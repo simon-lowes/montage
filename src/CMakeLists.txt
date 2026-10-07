@@ -11,6 +11,7 @@ add_library(montage_engine STATIC
   core/History.h core/History.cpp
   core/ProjectIO.h core/ProjectIO.cpp
   core/Interchange.h core/Interchange.cpp
+  automation/McpServer.h automation/McpServer.cpp
   media/Image.h media/Image.cpp
   media/Decoder.h media/Decoder.cpp
   media/HwAccel.h media/HwAccel.cpp

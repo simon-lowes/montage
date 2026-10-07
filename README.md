@@ -218,7 +218,26 @@ montage-cli new -o hdr.montage --color-space rec2100pq --hdr-peak 1000 a.mov   #
 montage-cli render hdr.montage -o hdr10.mp4 --vcodec libx265                   # 10-bit HDR10 with metadata
 montage-cli render hdr.montage -o sdr.mp4 --color-space rec709                 # tone-mapped SDR version
 montage-cli colorspaces                                      # colour space ids
+montage-cli mcp                                              # MCP server for AI agents (see below)
 ```
+
+## AI agents (MCP)
+
+`montage-cli mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server, so Claude and other MCP clients can edit with Montage. It works over stdio and speaks both the 2026-07-28 revision and the earlier initialize handshake (2024-11-05 to 2025-11-25).
+
+Its tools work on `.montage` files by path. Each edit is saved at once, and the previous version is kept beside the project as `.bak` for `montage_undo`. The tools can:
+- probe media, create projects and list a project's timeline;
+- place media, split, remove (with ripple), move, trim and change the speed of clips;
+- add titles, effects (including masked ones), transitions and markers;
+- transcribe (with speaker labels) and find spoken phrases in the cut;
+- return a rendered frame as an image so the agent can check its work;
+- render with any preset, with progress;
+- export and import EDL, OTIO, FCP 7 XML and FCPXML.
+
+```bash
+claude mcp add montage -- montage-cli mcp      # Claude Code
+```
+Other clients take the same command in their MCP settings, e.g. `{"mcpServers": {"montage": {"command": "/Applications/Montage.app/Contents/MacOS/montage-cli", "args": ["mcp"]}}}`. Reopen a project in the app to see changes an agent made.
 
 ## Architecture
 
@@ -243,4 +262,4 @@ Notes on the design:
 
 ## Roadmap
 
-Phase 2 is ranked in [`docs/research/phase2-roadmap.md`](docs/research/phase2-roadmap.md) and tracked in [`PROGRESS.md`](PROGRESS.md). Next up: a GPU compositor, HDR monitoring, and Phase 3 (an open scripting API and MCP server first).
+Phase 2 is ranked in [`docs/research/phase2-roadmap.md`](docs/research/phase2-roadmap.md) and tracked in [`PROGRESS.md`](PROGRESS.md). Next up: a GPU compositor, HDR monitoring, and more of Phase 3 (semantic visual search, metadata and smart bins).

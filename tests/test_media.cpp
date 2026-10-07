@@ -1,11 +1,15 @@
 // Media tests: probing, frame-accurate decoding, audio mixing, export round trips.
 #include <QtTest>
 #include <QPainter>
+#include <QJsonObject>
+#include <QJsonDocument>
+#include <QJsonArray>
 
 #include <algorithm>
 #include <cmath>
 #include <functional>
 #include <random>
+#include <sstream>
 #include <cstdio>
 
 #include "core/EditOps.h"
@@ -24,6 +28,7 @@
 #include "media/Tracking.h"
 #include "media/Segmenter.h"
 #include "media/Diarizer.h"
+#include "automation/McpServer.h"
 #ifdef MONTAGE_WITH_WHISPER
 #include "media/Transcriber.h"
 #endif
@@ -712,6 +717,124 @@ private slots:
         one.speakers = 1;
         QVERIFY(diarize(mix, one, turns, {}, nullptr, &err));
         for (const auto& turn : turns) QCOMPARE(turn.speaker, 0);
+    }
+
+    void mcpServerEditsProjects() {
+        writeBallVideo(path("mcp-ball.mp4"), 12);
+        const QString project = QString::fromStdString(path("agent.montage"));
+        McpServer server;
+        int nextId = 1;
+        // One request: the response object (progress notifications before it in `notes`).
+        std::vector<QJsonObject> notes;
+        auto call = [&](const QString& method, QJsonObject params, const QJsonObject& meta = {}) {
+            if (!meta.isEmpty()) params["_meta"] = meta;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", nextId++}, {"method", method}, {"params", params}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            notes.clear();
+            for (size_t i = 0; i + 1 < lines.size(); ++i) notes.push_back(QJsonDocument::fromJson(QByteArray::fromStdString(lines[i])).object());
+            return lines.empty() ? QJsonObject{} : QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object();
+        };
+        auto tool = [&](const QString& name, const QJsonObject& args, const QJsonObject& meta = {}) {
+            return call("tools/call", QJsonObject{{"name", name}, {"arguments", args}}, meta).value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) {
+            for (const QJsonValue& c : r.value("content").toArray())
+                if (c.toObject().value("type").toString() == "text") return c.toObject().value("text").toString();
+            return QString();
+        };
+
+        // The handshake older clients use.
+        QJsonObject init = call("initialize", QJsonObject{{"protocolVersion", "2025-06-18"}, {"capabilities", QJsonObject{}},
+                                                           {"clientInfo", QJsonObject{{"name", "test"}, {"version", "1"}}}});
+        QCOMPARE(init.value("result").toObject().value("protocolVersion").toString(), QString("2025-06-18"));
+        QCOMPARE(init.value("result").toObject().value("serverInfo").toObject().value("name").toString(), QString("montage"));
+        QVERIFY(server.handle(R"({"jsonrpc":"2.0","method":"notifications/initialized"})").empty());
+        const QJsonArray tools = call("tools/list", {}).value("result").toObject().value("tools").toArray();
+        QVERIFY(tools.size() >= 20);
+        for (const QJsonValue& t : tools) {
+            QVERIFY(t.toObject().value("name").toString().startsWith("montage_"));
+            QCOMPARE(t.toObject().value("inputSchema").toObject().value("type").toString(), QString("object"));
+        }
+
+        // Build and edit a project.
+        QJsonObject r = tool("montage_create_project", QJsonObject{{"project", project}, {"media", QJsonArray{QString::fromStdString(path("mcp-ball.mp4"))}}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QCOMPARE(r.value("structuredContent").toObject().value("width").toInt(), 640);
+        r = tool("montage_split", QJsonObject{{"project", project}, {"at", 0.2}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = tool("montage_project_info", QJsonObject{{"project", project}});
+        const QJsonArray v1 = r.value("structuredContent").toObject().value("tracks").toArray().at(0).toObject().value("clips").toArray();
+        QCOMPARE(v1.size(), 2);
+        QCOMPARE(v1.at(1).toObject().value("start").toString(), QString("00:00:00:05"));  // 0.2 s at 25 fps
+        const double second = v1.at(1).toObject().value("id").toDouble();
+        r = tool("montage_add_effect", QJsonObject{{"project", project}, {"clip", second}, {"effect", "invert"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = tool("montage_add_effect", QJsonObject{{"project", project}, {"clip", second}, {"effect", "gaussian_blur"}, {"params", QJsonObject{{"no_such", 1}}}});
+        QVERIFY(r.value("isError").toBool() && text(r).contains("no_such"));
+        r = tool("montage_add_title", QJsonObject{{"project", project}, {"text", "Hello"}, {"at", "00:00:00:00"}, {"duration", 0.3}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QCOMPARE(r.value("structuredContent").toObject().value("text").toString(), QString("Hello"));
+        r = tool("montage_add_marker", QJsonObject{{"project", project}, {"at", 0.1}, {"name", "Look"}});
+        QVERIFY(!r.value("isError").toBool());
+        Project saved;
+        QVERIFY(loadProject(project.toStdString(), saved));
+        QCOMPARE(saved.active()->markers.size(), size_t(1));
+        QCOMPARE(saved.active()->videoTracks.at(1).clips.size(), size_t(1));  // the title, above the picture
+        // Undo puts back the version before the marker.
+        r = tool("montage_undo", QJsonObject{{"project", project}});
+        QVERIFY(!r.value("isError").toBool());
+        QVERIFY(loadProject(project.toStdString(), saved));
+        QVERIFY(saved.active()->markers.empty());
+
+        // Looking at a frame returns an image.
+        r = tool("montage_render_frame", QJsonObject{{"project", project}, {"at", 0.4}, {"width", 320}});
+        const QJsonObject image = r.value("content").toArray().at(0).toObject();
+        QCOMPARE(image.value("type").toString(), QString("image"));
+        QImage shown;
+        QVERIFY(shown.loadFromData(QByteArray::fromBase64(image.value("data").toString().toLatin1()), "PNG"));
+        QCOMPARE(shown.width(), 320);
+        QVERIFY(shown.pixelColor(260, 30).red() > 100 || shown.pixelColor(260, 30).blue() > 100);  // the (inverted) ground
+        // Exchange and render, with progress.
+        r = tool("montage_export_timeline", QJsonObject{{"project", project}, {"format", "otio"}, {"output", QString::fromStdString(path("agent.otio"))}});
+        QVERIFY(!r.value("isError").toBool() && QFileInfo::exists(QString::fromStdString(path("agent.otio"))));
+        r = tool("montage_render", QJsonObject{{"project", project}, {"output", QString::fromStdString(path("agent.mp4"))}, {"out", 0.3}},
+                 QJsonObject{{"progressToken", "render-1"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY(!notes.empty());
+        QCOMPARE(notes.front().value("method").toString(), QString("notifications/progress"));
+        QCOMPARE(notes.front().value("params").toObject().value("progressToken").toString(), QString("render-1"));
+
+        // Mistakes are reported, not fatal.
+        r = tool("montage_move_clip", QJsonObject{{"project", project}, {"clip", 999999}, {"start", 1}});
+        QVERIFY(r.value("isError").toBool() && text(r).contains("No clip"));
+        r = tool("montage_split", QJsonObject{{"project", project}, {"at", "half past"}});
+        QVERIFY(r.value("isError").toBool());
+        QCOMPARE(call("tools/call", QJsonObject{{"name", "no_such_tool"}}).value("error").toObject().value("code").toInt(), -32602);
+        QCOMPARE(call("no/such", {}).value("error").toObject().value("code").toInt(), -32601);
+        QCOMPARE(QJsonDocument::fromJson(QByteArray::fromStdString(server.handle("{oops").at(0))).object().value("error").toObject().value("code").toInt(), -32700);
+
+        // The stateless revision: version and capabilities on every request.
+        const QJsonObject modern{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                 {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}};
+        QJsonObject d = call("server/discover", {}, modern).value("result").toObject();
+        QCOMPARE(d.value("resultType").toString(), QString("complete"));
+        QVERIFY(d.value("supportedVersions").toArray().contains(QJsonValue("2026-07-28")));
+        QCOMPARE(d.value("_meta").toObject().value("io.modelcontextprotocol/serverInfo").toObject().value("name").toString(), QString("montage"));
+        r = tool("montage_project_info", QJsonObject{{"project", project}}, modern);
+        QCOMPARE(r.value("resultType").toString(), QString("complete"));
+        QVERIFY(!r.value("isError").toBool());
+        QJsonObject old = modern;
+        old["io.modelcontextprotocol/protocolVersion"] = "1999-01-01";
+        const QJsonObject e = call("tools/list", {}, old).value("error").toObject();
+        QCOMPARE(e.value("code").toInt(), -32022);
+        QVERIFY(e.value("data").toObject().value("supported").toArray().contains(QJsonValue("2025-11-25")));
+        QCOMPARE(call("tools/list", {}, QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"}}).value("error").toObject().value("code").toInt(), -32602);
+
+        // On a stream: one line per message.
+        std::istringstream in("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n");
+        std::ostringstream out;
+        QCOMPARE(server.run(in, out), 0);
+        QCOMPARE(QString::fromStdString(out.str()), QString("{\"id\":1,\"jsonrpc\":\"2.0\",\"result\":{}}\n"));
     }
 
     void transcribesSpeech() {

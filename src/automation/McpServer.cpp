@@ -1,0 +1,870 @@
+#include "McpServer.h"
+
+#include <QBuffer>
+#include <QFile>
+#include <QFileInfo>
+#include <QImage>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <algorithm>
+#include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <map>
+#include <sstream>
+
+#include "core/EditOps.h"
+#include "core/Effects.h"
+#include "core/History.h"
+#include "core/Interchange.h"
+#include "core/ProjectIO.h"
+#include "core/TranscriptEdit.h"
+#include "media/Decoder.h"
+#include "media/Transcriber.h"
+#include "render/Compositor.h"
+#include "render/Exporter.h"
+#include "render/Processing.h"
+
+namespace montage {
+
+namespace {
+
+const char* kModern = "2026-07-28";
+const char* kVersionKey = "io.modelcontextprotocol/protocolVersion";
+const char* kCapabilitiesKey = "io.modelcontextprotocol/clientCapabilities";
+const char* kServerInfoKey = "io.modelcontextprotocol/serverInfo";
+
+const char* kInstructions =
+    "Montage is a video editor. Projects are .montage files: pass their path to every tool, and each edit is saved "
+    "at once (montage_undo restores the version before the last edit). Times are seconds (numbers) or timecode "
+    "strings like \"00:01:02:03\"; tracks are \"V1\", \"V2\", \"A1\"... Clips are referred to by the ids "
+    "montage_project_info lists. Look at the result with montage_render_frame before rendering the whole sequence. "
+    "If the project is open in the Montage app, reopen it there to see the changes.";
+
+QJsonObject serverInfo() {
+    return QJsonObject{{"name", "montage"}, {"title", "Montage"}, {"version", MONTAGE_VERSION}};
+}
+
+// ---- Tool results -----------------------------------------------------------------
+
+struct ToolResult {
+    QString text;
+    QJsonObject structured;
+    QByteArray png;  // an image to show (base64-encoded in the reply)
+    bool error = false;
+};
+
+ToolResult fail(const QString& message) { return {message, {}, {}, true}; }
+ToolResult ok(const QString& text, const QJsonObject& structured = {}) { return {text, structured, {}, false}; }
+
+// A tool argument problem, reported as a failed tool call (so the model can correct itself).
+struct ArgError {
+    QString message;
+};
+
+QString str(const QJsonObject& a, const char* key, const QString& def = {}) {
+    const QJsonValue v = a.value(key);
+    return v.isString() ? v.toString() : def;
+}
+QString need(const QJsonObject& a, const char* key) {
+    const QString v = str(a, key);
+    if (v.isEmpty()) throw ArgError{QStringLiteral("\"%1\" is required").arg(key)};
+    return v;
+}
+
+// Seconds (a number) or a timecode / frame count / "N s" string, in the sequence's frames.
+FrameTime timeArg(const QJsonValue& v, const Sequence& s, const char* name) {
+    if (v.isDouble()) return FrameTime(std::llround(v.toDouble() * s.fpsValue()));
+    FrameTime f = 0;
+    if (v.isString() && parseTimecode(v.toString().toStdString(), s.fps, f)) return f;
+    throw ArgError{QStringLiteral("\"%1\" must be seconds or a timecode like 00:00:01:00").arg(name)};
+}
+
+TrackRef trackArg(const QString& name, const Sequence& s, bool mayCreate, Project* p = nullptr, Sequence* ms = nullptr) {
+    const QString n = name.trimmed().toUpper();
+    if (n.size() >= 2 && (n[0] == 'V' || n[0] == 'A')) {
+        bool good = false;
+        const int i = n.mid(1).toInt(&good) - 1;
+        const TrackKind kind = n[0] == 'V' ? TrackKind::Video : TrackKind::Audio;
+        const int count = int(kind == TrackKind::Video ? s.videoTracks.size() : s.audioTracks.size());
+        if (good && i >= 0 && i < count) return {kind, i};
+        if (good && mayCreate && p && ms && i == count) return edit::addTrack(*p, *ms, kind);
+    }
+    throw ArgError{QStringLiteral("Unknown track \"%1\": use V1, V2... or A1, A2...").arg(name)};
+}
+
+QString tc(FrameTime f, const Sequence& s) { return QString::fromStdString(formatTimecode(f, s.fps)); }
+double secs(FrameTime f, const Sequence& s) { return double(f) / s.fpsValue(); }
+
+QString absolute(const QString& path) { return QString::fromStdString(std::filesystem::absolute(path.toStdString()).string()); }
+
+// ---- Projects on disk ---------------------------------------------------------------
+
+struct Loaded {
+    QString path;
+    Project project;
+    Sequence& seq() { return *project.active(); }
+};
+
+Loaded open(const QJsonObject& a) {
+    Loaded l;
+    l.path = absolute(need(a, "project"));
+    std::string err;
+    if (!loadProject(l.path.toStdString(), l.project, &err))
+        throw ArgError{QStringLiteral("Cannot open %1: %2").arg(l.path, QString::fromStdString(err))};
+    if (!l.project.active()) throw ArgError{QStringLiteral("%1 has no sequence").arg(l.path)};
+    return l;
+}
+
+// Saves, keeping the previous version as <project>.bak for montage_undo.
+void save(Loaded& l) {
+    const QString bak = l.path + ".bak";
+    if (QFileInfo::exists(l.path)) {
+        QFile::remove(bak);
+        QFile::copy(l.path, bak);
+    }
+    std::string err;
+    if (!saveProject(l.project, l.path.toStdString(), &err))
+        throw ArgError{QStringLiteral("Cannot save %1: %2").arg(l.path, QString::fromStdString(err))};
+}
+
+void check(const edit::Result& r) {
+    if (!r.ok) throw ArgError{QString::fromStdString(r.error)};
+}
+
+Clip& clipArg(Loaded& l, const QJsonObject& a, const char* key = "clip") {
+    const QJsonValue v = a.value(key);
+    if (!v.isDouble()) throw ArgError{QStringLiteral("\"%1\" must be a clip id (see montage_project_info)").arg(key)};
+    Clip* c = edit::clipById(l.seq(), Id(v.toDouble()));
+    if (!c) throw ArgError{QStringLiteral("No clip %1 in the active sequence").arg(qulonglong(v.toDouble()))};
+    return *c;
+}
+
+QJsonObject clipJson(const Project& p, const Sequence& s, const Clip& c) {
+    QJsonObject o{{"id", double(c.id)},
+                  {"name", QString::fromStdString(c.name)},
+                  {"start", tc(c.start, s)},
+                  {"end", tc(c.end(), s)},
+                  {"start_seconds", secs(c.start, s)},
+                  {"duration_seconds", secs(c.duration, s)}};
+    if (c.isGenerator()) {
+        o["generator"] = QString::fromStdString(c.generator.type);
+        if (c.generator.type == "title") o["text"] = QString::fromStdString(c.generator.s("text"));
+    } else if (const MediaItem* m = p.findMedia(c.mediaId)) {
+        o["media"] = QString::fromStdString(m->path.empty() ? m->name : m->path);
+        o["source_in_seconds"] = c.sourceIn / s.fpsValue();
+    }
+    if (c.speed != 1.0 || c.reverse) o["speed"] = (c.reverse ? -1 : 1) * c.speed;
+    if (!c.enabled) o["enabled"] = false;
+    if (c.linkGroup) o["linked_group"] = double(c.linkGroup);
+    QJsonArray fx;
+    for (const Effect& e : c.effects) fx.append(QJsonObject{{"id", double(e.id)}, {"type", QString::fromStdString(e.type)}});
+    if (!fx.isEmpty()) o["effects"] = fx;
+    return o;
+}
+
+QJsonObject projectJson(const Project& p) {
+    const Sequence& s = *p.active();
+    QJsonArray tracks;
+    for (TrackRef r : allTracks(s)) {
+        const Track* t = trackAt(s, r);
+        QJsonArray clips;
+        for (const Clip& c : t->clips) clips.append(clipJson(p, s, c));
+        QJsonObject to{{"track", QString::fromStdString(t->name)}, {"kind", r.kind == TrackKind::Video ? "video" : "audio"},
+                       {"clips", clips}};
+        if (t->muted) to["muted"] = true;
+        QJsonArray trs;
+        for (const auto& tr : t->transitions)
+            trs.append(QJsonObject{{"type", QString::fromStdString(tr.type)}, {"from_clip", double(tr.clipA)}, {"to_clip", double(tr.clipB)}});
+        if (!trs.isEmpty()) to["transitions"] = trs;
+        tracks.append(to);
+    }
+    QJsonArray markers;
+    for (const Marker& m : s.markers)
+        markers.append(QJsonObject{{"at", tc(m.t, s)}, {"name", QString::fromStdString(m.name)}, {"comment", QString::fromStdString(m.comment)}});
+    QJsonArray media;
+    for (const MediaItem& m : p.media) {
+        QJsonObject mo{{"id", double(m.id)}, {"name", QString::fromStdString(m.name)}, {"duration_seconds", m.duration}};
+        if (!m.path.empty()) mo["path"] = QString::fromStdString(m.path);
+        if (m.transcript) mo["transcribed"] = true;
+        media.append(mo);
+    }
+    return QJsonObject{{"sequence", QString::fromStdString(s.name)},
+                       {"width", s.width},
+                       {"height", s.height},
+                       {"fps", s.fpsValue()},
+                       {"duration", tc(s.duration(), s)},
+                       {"duration_seconds", secs(s.duration(), s)},
+                       {"tracks", tracks},
+                       {"markers", markers},
+                       {"media", media}};
+}
+
+// Adds a media file to the project (or finds it there).
+Id mediaFor(Project& p, const QString& path) {
+    const std::string abs = absolute(path).toStdString();
+    for (const MediaItem& m : p.media)
+        if (m.path == abs) return m.id;
+    MediaItem m;
+    m.id = p.newId();
+    std::string err;
+    if (!probeMedia(abs, m, &err)) throw ArgError{QStringLiteral("Cannot read %1: %2").arg(path, QString::fromStdString(err))};
+    p.media.push_back(m);
+    return m.id;
+}
+
+QJsonObject mediaJson(const MediaItem& m) {
+    QJsonObject o{{"name", QString::fromStdString(m.name)}, {"duration_seconds", m.duration}};
+    if (m.hasVideo) {
+        o["width"] = m.width;
+        o["height"] = m.height;
+        o["fps"] = m.fps.toDouble();
+        o["video_codec"] = QString::fromStdString(m.videoCodec);
+    }
+    if (m.hasAudio) {
+        o["sample_rate"] = m.sampleRate;
+        o["channels"] = m.channels;
+        o["audio_codec"] = QString::fromStdString(m.audioCodec);
+    }
+    return o;
+}
+
+QString json(const QJsonObject& o) { return QString::fromUtf8(QJsonDocument(o).toJson(QJsonDocument::Indented)); }
+
+}  // namespace
+
+// ---- Tools ------------------------------------------------------------------------------
+
+struct McpServer::Impl {
+    struct Tool {
+        QString name, title, description;
+        QJsonObject schema;
+        bool readOnly = false;
+        std::function<ToolResult(const QJsonObject&)> run;
+    };
+    std::vector<Tool> tools;
+    QString legacyVersion;  // set by initialize (legacy clients)
+    std::function<void(const QJsonObject&)> notify;  // progress notifications while a tool runs
+    QJsonValue progressToken;
+    std::ostream* live = nullptr;  // when serving a stream: notifications go out as they happen
+
+    Impl() { addTools(); }
+
+    void add(const char* name, const char* title, const char* description, const char* schema, bool readOnly,
+             std::function<ToolResult(const QJsonObject&)> run) {
+        tools.push_back({name, title, description, QJsonDocument::fromJson(schema).object(), readOnly, std::move(run)});
+    }
+
+    void progress(double fraction, const QString& message) {
+        if (!notify || progressToken.isUndefined() || progressToken.isNull()) return;
+        notify(QJsonObject{{"jsonrpc", "2.0"},
+                           {"method", "notifications/progress"},
+                           {"params", QJsonObject{{"progressToken", progressToken}, {"progress", fraction}, {"total", 1.0}, {"message", message}}}});
+    }
+
+    void addTools();
+};
+
+void McpServer::Impl::addTools() {
+    add("montage_probe_media", "Probe media", "Describe a video, audio or image file: duration, size, frame rate and codecs.",
+        R"json({"type":"object","properties":{"path":{"type":"string","description":"Media file"}},"required":["path"]})json", true,
+        [](const QJsonObject& a) {
+            MediaItem m;
+            std::string err;
+            if (!probeMedia(absolute(need(a, "path")).toStdString(), m, &err)) return fail(QString::fromStdString(err));
+            const QJsonObject o = mediaJson(m);
+            return ok(json(o), o);
+        });
+
+    add("montage_create_project", "Create a project",
+        "Create a .montage project with the given media laid end to end on V1/A1. The sequence takes the first video's "
+        "size and frame rate unless width, height or fps are given.",
+        R"json({"type":"object","properties":{
+            "project":{"type":"string","description":"Path of the .montage file to write"},
+            "media":{"type":"array","items":{"type":"string"},"description":"Media files, in order"},
+            "width":{"type":"integer"},"height":{"type":"integer"},"fps":{"type":"number"}},
+            "required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l;
+            l.path = absolute(need(a, "project"));
+            l.project = makeDefaultProject();
+            l.project.name = QFileInfo(l.path).completeBaseName().toStdString();
+            std::vector<Id> ids;
+            for (const QJsonValue& v : a.value("media").toArray()) ids.push_back(mediaFor(l.project, v.toString()));
+            Sequence& s = l.seq();
+            for (Id id : ids)
+                if (const MediaItem* m = l.project.findMedia(id); m && m->kind == MediaKind::Video && m->hasVideo) {
+                    if (m->width > 0) {
+                        s.width = m->width;
+                        s.height = m->height;
+                    }
+                    if (m->fps.valid()) s.fps = m->fps;
+                    break;
+                }
+            if (a.value("width").isDouble()) s.width = a.value("width").toInt();
+            if (a.value("height").isDouble()) s.height = a.value("height").toInt();
+            if (a.value("fps").isDouble()) {
+                const double f = a.value("fps").toDouble();
+                s.fps = std::fabs(f - std::round(f)) < 1e-6 ? Rational{int(std::lround(f)), 1} : Rational{int(std::lround(f * 1001)), 1001};
+            }
+            FrameTime at = 0;
+            for (Id id : ids) {
+                check(edit::placeMedia(l.project, s, id, at, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false));
+                at = s.duration();
+            }
+            save(l);
+            const QJsonObject o = projectJson(l.project);
+            return ok(QStringLiteral("Created %1 (%2)").arg(l.path, tc(s.duration(), s)), o);
+        });
+
+    add("montage_project_info", "Project info",
+        "List the active sequence of a project: size, frame rate, duration, every track with its clips (ids, times, media, "
+        "effects), transitions, markers and media.",
+        R"json({"type":"object","properties":{"project":{"type":"string"}},"required":["project"]})json", true,
+        [](const QJsonObject& a) {
+            Loaded l = open(a);
+            const QJsonObject o = projectJson(l.project);
+            return ok(json(o), o);
+        });
+
+    add("montage_place_media", "Place media",
+        "Put a media file (or part of it) on the timeline at a time, with its sound linked on the audio track. "
+        "Overwrite replaces what is there; insert pushes later clips along.",
+        R"json({"type":"object","properties":{
+            "project":{"type":"string"},"media":{"type":"string","description":"Media file"},
+            "at":{"type":["number","string"],"description":"Timeline time; default: the end of the sequence"},
+            "track":{"type":"string","description":"Video track, default V1 (a new one is made if it is the next number)"},
+            "audio_track":{"type":"string","description":"Audio track, default A1"},
+            "in":{"type":["number","string"],"description":"Source in, seconds"},
+            "out":{"type":["number","string"],"description":"Source out, seconds"},
+            "insert":{"type":"boolean","default":false}},
+            "required":["project","media"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const Id media = mediaFor(l.project, need(a, "media"));
+            const FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : s.duration();
+            const TrackRef v = trackArg(str(a, "track", "V1"), s, true, &l.project, &s);
+            const TrackRef au = trackArg(str(a, "audio_track", "A1"), s, true, &l.project, &s);
+            auto seconds = [&](const char* k, double def) {
+                const QJsonValue x = a.value(k);
+                if (x.isDouble()) return x.toDouble();
+                if (x.isString()) return double(timeArg(x, s, k)) / s.fpsValue();
+                return def;
+            };
+            const auto r = edit::placeMedia(l.project, s, media, at, seconds("in", 0), seconds("out", -1), v, au, a.value("insert").toBool());
+            check(r);
+            save(l);
+            QJsonArray created;
+            for (Id id : r.created)
+                if (const Clip* c = edit::clipById(s, id)) created.append(clipJson(l.project, s, *c));
+            return ok(QStringLiteral("Placed %1 clip(s) at %2").arg(r.created.size()).arg(tc(at, s)), QJsonObject{{"clips", created}});
+        });
+
+    add("montage_split", "Split clips",
+        "Cut clips in two at a timeline time: on one track, or on every track.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"at":{"type":["number","string"]},
+            "track":{"type":"string","description":"Only this track (default: all)"}},"required":["project","at"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const FrameTime at = timeArg(a.value("at"), s, "at");
+            if (a.contains("track")) check(edit::razor(l.project, s, trackArg(str(a, "track"), s, false), at));
+            else check(edit::razorAll(l.project, s, at));
+            save(l);
+            return ok(QStringLiteral("Split at %1").arg(tc(at, s)), projectJson(l.project));
+        });
+
+    add("montage_remove_clips", "Remove clips",
+        "Remove clips by id. With ripple, later clips move up to close the gap (keeping sound in sync).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clips":{"type":"array","items":{"type":"number"}},
+            "ripple":{"type":"boolean","default":false}},"required":["project","clips"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            std::vector<Id> ids;
+            for (const QJsonValue& v : a.value("clips").toArray()) ids.push_back(Id(v.toDouble()));
+            if (ids.empty()) throw ArgError{"\"clips\" must list clip ids"};
+            check(edit::removeClips(l.project, l.seq(), ids, a.value("ripple").toBool()));
+            save(l);
+            return ok(QStringLiteral("Removed %1 clip(s)").arg(ids.size()), projectJson(l.project));
+        });
+
+    add("montage_move_clip", "Move a clip",
+        "Move a clip (and the clips linked to it) to a new start time, optionally to another video track.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
+            "start":{"type":["number","string"]},"track":{"type":"string"}},"required":["project","clip","start"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            Clip& c = clipArg(l, a);
+            const Id id = c.id;
+            const FrameTime delta = timeArg(a.value("start"), s, "start") - c.start;
+            int videoDelta = 0, audioDelta = 0;
+            if (a.contains("track")) {
+                const auto loc = edit::locate(s, id);
+                const TrackRef to = trackArg(str(a, "track"), s, true, &l.project, &s);
+                if (!loc || to.kind != loc->track.kind) throw ArgError{"A clip moves only between tracks of its own kind"};
+                (to.kind == TrackKind::Video ? videoDelta : audioDelta) = to.index - loc->track.index;
+            }
+            check(edit::moveClips(l.project, s, {id}, delta, videoDelta, audioDelta));
+            save(l);
+            const Clip* moved = edit::clipById(s, id);
+            return ok(QStringLiteral("Moved to %1").arg(tc(moved ? moved->start : 0, s)), moved ? clipJson(l.project, s, *moved) : QJsonObject{});
+        });
+
+    add("montage_trim_clip", "Trim a clip",
+        "Move a clip's in or out point by a number of seconds (positive: later). Ripple moves later clips with it.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
+            "edge":{"type":"string","enum":["in","out"]},"by":{"type":"number","description":"Seconds"},
+            "ripple":{"type":"boolean","default":false}},"required":["project","clip","edge","by"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const Id id = clipArg(l, a).id;
+            const FrameTime by = FrameTime(std::llround(a.value("by").toDouble() * s.fpsValue()));
+            const auto r = edit::trim(l.project, s, id, str(a, "edge") == "in" ? edit::Edge::In : edit::Edge::Out, by,
+                                      a.value("ripple").toBool() ? edit::TrimMode::Ripple : edit::TrimMode::Normal);
+            check(r);
+            save(l);
+            const Clip* c = edit::clipById(s, id);
+            return ok(QStringLiteral("Trimmed by %1 frame(s)").arg(r.applied), c ? clipJson(l.project, s, *c) : QJsonObject{});
+        });
+
+    add("montage_set_speed", "Set clip speed",
+        "Change a clip's playback speed (1 = normal, 0.5 = half speed, 2 = double; negative plays backwards). "
+        "Its length changes to match, and later clips ripple.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},"speed":{"type":"number"}},
+            "required":["project","clip","speed"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            const Id id = clipArg(l, a).id;
+            const double sp = a.value("speed").toDouble();
+            if (std::fabs(sp) < 0.01 || std::fabs(sp) > 100) throw ArgError{"Speed must be between 0.01 and 100 (or -0.01 and -100)"};
+            check(edit::setSpeed(l.project, l.seq(), id, std::fabs(sp), true, sp < 0));
+            save(l);
+            const Clip* c = edit::clipById(l.seq(), id);
+            return ok(QStringLiteral("Speed set to %1").arg(sp), c ? clipJson(l.project, l.seq(), *c) : QJsonObject{});
+        });
+
+    add("montage_add_title", "Add a title",
+        "Add a text title over the picture at a time, for a duration (default 3 s), on a video track (default: the "
+        "track above the top one in use).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"text":{"type":"string"},
+            "at":{"type":["number","string"]},"duration":{"type":["number","string"],"default":3},
+            "track":{"type":"string"},"size":{"type":"number","description":"Font size in pixels"}},
+            "required":["project","text","at"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            TrackRef t{TrackKind::Video, 0};
+            if (a.contains("track")) t = trackArg(str(a, "track"), s, true, &l.project, &s);
+            else {
+                int top = -1;
+                for (int i = 0; i < int(s.videoTracks.size()); ++i)
+                    if (!s.videoTracks[size_t(i)].clips.empty()) top = i;
+                t = top + 1 < int(s.videoTracks.size()) ? TrackRef{TrackKind::Video, top + 1} : edit::addTrack(l.project, s, TrackKind::Video);
+            }
+            const FrameTime len = a.contains("duration") ? timeArg(a.value("duration"), s, "duration") : FrameTime(std::llround(3 * s.fpsValue()));
+            Clip c = makeGeneratorClip(l.project, "title", std::max<FrameTime>(1, len));
+            c.generator.strings["text"] = need(a, "text").toStdString();
+            if (a.value("size").isDouble()) c.generator.params["size"] = Param(a.value("size").toDouble());
+            c.start = timeArg(a.value("at"), s, "at");
+            c.name = need(a, "text").left(40).toStdString();
+            const auto r = edit::overwrite(l.project, s, t, c);
+            check(r);
+            save(l);
+            const Clip* made = r.created.empty() ? nullptr : edit::clipById(s, r.created[0]);
+            return ok(QStringLiteral("Added a title on %1").arg(QString::fromStdString(trackAt(s, t)->name)),
+                      made ? clipJson(l.project, s, *made) : QJsonObject{});
+        });
+
+    add("montage_list_effects", "List effects",
+        "The effects and transitions Montage has, with their parameters (name, range, default).",
+        R"json({"type":"object","properties":{"kind":{"type":"string","enum":["video","audio","transition"],"default":"video"}}})json", true,
+        [](const QJsonObject& a) {
+            const QString kind = str(a, "kind", "video");
+            QJsonArray list;
+            for (const EffectInfo& e : effectCatalog()) {
+                const bool want = kind == "audio"        ? e.category == EffectCategory::AudioFilter
+                                  : kind == "transition" ? e.category == EffectCategory::VideoTransition || e.category == EffectCategory::AudioTransition
+                                                         : e.category == EffectCategory::VideoFilter;
+                if (!want || e.hidden) continue;
+                QJsonArray params;
+                for (const ParamInfo& pi : e.params) {
+                    QJsonObject po{{"name", QString::fromStdString(pi.name)}, {"label", QString::fromStdString(pi.label)},
+                                   {"min", pi.min}, {"max", pi.max}, {"default", pi.def}};
+                    if (!pi.choices.empty()) {
+                        QJsonArray ch;
+                        for (const auto& c : pi.choices) ch.append(QString::fromStdString(c));
+                        po["choices"] = ch;
+                    }
+                    params.append(po);
+                }
+                list.append(QJsonObject{{"type", QString::fromStdString(e.type)}, {"name", QString::fromStdString(e.displayName)},
+                                        {"group", QString::fromStdString(e.group)}, {"params", params}});
+            }
+            const QJsonObject o{{"effects", list}};
+            return ok(json(o), o);
+        });
+
+    add("montage_add_effect", "Add an effect",
+        "Add an effect to a clip (see montage_list_effects), with parameter values. Video effects can be limited to a "
+        "mask: mask.shape 1 ellipse or 2 rectangle, mask.x / mask.y centre and mask.w / mask.h size as fractions of the frame.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},"effect":{"type":"string"},
+            "params":{"type":"object","additionalProperties":{"type":"number"}}},"required":["project","clip","effect"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Clip& c = clipArg(l, a);
+            const std::string type = need(a, "effect").toStdString();
+            const EffectInfo* info = findEffectInfo(type);
+            if (!info || info->hidden || (info->category != EffectCategory::VideoFilter && info->category != EffectCategory::AudioFilter))
+                throw ArgError{QStringLiteral("Unknown effect \"%1\" (see montage_list_effects)").arg(QString::fromStdString(type))};
+            Effect e = makeEffect(l.project, type);
+            const QJsonObject params = a.value("params").toObject();
+            for (auto it = params.begin(); it != params.end(); ++it) {
+                const std::string name = it.key().toStdString();
+                const bool known = std::any_of(info->params.begin(), info->params.end(), [&](const ParamInfo& p) { return p.name == name; }) ||
+                                   (name.rfind("mask.", 0) == 0 && supportsMask(type));
+                if (!known) throw ArgError{QStringLiteral("\"%1\" has no parameter \"%2\"").arg(QString::fromStdString(type), it.key())};
+                e.params[name] = Param(it.value().toDouble());
+            }
+            const auto loc = edit::locate(l.seq(), c.id);
+            const bool audioClip = loc && loc->track.kind == TrackKind::Audio;
+            if (audioClip != (info->category == EffectCategory::AudioFilter))
+                throw ArgError{audioClip ? QStringLiteral("That is an audio clip: choose an audio effect")
+                                         : QStringLiteral("That is a video clip: choose a video effect")};
+            c.effects.push_back(e);
+            save(l);
+            return ok(QStringLiteral("Added %1 to %2").arg(QString::fromStdString(info->displayName), QString::fromStdString(c.name)),
+                      QJsonObject{{"effect_id", double(e.id)}});
+        });
+
+    add("montage_add_transition", "Add a transition",
+        "Add a transition at a clip's start or end (cross_dissolve by default, centred on the cut).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
+            "edge":{"type":"string","enum":["in","out"],"default":"in"},"type":{"type":"string","default":"cross_dissolve"},
+            "duration":{"type":["number","string"],"default":1}},"required":["project","clip"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const Id id = clipArg(l, a).id;
+            const FrameTime len = a.contains("duration") ? timeArg(a.value("duration"), s, "duration") : FrameTime(std::llround(s.fpsValue()));
+            check(edit::addTransition(l.project, s, id, str(a, "edge", "in") == "out" ? edit::Edge::Out : edit::Edge::In,
+                                      str(a, "type", "cross_dissolve").toStdString(), std::max<FrameTime>(1, len)));
+            save(l);
+            return ok(QStringLiteral("Added the transition"));
+        });
+
+    add("montage_add_marker", "Add a marker", "Add a timeline marker with a name and comment.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"at":{"type":["number","string"]},
+            "name":{"type":"string"},"comment":{"type":"string"}},"required":["project","at"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const FrameTime at = timeArg(a.value("at"), s, "at");
+            edit::addMarker(s, Marker{at, 0, str(a, "name").toStdString(), str(a, "comment").toStdString(), 0});
+            save(l);
+            return ok(QStringLiteral("Marker at %1").arg(tc(at, s)));
+        });
+
+    add("montage_transcribe", "Transcribe",
+        "Turn the speech in a media file into word-timed text (whisper.cpp, on this computer), optionally labelling who "
+        "speaks. With a project, the transcript is kept on that media item (for montage_find_phrase and captions).",
+        R"json({"type":"object","properties":{"media":{"type":"string"},"project":{"type":"string"},
+            "model":{"type":"string","default":"base.en","description":"A downloaded whisper model (montage-cli models)"},
+            "language":{"type":"string","default":"auto"},"speakers":{"type":"boolean","default":false}},"required":["media"]})json",
+        false, [this](const QJsonObject& a) {
+            TranscribeOptions o;
+            o.model = str(a, "model", "base.en").toStdString();
+            o.language = str(a, "language", "auto").toStdString();
+            o.speakers = a.value("speakers").toBool();
+            const QString media = absolute(need(a, "media"));
+            auto t = std::make_shared<Transcript>();
+            std::string err;
+            if (!transcribeMedia(media.toStdString(), o, *t, [this](double f) { progress(f, "Transcribing"); }, nullptr, &err))
+                return fail(QString::fromStdString(err));
+            QString text;
+            for (const auto& seg : t->segments) {
+                const QString who = QString::fromStdString(speakerName(*t, seg.speaker));
+                text += QStringLiteral("[%1 - %2] ").arg(seg.start, 0, 'f', 2).arg(seg.end, 0, 'f', 2) + (who.isEmpty() ? QString() : who + ": ") +
+                        QString::fromStdString(seg.text) + "\n";
+            }
+            if (a.contains("project")) {
+                Loaded l = open(a);
+                const Id id = mediaFor(l.project, media);
+                l.project.findMedia(id)->transcript = t;
+                save(l);
+            }
+            return ok(text.isEmpty() ? QStringLiteral("(no speech)") : text,
+                      QJsonDocument::fromJson(QByteArray::fromStdString(transcriptToJson(*t))).object());
+        });
+
+    add("montage_find_phrase", "Find spoken words",
+        "Find where a phrase is spoken in the cut (from the transcripts of the clips' media), as timeline times.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"phrase":{"type":"string"}},"required":["project","phrase"]})json", true,
+        [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            Transcript cut;
+            TranscriptSegment seg;
+            seg.words = sequenceTranscriptWords(l.project, s);
+            cut.segments.push_back(seg);
+            QJsonArray hits;
+            QString text;
+            for (const auto& [from, to] : findPhrase(cut, need(a, "phrase").toStdString())) {
+                const FrameTime f0 = FrameTime(std::floor(from * s.fpsValue())), f1 = FrameTime(std::ceil(to * s.fpsValue()));
+                hits.append(QJsonObject{{"start", tc(f0, s)}, {"end", tc(f1, s)}, {"start_seconds", from}, {"end_seconds", to}});
+                text += tc(f0, s) + " - " + tc(f1, s) + "\n";
+            }
+            if (seg.words.empty()) return ok("Nothing in the sequence is transcribed (use montage_transcribe with the project)");
+            return ok(hits.isEmpty() ? QStringLiteral("Not found") : text, QJsonObject{{"hits", hits}});
+        });
+
+    add("montage_render_frame", "Look at a frame",
+        "Render the program at a timeline time and return it as an image (to check an edit), optionally saving a PNG.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"at":{"type":["number","string"]},
+            "width":{"type":"integer","default":640,"description":"Width of the returned image"},
+            "output":{"type":"string","description":"Also save the full-size frame here (PNG)"}},"required":["project","at"]})json", true,
+        [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const FrameTime at = timeArg(a.value("at"), s, "at");
+            const int w = std::clamp(a.value("width").toInt(640), 64, 1920);
+            RenderOptions ro;
+            ro.scale = std::min(1.0, double(w) / std::max(1, s.width));
+            ro.captions = true;
+            Image img = renderProgramFrame(l.project, s, at, ro);
+            flattenOver(img, 0, 0, 0);
+            QImage q(img.width, img.height, QImage::Format_RGBA8888);
+            toRgba8(img, q.bits(), size_t(q.bytesPerLine()));
+            QByteArray png;
+            QBuffer buf(&png);
+            buf.open(QIODevice::WriteOnly);
+            q.save(&buf, "PNG");
+            if (a.contains("output")) {
+                std::string err;
+                if (!exportStill(l.project, s, at, absolute(str(a, "output")).toStdString(), &err)) return fail(QString::fromStdString(err));
+            }
+            ToolResult r = ok(QStringLiteral("Frame at %1 (%2x%3)").arg(tc(at, s)).arg(img.width).arg(img.height));
+            r.png = png;
+            return r;
+        });
+
+    add("montage_list_presets", "List export presets", "The export presets montage_render accepts.",
+        R"json({"type":"object","properties":{}})json", true, [](const QJsonObject&) {
+            QJsonArray list;
+            QString text;
+            for (const auto& p : exportPresets()) {
+                list.append(QJsonObject{{"name", QString::fromStdString(p.name)}, {"extension", QString::fromStdString(p.extension)},
+                                        {"description", QString::fromStdString(p.description)}});
+                text += QString::fromStdString(p.name + " (." + p.extension + "): " + p.description) + "\n";
+            }
+            return ok(text, QJsonObject{{"presets", list}});
+        });
+
+    add("montage_render", "Render",
+        "Render the active sequence (or its in-out range) to a file with an export preset (default \"H.264 - High Quality\").",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"output":{"type":"string"},
+            "preset":{"type":"string"},"in":{"type":["number","string"]},"out":{"type":["number","string"]}},
+            "required":["project","output"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const ExportPreset* pr = findExportPreset(str(a, "preset", "H.264 - High Quality").toStdString());
+            if (!pr) throw ArgError{"Unknown preset (see montage_list_presets)"};
+            ExportSettings st = pr->settings;
+            st.path = absolute(need(a, "output")).toStdString();
+            if (a.contains("in")) st.in = timeArg(a.value("in"), s, "in");
+            if (a.contains("out")) st.out = timeArg(a.value("out"), s, "out");
+            std::string err;
+            if (!exportSequence(l.project, s, st, [this](double f, FrameTime) { progress(f, "Rendering"); }, nullptr, &err))
+                return fail(QString::fromStdString(err));
+            return ok(QStringLiteral("Wrote %1").arg(QString::fromStdString(st.path)), QJsonObject{{"output", QString::fromStdString(st.path)}});
+        });
+
+    add("montage_export_timeline", "Export the timeline",
+        "Write the active sequence as an EDL, OpenTimelineIO, Final Cut Pro 7 XML (Premiere, Resolve) or FCPXML (Final Cut Pro).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"format":{"type":"string","enum":["edl","otio","xml","fcpxml"]},
+            "output":{"type":"string"}},"required":["project","format","output"]})json",
+        true, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            const QString f = need(a, "format");
+            const std::string text = f == "otio" ? exportOtio(l.project, l.seq())
+                                     : f == "xml" ? exportFcp7Xml(l.project, l.seq())
+                                     : f == "fcpxml" ? exportFcpXml(l.project, l.seq())
+                                     : f == "edl" ? exportEdl(l.project, l.seq())
+                                                  : throw ArgError{"format must be edl, otio, xml or fcpxml"};
+            const QString out = absolute(need(a, "output"));
+            QFile file(out);
+            if (!file.open(QIODevice::WriteOnly) || file.write(text.data(), qint64(text.size())) != qint64(text.size()))
+                return fail(QStringLiteral("Cannot write %1").arg(out));
+            return ok(QStringLiteral("Wrote %1").arg(out));
+        });
+
+    add("montage_import_timeline", "Import a timeline",
+        "Make a project from an EDL, OpenTimelineIO, Final Cut Pro 7 XML or FCPXML file (media found by path).",
+        R"json({"type":"object","properties":{"input":{"type":"string"},"project":{"type":"string","description":"The .montage file to write"},
+            "fps":{"type":"number","description":"Frame rate for an EDL (default 30)"}},"required":["input","project"]})json",
+        false, [](const QJsonObject& a) {
+            std::string in = absolute(need(a, "input")).toStdString();
+            if (std::filesystem::is_directory(in)) in += "/Info.fcpxml";
+            std::ifstream f(in, std::ios::binary);
+            if (!f) return fail(QStringLiteral("Cannot read %1").arg(QString::fromStdString(in)));
+            const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            Loaded l;
+            l.path = absolute(need(a, "project"));
+            l.project.name = std::filesystem::path(in).stem().string();
+            const MediaProber prober = [](const std::string& file, MediaItem& m) { return probeMedia(file, m, nullptr); };
+            const std::string ext = std::filesystem::path(in).extension().string();
+            const double fps = a.value("fps").toDouble(30);
+            const Rational rate = std::fabs(fps - std::round(fps)) < 1e-6 ? Rational{int(std::lround(fps)), 1} : Rational{int(std::lround(fps * 1001)), 1001};
+            const ImportResult r = ext == ".edl" ? importEdl(l.project, text, rate, prober, std::filesystem::path(in).parent_path().string())
+                                   : ext == ".xml" || ext == ".fcpxml" ? importXmlTimeline(l.project, text, prober)
+                                                                       : importOtio(l.project, text, prober);
+            if (!r.ok) return fail(QString::fromStdString(r.error));
+            save(l);
+            QString note = QStringLiteral("Imported %1 clip(s) into %2").arg(r.clips).arg(l.path);
+            for (const auto& o : r.offline) note += "\nOffline: " + QString::fromStdString(o);
+            for (const auto& w : r.warnings) note += "\nWarning: " + QString::fromStdString(w);
+            return ok(note, projectJson(l.project));
+        });
+
+    add("montage_undo", "Undo the last edit",
+        "Put the project back as it was before the last edit made through these tools (one step).",
+        R"json({"type":"object","properties":{"project":{"type":"string"}},"required":["project"]})json", false,
+        [](const QJsonObject& a) {
+            const QString path = absolute(need(a, "project")), bak = path + ".bak";
+            if (!QFileInfo::exists(bak)) return fail("Nothing to undo");
+            QFile::remove(path);
+            if (!QFile::rename(bak, path)) return fail(QStringLiteral("Cannot restore %1").arg(path));
+            return ok(QStringLiteral("Restored %1").arg(path));
+        });
+}
+
+// ---- Protocol -------------------------------------------------------------------------------
+
+McpServer::McpServer() : d_(new Impl) {}
+McpServer::~McpServer() { delete d_; }
+
+const std::vector<std::string>& McpServer::protocolVersions() {
+    static const std::vector<std::string> v = {kModern, "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"};
+    return v;
+}
+
+std::vector<std::string> McpServer::handle(const std::string& message) {
+    std::vector<std::string> out;
+    auto send = [&](const QJsonObject& o) { out.push_back(QJsonDocument(o).toJson(QJsonDocument::Compact).toStdString()); };
+    QJsonParseError perr{};
+    const QJsonDocument doc = QJsonDocument::fromJson(QByteArray::fromStdString(message), &perr);
+    if (perr.error != QJsonParseError::NoError || !doc.isObject()) {
+        send(QJsonObject{{"jsonrpc", "2.0"}, {"id", QJsonValue()}, {"error", QJsonObject{{"code", -32700}, {"message", "Parse error"}}}});
+        return out;
+    }
+    const QJsonObject msg = doc.object();
+    const QString method = msg.value("method").toString();
+    const bool isRequest = msg.contains("id") && !msg.value("id").isNull();
+    if (method.isEmpty()) {
+        if (isRequest) send(QJsonObject{{"jsonrpc", "2.0"}, {"id", msg.value("id")}, {"error", QJsonObject{{"code", -32600}, {"message", "Invalid request"}}}});
+        return out;  // a response to us: nothing to do
+    }
+    if (!isRequest) return out;  // notifications (initialized, cancelled...) need no reply
+    const QJsonValue id = msg.value("id");
+    const QJsonObject params = msg.value("params").toObject();
+    const QJsonObject meta = params.value("_meta").toObject();
+    auto error = [&](int code, const QString& text, const QJsonValue& data = QJsonValue()) {
+        QJsonObject e{{"code", code}, {"message", text}};
+        if (!data.isUndefined() && !data.isNull()) e["data"] = data;
+        send(QJsonObject{{"jsonrpc", "2.0"}, {"id", id}, {"error", e}});
+        return out;
+    };
+    // Modern requests carry their protocol version; legacy ones follow initialize.
+    const bool modern = meta.contains(kVersionKey);
+    QJsonArray supported;
+    for (const auto& v : protocolVersions()) supported.append(QString::fromStdString(v));
+    if (modern) {
+        const QString version = meta.value(kVersionKey).toString();
+        if (version != kModern)
+            return error(-32022, "Unsupported protocol version", QJsonObject{{"supported", supported}, {"requested", version}});
+        if (!meta.contains(kCapabilitiesKey)) return error(-32602, "Missing io.modelcontextprotocol/clientCapabilities in _meta");
+    }
+    auto reply = [&](QJsonObject result) {
+        if (modern) {
+            result["resultType"] = "complete";
+            QJsonObject m = result.value("_meta").toObject();
+            m[kServerInfoKey] = serverInfo();
+            result["_meta"] = m;
+        }
+        send(QJsonObject{{"jsonrpc", "2.0"}, {"id", id}, {"result", result}});
+        return out;
+    };
+
+    if (method == "initialize") {
+        const QString asked = params.value("protocolVersion").toString();
+        QString chosen = "2025-11-25";
+        for (const auto& v : protocolVersions())
+            if (QString::fromStdString(v) == asked && v != kModern) chosen = asked;
+        d_->legacyVersion = chosen;
+        return reply(QJsonObject{{"protocolVersion", chosen},
+                                 {"capabilities", QJsonObject{{"tools", QJsonObject{{"listChanged", false}}}}},
+                                 {"serverInfo", serverInfo()},
+                                 {"instructions", kInstructions}});
+    }
+    if (method == "server/discover")
+        return reply(QJsonObject{{"supportedVersions", supported},
+                                 {"capabilities", QJsonObject{{"tools", QJsonObject{}}}},
+                                 {"instructions", kInstructions}});
+    if (method == "ping") return reply(QJsonObject{});
+    if (method == "tools/list") {
+        QJsonArray list;
+        for (const auto& t : d_->tools) {
+            QJsonObject o{{"name", t.name}, {"title", t.title}, {"description", t.description}, {"inputSchema", t.schema}};
+            o["annotations"] = QJsonObject{{"readOnlyHint", t.readOnly}, {"destructiveHint", false}, {"openWorldHint", false}};
+            list.append(o);
+        }
+        return reply(QJsonObject{{"tools", list}});
+    }
+    if (method == "tools/call") {
+        const QString name = params.value("name").toString();
+        auto tool = std::find_if(d_->tools.begin(), d_->tools.end(), [&](const auto& t) { return t.name == name; });
+        if (tool == d_->tools.end()) return error(-32602, QStringLiteral("Unknown tool: %1").arg(name));
+        d_->progressToken = meta.value("progressToken");
+        d_->notify = [&](const QJsonObject& n) {
+            if (!d_->live) return send(n);
+            *d_->live << QJsonDocument(n).toJson(QJsonDocument::Compact).toStdString() << '\n';
+            d_->live->flush();
+        };
+        ToolResult r;
+        try {
+            r = tool->run(params.value("arguments").toObject());
+        } catch (const ArgError& e) {
+            r = fail(e.message);
+        } catch (const std::exception& e) {
+            r = fail(QString::fromUtf8(e.what()));
+        }
+        d_->notify = nullptr;
+        QJsonArray content;
+        if (!r.png.isEmpty())
+            content.append(QJsonObject{{"type", "image"}, {"data", QString::fromLatin1(r.png.toBase64())}, {"mimeType", "image/png"}});
+        content.append(QJsonObject{{"type", "text"}, {"text", r.text}});
+        QJsonObject result{{"content", content}, {"isError", r.error}};
+        if (!r.structured.isEmpty()) result["structuredContent"] = r.structured;
+        return reply(result);
+    }
+    return error(-32601, QStringLiteral("Method not found: %1").arg(method));
+}
+
+int McpServer::run(std::istream& in, std::ostream& out) {
+    d_->live = &out;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.find_first_not_of(" \t") == std::string::npos) continue;
+        for (const std::string& reply : handle(line)) out << reply << '\n';
+        out.flush();
+    }
+    return 0;
+}
+
+}  // namespace montage

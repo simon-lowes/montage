@@ -194,3 +194,8 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
     - the panel and rename in the app;
     - switching from labels gives the same cuts as from microphones.
 - [x] Windows: Montage's own onnxruntime.dll is copied beside every program and test, because Windows' older one in System32 is found first. A C-API check reports a mismatched runtime instead of crashing.
+- [x] MCP server (Phase 3's first candidate): `montage-cli mcp` serves the Model Context Protocol on stdio.
+  - Protocol: both the stateless 2026-07-28 revision (per-request `_meta`, `server/discover`, `resultType`, the unsupported-version error) and the initialize handshake of 2024-11-05 to 2025-11-25.
+  - 22 tools on project files: probe, create, info, place, split, remove, move, trim, speed, title, effects (validated against the catalogue), transitions, markers, transcription, phrase search, frame preview as an image, presets, render with progress notifications, timeline export/import, and one-step undo (`.bak`).
+  - Argument mistakes come back as tool errors the model can correct.
+  - Tested: a whole session in both eras with real media, the preview image, render progress, errors, and stdio framing.

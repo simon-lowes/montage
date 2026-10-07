@@ -26,6 +26,7 @@
 #include "media/Decoder.h"
 #include "media/Loudness.h"
 #ifdef MONTAGE_WITH_WHISPER
+#include "automation/McpServer.h"
 #include "media/Diarizer.h"
 #include "media/Segmenter.h"
 #include "media/Transcriber.h"
@@ -66,6 +67,7 @@ int usage() {
                  "  montage-cli transcribe <media> [--model base.en|PATH] [--language auto|en|...] [--translate] [--speakers [N]]\n"
                  "                     [--srt out.srt] [--vtt out.vtt] [--json out.json] [--txt out.txt]\n"
                  "  montage-cli models\n"
+                 "  montage-cli mcp                       (Model Context Protocol server on stdio, for AI agents)\n"
                  "  montage-cli captions <project.montage> [-o out.srt|out.vtt|out.scc] [--transcribe MODEL]\n"
                  "                     [--generate] [--import file.srt] [--save]\n",
                  MONTAGE_VERSION);
@@ -696,6 +698,11 @@ int main(int argc, char** argv) {
         return 1;
     }
 #endif
+    if (cmd == "mcp") {
+        // A Model Context Protocol server on stdin/stdout: stdout carries only protocol messages.
+        McpServer server;
+        return server.run(std::cin, std::cout);
+    }
     if (cmd == "--version" || cmd == "version") {
         std::printf("Montage %s\n", MONTAGE_VERSION);
         return 0;
