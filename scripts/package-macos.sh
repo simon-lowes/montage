@@ -17,26 +17,45 @@ DMG="dist/Montage-$VERSION-macos-$ARCH.dmg"
 [ -d "$APP" ] || { echo "No app bundle at $APP; build first." >&2; exit 1; }
 MACDEPLOYQT=$(command -v macdeployqt || echo "$(brew --prefix qtbase)/bin/macdeployqt")
 
-# The command-line tool ships inside the bundle, next to the app binary.
+# The command-line tool ships inside the bundle, next to the app binary, with
+# the headless "offscreen" platform plugin it runs on (macdeployqt only adds cocoa).
 cp "$BUILD/src/montage-cli" "$APP/Contents/MacOS/"
+OFFSCREEN=$(find -L "$(brew --prefix)/share/qt" "$(brew --prefix qtbase)" -name libqoffscreen.dylib 2>/dev/null | head -1)
+[ -n "$OFFSCREEN" ] || { echo "libqoffscreen.dylib not found" >&2; exit 1; }
+mkdir -p "$APP/Contents/PlugIns/platforms"
+cp "$OFFSCREEN" "$APP/Contents/PlugIns/platforms/"
 
 # Copies Qt, FFmpeg and every other non-system library into the bundle and
 # rewrites the load paths to point there.
 # -libpath: Homebrew installs each Qt module in its own prefix, so plugins
 # reach frameworks (QtSvg...) through rpaths only the shared lib dir resolves.
 "$MACDEPLOYQT" "$APP" -always-overwrite -executable="$APP/Contents/MacOS/montage-cli" \
-  -libpath="$(brew --prefix)/lib"
+  -executable="$APP/Contents/PlugIns/platforms/libqoffscreen.dylib" -libpath="$(brew --prefix)/lib"
 
-# Nothing may still load from Homebrew, or the app only works on this machine.
-# (A library's own install name is listed too but is not loaded; skip it.)
-leaks=$(find "$APP" -type f \( -perm -u+x -o -name '*.dylib' \) | while read -r f; do
+# Qt's SVG image and icon plugins need QtSvg, which macdeployqt cannot find in
+# Homebrew's layout. Montage uses no SVG, so leave them out.
+rm -f "$APP/Contents/PlugIns/imageformats/libqsvg.dylib" "$APP/Contents/PlugIns/iconengines/libqsvgicon.dylib"
+
+# Every library the bundle loads must be inside it: nothing from Homebrew (or
+# the app only works on this machine) and no bundle-relative path that is
+# missing. (A library's own install name is listed too but is not loaded.)
+problems=$(find "$APP" -type f \( -perm -u+x -o -name '*.dylib' \) | while read -r f; do
   id=$(otool -D "$f" 2>/dev/null | sed -n 2p)
-  otool -L "$f" 2>/dev/null | sed 1d | awk '{print $1}' | grep -vxF "${id:-<none>}" |
-    grep -E '^(/opt/homebrew|/usr/local)/' | sed "s|^|$f -> |"
-done || true)
-if [ -n "$leaks" ]; then
-  echo "Bundle still references libraries outside it:" >&2
-  echo "$leaks" | sort -u >&2
+  otool -L "$f" 2>/dev/null | sed 1d | awk '{print $1}' | while read -r dep; do
+    [ "$dep" = "$id" ] && continue
+    case "$dep" in
+      /opt/homebrew/* | /usr/local/*) echo "$f -> $dep (outside the bundle)"; continue ;;
+      @executable_path/*) p="$APP/Contents/MacOS/${dep#@executable_path/}" ;;
+      @loader_path/*) p="$(dirname "$f")/${dep#@loader_path/}" ;;
+      @rpath/*) p="$APP/Contents/Frameworks/${dep#@rpath/}" ;;
+      *) continue ;;
+    esac
+    [ -e "$p" ] || echo "$f -> $dep (missing)"
+  done
+done)
+if [ -n "$problems" ]; then
+  echo "Bundle libraries do not resolve:" >&2
+  echo "$problems" | sort -u >&2
   exit 1
 fi
 

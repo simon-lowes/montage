@@ -19,6 +19,12 @@ cp "$BUILD/src/app/montage.exe" "$BUILD/src/montage-cli.exe" "$OUT/"
 WINDEPLOYQT=$(command -v windeployqt6 || command -v windeployqt || ls /ucrt64/share/qt6/bin/windeployqt*.exe | head -1)
 "$WINDEPLOYQT" --release --no-translations --no-system-d3d-compiler --no-opengl-sw "$OUT/montage.exe"
 
+# montage-cli runs on the headless "offscreen" platform plugin; windeployqt only adds qwindows.
+OFFSCREEN=$(find /ucrt64/share/qt6/plugins /ucrt64/lib/qt6/plugins -name qoffscreen.dll 2>/dev/null | head -1)
+[ -n "$OFFSCREEN" ] || { echo "qoffscreen.dll not found" >&2; exit 1; }
+mkdir -p "$OUT/platforms"
+cp "$OFFSCREEN" "$OUT/platforms/"
+
 # windeployqt only handles Qt. Copy every other DLL the programs and the Qt
 # plugins load from MSYS2 (FFmpeg and its codecs, the GCC runtime...).
 # ldd lists dependencies recursively; repeat until nothing new appears.
