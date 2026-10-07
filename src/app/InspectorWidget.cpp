@@ -23,6 +23,7 @@
 
 #include "EditorState.h"
 #include "Theme.h"
+#include "audio/PluginEffect.h"
 
 namespace montage {
 
@@ -310,8 +311,13 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
     // ---- Effect stack ------------------------------------------------------------
     for (size_t i = 0; i < clip.effects.size(); ++i) {
         const Effect& e = clip.effects[i];
-        const EffectInfo* info = findEffectInfo(e.type);
-        if (!info) continue;
+        const EffectInfo* catalog = findEffectInfo(e.type);
+        if (!catalog) continue;
+        // Plugin effects carry their own parameter list and name.
+        EffectInfo shown = *catalog;
+        shown.displayName = plugins::effectName(e);
+        shown.params = effectParams(e);
+        const EffectInfo* info = &shown;
         Id eid = e.id;
         auto* tools = new QWidget;
         auto* th = new QHBoxLayout(tools);
@@ -356,8 +362,12 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
         });
         connect(reset, &QToolButton::clicked, this, [=] {
             mutateStack(tr("Reset Effect"), [](std::vector<Effect>& v, size_t k, Project&) {
-                Effect fresh = makeEffect(v[k].type, v[k].id);
-                v[k] = fresh;
+                if (v[k].type == "plugin") {
+                    // Keep the plugin; put its parameters back to their defaults.
+                    for (const ParamInfo& pi : effectParams(v[k])) v[k].params[pi.name] = Param(pi.def);
+                } else {
+                    v[k] = makeEffect(v[k].type, v[k].id);
+                }
             });
         });
         connect(del, &QToolButton::clicked, this, [=] {
@@ -384,6 +394,36 @@ void InspectorWidget::addEffectMenu(TrackKind kind, Id clipId) {
                 return true;
             });
         });
+    }
+    if (kind == TrackKind::Audio) {
+        // Installed plugins this build can run, grouped by vendor.
+        std::map<QString, QMenu*> vendors;
+        QMenu* pluginMenu = nullptr;
+        for (const plugins::Descriptor& d : plugins::Registry::instance().plugins()) {
+            if (!plugins::canHost(d.format) || d.instrument) continue;
+            if (!pluginMenu) pluginMenu = menu->addMenu(tr("Plugins"));
+            const QString vendor = d.vendor.empty() ? tr("Other") : QString::fromStdString(d.vendor);
+            QMenu*& vm = vendors[vendor];
+            if (!vm) vm = pluginMenu->addMenu(vendor);
+            const std::string type = plugins::pluginType(d);
+            const QString label = QString::fromStdString(d.name);
+            vm->addAction(label, this, [this, clipId, type, label] {
+                QString error;
+                state_->edit(tr("Add %1").arg(label), [clipId, type, &error](Project& p, Sequence& s) {
+                    Clip* c = edit::clipById(s, clipId);
+                    if (!c) return false;
+                    std::string err;
+                    auto e = plugins::makeEffectOfType(p, type, &err);
+                    if (!e) {
+                        error = QString::fromStdString(err);
+                        return false;
+                    }
+                    c->effects.push_back(*e);
+                    return true;
+                });
+                if (!error.isEmpty()) state_->message(tr("Could not load %1: %2").arg(label, error));
+            });
+        }
     }
     btn->setMenu(menu);
     layout_->addWidget(btn);

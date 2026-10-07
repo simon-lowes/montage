@@ -7,10 +7,13 @@
 #include <QDoubleSpinBox>
 #include <QMimeData>
 #include <QScrollBar>
+#include <QTreeWidget>
 #include <algorithm>
 #include <cmath>
 
 #include "EditorState.h"
+#include "EffectsBrowser.h"
+#include "audio/Plugins.h"
 #include "MainWindow.h"
 #include "PlaybackController.h"
 #include "TimelineWidget.h"
@@ -292,6 +295,78 @@ private slots:
         state()->undo();
         state()->undo();
         QCOMPARE(edit::clipById(*state()->sequence(), red)->effects.size(), size_t(0));
+    }
+
+    void audioPluginFromBrowserToInspector() {
+        // Register the test CLAP plugins (built with the tests).
+        plugins::Registry& reg = plugins::Registry::instance();
+        reg.setCachePath((dir_.path() + "/plugin-cache.json").toStdString());
+        reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
+        for (plugins::Format f : plugins::kAllFormats) reg.setSearchPaths(f, {"/nonexistent-montage-test-dir"});
+        reg.setSearchPaths(plugins::Format::Clap, {QStringLiteral(MONTAGE_TEST_CLAP_DIR "/good").toStdString()});
+        reg.scan();
+        auto* browser = win_->findChild<EffectsBrowser*>();
+        QVERIFY(browser);
+        browser->reload();
+        bool listed = false;
+        for (QTreeWidgetItem* item : browser->findChild<QTreeWidget*>()->findItems("Montage Test Gain", Qt::MatchRecursive))
+            listed |= item->data(0, Qt::UserRole).toString() == "plugin:clap:org.montage.test.gain";
+        QVERIFY(listed);
+
+        // An audio clip on A1.
+        const QString wav = dir_.path() + "/tone.wav";
+        {
+            QFile f(wav);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            const int frames = 48000 * 2;
+            QByteArray data;
+            QDataStream out(&data, QIODevice::WriteOnly);
+            out.setByteOrder(QDataStream::LittleEndian);
+            out.writeRawData("RIFF", 4);
+            out << quint32(36 + frames * 4);
+            out.writeRawData("WAVEfmt ", 8);
+            out << quint32(16) << quint16(1) << quint16(2) << quint32(48000) << quint32(48000 * 4) << quint16(4) << quint16(16);
+            out.writeRawData("data", 4);
+            out << quint32(frames * 4);
+            for (int i = 0; i < frames * 2; ++i) out << qint16(8000);
+            f.write(data);
+        }
+        state()->newProject();
+        auto ids = state()->importFiles({wav});
+        QCOMPARE(ids.size(), size_t(1));
+        Id media = ids[0];
+        QVERIFY(state()->apply("Place", [media](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, media, 0, 0, -1, V1, A1, false);
+        }));
+        ppf_ = measurePpf();
+        Id clip = trackAt(*state()->sequence(), A1)->clips.at(0).id;
+
+        // Drag the plugin from the browser onto the clip.
+        QMimeData mime;
+        mime.setData("application/x-montage-effect", "plugin:clap:org.montage.test.gain");
+        const QPoint pos = pointFor(10, A1);
+        QDragEnterEvent enter(pos, Qt::CopyAction, &mime, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(viewport(), &enter);
+        QDropEvent drop(pos, Qt::CopyAction, &mime, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(viewport(), &drop);
+        const Clip* c = edit::clipById(*state()->sequence(), clip);
+        QCOMPARE(c->effects.size(), size_t(1));
+        QCOMPARE(c->effects[0].type, std::string("plugin"));
+
+        // The inspector shows the plugin's Gain parameter (0..2); editing it is undoable.
+        state()->setSelection({clip}, false);
+        QApplication::processEvents();
+        QDoubleSpinBox* gain = nullptr;
+        for (auto* sp : win_->findChildren<QDoubleSpinBox*>())
+            if (sp->maximum() == 2 && sp->minimum() == 0 && sp->isVisibleTo(win_.get())) gain = sp;
+        QVERIFY(gain);
+        gain->setValue(0.5);
+        c = edit::clipById(*state()->sequence(), clip);
+        QCOMPARE(c->effects[0].p("param.7", 0), 0.5);
+        state()->undo();
+        c = edit::clipById(*state()->sequence(), clip);
+        QCOMPARE(c->effects[0].p("param.7", 0), 1.0);
+        state()->newProject();
     }
 
     void inspectorEditsAreUndoable() {

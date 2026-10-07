@@ -32,6 +32,7 @@
 #include <tuple>
 
 #include "AudioMeterWidget.h"
+#include "audio/PluginEffect.h"
 #include "EditorState.h"
 #include "EffectsBrowser.h"
 #include "ExportDialog.h"
@@ -40,6 +41,7 @@
 #include "MixerPanel.h"
 #include "MonitorPanel.h"
 #include "PlaybackController.h"
+#include "PluginManagerDialog.h"
 #include "ScopesWidget.h"
 #include "SequenceSettingsDialog.h"
 #include "Theme.h"
@@ -68,6 +70,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     buildPanels();
     buildActions();
     buildMenus();
+    scanPluginsInBackground();
 
     syncTimer_.setSingleShot(true);
     syncTimer_.setInterval(0);
@@ -467,6 +470,13 @@ void MainWindow::buildMenus() {
     toolActions_.front().second->setChecked(true);
     connect(timeline_, &TimelineWidget::toolChanged, this, [this](TimelineWidget::Tool t) {
         for (auto& [tool, a] : toolActions_) a->setChecked(tool == t);
+    });
+    toolsM->addSeparator();
+    add(toolsM, tr("Audio &Plugins…"), QKeySequence(), [this] {
+        auto* dlg = new PluginManagerDialog(this);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        connect(dlg, &PluginManagerDialog::pluginsChanged, effects_, &EffectsBrowser::reload);
+        dlg->show();
     });
     tb->addSeparator();
     tb->addAction(snapping_);
@@ -1131,12 +1141,28 @@ void MainWindow::newSequence() {
         });
 }
 
+void MainWindow::scanPluginsInBackground() {
+    // Like other hosts, look for new or changed plugins at every launch; unchanged
+    // ones come from the cache, so this is quick after the first run.
+    if (qEnvironmentVariableIsSet("MONTAGE_NO_PLUGIN_SCAN")) return;
+    auto* watcher = new QFutureWatcher<plugins::ScanReport>(this);
+    connect(watcher, &QFutureWatcher<plugins::ScanReport>::finished, this, [this, watcher] {
+        watcher->deleteLater();
+        effects_->reload();
+        const int blocked = int(watcher->result().newlyBlocked.size());
+        if (blocked > 0)
+            state_->message(tr("%n audio plugin(s) failed to load and were blocked (Tools › Audio Plugins)", "", blocked), 8000);
+    });
+    watcher->setFuture(QtConcurrent::run([] { return plugins::Registry::instance().scan(); }));
+}
+
 void MainWindow::applyFromBrowser(const QString& typeQ, EffectCategory category) {
     const Sequence* s = state_->sequence();
     if (!s) return;
     std::string type = typeQ.toStdString();
     const EffectInfo* info = findEffectInfo(type);
-    if (!info) return;
+    if (!info && !plugins::isPluginType(type)) return;
+    const QString name = QString::fromStdString(plugins::effectTypeName(type));
     if (category == EffectCategory::Generator) {
         FrameTime at = s->playhead, len = FrameTime(std::llround(5 * s->fpsValue()));
         int vt = state_->targetVideoTrack();
@@ -1177,11 +1203,22 @@ void MainWindow::applyFromBrowser(const QString& typeQ, EffectCategory category)
         state_->message(video ? tr("Select a video clip to apply the effect to") : tr("Select an audio clip to apply the effect to"));
         return;
     }
-    state_->edit(tr("Add %1").arg(QString::fromStdString(info->displayName)), [targets, type](Project& p, Sequence& sq) {
+    QString error;
+    state_->edit(tr("Add %1").arg(name), [targets, type, &error](Project& p, Sequence& sq) {
+        bool added = false;
         for (Id id : targets)
-            if (Clip* c = edit::clipById(sq, id)) c->effects.push_back(makeEffect(p, type));
-        return true;
+            if (Clip* c = edit::clipById(sq, id)) {
+                std::string err;
+                if (auto e = plugins::makeEffectOfType(p, type, &err)) {
+                    c->effects.push_back(*e);
+                    added = true;
+                } else {
+                    error = QString::fromStdString(err);
+                }
+            }
+        return added;
     });
+    if (!error.isEmpty()) state_->message(tr("Could not load %1: %2").arg(name, error));
     inspectorDock_->raise();
 }
 

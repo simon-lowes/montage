@@ -36,4 +36,35 @@ std::optional<Effect> makePluginEffect(Project& p, const Descriptor& d, std::str
     return e;
 }
 
+bool isPluginType(const std::string& type) { return type.rfind(kPluginTypePrefix, 0) == 0; }
+
+std::string pluginType(const Descriptor& d) { return kPluginTypePrefix + d.id; }
+
+std::optional<Effect> makeEffectOfType(Project& p, const std::string& type, std::string* error) {
+    if (!isPluginType(type)) return makeEffect(p, type);
+    auto d = Registry::instance().find(type.substr(std::char_traits<char>::length(kPluginTypePrefix)));
+    if (!d) {
+        if (error) *error = "the plugin is not installed";
+        return std::nullopt;
+    }
+    return makePluginEffect(p, *d, error);
+}
+
+std::string effectTypeName(const std::string& type) {
+    if (isPluginType(type)) {
+        auto d = Registry::instance().find(type.substr(std::char_traits<char>::length(kPluginTypePrefix)));
+        return d ? d->name : type;
+    }
+    const EffectInfo* info = findEffectInfo(type);
+    return info ? info->displayName : type;
+}
+
+std::string effectName(const Effect& e) {
+    if (e.type == "plugin") {
+        const std::string fmt = e.s("plugin_format");
+        return e.s("plugin_name", "Audio Plugin") + (fmt.empty() ? "" : " (" + fmt + ")");
+    }
+    return effectTypeName(e.type);
+}
+
 }  // namespace montage::plugins

@@ -16,6 +16,7 @@
 #include <functional>
 
 #include "Theme.h"
+#include "audio/PluginEffect.h"
 
 namespace montage {
 
@@ -255,6 +256,38 @@ void EffectsBrowser::populate() {
         }
         top->setExpanded(true);
     }
+    // Installed audio plugins this build can run, by vendor, after "Audio Effects".
+    QTreeWidgetItem* pluginsTop = nullptr;
+    QHash<QString, QTreeWidgetItem*> vendors;
+    const QIcon pluginIcon = categoryIcon(EffectCategory::AudioFilter);
+    for (const plugins::Descriptor& d : plugins::Registry::instance().plugins()) {
+        if (!plugins::canHost(d.format) || d.instrument) continue;
+        if (!pluginsTop) {
+            pluginsTop = new QTreeWidgetItem(QStringList{tr("Audio Plugins")});
+            pluginsTop->setIcon(0, folderIcon);
+            pluginsTop->setFlags(folderFlags);
+            tree_->insertTopLevelItem(2, pluginsTop);
+        }
+        const QString vendor = d.vendor.empty() ? tr("Other") : QString::fromStdString(d.vendor);
+        QTreeWidgetItem*& folder = vendors[vendor];
+        if (!folder) {
+            folder = new QTreeWidgetItem(pluginsTop, QStringList{vendor});
+            folder->setIcon(0, folderIcon);
+            folder->setFlags(folderFlags);
+        }
+        const QString name = QString::fromStdString(d.name);
+        auto* leaf = new QTreeWidgetItem(folder, QStringList{name});
+        leaf->setFlags(leafFlags);
+        leaf->setIcon(0, pluginIcon);
+        QStringList details{QString::fromLatin1(plugins::formatName(d.format)), vendor};
+        if (!d.category.empty()) details << QString::fromStdString(d.category);
+        if (!d.version.empty()) details << tr("version %1").arg(QString::fromStdString(d.version));
+        leaf->setToolTip(0, QStringLiteral("<b>%1</b><br>%2").arg(name.toHtmlEscaped(), details.join(QStringLiteral(" · ")).toHtmlEscaped()));
+        leaf->setData(0, kTypeRole, QString::fromStdString(plugins::pluginType(d)));
+        leaf->setData(0, kCategoryRole, int(EffectCategory::AudioFilter));
+        leaf->setData(0, kSearchRole, QStringList{name, vendor, QString::fromStdString(d.category), tr("plugin")}.join(' '));
+    }
+    if (pluginsTop) pluginsTop->setExpanded(true);
     if (!activeFilter_.isEmpty()) {
         const QString filter = activeFilter_;
         activeFilter_.clear();

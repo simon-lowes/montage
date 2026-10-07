@@ -88,6 +88,7 @@ private:
     void newSequence();
     void openInSource(Id media);
     void applyFromBrowser(const QString& type, EffectCategory category);
+    void scanPluginsInBackground();
     void showShortcuts();
     void about();
 

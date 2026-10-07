@@ -19,6 +19,7 @@
 #include "EditorState.h"
 #include "Theme.h"
 #include "ThumbnailCache.h"
+#include "audio/PluginEffect.h"
 #include "core/Effects.h"
 #include "media/MediaPool.h"
 
@@ -1230,26 +1231,37 @@ void TimelineWidget::dropEffect(const QString& typeQ, const QPoint& pos) {
     const Sequence* s = state_->sequence();
     std::string type = typeQ.toStdString();
     const EffectInfo* info = findEffectInfo(type);
-    if (!info || !s) return;
+    const bool plugin = plugins::isPluginType(type);
+    if ((!info && !plugin) || !s) return;
+    const EffectCategory category = plugin ? EffectCategory::AudioFilter : info->category;
+    const QString name = QString::fromStdString(plugins::effectTypeName(type));
     Hit h = hitTest(pos);
     auto row = rowAt(pos.y());
-    switch (info->category) {
+    switch (category) {
         case EffectCategory::VideoFilter:
         case EffectCategory::AudioFilter: {
             if (!h.clip) return;
             auto loc = edit::locate(*s, h.clip);
-            bool wantVideo = info->category == EffectCategory::VideoFilter;
+            bool wantVideo = category == EffectCategory::VideoFilter;
             if (!loc || (loc->track.kind == TrackKind::Video) != wantVideo) {
                 state_->message(wantVideo ? tr("Drop video effects onto video clips") : tr("Drop audio effects onto audio clips"));
                 return;
             }
             Id id = h.clip;
-            state_->edit(tr("Add %1").arg(QString::fromStdString(info->displayName)), [id, type](Project& p, Sequence& sq) {
+            QString error;
+            state_->edit(tr("Add %1").arg(name), [id, type, &error](Project& p, Sequence& sq) {
                 Clip* c = edit::clipById(sq, id);
                 if (!c) return false;
-                c->effects.push_back(makeEffect(p, type));
+                std::string err;
+                auto e = plugins::makeEffectOfType(p, type, &err);
+                if (!e) {
+                    error = QString::fromStdString(err);
+                    return false;
+                }
+                c->effects.push_back(*e);
                 return true;
             });
+            if (!error.isEmpty()) state_->message(tr("Could not load %1: %2").arg(name, error));
             state_->setSelection({id}, false);
             break;
         }
