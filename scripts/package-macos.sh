@@ -39,20 +39,24 @@ rm -f "$APP/Contents/PlugIns/imageformats/libqsvg.dylib" "$APP/Contents/PlugIns/
 # Every library the bundle loads must be inside it: nothing from Homebrew (or
 # the app only works on this machine) and no bundle-relative path that is
 # missing. (A library's own install name is listed too but is not loaded.)
-problems=$(find "$APP" -type f \( -perm -u+x -o -name '*.dylib' \) | while read -r f; do
-  id=$(otool -D "$f" 2>/dev/null | sed -n 2p)
-  otool -L "$f" 2>/dev/null | sed 1d | awk '{print $1}' | while read -r dep; do
-    [ "$dep" = "$id" ] && continue
-    case "$dep" in
-      /opt/homebrew/* | /usr/local/*) echo "$f -> $dep (outside the bundle)"; continue ;;
-      @executable_path/*) p="$APP/Contents/MacOS/${dep#@executable_path/}" ;;
-      @loader_path/*) p="$(dirname "$f")/${dep#@loader_path/}" ;;
-      @rpath/*) p="$APP/Contents/Frameworks/${dep#@rpath/}" ;;
-      *) continue ;;
-    esac
-    [ -e "$p" ] || echo "$f -> $dep (missing)"
+# (A function: macOS's bash 3.2 cannot parse a case statement inside $(...).)
+unresolved_libraries() {
+  find "$APP" -type f \( -perm -u+x -o -name '*.dylib' \) | while read -r f; do
+    id=$(otool -D "$f" 2>/dev/null | sed -n 2p)
+    otool -L "$f" 2>/dev/null | sed 1d | awk '{print $1}' | while read -r dep; do
+      [ "$dep" = "$id" ] && continue
+      case "$dep" in
+        /opt/homebrew/* | /usr/local/*) echo "$f -> $dep (outside the bundle)"; continue ;;
+        @executable_path/*) p="$APP/Contents/MacOS/${dep#@executable_path/}" ;;
+        @loader_path/*) p="$(dirname "$f")/${dep#@loader_path/}" ;;
+        @rpath/*) p="$APP/Contents/Frameworks/${dep#@rpath/}" ;;
+        *) continue ;;
+      esac
+      [ -e "$p" ] || echo "$f -> $dep (missing)"
+    done
   done
-done)
+}
+problems=$(unresolved_libraries)
 if [ -n "$problems" ]; then
   echo "Bundle libraries do not resolve:" >&2
   echo "$problems" | sort -u >&2
