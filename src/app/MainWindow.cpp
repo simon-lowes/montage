@@ -12,7 +12,11 @@
 #include <QHeaderView>
 #include <QInputDialog>
 #include <QLabel>
+#include <QFutureWatcher>
 #include <QMenuBar>
+#include <QPointer>
+#include <QProgressDialog>
+#include <QtConcurrent>
 #include <QMessageBox>
 #include <QScreen>
 #include <QSettings>
@@ -35,6 +39,7 @@
 #include "SequenceSettingsDialog.h"
 #include "Theme.h"
 #include "core/Effects.h"
+#include "media/Analysis.h"
 #include "media/MediaPool.h"
 #include "render/Exporter.h"
 
@@ -309,6 +314,7 @@ void MainWindow::buildMenus() {
         if (!ok || name.isEmpty()) return;
         state_->apply(tr("Nest"), [sel, name](Project& p, Sequence& s) { return edit::makeCompound(p, s, sel, name.toStdString()); });
     });
+    add(clipM, tr("Detect &Scene Cuts"), QKeySequence(), [this] { detectScenes(); });
     clipM->addSeparator();
     add(clipM, tr("&Insert from Source"), QKeySequence(Qt::Key_Comma), [this] { state_->insertFromSource(false); });
     add(clipM, tr("&Overwrite from Source"), QKeySequence(Qt::Key_Period), [this] { state_->insertFromSource(true); });
@@ -852,6 +858,73 @@ void MainWindow::markClip() {
     if (!c) return;
     state_->setInPoint(c->start);
     state_->setOutPoint(c->end() - 1);
+}
+
+void MainWindow::detectScenes() {
+    const Clip* c = state_->primaryClip();
+    const Sequence* s = state_->sequence();
+    const MediaItem* m = c ? state_->project().findMedia(c->mediaId) : nullptr;
+    if (!m || m->kind != MediaKind::Video || !s) {
+        state_->message(tr("Select a video clip to detect scene cuts in"));
+        return;
+    }
+    const Id clipId = c->id;
+    const std::string path = m->path;
+    auto* dlg = new QProgressDialog(tr("Detecting scene cuts in %1...").arg(QString::fromStdString(m->name)), tr("Cancel"), 0, 1000, this);
+    dlg->setWindowModality(Qt::WindowModal);
+    dlg->setMinimumDuration(300);
+    auto cancel = std::make_shared<std::atomic<bool>>(false);
+    connect(dlg, &QProgressDialog::canceled, this, [cancel] { *cancel = true; });
+    QPointer<QProgressDialog> guard(dlg);
+    auto* watcher = new QFutureWatcher<std::vector<double>>(this);
+    connect(watcher, &QFutureWatcher<std::vector<double>>::finished, this, [this, watcher, dlg, clipId, cancel] {
+        std::vector<double> cuts = watcher->result();
+        dlg->close();
+        dlg->deleteLater();
+        watcher->deleteLater();
+        if (*cancel) return;
+        int made = 0;
+        state_->apply(tr("Detect Scene Cuts"), [&](Project& p, Sequence& sq) {
+            const Clip* clip = edit::clipById(sq, clipId);
+            if (!clip) return edit::Result::fail("The clip is gone");
+            // Map source times to timeline frames inside the clip.
+            std::vector<FrameTime> frames;
+            for (double sec : cuts) {
+                double src = sec * sq.fpsValue();
+                double local = (src - clip->sourceIn) / clip->speed;
+                if (clip->reverse) local = double(clip->duration) - local;
+                FrameTime f = clip->start + FrameTime(std::llround(local));
+                if (f > clip->start && f < clip->end()) frames.push_back(f);
+            }
+            std::vector<TrackRef> tracks;
+            for (Id l : edit::linkedClips(sq, clipId))
+                if (auto loc = edit::locate(sq, l)) tracks.push_back(loc->track);
+            for (FrameTime f : frames) {
+                std::map<Id, Id> regroup;
+                for (TrackRef t : tracks) {
+                    const Clip* under = edit::clipAt(sq, t, f);
+                    Id group = under ? under->linkGroup : 0;
+                    auto r = edit::razor(p, sq, t, f);
+                    if (r.ok && group && !r.created.empty()) {
+                        auto it = regroup.find(group);
+                        if (it == regroup.end()) it = regroup.emplace(group, p.newId()).first;
+                        if (Clip* rc = edit::clipById(sq, r.created[0])) rc->linkGroup = it->second;
+                    }
+                }
+                ++made;
+            }
+            if (!made) return edit::Result::fail("No scene cuts found in this clip");
+            return edit::Result{};
+        });
+        if (made) state_->message(tr("Cut the clip at %n scene change(s)", "", made), 5000);
+    });
+    watcher->setFuture(QtConcurrent::run([path, cancel, guard] {
+        return detectSceneCuts(path, 0.5, [guard](double f) {
+            QMetaObject::invokeMethod(qApp, [guard, f] {
+                if (guard) guard->setValue(int(f * 1000));
+            }, Qt::QueuedConnection);
+        }, cancel.get());
+    }));
 }
 
 void MainWindow::addTitle() {

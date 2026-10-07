@@ -1,6 +1,14 @@
 #include "MediaBinWidget.h"
 
+#include <QCryptographicHash>
+#include <QApplication>
 #include <QDesktopServices>
+#include <QPointer>
+#include <QDir>
+#include <QFutureWatcher>
+#include <QProgressDialog>
+#include <QStandardPaths>
+#include <QtConcurrent>
 #include <QDragEnterEvent>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -19,6 +27,7 @@
 #include "EditorState.h"
 #include "Theme.h"
 #include "ThumbnailCache.h"
+#include "media/Analysis.h"
 
 namespace montage {
 
@@ -266,6 +275,20 @@ void MediaBinWidget::showContextMenu(const QPoint& pos) {
             });
         });
     }
+    std::vector<Id> videos;
+    for (Id id : ids)
+        if (const MediaItem* m = state_->project().findMedia(id); m && m->kind == MediaKind::Video && m->hasVideo) videos.push_back(id);
+    if (!videos.empty()) {
+        menu.addSeparator();
+        menu.addAction(tr("Create Proxy Media"), this, [this, videos] { createProxies(videos); });
+        menu.addAction(tr("Detach Proxy Media"), this, [this, videos] {
+            state_->edit(tr("Detach Proxies"), [videos](Project& p, Sequence&) {
+                for (Id id : videos)
+                    if (MediaItem* m = p.findMedia(id)) m->proxyPath.clear();
+                return true;
+            });
+        });
+    }
     if (!ids.empty()) {
         menu.addSeparator();
         menu.addAction(tr("Remove from Project"), this, [this, ids] {
@@ -278,6 +301,67 @@ void MediaBinWidget::showContextMenu(const QPoint& pos) {
     menu.addSeparator();
     menu.addAction(tr("Import..."), this, &MediaBinWidget::importDialog);
     menu.exec(list_->viewport()->mapToGlobal(pos));
+}
+
+void MediaBinWidget::createProxies(const std::vector<Id>& ids) {
+    QString dir = QStandardPaths::writableLocation(QStandardPaths::CacheLocation) + "/proxies";
+    QDir().mkpath(dir);
+    struct Job {
+        Id id;
+        std::string src, dst;
+    };
+    std::vector<Job> jobs;
+    for (Id id : ids) {
+        const MediaItem* m = state_->project().findMedia(id);
+        if (!m) continue;
+        QByteArray hash = QCryptographicHash::hash(QByteArray::fromStdString(m->path), QCryptographicHash::Sha1).toHex().left(16);
+        jobs.push_back({id, m->path, (dir + "/" + QString::fromLatin1(hash) + "_proxy.mp4").toStdString()});
+    }
+    if (jobs.empty()) return;
+    auto* dlg = new QProgressDialog(tr("Creating proxy media..."), tr("Cancel"), 0, 1000, this);
+    dlg->setWindowModality(Qt::WindowModal);
+    dlg->setMinimumDuration(300);
+    auto cancel = std::make_shared<std::atomic<bool>>(false);
+    connect(dlg, &QProgressDialog::canceled, this, [cancel] { *cancel = true; });
+    auto* watcher = new QFutureWatcher<QStringList>(this);
+    connect(watcher, &QFutureWatcher<QStringList>::finished, this, [this, watcher, dlg, jobs] {
+        QStringList errors = watcher->result();
+        dlg->close();
+        dlg->deleteLater();
+        watcher->deleteLater();
+        // Attach the proxies that were written.
+        state_->edit(tr("Attach Proxies"), [jobs](Project& p, Sequence&) {
+            bool any = false;
+            for (const auto& j : jobs)
+                if (QFileInfo::exists(QString::fromStdString(j.dst)))
+                    if (MediaItem* m = p.findMedia(j.id)) {
+                        m->proxyPath = j.dst;
+                        any = true;
+                    }
+            return any;
+        });
+        if (!errors.isEmpty()) QMessageBox::warning(this, tr("Proxy Media"), errors.join("\n"));
+        else state_->message(tr("Proxy media ready — toggle \"Proxy\" in the Program monitor to use it"), 6000);
+    });
+    QPointer<QProgressDialog> guard(dlg);
+    watcher->setFuture(QtConcurrent::run([jobs, cancel, guard]() {
+        QStringList errors;
+        for (size_t i = 0; i < jobs.size(); ++i) {
+            std::string err;
+            auto progress = [&](double f) {
+                int v = int((double(i) + f) / double(jobs.size()) * 1000);
+                QMetaObject::invokeMethod(qApp, [guard, v] {
+                    if (guard) guard->setValue(v);
+                }, Qt::QueuedConnection);
+            };
+            if (!createProxy(jobs[i].src, jobs[i].dst, 960, progress, cancel.get(), &err)) {
+                QFile::remove(QString::fromStdString(jobs[i].dst));
+                if (*cancel) break;
+                errors << QString::fromStdString(err);
+            }
+        }
+        return errors;
+    }));
 }
 
 }  // namespace montage

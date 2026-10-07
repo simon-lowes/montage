@@ -26,6 +26,7 @@ public:
         Id sequence = 0;
         FrameTime frame = 0;
         double scale = 1;
+        bool proxies = false;
     };
     void request(const Request& r) {
         {
@@ -53,6 +54,7 @@ private:
         if (!s) return;
         RenderOptions o;
         o.scale = r.scale;
+        o.useProxies = r.proxies;
         Image img = renderProgramFrame(*r.project, *s, r.frame, o);
         std::vector<uint8_t> rgba = toRgba8(img);
         QImage q(rgba.data(), img.width, img.height, img.width * 4, QImage::Format_RGBA8888);
@@ -174,12 +176,17 @@ void PlaybackController::setPreviewScale(double s) {
     requestFrame();
 }
 
+void PlaybackController::setUseProxies(bool on) {
+    useProxies_ = on;
+    requestFrame();
+}
+
 FrameTime PlaybackController::clampToSequence(FrameTime t) const { return std::max<FrameTime>(0, t); }
 
 void PlaybackController::requestFrame() {
     if (!sequence()) return;
     // Paused frames render at full quality; playback uses the preview scale.
-    worker_->request({project_, sequenceId_, position_, isPlaying() ? scale_ : 1.0});
+    worker_->request({project_, sequenceId_, position_, isPlaying() ? scale_ : 1.0, useProxies_});
 }
 
 void PlaybackController::seek(FrameTime t) {
@@ -274,7 +281,7 @@ void PlaybackController::tick() {
     }
     if (t != position_) {
         position_ = t;
-        worker_->request({project_, sequenceId_, t, scale_});
+        worker_->request({project_, sequenceId_, t, scale_, useProxies_});
         emit positionChanged(t);
     }
 }

@@ -14,6 +14,7 @@
 #include "core/Effects.h"
 #include "core/History.h"
 #include "core/ProjectIO.h"
+#include "media/Analysis.h"
 #include "media/Decoder.h"
 #include "render/Exporter.h"
 
@@ -33,7 +34,9 @@ int usage() {
                  "  montage-cli render <project.montage> -o <output> [--preset NAME] [--in TC] [--out TC]\n"
                  "                     [--width W] [--height H] [--crf N] [--vcodec C] [--acodec C] [--proxies]\n"
                  "  montage-cli frame <project.montage> --at TC -o <image.png>\n"
-                 "  montage-cli presets\n",
+                 "  montage-cli presets\n"
+                 "  montage-cli scenes <video> [--sensitivity 0..1]\n"
+                 "  montage-cli proxy <video> -o <proxy.mp4> [--width 960]\n",
                  MONTAGE_VERSION);
     return 2;
 }
@@ -256,6 +259,52 @@ int cmdFrame(const std::vector<std::string>& args) {
     return 0;
 }
 
+int cmdScenes(const std::vector<std::string>& args) {
+    if (args.empty()) return usage();
+    double sensitivity = 0.5;
+    for (size_t i = 1; i < args.size(); ++i)
+        if (args[i] == "--sensitivity" && i + 1 < args.size()) sensitivity = std::atof(args[++i].c_str());
+    MediaItem m;
+    std::string err;
+    if (!probeMedia(args[0], m, &err)) {
+        std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
+    }
+    Rational fps = m.fps.valid() ? m.fps : Rational{30, 1};
+    auto cuts = detectSceneCuts(args[0], sensitivity, {}, &gCancel, &err);
+    if (!err.empty()) {
+        std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
+    }
+    for (double t : cuts) std::printf("%s  %.3f s\n", formatTimecode(FrameTime(std::llround(t * fps.toDouble())), fps).c_str(), t);
+    std::fprintf(stderr, "%zu scene cut(s)\n", cuts.size());
+    return 0;
+}
+
+int cmdProxy(const std::vector<std::string>& args) {
+    if (args.empty()) return usage();
+    std::string out;
+    int width = 960;
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (args[i] == "-o" && i + 1 < args.size()) out = args[++i];
+        else if (args[i] == "--width" && i + 1 < args.size()) width = std::atoi(args[++i].c_str());
+        else return usage();
+    }
+    if (out.empty()) return usage();
+    std::string err;
+    bool ok = createProxy(args[0], out, width, [](double f) {
+        std::fprintf(stderr, "\rProxy... %5.1f%%", f * 100.0);
+        std::fflush(stderr);
+    }, &gCancel, &err);
+    std::fprintf(stderr, "\n");
+    if (!ok) {
+        std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
+    }
+    std::printf("Wrote %s\n", out.c_str());
+    return 0;
+}
+
 int cmdPresets() {
     for (const auto& p : exportPresets())
         std::printf("%-28s .%-5s %s\n", p.name.c_str(), p.extension.c_str(), p.description.c_str());
@@ -277,6 +326,8 @@ int main(int argc, char** argv) {
     if (cmd == "render") return cmdRender(args);
     if (cmd == "frame") return cmdFrame(args);
     if (cmd == "presets") return cmdPresets();
+    if (cmd == "scenes") return cmdScenes(args);
+    if (cmd == "proxy") return cmdProxy(args);
     if (cmd == "--version" || cmd == "version") {
         std::printf("Montage %s\n", MONTAGE_VERSION);
         return 0;

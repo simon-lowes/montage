@@ -107,6 +107,10 @@ FrameTime snap(const std::vector<FrameTime>& points, FrameTime frame, FrameTime 
 FrameTime nextEdit(const Sequence& s, FrameTime frame);
 FrameTime prevEdit(const Sequence& s, FrameTime frame);
 
+// Adopts the media's frame size and rate if the sequence is still empty
+// (like "match sequence settings to clip"). Returns true if anything changed.
+bool matchSequenceToMedia(Sequence& s, const MediaItem& m);
+
 // ---- Nesting --------------------------------------------------------------------------
 // Moves the clips into a new sequence and replaces them with a compound clip.
 Result makeCompound(Project& p, Sequence& s, const std::vector<Id>& ids, const std::string& name);

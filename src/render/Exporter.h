@@ -17,6 +17,7 @@ struct ExportSettings {
     int width = 0;                       // 0 = sequence size
     int height = 0;
     int crf = 18;
+    int gop = 0;                         // keyframe interval in frames; 0 = 2 seconds
     int64_t videoBitrate = 0;            // bits/s; 0 = constant quality (crf)
     std::string preset = "medium";       // encoder speed preset
     std::string profile;                 // e.g. ProRes "hq" / "4444", DNxHR "dnxhr_hq"

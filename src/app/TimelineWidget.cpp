@@ -1163,11 +1163,14 @@ void TimelineWidget::dropMedia(const QMimeData* mime, const QPoint& pos, bool in
     int vt = row && row->ref.kind == TrackKind::Video ? row->ref.index : state_->targetVideoTrack();
     int at = row && row->ref.kind == TrackKind::Audio ? row->ref.index : state_->targetAudioTrack();
     std::vector<Id> created;
+    QString matched;
     state_->apply(insertMode ? tr("Insert") : tr("Overwrite"), [&](Project& p, Sequence& sq) {
         FrameTime f = start;
         edit::Result last = edit::Result::fail("Nothing to place");
         TrackRef v{TrackKind::Video, std::min(vt, int(sq.videoTracks.size()) - 1)};
         TrackRef a{TrackKind::Audio, std::min(at, int(sq.audioTracks.size()) - 1)};
+        if (const MediaItem* first = p.findMedia(refs.front().id); first && edit::matchSequenceToMedia(sq, *first))
+            matched = QString::fromStdString(first->name);
         for (const auto& r : refs) {
             const MediaItem* m = p.findMedia(r.id);
             if (!m) continue;
@@ -1191,6 +1194,8 @@ void TimelineWidget::dropMedia(const QMimeData* mime, const QPoint& pos, bool in
         return last;
     });
     if (!created.empty()) state_->setSelection(created);
+    if (!matched.isEmpty() && !created.empty())
+        state_->message(tr("Sequence settings changed to match %1").arg(matched), 6000);
 }
 
 void TimelineWidget::dropEffect(const QString& typeQ, const QPoint& pos) {

@@ -164,7 +164,8 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
         o.vctx->framerate = fps;
         o.vctx->sample_aspect_ratio = AVRational{1, 1};
         o.vctx->pix_fmt = defaultPixFmt(s, codec);
-        o.vctx->gop_size = std::max(1, int(std::lround(seq.fpsValue() * 2)));
+        o.vctx->gop_size = s.gop > 0 ? s.gop : std::max(1, int(std::lround(seq.fpsValue() * 2)));
+        if (s.gop == 1) o.vctx->max_b_frames = 0;
         o.vctx->color_primaries = AVCOL_PRI_BT709;
         o.vctx->color_trc = AVCOL_TRC_BT709;
         o.vctx->colorspace = AVCOL_SPC_BT709;

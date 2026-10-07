@@ -6,6 +6,7 @@
 
 #include "core/EditOps.h"
 #include "core/Effects.h"
+#include "media/Analysis.h"
 #include "media/Decoder.h"
 #include "media/MediaPool.h"
 #include "render/Compositor.h"
@@ -203,6 +204,66 @@ private slots:
         Image img = renderProgramFrame(p, s, 40, o);  // source frame 20
         float red = img.at(80, 45)[0];
         QVERIFY2(std::fabs(red - 20 / 29.0f) < 0.04f, qPrintable(QString::number(red)));
+    }
+
+    void sceneDetectionAndProxies() {
+        // Three shots: 1 s red, 1 s blue (with a moving title), 1 s bars.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320;
+        s.height = 180;
+        Clip a = makeGeneratorClip(p, "color", 30);
+        a.generator.params["color.r"] = 0.9;
+        Clip b = makeGeneratorClip(p, "color", 30);
+        b.start = 30;
+        b.generator.params["color.b"] = 0.9;
+        Clip c = makeGeneratorClip(p, "bars", 30);
+        c.start = 60;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, a);
+        edit::overwrite(p, s, {TrackKind::Video, 0}, b);
+        edit::overwrite(p, s, {TrackKind::Video, 0}, c);
+        Clip t = makeGeneratorClip(p, "title", 30);
+        t.start = 30;
+        t.generator.params["size"] = 24.0;
+        t.generator.params["pos_x"].addKey(0, -100);
+        t.generator.params["pos_x"].addKey(29, 100);
+        edit::overwrite(p, s, {TrackKind::Video, 1}, t);
+        ExportSettings st;
+        st.path = path("shots.mp4");
+        st.audioCodec = "none";
+        st.preset = "ultrafast";
+        std::string err;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        auto cuts = detectSceneCuts(st.path, 0.5, nullptr, nullptr, &err);
+        QCOMPARE(cuts.size(), size_t(2));
+        QVERIFY(std::fabs(cuts[0] - 1.0) < 0.05);
+        QVERIFY(std::fabs(cuts[1] - 2.0) < 0.05);
+        // Proxy: smaller, intra-coded, same length.
+        std::string proxy = path("shots_proxy.mp4");
+        QVERIFY2(createProxy(st.path, proxy, 160, nullptr, nullptr, &err), err.c_str());
+        Project q;
+        MediaItem pm = probeOrFail(q, proxy);
+        QCOMPARE(pm.width, 160);
+        QCOMPARE(pm.height, 90);
+        QVERIFY(!pm.hasAudio);
+        QVERIFY(std::fabs(pm.duration - 3.0) < 0.1);
+        // Rendering with proxies uses the proxy file but keeps the clip geometry.
+        MediaItem src = probeOrFail(p, st.path);
+        src.proxyPath = proxy;
+        p.media.push_back(src);
+        Sequence& s2 = p.sequences.emplace_back(makeSequence(p, "Proxy test", 320, 180, {30, 1}));
+        edit::placeMedia(p, s2, src.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        RenderOptions ro;
+        ro.useProxies = true;
+        Image img = renderProgramFrame(p, s2, 45, ro);
+        QCOMPARE(img.width, 320);
+        QVERIFY(img.at(10, 170)[2] > 0.6f);  // blue shot
+        // Matching an empty sequence to a clip adopts its size and rate.
+        Sequence empty = makeSequence(p, "Empty", 1920, 1080, {25, 1});
+        QVERIFY(edit::matchSequenceToMedia(empty, src));
+        QCOMPARE(empty.width, 320);
+        QCOMPARE(empty.fps.toDouble(), 30.0);
+        QVERIFY(!edit::matchSequenceToMedia(s2, src));  // not empty
     }
 
     void exportAudioAndIntermediates() {

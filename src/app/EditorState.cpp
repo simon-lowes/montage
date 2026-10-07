@@ -342,7 +342,9 @@ bool EditorState::insertFromSource(bool overwriteMode) {
     TrackRef vt{TrackKind::Video, std::min(targetVideo_, int(s->videoTracks.size()) - 1)};
     TrackRef at_{TrackKind::Audio, std::min(targetAudio_, int(s->audioTracks.size()) - 1)};
     std::vector<Id> created;
+    bool matched = false;
     bool ok = apply(overwriteMode ? tr("Overwrite") : tr("Insert"), [&](Project& p, Sequence& sq) {
+        matched = edit::matchSequenceToMedia(sq, *m);
         auto r = edit::placeMedia(p, sq, m->id, at, in, out, vt, at_, !overwriteMode);
         created = r.created;
         return r;
@@ -350,6 +352,7 @@ bool EditorState::insertFromSource(bool overwriteMode) {
     if (ok && !created.empty()) {
         if (const Clip* c = edit::clipById(*sequence(), created.front())) setPlayhead(c->end());
         setSelection(created);
+        if (matched) message(tr("Sequence settings changed to match %1").arg(QString::fromStdString(m->name)), 6000);
     }
     return ok;
 }

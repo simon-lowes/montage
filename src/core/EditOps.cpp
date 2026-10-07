@@ -965,6 +965,23 @@ FrameTime prevEdit(const Sequence& s, FrameTime frame) {
     return best < 0 ? 0 : best;
 }
 
+bool matchSequenceToMedia(Sequence& s, const MediaItem& m) {
+    if (s.duration() > 0 || m.kind != MediaKind::Video || !m.hasVideo) return false;
+    if (m.width <= 0 || m.height <= 0) return false;
+    bool changed = false;
+    int w = m.width + (m.width & 1), h = m.height + (m.height & 1);
+    if (s.width != w || s.height != h) {
+        s.width = w;
+        s.height = h;
+        changed = true;
+    }
+    if (m.fps.valid() && m.fps.toDouble() >= 1 && m.fps.toDouble() <= 240 && !(s.fps == m.fps)) {
+        s.fps = m.fps;
+        changed = true;
+    }
+    return changed;
+}
+
 // ---------------------------------------------------------------------------
 // Nesting
 

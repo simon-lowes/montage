@@ -79,6 +79,7 @@ private:
     void addMarker();
     void jumpMarker(bool forward);
     void markClip();
+    void detectScenes();
     void addTitle();
     void newSequence();
     void openInSource(Id media);

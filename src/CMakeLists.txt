@@ -7,6 +7,7 @@ add_library(montage_engine STATIC
   media/Image.h media/Image.cpp
   media/Decoder.h media/Decoder.cpp
   media/MediaPool.h media/MediaPool.cpp
+  media/Analysis.h media/Analysis.cpp
   render/Processing.h render/Processing.cpp
   render/Compositor.h render/Compositor.cpp
   render/Exporter.h render/Exporter.cpp

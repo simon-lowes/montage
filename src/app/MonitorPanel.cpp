@@ -212,8 +212,11 @@ MonitorPanel::MonitorPanel(Mode mode, EditorState* state, PlaybackController* co
         auto* loop = tool(this, tr("Loop"), tr("Loop playback between In and Out"));
         loop->setCheckable(true);
         auto* still = tool(this, QString(), tr("Export Frame..."), "save");
+        auto* proxy = tool(this, tr("Proxy"), tr("Play back with proxy media where available (exports always use originals)"));
+        proxy->setCheckable(true);
         bar->addSpacing(8);
-        for (QToolButton* b : {lift, extract, safe, loop, still}) bar->addWidget(b);
+        for (QToolButton* b : {lift, extract, safe, loop, proxy, still}) bar->addWidget(b);
+        connect(proxy, &QToolButton::toggled, this, [this](bool on) { controller_->setUseProxies(on); });
         connect(lift, &QToolButton::clicked, this, [this] {
             const Sequence* s = state_->sequence();
             if (!s) return;

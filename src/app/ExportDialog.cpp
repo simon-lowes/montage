@@ -319,9 +319,9 @@ bool ExportDialog::rangeFrames(FrameTime& in, FrameTime& out) const {
     in = 0;
     out = seq ? seq->duration() : 0;
     if (seq && rangeIsInOut()) {
-        // Same convention as montage-cli: the Out point is exclusive.
+        // In / Out marks are inclusive; the export range end is exclusive.
         if (seq->inPoint >= 0) in = seq->inPoint;
-        if (seq->outPoint >= 0) out = seq->outPoint;
+        if (seq->outPoint >= 0) out = seq->outPoint + 1;
     }
     return out > in;
 }
