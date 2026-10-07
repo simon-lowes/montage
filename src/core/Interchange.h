@@ -40,4 +40,12 @@ ImportResult importOtio(Project& p, const std::string& json, const MediaProber& 
 ImportResult importEdl(Project& p, const std::string& text, Rational fps, const MediaProber& probe = {},
                        const std::string& mediaDir = {});
 
+// Final Cut Pro 7 XML (xmeml 5), which Premiere Pro and Resolve read and write.
+std::string exportFcp7Xml(const Project& p, const Sequence& s);
+// FCPXML 1.10 for Final Cut Pro: V1 as the primary storyline, other tracks
+// as connected clips, dissolves, titles, speed changes and markers.
+std::string exportFcpXml(const Project& p, const Sequence& s);
+// Either XML flavour (told apart by the root element).
+ImportResult importXmlTimeline(Project& p, const std::string& xml, const MediaProber& probe = {});
+
 }  // namespace montage

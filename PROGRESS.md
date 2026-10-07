@@ -143,5 +143,12 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
   - The Inspector's Time Remapping section keeps linked sound in step. The timeline shows a "ramp" badge.
   - Reversed clips play at constant speed.
   - Tested: exact integrals for each interpolation, the inverse, continuity across splits and in-point trims, round trip; slow motion of a moving square (nearest, blend shows two copies, flow moves one square into place); and linked sound in the app.
-- [ ] 19. Interchange round trip: OTIO import, EDL import, FCP7 XML and FCPXML (L)
+- [x] 19. Interchange round trip: OTIO import, EDL import, FCP7 XML and FCPXML (L):
+  - Import (File > Import Timeline, `montage-cli import`) of OTIO, CMX 3600 EDL, Final Cut Pro 7 XML (xmeml 4/5, as Premiere and Resolve write it) and FCPXML (1.8 to 1.11, and .fcpxmld bundles). Each becomes a new sequence in one undo step:
+    - media are found by path and probed, project media are reused, and missing files come in offline and are reported;
+    - picture and sound are linked again;
+    - dissolves are centred on the cut; speed, reverse, titles, solid mattes and markers come across.
+  - Export of FCP 7 XML (clipitems with -1 edges around dissolves, Time Remap speed, links, files described once) and FCPXML 1.10 (V1 as the primary storyline, other tracks as connected clips in lanes, gaps, Cross Dissolve, Basic Title, timeMap speed, markers), beside EDL and OTIO.
+  - Tested: each of our four exports reads back to the same timeline, plus files written in the style of Resolve (OTIO), Premiere (EDL and FCP 7 XML) and Final Cut (FCPXML with a timecode start, a connected title and audio, and a marker).
+  - Still to do: compound and multicam clips from Final Cut (reported, not imported), and AAF.
 - [ ] 20. AI object masks with SAM 2 (XL)

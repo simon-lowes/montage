@@ -110,7 +110,9 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
   - Edit, add, split, merge and delete captions in the Captions panel. You can also set the font, size, colours, background box, outline and position.
   - Import SubRip or WebVTT files. Export SubRip, WebVTT or Scenarist SCC (CEA-608 broadcast captions).
   - The CC button shows captions in the Program monitor. When exporting, captions can be burned into the picture, embedded as a subtitle track (mov_text in MP4/MOV, SubRip in MKV, WebVTT in WebM, with the track's language), or both.
-- Interchange: CMX 3600 EDL and OpenTimelineIO (`.otio`) export, for finishing in Resolve, Premiere, Avid or Nuke
+- Interchange both ways with Premiere Pro, DaVinci Resolve, Final Cut Pro, Avid and Nuke:
+  - Final Cut Pro 7 XML, FCPXML, OpenTimelineIO and CMX 3600 EDL.
+  - Imported timelines find their media (missing files come in offline) and keep links, dissolves, speed changes, titles and markers.
 - Project files are readable JSON (`.montage`) and relink moved media through relative paths
 - Crash safety:
   - Unsaved work is saved to a recovery copy about a second after each edit. After a crash or forced quit, the next launch offers to recover it.
@@ -187,6 +189,9 @@ montage-cli proxy a.mov -o a_proxy.mp4 --width 960
 montage-cli loudness mix.wav                                 # integrated LUFS and peak
 montage-cli edl cut.montage -o cut.edl                       # CMX 3600 EDL
 montage-cli otio cut.montage -o cut.otio                     # OpenTimelineIO
+montage-cli xml cut.montage -o cut.xml                       # Final Cut Pro 7 XML (Premiere, Resolve)
+montage-cli fcpxml cut.montage -o cut.fcpxml                 # FCPXML (Final Cut Pro)
+montage-cli import edit.fcpxml -o edit.montage               # FCP XML, FCPXML, OTIO or EDL into a project
 montage-cli presets
 montage-cli models                                           # speech models and where they go
 montage-cli transcribe interview.mp4 --model base.en --srt interview.srt --vtt interview.vtt
@@ -221,4 +226,4 @@ Notes on the design:
 
 ## Roadmap
 
-Phase 2 is ranked in [`docs/research/phase2-roadmap.md`](docs/research/phase2-roadmap.md) and tracked in [`PROGRESS.md`](PROGRESS.md). Next up: FCP XML / FCPXML / OTIO interchange, AI object masks, and a GPU compositor.
+Phase 2 is ranked in [`docs/research/phase2-roadmap.md`](docs/research/phase2-roadmap.md) and tracked in [`PROGRESS.md`](PROGRESS.md). Next up: AI object masks (SAM 2) and a GPU compositor.

@@ -56,7 +56,9 @@ int usage() {
                  "  montage-cli loudness <media>\n"
                  "  montage-cli edl <project.montage> [-o out.edl]\n"
                  "  montage-cli otio <project.montage> [-o out.otio]\n"
-                 "  montage-cli import <timeline.otio|.edl> -o <project.montage> [--fps N]\n"
+                 "  montage-cli xml <project.montage> [-o out.xml]       (Final Cut Pro 7 XML)\n"
+                 "  montage-cli fcpxml <project.montage> [-o out.fcpxml]\n"
+                 "  montage-cli import <timeline.xml|.fcpxml|.otio|.edl> -o <project.montage> [--fps N]\n"
                  "  montage-cli bench <project.montage> [--scale 0.5] [--frames 120]\n"
                  "  montage-cli transcribe <media> [--model base.en|PATH] [--language auto|en|...] [--translate]\n"
                  "                     [--srt out.srt] [--vtt out.vtt] [--json out.json] [--txt out.txt]\n"
@@ -388,7 +390,7 @@ int cmdLoudness(const std::vector<std::string>& args) {
     return 0;
 }
 
-// montage-cli import <timeline.otio|.edl> -o project.montage [--fps N]
+// montage-cli import <timeline.xml|.fcpxml|.otio|.edl> -o project.montage [--fps N]
 int cmdImport(const std::vector<std::string>& args) {
     if (args.empty()) return usage();
     std::string in = args[0], out;
@@ -400,6 +402,7 @@ int cmdImport(const std::vector<std::string>& args) {
         } else return usage();
     }
     if (out.empty()) return usage();
+    if (std::filesystem::is_directory(in)) in += "/Info.fcpxml";  // an .fcpxmld bundle
     std::ifstream f(in, std::ios::binary);
     if (!f) {
         std::fprintf(stderr, "error: cannot read %s\n", in.c_str());
@@ -409,8 +412,10 @@ int cmdImport(const std::vector<std::string>& args) {
     Project p;
     p.name = std::filesystem::path(in).stem().string();
     const MediaProber prober = [](const std::string& file, MediaItem& m) { return probeMedia(file, m, nullptr); };
-    const bool edl = std::filesystem::path(in).extension() == ".edl";
-    ImportResult r = edl ? importEdl(p, text, fps, prober, std::filesystem::path(in).parent_path().string()) : importOtio(p, text, prober);
+    const std::string ext = std::filesystem::path(in).extension().string();
+    ImportResult r = ext == ".edl"                         ? importEdl(p, text, fps, prober, std::filesystem::path(in).parent_path().string())
+                     : ext == ".xml" || ext == ".fcpxml" ? importXmlTimeline(p, text, prober)
+                                                         : importOtio(p, text, prober);
     if (!r.ok) {
         std::fprintf(stderr, "error: %s\n", r.error.c_str());
         return 1;
@@ -425,14 +430,18 @@ int cmdImport(const std::vector<std::string>& args) {
     return 0;
 }
 
-int cmdInterchange(const std::vector<std::string>& args, bool otio) {
+int cmdInterchange(const std::vector<std::string>& args, const std::string& format) {
     if (args.empty()) return usage();
     std::string out;
     for (size_t i = 1; i < args.size(); ++i)
         if (args[i] == "-o" && i + 1 < args.size()) out = args[++i];
     Project p;
     if (!load(args[0], p)) return 1;
-    std::string text = otio ? exportOtio(p, *p.active()) : exportEdl(p, *p.active());
+    const Sequence& s = *p.active();
+    const std::string text = format == "otio"     ? exportOtio(p, s)
+                             : format == "xml"    ? exportFcp7Xml(p, s)
+                             : format == "fcpxml" ? exportFcpXml(p, s)
+                                                  : exportEdl(p, s);
     if (out.empty()) {
         std::fwrite(text.data(), 1, text.size(), stdout);
         return 0;
@@ -658,8 +667,7 @@ int main(int argc, char** argv) {
     if (cmd == "bench") return cmdBench(args);
     if (cmd == "captions") return cmdCaptions(args);
     if (cmd == "import") return cmdImport(args);
-    if (cmd == "edl") return cmdInterchange(args, false);
-    if (cmd == "otio") return cmdInterchange(args, true);
+    if (cmd == "edl" || cmd == "otio" || cmd == "xml" || cmd == "fcpxml") return cmdInterchange(args, cmd);
 #ifdef MONTAGE_WITH_WHISPER
     if (cmd == "transcribe") return cmdTranscribe(args);
     if (cmd == "models") return cmdModels();

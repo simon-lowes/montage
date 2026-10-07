@@ -87,7 +87,8 @@ private:
     void normalizeLoudness();
     void autoColor();
     void syncByAudio();
-    void exportInterchange(bool otio);
+    enum class Interchange { Edl, Otio, Fcp7Xml, FcpXml };
+    void exportInterchange(Interchange format);
     // Imports an OTIO, EDL or FCP XML timeline as a new sequence (one undo step).
     void importTimeline();
     void addTitle();

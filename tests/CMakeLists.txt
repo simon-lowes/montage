@@ -10,6 +10,7 @@ montage_test(test_core)
 montage_test(test_render)
 montage_test(test_media)
 target_compile_definitions(test_media PRIVATE MONTAGE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+target_compile_definitions(test_core PRIVATE MONTAGE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 
 if(MONTAGE_BUILD_APP)
   add_executable(test_app test_app.cpp)

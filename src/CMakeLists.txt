@@ -5,7 +5,7 @@ add_library(montage_engine STATIC
   core/TranscriptEdit.h core/TranscriptEdit.cpp
   core/Effects.h core/Effects.cpp
   core/EditOps.h core/EditOps.cpp
-  core/ImportBuilder.h core/InterchangeImport.cpp
+  core/ImportBuilder.h core/InterchangeImport.cpp core/FcpXml.cpp
   core/Multicam.h core/Multicam.cpp
   core/History.h core/History.cpp
   core/ProjectIO.h core/ProjectIO.cpp
@@ -53,7 +53,7 @@ if(MONTAGE_WITH_VST3)
   target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_VST3)
 endif()
 target_compile_definitions(montage_engine PUBLIC MONTAGE_VERSION="${PROJECT_VERSION}")
-target_link_libraries(montage_engine PUBLIC Qt6::Core Qt6::Gui PkgConfig::FFMPEG Threads::Threads ${CMAKE_DL_LIBS})
+target_link_libraries(montage_engine PUBLIC Qt6::Core Qt6::Gui Qt6::Xml PkgConfig::FFMPEG Threads::Threads ${CMAKE_DL_LIBS})
 if(APPLE)
   target_sources(montage_engine PRIVATE audio/AuHost.cpp)
   target_link_libraries(montage_engine PUBLIC "-framework AudioToolbox" "-framework CoreFoundation")

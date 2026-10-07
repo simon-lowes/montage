@@ -24,7 +24,7 @@ option(MONTAGE_WITH_RNNOISE "Voice isolation with RNNoise (BSD, fetched with its
 option(MONTAGE_WITH_LV2 "Host LV2 audio plugins, when lilv is installed" ON)
 option(MONTAGE_WITH_OCIO "OpenColorIO configs and ACES transforms, when OpenColorIO 2.1+ is installed" ON)
 
-find_package(Qt6 6.4 REQUIRED COMPONENTS Core Gui Concurrent)
+find_package(Qt6 6.4 REQUIRED COMPONENTS Core Gui Concurrent Xml)
 if(MONTAGE_BUILD_APP)
   find_package(Qt6 6.4 REQUIRED COMPONENTS Widgets Multimedia Network)
 endif()

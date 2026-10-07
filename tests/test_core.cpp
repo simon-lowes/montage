@@ -24,6 +24,11 @@ const TrackRef V2{TrackKind::Video, 1};
 const TrackRef A1{TrackKind::Audio, 0};
 
 // Project with one 30 fps sequence and a 10 s A/V media item (no file needed).
+std::string readData(const char* name) {
+    QFile f(QStringLiteral(MONTAGE_TEST_DATA_DIR "/") + name);
+    return f.open(QIODevice::ReadOnly) ? f.readAll().toStdString() : std::string();
+}
+
 struct Fixture {
     Project p = makeDefaultProject();
     Id media = 0;
@@ -1135,8 +1140,78 @@ private slots:
             QCOMPARE(p.findMedia(b.mediaId)->name, std::string("broll.mov"));
             QCOMPARE(b.sourceIn, 500.0 + 6);
         }
+        // Final Cut Pro 7 XML and FCPXML: our exports read back to the same timeline.
+        for (int flavour = 0; flavour < 2; ++flavour) {
+            Fixture fx;
+            interchangeFixture(fx);
+            const Sequence original = fx.s();
+            const std::string xml = flavour == 0 ? exportFcp7Xml(fx.p, original) : exportFcpXml(fx.p, original);
+            QVERIFY(xml.find(flavour == 0 ? "<xmeml version=\"5\">" : "<fcpxml version=\"1.10\">") != std::string::npos);
+            ImportResult r = importXmlTimeline(fx.p, xml);
+            QVERIFY2(r.ok, r.error.c_str());
+            const Sequence& back = *fx.p.findSequence(r.sequence);
+            QCOMPARE(back.fps, original.fps);
+            QCOMPARE(back.width, original.width);
+            QCOMPARE(fx.p.media.size(), size_t(1));
+            compareTimelines(original, back, true, 2);
+            QVERIFY(back.videoTracks[0].clips[0].linkGroup != 0);
+            QCOMPARE(back.videoTracks[0].clips[0].linkGroup, back.audioTracks[0].clips[0].linkGroup);
+            QCOMPARE(back.videoTracks[1].clips.at(0).generator.type, std::string("title"));
+            QCOMPARE(back.videoTracks[1].clips.at(0).generator.s("text"), std::string("Hello"));
+            QCOMPARE(back.markers.size(), size_t(1));
+            QCOMPARE(back.markers[0].t, FrameTime(10));
+        }
+        // FCPXML as Final Cut writes it: 29.97, a timecode start, a connected title and audio.
+        {
+            Project p = makeDefaultProject();
+            const std::string fcpxml = readData("interchange/final-cut.fcpxml");
+            ImportResult r = importXmlTimeline(p, fcpxml);
+            QVERIFY2(r.ok, r.error.c_str());
+            const Sequence& s = *p.findSequence(r.sequence);
+            QCOMPARE(s.name, std::string("Edit 3"));
+            QCOMPARE(s.fps, (Rational{30000, 1001}));
+            const Clip& v = s.videoTracks.at(0).clips.at(0);
+            QCOMPARE(v.start, FrameTime(0));
+            QCOMPARE(v.duration, FrameTime(150));
+            // The asset starts at timecode 01:00:00:00; 3603.6 s into it is 3.6 s into the file.
+            QVERIFY(std::fabs(v.sourceIn - 108) < 0.01);
+            QCOMPARE(s.audioTracks.at(0).clips.size(), size_t(1));  // the interview's own sound, linked
+            QCOMPARE(s.audioTracks[0].clips[0].linkGroup, v.linkGroup);
+            const Clip& title = s.videoTracks.at(1).clips.at(0);
+            QCOMPARE(title.start, FrameTime(3));  // 111111 - 108108 = 3003/30000 s = 3 frames into the clip
+            QCOMPARE(title.generator.s("text"), std::string("Jane Doe"));
+            const Clip& music = s.audioTracks.at(1).clips.at(0);
+            QCOMPARE(music.start, FrameTime(0));
+            QCOMPARE(s.markers.size(), size_t(1));
+            QCOMPARE(s.markers[0].t, FrameTime(12));
+            QCOMPARE(s.markers[0].name, std::string("Good line"));
+            QCOMPARE(r.offline.size(), size_t(2));
+        }
+        // FCP 7 XML as Premiere writes it: -1 edges around a dissolve, links, file references.
+        {
+            Project p = makeDefaultProject();
+            const std::string xmeml = readData("interchange/premiere.xml");
+            ImportResult r = importXmlTimeline(p, xmeml);
+            QVERIFY2(r.ok, r.error.c_str());
+            const Sequence& s = *p.findSequence(r.sequence);
+            QCOMPARE(s.fps, (Rational{25, 1}));
+            QCOMPARE(s.width, 1280);
+            const auto& v = s.videoTracks.at(0).clips;
+            QCOMPARE(v.size(), size_t(2));
+            QCOMPARE(v[0].start, FrameTime(0));
+            QCOMPARE(v[0].end(), FrameTime(110));  // cut in the middle of the dissolve
+            QCOMPARE(v[1].start, FrameTime(110));
+            QCOMPARE(v[1].sourceIn, 60.0);
+            QCOMPARE(s.videoTracks[0].transitions.size(), size_t(1));
+            QCOMPARE(s.videoTracks[0].transitions[0].duration, FrameTime(20));
+            QCOMPARE(v[0].mediaId, v[1].mediaId);  // one file, referenced twice
+            QVERIFY(v[0].linkGroup != 0);
+            QCOMPARE(s.audioTracks.at(0).clips.at(0).linkGroup, v[0].linkGroup);
+        }
         // Not a timeline.
         Project p = makeDefaultProject();
+        QVERIFY(!importXmlTimeline(p, "<html/>").ok);
+        QVERIFY(!importXmlTimeline(p, "not xml").ok);
         QVERIFY(!importOtio(p, "{}").ok);
         QVERIFY(!importEdl(p, "nothing here", {25, 1}).ok);
     }

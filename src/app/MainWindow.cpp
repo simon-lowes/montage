@@ -315,9 +315,11 @@ void MainWindow::buildMenus() {
     add(file, tr("&Import Media…"), QKeySequence("Ctrl+I"), [this] { bin_->importDialog(); });
     add(file, tr("&Export Media…"), QKeySequence("Ctrl+M"), [this] { exportMedia(); });
     add(file, tr("Export &Frame…"), QKeySequence("Ctrl+Shift+E"), [this] { exportFrame(); });
-    add(file, tr("&Import Timeline (OTIO, EDL)…"), QKeySequence(), [this] { importTimeline(); });
-    add(file, tr("Export E&DL (CMX 3600)…"), QKeySequence(), [this] { exportInterchange(false); });
-    add(file, tr("Export &OpenTimelineIO…"), QKeySequence(), [this] { exportInterchange(true); });
+    add(file, tr("&Import Timeline (FCP XML, FCPXML, OTIO, EDL)…"), QKeySequence(), [this] { importTimeline(); });
+    add(file, tr("Export Final Cut Pro &7 XML (Premiere, Resolve)…"), QKeySequence(), [this] { exportInterchange(Interchange::Fcp7Xml); });
+    add(file, tr("Export &FCPXML (Final Cut Pro)…"), QKeySequence(), [this] { exportInterchange(Interchange::FcpXml); });
+    add(file, tr("Export E&DL (CMX 3600)…"), QKeySequence(), [this] { exportInterchange(Interchange::Edl); });
+    add(file, tr("Export &OpenTimelineIO…"), QKeySequence(), [this] { exportInterchange(Interchange::Otio); });
     file->addSeparator();
     add(file, tr("&Quit"), QKeySequence::Quit, [this] { close(); });
 
@@ -1154,16 +1156,28 @@ void MainWindow::syncByAudio() {
     else state_->message(tr("Synchronized %n clip(s) to %1", "", int(moves.size())).arg(QString::fromStdString(ref->name)), 5000);
 }
 
-void MainWindow::exportInterchange(bool otio) {
+void MainWindow::exportInterchange(Interchange format) {
     const Sequence* s = state_->sequence();
     if (!s) return;
     QSettings st = appSettings();
-    QString ext = otio ? "otio" : "edl";
-    QString path = QFileDialog::getSaveFileName(this, otio ? tr("Export OpenTimelineIO") : tr("Export EDL"),
-                                                st.value("lastExportDir").toString() + "/" + QString::fromStdString(s->name) + "." + ext,
-                                                otio ? tr("OpenTimelineIO (*.otio)") : tr("CMX 3600 EDL (*.edl)"));
+    struct Kind {
+        const char* ext;
+        QString title, filter;
+    };
+    const Kind kinds[] = {{"edl", tr("Export EDL"), tr("CMX 3600 EDL (*.edl)")},
+                          {"otio", tr("Export OpenTimelineIO"), tr("OpenTimelineIO (*.otio)")},
+                          {"xml", tr("Export Final Cut Pro 7 XML"), tr("Final Cut Pro 7 XML (*.xml)")},
+                          {"fcpxml", tr("Export FCPXML"), tr("FCPXML (*.fcpxml)")}};
+    const Kind& k = kinds[int(format)];
+    QString path = QFileDialog::getSaveFileName(this, k.title,
+                                                st.value("lastExportDir").toString() + "/" + QString::fromStdString(s->name) + "." + k.ext,
+                                                k.filter);
     if (path.isEmpty()) return;
-    std::string text = otio ? exportOtio(state_->project(), *s) : exportEdl(state_->project(), *s);
+    const Project& pr = state_->project();
+    const std::string text = format == Interchange::Edl ? exportEdl(pr, *s)
+                             : format == Interchange::Otio ? exportOtio(pr, *s)
+                             : format == Interchange::Fcp7Xml ? exportFcp7Xml(pr, *s)
+                                                              : exportFcpXml(pr, *s);
     QFile f(path);
     if (!f.open(QIODevice::WriteOnly) || f.write(text.data(), qint64(text.size())) != qint64(text.size())) {
         QMessageBox::warning(this, tr("Export"), tr("Cannot write %1").arg(path));
@@ -1175,9 +1189,11 @@ void MainWindow::exportInterchange(bool otio) {
 
 void MainWindow::importTimeline() {
     QSettings st = appSettings();
-    const QString path = QFileDialog::getOpenFileName(this, tr("Import Timeline"), st.value("lastImportTimelineDir").toString(),
-                                                      tr("Timelines (*.otio *.edl);;OpenTimelineIO (*.otio);;CMX 3600 EDL (*.edl)"));
+    QString path = QFileDialog::getOpenFileName(this, tr("Import Timeline"), st.value("lastImportTimelineDir").toString(),
+                                                tr("Timelines (*.xml *.fcpxml *.otio *.edl);;Final Cut Pro 7 XML (*.xml);;"
+                                                   "FCPXML (*.fcpxml);;OpenTimelineIO (*.otio);;CMX 3600 EDL (*.edl)"));
     if (path.isEmpty()) return;
+    if (QFileInfo(path).isDir()) path += "/Info.fcpxml";  // an .fcpxmld bundle
     QFile f(path);
     if (!f.open(QIODevice::ReadOnly)) {
         QMessageBox::warning(this, tr("Import Timeline"), tr("Cannot read %1").arg(path));
@@ -1193,7 +1209,9 @@ void MainWindow::importTimeline() {
     ImportResult r;
     QApplication::setOverrideCursor(Qt::WaitCursor);
     state_->edit(tr("Import Timeline"), [&](Project& p, Sequence&) {
-        r = ext == "edl" ? importEdl(p, text, fps, prober, dir) : importOtio(p, text, prober);
+        r = ext == "edl"                      ? importEdl(p, text, fps, prober, dir)
+            : ext == "xml" || ext == "fcpxml" ? importXmlTimeline(p, text, prober)
+                                              : importOtio(p, text, prober);
         return r.ok;
     });
     QApplication::restoreOverrideCursor();
