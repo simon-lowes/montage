@@ -21,6 +21,7 @@ add_library(montage_engine STATIC
   audio/Plugins.h audio/PluginScan.cpp audio/ClapHost.cpp
   audio/DynLib.h audio/DynLib.cpp
   audio/PluginEffect.h audio/PluginEffect.cpp
+  audio/SpeechCleanup.h audio/SpeechCleanup.cpp
 )
 target_include_directories(montage_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(montage_engine PRIVATE ${PROJECT_SOURCE_DIR}/third_party/clap/include)
@@ -51,6 +52,11 @@ endif()
 target_compile_options(montage_engine PRIVATE
   $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wno-unused-parameter>)
 set_target_properties(montage_engine PROPERTIES AUTOMOC OFF)
+
+if(MONTAGE_WITH_RNNOISE)
+  target_link_libraries(montage_engine PRIVATE montage_rnnoise)
+  target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_RNNOISE)
+endif()
 
 # Without whisper the transcriber reports that speech recognition is unavailable.
 target_sources(montage_engine PRIVATE media/Transcriber.h media/Transcriber.cpp)

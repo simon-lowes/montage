@@ -66,7 +66,11 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
   - Sequence mode: the cut's words with the current one highlighted; click to seek; search, including a partly typed last word; delete words as a ripple delete across all tracks and caption tracks; remove filler words; shorten pauses.
   - Source mode: select words to set In and Out, then insert or overwrite them into the timeline.
   - Uncertain words are dotted and filler words dimmed.
-- [ ] 8. Dialogue denoise and voice isolation (M)
+- [x] 8. Dialogue denoise and voice isolation (M):
+  - **Noise Reduction**: spectral, with a noise print from the quietest tenth of the recording, gain smoothing over frequency and time, and adjustable reduction and sensitivity.
+  - **Voice Isolation**: RNNoise (Xiph, BSD), with its model fetched and pinned at configure time and its 20 ms delay compensated.
+  - Both process the whole source audio in the background with a cache, so there is no latency and seeking is free. Playback uses the original audio until the result is ready; exports wait for it.
+  - Tested on real speech plus noise: SNR 12.8 → 19.1 dB, pauses 14 dB quieter (Noise Reduction) and 84 dB quieter (Voice Isolation), with speech level kept.
 - [ ] 9. Shape masks and HSL qualifier (M)
 - [ ] 10. Plugin editor windows (L)
 - [ ] 11. Track and bus effect chains, delay compensation, offline plugin rendering (L)

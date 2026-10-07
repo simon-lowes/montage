@@ -7,6 +7,7 @@
 #include "core/EditOps.h"
 #include "core/Effects.h"
 #include "core/Transcript.h"
+#include "audio/SpeechCleanup.h"
 #include "media/Analysis.h"
 #include "media/AudioSync.h"
 #include "media/Decoder.h"
@@ -606,6 +607,119 @@ private slots:
         // caption at 2 s; FFmpeg's decoder shows it as soon as the line is read.
         for (const auto& e : events)
             if (e.text.contains("HELLO")) QVERIFY2(e.start > 1.4 && e.start < 2.05, qPrintable(QString::number(e.start)));
+    }
+
+    void noiseReductionAndVoiceIsolation() {
+        // Speech (the public-domain JFK clip) plus steady white noise at about -32 dBFS.
+        std::string err;
+        AudioBufferPtr clean = decodeAudio(MONTAGE_TEST_DATA_DIR "/jfk.wav", 48000, &err);
+        QVERIFY2(clean && clean->frames() > 48000 * 10, err.c_str());
+        AudioBuffer noisy = *clean;
+        uint32_t seed = 12345;
+        for (float& v : noisy.samples) {
+            seed = seed * 1664525u + 1013904223u;
+            v += (float(seed >> 8) / float(1 << 24) - 0.5f) * 0.08f;
+        }
+        auto rms = [](const AudioBuffer& b, double t0, double t1) {
+            double acc = 0;
+            const int64_t a = int64_t(t0 * b.sampleRate), z = int64_t(t1 * b.sampleRate);
+            for (int64_t i = a; i < z; ++i) acc += double(b.samples[size_t(i) * 2]) * b.samples[size_t(i) * 2];
+            return std::sqrt(acc / double(z - a));
+        };
+        // How well the result matches the clean speech: SNR in dB over the whole clip,
+        // at the best alignment within +/- 1000 samples (also reports that lag).
+        auto snr = [&](const AudioBuffer& b, int* lagOut) {
+            double best = -1e9;
+            int bestLag = 0;
+            const int64_t n = std::min(b.frames(), clean->frames());
+            for (int lag = -1000; lag <= 1000; lag += 4) {
+                double sig = 0, err2 = 0;
+                for (int64_t i = 2000; i < n - 2000; i += 3) {
+                    const double c = clean->samples[size_t(i) * 2], o = b.samples[size_t(i + lag) * 2];
+                    sig += c * c;
+                    err2 += (o - c) * (o - c);
+                }
+                const double v = 10 * std::log10(sig / std::max(err2, 1e-12));
+                if (v > best) best = v, bestLag = lag;
+            }
+            if (lagOut) *lagOut = bestLag;
+            return best;
+        };
+        int lag = 0;
+        const double snrIn = snr(noisy, &lag);
+        // The pause between "Americans" and "ask not" (about 2.2 s to 3.2 s) is noise only.
+        const double pauseIn = rms(noisy, 2.3, 3.1);
+
+        AudioBuffer denoised;
+        reduceNoise(noisy, denoised, 20, 50);
+        QCOMPARE(denoised.frames(), noisy.frames());
+        const double snrDenoise = snr(denoised, &lag);
+        const double pauseDenoise = rms(denoised, 2.3, 3.1);
+        qInfo("noise reduction: SNR %.1f -> %.1f dB, pause %.1f dB lower, lag %d", snrIn, snrDenoise,
+              20 * std::log10(pauseIn / pauseDenoise), lag);
+        QCOMPARE(lag, 0);
+        QVERIFY(pauseDenoise < pauseIn * std::pow(10.0, -12 / 20.0));  // noise down by 12 dB or more
+        QVERIFY(snrDenoise > snrIn + 4);                                // and the speech is still there
+
+        if (hasVoiceIsolation()) {
+            AudioBuffer isolated;
+            QVERIFY(isolateVoice(noisy, isolated, 100));
+            const double snrVoice = snr(isolated, &lag);
+            const double pauseVoice = rms(isolated, 2.3, 3.1);
+            qInfo("voice isolation: SNR %.1f -> %.1f dB, pause %.1f dB lower, lag %d", snrIn, snrVoice,
+                  20 * std::log10(pauseIn / pauseVoice), lag);
+            QVERIFY2(std::abs(lag) <= 8, "RNNoise delay is not compensated");
+            QVERIFY(pauseVoice < pauseIn * std::pow(10.0, -15 / 20.0));
+            // RNNoise also removes the crowd noise in the 1961 recording itself, so compare
+            // speech levels rather than waveforms: "And so my fellow Americans" keeps its level.
+            QVERIFY(snrVoice > snrIn);
+            const double speechClean = rms(*clean, 0.4, 2.0), speechVoice = rms(isolated, 0.4, 2.0);
+            QVERIFY2(std::fabs(20 * std::log10(speechVoice / speechClean)) < 4,
+                     qPrintable(QString::number(20 * std::log10(speechVoice / speechClean))));
+            // Amount 0 leaves the audio as it was.
+            QVERIFY(isolateVoice(noisy, isolated, 0));
+            QCOMPARE(isolated.samples.size(), noisy.samples.size());
+            QVERIFY(std::fabs(isolated.samples[48000] - noisy.samples[48000]) < 1e-5f);
+        }
+
+        // Through the mixer: an exported mix of a clip with Noise Reduction is cleaner.
+        const std::string noisyWav = path("noisy-speech.wav");
+        {
+            std::vector<int16_t> pcm(noisy.samples.size());
+            for (size_t i = 0; i < pcm.size(); ++i) pcm[i] = int16_t(std::lround(std::clamp(noisy.samples[i], -1.0f, 1.0f) * 32767));
+            FILE* f = std::fopen(noisyWav.c_str(), "wb");
+            QVERIFY(f);
+            const uint32_t bytes = uint32_t(pcm.size() * 2);
+            auto u32 = [&](uint32_t v) { std::fwrite(&v, 4, 1, f); };
+            auto u16 = [&](uint16_t v) { std::fwrite(&v, 2, 1, f); };
+            std::fwrite("RIFF", 1, 4, f);
+            u32(36 + bytes);
+            std::fwrite("WAVEfmt ", 1, 8, f);
+            u32(16), u16(1), u16(2), u32(48000), u32(48000 * 4), u16(4), u16(16);
+            std::fwrite("data", 1, 4, f);
+            u32(bytes);
+            std::fwrite(pcm.data(), 2, pcm.size(), f);
+            std::fclose(f);
+        }
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        MediaItem m = probeOrFail(p, noisyWav);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Effect fx;
+        fx.id = p.newId();
+        fx.type = "denoise";
+        fx.params["reduction_db"] = 20.0;
+        fx.params["sensitivity"] = 50.0;
+        s.audioTracks[0].clips[0].effects.push_back(fx);
+        ExportSettings st;
+        st.path = path("denoised-mix.wav");
+        st.videoCodec = "none";
+        st.audioCodec = "pcm_s16le";
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        AudioBufferPtr mixed = decodeAudio(st.path, 48000, &err);
+        QVERIFY(mixed);
+        QVERIFY2(rms(*mixed, 2.3, 3.1) < pauseIn * std::pow(10.0, -10 / 20.0), "the mixer did not apply Noise Reduction");
     }
 
     void importedVideoComposites() {

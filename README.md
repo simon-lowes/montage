@@ -40,6 +40,10 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Effects: 3-band EQ, compressor, limiter, high/low-pass, delay
 - Third-party audio plugins: VST3 and CLAP plugins run as clip effects. Their parameters are keyframeable and their settings are saved in the project. The Effects browser lists them by vendor, and Tools › Audio Plugins shows every plugin found and its status. LV2 and Audio Unit plugins are listed; hosting them is on the roadmap.
 - Plugin scanning works like a DAW's: new or changed plugins load in a separate helper process, so one that crashes or hangs is blocked instead of taking Montage down. Results are cached, so later launches are quick.
+- Dialogue cleanup (Effects › Audio Filters › Restoration):
+  - **Noise Reduction** learns the noise print from the quietest moments of the recording itself, then turns down hum, hiss and room tone by up to the amount you set.
+  - **Voice Isolation** uses RNNoise, a neural network from Xiph, to keep speech and remove everything else, mixed with the original by Amount.
+  - Both process the clip's whole source audio in the background and cache the result. Playback uses the original audio until the cleaned copy is ready (usually a few seconds); exports always wait for it.
 - Crossfades: equal power or constant gain
 - Loudness normalisation to -14, -16, -23 or -24 LUFS (ITU-R BS.1770 / EBU R128 gated measurement)
 - Waveforms on the timeline
@@ -177,4 +181,4 @@ Notes on the design:
 
 ## Roadmap
 
-Phase 2 is ranked in [`docs/research/phase2-roadmap.md`](docs/research/phase2-roadmap.md) and tracked in [`PROGRESS.md`](PROGRESS.md). Next up: dialogue denoise, masks, plugin editor windows, track and bus effect chains, Audio Unit and LV2 hosting, OCIO/ACES and HDR, multicam, a GPU compositor, tracking, optical-flow retiming and FCP XML interchange.
+Phase 2 is ranked in [`docs/research/phase2-roadmap.md`](docs/research/phase2-roadmap.md) and tracked in [`PROGRESS.md`](PROGRESS.md). Next up: masks, plugin editor windows, track and bus effect chains, Audio Unit and LV2 hosting, OCIO/ACES and HDR, multicam, a GPU compositor, tracking, optical-flow retiming and FCP XML interchange.

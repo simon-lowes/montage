@@ -10,6 +10,7 @@
 
 #include "Processing.h"
 #include "audio/PluginEffect.h"
+#include "audio/SpeechCleanup.h"
 #include "core/EditOps.h"
 #include "media/MediaPool.h"
 
@@ -677,6 +678,13 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
                 AudioBufferPtr buf = nonBlocking_ ? MediaPool::instance().audioIfReady(m->path, int(sr))
                                                   : MediaPool::instance().audio(m->path, int(sr));
                 if (!buf || buf->samples.empty()) continue;
+                // Noise reduction and voice isolation work on the whole source (the
+                // original plays until the cleaned copy is ready in real time).
+                std::vector<const Effect*> sourceFx;
+                for (const Effect& e : c.effects)
+                    if (e.enabled && isSourceAudioEffect(e.type)) sourceFx.push_back(&e);
+                if (!sourceFx.empty())
+                    if (AudioBufferPtr clean = cleanedAudio(m->path, buf, sourceFx, !nonBlocking_)) buf = clean;
                 const int64_t n = buf->frames();
                 const float* src = buf->samples.data();
                 for (int64_t s = s0; s < s1; ++s) {
@@ -691,7 +699,7 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
             }
             // Clip filters (stateful, processed over the whole block for continuity).
             for (const Effect& e : c.effects) {
-                if (!e.enabled) continue;
+                if (!e.enabled || isSourceAudioEffect(e.type)) continue;
                 auto& st = states_[{c.id, e.id}];
                 if (!st) st = std::make_unique<State>();
                 FrameTime lt = FrameTime(double(start) * fps / sr) - c.start;

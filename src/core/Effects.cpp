@@ -179,6 +179,16 @@ std::vector<EffectInfo> buildCatalog() {
     c.push_back({"limiter", "Limiter", EffectCategory::AudioFilter, "Dynamics",
                  {num("ceiling_db", "Ceiling (dB)", -20, 0, -1, 0.1), num("release_ms", "Release (ms)", 5, 1000, 60, 1)},
                  {}});
+    // Restoration: processed on the clip's whole source audio (audio/SpeechCleanup.h).
+    c.push_back({"denoise", "Noise Reduction", EffectCategory::AudioFilter, "Restoration",
+                 {num("reduction_db", "Reduction (dB)", 0, 40, 15, 0.5), pct("sensitivity", "Sensitivity", 0, 100, 50)},
+                 {}});
+    c.push_back({"voice_isolate", "Voice Isolation", EffectCategory::AudioFilter, "Restoration",
+                 {pct("amount", "Amount", 0, 100, 100)},
+                 {}});
+#ifndef MONTAGE_WITH_RNNOISE
+    c.back().hidden = true;  // needs the RNNoise model
+#endif
     c.push_back({"highpass", "High-Pass Filter", EffectCategory::AudioFilter, "EQ",
                  {num("hz", "Cutoff (Hz)", 20, 2000, 80, 1)}, {}});
     c.push_back({"lowpass", "Low-Pass Filter", EffectCategory::AudioFilter, "EQ",

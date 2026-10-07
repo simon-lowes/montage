@@ -20,6 +20,7 @@ option(MONTAGE_BUILD_APP "Build the Montage GUI application" ON)
 option(MONTAGE_BUILD_TESTS "Build the Montage test suite" ON)
 option(MONTAGE_WITH_VST3 "Host VST3 audio plugins (VST 3 SDK, MIT, vendored)" ON)
 option(MONTAGE_WITH_WHISPER "Speech-to-text with whisper.cpp (MIT, fetched at configure time)" ON)
+option(MONTAGE_WITH_RNNOISE "Voice isolation with RNNoise (BSD, fetched with its model at configure time)" ON)
 
 find_package(Qt6 6.4 REQUIRED COMPONENTS Core Gui Concurrent)
 if(MONTAGE_BUILD_APP)
@@ -50,6 +51,37 @@ if(MONTAGE_WITH_WHISPER)
     GIT_SHALLOW TRUE)
   FetchContent_MakeAvailable(whisper)
   set(BUILD_SHARED_LIBS ${MONTAGE_SAVED_BUILD_SHARED_LIBS})
+endif()
+
+if(MONTAGE_WITH_RNNOISE)
+  include(FetchContent)
+  # RNNoise has no CMake build; only its sources and the trained model (a
+  # generated C file, pinned by the hash in the repository's model_version).
+  set(MONTAGE_RNNOISE_MODEL 0a8755f8e2d834eff6a54714ecc7d75f9932e845df35f8b59bc52a7cfe6e8b37)
+  FetchContent_Declare(rnnoise
+    GIT_REPOSITORY https://github.com/xiph/rnnoise.git
+    GIT_TAG 70f1d256acd4b34a572f999a05c87bf00b67730d
+    SOURCE_SUBDIR no-cmake)
+  FetchContent_Declare(rnnoise_model
+    URL https://media.xiph.org/rnnoise/models/rnnoise_data-${MONTAGE_RNNOISE_MODEL}.tar.gz
+    URL_HASH SHA256=${MONTAGE_RNNOISE_MODEL}
+    SOURCE_SUBDIR no-cmake)
+  FetchContent_MakeAvailable(rnnoise rnnoise_model)
+  enable_language(C)
+  set(RNNOISE_SRC ${rnnoise_SOURCE_DIR}/src)
+  add_library(montage_rnnoise STATIC
+    ${RNNOISE_SRC}/denoise.c ${RNNOISE_SRC}/rnn.c ${RNNOISE_SRC}/pitch.c ${RNNOISE_SRC}/kiss_fft.c
+    ${RNNOISE_SRC}/celt_lpc.c ${RNNOISE_SRC}/nnet.c ${RNNOISE_SRC}/nnet_default.c
+    ${RNNOISE_SRC}/parse_lpcnet_weights.c ${RNNOISE_SRC}/rnnoise_tables.c
+    ${rnnoise_model_SOURCE_DIR}/src/rnnoise_data.c)
+  target_include_directories(montage_rnnoise
+    PUBLIC ${rnnoise_SOURCE_DIR}/include
+    PRIVATE ${rnnoise_model_SOURCE_DIR}/src ${RNNOISE_SRC})
+  set_target_properties(montage_rnnoise PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET hidden)
+  target_compile_options(montage_rnnoise PRIVATE $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-w -O2>)
+  if(NOT WIN32)
+    target_link_libraries(montage_rnnoise PRIVATE m)
+  endif()
 endif()
 
 add_subdirectory(src)
