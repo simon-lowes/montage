@@ -1,14 +1,20 @@
 #include "MaskOverlay.h"
 
+#include <QFutureWatcher>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
+#include <QPointer>
+#include <QtConcurrent>
+#include <algorithm>
 #include <cmath>
 
 #include "EditorState.h"
 #include "MonitorPanel.h"
+#include "ObjectModel.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
+#include "render/ClipAnalysis.h"
 #include "render/Compositor.h"
 
 namespace montage {
@@ -18,6 +24,7 @@ constexpr double kHandleRadius = 9;
 }
 
 MaskOverlay::MaskOverlay(EditorState* state, ViewerWidget* viewer) : QObject(viewer), state_(state), viewer_(viewer) {
+    pool_.setMaxThreadCount(1);
     viewer_->installEventFilter(this);
     viewer_->setMouseTracking(true);
     viewer_->setOverlay([this](QPainter& p, const QRectF& r) { paint(p, r); });
@@ -57,9 +64,15 @@ void MaskOverlay::localToFrame(const Shape& s, double lx, double ly, double& u, 
     v = s.y + (lx * std::sin(r) + ly * std::cos(r)) / mh;
 }
 
-bool MaskOverlay::toWidget(const Shape& s, double u, double v, QPointF& out) const {
+bool MaskOverlay::toWidget(const Shape& s, double u, double v, QPointF& out) const { return toWidget(s.clip, u, v, out); }
+
+bool MaskOverlay::fromWidget(const Shape& s, const QPointF& pt, double& u, double& v) const {
+    return fromWidget(s.clip, pt, u, v);
+}
+
+bool MaskOverlay::toWidget(Id clip, double u, double v, QPointF& out) const {
     const Sequence* seq = state_->sequence();
-    const Clip* c = seq ? edit::clipById(*seq, s.clip) : nullptr;
+    const Clip* c = seq ? edit::clipById(*seq, clip) : nullptr;
     const QRectF r = viewer_->imageRect();
     double x = 0, y = 0;
     if (!c || r.isEmpty() || !clipFrameToSequence(state_->project(), *seq, *c, state_->playhead(), u, v, x, y)) return false;
@@ -67,9 +80,9 @@ bool MaskOverlay::toWidget(const Shape& s, double u, double v, QPointF& out) con
     return true;
 }
 
-bool MaskOverlay::fromWidget(const Shape& s, const QPointF& pt, double& u, double& v) const {
+bool MaskOverlay::fromWidget(Id clip, const QPointF& pt, double& u, double& v) const {
     const Sequence* seq = state_->sequence();
-    const Clip* c = seq ? edit::clipById(*seq, s.clip) : nullptr;
+    const Clip* c = seq ? edit::clipById(*seq, clip) : nullptr;
     const QRectF r = viewer_->imageRect();
     if (!c || r.isEmpty()) return false;
     const double x = (pt.x() - r.left()) * seq->width / r.width(), y = (pt.y() - r.top()) * seq->height / r.height();
@@ -133,6 +146,207 @@ void MaskOverlay::paint(QPainter& p, const QRectF&) const {
         }
     }
     p.restore();
+    paintObjects(p);
+}
+
+// ---- Object masks ------------------------------------------------------------------
+
+std::vector<MaskOverlay::ObjectTarget> MaskOverlay::objectTargets() const {
+    std::vector<ObjectTarget> out;
+    const Sequence* s = state_->sequence();
+    const FrameTime t = state_->playhead();
+    if (!s) return out;
+    for (Id id : state_->selectedClips()) {
+        auto loc = edit::locate(*s, id);
+        if (!loc || loc->track.kind != TrackKind::Video) continue;
+        const Clip& c = trackAt(*s, loc->track)->clips[loc->index];
+        const MediaItem* m = c.mediaId ? state_->project().findMedia(c.mediaId) : nullptr;
+        if (!c.contains(t) || !m || m->kind != MediaKind::Video) continue;
+        const FrameTime lt = t - c.start;
+        for (const Effect& e : c.effects)
+            if (e.enabled && std::lround(e.p("mask.shape", lt)) == 3)
+                out.push_back({c.id, e.id, lt, e.object, clipObjectFrame(state_->project(), *s, c, lt)});
+    }
+    return out;
+}
+
+void MaskOverlay::paintObjects(QPainter& p) const {
+    const auto targets = objectTargets();
+    if (targets.empty()) return;
+    p.save();
+    p.setRenderHint(QPainter::Antialiasing);
+    p.setRenderHint(QPainter::SmoothPixmapTransform);
+    for (const ObjectTarget& t : targets) {
+        // The clip's frame in the widget: the segmentation is drawn into it as a tint.
+        QPointF c00, c10, c11, c01;
+        if (!toWidget(t.clip, 0, 0, c00) || !toWidget(t.clip, 1, 0, c10) || !toWidget(t.clip, 1, 1, c11) ||
+            !toWidget(t.clip, 0, 1, c01))
+            continue;
+        std::vector<float> logits;
+        if (t.object && t.object->logits(t.frame, logits)) {
+            const QString key = QStringLiteral("%1:%2").arg(quintptr(t.object.get())).arg(t.frame);
+            if (key != tintKey_) {
+                tint_ = QImage(kObjectGrid, kObjectGrid, QImage::Format_ARGB32_Premultiplied);
+                for (int y = 0; y < kObjectGrid; ++y) {
+                    auto* row = reinterpret_cast<QRgb*>(tint_.scanLine(y));
+                    for (int x = 0; x < kObjectGrid; ++x) {
+                        const float a = std::clamp(0.5f + logits[size_t(y) * kObjectGrid + size_t(x)], 0.f, 1.f) * 0.42f;
+                        row[x] = qPremultiply(qRgba(70, 160, 255, int(a * 255)));
+                    }
+                }
+                tintKey_ = key;
+            }
+            QTransform tr;
+            if (QTransform::quadToQuad(QPolygonF(QRectF(0, 0, kObjectGrid, kObjectGrid)), QPolygonF({c00, c10, c11, c01}), tr)) {
+                p.save();
+                p.setTransform(tr, true);
+                p.drawImage(QRectF(0, 0, kObjectGrid, kObjectGrid), tint_);
+                p.restore();
+            }
+        }
+        // The clicks on this frame: + the object, - not the object, and the box.
+        if (t.object)
+            if (auto it = t.object->prompts.find(t.frame); it != t.object->prompts.end()) {
+                QPointF box[2];
+                int corners = 0;
+                for (const ObjectPoint& pt : it->second) {
+                    QPointF w;
+                    if (!toWidget(t.clip, pt.x, pt.y, w)) continue;
+                    if (pt.label >= 2) {
+                        box[pt.label - 2] = w;
+                        ++corners;
+                        continue;
+                    }
+                    const QColor fill = pt.label == 1 ? QColor(60, 200, 90) : QColor(230, 70, 60);
+                    p.setPen(QPen(QColor(0, 0, 0, 180), 1.5));
+                    p.setBrush(fill);
+                    p.drawEllipse(w, 6, 6);
+                    p.setPen(QPen(Qt::white, 1.6));
+                    p.drawLine(w + QPointF(-3, 0), w + QPointF(3, 0));
+                    if (pt.label == 1) p.drawLine(w + QPointF(0, -3), w + QPointF(0, 3));
+                }
+                if (corners == 2) {
+                    p.setBrush(Qt::NoBrush);
+                    p.setPen(QPen(QColor(0, 0, 0, 160), 3));
+                    p.drawRect(QRectF(box[0], box[1]).normalized());
+                    p.setPen(QPen(QColor(255, 214, 90), 1.5, Qt::DashLine));
+                    p.drawRect(QRectF(box[0], box[1]).normalized());
+                }
+            }
+    }
+    if (objectGesture_ && QLineF(pressPos_, dragPos_).length() >= 6) {
+        p.setBrush(Qt::NoBrush);
+        p.setPen(QPen(QColor(255, 214, 90), 1.5, Qt::DashLine));
+        p.drawRect(QRectF(pressPos_, dragPos_).normalized());
+    }
+    if (pending_ > 0) {
+        const QRectF r = viewer_->imageRect();
+        p.setPen(Qt::white);
+        p.drawText(r.adjusted(8, 6, -8, -6), Qt::AlignLeft | Qt::AlignTop, tr("Finding the object…"));
+    }
+    p.restore();
+}
+
+bool MaskOverlay::objectPress(const QPointF& pos) {
+    for (const ObjectTarget& t : objectTargets()) {
+        double u, v;
+        if (!fromWidget(t.clip, pos, u, v) || u < 0 || v < 0 || u > 1 || v > 1) continue;
+        objectGesture_ = true;
+        objectTarget_ = t;
+        pressPos_ = dragPos_ = pos;
+        return true;
+    }
+    return false;
+}
+
+void MaskOverlay::objectRelease(const QPointF& pos, Qt::KeyboardModifiers mods) {
+    objectGesture_ = false;
+    viewer_->update();
+    const ObjectTarget t = objectTarget_;
+    double u0, v0, u1, v1;
+    if (!fromWidget(t.clip, pressPos_, u0, v0) || !fromWidget(t.clip, pos, u1, v1)) return;
+    auto clamp01 = [](double x) { return std::clamp(x, 0.0, 1.0); };
+    std::vector<ObjectPoint> pts;
+    if (t.object)
+        if (auto it = t.object->prompts.find(t.frame); it != t.object->prompts.end()) pts = it->second;
+    if (QLineF(pressPos_, pos).length() >= 6) {
+        // A box around the object (one per frame).
+        pts.erase(std::remove_if(pts.begin(), pts.end(), [](const ObjectPoint& p) { return p.label >= 2; }), pts.end());
+        pts.insert(pts.begin(), {{clamp01(std::min(u0, u1)), clamp01(std::min(v0, v1)), 2},
+                                 {clamp01(std::max(u0, u1)), clamp01(std::max(v0, v1)), 3}});
+    } else if (mods & (Qt::ControlModifier | Qt::MetaModifier)) {
+        // Remove the click under the pointer (both corners for the box).
+        int nearest = -1;
+        double best = 10;
+        for (size_t i = 0; i < pts.size(); ++i) {
+            QPointF w;
+            if (toWidget(t.clip, pts[i].x, pts[i].y, w) && QLineF(w, pos).length() < best) {
+                best = QLineF(w, pos).length();
+                nearest = int(i);
+            }
+        }
+        if (nearest < 0) return;
+        if (pts[size_t(nearest)].label >= 2)
+            pts.erase(std::remove_if(pts.begin(), pts.end(), [](const ObjectPoint& p) { return p.label >= 2; }), pts.end());
+        else
+            pts.erase(pts.begin() + nearest);
+    } else {
+        pts.push_back({clamp01(u1), clamp01(v1), (mods & Qt::AltModifier) ? 0 : 1});
+    }
+    pickObject(t, pts);
+}
+
+void MaskOverlay::pickObject(const ObjectTarget& t, const std::vector<ObjectPoint>& points) {
+    if (!points.empty() && !ensureObjectModel(viewer_->window())) return;
+    const bool changed = state_->edit(points.empty() ? tr("Clear Object Clicks") : tr("Pick Object"), [t, points](Project& p, Sequence& s) {
+        Clip* c = edit::clipById(s, t.clip);
+        Effect* e = c ? edit::ownedEffect(s, t.clip, t.effect) : nullptr;
+        if (!c || !e) return false;
+        e->object = withObjectPrompts(p, s, *c, *e, t.local, points);
+        return e->object != nullptr;
+    });
+    if (!changed || points.empty()) return;
+    // Segment the frame from a copy of the project, off the UI thread.
+    auto project = std::make_shared<const Project>(state_->project());
+    const Id seq = state_->sequence()->id;
+    using Out = std::pair<std::shared_ptr<const ObjectMask>, std::string>;
+    auto* watcher = new QFutureWatcher<Out>(this);
+    ++pending_;
+    viewer_->update();
+    QPointer<EditorState> st(state_);
+    connect(watcher, &QFutureWatcher<Out>::finished, this, [this, watcher, st, t, points] {
+        watcher->deleteLater();
+        --pending_;
+        viewer_->update();
+        const Out r = watcher->result();
+        if (!st) return;
+        if (!r.first) {
+            if (!r.second.empty()) st->message(QString::fromStdString(r.second), 6000);
+            return;
+        }
+        // Kept only while the clicks it answers are still the ones on that frame.
+        st->amend([t, points, r](Project&, Sequence& s) {
+            Effect* e = edit::ownedEffect(s, t.clip, t.effect);
+            if (!e || !e->object) return false;
+            const int64_t n = t.frame;
+            auto have = e->object->prompts.find(n);
+            auto seg = r.first->frames.find(n);
+            if (have == e->object->prompts.end() || have->second != points || seg == r.first->frames.end()) return false;
+            auto o = std::make_shared<ObjectMask>(*e->object);
+            o->frames[n] = seg->second;
+            e->object = o;
+            return true;
+        });
+    });
+    watcher->setFuture(QtConcurrent::run(&pool_, [project, seq, t]() -> Out {
+        const Sequence* s = project->findSequence(seq);
+        const Clip* c = s ? edit::clipById(*s, t.clip) : nullptr;
+        const Effect* e = s ? edit::ownedEffect(const_cast<Sequence&>(*s), t.clip, t.effect) : nullptr;
+        if (!c || !e || !e->object) return {};
+        std::string err;
+        auto o = segmentClipObjectFrame(*project, *s, *c, *e->object, t.local, &err);
+        return {o, err};
+    }));
 }
 
 void MaskOverlay::apply(const Shape& s) {
@@ -195,7 +409,17 @@ bool MaskOverlay::eventFilter(QObject* obj, QEvent* e) {
                 return true;
             }
         }
-        return false;
+        return objectPress(pos);
+    }
+    if (objectGesture_ && e->type() == QEvent::MouseMove) {
+        dragPos_ = static_cast<QMouseEvent*>(e)->position();
+        viewer_->update();
+        return true;
+    }
+    if (objectGesture_ && e->type() == QEvent::MouseButtonRelease) {
+        auto* me = static_cast<QMouseEvent*>(e);
+        objectRelease(me->position(), me->modifiers());
+        return true;
     }
     if (e->type() == QEvent::MouseMove) {
         auto* me = static_cast<QMouseEvent*>(e);

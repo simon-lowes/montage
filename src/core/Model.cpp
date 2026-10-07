@@ -62,6 +62,12 @@ const Keyframe* Param::keyAt(FrameTime t) const {
 // ---------------------------------------------------------------------------
 // Effect
 
+bool Effect::operator==(const Effect& o) const {
+    if (id != o.id || type != o.type || enabled != o.enabled || params != o.params || strings != o.strings) return false;
+    if (object == o.object) return true;
+    return object && o.object && *object == *o.object;
+}
+
 double Effect::p(const std::string& name, FrameTime t, double def) const {
     auto it = params.find(name);
     if (it == params.end()) return def;

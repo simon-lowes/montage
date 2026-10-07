@@ -30,6 +30,11 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Masks on every video effect:
   - An ellipse or rectangle with feather, expansion, rotation, opacity and invert, all keyframeable. Drag it in the Program monitor to move it, or pull its handles to resize it.
   - An HSL qualifier selects by hue, saturation and luma with softness, for example to grade only skin or only the sky. Show Mask displays the selection.
+  - **Object masks** (AI): choose the Object shape and click a person or thing in the Program monitor.
+    - Alt-click marks what is not part of it, a drag draws a box around it, and Ctrl/Cmd-click removes a click.
+    - ◀ Track / Track ▶ follow it through the clip, finding it again after it turns or is briefly hidden.
+    - Feather, expansion, invert and Show Mask work as for the shapes, and the mask stays with the footage through trims and speed changes.
+    - It runs locally with EdgeTAM, Meta's on-device model in the Segment Anything 2 family (Apache-2.0), on ONNX Runtime. The 65 MB model is downloaded on first use.
 - Speed ramps and slow motion:
   - **Time Remapping** gives every clip a keyframeable speed curve (linear, hold or eased) inside its length. Picture and linked sound follow it together.
   - **Frame Sampling** sets how in-between frames are made in slow motion: Nearest Frame, Frame Blending, or Optical Flow, which moves pixels along their motion instead of cross-fading.
@@ -142,11 +147,16 @@ ctest --test-dir build --output-on-failure
 ./build/src/montage-cli --help          # the command-line tool
 ```
 
-On macOS: `brew install qtbase qtmultimedia ffmpeg ninja pkgconf`, configure with `-DCMAKE_PREFIX_PATH="$(brew --prefix)"`, then `scripts/package-macos.sh build` makes the DMG. On Windows, build in an MSYS2 UCRT64 shell with the `qt6-base`, `qt6-multimedia`, `qt6-tools` and `ffmpeg` packages; `scripts/package-windows.sh build` makes the portable folder and zip, and `packaging/windows/montage.iss` (Inno Setup) the installer.
+Optional libraries are used when found: OpenColorIO (OCIO transforms), lilv (LV2 plugins) and ONNX Runtime (object masks). `setup-deps.sh` installs all three; ONNX Runtime goes to `/opt/onnxruntime` from Microsoft's release archive (point `ONNXRUNTIME_ROOT` at another copy).
+
+On macOS: `brew install qtbase qtmultimedia ffmpeg opencolorio lilv onnxruntime ninja pkgconf`, configure with `-DCMAKE_PREFIX_PATH="$(brew --prefix)"`, then `scripts/package-macos.sh build` makes the DMG. On Windows, build in an MSYS2 UCRT64 shell with the `qt6-base`, `qt6-multimedia`, `qt6-tools`, `ffmpeg`, `opencolorio`, `lilv` and `onnxruntime` packages; `scripts/package-windows.sh build` makes the portable folder and zip, and `packaging/windows/montage.iss` (Inno Setup) the installer.
 
 CMake options:
 - `-DMONTAGE_BUILD_APP=OFF` builds only the engine and CLI, without Qt Widgets or Multimedia.
 - `-DMONTAGE_BUILD_TESTS=OFF` skips the tests.
+- `-DMONTAGE_REQUIRE_ONNXRUNTIME=ON` stops the configure step if ONNX Runtime is missing (release builds use it).
+
+The object mask tests need the model: `scripts/fetch-object-model.sh ~/object-model`, then set `MONTAGE_OBJECT_MODEL=~/object-model` (the app reads the same variable). The speech tests read `MONTAGE_TEST_WHISPER_MODEL`.
 
 ## Using the editor
 
@@ -193,7 +203,7 @@ montage-cli xml cut.montage -o cut.xml                       # Final Cut Pro 7 X
 montage-cli fcpxml cut.montage -o cut.fcpxml                 # FCPXML (Final Cut Pro)
 montage-cli import edit.fcpxml -o edit.montage               # FCP XML, FCPXML, OTIO or EDL into a project
 montage-cli presets
-montage-cli models                                           # speech models and where they go
+montage-cli models                                           # speech and object models, and where they go
 montage-cli transcribe interview.mp4 --model base.en --srt interview.srt --vtt interview.vtt
 montage-cli captions cut.montage --transcribe base.en -o cut.scc --save   # caption a cut, keep the track
 montage-cli render cut.montage -o cut.mp4 --burn-captions --embed-captions
@@ -226,4 +236,4 @@ Notes on the design:
 
 ## Roadmap
 
-Phase 2 is ranked in [`docs/research/phase2-roadmap.md`](docs/research/phase2-roadmap.md) and tracked in [`PROGRESS.md`](PROGRESS.md). Next up: AI object masks (SAM 2) and a GPU compositor.
+Phase 2 is ranked in [`docs/research/phase2-roadmap.md`](docs/research/phase2-roadmap.md) and tracked in [`PROGRESS.md`](PROGRESS.md). Next up: a GPU compositor, HDR monitoring, and Phase 3 (an open scripting API and MCP server first).

@@ -20,7 +20,7 @@ jobs:
         timeout-minutes: 15
         run: ./scripts/setup-deps.sh
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DMONTAGE_BUILD_APP=ON
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DMONTAGE_BUILD_APP=ON -DMONTAGE_REQUIRE_ONNXRUNTIME=ON
       - name: Build
         run: cmake --build build
       - name: Cache the speech model
@@ -37,5 +37,15 @@ jobs:
               || { rm -f "$f"; echo "::warning::Could not download the speech model; transcription tests will be skipped"; }
           fi
           [ -s "$f" ] && echo "MONTAGE_TEST_WHISPER_MODEL=$f" >> "$GITHUB_ENV" || true
+      - name: Cache the object model
+        uses: actions/cache@v4
+        with:
+          path: ~/object-model
+          key: edgetam-video-8ca3d3e
+      - name: Object model for the object mask tests
+        run: |
+          scripts/fetch-object-model.sh ~/object-model \
+            && echo "MONTAGE_OBJECT_MODEL=$HOME/object-model" >> "$GITHUB_ENV" \
+            || echo "::warning::Could not download the object model; object mask tests will be skipped"
       - name: Test
         run: ctest --test-dir build --output-on-failure

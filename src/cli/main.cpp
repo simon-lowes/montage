@@ -25,6 +25,7 @@
 #include "media/Decoder.h"
 #include "media/Loudness.h"
 #ifdef MONTAGE_WITH_WHISPER
+#include "media/Segmenter.h"
 #include "media/Transcriber.h"
 #endif
 #include "render/ColorSpace.h"
@@ -479,6 +480,11 @@ int cmdModels() {
         std::printf("  %-22s %6.0f MB  %-10s %s\n", m.name.c_str(), double(m.bytes) / 1e6,
                     whisperModelPath(m.name).empty() ? "" : "downloaded", m.label.c_str());
     std::printf("\nDownload a model into the folder from %s\n", whisperModelUrl("<name>").c_str());
+    std::printf("\nObject model (EdgeTAM, for object masks; folder: %s)\n", segmenterModelDirectory().c_str());
+    if (!segmenterAvailable()) std::printf("  unavailable: this build has no ONNX Runtime\n");
+    else
+        std::printf("  %-22s %6.0f MB  %-10s ONNX Runtime %s\n", "edgetam-video", double(segmenterDownloadBytes()) / 1e6,
+                    segmenterModelInstalled() ? "downloaded" : "", segmenterRuntimeVersion().c_str());
     return 0;
 }
 

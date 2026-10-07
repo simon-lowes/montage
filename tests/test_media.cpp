@@ -22,6 +22,7 @@
 #include "media/MediaPool.h"
 #include "media/SpeakerSwitch.h"
 #include "media/Tracking.h"
+#include "media/Segmenter.h"
 #ifdef MONTAGE_WITH_WHISPER
 #include "media/Transcriber.h"
 #endif
@@ -29,6 +30,7 @@
 #include "render/ColorSpace.h"
 #include "render/Compositor.h"
 #include "render/Exporter.h"
+#include "render/Processing.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -682,6 +684,148 @@ private slots:
         std::string err;
         if (!exportSequence(p, s, st, nullptr, nullptr, &err)) qWarning("export failed: %s", err.c_str());
         return jitter;
+    }
+
+    // A shaded red ball (70 x 50 px radii) crossing textured ground, 640 x 360 at
+    // 25 fps; returns its centre in each frame.
+    std::vector<Point2> writeBallVideo(const std::string& file, int frames) {
+        QImage bg(640, 360, QImage::Format_RGB32);
+        std::mt19937 rng(3);
+        std::normal_distribution<double> noise(0, 10);
+        for (int y = 0; y < 360; ++y)
+            for (int x = 0; x < 640; ++x) {
+                const double r = 76 + 51 * std::sin(x / 37.0) + 25 * std::cos(y / 23.0) + noise(rng);
+                const double g = 115 + 38 * std::sin((x + y) / 41.0) + noise(rng);
+                const double b = 128 + 51 * std::cos(x / 53.0) + noise(rng);
+                bg.setPixel(x, y, qRgb(std::clamp(int(r), 0, 255), std::clamp(int(g), 0, 255), std::clamp(int(b), 0, 255)));
+            }
+        QImage ball(640, 360, QImage::Format_ARGB32);
+        ball.fill(Qt::transparent);
+        for (int y = 0; y < 360; ++y)
+            for (int x = 0; x < 640; ++x) {
+                const double u = (x + 0.5 - 320) / 70, v = (y + 0.5 - 180) / 50;
+                if (u * u + v * v > 1) continue;
+                const double sh = 1.0 - 0.35 * ((u + 0.28) * (u + 0.28) + (v + 0.3) * (v + 0.3));
+                ball.setPixel(x, y, qRgba(int(230 * sh), int(51 * sh), int(38 * sh), 255));
+            }
+        const QString bgPng = QString::fromStdString(path("ground.png")), ballPng = QString::fromStdString(path("ball.png"));
+        bg.save(bgPng);
+        ball.save(ballPng);
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 640;
+        s.height = 360;
+        s.fps = {25, 1};
+        MediaItem mb = probeOrFail(p, bgPng.toStdString()), mo = probeOrFail(p, ballPng.toStdString());
+        p.media.push_back(mb);
+        p.media.push_back(mo);
+        Clip cb = makeClip(p, mb, TrackKind::Video, s), co = makeClip(p, mo, TrackKind::Video, s);
+        cb.duration = co.duration = frames;
+        std::vector<Point2> centres;
+        for (int i = 0; i < frames; ++i) {
+            const Point2 c{180.0 + 14 * i, 170 + 40 * std::sin(i / 3.0)};
+            centres.push_back(c);
+            co.motion.params["pos_x"].addKey(i, c.x - 320, Interp::Hold);
+            co.motion.params["pos_y"].addKey(i, c.y - 180, Interp::Hold);
+        }
+        edit::overwrite(p, s, {TrackKind::Video, 0}, cb);
+        while (s.videoTracks.size() < 2) s.videoTracks.push_back(makeTrack(p, TrackKind::Video, "V2"));
+        edit::overwrite(p, s, {TrackKind::Video, 1}, co);
+        ExportSettings st;
+        st.path = file;
+        st.audioCodec = "none";
+        st.crf = 10;
+        st.preset = "ultrafast";
+        std::string err;
+        if (!exportSequence(p, s, st, nullptr, nullptr, &err)) qWarning("export failed: %s", err.c_str());
+        return centres;
+    }
+
+    void objectMasksFollowAnObject() {
+        if (!segmenterAvailable()) QSKIP("Built without ONNX Runtime");
+        if (!segmenterModelInstalled())
+            QSKIP("Set MONTAGE_OBJECT_MODEL to a folder with the EdgeTAM model files to run this test");
+        const int frames = 16;
+        const std::string video = path("ball.mp4");
+        const auto centres = writeBallVideo(video, frames);
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 640;
+        s.height = 360;
+        s.fps = {25, 1};
+        MediaItem m = probeOrFail(p, video);
+        p.media.push_back(m);
+        Clip c = makeClip(p, m, TrackKind::Video, s);
+        c.duration = frames;
+        Effect e = makeEffect(p, "invert");
+        e.params["mask.shape"] = Param(3.0);
+        // How well a frame's segmentation covers the ball (intersection over union).
+        auto iou = [&](const ObjectMask& o, int64_t n) {
+            std::vector<float> logits;
+            if (!o.logits(n, logits)) return -1.0;
+            const std::vector<float> matte = objectMatte(logits, 640, 360, 1, 0);
+            double both = 0, either = 0;
+            for (int y = 0; y < 360; ++y)
+                for (int x = 0; x < 640; ++x) {
+                    const double u = (x + 0.5 - centres[size_t(n)].x) / 70, v = (y + 0.5 - centres[size_t(n)].y) / 50;
+                    const bool in = u * u + v * v <= 1, picked = matte[size_t(y) * 640 + size_t(x)] > 0.5f;
+                    both += in && picked;
+                    either += in || picked;
+                }
+            return both / std::max(1.0, either);
+        };
+
+        // One click on the ball picks it out of the first frame.
+        auto clicked = withObjectPoint(p, s, c, e, 0, {centres[0].x / 640, centres[0].y / 360, 1});
+        QVERIFY(clicked);
+        QCOMPARE(clicked->fps, 25.0);
+        std::string err;
+        auto first = segmentClipObjectFrame(p, s, c, *clicked, 0, &err);
+        QVERIFY2(first, err.c_str());
+        QCOMPARE(int(first->frames.size()), 1);
+        QVERIFY2(iou(*first, 0) > 0.95, qPrintable(QString::number(iou(*first, 0))));
+
+        // Tracked through the clip from that click.
+        std::vector<double> fractions;
+        auto tracked = trackClipObject(p, s, c, *first, 0, true, [&](double f) { fractions.push_back(f); }, nullptr, &err);
+        QVERIFY2(tracked, err.c_str());
+        QCOMPARE(int(tracked->frames.size()), frames);
+        QCOMPARE(int(fractions.size()), frames);
+        QCOMPARE(fractions.back(), 1.0);
+        for (int n = 0; n < frames; ++n) QVERIFY2(iou(*tracked, n) > 0.95, qPrintable(QString("frame %1: %2").arg(n).arg(iou(*tracked, n))));
+
+        // Rendered as the effect's matte: the inverted area is the ball at that frame.
+        e.object = tracked;
+        Image frame(640, 360);
+        frame.fill(1, 1, 1, 1);
+        const std::vector<float> matte = effectMatte(e, 8, frame, 1.0, (8 + 0.5) / 25);
+        double inside = 0, outside = 0;
+        for (int y = 0; y < 360; ++y)
+            for (int x = 0; x < 640; ++x) {
+                const double u = (x + 0.5 - centres[8].x) / 70, v = (y + 0.5 - centres[8].y) / 50;
+                (u * u + v * v <= 0.8 ? inside : outside) += u * u + v * v > 0.8 && u * u + v * v < 1.25 ? 0 : matte[size_t(y) * 640 + size_t(x)];
+            }
+        QVERIFY2(inside > 0.97 * M_PI * 70 * 50 * 0.8 && outside < 50, qPrintable(QString("%1 %2").arg(inside).arg(outside)));
+        // Not segmented: no matte (a frame of the media the clip does not show).
+        const std::vector<float> none = effectMatte(e, 8, frame, 1.0, 40.0);
+        QVERIFY(!none.empty() && *std::max_element(none.begin(), none.end()) == 0.f);
+
+        // Backwards, from a click on the last frame only.
+        Effect e2 = makeEffect(p, "invert");
+        e2.params["mask.shape"] = Param(3.0);
+        auto lastClick = withObjectPoint(p, s, c, e2, frames - 1, {centres.back().x / 640, centres.back().y / 360, 1});
+        QVERIFY(!trackClipObject(p, s, c, *lastClick, 4, true, {}, nullptr, &err));
+        QVERIFY(!err.empty());  // nothing clicked at or before frame 4
+        auto back = trackClipObject(p, s, c, *lastClick, frames - 1, false, {}, nullptr, &err);
+        QVERIFY2(back, err.c_str());
+        QCOMPARE(int(back->frames.size()), frames);
+        for (int n = 0; n < frames; ++n) QVERIFY2(iou(*back, n) > 0.95, qPrintable(QString("frame %1: %2").arg(n).arg(iou(*back, n))));
+
+        // Cancelling stops without a result.
+        std::atomic<bool> cancel{true};
+        err = "x";
+        QVERIFY(!trackClipObject(p, s, c, *first, 0, true, {}, &cancel, &err));
+        QVERIFY(err.empty());
     }
 
     void slowMotionFrameSampling() {

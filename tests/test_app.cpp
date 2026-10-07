@@ -8,6 +8,7 @@
 #include <QDockWidget>
 #include <QDoubleSpinBox>
 #include <QLineEdit>
+#include <QLabel>
 #include <QListWidget>
 #include <QMimeData>
 #include <QScrollBar>
@@ -35,6 +36,7 @@
 #include "PluginEditorWindow.h"
 #include "audio/PluginEffect.h"
 #include "MaskOverlay.h"
+#include "media/Segmenter.h"
 #include "MonitorPanel.h"
 #include "PlaybackController.h"
 #include "Recovery.h"
@@ -1224,6 +1226,167 @@ private slots:
         QVERIFY(std::fabs(undone.p("mask.w", 10, 0.4) - 0.4) < 1e-6);
         QVERIFY(std::fabs(undone.p("mask.x", 10) - 0.6) < 0.02);  // the move stays
         state()->setSelection({}, false);
+    }
+
+    void objectMaskFromViewer() {
+        // A red ball crossing textured ground, 320 x 180 at 25 fps.
+        QImage bg(320, 180, QImage::Format_RGB32), ball(320, 180, QImage::Format_ARGB32);
+        ball.fill(Qt::transparent);
+        for (int y = 0; y < 180; ++y)
+            for (int x = 0; x < 320; ++x) {
+                bg.setPixel(x, y, qRgb(int(76 + 51 * std::sin(x / 18.0)), int(115 + 38 * std::sin((x + y) / 20.0)), int(128 + 51 * std::cos(y / 26.0))));
+                const double u = (x + 0.5 - 160) / 36, v = (y + 0.5 - 90) / 26;
+                const double sh = 1.0 - 0.35 * ((u + 0.28) * (u + 0.28) + (v + 0.3) * (v + 0.3));
+                if (u * u + v * v <= 1) ball.setPixel(x, y, qRgba(int(230 * sh), int(51 * sh), int(38 * sh), 255));
+            }
+        const QString bgPng = dir_.path() + "/ground.png", ballPng = dir_.path() + "/ball.png";
+        QVERIFY(bg.save(bgPng) && ball.save(ballPng));
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 320;
+        gs.height = 180;
+        gs.fps = {25, 1};
+        std::string err;
+        MediaItem mb, mo;
+        mb.id = gen.newId();
+        mo.id = gen.newId();
+        QVERIFY(probeMedia(bgPng.toStdString(), mb, &err) && probeMedia(ballPng.toStdString(), mo, &err));
+        gen.media.push_back(mb);
+        gen.media.push_back(mo);
+        const int frames = 6;
+        Clip cb = makeClip(gen, mb, TrackKind::Video, gs), co = makeClip(gen, mo, TrackKind::Video, gs);
+        cb.duration = co.duration = frames;
+        auto centre = [](int i) { return QPointF(90.0 + 8 * i, 90 + 10 * std::sin(i / 2.0)); };
+        for (int i = 0; i < frames; ++i) {
+            co.motion.params["pos_x"].addKey(i, centre(i).x() - 160, Interp::Hold);
+            co.motion.params["pos_y"].addKey(i, centre(i).y() - 90, Interp::Hold);
+        }
+        edit::overwrite(gen, gs, {TrackKind::Video, 0}, cb);
+        edit::overwrite(gen, gs, {TrackKind::Video, 1}, co);
+        ExportSettings st;
+        st.path = (dir_.path() + "/ball.mp4").toStdString();
+        st.audioCodec = "none";
+        st.crf = 10;
+        st.preset = "ultrafast";
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+
+        state()->newProject();
+        auto ids = state()->importFiles({QString::fromStdString(st.path)});
+        QCOMPARE(ids.size(), size_t(1));
+        state()->apply("Place", [&](Project& p, Sequence& s) {
+            s.width = 320;
+            s.height = 180;
+            s.fps = {25, 1};
+            return edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        });
+        const Id clip = state()->sequence()->videoTracks[0].clips.at(0).id;
+        state()->edit("Invert", [clip](Project& p, Sequence& s) {
+            Effect e = makeEffect(p, "invert");
+            e.params["mask.shape"] = Param(3.0);
+            e.params["mask.feather"] = Param(1.0);
+            edit::clipById(s, clip)->effects.push_back(e);
+            return true;
+        });
+        const Id fxId = edit::clipById(*state()->sequence(), clip)->effects.back().id;
+        state()->setSelection({clip}, false);
+        state()->setPlayhead(0);
+        win_->findChild<QDockWidget*>("inspector")->show();
+        win_->findChild<QDockWidget*>("inspector")->raise();
+        QApplication::processEvents();
+        auto visible = [&](const char* name) -> QWidget* {
+            for (auto* w : win_->findChildren<QWidget*>(name))
+                if (w->isVisibleTo(win_.get())) return w;
+            return nullptr;
+        };
+        // The Object shape has its own controls in place of the shape tracker.
+        QTRY_VERIFY(visible("objectStatus"));
+        QVERIFY(static_cast<QLabel*>(visible("objectStatus"))->text().contains("Click the object"));
+        QVERIFY(visible("trackObjectForward") && visible("trackObjectBack") && visible("clearObject"));
+        QVERIFY(!visible("trackMaskForward"));
+        // Tracking needs a click first.
+        static_cast<QToolButton*>(visible("trackObjectForward"))->click();
+        QTest::qWait(50);
+        QVERIFY(!edit::clipById(*state()->sequence(), clip)->effects.back().object);
+
+        if (!segmenterAvailable() || !segmenterModelInstalled())
+            QSKIP("Picking objects needs ONNX Runtime and the model (MONTAGE_OBJECT_MODEL)");
+        MonitorPanel* program = nullptr;
+        for (auto* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Program) program = m;
+        QVERIFY(program);
+        ViewerWidget* viewer = program->viewer();
+        QTRY_VERIFY_WITH_TIMEOUT(!viewer->image().isNull(), 5000);
+        auto* overlay = viewer->findChild<MaskOverlay*>();
+        QVERIFY(overlay);
+        QCOMPARE(overlay->objectTargets().size(), size_t(1));
+        const QRectF r = viewer->imageRect();
+        auto at = [&](QPointF seqPx) { return QPointF(r.left() + seqPx.x() * r.width() / 320, r.top() + seqPx.y() * r.height() / 180).toPoint(); };
+        auto object = [&]() { return edit::clipById(*state()->sequence(), clip)->effects.back().object; };
+
+        // A click on the ball: the click is kept at once, the segmentation follows.
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::NoModifier, at(centre(0)));
+        QVERIFY(object() && object()->prompts.size() == 1);
+        QCOMPARE(object()->prompts.begin()->second.at(0).label, 1);
+        QTRY_VERIFY_WITH_TIMEOUT(object()->frames.count(0) == 1, 60000);
+        QTRY_COMPARE(overlay->pending(), 0);
+        std::vector<float> logits;
+        QVERIFY(object()->logits(0, logits));
+        QVERIFY2(objectCoverage(logits) > 0.04 && objectCoverage(logits) < 0.08, qPrintable(QString::number(objectCoverage(logits))));
+        QTRY_VERIFY(static_cast<QLabel*>(visible("objectStatus"))->text().contains("1 segmented"));
+        // One undo step takes the click and its segmentation away; redo brings both back.
+        state()->undo();
+        QVERIFY(!object() || object()->prompts.empty());
+        state()->redo();
+        QVERIFY(object() && object()->frames.count(0) == 1);
+
+        // Alt-click: not the object. Ctrl-click on it: removed again.
+        const QPoint off = at(QPointF(280, 30));
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::AltModifier, off);
+        QCOMPARE(int(object()->prompts.at(0).size()), 2);
+        QCOMPARE(object()->prompts.at(0).back().label, 0);
+        QTRY_COMPARE_WITH_TIMEOUT(overlay->pending(), 0, 60000);
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::ControlModifier, off);
+        QCOMPARE(int(object()->prompts.at(0).size()), 1);
+        QTRY_COMPARE_WITH_TIMEOUT(overlay->pending(), 0, 60000);
+        // A dragged box replaces nothing else on the frame and adds two corners.
+        const QPoint b0 = at(centre(0) - QPointF(45, 32)), b1 = at(centre(0) + QPointF(45, 32));
+        QTest::mousePress(viewer, Qt::LeftButton, Qt::NoModifier, b0);
+        QMouseEvent move(QEvent::MouseMove, QPointF(b1), viewer->mapToGlobal(QPointF(b1)), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(viewer, &move);
+        QTest::mouseRelease(viewer, Qt::LeftButton, Qt::NoModifier, b1);
+        QCOMPARE(int(object()->prompts.at(0).size()), 3);
+        QCOMPARE(object()->prompts.at(0)[0].label, 2);
+        QCOMPARE(object()->prompts.at(0)[1].label, 3);
+        QTRY_COMPARE_WITH_TIMEOUT(overlay->pending(), 0, 60000);
+
+        // Track ▶ follows it to the end of the clip, as one undo step.
+        static_cast<QToolButton*>(visible("trackObjectForward"))->click();
+        QTRY_VERIFY_WITH_TIMEOUT(object()->frames.size() == size_t(frames), 120000);
+        for (int n = 0; n < frames; ++n) {
+            QVERIFY(object()->logits(n, logits));
+            QVERIFY2(objectCoverage(logits) > 0.04 && objectCoverage(logits) < 0.08, qPrintable(QString("%1: %2").arg(n).arg(objectCoverage(logits))));
+        }
+        // The program monitor inverts the ball only.
+        state()->setPlayhead(3);
+        QTRY_VERIFY_WITH_TIMEOUT(!viewer->image().isNull(), 5000);
+        RenderOptions ro;
+        const Image frame3 = renderProgramFrame(state()->project(), *state()->sequence(), 3, ro);
+        const QPointF c3 = centre(3);
+        QVERIFY2(frame3.at(int(c3.x()), int(c3.y()))[0] < 0.4f, "the ball is inverted (red becomes dark)");
+        QVERIFY(std::fabs(frame3.at(300, 170)[0] - float(bg.pixelColor(300, 170).redF())) < 0.08f);
+
+        // Saved with the project.
+        QString err2;
+        const QString saved = dir_.path() + "/object.montage";
+        QVERIFY2(state()->save(saved, &err2), qPrintable(err2));
+        state()->newProject();
+        QVERIFY(win_->openProject(saved));
+        const Clip* reopened = edit::clipById(*state()->sequence(), clip);
+        QVERIFY(reopened && reopened->effects.back().object && reopened->effects.back().object->frames.size() == size_t(frames));
+        QCOMPARE(reopened->effects.back().id, fxId);
+        state()->setSelection({}, false);
+        win_->activateWindow();
+        QVERIFY(QTest::qWaitForWindowActive(win_.get()));
     }
 
     void timeRemappingKeepsSoundWithPicture() {

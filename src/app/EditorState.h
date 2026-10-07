@@ -34,6 +34,10 @@ public:
     // within ~1.5 s collapse into one undo step (slider drags, typing).
     bool edit(const QString& label, const std::function<bool(Project&, Sequence&)>& fn,
               const QString& mergeKey = QString());
+    // Changes the project without a new undo step, for results derived from the
+    // latest edit (a segmentation that finished in the background): undoing
+    // that edit takes them away with it.
+    bool amend(const std::function<bool(Project&, Sequence&)>& fn);
     // Convenience for EditOps that return a Result; reports errors to the status bar.
     bool apply(const QString& label, const std::function<edit::Result(Project&, Sequence&)>& fn);
 

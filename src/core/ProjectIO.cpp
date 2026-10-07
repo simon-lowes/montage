@@ -76,6 +76,36 @@ Param paramFromJson(const QJsonValue& v) {
     return p;
 }
 
+// Object masks: prompts per frame, and each segmented frame as base64 of its packed logits.
+QJsonObject objectMaskToJson(const ObjectMask& m) {
+    QJsonObject prompts, frames;
+    for (const auto& [f, pts] : m.prompts) {
+        QJsonArray a;
+        for (const ObjectPoint& pt : pts) a.append(QJsonArray{pt.x, pt.y, pt.label});
+        prompts[QString::number(f)] = a;
+    }
+    for (const auto& [f, data] : m.frames)
+        frames[QString::number(f)] = QString::fromLatin1(QByteArray::fromRawData(data.data(), qsizetype(data.size())).toBase64());
+    return QJsonObject{{"fps", m.fps}, {"prompts", prompts}, {"frames", frames}};
+}
+
+std::shared_ptr<const ObjectMask> objectMaskFromJson(const QJsonObject& o) {
+    auto m = std::make_shared<ObjectMask>();
+    m->fps = o.value("fps").toDouble();
+    const QJsonObject prompts = o.value("prompts").toObject(), frames = o.value("frames").toObject();
+    for (auto it = prompts.begin(); it != prompts.end(); ++it) {
+        std::vector<ObjectPoint> pts;
+        for (const QJsonValue& v : it.value().toArray()) {
+            const QJsonArray a = v.toArray();
+            if (a.size() >= 3) pts.push_back({a[0].toDouble(), a[1].toDouble(), a[2].toInt()});
+        }
+        if (!pts.empty()) m->prompts[it.key().toLongLong()] = std::move(pts);
+    }
+    for (auto it = frames.begin(); it != frames.end(); ++it)
+        m->frames[it.key().toLongLong()] = QByteArray::fromBase64(it.value().toString().toLatin1()).toStdString();
+    return m;
+}
+
 QJsonObject effectToJson(const Effect& e) {
     QJsonObject o{{"id", double(e.id)}, {"type", qs(e.type)}};
     if (!e.enabled) o["enabled"] = false;
@@ -85,6 +115,7 @@ QJsonObject effectToJson(const Effect& e) {
     QJsonObject strings;
     for (const auto& [k, v] : e.strings) strings[qs(k)] = qs(v);
     if (!strings.isEmpty()) o["strings"] = strings;
+    if (e.object) o["object"] = objectMaskToJson(*e.object);
     return o;
 }
 
@@ -99,6 +130,7 @@ Effect effectFromJson(const QJsonValue& v) {
     for (auto it = params.begin(); it != params.end(); ++it) e.params[it.key().toStdString()] = paramFromJson(it.value());
     QJsonObject strings = o.value("strings").toObject();
     for (auto it = strings.begin(); it != strings.end(); ++it) e.strings[it.key().toStdString()] = ss(it.value());
+    if (o.contains("object")) e.object = objectMaskFromJson(o.value("object").toObject());
     return e;
 }
 

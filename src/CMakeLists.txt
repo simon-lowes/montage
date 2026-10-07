@@ -1,5 +1,6 @@
 add_library(montage_engine STATIC
   core/Model.h core/Model.cpp
+  core/ObjectMask.h core/ObjectMask.cpp
   core/Transcript.h core/Transcript.cpp
   core/Captions.h core/Captions.cpp
   core/TranscriptEdit.h core/TranscriptEdit.cpp
@@ -19,6 +20,7 @@ add_library(montage_engine STATIC
   media/AudioSync.h media/AudioSync.cpp
   media/SpeakerSwitch.h media/SpeakerSwitch.cpp
   media/Tracking.h media/Tracking.cpp
+  media/Segmenter.h media/Segmenter.cpp
   render/Processing.h render/Processing.cpp
   render/Retime.h render/Retime.cpp
   render/ClipAnalysis.h render/ClipAnalysis.cpp
@@ -89,6 +91,53 @@ if(MONTAGE_WITH_OCIO)
     target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_OCIO)
   elseif(NOT OpenColorIO_FOUND)
     message(STATUS "OpenColorIO not found: OCIO transforms disabled")
+  endif()
+endif()
+if(MONTAGE_WITH_ONNXRUNTIME)
+  # Microsoft's release archive (unpacked at ONNXRUNTIME_ROOT, or /opt/onnxruntime)
+  # is found by its header and library: its CMake and pkg-config files name a
+  # lib64 folder it does not have. Homebrew ships a CMake package, MSYS2 a
+  # pkg-config file.
+  if(NOT ONNXRUNTIME_ROOT)
+    if(DEFINED ENV{ONNXRUNTIME_ROOT})
+      set(ONNXRUNTIME_ROOT $ENV{ONNXRUNTIME_ROOT})
+    elseif(EXISTS /opt/onnxruntime/include/onnxruntime_cxx_api.h)
+      set(ONNXRUNTIME_ROOT /opt/onnxruntime)
+    endif()
+  endif()
+  set(MONTAGE_ORT_TARGET "")
+  if(ONNXRUNTIME_ROOT)
+    find_path(ORT_INCLUDE_DIR onnxruntime_cxx_api.h PATHS ${ONNXRUNTIME_ROOT}
+      PATH_SUFFIXES include include/onnxruntime NO_DEFAULT_PATH)
+    find_library(ORT_LIBRARY onnxruntime PATHS ${ONNXRUNTIME_ROOT} PATH_SUFFIXES lib lib64 NO_DEFAULT_PATH)
+    if(ORT_INCLUDE_DIR AND ORT_LIBRARY)
+      add_library(montage_onnxruntime INTERFACE)
+      target_include_directories(montage_onnxruntime INTERFACE ${ORT_INCLUDE_DIR})
+      target_link_libraries(montage_onnxruntime INTERFACE ${ORT_LIBRARY})
+      set(MONTAGE_ORT_TARGET montage_onnxruntime)
+      message(STATUS "ONNX Runtime (${ORT_LIBRARY}): object masks enabled")
+    endif()
+  endif()
+  if(NOT MONTAGE_ORT_TARGET)
+    find_package(onnxruntime CONFIG QUIET)
+    if(onnxruntime_FOUND AND TARGET onnxruntime::onnxruntime)
+      set(MONTAGE_ORT_TARGET onnxruntime::onnxruntime)
+      message(STATUS "ONNX Runtime ${onnxruntime_VERSION}: object masks enabled")
+    else()
+      pkg_check_modules(ORT IMPORTED_TARGET libonnxruntime>=1.16)
+      if(ORT_FOUND)
+        set(MONTAGE_ORT_TARGET PkgConfig::ORT)
+        message(STATUS "ONNX Runtime ${ORT_VERSION} (pkg-config): object masks enabled")
+      endif()
+    endif()
+  endif()
+  if(MONTAGE_ORT_TARGET)
+    target_link_libraries(montage_engine PRIVATE ${MONTAGE_ORT_TARGET})
+    target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_ONNXRUNTIME)
+  elseif(MONTAGE_REQUIRE_ONNXRUNTIME)
+    message(FATAL_ERROR "ONNX Runtime not found (set ONNXRUNTIME_ROOT)")
+  else()
+    message(STATUS "ONNX Runtime not found: object masks can be shown but not tracked")
   endif()
 endif()
 if(MONTAGE_WITH_RNNOISE)

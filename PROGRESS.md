@@ -151,4 +151,26 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
   - Export of FCP 7 XML (clipitems with -1 edges around dissolves, Time Remap speed, links, files described once) and FCPXML 1.10 (V1 as the primary storyline, other tracks as connected clips in lanes, gaps, Cross Dissolve, Basic Title, timeMap speed, markers), beside EDL and OTIO.
   - Tested: each of our four exports reads back to the same timeline, plus files written in the style of Resolve (OTIO), Premiere (EDL and FCP 7 XML) and Final Cut (FCPXML with a timecode start, a connected title and audio, and a marker).
   - Still to do: compound and multicam clips from Final Cut (reported, not imported), and AAF.
-- [ ] 20. AI object masks with SAM 2 (XL)
+- [x] 20. AI object masks with SAM 2 (XL):
+  - Model: EdgeTAM, Meta's on-device member of the SAM 2 family (Apache-2.0, about 22x faster than SAM 2), as a four-graph ONNX export that includes the video memory: an image encoder, a prompt/mask decoder, memory attention and a memory encoder.
+    - It runs on ONNX Runtime (optional; Microsoft's archive on Linux, Homebrew on macOS and MSYS2 on Windows, all in CI and the packages).
+    - The 65 MB model is downloaded on first use, from a pinned revision, with each file's SHA-256 checked.
+  - The SAM 2 memory bank is assembled in C++ exactly as the reference does:
+    - the clicked frames and the last six tracked frames as spatial memory, with temporal encodings;
+    - up to 16 object pointers;
+    - the "no memory" embedding on the first frame;
+    - corrective clicks on later frames.
+    - The two learned constants the graphs leave out are taken from the checkpoint. Checked against PyTorch: IoU 1.000 on every frame, logits within 2e-4.
+  - Masks have a new Object shape:
+    - In the Program monitor: click the object, Alt-click what is not part of it, drag a box around it, and Ctrl/Cmd-click to remove a click. The frame is segmented in the background, as part of the same undo step, and shown as a tint with the clicks.
+    - Inspector: ◀ Track / Track ▶ from the playhead (starting at the nearest clicked frame), Clear Frame, Clear All, and a status line.
+  - Segmentations are stored per media frame (not timeline frame), so trims, splits, speed changes and reverse keep them aligned:
+    - 256² logits quantised to 1/8, deflated to a few kB a frame;
+    - kept in the project and shared between undo snapshots.
+  - Rendering: the logits are resampled to the frame, with the edge placed to a fraction of a pixel from the logit field. An exact distance transform (Felzenszwalb–Huttenlocher) makes expansion and feather behave as for the ellipse and rectangle; invert, opacity and Show Mask work too.
+  - `montage-cli models` reports the object model and the ONNX Runtime version. `scripts/fetch-object-model.sh` fetches it for CI or offline installs.
+  - Tested:
+    - with the model (Linux CI, and the macOS and Windows package runs): a click picks a moving ball out of textured footage, then forward and backward tracking at IoU > 0.95 on every frame, the rendered matte, an error without a click, and cancel;
+    - in the app: click, Alt-click, Ctrl-click, box, undo/redo of a click with its segmentation, Track ▶, the inverted render, and save/reopen;
+    - without it: the distance transform against brute force, sub-pixel edge placement, expansion, contraction and feather, frame lookup, and a project round trip.
+  - Still to do: GPU execution providers (CoreML, DirectML), BiRefNet edge refinement, and more than one object per mask.

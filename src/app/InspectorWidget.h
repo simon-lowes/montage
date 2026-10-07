@@ -54,6 +54,8 @@ public:
     // Tracks the mask of `effect` on `clip` from the playhead to the clip's end
     // (forward) or start; model 0 position, 1 + scale, 2 + rotation.
     void trackMask(Id clip, Id effect, bool forward, int model);
+    // Follows the object of `effect`'s Object mask from the playhead to the clip's end (or start).
+    void trackObject(Id clip, Id effect, bool forward);
 
 private:
     // Runs `work` off the UI thread behind a progress dialog with Cancel;

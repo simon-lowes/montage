@@ -904,11 +904,37 @@ private slots:
         fx.s().hdrPeakNits = 1600;
         fx.p.findMedia(fx.media)->colorSpace = "rec2100pq";
         fx.p.findMedia(fx.media)->colorOverride = "slog3-sgamut3cine";
+        // An object mask: clicks on two frames and two segmented frames.
+        {
+            auto obj = std::make_shared<ObjectMask>();
+            obj->fps = 29.97;
+            obj->prompts[12] = {{0.25, 0.5, 1}, {0.75, 0.125, 0}};
+            obj->prompts[40] = {{0.1, 0.2, 2}, {0.6, 0.7, 3}};
+            std::vector<float> logits(size_t(kObjectGrid) * kObjectGrid);
+            for (int y = 0; y < kObjectGrid; ++y)
+                for (int x = 0; x < kObjectGrid; ++x)
+                    logits[size_t(y) * kObjectGrid + size_t(x)] = float(40 - std::hypot(x - 100.0, y - 120.0)) * 0.37f;
+            obj->frames[12] = packObjectLogits(logits.data());
+            obj->frames[13] = packObjectLogits(logits.data());
+            v->effects.back().params["mask.shape"] = Param(3.0);
+            v->effects.back().object = obj;
+            // Packed to 1/8 of a logit, clamped where the sigmoid is flat; a few kB a frame.
+            std::vector<float> back;
+            QVERIFY(obj->logits(12, back));
+            for (size_t i = 0; i < logits.size(); ++i)
+                QVERIFY(std::fabs(back[i] - std::clamp(logits[i], -15.875f, 15.875f)) <= 1.0f / 16 + 1e-6f);
+            QVERIFY2(obj->frames[12].size() < 8000, qPrintable(QString::number(obj->frames[12].size())));
+            QVERIFY(std::fabs(objectCoverage(back) - objectCoverage(logits)) < 0.001);
+            QVERIFY(obj->logitsAt(12.5 / 29.97, back) && !obj->logitsAt(14.2 / 29.97, back));
+            QCOMPARE(obj->frameAt(13 / 29.97), int64_t(13));  // the frame on screen, not the nearest
+            QCOMPARE(obj->frameAt(13.9 / 29.97), int64_t(13));
+        }
         std::string json = projectToJson(fx.p);
         Project back;
         std::string err;
         QVERIFY2(projectFromJson(json, back, &err), err.c_str());
         QVERIFY(back == fx.p);
+        QVERIFY(clipById(*back.active(), r.created[0])->effects.back().object != v->effects.back().object);  // equal by value
         // Garbage is rejected with a message.
         QVERIFY(!projectFromJson("{nope", back, &err));
         QVERIFY(!err.empty());

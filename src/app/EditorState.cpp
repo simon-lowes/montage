@@ -63,6 +63,22 @@ bool EditorState::edit(const QString& label, const std::function<bool(Project&, 
     return true;
 }
 
+bool EditorState::amend(const std::function<bool(Project&, Sequence&)>& fn) {
+    if (gesture_) endGesture(true);
+    Sequence* s = project_.active();
+    if (!s) return false;
+    Project before = project_;
+    if (!fn(project_, *project_.active())) {
+        project_ = std::move(before);
+        return false;
+    }
+    if (project_ == before) return true;
+    history_.touch();
+    emit projectChanged();
+    emit fileStateChanged();
+    return true;
+}
+
 bool EditorState::apply(const QString& label, const std::function<edit::Result(Project&, Sequence&)>& fn) {
     QString err;
     bool ok = edit(label, [&](Project& p, Sequence& s) {

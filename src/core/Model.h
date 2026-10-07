@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "Captions.h"
+#include "ObjectMask.h"
 #include "Transcript.h"
 
 namespace montage {
@@ -69,11 +70,13 @@ struct Effect {
     bool enabled = true;
     std::map<std::string, Param> params;
     std::map<std::string, std::string> strings;
+    // The object picked for an "Object" mask (shared: undo snapshots copy the pointer).
+    std::shared_ptr<const ObjectMask> object;
 
     double p(const std::string& name, FrameTime t, double def = 0) const;
     std::string s(const std::string& name, const std::string& def = {}) const;
     bool empty() const { return type.empty(); }
-    bool operator==(const Effect&) const = default;
+    bool operator==(const Effect&) const;  // compares the object mask by value
 };
 
 // ---------------------------------------------------------------------------

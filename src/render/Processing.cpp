@@ -438,12 +438,132 @@ void flattenOver(Image& img, float r, float g, float b) {
     });
 }
 
-std::vector<float> effectMatte(const Effect& e, FrameTime t, const Image& img, double pixelScale) {
+namespace {
+constexpr double kFar = 1e30;
+// Squared distance transform of one row or column: the lower envelope of the
+// parabolas rooted at the finite entries of f (seeds are 0, others kFar).
+void edt1d(const double* f, double* d, int n, int* v, double* z) {
+    int k = -1;
+    for (int q = 0; q < n; ++q) {
+        if (f[q] >= kFar) continue;
+        double s = -kFar;
+        while (k >= 0) {
+            const int p = v[k];
+            s = ((f[q] + double(q) * q) - (f[p] + double(p) * p)) / (2.0 * (q - p));
+            if (s > z[k]) break;
+            --k;
+        }
+        ++k;
+        v[k] = q;
+        z[k] = k == 0 ? -kFar : s;
+        z[k + 1] = kFar;
+    }
+    if (k < 0) {
+        std::fill(d, d + n, kFar);
+        return;
+    }
+    int j = 0;
+    for (int q = 0; q < n; ++q) {
+        while (z[j + 1] < q) ++j;
+        d[q] = double(q - v[j]) * (q - v[j]) + f[v[j]];
+    }
+}
+}  // namespace
+
+std::vector<float> distanceTransform(const std::vector<uint8_t>& seed, int w, int h) {
+    std::vector<double> g(size_t(w) * size_t(h));
+    for (size_t i = 0; i < g.size(); ++i) g[i] = seed[i] ? 0.0 : kFar;
+    // Columns, then rows.
+    parallelRows(w, [&](int x0, int x1) {
+        std::vector<double> f(static_cast<size_t>(h)), d(static_cast<size_t>(h)), z(static_cast<size_t>(h) + 1);
+        std::vector<int> v(static_cast<size_t>(h));
+        for (int x = x0; x < x1; ++x) {
+            for (int y = 0; y < h; ++y) f[size_t(y)] = g[size_t(y) * size_t(w) + size_t(x)];
+            edt1d(f.data(), d.data(), h, v.data(), z.data());
+            for (int y = 0; y < h; ++y) g[size_t(y) * size_t(w) + size_t(x)] = d[size_t(y)];
+        }
+    });
+    std::vector<float> out(g.size());
+    parallelRows(h, [&](int y0, int y1) {
+        std::vector<double> d(static_cast<size_t>(w)), z(static_cast<size_t>(w) + 1);
+        std::vector<int> v(static_cast<size_t>(w));
+        for (int y = y0; y < y1; ++y) {
+            edt1d(&g[size_t(y) * size_t(w)], d.data(), w, v.data(), z.data());
+            for (int x = 0; x < w; ++x) out[size_t(y) * size_t(w) + size_t(x)] = float(d[size_t(x)] >= kFar ? 1e15 : std::sqrt(d[size_t(x)]));
+        }
+    });
+    return out;
+}
+
+std::vector<float> objectMatte(const std::vector<float>& logits, int W, int H, double feather, double expand) {
+    std::vector<float> matte(size_t(W) * size_t(H), 0.f);
+    constexpr int G = kObjectGrid;
+    if (logits.size() != size_t(G) * G || W <= 0 || H <= 0) return matte;
+    // The logits resampled to the image (bilinear, pixel centres aligned as the model's upsampling is).
+    std::vector<float> L(size_t(W) * size_t(H));
+    parallelRows(H, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y) {
+            const double gy = std::clamp((y + 0.5) * G / H - 0.5, 0.0, G - 1.0);
+            const int ya = int(gy), yb = std::min(ya + 1, G - 1);
+            const float fy = float(gy - ya);
+            for (int x = 0; x < W; ++x) {
+                const double gx = std::clamp((x + 0.5) * G / W - 0.5, 0.0, G - 1.0);
+                const int xa = int(gx), xb = std::min(xa + 1, G - 1);
+                const float fx = float(gx - xa);
+                const float a = logits[size_t(ya) * G + size_t(xa)] + (logits[size_t(ya) * G + size_t(xb)] - logits[size_t(ya) * G + size_t(xa)]) * fx;
+                const float b = logits[size_t(yb) * G + size_t(xa)] + (logits[size_t(yb) * G + size_t(xb)] - logits[size_t(yb) * G + size_t(xa)]) * fx;
+                L[size_t(y) * size_t(W) + size_t(x)] = a + (b - a) * fy;
+            }
+        }
+    });
+    // Signed distance to the edge (negative inside). Next to the edge it comes
+    // from the logit field's zero crossing (sub-pixel, so the edge is smooth);
+    // further away from an exact distance transform, needed only when the edge
+    // is expanded, contracted or feathered beyond a couple of pixels.
+    const bool far = std::fabs(expand) > 0.25 || feather > 2.5;
+    std::vector<float> distIn, distOut;
+    if (far) {
+        std::vector<uint8_t> inside(L.size()), outside(L.size());
+        for (size_t i = 0; i < L.size(); ++i) {
+            inside[i] = L[i] > 0;
+            outside[i] = !inside[i];
+        }
+        distOut = distanceTransform(inside, W, H);  // from outside pixels to the object
+        distIn = distanceTransform(outside, W, H);  // from inside pixels to the background
+    }
+    const double fe = std::max(1.0, feather);
+    parallelRows(H, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y)
+            for (int x = 0; x < W; ++x) {
+                const size_t i = size_t(y) * size_t(W) + size_t(x);
+                const float l = L[i];
+                const float gx = L[size_t(y) * size_t(W) + size_t(std::min(x + 1, W - 1))] - L[size_t(y) * size_t(W) + size_t(std::max(x - 1, 0))];
+                const float gy = L[size_t(std::min(y + 1, H - 1)) * size_t(W) + size_t(x)] - L[size_t(std::max(y - 1, 0)) * size_t(W) + size_t(x)];
+                const double grad = 0.5 * std::sqrt(double(gx) * gx + double(gy) * gy);
+                double d = grad > 1e-6 ? -l / grad : (l > 0 ? -1e6 : 1e6);
+                if (far && std::fabs(d) > 1.0) d = l > 0 ? -(distIn[i] - 0.5) : distOut[i] - 0.5;
+                d -= expand;
+                const double k = std::clamp(0.5 - d / fe, 0.0, 1.0);
+                matte[i] = float(k * k * (3 - 2 * k));
+            }
+    });
+    return matte;
+}
+
+std::vector<float> effectMatte(const Effect& e, FrameTime t, const Image& img, double pixelScale, double sourceSeconds) {
     std::vector<float> matte;
     if (img.empty() || !hasMask(e, t)) return matte;
     const int W = img.width, H = img.height;
     matte.assign(size_t(W) * size_t(H), 1.0f);
     const int shape = int(std::lround(e.p("mask.shape", t)));
+    if (shape == 3) {
+        // An object picked by the model: nothing where it was not segmented.
+        std::vector<float> logits;
+        if (e.object && sourceSeconds >= 0 && e.object->logitsAt(sourceSeconds, logits))
+            matte = objectMatte(logits, W, H, e.p("mask.feather", t, 20) * pixelScale, e.p("mask.expansion", t) * pixelScale);
+        else
+            std::fill(matte.begin(), matte.end(), 0.f);
+    }
     if (shape == 1 || shape == 2) {
         // Image pixels, centred on the mask and rotated into its axes.
         const double cx = e.p("mask.x", t, 0.5) * W, cy = e.p("mask.y", t, 0.5) * H;
@@ -600,7 +720,7 @@ void applyVideoEffect(const Effect& e, FrameTime t, Image& img, double pixelScal
         applyEffectUnmasked(e, t, img, pixelScale);
         return;
     }
-    const std::vector<float> matte = effectMatte(e, t, img, pixelScale);
+    const std::vector<float> matte = effectMatte(e, t, img, pixelScale, sourceSeconds);
     if (e.p("mask.show", t) > 0.5) {
         // The mask itself, as grey over the clip's shape.
         for (size_t i = 0; i < matte.size(); ++i) {

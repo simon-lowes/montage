@@ -37,11 +37,21 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install dependencies
         # Only the Qt modules Montage uses; the "qt" formula installs all of Qt.
-        run: brew install qtbase qtmultimedia ffmpeg opencolorio lilv ninja pkgconf
+        run: brew install qtbase qtmultimedia ffmpeg opencolorio lilv onnxruntime ninja pkgconf
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(brew --prefix)"
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(brew --prefix)" -DMONTAGE_REQUIRE_ONNXRUNTIME=ON
       - name: Build
         run: cmake --build build
+      - name: Cache the object model
+        uses: actions/cache@v4
+        with:
+          path: ~/object-model
+          key: edgetam-video-8ca3d3e
+      - name: Object model for the object mask tests
+        run: |
+          scripts/fetch-object-model.sh ~/object-model \
+            && echo "MONTAGE_OBJECT_MODEL=$HOME/object-model" >> "$GITHUB_ENV" \
+            || echo "::warning::Could not download the object model; object mask tests will be skipped"
       - name: Test
         run: ctest --test-dir build --output-on-failure
       - name: Package
@@ -75,14 +85,25 @@ jobs:
         with:
           msystem: UCRT64
           update: true
-          install: zip
+          install: zip curl
           pacboy: >-
             gcc:p cmake:p ninja:p pkgconf:p
-            qt6-base:p qt6-multimedia:p qt6-tools:p ffmpeg:p opencolorio:p lilv:p
+            qt6-base:p qt6-multimedia:p qt6-tools:p ffmpeg:p opencolorio:p lilv:p onnxruntime:p
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DMONTAGE_REQUIRE_ONNXRUNTIME=ON
       - name: Build
         run: cmake --build build
+      - name: Cache the object model
+        uses: actions/cache@v4
+        with:
+          path: ~/object-model
+          key: edgetam-video-8ca3d3e
+      - name: Object model for the object mask tests
+        run: |
+          dir="$(cygpath -u "$USERPROFILE")/object-model"  # where actions/cache's ~ points
+          scripts/fetch-object-model.sh "$dir" \
+            && echo "MONTAGE_OBJECT_MODEL=$(cygpath -m "$dir")" >> "$GITHUB_ENV" \
+            || echo "::warning::Could not download the object model; object mask tests will be skipped"
       - name: Test
         # A failing Qt Test binary is run again directly so its own log shows.
         run: |

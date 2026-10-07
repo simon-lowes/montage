@@ -23,6 +23,8 @@ option(MONTAGE_WITH_WHISPER "Speech-to-text with whisper.cpp (MIT, fetched at co
 option(MONTAGE_WITH_RNNOISE "Voice isolation with RNNoise (BSD, fetched with its model at configure time)" ON)
 option(MONTAGE_WITH_LV2 "Host LV2 audio plugins, when lilv is installed" ON)
 option(MONTAGE_WITH_OCIO "OpenColorIO configs and ACES transforms, when OpenColorIO 2.1+ is installed" ON)
+option(MONTAGE_WITH_ONNXRUNTIME "AI object masks (EdgeTAM), when ONNX Runtime 1.16+ is installed (ONNXRUNTIME_ROOT or the usual prefixes)" ON)
+option(MONTAGE_REQUIRE_ONNXRUNTIME "Fail to configure without ONNX Runtime (release builds)" OFF)
 
 find_package(Qt6 6.4 REQUIRED COMPONENTS Core Gui Concurrent Xml)
 if(MONTAGE_BUILD_APP)

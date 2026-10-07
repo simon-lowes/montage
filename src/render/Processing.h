@@ -18,8 +18,17 @@ namespace montage {
 void applyVideoEffect(const Effect& e, FrameTime t, Image& img, double pixelScale, double sourceSeconds = -1);
 
 // The effect's mask (Effects.h maskInfo) over `img` as one value in 0..1 per
-// pixel; the qualifier reads the colours of `img`. Empty when there is no mask.
-std::vector<float> effectMatte(const Effect& e, FrameTime t, const Image& img, double pixelScale);
+// pixel; the qualifier reads the colours of `img`, an object mask the frame
+// of the media at `sourceSeconds`. Empty when there is no mask.
+std::vector<float> effectMatte(const Effect& e, FrameTime t, const Image& img, double pixelScale, double sourceSeconds = -1);
+
+// Euclidean distance (px) from each pixel to the nearest pixel where seed is
+// non-zero (exact; Felzenszwalb–Huttenlocher). Very large where there is no seed.
+std::vector<float> distanceTransform(const std::vector<uint8_t>& seed, int w, int h);
+
+// An object mask's matte at w x h from its logits (ObjectMask.h grid): a
+// sub-pixel edge, moved out by `expand` px and softened over `feather` px.
+std::vector<float> objectMatte(const std::vector<float>& logits, int w, int h, double feather, double expand);
 
 // 3D LUT loaded from a .cube file.
 struct Lut3D {

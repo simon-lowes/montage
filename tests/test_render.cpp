@@ -242,6 +242,70 @@ colorspaces:
         QVERIFY(c[0] > 0.36f && c[0] < 0.5f);
     }
 
+    void objectMaskMatte() {
+        // Exact distances, checked against brute force on scattered seeds.
+        const int w = 37, h = 23;
+        std::vector<uint8_t> seed(size_t(w) * h, 0);
+        for (int i = 0; i < 9; ++i) seed[size_t((i * 7919) % (w * h))] = 1;
+        const std::vector<float> d = distanceTransform(seed, w, h);
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                double best = 1e9;
+                for (int k = 0; k < w * h; ++k)
+                    if (seed[size_t(k)]) best = std::min(best, std::hypot(x - k % w, y - k / w));
+                QVERIFY2(std::fabs(d[size_t(y) * w + size_t(x)] - best) < 1e-4, qPrintable(QString("%1,%2").arg(x).arg(y)));
+            }
+        QVERIFY(distanceTransform(std::vector<uint8_t>(size_t(w) * h, 0), w, h)[5] > 1e9);  // no seeds: far away
+
+        // Logits of a disc of radius 40.3 grid cells: 100.75 px in a 640 x 360 picture (the
+        // grid spans the frame, so its cells are 2.5 px wide and 1.40625 px tall), centred.
+        std::vector<float> logits(size_t(kObjectGrid) * kObjectGrid);
+        for (int y = 0; y < kObjectGrid; ++y)
+            for (int x = 0; x < kObjectGrid; ++x)
+                logits[size_t(y) * kObjectGrid + size_t(x)] = float(40.3 - std::hypot(x + 0.5 - 128, (y + 0.5 - 128) * 360 / 640.0)) * 0.6f;
+        auto area = [](const std::vector<float>& m) {
+            double a = 0;
+            for (float v : m) a += v;
+            return a;
+        };
+        auto radius = [&](const std::vector<float>& m) { return std::sqrt(area(m) / M_PI); };
+        const std::vector<float> sharp = objectMatte(logits, 640, 360, 1, 0);
+        QVERIFY2(std::fabs(radius(sharp) - 100.75) < 0.5, qPrintable(QString::number(radius(sharp))));
+        // The edge is placed to a fraction of a pixel: a row's coverage is the chord's length.
+        double row = 0;
+        for (int x = 0; x < 640; ++x) row += sharp[size_t(180) * 640 + size_t(x)];
+        QVERIFY2(std::fabs(row - 2 * std::sqrt(100.75 * 100.75 - 0.25)) < 0.3, qPrintable(QString::number(row)));
+        // Expansion grows the edge outwards by that many pixels, contraction shrinks it.
+        QVERIFY2(std::fabs(radius(objectMatte(logits, 640, 360, 1, 12)) - 112.75) < 0.6,
+                 qPrintable(QString::number(radius(objectMatte(logits, 640, 360, 1, 12)))));
+        QVERIFY(std::fabs(radius(objectMatte(logits, 640, 360, 1, -20)) - 80.75) < 0.6);
+        // Feathering keeps the area but softens the edge over its width.
+        const std::vector<float> soft = objectMatte(logits, 640, 360, 30, 0);
+        QVERIFY2(std::fabs(radius(soft) - 100.75) < 1.5, qPrintable(QString::number(radius(soft))));
+        QVERIFY(soft[size_t(180) * 640 + 320 + 100] > 0.4f && soft[size_t(180) * 640 + 320 + 100] < 0.6f);
+        QVERIFY(soft[size_t(180) * 640 + 320 + 90] > 0.9f && soft[size_t(180) * 640 + 320 + 112] < 0.1f);
+        // Through an effect: only frames that were segmented, inverted on request.
+        Project p = makeDefaultProject();
+        Effect e = makeEffect(p, "invert");
+        e.params["mask.shape"] = Param(3.0);
+        e.params["mask.feather"] = Param(1.0);
+        auto obj = std::make_shared<ObjectMask>();
+        obj->fps = 25;
+        obj->frames[10] = packObjectLogits(logits.data());
+        e.object = obj;
+        Image img(640, 360);
+        img.fill(0.2f, 0.4f, 0.6f, 1);
+        QVERIFY(std::fabs(area(effectMatte(e, 0, img, 1.0, 10.2 / 25)) - M_PI * 100.75 * 100.75) < 300);
+        QCOMPARE(area(effectMatte(e, 0, img, 1.0, 11.2 / 25)), 0.0);
+        QCOMPARE(area(effectMatte(e, 0, img, 1.0, -1)), 0.0);  // not footage (a still or generator)
+        e.params["mask.invert"] = Param(1.0);
+        QVERIFY(std::fabs(area(effectMatte(e, 0, img, 1.0, 10.2 / 25)) - (640 * 360 - M_PI * 100.75 * 100.75)) < 300);
+        // The effect applies inside the object only.
+        e.params["mask.invert"] = Param(0.0);
+        applyVideoEffect(e, 0, img, 1.0, 10.2 / 25);
+        QVERIFY(std::fabs(img.at(320, 180)[0] - 0.8f) < 1e-4 && std::fabs(img.at(20, 20)[0] - 0.2f) < 1e-4);
+    }
+
     void multicamShowsOneAngle() {
         // A multicam sequence with a red and a blue angle (the blue one on top).
         Project p = makeDefaultProject();

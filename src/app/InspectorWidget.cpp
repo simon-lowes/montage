@@ -27,6 +27,7 @@
 #include <utility>
 
 #include "EditorState.h"
+#include "ObjectModel.h"
 #include "PluginEditorWindow.h"
 #include "Theme.h"
 #include "audio/PluginEffect.h"
@@ -100,7 +101,9 @@ QString InspectorWidget::signature() const {
         return sig;
     }
     QString sig = QString("C%1:%2").arg(c->id).arg(QString::fromStdString(c->generator.type));
-    for (const auto& e : c->effects) sig += QString(":%1%2").arg(e.id).arg(e.enabled ? "+" : "-");
+    // Object masks have their own controls: rebuild when one is chosen.
+    for (const auto& e : c->effects)
+        sig += QString(":%1%2%3").arg(e.id).arg(e.enabled ? "+" : "-").arg(std::lround(e.p("mask.shape", 0)) == 3 ? "o" : "");
     return sig;
 }
 
@@ -471,7 +474,70 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
             QFormLayout* mf = addSection(tr("%1 Mask").arg(QString::fromStdString(info->displayName)), nullptr,
                                          !hasMask(e, localTime()));
             addParamRows(mf, maskInfo(), target(eid));
-            if (onClip) {
+            if (onClip && std::lround(e.p("mask.shape", localTime())) == 3) {
+                // An object picked in the viewer, then followed through the clip.
+                auto* status = new QLabel(content_);
+                status->setObjectName(QStringLiteral("objectStatus"));
+                status->setWordWrap(true);
+                auto read = [this, owner, eid]() -> QString {
+                    const Sequence* sq = state_->sequence();
+                    const Effect* ef = sq ? edit::ownedEffect(const_cast<Sequence&>(*sq), owner, eid) : nullptr;
+                    if (!ef || !ef->object || ef->object->prompts.empty())
+                        return tr("Click the object in the viewer. Alt-click what is not part of it, or drag a box around it.");
+                    return tr("%n frame(s) clicked", "", int(ef->object->prompts.size())) + QStringLiteral(", ") +
+                           tr("%n segmented", "", int(ef->object->frames.size()));
+                };
+                status->setText(read());
+                refreshers_.push_back([status, read] { status->setText(read()); });
+                mf->addRow(QString(), status);
+                auto* row = new QWidget(content_);
+                auto* rh = new QHBoxLayout(row);
+                rh->setContentsMargins(0, 0, 0, 0);
+                auto* back = new QToolButton(row);
+                back->setText(tr("◀ Track"));
+                back->setObjectName(QStringLiteral("trackObjectBack"));
+                back->setToolTip(tr("Follow the object backwards from the playhead to the clip's start"));
+                auto* fwd = new QToolButton(row);
+                fwd->setText(tr("Track ▶"));
+                fwd->setObjectName(QStringLiteral("trackObjectForward"));
+                fwd->setToolTip(tr("Follow the object from the playhead to the clip's end"));
+                auto* clear = new QToolButton(row);
+                clear->setText(tr("Clear Frame"));
+                clear->setObjectName(QStringLiteral("clearObjectFrame"));
+                clear->setToolTip(tr("Remove the clicks on this frame"));
+                auto* reset = new QToolButton(row);
+                reset->setText(tr("Clear All"));
+                reset->setObjectName(QStringLiteral("clearObject"));
+                reset->setToolTip(tr("Remove every click and the tracked object"));
+                for (QToolButton* b : {back, fwd, clear, reset}) rh->addWidget(b);
+                rh->addStretch(1);
+                mf->addRow(tr("Object:"), row);
+                for (auto [button, forward] : {std::pair{back, false}, std::pair{fwd, true}})
+                    connect(button, &QToolButton::clicked, this, [this, owner, eid, forward = forward] {
+                        QTimer::singleShot(0, this, [this, owner, eid, forward] { trackObject(owner, eid, forward); });
+                    });
+                connect(clear, &QToolButton::clicked, this, [this, owner, eid] {
+                    const Sequence* sq = state_->sequence();
+                    const Clip* cl = sq ? edit::clipById(*sq, owner) : nullptr;
+                    if (!cl) return;
+                    const FrameTime lt = state_->playhead() - cl->start;
+                    state_->edit(tr("Clear Object Clicks"), [owner, eid, lt](Project& p, Sequence& s) {
+                        Clip* c = edit::clipById(s, owner);
+                        Effect* ef = c ? edit::ownedEffect(s, owner, eid) : nullptr;
+                        if (!c || !ef || !ef->object) return false;
+                        ef->object = withObjectPrompts(p, s, *c, *ef, lt, {});
+                        return true;
+                    });
+                });
+                connect(reset, &QToolButton::clicked, this, [this, owner, eid] {
+                    state_->edit(tr("Clear Object"), [owner, eid](Project&, Sequence& s) {
+                        Effect* ef = edit::ownedEffect(s, owner, eid);
+                        if (!ef || !ef->object) return false;
+                        ef->object.reset();
+                        return true;
+                    });
+                });
+            } else if (onClip) {
                 // Make the mask follow what it covers, from the playhead on (or back).
                 auto* row = new QWidget(content_);
                 auto* rh = new QHBoxLayout(row);
@@ -1094,6 +1160,38 @@ void InspectorWidget::trackMask(Id clip, Id effect, bool forward, int model) {
         return true;
     });
     state_->message(tr("Tracked %n frame(s)", "", int(keys.size())), 4000);
+}
+
+void InspectorWidget::trackObject(Id clip, Id effect, bool forward) {
+    const Sequence* s = state_->sequence();
+    const Clip* c = s ? edit::clipById(*s, clip) : nullptr;
+    const Effect* e = s ? edit::ownedEffect(const_cast<Sequence&>(*s), clip, effect) : nullptr;
+    if (!c || !e) return;
+    if (!e->object || e->object->prompts.empty()) {
+        state_->message(tr("Click the object in the viewer first, then track it"), 5000);
+        return;
+    }
+    if (!ensureObjectModel(window())) return;
+    auto project = std::make_shared<const Project>(state_->project());
+    const Id seqId = s->id;
+    const FrameTime from = std::clamp<FrameTime>(state_->playhead() - c->start, 0, c->duration - 1);
+    std::shared_ptr<const ObjectMask> result;
+    const bool ok = runAnalysis(tr("Tracking the object..."), [&, project, seqId](const auto& progress, const auto* cancel, std::string* err) {
+        const Sequence* sq = project->findSequence(seqId);
+        const Clip* cl = sq ? edit::clipById(*sq, clip) : nullptr;
+        const Effect* ef = sq ? edit::ownedEffect(const_cast<Sequence&>(*sq), clip, effect) : nullptr;
+        if (!cl || !ef || !ef->object) return false;
+        result = trackClipObject(*project, *sq, *cl, *ef->object, from, forward, progress, cancel, err);
+        return result != nullptr;
+    });
+    if (!ok) return;
+    state_->edit(tr("Track Object"), [clip, effect, result](Project&, Sequence& sq) {
+        Effect* ef = edit::ownedEffect(sq, clip, effect);
+        if (!ef) return false;
+        ef->object = result;
+        return true;
+    });
+    state_->message(tr("Tracked the object: %n frame(s) segmented", "", int(result->frames.size())), 4000);
 }
 
 }  // namespace montage
