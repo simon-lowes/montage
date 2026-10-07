@@ -42,3 +42,19 @@ add_dependencies(test_plugins montage_test_plugins montage_test_hang montage_tes
 target_compile_definitions(test_plugins PRIVATE
   MONTAGE_TEST_CLAP_DIR="${CMAKE_CURRENT_BINARY_DIR}/clap"
   MONTAGE_PLUGIN_PROBE="$<TARGET_FILE:montage-plugin-probe>")
+
+if(MONTAGE_WITH_VST3)
+  # A VST3 gain written against the SDK interfaces, built as one .vst3 file.
+  set(VST3SDK ${PROJECT_SOURCE_DIR}/third_party/vst3sdk)
+  add_library(montage_test_vst3 MODULE plugins/test_vst3_gain.cpp
+    ${VST3SDK}/pluginterfaces/base/funknown.cpp
+    ${VST3SDK}/pluginterfaces/base/coreiids.cpp
+    ${VST3SDK}/public.sdk/source/vst/vstinitiids.cpp)
+  target_include_directories(montage_test_vst3 PRIVATE ${VST3SDK})
+  target_compile_options(montage_test_vst3 PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-w>)
+  set_target_properties(montage_test_vst3 PROPERTIES PREFIX "" SUFFIX ".vst3" OUTPUT_NAME MontageTestVst3
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/vst3
+    CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON)
+  add_dependencies(test_plugins montage_test_vst3)
+  target_compile_definitions(test_plugins PRIVATE MONTAGE_TEST_VST3_DIR="${CMAKE_CURRENT_BINARY_DIR}/vst3")
+endif()

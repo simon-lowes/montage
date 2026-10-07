@@ -20,6 +20,25 @@ add_library(montage_engine STATIC
 )
 target_include_directories(montage_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(montage_engine PRIVATE ${PROJECT_SOURCE_DIR}/third_party/clap/include)
+
+if(MONTAGE_WITH_VST3)
+  # The VST 3 interfaces and the few SDK host helpers Montage uses (MIT).
+  set(VST3SDK ${PROJECT_SOURCE_DIR}/third_party/vst3sdk)
+  set(MONTAGE_VST3SDK_SOURCES
+    ${VST3SDK}/pluginterfaces/base/funknown.cpp
+    ${VST3SDK}/pluginterfaces/base/coreiids.cpp
+    ${VST3SDK}/public.sdk/source/vst/vstinitiids.cpp
+    ${VST3SDK}/public.sdk/source/vst/hosting/hostclasses.cpp
+    ${VST3SDK}/public.sdk/source/vst/hosting/pluginterfacesupport.cpp
+    ${VST3SDK}/public.sdk/source/vst/hosting/parameterchanges.cpp
+    ${VST3SDK}/public.sdk/source/vst/utility/stringconvert.cpp
+    ${VST3SDK}/public.sdk/source/common/commonstringconvert.cpp
+    ${VST3SDK}/public.sdk/source/common/memorystream.cpp)
+  set_source_files_properties(${MONTAGE_VST3SDK_SOURCES} PROPERTIES COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-w>")
+  target_sources(montage_engine PRIVATE audio/Vst3Host.cpp ${MONTAGE_VST3SDK_SOURCES})
+  target_include_directories(montage_engine PRIVATE ${VST3SDK})
+  target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_VST3)
+endif()
 target_compile_definitions(montage_engine PUBLIC MONTAGE_VERSION="${PROJECT_VERSION}")
 target_link_libraries(montage_engine PUBLIC Qt6::Core Qt6::Gui PkgConfig::FFMPEG Threads::Threads ${CMAKE_DL_LIBS})
 if(APPLE)

@@ -16,6 +16,7 @@ public:
     bool open(const std::string& path, std::string* error);
     void* symbol(const char* name) const;
     bool isOpen() const { return handle_ != nullptr; }
+    void* handle() const { return handle_; }
 
 private:
     void* handle_ = nullptr;

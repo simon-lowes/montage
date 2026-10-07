@@ -43,7 +43,12 @@ std::optional<Format> formatFromName(std::string_view name) {
     return std::nullopt;
 }
 
-bool canHost(Format f) { return f == Format::Clap; }
+bool canHost(Format f) {
+#ifdef MONTAGE_WITH_VST3
+    if (f == Format::Vst3) return true;
+#endif
+    return f == Format::Clap;
+}
 
 namespace {
 
@@ -149,9 +154,9 @@ std::optional<std::vector<Descriptor>> readLv2Bundle(const std::string& path) {
     QFile mf(bundle + "/manifest.ttl");
     if (!mf.open(QIODevice::ReadOnly)) return std::nullopt;
     const QString manifest = QString::fromUtf8(mf.readAll());
-    // Subjects declared "a lv2:Plugin" and the files they point to with rdfs:seeAlso.
-    static const QRegularExpression subjectRe(QStringLiteral("<([^>]+)>\\s+a\\s+[^;.]*lv2:Plugin([^.]*)\\."),
-                                              QRegularExpression::DotMatchesEverythingOption);
+    // Statements "<uri> a ... ." (a Turtle statement ends at a dot followed by
+    // whitespace, so file names like comp.so stay inside it).
+    static const QRegularExpression subjectRe(QStringLiteral("<([^>]+)>\\s+a\\s+((?:[^.]|\\.(?=\\S))*)\\.(?=\\s|$)"));
     static const QRegularExpression seeAlsoRe(QStringLiteral("rdfs:seeAlso\\s+<([^>]+)>"));
     static const QRegularExpression nameRe(QStringLiteral("doap:name\\s+\"([^\"]+)\""));
     static const QRegularExpression typeRe(QStringLiteral("\\ba\\s+([^;]*lv2:\\w*Plugin[^;]*);"));
@@ -159,6 +164,8 @@ std::optional<std::vector<Descriptor>> readLv2Bundle(const std::string& path) {
     auto it = subjectRe.globalMatch(manifest);
     while (it.hasNext()) {
         auto m = it.next();
+        if (!m.captured(2).contains(QLatin1String("lv2:Plugin")) && !m.captured(2).contains(QLatin1String("lv2core#Plugin")))
+            continue;
         Descriptor d;
         d.format = Format::Lv2;
         d.pluginId = m.captured(1).toStdString();
@@ -327,14 +334,34 @@ std::optional<std::vector<Descriptor>> readStaticMetadata(Format f, const std::s
     return std::nullopt;
 }
 
-// Implemented per format (ClapHost.cpp).
+// Implemented per format (ClapHost.cpp, Vst3Host.cpp).
 std::vector<Descriptor> probeClap(const std::string& path, std::string* error);
+std::unique_ptr<Instance> instantiateClap(const Descriptor& d, std::string* error);
+#ifdef MONTAGE_WITH_VST3
+std::vector<Descriptor> probeVst3(const std::string& path, std::string* error);
+std::unique_ptr<Instance> instantiateVst3(const Descriptor& d, std::string* error);
+#endif
 
 std::vector<Descriptor> probeInProcess(Format f, const std::string& path, std::string* error) {
     if (f == Format::Clap) return probeClap(path, error);
+#ifdef MONTAGE_WITH_VST3
+    if (f == Format::Vst3) return probeVst3(path, error);
+#endif
     if (auto s = readStaticMetadata(f, path)) return *s;
     if (error) *error = std::string(formatName(f)) + " plugins without metadata cannot be probed by this build";
     return {};
+}
+
+std::unique_ptr<Instance> instantiate(const Descriptor& d, std::string* error) {
+    switch (d.format) {
+        case Format::Clap: return instantiateClap(d, error);
+#ifdef MONTAGE_WITH_VST3
+        case Format::Vst3: return instantiateVst3(d, error);
+#endif
+        default: break;
+    }
+    if (error) *error = std::string(formatName(d.format)) + " plugins cannot be run by this version yet";
+    return nullptr;
 }
 
 // ---------------------------------------------------------------------------

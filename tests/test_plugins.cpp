@@ -108,6 +108,54 @@ private slots:
         QCOMPARE(descriptorsFromJson(descriptorsToJson(ds)), ds);
     }
 
+    void readsMetadataWithoutLoadingCode() {
+        // VST3 bundle with moduleinfo.json (JSON5 style: comments, trailing commas).
+        const QString vst3 = path("Fake EQ.vst3");
+        QVERIFY(QDir().mkpath(vst3 + "/Contents/Resources"));
+        {
+            QFile f(vst3 + "/Contents/Resources/moduleinfo.json");
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(R"({
+  "Name": "Fake EQ", // module name
+  "Factory Info": { "Vendor": "Fake Audio", },
+  "Classes": [
+    { "CID": "0123456789ABCDEF0123456789ABCDEF", "Category": "Audio Module Class", "Name": "Fake EQ",
+      "Version": "2.1.0", "Sub Categories": ["Fx", "EQ",], },
+    { "CID": "FEDCBA9876543210FEDCBA9876543210", "Category": "Component Controller Class", "Name": "Fake EQ Controller" },
+  ],
+})");
+        }
+        auto vd = readStaticMetadata(Format::Vst3, vst3.toStdString());
+        QVERIFY(vd.has_value());
+        QCOMPARE(vd->size(), size_t(1));
+        QCOMPARE(QString::fromStdString((*vd)[0].name), QString("Fake EQ"));
+        QCOMPARE(QString::fromStdString((*vd)[0].vendor), QString("Fake Audio"));
+        QCOMPARE(QString::fromStdString((*vd)[0].category), QString("EQ"));
+        QCOMPARE(QString::fromStdString((*vd)[0].id), QString("vst3:0123456789ABCDEF0123456789ABCDEF"));
+        QCOMPARE(findPluginFiles(Format::Vst3, {dir_.path().toStdString()}).size(), size_t(1));
+
+        // LV2 bundle: manifest.ttl names the plugin, its .ttl file the details.
+        const QString lv2 = path("fake-comp.lv2");
+        QVERIFY(QDir().mkpath(lv2));
+        {
+            QFile m(lv2 + "/manifest.ttl");
+            QVERIFY(m.open(QIODevice::WriteOnly));
+            m.write("@prefix lv2: <http://lv2plug.in/ns/lv2core#> .\n"
+                    "@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n"
+                    "<urn:fake:comp> a lv2:Plugin ;\n    lv2:binary <comp.so> ;\n    rdfs:seeAlso <comp.ttl> .\n");
+            QFile t(lv2 + "/comp.ttl");
+            QVERIFY(t.open(QIODevice::WriteOnly));
+            t.write("<urn:fake:comp> a lv2:Plugin, lv2:CompressorPlugin ;\n    doap:name \"Fake Compressor\" .\n");
+        }
+        auto ld = readStaticMetadata(Format::Lv2, lv2.toStdString());
+        QVERIFY(ld.has_value());
+        QCOMPARE(ld->size(), size_t(1));
+        QCOMPARE(QString::fromStdString((*ld)[0].name), QString("Fake Compressor"));
+        QCOMPARE(QString::fromStdString((*ld)[0].pluginId), QString("urn:fake:comp"));
+        QCOMPARE(QString::fromStdString((*ld)[0].category), QString("Dynamics"));
+        QCOMPARE(findPluginFiles(Format::Lv2, {dir_.path().toStdString()}).size(), size_t(1));
+    }
+
     void scanProbesNewFilesAndCachesThem() {
         const QString cache = path("cache-good.json");
         {
@@ -190,6 +238,63 @@ private slots:
         QVERIFY(other->loadState(state));
         QCOMPARE(other->parameter(7), 0.5);
     }
+
+#ifdef MONTAGE_WITH_VST3
+    void probesAndHostsAVst3Plugin() {
+        const std::string dir = MONTAGE_TEST_VST3_DIR;
+        auto files = findPluginFiles(Format::Vst3, {dir});
+        QCOMPARE(files.size(), size_t(1));
+        std::string err;
+        auto ds = probeInProcess(Format::Vst3, files[0], &err);
+        QVERIFY2(err.empty(), err.c_str());
+        QCOMPARE(ds.size(), size_t(1));  // the controller class is not listed
+        const Descriptor& d = ds[0];
+        QCOMPARE(QString::fromStdString(d.name), QString("Montage Test VST3 Gain"));
+        QCOMPARE(QString::fromStdString(d.vendor), QString("Montage"));
+        QCOMPARE(QString::fromStdString(d.category), QString("Utility"));
+        QCOMPARE(d.pluginId.size(), size_t(32));
+        QVERIFY(canHost(Format::Vst3));
+
+        // Scanned through the probe process like CLAP files without metadata.
+        Registry r;
+        isolate(r, path("cache-vst3.json"), {});
+        r.setSearchPaths(Format::Vst3, {dir});
+        ScanReport rep = r.scan();
+        QCOMPARE(rep.probed, 1);
+        QVERIFY(r.find(d.id).has_value());
+
+        auto inst = instantiate(d, &err);
+        QVERIFY2(inst, err.c_str());
+        QVERIFY(inst->activate(48000, 256));
+        auto params = inst->parameters();
+        QCOMPARE(params.size(), size_t(1));
+        QCOMPARE(params[0].id, 3u);
+        QCOMPARE(QString::fromStdString(params[0].name), QString("Gain"));
+        QCOMPARE(params[0].def, 0.5);
+        inst->setParameter(3, 0.25);  // gain 0.5
+        std::vector<float> l(700, 0.8f), rr(700, -0.4f);
+        float* ch[2] = {l.data(), rr.data()};
+        inst->process(ch, 2, 700);
+        QCOMPARE(l[0], 0.4f);
+        QCOMPARE(l[699], 0.4f);
+        QCOMPARE(rr[300], -0.2f);
+        QCOMPARE(inst->parameter(3), 0.25);
+
+        // Component state reaches a new instance's processor and controller.
+        const std::string state = inst->saveState();
+        auto other = instantiate(d, &err);
+        QVERIFY2(other, err.c_str());
+        QVERIFY(other->activate(48000, 256));
+        QVERIFY(other->loadState(state));
+        QCOMPARE(other->parameter(3), 0.25);
+        std::vector<float> l2(64, 1.0f), r2(64, 1.0f);
+        float* ch2[2] = {l2.data(), r2.data()};
+        other->process(ch2, 2, 64);
+        QCOMPARE(l2[10], 0.5f);
+        inst->reset();
+        inst->process(ch2, 2, 64);  // still runs after a reset
+    }
+#endif
 
     void pluginEffectRunsInTheMixer() {
         // The mixer finds plugins through the shared registry.

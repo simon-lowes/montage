@@ -18,6 +18,7 @@ endif()
 
 option(MONTAGE_BUILD_APP "Build the Montage GUI application" ON)
 option(MONTAGE_BUILD_TESTS "Build the Montage test suite" ON)
+option(MONTAGE_WITH_VST3 "Host VST3 audio plugins (VST 3 SDK, MIT, vendored)" ON)
 
 find_package(Qt6 6.4 REQUIRED COMPONENTS Core Gui Concurrent)
 if(MONTAGE_BUILD_APP)

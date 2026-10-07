@@ -351,11 +351,7 @@ std::vector<Descriptor> probeClap(const std::string& path, std::string* error) {
     return out;
 }
 
-std::unique_ptr<Instance> instantiate(const Descriptor& d, std::string* error) {
-    if (d.format != Format::Clap) {
-        if (error) *error = std::string(formatName(d.format)) + " plugins cannot be run by this version yet";
-        return nullptr;
-    }
+std::unique_ptr<Instance> instantiateClap(const Descriptor& d, std::string* error) {
     auto inst = std::make_unique<ClapInstance>();
     if (!inst->create(d, error)) return nullptr;
     return inst;
