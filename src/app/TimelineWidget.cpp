@@ -27,6 +27,7 @@
 #include "ThumbnailCache.h"
 #include "audio/PluginEffect.h"
 #include "core/Effects.h"
+#include "core/KeyframeEdit.h"
 #include "core/Multicam.h"
 #include "media/MediaPool.h"
 
@@ -44,6 +45,32 @@ constexpr int kEdgeGrab = 6;
 constexpr int kSnapPx = 9;
 constexpr int kNameStrip = 16;
 constexpr int kBtn = 20;
+
+// A clip's line parameter (generic over the timeline's private Lane type).
+template <class L>
+const Param* laneParam(const Clip& c, const L& lane) {
+    const Effect& fx = c.*(lane.fixed);
+    const auto it = fx.params.find(lane.param);
+    return it == fx.params.end() ? nullptr : &it->second;
+}
+template <class L>
+Param& laneParamRef(Clip& c, const L& lane) {
+    Effect& fx = c.*(lane.fixed);
+    auto it = fx.params.find(lane.param);
+    if (it == fx.params.end()) it = fx.params.emplace(lane.param, Param(lane.def)).first;
+    return it->second;
+}
+template <class L>
+double laneAt(const Clip& c, const L& lane, FrameTime t) {
+    const Param* p = laneParam(c, lane);
+    return p ? p->at(t) : lane.def;
+}
+template <class L>
+QString laneText(const L& lane, double v) {
+    if (!lane.gain) return QObject::tr("Opacity %1 %").arg(v, 0, 'f', 0);
+    if (v <= kGainLineMinDb) return QObject::tr("Volume -inf dB");
+    return QObject::tr("Volume %1%2 dB").arg(v > 0.05 ? "+" : "").arg(v, 0, 'f', 1);
+}
 
 int trackHeight(const Track& t) { return t.height > 0 ? t.height : (t.kind == TrackKind::Video ? kVideoH : kAudioH); }
 
@@ -551,6 +578,7 @@ void TimelineWidget::paintClip(QPainter& p, const Row& row, const Clip& c, const
         p.setPen(QPen(QColor(0, 0, 0, 60), 1));
         for (int x = r.left() - r.height(); x < r.right(); x += 8) p.drawLine(x, r.bottom(), x + r.height(), r.top());
     }
+    paintLane(p, c, row.ref.kind, r);
     // Name strip with badges.
     p.fillRect(QRect(r.left(), r.top(), r.width(), kNameStrip), QColor(0, 0, 0, 70));
     QString badges;
@@ -620,6 +648,234 @@ void TimelineWidget::paintClip(QPainter& p, const Row& row, const Clip& c, const
         p.setPen(QPen(base.darker(150), 1));
         p.setBrush(Qt::NoBrush);
         p.drawRoundedRect(r, 3, 3);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lines over clips: volume on audio clips, opacity on video clips
+
+void TimelineWidget::setShowVolumeLines(bool on) {
+    showVolume_ = on;
+    viewport()->update();
+}
+
+void TimelineWidget::setShowOpacityLines(bool on) {
+    showOpacity_ = on;
+    viewport()->update();
+}
+
+std::optional<TimelineWidget::Lane> TimelineWidget::laneFor(const Clip&, TrackKind kind) const {
+    if (kind == TrackKind::Audio) {
+        if (!showVolume_) return std::nullopt;
+        return Lane{&Clip::audio, "gain_db", 0.0, kGainLineMinDb, kGainLineMaxDb, true};
+    }
+    if (!showOpacity_) return std::nullopt;
+    return Lane{&Clip::motion, "opacity", 100.0, 0.0, 100.0, false};
+}
+
+QRect TimelineWidget::laneBand(const QRect& clipRect) {
+    const QRect band = clipRect.adjusted(2, kNameStrip + 3, -2, -4);
+    return band.height() >= 10 && band.width() >= 4 ? band : QRect();
+}
+
+int TimelineWidget::laneY(const Lane& lane, const QRect& band, double v) {
+    const double level = lane.gain ? gainToLevel(v) : std::clamp((v - lane.lo) / (lane.hi - lane.lo), 0.0, 1.0);
+    return band.top() + int(std::lround((1.0 - level) * (band.height() - 1)));
+}
+
+double TimelineWidget::laneValue(const Lane& lane, const QRect& band, int y) {
+    const double level = std::clamp(double(band.bottom() - y) / std::max(1, band.height() - 1), 0.0, 1.0);
+    return lane.gain ? levelToGain(level) : lane.lo + level * (lane.hi - lane.lo);
+}
+
+bool TimelineWidget::clipRect(Id clip, QRect& r, TrackKind* kind) const {
+    const Sequence* s = state_->sequence();
+    if (!s) return false;
+    for (const Row& row : rows()) {
+        const Track* t = trackAt(*s, row.ref);
+        for (const Clip& c : t->clips)
+            if (c.id == clip) {
+                const int xs = xForFrame(c.start), xe = xForFrame(c.end());
+                r = QRect(xs, row.y + 1, std::max(2, xe - xs), row.h - 3);
+                if (kind) *kind = row.ref.kind;
+                return true;
+            }
+    }
+    return false;
+}
+
+bool TimelineWidget::laneOf(Id clip, Lane& lane, QRect& band) const {
+    QRect r;
+    TrackKind kind;
+    const Clip* c = state_->sequence() ? edit::clipById(*state_->sequence(), clip) : nullptr;
+    if (!c || !clipRect(clip, r, &kind)) return false;
+    const auto l = laneFor(*c, kind);
+    if (!l) return false;
+    lane = *l;
+    band = laneBand(r);
+    return !band.isNull();
+}
+
+QRect TimelineWidget::lineBand(Id clip) const {
+    Lane lane{};
+    QRect band;
+    return laneOf(clip, lane, band) ? band : QRect();
+}
+
+int TimelineWidget::lineY(Id clip, FrameTime local) const {
+    Lane lane{};
+    QRect band;
+    const Clip* c = state_->sequence() ? edit::clipById(*state_->sequence(), clip) : nullptr;
+    if (!c || !laneOf(clip, lane, band)) return -1;
+    return laneY(lane, band, laneAt(*c, lane, local));
+}
+
+std::optional<TimelineWidget::LaneHit> TimelineWidget::laneHit(const QPoint& pos) const {
+    const Sequence* s = state_->sequence();
+    const auto row = rowAt(pos.y());
+    if (!s || !row || pos.x() < kHeaderW) return std::nullopt;
+    const Track* t = trackAt(*s, row->ref);
+    for (const Clip& c : t->clips) {
+        const int xs = xForFrame(c.start), xe = xForFrame(c.end());
+        if (pos.x() < xs - 4 || pos.x() > xe + 4) continue;
+        const auto lane = laneFor(c, row->ref.kind);
+        if (!lane) continue;
+        const QRect band = laneBand(QRect(xs, row->y + 1, std::max(2, xe - xs), row->h - 3));
+        if (band.isNull() || pos.y() < band.top() - 5 || pos.y() > band.bottom() + 5) continue;
+        LaneHit h;
+        h.clip = c.id;
+        h.lane = *lane;
+        if (const Param* prm = laneParam(c, *lane))
+            for (const Keyframe& k : prm->keys) {
+                if (k.t < 0 || k.t >= c.duration) continue;
+                if (std::abs(pos.x() - xForFrame(c.start + k.t)) <= 4 && std::abs(pos.y() - laneY(*lane, band, k.v)) <= 4) {
+                    h.key = h.local = k.t;
+                    return h;
+                }
+            }
+        if (pos.x() < xs || pos.x() >= xe) continue;
+        h.local = std::clamp<FrameTime>(FrameTime(std::floor(frameAtX(pos.x()))) - c.start, 0, c.duration - 1);
+        h.onLine = std::abs(pos.y() - laneY(*lane, band, laneAt(c, *lane, h.local))) <= 3;
+        if (h.onLine) return h;
+    }
+    return std::nullopt;
+}
+
+void TimelineWidget::paintLane(QPainter& p, const Clip& c, TrackKind kind, const QRect& r) {
+    const auto lane = laneFor(c, kind);
+    if (!lane) return;
+    const QRect band = laneBand(r);
+    if (band.isNull()) return;
+    const Param* found = laneParam(c, *lane);
+    const Param prm = found ? *found : Param(lane->def);
+    const int x0 = std::max(r.left(), kHeaderW), x1 = std::min(r.right(), viewport()->width());
+    if (x1 <= x0) return;
+    // Sample the curve every two pixels and at each key.
+    std::vector<int> xs;
+    for (int x = x0; x <= x1; x += 2) xs.push_back(x);
+    for (const Keyframe& k : prm.keys)
+        if (const int kx = xForFrame(c.start + k.t); kx > x0 && kx < x1) xs.push_back(kx);
+    std::sort(xs.begin(), xs.end());
+    QPolygonF line;
+    for (int x : xs) {
+        const FrameTime t = std::clamp<FrameTime>(FrameTime(std::floor(frameAtX(x))) - c.start, 0, c.duration - 1);
+        line << QPointF(x, laneY(*lane, band, prm.at(t)));
+    }
+    const bool sel = state_->isSelected(c.id);
+    const QColor col = sel ? QColor(255, 222, 96) : QColor(236, 200, 92, 210);
+    p.save();
+    p.setRenderHint(QPainter::Antialiasing);
+    p.setPen(QPen(col, 1.5));
+    p.setBrush(Qt::NoBrush);
+    p.drawPolyline(line);
+    p.setPen(QPen(QColor(0, 0, 0, 160), 1));
+    p.setBrush(col);
+    for (const Keyframe& k : prm.keys) {
+        if (k.t < 0 || k.t >= c.duration) continue;
+        const QPointF at(xForFrame(c.start + k.t), laneY(*lane, band, k.v));
+        QPolygonF d;
+        d << at + QPointF(0, -4) << at + QPointF(4, 0) << at + QPointF(0, 4) << at + QPointF(-4, 0);
+        p.drawPolygon(d);
+    }
+    p.restore();
+}
+
+bool TimelineWidget::beginLaneDrag(QMouseEvent* e, const LaneHit& h) {
+    const bool add = e->modifiers() & (Qt::ControlModifier | Qt::MetaModifier);
+    const bool alt = e->modifiers() & Qt::AltModifier;
+    const Id id = h.clip;
+    const Lane lane = h.lane;
+    if (!state_->isSelected(id)) state_->setSelection({id}, false);
+    drag_.clip = id;
+    if (h.key >= 0) {
+        const FrameTime key = h.key;
+        if (alt) {
+            state_->edit(tr("Delete Keyframe"), [id, lane, key](Project&, Sequence& s) {
+                Clip* c = edit::clipById(s, id);
+                return c && laneParamRef(*c, lane).removeKey(key);
+            });
+            drag_ = DragState{};
+            return true;
+        }
+        drag_.kind = DragKind::LineKey;
+        drag_.key = key;
+        return true;
+    }
+    if (add) {
+        // Ctrl/Cmd-click adds a key on the line; dragging on moves it.
+        const FrameTime t = h.local;
+        state_->edit(tr("Add Keyframe"), [id, lane, t](Project&, Sequence& s) {
+            Clip* c = edit::clipById(s, id);
+            if (!c) return false;
+            Param& prm = laneParamRef(*c, lane);
+            if (prm.keyAt(t)) return false;
+            Interp interp = Interp::Linear;
+            for (const Keyframe& k : prm.keys)
+                if (k.t < t) interp = k.interp;
+            prm.addKey(t, prm.at(t), interp);
+            return true;
+        });
+        drag_.kind = DragKind::LineKey;
+        drag_.key = t;
+        return true;
+    }
+    drag_.kind = DragKind::Line;
+    drag_.key = h.local;
+    return true;
+}
+
+void TimelineWidget::laneMenu(QMenu& menu, const LaneHit& h) {
+    const Id id = h.clip;
+    const Lane lane = h.lane;
+    const FrameTime key = h.key;
+    const Clip* c = edit::clipById(*state_->sequence(), id);
+    const Param* prm = c ? laneParam(*c, lane) : nullptr;
+    const Keyframe* k = prm ? prm->keyAt(key) : nullptr;
+    if (!k) return;
+    menu.addAction(tr("Delete Keyframe"), this, [this, id, lane, key] {
+        state_->edit(tr("Delete Keyframe"), [id, lane, key](Project&, Sequence& s) {
+            Clip* c = edit::clipById(s, id);
+            return c && laneParamRef(*c, lane).removeKey(key);
+        });
+    })->setObjectName(QStringLiteral("deleteKeyframe"));
+    menu.addSeparator();
+    const std::pair<Interp, QString> kinds[] = {{Interp::Linear, tr("Linear")}, {Interp::Hold, tr("Hold")}, {Interp::Smooth, tr("Smooth (Ease In and Out)")}};
+    for (const auto& [interp, name] : kinds) {
+        QAction* a = menu.addAction(name, this, [this, id, lane, key, interp = interp] {
+            state_->edit(tr("Keyframe Interpolation"), [id, lane, key, interp](Project&, Sequence& s) {
+                Clip* c = edit::clipById(s, id);
+                if (!c) return false;
+                for (Keyframe& k : laneParamRef(*c, lane).keys)
+                    if (k.t == key && k.interp != interp) {
+                        k.interp = interp;
+                        return true;
+                    }
+                return false;
+            });
+        });
+        a->setCheckable(true);
+        a->setChecked(k->interp == interp);
+        a->setData(int(interp));
     }
 }
 
@@ -907,6 +1163,10 @@ void TimelineWidget::mousePressEvent(QMouseEvent* e) {
         state_->setPlayhead(f);
         return;
     }
+    // A clip's volume or opacity line, or one of its keyframes (clip edges keep trimming).
+    if (tool_ == Tool::Select)
+        if (const auto lh = laneHit(e->pos()); lh && (lh->key >= 0 || (lh->onLine && hit.kind == HitKind::ClipBody)))
+            if (beginLaneDrag(e, *lh)) return;
     beginDrag(e, hit);
 }
 
@@ -1008,7 +1268,9 @@ void TimelineWidget::updateDrag(QMouseEvent* e) {
     if (!state_->sequence()) return;
     QPoint pos = e->pos();
     if (!drag_.started) {
-        if ((pos - drag_.pressPos).manhattanLength() < QApplication::startDragDistance()) return;
+        // Lines respond to small moves: a few pixels can be a few dB.
+        const bool line = drag_.kind == DragKind::Line || drag_.kind == DragKind::LineKey;
+        if ((pos - drag_.pressPos).manhattanLength() < (line ? 2 : QApplication::startDragDistance())) return;
         drag_.started = true;
         switch (drag_.kind) {
             case DragKind::Move: state_->beginGesture(drag_.insertMode ? tr("Insert Move") : tr("Move")); break;
@@ -1019,6 +1281,13 @@ void TimelineWidget::updateDrag(QMouseEvent* e) {
             case DragKind::CaptionMove: state_->beginGesture(tr("Move Caption")); break;
             case DragKind::CaptionIn:
             case DragKind::CaptionOut: state_->beginGesture(tr("Trim Caption")); break;
+            case DragKind::Line: {
+                Lane lane{};
+                QRect band;
+                state_->beginGesture(laneOf(drag_.clip, lane, band) && !lane.gain ? tr("Opacity") : tr("Volume"));
+                break;
+            }
+            case DragKind::LineKey: state_->beginGesture(tr("Move Keyframe")); break;
             default: break;
         }
     }
@@ -1147,6 +1416,39 @@ void TimelineWidget::updateDrag(QMouseEvent* e) {
             state_->setSelection(sel, true);
             break;
         }
+        case DragKind::Line: {
+            Lane lane{};
+            QRect band;
+            if (!laneOf(drag_.clip, lane, band)) break;
+            // Past the top or bottom of the clip pins the line there.
+            const double delta = pos.y() <= band.top()      ? lane.hi - lane.lo
+                                 : pos.y() >= band.bottom() ? lane.lo - lane.hi
+                                                            : laneValue(lane, band, pos.y()) - laneValue(lane, band, drag_.pressPos.y());
+            const Id id = drag_.clip;
+            const FrameTime t = drag_.key;
+            state_->updateGesture([=](Project&, Sequence& sq) {
+                if (Clip* c = edit::clipById(sq, id)) offsetLine(laneParamRef(*c, lane), t, delta, lane.lo, lane.hi);
+            });
+            if (const Clip* c = edit::clipById(*state_->sequence(), id)) drag_.label = laneText(lane, laneAt(*c, lane, t));
+            break;
+        }
+        case DragKind::LineKey: {
+            Lane lane{};
+            QRect band;
+            const Clip* base = edit::clipById(*s, drag_.clip);
+            if (!base || !laneOf(drag_.clip, lane, band)) break;
+            // Shift keeps the key's time and changes only its value.
+            const FrameTime to = (e->modifiers() & Qt::ShiftModifier) ? drag_.key : frameRound(pos.x()) - base->start;
+            const double v = laneValue(lane, band, pos.y());
+            const Id id = drag_.clip;
+            const FrameTime from = drag_.key;
+            FrameTime placed = from;
+            state_->updateGesture([&](Project&, Sequence& sq) {
+                if (Clip* c = edit::clipById(sq, id)) placed = moveKey(laneParamRef(*c, lane), from, to, v, c->duration - 1);
+            });
+            drag_.label = laneText(lane, v) + QStringLiteral("  ") + signedTc(placed - from);
+            break;
+        }
         default: break;
     }
     viewport()->update();
@@ -1161,6 +1463,11 @@ void TimelineWidget::mouseMoveEvent(QMouseEvent* e) {
     // Hover cursor feedback.
     if (tool_ == Tool::Select || tool_ == Tool::Ripple || tool_ == Tool::Roll) {
         Hit h = hitTest(e->pos());
+        if (tool_ == Tool::Select)
+            if (const auto lh = laneHit(e->pos()); lh && (lh->key >= 0 || (lh->onLine && h.kind == HitKind::ClipBody))) {
+                viewport()->setCursor(lh->key >= 0 ? Qt::SizeAllCursor : Qt::SizeVerCursor);
+                return;
+            }
         if (h.kind == HitKind::ClipIn || h.kind == HitKind::ClipOut || h.kind == HitKind::CaptionIn ||
             h.kind == HitKind::CaptionOut)
             viewport()->setCursor(Qt::SizeHorCursor);
@@ -1176,7 +1483,8 @@ void TimelineWidget::mouseReleaseEvent(QMouseEvent* e) {
     bool gesture = drag_.started && (drag_.kind == DragKind::Move || drag_.kind == DragKind::Trim || drag_.kind == DragKind::Roll ||
                                      drag_.kind == DragKind::Slip || drag_.kind == DragKind::Slide ||
                                      drag_.kind == DragKind::CaptionMove || drag_.kind == DragKind::CaptionIn ||
-                                     drag_.kind == DragKind::CaptionOut);
+                                     drag_.kind == DragKind::CaptionOut || drag_.kind == DragKind::Line ||
+                                     drag_.kind == DragKind::LineKey);
     if (gesture) state_->endGesture(true);
     drag_ = DragState{};
     snapIndicator_ = -1;
@@ -1260,6 +1568,14 @@ bool TimelineWidget::renderAndReplace(Id clip, QString* error) {
 }
 
 void TimelineWidget::contextMenuEvent(QContextMenuEvent* e) {
+    // A keyframe on a clip's line: delete it or change how it eases.
+    if (const auto lh = laneHit(e->pos()); lh && lh->key >= 0) {
+        QMenu menu(this);
+        menu.setObjectName(QStringLiteral("keyframeMenu"));
+        laneMenu(menu, *lh);
+        if (!menu.isEmpty()) menu.exec(e->globalPos());
+        return;
+    }
     Hit h = hitTest(e->pos());
     contextFrame_ = h.frame;
     contextTrack_ = h.track;

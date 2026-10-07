@@ -484,6 +484,28 @@ void MainWindow::buildMenus() {
     snapping_ = add(seqM, tr("S&napping"), QKeySequence(Qt::Key_S), [this] { state_->setSnapping(snapping_->isChecked()); });
     snapping_->setCheckable(true);
     snapping_->setChecked(true);
+    {
+        // Lines over clips for volume and opacity, with their keyframes.
+        const bool volume = appSettings().value("timeline/volumeLines", true).toBool();
+        const bool opacity = appSettings().value("timeline/opacityLines", false).toBool();
+        timeline_->setShowVolumeLines(volume);
+        timeline_->setShowOpacityLines(opacity);
+        QAction* v = add(seqM, tr("Show Clip &Volume"), QKeySequence(), [this](bool on) {
+            timeline_->setShowVolumeLines(on);
+            appSettings().setValue("timeline/volumeLines", on);
+        });
+        v->setCheckable(true);
+        v->setChecked(volume);
+        v->setObjectName(QStringLiteral("showVolumeLines"));
+        v->setToolTip(tr("Draw each audio clip's volume as a line: drag it, Ctrl/Cmd-click to add a keyframe, Alt-click a keyframe to delete it"));
+        QAction* o = add(seqM, tr("Show Clip &Opacity"), QKeySequence(), [this](bool on) {
+            timeline_->setShowOpacityLines(on);
+            appSettings().setValue("timeline/opacityLines", on);
+        });
+        o->setCheckable(true);
+        o->setChecked(opacity);
+        o->setObjectName(QStringLiteral("showOpacityLines"));
+    }
     add(seqM, tr("Zoom &In"), QKeySequence(Qt::Key_Equal), [this] { timeline_->zoomIn(); });
     add(seqM, tr("Zoom &Out"), QKeySequence(Qt::Key_Minus), [this] { timeline_->zoomOut(); });
     add(seqM, tr("Zoom to &Fit"), QKeySequence(Qt::Key_Backslash), [this] { timeline_->zoomToFit(); });

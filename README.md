@@ -44,6 +44,10 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
   - Under the hood: pyramidal Lucas–Kanade on Shi–Tomasi corners with forward–backward checks, and RANSAC similarity fits.
 - Gaussian blur, sharpen, vignette, mosaic, mirror, drop shadow
 - Keyframes on every parameter: linear, hold or smooth, with previous/next navigation
+- Volume and opacity lines on timeline clips (Sequence › Show Clip Volume / Show Clip Opacity):
+  - Drag a line to raise or lower it. Ctrl/Cmd-click adds a keyframe; drag keyframes in time and value (Shift for value only).
+  - Alt-click a keyframe to delete it, or right-click it for Linear, Hold or Smooth.
+  - Volume is drawn on a perceptual scale up to +6 dB.
 - Titles (font, outline, shadow, background box, alignment, tracking), colour mattes, gradients, SMPTE bars
 - Transitions: cross dissolve, dip to black/white, wipe, push, slide, iris, cross zoom
 - Scopes: waveform, RGB parade, vectorscope, histogram

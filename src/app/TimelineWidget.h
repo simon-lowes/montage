@@ -45,6 +45,17 @@ public:
     // Bakes an audio clip's effects into a new audio file and points the clip at it (undoable).
     bool renderAndReplace(montage::Id clip, QString* error = nullptr);
 
+    // Lines over clips for their volume (audio clips) and opacity (video clips),
+    // with their keyframes: drag the line to change it, Ctrl/Cmd-click it to add
+    // a keyframe, drag keyframes, Alt-click one to delete it.
+    void setShowVolumeLines(bool on);
+    bool showVolumeLines() const { return showVolume_; }
+    void setShowOpacityLines(bool on);
+    bool showOpacityLines() const { return showOpacity_; }
+    // Where a clip's line is drawn (widget coordinates), for tests; empty if it is not shown.
+    QRect lineBand(montage::Id clip) const;
+    int lineY(montage::Id clip, montage::FrameTime local) const;
+
 signals:
     void toolChanged(montage::TimelineWidget::Tool tool);
     void clipActivated(montage::Id clip);  // double-click
@@ -84,7 +95,7 @@ private:
         Id captionTrack = 0;
         int caption = -1;
     };
-    enum class DragKind { None, Scrub, Move, Trim, Roll, Slip, Slide, Rubber, Pan, CaptionMove, CaptionIn, CaptionOut };
+    enum class DragKind { None, Scrub, Move, Trim, Roll, Slip, Slide, Rubber, Pan, CaptionMove, CaptionIn, CaptionOut, Line, LineKey };
     struct DragState {
         DragKind kind = DragKind::None;
         QPoint pressPos;
@@ -104,6 +115,22 @@ private:
         QString label;  // live readout (e.g. "+00:00:00:12")
         Id captionTrack = 0;
         int caption = -1;
+        FrameTime key = -1;     // the keyframe dragged (clip-local frame)
+        double lineAtPress = 0;  // the line's value under the press
+    };
+    // A clip's line: which fixed parameter it shows and its range.
+    struct Lane {
+        Effect Clip::*fixed;
+        const char* param;
+        double def, lo, hi;
+        bool gain;  // drawn on the volume scale (core/KeyframeEdit.h)
+    };
+    struct LaneHit {
+        Id clip = 0;
+        Lane lane{};
+        FrameTime local = 0;  // clip-local frame under the pointer
+        FrameTime key = -1;   // a keyframe under the pointer
+        bool onLine = false;
     };
     struct Ghost {
         TrackRef track;
@@ -133,6 +160,16 @@ private:
     void paintClip(QPainter& p, const Row& row, const Clip& c, const QRect& r);
     void paintWaveform(QPainter& p, const Clip& c, const QRect& r, const QColor& col);
     void paintThumbnails(QPainter& p, const Clip& c, const QRect& r);
+    std::optional<Lane> laneFor(const Clip& c, TrackKind kind) const;
+    static QRect laneBand(const QRect& clipRect);
+    static int laneY(const Lane& lane, const QRect& band, double v);
+    static double laneValue(const Lane& lane, const QRect& band, int y);
+    std::optional<LaneHit> laneHit(const QPoint& pos) const;
+    bool clipRect(Id clip, QRect& r, TrackKind* kind = nullptr) const;
+    bool laneOf(Id clip, Lane& lane, QRect& band) const;
+    void paintLane(QPainter& p, const Clip& c, TrackKind kind, const QRect& r);
+    bool beginLaneDrag(QMouseEvent* e, const LaneHit& h);
+    void laneMenu(QMenu& menu, const LaneHit& h);
 
     void beginDrag(QMouseEvent* e, const Hit& hit);
     void updateDrag(QMouseEvent* e);
@@ -154,6 +191,8 @@ private:
     FrameTime contextFrame_ = 0;
     std::optional<TrackRef> contextTrack_;
     QPoint hoverPos_;
+    bool showVolume_ = true;
+    bool showOpacity_ = false;
 };
 
 }  // namespace montage

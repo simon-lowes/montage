@@ -9,6 +9,7 @@
 #include "core/Effects.h"
 #include "core/History.h"
 #include "core/Interchange.h"
+#include "core/KeyframeEdit.h"
 #include "core/MediaLog.h"
 #include "core/Multicam.h"
 #include "core/ProjectIO.h"
@@ -940,6 +941,50 @@ private slots:
         QVERIFY(!projectFromJson("{nope", back, &err));
         QVERIFY(!err.empty());
         QVERIFY(!projectFromJson("{\"format\":\"other\"}", back, &err));
+    }
+
+    void keyframeLines() {
+        // The volume scale: silence at the bottom, +6 dB at the top, 0 dB at 71 %.
+        QCOMPARE(gainToLevel(kGainLineMaxDb), 1.0);
+        QCOMPARE(gainToLevel(kGainLineMinDb), 0.0);
+        QCOMPARE(gainToLevel(-200), 0.0);
+        QVERIFY(std::fabs(gainToLevel(0) - std::sqrt(0.5)) < 0.01);
+        QVERIFY(std::fabs(gainToLevel(-6.02) - 0.5) < 0.01);
+        for (double db : {-40.0, -12.0, -3.0, 0.0, 4.5}) QVERIFY(std::fabs(levelToGain(gainToLevel(db)) - db) < 1e-9);
+        QCOMPARE(levelToGain(0), kGainLineMinDb);
+        QCOMPARE(levelToGain(2), kGainLineMaxDb);
+
+        // Dragging the line: the static value, or the keys around the point.
+        Param flat(-3);
+        offsetLine(flat, 10, -2, -60, 6);
+        QCOMPARE(flat.value, -5.0);
+        offsetLine(flat, 10, 100, -60, 6);
+        QCOMPARE(flat.value, 6.0);
+        Param keyed;
+        keyed.addKey(10, 0);
+        keyed.addKey(20, -6);
+        keyed.addKey(30, -12);
+        offsetLine(keyed, 15, -1, -60, 6);  // between the first two
+        QCOMPARE(keyed.keys[0].v, -1.0);
+        QCOMPARE(keyed.keys[1].v, -7.0);
+        QCOMPARE(keyed.keys[2].v, -12.0);
+        offsetLine(keyed, 2, 3, -60, 6);  // before the first: the first
+        QCOMPARE(keyed.keys[0].v, 2.0);
+        offsetLine(keyed, 99, -100, -60, 6);  // after the last: the last, clamped
+        QCOMPARE(keyed.keys[2].v, -60.0);
+        offsetLine(keyed, 20, 1, -60, 6);  // on a key: it and the next
+        QCOMPARE(keyed.keys[1].v, -6.0);
+        QCOMPARE(keyed.keys[2].v, -59.0);
+
+        // Moving a key stays between its neighbours and inside the clip.
+        QCOMPARE(moveKey(keyed, 20, 25, -4, 99), FrameTime(25));
+        QCOMPARE(keyed.keys[1].t, FrameTime(25));
+        QCOMPARE(keyed.keys[1].v, -4.0);
+        QCOMPARE(moveKey(keyed, 25, 50, -4, 99), FrameTime(29));
+        QCOMPARE(moveKey(keyed, 10, -5, 0, 99), FrameTime(0));
+        QCOMPARE(moveKey(keyed, 30, 500, 0, 99), FrameTime(99));
+        QCOMPARE(moveKey(keyed, 31, 40, 0, 99), FrameTime(-1));
+        QCOMPARE(keyed.keys.size(), size_t(3));
     }
 
     void mediaLogging() {

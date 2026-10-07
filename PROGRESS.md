@@ -241,4 +241,17 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
     - the app: bins, a drop on the tree, rating keys, the label menu, multi-row list edits with undo, sorting, the smart bin dialog and live updates, deleting a bin, and save;
     - the MCP tools, including their errors.
   - Still to do: range-based ratings and keywords (part of a clip, as Final Cut Pro does), keywords and ratings in FCPXML, and AI auto-tagging (shot size, people).
+- [x] Volume and opacity lines on timeline clips (the "rubber band" of Premiere, Final Cut and Resolve):
+  - Audio clips show their volume and video clips their opacity, as a line with its keyframes. Each has its own toggle in the Sequence menu; volume is on by default.
+  - Volume uses a square-root-of-amplitude scale from silence to +6 dB, with 0 dB at 71 % of the height.
+  - Editing:
+    - Dragging the line moves the static value, or the two keyframes around the pointer. Dragging past the clip's edge pins it at the limit.
+    - Ctrl/Cmd-click adds a keyframe with the line's value and the previous key's interpolation.
+    - Keyframes drag in time (kept between their neighbours) and value; Shift drags the value only.
+    - Alt-click deletes a keyframe. Right-click offers Delete and Linear, Hold or Smooth.
+    - Each drag is one undo step, with a live readout of the value.
+  - Clip edges keep trimming. Lines start a drag after 2 px rather than the usual drag distance, for fine changes.
+  - Tested:
+    - the scale and its inverse, offsetting lines with and without keys, and clamped key moves;
+    - in the app, with the mouse: dragging, pinning, adding, moving, Shift-moving and deleting keys, interpolation from the menu, undo, opacity, and moving the clip when lines are hidden.
 

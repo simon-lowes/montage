@@ -33,6 +33,7 @@
 #include "MediaBinModel.h"
 #include "MediaBinWidget.h"
 #include "SmartBinDialog.h"
+#include "core/KeyframeEdit.h"
 #include "core/MediaLog.h"
 #include "SequenceSettingsDialog.h"
 #include "audio/Plugins.h"
@@ -953,6 +954,122 @@ private slots:
         QVERIFY(bin->shownMedia().empty());
         QCOMPARE(bin->currentSmartBin(), Id(0));
         QVERIFY(tree->isHidden());
+    }
+
+    void clipLinesOnTheTimeline() {
+        // A sound clip on A1 and a colour clip on V1, 11 s each.
+        state()->newProject();
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        QVERIFY(state()->apply("Place", [media](Project& p, Sequence& s) { return edit::placeMedia(p, s, media, 0, 0, -1, V1, A1, false); }));
+        const Clip* placed = trackAt(*state()->sequence(), A1)->clips.empty() ? nullptr : &trackAt(*state()->sequence(), A1)->clips.front();
+        QVERIFY(placed);
+        const Id audio = placed->id;
+        const FrameTime len = placed->duration;
+        QVERIFY(state()->edit("Colour", [len](Project& p, Sequence& s) {
+            Clip c = makeGeneratorClip(p, "color", len);
+            return edit::overwrite(p, s, V1, c).ok;
+        }));
+        const Id video = trackAt(*state()->sequence(), V1)->clips.front().id;
+        ppf_ = measurePpf();
+        timeline()->setShowVolumeLines(true);
+        timeline()->setShowOpacityLines(false);
+        state()->clearSelection();
+        auto clip = [&](Id id) { return edit::clipById(*state()->sequence(), id); };
+        auto gain = [&]() -> const Param& { return clip(audio)->audio.params.at("gain_db"); };
+        const QRect band = timeline()->lineBand(audio);
+        QVERIFY(!band.isNull());
+        QVERIFY(timeline()->lineBand(video).isNull());  // opacity lines are off
+        auto at = [&](FrameTime f, Id id = 0) {
+            const int x = band.left() - 2 + int(std::lround(double(f) * ppf_));
+            return QPoint(x, timeline()->lineY(id ? id : audio, f));
+        };
+        // 0 dB sits at 71 % of the height.
+        QVERIFY(std::abs(at(60).y() - (band.top() + int(std::lround((1 - std::sqrt(0.5)) * (band.height() - 1))))) <= 1);
+
+        // Dragging the line down lowers the volume, as one undo step.
+        drag(at(60), at(60) + QPoint(0, band.height() / 4));
+        const double lowered = gain().value;
+        QVERIFY2(lowered < -3 && lowered > -20, qPrintable(QString::number(lowered)));
+        QVERIFY(!gain().animated());
+        QVERIFY(state()->isSelected(audio));
+        QCOMPARE(trackAt(*state()->sequence(), A1)->clips.front().start, FrameTime(0));  // the clip did not move
+        state()->undo();
+        QCOMPARE(gain().value, 0.0);
+        state()->redo();
+        QCOMPARE(gain().value, lowered);
+        // It stops at +6 dB.
+        drag(at(60), QPoint(at(60).x(), band.top() - 30));
+        QCOMPARE(gain().value, kGainLineMaxDb);
+        state()->undo();
+
+        // Ctrl/Cmd-click adds keyframes on the line.
+        QTest::mouseClick(viewport(), Qt::LeftButton, Qt::ControlModifier, at(90));
+        QTest::mouseClick(viewport(), Qt::LeftButton, Qt::ControlModifier, at(200));
+        QCOMPARE(gain().keys.size(), size_t(2));
+        QVERIFY(std::abs(gain().keys[0].t - 90) <= 1 && std::abs(gain().keys[1].t - 200) <= 1);
+        QCOMPARE(gain().keys[0].v, lowered);
+        const FrameTime k0 = gain().keys[0].t, k1 = gain().keys[1].t;
+        // Dragging the line between them moves both.
+        drag(at(150), at(150) + QPoint(0, 12));
+        QVERIFY(gain().keys[0].v < lowered);
+        QCOMPARE(gain().keys[0].v, gain().keys[1].v);
+        // Dragging a key moves it in time and value; with Shift only in value.
+        const double before = gain().keys[0].v;
+        drag(QPoint(at(k0).x(), timeline()->lineY(audio, k0)), QPoint(at(k0 + 20).x(), timeline()->lineY(audio, k0) - 10));
+        QVERIFY2(std::abs(gain().keys[0].t - (k0 + 20)) <= 1, qPrintable(QString::number(gain().keys[0].t)));
+        QVERIFY(gain().keys[0].v > before);
+        const FrameTime moved = gain().keys[0].t;
+        drag(QPoint(at(moved).x(), timeline()->lineY(audio, moved)), QPoint(at(moved + 30).x(), timeline()->lineY(audio, moved) + 8),
+             Qt::ShiftModifier);
+        QCOMPARE(gain().keys[0].t, moved);
+        state()->undo();
+        QCOMPARE(gain().keys[0].t, moved);
+        // A key cannot pass its neighbour.
+        drag(QPoint(at(moved).x(), timeline()->lineY(audio, moved)), QPoint(at(k1 + 40).x(), timeline()->lineY(audio, moved)));
+        QCOMPARE(gain().keys[0].t, k1 - 1);
+        state()->undo();
+
+        // Right-click a key to change how it eases; Alt-click deletes it.
+        bool triggered = false;
+        QTimer::singleShot(0, this, [&] {
+            auto* menu = qobject_cast<QMenu*>(QApplication::activePopupWidget());
+            if (!menu) return;
+            for (QAction* a : menu->actions())
+                if (a->data().toInt() == int(Interp::Hold) && a->isCheckable()) {
+                    a->trigger();
+                    triggered = true;
+                }
+            menu->close();
+        });
+        const QPoint key0(at(moved).x(), timeline()->lineY(audio, moved));
+        QContextMenuEvent menuEvent(QContextMenuEvent::Mouse, key0, viewport()->mapToGlobal(key0));
+        QApplication::sendEvent(viewport(), &menuEvent);
+        QVERIFY(triggered);
+        QCOMPARE(gain().keys[0].interp, Interp::Hold);
+        QTest::mouseClick(viewport(), Qt::LeftButton, Qt::AltModifier, QPoint(at(k1).x(), timeline()->lineY(audio, k1)));
+        QCOMPARE(gain().keys.size(), size_t(1));
+        state()->undo();
+        QCOMPARE(gain().keys.size(), size_t(2));
+
+        // Opacity lines on video clips, linear from 0 to 100 %.
+        timeline()->setShowOpacityLines(true);
+        const QRect vband = timeline()->lineBand(video);
+        QVERIFY(!vband.isNull());
+        const QPoint top = at(100, video);
+        QCOMPARE(top.y(), vband.top());  // 100 %
+        drag(top, QPoint(top.x(), vband.top() + (vband.height() - 1) / 2));
+        const double opacity = clip(video)->motion.params.at("opacity").value;
+        QVERIFY2(std::fabs(opacity - 50) < 3, qPrintable(QString::number(opacity)));
+        // With the line hidden, the same drag moves the clip instead.
+        timeline()->setShowOpacityLines(false);
+        state()->setSnapping(false);
+        const QPoint mid(top.x(), vband.top() + (vband.height() - 1) / 2);
+        drag(mid, mid + QPoint(int(30 * ppf_), 0));
+        QVERIFY(clip(video)->start > 0);
+        state()->setSnapping(true);
+        state()->newProject();
     }
 
     void colourManagementUi() {
