@@ -191,6 +191,8 @@ namespace {
 
 // Closes a progress dialog and gives the focus back to the window it covered.
 void closeProgress(QProgressDialog* dlg, QWidget* parent) {
+    // Its update timer must not show it again between closing and deletion.
+    for (QTimer* t : dlg->findChildren<QTimer*>()) t->stop();
     dlg->close();
     dlg->deleteLater();
     if (parent) parent->window()->activateWindow();
