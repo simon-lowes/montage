@@ -1,6 +1,7 @@
 #include "Effects.h"
 
 #include <algorithm>
+#include <cstdlib>
 
 namespace montage {
 
@@ -186,6 +187,12 @@ std::vector<EffectInfo> buildCatalog() {
                  {num("time_ms", "Time (ms)", 1, 2000, 300, 1), num("feedback", "Feedback", 0, 0.95, 0.35),
                   pct("mix", "Mix", 0, 100, 30)},
                  {}});
+    {
+        // A third-party audio plugin (CLAP/VST3/AU/LV2); see audio/PluginEffect.h.
+        EffectInfo plugin{"plugin", "Audio Plugin", EffectCategory::AudioFilter, "Plugins", {}, {}};
+        plugin.hidden = true;
+        c.push_back(plugin);
+    }
 
     // ---- Generators -------------------------------------------------------
     c.push_back({"color", "Color Matte", EffectCategory::Generator, "Generators",
@@ -258,7 +265,43 @@ const EffectInfo* findEffectInfo(const std::string& type) {
 std::vector<const EffectInfo*> effectsInCategory(EffectCategory c) {
     std::vector<const EffectInfo*> out;
     for (const auto& e : effectCatalog())
-        if (e.category == c) out.push_back(&e);
+        if (e.category == c && !e.hidden) out.push_back(&e);
+    return out;
+}
+
+std::string pluginParamMeta(const ParamInfo& p) {
+    return p.label + "\t" + std::to_string(p.min) + "\t" + std::to_string(p.max) + "\t" + std::to_string(p.def) + "\t" +
+           (p.step >= 1 ? "1" : "0");
+}
+
+std::vector<ParamInfo> effectParams(const Effect& e) {
+    if (e.type != "plugin") {
+        const EffectInfo* info = findEffectInfo(e.type);
+        return info ? info->params : std::vector<ParamInfo>{};
+    }
+    std::vector<ParamInfo> out;
+    for (const auto& [key, param] : e.params) {
+        if (key.rfind("param.", 0) != 0) continue;
+        ParamInfo p;
+        p.name = key;
+        p.label = key.substr(6);
+        auto meta = e.strings.find("meta." + key.substr(6));
+        if (meta != e.strings.end()) {
+            std::vector<std::string> f;
+            size_t start = 0;
+            for (size_t tab; (tab = meta->second.find('\t', start)) != std::string::npos; start = tab + 1)
+                f.push_back(meta->second.substr(start, tab - start));
+            f.push_back(meta->second.substr(start));
+            if (f.size() >= 5) {
+                p.label = f[0];
+                p.min = std::atof(f[1].c_str());
+                p.max = std::atof(f[2].c_str());
+                p.def = std::atof(f[3].c_str());
+                p.step = f[4] == "1" ? 1.0 : (p.max - p.min) / 1000.0;
+            }
+        }
+        out.push_back(p);
+    }
     return out;
 }
 

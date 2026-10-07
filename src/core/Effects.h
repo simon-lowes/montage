@@ -55,11 +55,19 @@ struct EffectInfo {
     std::string group;  // UI grouping, e.g. "Color", "Blur & Sharpen", "Keying"
     std::vector<ParamInfo> params;
     std::vector<StringParamInfo> strings;
+    // Not offered in effect lists (e.g. "plugin", added per installed plugin).
+    bool hidden = false;
 };
 
 const std::vector<EffectInfo>& effectCatalog();
 const EffectInfo* findEffectInfo(const std::string& type);
 std::vector<const EffectInfo*> effectsInCategory(EffectCategory c);
+
+// The parameters the inspector shows for an effect: the catalogue entry's,
+// or for "plugin" effects those recorded when the plugin was added
+// (keys "param.<id>", described by strings "meta.<id>").
+std::vector<ParamInfo> effectParams(const Effect& e);
+std::string pluginParamMeta(const ParamInfo& p);
 
 // Builds an Effect of the given type populated with default values.
 Effect makeEffect(Project& p, const std::string& type);

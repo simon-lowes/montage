@@ -17,3 +17,24 @@ if(MONTAGE_BUILD_APP)
   add_test(NAME test_app COMMAND test_app)
   set_tests_properties(test_app PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 300)
 endif()
+
+# ---- Audio plugins: test CLAP plugins built as loadable *.clap modules ----
+enable_language(C)
+function(montage_test_clap target output dir source)
+  add_library(${target} MODULE ${source})
+  target_include_directories(${target} PRIVATE ${PROJECT_SOURCE_DIR}/third_party/clap/include)
+  set_target_properties(${target} PROPERTIES PREFIX "" SUFFIX ".clap" OUTPUT_NAME ${output}
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/clap/${dir}
+    C_VISIBILITY_PRESET hidden)
+endfunction()
+montage_test_clap(montage_test_plugins MontageTestPlugins good plugins/test_clap_plugins.c)
+montage_test_clap(montage_test_hang MontageTestHang hang plugins/test_clap_misbehaving.c)
+target_compile_definitions(montage_test_hang PRIVATE MONTAGE_TEST_HANG)
+montage_test_clap(montage_test_crash MontageTestCrash crash plugins/test_clap_misbehaving.c)
+target_compile_definitions(montage_test_crash PRIVATE MONTAGE_TEST_CRASH)
+
+montage_test(test_plugins)
+add_dependencies(test_plugins montage_test_plugins montage_test_hang montage_test_crash montage-plugin-probe)
+target_compile_definitions(test_plugins PRIVATE
+  MONTAGE_TEST_CLAP_DIR="${CMAKE_CURRENT_BINARY_DIR}/clap"
+  MONTAGE_PLUGIN_PROBE="$<TARGET_FILE:montage-plugin-probe>")

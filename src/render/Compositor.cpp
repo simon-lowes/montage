@@ -9,6 +9,7 @@
 #include <cmath>
 
 #include "Processing.h"
+#include "audio/PluginEffect.h"
 #include "core/EditOps.h"
 #include "media/MediaPool.h"
 
@@ -468,14 +469,76 @@ struct AudioMixer::State {
     double gain = 1;
     std::vector<float> delay;
     size_t pos = 0;
+    // "plugin" effects: the running plugin, kept across seeks.
+    std::unique_ptr<plugins::Instance> plugin;
+    double pluginRate = 0;
+    bool pluginFailed = false;
+    std::vector<float> planar;
 };
+
+namespace {
+constexpr int kPluginBlock = 4096;
+}
+
+namespace {
+// Runs a third-party plugin over an interleaved stereo block.
+void processPlugin(AudioMixer::State& st, const Effect& e, double sr, FrameTime lt, bool paramsChanged, float* buf,
+                   int frames) {
+    if (st.plugin && st.pluginRate != sr) {
+        st.pluginRate = sr;
+        if (!st.plugin->activate(sr, kPluginBlock)) st.plugin.reset();
+    }
+    if (!st.plugin && !st.pluginFailed) {
+        // Tried once per effect: a missing or broken plugin leaves the audio unprocessed.
+        st.pluginFailed = true;
+        if (auto d = plugins::Registry::instance().find(e.s("plugin_id")))
+            if (auto inst = plugins::instantiate(*d))
+                if (inst->activate(sr, kPluginBlock)) {
+                    const std::string state = plugins::decodeState(e.s("state"));
+                    if (!state.empty()) inst->loadState(state);
+                    st.plugin = std::move(inst);
+                    st.pluginRate = sr;
+                    st.pluginFailed = false;
+                    paramsChanged = true;
+                }
+    }
+    if (!st.plugin) return;
+    if (paramsChanged)
+        for (const auto& [key, param] : e.params)
+            if (key.rfind("param.", 0) == 0)
+                st.plugin->setParameter(uint32_t(std::strtoul(key.c_str() + 6, nullptr, 10)), param.at(lt));
+    st.planar.resize(size_t(frames) * 2);
+    float* ch[2] = {st.planar.data(), st.planar.data() + frames};
+    for (int i = 0; i < frames; ++i) {
+        ch[0][i] = buf[size_t(i) * 2];
+        ch[1][i] = buf[size_t(i) * 2 + 1];
+    }
+    st.plugin->process(ch, 2, frames);
+    for (int i = 0; i < frames; ++i) {
+        buf[size_t(i) * 2] = ch[0][i];
+        buf[size_t(i) * 2 + 1] = ch[1][i];
+    }
+}
+}  // namespace
 
 AudioMixer::AudioMixer() = default;
 AudioMixer::~AudioMixer() = default;
 
 void AudioMixer::reset() {
     std::lock_guard lock(m_);
-    states_.clear();
+    // Plugins are expensive to load: keep them, clearing only their audio state.
+    for (auto it = states_.begin(); it != states_.end();) {
+        if (auto plugin = std::move(it->second->plugin)) {
+            plugin->reset();
+            const double rate = it->second->pluginRate;
+            *it->second = State{};
+            it->second->plugin = std::move(plugin);
+            it->second->pluginRate = rate;
+            ++it;
+        } else {
+            it = states_.erase(it);
+        }
+    }
 }
 
 void AudioMixer::mix(const Project& p, const Sequence& seq, int64_t start, int frames, float* out,
@@ -624,6 +687,8 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
                         d[0] = std::clamp(float(d[0] * st->gain), -ceil, ceil);
                         d[1] = std::clamp(float(d[1] * st->gain), -ceil, ceil);
                     }
+                } else if (e.type == "plugin") {
+                    processPlugin(*st, e, sr, lt, changed, clipBuf.data(), frames);
                 } else if (e.type == "delay") {
                     size_t del = size_t(std::max(1.0, e.p("time_ms", lt, 300) * sr / 1000));
                     float fb = float(std::clamp(e.p("feedback", lt, 0.35), 0.0, 0.95));

@@ -14,7 +14,7 @@ ZIP="Montage-$VERSION-windows-x64.zip"
 
 rm -rf "$OUT" "dist/$ZIP"
 mkdir -p "$OUT"
-cp "$BUILD/src/app/montage.exe" "$BUILD/src/montage-cli.exe" "$OUT/"
+cp "$BUILD/src/app/montage.exe" "$BUILD/src/app/montage-plugin-probe.exe" "$BUILD/src/montage-cli.exe" "$OUT/"
 
 WINDEPLOYQT=$(command -v windeployqt6 || command -v windeployqt || ls /ucrt64/share/qt6/bin/windeployqt*.exe | head -1)
 "$WINDEPLOYQT" --release --no-translations --no-system-d3d-compiler --no-opengl-sw "$OUT/montage.exe"
