@@ -36,8 +36,12 @@ struct EdlWriter {
     int event = 0;
 
     std::string tc(FrameTime f) const { return formatTimecode(std::max<FrameTime>(0, f), s.fps); }
-    // Source timecode of timeline frame t inside clip c.
-    FrameTime src(const Clip& c, FrameTime t) const { return FrameTime(std::llround(c.sourceFrameAt(t))); }
+    // Source timecode of timeline frame t inside clip c (from the media's own start timecode).
+    FrameTime src(const Clip& c, FrameTime t) const {
+        double origin = 0;
+        if (const MediaItem* m = c.mediaId ? p.findMedia(c.mediaId) : nullptr; m && m->timecode > 0) origin = m->timecode * s.fpsValue();
+        return FrameTime(std::llround(c.sourceFrameAt(t) + origin));
+    }
 
     void comment(const Clip& c) {
         out << "* FROM CLIP NAME: " << c.name << "\n";

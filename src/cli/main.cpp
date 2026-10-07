@@ -9,6 +9,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -54,6 +56,7 @@ int usage() {
                  "  montage-cli loudness <media>\n"
                  "  montage-cli edl <project.montage> [-o out.edl]\n"
                  "  montage-cli otio <project.montage> [-o out.otio]\n"
+                 "  montage-cli import <timeline.otio|.edl> -o <project.montage> [--fps N]\n"
                  "  montage-cli bench <project.montage> [--scale 0.5] [--frames 120]\n"
                  "  montage-cli transcribe <media> [--model base.en|PATH] [--language auto|en|...] [--translate]\n"
                  "                     [--srt out.srt] [--vtt out.vtt] [--json out.json] [--txt out.txt]\n"
@@ -385,6 +388,43 @@ int cmdLoudness(const std::vector<std::string>& args) {
     return 0;
 }
 
+// montage-cli import <timeline.otio|.edl> -o project.montage [--fps N]
+int cmdImport(const std::vector<std::string>& args) {
+    if (args.empty()) return usage();
+    std::string in = args[0], out;
+    Rational fps{30, 1};
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (args[i] == "-o" && i + 1 < args.size()) out = args[++i];
+        else if (args[i] == "--fps" && i + 1 < args.size()) {
+            if (!parseFps(args[++i], fps)) return usage();
+        } else return usage();
+    }
+    if (out.empty()) return usage();
+    std::ifstream f(in, std::ios::binary);
+    if (!f) {
+        std::fprintf(stderr, "error: cannot read %s\n", in.c_str());
+        return 1;
+    }
+    const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    Project p;
+    p.name = std::filesystem::path(in).stem().string();
+    const MediaProber prober = [](const std::string& file, MediaItem& m) { return probeMedia(file, m, nullptr); };
+    const bool edl = std::filesystem::path(in).extension() == ".edl";
+    ImportResult r = edl ? importEdl(p, text, fps, prober, std::filesystem::path(in).parent_path().string()) : importOtio(p, text, prober);
+    if (!r.ok) {
+        std::fprintf(stderr, "error: %s\n", r.error.c_str());
+        return 1;
+    }
+    for (const auto& o : r.offline) std::fprintf(stderr, "offline: %s\n", o.c_str());
+    for (const auto& w : r.warnings) std::fprintf(stderr, "warning: %s\n", w.c_str());
+    if (!saveProject(p, out)) {
+        std::fprintf(stderr, "error: cannot write %s\n", out.c_str());
+        return 1;
+    }
+    std::printf("Imported %d clips into %s\n", r.clips, out.c_str());
+    return 0;
+}
+
 int cmdInterchange(const std::vector<std::string>& args, bool otio) {
     if (args.empty()) return usage();
     std::string out;
@@ -617,6 +657,7 @@ int main(int argc, char** argv) {
     if (cmd == "loudness") return cmdLoudness(args);
     if (cmd == "bench") return cmdBench(args);
     if (cmd == "captions") return cmdCaptions(args);
+    if (cmd == "import") return cmdImport(args);
     if (cmd == "edl") return cmdInterchange(args, false);
     if (cmd == "otio") return cmdInterchange(args, true);
 #ifdef MONTAGE_WITH_WHISPER

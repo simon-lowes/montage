@@ -37,6 +37,7 @@
 
 #include "AudioMeterWidget.h"
 #include "audio/PluginEffect.h"
+#include "media/Decoder.h"
 #include "media/HwAccel.h"
 #include "media/MediaPool.h"
 #include "EditorState.h"
@@ -314,6 +315,7 @@ void MainWindow::buildMenus() {
     add(file, tr("&Import Media…"), QKeySequence("Ctrl+I"), [this] { bin_->importDialog(); });
     add(file, tr("&Export Media…"), QKeySequence("Ctrl+M"), [this] { exportMedia(); });
     add(file, tr("Export &Frame…"), QKeySequence("Ctrl+Shift+E"), [this] { exportFrame(); });
+    add(file, tr("&Import Timeline (OTIO, EDL)…"), QKeySequence(), [this] { importTimeline(); });
     add(file, tr("Export E&DL (CMX 3600)…"), QKeySequence(), [this] { exportInterchange(false); });
     add(file, tr("Export &OpenTimelineIO…"), QKeySequence(), [this] { exportInterchange(true); });
     file->addSeparator();
@@ -1169,6 +1171,43 @@ void MainWindow::exportInterchange(bool otio) {
     }
     st.setValue("lastExportDir", QFileInfo(path).absolutePath());
     statusBar()->showMessage(tr("Exported %1").arg(path), 4000);
+}
+
+void MainWindow::importTimeline() {
+    QSettings st = appSettings();
+    const QString path = QFileDialog::getOpenFileName(this, tr("Import Timeline"), st.value("lastImportTimelineDir").toString(),
+                                                      tr("Timelines (*.otio *.edl);;OpenTimelineIO (*.otio);;CMX 3600 EDL (*.edl)"));
+    if (path.isEmpty()) return;
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly)) {
+        QMessageBox::warning(this, tr("Import Timeline"), tr("Cannot read %1").arg(path));
+        return;
+    }
+    st.setValue("lastImportTimelineDir", QFileInfo(path).absolutePath());
+    const std::string text = f.readAll().toStdString();
+    const MediaProber prober = [](const std::string& file, MediaItem& m) { return probeMedia(file, m, nullptr); };
+    const QString ext = QFileInfo(path).suffix().toLower();
+    // EDLs do not say their rate: take the open sequence's.
+    const Rational fps = state_->sequence() ? state_->sequence()->fps : Rational{30, 1};
+    const std::string dir = QFileInfo(path).absolutePath().toStdString();
+    ImportResult r;
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    state_->edit(tr("Import Timeline"), [&](Project& p, Sequence&) {
+        r = ext == "edl" ? importEdl(p, text, fps, prober, dir) : importOtio(p, text, prober);
+        return r.ok;
+    });
+    QApplication::restoreOverrideCursor();
+    if (!r.ok) {
+        QMessageBox::warning(this, tr("Import Timeline"), QString::fromStdString(r.error));
+        return;
+    }
+    state_->setActiveSequence(r.sequence);
+    QStringList notes;
+    if (!r.offline.empty()) notes << tr("%n file(s) not found; their clips are offline:", "", int(r.offline.size()));
+    for (size_t i = 0; i < r.offline.size() && i < 10; ++i) notes << QStringLiteral("  ") + QString::fromStdString(r.offline[i]);
+    for (const auto& w : r.warnings) notes << QString::fromStdString(w);
+    if (!notes.isEmpty()) QMessageBox::information(this, tr("Import Timeline"), notes.join('\n'));
+    statusBar()->showMessage(tr("Imported %n clip(s) from %1", "", r.clips).arg(QFileInfo(path).fileName()), 5000);
 }
 
 void MainWindow::addTitle() {

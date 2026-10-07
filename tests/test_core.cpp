@@ -1002,6 +1002,145 @@ private slots:
         QCOMPARE(root["tracks"].toObject()["markers"].toArray().size(), 1);
     }
 
+    // A timeline with linked picture and sound, a dissolve, a gap, a title on
+    // V2, a speed change and a marker: what interchange must carry.
+    static Id interchangeFixture(Fixture& fx) {
+        placeMedia(fx.p, fx.s(), fx.media, 0, 30, 90, V1, A1, false);          // record 0..60
+        placeMedia(fx.p, fx.s(), fx.media, 60, 120, 180, V1, A1, false);       // record 60..120
+        placeMedia(fx.p, fx.s(), fx.media, 150, 0, 30, V1, A1, false);         // after a gap
+        const Id a = fx.v1().clips[0].id;
+        addTransition(fx.p, fx.s(), a, Edge::Out, "cross_dissolve", 20);
+        addTransition(fx.p, fx.s(), fx.a1().clips[0].id, Edge::Out, "crossfade", 20);
+        setSpeed(fx.p, fx.s(), fx.v1().clips[2].id, 0.5, false);
+        Clip title = makeGeneratorClip(fx.p, "title", 40);
+        title.start = 20;
+        title.generator.strings["text"] = "Hello";
+        overwrite(fx.p, fx.s(), V2, title);
+        addMarker(fx.s(), Marker{10, 0, "Start", "first beat", 0});
+        return a;
+    }
+
+    static void compareTimelines(const Sequence& a, const Sequence& b, bool generators, size_t videoTracks) {
+        for (size_t ti = 0; ti < videoTracks + a.audioTracks.size(); ++ti) {
+            const bool video = ti < videoTracks;
+            const Track& ta = video ? a.videoTracks[ti] : a.audioTracks[ti - videoTracks];
+            const auto& list = video ? b.videoTracks : b.audioTracks;
+            const size_t bi = video ? ti : ti - videoTracks;
+            if (ta.clips.empty() && bi >= list.size()) continue;  // empty tracks need not come back
+            QVERIFY(bi < list.size());
+            const Track& tb = list[bi];
+            std::vector<const Clip*> ca, cb;
+            for (const Clip& c : ta.clips)
+                if (generators || !c.isGenerator()) ca.push_back(&c);
+            for (const Clip& c : tb.clips)
+                if (generators || !c.isGenerator()) cb.push_back(&c);
+            QCOMPARE(cb.size(), ca.size());
+            for (size_t i = 0; i < ca.size(); ++i) {
+                QCOMPARE(cb[i]->start, ca[i]->start);
+                QCOMPARE(cb[i]->duration, ca[i]->duration);
+                QCOMPARE(cb[i]->isGenerator(), ca[i]->isGenerator());
+                if (!ca[i]->isGenerator()) {
+                    QVERIFY2(std::fabs(cb[i]->sourceIn - ca[i]->sourceIn) < 0.51,
+                             qPrintable(QString("%1 vs %2").arg(cb[i]->sourceIn).arg(ca[i]->sourceIn)));
+                    QCOMPARE(cb[i]->speed, ca[i]->speed);
+                    QCOMPARE(cb[i]->mediaId, ca[i]->mediaId);
+                }
+            }
+            QCOMPARE(tb.transitions.size(), ta.transitions.size());
+            for (size_t i = 0; i < ta.transitions.size(); ++i) QCOMPARE(tb.transitions[i].duration, ta.transitions[i].duration);
+        }
+    }
+
+    void interchangeImports() {
+        // OpenTimelineIO: everything comes back.
+        {
+            Fixture fx;
+            interchangeFixture(fx);
+            const Sequence original = fx.s();
+            const std::string otio = exportOtio(fx.p, original);
+            ImportResult r = importOtio(fx.p, otio);
+            QVERIFY2(r.ok, r.error.c_str());
+            const Sequence& back = *fx.p.findSequence(r.sequence);
+            QCOMPARE(fx.p.activeSequence, r.sequence);
+            QCOMPARE(back.fps, original.fps);
+            QCOMPARE(fx.p.media.size(), size_t(1));  // the same file is not added twice
+            QVERIFY(r.offline.empty());
+            compareTimelines(original, back, true, 2);
+            // Picture and sound are linked again, the title kept its text, the marker came back.
+            QVERIFY(back.videoTracks[0].clips[0].linkGroup != 0);
+            QCOMPARE(back.videoTracks[0].clips[0].linkGroup, back.audioTracks[0].clips[0].linkGroup);
+            QCOMPARE(back.videoTracks[1].clips.at(0).generator.s("text"), std::string("Hello"));
+            QCOMPARE(back.markers.size(), size_t(1));
+            QCOMPARE(back.markers[0].comment, std::string("first beat"));
+        }
+        // EDL: one video track and the audio, cuts and dissolves.
+        {
+            Fixture fx;
+            interchangeFixture(fx);
+            const Sequence original = fx.s();
+            const std::string edl = exportEdl(fx.p, original);
+            ImportResult r = importEdl(fx.p, edl, original.fps);
+            QVERIFY2(r.ok, r.error.c_str());
+            const Sequence& back = *fx.p.findSequence(r.sequence);
+            QCOMPARE(fx.p.media.size(), size_t(1));  // found by its SOURCE FILE comment
+            compareTimelines(original, back, false, 1);
+        }
+        // An OTIO file in the older style (media_reference, 24 fps) from another tool.
+        {
+            Project p = makeDefaultProject();
+            const char* otio = R"({"OTIO_SCHEMA":"Timeline.1","name":"From Resolve","tracks":{"OTIO_SCHEMA":"Stack.1","children":[
+              {"OTIO_SCHEMA":"Track.1","kind":"Video","name":"Video 1","children":[
+                {"OTIO_SCHEMA":"Gap.1","source_range":{"OTIO_SCHEMA":"TimeRange.1","start_time":{"OTIO_SCHEMA":"RationalTime.1","rate":24,"value":0},"duration":{"OTIO_SCHEMA":"RationalTime.1","rate":24,"value":24}}},
+                {"OTIO_SCHEMA":"Clip.1","name":"A001_C002","source_range":{"OTIO_SCHEMA":"TimeRange.1","start_time":{"OTIO_SCHEMA":"RationalTime.1","rate":24,"value":48},"duration":{"OTIO_SCHEMA":"RationalTime.1","rate":24,"value":72}},
+                 "media_reference":{"OTIO_SCHEMA":"ExternalReference.1","target_url":"file:///nowhere/A001_C002.mov","available_range":{"OTIO_SCHEMA":"TimeRange.1","start_time":{"OTIO_SCHEMA":"RationalTime.1","rate":24,"value":0},"duration":{"OTIO_SCHEMA":"RationalTime.1","rate":24,"value":240}}}}]}]}})";
+            ImportResult r = importOtio(p, otio);
+            QVERIFY2(r.ok, r.error.c_str());
+            const Sequence& s = *p.findSequence(r.sequence);
+            QCOMPARE(s.fps, (Rational{24, 1}));
+            QCOMPARE(s.name, std::string("From Resolve"));
+            const Clip& c = s.videoTracks.at(0).clips.at(0);
+            QCOMPARE(c.start, FrameTime(24));
+            QCOMPARE(c.duration, FrameTime(72));
+            QCOMPARE(c.sourceIn, 48.0);
+            QCOMPARE(r.offline.size(), size_t(1));  // the file is not here: offline, ten seconds long
+            QCOMPARE(p.findMedia(c.mediaId)->duration, 10.0);
+            QCOMPARE(p.findMedia(c.mediaId)->path, std::string("/nowhere/A001_C002.mov"));
+        }
+        // A Premiere-style EDL: A/V events, a dissolve, clip names without paths.
+        {
+            Project p = makeDefaultProject();
+            const char* edl =
+                "TITLE: Rough Cut\nFCM: NON-DROP FRAME\n\n"
+                "001  AX       AA/V  C        00:00:00:00 00:00:04:00 01:00:00:00 01:00:04:00\n"
+                "* FROM CLIP NAME: interview.mov\n\n"
+                "002  AX       V     C        00:00:10:00 00:00:10:00 01:00:04:00 01:00:04:00\n"
+                "002  AX       V     D    012 00:00:20:00 00:00:24:00 01:00:04:00 01:00:08:00\n"
+                "* FROM CLIP NAME: interview.mov\n* TO CLIP NAME: broll.mov\n";
+            ImportResult r = importEdl(p, edl, {25, 1});
+            QVERIFY2(r.ok, r.error.c_str());
+            const Sequence& s = *p.findSequence(r.sequence);
+            QCOMPARE(s.name, std::string("Rough Cut"));
+            QCOMPARE(s.videoTracks.at(0).clips.size(), size_t(2));
+            const Clip& a = s.videoTracks[0].clips[0];
+            const Clip& b = s.videoTracks[0].clips[1];
+            // Record timecode 01:00:00:00 is where the EDL's timeline starts.
+            QCOMPARE(a.start, FrameTime(25 * 3600));
+            QCOMPARE(b.start - a.start, FrameTime(100 + 6));  // the dissolve is centred on the cut
+            QCOMPARE(a.end(), b.start);
+            QCOMPARE(s.videoTracks[0].transitions.size(), size_t(1));
+            QCOMPARE(s.videoTracks[0].transitions[0].duration, FrameTime(12));
+            QCOMPARE(s.audioTracks.at(0).clips.size(), size_t(1));
+            QCOMPARE(s.audioTracks.at(1).clips.size(), size_t(1));  // AA: both channels
+            QCOMPARE(r.offline.size(), size_t(2));
+            QCOMPARE(p.findMedia(b.mediaId)->name, std::string("broll.mov"));
+            QCOMPARE(b.sourceIn, 500.0 + 6);
+        }
+        // Not a timeline.
+        Project p = makeDefaultProject();
+        QVERIFY(!importOtio(p, "{}").ok);
+        QVERIFY(!importEdl(p, "nothing here", {25, 1}).ok);
+    }
+
     void projectFileRelinksRelativePaths() {
         QTemporaryDir dir;
         QVERIFY(dir.isValid());

@@ -88,6 +88,8 @@ private:
     void autoColor();
     void syncByAudio();
     void exportInterchange(bool otio);
+    // Imports an OTIO, EDL or FCP XML timeline as a new sequence (one undo step).
+    void importTimeline();
     void addTitle();
     void newSequence();
     void openInSource(Id media);
