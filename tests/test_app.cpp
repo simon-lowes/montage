@@ -10,6 +10,9 @@
 #include <QListWidget>
 #include <QMimeData>
 #include <QScrollBar>
+#include <QSlider>
+#include <QPushButton>
+#include <QMenu>
 #include <QTableWidget>
 #include <QToolButton>
 #include <QTreeWidget>
@@ -22,6 +25,7 @@
 #include "EffectsBrowser.h"
 #include "audio/Plugins.h"
 #include "MainWindow.h"
+#include "MixerPanel.h"
 #include "PluginEditorWindow.h"
 #include "audio/PluginEffect.h"
 #include "MaskOverlay.h"
@@ -451,6 +455,69 @@ private slots:
         QVERIFY(!PluginEditorWindow::find(clip, eid));
         state()->newProject();
         QVERIFY(QTest::qWaitForWindowActive(win_.get()));
+    }
+
+    void mixerEffectsAndBuses() {
+        loadDemo();
+        auto* mixer = win_->findChild<MixerPanel*>();
+        QVERIFY(mixer);
+        const Id a1 = state()->sequence()->audioTracks.at(0).id;
+        // FX on the first strip puts its inserts in the Inspector.
+        QToolButton* fx = nullptr;
+        for (auto* b : mixer->findChildren<QToolButton*>("fxButton"))
+            if (!fx && b->isVisibleTo(mixer)) fx = b;
+        QVERIFY(fx);
+        fx->click();
+        QCOMPARE(state()->inspectedChain(), a1);
+        QApplication::processEvents();
+        // Add a limiter from the Inspector's Add menu.
+        QPushButton* add = nullptr;
+        for (auto* b : win_->findChildren<QPushButton*>())
+            if (b->text().startsWith("Add Audio Effect") && b->isVisibleTo(win_.get())) add = b;
+        QVERIFY(add);
+        QAction* limiter = nullptr;
+        std::function<void(QMenu*)> findIn = [&](QMenu* m) {
+            for (QAction* a : m->actions()) {
+                if (a->menu()) findIn(a->menu());
+                else if (a->text() == "Limiter") limiter = a;
+            }
+        };
+        findIn(add->menu());
+        QVERIFY(limiter);
+        limiter->trigger();
+        QCOMPARE(state()->sequence()->audioTracks.at(0).effects.size(), size_t(1));
+        QApplication::processEvents();
+        QCOMPARE(fx->text(), QString("FX 1"));
+        // Selecting a clip shows the clip again.
+        state()->setSelection({clipNamed(*state()->sequence(), "Red")->id}, false);
+        QCOMPARE(state()->inspectedChain(), Id(0));
+
+        // A bus, and routing the track to it.
+        auto* addBus = mixer->findChild<QToolButton*>("addBus");
+        QVERIFY(addBus);
+        addBus->click();
+        QCOMPARE(state()->sequence()->buses.size(), size_t(1));
+        const Id bus = state()->sequence()->buses[0].id;
+        QApplication::processEvents();
+        QComboBox* out = nullptr;
+        for (auto* c : mixer->findChildren<QComboBox*>("outputCombo"))
+            if (!out && c->isVisibleTo(mixer)) out = c;  // rebuilt strips replace the old ones
+        QVERIFY(out);
+        QCOMPARE(out->count(), 2);
+        out->setCurrentIndex(1);
+        emit out->activated(1);
+        QCOMPARE(state()->sequence()->audioTracks.at(0).output, bus);
+        // Master fader.
+        auto* master = mixer->findChild<QSlider*>("masterFader");
+        QVERIFY(master);
+        master->setValue(-60);
+        QCOMPARE(state()->sequence()->masterVolumeDb, -6.0);
+        // Undo walks it back.
+        state()->undo();
+        state()->undo();
+        QCOMPARE(state()->sequence()->audioTracks.at(0).output, Id(0));
+        state()->undo();
+        QVERIFY(state()->sequence()->buses.empty());
     }
 
     void crashRecoveryAndSnapshots() {

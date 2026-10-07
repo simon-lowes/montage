@@ -665,6 +665,85 @@ void AudioMixer::reset() {
     }
 }
 
+void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameTime lt, double sr, float* buf, int frames) {
+    for (const Effect& e : chain) {
+        if (!e.enabled || isSourceAudioEffect(e.type)) continue;
+        auto& st = states_[{owner, e.id}];
+        if (!st) st = std::make_unique<State>();
+        std::vector<double> params;
+        for (const auto& [k, v] : e.params) params.push_back(v.at(lt));
+        bool changed = params != st->lastParams;
+        st->lastParams = params;
+        if (e.type == "eq3") {
+            if (changed) {
+                st->bq[0].lowShelf(sr, e.p("low_hz", lt, 200), e.p("low_db", lt));
+                st->bq[1].peaking(sr, e.p("mid_hz", lt, 1000), std::max(0.1, e.p("mid_q", lt, 0.9)), e.p("mid_db", lt));
+                st->bq[2].highShelf(sr, e.p("high_hz", lt, 5000), e.p("high_db", lt));
+            }
+            for (int i = 0; i < frames; ++i)
+                for (int ch = 0; ch < 2; ++ch) {
+                    float v = buf[size_t(i) * 2 + ch];
+                    for (auto& bq : st->bq) v = bq.process(ch, v);
+                    buf[size_t(i) * 2 + ch] = v;
+                }
+        } else if (e.type == "highpass" || e.type == "lowpass") {
+            if (changed) {
+                if (e.type == "highpass") st->bq[0].highPass(sr, e.p("hz", lt, 80));
+                else st->bq[0].lowPass(sr, e.p("hz", lt, 12000));
+            }
+            for (int i = 0; i < frames; ++i)
+                for (int ch = 0; ch < 2; ++ch)
+                    buf[size_t(i) * 2 + ch] = st->bq[0].process(ch, buf[size_t(i) * 2 + ch]);
+        } else if (e.type == "compressor") {
+            double thr = e.p("threshold_db", lt, -18), ratio = std::max(1.0, e.p("ratio", lt, 4));
+            double att = std::exp(-1.0 / (std::max(0.1, e.p("attack_ms", lt, 10)) * sr / 1000));
+            double rel = std::exp(-1.0 / (std::max(1.0, e.p("release_ms", lt, 120)) * sr / 1000));
+            double makeup = e.p("makeup_db", lt);
+            for (int i = 0; i < frames; ++i) {
+                float* d = &buf[size_t(i) * 2];
+                double lvl = std::max(std::fabs(d[0]), std::fabs(d[1]));
+                st->env = lvl > st->env ? att * st->env + (1 - att) * lvl : rel * st->env + (1 - rel) * lvl;
+                double envDb = 20 * std::log10(st->env + 1e-9);
+                double over = envDb - thr;
+                double gr = over > 0 ? over * (1 - 1 / ratio) : 0;
+                float g = dbToLin(makeup - gr);
+                d[0] *= g;
+                d[1] *= g;
+            }
+        } else if (e.type == "limiter") {
+            float ceil = dbToLin(e.p("ceiling_db", lt, -1));
+            double rel = std::exp(-1.0 / (std::max(1.0, e.p("release_ms", lt, 60)) * sr / 1000));
+            for (int i = 0; i < frames; ++i) {
+                float* d = &buf[size_t(i) * 2];
+                double pk = std::max(std::fabs(d[0]), std::fabs(d[1]));
+                double target = pk > ceil ? ceil / pk : 1.0;
+                st->gain = target < st->gain ? target : rel * st->gain + (1 - rel) * target;
+                d[0] = std::clamp(float(d[0] * st->gain), -ceil, ceil);
+                d[1] = std::clamp(float(d[1] * st->gain), -ceil, ceil);
+            }
+        } else if (e.type == "plugin") {
+            processPlugin(*st, e, sr, lt, changed, buf, frames);
+        } else if (e.type == "delay") {
+            size_t del = size_t(std::max(1.0, e.p("time_ms", lt, 300) * sr / 1000));
+            float fb = float(std::clamp(e.p("feedback", lt, 0.35), 0.0, 0.95));
+            float mix = float(e.p("mix", lt, 30) / 100.0);
+            size_t N = size_t(sr * 2.1);
+            if (st->delay.size() != N * 2) st->delay.assign(N * 2, 0.0f);
+            del = std::min(del, N - 1);
+            for (int i = 0; i < frames; ++i) {
+                size_t r = (st->pos + N - del) % N;
+                for (int ch = 0; ch < 2; ++ch) {
+                    float x = buf[size_t(i) * 2 + ch];
+                    float delayed = st->delay[r * 2 + size_t(ch)];
+                    st->delay[st->pos * 2 + size_t(ch)] = x + delayed * fb;
+                    buf[size_t(i) * 2 + ch] = x + delayed * mix;
+                }
+                st->pos = (st->pos + 1) % N;
+            }
+        }
+    }
+}
+
 void AudioMixer::mix(const Project& p, const Sequence& seq, int64_t start, int frames, float* out,
                      std::vector<MeterLevels>* trackLevels) {
     std::lock_guard lock(m_);
@@ -680,6 +759,11 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
     bool anySolo = std::any_of(seq.audioTracks.begin(), seq.audioTracks.end(), [](const Track& t) { return t.solo; });
     if (trackLevels && depth == 0) trackLevels->assign(seq.audioTracks.size(), MeterLevels{});
     std::vector<float> trackBuf(size_t(frames) * 2), clipBuf(size_t(frames) * 2);
+    const FrameTime blockFrame = FrameTime(double(start) * fps / sr);  // keyframe time of track, bus and master effects
+    // Buses: tracks routed to them are summed here first.
+    std::map<Id, std::vector<float>> busBufs;
+    for (const Bus& b : seq.buses) busBufs[b.id].assign(size_t(frames) * 2, 0.0f);
+    std::fill(out, out + size_t(frames) * 2, 0.0f);
 
     for (size_t ti = 0; ti < seq.audioTracks.size(); ++ti) {
         const Track& track = seq.audioTracks[ti];
@@ -762,83 +846,7 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
                 }
             }
             // Clip filters (stateful, processed over the whole block for continuity).
-            for (const Effect& e : c.effects) {
-                if (!e.enabled || isSourceAudioEffect(e.type)) continue;
-                auto& st = states_[{c.id, e.id}];
-                if (!st) st = std::make_unique<State>();
-                FrameTime lt = FrameTime(double(start) * fps / sr) - c.start;
-                std::vector<double> params;
-                for (const auto& [k, v] : e.params) params.push_back(v.at(lt));
-                bool changed = params != st->lastParams;
-                st->lastParams = params;
-                if (e.type == "eq3") {
-                    if (changed) {
-                        st->bq[0].lowShelf(sr, e.p("low_hz", lt, 200), e.p("low_db", lt));
-                        st->bq[1].peaking(sr, e.p("mid_hz", lt, 1000), std::max(0.1, e.p("mid_q", lt, 0.9)), e.p("mid_db", lt));
-                        st->bq[2].highShelf(sr, e.p("high_hz", lt, 5000), e.p("high_db", lt));
-                    }
-                    for (int i = 0; i < frames; ++i)
-                        for (int ch = 0; ch < 2; ++ch) {
-                            float v = clipBuf[size_t(i) * 2 + ch];
-                            for (auto& bq : st->bq) v = bq.process(ch, v);
-                            clipBuf[size_t(i) * 2 + ch] = v;
-                        }
-                } else if (e.type == "highpass" || e.type == "lowpass") {
-                    if (changed) {
-                        if (e.type == "highpass") st->bq[0].highPass(sr, e.p("hz", lt, 80));
-                        else st->bq[0].lowPass(sr, e.p("hz", lt, 12000));
-                    }
-                    for (int i = 0; i < frames; ++i)
-                        for (int ch = 0; ch < 2; ++ch)
-                            clipBuf[size_t(i) * 2 + ch] = st->bq[0].process(ch, clipBuf[size_t(i) * 2 + ch]);
-                } else if (e.type == "compressor") {
-                    double thr = e.p("threshold_db", lt, -18), ratio = std::max(1.0, e.p("ratio", lt, 4));
-                    double att = std::exp(-1.0 / (std::max(0.1, e.p("attack_ms", lt, 10)) * sr / 1000));
-                    double rel = std::exp(-1.0 / (std::max(1.0, e.p("release_ms", lt, 120)) * sr / 1000));
-                    double makeup = e.p("makeup_db", lt);
-                    for (int i = 0; i < frames; ++i) {
-                        float* d = &clipBuf[size_t(i) * 2];
-                        double lvl = std::max(std::fabs(d[0]), std::fabs(d[1]));
-                        st->env = lvl > st->env ? att * st->env + (1 - att) * lvl : rel * st->env + (1 - rel) * lvl;
-                        double envDb = 20 * std::log10(st->env + 1e-9);
-                        double over = envDb - thr;
-                        double gr = over > 0 ? over * (1 - 1 / ratio) : 0;
-                        float g = dbToLin(makeup - gr);
-                        d[0] *= g;
-                        d[1] *= g;
-                    }
-                } else if (e.type == "limiter") {
-                    float ceil = dbToLin(e.p("ceiling_db", lt, -1));
-                    double rel = std::exp(-1.0 / (std::max(1.0, e.p("release_ms", lt, 60)) * sr / 1000));
-                    for (int i = 0; i < frames; ++i) {
-                        float* d = &clipBuf[size_t(i) * 2];
-                        double pk = std::max(std::fabs(d[0]), std::fabs(d[1]));
-                        double target = pk > ceil ? ceil / pk : 1.0;
-                        st->gain = target < st->gain ? target : rel * st->gain + (1 - rel) * target;
-                        d[0] = std::clamp(float(d[0] * st->gain), -ceil, ceil);
-                        d[1] = std::clamp(float(d[1] * st->gain), -ceil, ceil);
-                    }
-                } else if (e.type == "plugin") {
-                    processPlugin(*st, e, sr, lt, changed, clipBuf.data(), frames);
-                } else if (e.type == "delay") {
-                    size_t del = size_t(std::max(1.0, e.p("time_ms", lt, 300) * sr / 1000));
-                    float fb = float(std::clamp(e.p("feedback", lt, 0.35), 0.0, 0.95));
-                    float mix = float(e.p("mix", lt, 30) / 100.0);
-                    size_t N = size_t(sr * 2.1);
-                    if (st->delay.size() != N * 2) st->delay.assign(N * 2, 0.0f);
-                    del = std::min(del, N - 1);
-                    for (int i = 0; i < frames; ++i) {
-                        size_t r = (st->pos + N - del) % N;
-                        for (int ch = 0; ch < 2; ++ch) {
-                            float x = clipBuf[size_t(i) * 2 + ch];
-                            float delayed = st->delay[r * 2 + size_t(ch)];
-                            st->delay[st->pos * 2 + size_t(ch)] = x + delayed * fb;
-                            clipBuf[size_t(i) * 2 + ch] = x + delayed * mix;
-                        }
-                        st->pos = (st->pos + 1) % N;
-                    }
-                }
-            }
+            processChain(c.effects, c.id, FrameTime(double(start) * fps / sr) - c.start, sr, clipBuf.data(), frames);
             // Clip volume / pan (keyframed, evaluated every 64 samples) and fades.
             for (int64_t s = s0; s < s1; s += 64) {
                 int64_t e2 = std::min(s1, s + 64);
@@ -864,18 +872,38 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
             }
             any = true;
         }
-        if (!any) continue;
+        // Track inserts keep running without clips, so reverb and delay tails ring out.
+        if (!any && track.effects.empty()) continue;
+        if (!track.effects.empty()) processChain(track.effects, track.id, blockFrame, sr, trackBuf.data(), frames);
         float tg = dbToLin(track.volumeDb), tl, tr;
         panGains(track.pan, tl, tr);
+        auto bus = track.output ? busBufs.find(track.output) : busBufs.end();
+        float* dest = bus != busBufs.end() ? bus->second.data() : out;
         MeterLevels lv;
         for (int i = 0; i < frames; ++i) {
             float l = trackBuf[size_t(i) * 2] * tg * tl, r = trackBuf[size_t(i) * 2 + 1] * tg * tr;
-            out[i * 2] += l;
-            out[i * 2 + 1] += r;
+            dest[i * 2] += l;
+            dest[i * 2 + 1] += r;
             lv.peakL = std::max(lv.peakL, std::fabs(l));
             lv.peakR = std::max(lv.peakR, std::fabs(r));
         }
         if (trackLevels && depth == 0) (*trackLevels)[ti] = lv;
+    }
+    for (const Bus& b : seq.buses) {
+        std::vector<float>& bb = busBufs[b.id];
+        if (!b.effects.empty()) processChain(b.effects, b.id, blockFrame, sr, bb.data(), frames);
+        if (b.muted) continue;
+        float g = dbToLin(b.volumeDb), bl, br;
+        panGains(b.pan, bl, br);
+        for (int i = 0; i < frames; ++i) {
+            out[i * 2] += bb[size_t(i) * 2] * g * bl;
+            out[i * 2 + 1] += bb[size_t(i) * 2 + 1] * g * br;
+        }
+    }
+    if (!seq.masterEffects.empty()) processChain(seq.masterEffects, seq.id, blockFrame, sr, out, frames);
+    if (seq.masterVolumeDb != 0) {
+        const float g = dbToLin(seq.masterVolumeDb);
+        for (int i = 0; i < frames * 2; ++i) out[i] *= g;
     }
 }
 

@@ -115,6 +115,12 @@ bool matchSequenceToMedia(Sequence& s, const MediaItem& m);
 
 // ---- Nesting --------------------------------------------------------------------------
 // Moves the clips into a new sequence and replaces them with a compound clip.
+// The effect chain owned by `owner`: a clip's effects, an audio track's
+// inserts, a bus's effects, or (the sequence's own id) the master effects.
+// `origin` receives the timeline frame its keyframes count from.
+std::vector<Effect>* effectChain(Sequence& s, Id owner, FrameTime* origin = nullptr);
+Effect* ownedEffect(Sequence& s, Id owner, Id effect, FrameTime* origin = nullptr);
+
 Result makeCompound(Project& p, Sequence& s, const std::vector<Id>& ids, const std::string& name);
 
 }  // namespace montage::edit

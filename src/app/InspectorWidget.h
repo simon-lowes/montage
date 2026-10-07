@@ -41,7 +41,11 @@ private:
     void addParamRows(QFormLayout* form, const EffectInfo& info, const Target& target);
     void addParamRow(QFormLayout* form, const ParamInfo& pi, const Target& target);
     void addStringRow(QFormLayout* form, const StringParamInfo& si, const Target& target);
-    void addEffectMenu(TrackKind kind, Id clip);
+    // The effect stack of a clip, audio track, bus or master (by owner id), with its Add menu.
+    void buildEffectStack(Id owner, TrackKind kind, const std::vector<Effect>& effects,
+                          const std::function<FrameTime()>& localTime);
+    void buildChain(Id owner);
+    void addEffectMenu(TrackKind kind, Id owner);
 
     EditorState* state_;
     QWidget* content_ = nullptr;

@@ -80,7 +80,16 @@ QString InspectorWidget::signature() const {
         return t ? QString("T%1:%2").arg(tid).arg(QString::fromStdString(t->type)) : QString();
     }
     const Clip* c = state_->primaryClip();
-    if (!c) return {};
+    if (!c) {
+        // An inspected track, bus or master chain: rebuild when its effects change.
+        std::vector<Effect>* chain = state_->inspectedChain()
+                                         ? edit::effectChain(const_cast<Sequence&>(*s), state_->inspectedChain())
+                                         : nullptr;
+        if (!chain) return {};
+        QString sig = QString("X%1").arg(state_->inspectedChain());
+        for (const auto& e : *chain) sig += QString(":%1%2").arg(e.id).arg(e.enabled ? "+" : "-");
+        return sig;
+    }
     QString sig = QString("C%1:%2").arg(c->id).arg(QString::fromStdString(c->generator.type));
     for (const auto& e : c->effects) sig += QString(":%1%2").arg(e.id).arg(e.enabled ? "+" : "-");
     return sig;
@@ -138,6 +147,8 @@ void InspectorWidget::rebuild() {
     } else if (const Clip* c = state_->primaryClip()) {
         auto loc = edit::locate(*s, c->id);
         buildClip(*c, loc ? loc->track.kind : TrackKind::Video);
+    } else if (s && state_->inspectedChain()) {
+        buildChain(state_->inspectedChain());
     } else {
         auto* l = new QLabel(tr("Select a clip or transition in the timeline to edit its properties and effects."), content_);
         l->setWordWrap(true);
@@ -310,8 +321,52 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
         addParamRows(a, *info, target(clip.audio.id));
     }
     // ---- Effect stack ------------------------------------------------------------
-    for (size_t i = 0; i < clip.effects.size(); ++i) {
-        const Effect& e = clip.effects[i];
+    buildEffectStack(clipId, kind, clip.effects, localTime);
+}
+
+void InspectorWidget::buildChain(Id owner) {
+    const Sequence* s = state_->sequence();
+    std::vector<Effect>* chain = s ? edit::effectChain(const_cast<Sequence&>(*s), owner) : nullptr;
+    if (!chain) return;
+    QString title = tr("Master");
+    if (owner != s->id) {
+        for (size_t i = 0; i < s->audioTracks.size(); ++i)
+            if (s->audioTracks[i].id == owner)
+                title = tr("Track %1").arg(s->audioTracks[i].name.empty() ? QStringLiteral("A%1").arg(i + 1)
+                                                                          : QString::fromStdString(s->audioTracks[i].name));
+        for (const Bus& b : s->buses)
+            if (b.id == owner) title = tr("Bus %1").arg(QString::fromStdString(b.name));
+    }
+    QFormLayout* form = addSection(title);
+    auto* note = new QLabel(chain->empty() ? tr("No effects yet. Effects here process everything this %1 carries, "
+                                                 "before its fader.")
+                                                 .arg(owner == s->id ? tr("mix") : tr("channel"))
+                                           : tr("%n effect(s), processed top to bottom before the fader.", "",
+                                                int(chain->size())),
+                            content_);
+    note->setWordWrap(true);
+    note->setStyleSheet(QString("color: %1;").arg(theme::kTextDim.name()));
+    form->addRow(note);
+    buildEffectStack(owner, TrackKind::Audio, *chain, [this] { return state_->playhead(); });
+}
+
+void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vector<Effect>& effects,
+                                       const std::function<FrameTime()>& localTime) {
+    auto target = [&](Id effectId) {
+        Target t;
+        t.resolve = [owner, effectId](Sequence& s) -> Effect* { return edit::ownedEffect(s, owner, effectId); };
+        t.time = localTime;
+        t.origin = [this, owner]() -> FrameTime {
+            FrameTime origin = 0;
+            const Sequence* s = state_->sequence();
+            if (s) edit::effectChain(const_cast<Sequence&>(*s), owner, &origin);
+            return origin;
+        };
+        t.key = QString("p%1:%2").arg(owner).arg(effectId);
+        return t;
+    };
+    for (size_t i = 0; i < effects.size(); ++i) {
+        const Effect& e = effects[i];
         const EffectInfo* catalog = findEffectInfo(e.type);
         if (!catalog) continue;
         // Plugin effects carry their own parameter list and name.
@@ -336,9 +391,9 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
             editor = smallButton(tools, tr("Editor"), tr("Open the plugin's own editor"));
             editor->setObjectName("pluginEditor");
             th->addWidget(editor);
-            connect(editor, &QToolButton::clicked, this, [this, clipId, eid] {
+            connect(editor, &QToolButton::clicked, this, [this, owner, eid] {
                 QString err;
-                if (!PluginEditorWindow::open(state_, clipId, eid, window(), &err) && !err.isEmpty()) state_->message(err, 6000);
+                if (!PluginEditorWindow::open(state_, owner, eid, window(), &err) && !err.isEmpty()) state_->message(err, 6000);
             });
         }
         for (QWidget* w : {static_cast<QWidget*>(on), static_cast<QWidget*>(up), static_cast<QWidget*>(down),
@@ -349,16 +404,16 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
         if (kind == TrackKind::Video && supportsMask(e.type)) {
             // Shape masks and the HSL qualifier; folded away until one is used.
             QFormLayout* mf = addSection(tr("%1 Mask").arg(QString::fromStdString(info->displayName)), nullptr,
-                                         !hasMask(e, state_->playhead() - clip.start));
+                                         !hasMask(e, localTime()));
             addParamRows(mf, maskInfo(), target(eid));
         }
-        auto mutateStack = [this, clipId, eid](const QString& label, std::function<void(std::vector<Effect>&, size_t, Project&)> fn) {
+        auto mutateStack = [this, owner, eid](const QString& label, std::function<void(std::vector<Effect>&, size_t, Project&)> fn) {
             state_->edit(label, [=](Project& p, Sequence& s) {
-                Clip* c = edit::clipById(s, clipId);
-                if (!c) return false;
-                for (size_t k = 0; k < c->effects.size(); ++k)
-                    if (c->effects[k].id == eid) {
-                        fn(c->effects, k, p);
+                std::vector<Effect>* chain = edit::effectChain(s, owner);
+                if (!chain) return false;
+                for (size_t k = 0; k < chain->size(); ++k)
+                    if ((*chain)[k].id == eid) {
+                        fn(*chain, k, p);
                         return true;
                     }
                 return false;
@@ -391,10 +446,10 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
             mutateStack(tr("Remove Effect"), [](std::vector<Effect>& v, size_t k, Project&) { v.erase(v.begin() + long(k)); });
         });
     }
-    addEffectMenu(kind, clipId);
+    addEffectMenu(kind, owner);
 }
 
-void InspectorWidget::addEffectMenu(TrackKind kind, Id clipId) {
+void InspectorWidget::addEffectMenu(TrackKind kind, Id owner) {
     auto* btn = new QPushButton(kind == TrackKind::Video ? tr("Add Video Effect…") : tr("Add Audio Effect…"), content_);
     auto* menu = new QMenu(btn);
     std::map<std::string, QMenu*> groups;
@@ -403,11 +458,11 @@ void InspectorWidget::addEffectMenu(TrackKind kind, Id clipId) {
         if (!g) g = menu->addMenu(QString::fromStdString(info->group));
         std::string type = info->type;
         QString label = QString::fromStdString(info->displayName);
-        g->addAction(label, this, [this, clipId, type, label] {
-            state_->edit(tr("Add %1").arg(label), [clipId, type](Project& p, Sequence& s) {
-                Clip* c = edit::clipById(s, clipId);
-                if (!c) return false;
-                c->effects.push_back(makeEffect(p, type));
+        g->addAction(label, this, [this, owner, type, label] {
+            state_->edit(tr("Add %1").arg(label), [owner, type](Project& p, Sequence& s) {
+                std::vector<Effect>* chain = edit::effectChain(s, owner);
+                if (!chain) return false;
+                chain->push_back(makeEffect(p, type));
                 return true;
             });
         });
@@ -424,18 +479,18 @@ void InspectorWidget::addEffectMenu(TrackKind kind, Id clipId) {
             if (!vm) vm = pluginMenu->addMenu(vendor);
             const std::string type = plugins::pluginType(d);
             const QString label = QString::fromStdString(d.name);
-            vm->addAction(label, this, [this, clipId, type, label] {
+            vm->addAction(label, this, [this, owner, type, label] {
                 QString error;
-                state_->edit(tr("Add %1").arg(label), [clipId, type, &error](Project& p, Sequence& s) {
-                    Clip* c = edit::clipById(s, clipId);
-                    if (!c) return false;
+                state_->edit(tr("Add %1").arg(label), [owner, type, &error](Project& p, Sequence& s) {
+                    std::vector<Effect>* chain = edit::effectChain(s, owner);
+                    if (!chain) return false;
                     std::string err;
                     auto e = plugins::makeEffectOfType(p, type, &err);
                     if (!e) {
                         error = QString::fromStdString(err);
                         return false;
                     }
-                    c->effects.push_back(*e);
+                    chain->push_back(*e);
                     return true;
                 });
                 if (!error.isEmpty()) state_->message(tr("Could not load %1: %2").arg(label, error));

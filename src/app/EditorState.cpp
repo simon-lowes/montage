@@ -137,9 +137,10 @@ bool EditorState::isSelected(Id clip) const {
 
 void EditorState::setSelection(std::vector<Id> clips, bool expandLinked) {
     if (expandLinked && sequence()) clips = edit::expandLinks(*sequence(), clips);
-    if (clips == selection_ && selectedTransition_ == 0) return;
+    if (clips == selection_ && selectedTransition_ == 0 && (clips.empty() || !inspectedChain_)) return;
     selection_ = std::move(clips);
     selectedTransition_ = 0;
+    if (!selection_.empty()) inspectedChain_ = 0;
     emit selectionChanged();
 }
 
@@ -153,6 +154,14 @@ void EditorState::clearSelection() {
 void EditorState::selectTransition(Id id) {
     selection_.clear();
     selectedTransition_ = id;
+    inspectedChain_ = 0;
+    emit selectionChanged();
+}
+
+void EditorState::inspectChain(Id owner) {
+    selection_.clear();
+    selectedTransition_ = 0;
+    inspectedChain_ = owner;
     emit selectionChanged();
 }
 
@@ -185,7 +194,9 @@ void EditorState::pruneSelection() {
         if (selectedTransition_ && !edit::transitionById(const_cast<Sequence&>(*s), selectedTransition_))
             selectedTransition_ = 0;
     }
-    if (selection_.size() != before || tr != selectedTransition_) emit selectionChanged();
+    const Id chain = inspectedChain_;
+    if (inspectedChain_ && (!s || !edit::effectChain(const_cast<Sequence&>(*s), inspectedChain_))) inspectedChain_ = 0;
+    if (selection_.size() != before || tr != selectedTransition_ || chain != inspectedChain_) emit selectionChanged();
 }
 
 // ---------------------------------------------------------------------------
@@ -377,6 +388,7 @@ void EditorState::setActiveSequence(Id id) {
     project_.activeSequence = id;
     selection_.clear();
     selectedTransition_ = 0;
+    inspectedChain_ = 0;
     history_.touch();
     emit sequenceSwitched();
     emit selectionChanged();
@@ -439,6 +451,7 @@ bool EditorState::open(const QString& path, QString* error) {
     path_ = path;
     selection_.clear();
     selectedTransition_ = 0;
+    inspectedChain_ = 0;
     sourceMedia_ = 0;
     sourceIn_ = sourceOut_ = -1;
     targetVideo_ = targetAudio_ = 0;

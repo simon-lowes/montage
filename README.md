@@ -39,6 +39,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 **Audio**
 - Clip gain and pan, both keyframeable
 - Track faders, pan, mute and solo in a mixer panel
+- Insert effects on audio tracks, buses (submixes) and the master, including plugins. Use a strip's FX button to edit them in the Inspector, route tracks to buses from the strip's output menu, and add buses with + Bus. Track effects keep running past the last clip, so reverb and echo tails ring out.
 - Peak meters with hold and clip indicators
 - Effects: 3-band EQ, compressor, limiter, high/low-pass, delay
 - Third-party audio plugins: VST3 and CLAP plugins run as clip effects. Their parameters are keyframeable and their settings are saved in the project. The Effects browser lists them by vendor, and Tools › Audio Plugins shows every plugin found and its status. LV2 and Audio Unit plugins are listed; hosting them is on the roadmap.

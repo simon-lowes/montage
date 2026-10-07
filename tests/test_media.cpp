@@ -6,6 +6,7 @@
 
 #include "core/EditOps.h"
 #include "core/Effects.h"
+#include "core/ProjectIO.h"
 #include "core/Transcript.h"
 #include "audio/SpeechCleanup.h"
 #include "media/Analysis.h"
@@ -230,6 +231,74 @@ private slots:
             unrelated.samples.push_back(v);
         }
         QVERIFY(!findAudioOffset(ref, unrelated).found);
+    }
+
+    void trackBusAndMasterEffects() {
+        std::string wav = path("bus.wav");
+        writeWav(wav, 48000, 1.0, 0.5f, 0.5f);
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        MediaItem m = probeOrFail(p, wav);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        auto limiter = [&](double ceilingDb) {
+            Effect e = makeEffect(p, "limiter");
+            e.params["ceiling_db"] = ceilingDb;
+            return e;
+        };
+        auto level = [&](int64_t at) {
+            AudioMixer mixer;  // fresh state each time
+            std::vector<float> out(4800 * 2);
+            mixer.mix(p, s, at, 4800, out.data());
+            return out[4000 * 2];
+        };
+        QVERIFY(std::fabs(level(12000) - 0.5f) < 0.005f);
+        // A track insert (limiter at -12 dB) works on the track's sum.
+        Track& a1 = s.audioTracks[0];
+        a1.effects.push_back(limiter(-12));
+        QVERIFY(std::fabs(level(12000) - 0.2512f) < 0.005f);
+        a1.effects.clear();
+        // Routed to a bus with its own limiter; a muted bus is silent; a missing bus means master.
+        Bus b;
+        b.id = p.newId();
+        b.name = "Dialogue";
+        b.effects.push_back(limiter(-20));
+        s.buses.push_back(b);
+        a1.output = b.id;
+        QVERIFY(std::fabs(level(12000) - 0.1f) < 0.003f);
+        s.buses[0].volumeDb = -6.0206;
+        QVERIFY(std::fabs(level(12000) - 0.05f) < 0.003f);
+        s.buses[0].muted = true;
+        QVERIFY(std::fabs(level(12000)) < 1e-6f);
+        a1.output = 999999;
+        QVERIFY(std::fabs(level(12000) - 0.5f) < 0.005f);
+        a1.output = 0;
+        // Master effects and fader.
+        s.masterEffects.push_back(limiter(-12));
+        QVERIFY(std::fabs(level(12000) - 0.2512f) < 0.005f);
+        s.masterVolumeDb = -6.0206;
+        QVERIFY(std::fabs(level(12000) - 0.1256f) < 0.004f);
+        s.masterEffects.clear();
+        s.masterVolumeDb = 0;
+        // Track inserts keep running after the last clip: an echo rings past the clip's end (1 s).
+        Effect echo = makeEffect(p, "delay");
+        echo.params["time_ms"] = 300.0;
+        echo.params["feedback"] = 0.0;
+        echo.params["mix"] = 100.0;
+        a1.effects.push_back(echo);
+        {
+            AudioMixer mixer;
+            std::vector<float> out(48000 * 2);
+            mixer.mix(p, s, 24000, 48000, out.data());  // 0.5 s .. 1.5 s
+            QVERIFY(std::fabs(out[(48000 * 1.1 - 24000) * 2]) > 0.4f);   // 1.1 s: the echo of 0.8 s
+            QVERIFY(std::fabs(out[(48000 * 1.4 - 24000) * 2]) < 1e-6f);  // 1.4 s: the echo is over
+        }
+        // All of it is saved with the project.
+        Project q;
+        QVERIFY(projectFromJson(projectToJson(p), q));
+        QCOMPARE(q.active()->buses, s.buses);
+        QCOMPARE(q.active()->audioTracks[0].effects.size(), size_t(1));
+        QCOMPARE(q.active()->audioTracks[0], s.audioTracks[0]);
     }
 
     void mixerGainPanMuteAndFades() {

@@ -168,6 +168,12 @@ QJsonObject trackToJson(const Track& t) {
     if (t.volumeDb != 0) o["volumeDb"] = t.volumeDb;
     if (t.pan != 0) o["pan"] = t.pan;
     if (t.height) o["height"] = t.height;
+    if (!t.effects.empty()) {
+        QJsonArray fx;
+        for (const auto& e : t.effects) fx.append(effectToJson(e));
+        o["effects"] = fx;
+    }
+    if (t.output) o["output"] = double(t.output);
     return o;
 }
 
@@ -195,6 +201,8 @@ Track trackFromJson(const QJsonObject& o, TrackKind kind) {
     t.volumeDb = o.value("volumeDb").toDouble(0);
     t.pan = o.value("pan").toDouble(0);
     t.height = o.value("height").toInt(0);
+    for (const auto& e : o.value("effects").toArray()) t.effects.push_back(effectFromJson(e));
+    t.output = Id(i64(o.value("output")));
     std::sort(t.clips.begin(), t.clips.end(), [](const Clip& a, const Clip& b) { return a.start < b.start; });
     return t;
 }
@@ -269,6 +277,22 @@ QJsonObject sequenceToJson(const Sequence& s) {
         for (const auto& t : s.captionTracks) c.append(captionTrackToJson(t));
         o["captions"] = c;
     }
+    if (!s.buses.empty()) {
+        QJsonArray buses;
+        for (const auto& b : s.buses) {
+            QJsonArray fx;
+            for (const auto& e : b.effects) fx.append(effectToJson(e));
+            buses.append(QJsonObject{{"id", double(b.id)}, {"name", qs(b.name)}, {"effects", fx},
+                                     {"volumeDb", b.volumeDb}, {"pan", b.pan}, {"muted", b.muted}});
+        }
+        o["buses"] = buses;
+    }
+    if (!s.masterEffects.empty()) {
+        QJsonArray fx;
+        for (const auto& e : s.masterEffects) fx.append(effectToJson(e));
+        o["masterEffects"] = fx;
+    }
+    if (s.masterVolumeDb != 0) o["masterVolumeDb"] = s.masterVolumeDb;
     return o;
 }
 
@@ -298,6 +322,19 @@ Sequence sequenceFromJson(const QJsonObject& o) {
         s.markers.push_back(mk);
     }
     for (const auto& c : o.value("captions").toArray()) s.captionTracks.push_back(captionTrackFromJson(c.toObject()));
+    for (const auto& v : o.value("buses").toArray()) {
+        const QJsonObject bo = v.toObject();
+        Bus b;
+        b.id = Id(i64(bo.value("id")));
+        b.name = ss(bo.value("name"));
+        for (const auto& e : bo.value("effects").toArray()) b.effects.push_back(effectFromJson(e));
+        b.volumeDb = bo.value("volumeDb").toDouble(0);
+        b.pan = bo.value("pan").toDouble(0);
+        b.muted = bo.value("muted").toBool(false);
+        s.buses.push_back(std::move(b));
+    }
+    for (const auto& e : o.value("masterEffects").toArray()) s.masterEffects.push_back(effectFromJson(e));
+    s.masterVolumeDb = o.value("masterVolumeDb").toDouble(0);
     return s;
 }
 
@@ -422,7 +459,14 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
                     bump(tr.id);
                     bump(tr.params.id);
                 }
+                for (const auto& e : t.effects) bump(e.id);
             }
+        for (const auto& b : s.buses) {
+            bump(b.id);
+            for (const auto& e : b.effects) bump(e.id);
+        }
+        for (const auto& e : s.masterEffects) bump(e.id);
+        for (const auto& ct : s.captionTracks) bump(ct.id);
     }
     p.nextId = std::max(p.nextId, maxId + 1);
     out = std::move(p);

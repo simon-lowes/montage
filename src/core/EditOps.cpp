@@ -1034,6 +1034,29 @@ bool matchSequenceToMedia(Sequence& s, const MediaItem& m) {
 // ---------------------------------------------------------------------------
 // Nesting
 
+std::vector<Effect>* effectChain(Sequence& s, Id owner, FrameTime* origin) {
+    if (origin) *origin = 0;
+    if (!owner) return nullptr;
+    if (owner == s.id) return &s.masterEffects;
+    for (auto& t : s.audioTracks)
+        if (t.id == owner) return &t.effects;
+    for (auto& b : s.buses)
+        if (b.id == owner) return &b.effects;
+    if (Clip* c = clipById(s, owner)) {
+        if (origin) *origin = c->start;
+        return &c->effects;
+    }
+    return nullptr;
+}
+
+Effect* ownedEffect(Sequence& s, Id owner, Id effect, FrameTime* origin) {
+    std::vector<Effect>* chain = effectChain(s, owner, origin);
+    if (!chain) return nullptr;
+    for (Effect& e : *chain)
+        if (e.id == effect) return &e;
+    return nullptr;
+}
+
 Result makeCompound(Project& p, Sequence& s, const std::vector<Id>& ids, const std::string& name) {
     std::vector<Id> all = expandLinks(s, ids);
     if (all.empty()) return Result::fail("Select clips to nest");

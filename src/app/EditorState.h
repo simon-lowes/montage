@@ -62,6 +62,11 @@ public:
     void clearSelection();
     Id selectedTransition() const { return selectedTransition_; }
     void selectTransition(Id id);
+    // An effect chain shown in the Inspector instead of a clip: an audio
+    // track's inserts, a bus, or the master (the sequence's id); 0 = none.
+    // Selecting clips or a transition clears it.
+    Id inspectedChain() const { return inspectedChain_; }
+    void inspectChain(Id owner);
     // The single clip shown in the inspector (first selected), or nullptr.
     const Clip* primaryClip() const;
 
@@ -136,6 +141,7 @@ private:
     QString path_;
     std::vector<Id> selection_;
     Id selectedTransition_ = 0;
+    Id inspectedChain_ = 0;
     int targetVideo_ = 0;
     int targetAudio_ = 0;
     bool snapping_ = true;

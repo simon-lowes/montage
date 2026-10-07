@@ -73,6 +73,8 @@ private:
     // `rate` overrides the sequence's sample rate (nested sequences mix at the outer rate).
     void mixInto(const Project& p, const Sequence& seq, int64_t start, int frames, float* out,
                  std::vector<MeterLevels>* trackLevels, int depth, int rate = 0);
+    // Runs an effect chain over an interleaved stereo block; DSP state is kept per (owner, effect).
+    void processChain(const std::vector<Effect>& chain, Id owner, FrameTime lt, double sr, float* buf, int frames);
     std::map<std::pair<Id, Id>, std::unique_ptr<State>> states_;
     std::mutex m_;
     bool nonBlocking_ = false;

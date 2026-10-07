@@ -198,6 +198,10 @@ void MainWindow::buildPanels() {
     inspector_ = new InspectorWidget(state_, this);
     scopes_ = new ScopesWidget(this);
     mixer_ = new MixerPanel(state_, this);
+    connect(mixer_, &MixerPanel::effectsRequested, this, [this] {
+        inspectorDock_->show();
+        inspectorDock_->raise();
+    });
     captions_ = new CaptionsPanel(state_, this);
     transcript_ = new TranscriptPanel(state_, this);
     connect(transcript_, &TranscriptPanel::sourceSeekRequested, this, [this](FrameTime f) {

@@ -65,17 +65,15 @@ PluginEditorWindow::~PluginEditorWindow() {
 
 const Effect* PluginEditorWindow::effect() const {
     const Sequence* s = state_->sequence();
-    const Clip* c = s ? edit::clipById(*s, clip_) : nullptr;
-    if (!c) return nullptr;
-    for (const Effect& e : c->effects)
-        if (e.id == effect_) return &e;
-    return nullptr;
+    return s ? edit::ownedEffect(const_cast<Sequence&>(*s), clip_, effect_) : nullptr;
 }
 
 FrameTime PluginEditorWindow::localTime() const {
     const Sequence* s = state_->sequence();
-    const Clip* c = s ? edit::clipById(*s, clip_) : nullptr;
-    return c ? std::clamp<FrameTime>(state_->playhead() - c->start, 0, std::max<FrameTime>(0, c->duration - 1)) : 0;
+    if (!s) return 0;
+    if (const Clip* c = edit::clipById(*s, clip_))
+        return std::clamp<FrameTime>(state_->playhead() - c->start, 0, std::max<FrameTime>(0, c->duration - 1));
+    return state_->playhead();  // track, bus and master effects keyframe on the timeline
 }
 
 bool PluginEditorWindow::start(QString* error) {
@@ -149,15 +147,10 @@ void PluginEditorWindow::editorParameter(uint32_t id, double value) {
     const auto g = gesture_.find(id);
     const QString merge = QStringLiteral("plugin-%1-%2-%3").arg(eff).arg(id).arg(g != gesture_.end() ? g->second : 0);
     state_->edit(tr("Change Plugin Parameter"), [clip, eff, key, value, lt](Project&, Sequence& s) {
-        Clip* c = edit::clipById(s, clip);
-        if (!c) return false;
-        for (Effect& e : c->effects)
-            if (e.id == eff) {
-                if (e.params.count(key) && std::fabs(e.params[key].at(lt) - value) < 1e-12) return false;
-                e.params[key].set(lt, value);
-                return true;
-            }
-        return false;
+        Effect* e = edit::ownedEffect(s, clip, eff);
+        if (!e || (e->params.count(key) && std::fabs(e->params[key].at(lt) - value) < 1e-12)) return false;
+        e->params[key].set(lt, value);
+        return true;
     }, merge);
 }
 
@@ -195,14 +188,10 @@ void PluginEditorWindow::saveSettings() {
     if (state.empty() || state == e->s("state")) return;
     const Id clip = clip_, eff = effect_;
     state_->edit(tr("Plugin Settings"), [clip, eff, state](Project&, Sequence& s) {
-        Clip* c = edit::clipById(s, clip);
-        if (!c) return false;
-        for (Effect& fx : c->effects)
-            if (fx.id == eff) {
-                fx.strings["state"] = state;
-                return true;
-            }
-        return false;
+        Effect* fx = edit::ownedEffect(s, clip, eff);
+        if (!fx) return false;
+        fx->strings["state"] = state;
+        return true;
     }, QStringLiteral("plugin-state-%1").arg(eff));
 }
 

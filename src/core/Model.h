@@ -160,7 +160,21 @@ struct Track {
     double volumeDb = 0;  // audio track fader
     double pan = 0;       // audio track pan -1..1
     int height = 0;       // UI hint, 0 = default
+    std::vector<Effect> effects;  // audio track inserts, before the fader (keyframes in timeline frames)
+    Id output = 0;                // audio: the bus the track feeds, 0 = master
     bool operator==(const Track&) const = default;
+};
+
+// An audio bus (submix): tracks routed to it are summed, run through its
+// effects, fader and pan, and go to the master.
+struct Bus {
+    Id id = 0;
+    std::string name = "Bus";
+    std::vector<Effect> effects;
+    double volumeDb = 0;
+    double pan = 0;
+    bool muted = false;
+    bool operator==(const Bus&) const = default;
 };
 
 struct Marker {
@@ -183,6 +197,9 @@ struct Sequence {
     std::vector<Track> audioTracks;   // [0] = A1
     std::vector<Marker> markers;
     std::vector<CaptionTrack> captionTracks;  // subtitles, drawn above the video tracks
+    std::vector<Bus> buses;                   // audio submixes
+    std::vector<Effect> masterEffects;        // on the final mix, before the master fader
+    double masterVolumeDb = 0;
     FrameTime inPoint = -1;   // In / Out marks; both frames are included, -1 = unset
     FrameTime outPoint = -1;
     FrameTime playhead = 0;

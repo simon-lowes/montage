@@ -20,7 +20,8 @@ class EditorState;
 class PluginEditorWindow : public QWidget, public plugins::EditorListener {
     Q_OBJECT
 public:
-    // Opens the editor of plugin effect `effect` on clip `clip`, or raises it
+    // Opens the editor of plugin effect `effect` in the chain owned by `clip`
+    // (a clip, audio track, bus or the sequence for master), or raises it
     // if it is already open. nullptr (and `error`) if the plugin has none.
     static PluginEditorWindow* open(EditorState* state, Id clip, Id effect, QWidget* parent, QString* error = nullptr);
     static PluginEditorWindow* find(Id clip, Id effect);
