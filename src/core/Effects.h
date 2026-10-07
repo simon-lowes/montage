@@ -38,7 +38,9 @@ struct ParamInfo {
     bool keyframeable = true;
 };
 
-enum class StringKind { Text, MultilineText, File, Font, Choice, Curve };
+// Dynamic: an editable list whose entries depend on the effect's other
+// settings (the colour spaces of the chosen OCIO config, for example).
+enum class StringKind { Text, MultilineText, File, Font, Choice, Curve, Dynamic };
 
 struct StringParamInfo {
     std::string name;
@@ -46,6 +48,7 @@ struct StringParamInfo {
     StringKind kind = StringKind::Text;
     std::string def;
     std::vector<std::string> choices;
+    std::string fileFilter;  // File: the open dialog's filter, e.g. "LUT files (*.cube)"
 };
 
 struct EffectInfo {

@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cstdlib>
 
+#include "render/ColorSpace.h"
+
 namespace montage {
 
 namespace {
@@ -128,6 +130,32 @@ std::vector<EffectInfo> buildCatalog() {
     c.push_back({"lut", "LUT (.cube)", EffectCategory::VideoFilter, "Color",
                  {pct("strength", "Strength", 0, 100, 100)},
                  {str("path", "LUT File", StringKind::File)}});
+    c.back().strings[0].fileFilter = "LUT files (*.cube)";
+    {
+        // Colour Space Transform: one clip from any space into another (render/ColorSpace.h).
+        std::vector<std::string> spaces;
+        for (const auto& cs : colorSpaces()) spaces.push_back(cs.label);
+        EffectInfo cst{"color_space_transform", "Colour Space Transform", EffectCategory::VideoFilter, "Color", {},
+                       {str("from", "From", StringKind::Choice, colorSpaces().front().label),
+                        str("to", "To", StringKind::Choice, colorSpaces().front().label)}};
+        cst.strings[0].choices = cst.strings[1].choices = spaces;
+        c.push_back(cst);
+    }
+    {
+        // OpenColorIO transform from a config file, a built-in config or $OCIO (render/Ocio.h).
+        EffectInfo ocio{"ocio", "OpenColorIO Transform", EffectCategory::VideoFilter, "Color",
+                        {boolean("inverse", "Inverse")},
+                        {str("config", "Config", StringKind::File), str("mode", "Mode", StringKind::Choice, "Colour Space"),
+                         str("src", "Input Space", StringKind::Dynamic), str("dst", "Output Space", StringKind::Dynamic),
+                         str("display", "Display", StringKind::Dynamic), str("view", "View", StringKind::Dynamic),
+                         str("look", "Look", StringKind::Dynamic)}};
+        ocio.strings[0].fileFilter = "OpenColorIO configs (*.ocio);;All files (*)";
+        ocio.strings[1].choices = {"Colour Space", "Display / View"};
+#ifndef MONTAGE_WITH_OCIO
+        ocio.hidden = true;  // needs OpenColorIO
+#endif
+        c.push_back(ocio);
+    }
     c.push_back({"black_white", "Black & White", EffectCategory::VideoFilter, "Color",
                  {pct("amount", "Amount", 0, 100, 100), color("tint", "Tint", 1, 1, 1)},
                  {}});

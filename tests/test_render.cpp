@@ -3,12 +3,14 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <fstream>
 
 #include "core/EditOps.h"
 #include "core/Effects.h"
 #include "render/ColorSpace.h"
 #include "render/Compositor.h"
+#include "render/Ocio.h"
 #include "render/Processing.h"
 
 using namespace montage;
@@ -109,6 +111,135 @@ private slots:
         QCOMPARE(colorSpaceFromTags("bt2020", "bt2020-10"), std::string("rec2020"));
         QCOMPARE(colorSpaceFromTags("bt709", "iec61966-2-1"), std::string("rec709"));
         QCOMPARE(colorSpaceFromTags("unknown", "unknown"), std::string("rec709"));
+    }
+
+    void cameraLogMatchesOpenColorIO() {
+        if (!ocioAvailable()) QSKIP("Built without OpenColorIO");
+        // Each camera space against OCIO's reference transform to ACES, compared in XYZ D65.
+        const std::pair<const char*, const char*> cases[] = {
+            {"SONY_SLOG3-SGAMUT3.CINE_to_ACES2065-1", "slog3-sgamut3cine"},
+            {"ARRI_ALEXA-LOGC-EI800-AWG_to_ACES2065-1", "logc3-awg3"},
+            {"PANASONIC_VLOG-VGAMUT_to_ACES2065-1", "vlog-vgamut"},
+            {"CANON_CLOG3-CGAMUT_to_ACES2065-1", "clog3-cinemagamut"},
+            {"ACEScct_to_ACES2065-1", "acescct"},
+            {"IDENTITY", "aces2065-1"}};
+        const float codes[4][3] = {{0.2f, 0.4f, 0.6f}, {0.5f, 0.5f, 0.5f}, {0.7f, 0.3f, 0.15f}, {0.1f, 0.12f, 0.9f}};
+        for (const auto& [style, id] : cases) {
+            const ColorSpace* cs = findColorSpace(id);
+            QVERIFY(cs);
+            float ref[12];
+            std::memcpy(ref, codes, sizeof ref);
+            std::string err;
+            QVERIFY2(applyOcioBuiltin(style, ref, 4, false, &err), err.c_str());
+            QVERIFY2(applyOcioBuiltin("UTILITY - ACES-AP0_to_CIE-XYZ-D65_BFD", ref, 4, false, &err), err.c_str());
+            double m[9];
+            primariesToXyz(cs->primaries, m);
+            for (int k = 0; k < 4; ++k) {
+                double l[3];
+                for (int j = 0; j < 3; ++j) l[j] = toLinear(cs->transfer, codes[k][j]);
+                for (int r = 0; r < 3; ++r) {
+                    const double mine = m[r * 3] * l[0] + m[r * 3 + 1] * l[1] + m[r * 3 + 2] * l[2];
+                    QVERIFY2(std::fabs(mine - ref[k * 3 + r]) < 1e-4 + 1e-4 * std::fabs(mine),
+                             qPrintable(QString("%1: %2 vs OCIO %3").arg(id).arg(mine).arg(ref[k * 3 + r])));
+                }
+            }
+        }
+        // PQ, in OCIO's units (1.0 = 100 nits).
+        float pq[3] = {0.5f, 0.58f, 0.75f};
+        QVERIFY(applyOcioBuiltin("CURVE - ST-2084_to_LINEAR", pq, 1));
+        for (int i = 0; i < 3; ++i) QVERIFY(std::fabs(toLinear(Transfer::Pq, (i == 0 ? 0.5 : i == 1 ? 0.58 : 0.75)) * 2.03 - pq[i]) < 1e-4 * pq[i]);
+    }
+
+    void ocioTransformEffect() {
+        if (!ocioAvailable()) QSKIP("Built without OpenColorIO");
+        QTemporaryDir dir;
+        const QString cfg = dir.filePath("test.ocio");
+        QFile f(cfg);
+        QVERIFY(f.open(QIODevice::WriteOnly));
+        f.write(R"(ocio_profile_version: 2
+roles:
+  default: linear
+  scene_linear: linear
+file_rules:
+  - !<Rule> {name: Default, colorspace: default}
+displays:
+  Monitor:
+    - !<View> {name: Gamma, colorspace: gamma_display}
+active_displays: []
+active_views: []
+looks:
+  - !<Look>
+    name: Brighter
+    process_space: linear
+    transform: !<MatrixTransform> {matrix: [2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 1]}
+colorspaces:
+  - !<ColorSpace>
+    name: linear
+  - !<ColorSpace>
+    name: half
+    from_scene_reference: !<MatrixTransform> {matrix: [0.5, 0, 0, 0, 0, 0.5, 0, 0, 0, 0, 0.5, 0, 0, 0, 0, 1]}
+  - !<ColorSpace>
+    name: gamma_display
+    from_scene_reference: !<ExponentTransform> {value: [2.2, 2.2, 2.2, 1], direction: inverse}
+)");
+        f.close();
+        Project p = makeDefaultProject();
+        Effect e = makeEffect(p, "ocio");
+        e.strings["config"] = cfg.toStdString();
+        QCOMPARE(ocioChoices(e, "src"), (std::vector<std::string>{"linear", "half", "gamma_display"}));
+        QCOMPARE(ocioChoices(e, "display"), std::vector<std::string>{"Monitor"});
+        QCOMPARE(ocioChoices(e, "view"), std::vector<std::string>{"Gamma"});
+        QCOMPARE(ocioChoices(e, "look"), (std::vector<std::string>{"", "Brighter"}));
+
+        // Colour space to colour space, on premultiplied pixels.
+        e.strings["src"] = "linear";
+        e.strings["dst"] = "half";
+        Image img = solid(4, 2, 0.8f, 0.8f, 0.8f, 0.5f);  // straight 0.8, half covered
+        applyVideoEffect(e, 0, img, 1.0);
+        float c[4];
+        rgb(img, 1, 1, c);
+        QVERIFY2(near(c[0], 0.4f, 1e-4f) && near(c[3], 0.5f, 1e-6f), qPrintable(QString("%1 %2").arg(c[0]).arg(c[3])));
+        e.params["inverse"] = Param(1.0);
+        img = solid(4, 2, 0.4f, 0.4f, 0.4f);
+        applyVideoEffect(e, 0, img, 1.0);
+        rgb(img, 0, 0, c);
+        QVERIFY(near(c[0], 0.8f, 1e-4f));
+        e.params["inverse"] = Param(0.0);
+        // Display / view, with a look.
+        e.strings["mode"] = "Display / View";
+        img = solid(2, 2, 0.5f, 0.5f, 0.5f);
+        applyVideoEffect(e, 0, img, 1.0);
+        rgb(img, 0, 0, c);
+        QVERIFY(near(c[0], float(std::pow(0.5, 1 / 2.2)), 1e-4f));
+        e.strings["look"] = "Brighter";
+        img = solid(2, 2, 0.25f, 0.25f, 0.25f);
+        applyVideoEffect(e, 0, img, 1.0);
+        rgb(img, 0, 0, c);
+        QVERIFY(near(c[0], float(std::pow(0.5, 1 / 2.2)), 1e-4f));
+        // A broken config leaves the picture alone.
+        e.strings["config"] = dir.filePath("missing.ocio").toStdString();
+        img = solid(2, 2, 0.3f, 0.3f, 0.3f);
+        std::string err;
+        QVERIFY(!applyOcio(e, img, &err));
+        QVERIFY(!err.empty());
+        rgb(img, 0, 0, c);
+        QVERIFY(near(c[0], 0.3f, 1e-6f));
+    }
+
+    void colorSpaceTransformEffect() {
+        Project p = makeDefaultProject();
+        Effect e = makeEffect(p, "color_space_transform");
+        e.strings["from"] = findColorSpace("slog3-sgamut3cine")->label;
+        e.strings["to"] = findColorSpace("rec709")->label;
+        const float grey = float(420.0 / 1023);
+        Image img = solid(2, 2, grey, grey, grey);
+        applyVideoEffect(e, 0, img, 1.0);
+        float c[4];
+        rgb(img, 0, 0, c);
+        float px[3] = {grey, grey, grey};
+        convertPixel(px, *findColorSpace("slog3-sgamut3cine"), *findColorSpace("rec709"));
+        QVERIFY(near(c[0], px[0], 0.005f));
+        QVERIFY(c[0] > 0.36f && c[0] < 0.5f);
     }
 
     void colorManagedCompositing() {

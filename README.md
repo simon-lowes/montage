@@ -40,6 +40,13 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
   - Each sequence works in Rec.709, Rec.2020, P3, PQ or HLG. Clips are converted into it, with tone mapping between HDR and SDR and a display rendering for log footage.
   - HDR sequences are previewed tone mapped to SDR.
   - HDR exports are 10-bit and tagged, and PQ files carry HDR10 metadata. An HDR master can also be delivered as a tone-mapped SDR version.
+  - Colour Space Transform effect: convert one clip between any two of these spaces.
+  - OpenColorIO Transform effect (when built with OpenColorIO 2.1+):
+    - Applies a studio's `.ocio` config, `$OCIO`, or a config built into OCIO (e.g. `ocio://studio-config-latest`).
+    - Converts colour space to colour space, or to a display/view with an optional look; it can also run inverted.
+    - The Inspector lists the config's spaces, displays, views and looks.
+    - ACES 2.0 output transforms come with OCIO 2.5's built-in configs.
+  - The camera log curves and gamuts match OpenColorIO's reference ACES transforms to 1e-4. They use the makers' published matrices to ACES.
 
 **Audio**
 - Clip gain and pan, both keyframeable

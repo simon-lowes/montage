@@ -21,6 +21,7 @@ option(MONTAGE_BUILD_TESTS "Build the Montage test suite" ON)
 option(MONTAGE_WITH_VST3 "Host VST3 audio plugins (VST 3 SDK, MIT, vendored)" ON)
 option(MONTAGE_WITH_WHISPER "Speech-to-text with whisper.cpp (MIT, fetched at configure time)" ON)
 option(MONTAGE_WITH_RNNOISE "Voice isolation with RNNoise (BSD, fetched with its model at configure time)" ON)
+option(MONTAGE_WITH_OCIO "OpenColorIO configs and ACES transforms, when OpenColorIO 2.1+ is installed" ON)
 
 find_package(Qt6 6.4 REQUIRED COMPONENTS Core Gui Concurrent)
 if(MONTAGE_BUILD_APP)

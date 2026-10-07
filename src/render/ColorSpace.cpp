@@ -97,6 +97,7 @@ Chroma chroma(Primaries p) {
         case Primaries::VGamut: return {0.730, 0.280, 0.165, 0.840, 0.100, -0.030, wx, wy};
         case Primaries::CinemaGamut: return {0.740, 0.270, 0.170, 1.140, 0.080, -0.100, wx, wy};
         case Primaries::Ap1: return {0.713, 0.293, 0.165, 0.830, 0.128, 0.044, 0.32168, 0.33767};
+        case Primaries::Ap0: return {0.7347, 0.2653, 0.0, 1.0, 0.0001, -0.077, 0.32168, 0.33767};
     }
     return chroma(Primaries::Bt709);
 }
@@ -165,6 +166,7 @@ const std::vector<ColorSpace>& colorSpaces() {
         {"vlog-vgamut", "Panasonic V-Log / V-Gamut", Primaries::VGamut, Transfer::VLog, true},
         {"clog3-cinemagamut", "Canon Log 3 / Cinema Gamut", Primaries::CinemaGamut, Transfer::CLog3, true},
         {"acescct", "ACEScct", Primaries::Ap1, Transfer::AcesCct, true},
+        {"aces2065-1", "ACES2065-1 (linear AP0)", Primaries::Ap0, Transfer::Linear, true},
         {"linear-rec709", "Linear Rec.709 (scene)", Primaries::Bt709, Transfer::Linear, true},
     };
     return spaces;
@@ -240,16 +242,11 @@ double fromLinear(Transfer t, double l) {
 }
 
 void primariesMatrix(Primaries from, Primaries to, double m[9]) {
-    const Chroma a = chroma(from), b = chroma(to);
-    double toXyz[9], fromXyz[9], b2[9];
-    rgbToXyz(a, toXyz);
-    rgbToXyz(b, b2);
-    invert3(b2, fromXyz);
-    double adapt[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
-    if (std::fabs(a.wx - b.wx) > 1e-6 || std::fabs(a.wy - b.wy) > 1e-6) bradford(a.wx, a.wy, b.wx, b.wy, adapt);
-    double t[9];
-    mul3(adapt, toXyz, t);
-    mul3(fromXyz, t, m);
+    double a[9], b[9], bInv[9];
+    primariesToXyz(from, a);
+    primariesToXyz(to, b);
+    invert3(b, bInv);
+    mul3(bInv, a, m);
 }
 
 namespace {
@@ -307,6 +304,31 @@ void convertPixelWith(float rgb[3], const ColorSpace& from, const ColorSpace& to
     }
 }
 }  // namespace
+
+void primariesToXyz(Primaries p, double m[9]) {
+    // The makers' published matrices to ACES AP0 (the ACES IDTs).
+    static const double sgamut3cine[9] = {0.6387886672, 0.2723514337, 0.0888598992, -0.0039159061, 1.0880732308,
+                                          -0.0841573249, -0.0299072021, -0.0264325799, 1.0563397820};
+    static const double awg3[9] = {0.680206, 0.236137, 0.083658, 0.085415, 1.017471, -0.102886, 0.002057, -0.062563, 1.060506};
+    static const double cinemaGamut[9] = {0.763064455, 0.149021161, 0.087914384, 0.003657457, 1.10696038,
+                                          -0.110617837, -0.009407794, -0.218383305, 1.227791099};
+    const double* toAp0 = p == Primaries::SGamut3Cine       ? sgamut3cine
+                          : p == Primaries::AlexaWideGamut3 ? awg3
+                          : p == Primaries::CinemaGamut     ? cinemaGamut
+                                                            : nullptr;
+    if (toAp0) {
+        double ap0[9];
+        primariesToXyz(Primaries::Ap0, ap0);
+        mul3(ap0, toAp0, m);
+        return;
+    }
+    const Chroma c = chroma(p);
+    double toXyz[9];
+    rgbToXyz(c, toXyz);
+    double adapt[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+    if (std::fabs(c.wx - 0.3127) > 1e-6 || std::fabs(c.wy - 0.3290) > 1e-6) bradford(c.wx, c.wy, 0.3127, 0.3290, adapt);
+    mul3(adapt, toXyz, m);
+}
 
 void convertPixel(float rgb[3], const ColorSpace& from, const ColorSpace& to, double hdrPeakNits) {
     double m[9];

@@ -2,6 +2,7 @@
 
 #include <QCheckBox>
 #include <QColorDialog>
+#include <QAbstractItemView>
 #include <QComboBox>
 #include <QDoubleSpinBox>
 #include <QFileDialog>
@@ -25,6 +26,7 @@
 #include "PluginEditorWindow.h"
 #include "Theme.h"
 #include "audio/PluginEffect.h"
+#include "render/Ocio.h"
 
 namespace montage {
 
@@ -827,8 +829,9 @@ void InspectorWidget::addStringRow(QFormLayout* form, const StringParamInfo& si,
             h->addWidget(browse);
             form->addRow(label, row);
             connect(line, &QLineEdit::editingFinished, this, [line, write] { write(line->text()); });
-            connect(browse, &QToolButton::clicked, this, [this, line, write, label] {
-                QString f = QFileDialog::getOpenFileName(this, label, line->text(), tr("LUT files (*.cube);;All files (*)"));
+            const QString filter = si.fileFilter.empty() ? tr("All files (*)") : QString::fromStdString(si.fileFilter);
+            connect(browse, &QToolButton::clicked, this, [this, line, write, label, filter] {
+                QString f = QFileDialog::getOpenFileName(this, label, line->text(), filter);
                 if (!f.isEmpty()) write(f);
             });
             refreshers_.push_back([line, read] {
@@ -862,6 +865,31 @@ void InspectorWidget::addStringRow(QFormLayout* form, const StringParamInfo& si,
             });
             refreshers_.push_back([line, read] {
                 if (!line->hasFocus()) line->setText(read());
+            });
+            break;
+        }
+        case StringKind::Dynamic: {
+            // Entries come from the effect's other settings (the OCIO config's spaces, displays...).
+            auto* combo = new QComboBox(content_);
+            combo->setEditable(true);
+            combo->setInsertPolicy(QComboBox::NoInsert);
+            combo->setObjectName(QString::fromStdString("dynamic_" + name));
+            form->addRow(label, combo);
+            connect(combo, &QComboBox::textActivated, this, write);
+            refreshers_.push_back([this, combo, read, target, name] {
+                if (combo->hasFocus() || (combo->view() && combo->view()->isVisible())) return;
+                QStringList items;
+                if (const Sequence* s = state_->sequence())
+                    if (const Effect* e = target.resolve(const_cast<Sequence&>(*s)); e && e->type == "ocio")
+                        for (const auto& c : ocioChoices(*e, name)) items << QString::fromStdString(c);
+                QSignalBlocker b(combo);
+                QStringList current;
+                for (int i = 0; i < combo->count(); ++i) current << combo->itemText(i);
+                if (current != items) {
+                    combo->clear();
+                    combo->addItems(items);
+                }
+                combo->setCurrentText(read());
             });
             break;
         }

@@ -44,6 +44,7 @@
 #include "render/ColorSpace.h"
 #include "render/Compositor.h"
 #include "render/Exporter.h"
+#include "render/Ocio.h"
 
 using namespace montage;
 
@@ -799,6 +800,43 @@ private slots:
         state()->newProject();
         win_->activateWindow();  // the context menu took the focus
         QVERIFY(QTest::qWaitForWindowActive(win_.get()));
+    }
+
+    void ocioEffectInInspector() {
+        if (!ocioAvailable()) QSKIP("Built without OpenColorIO");
+        const QString cfg = dir_.path() + "/inspector.ocio";
+        QFile f(cfg);
+        QVERIFY(f.open(QIODevice::WriteOnly));
+        f.write("ocio_profile_version: 2\nroles:\n  default: linear\n  scene_linear: linear\n"
+                "file_rules:\n  - !<Rule> {name: Default, colorspace: default}\n"
+                "displays:\n  Monitor:\n    - !<View> {name: Raw, colorspace: linear}\n"
+                "colorspaces:\n  - !<ColorSpace>\n    name: linear\n  - !<ColorSpace>\n    name: half\n"
+                "    from_scene_reference: !<MatrixTransform> {matrix: [0.5, 0, 0, 0, 0, 0.5, 0, 0, 0, 0, 0.5, 0, 0, 0, 0, 1]}\n");
+        f.close();
+        loadDemo();
+        const Id clip = clipNamed(*state()->sequence(), "Red")->id;
+        Id fx = 0;
+        state()->edit("OCIO", [&](Project& p, Sequence& s) {
+            Effect e = makeEffect(p, "ocio");
+            e.strings["config"] = cfg.toStdString();
+            fx = e.id;
+            edit::clipById(s, clip)->effects.push_back(e);
+            return true;
+        });
+        state()->setSelection({clip}, false);
+        QApplication::processEvents();
+        // The input and output lists come from the config.
+        QComboBox* src = nullptr;
+        for (auto* c : win_->findChildren<QComboBox*>("dynamic_dst"))
+            if (c->isVisibleTo(win_.get())) src = c;
+        QVERIFY(src);
+        QCOMPARE(src->count(), 2);
+        QCOMPARE(src->itemText(1), QString("half"));
+        emit src->textActivated("half");
+        const Effect* e = edit::ownedEffect(const_cast<Sequence&>(*state()->sequence()), clip, fx);
+        QVERIFY(e);
+        QCOMPARE(e->s("dst"), std::string("half"));
+        state()->newProject();
     }
 
     void captionsPanelAndTimelineLane() {

@@ -25,7 +25,7 @@ enum class Transfer {
     AcesCct,  // ACEScct
 };
 
-enum class Primaries { Bt709, Bt2020, P3D65, SGamut3Cine, AlexaWideGamut3, AlexaWideGamut4, VGamut, CinemaGamut, Ap1 };
+enum class Primaries { Bt709, Bt2020, P3D65, SGamut3Cine, AlexaWideGamut3, AlexaWideGamut4, VGamut, CinemaGamut, Ap1, Ap0 };
 
 struct ColorSpace {
     std::string id;     // e.g. "rec709", "rec2100pq", "slog3-sgamut3cine"
@@ -55,9 +55,12 @@ const ColorSpace& rec709Space();
 double toLinear(Transfer t, double v);
 double fromLinear(Transfer t, double l);
 
-// 3x3 matrix taking linear RGB in `from` primaries to `to` primaries (D65 white,
-// with a Bradford adaptation for primaries on other whites).
+// 3x3 matrix taking linear RGB in `from` primaries to `to` primaries, through
+// XYZ D65 (Bradford adaptation for the ACES whites). Camera gamuts whose makers
+// publish a matrix to ACES use it, as the ACES IDTs and OpenColorIO do.
 void primariesMatrix(Primaries from, Primaries to, double m[9]);
+// Linear RGB in `p` to CIE XYZ relative to D65 (Bradford adapted when `p` has another white).
+void primariesToXyz(Primaries p, double m[9]);
 
 // Converts premultiplied RGBA pixels from one space to another in place.
 // HDR shown in SDR is tone mapped (BT.2390-style roll-off from `hdrPeakNits`);

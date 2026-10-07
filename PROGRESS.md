@@ -99,7 +99,13 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
     - HDR sequences are previewed tone mapped to SDR.
     - Export: 10-bit and tagged HDR, HDR10 mastering display and MaxCLL/MaxFALL (stream side data, per-frame side data and x265 SEI), and SDR versions of HDR masters.
     - Checked against published curve values (PQ, HLG, S-Log3, LogC3/4, V-Log, Canon Log 3, ACEScct) and the BT.2087 matrix, with an HDR10 export round trip.
-  - [ ] Part B: OpenColorIO configs (an OCIO transform effect, ACES 2.0 output transforms), and HDR monitoring on HDR displays.
+  - [x] Part B, OpenColorIO and ACES:
+    - Optional OCIO 2.1+ support: an OpenColorIO Transform effect using a config file, `$OCIO` or a built-in config, in colour-space or display/view mode, with looks and inverse.
+    - The Inspector lists the config's spaces, displays, views and looks.
+    - ACES 2.0 through OCIO 2.5's built-in configs.
+    - Also a Colour Space Transform effect using Montage's own engine.
+    - ACES2065-1 added as a space. Camera gamuts use the makers' published ACES matrices, and the tests check every camera transform against OCIO's built-ins.
+  - [ ] Still to do: HDR monitoring on HDR displays (macOS EDR, Windows HDR), and colour-managed scopes.
 - [ ] 14. Multicam (L)
 - [ ] 15. GPU compositor on QRhi (XL)
 - [ ] 16. Tracking and stabilisation (L)

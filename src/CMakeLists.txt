@@ -17,6 +17,7 @@ add_library(montage_engine STATIC
   media/AudioSync.h media/AudioSync.cpp
   render/Processing.h render/Processing.cpp
   render/ColorSpace.h render/ColorSpace.cpp
+  render/Ocio.h render/Ocio.cpp
   render/Compositor.h render/Compositor.cpp
   render/Exporter.h render/Exporter.cpp
   audio/Plugins.h audio/PluginScan.cpp audio/ClapHost.cpp
@@ -55,6 +56,24 @@ target_compile_options(montage_engine PRIVATE
   $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wno-unused-parameter>)
 set_target_properties(montage_engine PROPERTIES AUTOMOC OFF)
 
+if(MONTAGE_WITH_OCIO)
+  find_package(OpenColorIO 2.1 CONFIG QUIET)
+  if(OpenColorIO_FOUND)
+    message(STATUS "OpenColorIO ${OpenColorIO_VERSION}: OCIO transforms enabled")
+    target_link_libraries(montage_engine PRIVATE OpenColorIO::OpenColorIO)
+    target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_OCIO)
+  else()
+    # Debian/Ubuntu install the CMake package where find_package does not look.
+    pkg_check_modules(OCIO IMPORTED_TARGET OpenColorIO>=2.1)
+  endif()
+  if(OCIO_FOUND)
+    message(STATUS "OpenColorIO ${OCIO_VERSION} (pkg-config): OCIO transforms enabled")
+    target_link_libraries(montage_engine PRIVATE PkgConfig::OCIO)
+    target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_OCIO)
+  elseif(NOT OpenColorIO_FOUND)
+    message(STATUS "OpenColorIO not found: OCIO transforms disabled")
+  endif()
+endif()
 if(MONTAGE_WITH_RNNOISE)
   target_link_libraries(montage_engine PRIVATE montage_rnnoise)
   target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_RNNOISE)

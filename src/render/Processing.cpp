@@ -1,5 +1,7 @@
 #include "Processing.h"
 
+#include "ColorSpace.h"
+#include "Ocio.h"
 #include "core/Effects.h"
 
 #include <algorithm>
@@ -549,6 +551,16 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
     else if (ty == "curves") curves(e, t, img);
     else if (ty == "hue_sat") hueSat(e, t, img);
     else if (ty == "lut") applyLut(e, t, img);
+    else if (ty == "color_space_transform") {
+        const ColorSpace* from = nullptr;
+        const ColorSpace* to = nullptr;
+        for (const auto& cs : colorSpaces()) {
+            if (cs.label == e.s("from")) from = &cs;
+            if (cs.label == e.s("to")) to = &cs;
+        }
+        if (from && to) convertColor(img, *from, *to);
+    } else if (ty == "ocio")
+        applyOcio(e, img);
     else if (ty == "chroma_key") chromaKey(e, t, img);
     else if (ty == "luma_key") lumaKey(e, t, img);
     else if (ty == "black_white") blackWhite(e, t, img);
