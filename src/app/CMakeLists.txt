@@ -24,6 +24,7 @@ endif()
 
 add_executable(montage ${MONTAGE_APP_SOURCES})
 target_link_libraries(montage PRIVATE montage_ui)
+montage_copy_runtime(montage)
 set_target_properties(montage PROPERTIES
   AUTOMOC ON
   AUTORCC ON

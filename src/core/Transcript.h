@@ -28,6 +28,7 @@ struct Transcript {
     std::string language;  // ISO 639-1, e.g. "en"
     std::string model;     // the model that produced it, e.g. "base.en"
     std::vector<TranscriptSegment> segments;
+    std::vector<std::string> speakerNames;  // by speaker number; empty or missing = "Speaker N"
 
     bool empty() const { return segments.empty(); }
     std::string text() const;  // the whole transcript as plain text
@@ -35,15 +36,33 @@ struct Transcript {
     bool operator==(const Transcript&) const = default;
 };
 
+// Who speaks when (from media/Diarizer.h), in seconds of media time.
+struct SpeakerTurn {
+    double start = 0;
+    double end = 0;
+    int speaker = 0;
+    bool operator==(const SpeakerTurn&) const = default;
+};
+// Labels the transcript with its speakers: each word goes to the person
+// speaking over most of it (or the nearest turn within a second), a lone
+// word between two of someone else's is theirs, and segments are split
+// where the speaker changes.
+void applySpeakers(Transcript& t, const std::vector<SpeakerTurn>& turns);
+// The speaker's name, "Speaker 1" etc. unless it was renamed; "" for -1.
+std::string speakerName(const Transcript& t, int speaker);
+int speakerCount(const Transcript& t);  // highest speaker number + 1
+
 std::string transcriptToJson(const Transcript& t);
 bool transcriptFromJson(const std::string& json, Transcript& out, std::string* error = nullptr);
 
 // Caption cues: transcript text split into readable lines, at most
-// `maxChars` characters and `maxSeconds` long, breaking at word boundaries.
+// `maxChars` characters and `maxSeconds` long, breaking at word boundaries
+// and where the speaker changes.
 struct Cue {
     double start = 0;
     double end = 0;
     std::string text;
+    std::string voice;  // who speaks it, when the transcript knows (WebVTT <v>)
 };
 std::vector<Cue> transcriptCues(const Transcript& t, int maxChars = 42, double maxSeconds = 6.0);
 

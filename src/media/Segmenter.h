@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "Image.h"
+#include "ModelFiles.h"
 #include "core/ObjectMask.h"
 
 namespace montage {
@@ -24,22 +25,9 @@ namespace montage {
 bool segmenterAvailable();
 std::string segmenterRuntimeVersion();
 
-// The model's files, downloaded on first use.
-struct SegmenterFile {
-    std::string name;
-    std::string sha256;
-    int64_t bytes = 0;
-};
-const std::vector<SegmenterFile>& segmenterFiles();
-int64_t segmenterDownloadBytes();
-// $MONTAGE_OBJECT_MODEL, or a folder in the app data location.
-std::string segmenterModelDirectory();
-// Download location of one file ($MONTAGE_OBJECT_MODEL_URL replaces the folder: a mirror, or file:// in tests).
-std::string segmenterFileUrl(const std::string& name);
-// Every file is present with the expected size.
-bool segmenterModelInstalled();
-// SHA-256 of a downloaded file matches (run after downloading, before renaming into place).
-bool segmenterFileVerified(const std::string& path, const SegmenterFile& f);
+// The model's files (65 MB), downloaded on first use; $MONTAGE_OBJECT_MODEL
+// names another folder, $MONTAGE_OBJECT_MODEL_URL a mirror.
+const ModelPack& objectModel();
 
 // The image size the model sees: frames are scaled to this square.
 constexpr int kSegmenterInput = 1024;

@@ -26,6 +26,16 @@ option(MONTAGE_WITH_OCIO "OpenColorIO configs and ACES transforms, when OpenColo
 option(MONTAGE_WITH_ONNXRUNTIME "AI object masks (EdgeTAM), when ONNX Runtime 1.16+ is installed (ONNXRUNTIME_ROOT or the usual prefixes)" ON)
 option(MONTAGE_REQUIRE_ONNXRUNTIME "Fail to configure without ONNX Runtime (release builds)" OFF)
 
+# Windows ships an older onnxruntime.dll of its own in System32, which the
+# loader finds before PATH: programs get a copy of ours beside them
+# (MONTAGE_ORT_DLL is found in src/CMakeLists.txt).
+function(montage_copy_runtime target)
+  if(WIN32 AND MONTAGE_ORT_DLL)
+    add_custom_command(TARGET ${target} POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${MONTAGE_ORT_DLL}" "$<TARGET_FILE_DIR:${target}>")
+  endif()
+endfunction()
+
 find_package(Qt6 6.4 REQUIRED COMPONENTS Core Gui Concurrent Xml)
 if(MONTAGE_BUILD_APP)
   find_package(Qt6 6.4 REQUIRED COMPONENTS Widgets Multimedia Network)

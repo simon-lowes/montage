@@ -1,10 +1,8 @@
 #include "Segmenter.h"
 
-#include <QCryptographicHash>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
-#include <QStandardPaths>
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -12,6 +10,7 @@
 #include <deque>
 #include <mutex>
 #include <thread>
+#include <tuple>
 
 #ifdef MONTAGE_WITH_ONNXRUNTIME
 #if __has_include(<onnxruntime_cxx_api.h>)
@@ -19,57 +18,32 @@
 #else
 #include <onnxruntime/onnxruntime_cxx_api.h>
 #endif
+#include "OrtSupport.h"
 #endif
 
 namespace montage {
 
 // ---- Model files ---------------------------------------------------------------
 
-const std::vector<SegmenterFile>& segmenterFiles() {
-    static const std::vector<SegmenterFile> files = {
-        {"vision_encoder.onnx", "57fe1a2b3d500813fe4987c4209b856920f187ab0b7723d81586b607ea2cffc1", 19826101},
-        {"mask_decoder.onnx", "ee24ee1cae6ecc71889912c1893e08b09f645bb63875108ccd180f7218a3647d", 17800677},
-        {"memory_attention.onnx", "6477d775639905945949508c08a2c652d01e5933c0eb00a02225ae5f6aa1602c", 20914958},
-        {"memory_encoder.onnx", "035b30f8fb1f7c99211ada6eb9d72f0819de819ef94310b14e8147dc97f120ec", 6692568},
-    };
-    return files;
-}
-
-int64_t segmenterDownloadBytes() {
-    int64_t n = 0;
-    for (const auto& f : segmenterFiles()) n += f.bytes;
-    return n;
-}
-
-std::string segmenterModelDirectory() {
-    if (const char* env = std::getenv("MONTAGE_OBJECT_MODEL"); env && *env) return env;
-    QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
-    if (dir.isEmpty()) dir = QDir::homePath() + "/.montage";
-    return (dir + "/object-models/edgetam-video").toStdString();
-}
-
-std::string segmenterFileUrl(const std::string& name) {
+const ModelPack& objectModel() {
     // The EdgeTAM video export (graphs for the memory bank as well as the
     // encoder and decoder), pinned to the revision these hashes describe.
-    std::string base = "https://huggingface.co/jax-image-tools/edgetam-video-onnx/resolve/8ca3d3e4169938e65b552cdf14542fde25e8badb";
-    if (const char* env = std::getenv("MONTAGE_OBJECT_MODEL_URL"); env && *env) base = env;
-    if (!base.empty() && base.back() == '/') base.pop_back();
-    return base + "/" + name;
-}
-
-bool segmenterModelInstalled() {
-    const QString dir = QString::fromStdString(segmenterModelDirectory());
-    for (const auto& f : segmenterFiles())
-        if (QFileInfo(dir + "/" + QString::fromStdString(f.name)).size() != f.bytes) return false;
-    return true;
-}
-
-bool segmenterFileVerified(const std::string& path, const SegmenterFile& f) {
-    QFile file(QString::fromStdString(path));
-    if (file.size() != f.bytes || !file.open(QIODevice::ReadOnly)) return false;
-    QCryptographicHash h(QCryptographicHash::Sha256);
-    if (!h.addData(&file)) return false;
-    return h.result().toHex().toStdString() == f.sha256;
+    static const ModelPack pack = [] {
+        const std::string base = "https://huggingface.co/jax-image-tools/edgetam-video-onnx/resolve/8ca3d3e4169938e65b552cdf14542fde25e8badb/";
+        ModelPack p;
+        p.id = "edgetam-video";
+        p.title = "object model";
+        p.directoryEnv = "MONTAGE_OBJECT_MODEL";
+        p.urlEnv = "MONTAGE_OBJECT_MODEL_URL";
+        for (const auto& [name, sha, bytes] : std::vector<std::tuple<std::string, std::string, int64_t>>{
+                 {"vision_encoder.onnx", "57fe1a2b3d500813fe4987c4209b856920f187ab0b7723d81586b607ea2cffc1", 19826101},
+                 {"mask_decoder.onnx", "ee24ee1cae6ecc71889912c1893e08b09f645bb63875108ccd180f7218a3647d", 17800677},
+                 {"memory_attention.onnx", "6477d775639905945949508c08a2c652d01e5933c0eb00a02225ae5f6aa1602c", 20914958},
+                 {"memory_encoder.onnx", "035b30f8fb1f7c99211ada6eb9d72f0819de819ef94310b14e8147dc97f120ec", 6692568}})
+            p.files.push_back({name, base + name, sha, bytes});
+        return p;
+    }();
+    return pack;
 }
 
 #ifndef MONTAGE_WITH_ONNXRUNTIME
@@ -96,7 +70,7 @@ int ObjectTracker::framesTracked() const { return 0; }
 #include "EdgeTamConstants.inc"
 
 bool segmenterAvailable() { return true; }
-std::string segmenterRuntimeVersion() { return Ort::GetVersionString(); }
+std::string segmenterRuntimeVersion() { return OrtGetApiBase()->GetVersionString(); }
 
 namespace {
 
@@ -130,12 +104,13 @@ std::shared_ptr<Models> loadModels(std::string* error) {
     static auto* cached = new std::shared_ptr<Models>();
     std::lock_guard lock(m);
     if (*cached) return *cached;
-    const QString dir = QString::fromStdString(segmenterModelDirectory());
-    for (const auto& f : segmenterFiles())
-        if (!QFileInfo::exists(dir + "/" + QString::fromStdString(f.name))) {
-            if (error) *error = "The object model is not downloaded";
-            return nullptr;
-        }
+    if (!ortUsable(error)) return nullptr;
+    const ModelPack& pack = objectModel();
+    if (!pack.installed()) {
+        if (error) *error = "The object model is not downloaded";
+        return nullptr;
+    }
+    const QString dir = QString::fromStdString(pack.directory());
     try {
         auto models = std::make_shared<Models>();
         Ort::SessionOptions so;

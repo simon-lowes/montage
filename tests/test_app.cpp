@@ -1308,7 +1308,7 @@ private slots:
         QTest::qWait(50);
         QVERIFY(!edit::clipById(*state()->sequence(), clip)->effects.back().object);
 
-        if (!segmenterAvailable() || !segmenterModelInstalled())
+        if (!segmenterAvailable() || !objectModel().installed())
             QSKIP("Picking objects needs ONNX Runtime and the model (MONTAGE_OBJECT_MODEL)");
         MonitorPanel* program = nullptr;
         for (auto* m : win_->findChildren<MonitorPanel*>())

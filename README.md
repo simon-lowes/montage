@@ -156,7 +156,7 @@ CMake options:
 - `-DMONTAGE_BUILD_TESTS=OFF` skips the tests.
 - `-DMONTAGE_REQUIRE_ONNXRUNTIME=ON` stops the configure step if ONNX Runtime is missing (release builds use it).
 
-The object mask tests need the model: `scripts/fetch-object-model.sh ~/object-model`, then set `MONTAGE_OBJECT_MODEL=~/object-model` (the app reads the same variable). The speech tests read `MONTAGE_TEST_WHISPER_MODEL`.
+The object mask and speaker tests need their models: `scripts/fetch-models.sh ~/montage-models`, then set `MONTAGE_OBJECT_MODEL=~/montage-models/edgetam-video` and `MONTAGE_SPEAKER_MODEL=~/montage-models/speakers` (the app reads the same variables). The speech tests read `MONTAGE_TEST_WHISPER_MODEL`.
 
 ## Using the editor
 

@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <csignal>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -25,6 +26,7 @@
 #include "media/Decoder.h"
 #include "media/Loudness.h"
 #ifdef MONTAGE_WITH_WHISPER
+#include "media/Diarizer.h"
 #include "media/Segmenter.h"
 #include "media/Transcriber.h"
 #endif
@@ -61,7 +63,7 @@ int usage() {
                  "  montage-cli fcpxml <project.montage> [-o out.fcpxml]\n"
                  "  montage-cli import <timeline.xml|.fcpxml|.otio|.edl> -o <project.montage> [--fps N]\n"
                  "  montage-cli bench <project.montage> [--scale 0.5] [--frames 120]\n"
-                 "  montage-cli transcribe <media> [--model base.en|PATH] [--language auto|en|...] [--translate]\n"
+                 "  montage-cli transcribe <media> [--model base.en|PATH] [--language auto|en|...] [--translate] [--speakers [N]]\n"
                  "                     [--srt out.srt] [--vtt out.vtt] [--json out.json] [--txt out.txt]\n"
                  "  montage-cli models\n"
                  "  montage-cli captions <project.montage> [-o out.srt|out.vtt|out.scc] [--transcribe MODEL]\n"
@@ -480,11 +482,16 @@ int cmdModels() {
         std::printf("  %-22s %6.0f MB  %-10s %s\n", m.name.c_str(), double(m.bytes) / 1e6,
                     whisperModelPath(m.name).empty() ? "" : "downloaded", m.label.c_str());
     std::printf("\nDownload a model into the folder from %s\n", whisperModelUrl("<name>").c_str());
-    std::printf("\nObject model (EdgeTAM, for object masks; folder: %s)\n", segmenterModelDirectory().c_str());
+    std::printf("\nObject model (EdgeTAM, for object masks; folder: %s)\n", objectModel().directory().c_str());
     if (!segmenterAvailable()) std::printf("  unavailable: this build has no ONNX Runtime\n");
     else
-        std::printf("  %-22s %6.0f MB  %-10s ONNX Runtime %s\n", "edgetam-video", double(segmenterDownloadBytes()) / 1e6,
-                    segmenterModelInstalled() ? "downloaded" : "", segmenterRuntimeVersion().c_str());
+        std::printf("  %-22s %6.0f MB  %-10s ONNX Runtime %s\n", objectModel().id.c_str(), double(objectModel().bytes()) / 1e6,
+                    objectModel().installed() ? "downloaded" : "", segmenterRuntimeVersion().c_str());
+    std::printf("\nSpeaker model (pyannote segmentation + CAM++, for speaker labels; folder: %s)\n", speakerModel().directory().c_str());
+    if (!diarizerAvailable()) std::printf("  unavailable: this build has no ONNX Runtime\n");
+    else
+        std::printf("  %-22s %6.0f MB  %s\n", speakerModel().id.c_str(), double(speakerModel().bytes()) / 1e6,
+                    speakerModel().installed() ? "downloaded" : "");
     return 0;
 }
 
@@ -500,6 +507,12 @@ int cmdTranscribe(const std::vector<std::string>& args) {
         else if (a == "--language") opts.language = next();
         else if (a == "--translate") opts.translate = true;
         else if (a == "--threads") opts.threads = std::atoi(next().c_str());
+        else if (a == "--speakers") {
+            // Optional count: --speakers 2; plain --speakers finds out.
+            opts.speakers = true;
+            if (i + 1 < args.size() && !args[i + 1].empty() && std::isdigit(static_cast<unsigned char>(args[i + 1][0])))
+                opts.speakerCount = std::atoi(next().c_str());
+        }
         else if (a == "--srt") srt = next();
         else if (a == "--vtt") vtt = next();
         else if (a == "--json") json = next();

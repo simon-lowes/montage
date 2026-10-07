@@ -15,6 +15,7 @@
 #endif
 
 #include "Decoder.h"
+#include "Diarizer.h"
 
 namespace montage {
 
@@ -194,7 +195,21 @@ bool transcribeMedia(const std::string& path, const TranscribeOptions& options, 
     }
     std::vector<float> mono(size_t(audio->frames()));
     for (size_t i = 0; i < mono.size(); ++i) mono[i] = 0.5f * (audio->samples[i * 2] + audio->samples[i * 2 + 1]);
-    return transcribeSamples(mono, options, out, progress, cancel, error);
+    if (!options.speakers) return transcribeSamples(mono, options, out, progress, cancel, error);
+    // Words first (most of the time), then who says them.
+    auto part = [&](double from, double to) -> TranscribeProgress {
+        if (!progress) return {};
+        return [=](double f) { progress(from + (to - from) * f); };
+    };
+    Transcript t;
+    if (!transcribeSamples(mono, options, t, part(0, 0.85), cancel, error)) return false;
+    DiarizeOptions d;
+    d.speakers = options.speakerCount;
+    std::vector<SpeakerTurn> turns;
+    if (!diarize(mono, d, turns, part(0.85, 1), cancel, error)) return false;
+    applySpeakers(t, turns);
+    out = std::move(t);
+    return true;
 }
 
 }  // namespace montage

@@ -37,15 +37,15 @@ jobs:
               || { rm -f "$f"; echo "::warning::Could not download the speech model; transcription tests will be skipped"; }
           fi
           [ -s "$f" ] && echo "MONTAGE_TEST_WHISPER_MODEL=$f" >> "$GITHUB_ENV" || true
-      - name: Cache the object model
+      - name: Cache the AI models
         uses: actions/cache@v4
         with:
-          path: ~/object-model
-          key: edgetam-video-8ca3d3e
-      - name: Object model for the object mask tests
+          path: ~/montage-models
+          key: models-edgetam-8ca3d3e-speakers-9403a69-0743f30
+      - name: AI models for the object mask and speaker tests
         run: |
-          scripts/fetch-object-model.sh ~/object-model \
-            && echo "MONTAGE_OBJECT_MODEL=$HOME/object-model" >> "$GITHUB_ENV" \
-            || echo "::warning::Could not download the object model; object mask tests will be skipped"
+          scripts/fetch-models.sh ~/montage-models \
+            && { echo "MONTAGE_OBJECT_MODEL=$HOME/montage-models/edgetam-video"; echo "MONTAGE_SPEAKER_MODEL=$HOME/montage-models/speakers"; } >> "$GITHUB_ENV" \
+            || echo "::warning::Could not download the AI models; object mask and speaker tests will be skipped"
       - name: Test
         run: ctest --test-dir build --output-on-failure

@@ -42,16 +42,16 @@ jobs:
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(brew --prefix)" -DMONTAGE_REQUIRE_ONNXRUNTIME=ON
       - name: Build
         run: cmake --build build
-      - name: Cache the object model
+      - name: Cache the AI models
         uses: actions/cache@v4
         with:
-          path: ~/object-model
-          key: edgetam-video-8ca3d3e
-      - name: Object model for the object mask tests
+          path: ~/montage-models
+          key: models-edgetam-8ca3d3e-speakers-9403a69-0743f30
+      - name: AI models for the object mask and speaker tests
         run: |
-          scripts/fetch-object-model.sh ~/object-model \
-            && echo "MONTAGE_OBJECT_MODEL=$HOME/object-model" >> "$GITHUB_ENV" \
-            || echo "::warning::Could not download the object model; object mask tests will be skipped"
+          scripts/fetch-models.sh ~/montage-models \
+            && { echo "MONTAGE_OBJECT_MODEL=$HOME/montage-models/edgetam-video"; echo "MONTAGE_SPEAKER_MODEL=$HOME/montage-models/speakers"; } >> "$GITHUB_ENV" \
+            || echo "::warning::Could not download the AI models; object mask and speaker tests will be skipped"
       - name: Test
         run: ctest --test-dir build --output-on-failure
       - name: Package
@@ -93,17 +93,17 @@ jobs:
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DMONTAGE_REQUIRE_ONNXRUNTIME=ON
       - name: Build
         run: cmake --build build
-      - name: Cache the object model
+      - name: Cache the AI models
         uses: actions/cache@v4
         with:
-          path: ~/object-model
-          key: edgetam-video-8ca3d3e
-      - name: Object model for the object mask tests
+          path: ~/montage-models
+          key: models-edgetam-8ca3d3e-speakers-9403a69-0743f30
+      - name: AI models for the object mask and speaker tests
         run: |
-          dir="$(cygpath -u "$USERPROFILE")/object-model"  # where actions/cache's ~ points
-          scripts/fetch-object-model.sh "$dir" \
-            && echo "MONTAGE_OBJECT_MODEL=$(cygpath -m "$dir")" >> "$GITHUB_ENV" \
-            || echo "::warning::Could not download the object model; object mask tests will be skipped"
+          dir="$(cygpath -u "$USERPROFILE")/montage-models"  # where actions/cache's ~ points
+          scripts/fetch-models.sh "$dir" \
+            && { echo "MONTAGE_OBJECT_MODEL=$(cygpath -m "$dir/edgetam-video")"; echo "MONTAGE_SPEAKER_MODEL=$(cygpath -m "$dir/speakers")"; } >> "$GITHUB_ENV" \
+            || echo "::warning::Could not download the AI models; object mask and speaker tests will be skipped"
       - name: Test
         # A failing Qt Test binary is run again directly so its own log shows.
         run: |

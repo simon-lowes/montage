@@ -27,7 +27,7 @@
 #include <utility>
 
 #include "EditorState.h"
-#include "ObjectModel.h"
+#include "ModelPacks.h"
 #include "PluginEditorWindow.h"
 #include "Theme.h"
 #include "audio/PluginEffect.h"

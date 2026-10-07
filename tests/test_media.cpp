@@ -23,6 +23,7 @@
 #include "media/SpeakerSwitch.h"
 #include "media/Tracking.h"
 #include "media/Segmenter.h"
+#include "media/Diarizer.h"
 #ifdef MONTAGE_WITH_WHISPER
 #include "media/Transcriber.h"
 #endif
@@ -603,6 +604,116 @@ private slots:
     }
 
 #ifdef MONTAGE_WITH_WHISPER
+    void speakerLabels() {
+        // Labelling: words go to whoever speaks over them; segments split where that changes.
+        Transcript t;
+        TranscriptSegment seg;
+        seg.start = 0;
+        seg.end = 6;
+        for (int i = 0; i < 6; ++i) seg.words.push_back({double(i), i + 0.8, "w" + std::to_string(i), 1});
+        seg.text = "w0 w1 w2 w3 w4 w5";
+        t.segments.push_back(seg);
+        TranscriptSegment quiet{7, 8, "hm", {}, -1};
+        t.segments.push_back(quiet);
+        applySpeakers(t, {{0, 2.9, 0}, {2.9, 3.1, 1}, {3.1, 3.5, 0}, {3.5, 6.5, 1}});
+        QCOMPARE(int(t.segments.size()), 3);
+        QCOMPARE(t.segments[0].text, std::string("w0 w1 w2 w3"));  // w3 overlaps 0 most
+        QCOMPARE(t.segments[0].speaker, 0);
+        QCOMPARE(t.segments[1].text, std::string("w4 w5"));
+        QCOMPARE(t.segments[1].speaker, 1);
+        QCOMPARE(t.segments[2].speaker, 1);  // within a second of speaker 2's turn
+        QCOMPARE(speakerCount(t), 2);
+        QCOMPARE(speakerName(t, 1), std::string("Speaker 2"));
+        t.speakerNames = {"Ann"};
+        QCOMPARE(speakerName(t, 0), std::string("Ann"));
+        const std::string vtt = transcriptAs(t, "vtt");
+        QVERIFY2(vtt.find("<v Ann>w0 w1 w2 w3") != std::string::npos && vtt.find("<v Speaker 2>w4 w5") != std::string::npos, vtt.c_str());
+        QVERIFY(transcriptAs(t, "txt").find("Ann:\nw0 w1 w2 w3\n\nSpeaker 2:\nw4 w5\n") != std::string::npos);
+        Transcript back;
+        QVERIFY(transcriptFromJson(transcriptToJson(t), back) && back == t);
+
+        // Features: a 1 kHz tone puts its energy in the mel bin around 1 kHz, every 10 ms.
+        std::vector<float> tone(16000);
+        for (size_t i = 0; i < tone.size(); ++i) tone[i] = 0.3f * float(std::sin(2 * M_PI * 1000 * double(i) / 16000));
+        const std::vector<float> fb = speakerFeatures(tone.data(), tone.size());
+        QCOMPARE(int(fb.size()), 100 * 80);
+        const float* frame = &fb[50 * 80];
+        const int peak = int(std::max_element(frame, frame + 80) - frame);
+        // Mel bin centres: 1 kHz is 1000.0 Hz -> mel 999.99; bins step (mel(7600) - mel(20)) / 81.
+        const double step = (1127 * std::log(1 + 7600 / 700.0) - 1127 * std::log(1 + 20 / 700.0)) / 81;
+        const int expected = int(std::lround((1127 * std::log(1 + 1000 / 700.0) - 1127 * std::log(1 + 20 / 700.0)) / step)) - 1;
+        QVERIFY2(std::abs(peak - expected) <= 1, qPrintable(QString("%1 %2").arg(peak).arg(expected)));
+
+        // Clustering: three voices, each heard eight times with some variation.
+        std::mt19937 rng(5);
+        std::normal_distribution<float> g(0, 1);
+        std::vector<std::vector<float>> centres(3, std::vector<float>(64)), points;
+        for (auto& c : centres)
+            for (float& v : c) v = g(rng);
+        std::vector<int> truth;
+        for (int i = 0; i < 24; ++i) {
+            const int k = (i * 7) % 3;
+            std::vector<float> p = centres[size_t(k)];
+            for (float& v : p) v += 0.25f * g(rng);
+            points.push_back(p);
+            truth.push_back(k);
+        }
+        for (const auto& labels : {clusterSpeakers(points, 0, 0.5), clusterSpeakers(points, 3, 0)}) {
+            QCOMPARE(*std::max_element(labels.begin(), labels.end()), 2);
+            for (int i = 0; i < 24; ++i)
+                for (int j = 0; j < 24; ++j) QCOMPARE(labels[size_t(i)] == labels[size_t(j)], truth[size_t(i)] == truth[size_t(j)]);
+            QCOMPARE(labels[0], 0);  // numbered in order of first appearance
+        }
+        const std::vector<int> two = clusterSpeakers(points, 2, 0);
+        QCOMPARE(*std::max_element(two.begin(), two.end()), 1);
+        QCOMPARE(int(clusterSpeakers({}, 0, 0.5).size()), 0);
+
+        // The real models, if present: two voices, one of them heard twice.
+        if (!diarizerAvailable()) QSKIP("Built without ONNX Runtime");
+        if (!speakerModel().installed()) QSKIP("Set MONTAGE_SPEAKER_MODEL to a folder with the speaker models to run the rest");
+        std::string err;
+        AudioBufferPtr jfk = decodeAudio(MONTAGE_TEST_DATA_DIR "/jfk.wav", 16000, &err);
+        QVERIFY2(jfk, err.c_str());
+        std::vector<float> a(size_t(jfk->frames()));
+        for (size_t i = 0; i < a.size(); ++i) a[i] = jfk->samples[i * 2];
+        // A second voice: the same speech 35 % higher and faster (pitch and formants move together).
+        std::vector<float> b;
+        for (double x = 0; x + 1 < double(a.size()); x += 1.35) {
+            const size_t i = size_t(x);
+            b.push_back(float(a[i] + (a[i + 1] - a[i]) * (x - double(i))));
+        }
+        std::vector<float> mix = a;
+        mix.insert(mix.end(), 16000, 0.f);
+        const double bStart = double(mix.size()) / 16000;
+        mix.insert(mix.end(), b.begin(), b.end());
+        mix.insert(mix.end(), 16000, 0.f);
+        const double aAgain = double(mix.size()) / 16000;
+        mix.insert(mix.end(), a.begin(), a.begin() + 16000 * 6);
+        std::vector<SpeakerTurn> turns;
+        double last = 0;
+        QVERIFY2(diarize(mix, {}, turns, [&](double f) { last = f; }, nullptr, &err), err.c_str());
+        QCOMPARE(last, 1.0);
+        for (const auto& turn : turns) qInfo("turn %.2f-%.2f speaker %d", turn.start, turn.end, turn.speaker);
+        // Who speaks most in each part, and for most of it.
+        auto main = [&](double from, double to) {
+            std::map<int, double> time;
+            for (const auto& turn : turns) time[turn.speaker] += std::max(0.0, std::min(to, turn.end) - std::max(from, turn.start));
+            auto best = std::max_element(time.begin(), time.end(), [](auto& x, auto& y) { return x.second < y.second; });
+            return best == time.end() || best->second < 0.5 * (to - from) ? -1 : best->first;
+        };
+        QCOMPARE(main(0, 11), 0);
+        QCOMPARE(main(bStart, bStart + 8), 1);
+        QCOMPARE(main(aAgain, aAgain + 6), 0);
+        int people = 0;
+        for (const auto& turn : turns) people = std::max(people, turn.speaker + 1);
+        QCOMPARE(people, 2);
+        // Told there is one speaker, it finds one.
+        DiarizeOptions one;
+        one.speakers = 1;
+        QVERIFY(diarize(mix, one, turns, {}, nullptr, &err));
+        for (const auto& turn : turns) QCOMPARE(turn.speaker, 0);
+    }
+
     void transcribesSpeech() {
         // Needs a whisper model: $MONTAGE_TEST_WHISPER_MODEL (CI downloads tiny.en).
         const QByteArray model = qgetenv("MONTAGE_TEST_WHISPER_MODEL");
@@ -632,6 +743,16 @@ private slots:
         QVERIFY(!hits.empty());
         QVERIFY(hits[0].first > 3 && hits[0].second < 11);
         QVERIFY(!transcriptCues(t).empty());
+
+        // With speaker labels: one voice throughout.
+        if (diarizerAvailable() && speakerModel().installed()) {
+            TranscribeOptions withSpeakers = opts;
+            withSpeakers.speakers = true;
+            Transcript labelled;
+            QVERIFY2(transcribeMedia(jfk, withSpeakers, labelled, {}, nullptr, &err), err.c_str());
+            QCOMPARE(labelled.text(), t.text());
+            for (const auto& s : labelled.segments) QCOMPARE(s.speaker, 0);
+        }
 
         // Cancelling stops it.
         std::atomic<bool> cancel{true};
@@ -743,7 +864,7 @@ private slots:
 
     void objectMasksFollowAnObject() {
         if (!segmenterAvailable()) QSKIP("Built without ONNX Runtime");
-        if (!segmenterModelInstalled())
+        if (!objectModel().installed())
             QSKIP("Set MONTAGE_OBJECT_MODEL to a folder with the EdgeTAM model files to run this test");
         const int frames = 16;
         const std::string video = path("ball.mp4");

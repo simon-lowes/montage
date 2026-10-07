@@ -168,7 +168,7 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
     - 256² logits quantised to 1/8, deflated to a few kB a frame;
     - kept in the project and shared between undo snapshots.
   - Rendering: the logits are resampled to the frame, with the edge placed to a fraction of a pixel from the logit field. An exact distance transform (Felzenszwalb–Huttenlocher) makes expansion and feather behave as for the ellipse and rectangle; invert, opacity and Show Mask work too.
-  - `montage-cli models` reports the object model and the ONNX Runtime version. `scripts/fetch-object-model.sh` fetches it for CI or offline installs.
+  - `montage-cli models` reports the object model and the ONNX Runtime version. `scripts/fetch-models.sh` fetches it for CI or offline installs.
   - Tested:
     - with the model (Linux CI, and the macOS and Windows package runs): a click picks a moving ball out of textured footage, then forward and backward tracking at IoU > 0.95 on every frame, the rendered matte, an error without a click, and cancel;
     - in the app: click, Alt-click, Ctrl-click, box, undo/redo of a click with its segmentation, Track ▶, the inverted render, and save/reopen;

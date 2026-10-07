@@ -35,6 +35,8 @@ struct TranscribeOptions {
     std::string language = "auto";   // ISO 639-1 code or "auto"
     bool translate = false;          // translate to English
     int threads = 0;                 // 0 = automatic
+    bool speakers = false;           // also tell the speakers apart (media/Diarizer.h)
+    int speakerCount = 0;            // how many speak, 0 = find out
 };
 
 using TranscribeProgress = std::function<void(double fraction)>;
@@ -44,7 +46,8 @@ bool transcribeSamples(const std::vector<float>& mono16k, const TranscribeOption
                        const TranscribeProgress& progress = {}, const std::atomic<bool>* cancel = nullptr,
                        std::string* error = nullptr);
 
-// Decodes a media file's audio and transcribes it (media time).
+// Decodes a media file's audio and transcribes it (media time), labelling
+// speakers when asked.
 bool transcribeMedia(const std::string& path, const TranscribeOptions& options, Transcript& out,
                      const TranscribeProgress& progress = {}, const std::atomic<bool>* cancel = nullptr,
                      std::string* error = nullptr);

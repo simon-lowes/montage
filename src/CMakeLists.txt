@@ -20,7 +20,9 @@ add_library(montage_engine STATIC
   media/AudioSync.h media/AudioSync.cpp
   media/SpeakerSwitch.h media/SpeakerSwitch.cpp
   media/Tracking.h media/Tracking.cpp
+  media/ModelFiles.h media/ModelFiles.cpp
   media/Segmenter.h media/Segmenter.cpp
+  media/Diarizer.h media/Diarizer.cpp
   render/Processing.h render/Processing.cpp
   render/Retime.h render/Retime.cpp
   render/ClipAnalysis.h render/ClipAnalysis.cpp
@@ -134,6 +136,13 @@ if(MONTAGE_WITH_ONNXRUNTIME)
   if(MONTAGE_ORT_TARGET)
     target_link_libraries(montage_engine PRIVATE ${MONTAGE_ORT_TARGET})
     target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_ONNXRUNTIME)
+    if(WIN32)
+      find_file(MONTAGE_ORT_DLL_PATH NAMES onnxruntime.dll libonnxruntime.dll
+        HINTS ${ONNXRUNTIME_ROOT}/lib ${ONNXRUNTIME_ROOT}/bin ${ORT_PREFIX}/bin ${onnxruntime_DIR}/../../../bin
+        PATH_SUFFIXES bin NO_CACHE)
+      set(MONTAGE_ORT_DLL "${MONTAGE_ORT_DLL_PATH}" CACHE INTERNAL "ONNX Runtime DLL copied beside the programs")
+      message(STATUS "ONNX Runtime DLL: ${MONTAGE_ORT_DLL}")
+    endif()
   elseif(MONTAGE_REQUIRE_ONNXRUNTIME)
     message(FATAL_ERROR "ONNX Runtime not found (set ONNXRUNTIME_ROOT)")
   else()
@@ -154,6 +163,7 @@ endif()
 
 add_executable(montage-cli cli/main.cpp)
 target_link_libraries(montage-cli PRIVATE montage_engine)
+montage_copy_runtime(montage-cli)
 set_target_properties(montage-cli PROPERTIES AUTOMOC OFF)
 install(TARGETS montage-cli RUNTIME DESTINATION bin)
 
@@ -165,6 +175,7 @@ endif()
 # Built next to the editor so the app finds it beside itself.
 add_executable(montage-plugin-probe tools/plugin_probe.cpp)
 target_link_libraries(montage-plugin-probe PRIVATE montage_engine)
+montage_copy_runtime(montage-plugin-probe)
 set_target_properties(montage-plugin-probe PROPERTIES AUTOMOC OFF
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/app)
 install(TARGETS montage-plugin-probe RUNTIME DESTINATION bin)

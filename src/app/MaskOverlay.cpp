@@ -11,7 +11,7 @@
 
 #include "EditorState.h"
 #include "MonitorPanel.h"
-#include "ObjectModel.h"
+#include "ModelPacks.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
 #include "render/ClipAnalysis.h"
