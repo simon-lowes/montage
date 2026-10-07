@@ -1,6 +1,7 @@
 #include "MainWindow.h"
 
 #include <QAction>
+#include <QCheckBox>
 #include <QActionGroup>
 #include <QApplication>
 #include <QCloseEvent>
@@ -13,10 +14,12 @@
 #include <QHeaderView>
 #include <QInputDialog>
 #include <QLabel>
+#include <QLocale>
 #include <QFutureWatcher>
 #include <QMenuBar>
 #include <QPointer>
 #include <QProgressDialog>
+#include <QPushButton>
 #include <QtConcurrent>
 #include <QMessageBox>
 #include <QScreen>
@@ -70,7 +73,17 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     buildPanels();
     buildActions();
     buildMenus();
-    scanPluginsInBackground();
+
+    // Crash safety: find sessions that did not exit cleanly before starting ours.
+    recovery_ = new RecoveryManager(state_, QString(), this);
+    const auto crashed = recovery_->crashedSessions();
+    recovery_->beginSession();
+    if (!crashed.empty() && !qEnvironmentVariableIsSet("MONTAGE_NO_RECOVERY_PROMPT")) {
+        // Ask after the window is up; the plugin scan waits for the safe-mode answer.
+        QTimer::singleShot(0, this, [this, crashed] { offerRecovery(crashed); });
+    } else {
+        scanPluginsInBackground();
+    }
 
     syncTimer_.setSingleShot(true);
     syncTimer_.setInterval(0);
@@ -115,10 +128,6 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     });
     connect(sourcePanel_, &MonitorPanel::activated, this, [this] { active_ = Monitor::Source; });
     connect(programPanel_, &MonitorPanel::activated, this, [this] { active_ = Monitor::Program; });
-
-    autosave_.setInterval(120000);
-    connect(&autosave_, &QTimer::timeout, state_, &EditorState::autosave);
-    autosave_.start();
 
     statusInfo_ = new QLabel(this);
     statusInfo_->setStyleSheet(QString("color: %1; padding-right: 8px;").arg(theme::kTextDim.name()));
@@ -256,6 +265,7 @@ void MainWindow::buildMenus() {
     rebuildRecentMenu();
     add(file, tr("&Save"), QKeySequence::Save, [this] { save(); });
     add(file, tr("Save &As…"), QKeySequence("Ctrl+Shift+S"), [this] { saveAs(); });
+    add(file, tr("Open Auto-Save S&napshot…"), QKeySequence(), [this] { openSnapshot(); });
     file->addSeparator();
     add(file, tr("&Import Media…"), QKeySequence("Ctrl+I"), [this] { bin_->importDialog(); });
     add(file, tr("&Export Media…"), QKeySequence("Ctrl+M"), [this] { exportMedia(); });
@@ -610,16 +620,6 @@ bool MainWindow::openProject(const QString& path) {
     }
     addRecent(path);
     appSettings().setValue("lastProjectDir", QFileInfo(path).absolutePath());
-    // Offer to restore a newer autosave.
-    QFileInfo autosave(path + ".autosave");
-    if (autosave.exists() && autosave.lastModified() > QFileInfo(path).lastModified()) {
-        if (QMessageBox::question(this, tr("Autosave"), tr("A newer autosave of this project exists. Restore it?")) == QMessageBox::Yes) {
-            if (state_->open(autosave.absoluteFilePath(), &err)) {
-                // Keep the real path so saving writes the project, not the autosave.
-                state_->save(path);
-            }
-        }
-    }
     timeline_->zoomToFit();
     statusBar()->showMessage(tr("Opened %1").arg(path), 4000);
     return true;
@@ -702,6 +702,7 @@ void MainWindow::closeEvent(QCloseEvent* e) {
     }
     program_->pause();
     source_->pause();
+    recovery_->endSession();  // a clean exit: nothing to recover next time
     QSettings s = appSettings();
     s.setValue("window/geometry", saveGeometry());
     s.setValue("window/state", saveState(1));
@@ -1139,6 +1140,71 @@ void MainWindow::newSequence() {
             s.sampleRate = rate;
             return true;
         });
+}
+
+void MainWindow::offerRecovery(const std::vector<RecoveryManager::Session>& crashed) {
+    const bool pluginsUsed = std::any_of(crashed.begin(), crashed.end(), [](const auto& s) { return s.pluginsUsed; });
+    auto unsaved = std::find_if(crashed.begin(), crashed.end(), [](const auto& s) { return !s.recoveryFile.isEmpty(); });
+    bool safeMode = false;
+    if (unsaved != crashed.end()) {
+        QMessageBox box(QMessageBox::Warning, tr("Recover Unsaved Work"),
+                        tr("Montage closed unexpectedly. Unsaved changes to “%1” from %2 can be recovered.")
+                            .arg(unsaved->projectName.isEmpty() ? tr("Untitled") : unsaved->projectName,
+                                 QLocale().toString(unsaved->lastSave.toLocalTime(), QLocale::ShortFormat)),
+                        QMessageBox::NoButton, this);
+        QPushButton* recover = box.addButton(tr("Recover"), QMessageBox::AcceptRole);
+        box.addButton(tr("Discard"), QMessageBox::DestructiveRole);
+        box.setDefaultButton(recover);
+        auto* safe = new QCheckBox(tr("Start with audio plugins disabled (safe mode)"), &box);
+        safe->setChecked(pluginsUsed);
+        safe->setVisible(pluginsUsed);
+        box.setCheckBox(safe);
+        box.exec();
+        safeMode = pluginsUsed && safe->isChecked();
+        if (box.clickedButton() == recover) {
+            QString err;
+            if (recovery_->recover(*unsaved, &err)) {
+                timeline_->zoomToFit();
+                statusBar()->showMessage(tr("Recovered unsaved changes; save to keep them"), 8000);
+            } else {
+                QMessageBox::warning(this, tr("Recover Unsaved Work"), err);
+            }
+        } else {
+            recovery_->discard(*unsaved);
+        }
+    } else if (pluginsUsed) {
+        safeMode = QMessageBox::question(this, tr("Safe Mode"),
+                                         tr("Montage closed unexpectedly while audio plugins were in use. Start with "
+                                            "audio plugins disabled for this session (safe mode)?")) == QMessageBox::Yes;
+    }
+    // Sessions without unsaved work have been reported; forget them.
+    for (const auto& s : crashed)
+        if (s.recoveryFile.isEmpty()) recovery_->discard(s);
+    if (safeMode) {
+        plugins::Registry::instance().setEnabled(false);
+        effects_->reload();
+        statusBar()->showMessage(tr("Safe mode: audio plugins are disabled until Montage is restarted"), 10000);
+    } else {
+        scanPluginsInBackground();
+    }
+}
+
+void MainWindow::openSnapshot() {
+    if (!maybeSave()) return;
+    const QString name = state_->filePath().isEmpty() ? QString::fromStdString(state_->project().name)
+                                                       : QFileInfo(state_->filePath()).completeBaseName();
+    QString dir = recovery_->snapshotDir(name.isEmpty() ? tr("Untitled") : name);
+    if (!QFileInfo::exists(dir)) dir = recovery_->baseDir() + "/snapshots";
+    const QString path = QFileDialog::getOpenFileName(this, tr("Open Auto-Save Snapshot"), dir, tr("Montage projects (*.montage)"));
+    if (path.isEmpty()) return;
+    QString err;
+    // Opened as an untitled copy so saving never overwrites the snapshot.
+    if (!state_->recover(path, QString(), &err)) {
+        QMessageBox::warning(this, tr("Open Auto-Save Snapshot"), err);
+        return;
+    }
+    timeline_->zoomToFit();
+    statusBar()->showMessage(tr("Opened snapshot %1 as an untitled project").arg(QFileInfo(path).fileName()), 6000);
 }
 
 void MainWindow::scanPluginsInBackground() {

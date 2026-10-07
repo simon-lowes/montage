@@ -56,7 +56,7 @@ verified run.
 
 Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effort; S ≤ 2, M 2–6, L 6–12, XL > 12 person-weeks). Each item lands with tests and keeps CI and the Package workflow green.
 
-- [ ] 1. Crash-safe project history and recovery (S)
+- [x] 1. Crash-safe project history and recovery (S): live recovery copy after each edit, crash detection via session locks, recovery dialog that keeps the project path, plugin safe mode, rolling timestamped snapshots.
 - [ ] 2. Hardware decode and encode (M)
 - [ ] 3. Audio plugin manager UI (S). Done: Audio Plugins window (status, blocklist with reasons, rescan, retry blocked), background scan at startup. To do: enable switches, rescan selected, search folders, scan log, parallel scan.
 - [ ] 4. Transcription engine: whisper.cpp + speaker labels (M)

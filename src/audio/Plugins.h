@@ -69,6 +69,8 @@ public:
 };
 
 std::unique_ptr<Instance> instantiate(const Descriptor& d, std::string* error = nullptr);
+// Plugins loaded by this process so far (crash reports note whether plugins were in use).
+int instancesCreated();
 
 // Standard folders for a format on this OS, after the format's environment
 // variable (CLAP_PATH, VST3_PATH, LV2_PATH) if set.
@@ -120,6 +122,10 @@ public:
     ScanReport scan(bool rescanBlocked = false,
                     const std::function<void(int done, int total, const std::string& path)>& progress = {});
 
+    // Safe mode: while disabled, no plugin is listed or found (effects pass audio through).
+    void setEnabled(bool on);
+    bool enabled() const;
+
     std::vector<Descriptor> plugins() const;
     std::optional<Descriptor> find(const std::string& id) const;
     std::vector<Blocked> blocklist() const;
@@ -139,6 +145,7 @@ private:
     std::vector<std::string> searchPaths_[4];
     bool customPaths_[4] = {false, false, false, false};
     mutable bool loaded_ = false;
+    bool enabled_ = true;
     mutable std::vector<Entry> entries_;
 };
 

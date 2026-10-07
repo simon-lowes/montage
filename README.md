@@ -38,6 +38,8 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Track faders, pan, mute and solo in a mixer panel
 - Peak meters with hold and clip indicators
 - Effects: 3-band EQ, compressor, limiter, high/low-pass, delay
+- Third-party audio plugins: VST3 and CLAP plugins run as clip effects. Their parameters are keyframeable and their settings are saved in the project. The Effects browser lists them by vendor, and Tools › Audio Plugins shows every plugin found and its status. LV2 and Audio Unit plugins are listed; hosting them is on the roadmap.
+- Plugin scanning works like a DAW's: new or changed plugins load in a separate helper process, so one that crashes or hangs is blocked instead of taking Montage down. Results are cached, so later launches are quick.
 - Crossfades: equal power or constant gain
 - Loudness normalisation to -14, -16, -23 or -24 LUFS (ITU-R BS.1770 / EBU R128 gated measurement)
 - Waveforms on the timeline
@@ -51,7 +53,11 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Export presets: H.264 (x264), H.265 (x265, 8- and 10-bit), Apple ProRes 422 HQ/LT/4444 (with alpha), Avid DNxHR, VP9, AV1 (SVT-AV1), WAV and AAC; exports either the whole sequence or In–Out
 - Still frame export
 - Interchange: CMX 3600 EDL and OpenTimelineIO (`.otio`) export, for finishing in Resolve, Premiere, Avid or Nuke
-- Project files are readable JSON (`.montage`). They relink moved media through relative paths and autosave every 2 minutes.
+- Project files are readable JSON (`.montage`) and relink moved media through relative paths
+- Crash safety:
+  - Unsaved work is saved to a recovery copy about a second after each edit. After a crash or forced quit, the next launch offers to recover it.
+  - If audio plugins were in use, it offers to start in safe mode with plugins disabled.
+  - Every five minutes of editing, a timestamped snapshot is kept, the newest 20 per project (File › Open Auto-Save Snapshot).
 - `montage-cli` for headless rendering and automation
 
 ## Installing

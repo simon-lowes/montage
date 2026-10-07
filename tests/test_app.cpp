@@ -16,6 +16,7 @@
 #include "audio/Plugins.h"
 #include "MainWindow.h"
 #include "PlaybackController.h"
+#include "Recovery.h"
 #include "TimelineWidget.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
@@ -366,6 +367,75 @@ private slots:
         state()->undo();
         c = edit::clipById(*state()->sequence(), clip);
         QCOMPARE(c->effects[0].p("param.7", 0), 1.0);
+        state()->newProject();
+    }
+
+    void crashRecoveryAndSnapshots() {
+        QTemporaryDir rdir;
+        QVERIFY(rdir.isValid());
+        loadDemo();
+        const QString projectPath = state()->filePath();
+        Id red = clipNamed(*state()->sequence(), "Red")->id;
+        {
+            RecoveryManager rm(state(), rdir.path());
+            QVERIFY(rm.crashedSessions().empty());
+            rm.setSnapshotInterval(0);
+            rm.beginSession();
+            state()->edit("Rename", [red](Project&, Sequence& s) {
+                edit::clipById(s, red)->name = "Recovered";
+                return true;
+            });
+            rm.saveNow();
+            QCOMPARE(rm.snapshots("demo").size(), 1);
+            rm.abandonSession();  // the process "crashes"
+        }
+        state()->newProject();  // the edit is gone from the editor
+
+        RecoveryManager rm2(state(), rdir.path());
+        auto crashed = rm2.crashedSessions();
+        QCOMPARE(crashed.size(), size_t(1));
+        QCOMPARE(crashed[0].projectPath, projectPath);
+        QCOMPARE(crashed[0].projectName, QString("demo"));
+        QVERIFY(!crashed[0].recoveryFile.isEmpty());
+        QVERIFY(rm2.recover(crashed[0]));
+        QCOMPARE(state()->filePath(), projectPath);  // saving writes the real project
+        QVERIFY(state()->isModified());
+        QVERIFY(clipNamed(*state()->sequence(), "Recovered"));
+        QVERIFY(rm2.crashedSessions().empty());
+
+        // A running session is never reported as crashed; a clean exit leaves nothing.
+        rm2.beginSession();
+        {
+            RecoveryManager other(state(), rdir.path());
+            QVERIFY(other.crashedSessions().empty());
+        }
+        rm2.endSession();
+        QVERIFY(QDir(rdir.path() + "/sessions").entryList(QDir::Dirs | QDir::NoDotAndDotDot).isEmpty());
+
+        // Snapshots keep the newest N.
+        const QString snaps = rm2.snapshotDir("demo");
+        for (int i = 1; i <= 5; ++i) {
+            QFile f(snaps + QString("/demo 2020-01-0%1 10-00-00.montage").arg(i));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+        }
+        rm2.setMaxSnapshots(3);
+        rm2.setSnapshotInterval(0);
+        rm2.beginSession();
+        state()->edit("Rename", [red](Project&, Sequence& s) {
+            edit::clipById(s, red)->name = "Again";
+            return true;
+        });
+        rm2.saveNow();
+        const QStringList kept = rm2.snapshots("demo");
+        QCOMPARE(kept.size(), 3);
+        QVERIFY(!kept[0].contains("2020"));  // today's snapshot is the newest
+        rm2.endSession();
+
+        // Safe mode hides plugins.
+        plugins::Registry::instance().setEnabled(false);
+        QVERIFY(!plugins::Registry::instance().find("clap:org.montage.test.gain").has_value());
+        QVERIFY(plugins::Registry::instance().plugins().empty());
+        plugins::Registry::instance().setEnabled(true);
         state()->newProject();
     }
 

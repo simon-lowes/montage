@@ -471,17 +471,12 @@ void EditorState::newProject() {
     emit fileStateChanged();
 }
 
-void EditorState::autosave() {
-    if (!isModified()) return;
-    QString target;
-    if (!path_.isEmpty()) {
-        target = path_ + ".autosave";
-    } else {
-        QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
-        QDir().mkpath(dir);
-        target = dir + "/untitled.montage.autosave";
-    }
-    saveProject(project_, target.toStdString());
+bool EditorState::recover(const QString& copy, const QString& originalPath, QString* error) {
+    if (!open(copy, error)) return false;
+    path_ = originalPath;
+    savedRevision_ = ~uint64_t(0);  // never equal to a real revision: unsaved until saved
+    emit fileStateChanged();
+    return true;
 }
 
 }  // namespace montage

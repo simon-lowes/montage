@@ -107,8 +107,9 @@ public:
     bool save(const QString& path, QString* error = nullptr);
     bool open(const QString& path, QString* error = nullptr);
     void newProject();
-    // Writes an autosave copy next to the project (or in the app data dir).
-    void autosave();
+    // Opens a recovered copy as if it were `originalPath` (empty = untitled),
+    // marked modified so the user decides whether to save it.
+    bool recover(const QString& copy, const QString& originalPath, QString* error = nullptr);
 
     // Emits projectChanged() after a direct mutation of mutableProject().
     void notifyChanged() { emit projectChanged(); }

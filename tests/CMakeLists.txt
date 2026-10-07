@@ -15,7 +15,7 @@ if(MONTAGE_BUILD_APP)
   target_link_libraries(test_app PRIVATE montage_ui Qt6::Test)
   set_target_properties(test_app PROPERTIES AUTOMOC ON)
   add_test(NAME test_app COMMAND test_app)
-  set_tests_properties(test_app PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;MONTAGE_NO_PLUGIN_SCAN=1" TIMEOUT 300)
+  set_tests_properties(test_app PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;MONTAGE_NO_PLUGIN_SCAN=1;MONTAGE_NO_RECOVERY_PROMPT=1;MONTAGE_RECOVERY_DIR=${CMAKE_CURRENT_BINARY_DIR}/recovery-test" TIMEOUT 300)
   add_dependencies(test_app montage_test_plugins montage-plugin-probe)
   target_compile_definitions(test_app PRIVATE
     MONTAGE_TEST_CLAP_DIR="${CMAKE_CURRENT_BINARY_DIR}/clap"

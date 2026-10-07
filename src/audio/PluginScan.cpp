@@ -12,6 +12,7 @@
 #include <QSaveFile>
 #include <QStandardPaths>
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <map>
 #include <utility>
@@ -352,16 +353,25 @@ std::vector<Descriptor> probeInProcess(Format f, const std::string& path, std::s
     return {};
 }
 
+namespace {
+std::atomic<int> gInstancesCreated{0};
+}
+
+int instancesCreated() { return gInstancesCreated.load(); }
+
 std::unique_ptr<Instance> instantiate(const Descriptor& d, std::string* error) {
+    std::unique_ptr<Instance> inst;
     switch (d.format) {
-        case Format::Clap: return instantiateClap(d, error);
+        case Format::Clap: inst = instantiateClap(d, error); break;
 #ifdef MONTAGE_WITH_VST3
-        case Format::Vst3: return instantiateVst3(d, error);
+        case Format::Vst3: inst = instantiateVst3(d, error); break;
 #endif
-        default: break;
+        default:
+            if (error) *error = std::string(formatName(d.format)) + " plugins cannot be run by this version yet";
+            break;
     }
-    if (error) *error = std::string(formatName(d.format)) + " plugins cannot be run by this version yet";
-    return nullptr;
+    if (inst) ++gInstancesCreated;
+    return inst;
 }
 
 // ---------------------------------------------------------------------------
@@ -633,8 +643,19 @@ ScanReport Registry::scan(bool rescanBlocked, const std::function<void(int, int,
     return report;
 }
 
+void Registry::setEnabled(bool on) {
+    std::lock_guard lock(m_);
+    enabled_ = on;
+}
+
+bool Registry::enabled() const {
+    std::lock_guard lock(m_);
+    return enabled_;
+}
+
 std::vector<Descriptor> Registry::plugins() const {
     std::lock_guard lock(m_);
+    if (!enabled_) return {};
     loadCacheLocked();
     std::vector<Descriptor> out;
     for (const Entry& e : entries_)
@@ -647,6 +668,7 @@ std::vector<Descriptor> Registry::plugins() const {
 
 std::optional<Descriptor> Registry::find(const std::string& id) const {
     std::lock_guard lock(m_);
+    if (!enabled_) return std::nullopt;
     loadCacheLocked();
     for (const Entry& e : entries_)
         if (!e.blocked)

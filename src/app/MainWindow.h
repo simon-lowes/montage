@@ -6,6 +6,7 @@
 #include <QTimer>
 #include <vector>
 
+#include "Recovery.h"
 #include "TimelineWidget.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
@@ -89,6 +90,8 @@ private:
     void openInSource(Id media);
     void applyFromBrowser(const QString& type, EffectCategory category);
     void scanPluginsInBackground();
+    void offerRecovery(const std::vector<RecoveryManager::Session>& crashed);
+    void openSnapshot();
     void showShortcuts();
     void about();
 
@@ -119,7 +122,7 @@ private:
     Monitor active_ = Monitor::Program;
     std::vector<edit::ClipboardItem> clipboard_;
     Id sourceSequence_ = 0;
-    QTimer autosave_;
+    RecoveryManager* recovery_ = nullptr;
     QTimer syncTimer_;
 
     // Actions that change enabled state.
