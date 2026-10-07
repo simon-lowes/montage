@@ -154,6 +154,17 @@ private slots:
         QCOMPARE(QString::fromStdString((*ld)[0].pluginId), QString("urn:fake:comp"));
         QCOMPARE(QString::fromStdString((*ld)[0].category), QString("Dynamics"));
         QCOMPARE(findPluginFiles(Format::Lv2, {dir_.path().toStdString()}).size(), size_t(1));
+
+#ifdef __APPLE__
+        // Audio Units are listed from the system registry; macOS ships Apple's effects.
+        auto au = readStaticMetadata(Format::AudioUnit, "AudioUnit");
+        QVERIFY(au.has_value() && !au->empty());
+        bool apple = false;
+        for (const Descriptor& d : *au) apple |= d.vendor == "Apple" && !d.name.empty();
+        QVERIFY(apple);
+        QCOMPARE(findPluginFiles(Format::AudioUnit, defaultSearchPaths(Format::AudioUnit)).size(), size_t(1));
+        QVERIFY(findPluginFiles(Format::AudioUnit, {"/nonexistent"}).empty());
+#endif
     }
 
     void scanProbesNewFilesAndCachesThem() {

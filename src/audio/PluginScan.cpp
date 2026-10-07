@@ -296,8 +296,10 @@ std::vector<std::string> defaultSearchPaths(Format f) {
 std::vector<std::string> findPluginFiles(Format f, const std::vector<std::string>& dirs) {
     std::vector<std::string> out;
     if (f == Format::AudioUnit) {
+        // Audio Units come from the system registry, enabled by the "AudioUnit"
+        // entry of the default search list.
 #ifdef __APPLE__
-        if (!dirs.empty()) out.push_back("AudioUnit");
+        if (std::find(dirs.begin(), dirs.end(), "AudioUnit") != dirs.end()) out.push_back("AudioUnit");
 #endif
         return out;
     }
