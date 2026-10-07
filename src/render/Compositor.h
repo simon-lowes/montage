@@ -17,6 +17,7 @@ struct RenderOptions {
     bool useProxies = false;
     int depth = 0;             // nesting depth (internal)
     bool captions = false;     // draw the visible caption track over the program
+    std::string displaySpace;  // program frames converted to this space (ColorSpace.h id) for viewing; "" = as is
 };
 
 // Composites all video tracks of `seq` at timeline frame `t`.
@@ -38,7 +39,9 @@ bool sequenceToClipFrame(const Project& p, const Sequence& seq, const Clip& c, F
 bool clipFrameSize(const Project& p, const Sequence& seq, const Clip& c, double& w, double& h);
 
 // Draws the caption on screen at frame t from `track` over `img` (the whole frame).
-void drawCaption(Image& img, const CaptionTrack& track, FrameTime t);
+// Captions are styled in SDR; `space` converts them into the picture's colour space.
+struct ColorSpace;
+void drawCaption(Image& img, const CaptionTrack& track, FrameTime t, const ColorSpace* space = nullptr);
 
 // Raw (unprocessed) frame of a media item at `seconds`, fitted into w x h; for the source monitor.
 Image renderMediaFrame(const Project& p, const MediaItem& m, double seconds, int w, int h);

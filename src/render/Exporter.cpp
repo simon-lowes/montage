@@ -5,7 +5,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 
+#include "ColorSpace.h"
 #include "Compositor.h"
 #include "core/EditOps.h"
 #include "Processing.h"
@@ -15,6 +17,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/mastering_display_metadata.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
@@ -65,6 +68,54 @@ AVPixelFormat defaultPixFmt(const ExportSettings& s, const std::string& c) {
     if (c == "libvpx-vp9" && s.alpha) return AV_PIX_FMT_YUVA420P;
     if (c == "png") return AV_PIX_FMT_RGBA;
     return AV_PIX_FMT_YUV420P;
+}
+
+struct ColorTags {
+    AVColorPrimaries primaries = AVCOL_PRI_BT709;
+    AVColorTransferCharacteristic trc = AVCOL_TRC_BT709;
+    AVColorSpace matrix = AVCOL_SPC_BT709;
+};
+ColorTags colorTags(const ColorSpace& c) {
+    ColorTags t;
+    if (c.primaries == Primaries::Bt2020) {
+        t.primaries = AVCOL_PRI_BT2020;
+        t.matrix = AVCOL_SPC_BT2020_NCL;
+        t.trc = AVCOL_TRC_BT2020_10;
+    } else if (c.primaries == Primaries::P3D65) {
+        t.primaries = AVCOL_PRI_SMPTE432;
+    }
+    if (c.transfer == Transfer::Pq) t.trc = AVCOL_TRC_SMPTE2084;
+    else if (c.transfer == Transfer::Hlg) t.trc = AVCOL_TRC_ARIB_STD_B67;
+    else if (c.transfer == Transfer::Srgb) t.trc = AVCOL_TRC_IEC61966_2_1;
+    return t;
+}
+
+// The encoder's pixel formats, or nullptr if it does not say.
+const AVPixelFormat* supportedPixFmts(const AVCodecContext* ctx, const AVCodec* codec) {
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(61, 13, 100)
+    const void* cfg = nullptr;
+    if (avcodec_get_supported_config(ctx, codec, AV_CODEC_CONFIG_PIX_FORMAT, 0, &cfg, nullptr) >= 0)
+        return static_cast<const AVPixelFormat*>(cfg);
+    return nullptr;
+#else
+    (void)ctx;
+    return codec->pix_fmts;
+#endif
+}
+
+// HDR wants at least 10 bits: the encoder's 10-bit counterpart of `f`, if it has one.
+AVPixelFormat tenBitFormat(AVPixelFormat f, const AVCodecContext* ctx, const AVCodec* codec) {
+    const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(f);
+    if (!d || d->comp[0].depth >= 10) return f;
+    const AVPixelFormat* fmts = supportedPixFmts(ctx, codec);
+    if (!fmts) return f;
+    const bool chroma422 = d->log2_chroma_h == 0 && d->log2_chroma_w == 1;
+    const AVPixelFormat wanted[] = {chroma422 ? AV_PIX_FMT_YUV422P10LE : AV_PIX_FMT_YUV420P10LE, AV_PIX_FMT_P010LE,
+                                    AV_PIX_FMT_YUV420P10LE};
+    for (AVPixelFormat w : wanted)
+        for (const AVPixelFormat* p = fmts; *p != AV_PIX_FMT_NONE; ++p)
+            if (*p == w) return w;
+    return f;
 }
 
 // ISO 639-2 code for a caption track's ISO 639-1 language (MP4 and MKV store three letters).
@@ -201,6 +252,12 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     H += H & 1;
     const int sr = s.sampleRate > 0 ? s.sampleRate : seq.sampleRate;
 
+    const ColorSpace& seqSpace = sequenceColorSpace(seq);
+    const ColorSpace* chosen = findColorSpace(s.colorSpace);
+    const ColorSpace& outSpace = chosen && !chosen->sceneReferred ? *chosen : seqSpace;
+    const bool pq = outSpace.transfer == Transfer::Pq;
+    const double peakNits = std::clamp(seq.hdrPeakNits, 100.0, 10000.0);
+    const int maxFall = int(std::lround(std::min(peakNits, 400.0)));
     if (wantVideo) {
         std::string c = s.videoCodec;
         const bool hardware = c == "hw_h264" || c == "hw_hevc";
@@ -220,11 +277,13 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         o.vctx->framerate = fps;
         o.vctx->sample_aspect_ratio = AVRational{1, 1};
         o.vctx->pix_fmt = defaultPixFmt(s, c);
+        if (outSpace.hdr() && s.pixFmt.empty()) o.vctx->pix_fmt = tenBitFormat(o.vctx->pix_fmt, o.vctx, codec);
         o.vctx->gop_size = s.gop > 0 ? s.gop : std::max(1, int(std::lround(seq.fpsValue() * 2)));
         if (s.gop == 1) o.vctx->max_b_frames = 0;
-        o.vctx->color_primaries = AVCOL_PRI_BT709;
-        o.vctx->color_trc = AVCOL_TRC_BT709;
-        o.vctx->colorspace = AVCOL_SPC_BT709;
+        const ColorTags tags = colorTags(outSpace);
+        o.vctx->color_primaries = tags.primaries;
+        o.vctx->color_trc = tags.trc;
+        o.vctx->colorspace = tags.matrix;
         o.vctx->color_range = c == "mjpeg" ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
         o.vctx->thread_count = 0;
         if (s.videoBitrate > 0) o.vctx->bit_rate = s.videoBitrate;
@@ -250,7 +309,17 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             if (s.videoBitrate <= 0) av_dict_set_int(&opts, "crf", s.crf, 0);
             if (!s.preset.empty()) av_dict_set(&opts, "preset", s.preset.c_str(), 0);
             if (c == "libx265") {
-                av_dict_set(&opts, "x265-params", "log-level=error", 0);
+                std::string params = "log-level=error";
+                if (pq) {
+                    // HDR10: mastering display (P3-D65 at the sequence's peak) and light levels.
+                    char buf[256];
+                    std::snprintf(buf, sizeof buf,
+                                  ":hdr10=1:repeat-headers=1:master-display=G(13250,34500)B(7500,3000)R(34000,16000)"
+                                  "WP(15635,16450)L(%lld,1):max-cll=%d,%d",
+                                  static_cast<long long>(std::llround(peakNits * 10000)), int(std::lround(peakNits)), maxFall);
+                    params += buf;
+                }
+                av_dict_set(&opts, "x265-params", params.c_str(), 0);
                 o.vctx->codec_tag = MKTAG('h', 'v', 'c', '1');  // plays in QuickTime / Apple devices
             }
         } else if (c == "prores_ks") {
@@ -285,7 +354,33 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         o.vframe->height = H;
         o.vframe->color_range = o.vctx->color_range;
         o.vframe->colorspace = o.vctx->colorspace;
+        o.vframe->color_primaries = o.vctx->color_primaries;
+        o.vframe->color_trc = o.vctx->color_trc;
         if ((rc = av_frame_get_buffer(o.vframe, 0)) < 0) return fail("Out of memory");
+        if (pq) {
+            // The same HDR10 metadata on the stream (MP4/MOV mdcv and clli boxes, MKV
+            // colour elements) and on every frame (for encoders that read it there).
+            AVMasteringDisplayMetadata md{};
+            const double prim[3][2] = {{0.680, 0.320}, {0.265, 0.690}, {0.150, 0.060}};  // R, G, B
+            for (int i = 0; i < 3; ++i)
+                for (int j = 0; j < 2; ++j) md.display_primaries[i][j] = av_make_q(int(std::lround(prim[i][j] * 50000)), 50000);
+            md.white_point[0] = av_make_q(15635, 50000);
+            md.white_point[1] = av_make_q(16450, 50000);
+            md.max_luminance = av_make_q(int(std::lround(peakNits)), 1);
+            md.min_luminance = av_make_q(1, 10000);
+            md.has_primaries = md.has_luminance = 1;
+            AVContentLightMetadata cl{};
+            cl.MaxCLL = unsigned(std::lround(peakNits));
+            cl.MaxFALL = unsigned(maxFall);
+            if (AVPacketSideData* sd = av_packet_side_data_new(&o.vst->codecpar->coded_side_data, &o.vst->codecpar->nb_coded_side_data,
+                                                               AV_PKT_DATA_MASTERING_DISPLAY_METADATA, sizeof md, 0))
+                std::memcpy(sd->data, &md, sizeof md);
+            if (AVPacketSideData* sd = av_packet_side_data_new(&o.vst->codecpar->coded_side_data, &o.vst->codecpar->nb_coded_side_data,
+                                                               AV_PKT_DATA_CONTENT_LIGHT_LEVEL, sizeof cl, 0))
+                std::memcpy(sd->data, &cl, sizeof cl);
+            if (AVMasteringDisplayMetadata* f = av_mastering_display_metadata_create_side_data(o.vframe)) *f = md;
+            if (AVContentLightMetadata* f = av_content_light_metadata_create_side_data(o.vframe)) *f = cl;
+        }
     }
 
     int audioFrameSize = 1024;
@@ -473,7 +568,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         if (!writeCaptions(f + 1)) return fail("Writing captions failed");
         if (wantVideo) {
             Image img = s.alpha ? renderSequenceFrame(p, seq, f, ro) : renderProgramFrame(p, seq, f, ro);
-            if (s.burnInCaptions && captions) drawCaption(img, *captions, f);
+            if (s.burnInCaptions && captions) drawCaption(img, *captions, f, &seqSpace);
+            convertColor(img, seqSpace, outSpace, peakNits);
             toRgba16(img, rgba16);
             AVPixelFormat srcFmt = AV_PIX_FMT_RGBA64LE;
             o.sws = sws_getCachedContext(o.sws, img.width, img.height, srcFmt, W, H, o.vctx->pix_fmt,
@@ -481,7 +577,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             if (!o.sws) return fail("Cannot convert to the encoder pixel format");
             const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(o.vctx->pix_fmt);
             if (desc && !(desc->flags & AV_PIX_FMT_FLAG_RGB))
-                sws_setColorspaceDetails(o.sws, sws_getCoefficients(SWS_CS_DEFAULT), 1, sws_getCoefficients(SWS_CS_ITU709),
+                sws_setColorspaceDetails(o.sws, sws_getCoefficients(SWS_CS_DEFAULT), 1,
+                                         sws_getCoefficients(o.vctx->colorspace == AVCOL_SPC_BT2020_NCL ? SWS_CS_BT2020 : SWS_CS_ITU709),
                                          o.vctx->color_range == AVCOL_RANGE_JPEG ? 1 : 0, 0, 1 << 16, 1 << 16);
             if (av_frame_make_writable(o.vframe) < 0) return fail("Out of memory");
             const uint8_t* srcData[4] = {reinterpret_cast<const uint8_t*>(rgba16.data()), nullptr, nullptr, nullptr};

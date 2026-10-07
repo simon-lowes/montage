@@ -295,6 +295,8 @@ QJsonObject sequenceToJson(const Sequence& s) {
         o["masterEffects"] = fx;
     }
     if (s.masterVolumeDb != 0) o["masterVolumeDb"] = s.masterVolumeDb;
+    if (s.colorSpace != "rec709") o["colorSpace"] = qs(s.colorSpace);
+    if (s.hdrPeakNits != 1000) o["hdrPeakNits"] = s.hdrPeakNits;
     return o;
 }
 
@@ -311,6 +313,8 @@ Sequence sequenceFromJson(const QJsonObject& o) {
     s.inPoint = i64(o.value("in"), -1);
     s.outPoint = i64(o.value("out"), -1);
     s.playhead = i64(o.value("playhead"), 0);
+    s.colorSpace = o.contains("colorSpace") ? ss(o.value("colorSpace")) : "rec709";
+    s.hdrPeakNits = std::clamp(o.value("hdrPeakNits").toDouble(1000), 100.0, 10000.0);
     for (const auto& t : o.value("video").toArray()) s.videoTracks.push_back(trackFromJson(t.toObject(), TrackKind::Video));
     for (const auto& t : o.value("audio").toArray()) s.audioTracks.push_back(trackFromJson(t.toObject(), TrackKind::Audio));
     for (const auto& mv : o.value("markers").toArray()) {
@@ -380,6 +384,8 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
         if (!m.proxyPath.empty()) o["proxy"] = qs(m.proxyPath);
         if (m.sequenceId) o["sequence"] = double(m.sequenceId);
         if (!m.bin.empty()) o["bin"] = qs(m.bin);
+        if (!m.colorSpace.empty()) o["colorSpace"] = qs(m.colorSpace);
+        if (!m.colorOverride.empty()) o["colorOverride"] = qs(m.colorOverride);
         if (m.transcript && !m.transcript->empty())
             o["transcript"] = QJsonDocument::fromJson(QByteArray::fromStdString(transcriptToJson(*m.transcript))).object();
         media.append(o);
@@ -443,6 +449,8 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
         m.audioCodec = ss(o.value("audioCodec"));
         m.sequenceId = Id(i64(o.value("sequence")));
         m.bin = ss(o.value("bin"));
+        m.colorSpace = ss(o.value("colorSpace"));
+        m.colorOverride = ss(o.value("colorOverride"));
         p.media.push_back(m);
     }
     for (const auto& sv : root.value("sequences").toArray()) p.sequences.push_back(sequenceFromJson(sv.toObject()));

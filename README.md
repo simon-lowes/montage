@@ -35,6 +35,11 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Titles (font, outline, shadow, background box, alignment, tracking), colour mattes, gradients, SMPTE bars
 - Transitions: cross dissolve, dip to black/white, wipe, push, slide, iris, cross zoom
 - Scopes: waveform, RGB parade, vectorscope, histogram
+- Colour management and HDR:
+  - Media spaces come from the file's tags, and Interpret Colour overrides them: Rec.709, sRGB, Rec.2020, Display P3, Rec.2100 PQ and HLG, Sony S-Log3, ARRI LogC3 and LogC4, Panasonic V-Log, Canon Log 3, ACEScct.
+  - Each sequence works in Rec.709, Rec.2020, P3, PQ or HLG. Clips are converted into it, with tone mapping between HDR and SDR and a display rendering for log footage.
+  - HDR sequences are previewed tone mapped to SDR.
+  - HDR exports are 10-bit and tagged, and PQ files carry HDR10 metadata. An HDR master can also be delivered as a tone-mapped SDR version.
 
 **Audio**
 - Clip gain and pan, both keyframeable
@@ -163,6 +168,10 @@ montage-cli models                                           # speech models and
 montage-cli transcribe interview.mp4 --model base.en --srt interview.srt --vtt interview.vtt
 montage-cli captions cut.montage --transcribe base.en -o cut.scc --save   # caption a cut, keep the track
 montage-cli render cut.montage -o cut.mp4 --burn-captions --embed-captions
+montage-cli new -o hdr.montage --color-space rec2100pq --hdr-peak 1000 a.mov   # an HDR10 sequence
+montage-cli render hdr.montage -o hdr10.mp4 --vcodec libx265                   # 10-bit HDR10 with metadata
+montage-cli render hdr.montage -o sdr.mp4 --color-space rec709                 # tone-mapped SDR version
+montage-cli colorspaces                                      # colour space ids
 ```
 
 ## Architecture
@@ -188,4 +197,4 @@ Notes on the design:
 
 ## Roadmap
 
-Phase 2 is ranked in [`docs/research/phase2-roadmap.md`](docs/research/phase2-roadmap.md) and tracked in [`PROGRESS.md`](PROGRESS.md). Next up: LV2 hosting, OCIO/ACES and HDR, multicam, a GPU compositor, tracking, optical-flow retiming and FCP XML interchange.
+Phase 2 is ranked in [`docs/research/phase2-roadmap.md`](docs/research/phase2-roadmap.md) and tracked in [`PROGRESS.md`](PROGRESS.md). Next up: LV2 hosting, OpenColorIO and ACES, multicam, a GPU compositor, tracking, optical-flow retiming and FCP XML interchange.

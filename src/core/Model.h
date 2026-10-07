@@ -99,6 +99,8 @@ struct MediaItem {
     std::string audioCodec;
     Id sequenceId = 0;       // for MediaKind::Sequence (compound clip)
     std::string bin;         // bin (folder) name, "" = root
+    std::string colorSpace;     // detected from the file's colour tags (ColorSpace.h id), "" = Rec.709
+    std::string colorOverride;  // Interpret Colour: the space to read it as, "" = as detected
     // Speech-to-text of the media's audio (shared: undo snapshots copy the pointer).
     std::shared_ptr<const Transcript> transcript;
     bool operator==(const MediaItem&) const = default;
@@ -201,6 +203,8 @@ struct Sequence {
     std::vector<Bus> buses;                   // audio submixes
     std::vector<Effect> masterEffects;        // on the final mix, before the master fader
     double masterVolumeDb = 0;
+    std::string colorSpace = "rec709";  // working and delivery space (ColorSpace.h id)
+    double hdrPeakNits = 1000;          // mastering peak for HDR spaces
     FrameTime inPoint = -1;   // In / Out marks; both frames are included, -1 = unset
     FrameTime outPoint = -1;
     FrameTime playhead = 0;

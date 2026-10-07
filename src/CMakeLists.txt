@@ -16,6 +16,7 @@ add_library(montage_engine STATIC
   media/Loudness.h media/Loudness.cpp
   media/AudioSync.h media/AudioSync.cpp
   render/Processing.h render/Processing.cpp
+  render/ColorSpace.h render/ColorSpace.cpp
   render/Compositor.h render/Compositor.cpp
   render/Exporter.h render/Exporter.cpp
   audio/Plugins.h audio/PluginScan.cpp audio/ClapHost.cpp

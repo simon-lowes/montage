@@ -1101,6 +1101,8 @@ Result makeCompound(Project& p, Sequence& s, const std::vector<Id>& ids, const s
     Sequence nested = makeSequence(p, name, s.width, s.height, s.fps, int(s.videoTracks.size()),
                                    int(s.audioTracks.size()));
     nested.sampleRate = s.sampleRate;
+    nested.colorSpace = s.colorSpace;  // same working space: the clips are not converted twice
+    nested.hdrPeakNits = s.hdrPeakNits;
     bool hasAudio = false;
     for (Id id : all) {
         auto loc = locate(s, id);

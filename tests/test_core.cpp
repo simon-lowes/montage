@@ -731,6 +731,10 @@ private slots:
         fx.s().inPoint = 5;
         fx.s().outPoint = 50;
         trackAt(fx.s(), A1)->volumeDb = -3;
+        fx.s().colorSpace = "rec2100hlg";
+        fx.s().hdrPeakNits = 1600;
+        fx.p.findMedia(fx.media)->colorSpace = "rec2100pq";
+        fx.p.findMedia(fx.media)->colorOverride = "slog3-sgamut3cine";
         std::string json = projectToJson(fx.p);
         Project back;
         std::string err;

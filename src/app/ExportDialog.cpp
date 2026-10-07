@@ -28,6 +28,7 @@
 #include "SequenceSettingsDialog.h"
 #include "Theme.h"
 #include "core/History.h"
+#include "render/ColorSpace.h"
 
 namespace montage {
 
@@ -182,6 +183,15 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     captions_->addItem(tr("Burn in and embed"), 3);
     captions_->setCurrentIndex(std::clamp(appSettings().value("export/captions", 0).toInt(), 0, 3));
     form->addRow(tr("Captions:"), captions_);
+    color_ = new QComboBox(form_);
+    color_->setObjectName(QStringLiteral("exportColor"));
+    color_->addItem(tr("Same as sequence (%1)").arg(QString::fromStdString(seq ? sequenceColorSpace(*seq).label : "Rec.709")),
+                    QString());
+    for (const ColorSpace* cs : displayColorSpaces())
+        color_->addItem(QString::fromStdString(cs->label), QString::fromStdString(cs->id));
+    color_->setToolTip(tr("Deliver in another colour space: an HDR sequence delivered in Rec.709 is tone mapped.\n"
+                          "HDR output is 10-bit and tagged; PQ carries HDR10 metadata."));
+    form->addRow(tr("Colour:"), color_);
     form->addRow(tr("Summary:"), summary_);
 
     progress_ = new QProgressBar(this);
@@ -232,6 +242,7 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     connect(width_, &QSpinBox::valueChanged, this, [this](int w) { widthChanged(w); });
     connect(height_, &QSpinBox::valueChanged, this, [this](int h) { heightChanged(h); });
     connect(quality_, &QSpinBox::valueChanged, this, [this] { updateSummary(); });
+    connect(color_, &QComboBox::currentIndexChanged, this, [this] { updateSummary(); });
     connect(&watcher_, &QFutureWatcher<Result>::finished, this, [this] { exportFinished(); });
 
     presetChanged();
@@ -339,6 +350,7 @@ void ExportDialog::updateControls() {
     matchSize_->setEnabled(video);
     width_->setEnabled(video && !matchSize_->isChecked());
     height_->setEnabled(video && !matchSize_->isChecked());
+    color_->setEnabled(video);
     quality_->setEnabled(p && usesCrf(p->settings.videoCodec));
     const Sequence* seq = state_ ? state_->sequence() : nullptr;
     const CaptionTrack* ct = seq ? captionTrackFor(*seq) : nullptr;
@@ -371,6 +383,10 @@ void ExportDialog::updateSummary() {
                            .arg(fpsLabel(seq->fps));
         if (usesCrf(s.videoCodec)) line += tr(", CRF %1").arg(quality_->value());
         if (s.alpha) line += tr(", with alpha");
+        const ColorSpace* out = findColorSpace(color_->currentData().toString().toStdString());
+        const ColorSpace& space = out ? *out : sequenceColorSpace(*seq);
+        line += ", " + QString::fromStdString(space.label);
+        if (&space != &sequenceColorSpace(*seq) && sequenceColorSpace(*seq).hdr() && !space.hdr()) line += tr(" (tone mapped)");
         lines << line;
     } else {
         lines << tr("Video: none");
@@ -453,6 +469,7 @@ void ExportDialog::startExport() {
         s.embedCaptions = mode & 2;
     }
     settings.setValue("export/captions", captions_->currentIndex());
+    if (hasVideo(s)) s.colorSpace = color_->currentData().toString().toStdString();
     if (rangeIsInOut()) {
         s.in = in;
         s.out = out;

@@ -1183,8 +1183,10 @@ void MainWindow::newSequence() {
     if (!spec) return;
     Id id = state_->newSequence(spec->name, spec->width, spec->height, spec->fps);
     if (id)
-        state_->edit(tr("Sequence Settings"), [rate = spec->sampleRate](Project&, Sequence& s) {
-            s.sampleRate = rate;
+        state_->edit(tr("Sequence Settings"), [spec = *spec](Project&, Sequence& s) {
+            s.sampleRate = spec.sampleRate;
+            s.colorSpace = spec.colorSpace;
+            s.hdrPeakNits = spec.hdrPeakNits;
             return true;
         });
 }

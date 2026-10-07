@@ -25,6 +25,7 @@
 #ifdef MONTAGE_WITH_WHISPER
 #include "media/Transcriber.h"
 #endif
+#include "render/ColorSpace.h"
 #include "render/Compositor.h"
 #include "render/Exporter.h"
 
@@ -39,13 +40,15 @@ int usage() {
                  "Montage %s — command line\n\n"
                  "Usage:\n"
                  "  montage-cli probe <media>\n"
-                 "  montage-cli new -o <project.montage> [--size WxH] [--fps N[/D]] <media>...\n"
+                 "  montage-cli new -o <project.montage> [--size WxH] [--fps N[/D]] [--color-space ID]\n"
+                 "                     [--hdr-peak NITS] <media>...\n"
                  "  montage-cli info <project.montage>\n"
                  "  montage-cli render <project.montage> -o <output> [--preset NAME] [--in TC] [--out TC]\n"
                  "                     [--width W] [--height H] [--crf N] [--vcodec C] [--acodec C] [--proxies]\n"
-                 "                     [--burn-captions] [--embed-captions]\n"
+                 "                     [--burn-captions] [--embed-captions] [--color-space ID]\n"
                  "  montage-cli frame <project.montage> --at TC -o <image.png>\n"
                  "  montage-cli presets\n"
+                 "  montage-cli colorspaces\n"
                  "  montage-cli scenes <video> [--sensitivity 0..1]\n"
                  "  montage-cli proxy <video> -o <proxy.mp4> [--width 960]\n"
                  "  montage-cli loudness <media>\n"
@@ -100,6 +103,7 @@ int cmdProbe(const std::vector<std::string>& args) {
     std::printf("name:      %s\nkind:      %s\nduration:  %.3f s\n", m.name.c_str(), kindName(m.kind).c_str(), m.duration);
     if (m.hasVideo)
         std::printf("video:     %s %dx%d @ %.3f fps\n", m.videoCodec.c_str(), m.width, m.height, m.fps.toDouble());
+    if (m.hasVideo) std::printf("colour:    %s\n", mediaColorSpace(m).label.c_str());
     if (m.hasAudio) std::printf("audio:     %s %d Hz, %d ch\n", m.audioCodec.c_str(), m.sampleRate, m.channels);
     return 0;
 }
@@ -109,6 +113,8 @@ int cmdNew(const std::vector<std::string>& args) {
     int w = 1920, h = 1080;
     Rational fps{30, 1};
     bool fpsGiven = false, sizeGiven = false;
+    std::string colorSpace;
+    double hdrPeak = 1000;
     std::vector<std::string> files;
     for (size_t i = 0; i < args.size(); ++i) {
         const std::string& a = args[i];
@@ -119,6 +125,16 @@ int cmdNew(const std::vector<std::string>& args) {
         } else if (a == "--fps" && i + 1 < args.size()) {
             if (!parseFps(args[++i], fps)) return usage();
             fpsGiven = true;
+        } else if (a == "--color-space" && i + 1 < args.size()) {
+            colorSpace = args[++i];
+            const ColorSpace* c = findColorSpace(colorSpace);
+            if (!c || c->sceneReferred) {
+                std::fprintf(stderr, "error: \"%s\" is not a sequence colour space (see `montage-cli colorspaces`)\n",
+                             colorSpace.c_str());
+                return 1;
+            }
+        } else if (a == "--hdr-peak" && i + 1 < args.size()) {
+            hdrPeak = std::clamp(std::atof(args[++i].c_str()), 100.0, 10000.0);
         } else files.push_back(a);
     }
     if (outPath.empty()) return usage();
@@ -149,6 +165,8 @@ int cmdNew(const std::vector<std::string>& args) {
     s->width = w;
     s->height = h;
     s->fps = fps;
+    if (!colorSpace.empty()) s->colorSpace = colorSpace;
+    s->hdrPeakNits = hdrPeak;
     FrameTime at = 0;
     for (Id id : ids) {
         auto r = edit::placeMedia(p, *s, id, at, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
@@ -196,6 +214,8 @@ int cmdInfo(const std::vector<std::string>& args) {
         std::printf("Sequence \"%s\" %dx%d @ %.3f fps, %d Hz, duration %s%s\n", s.name.c_str(), s.width, s.height,
                     s.fpsValue(), s.sampleRate, formatTimecode(s.duration(), s.fps).c_str(),
                     s.id == p.activeSequence ? " (active)" : "");
+        std::printf("  colour: %s%s\n", sequenceColorSpace(s).label.c_str(),
+                    sequenceColorSpace(s).hdr() ? (", " + std::to_string(int(s.hdrPeakNits)) + " nits peak").c_str() : "");
         for (auto r : allTracks(s)) {
             const Track* t = trackAt(s, r);
             std::printf("  %-4s %zu clips, %zu transitions\n", t->name.c_str(), t->clips.size(), t->transitions.size());
@@ -229,6 +249,7 @@ int cmdRender(const std::vector<std::string>& args) {
         else if (a == "--proxies") proxies = true;
         else if (a == "--burn-captions") st.burnInCaptions = true;
         else if (a == "--embed-captions") st.embedCaptions = true;
+        else if (a == "--color-space") st.colorSpace = next();
         else return usage();
     }
     if (outPath.empty()) return usage();
@@ -238,9 +259,15 @@ int cmdRender(const std::vector<std::string>& args) {
         return 1;
     }
     const bool burn = st.burnInCaptions, embed = st.embedCaptions;
+    const std::string colorSpace = st.colorSpace;
+    if (!colorSpace.empty() && (!findColorSpace(colorSpace) || findColorSpace(colorSpace)->sceneReferred)) {
+        std::fprintf(stderr, "error: \"%s\" is not a delivery colour space (see `montage-cli colorspaces`)\n", colorSpace.c_str());
+        return 1;
+    }
     st = pr->settings;
     st.burnInCaptions = burn;
     st.embedCaptions = embed;
+    st.colorSpace = colorSpace;
     Project p;
     if (!load(projectPath, p)) return 1;
     const Sequence* s = p.active();
@@ -579,6 +606,11 @@ int main(int argc, char** argv) {
     if (cmd == "render") return cmdRender(args);
     if (cmd == "frame") return cmdFrame(args);
     if (cmd == "presets") return cmdPresets();
+    if (cmd == "colorspaces") {
+        for (const auto& c : colorSpaces())
+            std::printf("%-20s %s%s\n", c.id.c_str(), c.label.c_str(), c.sceneReferred ? "  (media only)" : "");
+        return 0;
+    }
     if (cmd == "scenes") return cmdScenes(args);
     if (cmd == "proxy") return cmdProxy(args);
     if (cmd == "loudness") return cmdLoudness(args);

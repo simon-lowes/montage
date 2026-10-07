@@ -5,12 +5,19 @@ on:
     branches: [main]
   pull_request:
 
+# A newer push supersedes the running check of the same branch.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-and-test:
     runs-on: ubuntu-24.04
+    timeout-minutes: 45  # a run takes about 8; a stuck apt mirror should not hold the runner for hours
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
+        timeout-minutes: 15
         run: ./scripts/setup-deps.sh
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DMONTAGE_BUILD_APP=ON

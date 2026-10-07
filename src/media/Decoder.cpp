@@ -18,6 +18,7 @@ extern "C" {
 }
 
 #include "HwAccel.h"
+#include "render/ColorSpace.h"
 
 namespace montage {
 
@@ -125,6 +126,10 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         AVStream* st = fmt->streams[v];
         const AVCodecDescriptor* d = avcodec_descriptor_get(st->codecpar->codec_id);
         m.videoCodec = d ? d->name : "unknown";
+        const char* pri = av_color_primaries_name(st->codecpar->color_primaries);
+        const char* trc = av_color_transfer_name(st->codecpar->color_trc);
+        m.colorSpace = colorSpaceFromTags(pri ? pri : "", trc ? trc : "");
+        if (m.colorSpace == "rec709") m.colorSpace.clear();
         int w = st->codecpar->width, h = st->codecpar->height;
         AVRational sar = st->sample_aspect_ratio.num ? st->sample_aspect_ratio : st->codecpar->sample_aspect_ratio;
         if (sar.num > 0 && sar.den > 0 && sar.num != sar.den) w = int(std::lround(double(w) * sar.num / sar.den));

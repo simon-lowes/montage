@@ -7,6 +7,7 @@
 
 #include "core/EditOps.h"
 #include "core/Effects.h"
+#include "render/ColorSpace.h"
 #include "render/Compositor.h"
 #include "render/Processing.h"
 
@@ -44,6 +45,106 @@ Clip colorClip(Project& p, float r, float g, float b, FrameTime start, FrameTime
 class TestRender : public QObject {
     Q_OBJECT
 private slots:
+    void colorTransfers() {
+        // Published reference values.
+        QVERIFY(near(float(fromLinear(Transfer::Pq, 100 / 203.0)), 0.5081f, 0.0005f));  // 100 nits
+        QVERIFY(near(float(fromLinear(Transfer::Pq, 10000 / 203.0)), 1.0f, 1e-5f));
+        QVERIFY(near(float(fromLinear(Transfer::Pq, 1.0)), 0.5807f, 0.0005f));  // HDR reference white, 203 nits
+        QVERIFY(near(float(fromLinear(Transfer::SLog3, 0.18) * 1023), 420.0f, 0.05f));
+        QVERIFY(near(float(fromLinear(Transfer::LogC3, 0.18)), 0.3910f, 0.0005f));
+        QVERIFY(near(float(fromLinear(Transfer::LogC4, 0.18)), 0.2784f, 0.0005f));
+        QVERIFY(near(float(fromLinear(Transfer::VLog, 0.18)), 0.4233f, 0.0005f));
+        QVERIFY(near(float(fromLinear(Transfer::CLog3, 0.18)), 0.3434f, 0.0005f));
+        QVERIFY(near(float(fromLinear(Transfer::AcesCct, 0.18)), 0.4136f, 0.0005f));
+        QVERIFY(near(float(fromLinear(Transfer::Hlg, 1.0 / 12)), 0.5f, 1e-5f));
+        // Every curve inverts itself, through both segments.
+        for (Transfer t : {Transfer::Bt1886, Transfer::Srgb, Transfer::Pq, Transfer::Hlg, Transfer::SLog3, Transfer::LogC3,
+                           Transfer::LogC4, Transfer::VLog, Transfer::CLog3, Transfer::AcesCct})
+            for (double v : {0.02, 0.1, 0.3, 0.6, 0.95}) QVERIFY2(std::fabs(fromLinear(t, toLinear(t, v)) - v) < 1e-6, qPrintable(QString::number(int(t))));
+
+        // Rec.709 primaries in BT.2020 (ITU-R BT.2087).
+        double m[9];
+        primariesMatrix(Primaries::Bt709, Primaries::Bt2020, m);
+        const double bt2087[9] = {0.6274, 0.3293, 0.0433, 0.0691, 0.9195, 0.0114, 0.0164, 0.0880, 0.8956};
+        for (int i = 0; i < 9; ++i) QVERIFY(std::fabs(m[i] - bt2087[i]) < 2e-4);
+        // ACES AP1 (D60 white) is adapted: its white lands on D65 white.
+        primariesMatrix(Primaries::Ap1, Primaries::Bt709, m);
+        for (int r = 0; r < 3; ++r) QVERIFY(std::fabs(m[r * 3] + m[r * 3 + 1] + m[r * 3 + 2] - 1) < 2e-3);
+
+        const ColorSpace& sdr = *findColorSpace("rec709");
+        const ColorSpace& pq = *findColorSpace("rec2100pq");
+        const ColorSpace& hlg = *findColorSpace("rec2100hlg");
+        auto through = [](float v, const ColorSpace& a, const ColorSpace& b) {
+            float px[3] = {v, v, v};
+            convertPixel(px, a, b);
+            return px[0];
+        };
+        // SDR white sits at HDR reference white: 203 nits in PQ, 75 % in HLG (BT.2408).
+        QVERIFY(near(through(1, sdr, pq), 0.5807f, 0.001f));
+        QVERIFY(near(through(1, sdr, hlg), 0.75f, 0.002f));
+        // HDR to SDR: reference white stays bright, the 1000-nit peak reaches white, and
+        // the curve keeps the order of tones.
+        QVERIFY(through(0.5807f, pq, sdr) > 0.94f);
+        QVERIFY(through(0.75f, hlg, sdr) > 0.94f);
+        QVERIFY(near(through(0.7518f, pq, sdr), 1.0f, 0.005f));
+        float last = 0;
+        for (float v = 0.05f; v <= 0.75f; v += 0.05f) {
+            const float o = through(v, pq, sdr);
+            QVERIFY(o >= last);
+            last = o;
+        }
+        // Mid tones of SDR pass through PQ and back almost unchanged.
+        QVERIFY(near(through(through(0.5f, sdr, pq), pq, sdr), 0.5f, 0.02f));
+        // Pure Rec.709 red in BT.2020 is a less saturated red (BT.2087).
+        float red[3] = {1, 0, 0};
+        convertPixel(red, sdr, *findColorSpace("rec2020"));
+        QVERIFY(near(red[0], float(std::pow(0.6274, 1 / 2.4)), 0.005f));
+        QVERIFY(near(red[1], float(std::pow(0.0691, 1 / 2.4)), 0.005f));
+        // Camera log gets a display rendering: 18 % grey lands in the mid tones.
+        const float grey = through(float(420.0 / 1023), *findColorSpace("slog3-sgamut3cine"), sdr);
+        QVERIFY2(grey > 0.36f && grey < 0.5f, qPrintable(QString::number(grey)));
+        // Tags.
+        QCOMPARE(colorSpaceFromTags("bt2020", "smpte2084"), std::string("rec2100pq"));
+        QCOMPARE(colorSpaceFromTags("bt2020", "arib-std-b67"), std::string("rec2100hlg"));
+        QCOMPARE(colorSpaceFromTags("bt2020", "bt2020-10"), std::string("rec2020"));
+        QCOMPARE(colorSpaceFromTags("bt709", "iec61966-2-1"), std::string("rec709"));
+        QCOMPARE(colorSpaceFromTags("unknown", "unknown"), std::string("rec709"));
+    }
+
+    void colorManagedCompositing() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64;
+        s.height = 36;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, colorClip(p, 1, 1, 1, 0, 30));
+        RenderOptions o;
+        float c[4];
+        rgb(renderProgramFrame(p, s, 5, o), 32, 18, c);
+        QVERIFY(near(c[0], 1));
+        // In an HDR10 sequence graphics white is reference white, not the 10 000-nit peak.
+        s.colorSpace = "rec2100pq";
+        rgb(renderProgramFrame(p, s, 5, o), 32, 18, c);
+        QVERIFY2(near(c[0], 0.5807f, 0.003f), qPrintable(QString::number(c[0])));
+        // The viewer previews it tone mapped to SDR.
+        o.displaySpace = "rec709";
+        rgb(renderProgramFrame(p, s, 5, o), 32, 18, c);
+        QVERIFY(c[0] > 0.94f && c[0] <= 1.0f);
+        o.displaySpace.clear();
+        // A compound clip keeps its parent's space; a Rec.709 one nested in HDR is converted.
+        s.colorSpace = "rec709";
+        const Id outerId = s.id;
+        auto r = edit::makeCompound(p, s, {s.videoTracks[0].clips[0].id}, "Nested");
+        QVERIFY(r.ok);
+        Sequence& outer = *p.findSequence(outerId);
+        const Clip& nc = outer.videoTracks[0].clips.at(0);
+        const Sequence* inner = p.findSequence(p.findMedia(nc.mediaId)->sequenceId);
+        QVERIFY(inner && inner != &outer);
+        QCOMPARE(inner->colorSpace, std::string("rec709"));
+        outer.colorSpace = "rec2100hlg";
+        rgb(renderProgramFrame(p, outer, 5, o), 32, 18, c);
+        QVERIFY2(near(c[0], 0.75f, 0.005f), qPrintable(QString::number(c[0])));
+    }
+
     void effectMasks() {
         auto masked = [](const char* type, int shape) {
             Effect e = makeEffect(type, 1);

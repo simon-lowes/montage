@@ -23,6 +23,9 @@
 #include "CaptionsPanel.h"
 #include "EditorState.h"
 #include "EffectsBrowser.h"
+#include "ExportDialog.h"
+#include "MediaBinWidget.h"
+#include "SequenceSettingsDialog.h"
 #include "audio/Plugins.h"
 #include "MainWindow.h"
 #include "MixerPanel.h"
@@ -38,6 +41,7 @@
 #include "core/EditOps.h"
 #include "core/Effects.h"
 #include "core/ProjectIO.h"
+#include "render/ColorSpace.h"
 #include "render/Compositor.h"
 #include "render/Exporter.h"
 
@@ -719,6 +723,82 @@ private slots:
         QCOMPARE(*back.findMedia(id)->transcript, *transcript);
         state()->newProject();
         QVERIFY(QTest::qWaitForWindowActive(win_.get()));  // the window has the focus back
+    }
+
+    void colourManagementUi() {
+        // A short grey video to interpret.
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 160;
+        gs.height = 90;
+        Clip grey = makeGeneratorClip(gen, "color", 10);
+        for (const char* k : {"color.r", "color.g", "color.b"}) grey.generator.params[k] = 0.4;
+        edit::overwrite(gen, gs, {TrackKind::Video, 0}, grey);
+        ExportSettings st;
+        st.path = (dir_.path() + "/grey.mp4").toStdString();
+        st.audioCodec = "none";
+        st.preset = "ultrafast";
+        std::string err;
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        state()->newProject();
+        auto ids = state()->importFiles({QString::fromStdString(st.path)});
+        QCOMPARE(ids.size(), size_t(1));
+
+        // Interpret Colour from the media bin's context menu.
+        auto* binWidget = win_->findChild<MediaBinWidget*>();
+        QVERIFY(binWidget);
+        auto* bin = binWidget->findChild<QListWidget*>();
+        QVERIFY(bin && bin->count() == 1);
+        bin->setCurrentRow(0);
+        bool triggered = false;
+        QTimer::singleShot(0, this, [&] {
+            auto* menu = qobject_cast<QMenu*>(QApplication::activePopupWidget());
+            if (!menu) return;
+            if (auto* sub = menu->findChild<QMenu*>("interpretColour"))
+                for (QAction* a : sub->actions())
+                    if (a->data().toString() == "slog3-sgamut3cine") {
+                        a->trigger();
+                        triggered = true;
+                    }
+            menu->close();
+        });
+        emit bin->customContextMenuRequested(QPoint(10, 10));
+        QVERIFY(triggered);
+        QCOMPARE(state()->project().findMedia(ids[0])->colorOverride, std::string("slog3-sgamut3cine"));
+        QVERIFY(bin->item(0)->toolTip().contains("S-Log3"));
+        state()->undo();
+        QVERIFY(state()->project().findMedia(ids[0])->colorOverride.empty());
+
+        // Sequence settings: colour space, with the HDR peak for PQ only.
+        SequenceSettingsDialog dlg(win_.get());
+        NewSequenceSpec spec;
+        spec.colorSpace = "rec2100pq";
+        spec.hdrPeakNits = 4000;
+        dlg.setSpec(spec);
+        auto* space = dlg.findChild<QComboBox*>("colorSpace");
+        auto* peak = dlg.findChild<QSpinBox*>("hdrPeak");
+        QVERIFY(space && peak);
+        QCOMPARE(space->currentData().toString(), QString("rec2100pq"));
+        QVERIFY(peak->isEnabled());
+        QCOMPARE(peak->value(), 4000);
+        QCOMPARE(dlg.spec().hdrPeakNits, 4000.0);
+        space->setCurrentIndex(space->findData(QString("rec709")));
+        QVERIFY(!peak->isEnabled());
+        QCOMPARE(dlg.spec().colorSpace, std::string("rec709"));
+
+        // Export: deliver the HLG sequence as it is or in any display space.
+        state()->edit("HLG", [](Project&, Sequence& s) {
+            s.colorSpace = "rec2100hlg";
+            return true;
+        });
+        ExportDialog ed(state(), win_.get());
+        auto* color = ed.findChild<QComboBox*>("exportColor");
+        QVERIFY(color);
+        QCOMPARE(color->count(), int(displayColorSpaces().size()) + 1);
+        QVERIFY(color->itemText(0).contains("HLG"));
+        state()->newProject();
+        win_->activateWindow();  // the context menu took the focus
+        QVERIFY(QTest::qWaitForWindowActive(win_.get()));
     }
 
     void captionsPanelAndTimelineLane() {

@@ -31,6 +31,7 @@
 #include "ThumbnailCache.h"
 #include "TranscribeDialog.h"
 #include "media/Analysis.h"
+#include "render/ColorSpace.h"
 
 namespace montage {
 
@@ -192,7 +193,8 @@ void MediaBinWidget::rebuild() {
     for (const auto& m : p.media)
         if (matches(m))
             signature << QString::number(m.id) + QString::fromStdString(m.name) + "/" +
-                             QString::number(m.transcript ? m.transcript->wordCount() : 0);
+                             QString::number(m.transcript ? m.transcript->wordCount() : 0) + "/" +
+                             QString::fromStdString(m.colorOverride);
     if (list_->property("signature").toStringList() == signature) {
         refreshThumbnails();
         return;
@@ -209,6 +211,9 @@ void MediaBinWidget::rebuild() {
                                      : QString();
         QString tip = QString("<b>%1</b><br>%2").arg(name.toHtmlEscaped(), kindLabel(m));
         if (m.hasVideo && m.width > 0) tip += QString("<br>%1×%2 @ %3 fps, %4").arg(m.width).arg(m.height).arg(m.fps.toDouble(), 0, 'f', 3).arg(QString::fromStdString(m.videoCodec));
+        if (m.hasVideo && m.kind != MediaKind::Sequence)
+            tip += "<br>" + tr("Colour: %1").arg(QString::fromStdString(mediaColorSpace(m).label)) +
+                   (m.colorOverride.empty() ? QString() : tr(" (interpreted)"));
         if (m.hasAudio && m.sampleRate > 0) tip += QString("<br>%1 Hz, %2 ch, %3").arg(m.sampleRate).arg(m.channels).arg(QString::fromStdString(m.audioCodec));
         if (!dur.isEmpty()) tip += "<br>" + dur;
         if (m.transcript)
@@ -318,6 +323,46 @@ void MediaBinWidget::showContextMenu(const QPoint& pos) {
     std::vector<Id> videos;
     for (Id id : ids)
         if (const MediaItem* m = state_->project().findMedia(id); m && m->kind == MediaKind::Video && m->hasVideo) videos.push_back(id);
+    std::vector<Id> pictures;
+    for (Id id : ids)
+        if (const MediaItem* m = state_->project().findMedia(id); m && m->hasVideo && m->kind != MediaKind::Sequence)
+            pictures.push_back(id);
+    if (!pictures.empty()) {
+        menu.addSeparator();
+        // Interpret Colour: read the media as another colour space (camera log, HDR without tags...).
+        QMenu* interpret = menu.addMenu(tr("Interpret Colour"));
+        interpret->setObjectName(QStringLiteral("interpretColour"));
+        const MediaItem* first = state_->project().findMedia(pictures.front());
+        std::string current = first ? first->colorOverride : std::string();
+        for (Id id : pictures)
+            if (const MediaItem* m = state_->project().findMedia(id); m && m->colorOverride != current) current = "?";
+        auto setOverride = [this, pictures](const std::string& space) {
+            state_->edit(tr("Interpret Colour"), [pictures, space](Project& p, Sequence&) {
+                bool any = false;
+                for (Id id : pictures)
+                    if (MediaItem* m = p.findMedia(id); m && m->colorOverride != space) {
+                        m->colorOverride = space;
+                        any = true;
+                    }
+                return any;
+            });
+        };
+        QAction* detected = interpret->addAction(tr("As Detected"), this, [setOverride] { setOverride({}); });
+        detected->setCheckable(true);
+        detected->setChecked(current.empty());
+        if (first && pictures.size() == 1) {
+            MediaItem plain = *first;
+            plain.colorOverride.clear();
+            detected->setText(tr("As Detected (%1)").arg(QString::fromStdString(mediaColorSpace(plain).label)));
+        }
+        interpret->addSeparator();
+        for (const ColorSpace& cs : colorSpaces()) {
+            QAction* a = interpret->addAction(QString::fromStdString(cs.label), this, [setOverride, id = cs.id] { setOverride(id); });
+            a->setCheckable(true);
+            a->setChecked(current == cs.id);
+            a->setData(QString::fromStdString(cs.id));
+        }
+    }
     if (!videos.empty()) {
         menu.addSeparator();
         menu.addAction(tr("Create Proxy Media"), this, [this, videos] { createProxies(videos); });

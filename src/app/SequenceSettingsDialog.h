@@ -1,5 +1,5 @@
-// Montage — sequence settings: name, frame size, frame rate and audio sample
-// rate, for editing the active sequence or creating a new one.
+// Montage — sequence settings: name, frame size, frame rate, audio sample
+// rate and colour space, for editing the active sequence or creating a new one.
 #pragma once
 
 #include <QDialog>
@@ -24,6 +24,8 @@ struct NewSequenceSpec {
     int height = 1080;
     Rational fps{30, 1};
     int sampleRate = 48000;
+    std::string colorSpace = "rec709";
+    double hdrPeakNits = 1000;
 };
 
 // Spin box that only accepts even values (most encoders need even frame sizes).
@@ -66,6 +68,8 @@ private:
     EvenSpinBox* height_ = nullptr;
     QComboBox* frameRate_ = nullptr;
     QComboBox* sampleRate_ = nullptr;
+    QComboBox* colorSpace_ = nullptr;
+    QSpinBox* hdrPeak_ = nullptr;
     QLabel* summary_ = nullptr;
     QPushButton* okButton_ = nullptr;
     bool updating_ = false;

@@ -62,6 +62,7 @@ private:
         o.scale = r.scale;
         o.useProxies = r.proxies;
         o.captions = r.captions;
+        o.displaySpace = "rec709";  // HDR and wide-gamut sequences are previewed tone mapped to SDR
         Image img = renderProgramFrame(*r.project, *s, t, o);
         std::vector<uint8_t> rgba = toRgba8(img);
         return QImage(rgba.data(), img.width, img.height, img.width * 4, QImage::Format_RGBA8888).copy();

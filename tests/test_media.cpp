@@ -18,12 +18,14 @@
 #ifdef MONTAGE_WITH_WHISPER
 #include "media/Transcriber.h"
 #endif
+#include "render/ColorSpace.h"
 #include "render/Compositor.h"
 #include "render/Exporter.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+#include <libavutil/mastering_display_metadata.h>
 }
 
 using namespace montage;
@@ -596,6 +598,96 @@ private slots:
         QVERIFY(QString::fromStdString(err).contains("not found"));
     }
 #endif
+
+    void hdrExportRoundTrip() {
+        if (!avcodec_find_encoder_by_name("libx265")) QSKIP("This FFmpeg has no libx265");
+        // Graphics white in an HDR10 sequence.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320;
+        s.height = 180;
+        s.fps = {25, 1};
+        s.colorSpace = "rec2100pq";
+        s.hdrPeakNits = 1000;
+        Clip c = makeGeneratorClip(p, "color", 10);
+        c.generator.params["color.r"] = 1.0;
+        c.generator.params["color.g"] = 1.0;
+        c.generator.params["color.b"] = 1.0;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, c);
+        ExportSettings st;
+        st.path = path("hdr10.mp4");
+        st.videoCodec = "libx265";
+        st.audioCodec = "none";
+        st.preset = "ultrafast";
+        std::string err;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+
+        // 10-bit, tagged BT.2020 / PQ, with HDR10 mastering display and light levels.
+        AVFormatContext* fmt = nullptr;
+        QCOMPARE(avformat_open_input(&fmt, st.path.c_str(), nullptr, nullptr), 0);
+        QVERIFY(avformat_find_stream_info(fmt, nullptr) >= 0);
+        const AVCodecParameters* cp = fmt->streams[0]->codecpar;
+        const int format = cp->format;
+        const auto trc = cp->color_trc;
+        const auto primaries = cp->color_primaries;
+        const auto matrix = cp->color_space;
+        double maxLum = 0;
+        unsigned maxCll = 0;
+        if (const AVPacketSideData* sd = av_packet_side_data_get(cp->coded_side_data, cp->nb_coded_side_data,
+                                                                  AV_PKT_DATA_MASTERING_DISPLAY_METADATA))
+            maxLum = av_q2d(reinterpret_cast<const AVMasteringDisplayMetadata*>(sd->data)->max_luminance);
+        if (const AVPacketSideData* sd =
+                av_packet_side_data_get(cp->coded_side_data, cp->nb_coded_side_data, AV_PKT_DATA_CONTENT_LIGHT_LEVEL))
+            maxCll = reinterpret_cast<const AVContentLightMetadata*>(sd->data)->MaxCLL;
+        avformat_close_input(&fmt);
+        QCOMPARE(format, int(AV_PIX_FMT_YUV420P10LE));
+        QCOMPARE(trc, AVCOL_TRC_SMPTE2084);
+        QCOMPARE(primaries, AVCOL_PRI_BT2020);
+        QCOMPARE(matrix, AVCOL_SPC_BT2020_NCL);
+        QCOMPARE(maxLum, 1000.0);
+        QCOMPARE(maxCll, 1000u);
+
+        // Montage reads it back as HDR10, at reference white (203 nits).
+        MediaItem m;
+        QVERIFY2(probeMedia(st.path, m, &err), err.c_str());
+        QCOMPARE(m.colorSpace, std::string("rec2100pq"));
+        VideoDecoder dec;
+        QVERIFY(dec.open(st.path, &err));
+        Frame16Ptr f = dec.frameAt(0.1);
+        QVERIFY(f);
+        const double code = f->px[(size_t(90) * 320 + 160) * 4] / 65535.0;
+        QVERIFY2(std::fabs(code - 0.5807) < 0.01, qPrintable(QString::number(code)));
+        // In a Rec.709 sequence it is tone mapped: white comes back near white.
+        Project q = makeDefaultProject();
+        Sequence& qs = *q.active();
+        qs.width = 320;
+        qs.height = 180;
+        qs.fps = {25, 1};
+        m.id = q.newId();
+        q.media.push_back(m);
+        QVERIFY(edit::placeMedia(q, qs, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        RenderOptions ro;
+        Image img = renderProgramFrame(q, qs, 2, ro);
+        QVERIFY2(img.at(160, 90)[0] > 0.93f && img.at(160, 90)[0] <= 1.0f, qPrintable(QString::number(img.at(160, 90)[0])));
+        // Interpreted as Rec.709 instead, the PQ code values show as they are (the flat look).
+        q.media.back().colorOverride = "rec709";
+        img = renderProgramFrame(q, qs, 2, ro);
+        QVERIFY(std::fabs(img.at(160, 90)[0] - 0.5807f) < 0.01f);
+
+        // The HDR sequence delivered in SDR: Rec.709, 8-bit, tone mapped.
+        st.path = path("sdr-version.mp4");
+        st.colorSpace = "rec709";
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        MediaItem sdr;
+        QVERIFY2(probeMedia(st.path, sdr, &err), err.c_str());
+        QVERIFY(sdr.colorSpace.empty());  // Rec.709
+        VideoDecoder dec2;
+        QVERIFY(dec2.open(st.path, &err));
+        f = dec2.frameAt(0.1);
+        QVERIFY(f);
+        const double white = f->px[(size_t(90) * 320 + 160) * 4] / 65535.0;
+        QVERIFY2(white > 0.93 && white <= 1.0, qPrintable(QString::number(white)));
+    }
 
     void captionsBurnInAndEmbed() {
         // A mid-grey clip with two captions.

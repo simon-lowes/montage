@@ -89,7 +89,17 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
   - Audio Units through the AudioComponent API: stereo or mono negotiation, input through a render callback, parameters with names and ranges, ClassInfo settings as binary plists, latency (so delay compensation covers AUs too) and reset.
   - Tested on macOS CI with Apple's AULowpass.
   - AU editor windows are not done yet (they need Cocoa views).
-- [ ] 13. OCIO colour management, ACES 2.0, HDR export (L)
+- [ ] 13. OCIO colour management, ACES 2.0, HDR export (L):
+  - [x] Part A, colour management and HDR:
+    - Colour spaces: Rec.709, sRGB, Rec.2020, Display P3, Rec.2100 PQ and HLG, and camera log (S-Log3/S-Gamut3.Cine, LogC3/AWG3, LogC4/AWG4, V-Log/V-Gamut, Canon Log 3/Cinema Gamut, ACEScct, linear).
+    - Each media item's space is read from its tags; Interpret Colour overrides it.
+    - Each sequence has a working and delivery space, plus an HDR mastering peak.
+    - Every clip, nested sequence, title and caption is converted into the sequence space through a cached 65³ LUT.
+    - Tone mapping: HDR into SDR with a hue-preserving roll-off; SDR into HDR at 203-nit reference white (BT.2408); camera log through a filmic display rendering.
+    - HDR sequences are previewed tone mapped to SDR.
+    - Export: 10-bit and tagged HDR, HDR10 mastering display and MaxCLL/MaxFALL (stream side data, per-frame side data and x265 SEI), and SDR versions of HDR masters.
+    - Checked against published curve values (PQ, HLG, S-Log3, LogC3/4, V-Log, Canon Log 3, ACEScct) and the BT.2087 matrix, with an HDR10 export round trip.
+  - [ ] Part B: OpenColorIO configs (an OCIO transform effect, ACES 2.0 output transforms), and HDR monitoring on HDR displays.
 - [ ] 14. Multicam (L)
 - [ ] 15. GPU compositor on QRhi (XL)
 - [ ] 16. Tracking and stabilisation (L)

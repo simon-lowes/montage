@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 
+#include "ColorSpace.h"
 #include "Processing.h"
 #include "audio/PluginEffect.h"
 #include "audio/SpeechCleanup.h"
@@ -268,6 +269,8 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
         int w, h;
         sourceSize(g, o.scale, int(SW * 4), int(SH * 4), w, h);
         src = renderGenerator(c.generator, lt, w, h, double(w) / SW);
+        // Titles and mattes are authored in SDR: graphics white sits at HDR reference white.
+        convertColor(src, rec709Space(), sequenceColorSpace(seq), seq.hdrPeakNits);
     } else {
         const MediaItem* m = p.findMedia(c.mediaId);
         if (!m) return {};
@@ -284,6 +287,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             no.scale = double(w) / nested->width;
             FrameTime nf = FrameTime(std::floor(c.sourceFrameAt(t) * nested->fpsValue() / seq.fpsValue() + 1e-6));
             src = renderSequenceFrame(p, *nested, nf, no);
+            convertColor(src, sequenceColorSpace(*nested), sequenceColorSpace(seq), seq.hdrPeakNits);
         } else if (m->kind == MediaKind::Video || m->kind == MediaKind::Image) {
             if (!m->hasVideo && m->kind != MediaKind::Image) return {};
             std::string path = (o.useProxies && !m->proxyPath.empty()) ? m->proxyPath : m->path;
@@ -301,6 +305,8 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             Frame16Ptr f = MediaPool::instance().videoFrame(path, sec, w, h, o.highQuality);
             if (!f) return {};
             src = toImage(*f);
+            // Input transform: the media's space into the sequence's working space.
+            convertColor(src, mediaColorSpace(*m), sequenceColorSpace(seq), seq.hdrPeakNits);
         } else {
             return {};
         }
@@ -371,7 +377,9 @@ Image renderProgramFrame(const Project& p, const Sequence& seq, FrameTime t, con
     Image img = renderSequenceFrame(p, seq, t, o);
     flattenOver(img, 0, 0, 0);
     if (o.captions && o.depth == 0)
-        if (const CaptionTrack* track = captionTrackFor(seq)) drawCaption(img, *track, t);
+        if (const CaptionTrack* track = captionTrackFor(seq)) drawCaption(img, *track, t, &sequenceColorSpace(seq));
+    if (!o.displaySpace.empty() && o.depth == 0)
+        if (const ColorSpace* d = findColorSpace(o.displaySpace)) convertColor(img, sequenceColorSpace(seq), *d, seq.hdrPeakNits);
     return img;
 }
 
@@ -428,7 +436,7 @@ bool sequenceToClipFrame(const Project& p, const Sequence& seq, const Clip& c, F
     return true;
 }
 
-void drawCaption(Image& img, const CaptionTrack& track, FrameTime t) {
+void drawCaption(Image& img, const CaptionTrack& track, FrameTime t, const ColorSpace* space) {
     const Caption* cap = captionAt(track, t);
     if (!cap || img.width < 8 || img.height < 8) return;
     const CaptionStyle& st = track.style;
@@ -473,6 +481,23 @@ void drawCaption(Image& img, const CaptionTrack& track, FrameTime t) {
             pa.strokePath(text, QPen(QColor(0, 0, 0), st.outline * px * 2, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
         pa.fillPath(text, col(st.textR, st.textG, st.textB, 1));
     }
+    if (space && space->id != rec709Space().id) {
+        // Caption colours are SDR: convert the rendered patch into the picture's space.
+        Image patch(qi.width(), qi.height());
+        for (int y = 0; y < patch.height; ++y) {
+            const uchar* s = qi.constScanLine(y);
+            float* d = patch.row(y);
+            for (int x = 0; x < patch.width * 4; ++x) d[x] = s[x] / 255.0f;
+        }
+        convertColor(patch, rec709Space(), *space);
+        for (int y = 0; y < patch.height; ++y) {
+            const float* s = patch.row(y);
+            float* d = img.row(y0 + y) + size_t(x0) * 4;
+            for (int x = 0; x < patch.width; ++x, s += 4, d += 4)
+                for (int c = 0; c < 4; ++c) d[c] = s[c] + d[c] * (1 - s[3]);
+        }
+        return;
+    }
     const float k = 1.0f / 255.0f;
     for (int y = y0; y < y1; ++y) {
         const uchar* s = qi.constScanLine(y - y0);
@@ -493,6 +518,7 @@ Image renderMediaFrame(const Project& p, const MediaItem& m, double seconds, int
         if (!s) return out;
         RenderOptions o;
         o.scale = std::min(double(w) / s->width, double(h) / s->height);
+        o.displaySpace = "rec709";
         Image img = renderProgramFrame(p, *s, FrameTime(std::floor(seconds * s->fpsValue() + 1e-6)), o);
         Geometry g;
         g.mw = img.width;
@@ -509,6 +535,7 @@ Image renderMediaFrame(const Project& p, const MediaItem& m, double seconds, int
     Frame16Ptr f = MediaPool::instance().videoFrame(m.path, std::max(0.0, seconds), dw, dh);
     if (!f) return out;
     Image img = toImage(*f);
+    convertColor(img, mediaColorSpace(m), rec709Space());  // the source monitor shows SDR
     Geometry g;
     g.mw = mw;
     g.mh = mh;
