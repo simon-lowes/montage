@@ -82,6 +82,7 @@ private:
     void detectScenes();
     void normalizeLoudness();
     void autoColor();
+    void syncByAudio();
     void exportInterchange(bool otio);
     void addTitle();
     void newSequence();

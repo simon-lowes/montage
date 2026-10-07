@@ -23,6 +23,7 @@ verified run.
 - [x] Match sequence settings to the first clip
 - [x] Loudness measurement and normalisation (BS.1770 / R128)
 - [x] EDL (CMX 3600) and OpenTimelineIO export
+- [x] Auto colour; synchronise clips by audio
 
 ## Application (Qt 6 Widgets)
 - [x] Main window with dockable panels, dark theme

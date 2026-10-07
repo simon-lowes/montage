@@ -7,6 +7,7 @@
 #include "core/EditOps.h"
 #include "core/Effects.h"
 #include "media/Analysis.h"
+#include "media/AudioSync.h"
 #include "media/Decoder.h"
 #include "media/Loudness.h"
 #include "media/MediaPool.h"
@@ -119,6 +120,46 @@ private slots:
         QVERIFY(!measureLoudness(quiet).valid);
         LoudnessResult part = measureLoudness(buf, 48000, 48000 * 2);
         QVERIFY(std::fabs(part.integrated + 23.0) < 0.3);
+    }
+
+    void audioSyncFindsOffset() {
+        // Reference: 12 s of irregular noise bursts. Other: the same scene recorded
+        // from 1.5 s in, quieter and with background hiss.
+        AudioBuffer ref, other;
+        ref.sampleRate = other.sampleRate = 48000;
+        uint32_t seed = 12345;
+        auto rnd = [&seed] {
+            seed = seed * 1664525u + 1013904223u;
+            return float((seed >> 8) & 0xffff) / 65535.0f * 2 - 1;
+        };
+        std::vector<float> mono(48000 * 12, 0.0f);
+        int pos = 0;
+        while (pos < int(mono.size())) {
+            int len = 2000 + int((rnd() + 1) * 6000);
+            for (int i = 0; i < len && pos + i < int(mono.size()); ++i) mono[size_t(pos + i)] = 0.6f * rnd() * std::exp(-i / 3000.0f);
+            pos += len + 4000 + int((rnd() + 1) * 20000);
+        }
+        for (float v : mono) {
+            ref.samples.push_back(v);
+            ref.samples.push_back(v);
+        }
+        for (size_t i = 72000; i < mono.size(); ++i) {
+            float v = mono[i] * 0.3f + 0.01f * rnd();
+            other.samples.push_back(v);
+            other.samples.push_back(v);
+        }
+        SyncResult r = findAudioOffset(ref, other);
+        QVERIFY(r.found);
+        QVERIFY2(std::fabs(r.offset - 1.5) < 0.005, qPrintable(QString::number(r.offset)));
+        // Unrelated audio does not produce a confident match.
+        AudioBuffer unrelated;
+        unrelated.sampleRate = 48000;
+        for (int i = 0; i < 48000 * 6; ++i) {
+            float v = 0.2f * std::sin(i * 0.05f);
+            unrelated.samples.push_back(v);
+            unrelated.samples.push_back(v);
+        }
+        QVERIFY(!findAudioOffset(ref, unrelated).found);
     }
 
     void mixerGainPanMuteAndFades() {

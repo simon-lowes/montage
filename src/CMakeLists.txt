@@ -10,6 +10,7 @@ add_library(montage_engine STATIC
   media/MediaPool.h media/MediaPool.cpp
   media/Analysis.h media/Analysis.cpp
   media/Loudness.h media/Loudness.cpp
+  media/AudioSync.h media/AudioSync.cpp
   render/Processing.h render/Processing.cpp
   render/Compositor.h render/Compositor.cpp
   render/Exporter.h render/Exporter.cpp

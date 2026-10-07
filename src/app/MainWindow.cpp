@@ -42,6 +42,7 @@
 #include "core/Effects.h"
 #include "core/Interchange.h"
 #include "media/Analysis.h"
+#include "media/AudioSync.h"
 #include "media/Loudness.h"
 #include "media/MediaPool.h"
 #include "render/Compositor.h"
@@ -324,6 +325,7 @@ void MainWindow::buildMenus() {
     add(clipM, tr("Detect &Scene Cuts"), QKeySequence(), [this] { detectScenes(); });
     add(clipM, tr("Normalize &Loudness…"), QKeySequence(), [this] { normalizeLoudness(); });
     add(clipM, tr("Auto &Colour"), QKeySequence("Ctrl+Alt+C"), [this] { autoColor(); });
+    add(clipM, tr("S&ynchronize by Audio"), QKeySequence(), [this] { syncByAudio(); });
     clipM->addSeparator();
     add(clipM, tr("&Insert from Source"), QKeySequence(Qt::Key_Comma), [this] { state_->insertFromSource(false); });
     add(clipM, tr("&Overwrite from Source"), QKeySequence(Qt::Key_Period), [this] { state_->insertFromSource(true); });
@@ -1015,6 +1017,56 @@ void MainWindow::autoColor() {
         return true;
     });
     inspectorDock_->raise();
+}
+
+void MainWindow::syncByAudio() {
+    const Sequence* s = state_->sequence();
+    if (!s) return;
+    // Audio clips in the selection, earliest (then lowest track) first: that one is the reference.
+    struct Item {
+        Id id;
+        FrameTime start;
+        int track;
+    };
+    std::vector<Item> items;
+    for (Id id : state_->selectedClips())
+        if (auto loc = edit::locate(*s, id); loc && loc->track.kind == TrackKind::Audio) {
+            const Clip& c = trackAt(*s, loc->track)->clips[loc->index];
+            const MediaItem* m = state_->project().findMedia(c.mediaId);
+            if (m && m->hasAudio && !m->path.empty() && c.speed == 1.0 && !c.reverse) items.push_back({id, c.start, loc->track.index});
+        }
+    std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) { return std::tie(a.start, a.track) < std::tie(b.start, b.track); });
+    if (items.size() < 2) {
+        state_->message(tr("Select two or more clips with audio (at 100% speed) to synchronize"));
+        return;
+    }
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    const Clip* ref = edit::clipById(*s, items[0].id);
+    AudioBufferPtr refBuf = MediaPool::instance().audio(state_->project().findMedia(ref->mediaId)->path, s->sampleRate);
+    std::vector<std::pair<std::vector<Id>, FrameTime>> moves;
+    QStringList failed;
+    Id refGroup = ref->linkGroup;
+    for (size_t i = 1; i < items.size(); ++i) {
+        const Clip* o = edit::clipById(*s, items[i].id);
+        if (refGroup && o->linkGroup == refGroup) continue;
+        const MediaItem* om = state_->project().findMedia(o->mediaId);
+        AudioBufferPtr ob = MediaPool::instance().audio(om->path, s->sampleRate);
+        SyncResult r = refBuf && ob ? findAudioOffset(*refBuf, *ob) : SyncResult{};
+        if (!r.found) {
+            failed << QString::fromStdString(o->name);
+            continue;
+        }
+        FrameTime newStart = FrameTime(std::llround(o->sourceIn - ref->sourceIn + double(ref->start) + r.offset * s->fpsValue()));
+        moves.push_back({edit::linkedClips(*s, o->id), newStart - o->start});
+    }
+    QApplication::restoreOverrideCursor();
+    if (!moves.empty())
+        state_->edit(tr("Synchronize by Audio"), [moves](Project& p, Sequence& sq) {
+            for (const auto& [ids, delta] : moves) edit::moveClips(p, sq, ids, delta, 0, 0);
+            return true;
+        });
+    if (!failed.isEmpty()) QMessageBox::information(this, tr("Synchronize"), tr("No reliable audio match for: %1").arg(failed.join(", ")));
+    else state_->message(tr("Synchronized %n clip(s) to %1", "", int(moves.size())).arg(QString::fromStdString(ref->name)), 5000);
 }
 
 void MainWindow::exportInterchange(bool otio) {
