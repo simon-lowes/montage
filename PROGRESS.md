@@ -51,3 +51,28 @@ verified run.
 - [x] README with build and usage docs
 - [x] Builds against FFmpeg 6.1 through 9 (tested with 9.0.2, which Homebrew ships)
 - [x] macOS DMG and Windows installer + zip from the Package workflow (built, and each packaged app launched, on CI runners)
+
+# Phase 2: rival the market leaders
+
+Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effort; S ≤ 2, M 2–6, L 6–12, XL > 12 person-weeks). Each item lands with tests and keeps CI and the Package workflow green.
+
+- [ ] 1. Crash-safe project history and recovery (S)
+- [ ] 2. Hardware decode and encode (M)
+- [ ] 3. Audio plugin manager UI (S). Done: Audio Plugins window (status, blocklist with reasons, rescan, retry blocked), background scan at startup. To do: enable switches, rescan selected, search folders, scan log, parallel scan.
+- [ ] 4. Transcription engine: whisper.cpp + speaker labels (M)
+- [ ] 5. Caption tracks: generate, style, burn in, SRT/VTT/SCC export, CEA-608 (M)
+- [x] 6. VST3 hosting (M): MIT VST 3.8 SDK, crash-isolated probing, parameters, automation, two-blob state. Also done ahead of the list: crash-isolated scanning for CLAP/VST3/LV2/AU and CLAP hosting.
+- [ ] 7. Transcript panel: search, select-to-edit, delete-words ripple (M)
+- [ ] 8. Dialogue denoise and voice isolation (M)
+- [ ] 9. Shape masks and HSL qualifier (M)
+- [ ] 10. Plugin editor windows (L)
+- [ ] 11. Track and bus effect chains, delay compensation, offline plugin rendering (L)
+- [ ] 12. Audio Unit hosting on macOS (M)
+- [ ] 13. OCIO colour management, ACES 2.0, HDR export (L)
+- [ ] 14. Multicam (L)
+- [ ] 15. GPU compositor on QRhi (XL)
+- [ ] 16. Tracking and stabilisation (L)
+- [ ] 17. LV2 hosting (M)
+- [ ] 18. Speed ramps and optical-flow retiming (L)
+- [ ] 19. Interchange round trip: OTIO import, EDL import, FCP7 XML and FCPXML (L)
+- [ ] 20. AI object masks with SAM 2 (XL)
