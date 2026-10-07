@@ -1,0 +1,71 @@
+// Montage — effect, generator and transition catalogue.
+//
+// Each effect type is described once here (its parameters, ranges and
+// defaults). The renderer implements the processing; the UI builds the
+// inspector from these descriptions, so adding a parameter here is enough to
+// expose it everywhere.
+#pragma once
+
+#include <string>
+#include <vector>
+
+#include "Model.h"
+
+namespace montage {
+
+enum class EffectCategory { VideoFilter, AudioFilter, Generator, VideoTransition, AudioTransition, Fixed };
+
+enum class ParamKind {
+    Number,   // plain slider
+    Angle,    // degrees
+    Percent,  // shown as %
+    Bool,     // 0 / 1 checkbox
+    Choice,   // integer index into choices
+    Color,    // three params "<name>.r", "<name>.g", "<name>.b" in 0..1
+};
+
+struct ParamInfo {
+    std::string name;
+    std::string label;
+    ParamKind kind = ParamKind::Number;
+    double min = 0;
+    double max = 1;
+    double def = 0;
+    double step = 0.01;
+    std::vector<std::string> choices;  // for Choice
+    // Default colour for Color params.
+    double defG = 0, defB = 0;
+    bool keyframeable = true;
+};
+
+enum class StringKind { Text, MultilineText, File, Font, Choice, Curve };
+
+struct StringParamInfo {
+    std::string name;
+    std::string label;
+    StringKind kind = StringKind::Text;
+    std::string def;
+    std::vector<std::string> choices;
+};
+
+struct EffectInfo {
+    std::string type;
+    std::string displayName;
+    EffectCategory category = EffectCategory::VideoFilter;
+    std::string group;  // UI grouping, e.g. "Color", "Blur & Sharpen", "Keying"
+    std::vector<ParamInfo> params;
+    std::vector<StringParamInfo> strings;
+};
+
+const std::vector<EffectInfo>& effectCatalog();
+const EffectInfo* findEffectInfo(const std::string& type);
+std::vector<const EffectInfo*> effectsInCategory(EffectCategory c);
+
+// Builds an Effect of the given type populated with default values.
+Effect makeEffect(Project& p, const std::string& type);
+Effect makeEffect(const std::string& type, Id id);
+
+// Blend modes supported by the compositor.
+const std::vector<std::string>& blendModes();
+
+}  // namespace montage
