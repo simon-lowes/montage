@@ -1,6 +1,7 @@
 // montage-cli — headless rendering, probing and project assembly.
 #include <QGuiApplication>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <csignal>
 #include <cstdio>
@@ -18,6 +19,7 @@
 #include "media/Analysis.h"
 #include "media/Decoder.h"
 #include "media/Loudness.h"
+#include "render/Compositor.h"
 #include "render/Exporter.h"
 
 using namespace montage;
@@ -41,7 +43,8 @@ int usage() {
                  "  montage-cli proxy <video> -o <proxy.mp4> [--width 960]\n"
                  "  montage-cli loudness <media>\n"
                  "  montage-cli edl <project.montage> [-o out.edl]\n"
-                 "  montage-cli otio <project.montage> [-o out.otio]\n",
+                 "  montage-cli otio <project.montage> [-o out.otio]\n"
+                 "  montage-cli bench <project.montage> [--scale 0.5] [--frames 120]\n",
                  MONTAGE_VERSION);
     return 2;
 }
@@ -348,6 +351,29 @@ int cmdInterchange(const std::vector<std::string>& args, bool otio) {
     return 0;
 }
 
+int cmdBench(const std::vector<std::string>& args) {
+    if (args.empty()) return usage();
+    double scale = 0.5;
+    int frames = 120;
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (args[i] == "--scale" && i + 1 < args.size()) scale = std::atof(args[++i].c_str());
+        else if (args[i] == "--frames" && i + 1 < args.size()) frames = std::atoi(args[++i].c_str());
+    }
+    Project p;
+    if (!load(args[0], p)) return 1;
+    const Sequence& s = *p.active();
+    RenderOptions o;
+    o.scale = scale;
+    frames = int(std::min<FrameTime>(frames, std::max<FrameTime>(1, s.duration())));
+    renderProgramFrame(p, s, 0, o);  // warm up decoders
+    auto t0 = std::chrono::steady_clock::now();
+    for (int f = 0; f < frames; ++f) renderProgramFrame(p, s, f, o);
+    double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::printf("%d frames at %dx%d in %.2f s: %.1f fps (%.1f ms/frame), sequence rate %.2f fps\n", frames,
+                int(s.width * scale), int(s.height * scale), sec, frames / sec, sec * 1000 / frames, s.fpsValue());
+    return 0;
+}
+
 int cmdPresets() {
     for (const auto& p : exportPresets())
         std::printf("%-28s .%-5s %s\n", p.name.c_str(), p.extension.c_str(), p.description.c_str());
@@ -372,6 +398,7 @@ int main(int argc, char** argv) {
     if (cmd == "scenes") return cmdScenes(args);
     if (cmd == "proxy") return cmdProxy(args);
     if (cmd == "loudness") return cmdLoudness(args);
+    if (cmd == "bench") return cmdBench(args);
     if (cmd == "edl") return cmdInterchange(args, false);
     if (cmd == "otio") return cmdInterchange(args, true);
     if (cmd == "--version" || cmd == "version") {

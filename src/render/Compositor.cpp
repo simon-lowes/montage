@@ -185,8 +185,31 @@ Image transformLayer(const Image& src, const Geometry& g, int SW, int SH, double
     const double u0 = g.mw * g.cl, u1 = g.mw * (1 - g.cr), v0 = g.mh * g.ct, v1 = g.mh * (1 - g.cb);
     if (u1 <= u0 || v1 <= v0) return out;
     const float op = float(g.opacity);
-    // Fast path: axis aligned, 1:1 pixel mapping, integer offset.
     bool axis = std::fabs(sinr) < 1e-9 && cosr > 0 && g.sx > 0 && g.sy > 0;
+    // Fast path: axis aligned, uncropped, one source pixel per output pixel at
+    // an integer offset (the common "clip fills the frame" case): copy rows.
+    if (axis && g.cl == 0 && g.cr == 0 && g.ct == 0 && g.cb == 0) {
+        double pxX = g.sx * scale / kx, pxY = g.sy * scale / ky;  // output pixels per image pixel
+        double ox = (cxs - (g.mw / 2 + g.ax) * g.sx) * scale, oy = (cys - (g.mh / 2 + g.ay) * g.sy) * scale;
+        if (std::fabs(pxX - 1) < 1e-6 && std::fabs(pxY - 1) < 1e-6 && std::fabs(ox - std::round(ox)) < 1e-3 &&
+            std::fabs(oy - std::round(oy)) < 1e-3) {
+            int dx = int(std::lround(ox)), dy = int(std::lround(oy));
+            int x0 = std::max(0, dx), x1 = std::min(W, dx + src.width);
+            if (x1 > x0)
+                parallelRows(H, [&](int y0, int y1) {
+                    for (int Y = y0; Y < y1; ++Y) {
+                        int sy = Y - dy;
+                        if (sy < 0 || sy >= src.height) continue;
+                        const float* in = src.at(x0 - dx, sy);
+                        float* o = out.at(x0, Y);
+                        if (op >= 1.0f) std::copy(in, in + size_t(x1 - x0) * 4, o);
+                        else
+                            for (int i = 0; i < (x1 - x0) * 4; ++i) o[i] = in[i] * op;
+                    }
+                });
+            return out;
+        }
+    }
     parallelRows(H, [&](int y0, int y1) {
         for (int Y = y0; Y < y1; ++Y) {
             float* o = out.row(Y);
@@ -301,6 +324,13 @@ const Clip* findClip(const Track& t, Id id) {
 Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o) {
     int W = std::max(1, int(std::lround(seq.width * o.scale))), H = std::max(1, int(std::lround(seq.height * o.scale)));
     Image canvas(W, H);
+    bool canvasEmpty = true;  // nothing drawn yet: the first normal layer can be moved in
+    auto composite = [&](Image&& layer, const std::string& mode) {
+        if (layer.empty()) return;
+        if (canvasEmpty && mode == "normal" && layer.width == W && layer.height == H) canvas = std::move(layer);
+        else blendOnto(canvas, layer, mode, 1.0f);
+        canvasEmpty = false;
+    };
     for (const Track& track : seq.videoTracks) {
         if (track.muted) continue;
         const Transition* active = nullptr;
@@ -322,14 +352,13 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
             Image lb = (B && B->enabled) ? clipLayer(p, seq, *B, t, o) : Image();
             Image mixed = transitionMix(active->type, active->params, la, lb, u, W, H);
             const Clip* top = B ? B : A;
-            blendOnto(canvas, mixed, top ? top->blendMode : "normal", 1.0f);
+            composite(std::move(mixed), top ? top->blendMode : "normal");
             continue;
         }
         for (const auto& c : track.clips) {
             if (c.start > t) break;
             if (!c.contains(t) || !c.enabled) continue;
-            Image layer = clipLayer(p, seq, c, t, o);
-            if (!layer.empty()) blendOnto(canvas, layer, c.blendMode, 1.0f);
+            composite(clipLayer(p, seq, c, t, o), c.blendMode);
             break;
         }
     }

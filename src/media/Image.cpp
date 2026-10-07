@@ -6,8 +6,24 @@
 #include <deque>
 #include <mutex>
 #include <thread>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 
 namespace montage {
+
+namespace {
+// Frame buffers are tens of megabytes. glibc serves allocations that large
+// with fresh mmap()s, so every frame paid for page faults and zero-filling.
+// Keeping them on the heap lets freed buffers be reused.
+const bool kHeapTuned = [] {
+#ifdef __GLIBC__
+    mallopt(M_MMAP_THRESHOLD, 256 * 1024 * 1024);
+    mallopt(M_TRIM_THRESHOLD, 512 * 1024 * 1024);
+#endif
+    return true;
+}();
+}  // namespace
 
 void Image::fill(float r, float g, float b, float a) {
     for (size_t i = 0; i < px.size(); i += 4) {

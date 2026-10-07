@@ -271,7 +271,7 @@ Frame16Ptr VideoDecoder::convert(const AVFrame* f, double pts, int w, int h, boo
     bool fullRange = f->color_range == AVCOL_RANGE_JPEG;
     AVPixelFormat srcFmt = dejpeg(AVPixelFormat(f->format), fullRange);
     sws_ = sws_getCachedContext(sws_, f->width, f->height, srcFmt, sw, sh, AV_PIX_FMT_RGBA64LE,
-                                (hq ? SWS_BICUBIC : SWS_BILINEAR) | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT, nullptr,
+                                hq ? (SWS_BICUBIC | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT) : SWS_BILINEAR, nullptr,
                                 nullptr, nullptr);
     if (!sws_) return nullptr;
     int cs = SWS_CS_DEFAULT;
