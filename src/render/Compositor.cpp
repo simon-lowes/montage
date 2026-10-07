@@ -178,6 +178,19 @@ Geometry geometryFor(const Effect& motion, FrameTime lt, double mw, double mh, i
 
 // Draws `src` (which depicts the media at any resolution) onto a canvas of
 // W x H (sequence size * scale) according to the geometry.
+// True when the layer maps one source pixel to one output pixel, unmoved,
+// filling the output exactly at full opacity: it can be used as it is.
+bool identityLayer(const Image& src, const Geometry& g, int SW, int SH, double scale) {
+    const int W = std::max(1, int(std::lround(SW * scale))), H = std::max(1, int(std::lround(SH * scale)));
+    if (src.width != W || src.height != H || g.opacity < 1 || g.rot != 0 || g.sx <= 0 || g.sy <= 0) return false;
+    if (g.cl != 0 || g.cr != 0 || g.ct != 0 || g.cb != 0) return false;
+    const double kx = src.width / g.mw, ky = src.height / g.mh;
+    const double pxX = g.sx * scale / kx, pxY = g.sy * scale / ky;
+    const double ox = (SW / 2.0 + g.px - (g.mw / 2 + g.ax) * g.sx) * scale;
+    const double oy = (SH / 2.0 + g.py - (g.mh / 2 + g.ay) * g.sy) * scale;
+    return std::fabs(pxX - 1) < 1e-6 && std::fabs(pxY - 1) < 1e-6 && std::fabs(ox) < 1e-3 && std::fabs(oy) < 1e-3;
+}
+
 Image transformLayer(const Image& src, const Geometry& g, int SW, int SH, double scale) {
     int W = std::max(1, int(std::lround(SW * scale))), H = std::max(1, int(std::lround(SH * scale)));
     Image out(W, H);
@@ -318,6 +331,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                                                                 c.motion.p("scale_x", lt, 100) / 100.0));
     double pixelScale = src.width / std::max(1.0, mw * fitX);
     for (const auto& e : c.effects) applyVideoEffect(e, lt, src, pixelScale);
+    if (identityLayer(src, g, SW, SH, o.scale)) return src;  // a full-frame clip: no copy
     return transformLayer(src, g, SW, SH, o.scale);
 }
 

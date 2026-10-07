@@ -64,8 +64,9 @@ private:
         o.captions = r.captions;
         o.displaySpace = "rec709";  // HDR and wide-gamut sequences are previewed tone mapped to SDR
         Image img = renderProgramFrame(*r.project, *s, t, o);
-        std::vector<uint8_t> rgba = toRgba8(img);
-        return QImage(rgba.data(), img.width, img.height, img.width * 4, QImage::Format_RGBA8888).copy();
+        QImage out(img.width, img.height, QImage::Format_RGBA8888);
+        toRgba8(img, out.bits(), size_t(out.bytesPerLine()));
+        return out;
     }
 
     void process() {

@@ -244,8 +244,9 @@ void MulticamPanel::requestRender() {
             o.soloVideoTrack = i;
             o.displaySpace = "rec709";
             Image img = renderProgramFrame(*snap, *m, frame, o);
-            std::vector<uint8_t> rgba = toRgba8(img);
-            out.push_back(QImage(rgba.data(), img.width, img.height, img.width * 4, QImage::Format_RGBA8888).copy());
+            QImage q(img.width, img.height, QImage::Format_RGBA8888);
+            toRgba8(img, q.bits(), size_t(q.bytesPerLine()));
+            out.push_back(q);
         }
         return out;
     }));

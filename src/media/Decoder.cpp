@@ -357,10 +357,29 @@ Frame16Ptr VideoDecoder::convert(const AVFrame* f, double pts, int w, int h, boo
     int sh = (rotation_ % 180) ? w : h;
     bool fullRange = f->color_range == AVCOL_RANGE_JPEG;
     AVPixelFormat srcFmt = dejpeg(AVPixelFormat(f->format), fullRange);
-    sws_ = sws_getCachedContext(sws_, f->width, f->height, srcFmt, sw, sh, AV_PIX_FMT_RGBA64LE,
-                                hq ? (SWS_BICUBIC | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT) : SWS_BILINEAR, nullptr,
-                                nullptr, nullptr);
-    if (!sws_) return nullptr;
+    const int flags = hq ? (SWS_BICUBIC | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT) : SWS_BILINEAR;
+    const int key[6] = {f->width, f->height, int(srcFmt), sw, sh, flags};
+    if (!sws_ || !std::equal(key, key + 6, swsKey_)) {
+        // A slice-threaded context: converting a 4K frame to 16-bit RGBA is
+        // otherwise a large share of a frame's time on one core.
+        if (sws_) sws_freeContext(sws_);
+        sws_ = sws_alloc_context();
+        if (!sws_) return nullptr;
+        av_opt_set_int(sws_, "srcw", f->width, 0);
+        av_opt_set_int(sws_, "srch", f->height, 0);
+        av_opt_set_int(sws_, "src_format", srcFmt, 0);
+        av_opt_set_int(sws_, "dstw", sw, 0);
+        av_opt_set_int(sws_, "dsth", sh, 0);
+        av_opt_set_int(sws_, "dst_format", AV_PIX_FMT_RGBA64LE, 0);
+        av_opt_set_int(sws_, "sws_flags", flags, 0);
+        av_opt_set_int(sws_, "threads", std::clamp(int(std::thread::hardware_concurrency()), 1, 8), 0);
+        if (sws_init_context(sws_, nullptr, nullptr) < 0) {
+            sws_freeContext(sws_);
+            sws_ = nullptr;
+            return nullptr;
+        }
+        std::copy(key, key + 6, swsKey_);
+    }
     int cs = SWS_CS_DEFAULT;
     switch (f->colorspace) {
         case AVCOL_SPC_BT709: cs = SWS_CS_ITU709; break;
@@ -383,7 +402,28 @@ Frame16Ptr VideoDecoder::convert(const AVFrame* f, double pts, int w, int h, boo
     out->px.resize(size_t(sw) * size_t(sh) * 4);
     uint8_t* dst[4] = {reinterpret_cast<uint8_t*>(out->px.data()), nullptr, nullptr, nullptr};
     int dstStride[4] = {sw * 8, 0, 0, 0};
-    sws_scale(sws_, f->data, f->linesize, 0, f->height, dst, dstStride);
+    // The threaded path needs reference-counted frames (decoders give those);
+    // the source is relabelled with the format the context was made for.
+    bool converted = false;
+    if (f->buf[0]) {
+        AVFrame* src = av_frame_clone(f);
+        AVFrame* dstFrame = av_frame_alloc();
+        if (src && dstFrame) {
+            src->format = srcFmt;
+            dstFrame->format = AV_PIX_FMT_RGBA64LE;
+            dstFrame->width = sw;
+            dstFrame->height = sh;
+            // Our buffer, wrapped without ownership (a frame without buf[0] would be
+            // given a buffer of the scaler's own).
+            dstFrame->buf[0] = av_buffer_create(dst[0], size_t(dstStride[0]) * size_t(sh), [](void*, uint8_t*) {}, nullptr, 0);
+            dstFrame->data[0] = dst[0];
+            dstFrame->linesize[0] = dstStride[0];
+            converted = dstFrame->buf[0] && sws_scale_frame(sws_, dstFrame, src) >= 0 && dstFrame->data[0] == dst[0];
+        }
+        av_frame_free(&src);
+        av_frame_free(&dstFrame);
+    }
+    if (!converted) sws_scale(sws_, f->data, f->linesize, 0, f->height, dst, dstStride);
     if (rotation_) {
         auto rotated = std::make_shared<Frame16>(rotateFrame(*out, rotation_));
         rotated->pts = pts;

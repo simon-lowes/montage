@@ -77,6 +77,7 @@ private:
     bool still_ = false;
     Frame16Ptr stillFrame_;
     SwsContext* sws_ = nullptr;
+    int swsKey_[6] = {};  // the conversion sws_ was made for: sizes, source format, flags
     // Hardware decoding: the device's pixel format (-1 = software), the frame
     // hardware frames are copied into, and whether a copy failed (reopen in software).
     int hwPixFmt_ = -1;
