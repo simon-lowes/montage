@@ -122,6 +122,8 @@ QJsonObject clipToJson(const Clip& c) {
     for (const auto& e : c.effects) fx.append(effectToJson(e));
     if (!fx.isEmpty()) o["effects"] = fx;
     if (!c.unrendered.empty()) o["unrendered"] = qs(c.unrendered);
+    if (c.angle != 0) o["angle"] = c.angle;
+    if (c.audioAngle != -1) o["audioAngle"] = c.audioAngle;
     return o;
 }
 
@@ -145,6 +147,8 @@ Clip clipFromJson(const QJsonObject& o) {
     c.audio = effectFromJson(o.value("audio"));
     for (const auto& e : o.value("effects").toArray()) c.effects.push_back(effectFromJson(e));
     c.unrendered = ss(o.value("unrendered"));
+    c.angle = std::max(0, o.value("angle").toInt(0));
+    c.audioAngle = std::max(-1, o.value("audioAngle").toInt(-1));
     return c;
 }
 
@@ -295,6 +299,7 @@ QJsonObject sequenceToJson(const Sequence& s) {
         o["masterEffects"] = fx;
     }
     if (s.masterVolumeDb != 0) o["masterVolumeDb"] = s.masterVolumeDb;
+    if (s.multicam) o["multicam"] = true;
     if (s.colorSpace != "rec709") o["colorSpace"] = qs(s.colorSpace);
     if (s.hdrPeakNits != 1000) o["hdrPeakNits"] = s.hdrPeakNits;
     return o;
@@ -313,6 +318,7 @@ Sequence sequenceFromJson(const QJsonObject& o) {
     s.inPoint = i64(o.value("in"), -1);
     s.outPoint = i64(o.value("out"), -1);
     s.playhead = i64(o.value("playhead"), 0);
+    s.multicam = o.value("multicam").toBool(false);
     s.colorSpace = o.contains("colorSpace") ? ss(o.value("colorSpace")) : "rec709";
     s.hdrPeakNits = std::clamp(o.value("hdrPeakNits").toDouble(1000), 100.0, 10000.0);
     for (const auto& t : o.value("video").toArray()) s.videoTracks.push_back(trackFromJson(t.toObject(), TrackKind::Video));
@@ -386,6 +392,7 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
         if (!m.bin.empty()) o["bin"] = qs(m.bin);
         if (!m.colorSpace.empty()) o["colorSpace"] = qs(m.colorSpace);
         if (!m.colorOverride.empty()) o["colorOverride"] = qs(m.colorOverride);
+        if (m.timecode >= 0) o["timecode"] = m.timecode;
         if (m.transcript && !m.transcript->empty())
             o["transcript"] = QJsonDocument::fromJson(QByteArray::fromStdString(transcriptToJson(*m.transcript))).object();
         media.append(o);
@@ -451,6 +458,7 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
         m.bin = ss(o.value("bin"));
         m.colorSpace = ss(o.value("colorSpace"));
         m.colorOverride = ss(o.value("colorOverride"));
+        m.timecode = o.value("timecode").toDouble(-1);
         p.media.push_back(m);
     }
     for (const auto& sv : root.value("sequences").toArray()) p.sequences.push_back(sequenceFromJson(sv.toObject()));

@@ -106,7 +106,13 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
     - Also a Colour Space Transform effect using Montage's own engine.
     - ACES2065-1 added as a space. Camera gamuts use the makers' published ACES matrices, and the tests check every camera transform against OCIO's built-ins.
   - [ ] Still to do: HDR monitoring on HDR displays (macOS EDR, Windows HDR), and colour-managed scopes.
-- [ ] 14. Multicam (L)
+- [x] 14. Multicam (L):
+  - Multicam clips are nested sequences whose video tracks are angles. They sync by audio (cross-correlation), by timecode (probed from the stream, the container or a tmcd track, drop-frame aware) or by in points.
+  - Clips carry a video angle and an audio angle (one source or all mixed). The compositor renders only the chosen angle, and the mixer mixes only the chosen source.
+  - Multicam panel with an angle grid (rendered off the UI thread): click or 1–9 to switch, live cuts while playing, Shift to cut when stopped, audio follows video.
+  - Speaker-based Auto Switch: per-angle microphones, a wide angle for silence and cross-talk, margin, hold and shortest shot.
+  - Timeline angle labels, angle and audio menus, and Flatten Multicam.
+  - Still to do: speaker labels from transcripts as an alternative to microphones, and multicam in EDL/OTIO export without flattening.
 - [ ] 15. GPU compositor on QRhi (XL)
 - [ ] 16. Tracking and stabilisation (L)
 - [ ] 17. LV2 hosting (M)

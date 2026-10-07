@@ -13,6 +13,7 @@ extern "C" {
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
+#include <libavutil/timecode.h>
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 }
@@ -138,6 +139,13 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         m.height = h;
         AVRational fr = av_guess_frame_rate(fmt, st, nullptr);
         if (fr.num > 0 && fr.den > 0) m.fps = Rational{fr.num, fr.den};
+        // Start timecode (camera files carry it in the stream, the container or a tmcd track).
+        const AVDictionaryEntry* tc = av_dict_get(st->metadata, "timecode", nullptr, 0);
+        if (!tc) tc = av_dict_get(fmt->metadata, "timecode", nullptr, 0);
+        for (unsigned i = 0; !tc && i < fmt->nb_streams; ++i) tc = av_dict_get(fmt->streams[i]->metadata, "timecode", nullptr, 0);
+        AVTimecode parsed;
+        if (tc && fr.num > 0 && fr.den > 0 && av_timecode_init_from_string(&parsed, fr, tc->value, nullptr) == 0)
+            m.timecode = double(parsed.start) * fr.den / fr.num;
         if (dur <= 0 && st->duration > 0) dur = double(st->duration) * av_q2d(st->time_base);
     }
     if (m.hasAudio) {

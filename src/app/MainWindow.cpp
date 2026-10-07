@@ -24,6 +24,7 @@
 #include <QMessageBox>
 #include <QScreen>
 #include <QSettings>
+#include <QShortcut>
 #include <QStatusBar>
 #include <QTableWidget>
 #include <QToolBar>
@@ -44,6 +45,7 @@
 #include "InspectorWidget.h"
 #include "MediaBinWidget.h"
 #include "MixerPanel.h"
+#include "MulticamPanel.h"
 #include "CaptionsPanel.h"
 #include "MaskOverlay.h"
 #include "TranscriptPanel.h"
@@ -193,6 +195,12 @@ void MainWindow::buildPanels() {
     connect(bin_, &MediaBinWidget::openInSource, this, &MainWindow::openInSource);
     connect(bin_, &MediaBinWidget::newTitleRequested, this, &MainWindow::addTitle);
     connect(bin_, &MediaBinWidget::newSequenceRequested, this, &MainWindow::newSequence);
+    connect(bin_, &MediaBinWidget::createMulticamRequested, this, [this](const std::vector<Id>& media) {
+        if (MulticamPanel::createMulticamDialog(state_, media, this)) {
+            multicamDock_->show();
+            multicamDock_->raise();
+        }
+    });
     effects_ = new EffectsBrowser(this);
     connect(effects_, &EffectsBrowser::applyRequested, this, &MainWindow::applyFromBrowser);
     inspector_ = new InspectorWidget(state_, this);
@@ -210,6 +218,7 @@ void MainWindow::buildPanels() {
     });
     connect(source_, &PlaybackController::positionChanged, transcript_, &TranscriptPanel::setSourcePosition);
     meter_ = new AudioMeterWidget(this);
+    multicam_ = new MulticamPanel(state_, program_, this);
 
     sourceDock_ = makeDock(tr("Source"), "source", sourcePanel_);
     programDock_ = makeDock(tr("Program"), "program", programPanel_);
@@ -220,6 +229,14 @@ void MainWindow::buildPanels() {
     mixerDock_ = makeDock(tr("Audio Mixer"), "mixer", mixer_);
     captionsDock_ = makeDock(tr("Captions"), "captions", captions_);
     transcriptDock_ = makeDock(tr("Transcript"), "transcript", transcript_);
+    multicamDock_ = makeDock(tr("Multicam"), "multicam", multicam_);
+    // 1–9 cut to an angle (live while playing); Shift cuts at the playhead when stopped.
+    for (int i = 0; i < 9; ++i) {
+        auto* sw = new QShortcut(QKeySequence(Qt::Key_1 + i), this);
+        connect(sw, &QShortcut::activated, this, [this, i] { multicam_->switchTo(i, false); });
+        auto* cut = new QShortcut(QKeySequence(Qt::SHIFT | (Qt::Key_1 + i)), this);
+        connect(cut, &QShortcut::activated, this, [this, i] { multicam_->switchTo(i, true); });
+    }
     connect(timeline_, &TimelineWidget::captionActivated, this, [this](Id track, int index) {
         captionsDock_->show();
         captionsDock_->raise();
@@ -244,6 +261,7 @@ void MainWindow::resetLayout() {
     tabifyDockWidget(sourceDock_, scopesDock_);
     tabifyDockWidget(sourceDock_, mixerDock_);
     tabifyDockWidget(sourceDock_, captionsDock_);
+    tabifyDockWidget(sourceDock_, multicamDock_);
     sourceDock_->raise();
     addDockWidget(Qt::LeftDockWidgetArea, binDock_);
     tabifyDockWidget(binDock_, effectsDock_);

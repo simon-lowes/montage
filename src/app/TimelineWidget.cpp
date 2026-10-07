@@ -27,6 +27,7 @@
 #include "ThumbnailCache.h"
 #include "audio/PluginEffect.h"
 #include "core/Effects.h"
+#include "core/Multicam.h"
 #include "media/MediaPool.h"
 
 namespace montage {
@@ -562,6 +563,15 @@ void TimelineWidget::paintClip(QPainter& p, const Row& row, const Clip& c, const
     QRect nameR = r.adjusted(5, 1, -4, 0);
     nameR.setHeight(kNameStrip - 2);
     QString name = QString::fromStdString(c.name);
+    if (const Sequence* mc = multicamSequence(proj, c)) {
+        // Multicam: the angle (or audio source) this part plays.
+        if (row.ref.kind == TrackKind::Video) {
+            const int a = std::clamp(c.angle, 0, std::max(0, int(mc->videoTracks.size()) - 1));
+            name = QStringLiteral("[%1] %2").arg(a + 1).arg(mc->videoTracks.empty() ? QString() : QString::fromStdString(mc->videoTracks[size_t(a)].name));
+        } else if (c.audioAngle >= 0 && c.audioAngle < int(mc->audioTracks.size())) {
+            name = QStringLiteral("[%1] %2").arg(QString::fromStdString(mc->audioTracks[size_t(c.audioAngle)].name), name);
+        }
+    }
     if (!badges.isEmpty()) {
         int bw = p.fontMetrics().horizontalAdvance(badges);
         if (nameR.width() > bw + 30) {
@@ -1256,6 +1266,41 @@ void TimelineWidget::contextMenuEvent(QContextMenuEvent* e) {
     if (h.kind == HitKind::ClipBody || h.kind == HitKind::ClipIn || h.kind == HitKind::ClipOut) {
         if (!state_->isSelected(h.clip)) state_->setSelection({h.clip});
         menu.addActions(clipActions_);
+        // Multicam: choose the angle or the sound, or replace with the angles' own clips.
+        if (const Clip* c = edit::clipById(*state_->sequence(), h.clip))
+            if (const Sequence* mc = multicamSequence(state_->project(), *c)) {
+                const Id id = h.clip;
+                menu.addSeparator();
+                if (h.track && h.track->kind == TrackKind::Video) {
+                    QMenu* angles = menu.addMenu(tr("Multicam Angle"));
+                    angles->setObjectName(QStringLiteral("multicamAngle"));
+                    for (int a = 0; a < int(mc->videoTracks.size()); ++a) {
+                        QAction* act = angles->addAction(QStringLiteral("%1  %2").arg(a + 1).arg(QString::fromStdString(mc->videoTracks[size_t(a)].name)),
+                                                         this, [this, id, a] {
+                                                             state_->apply(tr("Switch to Angle %1").arg(a + 1), [id, a](Project& p, Sequence& s) {
+                                                                 return edit::switchAngle(p, s, id, a, 0, false, false);
+                                                             });
+                                                         });
+                        act->setCheckable(true);
+                        act->setChecked(c->angle == a);
+                    }
+                } else {
+                    QMenu* sound = menu.addMenu(tr("Multicam Audio"));
+                    sound->setObjectName(QStringLiteral("multicamAudio"));
+                    for (int a = -1; a < int(mc->audioTracks.size()); ++a) {
+                        const QString label = a < 0 ? tr("All Sources Mixed") : QString::fromStdString(mc->audioTracks[size_t(a)].name);
+                        QAction* act = sound->addAction(label, this, [this, id, a] {
+                            state_->apply(tr("Multicam Audio"), [id, a](Project& p, Sequence& s) { return edit::setAudioAngle(p, s, id, a); });
+                        });
+                        act->setCheckable(true);
+                        act->setChecked(c->audioAngle == a);
+                    }
+                }
+                menu.addAction(tr("Flatten Multicam"), this, [this] {
+                    const std::vector<Id> sel = state_->selectedClips();
+                    state_->apply(tr("Flatten Multicam"), [sel](Project& p, Sequence& s) { return edit::flattenMulticam(p, s, sel); });
+                })->setObjectName(QStringLiteral("flattenMulticam"));
+            }
         // Offline rendering of an audio clip's effects (CPU-heavy plugins).
         if (h.track && h.track->kind == TrackKind::Audio)
             if (const Clip* c = edit::clipById(*state_->sequence(), h.clip)) {

@@ -18,6 +18,7 @@ struct RenderOptions {
     int depth = 0;             // nesting depth (internal)
     bool captions = false;     // draw the visible caption track over the program
     std::string displaySpace;  // program frames converted to this space (ColorSpace.h id) for viewing; "" = as is
+    int soloVideoTrack = -1;   // render only this video track (a multicam angle); not passed to nested sequences
 };
 
 // Composites all video tracks of `seq` at timeline frame `t`.
@@ -74,9 +75,10 @@ public:
     static bool ensurePlugin(State& st, const Effect& e, double sr);
 
 private:
-    // `rate` overrides the sequence's sample rate (nested sequences mix at the outer rate).
+    // `rate` overrides the sequence's sample rate (nested sequences mix at the outer rate);
+    // `onlyTrack` mixes that audio track alone (a multicam clip's audio angle).
     void mixInto(const Project& p, const Sequence& seq, int64_t start, int frames, float* out,
-                 std::vector<MeterLevels>* trackLevels, int depth, int rate = 0);
+                 std::vector<MeterLevels>* trackLevels, int depth, int rate = 0, int onlyTrack = -1);
     // Runs an effect chain over an interleaved stereo block; DSP state is kept per (owner, effect).
     void processChain(const std::vector<Effect>& chain, Id owner, FrameTime lt, double sr, float* buf, int frames);
     // Sums a track's clips over [start, start + frames) into trackBuf; false if none plays.

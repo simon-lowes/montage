@@ -5,6 +5,7 @@
 #include <QAbstractScrollArea>
 #include <QAction>
 #include <QComboBox>
+#include <QDockWidget>
 #include <QDoubleSpinBox>
 #include <QLineEdit>
 #include <QListWidget>
@@ -29,6 +30,7 @@
 #include "audio/Plugins.h"
 #include "MainWindow.h"
 #include "MixerPanel.h"
+#include "MulticamPanel.h"
 #include "PluginEditorWindow.h"
 #include "audio/PluginEffect.h"
 #include "MaskOverlay.h"
@@ -40,6 +42,7 @@
 #include "TranscriptPanel.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
+#include "core/Multicam.h"
 #include "core/ProjectIO.h"
 #include "render/ColorSpace.h"
 #include "render/Compositor.h"
@@ -800,6 +803,80 @@ private slots:
         state()->newProject();
         win_->activateWindow();  // the context menu took the focus
         QVERIFY(QTest::qWaitForWindowActive(win_.get()));
+    }
+
+    void multicamPanelSwitching() {
+        // Two cameras: a red one and a blue one, three seconds each.
+        auto camera = [&](const char* file, double r, double g, double b) {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 160;
+            gs.height = 90;
+            Clip c = makeGeneratorClip(gen, "color", 90);
+            c.generator.params["color.r"] = r;
+            c.generator.params["color.g"] = g;
+            c.generator.params["color.b"] = b;
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, c);
+            ExportSettings st;
+            st.path = (dir_.path() + "/" + file).toStdString();
+            st.audioCodec = "none";
+            st.preset = "ultrafast";
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        };
+        camera("red.mp4", 0.9, 0.1, 0.1);
+        camera("blue.mp4", 0.1, 0.1, 0.9);
+        state()->newProject();
+        auto ids = state()->importFiles({dir_.path() + "/red.mp4", dir_.path() + "/blue.mp4"});
+        QCOMPARE(ids.size(), size_t(2));
+        const Id mc = MulticamPanel::createMulticam(state(), ids, MulticamPanel::Sync::InPoints, "Show", win_.get());
+        QVERIFY(mc);
+        state()->apply("Place", [mc](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, mc, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        });
+        state()->setPlayhead(30);
+        auto* panel = win_->findChild<MulticamPanel*>();
+        QVERIFY(panel);
+        win_->findChild<QDockWidget*>("multicam")->show();
+        win_->findChild<QDockWidget*>("multicam")->raise();
+        QTRY_COMPARE(panel->angleCount(), 2);
+        const Id clip = panel->currentClip();
+        QVERIFY(clip);
+        // Both angles render side by side.
+        QTRY_VERIFY_WITH_TIMEOUT(panel->angleImages().size() == 2 && !panel->angleImages()[1].isNull(), 5000);
+        const QImage red = panel->angleImages()[0], blue = panel->angleImages()[1];
+        const QColor rc = red.pixelColor(red.width() / 2, red.height() / 2), bc = blue.pixelColor(blue.width() / 2, blue.height() / 2);
+        QVERIFY2(rc.red() > 180 && rc.blue() < 80, qPrintable(rc.name()));
+        QVERIFY2(bc.blue() > 180 && bc.red() < 80, qPrintable(bc.name()));
+
+        // Stopped: clicking an angle switches the shot without cutting.
+        QVERIFY(panel->switchTo(1));
+        const Sequence* s = state()->sequence();
+        QCOMPARE(s->videoTracks[0].clips.size(), size_t(1));
+        QCOMPARE(s->videoTracks[0].clips[0].angle, 1);
+        // Shift cuts at the playhead; the key cuts to angle 1 from there.
+        QTest::keyClick(win_.get(), Qt::Key_1, Qt::ShiftModifier);
+        s = state()->sequence();
+        QCOMPARE(s->videoTracks[0].clips.size(), size_t(2));
+        QCOMPARE(s->videoTracks[0].clips[0].angle, 1);
+        QCOMPARE(s->videoTracks[0].clips[1].start, FrameTime(30));
+        QCOMPARE(s->videoTracks[0].clips[1].angle, 0);
+        // The cut shows in the program: red from the cut on.
+        RenderOptions o;
+        auto centre = [&](FrameTime t) {
+            Image img = renderProgramFrame(state()->project(), *state()->sequence(), t, o);
+            return QColor::fromRgbF(img.at(img.width / 2, img.height / 2)[0], 0, img.at(img.width / 2, img.height / 2)[2]);
+        };
+        QVERIFY(centre(10).blueF() > 0.7f);
+        QVERIFY(centre(40).redF() > 0.7f);
+        // The key without Shift switches the shot under the playhead.
+        QTest::keyClick(win_.get(), Qt::Key_2);
+        QCOMPARE(state()->sequence()->videoTracks[0].clips[1].angle, 1);
+        state()->undo();
+        QCOMPARE(state()->sequence()->videoTracks[0].clips[1].angle, 0);
+        state()->undo();
+        QCOMPARE(state()->sequence()->videoTracks[0].clips.size(), size_t(1));
+        state()->newProject();
     }
 
     void ocioEffectInInspector() {

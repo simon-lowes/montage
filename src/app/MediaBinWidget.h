@@ -42,6 +42,7 @@ signals:
     void openInSource(montage::Id media);
     void newTitleRequested();
     void newSequenceRequested();
+    void createMulticamRequested(const std::vector<montage::Id>& media);
 
 private:
     void refreshThumbnails();

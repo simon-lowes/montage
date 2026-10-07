@@ -1,10 +1,13 @@
 // Media tests: probing, frame-accurate decoding, audio mixing, export round trips.
 #include <QtTest>
 
+#include <algorithm>
 #include <cmath>
+#include <functional>
 #include <cstdio>
 
 #include "core/EditOps.h"
+#include "core/Multicam.h"
 #include "core/Effects.h"
 #include "core/ProjectIO.h"
 #include "core/Transcript.h"
@@ -15,6 +18,7 @@
 #include "media/HwAccel.h"
 #include "media/Loudness.h"
 #include "media/MediaPool.h"
+#include "media/SpeakerSwitch.h"
 #ifdef MONTAGE_WITH_WHISPER
 #include "media/Transcriber.h"
 #endif
@@ -59,6 +63,41 @@ void writeWav(const std::string& path, int rate, double seconds, float left, flo
     for (int i = 0; i < frames; ++i) {
         std::fwrite(&l, 2, 1, f);
         std::fwrite(&r, 2, 1, f);
+    }
+    std::fclose(f);
+}
+
+// A mono "microphone" as a 16-bit stereo WAV: a tone at `amplitude` while
+// talking(t) says so, `bleed` of another voice otherwise.
+void writeVoiceWav(const std::string& path, double seconds, double hz, const std::function<bool(double)>& talking,
+                   const std::function<bool(double)>& other) {
+    const int rate = 48000;
+    FILE* f = std::fopen(path.c_str(), "wb");
+    QVERIFY(f);
+    const int frames = int(rate * seconds);
+    uint32_t dataBytes = uint32_t(frames) * 4;
+    auto u32 = [&](uint32_t v) { std::fwrite(&v, 4, 1, f); };
+    auto u16 = [&](uint16_t v) { std::fwrite(&v, 2, 1, f); };
+    std::fwrite("RIFF", 1, 4, f);
+    u32(36 + dataBytes);
+    std::fwrite("WAVEfmt ", 1, 8, f);
+    u32(16);
+    u16(1);
+    u16(2);
+    u32(uint32_t(rate));
+    u32(uint32_t(rate) * 4);
+    u16(4);
+    u16(16);
+    std::fwrite("data", 1, 4, f);
+    u32(dataBytes);
+    for (int i = 0; i < frames; ++i) {
+        const double t = double(i) / rate;
+        double v = 0.002 * std::sin(i * 0.37);  // room tone
+        if (talking(t)) v += 0.3 * std::sin(2 * M_PI * hz * t);
+        if (other(t)) v += 0.02 * std::sin(2 * M_PI * hz * 1.5 * t);  // the other voice, faintly
+        const int16_t s = int16_t(std::lround(std::clamp(v, -1.0, 1.0) * 32767));
+        std::fwrite(&s, 2, 1, f);
+        std::fwrite(&s, 2, 1, f);
     }
     std::fclose(f);
 }
@@ -598,6 +637,87 @@ private slots:
         QVERIFY(QString::fromStdString(err).contains("not found"));
     }
 #endif
+
+    void multicamSpeakerSwitchAndAudioAngles() {
+        // Two people with a microphone each: A talks for 3 s, then B for 3 s,
+        // then both at once for 2 s, then silence.
+        auto aTalks = [](double t) { return t < 3 || (t >= 6 && t < 8); };
+        auto bTalks = [](double t) { return (t >= 3 && t < 8); };
+        writeVoiceWav(path("lavA.wav"), 10, 220, aTalks, bTalks);
+        writeVoiceWav(path("lavB.wav"), 10, 330, bTalks, aTalks);
+        Project p = makeDefaultProject();
+        Sequence& s0 = *p.active();
+        s0.fps = {30, 1};
+        auto camera = [&](const char* name) {
+            MediaItem m;
+            m.id = p.newId();
+            m.name = name;
+            m.path = std::string("/nonexistent/") + name;
+            m.hasVideo = true;
+            m.duration = 10;
+            m.width = 320;
+            m.height = 180;
+            m.fps = {30, 1};
+            p.media.push_back(m);
+            return m.id;
+        };
+        const Id camA = camera("CamA.mov"), camB = camera("CamB.mov"), wide = camera("Wide.mov");
+        p.media.push_back(probeOrFail(p, path("lavA.wav")));
+        const Id lavA = p.media.back().id;
+        p.media.push_back(probeOrFail(p, path("lavB.wav")));
+        const Id lavB = p.media.back().id;
+        std::string err;
+        const Id mcId = makeMulticam(p, {camA, camB, wide, lavA, lavB}, {0, 0, 0, 0, 0}, "Talk", &err);
+        QVERIFY2(mcId, err.c_str());
+        const Sequence& mc = *p.findSequence(p.findMedia(mcId)->sequenceId);
+        QCOMPARE(mc.audioTracks.size(), size_t(2));
+
+        AutoSwitchOptions o;
+        o.listen = {0, 1, -1};  // A's close-up hears lav A, B's hears lav B
+        o.wideAngle = 2;
+        auto changes = speakerAngleChanges(p, mc, o, &err);
+        QVERIFY2(!changes.empty(), err.c_str());
+        QString got;
+        for (auto [f, a] : changes) got += QString("(%1,%2) ").arg(f).arg(a);
+        QCOMPARE(changes.size(), size_t(3));
+        QCOMPARE(changes[0], (std::pair<FrameTime, int>{0, 0}));
+        QVERIFY2(changes[1].second == 1 && changes[1].first >= 88 && changes[1].first <= 105, qPrintable(got));
+        QVERIFY2(changes[2].second == 2 && changes[2].first >= 178 && changes[2].first <= 195, qPrintable(got));
+        // A longer minimum shot holds A until 4 s, and the wide until B has had 4 s.
+        o.minShotSeconds = 4;
+        changes = speakerAngleChanges(p, mc, o, &err);
+        got.clear();
+        for (auto [f, a] : changes) got += QString("(%1,%2) ").arg(f).arg(a);
+        QCOMPARE(changes.size(), size_t(3));
+        QVERIFY2(changes[1].first == 120 && changes[1].second == 1, qPrintable(got));
+        QVERIFY2(changes[2].first == 240 && changes[2].second == 2, qPrintable(got));
+        // Without a wide angle the last speaker keeps the shot through cross-talk and silence.
+        o.minShotSeconds = 2;
+        o.wideAngle = -1;
+        changes = speakerAngleChanges(p, mc, o, &err);
+        QCOMPARE(changes.size(), size_t(2));
+        // Nobody to listen to.
+        o.listen = {-1, -1, -1};
+        QVERIFY(speakerAngleChanges(p, mc, o, &err).empty());
+        QVERIFY(!err.empty());
+
+        // Audio angles: the mix, or one microphone.
+        Sequence& s = *p.active();
+        QVERIFY(edit::placeMedia(p, s, mcId, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        auto rms = [&](int audioAngle, double at) {
+            trackAt(s, {TrackKind::Audio, 0})->clips[0].audioAngle = audioAngle;
+            AudioMixer mixer;
+            std::vector<float> out(4800 * 2);
+            mixer.mix(p, s, int64_t(at * 48000), 4800, out.data());
+            double sum = 0;
+            for (float v : out) sum += double(v) * v;
+            return std::sqrt(sum / double(out.size()));
+        };
+        QVERIFY(rms(-1, 1.0) > 0.15);  // A talking, whole mix
+        QVERIFY(rms(0, 1.0) > 0.15);   // lav A
+        QVERIFY(rms(1, 1.0) < 0.03);   // lav B hears A faintly
+        QVERIFY(rms(1, 4.0) > 0.15);
+    }
 
     void hdrExportRoundTrip() {
         if (!avcodec_find_encoder_by_name("libx265")) QSKIP("This FFmpeg has no libx265");

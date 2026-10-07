@@ -5,6 +5,7 @@ add_library(montage_engine STATIC
   core/TranscriptEdit.h core/TranscriptEdit.cpp
   core/Effects.h core/Effects.cpp
   core/EditOps.h core/EditOps.cpp
+  core/Multicam.h core/Multicam.cpp
   core/History.h core/History.cpp
   core/ProjectIO.h core/ProjectIO.cpp
   core/Interchange.h core/Interchange.cpp
@@ -15,6 +16,7 @@ add_library(montage_engine STATIC
   media/Analysis.h media/Analysis.cpp
   media/Loudness.h media/Loudness.cpp
   media/AudioSync.h media/AudioSync.cpp
+  media/SpeakerSwitch.h media/SpeakerSwitch.cpp
   render/Processing.h render/Processing.cpp
   render/ColorSpace.h render/ColorSpace.cpp
   render/Ocio.h render/Ocio.cpp

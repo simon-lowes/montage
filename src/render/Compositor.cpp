@@ -285,6 +285,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             RenderOptions no = o;
             no.depth = o.depth + 1;
             no.scale = double(w) / nested->width;
+            if (nested->multicam) no.soloVideoTrack = std::clamp(c.angle, 0, std::max(0, int(nested->videoTracks.size()) - 1));
             FrameTime nf = FrameTime(std::floor(c.sourceFrameAt(t) * nested->fpsValue() / seq.fpsValue() + 1e-6));
             src = renderSequenceFrame(p, *nested, nf, no);
             convertColor(src, sequenceColorSpace(*nested), sequenceColorSpace(seq), seq.hdrPeakNits);
@@ -329,7 +330,10 @@ const Clip* findClip(const Track& t, Id id) {
 
 }  // namespace
 
-Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o) {
+Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& opts) {
+    const int solo = opts.soloVideoTrack;
+    RenderOptions o = opts;
+    o.soloVideoTrack = -1;
     int W = std::max(1, int(std::lround(seq.width * o.scale))), H = std::max(1, int(std::lround(seq.height * o.scale)));
     Image canvas(W, H);
     bool canvasEmpty = true;  // nothing drawn yet: the first normal layer can be moved in
@@ -339,8 +343,9 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
         else blendOnto(canvas, layer, mode, 1.0f);
         canvasEmpty = false;
     };
-    for (const Track& track : seq.videoTracks) {
-        if (track.muted) continue;
+    for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti) {
+        const Track& track = seq.videoTracks[ti];
+        if (solo >= 0 ? int(ti) != solo : track.muted) continue;  // an angle shows even if its track is hidden
         const Transition* active = nullptr;
         FrameTime from = 0, to = 0;
         for (const auto& tr : track.transitions) {
@@ -858,7 +863,8 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
             int64_t nStart = int64_t(std::floor(lo));
             int64_t nLen = s1 > s0 ? int64_t(std::floor(hi)) - nStart + 2 : 0;
             std::vector<float> nb(size_t(std::max<int64_t>(0, nLen)) * 2, 0.0f);
-            if (nLen > 0) mixInto(p, *nested, nStart, int(nLen), nb.data(), nullptr, depth + 1, int(sr));
+            const int only = nested->multicam ? c.audioAngle : -1;
+            if (nLen > 0) mixInto(p, *nested, nStart, int(nLen), nb.data(), nullptr, depth + 1, int(sr), only);
             for (int64_t smp = s0; smp < s1; ++smp) {
                 double rel = srcPos(smp) - double(nStart);
                 int64_t i = std::clamp<int64_t>(int64_t(rel), 0, nLen - 2);
@@ -946,7 +952,7 @@ int AudioMixer::maxLatency(const Sequence& seq, double sr) {
 }
 
 void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, int frames, float* out,
-                         std::vector<MeterLevels>* trackLevels, int depth, int rate) {
+                         std::vector<MeterLevels>* trackLevels, int depth, int rate, int onlyTrack) {
     const double sr = rate > 0 ? rate : seq.sampleRate;
     const double fps = seq.fpsValue();
     bool anySolo = std::any_of(seq.audioTracks.begin(), seq.audioTracks.end(), [](const Track& t) { return t.solo; });
@@ -967,7 +973,7 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
     std::vector<float> trackBuf(size_t(frames) * 2);
     for (size_t ti = 0; ti < seq.audioTracks.size(); ++ti) {
         const Track& track = seq.audioTracks[ti];
-        if (track.muted || (anySolo && !track.solo)) continue;
+        if (onlyTrack >= 0 ? int(ti) != onlyTrack : (track.muted || (anySolo && !track.solo))) continue;
         auto bus = track.output ? busBufs.find(track.output) : busBufs.end();
         const int64_t downstream = masterLat + (bus != busBufs.end() ? busLat[bus->first] : 0);
         const int64_t trackLat = chainLatency(track.effects, track.id, sr);

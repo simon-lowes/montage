@@ -9,6 +9,7 @@
 #include "core/Effects.h"
 #include "core/History.h"
 #include "core/Interchange.h"
+#include "core/Multicam.h"
 #include "core/ProjectIO.h"
 #include "core/Transcript.h"
 #include "core/TranscriptEdit.h"
@@ -711,6 +712,112 @@ private slots:
         QVERIFY(fx.p == after);
         h.push("Other", fx.p);  // new edit clears redo
         QVERIFY(!h.canRedo());
+    }
+
+    void multicamClips() {
+        Project p = makeDefaultProject();
+        auto addMedia = [&](const char* name, bool video, bool audio, double tc) {
+            MediaItem m;
+            m.id = p.newId();
+            m.kind = video ? MediaKind::Video : MediaKind::Audio;
+            m.name = name;
+            m.path = std::string("/nonexistent/") + name;
+            m.duration = 10.0;
+            m.width = 1920;
+            m.height = 1080;
+            m.fps = {30, 1};
+            m.hasVideo = video;
+            m.hasAudio = audio;
+            m.timecode = tc;
+            p.media.push_back(m);
+            return m.id;
+        };
+        const Id camA = addMedia("CamA.mov", true, true, 3600.0);
+        const Id camB = addMedia("CamB.mov", true, true, 3601.0);
+        const Id lav = addMedia("Lav.wav", false, true, 3599.5);
+        std::vector<double> offsets;
+        QVERIFY(timecodeOffsets(p, {camA, camB, lav}, offsets));
+        std::string err;
+        const Id mcMedia = makeMulticam(p, {camA, camB, lav}, offsets, "Interview", &err);
+        QVERIFY2(mcMedia, err.c_str());
+        const MediaItem& mm = *p.findMedia(mcMedia);
+        const Sequence* mc = p.findSequence(mm.sequenceId);
+        QVERIFY(mc && mc->multicam);
+        QCOMPARE(angleNames(*mc), (std::vector<std::string>{"CamA.mov", "CamB.mov"}));
+        QCOMPARE(mc->audioTracks.size(), size_t(3));
+        // Synced by timecode: the lav starts first (frame 0), A half a second later, B 1.5 s later.
+        QCOMPARE(mc->videoTracks[0].clips[0].start, FrameTime(15));
+        QCOMPARE(mc->videoTracks[1].clips[0].start, FrameTime(45));
+        QCOMPARE(mc->audioTracks[2].clips[0].start, FrameTime(0));
+        QCOMPARE(angleAudioTrack(*mc, 1), 1);
+        QCOMPARE(audioTrackAngle(*mc, 2), -1);
+        // Without timecode on every item there is no timecode sync.
+        p.findMedia(lav)->timecode = -1;
+        QVERIFY(!timecodeOffsets(p, {camA, lav}, offsets));
+
+        // On the timeline: a video clip and its linked audio, showing angle 1 and the whole mix.
+        Sequence& s = *p.active();
+        QVERIFY(edit::placeMedia(p, s, mcMedia, 0, 0, -1, V1, A1, false).ok);
+        const Id v = trackAt(s, V1)->clips.at(0).id;
+        QCOMPARE(trackAt(s, V1)->clips[0].angle, 0);
+        QCOMPARE(trackAt(s, A1)->clips[0].audioAngle, -1);
+        QVERIFY(edit::switchAngle(p, s, v, 1, 0, false, false).ok);
+        QCOMPARE(edit::clipById(s, v)->angle, 1);
+        QVERIFY(!edit::switchAngle(p, s, v, 5, 0, false, false).ok);
+        // Cutting to angle 0 at frame 100: picture and sound are cut together.
+        Result r = edit::switchAngle(p, s, v, 0, 100, true, true);
+        QVERIFY(r.ok);
+        QCOMPARE(trackAt(s, V1)->clips.size(), size_t(2));
+        QCOMPARE(trackAt(s, A1)->clips.size(), size_t(2));
+        QCOMPARE(trackAt(s, V1)->clips[0].angle, 1);
+        QCOMPARE(trackAt(s, V1)->clips[1].angle, 0);
+        QCOMPARE(trackAt(s, V1)->clips[1].start, FrameTime(100));
+        QCOMPARE(trackAt(s, A1)->clips[0].audioAngle, -1);  // audio follows only from the cut on
+        QCOMPARE(trackAt(s, A1)->clips[1].audioAngle, 0);
+        QCOMPARE(trackAt(s, V1)->clips[1].linkGroup, trackAt(s, A1)->clips[1].linkGroup);
+        QVERIFY(trackAt(s, V1)->clips[1].linkGroup != trackAt(s, V1)->clips[0].linkGroup);
+        QVERIFY(edit::setAudioAngle(p, s, trackAt(s, A1)->clips[1].id, 2).ok);
+        QCOMPARE(trackAt(s, A1)->clips[1].audioAngle, 2);
+        QVERIFY(!edit::setAudioAngle(p, s, trackAt(s, A1)->clips[1].id, 3).ok);
+
+        // Automatic changes in multicam frames: the clip is cut wherever the angle changes.
+        Sequence& s2 = s;
+        removeClips(p, s2, expandLinks(s2, {trackAt(s2, V1)->clips[0].id, trackAt(s2, V1)->clips[1].id}), false);
+        QVERIFY(trackAt(s2, V1)->clips.empty() && trackAt(s2, A1)->clips.empty());
+        QVERIFY(edit::placeMedia(p, s2, mcMedia, 30, 60, 300, V1, A1, false).ok);  // shows multicam frames 60..299
+        const Id mcClip = trackAt(s2, V1)->clips.at(0).id;
+        r = edit::applyAngleChanges(p, s2, mcClip, {{0, 1}, {90, 0}, {150, 0}, {200, 1}, {400, 0}}, false);
+        QVERIFY2(r.ok, r.error.c_str());
+        const auto& vc = trackAt(s2, V1)->clips;
+        QCOMPARE(vc.size(), size_t(3));
+        QCOMPARE(vc[0].angle, 1);
+        QCOMPARE(vc[1].start, FrameTime(60));  // multicam frame 90 = timeline 30 + (90 - 60)
+        QCOMPARE(vc[1].angle, 0);
+        QCOMPARE(vc[2].start, FrameTime(170));
+        QCOMPARE(vc[2].angle, 1);
+        QCOMPARE(trackAt(s2, A1)->clips.size(), size_t(3));
+
+        // Flattening puts the angles' own clips in their place.
+        r = edit::flattenMulticam(p, s2, {vc[0].id, vc[1].id, vc[2].id});
+        QVERIFY2(r.ok, r.error.c_str());
+        const auto& flat = trackAt(s2, V1)->clips;
+        QCOMPARE(flat.size(), size_t(3));
+        QCOMPARE(flat[0].mediaId, camB);
+        QCOMPARE(flat[1].mediaId, camA);
+        QCOMPARE(flat[2].mediaId, camB);
+        QCOMPARE(flat[0].start, FrameTime(30));
+        // Camera A starts at multicam frame 15: multicam frame 90 is its frame 75.
+        QCOMPARE(flat[1].sourceIn, 75.0);
+        QCOMPARE(flat[2].sourceIn, 200.0 - 45.0);
+        // The whole-mix audio stays a multicam clip.
+        QVERIFY(multicamSequence(p, trackAt(s2, A1)->clips.at(0)));
+
+        // Saved with the project.
+        trackAt(s2, A1)->clips[0].audioAngle = 1;
+        Project back;
+        QVERIFY(projectFromJson(projectToJson(p), back));
+        QVERIFY(back == p);
+        QVERIFY(back.findSequence(mm.sequenceId)->multicam);
     }
 
     void projectRoundTrip() {

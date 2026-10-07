@@ -242,6 +242,46 @@ colorspaces:
         QVERIFY(c[0] > 0.36f && c[0] < 0.5f);
     }
 
+    void multicamShowsOneAngle() {
+        // A multicam sequence with a red and a blue angle (the blue one on top).
+        Project p = makeDefaultProject();
+        Sequence mc = makeSequence(p, "MC", 64, 36, {30, 1}, 2, 0);
+        mc.multicam = true;
+        mc.videoTracks[0].clips.push_back(colorClip(p, 1, 0, 0, 0, 60));
+        mc.videoTracks[1].clips.push_back(colorClip(p, 0, 0, 1, 0, 60));
+        mc.videoTracks[0].muted = true;  // a hidden angle still shows when chosen
+        MediaItem m;
+        m.id = p.newId();
+        m.kind = MediaKind::Sequence;
+        m.sequenceId = mc.id;
+        m.hasVideo = true;
+        m.width = 64;
+        m.height = 36;
+        p.sequences.push_back(mc);
+        p.media.push_back(m);
+        Sequence& s = *p.active();
+        s.width = 64;
+        s.height = 36;
+        Clip c = makeClip(p, m, TrackKind::Video, s);
+        c.duration = 60;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, c);
+        RenderOptions o;
+        float px[4];
+        rgb(renderProgramFrame(p, s, 5, o), 32, 18, px);
+        QVERIFY(near(px[0], 1) && near(px[2], 0));  // angle 0: red, not the blue track above it
+        trackAt(s, {TrackKind::Video, 0})->clips[0].angle = 1;
+        rgb(renderProgramFrame(p, s, 5, o), 32, 18, px);
+        QVERIFY(near(px[0], 0) && near(px[2], 1));
+        // Out-of-range angles fall back to the last one.
+        trackAt(s, {TrackKind::Video, 0})->clips[0].angle = 7;
+        rgb(renderProgramFrame(p, s, 5, o), 32, 18, px);
+        QVERIFY(near(px[2], 1));
+        // The same sequence nested as an ordinary compound shows every visible track.
+        p.findSequence(mc.id)->multicam = false;
+        rgb(renderProgramFrame(p, s, 5, o), 32, 18, px);
+        QVERIFY(near(px[2], 1) && near(px[0], 0));
+    }
+
     void colorManagedCompositing() {
         Project p = makeDefaultProject();
         Sequence& s = *p.active();

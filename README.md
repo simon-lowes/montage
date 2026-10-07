@@ -48,6 +48,16 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
     - ACES 2.0 output transforms come with OCIO 2.5's built-in configs.
   - The camera log curves and gamuts match OpenColorIO's reference ACES transforms to 1e-4. They use the makers' published matrices to ACES.
 
+**Multicam**
+- Create Multicam Clip (media bin) makes angles from any number of cameras, synced by their sound, by timecode or by in points. Every source with sound gets an audio track.
+- The Multicam panel shows every angle side by side:
+  - click an angle or press 1–9 to switch;
+  - while the program plays, each switch is a cut at the playhead, so a scene can be cut live;
+  - Shift cuts while stopped;
+  - audio can follow the video.
+- Auto Switch cuts to whoever is speaking. Each close-up listens to that person's microphone, a wide angle covers silence and cross-talk, and there is a shortest-shot length and a speaker margin.
+- On the timeline, clips are labelled with their angle. Multicam Angle and Multicam Audio (one source or all mixed) can be changed per clip, and Flatten Multicam swaps in the cameras' own clips.
+
 **Audio**
 - Clip gain and pan, both keyframeable
 - Track faders, pan, mute and solo in a mixer panel

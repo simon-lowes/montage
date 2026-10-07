@@ -101,6 +101,7 @@ struct MediaItem {
     std::string bin;         // bin (folder) name, "" = root
     std::string colorSpace;     // detected from the file's colour tags (ColorSpace.h id), "" = Rec.709
     std::string colorOverride;  // Interpret Colour: the space to read it as, "" = as detected
+    double timecode = -1;       // start timecode in seconds (for multicam sync), -1 = none
     // Speech-to-text of the media's audio (shared: undo snapshots copy the pointer).
     std::shared_ptr<const Transcript> transcript;
     bool operator==(const MediaItem&) const = default;
@@ -129,6 +130,8 @@ struct Clip {
     Effect audio;                // fixed "volume" attributes (audio clips)
     std::vector<Effect> effects; // filter stack, applied in order
     std::string unrendered;      // after Render and Replace: the clip as it was (JSON), for Restore
+    int angle = 0;               // multicam video clip: the angle shown (video track of the multicam sequence)
+    int audioAngle = -1;         // multicam audio clip: the audio track played, -1 = all of them
 
     FrameTime end() const { return start + duration; }
     bool contains(FrameTime t) const { return t >= start && t < end(); }
@@ -203,6 +206,7 @@ struct Sequence {
     std::vector<Bus> buses;                   // audio submixes
     std::vector<Effect> masterEffects;        // on the final mix, before the master fader
     double masterVolumeDb = 0;
+    bool multicam = false;              // a multicam clip's sequence: video tracks are angles (Multicam.h)
     std::string colorSpace = "rec709";  // working and delivery space (ColorSpace.h id)
     double hdrPeakNits = 1000;          // mastering peak for HDR spaces
     FrameTime inPoint = -1;   // In / Out marks; both frames are included, -1 = unset

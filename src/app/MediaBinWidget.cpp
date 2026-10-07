@@ -363,6 +363,18 @@ void MediaBinWidget::showContextMenu(const QPoint& pos) {
             a->setData(QString::fromStdString(cs.id));
         }
     }
+    std::vector<Id> sources;  // files a multicam clip can be made of
+    for (Id id : ids)
+        if (const MediaItem* m = state_->project().findMedia(id); m && m->kind != MediaKind::Sequence && (m->hasVideo || m->hasAudio))
+            sources.push_back(id);
+    if (sources.size() >= 2 && std::any_of(sources.begin(), sources.end(), [this](Id id) {
+            const MediaItem* m = state_->project().findMedia(id);
+            return m && m->hasVideo;
+        })) {
+        menu.addSeparator();
+        menu.addAction(tr("Create Multicam Clip..."), this, [this, sources] { emit createMulticamRequested(sources); })
+            ->setObjectName(QStringLiteral("createMulticam"));
+    }
     if (!videos.empty()) {
         menu.addSeparator();
         menu.addAction(tr("Create Proxy Media"), this, [this, videos] { createProxies(videos); });

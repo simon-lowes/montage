@@ -214,6 +214,7 @@ int cmdInfo(const std::vector<std::string>& args) {
         std::printf("Sequence \"%s\" %dx%d @ %.3f fps, %d Hz, duration %s%s\n", s.name.c_str(), s.width, s.height,
                     s.fpsValue(), s.sampleRate, formatTimecode(s.duration(), s.fps).c_str(),
                     s.id == p.activeSequence ? " (active)" : "");
+        if (s.multicam) std::printf("  multicam: %zu angles, %zu audio sources\n", s.videoTracks.size(), s.audioTracks.size());
         std::printf("  colour: %s%s\n", sequenceColorSpace(s).label.c_str(),
                     sequenceColorSpace(s).hdr() ? (", " + std::to_string(int(s.hdrPeakNits)) + " nits peak").c_str() : "");
         for (auto r : allTracks(s)) {
