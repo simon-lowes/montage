@@ -51,6 +51,9 @@ if(MONTAGE_WITH_VST3)
     ${VST3SDK}/pluginterfaces/base/coreiids.cpp
     ${VST3SDK}/public.sdk/source/vst/vstinitiids.cpp)
   target_include_directories(montage_test_vst3 PRIVATE ${VST3SDK})
+  if(APPLE)
+    target_link_libraries(montage_test_vst3 PRIVATE "-framework CoreFoundation")  # FUID::generate
+  endif()
   target_compile_options(montage_test_vst3 PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-w>)
   set_target_properties(montage_test_vst3 PROPERTIES PREFIX "" SUFFIX ".vst3" OUTPUT_NAME MontageTestVst3
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/vst3
