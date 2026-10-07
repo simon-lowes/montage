@@ -261,7 +261,7 @@ void EffectsBrowser::populate() {
     QHash<QString, QTreeWidgetItem*> vendors;
     const QIcon pluginIcon = categoryIcon(EffectCategory::AudioFilter);
     for (const plugins::Descriptor& d : plugins::Registry::instance().plugins()) {
-        if (!plugins::canHost(d.format) || d.instrument) continue;
+        if (!plugins::canHost(d.format) || d.instrument || plugins::Registry::instance().isPluginDisabled(d.id)) continue;
         if (!pluginsTop) {
             pluginsTop = new QTreeWidgetItem(QStringList{tr("Audio Plugins")});
             pluginsTop->setIcon(0, folderIcon);

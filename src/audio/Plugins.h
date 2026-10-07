@@ -15,6 +15,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -99,6 +100,7 @@ struct ScanReport {
     int fromCache = 0;  // unchanged files answered from the cache
     int probed = 0;     // files loaded in the probe process
     std::vector<Blocked> newlyBlocked;
+    std::vector<std::string> log;  // one line per file: cached / read / probed / blocked / listed
 };
 
 class Registry {
@@ -115,12 +117,18 @@ public:
     void setProbeTimeoutMs(int ms);
     // Folders scanned for a format; empty restores the defaults.
     void setSearchPaths(Format f, std::vector<std::string> dirs);
+    // Folders the user added, scanned after the defaults.
+    void setExtraSearchPaths(Format f, std::vector<std::string> dirs);
+    std::vector<std::string> extraSearchPaths(Format f) const;
     std::vector<std::string> searchPaths(Format f) const;
 
     // Scans every format's folders. Unchanged files come from the cache,
     // blocklisted files are skipped (unless rescanBlocked), the rest are probed.
     ScanReport scan(bool rescanBlocked = false,
                     const std::function<void(int done, int total, const std::string& path)>& progress = {});
+    // Like scan(), but loads these files again even if they are unchanged or blocked.
+    ScanReport rescan(const std::vector<std::string>& paths,
+                      const std::function<void(int done, int total, const std::string& path)>& progress = {});
 
     // Safe mode: while disabled, no plugin is listed or found (effects pass audio through).
     void setEnabled(bool on);
@@ -130,10 +138,16 @@ public:
     std::optional<Descriptor> find(const std::string& id) const;
     std::vector<Blocked> blocklist() const;
     void unblock(const std::string& path);
+    // Disabled plugins stay installed and keep working in existing projects,
+    // but are not offered in effect lists. Saved with the cache.
+    void setPluginDisabled(const std::string& id, bool disabled);
+    bool isPluginDisabled(const std::string& id) const;
     void clear();  // forgets the cache and the blocklist
 
 private:
     struct Entry;
+    ScanReport scanImpl(bool rescanBlocked, const std::set<std::string>& force,
+                        const std::function<void(int, int, const std::string&)>& progress);
     std::string defaultCachePath() const;
     void loadCacheLocked() const;
     void saveCacheLocked() const;
@@ -143,6 +157,8 @@ private:
     std::string probe_;
     int timeoutMs_ = 15000;
     std::vector<std::string> searchPaths_[4];
+    std::vector<std::string> extraPaths_[4];
+    mutable std::set<std::string> disabled_;
     bool customPaths_[4] = {false, false, false, false};
     mutable bool loaded_ = false;
     bool enabled_ = true;

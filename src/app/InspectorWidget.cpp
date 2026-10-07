@@ -400,7 +400,7 @@ void InspectorWidget::addEffectMenu(TrackKind kind, Id clipId) {
         std::map<QString, QMenu*> vendors;
         QMenu* pluginMenu = nullptr;
         for (const plugins::Descriptor& d : plugins::Registry::instance().plugins()) {
-            if (!plugins::canHost(d.format) || d.instrument) continue;
+            if (!plugins::canHost(d.format) || d.instrument || plugins::Registry::instance().isPluginDisabled(d.id)) continue;
             if (!pluginMenu) pluginMenu = menu->addMenu(tr("Plugins"));
             const QString vendor = d.vendor.empty() ? tr("Other") : QString::fromStdString(d.vendor);
             QMenu*& vm = vendors[vendor];

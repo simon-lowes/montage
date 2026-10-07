@@ -1234,6 +1234,7 @@ void MainWindow::scanPluginsInBackground() {
     // Like other hosts, look for new or changed plugins at every launch; unchanged
     // ones come from the cache, so this is quick after the first run.
     if (qEnvironmentVariableIsSet("MONTAGE_NO_PLUGIN_SCAN")) return;
+    PluginManagerDialog::applySavedFolders();
     auto* watcher = new QFutureWatcher<plugins::ScanReport>(this);
     connect(watcher, &QFutureWatcher<plugins::ScanReport>::finished, this, [this, watcher] {
         watcher->deleteLater();

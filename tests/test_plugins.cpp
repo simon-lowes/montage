@@ -218,6 +218,63 @@ private slots:
         QCOMPARE(r.blocklist().size(), size_t(2));
     }
 
+    void parallelScanRescanAndManagement() {
+        // Four copies of the hanging plugin are probed in parallel, so the scan
+        // takes about two timeouts instead of four.
+        std::vector<std::string> hangDirs;
+        const QString hangFile = QString::fromStdString(findPluginFiles(Format::Clap, {clapDir("hang")}).at(0));
+        for (int i = 0; i < 4; ++i) {
+            const QString d = path("hang-copies") + "/" + QString::number(i);
+            QVERIFY(QDir().mkpath(d));
+            QVERIFY(QFile::copy(hangFile, d + "/MontageTestHang.clap"));
+            hangDirs.push_back(d.toStdString());
+        }
+        Registry r;
+        isolate(r, path("cache-parallel.json"), hangDirs);
+        r.setProbeTimeoutMs(1500);
+        QElapsedTimer timer;
+        timer.start();
+        ScanReport rep = r.scan();
+        QCOMPARE(rep.probed, 4);
+        QCOMPARE(rep.newlyBlocked.size(), size_t(4));
+        QVERIFY2(timer.elapsed() < 5200, qPrintable(QString("%1 ms").arg(timer.elapsed())));  // serial: 6 s+
+        QCOMPARE(rep.log.size(), size_t(4));
+        for (const std::string& line : rep.log) QVERIFY2(line.rfind("blocked: ", 0) == 0, line.c_str());
+
+        // Rescan Selected loads a file again even though it is unchanged.
+        Registry g;
+        isolate(g, path("cache-manage.json"), {clapDir("good")});
+        g.scan();
+        const std::string goodFile = findPluginFiles(Format::Clap, {clapDir("good")}).at(0);
+        rep = g.rescan({goodFile});
+        QCOMPARE(rep.probed, 1);
+        QCOMPARE(rep.fromCache, 0);
+        QVERIFY(rep.log.at(0).rfind("probed: ", 0) == 0);
+        QCOMPARE(g.scan().fromCache, 1);
+
+        // Disabled plugins are remembered, still listed and still found (projects keep working).
+        g.setPluginDisabled("clap:org.montage.test.gain", true);
+        QVERIFY(g.isPluginDisabled("clap:org.montage.test.gain"));
+        QVERIFY(!g.isPluginDisabled("clap:org.montage.test.invert"));
+        {
+            Registry again;
+            isolate(again, path("cache-manage.json"), {clapDir("good")});
+            QVERIFY(again.isPluginDisabled("clap:org.montage.test.gain"));
+            QVERIFY(again.find("clap:org.montage.test.gain").has_value());
+            QCOMPARE(again.plugins().size(), size_t(2));
+        }
+        g.setPluginDisabled("clap:org.montage.test.gain", false);
+        QVERIFY(!g.isPluginDisabled("clap:org.montage.test.gain"));
+
+        // Folders the user adds are scanned after the defaults.
+        Registry e;
+        e.setCachePath(path("cache-extra.json").toStdString());
+        e.setExtraSearchPaths(Format::Clap, {"/extra/clap/folder"});
+        auto dirs = e.searchPaths(Format::Clap);
+        QVERIFY(dirs.size() > 1);
+        QCOMPARE(QString::fromStdString(dirs.back()), QString("/extra/clap/folder"));
+    }
+
     void hostsAClapPlugin() {
         auto d = gainDescriptor();
         QVERIFY(d.has_value());

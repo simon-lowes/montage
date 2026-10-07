@@ -15,6 +15,8 @@
 #include <atomic>
 #include <cstdlib>
 #include <map>
+#include <set>
+#include <thread>
 #include <utility>
 
 #include "Plugins.h"
@@ -491,20 +493,50 @@ void Registry::setSearchPaths(Format f, std::vector<std::string> dirs) {
     searchPaths_[int(f)] = std::move(dirs);
 }
 
+void Registry::setExtraSearchPaths(Format f, std::vector<std::string> dirs) {
+    std::lock_guard lock(m_);
+    extraPaths_[int(f)] = std::move(dirs);
+}
+
+std::vector<std::string> Registry::extraSearchPaths(Format f) const {
+    std::lock_guard lock(m_);
+    return extraPaths_[int(f)];
+}
+
 std::vector<std::string> Registry::searchPaths(Format f) const {
     std::lock_guard lock(m_);
-    return customPaths_[int(f)] ? searchPaths_[int(f)] : defaultSearchPaths(f);
+    if (customPaths_[int(f)]) return searchPaths_[int(f)];
+    std::vector<std::string> dirs = defaultSearchPaths(f);
+    for (const std::string& d : extraPaths_[int(f)])
+        if (std::find(dirs.begin(), dirs.end(), d) == dirs.end()) dirs.push_back(d);
+    return dirs;
+}
+
+void Registry::setPluginDisabled(const std::string& id, bool disabled) {
+    std::lock_guard lock(m_);
+    loadCacheLocked();
+    if (disabled) disabled_.insert(id);
+    else disabled_.erase(id);
+    saveCacheLocked();
+}
+
+bool Registry::isPluginDisabled(const std::string& id) const {
+    std::lock_guard lock(m_);
+    loadCacheLocked();
+    return disabled_.count(id) > 0;
 }
 
 void Registry::loadCacheLocked() const {
     if (loaded_) return;
     loaded_ = true;
     entries_.clear();
+    disabled_.clear();
     const std::string path = cachePath_.empty() ? defaultCachePath() : cachePath_;
     QFile f(q(path));
     if (!f.open(QIODevice::ReadOnly)) return;
     const QJsonObject root = QJsonDocument::fromJson(f.readAll()).object();
     if (root.value("version").toInt() != 1) return;
+    for (const QJsonValue& v : root.value("disabled").toArray()) disabled_.insert(v.toString().toStdString());
     for (const QJsonValue& v : root.value("entries").toArray()) {
         const QJsonObject o = v.toObject();
         auto fmt = formatFromName(o.value("format").toString().toStdString());
@@ -533,7 +565,9 @@ void Registry::saveCacheLocked() const {
     QDir().mkpath(QFileInfo(q(path)).absolutePath());
     QSaveFile f(q(path));
     if (!f.open(QIODevice::WriteOnly)) return;
-    f.write(QJsonDocument(QJsonObject{{"version", 1}, {"entries", entries}}).toJson());
+    QJsonArray disabled;
+    for (const std::string& id : disabled_) disabled.append(q(id));
+    f.write(QJsonDocument(QJsonObject{{"version", 1}, {"entries", entries}, {"disabled", disabled}}).toJson());
     f.commit();
 }
 
@@ -555,13 +589,55 @@ std::string defaultProbe() {
 }
 }  // namespace
 
+namespace {
+// Loads one plugin file in the probe process and turns its outcome into a
+// cache entry (plugins found, or blocked with the reason).
+void probeFile(const std::string& probe, int timeout, Format format, const std::string& path, std::vector<Descriptor>& plugins,
+               bool& blocked, std::string& reason) {
+    QProcess proc;
+    proc.start(q(probe), {formatName(format), q(path)});
+    if (!proc.waitForStarted(5000)) {
+        blocked = true;
+        reason = "the plugin probe could not be started (" + probe + ")";
+    } else if (!proc.waitForFinished(timeout)) {
+        proc.kill();
+        proc.waitForFinished(2000);
+        blocked = true;
+        reason = "timed out after " + std::to_string(timeout / 1000) + " s";
+    } else if (proc.exitStatus() != QProcess::NormalExit) {
+        blocked = true;
+        reason = "crashed while loading";
+    } else if (proc.exitCode() != 0) {
+        blocked = true;
+        QString msg = QString::fromUtf8(proc.readAllStandardError()).trimmed().section('\n', 0, 0);
+        reason = msg.isEmpty() ? "failed to load (exit code " + std::to_string(proc.exitCode()) + ")" : msg.toStdString();
+    } else {
+        std::string err;
+        plugins = descriptorsFromJson(proc.readAllStandardOutput().toStdString(), &err);
+        if (!err.empty()) {
+            blocked = true;
+            reason = err;
+        }
+    }
+}
+}  // namespace
+
 ScanReport Registry::scan(bool rescanBlocked, const std::function<void(int, int, const std::string&)>& progress) {
+    return scanImpl(rescanBlocked, {}, progress);
+}
+
+ScanReport Registry::rescan(const std::vector<std::string>& paths,
+                            const std::function<void(int, int, const std::string&)>& progress) {
+    return scanImpl(false, std::set<std::string>(paths.begin(), paths.end()), progress);
+}
+
+ScanReport Registry::scanImpl(bool rescanBlocked, const std::set<std::string>& force,
+                              const std::function<void(int, int, const std::string&)>& progress) {
     // Snapshot the settings and the old cache, scan without the lock (it can
     // take a while), then publish the new entries.
     std::vector<Entry> old;
     std::string probe;
     int timeout;
-    std::vector<std::pair<Format, std::string>> files;
     {
         std::lock_guard lock(m_);
         loadCacheLocked();
@@ -569,31 +645,43 @@ ScanReport Registry::scan(bool rescanBlocked, const std::function<void(int, int,
         probe = probe_.empty() ? defaultProbe() : probe_;
         timeout = timeoutMs_;
     }
+    std::vector<std::pair<Format, std::string>> files;
     for (Format f : kAllFormats)
         for (const std::string& file : findPluginFiles(f, searchPaths(f))) files.emplace_back(f, file);
 
     ScanReport report;
     report.files = int(files.size());
-    std::vector<Entry> fresh;
+    std::vector<Entry> fresh(files.size());
+    std::vector<size_t> toProbe;
+    std::mutex progressM;
     int done = 0;
-    for (const auto& [format, path] : files) {
+    auto step = [&](const std::string& path) {
+        std::lock_guard lock(progressM);
         if (progress) progress(done, int(files.size()), path);
         ++done;
-        Entry e;
+    };
+    // 1. Unchanged files come from the cache; metadata files and formats this
+    //    build cannot load are read directly; the rest need the probe.
+    for (size_t i = 0; i < files.size(); ++i) {
+        const auto& [format, path] = files[i];
+        Entry& e = fresh[i];
         e.format = format;
         e.path = path;
         // Audio Units come from the live system registry every time.
         e.signature = format == Format::AudioUnit ? std::string() : signature(path);
-        auto prev = std::find_if(old.begin(), old.end(),
-                                 [&](const Entry& o) { return o.format == format && o.path == path; });
+        auto prev = std::find_if(old.begin(), old.end(), [&](const Entry& o) { return o.format == format && o.path == path; });
         if (format != Format::AudioUnit && prev != old.end() && prev->signature == e.signature &&
-            !(prev->blocked && rescanBlocked)) {
-            fresh.push_back(*prev);
+            !(prev->blocked && rescanBlocked) && !force.count(path)) {
+            e = *prev;
             ++report.fromCache;
+            report.log.push_back("cached: " + path + (e.blocked ? " (blocked: " + e.reason + ")" : ""));
+            step(path);
             continue;
         }
         if (auto meta = readStaticMetadata(format, path)) {
             e.plugins = *meta;
+            report.log.push_back("read: " + path + " (" + std::to_string(e.plugins.size()) + " plugins)");
+            step(path);
         } else if (!canHost(format)) {
             // Listed so the user can see it, but this build cannot load it.
             Descriptor d;
@@ -603,39 +691,37 @@ ScanReport Registry::scan(bool rescanBlocked, const std::function<void(int, int,
             d.pluginId = path;
             d.id = std::string(idPrefix(format)) + path;
             e.plugins.push_back(d);
+            report.log.push_back("listed: " + path + " (this version cannot load " + formatName(format) + " plugins)");
+            step(path);
         } else {
-            ++report.probed;
-            QProcess proc;
-            proc.start(q(probe), {formatName(format), q(path)});
-            if (!proc.waitForStarted(5000)) {
-                e.blocked = true;
-                e.reason = "the plugin probe could not be started (" + probe + ")";
-            } else if (!proc.waitForFinished(timeout)) {
-                proc.kill();
-                proc.waitForFinished(2000);
-                e.blocked = true;
-                e.reason = "timed out after " + std::to_string(timeout / 1000) + " s";
-            } else if (proc.exitStatus() != QProcess::NormalExit) {
-                e.blocked = true;
-                e.reason = "crashed while loading";
-            } else if (proc.exitCode() != 0) {
-                e.blocked = true;
-                QString msg = QString::fromUtf8(proc.readAllStandardError()).trimmed().section('\n', 0, 0);
-                e.reason = msg.isEmpty() ? "failed to load (exit code " + std::to_string(proc.exitCode()) + ")"
-                                         : msg.toStdString();
-            } else {
-                std::string err;
-                e.plugins = descriptorsFromJson(proc.readAllStandardOutput().toStdString(), &err);
-                if (!err.empty()) {
-                    e.blocked = true;
-                    e.reason = err;
-                }
-            }
-            if (e.blocked) report.newlyBlocked.push_back({format, path, e.reason});
+            toProbe.push_back(i);
         }
-        fresh.push_back(std::move(e));
     }
-    if (progress) progress(done, int(files.size()), {});
+    // 2. Probe in parallel: each file loads in its own helper process.
+    report.probed = int(toProbe.size());
+    std::atomic<size_t> next{0};
+    auto worker = [&] {
+        for (size_t k; (k = next++) < toProbe.size();) {
+            Entry& e = fresh[toProbe[k]];
+            step(e.path);
+            probeFile(probe, timeout, e.format, e.path, e.plugins, e.blocked, e.reason);
+        }
+    };
+    const size_t workers = std::min<size_t>(toProbe.size(), std::clamp<unsigned>(std::thread::hardware_concurrency() / 2, 2u, 4u));
+    std::vector<std::thread> pool;
+    for (size_t w = 1; w < workers; ++w) pool.emplace_back(worker);
+    if (workers > 0) worker();
+    for (auto& t : pool) t.join();
+    for (size_t i : toProbe) {
+        const Entry& e = fresh[i];
+        if (e.blocked) {
+            report.newlyBlocked.push_back({e.format, e.path, e.reason});
+            report.log.push_back("blocked: " + e.path + " (" + e.reason + ")");
+        } else {
+            report.log.push_back("probed: " + e.path + " (" + std::to_string(e.plugins.size()) + " plugins)");
+        }
+    }
+    if (progress) progress(int(files.size()), int(files.size()), {});
     {
         std::lock_guard lock(m_);
         entries_ = std::move(fresh);
@@ -701,6 +787,7 @@ void Registry::unblock(const std::string& path) {
 void Registry::clear() {
     std::lock_guard lock(m_);
     entries_.clear();
+    disabled_.clear();
     loaded_ = true;
     saveCacheLocked();
 }
