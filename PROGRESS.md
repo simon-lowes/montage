@@ -50,4 +50,4 @@ verified run.
 - [x] CI (GitHub Actions): build + tests
 - [x] README with build and usage docs
 - [x] Builds against FFmpeg 6.1 through 9 (tested with 9.0.2, which Homebrew ships)
-- [ ] macOS DMG and Windows installer + zip from the Package workflow (verified on CI runners)
+- [x] macOS DMG and Windows installer + zip from the Package workflow (built, and each packaged app launched, on CI runners)
