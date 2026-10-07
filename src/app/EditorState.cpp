@@ -285,7 +285,7 @@ std::vector<Id> EditorState::importFiles(const QStringList& paths, QStringList* 
         if (fi.isDir()) {
             QStringList children;
             for (const QFileInfo& c : QDir(path).entryInfoList(QDir::Files, QDir::Name)) children << c.absoluteFilePath();
-            auto ids = importFiles(children, errors, fi.fileName());
+            auto ids = importFiles(children, errors, bin.isEmpty() ? fi.fileName() : bin + "/" + fi.fileName());
             (void)ids;
             continue;
         }

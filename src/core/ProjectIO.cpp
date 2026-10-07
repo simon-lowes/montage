@@ -427,6 +427,19 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
         if (!m.colorSpace.empty()) o["colorSpace"] = qs(m.colorSpace);
         if (!m.colorOverride.empty()) o["colorOverride"] = qs(m.colorOverride);
         if (m.timecode >= 0) o["timecode"] = m.timecode;
+        if (m.rating) o["rating"] = m.rating;
+        if (m.label) o["label"] = m.label;
+        if (!m.keywords.empty()) {
+            QJsonArray k;
+            for (const auto& w : m.keywords) k.append(qs(w));
+            o["keywords"] = k;
+        }
+        if (!m.metadata.empty()) {
+            QJsonObject md;
+            for (const auto& [key, v] : m.metadata) md[qs(key)] = qs(v);
+            o["metadata"] = md;
+        }
+        if (!m.created.empty()) o["created"] = qs(m.created);
         if (m.transcript && !m.transcript->empty())
             o["transcript"] = QJsonDocument::fromJson(QByteArray::fromStdString(transcriptToJson(*m.transcript))).object();
         if (m.visual && !m.visual->samples.empty())
@@ -434,6 +447,20 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
         media.append(o);
     }
     root["media"] = media;
+    if (!p.bins.empty()) {
+        QJsonArray bins;
+        for (const auto& b : p.bins) bins.append(qs(b));
+        root["bins"] = bins;
+    }
+    if (!p.smartBins.empty()) {
+        QJsonArray smart;
+        for (const SmartBin& b : p.smartBins) {
+            QJsonArray rules;
+            for (const SmartRule& r : b.rules) rules.append(QJsonObject{{"field", qs(r.field)}, {"op", qs(r.op)}, {"value", qs(r.value)}});
+            smart.append(QJsonObject{{"id", double(b.id)}, {"name", qs(b.name)}, {"all", b.matchAll}, {"rules", rules}});
+        }
+        root["smartBins"] = smart;
+    }
     QJsonArray seqs;
     for (const auto& s : p.sequences) seqs.append(sequenceToJson(s));
     root["sequences"] = seqs;
@@ -500,7 +527,26 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
         m.colorSpace = ss(o.value("colorSpace"));
         m.colorOverride = ss(o.value("colorOverride"));
         m.timecode = o.value("timecode").toDouble(-1);
+        m.rating = std::clamp(o.value("rating").toInt(0), -1, 5);
+        m.label = o.value("label").toInt(0);
+        for (const auto& k : o.value("keywords").toArray()) m.keywords.push_back(ss(k));
+        const QJsonObject md = o.value("metadata").toObject();
+        for (auto it = md.begin(); it != md.end(); ++it) m.metadata[it.key().toStdString()] = ss(it.value());
+        m.created = ss(o.value("created"));
         p.media.push_back(m);
+    }
+    for (const auto& b : root.value("bins").toArray()) p.bins.push_back(ss(b));
+    for (const auto& bv : root.value("smartBins").toArray()) {
+        const QJsonObject o = bv.toObject();
+        SmartBin b;
+        b.id = Id(i64(o.value("id")));
+        b.name = ss(o.value("name"));
+        b.matchAll = o.value("all").toBool(true);
+        for (const auto& rv : o.value("rules").toArray()) {
+            const QJsonObject r = rv.toObject();
+            b.rules.push_back({ss(r.value("field")), ss(r.value("op")), ss(r.value("value"))});
+        }
+        p.smartBins.push_back(std::move(b));
     }
     for (const auto& sv : root.value("sequences").toArray()) p.sequences.push_back(sequenceFromJson(sv.toObject()));
     if (p.sequences.empty()) {
@@ -512,6 +558,7 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
     Id maxId = 0;
     auto bump = [&](Id id) { maxId = std::max(maxId, id); };
     for (const auto& m : p.media) bump(m.id);
+    for (const auto& b : p.smartBins) bump(b.id);
     for (const auto& s : p.sequences) {
         bump(s.id);
         for (const auto* list : {&s.videoTracks, &s.audioTracks})

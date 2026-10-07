@@ -16,6 +16,7 @@
 #include <sstream>
 
 #include "core/EditOps.h"
+#include "core/MediaLog.h"
 #include "core/Effects.h"
 #include "core/History.h"
 #include "core/Interchange.h"
@@ -166,6 +167,20 @@ QJsonObject clipJson(const Project& p, const Sequence& s, const Clip& c) {
     return o;
 }
 
+// A media item's logging: rating, label, keywords, metadata, bin, recording date.
+void logJson(const MediaItem& m, QJsonObject& o) {
+    if (m.rating) o["rating"] = m.rating;
+    if (m.label > 0) o["label"] = QString::fromLatin1(labelName(m.label));
+    if (!m.keywords.empty()) {
+        QJsonArray k;
+        for (const std::string& w : m.keywords) k.append(QString::fromStdString(w));
+        o["keywords"] = k;
+    }
+    for (const auto& [key, v] : m.metadata) o[QString::fromStdString(key)] = QString::fromStdString(v);
+    if (!m.bin.empty()) o["bin"] = QString::fromStdString(m.bin);
+    if (!m.created.empty()) o["recorded"] = QString::fromStdString(m.created);
+}
+
 QJsonObject projectJson(const Project& p) {
     const Sequence& s = *p.active();
     QJsonArray tracks;
@@ -190,6 +205,7 @@ QJsonObject projectJson(const Project& p) {
         QJsonObject mo{{"id", double(m.id)}, {"name", QString::fromStdString(m.name)}, {"duration_seconds", m.duration}};
         if (!m.path.empty()) mo["path"] = QString::fromStdString(m.path);
         if (m.transcript) mo["transcribed"] = true;
+        logJson(m, mo);
         media.append(mo);
     }
     return QJsonObject{{"sequence", QString::fromStdString(s.name)},
@@ -214,6 +230,54 @@ Id mediaFor(Project& p, const QString& path) {
     if (!probeMedia(abs, m, &err)) throw ArgError{QStringLiteral("Cannot read %1: %2").arg(path, QString::fromStdString(err))};
     p.media.push_back(m);
     return m.id;
+}
+
+// A media item already in the project, by file path or name.
+MediaItem& projectMedia(Project& p, const QString& ref) {
+    const std::string abs = absolute(ref).toStdString(), name = ref.toStdString();
+    for (MediaItem& m : p.media)
+        if (!m.path.empty() && m.path == abs) return m;
+    for (MediaItem& m : p.media)
+        if (m.name == name) return m;
+    throw ArgError{QStringLiteral("No media \"%1\" in the project (see montage_project_info)").arg(ref)};
+}
+
+std::vector<std::string> stringList(const QJsonObject& a, const char* key) {
+    std::vector<std::string> out;
+    const QJsonValue v = a.value(key);
+    if (v.isString()) return parseKeywords(v.toString().toStdString());
+    for (const QJsonValue& x : v.toArray()) out.push_back(x.toString().trimmed().toStdString());
+    std::erase(out, std::string());
+    return out;
+}
+
+// Smart bin rules from JSON, checked against the fields and their tests.
+std::vector<SmartRule> rulesArg(const QJsonArray& rules) {
+    std::vector<SmartRule> out;
+    for (const QJsonValue& v : rules) {
+        const QJsonObject r = v.toObject();
+        SmartRule rule{str(r, "field").toStdString(), str(r, "op").toStdString(), {}};
+        const QJsonValue value = r.value("value");
+        rule.value = value.isDouble() ? QString::number(value.toDouble()).toStdString() : value.toString().toStdString();
+        const MediaField* f = mediaField(rule.field);
+        if (!f || !f->rule) {
+            QStringList keys;
+            for (const MediaField& m : mediaFields())
+                if (m.rule) keys << m.key;
+            throw ArgError{QStringLiteral("Unknown field \"%1\"; fields: %2").arg(QString::fromStdString(rule.field), keys.join(", "))};
+        }
+        QStringList ops;
+        bool known = false;
+        for (const RuleOp& o : ruleOps(f->type)) {
+            ops << o.id;
+            known |= rule.op == o.id;
+        }
+        if (!known)
+            throw ArgError{QStringLiteral("\"%1\" cannot be tested with \"%2\"; use %3").arg(QString::fromStdString(rule.field),
+                                                                                              QString::fromStdString(rule.op), ops.join(", "))};
+        out.push_back(std::move(rule));
+    }
+    return out;
 }
 
 QJsonObject mediaJson(const MediaItem& m) {
@@ -664,6 +728,105 @@ void McpServer::Impl::addTools() {
                             .arg(double(h.score), 0, 'f', 3);
             }
             return ok(text.isEmpty() ? QStringLiteral("No indexed video") : text, QJsonObject{{"moments", list}});
+        });
+
+    add("montage_log_media", "Log media",
+        "Log media in a project as an editor does, to find it again: a rating (-1 rejects, 0 unrated, 1-5 stars), a colour "
+        "label, keywords to add or remove, metadata fields (scene, shot, take, camera, device, description, comment, or name) "
+        "and the bin it is in (\"Interviews/Day 1\"; \"\" for the top level).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "media":{"type":["string","array"],"items":{"type":"string"},"description":"Media files or names in the project"},
+            "rating":{"type":"integer","minimum":-1,"maximum":5},
+            "label":{"type":"string","description":"None, Violet, Iris, Caribbean, Lavender, Cerulean, Forest, Rose, Mango, Yellow, Tan or Red"},
+            "add_keywords":{"type":["array","string"],"items":{"type":"string"}},
+            "remove_keywords":{"type":["array","string"],"items":{"type":"string"}},
+            "fields":{"type":"object","additionalProperties":{"type":"string"},"description":"Field name to text; empty text clears it"},
+            "bin":{"type":"string"}},"required":["project","media"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            std::vector<MediaItem*> items;
+            const QJsonValue mv = a.value("media");
+            if (mv.isString()) items.push_back(&projectMedia(l.project, mv.toString()));
+            for (const QJsonValue& v : mv.toArray()) items.push_back(&projectMedia(l.project, v.toString()));
+            if (items.empty()) throw ArgError{"\"media\" is required"};
+            const QJsonObject fields = a.value("fields").toObject();
+            for (auto it = fields.begin(); it != fields.end(); ++it) {
+                const MediaField* f = mediaField(it.key().toStdString());
+                if (!f || !f->editable || it.key() == "rating" || it.key() == "label" || it.key() == "keywords")
+                    throw ArgError{QStringLiteral("\"%1\" is not a field to set; use scene, shot, take, camera, device, description, comment or name").arg(it.key())};
+            }
+            for (MediaItem* m : items) {
+                if (a.value("rating").isDouble()) {
+                    const int r = a.value("rating").toInt();
+                    if (r < -1 || r > 5) throw ArgError{"\"rating\" must be -1 (rejected) to 5"};
+                    m->rating = r;
+                }
+                if (a.contains("label") && !setMediaField(*m, "label", str(a, "label").toStdString()))
+                    throw ArgError{QStringLiteral("Unknown label \"%1\"").arg(str(a, "label"))};
+                addKeywords(m->keywords, stringList(a, "add_keywords"));
+                removeKeywords(m->keywords, stringList(a, "remove_keywords"));
+                for (auto it = fields.begin(); it != fields.end(); ++it)
+                    if (!setMediaField(*m, it.key().toStdString(), it.value().toString().toStdString()))
+                        throw ArgError{QStringLiteral("Cannot set %1 to \"%2\"").arg(it.key(), it.value().toString())};
+            }
+            if (a.value("bin").isString()) {
+                std::vector<Id> ids;
+                for (MediaItem* m : items) ids.push_back(m->id);
+                std::string bin;
+                for (const QString& part : str(a, "bin").split('/', Qt::SkipEmptyParts)) bin = joinBin(bin, part.simplified().toStdString());
+                moveMediaToBin(l.project, ids, bin);
+            }
+            save(l);
+            QJsonArray out;
+            for (MediaItem* m : items) {
+                QJsonObject o{{"name", QString::fromStdString(m->name)}};
+                logJson(*m, o);
+                out.append(o);
+            }
+            return ok(QStringLiteral("Logged %1 media item(s)").arg(items.size()), QJsonObject{{"media", out}});
+        });
+
+    add("montage_find_media", "Find media",
+        "Find media in a project by text (names, keywords, metadata, speech; \"quoted phrases\") and/or rules on fields, as a "
+        "smart bin does. Rule fields: any, name, rating, label, duration (seconds), kind (video, audio, image, sequence), "
+        "keywords, usage (clips using it), scene, shot, take, camera, device, description, comment, created, width, height, "
+        "fps, videoCodec, audioCodec, channels, colour, transcript, proxy, bin, path. Tests: contains, !contains, is, !is, "
+        "starts, empty, !empty for text; >, >=, <, <=, is, !is for numbers and ratings; includes, !includes, empty, !empty "
+        "for keywords. Optionally saves the rules as a smart bin the app shows.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "text":{"type":"string"},
+            "rules":{"type":"array","items":{"type":"object","properties":{"field":{"type":"string"},"op":{"type":"string"},
+                "value":{"type":["string","number"]}},"required":["field","op"]}},
+            "match":{"type":"string","enum":["all","any"],"default":"all"},
+            "save_as":{"type":"string","description":"Also save the rules as a smart bin with this name"}},
+            "required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            SmartBin b;
+            b.name = str(a, "save_as").toStdString();
+            b.matchAll = str(a, "match", "all") != "any";
+            b.rules = rulesArg(a.value("rules").toArray());
+            const std::string text = str(a, "text").toStdString();
+            const std::map<Id, int> usage = mediaUsage(l.project);
+            QJsonArray list;
+            QString lines;
+            for (const MediaItem& m : l.project.media) {
+                if (!smartBinMatches(b, m, usage) || !mediaMatchesSearch(m, text)) continue;
+                QJsonObject o{{"name", QString::fromStdString(m.name)}, {"duration_seconds", m.duration}};
+                if (!m.path.empty()) o["path"] = QString::fromStdString(m.path);
+                o["usage"] = usage.count(m.id) ? usage.at(m.id) : 0;
+                logJson(m, o);
+                list.append(o);
+                lines += QString::fromStdString(m.name) + (m.rating > 0 ? "  " + QString(m.rating, QChar(0x2605)) : m.rating < 0 ? "  rejected" : "") +
+                         (m.keywords.empty() ? QString() : "  [" + QString::fromStdString(joinKeywords(m.keywords)) + "]") + "\n";
+            }
+            if (!b.name.empty()) {
+                if (b.rules.empty()) throw ArgError{"A smart bin needs rules"};
+                b.id = l.project.newId();
+                l.project.smartBins.push_back(b);
+                save(l);
+            }
+            return ok(lines.isEmpty() ? QStringLiteral("No media matches") : lines, QJsonObject{{"media", list}});
         });
 
     add("montage_render_frame", "Look at a frame",

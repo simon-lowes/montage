@@ -1,116 +1,209 @@
 #include "MediaBinWidget.h"
 
-#include <QCryptographicHash>
 #include <QApplication>
+#include <QComboBox>
+#include <QCompleter>
+#include <QCryptographicHash>
 #include <QDesktopServices>
-#include <QPointer>
 #include <QDir>
-#include <QFutureWatcher>
-#include <QProgressDialog>
-#include <QStandardPaths>
-#include <QtConcurrent>
 #include <QDragEnterEvent>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QFutureWatcher>
 #include <QHBoxLayout>
+#include <QHeaderView>
 #include <QInputDialog>
+#include <QKeyEvent>
 #include <QLineEdit>
+#include <QListView>
 #include <QMenu>
 #include <QMessageBox>
 #include <QMimeData>
-#include <QPainter>
+#include <QPointer>
+#include <QProgressDialog>
 #include <QSettings>
+#include <QSortFilterProxyModel>
+#include <QSplitter>
+#include <QStackedWidget>
+#include <QStandardPaths>
+#include <QStyle>
+#include <QStyledItemDelegate>
+#include <QTimer>
 #include <QToolButton>
+#include <QTreeView>
 #include <QUrl>
 #include <QVBoxLayout>
+#include <QtConcurrent>
 #include <algorithm>
 #include <memory>
 
 #include "EditorState.h"
+#include "MediaBinModel.h"
+#include "SmartBinDialog.h"
 #include "Theme.h"
 #include "ThumbnailCache.h"
 #include "TranscribeDialog.h"
+#include "core/MediaLog.h"
 #include "media/Analysis.h"
 #include "render/ColorSpace.h"
 
 namespace montage {
 
 namespace {
-constexpr int kThumbW = 128;
-constexpr int kThumbH = 72;
 
-QString kindLabel(const MediaItem& m) {
-    switch (m.kind) {
-        case MediaKind::Video: return m.hasAudio ? QObject::tr("Video + Audio") : QObject::tr("Video");
-        case MediaKind::Audio: return QObject::tr("Audio");
-        case MediaKind::Image: return QObject::tr("Still Image");
-        case MediaKind::Sequence: return QObject::tr("Sequence");
+constexpr const char* kMediaMime = "application/x-montage-media";
+constexpr const char* kBinMime = "application/x-montage-bin";
+
+std::vector<Id> mediaFromMime(const QMimeData* mime) {
+    std::vector<Id> ids;
+    for (const QString& part : QString::fromUtf8(mime->data(kMediaMime)).split(',', Qt::SkipEmptyParts)) ids.push_back(part.toULongLong());
+    return ids;
+}
+
+// A bin's name: no slashes (they separate nested bins).
+QString cleanBinName(const QString& name) { return name.simplified().replace('/', '-'); }
+
+QString starText(int n) { return n < 0 ? QObject::tr("Rejected") : n == 0 ? QObject::tr("Unrated") : QString(n, QChar(0x2605)); }
+
+QStringList defaultColumns() {
+    return {"name", "rating", "label", "duration", "kind", "resolution", "fps", "keywords", "usage", "comment"};
+}
+
+// Edits a list cell, and every selected row with it when the cell is in the selection.
+class LogDelegate : public QStyledItemDelegate {
+public:
+    LogDelegate(QAbstractItemView* view, MediaBinModel* model) : QStyledItemDelegate(view), view_(view), model_(model) {}
+
+    QWidget* createEditor(QWidget* parent, const QStyleOptionViewItem& option, const QModelIndex& index) const override {
+        const std::string key = MediaBinModel::columnKeys()[size_t(index.column())];
+        if (key == "rating") {
+            auto* box = new QComboBox(parent);
+            for (int r = -1; r <= 5; ++r) box->addItem(starText(r), r);
+            return box;
+        }
+        if (key == "label") {
+            auto* box = new QComboBox(parent);
+            box->addItem(QObject::tr("None"), 0);
+            for (int i = 1; i < theme::labelCount(); ++i) {
+                QPixmap sw(10, 10);
+                sw.fill(theme::labelColor(i));
+                box->addItem(QIcon(sw), QObject::tr(labelName(i)), i);
+            }
+            return box;
+        }
+        return QStyledItemDelegate::createEditor(parent, option, index);
     }
-    return {};
-}
 
-// Placeholder tile for media without a picture (audio, sequences).
-QPixmap tile(const QString& text, const QColor& color) {
-    QPixmap pm(kThumbW, kThumbH);
-    pm.fill(color.darker(220));
-    QPainter p(&pm);
-    p.setPen(color.lighter(150));
-    QFont f = p.font();
-    f.setPointSize(9);
-    f.setBold(true);
-    p.setFont(f);
-    p.drawText(pm.rect(), Qt::AlignCenter, text);
-    return pm;
-}
+    void setEditorData(QWidget* editor, const QModelIndex& index) const override {
+        if (auto* box = qobject_cast<QComboBox*>(editor)) {
+            const std::string key = MediaBinModel::columnKeys()[size_t(index.column())];
+            const int value = key == "rating" ? index.data(Qt::EditRole).toInt() : index.data(MediaBinModel::SortRole).toInt();
+            box->setCurrentIndex(std::max(0, box->findData(value)));
+            return;
+        }
+        QStyledItemDelegate::setEditorData(editor, index);
+    }
+
+    void setModelData(QWidget* editor, QAbstractItemModel*, const QModelIndex& index) const override {
+        QString value;
+        if (auto* box = qobject_cast<QComboBox*>(editor)) value = box->currentData().toString();
+        else if (auto* line = qobject_cast<QLineEdit*>(editor)) value = line->text();
+        else return;
+        std::vector<Id> ids;
+        const QItemSelectionModel* sel = view_->selectionModel();
+        if (sel->isSelected(index.siblingAtColumn(0)))
+            for (const QModelIndex& r : sel->selectedIndexes())
+                if (r.column() == 0) ids.push_back(r.data(MediaBinModel::IdRole).toULongLong());
+        if (ids.empty()) ids.push_back(index.data(MediaBinModel::IdRole).toULongLong());
+        model_->setField(ids, MediaBinModel::columnKeys()[size_t(index.column())], value);
+    }
+
+private:
+    QAbstractItemView* view_;
+    MediaBinModel* model_;
+};
+
 }  // namespace
 
-MediaList::MediaList(QWidget* parent) : QListWidget(parent) {
-    setViewMode(QListView::IconMode);
-    setIconSize(QSize(kThumbW, kThumbH));
-    setGridSize(QSize(kThumbW + 16, kThumbH + 40));
-    setResizeMode(QListView::Adjust);
-    setMovement(QListView::Static);
-    setSelectionMode(QAbstractItemView::ExtendedSelection);
+// ---------------------------------------------------------------------------
+// BinTree
+
+BinTree::BinTree(QWidget* parent) : QTreeWidget(parent) {
+    setHeaderHidden(true);
+    setColumnCount(1);
     setDragEnabled(true);
     setAcceptDrops(true);
-    setDropIndicatorShown(false);
+    viewport()->setAcceptDrops(true);
+    setDropIndicatorShown(true);
     setDragDropMode(QAbstractItemView::DragDrop);
-    setWordWrap(true);
-    setUniformItemSizes(true);
-    setTextElideMode(Qt::ElideMiddle);
+    setDefaultDropAction(Qt::MoveAction);
+    setSelectionMode(QAbstractItemView::SingleSelection);
+    setEditTriggers(QAbstractItemView::EditKeyPressed | QAbstractItemView::SelectedClicked);
+    setContextMenuPolicy(Qt::CustomContextMenu);
 }
 
-QStringList MediaList::mimeTypes() const { return {"application/x-montage-media", "text/uri-list"}; }
+QStringList BinTree::mimeTypes() const { return {kBinMime, kMediaMime, "text/uri-list"}; }
 
-QMimeData* MediaList::mimeData(const QList<QListWidgetItem*>& items) const {
-    QStringList ids;
-    for (auto* it : items) ids << QString::number(it->data(Qt::UserRole).toULongLong());
+QMimeData* BinTree::mimeData(const QList<QTreeWidgetItem*>& items) const {
+    if (items.size() != 1 || items[0]->data(0, KindRole).toInt() != BinItem || items[0]->data(0, PathRole).toString().isEmpty())
+        return nullptr;
     auto* m = new QMimeData;
-    m->setData("application/x-montage-media", ids.join(',').toUtf8());
+    m->setData(kBinMime, items[0]->data(0, PathRole).toString().toUtf8());
     return m;
 }
 
-void MediaList::dragEnterEvent(QDragEnterEvent* e) {
-    if (e->mimeData()->hasUrls()) e->acceptProposedAction();
-    else QListWidget::dragEnterEvent(e);
+QTreeWidgetItem* BinTree::binAt(const QPoint& pos) const {
+    QTreeWidgetItem* it = itemAt(pos);
+    return it && it->data(0, KindRole).toInt() == BinItem ? it : nullptr;
 }
 
-void MediaList::dragMoveEvent(QDragMoveEvent* e) {
-    if (e->mimeData()->hasUrls()) e->acceptProposedAction();
+void BinTree::dragEnterEvent(QDragEnterEvent* e) {
+    const QMimeData* m = e->mimeData();
+    if (m->hasFormat(kMediaMime) || m->hasFormat(kBinMime) || m->hasUrls()) e->acceptProposedAction();
     else e->ignore();
 }
 
-void MediaList::dropEvent(QDropEvent* e) {
-    if (!e->mimeData()->hasUrls()) {
+void BinTree::dragMoveEvent(QDragMoveEvent* e) {
+    QTreeWidgetItem* target = binAt(e->position().toPoint());
+    const QMimeData* m = e->mimeData();
+    if (!target) {
         e->ignore();
         return;
     }
-    QStringList files;
-    for (const QUrl& u : e->mimeData()->urls())
-        if (u.isLocalFile()) files << u.toLocalFile();
-    emit filesDropped(files);
-    e->acceptProposedAction();
+    if (m->hasFormat(kBinMime)) {
+        const QString bin = QString::fromUtf8(m->data(kBinMime)), into = target->data(0, PathRole).toString();
+        if (binWithin(into.toStdString(), bin.toStdString()) || binParent(bin.toStdString()) == into.toStdString()) {
+            e->ignore();
+            return;
+        }
+    }
+    e->setDropAction(m->hasUrls() ? Qt::CopyAction : Qt::MoveAction);
+    e->accept();
 }
+
+void BinTree::dropEvent(QDropEvent* e) {
+    QTreeWidgetItem* target = binAt(e->position().toPoint());
+    if (!target) {
+        e->ignore();
+        return;
+    }
+    const QString into = target->data(0, PathRole).toString();
+    const QMimeData* m = e->mimeData();
+    if (m->hasFormat(kMediaMime)) emit mediaDropped(mediaFromMime(m), into);
+    else if (m->hasFormat(kBinMime)) emit binDropped(QString::fromUtf8(m->data(kBinMime)), into);
+    else if (m->hasUrls()) {
+        QStringList files;
+        for (const QUrl& u : m->urls())
+            if (u.isLocalFile()) files << u.toLocalFile();
+        emit filesDropped(files, into);
+    }
+    // The tree is rebuilt from the project; nothing moves here.
+    e->setDropAction(Qt::IgnoreAction);
+    e->accept();
+}
+
+// ---------------------------------------------------------------------------
+// MediaBinWidget
 
 MediaBinWidget::MediaBinWidget(EditorState* state, QWidget* parent) : QWidget(parent), state_(state) {
     auto* lay = new QVBoxLayout(this);
@@ -128,41 +221,177 @@ MediaBinWidget::MediaBinWidget(EditorState* state, QWidget* parent) : QWidget(pa
     auto* importBtn = addButton(tr("Import"), tr("Import media files (Ctrl+I)"));
     auto* titleBtn = addButton(tr("Title"), tr("New title at the playhead"));
     auto* seqBtn = addButton(tr("Sequence"), tr("New sequence"));
+    auto* binBtn = addButton(tr("Bin"), tr("New bin (the arrow: a new smart bin)"));
+    binBtn->setObjectName(QStringLiteral("newBin"));
+    auto* binMenu = new QMenu(binBtn);
+    binMenu->addAction(tr("New Bin"), this, [this] { newBin(bin_); });
+    binMenu->addAction(tr("New Smart Bin…"), this, [this] { newSmartBinDialog(); });
+    binBtn->setMenu(binMenu);
+    binBtn->setPopupMode(QToolButton::MenuButtonPopup);
+    iconsBtn_ = addButton(QStringLiteral("▦"), tr("Icon view"));
+    listBtn_ = addButton(QStringLiteral("☰"), tr("List view, with metadata columns"));
+    iconsBtn_->setObjectName(QStringLiteral("iconViewButton"));
+    listBtn_->setObjectName(QStringLiteral("listViewButton"));
+    iconsBtn_->setCheckable(true);
+    listBtn_->setCheckable(true);
     search_ = new QLineEdit(this);
     search_->setPlaceholderText(tr("Search media"));
+    search_->setToolTip(tr("Finds names, keywords, metadata and what is said; \"quotes\" for a phrase"));
     search_->setClearButtonEnabled(true);
     bar->addWidget(search_, 1);
     lay->addLayout(bar);
-    list_ = new MediaList(this);
-    lay->addWidget(list_, 1);
-    list_->setContextMenuPolicy(Qt::CustomContextMenu);
+
+    model_ = new MediaBinModel(state_, this);
+    proxy_ = new QSortFilterProxyModel(this);
+    proxy_->setSourceModel(model_);
+    proxy_->setSortRole(MediaBinModel::SortRole);
+    proxy_->setDynamicSortFilter(true);
+
+    split_ = new QSplitter(Qt::Horizontal, this);
+    tree_ = new BinTree(split_);
+    tree_->setObjectName(QStringLiteral("binTree"));
+    stack_ = new QStackedWidget(split_);
+    icons_ = new QListView(stack_);
+    icons_->setObjectName(QStringLiteral("mediaIcons"));
+    icons_->setModel(proxy_);
+    icons_->setViewMode(QListView::IconMode);
+    icons_->setIconSize(QSize(MediaBinModel::kThumbW, MediaBinModel::kThumbH));
+    icons_->setGridSize(QSize(MediaBinModel::kThumbW + 16, MediaBinModel::kThumbH + 40));
+    icons_->setResizeMode(QListView::Adjust);
+    icons_->setMovement(QListView::Static);
+    icons_->setWordWrap(true);
+    icons_->setUniformItemSizes(true);
+    icons_->setTextElideMode(Qt::ElideMiddle);
+    icons_->setEditTriggers(QAbstractItemView::EditKeyPressed);
+    list_ = new QTreeView(stack_);
+    list_->setObjectName(QStringLiteral("mediaList"));
+    list_->setModel(proxy_);
+    list_->setRootIsDecorated(false);
+    list_->setUniformRowHeights(true);
+    list_->setSortingEnabled(true);
+    list_->sortByColumn(-1, Qt::AscendingOrder);  // project order until a column is clicked
+    list_->setAlternatingRowColors(true);
+    list_->setIconSize(QSize(48, 27));
+    list_->setEditTriggers(QAbstractItemView::EditKeyPressed | QAbstractItemView::SelectedClicked);
+    list_->setItemDelegate(new LogDelegate(list_, model_));
+    list_->header()->setSectionsMovable(true);
+    list_->header()->setStretchLastSection(false);
+    list_->header()->setContextMenuPolicy(Qt::CustomContextMenu);
+    list_->header()->resizeSection(0, 200);
+    QItemSelectionModel* old = list_->selectionModel();
+    list_->setSelectionModel(icons_->selectionModel());  // one selection for both views
+    delete old;
+    for (QAbstractItemView* v : {static_cast<QAbstractItemView*>(icons_), static_cast<QAbstractItemView*>(list_)}) {
+        v->setSelectionMode(QAbstractItemView::ExtendedSelection);
+        v->setSelectionBehavior(QAbstractItemView::SelectRows);
+        v->setDragEnabled(true);
+        v->setDragDropMode(QAbstractItemView::DragOnly);
+        v->viewport()->setAcceptDrops(true);  // files, imported into the bin shown
+        v->viewport()->installEventFilter(this);
+        v->installEventFilter(this);
+        v->setContextMenuPolicy(Qt::CustomContextMenu);
+        connect(v, &QWidget::customContextMenuRequested, this, [this, v](const QPoint& pos) { showContextMenu(v, pos); });
+        connect(v, &QAbstractItemView::activated, this,
+                [this](const QModelIndex& i) { open(i.data(MediaBinModel::IdRole).toULongLong()); });
+        stack_->addWidget(v);
+    }
+    split_->addWidget(tree_);
+    split_->addWidget(stack_);
+    split_->setStretchFactor(1, 1);
+    split_->setSizes({130, 400});
+    split_->setCollapsible(1, false);
+    lay->addWidget(split_, 1);
+
+    QSettings settings("Montage", "Montage");
+    const QStringList visible = settings.value("mediaBin/columns", defaultColumns()).toStringList();
+    for (int c = 0; c < model_->columnCount(); ++c)
+        list_->setColumnHidden(c, c != 0 && !visible.contains(QString::fromStdString(MediaBinModel::columnKeys()[size_t(c)])));
+    setView(settings.value("mediaBin/view").toString() == "list" ? View::List : View::Icons);
 
     connect(importBtn, &QToolButton::clicked, this, &MediaBinWidget::importDialog);
     connect(titleBtn, &QToolButton::clicked, this, &MediaBinWidget::newTitleRequested);
     connect(seqBtn, &QToolButton::clicked, this, &MediaBinWidget::newSequenceRequested);
+    connect(binBtn, &QToolButton::clicked, this, [this] { newBin(bin_); });
+    connect(iconsBtn_, &QToolButton::clicked, this, [this] { setView(View::Icons); });
+    connect(listBtn_, &QToolButton::clicked, this, [this] { setView(View::List); });
     connect(search_, &QLineEdit::textChanged, this, &MediaBinWidget::rebuild);
-    connect(list_, &MediaList::filesDropped, this, [this](const QStringList& files) {
-        QStringList errors;
-        state_->importFiles(files, &errors);
-        if (!errors.isEmpty()) QMessageBox::warning(this, tr("Import"), errors.join("\n"));
+    connect(list_->header(), &QWidget::customContextMenuRequested, this, &MediaBinWidget::showColumnMenu);
+    connect(tree_, &QTreeWidget::currentItemChanged, this, [this](QTreeWidgetItem* it) {
+        if (treeUpdating_ || !it) return;
+        if (it->data(0, BinTree::KindRole).toInt() == BinTree::SmartItem) showSmartBin(it->data(0, BinTree::IdRole).toULongLong());
+        else if (it->data(0, BinTree::KindRole).toInt() == BinTree::BinItem) showBin(it->data(0, BinTree::PathRole).toString());
     });
-    connect(list_, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem* it) {
-        Id id = it->data(Qt::UserRole).toULongLong();
-        const MediaItem* m = state_->project().findMedia(id);
-        if (m && m->kind == MediaKind::Sequence) state_->setActiveSequence(m->sequenceId);
-        else emit openInSource(id);
+    connect(tree_, &QTreeWidget::itemChanged, this, [this](QTreeWidgetItem* it) {
+        if (treeUpdating_) return;
+        const QString name = it->text(0).trimmed();
+        if (it->data(0, BinTree::KindRole).toInt() == BinTree::BinItem) {
+            if (!renameBin(it->data(0, BinTree::PathRole).toString(), name)) QTimer::singleShot(0, this, [this] { resetTree(); });
+        } else if (it->data(0, BinTree::KindRole).toInt() == BinTree::SmartItem) {
+            if (const SmartBin* b = findSmartBin(state_->project(), it->data(0, BinTree::IdRole).toULongLong())) {
+                SmartBin changed = *b;
+                changed.name = name.toStdString();
+                if (name.isEmpty() || !updateSmartBin(changed)) QTimer::singleShot(0, this, [this] { resetTree(); });
+            }
+        }
     });
-    connect(list_, &QWidget::customContextMenuRequested, this, &MediaBinWidget::showContextMenu);
+    connect(tree_, &QWidget::customContextMenuRequested, this, &MediaBinWidget::showBinMenu);
+    connect(tree_, &QTreeWidget::itemActivated, this, [this](QTreeWidgetItem* it) {
+        if (it->data(0, BinTree::KindRole).toInt() == BinTree::SmartItem) editSmartBinDialog(it->data(0, BinTree::IdRole).toULongLong());
+    });
+    connect(tree_, &BinTree::mediaDropped, this, [this](const std::vector<Id>& ids, const QString& bin) { moveToBin(ids, bin); });
+    connect(tree_, &BinTree::binDropped, this, [this](const QString& bin, const QString& into) { moveBin(bin, into); });
+    connect(tree_, &BinTree::filesDropped, this, [this](const QStringList& files, const QString& bin) { importInto(files, bin); });
     connect(state_, &EditorState::projectChanged, this, &MediaBinWidget::rebuild);
     connect(state_, &EditorState::sequenceSwitched, this, &MediaBinWidget::rebuild);
-    connect(&ThumbnailCache::instance(), &ThumbnailCache::ready, this, &MediaBinWidget::refreshThumbnails);
+    connect(&ThumbnailCache::instance(), &ThumbnailCache::ready, model_, &MediaBinModel::refreshThumbnails);
     rebuild();
+}
+
+void MediaBinWidget::setView(View v) {
+    view_ = v;
+    stack_->setCurrentWidget(v == View::Icons ? static_cast<QWidget*>(icons_) : static_cast<QWidget*>(list_));
+    iconsBtn_->setChecked(v == View::Icons);
+    listBtn_->setChecked(v == View::List);
+    QSettings("Montage", "Montage").setValue("mediaBin/view", v == View::List ? "list" : "icons");
+}
+
+QAbstractItemView* MediaBinWidget::currentView() const {
+    return view_ == View::Icons ? static_cast<QAbstractItemView*>(icons_) : static_cast<QAbstractItemView*>(list_);
+}
+
+void MediaBinWidget::showBin(const QString& bin) {
+    bin_ = bin;
+    smart_ = 0;
+    rebuild();
+}
+
+void MediaBinWidget::showSmartBin(Id id) {
+    smart_ = id;
+    rebuild();
+}
+
+std::vector<Id> MediaBinWidget::shownMedia() const {
+    std::vector<Id> ids;
+    for (int r = 0; r < proxy_->rowCount(); ++r) ids.push_back(proxy_->index(r, 0).data(MediaBinModel::IdRole).toULongLong());
+    return ids;
 }
 
 std::vector<Id> MediaBinWidget::selectedMedia() const {
     std::vector<Id> ids;
-    for (auto* it : list_->selectedItems()) ids.push_back(it->data(Qt::UserRole).toULongLong());
+    for (const QModelIndex& i : icons_->selectionModel()->selectedIndexes())
+        if (i.column() == 0) ids.push_back(i.data(MediaBinModel::IdRole).toULongLong());
     return ids;
+}
+
+void MediaBinWidget::selectMedia(const std::vector<Id>& ids) {
+    QItemSelection sel;
+    for (Id id : ids)
+        if (const int row = model_->rowOf(id); row >= 0) {
+            const QModelIndex i = proxy_->mapFromSource(model_->index(row, 0));
+            sel.select(i, i);
+        }
+    icons_->selectionModel()->select(sel, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+    if (!sel.isEmpty()) icons_->selectionModel()->setCurrentIndex(sel.indexes().first(), QItemSelectionModel::NoUpdate);
 }
 
 void MediaBinWidget::importDialog() {
@@ -174,95 +403,363 @@ void MediaBinWidget::importDialog() {
            "*.wav *.mp3 *.aac *.m4a *.flac *.ogg *.opus *.aif *.aiff *.png *.jpg *.jpeg *.tif *.tiff *.bmp *.webp *.exr);;All files (*)"));
     if (files.isEmpty()) return;
     settings.setValue("lastImportDir", QFileInfo(files.first()).absolutePath());
+    importInto(files, smart_ ? QString() : bin_);
+}
+
+void MediaBinWidget::importInto(const QStringList& files, const QString& bin) {
     QStringList errors;
-    state_->importFiles(files, &errors);
+    state_->importFiles(files, &errors, bin);
     if (!errors.isEmpty()) QMessageBox::warning(this, tr("Import"), errors.join("\n"));
 }
 
 void MediaBinWidget::rebuild() {
-    std::vector<Id> keep = selectedMedia();
     const Project& p = state_->project();
-    QString filter = search_->text().trimmed();
-    // Skip the rebuild if the visible set is unchanged (keeps scroll position and selection).
-    // The search matches names and, for transcribed media, what is said.
-    auto matches = [&filter](const MediaItem& m) {
-        return filter.isEmpty() || QString::fromStdString(m.name).contains(filter, Qt::CaseInsensitive) ||
-               (m.transcript && QString::fromStdString(m.transcript->text()).contains(filter, Qt::CaseInsensitive));
-    };
-    QStringList signature;
-    for (const auto& m : p.media)
-        if (matches(m))
-            signature << QString::number(m.id) + QString::fromStdString(m.name) + "/" +
-                             QString::number(m.transcript ? m.transcript->wordCount() : 0) + "/" +
-                             QString::fromStdString(m.colorOverride);
-    if (list_->property("signature").toStringList() == signature) {
-        refreshThumbnails();
-        return;
+    if (smart_ && !findSmartBin(p, smart_)) smart_ = 0;
+    if (!bin_.isEmpty()) {
+        const std::vector<std::string> bins = projectBins(p);
+        if (std::find(bins.begin(), bins.end(), bin_.toStdString()) == bins.end()) bin_.clear();
     }
-    list_->setProperty("signature", signature);
-    list_->clear();
-    for (const auto& m : p.media) {
-        QString name = QString::fromStdString(m.name);
-        if (!matches(m)) continue;
-        auto* it = new QListWidgetItem(name, list_);
-        it->setData(Qt::UserRole, QVariant::fromValue<qulonglong>(m.id));
-        QString dur = m.duration > 0 ? QString::fromStdString(formatTimecode(FrameTime(m.duration * (m.fps.valid() ? m.fps.toDouble() : 30)),
-                                                                              m.fps.valid() ? m.fps : Rational{30, 1}))
-                                     : QString();
-        QString tip = QString("<b>%1</b><br>%2").arg(name.toHtmlEscaped(), kindLabel(m));
-        if (m.hasVideo && m.width > 0) tip += QString("<br>%1×%2 @ %3 fps, %4").arg(m.width).arg(m.height).arg(m.fps.toDouble(), 0, 'f', 3).arg(QString::fromStdString(m.videoCodec));
-        if (m.hasVideo && m.kind != MediaKind::Sequence)
-            tip += "<br>" + tr("Colour: %1").arg(QString::fromStdString(mediaColorSpace(m).label)) +
-                   (m.colorOverride.empty() ? QString() : tr(" (interpreted)"));
-        if (m.hasAudio && m.sampleRate > 0) tip += QString("<br>%1 Hz, %2 ch, %3").arg(m.sampleRate).arg(m.channels).arg(QString::fromStdString(m.audioCodec));
-        if (!dur.isEmpty()) tip += "<br>" + dur;
-        if (m.transcript)
-            tip += "<br>" + tr("Transcript: %n word(s)", "", int(m.transcript->wordCount())) +
-                   (m.transcript->language.empty() ? QString() : QStringLiteral(" (%1)").arg(QString::fromStdString(m.transcript->language)));
-        if (!m.path.empty()) tip += "<br><i>" + QString::fromStdString(m.path).toHtmlEscaped() + "</i>";
-        it->setToolTip(tip);
-        if (std::find(keep.begin(), keep.end(), m.id) != keep.end()) it->setSelected(true);
+    rebuildTree();
+    const std::string query = search_->text().trimmed().toStdString(), bin = bin_.toStdString();
+    std::vector<Id> ids;
+    if (const SmartBin* sb = findSmartBin(p, smart_)) {
+        const std::map<Id, int> usage = mediaUsage(p);
+        for (const MediaItem& m : p.media)
+            if (smartBinMatches(*sb, m, usage) && mediaMatchesSearch(m, query)) ids.push_back(m.id);
+    } else {
+        // A bin shows what is in it; a search looks inside its bins too.
+        for (const MediaItem& m : p.media)
+            if (query.empty() ? m.bin == bin : binWithin(m.bin, bin) && mediaMatchesSearch(m, query)) ids.push_back(m.id);
     }
-    refreshThumbnails();
+    const std::vector<Id> keep = selectedMedia();
+    model_->setMedia(ids);
+    if (selectedMedia() != keep) selectMedia(keep);
 }
 
-void MediaBinWidget::refreshThumbnails() {
-    const Project& p = state_->project();
-    for (int i = 0; i < list_->count(); ++i) {
-        QListWidgetItem* it = list_->item(i);
-        const MediaItem* m = p.findMedia(it->data(Qt::UserRole).toULongLong());
-        if (!m) continue;
-        if (m->kind == MediaKind::Audio) {
-            if (it->icon().isNull()) it->setIcon(tile(tr("AUDIO"), theme::kAudioClip));
-            continue;
-        }
-        if (m->kind == MediaKind::Sequence) {
-            if (it->icon().isNull()) it->setIcon(tile(tr("SEQUENCE"), theme::kCompoundClip));
-            continue;
-        }
-        if (it->data(Qt::UserRole + 1).toBool()) continue;  // already has its real thumbnail
-        double aspect = m->width > 0 && m->height > 0 ? double(m->width) / m->height : 16.0 / 9;
-        int w = kThumbW, h = int(kThumbW / aspect);
-        if (h > kThumbH) {
-            h = kThumbH;
-            w = int(kThumbH * aspect);
-        }
-        double t = m->kind == MediaKind::Video ? std::min(1.0, m->duration * 0.1) : 0.0;
-        QImage img = ThumbnailCache::instance().get(QString::fromStdString(m->path), t, std::max(2, w), std::max(2, h));
-        if (img.isNull()) {
-            if (it->icon().isNull()) it->setIcon(tile(QString(), theme::kVideoClip));
-            continue;
-        }
-        QPixmap pm(kThumbW, kThumbH);
-        pm.fill(Qt::black);
-        QPainter pa(&pm);
-        pa.drawImage(QPoint((kThumbW - img.width()) / 2, (kThumbH - img.height()) / 2), img);
-        it->setIcon(pm);
-        it->setData(Qt::UserRole + 1, true);
-    }
+// Rebuilds the tree even if the project's bins are unchanged (to undo a rename that failed).
+void MediaBinWidget::resetTree() {
+    tree_->setProperty("signature", QStringList());
+    rebuildTree();
 }
 
-void MediaBinWidget::showContextMenu(const QPoint& pos) {
+void MediaBinWidget::rebuildTree() {
+    const Project& p = state_->project();
+    const std::vector<std::string> bins = projectBins(p);
+    QStringList signature{bin_, QString::number(smart_)};
+    for (const std::string& b : bins) signature << QString::fromStdString(b);
+    for (const SmartBin& b : p.smartBins) signature << QString::number(b.id) + ":" + QString::fromStdString(b.name);
+    // The tree shows once there is a bin to show.
+    const bool showTree = !bins.empty() || !p.smartBins.empty();
+    if (showTree && tree_->isHidden()) {
+        tree_->show();
+        if (split_->sizes().value(0) < 60) split_->setSizes({130, std::max(200, split_->width() - 130)});
+    } else if (!showTree) {
+        tree_->hide();
+    }
+    if (tree_->property("signature").toStringList() == signature) return;
+    tree_->setProperty("signature", signature);
+    treeUpdating_ = true;
+    tree_->clear();
+    const QIcon folder = style()->standardIcon(QStyle::SP_DirIcon);
+    auto* root = new QTreeWidgetItem(tree_, {tr("Project")});
+    root->setIcon(0, style()->standardIcon(QStyle::SP_DirHomeIcon));
+    root->setData(0, BinTree::KindRole, BinTree::BinItem);
+    root->setData(0, BinTree::PathRole, QString());
+    root->setFlags(Qt::ItemIsEnabled | Qt::ItemIsSelectable | Qt::ItemIsDropEnabled);
+    std::map<std::string, QTreeWidgetItem*> items{{"", root}};
+    QTreeWidgetItem* current = smart_ ? nullptr : root;
+    for (const std::string& b : bins) {
+        auto* it = new QTreeWidgetItem(items[binParent(b)], {QString::fromStdString(binLeaf(b))});
+        it->setIcon(0, folder);
+        it->setData(0, BinTree::KindRole, BinTree::BinItem);
+        it->setData(0, BinTree::PathRole, QString::fromStdString(b));
+        it->setFlags(Qt::ItemIsEnabled | Qt::ItemIsSelectable | Qt::ItemIsEditable | Qt::ItemIsDragEnabled | Qt::ItemIsDropEnabled);
+        items[b] = it;
+        if (!smart_ && b == bin_.toStdString()) current = it;
+    }
+    if (!p.smartBins.empty()) {
+        auto* header = new QTreeWidgetItem(tree_, {tr("Smart Bins")});
+        header->setData(0, BinTree::KindRole, BinTree::HeaderItem);
+        header->setFlags(Qt::ItemIsEnabled);
+        QFont f = header->font(0);
+        f.setBold(true);
+        header->setFont(0, f);
+        for (const SmartBin& b : p.smartBins) {
+            auto* it = new QTreeWidgetItem(header, {QString::fromStdString(b.name)});
+            it->setIcon(0, style()->standardIcon(QStyle::SP_FileDialogContentsView));
+            it->setData(0, BinTree::KindRole, BinTree::SmartItem);
+            it->setData(0, BinTree::IdRole, QVariant::fromValue<qulonglong>(b.id));
+            it->setFlags(Qt::ItemIsEnabled | Qt::ItemIsSelectable | Qt::ItemIsEditable);
+            it->setToolTip(0, tr("%n item(s); double-click to change its rules", "", int(smartBinMedia(p, b).size())));
+            if (b.id == smart_) current = it;
+        }
+    }
+    tree_->expandAll();
+    tree_->setCurrentItem(current);
+    treeUpdating_ = false;
+}
+
+void MediaBinWidget::open(Id id) {
+    const MediaItem* m = state_->project().findMedia(id);
+    if (!m) return;
+    if (m->kind == MediaKind::Sequence) state_->setActiveSequence(m->sequenceId);
+    else emit openInSource(id);
+}
+
+// ---------------------------------------------------------------------------
+// Logging
+
+bool MediaBinWidget::setRating(const std::vector<Id>& ids, int rating) {
+    rating = std::clamp(rating, -1, 5);
+    return state_->edit(rating < 0 ? tr("Reject") : tr("Rate %1").arg(starText(rating)), [ids, rating](Project& p, Sequence&) {
+        bool any = false;
+        for (Id id : ids)
+            if (MediaItem* m = p.findMedia(id); m && m->rating != rating) {
+                m->rating = rating;
+                any = true;
+            }
+        return any;
+    });
+}
+
+bool MediaBinWidget::setLabel(const std::vector<Id>& ids, int label) {
+    return state_->edit(tr("Set Label"), [ids, label](Project& p, Sequence&) {
+        bool any = false;
+        for (Id id : ids)
+            if (MediaItem* m = p.findMedia(id); m && m->label != label) {
+                m->label = label;
+                any = true;
+            }
+        return any;
+    });
+}
+
+bool MediaBinWidget::addKeywords(const std::vector<Id>& ids, const std::vector<std::string>& keywords) {
+    return state_->edit(tr("Add Keywords"), [ids, keywords](Project& p, Sequence&) {
+        bool any = false;
+        for (Id id : ids)
+            if (MediaItem* m = p.findMedia(id)) any |= montage::addKeywords(m->keywords, keywords);
+        return any;
+    });
+}
+
+bool MediaBinWidget::removeKeyword(const std::vector<Id>& ids, const std::string& keyword) {
+    return state_->edit(tr("Remove Keyword"), [ids, keyword](Project& p, Sequence&) {
+        bool any = false;
+        for (Id id : ids)
+            if (MediaItem* m = p.findMedia(id)) any |= montage::removeKeywords(m->keywords, {keyword});
+        return any;
+    });
+}
+
+bool MediaBinWidget::moveToBin(const std::vector<Id>& ids, const QString& bin) {
+    const std::string b = bin.toStdString();
+    return state_->edit(tr("Move to Bin"), [ids, b](Project& p, Sequence&) { return moveMediaToBin(p, ids, b); });
+}
+
+QString MediaBinWidget::newBin(const QString& parent) {
+    const std::string par = parent.toStdString();
+    const std::string path = joinBin(par, uniqueBinName(state_->project(), par, tr("Bin").toStdString()));
+    if (!state_->edit(tr("New Bin"), [path](Project& p, Sequence&) { return addBin(p, path); })) return {};
+    rebuild();
+    // Name it straight away.
+    for (QTreeWidgetItemIterator it(tree_); *it; ++it)
+        if ((*it)->data(0, BinTree::KindRole).toInt() == BinTree::BinItem && (*it)->data(0, BinTree::PathRole).toString().toStdString() == path) {
+            tree_->scrollToItem(*it);
+            if (tree_->isVisible()) tree_->editItem(*it);
+        }
+    return QString::fromStdString(path);
+}
+
+bool MediaBinWidget::renameBin(const QString& bin, const QString& name) {
+    const QString leaf = cleanBinName(name);
+    if (bin.isEmpty() || leaf.isEmpty()) return false;
+    const std::string from = bin.toStdString(), to = joinBin(binParent(from), leaf.toStdString());
+    if (to == from) return false;
+    const bool showing = !smart_ && binWithin(bin_.toStdString(), from);
+    if (!state_->edit(tr("Rename Bin"), [from, to](Project& p, Sequence&) { return montage::renameBin(p, from, to); })) return false;
+    if (showing) showBin(QString::fromStdString(to + bin_.toStdString().substr(from.size())));
+    return true;
+}
+
+bool MediaBinWidget::moveBin(const QString& bin, const QString& into) {
+    const std::string from = bin.toStdString(), to = joinBin(into.toStdString(), binLeaf(from));
+    const bool showing = !smart_ && binWithin(bin_.toStdString(), from);
+    if (!state_->edit(tr("Move Bin"), [from, into = into.toStdString()](Project& p, Sequence&) { return montage::moveBin(p, from, into); }))
+        return false;
+    if (showing) showBin(QString::fromStdString(to + bin_.toStdString().substr(from.size())));
+    return true;
+}
+
+bool MediaBinWidget::deleteBin(const QString& bin) {
+    const std::string b = bin.toStdString();
+    if (!state_->edit(tr("Delete Bin"), [b](Project& p, Sequence&) { return removeBin(p, b); })) return false;
+    if (!smart_ && binWithin(bin_.toStdString(), b)) showBin(QString::fromStdString(binParent(b)));
+    return true;
+}
+
+Id MediaBinWidget::addSmartBin(const SmartBin& bin) {
+    Id id = 0;
+    state_->edit(tr("New Smart Bin"), [&](Project& p, Sequence&) {
+        SmartBin b = bin;
+        b.id = id = p.newId();
+        if (b.name.empty()) b.name = tr("Smart Bin").toStdString();
+        p.smartBins.push_back(std::move(b));
+        return true;
+    });
+    if (id) showSmartBin(id);
+    return id;
+}
+
+bool MediaBinWidget::updateSmartBin(const SmartBin& bin) {
+    return state_->edit(tr("Change Smart Bin"), [bin](Project& p, Sequence&) {
+        SmartBin* b = findSmartBin(p, bin.id);
+        if (!b || *b == bin) return false;
+        *b = bin;
+        return true;
+    });
+}
+
+bool MediaBinWidget::deleteSmartBin(Id id) {
+    return state_->edit(tr("Delete Smart Bin"), [id](Project& p, Sequence&) {
+        return std::erase_if(p.smartBins, [id](const SmartBin& b) { return b.id == id; }) > 0;
+    });
+}
+
+Id MediaBinWidget::newSmartBinDialog() {
+    SmartBin b;
+    b.name = tr("Smart Bin").toStdString();
+    SmartBinDialog dlg(state_->project(), b, this);
+    if (dlg.exec() != QDialog::Accepted) return 0;
+    return addSmartBin(dlg.bin());
+}
+
+bool MediaBinWidget::editSmartBinDialog(Id id) {
+    const SmartBin* b = findSmartBin(state_->project(), id);
+    if (!b) return false;
+    SmartBinDialog dlg(state_->project(), *b, this);
+    if (dlg.exec() != QDialog::Accepted) return false;
+    return updateSmartBin(dlg.bin());
+}
+
+void MediaBinWidget::addKeywordsDialog(const std::vector<Id>& ids) {
+    QInputDialog dlg(this);
+    dlg.setWindowTitle(tr("Add Keywords"));
+    dlg.setLabelText(tr("Keywords, separated by commas:"));
+    if (auto* line = dlg.findChild<QLineEdit*>()) {
+        QStringList known;
+        for (const std::string& k : projectKeywords(state_->project())) known << QString::fromStdString(k);
+        auto* completer = new QCompleter(known, line);
+        completer->setCaseSensitivity(Qt::CaseInsensitive);
+        line->setCompleter(completer);
+    }
+    if (dlg.exec() != QDialog::Accepted) return;
+    addKeywords(ids, parseKeywords(dlg.textValue().toStdString()));
+}
+
+bool MediaBinWidget::eventFilter(QObject* watched, QEvent* event) {
+    const bool view = watched == icons_ || watched == list_;
+    // Rating keys: 0–5 and X (reject), over the window's shortcuts while a view has the focus.
+    if (view && (event->type() == QEvent::ShortcutOverride || event->type() == QEvent::KeyPress)) {
+        auto* ke = static_cast<QKeyEvent*>(event);
+        const Qt::KeyboardModifiers mods = ke->modifiers() & ~Qt::KeypadModifier;
+        const int key = ke->key();
+        const bool rating = mods == Qt::NoModifier && ((key >= Qt::Key_0 && key <= Qt::Key_5) || key == Qt::Key_X);
+        if (rating && !selectedMedia().empty()) {  // (an open editor has the focus, not the view)
+            ke->accept();
+            if (event->type() == QEvent::KeyPress) {
+                const std::vector<Id> ids = selectedMedia();
+                if (key == Qt::Key_X) {
+                    bool allRejected = true;
+                    for (Id id : ids)
+                        if (const MediaItem* m = state_->project().findMedia(id)) allRejected &= m->rating < 0;
+                    setRating(ids, allRejected ? 0 : -1);
+                } else {
+                    setRating(ids, key - Qt::Key_0);
+                }
+            }
+            return true;
+        }
+    }
+    // Files dropped on a view are imported into the bin shown.
+    if (!view && (watched == icons_->viewport() || watched == list_->viewport())) {
+        if (event->type() == QEvent::DragEnter || event->type() == QEvent::DragMove) {
+            auto* e = static_cast<QDragMoveEvent*>(event);
+            if (e->mimeData()->hasUrls()) {
+                e->acceptProposedAction();
+                return true;
+            }
+        } else if (event->type() == QEvent::Drop) {
+            auto* e = static_cast<QDropEvent*>(event);
+            if (e->mimeData()->hasUrls()) {
+                QStringList files;
+                for (const QUrl& u : e->mimeData()->urls())
+                    if (u.isLocalFile()) files << u.toLocalFile();
+                e->acceptProposedAction();
+                importInto(files, smart_ ? QString() : bin_);
+                return true;
+            }
+        }
+    }
+    return QWidget::eventFilter(watched, event);
+}
+
+// ---------------------------------------------------------------------------
+// Menus
+
+void MediaBinWidget::showColumnMenu(const QPoint& pos) {
+    QMenu menu(this);
+    menu.setObjectName(QStringLiteral("binColumns"));
+    for (int c = 1; c < model_->columnCount(); ++c) {
+        QAction* a = menu.addAction(model_->headerData(c, Qt::Horizontal).toString());
+        a->setCheckable(true);
+        a->setChecked(!list_->isColumnHidden(c));
+        a->setData(c);
+        connect(a, &QAction::toggled, this, [this, c](bool on) {
+            list_->setColumnHidden(c, !on);
+            saveColumns();
+        });
+    }
+    menu.addSeparator();
+    menu.addAction(tr("Default Columns"), this, [this] {
+        const QStringList d = defaultColumns();
+        for (int c = 1; c < model_->columnCount(); ++c)
+            list_->setColumnHidden(c, !d.contains(QString::fromStdString(MediaBinModel::columnKeys()[size_t(c)])));
+        saveColumns();
+    });
+    menu.exec(list_->header()->mapToGlobal(pos));
+}
+
+void MediaBinWidget::saveColumns() {
+    QStringList visible;
+    for (int c = 0; c < model_->columnCount(); ++c)
+        if (!list_->isColumnHidden(c)) visible << QString::fromStdString(MediaBinModel::columnKeys()[size_t(c)]);
+    QSettings("Montage", "Montage").setValue("mediaBin/columns", visible);
+}
+
+void MediaBinWidget::showBinMenu(const QPoint& pos) {
+    QTreeWidgetItem* it = tree_->itemAt(pos);
+    const int kind = it ? it->data(0, BinTree::KindRole).toInt() : 0;
+    const QString path = kind == BinTree::BinItem ? it->data(0, BinTree::PathRole).toString() : QString();
+    QMenu menu(this);
+    menu.addAction(tr("New Bin"), this, [this, path] { newBin(path); });
+    menu.addAction(tr("New Smart Bin…"), this, [this] { newSmartBinDialog(); });
+    if (kind == BinTree::BinItem && !path.isEmpty()) {
+        menu.addSeparator();
+        menu.addAction(tr("Rename"), this, [this, it] { tree_->editItem(it); });
+        menu.addAction(tr("Delete Bin (Keep Its Media)"), this, [this, path] { deleteBin(path); })
+            ->setObjectName(QStringLiteral("deleteBin"));
+    } else if (kind == BinTree::SmartItem) {
+        const Id id = it->data(0, BinTree::IdRole).toULongLong();
+        menu.addSeparator();
+        menu.addAction(tr("Edit Smart Bin…"), this, [this, id] { editSmartBinDialog(id); });
+        menu.addAction(tr("Rename"), this, [this, it] { tree_->editItem(it); });
+        menu.addAction(tr("Delete Smart Bin"), this, [this, id] { deleteSmartBin(id); });
+    }
+    menu.exec(tree_->viewport()->mapToGlobal(pos));
+}
+
+void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos) {
     auto ids = selectedMedia();
     QMenu menu(this);
     if (ids.size() == 1) {
@@ -282,14 +779,63 @@ void MediaBinWidget::showContextMenu(const QPoint& pos) {
             QString name = QInputDialog::getText(this, tr("Rename"), tr("Name:"), QLineEdit::Normal,
                                                  QString::fromStdString(m->name), &ok);
             if (!ok || name.isEmpty()) return;
-            state_->edit(tr("Rename Media"), [id, name](Project& p, Sequence&) {
-                MediaItem* mi = p.findMedia(id);
-                if (!mi) return false;
-                mi->name = name.toStdString();
-                if (mi->kind == MediaKind::Sequence)
-                    if (Sequence* s = p.findSequence(mi->sequenceId)) s->name = mi->name;
-                return true;
-            });
+            model_->setField({id}, "name", name);
+        });
+    }
+    if (!ids.empty()) {
+        // Logging.
+        menu.addSeparator();
+        const MediaItem* first = state_->project().findMedia(ids.front());
+        auto same = [&](auto get) {
+            for (Id id : ids)
+                if (const MediaItem* m = state_->project().findMedia(id); m && first && get(*m) != get(*first)) return false;
+            return first != nullptr;
+        };
+        QMenu* rating = menu.addMenu(tr("Rating"));
+        rating->setObjectName(QStringLiteral("ratingMenu"));
+        const bool sameRating = same([](const MediaItem& m) { return m.rating; });
+        for (int r : {-1, 0, 1, 2, 3, 4, 5}) {
+            QAction* a = rating->addAction(starText(r), this, [this, ids, r] { setRating(ids, r); });
+            a->setCheckable(true);
+            a->setChecked(sameRating && first->rating == r);
+            a->setShortcut(r < 0 ? QKeySequence(Qt::Key_X) : QKeySequence(Qt::Key_0 + r));
+            a->setData(r);
+        }
+        QMenu* label = menu.addMenu(tr("Label"));
+        label->setObjectName(QStringLiteral("labelMenu"));
+        const bool sameLabel = same([](const MediaItem& m) { return m.label; });
+        for (int i = 0; i < theme::labelCount(); ++i) {
+            QAction* a = label->addAction(i == 0 ? tr("None") : tr(labelName(i)), this, [this, ids, i] { setLabel(ids, i); });
+            if (i > 0) {
+                QPixmap sw(12, 12);
+                sw.fill(theme::labelColor(i));
+                a->setIcon(QIcon(sw));
+            }
+            a->setCheckable(true);
+            a->setChecked(sameLabel && first->label == i);
+            a->setData(i);
+        }
+        menu.addAction(tr("Add Keywords…"), this, [this, ids] { addKeywordsDialog(ids); })->setObjectName(QStringLiteral("addKeywords"));
+        std::vector<std::string> present;
+        for (Id id : ids)
+            if (const MediaItem* m = state_->project().findMedia(id)) montage::addKeywords(present, m->keywords);
+        if (!present.empty()) {
+            QMenu* remove = menu.addMenu(tr("Remove Keyword"));
+            remove->setObjectName(QStringLiteral("removeKeyword"));
+            for (const std::string& k : present)
+                remove->addAction(QString::fromStdString(k), this, [this, ids, k] { removeKeyword(ids, k); });
+        }
+        QMenu* move = menu.addMenu(tr("Move to Bin"));
+        move->setObjectName(QStringLiteral("moveToBin"));
+        move->addAction(tr("Project"), this, [this, ids] { moveToBin(ids, {}); })->setData(QString());
+        for (const std::string& b : projectBins(state_->project()))
+            move->addAction(QString(int(std::count(b.begin(), b.end(), '/')) * 2, ' ') + QString::fromStdString(binLeaf(b)), this,
+                            [this, ids, b] { moveToBin(ids, QString::fromStdString(b)); })
+                ->setData(QString::fromStdString(b));
+        move->addSeparator();
+        move->addAction(tr("New Bin…"), this, [this, ids] {
+            const QString bin = newBin(smart_ ? QString() : bin_);
+            if (!bin.isEmpty()) moveToBin(ids, bin);
         });
     }
     std::vector<Id> withSound;
@@ -396,8 +942,9 @@ void MediaBinWidget::showContextMenu(const QPoint& pos) {
         });
     }
     menu.addSeparator();
+    menu.addAction(tr("New Bin"), this, [this] { newBin(smart_ ? QString() : bin_); });
     menu.addAction(tr("Import..."), this, &MediaBinWidget::importDialog);
-    menu.exec(list_->viewport()->mapToGlobal(pos));
+    menu.exec(view->viewport()->mapToGlobal(pos));
 }
 
 void MediaBinWidget::transcribe(const std::vector<Id>& ids) {

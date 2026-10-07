@@ -123,6 +123,25 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         return false;
     }
     double dur = fmt->duration > 0 ? double(fmt->duration) / AV_TIME_BASE : 0.0;
+    // When and on what it was recorded, from the container's tags (or a stream's).
+    auto tag = [&](const char* key) -> std::string {
+        if (const AVDictionaryEntry* e = av_dict_get(fmt->metadata, key, nullptr, 0)) return e->value;
+        for (unsigned i = 0; i < fmt->nb_streams; ++i)
+            if (const AVDictionaryEntry* e = av_dict_get(fmt->streams[i]->metadata, key, nullptr, 0)) return e->value;
+        return {};
+    };
+    if (m.created.empty()) {
+        m.created = tag("com.apple.quicktime.creationdate");
+        if (m.created.empty()) m.created = tag("creation_time");
+        if (m.created.empty()) m.created = tag("date");
+    }
+    if (!m.metadata.count("device")) {
+        std::string make = tag("com.apple.quicktime.make"), model = tag("com.apple.quicktime.model");
+        if (make.empty()) make = tag("make");
+        if (model.empty()) model = tag("model");
+        std::string device = model.rfind(make, 0) == 0 ? model : make + (make.empty() || model.empty() ? "" : " ") + model;
+        if (!device.empty()) m.metadata["device"] = device;
+    }
     if (m.hasVideo) {
         AVStream* st = fmt->streams[v];
         const AVCodecDescriptor* d = avcodec_descriptor_get(st->codecpar->codec_id);

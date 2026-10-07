@@ -102,7 +102,7 @@ struct MediaItem {
     std::string videoCodec;
     std::string audioCodec;
     Id sequenceId = 0;       // for MediaKind::Sequence (compound clip)
-    std::string bin;         // bin (folder) name, "" = root
+    std::string bin;         // bin path, "/" between nested bins ("Interviews/Day 1"), "" = the project root
     std::string colorSpace;     // detected from the file's colour tags (ColorSpace.h id), "" = Rec.709
     std::string colorOverride;  // Interpret Colour: the space to read it as, "" = as detected
     double timecode = -1;       // start timecode in seconds (for multicam sync), -1 = none
@@ -110,7 +110,29 @@ struct MediaItem {
     std::shared_ptr<const Transcript> transcript;
     // What the footage shows, for search by description (shared like the transcript).
     std::shared_ptr<const VisualIndex> visual;
+    // Logging (core/MediaLog.h): what the editor notes about the media to find it again.
+    int rating = 0;                                // -1 rejected, 0 unrated, 1-5 stars
+    int label = 0;                                 // colour label (core/MediaLog.h labelName), 0 = none
+    std::vector<std::string> keywords;
+    std::map<std::string, std::string> metadata;  // scene, shot, take, camera, description, comment, ...
+    std::string created;                           // when it was recorded (ISO 8601, from the file), "" = unknown
     bool operator==(const MediaItem&) const = default;
+};
+
+// A saved search: the media matching its rules (core/MediaLog.h).
+struct SmartRule {
+    std::string field;  // a mediaFields() key, or "any" for any text
+    std::string op;     // contains, !contains, is, !is, starts, empty, !empty, >, >=, <, <=, includes, !includes
+    std::string value;
+    bool operator==(const SmartRule&) const = default;
+};
+
+struct SmartBin {
+    Id id = 0;
+    std::string name;
+    bool matchAll = true;  // all rules must match, or any of them
+    std::vector<SmartRule> rules;
+    bool operator==(const SmartBin&) const = default;
 };
 
 // ---------------------------------------------------------------------------
@@ -240,6 +262,8 @@ struct Project {
     std::string name = "Untitled";
     std::vector<MediaItem> media;
     std::vector<Sequence> sequences;
+    std::vector<std::string> bins;  // bin paths ("Interviews/Day 1"), including empty ones
+    std::vector<SmartBin> smartBins;
     Id activeSequence = 0;
     Id nextId = 1;
 

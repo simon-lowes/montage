@@ -1,38 +1,95 @@
-// Montage — project media bin: import, thumbnails, search and drag to timeline.
+// Montage — the project's media: bins, smart bins, and the media in the one
+// shown, as thumbnails or as a list with metadata columns. Media are logged
+// here: ratings (0–5 keys, X rejects), colour labels, keywords and fields
+// such as scene and take, all searchable and usable in smart bin rules.
 #pragma once
 
-#include <QListWidget>
+#include <QTreeWidget>
 #include <QWidget>
+#include <vector>
 
 #include "core/Model.h"
 
+class QAbstractItemView;
 class QLineEdit;
+class QListView;
+class QSortFilterProxyModel;
+class QSplitter;
+class QStackedWidget;
 class QToolButton;
+class QTreeView;
 
 namespace montage {
 
 class EditorState;
+class MediaBinModel;
 
-class MediaList : public QListWidget {
+// The bin tree: media dropped on a bin move into it, bins dropped on a bin
+// move inside it, and files dropped on a bin are imported into it.
+class BinTree : public QTreeWidget {
     Q_OBJECT
 public:
-    explicit MediaList(QWidget* parent = nullptr);
+    enum ItemKind { BinItem = 1, SmartItem, HeaderItem };
+    static constexpr int KindRole = Qt::UserRole;
+    static constexpr int PathRole = Qt::UserRole + 1;  // bin path
+    static constexpr int IdRole = Qt::UserRole + 2;    // smart bin id
+
+    explicit BinTree(QWidget* parent = nullptr);
 
 signals:
-    void filesDropped(const QStringList& paths);
+    void mediaDropped(const std::vector<montage::Id>& media, const QString& bin);
+    void binDropped(const QString& bin, const QString& into);
+    void filesDropped(const QStringList& files, const QString& bin);
 
 protected:
-    QMimeData* mimeData(const QList<QListWidgetItem*>& items) const override;
     QStringList mimeTypes() const override;
+    QMimeData* mimeData(const QList<QTreeWidgetItem*>& items) const override;
     void dragEnterEvent(QDragEnterEvent* e) override;
     void dragMoveEvent(QDragMoveEvent* e) override;
     void dropEvent(QDropEvent* e) override;
+
+private:
+    QTreeWidgetItem* binAt(const QPoint& pos) const;
 };
 
 class MediaBinWidget : public QWidget {
     Q_OBJECT
 public:
+    enum class View { Icons, List };
+
     explicit MediaBinWidget(EditorState* state, QWidget* parent = nullptr);
+
+    void setView(View v);
+    View view() const { return view_; }
+    QAbstractItemView* currentView() const;
+    MediaBinModel* model() const { return model_; }
+
+    // Where the media shown come from: a bin ("" = the project root), or a smart bin.
+    void showBin(const QString& bin);
+    void showSmartBin(Id id);
+    QString currentBin() const { return bin_; }
+    Id currentSmartBin() const { return smart_; }
+    std::vector<Id> shownMedia() const;  // in the order shown
+    std::vector<Id> selectedMedia() const;
+    void selectMedia(const std::vector<Id>& ids);
+
+    // Logging, each one undo step.
+    bool setRating(const std::vector<Id>& ids, int rating);
+    bool setLabel(const std::vector<Id>& ids, int label);
+    bool addKeywords(const std::vector<Id>& ids, const std::vector<std::string>& keywords);
+    bool removeKeyword(const std::vector<Id>& ids, const std::string& keyword);
+    bool moveToBin(const std::vector<Id>& ids, const QString& bin);
+    // Bins: a new bin inside `parent` (returned), rename, move into another, delete (contents move up).
+    QString newBin(const QString& parent);
+    bool renameBin(const QString& bin, const QString& name);
+    bool moveBin(const QString& bin, const QString& into);
+    bool deleteBin(const QString& bin);
+    // Smart bins: add one (returns its id), change one, delete one; or edit in the dialog.
+    Id addSmartBin(const SmartBin& bin);
+    bool updateSmartBin(const SmartBin& bin);
+    bool deleteSmartBin(Id id);
+    Id newSmartBinDialog();
+    bool editSmartBinDialog(Id id);
 
 public slots:
     void importDialog();
@@ -44,16 +101,37 @@ signals:
     void newSequenceRequested();
     void createMulticamRequested(const std::vector<montage::Id>& media);
 
+protected:
+    bool eventFilter(QObject* watched, QEvent* event) override;
+
 private:
-    void refreshThumbnails();
-    void showContextMenu(const QPoint& pos);
-    std::vector<Id> selectedMedia() const;
+    void rebuildTree();
+    void resetTree();
+    void open(Id id);
+    void showContextMenu(QAbstractItemView* view, const QPoint& pos);
+    void showBinMenu(const QPoint& pos);
+    void showColumnMenu(const QPoint& pos);
+    void addKeywordsDialog(const std::vector<Id>& ids);
+    void importInto(const QStringList& files, const QString& bin);
     void createProxies(const std::vector<Id>& ids);
     void transcribe(const std::vector<Id>& ids);
+    void saveColumns();
 
     EditorState* state_;
-    MediaList* list_;
+    MediaBinModel* model_;
+    QSortFilterProxyModel* proxy_;
+    QSplitter* split_;
+    BinTree* tree_;
+    QStackedWidget* stack_;
+    QListView* icons_;
+    QTreeView* list_;
     QLineEdit* search_;
+    QToolButton* iconsBtn_;
+    QToolButton* listBtn_;
+    View view_ = View::Icons;
+    QString bin_;
+    Id smart_ = 0;
+    bool treeUpdating_ = false;
 };
 
 }  // namespace montage

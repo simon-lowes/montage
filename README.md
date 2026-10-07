@@ -91,6 +91,16 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Loudness normalisation to -14, -16, -23 or -24 LUFS (ITU-R BS.1770 / EBU R128 gated measurement)
 - Waveforms on the timeline
 
+**Organising media**
+- Bins, nested to any depth: drag media or bins onto a bin in the bin tree, and drop files on a bin to import into it. Deleting a bin keeps its media.
+- Icon view, or a list view with sortable columns: rating, label, duration, type, resolution, frame rate, start timecode, codecs, keywords, usage in sequences, scene, shot, take, camera, camera model, description, comment, recording date, colour space, transcript, proxy, bin and file. Right-click the header to choose columns.
+- Logging:
+  - Ratings: press 1–5 for stars, 0 to clear, and X to reject.
+  - Colour labels, keywords, and metadata fields, edited in the list (an edit applies to every selected row) or from the right-click menu.
+  - The recording date and camera model are read from camera files.
+- The search box finds names, keywords, metadata and what is said; "quoted text" finds a phrase. It searches inside the bin's bins too.
+- **Smart bins** (saved searches) list the media matching their rules and stay up to date, for example "rating at least 4 and keyword includes interview". Rules cover every column, any text, and usage, so "used 0 times" finds what hasn't been cut in.
+
 **Media and output**
 - Imports anything FFmpeg reads
 - Frame-accurate decoding that honours rotation, pixel aspect ratio, colour space and range
@@ -236,6 +246,7 @@ Its tools work on `.montage` files by path. Each edit is saved at once, and the 
 - add titles, effects (including masked ones), transitions and markers;
 - transcribe (with speaker labels) and find spoken phrases in the cut;
 - find shots by description;
+- log media (ratings, labels, keywords, metadata fields, bins) and find media by text or smart-bin rules, optionally saving the rules as a smart bin;
 - return a rendered frame as an image so the agent can check its work;
 - render with any preset, with progress;
 - export and import EDL, OTIO, FCP 7 XML and FCPXML.

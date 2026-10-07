@@ -20,6 +20,7 @@
 #include <QTableWidget>
 #include <QTextEdit>
 #include <QToolButton>
+#include <QTreeView>
 #include <QTreeWidget>
 #include <algorithm>
 #include <cmath>
@@ -29,7 +30,10 @@
 #include "EditorState.h"
 #include "EffectsBrowser.h"
 #include "ExportDialog.h"
+#include "MediaBinModel.h"
 #include "MediaBinWidget.h"
+#include "SmartBinDialog.h"
+#include "core/MediaLog.h"
 #include "SequenceSettingsDialog.h"
 #include "audio/Plugins.h"
 #include "MainWindow.h"
@@ -715,12 +719,12 @@ private slots:
         for (auto* e : win_->findChildren<QLineEdit*>())
             if (e->placeholderText() == "Search media") search = e;
         QVERIFY(search);
-        QListWidget* bin = search->parentWidget()->findChild<QListWidget*>();
+        auto* bin = win_->findChild<MediaBinWidget*>();
         QVERIFY(bin);
-        search->setText("fellow americans");
-        QCOMPARE(bin->count(), 1);
-        search->setText("words nobody said");
-        QCOMPARE(bin->count(), 0);
+        search->setText("\"fellow americans\"");
+        QCOMPARE(bin->shownMedia().size(), size_t(1));
+        search->setText("\"words nobody said\"");
+        QCOMPARE(bin->shownMedia().size(), size_t(0));
         search->clear();
 
         // It is one undo step, and it is saved with the project.
@@ -736,6 +740,219 @@ private slots:
         QCOMPARE(*back.findMedia(id)->transcript, *transcript);
         state()->newProject();
         QVERIFY(QTest::qWaitForWindowActive(win_.get()));  // the window has the focus back
+    }
+
+    void mediaBinLogging() {
+        // Two short videos and a sound file.
+        QStringList files;
+        for (int k = 0; k < 2; ++k) {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 160;
+            gs.height = 90;
+            Clip c = makeGeneratorClip(gen, "color", 25);
+            c.generator.params["color.r"] = Param(k ? 0.2 : 0.8);
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, c);
+            ExportSettings st;
+            st.path = (dir_.path() + QString("/take%1.mp4").arg(k + 1)).toStdString();
+            st.audioCodec = "none";
+            st.preset = "ultrafast";
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+            files << QString::fromStdString(st.path);
+        }
+        files << QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav");
+        state()->newProject();
+        const std::vector<Id> ids = state()->importFiles(files);
+        QCOMPARE(ids.size(), size_t(3));
+        const Id take1 = ids[0], take2 = ids[1], jfk = ids[2];
+        auto* bin = win_->findChild<MediaBinWidget*>();
+        auto* tree = bin->findChild<BinTree*>("binTree");
+        auto* icons = bin->findChild<QAbstractItemView*>("mediaIcons");
+        auto* list = bin->findChild<QTreeView*>("mediaList");
+        QVERIFY(bin && tree && icons && list);
+        auto media = [&](Id id) { return state()->project().findMedia(id); };
+        QCOMPARE(bin->shownMedia(), ids);
+        QVERIFY(tree->isHidden());  // no bins yet
+
+        // Bins: a new one appears in the tree; renaming and moving media are undoable.
+        const QString first = bin->newBin({});
+        QCOMPARE(first, QString("Bin"));
+        QVERIFY(!tree->isHidden());
+        QVERIFY(bin->renameBin(first, "Inter/views"));  // a slash would nest it
+        QCOMPARE(projectBins(state()->project()), std::vector<std::string>{"Inter-views"});
+        state()->undo();
+        QCOMPARE(projectBins(state()->project()), std::vector<std::string>{"Bin"});
+        state()->redo();
+        QVERIFY(bin->renameBin("Inter-views", "Interviews"));
+        QVERIFY(bin->moveToBin({take1, take2}, "Interviews"));
+        QCOMPARE(bin->shownMedia(), std::vector<Id>{jfk});
+        bin->showBin("Interviews");
+        QCOMPARE(bin->shownMedia(), (std::vector<Id>{take1, take2}));
+        QCOMPARE(tree->currentItem()->text(0), QString("Interviews"));
+        // A nested bin, then media dropped on it in the tree.
+        const QString day = bin->newBin("Interviews");
+        QCOMPARE(day, QString("Interviews/Bin"));
+        QTreeWidgetItem* dayItem = nullptr;
+        for (QTreeWidgetItemIterator it(tree); *it; ++it)
+            if ((*it)->data(0, BinTree::PathRole).toString() == day) dayItem = *it;
+        QVERIFY(dayItem);
+        tree->scrollToItem(dayItem);
+        {
+            QMimeData mime;
+            mime.setData("application/x-montage-media", QByteArray::number(qulonglong(take2)));
+            const QPoint at = tree->visualItemRect(dayItem).center();
+            QDragEnterEvent enter(at, Qt::MoveAction, &mime, Qt::LeftButton, Qt::NoModifier);
+            QApplication::sendEvent(tree->viewport(), &enter);
+            QDragMoveEvent move(at, Qt::MoveAction, &mime, Qt::LeftButton, Qt::NoModifier);
+            QApplication::sendEvent(tree->viewport(), &move);
+            QVERIFY(move.isAccepted());
+            QDropEvent drop(QPointF(at), Qt::MoveAction, &mime, Qt::LeftButton, Qt::NoModifier);
+            QApplication::sendEvent(tree->viewport(), &drop);
+        }
+        QCOMPARE(media(take2)->bin, std::string("Interviews/Bin"));
+        QCOMPARE(bin->shownMedia(), std::vector<Id>{take1});
+        // A search looks inside the bin's bins.
+        bin->showBin({});
+        auto* search = bin->findChild<QLineEdit*>();
+        search->setText("take");
+        QCOMPARE(bin->shownMedia(), (std::vector<Id>{take1, take2}));
+        search->clear();
+
+        // Ratings from the keyboard: 0–5, and X to reject (or un-reject), over the window's multicam keys.
+        bin->showBin("Interviews");
+        bin->setView(MediaBinWidget::View::Icons);
+        bin->selectMedia({take1});
+        icons->setFocus();
+        QTest::keyClick(icons, Qt::Key_4);
+        QCOMPARE(media(take1)->rating, 4);
+        state()->undo();
+        QCOMPARE(media(take1)->rating, 0);
+        state()->redo();
+        QTest::keyClick(icons, Qt::Key_X);
+        QCOMPARE(media(take1)->rating, -1);
+        QTest::keyClick(icons, Qt::Key_X);
+        QCOMPARE(media(take1)->rating, 0);
+        QTest::keyClick(icons, Qt::Key_5);
+        QCOMPARE(media(take1)->rating, 5);
+
+        // A colour label from the context menu.
+        bool triggered = false;
+        QTimer::singleShot(0, this, [&] {
+            auto* menu = qobject_cast<QMenu*>(QApplication::activePopupWidget());
+            if (!menu) return;
+            if (auto* sub = menu->findChild<QMenu*>("labelMenu"))
+                for (QAction* a : sub->actions())
+                    if (a->data().toInt() == labelFromName("Forest")) {
+                        a->trigger();
+                        triggered = true;
+                    }
+            menu->close();
+        });
+        emit icons->customContextMenuRequested(QPoint(10, 10));
+        QVERIFY(triggered);
+        QCOMPARE(media(take1)->label, labelFromName("Forest"));
+        QVERIFY(bin->addKeywords({take1, jfk}, {"interview", "Anna"}));
+        QVERIFY(bin->removeKeyword({jfk}, "ANNA"));
+        QCOMPARE(media(jfk)->keywords, std::vector<std::string>{"interview"});
+
+        // The list view: columns of fields, edits to every selected row as one step, sorting.
+        bin->showBin({});
+        bin->setView(MediaBinWidget::View::List);
+        QCOMPARE(bin->currentView(), static_cast<QAbstractItemView*>(list));
+        search->setText("interview");  // take1 (in a bin) and jfk
+        QCOMPARE(bin->shownMedia().size(), size_t(2));
+        const int scene = MediaBinModel::columnOf("scene"), rating = MediaBinModel::columnOf("rating");
+        list->setColumnHidden(scene, false);
+        bin->selectMedia({take1, jfk});
+        const QModelIndex cell = list->model()->index(0, scene);
+        {
+            QLineEdit editor;
+            editor.setText("12A");
+            list->itemDelegate()->setModelData(&editor, list->model(), cell);
+        }
+        QCOMPARE(media(take1)->metadata.at("scene"), std::string("12A"));
+        QCOMPARE(media(jfk)->metadata.at("scene"), std::string("12A"));
+        QVERIFY(list->model()->index(0, scene).data().toString() == "12A");
+        state()->undo();
+        QVERIFY(!media(take1)->metadata.count("scene") && !media(jfk)->metadata.count("scene"));
+        state()->redo();
+        // One cell outside the selection edits just its row.
+        bin->selectMedia({take1});
+        const int jfkRow = bin->shownMedia()[0] == jfk ? 0 : 1;
+        QVERIFY(list->model()->setData(list->model()->index(jfkRow, scene), "14"));
+        QCOMPARE(media(jfk)->metadata.at("scene"), std::string("14"));
+        QCOMPARE(media(take1)->metadata.at("scene"), std::string("12A"));
+        list->sortByColumn(rating, Qt::DescendingOrder);
+        QCOMPARE(bin->shownMedia().front(), take1);
+        list->sortByColumn(rating, Qt::AscendingOrder);
+        QCOMPARE(bin->shownMedia().front(), jfk);
+        QCOMPARE(list->model()->index(1, rating).data().toString(), QString(5, QChar(0x2605)));
+        search->clear();
+
+        // Smart bins: rules edited in the dialog, contents kept up to date.
+        {
+            SmartBinDialog dlg(state()->project(), SmartBin{}, win_.get());
+            auto* count = dlg.findChild<QLabel*>("smartCount");
+            QVERIFY(count);
+            QCOMPARE(dlg.ruleCount(), 1);  // rating at least three stars, to start with
+            QVERIFY2(count->text().startsWith("1 "), qPrintable(count->text()));
+            dlg.findChild<QLineEdit*>("smartName")->setText("Interviews to use");
+            dlg.addRule();
+            QCOMPARE(dlg.ruleCount(), 2);
+            const auto fields = dlg.findChildren<QComboBox*>("ruleField");
+            QCOMPARE(fields.size(), 2);
+            fields[1]->setCurrentIndex(fields[1]->findData("keywords"));
+            auto choices = dlg.findChildren<QComboBox*>("ruleChoice");
+            choices[1]->setCurrentText("interview");
+            QVERIFY2(count->text().startsWith("1 "), qPrintable(count->text()));
+            dlg.findChild<QComboBox*>("smartMatch")->setCurrentIndex(1);  // any
+            QVERIFY2(count->text().startsWith("2 "), qPrintable(count->text()));
+            const SmartBin b = dlg.bin();
+            QCOMPARE(b.name, std::string("Interviews to use"));
+            QVERIFY(!b.matchAll);
+            QCOMPARE(b.rules.size(), size_t(2));
+            QCOMPARE(b.rules[0], (SmartRule{"rating", ">=", "3"}));
+            QCOMPARE(b.rules[1], (SmartRule{"keywords", "includes", "interview"}));
+            const Id smart = bin->addSmartBin(b);
+            QVERIFY(smart);
+            QCOMPARE(bin->currentSmartBin(), smart);
+            std::vector<Id> shown = bin->shownMedia();
+            std::sort(shown.begin(), shown.end());
+            QCOMPARE(shown, (std::vector<Id>{take1, jfk}));
+            // Logging updates it: rejecting take 1 still leaves its keyword.
+            SmartBin strict = *findSmartBin(state()->project(), smart);
+            strict.matchAll = true;
+            QVERIFY(bin->updateSmartBin(strict));
+            QCOMPARE(bin->shownMedia(), std::vector<Id>{take1});
+            QVERIFY(bin->setRating({take1}, -1));
+            QVERIFY(bin->shownMedia().empty());
+            state()->undo();
+            QCOMPARE(bin->shownMedia(), std::vector<Id>{take1});
+            // Editing an existing smart bin starts from its rules.
+            SmartBinDialog again(state()->project(), strict, win_.get());
+            QCOMPARE(again.ruleCount(), 2);
+            QCOMPARE(again.bin(), strict);
+        }
+
+        // Deleting a bin keeps its media; the project saves all of it.
+        QVERIFY(bin->deleteBin("Interviews"));
+        QCOMPARE(media(take1)->bin, std::string());
+        QCOMPARE(media(take2)->bin, std::string("Bin"));
+        const std::string path = (dir_.path() + "/logged.montage").toStdString();
+        QVERIFY(saveProject(state()->project(), path));
+        Project back;
+        QVERIFY(loadProject(path, back));
+        QCOMPARE(back.smartBins, state()->project().smartBins);
+        QCOMPARE(back.bins, state()->project().bins);
+        QCOMPARE(back.findMedia(take1)->rating, 5);
+        QCOMPARE(back.findMedia(take1)->label, labelFromName("Forest"));
+        QCOMPARE(back.findMedia(jfk)->metadata, (std::map<std::string, std::string>{{"scene", "14"}}));
+        bin->setView(MediaBinWidget::View::Icons);
+        state()->newProject();
+        QVERIFY(bin->shownMedia().empty());
+        QCOMPARE(bin->currentSmartBin(), Id(0));
+        QVERIFY(tree->isHidden());
     }
 
     void colourManagementUi() {
@@ -760,9 +977,9 @@ private slots:
         // Interpret Colour from the media bin's context menu.
         auto* binWidget = win_->findChild<MediaBinWidget*>();
         QVERIFY(binWidget);
-        auto* bin = binWidget->findChild<QListWidget*>();
-        QVERIFY(bin && bin->count() == 1);
-        bin->setCurrentRow(0);
+        QCOMPARE(binWidget->shownMedia(), ids);
+        binWidget->selectMedia(ids);
+        QAbstractItemView* bin = binWidget->currentView();
         bool triggered = false;
         QTimer::singleShot(0, this, [&] {
             auto* menu = qobject_cast<QMenu*>(QApplication::activePopupWidget());
@@ -778,7 +995,7 @@ private slots:
         emit bin->customContextMenuRequested(QPoint(10, 10));
         QVERIFY(triggered);
         QCOMPARE(state()->project().findMedia(ids[0])->colorOverride, std::string("slog3-sgamut3cine"));
-        QVERIFY(bin->item(0)->toolTip().contains("S-Log3"));
+        QVERIFY(bin->model()->index(0, 0).data(Qt::ToolTipRole).toString().contains("S-Log3"));
         state()->undo();
         QVERIFY(state()->project().findMedia(ids[0])->colorOverride.empty());
 

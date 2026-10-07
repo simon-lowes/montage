@@ -212,3 +212,33 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
     - cancelling;
     - the panel: index, search, open, and save/reopen;
     - the MCP tool.
+- [x] Organising and logging media (Phase 3):
+  - Compared with the leaders:
+    - Premiere: nested bins, list view metadata columns, labels, search bins.
+    - Resolve: smart bins built from metadata rules; scene, shot, take and camera fields.
+    - Final Cut Pro: ratings with favourites and rejects, keywords, and smart collections that match all or any rules.
+    - Avid: bins in columns, and sifting.
+  - Bins:
+    - Paths nest to any depth. Empty bins are kept in the project.
+    - You can create, rename, move (drag in the tree) and delete bins; a deleted bin's contents move up, keeping its sub-bins.
+    - Drag media onto a bin to move it there. Drop files on a bin to import them into it, and folders keep their structure.
+  - Logging:
+    - Ratings -1 to 5 (0–5 keys and X, over the window's multicam keys).
+    - Colour labels, shared with clips.
+    - Keywords, case-insensitive.
+    - Metadata fields: scene, shot, take, camera, camera model, description, comment.
+    - The recording date and camera make and model are read from the file's tags.
+  - Views: the icon view shows rating and label badges on the thumbnails. The list view has 25 sortable columns; logging cells are editable, and an edit applies to the whole selection as one undo step. Visible columns are remembered.
+  - Search: names, keywords, metadata and speech, every word or a quoted phrase, inside sub-bins too.
+  - Smart bins:
+    - rules on 27 fields, matching all or any;
+    - tests suited to each field: text, numbers with seconds or m:ss, ratings, labels, kinds, keywords;
+    - a rule editor with a live count.
+  - MCP tools: `montage_log_media`, and `montage_find_media` (which can save a smart bin). Project info now includes each media item's logging.
+  - Tested:
+    - the bin operations, keywords, field parsing and text, usage, search, every rule type, and the project round trip;
+    - probing a camera file's date and model;
+    - the app: bins, a drop on the tree, rating keys, the label menu, multi-row list edits with undo, sorting, the smart bin dialog and live updates, deleting a bin, and save;
+    - the MCP tools, including their errors.
+  - Still to do: range-based ratings and keywords (part of a clip, as Final Cut Pro does), keywords and ratings in FCPXML, and AI auto-tagging (shot size, people).
+

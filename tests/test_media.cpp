@@ -1,6 +1,8 @@
 // Media tests: probing, frame-accurate decoding, audio mixing, export round trips.
 #include <QtTest>
 #include <QPainter>
+#include <QProcess>
+#include <QStandardPaths>
 #include <QJsonObject>
 #include <QJsonDocument>
 #include <QJsonArray>
@@ -13,6 +15,7 @@
 #include <cstdio>
 
 #include "core/EditOps.h"
+#include "core/MediaLog.h"
 #include "core/Multicam.h"
 #include "core/Effects.h"
 #include "core/ProjectIO.h"
@@ -213,6 +216,27 @@ private slots:
         QVERIFY(std::fabs(b44->samples[20000] - 0.5f) < 0.01f);
         auto pk = computePeaks(*buf, 480);
         QCOMPARE(pk->minmax.size(), size_t(200));
+    }
+
+    void probeReadsWhenAndWhatRecorded() {
+        // A camera file's tags: when it was recorded, and the camera's make and model.
+        const QString ffmpeg = QStandardPaths::findExecutable("ffmpeg");
+        if (ffmpeg.isEmpty()) QSKIP("Needs the ffmpeg program");
+        const std::string file = path("camera.mov");
+        QProcess run;
+        run.start(ffmpeg, {"-v", "error", "-y", "-f", "lavfi", "-i", "color=c=red:s=64x36:d=1", "-metadata", "creation_time=2024-05-06T07:08:09Z",
+                           "-metadata", "make=Canon", "-metadata", "model=Canon EOS R5", "-c:v", "mpeg4", QString::fromStdString(file)});
+        QVERIFY(run.waitForFinished(60000));
+        QVERIFY2(run.exitCode() == 0, run.readAllStandardError().constData());
+        Project p;
+        const MediaItem m = probeOrFail(p, file);
+        QVERIFY2(QString::fromStdString(m.created).startsWith("2024-05-06T07:08:09"), m.created.c_str());
+        QCOMPARE(m.metadata.at("device"), std::string("Canon EOS R5"));  // the model already names the make
+        // Files without tags have neither.
+        const std::string wav = path("untagged.wav");
+        writeWav(wav, 48000, 0.1, 0.1f, 0.1f);
+        const MediaItem plain = probeOrFail(p, wav);
+        QVERIFY(plain.created.empty() && plain.metadata.empty());
     }
 
     void loudnessMeasurement() {
@@ -881,6 +905,51 @@ private slots:
         QVERIFY(!r.value("isError").toBool());
         QVERIFY(loadProject(project.toStdString(), saved));
         QVERIFY(saved.active()->markers.empty());
+
+        // Logging media, and finding it by text and by rules (saved as a smart bin).
+        const QString ball = QString::fromStdString(path("mcp-ball.mp4"));
+        r = tool("montage_log_media", QJsonObject{{"project", project}, {"media", ball}, {"rating", 4}, {"label", "rose"},
+                                                  {"add_keywords", QJsonArray{"ball", "test shot"}},
+                                                  {"fields", QJsonObject{{"scene", "3"}, {"take", "2"}}}, {"bin", "Selects/ Day 1"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QCOMPARE(r.value("structuredContent").toObject().value("media").toArray().at(0).toObject().value("label").toString(), QString("Rose"));
+        r = tool("montage_log_media", QJsonObject{{"project", project}, {"media", "mcp-ball.mp4"}, {"remove_keywords", "TEST SHOT"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));  // by name too
+        r = tool("montage_log_media", QJsonObject{{"project", project}, {"media", ball}, {"fields", QJsonObject{{"duration", "4"}}}});
+        QVERIFY(r.value("isError").toBool() && text(r).contains("not a field"));
+        r = tool("montage_log_media", QJsonObject{{"project", project}, {"media", "nope.mov"}, {"rating", 1}});
+        QVERIFY(r.value("isError").toBool() && text(r).contains("No media"));
+        r = tool("montage_log_media", QJsonObject{{"project", project}, {"media", ball}, {"rating", 9}});
+        QVERIFY(r.value("isError").toBool());
+        {
+            Project logged;
+            QVERIFY(loadProject(project.toStdString(), logged));
+            const MediaItem& m = logged.media.at(0);
+            QCOMPARE(m.rating, 4);
+            QCOMPARE(m.label, labelFromName("Rose"));
+            QCOMPARE(m.keywords, std::vector<std::string>{"ball"});
+            QCOMPARE(m.metadata, (std::map<std::string, std::string>{{"scene", "3"}, {"take", "2"}}));
+            QCOMPARE(m.bin, std::string("Selects/Day 1"));
+        }
+        const QJsonArray rules{QJsonObject{{"field", "rating"}, {"op", ">="}, {"value", 3}},
+                               QJsonObject{{"field", "keywords"}, {"op", "includes"}, {"value", "BALL"}}};
+        r = tool("montage_find_media", QJsonObject{{"project", project}, {"rules", rules}, {"save_as", "Selects"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QCOMPARE(r.value("structuredContent").toObject().value("media").toArray().size(), 1);
+        QVERIFY(text(r).contains("mcp-ball.mp4"));
+        r = tool("montage_find_media", QJsonObject{{"project", project}, {"text", "ball 3"}});  // keyword and scene
+        QCOMPARE(r.value("structuredContent").toObject().value("media").toArray().size(), 1);
+        r = tool("montage_find_media", QJsonObject{{"project", project}, {"rules", QJsonArray{QJsonObject{{"field", "usage"}, {"op", "is"}, {"value", 0}}}}});
+        QCOMPARE(r.value("structuredContent").toObject().value("media").toArray().size(), 0);  // it is in the cut
+        r = tool("montage_find_media", QJsonObject{{"project", project}, {"rules", QJsonArray{QJsonObject{{"field", "rating"}, {"op", "contains"}, {"value", "x"}}}}});
+        QVERIFY(r.value("isError").toBool() && text(r).contains(">="));
+        r = tool("montage_find_media", QJsonObject{{"project", project}, {"rules", QJsonArray{QJsonObject{{"field", "mood"}, {"op", "is"}, {"value", "x"}}}}});
+        QVERIFY(r.value("isError").toBool() && text(r).contains("scene"));
+        r = tool("montage_project_info", QJsonObject{{"project", project}});
+        QCOMPARE(r.value("structuredContent").toObject().value("media").toArray().at(0).toObject().value("rating").toInt(), 4);
+        QVERIFY(loadProject(project.toStdString(), saved));
+        QCOMPARE(saved.smartBins.size(), size_t(1));
+        QCOMPARE(saved.smartBins.at(0).name, std::string("Selects"));
 
         // Looking at a frame returns an image.
         r = tool("montage_render_frame", QJsonObject{{"project", project}, {"at", 0.4}, {"width", 320}});

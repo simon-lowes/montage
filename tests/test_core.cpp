@@ -9,6 +9,7 @@
 #include "core/Effects.h"
 #include "core/History.h"
 #include "core/Interchange.h"
+#include "core/MediaLog.h"
 #include "core/Multicam.h"
 #include "core/ProjectIO.h"
 #include "core/Transcript.h"
@@ -939,6 +940,169 @@ private slots:
         QVERIFY(!projectFromJson("{nope", back, &err));
         QVERIFY(!err.empty());
         QVERIFY(!projectFromJson("{\"format\":\"other\"}", back, &err));
+    }
+
+    void mediaLogging() {
+        Fixture fx;
+        Project& p = fx.p;
+        auto addMedia = [&](const char* name, MediaKind kind, double duration) {
+            MediaItem m;
+            m.id = p.newId();
+            m.kind = kind;
+            m.name = name;
+            m.path = std::string("/nonexistent/") + name;
+            m.duration = duration;
+            m.hasVideo = kind != MediaKind::Audio;
+            m.hasAudio = kind != MediaKind::Image;
+            m.width = 3840;
+            m.height = 2160;
+            m.fps = {25, 1};
+            p.media.push_back(m);
+            return m.id;
+        };
+        const Id clip = fx.media, wide = addMedia("wide.mov", MediaKind::Video, 4), song = addMedia("song.wav", MediaKind::Audio, 200),
+                 still = addMedia("still.png", MediaKind::Image, 0);
+
+        // Bins: paths with '/', parents implied, names unique per parent.
+        QVERIFY(addBin(p, "Interviews/Day 1"));
+        QVERIFY(!addBin(p, "Interviews"));  // implied by its child
+        QVERIFY(addBin(p, "B-roll"));
+        QCOMPARE(projectBins(p), (std::vector<std::string>{"B-roll", "Interviews", "Interviews/Day 1"}));
+        QCOMPARE(uniqueBinName(p, "", "b-roll"), std::string("b-roll 2"));
+        QCOMPARE(uniqueBinName(p, "Interviews", "Day 1"), std::string("Day 1 2"));
+        QCOMPARE(uniqueBinName(p, "Interviews", "Day 2"), std::string("Day 2"));
+        QVERIFY(binWithin("Interviews/Day 1", "Interviews") && binWithin("Interviews", "Interviews") && binWithin("x", ""));
+        QVERIFY(!binWithin("Interviews 2", "Interviews") && !binWithin("Interviews", "Interviews/Day 1"));
+        QCOMPARE(binParent("a/b/c"), std::string("a/b"));
+        QCOMPARE(binLeaf("a/b/c"), std::string("c"));
+        QVERIFY(moveMediaToBin(p, {clip}, "Interviews/Day 1"));
+        QVERIFY(moveMediaToBin(p, {wide}, "Interviews"));
+        QVERIFY(!moveMediaToBin(p, {wide}, "Interviews"));
+        // Renaming moves what is inside; not onto another bin or into itself.
+        QVERIFY(renameBin(p, "Interviews", "Talks"));
+        QCOMPARE(p.findMedia(clip)->bin, std::string("Talks/Day 1"));
+        QCOMPARE(p.findMedia(wide)->bin, std::string("Talks"));
+        QVERIFY(!renameBin(p, "Talks", "B-roll"));
+        QVERIFY(!renameBin(p, "Talks", "Talks/Inner"));
+        QVERIFY(!renameBin(p, "Nope", "Other"));
+        // Moving a bin keeps its name; deleting one moves its contents up.
+        QVERIFY(moveBin(p, "Talks/Day 1", "B-roll"));
+        QCOMPARE(p.findMedia(clip)->bin, std::string("B-roll/Day 1"));
+        QVERIFY(!moveBin(p, "B-roll", "B-roll/Day 1"));
+        QVERIFY(removeBin(p, "B-roll"));
+        QCOMPARE(p.findMedia(clip)->bin, std::string("Day 1"));
+        QCOMPARE(projectBins(p), (std::vector<std::string>{"Day 1", "Talks"}));
+        QVERIFY(removeBin(p, "Day 1"));
+        QCOMPARE(p.findMedia(clip)->bin, std::string());
+
+        // Keywords: split on commas and semicolons, trimmed, no case-insensitive duplicates.
+        QCOMPARE(parseKeywords(" Beach, sunset;beach ,, golden  hour "), (std::vector<std::string>{"Beach", "sunset", "golden hour"}));
+        std::vector<std::string> kw{"Beach"};
+        QVERIFY(addKeywords(kw, {"BEACH", "Dog"}));
+        QCOMPARE(kw, (std::vector<std::string>{"Beach", "Dog"}));
+        QVERIFY(!addKeywords(kw, {"dog"}));
+        QVERIFY(removeKeywords(kw, {"beach"}));
+        QCOMPARE(kw, std::vector<std::string>{"Dog"});
+        QCOMPARE(joinKeywords({"a", "b c"}), std::string("a, b c"));
+
+        // Fields, as the list view edits them.
+        MediaItem& m = *p.findMedia(clip);
+        QVERIFY(setMediaField(m, "rating", "****") && m.rating == 4);
+        QVERIFY(setMediaField(m, "rating", "x") && m.rating == -1);
+        QVERIFY(setMediaField(m, "rating", "5") && m.rating == 5);
+        QVERIFY(!setMediaField(m, "rating", "7") && m.rating == 5);
+        QVERIFY(setMediaField(m, "label", "rose") && m.label == labelFromName("Rose") && m.label > 0);
+        QVERIFY(!setMediaField(m, "label", "chartreuse"));
+        QVERIFY(setMediaField(m, "keywords", "interview, Anna") && m.keywords.size() == 2);
+        QVERIFY(setMediaField(m, "scene", " 12A ") && m.metadata.at("scene") == "12A");
+        QVERIFY(setMediaField(m, "take", "3"));
+        QVERIFY(setMediaField(m, "comment", "Laughs at the end"));
+        QVERIFY(setMediaField(m, "scene", "") && !m.metadata.count("scene"));
+        QVERIFY(setMediaField(m, "scene", "12A"));
+        QVERIFY(!setMediaField(m, "name", "  "));
+        QVERIFY(!setMediaField(m, "duration", "3"));  // not editable
+        QCOMPARE(mediaFieldText(m, "rating"), std::string("★★★★★"));
+        QCOMPARE(mediaFieldText(m, "label"), std::string("Rose"));
+        QCOMPARE(mediaFieldText(m, "duration"), std::string("00:00:10.00"));
+        QCOMPARE(mediaFieldText(*p.findMedia(song), "duration"), std::string("00:03:20.00"));
+        QCOMPARE(mediaFieldText(m, "resolution"), std::string("1920×1080"));
+        QCOMPARE(mediaFieldText(*p.findMedia(wide), "fps"), std::string("25"));
+        QCOMPARE(mediaFieldText(*p.findMedia(still), "fps"), std::string());
+        QCOMPARE(mediaFieldText(m, "keywords"), std::string("interview, Anna"));
+        p.findMedia(song)->rating = -1;
+        QCOMPARE(mediaFieldText(*p.findMedia(song), "rating"), std::string("Rejected"));
+        Transcript t;
+        t.segments.push_back({0, 2, "Hello world", {{0, 1, "Hello", 0.9f, {}}, {1, 2, "world", 0.9f, {}}}, -1});
+        p.findMedia(wide)->transcript = std::make_shared<const Transcript>(t);
+        QCOMPARE(mediaFieldText(*p.findMedia(wide), "transcript"), std::string("2 words"));
+
+        // Usage counts clips in every sequence.
+        placeMedia(p, fx.s(), clip, 0, 0, 30, V1, A1, false);
+        fx.put(V1, 100, 10);
+        std::map<Id, int> usage = mediaUsage(p);
+        QCOMPARE(usage[clip], 3);  // linked video and audio, and a second video clip
+        QCOMPARE(usage.count(wide), size_t(0));
+        QCOMPARE(mediaFieldText(m, "usage", &usage), std::string("3"));
+
+        // Search: every word, or a "quoted phrase", in names, keywords, metadata or speech.
+        QVERIFY(mediaMatchesSearch(m, "anna laughs"));
+        QVERIFY(mediaMatchesSearch(m, "\"at the end\""));
+        QVERIFY(!mediaMatchesSearch(m, "\"the at end\""));
+        QVERIFY(mediaMatchesSearch(m, "12a"));
+        QVERIFY(!mediaMatchesSearch(m, "anna beach"));
+        QVERIFY(mediaMatchesSearch(*p.findMedia(wide), "hello"));
+        QVERIFY(mediaMatchesSearch(m, "  "));
+
+        // Smart bin rules.
+        auto matches = [&](std::vector<SmartRule> rules, bool all = true) {
+            SmartBin b{1, "test", all, std::move(rules)};
+            std::vector<Id> ids = smartBinMedia(p, b);
+            std::sort(ids.begin(), ids.end());
+            return ids;
+        };
+        using Ids = std::vector<Id>;
+        QCOMPARE(matches({{"rating", ">=", "3"}}), Ids{clip});
+        QCOMPARE(matches({{"rating", "is", "-1"}}), Ids{song});
+        QCOMPARE(matches({{"rating", "<=", "0"}}), (Ids{wide, song, still}));
+        QCOMPARE(matches({{"label", "is", "Rose"}}), Ids{clip});
+        QCOMPARE(matches({{"label", "!is", "rose"}}), (Ids{wide, song, still}));
+        QCOMPARE(matches({{"kind", "is", "audio"}}), Ids{song});
+        QCOMPARE(matches({{"keywords", "includes", "ANNA"}}), Ids{clip});
+        QCOMPARE(matches({{"keywords", "includes", "ann"}}), Ids{});  // whole keywords
+        QCOMPARE(matches({{"keywords", "empty", ""}}), (Ids{wide, song, still}));
+        QCOMPARE(matches({{"duration", "<", "5"}}), (Ids{wide, still}));
+        QCOMPARE(matches({{"duration", ">=", "3:20"}}), Ids{song});
+        QCOMPARE(matches({{"duration", ">", "nonsense"}}), Ids{});
+        QCOMPARE(matches({{"usage", "is", "0"}}), (Ids{wide, song, still}));
+        QCOMPARE(matches({{"height", ">=", "2160"}}), (Ids{wide, still}));
+        QCOMPARE(matches({{"fps", "is", "25"}}), Ids{wide});
+        QCOMPARE(matches({{"scene", "starts", "12"}}), Ids{clip});
+        QCOMPARE(matches({{"comment", "!empty", ""}}), Ids{clip});
+        QCOMPARE(matches({{"name", "contains", ".WAV"}}), Ids{song});
+        QCOMPARE(matches({{"transcript", "contains", "hello world"}}), Ids{wide});
+        QCOMPARE(matches({{"any", "contains", "world"}}), Ids{wide});
+        QCOMPARE(matches({{"any", "contains", "laughs"}}), Ids{clip});
+        QCOMPARE(matches({{"bogus", "is", "x"}}), Ids{});
+        QCOMPARE(matches({{"kind", "is", "video"}, {"duration", ">", "5"}}), Ids{clip});
+        QCOMPARE(matches({{"kind", "is", "audio"}, {"kind", "is", "image"}}, false), (Ids{song, still}));
+        QCOMPARE(matches({}), (Ids{clip, wide, song, still}));  // no rules: everything
+
+        // Saved with the project.
+        p.bins = {"Talks", "Empty Bin"};
+        p.findMedia(still)->created = "2024-05-06T07:08:09Z";
+        p.findMedia(still)->metadata["device"] = "Canon EOS R5";
+        SmartBin best{p.newId(), "Best takes", false, {{"rating", ">=", "4"}, {"keywords", "includes", "hero"}}};
+        p.smartBins.push_back(best);
+        const std::string json = projectToJson(p);
+        Project back;
+        std::string err;
+        QVERIFY2(projectFromJson(json, back, &err), err.c_str());
+        QCOMPARE(*back.findMedia(wide)->transcript, t);
+        back.findMedia(wide)->transcript = p.findMedia(wide)->transcript;  // compared by pointer below
+        QVERIFY(back == p);
+        QCOMPARE(back.smartBins.at(0), best);
+        QVERIFY(back.nextId > best.id);
+        QVERIFY(findSmartBin(back, best.id) && !findSmartBin(back, best.id + 1000));
     }
 
     // Regression tests for review findings.
