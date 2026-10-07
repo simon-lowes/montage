@@ -806,10 +806,17 @@ private slots:
             worst = std::max({worst, std::fabs((track[size_t(i)].x - start.x) * 320 - (jitter[size_t(i)].x - jitter[0].x)),
                               std::fabs((track[size_t(i)].y - start.y) * 180 - (jitter[size_t(i)].y - jitter[0].y))});
         QVERIFY2(worst < 1.0, qPrintable(QString::number(worst)));
-        // Backwards from the end lands where it started.
+        // Backwards from the end follows the same motion in reverse (measured from where it
+        // starts, so the forward pass's own drift does not count twice).
         auto back = trackRegion(video, (frames - 1) / 25.0, 0, track.back(), MotionModel::Translation, {}, nullptr, &err);
         QCOMPARE(int(back.size()), frames);
-        QVERIFY(std::fabs(back.back().x - start.x) * 320 < 1.0 && std::fabs(back.back().y - start.y) * 180 < 1.0);
+        worst = 0;
+        for (int k = 0; k < frames; ++k) {
+            const int f = frames - 1 - k;
+            worst = std::max({worst, std::fabs((back[size_t(k)].x - back[0].x) * 320 - (jitter[size_t(f)].x - jitter[size_t(frames - 1)].x)),
+                              std::fabs((back[size_t(k)].y - back[0].y) * 180 - (jitter[size_t(f)].y - jitter[size_t(frames - 1)].y))});
+        }
+        QVERIFY2(worst < 1.0, qPrintable(QString::number(worst)));
 
         // In a sequence: the clip shows footage frames 10 to 34.
         Project p = makeDefaultProject();
@@ -868,10 +875,12 @@ private slots:
         QVERIFY2(std::fabs(dx - expect) < 1.0, qPrintable(QString("%1 vs %2").arg(dx).arg(expect)));
         // Not from the last frame forwards.
         QVERIFY(!trackClipMask(p, s, clip, blur, 24, true, MotionModel::Translation, keys, {}, nullptr, &err));
-        // Backwards from the end, the keys come back to where the forward track started.
+        // Backwards from the end: keys down to frame 0, following the footage (frame 34 to 10).
         QVERIFY(trackClipMask(p, s, clip, blur, 24, false, MotionModel::Translation, keys, {}, nullptr, &err));
+        QCOMPARE(keys.front().first, FrameTime(24));
         QCOMPARE(keys.back().first, FrameTime(0));
-        QVERIFY(std::fabs(keys.back().second.x - 0.4) * 320 < 1.0);
+        const double shift = (keys.back().second.x - keys.front().second.x) * 320, truth = jitter[10].x - jitter[34].x;
+        QVERIFY2(std::fabs(shift - truth) < 1.0, qPrintable(QString("%1 vs %2").arg(shift).arg(truth)));
     }
 
     void multicamSpeakerSwitchAndAudioAngles() {
