@@ -27,6 +27,9 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - One-click Auto Colour (grey-world balance and level stretch)
 - Curves with presets, HSL/vibrance, `.cube` 3D/1D LUTs, black & white, invert
 - Chroma key with spill suppression, and luma key
+- Masks on every video effect:
+  - An ellipse or rectangle with feather, expansion, rotation, opacity and invert, all keyframeable. Drag it in the Program monitor to move it, or pull its handles to resize it.
+  - An HSL qualifier selects by hue, saturation and luma with softness, for example to grade only skin or only the sky. Show Mask displays the selection.
 - Gaussian blur, sharpen, vignette, mosaic, mirror, drop shadow
 - Keyframes on every parameter: linear, hold or smooth, with previous/next navigation
 - Titles (font, outline, shadow, background box, alignment, tracking), colour mattes, gradients, SMPTE bars
@@ -181,4 +184,4 @@ Notes on the design:
 
 ## Roadmap
 
-Phase 2 is ranked in [`docs/research/phase2-roadmap.md`](docs/research/phase2-roadmap.md) and tracked in [`PROGRESS.md`](PROGRESS.md). Next up: masks, plugin editor windows, track and bus effect chains, Audio Unit and LV2 hosting, OCIO/ACES and HDR, multicam, a GPU compositor, tracking, optical-flow retiming and FCP XML interchange.
+Phase 2 is ranked in [`docs/research/phase2-roadmap.md`](docs/research/phase2-roadmap.md) and tracked in [`PROGRESS.md`](PROGRESS.md). Next up: plugin editor windows, track and bus effect chains, Audio Unit and LV2 hosting, OCIO/ACES and HDR, multicam, a GPU compositor, tracking, optical-flow retiming and FCP XML interchange.

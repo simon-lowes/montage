@@ -44,6 +44,122 @@ Clip colorClip(Project& p, float r, float g, float b, FrameTime start, FrameTime
 class TestRender : public QObject {
     Q_OBJECT
 private slots:
+    void effectMasks() {
+        auto masked = [](const char* type, int shape) {
+            Effect e = makeEffect(type, 1);
+            e.params["mask.shape"] = double(shape);
+            e.params["mask.x"] = 0.5;
+            e.params["mask.y"] = 0.5;
+            e.params["mask.w"] = 0.5;
+            e.params["mask.h"] = 0.5;
+            e.params["mask.feather"] = 1.0;
+            return e;
+        };
+        // An ellipse limits Invert to the middle of the frame.
+        Image img = solid(100, 50, 0.2f, 0.2f, 0.2f);
+        Effect inv = masked("invert", 1);
+        applyVideoEffect(inv, 0, img, 1.0);
+        QVERIFY(std::fabs(img.at(50, 25)[0] - 0.8f) < 0.01f);
+        QVERIFY(std::fabs(img.at(2, 2)[0] - 0.2f) < 0.01f);
+        QVERIFY(std::fabs(img.at(50, 2)[0] - 0.2f) < 0.01f);  // above the ellipse (semi-axis 12.5 px)
+        // The matte: 1 inside, 0 outside, a one-pixel edge at x = 50 + 25.
+        std::vector<float> m = effectMatte(inv, 0, solid(100, 50, 0.2f, 0.2f, 0.2f), 1.0);
+        QCOMPARE(m.size(), size_t(5000));
+        QCOMPARE(m[25 * 100 + 50], 1.0f);
+        QCOMPARE(m[0], 0.0f);
+        QVERIFY(m[25 * 100 + 74] > 0.9f && m[25 * 100 + 76] < 0.1f);
+        // Feather makes a gradient that falls outward.
+        inv.params["mask.feather"] = 30.0;
+        m = effectMatte(inv, 0, img, 1.0);
+        QVERIFY(m[25 * 100 + 60] > m[25 * 100 + 70] && m[25 * 100 + 70] > m[25 * 100 + 80] && m[25 * 100 + 80] > m[25 * 100 + 95]);
+        // Expansion grows the shape; invert and opacity.
+        inv.params["mask.feather"] = 1.0;
+        inv.params["mask.expansion"] = 10.0;
+        QCOMPARE(effectMatte(inv, 0, img, 1.0)[25 * 100 + 80], 1.0f);
+        inv.params["mask.expansion"] = 0.0;
+        inv.params["mask.invert"] = 1.0;
+        inv.params["mask.opacity"] = 50.0;
+        m = effectMatte(inv, 0, img, 1.0);
+        QCOMPARE(m[25 * 100 + 50], 0.0f);
+        QCOMPARE(m[0], 0.5f);
+        // Feather and expansion are in sequence pixels: a half-size image halves them.
+        inv.params["mask.invert"] = 0.0;
+        inv.params["mask.opacity"] = 100.0;
+        inv.params["mask.expansion"] = 10.0;
+        QCOMPARE(effectMatte(inv, 0, solid(50, 25, 0.2f, 0.2f, 0.2f), 0.5)[12 * 50 + 40], 1.0f);
+        inv.params["mask.expansion"] = 0.0;
+
+        // A rectangle turned 90 degrees: 40 px tall (clipped by the frame), 5 px wide either side.
+        Effect rect = masked("invert", 2);
+        rect.params["mask.w"] = 0.8;
+        rect.params["mask.h"] = 0.2;
+        rect.params["mask.rotation"] = 90.0;
+        m = effectMatte(rect, 0, img, 1.0);
+        QCOMPARE(m[3 * 100 + 50], 1.0f);
+        QCOMPARE(m[25 * 100 + 53], 1.0f);
+        QCOMPARE(m[25 * 100 + 70], 0.0f);
+
+        // The HSL qualifier picks the red half; Black & White greys only that.
+        Image two(100, 10);
+        for (int y = 0; y < 10; ++y)
+            for (int x = 0; x < 100; ++x) {
+                float* p = two.at(x, y);
+                p[0] = x < 50 ? 0.9f : 0.1f;
+                p[1] = 0.1f;
+                p[2] = x < 50 ? 0.1f : 0.9f;
+                p[3] = 1;
+            }
+        Effect bw = makeEffect("black_white", 2);
+        bw.params["mask.qualify"] = 1.0;
+        bw.params["mask.hue"] = 0.0;
+        bw.params["mask.hue_width"] = 40.0;
+        Image q = two;
+        applyVideoEffect(bw, 0, q, 1.0);
+        QVERIFY(std::fabs(q.at(10, 5)[0] - q.at(10, 5)[2]) < 0.02f);  // red became grey
+        QCOMPARE(q.at(90, 5)[2], 0.9f);                                // blue untouched
+        // Show Mask puts the matte on screen.
+        bw.params["mask.show"] = 1.0;
+        q = two;
+        applyVideoEffect(bw, 0, q, 1.0);
+        QCOMPARE(q.at(10, 5)[0], 1.0f);
+        QCOMPARE(q.at(90, 5)[0], 0.0f);
+        // No mask: the whole frame.
+        Image all = two;
+        applyVideoEffect(makeEffect("black_white", 3), 0, all, 1.0);
+        QVERIFY(std::fabs(all.at(90, 5)[0] - all.at(90, 5)[2]) < 0.02f);
+        QVERIFY(supportsMask("gaussian_blur"));
+        QVERIFY(!supportsMask("compressor"));
+    }
+
+    void clipFrameMapping() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 1920;
+        s.height = 1080;
+        Clip c = makeGeneratorClip(p, "color", 30);
+        c.motion.params["scale"] = 50.0;
+        c.motion.params["rotation"] = 30.0;
+        c.motion.params["pos_x"] = 200.0;
+        c.motion.params["pos_y"] = -100.0;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, c);
+        const Clip& placed = s.videoTracks[0].clips[0];
+        double x = 0, y = 0, u = 0, v = 0;
+        // The frame centre sits at the clip's position.
+        QVERIFY(clipFrameToSequence(p, s, placed, 5, 0.5, 0.5, x, y));
+        QVERIFY(std::fabs(x - (960 + 200)) < 1e-6 && std::fabs(y - (540 - 100)) < 1e-6);
+        // Round trip.
+        QVERIFY(clipFrameToSequence(p, s, placed, 5, 0.9, 0.2, x, y));
+        QVERIFY(sequenceToClipFrame(p, s, placed, 5, x, y, u, v));
+        QVERIFY(std::fabs(u - 0.9) < 1e-9 && std::fabs(v - 0.2) < 1e-9);
+        // Half scale: the right edge is half a frame width from the centre, turned 30 degrees.
+        QVERIFY(clipFrameToSequence(p, s, placed, 5, 1.0, 0.5, x, y));
+        QVERIFY(std::fabs(std::hypot(x - 1160, y - 440) - 480) < 1e-6);
+        QVERIFY(std::fabs(std::atan2(y - 440, x - 1160) * 180 / M_PI - 30) < 1e-6);
+        double w = 0, h = 0;
+        QVERIFY(clipFrameSize(p, s, placed, w, h));
+        QCOMPARE(w, 1920.0);
+    }
+
     void blendModes() {
         Image dst = solid(4, 4, 0, 0, 1);
         blendOnto(dst, solid(4, 4, 1, 0, 0), "normal", 0.5f);

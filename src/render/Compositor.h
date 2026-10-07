@@ -27,6 +27,16 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
 // Same, flattened over black — what the program monitor and exports show.
 Image renderProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o);
 
+// Maps between a clip's own frame (u, v as fractions of its media frame, as
+// masks use) and the sequence frame (pixels) at timeline frame t, following
+// the clip's transform. False if the clip has no picture.
+bool clipFrameToSequence(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, double u, double v,
+                         double& x, double& y);
+bool sequenceToClipFrame(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, double x, double y,
+                         double& u, double& v);
+// The size of the clip's own frame in its media's pixels.
+bool clipFrameSize(const Project& p, const Sequence& seq, const Clip& c, double& w, double& h);
+
 // Draws the caption on screen at frame t from `track` over `img` (the whole frame).
 void drawCaption(Image& img, const CaptionTrack& track, FrameTime t);
 

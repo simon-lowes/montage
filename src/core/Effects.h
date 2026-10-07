@@ -69,6 +69,14 @@ std::vector<const EffectInfo*> effectsInCategory(EffectCategory c);
 std::vector<ParamInfo> effectParams(const Effect& e);
 std::string pluginParamMeta(const ParamInfo& p);
 
+// The mask every video filter can have (params "mask.*", absent = no mask):
+// an ellipse or rectangle in the clip's source frame (centre and size as
+// fractions of the frame, feather and expansion in sequence pixels) and/or
+// an HSL qualifier that selects colours. The filter is applied through it.
+const EffectInfo& maskInfo();
+bool supportsMask(const std::string& effectType);
+bool hasMask(const Effect& e, FrameTime t);
+
 // Builds an Effect of the given type populated with default values.
 Effect makeEffect(Project& p, const std::string& type);
 Effect makeEffect(const std::string& type, Id id);

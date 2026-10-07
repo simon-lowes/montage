@@ -71,7 +71,11 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
   - **Voice Isolation**: RNNoise (Xiph, BSD), with its model fetched and pinned at configure time and its 20 ms delay compensated.
   - Both process the whole source audio in the background with a cache, so there is no latency and seeking is free. Playback uses the original audio until the result is ready; exports wait for it.
   - Tested on real speech plus noise: SNR 12.8 → 19.1 dB, pauses 14 dB quieter (Noise Reduction) and 84 dB quieter (Voice Isolation), with speech level kept.
-- [ ] 9. Shape masks and HSL qualifier (M)
+- [x] 9. Shape masks and HSL qualifier (M):
+  - Every video filter can have an ellipse or rectangle mask (feather, expansion, rotation, opacity, invert; keyframeable) and/or an HSL qualifier (hue, saturation, luma, softness), with a Show Mask view.
+  - Masks are in the clip's own frame, so they follow its transform.
+  - On-screen handles in the Program monitor move and resize them, one undo step per drag.
+  - Not done yet: bezier masks, and tracking (#16).
 - [ ] 10. Plugin editor windows (L)
 - [ ] 11. Track and bus effect chains, delay compensation, offline plugin rendering (L)
 - [ ] 12. Audio Unit hosting on macOS (M)

@@ -15,6 +15,10 @@ namespace montage {
 // radius...) from sequence pixels to this image's pixels.
 void applyVideoEffect(const Effect& e, FrameTime t, Image& img, double pixelScale);
 
+// The effect's mask (Effects.h maskInfo) over `img` as one value in 0..1 per
+// pixel; the qualifier reads the colours of `img`. Empty when there is no mask.
+std::vector<float> effectMatte(const Effect& e, FrameTime t, const Image& img, double pixelScale);
+
 // 3D LUT loaded from a .cube file.
 struct Lut3D {
     int size = 0;

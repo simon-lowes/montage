@@ -21,6 +21,8 @@
 #include "EffectsBrowser.h"
 #include "audio/Plugins.h"
 #include "MainWindow.h"
+#include "MaskOverlay.h"
+#include "MonitorPanel.h"
 #include "PlaybackController.h"
 #include "Recovery.h"
 #include "TimelineWidget.h"
@@ -679,6 +681,63 @@ private slots:
         panel->setMode(TranscriptPanel::Mode::Sequence);
         state()->newProject();
         QApplication::processEvents();
+    }
+
+    void maskOverlayInProgramMonitor() {
+        loadDemo();
+        // A blur limited to an ellipse on the red clip.
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        QVERIFY(state()->edit("Mask", [red](Project& p, Sequence& s) {
+            Effect e = makeEffect(p, "gaussian_blur");
+            e.params["mask.shape"] = 1.0;
+            edit::clipById(s, red)->effects.push_back(e);
+            return true;
+        }));
+        state()->setSelection({red}, false);
+        state()->setPlayhead(10);
+        MonitorPanel* program = nullptr;
+        for (auto* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Program) program = m;
+        QVERIFY(program);
+        ViewerWidget* viewer = program->viewer();
+        QTRY_VERIFY_WITH_TIMEOUT(!viewer->image().isNull(), 5000);
+        auto* overlay = viewer->findChild<MaskOverlay*>();
+        QVERIFY(overlay);
+        auto shapes = overlay->shapes();
+        QCOMPARE(shapes.size(), size_t(1));
+        QPointF center, wh, hh;
+        QVERIFY(overlay->handles(shapes[0], center, wh, hh));
+        QVERIFY(wh.x() > center.x() && hh.y() > center.y());
+
+        // Drag inside the mask to move it right by a tenth of the picture.
+        const QRectF r = viewer->imageRect();
+        const QPoint from = center.toPoint(), to = (center + QPointF(r.width() * 0.1, 0)).toPoint();
+        QTest::mousePress(viewer, Qt::LeftButton, Qt::NoModifier, from);
+        QMouseEvent move(QEvent::MouseMove, QPointF(to), viewer->mapToGlobal(QPointF(to)), Qt::NoButton, Qt::LeftButton,
+                         Qt::NoModifier);
+        QApplication::sendEvent(viewer, &move);
+        QTest::mouseRelease(viewer, Qt::LeftButton, Qt::NoModifier, to);
+        const Effect& fx = edit::clipById(*state()->sequence(), red)->effects.back();
+        QVERIFY2(std::fabs(fx.p("mask.x", 10) - 0.6) < 0.02, qPrintable(QString::number(fx.p("mask.x", 10))));
+        QVERIFY(std::fabs(fx.p("mask.y", 10) - 0.5) < 0.02);
+
+        // The width handle resizes it.
+        shapes = overlay->shapes();
+        QVERIFY(overlay->handles(shapes[0], center, wh, hh));
+        const QPoint w0 = wh.toPoint(), w1 = (wh + QPointF(r.width() * 0.1, 0)).toPoint();
+        QTest::mousePress(viewer, Qt::LeftButton, Qt::NoModifier, w0);
+        QMouseEvent move2(QEvent::MouseMove, QPointF(w1), viewer->mapToGlobal(QPointF(w1)), Qt::NoButton, Qt::LeftButton,
+                          Qt::NoModifier);
+        QApplication::sendEvent(viewer, &move2);
+        QTest::mouseRelease(viewer, Qt::LeftButton, Qt::NoModifier, w1);
+        const Effect& fx2 = edit::clipById(*state()->sequence(), red)->effects.back();
+        QVERIFY2(std::fabs(fx2.p("mask.w", 10) - 0.6) < 0.03, qPrintable(QString::number(fx2.p("mask.w", 10))));
+        // Each drag is one undo step.
+        state()->undo();
+        const Effect& undone = edit::clipById(*state()->sequence(), red)->effects.back();
+        QVERIFY(std::fabs(undone.p("mask.w", 10, 0.4) - 0.4) < 1e-6);
+        QVERIFY(std::fabs(undone.p("mask.x", 10) - 0.6) < 0.02);  // the move stays
+        state()->setSelection({}, false);
     }
 
     void inspectorEditsAreUndoable() {

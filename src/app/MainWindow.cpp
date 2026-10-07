@@ -45,6 +45,7 @@
 #include "MediaBinWidget.h"
 #include "MixerPanel.h"
 #include "CaptionsPanel.h"
+#include "MaskOverlay.h"
 #include "TranscriptPanel.h"
 #include "MonitorPanel.h"
 #include "PlaybackController.h"
@@ -186,6 +187,7 @@ void MainWindow::buildPanels() {
     };
     sourcePanel_ = new MonitorPanel(MonitorPanel::Mode::Source, state_, source_, this);
     programPanel_ = new MonitorPanel(MonitorPanel::Mode::Program, state_, program_, this);
+    new MaskOverlay(state_, programPanel_->viewer());
     connect(programPanel_, &MonitorPanel::exportFrameRequested, this, &MainWindow::exportFrame);
     bin_ = new MediaBinWidget(state_, this);
     connect(bin_, &MediaBinWidget::openInSource, this, &MainWindow::openInSource);

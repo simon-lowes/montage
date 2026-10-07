@@ -3,6 +3,7 @@
 
 #include <QImage>
 #include <QWidget>
+#include <functional>
 
 #include "core/Model.h"
 
@@ -26,6 +27,9 @@ public:
     void setPlaceholder(const QString& text);
     void setSafeMargins(bool on);
     void setDragSource(bool on) { dragSource_ = on; }
+    // Drawn over the picture; gets the rectangle the picture occupies.
+    void setOverlay(std::function<void(QPainter&, const QRectF&)> paint) { overlay_ = std::move(paint); }
+    QRectF imageRect() const;
     QSize sizeHint() const override { return {480, 270}; }
 
 signals:
@@ -41,6 +45,7 @@ private:
     QString placeholder_;
     bool safe_ = false;
     bool dragSource_ = false;
+    std::function<void(QPainter&, const QRectF&)> overlay_;
     QPoint pressPos_;
 };
 

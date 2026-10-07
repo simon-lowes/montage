@@ -375,6 +375,59 @@ Image renderProgramFrame(const Project& p, const Sequence& seq, FrameTime t, con
     return img;
 }
 
+namespace {
+bool clipGeometry(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, Geometry& g) {
+    double mw = seq.width, mh = seq.height;
+    if (!c.isGenerator()) {
+        const MediaItem* m = p.findMedia(c.mediaId);
+        if (!m) return false;
+        if (m->kind == MediaKind::Sequence) {
+            const Sequence* nested = p.findSequence(m->sequenceId);
+            if (!nested) return false;
+            mw = nested->width;
+            mh = nested->height;
+        } else {
+            if (!m->hasVideo && m->kind != MediaKind::Image) return false;
+            if (m->width > 0) mw = m->width;
+            if (m->height > 0) mh = m->height;
+        }
+    }
+    g = geometryFor(c.motion, t - c.start, mw, mh, seq.width, seq.height);
+    return g.sx != 0 && g.sy != 0;
+}
+}  // namespace
+
+bool clipFrameSize(const Project& p, const Sequence& seq, const Clip& c, double& w, double& h) {
+    Geometry g;
+    if (!clipGeometry(p, seq, c, c.start, g)) return false;
+    w = g.mw;
+    h = g.mh;
+    return true;
+}
+
+bool clipFrameToSequence(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, double u, double v,
+                         double& x, double& y) {
+    Geometry g;
+    if (!clipGeometry(p, seq, c, t, g)) return false;
+    const double rx = (u * g.mw - g.mw / 2 - g.ax) * g.sx, ry = (v * g.mh - g.mh / 2 - g.ay) * g.sy;
+    const double cr = std::cos(g.rot), sr = std::sin(g.rot);
+    x = seq.width / 2.0 + g.px + rx * cr - ry * sr;
+    y = seq.height / 2.0 + g.py + rx * sr + ry * cr;
+    return true;
+}
+
+bool sequenceToClipFrame(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, double x, double y,
+                         double& u, double& v) {
+    Geometry g;
+    if (!clipGeometry(p, seq, c, t, g)) return false;
+    const double pxs = x - seq.width / 2.0 - g.px, pys = y - seq.height / 2.0 - g.py;
+    const double cr = std::cos(g.rot), sr = std::sin(g.rot);
+    const double rx = pxs * cr + pys * sr, ry = -pxs * sr + pys * cr;
+    u = (rx / g.sx + g.mw / 2 + g.ax) / g.mw;
+    v = (ry / g.sy + g.mh / 2 + g.ay) / g.mh;
+    return true;
+}
+
 void drawCaption(Image& img, const CaptionTrack& track, FrameTime t) {
     const Caption* cap = captionAt(track, t);
     if (!cap || img.width < 8 || img.height < 8) return;

@@ -435,8 +435,115 @@ void flattenOver(Image& img, float r, float g, float b) {
     });
 }
 
+std::vector<float> effectMatte(const Effect& e, FrameTime t, const Image& img, double pixelScale) {
+    std::vector<float> matte;
+    if (img.empty() || !hasMask(e, t)) return matte;
+    const int W = img.width, H = img.height;
+    matte.assign(size_t(W) * size_t(H), 1.0f);
+    const int shape = int(std::lround(e.p("mask.shape", t)));
+    if (shape == 1 || shape == 2) {
+        // Image pixels, centred on the mask and rotated into its axes.
+        const double cx = e.p("mask.x", t, 0.5) * W, cy = e.p("mask.y", t, 0.5) * H;
+        const double a = std::max(0.5, e.p("mask.w", t, 0.4) * W / 2), b = std::max(0.5, e.p("mask.h", t, 0.4) * H / 2);
+        const double rot = e.p("mask.rotation", t) * M_PI / 180.0, cr = std::cos(rot), sr = std::sin(rot);
+        const double feather = std::max(1.0, e.p("mask.feather", t, 20) * pixelScale);
+        const double expand = e.p("mask.expansion", t) * pixelScale;
+        parallelRows(H, [&](int y0, int y1) {
+            for (int y = y0; y < y1; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const double px = x + 0.5 - cx, py = y + 0.5 - cy;
+                    const double u = px * cr + py * sr, v = -px * sr + py * cr;
+                    double d;  // signed distance to the edge, negative inside
+                    if (shape == 1) {
+                        const double f = (u * u) / (a * a) + (v * v) / (b * b) - 1;
+                        const double gx = 2 * u / (a * a), gy = 2 * v / (b * b);
+                        d = f / std::max(1e-9, std::sqrt(gx * gx + gy * gy));
+                    } else {
+                        const double qx = std::fabs(u) - a, qy = std::fabs(v) - b;
+                        d = std::hypot(std::max(qx, 0.0), std::max(qy, 0.0)) + std::min(std::max(qx, qy), 0.0);
+                    }
+                    d -= expand;
+                    const double k = std::clamp(0.5 - d / feather, 0.0, 1.0);
+                    matte[size_t(y) * size_t(W) + size_t(x)] = float(k * k * (3 - 2 * k));  // smoothstep
+                }
+        });
+    }
+    if (e.p("mask.qualify", t) > 0.5) {
+        const double hc = e.p("mask.hue", t), hw = e.p("mask.hue_width", t, 60) / 2;
+        const double soft = std::clamp(e.p("mask.softness", t, 20) / 100.0, 0.0, 1.0);
+        const double sl = e.p("mask.sat_low", t, 15) / 100, sh = e.p("mask.sat_high", t, 100) / 100;
+        const double ll = e.p("mask.lum_low", t, 5) / 100, lh = e.p("mask.lum_high", t, 100) / 100;
+        // 1 inside [lo, hi], falling to 0 over `ramp` outside it.
+        auto band = [](double v, double lo, double hi, double ramp) {
+            if (v >= lo && v <= hi) return 1.0;
+            const double out = v < lo ? lo - v : v - hi;
+            return ramp <= 0 ? 0.0 : std::max(0.0, 1.0 - out / ramp);
+        };
+        parallelRows(H, [&](int y0, int y1) {
+            for (int y = y0; y < y1; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const float* p = img.at(x, y);
+                    const float al = p[3];
+                    if (al <= 1e-6f) {
+                        matte[size_t(y) * size_t(W) + size_t(x)] = 0;
+                        continue;
+                    }
+                    const double r = p[0] / al, g = p[1] / al, bl = p[2] / al;
+                    const double mx = std::max({r, g, bl}), mn = std::min({r, g, bl}), c = mx - mn;
+                    const double sat = mx > 1e-6 ? c / mx : 0;
+                    const double luma = 0.2126 * r + 0.7152 * g + 0.0722 * bl;
+                    double hue = 0;
+                    if (c > 1e-6) {
+                        if (mx == r) hue = 60 * std::fmod((g - bl) / c + 6, 6.0);
+                        else if (mx == g) hue = 60 * ((bl - r) / c + 2);
+                        else hue = 60 * ((r - g) / c + 4);
+                    }
+                    double dh = std::fabs(hue - hc);
+                    dh = std::min(dh, 360 - dh);
+                    const double mh = hw >= 180 ? 1.0 : band(dh, 0, hw, 60 * soft + 1e-9);
+                    const double ms = band(sat, sl, sh, 0.25 * soft);
+                    const double ml = band(luma, ll, lh, 0.25 * soft);
+                    matte[size_t(y) * size_t(W) + size_t(x)] *= float(mh * ms * ml);
+                }
+        });
+    }
+    const bool invert = e.p("mask.invert", t) > 0.5;
+    const float opacity = float(std::clamp(e.p("mask.opacity", t, 100) / 100.0, 0.0, 1.0));
+    for (float& m : matte) m = (invert ? 1 - m : m) * opacity;
+    return matte;
+}
+
+namespace {
+void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelScale);
+}
+
 void applyVideoEffect(const Effect& e, FrameTime t, Image& img, double pixelScale) {
     if (!e.enabled || img.empty()) return;
+    if (!hasMask(e, t)) {
+        applyEffectUnmasked(e, t, img, pixelScale);
+        return;
+    }
+    const std::vector<float> matte = effectMatte(e, t, img, pixelScale);
+    if (e.p("mask.show", t) > 0.5) {
+        // The mask itself, as grey over the clip's shape.
+        for (size_t i = 0; i < matte.size(); ++i) {
+            float* p = &img.px[i * 4];
+            p[0] = p[1] = p[2] = matte[i] * p[3];
+        }
+        return;
+    }
+    Image original = img;
+    applyEffectUnmasked(e, t, img, pixelScale);
+    for (size_t i = 0; i < matte.size(); ++i) {
+        const float m = matte[i];
+        float* p = &img.px[i * 4];
+        const float* o = &original.px[i * 4];
+        for (int c = 0; c < 4; ++c) p[c] = o[c] + (p[c] - o[c]) * m;
+    }
+}
+
+namespace {
+void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelScale) {
     const std::string& ty = e.type;
     if (ty == "color_correct") colorCorrect(e, t, img);
     else if (ty == "curves") curves(e, t, img);
@@ -466,6 +573,7 @@ void applyVideoEffect(const Effect& e, FrameTime t, Image& img, double pixelScal
         }
     }
 }
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // LUTs

@@ -54,8 +54,7 @@ void ViewerWidget::paintEvent(QPaintEvent*) {
         p.drawText(rect(), Qt::AlignCenter, placeholder_);
         return;
     }
-    QSizeF s = QSizeF(image_.size()).scaled(size(), Qt::KeepAspectRatio);
-    QRectF r((width() - s.width()) / 2, (height() - s.height()) / 2, s.width(), s.height());
+    const QRectF r = imageRect();
     p.setRenderHint(QPainter::SmoothPixmapTransform);
     p.drawImage(r, image_);
     if (safe_) {
@@ -65,6 +64,13 @@ void ViewerWidget::paintEvent(QPaintEvent*) {
         p.drawLine(QPointF(r.center().x() - 10, r.center().y()), QPointF(r.center().x() + 10, r.center().y()));
         p.drawLine(QPointF(r.center().x(), r.center().y() - 10), QPointF(r.center().x(), r.center().y() + 10));
     }
+    if (overlay_) overlay_(p, r);
+}
+
+QRectF ViewerWidget::imageRect() const {
+    if (image_.isNull()) return {};
+    QSizeF s = QSizeF(image_.size()).scaled(size(), Qt::KeepAspectRatio);
+    return QRectF((width() - s.width()) / 2, (height() - s.height()) / 2, s.width(), s.height());
 }
 
 void ViewerWidget::mousePressEvent(QMouseEvent* e) {

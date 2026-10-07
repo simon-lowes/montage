@@ -335,6 +335,12 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
             th->addWidget(w);
         QFormLayout* f = addSection(QString::fromStdString(info->displayName), tools);
         addParamRows(f, *info, target(eid));
+        if (kind == TrackKind::Video && supportsMask(e.type)) {
+            // Shape masks and the HSL qualifier; folded away until one is used.
+            QFormLayout* mf = addSection(tr("%1 Mask").arg(QString::fromStdString(info->displayName)), nullptr,
+                                         !hasMask(e, state_->playhead() - clip.start));
+            addParamRows(mf, maskInfo(), target(eid));
+        }
         auto mutateStack = [this, clipId, eid](const QString& label, std::function<void(std::vector<Effect>&, size_t, Project&)> fn) {
             state_->edit(label, [=](Project& p, Sequence& s) {
                 Clip* c = edit::clipById(s, clipId);
@@ -513,11 +519,12 @@ void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const 
     if (pi.kind == ParamKind::Color) names = {name + ".r", name + ".g", name + ".b"};
 
     // Reads the current value(s) from the live project.
-    auto read = [this, target](const std::string& n) -> double {
+    auto read = [this, target, pi](const std::string& n) -> double {
         const Sequence* s = state_->sequence();
         if (!s) return 0;
         Effect* e = target.resolve(const_cast<Sequence&>(*s));
-        return e ? e->p(n, target.time()) : 0;
+        // A parameter not stored yet (e.g. an unused mask) shows its default.
+        return e ? e->p(n, target.time(), n == pi.name ? pi.def : 0) : 0;
     };
     auto readParam = [this, target](const std::string& n) -> const Param* {
         const Sequence* s = state_->sequence();

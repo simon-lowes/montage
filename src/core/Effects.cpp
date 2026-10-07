@@ -261,6 +261,40 @@ std::vector<EffectInfo> buildCatalog() {
 
 }  // namespace
 
+const EffectInfo& maskInfo() {
+    static const EffectInfo info = [] {
+        EffectInfo m{"mask", "Mask", EffectCategory::Fixed, "Mask", {}, {}, true};
+        m.params = {choice("mask.shape", "Shape", {"None", "Ellipse", "Rectangle"}, 0),
+                    num("mask.x", "Center X", -0.5, 1.5, 0.5, 0.001),
+                    num("mask.y", "Center Y", -0.5, 1.5, 0.5, 0.001),
+                    num("mask.w", "Width", 0.001, 2, 0.4, 0.001),
+                    num("mask.h", "Height", 0.001, 2, 0.4, 0.001),
+                    angle("mask.rotation", "Rotation"),
+                    num("mask.feather", "Feather (px)", 0, 500, 20, 0.5),
+                    num("mask.expansion", "Expansion (px)", -500, 500, 0, 0.5),
+                    pct("mask.opacity", "Mask Opacity", 0, 100, 100),
+                    boolean("mask.invert", "Invert"),
+                    boolean("mask.qualify", "HSL Qualifier"),
+                    num("mask.hue", "Hue Center", 0, 360, 0, 0.5),
+                    num("mask.hue_width", "Hue Width", 1, 360, 60, 0.5),
+                    pct("mask.sat_low", "Saturation Low", 0, 100, 15),
+                    pct("mask.sat_high", "Saturation High", 0, 100, 100),
+                    pct("mask.lum_low", "Luma Low", 0, 100, 5),
+                    pct("mask.lum_high", "Luma High", 0, 100, 100),
+                    pct("mask.softness", "Softness", 0, 100, 20),
+                    boolean("mask.show", "Show Mask")};
+        return m;
+    }();
+    return info;
+}
+
+bool supportsMask(const std::string& effectType) {
+    const EffectInfo* info = findEffectInfo(effectType);
+    return info && info->category == EffectCategory::VideoFilter;
+}
+
+bool hasMask(const Effect& e, FrameTime t) { return e.p("mask.shape", t) > 0.5 || e.p("mask.qualify", t) > 0.5; }
+
 const std::vector<EffectInfo>& effectCatalog() {
     static const std::vector<EffectInfo> catalog = buildCatalog();
     return catalog;
