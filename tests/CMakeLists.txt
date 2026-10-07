@@ -1,0 +1,11 @@
+function(montage_test name)
+  add_executable(${name} ${name}.cpp)
+  target_link_libraries(${name} PRIVATE montage_engine Qt6::Test)
+  set_target_properties(${name} PROPERTIES AUTOMOC ON)
+  add_test(NAME ${name} COMMAND ${name})
+  set_tests_properties(${name} PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 300)
+endfunction()
+
+montage_test(test_core)
+montage_test(test_render)
+montage_test(test_media)

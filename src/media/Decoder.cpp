@@ -21,6 +21,12 @@ namespace montage {
 
 namespace {
 
+// Keep FFmpeg quiet unless something is actually wrong.
+const bool kQuietLogs = [] {
+    av_log_set_level(AV_LOG_ERROR);
+    return true;
+}();
+
 std::string averr(int code) {
     char buf[AV_ERROR_MAX_STRING_SIZE] = {0};
     av_strerror(code, buf, sizeof buf);
