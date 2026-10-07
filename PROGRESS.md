@@ -62,7 +62,10 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
 - [x] 4. Transcription engine (M): whisper.cpp 1.9.5 built in, word timings, eight models from Tiny to Large v3 Turbo downloaded on first use, auto language detection and translation; Transcribe… in the media bin, transcripts saved in the project (undoable), media search by spoken words, SRT/VTT/TXT/JSON export; `montage-cli transcribe` and `models`. Speaker labels are still to do (the transcript format already has a speaker field).
 - [x] 5. Caption tracks (M): caption lanes on the timeline (move, retime, double-click to edit), generation from transcripts that follows trims, speed and mutes, a Captions panel (edit, add, split, merge, delete, style, rename, language), SubRip/WebVTT import, SubRip/WebVTT/SCC (CEA-608 pop-on, checked with FFmpeg's 608 decoder) export, viewer CC toggle, burn-in and embedded subtitle streams (mov_text, SubRip, WebVTT) on export; `montage-cli captions` and `render --burn-captions --embed-captions`. Not done yet: roll-up and paint-on 608, CEA-708, and captions following ripple edits.
 - [x] 6. VST3 hosting (M): MIT VST 3.8 SDK, crash-isolated probing, parameters, automation, two-blob state. Also done ahead of the list: crash-isolated scanning for CLAP/VST3/LV2/AU and CLAP hosting.
-- [ ] 7. Transcript panel: search, select-to-edit, delete-words ripple (M)
+- [x] 7. Transcript panel (M):
+  - Sequence mode: the cut's words with the current one highlighted; click to seek; search, including a partly typed last word; delete words as a ripple delete across all tracks and caption tracks; remove filler words; shorten pauses.
+  - Source mode: select words to set In and Out, then insert or overwrite them into the timeline.
+  - Uncertain words are dotted and filler words dimmed.
 - [ ] 8. Dialogue denoise and voice isolation (M)
 - [ ] 9. Shape masks and HSL qualifier (M)
 - [ ] 10. Plugin editor windows (L)

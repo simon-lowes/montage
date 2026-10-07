@@ -11,6 +11,7 @@
 #include "core/Interchange.h"
 #include "core/ProjectIO.h"
 #include "core/Transcript.h"
+#include "core/TranscriptEdit.h"
 
 using namespace montage;
 using namespace montage::edit;
@@ -180,6 +181,66 @@ private slots:
         // Without transcripts there is nothing to caption.
         p.media[0].transcript.reset();
         QVERIFY(captionsFromTranscripts(p, s).empty());
+    }
+
+    void editingByTranscript() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = {25, 1};
+        MediaItem m;
+        m.id = p.newId();
+        m.kind = MediaKind::Video;
+        m.hasVideo = m.hasAudio = true;
+        m.duration = 20;
+        auto t = std::make_shared<Transcript>();
+        TranscriptSegment seg;
+        // "Hello um world" then a 2.4 s pause, then "again".
+        seg.words = {{1.0, 1.4, "Hello", 1}, {1.5, 1.8, "um,", 1}, {1.9, 2.3, "world.", 1}, {4.7, 5.1, "Again", 1}};
+        t->segments.push_back(seg);
+        m.transcript = t;
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 10 * 25, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QCOMPARE(s.duration(), FrameTime(250));
+
+        // Linked video and audio copies give each word once.
+        auto words = sequenceTranscriptWords(p, s);
+        QCOMPARE(words.size(), size_t(4));
+        QCOMPARE(QString::fromStdString(words[1].text), QString("um,"));
+
+        QVERIFY(isFillerWord("Um,"));
+        QVERIFY(isFillerWord("uh"));
+        QVERIFY(!isFillerWord("umbrella"));
+        auto fillers = fillerWordRanges(words, 25);
+        QCOMPARE(fillers.size(), size_t(1));
+        QCOMPARE(fillers[0], FrameRange(38, 48));  // 1.5 s to the next word at 1.9 s
+
+        auto pauses = pauseRanges(words, 25, 1.0, 0.4);
+        QCOMPARE(pauses.size(), size_t(1));
+        QCOMPARE(pauses[0], FrameRange(63, 112));  // 2.3 + 0.2 s .. 4.7 - 0.2 s, whole frames inside
+
+        QCOMPARE(mergeRanges({{10, 20}, {5, 12}, {30, 30}, {20, 25}}), (std::vector<FrameRange>{{5, 25}}));
+
+        // Captions follow the ripple: inside goes, across shortens, later moves up.
+        CaptionTrack ct;
+        ct.id = p.newId();
+        ct.captions = {{20, 30, "before"}, {40, 45, "inside"}, {35, 60, "x"}, {120, 140, "after"}};
+        normalizeCaptions(ct.captions);  // "inside" is cut short by the overlap rules: {20,30} {35,40} {40,45} {120,140}
+        s.captionTracks.push_back(ct);
+        auto r = rippleDeleteRanges(p, s, {pauses[0], fillers[0]});
+        QVERIFY(r.ok);
+        QCOMPARE(r.applied, FrameTime(59));
+        QCOMPARE(s.duration(), FrameTime(191));
+        // Both tracks were cut the same way.
+        QCOMPARE(s.videoTracks[0].clips.size(), size_t(3));
+        QCOMPARE(s.audioTracks[0].clips.size(), size_t(3));
+        const auto& caps = s.captionTracks[0].captions;
+        QCOMPARE(caps.front(), (Caption{20, 30, "before"}));
+        QCOMPARE(caps.back(), (Caption{61, 81, "after"}));  // 120 - 59
+        // The word after the pause now starts 59 frames earlier.
+        words = sequenceTranscriptWords(p, s);
+        QCOMPARE(words.size(), size_t(3));  // the filler is gone
+        QVERIFY(std::fabs(words.back().start - (4.7 - 59 / 25.0)) < 0.05);
+        QVERIFY(!rippleDeleteRanges(p, s, {}).ok);
     }
 
     void transcriptsCaptionsAndSearch() {

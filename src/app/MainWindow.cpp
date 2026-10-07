@@ -45,6 +45,7 @@
 #include "MediaBinWidget.h"
 #include "MixerPanel.h"
 #include "CaptionsPanel.h"
+#include "TranscriptPanel.h"
 #include "MonitorPanel.h"
 #include "PlaybackController.h"
 #include "PluginManagerDialog.h"
@@ -196,6 +197,12 @@ void MainWindow::buildPanels() {
     scopes_ = new ScopesWidget(this);
     mixer_ = new MixerPanel(state_, this);
     captions_ = new CaptionsPanel(state_, this);
+    transcript_ = new TranscriptPanel(state_, this);
+    connect(transcript_, &TranscriptPanel::sourceSeekRequested, this, [this](FrameTime f) {
+        source_->seek(f);
+        sourceDock_->raise();
+    });
+    connect(source_, &PlaybackController::positionChanged, transcript_, &TranscriptPanel::setSourcePosition);
     meter_ = new AudioMeterWidget(this);
 
     sourceDock_ = makeDock(tr("Source"), "source", sourcePanel_);
@@ -206,6 +213,7 @@ void MainWindow::buildPanels() {
     scopesDock_ = makeDock(tr("Scopes"), "scopes", scopes_);
     mixerDock_ = makeDock(tr("Audio Mixer"), "mixer", mixer_);
     captionsDock_ = makeDock(tr("Captions"), "captions", captions_);
+    transcriptDock_ = makeDock(tr("Transcript"), "transcript", transcript_);
     connect(timeline_, &TimelineWidget::captionActivated, this, [this](Id track, int index) {
         captionsDock_->show();
         captionsDock_->raise();
@@ -233,6 +241,7 @@ void MainWindow::resetLayout() {
     sourceDock_->raise();
     addDockWidget(Qt::LeftDockWidgetArea, binDock_);
     tabifyDockWidget(binDock_, effectsDock_);
+    tabifyDockWidget(binDock_, transcriptDock_);
     binDock_->raise();
     addDockWidget(Qt::RightDockWidgetArea, meterDock_);
     for (QDockWidget* d : docks_) d->show();

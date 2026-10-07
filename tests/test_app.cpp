@@ -25,6 +25,7 @@
 #include "Recovery.h"
 #include "TimelineWidget.h"
 #include "TranscribeDialog.h"
+#include "TranscriptPanel.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
 #include "core/ProjectIO.h"
@@ -602,6 +603,80 @@ private slots:
         QVERIFY(panel->importFile(vtt));
         QCOMPARE(state()->sequence()->captionTracks.size(), size_t(2));
         QCOMPARE(state()->sequence()->captionTracks[1].captions, state()->sequence()->captionTracks[0].captions);
+        state()->newProject();
+        QApplication::processEvents();
+    }
+
+    void transcriptPanelEditsTheCut() {
+        state()->newProject();
+        auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        auto t = std::make_shared<Transcript>();
+        TranscriptSegment seg;
+        seg.words = {{0.5, 0.9, "And", 1},  {1.0, 1.3, "so,", 1},       {1.4, 1.7, "um,", 1},   {1.8, 2.2, "my", 1},
+                     {2.3, 2.8, "fellow", 1}, {2.9, 3.6, "Americans.", 1}, {6.0, 6.4, "Ask", 1}, {6.5, 6.9, "not.", 1}};
+        t->segments.push_back(seg);
+        QVERIFY(state()->edit("Transcript", [media, t](Project& p, Sequence&) {
+            p.findMedia(media)->transcript = t;
+            return true;
+        }));
+        QVERIFY(state()->apply("Place", [media](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, media, 0, 0, -1, V1, A1, false);
+        }));
+        const FrameTime full = state()->sequence()->duration();
+        const double fps = state()->sequence()->fpsValue();
+
+        auto* panel = win_->findChild<TranscriptPanel*>();
+        QVERIFY(panel);
+        panel->setMode(TranscriptPanel::Mode::Sequence);
+        QCOMPARE(panel->words().size(), size_t(8));
+        // Search, including a partly typed last word.
+        QCOMPARE(panel->find("fellow amer"), 1);
+        QCOMPARE(panel->selectedWords(), std::make_pair(4, 5));
+        QCOMPARE(panel->find("nothing like this"), 0);
+
+        // Deleting "my fellow" cuts 1.8 s .. 2.9 s out of every track.
+        panel->selectWords(3, 4);
+        panel->deleteSelection();
+        const FrameTime cut = FrameTime(std::llround(2.9 * fps)) - FrameTime(std::llround(1.8 * fps));
+        QCOMPARE(state()->sequence()->duration(), full - cut);
+        QCOMPARE(panel->words().size(), size_t(6));
+        state()->undo();
+        QCOMPARE(state()->sequence()->duration(), full);
+        QCOMPARE(panel->words().size(), size_t(8));
+
+        // Filler words and long pauses.
+        panel->removeFillerWords();
+        QCOMPARE(panel->words().size(), size_t(7));
+        QVERIFY(state()->sequence()->duration() < full);
+        const FrameTime noFillers = state()->sequence()->duration();
+        panel->removePauses(1.0, 0.3);
+        QVERIFY(state()->sequence()->duration() < noFillers - FrameTime(fps * 1.5));
+
+        // Clicking a word moves the playhead there.
+        state()->setPlayhead(0);
+        panel->selectWords(0, 0);
+
+        // Source mode: select words to edit them into the timeline.
+        state()->newProject();
+        ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        const Id src = ids[0];
+        QVERIFY(state()->edit("Transcript", [src, t](Project& p, Sequence&) {
+            p.findMedia(src)->transcript = t;
+            return true;
+        }));
+        state()->setSourceMedia(src);
+        panel->setMode(TranscriptPanel::Mode::Source);
+        QCOMPARE(panel->words().size(), size_t(8));
+        panel->selectWords(6, 7);  // "Ask not."
+        panel->insertSelection(false);
+        const Sequence* s = state()->sequence();
+        QCOMPARE(trackAt(*s, A1)->clips.size(), size_t(1));
+        const Clip& c = trackAt(*s, A1)->clips[0];
+        QCOMPARE(FrameTime(c.sourceIn), FrameTime(std::floor(6.0 * fps)));
+        QCOMPARE(c.duration, FrameTime(std::ceil(6.9 * fps)) - FrameTime(std::floor(6.0 * fps)));
+        panel->setMode(TranscriptPanel::Mode::Sequence);
         state()->newProject();
         QApplication::processEvents();
     }

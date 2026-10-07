@@ -59,6 +59,11 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
   - Right-click clips in the media bin › Transcribe…, pick a model (Tiny to Large v3 Turbo, English-only or 99 languages) and a language, or translate to English. The model downloads once.
   - Transcripts are word-timed, saved in the project, and undoable. The media bin search finds clips by what is said in them.
   - Export Transcript… writes SubRip (`.srt`) or WebVTT (`.vtt`) captions, plain text, or JSON with word timings.
+- Edit by transcript (Transcript panel):
+  - **Sequence mode** shows what the cut says, with the word under the playhead highlighted. Click a word to go there. Select words and press Delete to cut them out of every track; the gap closes and the captions move with it.
+  - Remove Fillers cuts um, uh, er and similar words in one step. Shorten Pauses trims silences between words to a length you choose.
+  - Find searches the words; the last word may be partly typed.
+  - **Source mode** shows the Source monitor clip's transcript. Select words to set In and Out, then Insert or Overwrite them into the timeline.
 - Captions:
   - Caption tracks on each sequence, shown as lanes above the video tracks. Drag captions to move them, drag their edges to retime them, and double-click one to edit its text in the Captions panel.
   - Generate captions from transcripts: words are placed where each clip plays them, following trims, speed changes and muted tracks, and are split into readable captions (42 characters per line, 2 lines and 7 seconds at most by default).
@@ -172,4 +177,4 @@ Notes on the design:
 
 ## Roadmap
 
-Phase 2 is ranked in [`docs/research/phase2-roadmap.md`](docs/research/phase2-roadmap.md) and tracked in [`PROGRESS.md`](PROGRESS.md). Next up: a transcript panel for text-based editing, dialogue denoise, masks, plugin editor windows, track and bus effect chains, Audio Unit and LV2 hosting, OCIO/ACES and HDR, multicam, a GPU compositor, tracking, optical-flow retiming and FCP XML interchange.
+Phase 2 is ranked in [`docs/research/phase2-roadmap.md`](docs/research/phase2-roadmap.md) and tracked in [`PROGRESS.md`](PROGRESS.md). Next up: dialogue denoise, masks, plugin editor windows, track and bus effect chains, Audio Unit and LV2 hosting, OCIO/ACES and HDR, multicam, a GPU compositor, tracking, optical-flow retiming and FCP XML interchange.

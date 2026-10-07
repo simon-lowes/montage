@@ -27,6 +27,7 @@ class InspectorWidget;
 class ScopesWidget;
 class MixerPanel;
 class CaptionsPanel;
+class TranscriptPanel;
 class AudioMeterWidget;
 
 class MainWindow : public QMainWindow {
@@ -108,6 +109,7 @@ private:
     ScopesWidget* scopes_ = nullptr;
     MixerPanel* mixer_ = nullptr;
     CaptionsPanel* captions_ = nullptr;
+    TranscriptPanel* transcript_ = nullptr;
     AudioMeterWidget* meter_ = nullptr;
     std::vector<QDockWidget*> docks_;
     QDockWidget* sourceDock_ = nullptr;
@@ -118,6 +120,7 @@ private:
     QDockWidget* scopesDock_ = nullptr;
     QDockWidget* mixerDock_ = nullptr;
     QDockWidget* captionsDock_ = nullptr;
+    QDockWidget* transcriptDock_ = nullptr;
     QDockWidget* meterDock_ = nullptr;
     QMenu* recentMenu_ = nullptr;
     QMenu* windowMenu_ = nullptr;

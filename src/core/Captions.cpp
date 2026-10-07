@@ -11,6 +11,7 @@
 #include "History.h"
 #include "Model.h"
 #include "Transcript.h"
+#include "TranscriptEdit.h"
 
 namespace montage {
 
@@ -89,47 +90,7 @@ std::string wrapCaptionText(const std::string& textIn, int lineChars, int maxLin
 
 std::vector<Caption> captionsFromTranscripts(const Project& p, const Sequence& seq, const CaptionRules& rules) {
     const double fps = seq.fpsValue() > 0 ? seq.fpsValue() : 30.0;
-    // Every transcribed word heard in the cut, in timeline seconds.
-    auto collect = [&](const std::vector<Track>& tracks, bool audio) {
-        std::vector<TranscriptWord> words;
-        const bool anySolo = audio && std::any_of(tracks.begin(), tracks.end(), [](const Track& t) { return t.solo; });
-        for (const Track& tr : tracks) {
-            if (tr.muted || (anySolo && !tr.solo)) continue;
-            for (const Clip& c : tr.clips) {
-                if (!c.enabled || c.isGenerator() || c.speed <= 0) continue;
-                const MediaItem* m = p.findMedia(c.mediaId);
-                if (!m || !m->transcript) continue;
-                const double srcA = c.sourceIn, srcB = c.sourceIn + c.sourceExtent();  // source frames shown
-                auto toTimeline = [&](double srcFrame) {
-                    const double rel = c.reverse ? (srcB - srcFrame) : (srcFrame - srcA);
-                    return double(c.start) + rel / c.speed;
-                };
-                for (const auto& s : m->transcript->segments)
-                    for (const auto& w : s.words) {
-                        const double mid = (w.start + w.end) * 0.5 * fps;
-                        if (mid < srcA || mid >= srcB) continue;
-                        double a = toTimeline(w.start * fps), b = toTimeline(w.end * fps);
-                        if (a > b) std::swap(a, b);
-                        a = std::clamp(a, double(c.start), double(c.end()));
-                        b = std::clamp(b, a, double(c.end()));
-                        words.push_back({a / fps, b / fps, w.text, w.probability});
-                    }
-            }
-        }
-        std::stable_sort(words.begin(), words.end(),
-                         [](const TranscriptWord& x, const TranscriptWord& y) { return x.start < y.start; });
-        // The same words from linked or stacked copies of a clip count once.
-        std::vector<TranscriptWord> unique;
-        for (const auto& w : words) {
-            bool dup = false;
-            for (auto it = unique.rbegin(); it != unique.rend() && w.start - it->start < 0.15; ++it)
-                if (it->text == w.text) dup = true;
-            if (!dup) unique.push_back(w);
-        }
-        return unique;
-    };
-    std::vector<TranscriptWord> words = collect(seq.audioTracks, true);
-    if (words.empty()) words = collect(seq.videoTracks, false);
+    std::vector<TranscriptWord> words = sequenceTranscriptWords(p, seq);
     if (words.empty()) return {};
 
     Transcript t;
