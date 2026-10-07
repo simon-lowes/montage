@@ -22,11 +22,18 @@ cp "$BUILD/src/montage-cli" "$APP/Contents/MacOS/"
 
 # Copies Qt, FFmpeg and every other non-system library into the bundle and
 # rewrites the load paths to point there.
-"$MACDEPLOYQT" "$APP" -always-overwrite -executable="$APP/Contents/MacOS/montage-cli"
+# -libpath: Homebrew installs each Qt module in its own prefix, so plugins
+# reach frameworks (QtSvg...) through rpaths only the shared lib dir resolves.
+"$MACDEPLOYQT" "$APP" -always-overwrite -executable="$APP/Contents/MacOS/montage-cli" \
+  -libpath="$(brew --prefix)/lib"
 
 # Nothing may still load from Homebrew, or the app only works on this machine.
-leaks=$(find "$APP" -type f \( -perm -u+x -o -name '*.dylib' \) -print0 |
-  xargs -0 otool -L 2>/dev/null | grep -E '^\s+(/opt/homebrew|/usr/local)/' || true)
+# (A library's own install name is listed too but is not loaded; skip it.)
+leaks=$(find "$APP" -type f \( -perm -u+x -o -name '*.dylib' \) | while read -r f; do
+  id=$(otool -D "$f" 2>/dev/null | sed -n 2p)
+  otool -L "$f" 2>/dev/null | sed 1d | awk '{print $1}' | grep -vxF "${id:-<none>}" |
+    grep -E '^(/opt/homebrew|/usr/local)/' | sed "s|^|$f -> |"
+done || true)
 if [ -n "$leaks" ]; then
   echo "Bundle still references libraries outside it:" >&2
   echo "$leaks" | sort -u >&2

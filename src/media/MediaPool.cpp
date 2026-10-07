@@ -1,7 +1,10 @@
 #include "MediaPool.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <iterator>
+#include <utility>
 
 namespace montage {
 

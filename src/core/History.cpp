@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <sstream>
+#include <utility>
 #include <vector>
 
 namespace montage {

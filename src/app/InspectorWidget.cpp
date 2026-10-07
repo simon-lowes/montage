@@ -17,7 +17,9 @@
 #include <QSlider>
 #include <QToolButton>
 #include <QVBoxLayout>
+#include <algorithm>
 #include <cmath>
+#include <utility>
 
 #include "EditorState.h"
 #include "Theme.h"

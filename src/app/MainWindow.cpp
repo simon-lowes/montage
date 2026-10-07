@@ -25,8 +25,11 @@
 #include <QTableWidget>
 #include <QToolBar>
 #include <QVBoxLayout>
+#include <algorithm>
 #include <cmath>
+#include <limits>
 #include <set>
+#include <tuple>
 
 #include "AudioMeterWidget.h"
 #include "EditorState.h"

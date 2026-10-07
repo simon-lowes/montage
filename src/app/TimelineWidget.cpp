@@ -11,8 +11,10 @@
 #include <QScrollBar>
 #include <QToolTip>
 #include <QUrl>
+#include <algorithm>
 #include <cmath>
 #include <set>
+#include <utility>
 
 #include "EditorState.h"
 #include "Theme.h"

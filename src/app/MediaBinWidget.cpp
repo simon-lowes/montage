@@ -23,6 +23,8 @@
 #include <QToolButton>
 #include <QUrl>
 #include <QVBoxLayout>
+#include <algorithm>
+#include <memory>
 
 #include "EditorState.h"
 #include "Theme.h"

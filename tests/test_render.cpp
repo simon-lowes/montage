@@ -1,6 +1,7 @@
 // Renderer tests: blending, transforms, effects, transitions, generators.
 #include <QtTest>
 
+#include <algorithm>
 #include <cmath>
 #include <fstream>
 

@@ -4,6 +4,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QUrl>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <iomanip>

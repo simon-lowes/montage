@@ -1,10 +1,12 @@
 // montage-cli — headless rendering, probing and project assembly.
 #include <QGuiApplication>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <iostream>

@@ -7,6 +7,8 @@
 #include <QDoubleSpinBox>
 #include <QMimeData>
 #include <QScrollBar>
+#include <algorithm>
+#include <cmath>
 
 #include "EditorState.h"
 #include "MainWindow.h"
