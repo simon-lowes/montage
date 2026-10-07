@@ -986,6 +986,14 @@ void MainWindow::about() {
                            .arg(MONTAGE_VERSION));
 }
 
+void MainWindow::raisePanel(const QString& name) {
+    for (QDockWidget* d : docks_)
+        if (d->objectName() == name) {
+            d->show();
+            d->raise();
+        }
+}
+
 void MainWindow::scheduleScreenshot(const QString& path, int delayMs) {
     QTimer::singleShot(delayMs, this, [this, path] {
         QApplication::processEvents();

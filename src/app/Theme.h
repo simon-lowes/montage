@@ -3,6 +3,7 @@
 
 #include <QColor>
 #include <QFont>
+#include <QIcon>
 
 class QApplication;
 
@@ -38,5 +39,9 @@ const char* labelName(int index);
 void apply(QApplication& app);
 
 QFont monoFont(int pointSize = 9);
+
+// Vector transport / UI icons drawn in the theme colour:
+// "play", "pause", "step-back", "step-forward", "to-in", "to-out", "mark-in", "mark-out", "save".
+QIcon icon(const char* name);
 
 }  // namespace montage::theme

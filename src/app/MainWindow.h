@@ -38,6 +38,8 @@ public:
     bool openProject(const QString& path);
     // Waits for pending renders and saves a screenshot of the window (testing aid).
     void scheduleScreenshot(const QString& path, int delayMs);
+    // Brings a panel to the front by its object name ("inspector", "scopes", "mixer", "effects"...).
+    void raisePanel(const QString& name);
 
 protected:
     void closeEvent(QCloseEvent* e) override;

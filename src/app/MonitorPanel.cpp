@@ -135,9 +135,9 @@ void ScrubBar::mouseMoveEvent(QMouseEvent* e) {
 // MonitorPanel
 
 namespace {
-QToolButton* tool(QWidget* parent, const QString& text, const QString& tip, QStyle::StandardPixmap icon = QStyle::SP_CustomBase) {
+QToolButton* tool(QWidget* parent, const QString& text, const QString& tip, const char* icon = nullptr) {
     auto* b = new QToolButton(parent);
-    if (icon != QStyle::SP_CustomBase) b->setIcon(parent->style()->standardIcon(icon));
+    if (icon) b->setIcon(theme::icon(icon));
     else b->setText(text);
     b->setToolTip(tip);
     b->setAutoRaise(true);
@@ -168,13 +168,13 @@ MonitorPanel::MonitorPanel(Mode mode, EditorState* state, PlaybackController* co
     bar->addWidget(timecode_);
     bar->addStretch();
 
-    auto* inBtn = tool(this, "{", tr("Mark In (I)"));
-    auto* outBtn = tool(this, "}", tr("Mark Out (O)"));
-    auto* goIn = tool(this, "{←", tr("Go to In (Shift+I)"));
-    auto* back = tool(this, QString(), tr("Step Back (Left)"), QStyle::SP_MediaSeekBackward);
-    playButton_ = tool(this, QString(), tr("Play / Pause (Space)"), QStyle::SP_MediaPlay);
-    auto* fwd = tool(this, QString(), tr("Step Forward (Right)"), QStyle::SP_MediaSeekForward);
-    auto* goOut = tool(this, "→}", tr("Go to Out (Shift+O)"));
+    auto* inBtn = tool(this, QString(), tr("Mark In (I)"), "mark-in");
+    auto* outBtn = tool(this, QString(), tr("Mark Out (O)"), "mark-out");
+    auto* goIn = tool(this, QString(), tr("Go to In (Shift+I)"), "to-in");
+    auto* back = tool(this, QString(), tr("Step Back (Left)"), "step-back");
+    playButton_ = tool(this, QString(), tr("Play / Pause (Space)"), "play");
+    auto* fwd = tool(this, QString(), tr("Step Forward (Right)"), "step-forward");
+    auto* goOut = tool(this, QString(), tr("Go to Out (Shift+O)"), "to-out");
     for (QToolButton* b : {inBtn, outBtn, goIn, back, playButton_, fwd, goOut}) bar->addWidget(b);
     connect(inBtn, &QToolButton::clicked, this, &MonitorPanel::markIn);
     connect(outBtn, &QToolButton::clicked, this, &MonitorPanel::markOut);
@@ -211,7 +211,7 @@ MonitorPanel::MonitorPanel(Mode mode, EditorState* state, PlaybackController* co
         safe->setCheckable(true);
         auto* loop = tool(this, tr("Loop"), tr("Loop playback between In and Out"));
         loop->setCheckable(true);
-        auto* still = tool(this, QString(), tr("Export Frame..."), QStyle::SP_DialogSaveButton);
+        auto* still = tool(this, QString(), tr("Export Frame..."), "save");
         bar->addSpacing(8);
         for (QToolButton* b : {lift, extract, safe, loop, still}) bar->addWidget(b);
         connect(lift, &QToolButton::clicked, this, [this] {
@@ -254,7 +254,7 @@ MonitorPanel::MonitorPanel(Mode mode, EditorState* state, PlaybackController* co
     });
     connect(controller_, &PlaybackController::positionChanged, this, [this] { refresh(); });
     connect(controller_, &PlaybackController::playingChanged, this, [this](bool playing) {
-        playButton_->setIcon(style()->standardIcon(playing ? QStyle::SP_MediaPause : QStyle::SP_MediaPlay));
+        playButton_->setIcon(theme::icon(playing ? "pause" : "play"));
     });
     connect(timecode_, &QLineEdit::returnPressed, this, [this] {
         const Sequence* s = controller_->sequence();

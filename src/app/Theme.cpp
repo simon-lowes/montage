@@ -2,6 +2,8 @@
 
 #include <QApplication>
 #include <QFontDatabase>
+#include <QPainter>
+#include <QPainterPath>
 #include <QPalette>
 #include <QStyleFactory>
 
@@ -36,6 +38,72 @@ QFont monoFont(int pointSize) {
     QFont f = QFontDatabase::systemFont(QFontDatabase::FixedFont);
     f.setPointSize(pointSize);
     return f;
+}
+
+QIcon icon(const char* nameC) {
+    const QString name = QString::fromLatin1(nameC);
+    QIcon result;
+    for (int size : {16, 32, 48}) {
+        QPixmap pm(size, size);
+        pm.fill(Qt::transparent);
+        QPainter p(&pm);
+        p.setRenderHint(QPainter::Antialiasing);
+        p.scale(size / 16.0, size / 16.0);
+        p.setPen(Qt::NoPen);
+        p.setBrush(kText);
+        auto tri = [&](double x0, double x1, double y0, double y1, bool right) {
+            QPainterPath path;
+            if (right) {
+                path.moveTo(x0, y0);
+                path.lineTo(x1, (y0 + y1) / 2);
+                path.lineTo(x0, y1);
+            } else {
+                path.moveTo(x1, y0);
+                path.lineTo(x0, (y0 + y1) / 2);
+                path.lineTo(x1, y1);
+            }
+            path.closeSubpath();
+            p.drawPath(path);
+        };
+        if (name == "play") tri(4, 13, 2.5, 13.5, true);
+        else if (name == "pause") {
+            p.drawRect(QRectF(4, 3, 3, 10));
+            p.drawRect(QRectF(9, 3, 3, 10));
+        } else if (name == "step-back") {
+            p.drawRect(QRectF(3, 3.5, 2, 9));
+            tri(6, 13, 3.5, 12.5, false);
+        } else if (name == "step-forward") {
+            tri(3, 10, 3.5, 12.5, true);
+            p.drawRect(QRectF(11, 3.5, 2, 9));
+        } else if (name == "to-in" || name == "to-out") {
+            bool in = name == "to-in";
+            p.setPen(QPen(kText, 1.6));
+            p.setBrush(Qt::NoBrush);
+            double bx = in ? 4 : 12;
+            p.drawLine(QPointF(bx, 3), QPointF(bx, 13));
+            p.drawLine(QPointF(bx, 3), QPointF(bx + (in ? 2.5 : -2.5), 3));
+            p.drawLine(QPointF(bx, 13), QPointF(bx + (in ? 2.5 : -2.5), 13));
+            p.setPen(Qt::NoPen);
+            p.setBrush(kText);
+            if (in) tri(7, 13, 4.5, 11.5, false);
+            else tri(3, 9, 4.5, 11.5, true);
+        } else if (name == "mark-in" || name == "mark-out") {
+            bool in = name == "mark-in";
+            p.setPen(QPen(kText, 1.8));
+            double bx = in ? 6 : 10;
+            p.drawLine(QPointF(bx, 2.5), QPointF(bx, 13.5));
+            p.drawLine(QPointF(bx, 2.5), QPointF(bx + (in ? 4 : -4), 2.5));
+            p.drawLine(QPointF(bx, 13.5), QPointF(bx + (in ? 4 : -4), 13.5));
+        } else if (name == "save") {
+            p.setPen(QPen(kText, 1.4));
+            p.setBrush(Qt::NoBrush);
+            p.drawRoundedRect(QRectF(2.5, 2.5, 11, 11), 1.5, 1.5);
+            p.drawRect(QRectF(5, 2.5, 6, 3.5));
+            p.drawRect(QRectF(4.5, 8.5, 7, 5));
+        }
+        result.addPixmap(pm);
+    }
+    return result;
 }
 
 void apply(QApplication& app) {

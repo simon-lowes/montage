@@ -107,6 +107,7 @@ SequenceSettingsDialog::SequenceSettingsDialog(QWidget* parent) : QDialog(parent
 
     name_ = new QLineEdit(this);
     name_->setMaxLength(200);
+    name_->setMinimumWidth(280);
 
     sizePreset_ = new QComboBox(this);
     for (const SizePreset& p : kSizePresets) sizePreset_->addItem(tr(p.label), QSize(p.width, p.height));
@@ -163,7 +164,6 @@ SequenceSettingsDialog::SequenceSettingsDialog(QWidget* parent) : QDialog(parent
     connect(sampleRate_, &QComboBox::currentIndexChanged, this, [this] { updateSummary(); });
 
     setSpec(NewSequenceSpec{tr("Sequence 1")});
-    setMinimumWidth(420);
 }
 
 void SequenceSettingsDialog::setSpec(const NewSequenceSpec& spec) {

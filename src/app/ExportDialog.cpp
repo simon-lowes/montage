@@ -125,7 +125,7 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     presetDescription_->setPalette(dim);
 
     path_ = new QLineEdit(form_);
-    path_->setMinimumWidth(320);
+    path_->setMinimumWidth(340);
     path_->setClearButtonEnabled(true);
     browse_ = new QPushButton(tr("Browse..."), form_);
     auto* pathRow = new QHBoxLayout;
@@ -228,7 +228,6 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     connect(&watcher_, &QFutureWatcher<Result>::finished, this, [this] { exportFinished(); });
 
     presetChanged();
-    setMinimumWidth(540);
 }
 
 ExportDialog::~ExportDialog() {

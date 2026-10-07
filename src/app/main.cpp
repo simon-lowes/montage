@@ -24,7 +24,8 @@ int main(int argc, char** argv) {
     QCommandLineOption frame("frame", "Move the playhead to <frame> after opening.", "frame");
     QCommandLineOption select("select-at", "Select the clip under the playhead on track V<n>.", "n");
     QCommandLineOption tool("source", "Open media item <index> (1-based) in the source monitor.", "index");
-    parser.addOptions({screenshot, frame, select, tool});
+    QCommandLineOption panel("panel", "Bring the named panel(s) to the front (comma separated).", "names");
+    parser.addOptions({screenshot, frame, select, tool, panel});
     parser.process(app);
 
     montage::MainWindow w;
@@ -49,6 +50,8 @@ int main(int argc, char** argv) {
         const auto& m = w.state()->project().media;
         if (idx >= 0 && idx < int(m.size())) w.state()->setSourceMedia(m[size_t(idx)].id);
     }
+    if (parser.isSet(panel))
+        for (const QString& n : parser.value(panel).split(',')) w.raisePanel(n.trimmed());
     if (parser.isSet(screenshot)) w.scheduleScreenshot(parser.value(screenshot), 3500);
     return app.exec();
 }
