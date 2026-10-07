@@ -59,6 +59,12 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
   - Right-click clips in the media bin › Transcribe…, pick a model (Tiny to Large v3 Turbo, English-only or 99 languages) and a language, or translate to English. The model downloads once.
   - Transcripts are word-timed, saved in the project, and undoable. The media bin search finds clips by what is said in them.
   - Export Transcript… writes SubRip (`.srt`) or WebVTT (`.vtt`) captions, plain text, or JSON with word timings.
+- Captions:
+  - Caption tracks on each sequence, shown as lanes above the video tracks. Drag captions to move them, drag their edges to retime them, and double-click one to edit its text in the Captions panel.
+  - Generate captions from transcripts: words are placed where each clip plays them, following trims, speed changes and muted tracks, and are split into readable captions (42 characters per line, 2 lines and 7 seconds at most by default).
+  - Edit, add, split, merge and delete captions in the Captions panel. You can also set the font, size, colours, background box, outline and position.
+  - Import SubRip or WebVTT files. Export SubRip, WebVTT or Scenarist SCC (CEA-608 broadcast captions).
+  - The CC button shows captions in the Program monitor. When exporting, captions can be burned into the picture, embedded as a subtitle track (mov_text in MP4/MOV, SubRip in MKV, WebVTT in WebM, with the track's language), or both.
 - Interchange: CMX 3600 EDL and OpenTimelineIO (`.otio`) export, for finishing in Resolve, Premiere, Avid or Nuke
 - Project files are readable JSON (`.montage`) and relink moved media through relative paths
 - Crash safety:
@@ -139,6 +145,8 @@ montage-cli otio cut.montage -o cut.otio                     # OpenTimelineIO
 montage-cli presets
 montage-cli models                                           # speech models and where they go
 montage-cli transcribe interview.mp4 --model base.en --srt interview.srt --vtt interview.vtt
+montage-cli captions cut.montage --transcribe base.en -o cut.scc --save   # caption a cut, keep the track
+montage-cli render cut.montage -o cut.mp4 --burn-captions --embed-captions
 ```
 
 ## Architecture
@@ -164,4 +172,4 @@ Notes on the design:
 
 ## Roadmap
 
-Phase 2 is ranked in [`docs/research/phase2-roadmap.md`](docs/research/phase2-roadmap.md) and tracked in [`PROGRESS.md`](PROGRESS.md). Next up: caption tracks, a transcript panel for text-based editing, dialogue denoise, masks, plugin editor windows, track and bus effect chains, Audio Unit and LV2 hosting, OCIO/ACES and HDR, multicam, a GPU compositor, tracking, optical-flow retiming and FCP XML interchange.
+Phase 2 is ranked in [`docs/research/phase2-roadmap.md`](docs/research/phase2-roadmap.md) and tracked in [`PROGRESS.md`](PROGRESS.md). Next up: a transcript panel for text-based editing, dialogue denoise, masks, plugin editor windows, track and bus effect chains, Audio Unit and LV2 hosting, OCIO/ACES and HDR, multicam, a GPU compositor, tracking, optical-flow retiming and FCP XML interchange.

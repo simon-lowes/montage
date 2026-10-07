@@ -10,6 +10,7 @@
 #include <QMouseEvent>
 #include <QPainter>
 #include <QStyle>
+#include <QSettings>
 #include <QToolButton>
 #include <QVBoxLayout>
 #include <algorithm>
@@ -217,9 +218,17 @@ MonitorPanel::MonitorPanel(Mode mode, EditorState* state, PlaybackController* co
         auto* still = tool(this, QString(), tr("Export Frame..."), "save");
         auto* proxy = tool(this, tr("Proxy"), tr("Play back with proxy media where available (exports always use originals)"));
         proxy->setCheckable(true);
+        auto* cc = tool(this, tr("CC"), tr("Show captions (the first visible caption track)"));
+        cc->setCheckable(true);
+        cc->setObjectName("showCaptions");
         bar->addSpacing(8);
-        for (QToolButton* b : {lift, extract, safe, loop, proxy, still}) bar->addWidget(b);
+        for (QToolButton* b : {lift, extract, safe, loop, proxy, cc, still}) bar->addWidget(b);
         connect(proxy, &QToolButton::toggled, this, [this](bool on) { controller_->setUseProxies(on); });
+        connect(cc, &QToolButton::toggled, this, [this](bool on) {
+            controller_->setShowCaptions(on);
+            QSettings().setValue("program/showCaptions", on);
+        });
+        cc->setChecked(QSettings().value("program/showCaptions", true).toBool());
         connect(lift, &QToolButton::clicked, this, [this] {
             const Sequence* s = state_->sequence();
             if (!s) return;

@@ -43,6 +43,7 @@ int usage() {
                  "  montage-cli info <project.montage>\n"
                  "  montage-cli render <project.montage> -o <output> [--preset NAME] [--in TC] [--out TC]\n"
                  "                     [--width W] [--height H] [--crf N] [--vcodec C] [--acodec C] [--proxies]\n"
+                 "                     [--burn-captions] [--embed-captions]\n"
                  "  montage-cli frame <project.montage> --at TC -o <image.png>\n"
                  "  montage-cli presets\n"
                  "  montage-cli scenes <video> [--sensitivity 0..1]\n"
@@ -53,7 +54,9 @@ int usage() {
                  "  montage-cli bench <project.montage> [--scale 0.5] [--frames 120]\n"
                  "  montage-cli transcribe <media> [--model base.en|PATH] [--language auto|en|...] [--translate]\n"
                  "                     [--srt out.srt] [--vtt out.vtt] [--json out.json] [--txt out.txt]\n"
-                 "  montage-cli models\n",
+                 "  montage-cli models\n"
+                 "  montage-cli captions <project.montage> [-o out.srt|out.vtt|out.scc] [--transcribe MODEL]\n"
+                 "                     [--generate] [--import file.srt] [--save]\n",
                  MONTAGE_VERSION);
     return 2;
 }
@@ -224,6 +227,8 @@ int cmdRender(const std::vector<std::string>& args) {
         else if (a == "--vcodec") vcodec = next();
         else if (a == "--acodec") acodec = next();
         else if (a == "--proxies") proxies = true;
+        else if (a == "--burn-captions") st.burnInCaptions = true;
+        else if (a == "--embed-captions") st.embedCaptions = true;
         else return usage();
     }
     if (outPath.empty()) return usage();
@@ -232,7 +237,10 @@ int cmdRender(const std::vector<std::string>& args) {
         std::fprintf(stderr, "error: unknown preset \"%s\" (see `montage-cli presets`)\n", presetName.c_str());
         return 1;
     }
+    const bool burn = st.burnInCaptions, embed = st.embedCaptions;
     st = pr->settings;
+    st.burnInCaptions = burn;
+    st.embedCaptions = embed;
     Project p;
     if (!load(projectPath, p)) return 1;
     const Sequence* s = p.active();
@@ -450,6 +458,106 @@ int cmdTranscribe(const std::vector<std::string>& args) {
 }
 #endif
 
+int cmdCaptions(const std::vector<std::string>& args) {
+    if (args.empty()) return usage();
+    std::string out, import, model;
+    bool generate = false, save = false;
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (args[i] == "-o" && i + 1 < args.size()) out = args[++i];
+        else if (args[i] == "--transcribe" && i + 1 < args.size()) model = args[++i], generate = true;
+        else if (args[i] == "--import" && i + 1 < args.size()) import = args[++i];
+        else if (args[i] == "--generate") generate = true;
+        else if (args[i] == "--save") save = true;
+        else return usage();
+    }
+    Project p;
+    if (!load(args[0], p)) return 1;
+    Sequence& s = *p.active();
+    auto addTrack = [&](std::vector<Caption> caps, const std::string& name) {
+        CaptionTrack t;
+        t.id = p.newId();
+        t.name = name;
+        t.captions = std::move(caps);
+        s.captionTracks.insert(s.captionTracks.begin(), std::move(t));
+    };
+    if (!model.empty()) {
+#ifdef MONTAGE_WITH_WHISPER
+        // Transcribe the media the sequence uses that has sound and no transcript yet.
+        std::signal(SIGINT, [](int) { gCancel = true; });
+        TranscribeOptions opts;
+        opts.model = model;
+        for (auto& m : p.media) {
+            bool used = false;
+            for (const auto* list : {&s.audioTracks, &s.videoTracks})
+                for (const auto& tr : *list)
+                    for (const auto& c : tr.clips) used |= c.mediaId == m.id;
+            if (!used || !m.hasAudio || m.path.empty() || m.transcript) continue;
+            auto t = std::make_shared<Transcript>();
+            std::string err;
+            std::fprintf(stderr, "Transcribing %s...\n", m.name.c_str());
+            if (!transcribeMedia(m.path, opts, *t, {}, &gCancel, &err)) {
+                std::fprintf(stderr, "error: %s: %s\n", m.name.c_str(), err.c_str());
+                return 1;
+            }
+            m.transcript = t;
+        }
+#else
+        std::fprintf(stderr, "error: this build has no speech recognition\n");
+        return 1;
+#endif
+    }
+    if (generate) {
+        auto caps = captionsFromTranscripts(p, s);
+        if (caps.empty()) {
+            std::fprintf(stderr, "error: no transcribed speech in the sequence (transcribe the media in the app first)\n");
+            return 1;
+        }
+        std::fprintf(stderr, "%zu captions from transcripts\n", caps.size());
+        addTrack(std::move(caps), "Subtitles");
+    }
+    if (!import.empty()) {
+        FILE* f = std::fopen(import.c_str(), "rb");
+        if (!f) {
+            std::fprintf(stderr, "error: cannot read %s\n", import.c_str());
+            return 1;
+        }
+        std::string text;
+        char buf[65536];
+        for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) text.append(buf, n);
+        std::fclose(f);
+        std::vector<Caption> caps;
+        std::string err;
+        if (!parseSubtitles(text, s.fps, caps, &err)) {
+            std::fprintf(stderr, "error: %s\n", err.c_str());
+            return 1;
+        }
+        addTrack(std::move(caps), std::filesystem::path(import).stem().string());
+    }
+    const CaptionTrack* t = captionTrackFor(s);
+    if (!t && !s.captionTracks.empty()) t = &s.captionTracks.front();
+    if (!t) {
+        std::fprintf(stderr, "error: the sequence has no captions\n");
+        return 1;
+    }
+    if (save) {
+        std::string err;
+        if (!saveProject(p, std::filesystem::absolute(args[0]).string(), &err)) {
+            std::fprintf(stderr, "error: %s\n", err.c_str());
+            return 1;
+        }
+        std::printf("Saved %s\n", args[0].c_str());
+    }
+    const std::string ext = std::filesystem::path(out).extension().string();
+    const std::string text = ext == ".vtt" ? captionsToVtt(t->captions, s.fps)
+                             : ext == ".scc" ? captionsToScc(t->captions, s.fps)
+                                             : captionsToSrt(t->captions, s.fps);
+    if (out.empty()) {
+        if (!save) std::fwrite(text.data(), 1, text.size(), stdout);
+        return 0;
+    }
+    return writeFile(out, text) ? 0 : 1;
+}
+
 int cmdPresets() {
     for (const auto& p : exportPresets())
         std::printf("%-28s .%-5s %s\n", p.name.c_str(), p.extension.c_str(), p.description.c_str());
@@ -475,6 +583,7 @@ int main(int argc, char** argv) {
     if (cmd == "proxy") return cmdProxy(args);
     if (cmd == "loudness") return cmdLoudness(args);
     if (cmd == "bench") return cmdBench(args);
+    if (cmd == "captions") return cmdCaptions(args);
     if (cmd == "edl") return cmdInterchange(args, false);
     if (cmd == "otio") return cmdInterchange(args, true);
 #ifdef MONTAGE_WITH_WHISPER

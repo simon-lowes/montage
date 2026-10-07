@@ -19,6 +19,11 @@
 #include "render/Compositor.h"
 #include "render/Exporter.h"
 
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+}
+
 using namespace montage;
 
 // Unbuffered output, so that if the process dies the log shows how far it got.
@@ -61,6 +66,62 @@ MediaItem probeOrFail(Project& p, const std::string& path) {
     bool ok = probeMedia(path, m, &err);
     if (!ok) qWarning("probe failed: %s", err.c_str());
     return m;
+}
+
+// Every subtitle event in a file, as (start seconds, end seconds, ASS text), read
+// back with FFmpeg's demuxer and decoder for the file's first subtitle stream.
+struct SubEvent {
+    double start, end;
+    QString text;
+};
+std::vector<SubEvent> readSubtitles(const std::string& path, const char* format, std::string* codecName,
+                                    std::string* language = nullptr) {
+    std::vector<SubEvent> out;
+    AVFormatContext* fmt = nullptr;
+    const AVInputFormat* in = format ? av_find_input_format(format) : nullptr;
+    if (avformat_open_input(&fmt, path.c_str(), in, nullptr) < 0) return out;
+    avformat_find_stream_info(fmt, nullptr);
+    int idx = av_find_best_stream(fmt, AVMEDIA_TYPE_SUBTITLE, -1, -1, nullptr, 0);
+    if (idx < 0) {
+        avformat_close_input(&fmt);
+        return out;
+    }
+    AVStream* st = fmt->streams[idx];
+    const AVCodec* codec = avcodec_find_decoder(st->codecpar->codec_id);
+    *codecName = codec ? codec->name : "";
+    if (language)
+        if (const AVDictionaryEntry* e = av_dict_get(st->metadata, "language", nullptr, 0)) *language = e->value;
+    AVCodecContext* ctx = avcodec_alloc_context3(codec);
+    avcodec_parameters_to_context(ctx, st->codecpar);
+    ctx->pkt_timebase = st->time_base;
+    if (avcodec_open2(ctx, codec, nullptr) < 0) {
+        avcodec_free_context(&ctx);
+        avformat_close_input(&fmt);
+        return out;
+    }
+    AVPacket* pkt = av_packet_alloc();
+    auto decode = [&](AVPacket* p) {
+        AVSubtitle sub{};
+        int got = 0;
+        if (avcodec_decode_subtitle2(ctx, &sub, &got, p) >= 0 && got) {
+            const double base = sub.pts != AV_NOPTS_VALUE ? double(sub.pts) / AV_TIME_BASE
+                                                          : double(p->pts) * av_q2d(st->time_base);
+            QStringList texts;
+            for (unsigned i = 0; i < sub.num_rects; ++i)
+                if (sub.rects[i]->ass) texts << QString::fromUtf8(sub.rects[i]->ass).section(',', 8);
+            if (!texts.isEmpty())
+                out.push_back({base + sub.start_display_time / 1000.0, base + sub.end_display_time / 1000.0, texts.join(' ')});
+            avsubtitle_free(&sub);
+        }
+    };
+    while (av_read_frame(fmt, pkt) >= 0) {
+        if (pkt->stream_index == idx) decode(pkt);
+        av_packet_unref(pkt);
+    }
+    av_packet_free(&pkt);
+    avcodec_free_context(&ctx);
+    avformat_close_input(&fmt);
+    return out;
 }
 
 float meanAbs(const std::vector<float>& v, int ch, size_t from, size_t to) {
@@ -351,6 +412,7 @@ private slots:
             return out;
         };
         std::string swName, hwName;
+        const int slotsBefore = activeHwDecoders();  // pooled decoders from earlier tests may hold some
         auto sw = frames(HwDecodeMode::Off, &swName);
         auto hw = frames(HwDecodeMode::Auto, &hwName);
         setHwDecodeMode(HwDecodeMode::Auto);
@@ -372,7 +434,7 @@ private slots:
             QVERIFY2(mean < 0.006 && worst < 0.08,
                      qPrintable(QString("frame %1 differs: mean %2, max %3").arg(i).arg(mean).arg(worst)));
         }
-        QCOMPARE(activeHwDecoders(), 0);  // slots are released when decoders close
+        QCOMPARE(activeHwDecoders(), slotsBefore);  // slots are released when decoders close
 
         // The hardware preset exports with this machine's encoder, or x264.
         const ExportPreset* preset = findExportPreset("H.264 - Hardware");
@@ -438,6 +500,113 @@ private slots:
         QVERIFY(QString::fromStdString(err).contains("not found"));
     }
 #endif
+
+    void captionsBurnInAndEmbed() {
+        // A mid-grey clip with two captions.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320;
+        s.height = 180;
+        s.fps = {25, 1};
+        Clip c = makeGeneratorClip(p, "color", 50);
+        c.generator.params["color.r"] = 0.3;
+        c.generator.params["color.g"] = 0.3;
+        c.generator.params["color.b"] = 0.3;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, c);
+        CaptionTrack ct;
+        ct.id = p.newId();
+        ct.name = "English";
+        ct.style.size = 0.1;
+        ct.captions = {{5, 20, "Hello world"}, {30, 45, "Second {line}\nof text"}};
+        s.captionTracks.push_back(ct);
+
+        // The viewer draws the caption only when asked, and only while it is on screen.
+        RenderOptions ro;
+        Image plain = renderProgramFrame(p, s, 10, ro);
+        ro.captions = true;
+        Image withCaption = renderProgramFrame(p, s, 10, ro);
+        Image between = renderProgramFrame(p, s, 25, ro);
+        auto bright = [](const Image& img) {
+            int n = 0;
+            for (int y = img.height * 3 / 4; y < img.height; ++y)
+                for (int x = 0; x < img.width; ++x) n += img.at(x, y)[0] > 0.9f ? 1 : 0;
+            return n;
+        };
+        QCOMPARE(bright(plain), 0);
+        QVERIFY2(bright(withCaption) > 30, qPrintable(QString::number(bright(withCaption))));  // white text, bottom quarter
+        QCOMPARE(bright(between), 0);
+
+        // MP4: burned in and embedded as mov_text with the language.
+        ExportSettings st;
+        st.path = path("captions.mp4");
+        st.audioCodec = "none";
+        st.preset = "ultrafast";
+        st.burnInCaptions = true;
+        st.embedCaptions = true;
+        std::string err;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        std::string codec, lang;
+        auto events = readSubtitles(st.path, nullptr, &codec, &lang);
+        QCOMPARE(QString::fromStdString(codec), QString("mov_text"));
+        QCOMPARE(QString::fromStdString(lang), QString("eng"));
+        QCOMPARE(events.size(), size_t(2));
+        QCOMPARE(events[0].text, QString("Hello world"));
+        QVERIFY(std::fabs(events[0].start - 0.2) < 0.02 && std::fabs(events[0].end - 0.8) < 0.02);
+        // Braces stay literal text (the decoder escapes them again for ASS).
+        QCOMPARE(events[1].text, QString("Second \\{line\\}\\Nof text"));
+        VideoDecoder dec;
+        QVERIFY(dec.open(st.path, &err));
+        Frame16Ptr f = dec.frameAt(10 / 25.0);
+        QVERIFY(f);
+        int burned = 0;
+        for (int y = 135; y < 180; ++y)
+            for (int x = 0; x < 320; ++x) burned += f->px[(size_t(y) * 320 + x) * 4] > 0.85 * 65535 ? 1 : 0;
+        QVERIFY2(burned > 20, qPrintable(QString::number(burned)));
+
+        // An export range shifts the captions; MKV gets SubRip.
+        st.path = path("captions.mkv");
+        st.burnInCaptions = false;
+        st.in = 25;
+        st.out = 50;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        events = readSubtitles(st.path, nullptr, &codec);
+        QVERIFY2(codec == "subrip" || codec == "srt", codec.c_str());  // the decoder's name varies by FFmpeg version
+        QCOMPARE(events.size(), size_t(1));
+        QVERIFY(std::fabs(events[0].start - 0.2) < 0.02);
+
+        // A WAV cannot carry captions: say so.
+        st.path = path("captions.wav");
+        st.videoCodec = "none";
+        st.audioCodec = "pcm_s16le";
+        QVERIFY(!exportSequence(p, s, st, nullptr, nullptr, &err));
+        QVERIFY(QString::fromStdString(err).contains("captions"));
+    }
+
+    void sccDecodesWithFfmpeg() {
+        // FFmpeg's own SCC demuxer and CEA-608 decoder read back what we write.
+        const Rational fps{30000, 1001};
+        std::vector<Caption> caps = {{60, 150, "HELLO WORLD"}, {300, 390, "Two lines\nof text"}, {420, 480, "Caf\xC3\xA9 \xE2\x99\xAA"}};
+        const std::string file = path("captions.scc");
+        {
+            QFile f(QString::fromStdString(file));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(QByteArray::fromStdString(captionsToScc(caps, fps)));
+        }
+        std::string codec;
+        auto events = readSubtitles(file, "scc", &codec);
+        QCOMPARE(QString::fromStdString(codec), QString("cc_dec"));
+        QStringList texts;
+        for (const auto& e : events) texts << e.text;
+        const QString all = texts.join(" | ");
+        qInfo("608: %s", qPrintable(all));
+        QVERIFY2(all.contains("HELLO WORLD"), qPrintable(all));
+        QVERIFY2(all.contains("Two lines") && all.contains("of text"), qPrintable(all));
+        QVERIFY2(all.contains(QString::fromUtf8("Caf\xC3\xA9")), qPrintable(all));
+        // Loading starts early so that a decoder taking one byte pair per frame shows the
+        // caption at 2 s; FFmpeg's decoder shows it as soon as the line is read.
+        for (const auto& e : events)
+            if (e.text.contains("HELLO")) QVERIFY2(e.start > 1.4 && e.start < 2.05, qPrintable(QString::number(e.start)));
+    }
 
     void importedVideoComposites() {
         // Use the exported ramp as media inside a new project, at half speed.

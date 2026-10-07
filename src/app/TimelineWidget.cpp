@@ -12,6 +12,7 @@
 #include <QToolTip>
 #include <QUrl>
 #include <algorithm>
+#include <limits>
 #include <cmath>
 #include <set>
 #include <utility>
@@ -32,6 +33,7 @@ constexpr int kRulerH = 30;
 constexpr int kDividerH = 8;
 constexpr int kVideoH = 62;
 constexpr int kAudioH = 52;
+constexpr int kCaptionH = 24;
 constexpr int kEdgeGrab = 6;
 constexpr int kSnapPx = 9;
 constexpr int kNameStrip = 16;
@@ -113,11 +115,16 @@ void TimelineWidget::setTool(Tool t) {
 // ---------------------------------------------------------------------------
 // Geometry
 
+int TimelineWidget::captionLanesHeight() const {
+    const Sequence* s = state_->sequence();
+    return s ? int(s->captionTracks.size()) * kCaptionH : 0;
+}
+
 std::vector<TimelineWidget::Row> TimelineWidget::rows() const {
     std::vector<Row> out;
     const Sequence* s = state_->sequence();
     if (!s) return out;
-    int y = kRulerH - verticalScrollBar()->value();
+    int y = kRulerH - verticalScrollBar()->value() + captionLanesHeight();
     for (int i = int(s->videoTracks.size()) - 1; i >= 0; --i) {
         int h = trackHeight(s->videoTracks[size_t(i)]);
         out.push_back({{TrackKind::Video, i}, y, h});
@@ -135,7 +142,7 @@ std::vector<TimelineWidget::Row> TimelineWidget::rows() const {
 int TimelineWidget::contentHeight() const {
     const Sequence* s = state_->sequence();
     if (!s) return 0;
-    int h = kDividerH + 40;
+    int h = kDividerH + 40 + captionLanesHeight();
     for (const auto& t : s->videoTracks) h += trackHeight(t);
     for (const auto& t : s->audioTracks) h += trackHeight(t);
     return h;
@@ -143,7 +150,7 @@ int TimelineWidget::contentHeight() const {
 
 int TimelineWidget::dividerY() const {
     const Sequence* s = state_->sequence();
-    int y = kRulerH - verticalScrollBar()->value();
+    int y = kRulerH - verticalScrollBar()->value() + captionLanesHeight();
     if (s)
         for (const auto& t : s->videoTracks) y += trackHeight(t);
     return y;
@@ -244,6 +251,26 @@ TimelineWidget::Hit TimelineWidget::hitTest(const QPoint& pos) const {
     if (!s) return h;
     if (pos.y() < kRulerH) {
         h.kind = pos.x() >= kHeaderW ? HitKind::Ruler : HitKind::None;
+        return h;
+    }
+    // Caption lanes, above the video tracks.
+    const int lanesTop = kRulerH - verticalScrollBar()->value();
+    if (pos.y() >= lanesTop && pos.y() < lanesTop + captionLanesHeight()) {
+        const CaptionTrack& ct = s->captionTracks[size_t((pos.y() - lanesTop) / kCaptionH)];
+        h.captionTrack = ct.id;
+        if (pos.x() < kHeaderW) return h;
+        h.kind = HitKind::CaptionLane;
+        for (size_t i = 0; i < ct.captions.size(); ++i) {
+            const int xs = xForFrame(ct.captions[i].start), xe = xForFrame(ct.captions[i].end);
+            if (pos.x() < xs - 4 || pos.x() > xe + 4) continue;
+            h.caption = int(i);
+            h.kind = std::abs(pos.x() - xs) <= 4 && xe - xs > 12   ? HitKind::CaptionIn
+                     : std::abs(pos.x() - xe) <= 4 && xe - xs > 12 ? HitKind::CaptionOut
+                     : pos.x() >= xs && pos.x() <= xe              ? HitKind::Caption
+                                                                   : HitKind::CaptionLane;
+            if (h.kind != HitKind::CaptionLane) break;
+            h.caption = -1;
+        }
         return h;
     }
     auto row = rowAt(pos.y());
@@ -401,6 +428,7 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
             }
         }
     }
+    paintCaptionLanes(p);
     // Divider between video and audio.
     int dy = dividerY();
     p.fillRect(QRect(kHeaderW, dy, W - kHeaderW, kDividerH), QColor(0x14, 0x15, 0x18));
@@ -444,6 +472,39 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
         p.drawRoundedRect(tr, 3, 3);
         p.setPen(theme::kText);
         p.drawText(tr, Qt::AlignCenter, drag_.label);
+    }
+}
+
+void TimelineWidget::paintCaptionLanes(QPainter& p) {
+    const Sequence* s = state_->sequence();
+    const int W = viewport()->width();
+    int y = kRulerH - verticalScrollBar()->value();
+    QFont f = p.font();
+    f.setPointSize(8);
+    p.setFont(f);
+    for (const CaptionTrack& ct : s->captionTracks) {
+        p.fillRect(QRect(kHeaderW, y, W - kHeaderW, kCaptionH), theme::kPanel.darker(118));
+        p.setPen(QColor(0, 0, 0, 90));
+        p.drawLine(kHeaderW, y + kCaptionH - 1, W, y + kCaptionH - 1);
+        const QColor fill = ct.visible ? QColor(0xc9, 0xa2, 0x27) : QColor(0x6b, 0x62, 0x48);
+        for (size_t i = 0; i < ct.captions.size(); ++i) {
+            const Caption& c = ct.captions[i];
+            const int xs = xForFrame(c.start), xe = xForFrame(c.end);
+            if (xe < kHeaderW || xs > W) continue;
+            const QRect r(xs, y + 2, std::max(2, xe - xs), kCaptionH - 5);
+            const bool sel = ct.id == selectedCaptionTrack_ && int(i) == selectedCaption_;
+            p.setPen(sel ? QPen(Qt::white, 1.5) : QPen(fill.darker(150), 1));
+            p.setBrush(fill.darker(sel ? 100 : 115));
+            p.drawRoundedRect(r, 3, 3);
+            if (r.width() > 16) {
+                p.setPen(QColor(20, 18, 10));
+                QString text = QString::fromStdString(c.text);
+                text.replace('\n', ' ');
+                p.drawText(r.adjusted(4, 0, -3, 0), Qt::AlignVCenter | Qt::AlignLeft,
+                           p.fontMetrics().elidedText(text, Qt::ElideRight, r.width() - 7));
+            }
+        }
+        y += kCaptionH;
     }
 }
 
@@ -693,6 +754,20 @@ void TimelineWidget::paintHeaders(QPainter& p, const std::vector<Row>& rs) {
         p.setPen(on ? Qt::white : theme::kTextDim);
         p.drawText(r, Qt::AlignCenter, text);
     };
+    {
+        int y = kRulerH - verticalScrollBar()->value();
+        for (const CaptionTrack& ct : s->captionTracks) {
+            QRect hr(0, y, kHeaderW, kCaptionH);
+            p.fillRect(hr, theme::kPanelAlt.darker(112));
+            p.setPen(QColor(0, 0, 0, 120));
+            p.drawLine(0, y + kCaptionH - 1, kHeaderW, y + kCaptionH - 1);
+            button(QRect(6, y + 4, 26, kCaptionH - 8), QStringLiteral("CC"), ct.visible, QColor(0xc9, 0xa2, 0x27));
+            p.setPen(ct.visible ? theme::kText : theme::kTextDim);
+            p.drawText(QRect(38, y, kHeaderW - 44, kCaptionH), Qt::AlignVCenter | Qt::AlignLeft,
+                       p.fontMetrics().elidedText(QString::fromStdString(ct.name), Qt::ElideRight, kHeaderW - 44));
+            y += kCaptionH;
+        }
+    }
     for (const Row& r : rs) {
         const Track* t = trackAt(*s, r.ref);
         QRect hr(0, r.y, kHeaderW, r.h);
@@ -782,6 +857,30 @@ void TimelineWidget::mousePressEvent(QMouseEvent* e) {
     if (e->button() != Qt::LeftButton) return;
     if (hit.kind == HitKind::Header) {
         handleHeaderClick(hit);
+        return;
+    }
+    if (hit.captionTrack) {
+        const Id track = hit.captionTrack;
+        if (e->pos().x() < kHeaderW) {
+            // The CC button shows or hides the track.
+            if (e->pos().x() < 34)
+                state_->edit(tr("Show Captions"), [track](Project&, Sequence& sq) {
+                    for (auto& t : sq.captionTracks)
+                        if (t.id == track) t.visible = !t.visible;
+                    return true;
+                });
+            return;
+        }
+        selectedCaptionTrack_ = track;
+        selectedCaption_ = hit.caption;
+        drag_.captionTrack = track;
+        drag_.caption = hit.caption;
+        drag_.kind = hit.kind == HitKind::Caption     ? DragKind::CaptionMove
+                     : hit.kind == HitKind::CaptionIn  ? DragKind::CaptionIn
+                     : hit.kind == HitKind::CaptionOut ? DragKind::CaptionOut
+                                                       : DragKind::None;
+        if (hit.caption < 0) state_->setPlayhead(hit.frame);
+        viewport()->update();
         return;
     }
     if (hit.kind == HitKind::Ruler) {
@@ -901,6 +1000,9 @@ void TimelineWidget::updateDrag(QMouseEvent* e) {
             case DragKind::Roll: state_->beginGesture(tr("Roll Edit")); break;
             case DragKind::Slip: state_->beginGesture(tr("Slip")); break;
             case DragKind::Slide: state_->beginGesture(tr("Slide")); break;
+            case DragKind::CaptionMove: state_->beginGesture(tr("Move Caption")); break;
+            case DragKind::CaptionIn:
+            case DragKind::CaptionOut: state_->beginGesture(tr("Trim Caption")); break;
             default: break;
         }
     }
@@ -982,6 +1084,38 @@ void TimelineWidget::updateDrag(QMouseEvent* e) {
             drag_.label = tr("Slide %1").arg(signedTc(applied));
             break;
         }
+        case DragKind::CaptionMove:
+        case DragKind::CaptionIn:
+        case DragKind::CaptionOut: {
+            const Id track = drag_.captionTrack;
+            const int i = drag_.caption;
+            const DragKind kind = drag_.kind;
+            FrameTime applied = 0;
+            state_->updateGesture([&](Project&, Sequence& sq) {
+                for (auto& t : sq.captionTracks) {
+                    if (t.id != track || i < 0 || size_t(i) >= t.captions.size()) continue;
+                    Caption& c = t.captions[size_t(i)];
+                    const FrameTime lo = i > 0 ? t.captions[size_t(i) - 1].end : 0;
+                    const FrameTime hi = size_t(i) + 1 < t.captions.size() ? t.captions[size_t(i) + 1].start
+                                                                           : std::numeric_limits<FrameTime>::max() / 4;
+                    if (kind == DragKind::CaptionMove) {
+                        applied = std::clamp(raw, lo - c.start, hi - c.end);
+                        c.start += applied;
+                        c.end += applied;
+                    } else if (kind == DragKind::CaptionIn) {
+                        const FrameTime v = std::clamp(c.start + raw, lo, c.end - 1);
+                        applied = v - c.start;
+                        c.start = v;
+                    } else {
+                        const FrameTime v = std::clamp(c.end + raw, c.start + 1, hi);
+                        applied = v - c.end;
+                        c.end = v;
+                    }
+                }
+            });
+            drag_.label = signedTc(applied);
+            break;
+        }
         case DragKind::Rubber: {
             drag_.band = QRect(drag_.pressPos, pos);
             QRect band = drag_.band.normalized();
@@ -1011,7 +1145,9 @@ void TimelineWidget::mouseMoveEvent(QMouseEvent* e) {
     // Hover cursor feedback.
     if (tool_ == Tool::Select || tool_ == Tool::Ripple || tool_ == Tool::Roll) {
         Hit h = hitTest(e->pos());
-        if (h.kind == HitKind::ClipIn || h.kind == HitKind::ClipOut) viewport()->setCursor(Qt::SizeHorCursor);
+        if (h.kind == HitKind::ClipIn || h.kind == HitKind::ClipOut || h.kind == HitKind::CaptionIn ||
+            h.kind == HitKind::CaptionOut)
+            viewport()->setCursor(Qt::SizeHorCursor);
         else if (tool_ == Tool::Select) viewport()->unsetCursor();
     }
 }
@@ -1022,7 +1158,9 @@ void TimelineWidget::mouseReleaseEvent(QMouseEvent* e) {
         if (tool_ == Tool::Hand) viewport()->setCursor(Qt::OpenHandCursor);
     }
     bool gesture = drag_.started && (drag_.kind == DragKind::Move || drag_.kind == DragKind::Trim || drag_.kind == DragKind::Roll ||
-                                     drag_.kind == DragKind::Slip || drag_.kind == DragKind::Slide);
+                                     drag_.kind == DragKind::Slip || drag_.kind == DragKind::Slide ||
+                                     drag_.kind == DragKind::CaptionMove || drag_.kind == DragKind::CaptionIn ||
+                                     drag_.kind == DragKind::CaptionOut);
     if (gesture) state_->endGesture(true);
     drag_ = DragState{};
     snapIndicator_ = -1;
@@ -1034,6 +1172,8 @@ void TimelineWidget::mouseDoubleClickEvent(QMouseEvent* e) {
     Hit h = hitTest(e->pos());
     if (h.kind == HitKind::ClipBody) {
         emit clipActivated(h.clip);
+    } else if (h.kind == HitKind::Caption) {
+        emit captionActivated(h.captionTrack, h.caption);
     } else if (h.kind == HitKind::Header && h.button == HeaderButton::Name && h.track) {
         const Track* t = trackAt(*state_->sequence(), *h.track);
         bool ok = false;

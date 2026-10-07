@@ -28,6 +28,10 @@ struct ExportSettings {
     FrameTime out = -1;
     bool useProxies = false;
     bool alpha = false;                  // keep transparency (ProRes 4444 etc.)
+    // Captions from the sequence's visible caption track (or captionTrack):
+    bool burnInCaptions = false;         // drawn into the picture
+    bool embedCaptions = false;          // as a subtitle stream (MP4/MOV mov_text, MKV SubRip, WebM WebVTT)
+    Id captionTrack = 0;                 // 0 = the first visible caption track
 };
 
 struct ExportPreset {

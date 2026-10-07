@@ -199,6 +199,49 @@ Track trackFromJson(const QJsonObject& o, TrackKind kind) {
     return t;
 }
 
+QJsonObject captionTrackToJson(const CaptionTrack& t) {
+    const CaptionStyle& st = t.style;
+    QJsonObject style{{"font", qs(st.font)},
+                      {"size", st.size},
+                      {"bold", st.bold},
+                      {"text", QJsonArray{st.textR, st.textG, st.textB}},
+                      {"boxOpacity", st.boxOpacity},
+                      {"box", QJsonArray{st.boxR, st.boxG, st.boxB}},
+                      {"outline", st.outline},
+                      {"position", st.position}};
+    QJsonArray items;
+    for (const Caption& c : t.captions) items.append(QJsonArray{double(c.start), double(c.end), qs(c.text)});
+    return QJsonObject{{"id", double(t.id)},        {"name", qs(t.name)}, {"language", qs(t.language)},
+                       {"visible", t.visible},      {"style", style},     {"captions", items}};
+}
+
+CaptionTrack captionTrackFromJson(const QJsonObject& o) {
+    CaptionTrack t;
+    t.id = Id(i64(o.value("id")));
+    t.name = ss(o.value("name"));
+    t.language = ss(o.value("language"));
+    t.visible = o.value("visible").toBool(true);
+    const QJsonObject so = o.value("style").toObject();
+    CaptionStyle& st = t.style;
+    const CaptionStyle def;
+    st.font = so.contains("font") ? ss(so.value("font")) : def.font;
+    st.size = so.value("size").toDouble(def.size);
+    st.bold = so.value("bold").toBool(def.bold);
+    const QJsonArray tc = so.value("text").toArray(), bc = so.value("box").toArray();
+    if (tc.size() == 3) st.textR = tc.at(0).toDouble(), st.textG = tc.at(1).toDouble(), st.textB = tc.at(2).toDouble();
+    if (bc.size() == 3) st.boxR = bc.at(0).toDouble(), st.boxG = bc.at(1).toDouble(), st.boxB = bc.at(2).toDouble();
+    st.boxOpacity = so.value("boxOpacity").toDouble(def.boxOpacity);
+    st.outline = so.value("outline").toDouble(def.outline);
+    st.position = so.value("position").toDouble(def.position);
+    for (const auto& v : o.value("captions").toArray()) {
+        const QJsonArray a = v.toArray();
+        if (a.size() < 3) continue;
+        t.captions.push_back({i64(a.at(0)), i64(a.at(1)), ss(a.at(2))});
+    }
+    normalizeCaptions(t.captions);
+    return t;
+}
+
 QJsonObject sequenceToJson(const Sequence& s) {
     QJsonObject o{{"id", double(s.id)},
                   {"name", qs(s.name)},
@@ -221,6 +264,11 @@ QJsonObject sequenceToJson(const Sequence& s) {
     o["video"] = v;
     o["audio"] = a;
     o["markers"] = m;
+    if (!s.captionTracks.empty()) {
+        QJsonArray c;
+        for (const auto& t : s.captionTracks) c.append(captionTrackToJson(t));
+        o["captions"] = c;
+    }
     return o;
 }
 
@@ -249,6 +297,7 @@ Sequence sequenceFromJson(const QJsonObject& o) {
         mk.color = mo.value("color").toInt(0);
         s.markers.push_back(mk);
     }
+    for (const auto& c : o.value("captions").toArray()) s.captionTracks.push_back(captionTrackFromJson(c.toObject()));
     return s;
 }
 

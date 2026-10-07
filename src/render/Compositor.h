@@ -16,6 +16,7 @@ struct RenderOptions {
     bool highQuality = false;  // bicubic scaling for export
     bool useProxies = false;
     int depth = 0;             // nesting depth (internal)
+    bool captions = false;     // draw the visible caption track over the program
 };
 
 // Composites all video tracks of `seq` at timeline frame `t`.
@@ -25,6 +26,9 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
 
 // Same, flattened over black — what the program monitor and exports show.
 Image renderProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o);
+
+// Draws the caption on screen at frame t from `track` over `img` (the whole frame).
+void drawCaption(Image& img, const CaptionTrack& track, FrameTime t);
 
 // Raw (unprocessed) frame of a media item at `seconds`, fitted into w x h; for the source monitor.
 Image renderMediaFrame(const Project& p, const MediaItem& m, double seconds, int w, int h);

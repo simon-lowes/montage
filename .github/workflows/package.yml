@@ -84,7 +84,14 @@ jobs:
       - name: Build
         run: cmake --build build
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        # A failing Qt Test binary is run again directly so its own log shows.
+        run: |
+          ctest --test-dir build --output-on-failure || {
+            for t in $(ctest --test-dir build --rerun-failed --show-only=json-v1 | sed -n 's/.*"name" *: *"\(test_[a-z]*\)".*/\1/p' | sort -u); do
+              echo "::group::$t"; (cd build/tests && QT_QPA_PLATFORM=offscreen "./$t.exe" -maxwarnings 0; echo "exit code $?"); echo "::endgroup::"
+            done
+            exit 1
+          }
       - name: Package (portable zip)
         run: scripts/package-windows.sh build
       - name: Package (installer)

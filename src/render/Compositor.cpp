@@ -369,7 +369,66 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
 Image renderProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o) {
     Image img = renderSequenceFrame(p, seq, t, o);
     flattenOver(img, 0, 0, 0);
+    if (o.captions && o.depth == 0)
+        if (const CaptionTrack* track = captionTrackFor(seq)) drawCaption(img, *track, t);
     return img;
+}
+
+void drawCaption(Image& img, const CaptionTrack& track, FrameTime t) {
+    const Caption* cap = captionAt(track, t);
+    if (!cap || img.width < 8 || img.height < 8) return;
+    const CaptionStyle& st = track.style;
+    QFont f(QString::fromStdString(st.font));
+    const double px = std::max(4.0, st.size * img.height);
+    f.setPixelSize(int(std::lround(px)));
+    f.setBold(st.bold);
+    f.setHintingPreference(QFont::PreferNoHinting);
+    const QFontMetricsF fm(f);
+    const QStringList lines = QString::fromStdString(cap->text).split('\n');
+    const double lineH = fm.height() * 1.1, padX = px * 0.3, padY = px * 0.08;
+    double blockW = 0;
+    for (const QString& l : lines) blockW = std::max(blockW, fm.horizontalAdvance(l));
+    const double blockH = lineH * double(lines.size());
+    const double bottom = std::clamp(st.position, 0.05, 1.0) * img.height;
+    // Render only the caption's area, then blend it over the frame.
+    const int x0 = std::max(0, int(std::floor(img.width / 2.0 - blockW / 2 - padX - 2)));
+    const int x1 = std::min(img.width, int(std::ceil(img.width / 2.0 + blockW / 2 + padX + 2)));
+    const int y0 = std::max(0, int(std::floor(bottom - blockH - padY - 2)));
+    const int y1 = std::min(img.height, int(std::ceil(bottom + padY + 2)));
+    if (x1 <= x0 || y1 <= y0) return;
+    QImage qi(x1 - x0, y1 - y0, QImage::Format_RGBA8888_Premultiplied);
+    qi.fill(Qt::transparent);
+    {
+        QPainter pa(&qi);
+        pa.setRenderHint(QPainter::Antialiasing);
+        pa.translate(-x0, -y0);
+        auto col = [](double r, double g, double b, double a) {
+            return QColor::fromRgbF(float(std::clamp(r, 0.0, 1.0)), float(std::clamp(g, 0.0, 1.0)),
+                                    float(std::clamp(b, 0.0, 1.0)), float(std::clamp(a, 0.0, 1.0)));
+        };
+        QPainterPath text;
+        for (int i = 0; i < lines.size(); ++i) {
+            const double w = fm.horizontalAdvance(lines[i]);
+            const double top = bottom - blockH + i * lineH;
+            if (st.boxOpacity > 0 && !lines[i].isEmpty())
+                pa.fillRect(QRectF(img.width / 2.0 - w / 2 - padX, top - padY, w + 2 * padX, lineH + 2 * padY),
+                            col(st.boxR, st.boxG, st.boxB, st.boxOpacity));
+            text.addText(QPointF(img.width / 2.0 - w / 2, top + (lineH - fm.height()) / 2 + fm.ascent()), f, lines[i]);
+        }
+        if (st.outline > 0)
+            pa.strokePath(text, QPen(QColor(0, 0, 0), st.outline * px * 2, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        pa.fillPath(text, col(st.textR, st.textG, st.textB, 1));
+    }
+    const float k = 1.0f / 255.0f;
+    for (int y = y0; y < y1; ++y) {
+        const uchar* s = qi.constScanLine(y - y0);
+        float* d = img.row(y) + size_t(x0) * 4;
+        for (int x = 0; x < x1 - x0; ++x, s += 4, d += 4) {
+            const float a = s[3] * k;
+            if (a <= 0) continue;
+            for (int c = 0; c < 4; ++c) d[c] = s[c] * k + d[c] * (1 - a);
+        }
+    }
 }
 
 Image renderMediaFrame(const Project& p, const MediaItem& m, double seconds, int w, int h) {

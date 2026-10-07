@@ -1,6 +1,7 @@
 add_library(montage_engine STATIC
   core/Model.h core/Model.cpp
   core/Transcript.h core/Transcript.cpp
+  core/Captions.h core/Captions.cpp
   core/Effects.h core/Effects.cpp
   core/EditOps.h core/EditOps.cpp
   core/History.h core/History.cpp

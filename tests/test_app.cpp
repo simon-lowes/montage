@@ -10,10 +10,13 @@
 #include <QListWidget>
 #include <QMimeData>
 #include <QScrollBar>
+#include <QTableWidget>
+#include <QToolButton>
 #include <QTreeWidget>
 #include <algorithm>
 #include <cmath>
 
+#include "CaptionsPanel.h"
 #include "EditorState.h"
 #include "EffectsBrowser.h"
 #include "audio/Plugins.h"
@@ -531,6 +534,76 @@ private slots:
         QCOMPARE(*back.findMedia(id)->transcript, *transcript);
         state()->newProject();
         QVERIFY(QTest::qWaitForWindowActive(win_.get()));  // the window has the focus back
+    }
+
+    void captionsPanelAndTimelineLane() {
+        // A clip whose media has a (made-up) transcript.
+        state()->newProject();
+        auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        auto t = std::make_shared<Transcript>();
+        TranscriptSegment seg;
+        const char* words[] = {"Ask", "not", "what", "your", "country", "can", "do", "for", "you."};
+        for (int i = 0; i < 9; ++i) seg.words.push_back({0.5 + i * 0.4, 0.85 + i * 0.4, words[i], 1});
+        t->segments.push_back(seg);
+        QVERIFY(state()->edit("Transcript", [media, t](Project& p, Sequence&) {
+            p.findMedia(media)->transcript = t;
+            return true;
+        }));
+        QVERIFY(state()->apply("Place", [media](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, media, 0, 0, -1, V1, A1, false);
+        }));
+
+        auto* panel = win_->findChild<CaptionsPanel*>();
+        QVERIFY(panel);
+        QVERIFY(panel->generateFromTranscripts() > 0);
+        const Sequence* s = state()->sequence();
+        QCOMPARE(s->captionTracks.size(), size_t(1));
+        const Id track = s->captionTracks[0].id;
+        QCOMPARE(panel->currentTrack(), track);
+        QCOMPARE(QString::fromStdString(s->captionTracks[0].captions[0].text), QString("Ask not what your country can do for you."));
+        auto* table = panel->findChild<QTableWidget*>();
+        QCOMPARE(table->rowCount(), int(s->captionTracks[0].captions.size()));
+
+        // Editing the text in the table is undoable.
+        table->item(0, 2)->setText("Ask not.");
+        QCOMPARE(state()->sequence()->captionTracks[0].captions[0].text, std::string("Ask not."));
+        state()->undo();
+        QCOMPARE(QString::fromStdString(state()->sequence()->captionTracks[0].captions[0].text).left(8), QString("Ask not "));
+
+        // The timeline shows the track as a lane above V1: drag the caption later.
+        ppf_ = measurePpf();
+        const Caption before = state()->sequence()->captionTracks[0].captions[0];
+        const int laneY = 30 + 12;
+        const int x = 176 + int((before.start + before.end) / 2 * ppf_) - timeline()->horizontalScrollBar()->value();
+        drag({x, laneY}, {x + int(10 * ppf_), laneY});
+        const Caption moved = state()->sequence()->captionTracks[0].captions[0];
+        QVERIFY2(moved.start > before.start, qPrintable(QString("%1 -> %2").arg(before.start).arg(moved.start)));
+        QCOMPARE(moved.end - moved.start, before.end - before.start);
+        state()->undo();
+        QCOMPARE(state()->sequence()->captionTracks[0].captions[0], before);
+        // Double-clicking a caption opens it for editing in the panel.
+        QSignalSpy activated(timeline(), &TimelineWidget::captionActivated);
+        QTest::mouseDClick(viewport(), Qt::LeftButton, Qt::NoModifier, {x, laneY});
+        QCOMPARE(activated.count(), 1);
+        QCOMPARE(activated.at(0).at(1).toInt(), 0);
+
+        // The program monitor shows captions when CC is on.
+        auto* cc = win_->findChild<QToolButton*>("showCaptions");
+        QVERIFY(cc);
+        cc->setChecked(false);
+        cc->setChecked(true);
+        QVERIFY(cc->isChecked());
+
+        // Export and import round trip through WebVTT.
+        const QString vtt = dir_.path() + "/captions.vtt";
+        QVERIFY(panel->exportFile(vtt));
+        QVERIFY(panel->importFile(vtt));
+        QCOMPARE(state()->sequence()->captionTracks.size(), size_t(2));
+        QCOMPARE(state()->sequence()->captionTracks[1].captions, state()->sequence()->captionTracks[0].captions);
+        state()->newProject();
+        QApplication::processEvents();
     }
 
     void inspectorEditsAreUndoable() {

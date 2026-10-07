@@ -45,6 +45,7 @@ public:
 signals:
     void toolChanged(montage::TimelineWidget::Tool tool);
     void clipActivated(montage::Id clip);  // double-click
+    void captionActivated(montage::Id track, int index);  // double-click on a caption
 
 protected:
     void paintEvent(QPaintEvent* e) override;
@@ -68,7 +69,7 @@ private:
         int y = 0;
         int h = 0;
     };
-    enum class HitKind { None, Ruler, Header, Body, ClipBody, ClipIn, ClipOut, Transition };
+    enum class HitKind { None, Ruler, Header, Body, ClipBody, ClipIn, ClipOut, Transition, CaptionLane, Caption, CaptionIn, CaptionOut };
     enum class HeaderButton { None, Target, Visible, Lock, Mute, Solo, Name };
     struct Hit {
         HitKind kind = HitKind::None;
@@ -77,8 +78,10 @@ private:
         Id transition = 0;
         HeaderButton button = HeaderButton::None;
         FrameTime frame = 0;
+        Id captionTrack = 0;
+        int caption = -1;
     };
-    enum class DragKind { None, Scrub, Move, Trim, Roll, Slip, Slide, Rubber, Pan };
+    enum class DragKind { None, Scrub, Move, Trim, Roll, Slip, Slide, Rubber, Pan, CaptionMove, CaptionIn, CaptionOut };
     struct DragState {
         DragKind kind = DragKind::None;
         QPoint pressPos;
@@ -96,6 +99,8 @@ private:
         int vOffsetAtPress = 0;
         QRect band;
         QString label;  // live readout (e.g. "+00:00:00:12")
+        Id captionTrack = 0;
+        int caption = -1;
     };
     struct Ghost {
         TrackRef track;
@@ -103,6 +108,8 @@ private:
         FrameTime duration = 0;
     };
 
+    int captionLanesHeight() const;
+    void paintCaptionLanes(QPainter& p);
     std::vector<Row> rows() const;
     int contentHeight() const;
     int dividerY() const;
@@ -135,6 +142,8 @@ private:
     Tool tool_ = Tool::Select;
     double ppf_ = 3.0;  // pixels per frame
     DragState drag_;
+    Id selectedCaptionTrack_ = 0;  // the caption last clicked
+    int selectedCaption_ = -1;
     FrameTime snapIndicator_ = -1;
     std::vector<Ghost> ghosts_;
     QList<QAction*> clipActions_;

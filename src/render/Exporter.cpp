@@ -66,12 +66,44 @@ AVPixelFormat defaultPixFmt(const ExportSettings& s, const std::string& c) {
     return AV_PIX_FMT_YUV420P;
 }
 
+// ISO 639-2 code for a caption track's ISO 639-1 language (MP4 and MKV store three letters).
+const char* iso639_2(const std::string& code) {
+    static const std::pair<const char*, const char*> table[] = {
+        {"en", "eng"}, {"es", "spa"}, {"fr", "fra"}, {"de", "deu"}, {"it", "ita"}, {"pt", "por"}, {"nl", "nld"},
+        {"pl", "pol"}, {"sv", "swe"}, {"da", "dan"}, {"no", "nor"}, {"fi", "fin"}, {"cs", "ces"}, {"el", "ell"},
+        {"tr", "tur"}, {"ru", "rus"}, {"uk", "ukr"}, {"ar", "ara"}, {"he", "heb"}, {"hi", "hin"}, {"id", "ind"},
+        {"vi", "vie"}, {"th", "tha"}, {"ja", "jpn"}, {"ko", "kor"}, {"zh", "zho"}, {"cy", "cym"}, {"ga", "gle"}};
+    for (const auto& [two, three] : table)
+        if (code == two) return three;
+    return code.size() == 3 ? code.c_str() : nullptr;
+}
+
+// Text subtitle encoders take ASS events and need an ASS header with a Default style.
+const char* kAssHeader =
+    "[Script Info]\r\nScriptType: v4.00+\r\nPlayResX: 384\r\nPlayResY: 288\r\nScaledBorderAndShadow: yes\r\n\r\n"
+    "[V4+ Styles]\r\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, "
+    "Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, "
+    "MarginR, MarginV, Encoding\r\nStyle: Default,Arial,16,&Hffffff,&Hffffff,&H0,&H0,0,0,0,0,100,100,0,0,1,1,0,2,10,10,10,1"
+    "\r\n\r\n[Events]\r\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\r\n";
+
+std::string assText(const std::string& text) {
+    std::string out;
+    for (char c : text) {
+        if (c == '\n') out += "\\N";
+        else if (c == '\\' || c == '{' || c == '}') (out += '\\') += c;
+        else if (c != '\r') out += c;
+    }
+    return out;
+}
+
 struct Output {
     AVFormatContext* oc = nullptr;
     AVCodecContext* vctx = nullptr;
     AVCodecContext* actx = nullptr;
+    AVCodecContext* sctx = nullptr;
     AVStream* vst = nullptr;
     AVStream* ast = nullptr;
+    AVStream* sst = nullptr;
     SwsContext* sws = nullptr;
     AVFrame* vframe = nullptr;
     AVFrame* aframe = nullptr;
@@ -84,6 +116,7 @@ struct Output {
         av_packet_free(&pkt);
         avcodec_free_context(&vctx);
         avcodec_free_context(&actx);
+        avcodec_free_context(&sctx);
         if (oc) {
             if (!(oc->oformat->flags & AVFMT_NOFILE) && oc->pb) avio_closep(&oc->pb);
             avformat_free_context(oc);
@@ -294,6 +327,33 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     }
     if (o.actx && o.actx->sample_rate != sr && s.audioCodec != "libopus") return fail("Unsupported sample rate");
 
+    // Captions as a subtitle stream, in the text format the container takes.
+    const CaptionTrack* captions = (s.embedCaptions || s.burnInCaptions) ? captionTrackFor(seq, s.captionTrack) : nullptr;
+    if (s.embedCaptions && captions && !captions->captions.empty()) {
+        AVCodecID id = AV_CODEC_ID_NONE;
+        for (AVCodecID c : {AV_CODEC_ID_MOV_TEXT, AV_CODEC_ID_SUBRIP, AV_CODEC_ID_WEBVTT})
+            if (avformat_query_codec(o.oc->oformat, c, FF_COMPLIANCE_NORMAL) == 1) {
+                id = c;
+                break;
+            }
+        if (id == AV_CODEC_ID_NONE) return fail("This file type cannot hold captions; export them as a sidecar file instead");
+        const AVCodec* codec = avcodec_find_encoder(id);
+        if (!codec) return fail("Caption encoder not available");
+        o.sctx = avcodec_alloc_context3(codec);
+        o.sctx->time_base = AVRational{1, 1000};
+        const size_t headerLen = std::char_traits<char>::length(kAssHeader);
+        o.sctx->subtitle_header = static_cast<uint8_t*>(av_mallocz(headerLen + 1));
+        std::copy(kAssHeader, kAssHeader + headerLen, o.sctx->subtitle_header);
+        o.sctx->subtitle_header_size = int(headerLen);
+        if (o.oc->oformat->flags & AVFMT_GLOBALHEADER) o.sctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+        if ((rc = avcodec_open2(o.sctx, codec, nullptr)) < 0) return fail("Cannot open caption encoder: " + averr(rc));
+        o.sst = avformat_new_stream(o.oc, nullptr);
+        avcodec_parameters_from_context(o.sst->codecpar, o.sctx);
+        o.sst->time_base = o.sctx->time_base;
+        if (const char* lang = iso639_2(captions->language)) av_dict_set(&o.sst->metadata, "language", lang, 0);
+        if (!captions->name.empty()) av_dict_set(&o.sst->metadata, "title", captions->name.c_str(), 0);
+    }
+
     if (!(o.oc->oformat->flags & AVFMT_NOFILE)) {
         if ((rc = avio_open(&o.oc->pb, s.path.c_str(), AVIO_FLAG_WRITE)) < 0)
             return fail("Cannot write " + s.path + ": " + averr(rc));
@@ -367,6 +427,41 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         return true;
     };
 
+    // Writes the captions that start before frame `until` (export range only).
+    size_t nextCaption = captions && o.sst ? captionIndexAt(*captions, in) : 0;
+    std::vector<uint8_t> subBuf(1 << 16);
+    auto writeCaptions = [&](FrameTime until) -> bool {
+        if (!o.sst) return true;
+        const double msPerFrame = 1000.0 / seq.fpsValue();
+        for (; nextCaption < captions->captions.size() && captions->captions[nextCaption].start < until; ++nextCaption) {
+            const Caption& c = captions->captions[nextCaption];
+            const FrameTime a = std::max(c.start, in), b = std::min(c.end, out);
+            if (b <= a) continue;
+            const int64_t startMs = std::llround(double(a - in) * msPerFrame);
+            const int64_t durMs = std::max<int64_t>(1, std::llround(double(b - a) * msPerFrame));
+            AVSubtitle sub{};
+            sub.format = 1;  // text
+            sub.pts = av_rescale_q(startMs, AVRational{1, 1000}, AV_TIME_BASE_Q);
+            sub.end_display_time = uint32_t(durMs);
+            sub.num_rects = 1;
+            sub.rects = static_cast<AVSubtitleRect**>(av_mallocz(sizeof(AVSubtitleRect*)));
+            sub.rects[0] = static_cast<AVSubtitleRect*>(av_mallocz(sizeof(AVSubtitleRect)));
+            sub.rects[0]->type = SUBTITLE_ASS;
+            sub.rects[0]->ass = av_strdup(("0,0,Default,,0,0,0,," + assText(c.text)).c_str());
+            const int n = avcodec_encode_subtitle(o.sctx, subBuf.data(), int(subBuf.size()), &sub);
+            avsubtitle_free(&sub);
+            if (n < 0) return false;
+            av_packet_unref(o.pkt);
+            if (av_new_packet(o.pkt, n) < 0) return false;
+            std::copy(subBuf.begin(), subBuf.begin() + n, o.pkt->data);
+            o.pkt->pts = o.pkt->dts = av_rescale_q(startMs, AVRational{1, 1000}, o.sst->time_base);
+            o.pkt->duration = av_rescale_q(durMs, AVRational{1, 1000}, o.sst->time_base);
+            o.pkt->stream_index = o.sst->index;
+            if (av_interleaved_write_frame(o.oc, o.pkt) < 0) return false;
+        }
+        return true;
+    };
+
     const int64_t total = out - in;
     RenderOptions ro;
     ro.scale = double(W) / seq.width;
@@ -374,8 +469,10 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     ro.useProxies = s.useProxies;
     for (FrameTime f = in; f < out; ++f) {
         if (cancel && cancel->load()) return fail("Export cancelled");
+        if (!writeCaptions(f + 1)) return fail("Writing captions failed");
         if (wantVideo) {
             Image img = s.alpha ? renderSequenceFrame(p, seq, f, ro) : renderProgramFrame(p, seq, f, ro);
+            if (s.burnInCaptions && captions) drawCaption(img, *captions, f);
             toRgba16(img, rgba16);
             AVPixelFormat srcFmt = AV_PIX_FMT_RGBA64LE;
             o.sws = sws_getCachedContext(o.sws, img.width, img.height, srcFmt, W, H, o.vctx->pix_fmt,

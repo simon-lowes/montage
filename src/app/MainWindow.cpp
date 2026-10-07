@@ -44,6 +44,7 @@
 #include "InspectorWidget.h"
 #include "MediaBinWidget.h"
 #include "MixerPanel.h"
+#include "CaptionsPanel.h"
 #include "MonitorPanel.h"
 #include "PlaybackController.h"
 #include "PluginManagerDialog.h"
@@ -194,6 +195,7 @@ void MainWindow::buildPanels() {
     inspector_ = new InspectorWidget(state_, this);
     scopes_ = new ScopesWidget(this);
     mixer_ = new MixerPanel(state_, this);
+    captions_ = new CaptionsPanel(state_, this);
     meter_ = new AudioMeterWidget(this);
 
     sourceDock_ = makeDock(tr("Source"), "source", sourcePanel_);
@@ -203,6 +205,12 @@ void MainWindow::buildPanels() {
     effectsDock_ = makeDock(tr("Effects"), "effects", effects_);
     scopesDock_ = makeDock(tr("Scopes"), "scopes", scopes_);
     mixerDock_ = makeDock(tr("Audio Mixer"), "mixer", mixer_);
+    captionsDock_ = makeDock(tr("Captions"), "captions", captions_);
+    connect(timeline_, &TimelineWidget::captionActivated, this, [this](Id track, int index) {
+        captionsDock_->show();
+        captionsDock_->raise();
+        captions_->editCaption(track, index);
+    });
     meterDock_ = makeDock(tr("Meters"), "meters", meter_);
     resetLayout();
 }
@@ -221,6 +229,7 @@ void MainWindow::resetLayout() {
     tabifyDockWidget(sourceDock_, inspectorDock_);
     tabifyDockWidget(sourceDock_, scopesDock_);
     tabifyDockWidget(sourceDock_, mixerDock_);
+    tabifyDockWidget(sourceDock_, captionsDock_);
     sourceDock_->raise();
     addDockWidget(Qt::LeftDockWidgetArea, binDock_);
     tabifyDockWidget(binDock_, effectsDock_);

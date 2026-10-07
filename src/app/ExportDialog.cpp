@@ -175,6 +175,13 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     form->addRow(tr("Size:"), matchSize_);
     form->addRow(QString(), sizeRow);
     form->addRow(tr("Quality (CRF):"), quality_);
+    captions_ = new QComboBox(form_);
+    captions_->addItem(tr("None"), 0);
+    captions_->addItem(tr("Burn into the picture"), 1);
+    captions_->addItem(tr("Embed as a subtitle track"), 2);
+    captions_->addItem(tr("Burn in and embed"), 3);
+    captions_->setCurrentIndex(std::clamp(appSettings().value("export/captions", 0).toInt(), 0, 3));
+    form->addRow(tr("Captions:"), captions_);
     form->addRow(tr("Summary:"), summary_);
 
     progress_ = new QProgressBar(this);
@@ -333,6 +340,11 @@ void ExportDialog::updateControls() {
     width_->setEnabled(video && !matchSize_->isChecked());
     height_->setEnabled(video && !matchSize_->isChecked());
     quality_->setEnabled(p && usesCrf(p->settings.videoCodec));
+    const Sequence* seq = state_ ? state_->sequence() : nullptr;
+    const CaptionTrack* ct = seq ? captionTrackFor(*seq) : nullptr;
+    captions_->setEnabled(video && ct && !ct->captions.empty());
+    captions_->setToolTip(captions_->isEnabled() ? tr("Uses the caption track \"%1\"").arg(QString::fromStdString(ct->name))
+                                                 : tr("Add a visible caption track (Captions panel) to export captions"));
 
     FrameTime in = 0, out = 0;
     const bool canExport = p && state_ && state_->sequence() && rangeFrames(in, out) && !path_->text().trimmed().isEmpty();
@@ -435,6 +447,12 @@ void ExportDialog::startExport() {
         s.height = height_->value();
     }
     if (usesCrf(s.videoCodec)) s.crf = quality_->value();
+    if (captions_->isEnabled()) {
+        const int mode = captions_->currentData().toInt();
+        s.burnInCaptions = mode & 1;
+        s.embedCaptions = mode & 2;
+    }
+    settings.setValue("export/captions", captions_->currentIndex());
     if (rangeIsInOut()) {
         s.in = in;
         s.out = out;

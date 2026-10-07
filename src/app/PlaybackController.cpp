@@ -32,6 +32,7 @@ public:
         double scale = 1;
         bool proxies = false;
         int direction = 0;  // playback step (+1, -2 ...), 0 when paused
+        bool captions = false;
     };
     void request(const Request& r) {
         {
@@ -50,7 +51,8 @@ private:
     static constexpr size_t kMaxCached = 48;
 
     bool sameContext(const Request& r) const {
-        return r.project == ctx_.project && r.sequence == ctx_.sequence && r.scale == ctx_.scale && r.proxies == ctx_.proxies;
+        return r.project == ctx_.project && r.sequence == ctx_.sequence && r.scale == ctx_.scale && r.proxies == ctx_.proxies &&
+               r.captions == ctx_.captions;
     }
 
     QImage render(const Request& r, FrameTime t) {
@@ -59,6 +61,7 @@ private:
         RenderOptions o;
         o.scale = r.scale;
         o.useProxies = r.proxies;
+        o.captions = r.captions;
         Image img = renderProgramFrame(*r.project, *s, t, o);
         std::vector<uint8_t> rgba = toRgba8(img);
         return QImage(rgba.data(), img.width, img.height, img.width * 4, QImage::Format_RGBA8888).copy();
@@ -243,6 +246,11 @@ void PlaybackController::setUseProxies(bool on) {
     requestFrame();
 }
 
+void PlaybackController::setShowCaptions(bool on) {
+    showCaptions_ = on;
+    requestFrame();
+}
+
 int PlaybackController::playStep() const {
     if (speed_ == 0) return 0;
     int step = int(std::lround(speed_));
@@ -254,7 +262,7 @@ FrameTime PlaybackController::clampToSequence(FrameTime t) const { return std::m
 void PlaybackController::requestFrame() {
     if (!sequence()) return;
     // Paused frames render at full quality; playback uses the preview scale.
-    worker_->request({project_, sequenceId_, position_, isPlaying() ? scale_ : 1.0, useProxies_, playStep()});
+    worker_->request({project_, sequenceId_, position_, isPlaying() ? scale_ : 1.0, useProxies_, playStep(), showCaptions_});
 }
 
 void PlaybackController::seek(FrameTime t) {
@@ -403,7 +411,7 @@ void PlaybackController::tick() {
     }
     if (t != position_) {
         position_ = t;
-        worker_->request({project_, sequenceId_, t, scale_, useProxies_, playStep()});
+        worker_->request({project_, sequenceId_, t, scale_, useProxies_, playStep(), showCaptions_});
         emit positionChanged(t);
     }
 }

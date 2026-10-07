@@ -40,6 +40,9 @@ public:
     // Decode proxies instead of the original media where available.
     void setUseProxies(bool on);
     bool useProxies() const { return useProxies_; }
+    // Draw the sequence's visible caption track (program monitor only).
+    void setShowCaptions(bool on);
+    bool showCaptions() const { return showCaptions_; }
 
     bool isPlaying() const { return speed_ != 0; }
     double speed() const { return speed_; }
@@ -82,6 +85,7 @@ private:
     Id sequenceId_ = 0;
     double scale_ = 0.5;
     bool useProxies_ = false;
+    bool showCaptions_ = false;
     double speed_ = 0;
     bool loop_ = false;
     FrameTime position_ = 0;

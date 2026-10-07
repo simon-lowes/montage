@@ -4,6 +4,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 
+#include "core/Captions.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
 #include "core/History.h"
@@ -57,6 +58,130 @@ struct Fixture {
 class TestCore : public QObject {
     Q_OBJECT
 private slots:
+    void captionTracks() {
+        // Wrapping: short text stays on one line; long text splits into two balanced lines.
+        QCOMPARE(QString::fromStdString(wrapCaptionText("Hello there")), QString("Hello there"));
+        const QString two = QString::fromStdString(
+            wrapCaptionText("And so, my fellow Americans, ask not what your country can do for you"));
+        const QStringList lines = two.split('\n');
+        QCOMPARE(lines.size(), 2);
+        QVERIFY(lines[0].size() <= 42 && lines[1].size() <= 42);
+        QVERIFY2(lines[0].endsWith(','), qPrintable(two));  // breaks after punctuation
+
+        // Lookup and normalisation.
+        CaptionTrack tr;
+        tr.captions = {{30, 60, "b"}, {0, 40, "a"}, {70, 70, "empty length"}, {80, 90, "  "}};
+        normalizeCaptions(tr.captions);
+        QCOMPARE(tr.captions.size(), size_t(2));
+        QCOMPARE(tr.captions[0].end, FrameTime(30));  // trimmed to the next caption
+        QCOMPARE(captionAt(tr, 10)->text, std::string("a"));
+        QCOMPARE(captionAt(tr, 30)->text, std::string("b"));
+        QVERIFY(!captionAt(tr, 60));
+        QCOMPARE(captionIndexAt(tr, 35), size_t(1));
+        QCOMPARE(captionIndexAt(tr, 65), size_t(2));
+
+        // SubRip and WebVTT, out and back in.
+        const Rational fps{25, 1};
+        std::vector<Caption> caps = {{25, 75, "First line\nsecond line"}, {100, 150, "Second caption"}};
+        const std::string srt = captionsToSrt(caps, fps);
+        QVERIFY(srt.find("00:00:01,000 --> 00:00:03,000\nFirst line\nsecond line") != std::string::npos);
+        std::vector<Caption> back;
+        QVERIFY(parseSubtitles(srt, fps, back));
+        QCOMPARE(back, caps);
+        QVERIFY(parseSubtitles(captionsToVtt(caps, fps), fps, back));
+        QCOMPARE(back, caps);
+        const std::string vtt =
+            "\xEF\xBB\xBFWEBVTT - a title\r\n\r\nNOTE a comment\r\n\r\nSTYLE\r\n::cue { color: yellow }\r\n\r\n"
+            "intro\r\n00:01.000 --> 00:02.500 align:start position:10%\r\n<v Roger>Hi &amp; <i>welcome</i>\r\n\r\n"
+            "00:00:03.000 --> 00:00:04.000\r\n{\\an8}Top\r\n";
+        QVERIFY(parseSubtitles(vtt, fps, back));
+        QCOMPARE(back.size(), size_t(2));
+        QCOMPARE(back[0].start, FrameTime(25));
+        QCOMPARE(back[0].end, FrameTime(63));  // 2.5 s at 25 fps, rounded
+        QCOMPARE(back[0].text, std::string("Hi & welcome"));
+        QCOMPARE(back[1].text, std::string("Top"));
+        std::string err;
+        QVERIFY(!parseSubtitles("not subtitles at all", fps, back, &err));
+        QVERIFY(!err.empty());
+
+        // Scenarist SCC: pop-on loading, bottom row, parity, drop-frame timecodes.
+        const std::string scc = captionsToScc({{30, 90, "HI"}, {300, 360, "Two\nlines"}}, Rational{30000, 1001});
+        QVERIFY(scc.rfind("Scenarist_SCC V1.0\n", 0) == 0);
+        // "HI" is the only row: preamble 9470 (row 15), tab offset to column 15, then 'H' (c8) 'I' (49).
+        QVERIFY2(scc.find("9420 9420 94ae 94ae 9476 9476 9723 9723 c849 942f 942f") != std::string::npos, scc.c_str());
+        // Caption 1 shows at frame 30: 11 pairs loaded from frame 20; cleared at 90.
+        QVERIFY2(scc.find("\n00:00:00;20\t9420") != std::string::npos, scc.c_str());
+        QVERIFY2(scc.find("\n00:00:03;00\t942c 942c") != std::string::npos, scc.c_str());
+        // Explicit lines go on rows 14 and 15: "Two" at column 14, "lines" at column 13.
+        QVERIFY2(scc.find("94d6 94d6 97a2 97a2") != std::string::npos, scc.c_str());
+        QVERIFY2(scc.find("9476 9476 97a1 97a1") != std::string::npos, scc.c_str());
+        // Characters outside the basic set: é is basic (5c); Ü is extended (fallback U then 92a4).
+        const std::string accents = captionsToScc({{0, 30, "\xC3\xA9\xC3\x9C"}}, Rational{30000, 1001});
+        QVERIFY2(accents.find("dcd5 92a4 92a4") != std::string::npos, accents.c_str());
+
+        // Project files keep caption tracks.
+        Project p = makeDefaultProject();
+        CaptionTrack ct;
+        ct.id = p.newId();
+        ct.name = "English";
+        ct.style.size = 0.07;
+        ct.style.boxOpacity = 0;
+        ct.captions = caps;
+        p.active()->captionTracks.push_back(ct);
+        Project q;
+        QVERIFY(projectFromJson(projectToJson(p), q));
+        QCOMPARE(q.active()->captionTracks, p.active()->captionTracks);
+    }
+
+    void captionsFromClipTranscripts() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = {25, 1};
+        MediaItem m;
+        m.id = p.newId();
+        m.kind = MediaKind::Audio;
+        m.hasAudio = true;
+        m.duration = 20;
+        m.name = "talk.wav";
+        auto t = std::make_shared<Transcript>();
+        TranscriptSegment seg;
+        const char* words[] = {"One", "two", "three.", "Four", "five", "six."};
+        for (int i = 0; i < 6; ++i) seg.words.push_back({2.0 + i * 0.5, 2.4 + i * 0.5, words[i], 1});
+        t->segments.push_back(seg);
+        m.transcript = t;
+        p.media.push_back(m);
+        // The clip starts 2.5 s into the media (skipping "One"), at timeline frame 100, at double speed.
+        Clip c;
+        c.id = p.newId();
+        c.mediaId = m.id;
+        c.start = 100;
+        c.duration = 50;
+        c.sourceIn = 2.5 * 25;
+        c.speed = 2.0;
+        s.audioTracks.at(0).clips.push_back(c);
+        // A linked copy on A2 counts once; a muted track does not count.
+        while (s.audioTracks.size() < 3) s.audioTracks.push_back(Track{p.newId(), TrackKind::Audio, "A"});
+        Clip copy = c;
+        copy.id = p.newId();
+        s.audioTracks[1].clips.push_back(copy);
+        Clip muted = c;
+        muted.id = p.newId();
+        muted.start = 400;
+        s.audioTracks[2].clips.push_back(muted);
+        s.audioTracks[2].muted = true;
+
+        auto caps = captionsFromTranscripts(p, s);
+        QCOMPARE(caps.size(), size_t(1));
+        QCOMPARE(QString::fromStdString(caps[0].text), QString("two three. Four five six."));
+        // "two" is at 2.5 s in the media = 0 s into the clip = frame 100; "six." ends at 4.9 s = 2.4 s
+        // of source = 1.2 s of timeline = frame 130.
+        QCOMPARE(caps[0].start, FrameTime(100));
+        QCOMPARE(caps[0].end, FrameTime(130));
+        // Without transcripts there is nothing to caption.
+        p.media[0].transcript.reset();
+        QVERIFY(captionsFromTranscripts(p, s).empty());
+    }
+
     void transcriptsCaptionsAndSearch() {
         Transcript t;
         t.language = "en";
