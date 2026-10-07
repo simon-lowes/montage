@@ -38,9 +38,9 @@ verified run.
 - [x] Offscreen GUI integration tests (test_app)
 
 ## Polish before calling the MVP done
-- [ ] Playback: render ahead and cache frames so playback and stepping are smooth
-- [ ] Audio scrubbing while dragging the playhead
-- [ ] Keyframe markers on timeline clips
+- [x] Playback: render ahead and cache frames so playback and stepping are smooth
+- [x] Audio scrubbing while dragging the playhead
+- [x] Keyframe markers on timeline clips
 - [ ] Correctness review of edit operations, playback and export; fix findings
 
 ## Delivery

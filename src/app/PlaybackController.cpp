@@ -10,13 +10,16 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <map>
 
 #include "render/Compositor.h"
 
 namespace montage {
 
 // ---------------------------------------------------------------------------
-// Renders frames on a background thread; only the newest request is served.
+// Renders frames on a background thread. Only the newest request is served;
+// while playing, idle time renders the frames ahead of the playhead into a
+// small cache so playback keeps up with complex timelines.
 
 class RenderWorker : public QObject {
     Q_OBJECT
@@ -27,6 +30,7 @@ public:
         FrameTime frame = 0;
         double scale = 1;
         bool proxies = false;
+        int direction = 0;  // playback step (+1, -2 ...), 0 when paused
     };
     void request(const Request& r) {
         {
@@ -41,6 +45,24 @@ signals:
     void rendered(const QImage& image, montage::FrameTime t);
 
 private:
+    static constexpr int kAhead = 24;
+    static constexpr size_t kMaxCached = 48;
+
+    bool sameContext(const Request& r) const {
+        return r.project == ctx_.project && r.sequence == ctx_.sequence && r.scale == ctx_.scale && r.proxies == ctx_.proxies;
+    }
+
+    QImage render(const Request& r, FrameTime t) {
+        const Sequence* s = r.project->findSequence(r.sequence);
+        if (!s) return {};
+        RenderOptions o;
+        o.scale = r.scale;
+        o.useProxies = r.proxies;
+        Image img = renderProgramFrame(*r.project, *s, t, o);
+        std::vector<uint8_t> rgba = toRgba8(img);
+        return QImage(rgba.data(), img.width, img.height, img.width * 4, QImage::Format_RGBA8888).copy();
+    }
+
     void process() {
         Request r;
         {
@@ -50,20 +72,59 @@ private:
             has_ = false;
         }
         if (!r.project) return;
-        const Sequence* s = r.project->findSequence(r.sequence);
+        if (!sameContext(r)) {
+            cache_.clear();
+            ctx_ = r;
+        }
+        ctx_.direction = r.direction;
+        ctx_.frame = r.frame;
+        auto it = cache_.find(r.frame);
+        QImage img = it != cache_.end() ? it->second : render(r, r.frame);
+        if (img.isNull()) return;
+        cache_[r.frame] = img;
+        emit rendered(img, r.frame);
+        trim();
+        if (r.direction != 0) QMetaObject::invokeMethod(this, &RenderWorker::prefetch, Qt::QueuedConnection);
+    }
+
+    // Renders one missing frame ahead of the playhead, then yields so new
+    // requests are always served first.
+    void prefetch() {
+        {
+            QMutexLocker lock(&m_);
+            if (has_) return;
+        }
+        if (ctx_.direction == 0 || !ctx_.project) return;
+        const Sequence* s = ctx_.project->findSequence(ctx_.sequence);
         if (!s) return;
-        RenderOptions o;
-        o.scale = r.scale;
-        o.useProxies = r.proxies;
-        Image img = renderProgramFrame(*r.project, *s, r.frame, o);
-        std::vector<uint8_t> rgba = toRgba8(img);
-        QImage q(rgba.data(), img.width, img.height, img.width * 4, QImage::Format_RGBA8888);
-        emit rendered(q.copy(), r.frame);
+        FrameTime end = s->duration();
+        for (int k = 1; k <= kAhead; ++k) {
+            FrameTime t = ctx_.frame + FrameTime(k) * ctx_.direction;
+            if (t < 0 || t >= end) return;
+            if (cache_.count(t)) continue;
+            QImage img = render(ctx_, t);
+            if (img.isNull()) return;
+            cache_[t] = img;
+            trim();
+            QMetaObject::invokeMethod(this, &RenderWorker::prefetch, Qt::QueuedConnection);
+            return;
+        }
+    }
+
+    // Drops cached frames furthest from the playhead.
+    void trim() {
+        while (cache_.size() > kMaxCached) {
+            auto first = cache_.begin(), last = std::prev(cache_.end());
+            if (std::llabs(first->first - ctx_.frame) > std::llabs(last->first - ctx_.frame)) cache_.erase(first);
+            else cache_.erase(last);
+        }
     }
 
     QMutex m_;
     Request pending_;
     bool has_ = false;
+    Request ctx_;  // context of the cached frames (render-thread only)
+    std::map<FrameTime, QImage> cache_;
 };
 
 // ---------------------------------------------------------------------------
@@ -181,12 +242,18 @@ void PlaybackController::setUseProxies(bool on) {
     requestFrame();
 }
 
+int PlaybackController::playStep() const {
+    if (speed_ == 0) return 0;
+    int step = int(std::lround(speed_));
+    return step == 0 ? (speed_ > 0 ? 1 : -1) : step;
+}
+
 FrameTime PlaybackController::clampToSequence(FrameTime t) const { return std::max<FrameTime>(0, t); }
 
 void PlaybackController::requestFrame() {
     if (!sequence()) return;
     // Paused frames render at full quality; playback uses the preview scale.
-    worker_->request({project_, sequenceId_, position_, isPlaying() ? scale_ : 1.0, useProxies_});
+    worker_->request({project_, sequenceId_, position_, isPlaying() ? scale_ : 1.0, useProxies_, playStep()});
 }
 
 void PlaybackController::seek(FrameTime t) {
@@ -200,7 +267,52 @@ void PlaybackController::seek(FrameTime t) {
         if (speed_ == 1) startAudio(t);
     }
     requestFrame();
+    if (!playing) scrubAudio(t);
     emit positionChanged(position_);
+}
+
+void PlaybackController::scrubAudio(FrameTime t) {
+    const Sequence* s = sequence();
+    if (!scrubbing_ || !s || s->audioTracks.empty()) return;
+    if (!scrubSink_) {
+        QAudioDevice dev = QMediaDevices::defaultAudioOutput();
+        if (dev.isNull()) {
+            scrubbing_ = false;  // no output device: don't try again
+            return;
+        }
+        QAudioFormat fmt;
+        fmt.setSampleRate(s->sampleRate);
+        fmt.setChannelCount(2);
+        fmt.setSampleFormat(QAudioFormat::Int16);
+        if (!dev.isFormatSupported(fmt)) {
+            scrubbing_ = false;
+            return;
+        }
+        scrubSink_ = new QAudioSink(dev, fmt, this);
+        scrubSink_->setBufferSize(fmt.bytesForDuration(150000));
+        scrubIo_ = scrubSink_->start();
+        scrubRate_ = s->sampleRate;
+        if (!scrubIo_) return;
+    }
+    if (!scrubIo_ || scrubRate_ != s->sampleRate) return;
+    // One frame of audio (at least 40 ms), faded at both ends to avoid clicks.
+    int frames = std::max(int(s->sampleRate / s->fpsValue()), s->sampleRate / 25);
+    if (scrubSink_->bytesFree() < frames * 4) return;  // still playing the previous snippet
+    std::vector<float> mix(size_t(frames) * 2);
+    int64_t start = int64_t(std::llround(double(t) * s->sampleRate / s->fpsValue()));
+    scrubMixer_.reset();
+    scrubMixer_.setNonBlocking(true);
+    scrubMixer_.mix(*project_, *s, start, frames, mix.data());
+    std::vector<int16_t> pcm(mix.size());
+    const int fade = std::min(frames / 4, 240);
+    for (int i = 0; i < frames; ++i) {
+        float g = 1.0f;
+        if (i < fade) g = float(i) / fade;
+        if (i >= frames - fade) g = float(frames - 1 - i) / fade;
+        for (int c = 0; c < 2; ++c)
+            pcm[size_t(i) * 2 + size_t(c)] = int16_t(std::lround(std::clamp(mix[size_t(i) * 2 + size_t(c)] * g, -1.0f, 1.0f) * 32767));
+    }
+    scrubIo_->write(reinterpret_cast<const char*>(pcm.data()), qint64(pcm.size() * sizeof(int16_t)));
 }
 
 void PlaybackController::step(int frames) {
@@ -281,7 +393,7 @@ void PlaybackController::tick() {
     }
     if (t != position_) {
         position_ = t;
-        worker_->request({project_, sequenceId_, t, scale_, useProxies_});
+        worker_->request({project_, sequenceId_, t, scale_, useProxies_, playStep()});
         emit positionChanged(t);
     }
 }

@@ -12,6 +12,7 @@
 #include <QToolTip>
 #include <QUrl>
 #include <cmath>
+#include <set>
 
 #include "EditorState.h"
 #include "Theme.h"
@@ -507,6 +508,28 @@ void TimelineWidget::paintClip(QPainter& p, const Row& row, const Clip& c, const
         // Unlinked A/V indicator.
         p.setPen(theme::kPlayhead);
         p.drawText(r.adjusted(0, 1, -4, 0), Qt::AlignRight | Qt::AlignTop, QString());
+    }
+    // Keyframe markers along the bottom edge.
+    if (r.width() > 24) {
+        std::set<FrameTime> keys;
+        auto collect = [&keys](const Effect& e) {
+            for (const auto& [n, param] : e.params)
+                for (const auto& k : param.keys) keys.insert(k.t);
+        };
+        collect(c.motion);
+        collect(c.audio);
+        collect(c.generator);
+        for (const auto& e : c.effects) collect(e);
+        p.setPen(Qt::NoPen);
+        p.setBrush(sel ? theme::kSnap : QColor(255, 255, 255, 150));
+        int y = r.bottom() - 5;
+        for (FrameTime k : keys) {
+            if (k < 0 || k >= c.duration) continue;
+            int x = xForFrame(c.start + k);
+            QPolygon d;
+            d << QPoint(x, y - 3) << QPoint(x + 3, y) << QPoint(x, y + 3) << QPoint(x - 3, y);
+            p.drawPolygon(d);
+        }
     }
     p.restore();
     if (sel) {

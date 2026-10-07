@@ -11,8 +11,10 @@
 #include <memory>
 
 #include "core/Model.h"
+#include "render/Compositor.h"
 
 class QAudioSink;
+class QIODevice;
 class QThread;
 
 namespace montage {
@@ -46,6 +48,8 @@ public:
     // Range playback (loops between in/out when enabled).
     void setLoop(bool on) { loop_ = on; }
     bool loop() const { return loop_; }
+    // Play a short audio snippet when seeking while paused (scrubbing).
+    void setAudioScrubbing(bool on) { scrubbing_ = on; }
 
 public slots:
     void play();                  // forward at 1x
@@ -71,6 +75,8 @@ private:
     void startAudio(FrameTime from);
     void stopAudio();
     FrameTime clampToSequence(FrameTime t) const;
+    int playStep() const;
+    void scrubAudio(FrameTime t);  // frames per tick direction for render-ahead (0 = paused)
 
     std::shared_ptr<const Project> project_;
     Id sequenceId_ = 0;
@@ -87,6 +93,11 @@ private:
     QAudioSink* sink_ = nullptr;
     MixerDevice* device_ = nullptr;
     bool audioClock_ = false;
+    bool scrubbing_ = true;
+    QAudioSink* scrubSink_ = nullptr;
+    QIODevice* scrubIo_ = nullptr;
+    int scrubRate_ = 0;
+    AudioMixer scrubMixer_;
 };
 
 }  // namespace montage
