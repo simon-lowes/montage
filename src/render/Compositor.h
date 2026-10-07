@@ -49,6 +49,9 @@ public:
              std::vector<MeterLevels>* trackLevels = nullptr);
     // Drop filter state (call after seeking).
     void reset();
+    // Real-time mode: media whose audio is not decoded yet plays as silence
+    // instead of blocking until decoding finishes.
+    void setNonBlocking(bool on) { nonBlocking_ = on; }
 
     struct State;  // per clip/effect DSP state
 
@@ -57,6 +60,7 @@ private:
                  std::vector<MeterLevels>* trackLevels, int depth);
     std::map<std::pair<Id, Id>, std::unique_ptr<State>> states_;
     std::mutex m_;
+    bool nonBlocking_ = false;
 };
 
 }  // namespace montage

@@ -509,7 +509,8 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
                 std::copy(nb.begin(), nb.end(), clipBuf.begin() + (s0 - start) * 2);
             } else {
                 if (!m->hasAudio) continue;
-                AudioBufferPtr buf = MediaPool::instance().audio(m->path, int(sr));
+                AudioBufferPtr buf = nonBlocking_ ? MediaPool::instance().audioIfReady(m->path, int(sr))
+                                                  : MediaPool::instance().audio(m->path, int(sr));
                 if (!buf || buf->samples.empty()) continue;
                 const int64_t n = buf->frames();
                 const float* src = buf->samples.data();

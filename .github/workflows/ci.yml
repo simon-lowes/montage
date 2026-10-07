@@ -13,7 +13,7 @@ jobs:
       - name: Install dependencies
         run: ./scripts/setup-deps.sh
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DMONTAGE_BUILD_APP=OFF
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DMONTAGE_BUILD_APP=ON
       - name: Build
         run: cmake --build build
       - name: Test

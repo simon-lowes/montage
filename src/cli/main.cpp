@@ -215,7 +215,7 @@ int cmdRender(const std::vector<std::string>& args) {
     if (!inTc.empty() && !parseTimecode(inTc, s->fps, st.in)) return usage();
     if (!outTc.empty() && !parseTimecode(outTc, s->fps, st.out)) return usage();
     if (st.in < 0 && s->inPoint >= 0) st.in = s->inPoint;
-    if (st.out < 0 && s->outPoint >= 0) st.out = s->outPoint;
+    if (st.out < 0 && s->outPoint >= 0) st.out = s->outPoint + 1;  // marks are inclusive
     std::signal(SIGINT, [](int) { gCancel = true; });
     std::string err;
     bool ok = exportSequence(

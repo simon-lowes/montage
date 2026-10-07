@@ -29,6 +29,8 @@ public:
     size_t undoCount() const { return undo_.size(); }
     // Increments whenever the history changes; used for "modified" tracking.
     uint64_t revision() const { return revision_; }
+    // Marks a change that is merged into the latest undo step (or not undoable).
+    void touch() { ++revision_; }
 
 private:
     struct Entry {

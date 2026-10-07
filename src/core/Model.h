@@ -176,7 +176,7 @@ struct Sequence {
     std::vector<Track> videoTracks;   // [0] = V1 (bottom-most)
     std::vector<Track> audioTracks;   // [0] = A1
     std::vector<Marker> markers;
-    FrameTime inPoint = -1;
+    FrameTime inPoint = -1;   // In / Out marks; both frames are included, -1 = unset
     FrameTime outPoint = -1;
     FrameTime playhead = 0;
 
