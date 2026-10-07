@@ -1,0 +1,123 @@
+name: Package
+
+# Builds the macOS DMG and the Windows installer + portable zip. Every run
+# uploads them as workflow artifacts; pushing a tag like v0.1.0 also
+# publishes them as a GitHub Release.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push waits for the running packaging run instead of cancelling it,
+# so each run reports both platforms.
+concurrency:
+  group: package-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  macos:
+    name: macOS DMG (Apple Silicon)
+    runs-on: macos-15
+    env:
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+      HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        # Only the Qt modules Montage uses; the "qt" formula installs all of Qt.
+        run: brew install qtbase qtmultimedia ffmpeg ninja pkgconf
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(brew --prefix)"
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Package
+        run: scripts/package-macos.sh build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: montage-macos
+          path: dist/*.dmg
+          if-no-files-found: error
+      - name: Launch the packaged app
+        timeout-minutes: 3
+        run: |
+          build/src/app/Montage.app/Contents/MacOS/Montage --screenshot montage-macos.png
+          test -s montage-macos.png
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshot-macos
+          path: montage-macos.png
+          if-no-files-found: ignore
+
+  windows:
+    name: Windows installer (x64)
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: zip
+          pacboy: >-
+            gcc:p cmake:p ninja:p pkgconf:p
+            qt6-base:p qt6-multimedia:p qt6-tools:p ffmpeg:p
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Package (portable zip)
+        run: scripts/package-windows.sh build
+      - name: Package (installer)
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path CMakeLists.txt -Pattern 'project\(Montage VERSION ([0-9.]+)').Matches[0].Groups[1].Value
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          & $iscc /Q "/DVersion=$version" packaging\windows\montage.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: montage-windows
+          path: |
+            dist/*.zip
+            dist/*-setup.exe
+          if-no-files-found: error
+      - name: Launch the packaged app
+        timeout-minutes: 3
+        run: |
+          dist/Montage/montage.exe --screenshot montage-windows.png
+          test -s montage-windows.png
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshot-windows
+          path: montage-windows.png
+          if-no-files-found: ignore
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [macos, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: montage-*
+          merge-multiple: true
+          path: dist
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "Montage ${GITHUB_REF_NAME#v}" --generate-notes
