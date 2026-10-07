@@ -5,6 +5,7 @@
 #include <QAbstractScrollArea>
 #include <QAction>
 #include <QComboBox>
+#include <QCheckBox>
 #include <QDockWidget>
 #include <QDoubleSpinBox>
 #include <QLineEdit>
@@ -17,6 +18,7 @@
 #include <QMenu>
 #include <QPainter>
 #include <QTableWidget>
+#include <QTextEdit>
 #include <QToolButton>
 #include <QTreeWidget>
 #include <algorithm>
@@ -36,6 +38,7 @@
 #include "PluginEditorWindow.h"
 #include "audio/PluginEffect.h"
 #include "MaskOverlay.h"
+#include "media/Diarizer.h"
 #include "media/Segmenter.h"
 #include "MonitorPanel.h"
 #include "PlaybackController.h"
@@ -1167,6 +1170,69 @@ private slots:
         QCOMPARE(FrameTime(c.sourceIn), FrameTime(std::floor(6.0 * fps)));
         QCOMPARE(c.duration, FrameTime(std::ceil(6.9 * fps)) - FrameTime(std::floor(6.0 * fps)));
         panel->setMode(TranscriptPanel::Mode::Sequence);
+        state()->newProject();
+        QApplication::processEvents();
+    }
+
+    void speakerLabelsInTranscriptPanel() {
+        // Two people: the panel names them at each change, in both modes.
+        state()->newProject();
+        auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        auto t = std::make_shared<Transcript>();
+        TranscriptSegment a, b, c;
+        a.words = {{0.5, 0.9, "Hello", 1}, {1.0, 1.4, "there.", 1}};
+        a.speaker = 0;
+        b.words = {{1.6, 2.0, "Hi", 1}, {2.1, 2.5, "back.", 1}};
+        b.speaker = 1;
+        c.words = {{2.7, 3.0, "Good.", 1}};
+        c.speaker = 0;
+        t->segments = {a, b, c};
+        QVERIFY(state()->edit("Transcript", [media, t](Project& p, Sequence&) {
+            p.findMedia(media)->transcript = t;
+            return true;
+        }));
+        auto* panel = win_->findChild<TranscriptPanel*>();
+        QVERIFY(panel);
+        auto* text = panel->findChild<QTextEdit*>();
+        QVERIFY(text);
+        state()->setSourceMedia(media);
+        panel->setMode(TranscriptPanel::Mode::Source);
+        QTRY_COMPARE(panel->words().size(), size_t(5));
+        QCOMPARE(panel->words()[2].speaker, std::string("Speaker 2"));
+        QString shown = text->toPlainText();
+        QVERIFY2(shown.indexOf("Speaker 1") == 0 && shown.indexOf("Speaker 2") > shown.indexOf("there."), qPrintable(shown));
+        QCOMPARE(shown.count("Speaker 1"), 2);  // again when they speak again
+        // Renaming is one undo step, and every label follows.
+        QVERIFY(panel->renameSpeaker("Speaker 1", "Ann"));
+        QCOMPARE(speakerName(*state()->project().findMedia(media)->transcript, 0), std::string("Ann"));
+        QTRY_VERIFY(text->toPlainText().count("Ann") == 2);
+        QVERIFY(!panel->renameSpeaker("Nobody", "Bob"));
+        state()->undo();
+        QTRY_VERIFY(text->toPlainText().count("Speaker 1") == 2);
+        state()->redo();
+        // In the cut, the names come from each clip's transcript.
+        QVERIFY(state()->apply("Place", [media](Project& p, Sequence& s) { return edit::placeMedia(p, s, media, 0, 0, -1, V1, A1, false); }));
+        panel->setMode(TranscriptPanel::Mode::Sequence);
+        QTRY_COMPARE(panel->words().size(), size_t(5));
+        QCOMPARE(panel->words()[0].speaker, std::string("Ann"));
+        QVERIFY(text->toPlainText().contains("Speaker 2"));
+        // The Transcribe dialog offers speaker labels (when this build can run them).
+        TranscribeDialog dlg(1, win_.get());
+        auto* label = dlg.findChild<QCheckBox*>("labelSpeakers");
+        auto* count = dlg.findChild<QComboBox*>("speakerCount");
+        QVERIFY(label && count);
+        QCOMPARE(label->isEnabled(), diarizerAvailable());
+        if (label->isEnabled()) {
+            label->setChecked(true);
+            count->setCurrentIndex(count->findData(2));
+            QVERIFY(dlg.options().speakers);
+            QCOMPARE(dlg.options().speakerCount, 2);
+            label->setChecked(false);
+            QVERIFY(!dlg.options().speakers);
+            QVERIFY(!count->isEnabled());
+        }
         state()->newProject();
         QApplication::processEvents();
     }

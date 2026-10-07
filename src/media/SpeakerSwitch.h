@@ -1,8 +1,9 @@
-// Montage — automatic multicam switching by who is speaking. Each speaker
-// angle listens to an audio track of the multicam sequence (usually that
-// person's microphone); the angle whose speaker is clearly loudest gets the
-// shot, a wide angle covers silence and cross-talk, and shots are held for a
-// minimum length so the cut does not chatter.
+// Montage — automatic multicam switching by who is speaking. Who speaks is
+// known either from microphones (each speaker angle listens to an audio
+// track of the multicam sequence, usually that person's mic, and the clearly
+// loudest one gets the shot) or from a transcript's speaker labels (one
+// recording is enough). A wide angle covers silence and cross-talk, and
+// shots are held for a minimum length so the cut does not chatter.
 #pragma once
 
 #include <atomic>
@@ -30,5 +31,15 @@ struct AutoSwitchOptions {
 std::vector<std::pair<FrameTime, int>> speakerAngleChanges(const Project& p, const Sequence& mc, const AutoSwitchOptions& o,
                                                            std::string* error = nullptr,
                                                            const std::atomic<bool>* cancel = nullptr);
+
+// Speaker turns heard on audio track `track` of the multicam sequence, from
+// its clips' labelled transcripts, in multicam sequence seconds. `speakers`
+// receives how many speakers the transcripts know.
+std::vector<SpeakerTurn> transcriptTurns(const Project& p, const Sequence& mc, int track, int* speakers = nullptr);
+// Angle changes from speaker turns: angleOfSpeaker[speaker] is the angle
+// that shows them (-1: no close-up). Shots follow `o` (listen is ignored).
+std::vector<std::pair<FrameTime, int>> turnAngleChanges(const Sequence& mc, const std::vector<SpeakerTurn>& turns,
+                                                        const std::vector<int>& angleOfSpeaker, const AutoSwitchOptions& o,
+                                                        std::string* error = nullptr);
 
 }  // namespace montage

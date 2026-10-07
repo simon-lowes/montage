@@ -59,7 +59,7 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
 - [x] 1. Crash-safe project history and recovery (S): live recovery copy after each edit, crash detection via session locks, recovery dialog that keeps the project path, plugin safe mode, rolling timestamped snapshots.
 - [x] 2. Hardware decode and encode (M): per-platform hwaccel decode with software fallback per stream and a decoder cap, Playback toggle; hardware H.264/H.265 presets that pick the first working encoder and fall back to x264/x265.
 - [x] 3. Audio plugin manager UI (S): Tools > Audio Plugins with on/off switches, status, blocklist with reasons, Rescan, Rescan Selected, Retry Blocked, extra search folders and a scan log; background scan at startup; probes run in parallel.
-- [x] 4. Transcription engine (M): whisper.cpp 1.9.5 built in, word timings, eight models from Tiny to Large v3 Turbo downloaded on first use, auto language detection and translation; Transcribe… in the media bin, transcripts saved in the project (undoable), media search by spoken words, SRT/VTT/TXT/JSON export; `montage-cli transcribe` and `models`. Speaker labels are still to do (the transcript format already has a speaker field).
+- [x] 4. Transcription engine (M): whisper.cpp 1.9.5 built in, word timings, eight models from Tiny to Large v3 Turbo downloaded on first use, auto language detection and translation; Transcribe… in the media bin, transcripts saved in the project (undoable), media search by spoken words, SRT/VTT/TXT/JSON export; `montage-cli transcribe` and `models`. Speaker labels followed (below).
 - [x] 5. Caption tracks (M): caption lanes on the timeline (move, retime, double-click to edit), generation from transcripts that follows trims, speed and mutes, a Captions panel (edit, add, split, merge, delete, style, rename, language), SubRip/WebVTT import, SubRip/WebVTT/SCC (CEA-608 pop-on, checked with FFmpeg's 608 decoder) export, viewer CC toggle, burn-in and embedded subtitle streams (mov_text, SubRip, WebVTT) on export; `montage-cli captions` and `render --burn-captions --embed-captions`. Not done yet: roll-up and paint-on 608, CEA-708, and captions following ripple edits.
 - [x] 6. VST3 hosting (M): MIT VST 3.8 SDK, crash-isolated probing, parameters, automation, two-blob state. Also done ahead of the list: crash-isolated scanning for CLAP/VST3/LV2/AU and CLAP hosting.
 - [x] 7. Transcript panel (M):
@@ -112,7 +112,8 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
   - Multicam panel with an angle grid (rendered off the UI thread): click or 1–9 to switch, live cuts while playing, Shift to cut when stopped, audio follows video.
   - Speaker-based Auto Switch: per-angle microphones, a wide angle for silence and cross-talk, margin, hold and shortest shot.
   - Timeline angle labels, angle and audio menus, and Flatten Multicam.
-  - Still to do: speaker labels from transcripts as an alternative to microphones, and multicam in EDL/OTIO export without flattening.
+  - Auto Switch can also follow a transcript's speaker labels (see "Beyond the roadmap"): one recording of everyone, with each speaker mapped to an angle.
+  - Still to do: multicam in EDL/OTIO export without flattening.
 - [ ] 15. GPU compositor on QRhi (XL). Deferred behind the user-facing items. The measured CPU fixes (threaded colour conversion, no redundant copies or zero-fills) took 1080p playback from 26 to 56 fps and the 1/2-resolution preview from 77 to 150 fps on 4 cores. A QRhi compositor needs Qt's private RHI headers on Ubuntu's Qt 6.4, shader baking on three platforms, and a GPU-less CI strategy.
 - [x] 16. Tracking and stabilisation (L):
   - Own tracker: Shi–Tomasi corners, pyramidal Lucas–Kanade with forward–backward checks, and RANSAC fits for translation, + scale, or similarity.
@@ -174,3 +175,22 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
     - in the app: click, Alt-click, Ctrl-click, box, undo/redo of a click with its segmentation, Track ▶, the inverted render, and save/reopen;
     - without it: the distance transform against brute force, sub-pixel edge placement, expansion, contraction and feather, frame lookup, and a project round trip.
   - Still to do: GPU execution providers (CoreML, DirectML), BiRefNet edge refinement, and more than one object per mask.
+
+# Beyond the roadmap
+
+- [x] Speaker labels (diarization):
+  - Pipeline: pyannote segmentation 3.0 (MIT) per 10 s window (1 s steps), then CAM++ embeddings (3D-Speaker, Apache-2.0) on Kaldi-compatible fbank features computed in Montage. Average-linkage clustering on cosine distance, by nearest-neighbour chains; stray clusters are folded into the nearest speaker, and a known speaker count is optional. Windows are stitched back frame by frame, as pyannote does.
+  - Models: ONNX Runtime, 36 MB downloaded on first use (pinned, SHA-256-checked).
+  - Transcribe… › Label speakers, and `montage-cli transcribe --speakers [N]`.
+    - Words are labelled, and segments are split where the speaker changes.
+    - The Transcript panel names the speakers (rename with a right-click, undoable). TXT exports are split by speaker, WebVTT gets voice tags, and caption cues break at speaker changes.
+  - Multicam Auto Switch can follow the labels instead of microphones.
+  - Tested:
+    - JFK, a pitched-up copy, then JFK again come out as speakers 1, 2, 1;
+    - clustering by threshold and by count;
+    - the fbank mel placement;
+    - labelling and splitting;
+    - the exports;
+    - the panel and rename in the app;
+    - switching from labels gives the same cuts as from microphones.
+- [x] Windows: Montage's own onnxruntime.dll is copied beside every program and test, because Windows' older one in System32 is found first. A C-API check reports a mismatched runtime instead of crashing.

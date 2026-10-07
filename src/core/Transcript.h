@@ -12,6 +12,7 @@ struct TranscriptWord {
     double end = 0;
     std::string text;  // without surrounding spaces
     float probability = 1;
+    std::string speaker;  // in word lists made for display: who says it (not saved; segments hold the speaker)
     bool operator==(const TranscriptWord&) const = default;
 };
 

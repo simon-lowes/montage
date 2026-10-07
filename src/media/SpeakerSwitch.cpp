@@ -13,6 +13,44 @@ namespace {
 constexpr int kRate = 4000;           // speech energy sits well below 2 kHz
 constexpr double kWindow = 0.05;      // seconds per analysis window
 constexpr int kSmooth = 6;            // windows averaged (0.3 s)
+
+// Shots from who has the floor in each window (an angle, -1 nobody, -2 several
+// people): follow the floor, hold each shot for the minimum, ignore blips.
+std::vector<std::pair<FrameTime, int>> shotsFromFloor(const std::vector<int>& floor, const AutoSwitchOptions& o, double fps) {
+    const int windows = int(floor.size());
+    const int minShot = std::max(1, int(std::lround(o.minShotSeconds / kWindow)));
+    const int hold = std::max(1, int(std::lround(o.holdSeconds / kWindow)));
+    auto wanted = [&](int w, int current) {
+        const int f = floor[size_t(w)];
+        if (f >= 0) return f;
+        return o.wideAngle >= 0 ? o.wideAngle : current;
+    };
+    int current = -1;
+    for (int w = 0; w < windows && current < 0; ++w)
+        if (floor[size_t(w)] >= 0) current = floor[size_t(w)];
+    if (current < 0) current = o.wideAngle >= 0 ? o.wideAngle : 0;
+    if (o.wideAngle >= 0 && floor[0] < 0) current = o.wideAngle;
+    std::vector<std::pair<FrameTime, int>> changes = {{0, current}};
+    int shotStart = 0;
+    int candidate = current, candidateStart = 0;
+    for (int w = 0; w < windows; ++w) {
+        const int want = wanted(w, current);
+        if (want != candidate) {
+            candidate = want;
+            candidateStart = w;
+        }
+        if (candidate == current) continue;
+        if (w - candidateStart + 1 < hold) continue;  // not yet sure
+        // Cut where the new speaker started, but not before the shot has run its minimum.
+        const int at = std::max(candidateStart, shotStart + minShot);
+        if (at > w) continue;
+        changes.push_back({FrameTime(std::llround(at * kWindow * fps)), candidate});
+        current = candidate;
+        shotStart = at;
+    }
+    return changes;
+}
+
 }  // namespace
 
 std::vector<std::pair<FrameTime, int>> speakerAngleChanges(const Project& p, const Sequence& mc, const AutoSwitchOptions& o,
@@ -98,38 +136,69 @@ std::vector<std::pair<FrameTime, int>> speakerAngleChanges(const Project& p, con
         else floor[size_t(w)] = bestDb - secondDb >= o.marginDb ? best : -2;
     }
 
-    // Shots: follow the floor, hold each shot for the minimum, ignore blips.
-    const int minShot = std::max(1, int(std::lround(o.minShotSeconds / kWindow)));
-    const int hold = std::max(1, int(std::lround(o.holdSeconds / kWindow)));
-    auto wanted = [&](int w, int current) {
-        const int f = floor[size_t(w)];
-        if (f >= 0) return f;
-        return o.wideAngle >= 0 ? o.wideAngle : current;
-    };
-    int current = -1;
-    for (int w = 0; w < windows && current < 0; ++w)
-        if (floor[size_t(w)] >= 0) current = floor[size_t(w)];
-    if (current < 0) current = o.wideAngle >= 0 ? o.wideAngle : 0;
-    if (o.wideAngle >= 0 && floor[0] < 0) current = o.wideAngle;
-    std::vector<std::pair<FrameTime, int>> changes = {{0, current}};
-    int shotStart = 0;
-    int candidate = current, candidateStart = 0;
-    for (int w = 0; w < windows; ++w) {
-        const int want = wanted(w, current);
-        if (want != candidate) {
-            candidate = want;
-            candidateStart = w;
+    return shotsFromFloor(floor, o, fps);
+}
+
+
+std::vector<SpeakerTurn> transcriptTurns(const Project& p, const Sequence& mc, int track, int* speakers) {
+    std::vector<SpeakerTurn> turns;
+    if (speakers) *speakers = 0;
+    if (track < 0 || track >= int(mc.audioTracks.size())) return turns;
+    const double fps = mc.fpsValue();
+    for (const Clip& c : mc.audioTracks[size_t(track)].clips) {
+        const MediaItem* m = c.mediaId ? p.findMedia(c.mediaId) : nullptr;
+        if (!m || !m->transcript || c.speed <= 0) continue;
+        if (speakers) *speakers = std::max(*speakers, speakerCount(*m->transcript));
+        // Media seconds to sequence seconds through this clip.
+        const double srcA = c.sourceIn / fps, srcB = srcA + c.sourceExtent() / fps;
+        auto toSeq = [&](double sec) { return (double(c.start) + (sec - srcA) * fps / c.speed) / fps; };
+        for (const auto& seg : m->transcript->segments) {
+            if (seg.speaker < 0) continue;
+            // Words are the speech itself (pauses between them are nobody speaking).
+            std::vector<std::pair<double, double>> spans;
+            if (seg.words.empty()) spans.push_back({seg.start, seg.end});
+            for (const auto& w : seg.words) spans.push_back({w.start, w.end});
+            for (auto [a, b] : spans) {
+                a = std::max(a, srcA);
+                b = std::min(b, srcB);
+                if (b <= a) continue;
+                SpeakerTurn t{toSeq(a), toSeq(b), seg.speaker};
+                if (!turns.empty() && turns.back().speaker == t.speaker && t.start - turns.back().end < 0.5)
+                    turns.back().end = std::max(turns.back().end, t.end);
+                else
+                    turns.push_back(t);
+            }
         }
-        if (candidate == current) continue;
-        if (w - candidateStart + 1 < hold) continue;  // not yet sure
-        // Cut where the new speaker started, but not before the shot has run its minimum.
-        const int at = std::max(candidateStart, shotStart + minShot);
-        if (at > w) continue;
-        changes.push_back({FrameTime(std::llround(at * kWindow * fps)), candidate});
-        current = candidate;
-        shotStart = at;
     }
-    return changes;
+    std::sort(turns.begin(), turns.end(), [](const SpeakerTurn& a, const SpeakerTurn& b) { return a.start < b.start; });
+    return turns;
+}
+
+std::vector<std::pair<FrameTime, int>> turnAngleChanges(const Sequence& mc, const std::vector<SpeakerTurn>& turns,
+                                                        const std::vector<int>& angleOfSpeaker, const AutoSwitchOptions& o,
+                                                        std::string* error) {
+    const double fps = mc.fpsValue();
+    const int windows = int(std::ceil(double(mc.duration()) / fps / kWindow));
+    if (windows <= 0) {
+        if (error) *error = "The multicam clip is empty";
+        return {};
+    }
+    if (std::none_of(angleOfSpeaker.begin(), angleOfSpeaker.end(), [](int a) { return a >= 0; })) {
+        if (error) *error = "No speaker has an angle: choose the angle that shows each person";
+        return {};
+    }
+    // Who has the floor in each window: the one person speaking, else nobody or several.
+    std::vector<int> floor(size_t(windows), -1);
+    for (const SpeakerTurn& t : turns) {
+        const int angle = t.speaker >= 0 && t.speaker < int(angleOfSpeaker.size()) ? angleOfSpeaker[size_t(t.speaker)] : -1;
+        const int w0 = std::max(0, int(t.start / kWindow)), w1 = std::min(windows, int(std::ceil(t.end / kWindow)));
+        for (int w = w0; w < w1; ++w) {
+            int& f = floor[size_t(w)];
+            if (angle < 0) continue;  // someone without a close-up: does not take the floor
+            f = f == -1 || f == angle ? angle : -2;
+        }
+    }
+    return shotsFromFloor(floor, o, fps);
 }
 
 }  // namespace montage

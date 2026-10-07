@@ -45,6 +45,8 @@ public slots:
     void markSelection();       // Source: In/Out from the selection
     void insertSelection(bool overwrite);  // Source
     void setSourcePosition(montage::FrameTime frame);  // highlights the word under the source playhead
+    // Source: renames a speaker of the source clip's transcript (one undo step).
+    bool renameSpeaker(const QString& from, const QString& to);
 
 signals:
     void sourceSeekRequested(montage::FrameTime frame);

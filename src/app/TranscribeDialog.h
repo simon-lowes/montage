@@ -56,6 +56,8 @@ private:
     QComboBox* model_;
     QComboBox* language_;
     QCheckBox* translate_;
+    QCheckBox* speakers_;
+    QComboBox* speakerCount_;
     QLabel* note_;
 };
 

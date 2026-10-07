@@ -1211,6 +1211,45 @@ private slots:
         QVERIFY(speakerAngleChanges(p, mc, o, &err).empty());
         QVERIFY(!err.empty());
 
+        // The same scene from one recording's speaker labels instead of two microphones:
+        // A's words for 3 s, B's for 3 s, then both for 2 s.
+        {
+            auto t = std::make_shared<Transcript>();
+            auto say = [&](double from, double to, int speaker) {
+                TranscriptSegment seg;
+                seg.speaker = speaker;
+                for (double w = from; w + 0.45 <= to; w += 0.5) seg.words.push_back({w, w + 0.45, "word", 1});
+                seg.start = from;
+                seg.end = to;
+                t->segments.push_back(seg);
+            };
+            say(0, 3, 0);
+            say(3, 6, 1);
+            say(6, 8, 0);
+            say(6, 8, 1);
+            p.findMedia(lavA)->transcript = t;
+            int speakers = 0;
+            const auto turns = transcriptTurns(p, mc, 0, &speakers);
+            QCOMPARE(speakers, 2);
+            QVERIFY(transcriptTurns(p, mc, 1).empty());  // lav B has no transcript
+            AutoSwitchOptions lo;
+            lo.wideAngle = 2;
+            auto byLabels = turnAngleChanges(mc, turns, {0, 1}, lo, &err);
+            got.clear();
+            for (auto [f, a] : byLabels) got += QString("(%1,%2) ").arg(f).arg(a);
+            QCOMPARE(byLabels.size(), size_t(3));
+            QCOMPARE(byLabels[0], (std::pair<FrameTime, int>{0, 0}));
+            QVERIFY2(byLabels[1].second == 1 && byLabels[1].first >= 88 && byLabels[1].first <= 105, qPrintable(got));
+            QVERIFY2(byLabels[2].second == 2 && byLabels[2].first >= 178 && byLabels[2].first <= 195, qPrintable(got));
+            // B without a close-up: A keeps the floor alone, the wide shot covers B.
+            byLabels = turnAngleChanges(mc, turns, {0, -1}, lo, &err);
+            got.clear();
+            for (auto [f, a] : byLabels) got += QString("(%1,%2) ").arg(f).arg(a);
+            QVERIFY2(byLabels.size() >= 2 && byLabels[1].second == 2, qPrintable(got));
+            QVERIFY(turnAngleChanges(mc, turns, {-1, -1}, lo, &err).empty() && !err.empty());
+            p.findMedia(lavA)->transcript.reset();
+        }
+
         // Audio angles: the mix, or one microphone.
         Sequence& s = *p.active();
         QVERIFY(edit::placeMedia(p, s, mcId, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);

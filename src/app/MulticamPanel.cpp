@@ -17,6 +17,7 @@
 #include <QProgressDialog>
 #include <QPushButton>
 #include <QSettings>
+#include <QStackedWidget>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QtConcurrent>
@@ -272,52 +273,146 @@ void MulticamPanel::autoSwitch() {
     if (!mc) return;
     QDialog dlg(this);
     dlg.setWindowTitle(tr("Auto Switch by Speaker"));
-    auto* form = new QFormLayout;
+    const Project& project = state_->project();
+    auto angleName = [&](int a) { return QStringLiteral("%1 %2").arg(a + 1).arg(QString::fromStdString(mc->videoTracks[size_t(a)].name)); };
+    // Who speaks can come from each person's microphone, or from a transcript
+    // whose speakers are labelled (one recording of everyone is enough).
+    auto* by = new QComboBox(&dlg);
+    by->setObjectName(QStringLiteral("switchBy"));
+    by->addItem(tr("Microphones (one per speaker)"), 0);
+    by->addItem(tr("Speaker labels in a transcript"), 1);
+    auto* pages = new QStackedWidget(&dlg);
+
+    auto* micPage = new QWidget(pages);
+    auto* form = new QFormLayout(micPage);
+    form->setContentsMargins(0, 0, 0, 0);
     auto* intro = new QLabel(tr("Choose the microphone that hears each angle's speaker. The clip is cut to whoever is "
                                 "clearly speaking; the wide angle covers silence and people talking over each other."),
-                             &dlg);
+                             micPage);
     intro->setWordWrap(true);
+    form->addRow(intro);
     std::vector<QComboBox*> listen;
     for (int a = 0; a < int(mc->videoTracks.size()); ++a) {
-        auto* combo = new QComboBox(&dlg);
+        auto* combo = new QComboBox(micPage);
         combo->setObjectName(QStringLiteral("listen%1").arg(a + 1));
         combo->addItem(tr("No one (not a close-up)"), -1);
         for (int t = 0; t < int(mc->audioTracks.size()); ++t)
             combo->addItem(QString::fromStdString(mc->audioTracks[size_t(t)].name), t);
         const int own = angleAudioTrack(*mc, a);
         combo->setCurrentIndex(std::max(0, combo->findData(own)));
-        form->addRow(tr("%1 %2 listens to:").arg(a + 1).arg(QString::fromStdString(mc->videoTracks[size_t(a)].name)), combo);
+        form->addRow(tr("%1 listens to:").arg(angleName(a)), combo);
         listen.push_back(combo);
     }
+    auto* margin = new QDoubleSpinBox(micPage);
+    margin->setRange(1, 20);
+    margin->setValue(4);
+    margin->setSuffix(tr(" dB"));
+    margin->setToolTip(tr("How much louder than everyone else a speaker must be to get the shot"));
+    form->addRow(tr("Speaker margin:"), margin);
+    pages->addWidget(micPage);
+
+    auto* labelPage = new QWidget(pages);
+    auto* labelForm = new QFormLayout(labelPage);
+    labelForm->setContentsMargins(0, 0, 0, 0);
+    auto* labelIntro = new QLabel(labelPage);
+    labelIntro->setWordWrap(true);
+    labelForm->addRow(labelIntro);
+    auto* fromTrack = new QComboBox(labelPage);
+    fromTrack->setObjectName(QStringLiteral("labelTrack"));
+    for (int t = 0; t < int(mc->audioTracks.size()); ++t) {
+        int speakers = 0;
+        transcriptTurns(project, *mc, t, &speakers);
+        if (speakers > 0)
+            fromTrack->addItem(tr("%1 (%n speaker(s))", "", speakers).arg(QString::fromStdString(mc->audioTracks[size_t(t)].name)), t);
+    }
+    labelForm->addRow(tr("Transcript of:"), fromTrack);
+    auto* speakerRows = new QWidget(labelPage);
+    auto* speakerForm = new QFormLayout(speakerRows);
+    speakerForm->setContentsMargins(0, 0, 0, 0);
+    labelForm->addRow(speakerRows);
+    std::vector<QComboBox*> showSpeaker;
+    // One row per speaker of the chosen recording: the angle that shows them (the n-th angle by default).
+    auto rebuildSpeakers = [&, speakerForm, speakerRows] {
+        while (speakerForm->rowCount() > 0) speakerForm->removeRow(0);
+        showSpeaker.clear();
+        const int track = fromTrack->currentData().toInt();
+        int speakers = 0;
+        transcriptTurns(project, *mc, track, &speakers);
+        const MediaItem* named = nullptr;
+        if (track >= 0 && track < int(mc->audioTracks.size()))
+            for (const Clip& c : mc->audioTracks[size_t(track)].clips)
+                if (const MediaItem* m = project.findMedia(c.mediaId); m && m->transcript && !named) named = m;
+        for (int sp = 0; sp < speakers; ++sp) {
+            auto* combo = new QComboBox(speakerRows);
+            combo->setObjectName(QStringLiteral("speakerAngle%1").arg(sp + 1));
+            combo->addItem(tr("No close-up"), -1);
+            for (int a = 0; a < int(mc->videoTracks.size()); ++a) combo->addItem(angleName(a), a);
+            combo->setCurrentIndex(sp + 1 < combo->count() ? sp + 1 : 0);
+            const QString who = named ? QString::fromStdString(speakerName(*named->transcript, sp)) : tr("Speaker %1").arg(sp + 1);
+            speakerForm->addRow(tr("%1 is on:").arg(who), combo);
+            showSpeaker.push_back(combo);
+        }
+    };
+    labelIntro->setText(fromTrack->count() == 0
+                            ? tr("No recording in this multicam clip has speaker labels yet. In the Media panel, choose "
+                                 "Transcribe… with Label speakers on one recording of everyone, then come back here.")
+                            : tr("Choose the angle that shows each person. The clip is cut to whoever is speaking, by the "
+                                 "transcript's speaker labels; the wide angle covers pauses and people talking over each other."));
+    rebuildSpeakers();
+    connect(fromTrack, &QComboBox::currentIndexChanged, &dlg, [&] { rebuildSpeakers(); });
+    pages->addWidget(labelPage);
+
+    auto* shared = new QFormLayout;
     auto* wide = new QComboBox(&dlg);
     wide->setObjectName(QStringLiteral("wideAngle"));
     wide->addItem(tr("None (stay on the last speaker)"), -1);
-    for (int a = 0; a < int(mc->videoTracks.size()); ++a)
-        wide->addItem(QStringLiteral("%1 %2").arg(a + 1).arg(QString::fromStdString(mc->videoTracks[size_t(a)].name)), a);
-    form->addRow(tr("Wide angle:"), wide);
+    for (int a = 0; a < int(mc->videoTracks.size()); ++a) wide->addItem(angleName(a), a);
+    shared->addRow(tr("Wide angle:"), wide);
     auto* minShot = new QDoubleSpinBox(&dlg);
     minShot->setObjectName(QStringLiteral("minShot"));
     minShot->setRange(0.5, 30);
     minShot->setSingleStep(0.5);
     minShot->setValue(2.0);
     minShot->setSuffix(tr(" s"));
-    form->addRow(tr("Shortest shot:"), minShot);
-    auto* margin = new QDoubleSpinBox(&dlg);
-    margin->setRange(1, 20);
-    margin->setValue(4);
-    margin->setSuffix(tr(" dB"));
-    margin->setToolTip(tr("How much louder than everyone else a speaker must be to get the shot"));
-    form->addRow(tr("Speaker margin:"), margin);
+    shared->addRow(tr("Shortest shot:"), minShot);
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
     buttons->button(QDialogButtonBox::Ok)->setText(tr("Switch"));
     connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
     connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    auto update = [&, pages, buttons] {
+        pages->setCurrentIndex(by->currentIndex());
+        buttons->button(QDialogButtonBox::Ok)->setEnabled(by->currentIndex() == 0 || fromTrack->count() > 0);
+    };
+    connect(by, &QComboBox::currentIndexChanged, &dlg, update);
+    if (fromTrack->count() > 0) by->setCurrentIndex(1);  // labels are there: the simpler way
+    update();
     auto* lay = new QVBoxLayout(&dlg);
-    lay->addWidget(intro);
-    lay->addLayout(form);
+    auto* top = new QFormLayout;
+    top->addRow(tr("Switch by:"), by);
+    lay->addLayout(top);
+    lay->addWidget(pages);
+    lay->addLayout(shared);
     lay->addWidget(buttons);
     if (dlg.exec() != QDialog::Accepted) return;
 
+    if (by->currentIndex() == 1) {
+        // From the transcript: nothing to decode.
+        AutoSwitchOptions o;
+        o.wideAngle = wide->currentData().toInt();
+        o.minShotSeconds = minShot->value();
+        std::vector<int> angleOf;
+        for (QComboBox* c : showSpeaker) angleOf.push_back(c->currentData().toInt());
+        std::string err;
+        const auto changes = turnAngleChanges(*mc, transcriptTurns(project, *mc, fromTrack->currentData().toInt()), angleOf, o, &err);
+        if (changes.empty()) {
+            state_->message(QString::fromStdString(err));
+            return;
+        }
+        const bool follows = audioFollows_->isChecked();
+        if (state_->apply(tr("Auto Switch"), [=](Project& p, Sequence& sq) { return edit::applyAngleChanges(p, sq, clip, changes, follows); }))
+            state_->message(tr("Auto Switch made %n cut(s)", "", int(changes.size()) - 1));
+        return;
+    }
     AutoSwitchOptions o;
     for (QComboBox* l : listen) o.listen.push_back(l->currentData().toInt());
     o.wideAngle = wide->currentData().toInt();

@@ -67,7 +67,9 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
   - while the program plays, each switch is a cut at the playhead, so a scene can be cut live;
   - Shift cuts while stopped;
   - audio can follow the video.
-- Auto Switch cuts to whoever is speaking. Each close-up listens to that person's microphone, a wide angle covers silence and cross-talk, and there is a shortest-shot length and a speaker margin.
+- Auto Switch cuts to whoever is speaking, a wide angle covers silence and cross-talk, and there is a shortest-shot length. Who speaks comes from either:
+  - each person's microphone (each close-up listens to one, with a speaker margin);
+  - the speaker labels of one transcribed recording of everyone (choose the angle that shows each person).
 - On the timeline, clips are labelled with their angle. Multicam Angle and Multicam Audio (one source or all mixed) can be changed per clip, and Flatten Multicam swaps in the cameras' own clips.
 
 **Audio**
@@ -104,6 +106,10 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
   - Right-click clips in the media bin › Transcribe…, pick a model (Tiny to Large v3 Turbo, English-only or 99 languages) and a language, or translate to English. The model downloads once.
   - Transcripts are word-timed, saved in the project, and undoable. The media bin search finds clips by what is said in them.
   - Export Transcript… writes SubRip (`.srt`) or WebVTT (`.vtt`) captions, plain text, or JSON with word timings.
+  - **Label speakers** (in the Transcribe dialog) also works out who speaks when, for any number of people or a number you give.
+    - Every word is labelled. The Transcript panel names the speaker at each change; rename them with a right-click.
+    - Plain-text exports are split by speaker, WebVTT carries voice tags, and captions break where the speaker changes.
+    - It runs locally: pyannote segmentation 3.0 (MIT) and the CAM++ voice model (Apache-2.0) on ONNX Runtime, a 36 MB one-time download.
 - Edit by transcript (Transcript panel):
   - **Sequence mode** shows what the cut says, with the word under the playhead highlighted. Click a word to go there. Select words and press Delete to cut them out of every track; the gap closes and the captions move with it.
   - Remove Fillers cuts um, uh, er and similar words in one step. Shorten Pauses trims silences between words to a length you choose.
@@ -205,6 +211,7 @@ montage-cli import edit.fcpxml -o edit.montage               # FCP XML, FCPXML, 
 montage-cli presets
 montage-cli models                                           # speech and object models, and where they go
 montage-cli transcribe interview.mp4 --model base.en --srt interview.srt --vtt interview.vtt
+montage-cli transcribe podcast.wav --speakers 2 --txt podcast.txt          # who said what
 montage-cli captions cut.montage --transcribe base.en -o cut.scc --save   # caption a cut, keep the track
 montage-cli render cut.montage -o cut.mp4 --burn-captions --embed-captions
 montage-cli new -o hdr.montage --color-space rec2100pq --hdr-peak 1000 a.mov   # an HDR10 sequence

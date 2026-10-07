@@ -1,6 +1,7 @@
 #include "TranscriptPanel.h"
 
 #include <QComboBox>
+#include <QContextMenuEvent>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDoubleSpinBox>
@@ -8,9 +9,11 @@
 #include <QFormLayout>
 #include <QGuiApplication>
 #include <QHBoxLayout>
+#include <QInputDialog>
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMenu>
 #include <QMouseEvent>
 #include <QRegularExpression>
 #include <QScrollBar>
@@ -172,14 +175,18 @@ void TranscriptPanel::rebuild() {
     } else {
         const MediaItem* m = state_->project().findMedia(state_->sourceMedia());
         if (m && m->transcript)
-            for (const auto& seg : m->transcript->segments) words.insert(words.end(), seg.words.begin(), seg.words.end());
+            for (const auto& seg : m->transcript->segments)
+                for (TranscriptWord w : seg.words) {
+                    w.speaker = speakerName(*m->transcript, seg.speaker);
+                    words.push_back(std::move(w));
+                }
         empty = !m ? tr("Open a clip in the Source monitor to see its transcript.")
                    : tr("\"%1\" has not been transcribed. Right-click it in the Media panel and choose Transcribe...")
                          .arg(QString::fromStdString(m->name));
     }
     // Rebuild the text only when the words or their timing changed.
     QString sig = QString::number(int(mode_)) + QString::number(qulonglong(words.size()));
-    for (const auto& w : words) sig += QString::fromStdString(w.text) + QString::number(std::lround(w.start * 100));
+    for (const auto& w : words) sig += QString::fromStdString(w.text + w.speaker) + QString::number(std::lround(w.start * 100));
     if (sig == signature_) return;
     signature_ = sig;
     words_ = std::move(words);
@@ -189,8 +196,10 @@ void TranscriptPanel::rebuild() {
     text_->clear();
     text_->setPlaceholderText(empty);
     QTextCursor cur(text_->document());
-    QTextCharFormat normal, label, filler, unsure;
+    QTextCharFormat normal, label, filler, unsure, who;
     label.setForeground(palette().color(QPalette::Disabled, QPalette::Text));
+    who.setFontWeight(QFont::Bold);
+    who.setFontPointSize(text_->font().pointSizeF() * 0.85);
     label.setFontPointSize(text_->font().pointSizeF() * 0.85);
     filler.setForeground(palette().color(QPalette::Disabled, QPalette::Text));
     filler.setFontItalic(true);
@@ -201,10 +210,16 @@ void TranscriptPanel::rebuild() {
     if (const Sequence* s = state_->sequence()) rate = s->fps;
     for (size_t i = 0; i < words_.size(); ++i) {
         const TranscriptWord& w = words_[i];
-        const bool newParagraph =
-            i == 0 || w.start - words_[i - 1].end > 1.5 || (endsSentence(words_[i - 1].text) && paragraphChars > 320);
+        const bool newSpeaker = i > 0 && w.speaker != words_[i - 1].speaker;
+        const bool newParagraph = i == 0 || newSpeaker || w.start - words_[i - 1].end > 1.5 ||
+                                  (endsSentence(words_[i - 1].text) && paragraphChars > 320);
         if (newParagraph) {
             if (i > 0) cur.insertBlock();
+            // Who speaks, at each change of speaker.
+            if (!w.speaker.empty() && (i == 0 || newSpeaker)) {
+                cur.insertText(QString::fromStdString(w.speaker), who);
+                cur.insertText(QStringLiteral("  "), normal);
+            }
             const QString tc = QString::fromStdString(formatTimecode(FrameTime(std::llround(w.start * fps())), rate));
             spans_.push_back({cur.position(), int(tc.size()), -1, w.start});
             cur.insertText(tc, label);
@@ -340,7 +355,42 @@ int TranscriptPanel::find(const QString& textIn, bool backwards) {
     return int(found_.size());
 }
 
+bool TranscriptPanel::renameSpeaker(const QString& from, const QString& to) {
+    const Id media = state_->sourceMedia();
+    const std::string a = from.toStdString(), b = to.trimmed().toStdString();
+    if (mode_ != Mode::Source || !media || b.empty() || a == b) return false;
+    return state_->edit(tr("Rename Speaker"), [media, a, b](Project& p, Sequence&) {
+        MediaItem* m = p.findMedia(media);
+        if (!m || !m->transcript) return false;
+        for (int i = 0; i < speakerCount(*m->transcript); ++i)
+            if (speakerName(*m->transcript, i) == a) {
+                auto t = std::make_shared<Transcript>(*m->transcript);
+                t->speakerNames.resize(std::max(t->speakerNames.size(), size_t(i) + 1));
+                t->speakerNames[size_t(i)] = b;
+                m->transcript = t;
+                return true;
+            }
+        return false;
+    });
+}
+
 bool TranscriptPanel::eventFilter(QObject* obj, QEvent* e) {
+    if (obj == text_->viewport() && e->type() == QEvent::ContextMenu && mode_ == Mode::Source) {
+        auto* ce = static_cast<QContextMenuEvent*>(e);
+        const int i = wordAtPosition(text_->cursorForPosition(ce->pos()).position());
+        const int w = i >= 0 ? spans_[size_t(i)].word : -1;
+        if (w >= 0 && !words_[size_t(w)].speaker.empty()) {
+            const QString name = QString::fromStdString(words_[size_t(w)].speaker);
+            QMenu menu(this);
+            QAction* rename = menu.addAction(tr("Rename Speaker \u201c%1\u201d…").arg(name));
+            if (menu.exec(ce->globalPos()) == rename) {
+                bool ok = false;
+                const QString to = QInputDialog::getText(this, tr("Rename Speaker"), tr("Name:"), QLineEdit::Normal, name, &ok);
+                if (ok) renameSpeaker(name, to);
+            }
+            return true;
+        }
+    }
     if (obj == text_->viewport() && e->type() == QEvent::MouseButtonRelease) {
         auto* me = static_cast<QMouseEvent*>(e);
         if (me->button() == Qt::LeftButton && !text_->textCursor().hasSelection()) {

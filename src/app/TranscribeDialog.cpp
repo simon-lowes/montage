@@ -9,6 +9,7 @@
 #include <QFileInfo>
 #include <QFormLayout>
 #include <QFutureWatcher>
+#include <QHBoxLayout>
 #include <QLabel>
 #include <QLocale>
 #include <QMessageBox>
@@ -27,6 +28,8 @@
 #include <memory>
 
 #include "EditorState.h"
+#include "ModelPacks.h"
+#include "media/Diarizer.h"
 
 namespace montage {
 
@@ -145,6 +148,29 @@ TranscribeDialog::TranscribeDialog(int mediaCount, QWidget* parent) : QDialog(pa
     form->addRow(tr("Language:"), language_);
     translate_ = new QCheckBox(tr("Translate to English"), this);
     form->addRow(QString(), translate_);
+    // Who speaks: for interviews, podcasts and multicam.
+    auto* who = new QWidget(this);
+    auto* wh = new QHBoxLayout(who);
+    wh->setContentsMargins(0, 0, 0, 0);
+    speakers_ = new QCheckBox(tr("Label speakers"), who);
+    speakers_->setObjectName(QStringLiteral("labelSpeakers"));
+    speakerCount_ = new QComboBox(who);
+    speakerCount_->setObjectName(QStringLiteral("speakerCount"));
+    speakerCount_->addItem(tr("Any number of people"), 0);
+    for (int n = 1; n <= 8; ++n) speakerCount_->addItem(tr("%n person(s)", "", n), n);
+    wh->addWidget(speakers_);
+    wh->addWidget(speakerCount_, 1);
+    form->addRow(QString(), who);
+    if (!diarizerAvailable()) {
+        speakers_->setEnabled(false);
+        speakers_->setToolTip(tr("This build of Montage was built without ONNX Runtime"));
+    } else {
+        speakers_->setChecked(settings.value("transcribe/speakers", false).toBool());
+        speakerCount_->setCurrentIndex(std::max(0, speakerCount_->findData(settings.value("transcribe/speakerCount", 0))));
+    }
+    speakerCount_->setEnabled(speakers_->isChecked());
+    connect(speakers_, &QCheckBox::toggled, speakerCount_, &QWidget::setEnabled);
+    connect(speakers_, &QCheckBox::toggled, this, &TranscribeDialog::updateState);
     lay->addLayout(form);
     note_ = new QLabel(this);
     note_->setWordWrap(true);
@@ -156,6 +182,8 @@ TranscribeDialog::TranscribeDialog(int mediaCount, QWidget* parent) : QDialog(pa
         QSettings s;
         s.setValue("transcribe/model", model_->currentData());
         s.setValue("transcribe/language", language_->currentData());
+        s.setValue("transcribe/speakers", speakers_->isChecked());
+        s.setValue("transcribe/speakerCount", speakerCount_->currentData());
         accept();
     });
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
@@ -170,11 +198,15 @@ void TranscribeDialog::updateState() {
     language_->setEnabled(!english);
     translate_->setEnabled(!english);
     if (english) translate_->setChecked(false);
+    QString note;
     if (m && whisperModelPath(m->name).empty())
-        note_->setText(tr("The model (%1) is downloaded once and kept for next time.").arg(megabytes(m->bytes)));
+        note = tr("The model (%1) is downloaded once and kept for next time.").arg(megabytes(m->bytes));
     else
-        note_->setText(english ? tr("English-only models are faster and a little more accurate for English.")
-                               : tr("Larger models are more accurate but slower."));
+        note = english ? tr("English-only models are faster and a little more accurate for English.")
+                       : tr("Larger models are more accurate but slower.");
+    if (speakers_->isChecked() && !speakerModel().installed())
+        note += QStringLiteral(" ") + tr("Labelling speakers needs a one-time %1 download.").arg(megabytes(speakerModel().bytes()));
+    note_->setText(note);
 }
 
 TranscribeOptions TranscribeDialog::options() const {
@@ -182,6 +214,8 @@ TranscribeOptions TranscribeDialog::options() const {
     o.model = model_->currentData().toString().toStdString();
     o.language = language_->isEnabled() ? language_->currentData().toString().toStdString() : "en";
     o.translate = translate_->isEnabled() && translate_->isChecked();
+    o.speakers = speakers_->isEnabled() && speakers_->isChecked();
+    o.speakerCount = speakerCount_->currentData().toInt();
     return o;
 }
 
@@ -281,8 +315,15 @@ void runTranscription(EditorState* state, const std::vector<TranscribeJob>& jobs
 
 }  // namespace
 
-void startTranscription(EditorState* state, const std::vector<Id>& media, const TranscribeOptions& options,
+void startTranscription(EditorState* state, const std::vector<Id>& media, const TranscribeOptions& optionsIn,
                         QWidget* parent) {
+    TranscribeOptions options = optionsIn;
+    // The speaker model first (asked for and fetched here); without it, words only.
+    if (options.speakers &&
+        !ensureModelPack(parent, speakerModel(), QObject::tr("Transcribe"),
+                         QObject::tr("Labelling speakers uses pyannote's segmentation model (MIT) and the CAM++ voice model "
+                                     "(Apache-2.0), which run on this computer.")))
+        options.speakers = false;
     std::vector<TranscribeJob> jobs;
     for (Id id : media)
         if (const MediaItem* m = state->project().findMedia(id); m && m->hasAudio && !m->path.empty())

@@ -34,7 +34,7 @@ std::vector<TranscriptWord> sequenceTranscriptWords(const Project& p, const Sequ
                         if (a > b) std::swap(a, b);
                         a = std::clamp(a, double(c.start), double(c.end()));
                         b = std::clamp(b, a, double(c.end()));
-                        words.push_back({a / fps, b / fps, w.text, w.probability});
+                        words.push_back({a / fps, b / fps, w.text, w.probability, speakerName(*m->transcript, s.speaker)});
                     }
             }
         }
