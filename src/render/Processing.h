@@ -40,6 +40,10 @@ Image transitionMix(const std::string& type, const Effect& params, const Image& 
 // Box-blur approximation of a Gaussian, separable; radius in pixels.
 void gaussianBlur(Image& img, double radius, bool horizontal = true, bool vertical = true);
 
+// Builds a primary colour correction that neutralises the image's colour
+// cast (grey world) and stretches its levels to 0.5 % / 99.5 % percentiles.
+Effect autoColorCorrection(const Image& img, Id effectId);
+
 // Flattens premultiplied RGBA over an opaque colour.
 void flattenOver(Image& img, float r, float g, float b);
 

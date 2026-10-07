@@ -44,7 +44,9 @@
 #include "media/Analysis.h"
 #include "media/Loudness.h"
 #include "media/MediaPool.h"
+#include "render/Compositor.h"
 #include "render/Exporter.h"
+#include "render/Processing.h"
 
 namespace montage {
 
@@ -321,6 +323,7 @@ void MainWindow::buildMenus() {
     });
     add(clipM, tr("Detect &Scene Cuts"), QKeySequence(), [this] { detectScenes(); });
     add(clipM, tr("Normalize &Loudness…"), QKeySequence(), [this] { normalizeLoudness(); });
+    add(clipM, tr("Auto &Colour"), QKeySequence("Ctrl+Alt+C"), [this] { autoColor(); });
     clipM->addSeparator();
     add(clipM, tr("&Insert from Source"), QKeySequence(Qt::Key_Comma), [this] { state_->insertFromSource(false); });
     add(clipM, tr("&Overwrite from Source"), QKeySequence(Qt::Key_Period), [this] { state_->insertFromSource(true); });
@@ -980,6 +983,38 @@ void MainWindow::normalizeLoudness() {
         return true;
     });
     state_->message(tr("Normalized %n clip(s) to %1 LUFS", "", int(gains.size())).arg(target), 5000);
+}
+
+void MainWindow::autoColor() {
+    const Sequence* s = state_->sequence();
+    const Clip* c = state_->primaryClip();
+    const MediaItem* m = c ? state_->project().findMedia(c->mediaId) : nullptr;
+    if (!s || !m || (m->kind != MediaKind::Video && m->kind != MediaKind::Image)) {
+        state_->message(tr("Select a video clip to colour-balance"));
+        return;
+    }
+    // Analyse the clip's own frame under the playhead (or its first frame).
+    FrameTime t = c->contains(state_->playhead()) ? state_->playhead() : c->start;
+    double sec = m->kind == MediaKind::Video ? std::max(0.0, c->sourceFrameAt(t) / s->fpsValue()) : 0.0;
+    Image frame = renderMediaFrame(state_->project(), *m, sec, 320, 180);
+    Id clipId = c->id;
+    state_->edit(tr("Auto Colour"), [clipId, &frame](Project& p, Sequence& sq) {
+        Clip* cc = edit::clipById(sq, clipId);
+        if (!cc) return false;
+        Effect e = autoColorCorrection(frame, p.newId());
+        // Replace an earlier auto correction instead of stacking another.
+        for (auto& existing : cc->effects)
+            if (existing.type == "color_correct" && existing.strings.count("auto")) {
+                e.id = existing.id;
+                e.strings["auto"] = "1";
+                existing = e;
+                return true;
+            }
+        e.strings["auto"] = "1";
+        cc->effects.insert(cc->effects.begin(), e);
+        return true;
+    });
+    inspectorDock_->raise();
 }
 
 void MainWindow::exportInterchange(bool otio) {

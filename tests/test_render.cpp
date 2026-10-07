@@ -259,6 +259,32 @@ private slots:
         QVERIFY(near(c[2], 1));
     }
 
+    void autoColorNeutralisesCasts() {
+        // A dim, blue-tinted gradient: auto colour should balance channels and stretch levels.
+        Image img(64, 16);
+        for (int y = 0; y < 16; ++y)
+            for (int x = 0; x < 64; ++x) {
+                float v = 0.2f + 0.4f * x / 63.0f;
+                float* p = img.at(x, y);
+                p[0] = v * 0.8f;
+                p[1] = v * 0.9f;
+                p[2] = std::min(1.0f, v * 1.3f);
+                p[3] = 1;
+            }
+        Effect e = autoColorCorrection(img, 1);
+        applyVideoEffect(e, 0, img, 1);
+        double mean[3] = {0, 0, 0};
+        float lo = 1, hi = 0;
+        for (size_t i = 0; i < img.px.size(); i += 4) {
+            for (int c = 0; c < 3; ++c) mean[c] += img.px[i + c];
+            float l = 0.2126f * img.px[i] + 0.7152f * img.px[i + 1] + 0.0722f * img.px[i + 2];
+            lo = std::min(lo, l);
+            hi = std::max(hi, l);
+        }
+        QVERIFY(std::fabs(mean[0] - mean[2]) / mean[1] < 0.05);  // cast removed
+        QVERIFY(lo < 0.05f && hi > 0.9f);                         // levels stretched
+    }
+
     void titlesRender() {
         Project p;
         Effect t = makeEffect(p, "title");

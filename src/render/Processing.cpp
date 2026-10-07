@@ -1,5 +1,7 @@
 #include "Processing.h"
 
+#include "core/Effects.h"
+
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -371,6 +373,50 @@ void gaussianBlur(Image& img, double radius, bool horizontal, bool vertical) {
         passes(tmp);
         transpose(tmp, img);
     }
+}
+
+Effect autoColorCorrection(const Image& img, Id effectId) {
+    Effect e = makeEffect("color_correct", effectId);
+    if (img.empty()) return e;
+    // Histograms of unpremultiplied channels and luma.
+    constexpr int kN = 1024;
+    std::vector<double> hist[4];
+    for (auto& h : hist) h.assign(kN, 0.0);
+    double sum[3] = {0, 0, 0}, count = 0;
+    for (size_t i = 0; i < img.px.size(); i += 4) {
+        float a = img.px[i + 3];
+        if (a < 0.5f) continue;
+        float c[3] = {img.px[i] / a, img.px[i + 1] / a, img.px[i + 2] / a};
+        for (int k = 0; k < 3; ++k) {
+            hist[k][size_t(std::clamp(int(c[k] * (kN - 1)), 0, kN - 1))] += 1;
+            sum[k] += c[k];
+        }
+        hist[3][size_t(std::clamp(int(luma(c[0], c[1], c[2]) * (kN - 1)), 0, kN - 1))] += 1;
+        count += 1;
+    }
+    if (count < 16) return e;
+    auto percentile = [&](const std::vector<double>& h, double q) {
+        double target = q * count, acc = 0;
+        for (int i = 0; i < kN; ++i) {
+            acc += h[size_t(i)];
+            if (acc >= target) return double(i) / (kN - 1);
+        }
+        return 1.0;
+    };
+    // Grey world: scale channels so their means match the luma-weighted mean.
+    double mean[3] = {sum[0] / count, sum[1] / count, sum[2] / count};
+    double grey = kLumaR * mean[0] + kLumaG * mean[1] + kLumaB * mean[2];
+    const char* gains[3] = {"gain_r", "gain_g", "gain_b"};
+    for (int k = 0; k < 3; ++k)
+        if (mean[k] > 1e-4) e.params[gains[k]] = std::clamp(grey / mean[k], 0.5, 2.0);
+    // Levels from the luma distribution: black point to 0, white point to 1.
+    double lo = percentile(hist[3], 0.005), hi = percentile(hist[3], 0.995);
+    if (hi - lo > 0.05) {
+        double gain = std::clamp(1.0 / (hi - lo), 0.5, 3.0);
+        e.params["gain"] = gain;
+        e.params["offset"] = std::clamp(-lo * gain, -0.5, 0.5);
+    }
+    return e;
 }
 
 void flattenOver(Image& img, float r, float g, float b) {

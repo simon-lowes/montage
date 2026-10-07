@@ -81,6 +81,7 @@ private:
     void markClip();
     void detectScenes();
     void normalizeLoudness();
+    void autoColor();
     void exportInterchange(bool otio);
     void addTitle();
     void newSequence();

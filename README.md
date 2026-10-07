@@ -23,6 +23,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Transform on every clip: position, scale, rotation, anchor, crop, opacity, flip, and fit/fill/stretch
 - 13 blend modes
 - Primary colour correction: lift, gamma and gain per channel, plus exposure, contrast, pivot, saturation, temperature, tint and offset
+- One-click Auto Colour (grey-world balance and level stretch)
 - Curves with presets, HSL/vibrance, `.cube` 3D/1D LUTs, black & white, invert
 - Chroma key with spill suppression, and luma key
 - Gaussian blur, sharpen, vignette, mosaic, mirror, drop shadow
