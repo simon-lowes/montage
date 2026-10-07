@@ -59,7 +59,7 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
 - [x] 1. Crash-safe project history and recovery (S): live recovery copy after each edit, crash detection via session locks, recovery dialog that keeps the project path, plugin safe mode, rolling timestamped snapshots.
 - [x] 2. Hardware decode and encode (M): per-platform hwaccel decode with software fallback per stream and a decoder cap, Playback toggle; hardware H.264/H.265 presets that pick the first working encoder and fall back to x264/x265.
 - [x] 3. Audio plugin manager UI (S): Tools > Audio Plugins with on/off switches, status, blocklist with reasons, Rescan, Rescan Selected, Retry Blocked, extra search folders and a scan log; background scan at startup; probes run in parallel.
-- [ ] 4. Transcription engine: whisper.cpp + speaker labels (M)
+- [x] 4. Transcription engine (M): whisper.cpp 1.9.5 built in, word timings, eight models from Tiny to Large v3 Turbo downloaded on first use, auto language detection and translation; Transcribe… in the media bin, transcripts saved in the project (undoable), media search by spoken words, SRT/VTT/TXT/JSON export; `montage-cli transcribe` and `models`. Speaker labels are still to do (the transcript format already has a speaker field).
 - [ ] 5. Caption tracks: generate, style, burn in, SRT/VTT/SCC export, CEA-608 (M)
 - [x] 6. VST3 hosting (M): MIT VST 3.8 SDK, crash-isolated probing, parameters, automation, two-blob state. Also done ahead of the list: crash-isolated scanning for CLAP/VST3/LV2/AU and CLAP hosting.
 - [ ] 7. Transcript panel: search, select-to-edit, delete-words ripple (M)

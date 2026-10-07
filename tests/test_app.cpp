@@ -4,7 +4,10 @@
 
 #include <QAbstractScrollArea>
 #include <QAction>
+#include <QComboBox>
 #include <QDoubleSpinBox>
+#include <QLineEdit>
+#include <QListWidget>
 #include <QMimeData>
 #include <QScrollBar>
 #include <QTreeWidget>
@@ -18,6 +21,7 @@
 #include "PlaybackController.h"
 #include "Recovery.h"
 #include "TimelineWidget.h"
+#include "TranscribeDialog.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
 #include "core/ProjectIO.h"
@@ -437,6 +441,96 @@ private slots:
         QVERIFY(plugins::Registry::instance().plugins().empty());
         plugins::Registry::instance().setEnabled(true);
         state()->newProject();
+    }
+
+    void speechModelDownload() {
+        // A local "mirror" with a model, a file that is not a model, and nothing else.
+        QTemporaryDir mirror, models;
+        auto writeFile = [&](const QString& name, const QByteArray& data) {
+            QFile f(mirror.path() + "/" + name);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(data);
+        };
+        writeFile("ggml-tiny.en.bin", QByteArray("lmgg", 4) + QByteArray(256 * 1024, '\0'));
+        writeFile("ggml-base.en.bin", "<html>Not found</html>");
+        qputenv("MONTAGE_WHISPER_MODELS", models.path().toLocal8Bit());
+        qputenv("MONTAGE_WHISPER_MODEL_URL", QUrl::fromLocalFile(mirror.path()).toString().toLocal8Bit());
+        auto fetch = [](const char* name, QString* error) {
+            ModelDownload dl;
+            QSignalSpy done(&dl, &ModelDownload::finished);
+            dl.start(name);
+            if (done.isEmpty() && !done.wait(20000)) return false;
+            *error = done.at(0).at(1).toString();
+            return done.at(0).at(0).toBool();
+        };
+        QString err;
+        QVERIFY2(fetch("tiny.en", &err), qPrintable(err));
+        QCOMPARE(QString::fromStdString(whisperModelPath("tiny.en")), models.path() + "/ggml-tiny.en.bin");
+        QCOMPARE(QFileInfo(models.path() + "/ggml-tiny.en.bin").size(), qint64(4 + 256 * 1024));
+        QVERIFY(!fetch("base.en", &err));
+        QVERIFY2(err.contains("not a speech model"), qPrintable(err));
+        QVERIFY(whisperModelPath("base.en").empty());
+        QVERIFY(!fetch("small.en", &err));
+        QVERIFY(!err.isEmpty());
+        QCOMPARE(QDir(models.path()).entryList(QDir::Files), QStringList{"ggml-tiny.en.bin"});  // no .part left
+
+        // The dialog says which models are already here.
+        {
+            TranscribeDialog dlg(1, win_.get());
+            auto* model = dlg.findChildren<QComboBox*>().value(0);
+            QVERIFY(model);
+            QVERIFY(model->itemText(0).contains("downloaded"));
+            QVERIFY(!model->itemText(1).contains("downloaded"));
+            model->setCurrentIndex(0);
+            QCOMPARE(QString::fromStdString(dlg.options().model), QString("tiny.en"));
+            QCOMPARE(QString::fromStdString(dlg.options().language), QString("en"));  // English-only model
+        }
+        qunsetenv("MONTAGE_WHISPER_MODELS");
+        qunsetenv("MONTAGE_WHISPER_MODEL_URL");
+    }
+
+    void transcribeFromMediaBin() {
+        const QString model = qEnvironmentVariable("MONTAGE_TEST_WHISPER_MODEL");
+        if (model.isEmpty() || !QFileInfo::exists(model))
+            QSKIP("Set MONTAGE_TEST_WHISPER_MODEL to a ggml whisper model to run this test");
+        state()->newProject();
+        auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id id = ids[0];
+        TranscribeOptions opts;
+        opts.model = model.toStdString();
+        startTranscription(state(), ids, opts, win_.get());
+        QTRY_VERIFY_WITH_TIMEOUT(state()->project().findMedia(id)->transcript != nullptr, 120000);
+        const auto transcript = state()->project().findMedia(id)->transcript;
+        QVERIFY(QString::fromStdString(transcript->text()).contains("your country", Qt::CaseInsensitive));
+        QVERIFY(transcript->wordCount() > 15);
+
+        // The media bin search finds the clip by what is said in it.
+        QLineEdit* search = nullptr;
+        for (auto* e : win_->findChildren<QLineEdit*>())
+            if (e->placeholderText() == "Search media") search = e;
+        QVERIFY(search);
+        QListWidget* bin = search->parentWidget()->findChild<QListWidget*>();
+        QVERIFY(bin);
+        search->setText("fellow americans");
+        QCOMPARE(bin->count(), 1);
+        search->setText("words nobody said");
+        QCOMPARE(bin->count(), 0);
+        search->clear();
+
+        // It is one undo step, and it is saved with the project.
+        state()->undo();
+        QVERIFY(!state()->project().findMedia(id)->transcript);
+        state()->redo();
+        QVERIFY(state()->project().findMedia(id)->transcript);
+        const std::string path = (dir_.path() + "/transcribed.montage").toStdString();
+        QVERIFY(saveProject(state()->project(), path));
+        Project back;
+        QVERIFY(loadProject(path, back));
+        QVERIFY(back.findMedia(id)->transcript);
+        QCOMPARE(*back.findMedia(id)->transcript, *transcript);
+        state()->newProject();
+        QVERIFY(QTest::qWaitForWindowActive(win_.get()));  // the window has the focus back
     }
 
     void inspectorEditsAreUndoable() {

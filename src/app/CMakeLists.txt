@@ -5,7 +5,7 @@ file(GLOB MONTAGE_UI_SOURCES CONFIGURE_DEPENDS
 list(FILTER MONTAGE_UI_SOURCES EXCLUDE REGEX ".*/main\\.cpp$")
 
 add_library(montage_ui STATIC ${MONTAGE_UI_SOURCES})
-target_link_libraries(montage_ui PUBLIC montage_engine Qt6::Widgets Qt6::Multimedia Qt6::Concurrent)
+target_link_libraries(montage_ui PUBLIC montage_engine Qt6::Widgets Qt6::Multimedia Qt6::Concurrent Qt6::Network)
 target_include_directories(montage_ui PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR})
 set_target_properties(montage_ui PROPERTIES AUTOMOC ON)
 target_compile_options(montage_ui PRIVATE

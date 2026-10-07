@@ -18,9 +18,13 @@
 #include "core/History.h"
 #include "core/Interchange.h"
 #include "core/ProjectIO.h"
+#include "core/Transcript.h"
 #include "media/Analysis.h"
 #include "media/Decoder.h"
 #include "media/Loudness.h"
+#ifdef MONTAGE_WITH_WHISPER
+#include "media/Transcriber.h"
+#endif
 #include "render/Compositor.h"
 #include "render/Exporter.h"
 
@@ -46,7 +50,10 @@ int usage() {
                  "  montage-cli loudness <media>\n"
                  "  montage-cli edl <project.montage> [-o out.edl]\n"
                  "  montage-cli otio <project.montage> [-o out.otio]\n"
-                 "  montage-cli bench <project.montage> [--scale 0.5] [--frames 120]\n",
+                 "  montage-cli bench <project.montage> [--scale 0.5] [--frames 120]\n"
+                 "  montage-cli transcribe <media> [--model base.en|PATH] [--language auto|en|...] [--translate]\n"
+                 "                     [--srt out.srt] [--vtt out.vtt] [--json out.json] [--txt out.txt]\n"
+                 "  montage-cli models\n",
                  MONTAGE_VERSION);
     return 2;
 }
@@ -163,6 +170,18 @@ bool load(const std::string& path, Project& p) {
         std::fprintf(stderr, "error: %s\n", err.c_str());
         return false;
     }
+    return true;
+}
+
+bool writeFile(const std::string& path, const std::string& text) {
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) {
+        std::fprintf(stderr, "error: cannot write %s\n", path.c_str());
+        return false;
+    }
+    std::fwrite(text.data(), 1, text.size(), f);
+    std::fclose(f);
+    std::printf("Wrote %s\n", path.c_str());
     return true;
 }
 
@@ -342,15 +361,7 @@ int cmdInterchange(const std::vector<std::string>& args, bool otio) {
         std::fwrite(text.data(), 1, text.size(), stdout);
         return 0;
     }
-    FILE* f = std::fopen(out.c_str(), "wb");
-    if (!f) {
-        std::fprintf(stderr, "error: cannot write %s\n", out.c_str());
-        return 1;
-    }
-    std::fwrite(text.data(), 1, text.size(), f);
-    std::fclose(f);
-    std::printf("Wrote %s\n", out.c_str());
-    return 0;
+    return writeFile(out, text) ? 0 : 1;
 }
 
 int cmdBench(const std::vector<std::string>& args) {
@@ -375,6 +386,69 @@ int cmdBench(const std::vector<std::string>& args) {
                 int(s.width * scale), int(s.height * scale), sec, frames / sec, sec * 1000 / frames, s.fpsValue());
     return 0;
 }
+
+#ifdef MONTAGE_WITH_WHISPER
+int cmdModels() {
+    std::printf("Speech models (folder: %s)\n", whisperModelsDirectory().c_str());
+    for (const auto& m : whisperModels())
+        std::printf("  %-22s %6.0f MB  %-10s %s\n", m.name.c_str(), double(m.bytes) / 1e6,
+                    whisperModelPath(m.name).empty() ? "" : "downloaded", m.label.c_str());
+    std::printf("\nDownload a model into the folder from %s\n", whisperModelUrl("<name>").c_str());
+    return 0;
+}
+
+int cmdTranscribe(const std::vector<std::string>& args) {
+    if (args.empty()) return usage();
+    TranscribeOptions opts;
+    opts.model = "base.en";
+    std::string srt, vtt, json, txt;
+    for (size_t i = 1; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        auto next = [&]() -> std::string { return i + 1 < args.size() ? args[++i] : std::string(); };
+        if (a == "--model") opts.model = next();
+        else if (a == "--language") opts.language = next();
+        else if (a == "--translate") opts.translate = true;
+        else if (a == "--threads") opts.threads = std::atoi(next().c_str());
+        else if (a == "--srt") srt = next();
+        else if (a == "--vtt") vtt = next();
+        else if (a == "--json") json = next();
+        else if (a == "--txt") txt = next();
+        else return usage();
+    }
+    if (whisperModelPath(opts.model).empty()) {
+        std::fprintf(stderr, "error: speech model \"%s\" is not downloaded.\nDownload %s into %s\n", opts.model.c_str(),
+                     whisperModelUrl(opts.model).c_str(), whisperModelsDirectory().c_str());
+        return 1;
+    }
+    std::signal(SIGINT, [](int) { gCancel = true; });
+    Transcript t;
+    std::string err;
+    const auto t0 = std::chrono::steady_clock::now();
+    bool ok = transcribeMedia(args[0], opts, t, [](double f) {
+        std::fprintf(stderr, "\rTranscribing... %5.1f%%", f * 100.0);
+        std::fflush(stderr);
+    }, &gCancel, &err);
+    std::fprintf(stderr, "\n");
+    if (!ok) {
+        std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
+    }
+    std::fprintf(stderr, "%zu words, language %s, %.1f s\n", t.wordCount(), t.language.c_str(),
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    bool wrote = false, failed = false;
+    auto out = [&](const std::string& path, const char* format) {
+        if (path.empty()) return;
+        wrote = true;
+        failed |= !writeFile(path, transcriptAs(t, format));
+    };
+    out(srt, "srt");
+    out(vtt, "vtt");
+    out(json, "json");
+    out(txt, "txt");
+    if (!wrote) std::printf("%s\n", t.text().c_str());
+    return failed ? 1 : 0;
+}
+#endif
 
 int cmdPresets() {
     for (const auto& p : exportPresets())
@@ -403,6 +477,15 @@ int main(int argc, char** argv) {
     if (cmd == "bench") return cmdBench(args);
     if (cmd == "edl") return cmdInterchange(args, false);
     if (cmd == "otio") return cmdInterchange(args, true);
+#ifdef MONTAGE_WITH_WHISPER
+    if (cmd == "transcribe") return cmdTranscribe(args);
+    if (cmd == "models") return cmdModels();
+#else
+    if (cmd == "transcribe" || cmd == "models") {
+        std::fprintf(stderr, "error: this build has no speech recognition (MONTAGE_WITH_WHISPER=OFF)\n");
+        return 1;
+    }
+#endif
     if (cmd == "--version" || cmd == "version") {
         std::printf("Montage %s\n", MONTAGE_VERSION);
         return 0;

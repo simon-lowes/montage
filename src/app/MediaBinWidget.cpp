@@ -29,6 +29,7 @@
 #include "EditorState.h"
 #include "Theme.h"
 #include "ThumbnailCache.h"
+#include "TranscribeDialog.h"
 #include "media/Analysis.h"
 
 namespace montage {
@@ -182,10 +183,16 @@ void MediaBinWidget::rebuild() {
     const Project& p = state_->project();
     QString filter = search_->text().trimmed();
     // Skip the rebuild if the visible set is unchanged (keeps scroll position and selection).
+    // The search matches names and, for transcribed media, what is said.
+    auto matches = [&filter](const MediaItem& m) {
+        return filter.isEmpty() || QString::fromStdString(m.name).contains(filter, Qt::CaseInsensitive) ||
+               (m.transcript && QString::fromStdString(m.transcript->text()).contains(filter, Qt::CaseInsensitive));
+    };
     QStringList signature;
     for (const auto& m : p.media)
-        if (filter.isEmpty() || QString::fromStdString(m.name).contains(filter, Qt::CaseInsensitive))
-            signature << QString::number(m.id) + QString::fromStdString(m.name);
+        if (matches(m))
+            signature << QString::number(m.id) + QString::fromStdString(m.name) + "/" +
+                             QString::number(m.transcript ? m.transcript->wordCount() : 0);
     if (list_->property("signature").toStringList() == signature) {
         refreshThumbnails();
         return;
@@ -194,7 +201,7 @@ void MediaBinWidget::rebuild() {
     list_->clear();
     for (const auto& m : p.media) {
         QString name = QString::fromStdString(m.name);
-        if (!filter.isEmpty() && !name.contains(filter, Qt::CaseInsensitive)) continue;
+        if (!matches(m)) continue;
         auto* it = new QListWidgetItem(name, list_);
         it->setData(Qt::UserRole, QVariant::fromValue<qulonglong>(m.id));
         QString dur = m.duration > 0 ? QString::fromStdString(formatTimecode(FrameTime(m.duration * (m.fps.valid() ? m.fps.toDouble() : 30)),
@@ -204,6 +211,9 @@ void MediaBinWidget::rebuild() {
         if (m.hasVideo && m.width > 0) tip += QString("<br>%1×%2 @ %3 fps, %4").arg(m.width).arg(m.height).arg(m.fps.toDouble(), 0, 'f', 3).arg(QString::fromStdString(m.videoCodec));
         if (m.hasAudio && m.sampleRate > 0) tip += QString("<br>%1 Hz, %2 ch, %3").arg(m.sampleRate).arg(m.channels).arg(QString::fromStdString(m.audioCodec));
         if (!dur.isEmpty()) tip += "<br>" + dur;
+        if (m.transcript)
+            tip += "<br>" + tr("Transcript: %n word(s)", "", int(m.transcript->wordCount())) +
+                   (m.transcript->language.empty() ? QString() : QStringLiteral(" (%1)").arg(QString::fromStdString(m.transcript->language)));
         if (!m.path.empty()) tip += "<br><i>" + QString::fromStdString(m.path).toHtmlEscaped() + "</i>";
         it->setToolTip(tip);
         if (std::find(keep.begin(), keep.end(), m.id) != keep.end()) it->setSelected(true);
@@ -277,6 +287,34 @@ void MediaBinWidget::showContextMenu(const QPoint& pos) {
             });
         });
     }
+    std::vector<Id> withSound;
+    for (Id id : ids)
+        if (const MediaItem* m = state_->project().findMedia(id); m && m->hasAudio && !m->path.empty()) withSound.push_back(id);
+    if (!withSound.empty()) {
+        menu.addSeparator();
+        menu.addAction(tr("Transcribe..."), this, [this, withSound] { transcribe(withSound); });
+        if (ids.size() == 1)
+            if (const MediaItem* m = state_->project().findMedia(ids.front()); m && m->transcript) {
+                menu.addAction(tr("Export Transcript..."), this, [this, id = ids.front()] {
+                    if (const MediaItem* mi = state_->project().findMedia(id)) exportTranscript(*mi, this);
+                });
+            }
+        bool anyTranscript = false;
+        for (Id id : withSound)
+            if (const MediaItem* m = state_->project().findMedia(id)) anyTranscript |= bool(m->transcript);
+        if (anyTranscript)
+            menu.addAction(tr("Remove Transcript"), this, [this, withSound] {
+                state_->edit(tr("Remove Transcript"), [withSound](Project& p, Sequence&) {
+                    bool any = false;
+                    for (Id id : withSound)
+                        if (MediaItem* m = p.findMedia(id); m && m->transcript) {
+                            m->transcript.reset();
+                            any = true;
+                        }
+                    return any;
+                });
+            });
+    }
     std::vector<Id> videos;
     for (Id id : ids)
         if (const MediaItem* m = state_->project().findMedia(id); m && m->kind == MediaKind::Video && m->hasVideo) videos.push_back(id);
@@ -303,6 +341,12 @@ void MediaBinWidget::showContextMenu(const QPoint& pos) {
     menu.addSeparator();
     menu.addAction(tr("Import..."), this, &MediaBinWidget::importDialog);
     menu.exec(list_->viewport()->mapToGlobal(pos));
+}
+
+void MediaBinWidget::transcribe(const std::vector<Id>& ids) {
+    TranscribeDialog dlg(int(ids.size()), this);
+    if (dlg.exec() != QDialog::Accepted) return;
+    startTranscription(state_, ids, dlg.options(), this);
 }
 
 void MediaBinWidget::createProxies(const std::vector<Id>& ids) {

@@ -9,6 +9,7 @@
 #include "core/History.h"
 #include "core/Interchange.h"
 #include "core/ProjectIO.h"
+#include "core/Transcript.h"
 
 using namespace montage;
 using namespace montage::edit;
@@ -56,6 +57,67 @@ struct Fixture {
 class TestCore : public QObject {
     Q_OBJECT
 private slots:
+    void transcriptsCaptionsAndSearch() {
+        Transcript t;
+        t.language = "en";
+        t.model = "tiny.en";
+        TranscriptSegment a;
+        a.start = 0.5;
+        a.end = 4.0;
+        a.text = "And so, my fellow Americans, ask not";
+        const char* words[] = {"And", "so,", "my", "fellow", "Americans,", "ask", "not"};
+        for (int i = 0; i < 7; ++i) a.words.push_back({0.5 + i * 0.5, 0.9 + i * 0.5, words[i], 0.9f});
+        TranscriptSegment b;
+        b.start = 6.0;  // a pause before this one
+        b.end = 8.0;
+        b.text = "what your country can do for you.";
+        const char* words2[] = {"what", "your", "country", "can", "do", "for", "you."};
+        for (int i = 0; i < 7; ++i) b.words.push_back({6.0 + i * 0.25, 6.2 + i * 0.25, words2[i], 0.8f});
+        t.segments = {a, b};
+        QCOMPARE(t.wordCount(), size_t(14));
+        QCOMPARE(QString::fromStdString(t.text()), QString("And so, my fellow Americans, ask not what your country can do for you."));
+
+        // JSON round trip.
+        Transcript back;
+        QVERIFY(transcriptFromJson(transcriptToJson(t), back));
+        QCOMPARE(back, t);
+
+        // Cues: at most 20 characters, never across the pause.
+        auto cues = transcriptCues(t, 20, 6.0);
+        QVERIFY(cues.size() >= 3);
+        for (const Cue& c : cues) {
+            QVERIFY2(c.text.size() <= 20, c.text.c_str());
+            QVERIFY(c.end > c.start);
+        }
+        QVERIFY(std::none_of(cues.begin(), cues.end(), [](const Cue& c) { return c.start < 4.0 && c.end > 6.0; }));
+        const std::string srt = cuesToSrt(cues, 3600);
+        QVERIFY2(srt.rfind("1\n01:00:00,500 --> ", 0) == 0, srt.c_str());
+        QVERIFY(srt.find("\n2\n") != std::string::npos);
+        QVERIFY(cuesToVtt(cues).rfind("WEBVTT\n\n00:00:00.500 --> ", 0) == 0);
+
+        // Phrase search: whole words, ignoring case and punctuation, across segments.
+        auto hits = findPhrase(t, "Ask NOT what");
+        QCOMPARE(hits.size(), size_t(1));
+        QCOMPARE(hits[0].first, 3.0);
+        QCOMPARE(hits[0].second, 6.2);
+        QCOMPARE(findPhrase(t, "for you").size(), size_t(1));
+        QVERIFY(findPhrase(t, "country can't").empty());
+        QVERIFY(findPhrase(t, "").empty());
+
+        // Stored on media items and saved with the project.
+        Project p = makeDefaultProject();
+        MediaItem m;
+        m.id = p.newId();
+        m.name = "interview";
+        m.transcript = std::make_shared<const Transcript>(t);
+        p.media.push_back(m);
+        Project loaded;
+        std::string err;
+        QVERIFY2(projectFromJson(projectToJson(p), loaded, &err), err.c_str());
+        QVERIFY(loaded.media.at(0).transcript);
+        QCOMPARE(*loaded.media.at(0).transcript, t);
+    }
+
     void keyframeInterpolation() {
         Param p(5);
         QCOMPARE(p.at(100), 5.0);

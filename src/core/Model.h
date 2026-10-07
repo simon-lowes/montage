@@ -9,9 +9,12 @@
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
+
+#include "Transcript.h"
 
 namespace montage {
 
@@ -95,6 +98,8 @@ struct MediaItem {
     std::string audioCodec;
     Id sequenceId = 0;       // for MediaKind::Sequence (compound clip)
     std::string bin;         // bin (folder) name, "" = root
+    // Speech-to-text of the media's audio (shared: undo snapshots copy the pointer).
+    std::shared_ptr<const Transcript> transcript;
     bool operator==(const MediaItem&) const = default;
 };
 

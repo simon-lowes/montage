@@ -16,5 +16,19 @@ jobs:
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DMONTAGE_BUILD_APP=ON
       - name: Build
         run: cmake --build build
+      - name: Cache the speech model
+        uses: actions/cache@v4
+        with:
+          path: ~/whisper-models
+          key: whisper-ggml-tiny.en-v1
+      - name: Speech model for the transcription tests
+        run: |
+          mkdir -p ~/whisper-models
+          f="$HOME/whisper-models/ggml-tiny.en.bin"
+          if [ ! -s "$f" ]; then
+            curl -fL --retry 3 -o "$f" https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin \
+              || { rm -f "$f"; echo "::warning::Could not download the speech model; transcription tests will be skipped"; }
+          fi
+          [ -s "$f" ] && echo "MONTAGE_TEST_WHISPER_MODEL=$f" >> "$GITHUB_ENV" || true
       - name: Test
         run: ctest --test-dir build --output-on-failure

@@ -48,6 +48,7 @@ private:
     void showContextMenu(const QPoint& pos);
     std::vector<Id> selectedMedia() const;
     void createProxies(const std::vector<Id>& ids);
+    void transcribe(const std::vector<Id>& ids);
 
     EditorState* state_;
     MediaList* list_;

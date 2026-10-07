@@ -55,6 +55,10 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Preview resolution: Full, 1/2, 1/4, 1/8
 - Export presets: H.264 (x264), H.265 (x265, 8- and 10-bit), hardware H.264/H.265 (VideoToolbox, NVENC, Quick Sync, AMF or Media Foundation, falling back to x264/x265), Apple ProRes 422 HQ/LT/4444 (with alpha), Avid DNxHR, VP9, AV1 (SVT-AV1), WAV and AAC; exports either the whole sequence or In–Out
 - Still frame export
+- Transcription that runs on your computer (whisper.cpp; nothing is uploaded):
+  - Right-click clips in the media bin › Transcribe…, pick a model (Tiny to Large v3 Turbo, English-only or 99 languages) and a language, or translate to English. The model downloads once.
+  - Transcripts are word-timed, saved in the project, and undoable. The media bin search finds clips by what is said in them.
+  - Export Transcript… writes SubRip (`.srt`) or WebVTT (`.vtt`) captions, plain text, or JSON with word timings.
 - Interchange: CMX 3600 EDL and OpenTimelineIO (`.otio`) export, for finishing in Resolve, Premiere, Avid or Nuke
 - Project files are readable JSON (`.montage`) and relink moved media through relative paths
 - Crash safety:
@@ -133,6 +137,8 @@ montage-cli loudness mix.wav                                 # integrated LUFS a
 montage-cli edl cut.montage -o cut.edl                       # CMX 3600 EDL
 montage-cli otio cut.montage -o cut.otio                     # OpenTimelineIO
 montage-cli presets
+montage-cli models                                           # speech models and where they go
+montage-cli transcribe interview.mp4 --model base.en --srt interview.srt --vtt interview.vtt
 ```
 
 ## Architecture
@@ -158,13 +164,4 @@ Notes on the design:
 
 ## Roadmap
 
-These come after the MVP:
-- GPU compositor (Vulkan/OpenGL compute)
-- ACES/OCIO colour management and HDR
-- Multicam
-- Speech-to-text captions (whisper.cpp)
-- Speed ramps and optical-flow retiming
-- Tracking and stabilisation
-- OTIO import and FCP XML / AAF interchange
-- Hardware encode and decode (NVENC/VAAPI/VideoToolbox)
-- OpenFX plug-ins
+Phase 2 is ranked in [`docs/research/phase2-roadmap.md`](docs/research/phase2-roadmap.md) and tracked in [`PROGRESS.md`](PROGRESS.md). Next up: caption tracks, a transcript panel for text-based editing, dialogue denoise, masks, plugin editor windows, track and bus effect chains, Audio Unit and LV2 hosting, OCIO/ACES and HDR, multicam, a GPU compositor, tracking, optical-flow retiming and FCP XML interchange.

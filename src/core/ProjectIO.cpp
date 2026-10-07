@@ -281,6 +281,8 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
         if (!m.proxyPath.empty()) o["proxy"] = qs(m.proxyPath);
         if (m.sequenceId) o["sequence"] = double(m.sequenceId);
         if (!m.bin.empty()) o["bin"] = qs(m.bin);
+        if (m.transcript && !m.transcript->empty())
+            o["transcript"] = QJsonDocument::fromJson(QByteArray::fromStdString(transcriptToJson(*m.transcript))).object();
         media.append(o);
     }
     root["media"] = media;
@@ -324,6 +326,11 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
             if (QFileInfo::exists(rel)) m.path = QDir::cleanPath(rel).toStdString();
         }
         m.proxyPath = ss(o.value("proxy"));
+        if (o.contains("transcript")) {
+            Transcript t;
+            if (transcriptFromJson(QJsonDocument(o.value("transcript").toObject()).toJson(QJsonDocument::Compact).toStdString(), t))
+                m.transcript = std::make_shared<const Transcript>(std::move(t));
+        }
         m.duration = o.value("duration").toDouble();
         m.width = o.value("width").toInt();
         m.height = o.value("height").toInt();

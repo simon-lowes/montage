@@ -1,5 +1,6 @@
 add_library(montage_engine STATIC
   core/Model.h core/Model.cpp
+  core/Transcript.h core/Transcript.cpp
   core/Effects.h core/Effects.cpp
   core/EditOps.h core/EditOps.cpp
   core/History.h core/History.cpp
@@ -48,6 +49,13 @@ endif()
 target_compile_options(montage_engine PRIVATE
   $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wno-unused-parameter>)
 set_target_properties(montage_engine PROPERTIES AUTOMOC OFF)
+
+# Without whisper the transcriber reports that speech recognition is unavailable.
+target_sources(montage_engine PRIVATE media/Transcriber.h media/Transcriber.cpp)
+if(MONTAGE_WITH_WHISPER)
+  target_link_libraries(montage_engine PRIVATE whisper)
+  target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_WHISPER)
+endif()
 
 add_executable(montage-cli cli/main.cpp)
 target_link_libraries(montage-cli PRIVATE montage_engine)

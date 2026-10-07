@@ -6,12 +6,16 @@
 
 #include "core/EditOps.h"
 #include "core/Effects.h"
+#include "core/Transcript.h"
 #include "media/Analysis.h"
 #include "media/AudioSync.h"
 #include "media/Decoder.h"
 #include "media/HwAccel.h"
 #include "media/Loudness.h"
 #include "media/MediaPool.h"
+#ifdef MONTAGE_WITH_WHISPER
+#include "media/Transcriber.h"
+#endif
 #include "render/Compositor.h"
 #include "render/Exporter.h"
 
@@ -378,6 +382,48 @@ private slots:
         const float red = f->px[(size_t(90) * 320 + 160) * 4] / 65535.0f;
         QVERIFY2(std::fabs(red - 15 / 29.0f) < 0.06f, qPrintable(QString::number(red)));
     }
+
+#ifdef MONTAGE_WITH_WHISPER
+    void transcribesSpeech() {
+        // Needs a whisper model: $MONTAGE_TEST_WHISPER_MODEL (CI downloads tiny.en).
+        const QByteArray model = qgetenv("MONTAGE_TEST_WHISPER_MODEL");
+        if (model.isEmpty() || !QFileInfo::exists(QString::fromLocal8Bit(model)))
+            QSKIP("Set MONTAGE_TEST_WHISPER_MODEL to a ggml whisper model to run this test");
+        const std::string jfk = MONTAGE_TEST_DATA_DIR "/jfk.wav";
+        TranscribeOptions opts;
+        opts.model = model.toStdString();
+        opts.language = "en";
+        Transcript t;
+        std::string err;
+        double lastProgress = -1;
+        QVERIFY2(transcribeMedia(jfk, opts, t, [&](double f) { lastProgress = f; }, nullptr, &err), err.c_str());
+        const QString text = QString::fromStdString(t.text()).toLower();
+        qInfo("transcript: %s", qPrintable(text));
+        QVERIFY2(text.contains("ask not what your country can do for you"), qPrintable(text));
+        QCOMPARE(QString::fromStdString(t.language), QString("en"));
+        QVERIFY(lastProgress > 0.5);
+        // Word timings are ordered and inside the 11 s clip.
+        double prev = 0;
+        for (const auto& s : t.segments)
+            for (const auto& w : s.words) {
+                QVERIFY(w.start >= prev - 0.05 && w.end >= w.start && w.end <= 11.5);
+                prev = w.start;
+            }
+        auto hits = findPhrase(t, "your country");
+        QVERIFY(!hits.empty());
+        QVERIFY(hits[0].first > 3 && hits[0].second < 11);
+        QVERIFY(!transcriptCues(t).empty());
+
+        // Cancelling stops it.
+        std::atomic<bool> cancel{true};
+        Transcript none;
+        QVERIFY(!transcribeMedia(jfk, opts, none, {}, &cancel, &err));
+        // A missing model is reported.
+        opts.model = "no-such-model";
+        QVERIFY(!transcribeMedia(jfk, opts, none, {}, nullptr, &err));
+        QVERIFY(QString::fromStdString(err).contains("not found"));
+    }
+#endif
 
     void importedVideoComposites() {
         // Use the exported ramp as media inside a new project, at half speed.

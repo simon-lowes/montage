@@ -9,6 +9,7 @@ endfunction()
 montage_test(test_core)
 montage_test(test_render)
 montage_test(test_media)
+target_compile_definitions(test_media PRIVATE MONTAGE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 
 if(MONTAGE_BUILD_APP)
   add_executable(test_app test_app.cpp)
@@ -19,7 +20,8 @@ if(MONTAGE_BUILD_APP)
   add_dependencies(test_app montage_test_plugins montage-plugin-probe)
   target_compile_definitions(test_app PRIVATE
     MONTAGE_TEST_CLAP_DIR="${CMAKE_CURRENT_BINARY_DIR}/clap"
-    MONTAGE_PLUGIN_PROBE="$<TARGET_FILE:montage-plugin-probe>")
+    MONTAGE_PLUGIN_PROBE="$<TARGET_FILE:montage-plugin-probe>"
+    MONTAGE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 endif()
 
 # ---- Audio plugins: test CLAP plugins built as loadable *.clap modules ----
