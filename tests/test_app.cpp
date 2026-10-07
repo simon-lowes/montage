@@ -53,6 +53,7 @@
 #include "TimelineWidget.h"
 #include "TranscribeDialog.h"
 #include "TranscriptPanel.h"
+#include "core/AutoTag.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
 #include "core/Multicam.h"
@@ -1684,6 +1685,24 @@ private slots:
         QVERIFY(state()->sourceIn() >= FrameTime(std::floor((top.start - 0.01) * fps)) && state()->sourceIn() < state()->sourceOut());
         QVERIFY(panel->search("a red image") > 0);
         QVERIFY2(panel->results().front().best < 4, qPrintable(QString::number(panel->results().front().best)));
+        // A result saved as a subclip is named after the search.
+        const Id sub = panel->makeSubclip(0);
+        QVERIFY(sub);
+        QCOMPARE(state()->project().findMedia(sub)->name, std::string("A red image"));
+        QVERIFY(state()->project().findMedia(sub)->subclipIn < 4);
+        // Auto-Tag: keywords from the known labels, as one undo step (the subclip from its media's index).
+        auto* bin = win_->findChild<MediaBinWidget*>();
+        const int tagged = bin->autoTag({ids[0], sub});
+        QSet<QString> known;
+        for (const TagCategory& c : tagCategories())
+            for (const TagLabel& l : c.labels) known.insert(QString::fromStdString(l.keyword));
+        for (Id id : {ids[0], sub})
+            for (const std::string& k : state()->project().findMedia(id)->keywords) QVERIFY2(known.contains(QString::fromStdString(k)), k.c_str());
+        if (tagged > 0) {
+            state()->undo();
+            QVERIFY(state()->project().findMedia(ids[0])->keywords.empty() && state()->project().findMedia(sub)->keywords.empty());
+            state()->redo();
+        }
         const QString saved = dir_.path() + "/shots.montage";
         QString err2;
         QVERIFY(state()->save(saved, &err2));

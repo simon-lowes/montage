@@ -15,6 +15,7 @@
 #include <map>
 #include <sstream>
 
+#include "core/AutoTag.h"
 #include "core/EditOps.h"
 #include "core/MediaLog.h"
 #include "core/Effects.h"
@@ -335,7 +336,26 @@ struct McpServer::Impl {
     }
 
     void addTools();
+    // Indexes the videos (all, or these and subclips' media) that have no visual index; an error message or "".
+    QString indexMissing(Project& p, const std::vector<Id>& only, bool& changed);
 };
+
+QString McpServer::Impl::indexMissing(Project& p, const std::vector<Id>& only, bool& changed) {
+    std::vector<Id> want;
+    for (Id id : only)
+        if (const MediaItem* m = p.findMedia(id)) want.push_back(m->subclipOf ? m->subclipOf : id);
+    for (MediaItem& m : p.media) {
+        if (!only.empty() && std::find(want.begin(), want.end(), m.id) == want.end()) continue;
+        if (m.kind != MediaKind::Video || !m.hasVideo || m.path.empty() || m.subclipOf || (m.visual && !m.visual->samples.empty())) continue;
+        VisualIndex v;
+        std::string err;
+        if (!indexVideo(m.path, m.duration, v, 0, [&](double f) { progress(f, QStringLiteral("Indexing %1").arg(QString::fromStdString(m.name))); }, nullptr, &err))
+            return QString::fromStdString(m.name + ": " + err);
+        m.visual = std::make_shared<const VisualIndex>(std::move(v));
+        changed = true;
+    }
+    return {};
+}
 
 void McpServer::Impl::addTools() {
     add("montage_probe_media", "Probe media", "Describe a video, audio or image file: duration, size, frame rate and codecs.",
@@ -718,14 +738,7 @@ void McpServer::Impl::addTools() {
                 return fail("The visual search model is not downloaded: run `scripts/fetch-models.sh` or open Find Shots in the app once");
             std::string err;
             bool changed = false;
-            for (MediaItem& m : l.project.media) {
-                if (m.kind != MediaKind::Video || !m.hasVideo || m.path.empty() || m.subclipOf || (m.visual && !m.visual->samples.empty())) continue;
-                VisualIndex v;
-                if (!indexVideo(m.path, m.duration, v, 0, [&](double f) { progress(f, QStringLiteral("Indexing %1").arg(QString::fromStdString(m.name))); }, nullptr, &err))
-                    return fail(QString::fromStdString(m.name + ": " + err));
-                m.visual = std::make_shared<const VisualIndex>(std::move(v));
-                changed = true;
-            }
+            if (const QString e = indexMissing(l.project, {}, changed); !e.isEmpty()) return fail(e);
             if (changed) save(l);
             auto clip = ClipModel::load(&err);
             const std::vector<float> q = clip ? clip->text(need(a, "query").toStdString(), &err) : std::vector<float>{};
@@ -866,6 +879,47 @@ void McpServer::Impl::addTools() {
             QJsonObject o{{"name", QString::fromStdString(sub->name)}, {"id", double(sub->id)}};
             logJson(*sub, o);
             return ok(QStringLiteral("Made subclip \"%1\" (%2-%3 s)").arg(QString::fromStdString(sub->name)).arg(sub->subclipIn, 0, 'f', 2).arg(sub->subclipOut, 0, 'f', 2), o);
+        });
+
+    add("montage_auto_tag", "Auto-tag shots",
+        "Tag videos (and subclips) with keywords for what they show, with CLIP on this computer: Close-up, Medium shot or "
+        "Wide shot; Interior or Exterior; Day or Night; People. Videos are indexed first if needed. Returns each item's "
+        "keywords and the stretches of footage each tag covers.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "media":{"type":"array","items":{"type":"string"},"description":"Media files or names; default: every video"}},
+            "required":["project"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            if (!visualSearchAvailable()) return fail("This build of Montage cannot look at footage (no ONNX Runtime)");
+            if (!visualModel().installed())
+                return fail("The visual search model is not downloaded: run `scripts/fetch-models.sh` or open Find Shots in the app once");
+            std::vector<Id> ids;
+            for (const QJsonValue& v : a.value("media").toArray()) ids.push_back(projectMedia(l.project, v.toString()).id);
+            if (ids.empty())
+                for (const MediaItem& m : l.project.media)
+                    if (m.kind == MediaKind::Video && m.hasVideo) ids.push_back(m.id);
+            bool changed = false;
+            if (const QString e = indexMissing(l.project, ids, changed); !e.isEmpty()) return fail(e);
+            std::string err;
+            auto clip = ClipModel::load(&err);
+            const LabelEmbeddings labels = clip ? clip->labels(&err) : LabelEmbeddings{};
+            if (labels.empty()) return fail(QString::fromStdString(err));
+            QJsonArray list;
+            QString text;
+            for (Id id : ids) {
+                MediaItem* m = l.project.findMedia(id);
+                if (!m || m->kind != MediaKind::Video) continue;
+                const AutoTags t = autoTagMedia(l.project, *m, labels);
+                changed |= addKeywords(m->keywords, t.keywords);
+                QJsonArray kw, runs;
+                for (const std::string& k : t.keywords) kw.append(QString::fromStdString(k));
+                for (const TagRun& r : t.runs)
+                    runs.append(QJsonObject{{"keyword", QString::fromStdString(r.keyword)}, {"start_seconds", r.start}, {"end_seconds", r.end}});
+                list.append(QJsonObject{{"name", QString::fromStdString(m->name)}, {"keywords", kw}, {"runs", runs}});
+                text += QString::fromStdString(m->name) + ": " + (t.keywords.empty() ? QStringLiteral("(no tags)") : QString::fromStdString(joinKeywords(t.keywords))) + "\n";
+            }
+            if (changed) save(l);
+            return ok(text.isEmpty() ? QStringLiteral("No videos") : text, QJsonObject{{"media", list}});
         });
 
     add("montage_render_frame", "Look at a frame",

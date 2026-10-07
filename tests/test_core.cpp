@@ -4,6 +4,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 
+#include "core/AutoTag.h"
 #include "core/Captions.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
@@ -985,6 +986,68 @@ private slots:
         QCOMPARE(moveKey(keyed, 30, 500, 0, 99), FrameTime(99));
         QCOMPARE(moveKey(keyed, 31, 40, 0, 99), FrameTime(-1));
         QCOMPARE(keyed.keys.size(), size_t(3));
+    }
+
+    void autoTagging() {
+        // Labels as orthogonal directions, and samples that mix one label from some categories.
+        const auto& cats = tagCategories();
+        QCOMPARE(int(cats.size()), 4);
+        LabelEmbeddings labels;
+        int dim = 0;
+        for (const auto& c : cats) dim += int(c.labels.size());
+        int axis = 0;
+        for (const auto& c : cats) {
+            labels.emplace_back();
+            for (size_t l = 0; l < c.labels.size(); ++l) {
+                std::vector<float> e(size_t(dim), 0.f);
+                e[size_t(axis++)] = 1.f;
+                labels.back().push_back(e);
+            }
+        }
+        auto mix = [&](std::vector<std::pair<size_t, size_t>> parts) {
+            std::vector<float> e(size_t(dim), 0.f);
+            for (auto [c, l] : parts)
+                for (size_t i = 0; i < e.size(); ++i) e[i] += labels[c][l][i];
+            double len = 0;
+            for (float x : e) len += double(x) * x;
+            for (float& x : e) x = float(x / std::sqrt(len));
+            return e;
+        };
+        // Ten samples 2 s apart: close-ups then wide shots, all interior, daylight in the first three.
+        VisualIndex v;
+        v.step = 2;
+        for (int k = 0; k < 10; ++k) {
+            std::vector<std::pair<size_t, size_t>> parts{{0, k < 6 ? 0u : 2u}, {1, 0}};
+            if (k < 3) parts.push_back({2, 0});
+            v.add(k * 2.0, mix(parts));
+        }
+        AutoTags t = autoTags(v, labels);
+        QCOMPARE(t.keywords, (std::vector<std::string>{"Close-up", "Wide shot", "Interior"}));  // daylight is too little of it
+        auto run = [&](const char* k) {
+            for (const TagRun& r : t.runs)
+                if (r.keyword == k) return std::pair{r.start, r.end};
+            return std::pair{-1.0, -1.0};
+        };
+        QCOMPARE(run("Close-up"), (std::pair{0.0, 11.0}));
+        QCOMPARE(run("Wide shot"), (std::pair{11.0, 19.0}));
+        QCOMPARE(run("Interior"), (std::pair{0.0, 19.0}));
+        QCOMPARE(run("Day"), (std::pair{0.0, 5.0}));  // a run, though not a keyword
+        QVERIFY(std::is_sorted(t.runs.begin(), t.runs.end(), [](const TagRun& a, const TagRun& b) { return a.start < b.start; }));
+        // Part of the footage, as for a subclip.
+        QCOMPARE(autoTags(v, labels, 12, 18).keywords, (std::vector<std::string>{"Wide shot", "Interior"}));
+        Fixture fx;
+        MediaItem& m = *fx.p.findMedia(fx.media);
+        m.visual = std::make_shared<const VisualIndex>(v);
+        auto sub = makeSubclip(fx.p, fx.media, 0, 4.5);
+        QCOMPARE(autoTagMedia(fx.p, *sub, labels).keywords, (std::vector<std::string>{"Close-up", "Interior", "Day"}));
+        QCOMPARE(autoTagMedia(fx.p, m, labels).keywords, t.keywords);
+        m.visual.reset();
+        QVERIFY(autoTagMedia(fx.p, m, labels).keywords.empty());
+        // An undecided sample takes no label; "no people" never becomes a keyword.
+        VisualIndex unsure;
+        unsure.add(0, mix({{0, 0}, {0, 1}}));
+        unsure.add(1, mix({{3, 1}}));
+        QVERIFY(autoTags(unsure, labels).keywords.empty());
     }
 
     void subclips() {

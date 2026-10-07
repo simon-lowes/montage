@@ -90,6 +90,10 @@ public:
     bool deleteSmartBin(Id id);
     Id newSmartBinDialog();
     bool editSmartBinDialog(Id id);
+    // Tags videos and subclips with keywords for what they show (shot size,
+    // interior or exterior, day or night, people), indexing them first if
+    // needed; one undo step. Returns how many items got new keywords.
+    int autoTag(const std::vector<Id>& ids);
 
 public slots:
     void importDialog();

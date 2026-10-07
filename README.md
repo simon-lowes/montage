@@ -132,6 +132,8 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
   - Results show a thumbnail and the moment; opening one marks it with In and Out in the Source monitor.
   - It runs locally: CLIP ViT-B/32 (OpenAI, MIT) on ONNX Runtime, a 190 MB one-time download.
   - On the command line: `montage-cli shots project.montage "a red car at night"`.
+  - Right-click a result to save it as a subclip named after the search.
+- **Auto-Tag Shots** (right-click videos in the media bin): adds keywords for what each shot shows, using the same index. The keywords are Close-up, Medium shot or Wide shot; Interior or Exterior; Day or Night; and People. They work in searches and smart bins, and a subclip is tagged from its own range.
 - Edit by transcript (Transcript panel):
   - **Sequence mode** shows what the cut says, with the word under the playhead highlighted. Click a word to go there. Select words and press Delete to cut them out of every track; the gap closes and the captions move with it.
   - Remove Fillers cuts um, uh, er and similar words in one step. Shorten Pauses trims silences between words to a length you choose.
@@ -253,7 +255,7 @@ Its tools work on `.montage` files by path. Each edit is saved at once, and the 
 - add titles, effects (including masked ones), transitions and markers;
 - transcribe (with speaker labels) and find spoken phrases in the cut;
 - find shots by description;
-- log media (ratings, labels, keywords, metadata fields, bins), make subclips, and find media by text or smart-bin rules, optionally saving the rules as a smart bin;
+- log media (ratings, labels, keywords, metadata fields, bins), make subclips, auto-tag shots, and find media by text or smart-bin rules, optionally saving the rules as a smart bin;
 - return a rendered frame as an image so the agent can check its work;
 - render with any preset, with progress;
 - export and import EDL, OTIO, FCP 7 XML and FCPXML.

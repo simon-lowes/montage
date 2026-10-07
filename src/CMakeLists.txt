@@ -4,6 +4,7 @@ add_library(montage_engine STATIC
   core/KeyframeEdit.h core/KeyframeEdit.cpp
   core/ObjectMask.h core/ObjectMask.cpp
   core/VisualIndex.h core/VisualIndex.cpp
+  core/AutoTag.h core/AutoTag.cpp
   core/Transcript.h core/Transcript.cpp
   core/Captions.h core/Captions.cpp
   core/TranscriptEdit.h core/TranscriptEdit.cpp

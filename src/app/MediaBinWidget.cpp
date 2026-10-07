@@ -39,12 +39,16 @@
 
 #include "EditorState.h"
 #include "MediaBinModel.h"
+#include "ModelPacks.h"
+#include "ShotSearchPanel.h"
 #include "SmartBinDialog.h"
 #include "Theme.h"
 #include "ThumbnailCache.h"
 #include "TranscribeDialog.h"
 #include "core/MediaLog.h"
+#include "core/AutoTag.h"
 #include "media/Analysis.h"
+#include "media/VisualSearch.h"
 #include "render/ColorSpace.h"
 
 namespace montage {
@@ -642,6 +646,32 @@ bool MediaBinWidget::editSmartBinDialog(Id id) {
     return updateSmartBin(dlg.bin());
 }
 
+int MediaBinWidget::autoTag(const std::vector<Id>& ids) {
+    if (!visualSearchAvailable()) return 0;
+    if (!ensureModelPack(window(), visualModel(), tr("Auto-Tag"),
+                         tr("Tagging footage by what it shows uses CLIP (OpenAI, MIT licence), which runs on this computer.")))
+        return 0;
+    if (!indexVideos(state_, ids, window())) return 0;
+    std::string err;
+    const auto model = ClipModel::load(&err);
+    const LabelEmbeddings labels = model ? model->labels(&err) : LabelEmbeddings{};
+    if (labels.empty()) {
+        state_->message(QString::fromStdString(err), 6000);
+        return 0;
+    }
+    std::vector<std::pair<Id, std::vector<std::string>>> tags;
+    for (Id id : ids)
+        if (const MediaItem* m = state_->project().findMedia(id)) tags.emplace_back(id, autoTagMedia(state_->project(), *m, labels).keywords);
+    int changed = 0;
+    state_->edit(tr("Auto-Tag"), [&](Project& p, Sequence&) {
+        for (const auto& [id, keywords] : tags)
+            if (MediaItem* m = p.findMedia(id)) changed += montage::addKeywords(m->keywords, keywords) ? 1 : 0;
+        return changed > 0;
+    });
+    state_->message(changed ? tr("Tagged %n item(s) with what they show", "", changed) : tr("No new tags"), 5000);
+    return changed;
+}
+
 void MediaBinWidget::addKeywordsDialog(const std::vector<Id>& ids) {
     QInputDialog dlg(this);
     dlg.setWindowTitle(tr("Add Keywords"));
@@ -816,6 +846,12 @@ void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos)
             a->setData(i);
         }
         menu.addAction(tr("Add Keywords…"), this, [this, ids] { addKeywordsDialog(ids); })->setObjectName(QStringLiteral("addKeywords"));
+        std::vector<Id> taggable;
+        for (Id id : ids)
+            if (const MediaItem* m = state_->project().findMedia(id); m && m->kind == MediaKind::Video && m->hasVideo) taggable.push_back(id);
+        if (!taggable.empty() && visualSearchAvailable())
+            menu.addAction(tr("Auto-Tag Shots"), this, [this, taggable] { autoTag(taggable); })
+                ->setToolTip(tr("Add keywords for what each shot shows: close-up, medium or wide, interior or exterior, day or night, people"));
         std::vector<std::string> present;
         for (Id id : ids)
             if (const MediaItem* m = state_->project().findMedia(id)) montage::addKeywords(present, m->keywords);

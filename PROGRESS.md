@@ -270,4 +270,15 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
     - ranges, nesting, clamping, naming and inheritance, the speech in range, rules and usage, and the round trip;
     - in the app: Make Subclip with undo, opening, dropping on the timeline, usage, and removal with the media;
     - the MCP tools, and in/out seconds.
+- [x] Auto-Tag Shots (Final Cut Pro's shot and people analysis), from the Find Shots index with no extra model:
+  - Categories: shot size (Close-up, Medium shot, Wide shot), Interior or Exterior, Day or Night, and People against an empty scene. Each label is the average embedding of a few descriptions.
+  - Zero-shot, as CLIP does it: each sample's softmax over its category (logit scale 100). A sample takes a label at 60 % confidence, and the label becomes a keyword when it holds for 40 % of the footage.
+  - Runs of a label are reported too (the MCP tool returns them).
+  - The media bin's Auto-Tag Shots indexes what it needs first, and adds the keywords in one undo step. A subclip is tagged from its media's samples within its range.
+  - MCP `montage_auto_tag`.
+  - Find Shots results can be saved as subclips named after the search.
+  - Tested:
+    - the classifier on synthetic embeddings: keywords, shares, runs, a range, a subclip, undecided samples and the "no people" label;
+    - with the model: label embeddings are unit vectors, each nearest its own descriptions, and footage described as a close-up is tagged Close-up;
+    - the app (keywords, undo) and the MCP tool.
 

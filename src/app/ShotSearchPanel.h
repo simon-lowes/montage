@@ -20,6 +20,11 @@ namespace montage {
 class EditorState;
 class ThumbnailCache;
 
+// Indexes the given videos (a subclip's media, for a subclip) that have no
+// visual index yet, offering the model download first and showing progress.
+// False if cancelled or failed.
+bool indexVideos(EditorState* state, const std::vector<Id>& media, QWidget* parent);
+
 class ShotSearchPanel : public QWidget {
     Q_OBJECT
 public:

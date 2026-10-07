@@ -14,6 +14,7 @@
 #include <sstream>
 #include <cstdio>
 
+#include "core/AutoTag.h"
 #include "core/EditOps.h"
 #include "core/MediaLog.h"
 #include "core/Multicam.h"
@@ -837,6 +838,31 @@ private slots:
         // Cancelling stops without a result.
         std::atomic<bool> stop{true};
         QVERIFY(!indexVideo(st.path, 0, index, 0, {}, &stop, &err));
+
+        // Auto-tag labels: one unit embedding per label, each nearest its own descriptions.
+        const LabelEmbeddings labels = clip->labels(&err);
+        QVERIFY2(labels.size() == tagCategories().size(), err.c_str());
+        for (size_t c = 0; c < labels.size(); ++c) {
+            QCOMPARE(labels[c].size(), tagCategories()[c].labels.size());
+            for (size_t l = 0; l < labels[c].size(); ++l) {
+                double len = 0;
+                for (float x : labels[c][l]) len += double(x) * x;
+                QVERIFY(std::fabs(len - 1) < 1e-3);
+                const auto own = clip->text(tagCategories()[c].labels[l].prompts.front(), &err);
+                auto dot = [&](const std::vector<float>& a) {
+                    double d = 0;
+                    for (size_t i = 0; i < a.size(); ++i) d += double(a[i]) * own[i];
+                    return d;
+                };
+                for (size_t o = 0; o < labels[c].size(); ++o)
+                    if (o != l) QVERIFY(dot(labels[c][l]) > dot(labels[c][o]));
+            }
+        }
+        // Footage indexed from those descriptions gets those tags.
+        VisualIndex described;
+        described.step = 1;
+        for (int k = 0; k < 4; ++k) described.add(k, clip->text("an extreme close-up shot", &err));
+        QCOMPARE(autoTags(described, labels).keywords.front(), std::string("Close-up"));
     }
 
     void mcpServerEditsProjects() {
@@ -1009,6 +1035,19 @@ private slots:
             QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
             QVERIFY(!r.value("structuredContent").toObject().value("moments").toArray().isEmpty());
             QVERIFY(loadProject(project.toStdString(), saved) && saved.media.at(0).visual);
+        }
+
+        // Tagging footage by what it shows (from the same index).
+        if (visualSearchAvailable() && visualModel().installed()) {
+            r = tool("montage_auto_tag", QJsonObject{{"project", project}});
+            QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+            const QJsonArray tagged = r.value("structuredContent").toObject().value("media").toArray();
+            QVERIFY(!tagged.isEmpty());
+            QSet<QString> known;
+            for (const TagCategory& c : tagCategories())
+                for (const TagLabel& l : c.labels) known.insert(QString::fromStdString(l.keyword));
+            for (const QJsonValue& m : tagged)
+                for (const QJsonValue& k : m.toObject().value("keywords").toArray()) QVERIFY2(known.contains(k.toString()), qPrintable(k.toString()));
         }
 
         // Mistakes are reported, not fatal.

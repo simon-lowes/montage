@@ -12,6 +12,7 @@
 #include <QProgressDialog>
 #include <QPushButton>
 #include <QTimer>
+#include <algorithm>
 #include <QVBoxLayout>
 #include <QtConcurrent>
 #include <atomic>
@@ -94,6 +95,15 @@ void ShotSearchPanel::refreshStatus() {
 }
 
 bool ShotSearchPanel::indexMissing() {
+    std::vector<Id> ids;
+    for (const MediaItem& m : state_->project().media)
+        if (searchable(m)) ids.push_back(m.id);
+    const bool ok = indexVideos(state_, ids, window());
+    refreshStatus();
+    return ok;
+}
+
+bool indexVideos(EditorState* state, const std::vector<Id>& media, QWidget* parent) {
     if (!visualSearchAvailable()) return false;
     struct Job {
         Id id;
@@ -101,25 +111,29 @@ bool ShotSearchPanel::indexMissing() {
         double duration;
     };
     std::vector<Job> jobs;
-    for (const MediaItem& m : state_->project().media)
-        if (searchable(m) && (!m.visual || m.visual->samples.empty())) jobs.push_back({m.id, m.path, m.duration});
+    for (Id id : media) {
+        const MediaItem* m = state->project().findMedia(id);
+        if (m && m->subclipOf) m = state->project().findMedia(m->subclipOf);  // a subclip's media holds the index
+        if (!m || !searchable(*m) || (m->visual && !m->visual->samples.empty())) continue;
+        if (std::none_of(jobs.begin(), jobs.end(), [&](const Job& j) { return j.id == m->id; })) jobs.push_back({m->id, m->path, m->duration});
+    }
     if (jobs.empty()) return true;
-    if (!ensureModelPack(window(), visualModel(), tr("Find Shots"),
-                         tr("Searching footage by description uses CLIP (OpenAI, MIT licence), which runs on this computer.")))
+    if (!ensureModelPack(parent, visualModel(), QObject::tr("Find Shots"),
+                         QObject::tr("Searching and tagging footage by what it shows uses CLIP (OpenAI, MIT licence), which runs on this computer.")))
         return false;
-    QProgressDialog progress(tr("Indexing videos…"), tr("Cancel"), 0, 1000, window());
+    QProgressDialog progress(QObject::tr("Indexing videos…"), QObject::tr("Cancel"), 0, 1000, parent);
     progress.setWindowModality(Qt::WindowModal);
     progress.setMinimumDuration(300);
     auto done = std::make_shared<std::atomic<double>>(0.0);
     auto cancel = std::make_shared<std::atomic<bool>>(false);
-    connect(&progress, &QProgressDialog::canceled, this, [cancel] { *cancel = true; });
+    QObject::connect(&progress, &QProgressDialog::canceled, &progress, [cancel] { *cancel = true; });
     QTimer tick;
-    connect(&tick, &QTimer::timeout, &progress, [&progress, done] { progress.setValue(int(*done * 1000)); });
+    QObject::connect(&tick, &QTimer::timeout, &progress, [&progress, done] { progress.setValue(int(*done * 1000)); });
     tick.start(100);
     using Out = std::pair<std::vector<std::pair<Id, std::shared_ptr<const VisualIndex>>>, std::string>;
     QFutureWatcher<Out> watcher;
     QEventLoop wait;
-    connect(&watcher, &QFutureWatcher<Out>::finished, &wait, &QEventLoop::quit);
+    QObject::connect(&watcher, &QFutureWatcher<Out>::finished, &wait, &QEventLoop::quit);
     watcher.setFuture(QtConcurrent::run([jobs, done, cancel] {
         Out out;
         for (size_t i = 0; i < jobs.size() && !*cancel; ++i) {
@@ -135,20 +149,19 @@ bool ShotSearchPanel::indexMissing() {
     }));
     if (!watcher.isFinished()) wait.exec();
     tick.stop();
-    progress.disconnect(this);  // closing a progress dialog emits canceled()
+    QObject::disconnect(&progress, &QProgressDialog::canceled, nullptr, nullptr);  // closing a progress dialog emits canceled()
     progress.close();
     const Out r = watcher.result();
     if (!r.first.empty()) {
         // Saved with the project, but not an edit to undo.
         const auto indexes = r.first;
-        state_->amend([indexes](Project& p, Sequence&) {
+        state->amend([indexes](Project& p, Sequence&) {
             for (const auto& [id, v] : indexes)
                 if (MediaItem* m = p.findMedia(id)) m->visual = v;
             return true;
         });
     }
-    if (!r.second.empty()) state_->message(QString::fromStdString(r.second), 6000);
-    refreshStatus();
+    if (!r.second.empty()) state->message(QString::fromStdString(r.second), 6000);
     return !*cancel && r.second.empty();
 }
 

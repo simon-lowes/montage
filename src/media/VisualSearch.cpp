@@ -305,6 +305,27 @@ std::vector<std::vector<float>> ClipModel::images(const std::vector<Frame16Ptr>&
     return out;
 }
 
+LabelEmbeddings ClipModel::labels(std::string* error) const {
+    std::lock_guard lock(labelsMutex_);
+    if (!labels_.empty()) return labels_;
+    LabelEmbeddings out;
+    for (const TagCategory& c : tagCategories()) {
+        out.emplace_back();
+        for (const TagLabel& l : c.labels) {
+            std::vector<float> mean;
+            for (const std::string& prompt : l.prompts) {
+                const std::vector<float> e = text(prompt, error);
+                if (e.empty()) return {};
+                if (mean.empty()) mean.assign(e.size(), 0.f);
+                for (size_t i = 0; i < e.size() && i < mean.size(); ++i) mean[i] += e[i];
+            }
+            out.back().push_back(unit(mean.data(), mean.size()));
+        }
+    }
+    labels_ = out;
+    return out;
+}
+
 bool indexVideo(const std::string& path, double duration, VisualIndex& out, double step,
                 const std::function<void(double)>& progress, const std::atomic<bool>* cancel, std::string* error) {
     std::shared_ptr<ClipModel> model = ClipModel::load(error);

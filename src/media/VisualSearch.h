@@ -10,11 +10,13 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
 #include "Image.h"
 #include "ModelFiles.h"
+#include "core/AutoTag.h"
 #include "core/VisualIndex.h"
 
 namespace montage {
@@ -34,12 +36,17 @@ public:
     // Unit-length embeddings (512 values); empty on failure.
     std::vector<float> text(const std::string& query, std::string* error = nullptr) const;
     std::vector<std::vector<float>> images(const std::vector<Frame16Ptr>& frames, std::string* error = nullptr) const;
+    // The auto-tag labels' embeddings (core/AutoTag.h): each label's prompts
+    // averaged. Computed once; empty on failure.
+    LabelEmbeddings labels(std::string* error = nullptr) const;
 
     struct Impl;
 
 private:
     ClipModel();
     std::unique_ptr<Impl> d_;
+    mutable std::mutex labelsMutex_;
+    mutable LabelEmbeddings labels_;
 };
 
 // Embeds a frame every `step` seconds of a video (0: every 2 s, or every
