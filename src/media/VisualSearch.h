@@ -1,8 +1,8 @@
 // Montage — searching footage by what it shows ("a red car at night",
 // "two people shaking hands"). Frames sampled through each video and the
 // words of a query are embedded in one space by CLIP ViT-B/32 (OpenAI, MIT;
-// int8 ONNX export), so the frames nearest a query are the ones it
-// describes. Runs locally on ONNX Runtime; the model (155 MB) is downloaded
+// 4-bit ONNX export), so the frames nearest a query are the ones it
+// describes. Runs locally on ONNX Runtime; the model (190 MB) is downloaded
 // on first use.
 #pragma once
 

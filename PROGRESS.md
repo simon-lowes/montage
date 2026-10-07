@@ -200,7 +200,9 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
   - Argument mistakes come back as tool errors the model can correct.
   - Tested: a whole session in both eras with real media, the preview image, render progress, errors, and stdio framing.
 - [x] Find Shots (semantic visual search, Phase 3):
-  - Model: CLIP ViT-B/32 (OpenAI, MIT), an int8 ONNX export, downloaded on first use (155 MB, pinned and checked).
+  - Model: CLIP ViT-B/32 (OpenAI, MIT), a 4-bit ONNX export, downloaded on first use (190 MB, pinned and checked).
+    - It replaced the int8 export: ONNX Runtime's AMX int8 kernel crashed (illegal instruction) on the Windows runner.
+    - The 4-bit weights compute in floating point. Against the float model, its image embeddings match at cosine 0.976 (int8: 0.924) and its query scores correlate at 0.965 (int8: 0.867), at the same speed.
   - The tokenizer is CLIP's byte-level BPE, implemented in Montage and checked token for token against the reference: Unicode, contractions and digits.
   - Index: a frame every 2 s (1 s for short clips), decoded at CLIP's size and embedded in batches of 8. It is stored with each media item as 8-bit embeddings (about 0.5 kB a sample), saved with the project, and is not an undo step.
   - Search: a text query is embedded and compared with every sample. Runs near each peak become moments, best first.

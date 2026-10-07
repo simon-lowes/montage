@@ -36,10 +36,12 @@ const ModelPack& visualModel() {
         p.directoryEnv = "MONTAGE_VISUAL_MODEL";
         p.urlEnv = "MONTAGE_VISUAL_MODEL_URL";
         p.files = {
-            {"text_model_quantized.onnx", base + "onnx/text_model_quantized.onnx",
-             "73baab855d406190da9faa498cfedf65f15cf309f4cc7385b7b032e6d08e5c3a", 64504507},
-            {"vision_model_quantized.onnx", base + "onnx/vision_model_quantized.onnx",
-             "583fd1110a514667812fee7d684952aaf82a99b959760c8d7dca7e0ab9839299", 89117001},
+            // 4-bit weights with float maths (MatMulNBits): closer to the float model than the
+            // int8 export, and no integer matrix kernels (ONNX Runtime's AMX one crashed on Windows).
+            {"text_model_q4.onnx", base + "onnx/text_model_q4.onnx",
+             "e4ccd15d806b8af841a036884b42034535d58e04c52df00f56e73f72d3c166d5", 125742108},
+            {"vision_model_q4.onnx", base + "onnx/vision_model_q4.onnx",
+             "0769eb1d2f6f68927bbfa6e5330df4c4c3c112f89cd43eae28baafa9e6bd34b4", 63642858},
             {"vocab.json", base + "vocab.json", "5047b556ce86ccaf6aa22b3ffccfc52d391ea4accdab9c2f2407da5b742d4363", 862328},
             {"merges.txt", base + "merges.txt", "9fd691f7c8039210e0fced15865466c65820d09b63988b0174bfe25de299051a", 524619},
         };

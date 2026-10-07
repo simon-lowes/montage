@@ -35,8 +35,8 @@ fetch speakers campplus-voxceleb.onnx \
   https://huggingface.co/csukuangfj/speaker-embedding-models/resolve/0743f301363dec56491a490f6d6cbc9d67f9a3bf/3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx \
   357a834f702b80161e5b981182c038e18553c1f2ca752ed6cec2052365d4129b
 CLIP=https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/d15189d7028b43f1d3e65039190477f6af591c2a
-fetch clip-vit-b32 text_model_quantized.onnx "$CLIP/onnx/text_model_quantized.onnx" 73baab855d406190da9faa498cfedf65f15cf309f4cc7385b7b032e6d08e5c3a
-fetch clip-vit-b32 vision_model_quantized.onnx "$CLIP/onnx/vision_model_quantized.onnx" 583fd1110a514667812fee7d684952aaf82a99b959760c8d7dca7e0ab9839299
+fetch clip-vit-b32 text_model_q4.onnx "$CLIP/onnx/text_model_q4.onnx" e4ccd15d806b8af841a036884b42034535d58e04c52df00f56e73f72d3c166d5
+fetch clip-vit-b32 vision_model_q4.onnx "$CLIP/onnx/vision_model_q4.onnx" 0769eb1d2f6f68927bbfa6e5330df4c4c3c112f89cd43eae28baafa9e6bd34b4
 fetch clip-vit-b32 vocab.json "$CLIP/vocab.json" 5047b556ce86ccaf6aa22b3ffccfc52d391ea4accdab9c2f2407da5b742d4363
 fetch clip-vit-b32 merges.txt "$CLIP/merges.txt" 9fd691f7c8039210e0fced15865466c65820d09b63988b0174bfe25de299051a
 echo "Models in $DIR: MONTAGE_OBJECT_MODEL=$DIR/edgetam-video MONTAGE_SPEAKER_MODEL=$DIR/speakers MONTAGE_VISUAL_MODEL=$DIR/clip-vit-b32"

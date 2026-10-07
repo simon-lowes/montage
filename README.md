@@ -130,7 +130,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - **Find Shots**: search footage by what it shows ("a dog running on a beach", "close-up of hands").
   - Videos are indexed once, a frame every two seconds, and the index is saved with the project.
   - Results show a thumbnail and the moment; opening one marks it with In and Out in the Source monitor.
-  - It runs locally: CLIP ViT-B/32 (OpenAI, MIT) on ONNX Runtime, a 155 MB one-time download.
+  - It runs locally: CLIP ViT-B/32 (OpenAI, MIT) on ONNX Runtime, a 190 MB one-time download.
   - On the command line: `montage-cli shots project.montage "a red car at night"`.
 - Edit by transcript (Transcript panel):
   - **Sequence mode** shows what the cut says, with the word under the playhead highlighted. Click a word to go there. Select words and press Delete to cut them out of every track; the gap closes and the captions move with it.

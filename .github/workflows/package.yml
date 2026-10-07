@@ -46,7 +46,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/montage-models
-          key: models-edgetam-8ca3d3e-speakers-9403a69-0743f30-clip-d15189d
+          key: models-edgetam-8ca3d3e-speakers-9403a69-0743f30-clipq4-d15189d
       - name: AI models for the object mask, speaker and visual search tests
         run: |
           scripts/fetch-models.sh ~/montage-models \
@@ -97,7 +97,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/montage-models
-          key: models-edgetam-8ca3d3e-speakers-9403a69-0743f30-clip-d15189d
+          key: models-edgetam-8ca3d3e-speakers-9403a69-0743f30-clipq4-d15189d
       - name: AI models for the object mask, speaker and visual search tests
         run: |
           dir="$(cygpath -u "$USERPROFILE")/montage-models"  # where actions/cache's ~ points
