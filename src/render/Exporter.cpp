@@ -236,10 +236,18 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         else if (s.audioCodec == "pcm_s24le") want = AV_SAMPLE_FMT_S32;
         else if (s.audioCodec == "libopus") want = AV_SAMPLE_FMT_FLT;
         o.actx->sample_fmt = want;
-        if (codec->sample_fmts) {
+        const AVSampleFormat* fmts = nullptr;
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(61, 13, 100)
+        const void* cfg = nullptr;
+        if (avcodec_get_supported_config(o.actx, codec, AV_CODEC_CONFIG_SAMPLE_FORMAT, 0, &cfg, nullptr) >= 0)
+            fmts = static_cast<const AVSampleFormat*>(cfg);
+#else
+        fmts = codec->sample_fmts;
+#endif
+        if (fmts) {
             bool ok = false;
-            for (const AVSampleFormat* f = codec->sample_fmts; *f != AV_SAMPLE_FMT_NONE; ++f) ok |= (*f == want);
-            if (!ok) o.actx->sample_fmt = codec->sample_fmts[0];
+            for (const AVSampleFormat* f = fmts; *f != AV_SAMPLE_FMT_NONE; ++f) ok |= (*f == want);
+            if (!ok) o.actx->sample_fmt = fmts[0];
         }
         if (s.audioCodec == "aac" || s.audioCodec == "libopus") o.actx->bit_rate = s.audioBitrate;
         o.actx->time_base = AVRational{1, o.actx->sample_rate};

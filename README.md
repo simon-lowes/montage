@@ -54,6 +54,15 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Project files are readable JSON (`.montage`). They relink moved media through relative paths and autosave every 2 minutes.
 - `montage-cli` for headless rendering and automation
 
+## Installing
+
+The [Package workflow](.github/workflows/package.yml) builds installers on every push and pull request; download them from the run's **Artifacts**. Pushing a version tag (`git tag v0.1.0 && git push origin v0.1.0`) also publishes them as a GitHub Release.
+
+- **macOS** (Apple Silicon, macOS 15 or later): `Montage-<version>-macos-arm64.dmg`. Open it and drag Montage to Applications. The app is not notarised yet, so the first launch is blocked: open System Settings › Privacy & Security and choose **Open Anyway**.
+- **Windows** (x64, Windows 10 or later): `Montage-<version>-windows-x64-setup.exe` installs Montage, adds it to the Start menu and opens `.montage` projects on double-click. `Montage-<version>-windows-x64.zip` is the same app without installing. The installer is not code-signed yet, so SmartScreen warns: choose **More info › Run anyway**.
+
+Both include `montage-cli`: inside `Montage.app/Contents/MacOS/` on macOS, next to `montage.exe` on Windows.
+
 ## Building
 
 Ubuntu 24.04 or Debian with Qt ≥ 6.4 and FFmpeg ≥ 6:
@@ -64,8 +73,10 @@ cmake -S . -B build -G Ninja
 cmake --build build
 ctest --test-dir build --output-on-failure
 ./build/src/app/montage                 # the editor
-./build/src/cli/montage-cli --help      # the command-line tool
+./build/src/montage-cli --help          # the command-line tool
 ```
+
+On macOS: `brew install qtbase qtmultimedia ffmpeg ninja pkgconf`, configure with `-DCMAKE_PREFIX_PATH="$(brew --prefix)"`, then `scripts/package-macos.sh build` makes the DMG. On Windows, build in an MSYS2 UCRT64 shell with the `qt6-base`, `qt6-multimedia`, `qt6-tools` and `ffmpeg` packages; `scripts/package-windows.sh build` makes the portable folder and zip, and `packaging/windows/montage.iss` (Inno Setup) the installer.
 
 CMake options:
 - `-DMONTAGE_BUILD_APP=OFF` builds only the engine and CLI, without Qt Widgets or Multimedia.

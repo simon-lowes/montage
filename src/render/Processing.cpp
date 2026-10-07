@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <mutex>
@@ -517,7 +518,8 @@ std::shared_ptr<const Lut3D> loadCubeLut(const std::string& path, std::string* e
         auto it = cache.find(path);
         if (it != cache.end()) return it->second;
     }
-    std::ifstream in(path);
+    // Paths are UTF-8; a u8string path opens non-ASCII names on Windows too.
+    std::ifstream in(std::filesystem::path(std::u8string(path.begin(), path.end())));
     if (!in) {
         if (error) *error = "Cannot open LUT " + path;
         return nullptr;

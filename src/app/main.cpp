@@ -2,6 +2,7 @@
 #include <QApplication>
 #include <QCommandLineParser>
 #include <QFileInfo>
+#include <QIcon>
 #include <QTimer>
 
 #include "EditorState.h"
@@ -13,6 +14,7 @@ int main(int argc, char** argv) {
     QApplication::setApplicationName("Montage");
     QApplication::setOrganizationName("Montage");
     QApplication::setApplicationVersion(MONTAGE_VERSION);
+    QApplication::setWindowIcon(QIcon(":/montage.png"));
     montage::theme::apply(app);
 
     QCommandLineParser parser;

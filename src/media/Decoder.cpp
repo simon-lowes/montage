@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
-#include <filesystem>
 #include <thread>
 
 extern "C" {
@@ -108,7 +107,8 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
     }
     MediaItem m = out;
     m.path = path;
-    if (m.name.empty()) m.name = std::filesystem::path(path).filename().string();
+    // Not std::filesystem: on Windows it would read the UTF-8 path in the ANSI code page.
+    if (m.name.empty()) m.name = path.substr(path.find_last_of("/\\") + 1);
     int v = bestVideoStream(fmt);
     int a = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
     m.hasVideo = v >= 0;
