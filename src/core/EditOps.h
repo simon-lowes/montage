@@ -73,7 +73,8 @@ Result trim(Project& p, Sequence& s, Id clipId, Edge edge, FrameTime delta, Trim
 Result roll(Project& p, Sequence& s, Id leftClip, Id rightClip, FrameTime delta);
 Result slip(Project& p, Sequence& s, Id clipId, FrameTime delta);
 Result slide(Project& p, Sequence& s, Id clipId, FrameTime delta);
-Result setSpeed(Project& p, Sequence& s, Id clipId, double speed, bool ripple, bool reverse = false);
+Result setSpeed(Project& p, Sequence& s, Id clipId, double speed, bool ripple, bool reverse = false,
+                bool includeLinked = true);
 Result closeGap(Project& p, Sequence& s, TrackRef t, FrameTime frame);
 Result liftRange(Project& p, Sequence& s, FrameTime a, FrameTime b, const std::vector<TrackRef>& tracks);
 Result extractRange(Project& p, Sequence& s, FrameTime a, FrameTime b, const std::vector<TrackRef>& tracks);

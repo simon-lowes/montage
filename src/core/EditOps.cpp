@@ -136,9 +136,12 @@ void normalize(Track& t) {
         if (!a && !b) continue;
         if (a && b && a->end() != b->start) continue;
         // Keep transitions no longer than the clips they join.
+        // A centred transition may reach half its length into each clip; a
+        // one-sided fade lives entirely inside its clip.
         FrameTime maxDur = std::numeric_limits<FrameTime>::max();
-        if (a) maxDur = std::min(maxDur, a->duration * 2);
-        if (b) maxDur = std::min(maxDur, b->duration * 2);
+        const FrameTime k = (a && b) ? 2 : 1;
+        if (a) maxDur = std::min(maxDur, a->duration * k);
+        if (b) maxDur = std::min(maxDur, b->duration * k);
         tr.duration = std::clamp<FrameTime>(tr.duration, 1, maxDur);
         // Drop duplicates for the same edit point.
         bool dup = std::any_of(kept.begin(), kept.end(),
@@ -395,12 +398,21 @@ Result removeClips(Project& p, Sequence& s, const std::vector<Id>& ids, bool rip
         if (std::find(primary.begin(), primary.end(), r.track) == primary.end()) primary.push_back(r.track);
     for (auto it = merged.rbegin(); it != merged.rend(); ++it) {
         auto [a, b] = *it;
+        // Every affected track moves by the same amount so linked clips stay in
+        // sync: the gap length, limited by the free space on each primary track
+        // (linked clips of different lengths leave different gaps).
+        FrameTime len = b - a;
+        for (TrackRef r : primary) {
+            const Track* t = trackAt(s, r);
+            for (const auto& c : t->clips)
+                if (c.end() > a) len = std::min(len, std::max<FrameTime>(0, c.start - a));
+        }
+        if (len <= 0) continue;
         for (TrackRef r : rippleTracks(s, primary)) {
             Track* t = trackAt(s, r);
-            if (!editable(t)) continue;
-            if (!trackEmpty(*t, a, b)) continue;
+            if (!editable(t) || !trackEmpty(*t, a, a + len)) continue;
             for (auto& c : t->clips)
-                if (c.start >= b) c.start -= (b - a);
+                if (c.start >= a) c.start -= len;
             normalize(*t);
         }
     }
@@ -576,25 +588,29 @@ Result trim(Project& p, Sequence& s, Id clipId, Edge edge, FrameTime delta, Trim
     }
 
     std::vector<TrackRef> primary;
+    std::map<TrackRef, FrameTime> oldEnd;  // per primary track: where following material starts
+    const FrameTime primaryOldEnd = primaryClip.end();
     for (Id id : group) {
         auto l = locate(s, id);
         Track* lt = trackAt(s, l->track);
         if (lt->locked) continue;
         if (std::find(primary.begin(), primary.end(), l->track) == primary.end()) primary.push_back(l->track);
+        oldEnd[l->track] = lt->clips[l->index].end();
         applyTrim(lt->clips[l->index], edge, delta, mode);
     }
 
     if (mode == TrimMode::Ripple) {
         // Out edge: following material shifts by delta. In edge: the clip
-        // stays put and following material shifts by -delta.
+        // stays put and following material shifts by -delta. Each track
+        // shifts from its own trimmed clip's old end (linked partners may end
+        // at different frames); other sync-locked tracks follow the clicked clip.
         FrameTime shift = edge == Edge::Out ? delta : -delta;
-        FrameTime at = edge == Edge::Out ? edgePos : primaryClip.start;  // primaryClip is now updated
-        if (edge == Edge::In) {
-            // Clips that started after the trimmed clip's (unchanged) start.
-            const Clip* pc = clipById(s, clipId);
-            at = pc->end() + delta;  // old end
+        for (TrackRef r : rippleTracks(s, primary)) {
+            auto it = oldEnd.find(r);
+            bool isPrimary = it != oldEnd.end();
+            FrameTime at = isPrimary ? it->second : primaryOldEnd;
+            rippleShift(s, {r}, isPrimary ? std::vector<TrackRef>{r} : std::vector<TrackRef>{}, at, shift, group);
         }
-        rippleShift(s, rippleTracks(s, primary), primary, at, shift, group);
     }
     for (TrackRef r : primary) normalize(*trackAt(s, r));
     Result res;
@@ -669,27 +685,60 @@ Result slide(Project& p, Sequence& s, Id clipId, FrameTime delta) {
     return r;
 }
 
-Result setSpeed(Project& p, Sequence& s, Id clipId, double speed, bool ripple, bool reverse) {
+Result setSpeed(Project& p, Sequence& s, Id clipId, double speed, bool ripple, bool reverse, bool includeLinked) {
     if (!(speed > 0.001) || speed > 100) return Result::fail("Speed out of range");
     auto loc = locate(s, clipId);
     if (!loc) return Result::fail("Unknown clip");
-    Track* t = trackAt(s, loc->track);
-    if (t->locked) return Result::fail("Track is locked");
-    Clip& c = t->clips[loc->index];
-    double extent = c.sourceExtent();
-    FrameTime newDur = std::max<FrameTime>(1, FrameTime(std::llround(extent / speed)));
-    FrameTime limit = sourceLimit(p, s, c);
-    if (limit < kInfiniteFrames)
-        newDur = std::min<FrameTime>(newDur, std::max<FrameTime>(1, FrameTime((double(limit) - c.sourceIn) / speed)));
-    FrameTime oldEnd = c.end();
-    if (!ripple && loc->index + 1 < t->clips.size())
-        newDur = std::min<FrameTime>(newDur, t->clips[loc->index + 1].start - c.start);
-    FrameTime grow = newDur - c.duration;
-    c.speed = speed;
-    c.reverse = reverse;
-    c.duration = newDur;
-    if (ripple && grow != 0) rippleShift(s, rippleTracks(s, {loc->track}), {loc->track}, oldEnd, grow, {clipId});
-    normalize(*t);
+    if (trackAt(s, loc->track)->locked) return Result::fail("Track is locked");
+    const Clip& primaryClip = trackAt(s, loc->track)->clips[loc->index];
+    // Linked partners starting with the clip change speed with it, and the
+    // ripple is applied once per track (not once per partner).
+    std::vector<Id> group{clipId};
+    if (includeLinked && primaryClip.linkGroup)
+        for (Id l : linkedClips(s, clipId))
+            if (l != clipId)
+                if (const Clip* lc = clipById(s, l); lc && lc->start == primaryClip.start) group.push_back(l);
+    struct Change {
+        TrackRef track;
+        Id id;
+        FrameTime oldEnd, newDur;
+    };
+    std::vector<Change> changes;
+    for (Id id : group) {
+        auto l = locate(s, id);
+        Track* t = trackAt(s, l->track);
+        if (t->locked) continue;
+        const Clip& c = t->clips[l->index];
+        FrameTime newDur = std::max<FrameTime>(1, FrameTime(std::llround(c.sourceExtent() / speed)));
+        FrameTime limit = sourceLimit(p, s, c);
+        if (limit < kInfiniteFrames)
+            newDur = std::min<FrameTime>(newDur, std::max<FrameTime>(1, FrameTime((double(limit) - c.sourceIn) / speed)));
+        if (!ripple && l->index + 1 < t->clips.size())
+            newDur = std::min<FrameTime>(newDur, t->clips[l->index + 1].start - c.start);
+        changes.push_back({l->track, id, c.end(), newDur});
+    }
+    std::map<TrackRef, FrameTime> growBy, endBy;
+    std::vector<TrackRef> primary;
+    for (const auto& ch : changes) {
+        Clip* c = clipById(s, ch.id);
+        growBy[ch.track] = ch.newDur - c->duration;
+        endBy[ch.track] = ch.oldEnd;
+        primary.push_back(ch.track);
+        c->speed = speed;
+        c->reverse = reverse;
+        c->duration = ch.newDur;
+    }
+    if (ripple) {
+        FrameTime primaryGrow = growBy.count(loc->track) ? growBy[loc->track] : 0;
+        for (TrackRef r : rippleTracks(s, primary)) {
+            bool isPrimary = growBy.count(r) > 0;
+            FrameTime grow = isPrimary ? growBy[r] : primaryGrow;
+            FrameTime at = isPrimary ? endBy[r] : (endBy.count(loc->track) ? endBy[loc->track] : 0);
+            if (grow != 0)
+                rippleShift(s, {r}, isPrimary ? std::vector<TrackRef>{r} : std::vector<TrackRef>{}, at, grow, group);
+        }
+    }
+    for (TrackRef r : primary) normalize(*trackAt(s, r));
     return {};
 }
 

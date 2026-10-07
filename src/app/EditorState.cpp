@@ -1,6 +1,8 @@
 #include "EditorState.h"
 
+#include <QCoreApplication>
 #include <QDir>
+#include <QPointer>
 #include <QFileInfo>
 #include <QStandardPaths>
 #include <QtConcurrent>
@@ -13,12 +15,21 @@
 namespace montage {
 
 EditorState::EditorState(QObject* parent) : QObject(parent), project_(makeDefaultProject()) {
-    MediaPool::instance().setReadyCallback([this](const std::string& path) {
+    // Decodes finish on worker threads, possibly after this object is gone:
+    // hop to the application object and re-check before emitting.
+    QPointer<EditorState> self(this);
+    MediaPool::instance().setReadyCallback([self](const std::string& path) {
+        QCoreApplication* app = QCoreApplication::instance();
+        if (!app) return;
         QString p = QString::fromStdString(path);
-        QMetaObject::invokeMethod(this, [this, p] { emit mediaReady(p); }, Qt::QueuedConnection);
+        QMetaObject::invokeMethod(app, [self, p] {
+            if (self) emit self->mediaReady(p);
+        }, Qt::QueuedConnection);
     });
     savedRevision_ = history_.revision();
 }
+
+EditorState::~EditorState() { MediaPool::instance().setReadyCallback(nullptr); }
 
 QString timecodeString(const Sequence* s, FrameTime t) {
     return QString::fromStdString(formatTimecode(t, s ? s->fps : Rational{30, 1}));

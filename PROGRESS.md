@@ -44,7 +44,7 @@ verified run.
 - [x] Playback: render ahead and cache frames so playback and stepping are smooth
 - [x] Audio scrubbing while dragging the playhead
 - [x] Keyframe markers on timeline clips
-- [ ] Correctness review of edit operations, playback and export; fix findings
+- [x] Correctness review of edit operations, playback and export; fix findings (12 found, all fixed, regression tests added)
 
 ## Delivery
 - [x] CI (GitHub Actions): build + tests

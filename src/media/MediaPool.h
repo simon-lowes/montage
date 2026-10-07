@@ -40,7 +40,12 @@ private:
     struct Slot {
         std::unique_ptr<VideoDecoder> dec;
         bool busy = false;
+        uint64_t lastUsed = 0;
     };
+    // Closes the least recently used idle decoder (any file). Caller holds m_.
+    bool evictOne();
+    static constexpr size_t kMaxDecoders = 16;  // open files / FFmpeg thread pools across the app
+    uint64_t useClock_ = 0;
     VideoDecoder* acquire(const std::string& path, double t);
     void release(VideoDecoder* d);
 

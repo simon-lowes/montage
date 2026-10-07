@@ -213,6 +213,54 @@ private slots:
         QCOMPARE(out[10], 0.0f);
     }
 
+    void nestedAudioFollowsSpeedAndRate() {
+        // A 3 s WAV whose level steps up each second: 0.1, 0.2, 0.3.
+        std::string wav = path("steps.wav");
+        {
+            FILE* f = std::fopen(wav.c_str(), "wb");
+            int rate = 48000, frames = rate * 3;
+            uint32_t bytes = uint32_t(frames) * 4;
+            auto u32 = [&](uint32_t v) { std::fwrite(&v, 4, 1, f); };
+            auto u16 = [&](uint16_t v) { std::fwrite(&v, 2, 1, f); };
+            std::fwrite("RIFF", 1, 4, f); u32(36 + bytes); std::fwrite("WAVEfmt ", 1, 8, f); u32(16); u16(1); u16(2);
+            u32(uint32_t(rate)); u32(uint32_t(rate) * 4); u16(4); u16(16); std::fwrite("data", 1, 4, f); u32(bytes);
+            for (int i = 0; i < frames; ++i) {
+                int16_t v = int16_t(std::lround((0.1 * (i / rate + 1)) * 32767));
+                std::fwrite(&v, 2, 1, f);
+                std::fwrite(&v, 2, 1, f);
+            }
+            std::fclose(f);
+        }
+        Project p = makeDefaultProject();
+        Sequence& inner = *p.active();
+        MediaItem m = probeOrFail(p, wav);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, inner, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Id innerId = inner.id;
+        auto r = edit::makeCompound(p, *p.findSequence(innerId), edit::expandLinks(*p.findSequence(innerId),
+                                    {trackAt(*p.findSequence(innerId), {TrackKind::Audio, 0})->clips[0].id}), "Nest");
+        QVERIFY(r.ok);
+        Sequence& outer = *p.findSequence(innerId);
+        Id nestAudio = trackAt(outer, {TrackKind::Audio, 0})->clips[0].id;
+        AudioMixer mixer;
+        std::vector<float> out(4800 * 2);
+        // Normal speed: at 1.5 s we hear the second step.
+        mixer.mix(p, outer, 72000, 4800, out.data());
+        QVERIFY2(std::fabs(out[200] - 0.2f) < 0.01f, qPrintable(QString::number(out[200])));
+        // 2x speed: the block 0.9-1.1 s of timeline covers source 1.8-2.2 s, so the
+        // step from 0.2 to 0.3 happens inside it, at timeline 1.0 s.
+        QVERIFY(edit::setSpeed(p, outer, nestAudio, 2.0, true).ok);
+        std::vector<float> blk(9600 * 2);
+        mixer.mix(p, outer, 43200, 9600, blk.data());
+        QVERIFY2(std::fabs(blk[200] - 0.2f) < 0.01f, qPrintable(QString::number(blk[200])));
+        QVERIFY2(std::fabs(blk[7200 * 2] - 0.3f) < 0.01f, qPrintable(QString::number(blk[7200 * 2])));
+        // Outer sequence at 44.1 kHz: timing is still right (0.5 s -> source 1.0 s -> second step).
+        outer.sampleRate = 44100;
+        mixer.reset();
+        mixer.mix(p, outer, 22050 + 2000, 2000, out.data());
+        QVERIFY2(std::fabs(out[200] - 0.2f) < 0.01f, qPrintable(QString::number(out[200])));
+    }
+
     void exportAndDecodeFrameAccurately() {
         // A colour matte whose red channel ramps 0 -> 1 over 30 frames.
         Project p = makeDefaultProject();
@@ -374,6 +422,7 @@ private slots:
         ExportSettings st = findExportPreset("H.264 - Fast Draft")->settings;
         st.path = path("cancelled.mp4");
         QVERIFY(!exportSequence(p, s, st, nullptr, &cancel, &err));
+        QVERIFY(!QFileInfo::exists(QString::fromStdString(st.path)));  // no partial file left behind
         // Still frame.
         QVERIFY2(exportStill(p, s, 5, path("still.png"), &err), err.c_str());
         QVERIFY(QFileInfo(QString::fromStdString(path("still.png"))).size() > 100);

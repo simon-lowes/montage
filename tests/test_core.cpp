@@ -447,6 +447,64 @@ private slots:
         QVERIFY(!projectFromJson("{\"format\":\"other\"}", back, &err));
     }
 
+    // Regression tests for review findings.
+    void rippleTrimLinkedPartnersEndingElsewhere() {
+        Fixture fx;
+        const TrackRef A2{TrackKind::Audio, 1}, A3{TrackKind::Audio, 2};
+        Id v = fx.put(V1, 0, 150);
+        Id a = fx.put(A1, 0, 100);
+        linkClips(fx.p, fx.s(), {v, a});
+        Id a2 = fx.put(A2, 100, 50);
+        Id a3 = fx.put(A3, 150, 50);
+        QVERIFY(trim(fx.p, fx.s(), v, Edge::In, 10, TrimMode::Ripple).ok);
+        // A3 follows V1 (shifted from its old end, 150); A2 is not pushed into it.
+        QCOMPARE(clipById(fx.s(), a3)->start, FrameTime(140));
+        QCOMPARE(clipById(fx.s(), a2)->start, FrameTime(100));
+        for (TrackRef r : allTracks(fx.s())) {
+            const auto& cl = trackAt(fx.s(), r)->clips;
+            for (size_t i = 1; i < cl.size(); ++i) QVERIFY(cl[i - 1].end() <= cl[i].start);
+        }
+    }
+
+    void rippleDeleteKeepsLinkedSync() {
+        Fixture fx;
+        // A linked pair with audio longer than video, then a J-cut pair (audio starts 5 later).
+        Id v = fx.put(V1, 0, 10);
+        Id a = fx.put(A1, 0, 15);
+        linkClips(fx.p, fx.s(), {v, a});
+        Id v2 = fx.put(V1, 10, 30);
+        Id a2 = fx.put(A1, 15, 30);
+        linkClips(fx.p, fx.s(), {v2, a2});
+        QVERIFY(removeClips(fx.p, fx.s(), {v, a}, true).ok);
+        // Both tracks move by the same amount, preserving the 5-frame offset.
+        QCOMPARE(clipById(fx.s(), a2)->start - clipById(fx.s(), v2)->start, FrameTime(5));
+        QCOMPARE(clipById(fx.s(), v2)->start, FrameTime(0));
+    }
+
+    void speedChangeOnLinkedPairRipplesOnce() {
+        Fixture fx;
+        auto r = placeMedia(fx.p, fx.s(), fx.media, 0, 0, 100, V1, A1, false);
+        auto next = placeMedia(fx.p, fx.s(), fx.media, 100, 0, 50, V1, A1, false);
+        QVERIFY(setSpeed(fx.p, fx.s(), r.created[0], 0.5, true).ok);
+        QCOMPARE(clipById(fx.s(), r.created[0])->duration, FrameTime(200));
+        QCOMPARE(clipById(fx.s(), r.created[1])->duration, FrameTime(200));  // linked audio too
+        QCOMPARE(clipById(fx.s(), next.created[0])->start, FrameTime(200));  // pushed by 100, not 200
+        QCOMPARE(clipById(fx.s(), next.created[1])->start, FrameTime(200));
+    }
+
+    void oneSidedFadeClampedToClip() {
+        Fixture fx;
+        Id red = fx.put(V1, 0, 30);
+        fx.put(V1, 30, 10);
+        // Fade-out of the short blue clip can't exceed its own 10 frames.
+        Id blue = fx.v1().clips[1].id;
+        auto r = addTransition(fx.p, fx.s(), blue, Edge::Out, "dip_to_black", 30);
+        QCOMPARE(transitionById(fx.s(), r.created[0])->duration, FrameTime(10));
+        // A centred transition between red and blue may use half of each: up to 20.
+        auto c = addTransition(fx.p, fx.s(), red, Edge::Out, "cross_dissolve", 30);
+        QCOMPARE(transitionById(fx.s(), c.created[0])->duration, FrameTime(20));
+    }
+
     void interchangeExports() {
         Fixture fx;
         Id a = fx.put(V1, 0, 60, 30);

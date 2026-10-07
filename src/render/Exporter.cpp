@@ -4,6 +4,7 @@
 #include <QString>
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 
 #include "Compositor.h"
 #include "Processing.h"
@@ -129,8 +130,10 @@ const ExportPreset* findExportPreset(const std::string& name) {
     return nullptr;
 }
 
-bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
-                    const std::atomic<bool>* cancel, std::string* error) {
+namespace {
+
+bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
+                const std::atomic<bool>* cancel, std::string* error, bool& opened) {
     auto fail = [&](const std::string& msg) {
         if (error) *error = msg;
         return false;
@@ -252,6 +255,7 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
     if (!(o.oc->oformat->flags & AVFMT_NOFILE)) {
         if ((rc = avio_open(&o.oc->pb, s.path.c_str(), AVIO_FLAG_WRITE)) < 0)
             return fail("Cannot write " + s.path + ": " + averr(rc));
+        opened = true;
     }
     av_dict_set(&o.oc->metadata, "encoder", "Montage", 0);
     if ((rc = avformat_write_header(o.oc, nullptr)) < 0) return fail("Cannot write header: " + averr(rc));
@@ -360,17 +364,31 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
         }
         if (progress && ((f - in) % 5 == 0 || f + 1 == out)) progress(double(f - in + 1) / double(total), f);
     }
+    // Flush the encoders; errors here (e.g. a full disk) must fail the export.
     if (wantAudio) {
         if (!encodeAudio(true)) return fail("Audio encoding failed");
-        avcodec_send_frame(o.actx, nullptr);
-        drain(o, o.actx, o.ast);
+        if ((rc = avcodec_send_frame(o.actx, nullptr)) < 0 || (rc = drain(o, o.actx, o.ast)) < 0)
+            return fail("Finishing audio failed: " + averr(rc));
     }
     if (wantVideo) {
-        avcodec_send_frame(o.vctx, nullptr);
-        drain(o, o.vctx, o.vst);
+        if ((rc = avcodec_send_frame(o.vctx, nullptr)) < 0 || (rc = drain(o, o.vctx, o.vst)) < 0)
+            return fail("Finishing video failed: " + averr(rc));
     }
     if ((rc = av_write_trailer(o.oc)) < 0) return fail("Cannot finalise file: " + averr(rc));
+    if (o.oc->pb && o.oc->pb->error < 0) return fail("Writing the file failed: " + averr(o.oc->pb->error));
     return true;
+}
+
+}  // namespace
+
+bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
+                    const std::atomic<bool>* cancel, std::string* error) {
+    bool opened = false;
+    bool ok = exportImpl(p, seq, s, progress, cancel, error, opened);
+    // Never leave a truncated file behind (the output is closed by now), but
+    // don't touch an existing file if we failed before writing to it.
+    if (!ok && opened) std::remove(s.path.c_str());
+    return ok;
 }
 
 bool exportStill(const Project& p, const Sequence& seq, FrameTime t, const std::string& path, std::string* error) {

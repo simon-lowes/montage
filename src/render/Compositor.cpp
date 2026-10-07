@@ -486,8 +486,8 @@ void AudioMixer::mix(const Project& p, const Sequence& seq, int64_t start, int f
 }
 
 void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, int frames, float* out,
-                         std::vector<MeterLevels>* trackLevels, int depth) {
-    const double sr = seq.sampleRate;
+                         std::vector<MeterLevels>* trackLevels, int depth, int rate) {
+    const double sr = rate > 0 ? rate : seq.sampleRate;
     const double fps = seq.fpsValue();
     const int64_t end = start + frames;
     bool anySolo = std::any_of(seq.audioTracks.begin(), seq.audioTracks.end(), [](const Track& t) { return t.solo; });
@@ -532,10 +532,24 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
             if (m->kind == MediaKind::Sequence) {
                 const Sequence* nested = p.findSequence(m->sequenceId);
                 if (!nested || depth >= kMaxDepth || nested->id == seq.id) continue;
-                int64_t nStart = int64_t(std::llround(srcBase + double(s0 - cs) * c.speed));
-                std::vector<float> nb(size_t(s1 - s0) * 2, 0.0f);
-                mixInto(p, *nested, nStart, int(s1 - s0), nb.data(), nullptr, depth + 1);
-                std::copy(nb.begin(), nb.end(), clipBuf.begin() + (s0 - start) * 2);
+                // Mix the span of the nested sequence this block covers (at our
+                // rate), then resample it for the clip's speed and direction.
+                auto srcPos = [&](int64_t smp) {
+                    return c.reverse ? srcBase + double(ce - 1 - smp) * c.speed : srcBase + double(smp - cs) * c.speed;
+                };
+                double lo = std::min(srcPos(s0), srcPos(s1 - 1)), hi = std::max(srcPos(s0), srcPos(s1 - 1));
+                int64_t nStart = int64_t(std::floor(lo));
+                int64_t nLen = int64_t(std::floor(hi)) - nStart + 2;
+                std::vector<float> nb(size_t(nLen) * 2, 0.0f);
+                mixInto(p, *nested, nStart, int(nLen), nb.data(), nullptr, depth + 1, int(sr));
+                for (int64_t smp = s0; smp < s1; ++smp) {
+                    double rel = srcPos(smp) - double(nStart);
+                    int64_t i = std::clamp<int64_t>(int64_t(rel), 0, nLen - 2);
+                    float f = float(std::clamp(rel - double(i), 0.0, 1.0));
+                    float* d = &clipBuf[size_t(smp - start) * 2];
+                    d[0] = nb[size_t(i) * 2] + (nb[size_t(i + 1) * 2] - nb[size_t(i) * 2]) * f;
+                    d[1] = nb[size_t(i) * 2 + 1] + (nb[size_t(i + 1) * 2 + 1] - nb[size_t(i) * 2 + 1]) * f;
+                }
             } else {
                 if (!m->hasAudio) continue;
                 AudioBufferPtr buf = nonBlocking_ ? MediaPool::instance().audioIfReady(m->path, int(sr))

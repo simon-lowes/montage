@@ -20,6 +20,7 @@ class EditorState : public QObject {
     Q_OBJECT
 public:
     explicit EditorState(QObject* parent = nullptr);
+    ~EditorState() override;
 
     // ---- Project access ---------------------------------------------------
     const Project& project() const { return project_; }
@@ -43,6 +44,9 @@ public:
     void updateGesture(const std::function<void(Project&, Sequence&)>& fn);
     void endGesture(bool commit = true);
     bool inGesture() const { return gesture_.has_value(); }
+    // The active sequence as it was when the current gesture began (or the
+    // live one outside gestures): drag maths must be relative to this.
+    const Sequence* gestureBase() const { return gesture_ ? gesture_->origin.active() : sequence(); }
 
     void undo();
     void redo();

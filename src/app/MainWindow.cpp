@@ -26,6 +26,7 @@
 #include <QToolBar>
 #include <QVBoxLayout>
 #include <cmath>
+#include <set>
 
 #include "AudioMeterWidget.h"
 #include "EditorState.h"
@@ -807,10 +808,13 @@ void MainWindow::speedDialog() {
     auto sel = state_->selectedClips();
     double sp = pct / 100.0;
     state_->apply(tr("Speed / Duration"), [sel, sp](Project& p, Sequence& s) {
+        // One call per link group: setSpeed changes linked partners itself and ripples once.
         edit::Result last;
+        std::set<Id> done;
         for (Id id : sel) {
             const Clip* cc = edit::clipById(s, id);
-            if (!cc) continue;
+            if (!cc || done.count(id)) continue;
+            for (Id l : edit::linkedClips(s, id)) done.insert(l);
             last = edit::setSpeed(p, s, id, sp, true, cc->reverse);
             if (!last.ok) return last;
         }

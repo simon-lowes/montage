@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <thread>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -202,7 +203,8 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
     }
     ctx_ = avcodec_alloc_context3(codec);
     avcodec_parameters_to_context(ctx_, st->codecpar);
-    ctx_->thread_count = 0;
+    // Many decoders can be open at once; bound each one's thread pool.
+    ctx_->thread_count = int(std::clamp(std::thread::hardware_concurrency(), 1u, 8u));
     ctx_->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
     ctx_->pkt_timebase = st->time_base;
     if ((rc = avcodec_open2(ctx_, codec, nullptr)) < 0) {
@@ -341,13 +343,34 @@ Frame16Ptr VideoDecoder::frameAt(double t, int targetW, int targetH, bool highQu
 
     bool sequential = haveCur_ && t + eps >= curPts_ && t - curPts_ < 2.0;
     if (!sequential) {
+        auto isKey = [](const AVFrame* f) {
+#ifdef AV_FRAME_FLAG_KEY
+            return (f->flags & AV_FRAME_FLAG_KEY) != 0;
+#else
+            return f->key_frame != 0;
+#endif
+        };
         static const double backoff[] = {0.0, 1.0, 3.0, 10.0, 1e9};
         for (double b : backoff) {
-            seek(std::max(0.0, t - b));
-            if (!decodeNext(next_)) break;
+            double from = std::max(0.0, t - b);
+            seek(from);
+            // Some containers (e.g. MPEG-TS) seek to packets that are not
+            // keyframes, or past the last decodable frame. Skip to the first
+            // keyframe; if none arrives before the target, retry from earlier.
+            bool gotKey = false;
+            while (decodeNext(next_)) {
+                double pts = ptsOf(next_, -1);
+                if (isKey(next_) || from <= 0) {
+                    gotKey = true;
+                    nextPts_ = pts;
+                    break;
+                }
+                av_frame_unref(next_);
+                if (pts > t + eps) break;
+            }
+            if (!gotKey) continue;
             haveNext_ = true;
-            nextPts_ = ptsOf(next_, -1);
-            if (nextPts_ <= t + eps || t - b <= 0) break;  // landed before the target (or at the start)
+            if (nextPts_ <= t + eps || from <= 0) break;  // landed before the target (or at the start)
         }
     }
 

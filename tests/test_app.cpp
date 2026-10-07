@@ -155,6 +155,26 @@ private slots:
         state()->setSnapping(true);
     }
 
+    void gradualDragAcrossTracks() {
+        loadDemo();
+        state()->setSnapping(false);
+        Id blue = clipNamed(*state()->sequence(), "Blue")->id;
+        QPoint from = pointFor(80, V1);
+        QTest::mousePress(viewport(), Qt::LeftButton, Qt::NoModifier, from);
+        // Move up one track at a time (V1 -> V2 -> V3) and a few frames right.
+        for (int step = 1; step <= 12; ++step) {
+            QPoint p = from + QPoint(step * 2, -step * 62 * 2 / 12);
+            QMouseEvent mv(QEvent::MouseMove, p, viewport()->mapToGlobal(p), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+            QApplication::sendEvent(viewport(), &mv);
+        }
+        QPoint end = from + QPoint(24, -124);
+        QTest::mouseRelease(viewport(), Qt::LeftButton, Qt::NoModifier, end);
+        auto loc = edit::locate(*state()->sequence(), blue);
+        QVERIFY(loc);
+        QCOMPARE(loc->track.index, 2);  // reached V3
+        state()->setSnapping(true);
+    }
+
     void trimEdgeWithMouse() {
         loadDemo();
         state()->setSnapping(false);

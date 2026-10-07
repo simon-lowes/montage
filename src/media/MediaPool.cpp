@@ -1,6 +1,7 @@
 #include "MediaPool.h"
 
 #include <cmath>
+#include <cstdint>
 
 namespace montage {
 
@@ -26,6 +27,7 @@ VideoDecoder* MediaPool::acquire(const std::string& path, double t) {
     }
     if (best && (bestScore < 1e9 || slots.size() >= 4)) {
         best->busy = true;
+        best->lastUsed = ++useClock_;
         return best->dec.get();
     }
     if (slots.size() >= 6) {
@@ -35,13 +37,33 @@ VideoDecoder* MediaPool::acquire(const std::string& path, double t) {
         }
         return nullptr;  // all busy
     }
+    size_t open = 0;
+    for (const auto& [p, list] : decoders_) open += list.size();
+    if (open >= kMaxDecoders) evictOne();
     lock.unlock();
     auto dec = std::make_unique<VideoDecoder>();
     if (!dec->open(path)) return nullptr;
     lock.lock();
     auto& slots2 = decoders_[path];
-    slots2.push_back(Slot{std::move(dec), true});
+    slots2.push_back(Slot{std::move(dec), true, ++useClock_});
     return slots2.back().dec.get();
+}
+
+bool MediaPool::evictOne() {
+    std::vector<Slot>* bestList = nullptr;
+    size_t bestIndex = 0;
+    uint64_t oldest = UINT64_MAX;
+    for (auto& [p, list] : decoders_)
+        for (size_t i = 0; i < list.size(); ++i)
+            if (!list[i].busy && list[i].lastUsed < oldest) {
+                oldest = list[i].lastUsed;
+                bestList = &list;
+                bestIndex = i;
+            }
+    if (!bestList) return false;
+    bestList->erase(bestList->begin() + long(bestIndex));
+    for (auto it = decoders_.begin(); it != decoders_.end();) it = it->second.empty() ? decoders_.erase(it) : std::next(it);
+    return true;
 }
 
 void MediaPool::release(VideoDecoder* d) {
@@ -49,7 +71,10 @@ void MediaPool::release(VideoDecoder* d) {
     auto it = decoders_.find(d->path());
     if (it == decoders_.end()) return;
     for (auto& s : it->second)
-        if (s.dec.get() == d) s.busy = false;
+        if (s.dec.get() == d) {
+            s.busy = false;
+            s.lastUsed = ++useClock_;
+        }
 }
 
 Frame16Ptr MediaPool::videoFrame(const std::string& path, double t, int w, int h, bool highQuality) {

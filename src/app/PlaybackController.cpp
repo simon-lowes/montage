@@ -370,6 +370,15 @@ void PlaybackController::tick() {
     const Sequence* s = sequence();
     if (!s || speed_ == 0) return;
     double elapsed = clock_.nsecsElapsed() / 1e9;
+    // While audio plays, follow what the device has actually played (processed
+    // minus what is still buffered) so picture stays locked to sound. Backends
+    // differ in how they report this, so only trust it when it is close to
+    // the wall clock.
+    if (speed_ == 1 && sink_ && sink_->state() == QAudio::ActiveState) {
+        qint64 buffered = std::max<qint64>(0, sink_->bufferSize() - sink_->bytesFree());
+        double played = (sink_->processedUSecs() - sink_->format().durationForBytes(buffered)) / 1e6;
+        if (played > 0 && std::fabs(played - elapsed) < 0.25) elapsed = played;
+    }
     FrameTime t = startFrame_ + FrameTime(std::floor(elapsed * s->fpsValue() * speed_));
     FrameTime end = s->duration();
     FrameTime loopIn = s->inPoint >= 0 ? s->inPoint : 0;

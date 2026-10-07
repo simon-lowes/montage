@@ -153,7 +153,10 @@ void parallelRows(int height, const std::function<void(int, int)>& fn) {
         fn(0, height);
         return;
     }
-    std::atomic<int> remaining{bands};
+    // The counter is only touched under the mutex, so the last worker has
+    // released the mutex (and touches nothing else) before the waiting caller
+    // can observe zero and destroy these locals.
+    int remaining = bands;
     std::mutex m;
     std::condition_variable cv;
     for (int b = 0; b < bands; ++b) {
@@ -161,14 +164,12 @@ void parallelRows(int height, const std::function<void(int, int)>& fn) {
         int y1 = int(int64_t(height) * (b + 1) / bands);
         p.submit([&, y0, y1] {
             fn(y0, y1);
-            if (remaining.fetch_sub(1) == 1) {
-                std::lock_guard lock(m);
-                cv.notify_one();
-            }
+            std::lock_guard lock(m);
+            if (--remaining == 0) cv.notify_one();
         });
     }
     std::unique_lock lock(m);
-    cv.wait(lock, [&] { return remaining.load() == 0; });
+    cv.wait(lock, [&] { return remaining == 0; });
 }
 
 }  // namespace montage

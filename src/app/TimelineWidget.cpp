@@ -302,7 +302,7 @@ TimelineWidget::Hit TimelineWidget::hitTest(const QPoint& pos) const {
 
 FrameTime TimelineWidget::snapFrame(FrameTime f, const std::vector<Id>& exclude, bool* snapped) {
     if (snapped) *snapped = false;
-    const Sequence* s = state_->sequence();
+    const Sequence* s = state_->gestureBase();
     if (!s || !state_->snapping()) return f;
     auto pts = edit::snapPoints(*s, exclude);
     FrameTime tol = std::max<FrameTime>(1, FrameTime(kSnapPx / ppf_));
@@ -315,7 +315,7 @@ FrameTime TimelineWidget::snapFrame(FrameTime f, const std::vector<Id>& exclude,
 
 FrameTime TimelineWidget::snapDelta(const std::vector<Id>& ids, FrameTime delta) {
     snapIndicator_ = -1;
-    const Sequence* s = state_->sequence();
+    const Sequence* s = state_->gestureBase();
     if (!s || !state_->snapping()) return delta;
     auto pts = edit::snapPoints(*s, ids);
     FrameTime tol = std::max<FrameTime>(1, FrameTime(kSnapPx / ppf_));
@@ -885,8 +885,9 @@ void TimelineWidget::beginDrag(QMouseEvent* e, const Hit& hit) {
 }
 
 void TimelineWidget::updateDrag(QMouseEvent* e) {
-    const Sequence* s = state_->sequence();
-    if (!s) return;
+    // Positions and clamps come from the state at the start of the drag; the
+    // live state already contains the previous update of this gesture.
+    if (!state_->sequence()) return;
     QPoint pos = e->pos();
     if (!drag_.started) {
         if ((pos - drag_.pressPos).manhattanLength() < QApplication::startDragDistance()) return;
@@ -900,6 +901,7 @@ void TimelineWidget::updateDrag(QMouseEvent* e) {
             default: break;
         }
     }
+    const Sequence* s = state_->gestureBase();  // fetched after beginGesture() above
     const FrameTime raw = frameRound(pos.x()) - drag_.pressFrame;
     auto signedTc = [s](FrameTime d) { return (d < 0 ? "-" : "+") + timecodeString(s, std::llabs(d)); };
     switch (drag_.kind) {
@@ -944,7 +946,7 @@ void TimelineWidget::updateDrag(QMouseEvent* e) {
             bool linked = !drag_.unlinked;
             edit::Edge edge = drag_.edge;
             bool snapped = false;
-            FrameTime target = snapFrame(drag_.origEdge + raw, {id}, &snapped);
+            FrameTime target = snapFrame(drag_.origEdge + raw, edit::linkedClips(*s, id), &snapped);
             FrameTime delta = snapped ? target - drag_.origEdge : raw;
             FrameTime applied = 0;
             state_->updateGesture([&](Project& p, Sequence& sq) { applied = edit::trim(p, sq, id, edge, delta, mode, linked).applied; });
@@ -954,7 +956,8 @@ void TimelineWidget::updateDrag(QMouseEvent* e) {
         case DragKind::Roll: {
             Id a = drag_.clip, b = drag_.neighbor;
             bool snapped = false;
-            FrameTime target = snapFrame(drag_.origEdge + raw, {a, b}, &snapped);
+            std::vector<Id> ex = edit::expandLinks(*s, {a, b});
+            FrameTime target = snapFrame(drag_.origEdge + raw, ex, &snapped);
             FrameTime delta = snapped ? target - drag_.origEdge : raw;
             FrameTime applied = 0;
             state_->updateGesture([&](Project& p, Sequence& sq) { applied = edit::roll(p, sq, a, b, delta).applied; });
