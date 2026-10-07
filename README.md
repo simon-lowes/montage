@@ -102,6 +102,9 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
   - Ratings: press 1–5 for stars, 0 to clear, and X to reject.
   - Colour labels, keywords, and metadata fields, edited in the list (an edit applies to every selected row) or from the right-click menu.
   - The recording date and camera model are read from camera files.
+- **Subclips**: mark In and Out in the Source monitor and choose Clip › Make Subclip (Ctrl+U), or right-click a Find Shots result.
+  - A subclip is a bin item of its own, to rate, tag and find. It opens with In and Out around its range, and dragging it to the timeline places that range under its name.
+  - Its Usage counts the clips that play part of it, and searches look only at the words spoken inside it.
 - The search box finds names, keywords, metadata and what is said; "quoted text" finds a phrase. It searches inside the bin's bins too.
 - **Smart bins** (saved searches) list the media matching their rules and stay up to date, for example "rating at least 4 and keyword includes interview". Rules cover every column, any text, and usage, so "used 0 times" finds what hasn't been cut in.
 
@@ -250,7 +253,7 @@ Its tools work on `.montage` files by path. Each edit is saved at once, and the 
 - add titles, effects (including masked ones), transitions and markers;
 - transcribe (with speaker labels) and find spoken phrases in the cut;
 - find shots by description;
-- log media (ratings, labels, keywords, metadata fields, bins) and find media by text or smart-bin rules, optionally saving the rules as a smart bin;
+- log media (ratings, labels, keywords, metadata fields, bins), make subclips, and find media by text or smart-bin rules, optionally saving the rules as a smart bin;
 - return a rendered frame as an image so the agent can check its work;
 - render with any preset, with progress;
 - export and import EDL, OTIO, FCP 7 XML and FCPXML.

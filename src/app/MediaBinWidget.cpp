@@ -425,11 +425,11 @@ void MediaBinWidget::rebuild() {
     if (const SmartBin* sb = findSmartBin(p, smart_)) {
         const std::map<Id, int> usage = mediaUsage(p);
         for (const MediaItem& m : p.media)
-            if (smartBinMatches(*sb, m, usage) && mediaMatchesSearch(m, query)) ids.push_back(m.id);
+            if (smartBinMatches(*sb, m, usage, &p) && mediaMatchesSearch(m, query, &p)) ids.push_back(m.id);
     } else {
         // A bin shows what is in it; a search looks inside its bins too.
         for (const MediaItem& m : p.media)
-            if (query.empty() ? m.bin == bin : binWithin(m.bin, bin) && mediaMatchesSearch(m, query)) ids.push_back(m.id);
+            if (query.empty() ? m.bin == bin : binWithin(m.bin, bin) && mediaMatchesSearch(m, query, &p)) ids.push_back(m.id);
     }
     const std::vector<Id> keep = selectedMedia();
     model_->setMedia(ids);
@@ -838,15 +838,22 @@ void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos)
             if (!bin.isEmpty()) moveToBin(ids, bin);
         });
     }
-    std::vector<Id> withSound;
+    // Transcripts, proxies and colour belong to a subclip's media.
+    std::vector<Id> files;
     for (Id id : ids)
+        if (const MediaItem* m = state_->project().findMedia(id)) {
+            const Id f = m->subclipOf ? m->subclipOf : id;
+            if (std::find(files.begin(), files.end(), f) == files.end()) files.push_back(f);
+        }
+    std::vector<Id> withSound;
+    for (Id id : files)
         if (const MediaItem* m = state_->project().findMedia(id); m && m->hasAudio && !m->path.empty()) withSound.push_back(id);
     if (!withSound.empty()) {
         menu.addSeparator();
         menu.addAction(tr("Transcribe..."), this, [this, withSound] { transcribe(withSound); });
-        if (ids.size() == 1)
-            if (const MediaItem* m = state_->project().findMedia(ids.front()); m && m->transcript) {
-                menu.addAction(tr("Export Transcript..."), this, [this, id = ids.front()] {
+        if (files.size() == 1)
+            if (const MediaItem* m = state_->project().findMedia(files.front()); m && m->transcript) {
+                menu.addAction(tr("Export Transcript..."), this, [this, id = files.front()] {
                     if (const MediaItem* mi = state_->project().findMedia(id)) exportTranscript(*mi, this);
                 });
             }
@@ -867,10 +874,10 @@ void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos)
             });
     }
     std::vector<Id> videos;
-    for (Id id : ids)
+    for (Id id : files)
         if (const MediaItem* m = state_->project().findMedia(id); m && m->kind == MediaKind::Video && m->hasVideo) videos.push_back(id);
     std::vector<Id> pictures;
-    for (Id id : ids)
+    for (Id id : files)
         if (const MediaItem* m = state_->project().findMedia(id); m && m->hasVideo && m->kind != MediaKind::Sequence)
             pictures.push_back(id);
     if (!pictures.empty()) {
@@ -911,7 +918,8 @@ void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos)
     }
     std::vector<Id> sources;  // files a multicam clip can be made of
     for (Id id : ids)
-        if (const MediaItem* m = state_->project().findMedia(id); m && m->kind != MediaKind::Sequence && (m->hasVideo || m->hasAudio))
+        if (const MediaItem* m = state_->project().findMedia(id);
+            m && !m->subclipOf && m->kind != MediaKind::Sequence && (m->hasVideo || m->hasAudio))
             sources.push_back(id);
     if (sources.size() >= 2 && std::any_of(sources.begin(), sources.end(), [this](Id id) {
             const MediaItem* m = state_->project().findMedia(id);

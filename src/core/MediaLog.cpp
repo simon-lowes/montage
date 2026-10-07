@@ -313,12 +313,73 @@ const std::vector<std::string>& metadataKeys() {
 
 std::map<Id, int> mediaUsage(const Project& p) {
     std::map<Id, int> usage;
+    std::map<Id, std::vector<const MediaItem*>> subclips;
+    for (const MediaItem& m : p.media)
+        if (m.subclipOf) subclips[m.subclipOf].push_back(&m);
     for (const Sequence& s : p.sequences)
         for (const auto* tracks : {&s.videoTracks, &s.audioTracks})
             for (const Track& t : *tracks)
-                for (const Clip& c : t.clips)
-                    if (c.mediaId) ++usage[c.mediaId];
+                for (const Clip& c : t.clips) {
+                    if (!c.mediaId) continue;
+                    ++usage[c.mediaId];
+                    const auto it = subclips.find(c.mediaId);
+                    if (it == subclips.end() || c.duration <= 0) continue;
+                    // The part of the media the clip plays, in seconds.
+                    const double a = c.sourceFrameAt(c.start) / s.fpsValue(), b = c.sourceFrameAt(c.end() - 1) / s.fpsValue();
+                    const double lo = std::min(a, b), hi = std::max(a, b) + 1.0 / s.fpsValue();
+                    for (const MediaItem* sub : it->second)
+                        if (lo < sub->subclipOut && hi > sub->subclipIn) ++usage[sub->id];
+                }
     return usage;
+}
+
+std::optional<MediaItem> makeSubclip(const Project& p, Id media, double in, double out, const std::string& name) {
+    const MediaItem* src = p.findMedia(media);
+    if (!src) return std::nullopt;
+    const MediaItem* base = src;
+    if (src->subclipOf) {
+        base = p.findMedia(src->subclipOf);
+        if (!base) return std::nullopt;
+        in = std::max(in + src->subclipIn, src->subclipIn);
+        out = std::min(out + src->subclipIn, src->subclipOut);
+    }
+    if (base->kind != MediaKind::Video && base->kind != MediaKind::Audio) return std::nullopt;
+    in = std::max(0.0, in);
+    if (base->duration > 0) out = std::min(out, base->duration);
+    if (out - in < 1e-3) return std::nullopt;
+    MediaItem m = *base;
+    m.id = 0;
+    m.transcript.reset();
+    m.visual.reset();
+    m.subclipOf = base->id;
+    m.subclipIn = in;
+    m.subclipOut = out;
+    m.duration = out - in;
+    m.rating = 0;
+    m.bin = src->bin;
+    if (base->timecode >= 0) m.timecode = base->timecode + in;
+    if (name.empty()) {
+        int n = 1;
+        for (const MediaItem& o : p.media) n += o.subclipOf == base->id;
+        m.name = base->name + " Subclip " + std::to_string(n);
+    } else {
+        m.name = name;
+    }
+    return m;
+}
+
+std::string spokenText(const Project* p, const MediaItem& m) {
+    if (!m.subclipOf) return m.transcript ? m.transcript->text() : std::string();
+    const MediaItem* parent = p ? p->findMedia(m.subclipOf) : nullptr;
+    if (!parent || !parent->transcript) return {};
+    std::string out;
+    for (const TranscriptSegment& seg : parent->transcript->segments)
+        for (const TranscriptWord& w : seg.words) {
+            const double mid = (w.start + w.end) / 2;
+            if (mid < m.subclipIn || mid > m.subclipOut) continue;
+            out += (out.empty() ? "" : " ") + w.text;
+        }
+    return out;
 }
 
 std::string mediaFieldText(const MediaItem& m, const std::string& key, const std::map<Id, int>* usage) {
@@ -420,7 +481,7 @@ bool setMediaField(MediaItem& m, const std::string& key, const std::string& valu
 // ---------------------------------------------------------------------------
 // Search and smart bins
 
-bool mediaMatchesSearch(const MediaItem& m, const std::string& query) {
+bool mediaMatchesSearch(const MediaItem& m, const std::string& query, const Project* p) {
     // Terms: words, or "quoted phrases".
     QStringList terms;
     static const QRegularExpression term("\"([^\"]*)\"|(\\S+)");
@@ -433,7 +494,7 @@ bool mediaMatchesSearch(const MediaItem& m, const std::string& query) {
     QString text = qs(m.name);
     for (const std::string& k : m.keywords) text += "\n" + qs(k);
     for (const auto& [key, v] : m.metadata) text += "\n" + qs(v);
-    const QString spoken = m.transcript ? qs(m.transcript->text()) : QString();
+    const QString spoken = qs(spokenText(p, m));
     for (const QString& t : terms)
         if (!text.contains(t, Qt::CaseInsensitive) && !spoken.contains(t, Qt::CaseInsensitive)) return false;
     return true;
@@ -461,13 +522,13 @@ std::vector<RuleOp> ruleOps(FieldType type) {
 namespace {
 
 // Text a rule tests: the transcript's words rather than its summary, and everything for "any".
-QString ruleText(const MediaItem& m, const std::string& key, const std::map<Id, int>& usage) {
-    if (key == "transcript") return m.transcript ? qs(m.transcript->text()) : QString();
+QString ruleText(const MediaItem& m, const std::string& key, const std::map<Id, int>& usage, const Project* p) {
+    if (key == "transcript") return qs(spokenText(p, m));
     if (key == "any") {
         QString text = qs(m.name);
         for (const std::string& k : m.keywords) text += "\n" + qs(k);
         for (const auto& [k, v] : m.metadata) text += "\n" + qs(v);
-        if (m.transcript) text += "\n" + qs(m.transcript->text());
+        text += "\n" + qs(spokenText(p, m));
         return text;
     }
     return qs(mediaFieldText(m, key, &usage));
@@ -485,12 +546,12 @@ bool compare(double a, const std::string& op, double b, double eps) {
 
 }  // namespace
 
-bool ruleMatches(const SmartRule& r, const MediaItem& m, const std::map<Id, int>& usage) {
+bool ruleMatches(const SmartRule& r, const MediaItem& m, const std::map<Id, int>& usage, const Project* p) {
     const MediaField* f = mediaField(r.field);
     if (!f) return false;
     switch (f->type) {
         case FieldType::Text: {
-            const QString text = ruleText(m, r.field, usage), value = qs(r.value).trimmed();
+            const QString text = ruleText(m, r.field, usage, p), value = qs(r.value).trimmed();
             if (r.op == "contains") return text.contains(value, Qt::CaseInsensitive);
             if (r.op == "!contains") return !text.contains(value, Qt::CaseInsensitive);
             if (r.op == "is") return text.compare(value, Qt::CaseInsensitive) == 0;
@@ -516,7 +577,8 @@ bool ruleMatches(const SmartRule& r, const MediaItem& m, const std::map<Id, int>
             return compare(m.label, r.op, v, 0);
         }
         case FieldType::Kind: {
-            const bool same = sameText(kindKey(m.kind), qs(r.value).trimmed().toStdString());
+            const std::string v = qs(r.value).trimmed().toStdString();
+            const bool same = sameText(v, "subclip") ? m.subclipOf != 0 : sameText(kindKey(m.kind), v);
             return r.op == "is" ? same : r.op == "!is" ? !same : false;
         }
         case FieldType::Keywords: {
@@ -532,10 +594,10 @@ bool ruleMatches(const SmartRule& r, const MediaItem& m, const std::map<Id, int>
     return false;
 }
 
-bool smartBinMatches(const SmartBin& b, const MediaItem& m, const std::map<Id, int>& usage) {
+bool smartBinMatches(const SmartBin& b, const MediaItem& m, const std::map<Id, int>& usage, const Project* p) {
     if (b.rules.empty()) return true;
     for (const SmartRule& r : b.rules) {
-        const bool ok = ruleMatches(r, m, usage);
+        const bool ok = ruleMatches(r, m, usage, p);
         if (b.matchAll && !ok) return false;
         if (!b.matchAll && ok) return true;
     }
@@ -546,7 +608,7 @@ std::vector<Id> smartBinMedia(const Project& p, const SmartBin& b) {
     const std::map<Id, int> usage = mediaUsage(p);
     std::vector<Id> out;
     for (const MediaItem& m : p.media)
-        if (smartBinMatches(b, m, usage)) out.push_back(m.id);
+        if (smartBinMatches(b, m, usage, &p)) out.push_back(m.id);
     return out;
 }
 

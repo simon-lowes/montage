@@ -8,6 +8,7 @@
 #include <QtConcurrent>
 #include <algorithm>
 
+#include "core/MediaLog.h"
 #include "core/ProjectIO.h"
 #include "media/Decoder.h"
 #include "media/MediaPool.h"
@@ -321,6 +322,7 @@ bool EditorState::removeMedia(Id id, QString* error) {
         return false;
     }
     QString name = QString::fromStdString(m->name);
+    const Id removedSource = sourceMedia_;
     bool ok = edit(tr("Remove %1").arg(name), [id](Project& p, Sequence&) {
         for (auto& s : p.sequences) {
             std::vector<Id> uses;
@@ -337,18 +339,38 @@ bool EditorState::removeMedia(Id id, QString* error) {
                                              [sid](const Sequence& s) { return s.id == sid; }),
                               p.sequences.end());
         }
-        p.media.erase(std::remove_if(p.media.begin(), p.media.end(), [id](const MediaItem& x) { return x.id == id; }),
+        // Its subclips go with it.
+        p.media.erase(std::remove_if(p.media.begin(), p.media.end(), [id](const MediaItem& x) { return x.id == id || x.subclipOf == id; }),
                       p.media.end());
         return true;
     });
-    if (ok && sourceMedia_ == id) setSourceMedia(0);
+    if (ok && removedSource == id) setSourceMedia(0);
     return ok;
 }
 
 void EditorState::setSourceMedia(Id id) {
     sourceMedia_ = id;
     sourceIn_ = sourceOut_ = -1;
+    if (const MediaItem* m = project_.findMedia(id); m && m->subclipOf && project_.findMedia(m->subclipOf)) {
+        const double fps = sequence() ? sequence()->fpsValue() : 30.0;
+        sourceMedia_ = m->subclipOf;
+        sourceIn_ = FrameTime(std::floor(m->subclipIn * fps + 1e-6));
+        sourceOut_ = std::max(sourceIn_, FrameTime(std::ceil(m->subclipOut * fps - 1e-6)) - 1);
+    }
     emit sourceChanged();
+}
+
+Id EditorState::makeSubclip(Id media, FrameTime in, FrameTime out, const QString& name) {
+    const double fps = sequence() ? sequence()->fpsValue() : 30.0;
+    auto sub = montage::makeSubclip(project_, media, double(in) / fps, double(out + 1) / fps, name.toStdString());
+    if (!sub) return 0;
+    Id id = 0;
+    edit(tr("Make Subclip"), [&](Project& p, Sequence&) {
+        sub->id = id = p.newId();
+        p.media.push_back(*sub);
+        return true;
+    });
+    return id;
 }
 
 void EditorState::setSourceIn(FrameTime t) {

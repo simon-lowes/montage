@@ -5,6 +5,7 @@
 #pragma once
 
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -42,6 +43,18 @@ bool moveMediaToBin(Project& p, const std::vector<Id>& media, const std::string&
 bool moveBin(Project& p, const std::string& bin, const std::string& into);
 
 // ---------------------------------------------------------------------------
+// Subclips.
+
+// A subclip of `media` (a subclip's range is taken within its own parent)
+// from `in` to `out` seconds, named `name` or "<parent> Subclip N", in the
+// same bin and with the same keywords and metadata. Nothing for stills,
+// sequences, missing media or an empty range. It has no id yet.
+std::optional<MediaItem> makeSubclip(const Project& p, Id media, double in, double out, const std::string& name = {});
+// What is said in the media: its transcript, or for a subclip the words of
+// its parent's transcript within its range (which needs the project).
+std::string spokenText(const Project* p, const MediaItem& m);
+
+// ---------------------------------------------------------------------------
 // Keywords.
 
 // Splits "a, b; c" into keywords, trimmed, without duplicates (case-insensitive).
@@ -72,7 +85,8 @@ const MediaField* mediaField(const std::string& key);
 // The free-form metadata fields (stored in MediaItem::metadata).
 const std::vector<std::string>& metadataKeys();
 
-// How many clips use each media item, across every sequence.
+// How many clips use each media item, across every sequence (for a subclip:
+// clips of its parent that play part of its range).
 std::map<Id, int> mediaUsage(const Project& p);
 
 // The field as text, as the list view shows it.
@@ -87,8 +101,8 @@ bool setMediaField(MediaItem& m, const std::string& key, const std::string& valu
 // Search and smart bins.
 
 // The search box: every word must appear (case-insensitively) in the name,
-// keywords, metadata or transcript.
-bool mediaMatchesSearch(const MediaItem& m, const std::string& query);
+// keywords, metadata or speech (spokenText, so subclips need the project).
+bool mediaMatchesSearch(const MediaItem& m, const std::string& query, const Project* p = nullptr);
 
 struct RuleOp {
     const char* id;
@@ -97,8 +111,10 @@ struct RuleOp {
 };
 // The operators a field's rules can use.
 std::vector<RuleOp> ruleOps(FieldType type);
-bool ruleMatches(const SmartRule& r, const MediaItem& m, const std::map<Id, int>& usage);
-bool smartBinMatches(const SmartBin& b, const MediaItem& m, const std::map<Id, int>& usage);
+// Kind rules take video, audio, image, sequence or subclip. The project lets
+// subclips' speech be tested.
+bool ruleMatches(const SmartRule& r, const MediaItem& m, const std::map<Id, int>& usage, const Project* p = nullptr);
+bool smartBinMatches(const SmartBin& b, const MediaItem& m, const std::map<Id, int>& usage, const Project* p = nullptr);
 std::vector<Id> smartBinMedia(const Project& p, const SmartBin& b);
 SmartBin* findSmartBin(Project& p, Id id);
 const SmartBin* findSmartBin(const Project& p, Id id);

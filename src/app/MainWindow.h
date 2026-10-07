@@ -95,6 +95,7 @@ private:
     void addTitle();
     void newSequence();
     void openInSource(Id media);
+    Id makeSubclip();
     void applyFromBrowser(const QString& type, EffectCategory category);
     void scanPluginsInBackground();
     void offerRecovery(const std::vector<RecoveryManager::Session>& crashed);

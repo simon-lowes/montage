@@ -32,6 +32,8 @@ public:
     const std::vector<ShotMatch>& results() const { return results_; }
     // Opens result i in the Source monitor.
     void open(int i);
+    // Saves result i as a subclip named after the search; returns its id.
+    Id makeSubclip(int i);
 
 signals:
     void openRequested(montage::Id media, montage::FrameTime in, montage::FrameTime out, montage::FrameTime at);
@@ -48,6 +50,7 @@ private:
     QListWidget* list_;
     ThumbnailCache* thumbs_;
     std::vector<ShotMatch> results_;
+    QString lastQuery_;
 };
 
 }  // namespace montage

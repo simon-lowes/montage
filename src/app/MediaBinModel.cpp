@@ -4,6 +4,7 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <algorithm>
+#include <cmath>
 #include <set>
 
 #include "EditorState.h"
@@ -18,6 +19,7 @@ namespace montage {
 namespace {
 
 QString kindLabel(const MediaItem& m) {
+    if (m.subclipOf) return m.kind == MediaKind::Audio ? QObject::tr("Audio Subclip") : QObject::tr("Subclip");
     switch (m.kind) {
         case MediaKind::Video: return m.hasAudio ? QObject::tr("Video + Audio") : QObject::tr("Video");
         case MediaKind::Audio: return QObject::tr("Audio");
@@ -131,7 +133,7 @@ QPixmap MediaBinModel::thumbnail(const MediaItem& m) const {
         h = kThumbH;
         w = int(kThumbH * aspect);
     }
-    const double t = m.kind == MediaKind::Video ? std::min(1.0, m.duration * 0.1) : 0.0;
+    const double t = m.kind == MediaKind::Video ? m.subclipIn + std::min(1.0, m.duration * 0.1) : 0.0;
     const QImage img = ThumbnailCache::instance().get(QString::fromStdString(m.path), t, std::max(2, w), std::max(2, h));
     if (img.isNull()) return tile(QString(), theme::kVideoClip);
     QPixmap pm(kThumbW, kThumbH);
@@ -193,6 +195,14 @@ QString MediaBinModel::toolTip(const MediaItem& m) const {
         const Rational r = m.fps.valid() ? m.fps : Rational{30, 1};
         tip += "<br>" + QString::fromStdString(formatTimecode(FrameTime(m.duration * r.toDouble()), r));
     }
+    if (m.subclipOf)
+        if (const MediaItem* parent = state_->project().findMedia(m.subclipOf)) {
+            const Rational r = m.fps.valid() ? m.fps : Rational{30, 1};
+            tip += "<br>" + tr("Subclip of %1, %2 – %3")
+                                .arg(QString::fromStdString(parent->name).toHtmlEscaped(),
+                                     QString::fromStdString(formatTimecode(FrameTime(std::floor(m.subclipIn * r.toDouble())), r)),
+                                     QString::fromStdString(formatTimecode(FrameTime(std::floor(m.subclipOut * r.toDouble())), r)));
+        }
     if (m.rating < 0) tip += "<br>" + tr("Rejected");
     else if (m.rating > 0) tip += "<br>" + QString(m.rating, QChar(0x2605));
     if (!m.keywords.empty()) tip += "<br>" + tr("Keywords: %1").arg(QString::fromStdString(joinKeywords(m.keywords)).toHtmlEscaped());
@@ -270,8 +280,19 @@ QStringList MediaBinModel::mimeTypes() const { return {"application/x-montage-me
 QMimeData* MediaBinModel::mimeData(const QModelIndexList& indexes) const {
     QStringList ids;
     std::set<int> rows;
-    for (const QModelIndex& i : indexes)
-        if (rows.insert(i.row()).second) ids << QString::number(mediaAt(i.row()));
+    const double fps = state_->sequence() ? state_->sequence()->fpsValue() : 30.0;
+    for (const QModelIndex& i : indexes) {
+        if (!rows.insert(i.row()).second) continue;
+        const MediaItem* m = state_->project().findMedia(mediaAt(i.row()));
+        if (m && m->subclipOf) {
+            // A subclip places its media's range: "media:in:out:subclip", in sequence frames.
+            const FrameTime in = FrameTime(std::floor(m->subclipIn * fps + 1e-6));
+            const FrameTime out = std::max(in, FrameTime(std::ceil(m->subclipOut * fps - 1e-6)) - 1);
+            ids << QStringLiteral("%1:%2:%3:%4").arg(m->subclipOf).arg(in).arg(out).arg(m->id);
+        } else {
+            ids << QString::number(mediaAt(i.row()));
+        }
+    }
     auto* m = new QMimeData;
     m->setData("application/x-montage-media", ids.join(',').toUtf8());
     return m;

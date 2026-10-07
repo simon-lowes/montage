@@ -254,4 +254,18 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
   - Tested:
     - the scale and its inverse, offsetting lines with and without keys, and clamped key moves;
     - in the app, with the mouse: dragging, pinning, adding, moving, Shift-moving and deleting keys, interpolation from the menu, undo, opacity, and moving the clip when lines are hidden.
+- [x] Subclips (Premiere, Avid and Resolve subclips; Final Cut's favourite ranges):
+  - Clip › Make Subclip (Ctrl+U) saves the Source monitor's In–Out. A Find Shots result can be saved as a subclip named after the search.
+  - Subclips are media items with a parent and a range, and get logging, bins, search and smart bins like any other item.
+    - A subclip of a subclip is a range of the same media.
+    - Subclips inherit the bin, keywords and metadata, and their timecode starts at the range.
+  - Opening a subclip opens its media with In and Out set. Dragging it to the timeline places that range of the media, with clips named after the subclip, so rendering, interchange and the mixer are unchanged.
+  - Usage counts the clips of the media that play part of the range. Search and rules look only at the words spoken inside it.
+  - Transcription, proxies and Interpret Colour on a subclip act on its media, and removing the media removes its subclips.
+  - MCP: `montage_make_subclip`, and `montage_place_media` places a subclip by name.
+  - Fix found on the way: `montage_place_media` passed its in and out seconds where frames were expected.
+  - Tested:
+    - ranges, nesting, clamping, naming and inheritance, the speech in range, rules and usage, and the round trip;
+    - in the app: Make Subclip with undo, opening, dropping on the timeline, usage, and removal with the media;
+    - the MCP tools, and in/out seconds.
 

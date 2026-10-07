@@ -1072,6 +1072,71 @@ private slots:
         state()->newProject();
     }
 
+    void subclipsFromTheSourceMonitor() {
+        state()->newProject();
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id jfk = ids[0];
+        auto* bin = win_->findChild<MediaBinWidget*>();
+        auto* make = win_->findChild<QAction*>("makeSubclip");
+        QVERIFY(bin && make);
+        const double fps = state()->sequence()->fpsValue();
+
+        // In and Out in the Source monitor, then Make Subclip.
+        state()->setSourceMedia(jfk);
+        state()->setSourceIn(FrameTime(2 * fps));
+        state()->setSourceOut(FrameTime(5 * fps) - 1);
+        make->trigger();
+        QCOMPARE(state()->project().media.size(), size_t(2));
+        const MediaItem sub = state()->project().media.back();
+        QCOMPARE(sub.subclipOf, jfk);
+        QVERIFY(std::fabs(sub.subclipIn - 2) < 1e-9 && std::fabs(sub.subclipOut - 5) < 1e-9);
+        QCOMPARE(sub.name, std::string("jfk.wav Subclip 1"));
+        QCOMPARE(bin->shownMedia(), (std::vector<Id>{jfk, sub.id}));
+        const QModelIndex row = bin->model()->index(1, MediaBinModel::columnOf("kind"));
+        QCOMPARE(row.data().toString(), QString("Audio Subclip"));
+        QVERIFY(bin->model()->index(1, 0).data(Qt::ToolTipRole).toString().contains("Subclip of jfk.wav"));
+        state()->undo();
+        QCOMPARE(state()->project().media.size(), size_t(1));
+        state()->redo();
+
+        // Opening it opens its media with In and Out around it.
+        state()->setSourceMedia(0);
+        state()->setSourceMedia(sub.id);
+        QCOMPARE(state()->sourceMedia(), jfk);
+        QCOMPARE(state()->sourceIn(), FrameTime(2 * fps));
+        QCOMPARE(state()->sourceOut(), FrameTime(5 * fps) - 1);
+
+        // Dragged to the timeline, it places that range of its media, under its name.
+        bin->selectMedia({sub.id});
+        std::unique_ptr<QMimeData> mime(bin->model()->mimeData({bin->model()->index(1, 0)}));
+        ppf_ = measurePpf();
+        const QPoint at = pointFor(0, A1);
+        QDragEnterEvent enter(at, Qt::CopyAction, mime.get(), Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(viewport(), &enter);
+        QDragMoveEvent move(at, Qt::CopyAction, mime.get(), Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(viewport(), &move);
+        QDropEvent drop(QPointF(at), Qt::CopyAction, mime.get(), Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(viewport(), &drop);
+        const Track& a1 = *trackAt(*state()->sequence(), A1);
+        QCOMPARE(a1.clips.size(), size_t(1));
+        const Clip& placed = a1.clips.front();
+        QCOMPARE(placed.mediaId, jfk);
+        QCOMPARE(placed.name, sub.name);
+        QCOMPARE(placed.sourceIn, 2 * fps);
+        QCOMPARE(placed.duration, FrameTime(3 * fps));
+        bin->setView(MediaBinWidget::View::List);
+        QCOMPARE(bin->model()->index(1, MediaBinModel::columnOf("usage")).data().toString(), QString("1"));
+        bin->setView(MediaBinWidget::View::Icons);
+
+        // Removing the media takes its subclips with it, and undo brings both back.
+        QVERIFY(state()->removeMedia(jfk));
+        QVERIFY(state()->project().media.empty());
+        state()->undo();
+        QCOMPARE(state()->project().media.size(), size_t(2));
+        state()->newProject();
+    }
+
     void colourManagementUi() {
         // A short grey video to interpret.
         Project gen = makeDefaultProject();

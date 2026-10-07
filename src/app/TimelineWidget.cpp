@@ -88,6 +88,7 @@ QColor clipColor(const Project& p, const Clip& c, TrackKind kind) {
 struct MediaRef {
     Id id = 0;
     FrameTime in = -1, out = -1;
+    Id subclip = 0;  // the bin's subclip this range came from (its name names the clips)
 };
 std::vector<MediaRef> parseMediaMime(const QMimeData* mime) {
     std::vector<MediaRef> out;
@@ -100,6 +101,7 @@ std::vector<MediaRef> parseMediaMime(const QMimeData* mime) {
             r.in = f[1].toLongLong();
             r.out = f[2].toLongLong();
         }
+        if (f.size() >= 4) r.subclip = f[3].toULongLong();
         if (r.id) out.push_back(r);
     }
     return out;
@@ -1769,8 +1771,12 @@ void TimelineWidget::dropMedia(const QMimeData* mime, const QPoint& pos, bool in
             }
             last = res;
             created.insert(created.end(), res.created.begin(), res.created.end());
+            const MediaItem* sub = r.subclip ? p.findMedia(r.subclip) : nullptr;
             for (Id id : res.created)
-                if (const Clip* c = edit::clipById(sq, id)) f = std::max(f, c->end());
+                if (Clip* c = edit::clipById(sq, id)) {
+                    if (sub) c->name = sub->name;
+                    f = std::max(f, c->end());
+                }
         }
         if (!created.empty()) last.ok = true;
         return last;

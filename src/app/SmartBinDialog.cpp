@@ -171,6 +171,7 @@ void SmartBinDialog::fieldChanged(Row& row) {
             row.choice->addItem(tr("Audio"), QStringLiteral("audio"));
             row.choice->addItem(tr("Still Image"), QStringLiteral("image"));
             row.choice->addItem(tr("Sequence"), QStringLiteral("sequence"));
+            row.choice->addItem(tr("Subclip"), QStringLiteral("subclip"));
             break;
         case FieldType::Keywords:
             row.choice->setEditable(true);

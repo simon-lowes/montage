@@ -440,6 +440,11 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
             o["metadata"] = md;
         }
         if (!m.created.empty()) o["created"] = qs(m.created);
+        if (m.subclipOf) {
+            o["subclipOf"] = double(m.subclipOf);
+            o["subclipIn"] = m.subclipIn;
+            o["subclipOut"] = m.subclipOut;
+        }
         if (m.transcript && !m.transcript->empty())
             o["transcript"] = QJsonDocument::fromJson(QByteArray::fromStdString(transcriptToJson(*m.transcript))).object();
         if (m.visual && !m.visual->samples.empty())
@@ -533,6 +538,9 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
         const QJsonObject md = o.value("metadata").toObject();
         for (auto it = md.begin(); it != md.end(); ++it) m.metadata[it.key().toStdString()] = ss(it.value());
         m.created = ss(o.value("created"));
+        m.subclipOf = Id(i64(o.value("subclipOf")));
+        m.subclipIn = o.value("subclipIn").toDouble();
+        m.subclipOut = o.value("subclipOut").toDouble();
         p.media.push_back(m);
     }
     for (const auto& b : root.value("bins").toArray()) p.bins.push_back(ss(b));

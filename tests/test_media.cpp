@@ -945,6 +945,40 @@ private slots:
         QVERIFY(r.value("isError").toBool() && text(r).contains(">="));
         r = tool("montage_find_media", QJsonObject{{"project", project}, {"rules", QJsonArray{QJsonObject{{"field", "mood"}, {"op", "is"}, {"value", "x"}}}}});
         QVERIFY(r.value("isError").toBool() && text(r).contains("scene"));
+        // A subclip, placed by its name.
+        r = tool("montage_make_subclip", QJsonObject{{"project", project}, {"media", ball}, {"start_seconds", 0.12}, {"end_seconds", 0.36}, {"name", "Bounce"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QCOMPARE(r.value("structuredContent").toObject().value("subclip_start_seconds").toDouble(), 0.12);
+        r = tool("montage_make_subclip", QJsonObject{{"project", project}, {"media", ball}, {"start_seconds", 0.3}, {"end_seconds", 0.3}});
+        QVERIFY(r.value("isError").toBool());
+        r = tool("montage_place_media", QJsonObject{{"project", project}, {"media", "Bounce"}, {"at", 10}, {"track", "V1"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        {
+            Project withSub;
+            QVERIFY(loadProject(project.toStdString(), withSub));
+            const Clip* placedSub = nullptr;
+            for (const Clip& c : withSub.active()->videoTracks.at(0).clips)
+                if (c.name == "Bounce") placedSub = &c;
+            QVERIFY(placedSub);
+            QCOMPARE(placedSub->start, FrameTime(250));
+            QVERIFY(std::fabs(placedSub->sourceIn - 3) < 1e-6);  // 0.12 s at 25 fps
+            QCOMPARE(placedSub->duration, FrameTime(6));
+        }
+        r = tool("montage_find_media", QJsonObject{{"project", project}, {"rules", QJsonArray{QJsonObject{{"field", "kind"}, {"op", "is"}, {"value", "subclip"}}}}});
+        QCOMPARE(r.value("structuredContent").toObject().value("media").toArray().size(), 1);
+        // Used three times: the placed subclip, and both halves of the split clip play part of its range.
+        QCOMPARE(r.value("structuredContent").toObject().value("media").toArray().at(0).toObject().value("usage").toInt(), 3);
+        // Source in and out are seconds of the media.
+        r = tool("montage_place_media", QJsonObject{{"project", project}, {"media", ball}, {"at", 20}, {"in", 0.04}, {"out", 0.2}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        {
+            Project ranged;
+            QVERIFY(loadProject(project.toStdString(), ranged));
+            const Clip& last = ranged.active()->videoTracks.at(0).clips.back();
+            QCOMPARE(last.start, FrameTime(500));
+            QVERIFY(std::fabs(last.sourceIn - 1) < 1e-6);
+            QCOMPARE(last.duration, FrameTime(4));
+        }
         r = tool("montage_project_info", QJsonObject{{"project", project}});
         QCOMPARE(r.value("structuredContent").toObject().value("media").toArray().at(0).toObject().value("rating").toInt(), 4);
         QVERIFY(loadProject(project.toStdString(), saved));

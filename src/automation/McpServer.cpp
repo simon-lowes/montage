@@ -179,6 +179,11 @@ void logJson(const MediaItem& m, QJsonObject& o) {
     for (const auto& [key, v] : m.metadata) o[QString::fromStdString(key)] = QString::fromStdString(v);
     if (!m.bin.empty()) o["bin"] = QString::fromStdString(m.bin);
     if (!m.created.empty()) o["recorded"] = QString::fromStdString(m.created);
+    if (m.subclipOf) {
+        o["subclip_of"] = double(m.subclipOf);
+        o["subclip_start_seconds"] = m.subclipIn;
+        o["subclip_end_seconds"] = m.subclipOut;
+    }
 }
 
 QJsonObject projectJson(const Project& p) {
@@ -398,18 +403,24 @@ void McpServer::Impl::addTools() {
         "Put a media file (or part of it) on the timeline at a time, with its sound linked on the audio track. "
         "Overwrite replaces what is there; insert pushes later clips along.",
         R"json({"type":"object","properties":{
-            "project":{"type":"string"},"media":{"type":"string","description":"Media file"},
+            "project":{"type":"string"},"media":{"type":"string","description":"Media file, or the name of a subclip in the project"},
             "at":{"type":["number","string"],"description":"Timeline time; default: the end of the sequence"},
             "track":{"type":"string","description":"Video track, default V1 (a new one is made if it is the next number)"},
             "audio_track":{"type":"string","description":"Audio track, default A1"},
-            "in":{"type":["number","string"],"description":"Source in, seconds"},
-            "out":{"type":["number","string"],"description":"Source out, seconds"},
+            "in":{"type":["number","string"],"description":"Source in, seconds (of the subclip, for one)"},
+            "out":{"type":["number","string"],"description":"Source out, seconds (of the subclip, for one)"},
             "insert":{"type":"boolean","default":false}},
             "required":["project","media"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
-            const Id media = mediaFor(l.project, need(a, "media"));
+            // A subclip (by name) places its range of its media, under its name.
+            const MediaItem* sub = nullptr;
+            for (const MediaItem& m : l.project.media)
+                if (m.subclipOf && m.name == need(a, "media").toStdString()) sub = &m;
+            const std::string subName = sub ? sub->name : std::string();
+            const Id media = sub ? sub->subclipOf : mediaFor(l.project, need(a, "media"));
+            const double base = sub ? sub->subclipIn : 0;
             const FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : s.duration();
             const TrackRef v = trackArg(str(a, "track", "V1"), s, true, &l.project, &s);
             const TrackRef au = trackArg(str(a, "audio_track", "A1"), s, true, &l.project, &s);
@@ -419,8 +430,15 @@ void McpServer::Impl::addTools() {
                 if (x.isString()) return double(timeArg(x, s, k)) / s.fpsValue();
                 return def;
             };
-            const auto r = edit::placeMedia(l.project, s, media, at, seconds("in", 0), seconds("out", -1), v, au, a.value("insert").toBool());
+            // Seconds of the media (of the subclip, for one) into sequence frames, as placeMedia takes them.
+            const double in = (base + seconds("in", 0)) * s.fpsValue();
+            const double outSec = seconds("out", -1);
+            const double out = outSec >= 0 ? (base + outSec) * s.fpsValue() : sub ? sub->subclipOut * s.fpsValue() : -1.0;
+            const auto r = edit::placeMedia(l.project, s, media, at, in, out, v, au, a.value("insert").toBool());
             check(r);
+            if (sub)
+                for (Id id : r.created)
+                    if (Clip* c = edit::clipById(s, id)) c->name = subName;
             save(l);
             QJsonArray created;
             for (Id id : r.created)
@@ -701,7 +719,7 @@ void McpServer::Impl::addTools() {
             std::string err;
             bool changed = false;
             for (MediaItem& m : l.project.media) {
-                if (m.kind != MediaKind::Video || !m.hasVideo || m.path.empty() || (m.visual && !m.visual->samples.empty())) continue;
+                if (m.kind != MediaKind::Video || !m.hasVideo || m.path.empty() || m.subclipOf || (m.visual && !m.visual->samples.empty())) continue;
                 VisualIndex v;
                 if (!indexVideo(m.path, m.duration, v, 0, [&](double f) { progress(f, QStringLiteral("Indexing %1").arg(QString::fromStdString(m.name))); }, nullptr, &err))
                     return fail(QString::fromStdString(m.name + ": " + err));
@@ -811,7 +829,7 @@ void McpServer::Impl::addTools() {
             QJsonArray list;
             QString lines;
             for (const MediaItem& m : l.project.media) {
-                if (!smartBinMatches(b, m, usage) || !mediaMatchesSearch(m, text)) continue;
+                if (!smartBinMatches(b, m, usage, &l.project) || !mediaMatchesSearch(m, text, &l.project)) continue;
                 QJsonObject o{{"name", QString::fromStdString(m.name)}, {"duration_seconds", m.duration}};
                 if (!m.path.empty()) o["path"] = QString::fromStdString(m.path);
                 o["usage"] = usage.count(m.id) ? usage.at(m.id) : 0;
@@ -827,6 +845,27 @@ void McpServer::Impl::addTools() {
                 save(l);
             }
             return ok(lines.isEmpty() ? QStringLiteral("No media matches") : lines, QJsonObject{{"media", list}});
+        });
+
+    add("montage_make_subclip", "Make a subclip",
+        "Save a range of a media item in the project as a subclip: a bin item of its own (to log, find and place) that "
+        "plays that part of the media. Placing it with montage_place_media (by its name) places the range.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "media":{"type":"string","description":"A media file or name in the project"},
+            "start_seconds":{"type":"number"},"end_seconds":{"type":"number"},
+            "name":{"type":"string"}},"required":["project","media","start_seconds","end_seconds"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            MediaItem& src = projectMedia(l.project, need(a, "media"));
+            auto sub = makeSubclip(l.project, src.id, a.value("start_seconds").toDouble(), a.value("end_seconds").toDouble(),
+                                   str(a, "name").toStdString());
+            if (!sub) return fail("Cannot make that subclip: it needs a video or audio file and a range inside it");
+            sub->id = l.project.newId();
+            l.project.media.push_back(*sub);
+            save(l);
+            QJsonObject o{{"name", QString::fromStdString(sub->name)}, {"id", double(sub->id)}};
+            logJson(*sub, o);
+            return ok(QStringLiteral("Made subclip \"%1\" (%2-%3 s)").arg(QString::fromStdString(sub->name)).arg(sub->subclipIn, 0, 'f', 2).arg(sub->subclipOut, 0, 'f', 2), o);
         });
 
     add("montage_render_frame", "Look at a frame",

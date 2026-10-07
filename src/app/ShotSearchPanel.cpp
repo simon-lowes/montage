@@ -6,6 +6,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QMenu>
 #include <QMessageBox>
 #include <QPointer>
 #include <QProgressDialog>
@@ -25,7 +26,7 @@
 namespace montage {
 
 namespace {
-bool searchable(const MediaItem& m) { return m.kind == MediaKind::Video && m.hasVideo && !m.path.empty(); }
+bool searchable(const MediaItem& m) { return m.kind == MediaKind::Video && m.hasVideo && !m.path.empty() && !m.subclipOf; }
 }  // namespace
 
 ShotSearchPanel::ShotSearchPanel(EditorState* state, QWidget* parent)
@@ -60,6 +61,15 @@ ShotSearchPanel::ShotSearchPanel(EditorState* state, QWidget* parent)
     connect(searchBtn_, &QPushButton::clicked, this, [this] { search(query_->text()); });
     connect(indexBtn_, &QPushButton::clicked, this, [this] { QTimer::singleShot(0, this, [this] { indexMissing(); }); });
     connect(list_, &QListWidget::itemActivated, this, [this](QListWidgetItem* it) { open(list_->row(it)); });
+    list_->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(list_, &QWidget::customContextMenuRequested, this, [this](const QPoint& pos) {
+        const int row = list_->row(list_->itemAt(pos));
+        if (row < 0) return;
+        QMenu menu(this);
+        menu.addAction(tr("Open in Source Monitor"), this, [this, row] { open(row); });
+        menu.addAction(tr("Make Subclip"), this, [this, row] { makeSubclip(row); })->setObjectName(QStringLiteral("shotSubclip"));
+        menu.exec(list_->viewport()->mapToGlobal(pos));
+    });
     connect(state_, &EditorState::projectChanged, this, &ShotSearchPanel::refreshStatus);
     connect(thumbs_, &ThumbnailCache::ready, this, &ShotSearchPanel::showResults);
     refreshStatus();
@@ -158,6 +168,7 @@ int ShotSearchPanel::search(const QString& queryText) {
         return 0;
     }
     results_ = findShots(state_->project(), q, 30);
+    lastQuery_ = query;
     showResults();
     return int(results_.size());
 }
@@ -179,6 +190,18 @@ void ShotSearchPanel::showResults() {
         item->setToolTip(tr("Match %1").arg(double(r.score), 0, 'f', 3));
     }
     if (keep >= 0 && keep < list_->count()) list_->setCurrentRow(keep);
+}
+
+Id ShotSearchPanel::makeSubclip(int i) {
+    if (i < 0 || i >= int(results_.size())) return 0;
+    const ShotMatch& r = results_[size_t(i)];
+    const Sequence* s = state_->sequence();
+    const double fps = s ? s->fpsValue() : 30.0;
+    // Named after the search that found it.
+    const QString name = lastQuery_.isEmpty() ? QString() : lastQuery_.left(1).toUpper() + lastQuery_.mid(1);
+    const Id id = state_->makeSubclip(r.media, FrameTime(std::floor(r.start * fps)), FrameTime(std::ceil(r.end * fps)) - 1, name);
+    if (id) state_->message(tr("Subclip \"%1\" added to the media bin").arg(QString::fromStdString(state_->project().findMedia(id)->name)), 5000);
+    return id;
 }
 
 void ShotSearchPanel::open(int i) {

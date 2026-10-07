@@ -987,6 +987,86 @@ private slots:
         QCOMPARE(keyed.keys.size(), size_t(3));
     }
 
+    void subclips() {
+        Fixture fx;
+        Project& p = fx.p;
+        MediaItem& m = *p.findMedia(fx.media);
+        m.bin = "Interviews";
+        m.keywords = {"interview"};
+        Transcript t;
+        t.segments.push_back({1, 6, "hello world", {{1, 2, "hello", 1, {}}, {5, 6, "world", 1, {}}}, -1});
+        m.transcript = std::make_shared<const Transcript>(t);
+        m.timecode = 3600;
+
+        // A range of the media, in its bin, with its keywords; nothing for an empty range or a still.
+        auto sub = makeSubclip(p, fx.media, 4, 7);
+        QVERIFY(sub);
+        QCOMPARE(sub->subclipOf, fx.media);
+        QCOMPARE(sub->subclipIn, 4.0);
+        QCOMPARE(sub->subclipOut, 7.0);
+        QCOMPARE(sub->duration, 3.0);
+        QCOMPARE(sub->name, std::string("clip.mov Subclip 1"));
+        QCOMPARE(sub->bin, std::string("Interviews"));
+        QCOMPARE(sub->keywords, std::vector<std::string>{"interview"});
+        QCOMPARE(sub->timecode, 3604.0);
+        QVERIFY(!sub->transcript && sub->id == 0);
+        sub->id = p.newId();
+        p.media.push_back(*sub);
+        const Id subId = sub->id;
+        QVERIFY(!makeSubclip(p, fx.media, 5, 5));
+        QCOMPARE(makeSubclip(p, fx.media, 8, 50)->subclipOut, 10.0);  // kept inside the media
+        QCOMPARE(makeSubclip(p, fx.media, 8, 9)->name, std::string("clip.mov Subclip 2"));
+        QCOMPARE(makeSubclip(p, fx.media, 8, 9, "Best line")->name, std::string("Best line"));
+        // A subclip of a subclip is a range of the same media, inside the first.
+        auto inner = makeSubclip(p, subId, 1, 9);
+        QVERIFY(inner);
+        QCOMPARE(inner->subclipOf, fx.media);
+        QCOMPARE(inner->subclipIn, 5.0);
+        QCOMPARE(inner->subclipOut, 7.0);
+        MediaItem still;
+        still.id = p.newId();
+        still.kind = MediaKind::Image;
+        still.name = "still.png";
+        p.media.push_back(still);
+        QVERIFY(!makeSubclip(p, still.id, 0, 1));
+
+        // What is said in it: only the words in its range.
+        const MediaItem& s = *p.findMedia(subId);
+        QCOMPARE(spokenText(&p, s), std::string("world"));
+        QCOMPARE(spokenText(nullptr, s), std::string());
+        QCOMPARE(spokenText(&p, *p.findMedia(fx.media)), std::string("hello world"));
+        QVERIFY(mediaMatchesSearch(s, "world", &p));
+        QVERIFY(!mediaMatchesSearch(s, "hello", &p));
+        using Ids = std::vector<Id>;
+        auto matches = [&](std::vector<SmartRule> rules) {
+            std::vector<Id> ids = smartBinMedia(p, SmartBin{1, "t", true, std::move(rules)});
+            std::sort(ids.begin(), ids.end());
+            return ids;
+        };
+        QCOMPARE(matches({{"kind", "is", "subclip"}}), Ids{subId});
+        QCOMPARE(matches({{"kind", "is", "video"}}), (Ids{fx.media, subId}));
+        QCOMPARE(matches({{"transcript", "contains", "world"}}), (Ids{fx.media, subId}));
+        QCOMPARE(matches({{"any", "contains", "hello"}}), Ids{fx.media});
+
+        // Usage: clips of the media that play part of the range.
+        fx.put(V1, 0, 90, 0);  // media 0-3 s
+        std::map<Id, int> usage = mediaUsage(p);
+        QCOMPARE(usage[fx.media], 1);
+        QCOMPARE(usage.count(subId), size_t(0));
+        fx.put(V1, 200, 30, 150);  // media 5-6 s
+        usage = mediaUsage(p);
+        QCOMPARE(usage[fx.media], 2);
+        QCOMPARE(usage[subId], 1);
+
+        // Saved with the project.
+        Project back;
+        std::string err;
+        QVERIFY2(projectFromJson(projectToJson(p), back, &err), err.c_str());
+        QCOMPARE(back.findMedia(subId)->subclipOf, fx.media);
+        QCOMPARE(back.findMedia(subId)->subclipIn, 4.0);
+        QCOMPARE(back.findMedia(subId)->subclipOut, 7.0);
+    }
+
     void mediaLogging() {
         Fixture fx;
         Project& p = fx.p;

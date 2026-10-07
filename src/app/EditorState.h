@@ -97,6 +97,7 @@ public:
     // The media item loaded in the source monitor and its marks
     // (frames at the active sequence's rate; -1 = unset).
     Id sourceMedia() const { return sourceMedia_; }
+    // A subclip opens its media with In and Out around its range.
     void setSourceMedia(Id id);
     FrameTime sourceIn() const { return sourceIn_; }
     FrameTime sourceOut() const { return sourceOut_; }
@@ -105,6 +106,9 @@ public:
     // Three-point edits from the source monitor into the timeline at the
     // playhead (or the sequence In point), on the targeted tracks.
     bool insertFromSource(bool overwriteMode);
+    // Saves a range of a media item (frames of the active sequence, Out
+    // inclusive) as a subclip in the bin; returns its id, or 0.
+    Id makeSubclip(Id media, FrameTime in, FrameTime out, const QString& name = QString());
 
     // ---- Sequences ----------------------------------------------------------
     void setActiveSequence(Id id);

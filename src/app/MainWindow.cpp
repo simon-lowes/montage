@@ -406,6 +406,11 @@ void MainWindow::buildMenus() {
     add(clipM, tr("&Insert from Source"), QKeySequence(Qt::Key_Comma), [this] { state_->insertFromSource(false); });
     add(clipM, tr("&Overwrite from Source"), QKeySequence(Qt::Key_Period), [this] { state_->insertFromSource(true); });
     add(clipM, tr("&Match Frame"), QKeySequence(Qt::Key_F), [this] { matchFrame(); });
+    {
+        QAction* sub = add(clipM, tr("Make S&ubclip"), QKeySequence("Ctrl+U"), [this] { makeSubclip(); });
+        sub->setToolTip(tr("Save the Source monitor's In to Out as a subclip in the media bin"));
+        sub->setObjectName(QStringLiteral("makeSubclip"));
+    }
     add(clipM, tr("Nudge &Left"), QKeySequence("Alt+Left"), [this] { nudge(-1); });
     add(clipM, tr("Nudge &Right"), QKeySequence("Alt+Right"), [this] { nudge(1); });
     clipM->addSeparator();
@@ -683,8 +688,29 @@ void MainWindow::rebuildSourceProject() {
 
 void MainWindow::openInSource(Id media) {
     state_->setSourceMedia(media);
+    if (state_->sourceIn() >= 0) source_->seek(state_->sourceIn());  // a subclip: at its start
     sourceDock_->raise();
     active_ = Monitor::Source;
+}
+
+// Saves the Source monitor's In–Out as a subclip in the bin.
+Id MainWindow::makeSubclip() {
+    const Id media = state_->sourceMedia();
+    const MediaItem* m = state_->project().findMedia(media);
+    if (!m) {
+        statusBar()->showMessage(tr("Open a clip in the Source monitor and mark In and Out first"), 5000);
+        return 0;
+    }
+    const double fps = state_->sequence() ? state_->sequence()->fpsValue() : 30.0;
+    const FrameTime in = std::max<FrameTime>(0, state_->sourceIn());
+    const FrameTime out = state_->sourceOut() >= 0 ? state_->sourceOut() : FrameTime(std::ceil(m->duration * fps)) - 1;
+    const Id id = state_->makeSubclip(media, in, out);
+    if (!id) {
+        statusBar()->showMessage(tr("Only video and audio files can have subclips"), 5000);
+        return 0;
+    }
+    statusBar()->showMessage(tr("Subclip \"%1\" added to the media bin").arg(QString::fromStdString(state_->project().findMedia(id)->name)), 5000);
+    return id;
 }
 
 // ---------------------------------------------------------------------------
