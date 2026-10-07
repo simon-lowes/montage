@@ -210,6 +210,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
                 av_dict_set(&opts, "rc", "vbr", 0);
             }
             if (hasSuffix(c, "_amf")) av_dict_set(&opts, "quality", "quality", 0);
+            if (hasSuffix(c, "_mf")) av_dict_set(&opts, "hw_encoding", "1", 0);  // not Microsoft's software MFT
             if (c.rfind("hevc", 0) == 0) o.vctx->codec_tag = MKTAG('h', 'v', 'c', '1');
         } else if (c == "libx264" || c == "libx265") {
             if (s.videoBitrate <= 0) av_dict_set_int(&opts, "crf", s.crf, 0);

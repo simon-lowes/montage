@@ -93,6 +93,8 @@ std::string pickHwEncoder(const std::string& family, int width, int height, int 
         ctx->bit_rate = 8000000;
         AVDictionary* opts = nullptr;
         if (name.find("videotoolbox") != std::string::npos) av_dict_set(&opts, "allow_sw", "1", 0);
+        // Media Foundation would otherwise settle for Microsoft's software encoder.
+        if (name.find("_mf") != std::string::npos) av_dict_set(&opts, "hw_encoding", "1", 0);
         const bool ok = avcodec_open2(ctx, codec, &opts) >= 0;
         av_dict_free(&opts);
         avcodec_free_context(&ctx);
