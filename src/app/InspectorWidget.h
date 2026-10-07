@@ -47,6 +47,19 @@ private:
     void buildChain(Id owner);
     void addEffectMenu(TrackKind kind, Id owner);
 
+public:
+    // Analyses clip `clip`'s footage for its Stabilize effect `effect`.
+    void analyzeStabilize(Id clip, Id effect);
+    // Tracks the mask of `effect` on `clip` from the playhead to the clip's end
+    // (forward) or start; model 0 position, 1 + scale, 2 + rotation.
+    void trackMask(Id clip, Id effect, bool forward, int model);
+
+private:
+    // Runs `work` off the UI thread behind a progress dialog with Cancel;
+    // false (with the error shown) if it fails or is cancelled.
+    bool runAnalysis(const QString& title,
+                     const std::function<bool(const std::function<void(double)>&, const std::atomic<bool>*, std::string*)>& work);
+
     EditorState* state_;
     QWidget* content_ = nullptr;
     QVBoxLayout* layout_ = nullptr;

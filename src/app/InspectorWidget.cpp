@@ -1,8 +1,8 @@
 #include "InspectorWidget.h"
 
+#include <QAbstractItemView>
 #include <QCheckBox>
 #include <QColorDialog>
-#include <QAbstractItemView>
 #include <QComboBox>
 #include <QDoubleSpinBox>
 #include <QFileDialog>
@@ -14,11 +14,15 @@
 #include <QMenu>
 #include <QPainter>
 #include <QPlainTextEdit>
+#include <QProgressDialog>
 #include <QPushButton>
 #include <QSlider>
+#include <QTimer>
 #include <QToolButton>
 #include <QVBoxLayout>
+#include <QtConcurrent>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <utility>
 
@@ -26,6 +30,8 @@
 #include "PluginEditorWindow.h"
 #include "Theme.h"
 #include "audio/PluginEffect.h"
+#include "core/EditOps.h"
+#include "render/ClipAnalysis.h"
 #include "render/Ocio.h"
 
 namespace montage {
@@ -403,11 +409,57 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
             th->addWidget(w);
         QFormLayout* f = addSection(QString::fromStdString(info->displayName), tools);
         addParamRows(f, *info, target(eid));
+        const bool onClip = state_->sequence() && edit::clipById(*state_->sequence(), owner);
+        if (e.type == "stabilize" && onClip) {
+            // The analysis lives in the effect; it is redone on demand.
+            auto* row = new QWidget(content_);
+            auto* rh = new QHBoxLayout(row);
+            rh->setContentsMargins(0, 0, 0, 0);
+            auto* status = new QLabel(row);
+            CameraMotion cm;
+            status->setText(cameraMotionFromString(e.s("motion"), cm) ? tr("Analysed: %n frame(s)", "", int(cm.steps.size()))
+                                                                      : tr("Not analysed yet"));
+            auto* analyze = new QPushButton(tr("Analyze"), row);
+            analyze->setObjectName(QStringLiteral("analyzeStabilize"));
+            analyze->setToolTip(tr("Measure the camera's movement in this clip"));
+            rh->addWidget(status, 1);
+            rh->addWidget(analyze);
+            f->addRow(QString(), row);
+            // Deferred: the analysis waits in an event loop, and the Inspector may rebuild meanwhile.
+            connect(analyze, &QPushButton::clicked, this,
+                    [this, owner, eid] { QTimer::singleShot(0, this, [this, owner, eid] { analyzeStabilize(owner, eid); }); });
+        }
         if (kind == TrackKind::Video && supportsMask(e.type)) {
             // Shape masks and the HSL qualifier; folded away until one is used.
             QFormLayout* mf = addSection(tr("%1 Mask").arg(QString::fromStdString(info->displayName)), nullptr,
                                          !hasMask(e, localTime()));
             addParamRows(mf, maskInfo(), target(eid));
+            if (onClip) {
+                // Make the mask follow what it covers, from the playhead on (or back).
+                auto* row = new QWidget(content_);
+                auto* rh = new QHBoxLayout(row);
+                rh->setContentsMargins(0, 0, 0, 0);
+                auto* back = new QToolButton(row);
+                back->setText(tr("◀ Track"));
+                back->setObjectName(QStringLiteral("trackMaskBack"));
+                back->setToolTip(tr("Track the mask backwards from the playhead to the clip's start"));
+                auto* fwd = new QToolButton(row);
+                fwd->setText(tr("Track ▶"));
+                fwd->setObjectName(QStringLiteral("trackMaskForward"));
+                fwd->setToolTip(tr("Track the mask from the playhead to the clip's end"));
+                auto* model = new QComboBox(row);
+                model->setObjectName(QStringLiteral("trackModel"));
+                model->addItems({tr("Position"), tr("Position & Scale"), tr("Position, Scale & Rotation")});
+                rh->addWidget(back);
+                rh->addWidget(fwd);
+                rh->addWidget(model, 1);
+                mf->addRow(tr("Track:"), row);
+                for (auto [button, forward] : {std::pair{back, false}, std::pair{fwd, true}})
+                    connect(button, &QToolButton::clicked, this, [this, owner, eid, model, forward = forward] {
+                        const int m = model->currentIndex();
+                        QTimer::singleShot(0, this, [this, owner, eid, forward, m] { trackMask(owner, eid, forward, m); });
+                    });
+            }
         }
         auto mutateStack = [this, owner, eid](const QString& label, std::function<void(std::vector<Effect>&, size_t, Project&)> fn) {
             state_->edit(label, [=](Project& p, Sequence& s) {
@@ -461,12 +513,19 @@ void InspectorWidget::addEffectMenu(TrackKind kind, Id owner) {
         std::string type = info->type;
         QString label = QString::fromStdString(info->displayName);
         g->addAction(label, this, [this, owner, type, label] {
-            state_->edit(tr("Add %1").arg(label), [owner, type](Project& p, Sequence& s) {
+            Id added = 0;
+            state_->edit(tr("Add %1").arg(label), [owner, type, &added](Project& p, Sequence& s) {
                 std::vector<Effect>* chain = edit::effectChain(s, owner);
                 if (!chain) return false;
-                chain->push_back(makeEffect(p, type));
+                Effect e = makeEffect(p, type);
+                added = e.id;
+                // Stabilize moves the whole frame: it goes first, before any filter.
+                if (type == "stabilize") chain->insert(chain->begin(), e);
+                else chain->push_back(e);
                 return true;
             });
+            if (type == "stabilize" && added && state_->sequence() && edit::clipById(*state_->sequence(), owner))
+                QTimer::singleShot(0, this, [this, owner, added] { analyzeStabilize(owner, added); });
         });
     }
     if (kind == TrackKind::Audio) {
@@ -914,6 +973,87 @@ void InspectorWidget::addStringRow(QFormLayout* form, const StringParamInfo& si,
             break;
         }
     }
+}
+
+bool InspectorWidget::runAnalysis(
+    const QString& title, const std::function<bool(const std::function<void(double)>&, const std::atomic<bool>*, std::string*)>& work) {
+    QProgressDialog progress(title, tr("Cancel"), 0, 1000, window());
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(400);
+    auto done = std::make_shared<std::atomic<double>>(0.0);
+    auto cancel = std::make_shared<std::atomic<bool>>(false);
+    connect(&progress, &QProgressDialog::canceled, this, [cancel] { *cancel = true; });
+    QTimer tick;
+    connect(&tick, &QTimer::timeout, &progress, [&progress, done] { progress.setValue(int(*done * 1000)); });
+    tick.start(100);
+    using Out = std::pair<bool, std::string>;
+    QFutureWatcher<Out> watcher;
+    QEventLoop wait;
+    connect(&watcher, &QFutureWatcher<Out>::finished, &wait, &QEventLoop::quit);
+    watcher.setFuture(QtConcurrent::run([work, done, cancel] {
+        std::string err;
+        const bool ok = work([done](double f) { *done = f; }, cancel.get(), &err);
+        return Out{ok, err};
+    }));
+    if (!watcher.isFinished()) wait.exec();
+    tick.stop();
+    progress.disconnect(this);  // closing a progress dialog emits canceled()
+    progress.close();
+    const Out r = watcher.result();
+    if (!r.first && !*cancel && !r.second.empty()) state_->message(QString::fromStdString(r.second), 6000);
+    return r.first && !*cancel;
+}
+
+void InspectorWidget::analyzeStabilize(Id clip, Id effect) {
+    const Sequence* s = state_->sequence();
+    const Clip* c = s ? edit::clipById(*s, clip) : nullptr;
+    if (!c) return;
+    // The analysis reads a copy: editing can go on meanwhile.
+    auto project = std::make_shared<const Project>(state_->project());
+    const Id seqId = s->id;
+    std::string motion;
+    const bool ok = runAnalysis(tr("Analysing camera movement..."), [&, project, seqId, clip](const auto& progress, const auto* cancel, std::string* err) {
+        const Sequence* sq = project->findSequence(seqId);
+        const Clip* cl = sq ? edit::clipById(*sq, clip) : nullptr;
+        return cl && analyzeClipStabilization(*project, *sq, *cl, motion, progress, cancel, err);
+    });
+    if (!ok) return;
+    state_->edit(tr("Analyze Stabilization"), [clip, effect, motion](Project&, Sequence& sq) {
+        Effect* e = edit::ownedEffect(sq, clip, effect);
+        if (!e) return false;
+        e->strings["motion"] = motion;
+        return true;
+    });
+}
+
+void InspectorWidget::trackMask(Id clip, Id effect, bool forward, int model) {
+    const Sequence* s = state_->sequence();
+    const Clip* c = s ? edit::clipById(*s, clip) : nullptr;
+    const Effect* e = s ? edit::ownedEffect(const_cast<Sequence&>(*s), clip, effect) : nullptr;
+    if (!c || !e) return;
+    if (!hasMask(*e, state_->playhead() - c->start)) {
+        state_->message(tr("Draw a mask first (choose a shape), then track it"), 5000);
+        return;
+    }
+    auto project = std::make_shared<const Project>(state_->project());
+    const Id seqId = s->id;
+    const FrameTime from = std::clamp<FrameTime>(state_->playhead() - c->start, 0, c->duration - 1);
+    const MotionModel m = model == 0 ? MotionModel::Translation : model == 1 ? MotionModel::TranslationScale : MotionModel::Similarity;
+    std::vector<std::pair<FrameTime, TrackRegion>> keys;
+    const bool ok = runAnalysis(tr("Tracking the mask..."), [&, project, seqId](const auto& progress, const auto* cancel, std::string* err) {
+        const Sequence* sq = project->findSequence(seqId);
+        const Clip* cl = sq ? edit::clipById(*sq, clip) : nullptr;
+        const Effect* ef = sq ? edit::ownedEffect(const_cast<Sequence&>(*sq), clip, effect) : nullptr;
+        return cl && ef && trackClipMask(*project, *sq, *cl, *ef, from, forward, m, keys, progress, cancel, err);
+    });
+    if (!ok) return;
+    state_->edit(tr("Track Mask"), [clip, effect, keys](Project&, Sequence& sq) {
+        Effect* ef = edit::ownedEffect(sq, clip, effect);
+        if (!ef) return false;
+        applyMaskTrack(*ef, keys);
+        return true;
+    });
+    state_->message(tr("Tracked %n frame(s)", "", int(keys.size())), 4000);
 }
 
 }  // namespace montage

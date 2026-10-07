@@ -141,6 +141,14 @@ std::vector<EffectInfo> buildCatalog() {
         cst.strings[0].choices = cst.strings[1].choices = spaces;
         c.push_back(cst);
     }
+    // Stabilize: the analysed camera path (strings["motion"], written by the
+    // Inspector's Analyze) smoothed; render/Processing.cpp moves each frame.
+    c.push_back({"stabilize", "Stabilize", EffectCategory::VideoFilter, "Transform",
+                 {num("smoothness", "Smoothness (s)", 0, 10, 1.5, 0.1),
+                  choice("method", "Method", {"Position", "Position & Scale", "Position, Scale & Rotation"}, 2),
+                  choice("framing", "Framing", {"Zoom to Fill", "Show Edges"}, 0), pct("extra_zoom", "Extra Zoom", 0, 50, 0)},
+                 {}});
+    for (auto& pi : c.back().params) pi.keyframeable = false;
     {
         // OpenColorIO transform from a config file, a built-in config or $OCIO (render/Ocio.h).
         EffectInfo ocio{"ocio", "OpenColorIO Transform", EffectCategory::VideoFilter, "Color",

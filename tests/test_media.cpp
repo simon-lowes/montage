@@ -1,9 +1,11 @@
 // Media tests: probing, frame-accurate decoding, audio mixing, export round trips.
 #include <QtTest>
+#include <QPainter>
 
 #include <algorithm>
 #include <cmath>
 #include <functional>
+#include <random>
 #include <cstdio>
 
 #include "core/EditOps.h"
@@ -19,9 +21,11 @@
 #include "media/Loudness.h"
 #include "media/MediaPool.h"
 #include "media/SpeakerSwitch.h"
+#include "media/Tracking.h"
 #ifdef MONTAGE_WITH_WHISPER
 #include "media/Transcriber.h"
 #endif
+#include "render/ClipAnalysis.h"
 #include "render/ColorSpace.h"
 #include "render/Compositor.h"
 #include "render/Exporter.h"
@@ -637,6 +641,173 @@ private slots:
         QVERIFY(QString::fromStdString(err).contains("not found"));
     }
 #endif
+
+    // A textured still moved by known jitter every frame: a shaky "camera".
+    // Returns the jitter (sequence pixels) per frame.
+    std::vector<Point2> writeShakyVideo(const std::string& file, int frames) {
+        QImage tex(480, 270, QImage::Format_RGB32);
+        tex.fill(QColor(90, 90, 90));
+        {
+            QPainter pa(&tex);
+            std::mt19937 rng(7);
+            std::uniform_int_distribution<int> x(0, 470), y(0, 260), sz(6, 40), c(0, 255);
+            for (int i = 0; i < 220; ++i)
+                pa.fillRect(x(rng), y(rng), sz(rng), sz(rng), QColor(c(rng), c(rng), c(rng)));
+        }
+        const QString png = QString::fromStdString(path("texture.png"));
+        tex.save(png);
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320;
+        s.height = 180;
+        s.fps = {25, 1};
+        MediaItem m = probeOrFail(p, png.toStdString());
+        p.media.push_back(m);
+        Clip c = makeClip(p, m, TrackKind::Video, s);
+        c.duration = frames;
+        std::vector<Point2> jitter;
+        c.motion.params["scale"] = Param(130.0);
+        for (int i = 0; i < frames; ++i) {
+            const Point2 j{6 * std::sin(i * 1.7), 4 * std::cos(i * 1.1)};
+            jitter.push_back(j);
+            c.motion.params["pos_x"].addKey(i, j.x, Interp::Hold);
+            c.motion.params["pos_y"].addKey(i, j.y, Interp::Hold);
+        }
+        edit::overwrite(p, s, {TrackKind::Video, 0}, c);
+        ExportSettings st;
+        st.path = file;
+        st.audioCodec = "none";
+        st.crf = 12;
+        st.preset = "ultrafast";
+        std::string err;
+        if (!exportSequence(p, s, st, nullptr, nullptr, &err)) qWarning("export failed: %s", err.c_str());
+        return jitter;
+    }
+
+    void trackingAndStabilization() {
+        const std::string video = path("shaky.mp4");
+        const int frames = 40;
+        const auto jitter = writeShakyVideo(video, frames);
+        // Feature tracking between two frames recovers the shift.
+        VideoDecoder dec;
+        std::string err;
+        QVERIFY2(dec.open(video, &err), err.c_str());
+        const GrayImage a = toGray(*dec.frameAt(0)), b = toGray(*dec.frameAt(1 / 25.0));
+        const auto pts = goodFeatures(a, 200, 8);
+        QVERIFY2(pts.size() > 40, qPrintable(QString::number(pts.size())));
+        std::vector<Point2> moved;
+        std::vector<bool> ok;
+        trackPoints(a, b, pts, moved, ok);
+        std::vector<Point2> fa, fb;
+        for (size_t i = 0; i < pts.size(); ++i)
+            if (ok[i]) {
+                fa.push_back(pts[i]);
+                fb.push_back(moved[i]);
+            }
+        QVERIFY(fa.size() > pts.size() / 2);
+        Similarity m;
+        QVERIFY(fitMotion(fa, fb, MotionModel::Similarity, m));
+        QVERIFY2(std::fabs(m.tx - (jitter[1].x - jitter[0].x)) < 0.3 && std::fabs(m.ty - (jitter[1].y - jitter[0].y)) < 0.3,
+                 qPrintable(QString("%1 %2").arg(m.tx).arg(m.ty)));
+        QVERIFY(std::fabs(m.angle) < 0.003 && std::fabs(m.scale - 1) < 0.003);
+
+        // Camera motion over the clip follows the jitter (fractions of the width).
+        CameraMotion cam = analyzeCameraMotion(video, 0, frames / 25.0, {}, nullptr, &err);
+        QCOMPARE(int(cam.steps.size()), frames);
+        double x = 0, y = 0, worst = 0;
+        for (int i = 1; i < frames; ++i) {
+            x += cam.steps[size_t(i)].tx;
+            y += cam.steps[size_t(i)].ty;
+            worst = std::max({worst, std::fabs(x * 320 - (jitter[size_t(i)].x - jitter[0].x)),
+                              std::fabs(y * 320 - (jitter[size_t(i)].y - jitter[0].y))});
+        }
+        QVERIFY2(worst < 0.6, qPrintable(QString::number(worst)));
+        // Locked: each frame is moved back onto the first.
+        auto lock = stabilizationCorrections(cam, 0, MotionModel::Similarity);
+        for (int i = 0; i < frames; ++i)
+            QVERIFY(std::fabs(lock[size_t(i)].tx * 320 + (jitter[size_t(i)].x - jitter[0].x)) < 0.8);
+        // Smoothed corrections are smaller, and the zoom covers the largest.
+        auto smooth = stabilizationCorrections(cam, 1.0, MotionModel::Translation);
+        const double zoom = stabilizationZoom(lock, 180.0 / 320);
+        QVERIFY2(zoom > 1.02 && zoom < 1.2, qPrintable(QString::number(zoom)));
+        QVERIFY(stabilizationZoom(smooth, 180.0 / 320) <= zoom + 1e-9);
+
+        // A region followed through the clip.
+        TrackRegion start{0.4, 0.45, 0.25, 0.3, 0};
+        auto track = trackRegion(video, 0, (frames - 1) / 25.0, start, MotionModel::Translation, {}, nullptr, &err);
+        QCOMPARE(int(track.size()), frames);
+        worst = 0;
+        for (int i = 0; i < frames; ++i)
+            worst = std::max({worst, std::fabs((track[size_t(i)].x - start.x) * 320 - (jitter[size_t(i)].x - jitter[0].x)),
+                              std::fabs((track[size_t(i)].y - start.y) * 180 - (jitter[size_t(i)].y - jitter[0].y))});
+        QVERIFY2(worst < 1.0, qPrintable(QString::number(worst)));
+        // Backwards from the end lands where it started.
+        auto back = trackRegion(video, (frames - 1) / 25.0, 0, track.back(), MotionModel::Translation, {}, nullptr, &err);
+        QCOMPARE(int(back.size()), frames);
+        QVERIFY(std::fabs(back.back().x - start.x) * 320 < 1.0 && std::fabs(back.back().y - start.y) * 180 < 1.0);
+
+        // In a sequence: the clip shows footage frames 10 to 34.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320;
+        s.height = 180;
+        s.fps = {25, 1};
+        MediaItem mi = probeOrFail(p, video);
+        p.media.push_back(mi);
+        QVERIFY(edit::placeMedia(p, s, mi.id, 0, 10, 35, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Clip& clip = trackAt(s, {TrackKind::Video, 0})->clips.at(0);
+        // Stabilize: frame-to-frame differences shrink to almost nothing when locked.
+        std::string motion;
+        QVERIFY2(analyzeClipStabilization(p, s, clip, motion, {}, nullptr, &err), err.c_str());
+        Effect stab = makeEffect(p, "stabilize");
+        stab.strings["motion"] = motion;
+        stab.params["smoothness"] = Param(0.0);
+        stab.params["method"] = Param(0.0);
+        auto shake = [&](int from, int to) {
+            RenderOptions ro;
+            double total = 0;
+            Image prev = renderProgramFrame(p, s, from, ro);
+            for (int f = from + 1; f <= to; ++f) {
+                Image img = renderProgramFrame(p, s, f, ro);
+                double d = 0;
+                // The middle of the frame (edges move with the zoom).
+                for (int y = 45; y < 135; ++y)
+                    for (int x = 80; x < 240; ++x) d += std::fabs(img.at(x, y)[1] - prev.at(x, y)[1]);
+                total += d / (90 * 160);
+                prev = std::move(img);
+            }
+            return total / (to - from);
+        };
+        const double before = shake(0, 12);
+        clip.effects.push_back(stab);
+        const double after = shake(0, 12);
+        QVERIFY2(after < before * 0.35, qPrintable(QString("%1 -> %2").arg(before).arg(after)));
+        // The motion data travels with the project.
+        Project back2;
+        QVERIFY(projectFromJson(projectToJson(p), back2));
+        QCOMPARE(back2.active()->videoTracks[0].clips[0].effects.back().s("motion"), motion);
+
+        // Mask tracking writes keyframes that follow the footage.
+        Effect blur = makeEffect(p, "gaussian_blur");
+        blur.params["mask.shape"] = Param(1.0);
+        blur.params["mask.x"] = Param(0.4);
+        blur.params["mask.y"] = Param(0.45);
+        std::vector<std::pair<FrameTime, TrackRegion>> keys;
+        QVERIFY2(trackClipMask(p, s, clip, blur, 0, true, MotionModel::Translation, keys, {}, nullptr, &err), err.c_str());
+        QCOMPARE(clip.duration, FrameTime(25));
+        QCOMPARE(int(keys.size()), 25);
+        applyMaskTrack(blur, keys);
+        QCOMPARE(blur.params["mask.x"].keys.size(), size_t(25));
+        // Local frame 20 is footage frame 30.
+        const double dx = (blur.p("mask.x", 20) - 0.4) * 320, expect = jitter[30].x - jitter[10].x;
+        QVERIFY2(std::fabs(dx - expect) < 1.0, qPrintable(QString("%1 vs %2").arg(dx).arg(expect)));
+        // Not from the last frame forwards.
+        QVERIFY(!trackClipMask(p, s, clip, blur, 24, true, MotionModel::Translation, keys, {}, nullptr, &err));
+        // Backwards from the end, the keys come back to where the forward track started.
+        QVERIFY(trackClipMask(p, s, clip, blur, 24, false, MotionModel::Translation, keys, {}, nullptr, &err));
+        QCOMPARE(keys.back().first, FrameTime(0));
+        QVERIFY(std::fabs(keys.back().second.x - 0.4) * 320 < 1.0);
+    }
 
     void multicamSpeakerSwitchAndAudioAngles() {
         // Two people with a microphone each: A talks for 3 s, then B for 3 s,

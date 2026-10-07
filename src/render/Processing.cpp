@@ -3,6 +3,7 @@
 #include "ColorSpace.h"
 #include "Ocio.h"
 #include "core/Effects.h"
+#include "media/Tracking.h"
 
 #include <algorithm>
 #include <cmath>
@@ -519,8 +520,82 @@ namespace {
 void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelScale);
 }
 
-void applyVideoEffect(const Effect& e, FrameTime t, Image& img, double pixelScale) {
+namespace {
+// Stabilize: the analysed camera path (strings["motion"]) smoothed, and the
+// frame moved by the difference, zoomed so no edge shows.
+struct StabilizePlan {
+    double fps = 0, start = 0, zoom = 1;
+    std::vector<Similarity> corrections;
+};
+std::shared_ptr<const StabilizePlan> stabilizePlan(const Effect& e, FrameTime t, double aspect) {
+    static std::mutex m;
+    static std::map<std::string, std::shared_ptr<const StabilizePlan>> cache;
+    const std::string& data = e.s("motion");
+    if (data.empty()) return nullptr;
+    const double smooth = e.p("smoothness", t, 1.5);
+    const int method = int(e.p("method", t, 2));
+    const bool fill = e.p("framing", t, 0) < 0.5;
+    char key[96];
+    std::snprintf(key, sizeof key, "|%.4f|%d|%d|%.4f|%zu", smooth, method, fill ? 1 : 0, aspect, std::hash<std::string>{}(data));
+    std::lock_guard lock(m);
+    auto& slot = cache[key];
+    if (slot) return slot;
+    CameraMotion motion;
+    if (!cameraMotionFromString(data, motion)) return nullptr;
+    auto plan = std::make_shared<StabilizePlan>();
+    plan->fps = motion.fps;
+    plan->start = motion.start;
+    const MotionModel model = method == 0 ? MotionModel::Translation : method == 1 ? MotionModel::TranslationScale : MotionModel::Similarity;
+    plan->corrections = stabilizationCorrections(motion, smooth, model);
+    plan->zoom = fill ? stabilizationZoom(plan->corrections, aspect) : 1.0;
+    if (cache.size() > 32) cache.clear();
+    slot = plan;
+    return plan;
+}
+
+void stabilize(const Effect& e, FrameTime t, Image& img, double sourceSeconds) {
+    if (sourceSeconds < 0 || img.empty()) return;
+    auto plan = stabilizePlan(e, t, double(img.height) / img.width);
+    if (!plan || plan->corrections.empty()) return;
+    const long i = std::clamp<long>(std::lround((sourceSeconds - plan->start) * plan->fps), 0, long(plan->corrections.size()) - 1);
+    const Similarity& c = plan->corrections[size_t(i)];
+    const double zoom = plan->zoom * (1 + e.p("extra_zoom", t, 0) / 100);
+    if (std::fabs(c.tx) < 1e-7 && std::fabs(c.ty) < 1e-7 && std::fabs(c.angle) < 1e-9 && std::fabs(c.scale - 1) < 1e-9 && zoom == 1) return;
+    // Output pixel q (centred, in widths) shows source point R(-a)/s * (q / zoom - t).
+    const Image src = img;
+    const double W = img.width, H = img.height;
+    const double co = std::cos(-c.angle) / c.scale, si = std::sin(-c.angle) / c.scale;
+    parallelRows(img.height, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y) {
+            float* o = img.row(y);
+            for (int x = 0; x < img.width; ++x, o += 4) {
+                const double qx = ((x + 0.5) - W / 2) / W / zoom - c.tx, qy = ((y + 0.5) - H / 2) / W / zoom - c.ty;
+                const double sx = (co * qx - si * qy) * W + W / 2 - 0.5, sy = (si * qx + co * qy) * W + H / 2 - 0.5;
+                if (sx < -1 || sy < -1 || sx > W || sy > H) {
+                    o[0] = o[1] = o[2] = o[3] = 0;
+                    continue;
+                }
+                const int x0 = int(std::floor(sx)), yy0 = int(std::floor(sy));
+                const float fx = float(sx - x0), fy = float(sy - yy0);
+                const int xa = std::clamp(x0, 0, src.width - 1), xb = std::clamp(x0 + 1, 0, src.width - 1);
+                const int ya = std::clamp(yy0, 0, src.height - 1), yb = std::clamp(yy0 + 1, 0, src.height - 1);
+                const float *p00 = src.at(xa, ya), *p10 = src.at(xb, ya), *p01 = src.at(xa, yb), *p11 = src.at(xb, yb);
+                for (int k = 0; k < 4; ++k) {
+                    const float a = p00[k] + (p10[k] - p00[k]) * fx, b = p01[k] + (p11[k] - p01[k]) * fx;
+                    o[k] = a + (b - a) * fy;
+                }
+            }
+        }
+    });
+}
+}  // namespace
+
+void applyVideoEffect(const Effect& e, FrameTime t, Image& img, double pixelScale, double sourceSeconds) {
     if (!e.enabled || img.empty()) return;
+    if (e.type == "stabilize") {
+        stabilize(e, t, img, sourceSeconds);  // moves the whole frame: masks do not apply
+        return;
+    }
     if (!hasMask(e, t)) {
         applyEffectUnmasked(e, t, img, pixelScale);
         return;

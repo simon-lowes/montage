@@ -13,7 +13,9 @@ namespace montage {
 // Applies one video filter effect in place. `t` is the clip-relative frame
 // (for keyframes); `pixelScale` converts pixel-sized parameters (blur
 // radius...) from sequence pixels to this image's pixels.
-void applyVideoEffect(const Effect& e, FrameTime t, Image& img, double pixelScale);
+// `sourceSeconds` is the media time of the frame (for effects that follow
+// the footage, such as Stabilize); -1 when there is none.
+void applyVideoEffect(const Effect& e, FrameTime t, Image& img, double pixelScale, double sourceSeconds = -1);
 
 // The effect's mask (Effects.h maskInfo) over `img` as one value in 0..1 per
 // pixel; the qualifier reads the colours of `img`. Empty when there is no mask.

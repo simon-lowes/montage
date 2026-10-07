@@ -113,8 +113,17 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
   - Speaker-based Auto Switch: per-angle microphones, a wide angle for silence and cross-talk, margin, hold and shortest shot.
   - Timeline angle labels, angle and audio menus, and Flatten Multicam.
   - Still to do: speaker labels from transcripts as an alternative to microphones, and multicam in EDL/OTIO export without flattening.
-- [ ] 15. GPU compositor on QRhi (XL)
-- [ ] 16. Tracking and stabilisation (L)
+- [ ] 15. GPU compositor on QRhi (XL). Deferred behind the user-facing items. The measured CPU fixes (threaded colour conversion, no redundant copies or zero-fills) took 1080p playback from 26 to 56 fps and the 1/2-resolution preview from 77 to 150 fps on 4 cores. A QRhi compositor needs Qt's private RHI headers on Ubuntu's Qt 6.4, shader baking on three platforms, and a GPU-less CI strategy.
+- [x] 16. Tracking and stabilisation (L):
+  - Own tracker: Shi–Tomasi corners, pyramidal Lucas–Kanade with forward–backward checks, and RANSAC fits for translation, + scale, or similarity.
+  - Stabilize effect:
+    - analysed when added (or with Analyze) over the clip's media plus a second either side;
+    - Gaussian smoothing, or lock;
+    - three methods, and Zoom to Fill / Show Edges plus extra zoom;
+    - keyed to media time, so trims and speed changes keep working.
+  - Mask tracking from the playhead, forwards or backwards, with three motion models; it writes keyframes, as one undo step.
+  - Tested on synthetic shaky footage with known jitter: sub-pixel per-frame motion, a camera path within 0.6 px, region tracks within 1 px, and stabilised frame-to-frame change cut by more than 65 %.
+  - Still to do: planar (corner-pin) tracking, and attaching a track to a title or clip's position.
 - [ ] 17. LV2 hosting (M)
 - [ ] 18. Speed ramps and optical-flow retiming (L)
 - [ ] 19. Interchange round trip: OTIO import, EDL import, FCP7 XML and FCPXML (L)

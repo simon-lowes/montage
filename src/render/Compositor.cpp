@@ -277,6 +277,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
     Image src;
     double mw = SW, mh = SH;
     Geometry g;
+    double sourceSeconds = -1;  // media time of the frame, for effects that follow the footage
     if (c.isGenerator()) {
         g = geometryFor(c.motion, lt, SW, SH, SW, SH);
         int w, h;
@@ -318,6 +319,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             }
             Frame16Ptr f = MediaPool::instance().videoFrame(path, sec, w, h, o.highQuality);
             if (!f) return {};
+            if (m->kind == MediaKind::Video) sourceSeconds = sec;
             src = toImage(*f);
             // Input transform: the media's space into the sequence's working space.
             convertColor(src, mediaColorSpace(*m), sequenceColorSpace(seq), seq.hdrPeakNits);
@@ -330,7 +332,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
     double fitX = std::fabs(g.sx) / std::max(1e-9, std::fabs(c.motion.p("scale", lt, 100) / 100.0 *
                                                                 c.motion.p("scale_x", lt, 100) / 100.0));
     double pixelScale = src.width / std::max(1.0, mw * fitX);
-    for (const auto& e : c.effects) applyVideoEffect(e, lt, src, pixelScale);
+    for (const auto& e : c.effects) applyVideoEffect(e, lt, src, pixelScale, sourceSeconds);
     if (identityLayer(src, g, SW, SH, o.scale)) return src;  // a full-frame clip: no copy
     return transformLayer(src, g, SW, SH, o.scale);
 }

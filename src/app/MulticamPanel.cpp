@@ -342,6 +342,7 @@ void MulticamPanel::autoSwitch() {
         return std::make_pair(changes, err);
     }));
     if (!work.isFinished()) wait.exec();
+    progress.disconnect(this);  // closing a progress dialog emits canceled()
     progress.close();
     const auto [changes, err] = work.result();
     if (*cancel) return;

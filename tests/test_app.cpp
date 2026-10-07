@@ -14,6 +14,7 @@
 #include <QSlider>
 #include <QPushButton>
 #include <QMenu>
+#include <QPainter>
 #include <QTableWidget>
 #include <QToolButton>
 #include <QTreeWidget>
@@ -44,6 +45,7 @@
 #include "core/Effects.h"
 #include "core/Multicam.h"
 #include "core/ProjectIO.h"
+#include "media/Decoder.h"
 #include "render/ColorSpace.h"
 #include "render/Compositor.h"
 #include "render/Exporter.h"
@@ -877,6 +879,113 @@ private slots:
         state()->undo();
         QCOMPARE(state()->sequence()->videoTracks[0].clips.size(), size_t(1));
         state()->newProject();
+    }
+
+    void stabilizeAndTrackFromInspector() {
+        // A textured still shaken by a few pixels every frame.
+        QImage tex(320, 180, QImage::Format_RGB32);
+        tex.fill(QColor(80, 80, 80));
+        {
+            QPainter pa(&tex);
+            for (int i = 0; i < 120; ++i)
+                pa.fillRect((i * 97) % 300, (i * 53) % 170, 6 + (i * 7) % 20, 6 + (i * 11) % 20, QColor((i * 37) % 255, (i * 71) % 255, (i * 13) % 255));
+        }
+        const QString png = dir_.path() + "/texture.png";
+        QVERIFY(tex.save(png));
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 320;
+        gs.height = 180;
+        gs.fps = {25, 1};
+        MediaItem m;
+        m.id = gen.newId();
+        std::string err;
+        QVERIFY(probeMedia(png.toStdString(), m, &err));
+        gen.media.push_back(m);
+        Clip c = makeClip(gen, m, TrackKind::Video, gs);
+        c.duration = 30;
+        c.motion.params["scale"] = Param(130.0);
+        for (int i = 0; i < 30; ++i) {
+            c.motion.params["pos_x"].addKey(i, 5 * std::sin(i * 1.7), Interp::Hold);
+            c.motion.params["pos_y"].addKey(i, 4 * std::cos(i * 1.1), Interp::Hold);
+        }
+        edit::overwrite(gen, gs, {TrackKind::Video, 0}, c);
+        ExportSettings st;
+        st.path = (dir_.path() + "/shaky.mp4").toStdString();
+        st.audioCodec = "none";
+        st.crf = 12;
+        st.preset = "ultrafast";
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+
+        state()->newProject();
+        auto ids = state()->importFiles({QString::fromStdString(st.path)});
+        QCOMPARE(ids.size(), size_t(1));
+        state()->apply("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        });
+        const Id clip = state()->sequence()->videoTracks[0].clips.at(0).id;
+        state()->setSelection({clip}, false);
+        win_->findChild<QDockWidget*>("inspector")->show();
+        win_->findChild<QDockWidget*>("inspector")->raise();
+        QApplication::processEvents();
+
+        // Adding Stabilize analyses the clip straight away.
+        QPushButton* add = nullptr;
+        for (auto* b : win_->findChildren<QPushButton*>())
+            if (b->text().startsWith("Add Video Effect") && b->isVisibleTo(win_.get())) add = b;
+        QVERIFY(add);
+        QAction* stab = nullptr;
+        std::function<void(QMenu*)> findIn = [&](QMenu* menu) {
+            for (QAction* a : menu->actions()) {
+                if (a->menu()) findIn(a->menu());
+                else if (a->text() == "Stabilize") stab = a;
+            }
+        };
+        findIn(add->menu());
+        QVERIFY(stab);
+        stab->trigger();
+        auto effectOf = [&](const char* type) -> const Effect* {
+            const Clip* k = edit::clipById(*state()->sequence(), clip);
+            for (const Effect& e : k->effects)
+                if (e.type == type) return &e;
+            return nullptr;
+        };
+        QTRY_VERIFY_WITH_TIMEOUT(effectOf("stabilize") && !effectOf("stabilize")->s("motion").empty(), 30000);
+        QApplication::processEvents();
+        QPushButton* again = nullptr;
+        for (auto* b : win_->findChildren<QPushButton*>("analyzeStabilize"))
+            if (b->isVisibleTo(win_.get())) again = b;
+        QVERIFY(again);
+
+        // A masked blur, tracked forwards from the playhead.
+        state()->edit("Blur", [clip](Project& p, Sequence& s) {
+            Effect e = makeEffect(p, "gaussian_blur");
+            e.params["mask.shape"] = Param(1.0);
+            edit::clipById(s, clip)->effects.push_back(e);
+            return true;
+        });
+        state()->setPlayhead(5);
+        QApplication::processEvents();
+        QToolButton* fwd = nullptr;
+        for (auto* b : win_->findChildren<QToolButton*>("trackMaskForward"))
+            if (b->isVisibleTo(win_.get())) fwd = b;
+        QVERIFY(fwd);
+        fwd->click();
+        auto maskX = [&]() -> const Param* {
+            const Effect* b = effectOf("gaussian_blur");
+            auto it = b ? b->params.find("mask.x") : decltype(b->params.end()){};
+            return b && it != b->params.end() ? &it->second : nullptr;
+        };
+        QTRY_VERIFY_WITH_TIMEOUT(maskX() && maskX()->animated(), 30000);
+        const Effect* blur = effectOf("gaussian_blur");
+        QCOMPARE(blur->params.at("mask.x").keys.front().t, FrameTime(5));
+        // To the clip's last frame (25 fps footage in a 30 fps sequence).
+        QCOMPARE(blur->params.at("mask.x").keys.back().t, edit::clipById(*state()->sequence(), clip)->duration - 1);
+        state()->undo();
+        QVERIFY(!maskX() || !maskX()->animated());
+        state()->newProject();
+        win_->activateWindow();
+        QVERIFY(QTest::qWaitForWindowActive(win_.get()));
     }
 
     void ocioEffectInInspector() {
