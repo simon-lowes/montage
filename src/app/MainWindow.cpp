@@ -7,6 +7,7 @@
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDockWidget>
+#include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QHeaderView>
@@ -39,7 +40,9 @@
 #include "SequenceSettingsDialog.h"
 #include "Theme.h"
 #include "core/Effects.h"
+#include "core/Interchange.h"
 #include "media/Analysis.h"
+#include "media/Loudness.h"
 #include "media/MediaPool.h"
 #include "render/Exporter.h"
 
@@ -247,6 +250,8 @@ void MainWindow::buildMenus() {
     add(file, tr("&Import Media…"), QKeySequence("Ctrl+I"), [this] { bin_->importDialog(); });
     add(file, tr("&Export Media…"), QKeySequence("Ctrl+M"), [this] { exportMedia(); });
     add(file, tr("Export &Frame…"), QKeySequence("Ctrl+Shift+E"), [this] { exportFrame(); });
+    add(file, tr("Export E&DL (CMX 3600)…"), QKeySequence(), [this] { exportInterchange(false); });
+    add(file, tr("Export &OpenTimelineIO…"), QKeySequence(), [this] { exportInterchange(true); });
     file->addSeparator();
     add(file, tr("&Quit"), QKeySequence::Quit, [this] { close(); });
 
@@ -315,6 +320,7 @@ void MainWindow::buildMenus() {
         state_->apply(tr("Nest"), [sel, name](Project& p, Sequence& s) { return edit::makeCompound(p, s, sel, name.toStdString()); });
     });
     add(clipM, tr("Detect &Scene Cuts"), QKeySequence(), [this] { detectScenes(); });
+    add(clipM, tr("Normalize &Loudness…"), QKeySequence(), [this] { normalizeLoudness(); });
     clipM->addSeparator();
     add(clipM, tr("&Insert from Source"), QKeySequence(Qt::Key_Comma), [this] { state_->insertFromSource(false); });
     add(clipM, tr("&Overwrite from Source"), QKeySequence(Qt::Key_Period), [this] { state_->insertFromSource(true); });
@@ -925,6 +931,74 @@ void MainWindow::detectScenes() {
             }, Qt::QueuedConnection);
         }, cancel.get());
     }));
+}
+
+void MainWindow::normalizeLoudness() {
+    const Sequence* s = state_->sequence();
+    if (!s) return;
+    std::vector<Id> audio;
+    for (Id id : state_->selectedClips())
+        if (auto loc = edit::locate(*s, id); loc && loc->track.kind == TrackKind::Audio) audio.push_back(id);
+    if (audio.empty()) {
+        state_->message(tr("Select audio clips to normalize"));
+        return;
+    }
+    const QStringList targets = {tr("-14 LUFS (streaming: YouTube, Spotify)"), tr("-16 LUFS (podcasts, Apple)"),
+                                 tr("-23 LUFS (broadcast, EBU R128)"), tr("-24 LUFS (broadcast, ATSC A/85)")};
+    const double values[] = {-14, -16, -23, -24};
+    bool ok = false;
+    QString choice = QInputDialog::getItem(this, tr("Normalize Loudness"), tr("Target loudness:"), targets, 0, false, &ok);
+    if (!ok) return;
+    double target = values[std::max<qsizetype>(0, targets.indexOf(choice))];
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    std::vector<std::pair<Id, double>> gains;  // clip -> dB change
+    for (Id id : audio) {
+        const Clip* c = edit::clipById(*s, id);
+        const MediaItem* m = c ? state_->project().findMedia(c->mediaId) : nullptr;
+        if (!m || !m->hasAudio || m->path.empty()) continue;
+        AudioBufferPtr buf = MediaPool::instance().audio(m->path, s->sampleRate);
+        if (!buf) continue;
+        double perFrame = double(s->sampleRate) / s->fpsValue();
+        int64_t first = int64_t(std::llround(c->sourceIn * perFrame));
+        int64_t count = int64_t(std::llround(c->sourceExtent() * perFrame));
+        LoudnessResult r = measureLoudness(*buf, first, count);
+        if (r.valid) gains.push_back({id, target - r.integrated});
+    }
+    QApplication::restoreOverrideCursor();
+    if (gains.empty()) {
+        state_->message(tr("Nothing to normalize: the selected clips are silent"));
+        return;
+    }
+    state_->edit(tr("Normalize Loudness"), [gains](Project&, Sequence& sq) {
+        for (const auto& [id, delta] : gains) {
+            Clip* c = edit::clipById(sq, id);
+            if (!c) continue;
+            Param& g = c->audio.params["gain_db"];
+            g.value = std::clamp(g.value + delta, -60.0, 24.0);
+            for (auto& k : g.keys) k.v = std::clamp(k.v + delta, -60.0, 24.0);
+        }
+        return true;
+    });
+    state_->message(tr("Normalized %n clip(s) to %1 LUFS", "", int(gains.size())).arg(target), 5000);
+}
+
+void MainWindow::exportInterchange(bool otio) {
+    const Sequence* s = state_->sequence();
+    if (!s) return;
+    QSettings st = appSettings();
+    QString ext = otio ? "otio" : "edl";
+    QString path = QFileDialog::getSaveFileName(this, otio ? tr("Export OpenTimelineIO") : tr("Export EDL"),
+                                                st.value("lastExportDir").toString() + "/" + QString::fromStdString(s->name) + "." + ext,
+                                                otio ? tr("OpenTimelineIO (*.otio)") : tr("CMX 3600 EDL (*.edl)"));
+    if (path.isEmpty()) return;
+    std::string text = otio ? exportOtio(state_->project(), *s) : exportEdl(state_->project(), *s);
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly) || f.write(text.data(), qint64(text.size())) != qint64(text.size())) {
+        QMessageBox::warning(this, tr("Export"), tr("Cannot write %1").arg(path));
+        return;
+    }
+    st.setValue("lastExportDir", QFileInfo(path).absolutePath());
+    statusBar()->showMessage(tr("Exported %1").arg(path), 4000);
 }
 
 void MainWindow::addTitle() {

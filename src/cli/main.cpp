@@ -13,9 +13,11 @@
 #include "core/EditOps.h"
 #include "core/Effects.h"
 #include "core/History.h"
+#include "core/Interchange.h"
 #include "core/ProjectIO.h"
 #include "media/Analysis.h"
 #include "media/Decoder.h"
+#include "media/Loudness.h"
 #include "render/Exporter.h"
 
 using namespace montage;
@@ -36,7 +38,10 @@ int usage() {
                  "  montage-cli frame <project.montage> --at TC -o <image.png>\n"
                  "  montage-cli presets\n"
                  "  montage-cli scenes <video> [--sensitivity 0..1]\n"
-                 "  montage-cli proxy <video> -o <proxy.mp4> [--width 960]\n",
+                 "  montage-cli proxy <video> -o <proxy.mp4> [--width 960]\n"
+                 "  montage-cli loudness <media>\n"
+                 "  montage-cli edl <project.montage> [-o out.edl]\n"
+                 "  montage-cli otio <project.montage> [-o out.otio]\n",
                  MONTAGE_VERSION);
     return 2;
 }
@@ -305,6 +310,44 @@ int cmdProxy(const std::vector<std::string>& args) {
     return 0;
 }
 
+int cmdLoudness(const std::vector<std::string>& args) {
+    if (args.empty()) return usage();
+    std::string err;
+    auto buf = decodeAudio(args[0], 48000, &err);
+    if (!buf) {
+        std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
+    }
+    LoudnessResult r = measureLoudness(*buf);
+    if (!r.valid) std::printf("Integrated: silent (below -70 LUFS)\n");
+    else std::printf("Integrated: %.1f LUFS\n", r.integrated);
+    std::printf("Peak:       %.1f dBFS\n", r.truePeakDb);
+    return 0;
+}
+
+int cmdInterchange(const std::vector<std::string>& args, bool otio) {
+    if (args.empty()) return usage();
+    std::string out;
+    for (size_t i = 1; i < args.size(); ++i)
+        if (args[i] == "-o" && i + 1 < args.size()) out = args[++i];
+    Project p;
+    if (!load(args[0], p)) return 1;
+    std::string text = otio ? exportOtio(p, *p.active()) : exportEdl(p, *p.active());
+    if (out.empty()) {
+        std::fwrite(text.data(), 1, text.size(), stdout);
+        return 0;
+    }
+    FILE* f = std::fopen(out.c_str(), "wb");
+    if (!f) {
+        std::fprintf(stderr, "error: cannot write %s\n", out.c_str());
+        return 1;
+    }
+    std::fwrite(text.data(), 1, text.size(), f);
+    std::fclose(f);
+    std::printf("Wrote %s\n", out.c_str());
+    return 0;
+}
+
 int cmdPresets() {
     for (const auto& p : exportPresets())
         std::printf("%-28s .%-5s %s\n", p.name.c_str(), p.extension.c_str(), p.description.c_str());
@@ -328,6 +371,9 @@ int main(int argc, char** argv) {
     if (cmd == "presets") return cmdPresets();
     if (cmd == "scenes") return cmdScenes(args);
     if (cmd == "proxy") return cmdProxy(args);
+    if (cmd == "loudness") return cmdLoudness(args);
+    if (cmd == "edl") return cmdInterchange(args, false);
+    if (cmd == "otio") return cmdInterchange(args, true);
     if (cmd == "--version" || cmd == "version") {
         std::printf("Montage %s\n", MONTAGE_VERSION);
         return 0;

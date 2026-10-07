@@ -37,6 +37,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Peak meters with hold and clip indicators
 - Effects: 3-band EQ, compressor, limiter, high/low-pass, delay
 - Crossfades: equal power or constant gain
+- Loudness normalisation to -14, -16, -23 or -24 LUFS (ITU-R BS.1770 / EBU R128 gated measurement)
 - Waveforms on the timeline
 
 **Media and output**
@@ -47,6 +48,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Preview resolution: Full, 1/2, 1/4, 1/8
 - Export presets: H.264 (x264), H.265 (x265, 8- and 10-bit), Apple ProRes 422 HQ/LT/4444 (with alpha), Avid DNxHR, VP9, AV1 (SVT-AV1), WAV and AAC; exports either the whole sequence or In–Out
 - Still frame export
+- Interchange: CMX 3600 EDL and OpenTimelineIO (`.otio`) export, for finishing in Resolve, Premiere, Avid or Nuke
 - Project files are readable JSON (`.montage`). They relink moved media through relative paths and autosave every 2 minutes.
 - `montage-cli` for headless rendering and automation
 
@@ -105,6 +107,9 @@ montage-cli render cut.montage -o master.mov --preset "Apple ProRes 422 HQ" --in
 montage-cli frame cut.montage --at 00:00:05:12 -o poster.png
 montage-cli scenes interview.mp4 --sensitivity 0.6           # list shot changes
 montage-cli proxy a.mov -o a_proxy.mp4 --width 960
+montage-cli loudness mix.wav                                 # integrated LUFS and peak
+montage-cli edl cut.montage -o cut.edl                       # CMX 3600 EDL
+montage-cli otio cut.montage -o cut.otio                     # OpenTimelineIO
 montage-cli presets
 ```
 
@@ -138,6 +143,6 @@ These come after the MVP:
 - Speech-to-text captions (whisper.cpp)
 - Speed ramps and optical-flow retiming
 - Tracking and stabilisation
-- OTIO/EDL/XML interchange
+- OTIO import and FCP XML / AAF interchange
 - Hardware encode and decode (NVENC/VAAPI/VideoToolbox)
 - OpenFX plug-ins

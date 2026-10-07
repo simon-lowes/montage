@@ -1,9 +1,13 @@
 // Engine tests: keyframes, timecode, edit operations, undo, project I/O.
 #include <QtTest>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 
 #include "core/EditOps.h"
 #include "core/Effects.h"
 #include "core/History.h"
+#include "core/Interchange.h"
 #include "core/ProjectIO.h"
 
 using namespace montage;
@@ -441,6 +445,40 @@ private slots:
         QVERIFY(!projectFromJson("{nope", back, &err));
         QVERIFY(!err.empty());
         QVERIFY(!projectFromJson("{\"format\":\"other\"}", back, &err));
+    }
+
+    void interchangeExports() {
+        Fixture fx;
+        Id a = fx.put(V1, 0, 60, 30);
+        Id b = fx.put(V1, 60, 60, 120);
+        fx.put(V1, 150, 30, 0);  // after a gap
+        addTransition(fx.p, fx.s(), a, Edge::Out, "cross_dissolve", 20);
+        setSpeed(fx.p, fx.s(), clipById(fx.s(), b)->id, 1.0, false);
+        addMarker(fx.s(), Marker{10, 0, "Start", "", 0});
+        std::string edl = exportEdl(fx.p, fx.s());
+        QVERIFY(edl.find("TITLE: Sequence 1") != std::string::npos);
+        QVERIFY(edl.find("FCM: NON-DROP FRAME") != std::string::npos);
+        // First event: clip a, source 30..80 (trimmed to the dissolve start at 50), record 0..50.
+        QVERIFY2(edl.find("001  AX       V     C        00:00:01:00 00:00:02:20 00:00:00:00 00:00:01:20") != std::string::npos, edl.c_str());
+        QVERIFY(edl.find("D    020") != std::string::npos);
+        QVERIFY(edl.find("* FROM CLIP NAME: clip.mov") != std::string::npos);
+        std::string otio = exportOtio(fx.p, fx.s());
+        QJsonDocument doc = QJsonDocument::fromJson(QByteArray::fromStdString(otio));
+        QVERIFY(doc.isObject());
+        QJsonObject root = doc.object();
+        QCOMPARE(root["OTIO_SCHEMA"].toString(), QString("Timeline.1"));
+        QJsonArray tracks = root["tracks"].toObject()["children"].toArray();
+        QCOMPARE(tracks.size(), int(fx.s().videoTracks.size() + fx.s().audioTracks.size()));
+        QJsonArray v1 = tracks[0].toObject()["children"].toArray();
+        // clip, transition, clip, gap, clip
+        QStringList schemas;
+        for (const auto& c : v1) schemas << c.toObject()["OTIO_SCHEMA"].toString();
+        QCOMPARE(schemas, QStringList({"Clip.2", "Transition.1", "Clip.2", "Gap.1", "Clip.2"}));
+        QCOMPARE(v1[1].toObject()["in_offset"].toObject()["value"].toDouble(), 10.0);
+        QCOMPARE(v1[3].toObject()["source_range"].toObject()["duration"].toObject()["value"].toDouble(), 30.0);
+        QCOMPARE(v1[0].toObject()["source_range"].toObject()["start_time"].toObject()["value"].toDouble(), 30.0);
+        QVERIFY(v1[0].toObject()["media_references"].toObject()["DEFAULT_MEDIA"].toObject()["target_url"].toString().startsWith("file://"));
+        QCOMPARE(root["tracks"].toObject()["markers"].toArray().size(), 1);
     }
 
     void projectFileRelinksRelativePaths() {

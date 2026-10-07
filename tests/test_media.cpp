@@ -8,6 +8,7 @@
 #include "core/Effects.h"
 #include "media/Analysis.h"
 #include "media/Decoder.h"
+#include "media/Loudness.h"
 #include "media/MediaPool.h"
 #include "render/Compositor.h"
 #include "render/Exporter.h"
@@ -86,6 +87,38 @@ private slots:
         QVERIFY(std::fabs(b44->samples[20000] - 0.5f) < 0.01f);
         auto pk = computePeaks(*buf, 480);
         QCOMPARE(pk->minmax.size(), size_t(200));
+    }
+
+    void loudnessMeasurement() {
+        // A 997 Hz stereo sine at -23 dBFS reads -23 LUFS (EBU Tech 3341 case 1 style).
+        AudioBuffer buf;
+        buf.sampleRate = 48000;
+        double amp = std::pow(10.0, -23.0 / 20.0);
+        for (int i = 0; i < 48000 * 5; ++i) {
+            float v = float(amp * std::sin(2 * M_PI * 997.0 * i / 48000.0));
+            buf.samples.push_back(v);
+            buf.samples.push_back(v);
+        }
+        LoudnessResult r = measureLoudness(buf);
+        QVERIFY(r.valid);
+        QVERIFY2(std::fabs(r.integrated + 23.0) < 0.2, qPrintable(QString::number(r.integrated)));
+        QVERIFY(std::fabs(r.truePeakDb + 23.0) < 0.1);
+        // Same at 44.1 kHz (coefficients are rate-dependent).
+        AudioBuffer b44;
+        b44.sampleRate = 44100;
+        for (int i = 0; i < 44100 * 5; ++i) {
+            float v = float(amp * std::sin(2 * M_PI * 997.0 * i / 44100.0));
+            b44.samples.push_back(v);
+            b44.samples.push_back(v);
+        }
+        QVERIFY(std::fabs(measureLoudness(b44).integrated + 23.0) < 0.2);
+        // Silence is gated out; a sub-range measures only that range.
+        AudioBuffer quiet;
+        quiet.sampleRate = 48000;
+        quiet.samples.assign(48000 * 2 * 2, 0.0f);
+        QVERIFY(!measureLoudness(quiet).valid);
+        LoudnessResult part = measureLoudness(buf, 48000, 48000 * 2);
+        QVERIFY(std::fabs(part.integrated + 23.0) < 0.3);
     }
 
     void mixerGainPanMuteAndFades() {

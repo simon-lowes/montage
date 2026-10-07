@@ -21,6 +21,8 @@ verified run.
 - [x] Scene-cut detection
 - [x] Proxy generation and proxy playback
 - [x] Match sequence settings to the first clip
+- [x] Loudness measurement and normalisation (BS.1770 / R128)
+- [x] EDL (CMX 3600) and OpenTimelineIO export
 
 ## Application (Qt 6 Widgets)
 - [x] Main window with dockable panels, dark theme

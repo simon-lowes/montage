@@ -4,10 +4,12 @@ add_library(montage_engine STATIC
   core/EditOps.h core/EditOps.cpp
   core/History.h core/History.cpp
   core/ProjectIO.h core/ProjectIO.cpp
+  core/Interchange.h core/Interchange.cpp
   media/Image.h media/Image.cpp
   media/Decoder.h media/Decoder.cpp
   media/MediaPool.h media/MediaPool.cpp
   media/Analysis.h media/Analysis.cpp
+  media/Loudness.h media/Loudness.cpp
   render/Processing.h render/Processing.cpp
   render/Compositor.h render/Compositor.cpp
   render/Exporter.h render/Exporter.cpp

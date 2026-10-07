@@ -80,6 +80,8 @@ private:
     void jumpMarker(bool forward);
     void markClip();
     void detectScenes();
+    void normalizeLoudness();
+    void exportInterchange(bool otio);
     void addTitle();
     void newSequence();
     void openInSource(Id media);
