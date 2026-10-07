@@ -76,10 +76,76 @@ std::string Effect::s(const std::string& name, const std::string& def) const {
 // ---------------------------------------------------------------------------
 // Clip / Sequence / Project
 
-double Clip::sourceFrameAt(FrameTime t) const {
-    double local = double(t - start);
-    if (reverse) local = double(duration - 1) - local;
-    return double(sourceIn) + local * speed;
+namespace {
+// The integral of a parameter's curve from x0 to x1 (continuous form of Param::at).
+double integrate(const Param& p, double x0, double x1) {
+    const auto& k = p.keys;
+    if (k.empty()) return p.value * (x1 - x0);
+    // Antiderivative with G(first key) = 0.
+    auto G = [&](double x) {
+        if (x <= double(k.front().t)) return k.front().v * (x - double(k.front().t));
+        double cum = 0;
+        for (size_t i = 0; i + 1 < k.size(); ++i) {
+            const Keyframe& a = k[i];
+            const Keyframe& b = k[i + 1];
+            const double dt = double(b.t - a.t);
+            if (dt <= 0) continue;
+            const double u = std::min(1.0, (x - double(a.t)) / dt);
+            double part;
+            if (a.interp == Interp::Hold) part = a.v * u;
+            else if (a.interp == Interp::Smooth) part = a.v * u + (b.v - a.v) * (u * u * u - u * u * u * u / 2);
+            else part = a.v * u + (b.v - a.v) * u * u / 2;
+            if (x <= double(b.t)) return cum + part * dt;
+            cum += part * dt;
+        }
+        return cum + k.back().v * (x - double(k.back().t));
+    };
+    return G(x1) - G(x0);
+}
+}  // namespace
+
+bool Clip::ramped() const {
+    if (reverse || timing.empty()) return false;
+    auto it = timing.params.find("speed");
+    return it != timing.params.end() && (it->second.animated() || it->second.value != 100);
+}
+
+double Clip::speedAt(double local) const {
+    if (!ramped()) return speed;
+    const Param& p = timing.params.at("speed");
+    if (!p.animated()) return speed * p.value / 100;
+    return speed * std::max(1.0, integrate(p, local, local + 1e-6) / 1e-6) / 100;
+}
+
+double Clip::sourceOffset(double local) const {
+    if (!ramped()) return local * speed;
+    return speed * integrate(timing.params.at("speed"), 0, local) / 100;
+}
+
+double Clip::sourceAt(double local) const {
+    if (reverse) return double(sourceIn) + (double(duration - 1) - local) * speed;
+    return double(sourceIn) + sourceOffset(local);
+}
+
+double Clip::sourceFrameAt(FrameTime t) const { return sourceAt(double(t - start)); }
+
+double Clip::localForSource(double source) const {
+    if (reverse) return double(duration - 1) - (source - sourceIn) / speed;
+    const double want = source - sourceIn;
+    if (!ramped()) return want / speed;
+    // The offset grows with time (speeds are positive): bisect.
+    double lo = 0, hi = 1;
+    if (want < 0) {
+        lo = want / std::max(1e-6, speedAt(0));
+        hi = 0;
+    } else {
+        while (sourceOffset(hi) < want && hi < 1e9) hi *= 2;
+    }
+    for (int i = 0; i < 60; ++i) {
+        const double mid = (lo + hi) / 2;
+        (sourceOffset(mid) < want ? lo : hi) = mid;
+    }
+    return (lo + hi) / 2;
 }
 
 FrameTime Sequence::duration() const {
@@ -161,6 +227,7 @@ Clip makeClip(Project& p, const MediaItem& media, TrackKind kind, const Sequence
     c.duration = len;
     c.motion = makeEffect(p, "transform");
     c.audio = makeEffect(p, "volume");
+    c.timing = makeEffect(p, "time");
     (void)kind;
     return c;
 }
@@ -173,6 +240,7 @@ Clip makeGeneratorClip(Project& p, const std::string& generatorType, FrameTime d
     c.duration = std::max<FrameTime>(1, duration);
     c.motion = makeEffect(p, "transform");
     c.audio = makeEffect(p, "volume");
+    c.timing = makeEffect(p, "time");
     return c;
 }
 

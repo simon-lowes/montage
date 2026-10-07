@@ -128,6 +128,7 @@ struct Clip {
     Effect generator;            // non-empty type => clip is generated, not decoded
     Effect motion;               // fixed "transform" attributes (video clips)
     Effect audio;                // fixed "volume" attributes (audio clips)
+    Effect timing;               // fixed "time" attributes: Time Remapping speed (%) and frame sampling
     std::vector<Effect> effects; // filter stack, applied in order
     std::string unrendered;      // after Render and Replace: the clip as it was (JSON), for Restore
     int angle = 0;               // multicam video clip: the angle shown (video track of the multicam sequence)
@@ -138,8 +139,19 @@ struct Clip {
     bool isGenerator() const { return !generator.empty(); }
     // Source position, in sequence frames, displayed at timeline frame t.
     double sourceFrameAt(FrameTime t) const;
+    // The same at a fractional clip-local time (audio is sampled between frames).
+    double sourceAt(double local) const;
     // Number of source frames consumed by the clip.
-    double sourceExtent() const { return double(duration) * speed; }
+    double sourceExtent() const { return sourceOffset(double(duration)); }
+    // Time Remapping: the speed curve (timing "speed", % of `speed`) is keyframed.
+    // Reversed clips play at their constant speed.
+    bool ramped() const;
+    // Source frames per timeline frame at clip-local time `local`.
+    double speedAt(double local) const;
+    // Source frames consumed over clip-local [0, local) (the speed integrated; negative before 0).
+    double sourceOffset(double local) const;
+    // The clip-local time showing source position `source` (sequence frames).
+    double localForSource(double source) const;
     bool operator==(const Clip&) const = default;
 };
 

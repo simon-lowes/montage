@@ -41,6 +41,7 @@ namespace {
 Effect* findEffect(Clip& c, Id id) {
     if (c.motion.id == id) return &c.motion;
     if (c.audio.id == id) return &c.audio;
+    if (!c.timing.empty() && c.timing.id != 0 && c.timing.id == id) return &c.timing;
     if (c.generator.id == id) return &c.generator;
     for (auto& e : c.effects)
         if (e.id == id) return &e;
@@ -327,6 +328,42 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
     } else if (const EffectInfo* info = findEffectInfo("volume")) {
         QFormLayout* a = addSection(tr("Volume"));
         addParamRows(a, *info, target(clip.audio.id));
+    }
+    // Time Remapping: a speed curve inside the clip (clips saved before it existed get one on first use).
+    if (!clip.isGenerator() && !clip.reverse) {
+        if (const EffectInfo* info = findEffectInfo("time")) {
+            Target tt;
+            tt.resolve = [clipId](Sequence& s) -> Effect* {
+                Clip* c = edit::clipById(s, clipId);
+                if (!c) return nullptr;
+                if (c->timing.empty()) c->timing = makeEffect("time", 0);  // never looked up by id
+                return &c->timing;
+            };
+            tt.time = localTime;
+            tt.origin = originFn;
+            tt.key = QString("t%1").arg(clipId);
+            // Picture and sound stay in step: linked clips get the same curve.
+            tt.afterWrite = [clipId](Sequence& s) {
+                const Clip* c = edit::clipById(s, clipId);
+                if (!c) return;
+                for (Id other : edit::linkedClips(s, clipId))
+                    if (Clip* k = edit::clipById(s, other); k && other != clipId && !k->reverse) {
+                        const Id keep = k->timing.empty() ? 0 : k->timing.id;
+                        k->timing = c->timing;
+                        k->timing.id = keep;
+                    }
+            };
+            auto* reset = smallButton(nullptr, QStringLiteral("↺"), tr("Back to constant speed"));
+            QFormLayout* tf = addSection(tr("Time Remapping"), reset, !clip.ramped());
+            addParamRows(tf, *info, tt);
+            connect(reset, &QToolButton::clicked, this, [this, clipId] {
+                state_->edit(tr("Reset Time Remapping"), [clipId](Project&, Sequence& s) {
+                    for (Id id : edit::linkedClips(s, clipId))
+                        if (Clip* k = edit::clipById(s, id); k && !k->timing.empty()) k->timing = makeEffect("time", k->timing.id);
+                    return true;
+                });
+            });
+        }
     }
     // ---- Effect stack ------------------------------------------------------------
     buildEffectStack(clipId, kind, clip.effects, localTime);
@@ -667,6 +704,7 @@ void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const 
             Effect* e = target.resolve(s);
             if (!e) return false;
             for (const auto& [n, v] : values) e->params[n].set(t, v);
+            if (target.afterWrite) target.afterWrite(s);
             return true;
         }, mergeKey);
     };
@@ -787,6 +825,7 @@ void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const 
                         p.value = v;
                     }
                 }
+                if (target.afterWrite) target.afterWrite(s);
                 return true;
             });
         });
@@ -800,6 +839,7 @@ void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const 
                     if (p.keyAt(t)) p.removeKey(t);
                     else p.addKey(t, p.at(t));
                 }
+                if (target.afterWrite) target.afterWrite(s);
                 return true;
             });
         });

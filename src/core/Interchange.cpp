@@ -42,9 +42,11 @@ struct EdlWriter {
     void comment(const Clip& c) {
         out << "* FROM CLIP NAME: " << c.name << "\n";
         if (const MediaItem* m = p.findMedia(c.mediaId); m && !m->path.empty()) out << "* SOURCE FILE: " << m->path << "\n";
-        if (c.speed != 1.0 || c.reverse)
+        // A speed ramp is described by its average speed (EDL has no curves).
+        const double speed = c.ramped() ? c.sourceExtent() / double(c.duration) : c.speed;
+        if (speed != 1.0 || c.reverse)
             out << "M2   " << reelFor(c) << "       " << std::fixed << std::setprecision(1)
-                << (c.reverse ? -1 : 1) * c.speed * s.fpsValue() << "    " << tc(src(c, c.start)) << "\n";
+                << (c.reverse ? -1 : 1) * speed * s.fpsValue() << "    " << tc(src(c, c.start)) << "\n";
     }
 
     void line(const std::string& reel, const std::string& channel, const std::string& type, FrameTime srcIn,
@@ -150,10 +152,11 @@ QJsonObject clipJson(const Project& p, const Sequence& s, const Clip& c) {
     }
     o["media_references"] = QJsonObject{{"DEFAULT_MEDIA", ref}};
     o["active_media_reference_key"] = "DEFAULT_MEDIA";
-    if (c.speed != 1.0 || c.reverse) {
+    const double speed = c.ramped() ? c.sourceExtent() / double(c.duration) : c.speed;  // ramps: their average
+    if (speed != 1.0 || c.reverse) {
         QJsonArray fx;
         fx.append(QJsonObject{{"OTIO_SCHEMA", "LinearTimeWarp.1"}, {"name", ""}, {"effect_name", "LinearTimeWarp"},
-                              {"time_scalar", (c.reverse ? -1.0 : 1.0) * c.speed}, {"metadata", QJsonObject()}});
+                              {"time_scalar", (c.reverse ? -1.0 : 1.0) * speed}, {"metadata", QJsonObject()}});
         o["effects"] = fx;
     }
     QJsonObject meta;

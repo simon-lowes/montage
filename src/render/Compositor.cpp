@@ -10,6 +10,7 @@
 
 #include "ColorSpace.h"
 #include "Processing.h"
+#include "Retime.h"
 #include "audio/PluginEffect.h"
 #include "audio/SpeechCleanup.h"
 #include "core/EditOps.h"
@@ -321,6 +322,22 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             if (!f) return {};
             if (m->kind == MediaKind::Video) sourceSeconds = sec;
             src = toImage(*f);
+            // Slow motion between two source frames: blend them or follow the motion.
+            const int sampling = c.timing.empty() ? 0 : int(c.timing.p("sampling", lt, 0));
+            if (sampling > 0 && m->kind == MediaKind::Video && m->fps.valid()) {
+                const double mf = m->fps.toDouble(), pos = sec * mf, base = std::floor(pos + 1e-6), frac = pos - base;
+                const double next = (base + 1.25) / mf;
+                if (frac > 0.02 && frac < 0.98 && next < m->duration) {
+                    Frame16Ptr fa = MediaPool::instance().videoFrame(path, (base + 0.25) / mf, w, h, o.highQuality);
+                    Frame16Ptr fb = MediaPool::instance().videoFrame(path, next, w, h, o.highQuality);
+                    if (fa && fb) {
+                        const Image a = toImage(*fa), b = toImage(*fb);
+                        src = sampling == 1 ? blendFrames(a, b, frac)
+                                            : interpolateFrames(a, b, frac, path + '#' + std::to_string(int64_t(base)) + '@' +
+                                                                                std::to_string(w) + 'x' + std::to_string(h));
+                    }
+                }
+            }
             // Input transform: the media's space into the sequence's working space.
             convertColor(src, mediaColorSpace(*m), sequenceColorSpace(seq), seq.hdrPeakNits);
         } else {
@@ -866,13 +883,16 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
         const int64_t rs = start + lat;  // the source window fed to the chain
         int64_t s0 = std::max(rs, ps), s1 = std::min(rs + frames, pe);
         const double srcBase = c.sourceIn * sr / fps;
+        const bool ramped = c.ramped();  // Time Remapping: the source position follows the speed curve
         if (m->kind == MediaKind::Sequence) {
             const Sequence* nested = p.findSequence(m->sequenceId);
             if (!nested || depth >= kMaxDepth || nested->id == seq.id) continue;
             // Mix the span of the nested sequence this block covers (at our
             // rate), then resample it for the clip's speed and direction.
             auto srcPos = [&](int64_t smp) {
-                return c.reverse ? srcBase + double(ce - 1 - smp) * c.speed : srcBase + double(smp - cs) * c.speed;
+                if (c.reverse) return srcBase + double(ce - 1 - smp) * c.speed;
+                if (ramped) return (c.sourceIn + c.sourceOffset(double(smp - cs) * fps / sr)) * sr / fps;  // speed ramp
+                return srcBase + double(smp - cs) * c.speed;
             };
             const double lo = s1 > s0 ? std::min(srcPos(s0), srcPos(s1 - 1)) : 0;
             const double hi = s1 > s0 ? std::max(srcPos(s0), srcPos(s1 - 1)) : 0;
@@ -904,7 +924,9 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
             const int64_t n = buf->frames();
             const float* src = buf->samples.data();
             for (int64_t s = s0; s < s1; ++s) {
-                double pos = c.reverse ? srcBase + double(ce - 1 - s) * c.speed : srcBase + double(s - cs) * c.speed;
+                double pos = c.reverse ? srcBase + double(ce - 1 - s) * c.speed
+                             : ramped  ? (c.sourceIn + c.sourceOffset(double(s - cs) * fps / sr)) * sr / fps
+                                       : srcBase + double(s - cs) * c.speed;
                 if (pos < 0 || pos >= double(n - 1)) continue;
                 int64_t i = int64_t(pos);
                 float f = float(pos - double(i));

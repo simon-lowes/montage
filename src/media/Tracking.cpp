@@ -37,8 +37,9 @@ std::vector<GrayImage> pyramid(const GrayImage& img) {
     return p;
 }
 
-// One point through the pyramid from `a` to `b`, starting from `guess` (full-resolution displacement).
-bool lkPoint(const std::vector<GrayImage>& A, const std::vector<GrayImage>& B, Point2 p, Point2& out) {
+// One point through the pyramid from `a` to `b` (window half-size `win` <= kWin).
+bool lkPoint(const std::vector<GrayImage>& A, const std::vector<GrayImage>& B, Point2 p, Point2& out, int win = kWin,
+             int iterations = kIterations) {
     double gx = 0, gy = 0;  // displacement at the current level
     for (int l = int(A.size()) - 1; l >= 0; --l) {
         const GrayImage& a = A[size_t(l)];
@@ -53,8 +54,8 @@ bool lkPoint(const std::vector<GrayImage>& A, const std::vector<GrayImage>& B, P
         double gxx = 0, gxy = 0, gyy = 0;
         float tpl[(2 * kWin + 1) * (2 * kWin + 1)], ix[(2 * kWin + 1) * (2 * kWin + 1)], iy[(2 * kWin + 1) * (2 * kWin + 1)];
         int n = 0;
-        for (int dy = -kWin; dy <= kWin; ++dy)
-            for (int dx = -kWin; dx <= kWin; ++dx, ++n) {
+        for (int dy = -win; dy <= win; ++dy)
+            for (int dx = -win; dx <= win; ++dx, ++n) {
                 const double x = px + dx, y = py + dy;
                 tpl[n] = a.sample(x, y);
                 ix[n] = 0.5f * (a.sample(x + 1, y) - a.sample(x - 1, y));
@@ -65,11 +66,11 @@ bool lkPoint(const std::vector<GrayImage>& A, const std::vector<GrayImage>& B, P
             }
         const double det = gxx * gyy - gxy * gxy;
         if (det < 1e-9) return false;
-        for (int it = 0; it < kIterations; ++it) {
+        for (int it = 0; it < iterations; ++it) {
             double bx = 0, by = 0;
             n = 0;
-            for (int dy = -kWin; dy <= kWin; ++dy)
-                for (int dx = -kWin; dx <= kWin; ++dx, ++n) {
+            for (int dy = -win; dy <= win; ++dy)
+                for (int dx = -win; dx <= win; ++dx, ++n) {
                     const double diff = double(tpl[n]) - b.sample(px + dx + gx, py + dy + gy);
                     bx += diff * ix[n];
                     by += diff * iy[n];
@@ -270,6 +271,101 @@ void trackPoints(const GrayImage& a, const GrayImage& b, const std::vector<Point
         to[i] = fwd;
         ok[i] = e < kFbError;
     }
+}
+
+FlowField denseFlow(const GrayImage& a, const GrayImage& b, int step) {
+    FlowField f;
+    f.step = std::max(1, step);
+    f.gw = a.width / f.step + 1;
+    f.gh = a.height / f.step + 1;
+    f.v.assign(size_t(f.gw) * f.gh, {});
+    std::vector<char> known(f.v.size(), 0);
+    const auto A = pyramid(a), B = pyramid(b);
+    parallelRows(f.gh, [&](int y0, int y1) {
+        for (int gy = y0; gy < y1; ++gy)
+            for (int gx = 0; gx < f.gw; ++gx) {
+                const Point2 p{double(std::min(gx * f.step, a.width - 1)), double(std::min(gy * f.step, a.height - 1))};
+                Point2 q;
+                if (lkPoint(A, B, p, q, 5, 10)) {
+                    f.v[size_t(gy) * f.gw + gx] = {q.x - p.x, q.y - p.y};
+                    known[size_t(gy) * f.gw + gx] = 1;
+                }
+            }
+    });
+    // Fill untextured points from known neighbours, then smooth once.
+    for (int pass = 0; pass < std::max(f.gw, f.gh); ++pass) {
+        bool missing = false;
+        std::vector<char> next = known;
+        for (int gy = 0; gy < f.gh; ++gy)
+            for (int gx = 0; gx < f.gw; ++gx) {
+                const size_t i = size_t(gy) * f.gw + gx;
+                if (known[i]) continue;
+                double sx = 0, sy = 0;
+                int n = 0;
+                for (int dy = -1; dy <= 1; ++dy)
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        const int x = gx + dx, y = gy + dy;
+                        if (x < 0 || y < 0 || x >= f.gw || y >= f.gh || !known[size_t(y) * f.gw + x]) continue;
+                        sx += f.v[size_t(y) * f.gw + x].x;
+                        sy += f.v[size_t(y) * f.gw + x].y;
+                        ++n;
+                    }
+                if (n) {
+                    f.v[i] = {sx / n, sy / n};
+                    next[i] = 1;
+                } else {
+                    missing = true;
+                }
+            }
+        known.swap(next);
+        if (!missing) break;
+    }
+    std::vector<Point2> sm = f.v;
+    for (int gy = 0; gy < f.gh; ++gy)
+        for (int gx = 0; gx < f.gw; ++gx) {
+            double sx = 0, sy = 0;
+            int n = 0;
+            for (int dy = -1; dy <= 1; ++dy)
+                for (int dx = -1; dx <= 1; ++dx) {
+                    const int x = std::clamp(gx + dx, 0, f.gw - 1), y = std::clamp(gy + dy, 0, f.gh - 1);
+                    sx += f.v[size_t(y) * f.gw + x].x;
+                    sy += f.v[size_t(y) * f.gw + x].y;
+                    ++n;
+                }
+            sm[size_t(gy) * f.gw + gx] = {sx / n, sy / n};
+        }
+    f.v.swap(sm);
+    return f;
+}
+
+Point2 FlowField::at(double x, double y) const {
+    if (v.empty()) return {};
+    const double gx = std::clamp(x / step, 0.0, double(gw - 1)), gy = std::clamp(y / step, 0.0, double(gh - 1));
+    const int x0 = int(gx), y0 = int(gy), x1 = std::min(x0 + 1, gw - 1), y1 = std::min(y0 + 1, gh - 1);
+    const double fx = gx - x0, fy = gy - y0;
+    auto g = [&](int xx, int yy) { return v[size_t(yy) * gw + xx]; };
+    const Point2 a = g(x0, y0), b = g(x1, y0), c = g(x0, y1), d = g(x1, y1);
+    return {(a.x * (1 - fx) + b.x * fx) * (1 - fy) + (c.x * (1 - fx) + d.x * fx) * fy,
+            (a.y * (1 - fx) + b.y * fx) * (1 - fy) + (c.y * (1 - fx) + d.y * fx) * fy};
+}
+
+GrayImage toGray(const Image& img, int maxWidth) {
+    GrayImage g;
+    const int k = std::max(1, int(std::ceil(double(img.width) / std::max(1, maxWidth))));
+    g.width = std::max(1, img.width / k);
+    g.height = std::max(1, img.height / k);
+    g.px.resize(size_t(g.width) * g.height);
+    for (int y = 0; y < g.height; ++y)
+        for (int x = 0; x < g.width; ++x) {
+            double sum = 0;
+            for (int dy = 0; dy < k; ++dy)
+                for (int dx = 0; dx < k; ++dx) {
+                    const float* p = img.at(std::min(x * k + dx, img.width - 1), std::min(y * k + dy, img.height - 1));
+                    sum += 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2];
+                }
+            g.px[size_t(y) * g.width + x] = float(sum / (k * k));
+        }
+    return g;
 }
 
 Point2 Similarity::apply(Point2 p) const {

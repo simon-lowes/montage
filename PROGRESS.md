@@ -133,6 +133,15 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
   - Reset re-activates the instance.
   - Tested with a bundled test plugin (gain plus a 16-sample delay): scan, parameters, processing across blocks, state into a second instance at another rate, reset, and sample-exact compensation in the mixer.
   - Still to do: LV2 plugin GUIs (suil).
-- [ ] 18. Speed ramps and optical-flow retiming (L)
+- [x] 18. Speed ramps and optical-flow retiming (L):
+  - Time Remapping is a fixed "time" attribute on clips: speed in %, keyframeable, multiplying the clip's constant speed.
+  - The source position is the speed curve integrated exactly, per segment, for linear, hold and eased keys. The inverse (timeline time for a source time) is solved by bisection.
+  - Splits, trims, slips, the mixer (varispeed audio), transcripts, scene cuts, tracking and multicam all follow the curve. EDL and OTIO exports carry the average speed.
+  - Frame Sampling:
+    - Frame Blending;
+    - Optical Flow: dense pyramidal Lucas–Kanade on a grid at 480 px, gaps filled and smoothed, then both frames warped along the flow; the flow is cached across the in-betweens of one frame pair.
+  - The Inspector's Time Remapping section keeps linked sound in step. The timeline shows a "ramp" badge.
+  - Reversed clips play at constant speed.
+  - Tested: exact integrals for each interpolation, the inverse, continuity across splits and in-point trims, round trip; slow motion of a moving square (nearest, blend shows two copies, flow moves one square into place); and linked sound in the app.
 - [ ] 19. Interchange round trip: OTIO import, EDL import, FCP7 XML and FCPXML (L)
 - [ ] 20. AI object masks with SAM 2 (XL)

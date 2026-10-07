@@ -19,6 +19,7 @@ add_library(montage_engine STATIC
   media/SpeakerSwitch.h media/SpeakerSwitch.cpp
   media/Tracking.h media/Tracking.cpp
   render/Processing.h render/Processing.cpp
+  render/Retime.h render/Retime.cpp
   render/ClipAnalysis.h render/ClipAnalysis.cpp
   render/ColorSpace.h render/ColorSpace.cpp
   render/Ocio.h render/Ocio.cpp

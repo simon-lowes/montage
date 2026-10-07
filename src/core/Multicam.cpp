@@ -206,9 +206,7 @@ Result applyAngleChanges(Project& p, Sequence& s, Id clipId, const std::vector<s
     // Multicam frame f shows at timeline frame start + (f * outer/inner fps - sourceIn) / speed.
     const double ratio = s.fpsValue() / mc->fpsValue();
     const Clip clip = *c;
-    auto toTimeline = [&](FrameTime f) {
-        return clip.start + FrameTime(std::llround((double(f) * ratio - clip.sourceIn) / clip.speed));
-    };
+    auto toTimeline = [&](FrameTime f) { return clip.start + FrameTime(std::llround(clip.localForSource(double(f) * ratio))); };
     // The angle in effect at the clip's first frame, then every change inside it.
     int initial = changes.front().second;
     for (const auto& [f, a] : changes)
@@ -247,7 +245,7 @@ Result flattenMulticam(Project& p, Sequence& s, const std::vector<Id>& clips) {
         if (!loc) continue;
         const Clip c = trackAt(s, loc->track)->clips[loc->index];
         const Sequence* mc = multicamSequence(p, c);
-        if (!mc || c.speed != 1.0 || c.reverse) continue;
+        if (!mc || c.speed != 1.0 || c.reverse || c.ramped()) continue;
         const bool video = loc->track.kind == TrackKind::Video;
         const Track* src = nullptr;
         if (video && c.angle >= 0 && c.angle < int(mc->videoTracks.size())) src = &mc->videoTracks[size_t(c.angle)];

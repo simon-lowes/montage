@@ -30,6 +30,7 @@ private:
         std::function<FrameTime()> origin;  // timeline frame of the clip start (for keyframe navigation)
         QString key;                        // merge-key prefix
         bool keyframes = true;
+        std::function<void(Sequence&)> afterWrite;  // runs in the same edit (e.g. to keep linked clips in step)
     };
 
     void rebuild();

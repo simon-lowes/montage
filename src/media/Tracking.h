@@ -35,6 +35,17 @@ std::vector<Point2> goodFeatures(const GrayImage& img, int maxCorners, double mi
 void trackPoints(const GrayImage& a, const GrayImage& b, const std::vector<Point2>& from, std::vector<Point2>& to,
                  std::vector<bool>& ok);
 
+// Dense optical flow from `a` to `b` on a grid every `step` pixels: flow[gy *
+// gw + gx] is the motion of the point (gx * step, gy * step). Points without
+// texture take their neighbours' motion.
+struct FlowField {
+    int gw = 0, gh = 0, step = 1;
+    std::vector<Point2> v;
+    Point2 at(double x, double y) const;  // bilinear, in pixels of the analysed images
+};
+FlowField denseFlow(const GrayImage& a, const GrayImage& b, int step);
+GrayImage toGray(const Image& img, int maxWidth);  // premultiplied float RGBA, downscaled to at most maxWidth
+
 // p' = s * R(angle) * p + t.
 struct Similarity {
     double tx = 0, ty = 0, angle = 0, scale = 1;

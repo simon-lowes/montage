@@ -1226,6 +1226,48 @@ private slots:
         state()->setSelection({}, false);
     }
 
+    void timeRemappingKeepsSoundWithPicture() {
+        // A file with picture and sound, placed as linked video and audio clips.
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 160;
+        gs.height = 90;
+        edit::overwrite(gen, gs, {TrackKind::Video, 0}, makeGeneratorClip(gen, "color", 60));
+        MediaItem wav;
+        wav.id = gen.newId();
+        std::string err;
+        QVERIFY(probeMedia(MONTAGE_TEST_DATA_DIR "/jfk.wav", wav, &err));
+        gen.media.push_back(wav);
+        QVERIFY(edit::placeMedia(gen, gs, wav.id, 0, 0, 60, {TrackKind::Video, 1}, {TrackKind::Audio, 0}, false).ok);
+        ExportSettings st;
+        st.path = (dir_.path() + "/av.mp4").toStdString();
+        st.preset = "ultrafast";
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        state()->newProject();
+        auto ids = state()->importFiles({QString::fromStdString(st.path)});
+        QCOMPARE(ids.size(), size_t(1));
+        state()->apply("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        });
+        const Id v = state()->sequence()->videoTracks[0].clips.at(0).id;
+        const Id a = state()->sequence()->audioTracks[0].clips.at(0).id;
+        state()->setSelection({v}, false);
+        QApplication::processEvents();
+        // The Time Remapping speed (1..1000 %).
+        QDoubleSpinBox* speed = nullptr;
+        for (auto* sp : win_->findChildren<QDoubleSpinBox*>())
+            if (sp->suffix() == " %" && sp->minimum() == 1 && sp->maximum() == 1000) speed = sp;
+        QVERIFY(speed);
+        speed->setValue(200);
+        auto clipSpeed = [&](Id id) { return edit::clipById(*state()->sequence(), id)->speedAt(0); };
+        QVERIFY(std::fabs(clipSpeed(v) - 2) < 1e-6);
+        QVERIFY(std::fabs(clipSpeed(a) - 2) < 1e-6);  // the sound follows
+        QVERIFY(edit::clipById(*state()->sequence(), a)->ramped());
+        state()->undo();
+        QVERIFY(std::fabs(clipSpeed(v) - 1) < 1e-6 && std::fabs(clipSpeed(a) - 1) < 1e-6);
+        state()->newProject();
+    }
+
     void inspectorEditsAreUndoable() {
         loadDemo();
         Id red = clipNamed(*state()->sequence(), "Red")->id;

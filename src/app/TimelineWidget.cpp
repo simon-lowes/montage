@@ -555,6 +555,7 @@ void TimelineWidget::paintClip(QPainter& p, const Row& row, const Clip& c, const
     p.fillRect(QRect(r.left(), r.top(), r.width(), kNameStrip), QColor(0, 0, 0, 70));
     QString badges;
     if (c.speed != 1.0 || c.reverse) badges += QString(" %1%2%").arg(c.reverse ? "-" : "").arg(c.speed * 100, 0, 'f', 0);
+    if (c.ramped()) badges += tr(" ramp");
     if (!c.effects.empty()) badges += " fx";
     QFont f = p.font();
     f.setPointSize(8);

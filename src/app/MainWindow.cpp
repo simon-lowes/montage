@@ -985,7 +985,7 @@ void MainWindow::detectScenes() {
             std::vector<FrameTime> frames;
             for (double sec : cuts) {
                 double src = sec * sq.fpsValue();
-                double local = (src - clip->sourceIn) / clip->speed;
+                double local = clip->ramped() ? clip->localForSource(src) : (src - clip->sourceIn) / clip->speed;
                 if (clip->reverse) local = double(clip->duration) - local;
                 FrameTime f = clip->start + FrameTime(std::llround(local));
                 if (f > clip->start && f < clip->end()) frames.push_back(f);

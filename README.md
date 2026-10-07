@@ -30,6 +30,9 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Masks on every video effect:
   - An ellipse or rectangle with feather, expansion, rotation, opacity and invert, all keyframeable. Drag it in the Program monitor to move it, or pull its handles to resize it.
   - An HSL qualifier selects by hue, saturation and luma with softness, for example to grade only skin or only the sky. Show Mask displays the selection.
+- Speed ramps and slow motion:
+  - **Time Remapping** gives every clip a keyframeable speed curve (linear, hold or eased) inside its length. Picture and linked sound follow it together.
+  - **Frame Sampling** sets how in-between frames are made in slow motion: Nearest Frame, Frame Blending, or Optical Flow, which moves pixels along their motion instead of cross-fading.
 - Tracking and stabilisation (built in; no OpenCV):
   - **Stabilize** effect: analyses the clip's camera movement when added, then smooths it (or locks the shot). It can correct position, scale and rotation, and zooms to keep the edges hidden. Smoothness can be changed at any time without analysing again.
   - **Mask tracking**: ◀ Track / Track ▶ in any mask section follows what the mask covers from the playhead to the clip's start or end. It tracks position, scale and rotation, and writes keyframes.
@@ -218,4 +221,4 @@ Notes on the design:
 
 ## Roadmap
 
-Phase 2 is ranked in [`docs/research/phase2-roadmap.md`](docs/research/phase2-roadmap.md) and tracked in [`PROGRESS.md`](PROGRESS.md). Next up: speed ramps and optical-flow retiming, FCP XML / FCPXML / OTIO interchange, AI object masks, and a GPU compositor.
+Phase 2 is ranked in [`docs/research/phase2-roadmap.md`](docs/research/phase2-roadmap.md) and tracked in [`PROGRESS.md`](PROGRESS.md). Next up: FCP XML / FCPXML / OTIO interchange, AI object masks, and a GPU compositor.

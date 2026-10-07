@@ -104,6 +104,7 @@ void shiftKeyframes(Clip& c, FrameTime delta) {
     shiftParamKeys(c.motion, delta);
     shiftParamKeys(c.audio, delta);
     shiftParamKeys(c.generator, delta);
+    shiftParamKeys(c.timing, delta);
     for (auto& e : c.effects) shiftParamKeys(e, delta);
 }
 
@@ -116,7 +117,7 @@ Clip subClip(const Clip& c, FrameTime from, FrameTime to) {
     if (c.reverse)
         out.sourceIn = c.sourceIn + double(c.end() - to) * c.speed;
     else
-        out.sourceIn = c.sourceIn + double(from - c.start) * c.speed;
+        out.sourceIn = c.sourceIn + c.sourceOffset(double(from - c.start));  // follows a speed ramp
     shiftKeyframes(out, -(from - c.start));
     return out;
 }
@@ -515,7 +516,7 @@ FrameTime clampTrim(const Project& p, const Sequence& s, const Track& t, size_t 
         delta = std::max<FrameTime>(delta, 1 - c.duration);
         if (limit < kInfiniteFrames) {
             if (!c.reverse) {
-                double maxExtra = (lim - srcHigh(c)) / c.speed;
+                double maxExtra = (lim - srcHigh(c)) / c.speedAt(double(c.duration));
                 delta = std::min<FrameTime>(delta, FrameTime(std::floor(maxExtra + 1e-6)));
             } else {
                 double maxExtra = srcLow(c) / c.speed;
@@ -529,7 +530,7 @@ FrameTime clampTrim(const Project& p, const Sequence& s, const Track& t, size_t 
         delta = std::min<FrameTime>(delta, c.duration - 1);
         if (limit < kInfiniteFrames || !c.reverse) {
             if (!c.reverse) {
-                double maxBack = srcLow(c) / c.speed;  // how far we can extend backwards
+                double maxBack = srcLow(c) / c.speedAt(0);  // how far we can extend backwards
                 delta = std::max<FrameTime>(delta, -FrameTime(std::floor(maxBack + 1e-6)));
             } else {
                 double maxBack = (lim - srcHigh(c)) / c.speed;
@@ -549,7 +550,7 @@ void applyTrim(Clip& c, Edge edge, FrameTime delta, TrimMode mode) {
         if (c.reverse) c.sourceIn -= double(delta) * c.speed;
         c.duration += delta;
     } else {
-        if (!c.reverse) c.sourceIn += double(delta) * c.speed;
+        if (!c.reverse) c.sourceIn += c.sourceOffset(double(delta));
         c.duration -= delta;
         if (mode == TrimMode::Normal) c.start += delta;
         shiftKeyframes(c, -delta);
@@ -648,11 +649,11 @@ Result slip(Project& p, Sequence& s, Id clipId, FrameTime delta) {
     for (Id id : linkedClips(s, clipId)) {
         Clip* c = clipById(s, id);
         FrameTime limit = sourceLimit(p, s, *c);
-        double shift = double(delta) * c->speed;
+        double shift = double(delta) * c->speedAt(0);
         if (limit < kInfiniteFrames) shift = std::clamp(shift, -c->sourceIn, double(limit) - srcHigh(*c));
         else shift = std::max(shift, -c->sourceIn);
         c->sourceIn += shift;
-        if (id == clipId) res.applied = FrameTime(std::llround(shift / c->speed));
+        if (id == clipId) res.applied = FrameTime(std::llround(shift / c->speedAt(0)));
     }
     return res;
 }

@@ -118,6 +118,7 @@ QJsonObject clipToJson(const Clip& c) {
     if (!c.generator.empty()) o["generator"] = effectToJson(c.generator);
     if (!c.motion.empty()) o["motion"] = effectToJson(c.motion);
     if (!c.audio.empty()) o["audio"] = effectToJson(c.audio);
+    if (!c.timing.empty()) o["timing"] = effectToJson(c.timing);
     QJsonArray fx;
     for (const auto& e : c.effects) fx.append(effectToJson(e));
     if (!fx.isEmpty()) o["effects"] = fx;
@@ -145,6 +146,7 @@ Clip clipFromJson(const QJsonObject& o) {
     c.generator = effectFromJson(o.value("generator"));
     c.motion = effectFromJson(o.value("motion"));
     c.audio = effectFromJson(o.value("audio"));
+    c.timing = effectFromJson(o.value("timing"));
     for (const auto& e : o.value("effects").toArray()) c.effects.push_back(effectFromJson(e));
     c.unrendered = ss(o.value("unrendered"));
     c.angle = std::max(0, o.value("angle").toInt(0));
@@ -482,6 +484,7 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
                     bump(c.motion.id);
                     bump(c.audio.id);
                     bump(c.generator.id);
+                    bump(c.timing.id);
                     for (const auto& e : c.effects) bump(e.id);
                 }
                 for (const auto& tr : t.transitions) {

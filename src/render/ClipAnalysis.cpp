@@ -11,11 +11,7 @@ namespace {
 double sourceSeconds(const Sequence& s, const Clip& c, FrameTime lt) { return c.sourceFrameAt(c.start + lt) / s.fpsValue(); }
 
 // The clip-local frame showing media time `sec` (nearest).
-double localFrame(const Sequence& s, const Clip& c, double sec) {
-    double local = (sec * s.fpsValue() - c.sourceIn) / c.speed;
-    if (c.reverse) local = double(c.duration - 1) - local;
-    return local;
-}
+double localFrame(const Sequence& s, const Clip& c, double sec) { return c.localForSource(sec * s.fpsValue()); }
 
 const MediaItem* videoMedia(const Project& p, const Clip& c, std::string* error) {
     const MediaItem* m = c.mediaId ? p.findMedia(c.mediaId) : nullptr;

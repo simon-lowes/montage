@@ -22,6 +22,7 @@ std::vector<TranscriptWord> sequenceTranscriptWords(const Project& p, const Sequ
                 if (!m || !m->transcript) continue;
                 const double srcA = c.sourceIn, srcB = c.sourceIn + c.sourceExtent();  // source frames shown
                 auto toTimeline = [&](double srcFrame) {
+                    if (c.ramped()) return double(c.start) + c.localForSource(srcFrame);  // Time Remapping
                     const double rel = c.reverse ? (srcB - srcFrame) : (srcFrame - srcA);
                     return double(c.start) + rel / c.speed;
                 };

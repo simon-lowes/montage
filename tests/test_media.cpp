@@ -684,6 +684,71 @@ private slots:
         return jitter;
     }
 
+    void slowMotionFrameSampling() {
+        // A white square moving 12 px right every frame.
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 320;
+        gs.height = 180;
+        gs.fps = {25, 1};
+        Clip sq = makeGeneratorClip(gen, "color", 20);
+        sq.generator.params["color.r"] = sq.generator.params["color.g"] = sq.generator.params["color.b"] = Param(1.0);
+        sq.motion.params["scale"] = Param(10.0);  // 32 x 18 px
+        for (int i = 0; i < 20; ++i) sq.motion.params["pos_x"].addKey(i, -100 + 12 * i, Interp::Hold);
+        edit::overwrite(gen, gs, {TrackKind::Video, 0}, sq);
+        ExportSettings st;
+        st.path = path("moving.mp4");
+        st.audioCodec = "none";
+        st.crf = 0;
+        st.preset = "ultrafast";
+        std::string err;
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+
+        // At 50 % speed, timeline frame 3 shows source frame 1.5.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320;
+        s.height = 180;
+        s.fps = {25, 1};
+        MediaItem m = probeOrFail(p, st.path);
+        p.media.push_back(m);
+        Clip c = makeClip(p, m, TrackKind::Video, s);
+        c.duration = 36;
+        c.timing.params["speed"] = Param(50.0);
+        edit::overwrite(p, s, {TrackKind::Video, 0}, c);
+        QVERIFY(trackAt(s, {TrackKind::Video, 0})->clips[0].ramped());
+        auto row = [&](int sampling) {
+            trackAt(s, {TrackKind::Video, 0})->clips[0].timing.params["sampling"] = Param(double(sampling));
+            RenderOptions ro;
+            Image img = renderProgramFrame(p, s, 3, ro);
+            std::vector<float> v(320);
+            for (int x = 0; x < 320; ++x) v[size_t(x)] = img.at(x, 90)[1];
+            return v;
+        };
+        auto centroid = [](const std::vector<float>& v) {
+            double sum = 0, w = 0;
+            for (size_t x = 0; x < v.size(); ++x) {
+                sum += x * v[x];
+                w += v[x];
+            }
+            return sum / std::max(1e-9, w);
+        };
+        auto soft = [](const std::vector<float>& v) {  // pixels caught between black and white
+            int n = 0;
+            for (float x : v) n += x > 0.25f && x < 0.75f;
+            return n;
+        };
+        // Square centres: frame 1 at x = 72, frame 2 at 84, so 1.5 is at 78.
+        const auto nearest = row(0), blend = row(1), flow = row(2);
+        QVERIFY2(std::fabs(centroid(nearest) - 72) < 1.5, qPrintable(QString::number(centroid(nearest))));
+        QVERIFY2(std::fabs(centroid(blend) - 78) < 1.5, qPrintable(QString::number(centroid(blend))));
+        QVERIFY2(std::fabs(centroid(flow) - 78) < 1.5, qPrintable(QString::number(centroid(flow))));
+        // Blending shows two half-bright copies; optical flow moves one square into place.
+        QVERIFY2(soft(blend) >= 18, qPrintable(QString::number(soft(blend))));
+        QVERIFY2(soft(flow) <= 6, qPrintable(QString::number(soft(flow))));
+        QVERIFY(soft(nearest) <= 4);
+    }
+
     void trackingAndStabilization() {
         const std::string video = path("shaky.mp4");
         const int frames = 40;

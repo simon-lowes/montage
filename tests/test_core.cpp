@@ -714,6 +714,63 @@ private slots:
         QVERIFY(!h.canRedo());
     }
 
+    void speedRamps() {
+        Fixture fx;
+        Clip c = makeClip(fx.p, *fx.p.findMedia(fx.media), TrackKind::Video, fx.s());
+        c.duration = 60;
+        c.sourceIn = 10;
+        QVERIFY(!c.ramped());
+        QCOMPARE(c.sourceExtent(), 60.0);
+        // 100 % to 300 % over the clip: on average twice as fast.
+        Param& sp = c.timing.params["speed"];
+        sp.addKey(0, 100);
+        sp.addKey(60, 300);
+        QVERIFY(c.ramped());
+        QVERIFY(std::fabs(c.sourceExtent() - 120) < 1e-9);
+        QVERIFY(std::fabs(c.sourceOffset(30) - 45) < 1e-9);  // 30 * (1 + 2) / 2
+        QVERIFY(std::fabs(c.speedAt(30) - 2) < 1e-4);
+        QVERIFY(std::fabs(c.sourceFrameAt(30) - 55) < 1e-9);
+        QVERIFY(std::fabs(c.localForSource(55) - 30) < 1e-6);
+        // Hold, smooth (eased: the same total, less early on), and beyond the keys.
+        sp.keys[0].interp = Interp::Hold;
+        QVERIFY(std::fabs(c.sourceOffset(60) - 60) < 1e-9);
+        sp.keys[0].interp = Interp::Smooth;
+        QVERIFY(std::fabs(c.sourceOffset(60) - 120) < 1e-9);
+        auto eased = [](double u) { return u * u * u - u * u * u * u / 2; };  // integral of smoothstep
+        QVERIFY(std::fabs(c.sourceOffset(30) - 60 * (0.5 + 2 * eased(0.5))) < 1e-9);  // 41.25: slower early on
+        QVERIFY(std::fabs(c.sourceOffset(15) - 60 * (0.25 + 2 * eased(0.25))) < 1e-9);
+        QVERIFY(std::fabs(c.sourceOffset(70) - (120 + 30)) < 1e-9);  // 300 % after the last key
+        QVERIFY(std::fabs(c.sourceOffset(-5) + 5) < 1e-9);           // 100 % before the first
+        sp.keys[0].interp = Interp::Linear;
+        // A constant speed multiplies the curve; reversed clips ignore it.
+        c.speed = 0.5;
+        QVERIFY(std::fabs(c.sourceExtent() - 60) < 1e-9);
+        c.speed = 1;
+        c.reverse = true;
+        QVERIFY(!c.ramped());
+        QCOMPARE(c.sourceExtent(), 60.0);
+        c.reverse = false;
+
+        // Splitting keeps the picture continuous; trimming the in point follows the curve.
+        Id id = overwrite(fx.p, fx.s(), V1, c).created.at(0);
+        const double at25 = clipById(fx.s(), id)->sourceFrameAt(25);
+        QVERIFY(razor(fx.p, fx.s(), V1, 25).ok);
+        const Clip& right = fx.v1().clips.at(1);
+        QVERIFY(std::fabs(right.sourceFrameAt(25) - at25) < 1e-9);
+        QVERIFY(std::fabs(right.sourceFrameAt(59) - (10 + 120 - c.speedAt(59.5))) < 0.05);
+        const double extentBefore = fx.v1().clips[0].sourceExtent() + right.sourceExtent();
+        QVERIFY(std::fabs(extentBefore - 120) < 1e-9);
+        const double at35 = right.sourceFrameAt(35);
+        QVERIFY(trim(fx.p, fx.s(), right.id, Edge::In, 10, TrimMode::Normal).ok);
+        const Clip& trimmed = fx.v1().clips.at(1);
+        QCOMPARE(trimmed.start, FrameTime(35));
+        QVERIFY(std::fabs(trimmed.sourceFrameAt(35) - at35) < 1e-9);  // same picture at the same place
+        // Saved with the project.
+        Project back;
+        QVERIFY(projectFromJson(projectToJson(fx.p), back));
+        QVERIFY(back == fx.p);
+    }
+
     void multicamClips() {
         Project p = makeDefaultProject();
         auto addMedia = [&](const char* name, bool video, bool audio, double tc) {

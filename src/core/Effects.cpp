@@ -89,6 +89,12 @@ std::vector<EffectInfo> buildCatalog() {
                      choice("fit", "Fit", {"Fit", "Fill", "Stretch", "None (1:1)"}, 0),
                  },
                  {}});
+    // Time Remapping: a keyframeable speed curve within the clip's length, and
+    // how in-between source frames are made in slow motion.
+    c.push_back({"time", "Time Remapping", EffectCategory::Fixed, "Fixed",
+                 {pct("speed", "Speed", 1, 1000, 100),
+                  choice("sampling", "Frame Sampling", {"Nearest Frame", "Frame Blending", "Optical Flow"}, 0)},
+                 {}});
     c.push_back({"volume", "Volume", EffectCategory::Fixed, "Fixed",
                  {num("gain_db", "Gain (dB)", -60, 24, 0, 0.1), num("pan", "Pan", -1, 1, 0, 0.01)},
                  {}});
