@@ -275,6 +275,51 @@ private slots:
         QCOMPARE(QString::fromStdString(dirs.back()), QString("/extra/clap/folder"));
     }
 
+#ifdef __APPLE__
+    void hostsAppleAudioUnits() {
+        // macOS ships Apple's effects; AULowpass is "aufx:lpas:appl".
+        auto au = readStaticMetadata(Format::AudioUnit, "AudioUnit");
+        QVERIFY(au.has_value());
+        std::optional<Descriptor> lowpass;
+        for (const Descriptor& d : *au)
+            if (d.pluginId == "aufx:lpas:appl") lowpass = d;
+        QVERIFY(lowpass.has_value());
+        QVERIFY(canHost(Format::AudioUnit));
+        std::string err;
+        auto inst = instantiate(*lowpass, &err);
+        QVERIFY2(inst, err.c_str());
+        QVERIFY(inst->activate(48000, 512));
+        auto params = inst->parameters();
+        QVERIFY(!params.empty());
+        qInfo("AULowpass parameter 0: %s (%g..%g)", params[0].name.c_str(), params[0].min, params[0].max);
+        inst->setParameter(0, 300);  // cutoff, Hz
+        QVERIFY(std::fabs(inst->parameter(0) - 300) < 1);
+        auto rmsAfter = [&](double hz) {
+            inst->reset();
+            const int n = 9600;
+            std::vector<float> l(n), r(n);
+            for (int i = 0; i < n; ++i) l[i] = r[i] = 0.5f * float(std::sin(2 * M_PI * hz * i / 48000.0));
+            float* ch[2] = {l.data(), r.data()};
+            inst->process(ch, 2, n);  // more than one 512-frame block
+            double acc = 0;
+            for (int i = n / 2; i < n; ++i) acc += double(l[i]) * l[i];
+            return std::sqrt(acc / (n / 2));
+        };
+        const double low = rmsAfter(100), high = rmsAfter(6000);
+        qInfo("AULowpass at 300 Hz: 100 Hz -> %.3f, 6 kHz -> %.4f", low, high);
+        QVERIFY(low > 0.3);
+        QVERIFY(high < 0.02);
+        QVERIFY(inst->latencySamples() >= 0);
+        // Settings round trip into a second instance.
+        const std::string state = inst->saveState();
+        QVERIFY(!state.empty());
+        auto other = instantiate(*lowpass);
+        QVERIFY(other && other->activate(48000, 512));
+        QVERIFY(other->loadState(state));
+        QVERIFY(std::fabs(other->parameter(0) - 300) < 1);
+    }
+#endif
+
     void hostsAClapPlugin() {
         auto d = gainDescriptor();
         QVERIFY(d.has_value());

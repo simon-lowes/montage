@@ -50,6 +50,9 @@ bool canHost(Format f) {
 #ifdef MONTAGE_WITH_VST3
     if (f == Format::Vst3) return true;
 #endif
+#ifdef __APPLE__
+    if (f == Format::AudioUnit) return true;
+#endif
     return f == Format::Clap;
 }
 
@@ -346,6 +349,9 @@ std::unique_ptr<Instance> instantiateClap(const Descriptor& d, std::string* erro
 std::vector<Descriptor> probeVst3(const std::string& path, std::string* error);
 std::unique_ptr<Instance> instantiateVst3(const Descriptor& d, std::string* error);
 #endif
+#ifdef __APPLE__
+std::unique_ptr<Instance> instantiateAudioUnit(const Descriptor& d, std::string* error);
+#endif
 
 std::vector<Descriptor> probeInProcess(Format f, const std::string& path, std::string* error) {
     if (f == Format::Clap) return probeClap(path, error);
@@ -369,6 +375,9 @@ std::unique_ptr<Instance> instantiate(const Descriptor& d, std::string* error) {
         case Format::Clap: inst = instantiateClap(d, error); break;
 #ifdef MONTAGE_WITH_VST3
         case Format::Vst3: inst = instantiateVst3(d, error); break;
+#endif
+#ifdef __APPLE__
+        case Format::AudioUnit: inst = instantiateAudioUnit(d, error); break;
 #endif
         default:
             if (error) *error = std::string(formatName(d.format)) + " plugins cannot be run by this version yet";

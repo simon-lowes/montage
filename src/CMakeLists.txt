@@ -47,6 +47,7 @@ endif()
 target_compile_definitions(montage_engine PUBLIC MONTAGE_VERSION="${PROJECT_VERSION}")
 target_link_libraries(montage_engine PUBLIC Qt6::Core Qt6::Gui PkgConfig::FFMPEG Threads::Threads ${CMAKE_DL_LIBS})
 if(APPLE)
+  target_sources(montage_engine PRIVATE audio/AuHost.cpp)
   target_link_libraries(montage_engine PUBLIC "-framework AudioToolbox" "-framework CoreFoundation")
 endif()
 target_compile_options(montage_engine PRIVATE

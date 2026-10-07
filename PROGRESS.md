@@ -85,7 +85,10 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
   - Insert effects on audio tracks, buses and the master, with routing in the mixer and editing in the Inspector.
   - Plugin delay compensation: each stage is fed ahead by the latency after it, and the graph pre-rolls after any seek so pipelines are primed. It is checked sample-exact with a 64-sample latency test plugin on every stage at once.
   - Render and Replace and Restore Unrendered for audio clips.
-- [ ] 12. Audio Unit hosting on macOS (M)
+- [x] 12. Audio Unit hosting on macOS (M):
+  - Audio Units through the AudioComponent API: stereo or mono negotiation, input through a render callback, parameters with names and ranges, ClassInfo settings as binary plists, latency (so delay compensation covers AUs too) and reset.
+  - Tested on macOS CI with Apple's AULowpass.
+  - AU editor windows are not done yet (they need Cocoa views).
 - [ ] 13. OCIO colour management, ACES 2.0, HDR export (L)
 - [ ] 14. Multicam (L)
 - [ ] 15. GPU compositor on QRhi (XL)
