@@ -20,7 +20,7 @@ MACDEPLOYQT=$(command -v macdeployqt || echo "$(brew --prefix qtbase)/bin/macdep
 # The command-line tool ships inside the bundle, next to the app binary, with
 # the headless "offscreen" platform plugin it runs on (macdeployqt only adds cocoa).
 cp "$BUILD/src/montage-cli" "$APP/Contents/MacOS/"
-OFFSCREEN=$(find -L "$(brew --prefix)/share/qt" "$(brew --prefix qtbase)" -name libqoffscreen.dylib 2>/dev/null | head -1)
+OFFSCREEN=$(find -L "$(brew --prefix)/share/qt" "$(brew --prefix qtbase)" -name libqoffscreen.dylib 2>/dev/null | head -1 || true)
 [ -n "$OFFSCREEN" ] || { echo "libqoffscreen.dylib not found" >&2; exit 1; }
 mkdir -p "$APP/Contents/PlugIns/platforms"
 cp "$OFFSCREEN" "$APP/Contents/PlugIns/platforms/"
@@ -56,7 +56,7 @@ unresolved_libraries() {
     done
   done
 }
-problems=$(unresolved_libraries)
+problems=$(unresolved_libraries || true)
 if [ -n "$problems" ]; then
   echo "Bundle libraries do not resolve:" >&2
   echo "$problems" | sort -u >&2
