@@ -1,13 +1,16 @@
 // A VST3 effect for Montage's tests, written directly against the VST 3
 // interfaces: a stereo gain with a separate edit controller (the layout most
 // commercial plugins use). Parameter 3 "Gain" is normalised 0..1 = gain 0..2,
-// default 0.5 (unity). Built as MontageTestVst3.vst3.
+// default 0.5 (unity). Its editor has no real window: attached() asks the
+// host frame for 360x240 and turns the gain to 0.125 through the component
+// handler, as a user dragging its knob would. Built as MontageTestVst3.vst3.
 #include <atomic>
 #include <cstring>
 
 #include "pluginterfaces/base/funknown.h"
 #include "pluginterfaces/base/ibstream.h"
 #include "pluginterfaces/base/ipluginbase.h"
+#include "pluginterfaces/gui/iplugview.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
 #include "pluginterfaces/vst/ivstcomponent.h"
 #include "pluginterfaces/vst/ivsteditcontroller.h"
@@ -17,6 +20,9 @@
 
 using namespace Steinberg;
 using namespace Steinberg::Vst;
+
+DEF_CLASS_IID(IPlugView)
+DEF_CLASS_IID(IPlugFrame)
 
 namespace {
 
@@ -129,6 +135,74 @@ private:
     double norm_ = 0.5;
 };
 
+// The editor: the protocol only.
+class GainView : public IPlugView {
+public:
+    explicit GainView(IComponentHandler* handler, double* norm) : handler_(handler), norm_(norm) {}
+    tresult PLUGIN_API queryInterface(const TUID iid, void** obj) override {
+        if (FUnknownPrivate::iidEqual(iid, FUnknown::iid) || FUnknownPrivate::iidEqual(iid, IPlugView::iid)) {
+            addRef();
+            *obj = static_cast<IPlugView*>(this);
+            return kResultOk;
+        }
+        *obj = nullptr;
+        return kNoInterface;
+    }
+    uint32 PLUGIN_API addRef() override { return ++refs_; }
+    uint32 PLUGIN_API release() override {
+        uint32 r = --refs_;
+        if (r == 0) delete this;
+        return r;
+    }
+    tresult PLUGIN_API isPlatformTypeSupported(FIDString) override { return kResultTrue; }
+    tresult PLUGIN_API attached(void* parent, FIDString) override {
+        if (!parent) return kInvalidArgument;
+        attached_ = true;
+        if (frame_) {
+            ViewRect r(0, 0, 360, 240);
+            frame_->resizeView(this, &r);
+        }
+        if (handler_) {
+            handler_->beginEdit(kGainId);
+            *norm_ = 0.125;
+            handler_->performEdit(kGainId, 0.125);
+            handler_->endEdit(kGainId);
+        }
+        return kResultOk;
+    }
+    tresult PLUGIN_API removed() override {
+        attached_ = false;
+        return kResultOk;
+    }
+    tresult PLUGIN_API onWheel(float) override { return kResultFalse; }
+    tresult PLUGIN_API onKeyDown(char16, int16, int16) override { return kResultFalse; }
+    tresult PLUGIN_API onKeyUp(char16, int16, int16) override { return kResultFalse; }
+    tresult PLUGIN_API getSize(ViewRect* size) override {
+        *size = rect_;
+        return kResultOk;
+    }
+    tresult PLUGIN_API onSize(ViewRect* newSize) override {
+        rect_ = *newSize;
+        return kResultOk;
+    }
+    tresult PLUGIN_API onFocus(TBool) override { return kResultOk; }
+    tresult PLUGIN_API setFrame(IPlugFrame* frame) override {
+        frame_ = frame;
+        return kResultOk;
+    }
+    tresult PLUGIN_API canResize() override { return kResultFalse; }
+    tresult PLUGIN_API checkSizeConstraint(ViewRect*) override { return kResultOk; }
+
+private:
+    virtual ~GainView() = default;
+    std::atomic<uint32> refs_{1};
+    IComponentHandler* handler_;
+    double* norm_;
+    IPlugFrame* frame_ = nullptr;
+    ViewRect rect_{0, 0, 300, 180};
+    bool attached_ = false;
+};
+
 class GainController : public IEditController {
 public:
     tresult PLUGIN_API queryInterface(const TUID iid, void** obj) override {
@@ -177,13 +251,19 @@ public:
         norm_ = v;
         return kResultOk;
     }
-    tresult PLUGIN_API setComponentHandler(IComponentHandler*) override { return kResultOk; }
-    IPlugView* PLUGIN_API createView(FIDString) override { return nullptr; }
+    tresult PLUGIN_API setComponentHandler(IComponentHandler* handler) override {
+        handler_ = handler;
+        return kResultOk;
+    }
+    IPlugView* PLUGIN_API createView(FIDString name) override {
+        return name && std::strcmp(name, ViewType::kEditor) == 0 ? new GainView(handler_, &norm_) : nullptr;
+    }
 
 private:
     virtual ~GainController() = default;
     std::atomic<uint32> refs_{1};
     double norm_ = 0.5;
+    IComponentHandler* handler_ = nullptr;
 };
 
 class Factory : public IPluginFactory2 {

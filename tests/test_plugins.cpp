@@ -307,7 +307,74 @@ private slots:
         QCOMPARE(other->parameter(7), 0.5);
     }
 
+    void clapEditorProtocol() {
+        // The test gain's "editor" asks for a size and turns its knob when shown.
+        struct Listener : EditorListener {
+            std::vector<std::pair<uint32_t, double>> params;
+            std::vector<std::pair<uint32_t, bool>> gestures;
+            int w = 0, h = 0;
+            void editorParameter(uint32_t id, double v) override { params.emplace_back(id, v); }
+            void editorGesture(uint32_t id, bool begin) override { gestures.emplace_back(id, begin); }
+            void editorResize(int width, int height) override { w = width, h = height; }
+        } listener;
+        auto d = gainDescriptor();
+        QVERIFY(d.has_value());
+        auto inst = instantiate(*d);
+        QVERIFY(inst);
+        QVERIFY(inst->hasEditor());
+        int w = 0, h = 0;
+        QVERIFY(!inst->openEditor(nullptr, &listener, w, h));  // a parent window is required
+        int dummyWindow = 0;
+        QVERIFY(inst->openEditor(&dummyWindow, &listener, w, h));
+        QCOMPARE(w, 320);
+        QCOMPARE(h, 200);
+        QCOMPARE(listener.w, 400);  // asked for a resize when shown
+        QVERIFY(inst->editorResizable());
+        inst->idle();               // the host flushes: the knob change arrives
+        QCOMPARE(listener.params.size(), size_t(1));
+        QCOMPARE(listener.params[0], std::make_pair(7u, 0.25));
+        QCOMPARE(listener.gestures.size(), size_t(2));
+        QVERIFY(listener.gestures[0].second && !listener.gestures[1].second);
+        QCOMPARE(inst->parameter(7), 0.25);
+        inst->closeEditor();
+        inst->idle();  // nothing more once closed
+        QCOMPARE(listener.params.size(), size_t(1));
+    }
+
 #ifdef MONTAGE_WITH_VST3
+    void vst3EditorProtocol() {
+        struct Listener : EditorListener {
+            std::vector<std::pair<uint32_t, double>> params;
+            std::vector<std::pair<uint32_t, bool>> gestures;
+            int w = 0, h = 0;
+            void editorParameter(uint32_t id, double v) override { params.emplace_back(id, v); }
+            void editorGesture(uint32_t id, bool begin) override { gestures.emplace_back(id, begin); }
+            void editorResize(int width, int height) override { w = width, h = height; }
+        } listener;
+        auto files = findPluginFiles(Format::Vst3, {MONTAGE_TEST_VST3_DIR});
+        QCOMPARE(files.size(), size_t(1));
+        auto ds = probeInProcess(Format::Vst3, files[0]);
+        QCOMPARE(ds.size(), size_t(1));
+        auto inst = instantiate(ds[0]);
+        QVERIFY(inst);
+        QVERIFY(inst->hasEditor());
+        int w = 0, h = 0, dummyWindow = 0;
+        QVERIFY(!inst->openEditor(nullptr, &listener, w, h));
+        QVERIFY(inst->openEditor(&dummyWindow, &listener, w, h));
+        // The view asked the frame for 360x240 while attaching, which also resized it.
+        QCOMPARE(listener.w, 360);
+        QCOMPARE(listener.h, 240);
+        QCOMPARE(w, 360);
+        QCOMPARE(h, 240);
+        QVERIFY(!inst->editorResizable());
+        QCOMPARE(listener.params.size(), size_t(1));
+        QCOMPARE(listener.params[0], std::make_pair(3u, 0.125));  // normalised, as parameters() reports
+        QCOMPARE(listener.gestures.size(), size_t(2));
+        QVERIFY(listener.gestures[0].second && !listener.gestures[1].second);
+        inst->closeEditor();
+        QVERIFY(inst->hasEditor());
+    }
+
     void probesAndHostsAVst3Plugin() {
         const std::string dir = MONTAGE_TEST_VST3_DIR;
         auto files = findPluginFiles(Format::Vst3, {dir});

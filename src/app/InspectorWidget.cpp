@@ -22,6 +22,7 @@
 #include <utility>
 
 #include "EditorState.h"
+#include "PluginEditorWindow.h"
 #include "Theme.h"
 #include "audio/PluginEffect.h"
 
@@ -330,6 +331,16 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
         auto* down = smallButton(tools, QStringLiteral("▼"), tr("Move Down"));
         auto* reset = smallButton(tools, QStringLiteral("↺"), tr("Reset"));
         auto* del = smallButton(tools, QStringLiteral("✕"), tr("Remove Effect"));
+        QToolButton* editor = nullptr;
+        if (e.type == "plugin") {
+            editor = smallButton(tools, tr("Editor"), tr("Open the plugin's own editor"));
+            editor->setObjectName("pluginEditor");
+            th->addWidget(editor);
+            connect(editor, &QToolButton::clicked, this, [this, clipId, eid] {
+                QString err;
+                if (!PluginEditorWindow::open(state_, clipId, eid, window(), &err) && !err.isEmpty()) state_->message(err, 6000);
+            });
+        }
         for (QWidget* w : {static_cast<QWidget*>(on), static_cast<QWidget*>(up), static_cast<QWidget*>(down),
                            static_cast<QWidget*>(reset), static_cast<QWidget*>(del)})
             th->addWidget(w);

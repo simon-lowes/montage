@@ -2,6 +2,7 @@
 // VST is a registered trademark of Steinberg Media Technologies GmbH.
 #include <QString>
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -11,6 +12,7 @@
 #include "Plugins.h"
 #include "pluginterfaces/base/funknown.h"
 #include "pluginterfaces/base/ipluginbase.h"
+#include "pluginterfaces/gui/iplugview.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
 #include "pluginterfaces/vst/ivstcomponent.h"
 #include "pluginterfaces/vst/ivsteditcontroller.h"
@@ -24,12 +26,163 @@
 #include <CoreFoundation/CoreFoundation.h>
 #endif
 
+#if !defined(__APPLE__) && !defined(_WIN32)
+#include <QSocketNotifier>
+#include <QTimer>
+#endif
+
+namespace Steinberg {
+DEF_CLASS_IID(IPlugView)
+DEF_CLASS_IID(IPlugFrame)
+#if !defined(__APPLE__) && !defined(_WIN32)
+namespace Linux {
+DEF_CLASS_IID(IRunLoop)
+DEF_CLASS_IID(IEventHandler)
+DEF_CLASS_IID(ITimerHandler)
+}  // namespace Linux
+#endif
+}  // namespace Steinberg
+
 namespace montage::plugins {
 
 namespace {
 
 using namespace Steinberg;
 using namespace Steinberg::Vst;
+
+// FUnknown for objects owned by the instance (reference counts are kept for
+// the plugin's sake, but the instance decides when they go).
+#define MONTAGE_OWNED_FUNKNOWN                                       \
+    uint32 PLUGIN_API addRef() override { return ++refs_; }          \
+    uint32 PLUGIN_API release() override { return --refs_; }         \
+    std::atomic<uint32> refs_{1};
+
+// Receives edits made in the plugin's editor.
+class ComponentHandler : public IComponentHandler {
+public:
+    EditorListener* listener = nullptr;
+    tresult PLUGIN_API queryInterface(const TUID iid, void** obj) override {
+        if (FUnknownPrivate::iidEqual(iid, FUnknown::iid) || FUnknownPrivate::iidEqual(iid, IComponentHandler::iid)) {
+            addRef();
+            *obj = static_cast<IComponentHandler*>(this);
+            return kResultOk;
+        }
+        *obj = nullptr;
+        return kNoInterface;
+    }
+    MONTAGE_OWNED_FUNKNOWN
+    tresult PLUGIN_API beginEdit(ParamID id) override {
+        if (listener) listener->editorGesture(id, true);
+        return kResultOk;
+    }
+    tresult PLUGIN_API performEdit(ParamID id, ParamValue v) override {
+        if (listener) listener->editorParameter(id, v);
+        return kResultOk;
+    }
+    tresult PLUGIN_API endEdit(ParamID id) override {
+        if (listener) listener->editorGesture(id, false);
+        return kResultOk;
+    }
+    tresult PLUGIN_API restartComponent(int32) override { return kResultOk; }
+};
+
+#if !defined(__APPLE__) && !defined(_WIN32)
+// X11 editors need the host's run loop for their timers and sockets.
+class RunLoop : public Linux::IRunLoop {
+public:
+    ~RunLoop() {
+        for (auto& [h, n] : fds_) delete n;
+        for (auto& [h, t] : timers_) delete t;
+    }
+    tresult PLUGIN_API queryInterface(const TUID iid, void** obj) override {
+        if (FUnknownPrivate::iidEqual(iid, FUnknown::iid) || FUnknownPrivate::iidEqual(iid, Linux::IRunLoop::iid)) {
+            addRef();
+            *obj = static_cast<Linux::IRunLoop*>(this);
+            return kResultOk;
+        }
+        *obj = nullptr;
+        return kNoInterface;
+    }
+    MONTAGE_OWNED_FUNKNOWN
+    tresult PLUGIN_API registerEventHandler(Linux::IEventHandler* handler, Linux::FileDescriptor fd) override {
+        auto* n = new QSocketNotifier(fd, QSocketNotifier::Read);
+        QObject::connect(n, &QSocketNotifier::activated, [handler, fd] { handler->onFDIsSet(fd); });
+        fds_.emplace_back(handler, n);
+        return kResultOk;
+    }
+    tresult PLUGIN_API unregisterEventHandler(Linux::IEventHandler* handler) override {
+        for (auto it = fds_.begin(); it != fds_.end();)
+            if (it->first == handler) {
+                delete it->second;
+                it = fds_.erase(it);
+            } else {
+                ++it;
+            }
+        return kResultOk;
+    }
+    tresult PLUGIN_API registerTimer(Linux::ITimerHandler* handler, Linux::TimerInterval ms) override {
+        auto* t = new QTimer;
+        QObject::connect(t, &QTimer::timeout, [handler] { handler->onTimer(); });
+        t->start(int(ms));
+        timers_.emplace_back(handler, t);
+        return kResultOk;
+    }
+    tresult PLUGIN_API unregisterTimer(Linux::ITimerHandler* handler) override {
+        for (auto it = timers_.begin(); it != timers_.end();)
+            if (it->first == handler) {
+                delete it->second;
+                it = timers_.erase(it);
+            } else {
+                ++it;
+            }
+        return kResultOk;
+    }
+
+private:
+    std::vector<std::pair<Linux::IEventHandler*, QSocketNotifier*>> fds_;
+    std::vector<std::pair<Linux::ITimerHandler*, QTimer*>> timers_;
+};
+#endif
+
+// The window the editor lives in, as the plugin sees it.
+class PlugFrame : public IPlugFrame {
+public:
+    EditorListener* listener = nullptr;
+    tresult PLUGIN_API queryInterface(const TUID iid, void** obj) override {
+        if (FUnknownPrivate::iidEqual(iid, FUnknown::iid) || FUnknownPrivate::iidEqual(iid, IPlugFrame::iid)) {
+            addRef();
+            *obj = static_cast<IPlugFrame*>(this);
+            return kResultOk;
+        }
+#if !defined(__APPLE__) && !defined(_WIN32)
+        if (FUnknownPrivate::iidEqual(iid, Linux::IRunLoop::iid)) return runLoop_.queryInterface(iid, obj);
+#endif
+        *obj = nullptr;
+        return kNoInterface;
+    }
+    MONTAGE_OWNED_FUNKNOWN
+    tresult PLUGIN_API resizeView(IPlugView* view, ViewRect* r) override {
+        if (!view || !r) return kInvalidArgument;
+        if (listener) listener->editorResize(r->getWidth(), r->getHeight());
+        view->onSize(r);
+        return kResultTrue;
+    }
+
+private:
+#if !defined(__APPLE__) && !defined(_WIN32)
+    RunLoop runLoop_;
+#endif
+};
+
+FIDString viewPlatformType() {
+#if defined(__APPLE__)
+    return kPlatformTypeNSView;
+#elif defined(_WIN32)
+    return kPlatformTypeHWND;
+#else
+    return kPlatformTypeX11EmbedWindowID;
+#endif
+}
 
 using GetFactoryProc = IPluginFactory*(PLUGIN_API*)();
 
@@ -127,6 +280,8 @@ std::string categoryFromSubCategories(const std::string& subs, bool* instrument)
 class Vst3Instance final : public Instance {
 public:
     ~Vst3Instance() override {
+        closeEditor();
+        if (controller_) controller_->setComponentHandler(nullptr);
         if (processor_ && processing_) processor_->setProcessing(false);
         if (component_ && active_) component_->setActive(false);
         if (componentCP_ && controllerCP_) {
@@ -197,7 +352,10 @@ public:
             if (error) *error = "the plugin has no audio output";
             return false;
         }
-        if (controller_) changes_ = owned(new ParameterChanges(controller_->getParameterCount()));
+        if (controller_) {
+            changes_ = owned(new ParameterChanges(controller_->getParameterCount()));
+            controller_->setComponentHandler(&handler_);
+        }
         else changes_ = owned(new ParameterChanges(0));
         return true;
     }
@@ -245,6 +403,54 @@ public:
             out.push_back(p);
         }
         return out;
+    }
+
+    bool hasEditor() override {
+        if (view_) return true;
+        if (!controller_) return false;
+        IPtr<IPlugView> v = owned(controller_->createView(ViewType::kEditor));
+        return v && v->isPlatformTypeSupported(viewPlatformType()) == kResultTrue;
+    }
+
+    bool openEditor(void* parent, EditorListener* listener, int& width, int& height) override {
+        if (view_ || !controller_ || !parent) return false;
+        view_ = owned(controller_->createView(ViewType::kEditor));
+        if (!view_ || view_->isPlatformTypeSupported(viewPlatformType()) != kResultTrue) {
+            view_ = nullptr;
+            return false;
+        }
+        handler_.listener = listener;
+        frame_.listener = listener;
+        view_->setFrame(&frame_);
+        if (view_->attached(parent, viewPlatformType()) != kResultOk) {
+            view_->setFrame(nullptr);
+            view_ = nullptr;
+            handler_.listener = frame_.listener = nullptr;
+            return false;
+        }
+        ViewRect r;
+        if (view_->getSize(&r) == kResultOk) {
+            width = r.getWidth();
+            height = r.getHeight();
+        }
+        return true;
+    }
+
+    void closeEditor() override {
+        if (!view_) return;
+        view_->removed();
+        view_->setFrame(nullptr);
+        view_ = nullptr;
+        handler_.listener = frame_.listener = nullptr;
+    }
+
+    bool editorResizable() override { return view_ && view_->canResize() == kResultTrue; }
+
+    void setEditorSize(int width, int height) override {
+        if (!view_) return;
+        ViewRect r(0, 0, width, height);
+        view_->checkSizeConstraint(&r);
+        view_->onSize(&r);
     }
 
     double parameter(uint32_t id) override { return controller_ ? controller_->getParamNormalized(id) : 0; }
@@ -398,6 +604,9 @@ private:
         return true;
     }
 
+    ComponentHandler handler_;
+    PlugFrame frame_;
+    IPtr<IPlugView> view_;
     std::shared_ptr<Vst3Module> module_;
     IPtr<HostApplication> host_;
     IPtr<IComponent> component_;

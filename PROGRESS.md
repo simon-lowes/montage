@@ -76,7 +76,11 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
   - Masks are in the clip's own frame, so they follow its transform.
   - On-screen handles in the Program monitor move and resize them, one undo step per drag.
   - Not done yet: bezier masks, and tracking (#16).
-- [ ] 10. Plugin editor windows (L)
+- [x] 10. Plugin editor windows (L):
+  - CLAP editors through the gui extension, with host gui/params extensions, request_resize, flush-based parameter delivery and main-thread callbacks.
+  - VST3 editors through IPlugView and IPlugFrame, with a component handler for begin/perform/endEdit, and an IRunLoop for X11 editors.
+  - The editor runs on its own instance, so its edits are undoable parameter changes (merged per drag) and its saved settings go into the effect. The playing instance reloads changed settings, and undo or Inspector edits update the editor.
+  - Tested with protocol-only editors in the test CLAP and VST3 plugins.
 - [ ] 11. Track and bus effect chains, delay compensation, offline plugin rendering (L)
 - [ ] 12. Audio Unit hosting on macOS (M)
 - [ ] 13. OCIO colour management, ACES 2.0, HDR export (L)

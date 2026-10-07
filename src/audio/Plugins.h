@@ -51,6 +51,18 @@ struct ParamInfo {
     bool stepped = false;
 };
 
+// What the plugin's own editor reports back to the host (main thread).
+class EditorListener {
+public:
+    virtual ~EditorListener() = default;
+    // The user changed a parameter in the editor (plain value, as parameters() ranges).
+    virtual void editorParameter(uint32_t id, double value) = 0;
+    // A drag on a control began or ended (changes in between belong together).
+    virtual void editorGesture(uint32_t id, bool begin) {}
+    // The editor wants a new size (pixels).
+    virtual void editorResize(int width, int height) = 0;
+};
+
 // A loaded, running plugin. Not thread safe: use from one thread at a time.
 class Instance {
 public:
@@ -67,6 +79,16 @@ public:
     virtual int latencySamples() { return 0; }
     // Clears internal audio state (delay lines, envelopes) after a seek.
     virtual void reset() {}
+
+    // The plugin's own editor window, embedded in a native window of this
+    // platform: an NSView* on macOS, an HWND on Windows, an X11 window id on
+    // Linux. Main thread only; keep calling idle() while it is open.
+    virtual bool hasEditor() { return false; }
+    virtual bool openEditor(void* parent, EditorListener* listener, int& width, int& height) { return false; }
+    virtual void closeEditor() {}
+    virtual bool editorResizable() { return false; }
+    virtual void setEditorSize(int width, int height) {}
+    virtual void idle() {}
 };
 
 std::unique_ptr<Instance> instantiate(const Descriptor& d, std::string* error = nullptr);

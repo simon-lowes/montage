@@ -3,6 +3,7 @@
 
 #include <QFileInfo>
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -85,10 +86,48 @@ std::string categoryFromFeatures(const char* const* features, bool* instrument) 
 
 // ---- Host callbacks --------------------------------------------------------
 
-const void* hostGetExtension(const clap_host_t*, const char*) { return nullptr; }
+// What the host side of an instance answers (host_data points at one).
+struct HostSide {
+    std::atomic<bool> flushRequested{false};
+    std::atomic<bool> callbackRequested{false};
+    EditorListener* listener = nullptr;
+};
+
+const clap_host_gui_t kHostGui{
+    [](const clap_host_t*) {},  // resize_hints_changed
+    [](const clap_host_t* h, uint32_t w, uint32_t hgt) -> bool {
+        auto* side = static_cast<HostSide*>(h->host_data);
+        if (side->listener) side->listener->editorResize(int(w), int(hgt));
+        return true;
+    },
+    [](const clap_host_t*) -> bool { return true; },  // request_show
+    [](const clap_host_t*) -> bool { return true; },  // request_hide
+    [](const clap_host_t*, bool) {},                  // closed
+};
+const clap_host_params_t kHostParams{
+    [](const clap_host_t*, clap_param_rescan_flags) {},
+    [](const clap_host_t*, clap_id, clap_param_clear_flags) {},
+    [](const clap_host_t* h) { static_cast<HostSide*>(h->host_data)->flushRequested = true; },
+};
+
+const void* hostGetExtension(const clap_host_t*, const char* id) {
+    if (std::strcmp(id, CLAP_EXT_GUI) == 0) return &kHostGui;
+    if (std::strcmp(id, CLAP_EXT_PARAMS) == 0) return &kHostParams;
+    return nullptr;
+}
 void hostRequestRestart(const clap_host_t*) {}
 void hostRequestProcess(const clap_host_t*) {}
-void hostRequestCallback(const clap_host_t*) {}
+void hostRequestCallback(const clap_host_t* h) { static_cast<HostSide*>(h->host_data)->callbackRequested = true; }
+
+const char* clapWindowApi() {
+#if defined(__APPLE__)
+    return CLAP_WINDOW_API_COCOA;
+#elif defined(_WIN32)
+    return CLAP_WINDOW_API_WIN32;
+#else
+    return CLAP_WINDOW_API_X11;
+#endif
+}
 
 // ---- Event lists -------------------------------------------------------------
 
@@ -130,6 +169,7 @@ class ClapInstance final : public Instance {
 public:
     ~ClapInstance() override {
         if (!plugin_) return;
+        closeEditor();
         if (processing_) plugin_->stop_processing(plugin_);
         if (active_) plugin_->deactivate(plugin_);
         plugin_->destroy(plugin_);
@@ -139,7 +179,7 @@ public:
         lib_ = openLibrary(d.path, error);
         if (!lib_) return false;
         host_.clap_version = CLAP_VERSION;
-        host_.host_data = this;
+        host_.host_data = &side_;
         host_.name = "Montage";
         host_.vendor = "Montage";
         host_.url = "https://github.com/simon-lowes/montage";
@@ -162,6 +202,7 @@ public:
         params_ = static_cast<const clap_plugin_params_t*>(plugin_->get_extension(plugin_, CLAP_EXT_PARAMS));
         state_ = static_cast<const clap_plugin_state_t*>(plugin_->get_extension(plugin_, CLAP_EXT_STATE));
         latency_ = static_cast<const clap_plugin_latency_t*>(plugin_->get_extension(plugin_, CLAP_EXT_LATENCY));
+        gui_ = static_cast<const clap_plugin_gui_t*>(plugin_->get_extension(plugin_, CLAP_EXT_GUI));
         if (auto* ports = static_cast<const clap_plugin_audio_ports_t*>(
                 plugin_->get_extension(plugin_, CLAP_EXT_AUDIO_PORTS))) {
             clap_audio_port_info_t info{};
@@ -273,6 +314,78 @@ public:
         if (active_) plugin_->reset(plugin_);
     }
 
+    bool hasEditor() override { return gui_ && gui_->is_api_supported(plugin_, clapWindowApi(), false); }
+
+    bool openEditor(void* parent, EditorListener* listener, int& width, int& height) override {
+        if (!hasEditor() || editorOpen_) return false;
+        if (!gui_->create(plugin_, clapWindowApi(), false)) return false;
+        side_.listener = listener;
+        uint32_t w = 400, h = 300;
+        gui_->get_size(plugin_, &w, &h);
+        clap_window_t win{};
+        win.api = clapWindowApi();
+#if defined(__APPLE__)
+        win.cocoa = parent;
+#elif defined(_WIN32)
+        win.win32 = parent;
+#else
+        win.x11 = static_cast<clap_xwnd>(reinterpret_cast<uintptr_t>(parent));
+#endif
+        if (!gui_->set_parent(plugin_, &win)) {
+            gui_->destroy(plugin_);
+            side_.listener = nullptr;
+            return false;
+        }
+        editorOpen_ = true;
+        gui_->show(plugin_);
+        width = int(w);
+        height = int(h);
+        return true;
+    }
+
+    void closeEditor() override {
+        if (!editorOpen_) return;
+        idle();  // deliver the last changes
+        gui_->hide(plugin_);
+        gui_->destroy(plugin_);
+        editorOpen_ = false;
+        side_.listener = nullptr;
+    }
+
+    bool editorResizable() override { return editorOpen_ && gui_->can_resize(plugin_); }
+
+    void setEditorSize(int width, int height) override {
+        if (!editorOpen_) return;
+        uint32_t w = uint32_t(std::max(1, width)), h = uint32_t(std::max(1, height));
+        if (gui_->adjust_size(plugin_, &w, &h)) gui_->set_size(plugin_, w, h);
+    }
+
+    void idle() override {
+        if (side_.callbackRequested.exchange(false)) plugin_->on_main_thread(plugin_);
+        // Parameter changes made in the editor arrive through a flush.
+        if (!params_ || (!side_.flushRequested.exchange(false) && !editorOpen_)) return;
+        EventList none;
+        struct Collector {
+            ClapInstance* self;
+            clap_output_events_t out;
+        } collector{this, {nullptr, nullptr}};
+        collector.out.ctx = &collector;
+        collector.out.try_push = [](const clap_output_events_t* list, const clap_event_header_t* ev) -> bool {
+            auto* c = static_cast<Collector*>(list->ctx);
+            EditorListener* l = c->self->side_.listener;
+            if (!l || ev->space_id != CLAP_CORE_EVENT_SPACE_ID) return true;
+            if (ev->type == CLAP_EVENT_PARAM_VALUE) {
+                auto* pv = reinterpret_cast<const clap_event_param_value_t*>(ev);
+                l->editorParameter(pv->param_id, pv->value);
+            } else if (ev->type == CLAP_EVENT_PARAM_GESTURE_BEGIN || ev->type == CLAP_EVENT_PARAM_GESTURE_END) {
+                auto* g = reinterpret_cast<const clap_event_param_gesture_t*>(ev);
+                l->editorGesture(g->param_id, ev->type == CLAP_EVENT_PARAM_GESTURE_BEGIN);
+            }
+            return true;
+        };
+        params_->flush(plugin_, &none.in, &collector.out);
+    }
+
 private:
     void processBlock(float* const* channels, int numChannels, int offset, int n) {
         // The plugin's main ports may be mono or stereo; adapt our stereo to them.
@@ -319,6 +432,9 @@ private:
     const clap_plugin_params_t* params_ = nullptr;
     const clap_plugin_state_t* state_ = nullptr;
     const clap_plugin_latency_t* latency_ = nullptr;
+    const clap_plugin_gui_t* gui_ = nullptr;
+    HostSide side_;
+    bool editorOpen_ = false;
     int inChannels_ = 2, outChannels_ = 2;
     int maxFrames_ = 1024;
     bool active_ = false, processing_ = false;

@@ -15,12 +15,15 @@
 #include <QTreeWidget>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 #include "CaptionsPanel.h"
 #include "EditorState.h"
 #include "EffectsBrowser.h"
 #include "audio/Plugins.h"
 #include "MainWindow.h"
+#include "PluginEditorWindow.h"
+#include "audio/PluginEffect.h"
 #include "MaskOverlay.h"
 #include "MonitorPanel.h"
 #include "PlaybackController.h"
@@ -378,6 +381,76 @@ private slots:
         c = edit::clipById(*state()->sequence(), clip);
         QCOMPARE(c->effects[0].p("param.7", 0), 1.0);
         state()->newProject();
+    }
+
+    void pluginEditorWindow() {
+        // Runs after audioPluginFromBrowserToInspector, which registered the test CLAP plugins.
+        auto d = plugins::Registry::instance().find("clap:org.montage.test.gain");
+        QVERIFY(d.has_value());
+        state()->newProject();
+        auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        QVERIFY(state()->apply("Place", [media](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, media, 0, 0, -1, V1, A1, false);
+        }));
+        const Id clip = trackAt(*state()->sequence(), A1)->clips.at(0).id;
+        Id eid = 0;
+        QVERIFY(state()->edit("Add Plugin", [&](Project& p, Sequence& s) {
+            auto e = plugins::makePluginEffect(p, *d);
+            if (!e) return false;
+            eid = e->id;
+            edit::clipById(s, clip)->effects.push_back(*e);
+            return true;
+        }));
+        state()->setSelection({clip}, false);
+        state()->setPlayhead(10);
+        QApplication::processEvents();
+
+        // The Inspector's Editor button opens the plugin's editor in a window.
+        QToolButton* button = nullptr;
+        for (auto* b : win_->findChildren<QToolButton*>("pluginEditor"))
+            if (b->isVisibleTo(win_.get())) button = b;
+        QVERIFY(button);
+        button->click();
+        PluginEditorWindow* editor = PluginEditorWindow::find(clip, eid);
+        QVERIFY(editor);
+        QVERIFY(editor->isVisible());
+        QCOMPARE(PluginEditorWindow::open(state(), clip, eid, win_.get()), editor);  // raised, not opened twice
+
+        // The test plugin's editor turns its gain knob to 0.25 when shown: that becomes an edit of the effect.
+        auto gain = [&] { return edit::clipById(*state()->sequence(), clip)->effects.at(0).p("param.7", 10, -1); };
+        QTRY_COMPARE_WITH_TIMEOUT(gain(), 0.25, 3000);
+        // ...and the editor asked to be 400 x 250.
+        QTRY_VERIFY_WITH_TIMEOUT(editor->width() >= 400 && editor->height() >= 250, 2000);
+
+        // Undo puts the knob back in the editor too.
+        state()->undo();
+        QCOMPARE(gain(), 1.0);
+        QCOMPARE(editor->instance()->parameter(7), 1.0);
+
+        // Closing stores the plugin's settings in the effect.
+        editor->close();
+        QApplication::processEvents();
+        QVERIFY(!PluginEditorWindow::find(clip, eid));
+        const std::string bytes = plugins::decodeState(edit::clipById(*state()->sequence(), clip)->effects.at(0).s("state"));
+        QCOMPARE(bytes.size(), sizeof(double));
+        double saved = 0;
+        std::memcpy(&saved, bytes.data(), sizeof saved);
+        QCOMPARE(saved, 1.0);
+
+        // Deleting the clip closes an open editor.
+        button = nullptr;
+        for (auto* b : win_->findChildren<QToolButton*>("pluginEditor"))
+            if (b->isVisibleTo(win_.get())) button = b;
+        QVERIFY(button);
+        button->click();
+        QVERIFY(PluginEditorWindow::find(clip, eid));
+        QVERIFY(state()->apply("Delete", [clip](Project& p, Sequence& s) { return edit::removeClips(p, s, {clip}, true); }));
+        QApplication::processEvents();
+        QVERIFY(!PluginEditorWindow::find(clip, eid));
+        state()->newProject();
+        QVERIFY(QTest::qWaitForWindowActive(win_.get()));
     }
 
     void crashRecoveryAndSnapshots() {

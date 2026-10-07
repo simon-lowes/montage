@@ -586,6 +586,7 @@ struct AudioMixer::State {
     std::unique_ptr<plugins::Instance> plugin;
     double pluginRate = 0;
     bool pluginFailed = false;
+    std::string pluginState;  // the effect's saved state the plugin last loaded
     std::vector<float> planar;
 };
 
@@ -609,6 +610,7 @@ void processPlugin(AudioMixer::State& st, const Effect& e, double sr, FrameTime 
                 if (inst->activate(sr, kPluginBlock)) {
                     const std::string state = plugins::decodeState(e.s("state"));
                     if (!state.empty()) inst->loadState(state);
+                    st.pluginState = e.s("state");
                     st.plugin = std::move(inst);
                     st.pluginRate = sr;
                     st.pluginFailed = false;
@@ -616,6 +618,13 @@ void processPlugin(AudioMixer::State& st, const Effect& e, double sr, FrameTime 
                 }
     }
     if (!st.plugin) return;
+    // Settings changed in the plugin's editor arrive as a new saved state.
+    if (e.s("state") != st.pluginState) {
+        st.pluginState = e.s("state");
+        const std::string state = plugins::decodeState(st.pluginState);
+        if (!state.empty()) st.plugin->loadState(state);
+        paramsChanged = true;
+    }
     if (paramsChanged)
         for (const auto& [key, param] : e.params)
             if (key.rfind("param.", 0) == 0)
@@ -644,9 +653,11 @@ void AudioMixer::reset() {
         if (auto plugin = std::move(it->second->plugin)) {
             plugin->reset();
             const double rate = it->second->pluginRate;
+            std::string state = std::move(it->second->pluginState);
             *it->second = State{};
             it->second->plugin = std::move(plugin);
             it->second->pluginRate = rate;
+            it->second->pluginState = std::move(state);
             ++it;
         } else {
             it = states_.erase(it);

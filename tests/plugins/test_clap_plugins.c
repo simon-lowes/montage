@@ -1,5 +1,7 @@
 // CLAP plugins for Montage's tests: a library with two effects.
-//   org.montage.test.gain    stereo gain, one parameter (id 7, 0..2, default 1), saves its state
+//   org.montage.test.gain    stereo gain, one parameter (id 7, 0..2, default 1), saves its state, and has
+//                            an "editor" that, when shown, asks to be 400x250 and turns the gain to 0.25
+//                            (as if the user dragged its knob) so hosts can test the editor protocol
 //   org.montage.test.invert  polarity inversion, no parameters
 // Built as MontageTestPlugins.clap.
 #include <clap/clap.h>
@@ -11,6 +13,9 @@ typedef struct {
     const clap_host_t* host;
     int invert;
     double gain;
+    int guiCreated;
+    void* parent;          // the window handle the host gave the editor
+    int pendingKnob;       // a knob change waiting for the host's flush
 } TestPlugin;
 
 static const char* const kGainFeatures[] = {CLAP_PLUGIN_FEATURE_AUDIO_EFFECT, CLAP_PLUGIN_FEATURE_UTILITY, NULL};
@@ -68,9 +73,37 @@ static bool params_value(const clap_plugin_t* p, clap_id id, double* out) {
 }
 static bool params_to_text(const clap_plugin_t* p, clap_id id, double v, char* buf, uint32_t size) { (void)p; (void)id; (void)v; (void)buf; (void)size; return false; }
 static bool params_from_text(const clap_plugin_t* p, clap_id id, const char* s, double* v) { (void)p; (void)id; (void)s; (void)v; return false; }
+static void push_event(const clap_output_events_t* out, uint16_t type, double value) {
+    if (type == CLAP_EVENT_PARAM_VALUE) {
+        clap_event_param_value_t ev;
+        memset(&ev, 0, sizeof ev);
+        ev.header.size = sizeof ev;
+        ev.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+        ev.header.type = type;
+        ev.param_id = 7;
+        ev.note_id = ev.port_index = ev.channel = ev.key = -1;
+        ev.value = value;
+        out->try_push(out, &ev.header);
+    } else {
+        clap_event_param_gesture_t ev;
+        memset(&ev, 0, sizeof ev);
+        ev.header.size = sizeof ev;
+        ev.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+        ev.header.type = type;
+        ev.param_id = 7;
+        out->try_push(out, &ev.header);
+    }
+}
 static void params_flush(const clap_plugin_t* p, const clap_input_events_t* in, const clap_output_events_t* out) {
-    (void)out;
-    apply_events((TestPlugin*)p->plugin_data, in);
+    TestPlugin* t = (TestPlugin*)p->plugin_data;
+    apply_events(t, in);
+    if (t->pendingKnob) {
+        t->pendingKnob = 0;
+        t->gain = 0.25;
+        push_event(out, CLAP_EVENT_PARAM_GESTURE_BEGIN, 0);
+        push_event(out, CLAP_EVENT_PARAM_VALUE, 0.25);
+        push_event(out, CLAP_EVENT_PARAM_GESTURE_END, 0);
+    }
 }
 static const clap_plugin_params_t kParams = {params_count, params_info, params_value, params_to_text, params_from_text, params_flush};
 
@@ -86,6 +119,42 @@ static bool state_load(const clap_plugin_t* p, const clap_istream_t* s) {
     return true;
 }
 static const clap_plugin_state_t kState = {state_save, state_load};
+
+// ---- gui: no real window, just the protocol ----
+static bool gui_supported(const clap_plugin_t* p, const char* api, bool floating) { (void)p; (void)api; return !floating; }
+static bool gui_preferred(const clap_plugin_t* p, const char** api, bool* floating) { (void)p; (void)api; (void)floating; return false; }
+static bool gui_create(const clap_plugin_t* p, const char* api, bool floating) {
+    (void)api; (void)floating;
+    ((TestPlugin*)p->plugin_data)->guiCreated = 1;
+    return true;
+}
+static void gui_destroy(const clap_plugin_t* p) { ((TestPlugin*)p->plugin_data)->guiCreated = 0; }
+static bool gui_set_scale(const clap_plugin_t* p, double s) { (void)p; (void)s; return true; }
+static bool gui_get_size(const clap_plugin_t* p, uint32_t* w, uint32_t* h) { (void)p; *w = 320; *h = 200; return true; }
+static bool gui_can_resize(const clap_plugin_t* p) { (void)p; return true; }
+static bool gui_hints(const clap_plugin_t* p, clap_gui_resize_hints_t* h) { (void)p; (void)h; return false; }
+static bool gui_adjust(const clap_plugin_t* p, uint32_t* w, uint32_t* h) { (void)p; (void)w; (void)h; return true; }
+static bool gui_set_size(const clap_plugin_t* p, uint32_t w, uint32_t h) { (void)p; (void)w; (void)h; return true; }
+static bool gui_set_parent(const clap_plugin_t* p, const clap_window_t* w) {
+    TestPlugin* t = (TestPlugin*)p->plugin_data;
+    t->parent = w->ptr;
+    return t->guiCreated && w->ptr != NULL;
+}
+static bool gui_set_transient(const clap_plugin_t* p, const clap_window_t* w) { (void)p; (void)w; return false; }
+static void gui_suggest_title(const clap_plugin_t* p, const char* title) { (void)p; (void)title; }
+static bool gui_show(const clap_plugin_t* p) {
+    TestPlugin* t = (TestPlugin*)p->plugin_data;
+    const clap_host_gui_t* hg = (const clap_host_gui_t*)t->host->get_extension(t->host, CLAP_EXT_GUI);
+    const clap_host_params_t* hp = (const clap_host_params_t*)t->host->get_extension(t->host, CLAP_EXT_PARAMS);
+    if (hg) hg->request_resize(t->host, 400, 250);
+    t->pendingKnob = 1;
+    if (hp) hp->request_flush(t->host);
+    return true;
+}
+static bool gui_hide(const clap_plugin_t* p) { (void)p; return true; }
+static const clap_plugin_gui_t kGui = {gui_supported, gui_preferred, gui_create, gui_destroy, gui_set_scale,
+                                       gui_get_size, gui_can_resize, gui_hints, gui_adjust, gui_set_size,
+                                       gui_set_parent, gui_set_transient, gui_suggest_title, gui_show, gui_hide};
 
 // ---- plugin ----
 static bool plugin_init(const clap_plugin_t* p) { (void)p; return true; }
@@ -111,6 +180,7 @@ static const void* plugin_extension(const clap_plugin_t* p, const char* id) {
     if (!strcmp(id, CLAP_EXT_AUDIO_PORTS)) return &kPorts;
     if (!t->invert && !strcmp(id, CLAP_EXT_PARAMS)) return &kParams;
     if (!t->invert && !strcmp(id, CLAP_EXT_STATE)) return &kState;
+    if (!t->invert && !strcmp(id, CLAP_EXT_GUI)) return &kGui;
     return NULL;
 }
 static void plugin_main_thread(const clap_plugin_t* p) { (void)p; }
