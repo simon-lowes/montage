@@ -301,6 +301,32 @@ private slots:
         QCOMPARE(q.active()->audioTracks[0], s.audioTracks[0]);
     }
 
+    void renderClipAudioBakesEffects() {
+        std::string wav = path("render-src.wav");
+        writeWav(wav, 48000, 4.0, 0.5f, 0.5f);
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        MediaItem m = probeOrFail(p, wav);
+        p.media.push_back(m);
+        auto r = edit::placeMedia(p, s, m.id, 30, 0, 60, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        QVERIFY(r.ok);
+        Clip* c = nullptr;
+        for (Id id : r.created)
+            if (auto loc = edit::locate(s, id); loc && loc->track.kind == TrackKind::Audio) c = edit::clipById(s, id);
+        QVERIFY(c);
+        Effect lim = makeEffect(p, "limiter");
+        lim.params["ceiling_db"] = -12.0;
+        c->effects.push_back(lim);
+        c->audio.params["gain_db"] = -6.0;  // volume stays live: not baked
+        std::string err;
+        const std::string out = path("rendered.wav");
+        QVERIFY2(renderClipAudio(p, s, c->id, out, &err), err.c_str());
+        AudioBufferPtr baked = decodeAudio(out, 48000, &err);
+        QVERIFY(baked);
+        QVERIFY(std::abs(baked->frames() - 96000) < 100);  // 60 frames at 30 fps = 2 s
+        QVERIFY(std::fabs(baked->samples[48000 * 2] - 0.2512f) < 0.005f);
+    }
+
     void mixerGainPanMuteAndFades() {
         std::string wav = path("mix.wav");
         writeWav(wav, 48000, 2.0, 0.5f, 0.5f);

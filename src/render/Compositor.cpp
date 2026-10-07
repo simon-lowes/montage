@@ -596,27 +596,39 @@ constexpr int kPluginBlock = 4096;
 
 namespace {
 // Runs a third-party plugin over an interleaved stereo block.
+}  // namespace
+
+// Loads the effect's plugin (tried once) and keeps it activated at `sr`; true if it was just loaded.
+bool AudioMixer::ensurePlugin(State& st, const Effect& e, double sr) {
+    if (st.plugin && st.pluginRate != sr) {
+        st.pluginRate = sr;
+        if (!st.plugin->activate(sr, kPluginBlock)) st.plugin.reset();
+    }
+    if (st.plugin || st.pluginFailed) return false;
+    // A missing or broken plugin leaves the audio unprocessed.
+    st.pluginFailed = true;
+    if (auto d = plugins::Registry::instance().find(e.s("plugin_id")))
+        if (auto inst = plugins::instantiate(*d))
+            if (inst->activate(sr, kPluginBlock)) {
+                const std::string state = plugins::decodeState(e.s("state"));
+                if (!state.empty()) inst->loadState(state);
+                st.pluginState = e.s("state");
+                st.plugin = std::move(inst);
+                st.pluginRate = sr;
+                st.pluginFailed = false;
+                return true;
+            }
+    return false;
+}
+
+namespace {
 void processPlugin(AudioMixer::State& st, const Effect& e, double sr, FrameTime lt, bool paramsChanged, float* buf,
                    int frames) {
     if (st.plugin && st.pluginRate != sr) {
         st.pluginRate = sr;
         if (!st.plugin->activate(sr, kPluginBlock)) st.plugin.reset();
     }
-    if (!st.plugin && !st.pluginFailed) {
-        // Tried once per effect: a missing or broken plugin leaves the audio unprocessed.
-        st.pluginFailed = true;
-        if (auto d = plugins::Registry::instance().find(e.s("plugin_id")))
-            if (auto inst = plugins::instantiate(*d))
-                if (inst->activate(sr, kPluginBlock)) {
-                    const std::string state = plugins::decodeState(e.s("state"));
-                    if (!state.empty()) inst->loadState(state);
-                    st.pluginState = e.s("state");
-                    st.plugin = std::move(inst);
-                    st.pluginRate = sr;
-                    st.pluginFailed = false;
-                    paramsChanged = true;
-                }
-    }
+    if (AudioMixer::ensurePlugin(st, e, sr)) paramsChanged = true;
     if (!st.plugin) return;
     // Settings changed in the plugin's editor arrive as a new saved state.
     if (e.s("state") != st.pluginState) {
@@ -648,6 +660,11 @@ AudioMixer::~AudioMixer() = default;
 
 void AudioMixer::reset() {
     std::lock_guard lock(m_);
+    resetLocked();
+}
+
+void AudioMixer::resetLocked() {
+    nextStart_ = -1;
     // Plugins are expensive to load: keep them, clearing only their audio state.
     for (auto it = states_.begin(); it != states_.end();) {
         if (auto plugin = std::move(it->second->plugin)) {
@@ -747,138 +764,195 @@ void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameT
 void AudioMixer::mix(const Project& p, const Sequence& seq, int64_t start, int frames, float* out,
                      std::vector<MeterLevels>* trackLevels) {
     std::lock_guard lock(m_);
-    std::fill(out, out + size_t(frames) * 2, 0.0f);
+    if (start != nextStart_) {
+        // Not where the last block ended (a seek, or the first block): start the
+        // effects afresh, and fill plugin pipelines with the audio just before
+        // `start` so delay-compensated output is right from the first sample.
+        resetLocked();
+        if (const int pre = maxLatency(seq, seq.sampleRate); pre > 0) {
+            std::vector<float> scratch(size_t(pre) * 2);
+            mixInto(p, seq, start - pre, pre, scratch.data(), nullptr, 0);
+        }
+    }
+    nextStart_ = start + frames;
     mixInto(p, seq, start, frames, out, trackLevels, 0);
+}
+
+bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Track& track, int64_t start, int frames,
+                               double sr, int depth, float* trackBuf) {
+    const double fps = seq.fpsValue();
+    const int64_t end = start + frames;
+    std::vector<float> clipBuf(size_t(frames) * 2);
+    bool any = false;
+    for (const Clip& c : track.clips) {
+        if (!c.enabled) continue;
+        int64_t cs = int64_t(std::llround(c.start * sr / fps)), ce = int64_t(std::llround(c.end() * sr / fps));
+        // Transitions extend the playable range and add fades.
+        int64_t ps = cs, pe = ce;
+        int64_t fiS = 0, fiE = 0, foS = 0, foE = 0;
+        bool equalPowerIn = true, equalPowerOut = true;
+        for (const auto& tr : track.transitions) {
+            FrameTime a, b;
+            if (!edit::transitionRange(track, tr, a, b)) continue;
+            int64_t as = int64_t(std::llround(a * sr / fps)), bs = int64_t(std::llround(b * sr / fps));
+            if (tr.clipB == c.id) {
+                ps = std::min(ps, as);
+                fiS = as;
+                fiE = bs;
+                equalPowerIn = tr.type != "crossfade_linear";
+            }
+            if (tr.clipA == c.id) {
+                pe = std::max(pe, bs);
+                foS = as;
+                foE = bs;
+                equalPowerOut = tr.type != "crossfade_linear";
+            }
+        }
+        // A chain with latency is fed its source that many samples ahead, so its
+        // output lines up with the picture; it starts that much before the clip.
+        const int64_t lat = chainLatency(c.effects, c.id, sr);
+        if (pe <= start || ps - lat >= end) continue;
+        const MediaItem* m = c.mediaId ? p.findMedia(c.mediaId) : nullptr;
+        if (!m) continue;
+        std::fill(clipBuf.begin(), clipBuf.end(), 0.0f);
+        const int64_t rs = start + lat;  // the source window fed to the chain
+        int64_t s0 = std::max(rs, ps), s1 = std::min(rs + frames, pe);
+        const double srcBase = c.sourceIn * sr / fps;
+        if (m->kind == MediaKind::Sequence) {
+            const Sequence* nested = p.findSequence(m->sequenceId);
+            if (!nested || depth >= kMaxDepth || nested->id == seq.id) continue;
+            // Mix the span of the nested sequence this block covers (at our
+            // rate), then resample it for the clip's speed and direction.
+            auto srcPos = [&](int64_t smp) {
+                return c.reverse ? srcBase + double(ce - 1 - smp) * c.speed : srcBase + double(smp - cs) * c.speed;
+            };
+            const double lo = s1 > s0 ? std::min(srcPos(s0), srcPos(s1 - 1)) : 0;
+            const double hi = s1 > s0 ? std::max(srcPos(s0), srcPos(s1 - 1)) : 0;
+            int64_t nStart = int64_t(std::floor(lo));
+            int64_t nLen = s1 > s0 ? int64_t(std::floor(hi)) - nStart + 2 : 0;
+            std::vector<float> nb(size_t(std::max<int64_t>(0, nLen)) * 2, 0.0f);
+            if (nLen > 0) mixInto(p, *nested, nStart, int(nLen), nb.data(), nullptr, depth + 1, int(sr));
+            for (int64_t smp = s0; smp < s1; ++smp) {
+                double rel = srcPos(smp) - double(nStart);
+                int64_t i = std::clamp<int64_t>(int64_t(rel), 0, nLen - 2);
+                float f = float(std::clamp(rel - double(i), 0.0, 1.0));
+                float* d = &clipBuf[size_t(smp - rs) * 2];
+                d[0] = nb[size_t(i) * 2] + (nb[size_t(i + 1) * 2] - nb[size_t(i) * 2]) * f;
+                d[1] = nb[size_t(i) * 2 + 1] + (nb[size_t(i + 1) * 2 + 1] - nb[size_t(i) * 2 + 1]) * f;
+            }
+        } else {
+            if (!m->hasAudio) continue;
+            AudioBufferPtr buf = nonBlocking_ ? MediaPool::instance().audioIfReady(m->path, int(sr))
+                                              : MediaPool::instance().audio(m->path, int(sr));
+            if (!buf || buf->samples.empty()) continue;
+            // Noise reduction and voice isolation work on the whole source (the
+            // original plays until the cleaned copy is ready in real time).
+            std::vector<const Effect*> sourceFx;
+            for (const Effect& e : c.effects)
+                if (e.enabled && isSourceAudioEffect(e.type)) sourceFx.push_back(&e);
+            if (!sourceFx.empty())
+                if (AudioBufferPtr clean = cleanedAudio(m->path, buf, sourceFx, !nonBlocking_)) buf = clean;
+            const int64_t n = buf->frames();
+            const float* src = buf->samples.data();
+            for (int64_t s = s0; s < s1; ++s) {
+                double pos = c.reverse ? srcBase + double(ce - 1 - s) * c.speed : srcBase + double(s - cs) * c.speed;
+                if (pos < 0 || pos >= double(n - 1)) continue;
+                int64_t i = int64_t(pos);
+                float f = float(pos - double(i));
+                float* d = &clipBuf[size_t(s - rs) * 2];
+                d[0] = src[i * 2] + (src[i * 2 + 2] - src[i * 2]) * f;
+                d[1] = src[i * 2 + 1] + (src[i * 2 + 3] - src[i * 2 + 1]) * f;
+            }
+        }
+        // Clip filters (stateful, processed over the whole block for continuity).
+        processChain(c.effects, c.id, FrameTime(double(start) * fps / sr) - c.start, sr, clipBuf.data(), frames);
+        // Clip volume / pan (keyframed, evaluated every 64 samples) and fades.
+        const int64_t o0 = std::max(start, ps), o1 = std::min(end, pe);
+        for (int64_t s = o0; s < o1; s += 64) {
+            int64_t e2 = std::min(o1, s + 64);
+            FrameTime lt = FrameTime(std::floor(double(s) * fps / sr)) - c.start;
+            float g = dbToLin(c.audio.p("gain_db", lt, 0));
+            float pl, pr;
+            panGains(c.audio.p("pan", lt, 0), pl, pr);
+            for (int64_t k = s; k < e2; ++k) {
+                float fade = 1;
+                if (fiE > fiS && k < fiE) {
+                    double u = std::clamp(double(k - fiS) / double(fiE - fiS), 0.0, 1.0);
+                    fade *= equalPowerIn ? float(std::sin(u * M_PI / 2)) : float(u);
+                }
+                if (foE > foS && k >= foS) {
+                    double u = std::clamp(double(k - foS) / double(foE - foS), 0.0, 1.0);
+                    fade *= equalPowerOut ? float(std::cos(u * M_PI / 2)) : float(1 - u);
+                }
+                float* d = &clipBuf[size_t(k - start) * 2];
+                float* tb = &trackBuf[size_t(k - start) * 2];
+                tb[0] += d[0] * g * pl * fade;
+                tb[1] += d[1] * g * pr * fade;
+            }
+        }
+        any = true;
+    }
+    return any;
+}
+
+int AudioMixer::chainLatency(const std::vector<Effect>& chain, Id owner, double sr) {
+    int total = 0;
+    for (const Effect& e : chain) {
+        if (!e.enabled || e.type != "plugin") continue;
+        auto& st = states_[{owner, e.id}];
+        if (!st) st = std::make_unique<State>();
+        ensurePlugin(*st, e, sr);
+        if (st->plugin) total += std::max(0, st->plugin->latencySamples());
+    }
+    return total;
+}
+
+int AudioMixer::maxLatency(const Sequence& seq, double sr) {
+    int master = chainLatency(seq.masterEffects, seq.id, sr), bus = 0, track = 0;
+    for (const Bus& b : seq.buses) bus = std::max(bus, chainLatency(b.effects, b.id, sr));
+    for (const Track& t : seq.audioTracks) {
+        int clip = 0;
+        for (const Clip& c : t.clips) clip = std::max(clip, chainLatency(c.effects, c.id, sr));
+        track = std::max(track, clip + chainLatency(t.effects, t.id, sr));
+    }
+    return master + bus + track;
 }
 
 void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, int frames, float* out,
                          std::vector<MeterLevels>* trackLevels, int depth, int rate) {
     const double sr = rate > 0 ? rate : seq.sampleRate;
     const double fps = seq.fpsValue();
-    const int64_t end = start + frames;
     bool anySolo = std::any_of(seq.audioTracks.begin(), seq.audioTracks.end(), [](const Track& t) { return t.solo; });
     if (trackLevels && depth == 0) trackLevels->assign(seq.audioTracks.size(), MeterLevels{});
-    std::vector<float> trackBuf(size_t(frames) * 2), clipBuf(size_t(frames) * 2);
-    const FrameTime blockFrame = FrameTime(double(start) * fps / sr);  // keyframe time of track, bus and master effects
-    // Buses: tracks routed to them are summed here first.
+    auto frameAt = [&](int64_t sample) { return FrameTime(double(sample) * fps / sr); };
+    // Delay compensation: each stage is fed ahead by the latency of the stages
+    // after it, so everything lines up at the output. The master chain gets the
+    // mix of [start + Lm, ...), a bus that of [start + Lm + Lb, ...), and a track
+    // its clips at [start + Lm + Lb + Lt, ...).
+    const int64_t masterLat = chainLatency(seq.masterEffects, seq.id, sr);
+    std::vector<float> master(size_t(frames) * 2, 0.0f);
     std::map<Id, std::vector<float>> busBufs;
-    for (const Bus& b : seq.buses) busBufs[b.id].assign(size_t(frames) * 2, 0.0f);
-    std::fill(out, out + size_t(frames) * 2, 0.0f);
-
+    std::map<Id, int64_t> busLat;
+    for (const Bus& b : seq.buses) {
+        busBufs[b.id].assign(size_t(frames) * 2, 0.0f);
+        busLat[b.id] = chainLatency(b.effects, b.id, sr);
+    }
+    std::vector<float> trackBuf(size_t(frames) * 2);
     for (size_t ti = 0; ti < seq.audioTracks.size(); ++ti) {
         const Track& track = seq.audioTracks[ti];
         if (track.muted || (anySolo && !track.solo)) continue;
+        auto bus = track.output ? busBufs.find(track.output) : busBufs.end();
+        const int64_t downstream = masterLat + (bus != busBufs.end() ? busLat[bus->first] : 0);
+        const int64_t trackLat = chainLatency(track.effects, track.id, sr);
         std::fill(trackBuf.begin(), trackBuf.end(), 0.0f);
-        bool any = false;
-        for (const Clip& c : track.clips) {
-            if (!c.enabled) continue;
-            int64_t cs = int64_t(std::llround(c.start * sr / fps)), ce = int64_t(std::llround(c.end() * sr / fps));
-            // Transitions extend the playable range and add fades.
-            int64_t ps = cs, pe = ce;
-            int64_t fiS = 0, fiE = 0, foS = 0, foE = 0;
-            bool equalPowerIn = true, equalPowerOut = true;
-            for (const auto& tr : track.transitions) {
-                FrameTime a, b;
-                if (!edit::transitionRange(track, tr, a, b)) continue;
-                int64_t as = int64_t(std::llround(a * sr / fps)), bs = int64_t(std::llround(b * sr / fps));
-                if (tr.clipB == c.id) {
-                    ps = std::min(ps, as);
-                    fiS = as;
-                    fiE = bs;
-                    equalPowerIn = tr.type != "crossfade_linear";
-                }
-                if (tr.clipA == c.id) {
-                    pe = std::max(pe, bs);
-                    foS = as;
-                    foE = bs;
-                    equalPowerOut = tr.type != "crossfade_linear";
-                }
-            }
-            if (pe <= start || ps >= end) continue;
-            const MediaItem* m = c.mediaId ? p.findMedia(c.mediaId) : nullptr;
-            if (!m) continue;
-            std::fill(clipBuf.begin(), clipBuf.end(), 0.0f);
-            int64_t s0 = std::max(start, ps), s1 = std::min(end, pe);
-            const double srcBase = c.sourceIn * sr / fps;
-            if (m->kind == MediaKind::Sequence) {
-                const Sequence* nested = p.findSequence(m->sequenceId);
-                if (!nested || depth >= kMaxDepth || nested->id == seq.id) continue;
-                // Mix the span of the nested sequence this block covers (at our
-                // rate), then resample it for the clip's speed and direction.
-                auto srcPos = [&](int64_t smp) {
-                    return c.reverse ? srcBase + double(ce - 1 - smp) * c.speed : srcBase + double(smp - cs) * c.speed;
-                };
-                double lo = std::min(srcPos(s0), srcPos(s1 - 1)), hi = std::max(srcPos(s0), srcPos(s1 - 1));
-                int64_t nStart = int64_t(std::floor(lo));
-                int64_t nLen = int64_t(std::floor(hi)) - nStart + 2;
-                std::vector<float> nb(size_t(nLen) * 2, 0.0f);
-                mixInto(p, *nested, nStart, int(nLen), nb.data(), nullptr, depth + 1, int(sr));
-                for (int64_t smp = s0; smp < s1; ++smp) {
-                    double rel = srcPos(smp) - double(nStart);
-                    int64_t i = std::clamp<int64_t>(int64_t(rel), 0, nLen - 2);
-                    float f = float(std::clamp(rel - double(i), 0.0, 1.0));
-                    float* d = &clipBuf[size_t(smp - start) * 2];
-                    d[0] = nb[size_t(i) * 2] + (nb[size_t(i + 1) * 2] - nb[size_t(i) * 2]) * f;
-                    d[1] = nb[size_t(i) * 2 + 1] + (nb[size_t(i + 1) * 2 + 1] - nb[size_t(i) * 2 + 1]) * f;
-                }
-            } else {
-                if (!m->hasAudio) continue;
-                AudioBufferPtr buf = nonBlocking_ ? MediaPool::instance().audioIfReady(m->path, int(sr))
-                                                  : MediaPool::instance().audio(m->path, int(sr));
-                if (!buf || buf->samples.empty()) continue;
-                // Noise reduction and voice isolation work on the whole source (the
-                // original plays until the cleaned copy is ready in real time).
-                std::vector<const Effect*> sourceFx;
-                for (const Effect& e : c.effects)
-                    if (e.enabled && isSourceAudioEffect(e.type)) sourceFx.push_back(&e);
-                if (!sourceFx.empty())
-                    if (AudioBufferPtr clean = cleanedAudio(m->path, buf, sourceFx, !nonBlocking_)) buf = clean;
-                const int64_t n = buf->frames();
-                const float* src = buf->samples.data();
-                for (int64_t s = s0; s < s1; ++s) {
-                    double pos = c.reverse ? srcBase + double(ce - 1 - s) * c.speed : srcBase + double(s - cs) * c.speed;
-                    if (pos < 0 || pos >= double(n - 1)) continue;
-                    int64_t i = int64_t(pos);
-                    float f = float(pos - double(i));
-                    float* d = &clipBuf[size_t(s - start) * 2];
-                    d[0] = src[i * 2] + (src[i * 2 + 2] - src[i * 2]) * f;
-                    d[1] = src[i * 2 + 1] + (src[i * 2 + 3] - src[i * 2 + 1]) * f;
-                }
-            }
-            // Clip filters (stateful, processed over the whole block for continuity).
-            processChain(c.effects, c.id, FrameTime(double(start) * fps / sr) - c.start, sr, clipBuf.data(), frames);
-            // Clip volume / pan (keyframed, evaluated every 64 samples) and fades.
-            for (int64_t s = s0; s < s1; s += 64) {
-                int64_t e2 = std::min(s1, s + 64);
-                FrameTime lt = FrameTime(std::floor(double(s) * fps / sr)) - c.start;
-                float g = dbToLin(c.audio.p("gain_db", lt, 0));
-                float pl, pr;
-                panGains(c.audio.p("pan", lt, 0), pl, pr);
-                for (int64_t k = s; k < e2; ++k) {
-                    float fade = 1;
-                    if (fiE > fiS && k < fiE) {
-                        double u = std::clamp(double(k - fiS) / double(fiE - fiS), 0.0, 1.0);
-                        fade *= equalPowerIn ? float(std::sin(u * M_PI / 2)) : float(u);
-                    }
-                    if (foE > foS && k >= foS) {
-                        double u = std::clamp(double(k - foS) / double(foE - foS), 0.0, 1.0);
-                        fade *= equalPowerOut ? float(std::cos(u * M_PI / 2)) : float(1 - u);
-                    }
-                    float* d = &clipBuf[size_t(k - start) * 2];
-                    float* tb = &trackBuf[size_t(k - start) * 2];
-                    tb[0] += d[0] * g * pl * fade;
-                    tb[1] += d[1] * g * pr * fade;
-                }
-            }
-            any = true;
-        }
+        const bool any = mixTrackClips(p, seq, track, start + downstream + trackLat, frames, sr, depth, trackBuf.data());
         // Track inserts keep running without clips, so reverb and delay tails ring out.
         if (!any && track.effects.empty()) continue;
-        if (!track.effects.empty()) processChain(track.effects, track.id, blockFrame, sr, trackBuf.data(), frames);
+        if (!track.effects.empty())
+            processChain(track.effects, track.id, frameAt(start + downstream + trackLat), sr, trackBuf.data(), frames);
         float tg = dbToLin(track.volumeDb), tl, tr;
         panGains(track.pan, tl, tr);
-        auto bus = track.output ? busBufs.find(track.output) : busBufs.end();
-        float* dest = bus != busBufs.end() ? bus->second.data() : out;
+        float* dest = bus != busBufs.end() ? bus->second.data() : master.data();
         MeterLevels lv;
         for (int i = 0; i < frames; ++i) {
             float l = trackBuf[size_t(i) * 2] * tg * tl, r = trackBuf[size_t(i) * 2 + 1] * tg * tr;
@@ -891,20 +965,18 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
     }
     for (const Bus& b : seq.buses) {
         std::vector<float>& bb = busBufs[b.id];
-        if (!b.effects.empty()) processChain(b.effects, b.id, blockFrame, sr, bb.data(), frames);
+        if (!b.effects.empty()) processChain(b.effects, b.id, frameAt(start + masterLat + busLat[b.id]), sr, bb.data(), frames);
         if (b.muted) continue;
         float g = dbToLin(b.volumeDb), bl, br;
         panGains(b.pan, bl, br);
         for (int i = 0; i < frames; ++i) {
-            out[i * 2] += bb[size_t(i) * 2] * g * bl;
-            out[i * 2 + 1] += bb[size_t(i) * 2 + 1] * g * br;
+            master[size_t(i) * 2] += bb[size_t(i) * 2] * g * bl;
+            master[size_t(i) * 2 + 1] += bb[size_t(i) * 2 + 1] * g * br;
         }
     }
-    if (!seq.masterEffects.empty()) processChain(seq.masterEffects, seq.id, blockFrame, sr, out, frames);
-    if (seq.masterVolumeDb != 0) {
-        const float g = dbToLin(seq.masterVolumeDb);
-        for (int i = 0; i < frames * 2; ++i) out[i] *= g;
-    }
+    if (!seq.masterEffects.empty()) processChain(seq.masterEffects, seq.id, frameAt(start + masterLat), sr, master.data(), frames);
+    const float g = dbToLin(seq.masterVolumeDb);
+    for (int i = 0; i < frames * 2; ++i) out[i] = master[size_t(i)] * g;
 }
 
 }  // namespace montage

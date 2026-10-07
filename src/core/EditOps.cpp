@@ -1,5 +1,7 @@
 #include "EditOps.h"
 
+#include "ProjectIO.h"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -1033,6 +1035,35 @@ bool matchSequenceToMedia(Sequence& s, const MediaItem& m) {
 
 // ---------------------------------------------------------------------------
 // Nesting
+
+Result replaceWithRender(Sequence& s, Id clipId, Id media) {
+    Clip* c = clipById(s, clipId);
+    if (!c) return Result::fail("No such clip");
+    if (c->unrendered.empty()) c->unrendered = clipToJsonString(*c);
+    c->mediaId = media;
+    c->sourceIn = 0;
+    c->speed = 1;
+    c->reverse = false;
+    c->effects.clear();
+    return {};
+}
+
+Result restoreUnrendered(Sequence& s, Id clipId) {
+    Clip* c = clipById(s, clipId);
+    if (!c || c->unrendered.empty()) return Result::fail("This clip was not rendered");
+    Clip orig;
+    if (!clipFromJsonString(c->unrendered, orig)) return Result::fail("The original clip could not be read");
+    // Trims since rendering moved sourceIn along the rendered file, which starts where the original did.
+    const double trimmed = c->sourceIn;
+    c->mediaId = orig.mediaId;
+    c->speed = orig.speed;
+    c->reverse = orig.reverse;
+    c->sourceIn = orig.reverse ? orig.sourceIn + (double(orig.duration) - double(c->duration) - trimmed) * orig.speed
+                               : orig.sourceIn + trimmed * orig.speed;
+    c->effects = orig.effects;
+    c->unrendered.clear();
+    return {};
+}
 
 std::vector<Effect>* effectChain(Sequence& s, Id owner, FrameTime* origin) {
     if (origin) *origin = 0;

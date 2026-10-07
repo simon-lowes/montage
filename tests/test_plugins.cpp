@@ -85,7 +85,7 @@ private slots:
 
     void findsPluginFiles() {
         auto files = findPluginFiles(Format::Clap, {kClapDir.toStdString()});
-        QCOMPARE(files.size(), size_t(3));  // good, hang, crash
+        QCOMPARE(files.size(), size_t(4));  // good, hang, crash, latency
         auto good = findPluginFiles(Format::Clap, {clapDir("good")});
         QCOMPARE(good.size(), size_t(1));
         QVERIFY(QString::fromStdString(good[0]).endsWith("MontageTestPlugins.clap"));
@@ -430,6 +430,102 @@ private slots:
         inst->process(ch2, 2, 64);  // still runs after a reset
     }
 #endif
+
+    void pluginDelayCompensation() {
+        Registry& reg = Registry::instance();
+        isolate(reg, path("cache-latency.json"), {clapDir("latency")});
+        reg.scan();
+        auto d = reg.find("clap:org.montage.test.delay64");
+        QVERIFY(d.has_value());
+        {
+            auto inst = instantiate(*d);
+            QVERIFY(inst && inst->activate(48000, 512));
+            QCOMPARE(inst->latencySamples(), 64);
+        }
+
+        // A clip of constant 0.5 starting at 1 s (sample 48000).
+        const std::string wav = path("step.wav").toStdString();
+        writeWav(wav, 48000, 2.0, 0.5f);
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        MediaItem m;
+        m.id = p.newId();
+        std::string err;
+        QVERIFY2(probeMedia(wav, m, &err), err.c_str());
+        p.media.push_back(m);
+        const FrameTime at = FrameTime(std::llround(s.fpsValue()));
+        QVERIFY(edit::placeMedia(p, s, m.id, at, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Clip* clip = &s.audioTracks[0].clips[0];
+        auto delay = [&] {
+            auto e = makePluginEffect(p, *d, &err);
+            return *e;
+        };
+        // Where the step appears in a fresh mix from 47900, and the level after a seek into the clip.
+        auto stepAt = [&](int64_t from) {
+            AudioMixer mixer;
+            std::vector<float> out(400 * 2);
+            mixer.mix(p, s, from, 400, out.data());
+            for (int i = 0; i < 400; ++i)
+                if (out[size_t(i) * 2] > 0.25f) return from + i;
+            return int64_t(-1);
+        };
+        auto levelAfterSeek = [&] {
+            AudioMixer mixer;
+            std::vector<float> out(64 * 2);
+            mixer.mix(p, s, 60000, 64, out.data());
+            return out[0];
+        };
+        QCOMPARE(stepAt(47900), int64_t(48000));  // reference: no plugins
+
+        // On the clip, a track, a bus and the master, alone and all at once: the
+        // step stays at the clip start, and audio after a seek is right at once.
+        clip->effects.push_back(delay());
+        QCOMPARE(stepAt(47900), int64_t(48000));
+        QCOMPARE(levelAfterSeek(), 0.5f);
+        clip->effects.clear();
+        s.audioTracks[0].effects.push_back(delay());
+        QCOMPARE(stepAt(47900), int64_t(48000));
+        QCOMPARE(levelAfterSeek(), 0.5f);
+        Bus b;
+        b.id = p.newId();
+        b.effects.push_back(delay());
+        s.buses.push_back(b);
+        s.audioTracks[0].output = b.id;
+        QCOMPARE(stepAt(47900), int64_t(48000));
+        s.masterEffects.push_back(delay());
+        clip = &s.audioTracks[0].clips[0];
+        clip->effects.push_back(delay());
+        clip->effects.push_back(delay());  // 5 plugins, 320 samples in all
+        QCOMPARE(stepAt(47900), int64_t(48000));
+        QCOMPARE(levelAfterSeek(), 0.5f);
+
+        // A track without plugins stays in line with one that has them.
+        Track a2 = s.audioTracks[0];
+        a2.id = p.newId();
+        a2.effects.clear();
+        a2.output = 0;
+        for (Clip& c : a2.clips) {
+            c.id = p.newId();
+            c.effects.clear();
+            c.linkGroup = 0;
+        }
+        s.audioTracks.push_back(a2);
+        {
+            AudioMixer mixer;
+            std::vector<float> out(400 * 2);
+            mixer.mix(p, s, 47900, 400, out.data());
+            QVERIFY(std::fabs(out[99 * 2]) < 1e-6f);               // silence before the clip on both
+            QVERIFY(std::fabs(out[100 * 2] - 1.0f) < 0.01f);       // both tracks together, exactly at the start
+        }
+        // Contiguous blocks after the first need no priming and stay aligned.
+        {
+            AudioMixer mixer;
+            std::vector<float> a(100 * 2), bb(300 * 2);
+            mixer.mix(p, s, 47800, 100, a.data());
+            mixer.mix(p, s, 47900, 300, bb.data());
+            QVERIFY(std::fabs(bb[99 * 2]) < 1e-6f && std::fabs(bb[100 * 2] - 1.0f) < 0.01f);
+        }
+    }
 
     void pluginEffectRunsInTheMixer() {
         // The mixer finds plugins through the shared registry.

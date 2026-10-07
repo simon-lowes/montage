@@ -40,6 +40,8 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Clip gain and pan, both keyframeable
 - Track faders, pan, mute and solo in a mixer panel
 - Insert effects on audio tracks, buses (submixes) and the master, including plugins. Use a strip's FX button to edit them in the Inspector, route tracks to buses from the strip's output menu, and add buses with + Bus. Track effects keep running past the last clip, so reverb and echo tails ring out.
+- Plugin delay compensation: the latency plugins report is compensated on clips, tracks, buses and the master, so everything stays in sync with the picture and with other tracks, including straight after a seek.
+- Render and Replace bakes an audio clip's effects into a new audio file to save CPU, and Restore Unrendered brings the original back (both on the clip's right-click menu).
 - Peak meters with hold and clip indicators
 - Effects: 3-band EQ, compressor, limiter, high/low-pass, delay
 - Third-party audio plugins: VST3 and CLAP plugins run as clip effects. Their parameters are keyframeable and their settings are saved in the project. The Effects browser lists them by vendor, and Tools › Audio Plugins shows every plugin found and its status. LV2 and Audio Unit plugins are listed; hosting them is on the roadmap.
@@ -186,4 +188,4 @@ Notes on the design:
 
 ## Roadmap
 
-Phase 2 is ranked in [`docs/research/phase2-roadmap.md`](docs/research/phase2-roadmap.md) and tracked in [`PROGRESS.md`](PROGRESS.md). Next up: track and bus effect chains, Audio Unit and LV2 hosting, OCIO/ACES and HDR, multicam, a GPU compositor, tracking, optical-flow retiming and FCP XML interchange.
+Phase 2 is ranked in [`docs/research/phase2-roadmap.md`](docs/research/phase2-roadmap.md) and tracked in [`PROGRESS.md`](PROGRESS.md). Next up: Audio Unit and LV2 hosting, OCIO/ACES and HDR, multicam, a GPU compositor, tracking, optical-flow retiming and FCP XML interchange.

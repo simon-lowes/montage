@@ -126,6 +126,7 @@ struct Clip {
     Effect motion;               // fixed "transform" attributes (video clips)
     Effect audio;                // fixed "volume" attributes (audio clips)
     std::vector<Effect> effects; // filter stack, applied in order
+    std::string unrendered;      // after Render and Replace: the clip as it was (JSON), for Restore
 
     FrameTime end() const { return start + duration; }
     bool contains(FrameTime t) const { return t >= start && t < end(); }

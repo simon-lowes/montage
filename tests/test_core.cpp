@@ -183,6 +183,53 @@ private slots:
         QVERIFY(captionsFromTranscripts(p, s).empty());
     }
 
+    void renderAndReplaceBookkeeping() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        Clip c;
+        c.id = p.newId();
+        c.mediaId = 41;
+        c.start = 100;
+        c.duration = 50;
+        c.sourceIn = 20;
+        c.speed = 2;
+        c.effects.push_back(makeEffect(p, "limiter"));
+        s.audioTracks[0].clips.push_back(c);
+        QVERIFY(edit::replaceWithRender(s, c.id, 77).ok);
+        Clip* r = edit::clipById(s, c.id);
+        QCOMPARE(r->mediaId, Id(77));
+        QCOMPARE(r->sourceIn, 0.0);
+        QCOMPARE(r->speed, 1.0);
+        QVERIFY(r->effects.empty());
+        QVERIFY(!r->unrendered.empty());
+        // Saved with the project.
+        Project q;
+        QVERIFY(projectFromJson(projectToJson(p), q));
+        QCOMPARE(q.active()->audioTracks[0].clips[0].unrendered, r->unrendered);
+        // Trim 10 frames off the head of the rendered clip, then restore: the
+        // original source moves on by 10 frames at its speed of 2.
+        r->start += 10;
+        r->duration -= 10;
+        r->sourceIn = 10;
+        QVERIFY(edit::restoreUnrendered(s, c.id).ok);
+        r = edit::clipById(s, c.id);
+        QCOMPARE(r->mediaId, Id(41));
+        QCOMPARE(r->sourceIn, 40.0);
+        QCOMPARE(r->speed, 2.0);
+        QCOMPARE(r->effects.size(), size_t(1));
+        QVERIFY(r->unrendered.empty());
+        QVERIFY(!edit::restoreUnrendered(s, c.id).ok);
+        // Reversed clips count trims from the other end of the source.
+        r->reverse = true;
+        QVERIFY(edit::replaceWithRender(s, c.id, 78).ok);
+        r = edit::clipById(s, c.id);
+        r->duration -= 5;  // trim 5 frames off the tail
+        QVERIFY(edit::restoreUnrendered(s, c.id).ok);
+        r = edit::clipById(s, c.id);
+        QCOMPARE(r->sourceIn, 40.0 + 5 * 2);
+        QVERIFY(r->reverse);
+    }
+
     void editingByTranscript() {
         Project p = makeDefaultProject();
         Sequence& s = *p.active();

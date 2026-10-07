@@ -12,6 +12,9 @@ constexpr int kProjectFormatVersion = 1;
 // Serialises to a JSON document. Media paths are stored absolute and also
 // relative to `projectPath`'s directory, so a project folder can be moved.
 std::string projectToJson(const Project& p, const std::string& projectPath = {});
+// One clip as JSON (as in project files).
+std::string clipToJsonString(const Clip& c);
+bool clipFromJsonString(const std::string& json, Clip& out);
 bool projectFromJson(const std::string& json, Project& out, std::string* error = nullptr,
                      const std::string& projectPath = {});
 

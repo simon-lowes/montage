@@ -51,6 +51,11 @@ using ExportProgress = std::function<void(double fraction, FrameTime frame)>;
 bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
                     const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed = nullptr);
 
+// Renders an audio clip's sound with its effects (not its volume, pan or
+// fades) to a 24-bit WAV, from its first frame to its last.
+bool renderClipAudio(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error,
+                     const ExportProgress& progress = {}, const std::atomic<bool>* cancel = nullptr);
+
 // Writes a single frame as PNG/JPEG/TIFF (by extension).
 bool exportStill(const Project& p, const Sequence& seq, FrameTime t, const std::string& path, std::string* error);
 

@@ -121,6 +121,7 @@ QJsonObject clipToJson(const Clip& c) {
     QJsonArray fx;
     for (const auto& e : c.effects) fx.append(effectToJson(e));
     if (!fx.isEmpty()) o["effects"] = fx;
+    if (!c.unrendered.empty()) o["unrendered"] = qs(c.unrendered);
     return o;
 }
 
@@ -143,6 +144,7 @@ Clip clipFromJson(const QJsonObject& o) {
     c.motion = effectFromJson(o.value("motion"));
     c.audio = effectFromJson(o.value("audio"));
     for (const auto& e : o.value("effects").toArray()) c.effects.push_back(effectFromJson(e));
+    c.unrendered = ss(o.value("unrendered"));
     return c;
 }
 
@@ -339,6 +341,17 @@ Sequence sequenceFromJson(const QJsonObject& o) {
 }
 
 }  // namespace
+
+std::string clipToJsonString(const Clip& c) {
+    return QJsonDocument(clipToJson(c)).toJson(QJsonDocument::Compact).toStdString();
+}
+
+bool clipFromJsonString(const std::string& json, Clip& out) {
+    const QJsonDocument doc = QJsonDocument::fromJson(QByteArray::fromStdString(json));
+    if (!doc.isObject()) return false;
+    out = clipFromJson(doc.object());
+    return true;
+}
 
 std::string projectToJson(const Project& p, const std::string& projectPath) {
     QDir base = projectPath.empty() ? QDir() : QFileInfo(qs(projectPath)).absoluteDir();

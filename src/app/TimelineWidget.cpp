@@ -1,6 +1,10 @@
 #include "TimelineWidget.h"
 
 #include <QApplication>
+#include <QDir>
+#include <QRegularExpression>
+#include <QStandardPaths>
+#include <QDateTime>
 #include <QContextMenuEvent>
 #include <QFileInfo>
 #include <QInputDialog>
@@ -18,6 +22,7 @@
 #include <utility>
 
 #include "EditorState.h"
+#include "render/Exporter.h"
 #include "Theme.h"
 #include "ThumbnailCache.h"
 #include "audio/PluginEffect.h"
@@ -1210,6 +1215,39 @@ void TimelineWidget::leaveEvent(QEvent* e) {
     QAbstractScrollArea::leaveEvent(e);
 }
 
+bool TimelineWidget::renderAndReplace(Id clip, QString* error) {
+    const Sequence* s = state_->sequence();
+    const Clip* c = s ? edit::clipById(*s, clip) : nullptr;
+    if (!c) return false;
+    // Next to the project when it has been saved, else in the app's data folder.
+    QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/Rendered Audio";
+    if (!state_->filePath().isEmpty()) {
+        const QFileInfo fi(state_->filePath());
+        dir = fi.absolutePath() + "/" + fi.completeBaseName() + " Rendered Audio";
+    }
+    QDir().mkpath(dir);
+    const QString base = QString::fromStdString(c->name).replace(QRegularExpression(QStringLiteral("[^\\w\\- ]")), "_");
+    const QString path = QStringLiteral("%1/%2 %3.wav").arg(dir, base.isEmpty() ? tr("Clip") : base,
+                                                            QDateTime::currentDateTime().toString("yyyyMMdd-hhmmss-zzz"));
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    std::string err;
+    const bool ok = renderClipAudio(state_->project(), *s, clip, path.toStdString(), &err);
+    QApplication::restoreOverrideCursor();
+    if (!ok) {
+        if (error) *error = QString::fromStdString(err);
+        state_->message(tr("Render failed: %1").arg(QString::fromStdString(err)), 6000);
+        return false;
+    }
+    QStringList errors;
+    const auto ids = state_->importFiles({path}, &errors, tr("Rendered Audio"));
+    if (ids.empty()) {
+        if (error) *error = errors.join('\n');
+        return false;
+    }
+    const Id media = ids.front();
+    return state_->apply(tr("Render and Replace"), [clip, media](Project&, Sequence& sq) { return edit::replaceWithRender(sq, clip, media); });
+}
+
 void TimelineWidget::contextMenuEvent(QContextMenuEvent* e) {
     Hit h = hitTest(e->pos());
     contextFrame_ = h.frame;
@@ -1218,6 +1256,19 @@ void TimelineWidget::contextMenuEvent(QContextMenuEvent* e) {
     if (h.kind == HitKind::ClipBody || h.kind == HitKind::ClipIn || h.kind == HitKind::ClipOut) {
         if (!state_->isSelected(h.clip)) state_->setSelection({h.clip});
         menu.addActions(clipActions_);
+        // Offline rendering of an audio clip's effects (CPU-heavy plugins).
+        if (h.track && h.track->kind == TrackKind::Audio)
+            if (const Clip* c = edit::clipById(*state_->sequence(), h.clip)) {
+                const Id id = h.clip;
+                if (!c->effects.empty()) {
+                    menu.addSeparator();
+                    menu.addAction(tr("Render and Replace"), this, [this, id] { renderAndReplace(id); });
+                }
+                if (!c->unrendered.empty())
+                    menu.addAction(tr("Restore Unrendered"), this, [this, id] {
+                        state_->apply(tr("Restore Unrendered"), [id](Project&, Sequence& s) { return edit::restoreUnrendered(s, id); });
+                    });
+            }
     } else if (h.kind == HitKind::Transition) {
         state_->selectTransition(h.transition);
         Id id = h.transition;

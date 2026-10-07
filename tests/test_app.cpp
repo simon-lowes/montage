@@ -38,6 +38,7 @@
 #include "core/EditOps.h"
 #include "core/Effects.h"
 #include "core/ProjectIO.h"
+#include "render/Compositor.h"
 #include "render/Exporter.h"
 
 using namespace montage;
@@ -518,6 +519,47 @@ private slots:
         QCOMPARE(state()->sequence()->audioTracks.at(0).output, Id(0));
         state()->undo();
         QVERIFY(state()->sequence()->buses.empty());
+    }
+
+    void renderAndReplaceInTheTimeline() {
+        state()->newProject();
+        auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        QVERIFY(state()->apply("Place", [media](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, media, 0, 0, 90, V1, A1, false);
+        }));
+        const Id clip = trackAt(*state()->sequence(), A1)->clips.at(0).id;
+        QVERIFY(state()->edit("Limiter", [clip](Project& p, Sequence& s) {
+            Effect e = makeEffect(p, "limiter");
+            e.params["ceiling_db"] = -20.0;
+            edit::clipById(s, clip)->effects.push_back(e);
+            return true;
+        }));
+        QString err;
+        QVERIFY2(timeline()->renderAndReplace(clip, &err), qPrintable(err));
+        const Clip* c = edit::clipById(*state()->sequence(), clip);
+        QVERIFY(c->mediaId != media);
+        QVERIFY(c->effects.empty());
+        const MediaItem* rendered = state()->project().findMedia(c->mediaId);
+        QVERIFY(rendered);
+        QCOMPARE(QString::fromStdString(rendered->bin), QString("Rendered Audio"));
+        // The rendered sound is limited to -20 dB.
+        AudioMixer mixer;
+        std::vector<float> out(48000 * 2);
+        mixer.mix(state()->project(), *state()->sequence(), 0, 48000, out.data());
+        float peak = 0;
+        for (float v : out) peak = std::max(peak, std::fabs(v));
+        QVERIFY2(peak > 0.05f && peak < 0.105f, qPrintable(QString::number(peak)));
+        // Undo, and Restore Unrendered.
+        state()->undo();
+        QCOMPARE(edit::clipById(*state()->sequence(), clip)->mediaId, media);
+        state()->redo();
+        QVERIFY(state()->apply("Restore", [clip](Project&, Sequence& s) { return edit::restoreUnrendered(s, clip); }));
+        c = edit::clipById(*state()->sequence(), clip);
+        QCOMPARE(c->mediaId, media);
+        QCOMPARE(c->effects.size(), size_t(1));
+        state()->newProject();
     }
 
     void crashRecoveryAndSnapshots() {

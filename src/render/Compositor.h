@@ -68,6 +68,7 @@ public:
     void setNonBlocking(bool on) { nonBlocking_ = on; }
 
     struct State;  // per clip/effect DSP state
+    static bool ensurePlugin(State& st, const Effect& e, double sr);
 
 private:
     // `rate` overrides the sequence's sample rate (nested sequences mix at the outer rate).
@@ -75,6 +76,14 @@ private:
                  std::vector<MeterLevels>* trackLevels, int depth, int rate = 0);
     // Runs an effect chain over an interleaved stereo block; DSP state is kept per (owner, effect).
     void processChain(const std::vector<Effect>& chain, Id owner, FrameTime lt, double sr, float* buf, int frames);
+    // Sums a track's clips over [start, start + frames) into trackBuf; false if none plays.
+    bool mixTrackClips(const Project& p, const Sequence& seq, const Track& track, int64_t start, int frames, double sr,
+                       int depth, float* trackBuf);
+    // Latency (samples) of a chain's plugins, loading them if needed; and the largest in a sequence.
+    int chainLatency(const std::vector<Effect>& chain, Id owner, double sr);
+    int maxLatency(const Sequence& seq, double sr);
+    void resetLocked();
+    int64_t nextStart_ = -1;  // where the next contiguous block starts
     std::map<std::pair<Id, Id>, std::unique_ptr<State>> states_;
     std::mutex m_;
     bool nonBlocking_ = false;

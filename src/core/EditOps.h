@@ -121,6 +121,13 @@ bool matchSequenceToMedia(Sequence& s, const MediaItem& m);
 std::vector<Effect>* effectChain(Sequence& s, Id owner, FrameTime* origin = nullptr);
 Effect* ownedEffect(Sequence& s, Id owner, Id effect, FrameTime* origin = nullptr);
 
+// Render and Replace: points an audio clip at `media` (its sound with its
+// effects baked in, from the clip's first frame), dropping the effects and
+// remembering the clip as it was. Restore puts the original back, keeping
+// trims made since.
+Result replaceWithRender(Sequence& s, Id clip, Id media);
+Result restoreUnrendered(Sequence& s, Id clip);
+
 Result makeCompound(Project& p, Sequence& s, const std::vector<Id>& ids, const std::string& name);
 
 }  // namespace montage::edit

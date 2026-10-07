@@ -42,6 +42,9 @@ public:
 
     QSize sizeHint() const override { return {900, 320}; }
 
+    // Bakes an audio clip's effects into a new audio file and points the clip at it (undoable).
+    bool renderAndReplace(montage::Id clip, QString* error = nullptr);
+
 signals:
     void toolChanged(montage::TimelineWidget::Tool tool);
     void clipActivated(montage::Id clip);  // double-click

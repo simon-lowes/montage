@@ -81,7 +81,10 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
   - VST3 editors through IPlugView and IPlugFrame, with a component handler for begin/perform/endEdit, and an IRunLoop for X11 editors.
   - The editor runs on its own instance, so its edits are undoable parameter changes (merged per drag) and its saved settings go into the effect. The playing instance reloads changed settings, and undo or Inspector edits update the editor.
   - Tested with protocol-only editors in the test CLAP and VST3 plugins.
-- [ ] 11. Track and bus effect chains, delay compensation, offline plugin rendering (L)
+- [x] 11. Track and bus effect chains, delay compensation, offline plugin rendering (L):
+  - Insert effects on audio tracks, buses and the master, with routing in the mixer and editing in the Inspector.
+  - Plugin delay compensation: each stage is fed ahead by the latency after it, and the graph pre-rolls after any seek so pipelines are primed. It is checked sample-exact with a 64-sample latency test plugin on every stage at once.
+  - Render and Replace and Restore Unrendered for audio clips.
 - [ ] 12. Audio Unit hosting on macOS (M)
 - [ ] 13. OCIO colour management, ACES 2.0, HDR export (L)
 - [ ] 14. Multicam (L)

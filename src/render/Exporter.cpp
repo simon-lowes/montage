@@ -7,6 +7,7 @@
 #include <cstdio>
 
 #include "Compositor.h"
+#include "core/EditOps.h"
 #include "Processing.h"
 #include "media/HwAccel.h"
 
@@ -528,6 +529,37 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
     // don't touch an existing file if we failed before writing to it.
     if (!ok && opened) std::remove(s.path.c_str());
     return ok;
+}
+
+bool renderClipAudio(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error,
+                     const ExportProgress& progress, const std::atomic<bool>* cancel) {
+    const Clip* c = edit::clipById(seq, clip);
+    if (!c) {
+        if (error) *error = "No such clip";
+        return false;
+    }
+    // The clip alone, at the start of an otherwise empty copy of the sequence.
+    Sequence alone = seq;
+    alone.videoTracks.assign(1, Track{});
+    alone.videoTracks[0].kind = TrackKind::Video;
+    alone.audioTracks.assign(1, Track{});
+    alone.audioTracks[0].kind = TrackKind::Audio;
+    alone.buses.clear();
+    alone.masterEffects.clear();
+    alone.masterVolumeDb = 0;
+    alone.captionTracks.clear();
+    Clip copy = *c;
+    copy.start = 0;
+    copy.linkGroup = 0;
+    copy.audio.params.clear();  // volume and pan stay live on the clip
+    alone.audioTracks[0].clips.push_back(copy);
+    ExportSettings st;
+    st.path = path;
+    st.videoCodec = "none";
+    st.audioCodec = "pcm_s24le";
+    st.in = 0;
+    st.out = copy.duration;
+    return exportSequence(p, alone, st, progress, cancel, error);
 }
 
 bool exportStill(const Project& p, const Sequence& seq, FrameTime t, const std::string& path, std::string* error) {
