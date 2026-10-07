@@ -36,6 +36,8 @@
 
 #include "AudioMeterWidget.h"
 #include "audio/PluginEffect.h"
+#include "media/HwAccel.h"
+#include "media/MediaPool.h"
 #include "EditorState.h"
 #include "EffectsBrowser.h"
 #include "ExportDialog.h"
@@ -431,6 +433,27 @@ void MainWindow::buildMenus() {
 
     // ---- Playback
     QMenu* play = menuBar()->addMenu(tr("&Playback"));
+    {
+        // Hardware decoding (on by default; MONTAGE_HWACCEL=off overrides the saved choice).
+        const bool hw = qEnvironmentVariable("MONTAGE_HWACCEL") != "off" &&
+                        appSettings().value("playback/hardwareDecoding", true).toBool();
+        setHwDecodeMode(hw ? HwDecodeMode::Auto : HwDecodeMode::Off);
+        QAction* a = add(play, tr("&Hardware Decoding"), QKeySequence(), [this](bool on) {
+            setHwDecodeMode(on ? HwDecodeMode::Auto : HwDecodeMode::Off);
+            appSettings().setValue("playback/hardwareDecoding", on);
+            MediaPool::instance().clear();  // reopen decoders with the new setting
+            syncProgram();
+            program_->seek(state_->playhead());
+            statusBar()->showMessage(on ? tr("Hardware decoding on: video decodes on the GPU or media engine where supported")
+                                        : tr("Hardware decoding off: all video decodes on the CPU"),
+                                     5000);
+        });
+        a->setCheckable(true);
+        a->setChecked(hw);
+        a->setToolTip(tr("Decode H.264, HEVC, VP9, AV1 and ProRes on the GPU or media engine "
+                         "(VideoToolbox, D3D11, NVDEC, VAAPI) where supported"));
+        play->addSeparator();
+    }
     add(play, tr("&Play / Pause"), QKeySequence(Qt::Key_Space), [this] { activeController()->togglePlay(); });
     add(play, tr("Shuttle &Reverse"), QKeySequence(Qt::Key_J), [this] { activeController()->shuttle(-1); });
     add(play, tr("&Stop"), QKeySequence(Qt::Key_K), [this] { activeController()->shuttle(0); });

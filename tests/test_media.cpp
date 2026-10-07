@@ -9,6 +9,7 @@
 #include "media/Analysis.h"
 #include "media/AudioSync.h"
 #include "media/Decoder.h"
+#include "media/HwAccel.h"
 #include "media/Loudness.h"
 #include "media/MediaPool.h"
 #include "render/Compositor.h"
@@ -307,6 +308,75 @@ private slots:
         Frame16Ptr b = MediaPool::instance().videoFrame(st.path, 10 / 30.0, 80, 45);
         QVERIFY(a && a == b);
         QCOMPARE(a->width, 80);
+    }
+
+    void hardwareDecodeAndEncode() {
+        // A 320x180 ramp, encoded in software.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320;
+        s.height = 180;
+        Clip c = makeGeneratorClip(p, "color", 30);
+        c.generator.params["color.r"].addKey(0, 0.0);
+        c.generator.params["color.r"].addKey(29, 1.0);
+        c.generator.params["color.g"] = 0.3;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, c);
+        ExportSettings st;
+        st.path = path("hw-ramp.mp4");
+        st.videoCodec = "libx264";
+        st.audioCodec = "none";
+        st.crf = 10;
+        st.preset = "ultrafast";
+        std::string err;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+
+        // Hardware decoding (when this machine has a device) gives the same
+        // pixels as software: H.264 decoding is bit exact.
+        auto frames = [&](HwDecodeMode mode, std::string* hw) {
+            setHwDecodeMode(mode);
+            VideoDecoder dec;
+            std::vector<Frame16Ptr> out;
+            if (!dec.open(st.path, &err)) return out;
+            for (int f : {0, 7, 15, 29, 3}) out.push_back(dec.frameAt(f / 30.0));
+            *hw = dec.hardware();
+            return out;
+        };
+        std::string swName, hwName;
+        auto sw = frames(HwDecodeMode::Off, &swName);
+        auto hw = frames(HwDecodeMode::Auto, &hwName);
+        setHwDecodeMode(HwDecodeMode::Auto);
+        QVERIFY(swName.empty());
+        qInfo("hardware decoder: %s", hwName.empty() ? "none (software)" : hwName.c_str());
+        QCOMPARE(sw.size(), size_t(5));
+        QCOMPARE(hw.size(), size_t(5));
+        for (size_t i = 0; i < sw.size(); ++i) {
+            QVERIFY(sw[i] && hw[i]);
+            QCOMPARE(hw[i]->width, sw[i]->width);
+            QVERIFY2(hw[i]->px == sw[i]->px, qPrintable(QString("frame %1 differs").arg(i)));
+        }
+        QCOMPARE(activeHwDecoders(), 0);  // slots are released when decoders close
+
+        // The hardware preset exports with this machine's encoder, or x264.
+        const ExportPreset* preset = findExportPreset("H.264 - Hardware");
+        QVERIFY(preset);
+        QVERIFY(findExportPreset("H.265 - Hardware"));
+        ExportSettings hs = preset->settings;
+        hs.path = path("hw-export.mp4");
+        hs.audioCodec = "none";
+        std::string used;
+        QVERIFY2(exportSequence(p, s, hs, nullptr, nullptr, &err, &used), err.c_str());
+        qInfo("hardware preset encoder: %s", used.c_str());
+        QVERIFY(!used.empty());
+        Project q;
+        MediaItem m = probeOrFail(q, hs.path);
+        QCOMPARE(m.width, 320);
+        QVERIFY(std::fabs(m.duration - 1.0) < 0.1);
+        VideoDecoder dec;
+        QVERIFY(dec.open(hs.path, &err));
+        Frame16Ptr f = dec.frameAt(15 / 30.0);
+        QVERIFY(f);
+        const float red = f->px[(size_t(90) * 320 + 160) * 4] / 65535.0f;
+        QVERIFY2(std::fabs(red - 15 / 29.0f) < 0.06f, qPrintable(QString::number(red)));
     }
 
     void importedVideoComposites() {

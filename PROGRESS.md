@@ -57,7 +57,7 @@ verified run.
 Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effort; S ≤ 2, M 2–6, L 6–12, XL > 12 person-weeks). Each item lands with tests and keeps CI and the Package workflow green.
 
 - [x] 1. Crash-safe project history and recovery (S): live recovery copy after each edit, crash detection via session locks, recovery dialog that keeps the project path, plugin safe mode, rolling timestamped snapshots.
-- [ ] 2. Hardware decode and encode (M)
+- [x] 2. Hardware decode and encode (M): per-platform hwaccel decode with software fallback per stream and a decoder cap, Playback toggle; hardware H.264/H.265 presets that pick the first working encoder and fall back to x264/x265.
 - [ ] 3. Audio plugin manager UI (S). Done: Audio Plugins window (status, blocklist with reasons, rescan, retry blocked), background scan at startup. To do: enable switches, rescan selected, search folders, scan log, parallel scan.
 - [ ] 4. Transcription engine: whisper.cpp + speaker labels (M)
 - [ ] 5. Caption tracks: generate, style, burn in, SRT/VTT/SCC export, CEA-608 (M)

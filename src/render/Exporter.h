@@ -12,7 +12,7 @@ namespace montage {
 
 struct ExportSettings {
     std::string path;
-    std::string videoCodec = "libx264";  // libx264, libx265, prores_ks, dnxhd, libvpx-vp9, libsvtav1, mjpeg, none
+    std::string videoCodec = "libx264";  // libx264, libx265, hw_h264, hw_hevc, prores_ks, dnxhd, libvpx-vp9, libsvtav1, mjpeg, none
     std::string audioCodec = "aac";      // aac, pcm_s16le, pcm_s24le, libopus, none
     int width = 0;                       // 0 = sequence size
     int height = 0;
@@ -41,8 +41,11 @@ const ExportPreset* findExportPreset(const std::string& name);
 
 using ExportProgress = std::function<void(double fraction, FrameTime frame)>;
 
+// videoCodec "hw_h264" / "hw_hevc" picks this machine's hardware encoder
+// (VideoToolbox, NVENC, Quick Sync, AMF, Media Foundation) and falls back to
+// x264 / x265; `encoderUsed` receives the encoder that ran.
 bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
-                    const std::atomic<bool>* cancel, std::string* error);
+                    const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed = nullptr);
 
 // Writes a single frame as PNG/JPEG/TIFF (by extension).
 bool exportStill(const Project& p, const Sequence& seq, FrameTime t, const std::string& path, std::string* error);

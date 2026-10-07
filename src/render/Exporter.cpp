@@ -8,6 +8,7 @@
 
 #include "Compositor.h"
 #include "Processing.h"
+#include "media/HwAccel.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -43,12 +44,18 @@ ExportPreset preset(std::string name, std::string ext, std::string desc, std::st
     return p;
 }
 
-AVPixelFormat defaultPixFmt(const ExportSettings& s, const AVCodec* codec) {
+bool hasSuffix(const std::string& s, const char* suffix) {
+    const size_t n = std::char_traits<char>::length(suffix);
+    return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
+}
+
+// `c` is the encoder that will run (hardware families already resolved).
+AVPixelFormat defaultPixFmt(const ExportSettings& s, const std::string& c) {
+    if (hasSuffix(c, "_qsv") || hasSuffix(c, "_mf")) return AV_PIX_FMT_NV12;
     if (!s.pixFmt.empty()) {
         AVPixelFormat f = av_get_pix_fmt(s.pixFmt.c_str());
         if (f != AV_PIX_FMT_NONE) return f;
     }
-    const std::string& c = s.videoCodec;
     if (c == "prores_ks") return s.alpha || s.profile.rfind("4444", 0) == 0 ? AV_PIX_FMT_YUVA444P10LE : AV_PIX_FMT_YUV422P10LE;
     if (c == "dnxhd") return (s.profile == "dnxhr_444") ? AV_PIX_FMT_YUV444P10LE
                              : (s.profile == "dnxhr_hqx") ? AV_PIX_FMT_YUV422P10LE
@@ -56,7 +63,6 @@ AVPixelFormat defaultPixFmt(const ExportSettings& s, const AVCodec* codec) {
     if (c == "mjpeg") return AV_PIX_FMT_YUVJ420P;
     if (c == "libvpx-vp9" && s.alpha) return AV_PIX_FMT_YUVA420P;
     if (c == "png") return AV_PIX_FMT_RGBA;
-    (void)codec;
     return AV_PIX_FMT_YUV420P;
 }
 
@@ -105,6 +111,11 @@ const std::vector<ExportPreset>& exportPresets() {
         v.push_back(preset("H.264 - High Quality", "mp4", "Mastering-grade H.264 (CRF 16), AAC 320 kbps", "libx264", "aac", 16, "slow"));
         v.push_back(preset("H.264 - YouTube / Vimeo", "mp4", "Web delivery, CRF 20", "libx264", "aac", 20, "medium"));
         v.push_back(preset("H.264 - Fast Draft", "mp4", "Quick review copy", "libx264", "aac", 28, "veryfast"));
+        v.push_back(preset("H.264 - Hardware", "mp4",
+                           "Fast export on the GPU / media engine (VideoToolbox, NVENC, Quick Sync, AMF); x264 if there is none",
+                           "hw_h264", "aac", 20, "medium"));
+        v.push_back(preset("H.265 - Hardware", "mp4", "Hardware HEVC (VideoToolbox, NVENC, Quick Sync, AMF); x265 if there is none",
+                           "hw_hevc", "aac", 22, "medium"));
         v.push_back(preset("H.265 / HEVC", "mp4", "Half the size of H.264 at similar quality", "libx265", "aac", 22, "medium"));
         v.push_back(preset("H.265 / HEVC 10-bit", "mp4", "10-bit HEVC for HDR-ready masters", "libx265", "aac", 20, "medium", "", "yuv420p10le"));
         v.push_back(preset("Apple ProRes 422 HQ", "mov", "Intermediate / mastering, 10-bit 4:2:2", "prores_ks", "pcm_s24le", 0, "", "hq"));
@@ -133,7 +144,7 @@ const ExportPreset* findExportPreset(const std::string& name) {
 namespace {
 
 bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
-                const std::atomic<bool>* cancel, std::string* error, bool& opened) {
+                const std::atomic<bool>* cancel, std::string* error, bool& opened, std::string* encoderUsed) {
     auto fail = [&](const std::string& msg) {
         if (error) *error = msg;
         return false;
@@ -157,8 +168,16 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     const int sr = s.sampleRate > 0 ? s.sampleRate : seq.sampleRate;
 
     if (wantVideo) {
-        const AVCodec* codec = avcodec_find_encoder_by_name(s.videoCodec.c_str());
-        if (!codec) return fail("Video encoder not available: " + s.videoCodec);
+        std::string c = s.videoCodec;
+        const bool hardware = c == "hw_h264" || c == "hw_hevc";
+        if (hardware) {
+            const std::string family = c.substr(3);
+            c = pickHwEncoder(family, W, H, fps.num, fps.den);
+            if (c.empty()) c = family == "hevc" ? "libx265" : "libx264";  // no hardware encoder here
+        }
+        if (encoderUsed) *encoderUsed = c;
+        const AVCodec* codec = avcodec_find_encoder_by_name(c.c_str());
+        if (!codec) return fail("Video encoder not available: " + c);
         o.vst = avformat_new_stream(o.oc, nullptr);
         o.vctx = avcodec_alloc_context3(codec);
         o.vctx->width = W;
@@ -166,19 +185,33 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         o.vctx->time_base = av_inv_q(fps);
         o.vctx->framerate = fps;
         o.vctx->sample_aspect_ratio = AVRational{1, 1};
-        o.vctx->pix_fmt = defaultPixFmt(s, codec);
+        o.vctx->pix_fmt = defaultPixFmt(s, c);
         o.vctx->gop_size = s.gop > 0 ? s.gop : std::max(1, int(std::lround(seq.fpsValue() * 2)));
         if (s.gop == 1) o.vctx->max_b_frames = 0;
         o.vctx->color_primaries = AVCOL_PRI_BT709;
         o.vctx->color_trc = AVCOL_TRC_BT709;
         o.vctx->colorspace = AVCOL_SPC_BT709;
-        o.vctx->color_range = s.videoCodec == "mjpeg" ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
+        o.vctx->color_range = c == "mjpeg" ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
         o.vctx->thread_count = 0;
         if (s.videoBitrate > 0) o.vctx->bit_rate = s.videoBitrate;
         if (o.oc->oformat->flags & AVFMT_GLOBALHEADER) o.vctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
         AVDictionary* opts = nullptr;
-        const std::string& c = s.videoCodec;
-        if (c == "libx264" || c == "libx265") {
+        const bool hwEncoder = hasSuffix(c, "_videotoolbox") || hasSuffix(c, "_nvenc") || hasSuffix(c, "_qsv") ||
+                               hasSuffix(c, "_amf") || hasSuffix(c, "_mf");
+        if (hwEncoder) {
+            // Hardware encoders are rate controlled: aim for a bitrate by pixel rate.
+            if (s.videoBitrate <= 0) {
+                const double bitsPerPixel = c.rfind("hevc", 0) == 0 ? 0.10 : 0.16;
+                o.vctx->bit_rate = int64_t(std::clamp(double(W) * H * seq.fpsValue() * bitsPerPixel, 2e6, 150e6));
+            }
+            if (hasSuffix(c, "_videotoolbox")) av_dict_set(&opts, "allow_sw", "1", 0);
+            if (hasSuffix(c, "_nvenc")) {
+                av_dict_set(&opts, "preset", "p5", 0);
+                av_dict_set(&opts, "rc", "vbr", 0);
+            }
+            if (hasSuffix(c, "_amf")) av_dict_set(&opts, "quality", "quality", 0);
+            if (c.rfind("hevc", 0) == 0) o.vctx->codec_tag = MKTAG('h', 'v', 'c', '1');
+        } else if (c == "libx264" || c == "libx265") {
             if (s.videoBitrate <= 0) av_dict_set_int(&opts, "crf", s.crf, 0);
             if (!s.preset.empty()) av_dict_set(&opts, "preset", s.preset.c_str(), 0);
             if (c == "libx265") {
@@ -390,9 +423,9 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
 }  // namespace
 
 bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
-                    const std::atomic<bool>* cancel, std::string* error) {
+                    const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed) {
     bool opened = false;
-    bool ok = exportImpl(p, seq, s, progress, cancel, error, opened);
+    bool ok = exportImpl(p, seq, s, progress, cancel, error, opened, encoderUsed);
     // Never leave a truncated file behind (the output is closed by now), but
     // don't touch an existing file if we failed before writing to it.
     if (!ok && opened) std::remove(s.path.c_str());

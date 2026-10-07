@@ -44,9 +44,14 @@ public:
     bool isStill() const { return still_; }
     // Media time of the most recently decoded frame (for pool scheduling).
     double position() const { return curPts_; }
+    // The hardware device decoding this stream ("videotoolbox", "d3d11va"...), or "" for software.
+    const std::string& hardware() const { return hwName_; }
     const std::string& path() const { return path_; }
 
 private:
+    bool openCodec(bool tryHardware, std::string* error);
+    void freeCodec();
+    static int pickFormat(AVCodecContext* ctx, const int* formats);
     bool decodeNext(AVFrame* into);  // false at EOF / error
     bool seek(double t);
     Frame16Ptr convert(const AVFrame* f, double pts, int w, int h, bool hq);
@@ -72,6 +77,13 @@ private:
     bool still_ = false;
     Frame16Ptr stillFrame_;
     SwsContext* sws_ = nullptr;
+    // Hardware decoding: the device's pixel format (-1 = software), the frame
+    // hardware frames are copied into, and whether a copy failed (reopen in software).
+    int hwPixFmt_ = -1;
+    bool hwSlot_ = false;
+    bool hwBroken_ = false;
+    std::string hwName_;
+    AVFrame* hwTransfer_ = nullptr;
 };
 
 struct AudioBuffer {

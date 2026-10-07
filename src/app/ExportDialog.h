@@ -40,6 +40,7 @@ private:
     struct Result {
         bool ok = false;
         QString error;
+        QString encoder;  // the video encoder that ran (hardware presets resolve at export time)
     };
 
     const ExportPreset* currentPreset() const;

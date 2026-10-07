@@ -474,9 +474,10 @@ void ExportDialog::startExport() {
                 r.error = tr("The sequence no longer exists");
                 return r;
             }
-            std::string error;
-            r.ok = exportSequence(snap, *sq, s, onProgress, cancel, &error);
+            std::string error, encoder;
+            r.ok = exportSequence(snap, *sq, s, onProgress, cancel, &error, &encoder);
             r.error = QString::fromStdString(error);
+            r.encoder = QString::fromStdString(encoder);
         } catch (const std::exception& e) {
             r.ok = false;
             r.error = QString::fromLocal8Bit(e.what());
@@ -516,7 +517,10 @@ void ExportDialog::exportFinished() {
     const bool cancelled = cancel_.load();
     setExporting(false);
     if (r.ok) {
-        state_->message(tr("Exported %1").arg(QDir::toNativeSeparators(exportPath_)));
+        const QString where = QDir::toNativeSeparators(exportPath_);
+        state_->message(r.encoder.isEmpty() ? tr("Exported %1").arg(where)
+                                            : tr("Exported %1 (video encoder: %2)").arg(where, r.encoder),
+                        8000);
         accept();
         return;
     }

@@ -47,10 +47,13 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 **Media and output**
 - Imports anything FFmpeg reads
 - Frame-accurate decoding that honours rotation, pixel aspect ratio, colour space and range
+- Hardware decoding on by default (Playback › Hardware Decoding):
+  - Devices: VideoToolbox on macOS; D3D11VA, D3D12VA, NVDEC or DXVA2 on Windows; VAAPI or NVDEC on Linux.
+  - Any stream or device that isn't supported decodes in software instead, and at most 8 streams decode in hardware at once.
 - Images as stills
 - Proxy workflow: 960 px intra-frame proxies, toggled in the Program monitor
 - Preview resolution: Full, 1/2, 1/4, 1/8
-- Export presets: H.264 (x264), H.265 (x265, 8- and 10-bit), Apple ProRes 422 HQ/LT/4444 (with alpha), Avid DNxHR, VP9, AV1 (SVT-AV1), WAV and AAC; exports either the whole sequence or In–Out
+- Export presets: H.264 (x264), H.265 (x265, 8- and 10-bit), hardware H.264/H.265 (VideoToolbox, NVENC, Quick Sync, AMF or Media Foundation, falling back to x264/x265), Apple ProRes 422 HQ/LT/4444 (with alpha), Avid DNxHR, VP9, AV1 (SVT-AV1), WAV and AAC; exports either the whole sequence or In–Out
 - Still frame export
 - Interchange: CMX 3600 EDL and OpenTimelineIO (`.otio`) export, for finishing in Resolve, Premiere, Avid or Nuke
 - Project files are readable JSON (`.montage`) and relink moved media through relative paths

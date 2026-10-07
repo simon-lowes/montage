@@ -7,6 +7,7 @@ add_library(montage_engine STATIC
   core/Interchange.h core/Interchange.cpp
   media/Image.h media/Image.cpp
   media/Decoder.h media/Decoder.cpp
+  media/HwAccel.h media/HwAccel.cpp
   media/MediaPool.h media/MediaPool.cpp
   media/Analysis.h media/Analysis.cpp
   media/Loudness.h media/Loudness.cpp

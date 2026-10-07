@@ -17,6 +17,8 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
+#include "HwAccel.h"
+
 namespace montage {
 
 namespace {
@@ -163,13 +165,23 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
 VideoDecoder::VideoDecoder() = default;
 VideoDecoder::~VideoDecoder() { close(); }
 
+void VideoDecoder::freeCodec() {
+    avcodec_free_context(&ctx_);
+    if (hwSlot_) releaseHwDecoderSlot();
+    hwSlot_ = false;
+    hwPixFmt_ = -1;
+    hwName_.clear();
+}
+
 void VideoDecoder::close() {
     if (sws_) sws_freeContext(sws_);
     sws_ = nullptr;
     av_frame_free(&cur_);
     av_frame_free(&next_);
+    av_frame_free(&hwTransfer_);
     av_packet_free(&pkt_);
-    avcodec_free_context(&ctx_);
+    freeCodec();
+    hwBroken_ = false;
     if (fmt_) avformat_close_input(&fmt_);
     haveCur_ = haveNext_ = false;
     stillFrame_.reset();
@@ -195,20 +207,8 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
         return false;
     }
     AVStream* st = fmt_->streams[stream_];
-    const AVCodec* codec = avcodec_find_decoder(st->codecpar->codec_id);
-    if (!codec) {
-        if (error) *error = "Unsupported video codec";
-        close();
-        return false;
-    }
-    ctx_ = avcodec_alloc_context3(codec);
-    avcodec_parameters_to_context(ctx_, st->codecpar);
-    // Many decoders can be open at once; bound each one's thread pool.
-    ctx_->thread_count = int(std::clamp(std::thread::hardware_concurrency(), 1u, 8u));
-    ctx_->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
-    ctx_->pkt_timebase = st->time_base;
-    if ((rc = avcodec_open2(ctx_, codec, nullptr)) < 0) {
-        if (error) *error = "Cannot open decoder: " + averr(rc);
+    still_ = isStillFormat(fmt_);
+    if (!openCodec(hwDecodeMode() == HwDecodeMode::Auto && !still_, error)) {
         close();
         return false;
     }
@@ -223,7 +223,6 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
     AVRational fr = av_guess_frame_rate(fmt_, st, nullptr);
     fps_ = (fr.num > 0 && fr.den > 0) ? av_q2d(fr) : 25.0;
     duration_ = fmt_->duration > 0 ? double(fmt_->duration) / AV_TIME_BASE : 0;
-    still_ = isStillFormat(fmt_);
     rotation_ = streamRotation(st);
     int w = st->codecpar->width, h = st->codecpar->height;
     AVRational sar = st->sample_aspect_ratio.num ? st->sample_aspect_ratio : st->codecpar->sample_aspect_ratio;
@@ -236,9 +235,82 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
     return true;
 }
 
+bool VideoDecoder::openCodec(bool tryHardware, std::string* error) {
+    AVStream* st = fmt_->streams[stream_];
+    const AVCodec* codec = avcodec_find_decoder(st->codecpar->codec_id);
+    if (!codec) {
+        if (error) *error = "Unsupported video codec";
+        return false;
+    }
+    ctx_ = avcodec_alloc_context3(codec);
+    avcodec_parameters_to_context(ctx_, st->codecpar);
+    ctx_->pkt_timebase = st->time_base;
+    // Hardware: the first device of this platform's list that the codec supports.
+    for (const std::string& name : tryHardware ? hwDeviceCandidates() : std::vector<std::string>{}) {
+        const AVHWDeviceType type = av_hwdevice_find_type_by_name(name.c_str());
+        if (type == AV_HWDEVICE_TYPE_NONE) continue;
+        const AVCodecHWConfig* config = nullptr;
+        for (int i = 0; (config = avcodec_get_hw_config(codec, i)); ++i)
+            if ((config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) && config->device_type == type) break;
+        if (!config) continue;
+        AVBufferRef* device = hwDevice(type);
+        if (!device || !acquireHwDecoderSlot()) continue;
+        hwSlot_ = true;
+        ctx_->hw_device_ctx = av_buffer_ref(device);
+        hwPixFmt_ = config->pix_fmt;
+        hwName_ = name;
+        break;
+    }
+    if (hwPixFmt_ >= 0) {
+        ctx_->opaque = this;
+        ctx_->get_format = reinterpret_cast<AVPixelFormat (*)(AVCodecContext*, const AVPixelFormat*)>(&VideoDecoder::pickFormat);
+        ctx_->thread_count = 1;
+    } else {
+        // Many decoders can be open at once; bound each one's thread pool.
+        ctx_->thread_count = int(std::clamp(std::thread::hardware_concurrency(), 1u, 8u));
+        ctx_->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+    }
+    int rc = avcodec_open2(ctx_, codec, nullptr);
+    if (rc < 0 && hwPixFmt_ >= 0) {
+        freeCodec();
+        return openCodec(false, error);
+    }
+    if (rc < 0) {
+        if (error) *error = "Cannot open decoder: " + averr(rc);
+        freeCodec();
+        return false;
+    }
+    return true;
+}
+
+int VideoDecoder::pickFormat(AVCodecContext* ctx, const int* formats) {
+    auto* self = static_cast<VideoDecoder*>(ctx->opaque);
+    for (const int* f = formats; *f != AV_PIX_FMT_NONE; ++f)
+        if (*f == self->hwPixFmt_) return *f;
+    // The device cannot decode this stream (profile, size...): software it is.
+    self->hwName_.clear();
+    for (const int* f = formats; *f != AV_PIX_FMT_NONE; ++f) {
+        const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(AVPixelFormat(*f));
+        if (d && !(d->flags & AV_PIX_FMT_FLAG_HWACCEL)) return *f;
+    }
+    return formats[0];
+}
+
 bool VideoDecoder::decodeNext(AVFrame* into) {
     for (;;) {
         int rc = avcodec_receive_frame(ctx_, into);
+        if (rc == 0 && hwPixFmt_ >= 0 && into->format == hwPixFmt_) {
+            // Copy the hardware frame to memory for the CPU pipeline.
+            if (!hwTransfer_) hwTransfer_ = av_frame_alloc();
+            av_frame_unref(hwTransfer_);
+            if (av_hwframe_transfer_data(hwTransfer_, into, 0) < 0 || av_frame_copy_props(hwTransfer_, into) < 0) {
+                hwBroken_ = true;  // frameAt reopens the stream in software
+                av_frame_unref(into);
+                return false;
+            }
+            av_frame_unref(into);
+            av_frame_move_ref(into, hwTransfer_);
+        }
         if (rc == 0) return true;
         if (rc == AVERROR_EOF) return false;
         if (rc != AVERROR(EAGAIN)) return false;
@@ -308,6 +380,13 @@ Frame16Ptr VideoDecoder::convert(const AVFrame* f, double pts, int w, int h, boo
 }
 
 Frame16Ptr VideoDecoder::frameAt(double t, int targetW, int targetH, bool highQuality) {
+    if (hwBroken_) {
+        // A hardware frame could not be read back: continue in software.
+        hwBroken_ = false;
+        freeCodec();
+        if (!openCodec(false, nullptr)) return nullptr;
+        seek(std::max(0.0, t));
+    }
     if (!ctx_) return nullptr;
     if (targetW <= 0) targetW = dispW_;
     if (targetH <= 0) targetH = dispH_;
