@@ -37,7 +37,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install dependencies
         # Only the Qt modules Montage uses; the "qt" formula installs all of Qt.
-        run: brew install qtbase qtmultimedia ffmpeg opencolorio ninja pkgconf
+        run: brew install qtbase qtmultimedia ffmpeg opencolorio lilv ninja pkgconf
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(brew --prefix)"
       - name: Build
@@ -78,7 +78,7 @@ jobs:
           install: zip
           pacboy: >-
             gcc:p cmake:p ninja:p pkgconf:p
-            qt6-base:p qt6-multimedia:p qt6-tools:p ffmpeg:p opencolorio:p
+            qt6-base:p qt6-multimedia:p qt6-tools:p ffmpeg:p opencolorio:p lilv:p
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
       - name: Build

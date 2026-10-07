@@ -124,7 +124,15 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
   - Mask tracking from the playhead, forwards or backwards, with three motion models; it writes keyframes, as one undo step.
   - Tested on synthetic shaky footage with known jitter: sub-pixel per-frame motion, a camera path within 0.6 px, region tracks within 1 px, and stabilised frame-to-frame change cut by more than 65 %.
   - Still to do: planar (corner-pin) tracking, and attaching a track to a title or clip's position.
-- [ ] 17. LV2 hosting (M)
+- [x] 17. LV2 hosting (M):
+  - Through lilv (optional; installed in CI and the macOS and Windows packages). Bundles are loaded from wherever the scan found them.
+  - Ports: control inputs become parameters (range, default, stepped). Audio is mono or stereo, in blocks of the activated size. Atom and CV ports are connected to scratch buffers.
+  - Host features: URID map/unmap, options (block lengths), bounded block length.
+  - Settings are saved and restored as LV2 state.
+  - Latency comes from the latency output port (read after a silent priming run), so delay compensation covers LV2.
+  - Reset re-activates the instance.
+  - Tested with a bundled test plugin (gain plus a 16-sample delay): scan, parameters, processing across blocks, state into a second instance at another rate, reset, and sample-exact compensation in the mixer.
+  - Still to do: LV2 plugin GUIs (suil).
 - [ ] 18. Speed ramps and optical-flow retiming (L)
 - [ ] 19. Interchange round trip: OTIO import, EDL import, FCP7 XML and FCPXML (L)
 - [ ] 20. AI object masks with SAM 2 (XL)

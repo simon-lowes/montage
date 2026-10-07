@@ -46,6 +46,22 @@ target_compile_definitions(test_plugins PRIVATE
   MONTAGE_TEST_CLAP_DIR="${CMAKE_CURRENT_BINARY_DIR}/clap"
   MONTAGE_PLUGIN_PROBE="$<TARGET_FILE:montage-plugin-probe>")
 
+if(TARGET PkgConfig::LILV)
+  # An LV2 gain with latency, as a bundle (shared module + Turtle files).
+  set(LV2_BUNDLE ${CMAKE_CURRENT_BINARY_DIR}/lv2/montage-gain.lv2)
+  add_library(montage_test_lv2 MODULE plugins/test_lv2_gain.c)
+  target_include_directories(montage_test_lv2 PRIVATE $<TARGET_PROPERTY:PkgConfig::LILV,INTERFACE_INCLUDE_DIRECTORIES>)
+  set_target_properties(montage_test_lv2 PROPERTIES PREFIX "" OUTPUT_NAME montage_test_lv2_gain
+    LIBRARY_OUTPUT_DIRECTORY ${LV2_BUNDLE} C_VISIBILITY_PRESET hidden)
+  if(NOT WIN32)
+    target_link_libraries(montage_test_lv2 PRIVATE m)
+  endif()
+  configure_file(plugins/lv2/manifest.ttl.in ${LV2_BUNDLE}/manifest.ttl @ONLY)
+  configure_file(plugins/lv2/gain.ttl ${LV2_BUNDLE}/gain.ttl COPYONLY)
+  add_dependencies(test_plugins montage_test_lv2)
+  target_compile_definitions(test_plugins PRIVATE MONTAGE_TEST_LV2_BUNDLE="${LV2_BUNDLE}")
+endif()
+
 if(MONTAGE_WITH_VST3)
   # A VST3 gain written against the SDK interfaces, built as one .vst3 file.
   set(VST3SDK ${PROJECT_SOURCE_DIR}/third_party/vst3sdk)

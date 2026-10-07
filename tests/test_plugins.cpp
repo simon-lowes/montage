@@ -1,6 +1,7 @@
 // Audio plugin tests: discovery, out-of-process scanning with cache and
 // blocklist, CLAP hosting, and plugin effects in the mixer.
 #include <QtTest>
+#include <QFileInfo>
 
 #include <cmath>
 #include <cstdio>
@@ -473,6 +474,78 @@ private slots:
         QCOMPARE(l2[10], 0.5f);
         inst->reset();
         inst->process(ch2, 2, 64);  // still runs after a reset
+    }
+#endif
+
+#ifdef MONTAGE_TEST_LV2_BUNDLE
+    void hostsLv2Plugins() {
+        QVERIFY(canHost(Format::Lv2));
+        // Found by a scan of its folder (from the manifest, no code loaded).
+        Registry& reg = Registry::instance();
+        isolate(reg, path("cache-lv2.json"), {});
+        reg.setSearchPaths(Format::Lv2, {QFileInfo(MONTAGE_TEST_LV2_BUNDLE).absolutePath().toStdString()});
+        reg.scan();
+        auto d = reg.find("lv2:urn:montage:test:lv2-gain");
+        QVERIFY(d.has_value());
+        QCOMPARE(QString::fromStdString(d->name), QString("Montage Test Gain (LV2)"));
+
+        std::string err;
+        auto inst = instantiate(*d, &err);
+        QVERIFY2(inst, err.c_str());
+        QVERIFY(inst->activate(48000, 256));
+        // Control inputs are the parameters; the latency output is not one.
+        const auto params = inst->parameters();
+        QCOMPARE(params.size(), size_t(1));
+        QCOMPARE(QString::fromStdString(params[0].name), QString("Gain"));
+        QCOMPARE(params[0].min, -60.0);
+        QCOMPARE(params[0].max, 24.0);
+        QCOMPARE(params[0].def, 0.0);
+        QCOMPARE(inst->latencySamples(), 16);
+        // -6.0206 dB halves the level; the plugin delays by its reported 16 samples.
+        inst->setParameter(params[0].id, -6.0206);
+        std::vector<float> l(600), r(600);
+        for (int i = 0; i < 600; ++i) l[size_t(i)] = r[size_t(i)] = i >= 100 ? 0.8f : 0.0f;
+        float* ch[2] = {l.data(), r.data()};
+        inst->process(ch, 2, 600);  // more than one block of 256
+        QCOMPARE(l[115], 0.0f);
+        QVERIFY(std::fabs(l[116] - 0.4f) < 1e-4f && std::fabs(r[599] - 0.4f) < 1e-4f);
+        // Settings survive as LV2 state.
+        inst->setParameter(params[0].id, -12.0);
+        const std::string state = inst->saveState();
+        QVERIFY2(state.find("gain") != std::string::npos, state.c_str());
+        auto other = instantiate(*d, &err);
+        QVERIFY(other && other->activate(44100, 128));
+        QCOMPARE(other->parameter(params[0].id), 0.0);
+        QVERIFY(other->loadState(state));
+        QVERIFY(std::fabs(other->parameter(params[0].id) + 12.0) < 1e-6);
+        // Reset clears the delay line.
+        inst->reset();
+        std::vector<float> z(64, 0.0f), z2(64, 0.0f);
+        float* zc[2] = {z.data(), z2.data()};
+        inst->process(zc, 2, 64);
+        QCOMPARE(z[0], 0.0f);
+
+        // As a clip effect in the mixer, with its latency compensated.
+        const std::string wav = path("lv2-step.wav").toStdString();
+        writeWav(wav, 48000, 2.0, 0.5f);
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        MediaItem m;
+        m.id = p.newId();
+        QVERIFY2(probeMedia(wav, m, &err), err.c_str());
+        p.media.push_back(m);
+        const FrameTime at = FrameTime(std::llround(s.fpsValue()));
+        QVERIFY(edit::placeMedia(p, s, m.id, at, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        auto e = makePluginEffect(p, *d, &err);
+        QVERIFY2(e, err.c_str());
+        s.audioTracks[0].clips[0].effects.push_back(*e);
+        AudioMixer mixer;
+        std::vector<float> out(400 * 2);
+        mixer.mix(p, s, 47900, 400, out.data());
+        int64_t step = -1;
+        for (int i = 0; i < 400 && step < 0; ++i)
+            if (out[size_t(i) * 2] > 0.25f) step = 47900 + i;
+        QCOMPARE(step, int64_t(48000));
     }
 #endif
 

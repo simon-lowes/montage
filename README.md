@@ -70,7 +70,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Render and Replace bakes an audio clip's effects into a new audio file to save CPU, and Restore Unrendered brings the original back (both on the clip's right-click menu).
 - Peak meters with hold and clip indicators
 - Effects: 3-band EQ, compressor, limiter, high/low-pass, delay
-- Third-party audio plugins: VST3 and CLAP plugins, and Audio Units on macOS, run as clip, track, bus and master effects. Their parameters are keyframeable and their settings are saved in the project. The Effects browser lists them by vendor, and Tools › Audio Plugins shows every plugin found and its status. LV2 plugins are listed; hosting them is on the roadmap.
+- Third-party audio plugins: VST3, CLAP and LV2 plugins, and Audio Units on macOS, run as clip, track, bus and master effects. Their parameters are keyframeable, their settings are saved in the project, and their latency is compensated. LV2 hosting uses lilv when it is installed. The Effects browser lists plugins by vendor, and Tools › Audio Plugins shows every plugin found and its status.
 - Plugin editors: the Editor button on a plugin effect opens the plugin's own interface in a window, as in a DAW. Turning its knobs makes ordinary undoable, keyframe-aware parameter edits. The plugin's settings are saved in the project. Undo and Inspector changes show up in the open editor.
 - Plugin scanning works like a DAW's: new or changed plugins load in a separate helper process, so one that crashes or hangs is blocked instead of taking Montage down. Results are cached, so later launches are quick.
 - Dialogue cleanup (Effects › Audio Filters › Restoration):
@@ -218,4 +218,4 @@ Notes on the design:
 
 ## Roadmap
 
-Phase 2 is ranked in [`docs/research/phase2-roadmap.md`](docs/research/phase2-roadmap.md) and tracked in [`PROGRESS.md`](PROGRESS.md). Next up: LV2 hosting, OpenColorIO and ACES, multicam, a GPU compositor, tracking, optical-flow retiming and FCP XML interchange.
+Phase 2 is ranked in [`docs/research/phase2-roadmap.md`](docs/research/phase2-roadmap.md) and tracked in [`PROGRESS.md`](PROGRESS.md). Next up: speed ramps and optical-flow retiming, FCP XML / FCPXML / OTIO interchange, AI object masks, and a GPU compositor.

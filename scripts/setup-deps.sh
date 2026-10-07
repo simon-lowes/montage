@@ -9,6 +9,6 @@ $SUDO apt-get "${APT_OPTS[@]}" update -qq
 $SUDO env DEBIAN_FRONTEND=noninteractive apt-get "${APT_OPTS[@]}" install -y -qq \
   build-essential cmake ninja-build pkg-config ffmpeg \
   qt6-base-dev qt6-multimedia-dev libqt6opengl6-dev libgl1-mesa-dev \
-  libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev libopencolorio-dev \
+  libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev libopencolorio-dev liblilv-dev \
   xvfb xauth
 echo "Dependencies installed. Build with: cmake -S . -B build -G Ninja && cmake --build build"
