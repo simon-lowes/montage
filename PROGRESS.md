@@ -199,3 +199,16 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
   - 22 tools on project files: probe, create, info, place, split, remove, move, trim, speed, title, effects (validated against the catalogue), transitions, markers, transcription, phrase search, frame preview as an image, presets, render with progress notifications, timeline export/import, and one-step undo (`.bak`).
   - Argument mistakes come back as tool errors the model can correct.
   - Tested: a whole session in both eras with real media, the preview image, render progress, errors, and stdio framing.
+- [x] Find Shots (semantic visual search, Phase 3):
+  - Model: CLIP ViT-B/32 (OpenAI, MIT), an int8 ONNX export, downloaded on first use (155 MB, pinned and checked).
+  - The tokenizer is CLIP's byte-level BPE, implemented in Montage and checked token for token against the reference: Unicode, contractions and digits.
+  - Index: a frame every 2 s (1 s for short clips), decoded at CLIP's size and embedded in batches of 8. It is stored with each media item as 8-bit embeddings (about 0.5 kB a sample), saved with the project, and is not an undo step.
+  - Search: a text query is embedded and compared with every sample. Runs near each peak become moments, best first.
+  - Find Shots panel (query, index status, results with thumbnails; opening one marks In/Out in the Source monitor), `montage-cli shots`, and the MCP tool `montage_find_shots`.
+  - Tested:
+    - the 8-bit index, its precision and round trip;
+    - the tokenizer against reference ids;
+    - a red-then-blue clip found by "a red image" and "a blue image";
+    - cancelling;
+    - the panel: index, search, open, and save/reopen;
+    - the MCP tool.

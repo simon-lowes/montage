@@ -39,6 +39,8 @@
 #include "audio/PluginEffect.h"
 #include "MaskOverlay.h"
 #include "media/Diarizer.h"
+#include "media/VisualSearch.h"
+#include "ShotSearchPanel.h"
 #include "media/Segmenter.h"
 #include "MonitorPanel.h"
 #include "PlaybackController.h"
@@ -1235,6 +1237,62 @@ private slots:
         }
         state()->newProject();
         QApplication::processEvents();
+    }
+
+    void findShotsByDescription() {
+        // 4 s of a red scene, then 4 s of a blue one.
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 320;
+        gs.height = 180;
+        gs.fps = {25, 1};
+        for (int k = 0; k < 2; ++k) {
+            Clip c = makeGeneratorClip(gen, "color", 100);
+            c.generator.params["color.r"] = Param(k == 0 ? 0.85 : 0.05);
+            c.generator.params["color.g"] = Param(k == 0 ? 0.08 : 0.15);
+            c.generator.params["color.b"] = Param(k == 0 ? 0.06 : 0.9);
+            c.start = k * 100;
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, c);
+        }
+        ExportSettings st;
+        st.path = (dir_.path() + "/scenes.mp4").toStdString();
+        st.audioCodec = "none";
+        st.preset = "ultrafast";
+        std::string err;
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        state()->newProject();
+        const auto ids = state()->importFiles({QString::fromStdString(st.path)});
+        QCOMPARE(ids.size(), size_t(1));
+        auto* panel = win_->findChild<ShotSearchPanel*>();
+        QVERIFY(panel);
+        auto* status = panel->findChild<QLabel*>("shotStatus");
+        QVERIFY(status);
+        QCOMPARE(panel->search("   "), 0);
+        if (!visualSearchAvailable() || !visualModel().installed()) QSKIP("Needs ONNX Runtime and the CLIP model (MONTAGE_VISUAL_MODEL)");
+        QTRY_VERIFY(status->text().contains("0 of 1"));
+        QVERIFY(panel->indexMissing());
+        QTRY_VERIFY(status->text().contains("1 of 1"));
+        QVERIFY(state()->project().findMedia(ids[0])->visual);
+        // The index is not an edit: nothing to undo, but it is saved.
+        QVERIFY(panel->search("a blue image") > 0);
+        const ShotMatch top = panel->results().front();
+        QVERIFY2(top.best >= 4 && top.best <= 8, qPrintable(QString::number(top.best)));
+        QCOMPARE(panel->findChild<QListWidget*>("shotResults")->count(), int(panel->results().size()));
+        // Opening it marks the moment in the Source monitor.
+        panel->open(0);
+        QCOMPARE(state()->sourceMedia(), ids[0]);
+        const double fps = state()->sequence()->fpsValue();
+        QVERIFY(state()->sourceIn() >= FrameTime(std::floor((top.start - 0.01) * fps)) && state()->sourceIn() < state()->sourceOut());
+        QVERIFY(panel->search("a red image") > 0);
+        QVERIFY2(panel->results().front().best < 4, qPrintable(QString::number(panel->results().front().best)));
+        const QString saved = dir_.path() + "/shots.montage";
+        QString err2;
+        QVERIFY(state()->save(saved, &err2));
+        state()->newProject();
+        QVERIFY(win_->openProject(saved));
+        QVERIFY(state()->project().media.at(0).visual && !state()->project().media.at(0).visual->samples.empty());
+        win_->activateWindow();
+        QVERIFY(QTest::qWaitForWindowActive(win_.get()));
     }
 
     void maskOverlayInProgramMonitor() {

@@ -110,6 +110,11 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
     - Every word is labelled. The Transcript panel names the speaker at each change; rename them with a right-click.
     - Plain-text exports are split by speaker, WebVTT carries voice tags, and captions break where the speaker changes.
     - It runs locally: pyannote segmentation 3.0 (MIT) and the CAM++ voice model (Apache-2.0) on ONNX Runtime, a 36 MB one-time download.
+- **Find Shots**: search footage by what it shows ("a dog running on a beach", "close-up of hands").
+  - Videos are indexed once, a frame every two seconds, and the index is saved with the project.
+  - Results show a thumbnail and the moment; opening one marks it with In and Out in the Source monitor.
+  - It runs locally: CLIP ViT-B/32 (OpenAI, MIT) on ONNX Runtime, a 155 MB one-time download.
+  - On the command line: `montage-cli shots project.montage "a red car at night"`.
 - Edit by transcript (Transcript panel):
   - **Sequence mode** shows what the cut says, with the word under the playhead highlighted. Click a word to go there. Select words and press Delete to cut them out of every track; the gap closes and the captions move with it.
   - Remove Fillers cuts um, uh, er and similar words in one step. Shorten Pauses trims silences between words to a length you choose.
@@ -162,7 +167,7 @@ CMake options:
 - `-DMONTAGE_BUILD_TESTS=OFF` skips the tests.
 - `-DMONTAGE_REQUIRE_ONNXRUNTIME=ON` stops the configure step if ONNX Runtime is missing (release builds use it).
 
-The object mask and speaker tests need their models: `scripts/fetch-models.sh ~/montage-models`, then set `MONTAGE_OBJECT_MODEL=~/montage-models/edgetam-video` and `MONTAGE_SPEAKER_MODEL=~/montage-models/speakers` (the app reads the same variables). The speech tests read `MONTAGE_TEST_WHISPER_MODEL`.
+The object mask, speaker and visual search tests need their models: `scripts/fetch-models.sh ~/montage-models`, then set `MONTAGE_OBJECT_MODEL=~/montage-models/edgetam-video`, `MONTAGE_SPEAKER_MODEL=~/montage-models/speakers` and `MONTAGE_VISUAL_MODEL=~/montage-models/clip-vit-b32` (the app reads the same variables). The speech tests read `MONTAGE_TEST_WHISPER_MODEL`.
 
 ## Using the editor
 
@@ -230,6 +235,7 @@ Its tools work on `.montage` files by path. Each edit is saved at once, and the 
 - place media, split, remove (with ripple), move, trim and change the speed of clips;
 - add titles, effects (including masked ones), transitions and markers;
 - transcribe (with speaker labels) and find spoken phrases in the cut;
+- find shots by description;
 - return a rendered frame as an image so the agent can check its work;
 - render with any preset, with progress;
 - export and import EDL, OTIO, FCP 7 XML and FCPXML.
@@ -262,4 +268,4 @@ Notes on the design:
 
 ## Roadmap
 
-Phase 2 is ranked in [`docs/research/phase2-roadmap.md`](docs/research/phase2-roadmap.md) and tracked in [`PROGRESS.md`](PROGRESS.md). Next up: a GPU compositor, HDR monitoring, and more of Phase 3 (semantic visual search, metadata and smart bins).
+Phase 2 is ranked in [`docs/research/phase2-roadmap.md`](docs/research/phase2-roadmap.md) and tracked in [`PROGRESS.md`](PROGRESS.md). Next up: a GPU compositor, HDR monitoring, and more of Phase 3 (metadata, ratings and smart bins).

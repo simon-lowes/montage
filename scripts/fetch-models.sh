@@ -3,6 +3,7 @@
 # installs, checking each file's SHA-256:
 #   <dir>/edgetam-video  object masks       (MONTAGE_OBJECT_MODEL)
 #   <dir>/speakers       speaker labels     (MONTAGE_SPEAKER_MODEL)
+#   <dir>/clip-vit-b32   Find Shots         (MONTAGE_VISUAL_MODEL)
 #
 #   scripts/fetch-models.sh [dir]      (default: ./models)
 set -euo pipefail
@@ -33,4 +34,9 @@ fetch speakers pyannote-segmentation-3.0.onnx \
 fetch speakers campplus-voxceleb.onnx \
   https://huggingface.co/csukuangfj/speaker-embedding-models/resolve/0743f301363dec56491a490f6d6cbc9d67f9a3bf/3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx \
   357a834f702b80161e5b981182c038e18553c1f2ca752ed6cec2052365d4129b
-echo "Models in $DIR: MONTAGE_OBJECT_MODEL=$DIR/edgetam-video MONTAGE_SPEAKER_MODEL=$DIR/speakers"
+CLIP=https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/d15189d7028b43f1d3e65039190477f6af591c2a
+fetch clip-vit-b32 text_model_quantized.onnx "$CLIP/onnx/text_model_quantized.onnx" 73baab855d406190da9faa498cfedf65f15cf309f4cc7385b7b032e6d08e5c3a
+fetch clip-vit-b32 vision_model_quantized.onnx "$CLIP/onnx/vision_model_quantized.onnx" 583fd1110a514667812fee7d684952aaf82a99b959760c8d7dca7e0ab9839299
+fetch clip-vit-b32 vocab.json "$CLIP/vocab.json" 5047b556ce86ccaf6aa22b3ffccfc52d391ea4accdab9c2f2407da5b742d4363
+fetch clip-vit-b32 merges.txt "$CLIP/merges.txt" 9fd691f7c8039210e0fced15865466c65820d09b63988b0174bfe25de299051a
+echo "Models in $DIR: MONTAGE_OBJECT_MODEL=$DIR/edgetam-video MONTAGE_SPEAKER_MODEL=$DIR/speakers MONTAGE_VISUAL_MODEL=$DIR/clip-vit-b32"

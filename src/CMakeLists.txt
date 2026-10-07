@@ -1,6 +1,7 @@
 add_library(montage_engine STATIC
   core/Model.h core/Model.cpp
   core/ObjectMask.h core/ObjectMask.cpp
+  core/VisualIndex.h core/VisualIndex.cpp
   core/Transcript.h core/Transcript.cpp
   core/Captions.h core/Captions.cpp
   core/TranscriptEdit.h core/TranscriptEdit.cpp
@@ -24,6 +25,7 @@ add_library(montage_engine STATIC
   media/ModelFiles.h media/ModelFiles.cpp
   media/Segmenter.h media/Segmenter.cpp
   media/Diarizer.h media/Diarizer.cpp
+  media/VisualSearch.h media/VisualSearch.cpp
   render/Processing.h render/Processing.cpp
   render/Retime.h render/Retime.cpp
   render/ClipAnalysis.h render/ClipAnalysis.cpp

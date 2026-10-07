@@ -29,6 +29,7 @@
 #include "automation/McpServer.h"
 #include "media/Diarizer.h"
 #include "media/Segmenter.h"
+#include "media/VisualSearch.h"
 #include "media/Transcriber.h"
 #endif
 #include "render/ColorSpace.h"
@@ -67,6 +68,7 @@ int usage() {
                  "  montage-cli transcribe <media> [--model base.en|PATH] [--language auto|en|...] [--translate] [--speakers [N]]\n"
                  "                     [--srt out.srt] [--vtt out.vtt] [--json out.json] [--txt out.txt]\n"
                  "  montage-cli models\n"
+                 "  montage-cli shots <project.montage> \"a red car at night\" [--max N]   (find shots by description)\n"
                  "  montage-cli mcp                       (Model Context Protocol server on stdio, for AI agents)\n"
                  "  montage-cli captions <project.montage> [-o out.srt|out.vtt|out.scc] [--transcribe MODEL]\n"
                  "                     [--generate] [--import file.srt] [--save]\n",
@@ -489,6 +491,9 @@ int cmdModels() {
     else
         std::printf("  %-22s %6.0f MB  %-10s ONNX Runtime %s\n", objectModel().id.c_str(), double(objectModel().bytes()) / 1e6,
                     objectModel().installed() ? "downloaded" : "", segmenterRuntimeVersion().c_str());
+    std::printf("\nVisual search model (CLIP ViT-B/32, for Find Shots; folder: %s)\n", visualModel().directory().c_str());
+    std::printf("  %-22s %6.0f MB  %s\n", visualModel().id.c_str(), double(visualModel().bytes()) / 1e6,
+                visualModel().installed() ? "downloaded" : "");
     std::printf("\nSpeaker model (pyannote segmentation + CAM++, for speaker labels; folder: %s)\n", speakerModel().directory().c_str());
     if (!diarizerAvailable()) std::printf("  unavailable: this build has no ONNX Runtime\n");
     else
@@ -656,6 +661,51 @@ int cmdCaptions(const std::vector<std::string>& args) {
     return writeFile(out, text) ? 0 : 1;
 }
 
+// Finds shots by description, indexing the project's videos first (and saving the index).
+int cmdShots(const std::vector<std::string>& args) {
+    if (args.size() < 2) return usage();
+    size_t max = 10;
+    for (size_t i = 2; i < args.size(); ++i)
+        if (args[i] == "--max" && i + 1 < args.size()) max = size_t(std::max(1, std::atoi(args[++i].c_str())));
+        else return usage();
+    Project p;
+    if (!load(args[0], p)) return 1;
+    std::string err;
+    bool changed = false;
+    for (MediaItem& m : p.media) {
+        if (m.kind != MediaKind::Video || !m.hasVideo || m.path.empty() || (m.visual && !m.visual->samples.empty())) continue;
+        VisualIndex v;
+        const bool ok = indexVideo(
+            m.path, m.duration, v, 0,
+            [&](double f) {
+                std::fprintf(stderr, "\rIndexing %s... %5.1f%%", m.name.c_str(), f * 100);
+                std::fflush(stderr);
+            },
+            nullptr, &err);
+        std::fprintf(stderr, "\n");
+        if (!ok) {
+            std::fprintf(stderr, "error: %s: %s\n", m.name.c_str(), err.c_str());
+            return 1;
+        }
+        m.visual = std::make_shared<const VisualIndex>(std::move(v));
+        changed = true;
+    }
+    if (changed && !saveProject(p, args[0], &err)) {
+        std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
+    }
+    auto clip = ClipModel::load(&err);
+    const std::vector<float> q = clip ? clip->text(args[1], &err) : std::vector<float>{};
+    if (q.empty()) {
+        std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
+    }
+    for (const ShotMatch& h : findShots(p, q, max))
+        if (const MediaItem* m = p.findMedia(h.media))
+            std::printf("%.3f  %-30s %8.2f - %8.2f s\n", double(h.score), m->name.c_str(), h.start, h.end);
+    return 0;
+}
+
 int cmdPresets() {
     for (const auto& p : exportPresets())
         std::printf("%-28s .%-5s %s\n", p.name.c_str(), p.extension.c_str(), p.description.c_str());
@@ -698,6 +748,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 #endif
+    if (cmd == "shots") return cmdShots(args);
     if (cmd == "mcp") {
         // A Model Context Protocol server on stdin/stdout: stdout carries only protocol messages.
         McpServer server;

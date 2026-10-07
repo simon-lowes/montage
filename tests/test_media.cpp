@@ -28,6 +28,7 @@
 #include "media/Tracking.h"
 #include "media/Segmenter.h"
 #include "media/Diarizer.h"
+#include "media/VisualSearch.h"
 #include "automation/McpServer.h"
 #ifdef MONTAGE_WITH_WHISPER
 #include "media/Transcriber.h"
@@ -719,6 +720,101 @@ private slots:
         for (const auto& turn : turns) QCOMPARE(turn.speaker, 0);
     }
 
+    void visualSearch() {
+        // The index on its own: 8-bit samples keep similarities, and survive saving.
+        VisualIndex vi;
+        vi.model = "test";
+        vi.step = 1;
+        std::vector<float> a(512), b(512);
+        for (int i = 0; i < 512; ++i) {
+            a[size_t(i)] = float(std::sin(i * 0.37));
+            b[size_t(i)] = float(std::cos(i * 0.11));
+        }
+        auto normalise = [](std::vector<float>& v) {
+            double l = 0;
+            for (float x : v) l += double(x) * x;
+            for (float& x : v) x = float(x / std::sqrt(l));
+        };
+        normalise(a);
+        normalise(b);
+        vi.add(0.5, a);
+        vi.add(1.5, b);
+        QVERIFY(std::fabs(vi.similarity(0, a) - 1.f) < 0.002f);
+        double dot = 0;
+        for (int i = 0; i < 512; ++i) dot += double(a[size_t(i)]) * b[size_t(i)];
+        QVERIFY(std::fabs(vi.similarity(1, a) - float(dot)) < 0.01f);
+        VisualIndex back;
+        QVERIFY(visualIndexFromJson(visualIndexToJson(vi), back) && back == vi);
+
+        if (!visualSearchAvailable()) QSKIP("Built without ONNX Runtime");
+        if (!visualModel().installed()) QSKIP("Set MONTAGE_VISUAL_MODEL to a folder with the CLIP model to run the rest");
+        std::string err;
+        auto clip = ClipModel::load(&err);
+        QVERIFY2(clip, err.c_str());
+        // CLIP's tokenizer, against the reference implementation's ids.
+        const std::vector<std::pair<std::string, std::vector<int64_t>>> tokens = {
+            {"a photo of a dog", {49406, 320, 1125, 539, 320, 1929, 49407}},
+            {"A red car, driving FAST!!", {49406, 320, 736, 1615, 267, 4161, 1953, 748, 49407}},
+            {"Café au lait — 1990's \"quotes\"", {49406, 15304, 2566, 572, 585, 2005, 272, 280, 280, 271, 568, 257, 5808, 257, 49407}},
+            {"  two   spaces\tand tab", {49406, 1237, 9006, 537, 14724, 49407}},
+            {"running runners ran", {49406, 2761, 10571, 4031, 49407}},
+            {"Ünïcödé naïve résumé 日本語",
+             {49406, 6522, 77, 35689, 66, 7255, 67, 4166, 1097, 35689, 563, 29106, 7054, 4166, 39121, 44353, 34002, 508, 49407}},
+            {"it's we'll they're I'M", {49406, 585, 568, 649, 1342, 889, 982, 328, 880, 49407}},
+            {"a2b3 c4d 12345", {49406, 320, 273, 321, 274, 322, 275, 323, 272, 273, 274, 275, 276, 49407}},
+        };
+        for (const auto& [text, ids] : tokens) {
+            const auto got = clip->tokens(text);
+            QString shown;
+            for (int64_t id : got) shown += QString::number(id) + " ";
+            QVERIFY2(got == ids, qPrintable(QString::fromStdString(text) + ": " + shown));
+        }
+        QCOMPARE(int(clip->tokens(std::string(400, 'a') + " b c d e f g h i j k l m n o p q r s t u v w x y z").size()) <= 77, true);
+
+        // Footage: 4 s of a red scene, then 4 s of a blue one.
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 320;
+        gs.height = 180;
+        gs.fps = {25, 1};
+        for (int k = 0; k < 2; ++k) {
+            Clip c = makeGeneratorClip(gen, "color", 100);
+            c.generator.params["color.r"] = Param(k == 0 ? 0.85 : 0.05);
+            c.generator.params["color.g"] = Param(k == 0 ? 0.08 : 0.15);
+            c.generator.params["color.b"] = Param(k == 0 ? 0.06 : 0.9);
+            c.start = k * 100;
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, c);
+        }
+        ExportSettings st;
+        st.path = path("colours.mp4");
+        st.audioCodec = "none";
+        st.preset = "ultrafast";
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        VisualIndex index;
+        double last = 0;
+        QVERIFY2(indexVideo(st.path, 0, index, 0, [&](double f) { last = f; }, nullptr, &err), err.c_str());
+        QCOMPARE(int(index.samples.size()), 8);  // every second for a short clip
+        QCOMPARE(last, 1.0);
+        QCOMPARE(index.model, std::string("clip-vit-b32"));
+        Project p = makeDefaultProject();
+        MediaItem m = probeOrFail(p, st.path);
+        m.visual = std::make_shared<const VisualIndex>(index);
+        p.media.push_back(m);
+        for (const auto& [query, from, to] : {std::tuple{"a red image", 0.0, 4.0}, std::tuple{"a blue image", 4.0, 8.0}}) {
+            const auto q = clip->text(query, &err);
+            QCOMPARE(int(q.size()), 512);
+            const auto hits = findShots(p, q);
+            QVERIFY(!hits.empty());
+            QVERIFY2(hits[0].best >= from && hits[0].best <= to, qPrintable(QString("%1: %2").arg(query).arg(hits[0].best)));
+            QVERIFY2(hits[0].start >= from - 0.6 && hits[0].end <= to + 0.6,
+                     qPrintable(QString("%1: %2-%3").arg(query).arg(hits[0].start).arg(hits[0].end)));
+            QCOMPARE(hits[0].media, m.id);
+        }
+        // Cancelling stops without a result.
+        std::atomic<bool> stop{true};
+        QVERIFY(!indexVideo(st.path, 0, index, 0, {}, &stop, &err));
+    }
+
     void mcpServerEditsProjects() {
         writeBallVideo(path("mcp-ball.mp4"), 12);
         const QString project = QString::fromStdString(path("agent.montage"));
@@ -803,6 +899,14 @@ private slots:
         QVERIFY(!notes.empty());
         QCOMPARE(notes.front().value("method").toString(), QString("notifications/progress"));
         QCOMPARE(notes.front().value("params").toObject().value("progressToken").toString(), QString("render-1"));
+
+        // Finding shots by description (indexes the video first, once).
+        if (visualSearchAvailable() && visualModel().installed()) {
+            r = tool("montage_find_shots", QJsonObject{{"project", project}, {"query", "a red ball"}, {"max", 3}});
+            QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+            QVERIFY(!r.value("structuredContent").toObject().value("moments").toArray().isEmpty());
+            QVERIFY(loadProject(project.toStdString(), saved) && saved.media.at(0).visual);
+        }
 
         // Mistakes are reported, not fatal.
         r = tool("montage_move_clip", QJsonObject{{"project", project}, {"clip", 999999}, {"start", 1}});

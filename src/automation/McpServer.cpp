@@ -23,6 +23,7 @@
 #include "core/TranscriptEdit.h"
 #include "media/Decoder.h"
 #include "media/Transcriber.h"
+#include "media/VisualSearch.h"
 #include "render/Compositor.h"
 #include "render/Exporter.h"
 #include "render/Processing.h"
@@ -620,6 +621,49 @@ void McpServer::Impl::addTools() {
             }
             if (seg.words.empty()) return ok("Nothing in the sequence is transcribed (use montage_transcribe with the project)");
             return ok(hits.isEmpty() ? QStringLiteral("Not found") : text, QJsonObject{{"hits", hits}});
+        });
+
+    add("montage_find_shots", "Find shots by description",
+        "Search the project's footage by what it shows (\"a dog on a beach\", \"close-up of hands\"), with CLIP running on "
+        "this computer. Videos not indexed yet are indexed first (once; the index is saved in the project). Returns the "
+        "best moments: media file and media times, best first.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"query":{"type":"string"},
+            "max":{"type":"integer","default":10}},"required":["project","query"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            if (!visualSearchAvailable()) return fail("This build of Montage cannot search footage (no ONNX Runtime)");
+            if (!visualModel().installed())
+                return fail("The visual search model is not downloaded: run `scripts/fetch-models.sh` or open Find Shots in the app once");
+            std::string err;
+            bool changed = false;
+            for (MediaItem& m : l.project.media) {
+                if (m.kind != MediaKind::Video || !m.hasVideo || m.path.empty() || (m.visual && !m.visual->samples.empty())) continue;
+                VisualIndex v;
+                if (!indexVideo(m.path, m.duration, v, 0, [&](double f) { progress(f, QStringLiteral("Indexing %1").arg(QString::fromStdString(m.name))); }, nullptr, &err))
+                    return fail(QString::fromStdString(m.name + ": " + err));
+                m.visual = std::make_shared<const VisualIndex>(std::move(v));
+                changed = true;
+            }
+            if (changed) save(l);
+            auto clip = ClipModel::load(&err);
+            const std::vector<float> q = clip ? clip->text(need(a, "query").toStdString(), &err) : std::vector<float>{};
+            if (q.empty()) return fail(QString::fromStdString(err));
+            const auto hits = findShots(l.project, q, size_t(std::clamp(a.value("max").toInt(10), 1, 100)));
+            QJsonArray list;
+            QString text;
+            for (const ShotMatch& h : hits) {
+                const MediaItem* m = l.project.findMedia(h.media);
+                if (!m) continue;
+                list.append(QJsonObject{{"media", QString::fromStdString(m->path)}, {"start_seconds", h.start}, {"end_seconds", h.end},
+                                        {"best_seconds", h.best}, {"score", double(h.score)}});
+                text += QStringLiteral("%1  %2-%3 s (best %4 s, score %5)\n")
+                            .arg(QString::fromStdString(m->name))
+                            .arg(h.start, 0, 'f', 1)
+                            .arg(h.end, 0, 'f', 1)
+                            .arg(h.best, 0, 'f', 1)
+                            .arg(double(h.score), 0, 'f', 3);
+            }
+            return ok(text.isEmpty() ? QStringLiteral("No indexed video") : text, QJsonObject{{"moments", list}});
         });
 
     add("montage_render_frame", "Look at a frame",

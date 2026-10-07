@@ -49,6 +49,7 @@
 #include "MulticamPanel.h"
 #include "CaptionsPanel.h"
 #include "MaskOverlay.h"
+#include "ShotSearchPanel.h"
 #include "TranscriptPanel.h"
 #include "MonitorPanel.h"
 #include "PlaybackController.h"
@@ -218,6 +219,14 @@ void MainWindow::buildPanels() {
         sourceDock_->raise();
     });
     connect(source_, &PlaybackController::positionChanged, transcript_, &TranscriptPanel::setSourcePosition);
+    shots_ = new ShotSearchPanel(state_, this);
+    connect(shots_, &ShotSearchPanel::openRequested, this, [this](Id media, FrameTime in, FrameTime out, FrameTime at) {
+        // The moment, marked in the Source monitor and ready to edit in.
+        openInSource(media);
+        state_->setSourceIn(in);
+        state_->setSourceOut(out);
+        source_->seek(at);
+    });
     meter_ = new AudioMeterWidget(this);
     multicam_ = new MulticamPanel(state_, program_, this);
 
@@ -230,6 +239,7 @@ void MainWindow::buildPanels() {
     mixerDock_ = makeDock(tr("Audio Mixer"), "mixer", mixer_);
     captionsDock_ = makeDock(tr("Captions"), "captions", captions_);
     transcriptDock_ = makeDock(tr("Transcript"), "transcript", transcript_);
+    shotsDock_ = makeDock(tr("Find Shots"), "shots", shots_);
     multicamDock_ = makeDock(tr("Multicam"), "multicam", multicam_);
     // 1–9 cut to an angle (live while playing); Shift cuts at the playhead when stopped.
     for (int i = 0; i < 9; ++i) {
@@ -267,6 +277,7 @@ void MainWindow::resetLayout() {
     addDockWidget(Qt::LeftDockWidgetArea, binDock_);
     tabifyDockWidget(binDock_, effectsDock_);
     tabifyDockWidget(binDock_, transcriptDock_);
+    tabifyDockWidget(binDock_, shotsDock_);
     binDock_->raise();
     addDockWidget(Qt::RightDockWidgetArea, meterDock_);
     for (QDockWidget* d : docks_) d->show();

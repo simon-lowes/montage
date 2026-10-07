@@ -17,6 +17,7 @@
 #include "Captions.h"
 #include "ObjectMask.h"
 #include "Transcript.h"
+#include "VisualIndex.h"
 
 namespace montage {
 
@@ -107,6 +108,8 @@ struct MediaItem {
     double timecode = -1;       // start timecode in seconds (for multicam sync), -1 = none
     // Speech-to-text of the media's audio (shared: undo snapshots copy the pointer).
     std::shared_ptr<const Transcript> transcript;
+    // What the footage shows, for search by description (shared like the transcript).
+    std::shared_ptr<const VisualIndex> visual;
     bool operator==(const MediaItem&) const = default;
 };
 

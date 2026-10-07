@@ -28,6 +28,7 @@ class ScopesWidget;
 class MixerPanel;
 class CaptionsPanel;
 class TranscriptPanel;
+class ShotSearchPanel;
 class MulticamPanel;
 class AudioMeterWidget;
 
@@ -115,6 +116,7 @@ private:
     MulticamPanel* multicam_ = nullptr;
     CaptionsPanel* captions_ = nullptr;
     TranscriptPanel* transcript_ = nullptr;
+    ShotSearchPanel* shots_ = nullptr;
     AudioMeterWidget* meter_ = nullptr;
     std::vector<QDockWidget*> docks_;
     QDockWidget* sourceDock_ = nullptr;
@@ -126,6 +128,7 @@ private:
     QDockWidget* mixerDock_ = nullptr;
     QDockWidget* captionsDock_ = nullptr;
     QDockWidget* transcriptDock_ = nullptr;
+    QDockWidget* shotsDock_ = nullptr;
     QDockWidget* multicamDock_ = nullptr;
     QDockWidget* meterDock_ = nullptr;
     QMenu* recentMenu_ = nullptr;

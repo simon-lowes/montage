@@ -429,6 +429,8 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
         if (m.timecode >= 0) o["timecode"] = m.timecode;
         if (m.transcript && !m.transcript->empty())
             o["transcript"] = QJsonDocument::fromJson(QByteArray::fromStdString(transcriptToJson(*m.transcript))).object();
+        if (m.visual && !m.visual->samples.empty())
+            o["visual"] = QJsonDocument::fromJson(QByteArray::fromStdString(visualIndexToJson(*m.visual))).object();
         media.append(o);
     }
     root["media"] = media;
@@ -476,6 +478,11 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
             Transcript t;
             if (transcriptFromJson(QJsonDocument(o.value("transcript").toObject()).toJson(QJsonDocument::Compact).toStdString(), t))
                 m.transcript = std::make_shared<const Transcript>(std::move(t));
+        }
+        if (o.contains("visual")) {
+            VisualIndex v;
+            if (visualIndexFromJson(QJsonDocument(o.value("visual").toObject()).toJson(QJsonDocument::Compact).toStdString(), v))
+                m.visual = std::make_shared<const VisualIndex>(std::move(v));
         }
         m.duration = o.value("duration").toDouble();
         m.width = o.value("width").toInt();
