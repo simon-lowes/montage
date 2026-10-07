@@ -56,7 +56,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 
 ## Installing
 
-The [Package workflow](.github/workflows/package.yml) builds installers on every push and pull request; download them from the run's **Artifacts**. Pushing a version tag (`git tag v0.1.0 && git push origin v0.1.0`) also publishes them as a GitHub Release.
+The [Package workflow](.github/workflows/package.yml) builds installers on every push and pull request; download them from the run's **Artifacts**. Pushing a version tag (`git tag v0.1.0 && git push origin v0.1.0`), or running the Package workflow from the Actions tab with a release tag, also publishes them as a GitHub Release.
 
 - **macOS** (Apple Silicon, macOS 15 or later): `Montage-<version>-macos-arm64.dmg`. Open it and drag Montage to Applications. The app is not notarised yet, so the first launch is blocked: open System Settings › Privacy & Security and choose **Open Anyway**.
 - **Windows** (x64, Windows 10 or later): `Montage-<version>-windows-x64-setup.exe` installs Montage, adds it to the Start menu and opens `.montage` projects on double-click. `Montage-<version>-windows-x64.zip` is the same app without installing. The installer is not code-signed yet, so SmartScreen warns: choose **More info › Run anyway**.

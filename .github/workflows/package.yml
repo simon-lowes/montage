@@ -1,14 +1,24 @@
 name: Package
 
 # Builds the macOS DMG and the Windows installer + portable zip. Every run
-# uploads them as workflow artifacts; pushing a tag like v0.1.0 also
-# publishes them as a GitHub Release.
+# uploads them as workflow artifacts. Pushing a tag like v0.1.0, or running
+# the workflow by hand with a release tag, also publishes them as a GitHub
+# Release (an existing release with that tag gets its files replaced).
 on:
   push:
     branches: [main]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Publish a release with this tag (e.g. v0.1.0); empty = build only"
+        required: false
+        default: ""
+      target:
+        description: "Commit the new tag points at (default: the commit being built)"
+        required: false
+        default: ""
 
 # A newer push waits for the running packaging run instead of cancelling it,
 # so each run reports both platforms.
@@ -106,7 +116,7 @@ jobs:
 
   release:
     name: Publish release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
     needs: [macos, windows]
     runs-on: ubuntu-24.04
     permissions:
@@ -117,7 +127,15 @@ jobs:
           pattern: montage-*
           merge-multiple: true
           path: dist
-      - name: Create release
+      - name: Create or update the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "Montage ${GITHUB_REF_NAME#v}" --generate-notes
+          TAG: ${{ inputs.release_tag || github.ref_name }}
+          TARGET: ${{ inputs.target || github.sha }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --target "$TARGET" \
+              --title "Montage ${TAG#v}" --generate-notes
+          fi
