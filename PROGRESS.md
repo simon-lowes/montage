@@ -17,23 +17,32 @@ verified run.
 - [x] Audio mixer: clip gain/pan keyframes, track volume/pan/mute/solo, EQ, compressor, limiter, filters, delay, meters
 - [x] Export: H.264, H.265, ProRes (incl. 4444 alpha), DNxHR, VP9, AV1, WAV, AAC; presets; stills
 - [x] `montage-cli`: probe, new, info, render, frame, presets
-- [ ] Unit tests for the engine (ctest)
-- [ ] Scene-cut detection
+- [x] Unit tests for the engine (ctest)
+- [x] Scene-cut detection
+- [x] Proxy generation and proxy playback
+- [x] Match sequence settings to the first clip
 
 ## Application (Qt 6 Widgets)
-- [ ] Main window with dockable panels, dark theme
-- [ ] Media bin with import (dialog + drag & drop), thumbnails
-- [ ] Source monitor with In/Out and insert / overwrite
-- [ ] Program monitor with playback (audio-clocked), J/K/L, scrubbing, playback resolution
-- [ ] Timeline: tracks, clips with thumbnails/waveforms, tools (select, razor, ripple, roll, slip, slide), snapping, zoom, markers, transitions
-- [ ] Inspector with keyframes for every effect parameter
-- [ ] Effects & transitions browser
-- [ ] Scopes: waveform, RGB parade, vectorscope, histogram
-- [ ] Audio meters and track mixer
-- [ ] Export dialog with presets and progress
-- [ ] Save / open / autosave, sequence settings
-- [ ] Keyboard shortcuts matching industry conventions
+- [x] Main window with dockable panels, dark theme
+- [x] Media bin with import (dialog + drag & drop), thumbnails, proxies
+- [x] Source monitor with In/Out and insert / overwrite (buttons, keys, drag)
+- [x] Program monitor with playback, J/K/L, scrubbing, playback resolution, loop, safe guides
+- [x] Timeline: tracks, clips with thumbnails/waveforms, tools (select, razor, ripple, roll, slip, slide, hand), snapping, zoom, markers, transitions, drag & drop
+- [x] Inspector with keyframes for every effect parameter
+- [x] Effects & transitions browser
+- [x] Scopes: waveform, RGB parade, vectorscope, histogram
+- [x] Audio meters and track mixer
+- [x] Export dialog with presets, range, progress and cancel
+- [x] Save / open / recent / autosave, sequence settings, new sequences
+- [x] Keyboard shortcuts matching industry conventions (F1 lists them)
+- [x] Offscreen GUI integration tests (test_app)
+
+## Polish before calling the MVP done
+- [ ] Playback: render ahead and cache frames so playback and stepping are smooth
+- [ ] Audio scrubbing while dragging the playhead
+- [ ] Keyframe markers on timeline clips
+- [ ] Correctness review of edit operations, playback and export; fix findings
 
 ## Delivery
-- [ ] CI (GitHub Actions): build + tests
-- [ ] README with build and usage docs
+- [x] CI (GitHub Actions): build + tests
+- [x] README with build and usage docs
