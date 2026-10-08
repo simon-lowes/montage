@@ -14,6 +14,8 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Tools: Selection (V), Razor (C), Ripple (B), Roll (N), Slip (Y), Slide (U), Hand (H)
 - Insert, overwrite, lift, extract, ripple delete, close gap, nudge, duplicate, copy / paste / paste-insert
 - Three-point editing from the Source monitor (I / O marks, `,` insert, `.` overwrite, drag from the viewer)
+- Ripple Trim Previous / Next Edit to Playhead (Q / W), Select Clips After Playhead (A, Shift+A on the target track), Replace with Source Clip, Fit to Fill, and Add Frame Hold (Shift+F; Time Remapping can also go to 0 % to hold mid-ramp)
+- Paste Attributes (Ctrl+Alt+V) and Remove Attributes: motion, opacity and blend, Time Remapping, volume and effects, keyframes included
 - Synchronise clips from separate cameras and recorders by audio waveform (cross-correlation, sub-frame accurate)
 - Linked audio/video, linking and unlinking, snapping, markers, match frame, compound (nested) clips
 - Constant speed changes and reverse, with optional ripple

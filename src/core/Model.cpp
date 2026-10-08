@@ -120,7 +120,7 @@ double Clip::speedAt(double local) const {
     if (!ramped()) return speed;
     const Param& p = timing.params.at("speed");
     if (!p.animated()) return speed * p.value / 100;
-    return speed * std::max(1.0, integrate(p, local, local + 1e-6) / 1e-6) / 100;
+    return speed * std::max(0.0, integrate(p, local, local + 1e-6) / 1e-6) / 100;
 }
 
 double Clip::sourceOffset(double local) const {

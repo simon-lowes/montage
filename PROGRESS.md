@@ -370,3 +370,11 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
   - Sequence › Auto Reframe Sequence… (9:16, 1:1, 4:5, 16:9) makes a reframed copy and switches to it; Clip › Auto Reframe works in place; Sequence › Duplicate Sequence (edit::duplicateSequence: fresh ids throughout, transitions and link groups remapped, its own bin item).
   - MCP `montage_auto_reframe` (32 tools now): the reframed copy becomes the active sequence.
   - Tested: a red ball crossing textured ground is found within 40 px in every frame with motion; after reframing 16:9 to 9:16 it stays in the 360 px frame on every frame and within a quarter of its width of the centre (43 px at worst in practice), where a centre crop keeps it in frame for only 15 of 25; a still's off-centre subject is centred; still paths hold; the duplicate's ids and references; the app actions and the MCP tool.
+- [x] Editing staples from Premiere, Avid and Resolve (edit:: functions, each one undo step, with menu actions):
+  - Ripple Trim Previous / Next Edit to Playhead (Q / W) on every unlocked track, the playhead staying on the join.
+  - Paste Attributes (Ctrl+Alt+V) and Remove Attributes, with a dialog that remembers its choices: Motion, Opacity and blend mode, Time Remapping, Volume and pan, Effects (pasted after the clip's own, with fresh ids); keyframes come along.
+  - Add Frame Hold (Shift+F): split at the playhead, the rest holds that frame. Time Remapping now goes down to 0 % (a hold), and trimming and slipping a held clip work (no division by its zero speed).
+  - Replace with Source Clip: the Source monitor's clip takes the place of the selected one, its In point (or current frame, lined up with the playhead) placed accordingly; effects, transform and linked sound follow.
+  - Fit to Fill: the source In-Out range overwrites the timeline In-Out range at the speed that fits.
+  - Select Clips After Playhead (A) and on the target track (Shift+A), like Track Select Forward.
+  - Tested in core (exact frames, sources and speeds for each, plus errors) and through the app's actions.

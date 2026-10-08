@@ -364,6 +364,12 @@ void MainWindow::buildMenus() {
     QAction* copy = add(editM, tr("&Copy"), QKeySequence::Copy, [this] { copySelection(false); });
     QAction* pasteA = add(editM, tr("&Paste"), QKeySequence::Paste, [this] { paste(false); });
     add(editM, tr("Paste &Insert"), QKeySequence("Ctrl+Shift+V"), [this] { paste(true); });
+    add(editM, tr("Paste A&ttributes…"), QKeySequence("Ctrl+Alt+V"), [this] {
+        if (const unsigned what = askAttributes(tr("Paste Attributes"), false)) pasteAttributes(what);
+    })->setObjectName(QStringLiteral("pasteAttributes"));
+    add(editM, tr("Remove Attributes…"), QKeySequence(), [this] {
+        if (const unsigned what = askAttributes(tr("Remove Attributes"), true)) removeAttributes(what);
+    })->setObjectName(QStringLiteral("removeAttributes"));
     QAction* dup = add(editM, tr("D&uplicate"), QKeySequence("Ctrl+Alt+D"), [this] {
         auto sel = state_->selectedClips();
         FrameTime at = state_->playhead();
@@ -438,6 +444,10 @@ void MainWindow::buildMenus() {
     add(clipM, tr("Match Colour to Reference"), QKeySequence("Ctrl+Alt+Shift+C"), [this] { matchColour(); })
         ->setObjectName(QStringLiteral("matchColour"));
     add(clipM, tr("Auto Reframe"), QKeySequence(), [this] { autoReframeClips(); })->setObjectName(QStringLiteral("autoReframeClips"));
+    add(clipM, tr("Add Frame &Hold"), QKeySequence("Shift+F"), [this] { addFrameHold(); })->setObjectName(QStringLiteral("addFrameHold"));
+    add(clipM, tr("Replace with Source Clip"), QKeySequence(), [this] { replaceWithSource(); })
+        ->setObjectName(QStringLiteral("replaceWithSource"));
+    add(clipM, tr("Fit to Fill"), QKeySequence(), [this] { fitToFill(); })->setObjectName(QStringLiteral("fitToFill"));
     add(clipM, tr("S&ynchronize by Audio"), QKeySequence(), [this] { syncByAudio(); });
     clipM->addSeparator();
     add(clipM, tr("&Insert from Source"), QKeySequence(Qt::Key_Comma), [this] { state_->insertFromSource(false); });
@@ -542,6 +552,14 @@ void MainWindow::buildMenus() {
             state_->apply(tr("Extract"), [a, b](Project& p, Sequence& s) { return edit::extractRange(p, s, a, b, allTracks(s)); });
         }));
     seqM->addSeparator();
+    add(seqM, tr("Ripple Trim Previous Edit to Playhead"), QKeySequence(Qt::Key_Q), [this] { rippleTrimToPlayhead(true); })
+        ->setObjectName(QStringLiteral("rippleTrimPrevious"));
+    add(seqM, tr("Ripple Trim Next Edit to Playhead"), QKeySequence(Qt::Key_W), [this] { rippleTrimToPlayhead(false); })
+        ->setObjectName(QStringLiteral("rippleTrimNext"));
+    add(seqM, tr("Select Clips After Playhead"), QKeySequence(Qt::Key_A), [this] { selectForward(true); })
+        ->setObjectName(QStringLiteral("selectForward"));
+    add(seqM, tr("Select Clips After Playhead on Target Track"), QKeySequence("Shift+A"), [this] { selectForward(false); })
+        ->setObjectName(QStringLiteral("selectForwardTrack"));
     add(seqM, tr("Add &Marker"), QKeySequence(Qt::Key_M), [this] { addMarker(); });
     add(seqM, tr("Next Marker"), QKeySequence("Shift+M"), [this] { jumpMarker(true); });
     add(seqM, tr("Previous Marker"), QKeySequence("Ctrl+Shift+M"), [this] { jumpMarker(false); });
@@ -1319,6 +1337,172 @@ bool runWithProgress(QWidget* parent, EditorState* state, const QString& title,
 }
 
 }  // namespace
+
+bool MainWindow::rippleTrimToPlayhead(bool previous) {
+    const Sequence* s = state_->sequence();
+    if (!s) return false;
+    const FrameTime t = state_->playhead();
+    const FrameTime edit = previous ? edit::previousClipEdge(*s, t) : edit::nextClipEdge(*s, t);
+    const bool ok = state_->apply(previous ? tr("Ripple Trim Previous Edit") : tr("Ripple Trim Next Edit"),
+                                  [t, previous](Project& p, Sequence& sq) { return edit::rippleTrimToPlayhead(p, sq, t, previous); });
+    // The playhead stays on the join (it moves back to where the cut now is).
+    if (ok && previous) state_->setPlayhead(edit);
+    return ok;
+}
+
+unsigned MainWindow::askAttributes(const QString& title, bool removing) {
+    QDialog dlg(this);
+    dlg.setWindowTitle(title);
+    auto* lay = new QVBoxLayout(&dlg);
+    const std::pair<const char*, QString> items[] = {{"attrMotion", tr("Motion (position, scale, rotation, crop)")},
+                                                     {"attrOpacity", tr("Opacity and blend mode")},
+                                                     {"attrTimeRemap", tr("Time Remapping")},
+                                                     {"attrVolume", tr("Volume and pan")},
+                                                     {"attrEffects", removing ? tr("Effects") : tr("Effects (added after the clip's own)")}};
+    std::vector<QCheckBox*> boxes;
+    QSettings settings;
+    for (const auto& [name, label] : items) {
+        auto* b = new QCheckBox(label, &dlg);
+        b->setObjectName(QString::fromLatin1(name));
+        b->setChecked(settings.value(QStringLiteral("attributes/") + QString::fromLatin1(name), true).toBool());
+        lay->addWidget(b);
+        boxes.push_back(b);
+    }
+    auto* box = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    connect(box, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(box, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    lay->addWidget(box);
+    if (dlg.exec() != QDialog::Accepted) return 0;
+    unsigned what = 0;
+    for (size_t i = 0; i < boxes.size(); ++i) {
+        settings.setValue(QStringLiteral("attributes/") + boxes[i]->objectName(), boxes[i]->isChecked());
+        if (boxes[i]->isChecked()) what |= 1u << i;
+    }
+    return what;
+}
+
+bool MainWindow::pasteAttributes(unsigned what) {
+    if (!state_->sequence() || !what) return false;
+    if (clipboard_.empty()) {
+        state_->message(tr("Copy a clip first, then select clips and paste its attributes"));
+        return false;
+    }
+    std::vector<Id> to(state_->selectedClips().begin(), state_->selectedClips().end());
+    if (to.empty()) {
+        state_->message(tr("Select the clips to paste onto"));
+        return false;
+    }
+    // The first copied picture clip gives the picture attributes, the first sound clip the volume.
+    const edit::ClipboardItem* video = nullptr;
+    const edit::ClipboardItem* audio = nullptr;
+    for (const auto& item : clipboard_) {
+        if (!video && item.track.kind == TrackKind::Video) video = &item;
+        if (!audio && item.track.kind == TrackKind::Audio) audio = &item;
+    }
+    return state_->apply(tr("Paste Attributes"), [&](Project& p, Sequence& s) {
+        edit::Result r = edit::Result::fail("Nothing to paste onto");
+        if (video) {
+            edit::Result rv = edit::pasteAttributes(p, s, video->clip, TrackKind::Video, to, what & ~unsigned(edit::AttrVolume));
+            if (rv.ok) r = rv;
+        }
+        if (audio) {
+            const unsigned audioWhat = what & unsigned(edit::AttrVolume | edit::AttrEffects | edit::AttrTimeRemap);
+            edit::Result ra = edit::pasteAttributes(p, s, audio->clip, TrackKind::Audio, to, video ? audioWhat & ~unsigned(edit::AttrTimeRemap) : audioWhat);
+            if (ra.ok) r = ra;
+        }
+        return r;
+    });
+}
+
+bool MainWindow::removeAttributes(unsigned what) {
+    if (!state_->sequence() || !what) return false;
+    std::vector<Id> ids(state_->selectedClips().begin(), state_->selectedClips().end());
+    if (ids.empty()) {
+        state_->message(tr("Select the clips to change"));
+        return false;
+    }
+    return state_->apply(tr("Remove Attributes"), [&](Project& p, Sequence& s) { return edit::removeAttributes(p, s, ids, what); });
+}
+
+const Clip* MainWindow::clipForCommand() const {
+    const Sequence* s = state_->sequence();
+    if (!s) return nullptr;
+    const FrameTime t = state_->playhead();
+    for (Id id : state_->selectedClips()) {
+        auto loc = edit::locate(*s, id);
+        const Clip* c = edit::clipById(*s, id);
+        if (loc && loc->track.kind == TrackKind::Video && c && c->contains(t)) return c;
+    }
+    const int target = state_->targetVideoTrack();
+    if (target >= 0 && target < int(s->videoTracks.size()))
+        if (const Clip* c = edit::clipAt(*s, {TrackKind::Video, target}, t)) return c;
+    for (int i = int(s->videoTracks.size()) - 1; i >= 0; --i)
+        if (const Clip* c = edit::clipAt(*s, {TrackKind::Video, i}, t)) return c;
+    return nullptr;
+}
+
+bool MainWindow::addFrameHold() {
+    const Clip* c = clipForCommand();
+    if (!c) {
+        state_->message(tr("Put the playhead over a video clip"));
+        return false;
+    }
+    const Id id = c->id;
+    const FrameTime t = state_->playhead();
+    return state_->apply(tr("Add Frame Hold"), [id, t](Project& p, Sequence& s) { return edit::addFrameHold(p, s, id, t); });
+}
+
+bool MainWindow::replaceWithSource() {
+    const Sequence* s = state_->sequence();
+    const MediaItem* m = state_->project().findMedia(state_->sourceMedia());
+    if (!s || !m) {
+        state_->message(tr("Load a clip in the Source monitor first"));
+        return false;
+    }
+    const Clip* target = nullptr;
+    if (const Clip* sel = state_->primaryClip()) target = sel;
+    if (!target) target = clipForCommand();
+    if (!target) {
+        state_->message(tr("Select the clip to replace"));
+        return false;
+    }
+    // The source In goes to the clip's start; without one, the Source monitor's frame goes to the playhead.
+    const bool byIn = state_->sourceIn() >= 0;
+    const double align = byIn ? double(state_->sourceIn()) : double(source_->position());
+    const FrameTime at = byIn || !target->contains(state_->playhead()) ? target->start : state_->playhead();
+    const Id id = target->id, media = m->id;
+    return state_->apply(tr("Replace with Source Clip"),
+                         [=](Project& p, Sequence& sq) { return edit::replaceClip(p, sq, id, media, align, at); });
+}
+
+bool MainWindow::fitToFill() {
+    const Sequence* s = state_->sequence();
+    const MediaItem* m = state_->project().findMedia(state_->sourceMedia());
+    if (!s || !m) {
+        state_->message(tr("Load a clip in the Source monitor first"));
+        return false;
+    }
+    if (state_->sourceIn() < 0 || state_->sourceOut() < 0 || s->inPoint < 0 || s->outPoint < 0) {
+        state_->message(tr("Fit to Fill needs In and Out marked in both the Source monitor and the timeline"));
+        return false;
+    }
+    const TrackRef vt{TrackKind::Video, std::min(state_->targetVideoTrack(), int(s->videoTracks.size()) - 1)};
+    const TrackRef at{TrackKind::Audio, std::min(state_->targetAudioTrack(), int(s->audioTracks.size()) - 1)};
+    const double in = double(state_->sourceIn()), out = double(state_->sourceOut());
+    const FrameTime tin = s->inPoint, tout = s->outPoint;
+    const Id media = m->id;
+    return state_->apply(tr("Fit to Fill"), [=](Project& p, Sequence& sq) { return edit::fitToFill(p, sq, media, in, out, tin, tout, vt, at); });
+}
+
+int MainWindow::selectForward(bool allTracks) {
+    const Sequence* s = state_->sequence();
+    if (!s) return 0;
+    std::optional<TrackRef> track;
+    if (!allTracks) track = TrackRef{TrackKind::Video, std::min(state_->targetVideoTrack(), int(s->videoTracks.size()) - 1)};
+    const auto ids = edit::clipsFrom(*s, state_->playhead(), track);
+    state_->setSelection(ids);
+    return int(ids.size());
+}
 
 Id MainWindow::autoReframeSequence(int aspectW, int aspectH, int speed) {
     const Sequence* s = state_->sequence();

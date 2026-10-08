@@ -516,8 +516,9 @@ FrameTime clampTrim(const Project& p, const Sequence& s, const Track& t, size_t 
         delta = std::max<FrameTime>(delta, 1 - c.duration);
         if (limit < kInfiniteFrames) {
             if (!c.reverse) {
-                double maxExtra = (lim - srcHigh(c)) / c.speedAt(double(c.duration));
-                delta = std::min<FrameTime>(delta, FrameTime(std::floor(maxExtra + 1e-6)));
+                // A held frame (0 % speed) uses no more source however long it gets.
+                const double sp = c.speedAt(double(c.duration));
+                if (sp > 1e-9) delta = std::min<FrameTime>(delta, FrameTime(std::floor((lim - srcHigh(c)) / sp + 1e-6)));
             } else {
                 double maxExtra = srcLow(c) / c.speed;
                 delta = std::min<FrameTime>(delta, FrameTime(std::floor(maxExtra + 1e-6)));
@@ -530,8 +531,8 @@ FrameTime clampTrim(const Project& p, const Sequence& s, const Track& t, size_t 
         delta = std::min<FrameTime>(delta, c.duration - 1);
         if (limit < kInfiniteFrames || !c.reverse) {
             if (!c.reverse) {
-                double maxBack = srcLow(c) / c.speedAt(0);  // how far we can extend backwards
-                delta = std::max<FrameTime>(delta, -FrameTime(std::floor(maxBack + 1e-6)));
+                const double sp = c.speedAt(0);  // how far we can extend backwards (held frames: any way)
+                if (sp > 1e-9) delta = std::max<FrameTime>(delta, -FrameTime(std::floor(srcLow(c) / sp + 1e-6)));
             } else {
                 double maxBack = (lim - srcHigh(c)) / c.speed;
                 delta = std::max<FrameTime>(delta, -FrameTime(std::floor(maxBack + 1e-6)));
@@ -649,11 +650,12 @@ Result slip(Project& p, Sequence& s, Id clipId, FrameTime delta) {
     for (Id id : linkedClips(s, clipId)) {
         Clip* c = clipById(s, id);
         FrameTime limit = sourceLimit(p, s, *c);
-        double shift = double(delta) * c->speedAt(0);
+        const double sp = c->speedAt(0) > 1e-9 ? c->speedAt(0) : 1.0;  // a held frame slips frame by frame
+        double shift = double(delta) * sp;
         if (limit < kInfiniteFrames) shift = std::clamp(shift, -c->sourceIn, double(limit) - srcHigh(*c));
         else shift = std::max(shift, -c->sourceIn);
         c->sourceIn += shift;
-        if (id == clipId) res.applied = FrameTime(std::llround(shift / c->speedAt(0)));
+        if (id == clipId) res.applied = FrameTime(std::llround(shift / sp));
     }
     return res;
 }
@@ -890,6 +892,226 @@ Result addTransition(Project& p, Sequence& s, Id clipId, Edge edge, const std::s
     Result r;
     r.created.push_back(id);
     return r;
+}
+
+FrameTime previousClipEdge(const Sequence& s, FrameTime frame) {
+    FrameTime best = -1;
+    for (const auto* list : {&s.videoTracks, &s.audioTracks})
+        for (const Track& t : *list)
+            for (const Clip& c : t.clips)
+                for (FrameTime e : {c.start, c.end()})
+                    if (e < frame) best = std::max(best, e);
+    return best;
+}
+
+FrameTime nextClipEdge(const Sequence& s, FrameTime frame) {
+    FrameTime best = -1;
+    for (const auto* list : {&s.videoTracks, &s.audioTracks})
+        for (const Track& t : *list)
+            for (const Clip& c : t.clips)
+                for (FrameTime e : {c.start, c.end()})
+                    if (e > frame && (best < 0 || e < best)) best = e;
+    return best;
+}
+
+Result rippleTrimToPlayhead(Project& p, Sequence& s, FrameTime frame, bool previous) {
+    const FrameTime edit = previous ? previousClipEdge(s, frame) : nextClipEdge(s, frame);
+    if (edit < 0) return Result::fail(previous ? "No edit before the playhead" : "No edit after the playhead");
+    const FrameTime a = previous ? edit : frame, b = previous ? frame : edit;
+    std::vector<TrackRef> tracks;
+    for (TrackRef r : allTracks(s))
+        if (editable(trackAt(s, r))) tracks.push_back(r);
+    Result r = extractRange(p, s, a, b, tracks);
+    if (r.ok) r.applied = b - a;
+    return r;
+}
+
+namespace {
+
+// Transform parameters that belong to Motion (not Opacity) in Paste Attributes.
+bool isOpacityParam(const std::string& name) { return name == "opacity"; }
+
+void copyEffectsOnto(Project& p, const std::vector<Effect>& from, std::vector<Effect>& to) {
+    for (Effect e : from) {
+        e.id = p.newId();
+        to.push_back(std::move(e));
+    }
+}
+
+}  // namespace
+
+Result pasteAttributes(Project& p, Sequence& s, const Clip& from, TrackKind fromKind, const std::vector<Id>& to,
+                       unsigned what) {
+    Result res;
+    for (Id id : to) {
+        auto loc = locate(s, id);
+        if (!loc || id == from.id) continue;
+        Track* t = trackAt(s, loc->track);
+        if (!editable(t)) continue;
+        Clip& c = t->clips[loc->index];
+        const bool video = loc->track.kind == TrackKind::Video;
+        bool changed = false;
+        if (video && (what & AttrMotion)) {
+            const Id keep = c.motion.id;
+            for (const auto& [name, prm] : from.motion.params)
+                if (!isOpacityParam(name)) c.motion.params[name] = prm;
+            c.motion.id = keep;
+            changed = true;
+        }
+        if (video && (what & AttrOpacity)) {
+            auto it = from.motion.params.find("opacity");
+            if (it != from.motion.params.end()) c.motion.params["opacity"] = it->second;
+            else c.motion.params.erase("opacity");
+            c.blendMode = from.blendMode;
+            changed = true;
+        }
+        if (what & AttrTimeRemap) {
+            const Id keep = c.timing.id ? c.timing.id : p.newId();
+            c.timing = from.timing;
+            c.timing.id = keep;
+            changed = true;
+        }
+        if (!video && (what & AttrVolume)) {
+            const Id keep = c.audio.id;
+            c.audio.params = from.audio.params;
+            c.audio.id = keep;
+            changed = true;
+        }
+        if ((what & AttrEffects) && loc->track.kind == fromKind && !from.effects.empty()) {
+            copyEffectsOnto(p, from.effects, c.effects);
+            changed = true;
+        }
+        if (changed) res.created.push_back(id);
+    }
+    if (res.created.empty()) return Result::fail("Nothing to paste onto");
+    res.applied = FrameTime(res.created.size());
+    res.created.clear();
+    return res;
+}
+
+Result removeAttributes(Project& p, Sequence& s, const std::vector<Id>& ids, unsigned what) {
+    Result res;
+    for (Id id : ids) {
+        auto loc = locate(s, id);
+        if (!loc) continue;
+        Track* t = trackAt(s, loc->track);
+        if (!editable(t)) continue;
+        Clip& c = t->clips[loc->index];
+        const bool video = loc->track.kind == TrackKind::Video;
+        if (video && (what & AttrMotion)) {
+            const Effect fresh = makeEffect("transform", c.motion.id);
+            for (auto it = c.motion.params.begin(); it != c.motion.params.end();)
+                if (isOpacityParam(it->first)) ++it;
+                else it = c.motion.params.erase(it);
+            for (const auto& [name, prm] : fresh.params)
+                if (!isOpacityParam(name)) c.motion.params[name] = prm;
+        }
+        if (video && (what & AttrOpacity)) {
+            const Effect fresh = makeEffect("transform", 0);
+            auto it = fresh.params.find("opacity");
+            if (it != fresh.params.end()) c.motion.params["opacity"] = it->second;
+            else c.motion.params.erase("opacity");
+            c.blendMode = "normal";
+        }
+        if (what & AttrTimeRemap) c.timing = makeEffect("time", c.timing.id ? c.timing.id : p.newId());
+        if (!video && (what & AttrVolume)) c.audio = makeEffect("volume", c.audio.id);
+        if (what & AttrEffects) c.effects.clear();
+        ++res.applied;
+    }
+    if (res.applied == 0) return Result::fail("No clips to change");
+    return res;
+}
+
+Result addFrameHold(Project& p, Sequence& s, Id clipId, FrameTime frame) {
+    auto loc = locate(s, clipId);
+    if (!loc || loc->track.kind != TrackKind::Video) return Result::fail("Frame Hold needs a video clip");
+    Track* t = trackAt(s, loc->track);
+    if (!editable(t)) return Result::fail("Track is locked");
+    const Clip& c = t->clips[loc->index];
+    if (!c.contains(frame)) return Result::fail("The playhead is not over the clip");
+    const MediaItem* m = c.mediaId ? p.findMedia(c.mediaId) : nullptr;
+    if (!m || m->kind != MediaKind::Video) return Result::fail("Frame Hold needs a video clip");
+    Id held = clipId;
+    if (frame > c.start) {
+        held = splitClip(p, *t, loc->index, frame);
+        normalize(*t);
+    }
+    Clip* h = clipById(s, held);
+    if (!h) return Result::fail("Could not split the clip");
+    // The frame on screen at the split, held: Time Remapping at 0 % from there.
+    if (h->timing.empty()) h->timing = makeEffect("time", p.newId());
+    h->reverse = false;
+    h->timing.params["speed"] = Param(0.0);
+    Result r;
+    r.created.push_back(held);
+    return r;
+}
+
+Result replaceClip(Project& p, Sequence& s, Id clipId, Id mediaId, double srcAlign, FrameTime at) {
+    const MediaItem* m = p.findMedia(mediaId);
+    if (!m) return Result::fail("Unknown media");
+    auto loc = locate(s, clipId);
+    if (!loc) return Result::fail("Unknown clip");
+    const Clip& base = trackAt(s, loc->track)->clips[loc->index];
+    // The new in-point: srcAlign at `at` (at the clip's speed).
+    const double sourceIn = srcAlign - double(at - base.start) * base.speed;
+    if (sourceIn < -1e-6) return Result::fail("The source does not reach back to the clip's start");
+    Result res;
+    for (Id id : linkedClips(s, clipId)) {
+        auto l = locate(s, id);
+        if (!l) continue;
+        Track* t = trackAt(s, l->track);
+        if (!editable(t)) continue;
+        Clip& c = t->clips[l->index];
+        const bool video = l->track.kind == TrackKind::Video;
+        if (video ? !(m->hasVideo || m->kind == MediaKind::Image) : !m->hasAudio) continue;
+        Clip fresh = makeClip(p, *m, l->track.kind, s);
+        c.mediaId = mediaId;
+        c.name = fresh.name;
+        c.sourceIn = std::max(0.0, sourceIn);
+        c.reverse = false;
+        c.unrendered.clear();
+        const FrameTime limit = sourceLimit(p, s, c);
+        if (limit < kInfiniteFrames && srcHigh(c) > double(limit) + 1e-6)
+            return Result::fail("The source is too short for the clip");
+        res.created.push_back(id);
+    }
+    if (res.created.empty()) return Result::fail("The source has nothing for this clip's tracks");
+    return res;
+}
+
+Result fitToFill(Project& p, Sequence& s, Id mediaId, double srcIn, double srcOut, FrameTime tlIn, FrameTime tlOut,
+                 TrackRef videoTrack, TrackRef audioTrack) {
+    const MediaItem* m = p.findMedia(mediaId);
+    if (!m) return Result::fail("Unknown media");
+    if (srcOut < srcIn || tlOut < tlIn) return Result::fail("Mark In and Out in the source and the timeline");
+    const FrameTime len = tlOut - tlIn + 1;
+    const double speed = (srcOut - srcIn + 1) / double(len);
+    // The range is cleared on the tracks the media goes to, then it is placed at normal
+    // speed and sped up or slowed down to fill it.
+    std::vector<TrackRef> targets;
+    if (m->hasVideo || m->kind == MediaKind::Image) targets.push_back(videoTrack);
+    if (m->hasAudio && m->kind != MediaKind::Image) targets.push_back(audioTrack);
+    liftRange(p, s, tlIn, tlOut + 1, targets);
+    Result r = placeMedia(p, s, mediaId, tlIn, srcIn, srcIn + double(len), videoTrack, audioTrack, false);
+    if (!r.ok) return r;
+    for (Id id : r.created)
+        if (Clip* c = clipById(s, id)) {
+            c->speed = speed;
+            c->duration = len;
+        }
+    r.applied = len;
+    return r;
+}
+
+std::vector<Id> clipsFrom(const Sequence& s, FrameTime frame, std::optional<TrackRef> track) {
+    std::vector<Id> out;
+    for (TrackRef r : allTracks(s)) {
+        if (track && !(*track == r)) continue;
+        for (const Clip& c : trackAt(s, r)->clips)
+            if (c.start >= frame) out.push_back(c.id);
+    }
+    return out;
 }
 
 Id duplicateSequence(Project& p, Id id, const std::string& name, std::map<Id, Id>* clipIds) {

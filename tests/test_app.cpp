@@ -1325,6 +1325,97 @@ private slots:
         state()->newProject();
     }
 
+    void editingStaplesFromTheMenus() {
+        // Two seconds of colour bars as a video file.
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 160;
+        gs.height = 90;
+        gs.fps = {30, 1};
+        Clip bars = makeGeneratorClip(gen, "bars", 60);
+        edit::overwrite(gen, gs, {TrackKind::Video, 0}, bars);
+        ExportSettings st;
+        st.path = (dir_.path() + "/bars.mp4").toStdString();
+        st.audioCodec = "none";
+        st.preset = "ultrafast";
+        std::string err;
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        state()->newProject();
+        const auto ids = state()->importFiles({QString::fromStdString(st.path)});
+        QCOMPARE(ids.size(), size_t(1));
+        state()->apply("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids[0], 0, 0, 60, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        });
+        // Undo replaces the project, so the sequence is looked up each time.
+const auto seq = [this] { return state()->sequence(); };
+        auto action = [&](const char* name) {
+            auto* a = win_->findChild<QAction*>(name);
+            if (!a) qWarning("no action %s", name);
+            return a;
+        };
+        // Q at frame 10 takes frames 0-9 and puts the playhead on the join; W at 20 takes the rest.
+        state()->setPlayhead(10);
+        action("rippleTrimPrevious")->trigger();
+        QCOMPARE(seq()->duration(), FrameTime(50));
+        QCOMPARE(state()->playhead(), FrameTime(0));
+        QCOMPARE(seq()->videoTracks[0].clips[0].sourceIn, 10.0);
+        state()->setPlayhead(20);
+        action("rippleTrimNext")->trigger();
+        QCOMPARE(seq()->duration(), FrameTime(20));
+        state()->undo();
+        state()->undo();
+        QCOMPARE(seq()->duration(), FrameTime(60));
+        // Frame Hold at 15 (Shift+F).
+        state()->setSelection({}, false);
+        state()->setPlayhead(15);
+        action("addFrameHold")->trigger();
+        QCOMPARE(seq()->videoTracks[0].clips.size(), size_t(2));
+        QCOMPARE(seq()->videoTracks[0].clips[1].sourceFrameAt(40), 15.0);
+        state()->undo();
+        // Paste Attributes: split at 30, scale the first half, copy it and paste its motion onto the second.
+        state()->edit("Split and scale", [](Project& p, Sequence& sq) {
+            if (!edit::razorAll(p, sq, 30).ok) return false;
+            sq.videoTracks[0].clips[0].motion.params["scale"] = Param(150.0);
+            return true;
+        });
+        QCOMPARE(seq()->videoTracks[0].clips.size(), size_t(2));
+        const Id first = seq()->videoTracks[0].clips[0].id, second = seq()->videoTracks[0].clips[1].id;
+        QAction* copy = nullptr;
+        for (QAction* a : win_->findChildren<QAction*>())
+            if (a->shortcut() == QKeySequence(QKeySequence::Copy)) copy = a;
+        QVERIFY(copy && action("pasteAttributes") && action("removeAttributes"));
+        state()->setSelection({first}, false);
+        copy->trigger();
+        state()->setSelection({second}, false);
+        QVERIFY(win_->pasteAttributes(edit::AttrMotion));
+        QCOMPARE(edit::clipById(*seq(), second)->motion.p("scale", 0), 150.0);
+        QVERIFY(win_->removeAttributes(edit::AttrMotion));
+        QCOMPARE(edit::clipById(*seq(), second)->motion.p("scale", 0, 100), 100.0);
+        // Select Clips After Playhead (A).
+        state()->setPlayhead(30);
+        action("selectForward")->trigger();
+        QCOMPARE(state()->selectedClips(), std::vector<Id>{second});
+        // Replace with Source Clip: the source In (frame 5) goes to the clip's start.
+        state()->setSourceMedia(ids[0]);
+        state()->setSourceIn(5);
+        state()->setSourceOut(-1);
+        action("replaceWithSource")->trigger();
+        QCOMPARE(edit::clipById(*seq(), second)->sourceIn, 5.0);
+        // Fit to Fill: source 0-59 into timeline 0-29 at double speed.
+        state()->setSourceIn(0);
+        state()->setSourceOut(59);
+        state()->edit("Marks", [](Project&, Sequence& sq) {
+            sq.inPoint = 0;
+            sq.outPoint = 29;
+            return true;
+        });
+        action("fitToFill")->trigger();
+        const Clip* fitted = edit::clipAt(*seq(), {TrackKind::Video, 0}, 10);
+        QVERIFY(fitted && fitted->start == 0 && fitted->duration == 30);
+        QCOMPARE(fitted->speed, 2.0);
+        state()->newProject();
+    }
+
     void renderQueueInTheBackground() {
         loadDemo();
         RenderQueue* queue = win_->renderQueue();
@@ -2393,10 +2484,10 @@ private slots:
         const Id a = state()->sequence()->audioTracks[0].clips.at(0).id;
         state()->setSelection({v}, false);
         QApplication::processEvents();
-        // The Time Remapping speed (1..1000 %).
+        // The Time Remapping speed (0..1000 %; 0 holds the frame).
         QDoubleSpinBox* speed = nullptr;
         for (auto* sp : win_->findChildren<QDoubleSpinBox*>())
-            if (sp->suffix() == " %" && sp->minimum() == 1 && sp->maximum() == 1000) speed = sp;
+            if (sp->suffix() == " %" && sp->minimum() == 0 && sp->maximum() == 1000) speed = sp;
         QVERIFY(speed);
         speed->setValue(200);
         auto clipSpeed = [&](Id id) { return edit::clipById(*state()->sequence(), id)->speedAt(0); };

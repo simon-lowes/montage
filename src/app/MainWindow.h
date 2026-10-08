@@ -62,6 +62,14 @@ public:
     void autoReframeDialog();
     // Reframes the selected clips within the current sequence; returns how many.
     int autoReframeClips(int speed = 1);
+    // Editing staples (each one undo step; false/0 with a message when nothing applies).
+    bool rippleTrimToPlayhead(bool previous);         // Q / W
+    bool pasteAttributes(unsigned what);              // edit::Attribute flags, from the copied clips
+    bool removeAttributes(unsigned what);
+    bool addFrameHold();                              // the clip under the playhead
+    bool replaceWithSource();                         // the selected clip, or the one under the playhead
+    bool fitToFill();
+    int selectForward(bool allTracks);
 
 protected:
     void closeEvent(QCloseEvent* e) override;
@@ -104,6 +112,11 @@ private:
     void detectScenes();
     void normalizeLoudness();
     void autoColor();
+    // Asks which attributes (Paste Attributes / Remove Attributes); 0 if cancelled.
+    unsigned askAttributes(const QString& title, bool removing);
+    // The video clip a clip command acts on: the selected one under the playhead, else the
+    // top one under the playhead on the targeted track (or any).
+    const Clip* clipForCommand() const;
     void syncByAudio();
     enum class Interchange { Edl, Otio, Fcp7Xml, FcpXml };
     void exportInterchange(Interchange format);

@@ -1406,6 +1406,145 @@ private slots:
             QVERIFY(QString::fromStdString(xml).indexOf("Adjustment") < 0);
     }
 
+    void editingStaples() {
+        // Q and W: linked clips a [0,90) and b [90,180), playhead at 30 and then 120.
+        {
+            Fixture fx;
+            QVERIFY(placeMedia(fx.p, fx.s(), fx.media, 0, 0, 90, V1, A1, false).ok);
+            QVERIFY(placeMedia(fx.p, fx.s(), fx.media, 90, 100, 190, V1, A1, false).ok);
+            QCOMPARE(previousClipEdge(fx.s(), 30), FrameTime(0));
+            QCOMPARE(nextClipEdge(fx.s(), 30), FrameTime(90));
+            QCOMPARE(previousClipEdge(fx.s(), 0), FrameTime(-1));
+            // Q at 30: frames 0-29 go from every track; the first clip now starts 30 frames into its source.
+            Result r = rippleTrimToPlayhead(fx.p, fx.s(), 30, true);
+            QVERIFY(r.ok);
+            QCOMPARE(r.applied, FrameTime(30));
+            QCOMPARE(fx.s().duration(), FrameTime(150));
+            QCOMPARE(fx.v1().clips[0].sourceIn, 30.0);
+            QCOMPARE(fx.a1().clips[0].sourceIn, 30.0);
+            // W at 90 (30 into b): b's first 30 frames stay, the rest of b up to its end goes.
+            r = rippleTrimToPlayhead(fx.p, fx.s(), 90, false);
+            QVERIFY(r.ok);
+            QCOMPARE(fx.s().duration(), FrameTime(90));
+            QVERIFY(!rippleTrimToPlayhead(fx.p, fx.s(), 90, false).ok);  // nothing after the end
+        }
+        // Paste and Remove Attributes.
+        {
+            Fixture fx;
+            QVERIFY(placeMedia(fx.p, fx.s(), fx.media, 0, 0, 30, V1, A1, false).ok);
+            QVERIFY(placeMedia(fx.p, fx.s(), fx.media, 30, 0, 30, V1, A1, false).ok);
+            Clip& src = fx.v1().clips[0];
+            src.motion.params["scale"] = Param(150.0);
+            src.motion.params["pos_x"].addKey(0, 0, Interp::Linear);
+            src.motion.params["pos_x"].addKey(20, 100, Interp::Linear);
+            src.motion.params["opacity"] = Param(40.0);
+            src.blendMode = "screen";
+            src.effects.push_back(makeEffect(fx.p, "gaussian_blur"));
+            fx.a1().clips[0].audio.params["gain_db"] = Param(-6.0);
+            const Clip from = src, fromAudio = fx.a1().clips[0];
+            const Id v2 = fx.v1().clips[1].id, a2 = fx.a1().clips[1].id;
+            // Motion only: scale and the position keys, not opacity.
+            QVERIFY(pasteAttributes(fx.p, fx.s(), from, TrackKind::Video, {v2, a2}, AttrMotion).ok);
+            const Clip* t = clipById(fx.s(), v2);
+            QCOMPARE(t->motion.p("scale", 0), 150.0);
+            QCOMPARE(t->motion.params.at("pos_x").keys.size(), size_t(2));
+            QCOMPARE(t->motion.p("opacity", 0, 100), 100.0);
+            QVERIFY(t->effects.empty());
+            QVERIFY(t->motion.id != from.motion.id);
+            // Opacity and effects; effects get fresh ids.
+            QVERIFY(pasteAttributes(fx.p, fx.s(), from, TrackKind::Video, {v2}, AttrOpacity | AttrEffects).ok);
+            t = clipById(fx.s(), v2);
+            QCOMPARE(t->motion.p("opacity", 0, 100), 40.0);
+            QCOMPARE(t->blendMode, std::string("screen"));
+            QCOMPARE(t->effects.size(), size_t(1));
+            QVERIFY(t->effects[0].id != from.effects[0].id);
+            // Volume onto the audio clip only.
+            QVERIFY(pasteAttributes(fx.p, fx.s(), fromAudio, TrackKind::Audio, {v2, a2}, AttrVolume).ok);
+            QCOMPARE(clipById(fx.s(), a2)->audio.p("gain_db", 0), -6.0);
+            QVERIFY(!pasteAttributes(fx.p, fx.s(), from, TrackKind::Video, {a2}, AttrMotion).ok);  // nothing applies
+            // Remove: effects and motion back to defaults, opacity kept.
+            QVERIFY(removeAttributes(fx.p, fx.s(), {v2}, AttrMotion | AttrEffects).ok);
+            t = clipById(fx.s(), v2);
+            QCOMPARE(t->motion.p("scale", 0, 100), 100.0);
+            QVERIFY(!t->motion.params.at("pos_x").animated());
+            QCOMPARE(t->motion.p("opacity", 0, 100), 40.0);
+            QVERIFY(t->effects.empty());
+            QVERIFY(removeAttributes(fx.p, fx.s(), {v2}, AttrOpacity).ok);
+            QCOMPARE(clipById(fx.s(), v2)->blendMode, std::string("normal"));
+        }
+        // Frame Hold: the rest of the clip shows the frame at the split.
+        {
+            Fixture fx;
+            QVERIFY(placeMedia(fx.p, fx.s(), fx.media, 0, 60, 120, V1, A1, false).ok);
+            const Id v = fx.v1().clips[0].id;
+            Result r = addFrameHold(fx.p, fx.s(), v, 20);
+            QVERIFY2(r.ok, r.error.c_str());
+            QCOMPARE(fx.v1().clips.size(), size_t(2));
+            const Clip& held = fx.v1().clips[1];
+            QCOMPARE(held.id, r.created.at(0));
+            QCOMPARE(held.start, FrameTime(20));
+            QCOMPARE(held.sourceFrameAt(20), 80.0);
+            QCOMPARE(held.sourceFrameAt(55), 80.0);
+            QCOMPARE(fx.a1().clips.size(), size_t(1));  // the sound plays on
+            // A held clip can be trimmed out as far as wanted, and slipped frame by frame.
+            QVERIFY(trim(fx.p, fx.s(), held.id, Edge::Out, 400, TrimMode::Ripple, false).ok);
+            QCOMPARE(clipById(fx.s(), held.id)->duration, FrameTime(440));
+            QVERIFY(slip(fx.p, fx.s(), held.id, 5).ok);
+            QCOMPARE(clipById(fx.s(), held.id)->sourceFrameAt(30), 85.0);
+            QVERIFY(!addFrameHold(fx.p, fx.s(), fx.a1().clips[0].id, 10).ok);  // not sound
+        }
+        // Replace Edit and Fit to Fill.
+        {
+            Fixture fx;
+            MediaItem other = *fx.p.findMedia(fx.media);
+            other.id = fx.p.newId();
+            other.name = "other.mov";
+            other.path = "/nonexistent/other.mov";
+            fx.p.media.push_back(other);
+            QVERIFY(placeMedia(fx.p, fx.s(), fx.media, 30, 0, 60, V1, A1, false).ok);
+            Clip& c = fx.v1().clips[0];
+            c.effects.push_back(makeEffect(fx.p, "invert"));
+            c.motion.params["scale"] = Param(120.0);
+            // Source frame 100 lands on timeline frame 45 (15 frames into the clip).
+            Result r = replaceClip(fx.p, fx.s(), c.id, other.id, 100, 45);
+            QVERIFY2(r.ok, r.error.c_str());
+            QCOMPARE(r.created.size(), size_t(2));  // picture and sound
+            const Clip& v = fx.v1().clips[0];
+            QCOMPARE(v.mediaId, other.id);
+            QCOMPARE(v.sourceIn, 85.0);
+            QCOMPARE(v.start, FrameTime(30));
+            QCOMPARE(v.duration, FrameTime(60));
+            QCOMPARE(v.effects.size(), size_t(1));
+            QCOMPARE(v.motion.p("scale", 0), 120.0);
+            QCOMPARE(fx.a1().clips[0].mediaId, other.id);
+            QVERIFY(!replaceClip(fx.p, fx.s(), v.id, other.id, 5, 45).ok);  // does not reach back to the start
+            // Fit to Fill: 90 source frames into 45 timeline frames: double speed.
+            r = fitToFill(fx.p, fx.s(), fx.media, 0, 89, 100, 144, V1, A1);
+            QVERIFY2(r.ok, r.error.c_str());
+            const Clip* f = clipAt(fx.s(), V1, 120);
+            QVERIFY(f && f->start == 100 && f->duration == 45);
+            QCOMPARE(f->speed, 2.0);
+            QCOMPARE(f->sourceFrameAt(144), 88.0);
+            // Slower: 15 source frames over 60 timeline frames, over what was there.
+            r = fitToFill(fx.p, fx.s(), other.id, 0, 14, 40, 99, V1, A1);
+            QVERIFY(r.ok);
+            f = clipAt(fx.s(), V1, 50);
+            QVERIFY(f && f->mediaId == other.id && f->start == 40 && f->duration == 60);
+            QCOMPARE(f->speed, 0.25);
+            QVERIFY(!fitToFill(fx.p, fx.s(), other.id, 10, 5, 0, 10, V1, A1).ok);
+        }
+        // Track Select Forward.
+        {
+            Fixture fx;
+            QVERIFY(placeMedia(fx.p, fx.s(), fx.media, 0, 0, 30, V1, A1, false).ok);
+            QVERIFY(placeMedia(fx.p, fx.s(), fx.media, 50, 0, 30, V1, A1, false).ok);
+            fx.put(V2, 60, 10);
+            QCOMPARE(clipsFrom(fx.s(), 40).size(), size_t(3));
+            QCOMPARE(clipsFrom(fx.s(), 40, V1).size(), size_t(1));
+            QCOMPARE(clipsFrom(fx.s(), 0).size(), size_t(5));
+        }
+    }
+
     void duplicateSequences() {
         Fixture fx;
         QVERIFY(placeMedia(fx.p, fx.s(), fx.media, 0, 30, 90, V1, A1, false).ok);  // linked picture and sound
