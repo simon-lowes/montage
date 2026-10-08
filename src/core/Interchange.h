@@ -12,6 +12,11 @@
 namespace montage {
 
 // CMX 3600 EDL of one video track and the audio tracks (cuts and dissolves).
+// The sequence as the exports write it: adjustment layers have no
+// equivalent in other editors' interchange formats (they would arrive as
+// solid mattes over the picture), so they are left out.
+Sequence interchangeSequence(const Sequence& s);
+
 std::string exportEdl(const Project& p, const Sequence& s, int videoTrack = 0);
 
 // OpenTimelineIO (.otio, JSON) of the whole sequence: every track, gaps,

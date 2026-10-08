@@ -43,6 +43,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
   - **Mask tracking**: ◀ Track / Track ▶ in any mask section follows what the mask covers from the playhead to the clip's start or end. It tracks position, scale and rotation, and writes keyframes.
   - Under the hood: pyramidal Lucas–Kanade on Shi–Tomasi corners with forward–backward checks, and RANSAC similarity fits.
 - Gaussian blur, sharpen, vignette, mosaic, mirror, drop shadow
+- **Adjustment layers** (Clip › New Adjustment Layer, or Generators in the Effects panel): the effects, opacity, transform and blend mode on the layer apply to everything on the tracks below it, for a grade or a look over many clips at once.
 - Keyframes on every parameter: linear, hold or smooth, with previous/next navigation
 - Volume and opacity lines on timeline clips (Sequence › Show Clip Volume / Show Clip Opacity):
   - Drag a line to raise or lower it. Ctrl/Cmd-click adds a keyframe; drag keyframes in time and value (Shift for value only).
@@ -257,7 +258,7 @@ Its tools work on `.montage` files by path. Each edit is saved at once, and the 
 - transcribe (with speaker labels) and find spoken phrases in the cut;
 - find shots by description;
 - log media (ratings, labels, keywords, metadata fields, bins), make subclips, auto-tag shots, and find media by text or smart-bin rules, optionally saving the rules as a smart bin;
-- duck music under dialogue;
+- duck music under dialogue, and add adjustment layers;
 - return a rendered frame as an image so the agent can check its work;
 - render with any preset, with progress;
 - export and import EDL, OTIO, FCP 7 XML and FCPXML.

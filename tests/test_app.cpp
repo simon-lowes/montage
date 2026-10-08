@@ -1175,6 +1175,30 @@ private slots:
         state()->newProject();
     }
 
+    void adjustmentLayerFromTheClipMenu() {
+        loadDemo();
+        state()->setPlayhead(20);
+        const size_t tracks = state()->sequence()->videoTracks.size();
+        auto* action = win_->findChild<QAction*>("newAdjustmentLayer");
+        QVERIFY(action);
+        // Above the targeted track (V1): on V2, overwriting what is there as a matte does.
+        state()->setTargetVideoTrack(0);
+        action->trigger();
+        const Track& v2 = state()->sequence()->videoTracks.at(1);
+        const auto it = std::find_if(v2.clips.begin(), v2.clips.end(), [](const Clip& c) { return c.generator.type == "adjustment"; });
+        QVERIFY(it != v2.clips.end());
+        QCOMPARE(it->start, FrameTime(20));
+        QCOMPARE(state()->sequence()->videoTracks.size(), tracks);
+        state()->undo();
+        // From the top track, a new track is made for it.
+        state()->setTargetVideoTrack(int(tracks) - 1);
+        action->trigger();
+        QCOMPARE(state()->sequence()->videoTracks.size(), tracks + 1);
+        QCOMPARE(state()->sequence()->videoTracks.back().clips.at(0).generator.type, std::string("adjustment"));
+        state()->undo();
+        QCOMPARE(state()->sequence()->videoTracks.size(), tracks);
+    }
+
     void colourManagementUi() {
         // A short grey video to interpret.
         Project gen = makeDefaultProject();

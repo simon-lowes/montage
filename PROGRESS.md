@@ -289,4 +289,9 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
     - synthetic speech with a short pause and a knock: spans within 60 ms, levels at each point, fades and idempotence;
     - transcript words following the clip's position, muted tracks, and the MCP tool;
     - the dialog's defaults and undo in the app.
+- [x] Adjustment layers (Premiere's adjustment layers, Resolve's adjustment clips):
+  - An "adjustment" generator. Its picture is the composite of the tracks below at that frame, run through its own effects (masks and keyframes included), transform and opacity, then blended over that composite. With nothing below, it draws nothing. Transitions on its track see the same picture.
+  - Clip › New Adjustment Layer puts 5 s at the playhead on the track above the targeted one, adding a track at the top. It is also under Generators in the Effects panel. MCP `montage_add_adjustment_layer`.
+  - Interchange exports leave adjustment layers (and their transitions) out, since other editors would read them as solid mattes.
+  - Tested: inversion of the tracks below but not above, opacity mix, disabled, nothing below, blend mode, the menu action and track creation, the MCP tool, and the exports.
 

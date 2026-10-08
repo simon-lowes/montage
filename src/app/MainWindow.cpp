@@ -439,6 +439,20 @@ void MainWindow::buildMenus() {
             });
         }));
 
+    add(clipM, tr("New &Adjustment Layer"), QKeySequence(), withSeq([this] {
+            // Above the targeted track (a new track if it is the top one), so it adjusts what is below.
+            const Sequence* s = state_->sequence();
+            FrameTime at = s->playhead, len = FrameTime(std::llround(5 * s->fpsValue()));
+            int vt = state_->targetVideoTrack() + 1;
+            state_->apply(tr("New Adjustment Layer"), [=](Project& p, Sequence& sq) {
+                TrackRef track{TrackKind::Video, std::min(vt, int(sq.videoTracks.size()))};
+                if (track.index == int(sq.videoTracks.size())) track = edit::addTrack(p, sq, TrackKind::Video);
+                Clip c = makeGeneratorClip(p, "adjustment", len);
+                c.start = at;
+                return edit::overwrite(p, sq, track, c);
+            });
+        }))->setObjectName(QStringLiteral("newAdjustmentLayer"));
+
     // ---- Sequence
     QMenu* seqM = menuBar()->addMenu(tr("&Sequence"));
     add(seqM, tr("Sequence &Settings…"), QKeySequence(), [this] { SequenceSettingsDialog::editActive(state_, this); });

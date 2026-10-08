@@ -970,6 +970,31 @@ void McpServer::Impl::addTools() {
                       QJsonObject{{"dialogue", list}, {"clips_changed", changed}});
         });
 
+    add("montage_add_adjustment_layer", "Add an adjustment layer",
+        "Add an adjustment layer: a clip whose effects (montage_add_effect on the returned clip id), opacity and blend mode "
+        "apply to everything on the tracks below it, for a grade or a look over many clips at once.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"at":{"type":["number","string"]},
+            "duration":{"type":["number","string"],"description":"Default: to the end of the sequence"},
+            "track":{"type":"string","description":"Default: a new video track on top"}},"required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : 0;
+            FrameTime len = a.contains("duration") ? timeArg(a.value("duration"), s, "duration") : s.duration() - at;
+            if (len <= 0) throw ArgError{"The layer needs a length (the sequence is empty after \"at\")"};
+            const TrackRef track = a.contains("track") ? trackArg(str(a, "track"), s, true, &l.project, &s)
+                                                       : edit::addTrack(l.project, s, TrackKind::Video);
+            if (track.kind != TrackKind::Video) throw ArgError{"An adjustment layer goes on a video track"};
+            Clip c = makeGeneratorClip(l.project, "adjustment", len);
+            c.start = at;
+            const Id id = c.id;
+            check(edit::overwrite(l.project, s, track, c));
+            save(l);
+            const Clip* placed = edit::clipById(s, id);
+            const QJsonObject o = placed ? clipJson(l.project, s, *placed) : QJsonObject{};
+            return ok(QStringLiteral("Adjustment layer %1 on V%2 from %3").arg(qulonglong(id)).arg(track.index + 1).arg(tc(at, s)), o);
+        });
+
     add("montage_render_frame", "Look at a frame",
         "Render the program at a timeline time and return it as an image (to check an edit), optionally saving a PNG.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"at":{"type":["number","string"]},

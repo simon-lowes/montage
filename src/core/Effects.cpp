@@ -255,6 +255,8 @@ std::vector<EffectInfo> buildCatalog() {
                   angle("angle", "Angle", 90), choice("shape", "Shape", {"Linear", "Radial"})},
                  {}});
     c.push_back({"bars", "Color Bars", EffectCategory::Generator, "Generators", {}, {}});
+    // Its effects, opacity and blend mode apply to everything on the tracks below it.
+    c.push_back({"adjustment", "Adjustment Layer", EffectCategory::Generator, "Generators", {}, {}});
     {
         EffectInfo title{"title", "Title", EffectCategory::Generator, "Titles",
                          {

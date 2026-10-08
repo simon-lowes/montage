@@ -272,14 +272,21 @@ void sourceSize(const Geometry& g, double scale, int nativeW, int nativeH, int& 
     h = int(std::ceil(std::min<double>(nativeH, std::max(1.0, wantH))));
 }
 
-Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o) {
+// `below` is what the tracks under the clip have made so far, for adjustment layers.
+Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o,
+                const Image* below = nullptr) {
     const FrameTime lt = t - c.start;
     const int SW = seq.width, SH = seq.height;
     Image src;
     double mw = SW, mh = SH;
     Geometry g;
     double sourceSeconds = -1;  // media time of the frame, for effects that follow the footage
-    if (c.isGenerator()) {
+    if (c.isGenerator() && c.generator.type == "adjustment") {
+        // An adjustment layer's picture is the composite beneath it (already in the working space).
+        if (!below || below->empty()) return {};
+        g = geometryFor(c.motion, lt, SW, SH, SW, SH);
+        src = *below;
+    } else if (c.isGenerator()) {
         g = geometryFor(c.motion, lt, SW, SH, SW, SH);
         int w, h;
         sourceSize(g, o.scale, int(SW * 4), int(SH * 4), w, h);
@@ -394,8 +401,9 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
             const Clip* A = findClip(track, active->clipA);
             const Clip* B = findClip(track, active->clipB);
             double u = (double(t - from) + 0.5) / double(std::max<FrameTime>(1, to - from));
-            Image la = (A && A->enabled) ? clipLayer(p, seq, *A, t, o) : Image();
-            Image lb = (B && B->enabled) ? clipLayer(p, seq, *B, t, o) : Image();
+            const Image* below = canvasEmpty ? nullptr : &canvas;
+            Image la = (A && A->enabled) ? clipLayer(p, seq, *A, t, o, below) : Image();
+            Image lb = (B && B->enabled) ? clipLayer(p, seq, *B, t, o, below) : Image();
             Image mixed = transitionMix(active->type, active->params, la, lb, u, W, H);
             const Clip* top = B ? B : A;
             composite(std::move(mixed), top ? top->blendMode : "normal");
@@ -404,7 +412,7 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
         for (const auto& c : track.clips) {
             if (c.start > t) break;
             if (!c.contains(t) || !c.enabled) continue;
-            composite(clipLayer(p, seq, c, t, o), c.blendMode);
+            composite(clipLayer(p, seq, c, t, o, canvasEmpty ? nullptr : &canvas), c.blendMode);
             break;
         }
     }

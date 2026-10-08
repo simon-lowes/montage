@@ -1126,6 +1126,16 @@ private slots:
             QVERIFY(loadProject(project.toStdString(), saved) && saved.media.at(0).visual);
         }
 
+        // An adjustment layer on a new top track, then an effect on it.
+        r = tool("montage_add_adjustment_layer", QJsonObject{{"project", project}, {"at", 0}, {"duration", 0.2}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        const double layer = r.value("structuredContent").toObject().value("id").toDouble();
+        QCOMPARE(r.value("structuredContent").toObject().value("generator").toString(), QString("adjustment"));
+        r = tool("montage_add_effect", QJsonObject{{"project", project}, {"clip", layer}, {"effect", "invert"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = tool("montage_add_adjustment_layer", QJsonObject{{"project", project}, {"at", 0}, {"track", "A1"}});
+        QVERIFY(r.value("isError").toBool());
+
         // Tagging footage by what it shows (from the same index).
         if (visualSearchAvailable() && visualModel().installed()) {
             r = tool("montage_auto_tag", QJsonObject{{"project", project}});

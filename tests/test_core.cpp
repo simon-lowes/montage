@@ -1351,6 +1351,25 @@ private slots:
         QCOMPARE(transitionById(fx.s(), c.created[0])->duration, FrameTime(20));
     }
 
+    void adjustmentLayersStayOutOfInterchange() {
+        Fixture fx;
+        fx.put(V1, 0, 60);
+        Clip adj = makeGeneratorClip(fx.p, "adjustment", 30);
+        adj.start = 10;
+        QVERIFY(overwrite(fx.p, fx.s(), V2, adj).ok);
+        Clip after = makeGeneratorClip(fx.p, "color", 20);
+        after.start = 40;
+        QVERIFY(overwrite(fx.p, fx.s(), V2, after).ok);
+        QVERIFY(addTransition(fx.p, fx.s(), adj.id, Edge::Out, "cross_dissolve", 4).ok);
+        const Sequence out = interchangeSequence(fx.s());
+        QCOMPARE(out.videoTracks[1].clips.size(), size_t(1));
+        QCOMPARE(out.videoTracks[1].clips[0].generator.type, std::string("color"));
+        QVERIFY(out.videoTracks[1].transitions.empty());
+        QCOMPARE(out.videoTracks[0].clips.size(), size_t(1));
+        for (const std::string& xml : {exportFcp7Xml(fx.p, fx.s()), exportFcpXml(fx.p, fx.s()), exportOtio(fx.p, fx.s())})
+            QVERIFY(QString::fromStdString(xml).indexOf("Adjustment") < 0);
+    }
+
     void interchangeExports() {
         Fixture fx;
         Id a = fx.put(V1, 0, 60, 30);

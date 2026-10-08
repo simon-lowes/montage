@@ -508,7 +508,8 @@ std::string withEncoding(std::string xml) {
 }
 }  // namespace
 
-std::string exportFcp7Xml(const Project& p, const Sequence& s) {
+std::string exportFcp7Xml(const Project& p, const Sequence& sequence) {
+    const Sequence s = interchangeSequence(sequence);
     Fcp7Writer w(p, s);
     return withEncoding(w.run());
 }
@@ -969,7 +970,8 @@ ImportResult importFcpx(Project& p, const QDomDocument& doc, const MediaProber& 
 
 }  // namespace
 
-std::string exportFcpXml(const Project& p, const Sequence& s) {
+std::string exportFcpXml(const Project& p, const Sequence& sequence) {
+    const Sequence s = interchangeSequence(sequence);
     FcpxWriter w(p, s);
     return withEncoding(w.run());
 }

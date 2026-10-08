@@ -689,6 +689,66 @@ colorspaces:
         QVERIFY(near(c[2], 1));
     }
 
+    void adjustmentLayers() {
+        // Red on V1 for 60 frames, an inverting adjustment layer on V2 for frames 10-30, blue in a corner on V3.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 160;
+        s.height = 90;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, colorClip(p, 0.8f, 0.1f, 0.1f, 0, 60));
+        Clip adj = makeGeneratorClip(p, "adjustment", 20);
+        adj.start = 10;
+        QCOMPARE(adj.name, std::string("Adjustment Layer"));
+        adj.effects.push_back(makeEffect(p, "invert"));
+        const Id adjId = adj.id;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 1}, adj).ok);
+        Clip corner = colorClip(p, 0, 0, 1, 0, 60);
+        corner.motion.params["scale"] = 25.0;
+        corner.motion.params["pos_x"] = -60.0;
+        corner.motion.params["pos_y"] = -34.0;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 2}, corner).ok);
+        RenderOptions o;
+        float c[4];
+        // Outside the layer: the red as it is.
+        Image img = renderProgramFrame(p, s, 5, o);
+        rgb(img, 80, 45, c);
+        QVERIFY(near(c[0], 0.8f) && near(c[1], 0.1f));
+        // Under the layer: everything below is inverted; the track above it is not.
+        img = renderProgramFrame(p, s, 20, o);
+        rgb(img, 80, 45, c);
+        QVERIFY2(near(c[0], 0.2f) && near(c[1], 0.9f) && near(c[2], 0.9f), qPrintable(QString("%1 %2 %3").arg(c[0]).arg(c[1]).arg(c[2])));
+        rgb(img, 20, 11, c);
+        QVERIFY(near(c[2], 1) && near(c[0], 0));
+        // Opacity mixes the adjusted picture with the original.
+        Clip* layer = edit::clipById(s, adjId);
+        layer->motion.params["opacity"] = 50.0;
+        img = renderProgramFrame(p, s, 20, o);
+        rgb(img, 80, 45, c);
+        QVERIFY(near(c[0], 0.5f) && near(c[1], 0.5f));
+        layer->motion.params["opacity"] = 100.0;
+        // A disabled layer does nothing.
+        layer->enabled = false;
+        img = renderProgramFrame(p, s, 20, o);
+        rgb(img, 80, 45, c);
+        QVERIFY(near(c[0], 0.8f));
+        layer->enabled = true;
+        // With nothing below it, it draws nothing.
+        Project empty = makeDefaultProject();
+        Sequence& es = *empty.active();
+        es.width = 64;
+        es.height = 36;
+        Clip lone = makeGeneratorClip(empty, "adjustment", 10);
+        lone.effects.push_back(makeEffect(empty, "invert"));
+        edit::overwrite(empty, es, {TrackKind::Video, 1}, lone);
+        img = renderSequenceFrame(empty, es, 5, o);
+        QCOMPARE(img.at(32, 18)[3], 0.f);
+        // A blend mode applies to the adjusted picture: Multiply by the inverted red darkens it.
+        layer->blendMode = "multiply";
+        img = renderProgramFrame(p, s, 20, o);
+        rgb(img, 80, 45, c);
+        QVERIFY2(near(c[0], 0.16f) && near(c[1], 0.09f), qPrintable(QString("%1 %2").arg(c[0]).arg(c[1])));
+    }
+
     void compositorTransitionAndCrop() {
         Project p = makeDefaultProject();
         Sequence& s = *p.active();

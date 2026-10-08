@@ -96,7 +96,22 @@ struct EdlWriter {
 
 }  // namespace
 
-std::string exportEdl(const Project& p, const Sequence& s, int videoTrack) {
+Sequence interchangeSequence(const Sequence& in) {
+    Sequence s = in;
+    for (Track& t : s.videoTracks) {
+        std::vector<Id> gone;
+        for (const Clip& c : t.clips)
+            if (c.isGenerator() && c.generator.type == "adjustment") gone.push_back(c.id);
+        if (gone.empty()) continue;
+        auto removed = [&](Id id) { return std::find(gone.begin(), gone.end(), id) != gone.end(); };
+        std::erase_if(t.clips, [&](const Clip& c) { return removed(c.id); });
+        std::erase_if(t.transitions, [&](const Transition& tr) { return removed(tr.clipA) || removed(tr.clipB); });
+    }
+    return s;
+}
+
+std::string exportEdl(const Project& p, const Sequence& sequence, int videoTrack) {
+    const Sequence s = interchangeSequence(sequence);
     EdlWriter w{p, s, {}, 0};
     w.out << "TITLE: " << s.name << "\n";
     w.out << "FCM: " << (isDropFrameRate(s.fps) ? "DROP FRAME" : "NON-DROP FRAME") << "\n\n";
@@ -205,7 +220,8 @@ QJsonObject trackJson(const Project& p, const Sequence& s, const Track& t) {
 
 }  // namespace
 
-std::string exportOtio(const Project& p, const Sequence& s) {
+std::string exportOtio(const Project& p, const Sequence& sequence) {
+    const Sequence s = interchangeSequence(sequence);
     const double rate = s.fpsValue();
     QJsonArray tracks;
     for (const auto& t : s.videoTracks) tracks.append(trackJson(p, s, t));
