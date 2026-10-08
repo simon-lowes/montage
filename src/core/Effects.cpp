@@ -231,6 +231,32 @@ std::vector<EffectInfo> buildCatalog() {
 #ifndef MONTAGE_WITH_RNNOISE
     c.back().hidden = true;  // needs the RNNoise model
 #endif
+    c.push_back({"parametric_eq", "Parametric EQ", EffectCategory::AudioFilter, "EQ",
+                 {num("low_hz", "Low Shelf (Hz)", 20, 1000, 100, 1), num("low_db", "Low Shelf (dB)", -24, 24, 0, 0.1),
+                  num("b1_hz", "Band 1 (Hz)", 20, 20000, 250, 1), num("b1_db", "Band 1 (dB)", -24, 24, 0, 0.1),
+                  num("b1_q", "Band 1 Q", 0.1, 20, 1), num("b2_hz", "Band 2 (Hz)", 20, 20000, 1000, 1),
+                  num("b2_db", "Band 2 (dB)", -24, 24, 0, 0.1), num("b2_q", "Band 2 Q", 0.1, 20, 1),
+                  num("b3_hz", "Band 3 (Hz)", 20, 20000, 4000, 1), num("b3_db", "Band 3 (dB)", -24, 24, 0, 0.1),
+                  num("b3_q", "Band 3 Q", 0.1, 20, 1), num("high_hz", "High Shelf (Hz)", 1000, 20000, 10000, 1),
+                  num("high_db", "High Shelf (dB)", -24, 24, 0, 0.1), num("output_db", "Output (dB)", -24, 24, 0, 0.1)},
+                 {}});
+    c.push_back({"deesser", "De-Esser", EffectCategory::AudioFilter, "Dynamics",
+                 {num("hz", "Frequency (Hz)", 2000, 12000, 6000, 10), num("threshold_db", "Threshold (dB)", -60, 0, -30, 0.1),
+                  num("reduction_db", "Max Reduction (dB)", 0, 24, 10, 0.1)},
+                 {}});
+    c.push_back({"gate", "Noise Gate", EffectCategory::AudioFilter, "Dynamics",
+                 {num("threshold_db", "Threshold (dB)", -80, 0, -45, 0.1), num("range_db", "Range (dB)", -80, 0, -40, 0.1),
+                  num("attack_ms", "Attack (ms)", 0.1, 50, 1, 0.1), num("hold_ms", "Hold (ms)", 0, 500, 50, 1),
+                  num("release_ms", "Release (ms)", 5, 2000, 150, 1)},
+                 {}});
+    c.push_back({"reverb", "Reverb", EffectCategory::AudioFilter, "Time",
+                 {pct("size", "Room Size", 0, 100, 50), pct("damping", "Damping", 0, 100, 50), pct("width", "Width", 0, 100, 100),
+                  pct("mix", "Mix", 0, 100, 25)},
+                 {}});
+    c.push_back({"channels", "Channel Tools", EffectCategory::AudioFilter, "Channels",
+                 {choice("mode", "Channels", {"Stereo", "Mono (Sum)", "Left to Both", "Right to Both", "Swap Left and Right"}, 0),
+                  boolean("invert_l", "Invert Left Polarity"), boolean("invert_r", "Invert Right Polarity")},
+                 {}});
     c.push_back({"highpass", "High-Pass Filter", EffectCategory::AudioFilter, "EQ",
                  {num("hz", "Cutoff (Hz)", 20, 2000, 80, 1)}, {}});
     c.push_back({"lowpass", "Low-Pass Filter", EffectCategory::AudioFilter, "EQ",

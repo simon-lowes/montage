@@ -40,6 +40,7 @@
 #endif
 #include "render/ClipAnalysis.h"
 #include "render/ColorSpace.h"
+#include "render/AudioFx.h"
 #include "render/Compositor.h"
 #include "render/Exporter.h"
 #include "render/Processing.h"
@@ -286,6 +287,112 @@ private slots:
         }
         const double tp = measureLoudness(between).truePeakDb;
         QVERIFY2(std::fabs(tp - 20 * std::log10(0.5)) < 0.3, qPrintable(QString::number(tp)));
+    }
+
+    void builtInAudioEffects() {
+        constexpr int sr = 48000;
+        auto tone = [](double hz, double amp, int frames = 48000) {
+            std::vector<float> b(size_t(frames) * 2);
+            for (int i = 0; i < frames; ++i) b[size_t(i) * 2] = b[size_t(i) * 2 + 1] = float(amp * std::sin(2 * M_PI * hz * i / sr));
+            return b;
+        };
+        // RMS in dB over the second half (past any settling).
+        auto rmsDb = [](const std::vector<float>& b) {
+            double sum = 0;
+            const size_t from = b.size() / 2;
+            for (size_t i = from; i < b.size(); ++i) sum += double(b[i]) * b[i];
+            return 10 * std::log10(sum / double(b.size() - from) + 1e-20);
+        };
+        const double ref1k = rmsDb(tone(1000, 0.1)), ref100 = rmsDb(tone(100, 0.1));
+
+        // Parametric EQ: a +12 dB bell at 1 kHz lifts 1 kHz, not 100 Hz; the low shelf cuts 50 Hz.
+        fx::ParametricEq eq;
+        eq.set(sr, {100, 0, 1}, {250, 0, 1}, {1000, 12, 1}, {4000, 0, 1}, {10000, 0, 1}, 0);
+        auto b = tone(1000, 0.1);
+        eq.process(b.data(), sr);
+        QVERIFY2(std::fabs(rmsDb(b) - ref1k - 12) < 0.3, qPrintable(QString::number(rmsDb(b) - ref1k)));
+        fx::ParametricEq eq2;
+        eq2.set(sr, {100, 0, 1}, {250, 0, 1}, {1000, 12, 1}, {4000, 0, 1}, {10000, 0, 1}, 0);
+        b = tone(100, 0.1);
+        eq2.process(b.data(), sr);
+        QVERIFY(std::fabs(rmsDb(b) - ref100) < 0.6);
+        fx::ParametricEq shelf;
+        shelf.set(sr, {200, -12, 1}, {250, 0, 1}, {1000, 0, 1}, {4000, 0, 1}, {10000, 0, 1}, -3);
+        b = tone(30, 0.1);
+        shelf.process(b.data(), sr);
+        QVERIFY2(std::fabs(rmsDb(b) - rmsDb(tone(30, 0.1)) + 15) < 0.7, qPrintable(QString::number(rmsDb(b) - rmsDb(tone(30, 0.1)))));
+
+        // De-esser: a loud 7 kHz "s" comes down by up to the reduction; a 1 kHz voice does not.
+        fx::DeEsser ds;
+        b = tone(7000, 0.3);
+        ds.process(b.data(), sr, sr, 5000, -30, 10);
+        const double cut = rmsDb(tone(7000, 0.3)) - rmsDb(b);
+        QVERIFY2(cut > 6 && cut < 11, qPrintable(QString::number(cut)));
+        fx::DeEsser ds2;
+        b = tone(1000, 0.3);
+        ds2.process(b.data(), sr, sr, 5000, -30, 10);
+        QVERIFY(std::fabs(rmsDb(b) - rmsDb(tone(1000, 0.3))) < 0.5);
+
+        // Noise gate: speech-level sound passes, hiss below the threshold drops by the range.
+        fx::NoiseGate gate;
+        b = tone(1000, 0.1);
+        gate.process(b.data(), sr, sr, -45, -40, 1, 50, 150);
+        QVERIFY(std::fabs(rmsDb(b) - ref1k) < 0.2);
+        fx::NoiseGate gate2;
+        b = tone(1000, 0.002);  // -54 dBFS
+        gate2.process(b.data(), sr, sr, -45, -40, 1, 50, 150);
+        QVERIFY2(std::fabs(rmsDb(b) - rmsDb(tone(1000, 0.002)) + 40) < 1, qPrintable(QString::number(rmsDb(b) - rmsDb(tone(1000, 0.002)))));
+
+        // Reverb: a click rings on and dies away; with no mix the sound is untouched.
+        fx::Reverb rv;
+        std::vector<float> click(size_t(sr) * 2 * 2, 0.f);
+        click[0] = click[1] = 1.f;
+        rv.process(click.data(), 2 * sr, sr, 0.7, 0.3, 1, 1);
+        auto energy = [&](int from, int to) {
+            double e = 0;
+            for (int i = from; i < to; ++i) e += double(click[size_t(i) * 2]) * click[size_t(i) * 2];
+            return e;
+        };
+        QVERIFY(energy(sr / 10, sr / 5) > 1e-4);           // still ringing 100-200 ms later
+        QVERIFY(energy(sr, sr + sr / 10) < energy(sr / 10, sr / 5));  // and fading
+        fx::Reverb dry;
+        b = tone(1000, 0.1);
+        const auto before = b;
+        dry.process(b.data(), sr, sr, 0.7, 0.3, 1, 0);
+        QCOMPARE(b, before);
+
+        // Channel tools: a microphone on the left only fills both sides; swap; mono; polarity.
+        std::vector<float> lr{0.5f, 0.f, -0.25f, 0.f};
+        auto ch = lr;
+        fx::channelTools(ch.data(), 2, 2, false, false);
+        QCOMPARE(ch, (std::vector<float>{0.5f, 0.5f, -0.25f, -0.25f}));
+        ch = lr;
+        fx::channelTools(ch.data(), 2, 4, false, false);
+        QCOMPARE(ch, (std::vector<float>{0.f, 0.5f, 0.f, -0.25f}));
+        ch = lr;
+        fx::channelTools(ch.data(), 2, 1, false, true);
+        QCOMPARE(ch, (std::vector<float>{0.25f, -0.25f, -0.125f, 0.125f}));
+
+        // In the mixer, as clip effects: Left to Both on a left-only file.
+        const std::string wav = path("left.wav");
+        writeWav(wav, 48000, 1.0, 0.5f, 0.f);
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        MediaItem m = probeOrFail(p, wav);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Clip& c = s.audioTracks[0].clips.front();
+        Effect tools = makeEffect(p, "channels");
+        tools.params["mode"] = 2.0;
+        c.effects.push_back(tools);
+        c.effects.push_back(makeEffect(p, "parametric_eq"));
+        c.effects.push_back(makeEffect(p, "gate"));
+        c.effects.push_back(makeEffect(p, "deesser"));
+        AudioMixer mixer;
+        std::vector<float> out(4800 * 2);
+        mixer.mix(p, s, 12000, 4800, out.data());
+        QVERIFY2(std::fabs(out[4000 * 2] - out[4000 * 2 + 1]) < 1e-5f && out[4000 * 2] > 0.4f,
+                 qPrintable(QString("%1 %2").arg(out[4000 * 2]).arg(out[4000 * 2 + 1])));
     }
 
     void peakLimiter() {

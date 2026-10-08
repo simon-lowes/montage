@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 
+#include "AudioFx.h"
 #include "ColorSpace.h"
 #include "Processing.h"
 #include "Retime.h"
@@ -650,6 +651,10 @@ inline float dbToLin(double db) { return db <= -96 ? 0.0f : float(std::pow(10.0,
 
 struct AudioMixer::State {
     Biquad bq[3];
+    fx::ParametricEq eq;
+    fx::DeEsser deesser;
+    fx::NoiseGate gate;
+    fx::Reverb reverb;
     std::vector<double> lastParams;
     double env = 0;
     double gain = 1;
@@ -811,6 +816,26 @@ void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameT
                 d[0] = std::clamp(float(d[0] * st->gain), -ceil, ceil);
                 d[1] = std::clamp(float(d[1] * st->gain), -ceil, ceil);
             }
+        } else if (e.type == "parametric_eq") {
+            if (changed) {
+                auto band = [&](const char* n, double hz, bool q) {
+                    const std::string b(n);
+                    return fx::EqBand{e.p(b + "_hz", lt, hz), e.p(b + "_db", lt, 0), q ? e.p(b + "_q", lt, 1) : 1.0};
+                };
+                st->eq.set(sr, band("low", 100, false), band("b1", 250, true), band("b2", 1000, true), band("b3", 4000, true),
+                           band("high", 10000, false), e.p("output_db", lt, 0));
+            }
+            st->eq.process(buf, frames);
+        } else if (e.type == "deesser") {
+            st->deesser.process(buf, frames, sr, e.p("hz", lt, 6000), e.p("threshold_db", lt, -30), e.p("reduction_db", lt, 10));
+        } else if (e.type == "gate") {
+            st->gate.process(buf, frames, sr, e.p("threshold_db", lt, -45), e.p("range_db", lt, -40), e.p("attack_ms", lt, 1),
+                             e.p("hold_ms", lt, 50), e.p("release_ms", lt, 150));
+        } else if (e.type == "reverb") {
+            st->reverb.process(buf, frames, sr, e.p("size", lt, 50) / 100, e.p("damping", lt, 50) / 100, e.p("width", lt, 100) / 100,
+                               e.p("mix", lt, 25) / 100);
+        } else if (e.type == "channels") {
+            fx::channelTools(buf, frames, int(e.p("mode", lt, 0)), e.p("invert_l", lt) > 0.5, e.p("invert_r", lt) > 0.5);
         } else if (e.type == "plugin") {
             processPlugin(*st, e, sr, lt, changed, buf, frames);
         } else if (e.type == "delay") {

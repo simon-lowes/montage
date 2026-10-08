@@ -317,4 +317,16 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
     - the ruler and empty lanes move the playhead.
   - Clip parameters are addressed in core (ParamAddress, findParam), for this panel and later tools.
   - Tested: the shifting maths and addressing; in the app with the mouse, selection, dragging with undo, box selection, nudging against the clip start, interpolation, Delete with undo, double-click and the ruler.
+- [x] More built-in audio effects (render/AudioFx), keyframeable like the others:
+  - Parametric EQ: low shelf, three bells with Q, high shelf, and output gain (RBJ biquads).
+  - De-Esser: a Linkwitz-Riley (LR4) split at the chosen frequency, so the bands add back flat. The upper band comes down 1:1 over the threshold, up to the set reduction, with a 0.5 ms attack and 50 ms release.
+  - Noise Gate: peak detector, threshold, range (how far down when closed), attack, hold and release.
+  - Reverb: Freeverb's eight damped combs and four all-passes per channel, scaled to the sample rate, with size, damping, width and mix.
+  - Channel Tools: Left to Both and Right to Both (a mic on one channel), mono sum, swap, and polarity invert per side.
+  - Tested:
+    - +12 dB at 1 kHz within 0.3 dB, with 100 Hz untouched; a -12 dB shelf with -3 dB output;
+    - de-essing 6-11 dB on 7 kHz, with 1 kHz untouched;
+    - the gate passing speech and dropping hiss by the range;
+    - the reverb's tail ringing and decaying, and dry at 0 mix;
+    - every channel mode, and the effects on a clip in the mixer.
 

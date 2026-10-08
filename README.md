@@ -89,7 +89,11 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Plugin delay compensation: the latency plugins report is compensated on clips, tracks, buses and the master, so everything stays in sync with the picture and with other tracks, including straight after a seek.
 - Render and Replace bakes an audio clip's effects into a new audio file to save CPU, and Restore Unrendered brings the original back (both on the clip's right-click menu).
 - Peak meters with hold and clip indicators
-- Effects: 3-band EQ, compressor, limiter, high/low-pass, delay
+- Effects:
+  - EQ: 3-band and 5-band parametric EQ (low shelf, three bells, high shelf), high/low-pass.
+  - Dynamics: compressor, limiter, de-esser (split-band), noise gate (threshold, range, attack, hold, release).
+  - Space: reverb (Freeverb design) and delay.
+  - Channel tools: fill both sides from the left or right microphone, mono, swap, and polarity invert.
 - Third-party audio plugins: VST3, CLAP and LV2 plugins, and Audio Units on macOS, run as clip, track, bus and master effects. Their parameters are keyframeable, their settings are saved in the project, and their latency is compensated. LV2 hosting uses lilv when it is installed. The Effects browser lists plugins by vendor, and Tools › Audio Plugins shows every plugin found and its status.
 - Plugin editors: the Editor button on a plugin effect opens the plugin's own interface in a window, as in a DAW. Turning its knobs makes ordinary undoable, keyframe-aware parameter edits. The plugin's settings are saved in the project. Undo and Inspector changes show up in the open editor.
 - Plugin scanning works like a DAW's: new or changed plugins load in a separate helper process, so one that crashes or hangs is blocked instead of taking Montage down. Results are cached, so later launches are quick.
