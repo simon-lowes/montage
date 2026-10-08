@@ -55,6 +55,7 @@ add_library(montage_engine STATIC
   render/Processing.h render/Processing.cpp
   render/FaceRefine.h render/FaceRefine.cpp
   render/Relight.h render/Relight.cpp
+  render/FilmLook.h render/FilmLook.cpp
   render/Retime.h render/Retime.cpp
   render/VideoDenoise.h render/VideoDenoise.cpp
   render/Shapes.h render/Shapes.cpp

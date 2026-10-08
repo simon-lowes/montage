@@ -17,6 +17,7 @@
 #include "render/Ocio.h"
 #include "render/Processing.h"
 #include "render/Relight.h"
+#include "render/FilmLook.h"
 #include "media/DepthMap.h"
 #include "render/RenderCache.h"
 #include "render/Shapes.h"
@@ -58,6 +59,126 @@ Clip colorClip(Project& p, float r, float g, float b, FrameTime start, FrameTime
 class TestRender : public QObject {
     Q_OBJECT
 private slots:
+    void filmLookParts() {
+        auto none = [] {
+            FilmLookSettings s;
+            s.halation = s.bloom = s.grain = s.weave = s.vignette = s.softness = s.flicker = s.aberration = s.fade = 0;
+            return s;
+        };
+        const int W = 400, H = 300;
+        // A white square on black: halation glows red-orange round it, bloom glows neutral.
+        Image square(W, H);
+        square.fill(0, 0, 0, 1);
+        for (int y = 120; y < 180; ++y)
+            for (int x = 170; x < 230; ++x) std::fill_n(square.at(x, y), 3, 1.0f);
+        FilmLookSettings s = none();
+        s.halation = 1;
+        Image img = square;
+        filmLook(img, s, 0);
+        const float* near = img.at(234, 150);
+        QVERIFY2(near[0] > 0.05f && near[0] > near[1] * 2 && near[1] > near[2], qPrintable(QString("%1 %2 %3").arg(near[0]).arg(near[1]).arg(near[2])));
+        QCOMPARE(img.at(10, 10)[0], 0.0f);
+        s = none();
+        s.bloom = 1;
+        img = square;
+        filmLook(img, s, 0);
+        const float* glow = img.at(240, 150);
+        QVERIFY2(glow[0] > 0.02f && std::abs(glow[0] - glow[2]) < glow[0] * 0.05f, qPrintable(QString("%1 %2 %3").arg(glow[0]).arg(glow[1]).arg(glow[2])));
+        // Grain on flat grey: the mean kept, the spread with the gauge, the same frame the same.
+        Image grey(W, H);
+        grey.fill(0.5f, 0.5f, 0.5f, 1);
+        auto spread = [&](int gauge, FrameTime t, double* mean = nullptr) {
+            FilmLookSettings g = none();
+            g.grain = 1;
+            g.gauge = gauge;
+            Image im = grey;
+            filmLook(im, g, t);
+            double sum = 0, sq = 0;
+            for (size_t i = 0; i < im.px.size(); i += 4) sum += im.px[i + 1], sq += double(im.px[i + 1]) * im.px[i + 1];
+            const double n = double(im.px.size() / 4), m = sum / n;
+            if (mean) *mean = m;
+            return std::sqrt(sq / n - m * m);
+        };
+        double mean = 0;
+        const double s35 = spread(1, 3, &mean), s65 = spread(0, 3), s8 = spread(3, 3);
+        QVERIFY2(std::abs(mean - 0.5) < 0.01, qPrintable(QString::number(mean)));
+        QVERIFY(s35 > 0.01 && s65 < s35 && s8 > s35);
+        QCOMPARE(spread(1, 3), s35);
+        {
+            FilmLookSettings g = none();
+            g.grain = 1;
+            Image a = grey, b = grey;
+            filmLook(a, g, 3);
+            filmLook(b, g, 4);
+            QVERIFY(a.px != b.px);
+        }
+        // Gate weave: a dot wanders a little from frame to frame, and not at all without it.
+        Image dot(W, H);
+        dot.fill(0, 0, 0, 1);
+        for (int y = 148; y < 152; ++y)
+            for (int x = 198; x < 202; ++x) std::fill_n(dot.at(x, y), 3, 1.0f);
+        auto centre = [&](const Image& im) {
+            double sx = 0, sy = 0, sw = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const double v = im.at(x, y)[1];
+                    sx += v * x, sy += v * y, sw += v;
+                }
+            return std::pair{sx / sw, sy / sw};
+        };
+        s = none();
+        s.weave = 1;
+        double most = 0;
+        for (FrameTime t : {0, 12, 24, 37, 50}) {
+            Image im = dot;
+            filmLook(im, s, t);
+            const auto [cx, cy] = centre(im);
+            most = std::max(most, std::hypot(cx - 199.5, cy - 149.5));
+            QVERIFY(std::hypot(cx - 199.5, cy - 149.5) < 2.5);
+        }
+        QVERIFY(most > 0.1);
+        // Vignette darkens the corners only; fade lifts black; softness takes the edge off.
+        s = none();
+        s.vignette = 1;
+        img = grey;
+        filmLook(img, s, 0);
+        QVERIFY(img.at(2, 2)[0] < 0.3f && std::abs(img.at(200, 150)[0] - 0.5f) < 1e-4f);
+        s = none();
+        s.fade = 1;
+        img = square;
+        filmLook(img, s, 0);
+        QVERIFY(img.at(10, 10)[0] > 0.05f && img.at(200, 150)[0] > 0.99f);
+        s = none();
+        s.softness = 1;
+        img = square;
+        filmLook(img, s, 0);
+        QVERIFY(img.at(169, 150)[0] > 0.05f && img.at(170, 150)[0] < 0.95f);
+        // Flicker moves the brightness from frame to frame, within a few percent.
+        s = none();
+        s.flicker = 1;
+        double lo = 1, hi = 0;
+        for (FrameTime t = 0; t < 10; ++t) {
+            img = grey;
+            filmLook(img, s, t);
+            lo = std::min(lo, double(img.at(100, 100)[0])), hi = std::max(hi, double(img.at(100, 100)[0]));
+        }
+        QVERIFY(hi - lo > 0.01 && hi < 0.55 && lo > 0.45);
+        // Aberration: red and blue apart at the edges, none at the centre.
+        s = none();
+        s.aberration = 1;
+        img = square;
+        filmLook(img, s, 0);
+        const float* edge = img.at(229, 150);
+        QVERIFY(std::abs(edge[0] - edge[2]) > 0.05f);
+        // Through the effect, with its defaults.
+        Project p;
+        Effect e = makeEffect(p, "film_look");
+        QCOMPARE(filmLookSettings(e, 0).gauge, 1);
+        img = square;
+        applyVideoEffect(e, 5, img, 1.0);
+        QVERIFY(img.px != square.px);
+    }
+
     void relightFromDepth() {
         // A dome rising out of a flat backdrop, on a mid-grey picture.
         const int W = 200, H = 160;

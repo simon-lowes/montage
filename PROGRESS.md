@@ -660,3 +660,18 @@ All 15 items are in (October 2026). The near misses listed in the roadmap are th
     - a red disc on a known striped background: the error inside it against the background drops from 0.45 to 0.009, and nothing outside changes;
     - the flag on Armstrong's shoulder: its saturation from 0.21 to 0.004 (white suit), the rest identical, and nothing without a mask;
     - MCP, and the browser's Refine group.
+- [x] Film Look (render/FilmLook), like Resolve's Film Look Creator:
+  - **Gate weave and aberration:** one resample. The frame is moved by smooth noise in time (sines at unrelated rates, scaled by the gauge); red and blue are pushed apart radially.
+  - **Softness:** a blend towards a blur.
+  - **Halation:** highlights above 0.6 (soft-kneed), blurred at about 1.6 % of the width and added in red-orange.
+  - **Bloom:** highlights above 0.75 blurred wide (6 %) and added neutral.
+  - **Per pixel:** flicker (frame-seeded), lifted blacks and a squared radial vignette.
+  - **Grain:** noise on a grid the grain's size (gauge-scaled), new each frame and bilinear between cells. It is 80 % shared across the colours and weighted to the mid-tones.
+  - **Sizes and seeding:** all sizes are thousandths of the frame's width; everything random is seeded by the clip frame.
+  - **Tests:**
+    - halation red-orange beside a white square and none far away;
+    - bloom neutral;
+    - grain keeping the mean, coarser from 65mm to Super 8, the same for the same frame and new for the next;
+    - weave moving a dot by up to 2.5 px between frames (none without it);
+    - the vignette only at the corners, the fade lifting black, softness softening an edge, flicker within a few percent, aberration splitting colours at an edge;
+    - the effect through `applyVideoEffect`.

@@ -256,6 +256,13 @@ std::vector<EffectInfo> buildCatalog() {
                  {num("threshold", "Threshold", 0, 1, 0.7, 0.005), num("radius", "Radius (px)", 0, 200, 20, 0.5),
                   num("intensity", "Intensity", 0, 5, 1, 0.01)},
                  {}});
+    // Film's marks in one effect (Resolve's Film Look Creator); the gauge sets the grain's size and the weave.
+    c.push_back({"film_look", "Film Look", EffectCategory::VideoFilter, "Stylize",
+                 {choice("gauge", "Gauge", {"65mm", "35mm", "16mm", "Super 8"}, 1), pct("halation", "Halation", 0, 100, 30),
+                  pct("bloom", "Bloom", 0, 100, 20), pct("grain", "Grain", 0, 100, 30), pct("weave", "Gate Weave", 0, 100, 20),
+                  pct("vignette", "Vignette", 0, 100, 25), pct("softness", "Softness", 0, 100, 10), pct("flicker", "Flicker", 0, 100, 0),
+                  pct("aberration", "Chromatic Aberration", 0, 100, 0), pct("fade", "Fade (Lifted Blacks)", 0, 100, 10)},
+                 {}});
     c.push_back({"film_grain", "Film Grain", EffectCategory::VideoFilter, "Stylize",
                  {num("amount", "Amount", 0, 1, 0.15, 0.005), num("size", "Grain Size (px)", 0.5, 8, 1.5, 0.1),
                   boolean("color", "Colour Grain")},

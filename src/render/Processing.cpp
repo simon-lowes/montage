@@ -9,6 +9,7 @@
 #include "media/Inpaint.h"
 #include "FaceRefine.h"
 #include "Relight.h"
+#include "FilmLook.h"
 #include "media/Tracking.h"
 
 #include <algorithm>
@@ -1011,6 +1012,7 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
     else if (ty == "levels") vfx::levels(e, t, img);
     else if (ty == "glow") vfx::glow(e, t, img, pixelScale);
     else if (ty == "film_grain") vfx::filmGrain(e, t, img, pixelScale);
+    else if (ty == "film_look") filmLook(img, filmLookSettings(e, t), t);
     else if (ty == "directional_blur") vfx::directionalBlur(e, t, img, pixelScale);
     else if (ty == "chromatic_aberration") vfx::chromaticAberration(e, t, img, pixelScale);
     else if (ty == "lens_distortion") vfx::lensDistortion(e, t, img);
