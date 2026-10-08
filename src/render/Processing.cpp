@@ -6,6 +6,7 @@
 #include "core/Effects.h"
 #include "media/DepthMap.h"
 #include "media/Matting.h"
+#include "media/Inpaint.h"
 #include "FaceRefine.h"
 #include "Relight.h"
 #include "media/Tracking.h"
@@ -874,6 +875,24 @@ void applyVideoEffect(const Effect& e, FrameTime t, Image& img, double pixelScal
     if (!e.enabled || img.empty()) return;
     if (e.type == "stabilize") {
         stabilize(e, t, img, sourceSeconds);  // moves the whole frame: masks do not apply
+        return;
+    }
+    if (e.type == "object_removal") {
+        // It fills its mask, so there is nothing to do without one (or without the model).
+        if (!hasMask(e, t) || !inpaintAvailable() || !inpaintModel().installed()) return;
+        std::vector<float> matte = effectMatte(e, t, img, pixelScale, sourceSeconds);
+        const double grow = e.p("grow", t, 4) * pixelScale;
+        if (grow >= 0.25) refineMatte(matte, img.width, img.height, grow, 2, 0);
+        if (e.p("mask.show", t) > 0.5) {
+            for (size_t i = 0; i < matte.size(); ++i) {
+                float* p = &img.px[i * 4];
+                p[0] = p[1] = p[2] = matte[i] * p[3];
+            }
+            return;
+        }
+        Image filled;
+        cachedInpaint(img, matte, filled);
+        img = std::move(filled);
         return;
     }
     if (!hasMask(e, t)) {

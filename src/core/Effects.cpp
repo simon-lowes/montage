@@ -193,6 +193,10 @@ std::vector<EffectInfo> buildCatalog() {
                  {num("threshold", "Threshold", 0, 1, 0.1), num("softness", "Softness", 0, 1, 0.05),
                   boolean("invert", "Key Out Brights")},
                  {}});
+    // What is under its mask (a shape, a picked object, people) painted out and filled (LaMa).
+    c.push_back({"object_removal", "Object Removal", EffectCategory::VideoFilter, "Refine",
+                 {num("grow", "Grow Mask (px)", 0, 50, 4, 0.5)},
+                 {}});
     // The faces in the frame (YuNet, found again each frame) touched up within a soft mask.
     c.push_back({"face_refine", "Face Refinement", EffectCategory::VideoFilter, "Refine",
                  {pct("smooth", "Smooth Skin", 0, 100, 40), pct("lighten", "Lighten Face", 0, 100, 0),

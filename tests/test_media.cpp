@@ -58,6 +58,7 @@
 #include "media/Rife.h"
 #include "media/Matting.h"
 #include "media/TextToSpeech.h"
+#include "media/Inpaint.h"
 #include "media/VisualSearch.h"
 #include "automation/McpServer.h"
 #ifdef MONTAGE_WITH_WHISPER
@@ -2502,6 +2503,108 @@ private slots:
         QCOMPARE(int(bs.audioTracks[1].clips.size()), 1);
         QCOMPARE(bs.audioTracks[1].clips[0].start, FrameTime(std::llround(10 * bs.fpsValue())));
         QVERIFY(QFileInfo::exists(QFileInfo(project).absolutePath() + "/Voiceover"));
+    }
+
+    void objectRemoval() {
+        if (!inpaintAvailable() || !inpaintModel().installed()) QSKIP("Set MONTAGE_INPAINT_MODEL to the LaMa model");
+        // A red disc on a soft, striped background: removed, the background comes back.
+        const int W = 320, H = 240;
+        Image clean(W, H), withDisc(W, H);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const float g = 0.35f + 0.25f * float(x) / W + 0.05f * std::sin(y * 0.4f);
+                float* c = clean.at(x, y);
+                c[0] = g, c[1] = g * 0.9f + 0.05f, c[2] = 0.6f - 0.2f * float(y) / H, c[3] = 1;
+                std::copy_n(c, 4, withDisc.at(x, y));
+            }
+        std::vector<float> mask(size_t(W) * H, 0.0f);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const double r = std::hypot(x - 160.0, y - 120.0);
+                if (r < 22) {
+                    float* c = withDisc.at(x, y);
+                    c[0] = 0.95f, c[1] = 0.05f, c[2] = 0.05f;
+                }
+                if (r < 26) mask[size_t(y) * W + x] = 1;
+            }
+        auto error = [&](const Image& im) {  // mean difference from the clean picture inside the disc
+            double sum = 0;
+            int n = 0;
+            for (int y = 98; y < 142; ++y)
+                for (int x = 138; x < 182; ++x)
+                    if (std::hypot(x - 160.0, y - 120.0) < 22)
+                        for (int c = 0; c < 3; ++c) sum += std::abs(im.at(x, y)[c] - clean.at(x, y)[c]), ++n;
+            return sum / n;
+        };
+        Image out;
+        std::string err;
+        QVERIFY2(inpaint(withDisc, mask, out, &err), err.c_str());
+        qInfo("inside the disc: %.4f from the background before, %.4f after", error(withDisc), error(out));
+        QVERIFY(error(out) < error(withDisc) / 8);
+        QVERIFY(error(out) < 0.05);
+        // Outside the mask, nothing changes.
+        for (auto [x, y] : {std::pair{10, 10}, std::pair{300, 200}, std::pair{100, 120}})
+            for (int c = 0; c < 4; ++c) QCOMPARE(out.at(x, y)[c], withDisc.at(x, y)[c]);
+        // Nothing masked, nothing done.
+        QVERIFY(inpaint(withDisc, std::vector<float>(size_t(W) * H, 0.0f), out, &err));
+        QVERIFY(out.px == withDisc.px);
+
+        // On the photo, through the effect: the flag on his shoulder painted out, white suit in its place.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320;
+        s.height = 400;
+        MediaItem m = probeOrFail(p, MONTAGE_TEST_DATA_DIR "/faces/armstrong.jpg");
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Clip& clip = s.videoTracks[0].clips.at(0);
+        const Image plain = renderSequenceFrame(p, s, 0, {});
+        Effect removal = makeEffect(p, "object_removal");
+        removal.params["mask.shape"] = Param(2.0);
+        removal.params["mask.x"] = Param(0.84);
+        removal.params["mask.y"] = Param(0.465);
+        removal.params["mask.w"] = Param(0.2);
+        removal.params["mask.h"] = Param(0.11);
+        removal.params["mask.feather"] = Param(3.0);
+        clip.effects.push_back(removal);
+        const Image done = renderSequenceFrame(p, s, 0, {});
+        auto stats = [](const Image& im, int x0, int y0, int x1, int y1, double& red, double& sat) {
+            red = sat = 0;
+            int n = 0;
+            for (int y = y0; y < y1; ++y)
+                for (int x = x0; x < x1; ++x, ++n) {
+                    const float* q = im.at(x, y);
+                    red += q[0] - (q[1] + q[2]) / 2;
+                    sat += std::max({q[0], q[1], q[2]}) - std::min({q[0], q[1], q[2]});
+                }
+            red /= n, sat /= n;
+        };
+        double redBefore, satBefore, redAfter, satAfter;
+        stats(plain, 250, 175, 290, 195, redBefore, satBefore);
+        stats(done, 250, 175, 290, 195, redAfter, satAfter);
+        qInfo("flag area: saturation %.3f before, %.3f after", satBefore, satAfter);
+        QVERIFY(satAfter < satBefore / 2 && redAfter < 0.05);
+        for (auto [x, y] : {std::pair{60, 60}, std::pair{160, 300}, std::pair{100, 200}})
+            for (int c = 0; c < 4; ++c) QCOMPARE(done.at(x, y)[c], plain.at(x, y)[c]);
+        // Without a mask it does nothing.
+        clip.effects.back().params["mask.shape"] = Param(0.0);
+        QVERIFY(renderSequenceFrame(p, s, 0, {}).px == plain.px);
+        clip.effects.clear();
+
+        // Through MCP.
+        const QString project = QString::fromStdString(path("removal.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_add_effect"},
+                                                     {"arguments", QJsonObject{{"project", project}, {"clip", double(clip.id)}, {"effect", "object_removal"},
+                                                                               {"params", QJsonObject{{"mask.shape", 1}, {"mask.x", 0.84}, {"mask.y", 0.465},
+                                                                                                      {"mask.w", 0.22}, {"mask.h", 0.12}}}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
     }
 
     void peopleSearch() {

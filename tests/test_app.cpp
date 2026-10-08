@@ -72,6 +72,7 @@
 #include "media/Rife.h"
 #include "media/Matting.h"
 #include "media/TextToSpeech.h"
+#include "media/Inpaint.h"
 #include "SpeechDialog.h"
 #include "ShotSearchPanel.h"
 #include "PeoplePanel.h"
@@ -1667,6 +1668,11 @@ private slots:
         for (QTreeWidgetItem* item : browser->findChild<QTreeWidget*>()->findItems("Refine", Qt::MatchRecursive))
             for (int i = 0; i < item->childCount(); ++i) listed |= item->child(i)->data(0, Qt::UserRole).toString() == "face_refine";
         QVERIFY(listed);
+        bool removal = false;
+        for (QTreeWidgetItem* item : browser->findChild<QTreeWidget*>()->findItems("Refine", Qt::MatchRecursive))
+            for (int i = 0; i < item->childCount(); ++i) removal |= item->child(i)->data(0, Qt::UserRole).toString() == "object_removal";
+        QVERIFY(removal);
+        if (inpaintAvailable() && inpaintModel().installed()) QVERIFY(ensureEffectModel(win_.get(), "object_removal"));
         if (!faceSearchAvailable() || !faceModel().installed()) QSKIP("Set MONTAGE_FACE_MODEL to test with the model");
         QVERIFY(ensureEffectModel(win_.get(), "face_refine"));
     }

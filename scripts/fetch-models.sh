@@ -11,6 +11,7 @@
 #   <dir>/rife           AI slow motion     (MONTAGE_RIFE_MODEL)
 #   <dir>/matte          Remove Background  (MONTAGE_MATTE_MODEL)
 #   <dir>/tts            Generate Voiceover (MONTAGE_TTS_MODEL)
+#   <dir>/inpaint        Object Removal     (MONTAGE_INPAINT_MODEL)
 #
 #   scripts/fetch-models.sh [dir]      (default: ./models)
 set -euo pipefail
@@ -83,4 +84,7 @@ fetch tts bf_emma.bin "$KOKORO/voices/bf_emma.bin" 669fe0647f9dd04fcab92f1439a40
 fetch tts bf_isabella.bin "$KOKORO/voices/bf_isabella.bin" 3754352c4aaa46d17f27654ab7518d65b62ad6163a0f55a5f4330c2da2c4e94f
 fetch tts bm_george.bin "$KOKORO/voices/bm_george.bin" c4b235a4c1f2cd3b939fed08b899ce9385638b763f7b73a59616c4fc9bd6c9bc
 fetch tts bm_lewis.bin "$KOKORO/voices/bm_lewis.bin" b8f671cef828c30e66fdf0b0756a76bba58f6bb3398cbbf27058642acbcedb97
-echo "Models in $DIR: MONTAGE_OBJECT_MODEL=$DIR/edgetam-video MONTAGE_SPEAKER_MODEL=$DIR/speakers MONTAGE_VISUAL_MODEL=$DIR/clip-vit-b32 MONTAGE_SPEECH_MODEL=$DIR/speech-enhance MONTAGE_UPSCALE_MODEL=$DIR/upscale MONTAGE_FACE_MODEL=$DIR/faces MONTAGE_DEPTH_MODEL=$DIR/depth MONTAGE_RIFE_MODEL=$DIR/rife MONTAGE_MATTE_MODEL=$DIR/matte MONTAGE_TTS_MODEL=$DIR/tts"
+fetch inpaint lama_fp32.onnx \
+  https://huggingface.co/Carve/LaMa-ONNX/resolve/c3c0c9e468934d62e79c329e35d82dd09ff8c444/lama_fp32.onnx \
+  1faef5301d78db7dda502fe59966957ec4b79dd64e16f03ed96913c7a4eb68d6
+echo "Models in $DIR: MONTAGE_OBJECT_MODEL=$DIR/edgetam-video MONTAGE_SPEAKER_MODEL=$DIR/speakers MONTAGE_VISUAL_MODEL=$DIR/clip-vit-b32 MONTAGE_SPEECH_MODEL=$DIR/speech-enhance MONTAGE_UPSCALE_MODEL=$DIR/upscale MONTAGE_FACE_MODEL=$DIR/faces MONTAGE_DEPTH_MODEL=$DIR/depth MONTAGE_RIFE_MODEL=$DIR/rife MONTAGE_MATTE_MODEL=$DIR/matte MONTAGE_TTS_MODEL=$DIR/tts MONTAGE_INPAINT_MODEL=$DIR/inpaint"

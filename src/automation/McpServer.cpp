@@ -44,6 +44,7 @@
 #include "media/Faces.h"
 #include "media/DepthMap.h"
 #include "media/Matting.h"
+#include "media/Inpaint.h"
 #include "media/Rife.h"
 #include "media/TextToSpeech.h"
 #include "media/Transcriber.h"
@@ -752,7 +753,7 @@ void McpServer::Impl::addTools() {
         "depth_blur (lens blur keeping one distance sharp), depth_fog, depth_map and relight (a virtual light) work from "
         "the picture's depth. "
         "remove_background cuts people out (keep 1 keeps the background instead), and mask.shape 4 limits any effect to "
-        "the people in the picture.",
+        "the people in the picture. object_removal paints out whatever its mask covers and fills it in.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},"effect":{"type":"string"},
             "params":{"type":"object","additionalProperties":{"type":"number"}}},"required":["project","clip","effect"]})json",
         false, [](const QJsonObject& a) {
@@ -775,6 +776,8 @@ void McpServer::Impl::addTools() {
                 if (!known) throw ArgError{QStringLiteral("\"%1\" has no parameter \"%2\"").arg(QString::fromStdString(type), it.key())};
                 e.params[name] = Param(it.value().toDouble());
             }
+            if (type == "object_removal" && (!inpaintAvailable() || !inpaintModel().installed()))
+                return fail("Object Removal needs its model: run `scripts/fetch-models.sh` or add it once in the app");
             if (needsFaces(e) && (!faceSearchAvailable() || !faceModel().installed()))
                 return fail("Face Refinement needs the face models: run `scripts/fetch-models.sh` or add it once in the app");
             if (needsPersonMatte(e, 0) && (!mattingAvailable() || !mattingModel().installed()))

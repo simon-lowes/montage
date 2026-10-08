@@ -33,6 +33,7 @@ add_library(montage_engine STATIC
   media/DepthMap.h media/DepthMap.cpp
   media/Matting.h media/Matting.cpp
   media/TextToSpeech.h media/TextToSpeech.cpp
+  media/Inpaint.h media/Inpaint.cpp
   media/ValueMap.h
   media/Rife.h media/Rife.cpp
   media/HwAccel.h media/HwAccel.cpp

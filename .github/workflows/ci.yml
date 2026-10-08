@@ -41,11 +41,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/montage-models
-          key: models-edgetam-8ca3d3e-speakers-9403a69-0743f30-clipq4-d15189d-dfn3-888f33c-esrgan-899dc1e-faces-3cc26e7-3d70824-depth-4472b73-rife-01fdc7e-modnet-fa2fa54-kokoro-1939ad2
+          key: models-edgetam-8ca3d3e-speakers-9403a69-0743f30-clipq4-d15189d-dfn3-888f33c-esrgan-899dc1e-faces-3cc26e7-3d70824-depth-4472b73-rife-01fdc7e-modnet-fa2fa54-kokoro-1939ad2-lama-c3c0c9e
       - name: AI models for the object mask, speaker and visual search tests
         run: |
           scripts/fetch-models.sh ~/montage-models \
-            && { echo "MONTAGE_OBJECT_MODEL=$HOME/montage-models/edgetam-video"; echo "MONTAGE_SPEAKER_MODEL=$HOME/montage-models/speakers"; echo "MONTAGE_VISUAL_MODEL=$HOME/montage-models/clip-vit-b32"; echo "MONTAGE_SPEECH_MODEL=$HOME/montage-models/speech-enhance"; echo "MONTAGE_UPSCALE_MODEL=$HOME/montage-models/upscale"; echo "MONTAGE_FACE_MODEL=$HOME/montage-models/faces"; echo "MONTAGE_DEPTH_MODEL=$HOME/montage-models/depth"; echo "MONTAGE_RIFE_MODEL=$HOME/montage-models/rife"; echo "MONTAGE_MATTE_MODEL=$HOME/montage-models/matte"; echo "MONTAGE_TTS_MODEL=$HOME/montage-models/tts"; } >> "$GITHUB_ENV" \
+            && { echo "MONTAGE_OBJECT_MODEL=$HOME/montage-models/edgetam-video"; echo "MONTAGE_SPEAKER_MODEL=$HOME/montage-models/speakers"; echo "MONTAGE_VISUAL_MODEL=$HOME/montage-models/clip-vit-b32"; echo "MONTAGE_SPEECH_MODEL=$HOME/montage-models/speech-enhance"; echo "MONTAGE_UPSCALE_MODEL=$HOME/montage-models/upscale"; echo "MONTAGE_FACE_MODEL=$HOME/montage-models/faces"; echo "MONTAGE_DEPTH_MODEL=$HOME/montage-models/depth"; echo "MONTAGE_RIFE_MODEL=$HOME/montage-models/rife"; echo "MONTAGE_MATTE_MODEL=$HOME/montage-models/matte"; echo "MONTAGE_TTS_MODEL=$HOME/montage-models/tts"; echo "MONTAGE_INPAINT_MODEL=$HOME/montage-models/inpaint"; } >> "$GITHUB_ENV" \
             || echo "::warning::Could not download the AI models; AI model tests will be skipped"
       - name: Test
         run: ctest --test-dir build --output-on-failure

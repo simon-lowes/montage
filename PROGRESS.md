@@ -651,3 +651,12 @@ All 15 items are in (October 2026). The near misses listed in the roadmap are th
     - Whisper hears "hello", "welcome" and "Montage" in the speech;
     - MCP from a caption track (each cue fitting before the next) and from text on A2;
     - the dialog, with undo.
+- [x] Object Removal (media/Inpaint):
+  - **Model:** LaMa (big-lama, Apache-2.0) as Carve's fp32 ONNX port, 208 MB, at a fixed 512 x 512. OpenCV's 92 MB build of the same export was slower here (4.8 s against 3.3 s).
+  - **Fill:** the mask's bounding box, doubled (at least 128 px, at most the picture), is cut out and scaled to 512. The hole is grown 2 px at that scale, filled, scaled back, and blended in by the soft mask. Pixels outside the mask are untouched. Results are cached by picture and mask.
+  - **The effect:** Object Removal (Refine) fills its own mask, so it works with any mask shape, a tracked object, the People shape and the qualifiers. Grow Mask re-edges it by distance. It does nothing without a mask or the model, and Show Mask shows the area.
+  - **Also:** MCP `montage_add_effect`, `montage-cli models`, `scripts/fetch-models.sh` and the CI caches.
+  - **Tests:**
+    - a red disc on a known striped background: the error inside it against the background drops from 0.45 to 0.009, and nothing outside changes;
+    - the flag on Armstrong's shoulder: its saturation from 0.21 to 0.004 (white suit), the rest identical, and nothing without a mask;
+    - MCP, and the browser's Refine group.

@@ -39,6 +39,7 @@
 #include "media/Rife.h"
 #include "media/Matting.h"
 #include "media/TextToSpeech.h"
+#include "media/Inpaint.h"
 #include "media/Transcriber.h"
 #endif
 #include "render/ColorSpace.h"
@@ -639,6 +640,11 @@ int cmdModels() {
     else
         std::printf("  %-22s %6.1f MB  %s\n", mattingModel().id.c_str(), double(mattingModel().bytes()) / 1e6,
                     mattingModel().installed() ? "downloaded" : "");
+    std::printf("\nObject removal model (LaMa, for Object Removal; folder: %s)\n", inpaintModel().directory().c_str());
+    if (!inpaintAvailable()) std::printf("  unavailable: this build has no ONNX Runtime\n");
+    else
+        std::printf("  %-22s %6.1f MB  %s\n", inpaintModel().id.c_str(), double(inpaintModel().bytes()) / 1e6,
+                    inpaintModel().installed() ? "downloaded" : "");
     std::printf("\nSpeech model (Kokoro-82M with misaki's dictionaries, for voiceovers from text; folder: %s)\n", ttsModel().directory().c_str());
     if (!ttsAvailable()) std::printf("  unavailable: this build has no ONNX Runtime\n");
     else
