@@ -37,6 +37,7 @@
 #include "render/AutoMix.h"
 #include "render/VoiceMatch.h"
 #include "media/Segmenter.h"
+#include "media/Translator.h"
 #include "media/SpeechEnhance.h"
 #include "media/Reframe.h"
 #include "media/Diarizer.h"
@@ -2820,6 +2821,74 @@ private slots:
         // caption at 2 s; FFmpeg's decoder shows it as soon as the line is read.
         for (const auto& e : events)
             if (e.text.contains("HELLO")) QVERIFY2(e.start > 1.4 && e.start < 2.05, qPrintable(QString::number(e.start)));
+    }
+
+    void translation() {
+        // Languages and routes: direct models, English as the bridge between two others.
+        const auto& langs = translationLanguages();
+        QVERIFY(langs.size() >= 20);
+        QVERIFY(std::any_of(langs.begin(), langs.end(), [](const auto& l) { return l.code == "de" && l.name == "German"; }));
+        QCOMPARE(translationRoute("en", "de").size(), size_t(1));
+        QCOMPARE(translationRoute("de", "fr").size(), size_t(2));
+        QVERIFY(translationRoute("en", "en").empty());
+        QVERIFY(translationRoute("en", "xx").empty());
+        const ModelPack* ende = translationModel("en", "de");
+        QVERIFY(ende && ende->files.size() == 5 && ende->bytes() > 200'000'000);
+        if (!translatorAvailable() || !ende->installed())
+            QSKIP("Set MONTAGE_TRANSLATION_MODELS to a folder with translate-en-de to run the rest");
+        // SentencePiece splits as the reference implementation does.
+        SentencePiece sp;
+        std::string err;
+        QVERIFY2(sp.load(ende->path(ende->files[2]), &err), err.c_str());
+        QVERIFY(sp.size() > 30000);  // the source side (the vocabulary is shared with the target)
+        QCOMPARE(sp.encode("The meeting starts at nine o'clock tomorrow morning."),
+                 (std::vector<std::string>{"▁The", "▁meeting", "▁starts", "▁at", "▁nine", "▁o", "'", "clock",
+                                           "▁tomorrow", "▁morning", "."}));
+        QCOMPARE(sp.encode("  Hello   world "), (std::vector<std::string>{"▁Hello", "▁world"}));
+        // Translations as the reference gives them.
+        std::vector<std::string> out;
+        QVERIFY2(translateTexts({"And so, my fellow Americans, ask not what your country can do for you.",
+                                 "The meeting starts at nine o'clock tomorrow morning.", "Hello world", ""},
+                                "en", "de", out, {}, nullptr, &err),
+                 err.c_str());
+        QCOMPARE(out.size(), size_t(4));
+        QCOMPARE(QString::fromStdString(out[0]), QString("Und so, meine amerikanischen Kollegen, fragen Sie nicht, was Ihr Land für Sie tun kann."));
+        QCOMPARE(QString::fromStdString(out[1]), QString("Das Treffen beginnt morgen früh um neun Uhr."));
+        QCOMPARE(QString::fromStdString(out[2]), QString("Hallo Welt"));
+        QCOMPARE(out[3], std::string());
+        // A caption track, translated through MCP: same timings, German text, a new hidden track.
+        Project p = makeDefaultProject();
+        CaptionTrack ct;
+        ct.id = p.newId();
+        ct.captions = {{0, 60, "Hello world", {0.0, 0.5}}, {60, 150, "The meeting starts at nine\no'clock tomorrow morning.", {}}};
+        p.active()->captionTracks.push_back(ct);
+        const QString project = QString::fromStdString(path("captions.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_translate_captions"},
+                                                     {"arguments", QJsonObject{{"project", project}, {"to", "de"}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.active()->captionTracks.size(), size_t(2));
+        const CaptionTrack& de = back.active()->captionTracks[1];
+        QCOMPARE(de.language, std::string("de"));
+        QCOMPARE(de.name, std::string("Subtitles (German)"));
+        QVERIFY(!de.visible);
+        QCOMPARE(de.captions.size(), size_t(2));
+        QCOMPARE(de.captions[1].start, FrameTime(60));
+        QCOMPARE(de.captions[1].end, FrameTime(150));
+        QCOMPARE(QString::fromStdString(de.captions[0].text), QString("Hallo Welt"));
+        QVERIFY(de.captions[0].wordTimes.empty());
+        QVERIFY(QString::fromStdString(de.captions[1].text).simplified().startsWith("Das Treffen beginnt"));
+
+        // A pair whose model is not here says so.
+        QVERIFY(!translateTexts({"Hallo"}, "de", "en", out, {}, nullptr, &err) || translationModel("de", "en")->installed());
     }
 
     void audioRolesAndAutoMix() {

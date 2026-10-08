@@ -30,6 +30,7 @@
 #include "media/Diarizer.h"
 #include "media/Segmenter.h"
 #include "media/SpeechEnhance.h"
+#include "media/Translator.h"
 #include "media/VisualSearch.h"
 #include "media/Transcriber.h"
 #endif
@@ -77,7 +78,9 @@ int usage() {
                  "  montage-cli shots <project.montage> \"a red car at night\" [--max N]   (find shots by description)\n"
                  "  montage-cli mcp                       (Model Context Protocol server on stdio, for AI agents)\n"
                  "  montage-cli captions <project.montage> [-o out.srt|out.vtt|out.scc] [--transcribe MODEL]\n"
-                 "                     [--generate] [--import file.srt] [--save]\n",
+                 "                     [--generate] [--import file.srt] [--save]\n"
+                 "  montage-cli translate <subtitles.srt|.vtt> --to LANG [--from LANG] [-o out.srt|out.vtt]\n"
+                 "                     (on this computer, with Opus-MT; LANG is de, fr, es, ja... see `models`)\n",
                  MONTAGE_VERSION);
     return 2;
 }
@@ -530,6 +533,15 @@ int cmdModels() {
     else
         std::printf("  %-22s %6.0f MB  %s\n", speakerModel().id.c_str(), double(speakerModel().bytes()) / 1e6,
                     speakerModel().installed() ? "downloaded" : "");
+    std::printf("\nTranslation models (Opus-MT, CC-BY-4.0; one per direction, through English otherwise):\n");
+    if (!translatorAvailable()) std::printf("  unavailable: this build has no ONNX Runtime\n");
+    else
+        for (const auto& l : translationLanguages()) {
+            if (l.code == "en") continue;
+            for (const auto& [a, b] : {std::pair{l.code, std::string("en")}, std::pair{std::string("en"), l.code}})
+                if (const ModelPack* m = translationModel(a, b))
+                    std::printf("  %-22s %6.0f MB  %s\n", m->id.c_str(), double(m->bytes()) / 1e6, m->installed() ? "downloaded" : "");
+        }
     std::printf("\nSpeech enhancement model (DeepFilterNet3, for Enhance Speech; folder: %s)\n", speechModel().directory().c_str());
     if (!speechEnhancerAvailable()) std::printf("  unavailable: this build has no ONNX Runtime\n");
     else
@@ -697,6 +709,62 @@ int cmdCaptions(const std::vector<std::string>& args) {
     return writeFile(out, text) ? 0 : 1;
 }
 
+// Translates a subtitle file, keeping its timings.
+int cmdTranslate(const std::vector<std::string>& args) {
+    if (args.empty()) return usage();
+    std::string from = "en", to, out;
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (args[i] == "--to" && i + 1 < args.size()) to = args[++i];
+        else if (args[i] == "--from" && i + 1 < args.size()) from = args[++i];
+        else if (args[i] == "-o" && i + 1 < args.size()) out = args[++i];
+        else return usage();
+    }
+    if (to.empty()) return usage();
+    const auto route = translationRoute(from, to);
+    if (route.empty()) {
+        std::fprintf(stderr, "error: no translation from %s to %s (see `montage-cli models`)\n", from.c_str(), to.c_str());
+        return 1;
+    }
+    for (const ModelPack* pack : route)
+        if (!pack->installed()) {
+            std::fprintf(stderr, "error: the %s is not downloaded (%.0f MB, into %s); translate once in the app to fetch it\n",
+                         pack->title.c_str(), double(pack->bytes()) / 1e6, pack->directory().c_str());
+            return 1;
+        }
+    std::string text;
+    {
+        FILE* f = std::fopen(args[0].c_str(), "rb");
+        if (!f) {
+            std::fprintf(stderr, "error: cannot read %s\n", args[0].c_str());
+            return 1;
+        }
+        char buf[65536];
+        for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) text.append(buf, n);
+        std::fclose(f);
+    }
+    const Rational ms{1000, 1};  // millisecond "frames" keep the times exact
+    CaptionTrack t;
+    std::string err;
+    if (!parseSubtitles(text, ms, t.captions, &err)) {
+        std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
+    }
+    std::signal(SIGINT, [](int) { gCancel = true; });
+    std::vector<std::string> translated;
+    if (!translateTexts(captionTexts(t), from, to, translated, {}, &gCancel, &err)) {
+        std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
+    }
+    const CaptionTrack done = translatedTrack(t, translated, 1, to, translationLanguageName(to));
+    const bool vtt = std::filesystem::path(out.empty() ? args[0] : out).extension() == ".vtt";
+    const std::string result = vtt ? captionsToVtt(done.captions, ms) : captionsToSrt(done.captions, ms);
+    if (out.empty()) {
+        std::fwrite(result.data(), 1, result.size(), stdout);
+        return 0;
+    }
+    return writeFile(out, result) ? 0 : 1;
+}
+
 // Finds shots by description, indexing the project's videos first (and saving the index).
 int cmdShots(const std::vector<std::string>& args) {
     if (args.size() < 2) return usage();
@@ -773,6 +841,7 @@ int main(int argc, char** argv) {
     if (cmd == "loudness") return cmdLoudness(args);
     if (cmd == "bench") return cmdBench(args);
     if (cmd == "captions") return cmdCaptions(args);
+    if (cmd == "translate") return cmdTranslate(args);
     if (cmd == "import") return cmdImport(args);
     if (cmd == "edl" || cmd == "otio" || cmd == "xml" || cmd == "fcpxml") return cmdInterchange(args, cmd);
 #ifdef MONTAGE_WITH_WHISPER

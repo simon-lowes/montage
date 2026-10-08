@@ -19,6 +19,7 @@ struct ModelPack {
     std::string id;           // folder name under the models folder, e.g. "edgetam-video"
     std::string title;        // for people, e.g. "object model"
     std::string directoryEnv; // environment variable naming the folder instead
+    std::string parentEnv;    // or naming a folder holding it (as <folder>/<id>), for families of packs
     std::string urlEnv;       // environment variable replacing every file's folder URL (a mirror, or file:// in tests)
     std::vector<ModelFile> files;
 

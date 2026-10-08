@@ -5,6 +5,10 @@
 #include <QComboBox>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QEventLoop>
+#include <QFutureWatcher>
+#include <QProgressDialog>
+#include <QtConcurrent>
 #include <QDoubleSpinBox>
 #include <QFile>
 #include <QFileDialog>
@@ -23,11 +27,14 @@
 #include <QSettings>
 #include <QSpinBox>
 #include <QTableWidget>
+#include <QTimer>
 #include <QToolButton>
 #include <QVBoxLayout>
 #include <algorithm>
 
 #include "EditorState.h"
+#include "ModelPacks.h"
+#include "media/Translator.h"
 #include "TranscribeDialog.h"
 #include "core/History.h"
 
@@ -65,6 +72,7 @@ CaptionsPanel::CaptionsPanel(EditorState* state, QWidget* parent) : QWidget(pare
     menu->addAction(tr("New Caption Track"), this, &CaptionsPanel::addTrack);
     menu->addAction(tr("Import SubRip / WebVTT..."), this, &CaptionsPanel::importDialog);
     menu->addAction(tr("Export Captions..."), this, &CaptionsPanel::exportDialog);
+    menu->addAction(tr("Translate Track..."), this, &CaptionsPanel::translateDialog)->setObjectName(QStringLiteral("translateCaptions"));
     menu->addSeparator();
     menu->addAction(tr("Style..."), this, &CaptionsPanel::styleDialog);
     menu->addAction(tr("Rename Track..."), this, [this] {
@@ -267,6 +275,99 @@ void CaptionsPanel::itemChanged(QTableWidgetItem* item) {
         return true;
     });
     if (!ok) QMetaObject::invokeMethod(this, &CaptionsPanel::rebuild, Qt::QueuedConnection);
+}
+
+Id CaptionsPanel::translateTrack(const std::string& to, QString* error) {
+    const CaptionTrack* src = track();
+    if (!src || src->captions.empty()) {
+        if (error) *error = tr("There are no captions to translate");
+        return 0;
+    }
+    const std::string from = src->language.empty() ? "en" : src->language;
+    if (translationRoute(from, to).empty()) {
+        if (error)
+            *error = tr("There is no translation from %1 to %2")
+                         .arg(QString::fromStdString(translationLanguageName(from)), QString::fromStdString(translationLanguageName(to)));
+        return 0;
+    }
+    const CaptionTrack source = *src;
+    const std::vector<std::string> texts = captionTexts(source);
+    // Translating takes a while: in the background, with progress.
+    auto cancel = std::make_shared<std::atomic<bool>>(false);
+    auto done = std::make_shared<std::atomic<double>>(0.0);
+    QProgressDialog progress(tr("Translating captions…"), tr("Cancel"), 0, 1000, this);
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(400);
+    connect(&progress, &QProgressDialog::canceled, &progress, [cancel] { *cancel = true; });
+    QTimer tick;
+    connect(&tick, &QTimer::timeout, &progress, [&progress, done] { progress.setValue(int(*done * 1000)); });
+    tick.start(100);
+    using Out = std::pair<std::vector<std::string>, std::string>;
+    QFutureWatcher<Out> watcher;
+    QEventLoop wait;
+    connect(&watcher, &QFutureWatcher<Out>::finished, &wait, &QEventLoop::quit);
+    watcher.setFuture(QtConcurrent::run([texts, from, to, cancel, done] {
+        Out out;
+        std::string err;
+        if (!translateTexts(texts, from, to, out.first, [done](double f) { *done = f; }, cancel.get(), &err)) out.second = err.empty() ? "Cancelled" : err;
+        return out;
+    }));
+    if (!watcher.isFinished()) wait.exec();
+    tick.stop();
+    disconnect(&progress, &QProgressDialog::canceled, nullptr, nullptr);
+    progress.close();
+    const Out r = watcher.result();
+    if (*cancel || !r.second.empty()) {
+        if (error) *error = *cancel ? QString() : QString::fromStdString(r.second);
+        return 0;
+    }
+    Id created = 0;
+    state_->edit(tr("Translate Captions"), [&](Project& p, Sequence& sq) {
+        CaptionTrack t = translatedTrack(source, r.first, p.newId(), to, translationLanguageName(to));
+        t.visible = false;  // the original stays the one shown until this is chosen
+        created = t.id;
+        sq.captionTracks.push_back(std::move(t));
+        return true;
+    });
+    if (created) setCurrentTrack(created);
+    return created;
+}
+
+void CaptionsPanel::translateDialog() {
+    const CaptionTrack* src = track();
+    if (!src || src->captions.empty()) {
+        state_->message(tr("There are no captions to translate"));
+        return;
+    }
+    if (!translatorAvailable()) {
+        QMessageBox::information(this, tr("Translate Captions"), tr("This build of Montage cannot translate: it was built without ONNX Runtime."));
+        return;
+    }
+    const std::string from = src->language.empty() ? "en" : src->language;
+    QStringList names;
+    std::vector<std::string> codes;
+    for (const TranslationLanguage& l : translationLanguages())
+        if (l.code != from && !translationRoute(from, l.code).empty()) {
+            names << QString::fromStdString(l.name);
+            codes.push_back(l.code);
+        }
+    if (codes.empty()) {
+        state_->message(tr("There is no translation from %1").arg(QString::fromStdString(translationLanguageName(from))));
+        return;
+    }
+    bool ok = false;
+    const QString pick = QInputDialog::getItem(this, tr("Translate Captions"),
+                                               tr("Translate \"%1\" (%2) into:").arg(QString::fromStdString(src->name),
+                                                                                   QString::fromStdString(translationLanguageName(from))),
+                                               names, 0, false, &ok);
+    if (!ok) return;
+    const std::string to = codes[size_t(names.indexOf(pick))];
+    for (const ModelPack* pack : translationRoute(from, to))
+        if (!ensureModelPack(window(), *pack, tr("Translate Captions"),
+                             tr("Translation runs on this computer with Opus-MT (University of Helsinki, CC-BY-4.0), one model per language pair.")))
+            return;
+    QString error;
+    if (!translateTrack(to, &error) && !error.isEmpty()) QMessageBox::warning(this, tr("Translate Captions"), error);
 }
 
 void CaptionsPanel::addTrack() {

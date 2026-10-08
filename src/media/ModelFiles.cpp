@@ -18,6 +18,8 @@ std::string modelsDirectory() {
 std::string ModelPack::directory() const {
     if (!directoryEnv.empty())
         if (const char* env = std::getenv(directoryEnv.c_str()); env && *env) return env;
+    if (!parentEnv.empty())
+        if (const char* env = std::getenv(parentEnv.c_str()); env && *env) return std::string(env) + "/" + id;
     return modelsDirectory() + "/models/" + id;
 }
 

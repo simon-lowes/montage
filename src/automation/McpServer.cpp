@@ -17,6 +17,7 @@
 #include <sstream>
 
 #include "core/AutoTag.h"
+#include "core/Captions.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
 #include "core/History.h"
@@ -26,6 +27,7 @@
 #include "core/ScriptCut.h"
 #include "core/TranscriptEdit.h"
 #include "media/SpeechEnhance.h"
+#include "media/Translator.h"
 #include "render/AutoMix.h"
 #include "render/MusicEdit.h"
 #include "render/VoiceMatch.h"
@@ -994,6 +996,45 @@ void McpServer::Impl::addTools() {
             if (n == 0) return fail("No clips to match");
             save(l);
             return ok(QStringLiteral("Matched %1 clip(s) to %2").arg(n).arg(QString::fromStdString(ref.name)), QJsonObject{{"clips", out}});
+        });
+
+    add("montage_translate_captions", "Translate captions",
+        "Translate a caption track into another language on this computer (Opus-MT), as a new track with the same "
+        "timings (hidden until chosen). Languages are ISO 639-1 codes (de, fr, es, ja...); pairs without a direct model go "
+        "through English. The models must be downloaded (the app asks the first time; or scripts/fetch-models.sh).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"to":{"type":"string"},
+            "track":{"type":"integer","default":0,"description":"Caption track index"},
+            "from":{"type":"string","description":"The track's language, if its setting is wrong"}},"required":["project","to"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const int index = a.value("track").toInt(0);
+            if (index < 0 || index >= int(s.captionTracks.size())) return fail("No such caption track");
+            const CaptionTrack source = s.captionTracks[size_t(index)];
+            const std::string to = need(a, "to").toLower().toStdString();
+            const std::string from = a.contains("from") ? a.value("from").toString().toLower().toStdString()
+                                                        : (source.language.empty() ? "en" : source.language);
+            const auto route = translationRoute(from, to);
+            if (route.empty())
+                return fail(QStringLiteral("There is no translation from %1 to %2").arg(QString::fromStdString(from), QString::fromStdString(to)));
+            for (const ModelPack* pack : route)
+                if (!pack->installed())
+                    return fail(QStringLiteral("The %1 is not downloaded (%2 MB): translate once in the app, or fetch it into %3")
+                                    .arg(QString::fromStdString(pack->title))
+                                    .arg(pack->bytes() / 1000000)
+                                    .arg(QString::fromStdString(pack->directory())));
+            std::vector<std::string> out;
+            std::string err;
+            if (!translateTexts(captionTexts(source), from, to, out, {}, nullptr, &err)) return fail(QString::fromStdString(err));
+            CaptionTrack t = translatedTrack(source, out, l.project.newId(), to, translationLanguageName(to));
+            t.visible = false;
+            const QString name = QString::fromStdString(t.name);
+            s.captionTracks.push_back(std::move(t));
+            save(l);
+            QJsonArray sample;
+            for (size_t i = 0; i < std::min<size_t>(3, out.size()); ++i) sample.append(QString::fromStdString(out[i]));
+            return ok(QStringLiteral("Added \"%1\" (%2 captions)").arg(name).arg(out.size()),
+                      QJsonObject{{"track", int(s.captionTracks.size()) - 1}, {"name", name}, {"first", sample}});
         });
 
     add("montage_find_shots", "Find shots by description",

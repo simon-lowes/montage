@@ -75,6 +75,14 @@ void normalizeCaptions(std::vector<Caption>& captions);
 // balancing the line lengths.
 std::string wrapCaptionText(const std::string& text, int lineChars = 42, int maxLines = 2);
 
+// A translated copy of a track: the same timings and style, each caption's
+// text replaced (in order) and re-wrapped, word timings dropped (the words
+// are new). Named "<name> (<languageName>)".
+CaptionTrack translatedTrack(const CaptionTrack& source, const std::vector<std::string>& texts, Id id, const std::string& language,
+                             const std::string& languageName);
+// Each caption's text as one line, for translating.
+std::vector<std::string> captionTexts(const CaptionTrack& track);
+
 struct CaptionRules {
     int lineChars = 42;        // characters per line
     int maxLines = 2;

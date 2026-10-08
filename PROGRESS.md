@@ -454,7 +454,12 @@ The second gap analysis (`docs/research/phase3-roadmap.md`, October 2026) ranks 
   - [x] planMix measures each clip's integrated loudness and 3 s loudness every 0.5 s; replanClip sets levels per role and a dialogue ride (smoothed, within +/-6 dB, keyframes only where the line bends); applyMix writes clip volume and ducks music under the dialogue tracks.
   - [x] Sequence > Auto Mix... (roles can be corrected, presets web/podcast/broadcast, ride and duck switches), MCP `montage_auto_mix`.
   - [x] Match Voice (render/VoiceMatch): long-term spectra in 21 third-octave bands (100 Hz-10 kHz) over the louder 40 % of 85 ms frames; Gauss-Newton fits the Parametric EQ's five gains plus a free level offset to the difference in shape, weighting 150 Hz-8 kHz fully, using the EQ's exact biquad responses (new `responseDb`). JFK through a -8 dB low shelf and +6 dB at 4 kHz is fitted back as +7.3 and -6.0 dB, leaving 0.1 dB of shape. Clip > Set Voice Reference / Match Voice to Reference; MCP `montage_match_voice` (37 tools).
-- [ ] 9. Caption and transcript translation on the device (M)
+- [x] 9. Caption translation on the device (M):
+  - media/Translator: Opus-MT in Xenova's ONNX exports (4-bit weights; int8 is avoided because of the AMX crash seen with CLIP), greedy decoding with the plain decoder (no KV cache; a 17-token sentence takes 0.4 s), the pad token masked, and a target-language token first where the model needs one (Arabic, Vietnamese, Simplified Chinese).
+  - SentencePiece is read straight from the `.spm` protobuf, with unigram Viterbi per word after NFKC. tokenizer.json is not used: its list mixes in target-side pieces. Its output matched the `sentencepiece` library, and the translations matched a Python ONNX reference word for word.
+  - 40 pinned directions (22 into English, 18 out of it, generated into `TranslationModels.inc` with SHA-256s). Other pairs go through English. `ModelPack::parentEnv` gives a family of packs one override folder (`MONTAGE_TRANSLATION_MODELS`).
+  - Captions › More › Translate Track... (a new hidden track named "<track> (German)", re-wrapped to three lines at most, word timings dropped), MCP `montage_translate_captions` (38 tools), `montage-cli translate subs.srt --to de`, and translation models in `montage-cli models`.
+  - Transcript translation is left out: translated captions cover what people deliver, and Whisper already translates speech into English (`transcribe --translate`).
 - [ ] 10. Bézier keyframes and a graph editor (M)
 - [ ] 11. Surround and multichannel deliverables (M–L)
 - [ ] 12. Temporal video noise reduction (M)

@@ -33,6 +33,9 @@ public:
     bool exportFile(const QString& path, QString* error = nullptr) const;
     // Shows the caption and starts editing its text.
     void editCaption(Id track, int index);
+    // A translated copy of the current track, as a new track (one undo step),
+    // after downloading the models it needs if asked. Returns its id, or 0.
+    Id translateTrack(const std::string& to, QString* error = nullptr);
 
 public slots:
     void generateDialog();
@@ -40,6 +43,7 @@ public slots:
     void exportDialog();
     void styleDialog();
     void addTrack();
+    void translateDialog();
 
 private:
     void rebuild();

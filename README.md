@@ -181,6 +181,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
   - Edit, add, split, merge and delete captions in the Captions panel. You can also set the font, size, colours, background box, outline and position.
   - **Animated captions** for social video (Caption Style › Animation): Word by Word, Highlight the Spoken Word, Pop the Spoken Word, or One Word at a Time, in a highlight colour of your choice. Captions made from transcripts keep each word's timing; others spread the words by their length. On the command line: `render --burn-captions --caption-animation pop`.
   - Import SubRip or WebVTT files. Export SubRip, WebVTT or Scenarist SCC (CEA-608 broadcast captions).
+  - **Translate Track** (Captions › More): a copy of the track in another language, with the same timings, translated on this computer. Opus-MT models (University of Helsinki, CC-BY-4.0) cover English to and from 18 to 22 languages. A pair without its own model goes through English. Each model is about 270 MB and downloads the first time that pair is used. Also `montage-cli translate subs.srt --to de`.
   - The CC button shows captions in the Program monitor. When exporting, captions can be burned into the picture, embedded as a subtitle track (mov_text in MP4/MOV, SubRip in MKV, WebVTT in WebM, with the track's language), or both.
 - Interchange both ways with Premiere Pro, DaVinci Resolve, Final Cut Pro, Avid and Nuke:
   - Final Cut Pro 7 XML, FCPXML, OpenTimelineIO and CMX 3600 EDL.
@@ -274,6 +275,7 @@ montage-cli models                                           # speech and object
 montage-cli transcribe interview.mp4 --model base.en --srt interview.srt --vtt interview.vtt
 montage-cli transcribe podcast.wav --speakers 2 --txt podcast.txt          # who said what
 montage-cli captions cut.montage --transcribe base.en -o cut.scc --save   # caption a cut, keep the track
+montage-cli translate subs.srt --to de -o subs.de.srt               # translate subtitles on this computer
 montage-cli render cut.montage -o cut.mp4 --burn-captions --embed-captions
 montage-cli new -o hdr.montage --color-space rec2100pq --hdr-peak 1000 a.mov   # an HDR10 sequence
 montage-cli render hdr.montage -o hdr10.mp4 --vcodec libx265                   # 10-bit HDR10 with metadata
@@ -290,7 +292,7 @@ Its tools work on `.montage` files by path. Each edit is saved at once, and the 
 - probe media, create projects and list a project's timeline;
 - place media, split, remove (with ripple), move, trim and change the speed of clips;
 - add titles, effects (including masked ones), transitions and markers;
-- transcribe (with speaker labels), find spoken phrases in the cut, cut by transcript (phrases, filler words, long pauses, optionally with Smooth Cuts), and build a cut from a script;
+- transcribe (with speaker labels), translate caption tracks, find spoken phrases in the cut, cut by transcript (phrases, filler words, long pauses, optionally with Smooth Cuts), and build a cut from a script;
 - find shots by description;
 - log media (ratings, labels, keywords, metadata fields, bins), make subclips, auto-tag shots, and find media by text or smart-bin rules, optionally saving the rules as a smart bin;
 - make a first mix (roles, levels, dialogue rides, ducking), match voices to a reference, mark a music clip's bars or beats and fit music to a length, duck music under dialogue, match clips' colour to a shot, add adjustment layers, and make a reframed copy of the cut at another aspect ratio;

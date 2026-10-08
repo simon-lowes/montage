@@ -46,6 +46,27 @@ void normalizeCaptions(std::vector<Caption>& captions) {
                    captions.end());
 }
 
+CaptionTrack translatedTrack(const CaptionTrack& source, const std::vector<std::string>& texts, Id id, const std::string& language,
+                             const std::string& languageName) {
+    CaptionTrack t = source;
+    t.id = id;
+    t.language = language;
+    t.name = source.name + " (" + languageName + ")";
+    for (size_t i = 0; i < t.captions.size(); ++i) {
+        Caption& c = t.captions[i];
+        // Translations run longer than English: three lines rather than cut.
+        c.text = wrapCaptionText(i < texts.size() ? texts[i] : c.text, 42, 3);
+        c.wordTimes.clear();
+    }
+    return t;
+}
+
+std::vector<std::string> captionTexts(const CaptionTrack& track) {
+    std::vector<std::string> out;
+    for (const Caption& c : track.captions) out.push_back(QString::fromStdString(c.text).simplified().toStdString());
+    return out;
+}
+
 std::string wrapCaptionText(const std::string& textIn, int lineChars, int maxLines) {
     const QStringList words =
         QString::fromStdString(textIn).simplified().split(QLatin1Char(' '), Qt::SkipEmptyParts);

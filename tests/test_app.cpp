@@ -48,6 +48,7 @@
 #include "render/AudioFx.h"
 #include "audio/SpeechCleanup.h"
 #include "media/SpeechEnhance.h"
+#include "media/Translator.h"
 #include "ModelPacks.h"
 #include "MixerPanel.h"
 #include "MulticamPanel.h"
@@ -1447,6 +1448,37 @@ private slots:
         state()->undo();
         state()->undo();
         QVERIFY(edit::clipById(*state()->sequence(), other)->effects.empty());
+        state()->newProject();
+    }
+
+    void translateCaptionTrack() {
+        auto* panel = win_->findChild<CaptionsPanel*>();
+        QVERIFY(panel);
+        QVERIFY(panel->findChild<QAction*>("translateCaptions"));
+        const ModelPack* ende = translationModel("en", "de");
+        if (!translatorAvailable() || !ende || !ende->installed()) QSKIP("Set MONTAGE_TRANSLATION_MODELS to test with the en-de model");
+        state()->newProject();
+        Id track = 0;
+        state()->edit("Captions", [&](Project& p, Sequence& s) {
+            CaptionTrack t;
+            t.id = track = p.newId();
+            t.captions = {{0, 45, "Hello world", {}}, {45, 120, "The meeting starts at nine o'clock tomorrow morning.", {}}};
+            s.captionTracks.push_back(t);
+            return true;
+        });
+        panel->setCurrentTrack(track);
+        QString error;
+        const Id made = panel->translateTrack("de", &error);
+        QVERIFY2(made, qPrintable(error));
+        const Sequence& s = *state()->sequence();
+        QCOMPARE(s.captionTracks.size(), size_t(2));
+        QCOMPARE(panel->currentTrack(), made);
+        QCOMPARE(s.captionTracks[1].language, std::string("de"));
+        QCOMPARE(QString::fromStdString(s.captionTracks[1].captions[0].text), QString("Hallo Welt"));
+        QCOMPARE(s.captionTracks[1].captions[1].start, FrameTime(45));
+        // One undo removes it.
+        state()->undo();
+        QCOMPARE(state()->sequence()->captionTracks.size(), size_t(1));
         state()->newProject();
     }
 
