@@ -23,9 +23,19 @@ enum class Transfer {
     VLog,     // Panasonic
     CLog3,    // Canon Log 3
     AcesCct,  // ACEScct
+    AppleLog,             // Apple Log (iPhone)
+    DLog,                 // DJI D-Log
+    FLog2,                // Fujifilm F-Log2
+    NLog,                 // Nikon N-Log
+    Log3G10,              // RED Log3G10
+    BmdFilmGen5,          // Blackmagic Film Generation 5
+    DavinciIntermediate,  // DaVinci Intermediate
 };
 
-enum class Primaries { Bt709, Bt2020, P3D65, SGamut3Cine, AlexaWideGamut3, AlexaWideGamut4, VGamut, CinemaGamut, Ap1, Ap0 };
+enum class Primaries {
+    Bt709, Bt2020, P3D65, SGamut3Cine, AlexaWideGamut3, AlexaWideGamut4, VGamut, CinemaGamut, Ap1, Ap0,
+    SGamut3, DGamut, RedWideGamut, BmdWideGamut, DavinciWideGamut
+};
 
 struct ColorSpace {
     std::string id;     // e.g. "rec709", "rec2100pq", "slog3-sgamut3cine"

@@ -75,6 +75,41 @@ double linearToClog3(double l) {
     if (x <= 0.014) return 1.9754798 * x + 0.12512219;
     return 0.36726845 * std::log10(x * 14.98325 + 1) + 0.12240537;
 }
+// The makers' published curves (Apple Log Profile white paper, DJI D-Log, Fujifilm F-Log2 and
+// Nikon N-Log data sheets, RED Log3G10 v3, Blackmagic Film Gen 5 and DaVinci Intermediate),
+// checked against colour-science.
+constexpr double kAlR0 = -0.05641088, kAlRt = 0.01, kAlC = 47.28711236, kAlB = 0.00964052, kAlG = 0.08550479, kAlBeta = 0.69336945;
+double linearToAppleLog(double r) {
+    if (r >= kAlRt) return kAlG * std::log2(r + kAlB) + kAlBeta;
+    return r >= kAlR0 ? kAlC * (r - kAlR0) * (r - kAlR0) : 0.0;
+}
+double appleLogToLinear(double p) {
+    const double pt = kAlC * (kAlRt - kAlR0) * (kAlRt - kAlR0);
+    if (p >= pt) return std::pow(2.0, (p - kAlBeta) / kAlG) - kAlB;
+    return p >= 0 ? std::sqrt(p / kAlC) + kAlR0 : kAlR0;
+}
+double linearToDlog(double x) { return x <= 0.0078 ? 6.025 * x + 0.0929 : std::log10(x * 0.9892 + 0.0108) * 0.256663 + 0.584555; }
+double dlogToLinear(double y) { return y <= 0.14 ? (y - 0.0929) / 6.025 : (std::pow(10.0, 3.89616 * y - 2.27752) - 0.0108) / 0.9892; }
+constexpr double kF2a = 5.555556, kF2b = 0.064829, kF2c = 0.245281, kF2d = 0.384316, kF2e = 8.799461, kF2f = 0.092864, kF2cut1 = 0.000889,
+                 kF2cut2 = 0.100686;
+double linearToFlog2(double x) { return x >= kF2cut1 ? kF2c * std::log10(kF2a * x + kF2b) + kF2d : kF2e * x + kF2f; }
+double flog2ToLinear(double y) { return y >= kF2cut2 ? (std::pow(10.0, (y - kF2d) / kF2c) - kF2b) / kF2a : (y - kF2f) / kF2e; }
+constexpr double kNa = 650.0 / 1023, kNb = 0.0075, kNc = 150.0 / 1023, kNd = 619.0 / 1023, kNcut1 = 0.328, kNcut2 = 452.0 / 1023;
+double linearToNlog(double y) { return y < kNcut1 ? kNa * std::cbrt(y + kNb) : kNc * std::log(y) + kNd; }
+double nlogToLinear(double x) { return x < kNcut2 ? std::pow(x / kNa, 3) - kNb : std::exp((x - kNd) / kNc); }
+double linearToLog3g10(double x) {
+    x += 0.01;
+    return x < 0 ? x * 15.1927 : 0.224282 * std::log10(x * 155.975327 + 1);
+}
+double log3g10ToLinear(double y) { return y < 0 ? y / 15.1927 - 0.01 : (std::pow(10.0, y / 0.224282) - 1) / 155.975327 - 0.01; }
+constexpr double kG5a = 0.08692876065491224, kG5b = 0.005494072432257808, kG5c = 0.5300133392291939, kG5d = 8.283605932402494,
+                 kG5e = 0.09246575342465753, kG5cut = 0.005;
+double linearToBmdGen5(double x) { return x < kG5cut ? kG5d * x + kG5e : kG5a * std::log(x + kG5b) + kG5c; }
+double bmdGen5ToLinear(double y) { return y < kG5d * kG5cut + kG5e ? (y - kG5e) / kG5d : std::exp((y - kG5c) / kG5a) - kG5b; }
+constexpr double kDiA = 0.0075, kDiB = 7.0, kDiC = 0.07329248, kDiM = 10.44426855, kDiLinCut = 0.00262409, kDiLogCut = 0.02740668;
+double linearToDavinciIntermediate(double x) { return x <= kDiLinCut ? x * kDiM : (std::log2(x + kDiA) + kDiB) * kDiC; }
+double davinciIntermediateToLinear(double y) { return y <= kDiLogCut ? y / kDiM : std::pow(2.0, y / kDiC - kDiB) - kDiA; }
+
 double acescctToLinear(double v) {
     if (v <= 0.155251141552511) return (v - 0.0729055341958355) / 10.5402377416545;
     return std::min(65504.0, std::pow(2.0, v * 17.52 - 9.72));
@@ -98,6 +133,11 @@ Chroma chroma(Primaries p) {
         case Primaries::CinemaGamut: return {0.740, 0.270, 0.170, 1.140, 0.080, -0.100, wx, wy};
         case Primaries::Ap1: return {0.713, 0.293, 0.165, 0.830, 0.128, 0.044, 0.32168, 0.33767};
         case Primaries::Ap0: return {0.7347, 0.2653, 0.0, 1.0, 0.0001, -0.077, 0.32168, 0.33767};
+        case Primaries::SGamut3: return {0.730, 0.280, 0.140, 0.855, 0.100, -0.050, wx, wy};
+        case Primaries::DGamut: return {0.71, 0.31, 0.21, 0.88, 0.09, -0.08, wx, wy};
+        case Primaries::RedWideGamut: return {0.780308, 0.304253, 0.121595, 1.493994, 0.095612, -0.084589, wx, wy};
+        case Primaries::BmdWideGamut: return {0.7177215, 0.3171181, 0.2280410, 0.8615690, 0.1005841, -0.0820452, 0.3127170, 0.3290312};
+        case Primaries::DavinciWideGamut: return {0.8000, 0.3130, 0.1682, 0.9877, 0.0790, -0.1155, wx, wy};
     }
     return chroma(Primaries::Bt709);
 }
@@ -165,6 +205,14 @@ const std::vector<ColorSpace>& colorSpaces() {
         {"logc4-awg4", "ARRI LogC4 / ALEXA Wide Gamut 4", Primaries::AlexaWideGamut4, Transfer::LogC4, true},
         {"vlog-vgamut", "Panasonic V-Log / V-Gamut", Primaries::VGamut, Transfer::VLog, true},
         {"clog3-cinemagamut", "Canon Log 3 / Cinema Gamut", Primaries::CinemaGamut, Transfer::CLog3, true},
+        {"slog3-sgamut3", "Sony S-Log3 / S-Gamut3", Primaries::SGamut3, Transfer::SLog3, true},
+        {"applelog-rec2020", "Apple Log (iPhone) / Rec.2020", Primaries::Bt2020, Transfer::AppleLog, true},
+        {"dlog-dgamut", "DJI D-Log / D-Gamut", Primaries::DGamut, Transfer::DLog, true},
+        {"flog2-fgamut", "Fujifilm F-Log2 / F-Gamut", Primaries::Bt2020, Transfer::FLog2, true},
+        {"nlog-ngamut", "Nikon N-Log / N-Gamut", Primaries::Bt2020, Transfer::NLog, true},
+        {"log3g10-rwg", "RED Log3G10 / REDWideGamutRGB", Primaries::RedWideGamut, Transfer::Log3G10, true},
+        {"bmdfilm5-bmdwg", "Blackmagic Film Gen 5 / Wide Gamut", Primaries::BmdWideGamut, Transfer::BmdFilmGen5, true},
+        {"di-dwg", "DaVinci Intermediate / Wide Gamut", Primaries::DavinciWideGamut, Transfer::DavinciIntermediate, true},
         {"acescct", "ACEScct", Primaries::Ap1, Transfer::AcesCct, true},
         {"aces2065-1", "ACES2065-1 (linear AP0)", Primaries::Ap0, Transfer::Linear, true},
         {"linear-rec709", "Linear Rec.709 (scene)", Primaries::Bt709, Transfer::Linear, true},
@@ -220,6 +268,13 @@ double toLinear(Transfer t, double v) {
         case Transfer::VLog: return vlogToLinear(v);
         case Transfer::CLog3: return clog3ToLinear(v);
         case Transfer::AcesCct: return acescctToLinear(v);
+        case Transfer::AppleLog: return appleLogToLinear(v);
+        case Transfer::DLog: return dlogToLinear(v);
+        case Transfer::FLog2: return flog2ToLinear(v);
+        case Transfer::NLog: return nlogToLinear(v);
+        case Transfer::Log3G10: return log3g10ToLinear(v);
+        case Transfer::BmdFilmGen5: return bmdGen5ToLinear(v);
+        case Transfer::DavinciIntermediate: return davinciIntermediateToLinear(v);
     }
     return v;
 }
@@ -237,6 +292,13 @@ double fromLinear(Transfer t, double l) {
         case Transfer::VLog: return linearToVlog(l);
         case Transfer::CLog3: return linearToClog3(l);
         case Transfer::AcesCct: return linearToAcescct(l);
+        case Transfer::AppleLog: return linearToAppleLog(l);
+        case Transfer::DLog: return linearToDlog(l);
+        case Transfer::FLog2: return linearToFlog2(l);
+        case Transfer::NLog: return linearToNlog(l);
+        case Transfer::Log3G10: return linearToLog3g10(l);
+        case Transfer::BmdFilmGen5: return linearToBmdGen5(l);
+        case Transfer::DavinciIntermediate: return linearToDavinciIntermediate(l);
     }
     return l;
 }

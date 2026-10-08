@@ -1123,6 +1123,63 @@ colorspaces:
         QCOMPARE(red(9), red(8));
     }
 
+    void cameraLogSpaces() {
+        // Code values for scene-linear 0, 0.005, 0.01, 0.18 (grey), 0.9 and 4, from colour-science 0.4.7.
+        struct Curve {
+            Transfer t;
+            double code[6];
+        };
+        const double lin[6] = {0.0, 0.005, 0.01, 0.18, 0.9, 4.0};
+        const Curve curves[] = {
+            {Transfer::AppleLog, {0.150476452, 0.178333706, 0.208555319, 0.488272459, 0.681686796, 0.864675980}},
+            {Transfer::DLog, {0.092900000, 0.123025000, 0.152283809, 0.398764556, 0.572944426, 0.738174962}},
+            {Transfer::FLog2, {0.092864000, 0.130853109, 0.158797484, 0.391007242, 0.557132364, 0.714967701}},
+            {Transfer::NLog, {0.124372628, 0.147460056, 0.164961934, 0.363667770, 0.589634333, 0.808352057}},
+            {Transfer::Log3G10, {0.091551488, 0.117456111, 0.137898710, 0.333332912, 0.483360528, 0.627292998}},
+            {Transfer::BmdFilmGen5, {0.092465753, 0.133883783, 0.167755310, 0.383561644, 0.521383526, 0.650641506}},
+            {Transfer::DavinciIntermediate, {0.0, 0.049697572, 0.085275708, 0.336043272, 0.502784181, 0.659830394}},
+        };
+        for (const Curve& c : curves)
+            for (int i = 0; i < 6; ++i) {
+                const double e = fromLinear(c.t, lin[i]);
+                QVERIFY2(std::fabs(e - c.code[i]) < 2e-6, qPrintable(QString("curve %1 at %2: %3, wanted %4").arg(int(c.t)).arg(lin[i]).arg(e, 0, 'f', 9).arg(c.code[i], 0, 'f', 9)));
+                QVERIFY2(std::fabs(toLinear(c.t, e) - lin[i]) < 1e-6 * std::max(1.0, lin[i]), qPrintable(QString("curve %1 back at %2").arg(int(c.t)).arg(lin[i])));
+            }
+        // Linear (0.5, 0.3, 0.1) in each gamut, in linear Rec.709 (colour-science, Bradford adaptation).
+        struct Gamut {
+            Primaries p;
+            double rgb[3];
+        };
+        const Gamut gamuts[] = {
+            {Primaries::DGamut, {0.653931, 0.327562, 0.035016}},  // from the primaries; DJI's printed matrix is rounded to 4 places
+            {Primaries::RedWideGamut, {0.712703, 0.328837, -0.047771}},
+            {Primaries::BmdWideGamut, {0.622830, 0.334441, 0.029346}},
+            {Primaries::SGamut3, {0.692332, 0.299477, 0.059835}},
+            {Primaries::DavinciWideGamut, {0.701011, 0.330216, -0.011751}},
+        };
+        for (const Gamut& g : gamuts) {
+            double m[9];
+            primariesMatrix(g.p, Primaries::Bt709, m);
+            const double in[3] = {0.5, 0.3, 0.1};
+            for (int r = 0; r < 3; ++r) {
+                const double v = m[r * 3] * in[0] + m[r * 3 + 1] * in[1] + m[r * 3 + 2] * in[2];
+                QVERIFY2(std::fabs(v - g.rgb[r]) < 2e-5, qPrintable(QString("gamut %1 row %2: %3, wanted %4").arg(int(g.p)).arg(r).arg(v, 0, 'f', 6).arg(g.rgb[r], 0, 'f', 6)));
+            }
+        }
+        // Each is offered by name, scene-referred, and an Apple Log grey reads as Rec.709 grey.
+        for (const char* id : {"applelog-rec2020", "dlog-dgamut", "flog2-fgamut", "nlog-ngamut", "log3g10-rwg", "bmdfilm5-bmdwg", "di-dwg", "slog3-sgamut3"}) {
+            const ColorSpace* cs = findColorSpace(id);
+            QVERIFY2(cs && cs->sceneReferred, id);
+        }
+        Image grey = solid(2, 2, float(fromLinear(Transfer::AppleLog, 0.18)), float(fromLinear(Transfer::AppleLog, 0.18)),
+                           float(fromLinear(Transfer::AppleLog, 0.18)));
+        convertColor(grey, *findColorSpace("applelog-rec2020"), *findColorSpace("linear-rec709"), 1000);
+        float c[4];
+        rgb(grey, 0, 0, c);
+        QVERIFY2(std::fabs(c[0] - 0.18f) < 1e-3f && std::fabs(c[1] - 0.18f) < 1e-3f && std::fabs(c[2] - 0.18f) < 1e-3f,
+                 qPrintable(QString("%1 %2 %3").arg(c[0]).arg(c[1]).arg(c[2])));
+    }
+
     void curvesAndLuts() {
         auto id = buildCurve("0,0 1,1", 256);
         QVERIFY(near(id[128], 128.0f / 256, 0.002f));

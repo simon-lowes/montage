@@ -93,7 +93,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Transitions: cross dissolve, dip to black/white, wipe, luma wipe (dark or bright parts first), clock wipe, push, slide, iris, cross zoom; for creators, **Whip Pan**, **Zoom Blur** and **Spin** (smeared along their motion), **Glitch** (bands thrown sideways, colours split) and **Light Leak** (a warm light sweeping across); and **Smooth Cut** (like Premiere's Morph Cut or Resolve's Smooth Cut), which hides a jump cut in an interview by morphing the outgoing frame into the incoming one along their optical flow
 - Scopes: waveform, RGB parade, vectorscope, histogram
 - Colour management and HDR:
-  - Media spaces come from the file's tags, and Interpret Colour overrides them: Rec.709, sRGB, Rec.2020, Display P3, Rec.2100 PQ and HLG, Sony S-Log3, ARRI LogC3 and LogC4, Panasonic V-Log, Canon Log 3, ACEScct.
+  - Media spaces come from the file's tags, and Interpret Colour overrides them: Rec.709, sRGB, Rec.2020, Display P3, Rec.2100 PQ and HLG, Sony S-Log3 (S-Gamut3 and S-Gamut3.Cine), ARRI LogC3 and LogC4, Panasonic V-Log, Canon Log 3, Apple Log (iPhone), DJI D-Log, Fujifilm F-Log2, Nikon N-Log, RED Log3G10, Blackmagic Film Gen 5, DaVinci Intermediate / Wide Gamut, ACEScct. The new curves and gamuts match the colour-science library to 2e-6.
   - Each sequence works in Rec.709, Rec.2020, P3, PQ or HLG. Clips are converted into it, with tone mapping between HDR and SDR and a display rendering for log footage.
   - HDR sequences are previewed tone mapped to SDR.
   - HDR exports are 10-bit and tagged, and PQ files carry HDR10 metadata. An HDR master can also be delivered as a tone-mapped SDR version.
