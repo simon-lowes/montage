@@ -127,6 +127,10 @@ public:
     int addTakesFromBin();  // how many takes were added
     bool cycleTake(int step);
     bool finalizeAudition();
+    // Effect presets (core/EffectPresets.h, app/EffectPresetStore.h): the clip's effects saved under a name (the file,
+    // or empty with a message), and a preset's effects added to the selected clips of its kind (how many clips).
+    QString saveEffectsAsPreset(const QString& name);
+    int applyEffectPreset(const QString& file);
     int joinThroughEdits();  // the selected clips' through edits, else all of the sequence's; how many (one undo step)
     bool swapClip(bool withNext);                     // the selected clip (or the one under the playhead) with its neighbour
     bool replaceWithSource();                         // the selected clip, or the one under the playhead

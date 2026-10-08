@@ -47,6 +47,8 @@
 #include "MediaBinModel.h"
 #include "ScopesWidget.h"
 #include "LinkMediaDialog.h"
+#include "EffectPresetStore.h"
+#include "EffectsBrowser.h"
 #include "MediaBinWidget.h"
 #include "SmartBinDialog.h"
 #include "ScriptCutDialog.h"
@@ -3650,6 +3652,43 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(panel->graphRow(), 0);
         toggle->click();
         QVERIFY(!panel->graph());
+        state()->newProject();
+    }
+
+    void effectPresetsSaveAndApply() {
+        loadDemo();
+        const Id red = clipNamed(*state()->sequence(), "Red")->id, blue = clipNamed(*state()->sequence(), "Blue")->id;
+        QVERIFY(state()->edit("Fx", [red](Project& p, Sequence& s) {
+            Clip* c = edit::clipById(s, red);
+            Effect e = makeEffect("gaussian_blur", p.newId());
+            e.params["radius"] = Param(9.0);
+            c->effects.push_back(e);
+            return true;
+        }));
+        // Nothing selected: refused. Red selected: saved and listed in the Effects panel.
+        state()->setSelection({});
+        QVERIFY(win_->saveEffectsAsPreset("Soft Focus Test").isEmpty());
+        QVERIFY(win_->findChild<QAction*>("saveEffectPreset"));
+        state()->setSelection({red});
+        const QString file = win_->saveEffectsAsPreset("Soft Focus Test");
+        QVERIFY(QFileInfo::exists(file));
+        auto* browser = win_->findChild<EffectsBrowser*>();
+        auto* tree = browser->findChild<QTreeWidget*>();
+        bool listed = false;
+        for (int i = 0; i < tree->topLevelItemCount(); ++i)
+            if (tree->topLevelItem(i)->text(0) == "Presets")
+                for (int k = 0; k < tree->topLevelItem(i)->childCount(); ++k) listed |= tree->topLevelItem(i)->child(k)->text(0) == "Soft Focus Test";
+        QVERIFY(listed);
+        // On Blue: the blur added with its setting, as one undo step.
+        state()->setSelection({blue});
+        QCOMPARE(win_->applyEffectPreset(file), 1);
+        const Clip* b = edit::clipById(*state()->sequence(), blue);
+        QCOMPARE(b->effects.size(), size_t(1));
+        QCOMPARE(b->effects[0].p("radius", 0), 9.0);
+        state()->undo();
+        QVERIFY(edit::clipById(*state()->sequence(), blue)->effects.empty());
+        QVERIFY(presets::remove(file));
+        browser->reload();
         state()->newProject();
     }
 

@@ -1,7 +1,14 @@
 // Montage — effects browser.
 #include "EffectsBrowser.h"
 
+#include "EffectPresetStore.h"
+
+#include <QDesktopServices>
 #include <QDrag>
+#include <QFileDialog>
+#include <QMenu>
+#include <QMessageBox>
+#include <QUrl>
 #include <QFontMetrics>
 #include <QHash>
 #include <QKeyEvent>
@@ -197,6 +204,31 @@ EffectsBrowser::EffectsBrowser(QWidget* parent) : QWidget(parent) {
 
     connect(search_, &QLineEdit::textChanged, this, [this](const QString& text) { applyFilter(text); });
     connect(search_, &QLineEdit::returnPressed, this, [this] { focusFirstMatch(); });
+    // Presets: delete one, import a preset file, or show the folder they are kept in.
+    tree_->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(tree_, &QWidget::customContextMenuRequested, this, [this](const QPoint& pos) {
+        QTreeWidgetItem* item = tree_->itemAt(pos);
+        const QString type = item ? item->data(0, kTypeRole).toString() : QString();
+        QMenu menu(this);
+        if (type.startsWith(QStringLiteral("preset:"))) {
+            const QString file = type.mid(7);
+            menu.addAction(tr("Delete Preset"), this, [this, file] {
+                presets::remove(file);
+                populate();
+            });
+        }
+        menu.addAction(tr("Import Preset..."), this, [this] {
+            const QString file = QFileDialog::getOpenFileName(this, tr("Import Preset"), QString(), tr("Montage presets (*.montagepreset)"));
+            EffectPreset p;
+            QString error;
+            if (file.isEmpty()) return;
+            if (!presets::load(file, p, &error) || presets::save(p, &error).isEmpty())
+                QMessageBox::warning(this, tr("Import Preset"), error);
+            populate();
+        });
+        menu.addAction(tr("Show Presets Folder"), this, [] { QDesktopServices::openUrl(QUrl::fromLocalFile(presets::folder())); });
+        menu.exec(tree_->viewport()->mapToGlobal(pos));
+    });
     connect(tree_, &QTreeWidget::itemDoubleClicked, this, [this](QTreeWidgetItem* item) {
         if (isLeaf(item)) requestApply(item);
     });
@@ -288,6 +320,28 @@ void EffectsBrowser::populate() {
         leaf->setData(0, kSearchRole, QStringList{name, vendor, QString::fromStdString(d.category), tr("plugin")}.join(' '));
     }
     if (pluginsTop) pluginsTop->setExpanded(true);
+    // Effect presets saved on this computer, first.
+    const auto saved = presets::all();
+    if (!saved.empty()) {
+        auto* top = new QTreeWidgetItem(QStringList{tr("Presets")});
+        top->setIcon(0, folderIcon);
+        top->setFlags(folderFlags);
+        tree_->insertTopLevelItem(0, top);
+        for (const auto& [file, preset] : saved) {
+            const QString name = QString::fromStdString(preset.name);
+            auto* leaf = new QTreeWidgetItem(top, QStringList{name});
+            leaf->setFlags(leafFlags);
+            leaf->setIcon(0, categoryIcon(preset.video ? EffectCategory::VideoFilter : EffectCategory::AudioFilter));
+            QStringList inside;
+            for (const Effect& e : preset.effects)
+                if (const EffectInfo* info = findEffectInfo(e.type)) inside << QString::fromStdString(info->displayName);
+            leaf->setToolTip(0, QStringLiteral("<b>%1</b><br>%2").arg(name.toHtmlEscaped(), inside.join(QStringLiteral(", ")).toHtmlEscaped()));
+            leaf->setData(0, kTypeRole, QStringLiteral("preset:") + file);
+            leaf->setData(0, kCategoryRole, int(preset.video ? EffectCategory::VideoFilter : EffectCategory::AudioFilter));
+            leaf->setData(0, kSearchRole, QStringList{name, tr("preset"), inside.join(' ')}.join(' '));
+        }
+        top->setExpanded(true);
+    }
     if (!activeFilter_.isEmpty()) {
         const QString filter = activeFilter_;
         activeFilter_.clear();

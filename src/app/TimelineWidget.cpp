@@ -1,5 +1,7 @@
 #include "TimelineWidget.h"
 
+#include "EffectPresetStore.h"
+
 #include <QApplication>
 #include <QDir>
 #include <QRegularExpression>
@@ -2348,6 +2350,19 @@ void TimelineWidget::dropMedia(const QMimeData* mime, const QPoint& pos, bool in
 
 void TimelineWidget::dropEffect(const QString& typeQ, const QPoint& pos) {
     const Sequence* s = state_->sequence();
+    if (s && typeQ.startsWith(QStringLiteral("preset:"))) {
+        // An effect preset dropped on a clip of its kind: its effects added to that clip.
+        EffectPreset preset;
+        const Hit hit = hitTest(pos);
+        const auto loc = hit.clip ? edit::locate(*s, hit.clip) : std::nullopt;
+        if (!presets::load(typeQ.mid(7), preset) || !loc || (loc->track.kind == TrackKind::Video) != preset.video) return;
+        const Id clip = hit.clip;
+        state_->edit(tr("Apply Preset %1").arg(QString::fromStdString(preset.name)), [clip, preset](Project& p, Sequence& sq) {
+            Clip* c = edit::clipById(sq, clip);
+            return c && applyPreset(p, *c, preset) > 0;
+        });
+        return;
+    }
     std::string type = typeQ.toStdString();
     const EffectInfo* info = findEffectInfo(type);
     const bool plugin = plugins::isPluginType(type);

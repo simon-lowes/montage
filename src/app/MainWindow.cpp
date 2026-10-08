@@ -65,6 +65,7 @@
 #include "QualityCheckDialog.h"
 #include "ProjectManagerDialog.h"
 #include "LinkMediaDialog.h"
+#include "EffectPresetStore.h"
 #include "media/Relink.h"
 #include "KeyframePanel.h"
 #include "MediaBinWidget.h"
@@ -782,6 +783,13 @@ void MainWindow::buildMenus() {
     add(clipM, tr("Swap with Previous Clip"), QKeySequence("Ctrl+Shift+,"), [this] { swapClip(false); })->setObjectName(QStringLiteral("swapPrevious"));
     add(clipM, tr("Swap with Next Clip"), QKeySequence("Ctrl+Shift+."), [this] { swapClip(true); })->setObjectName(QStringLiteral("swapNext"));
     add(clipM, tr("Join Through Edits"), QKeySequence(), [this] { joinThroughEdits(); })->setObjectName(QStringLiteral("joinThroughEdits"));
+    add(clipM, tr("Save Effects as Preset…"), QKeySequence(), [this] {
+        const Clip* c = state_->primaryClip();
+        bool ok = false;
+        const QString name = QInputDialog::getText(this, tr("Save Effects as Preset"), tr("Preset name:"), QLineEdit::Normal,
+                                                   c ? QString::fromStdString(c->name) : QString(), &ok);
+        if (ok) saveEffectsAsPreset(name);
+    })->setObjectName(QStringLiteral("saveEffectPreset"));
     QMenu* auditionM = clipM->addMenu(tr("Audition"));
     add(auditionM, tr("Add Selected Media as Takes"), QKeySequence("Ctrl+Alt+Y"), [this] { addTakesFromBin(); })
         ->setObjectName(QStringLiteral("addTakes"));
@@ -2215,6 +2223,54 @@ const Clip* auditionClip(const EditorState* state, const Clip* underPlayhead) {
 }
 }  // namespace
 
+QString MainWindow::saveEffectsAsPreset(const QString& name) {
+    const Sequence* s = state_->sequence();
+    const Clip* c = state_->primaryClip();
+    const auto loc = c && s ? edit::locate(*s, c->id) : std::nullopt;
+    if (!c || !loc || c->effects.empty()) {
+        state_->message(tr("Select a clip with effects to save them as a preset"));
+        return {};
+    }
+    EffectPreset preset;
+    preset.name = name.trimmed().isEmpty() ? c->name : name.trimmed().toStdString();
+    preset.video = loc->track.kind == TrackKind::Video;
+    preset.effects = c->effects;
+    QString error;
+    const QString file = presets::save(preset, &error);
+    if (file.isEmpty()) {
+        state_->message(tr("Could not save the preset: %1").arg(error));
+        return {};
+    }
+    effects_->reload();
+    state_->message(tr("Saved preset %1 (in the Effects panel's Presets)").arg(QString::fromStdString(preset.name)), 4000);
+    return file;
+}
+
+int MainWindow::applyEffectPreset(const QString& file) {
+    EffectPreset preset;
+    QString error;
+    if (!presets::load(file, preset, &error)) {
+        state_->message(tr("Could not read the preset: %1").arg(error));
+        return 0;
+    }
+    const Sequence* s = state_->sequence();
+    if (!s) return 0;
+    const TrackKind kind = preset.video ? TrackKind::Video : TrackKind::Audio;
+    std::vector<Id> targets;
+    for (Id id : state_->selectedClips())
+        if (const auto loc = edit::locate(*s, id); loc && loc->track.kind == kind) targets.push_back(id);
+    if (targets.empty()) {
+        state_->message(preset.video ? tr("Select the video clips to put the preset on") : tr("Select the audio clips to put the preset on"));
+        return 0;
+    }
+    state_->edit(tr("Apply Preset %1").arg(QString::fromStdString(preset.name)), [&](Project& p, Sequence& sq) {
+        for (Id id : targets)
+            if (Clip* c = edit::clipById(sq, id)) applyPreset(p, *c, preset);
+        return true;
+    });
+    return int(targets.size());
+}
+
 int MainWindow::joinThroughEdits() {
     if (!state_->sequence()) return 0;
     const std::vector<Id> ids = state_->selectedClips();
@@ -3225,6 +3281,10 @@ void MainWindow::scanPluginsInBackground() {
 void MainWindow::applyFromBrowser(const QString& typeQ, EffectCategory category) {
     const Sequence* s = state_->sequence();
     if (!s) return;
+    if (typeQ.startsWith(QStringLiteral("preset:"))) {
+        applyEffectPreset(typeQ.mid(7));
+        return;
+    }
     std::string type = typeQ.toStdString();
     const EffectInfo* info = findEffectInfo(type);
     if (!info && !plugins::isPluginType(type)) return;

@@ -13,6 +13,7 @@
 #include "core/Chapters.h"
 #include "core/Checkerboard.h"
 #include "core/EditOps.h"
+#include "core/EffectPresets.h"
 #include "core/Effects.h"
 #include "core/History.h"
 #include "core/Interchange.h"
@@ -2582,6 +2583,39 @@ private slots:
         d = duplicateFrames(fx.s());
         QCOMPARE(d.size(), size_t(4));
         QCOMPARE(d[fx.v1().clips[3].id].front().group, 1);
+    }
+
+    void effectPresets() {
+        // A clip's blur and a keyframed brightness saved as a preset, read back and put on another clip.
+        Fixture fx;
+        const Id a = fx.put(V1, 0, 50), b = fx.put(V1, 60, 50);
+        Clip* ca = clipById(fx.s(), a);
+        Effect blur = makeEffect("gaussian_blur", fx.p.newId());
+        blur.params["radius"] = Param(7.5);
+        Effect bc = makeEffect("brightness_contrast", fx.p.newId());
+        bc.params["brightness"].addKey(0, 0.0);
+        bc.params["brightness"].addKey(20, 30.0);
+        ca->effects = {blur, bc};
+        EffectPreset preset{"Dreamy", true, ca->effects};
+        const std::string json = presetToJson(preset);
+        EffectPreset back;
+        QVERIFY(presetFromJson(json, back));
+        QCOMPARE(back.name, std::string("Dreamy"));
+        QVERIFY(back.video);
+        QCOMPARE(back.effects.size(), size_t(2));
+        QCOMPARE(back.effects[0].params.at("radius").value, 7.5);
+        QCOMPARE(back.effects[1].params.at("brightness").keys.size(), size_t(2));
+        std::string why;
+        QVERIFY(!presetFromJson("{}", back, &why));
+        QVERIFY(!presetFromJson("not json", back, &why));
+        // Applied: added after the clip's own effects, with new ids, keyframes where they were.
+        Clip* cb = clipById(fx.s(), b);
+        cb->effects.push_back(makeEffect("invert", fx.p.newId()));
+        QCOMPARE(applyPreset(fx.p, *cb, preset), 2);
+        QCOMPARE(cb->effects.size(), size_t(3));
+        QCOMPARE(cb->effects[1].type, std::string("gaussian_blur"));
+        QVERIFY(cb->effects[1].id != blur.id && cb->effects[2].id != bc.id);
+        QCOMPARE(cb->effects[2].params.at("brightness").at(20), 30.0);
     }
 
     void keyframeRepeat() {

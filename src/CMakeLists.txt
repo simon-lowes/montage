@@ -12,6 +12,7 @@ add_library(montage_engine STATIC
   core/Chapters.h core/Chapters.cpp
   core/Automation.h core/Automation.cpp
   core/MarkerList.h core/MarkerList.cpp
+  core/EffectPresets.h core/EffectPresets.cpp
   core/ScriptCut.h core/ScriptCut.cpp
   core/Cfb.h core/Cfb.cpp
   core/Zip.h core/Zip.cpp

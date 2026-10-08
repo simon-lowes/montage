@@ -516,6 +516,16 @@ bool clipFromJsonString(const std::string& json, Clip& out) {
     return true;
 }
 
+std::string effectToJsonString(const Effect& e) { return QJsonDocument(effectToJson(e)).toJson(QJsonDocument::Compact).toStdString(); }
+
+bool effectFromJsonString(const std::string& json, Effect& out) {
+    QJsonParseError err;
+    const QJsonDocument doc = QJsonDocument::fromJson(QByteArray::fromStdString(json), &err);
+    if (err.error != QJsonParseError::NoError || !doc.isObject()) return false;
+    out = effectFromJson(doc.object());
+    return !out.type.empty();
+}
+
 std::string projectToJson(const Project& p, const std::string& projectPath) {
     QDir base = projectPath.empty() ? QDir() : QFileInfo(qs(projectPath)).absoluteDir();
     QJsonObject root{{"format", "montage-project"},
