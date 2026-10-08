@@ -205,7 +205,7 @@ bool ensureEffectModel(QWidget* parent, const std::string& type) {
         return ensureModelPack(parent, faceModel(), QObject::tr("Face Refinement"),
                                QObject::tr("Face Refinement finds faces with YuNet (MIT), which runs on this computer."));
     }
-    if (type == "remove_background" || type == "mask.people") {
+    if (type == "remove_background" || type == "mask.people" || type == "behind_people") {
         if (!mattingAvailable()) {
             QMessageBox::information(parent, QObject::tr("Remove Background"),
                                      QObject::tr("This build of Montage cannot find people: it was built without ONNX Runtime."));

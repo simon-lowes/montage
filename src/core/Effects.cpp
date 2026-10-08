@@ -195,6 +195,11 @@ std::vector<EffectInfo> buildCatalog() {
                   num("softness", "Edge Softness", 0, 1, 0.1), num("spill", "Spill Suppression", 0, 1, 0.6),
                   num("choke", "Choke", -1, 1, 0), boolean("show_matte", "Show Matte")},
                  {}});
+    // A title or graphic behind the people in the shot beneath it (handled when tracks are composited).
+    c.push_back({"behind_people", "Behind People", EffectCategory::VideoFilter, "Keying",
+                 {pct("amount", "Amount", 0, 100, 100), num("shift", "Edge Shift (px)", -20, 20, 1, 0.5),
+                  num("soften", "Soften (px)", 0, 40, 1, 0.5)},
+                 {}});
     // Shows the clip through another track's picture (handled when tracks are composited).
     c.push_back({"track_matte", "Track Matte Key", EffectCategory::VideoFilter, "Keying",
                  {num("track", "Matte Track (V number, 0: the one above)", 0, 99, 0, 1),

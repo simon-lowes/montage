@@ -823,6 +823,18 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
                     applyTrackMatte(layer, matte, e->p("composite", lt, 0) > 0.5, e->p("reverse", lt, 0) > 0.5);
                 }
             }
+            // Behind People: the layer goes behind whoever is in the picture beneath it.
+            if (const Effect* bp = enabledEffect(*c, "behind_people"); bp && !layer.empty() && !canvasEmpty && mattingAvailable() &&
+                                                                        mattingModel().installed())
+                if (std::shared_ptr<const ValueMap> people = cachedPersonMatte(canvas)) {
+                    const FrameTime lt = t - c->start;
+                    std::vector<float> m = people->resized(layer.width, layer.height);
+                    const double soften = bp->p("soften", lt, 1) * o.scale;
+                    refineMatte(m, layer.width, layer.height, bp->p("shift", lt, 1) * o.scale, soften, soften);
+                    const float amount = float(std::clamp(bp->p("amount", lt, 100) / 100, 0.0, 1.0));
+                    for (size_t i = 0; i < m.size() && i * 4 < layer.px.size(); ++i)
+                        for (int k = 0; k < 4; ++k) layer.px[i * 4 + size_t(k)] *= 1 - m[i] * amount;
+                }
             composite(std::move(layer), c->blendMode);
         }
     }

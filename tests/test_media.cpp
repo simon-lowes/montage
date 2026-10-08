@@ -2824,6 +2824,39 @@ private slots:
         QCOMPARE(back.active()->videoTracks[0].clips.at(0).timing.p("sampling", 0), 3.0);
     }
 
+    void textBehindPeople() {
+        if (!mattingAvailable() || !mattingModel().installed()) QSKIP("Set MONTAGE_MATTE_MODEL to the MODNet model");
+        // A full-frame red "title" over the portrait, put behind him: red round him, he stays in front.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320;
+        s.height = 400;
+        MediaItem mi = probeOrFail(p, MONTAGE_TEST_DATA_DIR "/faces/armstrong.jpg");
+        p.media.push_back(mi);
+        QVERIFY(edit::placeMedia(p, s, mi.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Image plain = renderSequenceFrame(p, s, 0, {});
+        Clip red = makeGeneratorClip(p, "color", 60);
+        red.generator.params["color.r"] = Param(1.0);
+        red.generator.params["color.g"] = Param(0.0);
+        red.generator.params["color.b"] = Param(0.0);
+        red.effects.push_back(makeEffect(p, "behind_people"));
+        const Id redId = red.id;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 1}, red).ok);
+        auto px = [](const Image& im, double u, double v) { return im.at(int(u * im.width), int(v * im.height)); };
+        auto same = [&](const Image& im, double u, double v) {
+            const float *a = px(im, u, v), *b = px(plain, u, v);
+            return std::abs(a[0] - b[0]) + std::abs(a[1] - b[1]) + std::abs(a[2] - b[2]) < 0.03f;
+        };
+        Image shown = renderSequenceFrame(p, s, 0, {});
+        QVERIFY(px(shown, 0.03, 0.03)[0] > 0.95f && px(shown, 0.03, 0.03)[1] < 0.05f);
+        QVERIFY(same(shown, 0.62, 0.24) && same(shown, 0.6, 0.5));
+        // At half, half the red is over him.
+        edit::clipById(s, redId)->effects.back().params["amount"] = Param(50.0);
+        shown = renderSequenceFrame(p, s, 0, {});
+        const float r = px(shown, 0.62, 0.24)[0], r0 = px(plain, 0.62, 0.24)[0];
+        QVERIFY2(std::fabs(r - (0.5f + 0.5f * r0)) < 0.05f, qPrintable(QString("%1 %2").arg(r).arg(r0)));
+    }
+
     void removeBackground() {
         if (!mattingAvailable() || !mattingModel().installed()) QSKIP("Set MONTAGE_MATTE_MODEL to the MODNet model");
         const std::string still = MONTAGE_TEST_DATA_DIR "/faces/armstrong.jpg";

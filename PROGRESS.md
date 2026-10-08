@@ -759,4 +759,5 @@ All 15 items are in (October 2026). The near misses listed in the roadmap are th
   - Two LR4 crossovers split low, mid and high; the low band also goes through the upper crossover's all-pass (its low plus high halves), so the three add back to an all-pass, flat in level.
   - Each band has its own peak envelope (shared attack and release), a 6 dB soft knee, ratio and gain.
   - **Tests:** flat within 0.1 dB at 60 Hz, both crossovers, 1 kHz and 9 kHz when idle; a loud 80 Hz squeezed 16 dB while a quiet 6 kHz beside it moves 0.00 dB; +6 dB of mid gain lifting 900 Hz and not 8 kHz; in the mixer.
+- [x] Behind People (render/Compositor `renderSequenceFrame`): the effect marks the clip; when its layer is composited, the person matte of the canvas beneath it (MODNet, cached by picture) is refined (edge shift, soften) and the layer multiplied by 1 − matte × amount. The same model checks as Remove Background in the app and MCP. **Tests:** a full-frame red layer over the Armstrong portrait shows red round him and the portrait unchanged on his face and suit; at 50 %, half the red over him.
 

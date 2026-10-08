@@ -780,8 +780,8 @@ void McpServer::Impl::addTools() {
                 return fail("Object Removal needs its model: run `scripts/fetch-models.sh` or add it once in the app");
             if (needsFaces(e) && (!faceSearchAvailable() || !faceModel().installed()))
                 return fail("Face Refinement needs the face models: run `scripts/fetch-models.sh` or add it once in the app");
-            if (needsPersonMatte(e, 0) && (!mattingAvailable() || !mattingModel().installed()))
-                return fail("Remove Background and People masks need their model: run `scripts/fetch-models.sh` or add one once in the app");
+            if ((needsPersonMatte(e, 0) || type == "behind_people") && (!mattingAvailable() || !mattingModel().installed()))
+                return fail("Remove Background, Behind People and People masks need their model: run `scripts/fetch-models.sh` or add one once in the app");
             if (needsDepth(e, 0) && (!depthAvailable() || !depthModel().installed()))
                 return fail("Depth effects need the depth model: run `scripts/fetch-models.sh` or add one once in the app");
             const auto loc = edit::locate(l.seq(), c.id);
