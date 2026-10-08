@@ -3109,6 +3109,110 @@ private slots:
         QVERIFY(isRed(renderSequenceFrame(back, *back.active(), 0, {}), 0.03, 0.03));
     }
 
+    void blemishRemover() {
+        if (!faceSearchAvailable() || !faceModel().installed()) QSKIP("Set MONTAGE_FACE_MODEL to the YuNet and SFace models");
+        const std::string still = MONTAGE_TEST_DATA_DIR "/faces/jfk-color.jpg";
+        VideoDecoder dec;
+        std::string err;
+        QVERIFY2(dec.open(still, &err), err.c_str());
+        const Image clean = toImage(*dec.frameAt(0));
+        const auto faces = cachedFaces(clean);
+        QVERIFY(faces && faces->size() == 1);
+        const FaceBox f = faces->front();
+        const int W = clean.width, H = clean.height;
+        const double fw = f.w * W;
+        const std::vector<float> skin = faceSkinMask(f, W, H);
+        // Four dark spots (5 px across, 4 % of the face) on the cheeks, forehead and chin.
+        const double lx = f.landmarks[0] * W, ly = f.landmarks[1] * H, rx = f.landmarks[2] * W, ry = f.landmarks[3] * H;
+        const double mx = (f.landmarks[6] + f.landmarks[8]) / 2 * W, my = (f.landmarks[7] + f.landmarks[9]) / 2 * H;
+        const std::vector<std::pair<double, double>> spots = {
+            {lx * 0.55 + mx * 0.45 - 0.16 * fw, ly * 0.45 + my * 0.55},
+            {rx * 0.55 + mx * 0.45 + 0.08 * fw, ry * 0.45 + my * 0.55},
+            {(lx + rx) / 2, (ly + ry) / 2 - 0.28 * fw},
+            {mx, my + 0.16 * fw}};
+        for (auto [x, y] : spots) QVERIFY2(skin[size_t(y) * size_t(W) + size_t(x)] > 0.6f, qPrintable(QString("%1,%2").arg(x).arg(y)));
+        Image spotted = clean;
+        for (auto [cx, cy] : spots)
+            for (int y = int(cy) - 4; y <= int(cy) + 4; ++y)
+                for (int x = int(cx) - 4; x <= int(cx) + 4; ++x) {
+                    const double d = std::hypot(x + 0.5 - cx, y + 0.5 - cy);
+                    const float k = float(std::clamp(3.0 - d, 0.0, 1.0)) * 0.45f;  // 2.5 px radius, soft edge
+                    float* p = spotted.at(x, y);
+                    p[0] *= 1 - k * 0.8f, p[1] *= 1 - k, p[2] *= 1 - k;
+                }
+        auto luma = [](const Image& im, int x, int y) {
+            const float* q = im.at(x, y);
+            return 0.2126 * q[0] + 0.7152 * q[1] + 0.0722 * q[2];
+        };
+        // How much darker a spot's centre is than the ring round it.
+        auto contrast = [&](const Image& im, double cx, double cy) {
+            double in = 0, ring = 0;
+            int ni = 0, nr = 0;
+            for (int y = int(cy) - 7; y <= int(cy) + 7; ++y)
+                for (int x = int(cx) - 7; x <= int(cx) + 7; ++x) {
+                    const double d = std::hypot(x + 0.5 - cx, y + 0.5 - cy);
+                    if (d < 1.5) in += luma(im, x, y), ++ni;
+                    else if (d > 5 && d < 7) ring += luma(im, x, y), ++nr;
+                }
+            return ring / nr - in / ni;
+        };
+        Image healed = spotted;
+        const int found = removeBlemishes(healed, *faces, BlemishSettings{});
+        QVERIFY2(found >= 4, qPrintable(QString::number(found)));
+        for (auto [x, y] : spots) {
+            const double before = contrast(spotted, x, y), after = contrast(healed, x, y), natural = contrast(clean, x, y);
+            QVERIFY2(before > natural + 0.05, qPrintable(QString("%1 %2").arg(before).arg(natural)));
+            QVERIFY2(after - natural < 0.25 * (before - natural), qPrintable(QString("spot at %1,%2: %3 -> %4 (clean %5)").arg(x).arg(y).arg(before).arg(after).arg(natural)));
+        }
+        // Eyes, mouth and the backdrop untouched.
+        for (auto [ex, ey] : {std::pair{lx, ly}, std::pair{rx, ry}, std::pair{mx, my}})
+            for (int y = int(ey) - 3; y <= int(ey) + 3; ++y)
+                for (int x = int(ex) - 3; x <= int(ex) + 3; ++x)
+                    for (int c = 0; c < 3; ++c) QCOMPARE(healed.at(x, y)[c], spotted.at(x, y)[c]);
+        for (auto [x, y] : {std::pair{10, 10}, std::pair{300, 30}, std::pair{160, 400}})
+            for (int c = 0; c < 4; ++c) QCOMPARE(healed.at(x, y)[c], spotted.at(x, y)[c]);
+        // The clean face mostly as it was (its own few marks aside).
+        Image cleanHealed = clean;
+        removeBlemishes(cleanHealed, *faces, BlemishSettings{});
+        int changed = 0, inFace = 0;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                if (skin[size_t(y) * size_t(W) + size_t(x)] < 0.5f) continue;
+                ++inFace;
+                changed += std::abs(luma(cleanHealed, x, y) - luma(clean, x, y)) > 0.03;
+            }
+        QVERIFY2(changed < inFace / 25, qPrintable(QString("%1 of %2").arg(changed).arg(inFace)));
+        // No amount, no change; Show Spots marks them in red.
+        Image none = spotted;
+        BlemishSettings off;
+        off.amount = 0;
+        removeBlemishes(none, *faces, off);
+        QCOMPARE(none.px, spotted.px);
+        Image shown = spotted;
+        BlemishSettings show;
+        show.showSpots = true;
+        removeBlemishes(shown, *faces, show);
+        QVERIFY(shown.at(int(spots[0].first), int(spots[0].second))[0] > 0.9f);
+
+        // As an effect on a clip of the spotted picture.
+        QImage q(W, H, QImage::Format_RGBA8888);
+        toRgba8(spotted, q.bits(), size_t(q.bytesPerLine()));
+        const QString png = QString::fromStdString(path("spotted.png"));
+        QVERIFY(q.save(png));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = W, s.height = H;
+        MediaItem m = probeOrFail(p, png.toStdString());
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Clip& clip = s.videoTracks[0].clips.at(0);
+        QVERIFY(findEffectInfo("blemish_remover"));
+        clip.effects.push_back(makeEffect(p, "blemish_remover"));
+        QVERIFY(needsFaces(clip.effects.back()));
+        const Image frame = renderSequenceFrame(p, s, 0, {});
+        for (auto [x, y] : spots) QVERIFY2(contrast(frame, x, y) < contrast(spotted, x, y) * 0.5, qPrintable(QString("%1,%2").arg(x).arg(y)));
+    }
+
     void faceRefinement() {
         if (!faceSearchAvailable() || !faceModel().installed()) QSKIP("Set MONTAGE_FACE_MODEL to the YuNet and SFace models");
         const std::string still = MONTAGE_TEST_DATA_DIR "/faces/jfk-color.jpg";

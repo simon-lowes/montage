@@ -220,6 +220,11 @@ std::vector<EffectInfo> buildCatalog() {
                   pct("eyes_bright", "Brighten Eyes", 0, 100, 20), pct("eyes_sharp", "Sharpen Eyes", 0, 100, 30),
                   boolean("show", "Show Face Mask")},
                  {}});
+    // Spots, pimples and small marks on faces found and healed from the skin round them.
+    c.push_back({"blemish_remover", "Blemish Remover", EffectCategory::VideoFilter, "Refine",
+                 {pct("amount", "Amount", 0, 100, 100), pct("sensitivity", "Sensitivity", 0, 100, 50),
+                  pct("size", "Largest Spot (% of face)", 1, 15, 6), boolean("show", "Show Spots Found")},
+                 {}});
     // People cut out of their background (MODNet on the clip's source frame), keeping hair and soft edges.
     c.push_back({"remove_background", "Remove Background", EffectCategory::VideoFilter, "Keying",
                  {choice("keep", "Keep", {"People", "Background"}), num("shift", "Edge Shift (px)", -20, 20, 0, 0.5),
@@ -691,7 +696,7 @@ bool hasMask(const Effect& e, FrameTime t) {
     return e.p("mask.shape", t) > 0.5 || e.p("mask.qualify", t) > 0.5 || e.p("mask.depth", t) > 0.5;
 }
 
-bool needsFaces(const Effect& e) { return e.enabled && e.type == "face_refine"; }
+bool needsFaces(const Effect& e) { return e.enabled && (e.type == "face_refine" || e.type == "blemish_remover"); }
 
 bool needsPersonMatte(const Effect& e, FrameTime t) {
     if (!e.enabled) return false;

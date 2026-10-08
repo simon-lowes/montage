@@ -1110,6 +1110,15 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
             fs.showMask = e.p("show", t) > 0.5;
             refineFaces(img, *faces, fs);
         }
+    } else if (ty == "blemish_remover") {
+        if (const std::vector<FaceBox>* faces = currentFaces()) {
+            BlemishSettings bs;
+            bs.amount = e.p("amount", t, 100) / 100;
+            bs.sensitivity = e.p("sensitivity", t, 50) / 100;
+            bs.maxSize = e.p("size", t, 6) / 100;
+            bs.showSpots = e.p("show", t) > 0.5;
+            removeBlemishes(img, *faces, bs);
+        }
     } else if (ty == "remove_background") {
         // Transparent where no one is (or where someone is, keeping the background); nothing without the model.
         const ValueMap* person = currentPersonMatte();

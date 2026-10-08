@@ -196,14 +196,14 @@ bool ensureEffectModel(QWidget* parent, const std::string& type) {
                                QObject::tr("Object Removal fills what you mask with LaMa (Apache-2.0), an inpainting model that runs on "
                                            "this computer."));
     }
-    if (type == "face_refine") {
+    if (type == "face_refine" || type == "blemish_remover") {
         if (!faceSearchAvailable()) {
             QMessageBox::information(parent, QObject::tr("Face Refinement"),
                                      QObject::tr("This build of Montage cannot find faces: it was built without ONNX Runtime."));
             return false;
         }
         return ensureModelPack(parent, faceModel(), QObject::tr("Face Refinement"),
-                               QObject::tr("Face Refinement finds faces with YuNet (MIT), which runs on this computer."));
+                               QObject::tr("Face Refinement and Blemish Remover find faces with YuNet (MIT), which runs on this computer."));
     }
     if (type == "remove_background" || type == "mask.people" || type == "behind_people") {
         if (!mattingAvailable()) {
