@@ -2,6 +2,7 @@
 
 #include "Keymap.h"
 #include "LoudnessReadout.h"
+#include "Voiceover.h"
 
 #include <QAction>
 #include <QCheckBox>
@@ -530,6 +531,13 @@ void MainWindow::buildMenus() {
     })->setObjectName(QStringLiteral("duplicateSequence"));
     add(seqM, tr("Auto &Reframe Sequence…"), QKeySequence(), [this] { autoReframeDialog(); })
         ->setObjectName(QStringLiteral("autoReframeSequence"));
+    add(seqM, tr("Record &Voiceover…"), QKeySequence("Ctrl+Alt+R"), [this] {
+        if (!state_->sequence()) return;
+        // One dialog, kept open beside the work while takes are recorded.
+        if (!voiceover_) voiceover_ = new VoiceoverDialog(state_, program_, this);
+        voiceover_->show();
+        voiceover_->raise();
+    })->setObjectName(QStringLiteral("recordVoiceover"));
     add(seqM, tr("Render In to Out"), QKeySequence(Qt::Key_Return), [this] { renderInToOut(); })
         ->setObjectName(QStringLiteral("renderInToOut"));
     add(seqM, tr("Delete Render Files"), QKeySequence(), [this] { deleteRenderFiles(); })

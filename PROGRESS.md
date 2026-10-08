@@ -420,7 +420,10 @@ The second gap analysis (`docs/research/phase3-roadmap.md`, October 2026) ranks 
   - Caption styles add an animation (Word by Word, Highlight, Pop, One Word at a Time) and a highlight colour. The renderer lays out each word, keeping the line in place as it fills in, and pops the spoken word over its first three frames.
   - The Caption Style dialog has Animation and Highlight colour; `montage-cli render --caption-animation`.
   - Tested: word times from a sped-up, trimmed clip's transcript to 1e-3, the word at a frame, spreading by length (and ignoring a mismatched list), saving; rendered ink showing the highlight moving left to right, words appearing in order with the line in place, a popped word larger than a highlighted one, a single centred word, and nothing outside the caption.
-- [ ] 2. Voiceover recording onto the timeline (S)
+- [x] 2. Voiceover recording onto the timeline (S):
+  - app/Voiceover: WavWriter (32-bit float WAV written as it goes, sizes filled in at the end); VoiceoverRecorder (QAudioSource at 48 kHz mono float, or the device's format converted from 16- or 32-bit integers) writes numbered takes ("<sequence> VO n.wav") to a Voiceover folder beside the project (Music/Montage when unsaved), then imports each into the bin's Voiceover folder and places it on the chosen audio track at the start frame. Punch-in caps the take at Out and stops by itself.
+  - Sequence › Record Voiceover… (Ctrl+Alt+R): input, track, 3-second countdown, punch-in (In to Out), level meter, Record/Stop; the Program monitor plays along from the take's start.
+  - Tested without a microphone (sound fed in): the WAV read back at the right length; a take placed on A2 at its start frame with the right length, file name and bin; undo; punch-in stopping at Out; an empty take leaving no file; the menu's dialog.
 - [ ] 3. Burn-ins on export: timecode, clip name, metadata, watermark (S)
 - [ ] 4. Grading essentials: hue/luma/sat curves, colour wheels, split-screen compare (S–M)
 - [ ] 5. Build a cut from a script (M)

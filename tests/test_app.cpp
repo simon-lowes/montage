@@ -46,6 +46,7 @@
 #include "KeyframePanel.h"
 #include "Keymap.h"
 #include "LoudnessReadout.h"
+#include "Voiceover.h"
 #include "MaskOverlay.h"
 #include "media/Diarizer.h"
 #include "media/VisualSearch.h"
@@ -1584,6 +1585,69 @@ const auto seq = [this] { return state()->sequence(); };
         win_->findChild<QAction*>("deleteRenderFiles")->trigger();
         QCOMPARE(RenderCache::instance().count(), 0);
         QVERIFY(timeline()->renderedRanges().empty());
+    }
+
+    void voiceoverRecording() {
+        // The WAV writer: a second of tone, read back as a one-second sound.
+        const QString wav = dir_.path() + "/tone.wav";
+        {
+            WavWriter w;
+            QVERIFY(w.open(wav, 48000, 1));
+            std::vector<float> tone(48000);
+            for (size_t i = 0; i < tone.size(); ++i) tone[i] = float(0.5 * std::sin(2 * M_PI * 440 * double(i) / 48000));
+            w.write(tone.data(), 24000);
+            w.write(tone.data() + 24000, 24000);
+            QCOMPARE(w.frames(), qint64(48000));
+            QVERIFY(w.close());
+        }
+        MediaItem probed;
+        std::string err;
+        QVERIFY2(probeMedia(wav.toStdString(), probed, &err), err.c_str());
+        QVERIFY(probed.hasAudio && std::fabs(probed.duration - 1.0) < 0.01);
+
+        // A take fed with two seconds of sound lands on A2 where it began, saved beside the project.
+        state()->newProject();
+        QVERIFY(state()->save(dir_.path() + "/vo.montage"));
+        VoiceoverRecorder rec(state());
+        QCOMPARE(rec.takeFolder(), dir_.path() + "/Voiceover");
+        QVERIFY(rec.start(30, 1, -1, {}, false, 48000, 1));
+        QVERIFY(rec.isRecording());
+        std::vector<float> block(4800, 0.25f);
+        for (int i = 0; i < 20; ++i) rec.feed(block.data(), 4800);
+        QVERIFY(std::fabs(rec.seconds() - 2.0) < 1e-9);
+        const Id clip = rec.stop();
+        QVERIFY(clip);
+        QVERIFY(!rec.isRecording());
+        const Clip* c = edit::clipById(*state()->sequence(), clip);
+        auto loc = edit::locate(*state()->sequence(), clip);
+        QVERIFY(c && loc && loc->track == (TrackRef{TrackKind::Audio, 1}));
+        QCOMPARE(c->start, FrameTime(30));
+        QVERIFY(std::abs(c->duration - FrameTime(std::llround(2 * state()->sequence()->fpsValue()))) <= 1);
+        QCOMPARE(rec.lastTake(), dir_.path() + "/Voiceover/Sequence 1 VO 1.wav");
+        QVERIFY(QFileInfo::exists(rec.lastTake()));
+        QCOMPARE(state()->project().findMedia(c->mediaId)->bin, std::string("Voiceover"));
+        // Undo takes the clip off the track.
+        state()->undo();
+        QVERIFY(!edit::clipById(*state()->sequence(), clip));
+        // Punch-in: from In (100) to Out (129) it stops by itself at Out, whatever keeps coming.
+        QVERIFY(rec.start(100, 0, 130, {}, false, 48000, 1));
+        for (int i = 0; i < 40; ++i) rec.feed(block.data(), 4800);
+        QTRY_VERIFY(!rec.isRecording());
+        QCOMPARE(rec.lastTake(), dir_.path() + "/Voiceover/Sequence 1 VO 2.wav");
+        const Clip* punched = edit::clipAt(*state()->sequence(), {TrackKind::Audio, 0}, 110);
+        QVERIFY(punched && punched->start == 100);
+        QVERIFY(std::abs(punched->duration - 30) <= 1);
+        // Nothing recorded: no clip, no file.
+        QVERIFY(rec.start(200, 0, -1, {}, false));
+        QCOMPARE(rec.stop(), Id(0));
+        QVERIFY(!QFileInfo::exists(dir_.path() + "/Voiceover/Sequence 1 VO 3.wav"));
+        // The dialog from the Sequence menu.
+        win_->findChild<QAction*>("recordVoiceover")->trigger();
+        auto* dlg = win_->findChild<VoiceoverDialog*>("voiceoverDialog");
+        QVERIFY(dlg && dlg->isVisible());
+        QVERIFY(dlg->findChild<QPushButton*>("voiceoverRecord"));
+        dlg->close();
+        state()->newProject();
     }
 
     void renderQueueInTheBackground() {

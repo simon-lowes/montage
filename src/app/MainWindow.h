@@ -34,6 +34,7 @@ class ShotSearchPanel;
 class MulticamPanel;
 class AudioMeterWidget;
 class LoudnessReadout;
+class VoiceoverDialog;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -158,6 +159,7 @@ private:
     ShotSearchPanel* shots_ = nullptr;
     AudioMeterWidget* meter_ = nullptr;
     LoudnessReadout* loudness_ = nullptr;
+    VoiceoverDialog* voiceover_ = nullptr;
     QTimer renderBarTimer_;
     int renderBarGeneration_ = 0;
     std::vector<QDockWidget*> docks_;
