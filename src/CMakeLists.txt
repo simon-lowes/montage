@@ -37,6 +37,7 @@ add_library(montage_engine STATIC
   render/Ocio.h render/Ocio.cpp
   render/Compositor.h render/Compositor.cpp
   render/AudioFx.h render/AudioFx.cpp
+  render/VideoFx.h render/VideoFx.cpp
   render/Exporter.h render/Exporter.cpp
   audio/Plugins.h audio/PluginScan.cpp audio/ClapHost.cpp
   audio/DynLib.h audio/DynLib.cpp

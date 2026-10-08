@@ -2,6 +2,7 @@
 
 #include "ColorSpace.h"
 #include "Ocio.h"
+#include "VideoFx.h"
 #include "core/Effects.h"
 #include "media/Tracking.h"
 
@@ -764,6 +765,15 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
     else if (ty == "mosaic") mosaic(e, t, img, pixelScale);
     else if (ty == "mirror") mirror(e, t, img);
     else if (ty == "drop_shadow") dropShadow(e, t, img, pixelScale);
+    else if (ty == "levels") vfx::levels(e, t, img);
+    else if (ty == "glow") vfx::glow(e, t, img, pixelScale);
+    else if (ty == "film_grain") vfx::filmGrain(e, t, img, pixelScale);
+    else if (ty == "directional_blur") vfx::directionalBlur(e, t, img, pixelScale);
+    else if (ty == "chromatic_aberration") vfx::chromaticAberration(e, t, img, pixelScale);
+    else if (ty == "lens_distortion") vfx::lensDistortion(e, t, img);
+    else if (ty == "corner_pin") vfx::cornerPin(e, t, img);
+    else if (ty == "letterbox") vfx::letterbox(e, t, img);
+    else if (ty == "posterize") vfx::posterize(e, t, img);
     else if (ty == "gaussian_blur") {
         int dir = int(e.p("direction", t));
         gaussianBlur(img, e.p("radius", t, 10) * pixelScale, dir != 2, dir != 1);

@@ -329,4 +329,20 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
     - the gate passing speech and dropping hiss by the range;
     - the reverb's tail ringing and decaying, and dry at 0 mix;
     - every channel mode, and the effects on a clip in the mixer.
+- [x] More video effects (render/VideoFx), with masks, keyframes and preview scaling like the others:
+  - Levels (input black/white, gamma, output black/white) and Posterize, on straight colour.
+  - Glow: the part above a luma threshold, blurred and added back.
+  - Film Grain: a hashed noise grid at the grain size, new each frame and the same on re-render, weighted towards the mid-tones; mono or colour.
+  - Directional Blur: up to 96 bilinear taps along an angle.
+  - Chromatic Aberration: red scaled out and blue in from the centre.
+  - Lens Distortion: radial, barrel or pincushion.
+  - Corner Pin: Heckbert's square-to-quad homography, inverted for each output pixel.
+  - Letterbox: bars to 2.39, 2, 1.85, 4:3, 1:1 or 9:16, top and bottom or at the sides.
+  - Tested:
+    - levels and gamma values, and posterize to two levels;
+    - glow spreading from a spot but not below the threshold;
+    - grain keeping the mean, fixed per frame and new per frame;
+    - blur direction, aberration splitting red outwards of blue, and lens identity and barrel;
+    - corner pin geometry and a degenerate quad;
+    - letterbox and pillarbox.
 

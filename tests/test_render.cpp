@@ -12,6 +12,7 @@
 #include "render/Compositor.h"
 #include "render/Ocio.h"
 #include "render/Processing.h"
+#include "render/VideoFx.h"
 
 using namespace montage;
 
@@ -687,6 +688,117 @@ colorspaces:
         img = renderProgramFrame(p, s, 10, o);
         rgb(img, 240, 90, c);
         QVERIFY(near(c[2], 1));
+    }
+
+    void moreVideoEffects() {
+        Project p = makeDefaultProject();
+        auto fx = [&](const char* type, std::initializer_list<std::pair<const char*, double>> params) {
+            Effect e = makeEffect(p, type);
+            for (const auto& [k, v] : params) e.params[k] = v;
+            return e;
+        };
+        auto run = [](const Effect& e, Image img, FrameTime t = 0) {
+            applyVideoEffect(e, t, img, 1.0);
+            return img;
+        };
+        float c[4];
+
+        // Levels: input black and white stretch, gamma lifts the mid-tones.
+        Image grey = solid(8, 8, 0.5f, 0.2f, 0.8f);
+        Image lv = run(fx("levels", {{"in_black", 0.2}, {"in_white", 0.8}}), grey);
+        rgb(lv, 2, 2, c);
+        QVERIFY(near(c[0], 0.5f) && near(c[1], 0.f) && near(c[2], 1.f));
+        lv = run(fx("levels", {{"gamma", 2.0}}), solid(4, 4, 0.25f, 0.25f, 0.25f));
+        rgb(lv, 1, 1, c);
+        QVERIFY(near(c[0], 0.5f));
+
+        // Posterize to two levels: dark goes to black, light to white.
+        Image post = run(fx("posterize", {{"levels", 2}}), solid(4, 4, 0.3f, 0.7f, 0.5f));
+        rgb(post, 1, 1, c);
+        QVERIFY(near(c[0], 0) && near(c[1], 1));
+
+        // Glow: a bright spot lights the dark around it; a frame below the threshold is unchanged.
+        Image spot = solid(64, 64, 0, 0, 0);
+        for (int y = 30; y < 34; ++y)
+            for (int x = 30; x < 34; ++x) std::fill(spot.at(x, y), spot.at(x, y) + 3, 1.f);
+        Image glowed = run(fx("glow", {{"threshold", 0.5}, {"radius", 8}, {"intensity", 2}}), spot);
+        rgb(glowed, 40, 32, c);
+        QVERIFY2(c[0] > 0.02f, qPrintable(QString::number(c[0])));
+        rgb(run(fx("glow", {{"threshold", 0.9}}), solid(16, 16, 0.4f, 0.4f, 0.4f)), 8, 8, c);
+        QVERIFY(near(c[0], 0.4f, 1e-4f));
+
+        // Film grain: noisy but the same brightness on average; fixed per frame, new the next.
+        const Effect grain = fx("film_grain", {{"amount", 0.2}});
+        const Image g0 = run(grain, solid(64, 64, 0.5f, 0.5f, 0.5f), 7), g0b = run(grain, solid(64, 64, 0.5f, 0.5f, 0.5f), 7),
+                    g1 = run(grain, solid(64, 64, 0.5f, 0.5f, 0.5f), 8);
+        double mean = 0, var = 0;
+        for (int y = 0; y < 64; ++y)
+            for (int x = 0; x < 64; ++x) mean += g0.at(x, y)[1];
+        mean /= 64 * 64;
+        for (int y = 0; y < 64; ++y)
+            for (int x = 0; x < 64; ++x) var += (g0.at(x, y)[1] - mean) * (g0.at(x, y)[1] - mean);
+        QVERIFY2(std::fabs(mean - 0.5) < 0.02, qPrintable(QString::number(mean)));
+        QVERIFY(var / (64 * 64) > 1e-4);
+        QCOMPARE(g0.px, g0b.px);
+        QVERIFY(g0.px != g1.px);
+
+        // Directional blur along x smears a vertical edge sideways but not a horizontal one.
+        Image edge = solid(32, 32, 0, 0, 0);
+        for (int y = 0; y < 32; ++y)
+            for (int x = 16; x < 32; ++x) std::fill(edge.at(x, y), edge.at(x, y) + 3, 1.f);
+        Image smeared = run(fx("directional_blur", {{"length", 8}, {"angle", 0}}), edge);
+        rgb(smeared, 14, 16, c);
+        QVERIFY(c[0] > 0.1f && c[0] < 0.9f);
+        smeared = run(fx("directional_blur", {{"length", 8}, {"angle", 90}}), edge);
+        rgb(smeared, 14, 16, c);
+        QVERIFY(near(c[0], 0));
+
+        // Chromatic aberration: red moves outwards and blue inwards, so a white dot off-centre splits.
+        Image dot = solid(101, 101, 0, 0, 0);
+        std::fill(dot.at(90, 50), dot.at(90, 50) + 3, 1.f);
+        Image split = run(fx("chromatic_aberration", {{"amount", 6}}), dot);
+        int redAt = 0, blueAt = 0;
+        float bestR = 0, bestB = 0;
+        for (int x = 60; x < 101; ++x) {
+            if (split.at(x, 50)[0] > bestR) bestR = split.at(x, 50)[0], redAt = x;
+            if (split.at(x, 50)[2] > bestB) bestB = split.at(x, 50)[2], blueAt = x;
+        }
+        QVERIFY2(redAt > blueAt, qPrintable(QString("%1 %2").arg(redAt).arg(blueAt)));
+
+        // Lens distortion: none is identity; barrel pulls the edges in and leaves the centre.
+        Image chart = solid(64, 64, 0, 0, 1);
+        for (int y = 0; y < 64; ++y)
+            for (int x = 0; x < 8; ++x) std::fill(chart.at(x, y), chart.at(x, y) + 3, 1.f);
+        QCOMPARE(run(fx("lens_distortion", {{"amount", 0}}), chart).px, chart.px);
+        Image barrel = run(fx("lens_distortion", {{"amount", 60}}), chart);
+        rgb(barrel, 32, 32, c);
+        QVERIFY(near(c[2], 1) && near(c[0], 0));
+        rgb(barrel, 9, 32, c);
+        QVERIFY2(c[0] > 0.5f, qPrintable(QString::number(c[0])));  // the white strip has moved inwards
+
+        // Corner pin into the right half: the frame squeezes there, the left half is empty.
+        Image pin = run(fx("corner_pin", {{"tl_x", 0.5}, {"bl_x", 0.5}}), solid(40, 20, 0, 1, 0));
+        QCOMPARE(pin.at(5, 10)[3], 0.f);
+        rgb(pin, 30, 10, c);
+        QVERIFY(near(c[1], 1) && near(c[3], 1));
+        double h[9];
+        const double square[4][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
+        QVERIFY(vfx::squareToQuad(square, h));
+        QVERIFY(std::fabs(h[0] - 1) < 1e-12 && std::fabs(h[4] - 1) < 1e-12 && std::fabs(h[6]) < 1e-12);
+        const double flat[4][2] = {{0, 0}, {1, 0}, {2, 0}, {3, 0}};
+        QVERIFY(!vfx::squareToQuad(flat, h));
+
+        // Letterbox 2.39:1 on 16:9: black bars top and bottom, the picture between.
+        Image boxed = run(fx("letterbox", {{"aspect", 0}}), solid(160, 90, 1, 1, 1));
+        rgb(boxed, 80, 2, c);
+        QVERIFY(near(c[0], 0) && near(c[3], 1));
+        rgb(boxed, 80, 45, c);
+        QVERIFY(near(c[0], 1));
+        boxed = run(fx("letterbox", {{"aspect", 3}}), solid(160, 90, 1, 1, 1));  // 4:3 pillars
+        rgb(boxed, 2, 45, c);
+        QVERIFY(near(c[0], 0));
+        rgb(boxed, 80, 2, c);
+        QVERIFY(near(c[0], 1));
     }
 
     void adjustmentLayers() {

@@ -190,6 +190,42 @@ std::vector<EffectInfo> buildCatalog() {
     c.push_back({"sharpen", "Sharpen", EffectCategory::VideoFilter, "Blur & Sharpen",
                  {num("amount", "Amount", 0, 5, 1), num("radius", "Radius (px)", 0.5, 20, 1.5, 0.1)},
                  {}});
+    c.push_back({"levels", "Levels", EffectCategory::VideoFilter, "Color",
+                 {num("in_black", "Input Black", 0, 1, 0, 0.005), num("in_white", "Input White", 0, 1, 1, 0.005),
+                  num("gamma", "Gamma", 0.1, 10, 1, 0.01), num("out_black", "Output Black", 0, 1, 0, 0.005),
+                  num("out_white", "Output White", 0, 1, 1, 0.005)},
+                 {}});
+    c.push_back({"glow", "Glow", EffectCategory::VideoFilter, "Stylize",
+                 {num("threshold", "Threshold", 0, 1, 0.7, 0.005), num("radius", "Radius (px)", 0, 200, 20, 0.5),
+                  num("intensity", "Intensity", 0, 5, 1, 0.01)},
+                 {}});
+    c.push_back({"film_grain", "Film Grain", EffectCategory::VideoFilter, "Stylize",
+                 {num("amount", "Amount", 0, 1, 0.15, 0.005), num("size", "Grain Size (px)", 0.5, 8, 1.5, 0.1),
+                  boolean("color", "Colour Grain")},
+                 {}});
+    c.push_back({"directional_blur", "Directional Blur", EffectCategory::VideoFilter, "Blur & Sharpen",
+                 {num("length", "Length (px)", 0, 300, 20, 0.5), angle("angle", "Direction", 0)},
+                 {}});
+    c.push_back({"chromatic_aberration", "Chromatic Aberration", EffectCategory::VideoFilter, "Stylize",
+                 {num("amount", "Amount (px)", -30, 30, 3, 0.1)},
+                 {}});
+    c.push_back({"lens_distortion", "Lens Distortion", EffectCategory::VideoFilter, "Distort",
+                 {num("amount", "Barrel / Pincushion", -100, 100, 0, 0.5)},
+                 {}});
+    // Corners as fractions of the frame, keyframeable for screen replacements.
+    c.push_back({"corner_pin", "Corner Pin", EffectCategory::VideoFilter, "Distort",
+                 {num("tl_x", "Top Left X", -1, 2, 0, 0.001), num("tl_y", "Top Left Y", -1, 2, 0, 0.001),
+                  num("tr_x", "Top Right X", -1, 2, 1, 0.001), num("tr_y", "Top Right Y", -1, 2, 0, 0.001),
+                  num("br_x", "Bottom Right X", -1, 2, 1, 0.001), num("br_y", "Bottom Right Y", -1, 2, 1, 0.001),
+                  num("bl_x", "Bottom Left X", -1, 2, 0, 0.001), num("bl_y", "Bottom Left Y", -1, 2, 1, 0.001)},
+                 {}});
+    c.push_back({"letterbox", "Letterbox", EffectCategory::VideoFilter, "Stylize",
+                 {choice("aspect", "Aspect", {"2.39:1", "2:1", "1.85:1", "4:3", "1:1", "9:16"}, 0),
+                  pct("opacity", "Opacity", 0, 100, 100)},
+                 {}});
+    c.push_back({"posterize", "Posterize", EffectCategory::VideoFilter, "Stylize",
+                 {num("levels", "Levels", 2, 64, 6, 1)},
+                 {}});
     c.push_back({"vignette", "Vignette", EffectCategory::VideoFilter, "Stylize",
                  {num("amount", "Amount", 0, 1, 0.5), num("size", "Size", 0, 1.5, 0.75),
                   num("softness", "Softness", 0.01, 1, 0.5)},

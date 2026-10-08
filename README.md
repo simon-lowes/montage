@@ -27,6 +27,8 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - One-click Auto Colour (grey-world balance and level stretch)
 - Curves with presets, HSL/vibrance, `.cube` 3D/1D LUTs, black & white, invert
 - Chroma key with spill suppression, and luma key
+- Levels, Posterize, Glow, Film Grain (new each frame, strongest in the mid-tones), Directional Blur, Chromatic Aberration, Lens Distortion (barrel or pincushion), Letterbox (2.39, 2, 1.85, 4:3, 1:1, 9:16)
+- Corner Pin: four keyframeable corners map the picture onto any quadrilateral, for screen replacements
 - Masks on every video effect:
   - An ellipse or rectangle with feather, expansion, rotation, opacity and invert, all keyframeable. Drag it in the Program monitor to move it, or pull its handles to resize it.
   - An HSL qualifier selects by hue, saturation and luma with softness, for example to grade only skin or only the sky. Show Mask displays the selection.
