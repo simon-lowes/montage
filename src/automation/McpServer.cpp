@@ -42,6 +42,7 @@
 #include "media/Decoder.h"
 #include "media/Faces.h"
 #include "media/DepthMap.h"
+#include "media/Rife.h"
 #include "media/Transcriber.h"
 #include "media/VisualSearch.h"
 #include "render/ClipAnalysis.h"
@@ -574,15 +575,30 @@ void McpServer::Impl::addTools() {
 
     add("montage_set_speed", "Set clip speed",
         "Change a clip's playback speed (1 = normal, 0.5 = half speed, 2 = double; negative plays backwards). "
-        "Its length changes to match, and later clips ripple.",
-        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},"speed":{"type":"number"}},
+        "Its length changes to match, and later clips ripple. frames picks how slow motion makes the frames between "
+        "source frames: nearest (repeat), blend, optical_flow, or ai (RIFE, needs its model).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},"speed":{"type":"number"},
+            "frames":{"type":"string","enum":["nearest","blend","optical_flow","ai"]}},
             "required":["project","clip","speed"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
             const Id id = clipArg(l, a).id;
             const double sp = a.value("speed").toDouble();
             if (std::fabs(sp) < 0.01 || std::fabs(sp) > 100) throw ArgError{"Speed must be between 0.01 and 100 (or -0.01 and -100)"};
+            int sampling = -1;
+            if (a.contains("frames")) {
+                const QString f = a.value("frames").toString();
+                sampling = f == "nearest" ? 0 : f == "blend" ? 1 : f == "optical_flow" ? 2 : f == "ai" ? 3 : -2;
+                if (sampling == -2) throw ArgError{"frames is nearest, blend, optical_flow or ai"};
+                if (sampling == 3 && (!rifeAvailable() || !rifeModel().installed()))
+                    return fail("AI frames need the RIFE model: run `scripts/fetch-models.sh` or choose them once in the app");
+            }
             check(edit::setSpeed(l.project, l.seq(), id, std::fabs(sp), true, sp < 0));
+            if (sampling >= 0)
+                if (Clip* c = edit::clipById(l.seq(), id)) {
+                    if (c->timing.empty()) c->timing = makeEffect(l.project, "time");
+                    c->timing.params["sampling"] = Param(double(sampling));
+                }
             save(l);
             const Clip* c = edit::clipById(l.seq(), id);
             return ok(QStringLiteral("Speed set to %1").arg(sp), c ? clipJson(l.project, l.seq(), *c) : QJsonObject{});

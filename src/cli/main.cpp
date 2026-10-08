@@ -36,6 +36,7 @@
 #include "media/VisualSearch.h"
 #include "media/Faces.h"
 #include "media/DepthMap.h"
+#include "media/Rife.h"
 #include "media/Transcriber.h"
 #endif
 #include "render/ColorSpace.h"
@@ -625,6 +626,11 @@ int cmdModels() {
     else
         std::printf("  %-22s %6.1f MB  %s\n", depthModel().id.c_str(), double(depthModel().bytes()) / 1e6,
                     depthModel().installed() ? "downloaded" : "");
+    std::printf("\nRIFE 4.26 (the authors' release, for AI slow-motion frames; folder: %s)\n", rifeModel().directory().c_str());
+    if (!rifeAvailable()) std::printf("  unavailable: this build has no ONNX Runtime\n");
+    else
+        std::printf("  %-22s %6.1f MB  %s\n", rifeModel().id.c_str(), double(rifeModel().bytes()) / 1e6,
+                    rifeModel().installed() ? "downloaded" : "");
     return 0;
 }
 

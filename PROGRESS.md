@@ -580,3 +580,17 @@ All 15 items are in (October 2026). The near misses listed in the roadmap are th
     - the qualifier darkening only the near half, also through MCP;
     - lens blur focused on the helmet cutting the face's fine detail (mean Laplacian) to under 30 % while the helmet keeps 90 %;
     - the browser's Depth group, and the Inspector's download offer.
+- [x] AI slow motion with RIFE 4.26 (media/Rife, core/Zip):
+  - **Weights from their authors:** Practical-RIFE 4.26 (Zhewei Huang et al., MIT) from Zhewei Huang's own Hugging Face account (`hzwer/RIFE`, RIFEv4.26_0921.zip, pinned and SHA-256 checked). No third-party ONNX export is used.
+  - **The graph:** `scripts/gen-rife-graph.py` transcribes the release's IFNet (fast mode, 5 levels at 1/16 to 1/1) and exports it to ONNX without weights (212 KB, compiled in through CMake). Each of its 157 weights is external data naming the raw tensor file inside the release's `flownet.pkl`, matched by bytes.
+  - **First use:** the zip is downloaded, and `flownet.pkl` is inflated and its tensors written beside the graph.
+  - **Accuracy:** ONNX Runtime with these weights matches the PyTorch release to within 8e-6, at three sizes and timesteps.
+  - **Zip reading:** core/Zip handles stored, deflated and Zip64 entries with its own RFC 1951 inflater (stored, fixed and dynamic blocks) and checks CRC-32. No new dependency.
+  - **Use:** Time Remapping › Frame Sampling › AI Frames (RIFE). Frames are padded to multiples of 64 with zeros, as the authors pad. The colour is un-premultiplied, the alpha blended. Results are cached by source pair and position.
+  - **Fallback:** Optical Flow until the model is here; the Inspector offers the download.
+  - **Also:** MCP `montage_set_speed` `frames` (nearest, blend, optical_flow, ai), `montage-cli models`, `scripts/fetch-models.sh` and the CI caches.
+  - **Tests:**
+    - inflate on dynamic, fixed and stored blocks against Qt's zlib output, refusing truncated data; CRC-32's check value; a zip laid out by hand, including a corrupted byte caught by its checksum;
+    - halfway between two crops of a photo 10 and 6 px apart, mean error 0.0023 against Optical Flow's 0.0067 and blending's 0.111;
+    - in a sequence: a ProRes clip of the moving photo at half speed, within 0.006 of the true frame against 0.11 for blending;
+    - MCP, and the Inspector's download offer.

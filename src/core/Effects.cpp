@@ -93,7 +93,7 @@ std::vector<EffectInfo> buildCatalog() {
     // how in-between source frames are made in slow motion.
     c.push_back({"time", "Time Remapping", EffectCategory::Fixed, "Fixed",
                  {pct("speed", "Speed", 0, 1000, 100),  // 0 holds the frame
-                  choice("sampling", "Frame Sampling", {"Nearest Frame", "Frame Blending", "Optical Flow"}, 0)},
+                  choice("sampling", "Frame Sampling", {"Nearest Frame", "Frame Blending", "Optical Flow", "AI Frames (RIFE)"}, 0)},
                  {}});
     c.push_back({"volume", "Volume", EffectCategory::Fixed, "Fixed",
                  {num("gain_db", "Gain (dB)", -60, 24, 0, 0.1), num("pan", "Pan", -1, 1, 0, 0.01)},

@@ -28,6 +28,7 @@
 #include "core/History.h"
 #include "media/MediaPool.h"
 #include "media/DepthMap.h"
+#include "media/Rife.h"
 #include "media/SuperScale.h"
 
 namespace montage {
@@ -533,9 +534,12 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                     if (fa && fb) {
                         if (denoiseEffect(c)) decoded = src;
                         const Image a = toImage(*fa), b = toImage(*fb);
-                        src = sampling == 1 ? blendFrames(a, b, frac)
-                                            : interpolateFrames(a, b, frac, path + '#' + std::to_string(int64_t(base)) + '@' +
-                                                                                std::to_string(w) + 'x' + std::to_string(h));
+                        const std::string pair = path + '#' + std::to_string(int64_t(base)) + '@' + std::to_string(w) + 'x' + std::to_string(h);
+                        // AI frames when RIFE is here, else optical flow.
+                        Image ai;
+                        if (sampling == 1) src = blendFrames(a, b, frac);
+                        else if (sampling == 3 && rifeAvailable() && rifeModel().installed() && cachedRife(a, b, frac, pair, ai)) src = std::move(ai);
+                        else src = interpolateFrames(a, b, frac, pair);
                     }
                 }
             }

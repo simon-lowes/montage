@@ -46,11 +46,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/montage-models
-          key: models-edgetam-8ca3d3e-speakers-9403a69-0743f30-clipq4-d15189d-dfn3-888f33c-esrgan-899dc1e-faces-3cc26e7-3d70824-depth-4472b73
+          key: models-edgetam-8ca3d3e-speakers-9403a69-0743f30-clipq4-d15189d-dfn3-888f33c-esrgan-899dc1e-faces-3cc26e7-3d70824-depth-4472b73-rife-01fdc7e
       - name: AI models for the object mask, speaker and visual search tests
         run: |
           scripts/fetch-models.sh ~/montage-models \
-            && { echo "MONTAGE_OBJECT_MODEL=$HOME/montage-models/edgetam-video"; echo "MONTAGE_SPEAKER_MODEL=$HOME/montage-models/speakers"; echo "MONTAGE_VISUAL_MODEL=$HOME/montage-models/clip-vit-b32"; echo "MONTAGE_SPEECH_MODEL=$HOME/montage-models/speech-enhance"; echo "MONTAGE_UPSCALE_MODEL=$HOME/montage-models/upscale"; echo "MONTAGE_FACE_MODEL=$HOME/montage-models/faces"; echo "MONTAGE_DEPTH_MODEL=$HOME/montage-models/depth"; } >> "$GITHUB_ENV" \
+            && { echo "MONTAGE_OBJECT_MODEL=$HOME/montage-models/edgetam-video"; echo "MONTAGE_SPEAKER_MODEL=$HOME/montage-models/speakers"; echo "MONTAGE_VISUAL_MODEL=$HOME/montage-models/clip-vit-b32"; echo "MONTAGE_SPEECH_MODEL=$HOME/montage-models/speech-enhance"; echo "MONTAGE_UPSCALE_MODEL=$HOME/montage-models/upscale"; echo "MONTAGE_FACE_MODEL=$HOME/montage-models/faces"; echo "MONTAGE_DEPTH_MODEL=$HOME/montage-models/depth"; echo "MONTAGE_RIFE_MODEL=$HOME/montage-models/rife"; } >> "$GITHUB_ENV" \
             || echo "::warning::Could not download the AI models; AI model tests will be skipped"
       - name: Test
         run: ctest --test-dir build --output-on-failure
@@ -97,12 +97,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/montage-models
-          key: models-edgetam-8ca3d3e-speakers-9403a69-0743f30-clipq4-d15189d-dfn3-888f33c-esrgan-899dc1e-faces-3cc26e7-3d70824-depth-4472b73
+          key: models-edgetam-8ca3d3e-speakers-9403a69-0743f30-clipq4-d15189d-dfn3-888f33c-esrgan-899dc1e-faces-3cc26e7-3d70824-depth-4472b73-rife-01fdc7e
       - name: AI models for the object mask, speaker and visual search tests
         run: |
           dir="$(cygpath -u "$USERPROFILE")/montage-models"  # where actions/cache's ~ points
           scripts/fetch-models.sh "$dir" \
-            && { echo "MONTAGE_OBJECT_MODEL=$(cygpath -m "$dir/edgetam-video")"; echo "MONTAGE_SPEAKER_MODEL=$(cygpath -m "$dir/speakers")"; echo "MONTAGE_VISUAL_MODEL=$(cygpath -m "$dir/clip-vit-b32")"; echo "MONTAGE_SPEECH_MODEL=$(cygpath -m "$dir/speech-enhance")"; echo "MONTAGE_UPSCALE_MODEL=$(cygpath -m "$dir/upscale")"; echo "MONTAGE_FACE_MODEL=$(cygpath -m "$dir/faces")"; echo "MONTAGE_DEPTH_MODEL=$(cygpath -m "$dir/depth")"; } >> "$GITHUB_ENV" \
+            && { echo "MONTAGE_OBJECT_MODEL=$(cygpath -m "$dir/edgetam-video")"; echo "MONTAGE_SPEAKER_MODEL=$(cygpath -m "$dir/speakers")"; echo "MONTAGE_VISUAL_MODEL=$(cygpath -m "$dir/clip-vit-b32")"; echo "MONTAGE_SPEECH_MODEL=$(cygpath -m "$dir/speech-enhance")"; echo "MONTAGE_UPSCALE_MODEL=$(cygpath -m "$dir/upscale")"; echo "MONTAGE_FACE_MODEL=$(cygpath -m "$dir/faces")"; echo "MONTAGE_DEPTH_MODEL=$(cygpath -m "$dir/depth")"; echo "MONTAGE_RIFE_MODEL=$(cygpath -m "$dir/rife")"; } >> "$GITHUB_ENV" \
             || echo "::warning::Could not download the AI models; AI model tests will be skipped"
       - name: Test
         # A failing Qt Test binary is run again directly so its own log shows.

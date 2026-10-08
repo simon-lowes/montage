@@ -10,6 +10,7 @@ add_library(montage_engine STATIC
   core/TranscriptEdit.h core/TranscriptEdit.cpp
   core/ScriptCut.h core/ScriptCut.cpp
   core/Cfb.h core/Cfb.cpp
+  core/Zip.h core/Zip.cpp
   core/Checkerboard.h core/Checkerboard.cpp
   core/Bleep.h core/Bleep.cpp
   core/FaceIndex.h core/FaceIndex.cpp
@@ -29,6 +30,7 @@ add_library(montage_engine STATIC
   media/SuperScale.h media/SuperScale.cpp
   media/Faces.h media/Faces.cpp
   media/DepthMap.h media/DepthMap.cpp
+  media/Rife.h media/Rife.cpp
   media/HwAccel.h media/HwAccel.cpp
   media/MediaPool.h media/MediaPool.cpp
   media/Analysis.h media/Analysis.cpp
@@ -192,6 +194,15 @@ endif()
 
 # Without whisper the transcriber reports that speech recognition is unavailable.
 target_sources(montage_engine PRIVATE media/Transcriber.h media/Transcriber.cpp)
+
+# RIFE's graph without its weights (scripts/gen-rife-graph.py), compiled in as bytes.
+set(MONTAGE_RIFE_GRAPH ${CMAKE_CURRENT_SOURCE_DIR}/media/rife-4.26.onnx)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${MONTAGE_RIFE_GRAPH})
+file(READ ${MONTAGE_RIFE_GRAPH} MONTAGE_RIFE_HEX HEX)
+file(SIZE ${MONTAGE_RIFE_GRAPH} MONTAGE_RIFE_SIZE)
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," MONTAGE_RIFE_BYTES "${MONTAGE_RIFE_HEX}")
+configure_file(media/RifeGraph.cpp.in ${CMAKE_CURRENT_BINARY_DIR}/RifeGraph.cpp @ONLY)
+target_sources(montage_engine PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/RifeGraph.cpp)
 if(MONTAGE_WITH_WHISPER)
   target_link_libraries(montage_engine PRIVATE whisper)
   target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_WHISPER)

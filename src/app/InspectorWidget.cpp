@@ -29,6 +29,7 @@
 #include "EditorState.h"
 #include "ModelPacks.h"
 #include "media/DepthMap.h"
+#include "media/Rife.h"
 #include "PluginEditorWindow.h"
 #include "Theme.h"
 #include "audio/PluginEffect.h"
@@ -397,6 +398,17 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
             auto* reset = smallButton(nullptr, QStringLiteral("↺"), tr("Back to constant speed"));
             QFormLayout* tf = addSection(tr("Time Remapping"), reset, !clip.ramped());
             addParamRows(tf, *info, tt);
+            if (!clip.timing.empty() && std::lround(clip.timing.p("sampling", 0)) == 3 && rifeAvailable() && !rifeModel().installed()) {
+                // AI frames fall back to optical flow until the model is here.
+                auto* get = new QPushButton(tr("Download RIFE Model…"), content_);
+                get->setObjectName(QStringLiteral("getRifeModel"));
+                connect(get, &QPushButton::clicked, this, [this] {
+                    QTimer::singleShot(0, this, [this] {
+                        if (ensureEffectModel(window(), "rife")) state_->amend([](Project&, Sequence&) { return true; });
+                    });
+                });
+                tf->addRow(tr("AI Frames:"), get);
+            }
             connect(reset, &QToolButton::clicked, this, [this, clipId] {
                 state_->edit(tr("Reset Time Remapping"), [clipId](Project&, Sequence& s) {
                     for (Id id : edit::linkedClips(s, clipId))

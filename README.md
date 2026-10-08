@@ -52,7 +52,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - **Auto Reframe** (like Premiere's Auto Reframe or Resolve's Smart Reframe): Sequence › Auto Reframe Sequence… makes a copy of the cut at 9:16, 1:1, 4:5 or 16:9 where every clip fills the frame and follows its subject, found from what moves against the camera and what stands out. Motion can be slower (interviews), default or faster (sport). Clip › Auto Reframe does the same for selected clips, and Sequence › Duplicate Sequence copies a sequence as it is.
 - Speed ramps and slow motion:
   - **Time Remapping** gives every clip a keyframeable speed curve (linear, hold or eased) inside its length. Picture and linked sound follow it together.
-  - **Frame Sampling** sets how in-between frames are made in slow motion: Nearest Frame, Frame Blending, or Optical Flow, which moves pixels along their motion instead of cross-fading.
+  - **Frame Sampling** sets how in-between frames are made in slow motion: Nearest Frame, Frame Blending, Optical Flow, which moves pixels along their motion instead of cross-fading, or **AI Frames (RIFE)** (like Resolve's Speed Warp), which draws them with RIFE 4.26 (MIT). RIFE's weights are its authors' own release, downloaded the first time (23 MB) and unpacked beside its network. On a moving photo it lands a third as far from the true in-between frame as Optical Flow and a fiftieth as far as blending. It takes about 3 s a 1080p frame on four CPU cores, so render with Render In to Out; until the model is downloaded it falls back to Optical Flow.
 - Tracking and stabilisation (built in; no OpenCV):
   - **Stabilize** effect: analyses the clip's camera movement when added, then smooths it (or locks the shot). It can correct position, scale and rotation, and zooms to keep the edges hidden. Smoothness can be changed at any time without analysing again.
   - **Mask tracking**: ◀ Track / Track ▶ in any mask section follows what the mask covers from the playhead to the clip's start or end. It tracks position, scale and rotation, and writes keyframes.
@@ -238,7 +238,7 @@ CMake options:
 - `-DMONTAGE_REQUIRE_ONNXRUNTIME=ON` stops the configure step if ONNX Runtime is missing (release builds use it).
 - `-DMONTAGE_WITH_THORVG=OFF` leaves out Lottie and SVG import (ThorVG 1.1.2, MIT, is fetched and compiled at configure time).
 
-The object mask, speaker and visual search tests need their models: `scripts/fetch-models.sh ~/montage-models`, then set `MONTAGE_OBJECT_MODEL=~/montage-models/edgetam-video`, `MONTAGE_SPEAKER_MODEL=~/montage-models/speakers` and `MONTAGE_VISUAL_MODEL=~/montage-models/clip-vit-b32`; the people tests `MONTAGE_FACE_MODEL=~/montage-models/faces`, the depth tests `MONTAGE_DEPTH_MODEL=~/montage-models/depth` (the app reads the same variables). The speech tests read `MONTAGE_TEST_WHISPER_MODEL`.
+The object mask, speaker and visual search tests need their models: `scripts/fetch-models.sh ~/montage-models`, then set `MONTAGE_OBJECT_MODEL=~/montage-models/edgetam-video`, `MONTAGE_SPEAKER_MODEL=~/montage-models/speakers` and `MONTAGE_VISUAL_MODEL=~/montage-models/clip-vit-b32`; the people tests `MONTAGE_FACE_MODEL=~/montage-models/faces`, the depth tests `MONTAGE_DEPTH_MODEL=~/montage-models/depth`, the slow-motion tests `MONTAGE_RIFE_MODEL=~/montage-models/rife` (the app reads the same variables). The speech tests read `MONTAGE_TEST_WHISPER_MODEL`.
 
 ## Using the editor
 
@@ -348,4 +348,4 @@ Notes on the design:
 
 ## Roadmap
 
-Phases 2 and 3 are ranked in [`docs/research/phase2-roadmap.md`](docs/research/phase2-roadmap.md) and [`docs/research/phase3-roadmap.md`](docs/research/phase3-roadmap.md) and tracked in [`PROGRESS.md`](PROGRESS.md); both are complete apart from the GPU compositor. Of Phase 3's near misses, bleeping words, checkerboarding dialogue by speaker, Find Similar shots, people search and depth maps are in. Next up: the GPU compositor and better slow motion.
+Phases 2 and 3 are ranked in [`docs/research/phase2-roadmap.md`](docs/research/phase2-roadmap.md) and [`docs/research/phase3-roadmap.md`](docs/research/phase3-roadmap.md) and tracked in [`PROGRESS.md`](PROGRESS.md); both are complete apart from the GPU compositor. All of Phase 3's near misses are in: bleeping words, checkerboarding dialogue by speaker, Find Similar shots, people search, depth maps and AI slow motion (RIFE). Next up: the GPU compositor.

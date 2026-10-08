@@ -8,6 +8,7 @@
 #   <dir>/upscale        Super Scale        (MONTAGE_UPSCALE_MODEL)
 #   <dir>/faces          Find People        (MONTAGE_FACE_MODEL)
 #   <dir>/depth          depth effects      (MONTAGE_DEPTH_MODEL)
+#   <dir>/rife           AI slow motion     (MONTAGE_RIFE_MODEL)
 #
 #   scripts/fetch-models.sh [dir]      (default: ./models)
 set -euo pipefail
@@ -58,4 +59,7 @@ fetch faces face_recognition_sface_2021dec.onnx \
 fetch depth depth_anything_v2_small.onnx \
   https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/4472b7362082ad9968fee890ca0f1e5aca36b93d/onnx/model.onnx \
   afb6a5c28f3b6bf1618c6e43f02073ef9dfdc70e937502d51603e57b0a1df10c
-echo "Models in $DIR: MONTAGE_OBJECT_MODEL=$DIR/edgetam-video MONTAGE_SPEAKER_MODEL=$DIR/speakers MONTAGE_VISUAL_MODEL=$DIR/clip-vit-b32 MONTAGE_SPEECH_MODEL=$DIR/speech-enhance MONTAGE_UPSCALE_MODEL=$DIR/upscale MONTAGE_FACE_MODEL=$DIR/faces MONTAGE_DEPTH_MODEL=$DIR/depth"
+fetch rife RIFEv4.26_0921.zip \
+  https://huggingface.co/hzwer/RIFE/resolve/01fdc7e97404120c243c3ea7b427046e5dc7643e/RIFEv4.26_0921.zip \
+  1fa9b9cda3d9b8c3e301359e2595960902f97bf926c08598b0e9957a3f3f760e
+echo "Models in $DIR: MONTAGE_OBJECT_MODEL=$DIR/edgetam-video MONTAGE_SPEAKER_MODEL=$DIR/speakers MONTAGE_VISUAL_MODEL=$DIR/clip-vit-b32 MONTAGE_SPEECH_MODEL=$DIR/speech-enhance MONTAGE_UPSCALE_MODEL=$DIR/upscale MONTAGE_FACE_MODEL=$DIR/faces MONTAGE_DEPTH_MODEL=$DIR/depth MONTAGE_RIFE_MODEL=$DIR/rife"

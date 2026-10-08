@@ -15,6 +15,7 @@
 
 #include "media/Segmenter.h"
 #include "media/DepthMap.h"
+#include "media/Rife.h"
 #include "media/SuperScale.h"
 #include "media/SpeechEnhance.h"
 
@@ -180,6 +181,16 @@ bool ensureEffectModel(QWidget* parent, const std::string& type) {
         return ensureModelPack(parent, depthModel(), QObject::tr("Depth"),
                                QObject::tr("Depth effects use Depth Anything V2 Small (Apache-2.0), a model that works out how near each "
                                            "part of the picture is. It runs on this computer."));
+    }
+    if (type == "rife") {
+        if (!rifeAvailable()) {
+            QMessageBox::information(parent, QObject::tr("AI Frames"),
+                                     QObject::tr("This build of Montage cannot make AI frames: it was built without ONNX Runtime."));
+            return false;
+        }
+        return ensureModelPack(parent, rifeModel(), QObject::tr("AI Frames"),
+                               QObject::tr("AI frames for slow motion use RIFE 4.26 (MIT), downloaded from its authors' release. "
+                                           "It runs on this computer."));
     }
     if (type != "enhance_speech") return true;
     if (!speechEnhancerAvailable()) {

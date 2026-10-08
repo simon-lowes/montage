@@ -68,6 +68,7 @@
 #include "media/VisualSearch.h"
 #include "media/Faces.h"
 #include "media/DepthMap.h"
+#include "media/Rife.h"
 #include "ShotSearchPanel.h"
 #include "PeoplePanel.h"
 #include "media/Segmenter.h"
@@ -1653,6 +1654,51 @@ private slots:
         state()->setSelection({});
         state()->setSelection({red});
         QTRY_VERIFY(!win_->findChild<QPushButton*>("getDepthModel"));
+    }
+
+    void aiFramesOfferTheirModel() {
+        if (!rifeAvailable()) QSKIP("Built without ONNX Runtime");
+        // A video clip at half speed with AI frames chosen.
+        const QString video = dir_.path() + "/ai-frames.mp4";
+        {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 160;
+            gs.height = 90;
+            Clip c = makeGeneratorClip(gen, "color", 10);
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, c);
+            ExportSettings st;
+            st.path = video.toStdString();
+            st.audioCodec = "none";
+            st.preset = "ultrafast";
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        state()->newProject();
+        const auto ids = state()->importFiles({video});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        QVERIFY(state()->apply("Place", [media](Project& p, Sequence& s) { return edit::placeMedia(p, s, media, 0, 0, -1, V1, A1, false); }));
+        const Id clip = state()->sequence()->videoTracks[0].clips.at(0).id;
+        QVERIFY(state()->edit("Slow", [clip](Project& p, Sequence& s) {
+            Clip* c = edit::clipById(s, clip);
+            if (c->timing.empty()) c->timing = makeEffect(p, "time");
+            c->timing.params["sampling"] = Param(3.0);
+            return true;
+        }));
+        const QByteArray saved = qgetenv("MONTAGE_RIFE_MODEL");
+        qputenv("MONTAGE_RIFE_MODEL", (dir_.path() + "/no-rife").toUtf8());
+        state()->setSelection({});
+        state()->setSelection({clip});
+        QTRY_VERIFY(win_->findChild<QPushButton*>("getRifeModel"));
+        if (saved.isEmpty()) qunsetenv("MONTAGE_RIFE_MODEL");
+        else qputenv("MONTAGE_RIFE_MODEL", saved);
+        if (!rifeModel().installed()) QSKIP("Set MONTAGE_RIFE_MODEL to test with the model");
+        QVERIFY(ensureEffectModel(win_.get(), "rife"));
+        state()->setSelection({});
+        state()->setSelection({clip});
+        QTRY_VERIFY(!win_->findChild<QPushButton*>("getRifeModel"));
+        state()->newProject();
     }
 
     void enhanceSpeechAsksForItsModel() {

@@ -41,6 +41,7 @@
 #include "media/Vector.h"
 #include "media/Beats.h"
 #include "render/AafExport.h"
+#include "render/Retime.h"
 #include "render/AudioFx.h"
 #include "render/AutoMix.h"
 #include "render/VideoDenoise.h"
@@ -53,6 +54,7 @@
 #include "media/Diarizer.h"
 #include "media/Faces.h"
 #include "media/DepthMap.h"
+#include "media/Rife.h"
 #include "media/VisualSearch.h"
 #include "automation/McpServer.h"
 #ifdef MONTAGE_WITH_WHISPER
@@ -2103,6 +2105,125 @@ private slots:
         QVERIFY(loadProject(project.toStdString(), back, &err));
         shown = renderSequenceFrame(back, *back.active(), 0, {});
         QVERIFY(lum(shown, 0.25, 0.75) < 0.02f && std::abs(lum(shown, 0.62, 0.22) - lum(plain, 0.62, 0.22)) < 0.01f);
+    }
+
+    void rifeSlowMotion() {
+        if (!rifeAvailable() || !rifeModel().installed()) QSKIP("Set MONTAGE_RIFE_MODEL to the folder with RIFEv4.26_0921.zip");
+        // A photo moving 10 px right and 6 px down between two frames; the truth halfway is the crop moved 5 and 3.
+        VideoDecoder dec;
+        std::string err;
+        QVERIFY(dec.open(MONTAGE_TEST_DATA_DIR "/faces/armstrong.jpg", &err));
+        const Image photo = toImage(*dec.frameAt(0));
+        auto crop = [&](int dx, int dy) {
+            Image c(256, 192, Image::Uninitialized{});
+            for (int y = 0; y < 192; ++y)
+                for (int x = 0; x < 256; ++x) std::copy_n(photo.at(x + 40 - dx, y + 120 - dy), 4, c.at(x, y));
+            return c;
+        };
+        const Image a = crop(0, 0), b = crop(10, 6), truth = crop(5, 3);
+        auto error = [&](const Image& im) {  // mean absolute error inside a 16 px border
+            double sum = 0;
+            int n = 0;
+            for (int y = 16; y < 176; ++y)
+                for (int x = 16; x < 240; ++x, ++n)
+                    for (int c = 0; c < 3; ++c) sum += std::abs(im.at(x, y)[c] - truth.at(x, y)[c]);
+            return sum / (n * 3);
+        };
+        Image ai;
+        QVERIFY2(rifeInterpolate(a, b, 0.5, ai, &err), err.c_str());
+        QCOMPARE(ai.width, 256);
+        QCOMPARE(ai.height, 192);
+        const double eAi = error(ai), eBlend = error(blendFrames(a, b, 0.5)), eFlow = error(interpolateFrames(a, b, 0.5));
+        qInfo("halfway error: RIFE %.4f, optical flow %.4f, blend %.4f", eAi, eFlow, eBlend);
+        QVERIFY(eAi < eBlend / 3);
+        QVERIFY(eAi <= eFlow);
+        // A quarter of the way, and the ends: the frames themselves.
+        QVERIFY(rifeInterpolate(a, b, 0.0, ai));
+        double atA = 0;
+        for (size_t i = 0; i < ai.px.size(); ++i) atA = std::max(atA, double(std::abs(ai.px[i] - a.px[i])));
+        QVERIFY2(atA < 0.06, qPrintable(QString::number(atA)));
+        // The official weights were unpacked beside the graph once.
+        QVERIFY(QFile::exists(QString::fromStdString(rifeModel().directory()) + "/rife-4.26.onnx"));
+        QVERIFY(QDir(QString::fromStdString(rifeModel().directory()) + "/data").count() > 150);
+
+        // In a sequence: the moving photo as a video, then played at half speed with AI frames.
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 256;
+        gs.height = 192;
+        gs.fps = {25, 1};
+        MediaItem pm = probeOrFail(gen, MONTAGE_TEST_DATA_DIR "/faces/armstrong.jpg");
+        gen.media.push_back(pm);
+        QVERIFY(edit::placeMedia(gen, gs, pm.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Clip& moving = gs.videoTracks[0].clips.at(0);
+        moving.duration = 6;
+        moving.motion.params["fit"] = Param(3.0);  // 1:1
+        // Position in sequence pixels from the centre: 10 px right and 6 px down a frame.
+        moving.motion.params["pos_x"] = Param(0.0);
+        moving.motion.params["pos_y"] = Param(0.0);
+        moving.motion.params["pos_x"].keys = {{0, -40.0}, {5, 10.0}};
+        moving.motion.params["pos_y"].keys = {{0, -20.0}, {5, 10.0}};
+        ExportSettings st;
+        st.path = path("moving.mov");
+        st.videoCodec = "prores_ks";
+        st.profile = "hq";
+        st.audioCodec = "none";
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 256;
+        s.height = 192;
+        s.fps = {25, 1};
+        MediaItem vm = probeOrFail(p, st.path);
+        p.media.push_back(vm);
+        QVERIFY(edit::placeMedia(p, s, vm.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(edit::setSpeed(p, s, s.videoTracks[0].clips.at(0).id, 0.5, true, false).ok);
+        Clip& slow = s.videoTracks[0].clips.at(0);
+        if (slow.timing.empty()) slow.timing = makeEffect(p, "time");
+        // Sequence frame 5 is halfway between source frames 2 and 3; the truth is the photo rendered there.
+        auto at = [&](int sampling) {
+            slow.timing.params["sampling"] = Param(double(sampling));
+            return renderSequenceFrame(p, s, 5, {});
+        };
+        moving.motion.params["pos_x"].keys = {{0, -40.0}, {10, 10.0}};
+        moving.motion.params["pos_y"].keys = {{0, -20.0}, {10, 10.0}};
+        const Image real = renderSequenceFrame(gen, gs, 5, {});
+        auto diff = [&](const Image& im) {
+            double sum = 0;
+            int n = 0;
+            for (int y = 24; y < 168; ++y)
+                for (int x = 24; x < 232; ++x, ++n)
+                    for (int c = 0; c < 3; ++c) sum += std::abs(im.at(x, y)[c] - real.at(x, y)[c]);
+            return sum / (n * 3);
+        };
+        const double sAi = diff(at(3)), sBlend = diff(at(1)), sNearest = diff(at(0));
+        qInfo("half speed: RIFE %.4f, blend %.4f, nearest %.4f", sAi, sBlend, sNearest);
+        QVERIFY(sAi < sBlend / 2 && sAi < sNearest / 2);
+
+        // Through MCP: half speed with AI frames.
+        Project fresh = makeDefaultProject();
+        Sequence& fs = *fresh.active();
+        MediaItem fm = probeOrFail(fresh, st.path);
+        fresh.media.push_back(fm);
+        QVERIFY(edit::placeMedia(fresh, fs, fm.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const QString project = QString::fromStdString(path("rife.montage"));
+        QVERIFY(saveProject(fresh, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_set_speed"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        const double clipId = double(fs.videoTracks[0].clips.at(0).id);
+        QJsonObject r = call({{"project", project}, {"clip", clipId}, {"speed", 0.5}, {"frames", "ai"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(call({{"project", project}, {"clip", clipId}, {"speed", 0.5}, {"frames", "wobbly"}}).value("isError").toBool());
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back, &err));
+        QCOMPARE(back.active()->videoTracks[0].clips.at(0).timing.p("sampling", 0), 3.0);
     }
 
     void peopleSearch() {

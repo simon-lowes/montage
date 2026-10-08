@@ -22,6 +22,7 @@
 #include "core/Surround.h"
 #include "core/Transcript.h"
 #include "core/TranscriptEdit.h"
+#include "core/Zip.h"
 
 using namespace montage;
 using namespace montage::edit;
@@ -74,6 +75,76 @@ struct Fixture {
 class TestCore : public QObject {
     Q_OBJECT
 private slots:
+    void zipReaderAndInflate() {
+        // Raw DEFLATE from Qt's zlib stream: without its length prefix, header and checksum.
+        auto deflate = [](const QByteArray& data, int level) {
+            const QByteArray z = qCompress(data, level);
+            return z.mid(6, z.size() - 10);
+        };
+        QByteArray text;
+        for (int i = 0; i < 2000; ++i) text += QByteArray::number(i * 7919 % 1000) + (i % 3 ? " the quick brown fox " : "\n");
+        QByteArray noise(70000, Qt::Uninitialized);
+        std::mt19937 rng(7);
+        for (char& c : noise) c = char(rng());
+        // Dynamic Huffman (level 9), fixed Huffman (a short string), stored blocks (level 0, over 64 KiB).
+        for (const auto& [data, level] : {std::pair{text, 9}, std::pair{QByteArray("hello hello hello"), 9}, std::pair{noise, 0}, std::pair{noise, 6}}) {
+            const QByteArray raw = deflate(data, level);
+            std::string out;
+            QVERIFY(inflateRaw(reinterpret_cast<const uint8_t*>(raw.constData()), size_t(raw.size()), out));
+            QCOMPARE(QByteArray::fromStdString(out), data);
+            // Cut short, it fails rather than returning part.
+            std::string part;
+            QVERIFY(!inflateRaw(reinterpret_cast<const uint8_t*>(raw.constData()), size_t(raw.size() / 2), part));
+        }
+        QCOMPARE(crc32("123456789", 9), 0xCBF43926u);
+
+        // A zip with a stored and a deflated entry, laid out by hand.
+        struct In {
+            std::string name;
+            QByteArray data;
+            bool deflated;
+        };
+        const std::vector<In> files{{"a/stored.txt", "plain bytes", false}, {"a/text.txt", text, true}};
+        QByteArray zip, central;
+        auto u16 = [](QByteArray& b, int v) { b.append(char(v & 0xFF)).append(char((v >> 8) & 0xFF)); };
+        auto u32 = [&](QByteArray& b, uint32_t v) { u16(b, int(v & 0xFFFF)), u16(b, int(v >> 16)); };
+        for (const In& f : files) {
+            const QByteArray body = f.deflated ? deflate(f.data, 9) : f.data;
+            const uint32_t crc = crc32(f.data.constData(), size_t(f.data.size())), offset = uint32_t(zip.size());
+            for (QByteArray* b : {&zip, &central}) {
+                const bool c = b == &central;
+                u32(*b, c ? 0x02014b50 : 0x04034b50);
+                if (c) u16(*b, 20);
+                u16(*b, 20), u16(*b, 0), u16(*b, f.deflated ? 8 : 0), u16(*b, 0), u16(*b, 0);
+                u32(*b, crc), u32(*b, uint32_t(body.size())), u32(*b, uint32_t(f.data.size()));
+                u16(*b, int(f.name.size())), u16(*b, 0);
+                if (c) u16(*b, 0), u16(*b, 0), u16(*b, 0), u32(*b, 0), u32(*b, offset);
+                b->append(f.name.c_str());
+            }
+            zip += body;
+        }
+        const uint32_t cdOffset = uint32_t(zip.size());
+        zip += central;
+        u32(zip, 0x06054b50), u16(zip, 0), u16(zip, 0), u16(zip, 2), u16(zip, 2);
+        u32(zip, uint32_t(central.size())), u32(zip, cdOffset), u16(zip, 0);
+        ZipReader r;
+        QVERIFY(r.open(zip.toStdString()));
+        QCOMPARE(int(r.entries().size()), 2);
+        std::string got, err;
+        QVERIFY2(r.read("a/text.txt", got, &err), err.c_str());
+        QCOMPARE(QByteArray::fromStdString(got), text);
+        QVERIFY(r.read("a/stored.txt", got));
+        QCOMPARE(got, std::string("plain bytes"));
+        QVERIFY(!r.read("missing", got, &err));
+        // A damaged byte is caught by the checksum.
+        QByteArray bad = zip;
+        bad[30 + 12 + 2] = char(bad[30 + 12 + 2] ^ 0x20);  // inside "plain bytes", after the local header and name
+        QVERIFY(r.open(bad.toStdString()));
+        QVERIFY(!r.read("a/stored.txt", got, &err));
+        QVERIFY(QString::fromStdString(err).contains("checksum"));
+        QVERIFY(!r.open("not a zip at all, just some text that is long enough"));
+    }
+
     void captionTracks() {
         // Wrapping: short text stays on one line; long text splits into two balanced lines.
         QCOMPARE(QString::fromStdString(wrapCaptionText("Hello there")), QString("Hello there"));
