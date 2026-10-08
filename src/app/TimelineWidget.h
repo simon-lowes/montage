@@ -60,6 +60,8 @@ public:
     void setShowDuplicateFrames(bool on);
     bool showDuplicateFrames() const { return showDuplicates_; }
     const std::vector<edit::DuplicateSpan>& duplicateSpans(Id clip) const;  // as drawn
+    // Whether a through edit follows this clip (edit::throughEdits), as marked on the timeline.
+    bool isThroughEdit(Id clip) const;
     void setShowTrackAutomation(bool on);
     bool showTrackAutomation() const { return showTrackAuto_; }
     // Where audio track `index`'s automation line is at frame f, in viewport pixels (testing aid); (-1, -1) if hidden.
@@ -230,6 +232,8 @@ private:
     bool showTrackAuto_ = false;
     bool showDuplicates_ = false;
     mutable bool duplicatesDirty_ = true;
+    mutable bool throughDirty_ = true;
+    mutable std::vector<Id> through_;
     mutable std::map<Id, std::vector<edit::DuplicateSpan>> duplicates_;
     Id trimOut_ = 0, trimIn_ = 0;
     int trimSide_ = -1;

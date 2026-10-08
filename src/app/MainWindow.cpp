@@ -770,6 +770,7 @@ void MainWindow::buildMenus() {
     add(clipM, tr("Add Frame &Hold"), QKeySequence("Shift+F"), [this] { addFrameHold(); })->setObjectName(QStringLiteral("addFrameHold"));
     add(clipM, tr("Swap with Previous Clip"), QKeySequence("Ctrl+Shift+,"), [this] { swapClip(false); })->setObjectName(QStringLiteral("swapPrevious"));
     add(clipM, tr("Swap with Next Clip"), QKeySequence("Ctrl+Shift+."), [this] { swapClip(true); })->setObjectName(QStringLiteral("swapNext"));
+    add(clipM, tr("Join Through Edits"), QKeySequence(), [this] { joinThroughEdits(); })->setObjectName(QStringLiteral("joinThroughEdits"));
     QMenu* auditionM = clipM->addMenu(tr("Audition"));
     add(auditionM, tr("Add Selected Media as Takes"), QKeySequence("Ctrl+Alt+Y"), [this] { addTakesFromBin(); })
         ->setObjectName(QStringLiteral("addTakes"));
@@ -2172,6 +2173,18 @@ const Clip* auditionClip(const EditorState* state, const Clip* underPlayhead) {
     return underPlayhead;
 }
 }  // namespace
+
+int MainWindow::joinThroughEdits() {
+    if (!state_->sequence()) return 0;
+    const std::vector<Id> ids = state_->selectedClips();
+    int joined = 0;
+    state_->edit(tr("Join Through Edits"), [&](Project& p, Sequence& s) {
+        joined = edit::joinThroughEdits(p, s, ids);
+        return joined > 0;
+    });
+    state_->message(joined ? tr("Joined %n through edit(s)", "", joined) : tr("No through edits to join"), 3000);
+    return joined;
+}
 
 int MainWindow::addTakesFromBin() {
     const Clip* c = auditionClip(state_, clipForCommand());

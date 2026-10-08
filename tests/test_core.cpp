@@ -2506,6 +2506,55 @@ private slots:
         QCOMPARE(int(std::count_if(back.active()->markers.begin(), back.active()->markers.end(), [](const Marker& m) { return m.chapter; })), 4);
     }
 
+    void throughEditsJoin() {
+        // A clip with its sound, cut in two: the cut is a through edit on both tracks.
+        Fixture fx;
+        QVERIFY(placeMedia(fx.p, fx.s(), fx.media, 0, 10, 110, V1, A1, false).ok);
+        const Id v = fx.v1().clips[0].id, a = fx.a1().clips[0].id;
+        clipById(fx.s(), v)->markers.push_back(Marker{70, 0, "late", "", 0, false});
+        QVERIFY(razorAll(fx.p, fx.s(), 40).ok);
+        QCOMPARE(fx.v1().clips.size(), size_t(2));
+        QCOMPARE(throughEdits(fx.s()), (std::vector<Id>{v, a}));
+        // Moved a frame, cut to other material, at another speed or with a dissolve: not through any more.
+        {
+            Fixture g = fx;
+            g.v1().clips[1].start += 1;  // a frame later, with a gap
+            QCOMPARE(throughEdits(g.s()), std::vector<Id>{a});
+        }
+        {
+            Fixture g = fx;
+            g.v1().clips[1].sourceIn += 3;
+            g.v1().clips[1].speed = 1.0;
+            QCOMPARE(throughEdits(g.s()), std::vector<Id>{a});
+            g.v1().clips[1].sourceIn -= 3;
+            g.v1().clips[1].speed = 2.0;
+            QCOMPARE(throughEdits(g.s()), std::vector<Id>{a});
+        }
+        {
+            Fixture g = fx;
+            QVERIFY(addTransition(g.p, g.s(), v, Edge::Out, "cross_dissolve", 10).ok);
+            QCOMPARE(throughEdits(g.s()), std::vector<Id>{a});
+        }
+        // Joined: one clip on each track again, as before the cut, the marker kept.
+        QVERIFY(!joinThroughEdit(fx.p, fx.s(), fx.v1().clips[1].id).ok);  // nothing after the second half
+        QVERIFY(joinThroughEdit(fx.p, fx.s(), v).ok);
+        QCOMPARE(fx.v1().clips.size(), size_t(1));
+        QCOMPARE(fx.a1().clips.size(), size_t(1));
+        const Clip& joined = fx.v1().clips[0];
+        QCOMPARE(joined.id, v);
+        QCOMPARE(joined.start, FrameTime(0));
+        QCOMPARE(joined.duration, FrameTime(100));
+        QCOMPARE(joined.sourceIn, 10.0);
+        QCOMPARE(joined.markers.size(), size_t(1));
+        QCOMPARE(fx.a1().clips[0].duration, FrameTime(100));
+        QVERIFY(throughEdits(fx.s()).empty());
+        // Several at once.
+        QVERIFY(razorAll(fx.p, fx.s(), 20).ok && razorAll(fx.p, fx.s(), 60).ok);
+        QCOMPARE(joinThroughEdits(fx.p, fx.s()), 2);
+        QCOMPARE(fx.v1().clips.size(), size_t(1));
+        QCOMPARE(fx.v1().clips[0].duration, FrameTime(100));
+    }
+
     void duplicateFrameMarkers() {
         // The same file used three times: frames 0-40, then 20-60 (sharing 20-40), then 100-120 (shared with nothing).
         Fixture fx;

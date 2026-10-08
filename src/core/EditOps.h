@@ -154,6 +154,17 @@ struct DuplicateSpan {
 };
 std::map<Id, std::vector<DuplicateSpan>> duplicateFrames(const Sequence& s);
 
+// ---- Through edits (Premiere's through edit indicators and Join Through Edits) ----
+// An edit the picture or sound runs straight through: the next clip starts where this one ends and plays the same
+// media at the same speed from exactly where this one leaves off, with the same kind of effects and no transition
+// between them (what a razor cut leaves). The outgoing clips' ids, on every track.
+std::vector<Id> throughEdits(const Sequence& s);
+// Joins a clip with the one after it across a through edit, and its linked clips across theirs: one clip each, with
+// the outgoing clip's id, settings and keyframes. Fails when there is no through edit after it.
+Result joinThroughEdit(Project& p, Sequence& s, Id clipId);
+// Joins every through edit touching these clips (all of them when empty); how many were joined.
+int joinThroughEdits(Project& p, Sequence& s, const std::vector<Id>& ids = {});
+
 // ---- Auditions (Final Cut's auditions, Resolve's take selector) ----------------
 // Adds media as alternative takes of a clip, each from a source in-point (sequence frames), the clip staying the
 // pick. Takes must have what the track plays (pictures on a video track, sound on an audio track).

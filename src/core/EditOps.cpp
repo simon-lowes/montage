@@ -1570,6 +1570,90 @@ std::map<Id, std::vector<DuplicateSpan>> duplicateFrames(const Sequence& s) {
     return out;
 }
 
+// ---- Through edits -----------------------------------------------------------------
+
+namespace {
+bool isThrough(const Track& t, size_t i) {
+    if (i + 1 >= t.clips.size()) return false;
+    const Clip& a = t.clips[i];
+    const Clip& b = t.clips[i + 1];
+    if (a.end() != b.start || !a.mediaId || a.mediaId != b.mediaId || a.isGenerator() || b.isGenerator()) return false;
+    if (a.speed != b.speed || a.reverse || b.reverse || a.ramped() || b.ramped()) return false;
+    if (!a.takes.empty() || !b.takes.empty() || !a.unrendered.empty() || !b.unrendered.empty()) return false;
+    if (a.enabled != b.enabled || a.blendMode != b.blendMode || a.angle != b.angle || a.audioAngle != b.audioAngle) return false;
+    if (a.effects.size() != b.effects.size()) return false;
+    for (size_t k = 0; k < a.effects.size(); ++k)
+        if (a.effects[k].type != b.effects[k].type) return false;
+    if (std::fabs(b.sourceIn - (a.sourceIn + a.sourceExtent())) > 1e-3) return false;
+    for (const Transition& tr : t.transitions)
+        if (tr.clipA == a.id && tr.clipB == b.id) return false;
+    return true;
+}
+
+// Merges clip i of the track with the one after it.
+void mergeWithNext(Track& t, size_t i) {
+    Clip& a = t.clips[i];
+    const Clip b = t.clips[i + 1];
+    a.duration += b.duration;
+    for (const Marker& m : b.markers)
+        if (std::find(a.markers.begin(), a.markers.end(), m) == a.markers.end()) a.markers.push_back(m);
+    t.clips.erase(t.clips.begin() + long(i) + 1);
+    for (Transition& tr : t.transitions)
+        if (tr.clipA == b.id) tr.clipA = a.id;
+}
+}  // namespace
+
+std::vector<Id> throughEdits(const Sequence& s) {
+    std::vector<Id> out;
+    for (const std::vector<Track>* tracks : {&s.videoTracks, &s.audioTracks})
+        for (const Track& t : *tracks)
+            for (size_t i = 0; i + 1 < t.clips.size(); ++i)
+                if (isThrough(t, i)) out.push_back(t.clips[i].id);
+    return out;
+}
+
+Result joinThroughEdit(Project&, Sequence& s, Id clipId) {
+    const auto loc = locate(s, clipId);
+    if (!loc) return Result::fail("No such clip");
+    Track* t = trackAt(s, loc->track);
+    if (t->locked) return Result::fail("The track is locked");
+    if (!isThrough(*t, loc->index)) return Result::fail("There is no through edit after that clip");
+    const Id next = t->clips[loc->index + 1].id;
+    // Linked clips on other tracks that also run through, into the clips linked to the next one.
+    std::vector<std::pair<Track*, size_t>> joins{{t, loc->index}};
+    const std::vector<Id> after = linkedClips(s, next);
+    for (Id x : linkedClips(s, clipId)) {
+        if (x == clipId || x == next) continue;
+        const auto lx = locate(s, x);
+        Track* tx = lx ? trackAt(s, lx->track) : nullptr;
+        if (!tx || tx == t || tx->locked || lx->index + 1 >= tx->clips.size()) continue;
+        const Id y = tx->clips[lx->index + 1].id;
+        if (y != x && std::find(after.begin(), after.end(), y) != after.end() && isThrough(*tx, lx->index)) joins.push_back({tx, lx->index});
+    }
+    for (auto& [track, index] : joins) mergeWithNext(*track, index);
+    return {};
+}
+
+int joinThroughEdits(Project& p, Sequence& s, const std::vector<Id>& ids) {
+    auto wanted = [&](const Track& t, size_t i) {
+        if (ids.empty()) return true;
+        return std::find(ids.begin(), ids.end(), t.clips[i].id) != ids.end() ||
+               std::find(ids.begin(), ids.end(), t.clips[i + 1].id) != ids.end();
+    };
+    int joined = 0;
+    for (bool again = true; again;) {
+        again = false;
+        for (std::vector<Track>* tracks : {&s.videoTracks, &s.audioTracks})
+            for (Track& t : *tracks)
+                for (size_t i = 0; i + 1 < t.clips.size() && !again; ++i)
+                    if (!t.locked && isThrough(t, i) && wanted(t, i) && joinThroughEdit(p, s, t.clips[i].id).ok) {
+                        ++joined;
+                        again = true;  // indices moved: look again
+                    }
+    }
+    return joined;
+}
+
 // ---- Auditions -----------------------------------------------------------------
 
 Result addTakes(Project& p, Sequence& s, Id clipId, const std::vector<std::pair<Id, double>>& media) {

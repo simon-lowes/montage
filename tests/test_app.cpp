@@ -2134,6 +2134,18 @@ private slots:
         QCOMPARE(win_->timeline()->duplicateSpans(clip).front().from, FrameTime(0));
         dups->trigger();
         QVERIFY(!win_->timeline()->showDuplicateFrames());
+
+        // A razor cut is marked as a through edit; Join Through Edits puts the clip back together.
+        const Id again = state()->sequence()->videoTracks[0].clips[1].id;
+        state()->setSelection({});
+        QVERIFY(state()->apply("Cut", [](Project& p, Sequence& s) { return edit::razorAll(p, s, 75); }));
+        QVERIFY(win_->timeline()->isThroughEdit(again));
+        QVERIFY(!win_->timeline()->isThroughEdit(clip));
+        win_->findChild<QAction*>("joinThroughEdits")->trigger();
+        QVERIFY(!win_->timeline()->isThroughEdit(again));
+        QCOMPARE(state()->sequence()->videoTracks[0].clips.size(), size_t(2));
+        state()->undo();
+        QCOMPARE(state()->sequence()->videoTracks[0].clips.size(), size_t(3));
         state()->newProject();
     }
 

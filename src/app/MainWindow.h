@@ -125,6 +125,7 @@ public:
     int addTakesFromBin();  // how many takes were added
     bool cycleTake(int step);
     bool finalizeAudition();
+    int joinThroughEdits();  // the selected clips' through edits, else all of the sequence's; how many (one undo step)
     bool swapClip(bool withNext);                     // the selected clip (or the one under the playhead) with its neighbour
     bool replaceWithSource();                         // the selected clip, or the one under the playhead
     bool fitToFill();

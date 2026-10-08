@@ -122,14 +122,14 @@ TimelineWidget::TimelineWidget(EditorState* state, QWidget* parent) : QAbstractS
     horizontalScrollBar()->setSingleStep(20);
     verticalScrollBar()->setSingleStep(20);
     connect(state_, &EditorState::projectChanged, this, [this] {
-        duplicatesDirty_ = true;
+        duplicatesDirty_ = throughDirty_ = true;
         updateScrollBars();
         viewport()->update();
     });
     connect(state_, &EditorState::selectionChanged, viewport(), qOverload<>(&QWidget::update));
     connect(state_, &EditorState::playheadChanged, viewport(), qOverload<>(&QWidget::update));
     connect(state_, &EditorState::sequenceSwitched, this, [this] {
-        duplicatesDirty_ = true;
+        duplicatesDirty_ = throughDirty_ = true;
         horizontalScrollBar()->setValue(0);
         zoomToFit();
     });
@@ -601,6 +601,13 @@ void TimelineWidget::paintClip(QPainter& p, const Row& row, const Clip& c, const
         for (int x = r.left() - r.height(); x < r.right(); x += 8) p.drawLine(x, r.bottom(), x + r.height(), r.top());
     }
     paintLane(p, c, row.ref.kind, r);
+    if (isThroughEdit(c.id)) {
+        // A through edit (the picture or sound runs straight on): a small arrowhead into the cut, as Premiere marks it.
+        const int x = r.right() - 1, y = r.top() + kNameStrip + 2;
+        p.setPen(Qt::NoPen);
+        p.setBrush(QColor(255, 255, 255, 210));
+        p.drawPolygon(QPolygon({QPoint(x - 5, y), QPoint(x, y + 4), QPoint(x - 5, y + 8)}));
+    }
     if (showDuplicates_ && row.ref.kind == TrackKind::Video) {
         // Duplicate frame markers: a stripe in one colour per file under the frames used again elsewhere.
         static const QColor kDup[] = {QColor(0xff, 0x5c, 0x8a), QColor(0x4c, 0xd9, 0xff), QColor(0xff, 0xc8, 0x3c),
@@ -730,6 +737,14 @@ const std::vector<edit::DuplicateSpan>& TimelineWidget::duplicateSpans(Id clip) 
     }
     const auto it = duplicates_.find(clip);
     return it == duplicates_.end() ? none : it->second;
+}
+
+bool TimelineWidget::isThroughEdit(Id clip) const {
+    if (throughDirty_) {
+        through_ = state_->sequence() ? edit::throughEdits(*state_->sequence()) : std::vector<Id>{};
+        throughDirty_ = false;
+    }
+    return std::find(through_.begin(), through_.end(), clip) != through_.end();
 }
 
 void TimelineWidget::setShowTrackAutomation(bool on) {
