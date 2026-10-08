@@ -1104,6 +1104,71 @@ Result fitToFill(Project& p, Sequence& s, Id mediaId, double srcIn, double srcOu
     return r;
 }
 
+Result swapClip(Project& p, Sequence& s, Id clipId, bool withNext) {
+    (void)p;
+    const auto loc = locate(s, clipId);
+    if (!loc) return Result::fail("No such clip");
+    const Track* track = trackAt(s, loc->track);
+    if (track->locked) return Result::fail("Clip is on a locked track");
+    const size_t i = loc->index;
+    if (withNext ? i + 1 >= track->clips.size() : i == 0)
+        return Result::fail(withNext ? "There is no clip after it" : "There is no clip before it");
+    const Clip a = track->clips[withNext ? i : i - 1], b = track->clips[withNext ? i + 1 : i];  // a is the earlier
+    const bool adjacent = a.end() == b.start;
+    const FrameTime da = b.end() - a.duration - a.start, db = a.start - b.start;
+    // Each moves with the clips linked to it.
+    struct Moving {
+        TrackRef track;
+        Clip clip;
+    };
+    std::vector<Moving> moving;
+    std::set<Id> ids;
+    for (const auto& [group, delta] : {std::pair{linkedClips(s, a.id), da}, std::pair{linkedClips(s, b.id), db}})
+        for (Id id : group) {
+            const auto l = locate(s, id);
+            if (!l || ids.count(id)) continue;
+            const Track* t = trackAt(s, l->track);
+            if (t->locked) return Result::fail("A linked clip is on a locked track");
+            Clip c = t->clips[l->index];
+            c.start += delta;
+            if (c.start < 0) return Result::fail("Clips would move before 0");
+            moving.push_back({l->track, c});
+            ids.insert(id);
+        }
+    // Room for each where it goes, with all of them lifted out.
+    const std::vector<Id> ignore(ids.begin(), ids.end());
+    for (size_t k = 0; k < moving.size(); ++k) {
+        const Moving& m = moving[k];
+        if (!trackEmpty(*trackAt(s, m.track), m.clip.start, m.clip.end(), ignore))
+            return Result::fail("The clips linked to them would overlap other clips");
+        for (size_t o = k + 1; o < moving.size(); ++o)
+            if (moving[o].track == m.track && moving[o].clip.start < m.clip.end() && m.clip.start < moving[o].clip.end())
+                return Result::fail("The clips linked to them would overlap each other");
+    }
+    std::set<TrackRef> tracksDone;
+    for (const Moving& m : moving) {
+        Track* t = trackAt(s, m.track);
+        t->clips.erase(std::remove_if(t->clips.begin(), t->clips.end(), [&](const Clip& c) { return c.id == m.clip.id; }), t->clips.end());
+        if (!tracksDone.insert(m.track).second) continue;
+        // The dissolve between the two goes to their new edit (b now first); others on their edges go.
+        std::vector<Transition> kept;
+        for (Transition tr : t->transitions) {
+            const bool aIn = ids.count(tr.clipA) > 0, bIn = ids.count(tr.clipB) > 0;
+            if (!aIn && !bIn) kept.push_back(tr);
+            else if (adjacent && aIn && bIn && tr.clipA != 0 && tr.clipB != 0) {
+                std::swap(tr.clipA, tr.clipB);
+                kept.push_back(tr);
+            }
+        }
+        t->transitions = std::move(kept);
+    }
+    for (const Moving& m : moving) trackAt(s, m.track)->clips.push_back(m.clip);
+    for (const Moving& m : moving) normalize(*trackAt(s, m.track));
+    Result r;
+    r.applied = withNext ? da : db;
+    return r;
+}
+
 std::vector<Id> clipsFrom(const Sequence& s, FrameTime frame, std::optional<TrackRef> track) {
     std::vector<Id> out;
     for (TrackRef r : allTracks(s)) {

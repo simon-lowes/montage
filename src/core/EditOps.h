@@ -137,6 +137,13 @@ Result replaceClip(Project& p, Sequence& s, Id clipId, Id mediaId, double srcAli
 Result fitToFill(Project& p, Sequence& s, Id mediaId, double srcIn, double srcOut, FrameTime tlIn, FrameTime tlOut,
                  TrackRef videoTrack, TrackRef audioTrack);
 
+// Swap with Previous / Next Clip (Resolve's swap, Final Cut's reorder): the clip
+// and its neighbour on the track change places within the span they share
+// (any gap between them stays between them); clips linked to each move with
+// it. A transition between the two moves to their new edit; others on their
+// edges are removed.
+Result swapClip(Project& p, Sequence& s, Id clipId, bool withNext);
+
 // Clips that start at or after `frame` (Track Select Forward), on every track
 // or only `track`.
 std::vector<Id> clipsFrom(const Sequence& s, FrameTime frame, std::optional<TrackRef> track = {});

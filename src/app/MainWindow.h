@@ -87,6 +87,7 @@ public:
     bool pasteAttributes(unsigned what);              // edit::Attribute flags, from the copied clips
     bool removeAttributes(unsigned what);
     bool addFrameHold();                              // the clip under the playhead
+    bool swapClip(bool withNext);                     // the selected clip (or the one under the playhead) with its neighbour
     bool replaceWithSource();                         // the selected clip, or the one under the playhead
     bool fitToFill();
     int selectForward(bool allTracks);

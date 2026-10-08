@@ -3109,6 +3109,35 @@ private slots:
         QVERIFY(isRed(renderSequenceFrame(back, *back.active(), 0, {}), 0.03, 0.03));
     }
 
+    void mcpSwapsClips() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        Clip a = makeGeneratorClip(p, "color", 30), b = makeGeneratorClip(p, "color", 45);
+        b.start = 30;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, a).ok && edit::overwrite(p, s, {TrackKind::Video, 0}, b).ok);
+        const Id first = s.videoTracks[0].clips[0].id, second = s.videoTracks[0].clips[1].id;
+        const QString project = QString::fromStdString(path("swap.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_swap_clip"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call({{"project", project}, {"clip", double(first)}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(edit::clipById(*back.active(), second)->start, FrameTime(0));
+        QCOMPARE(edit::clipById(*back.active(), first)->start, FrameTime(45));
+        QVERIFY(call({{"project", project}, {"clip", double(first)}, {"with", "next"}}).value("isError").toBool());
+        QVERIFY(call({{"project", project}, {"clip", double(first)}, {"with", "sideways"}}).value("isError").toBool());
+        QVERIFY(!call({{"project", project}, {"clip", double(first)}, {"with", "previous"}}).value("isError").toBool());
+    }
+
     void blemishRemover() {
         if (!faceSearchAvailable() || !faceModel().installed()) QSKIP("Set MONTAGE_FACE_MODEL to the YuNet and SFace models");
         const std::string still = MONTAGE_TEST_DATA_DIR "/faces/jfk-color.jpg";

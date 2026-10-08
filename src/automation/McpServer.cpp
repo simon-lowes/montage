@@ -608,6 +608,23 @@ void McpServer::Impl::addTools() {
             return ok(QStringLiteral("Moved to %1").arg(tc(moved ? moved->start : 0, s)), moved ? clipJson(l.project, s, *moved) : QJsonObject{});
         });
 
+    add("montage_swap_clip", "Swap a clip with its neighbour",
+        "Swap a clip with the one before or after it on its track: they change places within the span they share (a gap "
+        "between them stays between them), with the clips linked to each.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
+            "with":{"type":"string","enum":["next","previous"],"default":"next"}},"required":["project","clip"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const Id id = clipArg(l, a).id;
+            const QString with = str(a, "with", "next");
+            if (with != "next" && with != "previous") throw ArgError{"\"with\" is next or previous"};
+            check(edit::swapClip(l.project, s, id, with == "next"));
+            save(l);
+            const Clip* c = edit::clipById(s, id);
+            return ok(QStringLiteral("Swapped; the clip now starts at %1").arg(tc(c ? c->start : 0, s)), c ? clipJson(l.project, s, *c) : QJsonObject{});
+        });
+
     add("montage_trim_clip", "Trim a clip",
         "Move a clip's in or out point by a number of seconds (positive: later). Ripple moves later clips with it.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},

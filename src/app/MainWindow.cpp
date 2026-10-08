@@ -555,6 +555,8 @@ void MainWindow::buildMenus() {
     compareRef_->setObjectName(QStringLiteral("compareReference"));
     add(clipM, tr("Auto Reframe"), QKeySequence(), [this] { autoReframeClips(); })->setObjectName(QStringLiteral("autoReframeClips"));
     add(clipM, tr("Add Frame &Hold"), QKeySequence("Shift+F"), [this] { addFrameHold(); })->setObjectName(QStringLiteral("addFrameHold"));
+    add(clipM, tr("Swap with Previous Clip"), QKeySequence("Ctrl+Shift+,"), [this] { swapClip(false); })->setObjectName(QStringLiteral("swapPrevious"));
+    add(clipM, tr("Swap with Next Clip"), QKeySequence("Ctrl+Shift+."), [this] { swapClip(true); })->setObjectName(QStringLiteral("swapNext"));
     add(clipM, tr("Replace with Source Clip"), QKeySequence(), [this] { replaceWithSource(); })
         ->setObjectName(QStringLiteral("replaceWithSource"));
     add(clipM, tr("Fit to Fill"), QKeySequence(), [this] { fitToFill(); })->setObjectName(QStringLiteral("fitToFill"));
@@ -1944,6 +1946,29 @@ void MainWindow::fitMusicDialog() {
     lay->addWidget(buttons);
     if (dlg.exec() != QDialog::Accepted) return;
     fitMusicToLength(FrameTime(std::llround(length->value() * fps)));
+}
+
+bool MainWindow::swapClip(bool withNext) {
+    const Sequence* s = state_->sequence();
+    if (!s) return false;
+    // The selected clip (a video one first), else the one under the playhead.
+    const Clip* c = nullptr;
+    for (Id id : state_->selectedClips()) {
+        const auto loc = edit::locate(*s, id);
+        if (loc && (!c || loc->track.kind == TrackKind::Video)) c = edit::clipById(*s, id);
+        if (c && loc && loc->track.kind == TrackKind::Video) break;
+    }
+    if (!c) c = clipForCommand();
+    if (!c) {
+        state_->message(tr("Select a clip to swap"));
+        return false;
+    }
+    const Id id = c->id;
+    const std::vector<Id> keep(state_->selectedClips().begin(), state_->selectedClips().end());
+    const bool ok = state_->apply(withNext ? tr("Swap with Next Clip") : tr("Swap with Previous Clip"),
+                                  [id, withNext](Project& p, Sequence& sq) { return edit::swapClip(p, sq, id, withNext); });
+    if (ok) state_->setSelection(keep.empty() ? std::vector<Id>{id} : keep);
+    return ok;
 }
 
 bool MainWindow::addFrameHold() {

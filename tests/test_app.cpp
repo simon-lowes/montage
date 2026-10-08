@@ -339,6 +339,27 @@ private slots:
         state()->setSnapping(true);
     }
 
+    void swapClipsFromTheMenu() {
+        loadDemo();
+        const Id red = clipNamed(*state()->sequence(), "Red")->id, blue = clipNamed(*state()->sequence(), "Blue")->id;
+        state()->setSelection({red});
+        win_->findChild<QAction*>("swapNext")->trigger();
+        QCOMPARE(edit::clipById(*state()->sequence(), blue)->start, FrameTime(0));
+        QCOMPARE(edit::clipById(*state()->sequence(), red)->start, FrameTime(60));
+        QVERIFY(state()->isSelected(red));
+        // Swapping the same clip back, then one undo step at a time.
+        win_->findChild<QAction*>("swapPrevious")->trigger();
+        QCOMPARE(edit::clipById(*state()->sequence(), red)->start, FrameTime(0));
+        state()->undo();
+        QCOMPARE(edit::clipById(*state()->sequence(), red)->start, FrameTime(60));
+        state()->undo();
+        QCOMPARE(edit::clipById(*state()->sequence(), blue)->start, FrameTime(60));
+        // Nothing after the last clip: a message, nothing changed.
+        state()->setSelection({blue});
+        QVERIFY(!win_->swapClip(true));
+        QCOMPARE(edit::clipById(*state()->sequence(), blue)->start, FrameTime(60));
+    }
+
     void razorTool() {
         loadDemo();
         timeline()->setTool(TimelineWidget::Tool::Razor);

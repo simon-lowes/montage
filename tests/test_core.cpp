@@ -2214,6 +2214,56 @@ private slots:
         QCOMPARE(duplicateSequence(fx.p, 987654), Id(0));
     }
 
+    void swapClips() {
+        // A (picture and sound), B (picture and sound), C (picture): A and B change places.
+        Fixture fx;
+        QVERIFY(placeMedia(fx.p, fx.s(), fx.media, 0, 20, 50, V1, A1, false).ok);  // handles either side, for a dissolve
+        QVERIFY(placeMedia(fx.p, fx.s(), fx.media, 30, 60, 110, V1, A1, false).ok);
+        const Id a = fx.v1().clips[0].id, b = fx.v1().clips[1].id, aSound = fx.a1().clips[0].id, bSound = fx.a1().clips[1].id;
+        const Id c = fx.put(V1, 80, 20);
+        QVERIFY(addTransition(fx.p, fx.s(), a, Edge::Out, "cross_dissolve", 10).ok);
+        Result r = swapClip(fx.p, fx.s(), a, true);
+        QVERIFY2(r.ok, r.error.c_str());
+        QCOMPARE(clipById(fx.s(), b)->start, FrameTime(0));
+        QCOMPARE(clipById(fx.s(), a)->start, FrameTime(50));
+        QCOMPARE(clipById(fx.s(), bSound)->start, FrameTime(0));
+        QCOMPARE(clipById(fx.s(), aSound)->start, FrameTime(50));
+        QCOMPARE(clipById(fx.s(), c)->start, FrameTime(80));
+        QCOMPARE(clipById(fx.s(), a)->sourceIn, 20.0);  // the same pictures, only moved
+        // The dissolve goes to the new edit, from B into A.
+        QCOMPARE(fx.v1().transitions.size(), size_t(1));
+        QCOMPARE(fx.v1().transitions[0].clipA, b);
+        QCOMPARE(fx.v1().transitions[0].clipB, a);
+        // And back.
+        QVERIFY(swapClip(fx.p, fx.s(), a, false).ok);
+        QCOMPARE(clipById(fx.s(), a)->start, FrameTime(0));
+        QCOMPARE(clipById(fx.s(), b)->start, FrameTime(30));
+        QCOMPARE(fx.v1().transitions[0].clipA, a);
+        // A gap between two stays between them.
+        const Id d = fx.put(V1, 120, 20), e = fx.put(V1, 150, 10);
+        QVERIFY(swapClip(fx.p, fx.s(), e, false).ok);
+        QCOMPARE(clipById(fx.s(), e)->start, FrameTime(120));
+        QCOMPARE(clipById(fx.s(), d)->start, FrameTime(140));
+        // Nothing beyond the ends.
+        QVERIFY(!swapClip(fx.p, fx.s(), a, false).ok);
+        QVERIFY(!swapClip(fx.p, fx.s(), d, true).ok);
+        // A locked track refuses.
+        fx.v1().locked = true;
+        QVERIFY(!swapClip(fx.p, fx.s(), c, true).ok);
+        fx.v1().locked = false;
+        // Linked sound that would land on another clip refuses, changing nothing.
+        Fixture f2;
+        QVERIFY(placeMedia(f2.p, f2.s(), f2.media, 0, 0, 30, V1, A1, false).ok);
+        const Id pa = f2.v1().clips[0].id;
+        const Id pb = f2.put(V1, 30, 50);
+        const Id x = f2.put(A1, 50, 30);
+        const Sequence before = f2.s();
+        QVERIFY(!swapClip(f2.p, f2.s(), pa, true).ok);
+        QCOMPARE(clipById(f2.s(), pb)->start, FrameTime(30));
+        QCOMPARE(clipById(f2.s(), x)->start, FrameTime(50));
+        QVERIFY(f2.s().videoTracks[0].clips == before.videoTracks[0].clips);
+    }
+
     void interchangeExports() {
         Fixture fx;
         Id a = fx.put(V1, 0, 60, 30);
