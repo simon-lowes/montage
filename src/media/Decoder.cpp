@@ -454,7 +454,66 @@ bool VideoDecoder::seek(double t) {
     return rc >= 0;
 }
 
-Frame16Ptr VideoDecoder::convert(const AVFrame* f, double pts, int w, int h, bool hq) {
+int fieldDominance(const AVFrame* f) {
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(58, 7, 100)
+    if (!(f->flags & AV_FRAME_FLAG_INTERLACED)) return 0;
+    return (f->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST) ? 1 : 2;
+#else
+    if (!f->interlaced_frame) return 0;
+    return f->top_field_first ? 1 : 2;
+#endif
+}
+
+namespace {
+
+template <typename T>
+bool deinterlacePlane(uint8_t* data, int linesize, int width, int height, bool keepTop, int threshold) {
+    bool changed = false;
+    for (int y = keepTop ? 1 : 0; y < height; y += 2) {
+        T* c = reinterpret_cast<T*>(data + size_t(y) * size_t(linesize));
+        const T* a = reinterpret_cast<const T*>(data + size_t(y > 0 ? y - 1 : y + 1) * size_t(linesize));
+        const T* b = reinterpret_cast<const T*>(data + size_t(y + 1 < height ? y + 1 : y - 1) * size_t(linesize));
+        for (int x = 0; x < width; ++x) {
+            const int lo = std::min<int>(a[x], b[x]) - threshold, hi = std::max<int>(a[x], b[x]) + threshold;
+            if (c[x] < lo || c[x] > hi) {
+                c[x] = T((int(a[x]) + int(b[x]) + 1) / 2);
+                changed = true;
+            }
+        }
+    }
+    return changed;
+}
+
+}  // namespace
+
+bool deinterlaceFrame(AVFrame* f) {
+    const int dominance = fieldDominance(f);
+    if (!dominance || f->height < 3) return false;
+    const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(AVPixelFormat(f->format));
+    if (!d || (d->flags & (AV_PIX_FMT_FLAG_HWACCEL | AV_PIX_FMT_FLAG_PAL | AV_PIX_FMT_FLAG_BITSTREAM | AV_PIX_FMT_FLAG_BE | AV_PIX_FMT_FLAG_RGB)) ||
+        d->comp[0].depth > 16 || av_frame_make_writable(f) < 0)
+        return false;
+    const bool wide = d->comp[0].depth > 8;
+    const int threshold = 8 << std::max(0, d->comp[0].depth - 8);
+    bool changed = false;
+    for (int p = 0; p < 4 && f->data[p]; ++p) {
+        const int bytes = av_image_get_linesize(AVPixelFormat(f->format), f->width, p);
+        if (bytes <= 0) continue;
+        const int rows = (p == 1 || p == 2) ? AV_CEIL_RSHIFT(f->height, d->log2_chroma_h) : f->height;
+        changed |= wide ? deinterlacePlane<uint16_t>(f->data[p], f->linesize[p], bytes / 2, rows, dominance == 1, threshold)
+                        : deinterlacePlane<uint8_t>(f->data[p], f->linesize[p], bytes, rows, dominance == 1, threshold);
+    }
+    return changed;
+}
+
+Frame16Ptr VideoDecoder::convert(const AVFrame* in, double pts, int w, int h, bool hq) {
+    // Interlaced pictures are deinterlaced on a copy first, in their own format.
+    std::unique_ptr<AVFrame, void (*)(AVFrame*)> deint(nullptr, [](AVFrame* fr) { av_frame_free(&fr); });
+    const AVFrame* f = in;
+    if (fieldDominance(in)) {
+        deint.reset(av_frame_clone(in));
+        if (deint && deinterlaceFrame(deint.get())) f = deint.get();
+    }
     if (w <= 0) w = dispW_;
     if (h <= 0) h = dispH_;
     int sw = (rotation_ % 180) ? h : w;

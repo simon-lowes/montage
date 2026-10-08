@@ -1802,6 +1802,138 @@ private slots:
         QVERIFY(std::fabs(vm.duration - 0.4) < 0.05);
     }
 
+    void interlacedFootage() {
+        // A combed picture: a smooth vertical gradient, with a bright box that moved between the fields
+        // (at x 10-20 in the top field's lines, x 34-44 in the bottom field's).
+        const int W = 64, H = 32;
+        auto combed = [&](AVFrame* f, bool interlaced, bool topFirst) {
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const bool box = (y % 2 == 0) ? (x >= 10 && x < 20) : (x >= 34 && x < 44);
+                    f->data[0][y * f->linesize[0] + x] = uint8_t(box && y >= 8 && y < 24 ? 235 : 40 + y * 4);
+                }
+            for (int p = 1; p < 3; ++p)
+                for (int y = 0; y < H / 2; ++y) std::fill_n(f->data[p] + y * f->linesize[p], W / 2, uint8_t(128));
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(58, 7, 100)
+            f->flags &= ~(AV_FRAME_FLAG_INTERLACED | AV_FRAME_FLAG_TOP_FIELD_FIRST);
+            if (interlaced) f->flags |= AV_FRAME_FLAG_INTERLACED | (topFirst ? AV_FRAME_FLAG_TOP_FIELD_FIRST : 0);
+#else
+            f->interlaced_frame = interlaced, f->top_field_first = topFirst;
+#endif
+        };
+        auto frame = [&] {
+            AVFrame* f = av_frame_alloc();
+            f->format = AV_PIX_FMT_YUV420P, f->width = W, f->height = H;
+            av_frame_get_buffer(f, 0);
+            return f;
+        };
+        // How much the box area's lines zig-zag against their neighbours.
+        auto zigzag = [&](const uint8_t* y0, int stride) {
+            double sum = 0;
+            for (int y = 9; y < 23; ++y)
+                for (int x = 8; x < 46; ++x)
+                    sum += std::abs(int(y0[y * stride + x]) - (int(y0[(y - 1) * stride + x]) + int(y0[(y + 1) * stride + x])) / 2);
+            return sum / (14 * 38);
+        };
+        AVFrame* f = frame();
+        combed(f, true, true);
+        const double before = zigzag(f->data[0], f->linesize[0]);
+        QCOMPARE(fieldDominance(f), 1);
+        QVERIFY(deinterlaceFrame(f));
+        const double after = zigzag(f->data[0], f->linesize[0]);
+        QVERIFY2(after < before * 0.05, qPrintable(QString("%1 -> %2").arg(before).arg(after)));
+        // The top field is kept: the box stands where its lines showed it; the gradient is untouched.
+        QCOMPARE(int(f->data[0][15 * f->linesize[0] + 15]), 235);
+        QVERIFY(f->data[0][15 * f->linesize[0] + 38] < 120);
+        QCOMPARE(int(f->data[0][3 * f->linesize[0] + 50]), 40 + 3 * 4);
+        // Bottom field first keeps the other field; a progressive frame is left alone.
+        combed(f, true, false);
+        QCOMPARE(fieldDominance(f), 2);
+        QVERIFY(deinterlaceFrame(f));
+        QCOMPARE(int(f->data[0][15 * f->linesize[0] + 38]), 235);
+        QVERIFY(f->data[0][16 * f->linesize[0] + 15] < 120);
+        combed(f, false, false);
+        QVERIFY(!deinterlaceFrame(f));
+        av_frame_free(&f);
+
+        // End to end: an interlaced MPEG-2 file of that picture decodes without the combing.
+        const std::string file = path("interlaced.mpg");
+        {
+            AVFormatContext* oc = nullptr;
+            QVERIFY(avformat_alloc_output_context2(&oc, nullptr, "mpeg", file.c_str()) >= 0);
+            const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_MPEG2VIDEO);
+            QVERIFY(codec);
+            AVStream* st = avformat_new_stream(oc, nullptr);
+            AVCodecContext* c = avcodec_alloc_context3(codec);
+            c->width = W * 4, c->height = H * 4;  // larger, so the encoder keeps the detail
+            c->time_base = {1, 25}, c->framerate = {25, 1};
+            c->pix_fmt = AV_PIX_FMT_YUV420P;
+            c->gop_size = 1, c->bit_rate = 8000000;
+            c->flags |= AV_CODEC_FLAG_INTERLACED_DCT | AV_CODEC_FLAG_INTERLACED_ME;
+            c->field_order = AV_FIELD_TT;
+            if (oc->oformat->flags & AVFMT_GLOBALHEADER) c->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+            QVERIFY(avcodec_open2(c, codec, nullptr) >= 0);
+            avcodec_parameters_from_context(st->codecpar, c);
+            st->time_base = c->time_base;
+            QVERIFY(avio_open(&oc->pb, file.c_str(), AVIO_FLAG_WRITE) >= 0);
+            QVERIFY(avformat_write_header(oc, nullptr) >= 0);
+            AVFrame* big = av_frame_alloc();
+            big->format = c->pix_fmt, big->width = c->width, big->height = c->height;
+            av_frame_get_buffer(big, 0);
+            AVPacket* pkt = av_packet_alloc();
+            auto drain = [&] {
+                while (avcodec_receive_packet(c, pkt) >= 0) {
+                    av_packet_rescale_ts(pkt, c->time_base, st->time_base);
+                    pkt->stream_index = st->index;
+                    av_interleaved_write_frame(oc, pkt);
+                }
+            };
+            for (int i = 0; i < 8; ++i) {
+                av_frame_make_writable(big);
+                // The combed pattern drawn 4x wider and 4x taller, field lines kept one line apart.
+                for (int y = 0; y < big->height; ++y)
+                    for (int x = 0; x < big->width; ++x) {
+                        const int sy = (y / 8) * 2 + (y % 2);  // pairs of field lines
+                        const bool box = (y % 2 == 0) ? (x / 4 >= 10 && x / 4 < 20) : (x / 4 >= 34 && x / 4 < 44);
+                        big->data[0][y * big->linesize[0] + x] = uint8_t(box && sy >= 8 && sy < 24 ? 235 : 40 + y);
+                    }
+                for (int p = 1; p < 3; ++p)
+                    for (int y = 0; y < big->height / 2; ++y) std::fill_n(big->data[p] + y * big->linesize[p], big->width / 2, uint8_t(128));
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(58, 7, 100)
+                big->flags |= AV_FRAME_FLAG_INTERLACED | AV_FRAME_FLAG_TOP_FIELD_FIRST;
+#else
+                big->interlaced_frame = 1, big->top_field_first = 1;
+#endif
+                big->pts = i;
+                QVERIFY(avcodec_send_frame(c, big) >= 0);
+                drain();
+            }
+            avcodec_send_frame(c, nullptr);
+            drain();
+            av_write_trailer(oc);
+            avio_closep(&oc->pb);
+            av_packet_free(&pkt);
+            av_frame_free(&big);
+            avcodec_free_context(&c);
+            avformat_free_context(oc);
+        }
+        VideoDecoder dec;
+        std::string err;
+        QVERIFY2(dec.open(file, &err), err.c_str());
+        const Frame16Ptr out = dec.frameAt(0.1);
+        QVERIFY(out && out->width == W * 4 && out->height == H * 4);
+        // Luma of the decoded picture (the green channel is close enough on grey and white).
+        double zz = 0;
+        int n = 0;
+        for (int y = 40; y < 90; ++y)
+            for (int x = 40; x < 176; ++x) {
+                auto g = [&](int yy) { return double(out->px[(size_t(yy) * size_t(out->width) + size_t(x)) * 4 + 1]) / 65535.0; };
+                zz += std::abs(g(y) - (g(y - 1) + g(y + 1)) / 2), ++n;
+            }
+        zz /= n;
+        QVERIFY2(zz < 0.02, qPrintable(QString("zig-zag left %1").arg(zz)));
+    }
+
     void cameraRawStills() {
         QVERIFY(isRawPath("/a/IMG_0001.CR3") && isRawPath("b.nef") && isRawPath("c.dng") && !isRawPath("d.jpg") && !isRawPath("raw"));
         if (!rawAvailable()) QSKIP("Built without LibRaw");

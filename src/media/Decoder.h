@@ -115,4 +115,13 @@ PeaksPtr computePeaks(const AudioBuffer& buf, int samplesPerBucket = 256);
 // Rotates an RGBA16 frame clockwise by 90/180/270 degrees.
 Frame16 rotateFrame(const Frame16& f, int degrees);
 
+// Deinterlacing (as Premiere and Resolve do automatically): a frame flagged as
+// interlaced keeps its first field, and each line of the other field is
+// rebuilt from the lines either side only where it combs (lies outside them),
+// so still detail stays sharp and motion loses its teeth. Works on planar and
+// semi-planar YUV (8 to 16 bits) in place; returns whether it changed anything.
+bool deinterlaceFrame(AVFrame* f);
+// 0 progressive, 1 top field first, 2 bottom field first.
+int fieldDominance(const AVFrame* f);
+
 }  // namespace montage
