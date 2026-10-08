@@ -204,6 +204,93 @@ void lensDistortion(const Effect& e, FrameTime t, Image& img) {
     });
 }
 
+void magnify(const Effect& e, FrameTime t, Image& img, double pixelScale) {
+    const bool square = e.p("shape", t, 0) >= 0.5;
+    const double cx = e.p("center_x", t, 0.5) * img.width, cy = e.p("center_y", t, 0.5) * img.height;
+    const double radius = std::max(1.0, e.p("size", t, 40) / 100.0 * img.height * 0.5);
+    const double mag = std::max(1.0, e.p("magnification", t, 200) / 100.0);
+    const double feather = std::max(0.0, e.p("feather", t, 0) * pixelScale), border = std::max(0.0, e.p("border", t, 2) * pixelScale);
+    const float bc[3] = {float(e.p("border_color.r", t, 1)), float(e.p("border_color.g", t, 1)), float(e.p("border_color.b", t, 1))};
+    const float opacity = float(std::clamp(e.p("opacity", t, 100) / 100.0, 0.0, 1.0));
+    if (opacity <= 0) return;
+    const Image src = img;
+    const double reach = radius + border + 1;
+    const int y0 = std::max(0, int(cy - reach)), y1 = std::min(img.height, int(cy + reach) + 1);
+    const int x0 = std::max(0, int(cx - reach)), x1 = std::min(img.width, int(cx + reach) + 1);
+    parallelRows(y1 - y0, [&](int r0, int r1) {
+        for (int y = y0 + r0; y < y0 + r1; ++y) {
+            float* p = img.row(y) + size_t(x0) * 4;
+            for (int x = x0; x < x1; ++x, p += 4) {
+                const double dx = x + 0.5 - cx, dy = y + 0.5 - cy;
+                const double d = square ? std::max(std::fabs(dx), std::fabs(dy)) : std::hypot(dx, dy);
+                // The lens: everything seen from the centre, `mag` times larger; a soft (or anti-aliased) edge.
+                const double cover = feather > 0 ? std::clamp((radius - d) / feather, 0.0, 1.0) : std::clamp(radius - d + 0.5, 0.0, 1.0);
+                if (cover > 0) {
+                    float m[4];
+                    sample(src, cx + dx / mag, cy + dy / mag, m);
+                    const float a = float(cover) * opacity;
+                    for (int k = 0; k < 4; ++k) p[k] += (m[k] - p[k]) * a;
+                }
+                if (border > 0) {
+                    const double ring = std::clamp(std::min(d - radius + 0.5, radius + border - d + 0.5), 0.0, 1.0);
+                    if (ring > 0) {
+                        const float a = float(ring) * opacity;
+                        for (int k = 0; k < 3; ++k) p[k] += (bc[k] - p[k]) * a;
+                        p[3] += (1.0f - p[3]) * a;
+                    }
+                }
+            }
+        }
+    });
+}
+
+void channelBlur(const Effect& e, FrameTime t, Image& img, double pixelScale) {
+    const char* names[4] = {"red", "green", "blue", "alpha"};
+    const int dims = int(std::lround(e.p("dimensions", t, 0)));  // both, horizontal, vertical
+    for (int c = 0; c < 4; ++c) {
+        const double r = std::max(0.0, e.p(names[c], t, 0)) * pixelScale;
+        if (r < 0.05) continue;
+        Image blurred = img;
+        gaussianBlur(blurred, r, dims != 2, dims != 1);
+        for (size_t i = size_t(c); i < img.px.size(); i += 4) img.px[i] = blurred.px[i];
+    }
+}
+
+namespace {
+// A well-mixed 32-bit hash of a pixel, frame and channel (for noise that is the same each time a frame is drawn).
+inline uint32_t mix(uint32_t x, uint32_t y, uint32_t t, uint32_t c) {
+    uint32_t h = x * 0x8da6b343u ^ y * 0xd8163841u ^ t * 0xcb1ab31fu ^ c * 0x165667b1u;
+    h ^= h >> 16;
+    h *= 0x7feb352du;
+    h ^= h >> 15;
+    h *= 0x846ca68bu;
+    h ^= h >> 16;
+    return h;
+}
+}  // namespace
+
+void noise(const Effect& e, FrameTime t, Image& img) {
+    const float amount = float(std::clamp(e.p("amount", t, 20) / 100.0, 0.0, 1.0));
+    if (amount <= 0) return;
+    const bool colour = e.p("color", t, 1) >= 0.5, clip = e.p("clip", t, 1) >= 0.5;
+    const uint32_t frame = uint32_t(t);
+    parallelRows(img.height, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y) {
+            float* p = img.row(y);
+            for (int x = 0; x < img.width; ++x, p += 4) {
+                const float a = p[3];
+                if (a <= 0) continue;
+                for (int c = 0; c < 3; ++c) {
+                    const float n = (float(mix(uint32_t(x), uint32_t(y), frame, colour ? uint32_t(c) : 0u)) / 4294967296.0f - 0.5f) * amount;
+                    float v = p[c] / a + n;  // on straight values
+                    if (clip) v = std::clamp(v, 0.0f, 1.0f);
+                    p[c] = v * a;
+                }
+            }
+        }
+    });
+}
+
 bool squareToQuad(const double q[4][2], double h[9]) {
     // Heckbert's closed form for the unit square to a quadrilateral.
     const double x0 = q[0][0], y0 = q[0][1], x1 = q[1][0], y1 = q[1][1], x2 = q[2][0], y2 = q[2][1], x3 = q[3][0], y3 = q[3][1];

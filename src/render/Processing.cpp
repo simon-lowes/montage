@@ -1070,6 +1070,9 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
     else if (ty == "directional_blur") vfx::directionalBlur(e, t, img, pixelScale);
     else if (ty == "chromatic_aberration") vfx::chromaticAberration(e, t, img, pixelScale);
     else if (ty == "lens_distortion") vfx::lensDistortion(e, t, img);
+    else if (ty == "magnify") vfx::magnify(e, t, img, pixelScale);
+    else if (ty == "channel_blur") vfx::channelBlur(e, t, img, pixelScale);
+    else if (ty == "noise") vfx::noise(e, t, img);
     else if (ty == "corner_pin") vfx::cornerPin(e, t, img);
     else if (ty == "letterbox") vfx::letterbox(e, t, img);
     else if (ty == "posterize") vfx::posterize(e, t, img);

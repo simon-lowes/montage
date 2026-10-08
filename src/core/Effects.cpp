@@ -238,6 +238,14 @@ std::vector<EffectInfo> buildCatalog() {
                  {num("amount", "Amount", 0, 5, 1), num("radius", "Radius (px)", 0.5, 20, 1.5, 0.1)},
                  {}});
     // Undoes a slight focus miss or lens softness by deconvolution (render/Deconvolve).
+    c.push_back({"channel_blur", "Channel Blur", EffectCategory::VideoFilter, "Blur & Sharpen",
+                 {num("red", "Red Blurriness", 0, 200, 0, 0.5), num("green", "Green Blurriness", 0, 200, 0, 0.5),
+                  num("blue", "Blue Blurriness", 0, 200, 0, 0.5), num("alpha", "Alpha Blurriness", 0, 200, 0, 0.5),
+                  choice("dimensions", "Blur Dimensions", {"Horizontal and Vertical", "Horizontal", "Vertical"}, 0)},
+                 {}});
+    c.push_back({"noise", "Noise", EffectCategory::VideoFilter, "Stylize",
+                 {pct("amount", "Amount of Noise", 0, 100, 20), boolean("color", "Color Noise", true), boolean("clip", "Clip Result Values", true)},
+                 {}});
     c.push_back({"focus_repair", "Focus Repair", EffectCategory::VideoFilter, "Blur & Sharpen",
                  {num("blur", "Blur to Undo (px)", 0.3, 8, 1.5, 0.1), num("iterations", "Iterations", 1, 100, 20, 1),
                   pct("strength", "Strength", 0, 100, 100), num("noise", "Noise Threshold (%)", 0, 10, 1, 0.1)},
@@ -304,6 +312,13 @@ std::vector<EffectInfo> buildCatalog() {
                  {}});
     c.push_back({"chromatic_aberration", "Chromatic Aberration", EffectCategory::VideoFilter, "Stylize",
                  {num("amount", "Amount (px)", -30, 30, 3, 0.1)},
+                 {}});
+    // Premiere 26.3's magnifying lens: render/VideoFx.h magnify.
+    c.push_back({"magnify", "Magnify", EffectCategory::VideoFilter, "Distort",
+                 {choice("shape", "Shape", {"Circle", "Square"}, 0), num("center_x", "Center X", -0.5, 1.5, 0.5, 0.001),
+                  num("center_y", "Center Y", -0.5, 1.5, 0.5, 0.001), pct("size", "Size (% of height)", 1, 200, 40),
+                  pct("magnification", "Magnification", 100, 1000, 200), num("feather", "Feather (px)", 0, 200, 0, 0.5),
+                  num("border", "Border (px)", 0, 50, 2, 0.5), color("border_color", "Border Color", 1, 1, 1), pct("opacity", "Opacity", 0, 100, 100)},
                  {}});
     c.push_back({"lens_distortion", "Lens Distortion", EffectCategory::VideoFilter, "Distort",
                  {num("amount", "Barrel / Pincushion", -100, 100, 0, 0.5)},

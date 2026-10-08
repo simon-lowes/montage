@@ -2591,6 +2591,76 @@ colorspaces:
         QVERIFY(!writeCubeLut(Lut3D{}, path));
     }
 
+    void magnifyChannelBlurNoise() {
+        Project p = makeDefaultProject();
+        // A horizontal ramp on a 200 x 100 frame.
+        Image ramp(200, 100);
+        for (int y = 0; y < 100; ++y)
+            for (int x = 0; x < 200; ++x) {
+                float* px = ramp.at(x, y);
+                px[0] = px[1] = px[2] = (x + 0.5f) / 200.0f, px[3] = 1;
+            }
+        // Magnify 2x in a circle 40 % of the height across at the middle, with a 2 px white border.
+        Effect mag = makeEffect(p, "magnify");
+        Image m = ramp;
+        applyVideoEffect(mag, 0, m, 1);
+        auto at = [](const Image& im, int x, int y) { return im.at(x, y)[0]; };
+        QVERIFY(std::fabs(at(m, 100, 50) - at(ramp, 100, 50)) < 0.01f);               // the centre stays
+        QVERIFY(std::fabs(at(m, 112, 50) - (100 + 12.5f / 2) / 200.0f) < 0.01f);       // 12 px out shows 6 px out
+        QCOMPARE(at(m, 150, 50), at(ramp, 150, 50));                                  // outside the lens: untouched
+        QVERIFY(at(m, 121, 50) > 0.95f && m.at(121, 50)[2] > 0.95f);                   // the border ring at the radius (20 px)
+        // A square lens, no border, half opacity.
+        mag.params["shape"] = 1.0;
+        mag.params["border"] = 0.0;
+        mag.params["opacity"] = 50.0;
+        m = ramp;
+        applyVideoEffect(mag, 0, m, 1);
+        const float expect = 0.5f * at(ramp, 118, 32) + 0.5f * (100 + 18.5f / 2) / 200.0f;
+        QVERIFY2(std::fabs(at(m, 118, 32) - expect) < 0.01f, qPrintable(QString("%1 %2").arg(at(m, 118, 32)).arg(expect)));  // a square's corner
+        // Channel Blur: a vertical stripe; red blurred only across it, green untouched, blue only up and down (no change).
+        Image stripe(64, 32);
+        for (int y = 0; y < 32; ++y)
+            for (int x = 0; x < 64; ++x) {
+                float* px = stripe.at(x, y);
+                const float v = x >= 28 && x < 36 ? 1.0f : 0.0f;
+                px[0] = px[1] = px[2] = v, px[3] = 1;
+            }
+        Effect cb = makeEffect(p, "channel_blur");
+        cb.params["red"] = 4.0;
+        cb.params["blue"] = 4.0;
+        Image blurred = stripe;
+        applyVideoEffect(cb, 0, blurred, 1);
+        QVERIFY(blurred.at(26, 16)[0] > 0.1f && blurred.at(31, 16)[0] < 0.99f);  // red spread across the edge
+        QCOMPARE(blurred.at(26, 16)[1], 0.0f);                                   // green untouched
+        cb.params["dimensions"] = 2.0;  // vertical only: a vertical stripe does not change
+        Image vertical = stripe;
+        applyVideoEffect(cb, 0, vertical, 1);
+        QVERIFY(std::fabs(vertical.at(26, 16)[0]) < 1e-4f && std::fabs(vertical.at(30, 16)[2] - 1) < 1e-4f);
+        // Noise: none at 0; at 40 % the mean holds and the spread is as uniform noise gives; the same frame twice
+        // is the same, the next frame differs; monochrome noise moves all three channels together.
+        Image grey(64, 64);
+        for (size_t i = 0; i < grey.px.size(); i += 4) grey.px[i] = grey.px[i + 1] = grey.px[i + 2] = 0.5f, grey.px[i + 3] = 1;
+        Effect nz = makeEffect(p, "noise");
+        nz.params["amount"] = 0.0;
+        Image same = grey;
+        applyVideoEffect(nz, 0, same, 1);
+        QVERIFY(same.px == grey.px);
+        nz.params["amount"] = 40.0;
+        Image a = grey, b = grey, c = grey;
+        applyVideoEffect(nz, 3, a, 1);
+        applyVideoEffect(nz, 3, b, 1);
+        applyVideoEffect(nz, 4, c, 1);
+        QVERIFY(a.px == b.px && a.px != c.px);
+        double sum = 0, sq = 0;
+        for (size_t i = 0; i < a.px.size(); i += 4) sum += a.px[i] - 0.5, sq += (a.px[i] - 0.5) * (a.px[i] - 0.5);
+        const double n = double(a.px.size() / 4), mean = sum / n, sd = std::sqrt(sq / n - mean * mean);
+        QVERIFY2(std::fabs(mean) < 0.01 && std::fabs(sd - 0.4 / std::sqrt(12.0)) < 0.01, qPrintable(QString("%1 %2").arg(mean).arg(sd)));
+        QVERIFY(std::fabs(a.px[0] - a.px[1]) > 1e-4f || std::fabs(a.px[4] - a.px[5]) > 1e-4f);  // colour noise
+        nz.params["color"] = 0.0;
+        applyVideoEffect(nz, 3, same, 1);
+        for (size_t i = 0; i < 400; i += 4) QVERIFY(same.px[i] == same.px[i + 1] && same.px[i + 1] == same.px[i + 2]);
+    }
+
     void titlesRender() {
         Project p;
         Effect t = makeEffect(p, "title");
