@@ -1503,6 +1503,66 @@ inline void sample(const Image& img, float x, float y, float out[4]) {
 
 }  // namespace
 
+namespace {
+
+// Distance to the centre in units of the shape's size (1 on its edge), for Shape Wipe.
+float shapeDistance(int shape, float qx, float qy) {
+    const float ax = std::fabs(qx), ay = std::fabs(qy), r = std::hypot(qx, qy);
+    switch (shape) {
+        case 1: return ax + ay;                                           // diamond
+        case 2: return std::max(ax, ay);                                  // square
+        case 3: {                                                         // five-pointed star
+            const float t = std::atan2(-qy, qx) - float(M_PI) / 2;
+            return r / (0.62f + 0.38f * std::cos(5 * t));
+        }
+        case 4: {  // heart: a polar heart, its notch at the top and point at the bottom
+            const float t = std::atan2(-qy + 0.35f * r, qx), s = std::sin(t), c = std::cos(t);
+            const float rho = (2 - 2 * s + s * std::sqrt(std::fabs(c)) / (s + 1.4f)) / 2.4f;
+            return r / std::max(0.05f, rho);
+        }
+        case 5: return std::min(std::max(ax / 0.35f, ay), std::max(ax, ay / 0.35f));  // cross
+        default: return r;                                                             // circle
+    }
+}
+
+// A unit square, turned in 3D and seen in perspective, as the inverse of its projection:
+// screen (x, y) to texture (u, v). `corners` are TL, TR, BR, BL in 3D (camera at z = -f).
+struct Face {
+    double inv[9];
+    bool facing = false;
+};
+Face projectFace(const double corners[4][3], double f, int w, int h) {
+    Face face;
+    double quad[4][2];
+    for (int i = 0; i < 4; ++i) {
+        const double k = f / (f + corners[i][2]);
+        quad[i][0] = w / 2.0 + corners[i][0] * k;
+        quad[i][1] = h / 2.0 + corners[i][1] * k;
+    }
+    // Facing the camera when the projected corners go round clockwise (as the picture's do).
+    double area = 0;
+    for (int i = 0; i < 4; ++i) area += quad[i][0] * quad[(i + 1) % 4][1] - quad[(i + 1) % 4][0] * quad[i][1];
+    face.facing = area > 1e-6;
+    double hm[9];
+    if (!face.facing || !vfx::squareToQuad(quad, hm)) {
+        face.facing = false;
+        return face;
+    }
+    const double a = hm[0], b = hm[1], c = hm[2], d = hm[3], e = hm[4], g = hm[5], p = hm[6], q = hm[7], r = hm[8];
+    const double det = a * (e * r - g * q) - b * (d * r - g * p) + c * (d * q - e * p);
+    if (std::fabs(det) < 1e-12) {
+        face.facing = false;
+        return face;
+    }
+    const double k = 1 / det;
+    const double inv[9] = {(e * r - g * q) * k, (c * q - b * r) * k, (b * g - c * e) * k, (g * p - d * r) * k, (a * r - c * p) * k,
+                           (c * d - a * g) * k, (d * q - e * p) * k, (b * p - a * q) * k, (a * e - b * d) * k};
+    std::copy(inv, inv + 9, face.inv);
+    return face;
+}
+
+}  // namespace
+
 Image transitionMix(const std::string& type, const Effect& params, const Image& aIn, const Image& bIn, double u, int w,
                     int h) {
     Image out(w, h);
@@ -1538,6 +1598,73 @@ Image transitionMix(const std::string& type, const Effect& params, const Image& 
     const float leak[3] = {float(params.p("color.r", 0, 1.0)), float(params.p("color.g", 0, 0.55)), float(params.p("color.b", 0, 0.2))};
     const bool brightsFirst = params.p("invert", 0) > 0.5;
     const uint32_t glitchSeed = uint32_t(uf * 40);  // the pattern jumps a few times through the transition
+    // Shape Wipe: square cells of the shape (one over the whole frame for a count of 1), and how far
+    // out the shape must grow to cover a cell's corners.
+    const int shape = int(std::lround(params.p("shape", 0, 0)));
+    const int count = std::clamp(int(std::lround(params.p("count", 0, 1))), 1, 64);
+    const float cell = count == 1 ? float(std::max(w, h)) : float(w) / count;
+    const float rot = float(params.p("angle", 0, 0)) * pi / 180, rc = std::cos(rot), rs = std::sin(rot);
+    float reach = 0;
+    if (type == "shape_wipe") {
+        const float hx = count == 1 ? w / (2 * cell) : 1.0f, hy = count == 1 ? h / (2 * cell) : 1.0f;
+        for (int i = 0; i <= 64; ++i)
+            for (int side = 0; side < 4; ++side) {
+                // The cell's edge, walked all round (a shape's farthest point need not be a corner).
+                const float t = float(i) / 64 * 2 - 1;
+                const float ex = side < 2 ? (side ? hx : -hx) : t * hx, ey = side < 2 ? t * hy : (side == 3 ? hy : -hy);
+                reach = std::max(reach, shapeDistance(shape, ex * rc + ey * rs, -ex * rs + ey * rc));
+            }
+    }
+    // 3D Cube and Flip: the faces' projections for this moment.
+    Face faces[2];
+    const Image* faceImg[2] = {&a, &b};
+    const bool threeD = type == "cube" || type == "flip";
+    if (threeD && uf > 0 && uf < 1) {
+        const double f = 2.0 * std::max(w, h), W2 = w / 2.0, H2 = h / 2.0;
+        const bool vertical = type == "cube" ? dir >= 2 : dir == 1;
+        // Turn about the vertical axis (or the horizontal one), then push back a little mid-way.
+        auto place = [&](double pts[4][3], double angle, double centreZ) {
+            const double c = std::cos(angle), s = std::sin(angle);
+            for (int i = 0; i < 4; ++i) {
+                double& p = vertical ? pts[i][1] : pts[i][0];
+                const double z = pts[i][2];
+                const double np = p * c + z * s, nz = -p * s + z * c;
+                p = np;
+                pts[i][2] = nz + centreZ;
+            }
+        };
+        if (type == "cube") {
+            const double D2 = vertical ? H2 : W2;  // half the cube's depth
+            const double sign = dir == 1 || dir == 3 ? -1 : 1;
+            const double angle = sign * uf * pi / 2, back = D2 + 0.6 * D2 * bell;
+            double front[4][3] = {{-W2, -H2, -D2}, {W2, -H2, -D2}, {W2, H2, -D2}, {-W2, H2, -D2}};
+            double side[4][3];
+            if (!vertical && sign > 0) {  // B on the right face
+                const double s[4][3] = {{W2, -H2, -D2}, {W2, -H2, D2}, {W2, H2, D2}, {W2, H2, -D2}};
+                std::copy(&s[0][0], &s[0][0] + 12, &side[0][0]);
+            } else if (!vertical) {  // on the left
+                const double s[4][3] = {{-W2, -H2, D2}, {-W2, -H2, -D2}, {-W2, H2, -D2}, {-W2, H2, D2}};
+                std::copy(&s[0][0], &s[0][0] + 12, &side[0][0]);
+            } else if (sign > 0) {  // below
+                const double s[4][3] = {{-W2, H2, -D2}, {W2, H2, -D2}, {W2, H2, D2}, {-W2, H2, D2}};
+                std::copy(&s[0][0], &s[0][0] + 12, &side[0][0]);
+            } else {  // above
+                const double s[4][3] = {{-W2, -H2, D2}, {W2, -H2, D2}, {W2, -H2, -D2}, {-W2, -H2, -D2}};
+                std::copy(&s[0][0], &s[0][0] + 12, &side[0][0]);
+            }
+            place(front, angle, back);
+            place(side, angle, back);
+            faces[0] = projectFace(front, f, w, h);
+            faces[1] = projectFace(side, f, w, h);
+        } else {
+            // A card: A on its front for the first half, B on its back for the second.
+            const bool second = uf >= 0.5f;
+            const double angle = second ? (uf - 1) * pi : uf * pi, back = 0.5 * std::max(W2, H2) * bell;
+            double card[4][3] = {{-W2, -H2, 0}, {W2, -H2, 0}, {W2, H2, 0}, {-W2, H2, 0}};
+            place(card, angle, back);
+            faces[second ? 1 : 0] = projectFace(card, f, w, h);
+        }
+    }
     parallelRows(h, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y) {
             for (int x = 0; x < w; ++x) {
@@ -1691,6 +1818,37 @@ Image transitionMix(const std::string& type, const Effect& params, const Image& 
                     const float s = std::max(1e-3f, soft), tt = uf * (1 + 2 * s) - s;
                     const float mb = 1 - smoothstep(tt, tt + s, la);
                     for (int c = 0; c < 4; ++c) o[c] = pa[c] * (1 - mb) + pb[c] * mb;
+                } else if (type == "shape_wipe") {
+                    // B inside the shapes, which grow from nothing until they meet over all of A.
+                    float qx, qy;
+                    if (count == 1) {
+                        qx = (x + 0.5f - w * 0.5f) / cell, qy = (y + 0.5f - h * 0.5f) / cell;
+                    } else {
+                        const float cx = (std::floor((x + 0.5f) / cell) + 0.5f) * cell, cy = (std::floor((y + 0.5f) / cell) + 0.5f) * cell;
+                        qx = (x + 0.5f - cx) / (cell / 2), qy = (y + 0.5f - cy) / (cell / 2);
+                    }
+                    const float d = shapeDistance(shape, qx * rc + qy * rs, -qx * rs + qy * rc);
+                    const float s = std::max(1e-3f, soft) * reach, tt = uf * (reach + s);
+                    const float mb = 1 - smoothstep(tt - s, tt, d);
+                    px(a, x, y, pa);
+                    px(b, x, y, pb);
+                    for (int c = 0; c < 4; ++c) o[c] = pa[c] * (1 - mb) + pb[c] * mb;
+                } else if (threeD) {
+                    if (uf <= 0 || uf >= 1) {
+                        px(uf <= 0 ? a : b, x, y, o);
+                        continue;
+                    }
+                    zero(o);
+                    for (int k = 0; k < 2; ++k) {
+                        const Face& fc = faces[k];
+                        if (!fc.facing || faceImg[k]->empty()) continue;
+                        const double sx = x + 0.5, sy = y + 0.5;
+                        const double tw = fc.inv[6] * sx + fc.inv[7] * sy + fc.inv[8];
+                        const double tu = (fc.inv[0] * sx + fc.inv[1] * sy + fc.inv[2]) / tw, tv = (fc.inv[3] * sx + fc.inv[4] * sy + fc.inv[5]) / tw;
+                        if (tu < 0 || tu > 1 || tv < 0 || tv > 1) continue;
+                        sampleOr(*faceImg[k], float(tu * faceImg[k]->width), float(tv * faceImg[k]->height), o);
+                        break;  // the faces of a cube that face the camera never overlap
+                    }
                 } else if (type == "clock_wipe") {
                     // A hand sweeping round from twelve o'clock.
                     const float dx = x + 0.5f - w * 0.5f, dy = y + 0.5f - h * 0.5f;

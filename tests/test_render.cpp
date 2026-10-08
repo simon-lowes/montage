@@ -76,7 +76,7 @@ private slots:
             return d;
         };
         Project p;
-        for (const char* type : {"whip_pan", "zoom_blur", "spin", "glitch", "light_leak", "luma_wipe", "clock_wipe"}) {
+        for (const char* type : {"whip_pan", "zoom_blur", "spin", "glitch", "light_leak", "luma_wipe", "clock_wipe", "shape_wipe", "cube", "flip"}) {
             const EffectInfo* info = findEffectInfo(type);
             QVERIFY2(info && info->category == EffectCategory::VideoTransition, type);
             const Effect e = makeEffect(p, type);
@@ -130,6 +130,40 @@ private slots:
             for (size_t i = 0; i < m.px.size(); i += 4)
                 for (int c = 0; c < 3; ++c) added[c] += m.px[i + c] - d.px[i + c];
             QVERIFY(added[0] > 0 && added[0] > added[2] * 2);
+        }
+        // Shape Wipe: a circle of B growing from the middle; a diamond reaches along the axes first; a grid of them.
+        {
+            Effect e = makeEffect(p, "shape_wipe");
+            Image m = transitionMix("shape_wipe", e, A, B, 0.5, W, H);
+            QVERIFY(redness(m.at(80, 60)) < -0.5f && redness(m.at(1, 1)) > 0.5f);
+            e.params["shape"] = Param(1.0);
+            m = transitionMix("shape_wipe", e, A, B, 0.28, W, H);
+            QVERIFY2(redness(m.at(110, 60)) < -0.5f && redness(m.at(101, 81)) > 0.1f,
+                     qPrintable(QString("%1 %2").arg(redness(m.at(110, 60))).arg(redness(m.at(101, 81)))));
+            e.params["shape"] = Param(0.0);
+            e.params["count"] = Param(4.0);
+            m = transitionMix("shape_wipe", e, A, B, 0.5, W, H);
+            for (int cx : {20, 60, 100, 140}) QVERIFY(redness(m.at(cx, 20)) < -0.5f && redness(m.at(cx + 19, 39)) > 0.5f);
+        }
+        // 3D Cube: halfway the cube's edge is in the middle, A turning away on the left and B coming in on the right,
+        // pushed back so the corners are empty.
+        {
+            Effect e = makeEffect(p, "cube");
+            const Image m = transitionMix("cube", e, A, B, 0.5, W, H);
+            QVERIFY(redness(m.at(50, 60)) > 0.5f && redness(m.at(110, 60)) < -0.5f && m.at(1, 1)[3] < 0.01f);
+            e.params["direction"] = Param(1.0);  // the other way round
+            const Image r = transitionMix("cube", e, A, B, 0.5, W, H);
+            QVERIFY(redness(r.at(50, 60)) < -0.5f && redness(r.at(110, 60)) > 0.5f);
+            e.params["direction"] = Param(2.0);  // up: B from below
+            const Image up = transitionMix("cube", e, A, B, 0.5, W, H);
+            QVERIFY(redness(up.at(80, 35)) > 0.5f && redness(up.at(80, 85)) < -0.5f);
+        }
+        // 3D Flip: A on a narrowing card, then B on its back.
+        {
+            Effect e = makeEffect(p, "flip");
+            const Image first = transitionMix("flip", e, A, B, 0.25, W, H), second = transitionMix("flip", e, A, B, 0.75, W, H);
+            QVERIFY(redness(first.at(80, 60)) > 0.5f && first.at(2, 60)[3] < 0.01f);
+            QVERIFY(redness(second.at(80, 60)) < -0.5f && second.at(2, 60)[3] < 0.01f);
         }
         // Luma Wipe: B through A's dark half first; brights first reverses it.
         {

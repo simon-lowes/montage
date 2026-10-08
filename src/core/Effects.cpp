@@ -622,6 +622,16 @@ std::vector<EffectInfo> buildCatalog() {
     c.push_back({"luma_wipe", "Luma Wipe", EffectCategory::VideoTransition, "Wipe",
                  {num("softness", "Softness", 0, 1, 0.1), boolean("invert", "Brights First")}, {}});
     c.push_back({"clock_wipe", "Clock Wipe", EffectCategory::VideoTransition, "Wipe", {num("softness", "Softness", 0, 1, 0.03)}, {}});
+    // Premiere's Shape Dissolve: B grows inside shapes (one, or a grid of them) until it covers A.
+    c.push_back({"shape_wipe", "Shape Wipe", EffectCategory::VideoTransition, "Wipe",
+                 {choice("shape", "Shape", {"Circle", "Diamond", "Square", "Star", "Heart", "Cross"}, 0), num("count", "Shapes Across", 1, 20, 1, 1),
+                  angle("angle", "Rotation", 0), num("softness", "Softness", 0, 1, 0.05)},
+                 {}});
+    // In perspective: A and B on two faces of a turning cube, or the two sides of a card.
+    c.push_back({"cube", "3D Cube", EffectCategory::VideoTransition, "3D",
+                 {choice("direction", "Direction", {"Left", "Right", "Up", "Down"})}, {}});
+    c.push_back({"flip", "3D Flip", EffectCategory::VideoTransition, "3D",
+                 {choice("direction", "Direction", {"Horizontal", "Vertical"})}, {}});
     c.push_back({"crossfade", "Crossfade (Equal Power)", EffectCategory::AudioTransition, "Crossfade", {}, {}});
     c.push_back({"crossfade_linear", "Crossfade (Constant Gain)", EffectCategory::AudioTransition, "Crossfade", {}, {}});
 
