@@ -2738,6 +2738,57 @@ private slots:
         QCOMPARE(q.active()->audioTracks[0], s.audioTracks[0]);
     }
 
+    void renderClipVideoBakesEffects() {
+        // A two-second ramp in ProRes (128 x 72), shown in a larger sequence, inverted and at double speed.
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 128, gs.height = 72, gs.fps = Rational{25, 1};
+        Clip ramp = makeGeneratorClip(gen, "color", 50);
+        ramp.generator.params["color.r"].addKey(0, 0.1);
+        ramp.generator.params["color.r"].addKey(49, 0.9);
+        ramp.generator.params["color.b"] = 0.3;
+        edit::overwrite(gen, gs, {TrackKind::Video, 0}, ramp);
+        ExportSettings st;
+        st.videoCodec = "prores_ks";
+        st.audioCodec = "none";
+        st.path = path("rr-source.mov");
+        std::string err;
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 256, s.height = 144, s.fps = Rational{25, 1};
+        MediaItem m = probeOrFail(p, st.path);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Id id = s.videoTracks[0].clips[0].id;
+        QVERIFY(edit::setSpeed(p, s, id, 2.0, true).ok);
+        edit::clipById(s, id)->effects.push_back(makeEffect(p, "invert"));
+        RenderOptions ro;
+        const Image before = renderProgramFrame(p, s, 10, ro);
+        // Rendered at the media's size, with its transparency, then swapped in.
+        const std::string out = path("rr-video.mov");
+        QVERIFY2(renderClipVideo(p, s, id, out, &err), err.c_str());
+        Project probe;
+        const MediaItem rendered = probeOrFail(probe, out);
+        QCOMPARE(rendered.width, 128);
+        QCOMPARE(rendered.height, 72);
+        QVERIFY(std::fabs(rendered.duration - 1.0) < 0.05);  // 25 frames: the double-speed clip
+        MediaItem rm = probeOrFail(p, out);
+        p.media.push_back(rm);
+        QVERIFY(edit::replaceWithRender(s, id, rm.id).ok);
+        const Clip& c = *edit::clipById(s, id);
+        QVERIFY(c.effects.empty() && c.speed == 1.0 && !c.ramped());
+        const Image after = renderProgramFrame(p, s, 10, ro);
+        float worst = 0;
+        for (size_t i = 0; i < after.px.size(); ++i) worst = std::max(worst, std::fabs(after.px[i] - before.px[i]));
+        QVERIFY2(worst < 0.02f, qPrintable(QString::number(worst)));
+        // Restored as it was.
+        QVERIFY(edit::restoreUnrendered(s, id).ok);
+        QCOMPARE(edit::clipById(s, id)->speed, 2.0);
+        QCOMPARE(edit::clipById(s, id)->effects.size(), size_t(1));
+        QCOMPARE(edit::clipById(s, id)->mediaId, m.id);
+    }
+
     void renderClipAudioBakesEffects() {
         std::string wav = path("render-src.wav");
         writeWav(wav, 48000, 4.0, 0.5f, 0.5f);

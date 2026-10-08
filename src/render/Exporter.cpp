@@ -1190,6 +1190,41 @@ bool exportStems(const Project& p, const Sequence& seq, const ExportSettings& s,
     return true;
 }
 
+bool renderClipVideo(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error,
+                     const ExportProgress& progress, const std::atomic<bool>* cancel) {
+    const Clip* c = edit::clipById(seq, clip);
+    if (!c) {
+        if (error) *error = "No such clip";
+        return false;
+    }
+    // The clip alone, at its media's own size (a generator at the sequence's), its transform left live on the clip.
+    Sequence alone = seq;
+    const MediaItem* m = c->mediaId ? p.findMedia(c->mediaId) : nullptr;
+    if (m && m->width > 0 && m->height > 0) alone.width = m->width + (m->width & 1), alone.height = m->height + (m->height & 1);
+    alone.videoTracks.assign(1, Track{});
+    alone.videoTracks[0].kind = TrackKind::Video;
+    alone.audioTracks.clear();
+    alone.buses.clear();
+    alone.captionTracks.clear();
+    alone.markers.clear();
+    Clip copy = *c;
+    copy.start = 0;
+    copy.linkGroup = 0;
+    copy.blendMode = "normal";
+    copy.motion = makeEffect("transform", c->motion.id);
+    alone.videoTracks[0].clips.push_back(copy);
+    ExportSettings st;
+    st.path = path;
+    st.videoCodec = "prores_ks";
+    st.profile = "4444";  // with its transparency
+    st.alpha = true;
+    st.audioCodec = "none";
+    st.smartRender = false;
+    st.in = 0;
+    st.out = copy.duration;
+    return exportSequence(p, alone, st, progress, cancel, error);
+}
+
 bool renderClipAudio(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error,
                      const ExportProgress& progress, const std::atomic<bool>* cancel) {
     const Clip* c = edit::clipById(seq, clip);

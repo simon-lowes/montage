@@ -152,7 +152,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - **Stems** (Export › Stems, or `--stems tracks|buses`): beside the export, a 24-bit WAV of each audio track, or of each bus plus "Main" for the tracks going straight to the master. Each is its part of the mix exactly as it plays there, so together they add up to the mix.
 - Insert effects on audio tracks, buses (submixes) and the master, including plugins. Use a strip's FX button to edit them in the Inspector, route tracks to buses from the strip's output menu, and add buses with + Bus. Track effects keep running past the last clip, so reverb and echo tails ring out.
 - Plugin delay compensation: the latency plugins report is compensated on clips, tracks, buses and the master, so everything stays in sync with the picture and with other tracks, including straight after a seek.
-- Render and Replace bakes an audio clip's effects into a new audio file to save CPU, and Restore Unrendered brings the original back (both on the clip's right-click menu).
+- Render and Replace bakes a clip's effects into a new file to save CPU, and Restore Unrendered brings the original back (both on the clip's right-click menu). Audio clips become WAVs; video clips (and titles and mattes) become ProRes 4444 with their transparency at the media's own size, with speed changes and ramps baked in and the clip's transform left live, so heavy AI effects such as Object Removal, Super Scale or noise reduction play back freely.
 - **Global Mute** (Sequence menu, as in Premiere): silences playback and scrubbing without touching any clip, track or export; the meters keep moving.
 - Peak meters with hold and clip indicators
 - Effects:

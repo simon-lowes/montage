@@ -1412,6 +1412,8 @@ Result replaceWithRender(Sequence& s, Id clipId, Id media) {
     c->speed = 1;
     c->reverse = false;
     c->effects.clear();
+    c->timing.params.clear();  // a speed ramp is in the render too
+    c->generator = Effect{};      // a title or matte is now footage
     return {};
 }
 
@@ -1428,6 +1430,8 @@ Result restoreUnrendered(Sequence& s, Id clipId) {
     c->sourceIn = orig.reverse ? orig.sourceIn + (double(orig.duration) - double(c->duration) - trimmed) * orig.speed
                                : orig.sourceIn + trimmed * orig.speed;
     c->effects = orig.effects;
+    c->timing = orig.timing;
+    c->generator = orig.generator;
     c->unrendered.clear();
     return {};
 }

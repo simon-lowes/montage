@@ -1810,19 +1810,23 @@ bool TimelineWidget::renderAndReplace(Id clip, QString* error) {
     const Sequence* s = state_->sequence();
     const Clip* c = s ? edit::clipById(*s, clip) : nullptr;
     if (!c) return false;
+    const auto loc = edit::locate(*s, clip);
+    const bool video = loc && loc->track.kind == TrackKind::Video;
+    const QString kind = video ? tr("Rendered Video") : tr("Rendered Audio");
     // Next to the project when it has been saved, else in the app's data folder.
-    QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/Rendered Audio";
+    QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/" + kind;
     if (!state_->filePath().isEmpty()) {
         const QFileInfo fi(state_->filePath());
-        dir = fi.absolutePath() + "/" + fi.completeBaseName() + " Rendered Audio";
+        dir = fi.absolutePath() + "/" + fi.completeBaseName() + " " + kind;
     }
     QDir().mkpath(dir);
     const QString base = QString::fromStdString(c->name).replace(QRegularExpression(QStringLiteral("[^\\w\\- ]")), "_");
-    const QString path = QStringLiteral("%1/%2 %3.wav").arg(dir, base.isEmpty() ? tr("Clip") : base,
-                                                            QDateTime::currentDateTime().toString("yyyyMMdd-hhmmss-zzz"));
+    const QString path = QStringLiteral("%1/%2 %3.%4").arg(dir, base.isEmpty() ? tr("Clip") : base,
+                                                           QDateTime::currentDateTime().toString("yyyyMMdd-hhmmss-zzz"), video ? "mov" : "wav");
     QApplication::setOverrideCursor(Qt::WaitCursor);
     std::string err;
-    const bool ok = renderClipAudio(state_->project(), *s, clip, path.toStdString(), &err);
+    const bool ok = video ? renderClipVideo(state_->project(), *s, clip, path.toStdString(), &err)
+                          : renderClipAudio(state_->project(), *s, clip, path.toStdString(), &err);
     QApplication::restoreOverrideCursor();
     if (!ok) {
         if (error) *error = QString::fromStdString(err);
@@ -1830,7 +1834,7 @@ bool TimelineWidget::renderAndReplace(Id clip, QString* error) {
         return false;
     }
     QStringList errors;
-    const auto ids = state_->importFiles({path}, &errors, tr("Rendered Audio"));
+    const auto ids = state_->importFiles({path}, &errors, kind);
     if (ids.empty()) {
         if (error) *error = errors.join('\n');
         return false;
@@ -1890,11 +1894,11 @@ void TimelineWidget::contextMenuEvent(QContextMenuEvent* e) {
                     state_->apply(tr("Flatten Multicam"), [sel](Project& p, Sequence& s) { return edit::flattenMulticam(p, s, sel); });
                 })->setObjectName(QStringLiteral("flattenMulticam"));
             }
-        // Offline rendering of an audio clip's effects (CPU-heavy plugins).
-        if (h.track && h.track->kind == TrackKind::Audio)
+        // Offline rendering of a clip's effects (CPU-heavy plugins, AI effects) and speed changes.
+        if (h.track)
             if (const Clip* c = edit::clipById(*state_->sequence(), h.clip)) {
                 const Id id = h.clip;
-                if (!c->effects.empty()) {
+                if (!c->effects.empty() || (h.track->kind == TrackKind::Video && (c->speed != 1 || c->reverse || c->ramped()))) {
                     menu.addSeparator();
                     menu.addAction(tr("Render and Replace"), this, [this, id] { renderAndReplace(id); });
                 }

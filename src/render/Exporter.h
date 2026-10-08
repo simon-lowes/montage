@@ -104,6 +104,10 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
 
 // Renders an audio clip's sound with its effects (not its volume, pan or
 // fades) to a 24-bit WAV, from its first frame to its last.
+// Render and Replace for video: the clip alone through its effects (and speed), at its media's size, to ProRes 4444
+// with its transparency; its transform is not baked in.
+bool renderClipVideo(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error = nullptr,
+                     const ExportProgress& progress = {}, const std::atomic<bool>* cancel = nullptr);
 bool renderClipAudio(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error,
                      const ExportProgress& progress = {}, const std::atomic<bool>* cancel = nullptr);
 

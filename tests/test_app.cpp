@@ -1408,6 +1408,31 @@ private slots:
         state()->newProject();
     }
 
+    void renderAndReplaceVideo() {
+        loadDemo();
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        state()->edit("Effect", [red](Project& p, Sequence& s) {
+            edit::clipById(s, red)->effects.push_back(makeEffect(p, "invert"));
+            return true;
+        });
+        RenderOptions ro;
+        const Image before = renderProgramFrame(state()->project(), *state()->sequence(), 5, ro);
+        QString err;
+        QVERIFY2(timeline()->renderAndReplace(red, &err), qPrintable(err));
+        const Clip* c = edit::clipById(*state()->sequence(), red);
+        QVERIFY(c && !c->isGenerator() && c->effects.empty() && !c->unrendered.empty());
+        const MediaItem* m = state()->project().findMedia(c->mediaId);
+        QVERIFY(m && QString::fromStdString(m->path).endsWith(".mov") && m->bin == "Rendered Video");
+        const Image after = renderProgramFrame(state()->project(), *state()->sequence(), 5, ro);
+        float worst = 0;
+        for (size_t i = 0; i < after.px.size(); ++i) worst = std::max(worst, std::fabs(after.px[i] - before.px[i]));
+        QVERIFY2(worst < 0.02f, qPrintable(QString::number(worst)));
+        // Restore Unrendered brings back the matte and its effect.
+        state()->apply("Restore", [red](Project&, Sequence& s) { return edit::restoreUnrendered(s, red); });
+        c = edit::clipById(*state()->sequence(), red);
+        QVERIFY(c->isGenerator() && c->effects.size() == 1);
+    }
+
     void renderAndReplaceInTheTimeline() {
         state()->newProject();
         auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
