@@ -549,6 +549,50 @@ private slots:
         QCOMPARE(a1().volumeAuto.keys.size(), keys);
     }
 
+    void trackAutomationOnTheTimeline() {
+        loadDemo();
+        auto* toggle = win_->findChild<QAction*>("showTrackAutomation");
+        QVERIFY(toggle);
+        if (!toggle->isChecked()) toggle->trigger();
+        QVERIFY(timeline()->showTrackAutomation());
+        ppf_ = measurePpf();
+        auto a1 = [&]() -> const Track& { return state()->sequence()->audioTracks.at(0); };
+        auto lane = [&](FrameTime f) { return timeline()->trackLanePoint(0, f); };
+        QVERIFY(lane(30).x() > 0);
+        // Without points the line is the fader's level: dragging it moves the fader, as one undo step.
+        drag(lane(30), lane(30) + QPoint(0, 10));
+        const double lowered = a1().volumeDb;
+        QVERIFY2(lowered < -1, qPrintable(QString::number(lowered)));
+        QVERIFY(!a1().volumeAuto.animated());
+        state()->undo();
+        QCOMPARE(a1().volumeDb, 0.0);
+        // Ctrl/Cmd-click adds points at the line's level; a point drags in time and value.
+        QTest::mouseClick(viewport(), Qt::LeftButton, Qt::ControlModifier, lane(30));
+        QTest::mouseClick(viewport(), Qt::LeftButton, Qt::ControlModifier, lane(90));
+        QCOMPARE(a1().volumeAuto.keys.size(), size_t(2));
+        QVERIFY(std::abs(a1().volumeAuto.keys[0].t - 30) <= 1 && std::abs(a1().volumeAuto.keys[1].t - 90) <= 1);
+        QCOMPARE(a1().volumeAuto.keys[1].v, 0.0);
+        const FrameTime k1 = a1().volumeAuto.keys[1].t;
+        drag(lane(k1), lane(k1) + QPoint(0, 14));
+        QVERIFY2(a1().volumeAuto.keys[1].v < -1, qPrintable(QString::number(a1().volumeAuto.keys[1].v)));
+        QVERIFY(std::abs(a1().volumeAuto.keys[1].t - k1) <= 1);
+        // The mixer's fader follows the line at the playhead.
+        auto* mixer = win_->findChild<MixerPanel*>();
+        state()->setPlayhead(a1().volumeAuto.keys[1].t);
+        QCOMPARE(mixer->trackFader(0)->value(), int(std::lround(a1().volumeAuto.keys[1].v * 10)));
+        // Dragging the line between the points moves both.
+        const double k0v = a1().volumeAuto.keys[0].v;
+        drag(lane(60), lane(60) + QPoint(0, -12));
+        QVERIFY(a1().volumeAuto.keys[0].v > k0v);
+        // Alt-click deletes a point.
+        QTest::mouseClick(viewport(), Qt::LeftButton, Qt::AltModifier, lane(a1().volumeAuto.keys[0].t));
+        QCOMPARE(a1().volumeAuto.keys.size(), size_t(1));
+        // Off: the clip lines come back and the track line is not drawn.
+        toggle->trigger();
+        QVERIFY(!timeline()->showTrackAutomation());
+        QCOMPARE(lane(30), QPoint(-1, -1));
+    }
+
     void razorTool() {
         loadDemo();
         timeline()->setTool(TimelineWidget::Tool::Razor);

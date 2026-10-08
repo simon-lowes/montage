@@ -28,6 +28,7 @@
 #include "ThumbnailCache.h"
 #include "audio/PluginEffect.h"
 #include "core/Effects.h"
+#include "core/Automation.h"
 #include "core/KeyframeEdit.h"
 #include "core/Multicam.h"
 #include "media/MediaPool.h"
@@ -435,6 +436,7 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
             QRect cr(xs, r.y + 1, std::max(2, xe - xs), r.h - 3);
             paintClip(p, r, c, cr);
         }
+        if (showTrackAuto_ && r.ref.kind == TrackKind::Audio) paintTrackLane(p, r, *t);
         for (const auto& tr : t->transitions) {
             FrameTime a, b;
             if (!edit::transitionRange(*t, tr, a, b)) continue;
@@ -662,6 +664,135 @@ void TimelineWidget::setShowVolumeLines(bool on) {
     viewport()->update();
 }
 
+void TimelineWidget::setShowTrackAutomation(bool on) {
+    showTrackAuto_ = on;
+    viewport()->update();
+}
+
+// A track's volume lane, on the same scale as clip volume lines.
+const TimelineWidget::Lane& TimelineWidget::trackVolumeLane() {
+    static const Lane lane{nullptr, "volume", 0.0, kGainLineMinDb, kGainLineMaxDb, true};
+    return lane;
+}
+
+namespace {
+double trackLaneValue(const Track& t, FrameTime f) { return t.volumeAuto.animated() ? t.volumeAuto.at(f) : t.volumeDb; }
+}  // namespace
+
+QRect TimelineWidget::trackLaneBand(const Row& row) const {
+    const QRect band(kHeaderW + 1, row.y + 5, viewport()->width() - kHeaderW - 2, row.h - 11);
+    return band.height() >= 8 ? band : QRect();
+}
+
+QPoint TimelineWidget::trackLanePoint(int index, FrameTime f) const {
+    const Sequence* s = state_->sequence();
+    if (!showTrackAuto_ || !s || index < 0 || index >= int(s->audioTracks.size())) return {-1, -1};
+    for (const Row& row : rows())
+        if (row.ref == TrackRef{TrackKind::Audio, index}) {
+            const QRect band = trackLaneBand(row);
+            if (band.isNull()) return {-1, -1};
+            return {xForFrame(f), laneY(trackVolumeLane(), band, trackLaneValue(s->audioTracks[size_t(index)], f))};
+        }
+    return {-1, -1};
+}
+
+std::optional<TimelineWidget::TrackLaneHit> TimelineWidget::trackLaneHit(const QPoint& pos) const {
+    const Sequence* s = state_->sequence();
+    if (!showTrackAuto_ || !s || pos.x() < kHeaderW) return std::nullopt;
+    const auto row = rowAt(pos.y());
+    if (!row || row->ref.kind != TrackKind::Audio) return std::nullopt;
+    const QRect band = trackLaneBand(*row);
+    if (band.isNull()) return std::nullopt;
+    const Track& t = s->audioTracks.at(size_t(row->ref.index));
+    TrackLaneHit h;
+    h.track = row->ref.index;
+    for (const Keyframe& k : t.volumeAuto.keys)
+        if (std::abs(pos.x() - xForFrame(k.t)) <= 4 && std::abs(pos.y() - laneY(trackVolumeLane(), band, k.v)) <= 4) {
+            h.key = h.frame = k.t;
+            return h;
+        }
+    h.frame = std::max<FrameTime>(0, FrameTime(std::floor(frameAtX(pos.x()))));
+    h.onLine = std::abs(pos.y() - laneY(trackVolumeLane(), band, trackLaneValue(t, h.frame))) <= 3;
+    return h;
+}
+
+void TimelineWidget::paintTrackLane(QPainter& p, const Row& row, const Track& t) {
+    const QRect band = trackLaneBand(row);
+    if (band.isNull()) return;
+    const Lane& lane = trackVolumeLane();
+    const int x0 = band.left(), x1 = band.right();
+    std::vector<int> xs;
+    for (int x = x0; x <= x1; x += 2) xs.push_back(x);
+    for (const Keyframe& k : t.volumeAuto.keys)
+        if (const int kx = xForFrame(k.t); kx > x0 && kx < x1) xs.push_back(kx);
+    std::sort(xs.begin(), xs.end());
+    QPolygonF line;
+    for (int x : xs) line << QPointF(x, laneY(lane, band, trackLaneValue(t, std::max<FrameTime>(0, FrameTime(std::floor(frameAtX(x)))))));
+    // Heard in Read, Latch and Touch; dimmed when the mode ignores it, dashed while it is only the fader's level.
+    const AutomationMode m = trackAutomation(t);
+    const bool heard = m == AutomationMode::Read || m == AutomationMode::Latch || m == AutomationMode::Touch;
+    QColor col(84, 200, 255, heard ? 230 : 110);
+    p.save();
+    p.setRenderHint(QPainter::Antialiasing);
+    QPen pen(col, 1.5);
+    if (!t.volumeAuto.animated()) pen.setStyle(Qt::DashLine);
+    p.setPen(pen);
+    p.setBrush(Qt::NoBrush);
+    p.drawPolyline(line);
+    p.setPen(QPen(QColor(0, 0, 0, 160), 1));
+    p.setBrush(col);
+    for (const Keyframe& k : t.volumeAuto.keys) {
+        const QPointF at(xForFrame(k.t), laneY(lane, band, k.v));
+        if (at.x() < x0 - 4 || at.x() > x1 + 4) continue;
+        QPolygonF d;
+        d << at + QPointF(0, -4) << at + QPointF(4, 0) << at + QPointF(0, 4) << at + QPointF(-4, 0);
+        p.drawPolygon(d);
+    }
+    p.setPen(col);
+    QFont f = p.font();
+    f.setPointSize(7);
+    p.setFont(f);
+    p.drawText(QRect(band.left() + 4, row.y + 1, 120, 12), Qt::AlignLeft | Qt::AlignTop,
+               tr("Volume · %1").arg(tr(automationModeName(m))));
+    p.restore();
+}
+
+bool TimelineWidget::beginTrackLaneDrag(QMouseEvent* e, const TrackLaneHit& h) {
+    const bool add = e->modifiers() & (Qt::ControlModifier | Qt::MetaModifier);
+    const bool alt = e->modifiers() & Qt::AltModifier;
+    const int ti = h.track;
+    drag_.track = ti;
+    if (h.key >= 0) {
+        const FrameTime key = h.key;
+        if (alt) {
+            state_->edit(tr("Delete Automation Point"), [ti, key](Project&, Sequence& s) {
+                return ti < int(s.audioTracks.size()) && s.audioTracks[size_t(ti)].volumeAuto.removeKey(key);
+            });
+            drag_ = DragState{};
+            return true;
+        }
+        drag_.kind = DragKind::TrackKey;
+        drag_.key = key;
+        return true;
+    }
+    if (add) {
+        const FrameTime f = h.frame;
+        state_->edit(tr("Add Automation Point"), [ti, f](Project&, Sequence& s) {
+            if (ti >= int(s.audioTracks.size())) return false;
+            Track& t = s.audioTracks[size_t(ti)];
+            if (t.volumeAuto.keyAt(f)) return false;
+            t.volumeAuto.addKey(f, trackLaneValue(t, f));
+            return true;
+        });
+        drag_.kind = DragKind::TrackKey;
+        drag_.key = f;
+        return true;
+    }
+    drag_.kind = DragKind::TrackLine;
+    drag_.key = h.frame;
+    return true;
+}
+
 void TimelineWidget::setShowOpacityLines(bool on) {
     showOpacity_ = on;
     viewport()->update();
@@ -669,7 +800,7 @@ void TimelineWidget::setShowOpacityLines(bool on) {
 
 std::optional<TimelineWidget::Lane> TimelineWidget::laneFor(const Clip&, TrackKind kind) const {
     if (kind == TrackKind::Audio) {
-        if (!showVolume_) return std::nullopt;
+        if (!showVolume_ || showTrackAuto_) return std::nullopt;
         return Lane{&Clip::audio, "gain_db", 0.0, kGainLineMinDb, kGainLineMaxDb, true};
     }
     if (!showOpacity_) return std::nullopt;
@@ -1184,6 +1315,10 @@ void TimelineWidget::mousePressEvent(QMouseEvent* e) {
         state_->setPlayhead(f);
         return;
     }
+    // A track's automation line or one of its points.
+    if (tool_ == Tool::Select)
+        if (const auto th = trackLaneHit(e->pos()); th && (th->key >= 0 || th->onLine))
+            if (beginTrackLaneDrag(e, *th)) return;
     // A clip's volume or opacity line, or one of its keyframes (clip edges keep trimming).
     if (tool_ == Tool::Select)
         if (const auto lh = laneHit(e->pos()); lh && (lh->key >= 0 || (lh->onLine && hit.kind == HitKind::ClipBody)))
@@ -1309,6 +1444,8 @@ void TimelineWidget::updateDrag(QMouseEvent* e) {
                 break;
             }
             case DragKind::LineKey: state_->beginGesture(tr("Move Keyframe")); break;
+            case DragKind::TrackLine: state_->beginGesture(tr("Track Volume")); break;
+            case DragKind::TrackKey: state_->beginGesture(tr("Move Automation Point")); break;
             default: break;
         }
     }
@@ -1470,6 +1607,37 @@ void TimelineWidget::updateDrag(QMouseEvent* e) {
             drag_.label = laneText(lane, v) + QStringLiteral("  ") + signedTc(placed - from);
             break;
         }
+        case DragKind::TrackLine:
+        case DragKind::TrackKey: {
+            const int ti = drag_.track;
+            QRect band;
+            for (const Row& row : rows())
+                if (row.ref == TrackRef{TrackKind::Audio, ti}) band = trackLaneBand(row);
+            if (band.isNull() || ti < 0 || ti >= int(s->audioTracks.size())) break;
+            const Lane& lane = trackVolumeLane();
+            if (drag_.kind == DragKind::TrackLine) {
+                const double delta = pos.y() <= band.top()      ? lane.hi - lane.lo
+                                     : pos.y() >= band.bottom() ? lane.lo - lane.hi
+                                                                : laneValue(lane, band, pos.y()) - laneValue(lane, band, drag_.pressPos.y());
+                const FrameTime t = drag_.key;
+                state_->updateGesture([=](Project&, Sequence& sq) {
+                    Track& tr = sq.audioTracks[size_t(ti)];
+                    if (tr.volumeAuto.animated()) offsetLine(tr.volumeAuto, t, delta, lane.lo, lane.hi);
+                    else tr.volumeDb = std::clamp(tr.volumeDb + delta, lane.lo, lane.hi);
+                });
+                drag_.label = laneText(lane, trackLaneValue(state_->sequence()->audioTracks[size_t(ti)], t));
+            } else {
+                const FrameTime to = (e->modifiers() & Qt::ShiftModifier) ? drag_.key : std::max<FrameTime>(0, frameRound(pos.x()));
+                const double v = laneValue(lane, band, pos.y());
+                const FrameTime from = drag_.key;
+                FrameTime placed = from;
+                state_->updateGesture([&](Project&, Sequence& sq) {
+                    placed = moveKey(sq.audioTracks[size_t(ti)].volumeAuto, from, to, v, std::numeric_limits<FrameTime>::max() / 4);
+                });
+                drag_.label = laneText(lane, v) + QStringLiteral("  ") + signedTc(placed - from);
+            }
+            break;
+        }
         default: break;
     }
     if (drag_.kind == DragKind::Trim || drag_.kind == DragKind::Roll || drag_.kind == DragKind::Slip || drag_.kind == DragKind::Slide)
@@ -1546,7 +1714,8 @@ void TimelineWidget::mouseReleaseEvent(QMouseEvent* e) {
                                      drag_.kind == DragKind::Slip || drag_.kind == DragKind::Slide ||
                                      drag_.kind == DragKind::CaptionMove || drag_.kind == DragKind::CaptionIn ||
                                      drag_.kind == DragKind::CaptionOut || drag_.kind == DragKind::Line ||
-                                     drag_.kind == DragKind::LineKey);
+                                     drag_.kind == DragKind::LineKey || drag_.kind == DragKind::TrackLine ||
+                                     drag_.kind == DragKind::TrackKey);
     if (gesture) state_->endGesture(true);
     if (drag_.started && (drag_.kind == DragKind::Trim || drag_.kind == DragKind::Roll || drag_.kind == DragKind::Slip || drag_.kind == DragKind::Slide))
         emit trimViewEnded();

@@ -761,6 +761,17 @@ void MainWindow::buildMenus() {
         o->setCheckable(true);
         o->setChecked(opacity);
         o->setObjectName(QStringLiteral("showOpacityLines"));
+        const bool trackAuto = appSettings().value("timeline/trackAutomation", false).toBool();
+        timeline_->setShowTrackAutomation(trackAuto);
+        QAction* a = add(seqM, tr("Show &Track Automation"), QKeySequence(), [this](bool on) {
+            timeline_->setShowTrackAutomation(on);
+            appSettings().setValue("timeline/trackAutomation", on);
+        });
+        a->setCheckable(true);
+        a->setChecked(trackAuto);
+        a->setObjectName(QStringLiteral("showTrackAutomation"));
+        a->setToolTip(tr("Draw each audio track's volume automation across its row: drag the line or a point, Ctrl/Cmd-click to add a "
+                         "point, Alt-click a point to delete it"));
     }
     add(seqM, tr("Zoom &In"), QKeySequence(Qt::Key_Equal), [this] { timeline_->zoomIn(); });
     add(seqM, tr("Zoom &Out"), QKeySequence(Qt::Key_Minus), [this] { timeline_->zoomOut(); });

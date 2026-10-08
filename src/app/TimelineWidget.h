@@ -50,6 +50,12 @@ public:
     // a keyframe, drag keyframes, Alt-click one to delete it.
     void setShowVolumeLines(bool on);
     bool showVolumeLines() const { return showVolume_; }
+    // Audio rows show their track's volume automation (core/Automation.h) across the row instead of clip lines:
+    // drag a key or the line, Ctrl/Cmd-click to add a key, Alt-click a key to delete it.
+    void setShowTrackAutomation(bool on);
+    bool showTrackAutomation() const { return showTrackAuto_; }
+    // Where audio track `index`'s automation line is at frame f, in viewport pixels (testing aid); (-1, -1) if hidden.
+    QPoint trackLanePoint(int index, FrameTime f) const;
     void setShowOpacityLines(bool on);
     bool showOpacityLines() const { return showOpacity_; }
     // The render bar under the ruler: the frame ranges ([first, end)) whose
@@ -104,7 +110,7 @@ private:
         Id captionTrack = 0;
         int caption = -1;
     };
-    enum class DragKind { None, Scrub, Move, Trim, Roll, Slip, Slide, Rubber, Pan, CaptionMove, CaptionIn, CaptionOut, Line, LineKey };
+    enum class DragKind { None, Scrub, Move, Trim, Roll, Slip, Slide, Rubber, Pan, CaptionMove, CaptionIn, CaptionOut, Line, LineKey, TrackLine, TrackKey };
     struct DragState {
         DragKind kind = DragKind::None;
         QPoint pressPos;
@@ -126,6 +132,13 @@ private:
         int caption = -1;
         FrameTime key = -1;     // the keyframe dragged (clip-local frame)
         double lineAtPress = 0;  // the line's value under the press
+        int track = -1;          // the audio track whose automation is dragged
+    };
+    struct TrackLaneHit {
+        int track = -1;       // audio track index
+        FrameTime frame = 0;  // timeline frame under the pointer
+        FrameTime key = -1;   // a key under the pointer
+        bool onLine = false;
     };
     // A clip's line: which fixed parameter it shows and its range.
     struct Lane {
@@ -174,6 +187,11 @@ private:
     static int laneY(const Lane& lane, const QRect& band, double v);
     static double laneValue(const Lane& lane, const QRect& band, int y);
     std::optional<LaneHit> laneHit(const QPoint& pos) const;
+    static const Lane& trackVolumeLane();
+    QRect trackLaneBand(const Row& row) const;
+    std::optional<TrackLaneHit> trackLaneHit(const QPoint& pos) const;
+    void paintTrackLane(QPainter& p, const Row& row, const Track& t);
+    bool beginTrackLaneDrag(QMouseEvent* e, const TrackLaneHit& h);
     bool clipRect(Id clip, QRect& r, TrackKind* kind = nullptr) const;
     bool laneOf(Id clip, Lane& lane, QRect& band) const;
     void paintLane(QPainter& p, const Clip& c, TrackKind kind, const QRect& r);
@@ -201,6 +219,7 @@ private:
     std::optional<TrackRef> contextTrack_;
     QPoint hoverPos_;
     bool showVolume_ = true;
+    bool showTrackAuto_ = false;
     bool showOpacity_ = false;
     std::vector<std::pair<FrameTime, FrameTime>> rendered_;
 };
