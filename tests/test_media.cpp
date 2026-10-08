@@ -83,6 +83,7 @@
 #include "media/CameraRaw.h"
 #include "core/Slate.h"
 #include "render/PaperEdit.h"
+#include "render/QualityCheck.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -585,6 +586,41 @@ private slots:
         mixer.mix(p, s, 12000, 4800, out.data());
         QVERIFY2(std::fabs(out[4000 * 2] - out[4000 * 2 + 1]) < 1e-5f && out[4000 * 2] > 0.4f,
                  qPrintable(QString("%1 %2").arg(out[4000 * 2]).arg(out[4000 * 2 + 1])));
+    }
+
+    void qualityCheckSound() {
+        // JFK's speech, then three seconds of nothing.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        MediaItem m = probeOrFail(p, MONTAGE_TEST_DATA_DIR "/jfk.wav");
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const double fps = s.fpsValue();
+        const FrameTime speechEnd = s.duration(), end = speechEnd + FrameTime(std::lround(3 * fps));
+        QcSettings q;
+        q.flashing = false, q.levels = false, q.blackSeconds = 0, q.freezeSeconds = 0;
+        auto describe = [](const std::vector<QcIssue>& v) {
+            QString t;
+            for (const QcIssue& i : v) t += QStringLiteral("%1 %2-%3 %4; ").arg(qcKindName(i.kind)).arg(i.start).arg(i.end).arg(QString::fromStdString(i.text));
+            return t;
+        };
+        std::vector<QcIssue> issues = qualityCheck(p, s, 0, end, q);
+        // Only the silence after the speech (its pauses are shorter than two seconds), and nothing clips.
+        QVERIFY2(issues.size() == 1 && issues[0].kind == QcKind::Silence, qPrintable(describe(issues)));
+        QVERIFY2(std::fabs(double(issues[0].start - speechEnd)) < 0.6 * fps && issues[0].end == end, qPrintable(describe(issues)));
+        // Against a streaming target: too quiet.
+        q.loudnessTarget = -14;
+        issues = qualityCheck(p, s, 0, speechEnd, q);
+        QVERIFY2(issues.size() == 1 && issues[0].kind == QcKind::Loudness, qPrintable(describe(issues)));
+        QVERIFY(QString::fromStdString(issues[0].text).contains("LUFS"));
+        // 24 dB louder: it clips and its peaks go over the ceiling.
+        s.audioTracks[0].clips.front().audio.params["gain_db"] = 24.0;
+        issues = qualityCheck(p, s, 0, speechEnd, q);
+        auto has = [&](QcKind k) { return std::any_of(issues.begin(), issues.end(), [&](const QcIssue& i) { return i.kind == k; }); };
+        QVERIFY2(has(QcKind::Clipping) && has(QcKind::TruePeak), qPrintable(describe(issues)));
+        QVERIFY(!has(QcKind::Silence));
+        q.clipping = false, q.loudnessTarget = 0;
+        QVERIFY2(qualityCheck(p, s, 0, speechEnd, q).empty(), qPrintable(describe(qualityCheck(p, s, 0, speechEnd, q))));
     }
 
     void audioRepair() {
@@ -4998,6 +5034,16 @@ private slots:
         r = tool("montage_chapters", QJsonObject{{"project", project}});
         QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
         QVERIFY2(text(r).startsWith("0:00 Intro\n0:00 Part two\n") && text(r).contains("three"), qPrintable(text(r)));
+        QVERIFY(!tool("montage_undo", QJsonObject{{"project", project}}).value("isError").toBool());
+        // Quality check: the problems listed, and marked when asked (one undo step).
+        r = tool("montage_quality_check", QJsonObject{{"project", project}, {"silence_seconds", 0.1}, {"markers", true}});
+        QVERIFY2(!r.value("isError").toBool() && text(r).contains("Silence"), qPrintable(text(r)));
+        {
+            Project checked;
+            QVERIFY(loadProject(project.toStdString(), checked));
+            const auto& mk = checked.active()->markers;
+            QVERIFY(std::any_of(mk.begin(), mk.end(), [](const Marker& m) { return m.name == "QC: Silence" && m.color == 11; }));
+        }
         QVERIFY(!tool("montage_undo", QJsonObject{{"project", project}}).value("isError").toBool());
         r = tool("montage_add_marker", QJsonObject{{"project", project}, {"at", 0.1}, {"name", "Look"}});
         QVERIFY(!r.value("isError").toBool());

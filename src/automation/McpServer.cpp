@@ -45,6 +45,7 @@
 #include "media/AutoDuck.h"
 #include "core/Slate.h"
 #include "render/PaperEdit.h"
+#include "render/QualityCheck.h"
 #include "media/Decoder.h"
 #include "media/Faces.h"
 #include "media/DepthMap.h"
@@ -917,6 +918,46 @@ void McpServer::Impl::addTools() {
             const std::string text = youtubeChapters(s, from, to, &warning);
             if (text.empty()) return fail(QString::fromStdString(warning));
             return ok(QString::fromStdString(text) + (warning.empty() ? QString() : QStringLiteral("\nNote: ") + QString::fromStdString(warning)));
+        });
+
+    add("montage_quality_check", "Quality check",
+        "Check the sequence (or from..to) before delivery, as broadcasters' QC does: flashing that can trigger seizures "
+        "(ITU-R BT.1702 / Ofcom / WCAG: more than three flashes a second over a quarter of the screen, or saturated red), "
+        "levels outside EBU R103, black or frozen picture, silence, clipping, and loudness against a target. Lists each "
+        "problem with its timecodes; with markers, puts a red \"QC:\" marker on each (replacing earlier ones).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"from":{"type":["number","string"]},
+            "to":{"type":["number","string"]},"flashing":{"type":"boolean","default":true},"levels":{"type":"boolean","default":true},
+            "black_seconds":{"type":"number","default":1,"description":"0 = not checked"},
+            "freeze_seconds":{"type":"number","default":5,"description":"0 = not checked"},
+            "silence_seconds":{"type":"number","default":2,"description":"0 = not checked"},
+            "clipping":{"type":"boolean","default":true},
+            "loudness_target":{"type":"number","description":"LUFS, e.g. -14 (streaming) or -23 (EBU R128); omitted = not checked"},
+            "peak_ceiling":{"type":"number","default":-1,"description":"dBTP, checked with the loudness"},
+            "markers":{"type":"boolean","default":false}},"required":["project"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const FrameTime from = a.contains("from") ? timeArg(a.value("from"), s, "from") : 0;
+            const FrameTime to = a.contains("to") ? timeArg(a.value("to"), s, "to") : -1;
+            QcSettings q;
+            q.flashing = a.value("flashing").toBool(true);
+            q.levels = a.value("levels").toBool(true);
+            q.blackSeconds = std::max(0.0, a.value("black_seconds").toDouble(1));
+            q.freezeSeconds = std::max(0.0, a.value("freeze_seconds").toDouble(5));
+            q.silenceSeconds = std::max(0.0, a.value("silence_seconds").toDouble(2));
+            q.clipping = a.value("clipping").toBool(true);
+            q.loudnessTarget = a.value("loudness_target").toDouble(0);
+            q.peakCeiling = a.value("peak_ceiling").toDouble(-1);
+            const std::vector<QcIssue> issues = qualityCheck(l.project, s, from, to, q, [this](double f) { progress(f, "Checking"); });
+            QString text;
+            for (const QcIssue& i : issues)
+                text += QStringLiteral("%1 - %2  %3: %4\n").arg(tc(i.start, s), tc(i.end, s), QString::fromLatin1(qcKindName(i.kind)),
+                                                             QString::fromStdString(i.text));
+            if (a.value("markers").toBool()) {
+                addQcMarkers(s, issues);
+                save(l);
+            }
+            return ok(issues.empty() ? QStringLiteral("No problems found.") : QStringLiteral("%1 problem(s):\n").arg(issues.size()) + text);
         });
 
     add("montage_transcribe", "Transcribe",

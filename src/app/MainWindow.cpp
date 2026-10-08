@@ -59,6 +59,7 @@
 #include "AutoDuckDialog.h"
 #include "AutoMixDialog.h"
 #include "ScriptCutDialog.h"
+#include "QualityCheckDialog.h"
 #include "KeyframePanel.h"
 #include "MediaBinWidget.h"
 #include "RenderQueue.h"
@@ -715,6 +716,11 @@ void MainWindow::buildMenus() {
     add(seqM, tr("Add &Marker"), QKeySequence(Qt::Key_M), [this] { addMarker(); });
     add(seqM, tr("Add C&hapter Marker"), QKeySequence("Alt+M"), [this] { addChapterMarker(); })->setObjectName(QStringLiteral("addChapter"));
     add(seqM, tr("Copy Chapters for YouTube"), QKeySequence(), [this] { copyYoutubeChapters(); })->setObjectName(QStringLiteral("copyChapters"));
+    add(seqM, tr("&Quality Check…"), QKeySequence(), [this] {
+        if (!state_->sequence()) return;
+        QualityCheckDialog dlg(state_, this);
+        dlg.exec();
+    })->setObjectName(QStringLiteral("qualityCheck"));
     add(seqM, tr("Next Marker"), QKeySequence("Shift+M"), [this] { jumpMarker(true); });
     add(seqM, tr("Previous Marker"), QKeySequence("Ctrl+Shift+M"), [this] { jumpMarker(false); });
     add(seqM, tr("Clear Marker at Playhead"), QKeySequence("Ctrl+Alt+M"), [this] {

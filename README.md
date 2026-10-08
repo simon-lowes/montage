@@ -167,6 +167,8 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Crossfades: equal power or constant gain
 - Loudness normalisation to -14, -16, -23 or -24 LUFS (ITU-R BS.1770 / EBU R128 gated measurement)
 - **Live loudness meter** under the audio meters while playing: momentary (400 ms), short-term (3 s) and integrated LUFS, loudness range (LU) and true peak (dBTP). The integrated value turns green on the chosen target (EBU R128 -23, ATSC A/85 -24, streaming -14, Apple and podcasts -16), amber within 2 LU, and red otherwise; true peak turns red above -1 dBTP. Reset starts a new measurement.
+- **Quality Check** (Sequence › Quality Check…, like the QC pass broadcasters run in Baton or Vidchecker, and the Harding test): the sequence or In to Out is checked before delivery for flashing that can trigger photosensitive seizures (ITU-R BT.1702, Ofcom and WCAG 2.3.1: more than three flashes a second over a quarter of the screen, or to and from saturated red), picture levels outside EBU R103, black and frozen picture, silence, clipping, and integrated loudness and true peak against a delivery target (streaming, podcast, EBU R128, ATSC A/85). Each problem is listed with its timecodes; double-click one to go there, or add red "QC:" markers spanning them all.
+- **Broadcast Safe** effect (Color; Premiere's Video Limiter, Final Cut's Broadcast Safe): limits a clip or an adjustment layer to EBU R103 (-5 to 105 %) or strictly 0 to 100 %, pulling over-range colours towards their own luma so hue is kept, with a soft knee; Highlight Unsafe Areas stripes what it would change.
 - Waveforms on the timeline
 
 **Organising media**
@@ -350,6 +352,7 @@ Its tools work on `.montage` files by path. Each edit is saved at once, and the 
 - probe media, create projects and list a project's timeline;
 - place media, split, remove (with ripple), move, trim and change the speed of clips;
 - add titles, effects (including masked ones), transitions and markers (chapter markers too), and list the chapters for YouTube;
+- run a delivery quality check (flashing, levels, black, freeze, silence, clipping, loudness) and mark the problems;
 - transcribe (with speaker labels), translate caption tracks, dub them into English, find spoken phrases in the cut, cut by transcript (phrases, filler words, retakes, long pauses, optionally with Smooth Cuts), and build a cut from a script;
 - find shots by description, and find, name and join the people in the footage;
 - generate voiceovers from text or from a caption track;

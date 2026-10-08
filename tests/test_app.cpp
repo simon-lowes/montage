@@ -38,6 +38,7 @@
 #include "EditorState.h"
 #include "EffectsBrowser.h"
 #include "ExportDialog.h"
+#include "QualityCheckDialog.h"
 #include "MediaBinModel.h"
 #include "MediaBinWidget.h"
 #include "SmartBinDialog.h"
@@ -421,6 +422,57 @@ private slots:
         state()->undo();
         const auto& restored = state()->sequence()->markers;
         QCOMPARE(std::count_if(restored.begin(), restored.end(), [](const Marker& m) { return m.chapter; }), 1);
+    }
+
+    void qualityCheckDialog() {
+        loadDemo();
+        QVERIFY(win_->findChild<QAction*>("qualityCheck"));
+        QualityCheckDialog dlg(state(), win_.get());
+        QCOMPARE(dlg.findChild<QComboBox*>("qcRange")->currentIndex(), 0);  // no In and Out
+        auto* markers = dlg.findChild<QPushButton*>("qcMarkers");
+        QVERIFY(!markers->isEnabled());
+        // The demo has no sound: four seconds of silence, and nothing else at the default limits.
+        QVERIFY(dlg.runCheck());
+        QCOMPARE(dlg.issues().size(), size_t(1));
+        QCOMPARE(dlg.issues()[0].kind, QcKind::Silence);
+        auto* table = dlg.findChild<QTableWidget*>("qcIssues");
+        QCOMPARE(table->rowCount(), 1);
+        QVERIFY(table->item(0, 2)->text().contains("Silence"));
+        QCOMPARE(table->item(0, 0)->text(), QString::fromStdString(formatTimecode(0, state()->sequence()->fps)));
+        QVERIFY(markers->isEnabled());
+        dlg.findChild<QCheckBox*>("qcSilence")->setChecked(false);
+        QVERIFY(dlg.runCheck());
+        QVERIFY(dlg.issues().empty());
+        QVERIFY(dlg.findChild<QLabel*>("qcSummary")->text().contains("No problems"));
+        QVERIFY(!markers->isEnabled());
+        // A one-second freeze limit finds the stills; a problem can be gone to and marked as one undo step.
+        dlg.findChild<QDoubleSpinBox*>("qcFreezeSeconds")->setValue(1.0);
+        QVERIFY(dlg.runCheck());
+        const auto& found = dlg.issues();
+        const auto blue = std::find_if(found.begin(), found.end(), [](const QcIssue& i) { return i.kind == QcKind::Freeze && i.start == 60; });
+        QVERIFY(blue != found.end());
+        QCOMPARE(blue->end, FrameTime(120));
+        state()->setPlayhead(0);
+        dlg.activate(int(blue - found.begin()));
+        QCOMPARE(state()->playhead(), FrameTime(60));
+        const size_t before = state()->sequence()->markers.size();
+        QCOMPARE(dlg.addMarkers(), int(found.size()));
+        QCOMPARE(state()->sequence()->markers.size(), before + found.size());
+        state()->undo();
+        QCOMPARE(state()->sequence()->markers.size(), before);
+        // In to Out when both are set.
+        state()->edit("Range", [](Project&, Sequence& s) {
+            s.inPoint = 60;
+            s.outPoint = 119;
+            return true;
+        });
+        QualityCheckDialog ranged(state(), win_.get());
+        QCOMPARE(ranged.findChild<QComboBox*>("qcRange")->currentIndex(), 1);
+        ranged.findChild<QCheckBox*>("qcSilence")->setChecked(false);
+        ranged.findChild<QDoubleSpinBox*>("qcFreezeSeconds")->setValue(1.0);
+        QVERIFY(ranged.runCheck());
+        QCOMPARE(ranged.issues().size(), size_t(1));
+        QVERIFY(ranged.issues()[0].start == 60 && ranged.issues()[0].end == 120);
     }
 
     void razorTool() {

@@ -279,6 +279,11 @@ std::vector<EffectInfo> buildCatalog() {
                   num("gamma", "Gamma", 0.1, 10, 1, 0.01), num("out_black", "Output Black", 0, 1, 0, 0.005),
                   num("out_white", "Output White", 0, 1, 1, 0.005)},
                  {}});
+    // A legaliser (Premiere's Video Limiter, Final Cut's Broadcast Safe): see render/QualityCheck.h broadcastSafe.
+    c.push_back({"broadcast_safe", "Broadcast Safe", EffectCategory::VideoFilter, "Color",
+                 {choice("limits", "Limits", {"EBU R103 (-5 to 105 %)", "Strict (0 to 100 %)"}, 0), pct("knee", "Soft Knee", 0, 20, 5),
+                  boolean("highlight", "Highlight Unsafe Areas", false)},
+                 {}});
     c.push_back({"glow", "Glow", EffectCategory::VideoFilter, "Stylize",
                  {num("threshold", "Threshold", 0, 1, 0.7, 0.005), num("radius", "Radius (px)", 0, 200, 20, 0.5),
                   num("intensity", "Intensity", 0, 5, 1, 0.01)},

@@ -16,6 +16,7 @@
 #include "render/Exporter.h"
 #include "render/Ocio.h"
 #include "render/Processing.h"
+#include "render/QualityCheck.h"
 #include "render/Relight.h"
 #include "render/Deconvolve.h"
 #include "render/FilmLook.h"
@@ -2358,6 +2359,155 @@ colorspaces:
 
         // As a clip effect on a still image: the spatial pass, under a mask when it has one.
         QVERIFY(findEffectInfo("video_denoise") && findEffectInfo("video_denoise")->category == EffectCategory::VideoFilter);
+    }
+
+    void qualityCheckPicture() {
+        // The flash counter on whole frames (linear light): `share` of the rows lit in the "on" state, black otherwise.
+        const int W = 32, H = 20;
+        auto frame = [&](double r, double g, double b, double share) {
+            std::vector<float> f(size_t(W) * H * 3, 0.0f);
+            for (int y = 0; y < int(std::lround(H * share)); ++y)
+                for (int x = 0; x < W; ++x) {
+                    float* px = &f[(size_t(y) * W + x) * 3];
+                    px[0] = float(r), px[1] = float(g), px[2] = float(b);
+                }
+            return f;
+        };
+        // The most transitions in any second of two seconds alternating every `half` frames at 30 fps.
+        auto most = [&](int half, double on, double off, double share, bool red, double g = -1) {
+            FlashDetector d(30);
+            int best = 0;
+            for (int i = 0; i < 60; ++i) {
+                const double v = (i / half) % 2 ? on : off;
+                const auto f = g < 0 ? frame(v, v, v, share) : frame(v, (i / half) % 2 ? g : off, (i / half) % 2 ? g : off, share);
+                d.add(f.data(), W, H);
+                best = std::max(best, d.transitionsInLastSecond(red));
+            }
+            return best;
+        };
+        QCOMPARE(most(3, 1, 0, 1, false), 10);   // five flashes a second
+        QCOMPARE(most(4, 1, 0, 1, false), 8);    // 3.75: fails
+        QCOMPARE(most(5, 1, 0, 1, false), 6);    // three a second: allowed
+        QCOMPARE(most(15, 1, 0, 1, false), 2);
+        QCOMPARE(most(3, 1, 0, 0.2, false), 0);  // a fifth of the screen
+        QCOMPARE(most(3, 1, 0, 0.3, false), 10); // over a quarter
+        QCOMPARE(most(3, 0.05, 0, 1, false), 0); // 10 cd/m2: too small
+        QCOMPARE(most(3, 1, 0.85, 1, false), 0); // both sides brighter than 160 cd/m2
+        // Saturated red to black: under the luminance threshold, but a red flash.
+        QCOMPARE(most(3, 0.3, 0, 1, false, 0), 0);
+        QCOMPARE(most(3, 0.3, 0, 1, true, 0), 10);
+        QCOMPARE(most(3, 0.3, 0, 1, true, 0.1), 0);  // not saturated red
+        // A slow fade up and down is one transition each way.
+        {
+            FlashDetector d(30);
+            int best = 0;
+            for (int i = 0; i < 60; ++i) {
+                const double v = i < 30 ? i / 29.0 : (59 - i) / 29.0;
+                const auto f = frame(v, v, v, 1);
+                d.add(f.data(), W, H);
+                best = std::max(best, d.transitionsInLastSecond());
+            }
+            QVERIFY(best <= 2);
+        }
+
+        // Broadcast Safe: hue kept, luma limited, premultiplied pixels handled.
+        {
+            std::vector<float> px = {1.2f, 0.5f, 0.5f, 1, 0.5f, 0.5f, 0.5f, 1, -0.2f, -0.2f, -0.2f, 1, 1.1f, 1.1f, 1.1f, 0.5f};
+            const std::vector<float> orig = px;
+            QCOMPARE(broadcastSafe(px.data(), 4, 1, false, 0), 3);
+            QCOMPARE(px[0], 1.05f);
+            QVERIFY(px[1] == px[2] && px[1] > 0.5f && px[1] < 0.6488f);  // pulled towards luma, keeping hue
+            QVERIFY(std::fabs((0.2126 * px[0] + 0.7152 * px[1] + 0.0722 * px[2]) - (0.2126 * 1.2 + 0.7152 * 0.5 + 0.0722 * 0.5)) < 1e-4);
+            QVERIFY(std::equal(px.begin() + 4, px.begin() + 8, orig.begin() + 4));  // legal: untouched
+            QVERIFY(std::fabs(px[8] + 0.01f) < 1e-5);
+            QVERIFY(std::fabs(px[12] - 0.515f) < 1e-5 && px[15] == 0.5f);  // 2.2 at half alpha: 1.03, premultiplied
+            px = orig;
+            QCOMPARE(broadcastSafe(px.data(), 4, 1, true, 0), 3);
+            QCOMPARE(px[0], 1.0f);
+            QVERIFY(std::fabs(px[8]) < 1e-6);
+            // A soft knee eases values near the limit and keeps them under it.
+            std::vector<float> knee = {0.97f, 0.97f, 0.97f, 1, 3, 3, 3, 1, 0.5f, 0.5f, 0.5f, 1};
+            QCOMPARE(broadcastSafe(knee.data(), 3, 1, true, 0.05), 1);
+            QVERIFY(knee[0] < 0.97f && knee[0] > 0.95f);
+            QVERIFY(knee[4] <= 1.0f && knee[4] > 0.99f);
+            QCOMPARE(knee[8], 0.5f);
+            // Highlighting stripes the unsafe pixels only.
+            px = orig;
+            broadcastSafe(px.data(), 4, 1, false, 0, true);
+            QVERIFY(std::equal(px.begin() + 4, px.begin() + 8, orig.begin() + 4));
+            QVERIFY(px[1] == 0 && px[0] == px[2]);
+        }
+
+        // The whole check on a sequence: flashing, then black, then a long still, then over-range red.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64;
+        s.height = 36;
+        s.fps = Rational{30, 1};
+        auto matte = [&](FrameTime start, FrameTime length, double r, double g, double b) {
+            Clip c = makeGeneratorClip(p, "color", length);
+            c.start = start;
+            c.generator.params["color.r"] = r;
+            c.generator.params["color.g"] = g;
+            c.generator.params["color.b"] = b;
+            return c;
+        };
+        Clip flash = matte(0, 60, 0, 0, 0);
+        for (const char* ch : {"color.r", "color.g", "color.b"}) {
+            Param k;
+            for (int i = 0; i <= 20; ++i) k.addKey(i * 3, double(i % 2));
+            flash.generator.params[ch] = k;
+        }
+        edit::overwrite(p, s, {TrackKind::Video, 0}, flash);
+        edit::overwrite(p, s, {TrackKind::Video, 0}, matte(60, 45, 0, 0, 0));
+        edit::overwrite(p, s, {TrackKind::Video, 0}, matte(105, 180, 0.5, 0.5, 0.5));
+        edit::overwrite(p, s, {TrackKind::Video, 0}, matte(285, 30, 1.3, 0.2, 0.2));
+        QcSettings q;
+        q.silenceSeconds = 0;
+        q.clipping = false;
+        int ticks = 0;
+        std::vector<QcIssue> issues = qualityCheck(p, s, 0, -1, q, [&](double) { ++ticks; });
+        QVERIFY(ticks >= 315);
+        QString got;
+        for (const QcIssue& i : issues) got += QStringLiteral("%1 %2-%3; ").arg(qcKindName(i.kind)).arg(i.start).arg(i.end);
+        QCOMPARE(issues.size(), size_t(4));
+        QCOMPARE(issues[0].kind, QcKind::Flashing);
+        QVERIFY2(issues[0].start <= 3 && issues[0].end >= 57 && issues[0].end <= 61, qPrintable(got));
+        QVERIFY2(QString::fromStdString(issues[0].text).contains("5 flashes"), issues[0].text.c_str());
+        QCOMPARE(issues[1].kind, QcKind::Black);
+        QVERIFY2(issues[1].start == 60 && issues[1].end == 105, qPrintable(got));
+        QCOMPARE(issues[2].kind, QcKind::Freeze);
+        QVERIFY2(issues[2].start == 105 && issues[2].end == 285, qPrintable(got));
+        QCOMPARE(issues[3].kind, QcKind::Levels);
+        QVERIFY2(issues[3].start == 285 && issues[3].end == 315, qPrintable(got));
+        QVERIFY(QString::fromStdString(issues[3].text).contains("100.0 %"));
+        // Thresholds: a longer freeze limit, no black check, a range.
+        q.freezeSeconds = 7;
+        q.blackSeconds = 0;
+        issues = qualityCheck(p, s, 0, -1, q);
+        QVERIFY(std::none_of(issues.begin(), issues.end(), [](const QcIssue& i) { return i.kind == QcKind::Freeze || i.kind == QcKind::Black; }));
+        q.blackSeconds = 1;
+        issues = qualityCheck(p, s, 60, 105, q);
+        QCOMPARE(issues.size(), size_t(1));
+        QCOMPARE(issues[0].kind, QcKind::Black);
+        // Broadcast Safe on the red clip makes it legal.
+        trackAt(s, {TrackKind::Video, 0})->clips.back().effects.push_back(makeEffect(p, "broadcast_safe"));
+        QcSettings levelsOnly;
+        levelsOnly.flashing = false, levelsOnly.blackSeconds = 0, levelsOnly.freezeSeconds = 0, levelsOnly.silenceSeconds = 0,
+        levelsOnly.clipping = false;
+        QVERIFY(qualityCheck(p, s, 0, -1, levelsOnly).empty());
+        // Markers: red, spanning each problem, replacing the last check's.
+        s.markers.push_back(Marker{10, 0, "Mine", "", 0});
+        issues = qualityCheck(p, s, 0, -1, QcSettings{true, true, 1, 5, 0, false});
+        QCOMPARE(addQcMarkers(s, issues), int(issues.size()));
+        QCOMPARE(addQcMarkers(s, issues), int(issues.size()));
+        QCOMPARE(s.markers.size(), issues.size() + 1);
+        const auto black = std::find_if(s.markers.begin(), s.markers.end(), [](const Marker& m) { return m.name == "QC: Black"; });
+        QVERIFY(black != s.markers.end());
+        QVERIFY(black->t == 60 && black->duration == 44 && black->color == 11);
+        // Cancelled: nothing.
+        std::atomic<bool> cancel{true};
+        QVERIFY(qualityCheck(p, s, 0, -1, q, {}, &cancel).empty());
     }
 
     void titlesRender() {

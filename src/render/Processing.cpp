@@ -12,6 +12,7 @@
 #include "FilmLook.h"
 #include "StyleFx.h"
 #include "Deconvolve.h"
+#include "QualityCheck.h"
 #include "media/Tracking.h"
 
 #include <algorithm>
@@ -1061,6 +1062,8 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
     else if (ty == "mirror") mirror(e, t, img);
     else if (ty == "drop_shadow") dropShadow(e, t, img, pixelScale);
     else if (ty == "levels") vfx::levels(e, t, img);
+    else if (ty == "broadcast_safe")
+        broadcastSafe(img.px.data(), img.width, img.height, e.p("limits", t, 0) >= 0.5, e.p("knee", t, 5) / 100.0, e.p("highlight", t, 0) >= 0.5);
     else if (ty == "glow") vfx::glow(e, t, img, pixelScale);
     else if (ty == "film_grain") vfx::filmGrain(e, t, img, pixelScale);
     else if (ty == "film_look") filmLook(img, filmLookSettings(e, t), t);
