@@ -580,6 +580,12 @@ std::vector<EffectInfo> buildCatalog() {
                              num("anim_in_dur", "In Duration (s)", 0.05, 10, 0.5, 0.05),
                              choice("anim_out", "Animate Out", {"None", "Fade", "Slide Up", "Slide Down", "Slide Left", "Slide Right", "Pop", "Typewriter", "Wipe"}, 0),
                              num("anim_out_dur", "Out Duration (s)", 0.05, 10, 0.5, 0.05),
+                             // Credits: the whole block moves through the frame over the clip's length, at a
+                             // steady speed after easing in and before easing out.
+                             choice("motion", "Roll / Crawl", {"Still", "Roll Up", "Crawl Left", "Crawl Right"}, 0),
+                             boolean("start_off", "Start Off Screen", true),
+                             boolean("end_off", "End Off Screen", true),
+                             num("motion_ease", "Ease In and Out (s)", 0, 10, 0, 0.1),
                          },
                          {str("text", "Text", StringKind::MultilineText, "Title"),
                           str("font", "Font", StringKind::Font, "Sans Serif")}};
@@ -777,6 +783,13 @@ const std::vector<TitleTemplate>& titleTemplates() {
         {"title_end_card", "End Card",
          {{"size", 110}, {"sub_style", 1}, {"sub_scale", 50}, {"anim_in", 1}, {"anim_in_dur", 0.8}, {"anim_out", 1}, {"anim_out_dur", 0.8}},
          {{"text", "Thanks for watching\nSee you next time"}}},
+        // motion 0 Still, 1 Roll Up, 2 Crawl Left, 3 Crawl Right.
+        {"title_credits", "Rolling Credits",
+         {{"size", 52}, {"bold", 0}, {"line_spacing", 1.45}, {"shadow", 2}, {"motion", 1}},
+         {{"text", "Directed by\nName Surname\n\nEdited by\nName Surname\n\nMusic by\nName Surname\n\nThank you for watching"}}},
+        {"title_crawl", "News Crawl",
+         {{"size", 44}, {"anchor", 2}, {"box_opacity", 80}, {"box_padding", 14}, {"shadow", 0}, {"motion", 2}},
+         {{"text", "Your headline here   \u2022   The next story follows   \u2022   And one more"}}},
     };
     return list;
 }

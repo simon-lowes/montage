@@ -130,6 +130,30 @@ Image renderTitle(const Effect& g, FrameTime t, int w, int h, double scale, Fram
         if (anchor == 4 || anchor == 5) cy = my + halfH + py;
         const int align = int(g.p("align", t, 1));
         const double left = cx - blockW / 2, top = cy - totalH / 2;
+        // Roll and crawl: from where it starts to where it ends over the clip, at a steady speed between the eases.
+        if (const int motion = int(std::lround(g.p("motion", t))); motion > 0 && duration > 1) {
+            const double u = std::clamp(double(t) / double(duration - 1), 0.0, 1.0);
+            const double a = std::clamp(g.p("motion_ease", t) * fps / double(duration - 1), 0.0, 0.5);
+            const double k = a <= 0 ? u
+                             : u < a ? u * u / (2 * a * (1 - a))
+                             : u > 1 - a ? 1 - (1 - u) * (1 - u) / (2 * a * (1 - a))
+                                         : (u - a / 2) / (1 - a);
+            const bool startOff = g.p("start_off", t, 1) > 0.5, endOff = g.p("end_off", t, 1) > 0.5;
+            if (motion == 1) {
+                // Up the frame. Not off screen: where it is laid out if it fits, else its first (last) line inside the safe area.
+                const bool fits = 2 * halfH <= h - 2 * my;
+                const double from = startOff ? h + halfH : (fits ? cy : my + halfH);
+                const double to = endOff ? -halfH : (fits ? cy : h - my - halfH);
+                dy += from + (to - from) * k - cy;
+            } else {
+                const double hw = halfW + (barKind == 1 ? (barW + barGap) / 2 : 0.0);
+                const bool fits = 2 * hw <= w - 2 * mx, leftward = motion == 2;
+                const double enter = leftward ? w + hw : -hw, exit = leftward ? -hw : w + hw;
+                const double from = startOff ? enter : (fits ? cx : (leftward ? mx + hw : w - mx - hw));
+                const double to = endOff ? exit : (fits ? cx : (leftward ? w - mx - hw : mx + hw));
+                dx += from + (to - from) * k - cx;
+            }
+        }
 
         // The text (typed so far), first line and the rest apart.
         int totalChars = 0;

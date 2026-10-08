@@ -1734,7 +1734,7 @@ colorspaces:
     void titleTemplatesAndAnimation() {
         Project p;
         // Every template is a Title with its own settings, listed as a generator.
-        QVERIFY(titleTemplates().size() >= 7);
+        QVERIFY(titleTemplates().size() >= 9);
         for (const TitleTemplate& tpl : titleTemplates()) {
             const EffectInfo* info = findEffectInfo(tpl.id);
             QVERIFY(info && info->category == EffectCategory::Generator);
@@ -1822,6 +1822,78 @@ colorspaces:
         // Without animation or a length, a title is unchanged throughout.
         Effect plain = makeEffect(p, "title");
         QCOMPARE(ink(renderGenerator(plain, 0, 320, 180, 1.0)).amount, ink(renderGenerator(plain, 50, 320, 180, 1.0, 60, 30)).amount);
+    }
+
+    void rollingAndCrawlingTitles() {
+        Project p;
+        QVERIFY(findTitleTemplate("title_credits") && findTitleTemplate("title_crawl"));
+        // The extent of the ink (alpha over 0.1) and how much there is.
+        struct Box {
+            int left = 1 << 30, top = 1 << 30, right = -1, bottom = -1;
+            bool empty() const { return right < 0; }
+            double cx() const { return (left + right) / 2.0; }
+            double cy() const { return (top + bottom) / 2.0; }
+        };
+        auto ink = [](const Image& img) {
+            Box b;
+            for (int y = 0; y < img.height; ++y)
+                for (int x = 0; x < img.width; ++x)
+                    if (img.at(x, y)[3] >= 0.1f) b.left = std::min(b.left, x), b.right = std::max(b.right, x), b.top = std::min(b.top, y), b.bottom = std::max(b.bottom, y);
+            return b;
+        };
+        const int W = 320, H = 180;
+        const FrameTime len = 61;
+        Effect roll = makeEffect(p, "title");
+        roll.strings["text"] = "Credits";
+        roll.params["size"] = Param(40.0);
+        roll.params["shadow"] = Param(0.0);
+        roll.params["motion"] = Param(1.0);
+        auto at = [&](const Effect& e, FrameTime t) { return ink(renderGenerator(e, t, W, H, 1.0, len, 30)); };
+        // Rolls up from below the frame to above it: nothing at either end, a steady speed between.
+        QVERIFY(at(roll, 0).empty());
+        QVERIFY(at(roll, len - 1).empty());
+        const Box mid = at(roll, 30), q1 = at(roll, 15), q3 = at(roll, 45);
+        QVERIFY(!mid.empty() && !q1.empty() && !q3.empty());
+        const double half = (mid.bottom - mid.top) / 2.0;
+        QVERIFY2(std::abs(mid.cy() - H / 2.0) <= 3, qPrintable(QString::number(mid.cy())));
+        QVERIFY(q1.cy() > mid.cy() && q3.cy() < mid.cy());
+        QVERIFY2(std::abs((q1.cy() - mid.cy()) - (mid.cy() - q3.cy())) <= 1.5, qPrintable(QString("%1 %2 %3").arg(q1.cy()).arg(mid.cy()).arg(q3.cy())));
+        // A quarter of the way: a quarter of the way from just below to just above.
+        const double travel = H + 2 * half;
+        QVERIFY2(std::abs(q1.cy() - (H / 2.0 + travel / 4)) <= 6, qPrintable(QString("%1 vs %2").arg(q1.cy()).arg(H / 2.0 + travel / 4)));
+        QCOMPARE(mid.cx(), at(roll, 20).cx());  // straight up
+        // Starting where it is laid out (it fits): in the middle on the first frame, then away.
+        Effect onScreen = roll;
+        onScreen.params["start_off"] = Param(0.0);
+        QVERIFY(std::abs(at(onScreen, 0).cy() - H / 2.0) <= 3);
+        QVERIFY(at(onScreen, len - 1).empty());
+        // Eased: slower at first than at a steady speed, and the same halfway.
+        Effect eased = roll;
+        eased.params["motion_ease"] = Param(0.5);
+        QVERIFY2(at(eased, 6).empty() || at(eased, 6).cy() > at(roll, 6).cy() + 3, "eases in");
+        QVERIFY(std::abs(at(eased, 30).cy() - mid.cy()) <= 1);
+        // Credits taller than the frame and not leaving it: the last line ends inside the title-safe area.
+        Effect tall = roll;
+        tall.strings["text"] = "One\nTwo\nThree\nFour\nFive\nSix\nSeven";
+        tall.params["end_off"] = Param(0.0);
+        const Box last = at(tall, len - 1);
+        QVERIFY2(last.bottom <= H - int(0.08 * H) + 1 && last.bottom > H - int(0.08 * H) - 12, qPrintable(QString::number(last.bottom)));
+        QVERIFY(last.bottom - last.top > H / 2);  // several lines still in view
+
+        // Crawls: right to left (the template), and left to right.
+        Effect crawl = makeEffect(p, "title_crawl");
+        crawl.strings["text"] = "Ticker";
+        const Box c1 = at(crawl, 15), c2 = at(crawl, 30);
+        QVERIFY(at(crawl, 0).empty() && at(crawl, len - 1).empty());
+        QVERIFY2(std::abs(c2.cx() - W / 2.0) <= 3, qPrintable(QString::number(c2.cx())));
+        QVERIFY(c1.cx() > c2.cx() + 20);
+        QVERIFY(std::abs(c1.cy() - c2.cy()) <= 0.5 && c2.bottom > H / 2);  // along the bottom, level
+        crawl.params["motion"] = Param(3.0);
+        QVERIFY(at(crawl, 15).cx() < W / 2.0 - 20);
+        // Still titles are unaffected by the new settings.
+        Effect still = roll;
+        still.params["motion"] = Param(0.0);
+        QCOMPARE(at(still, 0).cy(), at(still, 40).cy());
     }
 
     void renderCacheKeysAndFrames() {

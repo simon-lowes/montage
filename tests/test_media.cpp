@@ -4285,6 +4285,22 @@ private slots:
         QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
         r = tool("montage_add_title", QJsonObject{{"project", project}, {"text", "x"}, {"at", 0}, {"template", "nope"}});
         QVERIFY(r.value("isError").toBool() && text(r).contains("nope"));
+        // Rolling credits, and a title made to crawl.
+        r = tool("montage_add_title", QJsonObject{{"project", project}, {"text", "Cast\nCrew"}, {"at", 0}, {"duration", 0.3},
+                                                  {"template", "credits"}, {"track", "V4"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = tool("montage_add_title", QJsonObject{{"project", project}, {"text", "News"}, {"at", 0.3}, {"duration", 0.2},
+                                                  {"motion", "crawl_left"}, {"track", "V4"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY(tool("montage_add_title", QJsonObject{{"project", project}, {"text", "x"}, {"at", 0}, {"motion", "sideways"}}).value("isError").toBool());
+        {
+            Project withCredits;
+            QVERIFY(loadProject(project.toStdString(), withCredits));
+            const auto& v4 = withCredits.active()->videoTracks.at(3).clips;
+            QCOMPARE(v4.size(), size_t(2));
+            QCOMPARE(v4[0].generator.p("motion", 0), 1.0);
+            QCOMPARE(v4[1].generator.p("motion", 0), 2.0);
+        }
         r = tool("montage_add_marker", QJsonObject{{"project", project}, {"at", 0.1}, {"name", "Look"}});
         QVERIFY(!r.value("isError").toBool());
         Project saved;

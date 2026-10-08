@@ -660,11 +660,13 @@ void McpServer::Impl::addTools() {
     add("montage_add_title", "Add a title",
         "Add a text title over the picture at a time, for a duration (default 3 s), on a video track (default: the "
         "track above the top one in use). template picks a ready-made, animated design (a lower third takes two lines: "
-        "name, newline, role); the text replaces its sample text.",
+        "name, newline, role; credits roll up the frame, a crawl runs along the bottom); the text replaces its sample text. "
+        "motion makes any title roll or crawl, starting and ending off screen.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"text":{"type":"string"},
             "at":{"type":["number","string"]},"duration":{"type":["number","string"],"default":3},
             "track":{"type":"string"},"size":{"type":"number","description":"Font size in pixels"},
-            "template":{"type":"string","enum":["plain","lower_third","lower_third_box","centred","chapter","callout","typewriter","end_card"],"default":"plain"}},
+            "template":{"type":"string","enum":["plain","lower_third","lower_third_box","centred","chapter","callout","typewriter","end_card","credits","crawl"],"default":"plain"},
+            "motion":{"type":"string","enum":["still","roll","crawl_left","crawl_right"],"description":"Move the whole title through the frame over its duration (credits, a ticker)"}},
             "required":["project","text","at"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
@@ -684,6 +686,12 @@ void McpServer::Impl::addTools() {
             Clip c = makeGeneratorClip(l.project, type, std::max<FrameTime>(1, len));
             c.generator.strings["text"] = need(a, "text").toStdString();
             if (a.value("size").isDouble()) c.generator.params["size"] = Param(a.value("size").toDouble());
+            if (a.contains("motion")) {
+                const QStringList kinds{"still", "roll", "crawl_left", "crawl_right"};
+                const int m = int(kinds.indexOf(str(a, "motion")));
+                if (m < 0) throw ArgError{"\"motion\" is still, roll, crawl_left or crawl_right"};
+                c.generator.params["motion"] = Param(double(m));
+            }
             c.start = timeArg(a.value("at"), s, "at");
             c.name = need(a, "text").left(40).toStdString();
             const auto r = edit::overwrite(l.project, s, t, c);
