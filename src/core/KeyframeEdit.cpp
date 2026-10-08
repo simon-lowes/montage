@@ -39,6 +39,69 @@ void offsetLine(Param& p, FrameTime t, double delta, double lo, double hi) {
     shift((next - 1)->v);
 }
 
+bool easeKey(Param& p, FrameTime t, bool in, bool out) {
+    const auto it = std::find_if(p.keys.begin(), p.keys.end(), [t](const Keyframe& k) { return k.t == t; });
+    if (it == p.keys.end()) return false;
+    const size_t i = size_t(it - p.keys.begin());
+    if (in && i > 0) {
+        Keyframe& prev = p.keys[i - 1];
+        Keyframe& k = p.keys[i];
+        const double seg = double(k.t - prev.t);
+        if (prev.interp != Interp::Hold) {
+            if (prev.interp != Interp::Bezier && prev.outDt == 0 && prev.outDv == 0) {
+                // Keep how the segment left the key before: straight, or flat if it was smooth.
+                prev.outDt = seg / 3;
+                prev.outDv = prev.interp == Interp::Linear ? (k.v - prev.v) / 3 : 0;
+            }
+            prev.interp = Interp::Bezier;
+            k.inDt = -seg / 3;
+            k.inDv = 0;
+        }
+    }
+    if (out && i + 1 < p.keys.size()) {
+        Keyframe& k = p.keys[i];
+        Keyframe& next = p.keys[i + 1];
+        const double seg = double(next.t - k.t);
+        if (k.interp != Interp::Bezier && next.inDt == 0 && next.inDv == 0) {
+            next.inDt = -seg / 3;
+            next.inDv = k.interp == Interp::Linear ? -(next.v - k.v) / 3 : 0;
+        }
+        k.interp = Interp::Bezier;
+        k.outDt = seg / 3;
+        k.outDv = 0;
+    }
+    return true;
+}
+
+bool setKeyHandle(Param& p, FrameTime t, bool out, double dt, double dv, bool linked) {
+    const auto it = std::find_if(p.keys.begin(), p.keys.end(), [t](const Keyframe& k) { return k.t == t; });
+    if (it == p.keys.end()) return false;
+    const size_t i = size_t(it - p.keys.begin());
+    double inDt, inDv, outDt, outDv;
+    keyHandles(p.keys, i, inDt, inDv, outDt, outDv);
+    Keyframe& k = p.keys[i];
+    if (out) {
+        if (i + 1 >= p.keys.size()) return false;
+        k.outDt = std::clamp(dt, 0.0, double(p.keys[i + 1].t - k.t));
+        k.outDv = dv;
+        k.interp = Interp::Bezier;
+        if (linked && i > 0 && k.outDt > 1e-9) {
+            k.inDt = inDt;
+            k.inDv = k.outDv / k.outDt * inDt;
+        }
+    } else {
+        if (i == 0) return false;
+        k.inDt = std::clamp(dt, -double(k.t - p.keys[i - 1].t), 0.0);
+        k.inDv = dv;
+        p.keys[i - 1].interp = Interp::Bezier;
+        if (linked && i + 1 < p.keys.size() && k.inDt < -1e-9) {
+            k.outDt = outDt;
+            k.outDv = k.inDv / k.inDt * outDt;
+        }
+    }
+    return true;
+}
+
 FrameTime moveKey(Param& p, FrameTime from, FrameTime to, double v, FrameTime last) {
     const auto it = std::find_if(p.keys.begin(), p.keys.end(), [from](const Keyframe& k) { return k.t == from; });
     if (it == p.keys.end()) return -1;

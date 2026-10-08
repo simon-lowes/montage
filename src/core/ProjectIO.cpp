@@ -41,6 +41,7 @@ const char* interpName(Interp i) {
         case Interp::Linear: return "linear";
         case Interp::Hold: return "hold";
         case Interp::Smooth: return "smooth";
+        case Interp::Bezier: return "bezier";
     }
     return "linear";
 }
@@ -48,13 +49,18 @@ const char* interpName(Interp i) {
 Interp interpFrom(const QString& s) {
     if (s == "hold") return Interp::Hold;
     if (s == "smooth") return Interp::Smooth;
+    if (s == "bezier") return Interp::Bezier;
     return Interp::Linear;
 }
 
 QJsonValue paramToJson(const Param& p) {
     if (p.keys.empty()) return p.value;
     QJsonArray keys;
-    for (const auto& k : p.keys) keys.append(QJsonArray{double(k.t), k.v, interpName(k.interp)});
+    for (const auto& k : p.keys) {
+        QJsonArray a{double(k.t), k.v, interpName(k.interp)};
+        if (k.inDt != 0 || k.inDv != 0 || k.outDt != 0 || k.outDv != 0) a << k.inDt << k.inDv << k.outDt << k.outDv;  // Bezier handles
+        keys.append(a);
+    }
     return QJsonObject{{"value", p.value}, {"keys", keys}};
 }
 
@@ -69,8 +75,9 @@ Param paramFromJson(const QJsonValue& v) {
     for (const auto& kv : o.value("keys").toArray()) {
         QJsonArray a = kv.toArray();
         if (a.size() < 2) continue;
-        p.keys.push_back(Keyframe{FrameTime(a.at(0).toDouble()), a.at(1).toDouble(),
-                                  a.size() > 2 ? interpFrom(a.at(2).toString()) : Interp::Linear});
+        Keyframe k{FrameTime(a.at(0).toDouble()), a.at(1).toDouble(), a.size() > 2 ? interpFrom(a.at(2).toString()) : Interp::Linear};
+        if (a.size() >= 7) k.inDt = a.at(3).toDouble(), k.inDv = a.at(4).toDouble(), k.outDt = a.at(5).toDouble(), k.outDv = a.at(6).toDouble();
+        p.keys.push_back(k);
     }
     std::sort(p.keys.begin(), p.keys.end(), [](const Keyframe& a, const Keyframe& b) { return a.t < b.t; });
     return p;

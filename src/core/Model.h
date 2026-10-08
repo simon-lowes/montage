@@ -35,14 +35,22 @@ struct Rational {
 // ---------------------------------------------------------------------------
 // Keyframed parameters
 
-enum class Interp { Linear, Hold, Smooth };
+enum class Interp { Linear, Hold, Smooth, Bezier };
 
 struct Keyframe {
     FrameTime t = 0;          // relative to the start of the owning clip
     double v = 0;
     Interp interp = Interp::Linear;  // interpolation towards the next key
+    // Bezier handles, relative to the key in frames and value: the one coming in
+    // (dt <= 0, used when the key before is Bezier) and the one going out (dt >= 0,
+    // used when this key is). Both zero means automatic: smooth through the key,
+    // flat where it turns and at the ends.
+    double inDt = 0, inDv = 0, outDt = 0, outDv = 0;
     bool operator==(const Keyframe&) const = default;
 };
+
+// The handles key i actually uses (its own, or the automatic ones).
+void keyHandles(const std::vector<Keyframe>& keys, size_t i, double& inDt, double& inDv, double& outDt, double& outDv);
 
 struct Param {
     double value = 0;              // used when there are no keyframes

@@ -460,7 +460,10 @@ The second gap analysis (`docs/research/phase3-roadmap.md`, October 2026) ranks 
   - 40 pinned directions (22 into English, 18 out of it, generated into `TranslationModels.inc` with SHA-256s). Other pairs go through English. `ModelPack::parentEnv` gives a family of packs one override folder (`MONTAGE_TRANSLATION_MODELS`).
   - Captions › More › Translate Track... (a new hidden track named "<track> (German)", re-wrapped to three lines at most, word timings dropped), MCP `montage_translate_captions` (38 tools), `montage-cli translate subs.srt --to de`, and translation models in `montage-cli models`.
   - Transcript translation is left out: translated captions cover what people deliver, and Whisper already translates speech into English (`transcribe --translate`).
-- [ ] 10. Bézier keyframes and a graph editor (M)
+- [x] 10. Bézier keyframes and a graph editor (M):
+  - `Interp::Bezier` with per-key in/out handles (frames, value). Zero means automatic: Catmull-Rom slope, flat at turning points and the ends, a third of the way to each neighbour. Evaluation clamps the handle times inside the segment (so x(s) is monotonic) and solves by bisection. Saved as optional fields 4-7 of each key; older files read unchanged.
+  - `easeKey` (Ease In / Out / Easy Ease: flat handles a third of the way, keeping a straight segment's other end straight) and `setKeyHandle` (linked by default: the other handle takes the same slope, keeping its length).
+  - Keyframes panel Graph mode: curves per parameter (each scaled to its own range; one alone shows its values), keys and the handles of selected Bezier keys dragged as undoable gestures, with the ranges frozen while dragging. Box select, double-click to add on the nearest curve, Bezier in the timeline's key menu. Interchange formats carry no parameter keyframes, so there was nothing to map.
 - [ ] 11. Surround and multichannel deliverables (M–L)
 - [ ] 12. Temporal video noise reduction (M)
 - [ ] 13. Shape layers and Lottie motion graphics (M)

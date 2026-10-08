@@ -61,8 +61,9 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Keyframes on every parameter: linear, hold or smooth, with previous/next navigation
 - **Keyframes panel** (like the timeline in Premiere's Effect Controls): every animated parameter of the selected clip as a row of keys over the clip's length.
   - Click or drag a box to select keys, and drag them to retime (rows move together, without passing other keys).
-  - Arrow keys nudge (Shift for 10 frames) and Delete removes. Right-click for Linear, Hold or Smooth, and double-click adds a key.
+  - Arrow keys nudge (Shift for 10 frames) and Delete removes. Right-click for Linear, Hold, Smooth or **Bezier**, or to **Ease In**, **Ease Out** or **Easy Ease**. Double-click adds a key.
   - A click on the ruler or an empty lane moves the playhead.
+  - **Graph** shows the values as curves, like After Effects' value graph. Drag keys in time and value, and drag a Bezier key's handles to shape the curve; the two handles stay in line unless Alt is held. Click a parameter's name to see its curve alone, with its values. Bezier keys get automatic handles until one is dragged: smooth through each key, and flat where the curve turns and at the ends.
 - Volume and opacity lines on timeline clips (Sequence › Show Clip Volume / Show Clip Opacity):
   - Drag a line to raise or lower it. Ctrl/Cmd-click adds a keyframe; drag keyframes in time and value (Shift for value only).
   - Alt-click a keyframe to delete it, or right-click it for Linear, Hold or Smooth.

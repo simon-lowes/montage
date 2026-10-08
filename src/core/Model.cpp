@@ -10,6 +10,31 @@ namespace montage {
 // ---------------------------------------------------------------------------
 // Param
 
+void keyHandles(const std::vector<Keyframe>& keys, size_t i, double& inDt, double& inDv, double& outDt, double& outDv) {
+    inDt = inDv = outDt = outDv = 0;
+    if (i >= keys.size()) return;
+    const Keyframe& k = keys[i];
+    // Automatic: the slope through the neighbours, flat where the curve turns and at the ends.
+    double slope = 0;
+    if (i > 0 && i + 1 < keys.size()) {
+        const Keyframe& a = keys[i - 1];
+        const Keyframe& b = keys[i + 1];
+        if ((k.v - a.v) * (b.v - k.v) > 0 && b.t > a.t) slope = (b.v - a.v) / double(b.t - a.t);
+    }
+    if (k.inDt != 0 || k.inDv != 0) {
+        inDt = k.inDt, inDv = k.inDv;
+    } else if (i > 0) {
+        inDt = -double(k.t - keys[i - 1].t) / 3;
+        inDv = slope * inDt;
+    }
+    if (k.outDt != 0 || k.outDv != 0) {
+        outDt = k.outDt, outDv = k.outDv;
+    } else if (i + 1 < keys.size()) {
+        outDt = double(keys[i + 1].t - k.t) / 3;
+        outDv = slope * outDt;
+    }
+}
+
 double Param::at(FrameTime t) const {
     if (keys.empty()) return value;
     if (t <= keys.front().t) return keys.front().v;
@@ -20,6 +45,27 @@ double Param::at(FrameTime t) const {
     const Keyframe& a = *(it - 1);
     if (a.interp == Interp::Hold || b.t == a.t) return a.v;
     double u = double(t - a.t) / double(b.t - a.t);
+    if (a.interp == Interp::Bezier) {
+        // A cubic from a to b through a's out handle and b's in handle, their times kept
+        // inside the segment so the curve is a function of time; solved for t by bisection.
+        const size_t ia = size_t(it - keys.begin()) - 1;
+        double ai, av, aOutDt, aOutDv, bInDt, bInDv, bo1, bo2;
+        keyHandles(keys, ia, ai, av, aOutDt, aOutDv);
+        keyHandles(keys, ia + 1, bInDt, bInDv, bo1, bo2);
+        const double seg = double(b.t - a.t);
+        const double x1 = std::clamp(aOutDt, 0.0, seg) / seg, x2 = 1 + std::clamp(bInDt, -seg, 0.0) / seg;
+        const double y0 = a.v, y1 = a.v + aOutDv, y2 = b.v + bInDv, y3 = b.v;
+        auto bez = [](double p0, double p1, double p2, double p3, double s) {
+            const double r = 1 - s;
+            return r * r * r * p0 + 3 * r * r * s * p1 + 3 * r * s * s * p2 + s * s * s * p3;
+        };
+        double lo = 0, hi = 1;
+        for (int k = 0; k < 50; ++k) {
+            const double mid = 0.5 * (lo + hi);
+            (bez(0, x1, x2, 1, mid) < u ? lo : hi) = mid;
+        }
+        return bez(y0, y1, y2, y3, 0.5 * (lo + hi));
+    }
     if (a.interp == Interp::Smooth) u = u * u * (3.0 - 2.0 * u);
     return a.v + (b.v - a.v) * u;
 }

@@ -2180,6 +2180,87 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(queue->remove(longJob));
     }
 
+    void keyframeGraphEditor() {
+        loadDemo();
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        QVERIFY(state()->edit("Keys", [red](Project&, Sequence& s) {
+            Clip* c = edit::clipById(s, red);
+            c->motion.params["opacity"].addKey(0, 100);
+            c->motion.params["opacity"].addKey(30, 50);
+            c->motion.params["opacity"].addKey(50, 80);
+            return true;
+        }));
+        state()->setSelection({red}, false);
+        win_->raisePanel("keyframes");
+        auto* panel = win_->findChild<KeyframePanel*>();
+        QVERIFY(panel);
+        QTRY_VERIFY(panel->isVisible() && panel->width() > 300);
+        panel->resize(panel->width(), std::max(panel->height(), 220));
+        auto* toggle = panel->findChild<QToolButton*>("keyframeGraph");
+        QVERIFY(toggle && toggle->isCheckable());
+        toggle->click();
+        QVERIFY(panel->graph());
+        QCOMPARE(int(panel->rows().size()), 1);
+        auto opacity = [&]() -> const Param& { return edit::clipById(*state()->sequence(), red)->motion.params.at("opacity"); };
+        auto drag = [&](QPoint from, QPoint to, Qt::KeyboardModifiers mods = Qt::NoModifier) {
+            QTest::mousePress(panel, Qt::LeftButton, mods, from);
+            for (int i = 1; i <= 4; ++i) {
+                const QPoint at = from + (to - from) * i / 4;
+                QMouseEvent move(QEvent::MouseMove, at, panel->mapToGlobal(at), Qt::NoButton, Qt::LeftButton, mods);
+                QApplication::sendEvent(panel, &move);
+            }
+            QTest::mouseRelease(panel, Qt::LeftButton, mods, to);
+        };
+        // The keys sit on the curve at their values: 100 above 80 above 50.
+        const QPointF k0 = panel->graphPoint(0, 0), k30 = panel->graphPoint(0, 30), k50 = panel->graphPoint(0, 50);
+        QVERIFY(k0.y() < k50.y() && k50.y() < k30.y());
+        // Drag the middle key up to the last key's height and later: one undo step moves it in time and value.
+        const QPoint target(int(panel->graphPoint(0, 36).x()), int(k50.y()));
+        drag(k30.toPoint(), target);
+        const Param& moved = opacity();
+        QCOMPARE(moved.keys.size(), size_t(3));
+        QVERIFY2(std::llabs(moved.keys[1].t - 36) <= 1, qPrintable(QString::number(moved.keys[1].t)));
+        QVERIFY2(std::fabs(moved.keys[1].v - 80) < 3, qPrintable(QString::number(moved.keys[1].v)));
+        state()->undo();
+        QCOMPARE(opacity().keys[1].t, FrameTime(30));
+        QCOMPARE(opacity().keys[1].v, 50.0);
+
+        // Easy Ease from the menu on the middle key; its handles then show and can be dragged.
+        panel->select({{panel->rows()[0].address, 30}});
+        QVERIFY(panel->easeSelected(true, true));
+        QCOMPARE(opacity().keys[0].interp, Interp::Bezier);
+        QCOMPARE(opacity().keys[1].interp, Interp::Bezier);
+        QCOMPARE(opacity().keys[1].inDv, 0.0);
+        QCOMPARE(opacity().keys[1].outDv, 0.0);
+        panel->select({{panel->rows()[0].address, 30}});
+        const QPointF h = panel->handlePoint(0, 30, true);
+        QVERIFY(h.x() > panel->graphPoint(0, 30).x());
+        QVERIFY(std::fabs(h.y() - panel->graphPoint(0, 30).y()) < 1.5);  // flat
+        // Pull the out handle upwards: the curve rises sooner after the key, and the in handle follows (linked).
+        const double before = opacity().at(34);
+        drag(h.toPoint(), h.toPoint() + QPoint(0, -40));
+        QVERIFY(opacity().keys[1].outDv > 0);
+        QVERIFY(opacity().keys[1].inDv < 0);  // the same slope on the other side
+        QVERIFY(opacity().at(34) > before);
+        // Alt breaks the handles: dragging the in handle leaves the out one where it was.
+        const double out = opacity().keys[1].outDv;
+        panel->select({{panel->rows()[0].address, 30}});
+        const QPointF hin = panel->handlePoint(0, 30, false);
+        drag(hin.toPoint(), hin.toPoint() + QPoint(0, 30), Qt::AltModifier);
+        QCOMPARE(opacity().keys[1].outDv, out);
+        // All of it undoes step by step.
+        state()->undo();
+        state()->undo();
+        state()->undo();
+        QCOMPARE(opacity().keys[1].interp, Interp::Linear);
+        // Clicking the row's label shows its curve alone.
+        QTest::mouseClick(panel, Qt::LeftButton, Qt::NoModifier, QPoint(40, panel->keyPoint(0, 0).y()));
+        QCOMPARE(panel->graphRow(), 0);
+        toggle->click();
+        QVERIFY(!panel->graph());
+        state()->newProject();
+    }
+
     void keyframePanelEditsKeys() {
         loadDemo();
         const Id red = clipNamed(*state()->sequence(), "Red")->id;

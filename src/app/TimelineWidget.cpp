@@ -862,7 +862,10 @@ void TimelineWidget::laneMenu(QMenu& menu, const LaneHit& h) {
         });
     })->setObjectName(QStringLiteral("deleteKeyframe"));
     menu.addSeparator();
-    const std::pair<Interp, QString> kinds[] = {{Interp::Linear, tr("Linear")}, {Interp::Hold, tr("Hold")}, {Interp::Smooth, tr("Smooth (Ease In and Out)")}};
+    const std::pair<Interp, QString> kinds[] = {{Interp::Linear, tr("Linear")},
+                                                {Interp::Hold, tr("Hold")},
+                                                {Interp::Smooth, tr("Smooth (Ease In and Out)")},
+                                                {Interp::Bezier, tr("Bezier")}};
     for (const auto& [interp, name] : kinds) {
         QAction* a = menu.addAction(name, this, [this, id, lane, key, interp = interp] {
             state_->edit(tr("Keyframe Interpolation"), [id, lane, key, interp](Project&, Sequence& s) {

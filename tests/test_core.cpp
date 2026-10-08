@@ -1119,6 +1119,78 @@ private slots:
         QVERIFY(autoTags(unsure, labels).keywords.empty());
     }
 
+    void bezierKeyframes() {
+        // Automatic handles on two keys are flat at the ends: an S-curve through the middle.
+        Param p;
+        p.addKey(0, 0, Interp::Bezier);
+        p.addKey(30, 100);
+        QVERIFY(std::fabs(p.at(15) - 50) < 1e-6);
+        QVERIFY(p.at(5) < 100.0 * 5 / 30 - 5);
+        QVERIFY(p.at(25) > 100.0 * 25 / 30 + 5);
+        for (FrameTime t = 1; t < 30; ++t) QVERIFY(p.at(t) > p.at(t - 1));  // no overshoot, always rising
+        // Handles along the straight line give the straight line.
+        p.keys[0].outDt = 10, p.keys[0].outDv = 100.0 / 3;
+        p.keys[1].inDt = -10, p.keys[1].inDv = -100.0 / 3;
+        for (FrameTime t : {3, 7, 18, 29}) QVERIFY(std::fabs(p.at(t) - 100.0 * double(t) / 30) < 1e-6);
+        // Handles reaching past the segment are held inside it (the curve stays a function of time).
+        p.keys[0].outDt = 500, p.keys[0].outDv = 0;
+        QVERIFY(p.at(29) <= 100 + 1e-9 && p.at(1) >= 0);
+        // Three keys in a row: the middle one is passed straight through; at a peak it is flat.
+        Param line;
+        for (FrameTime t : {0, 10, 20}) line.addKey(t, double(t), Interp::Bezier);
+        QVERIFY(std::fabs((line.at(11) - line.at(9)) / 2 - 1) < 0.1);          // about the line's slope at the middle key
+        QVERIFY(std::fabs(line.at(5) + line.at(15) - 20) < 1e-6);             // and the curve symmetric about it
+        Param peak;
+        peak.addKey(0, 0, Interp::Bezier);
+        peak.addKey(10, 10, Interp::Bezier);
+        peak.addKey(20, 0);
+        QCOMPARE(peak.at(10), 10.0);
+        QVERIFY(peak.at(9) < 10 && peak.at(9) > 9.5 && std::fabs(peak.at(9) - peak.at(11)) < 1e-9);
+
+        // Ease In on the end of a straight move: it leaves as before and arrives slowly.
+        Param move;
+        move.addKey(0, 0);
+        move.addKey(30, 90);
+        QVERIFY(easeKey(move, 30, true, false));
+        QCOMPARE(move.keys[0].interp, Interp::Bezier);
+        QVERIFY(std::fabs(move.at(1) - 3) < 0.6);    // the straight start (3 a frame)
+        QVERIFY(90 - move.at(29) < 1.0);             // flat at the end
+        QVERIFY(!easeKey(move, 12, true, true));     // no key there
+        // Ease Out of the first key of a smooth move: both ends flat now.
+        Param smooth;
+        smooth.addKey(0, 0, Interp::Smooth);
+        smooth.addKey(30, 90);
+        QVERIFY(easeKey(smooth, 0, false, true));
+        QVERIFY(std::fabs(smooth.at(15) - 45) < 1e-6);
+        QVERIFY(smooth.at(1) < 1.0 && 90 - smooth.at(29) < 1.0);
+
+        // Dragging a handle: linked, the other side takes the same slope (keeping its length).
+        Param three;
+        for (FrameTime t : {0, 15, 30}) three.addKey(t, 0, Interp::Bezier);
+        QVERIFY(setKeyHandle(three, 15, true, 5, 10, true));
+        QCOMPARE(three.keys[1].outDt, 5.0);
+        QCOMPARE(three.keys[1].outDv, 10.0);
+        QCOMPARE(three.keys[1].inDt, -5.0);
+        QCOMPARE(three.keys[1].inDv, -10.0);
+        QVERIFY(three.at(20) > 0 && three.at(10) < 0);
+        QVERIFY(setKeyHandle(three, 15, false, -100, 3, false));  // held within the segment, the other side kept
+        QCOMPARE(three.keys[1].inDt, -15.0);
+        QCOMPARE(three.keys[1].outDv, 10.0);
+        QVERIFY(!setKeyHandle(three, 0, false, -1, 0, false));    // the first key has no incoming segment
+
+        // Saved and read back with the handles; older files without them still read.
+        Fixture fx;
+        const Id clip = fx.put(V1, 0, 40);
+        edit::clipById(fx.s(), clip)->motion.params["opacity"] = three;
+        Project back;
+        QVERIFY(projectFromJson(projectToJson(fx.p), back));
+        QCOMPARE(edit::clipById(*back.active(), clip)->motion.params.at("opacity"), three);
+        Clip old;
+        QVERIFY(clipFromJsonString(R"({"id":5,"name":"x","start":0,"duration":10,"motion":{"type":"motion","params":{"opacity":{"value":1,"keys":[[0,1,"smooth"],[9,0]]}}}})", old));
+        QCOMPARE(old.motion.params.at("opacity").keys[0].interp, Interp::Smooth);
+        QCOMPARE(old.motion.params.at("opacity").keys[0].outDt, 0.0);
+    }
+
     void scriptCut() {
         // A screenplay: cues above the words, "Name:" lines, and things to skip.
         const std::string script = "INT. KITCHEN - DAY\n\nJOHN\nI never thought we would make it this far.\n\n"

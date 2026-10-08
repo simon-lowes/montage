@@ -27,6 +27,17 @@ void offsetLine(Param& p, FrameTime t, double delta, double lo, double hi);
 // within [0, last], with value v. Returns its new time, or -1 if no key is at `from`.
 FrameTime moveKey(Param& p, FrameTime from, FrameTime to, double v, FrameTime last);
 
+// Easing (After Effects' Easy Ease): the key's value arrives (`in`) and/or
+// leaves (`out`) slowly, with flat Bezier handles a third of the way to the
+// neighbouring key. A straight segment it touches keeps its straight start.
+// False if no key is at t.
+bool easeKey(Param& p, FrameTime t, bool in, bool out);
+// Puts one of a key's handles (the outgoing one, or the incoming) at
+// (dt, dv) from the key, turning the segment it shapes to Bezier. With
+// `linked` the other handle turns to the same slope, keeping its length, so
+// the curve stays smooth through the key. False if no key is at t.
+bool setKeyHandle(Param& p, FrameTime t, bool out, double dt, double dv, bool linked);
+
 // Which of a clip's parameters: one of its fixed attributes, its generator,
 // or one of its effects (by id).
 enum class ParamSlot { Motion, Audio, Timing, Generator, Effect };
