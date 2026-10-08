@@ -71,6 +71,9 @@ AVPixelFormat defaultPixFmt(const ExportSettings& s, const std::string& c) {
     if (c == "dnxhd") return (s.profile == "dnxhr_444") ? AV_PIX_FMT_YUV444P10LE
                              : (s.profile == "dnxhr_hqx") ? AV_PIX_FMT_YUV422P10LE
                                                           : AV_PIX_FMT_YUV422P;
+    if (c == "cfhd") return s.alpha ? AV_PIX_FMT_GBRAP12LE : AV_PIX_FMT_YUV422P10LE;
+    if (c == "v210") return AV_PIX_FMT_YUV422P10LE;
+    if (c == "ffv1") return s.alpha ? AV_PIX_FMT_YUVA444P10LE : AV_PIX_FMT_YUV422P10LE;
     if (c == "mjpeg") return AV_PIX_FMT_YUVJ420P;
     if (c == "libvpx-vp9" && s.alpha) return AV_PIX_FMT_YUVA420P;
     if (c == "png") return s.alpha ? AV_PIX_FMT_RGBA : AV_PIX_FMT_RGB24;
@@ -212,13 +215,34 @@ const std::vector<ExportPreset>& exportPresets() {
         v.push_back(preset("H.265 / HEVC", "mp4", "Half the size of H.264 at similar quality", "libx265", "aac", 22, "medium"));
         v.push_back(preset("H.265 / HEVC 10-bit", "mp4", "10-bit HEVC for HDR-ready masters", "libx265", "aac", 20, "medium", "", "yuv420p10le"));
         v.push_back(preset("Apple ProRes 422 HQ", "mov", "Intermediate / mastering, 10-bit 4:2:2", "prores_ks", "pcm_s24le", 0, "", "hq"));
+        v.push_back(preset("Apple ProRes 422", "mov", "Standard ProRes, 10-bit 4:2:2", "prores_ks", "pcm_s24le", 0, "", "standard"));
         v.push_back(preset("Apple ProRes 422 LT", "mov", "Lighter ProRes for offline / proxies", "prores_ks", "pcm_s16le", 0, "", "lt"));
+        v.push_back(preset("Apple ProRes 422 Proxy", "mov", "The smallest ProRes, for offline editing", "prores_ks", "pcm_s16le", 0, "", "proxy"));
         {
             ExportPreset p = preset("Apple ProRes 4444 (alpha)", "mov", "Keeps transparency for graphics", "prores_ks", "pcm_s24le", 0, "", "4444");
             p.settings.alpha = true;
             v.push_back(p);
+            ExportPreset xq = preset("Apple ProRes 4444 XQ (alpha)", "mov", "The highest-quality ProRes, with transparency", "prores_ks",
+                                     "pcm_s24le", 0, "", "4444xq");
+            xq.settings.alpha = true;
+            v.push_back(xq);
         }
         v.push_back(preset("Avid DNxHR HQ", "mov", "Avid-friendly 8-bit 4:2:2 intermediate", "dnxhd", "pcm_s24le", 0, "", "dnxhr_hq"));
+        v.push_back(preset("Avid DNxHR SQ", "mov", "Avid 8-bit 4:2:2, standard quality", "dnxhd", "pcm_s24le", 0, "", "dnxhr_sq"));
+        v.push_back(preset("Avid DNxHR LB", "mov", "Avid 8-bit 4:2:2, low bandwidth for offline", "dnxhd", "pcm_s16le", 0, "", "dnxhr_lb"));
+        v.push_back(preset("Avid DNxHR HQX (10-bit)", "mov", "Avid 10-bit 4:2:2 for finishing and HDR", "dnxhd", "pcm_s24le", 0, "", "dnxhr_hqx"));
+        v.push_back(preset("Avid DNxHR 444 (10-bit)", "mov", "Avid 10-bit 4:4:4 for finishing and keying", "dnxhd", "pcm_s24le", 0, "", "dnxhr_444"));
+        {
+            ExportPreset cf = preset("GoPro CineForm", "mov", "Wavelet intermediate, 10-bit 4:2:2 (12-bit RGB with alpha)", "cfhd", "pcm_s24le", 0, "");
+            v.push_back(cf);
+            cf.name = "GoPro CineForm (alpha)";
+            cf.description = "CineForm 12-bit RGBA, keeping transparency";
+            cf.settings.alpha = true;
+            v.push_back(cf);
+        }
+        v.push_back(preset("FFV1 (lossless archive)", "mkv", "Mathematically lossless 10-bit 4:2:2 with FLAC sound, for archiving", "ffv1", "flac", 0,
+                           "", "", "yuv422p10le"));
+        v.push_back(preset("Uncompressed 10-bit (v210)", "mov", "Uncompressed 10-bit 4:2:2, for broadcast ingest", "v210", "pcm_s24le", 0, ""));
         v.push_back(preset("VP9 (WebM)", "webm", "Open web format, Opus audio", "libvpx-vp9", "libopus", 32, "good"));
         v.push_back(preset("AV1 (SVT-AV1)", "mp4", "Next-generation efficiency", "libsvtav1", "aac", 32, "8"));
         {
@@ -553,6 +577,11 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         } else if (c == "libsvtav1") {
             if (s.videoBitrate <= 0) av_dict_set_int(&opts, "crf", s.crf, 0);
             av_dict_set(&opts, "preset", s.preset.empty() ? "8" : s.preset.c_str(), 0);
+        } else if (c == "ffv1") {
+            // The archival settings (as the Library of Congress recommends): version 3, intra-only, per-slice CRCs.
+            av_dict_set(&opts, "level", "3", 0);
+            av_dict_set(&opts, "slicecrc", "1", 0);
+            o.vctx->gop_size = 1;
         } else if (c == "mjpeg") {
             o.vctx->flags |= AV_CODEC_FLAG_QSCALE;
             o.vctx->global_quality = FF_QP2LAMBDA * 3;

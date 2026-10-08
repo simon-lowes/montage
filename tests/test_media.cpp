@@ -86,6 +86,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/mastering_display_metadata.h>
+#include <libavutil/pixdesc.h>
 }
 
 using namespace montage;
@@ -1954,6 +1955,109 @@ private slots:
         QVERIFY(!exportSequence(p, s, tiff, nullptr, nullptr, &err));
         // The social presets normalise to -14 LUFS.
         QCOMPARE(findExportPreset("Social - TikTok / Reels / Shorts")->settings.loudnessTarget, -14.0);
+    }
+
+    void masteringCodecs() {
+        // A short sequence: colour bars, a title on transparency above, the JFK clip's sound.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = {25, 1};
+        Clip bars = makeGeneratorClip(p, "bars", 10);
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, bars).ok);
+        MediaItem speech = probeOrFail(p, MONTAGE_TEST_DATA_DIR "/jfk.wav");
+        p.media.push_back(speech);
+        QVERIFY(edit::placeMedia(p, s, speech.id, 0, 0, 10, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Project overlay = p;
+        Sequence& os = *overlay.active();
+        os.videoTracks[0].clips.clear();
+        Clip title = makeGeneratorClip(overlay, "title", 10);
+        QVERIFY(edit::overwrite(overlay, os, {TrackKind::Video, 0}, title).ok);
+        // What a file holds: video codec, its profile, pixel format, and the audio codec.
+        struct Info {
+            std::string codec, profile, pix, audio;
+        };
+        auto info = [](const std::string& file) {
+            Info r;
+            AVFormatContext* fmt = nullptr;
+            if (avformat_open_input(&fmt, file.c_str(), nullptr, nullptr) < 0) return r;
+            avformat_find_stream_info(fmt, nullptr);
+            for (unsigned i = 0; i < fmt->nb_streams; ++i) {
+                const AVCodecParameters* cp = fmt->streams[i]->codecpar;
+                if (cp->codec_type == AVMEDIA_TYPE_VIDEO) {
+                    r.codec = avcodec_get_name(cp->codec_id);
+                    if (const char* pr = avcodec_profile_name(cp->codec_id, cp->profile)) r.profile = pr;
+                    if (const char* pf = av_get_pix_fmt_name(AVPixelFormat(cp->format))) r.pix = pf;
+                } else if (cp->codec_type == AVMEDIA_TYPE_AUDIO) {
+                    r.audio = avcodec_get_name(cp->codec_id);
+                }
+            }
+            avformat_close_input(&fmt);
+            return r;
+        };
+        RenderOptions ro;
+        const Image ref = renderProgramFrame(p, s, 4, ro);
+        auto meanDiff = [&](const std::string& file) {
+            VideoDecoder dec;
+            if (!dec.open(file)) return 1.0;
+            const Frame16Ptr f = dec.frameAt(4.0 / 25 + 0.001);
+            if (!f) return 1.0;
+            const Image got = toImage(*f);
+            double d = 0;
+            for (int y = 0; y < ref.height; ++y)
+                for (int x = 0; x < ref.width; ++x)
+                    for (int c = 0; c < 3; ++c) d += std::abs(got.at(x, y)[c] - ref.at(x, y)[c]);
+            return d / (double(ref.width) * ref.height * 3);
+        };
+        struct Want {
+            const char* preset;
+            const char* codec;
+            const char* profile;  // "" = not checked
+            const char* pix;
+            const char* audio;
+            double tolerance;
+        };
+        const Want wants[] = {
+            {"Apple ProRes 422", "prores", "Standard", "yuv422p10le", "pcm_s24le", 0.012},
+            {"Apple ProRes 422 Proxy", "prores", "Proxy", "yuv422p10le", "pcm_s16le", 0.03},
+            {"Apple ProRes 4444 XQ (alpha)", "prores", "XQ", "yuva444p12le", "pcm_s24le", 0.012},  // decoded as 12-bit
+            {"Avid DNxHR SQ", "dnxhd", "DNXHR SQ", "yuv422p", "pcm_s24le", 0.02},
+            {"Avid DNxHR LB", "dnxhd", "DNXHR LB", "yuv422p", "pcm_s16le", 0.04},
+            {"Avid DNxHR HQX (10-bit)", "dnxhd", "DNXHR HQX", "yuv422p10le", "pcm_s24le", 0.012},
+            {"Avid DNxHR 444 (10-bit)", "dnxhd", "DNXHR 444", "yuv444p10le", "pcm_s24le", 0.012},
+            {"GoPro CineForm", "cfhd", "", "yuv422p10le", "pcm_s24le", 0.02},
+            {"FFV1 (lossless archive)", "ffv1", "", "yuv422p10le", "flac", 0.006},
+            {"Uncompressed 10-bit (v210)", "v210", "", "yuv422p10le", "pcm_s24le", 0.006},
+        };
+        std::string err;
+        for (const Want& w : wants) {
+            const ExportPreset* pr = findExportPreset(w.preset);
+            QVERIFY2(pr, w.preset);
+            ExportSettings st = pr->settings;
+            st.path = path((std::string("master-") + std::to_string(&w - wants) + "." + pr->extension).c_str());
+            QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), qPrintable(QString("%1: %2").arg(w.preset, err.c_str())));
+            const Info in = info(st.path);
+            QVERIFY2(in.codec == w.codec && in.audio == w.audio && (in.pix == w.pix || (std::string(w.codec) == "v210")),
+                     qPrintable(QString("%1: %2 %3 %4").arg(w.preset, in.codec.c_str(), in.pix.c_str(), in.audio.c_str())));
+            if (*w.profile) QVERIFY2(in.profile == w.profile, qPrintable(QString("%1: profile %2").arg(w.preset, in.profile.c_str())));
+            const double d = meanDiff(st.path);
+            QVERIFY2(d < w.tolerance, qPrintable(QString("%1: mean difference %2").arg(w.preset).arg(d)));
+        }
+        // Transparency survives CineForm RGBA and ProRes 4444 XQ: clear round the title, solid on it.
+        for (const char* name : {"GoPro CineForm (alpha)", "Apple ProRes 4444 XQ (alpha)"}) {
+            ExportSettings st = findExportPreset(name)->settings;
+            st.path = path((std::string("alpha-") + (name[0] == 'G' ? "cfhd" : "xq") + ".mov").c_str());
+            st.audioCodec = "none";
+            QVERIFY2(exportSequence(overlay, os, st, nullptr, nullptr, &err), err.c_str());
+            if (name[0] == 'G') QCOMPARE(QString::fromStdString(info(st.path).pix), QString("gbrap12le"));
+            VideoDecoder dec;
+            QVERIFY(dec.open(st.path));
+            const Image got = toImage(*dec.frameAt(0.16));
+            QVERIFY2(got.at(5, 5)[3] < 0.02f, name);
+            int solid = 0;
+            for (int y = 0; y < got.height; ++y)
+                for (int x = 0; x < got.width; ++x) solid += got.at(x, y)[3] > 0.98f;
+            QVERIFY2(solid > 50, name);
+        }
     }
 
     void motionBlurAndDeflicker() {

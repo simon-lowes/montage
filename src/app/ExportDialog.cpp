@@ -60,6 +60,7 @@ QString videoCodecName(const ExportSettings& s) {
         if (s.profile == "hq") return QStringLiteral("ProRes 422 HQ");
         if (s.profile == "lt") return QStringLiteral("ProRes 422 LT");
         if (s.profile == "proxy") return QStringLiteral("ProRes 422 Proxy");
+        if (s.profile == "4444xq") return QStringLiteral("ProRes 4444 XQ");
         if (s.profile.rfind("4444", 0) == 0) return QStringLiteral("ProRes 4444");
         return QStringLiteral("ProRes 422");
     }
@@ -70,6 +71,9 @@ QString videoCodecName(const ExportSettings& s) {
     if (c == "libvpx-vp9") return QStringLiteral("VP9");
     if (c == "libsvtav1") return QStringLiteral("AV1");
     if (c == "mjpeg") return QStringLiteral("Motion JPEG");
+    if (c == "cfhd") return s.alpha ? QStringLiteral("CineForm RGBA") : QStringLiteral("CineForm");
+    if (c == "ffv1") return QStringLiteral("FFV1 (lossless)");
+    if (c == "v210") return QStringLiteral("Uncompressed 10-bit");
     return QString::fromStdString(c);
 }
 
@@ -80,6 +84,7 @@ QString audioCodecName(const ExportSettings& s) {
     if (c == "libopus") return QStringLiteral("Opus %1 kb/s").arg(kbps);
     if (c == "pcm_s16le") return QStringLiteral("PCM 16-bit");
     if (c == "pcm_s24le") return QStringLiteral("PCM 24-bit");
+    if (c == "flac") return QStringLiteral("FLAC (lossless)");
     return QString::fromStdString(c);
 }
 
