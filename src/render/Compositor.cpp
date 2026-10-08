@@ -28,6 +28,7 @@
 #include "core/History.h"
 #include "media/MediaPool.h"
 #include "media/DepthMap.h"
+#include "media/Matting.h"
 #include "media/Rife.h"
 #include "media/SuperScale.h"
 
@@ -594,6 +595,12 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
         depthModel().installed())
         depth = cachedDepth(src);
     DepthScope depthScope(depth);
+    // And the people in it, for Remove Background and People masks.
+    std::shared_ptr<const ValueMap> people;
+    if (std::any_of(c.effects.begin(), c.effects.end(), [&](const Effect& e) { return needsPersonMatte(e, lt); }) && mattingAvailable() &&
+        mattingModel().installed())
+        people = cachedPersonMatte(src);
+    PersonScope personScope(people);
     for (const auto& e : c.effects)
         if (e.type != "video_denoise" && e.type != "super_scale") applyVideoEffect(e, lt, src, pixelScale, sourceSeconds);  // those ran on the source
     if (identityLayer(src, g, SW, SH, o.scale)) return src;  // a full-frame clip: no copy

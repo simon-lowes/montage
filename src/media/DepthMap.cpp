@@ -39,7 +39,7 @@ const ModelPack& depthModel() {
     return pack;
 }
 
-float DepthMap::at(double u, double v) const {
+float ValueMap::at(double u, double v) const {
     if (empty()) return 0;
     const double x = std::clamp(u * width - 0.5, 0.0, double(width - 1)), y = std::clamp(v * height - 0.5, 0.0, double(height - 1));
     const int x0 = int(x), y0 = int(y), x1 = std::min(x0 + 1, width - 1), y1 = std::min(y0 + 1, height - 1);
@@ -50,7 +50,7 @@ float DepthMap::at(double u, double v) const {
     return a + (b - a) * fy;
 }
 
-std::vector<float> DepthMap::resized(int w, int h) const {
+std::vector<float> ValueMap::resized(int w, int h) const {
     std::vector<float> out(size_t(std::max(0, w)) * size_t(std::max(0, h)), 0.0f);
     if (empty()) return out;
     for (int y = 0; y < h; ++y)

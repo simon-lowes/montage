@@ -30,6 +30,8 @@ add_library(montage_engine STATIC
   media/SuperScale.h media/SuperScale.cpp
   media/Faces.h media/Faces.cpp
   media/DepthMap.h media/DepthMap.cpp
+  media/Matting.h media/Matting.cpp
+  media/ValueMap.h
   media/Rife.h media/Rife.cpp
   media/HwAccel.h media/HwAccel.cpp
   media/MediaPool.h media/MediaPool.cpp

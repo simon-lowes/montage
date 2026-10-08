@@ -1,6 +1,7 @@
 #include "Effects.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 
 #include "render/ColorSpace.h"
@@ -191,6 +192,11 @@ std::vector<EffectInfo> buildCatalog() {
     c.push_back({"luma_key", "Luma Key", EffectCategory::VideoFilter, "Keying",
                  {num("threshold", "Threshold", 0, 1, 0.1), num("softness", "Softness", 0, 1, 0.05),
                   boolean("invert", "Key Out Brights")},
+                 {}});
+    // People cut out of their background (MODNet on the clip's source frame), keeping hair and soft edges.
+    c.push_back({"remove_background", "Remove Background", EffectCategory::VideoFilter, "Keying",
+                 {choice("keep", "Keep", {"People", "Background"}), num("shift", "Edge Shift (px)", -20, 20, 0, 0.5),
+                  num("soften", "Soften (px)", 0, 20, 0, 0.5)},
                  {}});
     c.push_back({"gaussian_blur", "Gaussian Blur", EffectCategory::VideoFilter, "Blur & Sharpen",
                  {num("radius", "Radius (px)", 0, 250, 10, 0.5),
@@ -462,7 +468,7 @@ std::vector<EffectInfo> buildCatalog() {
 const EffectInfo& maskInfo() {
     static const EffectInfo info = [] {
         EffectInfo m{"mask", "Mask", EffectCategory::Fixed, "Mask", {}, {}, true};
-        m.params = {choice("mask.shape", "Shape", {"None", "Ellipse", "Rectangle", "Object"}, 0),
+        m.params = {choice("mask.shape", "Shape", {"None", "Ellipse", "Rectangle", "Object", "People"}, 0),
                     num("mask.x", "Center X", -0.5, 1.5, 0.5, 0.001),
                     num("mask.y", "Center Y", -0.5, 1.5, 0.5, 0.001),
                     num("mask.w", "Width", 0.001, 2, 0.4, 0.001),
@@ -497,6 +503,11 @@ bool supportsMask(const std::string& effectType) {
 
 bool hasMask(const Effect& e, FrameTime t) {
     return e.p("mask.shape", t) > 0.5 || e.p("mask.qualify", t) > 0.5 || e.p("mask.depth", t) > 0.5;
+}
+
+bool needsPersonMatte(const Effect& e, FrameTime t) {
+    if (!e.enabled) return false;
+    return e.type == "remove_background" || std::lround(e.p("mask.shape", t)) == 4;
 }
 
 bool needsDepth(const Effect& e, FrameTime t) {

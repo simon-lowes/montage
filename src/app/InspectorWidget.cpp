@@ -29,6 +29,7 @@
 #include "EditorState.h"
 #include "ModelPacks.h"
 #include "media/DepthMap.h"
+#include "media/Matting.h"
 #include "media/Rife.h"
 #include "PluginEditorWindow.h"
 #include "Theme.h"
@@ -559,6 +560,17 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
                     });
                 });
                 mf->addRow(tr("Depth:"), get);
+            }
+            if (std::lround(e.p("mask.shape", localTime())) == 4 && mattingAvailable() && !mattingModel().installed()) {
+                // A People mask selects nothing until the model is here.
+                auto* get = new QPushButton(tr("Download People Model…"), content_);
+                get->setObjectName(QStringLiteral("getMatteModel"));
+                connect(get, &QPushButton::clicked, this, [this] {
+                    QTimer::singleShot(0, this, [this] {
+                        if (ensureEffectModel(window(), "mask.people")) state_->amend([](Project&, Sequence&) { return true; });
+                    });
+                });
+                mf->addRow(tr("People:"), get);
             }
             if (onClip && std::lround(e.p("mask.shape", localTime())) == 3) {
                 // An object picked in the viewer, then followed through the clip.

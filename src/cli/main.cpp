@@ -37,6 +37,7 @@
 #include "media/Faces.h"
 #include "media/DepthMap.h"
 #include "media/Rife.h"
+#include "media/Matting.h"
 #include "media/Transcriber.h"
 #endif
 #include "render/ColorSpace.h"
@@ -631,6 +632,11 @@ int cmdModels() {
     else
         std::printf("  %-22s %6.1f MB  %s\n", rifeModel().id.c_str(), double(rifeModel().bytes()) / 1e6,
                     rifeModel().installed() ? "downloaded" : "");
+    std::printf("\nPeople model (MODNet, for Remove Background and People masks; folder: %s)\n", mattingModel().directory().c_str());
+    if (!mattingAvailable()) std::printf("  unavailable: this build has no ONNX Runtime\n");
+    else
+        std::printf("  %-22s %6.1f MB  %s\n", mattingModel().id.c_str(), double(mattingModel().bytes()) / 1e6,
+                    mattingModel().installed() ? "downloaded" : "");
     return 0;
 }
 

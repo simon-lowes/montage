@@ -21,6 +21,7 @@ void applyVideoEffect(const Effect& e, FrameTime t, Image& img, double pixelScal
 // effects and depth qualifiers: set by the compositor for the effects of one
 // clip on this thread, null when there is none.
 struct DepthMap;
+struct ValueMap;
 const DepthMap* currentDepth();
 class DepthScope {
 public:
@@ -32,6 +33,21 @@ public:
 private:
     std::shared_ptr<const DepthMap> previous_;
 };
+// The same for the people in the frame (media/Matting.h): Remove Background and People masks.
+const ValueMap* currentPersonMatte();
+class PersonScope {
+public:
+    explicit PersonScope(std::shared_ptr<const ValueMap> matte);
+    ~PersonScope();
+    PersonScope(const PersonScope&) = delete;
+    PersonScope& operator=(const PersonScope&) = delete;
+
+private:
+    std::shared_ptr<const ValueMap> previous_;
+};
+// A soft matte's edge moved out by `expand` px (re-edged by distance, softened over
+// `feather`), or else blurred by `blur` px; unchanged when both are zero.
+void refineMatte(std::vector<float>& matte, int w, int h, double expand, double feather, double blur);
 
 // The effect's mask (Effects.h maskInfo) over `img` as one value in 0..1 per
 // pixel; the qualifier reads the colours of `img`, the depth qualifier

@@ -69,6 +69,7 @@
 #include "media/Faces.h"
 #include "media/DepthMap.h"
 #include "media/Rife.h"
+#include "media/Matting.h"
 #include "ShotSearchPanel.h"
 #include "PeoplePanel.h"
 #include "media/Segmenter.h"
@@ -1654,6 +1655,30 @@ private slots:
         state()->setSelection({});
         state()->setSelection({red});
         QTRY_VERIFY(!win_->findChild<QPushButton*>("getDepthModel"));
+    }
+
+    void peopleMaskOffersItsModel() {
+        if (!mattingAvailable()) QSKIP("Built without ONNX Runtime");
+        loadDemo();
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        QVERIFY(state()->edit("People", [red](Project& p, Sequence& s) {
+            Effect e = makeEffect(p, "color_correct");
+            e.params["mask.shape"] = Param(4.0);
+            edit::clipById(s, red)->effects.push_back(e);
+            return true;
+        }));
+        const QByteArray saved = qgetenv("MONTAGE_MATTE_MODEL");
+        qputenv("MONTAGE_MATTE_MODEL", (dir_.path() + "/no-matte").toUtf8());
+        state()->setSelection({});
+        state()->setSelection({red});
+        QTRY_VERIFY(win_->findChild<QPushButton*>("getMatteModel"));
+        if (saved.isEmpty()) qunsetenv("MONTAGE_MATTE_MODEL");
+        else qputenv("MONTAGE_MATTE_MODEL", saved);
+        if (!mattingModel().installed()) QSKIP("Set MONTAGE_MATTE_MODEL to test with the model");
+        QVERIFY(ensureEffectModel(win_.get(), "remove_background"));
+        state()->setSelection({});
+        state()->setSelection({red});
+        QTRY_VERIFY(!win_->findChild<QPushButton*>("getMatteModel"));
     }
 
     void aiFramesOfferTheirModel() {

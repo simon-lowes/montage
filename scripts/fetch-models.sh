@@ -9,6 +9,7 @@
 #   <dir>/faces          Find People        (MONTAGE_FACE_MODEL)
 #   <dir>/depth          depth effects      (MONTAGE_DEPTH_MODEL)
 #   <dir>/rife           AI slow motion     (MONTAGE_RIFE_MODEL)
+#   <dir>/matte          Remove Background  (MONTAGE_MATTE_MODEL)
 #
 #   scripts/fetch-models.sh [dir]      (default: ./models)
 set -euo pipefail
@@ -62,4 +63,7 @@ fetch depth depth_anything_v2_small.onnx \
 fetch rife RIFEv4.26_0921.zip \
   https://huggingface.co/hzwer/RIFE/resolve/01fdc7e97404120c243c3ea7b427046e5dc7643e/RIFEv4.26_0921.zip \
   1fa9b9cda3d9b8c3e301359e2595960902f97bf926c08598b0e9957a3f3f760e
-echo "Models in $DIR: MONTAGE_OBJECT_MODEL=$DIR/edgetam-video MONTAGE_SPEAKER_MODEL=$DIR/speakers MONTAGE_VISUAL_MODEL=$DIR/clip-vit-b32 MONTAGE_SPEECH_MODEL=$DIR/speech-enhance MONTAGE_UPSCALE_MODEL=$DIR/upscale MONTAGE_FACE_MODEL=$DIR/faces MONTAGE_DEPTH_MODEL=$DIR/depth MONTAGE_RIFE_MODEL=$DIR/rife"
+fetch matte modnet.onnx \
+  https://huggingface.co/Xenova/modnet/resolve/fa2fa546052fba4c08921230a26cc69a333fca12/onnx/model.onnx \
+  07c308cf0fc7e6e8b2065a12ed7fc07e1de8febb7dc7839d7b7f15dd66584df9
+echo "Models in $DIR: MONTAGE_OBJECT_MODEL=$DIR/edgetam-video MONTAGE_SPEAKER_MODEL=$DIR/speakers MONTAGE_VISUAL_MODEL=$DIR/clip-vit-b32 MONTAGE_SPEECH_MODEL=$DIR/speech-enhance MONTAGE_UPSCALE_MODEL=$DIR/upscale MONTAGE_FACE_MODEL=$DIR/faces MONTAGE_DEPTH_MODEL=$DIR/depth MONTAGE_RIFE_MODEL=$DIR/rife MONTAGE_MATTE_MODEL=$DIR/matte"

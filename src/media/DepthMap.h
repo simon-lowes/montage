@@ -11,6 +11,7 @@
 
 #include "Image.h"
 #include "ModelFiles.h"
+#include "ValueMap.h"
 
 namespace montage {
 
@@ -21,15 +22,7 @@ bool depthAvailable();  // built with ONNX Runtime
 
 // Relative depth: 0 for the farthest parts of the picture, 1 for the nearest
 // (the model's disparity stretched between its 1st and 99th percentiles).
-struct DepthMap {
-    int width = 0, height = 0;
-    std::vector<float> values;  // width * height, row by row
-    bool empty() const { return width <= 0 || height <= 0; }
-    // Bilinear, at fractions of the picture (0..1 across and down).
-    float at(double u, double v) const;
-    // Resampled to w x h (pixel centres).
-    std::vector<float> resized(int w, int h) const;
-};
+struct DepthMap : ValueMap {};
 
 // The depth of a picture (premultiplied RGBA, display-referred 0..1), the
 // model run with the short side at `size` pixels (a multiple of 14; 518 is

@@ -594,3 +594,15 @@ All 15 items are in (October 2026). The near misses listed in the roadmap are th
     - halfway between two crops of a photo 10 and 6 px apart, mean error 0.0023 against Optical Flow's 0.0067 and blending's 0.111;
     - in a sequence: a ProRes clip of the moving photo at half speed, within 0.006 of the true frame against 0.11 for blending;
     - MCP, and the Inspector's download offer.
+- [x] Remove Background and People masks (media/Matting):
+  - **Model:** MODNet's photographic portrait model (Zhanghan Ke et al., Apache-2.0) as Xenova's fp32 ONNX export, 26 MB. It runs with the short side at 512 and both sides multiples of 32, values scaled to -1..1, and gives a soft matte. Transparent pixels of the clip count as no one.
+  - **Other models considered:** BiRefNet lite (MIT) handles any subject but is 224 MB and several seconds a frame. RMBG-1.4 is non-commercial. ISNet's export is AGPL.
+  - **In the compositor:** worked out once per frame from the clip's source picture when an effect needs it (cached by content), and handed over per thread like depth (`PersonScope`).
+  - **Remove Background:** keep the people or the background; Edge Shift re-edges by signed distance; Soften feathers.
+  - **People mask shape (4):** on every video filter, with expansion and feather, combinable with the qualifiers and invertible. It selects nothing without the model; the Inspector offers the download.
+  - **Also:** MCP `montage_add_effect` (refusing without the model), `montage-cli models`, `scripts/fetch-models.sh` and the CI caches.
+  - **Tests:** on the Armstrong portrait:
+    - the matte's size and values (him 1, the backdrop 0, as the Python reference gives), and the cache;
+    - over a red track: the red showing round him and his face kept; keeping the background instead; Edge Shift widening the cut;
+    - a People mask darkening only him, and inverted;
+    - MCP, and the Inspector's download offer.

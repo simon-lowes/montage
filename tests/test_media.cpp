@@ -55,6 +55,7 @@
 #include "media/Faces.h"
 #include "media/DepthMap.h"
 #include "media/Rife.h"
+#include "media/Matting.h"
 #include "media/VisualSearch.h"
 #include "automation/McpServer.h"
 #ifdef MONTAGE_WITH_WHISPER
@@ -2224,6 +2225,97 @@ private slots:
         Project back;
         QVERIFY(loadProject(project.toStdString(), back, &err));
         QCOMPARE(back.active()->videoTracks[0].clips.at(0).timing.p("sampling", 0), 3.0);
+    }
+
+    void removeBackground() {
+        if (!mattingAvailable() || !mattingModel().installed()) QSKIP("Set MONTAGE_MATTE_MODEL to the MODNet model");
+        const std::string still = MONTAGE_TEST_DATA_DIR "/faces/armstrong.jpg";
+        VideoDecoder dec;
+        std::string err;
+        QVERIFY2(dec.open(still, &err), err.c_str());
+        const Image img = toImage(*dec.frameAt(0));
+        ValueMap m;
+        QVERIFY2(estimatePersonMatte(img, m, 512, &err), err.c_str());
+        // The short side at 512, multiples of 32.
+        QCOMPARE(m.width, 512);
+        QCOMPARE(m.height, 640);
+        // On him 1, on the backdrop 0, as the Python reference gives.
+        QVERIFY(m.at(0.62, 0.24) > 0.95f && m.at(0.6, 0.5) > 0.95f);
+        QVERIFY(m.at(0.03, 0.03) < 0.05f && m.at(0.95, 0.1) < 0.05f);
+        QVERIFY(cachedPersonMatte(img) == cachedPersonMatte(img));
+
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320;
+        s.height = 400;
+        Clip red = makeGeneratorClip(p, "color", 60);
+        red.generator.params["color.r"] = Param(1.0);
+        red.generator.params["color.g"] = Param(0.0);
+        red.generator.params["color.b"] = Param(0.0);
+        edit::overwrite(p, s, {TrackKind::Video, 0}, red);
+        MediaItem mi = probeOrFail(p, still);
+        p.media.push_back(mi);
+        QVERIFY(edit::placeMedia(p, s, mi.id, 0, 0, -1, {TrackKind::Video, 1}, {TrackKind::Audio, 0}, false).ok);
+        Clip& clip = s.videoTracks[1].clips.at(0);
+        const Image plain = renderSequenceFrame(p, s, 0, {});
+        auto px = [](const Image& im, double u, double v) { return im.at(int(u * im.width), int(v * im.height)); };
+        auto same = [&](const Image& im, double u, double v) {
+            const float *a = px(im, u, v), *b = px(plain, u, v);
+            return std::abs(a[0] - b[0]) + std::abs(a[1] - b[1]) + std::abs(a[2] - b[2]) < 0.03f;
+        };
+        auto isRed = [&](const Image& im, double u, double v) {
+            const float* q = px(im, u, v);
+            return q[0] > 0.95f && q[1] < 0.05f && q[2] < 0.05f;
+        };
+        // Remove Background: the red track shows through around him.
+        clip.effects.push_back(makeEffect(p, "remove_background"));
+        Image shown = renderSequenceFrame(p, s, 0, {});
+        QVERIFY(isRed(shown, 0.03, 0.03) && isRed(shown, 0.95, 0.1));
+        QVERIFY(same(shown, 0.62, 0.24) && same(shown, 0.6, 0.5));
+        // Keep the background instead: he is gone.
+        clip.effects.back().params["keep"] = Param(1.0);
+        shown = renderSequenceFrame(p, s, 0, {});
+        QVERIFY(isRed(shown, 0.62, 0.24) && same(shown, 0.03, 0.03));
+        // A wider edge reaches further into the backdrop.
+        clip.effects.back().params["keep"] = Param(0.0);
+        auto alphaSum = [&](const Image& im) {
+            double sum = 0;
+            for (int y = 0; y < im.height; ++y)
+                for (int x = 0; x < im.width; ++x) sum += 1 - im.at(x, y)[0] + im.at(x, y)[1];  // not red
+            return sum;
+        };
+        const double base = alphaSum(renderSequenceFrame(p, s, 0, {}));
+        clip.effects.back().params["shift"] = Param(8.0);
+        QVERIFY(alphaSum(renderSequenceFrame(p, s, 0, {})) > base * 1.02);
+        clip.effects.clear();
+        // A People mask: an effect on him only, and inverted on everything but him.
+        Effect dark = makeEffect(p, "color_correct");
+        dark.params["exposure"] = Param(-10.0);
+        dark.params["mask.shape"] = Param(4.0);
+        dark.params["mask.feather"] = Param(2.0);
+        clip.effects.push_back(dark);
+        shown = renderSequenceFrame(p, s, 0, {});
+        QVERIFY(px(shown, 0.62, 0.24)[0] < 0.02f && same(shown, 0.03, 0.03));
+        clip.effects.back().params["mask.invert"] = Param(1.0);
+        shown = renderSequenceFrame(p, s, 0, {});
+        QVERIFY(same(shown, 0.62, 0.24));
+        clip.effects.clear();
+
+        // Through MCP.
+        const QString project = QString::fromStdString(path("cutout.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_add_effect"},
+                                                     {"arguments", QJsonObject{{"project", project}, {"clip", double(clip.id)}, {"effect", "remove_background"}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back, &err));
+        QVERIFY(isRed(renderSequenceFrame(back, *back.active(), 0, {}), 0.03, 0.03));
     }
 
     void peopleSearch() {

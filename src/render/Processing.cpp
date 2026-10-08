@@ -5,6 +5,7 @@
 #include "VideoFx.h"
 #include "core/Effects.h"
 #include "media/DepthMap.h"
+#include "media/Matting.h"
 #include "media/Tracking.h"
 
 #include <algorithm>
@@ -640,11 +641,39 @@ std::vector<float> objectMatte(const std::vector<float>& logits, int W, int H, d
 
 namespace {
 thread_local std::shared_ptr<const DepthMap> tDepth;
+thread_local std::shared_ptr<const ValueMap> tPerson;
 }  // namespace
 
 const DepthMap* currentDepth() { return tDepth.get(); }
 DepthScope::DepthScope(std::shared_ptr<const DepthMap> depth) : previous_(std::move(tDepth)) { tDepth = std::move(depth); }
 DepthScope::~DepthScope() { tDepth = std::move(previous_); }
+const ValueMap* currentPersonMatte() { return tPerson.get(); }
+PersonScope::PersonScope(std::shared_ptr<const ValueMap> matte) : previous_(std::move(tPerson)) { tPerson = std::move(matte); }
+PersonScope::~PersonScope() { tPerson = std::move(previous_); }
+
+void refineMatte(std::vector<float>& matte, int W, int H, double expand, double feather, double blur) {
+    if (matte.size() != size_t(W) * size_t(H)) return;
+    if (std::fabs(expand) >= 0.25) {
+        std::vector<uint8_t> inside(matte.size()), outside(matte.size());
+        for (size_t i = 0; i < matte.size(); ++i) {
+            inside[i] = matte[i] > 0.5f;
+            outside[i] = !inside[i];
+        }
+        const std::vector<float> distOut = distanceTransform(inside, W, H), distIn = distanceTransform(outside, W, H);
+        const double fe = std::max(1.0, feather);
+        for (size_t i = 0; i < matte.size(); ++i) {
+            const double d = (inside[i] ? -(distIn[i] - 0.5) : distOut[i] - 0.5) - expand;
+            const double k = std::clamp(0.5 - d / fe, 0.0, 1.0);
+            matte[i] = float(k * k * (3 - 2 * k));
+        }
+        return;
+    }
+    if (blur < 0.5) return;
+    Image m(W, H, Image::Uninitialized{});
+    for (size_t i = 0; i < matte.size(); ++i) std::fill_n(&m.px[i * 4], 4, matte[i]);
+    gaussianBlur(m, blur);
+    for (size_t i = 0; i < matte.size(); ++i) matte[i] = m.px[i * 4];
+}
 
 std::vector<float> effectMatte(const Effect& e, FrameTime t, const Image& img, double pixelScale, double sourceSeconds) {
     std::vector<float> matte;
@@ -659,6 +688,17 @@ std::vector<float> effectMatte(const Effect& e, FrameTime t, const Image& img, d
             matte = objectMatte(logits, W, H, e.p("mask.feather", t, 20) * pixelScale, e.p("mask.expansion", t) * pixelScale);
         else
             std::fill(matte.begin(), matte.end(), 0.f);
+    }
+    if (shape == 4) {
+        // The people in the picture; nothing without the model.
+        const ValueMap* person = currentPersonMatte();
+        if (person && !person->empty()) {
+            matte = person->resized(W, H);
+            refineMatte(matte, W, H, e.p("mask.expansion", t) * pixelScale, e.p("mask.feather", t, 20) * pixelScale,
+                        e.p("mask.feather", t, 20) * pixelScale * 0.25);
+        } else {
+            std::fill(matte.begin(), matte.end(), 0.f);
+        }
     }
     if (shape == 1 || shape == 2) {
         // Image pixels, centred on the mask and rotated into its axes.
@@ -953,6 +993,20 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
     else if (ty == "posterize") vfx::posterize(e, t, img);
     else if (ty == "depth_map" || ty == "depth_fog" || ty == "depth_blur")
         depthEffect(e, t, img, pixelScale);
+    else if (ty == "remove_background") {
+        // Transparent where no one is (or where someone is, keeping the background); nothing without the model.
+        const ValueMap* person = currentPersonMatte();
+        if (person && !person->empty()) {
+            std::vector<float> m = person->resized(img.width, img.height);
+            const double soften = e.p("soften", t) * pixelScale;
+            refineMatte(m, img.width, img.height, e.p("shift", t) * pixelScale, soften, soften);
+            const bool keepBackground = e.p("keep", t) > 0.5;
+            for (size_t i = 0; i < m.size(); ++i) {
+                const float k = keepBackground ? 1 - m[i] : m[i];
+                for (int c = 0; c < 4; ++c) img.px[i * 4 + size_t(c)] *= k;
+            }
+        }
+    }
     else if (ty == "gaussian_blur") {
         int dir = int(e.p("direction", t));
         gaussianBlur(img, e.p("radius", t, 10) * pixelScale, dir != 2, dir != 1);

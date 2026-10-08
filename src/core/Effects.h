@@ -88,7 +88,8 @@ std::string pluginParamMeta(const ParamInfo& p);
 
 // The mask every video filter can have (params "mask.*", absent = no mask):
 // an ellipse or rectangle in the clip's source frame (centre and size as
-// fractions of the frame, feather and expansion in sequence pixels), an HSL
+// fractions of the frame, feather and expansion in sequence pixels), the
+// people in the picture (shape 4, media/Matting.h), an HSL
 // qualifier that selects colours, and/or a depth qualifier that selects a
 // range of distances. The filter is applied through it.
 const EffectInfo& maskInfo();
@@ -96,6 +97,8 @@ bool supportsMask(const std::string& effectType);
 bool hasMask(const Effect& e, FrameTime t);
 // The effect works from the picture's depth (a depth effect, or a depth qualifier).
 bool needsDepth(const Effect& e, FrameTime t);
+// The effect works from the people in the picture (Remove Background, or a People mask).
+bool needsPersonMatte(const Effect& e, FrameTime t);
 
 // Builds an Effect of the given type populated with default values.
 Effect makeEffect(Project& p, const std::string& type);
