@@ -199,6 +199,7 @@ private:
     QDockWidget* transcriptDock_ = nullptr;
     QDockWidget* shotsDock_ = nullptr;
     QDockWidget* peopleDock_ = nullptr;
+    QDockWidget* indexDock_ = nullptr;
     QDockWidget* multicamDock_ = nullptr;
     QDockWidget* queueDock_ = nullptr;
     QDockWidget* keyframesDock_ = nullptr;

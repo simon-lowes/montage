@@ -76,6 +76,8 @@
 #include "SpeechDialog.h"
 #include "ShotSearchPanel.h"
 #include "PeoplePanel.h"
+#include "SequenceIndexPanel.h"
+#include "core/History.h"
 #include "media/Segmenter.h"
 #include "MonitorPanel.h"
 #include "PlaybackController.h"
@@ -3486,6 +3488,49 @@ const auto seq = [this] { return state()->sequence(); };
         state()->undo();
         QVERIFY(std::fabs(edit::clipById(*state()->sequence(), red)->effects.back().p("tl_x", 10)) < 1e-9);
         state()->setSelection({}, false);
+    }
+
+    void sequenceIndexPanel() {
+        loadDemo();
+        state()->edit("Marker", [](Project&, Sequence& s) {
+            Marker m;
+            m.t = 30;
+            m.name = "Chorus";
+            s.markers.push_back(m);
+            return true;
+        });
+        auto* panel = win_->findChild<SequenceIndexPanel*>();
+        QVERIFY(panel);
+        // Two colour clips, a title and the marker.
+        QTRY_COMPARE(panel->rowCount(), 4);
+        QCOMPARE(win_->findChild<QLabel*>("indexCount")->text(), QString("4 of 4"));
+        // The filter matches any column: a name, a kind, a track.
+        panel->setFilter("blue");
+        QCOMPARE(panel->rowCount(), 1);
+        QCOMPARE(panel->cell(0, SequenceIndexPanel::Track), QString("V1"));
+        QCOMPARE(panel->cell(0, SequenceIndexPanel::Start), QString::fromStdString(formatTimecode(60, state()->sequence()->fps)));
+        panel->setFilter("marker");
+        QCOMPARE(panel->rowCount(), 1);
+        QCOMPARE(panel->cell(0, SequenceIndexPanel::Name), QString("Chorus"));
+        panel->setFilter("V2");
+        QCOMPARE(panel->rowCount(), 1);
+        QCOMPARE(panel->cell(0, SequenceIndexPanel::Kind), QString("Title"));
+        // Activating a row selects the clip and moves the playhead to it.
+        panel->setFilter("blue");
+        panel->activate(0);
+        const Clip* blue = clipNamed(*state()->sequence(), "Blue");
+        QCOMPARE(state()->playhead(), FrameTime(60));
+        QCOMPARE(state()->selectedClips(), std::vector<Id>{blue->id});
+        // Renamed in place, as one undo step; the index follows.
+        QVERIFY(panel->rename(0, "Navy"));
+        QVERIFY(clipNamed(*state()->sequence(), "Navy"));
+        panel->setFilter("navy");
+        QCOMPARE(panel->rowCount(), 1);
+        state()->undo();
+        QVERIFY(clipNamed(*state()->sequence(), "Blue"));
+        QCOMPARE(panel->rowCount(), 0);
+        panel->setFilter("");
+        QCOMPARE(panel->rowCount(), 4);
     }
 
     void peoplePanel() {

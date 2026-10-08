@@ -63,6 +63,7 @@
 #include "MulticamPanel.h"
 #include "CaptionsPanel.h"
 #include "MaskOverlay.h"
+#include "SequenceIndexPanel.h"
 #include "ShotSearchPanel.h"
 #include "PeoplePanel.h"
 #include "SpeechDialog.h"
@@ -284,6 +285,7 @@ void MainWindow::buildPanels() {
     transcriptDock_ = makeDock(tr("Transcript"), "transcript", transcript_);
     shotsDock_ = makeDock(tr("Find Shots"), "shots", shots_);
     peopleDock_ = makeDock(tr("People"), "people", people_);
+    indexDock_ = makeDock(tr("Sequence Index"), "index", new SequenceIndexPanel(state_, this));
     multicamDock_ = makeDock(tr("Multicam"), "multicam", multicam_);
     keyframesDock_ = makeDock(tr("Keyframes"), "keyframes", new KeyframePanel(state_, this));
     queue_ = new RenderQueue(this);
@@ -354,6 +356,7 @@ void MainWindow::resetLayout() {
     tabifyDockWidget(binDock_, transcriptDock_);
     tabifyDockWidget(binDock_, shotsDock_);
     tabifyDockWidget(binDock_, peopleDock_);
+    tabifyDockWidget(binDock_, indexDock_);
     tabifyDockWidget(binDock_, queueDock_);
     binDock_->raise();
     addDockWidget(Qt::RightDockWidgetArea, meterDock_);

@@ -22,6 +22,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Constant speed changes and reverse, with optional ripple
 - Snapshot undo/redo for every operation; drags and slider edits merge into one undo step
 - **Render cache** (like Premiere's Render In to Out): Sequence › Render In to Out (Return) renders the frames between In and Out (or the whole sequence) as the Program monitor shows them, so heavy effects play in real time. A green render bar under the ruler shows what is rendered. Frames stay rendered until something that shows in them changes. Moving a clip keeps its frames, and undo brings them back. Sequence › Delete Render Files empties the cache.
+- **Sequence Index** (a panel beside the Media bin, like Premiere's): every clip and marker in the sequence as a table, with its kind, track, start, end, duration, source In, media and effects. Type to filter on any column, click a header to sort, double-click a row to select the clip and go to it, and rename a clip or marker in place (one undo step).
 - **Keyboard Shortcuts** (Help › Keyboard Shortcuts, F1): every menu command can take any key, found by name or key. A key already in use moves only after asking. Keys can be reset one by one or all together, and layouts can be exported to or imported from a JSON file. Presets follow Premiere Pro (Montage's own), Final Cut Pro, DaVinci Resolve or Avid Media Composer.
 - Scene-cut detection that cuts a clip at every shot change
 
