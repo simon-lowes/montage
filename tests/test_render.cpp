@@ -17,6 +17,7 @@
 #include "render/Ocio.h"
 #include "render/Processing.h"
 #include "render/Relight.h"
+#include "render/Deconvolve.h"
 #include "render/FilmLook.h"
 #include "media/DepthMap.h"
 #include "render/RenderCache.h"
@@ -1822,6 +1823,91 @@ colorspaces:
         // Without animation or a length, a title is unchanged throughout.
         Effect plain = makeEffect(p, "title");
         QCOMPARE(ink(renderGenerator(plain, 0, 320, 180, 1.0)).amount, ink(renderGenerator(plain, 50, 320, 180, 1.0, 60, 30)).amount);
+    }
+
+    void focusRepair() {
+        Project proj;
+        // Fine detail (a pseudo-random pattern of blocks and lines), blurred by a Gaussian of sigma 2.
+        const int W = 160, H = 120;
+        Image sharp(W, H);
+        uint32_t seed = 12345;
+        auto rnd = [&] { return (seed = seed * 1664525u + 1013904223u) >> 8 & 0xffff; };
+        for (int by = 0; by < H; by += 4)
+            for (int bx = 0; bx < W; bx += 4) {
+                const float v = 0.15f + 0.7f * float(rnd() % 2);
+                for (int y = by; y < by + 4; ++y)
+                    for (int x = bx; x < bx + 4; ++x) {
+                        float* p = sharp.at(x, y);
+                        p[0] = v, p[1] = v * 0.8f, p[2] = v * 0.5f, p[3] = 1;
+                    }
+            }
+        auto blurred = [&](const Image& src, double sigma) {
+            Image out = src;
+            for (int c = 0; c < 3; ++c) {
+                std::vector<float> plane(size_t(W) * H);
+                for (size_t i = 0; i < plane.size(); ++i) plane[i] = src.px[i * 4 + size_t(c)];
+                gaussianPlane(plane, W, H, sigma);
+                for (size_t i = 0; i < plane.size(); ++i) out.px[i * 4 + size_t(c)] = plane[i];
+            }
+            return out;
+        };
+        auto rmse = [&](const Image& a, const Image& b) {
+            double e = 0;
+            int n = 0;
+            for (int y = 8; y < H - 8; ++y)  // away from the edges
+                for (int x = 8; x < W - 8; ++x)
+                    for (int c = 0; c < 3; ++c) e += std::pow(a.at(x, y)[c] - b.at(x, y)[c], 2), ++n;
+            return std::sqrt(e / n);
+        };
+        const Image soft = blurred(sharp, 2.0);
+        Image fixed = soft;
+        montage::focusRepair(fixed, FocusRepair{2.0, 30, 1.0, 0.0});
+        const double before = rmse(soft, sharp), after = rmse(fixed, sharp);
+        QVERIFY2(after < 0.72 * before, qPrintable(QString("%1 -> %2").arg(before).arg(after)));
+        // Better than Sharpen at its best for this blur.
+        double bestSharpen = 1e9;
+        for (double amount : {0.5, 1.0, 1.5, 2.0, 3.0}) {
+            Image sh = soft;
+            Effect e = makeEffect(proj, "sharpen");
+            e.params["amount"] = Param(amount);
+            e.params["radius"] = Param(4.0);
+            applyVideoEffect(e, 0, sh, 1.0);
+            bestSharpen = std::min(bestSharpen, rmse(sh, sharp));
+        }
+        QVERIFY2(after < bestSharpen, qPrintable(QString("%1 vs sharpen %2").arg(after).arg(bestSharpen)));
+        // Colour follows the brightness: the tint is kept.
+        for (int y = 20; y < H - 20; y += 13)
+            for (int x = 20; x < W - 20; x += 11) {
+                const float* p = fixed.at(x, y);
+                if (p[0] < 0.05f) continue;
+                QVERIFY(std::abs(p[1] / p[0] - 0.8f) < 0.01f && std::abs(p[2] / p[0] - 0.5f) < 0.01f);
+            }
+        // A flat picture, and no strength, change nothing.
+        Image flat(64, 48);
+        flat.fill(0.4f, 0.3f, 0.2f, 1.0f);
+        const Image flatBefore = flat;
+        montage::focusRepair(flat, FocusRepair{});
+        QVERIFY(std::abs(flat.at(32, 24)[0] - flatBefore.at(32, 24)[0]) < 1e-4f);
+        Image none = soft;
+        montage::focusRepair(none, FocusRepair{2.0, 10, 0.0, 0.01});
+        QCOMPARE(none.px, soft.px);
+        // From the catalogue, scaled with the preview: at half size it undoes half the blur.
+        Effect e = makeEffect(proj, "focus_repair");
+        QVERIFY(findEffectInfo("focus_repair"));
+        e.params["blur"] = Param(2.0);
+        e.params["iterations"] = Param(30.0);
+        e.params["noise"] = Param(0.0);
+        Image viaEffect = soft;
+        applyVideoEffect(e, 0, viaEffect, 1.0);
+        QVERIFY(std::abs(rmse(viaEffect, sharp) - after) < 1e-6);
+        // Noise: a threshold keeps flat grain from being amplified much.
+        Image grainy = soft;
+        for (size_t i = 0; i < grainy.px.size(); i += 4)
+            for (int c = 0; c < 3; ++c) grainy.px[i + size_t(c)] += 0.01f * (float(rnd() % 1000) / 500.0f - 1.0f);
+        Image raw = grainy, guarded = grainy;
+        montage::focusRepair(raw, FocusRepair{2.0, 30, 1.0, 0.0});
+        montage::focusRepair(guarded, FocusRepair{2.0, 30, 1.0, 0.03});
+        QVERIFY2(rmse(guarded, grainy) < rmse(raw, grainy), "the threshold changes the picture less");
     }
 
     void rollingAndCrawlingTitles() {

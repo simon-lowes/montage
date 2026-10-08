@@ -11,6 +11,7 @@
 #include "Relight.h"
 #include "FilmLook.h"
 #include "StyleFx.h"
+#include "Deconvolve.h"
 #include "media/Tracking.h"
 
 #include <algorithm>
@@ -1126,6 +1127,13 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
     else if (ty == "gaussian_blur") {
         int dir = int(e.p("direction", t));
         gaussianBlur(img, e.p("radius", t, 10) * pixelScale, dir != 2, dir != 1);
+    } else if (ty == "focus_repair") {
+        FocusRepair o;
+        o.blur = e.p("blur", t, 1.5) * pixelScale;
+        o.iterations = int(std::lround(e.p("iterations", t, 20)));
+        o.strength = e.p("strength", t, 100) / 100.0;
+        o.noise = e.p("noise", t, 1) / 100.0;
+        focusRepair(img, o);
     } else if (ty == "sharpen") {
         Image blurred = img;
         gaussianBlur(blurred, e.p("radius", t, 1.5) * pixelScale);

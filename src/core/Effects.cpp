@@ -232,6 +232,11 @@ std::vector<EffectInfo> buildCatalog() {
     c.push_back({"sharpen", "Sharpen", EffectCategory::VideoFilter, "Blur & Sharpen",
                  {num("amount", "Amount", 0, 5, 1), num("radius", "Radius (px)", 0.5, 20, 1.5, 0.1)},
                  {}});
+    // Undoes a slight focus miss or lens softness by deconvolution (render/Deconvolve).
+    c.push_back({"focus_repair", "Focus Repair", EffectCategory::VideoFilter, "Blur & Sharpen",
+                 {num("blur", "Blur to Undo (px)", 0.3, 8, 1.5, 0.1), num("iterations", "Iterations", 1, 100, 20, 1),
+                  pct("strength", "Strength", 0, 100, 100), num("noise", "Noise Threshold (%)", 0, 10, 1, 0.1)},
+                 {}});
     // Runs on the source frames before the clip's other effects (it needs the frames either side).
     c.push_back({"video_denoise", "Video Noise Reduction", EffectCategory::VideoFilter, "Blur & Sharpen",
                  {num("frames", "Temporal Frames Each Side", 0, 3, 2, 1), boolean("motion", "Motion Compensation", true),
