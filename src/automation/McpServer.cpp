@@ -20,6 +20,7 @@
 
 #include "core/AutoTag.h"
 #include "core/Captions.h"
+#include "core/Chapters.h"
 #include "core/Bleep.h"
 #include "core/Checkerboard.h"
 #include "core/EditOps.h"
@@ -887,16 +888,35 @@ void McpServer::Impl::addTools() {
             return ok(QStringLiteral("Added the transition"));
         });
 
-    add("montage_add_marker", "Add a marker", "Add a timeline marker with a name and comment.",
+    add("montage_add_marker", "Add a marker",
+        "Add a timeline marker with a name and comment. A chapter marker also becomes a chapter in exported MP4, MOV and "
+        "MKV files and in montage_chapters' list.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"at":{"type":["number","string"]},
-            "name":{"type":"string"},"comment":{"type":"string"}},"required":["project","at"]})json",
+            "name":{"type":"string"},"comment":{"type":"string"},"chapter":{"type":"boolean","default":false}},"required":["project","at"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
             const FrameTime at = timeArg(a.value("at"), s, "at");
-            edit::addMarker(s, Marker{at, 0, str(a, "name").toStdString(), str(a, "comment").toStdString(), 0});
+            const bool chapter = a.value("chapter").toBool();
+            edit::addMarker(s, Marker{at, 0, str(a, "name").toStdString(), str(a, "comment").toStdString(), 0, chapter});
             save(l);
-            return ok(QStringLiteral("Marker at %1").arg(tc(at, s)));
+            return ok(QStringLiteral("%1 at %2").arg(chapter ? QStringLiteral("Chapter marker") : QStringLiteral("Marker"), tc(at, s)));
+        });
+
+    add("montage_chapters", "List chapters",
+        "The sequence's chapter markers as YouTube's chapter list for a video description (\"0:00 Intro\", a line each), "
+        "timed from `from` when the export starts there, with a warning when YouTube would not show them.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"from":{"type":["number","string"]},
+            "to":{"type":["number","string"]}},"required":["project"]})json",
+        true, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            const Sequence& s = l.seq();
+            const FrameTime from = a.contains("from") ? timeArg(a.value("from"), s, "from") : 0;
+            const FrameTime to = a.contains("to") ? timeArg(a.value("to"), s, "to") : -1;
+            std::string warning;
+            const std::string text = youtubeChapters(s, from, to, &warning);
+            if (text.empty()) return fail(QString::fromStdString(warning));
+            return ok(QString::fromStdString(text) + (warning.empty() ? QString() : QStringLiteral("\nNote: ") + QString::fromStdString(warning)));
         });
 
     add("montage_transcribe", "Transcribe",

@@ -9,6 +9,7 @@
 #include "core/Captions.h"
 #include "core/Bleep.h"
 #include "core/Cfb.h"
+#include "core/Chapters.h"
 #include "core/Checkerboard.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
@@ -2250,6 +2251,51 @@ private slots:
         QVERIFY(!slateFromTranscript(said("Let's take a break and come back.")));
         QVERIFY(!slateFromTranscript(said("Scene 4 take 2", 30.0)));
         QVERIFY(slateFromTranscript(said("Scene 4 take 2", 30.0), 40.0));
+    }
+
+    void chapterMarkers() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = Rational{30, 1};
+        const FrameTime sec = 30;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, makeGeneratorClip(p, "color", 4000 * sec));  // over an hour
+        // Ordinary markers are not chapters.
+        edit::addMarker(s, Marker{5 * sec, 0, "Note", "", 0});
+        std::string warning;
+        QVERIFY(youtubeChapters(s, 0, -1, &warning).empty());
+        QVERIFY(!warning.empty());
+        edit::addMarker(s, Marker{65 * sec, 0, "Setup", "", 0, true});
+        edit::addMarker(s, Marker{20 * sec, 0, "Hook", "", 0, true});
+        edit::addMarker(s, Marker{3725 * sec, 0, "", "", 0, true});
+        // In time order, each running to the next, with an intro at 0:00 (YouTube needs one) and unnamed ones numbered.
+        std::vector<Chapter> ch = chaptersOf(s);
+        QCOMPARE(ch.size(), size_t(4));
+        QCOMPARE(QString::fromStdString(ch[0].title), QString("Intro"));
+        QCOMPARE(ch[0].end, 20 * sec);
+        QCOMPARE(QString::fromStdString(ch[1].title), QString("Hook"));
+        QCOMPARE(ch[2].end, 3725 * sec);
+        QCOMPARE(QString::fromStdString(ch[3].title), QString("Chapter 4"));
+        QCOMPARE(ch[3].end, s.duration());
+        QCOMPARE(QString::fromStdString(youtubeChapters(s, 0, -1, &warning)), QString("0:00 Intro\n0:20 Hook\n1:05 Setup\n1:02:05 Chapter 4\n"));
+        QVERIFY2(warning.empty(), warning.c_str());
+        // A range: times from its start, chapters outside it left out, and no intro when one starts it.
+        ch = chaptersOf(s, 20 * sec, 3725 * sec);
+        QCOMPARE(ch.size(), size_t(2));
+        QCOMPARE(ch[0].start, FrameTime(0));
+        QCOMPARE(QString::fromStdString(ch[0].title), QString("Hook"));
+        QCOMPARE(ch[1].start, 45 * sec);
+        QCOMPARE(ch[1].end, 3705 * sec);
+        // YouTube's rules: at least three chapters, each at least ten seconds.
+        QCOMPARE(QString::fromStdString(youtubeChapters(s, 20 * sec, 3725 * sec, &warning)), QString("0:00 Hook\n0:45 Setup\n"));
+        QVERIFY(QString::fromStdString(warning).contains("three"));
+        edit::addMarker(s, Marker{70 * sec, 0, "Blip", "", 0, true});
+        youtubeChapters(s, 0, -1, &warning);
+        QVERIFY2(QString::fromStdString(warning).contains("Setup"), warning.c_str());
+        // Saved with the project.
+        Project back;
+        QVERIFY(projectFromJson(projectToJson(p), back));
+        QCOMPARE(back.active()->markers, s.markers);
+        QCOMPARE(int(std::count_if(back.active()->markers.begin(), back.active()->markers.end(), [](const Marker& m) { return m.chapter; })), 4);
     }
 
     void swapClips() {

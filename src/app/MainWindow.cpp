@@ -6,6 +6,8 @@
 
 #include <QAction>
 #include <QCheckBox>
+#include <QClipboard>
+#include <QGuiApplication>
 #include <QActionGroup>
 #include <QApplication>
 #include <QCloseEvent>
@@ -46,6 +48,7 @@
 
 #include "AudioMeterWidget.h"
 #include "audio/PluginEffect.h"
+#include "core/Chapters.h"
 #include "media/Decoder.h"
 #include "media/HwAccel.h"
 #include "media/MediaPool.h"
@@ -710,6 +713,8 @@ void MainWindow::buildMenus() {
     add(seqM, tr("Select Clips After Playhead on Target Track"), QKeySequence("Shift+A"), [this] { selectForward(false); })
         ->setObjectName(QStringLiteral("selectForwardTrack"));
     add(seqM, tr("Add &Marker"), QKeySequence(Qt::Key_M), [this] { addMarker(); });
+    add(seqM, tr("Add C&hapter Marker"), QKeySequence("Alt+M"), [this] { addChapterMarker(); })->setObjectName(QStringLiteral("addChapter"));
+    add(seqM, tr("Copy Chapters for YouTube"), QKeySequence(), [this] { copyYoutubeChapters(); })->setObjectName(QStringLiteral("copyChapters"));
     add(seqM, tr("Next Marker"), QKeySequence("Shift+M"), [this] { jumpMarker(true); });
     add(seqM, tr("Previous Marker"), QKeySequence("Ctrl+Shift+M"), [this] { jumpMarker(false); });
     add(seqM, tr("Clear Marker at Playhead"), QKeySequence("Ctrl+Alt+M"), [this] {
@@ -1243,6 +1248,38 @@ void MainWindow::addMarker() {
         edit::addMarker(s, Marker{t, 0, "Marker " + std::to_string(n), "", 0});
         return true;
     });
+}
+
+void MainWindow::addChapterMarker() {
+    if (active_ == Monitor::Source || !state_->sequence()) return;
+    const FrameTime t = state_->playhead();
+    int n = 1;
+    for (const Marker& m : state_->sequence()->markers) n += m.chapter;
+    // A marker already at the playhead becomes a chapter; otherwise a new one is added.
+    state_->edit(tr("Add Chapter Marker"), [t, n](Project&, Sequence& s) {
+        for (Marker& m : s.markers)
+            if (m.t == t) {
+                if (m.chapter) return false;
+                m.chapter = true;
+                return true;
+            }
+        edit::addMarker(s, Marker{t, 0, "Chapter " + std::to_string(n), "", 0, true});
+        return true;
+    });
+}
+
+QString MainWindow::copyYoutubeChapters() {
+    const Sequence* s = state_->sequence();
+    if (!s) return {};
+    // Within In to Out when both are set, as the export would be.
+    const bool range = s->inPoint >= 0 && s->outPoint >= 0;
+    std::string warning;
+    const QString text = QString::fromStdString(youtubeChapters(*s, range ? s->inPoint : 0, range ? s->outPoint + 1 : -1, &warning));
+    if (!text.isEmpty()) QGuiApplication::clipboard()->setText(text);
+    statusBar()->showMessage(warning.empty() ? tr("Copied %n chapter(s) for YouTube", nullptr, int(text.count(QLatin1Char('\n'))))
+                                             : (text.isEmpty() ? QString() : tr("Copied chapters for YouTube. ")) + QString::fromStdString(warning),
+                             8000);
+    return text;
 }
 
 void MainWindow::jumpMarker(bool forward) {

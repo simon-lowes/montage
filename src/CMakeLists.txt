@@ -9,6 +9,7 @@ add_library(montage_engine STATIC
   core/Captions.h core/Captions.cpp
   core/TranscriptEdit.h core/TranscriptEdit.cpp
   core/Slate.h core/Slate.cpp
+  core/Chapters.h core/Chapters.cpp
   core/ScriptCut.h core/ScriptCut.cpp
   core/Cfb.h core/Cfb.cpp
   core/Zip.h core/Zip.cpp

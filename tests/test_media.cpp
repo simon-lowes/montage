@@ -2646,6 +2646,61 @@ private slots:
         QVERIFY2(std::fabs(out[200] - 0.2f) < 0.01f, qPrintable(QString::number(out[200])));
     }
 
+    void exportedChapters() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64;
+        s.height = 36;
+        const FrameTime sec = FrameTime(std::lround(s.fpsValue()));
+        edit::overwrite(p, s, {TrackKind::Video, 0}, makeGeneratorClip(p, "color", 3 * sec));
+        edit::addMarker(s, Marker{sec, 0, "Middle", "", 0, true});
+        edit::addMarker(s, Marker{2 * sec, 0, "End", "", 0, true});
+        edit::addMarker(s, Marker{sec + sec / 2, 0, "Not a chapter", "", 0});
+        // The chapters a player sees: start (seconds) and title.
+        auto chaptersIn = [](const std::string& file) {
+            std::vector<std::pair<double, QString>> out;
+            AVFormatContext* fmt = nullptr;
+            if (avformat_open_input(&fmt, file.c_str(), nullptr, nullptr) < 0) return out;
+            for (unsigned i = 0; i < fmt->nb_chapters; ++i) {
+                const AVChapter* c = fmt->chapters[i];
+                const AVDictionaryEntry* t = av_dict_get(c->metadata, "title", nullptr, 0);
+                out.push_back({double(c->start) * av_q2d(c->time_base), t ? QString::fromUtf8(t->value) : QString()});
+            }
+            avformat_close_input(&fmt);
+            return out;
+        };
+        ExportSettings st;
+        st.videoCodec = "libx264";
+        st.audioCodec = "none";
+        st.preset = "ultrafast";
+        st.crf = 35;
+        std::string err;
+        for (const char* file : {"chapters.mp4", "chapters.mov", "chapters.mkv"}) {
+            st.path = path(file);
+            QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+            const auto ch = chaptersIn(st.path);
+            QVERIFY2(ch.size() == 3, file);
+            QCOMPARE(ch[0].second, QString("Intro"));
+            QCOMPARE(ch[1].second, QString("Middle"));
+            QCOMPARE(ch[2].second, QString("End"));
+            QVERIFY2(std::fabs(ch[0].first) < 0.01 && std::fabs(ch[1].first - 1) < 0.01 && std::fabs(ch[2].first - 2) < 0.01, file);
+        }
+        // An In to Out range: timed from its start.
+        st.path = path("range.mp4");
+        st.in = sec;
+        st.out = 3 * sec - 1;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        auto ch = chaptersIn(st.path);
+        QCOMPARE(ch.size(), size_t(2));
+        QCOMPARE(ch[0].second, QString("Middle"));
+        QVERIFY(std::fabs(ch[0].first) < 0.01 && std::fabs(ch[1].first - 1) < 0.01);
+        // Turned off.
+        st.chapters = false;
+        st.path = path("nochapters.mp4");
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        QVERIFY(chaptersIn(st.path).empty());
+    }
+
     void exportAndDecodeFrameAccurately() {
         // A colour matte whose red channel ramps 0 -> 1 over 30 frames.
         Project p = makeDefaultProject();
@@ -4936,11 +4991,20 @@ private slots:
             QCOMPARE(v4[0].generator.p("motion", 0), 1.0);
             QCOMPARE(v4[1].generator.p("motion", 0), 2.0);
         }
+        // Chapters: none yet, then YouTube's list (with a warning: fewer than three).
+        QVERIFY(tool("montage_chapters", QJsonObject{{"project", project}}).value("isError").toBool());
+        r = tool("montage_add_marker", QJsonObject{{"project", project}, {"at", 0.2}, {"name", "Part two"}, {"chapter", true}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = tool("montage_chapters", QJsonObject{{"project", project}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY2(text(r).startsWith("0:00 Intro\n0:00 Part two\n") && text(r).contains("three"), qPrintable(text(r)));
+        QVERIFY(!tool("montage_undo", QJsonObject{{"project", project}}).value("isError").toBool());
         r = tool("montage_add_marker", QJsonObject{{"project", project}, {"at", 0.1}, {"name", "Look"}});
         QVERIFY(!r.value("isError").toBool());
         Project saved;
         QVERIFY(loadProject(project.toStdString(), saved));
         QCOMPARE(saved.active()->markers.size(), size_t(1));
+        QVERIFY(!saved.active()->markers[0].chapter);
         QCOMPARE(saved.active()->videoTracks.at(1).clips.size(), size_t(1));  // the title, above the picture
         // Undo puts back the version before the marker.
         r = tool("montage_undo", QJsonObject{{"project", project}});

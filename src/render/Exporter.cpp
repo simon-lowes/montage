@@ -1,5 +1,6 @@
 #include "Exporter.h"
 
+#include "core/Chapters.h"
 #include "core/Surround.h"
 
 #include <QImage>
@@ -454,6 +455,29 @@ bool exportGif(const Project& p, const Sequence& seq, const ExportSettings& s, F
     return true;
 }
 
+// Chapter markers in [in, out) as the container's chapters (MP4 and MOV write both QuickTime and Nero chapters).
+void addChapters(AVFormatContext* oc, const Sequence& seq, FrameTime in, FrameTime out) {
+    const std::string fmt = oc->oformat->name;
+    if (fmt.find("mov") == std::string::npos && fmt.find("mp4") == std::string::npos && fmt.find("matroska") == std::string::npos &&
+        fmt.find("webm") == std::string::npos)
+        return;
+    const std::vector<Chapter> chapters = chaptersOf(seq, in, out);
+    if (chapters.empty()) return;
+    oc->chapters = static_cast<AVChapter**>(av_calloc(chapters.size(), sizeof(AVChapter*)));
+    if (!oc->chapters) return;
+    const AVRational tb{int(seq.fps.den), int(seq.fps.num)};
+    for (const Chapter& c : chapters) {
+        auto* ch = static_cast<AVChapter*>(av_mallocz(sizeof(AVChapter)));
+        if (!ch) break;
+        ch->id = int64_t(oc->nb_chapters) + 1;
+        ch->time_base = tb;
+        ch->start = c.start;
+        ch->end = c.end;
+        av_dict_set(&ch->metadata, "title", c.title.c_str(), 0);
+        oc->chapters[oc->nb_chapters++] = ch;
+    }
+}
+
 bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
                 const std::atomic<bool>* cancel, std::string* error, bool& opened, std::string* encoderUsed) {
     auto fail = [&](const std::string& msg) {
@@ -703,6 +727,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         opened = true;
     }
     av_dict_set(&o.oc->metadata, "encoder", "Montage", 0);
+    if (s.chapters) addChapters(o.oc, seq, in, out);
     if ((rc = avformat_write_header(o.oc, nullptr)) < 0) return fail("Cannot write header: " + averr(rc));
     o.headerWritten = true;
 

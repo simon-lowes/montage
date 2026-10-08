@@ -1009,9 +1009,13 @@ void TimelineWidget::paintRuler(QPainter& p) {
     for (const auto& m : s->markers) {
         int x = xForFrame(m.t);
         QColor col = theme::labelColor(m.color);
-        if (!col.isValid()) col = theme::kSnap;
+        if (!col.isValid()) col = m.chapter ? QColor(255, 149, 0) : theme::kSnap;
         QPolygon poly;
-        poly << QPoint(x - 5, 14) << QPoint(x + 5, 14) << QPoint(x + 5, 20) << QPoint(x, 25) << QPoint(x - 5, 20);
+        if (m.chapter)  // a flag: chapter markers stand apart from ordinary ones
+            poly << QPoint(x - 1, 12) << QPoint(x + 7, 12) << QPoint(x + 4, 16) << QPoint(x + 7, 20) << QPoint(x + 1, 20) << QPoint(x + 1, 25)
+                 << QPoint(x - 1, 25);
+        else
+            poly << QPoint(x - 5, 14) << QPoint(x + 5, 14) << QPoint(x + 5, 20) << QPoint(x, 25) << QPoint(x - 5, 20);
         p.setPen(Qt::NoPen);
         p.setBrush(col);
         p.drawPolygon(poly);

@@ -65,6 +65,8 @@ struct ExportSettings {
     bool downmixStereo = false;
     // Only these audio tracks are heard (true = in); empty = all. Used for stems.
     std::vector<bool> audioTracks;
+    // The sequence's chapter markers become chapters in MP4, MOV and MKV files (players and YouTube read them).
+    bool chapters = true;
 };
 
 struct ExportPreset {

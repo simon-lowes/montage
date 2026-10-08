@@ -343,12 +343,11 @@ QJsonObject sequenceToJson(const Sequence& s) {
     QJsonArray v, a, m;
     for (const auto& t : s.videoTracks) v.append(trackToJson(t));
     for (const auto& t : s.audioTracks) a.append(trackToJson(t));
-    for (const auto& mk : s.markers)
-        m.append(QJsonObject{{"t", double(mk.t)},
-                             {"duration", double(mk.duration)},
-                             {"name", qs(mk.name)},
-                             {"comment", qs(mk.comment)},
-                             {"color", mk.color}});
+    for (const auto& mk : s.markers) {
+        QJsonObject mo{{"t", double(mk.t)}, {"duration", double(mk.duration)}, {"name", qs(mk.name)}, {"comment", qs(mk.comment)}, {"color", mk.color}};
+        if (mk.chapter) mo["chapter"] = true;
+        m.append(mo);
+    }
     o["video"] = v;
     o["audio"] = a;
     o["markers"] = m;
@@ -410,6 +409,7 @@ Sequence sequenceFromJson(const QJsonObject& o) {
         mk.name = ss(mo.value("name"));
         mk.comment = ss(mo.value("comment"));
         mk.color = mo.value("color").toInt(0);
+        mk.chapter = mo.value("chapter").toBool(false);
         s.markers.push_back(mk);
     }
     for (const auto& c : o.value("captions").toArray()) s.captionTracks.push_back(captionTrackFromJson(c.toObject()));

@@ -260,6 +260,7 @@ struct Marker {
     std::string name;
     std::string comment;
     int color = 0;
+    bool chapter = false;  // a chapter marker: a chapter in exported MP4 / MOV / MKV files and YouTube's list
     bool operator==(const Marker&) const = default;
 };
 

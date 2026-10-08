@@ -20,6 +20,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Paste Attributes (Ctrl+Alt+V) and Remove Attributes: motion, opacity and blend, Time Remapping, volume and effects, keyframes included
 - Synchronise clips from separate cameras and recorders by audio waveform (cross-correlation, sub-frame accurate)
 - Linked audio/video, linking and unlinking, snapping, markers, match frame, compound (nested) clips
+- **Chapter markers** (Sequence › Add Chapter Marker, `Alt+M`, like Final Cut's and Premiere's): drawn as orange flags; an ordinary marker at the playhead becomes one. They are written as chapters into exported MP4, MOV and MKV files (players and YouTube read them; an option in the Export dialog). **Copy Chapters for YouTube** puts the list for a video description on the clipboard ("0:00 Intro", "1:05 Setup", timed from In when In and Out are set) and warns when YouTube would not show it: fewer than three chapters, or one under ten seconds.
 - Constant speed changes and reverse, with optional ripple
 - Snapshot undo/redo for every operation; drags and slider edits merge into one undo step
 - **Render cache** (like Premiere's Render In to Out): Sequence › Render In to Out (Return) renders the frames between In and Out (or the whole sequence) as the Program monitor shows them, so heavy effects play in real time. A green render bar under the ruler shows what is rendered. Frames stay rendered until something that shows in them changes. Moving a clip keeps its frames, and undo brings them back. Sequence › Delete Render Files empties the cache.
@@ -348,7 +349,7 @@ montage-cli mcp                                              # MCP server for AI
 Its tools work on `.montage` files by path. Each edit is saved at once, and the previous version is kept beside the project as `.bak` for `montage_undo`. The tools can:
 - probe media, create projects and list a project's timeline;
 - place media, split, remove (with ripple), move, trim and change the speed of clips;
-- add titles, effects (including masked ones), transitions and markers;
+- add titles, effects (including masked ones), transitions and markers (chapter markers too), and list the chapters for YouTube;
 - transcribe (with speaker labels), translate caption tracks, dub them into English, find spoken phrases in the cut, cut by transcript (phrases, filler words, retakes, long pauses, optionally with Smooth Cuts), and build a cut from a script;
 - find shots by description, and find, name and join the people in the footage;
 - generate voiceovers from text or from a caption track;

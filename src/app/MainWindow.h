@@ -87,6 +87,8 @@ public:
     bool pasteAttributes(unsigned what);              // edit::Attribute flags, from the copied clips
     bool removeAttributes(unsigned what);
     bool addFrameHold();                              // the clip under the playhead
+    // Copies the chapter markers (within In to Out when set) as YouTube's chapter list; returns the text.
+    QString copyYoutubeChapters();
     bool swapClip(bool withNext);                     // the selected clip (or the one under the playhead) with its neighbour
     bool replaceWithSource();                         // the selected clip, or the one under the playhead
     bool fitToFill();
@@ -135,6 +137,7 @@ private:
     void nudge(int frames);
     void matchFrame();
     void addMarker();
+    void addChapterMarker();
     void jumpMarker(bool forward);
     void markClip();
     void detectScenes();

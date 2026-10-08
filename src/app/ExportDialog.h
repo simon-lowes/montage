@@ -80,6 +80,7 @@ private:
     QSpinBox* height_ = nullptr;
     QSpinBox* quality_ = nullptr;
     QComboBox* captions_ = nullptr;
+    QCheckBox* chapters_ = nullptr;
     QComboBox* color_ = nullptr;
     QComboBox* loudness_ = nullptr;
     QComboBox* audioOut_ = nullptr;  // a surround sequence: all its channels, or folded to stereo

@@ -193,6 +193,10 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     captions_->addItem(tr("Burn in and embed"), 3);
     captions_->setCurrentIndex(std::clamp(appSettings().value("export/captions", 0).toInt(), 0, 3));
     form->addRow(tr("Captions:"), captions_);
+    chapters_ = new QCheckBox(tr("From chapter markers"), form_);
+    chapters_->setObjectName(QStringLiteral("exportChapters"));
+    chapters_->setChecked(appSettings().value("export/chapters", true).toBool());
+    form->addRow(tr("Chapters:"), chapters_);
     color_ = new QComboBox(form_);
     color_->setObjectName(QStringLiteral("exportColor"));
     color_->addItem(tr("Same as sequence (%1)").arg(QString::fromStdString(seq ? sequenceColorSpace(*seq).label : "Rec.709")),
@@ -452,6 +456,14 @@ void ExportDialog::updateControls() {
     captions_->setEnabled(video && ct && !ct->captions.empty());
     captions_->setToolTip(captions_->isEnabled() ? tr("Uses the caption track \"%1\"").arg(QString::fromStdString(ct->name))
                                                  : tr("Add a visible caption track (Captions panel) to export captions"));
+    const QString ext = p ? QString::fromStdString(p->extension).toLower() : QString();
+    const bool chapterFile = ext == QLatin1String("mp4") || ext == QLatin1String("mov") || ext == QLatin1String("m4v") ||
+                             ext == QLatin1String("mkv") || ext == QLatin1String("webm");
+    const bool anyChapters = seq && std::any_of(seq->markers.begin(), seq->markers.end(), [](const Marker& m) { return m.chapter; });
+    chapters_->setEnabled(chapterFile && anyChapters);
+    chapters_->setToolTip(!chapterFile ? tr("Chapters can be written into MP4, MOV and MKV files")
+                          : anyChapters ? tr("Players and YouTube show the chapter markers as chapters")
+                                        : tr("Add chapter markers (Sequence > Add Chapter Marker) to export chapters"));
 
     FrameTime in = 0, out = 0;
     const bool canExport = p && state_ && state_->sequence() && rangeFrames(in, out) && !path_->text().trimmed().isEmpty();
@@ -571,6 +583,8 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
         s.embedCaptions = mode & 2;
     }
     settings.setValue("export/captions", captions_->currentIndex());
+    s.chapters = chapters_->isChecked();
+    settings.setValue("export/chapters", chapters_->isChecked());
     if (hasVideo(s)) s.colorSpace = color_->currentData().toString().toStdString();
     if (hasAudio(s) && loudness_->currentIndex() > 0) {
         const QPointF target = loudness_->currentData().toPointF();

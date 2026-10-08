@@ -7,6 +7,8 @@
 #include <QAction>
 #include <QComboBox>
 #include <QCheckBox>
+#include <QClipboard>
+#include <QStatusBar>
 #include <QDockWidget>
 #include <QDoubleSpinBox>
 #include <QLineEdit>
@@ -358,6 +360,67 @@ private slots:
         state()->setSelection({blue});
         QVERIFY(!win_->swapClip(true));
         QCOMPARE(edit::clipById(*state()->sequence(), blue)->start, FrameTime(60));
+    }
+
+    void chapterMarkersFromTheMenu() {
+        loadDemo();
+        auto* add = win_->findChild<QAction*>("addChapter");
+        QVERIFY(add);
+        QCOMPARE(add->shortcut(), QKeySequence("Alt+M"));
+        // The export dialog offers chapters only when there are chapter markers, and only for files that hold them.
+        auto presetIndex = [](const char* ext) {
+            for (size_t i = 0; i < exportPresets().size(); ++i)
+                if (exportPresets()[i].extension == ext) return int(i);
+            return -1;
+        };
+        {
+            ExportDialog ed(state(), win_.get());
+            ed.findChild<QComboBox*>("exportPreset")->setCurrentIndex(presetIndex("mp4"));
+            QVERIFY(!ed.findChild<QCheckBox*>("exportChapters")->isEnabled());
+        }
+        // A new chapter marker, then an ordinary marker made a chapter; the same place again changes nothing.
+        state()->setPlayhead(60);
+        add->trigger();
+        state()->setPlayhead(90);
+        QTest::keyClick(win_.get(), Qt::Key_M);
+        add->trigger();
+        add->trigger();
+        const auto& markers = state()->sequence()->markers;
+        QCOMPARE(markers.size(), size_t(2));
+        QVERIFY(std::all_of(markers.begin(), markers.end(), [](const Marker& m) { return m.chapter; }));
+        QCOMPARE(QString::fromStdString(std::find_if(markers.begin(), markers.end(), [](const Marker& m) { return m.t == 60; })->name),
+                 QString("Chapter 1"));
+        // YouTube's list on the clipboard, timed from In when In and Out are set, with a warning when YouTube would not show it.
+        const double fps = state()->sequence()->fpsValue();
+        win_->findChild<QAction*>("copyChapters")->trigger();
+        QString expected = QString("0:00 Intro\n0:%1 Chapter 1\n0:%2 Marker 2\n").arg(int(60 / fps), 2, 10, QChar('0')).arg(int(90 / fps), 2, 10, QChar('0'));
+        QCOMPARE(QGuiApplication::clipboard()->text(), expected);
+        QVERIFY(win_->statusBar()->currentMessage().contains("ten seconds"));
+        state()->edit("Range", [](Project&, Sequence& s) {
+            s.inPoint = 60;
+            s.outPoint = 119;
+            return true;
+        });
+        QCOMPARE(win_->copyYoutubeChapters(), QString("0:00 Chapter 1\n0:%1 Marker 2\n").arg(int(30 / fps), 2, 10, QChar('0')));
+        // The Sequence Index and the export dialog know them.
+        auto* panel = win_->findChild<SequenceIndexPanel*>();
+        panel->setFilter("chapter");
+        QTRY_COMPARE(panel->rowCount(), 2);
+        panel->setFilter("");
+        {
+            ExportDialog ed(state(), win_.get());
+            auto* preset = ed.findChild<QComboBox*>("exportPreset");
+            auto* chapters = ed.findChild<QCheckBox*>("exportChapters");
+            preset->setCurrentIndex(presetIndex("mp4"));
+            QVERIFY(chapters->isEnabled());
+            preset->setCurrentIndex(presetIndex("gif"));
+            QVERIFY(!chapters->isEnabled());
+        }
+        // One undo step each.
+        state()->undo();
+        state()->undo();
+        const auto& restored = state()->sequence()->markers;
+        QCOMPARE(std::count_if(restored.begin(), restored.end(), [](const Marker& m) { return m.chapter; }), 1);
     }
 
     void razorTool() {

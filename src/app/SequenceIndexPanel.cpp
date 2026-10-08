@@ -103,7 +103,7 @@ void SequenceIndexPanel::rebuild() {
             row.marker = true;
             row.markerIndex = int(i);
             row.start = mk.t;
-            addRow(row, {QString::fromStdString(mk.name), tr("Marker"), QString(), tc(mk.t), tc(mk.t + mk.duration), tc(mk.duration), QString(),
+            addRow(row, {QString::fromStdString(mk.name), mk.chapter ? tr("Chapter") : tr("Marker"), QString(), tc(mk.t), tc(mk.t + mk.duration), tc(mk.duration), QString(),
                          QString(), QString::fromStdString(mk.comment)});
         }
     }
