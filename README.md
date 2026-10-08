@@ -136,6 +136,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Insert effects on audio tracks, buses (submixes) and the master, including plugins. Use a strip's FX button to edit them in the Inspector, route tracks to buses from the strip's output menu, and add buses with + Bus. Track effects keep running past the last clip, so reverb and echo tails ring out.
 - Plugin delay compensation: the latency plugins report is compensated on clips, tracks, buses and the master, so everything stays in sync with the picture and with other tracks, including straight after a seek.
 - Render and Replace bakes an audio clip's effects into a new audio file to save CPU, and Restore Unrendered brings the original back (both on the clip's right-click menu).
+- **Global Mute** (Sequence menu, as in Premiere): silences playback and scrubbing without touching any clip, track or export; the meters keep moving.
 - Peak meters with hold and clip indicators
 - Effects:
   - EQ: 3-band and 5-band parametric EQ (low shelf, three bells, high shelf), high/low-pass.

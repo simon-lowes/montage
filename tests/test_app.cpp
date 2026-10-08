@@ -3490,6 +3490,46 @@ const auto seq = [this] { return state()->sequence(); };
         state()->setSelection({}, false);
     }
 
+    void globalMute() {
+        // A tone on A1: heard, then silent under Global Mute, with the clip and track untouched.
+        state()->newProject();
+        const QString wav = dir_.path() + "/mute-tone.wav";
+        {
+            QFile f(wav);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            const int rate = 48000, n = rate;
+            auto u32 = [&](uint32_t v) { f.write(reinterpret_cast<const char*>(&v), 4); };
+            auto u16 = [&](uint16_t v) { f.write(reinterpret_cast<const char*>(&v), 2); };
+            f.write("RIFF", 4), u32(36 + n * 2), f.write("WAVEfmt ", 8), u32(16), u16(1), u16(1), u32(rate), u32(rate * 2), u16(2), u16(16);
+            f.write("data", 4), u32(n * 2);
+            for (int i = 0; i < n; ++i) u16(uint16_t(int16_t(std::lround(8000 * std::sin(2 * M_PI * 440 * i / rate)))));
+        }
+        const auto ids = state()->importFiles({wav});
+        QCOMPARE(ids.size(), size_t(1));
+        state()->apply("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        });
+        auto* program = win_->findChild<PlaybackController*>("programPlayback");
+        QVERIFY(program);
+        auto peak = [](const std::vector<float>& v) {
+            float m = 0;
+            for (float x : v) m = std::max(m, std::fabs(x));
+            return m;
+        };
+        QTRY_VERIFY(peak(program->heard(4800, 4800)) > 0.1f);
+        QAction* mute = win_->findChild<QAction*>("globalMute");
+        QVERIFY(mute && mute->isCheckable());
+        mute->trigger();
+        QVERIFY(program->globalMute());
+        QCOMPARE(peak(program->heard(4800, 4800)), 0.0f);
+        // Nothing in the project changed.
+        const Sequence* s = state()->sequence();
+        QVERIFY(!s->audioTracks[0].muted && s->audioTracks[0].clips.front().enabled);
+        mute->trigger();
+        QVERIFY(!program->globalMute());
+        QVERIFY(peak(program->heard(4800, 4800)) > 0.1f);
+    }
+
     void sequenceIndexPanel() {
         loadDemo();
         state()->edit("Marker", [](Project&, Sequence& s) {

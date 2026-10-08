@@ -103,7 +103,9 @@ QSettings appSettings() { return QSettings("Montage", "Montage"); }
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     state_ = new EditorState(this);
     program_ = new PlaybackController(this);
+    program_->setObjectName(QStringLiteral("programPlayback"));
     source_ = new PlaybackController(this);
+    source_->setObjectName(QStringLiteral("sourcePlayback"));
     setDockNestingEnabled(true);
     setDockOptions(QMainWindow::AnimatedDocks | QMainWindow::AllowTabbedDocks | QMainWindow::AllowNestedDocks);
     buildPanels();
@@ -626,6 +628,15 @@ void MainWindow::buildMenus() {
         SpeechDialog dlg(state_, this);
         dlg.exec();
     })->setObjectName(QStringLiteral("generateVoiceover"));
+    {
+        QAction* mute = add(seqM, tr("Global &Mute"), QKeySequence(), [] {});
+        mute->setObjectName(QStringLiteral("globalMute"));
+        mute->setCheckable(true);
+        connect(mute, &QAction::toggled, this, [this](bool on) {
+            program_->setGlobalMute(on);
+            state_->message(on ? tr("Global Mute: playback is silent (clips, tracks and exports are unchanged)") : tr("Global Mute off"), 4000);
+        });
+    }
     add(seqM, tr("Render In to Out"), QKeySequence(Qt::Key_Return), [this] { renderInToOut(); })
         ->setObjectName(QStringLiteral("renderInToOut"));
     add(seqM, tr("Delete Render Files"), QKeySequence(), [this] { deleteRenderFiles(); })

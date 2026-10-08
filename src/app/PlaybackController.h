@@ -47,6 +47,11 @@ public:
     bool showCaptions() const { return showCaptions_; }
 
     bool isPlaying() const { return speed_ != 0; }
+    // Global Mute (as in Premiere): playback and scrubbing are silent; clips, tracks and exports are untouched.
+    void setGlobalMute(bool on);
+    bool globalMute() const { return globalMute_; }
+    // What the speakers get for `frames` samples of the sequence from sample `start` (silence under Global Mute).
+    std::vector<float> heard(int64_t start, int frames);
     double speed() const { return speed_; }
     FrameTime position() const { return position_; }
 
@@ -108,6 +113,7 @@ private:
     QIODevice* scrubIo_ = nullptr;
     int scrubRate_ = 0;
     AudioMixer scrubMixer_;
+    bool globalMute_ = false;
 };
 
 }  // namespace montage

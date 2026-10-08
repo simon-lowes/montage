@@ -1,5 +1,7 @@
 #include "PlaybackController.h"
 
+#include <atomic>
+
 #include "media/Loudness.h"
 #include "render/RenderCache.h"
 
@@ -178,6 +180,8 @@ public:
         QMutexLocker lock(&m_);
         project_ = std::move(p);
     }
+    // Global Mute: the meters still move, the speakers get silence.
+    void setMuted(bool on) { muted_ = on; }
     bool isSequential() const override { return true; }
     qint64 bytesAvailable() const override { return (1 << 16) + QIODevice::bytesAvailable(); }
 
@@ -204,6 +208,7 @@ protected:
             pl = std::max(pl, std::fabs(buf_[size_t(i) * 2]));
             pr = std::max(pr, std::fabs(buf_[size_t(i) * 2 + 1]));
         }
+        if (muted_) std::fill(buf_.begin(), buf_.end(), 0.0f);
         if (int16_) {
             auto* d = reinterpret_cast<int16_t*>(data);
             for (size_t i = 0; i < buf_.size(); ++i) d[i] = int16_t(std::lround(std::clamp(buf_[i], -1.0f, 1.0f) * 32767.0f));
@@ -240,6 +245,7 @@ private:
     Id seq_ = 0;
     int64_t sample_ = 0;
     bool int16_ = false;
+    std::atomic<bool> muted_{false};
     AudioMixer mixer_;
     std::vector<float> buf_;
     QMutex meterM_;
@@ -328,9 +334,24 @@ void PlaybackController::seek(FrameTime t) {
     emit positionChanged(position_);
 }
 
+void PlaybackController::setGlobalMute(bool on) {
+    globalMute_ = on;
+    device_->setMuted(on);
+}
+
+std::vector<float> PlaybackController::heard(int64_t start, int frames) {
+    std::vector<float> mix(size_t(std::max(0, frames)) * 2, 0.0f);
+    const Sequence* s = sequence();
+    if (!s || globalMute_ || frames <= 0) return mix;
+    scrubMixer_.reset();
+    scrubMixer_.setNonBlocking(false);
+    scrubMixer_.mix(*project_, *s, start, frames, mix.data());
+    return mix;
+}
+
 void PlaybackController::scrubAudio(FrameTime t) {
     const Sequence* s = sequence();
-    if (!scrubbing_ || !s || s->audioTracks.empty()) return;
+    if (!scrubbing_ || !s || s->audioTracks.empty() || globalMute_) return;
     if (!scrubSink_) {
         QAudioDevice dev = QMediaDevices::defaultAudioOutput();
         if (dev.isNull()) {
