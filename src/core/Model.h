@@ -205,6 +205,20 @@ struct Transition {
     bool operator==(const Transition&) const = default;
 };
 
+// Where a track or bus sits in a surround mix (core/Surround.h): its position
+// (x left to right, y back to front, both -1..1; the edge of the circle is at
+// the speakers, nearer the middle spreads it over all of them), how far apart
+// its left and right channels are (1: as wide as the front pair, 0: one
+// point), and how much goes to the LFE. The default puts a stereo track on
+// the front left and right speakers, as in stereo.
+struct SurroundPan {
+    double x = 0;
+    double y = 1;
+    double width = 1;
+    double lfeDb = -100;  // -100 = none
+    bool operator==(const SurroundPan&) const = default;
+};
+
 struct Track {
     Id id = 0;
     TrackKind kind = TrackKind::Video;
@@ -220,6 +234,7 @@ struct Track {
     int height = 0;       // UI hint, 0 = default
     std::vector<Effect> effects;  // audio track inserts, before the fader (keyframes in timeline frames)
     Id output = 0;                // audio: the bus the track feeds, 0 = master
+    SurroundPan surround;         // audio, in 5.1 and 7.1 sequences
     bool operator==(const Track&) const = default;
 };
 
@@ -232,6 +247,7 @@ struct Bus {
     double volumeDb = 0;
     double pan = 0;
     bool muted = false;
+    SurroundPan surround;
     bool operator==(const Bus&) const = default;
 };
 
@@ -251,6 +267,7 @@ struct Sequence {
     int height = 1080;
     Rational fps{30, 1};
     int sampleRate = 48000;
+    std::string audioLayout = "stereo";  // "stereo", "5.1" or "7.1" (core/Surround.h)
     std::vector<Track> videoTracks;   // [0] = V1 (bottom-most)
     std::vector<Track> audioTracks;   // [0] = A1
     std::vector<Marker> markers;

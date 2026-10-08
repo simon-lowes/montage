@@ -29,6 +29,7 @@ public:
         std::shared_ptr<const Project> project;
         Id sequence = 0;
         ExportSettings settings;
+        int stems = 0;  // after the export: 1 a WAV per audio track, 2 per bus
         Status status = Status::Waiting;
         double progress = 0;
         QString error;
@@ -43,7 +44,8 @@ public:
     ~RenderQueue() override;
 
     // Adds a job (a copy of `project` is kept); returns its id.
-    int add(const QString& name, const QString& preset, const Project& project, Id sequence, const ExportSettings& settings);
+    int add(const QString& name, const QString& preset, const Project& project, Id sequence, const ExportSettings& settings,
+            int stems = 0);
     const std::vector<Job>& jobs() const { return jobs_; }
     const Job* job(int id) const;
 

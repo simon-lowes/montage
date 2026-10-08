@@ -42,6 +42,7 @@
 #include "core/KeyframeEdit.h"
 #include "core/MediaLog.h"
 #include "SequenceSettingsDialog.h"
+#include "SurroundPanner.h"
 #include "audio/Plugins.h"
 #include "MainWindow.h"
 #include "media/Beats.h"
@@ -561,6 +562,111 @@ private slots:
         QCOMPARE(state()->sequence()->audioTracks.at(0).output, Id(0));
         state()->undo();
         QVERIFY(state()->sequence()->buses.empty());
+    }
+
+    void surroundMixerAndExport() {
+        loadDemo();
+        // Speech on A1 and A2.
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        QVERIFY(state()->sequence()->audioTracks.size() >= 2);
+        for (int t = 0; t < 2; ++t)
+            QVERIFY(state()->apply("Place", [media, t](Project& p, Sequence& s) {
+                return edit::placeMedia(p, s, media, 0, 0, 60, V1, {TrackKind::Audio, t}, false);
+            }));
+        // Sequence settings carry the layout.
+        {
+            SequenceSettingsDialog dlg(win_.get());
+            NewSequenceSpec spec;
+            spec.audioLayout = "5.1";
+            dlg.setSpec(spec);
+            auto* layout = dlg.findChild<QComboBox*>("audioLayout");
+            QVERIFY(layout);
+            QCOMPARE(layout->currentData().toString(), QString("5.1"));
+            layout->setCurrentIndex(layout->findData(QString("7.1")));
+            QCOMPARE(dlg.spec().audioLayout, std::string("7.1"));
+        }
+        auto* mixer = win_->findChild<MixerPanel*>();
+        QVERIFY(mixer);
+        auto visiblePanners = [&] {
+            std::vector<SurroundPanner*> v;
+            for (auto* p : mixer->findChildren<SurroundPanner*>("surroundPanner"))
+                if (p->isVisibleTo(mixer)) v.push_back(p);
+            return v;
+        };
+        QVERIFY(visiblePanners().empty());  // stereo: pan dials
+        QVERIFY(state()->edit("5.1", [](Project&, Sequence& s) {
+            s.audioLayout = "5.1";
+            return true;
+        }));
+        QApplication::processEvents();
+        const size_t tracks = state()->sequence()->audioTracks.size();
+        QCOMPARE(visiblePanners().size(), tracks);
+        // Drag the first track's sound round to the back left: one undo step.
+        SurroundPanner* panner = visiblePanners().front();
+        const QPointF front = panner->toWidget(0, 1), back = panner->toWidget(-0.7, -0.7);
+        QTest::mousePress(panner, Qt::LeftButton, {}, front.toPoint());
+        QTest::mouseMove(panner, ((front + back) / 2).toPoint());
+        QTest::mouseMove(panner, back.toPoint());
+        QTest::mouseRelease(panner, Qt::LeftButton, {}, back.toPoint());
+        const SurroundPan placed = state()->sequence()->audioTracks.at(0).surround;
+        QVERIFY2(placed.x < -0.5 && placed.y < -0.5, qPrintable(QString("%1 %2").arg(placed.x).arg(placed.y)));
+        // The wheel narrows it.
+        QWheelEvent wheel(panner->rect().center(), panner->mapToGlobal(panner->rect().center()), {}, {0, -120}, Qt::NoButton, {},
+                          Qt::NoScrollPhase, false);
+        QApplication::sendEvent(panner, &wheel);
+        QVERIFY(std::fabs(state()->sequence()->audioTracks.at(0).surround.width - 0.9) < 1e-9);
+        state()->undo();  // straight after, the drag and the wheel are one step
+        QCOMPARE(state()->sequence()->audioTracks.at(0).surround, SurroundPan{});
+        QCOMPARE(state()->sequence()->audioLayout, std::string("5.1"));
+        // Routed to a bus, a track is placed by the bus's panner instead.
+        mixer->findChild<QToolButton*>("addBus")->click();
+        const Id bus = state()->sequence()->buses.at(0).id;
+        QVERIFY(state()->edit("Route", [bus](Project&, Sequence& s) {
+            s.audioTracks[0].output = bus;
+            return true;
+        }));
+        QApplication::processEvents();
+        QCOMPARE(visiblePanners().size(), tracks);  // one track fewer, one bus more
+
+        // Export: every channel or the stereo fold-down, and stems.
+        {
+            ExportDialog ed(state(), win_.get());
+            auto* channels = ed.findChild<QComboBox*>("exportAudioChannels");
+            auto* stems = ed.findChild<QComboBox*>("exportStems");
+            QVERIFY(channels && stems);
+            QVERIFY(!channels->isHidden());
+            QVERIFY(channels->itemText(0).contains("5.1") && channels->itemText(0).contains("6"));
+            QCOMPARE(stems->count(), 3);
+            auto* preset = ed.findChild<QComboBox*>("exportPreset");
+            auto* path = ed.findChild<QLineEdit*>("exportPath");
+            QVERIFY(preset && path);
+            preset->setCurrentIndex(preset->findText("Audio - WAV 24-bit"));
+            path->setText(dir_.path() + "/surround-mix.wav");
+            channels->setCurrentIndex(1);
+            stems->setCurrentIndex(2);
+            auto* go = ed.findChild<QPushButton*>("exportButton");
+            QVERIFY(go);
+            go->click();
+            QTRY_COMPARE_WITH_TIMEOUT(ed.result(), int(QDialog::Accepted), 60000);
+        }
+        MediaItem m;
+        QVERIFY(probeMedia((dir_.path() + "/surround-mix.wav").toStdString(), m));
+        QCOMPARE(m.channels, 2);
+        const QString busName = QString::fromStdString(state()->sequence()->buses.at(0).name);
+        QVERIFY(QFileInfo::exists(dir_.path() + "/surround-mix - " + busName + ".wav"));
+        QVERIFY(QFileInfo::exists(dir_.path() + "/surround-mix - Main.wav"));
+        state()->undo();  // the route
+        state()->undo();  // the bus
+        state()->undo();  // 5.1
+        QCOMPARE(state()->sequence()->audioLayout, std::string("stereo"));
+        QApplication::processEvents();
+        QVERIFY(visiblePanners().empty());
+        {
+            ExportDialog ed(state(), win_.get());
+            QVERIFY(ed.findChild<QComboBox*>("exportAudioChannels")->isHidden());
+        }
     }
 
     void renderAndReplaceInTheTimeline() {

@@ -53,6 +53,21 @@ Interp interpFrom(const QString& s) {
     return Interp::Linear;
 }
 
+QJsonValue surroundToJson(const SurroundPan& p) {
+    if (p == SurroundPan{}) return QJsonValue();
+    return QJsonObject{{"x", p.x}, {"y", p.y}, {"width", p.width}, {"lfeDb", p.lfeDb}};
+}
+
+SurroundPan surroundFromJson(const QJsonValue& v) {
+    SurroundPan p;
+    const QJsonObject o = v.toObject();
+    p.x = std::clamp(o.value("x").toDouble(0), -1.0, 1.0);
+    p.y = std::clamp(o.value("y").toDouble(1), -1.0, 1.0);
+    p.width = std::clamp(o.value("width").toDouble(1), 0.0, 1.0);
+    p.lfeDb = std::clamp(o.value("lfeDb").toDouble(-100), -100.0, 12.0);
+    return p;
+}
+
 QJsonValue paramToJson(const Param& p) {
     if (p.keys.empty()) return p.value;
     QJsonArray keys;
@@ -221,6 +236,7 @@ QJsonObject trackToJson(const Track& t) {
         o["effects"] = fx;
     }
     if (t.output) o["output"] = double(t.output);
+    if (const QJsonValue sp = surroundToJson(t.surround); !sp.isUndefined()) o["surround"] = sp;
     return o;
 }
 
@@ -250,6 +266,7 @@ Track trackFromJson(const QJsonObject& o, TrackKind kind) {
     t.height = o.value("height").toInt(0);
     for (const auto& e : o.value("effects").toArray()) t.effects.push_back(effectFromJson(e));
     t.output = Id(i64(o.value("output")));
+    if (o.contains("surround")) t.surround = surroundFromJson(o.value("surround"));
     std::sort(t.clips.begin(), t.clips.end(), [](const Clip& a, const Clip& b) { return a.start < b.start; });
     return t;
 }
@@ -345,8 +362,10 @@ QJsonObject sequenceToJson(const Sequence& s) {
         for (const auto& b : s.buses) {
             QJsonArray fx;
             for (const auto& e : b.effects) fx.append(effectToJson(e));
-            buses.append(QJsonObject{{"id", double(b.id)}, {"name", qs(b.name)}, {"effects", fx},
-                                     {"volumeDb", b.volumeDb}, {"pan", b.pan}, {"muted", b.muted}});
+            QJsonObject bo{{"id", double(b.id)}, {"name", qs(b.name)}, {"effects", fx},
+                           {"volumeDb", b.volumeDb}, {"pan", b.pan}, {"muted", b.muted}};
+            if (const QJsonValue sp = surroundToJson(b.surround); !sp.isUndefined()) bo["surround"] = sp;
+            buses.append(bo);
         }
         o["buses"] = buses;
     }
@@ -359,6 +378,7 @@ QJsonObject sequenceToJson(const Sequence& s) {
     if (s.multicam) o["multicam"] = true;
     if (s.colorSpace != "rec709") o["colorSpace"] = qs(s.colorSpace);
     if (s.hdrPeakNits != 1000) o["hdrPeakNits"] = s.hdrPeakNits;
+    if (s.audioLayout != "stereo") o["audioLayout"] = qs(s.audioLayout);
     return o;
 }
 
@@ -378,6 +398,8 @@ Sequence sequenceFromJson(const QJsonObject& o) {
     s.multicam = o.value("multicam").toBool(false);
     s.colorSpace = o.contains("colorSpace") ? ss(o.value("colorSpace")) : "rec709";
     s.hdrPeakNits = std::clamp(o.value("hdrPeakNits").toDouble(1000), 100.0, 10000.0);
+    s.audioLayout = o.contains("audioLayout") ? ss(o.value("audioLayout")) : "stereo";
+    if (s.audioLayout != "5.1" && s.audioLayout != "7.1") s.audioLayout = "stereo";
     for (const auto& t : o.value("video").toArray()) s.videoTracks.push_back(trackFromJson(t.toObject(), TrackKind::Video));
     for (const auto& t : o.value("audio").toArray()) s.audioTracks.push_back(trackFromJson(t.toObject(), TrackKind::Audio));
     for (const auto& mv : o.value("markers").toArray()) {
@@ -400,6 +422,7 @@ Sequence sequenceFromJson(const QJsonObject& o) {
         b.volumeDb = bo.value("volumeDb").toDouble(0);
         b.pan = bo.value("pan").toDouble(0);
         b.muted = bo.value("muted").toBool(false);
+        if (bo.contains("surround")) b.surround = surroundFromJson(bo.value("surround"));
         s.buses.push_back(std::move(b));
     }
     for (const auto& e : o.value("masterEffects").toArray()) s.masterEffects.push_back(effectFromJson(e));

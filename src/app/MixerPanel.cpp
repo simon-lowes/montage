@@ -19,6 +19,8 @@
 
 #include "AudioMeterWidget.h"
 #include "EditorState.h"
+#include "SurroundPanner.h"
+#include "core/Surround.h"
 #include "Theme.h"
 
 namespace montage {
@@ -195,6 +197,10 @@ MixerPanel::BusStrip MixerPanel::makeBusStrip(Id bus) {
     b.mute->setText(tr("M"));
     b.mute->setCheckable(true);
     v->addWidget(b.mute, 0, Qt::AlignHCenter);
+    b.surround = new SurroundPanner(box);
+    b.surround->setObjectName(QStringLiteral("surroundPanner"));
+    b.surround->hide();
+    v->insertWidget(2, b.surround, 0, Qt::AlignHCenter);
     auto editBus = [this, bus](const QString& label, std::function<bool(Bus&)> fn, const QString& merge = {}) {
         state_->edit(label, [bus, fn](Project&, Sequence& s) {
             for (Bus& x : s.buses)
@@ -203,6 +209,13 @@ MixerPanel::BusStrip MixerPanel::makeBusStrip(Id bus) {
         }, merge);
     };
     connect(b.fx, &QToolButton::clicked, this, [this, bus] { inspect(bus); });
+    connect(b.surround, &SurroundPanner::changed, this, [editBus, bus](const SurroundPan& pan, bool) {
+        editBus(tr("Bus Surround Pan"), [pan](Bus& x) {
+            if (x.surround == pan) return false;
+            x.surround = pan;
+            return true;
+        }, QStringLiteral("bus-surround-%1").arg(bus));
+    });
     connect(b.fader, &QSlider::valueChanged, this, [editBus, bus](int value) {
         const double db = value / 10.0;
         editBus(tr("Bus Volume"), [db](Bus& x) {
@@ -290,6 +303,11 @@ MixerPanel::Strip MixerPanel::makeStrip(int index) {
     s.panLabel = smallLabel(box);
     s.panLabel->setStyleSheet(QStringLiteral("color: %1;").arg(theme::kTextDim.name()));
     v->addWidget(s.panLabel);
+    s.surround = new SurroundPanner(box);
+    s.surround->setObjectName(QStringLiteral("surroundPanner"));
+    s.surround->hide();
+    v->addWidget(s.surround, 0, Qt::AlignHCenter);
+    connect(s.surround, &SurroundPanner::changed, this, [this, index](const SurroundPan& pan, bool final) { setSurround(index, pan, final); });
 
     auto* mid = new QHBoxLayout;
     mid->setContentsMargins(0, 0, 0, 0);
@@ -419,6 +437,14 @@ void MixerPanel::refresh() {
             s.pan->setValue(int(std::lround(std::clamp(t.pan, -1.0, 1.0) * 100.0)));
         }
         s.panLabel->setText(panText(s.pan->value()));
+        // In surround, a track going straight to the master is placed among the speakers;
+        // one going to a bus is panned in stereo into it.
+        const bool surround = layoutChannels(seq->audioLayout) > 2 && !t.output;
+        s.pan->setVisible(!surround);
+        s.panLabel->setVisible(!surround);
+        s.surround->setVisible(surround);
+        s.surround->setSpeakerLayout(seq->audioLayout);
+        s.surround->setPan(t.surround);
         {
             const QSignalBlocker block(s.mute);
             s.mute->setChecked(t.muted);
@@ -454,6 +480,9 @@ void MixerPanel::refresh() {
             const QSignalBlocker block(st.mute);
             st.mute->setChecked(b.muted);
         }
+        st.surround->setVisible(layoutChannels(seq->audioLayout) > 2);
+        st.surround->setSpeakerLayout(seq->audioLayout);
+        st.surround->setPan(b.surround);
     }
     masterFx_->setText(seq->masterEffects.empty() ? tr("FX") : tr("FX %1").arg(seq->masterEffects.size()));
     {
@@ -493,6 +522,17 @@ void MixerPanel::setPan(int index, double pan) {
         QStringLiteral("track-pan-%1").arg(index));
     if (!ok)
         refresh();
+}
+
+void MixerPanel::setSurround(int index, const SurroundPan& pan, bool) {
+    state_->edit(
+        tr("Track Surround Pan"),
+        [index, pan](Project&, Sequence& s) {
+            if (index >= int(s.audioTracks.size()) || s.audioTracks[size_t(index)].surround == pan) return false;
+            s.audioTracks[size_t(index)].surround = pan;
+            return true;
+        },
+        QStringLiteral("track-surround-%1").arg(index));
 }
 
 void MixerPanel::setMute(int index, bool on) {

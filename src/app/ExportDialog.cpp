@@ -27,6 +27,7 @@
 
 #include "EditorState.h"
 #include "RenderQueue.h"
+#include "core/Surround.h"
 #include "SequenceSettingsDialog.h"
 #include "Theme.h"
 #include "core/History.h"
@@ -123,6 +124,7 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     form_ = new QWidget(this);
 
     preset_ = new QComboBox(form_);
+    preset_->setObjectName(QStringLiteral("exportPreset"));
     for (const ExportPreset& p : exportPresets()) preset_->addItem(QString::fromStdString(p.name));
     presetDescription_ = new QLabel(form_);
     presetDescription_->setPalette(dim);
@@ -207,6 +209,25 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     loudness_->setToolTip(tr("Measures the whole mix first, then sets its level to the target, with a limiter "
                              "keeping peaks under the ceiling"));
     form->addRow(tr("Loudness:"), loudness_);
+    // Surround sequences: every channel, or the stereo fold-down.
+    {
+        const Sequence* sq = state_->sequence();
+        const std::string layout = sq ? sq->audioLayout : "stereo";
+        audioOut_ = new QComboBox(form_);
+        audioOut_->setObjectName(QStringLiteral("exportAudioChannels"));
+        audioOut_->addItem(tr("%1 (%n channels)", "", layoutChannels(layout)).arg(QString::fromStdString(layout)));
+        audioOut_->addItem(tr("Stereo (folded down)"));
+        if (layoutChannels(layout) > 2) form->addRow(tr("Audio channels:"), audioOut_);
+        else audioOut_->hide();
+    }
+    stems_ = new QComboBox(form_);
+    stems_->setObjectName(QStringLiteral("exportStems"));
+    stems_->addItem(tr("None"));
+    stems_->addItem(tr("Also one WAV per audio track"));
+    stems_->addItem(tr("Also one WAV per bus (and Main)"));
+    stems_->setToolTip(tr("Stems for delivery: each track's or bus's part of the mix, exactly as it plays in it,\n"
+                          "written beside the export as \"<name> - <track>.wav\". Together they add up to the mix."));
+    form->addRow(tr("Stems:"), stems_);
     // Burn-ins: what a review copy carries in the picture.
     {
         QSettings st = appSettings();
@@ -267,6 +288,7 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
 
     auto* buttons = new QDialogButtonBox(this);
     exportButton_ = buttons->addButton(tr("Export"), QDialogButtonBox::AcceptRole);
+    exportButton_->setObjectName(QStringLiteral("exportButton"));
     queueButton_ = buttons->addButton(tr("Add to Queue"), QDialogButtonBox::ActionRole);
     queueButton_->setObjectName(QStringLiteral("addToQueue"));
     queueButton_->setToolTip(tr("Render it later from the Render Queue panel, and keep editing"));
@@ -551,6 +573,8 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
         s.peakCeiling = target.y();
     }
     settings.setValue("export/loudness", loudness_->currentIndex());
+    if (hasAudio(s)) s.downmixStereo = !audioOut_->isHidden() && audioOut_->currentIndex() == 1;
+    stemsMode_ = hasAudio(s) ? stems_->currentIndex() : 0;
     if (hasVideo(s)) {
         s.burnIn.timecode = burnTimecode_->isChecked();
         s.burnIn.clipName = burnClipName_->isChecked();
@@ -585,7 +609,7 @@ void ExportDialog::addToQueue() {
     if (!queue_ || !prepare(s, in, out)) return;
     const Sequence* seq = state_->sequence();
     const QString preset = preset_->currentText();
-    queue_->add(QString::fromStdString(seq->name), preset, state_->project(), seq->id, s);
+    queue_->add(QString::fromStdString(seq->name), preset, state_->project(), seq->id, s, stemsMode_);
     state_->message(tr("Added %1 to the render queue").arg(QFileInfo(QString::fromStdString(s.path)).fileName()), 5000);
     accept();
 }
@@ -621,7 +645,8 @@ void ExportDialog::startExport() {
     const std::atomic<bool>* cancel = &cancel_;
     Project snap = state_->project();
     const Id seqId = seq->id;
-    watcher_.setFuture(QtConcurrent::run([snap = std::move(snap), seqId, s, onProgress, cancel]() -> Result {
+    const int stems = stemsMode_;
+    watcher_.setFuture(QtConcurrent::run([snap = std::move(snap), seqId, s, onProgress, cancel, stems]() -> Result {
         Result r;
         try {
             const Sequence* sq = snap.findSequence(seqId);
@@ -630,7 +655,13 @@ void ExportDialog::startExport() {
                 return r;
             }
             std::string error, encoder;
-            r.ok = exportSequence(snap, *sq, s, onProgress, cancel, &error, &encoder);
+            // With stems, the export fills the first half of the bar and the stems the second.
+            const double share = stems > 0 ? 0.5 : 1.0;
+            r.ok = exportSequence(
+                snap, *sq, s, [&](double f, FrameTime t) { onProgress(f * share, t); }, cancel, &error, &encoder);
+            if (r.ok && stems > 0)
+                r.ok = exportStems(
+                    snap, *sq, s, stems == 2, nullptr, [&](double f, FrameTime t) { onProgress(0.5 + f * 0.5, t); }, cancel, &error);
             r.error = QString::fromStdString(error);
             r.encoder = QString::fromStdString(encoder);
         } catch (const std::exception& e) {

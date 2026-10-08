@@ -85,6 +85,12 @@ public:
     // into `out` (interleaved, overwritten). Per-track peak levels go to `trackLevels`.
     void mix(const Project& p, const Sequence& seq, int64_t start, int frames, float* out,
              std::vector<MeterLevels>* trackLevels = nullptr);
+    // The same in the sequence's own layout (core/Surround.h): `out` gets
+    // layoutChannels(seq.audioLayout) interleaved channels. mix() gives the
+    // stereo fold-down of a surround mix, for listening.
+    void mixLayout(const Project& p, const Sequence& seq, int64_t start, int frames, float* out);
+    // Mixes only the audio tracks whose entry is true (stems); empty = all.
+    void setTrackMask(std::vector<bool> mask) { mask_ = std::move(mask); }
     // Drop filter state (call after seeking).
     void reset();
     // Real-time mode: media whose audio is not decoded yet plays as silence
@@ -97,8 +103,9 @@ public:
 private:
     // `rate` overrides the sequence's sample rate (nested sequences mix at the outer rate);
     // `onlyTrack` mixes that audio track alone (a multicam clip's audio angle).
+    // `channels` is 2, or the sequence layout's count for a surround mix (depth 0 only).
     void mixInto(const Project& p, const Sequence& seq, int64_t start, int frames, float* out,
-                 std::vector<MeterLevels>* trackLevels, int depth, int rate = 0, int onlyTrack = -1);
+                 std::vector<MeterLevels>* trackLevels, int depth, int rate = 0, int onlyTrack = -1, int channels = 2);
     // Runs an effect chain over an interleaved stereo block; DSP state is kept per (owner, effect).
     void processChain(const std::vector<Effect>& chain, Id owner, FrameTime lt, double sr, float* buf, int frames);
     // Sums a track's clips over [start, start + frames) into trackBuf; false if none plays.
@@ -112,6 +119,7 @@ private:
     std::map<std::pair<Id, Id>, std::unique_ptr<State>> states_;
     std::mutex m_;
     bool nonBlocking_ = false;
+    std::vector<bool> mask_;
 };
 
 }  // namespace montage

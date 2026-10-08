@@ -26,6 +26,7 @@ struct NewSequenceSpec {
     int sampleRate = 48000;
     std::string colorSpace = "rec709";
     double hdrPeakNits = 1000;
+    std::string audioLayout = "stereo";  // "stereo", "5.1" or "7.1"
 };
 
 // Spin box that only accepts even values (most encoders need even frame sizes).
@@ -70,6 +71,7 @@ private:
     QComboBox* sampleRate_ = nullptr;
     QComboBox* colorSpace_ = nullptr;
     QSpinBox* hdrPeak_ = nullptr;
+    QComboBox* audioLayout_ = nullptr;
     QLabel* summary_ = nullptr;
     QPushButton* okButton_ = nullptr;
     bool updating_ = false;

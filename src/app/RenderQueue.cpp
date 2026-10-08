@@ -18,7 +18,8 @@ RenderQueue::~RenderQueue() {
     watcher_.waitForFinished();
 }
 
-int RenderQueue::add(const QString& name, const QString& preset, const Project& project, Id sequence, const ExportSettings& settings) {
+int RenderQueue::add(const QString& name, const QString& preset, const Project& project, Id sequence, const ExportSettings& settings,
+                     int stems) {
     Job j;
     j.id = nextId_++;
     j.name = name;
@@ -26,6 +27,7 @@ int RenderQueue::add(const QString& name, const QString& preset, const Project& 
     j.project = std::make_shared<const Project>(project);
     j.sequence = sequence;
     j.settings = settings;
+    j.stems = stems;
     jobs_.push_back(std::move(j));
     emit changed();
     return jobs_.back().id;
@@ -110,9 +112,10 @@ void RenderQueue::next() {
     const std::shared_ptr<const Project> project = j->project;
     const Id seq = j->sequence;
     const ExportSettings settings = j->settings;
+    const int stems = j->stems;
     std::atomic<bool>* cancel = &cancel_;
     std::atomic<double>* progress = &progress_;
-    watcher_.setFuture(QtConcurrent::run([project, seq, settings, cancel, progress]() -> Result {
+    watcher_.setFuture(QtConcurrent::run([project, seq, settings, stems, cancel, progress]() -> Result {
         Result r;
         const Sequence* s = project->findSequence(seq);
         if (!s) {
@@ -120,7 +123,12 @@ void RenderQueue::next() {
             return r;
         }
         try {
-            r.ok = exportSequence(*project, *s, settings, [progress](double f, FrameTime) { *progress = f; }, cancel, &r.error, &r.encoder);
+            const double share = stems ? 0.5 : 1.0;  // the stems take the second half of the bar
+            r.ok = exportSequence(*project, *s, settings, [progress, share](double f, FrameTime) { *progress = f * share; }, cancel,
+                                  &r.error, &r.encoder);
+            if (r.ok && stems)
+                r.ok = exportStems(*project, *s, settings, stems == 2, nullptr,
+                                   [progress](double f, FrameTime) { *progress = 0.5 + f * 0.5; }, cancel, &r.error);
         } catch (const std::exception& e) {
             r.error = e.what();
         }

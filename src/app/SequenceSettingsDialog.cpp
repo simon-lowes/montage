@@ -146,6 +146,14 @@ SequenceSettingsDialog::SequenceSettingsDialog(QWidget* parent) : QDialog(parent
     hdrPeak_->setSuffix(tr(" nits"));
     hdrPeak_->setToolTip(tr("Mastering display peak: the brightest level exported, written into HDR10 metadata"));
 
+    audioLayout_ = new QComboBox(this);
+    audioLayout_->setObjectName(QStringLiteral("audioLayout"));
+    audioLayout_->addItem(tr("Stereo"), QStringLiteral("stereo"));
+    audioLayout_->addItem(tr("5.1 surround (L R C LFE Ls Rs)"), QStringLiteral("5.1"));
+    audioLayout_->addItem(tr("7.1 surround (L R C LFE Lb Rb Ls Rs)"), QStringLiteral("7.1"));
+    audioLayout_->setToolTip(tr("The speakers the sequence mixes to. Surround mixes are heard folded down to stereo,\n"
+                                "and each track and bus gets a surround panner in the mixer."));
+
     summary_ = new QLabel(this);
     QPalette dim = summary_->palette();
     dim.setColor(QPalette::WindowText, theme::kTextDim);
@@ -158,6 +166,7 @@ SequenceSettingsDialog::SequenceSettingsDialog(QWidget* parent) : QDialog(parent
     form->addRow(QString(), sizeRow);
     form->addRow(tr("Frame rate:"), frameRate_);
     form->addRow(tr("Sample rate:"), sampleRate_);
+    form->addRow(tr("Audio channels:"), audioLayout_);
     form->addRow(tr("Colour space:"), colorSpace_);
     form->addRow(tr("HDR peak:"), hdrPeak_);
     form->addRow(QString(), summary_);
@@ -195,6 +204,8 @@ void SequenceSettingsDialog::setSpec(const NewSequenceSpec& spec) {
     const int cs = colorSpace_->findData(QString::fromStdString(spec.colorSpace));
     colorSpace_->setCurrentIndex(cs >= 0 ? cs : 0);
     hdrPeak_->setValue(int(std::lround(spec.hdrPeakNits)));
+    const int al = audioLayout_->findData(QString::fromStdString(spec.audioLayout));
+    audioLayout_->setCurrentIndex(al >= 0 ? al : 0);
     updateSummary();
 }
 
@@ -208,6 +219,7 @@ NewSequenceSpec SequenceSettingsDialog::spec() const {
     s.sampleRate = sampleRate_->currentData().toInt();
     s.colorSpace = colorSpace_->currentData().toString().toStdString();
     s.hdrPeakNits = hdrPeak_->value();
+    s.audioLayout = audioLayout_->currentData().toString().toStdString();
     return s;
 }
 
@@ -280,7 +292,7 @@ bool SequenceSettingsDialog::editActive(EditorState* state, QWidget* parent) {
     if (!state || !state->sequence()) return false;
     const Sequence& seq = *state->sequence();
     const NewSequenceSpec before{QString::fromStdString(seq.name), seq.width, seq.height, seq.fps, seq.sampleRate,
-                                 seq.colorSpace, seq.hdrPeakNits};
+                                 seq.colorSpace, seq.hdrPeakNits, seq.audioLayout};
 
     SequenceSettingsDialog dlg(parent);
     dlg.setWindowTitle(tr("Sequence Settings"));
@@ -295,7 +307,7 @@ bool SequenceSettingsDialog::editActive(EditorState* state, QWidget* parent) {
     const NewSequenceSpec after = dlg.spec();
     if (after.name == before.name && after.width == before.width && after.height == before.height &&
         after.fps == before.fps && after.sampleRate == before.sampleRate && after.colorSpace == before.colorSpace &&
-        after.hdrPeakNits == before.hdrPeakNits)
+        after.hdrPeakNits == before.hdrPeakNits && after.audioLayout == before.audioLayout)
         return false;
 
     const std::string name = after.name.toStdString();
@@ -307,6 +319,7 @@ bool SequenceSettingsDialog::editActive(EditorState* state, QWidget* parent) {
         s.sampleRate = after.sampleRate;
         s.colorSpace = after.colorSpace;
         s.hdrPeakNits = after.hdrPeakNits;
+        s.audioLayout = after.audioLayout;
         // Keep the media item that represents this sequence (for nesting) in sync.
         for (MediaItem& m : p.media) {
             if (m.kind != MediaKind::Sequence || m.sequenceId != s.id) continue;
@@ -330,6 +343,7 @@ std::optional<NewSequenceSpec> SequenceSettingsDialog::askNew(QWidget* parent, c
     spec.sampleRate = settings.value(QStringLiteral("newSequence/sampleRate"), spec.sampleRate).toInt();
     spec.colorSpace = settings.value(QStringLiteral("newSequence/colorSpace"), QStringLiteral("rec709")).toString().toStdString();
     spec.hdrPeakNits = settings.value(QStringLiteral("newSequence/hdrPeakNits"), spec.hdrPeakNits).toDouble();
+    spec.audioLayout = settings.value(QStringLiteral("newSequence/audioLayout"), QStringLiteral("stereo")).toString().toStdString();
 
     SequenceSettingsDialog dlg(parent);
     dlg.setWindowTitle(tr("New Sequence"));
@@ -345,6 +359,7 @@ std::optional<NewSequenceSpec> SequenceSettingsDialog::askNew(QWidget* parent, c
     settings.setValue(QStringLiteral("newSequence/sampleRate"), spec.sampleRate);
     settings.setValue(QStringLiteral("newSequence/colorSpace"), QString::fromStdString(spec.colorSpace));
     settings.setValue(QStringLiteral("newSequence/hdrPeakNits"), spec.hdrPeakNits);
+    settings.setValue(QStringLiteral("newSequence/audioLayout"), QString::fromStdString(spec.audioLayout));
     return spec;
 }
 

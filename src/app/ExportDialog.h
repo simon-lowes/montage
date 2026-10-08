@@ -82,6 +82,9 @@ private:
     QComboBox* captions_ = nullptr;
     QComboBox* color_ = nullptr;
     QComboBox* loudness_ = nullptr;
+    QComboBox* audioOut_ = nullptr;  // a surround sequence: all its channels, or folded to stereo
+    QComboBox* stems_ = nullptr;     // also write stems: none, per track, per bus
+    int stemsMode_ = 0;
     // Burn-ins for review copies.
     QCheckBox* burnTimecode_ = nullptr;
     QCheckBox* burnClipName_ = nullptr;

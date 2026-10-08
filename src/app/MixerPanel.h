@@ -21,6 +21,7 @@ namespace montage {
 
 class AudioMeterWidget;
 class EditorState;
+class SurroundPanner;
 
 class MixerPanel : public QWidget {
     Q_OBJECT
@@ -47,6 +48,7 @@ private:
         QLabel* name = nullptr;
         QDial* pan = nullptr;
         QLabel* panLabel = nullptr;
+        SurroundPanner* surround = nullptr;  // instead of the pan, in 5.1 and 7.1 sequences
         QSlider* fader = nullptr;
         QLabel* dbLabel = nullptr;
         AudioMeterWidget* meter = nullptr;
@@ -62,6 +64,7 @@ private:
         QSlider* fader = nullptr;
         QLabel* dbLabel = nullptr;
         QToolButton* mute = nullptr;
+        SurroundPanner* surround = nullptr;
     };
 
     void syncToProject();  // rebuild if the audio track count changed, else refresh
@@ -75,6 +78,7 @@ private:
 
     void setVolume(int index, double db);
     void setPan(int index, double pan);
+    void setSurround(int index, const SurroundPan& pan, bool final);
     void setMute(int index, bool on);
     void setSolo(int index, bool on);
 

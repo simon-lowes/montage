@@ -13,7 +13,7 @@ namespace {
 // with coefficients derived for any sample rate (as in libebur128).
 struct KFilter {
     double b[2][3], a[2][3];
-    double z[2][2][2] = {};  // [stage][channel][state]
+    double z[2][8][2] = {};  // [stage][channel][state]
     explicit KFilter(double fs) {
         double f0 = 1681.974450955533, G = 3.999843853973347, Q = 0.7071752369554196;
         double K = std::tan(M_PI * f0 / fs), Vh = std::pow(10.0, G / 20.0), Vb = std::pow(Vh, 0.4996667741545416);
@@ -74,7 +74,7 @@ struct LoudnessMeter::Impl {
     double acc = 0;
     int64_t n = 0;
     double peak = 0;
-    std::array<std::array<double, kTaps>, 2> history{};  // recent samples per channel, for oversampling
+    std::array<std::array<double, kTaps>, 8> history{};  // recent samples per channel, for oversampling
     size_t hpos = 0;
     double maxM = -200, maxS = -200;
     // The mean square of the last `count` steps (fewer at the start).
@@ -95,23 +95,32 @@ LoudnessMeter::LoudnessMeter(int sampleRate) : d_(std::make_unique<Impl>(sampleR
 LoudnessMeter::~LoudnessMeter() = default;
 
 void LoudnessMeter::add(const float* stereo, int64_t frames) {
+    static const double weights[2] = {1.0, 1.0};
+    addChannels(stereo, frames, 2, weights);
+}
+
+void LoudnessMeter::addChannels(const float* data, int64_t frames, int channels, const double* weights) {
     Impl& d = *d_;
+    channels = std::clamp(channels, 1, 8);
     const auto& h = truePeakFilter();
     for (int64_t i = 0; i < frames; ++i) {
-        const double l = stereo[i * 2], r = stereo[i * 2 + 1];
-        // True peak: the samples between this one and the last, interpolated.
-        d.history[0][d.hpos] = l;
-        d.history[1][d.hpos] = r;
+        double sum = 0;
+        for (int ch = 0; ch < channels; ++ch) {
+            const double x = data[i * channels + ch];
+            d.history[size_t(ch)][d.hpos] = x;
+            d.peak = std::max(d.peak, std::fabs(x));
+            const double k = d.k.process(ch, x);
+            sum += weights[ch] * k * k;
+        }
         d.hpos = (d.hpos + 1) % kTaps;
-        for (int ch = 0; ch < 2; ++ch)
+        // True peak: the samples between this one and the last, interpolated.
+        for (int ch = 0; ch < channels; ++ch)
             for (int ph = 0; ph < kPhases; ++ph) {
                 double v = 0;
                 for (int k = 0; k < kTaps; ++k) v += h[size_t(ph)][size_t(k)] * d.history[size_t(ch)][(d.hpos + size_t(k)) % kTaps];
                 d.peak = std::max(d.peak, std::fabs(v));
             }
-        d.peak = std::max({d.peak, std::fabs(l), std::fabs(r)});
-        const double kl = d.k.process(0, l), kr = d.k.process(1, r);
-        d.acc += kl * kl + kr * kr;  // channel weights are 1.0 for L/R
+        d.acc += sum;
         if (++d.n == d.step) {
             d.steps.push_back(d.acc / double(d.step));
             d.acc = 0;
@@ -202,22 +211,32 @@ LoudnessResult measureLoudness(const AudioBuffer& buf, int64_t first, int64_t co
     return m.result();
 }
 
+LoudnessResult measureLoudness(const float* data, int64_t frames, int channels, const double* weights, int sampleRate) {
+    if (frames <= 0 || sampleRate <= 0 || channels <= 0) return {};
+    LoudnessMeter m(sampleRate);
+    m.addChannels(data, frames, channels, weights);
+    return m.result();
+}
+
 // ---------------------------------------------------------------------------
 // PeakLimiter
 
-PeakLimiter::PeakLimiter(int sampleRate, double ceilingDb, double lookaheadMs, double releaseMs)
+PeakLimiter::PeakLimiter(int sampleRate, double ceilingDb, double lookaheadMs, double releaseMs, int channels)
     : ceiling_(float(std::pow(10.0, ceilingDb / 20.0))),
+      channels_(std::max(1, channels)),
       lookahead_(std::max(1, int(std::lround(sampleRate * lookaheadMs / 1000.0)))),
       release_(std::exp(-1.0 / std::max(1.0, sampleRate * releaseMs / 1000.0))),
-      delay_(size_t(lookahead_) * 2, 0.f),
+      delay_(size_t(lookahead_) * size_t(channels_), 0.f),
       box_(size_t(lookahead_), 1.f),
       boxSum_(double(lookahead_)) {}
 
 void PeakLimiter::process(const float* in, float* out, int frames) {
+    const size_t nc = size_t(channels_);
     for (int i = 0; i < frames; ++i, ++n_) {
-        const float l = in[i * 2], r = in[i * 2 + 1];
+        const float* x = in + size_t(i) * nc;
         // The gain this sample needs, and the smallest over the look-ahead window.
-        const float peak = std::max(std::fabs(l), std::fabs(r));
+        float peak = 0;
+        for (size_t c = 0; c < nc; ++c) peak = std::max(peak, std::fabs(x[c]));
         const float need = peak > ceiling_ ? ceiling_ / peak : 1.f;
         while (!minQueue_.empty() && minQueue_.back().second >= need) minQueue_.pop_back();
         minQueue_.emplace_back(n_, need);
@@ -229,13 +248,15 @@ void PeakLimiter::process(const float* in, float* out, int frames) {
         boxPos_ = (boxPos_ + 1) % box_.size();
         const double ramp = boxSum_ / double(lookahead_);
         gain_ = std::min(ramp, 1.0 - (1.0 - gain_) * release_);
-        // Out goes the sample from `lookahead_` frames ago.
-        const float dl = delay_[delayPos_ * 2], dr = delay_[delayPos_ * 2 + 1];
-        delay_[delayPos_ * 2] = l;
-        delay_[delayPos_ * 2 + 1] = r;
+        // Out goes the sample from `lookahead_` frames ago (read before `out` may overwrite `in`).
+        float* slot = delay_.data() + delayPos_ * nc;
+        for (size_t c = 0; c < nc; ++c) {
+            const float v = x[c];
+            const float d = slot[c];
+            slot[c] = v;
+            out[size_t(i) * nc + c] = float(d * gain_);
+        }
         delayPos_ = (delayPos_ + 1) % size_t(lookahead_);
-        out[i * 2] = float(dl * gain_);
-        out[i * 2 + 1] = float(dr * gain_);
     }
 }
 

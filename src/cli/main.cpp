@@ -57,6 +57,7 @@ int usage() {
                  "                     [--loudness LUFS [--ceiling dBTP]]  (e.g. --loudness -14: normalise the mix)\n"
                  "                     [--burn-captions [--caption-animation none|word|highlight|pop|one-word]]\n"
                  "                     [--embed-captions] [--color-space ID]\n"
+                 "                     [--downmix-stereo] [--stems tracks|buses]  (surround fold-down; WAV stems beside it)\n"
                  "                     [--burn-timecode] [--burn-clip-name] [--burn-text TEXT] [--burn-corner 0-5]\n"
                  "                     [--watermark IMAGE [--watermark-corner 0-5] [--watermark-opacity 0..1]]\n"
                  "                     (corners: 0 top left, 1 top centre, 2 top right, 3-5 bottom)\n"
@@ -258,6 +259,8 @@ int cmdRender(const std::vector<std::string>& args) {
     bool proxies = false;
     double loudness = 0, ceiling = -1;
     int captionAnimation = -1;  // -1: as the project has it
+    bool downmix = false;
+    int stems = 0;  // 1 per track, 2 per bus
     BurnIn burnIns;
     for (size_t i = 1; i < args.size(); ++i) {
         const std::string& a = args[i];
@@ -292,6 +295,12 @@ int cmdRender(const std::vector<std::string>& args) {
         else if (a == "--color-space") st.colorSpace = next();
         else if (a == "--loudness") loudness = std::atof(next().c_str());
         else if (a == "--ceiling") ceiling = std::atof(next().c_str());
+        else if (a == "--downmix-stereo") downmix = true;
+        else if (a == "--stems") {
+            const std::string v = next();
+            stems = v == "tracks" ? 1 : v == "buses" ? 2 : -1;
+            if (stems < 0) return usage();
+        }
         else return usage();
     }
     if (outPath.empty() || loudness > 0) return usage();
@@ -326,6 +335,7 @@ int cmdRender(const std::vector<std::string>& args) {
     st.useProxies = proxies;
     st.loudnessTarget = loudness;
     st.peakCeiling = ceiling;
+    st.downmixStereo = downmix;
     if (!inTc.empty() && !parseTimecode(inTc, s->fps, st.in)) return usage();
     if (!outTc.empty() && !parseTimecode(outTc, s->fps, st.out)) return usage();
     if (st.in < 0 && s->inPoint >= 0) st.in = s->inPoint;
@@ -345,6 +355,21 @@ int cmdRender(const std::vector<std::string>& args) {
         return 1;
     }
     std::printf("Wrote %s\n", outPath.c_str());
+    if (stems > 0) {
+        std::vector<StemFile> files;
+        if (!exportStems(
+                p, *s, st, stems == 2, &files,
+                [](double f, FrameTime) {
+                    std::fprintf(stderr, "\rStems... %5.1f%%", f * 100.0);
+                    std::fflush(stderr);
+                },
+                &gCancel, &err)) {
+            std::fprintf(stderr, "\nerror: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "\n");
+        for (const StemFile& f : files) std::printf("Wrote %s\n", f.path.c_str());
+    }
     return 0;
 }
 

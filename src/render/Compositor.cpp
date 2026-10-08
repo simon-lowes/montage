@@ -16,6 +16,7 @@
 #include "audio/PluginEffect.h"
 #include "audio/SpeechCleanup.h"
 #include "core/EditOps.h"
+#include "core/Surround.h"
 #include "core/History.h"
 #include "media/MediaPool.h"
 
@@ -1152,19 +1153,52 @@ void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameT
 
 void AudioMixer::mix(const Project& p, const Sequence& seq, int64_t start, int frames, float* out,
                      std::vector<MeterLevels>* trackLevels) {
+    const int n = layoutChannels(seq.audioLayout);
+    if (n == 2) {
+        std::lock_guard lock(m_);
+        if (start != nextStart_) {
+            // Not where the last block ended (a seek, or the first block): start the
+            // effects afresh, and fill plugin pipelines with the audio just before
+            // `start` so delay-compensated output is right from the first sample.
+            resetLocked();
+            if (const int pre = maxLatency(seq, seq.sampleRate); pre > 0) {
+                std::vector<float> scratch(size_t(pre) * 2);
+                mixInto(p, seq, start - pre, pre, scratch.data(), nullptr, 0);
+            }
+        }
+        nextStart_ = start + frames;
+        mixInto(p, seq, start, frames, out, trackLevels, 0);
+        return;
+    }
+    // A surround mix, folded down to stereo for listening.
+    std::vector<float> full(size_t(frames) * size_t(n));
+    {
+        std::lock_guard lock(m_);
+        if (start != nextStart_) {
+            resetLocked();
+            if (const int pre = maxLatency(seq, seq.sampleRate); pre > 0) {
+                std::vector<float> scratch(size_t(pre) * size_t(n));
+                mixInto(p, seq, start - pre, pre, scratch.data(), nullptr, 0, 0, -1, n);
+            }
+        }
+        nextStart_ = start + frames;
+        mixInto(p, seq, start, frames, full.data(), trackLevels, 0, 0, -1, n);
+    }
+    downmixToStereo(seq.audioLayout, full.data(), frames, out);
+}
+
+void AudioMixer::mixLayout(const Project& p, const Sequence& seq, int64_t start, int frames, float* out) {
+    const int n = layoutChannels(seq.audioLayout);
     std::lock_guard lock(m_);
     if (start != nextStart_) {
-        // Not where the last block ended (a seek, or the first block): start the
-        // effects afresh, and fill plugin pipelines with the audio just before
-        // `start` so delay-compensated output is right from the first sample.
         resetLocked();
         if (const int pre = maxLatency(seq, seq.sampleRate); pre > 0) {
-            std::vector<float> scratch(size_t(pre) * 2);
-            mixInto(p, seq, start - pre, pre, scratch.data(), nullptr, 0);
+            std::vector<float> scratch(size_t(pre) * size_t(n));
+            mixInto(p, seq, start - pre, pre, scratch.data(), nullptr, 0, 0, -1, n);
         }
     }
     nextStart_ = start + frames;
-    mixInto(p, seq, start, frames, out, trackLevels, 0);
+    mixInto(p, seq, start, frames, out, nullptr, 0, 0, -1, n);
 }
 
 bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Track& track, int64_t start, int frames,
@@ -1314,8 +1348,26 @@ int AudioMixer::maxLatency(const Sequence& seq, double sr) {
 }
 
 void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, int frames, float* out,
-                         std::vector<MeterLevels>* trackLevels, int depth, int rate, int onlyTrack) {
+                         std::vector<MeterLevels>* trackLevels, int depth, int rate, int onlyTrack, int channels) {
     const double sr = rate > 0 ? rate : seq.sampleRate;
+    // Surround: tracks and buses stay stereo inside and are panned onto the layout's speakers at their faders.
+    const int nch = depth == 0 && channels > 2 ? channels : 2;
+    const bool surround = nch > 2;
+    const int lfeCh = [&] {
+        const auto& sp = layoutSpeakers(seq.audioLayout);
+        for (size_t i = 0; i < sp.size(); ++i)
+            if (sp[i].lfe) return int(i);
+        return -1;
+    }();
+    auto panInto = [&](const float* stereo, const SurroundPan& pan, float gain, float* dest) {
+        const SurroundGains g = surroundGains(seq.audioLayout, pan);
+        for (int i = 0; i < frames; ++i) {
+            const float l = stereo[size_t(i) * 2] * gain, r = stereo[size_t(i) * 2 + 1] * gain;
+            float* d = dest + size_t(i) * size_t(nch);
+            for (int c = 0; c < nch; ++c) d[c] += l * g.left[size_t(c)] + r * g.right[size_t(c)];
+            if (lfeCh >= 0 && g.lfe > 0) d[lfeCh] += 0.70710678f * (l + r) * g.lfe;
+        }
+    };
     const double fps = seq.fpsValue();
     bool anySolo = std::any_of(seq.audioTracks.begin(), seq.audioTracks.end(), [](const Track& t) { return t.solo; });
     if (trackLevels && depth == 0) trackLevels->assign(seq.audioTracks.size(), MeterLevels{});
@@ -1325,7 +1377,7 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
     // mix of [start + Lm, ...), a bus that of [start + Lm + Lb, ...), and a track
     // its clips at [start + Lm + Lb + Lt, ...).
     const int64_t masterLat = chainLatency(seq.masterEffects, seq.id, sr);
-    std::vector<float> master(size_t(frames) * 2, 0.0f);
+    std::vector<float> master(size_t(frames) * size_t(nch), 0.0f);
     std::map<Id, std::vector<float>> busBufs;
     std::map<Id, int64_t> busLat;
     for (const Bus& b : seq.buses) {
@@ -1336,6 +1388,7 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
     for (size_t ti = 0; ti < seq.audioTracks.size(); ++ti) {
         const Track& track = seq.audioTracks[ti];
         if (onlyTrack >= 0 ? int(ti) != onlyTrack : (track.muted || (anySolo && !track.solo))) continue;
+        if (depth == 0 && !mask_.empty() && (ti >= mask_.size() || !mask_[ti])) continue;
         auto bus = track.output ? busBufs.find(track.output) : busBufs.end();
         const int64_t downstream = masterLat + (bus != busBufs.end() ? busLat[bus->first] : 0);
         const int64_t trackLat = chainLatency(track.effects, track.id, sr);
@@ -1346,15 +1399,24 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
         if (!track.effects.empty())
             processChain(track.effects, track.id, frameAt(start + downstream + trackLat), sr, trackBuf.data(), frames);
         float tg = dbToLin(track.volumeDb), tl, tr;
-        panGains(track.pan, tl, tr);
-        float* dest = bus != busBufs.end() ? bus->second.data() : master.data();
         MeterLevels lv;
-        for (int i = 0; i < frames; ++i) {
-            float l = trackBuf[size_t(i) * 2] * tg * tl, r = trackBuf[size_t(i) * 2 + 1] * tg * tr;
-            dest[i * 2] += l;
-            dest[i * 2 + 1] += r;
-            lv.peakL = std::max(lv.peakL, std::fabs(l));
-            lv.peakR = std::max(lv.peakR, std::fabs(r));
+        if (surround && bus == busBufs.end()) {
+            // Straight to the speakers through the track's surround panner.
+            for (int i = 0; i < frames; ++i) {
+                lv.peakL = std::max(lv.peakL, std::fabs(trackBuf[size_t(i) * 2] * tg));
+                lv.peakR = std::max(lv.peakR, std::fabs(trackBuf[size_t(i) * 2 + 1] * tg));
+            }
+            panInto(trackBuf.data(), track.surround, tg, master.data());
+        } else {
+            panGains(track.pan, tl, tr);
+            float* dest = bus != busBufs.end() ? bus->second.data() : master.data();
+            for (int i = 0; i < frames; ++i) {
+                float l = trackBuf[size_t(i) * 2] * tg * tl, r = trackBuf[size_t(i) * 2 + 1] * tg * tr;
+                dest[i * 2] += l;
+                dest[i * 2 + 1] += r;
+                lv.peakL = std::max(lv.peakL, std::fabs(l));
+                lv.peakR = std::max(lv.peakR, std::fabs(r));
+            }
         }
         if (trackLevels && depth == 0) (*trackLevels)[ti] = lv;
     }
@@ -1363,15 +1425,20 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
         if (!b.effects.empty()) processChain(b.effects, b.id, frameAt(start + masterLat + busLat[b.id]), sr, bb.data(), frames);
         if (b.muted) continue;
         float g = dbToLin(b.volumeDb), bl, br;
+        if (surround) {
+            panInto(bb.data(), b.surround, g, master.data());
+            continue;
+        }
         panGains(b.pan, bl, br);
         for (int i = 0; i < frames; ++i) {
             master[size_t(i) * 2] += bb[size_t(i) * 2] * g * bl;
             master[size_t(i) * 2 + 1] += bb[size_t(i) * 2 + 1] * g * br;
         }
     }
-    if (!seq.masterEffects.empty()) processChain(seq.masterEffects, seq.id, frameAt(start + masterLat), sr, master.data(), frames);
+    // Master inserts are stereo: in a surround mix they are left out.
+    if (!seq.masterEffects.empty() && !surround) processChain(seq.masterEffects, seq.id, frameAt(start + masterLat), sr, master.data(), frames);
     const float g = dbToLin(seq.masterVolumeDb);
-    for (int i = 0; i < frames * 2; ++i) out[i] = master[size_t(i)] * g;
+    for (int i = 0; i < frames * nch; ++i) out[i] = master[size_t(i)] * g;
 }
 
 }  // namespace montage

@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
 #include <functional>
 #include <random>
 #include <sstream>
@@ -20,6 +21,7 @@
 #include "core/Multicam.h"
 #include "core/Effects.h"
 #include "core/ProjectIO.h"
+#include "core/Surround.h"
 #include "core/Transcript.h"
 #include "core/TranscriptEdit.h"
 #include "audio/SpeechCleanup.h"
@@ -513,6 +515,178 @@ private slots:
         // The gain recovers over the release after the burst: well down soon after, nearly back 5 releases later.
         QVERIFY(std::fabs(out[size_t(25000 + delay) * 2]) < 0.9f * std::fabs(in[size_t(25000) * 2]) + 1e-6f || std::fabs(in[size_t(25000) * 2]) < 0.01f);
         for (int i = 45000; i < 45100; ++i) QVERIFY(std::fabs(out[size_t(i + delay) * 2] - in[size_t(i) * 2]) < 0.002f);
+    }
+
+    void surroundMixExportAndStems() {
+        // Two mono tones: 440 Hz on A1 (narrowed to the centre, with some LFE) and 1 kHz on A2 (a point, back left).
+        const int rate = 48000;
+        auto tone = [&](double hz, const char* name) {
+            std::vector<float> x(size_t(rate) * 3);
+            for (size_t i = 0; i < x.size(); ++i) x[i] = float(0.3 * std::sin(2 * M_PI * hz * double(i) / rate));
+            const std::string f = path(name);
+            writeMonoWav(f, x, rate);
+            return f;
+        };
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        for (const std::string& f : {tone(440, "a440.wav"), tone(1000, "a1k.wav")}) {
+            MediaItem m = probeOrFail(p, f);
+            p.media.push_back(m);
+        }
+        QVERIFY(edit::placeMedia(p, s, p.media[0].id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(edit::placeMedia(p, s, p.media[1].id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 1}, false).ok);
+        s.audioLayout = "5.1";
+        s.audioTracks[0].surround.width = 0;
+        s.audioTracks[0].surround.lfeDb = -6;
+        s.audioTracks[1].surround.x = -1;
+        s.audioTracks[1].surround.y = -1;
+        s.audioTracks[1].surround.width = 0;
+        // The mix in 5.1: L R C LFE Ls Rs.
+        AudioMixer mixer;
+        const int n = rate / 2;
+        std::vector<float> six(size_t(n) * 6);
+        mixer.mixLayout(p, s, rate / 2, n, six.data());
+        auto rms = [&](const std::vector<float>& buf, int ch, int channels) {
+            double acc = 0;
+            const size_t frames = buf.size() / size_t(channels);
+            for (size_t i = 0; i < frames; ++i) acc += double(buf[i * size_t(channels) + size_t(ch)]) * buf[i * size_t(channels) + size_t(ch)];
+            return std::sqrt(acc / double(frames));
+        };
+        const double toneRms = 0.3 / std::sqrt(2.0);
+        QVERIFY(rms(six, 0, 6) < 1e-4 && rms(six, 1, 6) < 1e-4);                     // nothing in front left and right
+        QVERIFY(std::fabs(rms(six, 2, 6) - toneRms) < 0.01);                         // 440 Hz in the centre
+        QVERIFY(std::fabs(rms(six, 3, 6) - toneRms * std::pow(10.0, -6.0 / 20)) < 0.01);  // and the LFE at -6 dB
+        QVERIFY(rms(six, 4, 6) > 3 * rms(six, 5, 6));                                // 1 kHz mostly in Ls
+        QVERIFY(std::fabs(std::hypot(rms(six, 4, 6), rms(six, 5, 6)) - toneRms) < 0.01);  // constant power
+        // Listening in stereo gives the fold-down of exactly that.
+        AudioMixer listen;
+        std::vector<float> two(size_t(n) * 2), fold(size_t(n) * 2);
+        listen.mix(p, s, rate / 2, n, two.data());
+        downmixToStereo("5.1", six.data(), n, fold.data());
+        for (size_t i = 0; i < two.size(); i += 97) QVERIFY(std::fabs(two[i] - fold[i]) < 1e-6);
+
+        // BS.1770 weights the surrounds by 1.41 (+1.5 dB) and leaves the LFE out.
+        const auto& sp = layoutSpeakers("5.1");
+        std::vector<double> w;
+        for (const Speaker& k : sp) w.push_back(k.loudnessWeight);
+        auto oneChannel = [&](int ch) {
+            std::vector<float> buf(size_t(rate) * 3 * 6, 0.0f);
+            for (size_t i = 0; i < size_t(rate) * 3; ++i) buf[i * 6 + size_t(ch)] = float(0.1 * std::sin(2 * M_PI * 1000 * double(i) / rate));
+            return measureLoudness(buf.data(), rate * 3, 6, w.data(), rate);
+        };
+        QVERIFY(std::fabs(oneChannel(4).integrated - oneChannel(0).integrated - 10 * std::log10(1.41)) < 0.05);
+        QVERIFY(!oneChannel(3).valid);
+
+        // Exported: six channels (WAV and AAC), or two when folded down.
+        ExportSettings st = findExportPreset("Audio - WAV 24-bit")->settings;
+        st.path = path("mix51.wav");
+        std::string err;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        MediaItem out;
+        QVERIFY(probeMedia(st.path, out));
+        QCOMPARE(out.channels, 6);
+        ExportSettings aac = st;
+        aac.path = path("mix51.m4a");
+        aac.audioCodec = "aac";
+        QVERIFY2(exportSequence(p, s, aac, nullptr, nullptr, &err), err.c_str());
+        QVERIFY(probeMedia(aac.path, out));
+        QCOMPARE(out.channels, 6);
+        ExportSettings down = st;
+        down.path = path("mix51-stereo.wav");
+        down.downmixStereo = true;
+        QVERIFY2(exportSequence(p, s, down, nullptr, nullptr, &err), err.c_str());
+        QVERIFY(probeMedia(down.path, out));
+        QCOMPARE(out.channels, 2);
+        // Loudness-normalised in 5.1: measured with the surround weights, within 0.3 LU.
+        ExportSettings norm = st;
+        norm.path = path("mix51-norm.wav");
+        norm.loudnessTarget = -24;
+        QVERIFY2(exportSequence(p, s, norm, nullptr, nullptr, &err), err.c_str());
+        {
+            // Read the 24-bit WAV directly (decoding would fold it down).
+            QFile f(QString::fromStdString(norm.path));
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            const QByteArray data = f.readAll();
+            const int at = data.indexOf("data");
+            QVERIFY(at > 0);
+            const auto* bytes = reinterpret_cast<const uint8_t*>(data.constData()) + at + 8;
+            const size_t samples = size_t(data.size() - at - 8) / 3;
+            std::vector<float> pcm(samples);
+            for (size_t i = 0; i < samples; ++i) {
+                int32_t v = int32_t(bytes[i * 3]) | int32_t(bytes[i * 3 + 1]) << 8 | int32_t(bytes[i * 3 + 2]) << 16;
+                if (v & 0x800000) v |= ~0xFFFFFF;
+                pcm[i] = float(v) / 8388608.0f;
+            }
+            const LoudnessResult r = measureLoudness(pcm.data(), int64_t(samples / 6), 6, w.data(), rate);
+            QVERIFY2(std::fabs(r.integrated + 24) < 0.3, qPrintable(QString::number(r.integrated)));
+        }
+
+        // Stems, from a stereo version: one per track, and they add up to the mix.
+        s.audioLayout = "stereo";
+        s.audioTracks[0].name = "Dialogue";
+        s.audioTracks[1].name = "Music";
+        st.path = path("show.wav");
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        std::vector<StemFile> stems;
+        QVERIFY2(exportStems(p, s, st, false, &stems, {}, nullptr, &err), err.c_str());
+        QCOMPARE(stems.size(), size_t(2));
+        QCOMPARE(QString::fromStdString(std::filesystem::path(stems[0].path).filename().string()), QString("show - Dialogue.wav"));
+        const AudioBufferPtr whole = decodeAudio(st.path, rate, &err), a = decodeAudio(stems[0].path, rate, &err),
+                             b = decodeAudio(stems[1].path, rate, &err);
+        QVERIFY(whole && a && b);
+        QCOMPARE(a->frames(), whole->frames());
+        double worst = 0;
+        for (size_t i = 0; i < whole->samples.size(); i += 13) worst = std::max(worst, double(std::fabs(a->samples[i] + b->samples[i] - whole->samples[i])));
+        QVERIFY2(worst < 1e-4, qPrintable(QString::number(worst)));
+        // By bus: the music routed to a bus; the dialogue goes straight to the master ("Main").
+        Bus bus;
+        bus.id = p.newId();
+        bus.name = "Music Bus";
+        s.buses.push_back(bus);
+        s.audioTracks[1].output = bus.id;
+        stems.clear();
+        QVERIFY2(exportStems(p, s, st, true, &stems, {}, nullptr, &err), err.c_str());
+        QCOMPARE(stems.size(), size_t(2));
+        QCOMPARE(stems[0].name, std::string("Main"));
+        QCOMPARE(stems[1].name, std::string("Music Bus"));
+
+        // Through MCP: 5.1, dialogue in the centre, the music round the back; a stereo fold-down with track stems.
+        s.audioTracks[1].output = 0;
+        s.buses.clear();
+        const QString project = QString::fromStdString(path("surround.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call("montage_set_surround",
+                             {{"project", project}, {"layout", "5.1"},
+                              {"tracks", QJsonArray{QJsonObject{{"track", "A1"}, {"width", 0}},
+                                                    QJsonObject{{"track", "A2"}, {"angle", 180}, {"lfe_db", -12}}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("channels").toInt(), 6);
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.active()->audioLayout, std::string("5.1"));
+        QCOMPARE(back.active()->audioTracks[0].surround.width, 0.0);
+        QVERIFY(back.active()->audioTracks[1].surround.y < -0.99 && std::fabs(back.active()->audioTracks[1].surround.lfeDb + 12) < 1e-9);
+        r = call("montage_set_surround", {{"project", project}, {"layout", "quad"}});
+        QVERIFY(r.value("isError").toBool());
+        const QString wav = QString::fromStdString(path("mcp-mix.wav"));
+        r = call("montage_render", {{"project", project}, {"output", wav}, {"preset", "Audio - WAV 24-bit"},
+                                    {"downmix_stereo", true}, {"stems", "tracks"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(probeMedia(wav.toStdString(), out));
+        QCOMPARE(out.channels, 2);
+        const QJsonArray stemList = r.value("structuredContent").toObject().value("stems").toArray();
+        QCOMPARE(stemList.size(), 2);
+        QVERIFY(probeMedia(stemList[1].toObject().value("path").toString().toStdString(), out));
+        QCOMPARE(out.channels, 2);  // the stems follow the fold-down
     }
 
     void loudnessNormalisedExport() {

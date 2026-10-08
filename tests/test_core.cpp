@@ -15,6 +15,7 @@
 #include "core/Multicam.h"
 #include "core/ProjectIO.h"
 #include "core/ScriptCut.h"
+#include "core/Surround.h"
 #include "core/Transcript.h"
 #include "core/TranscriptEdit.h"
 
@@ -1117,6 +1118,73 @@ private slots:
         unsure.add(0, mix({{0, 0}, {0, 1}}));
         unsure.add(1, mix({{3, 1}}));
         QVERIFY(autoTags(unsure, labels).keywords.empty());
+    }
+
+    void surroundPanning() {
+        QCOMPARE(layoutChannels("stereo"), 2);
+        QCOMPARE(layoutChannels("5.1"), 6);
+        QCOMPARE(layoutChannels("7.1"), 8);
+        QCOMPARE(layoutChannels("quad"), 2);  // unknown: stereo
+        auto power = [](const std::vector<float>& g) {
+            double p = 0;
+            for (float v : g) p += double(v) * v;
+            return p;
+        };
+        for (const char* layout : {"stereo", "5.1", "7.1"}) {
+            const auto& sp = layoutSpeakers(layout);
+            // A sound at a speaker's angle comes out of that speaker alone.
+            for (size_t i = 0; i < sp.size(); ++i) {
+                if (sp[i].lfe) continue;
+                const auto g = panGains(layout, sp[i].angle, 1);
+                for (size_t j = 0; j < g.size(); ++j) QVERIFY2(std::fabs(g[j] - (i == j ? 1.0f : 0.0f)) < 1e-6, layout);
+            }
+            // Anywhere, at any distance: constant power, and nothing to the LFE.
+            for (double a = -180; a <= 180; a += 7.5)
+                for (double d : {0.0, 0.3, 1.0}) {
+                    const auto g = panGains(layout, a, d);
+                    QVERIFY(std::fabs(power(g) - 1) < 1e-5);
+                    for (size_t j = 0; j < g.size(); ++j)
+                        if (sp[j].lfe) QCOMPARE(g[j], 0.0f);
+                }
+        }
+        // 5.1: L R C LFE Ls Rs. The default panner puts a stereo track on L and R, as in stereo.
+        SurroundPan p;
+        auto g = surroundGains("5.1", p);
+        QVERIFY(std::fabs(g.left[0] - 1) < 1e-6 && std::fabs(g.right[1] - 1) < 1e-6 && g.lfe == 0);
+        // Narrowed to a point: the centre, each channel at -3 dB (the same sound in both stays as loud).
+        p.width = 0;
+        g = surroundGains("5.1", p);
+        QVERIFY(std::fabs(g.left[2] - M_SQRT1_2) < 1e-6 && std::fabs(g.right[2] - M_SQRT1_2) < 1e-6);
+        // Hard right (90 degrees): between R (30) and Rs (110), three quarters of the way to Rs.
+        p.x = 1, p.y = 0;
+        g = surroundGains("5.1", p);
+        QVERIFY(std::fabs(g.left[1] - M_SQRT1_2 * std::cos(0.75 * M_PI / 2)) < 1e-5 && std::fabs(g.left[5] - M_SQRT1_2 * std::sin(0.75 * M_PI / 2)) < 1e-5);
+        // The middle of the room: evenly over the five main speakers.
+        p.x = 0, p.y = 0;
+        g = surroundGains("5.1", p);
+        for (int c : {0, 1, 2, 4, 5}) QVERIFY(std::fabs(g.left[size_t(c)] - M_SQRT1_2 / std::sqrt(5.0)) < 1e-5);
+        p.lfeDb = -6;
+        QVERIFY(std::fabs(surroundGains("5.1", p).lfe - std::pow(10.0, -6.0 / 20)) < 1e-6);
+        // The fold-down: centre and surrounds at -3 dB into their side, no LFE.
+        const float frame[6] = {0.1f, 0.2f, 0.4f, 0.9f, 0.3f, 0.5f};
+        float lr[2];
+        downmixToStereo("5.1", frame, 1, lr);
+        QVERIFY(std::fabs(lr[0] - (0.1f + 0.7071f * 0.4f + 0.7071f * 0.3f)) < 1e-6);
+        QVERIFY(std::fabs(lr[1] - (0.2f + 0.7071f * 0.4f + 0.7071f * 0.5f)) < 1e-6);
+        // Saved with the sequence and its tracks and buses.
+        Fixture fx;
+        fx.s().audioLayout = "7.1";
+        fx.s().audioTracks[0].surround = {0.5, -0.5, 0.25, -9};
+        Bus b;
+        b.id = fx.p.newId();
+        b.surround.x = -1;
+        fx.s().buses.push_back(b);
+        Project back;
+        QVERIFY(projectFromJson(projectToJson(fx.p), back));
+        QCOMPARE(back.active()->audioLayout, std::string("7.1"));
+        QCOMPARE(back.active()->audioTracks[0].surround, fx.s().audioTracks[0].surround);
+        QCOMPARE(back.active()->buses[0].surround.x, -1.0);
+        QCOMPARE(back.active()->audioTracks[1].surround, SurroundPan{});
     }
 
     void bezierKeyframes() {

@@ -2071,6 +2071,7 @@ void MainWindow::newSequence() {
             s.sampleRate = spec.sampleRate;
             s.colorSpace = spec.colorSpace;
             s.hdrPeakNits = spec.hdrPeakNits;
+            s.audioLayout = spec.audioLayout;
             return true;
         });
 }

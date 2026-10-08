@@ -20,6 +20,8 @@ struct LoudnessResult {
 // Measures interleaved-stereo samples [first, first + count) of `buf`
 // (count < 0 = to the end).
 LoudnessResult measureLoudness(const AudioBuffer& buf, int64_t first = 0, int64_t count = -1);
+// The same for interleaved audio of any channel count, with BS.1770 weights.
+LoudnessResult measureLoudness(const float* data, int64_t frames, int channels, const double* weights, int sampleRate);
 
 // The same measurement fed in pieces, for sound too long to hold at once.
 class LoudnessMeter {
@@ -27,6 +29,9 @@ public:
     explicit LoudnessMeter(int sampleRate);
     ~LoudnessMeter();
     void add(const float* stereo, int64_t frames);
+    // Interleaved audio of `channels` (up to 8), each weighted as BS.1770 says
+    // (1 front, 1.41 surround, 0 for the LFE).
+    void addChannels(const float* data, int64_t frames, int channels, const double* weights);
     LoudnessResult result() const;
     // Live readings (EBU R128): the last 400 ms and the last 3 s, in LUFS
     // (-70 or below for silence or before any sound), and their highest so far.
@@ -51,17 +56,19 @@ private:
 // after it. Output is delayed by latency() frames.
 class PeakLimiter {
 public:
-    PeakLimiter(int sampleRate, double ceilingDb, double lookaheadMs = 5, double releaseMs = 80);
-    // Limits `frames` stereo frames from `in` into `out` (which may be `in`).
+    // `channels` interleaved (all limited by one gain, so the image holds).
+    PeakLimiter(int sampleRate, double ceilingDb, double lookaheadMs = 5, double releaseMs = 80, int channels = 2);
+    // Limits `frames` frames from `in` into `out` (which may be `in`).
     void process(const float* in, float* out, int frames);
     int latency() const { return lookahead_; }
 
 private:
     float ceiling_;
+    int channels_;
     int lookahead_;
     double release_;
     double gain_ = 1;
-    std::vector<float> delay_;        // the last `lookahead_` stereo frames
+    std::vector<float> delay_;        // the last `lookahead_` frames
     size_t delayPos_ = 0;
     std::deque<std::pair<int64_t, float>> minQueue_;  // sliding minimum of the gains peaks need
     std::vector<float> box_;          // the last `lookahead_` minima, averaged

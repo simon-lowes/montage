@@ -105,6 +105,8 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - **Fit Music to Length** (Clip menu, like Premiere's Remix or Resolve's music editor): shortens or lengthens a music clip to In–Out, the picture, or any length, by skipping or repeating whole bars where the music matches itself best (harmony and timbre, a bar either side of each join). The start and the ending stay as they are, joins get short crossfades on the beat, and each piece starts a fraction of a frame in as needed so the beat runs on. The result is within half a bar of the length asked for.
 - **Auto Duck Music** (Clip menu): select music clips, tick the dialogue tracks, and the music dips under speech, fading down before it and back up after it. Speech is found from transcripts' words, or from loudness. The result is volume keyframes you can adjust on the clip's line.
 - Track faders, pan, mute and solo in a mixer panel
+- **Surround (5.1 and 7.1)**: choose the sequence's audio channels in Sequence Settings, and each mixer strip gets a surround panner in place of its pan dial. Drag the sound among the speakers (towards the middle spreads it over all of them), scroll to narrow a stereo track to a point, and right-click for its width, an LFE send, Front, or the Centre speaker for dialogue. Tracks routed to a bus are placed by the bus. You hear the mix folded down to stereo (ITU-R BS.775); exports carry every channel (5.1 or 7.1 WAV, AAC, ProRes...) unless you pick the stereo fold-down, and loudness normalisation weights the surrounds as BS.1770 says.
+- **Stems** (Export › Stems, or `--stems tracks|buses`): beside the export, a 24-bit WAV of each audio track, or of each bus plus "Main" for the tracks going straight to the master. Each is its part of the mix exactly as it plays there, so together they add up to the mix.
 - Insert effects on audio tracks, buses (submixes) and the master, including plugins. Use a strip's FX button to edit them in the Inspector, route tracks to buses from the strip's output menu, and add buses with + Bus. Track effects keep running past the last clip, so reverb and echo tails ring out.
 - Plugin delay compensation: the latency plugins report is compensated on clips, tracks, buses and the master, so everything stays in sync with the picture and with other tracks, including straight after a seek.
 - Render and Replace bakes an audio clip's effects into a new audio file to save CPU, and Restore Unrendered brings the original back (both on the clip's right-click menu).
@@ -282,6 +284,8 @@ montage-cli new -o hdr.montage --color-space rec2100pq --hdr-peak 1000 a.mov   #
 montage-cli render hdr.montage -o hdr10.mp4 --vcodec libx265                   # 10-bit HDR10 with metadata
 montage-cli render hdr.montage -o sdr.mp4 --color-space rec709                 # tone-mapped SDR version
 montage-cli colorspaces                                      # colour space ids
+montage-cli render show.montage -o show.wav --preset "Audio - WAV 24-bit" --stems buses   # mix plus stems
+montage-cli render show51.montage -o stereo.mp4 --downmix-stereo                         # a 5.1 mix folded to stereo
 montage-cli mcp                                              # MCP server for AI agents (see below)
 ```
 
@@ -296,9 +300,9 @@ Its tools work on `.montage` files by path. Each edit is saved at once, and the 
 - transcribe (with speaker labels), translate caption tracks, find spoken phrases in the cut, cut by transcript (phrases, filler words, long pauses, optionally with Smooth Cuts), and build a cut from a script;
 - find shots by description;
 - log media (ratings, labels, keywords, metadata fields, bins), make subclips, auto-tag shots, and find media by text or smart-bin rules, optionally saving the rules as a smart bin;
-- make a first mix (roles, levels, dialogue rides, ducking), match voices to a reference, mark a music clip's bars or beats and fit music to a length, duck music under dialogue, match clips' colour to a shot, add adjustment layers, and make a reframed copy of the cut at another aspect ratio;
+- make a first mix (roles, levels, dialogue rides, ducking), set up a 5.1 or 7.1 mix and place tracks in it, match voices to a reference, mark a music clip's bars or beats and fit music to a length, duck music under dialogue, match clips' colour to a shot, add adjustment layers, and make a reframed copy of the cut at another aspect ratio;
 - return a rendered frame as an image so the agent can check its work;
-- render with any preset, with progress;
+- render with any preset, with progress, optionally folding surround down to stereo and writing stems;
 - export and import EDL, OTIO, FCP 7 XML and FCPXML.
 
 ```bash

@@ -25,6 +25,7 @@
 #include "core/MediaLog.h"
 #include "core/ProjectIO.h"
 #include "core/ScriptCut.h"
+#include "core/Surround.h"
 #include "core/TranscriptEdit.h"
 #include "media/SpeechEnhance.h"
 #include "media/Translator.h"
@@ -384,7 +385,8 @@ void McpServer::Impl::addTools() {
         R"json({"type":"object","properties":{
             "project":{"type":"string","description":"Path of the .montage file to write"},
             "media":{"type":"array","items":{"type":"string"},"description":"Media files, in order"},
-            "width":{"type":"integer"},"height":{"type":"integer"},"fps":{"type":"number"}},
+            "width":{"type":"integer"},"height":{"type":"integer"},"fps":{"type":"number"},
+            "audio_layout":{"type":"string","enum":["stereo","5.1","7.1"],"default":"stereo"}},
             "required":["project"]})json",
         false, [](const QJsonObject& a) {
             Loaded l;
@@ -408,6 +410,12 @@ void McpServer::Impl::addTools() {
             if (a.value("fps").isDouble()) {
                 const double f = a.value("fps").toDouble();
                 s.fps = std::fabs(f - std::round(f)) < 1e-6 ? Rational{int(std::lround(f)), 1} : Rational{int(std::lround(f * 1001)), 1001};
+            }
+            if (a.contains("audio_layout")) {
+                const std::string layout = a.value("audio_layout").toString().toStdString();
+                if (std::find(audioLayouts().begin(), audioLayouts().end(), layout) == audioLayouts().end())
+                    throw ArgError{"\"audio_layout\" must be stereo, 5.1 or 7.1"};
+                s.audioLayout = layout;
             }
             FrameTime at = 0;
             for (Id id : ids) {
@@ -998,6 +1006,49 @@ void McpServer::Impl::addTools() {
             return ok(QStringLiteral("Matched %1 clip(s) to %2").arg(n).arg(QString::fromStdString(ref.name)), QJsonObject{{"clips", out}});
         });
 
+    add("montage_set_surround", "Set up a surround mix",
+        "Mix the active sequence in stereo, 5.1 (L R C LFE Ls Rs) or 7.1 (L R C LFE Lb Rb Ls Rs), and place audio tracks "
+        "among the speakers. A position is an angle (0 straight ahead, 90 right, -90 left, 180 behind) and a distance (1 at "
+        "the speakers, 0 spread over all of them); width narrows a stereo track to a point (0, e.g. dialogue in the centre "
+        "speaker); lfe_db sends it to the subwoofer (-100 off). A track routed to a bus is placed by its bus. Export with "
+        "montage_render (downmix_stereo for a stereo copy).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "layout":{"type":"string","enum":["stereo","5.1","7.1"]},
+            "tracks":{"type":"array","items":{"type":"object","properties":{
+                "track":{"type":"string","description":"Audio track, e.g. A1"},"angle":{"type":"number","default":0},
+                "distance":{"type":"number","default":1},"width":{"type":"number","default":1},"lfe_db":{"type":"number","default":-100}},
+                "required":["track"]}}},"required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            if (a.contains("layout")) {
+                const std::string layout = a.value("layout").toString().toStdString();
+                if (std::find(audioLayouts().begin(), audioLayouts().end(), layout) == audioLayouts().end())
+                    throw ArgError{"\"layout\" must be stereo, 5.1 or 7.1"};
+                s.audioLayout = layout;
+            }
+            QJsonArray out;
+            for (const QJsonValue& v : a.value("tracks").toArray()) {
+                const QJsonObject t = v.toObject();
+                const TrackRef r = trackArg(t.value("track").toString(), s, false);
+                if (r.kind != TrackKind::Audio) throw ArgError{"Surround placement is for audio tracks"};
+                Track* tr = trackAt(s, r);
+                const double angle = t.value("angle").toDouble(0) * M_PI / 180;
+                const double dist = std::clamp(t.value("distance").toDouble(1), 0.0, 1.0);
+                SurroundPan& p = tr->surround;
+                p.x = dist * std::sin(angle);
+                p.y = dist * std::cos(angle);
+                p.width = std::clamp(t.value("width").toDouble(1), 0.0, 1.0);
+                p.lfeDb = std::clamp(t.value("lfe_db").toDouble(-100), -100.0, 12.0);
+                out.append(QJsonObject{{"track", QString::fromStdString(tr->name)}, {"x", p.x}, {"y", p.y}, {"width", p.width},
+                                       {"lfe_db", p.lfeDb}});
+            }
+            save(l);
+            return ok(QStringLiteral("%1 mix, %2 track(s) placed").arg(QString::fromStdString(s.audioLayout)).arg(out.size()),
+                      QJsonObject{{"layout", QString::fromStdString(s.audioLayout)},
+                                  {"channels", layoutChannels(s.audioLayout)}, {"tracks", out}});
+        });
+
     add("montage_translate_captions", "Translate captions",
         "Translate a caption track into another language on this computer (Opus-MT), as a new track with the same "
         "timings (hidden until chosen). Languages are ISO 639-1 codes (de, fr, es, ja...); pairs without a direct model go "
@@ -1417,7 +1468,10 @@ void McpServer::Impl::addTools() {
                 "corner":{"type":"string","enum":["top_left","top_centre","top_right","bottom_left","bottom_centre","bottom_right"],"default":"top_left"},
                 "watermark":{"type":"string","description":"Image file, e.g. a logo"},
                 "watermark_corner":{"type":"string","enum":["top_left","top_centre","top_right","bottom_left","bottom_centre","bottom_right"],"default":"bottom_right"},
-                "watermark_opacity":{"type":"number","default":0.6}}}},
+                "watermark_opacity":{"type":"number","default":0.6}}},
+            "downmix_stereo":{"type":"boolean","default":false,"description":"A 5.1/7.1 sequence: fold the mix down to stereo"},
+            "stems":{"type":"string","enum":["none","tracks","buses"],"default":"none",
+                "description":"Also write 24-bit WAV stems beside the output, one per audio track or per bus (plus Main)"}},
             "required":["project","output"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
@@ -1450,10 +1504,27 @@ void McpServer::Impl::addTools() {
                 st.burnIn.watermarkCorner = corner("watermark_corner", 5);
                 st.burnIn.watermarkOpacity = std::clamp(b.value("watermark_opacity").toDouble(0.6), 0.0, 1.0);
             }
+            st.downmixStereo = a.value("downmix_stereo").toBool();
+            const QString stems = str(a, "stems", "none");
+            if (stems != "none" && stems != "tracks" && stems != "buses") throw ArgError{"\"stems\" must be none, tracks or buses"};
             std::string err;
             if (!exportSequence(l.project, s, st, [this](double f, FrameTime) { progress(f, "Rendering"); }, nullptr, &err))
                 return fail(QString::fromStdString(err));
-            return ok(QStringLiteral("Wrote %1").arg(QString::fromStdString(st.path)), QJsonObject{{"output", QString::fromStdString(st.path)}});
+            QJsonObject o{{"output", QString::fromStdString(st.path)}};
+            QString text = QStringLiteral("Wrote %1").arg(QString::fromStdString(st.path));
+            if (stems != "none") {
+                std::vector<StemFile> files;
+                if (!exportStems(l.project, s, st, stems == "buses", &files, [this](double f, FrameTime) { progress(f, "Stems"); },
+                                 nullptr, &err))
+                    return fail(QString::fromStdString(err));
+                QJsonArray list;
+                for (const StemFile& f : files) {
+                    list.append(QJsonObject{{"name", QString::fromStdString(f.name)}, {"path", QString::fromStdString(f.path)}});
+                    text += QStringLiteral("\nWrote %1").arg(QString::fromStdString(f.path));
+                }
+                o["stems"] = list;
+            }
+            return ok(text, o);
         });
 
     add("montage_export_timeline", "Export the timeline",

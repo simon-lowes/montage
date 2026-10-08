@@ -1,8 +1,11 @@
 #include "Exporter.h"
 
+#include "core/Surround.h"
+
 #include <QImage>
 #include <QString>
 #include <algorithm>
+#include <filesystem>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -391,8 +394,11 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         if (!codec) return fail("Audio encoder not available: " + s.audioCodec);
         o.ast = avformat_new_stream(o.oc, nullptr);
         o.actx = avcodec_alloc_context3(codec);
-        AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
-        av_channel_layout_copy(&o.actx->ch_layout, &stereo);
+        // The sequence's layout (the channel order core/Surround.h uses is FFmpeg's), or stereo.
+        AVChannelLayout layout = AV_CHANNEL_LAYOUT_STEREO;
+        if (!s.downmixStereo && seq.audioLayout == "5.1") layout = AV_CHANNEL_LAYOUT_5POINT1;
+        if (!s.downmixStereo && seq.audioLayout == "7.1") layout = AV_CHANNEL_LAYOUT_7POINT1;
+        av_channel_layout_copy(&o.actx->ch_layout, &layout);
         o.actx->sample_rate = sr;
         if (s.audioCodec == "libopus" && sr != 48000) o.actx->sample_rate = 48000;
         // Pick a supported sample format, preferring float planar.
@@ -464,7 +470,19 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     const int mixRate = o.actx ? o.actx->sample_rate : sr;
     Sequence mixSeq = seq;  // mixer runs at the encoder's rate
     mixSeq.sampleRate = mixRate;
+    // Channels written: the layout's, or 2 (a surround sequence folded down, or a stereo one).
+    const int nch = o.actx ? o.actx->ch_layout.nb_channels : 2;
+    std::vector<double> weights;
+    if (nch > 2)
+        for (const Speaker& sp : layoutSpeakers(seq.audioLayout)) weights.push_back(sp.loudnessWeight);
+    else
+        weights = {1.0, 1.0};
+    auto mixBlock = [&](AudioMixer& m, int64_t pos, int frames, float* dst) {
+        if (nch > 2) m.mixLayout(p, mixSeq, pos, frames, dst);
+        else m.mix(p, mixSeq, pos, frames, dst);
+    };
     AudioMixer mixer;
+    mixer.setTrackMask(s.audioTracks);
     std::vector<float> fifo;
     std::vector<float> mixBuf;
     int64_t audioPts = 0;
@@ -476,32 +494,34 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     int64_t limiterDelay = 0;
     if (wantAudio && s.loudnessTarget < 0) {
         AudioMixer meterMixer;
+        meterMixer.setTrackMask(s.audioTracks);
         LoudnessMeter meter(mixRate);
         const int64_t end = int64_t(std::llround(double(out) * mixRate / seq.fpsValue()));
-        std::vector<float> chunk(size_t(8192) * 2);
+        std::vector<float> chunk(size_t(8192) * size_t(nch));
         for (int64_t pos = audioCursor; pos < end;) {
             if (cancel && cancel->load()) return fail("Cancelled");
             const int n = int(std::min<int64_t>(8192, end - pos));
-            meterMixer.mix(p, mixSeq, pos, n, chunk.data());
-            meter.add(chunk.data(), n);
+            mixBlock(meterMixer, pos, n, chunk.data());
+            meter.addChannels(chunk.data(), n, nch, weights.data());
             pos += n;
         }
         const LoudnessResult measured = meter.result();
         if (measured.valid) normGain = std::pow(10.0, (s.loudnessTarget - measured.integrated) / 20.0);
         // A little under the ceiling: the limiter sees samples, and true peaks fall between them.
-        limiter = std::make_unique<PeakLimiter>(mixRate, s.peakCeiling - 0.5);
+        limiter = std::make_unique<PeakLimiter>(mixRate, s.peakCeiling - 0.5, 5, 80, nch);
         limiterDelay = limiter->latency();
         // Fill the limiter's look-ahead so its output starts at the first sample.
-        std::vector<float> prime(size_t(limiterDelay) * 2);
-        mixer.mix(p, mixSeq, audioCursor, int(limiterDelay), prime.data());
+        std::vector<float> prime(size_t(limiterDelay) * size_t(nch));
+        mixBlock(mixer, audioCursor, int(limiterDelay), prime.data());
         for (float& v : prime) v = float(v * normGain);
         limiter->process(prime.data(), prime.data(), int(limiterDelay));
         audioCursor += limiterDelay;
     }
 
     auto encodeAudio = [&](bool final) -> bool {
-        while (fifo.size() >= size_t(audioFrameSize) * 2 || (final && !fifo.empty())) {
-            int n = std::min<int>(audioFrameSize, int(fifo.size() / 2));
+        const size_t nc = size_t(nch);
+        while (fifo.size() >= size_t(audioFrameSize) * nc || (final && !fifo.empty())) {
+            int n = std::min<int>(audioFrameSize, int(fifo.size() / nc));
             av_frame_unref(o.aframe);
             o.aframe->nb_samples = n;
             o.aframe->format = o.actx->sample_fmt;
@@ -510,43 +530,37 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             if (av_frame_get_buffer(o.aframe, 0) < 0) return false;
             const float* srcp = fifo.data();
             switch (o.actx->sample_fmt) {
-                case AV_SAMPLE_FMT_FLTP: {
-                    auto* l = reinterpret_cast<float*>(o.aframe->data[0]);
-                    auto* r = reinterpret_cast<float*>(o.aframe->data[1]);
-                    for (int i = 0; i < n; ++i) {
-                        l[i] = srcp[i * 2];
-                        r[i] = srcp[i * 2 + 1];
+                case AV_SAMPLE_FMT_FLTP:
+                    for (size_t c = 0; c < nc; ++c) {
+                        auto* d = reinterpret_cast<float*>(o.aframe->data[c]);
+                        for (int i = 0; i < n; ++i) d[i] = srcp[size_t(i) * nc + c];
                     }
                     break;
-                }
                 case AV_SAMPLE_FMT_FLT:
-                    std::copy(srcp, srcp + n * 2, reinterpret_cast<float*>(o.aframe->data[0]));
+                    std::copy(srcp, srcp + size_t(n) * nc, reinterpret_cast<float*>(o.aframe->data[0]));
                     break;
                 case AV_SAMPLE_FMT_S16: {
                     auto* d = reinterpret_cast<int16_t*>(o.aframe->data[0]);
-                    for (int i = 0; i < n * 2; ++i) d[i] = int16_t(std::lround(std::clamp(srcp[i], -1.0f, 1.0f) * 32767.0f));
+                    for (size_t i = 0; i < size_t(n) * nc; ++i) d[i] = int16_t(std::lround(std::clamp(srcp[i], -1.0f, 1.0f) * 32767.0f));
                     break;
                 }
                 case AV_SAMPLE_FMT_S32: {
                     auto* d = reinterpret_cast<int32_t*>(o.aframe->data[0]);
-                    for (int i = 0; i < n * 2; ++i)
+                    for (size_t i = 0; i < size_t(n) * nc; ++i)
                         d[i] = int32_t(std::llround(double(std::clamp(srcp[i], -1.0f, 1.0f)) * 2147483647.0));
                     break;
                 }
-                case AV_SAMPLE_FMT_S16P: {
-                    auto* l = reinterpret_cast<int16_t*>(o.aframe->data[0]);
-                    auto* r = reinterpret_cast<int16_t*>(o.aframe->data[1]);
-                    for (int i = 0; i < n; ++i) {
-                        l[i] = int16_t(std::lround(std::clamp(srcp[i * 2], -1.0f, 1.0f) * 32767.0f));
-                        r[i] = int16_t(std::lround(std::clamp(srcp[i * 2 + 1], -1.0f, 1.0f) * 32767.0f));
+                case AV_SAMPLE_FMT_S16P:
+                    for (size_t c = 0; c < nc; ++c) {
+                        auto* d = reinterpret_cast<int16_t*>(o.aframe->data[c]);
+                        for (int i = 0; i < n; ++i) d[i] = int16_t(std::lround(std::clamp(srcp[size_t(i) * nc + c], -1.0f, 1.0f) * 32767.0f));
                     }
                     break;
-                }
                 default: return false;
             }
             o.aframe->pts = audioPts;
             audioPts += n;
-            fifo.erase(fifo.begin(), fifo.begin() + n * 2);
+            fifo.erase(fifo.begin(), fifo.begin() + long(size_t(n) * nc));
             if (avcodec_send_frame(o.actx, o.aframe) < 0) return false;
             if (drain(o, o.actx, o.ast) < 0) return false;
         }
@@ -626,8 +640,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             int64_t target = int64_t(std::llround(double(f + 1) * mixRate / seq.fpsValue())) + limiterDelay;
             int n = int(target - audioCursor);
             if (n > 0) {
-                mixBuf.resize(size_t(n) * 2);
-                mixer.mix(p, mixSeq, audioCursor, n, mixBuf.data());
+                mixBuf.resize(size_t(n) * size_t(nch));
+                mixBlock(mixer, audioCursor, n, mixBuf.data());
                 if (limiter) {
                     for (float& v : mixBuf) v = float(v * normGain);
                     limiter->process(mixBuf.data(), mixBuf.data(), n);
@@ -664,6 +678,66 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
     // don't touch an existing file if we failed before writing to it.
     if (!ok && opened) std::remove(s.path.c_str());
     return ok;
+}
+
+bool exportStems(const Project& p, const Sequence& seq, const ExportSettings& s, bool byBus, std::vector<StemFile>* written,
+                 const ExportProgress& progress, const std::atomic<bool>* cancel, std::string* error) {
+    // The groups: each track, or each bus's tracks (and the ones going straight to the master).
+    std::vector<std::pair<std::string, std::vector<bool>>> groups;
+    const size_t n = seq.audioTracks.size();
+    auto hasClips = [&](size_t i) { return !seq.audioTracks[i].muted && !seq.audioTracks[i].clips.empty(); };
+    if (!byBus) {
+        for (size_t i = 0; i < n; ++i) {
+            if (!hasClips(i)) continue;
+            std::vector<bool> mask(n, false);
+            mask[i] = true;
+            const std::string name = seq.audioTracks[i].name.empty() ? "A" + std::to_string(i + 1) : seq.audioTracks[i].name;
+            groups.push_back({name, mask});
+        }
+    } else {
+        std::vector<bool> main(n, false);
+        bool anyMain = false;
+        for (size_t i = 0; i < n; ++i) {
+            const bool routed = std::any_of(seq.buses.begin(), seq.buses.end(), [&](const Bus& b) { return b.id == seq.audioTracks[i].output; });
+            if (!routed && hasClips(i)) main[i] = anyMain = true;
+        }
+        if (anyMain) groups.push_back({"Main", main});
+        for (const Bus& b : seq.buses) {
+            std::vector<bool> mask(n, false);
+            bool any = false;
+            for (size_t i = 0; i < n; ++i)
+                if (seq.audioTracks[i].output == b.id && hasClips(i)) mask[i] = any = true;
+            if (any && !b.muted) groups.push_back({b.name, mask});
+        }
+    }
+    if (groups.empty()) {
+        if (error) *error = "There is no audio to split into stems";
+        return false;
+    }
+    const std::filesystem::path base(s.path);
+    const std::string stem = base.stem().string();
+    for (size_t g = 0; g < groups.size(); ++g) {
+        if (cancel && cancel->load()) {
+            if (error) *error = "Cancelled";
+            return false;
+        }
+        std::string safe = groups[g].first;
+        for (char& ch : safe)
+            if (std::string("/\\:*?\"<>|").find(ch) != std::string::npos) ch = '_';
+        ExportSettings one = s;
+        one.path = (base.parent_path() / (stem + " - " + safe + ".wav")).string();
+        one.videoCodec = "none";
+        one.audioCodec = "pcm_s24le";
+        one.loudnessTarget = 0;  // stems keep their levels, so they add back up to the mix
+        one.burnInCaptions = one.embedCaptions = false;
+        one.burnIn = {};
+        one.audioTracks = groups[g].second;
+        const ExportProgress part = progress ? ExportProgress([&, g](double f, FrameTime t) { progress((double(g) + f) / double(groups.size()), t); })
+                                             : ExportProgress();
+        if (!exportSequence(p, seq, one, part, cancel, error)) return false;
+        if (written) written->push_back({groups[g].first, one.path});
+    }
+    return true;
 }
 
 bool renderClipAudio(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error,

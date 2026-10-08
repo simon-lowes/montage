@@ -57,6 +57,10 @@ struct ExportSettings {
     double loudnessTarget = 0;
     double peakCeiling = -1;  // dBTP, when normalising
     BurnIn burnIn;
+    // A 5.1 or 7.1 sequence's audio is written with all its channels, or folded down to stereo.
+    bool downmixStereo = false;
+    // Only these audio tracks are heard (true = in); empty = all. Used for stems.
+    std::vector<bool> audioTracks;
 };
 
 struct ExportPreset {
@@ -73,6 +77,18 @@ using ExportProgress = std::function<void(double fraction, FrameTime frame)>;
 // videoCodec "hw_h264" / "hw_hevc" picks this machine's hardware encoder
 // (VideoToolbox, NVENC, Quick Sync, AMF, Media Foundation) and falls back to
 // x264 / x265; `encoderUsed` receives the encoder that ran.
+// Stems for delivery (split-track masters): one 24-bit WAV per audio track, or
+// per bus (the tracks routed to it, and "Main" for those going straight to
+// the master), each through its own effects, fader and pan exactly as in the
+// full mix, in the sequence's channel layout (or stereo with downmixStereo).
+// Written beside `s.path` as "<name> - <stem>.wav"; silent groups are skipped.
+struct StemFile {
+    std::string name;
+    std::string path;
+};
+bool exportStems(const Project& p, const Sequence& seq, const ExportSettings& s, bool byBus, std::vector<StemFile>* written,
+                 const ExportProgress& progress = {}, const std::atomic<bool>* cancel = nullptr, std::string* error = nullptr);
+
 bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
                     const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed = nullptr);
 
