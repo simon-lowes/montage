@@ -195,6 +195,12 @@ std::vector<EffectInfo> buildCatalog() {
                   num("softness", "Edge Softness", 0, 1, 0.1), num("spill", "Spill Suppression", 0, 1, 0.6),
                   num("choke", "Choke", -1, 1, 0), boolean("show_matte", "Show Matte")},
                  {}});
+    // Shows the clip through another track's picture (handled when tracks are composited).
+    c.push_back({"track_matte", "Track Matte Key", EffectCategory::VideoFilter, "Keying",
+                 {num("track", "Matte Track (V number, 0: the one above)", 0, 99, 0, 1),
+                  choice("composite", "Composite Using", {"Matte Alpha", "Matte Luma"}, 0), boolean("reverse", "Reverse"),
+                  boolean("hide", "Hide the Matte", true)},
+                 {}});
     c.push_back({"luma_key", "Luma Key", EffectCategory::VideoFilter, "Keying",
                  {num("threshold", "Threshold", 0, 1, 0.1), num("softness", "Softness", 0, 1, 0.05),
                   boolean("invert", "Key Out Brights")},

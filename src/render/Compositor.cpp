@@ -623,12 +623,60 @@ const Clip* findClip(const Track& t, Id id) {
 
 }  // namespace
 
+namespace {
+
+const Clip* clipAt(const Track& track, FrameTime t) {
+    for (const auto& c : track.clips) {
+        if (c.start > t) break;
+        if (c.contains(t) && c.enabled) return &c;
+    }
+    return nullptr;
+}
+
+const Effect* trackMatteOf(const Clip& c) {
+    for (const Effect& e : c.effects)
+        if (e.enabled && e.type == "track_matte") return &e;
+    return nullptr;
+}
+
+// The track a clip on track `ti` takes its matte from, or -1.
+int matteTrack(const Sequence& seq, size_t ti, const Clip& c, const Effect& e, FrameTime t) {
+    const int v = int(std::lround(e.p("track", t - c.start, 0)));
+    const int m = v <= 0 ? int(ti) + 1 : v - 1;
+    return m >= 0 && m < int(seq.videoTracks.size()) && m != int(ti) ? m : -1;
+}
+
+// `layer` (premultiplied) shown through the matte's alpha or luma, or the reverse.
+void applyTrackMatte(Image& layer, const Image& matte, bool luma, bool reverse) {
+    parallelRows(layer.height, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y)
+            for (int x = 0; x < layer.width; ++x) {
+                float m = 0;
+                if (x < matte.width && y < matte.height) {
+                    const float* q = matte.at(x, y);
+                    m = luma ? std::clamp(0.2126f * q[0] + 0.7152f * q[1] + 0.0722f * q[2], 0.0f, 1.0f) : q[3];
+                }
+                if (reverse) m = 1 - m;
+                float* p = layer.at(x, y);
+                for (int k = 0; k < 4; ++k) p[k] *= m;
+            }
+    });
+}
+
+}  // namespace
+
 Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& opts) {
     const int solo = opts.soloVideoTrack;
     RenderOptions o = opts;
     o.soloVideoTrack = -1;
     int W = std::max(1, int(std::lround(seq.width * o.scale))), H = std::max(1, int(std::lround(seq.height * o.scale)));
     Image canvas(W, H);
+    // Tracks a Track Matte Key is using now and hiding (the matte is not seen itself).
+    std::vector<bool> hiddenMatte(seq.videoTracks.size(), false);
+    for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti)
+        if (const Clip* c = clipAt(seq.videoTracks[ti], t))
+            if (const Effect* e = trackMatteOf(*c); e && e->p("hide", t - c->start, 1) > 0.5)
+                if (const int m = matteTrack(seq, ti, *c, *e, t); m >= 0) hiddenMatte[size_t(m)] = true;
     bool canvasEmpty = true;  // nothing drawn yet: the first normal layer can be moved in
     auto composite = [&](Image&& layer, const std::string& mode) {
         if (layer.empty()) return;
@@ -639,6 +687,7 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
     for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti) {
         const Track& track = seq.videoTracks[ti];
         if (solo >= 0 ? int(ti) != solo : track.muted) continue;  // an angle shows even if its track is hidden
+        if (solo < 0 && hiddenMatte[ti]) continue;
         const Transition* active = nullptr;
         FrameTime from = 0, to = 0;
         for (const auto& tr : track.transitions) {
@@ -675,11 +724,18 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
             composite(std::move(mixed), top ? top->blendMode : "normal");
             continue;
         }
-        for (const auto& c : track.clips) {
-            if (c.start > t) break;
-            if (!c.contains(t) || !c.enabled) continue;
-            composite(clipLayer(p, seq, c, t, o, canvasEmpty ? nullptr : &canvas), c.blendMode);
-            break;
+        if (const Clip* c = clipAt(track, t)) {
+            Image layer = clipLayer(p, seq, *c, t, o, canvasEmpty ? nullptr : &canvas);
+            if (const Effect* e = trackMatteOf(*c); e && !layer.empty()) {
+                // With no track to use the key does nothing; with nothing on that track now, the matte is empty.
+                if (const int m = matteTrack(seq, ti, *c, *e, t); m >= 0) {
+                    const FrameTime lt = t - c->start;
+                    Image matte;
+                    if (const Clip* mc = clipAt(seq.videoTracks[size_t(m)], t)) matte = clipLayer(p, seq, *mc, t, o, nullptr);
+                    applyTrackMatte(layer, matte, e->p("composite", lt, 0) > 0.5, e->p("reverse", lt, 0) > 0.5);
+                }
+            }
+            composite(std::move(layer), c->blendMode);
         }
     }
     return canvas;

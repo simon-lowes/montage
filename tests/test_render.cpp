@@ -894,6 +894,58 @@ colorspaces:
                  qPrintable(QString("%1 %2").arg(chroma(muted.at(0, 0)) / m0).arg(chroma(vivid.at(0, 0)) / v0)));
     }
 
+    void trackMatteKey() {
+        // V1 blue; V2 red through V3's matte, a small white square in the middle for the first 30 frames.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 160;
+        s.height = 90;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, colorClip(p, 0, 0, 1, 0, 60));
+        Clip fill = colorClip(p, 1, 0, 0, 0, 60);
+        fill.effects.push_back(makeEffect(p, "track_matte"));
+        const Id fillId = fill.id;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 1}, fill).ok);
+        Clip square = colorClip(p, 1, 1, 1, 0, 30);
+        square.motion.params["scale"] = 25.0;
+        const Id squareId = square.id;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 2}, square).ok);
+        RenderOptions o;
+        float c[4];
+        auto at = [&](FrameTime t, int x, int y) {
+            const Image img = renderProgramFrame(p, s, t, o);
+            rgb(img, x, y, c);
+            return QString("%1 %2 %3").arg(c[0]).arg(c[1]).arg(c[2]);
+        };
+        Effect& key = edit::clipById(s, fillId)->effects.back();
+        // Red only inside the square, which is not seen itself; blue round it.
+        QVERIFY2((at(10, 80, 45), near(c[0], 1) && near(c[1], 0) && near(c[2], 0)), qPrintable(at(10, 80, 45)));
+        QVERIFY2((at(10, 10, 10), near(c[0], 0) && near(c[2], 1)), qPrintable(at(10, 10, 10)));
+        // Reversed: red round the square, blue inside it.
+        key.params["reverse"] = 1.0;
+        QVERIFY2((at(10, 80, 45), near(c[0], 0) && near(c[2], 1)), qPrintable(at(10, 80, 45)));
+        QVERIFY2((at(10, 10, 10), near(c[0], 1) && near(c[2], 0)), qPrintable(at(10, 10, 10)));
+        // No matte (the square has ended): nothing of the fill shows, or all of it reversed.
+        QVERIFY2((at(40, 80, 45), near(c[0], 1) && near(c[2], 0)), qPrintable(at(40, 80, 45)));
+        key.params["reverse"] = 0.0;
+        QVERIFY2((at(40, 80, 45), near(c[0], 0) && near(c[2], 1)), qPrintable(at(40, 80, 45)));
+        // Not hidden: the white square is drawn over it.
+        key.params["hide"] = 0.0;
+        QVERIFY2((at(10, 80, 45), near(c[0], 1) && near(c[1], 1) && near(c[2], 1)), qPrintable(at(10, 80, 45)));
+        key.params["hide"] = 1.0;
+        // Luma: a mid-grey square lets half the red through.
+        Clip* sq = edit::clipById(s, squareId);
+        sq->generator.params["color.r"] = sq->generator.params["color.g"] = sq->generator.params["color.b"] = 0.5;
+        key.params["composite"] = 1.0;
+        at(10, 80, 45);
+        QVERIFY2(c[0] > 0.2f && c[0] < 0.8f && near(c[0] + c[2], 1, 0.02f), qPrintable(at(10, 80, 45)));
+        // An explicit track number works the same as "the one above"; its own track turns the key off.
+        key.params["composite"] = 0.0;
+        key.params["track"] = 3.0;
+        QVERIFY2((at(10, 10, 10), near(c[2], 1)), qPrintable(at(10, 10, 10)));
+        key.params["track"] = 2.0;
+        QVERIFY2((at(10, 10, 10), near(c[0], 1) && near(c[2], 0)), qPrintable(at(10, 10, 10)));
+    }
+
     void curvesAndLuts() {
         auto id = buildCurve("0,0 1,1", 256);
         QVERIFY(near(id[128], 128.0f / 256, 0.002f));

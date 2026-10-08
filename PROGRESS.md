@@ -720,4 +720,8 @@ All 15 items are in (October 2026). The near misses listed in the roadmap are th
   - The shift is built per frame as a table over 0..2 kept rising, so no combination turns tones over; brightness is scaled (shifted in the deepest blacks), so hue and saturation hold.
   - Vibrance scales saturation by (1 - saturation)², so muted colours move most.
   - **Tests:** neutral by default; each control moving its own range and leaving the far end within 0.005; a monotonic ramp with all four fighting; an orange in the shadows lightened with its ratios kept; vibrance lifting a muted colour 1.6x and a vivid one under 1.1x.
+- [x] Track Matte Key (render/Compositor `renderSequenceFrame`):
+  - The effect only marks the clip; compositing does the work. Before drawing, each track's clip at the frame is checked for the key, and the tracks it uses as mattes (and hides) are noted.
+  - The fill's layer is multiplied by the matte track's own layer at that frame (its alpha, or its premultiplied luma; Reverse flips it). Nothing on the matte track then means nothing shows (or everything, reversed); naming the clip's own track or one that does not exist turns the key off.
+  - **Tests:** red only inside a white square on the track above, which is not seen; reversed; with the square gone; not hidden; luma from a mid-grey square letting half through; an explicit track number, and its own track turning the key off.
 
