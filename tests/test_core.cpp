@@ -986,6 +986,27 @@ private slots:
         QCOMPARE(moveKey(keyed, 30, 500, 0, 99), FrameTime(99));
         QCOMPARE(moveKey(keyed, 31, 40, 0, 99), FrameTime(-1));
         QCOMPARE(keyed.keys.size(), size_t(3));
+
+        // Moving several keys together: as far as the keys that stay and the clip allow.
+        Param many;
+        for (FrameTime t : {10, 20, 30, 40}) many.addKey(t, double(t));
+        QCOMPARE(shiftRange(many, {20, 30}, 99), (std::pair<FrameTime, FrameTime>{-9, 9}));
+        QCOMPARE(shiftRange(many, {40}, 50), (std::pair<FrameTime, FrameTime>{-9, 10}));
+        QCOMPARE(shiftRange(many, {10, 20, 30, 40}, 99), (std::pair<FrameTime, FrameTime>{-10, 59}));
+        shiftKeys(many, {20, 30}, 5);
+        QCOMPARE(many.keys[1].t, FrameTime(25));
+        QCOMPARE(many.keys[1].v, 20.0);  // values travel with their keys
+        QCOMPARE(many.keys[2].t, FrameTime(35));
+        // Addressing a clip's parameters.
+        Fixture fx;
+        Clip c = makeClip(fx.p, *fx.p.findMedia(fx.media), TrackKind::Video, fx.s());
+        c.effects.push_back(makeEffect(fx.p, "gaussian_blur"));
+        c.effects.back().params["radius"].addKey(5, 3);
+        const ParamAddress blur{ParamSlot::Effect, c.effects.back().id, "radius"};
+        QVERIFY(findParam(c, blur) && findParam(c, blur)->keyAt(5));
+        QVERIFY(!findParam(c, ParamAddress{ParamSlot::Effect, 999999, "radius"}));
+        QCOMPARE(paramOwner(c, ParamAddress{ParamSlot::Motion, 0, "opacity"}), &c.motion);
+        QVERIFY(findParam(c, ParamAddress{ParamSlot::Motion, 0, "opacity"}));
     }
 
     void autoTagging() {

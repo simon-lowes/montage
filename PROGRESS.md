@@ -308,4 +308,13 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
   - The Render Queue panel (tabbed with Media) lists each job with its preset, output and live status. It has Start Queue, Stop (cancels the current job and stops), Retry, Remove, Clear Finished and Show File.
   - Jobs render one at a time on a worker thread while editing goes on. A failed or cancelled job removes only the file it wrote. The status bar reports each result, and quitting during renders asks first.
   - Tested: queue from the dialog, a failed job beside good ones, the snapshot rendering the original 4 s after the clips were deleted, retry, remove, clear, and stop cancelling with no partial file.
+- [x] Keyframes panel (the dope sheet in Premiere's Effect Controls, Resolve's keyframe editor):
+  - Rows for every animated parameter of the selected clip: Transform, Volume, Time Remapping, the generator and each effect. Hold keys are drawn square, Smooth keys blue, and held stretches dashed.
+  - Editing:
+    - click and Shift/Ctrl-click to select, or drag a box;
+    - drag to retime, live as one undo step; every selected row moves by the same frames, clamped so no key passes one that stays or leaves the clip (core shiftRange/shiftKeys);
+    - arrows nudge (Shift: 10 frames), Delete removes, the context menu sets interpolation, and double-click adds a key with the value there;
+    - the ruler and empty lanes move the playhead.
+  - Clip parameters are addressed in core (ParamAddress, findParam), for this panel and later tools.
+  - Tested: the shifting maths and addressing; in the app with the mouse, selection, dragging with undo, box selection, nudging against the clip start, interpolation, Delete with undo, double-click and the ruler.
 

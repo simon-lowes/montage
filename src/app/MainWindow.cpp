@@ -45,6 +45,7 @@
 #include "ExportDialog.h"
 #include "InspectorWidget.h"
 #include "AutoDuckDialog.h"
+#include "KeyframePanel.h"
 #include "MediaBinWidget.h"
 #include "RenderQueue.h"
 #include "RenderQueuePanel.h"
@@ -244,6 +245,7 @@ void MainWindow::buildPanels() {
     transcriptDock_ = makeDock(tr("Transcript"), "transcript", transcript_);
     shotsDock_ = makeDock(tr("Find Shots"), "shots", shots_);
     multicamDock_ = makeDock(tr("Multicam"), "multicam", multicam_);
+    keyframesDock_ = makeDock(tr("Keyframes"), "keyframes", new KeyframePanel(state_, this));
     queue_ = new RenderQueue(this);
     queueDock_ = makeDock(tr("Render Queue"), "renderqueue", new RenderQueuePanel(queue_, this));
     connect(queue_, &RenderQueue::jobFinished, this, [this](int id, bool ok) {
@@ -285,6 +287,7 @@ void MainWindow::resetLayout() {
     tabifyDockWidget(sourceDock_, mixerDock_);
     tabifyDockWidget(sourceDock_, captionsDock_);
     tabifyDockWidget(sourceDock_, multicamDock_);
+    tabifyDockWidget(sourceDock_, keyframesDock_);
     sourceDock_->raise();
     addDockWidget(Qt::LeftDockWidgetArea, binDock_);
     tabifyDockWidget(binDock_, effectsDock_);

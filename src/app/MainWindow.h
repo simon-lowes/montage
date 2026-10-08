@@ -134,6 +134,7 @@ private:
     QDockWidget* shotsDock_ = nullptr;
     QDockWidget* multicamDock_ = nullptr;
     QDockWidget* queueDock_ = nullptr;
+    QDockWidget* keyframesDock_ = nullptr;
     QDockWidget* meterDock_ = nullptr;
     RenderQueue* queue_ = nullptr;
     QMenu* recentMenu_ = nullptr;

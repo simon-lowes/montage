@@ -43,6 +43,7 @@
 #include "MulticamPanel.h"
 #include "PluginEditorWindow.h"
 #include "audio/PluginEffect.h"
+#include "KeyframePanel.h"
 #include "MaskOverlay.h"
 #include "media/Diarizer.h"
 #include "media/VisualSearch.h"
@@ -1269,6 +1270,80 @@ private slots:
         QVERIFY(!queue->running());
         QVERIFY(!QFileInfo::exists(dir_.path() + "/long.mp4"));
         QVERIFY(queue->remove(longJob));
+    }
+
+    void keyframePanelEditsKeys() {
+        loadDemo();
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        QVERIFY(state()->edit("Keys", [red](Project&, Sequence& s) {
+            Clip* c = edit::clipById(s, red);
+            c->motion.params["opacity"].addKey(0, 100);
+            c->motion.params["opacity"].addKey(30, 50);
+            c->motion.params["scale"].addKey(10, 100);
+            c->motion.params["scale"].addKey(40, 120);
+            return true;
+        }));
+        state()->setSelection({red}, false);
+        win_->raisePanel("keyframes");
+        auto* panel = win_->findChild<KeyframePanel*>();
+        QVERIFY(panel);
+        QTRY_VERIFY(panel->isVisible() && panel->width() > 300);
+        QCOMPARE(panel->clip(), red);
+        QCOMPARE(int(panel->rows().size()), 2);
+        int opacityRow = -1, scaleRow = -1;
+        for (int r = 0; r < 2; ++r) (panel->rows()[size_t(r)].address.param == "opacity" ? opacityRow : scaleRow) = r;
+        QVERIFY(opacityRow >= 0 && scaleRow >= 0);
+        QVERIFY(panel->rows()[size_t(opacityRow)].label.contains("Opacity"));
+        auto keysOf = [&](const char* name) {
+            std::vector<FrameTime> out;
+            for (const Keyframe& k : edit::clipById(*state()->sequence(), red)->motion.params.at(name).keys) out.push_back(k.t);
+            return out;
+        };
+        using Times = std::vector<FrameTime>;
+
+        // Click a key to select it, then drag it later.
+        const QPoint k30 = panel->keyPoint(opacityRow, 30);
+        QTest::mouseClick(panel, Qt::LeftButton, Qt::NoModifier, k30);
+        QCOMPARE(panel->selection().size(), size_t(1));
+        const QPoint later = panel->keyPoint(opacityRow, 45);
+        QTest::mousePress(panel, Qt::LeftButton, Qt::NoModifier, k30);
+        QMouseEvent move(QEvent::MouseMove, later, panel->mapToGlobal(later), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(panel, &move);
+        QTest::mouseRelease(panel, Qt::LeftButton, Qt::NoModifier, later);
+        QVERIFY2(std::llabs(keysOf("opacity")[1] - 45) <= 1, qPrintable(QString::number(keysOf("opacity")[1])));
+        state()->undo();
+        QCOMPARE(keysOf("opacity"), (Times{0, 30}));
+
+        // A box round everything selects all four; arrow keys nudge them together; Delete removes them.
+        panel->select({});
+        const QPoint from(panel->keyPoint(0, 0).x() - 10, panel->keyPoint(0, 0).y() - 10);
+        const QPoint to(panel->keyPoint(1, 59).x() + 5, panel->keyPoint(1, 59).y() + 10);
+        QTest::mousePress(panel, Qt::LeftButton, Qt::NoModifier, from);
+        QMouseEvent boxMove(QEvent::MouseMove, to, panel->mapToGlobal(to), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(panel, &boxMove);
+        QTest::mouseRelease(panel, Qt::LeftButton, Qt::NoModifier, to);
+        QCOMPARE(panel->selection().size(), size_t(4));
+        panel->setFocus();
+        QTest::keyClick(panel, Qt::Key_Left);  // the key at 0 cannot go earlier
+        QCOMPARE(keysOf("opacity"), (Times{0, 30}));
+        QTest::keyClick(panel, Qt::Key_Right);
+        QCOMPARE(keysOf("opacity"), (Times{1, 31}));
+        QCOMPARE(keysOf("scale"), (Times{11, 41}));
+        QVERIFY(panel->setInterpolation(Interp::Hold));
+        QCOMPARE(edit::clipById(*state()->sequence(), red)->motion.params.at("scale").keys[0].interp, Interp::Hold);
+        QTest::keyClick(panel, Qt::Key_Delete);
+        QVERIFY(!edit::clipById(*state()->sequence(), red)->motion.params.at("opacity").animated());
+        QVERIFY(panel->rows().empty());
+        state()->undo();
+        QCOMPARE(int(panel->rows().size()), 2);
+
+        // Double-click adds a key with the value there; a click on the ruler moves the playhead.
+        QTest::mouseDClick(panel, Qt::LeftButton, Qt::NoModifier, panel->keyPoint(opacityRow, 20));
+        const auto& op = edit::clipById(*state()->sequence(), red)->motion.params.at("opacity");
+        QCOMPARE(op.keys.size(), size_t(3));
+        QVERIFY(std::fabs(op.keys[1].v - op.at(op.keys[1].t)) < 1e-9);
+        QTest::mouseClick(panel, Qt::LeftButton, Qt::NoModifier, QPoint(panel->keyPoint(0, 25).x(), 5));
+        QVERIFY(std::llabs(state()->playhead() - 25) <= 1);
     }
 
     void colourManagementUi() {
