@@ -63,6 +63,7 @@ add_library(montage_engine STATIC
   render/ClipAnalysis.h render/ClipAnalysis.cpp
   render/MusicEdit.h render/MusicEdit.cpp
   render/Highlights.h render/Highlights.cpp
+  render/AutoBroll.h render/AutoBroll.cpp
   render/AutoMix.h render/AutoMix.cpp
   render/VoiceMatch.h render/VoiceMatch.cpp
   render/ColorSpace.h render/ColorSpace.cpp

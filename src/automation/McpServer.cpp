@@ -36,6 +36,7 @@
 #include "media/Translator.h"
 #include "render/AafExport.h"
 #include "render/AutoMix.h"
+#include "render/AutoBroll.h"
 #include "render/Highlights.h"
 #include "render/MusicEdit.h"
 #include "render/VoiceMatch.h"
@@ -1411,6 +1412,54 @@ void McpServer::Impl::addTools() {
             for (size_t i = 0; i < std::min<size_t>(3, out.size()); ++i) sample.append(QString::fromStdString(out[i]));
             return ok(QStringLiteral("Added \"%1\" (%2 captions)").arg(name).arg(out.size()),
                       QJsonObject{{"track", int(s.captionTracks.size()) - 1}, {"name", name}, {"first", sample}});
+        });
+
+    add("montage_auto_broll", "Add B-roll by what is said",
+        "Cutaways chosen by the dialogue: the cut's transcribed speech is split into sentences, each compared (CLIP, on "
+        "this computer) with what the footage shows, and over the best-matching sentences (`coverage`, a share) a few "
+        "seconds of the best-matching shot go on a video track above, picture only. `media` lists the footage to choose "
+        "from (default: every video not used in the sequence). Footage not indexed yet is indexed first.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"media":{"type":"array","items":{"type":"number"}},
+            "coverage":{"type":"number","default":0.5},"track":{"type":"number","default":1}},"required":["project"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            if (!visualSearchAvailable()) return fail("This build of Montage cannot search footage (no ONNX Runtime)");
+            if (!visualModel().installed())
+                return fail("The visual search model is not downloaded: run `scripts/fetch-models.sh` or open Find Shots in the app once");
+            Sequence& s = l.seq();
+            std::vector<Id> media;
+            for (const QJsonValue& v : a.value("media").toArray()) media.push_back(Id(v.toDouble()));
+            if (media.empty()) {
+                std::vector<Id> used;
+                for (TrackRef r : allTracks(s))
+                    for (const Clip& c : trackAt(s, r)->clips) used.push_back(c.mediaId);
+                for (const MediaItem& m : l.project.media)
+                    if (m.kind == MediaKind::Video && std::find(used.begin(), used.end(), m.id) == used.end()) media.push_back(m.id);
+            }
+            if (media.empty()) return fail("There is no footage to choose cutaways from");
+            bool changed = false;
+            if (const QString e = indexMissing(l.project, media, changed); !e.isEmpty()) return fail(e);
+            std::string err;
+            auto clip = ClipModel::load(&err);
+            if (!clip) return fail(QString::fromStdString(err));
+            BrollOptions o;
+            o.coverage = std::clamp(a.value("coverage").toDouble(0.5), 0.05, 1.0);
+            const std::vector<BrollPick> picks =
+                planBroll(l.project, s, media, [&](const std::string& t) { return clip->text(t); }, o, &err);
+            if (picks.empty()) {
+                if (changed) save(l);
+                return fail(QString::fromStdString(err));
+            }
+            const edit::Result r = placeBroll(l.project, s, picks, std::max(1, a.value("track").toInt(1)));
+            if (!r.ok) return fail(QString::fromStdString(r.error));
+            save(l);
+            QJsonArray list;
+            for (const BrollPick& b : picks) {
+                const MediaItem* m = l.project.findMedia(b.media);
+                list.append(QJsonObject{{"sentence", QString::fromStdString(b.sentence)}, {"at", tc(b.at, s)}, {"seconds", double(b.length) / s.fpsValue()},
+                                        {"media", m ? QString::fromStdString(m->name) : QString()}, {"media_id", double(b.media)}, {"score", b.score}});
+            }
+            return ok(QStringLiteral("%1 cutaway(s) added").arg(picks.size()), QJsonObject{{"cutaways", list}});
         });
 
     add("montage_find_shots", "Find shots by description",

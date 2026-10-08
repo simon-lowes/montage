@@ -88,6 +88,7 @@
 #include "render/ClipAnalysis.h"
 #include "render/RenderCache.h"
 #include "render/Compositor.h"
+#include "render/AutoBroll.h"
 #include "render/Highlights.h"
 #include "render/MusicEdit.h"
 #include "render/VoiceMatch.h"
@@ -557,6 +558,7 @@ void MainWindow::buildMenus() {
     add(clipM, tr("Cut Selected Media to the Beat"), QKeySequence(), [this] { cutMediaToBeat(1, true); })
         ->setObjectName(QStringLiteral("cutToBeat"));
     add(clipM, tr("Make Highlights…"), QKeySequence(), [this] { highlightsDialog(); })->setObjectName(QStringLiteral("makeHighlights"));
+    add(clipM, tr("Add B-Roll by What Is Said"), QKeySequence(), [this] { addBroll(); })->setObjectName(QStringLiteral("autoBroll"));
     add(clipM, tr("S&ynchronize by Audio"), QKeySequence(), [this] { syncByAudio(); });
     clipM->addSeparator();
     add(clipM, tr("&Insert from Source"), QKeySequence(Qt::Key_Comma), [this] { state_->insertFromSource(false); });
@@ -1754,6 +1756,54 @@ Id MainWindow::makeHighlights(double seconds, const QString& lookFor) {
         state_->message(tr("%n moment(s) in a new Highlights sequence", "", int(moments.size())), 6000);
     }
     return seq;
+}
+
+int MainWindow::addBroll(double coverage) {
+    const Sequence* s = state_->sequence();
+    if (!s) return 0;
+    if (!visualSearchAvailable()) {
+        state_->message(tr("This build of Montage cannot search footage (no ONNX Runtime)"));
+        return 0;
+    }
+    // The footage to choose from: the videos selected in the bin, or every video the sequence does not use.
+    std::vector<Id> media;
+    for (Id id : bin_ ? bin_->selectedMedia() : std::vector<Id>{})
+        if (const MediaItem* m = state_->project().findMedia(id); m && m->kind == MediaKind::Video) media.push_back(id);
+    if (media.empty()) {
+        std::vector<Id> used;
+        for (TrackRef r : allTracks(*s))
+            for (const Clip& c : trackAt(*s, r)->clips) used.push_back(c.mediaId);
+        for (const MediaItem& m : state_->project().media)
+            if (m.kind == MediaKind::Video && std::find(used.begin(), used.end(), m.id) == used.end()) media.push_back(m.id);
+    }
+    if (media.empty()) {
+        state_->message(tr("Import some footage to cut away to"));
+        return 0;
+    }
+    if (!ensureModelPack(this, visualModel(), tr("Add B-Roll"), tr("Matching footage to what is said uses CLIP, which runs on this computer.")))
+        return 0;
+    if (!indexVideos(state_, media, this)) return 0;
+    std::string err;
+    auto clip = ClipModel::load(&err);
+    if (!clip) {
+        state_->message(QString::fromStdString(err), 6000);
+        return 0;
+    }
+    BrollOptions o;
+    o.coverage = coverage;
+    const std::vector<BrollPick> picks = planBroll(state_->project(), *s, media, [&](const std::string& t) { return clip->text(t); }, o, &err);
+    if (picks.empty()) {
+        state_->message(QString::fromStdString(err), 6000);
+        return 0;
+    }
+    int n = 0;
+    state_->apply(tr("Add B-Roll"), [&](Project& p, Sequence& sq) {
+        edit::Result r = placeBroll(p, sq, picks, 1);
+        n = int(r.created.size());
+        return r;
+    });
+    if (n) state_->message(tr("%n cutaway(s) added on V2", "", n), 5000);
+    return n;
 }
 
 void MainWindow::highlightsDialog() {

@@ -72,6 +72,7 @@ public:
     int cutMediaToBeat(int every, bool bars);  // the bin's selected media, cut on the music clip's beats
     Id makeHighlights(double seconds, const QString& lookFor = {});  // a new Highlights sequence; its id, or 0
     void highlightsDialog();
+    int addBroll(double coverage = 0.5);  // cutaways on V2 matching what is said; how many
     bool fitMusicToLength(FrameTime target);
     void fitMusicDialog();
     // Auto Reframe: a copy of the current sequence at aspect w:h with every

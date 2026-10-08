@@ -52,6 +52,7 @@
 #include "audio/AudioRepair.h"
 #include "render/MusicEdit.h"
 #include "render/Highlights.h"
+#include "render/AutoBroll.h"
 #include "render/AutoMix.h"
 #include "render/VideoDenoise.h"
 #include "render/VoiceMatch.h"
@@ -3680,6 +3681,110 @@ private slots:
         // Nothing to go on: an error, not an empty sequence.
         r = call(QJsonObject{{"project", project}, {"script", "Lines nobody ever said."}});
         QVERIFY(r.value("isError").toBool());
+    }
+
+    void autoBroll() {
+        if (!visualSearchAvailable() || !visualModel().installed()) QSKIP("Set MONTAGE_VISUAL_MODEL to the CLIP model");
+        std::string err;
+        // Two cutaway shots made from the portraits, three seconds each, and a plain "talking head".
+        auto still = [&](const char* file, const char* image, FrameTime frames) {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 320;
+            gs.height = 240;
+            gs.fps = {25, 1};
+            if (image) {
+                MediaItem m = probeOrFail(gen, std::string(MONTAGE_TEST_DATA_DIR "/faces/") + image);
+                gen.media.push_back(m);
+                edit::placeMedia(gen, gs, m.id, 0, 0, double(frames), {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+            } else {
+                Clip c = makeGeneratorClip(gen, "color", frames);
+                c.generator.params["color.r"] = c.generator.params["color.g"] = c.generator.params["color.b"] = Param(0.5);
+                edit::overwrite(gen, gs, {TrackKind::Video, 0}, c);
+            }
+            ExportSettings st = findExportPreset("H.264 - Fast Draft")->settings;
+            st.path = path(file);
+            st.audioCodec = "none";
+            if (!exportSequence(gen, gs, st, nullptr, nullptr, &err)) qFatal("%s", err.c_str());
+            return st.path;
+        };
+        const std::string moon = still("broll-astronaut.mp4", "armstrong.jpg", 75), office = still("broll-office.mp4", "jfk-color.jpg", 75),
+                          head = still("broll-head.mp4", nullptr, 300);
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320;
+        s.height = 240;
+        s.fps = {25, 1};
+        std::vector<Id> cutaways;
+        for (const std::string& f : {moon, office}) {
+            MediaItem m = probeOrFail(p, f);
+            VisualIndex index;
+            QVERIFY2(indexVideo(f, 0, index, 0, {}, nullptr, &err), err.c_str());
+            m.visual = std::make_shared<const VisualIndex>(index);
+            p.media.push_back(m);
+            cutaways.push_back(m.id);
+        }
+        MediaItem talk = probeOrFail(p, head);
+        auto t = std::make_shared<Transcript>();
+        TranscriptSegment seg;
+        auto words = [&](const char* text, double at) {
+            for (const QString& w : QString(text).split(' ')) {
+                seg.words.push_back({at, at + 0.3, w.toStdString(), 1});
+                at += 0.35;
+            }
+        };
+        words("An astronaut in a white space suit stood in front of the moon.", 1.0);
+        words("Then the president in a dark suit smiled at his desk.", 6.0);
+        t->segments.push_back(seg);
+        talk.transcript = t;
+        p.media.push_back(talk);
+        QVERIFY(edit::placeMedia(p, s, talk.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        auto clip = ClipModel::load(&err);
+        QVERIFY2(clip, err.c_str());
+        BrollOptions o;
+        o.coverage = 1;
+        const std::vector<BrollPick> picks = planBroll(p, s, cutaways, [&](const std::string& x) { return clip->text(x); }, o, &err);
+        QVERIFY2(picks.size() == 2, err.c_str());
+        for (const BrollPick& b : picks) qInfo("\"%s\" -> %llu (%.3f)", b.sentence.c_str(), (unsigned long long)b.media, b.score);
+        // Each sentence gets the shot it describes, over its own words.
+        QCOMPARE(picks[0].media, cutaways[0]);
+        QCOMPARE(picks[1].media, cutaways[1]);
+        QCOMPARE(picks[0].at, FrameTime(25));
+        QCOMPARE(picks[1].at, FrameTime(150));
+        QVERIFY(picks[0].length <= 75 && picks[0].length >= 37);
+        // Placed on V2, picture only; the talking head is untouched and no sound is added.
+        size_t audioBefore = 0;
+        for (const Track& a : s.audioTracks) audioBefore += a.clips.size();
+        const edit::Result r = placeBroll(p, s, picks, 1);
+        QVERIFY2(r.ok, r.error.c_str());
+        QCOMPARE(s.videoTracks[1].clips.size(), size_t(2));
+        size_t audioAfter = 0;
+        for (const Track& a : s.audioTracks) audioAfter += a.clips.size();
+        QCOMPARE(audioAfter, audioBefore);
+        QCOMPARE(s.videoTracks[0].clips.size(), size_t(1));
+        // At half coverage, only the better match.
+        o.coverage = 0.5;
+        QCOMPARE(planBroll(p, s, cutaways, [&](const std::string& x) { return clip->text(x); }, o, &err).size(), size_t(1));
+        // Over MCP, choosing from the footage the sequence does not use.
+        Project q = makeDefaultProject();
+        Sequence& qs = *q.active();
+        qs.fps = {25, 1};
+        for (const MediaItem& m : p.media) q.media.push_back(m);
+        QVERIFY(edit::placeMedia(q, qs, talk.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const QString project = QString::fromStdString(path("broll.montage"));
+        QVERIFY(saveProject(q, project.toStdString()));
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_auto_broll"}, {"arguments", QJsonObject{{"project", project}, {"coverage", 1.0}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject res = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        QCOMPARE(res.value("structuredContent").toObject().value("cutaways").toArray().size(), 2);
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.active()->videoTracks[1].clips.size(), size_t(2));
     }
 
     void autoHighlights() {
