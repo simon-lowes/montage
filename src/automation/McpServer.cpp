@@ -19,6 +19,7 @@
 
 #include "core/AutoTag.h"
 #include "core/Captions.h"
+#include "core/Checkerboard.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
 #include "core/History.h"
@@ -1049,6 +1050,44 @@ void McpServer::Impl::addTools() {
             const int n = applyMix(l.project, s, plan, o);
             save(l);
             return ok(QStringLiteral("Mixed %1 clip(s)").arg(n), QJsonObject{{"clips", clips}, {"changed", n}});
+        });
+
+    add("montage_checkerboard", "Split dialogue by speaker",
+        "Checkerboard dialogue, as dialogue editors do before a mix: each audio clip is split where the speaker changes "
+        "(in the silence between them) and each person's parts go to an audio track of their own (a free track below, or a "
+        "new one named after them). Needs a transcript with speaker labels (montage_transcribe with speakers).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "clips":{"type":"array","items":{"type":"number"},"description":"Audio clip ids"},
+            "track":{"type":"string","description":"Or every clip on this audio track, e.g. A1"}},"required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            std::vector<Id> clips;
+            for (const QJsonValue& v : a.value("clips").toArray()) clips.push_back(Id(v.toDouble()));
+            if (a.contains("track")) {
+                const TrackRef t = trackArg(str(a, "track"), s, false);
+                if (t.kind != TrackKind::Audio) throw ArgError{"\"track\" must be an audio track"};
+                for (const Clip& c : trackAt(s, t)->clips) clips.push_back(c.id);
+            }
+            if (clips.empty()) throw ArgError{"Give \"clips\" or \"track\""};
+            int people = 0, split = 0;
+            QStringList errors;
+            for (Id id : clips) {
+                int n = 0;
+                const edit::Result r = checkerboardBySpeaker(l.project, s, id, &n);
+                if (!r.ok) {
+                    errors << QStringLiteral("%1: %2").arg(id).arg(QString::fromStdString(r.error));
+                    continue;
+                }
+                people = std::max(people, n);
+                split += int(r.created.size());
+            }
+            if (split == 0) return fail(errors.join("\n"));
+            save(l);
+            QJsonArray tracks;
+            for (const Track& t : s.audioTracks) tracks.append(QJsonObject{{"name", QString::fromStdString(t.name)}, {"clips", int(t.clips.size())}});
+            return ok(QStringLiteral("%1 pieces, %2 people").arg(split).arg(people) + (errors.isEmpty() ? QString() : "\n" + errors.join("\n")),
+                      QJsonObject{{"pieces", split}, {"people", people}, {"audio_tracks", tracks}});
         });
 
     add("montage_match_voice", "Match voices",

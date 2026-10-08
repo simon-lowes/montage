@@ -8,6 +8,7 @@
 #include "core/AutoTag.h"
 #include "core/Captions.h"
 #include "core/Cfb.h"
+#include "core/Checkerboard.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
 #include "core/History.h"
@@ -1120,6 +1121,96 @@ private slots:
         unsure.add(0, mix({{0, 0}, {0, 1}}));
         unsure.add(1, mix({{3, 1}}));
         QVERIFY(autoTags(unsure, labels).keywords.empty());
+    }
+
+    void checkerboardDialogue() {
+        // An interview at 25 fps: the host (0), a guest (1), the host again, a second guest (2).
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = {25, 1};
+        while (s.audioTracks.size() < 2) edit::addTrack(p, s, TrackKind::Audio);
+        s.audioTracks.resize(2);
+        MediaItem m;
+        m.id = p.newId();
+        m.name = "interview.wav";
+        m.kind = MediaKind::Audio;
+        m.hasAudio = true;
+        m.duration = 20;
+        auto t = std::make_shared<Transcript>();
+        auto seg = [&](double a, double b, int speaker, const char* text) {
+            TranscriptSegment g;
+            g.start = a;
+            g.end = b;
+            g.speaker = speaker;
+            g.text = text;
+            t->segments.push_back(g);
+        };
+        seg(1.0, 3.0, 0, "So tell me");
+        seg(3.0, 4.0, 0, "about it.");
+        seg(4.5, 6.0, 1, "Well, it began");
+        seg(6.6, 8.0, 0, "Really?");
+        seg(8.2, 10.0, 2, "Yes, I was there.");
+        seg(10.5, 12.0, 1, "Out of range");  // after the clip
+        t->speakerNames = {"Host", "Ana", "Ben"};
+        m.transcript = t;
+        p.media.push_back(m);
+        Clip c;
+        c.id = p.newId();
+        c.mediaId = m.id;
+        c.start = 100;
+        c.duration = 225;  // source 0.5 s to 9.5 s
+        c.sourceIn = 12.5;
+        c.audio = makeEffect(p, "volume");
+        Param gain;
+        gain.addKey(0, 0.0);
+        gain.addKey(200, -6.0);
+        c.audio.params["gain_db"] = gain;
+        s.audioTracks[0].clips.push_back(c);
+        // Something already on A2 where Ana speaks, so she gets a track of her own.
+        Clip busy = c;
+        busy.id = p.newId();
+        busy.start = 200;
+        busy.duration = 10;
+        s.audioTracks[1].clips.push_back(busy);
+        const size_t tracksBefore = s.audioTracks.size();
+
+        int people = 0;
+        const edit::Result r = checkerboardBySpeaker(p, s, c.id, &people);
+        QVERIFY2(r.ok, r.error.c_str());
+        QCOMPARE(people, 3);
+        QCOMPARE(r.created.size(), size_t(4));
+        // Cuts in the middle of each gap: 4.25 s, 6.3 s and 8.1 s of source, at 106.25, 157.5 and 202.5 frames.
+        const Track& host = s.audioTracks[0];
+        QCOMPARE(host.clips.size(), size_t(2));
+        QCOMPARE(host.clips[0].start, FrameTime(100));
+        QCOMPARE(host.clips[0].end(), FrameTime(194));   // 100 + 4.25 * 25 - 12.5
+        QCOMPARE(host.clips[1].start, FrameTime(245));
+        QCOMPARE(host.clips[1].end(), FrameTime(290));
+        QCOMPARE(s.audioTracks.size(), tracksBefore + 1);  // Ana could not go on A2
+        const Track& ana = s.audioTracks.back();
+        QCOMPARE(ana.name, std::string("Ana"));
+        QCOMPARE(ana.clips.size(), size_t(1));
+        QCOMPARE(ana.clips[0].start, FrameTime(194));
+        QCOMPARE(ana.clips[0].sourceIn, 12.5 + 94);  // carries on in the source where the host's part stopped
+        QCOMPARE(ana.clips[0].linkGroup, Id(0));
+        const Track& a2 = s.audioTracks[1];  // Ben fits on A2
+        QCOMPARE(a2.clips.size(), size_t(2));
+        QCOMPARE(a2.clips[1].start, FrameTime(290));
+        QCOMPARE(a2.clips[1].end(), FrameTime(325));
+        // Together they cover the clip, gain keyframes moved with each part.
+        QCOMPARE(host.clips[1].audio.p("gain_db", 0), -6.0 * 145 / 200);
+        // Errors: one speaker, no labels, video.
+        QVERIFY(!checkerboardBySpeaker(p, s, host.clips[0].id).ok);
+        Clip plain = c;
+        plain.id = p.newId();
+        plain.start = 1000;
+        MediaItem bare = m;
+        bare.id = p.newId();
+        bare.transcript.reset();
+        p.media.push_back(bare);
+        plain.mediaId = bare.id;
+        s.audioTracks[0].clips.push_back(plain);
+        QVERIFY(!checkerboardBySpeaker(p, s, plain.id).ok);
     }
 
     void compoundFileRoundTrip() {

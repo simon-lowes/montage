@@ -1005,6 +1005,39 @@ private slots:
             QVERIFY(QFileInfo::exists(QString::fromStdString(path("mcp Media/jfk.wav"))));
         }
 
+        // Checkerboarding through MCP: the speech labelled with two speakers, split onto two tracks.
+        {
+            Project cb = makeDefaultProject();
+            Sequence& cs = *cb.active();
+            cs.fps = {25, 1};
+            cs.audioTracks.resize(1);
+            MediaItem sp = probeOrFail(cb, MONTAGE_TEST_DATA_DIR "/jfk.wav");
+            auto tr = std::make_shared<Transcript>();
+            TranscriptSegment s1, s2;
+            s1.start = 0.3, s1.end = 3.0, s1.speaker = 0;
+            s2.start = 3.6, s2.end = 7.0, s2.speaker = 1;
+            tr->segments = {s1, s2};
+            sp.transcript = tr;
+            cb.media.push_back(sp);
+            QVERIFY(edit::placeMedia(cb, cs, sp.id, 0, 0, 200, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+            const QString project = QString::fromStdString(path("checker.montage"));
+            QVERIFY(saveProject(cb, project.toStdString()));
+            McpServer server;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_checkerboard"},
+                                                         {"arguments", QJsonObject{{"project", project}, {"track", "A1"}}},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            const QJsonObject res = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+            QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+            QCOMPARE(res.value("structuredContent").toObject().value("people").toInt(), 2);
+            Project back;
+            QVERIFY(loadProject(project.toStdString(), back));
+            QCOMPARE(back.active()->audioTracks.size(), size_t(2));
+            QCOMPARE(back.active()->audioTracks[1].name, std::string("Speaker 2"));
+        }
+
         // An independent reader (pyaaf2), when there is one: the same structure, through to the WAV files.
         const QByteArray python = qgetenv("MONTAGE_TEST_PYAAF2");
         if (python.isEmpty()) return;

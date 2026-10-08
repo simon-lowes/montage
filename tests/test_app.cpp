@@ -42,6 +42,7 @@
 #include "core/KeyframeEdit.h"
 #include "core/MediaLog.h"
 #include "InspectorWidget.h"
+#include "core/Transcript.h"
 #include "SequenceSettingsDialog.h"
 #include "media/Vector.h"
 #include "SurroundPanner.h"
@@ -743,6 +744,38 @@ private slots:
         state()->newProject();
         win_->activateWindow();  // the context menu took the focus
         QVERIFY(QTest::qWaitForWindowActive(win_.get()));
+    }
+
+    void checkerboardFromTheClipMenu() {
+        state()->newProject();
+        auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        // Two speakers, as diarization would label them.
+        QVERIFY(state()->edit("Label", [media](Project& p, Sequence&) {
+            auto t = std::make_shared<Transcript>();
+            TranscriptSegment a, b;
+            a.start = 0.3, a.end = 3.0, a.speaker = 0, a.text = "And so";
+            b.start = 3.6, b.end = 7.0, b.speaker = 1, b.text = "my fellow";
+            t->segments = {a, b};
+            p.findMedia(media)->transcript = t;
+            return true;
+        }));
+        QVERIFY(state()->apply("Place", [media](Project& p, Sequence& s) { return edit::placeMedia(p, s, media, 0, 0, -1, V1, A1, false); }));
+        const Id clip = trackAt(*state()->sequence(), A1)->clips.at(0).id;
+        state()->setSelection({clip}, false);
+        const size_t before = state()->sequence()->audioTracks.at(0).clips.size();
+        const FrameTime origEnd = edit::clipById(*state()->sequence(), clip)->end();
+        win_->findChild<QAction*>("checkerboardBySpeaker")->trigger();
+        QCOMPARE(state()->sequence()->audioTracks.at(0).clips.size(), before);  // the second speaker moved off A1
+        QCOMPARE(state()->sequence()->audioTracks.at(1).clips.size(), size_t(1));
+        const FrameTime cut = FrameTime(std::llround(3.3 * state()->sequence()->fpsValue()));
+        QCOMPARE(state()->sequence()->audioTracks.at(0).clips.at(0).end(), cut);
+        QCOMPARE(state()->sequence()->audioTracks.at(1).clips.at(0).start, cut);
+        state()->undo();
+        QCOMPARE(state()->sequence()->audioTracks.at(1).clips.size(), size_t(0));
+        QCOMPARE(edit::clipById(*state()->sequence(), clip)->end(), origEnd);  // one undo step puts it back
+        state()->newProject();
     }
 
     void exportAafFromTheFileMenu() {

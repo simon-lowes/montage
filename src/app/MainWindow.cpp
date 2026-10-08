@@ -71,6 +71,7 @@
 #include "ScopesWidget.h"
 #include "SequenceSettingsDialog.h"
 #include "Theme.h"
+#include "core/Checkerboard.h"
 #include "core/Effects.h"
 #include "core/Interchange.h"
 #include "media/Analysis.h"
@@ -468,6 +469,34 @@ void MainWindow::buildMenus() {
     });
     add(clipM, tr("Detect &Scene Cuts"), QKeySequence(), [this] { detectScenes(); });
     add(clipM, tr("Find Similar S&hots"), QKeySequence(), [this] { findSimilarShots(); })->setObjectName(QStringLiteral("findSimilarShots"));
+    add(clipM, tr("Checkerboard Dialogue by Speaker"), QKeySequence(), withSeq([this] {
+            // The selected audio clips, each split where the speaker changes, a track per person.
+            std::vector<Id> clips;
+            for (Id id : state_->selectedClips())
+                if (auto loc = edit::locate(*state_->sequence(), id); loc && loc->track.kind == TrackKind::Audio) clips.push_back(id);
+            if (clips.empty()) {
+                statusBar()->showMessage(tr("Select the dialogue clips to split by speaker"), 5000);
+                return;
+            }
+            int people = 0;
+            QString why;
+            const bool ok = state_->apply(tr("Checkerboard by Speaker"), [&](Project& p, Sequence& s) {
+                edit::Result all;
+                for (Id id : clips) {
+                    int n = 0;
+                    const edit::Result r = checkerboardBySpeaker(p, s, id, &n);
+                    if (!r.ok) {
+                        why = QString::fromStdString(r.error);
+                        continue;
+                    }
+                    people = std::max(people, n);
+                    all.created.insert(all.created.end(), r.created.begin(), r.created.end());
+                }
+                if (all.created.empty()) return edit::Result::fail(why.toStdString());
+                return all;
+            });
+            statusBar()->showMessage(ok ? tr("Split by speaker: %n people, each on their own track", "", people) : why, 6000);
+        }))->setObjectName(QStringLiteral("checkerboardBySpeaker"));
     add(clipM, tr("Normalize &Loudness…"), QKeySequence(), [this] { normalizeLoudness(); });
     add(clipM, tr("Auto &Duck Music…"), QKeySequence(), withSeq([this] {
             // The selected audio clips are the music.

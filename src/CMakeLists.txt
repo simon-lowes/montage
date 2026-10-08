@@ -10,6 +10,7 @@ add_library(montage_engine STATIC
   core/TranscriptEdit.h core/TranscriptEdit.cpp
   core/ScriptCut.h core/ScriptCut.cpp
   core/Cfb.h core/Cfb.cpp
+  core/Checkerboard.h core/Checkerboard.cpp
   core/Aaf.h core/Aaf.cpp core/AafMetaDictionary.inc
   core/Surround.h core/Surround.cpp
   core/Effects.h core/Effects.cpp

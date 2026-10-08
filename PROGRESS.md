@@ -535,3 +535,8 @@ All 15 items are in (October 2026). The near misses listed in the roadmap are th
 ## After Phase 3: the near misses
 
 - [x] Find Similar Shots: a frame's CLIP image embedding (`embedFrame`, sampled as the index samples) ranked against every indexed video with `findSimilarShots`, which widens moments for image-to-image scores (a 0.06 band, against 0.015 for words) and leaves out the moment the frame comes from. Available from Clip › Find Similar Shots (the selected or topmost video clip at the playhead), the bin's context menu (a video's middle frame), and MCP `montage_find_shots` with `like` instead of `query`. Tested with two videos holding the same two scenes in opposite order: a kitchen frame from one finds the other's kitchen first (score over 0.9) and never itself; the same through MCP and from the app's timeline.
+- [x] Checkerboard dialogue by speaker (core/Checkerboard):
+  - **Splitting:** the transcript's speaker turns inside the clip are joined per person, and the clip is cut with `edit::razor` (which carries keyframes and transitions) at the middle of each gap between two people.
+  - **Tracks:** the first person stays. Each other person goes to the first audio track below that is free over all of their parts, else to a new track named after them. Moved parts are unlinked from the picture, and transitions that joined them to their old neighbours are dropped.
+  - **Where to find it:** Clip › Checkerboard Dialogue by Speaker (for the selected audio clips, one undo step) and MCP `montage_checkerboard` (clips or a whole track).
+  - **Tests:** cut frames from known turns; source continuity and gain keyframes carried; a busy track skipped for a new one named after the speaker; the errors; the menu action with undo; MCP.
