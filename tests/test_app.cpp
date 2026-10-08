@@ -35,6 +35,7 @@
 
 #include "AutoDuckDialog.h"
 #include "Settings.h"
+#include "media/MediaPool.h"
 #include "AutoMixDialog.h"
 #include "CaptionsPanel.h"
 #include "ColorWheel.h"
@@ -4033,6 +4034,35 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(state()->sequence()->markers.empty());
         dlg->close();
         QVERIFY(!win_->compareWith(999999));
+        state()->newProject();
+    }
+
+    void normalizeWaveformsOption() {
+        // The JFK clip turned down 20 dB: drawn at a tenth normally, at its own peak's full height when normalised.
+        state()->newProject();
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            if (!edit::placeMedia(p, s, ids[0], 0, 0, -1, V1, {TrackKind::Audio, 0}, false).ok) return false;
+            s.audioTracks[0].clips[0].audio.params["gain_db"] = Param(-20.0);
+            return true;
+        }));
+        const Clip clip = state()->sequence()->audioTracks[0].clips.at(0);
+        const std::string path = state()->project().findMedia(ids[0])->path;
+        QTRY_VERIFY_WITH_TIMEOUT(MediaPool::instance().peaksIfReady(path) != nullptr, 20000);
+        auto* act = win_->findChild<QAction*>("normalizeWaveforms");
+        QVERIFY(act && act->isCheckable());
+        if (act->isChecked()) act->trigger();
+        QVERIFY(std::fabs(timeline()->waveformScale(clip) - 0.1) < 1e-9);
+        act->trigger();
+        QVERIFY(timeline()->normalizeWaveforms());
+        QVERIFY(appSettings().value("timeline/normalizeWaveforms").toBool());
+        const double scale = timeline()->waveformScale(clip);
+        float peak = 0;
+        for (float v : MediaPool::instance().peaksIfReady(path)->minmax) peak = std::max(peak, std::fabs(v));
+        QVERIFY2(peak > 0.05f && std::fabs(scale - 1.0 / peak) < 1e-3 * scale, qPrintable(QString("%1 %2").arg(scale).arg(peak)));
+        act->trigger();
+        QVERIFY(!timeline()->normalizeWaveforms());
         state()->newProject();
     }
 

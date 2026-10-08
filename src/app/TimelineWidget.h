@@ -2,6 +2,7 @@
 #pragma once
 
 #include <QAbstractScrollArea>
+#include <map>
 #include <QMenu>
 #include <QList>
 #include <optional>
@@ -60,6 +61,12 @@ public:
     // Each clip's duration in its name strip (Resolve 21.1's view option).
     void setShowClipDurations(bool on);
     bool showClipDurations() const { return showDurations_; }
+    // Resolve 21.1's independent waveform scaling: each audio clip's waveform drawn to the full height of the clip
+    // from its own loudest point, so quiet sound is readable (the clip's level no longer scales it).
+    void setNormalizeWaveforms(bool on);
+    bool normalizeWaveforms() const { return normalizeWaves_; }
+    // The factor a clip's samples are drawn at: its gain, or with normalising 1 / its peak (0 until peaks are read).
+    double waveformScale(const Clip& c) const;
     // Duplicate frame markers (Premiere's): a coloured stripe under video frames that another clip also shows.
     void setShowDuplicateFrames(bool on);
     bool showDuplicateFrames() const { return showDuplicates_; }
@@ -273,6 +280,8 @@ private:
     std::optional<Gap> gap_;
     bool showDuplicates_ = false;
     bool showDurations_ = false;
+    bool normalizeWaves_ = false;
+    mutable std::map<Id, double> clipPeaks_;  // normalising: each audio clip's loudest sample, until the project changes
     mutable bool duplicatesDirty_ = true;
     mutable bool throughDirty_ = true;
     mutable std::vector<Id> through_;

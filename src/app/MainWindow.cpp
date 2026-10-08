@@ -1161,6 +1161,19 @@ void MainWindow::buildMenus() {
         a->setObjectName(QStringLiteral("showClipDurations"));
     }
     {
+        const bool normalize = appSettings().value("timeline/normalizeWaveforms", false).toBool();
+        timeline_->setNormalizeWaveforms(normalize);
+        QAction* a = add(seqM, tr("Normalise Waveforms"), QKeySequence(), [this](bool on) {
+            timeline_->setNormalizeWaveforms(on);
+            appSettings().setValue("timeline/normalizeWaveforms", on);
+        });
+        a->setCheckable(true);
+        a->setChecked(normalize);
+        a->setObjectName(QStringLiteral("normalizeWaveforms"));
+        a->setToolTip(tr("Draw each audio clip's waveform to the full height from its own loudest point (quiet sound becomes "
+                         "readable; the clip's level no longer scales it)"));
+    }
+    {
         const bool dups = appSettings().value("timeline/duplicateFrames", false).toBool();
         timeline_->setShowDuplicateFrames(dups);
         QAction* a = add(seqM, tr("Show &Duplicate Frame Markers"), QKeySequence(), [this](bool on) {

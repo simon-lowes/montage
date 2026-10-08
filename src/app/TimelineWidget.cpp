@@ -126,6 +126,7 @@ TimelineWidget::TimelineWidget(EditorState* state, QWidget* parent) : QAbstractS
     verticalScrollBar()->setSingleStep(20);
     connect(state_, &EditorState::projectChanged, this, [this] {
         duplicatesDirty_ = throughDirty_ = true;
+        clipPeaks_.clear();
         gap_.reset();
         updateScrollBars();
         viewport()->update();
@@ -848,6 +849,31 @@ void TimelineWidget::setShowClipDurations(bool on) {
     viewport()->update();
 }
 
+void TimelineWidget::setNormalizeWaveforms(bool on) {
+    normalizeWaves_ = on;
+    clipPeaks_.clear();
+    viewport()->update();
+}
+
+double TimelineWidget::waveformScale(const Clip& c) const {
+    if (!normalizeWaves_) return std::pow(10.0, c.audio.p("gain_db", 0, 0) / 20.0);
+    const Sequence* s = state_->sequence();
+    const MediaItem* m = state_->project().findMedia(c.mediaId);
+    if (!s || !m) return 0;
+    if (auto it = clipPeaks_.find(c.id); it != clipPeaks_.end()) return it->second > 0 ? 1.0 / it->second : 0;
+    const PeaksPtr pk = MediaPool::instance().peaksIfReady(m->path);
+    if (!pk || pk->minmax.empty()) return 0;  // not cached: tried again once the peaks are read
+    // The loudest sample over the stretch of source the clip plays.
+    const double fps = s->fpsValue(), perBucket = pk->samplesPerBucket;
+    double a = c.sourceFrameAt(c.start) / fps * pk->sampleRate / perBucket, b = c.sourceFrameAt(c.end() - 1) / fps * pk->sampleRate / perBucket;
+    if (a > b) std::swap(a, b);
+    const size_t buckets = pk->minmax.size() / 2, first = size_t(std::max(0.0, a)), last = std::min(buckets, size_t(std::max(0.0, b)) + 2);
+    float peak = 0;
+    for (size_t i = first; i < last; ++i) peak = std::max({peak, std::fabs(pk->minmax[i * 2]), std::fabs(pk->minmax[i * 2 + 1])});
+    clipPeaks_[c.id] = peak;
+    return peak > 0 ? 1.0 / peak : 0;
+}
+
 void TimelineWidget::setShowDuplicateFrames(bool on) {
     showDuplicates_ = on;
     duplicatesDirty_ = true;
@@ -1266,7 +1292,7 @@ void TimelineWidget::paintWaveform(QPainter& p, const Clip& c, const QRect& r, c
     const double rate = pk->sampleRate;
     const size_t buckets = pk->minmax.size() / 2;
     int x0 = std::max(r.left(), kHeaderW), x1 = std::min(r.right(), viewport()->width());
-    double gain = std::pow(10.0, c.audio.p("gain_db", 0, 0) / 20.0);
+    const double gain = waveformScale(c);
     double mid = r.center().y(), half = r.height() / 2.0;
     p.setPen(col);
     for (int x = x0; x <= x1; ++x) {
