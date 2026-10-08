@@ -308,6 +308,15 @@ std::vector<EffectInfo> buildCatalog() {
                  {num("hz", "Frequency (Hz)", 2000, 12000, 6000, 10), num("threshold_db", "Threshold (dB)", -60, 0, -30, 0.1),
                   num("reduction_db", "Max Reduction (dB)", 0, 24, 10, 0.1)},
                  {}});
+    // Added from the transcript (Bleep Words); the stretches are in source seconds.
+    {
+        EffectInfo bleep{"bleep", "Bleep", EffectCategory::AudioFilter, "Restoration",
+                         {choice("mode", "Cover With", {"Tone", "Silence"}, 0), num("frequency", "Tone (Hz)", 200, 4000, 1000, 1),
+                          num("level", "Tone Level (dB)", -40, 0, -12, 0.5)},
+                         {str("ranges", "Bleeped (source seconds)", StringKind::Text)}};
+        bleep.hidden = true;
+        c.push_back(bleep);
+    }
     c.push_back({"gate", "Noise Gate", EffectCategory::AudioFilter, "Dynamics",
                  {num("threshold_db", "Threshold (dB)", -80, 0, -45, 0.1), num("range_db", "Range (dB)", -80, 0, -40, 0.1),
                   num("attack_ms", "Attack (ms)", 0.1, 50, 1, 0.1), num("hold_ms", "Hold (ms)", 0, 500, 50, 1),

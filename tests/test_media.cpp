@@ -17,6 +17,7 @@
 #include <cstdio>
 
 #include "core/Aaf.h"
+#include "core/Bleep.h"
 #include "core/AutoTag.h"
 #include "core/Cfb.h"
 #include "core/EditOps.h"
@@ -840,6 +841,90 @@ private slots:
         QCOMPARE(shape.generator.p("trim_end", 0), 0.0);
         QCOMPARE(shape.generator.p("trim_end", FrameTime(std::llround(bs.fpsValue()))), 100.0);
         QVERIFY(std::fabs(shape.generator.p("stroke_color.g", 0) - 0x88 / 255.0) < 1e-6);
+    }
+
+    void bleepInTheMix() {
+        // 3 s of a 300 Hz tone; "darn" said 1.0-1.5 s in.
+        const int rate = 48000;
+        std::vector<float> x(size_t(rate) * 3);
+        for (size_t i = 0; i < x.size(); ++i) x[i] = float(0.4 * std::sin(2 * M_PI * 300 * double(i) / rate));
+        const std::string wav = path("bleep-source.wav");
+        QVERIFY(writeMonoWav(wav, x, rate));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = {25, 1};
+        MediaItem m = probeOrFail(p, wav);
+        auto t = std::make_shared<Transcript>();
+        TranscriptSegment seg;
+        seg.start = 0.2;
+        seg.end = 2.5;
+        seg.text = "oh darn it";
+        seg.words = {{0.2, 0.6, "oh"}, {1.0, 1.5, "darn"}, {2.0, 2.5, "it"}};
+        t->segments = {seg};
+        m.transcript = t;
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const auto words = sequenceTranscriptWords(p, s);
+        QCOMPARE(words.size(), size_t(3));
+        QVERIFY(bleepWords(p, s, {words[1]}).ok);
+        // Energy at a frequency over a stretch of the mix (Goertzel).
+        auto energy = [&](const std::vector<float>& mix, double from, double to, double hz) {
+            const int a = int(from * rate), b = int(to * rate);
+            const double w = 2 * M_PI * hz / rate, k = 2 * std::cos(w);
+            double s1 = 0, s2 = 0;
+            for (int i = a; i < b; ++i) {
+                const double s0 = mix[size_t(i) * 2] + k * s1 - s2;
+                s2 = s1;
+                s1 = s0;
+            }
+            return std::sqrt(s1 * s1 + s2 * s2 - k * s1 * s2) / (b - a) * 2;  // the amplitude
+        };
+        auto mixdown = [&] {
+            AudioMixer mixer;
+            std::vector<float> out(size_t(rate) * 3 * 2);
+            mixer.mix(p, s, 0, rate * 3, out.data());
+            return out;
+        };
+        std::vector<float> mix = mixdown();
+        const float mono = std::sqrt(0.5f);  // a mono file decodes to each channel at -3 dB
+        QVERIFY(std::fabs(energy(mix, 0.2, 0.8, 300) - 0.4 * mono) < 0.02);   // the source before the word
+        QVERIFY(energy(mix, 1.05, 1.45, 300) < 0.01);                          // gone under the bleep
+        QVERIFY2(std::fabs(energy(mix, 1.05, 1.45, 1000) - std::pow(10.0, -12.0 / 20)) < 0.02,  // a -12 dB tone
+                 qPrintable(QString::number(energy(mix, 1.05, 1.45, 1000))));
+        QVERIFY(std::fabs(energy(mix, 1.6, 2.4, 300) - 0.4 * mono) < 0.02);   // back after it
+        // Silence instead of a tone.
+        edit::clipById(s, s.audioTracks[0].clips[0].id)->effects[0].params["mode"] = Param(1.0);
+        mix = mixdown();
+        double peak = 0;
+        for (int i = int(1.05 * rate); i < int(1.45 * rate); ++i) peak = std::max(peak, double(std::fabs(mix[size_t(i) * 2])));
+        QVERIFY(peak < 1e-4);
+        // Trimmed from the front, the bleep stays on the word.
+        Clip& c = s.audioTracks[0].clips[0];
+        c.sourceIn += 10;
+        c.duration -= 10;
+        mix = mixdown();
+        peak = 0;
+        for (int i = int(0.65 * rate); i < int(1.05 * rate); ++i) peak = std::max(peak, double(std::fabs(mix[size_t(i) * 2])));
+        QVERIFY(peak < 1e-4);  // the word now plays 0.6-1.1 s
+
+        // Through MCP: the profanity in a transcript.
+        t->segments[0].words[1].text = "damn";
+        p.media[0].transcript = t;
+        s.audioTracks[0].clips[0].effects.clear();
+        const QString project = QString::fromStdString(path("bleep.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_bleep"}, {"arguments", QJsonObject{{"project", project}, {"profanity", true}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("words").toArray().size(), 1);
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.active()->audioTracks[0].clips[0].effects.at(0).type, std::string("bleep"));
     }
 
     void aafExportForAudioPost() {

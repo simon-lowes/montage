@@ -42,6 +42,7 @@
 #include "core/KeyframeEdit.h"
 #include "core/MediaLog.h"
 #include "InspectorWidget.h"
+#include "core/Bleep.h"
 #include "core/Transcript.h"
 #include "SequenceSettingsDialog.h"
 #include "media/Vector.h"
@@ -3035,6 +3036,19 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(panel->selectedWords(), std::make_pair(4, 5));
         QCOMPARE(panel->find("nothing like this"), 0);
 
+        // Bleeping "fellow" (one undo step): a Bleep effect on the audio clip over that stretch of source.
+        {
+            auto* bleep = panel->findChild<QToolButton*>("bleepButton");
+            QVERIFY(bleep && bleep->isVisibleTo(panel) && bleep->menu());
+            panel->selectWords(4, 4);
+            panel->bleepSelection();
+            const Clip& a1 = trackAt(*state()->sequence(), A1)->clips.at(0);
+            QVERIFY(!a1.effects.empty() && a1.effects.back().type == "bleep");
+            const auto ranges = bleepRanges(a1.effects.back());
+            QVERIFY(ranges.size() == 1 && std::fabs(ranges[0].first - 2.3) < 0.05 && std::fabs(ranges[0].second - 2.8) < 0.05);
+            state()->undo();
+            QVERIFY(trackAt(*state()->sequence(), A1)->clips.at(0).effects.empty());
+        }
         // Deleting "my fellow" cuts 1.8 s .. 2.9 s out of every track.
         panel->selectWords(3, 4);
         panel->deleteSelection();

@@ -19,6 +19,7 @@
 
 #include "core/AutoTag.h"
 #include "core/Captions.h"
+#include "core/Bleep.h"
 #include "core/Checkerboard.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
@@ -1050,6 +1051,66 @@ void McpServer::Impl::addTools() {
             const int n = applyMix(l.project, s, plan, o);
             save(l);
             return ok(QStringLiteral("Mixed %1 clip(s)").arg(n), QJsonObject{{"clips", clips}, {"changed", n}});
+        });
+
+    add("montage_bleep", "Bleep words",
+        "Cover spoken words with a bleep tone (or silence), as broadcasters do: every swear word in the transcribed "
+        "dialogue (profanity), every time a phrase is said, or given stretches of the timeline. Kept on each clip in source "
+        "time, so later trims keep it on the word; the words are masked in the captions too (\"f***\").",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "profanity":{"type":"boolean","description":"Every common English swear word"},
+            "phrase":{"type":"string","description":"Every time this word or phrase is said"},
+            "times":{"type":"array","items":{"type":"array","items":{"type":"number"}},"description":"[[start, end], ...] timeline seconds"},
+            "mode":{"type":"string","enum":["tone","silence"],"default":"tone"}},"required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const std::vector<TranscriptWord> all = sequenceTranscriptWords(l.project, s);
+            std::vector<TranscriptWord> chosen;
+            if (a.value("profanity").toBool()) chosen = profanity(all);
+            if (a.contains("phrase")) {
+                std::vector<std::string> want;
+                for (const QString& w : str(a, "phrase").toLower().split(' ', Qt::SkipEmptyParts)) {
+                    QString b;
+                    for (QChar c : w)
+                        if (c.isLetterOrNumber() || c == '\'') b += c;
+                    if (!b.isEmpty()) want.push_back(b.toStdString());
+                }
+                auto bareOf = [](const std::string& t) {
+                    QString b;
+                    for (QChar c : QString::fromStdString(t).toLower())
+                        if (c.isLetterOrNumber() || c == '\'') b += c;
+                    return b.toStdString();
+                };
+                for (size_t i = 0; !want.empty() && i + want.size() <= all.size(); ++i) {
+                    bool match = true;
+                    for (size_t k = 0; k < want.size() && match; ++k) match = bareOf(all[i + k].text) == want[k];
+                    if (match)
+                        for (size_t k = 0; k < want.size(); ++k) chosen.push_back(all[i + k]);
+                }
+            }
+            for (const QJsonValue& v : a.value("times").toArray()) {
+                const QJsonArray r = v.toArray();
+                if (r.size() != 2) throw ArgError{"Each of \"times\" is [start, end] in seconds"};
+                TranscriptWord w;
+                w.start = r[0].toDouble();
+                w.end = r[1].toDouble();
+                if (w.end > w.start) chosen.push_back(w);
+            }
+            if (chosen.empty()) return fail("Nothing to bleep: no such words in the transcribed dialogue");
+            const edit::Result r = bleepWords(l.project, s, chosen);
+            if (!r.ok) return fail(QString::fromStdString(r.error));
+            if (str(a, "mode", "tone") == "silence")
+                for (Id id : r.created)
+                    if (Clip* c = edit::clipById(s, id))
+                        for (Effect& e : c->effects)
+                            if (e.type == "bleep") e.params["mode"] = Param(1.0);
+            save(l);
+            QJsonArray words;
+            for (const TranscriptWord& w : chosen)
+                words.append(QJsonObject{{"text", QString::fromStdString(w.text)}, {"start", w.start}, {"end", w.end}});
+            return ok(QStringLiteral("Bleeped %1 word(s) on %2 clip(s)").arg(chosen.size()).arg(r.created.size()),
+                      QJsonObject{{"words", words}, {"clips", int(r.created.size())}});
         });
 
     add("montage_checkerboard", "Split dialogue by speaker",

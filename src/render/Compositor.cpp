@@ -21,6 +21,7 @@
 #include "VideoDenoise.h"
 #include "audio/PluginEffect.h"
 #include "audio/SpeechCleanup.h"
+#include "core/Bleep.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
 #include "core/Surround.h"
@@ -1422,6 +1423,19 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
                 if (AudioBufferPtr clean = cleanedAudio(m->path, buf, sourceFx, !nonBlocking_)) buf = clean;
             const int64_t n = buf->frames();
             const float* src = buf->samples.data();
+            // Bleeps: stretches of source (as samples) covered by a tone or silence, with 5 ms ramps.
+            std::vector<std::pair<double, double>> bleeps;
+            bool bleepTone = true;
+            double bleepFreq = 1000;
+            float bleepLevel = 0.25f;
+            for (const Effect& e : c.effects)
+                if (e.enabled && e.type == "bleep") {
+                    for (const auto& [a, b] : bleepRanges(e)) bleeps.push_back({a * sr, b * sr});
+                    bleepTone = e.p("mode", 0, 0) < 0.5;
+                    bleepFreq = e.p("frequency", 0, 1000);
+                    bleepLevel = dbToLin(e.p("level", 0, -12));
+                }
+            const double ramp = 0.005 * sr;
             for (int64_t s = s0; s < s1; ++s) {
                 double pos = c.reverse ? srcBase + double(ce - 1 - s) * c.speed
                              : ramped  ? (c.sourceIn + c.sourceOffset(double(s - cs) * fps / sr)) * sr / fps
@@ -1432,6 +1446,18 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
                 float* d = &clipBuf[size_t(s - rs) * 2];
                 d[0] = src[i * 2] + (src[i * 2 + 2] - src[i * 2]) * f;
                 d[1] = src[i * 2 + 1] + (src[i * 2 + 3] - src[i * 2 + 1]) * f;
+                if (!bleeps.empty()) {
+                    double g = 0;
+                    for (const auto& [a, b] : bleeps)
+                        if (pos > a - ramp && pos < b + ramp)
+                            g = std::max(g, std::min({1.0, (pos - (a - ramp)) / ramp, ((b + ramp) - pos) / ramp}));
+                    if (g > 0) {
+                        const float tone = bleepTone ? bleepLevel * float(std::sin(2 * M_PI * bleepFreq * pos / sr)) : 0.0f;
+                        const float k = float(g);
+                        d[0] = d[0] * (1 - k) + tone * k;
+                        d[1] = d[1] * (1 - k) + tone * k;
+                    }
+                }
             }
         }
         // Clip filters (stateful, processed over the whole block for continuity).

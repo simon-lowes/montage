@@ -7,6 +7,7 @@
 
 #include "core/AutoTag.h"
 #include "core/Captions.h"
+#include "core/Bleep.h"
 #include "core/Cfb.h"
 #include "core/Checkerboard.h"
 #include "core/EditOps.h"
@@ -1121,6 +1122,65 @@ private slots:
         unsure.add(0, mix({{0, 0}, {0, 1}}));
         unsure.add(1, mix({{3, 1}}));
         QVERIFY(autoTags(unsure, labels).keywords.empty());
+    }
+
+    void bleepWordsAndCaptions() {
+        QCOMPARE(maskWord("damn,"), std::string("d***,"));
+        QCOMPARE(maskWord("\"Shit!\""), std::string("\"S***!\""));
+        QVERIFY(isProfanity("Fucking.") && isProfanity("BULLSHIT") && !isProfanity("duck") && !isProfanity("hello"));
+        Effect e = makeEffect("bleep", 1);
+        setBleepRanges(e, {{2.0, 2.5}, {1.0, 1.2}, {2.4, 3.0}});
+        const auto r = bleepRanges(e);
+        QCOMPARE(r.size(), size_t(2));
+        QCOMPARE(r[1], (SecondsRange{2.0, 3.0}));
+        // A clip playing source 10-20 s from timeline 4 s (25 fps), and a caption over the words.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = {25, 1};
+        MediaItem m;
+        m.id = p.newId();
+        m.kind = MediaKind::Audio;
+        m.hasAudio = true;
+        m.duration = 30;
+        m.transcript = std::make_shared<Transcript>();
+        p.media.push_back(m);
+        Clip c;
+        c.id = p.newId();
+        c.mediaId = m.id;
+        c.start = 100;
+        c.duration = 250;
+        c.sourceIn = 250;
+        s.audioTracks[0].clips.push_back(c);
+        CaptionTrack ct;
+        Caption cap;
+        cap.start = 125;
+        cap.end = 175;
+        cap.text = "well damn it\nall";
+        cap.wordTimes = {0.0, 0.3, 0.6, 0.8};
+        ct.captions.push_back(cap);
+        s.captionTracks.push_back(ct);
+        TranscriptWord w;
+        w.text = "damn";
+        w.start = 5.6;  // timeline seconds: frames 140-150, source 11.6-12.0 s
+        w.end = 6.0;
+        const edit::Result res = bleepWords(p, s, {w});
+        QVERIFY2(res.ok, res.error.c_str());
+        const Clip& after = s.audioTracks[0].clips[0];
+        QCOMPARE(after.effects.size(), size_t(1));
+        const auto br = bleepRanges(after.effects[0]);
+        QCOMPARE(br.size(), size_t(1));
+        QVERIFY(std::fabs(br[0].first - 11.6) < 1e-6 && std::fabs(br[0].second - 12.0) < 1e-6);
+        QCOMPARE(s.captionTracks[0].captions[0].text, std::string("well d*** it\nall"));
+        // Bleeping again adds to the same effect; nothing under a word is an error.
+        w.start = 8.0;
+        w.end = 8.2;
+        QVERIFY(bleepWords(p, s, {w}).ok);
+        QCOMPARE(bleepRanges(s.audioTracks[0].clips[0].effects[0]).size(), size_t(2));
+        w.start = 50;
+        w.end = 51;
+        QVERIFY(!bleepWords(p, s, {w}).ok);
+        // In the effects list it is there to remove, but not offered to add.
+        QVERIFY(findEffectInfo("bleep") && findEffectInfo("bleep")->hidden);
     }
 
     void checkerboardDialogue() {

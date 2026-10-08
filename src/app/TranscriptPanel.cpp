@@ -29,6 +29,7 @@
 #include "EditorState.h"
 #include "Theme.h"
 #include "core/History.h"
+#include "core/Bleep.h"
 #include "core/TranscriptEdit.h"
 
 namespace montage {
@@ -81,6 +82,23 @@ TranscriptPanel::TranscriptPanel(EditorState* state, QWidget* parent) : QWidget(
     deleteBtn_ = button(this, tr("Delete"), tr("Cut the selected words out of the sequence and close the gap (Delete)"));
     fillersBtn_ = button(this, tr("Remove Fillers"), tr("Cut out um, uh, er and similar filler words"));
     pausesBtn_ = button(this, tr("Shorten Pauses..."), tr("Shorten silences between words"));
+    bleepBtn_ = button(this, tr("Bleep"), tr("Cover words with a bleep tone, and mask them in the captions"));
+    bleepBtn_->setObjectName(QStringLiteral("bleepButton"));
+    {
+        auto* menu = new QMenu(bleepBtn_);
+        QAction* sel = menu->addAction(tr("Bleep Selected Words"), this, &TranscriptPanel::bleepSelection);
+        sel->setObjectName(QStringLiteral("bleepSelection"));
+        QAction* swear = menu->addAction(tr("Bleep Profanity"), this, &TranscriptPanel::bleepProfanity);
+        swear->setObjectName(QStringLiteral("bleepProfanity"));
+        connect(menu, &QMenu::aboutToShow, this, [this, sel, swear] {
+            sel->setEnabled(selectedWords().first >= 0);
+            const int n = int(profanity(words_).size());
+            swear->setText(n ? tr("Bleep Profanity (%n word(s))", "", n) : tr("Bleep Profanity (none found)"));
+            swear->setEnabled(n > 0);
+        });
+        bleepBtn_->setMenu(menu);
+        bleepBtn_->setPopupMode(QToolButton::InstantPopup);
+    }
     insertBtn_ = button(this, tr("Insert"), tr("Insert the selected words into the timeline at the playhead"));
     overwriteBtn_ = button(this, tr("Overwrite"), tr("Overwrite the timeline at the playhead with the selected words"));
     smoothBtn_ = button(this, tr("Smooth Cuts"),
@@ -90,7 +108,7 @@ TranscriptPanel::TranscriptPanel(EditorState* state, QWidget* parent) : QWidget(
     smoothBtn_->setCheckable(true);
     smoothBtn_->setChecked(QSettings().value(QStringLiteral("transcript/smoothCuts"), false).toBool());
     connect(smoothBtn_, &QToolButton::toggled, this, [](bool on) { QSettings().setValue(QStringLiteral("transcript/smoothCuts"), on); });
-    for (QToolButton* b : {deleteBtn_, fillersBtn_, pausesBtn_, insertBtn_, overwriteBtn_}) bottom->addWidget(b);
+    for (QToolButton* b : {deleteBtn_, fillersBtn_, pausesBtn_, bleepBtn_, insertBtn_, overwriteBtn_}) bottom->addWidget(b);
     bottom->addStretch();
     bottom->addWidget(smoothBtn_);
     lay->addLayout(bottom);
@@ -167,7 +185,7 @@ void TranscriptPanel::setMode(Mode m) {
     mode_ = m;
     modeBox_->setCurrentIndex(m == Mode::Sequence ? 0 : 1);
     const bool seq = m == Mode::Sequence;
-    for (QToolButton* b : {deleteBtn_, fillersBtn_, pausesBtn_}) b->setVisible(seq);
+    for (QToolButton* b : {deleteBtn_, fillersBtn_, pausesBtn_, bleepBtn_}) b->setVisible(seq);
     for (QToolButton* b : {insertBtn_, overwriteBtn_}) b->setVisible(!seq);
     signature_.clear();
     current_ = -1;
@@ -438,6 +456,33 @@ void TranscriptPanel::deleteSelection() {
     const int n = last - first + 1;
     if (state_->apply(tr("Delete Words"), [range, smooth = smoothCutFrames()](Project& p, Sequence& s) { return rippleDeleteRanges(p, s, {range}, smooth); }))
         state_->message(tr("Cut %n word(s)", "", n));
+}
+
+void TranscriptPanel::bleepSelection() {
+    if (mode_ != Mode::Sequence) return;
+    const auto [first, last] = selectedWords();
+    if (first < 0) return;
+    const std::vector<TranscriptWord> chosen(words_.begin() + first, words_.begin() + last + 1);
+    QString why;
+    if (state_->apply(tr("Bleep Words"), [chosen, &why](Project& p, Sequence& s) {
+            edit::Result r = bleepWords(p, s, chosen);
+            if (!r.ok) why = QString::fromStdString(r.error);
+            return r;
+        }))
+        state_->message(tr("Bleeped %n word(s)", "", int(chosen.size())));
+    else if (!why.isEmpty())
+        state_->message(why);
+}
+
+void TranscriptPanel::bleepProfanity() {
+    if (mode_ != Mode::Sequence) return;
+    const std::vector<TranscriptWord> chosen = profanity(words_);
+    if (chosen.empty()) {
+        state_->message(tr("No profanity found"));
+        return;
+    }
+    if (state_->apply(tr("Bleep Profanity"), [chosen](Project& p, Sequence& s) { return bleepWords(p, s, chosen); }))
+        state_->message(tr("Bleeped %n word(s)", "", int(chosen.size())));
 }
 
 FrameTime TranscriptPanel::smoothCutFrames() const {

@@ -540,3 +540,16 @@ All 15 items are in (October 2026). The near misses listed in the roadmap are th
   - **Tracks:** the first person stays. Each other person goes to the first audio track below that is free over all of their parts, else to a new track named after them. Moved parts are unlinked from the picture, and transitions that joined them to their old neighbours are dropped.
   - **Where to find it:** Clip › Checkerboard Dialogue by Speaker (for the selected audio clips, one undo step) and MCP `montage_checkerboard` (clips or a whole track).
   - **Tests:** cut frames from known turns; source continuity and gain keyframes carried; a busy track skipped for a new one named after the speaker; the errors; the menu action with undo; MCP.
+- [x] Bleep words from the transcript (core/Bleep):
+  - **Storage:** a hidden "bleep" audio effect on each clip lists stretches of source in seconds, so trims, moves and speed keep it on the word.
+  - **Mixing:** the mixer replaces the source over those stretches, as it reads it, with a tone (frequency and level settable) or silence, with 5 ms ramps; the tone's phase follows source time.
+  - **Which clips:** `bleepWords` maps timeline words to every unmuted audio clip under them whose media is transcribed.
+  - **Captions:** the words are masked ("d***"), found by the captions' per-word times or else by text.
+  - **Profanity:** a built-in English list (case and punctuation ignored).
+  - **Where to find it:** the Transcript panel's Bleep menu (Selected Words; Profanity, with a count) as one undo step each, and MCP `montage_bleep` (profanity, a phrase, or time ranges; tone or silence; 43 tools).
+  - **Tests:**
+    - masking and merging;
+    - source ranges from a trimmed clip;
+    - a caption masked by word time;
+    - in the mix, Goertzel: the 300 Hz source intact around the word and gone under it, the 1 kHz tone at -12 dB, silence mode silent, and still on the word after a trim;
+    - the panel with undo, and MCP.

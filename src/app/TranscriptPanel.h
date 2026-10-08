@@ -41,6 +41,8 @@ public:
 public slots:
     void deleteSelection();     // Sequence: ripple-delete the selected words
     void removeFillerWords();   // Sequence
+    void bleepSelection();      // Sequence: a tone over the selected words, masked in the captions
+    void bleepProfanity();      // Sequence: the same for every swear word found
     void removePauses(double minPause = 1.0, double keep = 0.3);  // Sequence
     void markSelection();       // Source: In/Out from the selection
     void insertSelection(bool overwrite);  // Source
@@ -78,6 +80,7 @@ private:
     QToolButton* deleteBtn_;
     QToolButton* fillersBtn_;
     QToolButton* pausesBtn_;
+    QToolButton* bleepBtn_;
     QToolButton* insertBtn_;
     QToolButton* overwriteBtn_;
     QToolButton* smoothBtn_;
