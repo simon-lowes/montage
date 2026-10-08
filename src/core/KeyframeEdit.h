@@ -59,4 +59,24 @@ const Param* findParam(const Clip& c, const ParamAddress& a);
 std::pair<FrameTime, FrameTime> shiftRange(const Param& p, const std::vector<FrameTime>& keys, FrameTime last);
 void shiftKeys(Param& p, const std::vector<FrameTime>& keys, FrameTime delta);
 
+// Copying and pasting keyframes (After Effects, Premiere, Resolve): the keys
+// of each parameter, timed from the earliest key copied, pasted at a clip
+// frame into the same parameter of the same clip or another one (an effect's
+// parameters go to that effect if the clip has it, else to its first effect
+// of the same type). Pasted keys replace any at the same frames.
+struct CopiedKeys {
+    struct Lane {
+        ParamAddress address;
+        std::string effectType;  // for ParamSlot::Effect
+        std::vector<Keyframe> keys;
+    };
+    std::vector<Lane> lanes;
+    bool empty() const { return lanes.empty(); }
+};
+CopiedKeys copyKeys(const Clip& c, const std::vector<std::pair<ParamAddress, FrameTime>>& keys);
+// The parameter of `target` a copied lane goes to (nullptr if it has none such).
+Effect* pasteOwner(Clip& target, const CopiedKeys::Lane& lane);
+// Returns how many keys were pasted.
+int pasteKeys(Clip& target, const CopiedKeys& keys, FrameTime at);
+
 }  // namespace montage

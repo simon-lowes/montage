@@ -1,6 +1,7 @@
 #include "KeyframeEdit.h"
 
 #include <algorithm>
+#include <limits>
 #include <cmath>
 
 namespace montage {
@@ -167,6 +168,64 @@ void shiftKeys(Param& p, const std::vector<FrameTime>& keys, FrameTime delta) {
     for (Keyframe& k : p.keys)
         if (std::find(keys.begin(), keys.end(), k.t) != keys.end()) k.t += delta;
     std::stable_sort(p.keys.begin(), p.keys.end(), [](const Keyframe& a, const Keyframe& b) { return a.t < b.t; });
+}
+
+CopiedKeys copyKeys(const Clip& c, const std::vector<std::pair<ParamAddress, FrameTime>>& keys) {
+    CopiedKeys out;
+    FrameTime first = std::numeric_limits<FrameTime>::max();
+    for (const auto& [a, t] : keys)
+        if (const Param* p = findParam(c, a); p && p->keyAt(t)) first = std::min(first, t);
+    for (const auto& [a, t] : keys) {
+        const Param* p = findParam(c, a);
+        const Keyframe* k = p ? p->keyAt(t) : nullptr;
+        if (!k) continue;
+        auto lane = std::find_if(out.lanes.begin(), out.lanes.end(), [&](const CopiedKeys::Lane& l) { return l.address == a; });
+        if (lane == out.lanes.end()) {
+            CopiedKeys::Lane l;
+            l.address = a;
+            if (a.slot == ParamSlot::Effect)
+                if (const Effect* e = paramOwner(c, a)) l.effectType = e->type;
+            out.lanes.push_back(std::move(l));
+            lane = out.lanes.end() - 1;
+        }
+        Keyframe copy = *k;
+        copy.t -= first;
+        lane->keys.push_back(copy);
+    }
+    for (auto& l : out.lanes)
+        std::sort(l.keys.begin(), l.keys.end(), [](const Keyframe& a, const Keyframe& b) { return a.t < b.t; });
+    return out;
+}
+
+Effect* pasteOwner(Clip& target, const CopiedKeys::Lane& lane) {
+    if (lane.address.slot != ParamSlot::Effect) {
+        Effect* e = paramOwner(target, lane.address);
+        return e && (lane.address.slot != ParamSlot::Generator || !e->empty()) ? e : nullptr;
+    }
+    if (Effect* same = paramOwner(target, lane.address); same && same->type == lane.effectType) return same;
+    for (Effect& e : target.effects)
+        if (e.type == lane.effectType) return &e;
+    return nullptr;
+}
+
+int pasteKeys(Clip& target, const CopiedKeys& keys, FrameTime at) {
+    int pasted = 0;
+    for (const CopiedKeys::Lane& lane : keys.lanes) {
+        Effect* owner = pasteOwner(target, lane);
+        if (!owner) continue;
+        Param& p = owner->params[lane.address.param];
+        if (p.keys.empty()) p.value = p.at(0);
+        for (Keyframe k : lane.keys) {
+            k.t += std::max<FrameTime>(0, at);
+            auto it = std::lower_bound(p.keys.begin(), p.keys.end(), k.t, [](const Keyframe& x, FrameTime t) { return x.t < t; });
+            if (it != p.keys.end() && it->t == k.t)
+                *it = k;
+            else
+                p.keys.insert(it, k);
+            ++pasted;
+        }
+    }
+    return pasted;
 }
 
 }  // namespace montage

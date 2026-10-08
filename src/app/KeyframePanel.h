@@ -53,6 +53,11 @@ public:
     bool easeSelected(bool in, bool out);
     // After the last keyframe, for the parameters of the selected keys: hold, loop, ping-pong or offset.
     bool setRepeat(Repeat repeat);
+    // Copy the selected keys, and paste the copied ones at the playhead into this clip (or another one): the same
+    // parameters, the earliest copied key at the playhead. Ctrl+C / Ctrl+V while the panel has focus.
+    bool copySelected();
+    int pasteAtPlayhead();
+    static bool hasCopiedKeys();
 
     // The value graph.
     void setGraph(bool on);

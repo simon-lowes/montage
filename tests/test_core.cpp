@@ -2719,6 +2719,46 @@ private slots:
         QCOMPARE(cb->effects[2].params.at("brightness").at(20), 30.0);
     }
 
+    void keyframeCopyPasteCore() {
+        Fixture fx;
+        const Id a = fx.put(V1, 0, 100), b = fx.put(V1, 100, 100);
+        Clip& ca = *clipById(fx.s(), a);
+        ca.motion.params["scale"].addKey(20, 100);
+        ca.motion.params["scale"].addKey(40, 150, Interp::Bezier);
+        ca.motion.params["scale"].keys[1].inDt = -5;
+        ca.motion.params["scale"].keys[1].inDv = 3;
+        Effect blur = makeEffect("gaussian_blur", fx.p.newId());
+        blur.params["radius"].addKey(30, 4);
+        ca.effects.push_back(blur);
+        const ParamAddress scale{ParamSlot::Motion, 0, "scale"}, radius{ParamSlot::Effect, blur.id, "radius"};
+        const CopiedKeys copied = copyKeys(ca, {{scale, 20}, {scale, 40}, {radius, 30}, {scale, 99}});  // 99: no key
+        QCOMPARE(copied.lanes.size(), size_t(2));
+        QCOMPARE(copied.lanes[0].keys.front().t, FrameTime(0));  // from the earliest copied key
+        QCOMPARE(copied.lanes[1].effectType, std::string("gaussian_blur"));
+        QCOMPARE(copied.lanes[1].keys.front().t, FrameTime(10));
+        // Onto b at its frame 50: scale goes in; b has no blur, so the radius lane is skipped.
+        Clip& cb = *clipById(fx.s(), b);
+        cb.motion.params["scale"].addKey(70, 50);  // replaced by the pasted key at 70
+        QCOMPARE(pasteKeys(cb, copied, 50), 2);
+        const Param& sc = cb.motion.params.at("scale");
+        QCOMPARE(sc.keys.size(), size_t(2));
+        QCOMPARE(sc.keys[0].t, FrameTime(50));
+        QCOMPARE(sc.keys[1].t, FrameTime(70));
+        QCOMPARE(sc.keys[1].v, 150.0);
+        QCOMPARE(sc.keys[1].interp, Interp::Bezier);
+        QCOMPARE(sc.keys[1].inDt, -5.0);
+        // With a blur of its own (another id), the radius goes there.
+        cb.effects.push_back(makeEffect("gaussian_blur", fx.p.newId()));
+        QCOMPARE(pasteKeys(cb, copied, 0), 3);
+        QCOMPARE(cb.effects[0].params.at("radius").keys.at(0).t, FrameTime(10));
+        QCOMPARE(sc.keys.size(), size_t(4));
+        // Into the same clip, later: a second fade.
+        QCOMPARE(pasteKeys(ca, copied, 60), 3);
+        QCOMPARE(ca.motion.params.at("scale").keys.size(), size_t(4));
+        QCOMPARE(ca.effects[0].params.at("radius").keys.size(), size_t(2));
+        QCOMPARE(pasteKeys(ca, CopiedKeys{}, 0), 0);
+    }
+
     void keyframeRepeat() {
         // 0 at frame 10, 10 at frame 20.
         Param p;

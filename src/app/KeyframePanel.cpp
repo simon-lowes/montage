@@ -726,10 +726,19 @@ void KeyframePanel::contextMenuEvent(QContextMenuEvent* e) {
     Key k;
     int row = -1;
     if ((graph_ ? graphKeyAt(e->pos(), k, row) : keyAt(e->pos(), k)) && !selection_.count(k)) selection_ = {k};
-    if (selection_.empty()) return;
+    if (selection_.empty() && !(hasCopiedKeys() && currentClip())) return;
     update();
     QMenu menu(this);
     menu.setObjectName(QStringLiteral("keyframePanelMenu"));
+    if (selection_.empty()) {
+        menu.addAction(tr("Paste Keyframes at Playhead"), this, [this] { pasteAtPlayhead(); })->setObjectName(QStringLiteral("pasteKeyframes"));
+        menu.exec(e->globalPos());
+        return;
+    }
+    menu.addAction(tr("Copy"), this, [this] { copySelected(); })->setObjectName(QStringLiteral("copyKeyframes"));
+    if (hasCopiedKeys())
+        menu.addAction(tr("Paste at Playhead"), this, [this] { pasteAtPlayhead(); })->setObjectName(QStringLiteral("pasteKeyframes"));
+    menu.addSeparator();
     const std::pair<Interp, QString> kinds[] = {{Interp::Linear, tr("Linear")},
                                                 {Interp::Hold, tr("Hold")},
                                                 {Interp::Smooth, tr("Smooth (Ease In and Out)")},
@@ -771,13 +780,66 @@ bool KeyframePanel::setRepeat(Repeat repeat) {
     });
 }
 
+namespace {
+CopiedKeys& keyClipboard() {
+    static CopiedKeys keys;
+    return keys;
+}
+}  // namespace
+
+bool KeyframePanel::hasCopiedKeys() { return !keyClipboard().empty(); }
+
+bool KeyframePanel::copySelected() {
+    const Clip* c = currentClip();
+    if (!c || selection_.empty()) return false;
+    std::vector<std::pair<ParamAddress, FrameTime>> keys;
+    for (const Key& k : selection_) keys.push_back({k.address, k.t});
+    CopiedKeys copied = copyKeys(*c, keys);
+    if (copied.empty()) return false;
+    size_t n = 0;
+    for (const auto& l : copied.lanes) n += l.keys.size();
+    keyClipboard() = std::move(copied);
+    state_->message(tr("Copied %n keyframe(s)", nullptr, int(n)));
+    return true;
+}
+
+int KeyframePanel::pasteAtPlayhead() {
+    const Clip* c = currentClip();
+    if (!c || keyClipboard().empty()) return 0;
+    const Id id = clip_;
+    const FrameTime at = std::max<FrameTime>(0, state_->playhead() - c->start);
+    const CopiedKeys keys = keyClipboard();
+    int pasted = 0;
+    state_->edit(tr("Paste Keyframes"), [&](Project&, Sequence& s) {
+        Clip* target = edit::clipById(s, id);
+        if (!target) return false;
+        pasted = pasteKeys(*target, keys, at);
+        return pasted > 0;
+    });
+    if (!pasted) {
+        state_->message(tr("This clip has none of the copied parameters"));
+        return 0;
+    }
+    // The pasted keys, selected.
+    std::set<Key> sel;
+    if (const Clip* now = currentClip())
+        for (const auto& lane : keys.lanes)
+            if (pasteOwner(const_cast<Clip&>(*now), lane))
+                for (const Row& r : rows_)
+                    if (r.address.param == lane.address.param && paramOwner(*now, r.address) == pasteOwner(const_cast<Clip&>(*now), lane))
+                        for (const Keyframe& k : lane.keys) sel.insert({r.address, k.t + at});
+    select(sel);
+    return pasted;
+}
+
 bool KeyframePanel::event(QEvent* e) {
-    // Delete and the arrow keys act on the selected keys, over the window's shortcuts.
+    // Delete, the arrow keys, copy and paste act on the keys, over the window's shortcuts.
     if (e->type() == QEvent::ShortcutOverride) {
         auto* ke = static_cast<QKeyEvent*>(e);
         const int key = ke->key();
-        const bool ours = key == Qt::Key_Delete || key == Qt::Key_Backspace || key == Qt::Key_Left || key == Qt::Key_Right;
-        if (!selection_.empty() && ours) {
+        const bool ours = key == Qt::Key_Delete || key == Qt::Key_Backspace || key == Qt::Key_Left || key == Qt::Key_Right ||
+                          ke->matches(QKeySequence::Copy);
+        if ((!selection_.empty() && ours) || (ke->matches(QKeySequence::Paste) && hasCopiedKeys() && currentClip())) {
             ke->accept();
             return true;
         }
@@ -786,6 +848,14 @@ bool KeyframePanel::event(QEvent* e) {
 }
 
 void KeyframePanel::keyPressEvent(QKeyEvent* e) {
+    if (e->matches(QKeySequence::Copy)) {
+        copySelected();
+        return;
+    }
+    if (e->matches(QKeySequence::Paste)) {
+        pasteAtPlayhead();
+        return;
+    }
     switch (e->key()) {
         case Qt::Key_Delete:
         case Qt::Key_Backspace: deleteSelected(); return;

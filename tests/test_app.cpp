@@ -3852,6 +3852,64 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(edit::clipById(*state()->sequence(), red)->motion.params.at("rotation").repeat, Repeat::Hold);
     }
 
+    void keyframeCopyPaste() {
+        // Red's opacity fade and a blur's radius, copied and pasted onto Blue at the playhead.
+        loadDemo();
+        const Id red = clipNamed(*state()->sequence(), "Red")->id, blue = clipNamed(*state()->sequence(), "Blue")->id;
+        QVERIFY(state()->edit("Keys", [&](Project& p, Sequence& s) {
+            Clip* c = edit::clipById(s, red);
+            c->motion.params["opacity"].addKey(10, 100);
+            c->motion.params["opacity"].addKey(30, 0, Interp::Hold);
+            Effect blur = makeEffect("gaussian_blur", p.newId());
+            blur.params["radius"].addKey(20, 8);
+            c->effects.push_back(blur);
+            Clip* b = edit::clipById(s, blue);
+            b->effects.push_back(makeEffect("gaussian_blur", p.newId()));
+            return true;
+        }));
+        state()->setSelection({red}, false);
+        win_->raisePanel("keyframes");
+        auto* panel = win_->findChild<KeyframePanel*>();
+        QTRY_COMPARE(panel->clip(), red);
+        QVERIFY(!panel->copySelected());  // nothing selected
+        std::set<KeyframePanel::Key> all;
+        for (const auto& r : panel->rows())
+            if (const Param* p = findParam(*edit::clipById(*state()->sequence(), red), r.address))
+                for (const Keyframe& k : p->keys) all.insert({r.address, k.t});
+        QCOMPARE(all.size(), size_t(3));
+        panel->select(all);
+        // Ctrl+C in the panel copies the keys, not the clip.
+        panel->setFocus();
+        QTest::keyClick(panel, Qt::Key_C, Qt::ControlModifier);
+        QVERIFY(KeyframePanel::hasCopiedKeys());
+        // Onto Blue (starts at 60) at frame 70: the earliest copied key (10) lands at Blue's frame 10.
+        state()->setSelection({blue}, false);
+        QTRY_COMPARE(panel->clip(), blue);
+        state()->setPlayhead(70);
+        panel->setFocus();
+        QTest::keyClick(panel, Qt::Key_V, Qt::ControlModifier);
+        const Clip* b = edit::clipById(*state()->sequence(), blue);
+        const Param& op = b->motion.params.at("opacity");
+        QCOMPARE(op.keys.size(), size_t(2));
+        QCOMPARE(op.keys[0].t, FrameTime(10));
+        QCOMPARE(op.keys[1].t, FrameTime(30));
+        QCOMPARE(op.keys[1].interp, Interp::Hold);
+        QCOMPARE(b->effects.at(0).params.at("radius").keys.at(0).t, FrameTime(20));
+        QCOMPARE(b->effects.at(0).params.at("radius").keys.at(0).v, 8.0);
+        QCOMPARE(panel->selection().size(), size_t(3));  // the pasted keys
+        // One undo step; Blue's own clips were not pasted over by the window's Paste.
+        QCOMPARE(state()->sequence()->videoTracks[0].clips.size(), size_t(2));
+        state()->undo();
+        QVERIFY(!edit::clipById(*state()->sequence(), blue)->motion.params.count("opacity") ||
+                !edit::clipById(*state()->sequence(), blue)->motion.params.at("opacity").animated());
+        // From the menu-less API: a clip with no blur takes only the opacity.
+        const Id title = state()->sequence()->videoTracks[1].clips.at(0).id;
+        state()->setSelection({title}, false);
+        QTRY_COMPARE(panel->clip(), title);
+        state()->setPlayhead(15);
+        QCOMPARE(panel->pasteAtPlayhead(), 2);
+    }
+
     void keyframePanelEditsKeys() {
         loadDemo();
         const Id red = clipNamed(*state()->sequence(), "Red")->id;
