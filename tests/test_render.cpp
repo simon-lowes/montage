@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <tuple>
 
 #include "core/EditOps.h"
 #include "core/Effects.h"
@@ -1015,6 +1016,99 @@ colorspaces:
         const Effect none = colorMatchCorrection(Image(), ga, 5);
         QCOMPARE(none.p("gain_r", 0, 1), 1.0);
         QCOMPARE(none.p("lift_g", 0, 0), 0.0);
+    }
+
+    void titleTemplatesAndAnimation() {
+        Project p;
+        // Every template is a Title with its own settings, listed as a generator.
+        QVERIFY(titleTemplates().size() >= 7);
+        for (const TitleTemplate& tpl : titleTemplates()) {
+            const EffectInfo* info = findEffectInfo(tpl.id);
+            QVERIFY(info && info->category == EffectCategory::Generator);
+            QCOMPARE(makeEffect(p, tpl.id).type, std::string("title"));
+        }
+        Clip lower = makeGeneratorClip(p, "title_lower_third", 90);
+        QCOMPARE(lower.generator.type, std::string("title"));
+        QCOMPARE(lower.name, std::string("Lower Third"));
+        QCOMPARE(lower.generator.s("text"), std::string("Name Surname\nRole or place"));
+
+        // Where the ink is, and how much.
+        struct Ink {
+            int left = 1 << 30, top = 1 << 30, right = -1, bottom = -1;
+            double amount = 0;
+        };
+        auto ink = [](const Image& img) {
+            Ink k;
+            for (int y = 0; y < img.height; ++y)
+                for (int x = 0; x < img.width; ++x) {
+                    const float a = img.at(x, y)[3];
+                    k.amount += a;
+                    if (a < 0.1f) continue;
+                    k.left = std::min(k.left, x);
+                    k.right = std::max(k.right, x);
+                    k.top = std::min(k.top, y);
+                    k.bottom = std::max(k.bottom, y);
+                }
+            return k;
+        };
+        // A lower third sits in the lower left inside the title-safe area, at 16:9 and at 9:16.
+        for (auto [w, h, sc] : {std::tuple{480, 270, 0.25}, std::tuple{270, 480, 0.25}}) {
+            const Ink k = ink(renderGenerator(lower.generator, 45, w, h, sc, 90, 30));
+            QVERIFY2(k.left >= int(0.08 * w) - 1 && k.left < w / 3, qPrintable(QString("%1x%2 left %3").arg(w).arg(h).arg(k.left)));
+            QVERIFY2(k.bottom <= h - int(0.08 * h) + 1 && k.bottom > h / 2, qPrintable(QString("%1x%2 bottom %3").arg(w).arg(h).arg(k.bottom)));
+            QVERIFY(k.right < w);
+        }
+        // Its accent bar is drawn (amber), and the second line has its own colour.
+        Effect styled = lower.generator;
+        styled.params["color.r"] = 1.0;
+        styled.params["color.g"] = 0.0;
+        styled.params["color.b"] = 0.0;
+        styled.params["sub_color.r"] = 0.0;
+        styled.params["sub_color.g"] = 0.0;
+        styled.params["sub_color.b"] = 1.0;
+        styled.params["shadow"] = 0.0;
+        const Image si = renderGenerator(styled, 45, 480, 270, 0.25, 90, 30);
+        int amber = 0, red = 0, blue = 0;
+        for (int y = 0; y < si.height; ++y)
+            for (int x = 0; x < si.width; ++x) {
+                const float* q = si.at(x, y);
+                if (q[3] < 0.9f) continue;
+                if (q[0] > 0.9f && q[1] > 0.6f && q[2] < 0.2f) ++amber;
+                else if (q[0] > 0.9f && q[1] < 0.1f) ++red;
+                else if (q[2] > 0.9f && q[0] < 0.1f) ++blue;
+            }
+        QVERIFY2(amber > 20 && red > 20 && blue > 20, qPrintable(QString("%1 %2 %3").arg(amber).arg(red).arg(blue)));
+        // Slides in from the left (moving right), settled after half a second.
+        const Ink settled = ink(renderGenerator(lower.generator, 45, 480, 270, 0.25, 90, 30));
+        const Ink early = ink(renderGenerator(lower.generator, 4, 480, 270, 0.25, 90, 30));
+        QVERIFY2(early.left < settled.left - 5, qPrintable(QString("%1 vs %2").arg(early.left).arg(settled.left)));
+        QCOMPARE(ink(renderGenerator(lower.generator, 20, 480, 270, 0.25, 90, 30)).left, settled.left);
+        // Fades out over its last 0.4 s, gone on the last frame.
+        const double full = settled.amount;
+        const double fading = ink(renderGenerator(lower.generator, 87, 480, 270, 0.25, 90, 30)).amount;  // 2 frames from the end
+        QVERIFY(fading > 0.05 * full && fading < 0.8 * full);
+        QCOMPARE(ink(renderGenerator(lower.generator, 89, 480, 270, 0.25, 90, 30)).amount, 0.0);
+        // Pop: small and see-through at first, then full size.
+        Effect pop = makeEffect(p, "title_centred");
+        const Ink popStart = ink(renderGenerator(pop, 1, 480, 270, 0.25, 90, 30));
+        const Ink popDone = ink(renderGenerator(pop, 30, 480, 270, 0.25, 90, 30));
+        QVERIFY(popStart.right - popStart.left < popDone.right - popDone.left);
+        QVERIFY(popStart.amount < 0.5 * popDone.amount);
+        // Centred: free placement puts it in the middle.
+        QVERIFY(std::abs((popDone.left + popDone.right) / 2 - 240) <= 3 && std::abs((popDone.top + popDone.bottom) / 2 - 135) <= 4);
+        // Typewriter: a third of the way through, about a third of the letters.
+        Effect type = makeEffect(p, "title_typewriter");
+        const double typed = ink(renderGenerator(type, 15, 480, 270, 0.25, 120, 30)).amount;
+        const double all = ink(renderGenerator(type, 60, 480, 270, 0.25, 120, 30)).amount;
+        QVERIFY2(typed > 0.15 * all && typed < 0.6 * all, qPrintable(QString("%1 of %2").arg(typed).arg(all)));
+        // Wipe: revealed from the left.
+        Effect boxed = makeEffect(p, "title_lower_third_box");
+        const Ink wiping = ink(renderGenerator(boxed, 5, 480, 270, 0.25, 90, 30));
+        const Ink wiped = ink(renderGenerator(boxed, 40, 480, 270, 0.25, 90, 30));
+        QVERIFY(wiping.right < wiped.right - 10 && std::abs(wiping.left - wiped.left) <= 1);
+        // Without animation or a length, a title is unchanged throughout.
+        Effect plain = makeEffect(p, "title");
+        QCOMPARE(ink(renderGenerator(plain, 0, 320, 180, 1.0)).amount, ink(renderGenerator(plain, 50, 320, 180, 1.0, 60, 30)).amount);
     }
 
     void titlesRender() {

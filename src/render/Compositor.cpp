@@ -26,7 +26,10 @@ constexpr int kMaxDepth = 8;
 // ---------------------------------------------------------------------------
 // Generators
 
-Image renderTitle(const Effect& g, FrameTime t, int w, int h, double scale) {
+// How far an animation has got (0 hidden, 1 settled), eased out.
+double easeOut(double p) { return 1 - std::pow(1 - std::clamp(p, 0.0, 1.0), 3); }
+
+Image renderTitle(const Effect& g, FrameTime t, int w, int h, double scale, FrameTime duration, double fps) {
     QImage qi(w, h, QImage::Format_RGBA8888_Premultiplied);
     qi.fill(Qt::transparent);
     {
@@ -39,42 +42,121 @@ Image renderTitle(const Effect& g, FrameTime t, int w, int h, double scale) {
         f.setItalic(g.p("italic", t) > 0.5);
         f.setLetterSpacing(QFont::AbsoluteSpacing, g.p("tracking", t) * scale);
         f.setHintingPreference(QFont::PreferNoHinting);
-        QStringList lines = QString::fromStdString(g.s("text", "Title")).split('\n');
-        QFontMetricsF fm(f);
-        double lineH = fm.height() * g.p("line_spacing", t, 1.15);
-        double blockW = 0;
-        for (const auto& l : lines) blockW = std::max(blockW, fm.horizontalAdvance(l));
-        double totalH = lineH * double(lines.size() - 1) + fm.height();
-        double cx = w * 0.5 + g.p("pos_x", t) * scale, cy = h * 0.5 + g.p("pos_y", t) * scale;
-        int align = int(g.p("align", t, 1));
-        QPainterPath path;
+        // Lines after the first can have their own size and colour.
+        const bool sub = g.p("sub_style", t) > 0.5;
+        QFont fs = f;
+        if (sub) fs.setPixelSize(std::max(1, int(std::lround(g.p("size", t, 96) * scale * g.p("sub_scale", t, 60) / 100.0))));
+        const QStringList lines = QString::fromStdString(g.s("text", "Title")).split('\n');
+        auto fontOf = [&](int i) -> const QFont& { return i > 0 && sub ? fs : f; };
+
+        // Animation: how far in (from the start) and out (towards the end) at this frame.
+        fps = fps > 0 ? fps : 30;
+        const double sec = double(t) / fps;
+        const int inKind = int(std::lround(g.p("anim_in", t))), outKind = int(std::lround(g.p("anim_out", t)));
+        const double inDur = std::max(0.01, g.p("anim_in_dur", t, 0.5)), outDur = std::max(0.01, g.p("anim_out_dur", t, 0.5));
+        const double pin = inKind ? std::clamp(sec / inDur, 0.0, 1.0) : 1.0;
+        const double pout = outKind && duration > 0 ? std::clamp((double(duration - 1 - t)) / fps / outDur, 0.0, 1.0) : 1.0;
+        double dx = 0, dy = 0, sc = 1, op = 1, wipe = 1, typed = 1;
+        auto animate = [&](int kind, double p, bool entering) {
+            const double e = easeOut(p), sign = entering ? 1 : -1;
+            switch (kind) {
+                case 1: op *= e; break;                                                // fade
+                case 2: dy += sign * (1 - e) * 0.12 * h; op *= std::min(1.0, 2 * p); break;   // slide up
+                case 3: dy -= sign * (1 - e) * 0.12 * h; op *= std::min(1.0, 2 * p); break;   // slide down
+                case 4: dx += sign * (1 - e) * 0.15 * w; op *= std::min(1.0, 2 * p); break;   // slide left
+                case 5: dx -= sign * (1 - e) * 0.15 * w; op *= std::min(1.0, 2 * p); break;   // slide right
+                case 6: {                                                                       // pop, overshooting a little
+                    const double c1 = 1.70158, c3 = c1 + 1, q = std::clamp(p, 0.0, 1.0);
+                    const double back = 1 + c3 * std::pow(q - 1, 3) + c1 * std::pow(q - 1, 2);
+                    sc *= entering ? 0.6 + 0.4 * back : 0.6 + 0.4 * q;
+                    op *= std::min(1.0, 2 * q);
+                    break;
+                }
+                case 7: typed = std::min(typed, p); break;  // typewriter
+                case 8: wipe = std::min(wipe, e); break;    // wipe from the left
+                default: break;
+            }
+        };
+        animate(inKind, pin, true);
+        animate(outKind, pout, false);
+        if (op <= 0 || wipe <= 0) return Image(w, h);
+
+        // Layout on the whole text, so nothing moves while it types on.
+        std::vector<double> widths, heights, ascents;
+        double blockW = 0, totalH = 0;
         for (int i = 0; i < lines.size(); ++i) {
-            double lw = fm.horizontalAdvance(lines[i]);
-            double x = align == 0 ? cx - blockW / 2 : (align == 2 ? cx + blockW / 2 - lw : cx - lw / 2);
-            double y = cy - totalH / 2 + i * lineH + fm.ascent();
-            path.addText(QPointF(x, y), f, lines[i]);
+            QFontMetricsF fm(fontOf(i));
+            widths.push_back(fm.horizontalAdvance(lines[i]));
+            heights.push_back(fm.height());
+            ascents.push_back(fm.ascent());
+            blockW = std::max(blockW, widths.back());
+        }
+        const double spacing = g.p("line_spacing", t, 1.15);
+        std::vector<double> tops;
+        for (int i = 0; i < lines.size(); ++i) {
+            tops.push_back(totalH);
+            totalH += i + 1 < lines.size() ? heights[size_t(i)] * spacing : heights[size_t(i)];
+        }
+        const double boxOp = g.p("box_opacity", t) / 100.0;
+        const double pad = boxOp > 0 ? g.p("box_padding", t, 24) * scale : 0.0;
+        const int barKind = int(std::lround(g.p("bar", t)));
+        const double barW = barKind ? g.p("bar_width", t, 8) * scale : 0.0, barGap = barKind == 1 ? barW * 1.5 : 0.0;
+        // Placement: Free is Position from the centre; the anchors sit inside the title-safe area (8 %).
+        const int anchor = int(std::lround(g.p("anchor", t)));
+        const double mx = 0.08 * w, my = 0.08 * h, px = g.p("pos_x", t) * scale, py = g.p("pos_y", t) * scale;
+        const double halfW = blockW / 2 + pad, halfH = totalH / 2 + pad + (barKind == 2 ? barW * 2 : 0);
+        double cx = w * 0.5 + px, cy = h * 0.5 + py;
+        if (anchor == 1 || anchor == 4) cx = mx + barW + barGap + halfW + px;
+        if (anchor == 3 || anchor == 5) cx = w - mx - halfW + px;
+        if (anchor == 2) cx = w * 0.5 + px;
+        if (anchor >= 1 && anchor <= 3) cy = h - my - halfH + py;
+        if (anchor == 4 || anchor == 5) cy = my + halfH + py;
+        const int align = int(g.p("align", t, 1));
+        const double left = cx - blockW / 2, top = cy - totalH / 2;
+
+        // The text (typed so far), first line and the rest apart.
+        int totalChars = 0;
+        for (const QString& l : lines) totalChars += int(l.size());
+        int budget = int(std::floor(typed * totalChars + 1e-9));
+        QPainterPath mainPath, subPath;
+        for (int i = 0; i < lines.size(); ++i) {
+            const QString shown = lines[i].left(std::max(0, budget));
+            budget -= int(lines[i].size());
+            if (shown.isEmpty()) continue;
+            const double lw = widths[size_t(i)];
+            const double x = align == 0 ? left : (align == 2 ? left + blockW - lw : cx - lw / 2);
+            const double y = top + tops[size_t(i)] + ascents[size_t(i)];
+            (i > 0 && sub ? subPath : mainPath).addText(QPointF(x, y), fontOf(i), shown);
         }
         auto col = [&](const char* base, double a) {
             std::string b(base);
             return QColor::fromRgbF(float(std::clamp(g.p(b + ".r", t), 0.0, 1.0)), float(std::clamp(g.p(b + ".g", t), 0.0, 1.0)),
                                     float(std::clamp(g.p(b + ".b", t), 0.0, 1.0)), float(std::clamp(a, 0.0, 1.0)));
         };
-        pa.setOpacity(std::clamp(g.p("opacity", t, 100) / 100.0, 0.0, 1.0));
-        double boxOp = g.p("box_opacity", t) / 100.0;
-        if (boxOp > 0 && !lines.isEmpty()) {
-            double pad = g.p("box_padding", t, 24) * scale;
-            QRectF box(cx - blockW / 2 - pad, cy - totalH / 2 - pad, blockW + 2 * pad, totalH + 2 * pad);
-            pa.fillRect(box, col("box_color", boxOp));
+        pa.setOpacity(std::clamp(g.p("opacity", t, 100) / 100.0 * op, 0.0, 1.0));
+        pa.translate(cx + dx, cy + dy);
+        pa.scale(sc, sc);
+        pa.translate(-cx, -cy);
+        const QRectF block(left - pad, top - pad, blockW + 2 * pad, totalH + 2 * pad);
+        if (wipe < 1) {
+            const double from = block.left() - barW - barGap;
+            pa.setClipRect(QRectF(from, -h, (block.right() - from) * wipe, 3.0 * h));
         }
-        double sh = g.p("shadow", t, 4) * scale;
-        double shOp = g.p("shadow_opacity", t, 50) / 100.0;
-        if (sh > 0 && shOp > 0) pa.fillPath(path.translated(sh, sh), QColor::fromRgbF(0, 0, 0, float(shOp)));
-        double ow = g.p("outline", t) * scale;
+        if (boxOp > 0 && !lines.isEmpty()) pa.fillRect(block, col("box_color", boxOp));
+        if (barKind == 1) pa.fillRect(QRectF(block.left() - barGap - barW, block.top(), barW, block.height()), col("bar_color", 1.0));
+        if (barKind == 2) pa.fillRect(QRectF(left, block.bottom() + barW, blockW, barW), col("bar_color", 1.0));
+        const double sh = g.p("shadow", t, 4) * scale;
+        const double shOp = g.p("shadow_opacity", t, 50) / 100.0;
+        if (sh > 0 && shOp > 0)
+            for (const QPainterPath* path : {&mainPath, &subPath}) pa.fillPath(path->translated(sh, sh), QColor::fromRgbF(0, 0, 0, float(shOp)));
+        const double ow = g.p("outline", t) * scale;
         if (ow > 0) {
             QPen pen(col("outline_color", 1.0), ow * 2, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
-            pa.strokePath(path, pen);
+            pa.strokePath(mainPath, pen);
+            pa.strokePath(subPath, pen);
         }
-        pa.fillPath(path, col("color", 1.0));
+        pa.fillPath(mainPath, col("color", 1.0));
+        pa.fillPath(subPath, col("sub_color", 1.0));
     }
     Image img(w, h);
     const float k = 1.0f / 255.0f;
@@ -88,7 +170,7 @@ Image renderTitle(const Effect& g, FrameTime t, int w, int h, double scale) {
 
 }  // namespace
 
-Image renderGenerator(const Effect& g, FrameTime t, int w, int h, double scale) {
+Image renderGenerator(const Effect& g, FrameTime t, int w, int h, double scale, FrameTime duration, double fps) {
     Image img(w, h);
     if (g.type == "color") {
         img.fill(float(g.p("color.r", t)), float(g.p("color.g", t)), float(g.p("color.b", t)),
@@ -131,7 +213,7 @@ Image renderGenerator(const Effect& g, FrameTime t, int w, int h, double scale) 
                 p[3] = 1;
             }
     } else if (g.type == "title") {
-        return renderTitle(g, t, w, h, scale);
+        return renderTitle(g, t, w, h, scale, duration, fps);
     }
     return img;
 }
@@ -291,7 +373,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
         g = geometryFor(c.motion, lt, SW, SH, SW, SH);
         int w, h;
         sourceSize(g, o.scale, int(SW * 4), int(SH * 4), w, h);
-        src = renderGenerator(c.generator, lt, w, h, double(w) / SW);
+        src = renderGenerator(c.generator, lt, w, h, double(w) / SW, c.duration, seq.fpsValue());
         // Titles and mattes are authored in SDR: graphics white sits at HDR reference white.
         convertColor(src, rec709Space(), sequenceColorSpace(seq), seq.hdrPeakNits);
     } else {

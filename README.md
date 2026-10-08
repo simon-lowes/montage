@@ -63,6 +63,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
   - Alt-click a keyframe to delete it, or right-click it for Linear, Hold or Smooth.
   - Volume is drawn on a perceptual scale up to +6 dB.
 - Titles (font, outline, shadow, background box, alignment, tracking), colour mattes, gradients, SMPTE bars
+- **Animated titles and templates**: titles animate in and out (fade, slide in four directions, pop, typewriter, wipe), sit at a placement that stays inside the title-safe area at any frame size (lower left, lower centre, upper right...), can style the lines after the first in their own size and colour, and can carry an accent bar. Ready-made designs are listed under Titles in the Effects panel: Lower Third, Lower Third (Box), Centred Title, Chapter Heading, Call-out, Typewriter and End Card.
 - Transitions: cross dissolve, dip to black/white, wipe, push, slide, iris, cross zoom, and **Smooth Cut** (like Premiere's Morph Cut or Resolve's Smooth Cut), which hides a jump cut in an interview by morphing the outgoing frame into the incoming one along their optical flow
 - Scopes: waveform, RGB parade, vectorscope, histogram
 - Colour management and HDR:

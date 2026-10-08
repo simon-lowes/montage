@@ -1322,6 +1322,12 @@ private slots:
         r = tool("montage_add_title", QJsonObject{{"project", project}, {"text", "Hello"}, {"at", "00:00:00:00"}, {"duration", 0.3}});
         QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
         QCOMPARE(r.value("structuredContent").toObject().value("text").toString(), QString("Hello"));
+        // A ready-made lower third, and an unknown template refused.
+        r = tool("montage_add_title", QJsonObject{{"project", project}, {"text", "Ada Lovelace\nMathematician"}, {"at", 0.1},
+                                                  {"duration", 0.2}, {"template", "lower_third"}, {"track", "V3"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = tool("montage_add_title", QJsonObject{{"project", project}, {"text", "x"}, {"at", 0}, {"template", "nope"}});
+        QVERIFY(r.value("isError").toBool() && text(r).contains("nope"));
         r = tool("montage_add_marker", QJsonObject{{"project", project}, {"at", 0.1}, {"name", "Look"}});
         QVERIFY(!r.value("isError").toBool());
         Project saved;

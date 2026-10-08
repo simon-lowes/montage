@@ -556,10 +556,12 @@ void McpServer::Impl::addTools() {
 
     add("montage_add_title", "Add a title",
         "Add a text title over the picture at a time, for a duration (default 3 s), on a video track (default: the "
-        "track above the top one in use).",
+        "track above the top one in use). template picks a ready-made, animated design (a lower third takes two lines: "
+        "name, newline, role); the text replaces its sample text.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"text":{"type":"string"},
             "at":{"type":["number","string"]},"duration":{"type":["number","string"],"default":3},
-            "track":{"type":"string"},"size":{"type":"number","description":"Font size in pixels"}},
+            "track":{"type":"string"},"size":{"type":"number","description":"Font size in pixels"},
+            "template":{"type":"string","enum":["plain","lower_third","lower_third_box","centred","chapter","callout","typewriter","end_card"],"default":"plain"}},
             "required":["project","text","at"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
@@ -573,7 +575,10 @@ void McpServer::Impl::addTools() {
                 t = top + 1 < int(s.videoTracks.size()) ? TrackRef{TrackKind::Video, top + 1} : edit::addTrack(l.project, s, TrackKind::Video);
             }
             const FrameTime len = a.contains("duration") ? timeArg(a.value("duration"), s, "duration") : FrameTime(std::llround(3 * s.fpsValue()));
-            Clip c = makeGeneratorClip(l.project, "title", std::max<FrameTime>(1, len));
+            const QString tpl = str(a, "template", "plain");
+            const std::string type = tpl == "plain" ? std::string("title") : "title_" + tpl.toStdString();
+            if (type != "title" && !findTitleTemplate(type)) throw ArgError{QStringLiteral("Unknown template \"%1\"").arg(tpl)};
+            Clip c = makeGeneratorClip(l.project, type, std::max<FrameTime>(1, len));
             c.generator.strings["text"] = need(a, "text").toStdString();
             if (a.value("size").isDouble()) c.generator.params["size"] = Param(a.value("size").toDouble());
             c.start = timeArg(a.value("at"), s, "at");

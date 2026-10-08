@@ -57,7 +57,9 @@ Image colourReferenceFrame(const Project& p, const Sequence& s, FrameTime t);
 int matchClipColour(Project& p, Sequence& s, const std::vector<Id>& clips, const Image& reference, FrameTime at);
 
 // Renders a title / colour / gradient generator at the given size.
-Image renderGenerator(const Effect& g, FrameTime t, int w, int h, double scale);
+// A generator's picture at clip-local frame t; titles animate in and out over
+// the clip's `duration` (frames at `fps`).
+Image renderGenerator(const Effect& g, FrameTime t, int w, int h, double scale, FrameTime duration = 0, double fps = 30);
 
 // ---------------------------------------------------------------------------
 // Audio

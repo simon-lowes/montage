@@ -339,10 +339,31 @@ std::vector<EffectInfo> buildCatalog() {
                              color("box_color", "Box Color", 0, 0, 0),
                              num("box_padding", "Box Padding (px)", 0, 200, 24, 1),
                              pct("opacity", "Opacity", 0, 100, 100),
+                             // Where it sits: Free is Position from the centre; the others keep it inside
+                             // the title-safe area at any frame size, Position then nudging it.
+                             choice("anchor", "Placement", {"Free", "Lower Left", "Lower Centre", "Lower Right", "Upper Left", "Upper Right"}, 0),
+                             // Lines after the first in their own size and colour (a name and a role).
+                             boolean("sub_style", "Style Lines After the First"),
+                             pct("sub_scale", "Their Size", 20, 200, 60),
+                             color("sub_color", "Their Color", 0.85, 0.85, 0.85),
+                             choice("bar", "Accent Bar", {"None", "Left", "Below"}, 0),
+                             color("bar_color", "Bar Color", 1, 0.75, 0.1),
+                             num("bar_width", "Bar Width (px)", 1, 60, 8, 0.5),
+                             choice("anim_in", "Animate In", {"None", "Fade", "Slide Up", "Slide Down", "Slide Left", "Slide Right", "Pop", "Typewriter", "Wipe"}, 0),
+                             num("anim_in_dur", "In Duration (s)", 0.05, 10, 0.5, 0.05),
+                             choice("anim_out", "Animate Out", {"None", "Fade", "Slide Up", "Slide Down", "Slide Left", "Slide Right", "Pop", "Typewriter", "Wipe"}, 0),
+                             num("anim_out_dur", "Out Duration (s)", 0.05, 10, 0.5, 0.05),
                          },
                          {str("text", "Text", StringKind::MultilineText, "Title"),
                           str("font", "Font", StringKind::Font, "Sans Serif")}};
         c.push_back(title);
+        // Ready-made titles: a Title with its settings filled in (makeEffect gives type "title").
+        for (const TitleTemplate& tpl : titleTemplates()) {
+            EffectInfo t = title;
+            t.type = tpl.id;
+            t.displayName = tpl.name;
+            c.push_back(t);
+        }
     }
 
     // ---- Transitions ------------------------------------------------------
@@ -458,7 +479,54 @@ std::vector<ParamInfo> effectParams(const Effect& e) {
     return out;
 }
 
+const std::vector<TitleTemplate>& titleTemplates() {
+    // Choices: anchor 0 Free, 1 Lower Left, 2 Lower Centre, 3 Lower Right, 4 Upper Left, 5 Upper Right;
+    // bar 0 None, 1 Left, 2 Below; animations 0 None, 1 Fade, 2 Slide Up, 3 Slide Down, 4 Slide Left,
+    // 5 Slide Right, 6 Pop, 7 Typewriter, 8 Wipe.
+    static const std::vector<TitleTemplate> list = {
+        {"title_lower_third", "Lower Third",
+         {{"size", 60}, {"align", 0}, {"anchor", 1}, {"sub_style", 1}, {"sub_scale", 60}, {"bar", 1}, {"shadow", 3},
+          {"shadow_opacity", 60}, {"anim_in", 5}, {"anim_in_dur", 0.5}, {"anim_out", 1}, {"anim_out_dur", 0.4}},
+         {{"text", "Name Surname\nRole or place"}}},
+        {"title_lower_third_box", "Lower Third (Box)",
+         {{"size", 54}, {"align", 0}, {"anchor", 1}, {"sub_style", 1}, {"sub_scale", 62}, {"box_opacity", 72},
+          {"box_padding", 22}, {"shadow", 0}, {"anim_in", 8}, {"anim_in_dur", 0.45}, {"anim_out", 8}, {"anim_out_dur", 0.35}},
+         {{"text", "Name Surname\nRole or place"}}},
+        {"title_centred", "Centred Title",
+         {{"size", 128}, {"shadow", 6}, {"anim_in", 6}, {"anim_in_dur", 0.45}, {"anim_out", 1}, {"anim_out_dur", 0.5}},
+         {{"text", "Title"}}},
+        {"title_chapter", "Chapter Heading",
+         {{"size", 96}, {"sub_style", 1}, {"sub_scale", 45}, {"bar", 2}, {"bar_width", 6}, {"anim_in", 2}, {"anim_in_dur", 0.6},
+          {"anim_out", 1}, {"anim_out_dur", 0.5}},
+         {{"text", "Chapter One\nWhere it begins"}}},
+        {"title_callout", "Call-out",
+         {{"size", 64}, {"color.r", 0.05}, {"color.g", 0.05}, {"color.b", 0.05}, {"box_opacity", 100}, {"box_color.r", 1},
+          {"box_color.g", 0.82}, {"box_color.b", 0.15}, {"box_padding", 20}, {"shadow", 0}, {"anchor", 5}, {"anim_in", 6},
+          {"anim_in_dur", 0.35}, {"anim_out", 6}, {"anim_out_dur", 0.3}},
+         {{"text", "Look at this!"}}},
+        {"title_typewriter", "Typewriter",
+         {{"size", 72}, {"bold", 0}, {"shadow", 2}, {"anim_in", 7}, {"anim_in_dur", 1.5}, {"anim_out", 1}, {"anim_out_dur", 0.5}},
+         {{"text", "Once upon a time..."}, {"font", "Monospace"}}},
+        {"title_end_card", "End Card",
+         {{"size", 110}, {"sub_style", 1}, {"sub_scale", 50}, {"anim_in", 1}, {"anim_in_dur", 0.8}, {"anim_out", 1}, {"anim_out_dur", 0.8}},
+         {{"text", "Thanks for watching\nSee you next time"}}},
+    };
+    return list;
+}
+
+const TitleTemplate* findTitleTemplate(const std::string& id) {
+    for (const TitleTemplate& t : titleTemplates())
+        if (id == t.id) return &t;
+    return nullptr;
+}
+
 Effect makeEffect(const std::string& type, Id id) {
+    if (const TitleTemplate* tpl = findTitleTemplate(type)) {
+        Effect e = makeEffect("title", id);
+        for (const auto& [name, value] : tpl->params) e.params[name] = Param(value);
+        for (const auto& [name, value] : tpl->strings) e.strings[name] = value;
+        return e;
+    }
     Effect e;
     e.id = id;
     e.type = type;

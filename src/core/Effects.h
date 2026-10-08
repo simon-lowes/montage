@@ -7,6 +7,7 @@
 #pragma once
 
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "Model.h"
@@ -64,6 +65,17 @@ struct EffectInfo {
 
 const std::vector<EffectInfo>& effectCatalog();
 const EffectInfo* findEffectInfo(const std::string& type);
+
+// Ready-made titles (lower thirds, call-outs...): listed as generators of
+// their own, they make a "title" generator with these settings.
+struct TitleTemplate {
+    const char* id;
+    const char* name;
+    std::vector<std::pair<const char*, double>> params;
+    std::vector<std::pair<const char*, const char*>> strings;
+};
+const std::vector<TitleTemplate>& titleTemplates();
+const TitleTemplate* findTitleTemplate(const std::string& id);
 std::vector<const EffectInfo*> effectsInCategory(EffectCategory c);
 
 // The parameters the inspector shows for an effect: the catalogue entry's,
