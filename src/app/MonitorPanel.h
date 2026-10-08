@@ -26,6 +26,11 @@ public:
     const QImage& image() const { return image_; }
     void setPlaceholder(const QString& text);
     void setSafeMargins(bool on);
+    // An exposure check over the picture (ExposureView.h); 0 = off.
+    void setExposureView(int mode);
+    int exposureView() const { return exposure_; }
+    // The picture as drawn (with the exposure check), for testing.
+    QImage shownImage() const;
     void setDragSource(bool on) { dragSource_ = on; }
     // Drawn over the picture; gets the rectangle the picture occupies.
     void setOverlay(std::function<void(QPainter&, const QRectF&)> paint) { overlay_ = std::move(paint); }
@@ -71,6 +76,10 @@ private:
     bool draggingSplit_ = false;
     QString placeholder_;
     bool safe_ = false;
+    int exposure_ = 0;
+    mutable QImage exposed_;           // image_ with the exposure check
+    mutable qint64 exposedKey_ = -1;
+    mutable int exposedMode_ = 0;
     bool dragSource_ = false;
     std::function<void(QPainter&, const QRectF&)> overlay_;
     QPoint pressPos_;
@@ -147,6 +156,7 @@ private:
     QLabel* durationLabel_;
     QToolButton* playButton_;
     QComboBox* resolution_ = nullptr;
+    QComboBox* exposure_ = nullptr;  // exposure check (ExposureView.h)
 
     void renderTrimView();
     bool trimView_ = false, trimBusy_ = false, trimPending_ = false;

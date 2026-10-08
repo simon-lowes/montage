@@ -1,5 +1,7 @@
 #include "MonitorPanel.h"
 
+#include "ExposureView.h"
+
 #include <QApplication>
 #include <QComboBox>
 #include <QDrag>
@@ -51,6 +53,21 @@ void ViewerWidget::setSafeMargins(bool on) {
     update();
 }
 
+void ViewerWidget::setExposureView(int mode) {
+    exposure_ = std::clamp(mode, 0, 3);
+    update();
+}
+
+QImage ViewerWidget::shownImage() const {
+    if (exposure_ == 0 || image_.isNull()) return image_;
+    if (exposedKey_ != image_.cacheKey() || exposedMode_ != exposure_) {
+        exposed_ = montage::exposureView(image_, ExposureView(exposure_));
+        exposedKey_ = image_.cacheKey();
+        exposedMode_ = exposure_;
+    }
+    return exposed_;
+}
+
 QRectF ViewerWidget::twoUpRect(bool right) const {
     // Each half fitted to the picture's shape (the sequence's, from whichever image there is).
     const double gap = 6, labelH = fontMetrics().height() + 8;
@@ -97,7 +114,7 @@ void ViewerWidget::paintEvent(QPaintEvent*) {
     }
     const QRectF r = imageRect();
     p.setRenderHint(QPainter::SmoothPixmapTransform);
-    p.drawImage(r, image_);
+    p.drawImage(r, exposure_ ? shownImage() : image_);
     if (safe_) {
         p.setPen(QPen(QColor(255, 255, 255, 90), 1, Qt::DashLine));
         p.drawRect(r.adjusted(r.width() * 0.05, r.height() * 0.05, -r.width() * 0.05, -r.height() * 0.05));
@@ -373,6 +390,17 @@ MonitorPanel::MonitorPanel(Mode mode, EditorState* state, PlaybackController* co
                 [this] { controller_->setPreviewScale(resolution_->currentData().toDouble()); });
         bar->addWidget(resolution_);
     }
+    // Exposure checks on either monitor.
+    exposure_ = new QComboBox(this);
+    exposure_->setObjectName(QStringLiteral("exposureView"));
+    exposure_->addItem(tr("Exposure: Off"));
+    exposure_->addItem(tr("Zebras 100 %"));
+    exposure_->addItem(tr("Zebras 70 %"));
+    exposure_->addItem(tr("False Colour"));
+    exposure_->setToolTip(tr("Zebra stripes over clipping (or skin-tone exposure), or false colour by brightness: purple crushed, "
+                             "blue near black, green 18 % grey, pink a stop over, yellow near clipping, red clipped"));
+    connect(exposure_, &QComboBox::currentIndexChanged, viewer_, &ViewerWidget::setExposureView);
+    bar->addWidget(exposure_);
     bar->addStretch();
     durationLabel_ = new QLabel(this);
     durationLabel_->setFont(theme::monoFont(9));

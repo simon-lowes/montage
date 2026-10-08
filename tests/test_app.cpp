@@ -38,6 +38,7 @@
 #include "EditorState.h"
 #include "EffectsBrowser.h"
 #include "ExportDialog.h"
+#include "ExposureView.h"
 #include "QualityCheckDialog.h"
 #include "MediaBinModel.h"
 #include "MediaBinWidget.h"
@@ -663,6 +664,55 @@ private slots:
         state()->setPlayhead(5000);
         add->trigger();
         QVERIFY(win_->statusBar()->currentMessage().contains("Select a clip"));
+    }
+
+    void exposureChecks() {
+        // False colour by brightness (Rec.709 luma of what is shown).
+        QCOMPARE(falseColorFor(0.01), QColor(130, 40, 170));
+        QCOMPARE(falseColorFor(0.03), QColor(40, 90, 230));
+        QCOMPARE(falseColorFor(0.41), QColor(70, 190, 70));
+        QCOMPARE(falseColorFor(0.54), QColor(240, 130, 190));
+        QCOMPARE(falseColorFor(0.98), QColor(250, 230, 40));
+        QCOMPARE(falseColorFor(1.0), QColor(230, 30, 30));
+        QCOMPARE(falseColorFor(0.7), QColor(179, 179, 179));
+        // Zebras: only where it is that bright, striped dark and light.
+        QImage img(64, 32, QImage::Format_RGB32);
+        img.fill(qRgb(128, 128, 128));
+        for (int y = 0; y < 32; ++y)
+            for (int x = 32; x < 64; ++x) img.setPixel(x, y, qRgb(255, 255, 255));
+        const QImage z = exposureView(img, ExposureView::Zebras100);
+        int dark = 0, untouched = 0;
+        for (int y = 0; y < 32; ++y)
+            for (int x = 0; x < 64; ++x) {
+                if (x < 32) untouched += z.pixel(x, y) == img.pixel(x, y);
+                else dark += qRed(z.pixel(x, y)) < 50;
+            }
+        QCOMPARE(untouched, 32 * 32);
+        QVERIFY(dark > 32 * 32 / 3 && dark < 2 * 32 * 32 / 3);
+        // Skin zebras catch 65-75 %, not white.
+        img.fill(qRgb(178, 178, 178));  // 70 %
+        QVERIFY(exposureView(img, ExposureView::Zebras70) != img);
+        img.fill(qRgb(255, 255, 255));
+        QCOMPARE(exposureView(img, ExposureView::Zebras70).pixel(5, 5), img.pixel(5, 5));
+        // On the Program monitor: the shown picture changes, the rendered frame does not.
+        loadDemo();
+        MonitorPanel* program = nullptr;
+        for (auto* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Program) program = m;
+        QVERIFY(program);
+        auto* combo = program->findChild<QComboBox*>("exposureView");
+        QVERIFY(combo && combo->count() == 4);
+        state()->setPlayhead(10);
+        QTRY_VERIFY(!program->viewer()->image().isNull());
+        const QImage frame = program->viewer()->image();
+        combo->setCurrentIndex(3);
+        QCOMPARE(program->viewer()->exposureView(), int(ExposureView::FalseColor));
+        const QImage shown = program->viewer()->shownImage();
+        QCOMPARE(shown, exposureView(frame, ExposureView::FalseColor));
+        QVERIFY(shown != frame.convertToFormat(QImage::Format_RGB32));
+        QCOMPARE(program->viewer()->image(), frame);
+        combo->setCurrentIndex(0);
+        QCOMPARE(program->viewer()->shownImage(), program->viewer()->image());
     }
 
     void razorTool() {

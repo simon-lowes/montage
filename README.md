@@ -197,6 +197,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Images as stills
 - Proxy workflow: 960 px intra-frame proxies, toggled in the Program monitor
 - Preview resolution: Full, 1/2, 1/4, 1/8
+- **Exposure checks** on both monitors (as cinema cameras and Resolve show them): **zebras** over what is at 98 % or more, or over 65–75 % for faces exposed for skin, and **false colour** by brightness: purple crushed, blue just above black, green at 18 % grey, pink a stop over, yellow near clipping, red clipped, grey elsewhere. Only the monitor changes, never the export.
 - **Render queue** (as in Media Encoder and Resolve): Add to Queue in the Export dialog. Queued exports render one after another in the background while you edit, each from the project as it was when queued. The Render Queue panel has Start, Stop, Retry, Remove, Clear Finished and Show File.
 - Loudness for delivery (Export › Loudness, or `--loudness -14`): the whole mix is measured first (ITU-R BS.1770 / EBU R128) and set to -14, -16, -23 or -24 LUFS. A look-ahead limiter keeps true peaks under -1 or -2 dBTP.
 - **Burn-ins for review copies** (Export › Burn in, or `--burn-timecode`, `--burn-clip-name`, `--burn-text`, `--watermark`): timecode, the clip's name and any text in a box in a chosen corner, plus a logo or watermark image with its own corner and opacity.
