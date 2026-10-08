@@ -14,6 +14,7 @@
 #include <QTimer>
 
 #include "media/Segmenter.h"
+#include "media/SpeechEnhance.h"
 
 namespace montage {
 
@@ -156,6 +157,17 @@ bool ensureObjectModel(QWidget* parent) {
     }
     return ensureModelPack(parent, objectModel(), QObject::tr("Object Mask"),
                            QObject::tr("Picking objects uses EdgeTAM, a segmentation model from Meta (Apache-2.0) that runs on this computer."));
+}
+
+bool ensureEffectModel(QWidget* parent, const std::string& type) {
+    if (type != "enhance_speech") return true;
+    if (!speechEnhancerAvailable()) {
+        QMessageBox::information(parent, QObject::tr("Enhance Speech"),
+                                 QObject::tr("This build of Montage cannot enhance speech: it was built without ONNX Runtime."));
+        return false;
+    }
+    return ensureModelPack(parent, speechModel(), QObject::tr("Enhance Speech"),
+                           QObject::tr("Enhance Speech uses DeepFilterNet3 (MIT or Apache-2.0), a speech model that runs on this computer."));
 }
 
 }  // namespace montage

@@ -276,6 +276,13 @@ std::vector<EffectInfo> buildCatalog() {
 #ifndef MONTAGE_WITH_RNNOISE
     c.back().hidden = true;  // needs the RNNoise model
 #endif
+    c.push_back({"enhance_speech", "Enhance Speech", EffectCategory::AudioFilter, "Restoration",
+                 {choice("keep", "Keep", {"Speech", "Everything but Speech"}, 0), pct("amount", "Amount", 0, 100, 100),
+                  num("max_reduction_db", "Max Reduction (dB)", 3, 100, 100, 1)},
+                 {}});
+#ifndef MONTAGE_WITH_ONNXRUNTIME
+    c.back().hidden = true;  // needs ONNX Runtime
+#endif
     c.push_back({"parametric_eq", "Parametric EQ", EffectCategory::AudioFilter, "EQ",
                  {num("low_hz", "Low Shelf (Hz)", 20, 1000, 100, 1), num("low_db", "Low Shelf (dB)", -24, 24, 0, 0.1),
                   num("b1_hz", "Band 1 (Hz)", 20, 20000, 250, 1), num("b1_db", "Band 1 (dB)", -24, 24, 0, 0.1),

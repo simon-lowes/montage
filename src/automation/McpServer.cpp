@@ -25,6 +25,7 @@
 #include "core/ProjectIO.h"
 #include "core/ScriptCut.h"
 #include "core/TranscriptEdit.h"
+#include "media/SpeechEnhance.h"
 #include "media/AutoDuck.h"
 #include "media/Decoder.h"
 #include "media/Transcriber.h"
@@ -633,6 +634,8 @@ void McpServer::Impl::addTools() {
             const EffectInfo* info = findEffectInfo(type);
             if (!info || info->hidden || (info->category != EffectCategory::VideoFilter && info->category != EffectCategory::AudioFilter))
                 throw ArgError{QStringLiteral("Unknown effect \"%1\" (see montage_list_effects)").arg(QString::fromStdString(type))};
+            if (type == "enhance_speech" && (!speechEnhancerAvailable() || !speechModel().installed()))
+                return fail("Enhance Speech needs its model: run `scripts/fetch-models.sh` or add the effect once in the app");
             Effect e = makeEffect(l.project, type);
             const QJsonObject params = a.value("params").toObject();
             for (auto it = params.begin(); it != params.end(); ++it) {

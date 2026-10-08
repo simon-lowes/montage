@@ -438,7 +438,10 @@ The second gap analysis (`docs/research/phase3-roadmap.md`, October 2026) ranks 
   - `matchScript`: Smith-Waterman over normalised words (2 for a word, 1 for a near miss, -1 for a mismatch or gap) in windows around the line's telling words, every reading in each window. Score = coverage x 100 - 4 per extra word, +5/-10 for a named speaker who matches or not; ties go to the later take.
   - `buildScriptCut`: a new sequence sized like the active one; best readings back to back with handles on V1/A1, alternates disabled on the first free tracks above, a marker per line and a red one for each missing line.
   - Sequence > Build Cut from Script... with a live preview, and MCP `montage_script_cut` (with `dry_run`).
-- [ ] 6. Speech enhancement and stem separation (M)
+- [x] 6. Speech enhancement (M); stem separation deferred:
+  - media/SpeechEnhance: DeepFilterNet3 as torchDF's single streaming ONNX graph (480 samples at 48 kHz in, a 45,304-float state carried between frames), 1440 samples of delay compensated. The model's own attenuation limit mixes in the undelayed input (comb filtering), so the cap is applied after, lined up. About 6x real time per channel; stereo channels run in parallel, identical ones once.
+  - Enhance Speech, a source-audio effect: Keep (Speech, or Everything but Speech = the original less the speech), Amount, Max Reduction. The model pack downloads when the effect is first added (Inspector or drag and drop); `montage-cli models` lists it, `scripts/fetch-models.sh` fetches it, MCP refuses the effect without it.
+  - Stem separation (vocals, drums, bass, other) is deferred: Spleeter's and Demucs' code is MIT, but neither publishes explicit terms for its pretrained weights (Demucs' author has called them research-only; both are trained on MUSDB18, which is non-commercial). Revisit if weights with a clear licence appear.
 - [ ] 7. Beat markers and fitting music to length (M)
 - [ ] 8. One-click mix: classify, ride and match dialogue (M)
 - [ ] 9. Caption and transcript translation on the device (M)

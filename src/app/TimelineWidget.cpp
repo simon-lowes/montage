@@ -22,6 +22,7 @@
 #include <utility>
 
 #include "EditorState.h"
+#include "ModelPacks.h"
 #include "render/Exporter.h"
 #include "Theme.h"
 #include "ThumbnailCache.h"
@@ -1803,6 +1804,9 @@ void TimelineWidget::dropEffect(const QString& typeQ, const QPoint& pos) {
     const EffectInfo* info = findEffectInfo(type);
     const bool plugin = plugins::isPluginType(type);
     if ((!info && !plugin) || !s) return;
+    if (!ensureEffectModel(window(), type)) return;
+    s = state_->sequence();  // the download waited in an event loop
+    if (!s) return;
     const EffectCategory category = plugin ? EffectCategory::AudioFilter : info->category;
     const QString name = QString::fromStdString(plugins::effectTypeName(type));
     Hit h = hitTest(pos);

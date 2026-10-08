@@ -678,6 +678,7 @@ void InspectorWidget::addEffectMenu(TrackKind kind, Id owner) {
         std::string type = info->type;
         QString label = QString::fromStdString(info->displayName);
         g->addAction(label, this, [this, owner, type, label] {
+            if (!ensureEffectModel(window(), type)) return;
             Id added = 0;
             state_->edit(tr("Add %1").arg(label), [owner, type, &added](Project& p, Sequence& s) {
                 std::vector<Effect>* chain = edit::effectChain(s, owner);

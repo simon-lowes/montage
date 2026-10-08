@@ -33,6 +33,7 @@
 #include "media/SpeakerSwitch.h"
 #include "media/Tracking.h"
 #include "media/Segmenter.h"
+#include "media/SpeechEnhance.h"
 #include "media/Reframe.h"
 #include "media/Diarizer.h"
 #include "media/VisualSearch.h"
@@ -2794,6 +2795,63 @@ private slots:
             QVERIFY(isolateVoice(noisy, isolated, 0));
             QCOMPARE(isolated.samples.size(), noisy.samples.size());
             QVERIFY(std::fabs(isolated.samples[48000] - noisy.samples[48000]) < 1e-5f);
+        }
+
+        // Enhance Speech (DeepFilterNet3), when its model is here.
+        if (speechEnhancerAvailable() && speechModel().installed()) {
+            AudioBuffer enhanced;
+            std::string err;
+            QVERIFY2(enhanceSpeech(noisy, enhanced, 100, 100, false, nullptr, &err), err.c_str());
+            QCOMPARE(enhanced.frames(), noisy.frames());
+            const double snrEnhanced = snr(enhanced, &lag);
+            const double pauseEnhanced = rms(enhanced, 2.3, 3.1);
+            qInfo("enhance speech: SNR %.1f -> %.1f dB, pause %.1f dB lower, lag %d", snrIn, snrEnhanced,
+                  20 * std::log10(pauseIn / pauseEnhanced), lag);
+            QVERIFY2(std::abs(lag) <= 4, "the model's delay is not compensated");
+            // Far quieter pauses than spectral noise reduction. Like RNNoise it also takes out the
+            // crowd in the 1961 recording, so the waveform match is checked only loosely.
+            QVERIFY(pauseEnhanced < pauseIn * std::pow(10.0, -30 / 20.0));
+            QVERIFY(pauseEnhanced < pauseDenoise * std::pow(10.0, -15 / 20.0));
+            QVERIFY(snrEnhanced > snrIn);
+            const double speechEnhanced = rms(enhanced, 0.4, 2.0), speechClean = rms(*clean, 0.4, 2.0);
+            QVERIFY2(std::fabs(20 * std::log10(speechEnhanced / speechClean)) < 4,
+                     qPrintable(QString::number(20 * std::log10(speechEnhanced / speechClean))));
+            // A 10 dB cap: the pause comes down by about 10 dB, not more.
+            AudioBuffer capped;
+            QVERIFY(enhanceSpeech(noisy, capped, 100, 10));
+            const double pauseCapped = 20 * std::log10(pauseIn / rms(capped, 2.3, 3.1));
+            QVERIFY2(pauseCapped > 8 && pauseCapped < 10.5, qPrintable(QString::number(pauseCapped)));
+            // Amount 0 leaves the audio as it was.
+            QVERIFY(enhanceSpeech(noisy, capped, 0, 100));
+            QVERIFY(std::fabs(capped.samples[48000] - noisy.samples[48000]) < 1e-6f);
+            // Everything but the speech: a hum under the voice comes through, the voice does not.
+            AudioBuffer hummed = *clean;
+            for (int64_t i = 0; i < hummed.frames(); ++i)
+                for (int c = 0; c < 2; ++c)
+                    hummed.samples[size_t(i) * 2 + size_t(c)] += float(0.05 * std::sin(2 * M_PI * 120 * double(i) / hummed.sampleRate));
+            AudioBuffer rest;
+            QVERIFY(enhanceSpeech(hummed, rest, 100, 100, true));
+            QCOMPARE(rest.frames(), hummed.frames());
+            // The hum is all there (its share of the result), and the speech is mostly gone:
+            // what is left besides the hum while he speaks, against the speech itself.
+            double humIn = 0, hum2 = 0, left = 0, speech = 0;
+            const int64_t a = int64_t(0.4 * hummed.sampleRate), z = int64_t(2.0 * hummed.sampleRate);
+            for (int64_t i = 2000; i < hummed.frames() - 2000; ++i) {
+                const double h = 0.05 * std::sin(2 * M_PI * 120 * double(i) / hummed.sampleRate);
+                hum2 += h * h;
+                humIn += rest.samples[size_t(i) * 2] * h;
+                if (i >= a && i < z) {
+                    left += std::pow(rest.samples[size_t(i) * 2] - h, 2);
+                    speech += std::pow(clean->samples[size_t(i) * 2], 2);
+                }
+            }
+            const double humGain = 20 * std::log10(humIn / hum2), speechDown = 10 * std::log10(speech / left);
+            qInfo("everything but speech: hum %.1f dB, speech %.1f dB lower", humGain, speechDown);
+            // (What is left also holds the 1961 crowd, which belongs in the background.)
+            QVERIFY(std::fabs(humGain) < 1.5);
+            QVERIFY(speechDown > 7);
+        } else {
+            qInfo("Set MONTAGE_SPEECH_MODEL to a folder with deepfilternet3.onnx to test Enhance Speech");
         }
 
         // Through the mixer: an exported mix of a clip with Noise Reduction is cleaner.

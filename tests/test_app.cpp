@@ -43,6 +43,9 @@
 #include "SequenceSettingsDialog.h"
 #include "audio/Plugins.h"
 #include "MainWindow.h"
+#include "audio/SpeechCleanup.h"
+#include "media/SpeechEnhance.h"
+#include "ModelPacks.h"
 #include "MixerPanel.h"
 #include "MulticamPanel.h"
 #include "PluginEditorWindow.h"
@@ -1378,6 +1381,16 @@ private slots:
         QVERIFY(!compare->isChecked() && !program->comparing());
         program->setSplit(0.5);
         state()->newProject();
+    }
+
+    void enhanceSpeechAsksForItsModel() {
+        // Effects without a model need nothing; Enhance Speech is ready once its model is here.
+        QVERIFY(ensureEffectModel(win_.get(), "denoise"));
+        if (!speechEnhancerAvailable() || !speechModel().installed()) QSKIP("Set MONTAGE_SPEECH_MODEL to test with the model");
+        QVERIFY(ensureEffectModel(win_.get(), "enhance_speech"));
+        const EffectInfo* info = findEffectInfo("enhance_speech");
+        QVERIFY(info && !info->hidden);
+        QVERIFY(isSourceAudioEffect("enhance_speech"));
     }
 
     void buildACutFromAScript() {

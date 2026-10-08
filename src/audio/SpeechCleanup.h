@@ -16,7 +16,7 @@
 
 namespace montage {
 
-// Effect types processed this way ("denoise", "voice_isolate").
+// Effect types processed this way ("denoise", "voice_isolate", "enhance_speech").
 bool isSourceAudioEffect(const std::string& type);
 // True if this build includes the RNNoise voice model.
 bool hasVoiceIsolation();
@@ -31,6 +31,14 @@ void reduceNoise(const AudioBuffer& in, AudioBuffer& out, double reductionDb, do
 // Keeps speech and removes everything else with RNNoise (Xiph, BSD), mixed
 // with the original by `amount` (0..100). False if unavailable.
 bool isolateVoice(const AudioBuffer& in, AudioBuffer& out, double amount, const std::atomic<bool>* cancel = nullptr);
+
+// Takes noise and room out of speech with DeepFilterNet3 (media/SpeechEnhance.h),
+// or with `background` keeps everything but the speech (the original less the
+// speech, lined up: music, effects and ambience). What is taken out is turned
+// down by at most `maxReductionDb`, and the result is mixed with the original
+// by `amount` (0..100). False if the model is not available (`error` says why).
+bool enhanceSpeech(const AudioBuffer& in, AudioBuffer& out, double amount, double maxReductionDb, bool background = false,
+                   const std::atomic<bool>* cancel = nullptr, std::string* error = nullptr);
 
 // The source audio with the clip's source effects applied, in order. With
 // `blocking` the work is done now; otherwise it starts in the background and

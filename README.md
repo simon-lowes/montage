@@ -115,7 +115,8 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Dialogue cleanup (Effects › Audio Filters › Restoration):
   - **Noise Reduction** learns the noise print from the quietest moments of the recording itself, then turns down hum, hiss and room tone by up to the amount you set.
   - **Voice Isolation** uses RNNoise, a neural network from Xiph, to keep speech and remove everything else, mixed with the original by Amount.
-  - Both process the clip's whole source audio in the background and cache the result. Playback uses the original audio until the cleaned copy is ready (usually a few seconds); exports always wait for it.
+  - **Enhance Speech** (like Premiere's Enhance Speech or Descript's Studio Sound) uses DeepFilterNet3 (MIT or Apache-2.0, 16 MB, downloaded the first time it is added) to take noise and room out of a voice: in the test it brings the pauses in a noisy recording down by 48 dB, against 14 dB for Noise Reduction. Max Reduction caps how far anything is turned down, for a lighter touch. Keep › Everything but Speech does the opposite and gives the music, effects and ambience with the voice about 8–10 dB down, for a music-and-effects bed.
+  - All of these process the clip's whole source audio in the background and cache the result. Playback uses the original audio until the cleaned copy is ready (usually a few seconds); exports always wait for it.
 - Crossfades: equal power or constant gain
 - Loudness normalisation to -14, -16, -23 or -24 LUFS (ITU-R BS.1770 / EBU R128 gated measurement)
 - **Live loudness meter** under the audio meters while playing: momentary (400 ms), short-term (3 s) and integrated LUFS, loudness range (LU) and true peak (dBTP). The integrated value turns green on the chosen target (EBU R128 -23, ATSC A/85 -24, streaming -14, Apple and podcasts -16), amber within 2 LU, and red otherwise; true peak turns red above -1 dBTP. Reset starts a new measurement.

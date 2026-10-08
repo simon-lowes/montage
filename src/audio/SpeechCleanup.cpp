@@ -20,9 +20,11 @@ extern "C" {
 #include <rnnoise.h>
 #endif
 
+#include "media/SpeechEnhance.h"
+
 namespace montage {
 
-bool isSourceAudioEffect(const std::string& type) { return type == "denoise" || type == "voice_isolate"; }
+bool isSourceAudioEffect(const std::string& type) { return type == "denoise" || type == "voice_isolate" || type == "enhance_speech"; }
 
 bool hasVoiceIsolation() {
 #ifdef MONTAGE_WITH_RNNOISE
@@ -168,11 +170,7 @@ void reduceNoise(const AudioBuffer& in, AudioBuffer& out, double reductionDb, do
 
 // ---- Voice isolation (RNNoise) -------------------------------------------------
 
-#ifdef MONTAGE_WITH_RNNOISE
 namespace {
-// RNNoise's output lags its input by this many samples at 48 kHz:
-constexpr int kRnnoiseDelay = 960;  // two 10 ms frames (measured by the voice isolation test)
-
 std::vector<float> resample(const std::vector<float>& in, double from, double to) {
     if (from == to || in.empty()) return in;
     const size_t n = size_t(std::llround(double(in.size()) * to / from));
@@ -187,6 +185,12 @@ std::vector<float> resample(const std::vector<float>& in, double from, double to
     }
     return out;
 }
+}  // namespace
+
+#ifdef MONTAGE_WITH_RNNOISE
+namespace {
+// RNNoise's output lags its input by this many samples at 48 kHz:
+constexpr int kRnnoiseDelay = 960;  // two 10 ms frames (measured by the voice isolation test)
 }  // namespace
 #endif
 
@@ -232,6 +236,58 @@ bool isolateVoice(const AudioBuffer& in, AudioBuffer& out, double amount, const 
 #endif
 }
 
+bool enhanceSpeech(const AudioBuffer& in, AudioBuffer& out, double amount, double maxReductionDb, bool background,
+                   const std::atomic<bool>* cancel, std::string* error) {
+    if (!speechEnhancerAvailable()) {
+        if (error) *error = "This build of Montage cannot enhance speech (it was built without ONNX Runtime)";
+        return false;
+    }
+    const int64_t frames = in.frames();
+    const float mix = float(std::clamp(amount, 0.0, 100.0) / 100.0);
+    // Never further down than the limit: the original, that much quieter, stays under the result.
+    const float floor = maxReductionDb >= 100 ? 0.0f : float(std::pow(10.0, -std::max(0.0, maxReductionDb) / 20.0));
+    std::vector<float> ch[2];
+    for (int c = 0; c < 2; ++c) {
+        ch[c].resize(size_t(frames));
+        for (int64_t s = 0; s < frames; ++s) ch[c][size_t(s)] = in.samples[size_t(s) * 2 + size_t(c)];
+    }
+    // A mono recording (both sides the same) is enhanced once.
+    const bool mono = ch[0] == ch[1];
+    std::vector<float> wet[2];
+    bool ok[2] = {true, true};
+    std::string err[2];
+    auto run = [&](int c) {
+        std::vector<float> y;
+        ok[c] = enhanceSpeech48k(resample(ch[c], in.sampleRate, 48000), y, cancel, &err[c]);
+        if (!ok[c]) return;
+        wet[c] = resample(y, 48000, in.sampleRate);
+        wet[c].resize(size_t(frames), 0.0f);
+    };
+    if (mono) {
+        run(0);
+    } else {
+        std::thread other(run, 1);
+        run(0);
+        other.join();
+    }
+    if (!ok[0] || !ok[1]) {
+        if (error) *error = !ok[0] ? err[0] : err[1];
+        return false;
+    }
+    out.sampleRate = in.sampleRate;
+    out.samples.assign(in.samples.size(), 0.0f);
+    for (int c = 0; c < 2; ++c) {
+        const std::vector<float>& w = wet[mono ? 0 : c];
+        for (int64_t s = 0; s < frames; ++s) {
+            const float dry = ch[c][size_t(s)], speech = w[size_t(s)];
+            // What is kept, with what is taken out let through at the floor.
+            const float kept = background ? dry - speech * (1 - floor) : speech * (1 - floor) + dry * floor;
+            out.samples[size_t(s) * 2 + size_t(c)] = dry + (kept - dry) * mix;
+        }
+    }
+    return true;
+}
+
 // ---- Cache --------------------------------------------------------------------
 
 namespace {
@@ -270,6 +326,8 @@ AudioBufferPtr process(const AudioBufferPtr& source, const std::vector<Effect>& 
             ok = true;
         } else if (e.type == "voice_isolate") {
             ok = isolateVoice(*cur, *out, e.p("amount", 0, 100));
+        } else if (e.type == "enhance_speech") {
+            ok = enhanceSpeech(*cur, *out, e.p("amount", 0, 100), e.p("max_reduction_db", 0, 100), e.p("keep", 0) > 0.5);
         }
         if (ok) cur = out;
     }

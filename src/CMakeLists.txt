@@ -32,6 +32,7 @@ add_library(montage_engine STATIC
   media/Segmenter.h media/Segmenter.cpp
   media/Diarizer.h media/Diarizer.cpp
   media/VisualSearch.h media/VisualSearch.cpp
+  media/SpeechEnhance.h media/SpeechEnhance.cpp
   render/Processing.h render/Processing.cpp
   render/Retime.h render/Retime.cpp
   render/ClipAnalysis.h render/ClipAnalysis.cpp

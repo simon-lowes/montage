@@ -29,6 +29,7 @@
 #include "automation/McpServer.h"
 #include "media/Diarizer.h"
 #include "media/Segmenter.h"
+#include "media/SpeechEnhance.h"
 #include "media/VisualSearch.h"
 #include "media/Transcriber.h"
 #endif
@@ -529,6 +530,11 @@ int cmdModels() {
     else
         std::printf("  %-22s %6.0f MB  %s\n", speakerModel().id.c_str(), double(speakerModel().bytes()) / 1e6,
                     speakerModel().installed() ? "downloaded" : "");
+    std::printf("\nSpeech enhancement model (DeepFilterNet3, for Enhance Speech; folder: %s)\n", speechModel().directory().c_str());
+    if (!speechEnhancerAvailable()) std::printf("  unavailable: this build has no ONNX Runtime\n");
+    else
+        std::printf("  %-22s %6.0f MB  %s\n", speechModel().id.c_str(), double(speechModel().bytes()) / 1e6,
+                    speechModel().installed() ? "downloaded" : "");
     return 0;
 }
 

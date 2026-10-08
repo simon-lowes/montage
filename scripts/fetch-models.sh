@@ -4,6 +4,7 @@
 #   <dir>/edgetam-video  object masks       (MONTAGE_OBJECT_MODEL)
 #   <dir>/speakers       speaker labels     (MONTAGE_SPEAKER_MODEL)
 #   <dir>/clip-vit-b32   Find Shots         (MONTAGE_VISUAL_MODEL)
+#   <dir>/speech-enhance Enhance Speech     (MONTAGE_SPEECH_MODEL)
 #
 #   scripts/fetch-models.sh [dir]      (default: ./models)
 set -euo pipefail
@@ -39,4 +40,7 @@ fetch clip-vit-b32 text_model_q4.onnx "$CLIP/onnx/text_model_q4.onnx" e4ccd15d80
 fetch clip-vit-b32 vision_model_q4.onnx "$CLIP/onnx/vision_model_q4.onnx" 0769eb1d2f6f68927bbfa6e5330df4c4c3c112f89cd43eae28baafa9e6bd34b4
 fetch clip-vit-b32 vocab.json "$CLIP/vocab.json" 5047b556ce86ccaf6aa22b3ffccfc52d391ea4accdab9c2f2407da5b742d4363
 fetch clip-vit-b32 merges.txt "$CLIP/merges.txt" 9fd691f7c8039210e0fced15865466c65820d09b63988b0174bfe25de299051a
-echo "Models in $DIR: MONTAGE_OBJECT_MODEL=$DIR/edgetam-video MONTAGE_SPEAKER_MODEL=$DIR/speakers MONTAGE_VISUAL_MODEL=$DIR/clip-vit-b32"
+fetch speech-enhance deepfilternet3.onnx \
+  https://huggingface.co/kimtos-labs/denoiser-dfn3/resolve/888f33c41851d7168ae31c3637c323b9e2f3c2a4/denoiser_model.onnx \
+  fe5eb64fa2e4154c83f8e4935e82871c850c154387ee892e0ab65fe179e7d8c9
+echo "Models in $DIR: MONTAGE_OBJECT_MODEL=$DIR/edgetam-video MONTAGE_SPEAKER_MODEL=$DIR/speakers MONTAGE_VISUAL_MODEL=$DIR/clip-vit-b32 MONTAGE_SPEECH_MODEL=$DIR/speech-enhance"
