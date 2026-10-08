@@ -2276,7 +2276,9 @@ private slots:
         state()->newProject();
         // Closing the project lets its files go (on Windows a folder with an open file cannot be renamed); background
         // thumbnail and audio jobs may hold one a moment longer.
-        QTRY_VERIFY_WITH_TIMEOUT(QDir().rename(root + "/card", root + "/Card 2"), 10000);
+        // (QTRY_ evaluates its condition again once it holds, so the rename is latched.)
+        bool renamed = false;
+        QTRY_VERIFY_WITH_TIMEOUT(renamed || (renamed = QDir().rename(root + "/card", root + "/Card 2")), 10000);
 
         // Opening it lists both files as offline, in the bin and on the timeline.
         QVERIFY(win_->openProject(root + "/cut.montage"));
