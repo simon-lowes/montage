@@ -17,6 +17,8 @@ class QDockWidget;
 class QLabel;
 class QMenu;
 
+class QTabBar;
+
 namespace montage {
 
 class EditorState;
@@ -115,6 +117,7 @@ private:
     void restoreLayout();
     void resetLayout();
     void syncProgram();
+    void syncSequenceTabs();
     void rebuildSourceProject();
     void updateTitle();
     void updateActions();
@@ -180,6 +183,9 @@ private:
     PlaybackController* program_;
     PlaybackController* source_;
     TimelineWidget* timeline_ = nullptr;
+    // Open sequences as tabs above the timeline (Premiere's and Resolve's timeline tabs).
+    QTabBar* sequenceTabs_ = nullptr;
+    std::vector<Id> openSequences_;
     MonitorPanel* sourcePanel_ = nullptr;
     MonitorPanel* programPanel_ = nullptr;
     MediaBinWidget* bin_ = nullptr;

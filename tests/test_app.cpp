@@ -20,6 +20,7 @@
 #include <QPushButton>
 #include <QMenu>
 #include <QPainter>
+#include <QTabBar>
 #include <QTableWidget>
 #include <QTextEdit>
 #include <QToolButton>
@@ -713,6 +714,39 @@ private slots:
         QCOMPARE(program->viewer()->image(), frame);
         combo->setCurrentIndex(0);
         QCOMPARE(program->viewer()->shownImage(), program->viewer()->image());
+    }
+
+    void sequenceTabs() {
+        loadDemo();
+        auto* tabs = win_->findChild<QTabBar*>("sequenceTabs");
+        QVERIFY(tabs);
+        QTRY_COMPARE(tabs->count(), 1);
+        const Id first = state()->project().activeSequence;
+        QCOMPARE(tabs->tabText(0), QString::fromStdString(state()->sequence()->name));
+        QVERIFY(!tabs->tabsClosable());  // the only one stays
+        // A new sequence opens in its own tab; clicking a tab switches to it.
+        const Id second = state()->newSequence("Second", 320, 180, Rational{30, 1});
+        QCOMPARE(tabs->count(), 2);
+        QCOMPARE(tabs->currentIndex(), 1);
+        QCOMPARE(tabs->tabText(1), QString("Second"));
+        tabs->setCurrentIndex(0);
+        QCOMPARE(state()->project().activeSequence, first);
+        state()->edit("Rename", [](Project&, Sequence& s) {
+            s.name = "Main cut";
+            return true;
+        });
+        QCOMPARE(tabs->tabText(0), QString("Main cut"));
+        // Closing the active tab moves to its neighbour; the last one cannot be closed.
+        emit tabs->tabCloseRequested(0);
+        QCOMPARE(tabs->count(), 1);
+        QCOMPARE(state()->project().activeSequence, second);
+        emit tabs->tabCloseRequested(0);
+        QCOMPARE(tabs->count(), 1);
+        // Opening the first again (as from the bin) brings its tab back.
+        state()->setActiveSequence(first);
+        QCOMPARE(tabs->count(), 2);
+        QCOMPARE(tabs->currentIndex(), 1);
+        QCOMPARE(tabs->tabText(1), QString("Main cut"));
     }
 
     void razorTool() {

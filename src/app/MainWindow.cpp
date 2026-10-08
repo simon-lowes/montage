@@ -38,6 +38,7 @@
 #include <QShortcut>
 #include <QStatusBar>
 #include <QTableWidget>
+#include <QTabBar>
 #include <QToolBar>
 #include <QVBoxLayout>
 #include <algorithm>
@@ -215,7 +216,41 @@ MainWindow::~MainWindow() = default;
 
 void MainWindow::buildPanels() {
     timeline_ = new TimelineWidget(state_, this);
-    setCentralWidget(timeline_);
+    {
+        auto* centre = new QWidget(this);
+        auto* v = new QVBoxLayout(centre);
+        v->setContentsMargins(0, 0, 0, 0);
+        v->setSpacing(0);
+        sequenceTabs_ = new QTabBar(centre);
+        sequenceTabs_->setObjectName(QStringLiteral("sequenceTabs"));
+        sequenceTabs_->setTabsClosable(true);
+        sequenceTabs_->setMovable(true);
+        sequenceTabs_->setExpanding(false);
+        sequenceTabs_->setDocumentMode(true);
+        sequenceTabs_->setToolTip(tr("Open sequences: click to switch, drag to reorder, close to put away (double-click a sequence in the bin to open it)"));
+        v->addWidget(sequenceTabs_);
+        v->addWidget(timeline_, 1);
+        setCentralWidget(centre);
+        connect(sequenceTabs_, &QTabBar::currentChanged, this, [this](int i) {
+            if (i >= 0 && i < int(openSequences_.size())) state_->setActiveSequence(openSequences_[size_t(i)]);
+        });
+        connect(sequenceTabs_, &QTabBar::tabMoved, this, [this](int from, int to) {
+            if (from < 0 || to < 0 || from >= int(openSequences_.size()) || to >= int(openSequences_.size())) return;
+            const Id id = openSequences_[size_t(from)];
+            openSequences_.erase(openSequences_.begin() + from);
+            openSequences_.insert(openSequences_.begin() + to, id);
+        });
+        connect(sequenceTabs_, &QTabBar::tabCloseRequested, this, [this](int i) {
+            // The last open sequence stays: the timeline always shows one.
+            if (openSequences_.size() <= 1 || i < 0 || i >= int(openSequences_.size())) return;
+            const Id closing = openSequences_[size_t(i)];
+            openSequences_.erase(openSequences_.begin() + i);
+            if (state_->project().activeSequence == closing)
+                state_->setActiveSequence(openSequences_[size_t(std::min<int>(i, int(openSequences_.size()) - 1))]);
+            syncSequenceTabs();
+        });
+        for (auto sig : {&EditorState::projectChanged, &EditorState::sequenceSwitched}) connect(state_, sig, this, &MainWindow::syncSequenceTabs);
+    }
     connect(timeline_, &TimelineWidget::clipActivated, this, [this](Id clip) {
         const Sequence* s = state_->sequence();
         const Clip* c = s ? edit::clipById(*s, clip) : nullptr;
@@ -1730,6 +1765,23 @@ bool MainWindow::exportClipLut(const QString& path, int size) {
                                                   .arg(QFileInfo(path).fileName(), left.join(QStringLiteral(", "))),
                              8000);
     return true;
+}
+
+void MainWindow::syncSequenceTabs() {
+    if (!sequenceTabs_) return;
+    const Project& p = state_->project();
+    std::erase_if(openSequences_, [&](Id id) { return !p.findSequence(id); });
+    if (p.activeSequence && std::find(openSequences_.begin(), openSequences_.end(), p.activeSequence) == openSequences_.end())
+        openSequences_.push_back(p.activeSequence);
+    const QSignalBlocker block(sequenceTabs_);
+    while (sequenceTabs_->count() > int(openSequences_.size())) sequenceTabs_->removeTab(sequenceTabs_->count() - 1);
+    while (sequenceTabs_->count() < int(openSequences_.size())) sequenceTabs_->addTab(QString());
+    for (int i = 0; i < int(openSequences_.size()); ++i) {
+        const Sequence* s = p.findSequence(openSequences_[size_t(i)]);
+        sequenceTabs_->setTabText(i, s ? QString::fromStdString(s->name) : QString());
+        if (openSequences_[size_t(i)] == p.activeSequence) sequenceTabs_->setCurrentIndex(i);
+    }
+    sequenceTabs_->setTabsClosable(openSequences_.size() > 1);
 }
 
 const Clip* MainWindow::clipForCommand() const {
