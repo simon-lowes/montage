@@ -70,6 +70,8 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
   - Alt-click a keyframe to delete it, or right-click it for Linear, Hold or Smooth.
   - Volume is drawn on a perceptual scale up to +6 dB.
 - Titles (font, outline, shadow, background box, alignment, tracking), colour mattes, gradients, SMPTE bars
+- **Shape layers** (Effects › Generators › Shape): a rectangle (with rounded corners), ellipse, polygon, star, line or arrow, filled with a colour or a linear or radial gradient, with a stroke that can be dashed. Every value is keyframeable, and Trim Start, Trim End and Trim Offset (as in After Effects) draw the outline on or send a segment round it.
+- **Lottie animations and SVG graphics** import like footage. Lottie `.json` files exported from After Effects with Bodymovin or downloaded from LottieFiles play as clips with transparency, at their own frame rate and length, expressions included. SVGs are stills. Both are drawn by ThorVG at the size they are shown, so they stay sharp when scaled up.
 - **Animated titles and templates**: titles animate in and out (fade, slide in four directions, pop, typewriter, wipe), sit at a placement that stays inside the title-safe area at any frame size (lower left, lower centre, upper right...), can style the lines after the first in their own size and colour, and can carry an accent bar. Ready-made designs are listed under Titles in the Effects panel: Lower Third, Lower Third (Box), Centred Title, Chapter Heading, Call-out, Typewriter and End Card.
 - Transitions: cross dissolve, dip to black/white, wipe, push, slide, iris, cross zoom, and **Smooth Cut** (like Premiere's Morph Cut or Resolve's Smooth Cut), which hides a jump cut in an interview by morphing the outgoing frame into the incoming one along their optical flow
 - Scopes: waveform, RGB parade, vectorscope, histogram
@@ -227,6 +229,7 @@ CMake options:
 - `-DMONTAGE_BUILD_APP=OFF` builds only the engine and CLI, without Qt Widgets or Multimedia.
 - `-DMONTAGE_BUILD_TESTS=OFF` skips the tests.
 - `-DMONTAGE_REQUIRE_ONNXRUNTIME=ON` stops the configure step if ONNX Runtime is missing (release builds use it).
+- `-DMONTAGE_WITH_THORVG=OFF` leaves out Lottie and SVG import (ThorVG 1.1.2, MIT, is fetched and compiled at configure time).
 
 The object mask, speaker and visual search tests need their models: `scripts/fetch-models.sh ~/montage-models`, then set `MONTAGE_OBJECT_MODEL=~/montage-models/edgetam-video`, `MONTAGE_SPEAKER_MODEL=~/montage-models/speakers` and `MONTAGE_VISUAL_MODEL=~/montage-models/clip-vit-b32` (the app reads the same variables). The speech tests read `MONTAGE_TEST_WHISPER_MODEL`.
 
@@ -301,6 +304,7 @@ Its tools work on `.montage` files by path. Each edit is saved at once, and the 
 - transcribe (with speaker labels), translate caption tracks, find spoken phrases in the cut, cut by transcript (phrases, filler words, long pauses, optionally with Smooth Cuts), and build a cut from a script;
 - find shots by description;
 - log media (ratings, labels, keywords, metadata fields, bins), make subclips, auto-tag shots, and find media by text or smart-bin rules, optionally saving the rules as a smart bin;
+- add shape layers (drawn on if asked);
 - make a first mix (roles, levels, dialogue rides, ducking), set up a 5.1 or 7.1 mix and place tracks in it, match voices to a reference, mark a music clip's bars or beats and fit music to a length, duck music under dialogue, match clips' colour to a shot, add adjustment layers, and make a reframed copy of the cut at another aspect ratio;
 - return a rendered frame as an image so the agent can check its work;
 - render with any preset, with progress, optionally folding surround down to stereo and writing stems;

@@ -13,6 +13,7 @@
 #include "Exporter.h"
 #include "Processing.h"
 #include "Retime.h"
+#include "Shapes.h"
 #include "VideoDenoise.h"
 #include "audio/PluginEffect.h"
 #include "audio/SpeechCleanup.h"
@@ -219,6 +220,8 @@ Image renderGenerator(const Effect& g, FrameTime t, int w, int h, double scale, 
             }
     } else if (g.type == "title") {
         return renderTitle(g, t, w, h, scale, duration, fps);
+    } else if (g.type == "shape") {
+        return renderShape(g, t, w, h, scale);
     }
     return img;
 }

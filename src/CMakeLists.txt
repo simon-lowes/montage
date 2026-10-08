@@ -20,6 +20,7 @@ add_library(montage_engine STATIC
   automation/McpServer.h automation/McpServer.cpp
   media/Image.h media/Image.cpp
   media/Decoder.h media/Decoder.cpp
+  media/Vector.h media/Vector.cpp
   media/HwAccel.h media/HwAccel.cpp
   media/MediaPool.h media/MediaPool.cpp
   media/Analysis.h media/Analysis.cpp
@@ -39,6 +40,7 @@ add_library(montage_engine STATIC
   render/Processing.h render/Processing.cpp
   render/Retime.h render/Retime.cpp
   render/VideoDenoise.h render/VideoDenoise.cpp
+  render/Shapes.h render/Shapes.cpp
   render/ClipAnalysis.h render/ClipAnalysis.cpp
   render/MusicEdit.h render/MusicEdit.cpp
   render/AutoMix.h render/AutoMix.cpp
@@ -169,6 +171,11 @@ if(MONTAGE_WITH_ONNXRUNTIME)
     message(STATUS "ONNX Runtime not found: object masks can be shown but not tracked")
   endif()
 endif()
+if(MONTAGE_WITH_THORVG)
+  target_link_libraries(montage_engine PRIVATE montage_thorvg)
+  target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_THORVG)
+endif()
+
 if(MONTAGE_WITH_RNNOISE)
   target_link_libraries(montage_engine PRIVATE montage_rnnoise)
   target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_RNNOISE)

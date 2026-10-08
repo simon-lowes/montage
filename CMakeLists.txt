@@ -21,6 +21,7 @@ option(MONTAGE_BUILD_TESTS "Build the Montage test suite" ON)
 option(MONTAGE_WITH_VST3 "Host VST3 audio plugins (VST 3 SDK, MIT, vendored)" ON)
 option(MONTAGE_WITH_WHISPER "Speech-to-text with whisper.cpp (MIT, fetched at configure time)" ON)
 option(MONTAGE_WITH_RNNOISE "Voice isolation with RNNoise (BSD, fetched with its model at configure time)" ON)
+option(MONTAGE_WITH_THORVG "Lottie animations and SVG graphics with ThorVG (MIT, fetched at configure time)" ON)
 option(MONTAGE_WITH_LV2 "Host LV2 audio plugins, when lilv is installed" ON)
 option(MONTAGE_WITH_OCIO "OpenColorIO configs and ACES transforms, when OpenColorIO 2.1+ is installed" ON)
 option(MONTAGE_WITH_ONNXRUNTIME "AI object masks (EdgeTAM), when ONNX Runtime 1.16+ is installed (ONNXRUNTIME_ROOT or the usual prefixes)" ON)
@@ -96,6 +97,55 @@ if(MONTAGE_WITH_RNNOISE)
   if(NOT WIN32)
     target_link_libraries(montage_rnnoise PRIVATE m)
   endif()
+endif()
+
+if(MONTAGE_WITH_THORVG)
+  include(FetchContent)
+  # ThorVG builds with Meson; its sources are compiled here instead, with the
+  # CPU renderer and the Lottie (with expressions), SVG, font, PNG and JPEG loaders.
+  FetchContent_Declare(thorvg
+    GIT_REPOSITORY https://github.com/thorvg/thorvg.git
+    GIT_TAG b004a778f53a5df61f06be45748761ae42c52dda  # v1.1.2
+    SOURCE_SUBDIR no-cmake)
+  FetchContent_MakeAvailable(thorvg)
+  set(TVG ${thorvg_SOURCE_DIR}/src)
+  file(GLOB_RECURSE MONTAGE_THORVG_SOURCES
+    ${TVG}/common/*.cpp ${TVG}/renderer/*.cpp
+    ${TVG}/loaders/raw/*.cpp ${TVG}/loaders/svg/*.cpp ${TVG}/loaders/sfnt/*.cpp
+    ${TVG}/loaders/png/*.cpp ${TVG}/loaders/jpg/*.cpp ${TVG}/loaders/lottie/*.cpp)
+  list(FILTER MONTAGE_THORVG_SOURCES EXCLUDE REGEX "/renderer/gpu_engine/")
+  file(WRITE ${CMAKE_BINARY_DIR}/thorvg/config.h
+    "#define THORVG_VERSION_STRING \"1.1.2\"\n"
+    "#define THORVG_THREAD_SUPPORT 1\n"
+    "#define THORVG_CPU_ENGINE_SUPPORT 1\n"
+    "#define THORVG_PARTIAL_RENDER_SUPPORT 1\n"
+    "#define THORVG_SVG_LOADER_SUPPORT 1\n"
+    "#define THORVG_PNG_LOADER_SUPPORT 1\n"
+    "#define THORVG_JPG_LOADER_SUPPORT 1\n"
+    "#define THORVG_LOTTIE_LOADER_SUPPORT 1\n"
+    "#define THORVG_LOTTIE_EXPRESSIONS_SUPPORT 1\n"
+    "#define THORVG_SFNT_LOADER_SUPPORT 1\n"
+    "#define THORVG_TTF_LOADER_SUPPORT 1\n"
+    "#define THORVG_OTF_LOADER_SUPPORT 1\n"
+    "#define THORVG_FILE_IO_SUPPORT 1\n"
+    "#define WIN32_LEAN_AND_MEAN 1\n")
+  add_library(montage_thorvg STATIC ${MONTAGE_THORVG_SOURCES})
+  # The include directories Meson gives each part.
+  set(JERRY ${TVG}/loaders/lottie/jerryscript)
+  target_include_directories(montage_thorvg
+    PUBLIC ${thorvg_SOURCE_DIR}/inc
+    PRIVATE ${CMAKE_BINARY_DIR}/thorvg ${TVG}/common ${TVG}/renderer ${TVG}/renderer/cpu_engine ${TVG}/loaders
+      ${TVG}/loaders/raw ${TVG}/loaders/svg ${TVG}/loaders/sfnt ${TVG}/loaders/png ${TVG}/loaders/jpg ${TVG}/loaders/lottie
+      ${JERRY}/jerry-port/common ${JERRY}/jerry-core/api ${JERRY}/jerry-core/include ${JERRY}/jerry-core/ecma/base
+      ${JERRY}/jerry-core/ecma/builtin-objects ${JERRY}/jerry-core/ecma/builtin-objects/typedarray
+      ${JERRY}/jerry-core/ecma/operations ${JERRY}/jerry-core/jcontext ${JERRY}/jerry-core/jmem ${JERRY}/jerry-core/jrt
+      ${JERRY}/jerry-core/lit ${JERRY}/jerry-core/parser/js ${JERRY}/jerry-core/parser/regexp ${JERRY}/jerry-core/vm)
+  target_compile_definitions(montage_thorvg PUBLIC TVG_STATIC PRIVATE $<$<BOOL:${WIN32}>:NOMINMAX>)
+  set_target_properties(montage_thorvg PROPERTIES POSITION_INDEPENDENT_CODE ON CXX_VISIBILITY_PRESET hidden
+    AUTOMOC OFF AUTOUIC OFF AUTORCC OFF CXX_STANDARD 14)
+  target_compile_options(montage_thorvg PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-w -O2> $<$<CXX_COMPILER_ID:MSVC>:/w /O2>)
+  find_package(Threads REQUIRED)
+  target_link_libraries(montage_thorvg PRIVATE Threads::Threads)
 endif()
 
 add_subdirectory(src)

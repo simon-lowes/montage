@@ -22,6 +22,8 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error = nu
 
 // Frame-accurate video decoder. Not thread safe: use one per thread
 // (MediaPool hands them out).
+class VectorDocument;
+
 class VideoDecoder {
 public:
     VideoDecoder();
@@ -31,7 +33,7 @@ public:
 
     bool open(const std::string& path, std::string* error = nullptr);
     void close();
-    bool isOpen() const { return ctx_ != nullptr; }
+    bool isOpen() const { return ctx_ != nullptr || vector_ != nullptr; }
 
     // Frame displayed at media time `t` (seconds from the start of the file),
     // converted to RGBA16 at exactly targetW x targetH (0 = native display size).
@@ -85,6 +87,7 @@ private:
     bool hwBroken_ = false;
     std::string hwName_;
     AVFrame* hwTransfer_ = nullptr;
+    std::shared_ptr<VectorDocument> vector_;  // a Lottie animation or SVG, rendered instead of decoded
 };
 
 struct AudioBuffer {

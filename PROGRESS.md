@@ -481,6 +481,17 @@ The second gap analysis (`docs/research/phase3-roadmap.md`, October 2026) ranks 
     - synthetic footage moving (2, 1) px a frame with σ 0.04: measured within 20 %; temporal −8.6 dB, spatial −8.3 dB, both −12.2 dB; without motion compensation there is less gain but no ghosting; edges keep 98 % of their step; chained motion within 0.35 px; reuse is checked;
     - ProRes film-grain footage through the compositor: neighbours used (including at the first frame), the colour unchanged, and the mask respected.
   - Left out: a learned denoiser (no permissively licensed video model is small enough yet) and GPU kernels (the compositor is still on the CPU; see Phase 2 #15).
-- [ ] 13. Shape layers and Lottie motion graphics (M)
+- [x] 13. Shape layers and Lottie motion graphics (M):
+  - **Shape generator** (render/Shapes, QPainter): rectangle (rounded), ellipse, polygon, star (inner radius), line and arrow; solid, linear or radial gradient fill; a stroke with round, sharp or bevelled corners and dashes; opacity. Every value is keyframeable.
+  - **Trim paths:** the outline is flattened at output resolution and cut by length. On closed paths the offset wraps across the start point, as in After Effects. A trimmed fill closes its open run.
+  - **Shape tests:** areas match the formulas within 1–1.5 % (rectangle, ellipse, rounded rectangle, hexagon, star); trims, offset across the join, dashes, gradients, rotation, opacity and a keyframed draw-on are checked.
+  - **Lottie and SVG** (media/Vector) through ThorVG 1.1.2 (MIT, the dotLottie engine). It is compiled from source in CMake: the CPU renderer, and the Lottie (with JerryScript expressions), SVG, font, PNG and JPEG loaders.
+    - `VideoDecoder` opens `.svg` and Lottie `.json` files (sniffed by `fr`/`ip`/`op`) and renders each frame at the size asked for, straight alpha. So the timeline, thumbnails, proxies, effects, tracking and analysis all take them like footage. `probeMedia` gives a Lottie its size, frame rate and length, and an SVG its size as a still.
+    - Tests: a hand-written Lottie lands within 1.5 px of where it should at 1 s, stays sharp drawn twice as large, and holds its last frame; an SVG keeps 1-px edges at ten times its size; both composite over a background, and the Lottie is placed through MCP.
+  - MCP `montage_add_shape` (40 tools): shape, size, position, rotation, fill or gradient, stroke, roundness, points and `draw_on` seconds. Lottie and SVG files go through `montage_place_media`.
+  - Left out:
+    - `.lottie` (dotLottie zip) files: ThorVG reads only the JSON, and unzipping them needs a ZIP reader.
+    - Lottie text with fonts that are not embedded.
+    - Editable vector paths drawn with a pen tool: the shape set covers the common motion graphics.
 - [ ] 14. AI upscaling (M)
 - [ ] 15. AAF export to Pro Tools and Fairlight (L)

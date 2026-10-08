@@ -1,3 +1,4 @@
+#include "Vector.h"
 #include "Decoder.h"
 
 #include <algorithm>
@@ -97,6 +98,29 @@ AVPixelFormat dejpeg(AVPixelFormat f, bool& fullRange) {
 // Probe
 
 bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
+    if (isVectorPath(path)) {
+        VectorInfo vi;
+        if (!openVector(path, vi, error)) return false;
+        MediaItem m = out;
+        m.path = path;
+        if (m.name.empty()) m.name = path.substr(path.find_last_of("/\\") + 1);
+        m.hasVideo = true;
+        m.hasAudio = false;
+        m.width = vi.width;
+        m.height = vi.height;
+        m.videoCodec = vi.animated ? "lottie" : "svg";
+        if (vi.animated) {
+            m.kind = MediaKind::Video;
+            m.duration = vi.duration;
+            const double f = vi.fps;
+            m.fps = std::fabs(f - std::round(f)) < 1e-3 ? Rational{int(std::lround(f)), 1} : Rational{int(std::lround(f * 1001)), 1001};
+        } else {
+            m.kind = MediaKind::Image;
+            m.duration = 0;
+        }
+        out = m;
+        return true;
+    }
     AVFormatContext* fmt = nullptr;
     int rc = avformat_open_input(&fmt, path.c_str(), nullptr, nullptr);
     if (rc < 0) {
@@ -217,11 +241,26 @@ void VideoDecoder::close() {
     if (fmt_) avformat_close_input(&fmt_);
     haveCur_ = haveNext_ = false;
     stillFrame_.reset();
+    vector_.reset();
 }
 
 bool VideoDecoder::open(const std::string& path, std::string* error) {
     close();
     path_ = path;
+    if (isVectorPath(path)) {
+        VectorInfo vi;
+        vector_ = openVector(path, vi, error);
+        if (!vector_) return false;
+        dispW_ = vi.width;
+        dispH_ = vi.height;
+        fps_ = vi.animated ? vi.fps : 25.0;
+        duration_ = vi.duration;
+        still_ = !vi.animated;
+        rotation_ = 0;
+        origin_ = 0;
+        curPts_ = nextPts_ = -1;
+        return true;
+    }
     int rc = avformat_open_input(&fmt_, path.c_str(), nullptr, nullptr);
     if (rc < 0) {
         if (error) *error = "Cannot open " + path + ": " + averr(rc);
@@ -452,6 +491,11 @@ Frame16Ptr VideoDecoder::convert(const AVFrame* f, double pts, int w, int h, boo
 }
 
 Frame16Ptr VideoDecoder::frameAt(double t, int targetW, int targetH, bool highQuality) {
+    if (vector_) {
+        Frame16Ptr f = renderVector(*vector_, t, targetW, targetH);
+        if (f) curPts_ = f->pts;
+        return f;
+    }
     if (hwBroken_) {
         // A hardware frame could not be read back: continue in software.
         hwBroken_ = false;

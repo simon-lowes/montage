@@ -41,7 +41,9 @@
 #include "ScriptCutDialog.h"
 #include "core/KeyframeEdit.h"
 #include "core/MediaLog.h"
+#include "InspectorWidget.h"
 #include "SequenceSettingsDialog.h"
+#include "media/Vector.h"
 #include "SurroundPanner.h"
 #include "audio/Plugins.h"
 #include "MainWindow.h"
@@ -667,6 +669,51 @@ private slots:
             ExportDialog ed(state(), win_.get());
             QVERIFY(ed.findChild<QComboBox*>("exportAudioChannels")->isHidden());
         }
+    }
+
+    void shapeLayersAndLottieInTheApp() {
+        state()->newProject();
+        // A Shape from the Effects browser lands at the playhead, selected, with its settings in the Inspector.
+        auto* browser = win_->findChild<EffectsBrowser*>();
+        QVERIFY(browser);
+        bool listed = false;
+        for (QTreeWidgetItem* item : browser->findChild<QTreeWidget*>()->findItems("Shape", Qt::MatchRecursive))
+            listed |= item->data(0, Qt::UserRole).toString() == "shape";
+        QVERIFY(listed);
+        emit browser->applyRequested("shape", EffectCategory::Generator);
+        const Clip* c = state()->primaryClip();
+        QVERIFY(c && c->generator.type == "shape");
+        QApplication::processEvents();
+        auto* inspector = win_->findChild<InspectorWidget*>();
+        QVERIFY(inspector);
+        bool trim = false;
+        for (auto* l : inspector->findChildren<QLabel*>()) trim |= l->text().startsWith("Trim End") && l->isVisibleTo(inspector);
+        QVERIFY(trim);
+        // It renders in the viewer's frame: the default 400 x 300 amber rectangle in the middle.
+        const Image frame = renderSequenceFrame(state()->project(), *state()->sequence(), c->start, {});
+        const float* mid = frame.at(frame.width / 2, frame.height / 2);
+        QVERIFY(mid[0] > 0.9f && mid[1] > 0.7f && mid[2] < 0.15f);
+        // A Lottie file imports as footage with its length and frame rate.
+        const QString json = dir_.path() + "/pulse.json";
+        {
+            QFile f(json);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(R"({"v":"5.7.4","fr":25,"ip":0,"op":50,"w":100,"h":100,"nm":"pulse","ddd":0,"assets":[],
+                "layers":[{"ddd":0,"ind":1,"ty":4,"nm":"dot","sr":1,"ao":0,"ip":0,"op":50,"st":0,"bm":0,
+                "ks":{"o":{"a":0,"k":100},"r":{"a":0,"k":0},"a":{"a":0,"k":[0,0,0]},"p":{"a":0,"k":[50,50,0]},
+                  "s":{"a":1,"k":[{"t":0,"s":[50,50,100],"o":{"x":[0],"y":[0]},"i":{"x":[1],"y":[1]}},{"t":50,"s":[100,100,100]}]}},
+                "shapes":[{"ty":"el","nm":"e","d":1,"s":{"a":0,"k":[60,60]},"p":{"a":0,"k":[0,0]}},
+                          {"ty":"fl","nm":"f","c":{"a":0,"k":[0,0.6,1,1]},"o":{"a":0,"k":100},"r":1}]}]})");
+        }
+        if (vectorSupport()) {
+            const auto ids = state()->importFiles({json});
+            QCOMPARE(ids.size(), size_t(1));
+            const MediaItem* m = state()->project().findMedia(ids[0]);
+            QVERIFY(m && m->kind == MediaKind::Video && m->hasVideo && !m->hasAudio);
+            QVERIFY(std::fabs(m->duration - 2.0) < 1e-6);
+            QCOMPARE(m->fps.num, 25);
+        }
+        state()->newProject();
     }
 
     void renderAndReplaceInTheTimeline() {

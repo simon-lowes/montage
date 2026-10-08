@@ -17,6 +17,7 @@
 #include "render/Ocio.h"
 #include "render/Processing.h"
 #include "render/RenderCache.h"
+#include "render/Shapes.h"
 #include "render/VideoDenoise.h"
 #include "render/VideoFx.h"
 #include <random>
@@ -1344,6 +1345,106 @@ colorspaces:
         QVERIFY2(std::fabs(px[0] - 0.6f) < 0.03f && px[1] < 0.05f, qPrintable(QString::number(px[0])));
         QVERIFY(w.at(100, 100)[0] < 0.01f);
         QVERIFY(!BurnIn{}.any() && tc.any() && wm.any());
+    }
+
+    void shapeLayers() {
+        const int W = 400, H = 300;
+        auto make = [](int shape, double w, double h) {
+            Effect e = makeEffect("shape", 1);
+            e.params["shape"] = Param(double(shape));
+            e.params["width"] = Param(w);
+            e.params["height"] = Param(h);
+            e.params["fill_color.r"] = Param(1.0);
+            e.params["fill_color.g"] = Param(0.0);
+            e.params["fill_color.b"] = Param(0.0);
+            return e;
+        };
+        // Coverage in pixels (alpha summed, so anti-aliased edges count by how much they are covered).
+        auto area = [](const Image& img) {
+            double a = 0;
+            for (size_t i = 3; i < img.px.size(); i += 4) a += img.px[i];
+            return a;
+        };
+        auto near = [](double got, double want, double tol) { return std::fabs(got - want) <= tol * want; };
+        // Areas against the formulas.
+        const Image rect = renderGenerator(make(0, 100, 50), 0, W, H, 1.0);
+        QVERIFY2(near(area(rect), 5000, 0.01), qPrintable(QString::number(area(rect))));
+        QVERIFY(rect.at(200, 150)[0] > 0.99f && rect.at(200, 150)[3] > 0.99f && rect.at(260, 150)[3] < 0.01f);
+        QVERIFY2(near(area(renderGenerator(make(1, 100, 50), 0, W, H, 1.0)), M_PI * 50 * 25, 0.01), "ellipse");
+        Effect rounded = make(0, 200, 100);
+        rounded.params["roundness"] = Param(20.0);
+        QVERIFY2(near(area(renderGenerator(rounded, 0, W, H, 1.0)), 200 * 100 - (4 - M_PI) * 400, 0.01), "rounded rectangle");
+        Effect hexagon = make(2, 200, 200);
+        hexagon.params["points"] = Param(6.0);
+        QVERIFY2(near(area(renderGenerator(hexagon, 0, W, H, 1.0)), 1.5 * std::sqrt(3.0) * 100 * 100, 0.01), "hexagon");
+        Effect star = make(3, 200, 200);
+        star.params["inner"] = Param(50.0);
+        QVERIFY2(near(area(renderGenerator(star, 0, W, H, 1.0)), 5 * 100 * 50 * std::sin(M_PI / 5), 0.015), "star");
+        // Drawn at the output's scale: half size is a quarter of the area.
+        QVERIFY(near(area(renderGenerator(make(0, 100, 50), 0, W / 2, H / 2, 0.5)), 1250, 0.02));
+        // Rotated a quarter turn, moved and see-through.
+        Effect turned = make(0, 100, 20);
+        turned.params["rotation"] = Param(90.0);
+        turned.params["pos_x"] = Param(-100.0);
+        turned.params["opacity"] = Param(50.0);
+        const Image tu = renderGenerator(turned, 0, W, H, 1.0);
+        QVERIFY(std::fabs(tu.at(100, 110)[3] - 0.5f) < 0.01f && tu.at(100, 110)[0] > 0.49f);  // straight up and down now
+        QVERIFY(tu.at(140, 150)[3] < 0.01f);
+        // A linear gradient left to right, and a radial one from the middle.
+        Effect grad = make(0, 300, 100);
+        grad.params["gradient"] = Param(1.0);
+        grad.params["fill_color2.r"] = Param(0.0);
+        grad.params["fill_color2.g"] = Param(0.0);
+        grad.params["fill_color2.b"] = Param(1.0);
+        const Image gi = renderGenerator(grad, 0, W, H, 1.0);
+        QVERIFY(gi.at(52, 150)[0] > 0.97f && gi.at(347, 150)[2] > 0.97f && std::fabs(gi.at(200, 150)[0] - 0.5f) < 0.02f);
+        grad.params["gradient"] = Param(2.0);
+        const Image ri = renderGenerator(grad, 0, W, H, 1.0);
+        QVERIFY(ri.at(200, 150)[0] > 0.98f && ri.at(340, 150)[2] > ri.at(340, 150)[0]);
+
+        // Outlines: a 4 px stroke round a 200 x 100 rectangle, no fill: about 600 px long.
+        Effect outline = make(0, 200, 100);
+        outline.params["fill"] = Param(0.0);
+        outline.params["stroke"] = Param(4.0);
+        outline.params["join"] = Param(1.0);  // sharp corners, flat ends
+        const double full = area(renderGenerator(outline, 0, W, H, 1.0));
+        QVERIFY2(near(full, 600 * 4, 0.02), qPrintable(QString::number(full)));
+        // Trimmed to its first half, and to a quarter moved round by an offset.
+        outline.params["trim_end"] = Param(50.0);
+        QVERIFY2(near(area(renderGenerator(outline, 0, W, H, 1.0)), full / 2, 0.03), "trim to half");
+        outline.params["trim_start"] = Param(25.0);
+        outline.params["trim_offset"] = Param(270.0);  // three quarters round: 25-50 % becomes 100-125 %, across the join
+        const double quarter = area(renderGenerator(outline, 0, W, H, 1.0));
+        QVERIFY2(near(quarter, full / 4, 0.04), qPrintable(QString::number(quarter / full)));
+        // Dashes: 12 on, 12 off is half the ink.
+        outline.params["trim_start"] = Param(0.0);
+        outline.params["trim_end"] = Param(100.0);
+        outline.params["trim_offset"] = Param(0.0);
+        outline.params["dash"] = Param(12.0);
+        outline.params["gap"] = Param(12.0);
+        QVERIFY2(near(area(renderGenerator(outline, 0, W, H, 1.0)), full / 2, 0.06), "dashes");
+        // trimPath on its own: lengths add up, and nothing is left when start meets end.
+        QPainterPath line;
+        line.moveTo(0, 0);
+        line.lineTo(100, 0);
+        QCOMPARE(trimPath(line, 0.2, 0.7, 0).length(), 50.0);
+        QCOMPARE(trimPath(line, 0.6, 0.9, 0.2).length(), 20.0);  // an open path stops at its end
+        QVERIFY(trimPath(line, 0.5, 0.5, 0).isEmpty());
+
+        // Keyframed Trim End draws a line on over the clip; an arrow points right.
+        Effect drawOn = make(4, 200, 10);
+        drawOn.params["stroke"] = Param(6.0);
+        drawOn.params["join"] = Param(1.0);
+        Param te;
+        te.addKey(0, 0.0);
+        te.addKey(30, 100.0);
+        drawOn.params["trim_end"] = te;
+        QCOMPARE(area(renderGenerator(drawOn, 0, W, H, 1.0)), 0.0);
+        QVERIFY(near(area(renderGenerator(drawOn, 15, W, H, 1.0)), 100 * 6, 0.03));
+        QVERIFY(near(area(renderGenerator(drawOn, 30, W, H, 1.0)), 200 * 6, 0.03));
+        const Image arrow = renderGenerator(make(5, 200, 60), 0, W, H, 1.0);
+        QVERIFY(arrow.at(296, 150)[3] > 0.9f && arrow.at(296, 130)[3] < 0.1f);  // the tip, narrow
+        QVERIFY(arrow.at(245, 128)[3] > 0.9f && arrow.at(150, 128)[3] < 0.1f);  // the head is wide, the shaft is not
     }
 
     void videoNoiseReduction() {

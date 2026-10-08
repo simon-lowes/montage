@@ -340,6 +340,24 @@ std::vector<EffectInfo> buildCatalog() {
                   angle("angle", "Angle", 90), choice("shape", "Shape", {"Linear", "Radial"})},
                  {}});
     c.push_back({"bars", "Color Bars", EffectCategory::Generator, "Generators", {}, {}});
+    // Shape layers: every value keyframeable; Trim End from 0 to 100 % draws the outline on.
+    c.push_back({"shape", "Shape", EffectCategory::Generator, "Generators",
+                 {choice("shape", "Shape", {"Rectangle", "Ellipse", "Polygon", "Star", "Line", "Arrow"}, 0),
+                  num("width", "Width (px)", 1, 8000, 400, 1), num("height", "Height (px)", 1, 8000, 300, 1),
+                  num("pos_x", "Position X", -8000, 8000, 0, 1), num("pos_y", "Position Y", -8000, 8000, 0, 1),
+                  angle("rotation", "Rotation", 0), num("roundness", "Corner Roundness (px)", 0, 4000, 0, 0.5),
+                  num("points", "Sides / Points", 3, 64, 5, 1), pct("inner", "Star Inner Radius", 1, 100, 45),
+                  boolean("fill", "Fill", true), color("fill_color", "Fill Color", 0.95, 0.75, 0.1),
+                  pct("fill_opacity", "Fill Opacity", 0, 100, 100),
+                  choice("gradient", "Fill Gradient", {"None", "Linear", "Radial"}, 0),
+                  color("fill_color2", "Gradient End Color", 0.9, 0.2, 0.4), angle("gradient_angle", "Gradient Angle", 0),
+                  num("stroke", "Stroke Width (px)", 0, 500, 0, 0.5), color("stroke_color", "Stroke Color", 1, 1, 1),
+                  pct("stroke_opacity", "Stroke Opacity", 0, 100, 100),
+                  choice("join", "Corners and Ends", {"Round", "Sharp", "Bevelled"}, 0),
+                  num("dash", "Dash (px, 0 solid)", 0, 2000, 0, 0.5), num("gap", "Dash Gap (px)", 0, 2000, 10, 0.5),
+                  pct("trim_start", "Trim Start", 0, 100, 0), pct("trim_end", "Trim End", 0, 100, 100),
+                  angle("trim_offset", "Trim Offset", 0), pct("opacity", "Opacity", 0, 100, 100)},
+                 {}});
     // Its effects, opacity and blend mode apply to everything on the tracks below it.
     c.push_back({"adjustment", "Adjustment Layer", EffectCategory::Generator, "Generators", {}, {}});
     {

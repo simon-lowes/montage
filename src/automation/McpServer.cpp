@@ -1,6 +1,7 @@
 #include "McpServer.h"
 
 #include <QBuffer>
+#include <QColor>
 #include <QFile>
 #include <QFileInfo>
 #include <QImage>
@@ -603,6 +604,78 @@ void McpServer::Impl::addTools() {
             save(l);
             const Clip* made = r.created.empty() ? nullptr : edit::clipById(s, r.created[0]);
             return ok(QStringLiteral("Added a title on %1").arg(QString::fromStdString(trackAt(s, t)->name)),
+                      made ? clipJson(l.project, s, *made) : QJsonObject{});
+        });
+
+    add("montage_add_shape", "Add a shape",
+        "Add a shape layer over the picture: a rectangle, ellipse, polygon, star, line or arrow, filled (a colour, or a "
+        "gradient to a second colour) and/or outlined. Sizes and positions are in sequence pixels, from the centre. "
+        "draw_on animates the outline drawing itself on over that many seconds (Trim End keyframed 0 to 100 %). Lottie "
+        "animations (.json) and SVG graphics are placed like other media, with montage_place_media.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "shape":{"type":"string","enum":["rectangle","ellipse","polygon","star","line","arrow"],"default":"rectangle"},
+            "at":{"type":["number","string"]},"duration":{"type":["number","string"],"default":3},"track":{"type":"string"},
+            "width":{"type":"number","default":400},"height":{"type":"number","default":300},
+            "x":{"type":"number","default":0},"y":{"type":"number","default":0},"rotation":{"type":"number","default":0},
+            "fill":{"type":"string","description":"#rrggbb, or \"none\""},"gradient_to":{"type":"string","description":"#rrggbb"},
+            "stroke_width":{"type":"number","default":0},"stroke_color":{"type":"string","default":"#ffffff"},
+            "roundness":{"type":"number","default":0},"points":{"type":"integer","description":"Sides of a polygon, points of a star"},
+            "opacity":{"type":"number","default":100},"draw_on":{"type":"number","description":"Seconds"}},
+            "required":["project","at"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            TrackRef t{TrackKind::Video, 0};
+            if (a.contains("track")) t = trackArg(str(a, "track"), s, true, &l.project, &s);
+            else {
+                int top = -1;
+                for (int i = 0; i < int(s.videoTracks.size()); ++i)
+                    if (!s.videoTracks[size_t(i)].clips.empty()) top = i;
+                t = top + 1 < int(s.videoTracks.size()) ? TrackRef{TrackKind::Video, top + 1} : edit::addTrack(l.project, s, TrackKind::Video);
+            }
+            static const QStringList shapes = {"rectangle", "ellipse", "polygon", "star", "line", "arrow"};
+            const int kind = int(shapes.indexOf(str(a, "shape", "rectangle")));
+            if (kind < 0) throw ArgError{QStringLiteral("\"shape\" must be one of %1").arg(shapes.join(", "))};
+            const FrameTime len = a.contains("duration") ? timeArg(a.value("duration"), s, "duration") : FrameTime(std::llround(3 * s.fpsValue()));
+            Clip c = makeGeneratorClip(l.project, "shape", std::max<FrameTime>(1, len));
+            Effect& g = c.generator;
+            auto setColor = [&](const char* name, const QString& hex) {
+                const QColor col(hex);
+                if (!col.isValid()) throw ArgError{QStringLiteral("\"%1\" is not a colour (use #rrggbb)").arg(hex)};
+                g.params[std::string(name) + ".r"] = Param(col.redF());
+                g.params[std::string(name) + ".g"] = Param(col.greenF());
+                g.params[std::string(name) + ".b"] = Param(col.blueF());
+            };
+            g.params["shape"] = Param(double(kind));
+            for (const char* k : {"width", "height", "rotation", "roundness", "opacity"})
+                if (a.value(k).isDouble()) g.params[k] = Param(a.value(k).toDouble());
+            if (a.value("x").isDouble()) g.params["pos_x"] = Param(a.value("x").toDouble());
+            if (a.value("y").isDouble()) g.params["pos_y"] = Param(a.value("y").toDouble());
+            if (a.value("points").isDouble()) g.params["points"] = Param(double(std::clamp(a.value("points").toInt(), 3, 64)));
+            if (a.contains("fill")) {
+                if (str(a, "fill") == "none") g.params["fill"] = Param(0.0);
+                else setColor("fill_color", str(a, "fill"));
+            }
+            if (a.contains("gradient_to")) {
+                setColor("fill_color2", str(a, "gradient_to"));
+                g.params["gradient"] = Param(1.0);
+            }
+            if (a.value("stroke_width").isDouble()) g.params["stroke"] = Param(std::max(0.0, a.value("stroke_width").toDouble()));
+            if (a.contains("stroke_color")) setColor("stroke_color", str(a, "stroke_color"));
+            if (a.value("draw_on").isDouble()) {
+                const FrameTime over = std::max<FrameTime>(1, FrameTime(std::llround(a.value("draw_on").toDouble() * s.fpsValue())));
+                Param p;
+                p.addKey(0, 0.0);
+                p.addKey(std::min(over, c.duration - 1), 100.0);
+                g.params["trim_end"] = p;
+            }
+            c.start = timeArg(a.value("at"), s, "at");
+            c.name = findEffectInfo("shape")->params[0].choices[size_t(kind)];
+            const auto r = edit::overwrite(l.project, s, t, c);
+            check(r);
+            save(l);
+            const Clip* made = r.created.empty() ? nullptr : edit::clipById(s, r.created[0]);
+            return ok(QStringLiteral("Added a %1 on %2").arg(shapes[kind], QString::fromStdString(trackAt(s, t)->name)),
                       made ? clipJson(l.project, s, *made) : QJsonObject{});
         });
 

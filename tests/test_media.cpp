@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <random>
 #include <sstream>
@@ -34,6 +35,7 @@
 #include "media/MediaPool.h"
 #include "media/SpeakerSwitch.h"
 #include "media/Tracking.h"
+#include "media/Vector.h"
 #include "media/Beats.h"
 #include "render/AudioFx.h"
 #include "render/AutoMix.h"
@@ -688,6 +690,152 @@ private slots:
         QCOMPARE(stemList.size(), 2);
         QVERIFY(probeMedia(stemList[1].toObject().value("path").toString().toStdString(), out));
         QCOMPARE(out.channels, 2);  // the stems follow the fold-down
+    }
+
+    void lottieAndSvgMedia() {
+        if (!vectorSupport()) QSKIP("Built without ThorVG");
+        // A 200x100 Lottie: a 20 px red square moving from x 20 to x 180 over 2 s at 30 fps, linearly.
+        const std::string lottie = path("box.json");
+        {
+            std::ofstream f(lottie);
+            f << R"({"v":"5.7.4","fr":30,"ip":0,"op":60,"w":200,"h":100,"nm":"box","ddd":0,"assets":[],
+              "layers":[{"ddd":0,"ind":1,"ty":4,"nm":"box","sr":1,"ao":0,"ip":0,"op":60,"st":0,"bm":0,
+                "ks":{"o":{"a":0,"k":100},"r":{"a":0,"k":0},"a":{"a":0,"k":[0,0,0]},"s":{"a":0,"k":[100,100,100]},
+                  "p":{"a":1,"k":[{"t":0,"s":[20,50,0],"o":{"x":[0],"y":[0]},"i":{"x":[1],"y":[1]}},{"t":60,"s":[180,50,0]}]}},
+                "shapes":[{"ty":"gr","nm":"g","it":[
+                  {"ty":"rc","nm":"r","d":1,"s":{"a":0,"k":[20,20]},"p":{"a":0,"k":[0,0]},"r":{"a":0,"k":0}},
+                  {"ty":"fl","nm":"f","c":{"a":0,"k":[1,0,0,1]},"o":{"a":0,"k":100},"r":1},
+                  {"ty":"tr","p":{"a":0,"k":[0,0]},"a":{"a":0,"k":[0,0]},"s":{"a":0,"k":[100,100]},"r":{"a":0,"k":0},"o":{"a":0,"k":100}}]}]}]})";
+        }
+        QVERIFY(isVectorPath(lottie));
+        const std::string notLottie = path("settings.json");
+        {
+            std::ofstream f(notLottie);
+            f << R"({"name": "not an animation"})";
+        }
+        QVERIFY(!isVectorPath(notLottie));
+        MediaItem m;
+        std::string err;
+        QVERIFY2(probeMedia(lottie, m, &err), err.c_str());
+        QVERIFY(m.kind == MediaKind::Video && m.hasVideo && !m.hasAudio);
+        QCOMPARE(m.width, 200);
+        QCOMPARE(m.height, 100);
+        QCOMPARE(m.fps.num, 30);
+        QCOMPARE(m.fps.den, 1);
+        QVERIFY(std::fabs(m.duration - 2.0) < 1e-6);
+        // Where the red is, and that the rest is transparent.
+        auto redCentre = [](const Frame16& f) {
+            double sx = 0, n = 0;
+            for (int y = 0; y < f.height; ++y)
+                for (int x = 0; x < f.width; ++x) {
+                    const uint16_t* p = &f.px[(size_t(y) * size_t(f.width) + size_t(x)) * 4];
+                    if (p[3] > 32768 && p[0] > 60000 && p[1] < 5000) sx += x, ++n;
+                }
+            return n > 0 ? sx / n : -1.0;
+        };
+        VideoDecoder dec;
+        QVERIFY2(dec.open(lottie, &err), err.c_str());
+        QVERIFY(!dec.isStill());
+        QCOMPARE(dec.displayWidth(), 200);
+        Frame16Ptr f0 = dec.frameAt(0.0), f1 = dec.frameAt(1.0);
+        QVERIFY(f0 && f1);
+        QVERIFY2(std::fabs(redCentre(*f0) - 20) < 1.5, qPrintable(QString::number(redCentre(*f0))));
+        QVERIFY2(std::fabs(redCentre(*f1) - 100) < 1.5, qPrintable(QString::number(redCentre(*f1))));
+        QCOMPARE(int(f1->px[(size_t(5) * 200 + 5) * 4 + 3]), 0);
+        // Drawn at the size it is shown: twice as big, the square is still sharp and in the same place.
+        Frame16Ptr big = dec.frameAt(1.0, 400, 200);
+        QVERIFY(big && big->width == 400);
+        QVERIFY2(std::fabs(redCentre(*big) - 200) < 2, qPrintable(QString::number(redCentre(*big))));
+        int soft = 0;
+        for (int x = 0; x < 400; ++x) {
+            const uint16_t a = big->px[(size_t(100) * 400 + size_t(x)) * 4 + 3];
+            if (a > 2000 && a < 63000) ++soft;
+        }
+        QVERIFY2(soft <= 2, qPrintable(QString::number(soft)));  // an edge each side, at most a pixel wide
+        // Past the end it holds the last frame.
+        Frame16Ptr end = dec.frameAt(5.0);
+        QVERIFY(end && redCentre(*end) > 175);
+
+        // An SVG: a still, sharp at ten times its size.
+        const std::string svg = path("dot.svg");
+        {
+            std::ofstream f(svg);
+            f << R"(<svg xmlns="http://www.w3.org/2000/svg" width="64" height="32" viewBox="0 0 64 32">)"
+                 R"(<circle cx="16" cy="16" r="10" fill="#0000ff"/></svg>)";
+        }
+        MediaItem sm;
+        QVERIFY2(probeMedia(svg, sm, &err), err.c_str());
+        QVERIFY(sm.kind == MediaKind::Image);
+        QCOMPARE(sm.width, 64);
+        QCOMPARE(sm.height, 32);
+        VideoDecoder sd;
+        QVERIFY(sd.open(svg, &err) && sd.isStill());
+        Frame16Ptr dot = sd.frameAt(0, 640, 320);
+        QVERIFY(dot);
+        const uint16_t* c = &dot->px[(size_t(160) * 640 + 160) * 4];
+        QVERIFY(c[2] > 65000 && c[0] < 500 && c[3] > 65000);
+        QCOMPARE(int(dot->px[(size_t(300) * 640 + 600) * 4 + 3]), 0);
+        int edge = 0;
+        for (int x = 0; x < 640; ++x) {
+            const uint16_t a = dot->px[(size_t(160) * 640 + size_t(x)) * 4 + 3];
+            if (a > 2000 && a < 63000) ++edge;
+        }
+        QVERIFY2(edge <= 4, qPrintable(QString::number(edge)));
+
+        // On the timeline: two seconds long, over a background, at 30 fps.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 200;
+        s.height = 100;
+        s.fps = {30, 1};
+        Clip bg = makeGeneratorClip(p, "color", 60);
+        bg.generator.params["color.r"] = Param(0.0);
+        bg.generator.params["color.g"] = Param(0.5);
+        bg.generator.params["color.b"] = Param(0.0);
+        edit::overwrite(p, s, {TrackKind::Video, 0}, bg);
+        MediaItem pm = probeOrFail(p, lottie);
+        p.media.push_back(pm);
+        QVERIFY(edit::placeMedia(p, s, pm.id, 0, 0, -1, {TrackKind::Video, 1}, {TrackKind::Audio, 0}, false).ok);
+        QCOMPARE(s.videoTracks[1].clips.at(0).duration, FrameTime(60));
+        const Image frame = renderSequenceFrame(p, s, 30, {});
+        const float* red = frame.at(100, 50);
+        const float* green = frame.at(30, 20);
+        QVERIFY(red[0] > 0.95f && red[1] < 0.05f);
+        QVERIFY(green[0] < 0.05f && std::fabs(green[1] - 0.5f) < 0.02f);
+
+        // Through MCP: the Lottie placed like any media, and a star drawn on over a second.
+        const QString project = QString::fromStdString(path("graphics.montage"));
+        QVERIFY(saveProject(makeDefaultProject(), project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call("montage_place_media", {{"project", project}, {"media", QString::fromStdString(lottie)}, {"at", 0}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        r = call("montage_add_shape", {{"project", project}, {"shape", "star"}, {"at", 0}, {"duration", 2}, {"width", 300},
+                                       {"height", 300}, {"fill", "none"}, {"stroke_width", 6}, {"stroke_color", "#ff8800"},
+                                       {"points", 6}, {"draw_on", 1.0}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(call("montage_add_shape", {{"project", project}, {"at", 0}, {"fill", "not a colour"}}).value("isError").toBool());
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Sequence& bs = *back.active();
+        QVERIFY(bs.videoTracks.size() >= 2);
+        const Clip& placed = bs.videoTracks[0].clips.at(0);
+        QCOMPARE(placed.duration, FrameTime(std::llround(2.0 * bs.fpsValue())));
+        const Clip& shape = bs.videoTracks[1].clips.at(0);
+        QCOMPARE(shape.generator.type, std::string("shape"));
+        QCOMPARE(shape.generator.p("shape", 0), 3.0);
+        QCOMPARE(shape.generator.p("points", 0), 6.0);
+        QCOMPARE(shape.generator.p("fill", 0), 0.0);
+        QCOMPARE(shape.generator.p("trim_end", 0), 0.0);
+        QCOMPARE(shape.generator.p("trim_end", FrameTime(std::llround(bs.fpsValue()))), 100.0);
+        QVERIFY(std::fabs(shape.generator.p("stroke_color.g", 0) - 0x88 / 255.0) < 1e-6);
     }
 
     void videoNoiseReductionOnFootage() {
