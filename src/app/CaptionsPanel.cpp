@@ -34,6 +34,10 @@
 
 #include "EditorState.h"
 #include "ModelPacks.h"
+#include "SpeechDialog.h"
+#include "core/EditOps.h"
+#include "media/AutoDuck.h"
+#include "media/TextToSpeech.h"
 #include "media/Translator.h"
 #include "TranscribeDialog.h"
 #include "core/History.h"
@@ -73,6 +77,7 @@ CaptionsPanel::CaptionsPanel(EditorState* state, QWidget* parent) : QWidget(pare
     menu->addAction(tr("Import SubRip / WebVTT..."), this, &CaptionsPanel::importDialog);
     menu->addAction(tr("Export Captions..."), this, &CaptionsPanel::exportDialog);
     menu->addAction(tr("Translate Track..."), this, &CaptionsPanel::translateDialog)->setObjectName(QStringLiteral("translateCaptions"));
+    menu->addAction(tr("Dub into English..."), this, &CaptionsPanel::dubDialog)->setObjectName(QStringLiteral("dubCaptions"));
     menu->addSeparator();
     menu->addAction(tr("Style..."), this, &CaptionsPanel::styleDialog);
     menu->addAction(tr("Rename Track..."), this, [this] {
@@ -368,6 +373,101 @@ void CaptionsPanel::translateDialog() {
             return;
     QString error;
     if (!translateTrack(to, &error) && !error.isEmpty()) QMessageBox::warning(this, tr("Translate Captions"), error);
+}
+
+CaptionsPanel::DubResult CaptionsPanel::dub(const std::string& voice, double duckDb, QString* error) {
+    DubResult r;
+    const CaptionTrack* src = track();
+    if (!src || src->captions.empty()) {
+        if (error) *error = tr("There are no captions to dub");
+        return r;
+    }
+    const std::string from = src->language.empty() ? "en" : src->language;
+    r.captions = from == "en" ? src->id : translateTrack("en", error);
+    if (!r.captions) return r;
+    const Sequence* s = state_->sequence();
+    int index = -1;
+    for (int i = 0; i < int(s->captionTracks.size()); ++i)
+        if (s->captionTracks[size_t(i)].id == r.captions) index = i;
+    r.clips = generateSpeech(state_, captionLines(*s, index), voice, 1.0, -1, window(), error);
+    if (r.clips.empty()) return r;
+    const auto at = edit::locate(*state_->sequence(), r.clips.front());
+    if (!at) return r;
+    r.audioTrack = at->track.index;
+    // Part of the same undo step as the speech.
+    state_->amend([&](Project&, Sequence& sq) {
+        sq.audioTracks[size_t(r.audioTrack)].name = tr("Dub (English)").toStdString();
+        if (duckDb < 0) {
+            DuckOptions o;
+            o.amountDb = std::max(-60.0, duckDb);
+            const Spans spans = clipSpans(sq, r.audioTrack, o.minPause);
+            for (int i = 0; i < int(sq.audioTracks.size()); ++i)
+                if (i != r.audioTrack)
+                    for (Clip& c : sq.audioTracks[size_t(i)].clips) r.ducked += duckClip(c, sq, spans, o) ? 1 : 0;
+        }
+        return true;
+    });
+    return r;
+}
+
+void CaptionsPanel::dubDialog() {
+    const CaptionTrack* src = track();
+    if (!src || src->captions.empty()) {
+        state_->message(tr("There are no captions to dub"));
+        return;
+    }
+    if (!translatorAvailable() || !ttsAvailable()) {
+        QMessageBox::information(this, tr("Dub into English"), tr("This build of Montage cannot dub: it was built without ONNX Runtime."));
+        return;
+    }
+    const std::string from = src->language.empty() ? "en" : src->language;
+    const auto route = from == "en" ? std::vector<const ModelPack*>{} : translationRoute(from, "en");
+    if (from != "en" && route.empty()) {
+        state_->message(tr("There is no translation from %1 to English").arg(QString::fromStdString(translationLanguageName(from))));
+        return;
+    }
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Dub into English"));
+    auto* lay = new QVBoxLayout(&dlg);
+    auto* about = new QLabel(from == "en" ? tr("Speaks \"%1\" with an AI voice on a new audio track, each caption at its time, and lowers "
+                                               "the other audio under it.")
+                                                .arg(QString::fromStdString(src->name))
+                                          : tr("Translates \"%1\" from %2 into English, speaks it with an AI voice on a new audio track, "
+                                               "each caption at its time, and lowers the other audio under it.")
+                                                .arg(QString::fromStdString(src->name), QString::fromStdString(translationLanguageName(from))),
+                             &dlg);
+    about->setWordWrap(true);
+    lay->addWidget(about);
+    auto* form = new QFormLayout;
+    auto* voice = new QComboBox(&dlg);
+    voice->setObjectName(QStringLiteral("dubVoice"));
+    for (const TtsVoice& v : ttsVoices()) voice->addItem(QString::fromStdString(v.name), QString::fromStdString(v.id));
+    form->addRow(tr("Voice:"), voice);
+    auto* duck = new QDoubleSpinBox(&dlg);
+    duck->setObjectName(QStringLiteral("dubDuck"));
+    duck->setRange(-60, 0);
+    duck->setValue(-18);
+    duck->setSuffix(tr(" dB"));
+    duck->setToolTip(tr("How far the original audio is lowered while the dub speaks (0 leaves it as it is)"));
+    form->addRow(tr("Lower the original by:"), duck);
+    lay->addLayout(form);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    buttons->button(QDialogButtonBox::Ok)->setText(tr("Dub"));
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    lay->addWidget(buttons);
+    if (dlg.exec() != QDialog::Accepted) return;
+    for (const ModelPack* pack : route)
+        if (!ensureModelPack(window(), *pack, tr("Dub into English"),
+                             tr("Translation runs on this computer with Opus-MT (University of Helsinki, CC-BY-4.0), one model per language pair.")))
+            return;
+    QString error;
+    const DubResult r = dub(voice->currentData().toString().toStdString(), duck->value(), &error);
+    if (r.clips.empty()) {
+        if (!error.isEmpty() && error != QLatin1String("Cancelled")) QMessageBox::warning(this, tr("Dub into English"), error);
+        return;
+    }
+    state_->message(tr("Dubbed %1 captions onto %2").arg(r.clips.size()).arg(QString::fromStdString(state_->sequence()->audioTracks[size_t(r.audioTrack)].name)));
 }
 
 void CaptionsPanel::addTrack() {

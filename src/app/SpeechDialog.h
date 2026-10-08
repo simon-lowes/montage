@@ -27,7 +27,7 @@ struct SpeechLine {
 };
 
 // Speaks the lines (offering the model download first, with progress) and places each at its time
-// on audio track `track`, in one undo step. Returns the new clips; empty if cancelled or failed.
+// on audio track `track` (-1: a new one), in one undo step. Returns the new clips; empty if cancelled or failed.
 std::vector<Id> generateSpeech(EditorState* state, const std::vector<SpeechLine>& lines, const std::string& voice, double speed,
                                int track, QWidget* parent, QString* error = nullptr);
 

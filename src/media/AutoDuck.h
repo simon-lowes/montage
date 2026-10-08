@@ -31,6 +31,11 @@ using Spans = std::vector<std::pair<double, double>>;  // [start, end) in timeli
 Spans dialogueSpans(const Project& p, const Sequence& s, const std::vector<int>& tracks, const DuckOptions& o,
                     std::string* error = nullptr, const std::atomic<bool>* cancel = nullptr);
 
+// The time the enabled clips on audio track `track` cover, joined across gaps
+// shorter than `minPause`: for ducking under clips whose whole length is
+// speech (a voiceover or a dub).
+Spans clipSpans(const Sequence& s, int track, double minPause);
+
 // Rewrites a clip's volume keyframes so it dips under the spans, from its
 // level at its start. A clip no span reaches loses its keyframes and keeps
 // that level. Returns whether the clip changed.

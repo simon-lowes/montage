@@ -114,8 +114,8 @@ std::vector<Id> generateSpeech(EditorState* state, const std::vector<SpeechLine>
     std::vector<Id> created;
     state->apply(QObject::tr("Generate Voiceover"), [&](Project& p, Sequence& sq) {
         edit::Result all;
-        if (sq.audioTracks.empty()) edit::addTrack(p, sq, TrackKind::Audio);
-        const TrackRef a{TrackKind::Audio, std::clamp(track, 0, int(sq.audioTracks.size()) - 1)};
+        if (sq.audioTracks.empty() || track < 0) edit::addTrack(p, sq, TrackKind::Audio);
+        const TrackRef a{TrackKind::Audio, track < 0 ? int(sq.audioTracks.size()) - 1 : std::clamp(track, 0, int(sq.audioTracks.size()) - 1)};
         for (size_t i = 0; i < lines.size(); ++i) {
             edit::Result r = edit::placeMedia(p, sq, media[i], lines[i].at, 0, -1, {TrackKind::Video, 0}, a, false);
             if (!r.ok) return r;

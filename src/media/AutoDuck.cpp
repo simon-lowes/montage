@@ -98,6 +98,15 @@ Spans dialogueSpans(const Project& p, const Sequence& s, const std::vector<int>&
     return merge(speech, std::max(o.minPause, o.fadeDown + o.fadeUp));
 }
 
+Spans clipSpans(const Sequence& s, int track, double minPause) {
+    if (track < 0 || track >= int(s.audioTracks.size())) return {};
+    const double fps = s.fpsValue();
+    Spans spans;
+    for (const Clip& c : s.audioTracks[size_t(track)].clips)
+        if (c.enabled) spans.emplace_back(double(c.start) / fps, double(c.end()) / fps);
+    return merge(std::move(spans), minPause);
+}
+
 bool duckClip(Clip& c, const Sequence& s, const Spans& spans, const DuckOptions& o) {
     const double fps = s.fpsValue();
     Param& gain = c.audio.params["gain_db"];

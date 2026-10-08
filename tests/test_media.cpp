@@ -5565,6 +5565,79 @@ private slots:
         QVERIFY(!translateTexts({"Hallo"}, "de", "en", out, {}, nullptr, &err) || translationModel("de", "en")->installed());
     }
 
+    void dubIntoEnglish() {
+        const ModelPack* deen = translationModel("de", "en");
+        QVERIFY(deen);
+        if (!translatorAvailable() || !deen->installed() || !ttsAvailable() || !ttsModel().installed())
+            QSKIP("Set MONTAGE_TRANSLATION_MODELS (with translate-de-en) and MONTAGE_TTS_MODEL to test dubbing");
+        // German captions over the original speech on A1.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = {25, 1};
+        MediaItem speech = probeOrFail(p, MONTAGE_TEST_DATA_DIR "/jfk.wav");
+        p.media.push_back(speech);
+        QVERIFY(edit::placeMedia(p, s, speech.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        CaptionTrack de;
+        de.id = p.newId();
+        de.language = "de";
+        de.captions = {{0, 50, "Hallo Welt", {}}, {150, 250, "Das Treffen beginnt morgen früh um neun Uhr.", {}}};
+        s.captionTracks.push_back(de);
+        const size_t tracks = s.audioTracks.size();
+        const QString project = QString::fromStdString(path("dub.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_dub"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call({{"project", project}, {"voice", "am_michael"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("audio_track").toString(), QStringLiteral("A%1").arg(tracks + 1));
+        Project back;
+        std::string err;
+        QVERIFY(loadProject(project.toStdString(), back, &err));
+        const Sequence& bs = *back.active();
+        // English captions, same timings, hidden.
+        QCOMPARE(bs.captionTracks.size(), size_t(2));
+        const CaptionTrack& en = bs.captionTracks[1];
+        QCOMPARE(en.language, std::string("en"));
+        QVERIFY(!en.visible);
+        QVERIFY2(QString::fromStdString(en.captions[0].text).toLower().contains("hello"), en.captions[0].text.c_str());
+        QVERIFY2(QString::fromStdString(en.captions[1].text).toLower().contains("meeting"), en.captions[1].text.c_str());
+        QCOMPARE(en.captions[1].start, FrameTime(150));
+        // Spoken at each cue on a new track, each before the next cue.
+        QCOMPARE(bs.audioTracks.size(), tracks + 1);
+        const Track& dub = bs.audioTracks[tracks];
+        QCOMPARE(dub.name, std::string("Dub (English)"));
+        QCOMPARE(dub.clips.size(), size_t(2));
+        QCOMPARE(dub.clips[0].start, FrameTime(0));
+        QCOMPARE(dub.clips[1].start, FrameTime(150));
+        QVERIFY(dub.clips[0].end() <= 152);
+        // The original dips 18 dB while the dub speaks and is back up between the lines.
+        const Clip& original = bs.audioTracks[0].clips[0];
+        const Param& gain = original.audio.params.at("gain_db");
+        QVERIFY(!gain.keys.empty());
+        QVERIFY(std::abs(gain.at(10) + 18) < 0.01);
+        QVERIFY(std::abs(gain.at(200 - original.start) + 18) < 0.01);
+        const FrameTime between = (dub.clips[0].end() + 150) / 2;
+        QVERIFY2(dub.clips[0].end() + 30 < 150 - 10, "the lines are far enough apart to come back up between them");
+        QVERIFY2(std::abs(gain.at(between)) < 0.01, qPrintable(QString::number(gain.at(between))));
+
+        // English already: spoken as it is, and nothing ducked when asked.
+        r = call({{"project", project}, {"track", 1}, {"duck_db", 0}, {"voice", "bf_emma"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("ducked").toInt(), 0);
+        QVERIFY(loadProject(project.toStdString(), back, &err));
+        QCOMPARE(back.active()->captionTracks.size(), size_t(2));
+        QCOMPARE(back.active()->audioTracks.size(), tracks + 2);
+        QCOMPARE(back.active()->audioTracks[tracks + 1].clips.size(), size_t(2));
+        QVERIFY(call({{"project", project}, {"track", 5}}).value("isError").toBool());
+    }
+
     void audioRolesAndAutoMix() {
         // Speech (the JFK clip), music (the test song), and effects (door slams over room tone, pink-ish noise).
         std::vector<float> speech;

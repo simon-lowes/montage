@@ -1867,6 +1867,50 @@ private slots:
         state()->newProject();
     }
 
+    void dubCaptionTrack() {
+        auto* panel = win_->findChild<CaptionsPanel*>();
+        QVERIFY(panel);
+        QVERIFY(panel->findChild<QAction*>("dubCaptions"));
+        const ModelPack* deen = translationModel("de", "en");
+        if (!translatorAvailable() || !deen || !deen->installed() || !ttsAvailable() || !ttsModel().installed())
+            QSKIP("Set MONTAGE_TRANSLATION_MODELS (with translate-de-en) and MONTAGE_TTS_MODEL to test dubbing");
+        state()->newProject();
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        Id track = 0;
+        state()->apply("Place", [&](Project& p, Sequence& s) {
+            CaptionTrack t;
+            t.id = track = p.newId();
+            t.language = "de";
+            t.captions = {{0, 45, "Hallo Welt", {}}};
+            s.captionTracks.push_back(t);
+            return edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        });
+        panel->setCurrentTrack(track);
+        const int tracks = int(state()->sequence()->audioTracks.size());
+        QString error;
+        const auto r = panel->dub("af_heart", -12, &error);
+        QVERIFY2(!r.clips.empty(), qPrintable(error));
+        const Sequence& s = *state()->sequence();
+        QCOMPARE(s.captionTracks.size(), size_t(2));
+        QCOMPARE(s.captionTracks[1].id, r.captions);
+        QCOMPARE(r.audioTrack, tracks);
+        QCOMPARE(s.audioTracks[size_t(tracks)].name, std::string("Dub (English)"));
+        QCOMPARE(r.ducked, 1);
+        QVERIFY(std::abs(s.audioTracks[0].clips[0].audio.params.at("gain_db").at(5) + 12) < 0.01);
+        // One undo takes the speech and the ducking away together; then the import of its sound files, then the translation.
+        state()->undo();
+        QCOMPARE(int(state()->sequence()->audioTracks.size()), tracks);
+        const auto& params = state()->sequence()->audioTracks[0].clips[0].audio.params;
+        QVERIFY(!params.count("gain_db") || params.at("gain_db").keys.empty());
+        QCOMPARE(state()->sequence()->captionTracks.size(), size_t(2));
+        state()->undo();
+        QCOMPARE(state()->sequence()->captionTracks.size(), size_t(2));
+        state()->undo();
+        QCOMPARE(state()->sequence()->captionTracks.size(), size_t(1));
+        state()->newProject();
+    }
+
     void autoMixDialog() {
         state()->newProject();
         const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});

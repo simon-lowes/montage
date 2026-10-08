@@ -222,6 +222,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
   - **Animated captions** for social video (Caption Style › Animation): Word by Word, Highlight the Spoken Word, Pop the Spoken Word, or One Word at a Time, in a highlight colour of your choice. Captions made from transcripts keep each word's timing; others spread the words by their length. On the command line: `render --burn-captions --caption-animation pop`.
   - Import SubRip or WebVTT files. Export SubRip, WebVTT or Scenarist SCC (CEA-608 broadcast captions).
   - **Translate Track** (Captions › More): a copy of the track in another language, with the same timings, translated on this computer. Opus-MT models (University of Helsinki, CC-BY-4.0) cover English to and from 18 to 22 languages. A pair without its own model goes through English. Each model is about 270 MB and downloads the first time that pair is used. Also `montage-cli translate subs.srt --to de`.
+  - **Dub into English** (Captions › More, or MCP `montage_dub`; like YouTube's and ElevenLabs' AI dubbing, done on this computer): a caption track in any language Opus-MT covers is translated into English, each cue is spoken at its time with an AI voice (Kokoro, a little faster where a cue is short) on a new "Dub (English)" audio track, and the original audio is lowered (18 dB by default) while the dub speaks, as in a voice-over translation. The English captions are kept as a hidden track.
   - The CC button shows captions in the Program monitor. When exporting, captions can be burned into the picture, embedded as a subtitle track (mov_text in MP4/MOV, SubRip in MKV, WebVTT in WebM, with the track's language), or both.
 - Interchange both ways with Premiere Pro, DaVinci Resolve, Final Cut Pro, Avid and Nuke:
   - Final Cut Pro 7 XML, FCPXML, OpenTimelineIO and CMX 3600 EDL.
@@ -339,7 +340,7 @@ Its tools work on `.montage` files by path. Each edit is saved at once, and the 
 - probe media, create projects and list a project's timeline;
 - place media, split, remove (with ripple), move, trim and change the speed of clips;
 - add titles, effects (including masked ones), transitions and markers;
-- transcribe (with speaker labels), translate caption tracks, find spoken phrases in the cut, cut by transcript (phrases, filler words, retakes, long pauses, optionally with Smooth Cuts), and build a cut from a script;
+- transcribe (with speaker labels), translate caption tracks, dub them into English, find spoken phrases in the cut, cut by transcript (phrases, filler words, retakes, long pauses, optionally with Smooth Cuts), and build a cut from a script;
 - find shots by description, and find, name and join the people in the footage;
 - generate voiceovers from text or from a caption track;
 - log media (ratings, labels, keywords, metadata fields, bins), make subclips, auto-tag shots, and find media by text or smart-bin rules, optionally saving the rules as a smart bin;

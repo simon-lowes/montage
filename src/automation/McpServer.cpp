@@ -362,6 +362,25 @@ struct McpServer::Impl {
     }
 
     void addTools();
+    struct SpeechLine {
+        std::string text;
+        FrameTime at = 0, fit = -1;  // fit: the room it has, in frames (-1: any)
+    };
+    // A caption track's cues, each with the room until the next one starts.
+    static std::vector<SpeechLine> captionSpeech(const CaptionTrack& t) {
+        std::vector<SpeechLine> lines;
+        for (size_t i = 0; i < t.captions.size(); ++i) {
+            std::string text = t.captions[i].text;
+            std::replace(text.begin(), text.end(), '\n', ' ');
+            if (!text.empty())
+                lines.push_back({text, t.captions[i].start, (i + 1 < t.captions.size() ? t.captions[i + 1].start : t.captions[i].end) - t.captions[i].start});
+        }
+        return lines;
+    }
+    // Speaks each line (Kokoro) into a WAV in `folder`, a little faster where it has too little room, and places it at its time
+    // on audio track `track`, adding `placed` entries; an error message or "".
+    QString speakLines(Project& p, Sequence& s, const std::vector<SpeechLine>& lines, const std::string& voice, double speed, TrackRef track,
+                       const QString& folder, QJsonArray& placed, double& seconds);
     // Indexes the videos (all, or these and subclips' media) that have no visual index; an error message or "".
     QString indexMissing(Project& p, const std::vector<Id>& only, bool& changed);
 };
@@ -390,6 +409,34 @@ QString McpServer::Impl::indexMissing(Project& p, const std::vector<Id>& only, b
             return QString::fromStdString(m.name + ": " + err);
         m.visual = std::make_shared<const VisualIndex>(std::move(v));
         changed = true;
+    }
+    return {};
+}
+
+QString McpServer::Impl::speakLines(Project& p, Sequence& s, const std::vector<SpeechLine>& lines, const std::string& voice, double speed,
+                                    TrackRef track, const QString& folder, QJsonArray& placed, double& seconds) {
+    QDir().mkpath(folder);
+    int n = 1;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        std::vector<float> audio;
+        std::string err;
+        progress(double(i) / lines.size(), QStringLiteral("Speaking"));
+        if (!synthesizeSpeech(lines[i].text, voice, speed, audio, &err)) return QString::fromStdString(err);
+        const double room = lines[i].fit > 0 ? lines[i].fit / s.fpsValue() : 0, said = double(audio.size()) / kTtsSampleRate;
+        if (room > 0 && said > room * 1.02) {
+            const double faster = std::min(1.6, speed * said / room);
+            if (faster > speed * 1.02 && !synthesizeSpeech(lines[i].text, voice, faster, audio, &err)) return QString::fromStdString(err);
+        }
+        QString path;
+        do path = folder + '/' + QString::fromStdString(s.name) + QStringLiteral(" Speech ") + QString::number(n++) + QStringLiteral(".wav");
+        while (QFileInfo::exists(path));
+        if (!writeSpeechWav(path.toStdString(), audio, &err)) return QString::fromStdString(err);
+        const Id media = mediaFor(p, path);
+        const edit::Result r = edit::placeMedia(p, s, media, lines[i].at, 0, -1, {TrackKind::Video, 0}, track, false);
+        if (!r.ok) return QString::fromStdString(r.error);
+        seconds += double(audio.size()) / kTtsSampleRate;
+        placed.append(QJsonObject{{"file", path}, {"at_seconds", lines[i].at / s.fpsValue()}, {"seconds", double(audio.size()) / kTtsSampleRate},
+                                  {"clip", r.created.empty() ? 0.0 : double(r.created.front())}});
     }
     return {};
 }
@@ -1619,53 +1666,100 @@ void McpServer::Impl::addTools() {
             const std::string voice = str(a, "voice", "af_heart").toStdString();
             if (!findTtsVoice(voice)) throw ArgError{QStringLiteral("Unknown voice \"%1\"").arg(QString::fromStdString(voice))};
             const double speed = std::clamp(a.value("speed").toDouble(1), 0.5, 2.0);
-            struct Line {
-                std::string text;
-                FrameTime at, fit;
-            };
-            std::vector<Line> lines;
+            std::vector<SpeechLine> lines;
             if (a.contains("captions")) {
                 const int index = a.value("captions").toInt();
                 if (index < 0 || index >= int(s.captionTracks.size())) throw ArgError{"No such caption track"};
-                const auto& caps = s.captionTracks[size_t(index)].captions;
-                for (size_t i = 0; i < caps.size(); ++i) {
-                    std::string t = caps[i].text;
-                    std::replace(t.begin(), t.end(), '\n', ' ');
-                    if (!t.empty()) lines.push_back({t, caps[i].start, (i + 1 < caps.size() ? caps[i + 1].start : caps[i].end) - caps[i].start});
-                }
+                lines = captionSpeech(s.captionTracks[size_t(index)]);
             } else {
                 lines.push_back({need(a, "text").toStdString(), a.contains("at") ? timeArg(a.value("at"), s, "at") : 0, -1});
             }
             if (lines.empty()) return fail("Nothing to say");
             const TrackRef au = trackArg(str(a, "track", "A1"), s, true, &l.project, &s);
-            const QString folder = QFileInfo(absolute(need(a, "project"))).absolutePath() + QStringLiteral("/Voiceover");
-            QDir().mkpath(folder);
             QJsonArray placed;
             double total = 0;
-            int n = 1;
-            for (size_t i = 0; i < lines.size(); ++i) {
-                std::vector<float> audio;
-                std::string err;
-                progress(double(i) / lines.size(), QStringLiteral("Speaking"));
-                if (!synthesizeSpeech(lines[i].text, voice, speed, audio, &err)) return fail(QString::fromStdString(err));
-                const double room = lines[i].fit > 0 ? lines[i].fit / s.fpsValue() : 0, said = double(audio.size()) / kTtsSampleRate;
-                if (room > 0 && said > room * 1.02) {
-                    const double faster = std::min(1.6, speed * said / room);
-                    if (faster > speed * 1.02 && !synthesizeSpeech(lines[i].text, voice, faster, audio, &err)) return fail(QString::fromStdString(err));
-                }
-                QString path;
-                do path = folder + '/' + QString::fromStdString(s.name) + QStringLiteral(" Speech ") + QString::number(n++) + QStringLiteral(".wav");
-                while (QFileInfo::exists(path));
-                if (!writeSpeechWav(path.toStdString(), audio, &err)) return fail(QString::fromStdString(err));
-                const Id media = mediaFor(l.project, path);
-                check(edit::placeMedia(l.project, s, media, lines[i].at, 0, -1, {TrackKind::Video, 0}, au, false));
-                total += double(audio.size()) / kTtsSampleRate;
-                placed.append(QJsonObject{{"file", path}, {"at_seconds", lines[i].at / s.fpsValue()},
-                                          {"seconds", double(audio.size()) / kTtsSampleRate}});
-            }
+            const QString err = speakLines(l.project, s, lines, voice, speed, au,
+                                           QFileInfo(absolute(need(a, "project"))).absolutePath() + QStringLiteral("/Voiceover"), placed, total);
+            if (!err.isEmpty()) return fail(err);
             save(l);
             return ok(QStringLiteral("Placed %1 voiceover clip(s), %2 s in all").arg(lines.size()).arg(total, 0, 'f', 1),
                       QJsonObject{{"clips", placed}});
+        });
+
+    add("montage_dub", "Dub into English",
+        "Dub a caption track into English on this computer: translated from its language (Opus-MT; skipped if it is English), "
+        "each cue spoken at its time with an AI voice (Kokoro; a little faster where a cue is short) on a new audio track "
+        "\"Dub (English)\", and every other audio clip lowered by duck_db while the dub speaks (volume keyframes, replacing "
+        "theirs; 0 leaves them), as in a voice-over translation. The English captions are added as a hidden track. Needs the "
+        "translation and speech models (the app asks the first time; or scripts/fetch-models.sh).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "track":{"type":"integer","default":0,"description":"Caption track index"},
+            "from":{"type":"string","description":"The track's language, if its setting is wrong"},
+            "voice":{"type":"string","default":"af_heart"},"speed":{"type":"number","default":1},
+            "duck_db":{"type":"number","default":-18}},"required":["project"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const int index = a.value("track").toInt(0);
+            if (index < 0 || index >= int(s.captionTracks.size())) return fail("No such caption track");
+            if (s.captionTracks[size_t(index)].captions.empty()) return fail("That caption track is empty");
+            if (!ttsAvailable() || !translatorAvailable()) return fail("This build of Montage cannot dub (no ONNX Runtime)");
+            if (!ttsModel().installed())
+                return fail("The speech model is not downloaded: run `scripts/fetch-models.sh` or generate a voiceover once in the app");
+            const std::string voice = str(a, "voice", "af_heart").toStdString();
+            if (!findTtsVoice(voice)) throw ArgError{QStringLiteral("Unknown voice \"%1\"").arg(QString::fromStdString(voice))};
+            const double speed = std::clamp(a.value("speed").toDouble(1), 0.5, 2.0);
+            const double duckDb = std::clamp(a.value("duck_db").toDouble(-18), -60.0, 0.0);
+            const CaptionTrack source = s.captionTracks[size_t(index)];
+            const std::string from = a.contains("from") ? a.value("from").toString().toLower().toStdString()
+                                                        : (source.language.empty() ? "en" : source.language);
+            int english = index;
+            if (from != "en") {
+                const auto route = translationRoute(from, "en");
+                if (route.empty()) return fail(QStringLiteral("There is no translation from %1 to English").arg(QString::fromStdString(from)));
+                for (const ModelPack* pack : route)
+                    if (!pack->installed())
+                        return fail(QStringLiteral("The %1 is not downloaded (%2 MB): translate once in the app, or fetch it into %3")
+                                        .arg(QString::fromStdString(pack->title))
+                                        .arg(pack->bytes() / 1000000)
+                                        .arg(QString::fromStdString(pack->directory())));
+                std::vector<std::string> out;
+                std::string err;
+                progress(0, QStringLiteral("Translating"));
+                if (!translateTexts(captionTexts(source), from, "en", out, {}, nullptr, &err)) return fail(QString::fromStdString(err));
+                CaptionTrack t = translatedTrack(source, out, l.project.newId(), "en", translationLanguageName("en"));
+                t.visible = false;
+                s.captionTracks.push_back(std::move(t));
+                english = int(s.captionTracks.size()) - 1;
+            }
+            const std::vector<SpeechLine> lines = captionSpeech(s.captionTracks[size_t(english)]);
+            if (lines.empty()) return fail("Nothing to say");
+            const TrackRef dub = edit::addTrack(l.project, s, TrackKind::Audio);
+            s.audioTracks[size_t(dub.index)].name = "Dub (English)";
+            QJsonArray placed;
+            double total = 0;
+            const QString err = speakLines(l.project, s, lines, voice, speed, dub,
+                                           QFileInfo(absolute(need(a, "project"))).absolutePath() + QStringLiteral("/Voiceover"), placed, total);
+            if (!err.isEmpty()) return fail(err);
+            int ducked = 0;
+            if (duckDb < 0) {
+                DuckOptions o;
+                o.amountDb = duckDb;
+                const Spans spans = clipSpans(s, dub.index, o.minPause);
+                for (int i = 0; i < int(s.audioTracks.size()); ++i)
+                    if (i != dub.index)
+                        for (Clip& c : s.audioTracks[size_t(i)].clips) ducked += duckClip(c, s, spans, o) ? 1 : 0;
+            }
+            save(l);
+            QJsonArray sample;
+            for (size_t i = 0; i < std::min<size_t>(3, lines.size()); ++i) sample.append(QString::fromStdString(lines[i].text));
+            return ok(QStringLiteral("Dubbed %1 caption(s) onto A%2 (%3 s of speech); lowered %4 other clip(s) under it")
+                          .arg(lines.size())
+                          .arg(dub.index + 1)
+                          .arg(total, 0, 'f', 1)
+                          .arg(ducked),
+                      QJsonObject{{"captions_track", english}, {"audio_track", QStringLiteral("A%1").arg(dub.index + 1)}, {"clips", placed},
+                                  {"ducked", ducked}, {"first", sample}});
         });
 
     add("montage_log_media", "Log media",

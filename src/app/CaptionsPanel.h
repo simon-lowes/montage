@@ -36,6 +36,18 @@ public:
     // A translated copy of the current track, as a new track (one undo step),
     // after downloading the models it needs if asked. Returns its id, or 0.
     Id translateTrack(const std::string& to, QString* error = nullptr);
+    // Dubs the current track into English: translated first unless it is
+    // English already, spoken cue by cue at each cue's time with an AI voice
+    // (Kokoro) on a new audio track, and every other audio clip lowered by
+    // `duckDb` under the speech (0: left as it is) so the original stays
+    // faintly audible, as in a voice-over translation.
+    struct DubResult {
+        Id captions = 0;      // the English track
+        int audioTrack = -1;  // the dub's audio track
+        std::vector<Id> clips;
+        int ducked = 0;       // clips lowered under it
+    };
+    DubResult dub(const std::string& voice, double duckDb = -18, QString* error = nullptr);
 
 public slots:
     void generateDialog();
@@ -44,6 +56,7 @@ public slots:
     void styleDialog();
     void addTrack();
     void translateDialog();
+    void dubDialog();
 
 private:
     void rebuild();
