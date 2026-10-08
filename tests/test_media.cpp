@@ -5535,6 +5535,59 @@ private slots:
         QVERIFY(r.value("isError").toBool());
     }
 
+    void mcpCompareSequences() {
+        // Two versions of a cut of the same (not decoded) file: the second trims the first shot and adds a third.
+        Project p = makeDefaultProject();
+        MediaItem m;
+        m.id = p.newId();
+        m.kind = MediaKind::Video;
+        m.name = "shot.mov";
+        m.path = path("shot.mov");
+        m.duration = 20;
+        m.width = 1920, m.height = 1080;
+        m.fps = {30, 1};
+        m.hasVideo = true;
+        p.media.push_back(m);
+        Sequence& v1 = *p.active();
+        v1.name = "Cut 1";
+        QVERIFY(edit::placeMedia(p, v1, m.id, 0, 0, 60, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(edit::placeMedia(p, v1, m.id, 60, 100, 160, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Sequence v2 = v1;
+        v2.id = p.newId();
+        v2.name = "Cut 2";
+        v2.videoTracks[0].clips[0].duration = 40;  // out 20 earlier
+        QVERIFY(edit::placeMedia(p, v2, m.id, 200, 300, 330, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        p.sequences.push_back(v2);
+        p.activeSequence = p.sequences.back().id;
+        const QString project = QString::fromStdString(path("versions.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_compare_sequences"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call({{"project", project}, {"before", "Cut 1"}, {"add_markers", true}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonArray changes = r.value("structuredContent").toObject().value("changes").toArray();
+        QCOMPARE(changes.size(), 2);  // the linked sound changes with the picture, so it is not listed again
+        QCOMPARE(changes[0].toObject().value("change").toString(), QString("trimmed"));
+        QCOMPARE(changes[0].toObject().value("details").toString(), QString("out -20"));
+        QCOMPARE(changes[1].toObject().value("change").toString(), QString("added"));
+        QCOMPARE(changes[1].toObject().value("at_seconds").toDouble(), 200.0 / 30);
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.active()->markers.size(), size_t(2));
+        QCOMPARE(back.active()->markers[0].name, std::string("Trimmed: shot.mov"));
+        r = call({{"project", project}, {"before", "Cut 1"}, {"after", "Cut 1"}});
+        QVERIFY(r.value("isError").toBool());
+        r = call({{"project", project}, {"before", "Cut 9"}});
+        QVERIFY(r.value("isError").toBool());
+    }
+
     void mcpServerEditsProjects() {
         writeBallVideo(path("mcp-ball.mp4"), 12);
         const QString project = QString::fromStdString(path("agent.montage"));

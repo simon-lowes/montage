@@ -24,6 +24,7 @@ add_library(montage_engine STATIC
   core/Surround.h core/Surround.cpp
   core/Effects.h core/Effects.cpp
   core/EditOps.h core/EditOps.cpp
+  core/TimelineCompare.h core/TimelineCompare.cpp
   core/ImportBuilder.h core/InterchangeImport.cpp core/FcpXml.cpp
   core/Multicam.h core/Multicam.cpp
   core/History.h core/History.cpp

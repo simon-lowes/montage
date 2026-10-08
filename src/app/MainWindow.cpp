@@ -1,5 +1,7 @@
 #include "MainWindow.h"
 
+#include "CompareDialog.h"
+
 #include "Keymap.h"
 #include "LoudnessReadout.h"
 #include "Voiceover.h"
@@ -1067,6 +1069,26 @@ void MainWindow::buildMenus() {
     add(seqM, tr("Add C&hapter Marker"), QKeySequence("Alt+M"), [this] { addChapterMarker(); })->setObjectName(QStringLiteral("addChapter"));
     add(seqM, tr("Add C&lip Marker"), QKeySequence("Shift+Alt+M"), [this] { addClipMarker(); })->setObjectName(QStringLiteral("addClipMarker"));
     add(seqM, tr("Copy Chapters for YouTube"), QKeySequence(), [this] { copyYoutubeChapters(); })->setObjectName(QStringLiteral("copyChapters"));
+    add(seqM, tr("Compare with Sequence…"), QKeySequence(), [this] {
+        // Another version of the cut, compared with this one (the older one picked from the project's sequences).
+        const Sequence* now = state_->sequence();
+        if (!now) return;
+        QStringList names;
+        std::vector<Id> ids;
+        for (const Sequence& sq : state_->project().sequences)
+            if (sq.id != now->id && !sq.multicam) {
+                names << QString::fromStdString(sq.name);
+                ids.push_back(sq.id);
+            }
+        if (ids.empty()) {
+            state_->message(tr("Duplicate the sequence before changing it, then compare the two versions"), 6000);
+            return;
+        }
+        bool ok = false;
+        const QString pick = QInputDialog::getItem(this, tr("Compare with Sequence"), tr("Compare %1 with the earlier version:").arg(QString::fromStdString(now->name)),
+                                                   names, 0, false, &ok);
+        if (ok) compareWith(ids[size_t(names.indexOf(pick))]);
+    })->setObjectName(QStringLiteral("compareSequences"));
     add(seqM, tr("Export Markers…"), QKeySequence(), [this] {
         QString filter;
         const QString path = QFileDialog::getSaveFileName(this, tr("Export Markers"), QString(),
@@ -1697,6 +1719,14 @@ void MainWindow::matchFrame() {
         return;
     }
     state_->message(tr("No video clip under the playhead"));
+}
+
+CompareDialog* MainWindow::compareWith(Id before) {
+    if (!state_->sequence() || !state_->project().findSequence(before)) return nullptr;
+    auto* dlg = new CompareDialog(state_, before, this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    dlg->show();
+    return dlg;
 }
 
 QString MainWindow::selectionSummary() const {

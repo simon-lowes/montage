@@ -73,6 +73,7 @@
 #include "PluginEditorWindow.h"
 #include "audio/PluginEffect.h"
 #include "KeyframePanel.h"
+#include "CompareDialog.h"
 #include "Keymap.h"
 #include "LoudnessReadout.h"
 #include "Voiceover.h"
@@ -3992,6 +3993,42 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(std::fabs(m(title, "scale") - 30) < 1e-9);
         state()->setSelection({}, false);
         QVERIFY(readout->text().isEmpty());
+    }
+
+    void compareSequencesDialog() {
+        // The demo, then a second version with Blue 15 frames shorter and Red turned off.
+        loadDemo();
+        const Id first = state()->sequence()->id;
+        Sequence copy = *state()->sequence();
+        QVERIFY(state()->edit("Version 2", [&](Project& p, Sequence&) {
+            copy.id = p.newId();
+            copy.name = "Version 2";
+            copy.videoTracks[0].clips[1].duration -= 15;
+            copy.videoTracks[0].clips[0].enabled = false;
+            p.sequences.push_back(copy);
+            return true;
+        }));
+        state()->setActiveSequence(copy.id);
+        QVERIFY(win_->findChild<QAction*>("compareSequences"));
+        CompareDialog* dlg = win_->compareWith(first);
+        QVERIFY(dlg);
+        QCOMPARE(dlg->rowCount(), 2);
+        QCOMPARE(dlg->cell(0, CompareDialog::Change), QString("Changed"));
+        QCOMPARE(dlg->cell(0, CompareDialog::Details), QString("turned off"));
+        QCOMPARE(dlg->cell(1, CompareDialog::Change), QString("Trimmed"));
+        QCOMPARE(dlg->cell(1, CompareDialog::Track), QString("V1"));
+        QVERIFY(dlg->findChild<QLabel*>("compareSummary")->text().contains("1 trimmed"));
+        dlg->activate(1);
+        QCOMPARE(state()->playhead(), FrameTime(60));
+        QCOMPARE(state()->selectedClips(), std::vector<Id>{copy.videoTracks[0].clips[1].id});
+        QCOMPARE(dlg->addMarkers(), 2);
+        QCOMPARE(state()->sequence()->markers.size(), size_t(2));
+        QCOMPARE(state()->sequence()->markers[1].color, CompareDialog::labelFor(ChangeKind::Trimmed));
+        state()->undo();
+        QVERIFY(state()->sequence()->markers.empty());
+        dlg->close();
+        QVERIFY(!win_->compareWith(999999));
+        state()->newProject();
     }
 
     void keyframePanelEditsKeys() {

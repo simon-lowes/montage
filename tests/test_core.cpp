@@ -21,6 +21,7 @@
 #include "core/KeyframeEdit.h"
 #include "core/MediaLog.h"
 #include "core/Multicam.h"
+#include "core/TimelineCompare.h"
 #include "core/ProjectIO.h"
 #include "core/ScriptCut.h"
 #include "core/Surround.h"
@@ -2903,6 +2904,78 @@ private slots:
         QVERIFY(overwrite(p, top, {TrackKind::Video, 2}, title).ok);
         m = matchSource(p, top, 160);
         QVERIFY(m && m->media == camB);
+    }
+
+    void timelineCompare() {
+        // The old cut: three shots of the same file on V1 (the middle one with its sound), a title on V2 and an extra
+        // shot on V2 later on.
+        Fixture fx;
+        Sequence& old = fx.s();
+        const Id c1 = fx.put(V1, 0, 60, 0);
+        const Result mid = placeMedia(fx.p, old, fx.media, 60, 100, 160, V1, A1, false);
+        QVERIFY(mid.ok);
+        const Id c2 = mid.created[0];
+        const Id c3 = fx.put(V1, 120, 60, 200);
+        Clip title = makeGeneratorClip(fx.p, "title", 30);
+        title.start = 10;
+        title.generator.strings["text"] = "Hello";
+        const Id titleId = title.id;
+        QVERIFY(overwrite(fx.p, old, V2, title).ok);
+        const Id extra = fx.put(V2, 200, 20, 250);
+        QVERIFY(compareSequences(fx.p, old, old).empty());  // nothing changed
+        // The new cut: shot 1 trimmed 10 frames at the head and everything rippled up; shots 2 and 3 swapped; shot 3
+        // blurred; the title on V3; the extra shot gone; a new shot at the end.
+        Sequence cut = old;
+        cut.id = fx.p.newId();
+        while (cut.videoTracks.size() < 3) cut.videoTracks.push_back(makeTrack(fx.p, TrackKind::Video, "V3"));
+        Clip* n1 = clipById(cut, c1);
+        n1->sourceIn = 10, n1->duration = 50;
+        clipById(cut, c3)->start = 50;
+        clipById(cut, c2)->start = 110;
+        for (Clip& a : cut.audioTracks[0].clips) a.start = 110;
+        cut.videoTracks[0].clips = {*clipById(cut, c1), *clipById(cut, c3), *clipById(cut, c2)};
+        cut.videoTracks[0].clips[1].effects.push_back(makeEffect("gaussian_blur", fx.p.newId()));
+        Clip movedTitle = *clipById(cut, titleId);
+        cut.videoTracks[1].clips.clear();
+        cut.videoTracks[2].clips = {movedTitle};
+        Clip added = makeClip(fx.p, *fx.p.findMedia(fx.media), TrackKind::Video, cut);
+        added.start = 170, added.duration = 30, added.sourceIn = 280;
+        cut.videoTracks[0].clips.push_back(added);
+        const auto changes = compareSequences(fx.p, old, cut);
+        auto find = [&](Id before, Id after) -> const TimelineChange* {
+            for (const auto& c : changes)
+                if (c.before == before && c.after == after) return &c;
+            return nullptr;
+        };
+        const TimelineChange* t1 = find(c1, c1);
+        QVERIFY(t1 && t1->kind == ChangeKind::Trimmed);
+        QCOMPARE(t1->details, std::string("in +10"));
+        const TimelineChange* t3 = find(c3, c3);
+        QVERIFY(t3 && t3->kind == ChangeKind::Changed && t3->details == "effects");  // slid up, but kept its place
+        const TimelineChange* t2 = find(c2, c2);
+        QVERIFY(t2 && t2->kind == ChangeKind::Moved);
+        QCOMPARE(t2->details, std::string("changed places"));
+        const TimelineChange* tt = find(titleId, titleId);
+        QVERIFY(tt && tt->kind == ChangeKind::Moved && tt->details == "V2 → V3");
+        const TimelineChange* gone = find(extra, 0);
+        QVERIFY(gone && gone->kind == ChangeKind::Removed && gone->at == 200);
+        const TimelineChange* fresh = find(0, added.id);
+        QVERIFY(fresh && fresh->kind == ChangeKind::Added && fresh->at == 170);
+        // Shot 2's sound only slid along: nothing more. In time order.
+        QCOMPARE(changes.size(), size_t(6));
+        QVERIFY(std::is_sorted(changes.begin(), changes.end(), [](const auto& a, const auto& b) { return a.at < b.at; }));
+        // A retitled card is a change; the linked sound of a removed shot is not listed again.
+        clipById(cut, titleId)->generator.strings["text"] = "Goodbye";
+        const auto retitled = compareSequences(fx.p, old, cut);
+        QCOMPARE(retitled.size(), size_t(6));
+        for (const auto& c : retitled)
+            if (c.after == titleId) QCOMPARE(c.details, std::string("V2 → V3, title"));
+        Sequence noMid = old;
+        QVERIFY(removeClips(fx.p, noMid, linkedClips(noMid, c2), false).ok);
+        const auto lost = compareSequences(fx.p, old, noMid);
+        QCOMPARE(lost.size(), size_t(1));
+        QVERIFY(lost[0].kind == ChangeKind::Removed && lost[0].before == c2);
+        QCOMPARE(std::string(changeKindName(ChangeKind::Trimmed)), std::string("Trimmed"));
     }
 
     void keyframeRepeat() {

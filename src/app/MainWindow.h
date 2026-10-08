@@ -27,6 +27,7 @@ class QTabBar;
 namespace montage {
 
 class EditorState;
+class CompareDialog;
 struct ConsolidateOptions;
 class PlaybackController;
 class MonitorPanel;
@@ -143,6 +144,8 @@ public:
     bool reverseMatchFrame();
     // The status bar's selection readout: "3 clips selected · 00:00:12:05", the first start to the last end.
     QString selectionSummary() const;
+    // Sequence › Compare with Sequence: the differences from an earlier version to this sequence, in a dialog.
+    CompareDialog* compareWith(Id before);
     // Video layouts (Clip › Layout): the selected video clips, or with fewer than two every video clip under the
     // playhead, sharing the frame. Returns how many clips were arranged.
     int arrangeLayout(edit::Layout layout, double gap = 0);

@@ -26,6 +26,7 @@
 #include "core/Bleep.h"
 #include "core/Checkerboard.h"
 #include "core/EditOps.h"
+#include "core/TimelineCompare.h"
 #include "core/Effects.h"
 #include "core/History.h"
 #include "core/Interchange.h"
@@ -1625,6 +1626,50 @@ void McpServer::Impl::addTools() {
             const int n = applyMix(l.project, s, plan, o);
             save(l);
             return ok(QStringLiteral("Mixed %1 clip(s)").arg(n), QJsonObject{{"clips", clips}, {"changed", n}});
+        });
+
+    add("montage_compare_sequences", "Compare two versions of a cut",
+        "What changed from one sequence to another (Resolve's timeline comparison): clips added, removed, trimmed (in "
+        "and out points, in source frames), moved (to another track, or changed places) and changed (speed, effects, "
+        "picture, sound, a title's text). Clips that only slid along with the edits around them are not changes. "
+        "add_markers puts a coloured marker on the newer sequence for each change.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "before":{"type":"string","description":"The earlier sequence's name"},
+            "after":{"type":"string","description":"The later sequence's name (default: the active one)"},
+            "add_markers":{"type":"boolean","default":false}},"required":["project","before"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            auto byName = [&](const QString& name) -> Sequence* {
+                for (Sequence& sq : l.project.sequences)
+                    if (QString::fromStdString(sq.name) == name) return &sq;
+                throw ArgError{QStringLiteral("No sequence named \"%1\"").arg(name)};
+            };
+            const Sequence* before = byName(need(a, "before"));
+            Sequence* after = a.contains("after") ? byName(str(a, "after")) : &l.seq();
+            if (before == after) throw ArgError{"Compare two different sequences"};
+            const auto changes = compareSequences(l.project, *before, *after);
+            QJsonArray list;
+            for (const TimelineChange& c : changes)
+                list.append(QJsonObject{{"change", QString::fromLatin1(changeKindName(c.kind)).toLower()},
+                                        {"clip", QString::fromStdString(c.name)},
+                                        {"before_clip", double(c.before)},
+                                        {"after_clip", double(c.after)},
+                                        {"track", QStringLiteral("%1%2").arg(c.track.kind == TrackKind::Video ? "V" : "A").arg(c.track.index + 1)},
+                                        {"at", tc(c.at, *after)},
+                                        {"at_seconds", secs(c.at, *after)},
+                                        {"details", QString::fromStdString(c.details)}});
+            if (a.value("add_markers").toBool() && !changes.empty()) {
+                static const std::map<ChangeKind, const char*> colours{{ChangeKind::Added, "Forest"}, {ChangeKind::Removed, "Red"},
+                                                                        {ChangeKind::Trimmed, "Yellow"}, {ChangeKind::Moved, "Cerulean"},
+                                                                        {ChangeKind::Changed, "Violet"}};
+                for (const TimelineChange& c : changes)
+                    edit::addMarker(*after, Marker{c.at, c.kind == ChangeKind::Removed ? 0 : c.length,
+                                                   std::string(changeKindName(c.kind)) + (c.name.empty() ? "" : ": " + c.name), c.details,
+                                                   labelFromName(colours.at(c.kind))});
+                save(l);
+            }
+            return ok(changes.empty() ? QStringLiteral("No differences") : QStringLiteral("%1 change(s)").arg(changes.size()),
+                      QJsonObject{{"changes", list}});
         });
 
     add("montage_layout", "Arrange clips in a layout",
