@@ -1,4 +1,5 @@
 #include "Vector.h"
+#include "CameraRaw.h"
 #include "Decoder.h"
 
 #include <algorithm>
@@ -118,6 +119,23 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
             m.kind = MediaKind::Image;
             m.duration = 0;
         }
+        out = m;
+        return true;
+    }
+    if (rawAvailable() && isRawPath(path)) {
+        RawInfo ri;
+        if (!probeRaw(path, ri, error)) return false;
+        MediaItem m = out;
+        m.path = path;
+        if (m.name.empty()) m.name = path.substr(path.find_last_of("/\\") + 1);
+        m.kind = MediaKind::Image;
+        m.hasVideo = true;
+        m.hasAudio = false;
+        m.width = ri.width;
+        m.height = ri.height;
+        m.duration = 0;
+        m.videoCodec = "raw";
+        if (!ri.camera.empty() && !m.metadata.count("camera")) m.metadata["camera"] = ri.camera;
         out = m;
         return true;
     }
@@ -242,6 +260,7 @@ void VideoDecoder::close() {
     haveCur_ = haveNext_ = false;
     stillFrame_.reset();
     vector_.reset();
+    if (raw_) av_frame_free(&raw_);
 }
 
 bool VideoDecoder::open(const std::string& path, std::string* error) {
@@ -256,6 +275,33 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
         fps_ = vi.animated ? vi.fps : 25.0;
         duration_ = vi.duration;
         still_ = !vi.animated;
+        rotation_ = 0;
+        origin_ = 0;
+        curPts_ = nextPts_ = -1;
+        return true;
+    }
+    if (rawAvailable() && isRawPath(path)) {
+        RawImage img;
+        if (!developRaw(path, img, error)) return false;
+        raw_ = av_frame_alloc();
+        if (!raw_) return false;
+        raw_->format = AV_PIX_FMT_RGB48;  // host byte order, as LibRaw writes it
+        raw_->width = img.width;
+        raw_->height = img.height;
+        raw_->color_range = AVCOL_RANGE_JPEG;
+        if (av_frame_get_buffer(raw_, 0) < 0) {
+            if (error) *error = "Out of memory developing " + path;
+            close();
+            return false;
+        }
+        for (int y = 0; y < img.height; ++y)
+            std::memcpy(raw_->data[0] + size_t(y) * size_t(raw_->linesize[0]), img.rgb.data() + size_t(y) * size_t(img.width) * 3,
+                        size_t(img.width) * 3 * sizeof(uint16_t));
+        dispW_ = img.width;
+        dispH_ = img.height;
+        fps_ = 25.0;
+        duration_ = 0;
+        still_ = true;
         rotation_ = 0;
         origin_ = 0;
         curPts_ = nextPts_ = -1;
@@ -495,6 +541,13 @@ Frame16Ptr VideoDecoder::frameAt(double t, int targetW, int targetH, bool highQu
         Frame16Ptr f = renderVector(*vector_, t, targetW, targetH);
         if (f) curPts_ = f->pts;
         return f;
+    }
+    if (raw_) {
+        if (targetW <= 0) targetW = dispW_;
+        if (targetH <= 0) targetH = dispH_;
+        if (!stillFrame_ || stillFrame_->width != targetW || stillFrame_->height != targetH) stillFrame_ = convert(raw_, 0, targetW, targetH, true);
+        curPts_ = 0;
+        return stillFrame_;
     }
     if (hwBroken_) {
         // A hardware frame could not be read back: continue in software.

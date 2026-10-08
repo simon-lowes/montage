@@ -28,6 +28,7 @@ add_library(montage_engine STATIC
   media/Image.h media/Image.cpp
   media/Decoder.h media/Decoder.cpp
   media/Vector.h media/Vector.cpp
+  media/CameraRaw.h media/CameraRaw.cpp
   media/SuperScale.h media/SuperScale.cpp
   media/Faces.h media/Faces.cpp
   media/DepthMap.h media/DepthMap.cpp
@@ -121,6 +122,16 @@ if(MONTAGE_WITH_LV2)
     target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_LV2)
   else()
     message(STATUS "lilv not found: LV2 plugins are listed but not hosted")
+  endif()
+endif()
+if(MONTAGE_WITH_LIBRAW)
+  pkg_check_modules(LIBRAW IMPORTED_TARGET GLOBAL libraw>=0.20)
+  if(LIBRAW_FOUND)
+    message(STATUS "LibRaw ${LIBRAW_VERSION}: camera raw stills enabled")
+    target_link_libraries(montage_engine PRIVATE PkgConfig::LIBRAW)
+    target_compile_definitions(montage_engine PRIVATE MONTAGE_WITH_LIBRAW)
+  else()
+    message(STATUS "LibRaw not found: camera raw stills are not read")
   endif()
 endif()
 if(MONTAGE_WITH_OCIO)

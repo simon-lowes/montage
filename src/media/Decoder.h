@@ -33,7 +33,7 @@ public:
 
     bool open(const std::string& path, std::string* error = nullptr);
     void close();
-    bool isOpen() const { return ctx_ != nullptr || vector_ != nullptr; }
+    bool isOpen() const { return ctx_ != nullptr || vector_ != nullptr || raw_ != nullptr; }
 
     // Frame displayed at media time `t` (seconds from the start of the file),
     // converted to RGBA16 at exactly targetW x targetH (0 = native display size).
@@ -88,6 +88,7 @@ private:
     std::string hwName_;
     AVFrame* hwTransfer_ = nullptr;
     std::shared_ptr<VectorDocument> vector_;  // a Lottie animation or SVG, rendered instead of decoded
+    AVFrame* raw_ = nullptr;                  // a camera raw still, developed once (RGB48)
 };
 
 struct AudioBuffer {

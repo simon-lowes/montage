@@ -404,7 +404,8 @@ void MediaBinWidget::importDialog() {
     QStringList files = QFileDialog::getOpenFileNames(
         this, tr("Import Media"), dir,
         tr("Media (*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.mxf *.mts *.m2ts *.ts *.mpg *.mpeg *.wmv *.flv *.gif "
-           "*.wav *.mp3 *.aac *.m4a *.flac *.ogg *.opus *.aif *.aiff *.png *.jpg *.jpeg *.tif *.tiff *.bmp *.webp *.exr *.svg *.json);;All files (*)"));
+           "*.wav *.mp3 *.aac *.m4a *.flac *.ogg *.opus *.aif *.aiff *.png *.jpg *.jpeg *.tif *.tiff *.bmp *.webp *.exr *.svg *.json "
+           "*.dng *.cr2 *.cr3 *.nef *.arw *.raf *.rw2 *.orf *.pef *.srw *.3fr *.iiq);;All files (*)"));
     if (files.isEmpty()) return;
     settings.setValue("lastImportDir", QFileInfo(files.first()).absolutePath());
     importInto(files, smart_ ? QString() : bin_);

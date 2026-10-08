@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <array>
 #include <QImage>
 #include <QDir>
 #include <QFileInfo>
@@ -79,6 +80,7 @@
 #include "render/Compositor.h"
 #include "render/Exporter.h"
 #include "render/Processing.h"
+#include "media/CameraRaw.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -154,6 +156,87 @@ void writeVoiceWav(const std::string& path, double seconds, double hz, const std
         std::fwrite(&s, 2, 1, f);
     }
     std::fclose(f);
+}
+
+// A minimal uncompressed DNG: an RGGB Bayer mosaic of `scene` (linear RGB, 0..1) from a
+// "camera" whose sensor sees linear sRGB, so it develops back to the scene.
+bool writeTestDng(const std::string& path, int w, int h, const std::function<std::array<double, 3>(int, int)>& scene, int orientation = 1) {
+    struct Entry {
+        uint16_t tag, type;
+        uint32_t count;
+        std::vector<uint8_t> data;
+    };
+    std::vector<Entry> entries;
+    auto bytes = [](const void* p, size_t n) { return std::vector<uint8_t>(static_cast<const uint8_t*>(p), static_cast<const uint8_t*>(p) + n); };
+    auto shorts = [&](uint16_t tag, std::vector<uint16_t> v) { entries.push_back({tag, 3, uint32_t(v.size()), bytes(v.data(), v.size() * 2)}); };
+    auto longs = [&](uint16_t tag, std::vector<uint32_t> v) { entries.push_back({tag, 4, uint32_t(v.size()), bytes(v.data(), v.size() * 4)}); };
+    auto byteList = [&](uint16_t tag, std::vector<uint8_t> v) { entries.push_back({tag, 1, uint32_t(v.size()), v}); };
+    auto ascii = [&](uint16_t tag, const std::string& t) { entries.push_back({tag, 2, uint32_t(t.size() + 1), bytes(t.c_str(), t.size() + 1)}); };
+    auto rationals = [&](uint16_t tag, uint16_t type, const std::vector<double>& v) {
+        std::vector<int32_t> r;
+        for (double x : v) r.push_back(int32_t(std::lround(x * 10000))), r.push_back(10000);
+        entries.push_back({tag, type, uint32_t(v.size()), bytes(r.data(), r.size() * 4)});
+    };
+    const uint32_t dataBytes = uint32_t(w) * uint32_t(h) * 2;
+    longs(254, {0});
+    longs(256, {uint32_t(w)});
+    longs(257, {uint32_t(h)});
+    shorts(258, {16});
+    shorts(259, {1});
+    shorts(262, {32803});
+    ascii(271, "Montage");
+    ascii(272, "Test Camera");
+    longs(273, {8});  // the pixels follow the header
+    shorts(274, {uint16_t(orientation)});
+    shorts(277, {1});
+    longs(278, {uint32_t(h)});
+    longs(279, {dataBytes});
+    shorts(284, {1});
+    shorts(33421, {2, 2});
+    byteList(33422, {0, 1, 1, 2});
+    byteList(50706, {1, 4, 0, 0});
+    byteList(50707, {1, 1, 0, 0});
+    ascii(50708, "Montage Test Camera");
+    longs(50714, {0});
+    longs(50717, {65535});
+    // XYZ to camera: the camera is linear sRGB.
+    rationals(50721, 10, {3.2406, -1.5372, -0.4986, -0.9689, 1.8758, 0.0415, 0.0557, -0.2040, 1.0570});
+    rationals(50728, 5, {1, 1, 1});
+    shorts(50778, {21});
+    std::vector<uint8_t> file = {'I', 'I', 42, 0};
+    const uint32_t ifd = 8 + dataBytes;
+    file.insert(file.end(), reinterpret_cast<const uint8_t*>(&ifd), reinterpret_cast<const uint8_t*>(&ifd) + 4);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            const auto c = scene(x, y);
+            const int ch = (y % 2 == 0) ? (x % 2 == 0 ? 0 : 1) : (x % 2 == 0 ? 1 : 2);
+            const uint16_t v = uint16_t(std::clamp(c[size_t(ch)] * 0.8, 0.0, 1.0) * 65535 + 0.5);
+            file.push_back(uint8_t(v & 0xff)), file.push_back(uint8_t(v >> 8));
+        }
+    // The IFD, then the values too long to sit in it.
+    const uint32_t extra0 = ifd + 2 + uint32_t(entries.size()) * 12 + 4;
+    std::vector<uint8_t> extra;
+    const uint16_t n = uint16_t(entries.size());
+    file.push_back(uint8_t(n & 0xff)), file.push_back(uint8_t(n >> 8));
+    for (const Entry& e : entries) {
+        uint8_t rec[12] = {};
+        std::memcpy(rec, &e.tag, 2), std::memcpy(rec + 2, &e.type, 2), std::memcpy(rec + 4, &e.count, 4);
+        if (e.data.size() <= 4) std::memcpy(rec + 8, e.data.data(), e.data.size());
+        else {
+            const uint32_t at = extra0 + uint32_t(extra.size());
+            std::memcpy(rec + 8, &at, 4);
+            extra.insert(extra.end(), e.data.begin(), e.data.end());
+            if (extra.size() % 2) extra.push_back(0);
+        }
+        file.insert(file.end(), rec, rec + 12);
+    }
+    for (int i = 0; i < 4; ++i) file.push_back(0);
+    file.insert(file.end(), extra.begin(), extra.end());
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) return false;
+    const bool ok = std::fwrite(file.data(), 1, file.size(), f) == file.size();
+    std::fclose(f);
+    return ok;
 }
 
 MediaItem probeOrFail(Project& p, const std::string& path) {
@@ -1714,6 +1797,81 @@ private slots:
         QVERIFY(vm.hasAudio);
         QCOMPARE(vm.videoCodec, std::string("prores"));
         QVERIFY(std::fabs(vm.duration - 0.4) < 0.05);
+    }
+
+    void cameraRawStills() {
+        QVERIFY(isRawPath("/a/IMG_0001.CR3") && isRawPath("b.nef") && isRawPath("c.dng") && !isRawPath("d.jpg") && !isRawPath("raw"));
+        if (!rawAvailable()) QSKIP("Built without LibRaw");
+        // Red on the left, blue on the right, a grey band along the top.
+        auto scene = [](int x, int y) -> std::array<double, 3> {
+            if (y < 54) return {0.45, 0.45, 0.45};
+            return x < 192 ? std::array<double, 3>{0.7, 0.04, 0.04} : std::array<double, 3>{0.04, 0.04, 0.7};
+        };
+        const std::string dng = path("scene.dng");
+        QVERIFY(writeTestDng(dng, 384, 216, scene));
+        Project p = makeDefaultProject();
+        MediaItem m;
+        m.id = p.newId();
+        std::string err;
+        QVERIFY2(probeMedia(dng, m, &err), err.c_str());
+        QCOMPARE(int(m.kind), int(MediaKind::Image));
+        QCOMPARE(m.width, 384);
+        QCOMPARE(m.height, 216);
+        QCOMPARE(m.videoCodec, std::string("raw"));
+        QVERIFY2(QString::fromStdString(m.metadata["camera"]).contains("Test Camera"), m.metadata["camera"].c_str());
+        // Developed: the colours where they were, the grey neutral.
+        VideoDecoder dec;
+        QVERIFY2(dec.open(dng, &err), err.c_str());
+        QVERIFY(dec.isStill());
+        const Frame16Ptr f = dec.frameAt(0);
+        QVERIFY(f && f->width == 384 && f->height == 216);
+        auto px = [&](const Frame16& fr, int x, int y) {
+            const uint16_t* q = &fr.px[(size_t(y) * size_t(fr.width) + size_t(x)) * 4];
+            return std::array<double, 3>{q[0] / 65535.0, q[1] / 65535.0, q[2] / 65535.0};
+        };
+        const auto red = px(*f, 96, 140), blue = px(*f, 288, 140), grey = px(*f, 192, 25);
+        QVERIFY2(red[0] > 0.5 && red[1] < 0.25 && red[2] < 0.25, qPrintable(QString("%1 %2 %3").arg(red[0]).arg(red[1]).arg(red[2])));
+        QVERIFY2(blue[2] > 0.5 && blue[0] < 0.25 && blue[1] < 0.25, qPrintable(QString("%1 %2 %3").arg(blue[0]).arg(blue[1]).arg(blue[2])));
+        QVERIFY2(grey[0] > 0.3 && std::abs(grey[0] - grey[1]) < 0.03 && std::abs(grey[2] - grey[1]) < 0.03,
+                 qPrintable(QString("%1 %2 %3").arg(grey[0]).arg(grey[1]).arg(grey[2])));
+        // Scaled on request, as other stills are.
+        const Frame16Ptr small = dec.frameAt(0, 192, 108);
+        QVERIFY(small && small->width == 192 && small->height == 108);
+        QVERIFY(px(*small, 48, 70)[0] > 0.5);
+
+        // Shot in portrait: turned upright (the stored left half becomes the top).
+        const std::string tall = path("portrait.dng");
+        QVERIFY(writeTestDng(tall, 384, 216, scene, 6));
+        MediaItem pm;
+        QVERIFY(probeMedia(tall, pm, &err));
+        QCOMPARE(pm.width, 216);
+        QCOMPARE(pm.height, 384);
+        VideoDecoder up;
+        QVERIFY(up.open(tall, &err));
+        const Frame16Ptr u = up.frameAt(0);
+        QVERIFY(u && u->width == 216 && u->height == 384);
+        QVERIFY(px(*u, 80, 96)[0] > 0.5 && px(*u, 80, 288)[2] > 0.5);
+
+        // In a sequence, like any other still.
+        p.media.push_back(m);
+        Sequence& s = *p.active();
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 30, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        RenderOptions o;
+        o.scale = 0.25;
+        const Image frame = renderProgramFrame(p, s, 10, o);
+        const float* l = frame.at(frame.width / 4, frame.height * 2 / 3);
+        const float* r = frame.at(frame.width * 3 / 4, frame.height * 2 / 3);
+        QVERIFY2(l[0] > 0.5f && l[2] < 0.25f && r[2] > 0.5f && r[0] < 0.25f, qPrintable(QString("%1 %2").arg(l[0]).arg(r[2])));
+        // A file that is not raw at all says so.
+        const std::string bad = path("broken.cr2");
+        {
+            FILE* f2 = std::fopen(bad.c_str(), "wb");
+            QVERIFY(f2);
+            std::fputs("not a raw file", f2);
+            std::fclose(f2);
+        }
+        MediaItem none;
+        QVERIFY(!probeMedia(bad, none, &err) && !err.empty());
     }
 
     void gifAndImageSequences() {
