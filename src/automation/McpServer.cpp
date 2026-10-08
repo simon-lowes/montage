@@ -1193,9 +1193,12 @@ void McpServer::Impl::addTools() {
     add("montage_find_shots", "Find shots by description",
         "Search the project's footage by what it shows (\"a dog on a beach\", \"close-up of hands\"), with CLIP running on "
         "this computer. Videos not indexed yet are indexed first (once; the index is saved in the project). Returns the "
-        "best moments: media file and media times, best first.",
+        "best moments: media file and media times, best first. Give like instead of query to find moments that look like "
+        "a frame of the footage (the other takes of a shot, cutaways of the same place).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"query":{"type":"string"},
-            "max":{"type":"integer","default":10}},"required":["project","query"]})json",
+            "like":{"type":"object","properties":{"media":{"type":"string","description":"Media file or name in the project"},
+                "seconds":{"type":"number","description":"Media time of the frame"}},"required":["media","seconds"]},
+            "max":{"type":"integer","default":10}},"required":["project"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
             if (!visualSearchAvailable()) return fail("This build of Montage cannot search footage (no ONNX Runtime)");
@@ -1205,10 +1208,25 @@ void McpServer::Impl::addTools() {
             bool changed = false;
             if (const QString e = indexMissing(l.project, {}, changed); !e.isEmpty()) return fail(e);
             if (changed) save(l);
-            auto clip = ClipModel::load(&err);
-            const std::vector<float> q = clip ? clip->text(need(a, "query").toStdString(), &err) : std::vector<float>{};
-            if (q.empty()) return fail(QString::fromStdString(err));
-            const auto hits = findShots(l.project, q, size_t(std::clamp(a.value("max").toInt(10), 1, 100)));
+            const size_t max = size_t(std::clamp(a.value("max").toInt(10), 1, 100));
+            std::vector<ShotMatch> hits;
+            if (a.value("like").isObject()) {
+                const QJsonObject like = a.value("like").toObject();
+                const QString which = like.value("media").toString();
+                const MediaItem* from = nullptr;
+                for (const MediaItem& m : l.project.media)
+                    if (QString::fromStdString(m.name) == which || QString::fromStdString(m.path) == absolute(which)) from = &m;
+                if (!from) throw ArgError{QStringLiteral("No media \"%1\" in the project").arg(which)};
+                std::vector<float> image;
+                const double at = like.value("seconds").toDouble();
+                if (!embedFrame(from->path, at, image, &err)) return fail(QString::fromStdString(err));
+                hits = findSimilarShots(l.project, image, from->id, at, max);
+            } else {
+                auto clip = ClipModel::load(&err);
+                const std::vector<float> q = clip ? clip->text(need(a, "query").toStdString(), &err) : std::vector<float>{};
+                if (q.empty()) return fail(QString::fromStdString(err));
+                hits = findShots(l.project, q, max);
+            }
             QJsonArray list;
             QString text;
             for (const ShotMatch& h : hits) {

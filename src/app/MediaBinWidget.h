@@ -104,6 +104,8 @@ signals:
     void newTitleRequested();
     void newSequenceRequested();
     void createMulticamRequested(const std::vector<montage::Id>& media);
+    // Find Shots for moments like this video (its middle frame).
+    void findSimilarRequested(montage::Id media);
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;

@@ -71,7 +71,7 @@ bool visualIndexFromJson(const std::string& json, VisualIndex& out) {
     return true;
 }
 
-std::vector<ShotMatch> findShots(const Project& p, const std::vector<float>& query, size_t max) {
+std::vector<ShotMatch> findShots(const Project& p, const std::vector<float>& query, size_t max, float tolerance) {
     std::vector<ShotMatch> all;
     for (const MediaItem& m : p.media) {
         if (!m.visual || m.visual->samples.empty()) continue;
@@ -87,7 +87,7 @@ std::vector<ShotMatch> findShots(const Project& p, const std::vector<float>& que
         for (size_t peak : order) {
             if (used[peak]) continue;
             size_t a = peak, b = peak;
-            const float floorScore = score[peak] - 0.015f;
+            const float floorScore = score[peak] - tolerance;
             while (a > 0 && !used[a - 1] && score[a - 1] >= floorScore) --a;
             while (b + 1 < score.size() && !used[b + 1] && score[b + 1] >= floorScore) ++b;
             for (size_t k = a; k <= b; ++k) used[k] = true;
@@ -103,6 +103,16 @@ std::vector<ShotMatch> findShots(const Project& p, const std::vector<float>& que
     std::sort(all.begin(), all.end(), [](const ShotMatch& a, const ShotMatch& b) { return a.score > b.score; });
     if (all.size() > max) all.resize(max);
     return all;
+}
+
+std::vector<ShotMatch> findSimilarShots(const Project& p, const std::vector<float>& image, uint64_t fromMedia, double fromSeconds,
+                                        size_t max) {
+    std::vector<ShotMatch> hits = findShots(p, image, max + 4, 0.06f);
+    hits.erase(std::remove_if(hits.begin(), hits.end(),
+                              [&](const ShotMatch& h) { return h.media == fromMedia && fromSeconds >= h.start && fromSeconds <= h.end; }),
+               hits.end());
+    if (hits.size() > max) hits.resize(max);
+    return hits;
 }
 
 }  // namespace montage

@@ -217,6 +217,13 @@ void MainWindow::buildPanels() {
     connect(bin_, &MediaBinWidget::openInSource, this, &MainWindow::openInSource);
     connect(bin_, &MediaBinWidget::newTitleRequested, this, &MainWindow::addTitle);
     connect(bin_, &MediaBinWidget::newSequenceRequested, this, &MainWindow::newSequence);
+    connect(bin_, &MediaBinWidget::findSimilarRequested, this, [this](Id media) {
+        const MediaItem* m = state_->project().findMedia(media);
+        if (!m) return;
+        shotsDock_->show();
+        shotsDock_->raise();
+        shots_->searchSimilar(media, m->duration / 2);
+    });
     connect(bin_, &MediaBinWidget::createMulticamRequested, this, [this](const std::vector<Id>& media) {
         if (MulticamPanel::createMulticamDialog(state_, media, this)) {
             multicamDock_->show();
@@ -460,6 +467,7 @@ void MainWindow::buildMenus() {
         state_->apply(tr("Nest"), [sel, name](Project& p, Sequence& s) { return edit::makeCompound(p, s, sel, name.toStdString()); });
     });
     add(clipM, tr("Detect &Scene Cuts"), QKeySequence(), [this] { detectScenes(); });
+    add(clipM, tr("Find Similar S&hots"), QKeySequence(), [this] { findSimilarShots(); })->setObjectName(QStringLiteral("findSimilarShots"));
     add(clipM, tr("Normalize &Loudness…"), QKeySequence(), [this] { normalizeLoudness(); });
     add(clipM, tr("Auto &Duck Music…"), QKeySequence(), withSeq([this] {
             // The selected audio clips are the music.
@@ -1997,6 +2005,27 @@ void MainWindow::exportInterchange(Interchange format) {
     }
     st.setValue("lastExportDir", QFileInfo(path).absolutePath());
     statusBar()->showMessage(tr("Exported %1").arg(path), 4000);
+}
+
+void MainWindow::findSimilarShots() {
+    const Sequence* s = state_->sequence();
+    if (!s) return;
+    // The selected video clip, else the top one under the playhead; its frame at the playhead (or its middle).
+    const Clip* c = state_->primaryClip();
+    if (c && !(edit::locate(*s, c->id) && edit::locate(*s, c->id)->track.kind == TrackKind::Video)) c = nullptr;
+    for (int i = int(s->videoTracks.size()) - 1; !c && i >= 0; --i)
+        if (const Clip* under = edit::clipAt(*s, TrackRef{TrackKind::Video, i}, s->playhead); under && under->mediaId) c = under;
+    const MediaItem* m = c ? state_->project().findMedia(c->mediaId) : nullptr;
+    if (!m || m->kind != MediaKind::Video) {
+        statusBar()->showMessage(tr("Select a video clip, or put the playhead over one"), 5000);
+        return;
+    }
+    const FrameTime at = c->contains(s->playhead) ? s->playhead : c->start + c->duration / 2;
+    const double seconds = c->sourceFrameAt(at) / s->fpsValue();
+    shotsDock_->show();
+    shotsDock_->raise();
+    const int n = shots_->searchSimilar(m->id, seconds);
+    statusBar()->showMessage(tr("%n moment(s) like this one", "", n), 5000);
 }
 
 bool MainWindow::exportAafTo(const QString& path, QString* summary) {

@@ -1780,6 +1780,78 @@ private slots:
         for (const auto& turn : turns) QCOMPARE(turn.speaker, 0);
     }
 
+    void findSimilarShotsByFrame() {
+        if (!visualSearchAvailable() || !visualModel().installed()) QSKIP("Set MONTAGE_VISUAL_MODEL to the CLIP model");
+        // Two videos with the same two scenes (a red kitchen, a blue garden) in the opposite order.
+        auto scenes = [&](const std::string& file, bool kitchenFirst) {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 320;
+            gs.height = 180;
+            gs.fps = {25, 1};
+            for (int k = 0; k < 2; ++k) {
+                const bool kitchen = (k == 0) == kitchenFirst;
+                Clip c = makeGeneratorClip(gen, "color", 100);
+                c.generator.params["color.r"] = Param(kitchen ? 0.85 : 0.05);
+                c.generator.params["color.g"] = Param(kitchen ? 0.08 : 0.35);
+                c.generator.params["color.b"] = Param(kitchen ? 0.06 : 0.9);
+                c.start = k * 100;
+                edit::overwrite(gen, gs, {TrackKind::Video, 0}, c);
+                Clip t = makeGeneratorClip(gen, "title", 100);
+                t.generator.strings["text"] = kitchen ? "KITCHEN" : "GARDEN";
+                t.generator.params["size"] = Param(48.0);
+                t.start = k * 100;
+                edit::overwrite(gen, gs, {TrackKind::Video, 1}, t);
+            }
+            ExportSettings st;
+            st.path = path(file.c_str());
+            st.audioCodec = "none";
+            st.preset = "ultrafast";
+            std::string err;
+            return exportSequence(gen, gs, st, nullptr, nullptr, &err) ? st.path : std::string();
+        };
+        const std::string a = scenes("similar-a.mp4", true), b = scenes("similar-b.mp4", false);
+        QVERIFY(!a.empty() && !b.empty());
+        Project p = makeDefaultProject();
+        std::string err;
+        for (const std::string& f : {a, b}) {
+            MediaItem m = probeOrFail(p, f);
+            VisualIndex index;
+            QVERIFY2(indexVideo(f, 0, index, 0, {}, nullptr, &err), err.c_str());
+            m.visual = std::make_shared<const VisualIndex>(index);
+            p.media.push_back(m);
+        }
+        // Like the kitchen in A (at 1 s): the kitchen in B (4-8 s) first, A's own kitchen left out.
+        std::vector<float> like;
+        QVERIFY2(embedFrame(a, 1.0, like, &err), err.c_str());
+        QCOMPARE(int(like.size()), 512);
+        const auto hits = montage::findSimilarShots(p, like, p.media[0].id, 1.0, 5);
+        QVERIFY(!hits.empty());
+        QCOMPARE(hits[0].media, p.media[1].id);
+        QVERIFY2(hits[0].best >= 4 && hits[0].best <= 8, qPrintable(QString::number(hits[0].best)));
+        QVERIFY(hits[0].score > 0.9f);
+        for (const ShotMatch& h : hits) QVERIFY(!(h.media == p.media[0].id && h.start <= 1.0 && h.end >= 1.0));
+        // The gardens come after the kitchen.
+        for (size_t i = 1; i < hits.size(); ++i) QVERIFY(hits[i].score <= hits[0].score);
+
+        // Through MCP: like B's garden at 2 s finds A's garden (4-8 s).
+        const QString project = QString::fromStdString(path("similar.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_find_shots"},
+                                                     {"arguments", QJsonObject{{"project", project},
+                                                                               {"like", QJsonObject{{"media", QString::fromStdString(b)}, {"seconds", 2.0}}}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject first = r.value("structuredContent").toObject().value("moments").toArray()[0].toObject();
+        QVERIFY(first.value("media").toString().endsWith("similar-a.mp4"));
+        QVERIFY(first.value("best_seconds").toDouble() >= 4);
+    }
+
     void visualSearch() {
         // The index on its own: 8-bit samples keep similarities, and survive saving.
         VisualIndex vi;

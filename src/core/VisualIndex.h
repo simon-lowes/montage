@@ -42,6 +42,11 @@ struct ShotMatch {
 };
 // The best moments across the project's indexed media, best first: runs of
 // samples close to their media's best score are joined into one moment.
-std::vector<ShotMatch> findShots(const Project& p, const std::vector<float>& query, size_t max = 20);
+// `tolerance`: how far below a peak a neighbouring sample may score and still be part of its moment.
+std::vector<ShotMatch> findShots(const Project& p, const std::vector<float>& query, size_t max = 20, float tolerance = 0.015f);
+// The moments most like a frame (its image embedding), best first, leaving out the moment it comes from
+// (`fromMedia` at `fromSeconds`). Frames of one shot score alike, so moments are wider than for words.
+std::vector<ShotMatch> findSimilarShots(const Project& p, const std::vector<float>& image, uint64_t fromMedia, double fromSeconds,
+                                        size_t max = 20);
 
 }  // namespace montage

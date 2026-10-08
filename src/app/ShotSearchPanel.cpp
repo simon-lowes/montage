@@ -186,6 +186,28 @@ int ShotSearchPanel::search(const QString& queryText) {
     return int(results_.size());
 }
 
+int ShotSearchPanel::searchSimilar(Id media, double seconds) {
+    results_.clear();
+    const MediaItem* m = state_->project().findMedia(media);
+    if (!m || !visualSearchAvailable()) {
+        showResults();
+        return 0;
+    }
+    if (!indexMissing() && !visualModel().installed()) return 0;
+    std::string err;
+    std::vector<float> q;
+    if (!embedFrame(m->path, seconds, q, &err)) {
+        state_->message(QString::fromStdString(err), 6000);
+        return 0;
+    }
+    results_ = findSimilarShots(state_->project(), q, media, seconds, 30);
+    lastQuery_ = tr("Like %1").arg(QString::fromStdString(m->name));
+    query_->setText(QString());
+    query_->setPlaceholderText(lastQuery_);
+    showResults();
+    return int(results_.size());
+}
+
 void ShotSearchPanel::showResults() {
     const Sequence* s = state_->sequence();
     const Rational rate = s ? s->fps : Rational{30, 1};

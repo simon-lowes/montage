@@ -3168,6 +3168,19 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(state()->sourceIn() >= FrameTime(std::floor((top.start - 0.01) * fps)) && state()->sourceIn() < state()->sourceOut());
         QVERIFY(panel->search("a red image") > 0);
         QVERIFY2(panel->results().front().best < 4, qPrintable(QString::number(panel->results().front().best)));
+        // Find Similar Shots from the timeline: like the red scene at the playhead, leaving that moment out.
+        {
+            const Id media = ids[0];
+            QVERIFY(state()->apply("Place", [media](Project& p, Sequence& s) { return edit::placeMedia(p, s, media, 0, 0, -1, V1, A1, false); }));
+            state()->setPlayhead(25);
+            state()->setSelection({}, false);
+            win_->findChild<QAction*>("findSimilarShots")->trigger();
+            QVERIFY(!panel->results().empty());
+            for (const ShotMatch& h : panel->results()) QVERIFY(!(h.start <= 1.0 && h.end >= 1.0));
+            QVERIFY(panel->findChild<QLineEdit*>()->placeholderText().startsWith("Like"));
+            state()->undo();
+            QVERIFY(panel->search("a red image") > 0);
+        }
         // A result saved as a subclip is named after the search.
         const Id sub = panel->makeSubclip(0);
         QVERIFY(sub);

@@ -965,6 +965,9 @@ void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos)
         menu.addAction(tr("Create Multicam Clip..."), this, [this, sources] { emit createMulticamRequested(sources); })
             ->setObjectName(QStringLiteral("createMulticam"));
     }
+    if (videos.size() == 1)
+        menu.addAction(tr("Find Similar Shots"), this, [this, v = videos.front()] { emit findSimilarRequested(v); })
+            ->setObjectName(QStringLiteral("binFindSimilar"));
     std::vector<Id> scalable;  // footage and stills, not graphics drawn at any size
     for (Id id : pictures)
         if (const MediaItem* m = state_->project().findMedia(id); m && m->videoCodec != "svg" && m->videoCodec != "lottie")

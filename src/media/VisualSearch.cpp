@@ -326,6 +326,26 @@ LabelEmbeddings ClipModel::labels(std::string* error) const {
     return out;
 }
 
+bool embedFrame(const std::string& path, double seconds, std::vector<float>& out, std::string* error) {
+    std::shared_ptr<ClipModel> model = ClipModel::load(error);
+    if (!model) return false;
+    VideoDecoder dec;
+    if (!dec.open(path, error)) return false;
+    // As the index samples it: the short side at CLIP's size, keeping the shape.
+    const int dw = std::max(1, dec.displayWidth()), dh = std::max(1, dec.displayHeight());
+    const double k = double(kClipInput) / std::min(dw, dh);
+    const int w = std::max(kClipInput, int(std::lround(dw * k))), h = std::max(kClipInput, int(std::lround(dh * k)));
+    Frame16Ptr f = dec.frameAt(std::max(0.0, seconds), w, h, true);
+    if (!f) {
+        if (error) *error = "Cannot read that frame of " + path;
+        return false;
+    }
+    const auto embeds = model->images({f}, error);
+    if (embeds.size() != 1 || embeds[0].empty()) return false;
+    out = embeds[0];
+    return true;
+}
+
 bool indexVideo(const std::string& path, double duration, VisualIndex& out, double step,
                 const std::function<void(double)>& progress, const std::atomic<bool>* cancel, std::string* error) {
     std::shared_ptr<ClipModel> model = ClipModel::load(error);

@@ -32,6 +32,8 @@ public:
 
     // Searches (indexing unindexed videos first, after asking). Returns the number of moments found.
     int search(const QString& query);
+    // Searches for moments that look like `media` at `seconds` (CLIP image to image), leaving that moment out.
+    int searchSimilar(Id media, double seconds);
     // Indexes the project's videos that have no index yet; false if cancelled or failed.
     bool indexMissing();
     const std::vector<ShotMatch>& results() const { return results_; }

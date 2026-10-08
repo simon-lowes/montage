@@ -531,3 +531,7 @@ All 15 items are in (October 2026). The near misses listed in the roadmap are th
     - video tracks, because the turnover is for sound;
     - track volume, pan and plugin effects, which the mixer redoes;
     - testing against Pro Tools itself, which is not available here.
+
+## After Phase 3: the near misses
+
+- [x] Find Similar Shots: a frame's CLIP image embedding (`embedFrame`, sampled as the index samples) ranked against every indexed video with `findSimilarShots`, which widens moments for image-to-image scores (a 0.06 band, against 0.015 for words) and leaves out the moment the frame comes from. Available from Clip › Find Similar Shots (the selected or topmost video clip at the playhead), the bin's context menu (a video's middle frame), and MCP `montage_find_shots` with `like` instead of `query`. Tested with two videos holding the same two scenes in opposite order: a kitchen frame from one finds the other's kitchen first (score over 0.9) and never itself; the same through MCP and from the app's timeline.

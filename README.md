@@ -175,6 +175,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
   - It runs locally: CLIP ViT-B/32 (OpenAI, MIT) on ONNX Runtime, a 190 MB one-time download.
   - On the command line: `montage-cli shots project.montage "a red car at night"`.
   - Right-click a result to save it as a subclip named after the search.
+- **Find Similar Shots** (Clip menu, or right-click a video in the bin): the moments across the project that look like the frame at the playhead (the other takes of a shot, cutaways of the same place), from the same CLIP index, leaving out the moment you are on.
 - **Auto-Tag Shots** (right-click videos in the media bin): adds keywords for what each shot shows, using the same index. The keywords are Close-up, Medium shot or Wide shot; Interior or Exterior; Day or Night; and People. They work in searches and smart bins, and a subclip is tagged from its own range.
 - Edit by transcript (Transcript panel):
   - **Sequence mode** shows what the cut says, with the word under the playhead highlighted. Click a word to go there. Select words and press Delete to cut them out of every track; the gap closes and the captions move with it.

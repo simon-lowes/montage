@@ -55,6 +55,9 @@ bool indexVideo(const std::string& path, double duration, VisualIndex& out, doub
                 const std::function<void(double)>& progress = {}, const std::atomic<bool>* cancel = nullptr,
                 std::string* error = nullptr);
 
+// The image embedding of the frame of `path` at `seconds` (unit length, as for an index sample).
+bool embedFrame(const std::string& path, double seconds, std::vector<float>& out, std::string* error = nullptr);
+
 // The size CLIP looks at: frames are scaled so their short side is this, then centre-cropped square.
 constexpr int kClipInput = 224;
 
