@@ -5255,6 +5255,14 @@ private slots:
             QVERIFY(tool("montage_add_marker", QJsonObject{{"project", project}, {"at", 9999}, {"clip", double(first.id)}}).value("isError").toBool());
             QVERIFY(!tool("montage_undo", QJsonObject{{"project", project}}).value("isError").toBool());
         }
+        // Marker lists in and out.
+        r = tool("montage_import_markers", QJsonObject{{"project", project}, {"text", "Timecode,Comment\n00:00:00:05,Check the title\n"}});
+        QVERIFY2(!r.value("isError").toBool() && text(r).contains("Added 1"), qPrintable(text(r)));
+        r = tool("montage_export_markers", QJsonObject{{"project", project}, {"format", "avid"}});
+        QVERIFY2(!r.value("isError").toBool() && text(r).contains("\t00:00:00:05\tV1\t"), qPrintable(text(r)));
+        QVERIFY(tool("montage_export_markers", QJsonObject{{"project", project}, {"format", "pdf"}}).value("isError").toBool());
+        QVERIFY(tool("montage_import_markers", QJsonObject{{"project", project}, {"text", "nothing here"}}).value("isError").toBool());
+        QVERIFY(!tool("montage_undo", QJsonObject{{"project", project}}).value("isError").toBool());
         r = tool("montage_add_marker", QJsonObject{{"project", project}, {"at", 0.1}, {"name", "Look"}});
         QVERIFY(!r.value("isError").toBool());
         Project saved;

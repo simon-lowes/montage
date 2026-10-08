@@ -749,6 +749,32 @@ private slots:
         QCOMPARE(tabs->tabText(1), QString("Main cut"));
     }
 
+    void markerListsFromTheMenu() {
+        loadDemo();
+        QVERIFY(win_->findChild<QAction*>("exportMarkers") && win_->findChild<QAction*>("importMarkers"));
+        state()->edit("Markers", [](Project&, Sequence& s) {
+            edit::addMarker(s, Marker{10, 0, "One", "first", 0});
+            edit::addMarker(s, Marker{40, 5, "Two", "", 6});
+            return true;
+        });
+        const QString csv = dir_.path() + "/markers.csv";
+        QVERIFY(win_->exportMarkers(csv));
+        QVERIFY(win_->exportMarkers(dir_.path() + "/markers.txt"));
+        QVERIFY(win_->exportMarkers(dir_.path() + "/markers.edl"));
+        QFile edl(dir_.path() + "/markers.edl");
+        QVERIFY(edl.open(QIODevice::ReadOnly) && edl.readAll().contains("|M:Two"));
+        const auto saved = state()->sequence()->markers;
+        state()->edit("Clear", [](Project&, Sequence& s) {
+            s.markers.clear();
+            return true;
+        });
+        QCOMPARE(win_->importMarkers(csv), 2);
+        QCOMPARE(state()->sequence()->markers, saved);
+        state()->undo();
+        QVERIFY(state()->sequence()->markers.empty());
+        QCOMPARE(win_->importMarkers(dir_.path() + "/missing.csv"), 0);
+    }
+
     void razorTool() {
         loadDemo();
         timeline()->setTool(TimelineWidget::Tool::Razor);

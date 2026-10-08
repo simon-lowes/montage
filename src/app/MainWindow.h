@@ -91,6 +91,10 @@ public:
     bool addFrameHold();                              // the clip under the playhead
     // Copies the chapter markers (within In to Out when set) as YouTube's chapter list; returns the text.
     QString copyYoutubeChapters();
+    // The sequence's markers as a CSV (.csv), Avid locators (.txt) or a Resolve marker EDL (.edl); markers from a CSV
+    // or Avid locator file, as one undo step (returns how many).
+    bool exportMarkers(const QString& path);
+    int importMarkers(const QString& path);
     // Bakes the colour effects of the clip a command acts on, at the playhead, into a .cube file.
     bool exportClipLut(const QString& path, int size = 33);
     bool swapClip(bool withNext);                     // the selected clip (or the one under the playhead) with its neighbour

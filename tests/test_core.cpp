@@ -16,6 +16,7 @@
 #include "core/Effects.h"
 #include "core/History.h"
 #include "core/Interchange.h"
+#include "core/MarkerList.h"
 #include "core/KeyframeEdit.h"
 #include "core/MediaLog.h"
 #include "core/Multicam.h"
@@ -2419,6 +2420,45 @@ private slots:
         QVERIFY(std::any_of(xm.begin(), xm.end(), [](const Marker& m) { return m.chapter && m.name == "Part 1" && m.t == 5; }));
         QVERIFY(edit::removeClipMarkerAt(s, second, 40));
         QCOMPARE(edit::clipById(s, second)->markers.size(), size_t(1));
+    }
+
+    void markerLists() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = Rational{25, 1};
+        edit::overwrite(p, s, {TrackKind::Video, 0}, makeGeneratorClip(p, "color", 25 * 60));
+        s.markers = {Marker{50, 25, "Intro, part 1", "Say \"hi\"", 11, false}, Marker{500, 0, "Chapter two", "", 0, true}};
+        // CSV with Premiere's columns, quoted where needed, and read back exactly.
+        const std::string csv = markersToCsv(s);
+        QVERIFY(csv.rfind("Marker Name,Description,In,Out,Duration,Marker Type,Color\n", 0) == 0);
+        QVERIFY(csv.find("\"Intro, part 1\",\"Say \"\"hi\"\"\",00:00:02:00,00:00:03:00,00:00:01:00,Comment,Red") != std::string::npos);
+        QVERIFY(csv.find("Chapter two,,00:00:20:00,00:00:20:00,00:00:00:00,Chapter,") != std::string::npos);
+        std::vector<Marker> back;
+        std::string err;
+        QVERIFY2(parseMarkerList(csv, s, back, &err), err.c_str());
+        QCOMPARE(back, s.markers);
+        // Avid locators, and back (name and colour; the comment joins the name).
+        const std::string avid = markersToAvidLocators(s);
+        QVERIFY(avid.find("Montage\t00:00:02:00\tV1\tred\tIntro, part 1: Say \"hi\"\t1\n") != std::string::npos);
+        QVERIFY(parseMarkerList(avid, s, back, &err));
+        QCOMPARE(back.size(), size_t(2));
+        QCOMPARE(back[0].t, FrameTime(50));
+        QCOMPARE(back[0].color, 11);
+        QCOMPARE(QString::fromStdString(back[1].name), QString("Chapter two"));
+        // A marker EDL Resolve reads.
+        const std::string edl = markersToResolveEdl(s);
+        QVERIFY(edl.find("001  001      V     C        00:00:02:00 00:00:02:01 00:00:02:00 00:00:02:01") != std::string::npos);
+        QVERIFY(edl.find(" |C:ResolveColorRed |M:Intro, part 1 |D:25") != std::string::npos);
+        // A review tool's notes, on a timeline that starts at 01:00:00:00, with a byte-order mark.
+        QVERIFY(parseMarkerList("\xEF\xBB\xBFTimecode,Comment,Commenter\n01:00:04:00,Fix the colour,Sam\n01:00:10:12,\"Cut, here\",Ana\n", s, back, &err));
+        QCOMPARE(back.size(), size_t(2));
+        QCOMPARE(back[0].t, FrameTime(100));
+        QCOMPARE(QString::fromStdString(back[0].comment), QString("Fix the colour"));
+        QCOMPARE(back[1].t, FrameTime(262));
+        QCOMPARE(QString::fromStdString(back[1].comment), QString("Cut, here"));
+        // Nothing usable.
+        QVERIFY(!parseMarkerList("", s, back, &err));
+        QVERIFY(!parseMarkerList("Name,In\nA,soon\n", s, back, &err));
     }
 
     void chapterMarkers() {

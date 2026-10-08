@@ -22,6 +22,7 @@
 #include "core/Automation.h"
 #include "core/Captions.h"
 #include "core/Chapters.h"
+#include "core/MarkerList.h"
 #include "core/Bleep.h"
 #include "core/Checkerboard.h"
 #include "core/EditOps.h"
@@ -1045,6 +1046,48 @@ void McpServer::Impl::addTools() {
                 save(l);
             }
             return ok(issues.empty() ? QStringLiteral("No problems found.") : QStringLiteral("%1 problem(s):\n").arg(issues.size()) + text);
+        });
+
+    add("montage_export_markers", "Export markers",
+        "The sequence's markers as a marker list: csv (Premiere's columns: name, description, in, out, duration, type, colour), "
+        "avid (Media Composer locators) or edl (a marker EDL DaVinci Resolve imports). Written to `path` when given.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"format":{"type":"string","enum":["csv","avid","edl"],"default":"csv"},
+            "path":{"type":"string"}},"required":["project"]})json",
+        true, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            const Sequence& s = l.seq();
+            const QString format = str(a, "format", "csv").toLower();
+            if (format != "csv" && format != "avid" && format != "edl") throw ArgError{QStringLiteral("\"format\" must be csv, avid or edl")};
+            const std::string text = format == "avid" ? markersToAvidLocators(s) : format == "edl" ? markersToResolveEdl(s) : markersToCsv(s);
+            if (a.contains("path")) {
+                QFile f(absolute(need(a, "path")));
+                if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate) || f.write(text.data(), qint64(text.size())) != qint64(text.size()))
+                    return fail(QStringLiteral("Cannot write %1").arg(f.fileName()));
+                return ok(QStringLiteral("Wrote %1 marker(s) to %2").arg(s.markers.size()).arg(f.fileName()));
+            }
+            return ok(QString::fromStdString(text));
+        });
+
+    add("montage_import_markers", "Import markers",
+        "Add markers from a marker list: a CSV with a header row (name, description or notes, in or timecode, out or duration, "
+        "type, colour), as review tools and Premiere write them, or Avid locator lines. Give the file's `path` or its `text`.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"path":{"type":"string"},"text":{"type":"string"}},
+            "required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            std::string text = str(a, "text").toStdString();
+            if (a.contains("path")) {
+                QFile f(absolute(need(a, "path")));
+                if (!f.open(QIODevice::ReadOnly)) return fail(QStringLiteral("Cannot read %1").arg(f.fileName()));
+                text = f.readAll().toStdString();
+            }
+            std::vector<Marker> markers;
+            std::string err;
+            if (!parseMarkerList(text, s, markers, &err)) return fail(QString::fromStdString(err));
+            for (const Marker& m : markers) edit::addMarker(s, m);
+            save(l);
+            return ok(QStringLiteral("Added %1 marker(s)").arg(markers.size()));
         });
 
     add("montage_transcribe", "Transcribe",

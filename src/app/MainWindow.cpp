@@ -50,6 +50,7 @@
 #include "AudioMeterWidget.h"
 #include "audio/PluginEffect.h"
 #include "core/Chapters.h"
+#include "core/MarkerList.h"
 #include "render/LutExport.h"
 #include "media/Decoder.h"
 #include "media/HwAccel.h"
@@ -770,6 +771,19 @@ void MainWindow::buildMenus() {
     add(seqM, tr("Add C&hapter Marker"), QKeySequence("Alt+M"), [this] { addChapterMarker(); })->setObjectName(QStringLiteral("addChapter"));
     add(seqM, tr("Add C&lip Marker"), QKeySequence("Shift+Alt+M"), [this] { addClipMarker(); })->setObjectName(QStringLiteral("addClipMarker"));
     add(seqM, tr("Copy Chapters for YouTube"), QKeySequence(), [this] { copyYoutubeChapters(); })->setObjectName(QStringLiteral("copyChapters"));
+    add(seqM, tr("Export Markers…"), QKeySequence(), [this] {
+        QString filter;
+        const QString path = QFileDialog::getSaveFileName(this, tr("Export Markers"), QString(),
+                                                          tr("Marker list (*.csv);;Avid locators (*.txt);;Resolve marker EDL (*.edl)"), &filter);
+        if (path.isEmpty()) return;
+        QString file = path;
+        if (QFileInfo(file).suffix().isEmpty()) file += filter.contains("*.txt") ? ".txt" : filter.contains("*.edl") ? ".edl" : ".csv";
+        exportMarkers(file);
+    })->setObjectName(QStringLiteral("exportMarkers"));
+    add(seqM, tr("Import Markers…"), QKeySequence(), [this] {
+        const QString path = QFileDialog::getOpenFileName(this, tr("Import Markers"), QString(), tr("Marker lists (*.csv *.txt *.tsv)"));
+        if (!path.isEmpty()) importMarkers(path);
+    })->setObjectName(QStringLiteral("importMarkers"));
     add(seqM, tr("&Quality Check…"), QKeySequence(), [this] {
         if (!state_->sequence()) return;
         QualityCheckDialog dlg(state_, this);
@@ -1358,6 +1372,41 @@ void MainWindow::addClipMarker() {
     const Id id = target->id;
     const std::string name = "Marker " + std::to_string(target->markers.size() + 1);
     state_->edit(tr("Add Clip Marker"), [id, t, name](Project&, Sequence& sq) { return edit::addClipMarker(sq, id, t, Marker{0, 0, name, "", 0}); });
+}
+
+bool MainWindow::exportMarkers(const QString& path) {
+    const Sequence* s = state_->sequence();
+    if (!s) return false;
+    const QString ext = QFileInfo(path).suffix().toLower();
+    const std::string text = ext == QLatin1String("txt") ? markersToAvidLocators(*s) : ext == QLatin1String("edl") ? markersToResolveEdl(*s) : markersToCsv(*s);
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate) || f.write(text.data(), qint64(text.size())) != qint64(text.size())) {
+        statusBar()->showMessage(tr("Cannot write %1").arg(path), 6000);
+        return false;
+    }
+    statusBar()->showMessage(tr("Exported %n marker(s) to %1", nullptr, int(s->markers.size())).arg(QFileInfo(path).fileName()), 6000);
+    return true;
+}
+
+int MainWindow::importMarkers(const QString& path) {
+    const Sequence* s = state_->sequence();
+    QFile f(path);
+    if (!s || !f.open(QIODevice::ReadOnly)) {
+        statusBar()->showMessage(tr("Cannot read %1").arg(path), 6000);
+        return 0;
+    }
+    std::vector<Marker> markers;
+    std::string err;
+    if (!parseMarkerList(f.readAll().toStdString(), *s, markers, &err)) {
+        statusBar()->showMessage(QString::fromStdString(err), 6000);
+        return 0;
+    }
+    state_->edit(tr("Import Markers"), [&](Project&, Sequence& sq) {
+        for (const Marker& m : markers) edit::addMarker(sq, m);
+        return true;
+    });
+    statusBar()->showMessage(tr("Imported %n marker(s)", nullptr, int(markers.size())), 6000);
+    return int(markers.size());
 }
 
 QString MainWindow::copyYoutubeChapters() {
