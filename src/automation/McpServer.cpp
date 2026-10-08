@@ -42,6 +42,7 @@
 #include "render/VoiceMatch.h"
 #include "media/Analysis.h"
 #include "media/AutoDuck.h"
+#include "core/Slate.h"
 #include "media/Decoder.h"
 #include "media/Faces.h"
 #include "media/DepthMap.h"
@@ -1789,8 +1790,9 @@ void McpServer::Impl::addTools() {
 
     add("montage_log_media", "Log media",
         "Log media in a project as an editor does, to find it again: a rating (-1 rejects, 0 unrated, 1-5 stars), a colour "
-        "label, keywords to add or remove, metadata fields (scene, shot, take, camera, device, description, comment, or name) "
-        "and the bin it is in (\"Interviews/Day 1\"; \"\" for the top level).",
+        "label, keywords to add or remove, metadata fields (scene, shot, take, camera, device, description, comment, or name), "
+        "the scene, shot and take read from the slate called at the head of a transcribed take, and the bin it is in "
+        "(\"Interviews/Day 1\"; \"\" for the top level).",
         R"json({"type":"object","properties":{"project":{"type":"string"},
             "media":{"type":["string","array"],"items":{"type":"string"},"description":"Media files or names in the project"},
             "rating":{"type":"integer","minimum":-1,"maximum":5},
@@ -1798,6 +1800,7 @@ void McpServer::Impl::addTools() {
             "add_keywords":{"type":["array","string"],"items":{"type":"string"}},
             "remove_keywords":{"type":["array","string"],"items":{"type":"string"}},
             "fields":{"type":"object","additionalProperties":{"type":"string"},"description":"Field name to text; empty text clears it"},
+            "from_slate":{"type":"boolean","description":"Set scene, shot and take from the slate called at the head of each (\"Scene 12 apple, take 3\"), from its transcript"},
             "bin":{"type":"string"}},"required":["project","media"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
@@ -1811,6 +1814,15 @@ void McpServer::Impl::addTools() {
                 const MediaField* f = mediaField(it.key().toStdString());
                 if (!f || !f->editable || it.key() == "rating" || it.key() == "label" || it.key() == "keywords")
                     throw ArgError{QStringLiteral("\"%1\" is not a field to set; use scene, shot, take, camera, device, description, comment or name").arg(it.key())};
+            }
+            int slates = 0;
+            if (a.value("from_slate").toBool()) {
+                std::vector<Id> ids;
+                for (MediaItem* m : items) {
+                    if (!m->transcript) throw ArgError{QStringLiteral("%1 has no transcript: transcribe it first").arg(QString::fromStdString(m->name))};
+                    ids.push_back(m->id);
+                }
+                slates = logFromSlates(l.project, ids);
             }
             for (MediaItem* m : items) {
                 if (a.value("rating").isDouble()) {
@@ -1840,7 +1852,10 @@ void McpServer::Impl::addTools() {
                 logJson(*m, o);
                 out.append(o);
             }
-            return ok(QStringLiteral("Logged %1 media item(s)").arg(items.size()), QJsonObject{{"media", out}});
+            return ok(QStringLiteral("Logged %1 media item(s)%2").arg(items.size()).arg(a.value("from_slate").toBool()
+                                                                                         ? QStringLiteral(", %1 from spoken slates").arg(slates)
+                                                                                         : QString()),
+                      QJsonObject{{"media", out}, {"from_slates", slates}});
         });
 
     add("montage_find_media", "Find media",

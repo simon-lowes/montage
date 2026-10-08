@@ -45,6 +45,7 @@
 #include "Theme.h"
 #include "ThumbnailCache.h"
 #include "TranscribeDialog.h"
+#include "core/Slate.h"
 #include "core/MediaLog.h"
 #include "core/AutoTag.h"
 #include "media/Analysis.h"
@@ -897,6 +898,17 @@ void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos)
         bool anyTranscript = false;
         for (Id id : withSound)
             if (const MediaItem* m = state_->project().findMedia(id)) anyTranscript |= bool(m->transcript);
+        if (anyTranscript)
+            menu.addAction(tr("Log from Spoken Slate"), this, [this, withSound] {
+                int n = 0;
+                state_->edit(tr("Log from Spoken Slate"), [withSound, &n](Project& p, Sequence&) {
+                    n = logFromSlates(p, withSound);
+                    return n > 0;
+                });
+                state_->message(n ? tr("Logged scene, shot and take for %n clip(s) from their spoken slates", nullptr, n)
+                                  : tr("No slate (\"Scene 12 apple, take 3\") was heard at the head of these clips"),
+                                5000);
+            })->setObjectName(QStringLiteral("logFromSlate"));
         if (anyTranscript)
             menu.addAction(tr("Remove Transcript"), this, [this, withSound] {
                 state_->edit(tr("Remove Transcript"), [withSound](Project& p, Sequence&) {

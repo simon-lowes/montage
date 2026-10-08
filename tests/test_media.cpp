@@ -81,6 +81,7 @@
 #include "render/Exporter.h"
 #include "render/Processing.h"
 #include "media/CameraRaw.h"
+#include "core/Slate.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -3211,6 +3212,53 @@ private slots:
         Project back;
         QVERIFY(loadProject(project.toStdString(), back, &err));
         QVERIFY(isRed(renderSequenceFrame(back, *back.active(), 0, {}), 0.03, 0.03));
+    }
+
+    void slateFromSpeech() {
+        const QByteArray whisper = qgetenv("MONTAGE_TEST_WHISPER_MODEL");
+        if (!ttsAvailable() || !ttsModel().installed() || whisper.isEmpty())
+            QSKIP("Set MONTAGE_TTS_MODEL and MONTAGE_TEST_WHISPER_MODEL to test slates from speech");
+        // A take that opens with its slate called out, then the line.
+        std::vector<float> audio;
+        std::string err;
+        QVERIFY2(synthesizeSpeech("Scene twelve, take three. Action! The meeting starts at nine.", "am_michael", 1.0, audio, &err), err.c_str());
+        const std::string wav = path("slate.wav");
+        QVERIFY(writeSpeechWav(wav, audio, &err));
+        Project p = makeDefaultProject();
+        MediaItem m = probeOrFail(p, wav);
+        TranscribeOptions opts;
+        opts.model = whisper.toStdString();
+        Transcript t;
+        QVERIFY2(transcribeMedia(wav, opts, t, {}, nullptr, &err), err.c_str());
+        m.transcript = std::make_shared<const Transcript>(t);
+        p.media.push_back(m);
+        MediaItem plain = probeOrFail(p, MONTAGE_TEST_DATA_DIR "/jfk.wav");  // no slate in it
+        Transcript jfk;
+        QVERIFY(transcribeMedia(plain.path, opts, jfk, {}, nullptr, &err));
+        plain.transcript = std::make_shared<const Transcript>(jfk);
+        p.media.push_back(plain);
+        QCOMPARE(logFromSlates(p), 1);
+        QCOMPARE(QString::fromStdString(p.media[0].metadata["scene"]), QString("12"));
+        QCOMPARE(QString::fromStdString(p.media[0].metadata["take"]), QString("3"));
+        QVERIFY(p.media[1].metadata["scene"].empty());
+        // Over MCP, on a saved project.
+        p.media[0].metadata.clear();
+        const QString project = QString::fromStdString(path("slate.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_log_media"},
+                                                     {"arguments", QJsonObject{{"project", project}, {"media", "slate.wav"}, {"from_slate", true}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("from_slates").toInt(), 1);
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(QString::fromStdString(back.media[0].metadata["scene"]), QString("12"));
+        QCOMPARE(QString::fromStdString(back.media[0].metadata["take"]), QString("3"));
     }
 
     void mcpSwapsClips() {

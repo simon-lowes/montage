@@ -21,6 +21,7 @@
 #include "core/ScriptCut.h"
 #include "core/Surround.h"
 #include "core/Transcript.h"
+#include "core/Slate.h"
 #include "core/TranscriptEdit.h"
 #include "core/Zip.h"
 #include "core/G2p.h"
@@ -2212,6 +2213,43 @@ private slots:
         const Clip& da = dup.audioTracks[0].clips[0];
         QVERIFY(dv.linkGroup != 0 && dv.linkGroup == da.linkGroup && dv.linkGroup != orig.videoTracks[0].clips[0].linkGroup);
         QCOMPARE(duplicateSequence(fx.p, 987654), Id(0));
+    }
+
+    void spokenSlates() {
+        // A transcript of words said one after another, a third of a second each, from `at`.
+        auto said = [](const char* text, double at = 0.5) {
+            Transcript t;
+            TranscriptSegment seg;
+            double time = at;
+            for (const QString& w : QString(text).split(' ', Qt::SkipEmptyParts)) {
+                seg.words.push_back({time, time + 0.3, w.toStdString()});
+                time += 0.35;
+            }
+            seg.start = at, seg.end = time;
+            t.segments.push_back(seg);
+            return t;
+        };
+        auto check = [&](const char* text, const char* scene, const char* shot, const char* take) {
+            const auto s = slateFromTranscript(said(text));
+            QVERIFY2(s, text);
+            QCOMPARE(QString::fromStdString(s->scene), QString(scene));
+            QCOMPARE(QString::fromStdString(s->shot), QString(shot));
+            QCOMPARE(QString::fromStdString(s->take), QString(take));
+        };
+        check("Scene twelve apple, take three.", "12", "A", "3");
+        check("Slate 42, take 1.", "42", "", "1");
+        check("12B take 2", "12", "B", "2");
+        check("Scene one hundred and four bravo, take twenty one.", "104", "B", "21");
+        check("Shot C, take 4.", "", "C", "4");
+        check("Okay. Scene 7 Charlie. Take 11. Action!", "7", "C", "11");
+        check("scene thirty-five take two", "35", "", "2");
+        // When it was said.
+        QCOMPARE(slateFromTranscript(said("Rolling. Scene 3 take 1", 1.0))->at, 1.35);
+        // No slate: ordinary speech, "take" without a number, or a slate called too late.
+        QVERIFY(!slateFromTranscript(said("Hello and welcome to the show.")));
+        QVERIFY(!slateFromTranscript(said("Let's take a break and come back.")));
+        QVERIFY(!slateFromTranscript(said("Scene 4 take 2", 30.0)));
+        QVERIFY(slateFromTranscript(said("Scene 4 take 2", 30.0), 40.0));
     }
 
     void swapClips() {
