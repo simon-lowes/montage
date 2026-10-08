@@ -88,6 +88,42 @@ std::string wrapCaptionText(const std::string& textIn, int lineChars, int maxLin
     return lines.join('\n').toStdString();
 }
 
+namespace {
+
+QStringList captionWords(const Caption& c) {
+    static const QRegularExpression space(QStringLiteral("\\s+"));
+    return QString::fromStdString(c.text).split(space, Qt::SkipEmptyParts);
+}
+
+}  // namespace
+
+std::vector<double> captionWordStarts(const Caption& c) {
+    const QStringList words = captionWords(c);
+    if (words.isEmpty()) return {};
+    if (c.wordTimes.size() == size_t(words.size())) return c.wordTimes;
+    // Unknown: longer words take longer to say.
+    double total = 0;
+    for (const QString& w : words) total += double(w.size()) + 1;
+    std::vector<double> out;
+    double at = 0;
+    for (const QString& w : words) {
+        out.push_back(at / total);
+        at += double(w.size()) + 1;
+    }
+    return out;
+}
+
+int captionWordAt(const Caption& c, FrameTime t) {
+    if (t < c.start) return -1;
+    const auto starts = captionWordStarts(c);
+    if (starts.empty()) return -1;
+    const double f = (double(t - c.start) + 0.5) / double(std::max<FrameTime>(1, c.end - c.start));
+    int w = 0;
+    for (size_t i = 0; i < starts.size(); ++i)
+        if (starts[i] <= f) w = int(i);
+    return w;
+}
+
 std::vector<Caption> captionsFromTranscripts(const Project& p, const Sequence& seq, const CaptionRules& rules) {
     const double fps = seq.fpsValue() > 0 ? seq.fpsValue() : 30.0;
     std::vector<TranscriptWord> words = sequenceTranscriptWords(p, seq);
@@ -99,11 +135,19 @@ std::vector<Caption> captionsFromTranscripts(const Project& p, const Sequence& s
     t.segments.push_back(std::move(seg));
     const auto cues = transcriptCues(t, rules.lineChars * std::max(1, rules.maxLines), rules.maxSeconds);
     std::vector<Caption> out;
+    std::vector<std::vector<double>> wordFrames;  // when each of a caption's words starts, in frames
+    const auto& all = t.segments.front().words;
+    size_t next = 0;
     for (const Cue& c : cues) {
         Caption cap;
         cap.start = FrameTime(std::llround(c.start * fps));
         cap.end = std::max(cap.start + 1, FrameTime(std::llround(c.end * fps)));
         cap.text = wrapCaptionText(c.text, rules.lineChars, rules.maxLines);
+        // The cue's words are the next ones of the transcript.
+        const int n = int(captionWords(cap).size());
+        std::vector<double> frames;
+        for (int k = 0; k < n && next < all.size(); ++k, ++next) frames.push_back(all[next].start * fps);
+        wordFrames.push_back(int(frames.size()) == n ? frames : std::vector<double>{});
         out.push_back(std::move(cap));
     }
     // Short captions stay up a little longer when there is room.
@@ -111,6 +155,8 @@ std::vector<Caption> captionsFromTranscripts(const Project& p, const Sequence& s
     for (size_t i = 0; i < out.size(); ++i) {
         const FrameTime limit = i + 1 < out.size() ? out[i + 1].start : std::numeric_limits<FrameTime>::max();
         if (out[i].end - out[i].start < minLen) out[i].end = std::min(out[i].start + minLen, limit);
+        const double len = double(std::max<FrameTime>(1, out[i].end - out[i].start));
+        for (double f : wordFrames[i]) out[i].wordTimes.push_back(std::clamp((f - double(out[i].start)) / len, 0.0, 0.999));
     }
     normalizeCaptions(out);
     return out;

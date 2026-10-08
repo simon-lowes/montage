@@ -582,23 +582,59 @@ void drawCaption(Image& img, const CaptionTrack& track, FrameTime t, const Color
     const Caption* cap = captionAt(track, t);
     if (!cap || img.width < 8 || img.height < 8) return;
     const CaptionStyle& st = track.style;
+    const int anim = std::clamp(st.animation, 0, 4);
+    const int spoken = anim ? captionWordAt(*cap, t) : -1;  // the word being said
     QFont f(QString::fromStdString(st.font));
-    const double px = std::max(4.0, st.size * img.height);
+    // One word at a time is shown large.
+    const double px = std::max(4.0, st.size * img.height * (anim == 4 ? 1.8 : 1.0));
     f.setPixelSize(int(std::lround(px)));
-    f.setBold(st.bold);
+    f.setBold(st.bold || anim == 4);
     f.setHintingPreference(QFont::PreferNoHinting);
     const QFontMetricsF fm(f);
-    const QStringList lines = QString::fromStdString(cap->text).split('\n');
+    // The words of each line, numbered through the caption.
+    struct Word {
+        QString text;
+        int line = 0, index = 0;
+        double x = 0, w = 0;  // within the line
+    };
+    std::vector<Word> words;
+    QStringList lines = QString::fromStdString(cap->text).split('\n');
+    {
+        int index = 0;
+        for (int li = 0; li < lines.size(); ++li) {
+            int pos = 0;
+            const QString& line = lines[li];
+            while (pos < line.size()) {
+                while (pos < line.size() && line[pos].isSpace()) ++pos;
+                if (pos >= line.size()) break;
+                int end = pos;
+                while (end < line.size() && !line[end].isSpace()) ++end;
+                const QString word = line.mid(pos, end - pos);
+                words.push_back({word, li, index++, fm.horizontalAdvance(line.left(pos)), fm.horizontalAdvance(word)});
+                pos = end;
+            }
+        }
+    }
+    if (anim == 4) {
+        // Only the word being said, on a line of its own.
+        const Word* w = nullptr;
+        for (const Word& x : words)
+            if (x.index == spoken) w = &x;
+        if (!w) return;
+        lines = QStringList{w->text};
+        words = {{w->text, 0, w->index, 0, w->w}};
+    }
     const double lineH = fm.height() * 1.1, padX = px * 0.3, padY = px * 0.08;
     double blockW = 0;
     for (const QString& l : lines) blockW = std::max(blockW, fm.horizontalAdvance(l));
     const double blockH = lineH * double(lines.size());
     const double bottom = std::clamp(st.position, 0.05, 1.0) * img.height;
+    const double grow = anim == 3 ? 0.25 : 0.0;  // room for a popped word
     // Render only the caption's area, then blend it over the frame.
-    const int x0 = std::max(0, int(std::floor(img.width / 2.0 - blockW / 2 - padX - 2)));
-    const int x1 = std::min(img.width, int(std::ceil(img.width / 2.0 + blockW / 2 + padX + 2)));
-    const int y0 = std::max(0, int(std::floor(bottom - blockH - padY - 2)));
-    const int y1 = std::min(img.height, int(std::ceil(bottom + padY + 2)));
+    const int x0 = std::max(0, int(std::floor(img.width / 2.0 - blockW / 2 - padX - 2 - grow * px)));
+    const int x1 = std::min(img.width, int(std::ceil(img.width / 2.0 + blockW / 2 + padX + 2 + grow * px)));
+    const int y0 = std::max(0, int(std::floor(bottom - blockH - padY - 2 - grow * px)));
+    const int y1 = std::min(img.height, int(std::ceil(bottom + padY + 2 + grow * px)));
     if (x1 <= x0 || y1 <= y0) return;
     QImage qi(x1 - x0, y1 - y0, QImage::Format_RGBA8888_Premultiplied);
     qi.fill(Qt::transparent);
@@ -610,18 +646,55 @@ void drawCaption(Image& img, const CaptionTrack& track, FrameTime t, const Color
             return QColor::fromRgbF(float(std::clamp(r, 0.0, 1.0)), float(std::clamp(g, 0.0, 1.0)),
                                     float(std::clamp(b, 0.0, 1.0)), float(std::clamp(a, 0.0, 1.0)));
         };
-        QPainterPath text;
-        for (int i = 0; i < lines.size(); ++i) {
-            const double w = fm.horizontalAdvance(lines[i]);
-            const double top = bottom - blockH + i * lineH;
-            if (st.boxOpacity > 0 && !lines[i].isEmpty())
-                pa.fillRect(QRectF(img.width / 2.0 - w / 2 - padX, top - padY, w + 2 * padX, lineH + 2 * padY),
-                            col(st.boxR, st.boxG, st.boxB, st.boxOpacity));
-            text.addText(QPointF(img.width / 2.0 - w / 2, top + (lineH - fm.height()) / 2 + fm.ascent()), f, lines[i]);
+        QPainterPath text, said;
+        for (int li = 0; li < lines.size(); ++li) {
+            const double lw = fm.horizontalAdvance(lines[li]);
+            const double left = img.width / 2.0 - lw / 2;
+            const double top = bottom - blockH + li * lineH;
+            const double baseline = top + (lineH - fm.height()) / 2 + fm.ascent();
+            // Word by word: only what has been said so far, its box growing with it.
+            double shownW = lw;
+            if (anim == 1) {
+                shownW = 0;
+                for (const Word& w : words)
+                    if (w.line == li && w.index <= spoken) shownW = w.x + w.w;
+            }
+            if (st.boxOpacity > 0 && !lines[li].isEmpty() && shownW > 0)
+                pa.fillRect(QRectF(left - padX, top - padY, shownW + 2 * padX, lineH + 2 * padY), col(st.boxR, st.boxG, st.boxB, st.boxOpacity));
+            if (anim == 0) {
+                text.addText(QPointF(left, baseline), f, lines[li]);
+                continue;
+            }
+            for (const Word& w : words) {
+                if (w.line != li || (anim == 1 && w.index > spoken)) continue;
+                if (w.index == spoken && anim >= 2) {
+                    QPainterPath p;
+                    p.addText(QPointF(left + w.x, baseline), f, w.text);
+                    if (anim == 3) {
+                        // Pops up over its first few frames.
+                        const auto starts = captionWordStarts(*cap);
+                        const double since = (double(t - cap->start) - starts[size_t(w.index)] * double(cap->end - cap->start));
+                        const double sc = 1 + grow * std::clamp(since / 3.0 + 0.34, 0.0, 1.0);
+                        const QPointF c(left + w.x + w.w / 2, top + lineH / 2);
+                        QTransform tr;
+                        tr.translate(c.x(), c.y());
+                        tr.scale(sc, sc);
+                        tr.translate(-c.x(), -c.y());
+                        p = tr.map(p);
+                    }
+                    said.addPath(p);
+                } else {
+                    text.addText(QPointF(left + w.x, baseline), f, w.text);
+                }
+            }
         }
-        if (st.outline > 0)
-            pa.strokePath(text, QPen(QColor(0, 0, 0), st.outline * px * 2, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        if (st.outline > 0 || anim == 4) {
+            const QPen pen(QColor(0, 0, 0), std::max(st.outline, anim == 4 ? 0.06 : 0.0) * px * 2, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+            pa.strokePath(text, pen);
+            pa.strokePath(said, pen);
+        }
         pa.fillPath(text, col(st.textR, st.textG, st.textB, 1));
+        pa.fillPath(said, col(st.hiR, st.hiG, st.hiB, 1));
     }
     if (space && space->id != rec709Space().id) {
         // Caption colours are SDR: convert the rendered patch into the picture's space.

@@ -53,7 +53,8 @@ int usage() {
                  "  montage-cli render <project.montage> -o <output> [--preset NAME] [--in TC] [--out TC]\n"
                  "                     [--width W] [--height H] [--crf N] [--vcodec C] [--acodec C] [--proxies]\n"
                  "                     [--loudness LUFS [--ceiling dBTP]]  (e.g. --loudness -14: normalise the mix)\n"
-                 "                     [--burn-captions] [--embed-captions] [--color-space ID]\n"
+                 "                     [--burn-captions [--caption-animation none|word|highlight|pop|one-word]]\n"
+                 "                     [--embed-captions] [--color-space ID]\n"
                  "  montage-cli frame <project.montage> --at TC -o <image.png>\n"
                  "  montage-cli presets\n"
                  "  montage-cli colorspaces\n"
@@ -249,6 +250,7 @@ int cmdRender(const std::vector<std::string>& args) {
     std::string vcodec, acodec;
     bool proxies = false;
     double loudness = 0, ceiling = -1;
+    int captionAnimation = -1;  // -1: as the project has it
     for (size_t i = 1; i < args.size(); ++i) {
         const std::string& a = args[i];
         auto next = [&]() -> std::string { return i + 1 < args.size() ? args[++i] : std::string(); };
@@ -263,6 +265,14 @@ int cmdRender(const std::vector<std::string>& args) {
         else if (a == "--acodec") acodec = next();
         else if (a == "--proxies") proxies = true;
         else if (a == "--burn-captions") st.burnInCaptions = true;
+        else if (a == "--caption-animation") {
+            static const char* const names[] = {"none", "word", "highlight", "pop", "one-word"};
+            const std::string v = next();
+            captionAnimation = -1;
+            for (int k = 0; k < 5; ++k)
+                if (v == names[k]) captionAnimation = k;
+            if (captionAnimation < 0) return usage();
+        }
         else if (a == "--embed-captions") st.embedCaptions = true;
         else if (a == "--color-space") st.colorSpace = next();
         else if (a == "--loudness") loudness = std::atof(next().c_str());
@@ -287,6 +297,8 @@ int cmdRender(const std::vector<std::string>& args) {
     st.colorSpace = colorSpace;
     Project p;
     if (!load(projectPath, p)) return 1;
+    if (captionAnimation >= 0)
+        for (CaptionTrack& t : p.active()->captionTracks) t.style.animation = captionAnimation;
     const Sequence* s = p.active();
     st.path = outPath;
     if (width > 0) st.width = width;

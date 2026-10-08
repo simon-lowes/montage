@@ -187,6 +187,38 @@ private slots:
         // of source = 1.2 s of timeline = frame 130.
         QCOMPARE(caps[0].start, FrameTime(100));
         QCOMPARE(caps[0].end, FrameTime(130));
+        // Each word's time comes along, as a fraction of the caption: "three." at 3.0 s of media is
+        // 0.25 s into the clip's timeline (frame 106.25 of 100-130), "Four" 112.5, "five" 118.75, "six." 125.
+        QCOMPARE(caps[0].wordTimes.size(), size_t(5));
+        const double want[] = {0, 6.25 / 30, 12.5 / 30, 18.75 / 30, 25.0 / 30};
+        for (int i = 0; i < 5; ++i) QVERIFY2(std::fabs(caps[0].wordTimes[size_t(i)] - want[i]) < 1e-3, qPrintable(QString::number(caps[0].wordTimes[size_t(i)])));
+        QCOMPARE(captionWordAt(caps[0], 99), -1);
+        QCOMPARE(captionWordAt(caps[0], 100), 0);
+        QCOMPARE(captionWordAt(caps[0], 113), 2);
+        QCOMPARE(captionWordAt(caps[0], 129), 4);
+        // Without times (or with the text changed), words are spread by their length.
+        Caption manual{0, 40, "ab\ncdef", {}};
+        const auto spread = captionWordStarts(manual);
+        QCOMPARE(spread.size(), size_t(2));
+        QCOMPARE(spread[0], 0.0);
+        QCOMPARE(spread[1], 3.0 / 8);
+        manual.wordTimes = {0, 0.5, 0.9};  // three times for two words: not used
+        QCOMPARE(captionWordStarts(manual), spread);
+        // Word times and the animation style are saved with the project.
+        CaptionTrack ct;
+        ct.id = p.newId();
+        ct.style.animation = 3;
+        ct.style.hiR = 0.2;
+        ct.captions = caps;
+        s.captionTracks.push_back(ct);
+        Project back;
+        QVERIFY(projectFromJson(projectToJson(p), back));
+        const CaptionTrack& bt = back.active()->captionTracks.at(0);
+        QCOMPARE(bt.style.animation, 3);
+        QCOMPARE(bt.style.hiR, 0.2);
+        QCOMPARE(bt.captions[0].wordTimes.size(), size_t(5));
+        QVERIFY(std::fabs(bt.captions[0].wordTimes[2] - want[2]) < 1e-3);
+        s.captionTracks.clear();
         // Without transcripts there is nothing to caption.
         p.media[0].transcript.reset();
         QVERIFY(captionsFromTranscripts(p, s).empty());

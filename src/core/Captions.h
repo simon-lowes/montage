@@ -24,6 +24,12 @@ struct CaptionStyle {
     double boxR = 0, boxG = 0, boxB = 0;
     double outline = 0;            // outline width, fraction of the text height
     double position = 0.92;        // bottom of the caption block, fraction of the frame height
+    // Word animation, for captions on social video: 0 none, 1 word by word (each
+    // appears as it is said), 2 highlight (the word being said in the highlight
+    // colour), 3 pop (the same, a little larger), 4 one word (only the word being
+    // said, large).
+    int animation = 0;
+    double hiR = 1, hiG = 0.84, hiB = 0.1;  // highlight colour
     bool operator==(const CaptionStyle&) const = default;
 };
 
@@ -31,6 +37,9 @@ struct Caption {
     FrameTime start = 0;  // timeline frames; end is exclusive
     FrameTime end = 0;
     std::string text;     // lines separated by '\n'
+    // When each word of the text is said, as fractions of the caption's length
+    // (so moves and retimes keep them); empty, or not one per word, when unknown.
+    std::vector<double> wordTimes;
     bool operator==(const Caption&) const = default;
 };
 
@@ -52,6 +61,12 @@ const CaptionTrack* captionTrackFor(const Sequence& seq, Id id = 0);
 const Caption* captionAt(const CaptionTrack& track, FrameTime t);
 // Index of the caption at or after t (captions.size() if none).
 size_t captionIndexAt(const CaptionTrack& track, FrameTime t);
+
+// When each word of the caption is said (fractions of its length): its word
+// times, or else spread over it by the words' lengths.
+std::vector<double> captionWordStarts(const Caption& c);
+// The word being said at frame t (-1 before the caption, the last word after it).
+int captionWordAt(const Caption& c, FrameTime t);
 
 // Sorts, drops empty or zero-length captions and trims overlaps.
 void normalizeCaptions(std::vector<Caption>& captions);

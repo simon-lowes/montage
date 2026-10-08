@@ -2158,7 +2158,15 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(panel->exportFile(vtt));
         QVERIFY(panel->importFile(vtt));
         QCOMPARE(state()->sequence()->captionTracks.size(), size_t(2));
-        QCOMPARE(state()->sequence()->captionTracks[1].captions, state()->sequence()->captionTracks[0].captions);
+        // What WebVTT carries comes back: times and text (not the words' timings).
+        const auto& made = state()->sequence()->captionTracks[0].captions;
+        const auto& read = state()->sequence()->captionTracks[1].captions;
+        QCOMPARE(read.size(), made.size());
+        for (size_t i = 0; i < made.size(); ++i) {
+            QCOMPARE(read[i].start, made[i].start);
+            QCOMPARE(read[i].end, made[i].end);
+            QCOMPARE(read[i].text, made[i].text);
+        }
         state()->newProject();
         QApplication::processEvents();
     }

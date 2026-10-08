@@ -8,6 +8,7 @@
 #include <fstream>
 #include <tuple>
 
+#include "core/Captions.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
 #include "render/ColorSpace.h"
@@ -1170,6 +1171,65 @@ colorspaces:
         // Cancelling stops at once.
         std::atomic<bool> stop{true};
         QCOMPARE(renderToCache(p, s, 0, 59, o, again, {}, &stop), -1);
+    }
+
+    void wordByWordCaptions() {
+        CaptionTrack track;
+        track.style.textR = track.style.textG = track.style.textB = 1;
+        track.style.hiR = 0;
+        track.style.hiG = 1;
+        track.style.hiB = 0;
+        track.style.boxOpacity = 0;
+        track.style.size = 0.1;
+        track.captions = {{0, 30, "red green blue", {0, 0.33, 0.66}}};
+        struct Ink {
+            double amount = 0, highlight = 0, hx = 0;
+            int left = 1 << 30, right = -1;
+        };
+        auto draw = [&](int anim, FrameTime t) {
+            track.style.animation = anim;
+            Image img(320, 180);
+            img.fill(0, 0, 0, 1);
+            drawCaption(img, track, t);
+            Ink k;
+            for (int y = 0; y < 180; ++y)
+                for (int x = 0; x < 320; ++x) {
+                    const float* p = img.at(x, y);
+                    const double v = (p[0] + p[1] + p[2]) / 3;
+                    if (v < 0.2) continue;
+                    k.amount += v;
+                    k.left = std::min(k.left, x);
+                    k.right = std::max(k.right, x);
+                    if (p[1] > 0.6f && p[0] < 0.3f) {  // the highlight colour
+                        k.highlight += 1;
+                        k.hx += x;
+                    }
+                }
+            if (k.highlight > 0) k.hx /= k.highlight;
+            return k;
+        };
+        // None: no highlight, the whole line.
+        const Ink plain = draw(0, 15);
+        QVERIFY(plain.amount > 0 && plain.highlight == 0);
+        // Highlight: the spoken word is green, moving left to right.
+        const Ink first = draw(2, 2), last = draw(2, 25);
+        QVERIFY(first.highlight > 20 && last.highlight > 20);
+        QVERIFY2(first.hx < 140 && last.hx > 180, qPrintable(QString("%1 %2").arg(first.hx).arg(last.hx)));
+        QVERIFY(std::fabs(first.amount - plain.amount) < 0.25 * plain.amount);  // the rest is still there
+        // Word by word: more appears as it is said.
+        const Ink one = draw(1, 2), two = draw(1, 12), three = draw(1, 25);
+        QVERIFY(one.amount < two.amount && two.amount < three.amount);
+        QCOMPARE(one.left, plain.left);  // the line keeps its place as it fills in
+        // Pop: the spoken word is larger than when only highlighted.
+        const Ink popped = draw(3, 14), lit = draw(2, 14);
+        QVERIFY2(popped.highlight > lit.highlight * 1.15, qPrintable(QString("%1 vs %2").arg(popped.highlight).arg(lit.highlight)));
+        // One word at a time: just the spoken word, large, in the middle.
+        const Ink single = draw(4, 14);
+        QVERIFY(single.right - single.left < plain.right - plain.left);
+        QVERIFY(std::abs((single.left + single.right) / 2 - 160) <= 4);
+        QVERIFY(single.highlight > lit.highlight);
+        // Outside the caption nothing is drawn.
+        QCOMPARE(draw(2, 40).amount, 0.0);
     }
 
     void titlesRender() {

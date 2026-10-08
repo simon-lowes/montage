@@ -257,8 +257,19 @@ QJsonObject captionTrackToJson(const CaptionTrack& t) {
                       {"box", QJsonArray{st.boxR, st.boxG, st.boxB}},
                       {"outline", st.outline},
                       {"position", st.position}};
+    if (st.animation) style["animation"] = st.animation;
+    const CaptionStyle def;
+    if (st.hiR != def.hiR || st.hiG != def.hiG || st.hiB != def.hiB) style["highlight"] = QJsonArray{st.hiR, st.hiG, st.hiB};
     QJsonArray items;
-    for (const Caption& c : t.captions) items.append(QJsonArray{double(c.start), double(c.end), qs(c.text)});
+    for (const Caption& c : t.captions) {
+        QJsonArray item{double(c.start), double(c.end), qs(c.text)};
+        if (!c.wordTimes.empty()) {
+            QJsonArray w;
+            for (double f : c.wordTimes) w.append(std::round(f * 10000) / 10000);
+            item.append(w);
+        }
+        items.append(item);
+    }
     return QJsonObject{{"id", double(t.id)},        {"name", qs(t.name)}, {"language", qs(t.language)},
                        {"visible", t.visible},      {"style", style},     {"captions", items}};
 }
@@ -281,10 +292,15 @@ CaptionTrack captionTrackFromJson(const QJsonObject& o) {
     st.boxOpacity = so.value("boxOpacity").toDouble(def.boxOpacity);
     st.outline = so.value("outline").toDouble(def.outline);
     st.position = so.value("position").toDouble(def.position);
+    st.animation = so.value("animation").toInt(def.animation);
+    const QJsonArray hc = so.value("highlight").toArray();
+    if (hc.size() == 3) st.hiR = hc.at(0).toDouble(), st.hiG = hc.at(1).toDouble(), st.hiB = hc.at(2).toDouble();
     for (const auto& v : o.value("captions").toArray()) {
         const QJsonArray a = v.toArray();
         if (a.size() < 3) continue;
-        t.captions.push_back({i64(a.at(0)), i64(a.at(1)), ss(a.at(2))});
+        Caption c{i64(a.at(0)), i64(a.at(1)), ss(a.at(2)), {}};
+        for (const auto& w : a.at(3).toArray()) c.wordTimes.push_back(w.toDouble());
+        t.captions.push_back(std::move(c));
     }
     normalizeCaptions(t.captions);
     return t;

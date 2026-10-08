@@ -415,7 +415,11 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
 
 The second gap analysis (`docs/research/phase3-roadmap.md`, October 2026) ranks what is still missing against Premiere 26.5, Resolve 21, Final Cut Pro 12.4, Media Composer 2026.8, CapCut and Descript.
 
-- [ ] 1. Animated word-by-word captions (S)
+- [x] 1. Animated word-by-word captions (S):
+  - Captions keep each word's start as a fraction of the caption, so moves, retimes and ripples keep them in step. Captions made from transcripts fill them; otherwise words are spread by their length. Saved with the project.
+  - Caption styles add an animation (Word by Word, Highlight, Pop, One Word at a Time) and a highlight colour. The renderer lays out each word, keeping the line in place as it fills in, and pops the spoken word over its first three frames.
+  - The Caption Style dialog has Animation and Highlight colour; `montage-cli render --caption-animation`.
+  - Tested: word times from a sped-up, trimmed clip's transcript to 1e-3, the word at a frame, spreading by length (and ignoring a mismatched list), saving; rendered ink showing the highlight moving left to right, words appearing in order with the line in place, a popped word larger than a highlighted one, a single centred word, and nothing outside the caption.
 - [ ] 2. Voiceover recording onto the timeline (S)
 - [ ] 3. Burn-ins on export: timecode, clip name, metadata, watermark (S)
 - [ ] 4. Grading essentials: hue/luma/sat curves, colour wheels, split-screen compare (S–M)

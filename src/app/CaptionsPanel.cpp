@@ -514,6 +514,14 @@ void CaptionsPanel::styleDialog() {
     form->addRow(tr("Background colour:"), colourButton(st.boxR, st.boxG, st.boxB));
     form->addRow(tr("Outline:"), outline);
     form->addRow(tr("Bottom edge:"), position);
+    // Word animation (from the words' timings when the captions came from a transcript).
+    auto* animation = new QComboBox(&dlg);
+    animation->setObjectName(QStringLiteral("captionAnimation"));
+    animation->addItems({tr("None"), tr("Word by Word"), tr("Highlight the Spoken Word"), tr("Pop the Spoken Word"), tr("One Word at a Time")});
+    animation->setCurrentIndex(std::clamp(st.animation, 0, 4));
+    animation->setToolTip(tr("Animate captions word by word, as social video does"));
+    form->addRow(tr("Animation:"), animation);
+    form->addRow(tr("Highlight colour:"), colourButton(st.hiR, st.hiG, st.hiB));
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
     connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
     connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
@@ -525,6 +533,7 @@ void CaptionsPanel::styleDialog() {
     st.boxOpacity = box->value() / 100.0;
     st.outline = outline->value() / 100.0;
     st.position = position->value() / 100.0;
+    st.animation = animation->currentIndex();
     editTrack(tr("Caption Style"), [st](CaptionTrack& tr) {
         if (tr.style == st) return false;
         tr.style = st;

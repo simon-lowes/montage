@@ -168,6 +168,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
   - Caption tracks on each sequence, shown as lanes above the video tracks. Drag captions to move them, drag their edges to retime them, and double-click one to edit its text in the Captions panel.
   - Generate captions from transcripts: words are placed where each clip plays them, following trims, speed changes and muted tracks, and are split into readable captions (42 characters per line, 2 lines and 7 seconds at most by default).
   - Edit, add, split, merge and delete captions in the Captions panel. You can also set the font, size, colours, background box, outline and position.
+  - **Animated captions** for social video (Caption Style › Animation): Word by Word, Highlight the Spoken Word, Pop the Spoken Word, or One Word at a Time, in a highlight colour of your choice. Captions made from transcripts keep each word's timing; others spread the words by their length. On the command line: `render --burn-captions --caption-animation pop`.
   - Import SubRip or WebVTT files. Export SubRip, WebVTT or Scenarist SCC (CEA-608 broadcast captions).
   - The CC button shows captions in the Program monitor. When exporting, captions can be burned into the picture, embedded as a subtitle track (mov_text in MP4/MOV, SubRip in MKV, WebVTT in WebM, with the track's language), or both.
 - Interchange both ways with Premiere Pro, DaVinci Resolve, Final Cut Pro, Avid and Nuke:
