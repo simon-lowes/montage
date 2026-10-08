@@ -37,6 +37,7 @@ add_library(montage_engine STATIC
   render/ColorSpace.h render/ColorSpace.cpp
   render/Ocio.h render/Ocio.cpp
   render/Compositor.h render/Compositor.cpp
+  render/RenderCache.h render/RenderCache.cpp
   render/AudioFx.h render/AudioFx.cpp
   render/VideoFx.h render/VideoFx.cpp
   render/Exporter.h render/Exporter.cpp

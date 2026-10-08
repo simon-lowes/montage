@@ -71,6 +71,13 @@ public:
     bool replaceWithSource();                         // the selected clip, or the one under the playhead
     bool fitToFill();
     int selectForward(bool allTracks);
+    // Render cache: renders the frames between In and Out (the whole sequence
+    // without marks) as the Program monitor shows them; returns how many were
+    // rendered (-1 if cancelled). The render bar follows edits by itself;
+    // refreshRenderBar(true) brings it up to date before returning.
+    int renderInToOut();
+    void deleteRenderFiles();
+    void refreshRenderBar(bool wait = false);
 
 protected:
     void closeEvent(QCloseEvent* e) override;
@@ -151,6 +158,8 @@ private:
     ShotSearchPanel* shots_ = nullptr;
     AudioMeterWidget* meter_ = nullptr;
     LoudnessReadout* loudness_ = nullptr;
+    QTimer renderBarTimer_;
+    int renderBarGeneration_ = 0;
     std::vector<QDockWidget*> docks_;
     QDockWidget* sourceDock_ = nullptr;
     QDockWidget* programDock_ = nullptr;

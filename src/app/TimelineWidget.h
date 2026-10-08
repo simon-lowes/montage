@@ -52,6 +52,10 @@ public:
     bool showVolumeLines() const { return showVolume_; }
     void setShowOpacityLines(bool on);
     bool showOpacityLines() const { return showOpacity_; }
+    // The render bar under the ruler: the frame ranges ([first, end)) whose
+    // rendered previews are cached show green.
+    void setRenderedRanges(std::vector<std::pair<FrameTime, FrameTime>> ranges);
+    const std::vector<std::pair<FrameTime, FrameTime>>& renderedRanges() const { return rendered_; }
     // Where a clip's line is drawn (widget coordinates), for tests; empty if it is not shown.
     QRect lineBand(montage::Id clip) const;
     int lineY(montage::Id clip, montage::FrameTime local) const;
@@ -193,6 +197,7 @@ private:
     QPoint hoverPos_;
     bool showVolume_ = true;
     bool showOpacity_ = false;
+    std::vector<std::pair<FrameTime, FrameTime>> rendered_;
 };
 
 }  // namespace montage

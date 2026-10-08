@@ -1,5 +1,6 @@
 // Renderer tests: blending, transforms, effects, transitions, generators.
 #include <QtTest>
+#include <QTemporaryDir>
 
 #include <algorithm>
 #include <cmath>
@@ -13,6 +14,7 @@
 #include "render/Compositor.h"
 #include "render/Ocio.h"
 #include "render/Processing.h"
+#include "render/RenderCache.h"
 #include "render/VideoFx.h"
 
 using namespace montage;
@@ -1109,6 +1111,65 @@ colorspaces:
         // Without animation or a length, a title is unchanged throughout.
         Effect plain = makeEffect(p, "title");
         QCOMPARE(ink(renderGenerator(plain, 0, 320, 180, 1.0)).amount, ink(renderGenerator(plain, 50, 320, 180, 1.0, 60, 30)).amount);
+    }
+
+    void renderCacheKeysAndFrames() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        RenderCache cache(dir.path() + "/render");
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64;
+        s.height = 36;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, colorClip(p, 1, 0, 0, 0, 30));
+        edit::overwrite(p, s, {TrackKind::Video, 0}, colorClip(p, 0, 0, 1, 30, 30));
+        RenderOptions o;
+        const QByteArray k10 = frameKey(p, s, 10, o), k40 = frameKey(p, s, 40, o);
+        QVERIFY(!k10.isEmpty() && k10 != frameKey(p, s, 11, o) && k10 != k40);
+        QCOMPARE(frameKey(p, s, 10, o), k10);
+        QVERIFY(frameKey(p, s, 100, o).isEmpty());  // nothing on screen
+        RenderOptions half = o;
+        half.scale = 0.5;
+        QVERIFY(frameKey(p, s, 10, half) != k10);
+        // An effect on the blue clip changes its frames' keys, not the red one's.
+        Clip& blue = trackAt(s, {TrackKind::Video, 0})->clips.at(1);
+        blue.effects.push_back(makeEffect(p, "invert"));
+        QCOMPARE(frameKey(p, s, 10, o), k10);
+        QVERIFY(frameKey(p, s, 40, o) != k40);
+        blue.effects.clear();
+        QCOMPARE(frameKey(p, s, 40, o), k40);
+        // Moving a clip keeps its frames: the same frame of it has the same key wherever it sits.
+        Project lone = makeDefaultProject();
+        Sequence& ls = *lone.active();
+        ls.width = 64;
+        ls.height = 36;
+        edit::overwrite(lone, ls, {TrackKind::Video, 0}, colorClip(lone, 0, 1, 0, 0, 20));
+        const QByteArray before = frameKey(lone, ls, 5, o);
+        trackAt(ls, {TrackKind::Video, 0})->clips[0].start = 10;
+        QCOMPARE(frameKey(lone, ls, 15, o), before);
+        // Rendering fills the cache once; frames come back as rendered (JPEG, near enough).
+        QCOMPARE(renderToCache(p, s, 0, 59, o, cache), 60);
+        QCOMPARE(renderToCache(p, s, 0, 59, o, cache), 0);
+        QCOMPARE(cache.count(), 60);
+        QVERIFY(cache.bytes() > 0);
+        const QImage got = cache.load(k10);
+        QVERIFY(!got.isNull() && got.width() == 64 && got.height() == 36);
+        const QRgb c = got.pixel(32, 18);
+        QVERIFY2(qRed(c) > 245 && qGreen(c) < 10 && qBlue(c) < 10, qPrintable(QString("%1 %2 %3").arg(qRed(c)).arg(qGreen(c)).arg(qBlue(c))));
+        QCOMPARE(cachedRanges(p, s, 0, 70, o, cache), (std::vector<std::pair<FrameTime, FrameTime>>{{0, 60}}));
+        // After an edit, only the frames it does not touch stay rendered.
+        blue.effects.push_back(makeEffect(p, "invert"));
+        QCOMPARE(cachedRanges(p, s, 0, 70, o, cache), (std::vector<std::pair<FrameTime, FrameTime>>{{0, 30}}));
+        // The cache is found again by a new session, and can be cleared.
+        RenderCache again(dir.path() + "/render");
+        QCOMPARE(again.count(), 60);
+        QVERIFY(again.has(k10));
+        again.clear();
+        QCOMPARE(again.count(), 0);
+        QVERIFY(again.load(k10).isNull());
+        // Cancelling stops at once.
+        std::atomic<bool> stop{true};
+        QCOMPARE(renderToCache(p, s, 0, 59, o, again, {}, &stop), -1);
     }
 
     void titlesRender() {

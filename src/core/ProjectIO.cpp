@@ -390,6 +390,14 @@ std::string clipToJsonString(const Clip& c) {
     return QJsonDocument(clipToJson(c)).toJson(QJsonDocument::Compact).toStdString();
 }
 
+std::string captionTrackToJsonString(const CaptionTrack& t) {
+    return QJsonDocument(captionTrackToJson(t)).toJson(QJsonDocument::Compact).toStdString();
+}
+
+std::string objectMaskToJsonString(const ObjectMask& m) {
+    return QJsonDocument(objectMaskToJson(m)).toJson(QJsonDocument::Compact).toStdString();
+}
+
 bool clipFromJsonString(const std::string& json, Clip& out) {
     const QJsonDocument doc = QJsonDocument::fromJson(QByteArray::fromStdString(json));
     if (!doc.isObject()) return false;

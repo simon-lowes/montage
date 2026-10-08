@@ -83,6 +83,7 @@ public:
     MonitorPanel(Mode mode, EditorState* state, PlaybackController* controller, QWidget* parent = nullptr);
 
     ViewerWidget* viewer() const { return viewer_; }
+    PlaybackController* controller() const { return controller_; }
     Mode mode() const { return mode_; }
     // Re-reads duration, marks and timecode from the state / controller.
     void refresh();

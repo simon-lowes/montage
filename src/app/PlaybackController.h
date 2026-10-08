@@ -37,6 +37,8 @@ public:
     // Preview resolution as a fraction of the sequence size (1, 1/2, 1/4...).
     void setPreviewScale(double s);
     double previewScale() const { return scale_; }
+    // How this monitor renders frames (so Render In to Out makes frames it will use).
+    RenderOptions renderOptions() const;
     // Decode proxies instead of the original media where available.
     void setUseProxies(bool on);
     bool useProxies() const { return useProxies_; }

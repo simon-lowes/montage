@@ -67,6 +67,7 @@
 #include "media/Decoder.h"
 #include "render/ColorSpace.h"
 #include "render/Compositor.h"
+#include "render/RenderCache.h"
 #include "render/Exporter.h"
 #include "render/Ocio.h"
 
@@ -1533,6 +1534,56 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(reset.count(), 1);
         QCOMPARE(readout->text("M"), QString("—"));
         readout->setTargetIndex(0);
+    }
+
+    void renderInToOutAndTheRenderBar() {
+        loadDemo();
+        RenderCache::instance().clear();
+        MonitorPanel* program = nullptr;
+        for (auto* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Program) program = m;
+        QVERIFY(program && program->controller());
+        state()->edit("Marks", [](Project&, Sequence& s) {
+            s.inPoint = 0;
+            s.outPoint = 9;
+            return true;
+        });
+        auto* render = win_->findChild<QAction*>("renderInToOut");
+        QVERIFY(render && render->shortcut() == QKeySequence(Qt::Key_Return));
+        render->trigger();
+        QCOMPARE(RenderCache::instance().count(), 10);
+        QCOMPARE(timeline()->renderedRanges(), (std::vector<std::pair<FrameTime, FrameTime>>{{0, 10}}));
+        QCOMPARE(win_->renderInToOut(), 0);  // nothing left to render there
+        // The Program monitor shows the rendered frame: marked so it can be told apart, it is what appears.
+        const RenderOptions o = program->controller()->renderOptions();
+        const QByteArray key = frameKey(state()->project(), *state()->sequence(), 4, o);
+        QImage marked = RenderCache::instance().load(key);
+        QVERIFY(!marked.isNull());
+        marked.fill(QColor(255, 0, 255));
+        QVERIFY(RenderCache::instance().store(key, marked));
+        state()->setPlayhead(3);
+        program->controller()->seek(4);
+        QTRY_VERIFY_WITH_TIMEOUT(!program->viewer()->image().isNull() && program->viewer()->image().pixelColor(5, 5).red() > 240 &&
+                                     program->viewer()->image().pixelColor(5, 5).green() < 15,
+                                 5000);
+        // An edit to what is on screen there takes those frames off the bar (once it settles).
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        state()->edit("Invert", [red](Project& p, Sequence& s) {
+            edit::clipById(s, red)->effects.push_back(makeEffect(p, "invert"));
+            return true;
+        });
+        win_->refreshRenderBar(true);
+        const auto after = timeline()->renderedRanges();
+        FrameTime covered = 0;
+        for (const auto& [a, b] : after) covered += b - a;
+        QVERIFY2(covered < 10, qPrintable(QString::number(covered)));
+        // Undo brings them back.
+        state()->undo();
+        win_->refreshRenderBar(true);
+        QCOMPARE(timeline()->renderedRanges(), (std::vector<std::pair<FrameTime, FrameTime>>{{0, 10}}));
+        win_->findChild<QAction*>("deleteRenderFiles")->trigger();
+        QCOMPARE(RenderCache::instance().count(), 0);
+        QVERIFY(timeline()->renderedRanges().empty());
     }
 
     void renderQueueInTheBackground() {

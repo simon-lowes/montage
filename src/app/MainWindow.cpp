@@ -74,6 +74,7 @@
 #include "media/Loudness.h"
 #include "media/MediaPool.h"
 #include "render/ClipAnalysis.h"
+#include "render/RenderCache.h"
 #include "render/Compositor.h"
 #include "render/Exporter.h"
 #include "render/Processing.h"
@@ -290,6 +291,12 @@ void MainWindow::buildPanels() {
         source_->resetLoudness();
     });
     meterDock_ = makeDock(tr("Meters"), "meters", meters);
+    // The render bar follows edits (once they settle).
+    renderBarTimer_.setSingleShot(true);
+    renderBarTimer_.setInterval(400);
+    connect(&renderBarTimer_, &QTimer::timeout, this, [this] { refreshRenderBar(); });
+    for (auto sig : {&EditorState::projectChanged, &EditorState::sequenceSwitched})
+        connect(state_, sig, &renderBarTimer_, qOverload<>(&QTimer::start));
     resetLayout();
 }
 
@@ -523,6 +530,10 @@ void MainWindow::buildMenus() {
     })->setObjectName(QStringLiteral("duplicateSequence"));
     add(seqM, tr("Auto &Reframe Sequence…"), QKeySequence(), [this] { autoReframeDialog(); })
         ->setObjectName(QStringLiteral("autoReframeSequence"));
+    add(seqM, tr("Render In to Out"), QKeySequence(Qt::Key_Return), [this] { renderInToOut(); })
+        ->setObjectName(QStringLiteral("renderInToOut"));
+    add(seqM, tr("Delete Render Files"), QKeySequence(), [this] { deleteRenderFiles(); })
+        ->setObjectName(QStringLiteral("deleteRenderFiles"));
     add(seqM, tr("Add &Video Track"), QKeySequence(), [this] {
         state_->edit(tr("Add Video Track"), [](Project& p, Sequence& s) {
             edit::addTrack(p, s, TrackKind::Video);
@@ -1511,6 +1522,62 @@ bool MainWindow::fitToFill() {
     const FrameTime tin = s->inPoint, tout = s->outPoint;
     const Id media = m->id;
     return state_->apply(tr("Fit to Fill"), [=](Project& p, Sequence& sq) { return edit::fitToFill(p, sq, media, in, out, tin, tout, vt, at); });
+}
+
+int MainWindow::renderInToOut() {
+    const Sequence* s = state_->sequence();
+    if (!s || s->duration() == 0) return 0;
+    const FrameTime from = s->inPoint >= 0 ? s->inPoint : 0;
+    const FrameTime to = s->outPoint >= 0 ? std::min(s->outPoint, s->duration() - 1) : s->duration() - 1;
+    if (to < from) return 0;
+    auto project = std::make_shared<const Project>(state_->project());
+    const Id seqId = s->id;
+    const RenderOptions o = program_->renderOptions();
+    int rendered = 0;
+    const bool ok = runWithProgress(this, state_, tr("Rendering previews..."), [&, project, seqId](const auto& progress, const auto* cancel, std::string*) {
+        const Sequence* sq = project->findSequence(seqId);
+        if (!sq) return false;
+        rendered = renderToCache(*project, *sq, from, to, o, RenderCache::instance(), progress, cancel);
+        return rendered >= 0;
+    });
+    refreshRenderBar(true);
+    if (!ok) return -1;
+    state_->message(rendered ? tr("Rendered %n frame(s)", "", rendered) : tr("Everything there is already rendered"), 4000);
+    return rendered;
+}
+
+void MainWindow::deleteRenderFiles() {
+    RenderCache::instance().clear();
+    timeline_->setRenderedRanges({});
+    state_->message(tr("Render files deleted"), 3000);
+}
+
+void MainWindow::refreshRenderBar(bool wait) {
+    const Sequence* s = state_->sequence();
+    const int generation = ++renderBarGeneration_;
+    if (!s || RenderCache::instance().count() == 0) {
+        timeline_->setRenderedRanges({});
+        return;
+    }
+    // Keys for every frame take a moment on long timelines: worked out off the UI thread.
+    auto project = std::make_shared<const Project>(state_->project());
+    const Id seqId = s->id;
+    const RenderOptions o = program_->renderOptions();
+    auto work = [project, seqId, o] {
+        const Sequence* sq = project->findSequence(seqId);
+        return sq ? cachedRanges(*project, *sq, 0, sq->duration(), o, RenderCache::instance())
+                  : std::vector<std::pair<FrameTime, FrameTime>>{};
+    };
+    if (wait) {
+        timeline_->setRenderedRanges(work());
+        return;
+    }
+    auto* watcher = new QFutureWatcher<std::vector<std::pair<FrameTime, FrameTime>>>(this);
+    connect(watcher, &QFutureWatcherBase::finished, this, [this, watcher, generation] {
+        if (generation == renderBarGeneration_) timeline_->setRenderedRanges(watcher->result());
+        watcher->deleteLater();
+    });
+    watcher->setFuture(QtConcurrent::run(work));
 }
 
 int MainWindow::selectForward(bool allTracks) {

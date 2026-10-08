@@ -14,6 +14,8 @@ constexpr int kProjectFormatVersion = 1;
 std::string projectToJson(const Project& p, const std::string& projectPath = {});
 // One clip as JSON (as in project files).
 std::string clipToJsonString(const Clip& c);
+std::string captionTrackToJsonString(const CaptionTrack& t);
+std::string objectMaskToJsonString(const ObjectMask& m);
 bool clipFromJsonString(const std::string& json, Clip& out);
 bool projectFromJson(const std::string& json, Project& out, std::string* error = nullptr,
                      const std::string& projectPath = {});

@@ -394,3 +394,39 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
   - Playback feeds what is heard into it (in the audio thread, ten reports a second); it integrates across plays of a sequence until reset.
   - The Meters panel shows M, S, I, LRA and TP under the peak meters, with a target (-23, -24, -14, -16; remembered) colouring the integrated value and a red true peak above -1 dBTP.
   - Tested: on a steady tone momentary, short-term and integrated agree within 0.1 LU and the range is under 0.5; a +9.5 dB step shows in momentary at once and only part way in short-term; tones alternating 10 dB give a range of 10 ± 1 LU; reset; and the readout's values, colours by target and reset. (The playback feed itself has no automated test: the test machines have no audio output.)
+- [x] Render cache (Premiere's Render In to Out and render bar, Final Cut's background render files, Resolve's render cache):
+  - render/RenderCache: frameKey is a SHA-1 of everything that decides a frame as renderProgramFrame draws it:
+    - the sequence's size, rate and colour space;
+    - each video track's clip at t, with its settings (ids, name, place and label left out, so a moved clip keeps its frames) and how far into it t is;
+    - active transitions with both their clips;
+    - media identity (path, size, modification time, interpretation);
+    - nested sequences, recursively at the mapped frame;
+    - the visible caption, and the render options.
+  - Object masks are hashed once each, and an empty key means nothing is on screen.
+  - Frames are JPEGs (quality 92) under the cache folder, written aside and renamed, and indexed in memory. The cache is reopened on start and can be cleared.
+  - Sequence › Render In to Out (Return) renders the missing frames in the background behind a progress dialog with Cancel, as the Program monitor renders them for playback. Playback, and paused frames too, use a cached frame when there is one.
+  - The timeline's render bar (green under the ruler) is worked out off the UI thread after edits settle. Sequence › Delete Render Files.
+  - Tested:
+    - keys: stable; changed by what is on screen and by options, not by other clips; the same for a moved clip;
+    - storage: 60 frames rendered once, then 0; a stored frame read back at the right colour; ranges shrinking after an edit; a new cache object over the folder finding the frames; clear and cancel;
+    - in the app: Render In to Out (In to Out only); the render bar; the Program monitor showing a cached frame when paused (marked to prove it); an edit taking frames off the bar and undo putting them back; Delete Render Files.
+
+# Phase 3
+
+The second gap analysis (`docs/research/phase3-roadmap.md`, October 2026) ranks what is still missing against Premiere 26.5, Resolve 21, Final Cut Pro 12.4, Media Composer 2026.8, CapCut and Descript.
+
+- [ ] 1. Animated word-by-word captions (S)
+- [ ] 2. Voiceover recording onto the timeline (S)
+- [ ] 3. Burn-ins on export: timecode, clip name, metadata, watermark (S)
+- [ ] 4. Grading essentials: hue/luma/sat curves, colour wheels, split-screen compare (S–M)
+- [ ] 5. Build a cut from a script (M)
+- [ ] 6. Speech enhancement and stem separation (M)
+- [ ] 7. Beat markers and fitting music to length (M)
+- [ ] 8. One-click mix: classify, ride and match dialogue (M)
+- [ ] 9. Caption and transcript translation on the device (M)
+- [ ] 10. Bézier keyframes and a graph editor (M)
+- [ ] 11. Surround and multichannel deliverables (M–L)
+- [ ] 12. Temporal video noise reduction (M)
+- [ ] 13. Shape layers and Lottie motion graphics (M)
+- [ ] 14. AI upscaling (M)
+- [ ] 15. AAF export to Pro Tools and Fairlight (L)

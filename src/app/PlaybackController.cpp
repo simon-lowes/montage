@@ -1,6 +1,7 @@
 #include "PlaybackController.h"
 
 #include "media/Loudness.h"
+#include "render/RenderCache.h"
 
 #include <QAudioDevice>
 #include <QAudioFormat>
@@ -35,6 +36,7 @@ public:
         bool proxies = false;
         int direction = 0;  // playback step (+1, -2 ...), 0 when paused
         bool captions = false;
+        double cacheScale = 0;  // the scale rendered previews are kept at (playback's), 0 = scale
     };
     void request(const Request& r) {
         {
@@ -65,6 +67,14 @@ private:
         o.useProxies = r.proxies;
         o.captions = r.captions;
         o.displaySpace = "rec709";  // HDR and wide-gamut sequences are previewed tone mapped to SDR
+        // A rendered preview of this frame (kept at playback's scale) is used as it is, paused too.
+        RenderOptions co = o;
+        if (r.cacheScale > 0) co.scale = r.cacheScale;
+        const QByteArray key = frameKey(*r.project, *s, t, co);
+        if (RenderCache::instance().has(key)) {
+            QImage cached = RenderCache::instance().load(key);
+            if (!cached.isNull()) return cached;
+        }
         Image img = renderProgramFrame(*r.project, *s, t, o);
         QImage out(img.width, img.height, QImage::Format_RGBA8888);
         toRgba8(img, out.bits(), size_t(out.bytesPerLine()));
@@ -300,7 +310,7 @@ FrameTime PlaybackController::clampToSequence(FrameTime t) const { return std::m
 void PlaybackController::requestFrame() {
     if (!sequence()) return;
     // Paused frames render at full quality; playback uses the preview scale.
-    worker_->request({project_, sequenceId_, position_, isPlaying() ? scale_ : 1.0, useProxies_, playStep(), showCaptions_});
+    worker_->request({project_, sequenceId_, position_, isPlaying() ? scale_ : 1.0, useProxies_, playStep(), showCaptions_, scale_});
 }
 
 void PlaybackController::seek(FrameTime t) {
@@ -449,7 +459,7 @@ void PlaybackController::tick() {
     }
     if (t != position_) {
         position_ = t;
-        worker_->request({project_, sequenceId_, t, scale_, useProxies_, playStep(), showCaptions_});
+        worker_->request({project_, sequenceId_, t, scale_, useProxies_, playStep(), showCaptions_, scale_});
         emit positionChanged(t);
     }
 }
@@ -483,6 +493,15 @@ void PlaybackController::stopAudio() {
     sink_->stop();
     sink_->deleteLater();
     sink_ = nullptr;
+}
+
+RenderOptions PlaybackController::renderOptions() const {
+    RenderOptions o;
+    o.scale = scale_;
+    o.useProxies = useProxies_;
+    o.captions = showCaptions_;
+    o.displaySpace = "rec709";
+    return o;
 }
 
 void PlaybackController::resetLoudness() { device_->resetLoudness(); }

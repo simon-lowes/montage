@@ -946,6 +946,11 @@ void TimelineWidget::paintWaveform(QPainter& p, const Clip& c, const QRect& r, c
     }
 }
 
+void TimelineWidget::setRenderedRanges(std::vector<std::pair<FrameTime, FrameTime>> ranges) {
+    rendered_ = std::move(ranges);
+    viewport()->update();
+}
+
 void TimelineWidget::paintRuler(QPainter& p) {
     const Sequence* s = state_->sequence();
     const int W = viewport()->width();
@@ -983,6 +988,12 @@ void TimelineWidget::paintRuler(QPainter& p) {
             p.setPen(theme::kTextDim);
             p.drawText(x + 3, 12, timecodeString(s, ft));
         }
+    }
+    // Render bar: rendered previews in green along the foot of the ruler.
+    for (const auto& [a, b] : rendered_) {
+        const int xa = xForFrame(a), xb = xForFrame(b);
+        if (xb < kHeaderW || xa > W) continue;
+        p.fillRect(QRect(xa, kRulerH - 3, std::max(1, xb - xa), 2), QColor(63, 185, 80));
     }
     // In/out band.
     if (s->inPoint >= 0 || s->outPoint >= 0) {
