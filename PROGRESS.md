@@ -744,4 +744,10 @@ All 15 items are in (October 2026). The near misses listed in the roadmap are th
     - Tilt-Shift: the band's detail kept, the top's cut by 80 %;
     - Camera Shake: moving by about the amplitude, the same frame the same, no edges at 20 px and 3°;
     - Stop Motion: a fade held four frames at a time through the compositor.
+- [x] Motion Blur and Deflicker (render/TemporalFx; worked out in render/Compositor where the source frame is read):
+  - **Motion Blur:** the motion to the frames before and after comes from `chainedMotion` (the consecutive flows Video Noise Reduction measures and caches). Each pixel averages 2–64 samples spread evenly over the shutter's time along that path, centred on the frame.
+  - **Deflicker:** each neighbouring frame's mean brightness per area (16 × 9, or the whole frame) is cached by media, size and frame, so playing on reads one new frame. Each area's gain is the trapezoid-weighted average of its neighbours over its own (half weight at the ends, so flicker that alternates frame to frame cancels exactly and a steady ramp is kept), clamped to 0.5–2 and blended bilinearly between area centres.
+  - **Tests** (on exported ProRes footage):
+    - a white square moving 16 px a frame: 24 soft pixels along its path at 360° (none without), none across it, and identical with the shutter shut;
+    - a gradient flickering ±0.2 stops each frame while brightening 0.02 stops a frame: frame-to-frame jitter down 2,400×, with the brightening kept to 0.1 %.
 

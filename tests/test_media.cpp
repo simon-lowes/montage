@@ -1672,6 +1672,109 @@ private slots:
         QVERIFY(std::fabs(vm.duration - 0.4) < 0.05);
     }
 
+    void motionBlurAndDeflicker() {
+        std::string err;
+        auto footage = [&](const std::string& file, const std::function<void(Project&, Sequence&)>& build) {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 320;
+            gs.height = 180;
+            gs.fps = {25, 1};
+            build(gen, gs);
+            ExportSettings st = findExportPreset("Apple ProRes 422 HQ")->settings;
+            st.path = path(file.c_str());
+            st.audioCodec = "none";
+            if (!exportSequence(gen, gs, st, nullptr, nullptr, &err)) qFatal("%s", err.c_str());
+            return st.path;
+        };
+        auto openIn = [&](Project& p, const std::string& file) -> Clip& {
+            Sequence& s = *p.active();
+            s.width = 320;
+            s.height = 180;
+            s.fps = {25, 1};
+            MediaItem m = probeOrFail(p, file);
+            p.media.push_back(m);
+            edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+            return s.videoTracks[0].clips.at(0);
+        };
+        // Motion Blur: a white square moving 16 px a frame smears along its path, not across it.
+        const std::string moving = footage("moving-square.mov", [](Project& gen, Sequence& gs) {
+            Clip bg = makeGeneratorClip(gen, "color", 20);
+            bg.generator.params["color.r"] = bg.generator.params["color.g"] = bg.generator.params["color.b"] = Param(0.0);
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, bg);
+            Clip sq = makeGeneratorClip(gen, "shape", 20);
+            sq.generator.params["width"] = Param(40.0);
+            sq.generator.params["height"] = Param(40.0);
+            sq.generator.params["fill_color.r"] = sq.generator.params["fill_color.g"] = sq.generator.params["fill_color.b"] = Param(1.0);
+            sq.generator.params["pos_x"].addKey(0, -150.0);
+            sq.generator.params["pos_x"].addKey(19, 154.0);
+            edit::overwrite(gen, gs, {TrackKind::Video, 1}, sq);
+        });
+        Project p = makeDefaultProject();
+        Clip& clip = openIn(p, moving);
+        Sequence& s = *p.active();
+        auto soft = [](const Image& img, bool across) {
+            // Pixels part way between black and white along the middle row (across) or column (along the square's centre).
+            int n = 0, cx = 0;
+            double best = 0;
+            for (int x = 0; x < img.width; ++x)
+                if (img.at(x, 90)[1] > best) best = img.at(x, 90)[1], cx = x;
+            const int len = across ? img.width : img.height;
+            for (int i = 0; i < len; ++i) {
+                const float v = across ? img.at(i, 90)[1] : img.at(cx, i)[1];
+                n += v > 0.1f && v < 0.9f;
+            }
+            return n;
+        };
+        const Image sharp = renderSequenceFrame(p, s, 8, {});
+        Effect mb = makeEffect(p, "motion_blur");
+        mb.params["shutter"] = 360.0;
+        clip.effects.push_back(mb);
+        const Image blurred = renderSequenceFrame(p, s, 8, {});
+        qInfo("motion blur: %d soft pixels across (from %d), %d along (from %d)", soft(blurred, true), soft(sharp, true), soft(blurred, false),
+              soft(sharp, false));
+        QVERIFY(soft(sharp, true) <= 4 && soft(blurred, true) >= 16);
+        QVERIFY(soft(blurred, false) <= 6);
+        clip.effects.back().params["shutter"] = 0.0;
+        QVERIFY(renderSequenceFrame(p, s, 8, {}).px == sharp.px);
+
+        // Deflicker: a gradient that flickers a fifth of a stop up and down each frame while slowly brightening.
+        const std::string flicker = footage("flicker.mov", [](Project& gen, Sequence& gs) {
+            Clip g = makeGeneratorClip(gen, "gradient", 24);
+            Effect cc = makeEffect(gen, "color_correct");
+            for (int f = 0; f < 24; ++f) cc.params["exposure"].addKey(f, (f % 2 ? -0.2 : 0.2) + 0.02 * f);
+            g.effects.push_back(cc);
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, g);
+        });
+        Project q = makeDefaultProject();
+        Clip& fc = openIn(q, flicker);
+        Sequence& qs = *q.active();
+        auto means = [&] {
+            std::vector<double> v;
+            for (FrameTime t = 5; t < 17; ++t) {
+                const Image img = renderSequenceFrame(q, qs, t, {});
+                double acc = 0;
+                for (size_t i = 0; i < img.px.size(); i += 4) acc += img.px[i + 1];
+                v.push_back(acc / double(img.px.size() / 4));
+            }
+            return v;
+        };
+        // How much it jumps about: the second difference (a steady ramp has none).
+        auto jitter = [](const std::vector<double>& v) {
+            double acc = 0;
+            for (size_t i = 1; i + 1 < v.size(); ++i) acc += std::fabs(v[i + 1] - 2 * v[i] + v[i - 1]);
+            return acc / double(v.size() - 2);
+        };
+        const std::vector<double> before = means();
+        fc.effects.push_back(makeEffect(q, "deflicker"));
+        const std::vector<double> after = means();
+        qInfo("deflicker: jitter %.5f from %.5f; %.4f to %.4f over the run (from %.4f to %.4f)", jitter(after), jitter(before), after.front(),
+              after.back(), before.front(), before.back());
+        QVERIFY2(jitter(after) < jitter(before) / 5, qPrintable(QString("%1 %2").arg(jitter(after)).arg(jitter(before))));
+        // The slow brightening is kept.
+        QVERIFY(after.back() > after.front() + 0.01);
+    }
+
     void videoNoiseReductionOnFootage() {
         // Grainy footage: a flat colour with fresh film grain on every frame, kept by ProRes 422 HQ.
         Project gen = makeDefaultProject();

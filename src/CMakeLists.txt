@@ -71,6 +71,7 @@ add_library(montage_engine STATIC
   render/AudioFx.h render/AudioFx.cpp
   render/VideoFx.h render/VideoFx.cpp
   render/StyleFx.h render/StyleFx.cpp
+  render/TemporalFx.h render/TemporalFx.cpp
   render/Exporter.h render/Exporter.cpp
   audio/Plugins.h audio/PluginScan.cpp audio/ClapHost.cpp
   audio/DynLib.h audio/DynLib.cpp

@@ -486,6 +486,13 @@ std::vector<EffectInfo> buildCatalog() {
         // Holds each frame for a few (handled where the clip's frame is chosen).
         c.push_back({"stop_motion", "Stop Motion", EffectCategory::VideoFilter, "Stylize",
                      {num("hold", "Hold Each Frame For (frames)", 1, 30, 3, 1)}, {}});
+        // From the frames either side (render/TemporalFx.h; worked out where the source frame is read).
+        c.push_back({"motion_blur", "Motion Blur", EffectCategory::VideoFilter, "Blur & Sharpen",
+                     {num("shutter", "Shutter Angle (°)", 0, 720, 180, 1)}, {}});
+        c.push_back({"deflicker", "Deflicker", EffectCategory::VideoFilter, "Repair",
+                     {num("frames", "Frames Either Side", 1, 12, 3, 1), choice("area", "Even Out", {"Whole Frame", "Each Area (16 x 9)"}, 1),
+                      pct("strength", "Strength", 0, 100, 100)},
+                     {}});
         c.push_back({"tilt_shift", "Tilt-Shift Blur", EffectCategory::VideoFilter, "Blur & Sharpen",
                      {pct("focus", "Focus Position", 0, 100, 50), pct("width", "Focus Width", 0, 100, 20), num("blur", "Blur (px)", 0, 200, 12, 0.5),
                       angle("angle", "Angle", 0), pct("saturation", "Saturation", 0, 200, 120)},

@@ -18,6 +18,7 @@
 #include "Processing.h"
 #include "Retime.h"
 #include "Shapes.h"
+#include "TemporalFx.h"
 #include "VideoDenoise.h"
 #include "audio/PluginEffect.h"
 #include "audio/SpeechCleanup.h"
@@ -297,6 +298,31 @@ const Effect* denoiseEffect(const Clip& c) {
     for (const Effect& e : c.effects)
         if (e.type == "video_denoise" && e.enabled) return &e;
     return nullptr;
+}
+
+const Effect* enabledEffect(const Clip& c, const char* type) {
+    for (const Effect& e : c.effects)
+        if (e.enabled && e.type == type) return &e;
+    return nullptr;
+}
+
+// Deflicker's per-frame brightness, kept by media, size and frame: playing on needs one new frame's worth.
+bool cachedTileStats(const std::string& key, TileStats& out, const std::function<bool(TileStats&)>& make) {
+    static std::mutex m;
+    static std::deque<std::pair<std::string, TileStats>> cache;
+    {
+        std::lock_guard lock(m);
+        for (const auto& [k, v] : cache)
+            if (k == key) {
+                out = v;
+                return true;
+            }
+    }
+    if (!make(out)) return false;
+    std::lock_guard lock(m);
+    cache.emplace_front(key, out);
+    if (cache.size() > 256) cache.pop_back();
+    return true;
 }
 
 // Video Noise Reduction on the source frame, under the effect's mask if it has one.
@@ -581,6 +607,62 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                 }
                 applyDenoise(*nr, lt, src, around, motion, effectPixelScale(c, lt, g.sx, mw, src.width),
                              m->kind == MediaKind::Video ? sec : -1);
+            }
+            // Motion Blur and Deflicker, from the source frames either side.
+            const Effect* blur = enabledEffect(c, "motion_blur");
+            const Effect* flicker = enabledEffect(c, "deflicker");
+            if ((blur || flicker) && m->kind == MediaKind::Video && m->fps.valid()) {
+                const double mf = m->fps.toDouble();
+                const int64_t base = int64_t(std::floor(sec * mf + 1e-6));
+                const std::string key = path + '@' + std::to_string(w) + 'x' + std::to_string(h);
+                auto fetch = [&](int64_t i, Image& into) {
+                    const double at = (double(i) + 0.25) / mf;
+                    if (at < 0 || at >= m->duration) return false;
+                    Frame16Ptr nf = MediaPool::instance().videoFrame(path, at, w, h, o.highQuality);
+                    if (nf) into = toImage(*nf);
+                    return bool(nf);
+                };
+                if (blur) {
+                    const Image self = decoded.empty() ? src : decoded;
+                    Image prev, next;
+                    int havePrev = -1, haveNext = -1;  // not tried yet
+                    const std::vector<MotionFn> motion = chainedMotion(key, base, {-1, 1}, [&](int64_t i) -> const Image* {
+                        if (i == base) return &self;
+                        if (i == base - 1) {
+                            if (havePrev < 0) havePrev = fetch(i, prev);
+                            return havePrev ? &prev : nullptr;
+                        }
+                        if (i == base + 1) {
+                            if (haveNext < 0) haveNext = fetch(i, next);
+                            return haveNext ? &next : nullptr;
+                        }
+                        return nullptr;
+                    });
+                    src = motionBlur(src, motion[0], motion[1], blur->p("shutter", lt, 180) / 360);
+                }
+                if (flicker) {
+                    const int r = std::clamp(int(std::lround(flicker->p("frames", lt, 3))), 1, 12);
+                    const bool local = flicker->p("area", lt, 1) > 0.5;
+                    const int gw = local ? 16 : 1, gh = local ? 9 : 1;
+                    std::vector<TileStats> around;
+                    std::vector<double> weights;
+                    for (int k = -r; k <= r; ++k) {
+                        if (k == 0) continue;
+                        TileStats st;
+                        const std::string id = key + '#' + std::to_string(base + k) + '#' + std::to_string(gw);
+                        if (!cachedTileStats(id, st, [&](TileStats& made) {
+                                Image f;
+                                if (!fetch(base + k, f)) return false;
+                                made = tileStats(f, gw, gh);
+                                return true;
+                            }))
+                            continue;
+                        around.push_back(std::move(st));
+                        // Half weight at the ends, so flicker that alternates frame to frame cancels exactly.
+                        weights.push_back(std::abs(k) == r ? 0.5 : 1.0);
+                    }
+                    deflicker(src, tileStats(src, gw, gh), 1.0, around, weights, flicker->p("strength", lt, 100) / 100);
+                }
             }
             if (upscale) {
                 Image big;
