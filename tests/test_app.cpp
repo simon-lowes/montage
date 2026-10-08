@@ -34,6 +34,7 @@
 #include <cstring>
 
 #include "AutoDuckDialog.h"
+#include "Settings.h"
 #include "AutoMixDialog.h"
 #include "CaptionsPanel.h"
 #include "ColorWheel.h"
@@ -2273,7 +2274,9 @@ private slots:
         }));
         QVERIFY(state()->save(root + "/cut.montage"));
         state()->newProject();
-        QVERIFY(QDir().rename(root + "/card", root + "/Card 2"));
+        // Closing the project lets its files go (on Windows a folder with an open file cannot be renamed); background
+        // thumbnail and audio jobs may hold one a moment longer.
+        QTRY_VERIFY_WITH_TIMEOUT(QDir().rename(root + "/card", root + "/Card 2"), 10000);
 
         // Opening it lists both files as offline, in the bin and on the timeline.
         QVERIFY(win_->openProject(root + "/cut.montage"));
@@ -3334,7 +3337,7 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(marker->shortcut(), QKeySequence(Qt::Key_Q));
         QVERIFY(trim->shortcut().isEmpty());
         // Kept between sessions: only the changes are stored, and load() puts them back.
-        QSettings settings;
+        QSettings settings = appSettings();
         QCOMPARE(settings.value("keymap/Sequence/Add Marker").toString(), QString("Q"));
         QCOMPARE(settings.value("keymap/Sequence/Ripple Trim Previous Edit to Playhead").toString(), QString("none"));
         QVERIFY(!settings.contains("keymap/Sequence/Lift"));
@@ -4602,7 +4605,7 @@ const auto seq = [this] { return state()->sequence(); };
         auto* smooth = panel->findChild<QToolButton*>("smoothCuts");
         QVERIFY(smooth && smooth->isCheckable());
         smooth->setChecked(true);
-        QVERIFY(QSettings().value("transcript/smoothCuts").toBool());
+        QVERIFY(appSettings().value("transcript/smoothCuts").toBool());
         panel->selectWords(3, 4);
         panel->deleteSelection();
         QCOMPARE(state()->sequence()->duration(), full - cut);

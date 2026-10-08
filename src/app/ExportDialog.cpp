@@ -1,5 +1,6 @@
 // Montage — export dialog.
 #include "ExportDialog.h"
+#include "Settings.h"
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -40,7 +41,6 @@ namespace {
 const QString kSettingsDir = QStringLiteral("export/lastDirectory");
 const QString kSettingsPreset = QStringLiteral("export/preset");
 
-QSettings appSettings() { return QSettings(QStringLiteral("Montage"), QStringLiteral("Montage")); }
 
 bool hasVideo(const ExportSettings& s) { return !s.videoCodec.empty() && s.videoCodec != "none"; }
 bool hasAudio(const ExportSettings& s) { return !s.audioCodec.empty() && s.audioCodec != "none"; }

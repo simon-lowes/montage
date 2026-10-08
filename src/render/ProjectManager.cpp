@@ -19,8 +19,9 @@ namespace fs = std::filesystem;
 namespace {
 
 fs::path u8path(const std::string& s) { return fs::path(std::u8string(s.begin(), s.end())); }
+// With forward slashes on every system, so a collected project's paths read the same everywhere (Windows takes both).
 std::string utf8(const fs::path& p) {
-    const std::u8string s = p.u8string();
+    const std::u8string s = p.generic_u8string();
     return std::string(s.begin(), s.end());
 }
 

@@ -592,6 +592,9 @@ bool EditorState::open(const QString& path, QString* error) {
     }
     if (gesture_) gesture_.reset();
     project_ = std::move(p);
+    // The last project's files are let go (idle decoders keep them open, which on Windows stops their folder being
+    // moved or renamed, as when a card is relinked).
+    MediaPool::instance().clear();
     history_.clear();
     savedRevision_ = history_.revision();
     path_ = path;
@@ -615,6 +618,7 @@ bool EditorState::open(const QString& path, QString* error) {
 void EditorState::newProject() {
     if (gesture_) gesture_.reset();
     project_ = makeDefaultProject();
+    MediaPool::instance().clear();  // let the last project's files go
     history_.clear();
     savedRevision_ = history_.revision();
     path_.clear();

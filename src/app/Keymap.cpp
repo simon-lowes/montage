@@ -1,4 +1,5 @@
 #include "Keymap.h"
+#include "Settings.h"
 
 #include <QAction>
 #include <QComboBox>
@@ -45,7 +46,7 @@ QList<QKeySequence> defaultKeys(const QAction* a) {
 
 // Saves the action's key if it differs from its own, else forgets it.
 void persist(const QAction* a) {
-    QSettings s;
+    QSettings s = appSettings();
     const QString id = idOf(a);
     if (a->shortcuts() == defaultKeys(a)) s.remove(kGroup + id);
     else s.setValue(kGroup + id, a->shortcut().isEmpty() ? QStringLiteral("none") : keyText(a->shortcut()));
@@ -186,7 +187,7 @@ QAction* find(const QWidget* window, const QString& id) {
 }
 
 void load(QWidget* window) {
-    QSettings s;
+    QSettings s = appSettings();
     for (QAction* a : actions(window)) {
         // Montage's own keys, as the menus left them.
         if (!a->property(kDefault).isValid()) {
@@ -224,7 +225,7 @@ bool assign(QWidget* window, const QString& id, const QKeySequence& key, bool ta
 }
 
 void resetAll(QWidget* window) {
-    QSettings().remove(QStringLiteral("keymap"));
+    appSettings().remove(QStringLiteral("keymap"));
     for (QAction* a : actions(window)) setKeys(a, defaultKeys(a));
 }
 
@@ -255,7 +256,7 @@ bool applyPreset(QWidget* window, const QString& preset) {
     for (auto it = keys.begin(); it != keys.end(); ++it)
         if (!it.value().toString().isEmpty())
             assign(window, it.key(), QKeySequence::fromString(it.value().toString(), QKeySequence::PortableText), true);
-    QSettings().setValue(QStringLiteral("keymapPreset"), preset);
+    appSettings().setValue(QStringLiteral("keymapPreset"), preset);
     return true;
 }
 

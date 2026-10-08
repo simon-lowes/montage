@@ -1,4 +1,5 @@
 #include "MediaBinWidget.h"
+#include "Settings.h"
 
 #include <QApplication>
 #include <QComboBox>
@@ -271,7 +272,7 @@ MediaBinWidget::MediaBinWidget(EditorState* state, QWidget* parent) : QWidget(pa
     icons_->setTextElideMode(Qt::ElideMiddle);
     icons_->setEditTriggers(QAbstractItemView::EditKeyPressed);
     icons_->viewport()->setMouseTracking(true);  // hover scrub
-    hoverScrub_ = QSettings(QStringLiteral("Montage"), QStringLiteral("Montage")).value(QStringLiteral("bin/hoverScrub"), true).toBool();
+    hoverScrub_ = appSettings().value(QStringLiteral("bin/hoverScrub"), true).toBool();
     list_ = new QTreeView(stack_);
     list_->setObjectName(QStringLiteral("mediaList"));
     list_->setModel(proxy_);
@@ -311,7 +312,7 @@ MediaBinWidget::MediaBinWidget(EditorState* state, QWidget* parent) : QWidget(pa
     split_->setCollapsible(1, false);
     lay->addWidget(split_, 1);
 
-    QSettings settings("Montage", "Montage");
+    QSettings settings = appSettings();
     const QStringList visible = settings.value("mediaBin/columns", defaultColumns()).toStringList();
     for (int c = 0; c < model_->columnCount(); ++c)
         list_->setColumnHidden(c, c != 0 && !visible.contains(QString::fromStdString(MediaBinModel::columnKeys()[size_t(c)])));
@@ -405,7 +406,7 @@ void MediaBinWidget::selectMedia(const std::vector<Id>& ids) {
 }
 
 void MediaBinWidget::importDialog() {
-    QSettings settings("Montage", "Montage");
+    QSettings settings = appSettings();
     QString dir = settings.value("lastImportDir").toString();
     QStringList files = QFileDialog::getOpenFileNames(
         this, tr("Import Media"), dir,
@@ -707,7 +708,7 @@ bool MediaBinWidget::replaceFootage(Id id, const QString& path, QString* why) {
 void MediaBinWidget::setHoverScrub(bool on) {
     hoverScrub_ = on;
     if (!on) model_->clearSkim();
-    QSettings(QStringLiteral("Montage"), QStringLiteral("Montage")).setValue(QStringLiteral("bin/hoverScrub"), on);
+    appSettings().setValue(QStringLiteral("bin/hoverScrub"), on);
 }
 
 void MediaBinWidget::skimAt(const QPoint& pos) {

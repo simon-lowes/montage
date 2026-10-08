@@ -1,5 +1,6 @@
 // Montage — sequence settings dialog.
 #include "SequenceSettingsDialog.h"
+#include "Settings.h"
 
 #include <QComboBox>
 #include <QDialogButtonBox>
@@ -333,7 +334,7 @@ bool SequenceSettingsDialog::editActive(EditorState* state, QWidget* parent) {
 }
 
 std::optional<NewSequenceSpec> SequenceSettingsDialog::askNew(QWidget* parent, const QString& defaultName) {
-    QSettings settings(QStringLiteral("Montage"), QStringLiteral("Montage"));
+    QSettings settings = appSettings();
     NewSequenceSpec spec;
     spec.name = defaultName.isEmpty() ? tr("Sequence") : defaultName;
     spec.width = settings.value(QStringLiteral("newSequence/width"), spec.width).toInt();

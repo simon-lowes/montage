@@ -1,4 +1,5 @@
 #include "MonitorPanel.h"
+#include "Settings.h"
 
 #include "ExposureView.h"
 
@@ -395,9 +396,9 @@ MonitorPanel::MonitorPanel(Mode mode, EditorState* state, PlaybackController* co
         connect(proxy, &QToolButton::toggled, this, [this](bool on) { controller_->setUseProxies(on); });
         connect(cc, &QToolButton::toggled, this, [this](bool on) {
             controller_->setShowCaptions(on);
-            QSettings().setValue("program/showCaptions", on);
+            appSettings().setValue("program/showCaptions", on);
         });
-        cc->setChecked(QSettings().value("program/showCaptions", true).toBool());
+        cc->setChecked(appSettings().value("program/showCaptions", true).toBool());
         connect(lift, &QToolButton::clicked, this, [this] {
             const Sequence* s = state_->sequence();
             if (!s) return;

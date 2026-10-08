@@ -1,4 +1,5 @@
 #include "PluginManagerDialog.h"
+#include "Settings.h"
 
 #include <QApplication>
 #include <QComboBox>
@@ -31,7 +32,7 @@ QString settingsKey(Format f) { return QStringLiteral("plugins/extraFolders/%1")
 }  // namespace
 
 void PluginManagerDialog::applySavedFolders() {
-    QSettings s;
+    QSettings s = appSettings();
     for (Format f : kAllFormats) {
         std::vector<std::string> dirs;
         for (const QString& d : s.value(settingsKey(f)).toStringList()) dirs.push_back(d.toStdString());
@@ -216,7 +217,7 @@ void PluginManagerDialog::editFolders() {
     auto* box = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
     lay->addWidget(box);
 
-    QSettings settings;
+    QSettings settings = appSettings();
     std::map<int, QStringList> folders;
     for (Format f : kAllFormats) folders[int(f)] = settings.value(settingsKey(f)).toStringList();
     auto show = [&] {

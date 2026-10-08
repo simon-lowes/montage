@@ -1,4 +1,5 @@
 #include "TranscribeDialog.h"
+#include "Settings.h"
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -126,7 +127,7 @@ TranscribeDialog::TranscribeDialog(int mediaCount, QWidget* parent) : QDialog(pa
     lay->addWidget(intro);
     auto* form = new QFormLayout;
     model_ = new QComboBox(this);
-    QSettings settings;
+    QSettings settings = appSettings();
     const QString english = QLocale::system().language() == QLocale::English ? "base.en" : "base";
     const QString chosen = settings.value("transcribe/model", english).toString();
     for (const auto& m : whisperModels()) {
@@ -179,7 +180,7 @@ TranscribeDialog::TranscribeDialog(int mediaCount, QWidget* parent) : QDialog(pa
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
     buttons->button(QDialogButtonBox::Ok)->setText(tr("Transcribe"));
     connect(buttons, &QDialogButtonBox::accepted, this, [this] {
-        QSettings s;
+        QSettings s = appSettings();
         s.setValue("transcribe/model", model_->currentData());
         s.setValue("transcribe/language", language_->currentData());
         s.setValue("transcribe/speakers", speakers_->isChecked());
@@ -365,7 +366,7 @@ void startTranscription(EditorState* state, const std::vector<Id>& media, const 
 
 void exportTranscript(const MediaItem& media, QWidget* parent) {
     if (!media.transcript) return;
-    QSettings settings;
+    QSettings settings = appSettings();
     const QString dir = settings.value("transcribe/exportDir", QFileInfo(QString::fromStdString(media.path)).absolutePath())
                             .toString();
     const QString srt = QObject::tr("SubRip captions (*.srt)"), vtt = QObject::tr("WebVTT captions (*.vtt)"),

@@ -1,4 +1,5 @@
 #include "CaptionsPanel.h"
+#include "Settings.h"
 
 #include <QCheckBox>
 #include <QColorDialog>
@@ -552,7 +553,7 @@ void CaptionsPanel::generateDialog() {
     QDialog dlg(this);
     dlg.setWindowTitle(tr("Generate Captions"));
     auto* form = new QFormLayout(&dlg);
-    QSettings settings;
+    QSettings settings = appSettings();
     auto* chars = new QSpinBox(&dlg);
     chars->setRange(16, 80);
     chars->setValue(settings.value("captions/lineChars", 42).toInt());
@@ -636,7 +637,7 @@ bool CaptionsPanel::exportFile(const QString& path, QString* error) const {
 }
 
 void CaptionsPanel::importDialog() {
-    QSettings settings;
+    QSettings settings = appSettings();
     const QString path = QFileDialog::getOpenFileName(this, tr("Import Captions"), settings.value("captions/dir").toString(),
                                                       tr("Captions (*.srt *.vtt);;All files (*)"));
     if (path.isEmpty()) return;
@@ -648,7 +649,7 @@ void CaptionsPanel::importDialog() {
 void CaptionsPanel::exportDialog() {
     const CaptionTrack* t = track();
     if (!t) return;
-    QSettings settings;
+    QSettings settings = appSettings();
     const QString srt = tr("SubRip (*.srt)"), vtt = tr("WebVTT (*.vtt)"), scc = tr("Scenarist SCC, CEA-608 (*.scc)");
     QString filter = srt;
     QString path = QFileDialog::getSaveFileName(this, tr("Export Captions"),

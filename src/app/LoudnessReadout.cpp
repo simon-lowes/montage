@@ -1,4 +1,5 @@
 #include "LoudnessReadout.h"
+#include "Settings.h"
 
 #include <QComboBox>
 #include <QGridLayout>
@@ -40,7 +41,7 @@ LoudnessReadout::LoudnessReadout(QWidget* parent) : QWidget(parent) {
     target_->setObjectName(QStringLiteral("loudnessTarget"));
     target_->addItems({tr("-23 (EBU R128)"), tr("-24 (ATSC A/85)"), tr("-14 (Streaming)"), tr("-16 (Apple, podcasts)")});
     target_->setToolTip(tr("The integrated loudness to aim for"));
-    target_->setCurrentIndex(std::clamp(QSettings().value(QStringLiteral("loudness/target"), 0).toInt(), 0, 3));
+    target_->setCurrentIndex(std::clamp(appSettings().value(QStringLiteral("loudness/target"), 0).toInt(), 0, 3));
     reset_ = new QToolButton(this);
     reset_->setObjectName(QStringLiteral("loudnessReset"));
     reset_->setText(tr("Reset"));
@@ -49,7 +50,7 @@ LoudnessReadout::LoudnessReadout(QWidget* parent) : QWidget(parent) {
     grid->addWidget(reset_, 6, 0, 1, 2);
     grid->setRowStretch(7, 1);
     connect(target_, &QComboBox::currentIndexChanged, this, [this](int i) {
-        QSettings().setValue(QStringLiteral("loudness/target"), i);
+        appSettings().setValue(QStringLiteral("loudness/target"), i);
         setReading(std::nan(""), std::nan(""), integrated_, std::nan(""), std::nan(""));
     });
     connect(reset_, &QToolButton::clicked, this, [this] {

@@ -1,4 +1,5 @@
 #include "MulticamPanel.h"
+#include "Settings.h"
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -37,7 +38,7 @@
 namespace montage {
 
 namespace {
-QSettings settings() { return QSettings(QStringLiteral("Montage"), QStringLiteral("Montage")); }
+QSettings settings() { return appSettings(); }
 }  // namespace
 
 // One angle: its picture, number and name; red while it is on the program.

@@ -1,4 +1,5 @@
 #include "MainWindow.h"
+#include "Settings.h"
 
 #include "CompareDialog.h"
 
@@ -116,9 +117,6 @@
 
 namespace montage {
 
-namespace {
-QSettings appSettings() { return QSettings("Montage", "Montage"); }
-}  // namespace
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     state_ = new EditorState(this);
@@ -2397,7 +2395,7 @@ unsigned MainWindow::askAttributes(const QString& title, bool removing) {
                                                      {"attrVolume", tr("Volume and pan")},
                                                      {"attrEffects", removing ? tr("Effects") : tr("Effects (added after the clip's own)")}};
     std::vector<QCheckBox*> boxes;
-    QSettings settings;
+    QSettings settings = appSettings();
     for (const auto& [name, label] : items) {
         auto* b = new QCheckBox(label, &dlg);
         b->setObjectName(QString::fromLatin1(name));

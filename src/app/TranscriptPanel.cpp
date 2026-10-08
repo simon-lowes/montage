@@ -1,4 +1,5 @@
 #include "TranscriptPanel.h"
+#include "Settings.h"
 
 #include <QComboBox>
 #include <QContextMenuEvent>
@@ -109,8 +110,8 @@ TranscriptPanel::TranscriptPanel(EditorState* state, QWidget* parent) : QWidget(
                            "so the jump in the picture morphs across instead of cutting"));
     smoothBtn_->setObjectName(QStringLiteral("smoothCuts"));
     smoothBtn_->setCheckable(true);
-    smoothBtn_->setChecked(QSettings().value(QStringLiteral("transcript/smoothCuts"), false).toBool());
-    connect(smoothBtn_, &QToolButton::toggled, this, [](bool on) { QSettings().setValue(QStringLiteral("transcript/smoothCuts"), on); });
+    smoothBtn_->setChecked(appSettings().value(QStringLiteral("transcript/smoothCuts"), false).toBool());
+    connect(smoothBtn_, &QToolButton::toggled, this, [](bool on) { appSettings().setValue(QStringLiteral("transcript/smoothCuts"), on); });
     paperAddBtn_ = button(this, tr("Add to Paper Edit"), tr("Add the selected words to the Paper Edit list below; lines can come from any clip"));
     paperAddBtn_->setObjectName(QStringLiteral("paperAdd"));
     paperBuildBtn_ = button(this, tr("Assemble"), tr("Lay the Paper Edit's lines out, in the list's order, as a new sequence"));
