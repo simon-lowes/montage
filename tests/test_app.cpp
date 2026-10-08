@@ -41,6 +41,7 @@
 #include "ExportDialog.h"
 #include "ExposureView.h"
 #include "QualityCheckDialog.h"
+#include "ProjectManagerDialog.h"
 #include "MediaBinModel.h"
 #include "MediaBinWidget.h"
 #include "SmartBinDialog.h"
@@ -782,6 +783,41 @@ private slots:
         state()->undo();
         QVERIFY(state()->sequence()->markers.empty());
         QCOMPARE(win_->importMarkers(dir_.path() + "/missing.csv"), 0);
+    }
+
+    void projectManagerDialog() {
+        loadDemo();
+        QVERIFY(win_->findChild<QAction*>("projectManager"));
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        QVERIFY(state()->apply("Place", [media](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, media, 0, 0, 60, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        }));
+        // The dialog's choices become the options.
+        ProjectManagerDialog dlg(state(), win_.get());
+        dlg.findChild<QLineEdit*>("pmFolder")->setText(dir_.path() + "/handoff");
+        dlg.findChild<QLineEdit*>("pmName")->setText("Handoff");
+        dlg.findChild<QComboBox*>("pmSequences")->setCurrentIndex(1);
+        auto* codec = dlg.findChild<QComboBox*>("pmCodec");
+        QVERIFY(!codec->isEnabled());  // only when consolidating
+        dlg.findChild<QComboBox*>("pmMode")->setCurrentIndex(1);
+        QVERIFY(codec->isEnabled());
+        dlg.findChild<QComboBox*>("pmMode")->setCurrentIndex(0);
+        const ConsolidateOptions o = dlg.options();
+        QCOMPARE(QString::fromStdString(o.name), QString("Handoff"));
+        QCOMPARE(o.sequences, std::vector<Id>{state()->sequence()->id});
+        QVERIFY(!o.trim);
+        // Collect: the sound is copied beside the new project, which opens.
+        QVERIFY(win_->runProjectManager(o));
+        QVERIFY(QFileInfo::exists(dir_.path() + "/handoff/Handoff.montage"));
+        QVERIFY(QFileInfo::exists(dir_.path() + "/handoff/Media/jfk.wav"));
+        QVERIFY(win_->statusBar()->currentMessage().contains("1 file"));
+        Project copy;
+        QVERIFY(loadProject((dir_.path() + "/handoff/Handoff.montage").toStdString(), copy));
+        QCOMPARE(copy.media.size(), size_t(1));
+        QVERIFY(QString::fromStdString(copy.media[0].path).endsWith("handoff/Media/jfk.wav"));
+        QVERIFY(!win_->runProjectManager(ConsolidateOptions{}));  // no folder
     }
 
     void razorTool() {

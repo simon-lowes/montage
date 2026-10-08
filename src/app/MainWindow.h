@@ -22,6 +22,7 @@ class QTabBar;
 namespace montage {
 
 class EditorState;
+struct ConsolidateOptions;
 class PlaybackController;
 class MonitorPanel;
 class MediaBinWidget;
@@ -97,6 +98,8 @@ public:
     int importMarkers(const QString& path);
     // Bakes the colour effects of the clip a command acts on, at the playhead, into a .cube file.
     bool exportClipLut(const QString& path, int size = 33);
+    // File › Project Manager: copies the project and its media (render/ProjectManager.h), with progress.
+    bool runProjectManager(const ConsolidateOptions& o);
     bool swapClip(bool withNext);                     // the selected clip (or the one under the playhead) with its neighbour
     bool replaceWithSource();                         // the selected clip, or the one under the playhead
     bool fitToFill();

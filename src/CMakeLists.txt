@@ -71,6 +71,7 @@ add_library(montage_engine STATIC
   render/PaperEdit.h render/PaperEdit.cpp
   render/QualityCheck.h render/QualityCheck.cpp
   render/LutExport.h render/LutExport.cpp
+  render/ProjectManager.h render/ProjectManager.cpp
   render/AutoBroll.h render/AutoBroll.cpp
   render/AutoMix.h render/AutoMix.cpp
   render/VoiceMatch.h render/VoiceMatch.cpp

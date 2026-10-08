@@ -63,6 +63,7 @@
 #include "AutoMixDialog.h"
 #include "ScriptCutDialog.h"
 #include "QualityCheckDialog.h"
+#include "ProjectManagerDialog.h"
 #include "KeyframePanel.h"
 #include "MediaBinWidget.h"
 #include "RenderQueue.h"
@@ -471,6 +472,10 @@ void MainWindow::buildMenus() {
     file->addSeparator();
     add(file, tr("&Import Media…"), QKeySequence("Ctrl+I"), [this] { bin_->importDialog(); });
     add(file, tr("&Export Media…"), QKeySequence("Ctrl+M"), [this] { exportMedia(); });
+    add(file, tr("Project &Manager…"), QKeySequence(), [this] {
+        ProjectManagerDialog dlg(state_, this);
+        if (dlg.exec() == QDialog::Accepted) runProjectManager(dlg.options());
+    })->setObjectName(QStringLiteral("projectManager"));
     add(file, tr("Export &Frame…"), QKeySequence("Ctrl+Shift+E"), [this] { exportFrame(); });
     add(file, tr("&Import Timeline (FCP XML, FCPXML, OTIO, EDL)…"), QKeySequence(), [this] { importTimeline(); });
     add(file, tr("Export Final Cut Pro &7 XML (Premiere, Resolve)…"), QKeySequence(), [this] { exportInterchange(Interchange::Fcp7Xml); });
@@ -1831,6 +1836,25 @@ void MainWindow::syncSequenceTabs() {
         if (openSequences_[size_t(i)] == p.activeSequence) sequenceTabs_->setCurrentIndex(i);
     }
     sequenceTabs_->setTabsClosable(openSequences_.size() > 1);
+}
+
+bool MainWindow::runProjectManager(const ConsolidateOptions& o) {
+    if (o.folder.empty()) {
+        statusBar()->showMessage(tr("Choose a folder to copy the project to"), 5000);
+        return false;
+    }
+    const Project project = state_->project();
+    ConsolidateResult res;
+    const bool ok = runWithProgress(this, state_, o.trim ? tr("Consolidating the project…") : tr("Collecting the project's media…"),
+                                    [&](const std::function<void(double)>& progress, const std::atomic<bool>* cancel, std::string* error) {
+                                        return consolidateProject(project, o, &res, progress, cancel, error);
+                                    });
+    if (!ok) return false;
+    QString text = tr("Copied the project to %1: %n file(s) copied", nullptr, res.copied).arg(QString::fromStdString(res.projectPath));
+    if (res.trimmed) text += tr(", %n consolidated", nullptr, res.trimmed);
+    if (!res.missing.empty()) text += tr(", %n missing", nullptr, int(res.missing.size()));
+    statusBar()->showMessage(text, 10000);
+    return true;
 }
 
 const Clip* MainWindow::clipForCommand() const {

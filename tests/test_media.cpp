@@ -85,6 +85,7 @@
 #include "core/Slate.h"
 #include "render/PaperEdit.h"
 #include "render/QualityCheck.h"
+#include "render/ProjectManager.h"
 #include "render/LutExport.h"
 
 extern "C" {
@@ -2862,6 +2863,101 @@ private slots:
         QVERIFY2(std::fabs(out[200] - 0.2f) < 0.01f, qPrintable(QString::number(out[200])));
     }
 
+    void projectManager() {
+        // A: four seconds of a changing ramp (ProRes, 96 x 54 at 25 fps); B: a sound nothing uses; C: a still.
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 96, gs.height = 54, gs.fps = Rational{25, 1};
+        Clip ramp = makeGeneratorClip(gen, "color", 100);
+        ramp.generator.params["color.r"].addKey(0, 0.0);
+        ramp.generator.params["color.r"].addKey(99, 1.0);
+        edit::overwrite(gen, gs, {TrackKind::Video, 0}, ramp);
+        ExportSettings st;
+        st.videoCodec = "prores_ks";
+        st.audioCodec = "none";
+        st.path = path("pm-a.mov");
+        std::string err;
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        writeWav(path("pm-b.wav"), 48000, 1.0, 0.2f, 0.2f);
+        QImage still(96, 54, QImage::Format_RGB32);
+        still.fill(qRgb(30, 160, 60));
+        QVERIFY(still.save(QString::fromStdString(path("pm-c.png"))));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 96, s.height = 54, s.fps = Rational{25, 1};
+        MediaItem a = probeOrFail(p, path("pm-a.mov")), b = probeOrFail(p, path("pm-b.wav")), c = probeOrFail(p, path("pm-c.png"));
+        auto t = std::make_shared<Transcript>();
+        TranscriptSegment seg;
+        seg.start = 0.5, seg.end = 3.5;
+        seg.words = {{0.5, 0.8, "one"}, {1.5, 1.8, "two"}, {3.2, 3.5, "three"}};
+        t->segments.push_back(seg);
+        a.transcript = t;
+        p.media.push_back(a), p.media.push_back(b), p.media.push_back(c);
+        // The cut uses A's second second, then the still; another sequence uses A from 3 s.
+        QVERIFY(edit::placeMedia(p, s, a.id, 0, 25, 50, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(edit::placeMedia(p, s, c.id, 25, 0, 25, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Id mainId = s.id;  // `s` goes stale when the sequence list grows
+        Sequence other = makeSequence(p, "Other", 96, 54, Rational{25, 1});
+        QVERIFY(edit::placeMedia(p, other, a.id, 0, 75, 90, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        p.sequences.push_back(other);
+        auto frame = [](const Project& pr, FrameTime f) {
+            RenderOptions ro;
+            return renderProgramFrame(pr, *pr.active(), f, ro);
+        };
+        const Image before = frame(p, 10);
+        QCOMPARE(usedMedia(p, {}).size(), size_t(2));
+
+        // Collect: the used files copied whole, B left out, everything pointing into the new folder.
+        ConsolidateOptions o;
+        o.folder = path("collected");
+        o.name = "Collected";
+        ConsolidateResult res;
+        QVERIFY2(consolidateProject(p, o, &res, {}, nullptr, &err), err.c_str());
+        QCOMPARE(res.copied, 2);
+        QCOMPARE(res.trimmed, 0);
+        QVERIFY(res.bytes > 0 && res.missing.empty());
+        Project collected;
+        QVERIFY2(loadProject(res.projectPath, collected, &err), err.c_str());
+        QCOMPARE(collected.media.size(), size_t(2));
+        QCOMPARE(collected.sequences.size(), size_t(2));
+        for (const MediaItem& m : collected.media) QVERIFY2(QString::fromStdString(m.path).contains("/collected/Media/"), m.path.c_str());
+        QVERIFY(frame(collected, 10).px == before.px);
+
+        // Consolidate the first sequence only, with half a second of handles: A becomes 0.5 to 2.5 s.
+        o.folder = path("trimmed");
+        o.trim = true;
+        o.handles = 0.5;
+        o.sequences = {mainId};
+        QVERIFY2(consolidateProject(p, o, &res, {}, nullptr, &err), err.c_str());
+        QCOMPARE(res.trimmed, 1);
+        QCOMPARE(res.copied, 1);
+        Project trimmed;
+        QVERIFY2(loadProject(res.projectPath, trimmed, &err), err.c_str());
+        QCOMPARE(trimmed.sequences.size(), size_t(1));
+        const MediaItem* ta = trimmed.findMedia(a.id);
+        QVERIFY(ta && QString::fromStdString(ta->path).endsWith("_trim.mov"));
+        QVERIFY2(std::fabs(ta->duration - 2.0) < 0.1, qPrintable(QString::number(ta->duration)));
+        QCOMPARE(trimmed.active()->videoTracks[0].clips[0].sourceIn, 12.5);
+        const Image after = frame(trimmed, 10);
+        float worst = 0;
+        for (size_t i = 0; i < after.px.size(); ++i) worst = std::max(worst, std::fabs(after.px[i] - before.px[i]));
+        QVERIFY2(worst < 0.02f, qPrintable(QString::number(worst)));
+        // The transcript moved with it: "one" at 0 s, "two" at 1 s, "three" (3.2 s) outside the span.
+        QVERIFY(ta->transcript);
+        const auto& words = ta->transcript->segments.at(0).words;
+        QCOMPARE(words.size(), size_t(2));
+        QVERIFY(std::fabs(words[0].start) < 1e-9 && std::fabs(words[1].start - 1.0) < 1e-9);
+
+        // A missing file is reported and left where it was; no folder is an error.
+        p.media.back().path = path("gone.png");
+        o.trim = false;
+        o.folder = path("partial");
+        QVERIFY(consolidateProject(p, o, &res, {}, nullptr, &err));
+        QCOMPARE(res.missing.size(), size_t(1));
+        o.folder.clear();
+        QVERIFY(!consolidateProject(p, o, &res, {}, nullptr, &err));
+    }
+
     void smartRendering() {
         // The source: one second of a changing ramp in ProRes 422 HQ, 128 x 72 at 25 fps.
         Project gen = makeDefaultProject();
@@ -5332,6 +5428,10 @@ private slots:
             QVERIFY(tool("montage_add_marker", QJsonObject{{"project", project}, {"at", 9999}, {"clip", double(first.id)}}).value("isError").toBool());
             QVERIFY(!tool("montage_undo", QJsonObject{{"project", project}}).value("isError").toBool());
         }
+        // A copy of the project with its media in a new folder.
+        r = tool("montage_consolidate", QJsonObject{{"project", project}, {"folder", QString::fromStdString(path("mcp-copy"))}, {"name", "Copy"}});
+        QVERIFY2(!r.value("isError").toBool() && text(r).contains("Wrote"), qPrintable(text(r)));
+        QVERIFY(QFileInfo::exists(QString::fromStdString(path("mcp-copy/Copy.montage"))));
         // Marker lists in and out.
         r = tool("montage_import_markers", QJsonObject{{"project", project}, {"text", "Timecode,Comment\n00:00:00:05,Check the title\n"}});
         QVERIFY2(!r.value("isError").toBool() && text(r).contains("Added 1"), qPrintable(text(r)));

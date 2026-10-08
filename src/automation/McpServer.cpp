@@ -48,6 +48,7 @@
 #include "core/Slate.h"
 #include "render/PaperEdit.h"
 #include "render/LutExport.h"
+#include "render/ProjectManager.h"
 #include "render/QualityCheck.h"
 #include "media/Decoder.h"
 #include "media/Faces.h"
@@ -1088,6 +1089,35 @@ void McpServer::Impl::addTools() {
             for (const Marker& m : markers) edit::addMarker(s, m);
             save(l);
             return ok(QStringLiteral("Added %1 marker(s)").arg(markers.size()));
+        });
+
+    add("montage_consolidate", "Copy the project and its media",
+        "Copy the project to a folder with the media it uses (Premiere's Project Manager): collect copies each used file "
+        "whole; with trim, only the parts of videos the sequences use are transcoded (plus handles) and the clips point at "
+        "the new files. Media nothing uses is left out unless keep_unused. Returns the new project's path.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"folder":{"type":"string"},"name":{"type":"string"},
+            "sequences":{"type":"string","enum":["all","active"],"default":"all"},"trim":{"type":"boolean","default":false},
+            "handles":{"type":"number","default":1,"description":"Seconds kept either side, when trimming"},
+            "codec":{"type":"string","enum":["prores","h264"],"default":"prores"},"keep_unused":{"type":"boolean","default":false}},
+            "required":["project","folder"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            ConsolidateOptions o;
+            o.folder = absolute(need(a, "folder")).toStdString();
+            o.name = str(a, "name", QFileInfo(l.path).completeBaseName()).toStdString();
+            if (str(a, "sequences", "all") == "active") o.sequences = {l.project.activeSequence};
+            o.trim = a.value("trim").toBool();
+            o.handles = std::max(0.0, a.value("handles").toDouble(1));
+            o.codec = str(a, "codec", "prores") == "h264" ? "libx264" : "prores_ks";
+            o.keepUnused = a.value("keep_unused").toBool();
+            ConsolidateResult res;
+            std::string err;
+            if (!consolidateProject(l.project, o, &res, [this](double f) { progress(f, "Copying"); }, nullptr, &err))
+                return fail(QString::fromStdString(err));
+            QString text = QStringLiteral("Wrote %1: %2 file(s) copied, %3 consolidated, %4 MB")
+                               .arg(QString::fromStdString(res.projectPath)).arg(res.copied).arg(res.trimmed).arg(double(res.bytes) / 1e6, 0, 'f', 1);
+            for (const std::string& m : res.missing) text += QStringLiteral("\nMissing: ") + QString::fromStdString(m);
+            return ok(text);
         });
 
     add("montage_transcribe", "Transcribe",
