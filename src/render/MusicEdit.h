@@ -32,4 +32,13 @@ bool analyzeMusicFit(const Project& p, const Sequence& s, const Clip& c, FrameTi
 // Only for audio clips at normal speed that are not linked to a picture.
 edit::Result applyMusicFit(Project& p, Sequence& s, Id clipId, const MusicFit& fit, double crossfadeSeconds = 0.08);
 
+// Cuts picture to the music: `media` (videos or stills, in order, starting
+// again when the music outlasts them) laid back to back on video track
+// `videoTrack` from the music clip's first beat (or bar), a cut every `every`
+// beats (or bars), until the clip ends. Each piece is the middle of its
+// media; a video too short for its piece is passed over for the next one.
+// Picture only. `created` lists the clips made.
+edit::Result cutToBeat(Project& p, Sequence& s, const Clip& music, const BeatGrid& g, const std::vector<Id>& media, int every, bool bars,
+                       int videoTrack);
+
 }  // namespace montage

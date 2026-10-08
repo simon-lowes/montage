@@ -545,6 +545,8 @@ void MainWindow::buildMenus() {
     add(clipM, tr("Add Bar Markers"), QKeySequence(), [this] { addBeatMarkers(false); })->setObjectName(QStringLiteral("addBarMarkers"));
     add(clipM, tr("Add Beat Markers"), QKeySequence(), [this] { addBeatMarkers(true); })->setObjectName(QStringLiteral("addBeatMarkers"));
     add(clipM, tr("Fit Music to Length…"), QKeySequence(), [this] { fitMusicDialog(); })->setObjectName(QStringLiteral("fitMusic"));
+    add(clipM, tr("Cut Selected Media to the Beat"), QKeySequence(), [this] { cutMediaToBeat(1, true); })
+        ->setObjectName(QStringLiteral("cutToBeat"));
     add(clipM, tr("S&ynchronize by Audio"), QKeySequence(), [this] { syncByAudio(); });
     clipM->addSeparator();
     add(clipM, tr("&Insert from Source"), QKeySequence(Qt::Key_Comma), [this] { state_->insertFromSource(false); });
@@ -1692,6 +1694,36 @@ int MainWindow::addBeatMarkers(bool everyBeat) {
         return n > 0;
     });
     state_->message(tr("%n marker(s) at %1 BPM", "", n).arg(grid.tempo, 0, 'f', 1), 5000);
+    return n;
+}
+
+int MainWindow::cutMediaToBeat(int every, bool bars) {
+    const Clip* c = musicClip();
+    const std::vector<Id> media = bin_ ? bin_->selectedMedia() : std::vector<Id>{};
+    if (!c || media.empty()) {
+        state_->message(tr("Select a music clip on the timeline and the clips to cut to it in the bin"));
+        return 0;
+    }
+    const Id clip = c->id, music = c->mediaId;
+    auto project = std::make_shared<const Project>(state_->project());
+    BeatGrid grid;
+    if (!runWithProgress(this, state_, tr("Finding the beat..."), [&, project](const auto&, const auto* cancel, std::string* err) {
+            return mediaBeats(*project, music, grid, cancel, err);
+        }))
+        return 0;
+    int n = 0;
+    std::string error;
+    state_->apply(tr("Cut to the Beat"), [&](Project& p, Sequence& s) {
+        const Clip* k = edit::clipById(s, clip);
+        if (!k) return edit::Result::fail("The music clip is gone");
+        const Clip copy = *k;
+        edit::Result r = cutToBeat(p, s, copy, grid, media, every, bars, std::max(0, state_->targetVideoTrack()));
+        n = int(r.created.size());
+        error = r.error;
+        return r;
+    });
+    if (n) state_->message(tr("%n clip(s) cut to the music at %1 BPM", "", n).arg(grid.tempo, 0, 'f', 1), 5000);
+    else if (!error.empty()) state_->message(QString::fromStdString(error), 6000);
     return n;
 }
 

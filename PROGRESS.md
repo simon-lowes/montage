@@ -760,4 +760,8 @@ All 15 items are in (October 2026). The near misses listed in the roadmap are th
   - Each band has its own peak envelope (shared attack and release), a 6 dB soft knee, ratio and gain.
   - **Tests:** flat within 0.1 dB at 60 Hz, both crossovers, 1 kHz and 9 kHz when idle; a loud 80 Hz squeezed 16 dB while a quiet 6 kHz beside it moves 0.00 dB; +6 dB of mid gain lifting 900 Hz and not 8 kHz; in the mixer.
 - [x] Behind People (render/Compositor `renderSequenceFrame`): the effect marks the clip; when its layer is composited, the person matte of the canvas beneath it (MODNet, cached by picture) is refined (edge shift, soften) and the layer multiplied by 1 − matte × amount. The same model checks as Remove Background in the app and MCP. **Tests:** a full-frame red layer over the Armstrong portrait shows red round him and the portrait unchanged on his face and suit; at 50 %, half the red over him.
+- [x] Cut to the Beat (render/MusicEdit `cutToBeat`, MCP `montage_cut_to_beat`, Clip menu):
+  - The music clip's beats (or downbeats) are mapped to timeline frames as the beat markers are; every Nth is a cut, and the last piece runs on to the music's end if that is at least half a piece.
+  - Media are taken in order and cycled; each piece is the middle of a video long enough for it (others are passed over) or a still; picture only (the audio track reference is left empty, so nothing linked is placed).
+  - **Tests:** a 20-bar song at 128 BPM with a four-second video, a one-second one and a still: clips from the first bar, a bar each (within 0.06 s), back to back to the music's end, the short video never used and the other two alternating, the video's middle taken, no sound added; every two bars over MCP.
 

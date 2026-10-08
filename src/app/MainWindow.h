@@ -69,6 +69,7 @@ public:
     bool hasVoiceReference() const { return !voiceRef_.empty(); }
     int matchVoice();
     int addBeatMarkers(bool everyBeat);
+    int cutMediaToBeat(int every, bool bars);  // the bin's selected media, cut on the music clip's beats
     bool fitMusicToLength(FrameTime target);
     void fitMusicDialog();
     // Auto Reframe: a copy of the current sequence at aspect w:h with every

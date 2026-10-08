@@ -50,6 +50,7 @@
 #include "render/FaceRefine.h"
 #include "render/AudioFx.h"
 #include "audio/AudioRepair.h"
+#include "render/MusicEdit.h"
 #include "render/AutoMix.h"
 #include "render/VideoDenoise.h"
 #include "render/VoiceMatch.h"
@@ -3678,6 +3679,85 @@ private slots:
         // Nothing to go on: an error, not an empty sequence.
         r = call(QJsonObject{{"project", project}, {"script", "Lines nobody ever said."}});
         QVERIFY(r.value("isError").toBool());
+    }
+
+    void cutToTheBeat() {
+        // Twenty bars at 128 BPM (a bar every 1.875 s), from half a second in.
+        const double lead = 0.5;
+        const std::vector<int> chords = {0, 0, 1, 2, 1, 2, 0, 3, 0, 3, 1, 2, 1, 2, 0, 3, 0, 3, 3, 3};
+        const std::string wav = path("cut-song.wav");
+        QVERIFY(writeMonoWav(wav, testSong(48000, lead, chords), 48000));
+        // A four-second video, a one-second one (too short for a bar) and a still.
+        std::string err;
+        auto video = [&](const char* name, FrameTime frames, float red) {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 160;
+            gs.height = 90;
+            Clip c = makeGeneratorClip(gen, "color", frames);
+            c.generator.params["color.r"] = Param(double(red));
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, c);
+            ExportSettings st = findExportPreset("H.264 - Fast Draft")->settings;
+            st.path = path(name);
+            st.audioCodec = "none";
+            if (!exportSequence(gen, gs, st, nullptr, nullptr, &err)) qFatal("%s", err.c_str());
+            return st.path;
+        };
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        const double fps = s.fpsValue();
+        auto add = [&](const std::string& file) {
+            MediaItem m = probeOrFail(p, file);
+            p.media.push_back(m);
+            return m.id;
+        };
+        const Id song = add(wav), longer = add(video("beat-4s.mp4", FrameTime(std::lround(4 * fps)), 0.9f)),
+                 shorter = add(video("beat-1s.mp4", FrameTime(std::lround(1 * fps)), 0.2f)), still = add(MONTAGE_TEST_DATA_DIR "/faces/jfk-color.jpg");
+        QVERIFY(edit::placeMedia(p, s, song, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Clip music = s.audioTracks[0].clips.at(0);
+        BeatGrid g;
+        QVERIFY2(mediaBeats(p, song, g, nullptr, &err), err.c_str());
+        const edit::Result r = cutToBeat(p, s, music, g, {longer, shorter, still}, 1, true, 0);
+        QVERIFY2(r.ok, r.error.c_str());
+        const auto& clips = s.videoTracks[0].clips;
+        QCOMPARE(clips.size(), r.created.size());
+        QVERIFY2(clips.size() >= 18, qPrintable(QString::number(clips.size())));
+        // From the first bar, a bar each, back to back, to the end of the music.
+        QVERIFY2(std::fabs(double(clips.front().start) / fps - lead) < 0.05, qPrintable(QString::number(clips.front().start)));
+        for (size_t i = 0; i < clips.size(); ++i) {
+            if (i + 1 < clips.size()) {
+                QCOMPARE(clips[i].end(), clips[i + 1].start);
+                QVERIFY2(std::fabs(double(clips[i].duration) / fps - kSongBar) < 0.06, qPrintable(QString::number(clips[i].duration)));
+            }
+            // The one-second video never fits a bar; the four-second one and the still take turns.
+            QCOMPARE(clips[i].mediaId, i % 2 ? still : longer);
+        }
+        QVERIFY(std::abs(clips.back().end() - music.end()) <= 1);
+        // The video's middle is used, and no sound comes with the pictures.
+        QVERIFY(std::fabs(clips[0].sourceIn - std::floor((4 * fps - double(clips[0].duration)) / 2)) <= 1);
+        QCOMPARE(s.audioTracks[0].clips.size(), size_t(1));
+        // Over MCP: every two bars.
+        Project q = makeDefaultProject();
+        Sequence& qs = *q.active();
+        for (const MediaItem& m : p.media) q.media.push_back(m);
+        QVERIFY(edit::placeMedia(q, qs, song, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const QString project = QString::fromStdString(path("cut-to-beat.montage"));
+        QVERIFY(saveProject(q, project.toStdString()));
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_cut_to_beat"},
+                                                     {"arguments", QJsonObject{{"project", project}, {"clip", double(qs.audioTracks[0].clips[0].id)},
+                                                                               {"media", QJsonArray{double(longer), double(still)}}, {"every", 2}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject res = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const auto& two = back.active()->videoTracks[0].clips;
+        QVERIFY(two.size() >= 9 && two.size() <= 11);
+        QVERIFY(std::fabs(double(two[0].duration) / fps - 2 * kSongBar) < 0.06);
     }
 
     void mcpMarksTheBeatAndFitsMusic() {

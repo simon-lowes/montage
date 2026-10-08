@@ -31,6 +31,52 @@ FrameTime timelineFrame(const Sequence& s, const Clip& c, double seconds) {
 
 }  // namespace
 
+edit::Result cutToBeat(Project& p, Sequence& s, const Clip& music, const BeatGrid& g, const std::vector<Id>& media, int every, bool bars,
+                       int videoTrack) {
+    if (media.empty()) return edit::Result::fail("Choose the clips to cut to the music");
+    if (g.empty()) return edit::Result::fail("No beat was found in the music");
+    every = std::max(1, every);
+    // Where the cuts fall on the timeline.
+    std::vector<FrameTime> cuts;
+    const std::vector<double>& marks = bars && !g.downbeats.empty() ? g.downbeats : g.beats;
+    for (size_t i = 0; i < marks.size(); ++i) {
+        const FrameTime t = timelineFrame(s, music, marks[i]);
+        if (t >= 0 && (cuts.empty() || t > cuts.back())) cuts.push_back(t);
+    }
+    std::vector<FrameTime> at;
+    for (size_t i = 0; i < cuts.size(); i += size_t(every)) at.push_back(cuts[i]);
+    if (at.empty()) return edit::Result::fail("The music clip plays none of its beats");
+    // The last piece runs on to the end of the music, if that is at least half a piece.
+    const FrameTime end = music.end();
+    const FrameTime typical = at.size() > 1 ? (at.back() - at.front()) / FrameTime(at.size() - 1) : end - at.front();
+    if (end - at.back() >= std::max<FrameTime>(1, typical / 2)) at.push_back(end);
+    while (int(s.videoTracks.size()) <= videoTrack) edit::addTrack(p, s, TrackKind::Video);
+    edit::Result all;
+    all.ok = true;
+    size_t next = 0;
+    for (size_t i = 0; i + 1 < at.size(); ++i) {
+        const FrameTime len = at[i + 1] - at[i];
+        // The next clip long enough for this piece (stills always are).
+        const MediaItem* m = nullptr;
+        for (size_t tries = 0; tries < media.size() && !m; ++tries) {
+            const MediaItem* cand = p.findMedia(media[next % media.size()]);
+            ++next;
+            if (!cand) continue;
+            const bool still = cand->kind == MediaKind::Image;
+            if (still || cand->duration * s.fpsValue() >= double(len)) m = cand;
+        }
+        if (!m) continue;
+        const double frames = m->kind == MediaKind::Image ? double(len) : m->duration * s.fpsValue();
+        const double in = m->kind == MediaKind::Image ? 0.0 : std::floor((frames - double(len)) / 2);
+        const edit::Result r = edit::placeMedia(p, s, m->id, at[i], in, in + double(len), {TrackKind::Video, videoTrack},
+                                                {TrackKind::Audio, -1}, false);
+        if (!r.ok) return r;
+        all.created.insert(all.created.end(), r.created.begin(), r.created.end());
+    }
+    if (all.created.empty()) return edit::Result::fail("None of the clips is long enough for a piece");
+    return all;
+}
+
 bool mediaBeats(const Project& p, Id mediaId, BeatGrid& out, const std::atomic<bool>* cancel, std::string* error) {
     const MediaItem* m = p.findMedia(mediaId);
     if (!m || !m->hasAudio || m->path.empty()) {

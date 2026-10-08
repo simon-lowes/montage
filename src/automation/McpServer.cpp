@@ -1027,6 +1027,33 @@ void McpServer::Impl::addTools() {
                       QJsonObject{{"markers", n}, {"tempo", g.tempo}});
         });
 
+    add("montage_cut_to_beat", "Cut clips to the beat",
+        "Lay media (videos or stills, in order, repeating if the music outlasts them) back to back on a video track with a "
+        "cut every `every` beats or bars of a music clip, from its first beat to its end. Each piece is the middle of its "
+        "media; a video too short for a piece is passed over. Picture only (the music is the sound).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number","description":"the music clip"},
+            "media":{"type":"array","items":{"type":"number"}},"every":{"type":"number","default":1},
+            "unit":{"type":"string","enum":["beat","bar"],"default":"bar"},"track":{"type":"number","default":0}},
+            "required":["project","clip","media"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            const Clip c = clipArg(l, a);
+            BeatGrid g;
+            std::string err;
+            if (!mediaBeats(l.project, c.mediaId, g, nullptr, &err)) return fail(QString::fromStdString(err));
+            std::vector<Id> media;
+            for (const QJsonValue& v : a.value("media").toArray()) media.push_back(Id(v.toDouble()));
+            const edit::Result r = cutToBeat(l.project, l.seq(), c, g, media, std::max(1, a.value("every").toInt(1)),
+                                             a.value("unit").toString(QStringLiteral("bar")) == QLatin1String("bar"),
+                                             std::max(0, a.value("track").toInt(0)));
+            if (!r.ok) return fail(QString::fromStdString(r.error));
+            save(l);
+            QJsonArray clips;
+            for (Id id : r.created) clips.append(double(id));
+            return ok(QStringLiteral("%1 clip(s) cut to the music at %2 BPM").arg(r.created.size()).arg(g.tempo, 0, 'f', 1),
+                      QJsonObject{{"clips", clips}, {"tempo", g.tempo}});
+        });
+
     add("montage_fit_music", "Fit music to a length",
         "Re-edit a music clip (audio, normal speed, not linked to picture) to last about `seconds`: whole bars are skipped "
         "or repeated where the music matches itself best, keeping its start and ending, with short crossfades on the beat. "
