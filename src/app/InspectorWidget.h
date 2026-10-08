@@ -31,7 +31,14 @@ private:
         QString key;                        // merge-key prefix
         bool keyframes = true;
         std::function<void(Sequence&)> afterWrite;  // runs in the same edit (e.g. to keep linked clips in step)
+        Id clip = 0;  // a clip's own effect: value changes reach the same effect on the other selected clips
+        Id effect = 0;
     };
+    // The other selected clips a change to `target` also goes to (Resolve's multi-clip Inspector), and applying
+    // `fn` to their matching effects at their own times, inside an edit.
+    std::vector<Id> otherSelected(const Target& target) const;
+    void applyToOthers(Sequence& s, const Target& target, const std::vector<Id>& others, FrameTime playhead,
+                       const std::function<void(Effect&, FrameTime)>& fn) const;
 
     void rebuild();
     void refreshValues();

@@ -54,6 +54,22 @@ Effect* findEffect(Clip& c, Id id) {
     return nullptr;
 }
 
+// The same effect in another clip: the fixed attributes by kind, a generator of the same type, else the effect of
+// the same type at the same place among those of its type.
+Effect* matchingEffect(Clip& from, Id effectId, Clip& to) {
+    if (from.motion.id == effectId) return &to.motion;
+    if (from.audio.id == effectId) return &to.audio;
+    if (!from.timing.empty() && from.timing.id == effectId) return to.timing.empty() ? nullptr : &to.timing;
+    if (from.generator.id == effectId) return to.generator.type == from.generator.type ? &to.generator : nullptr;
+    const auto it = std::find_if(from.effects.begin(), from.effects.end(), [&](const Effect& e) { return e.id == effectId; });
+    if (it == from.effects.end()) return nullptr;
+    const std::string type = it->type;
+    int nth = int(std::count_if(from.effects.begin(), it, [&](const Effect& e) { return e.type == type; }));  // of its type before it
+    for (Effect& e : to.effects)
+        if (e.type == type && nth-- == 0) return &e;
+    return nullptr;
+}
+
 QToolButton* smallButton(QWidget* parent, const QString& text, const QString& tip) {
     auto* b = new QToolButton(parent);
     b->setText(text);
@@ -208,11 +224,20 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
         t.time = localTime;
         t.origin = originFn;
         t.key = QString("p%1:%2").arg(clipId).arg(effectId);
+        t.clip = clipId;
+        t.effect = effectId;
         return t;
     };
 
     // ---- Clip ---------------------------------------------------------------
     QFormLayout* form = addSection(clip.isGenerator() ? tr("Clip (Generated)") : tr("Clip"));
+    if (const size_t n = otherSelected(target(clip.motion.id)).size(); n > 0) {
+        auto* many = new QLabel(tr("Values changed here go to all %1 selected clips").arg(n + 1), content_);
+        many->setObjectName(QStringLiteral("inspectorMultiClip"));
+        many->setWordWrap(true);
+        many->setStyleSheet(QString("color: %1;").arg(theme::kAccent.name()));
+        form->addRow(many);
+    }
     auto* name = new QLineEdit(QString::fromStdString(clip.name), content_);
     form->addRow(tr("Name"), name);
     connect(name, &QLineEdit::textEdited, this, [this, clipId](const QString& text) {
@@ -869,10 +894,15 @@ void InspectorWidget::addColorWheels(QFormLayout* form, const Target& target) {
             const double common = (now[0] + now[1] + now[2]) / 3;
             const double v[3] = {common + r + w.neutral, common + g + w.neutral, common + b + w.neutral};
             const FrameTime t = target.time();
-            state_->edit(label, [target, w, v, t](Project&, Sequence& s) {
+            const std::vector<Id> others = otherSelected(target);
+            const FrameTime playhead = state_->playhead();
+            state_->edit(label, [this, target, w, v, t, others, playhead](Project&, Sequence& s) {
                 Effect* e = target.resolve(s);
                 if (!e) return false;
                 for (int i = 0; i < 3; ++i) e->params[w.names[i]].set(t, v[i]);
+                applyToOthers(s, target, others, playhead, [&](Effect& o, FrameTime ot) {
+                    for (int i = 0; i < 3; ++i) o.params[w.names[i]].set(ot, v[i]);
+                });
                 if (target.afterWrite) target.afterWrite(s);
                 return true;
             }, mergeKey);
@@ -887,6 +917,30 @@ void InspectorWidget::addColorWheels(QFormLayout* form, const Target& target) {
         refreshers_.push_back(refresh);
     }
     form->addRow(row);
+}
+
+std::vector<Id> InspectorWidget::otherSelected(const Target& target) const {
+    std::vector<Id> out;
+    const Sequence* s = state_->sequence();
+    if (!target.clip || !s) return out;
+    const auto here = edit::locate(*s, target.clip);
+    for (Id id : state_->selectedClips()) {
+        const auto loc = edit::locate(*s, id);
+        if (id != target.clip && here && loc && loc->track.kind == here->track.kind) out.push_back(id);
+    }
+    return out;
+}
+
+void InspectorWidget::applyToOthers(Sequence& s, const Target& target, const std::vector<Id>& others, FrameTime playhead,
+                                    const std::function<void(Effect&, FrameTime)>& fn) const {
+    Clip* from = target.clip ? edit::clipById(s, target.clip) : nullptr;
+    if (!from) return;
+    for (Id id : others) {
+        Clip* c = edit::clipById(s, id);
+        if (!c || c == from) continue;
+        if (Effect* e = matchingEffect(*from, target.effect, *c))
+            fn(*e, std::clamp<FrameTime>(playhead - c->start, 0, std::max<FrameTime>(0, c->duration - 1)));
+    }
 }
 
 void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const Target& target) {
@@ -918,10 +972,15 @@ void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const 
     };
     auto write = [this, target, label, mergeKey](std::vector<std::pair<std::string, double>> values) {
         FrameTime t = target.time();
-        state_->edit(tr("Change %1").arg(label), [target, values, t](Project&, Sequence& s) {
+        const std::vector<Id> others = otherSelected(target);
+        const FrameTime playhead = state_->playhead();
+        state_->edit(tr("Change %1").arg(label), [this, target, values, t, others, playhead](Project&, Sequence& s) {
             Effect* e = target.resolve(s);
             if (!e) return false;
             for (const auto& [n, v] : values) e->params[n].set(t, v);
+            applyToOthers(s, target, others, playhead, [&](Effect& o, FrameTime ot) {
+                for (const auto& [n, v] : values) o.params[n].set(ot, v);
+            });
             if (target.afterWrite) target.afterWrite(s);
             return true;
         }, mergeKey);

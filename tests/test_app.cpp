@@ -5011,6 +5011,33 @@ const auto seq = [this] { return state()->sequence(); };
         state()->newProject();
     }
 
+    void inspectorEditsAllSelected() {
+        loadDemo();
+        const Id red = clipNamed(*state()->sequence(), "Red")->id, blue = clipNamed(*state()->sequence(), "Blue")->id;
+        state()->setSelection({red, blue});
+        QApplication::processEvents();
+        const Id primary = state()->primaryClip()->id, other = primary == red ? blue : red;
+        auto* note = win_->findChild<QLabel*>("inspectorMultiClip");
+        QVERIFY(note && note->text().contains("2 selected"));
+        QDoubleSpinBox* opacity = nullptr;
+        for (auto* sp : win_->findChildren<QDoubleSpinBox*>())
+            if (sp->suffix() == " %" && sp->maximum() == 100 && sp->value() == 100 && sp->isVisibleTo(win_.get())) opacity = sp;
+        QVERIFY(opacity);
+        opacity->setValue(40);
+        // The same parameter changed on both clips, in one undo step.
+        const Clip* a = edit::clipById(*state()->sequence(), primary);
+        const char* name = std::fabs(a->motion.p("opacity", 0) - 40) < 0.01 ? "opacity" : "crop_bottom";
+        QVERIFY(std::fabs(a->motion.p(name, 0) - 40) < 0.01);
+        QVERIFY(std::fabs(edit::clipById(*state()->sequence(), other)->motion.p(name, 0) - 40) < 0.01);
+        state()->undo();
+        QCOMPARE(edit::clipById(*state()->sequence(), other)->motion.p("opacity", 0), 100.0);
+        QCOMPARE(edit::clipById(*state()->sequence(), primary)->motion.p("opacity", 0), 100.0);
+        // One clip selected: no note, and only that clip changes.
+        state()->setSelection({red});
+        QApplication::processEvents();
+        QVERIFY(!win_->findChild<QLabel*>("inspectorMultiClip"));
+    }
+
     void inspectorEditsAreUndoable() {
         loadDemo();
         Id red = clipNamed(*state()->sequence(), "Red")->id;

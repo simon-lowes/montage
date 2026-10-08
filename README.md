@@ -99,6 +99,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Gaussian blur, sharpen, vignette, mosaic, mirror, drop shadow
 - **Adjustment layers** (Clip › New Adjustment Layer, or Generators in the Effects panel): the effects, opacity, transform and blend mode on the layer apply to everything on the tracks below it, for a grade or a look over many clips at once.
 - Keyframes on every parameter: linear, hold or smooth, with previous/next navigation
+- **Several clips at once in the Inspector** (Resolve 21's): with more than one clip selected, a value changed in the Inspector (a transform, a colour wheel, any effect's parameter) goes to the same parameter on every selected clip of that kind, each at its own playhead position, in one undo step; a note at the top says how many clips it reaches. Effects are matched by type and place among those of their type.
 - **Keyframes panel** (like the timeline in Premiere's Effect Controls): every animated parameter of the selected clip as a row of keys over the clip's length.
   - Click or drag a box to select keys, and drag them to retime (rows move together, without passing other keys).
   - Arrow keys nudge (Shift for 10 frames) and Delete removes. Right-click for Linear, Hold, Smooth or **Bezier**, or to **Ease In**, **Ease Out** or **Easy Ease**. Double-click adds a key.
