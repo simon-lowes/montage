@@ -60,6 +60,10 @@ public:
     // (in the clip beneath it, or its own footage) from the playhead to the
     // clip's end (forward) or start, keying the corners.
     void trackCorners(Id clip, Id effect, bool forward);
+    // Moves `clip` with what is under its position in the footage beneath, from
+    // the playhead to the clip's end (forward) or start; model 0 position,
+    // 1 + scale, 2 + rotation; `size` the tracked square, a fraction of the frame height.
+    void followFootage(Id clip, bool forward, int model, double size);
 
 private:
     // Runs `work` off the UI thread behind a progress dialog with Cancel;

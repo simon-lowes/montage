@@ -1702,6 +1702,36 @@ private slots:
         for (const Keyframe& k : corner("tl_x")->keys) QVERIFY(std::fabs(k.v - 0.3) < 0.06);
         state()->undo();
         QVERIFY(!corner("tl_x")->animated());
+
+        // A title above the footage follows it (Transform › Follow).
+        Id titleId = 0;
+        state()->edit("Title", [&](Project& p, Sequence& s) {
+            Clip t = makeGeneratorClip(p, "title", edit::clipById(s, clip)->duration);
+            t.motion.params["pos_x"] = -20.0;
+            titleId = t.id;
+            return edit::overwrite(p, s, {TrackKind::Video, 1}, t).ok;
+        });
+        state()->setSelection({titleId}, false);
+        QApplication::processEvents();
+        QToolButton* follow = nullptr;
+        for (auto* b : win_->findChildren<QToolButton*>("followForward"))
+            if (b->isVisibleTo(win_.get())) follow = b;
+        QVERIFY(follow);
+        follow->click();
+        auto posX = [&]() -> const Param* {
+            const Clip* t = edit::clipById(*state()->sequence(), titleId);
+            auto it = t ? t->motion.params.find("pos_x") : decltype(t->motion.params.end()){};
+            return t && it != t->motion.params.end() ? &it->second : nullptr;
+        };
+        QTRY_VERIFY_WITH_TIMEOUT(posX() && posX()->animated(), 30000);
+        QCOMPARE(posX()->keys.front().t, FrameTime(5));
+        // The 320 px footage shakes up to 5 px either way, scaled up to the sequence; the title moves as much.
+        const double px = state()->sequence()->width / 320.0;
+        double most = 0;
+        for (const Keyframe& k : posX()->keys) most = std::max(most, std::fabs(k.v + 20));
+        QVERIFY2(most > 1 * px && most < 11 * px, qPrintable(QString::number(most / px)));
+        state()->undo();
+        QVERIFY(!posX()->animated());
         state()->newProject();
         win_->activateWindow();
         QVERIFY(QTest::qWaitForWindowActive(win_.get()));

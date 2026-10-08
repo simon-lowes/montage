@@ -1998,6 +1998,54 @@ private slots:
         QVERIFY2(std::fabs(shift - truth) < 1.0, qPrintable(QString("%1 vs %2").arg(shift).arg(truth)));
     }
 
+    void followTheFootage() {
+        const std::string video = path("follow.mp4");
+        const auto jitter = writeShakyVideo(video, 40);
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320;
+        s.height = 180;
+        s.fps = {25, 1};
+        MediaItem mi = probeOrFail(p, video);
+        p.media.push_back(mi);
+        // The footage shows its frames 10 to 34; a title above it, positioned on a detailed spot.
+        QVERIFY(edit::placeMedia(p, s, mi.id, 0, 10, 35, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Clip title = makeGeneratorClip(p, "title", 25);
+        title.generator.strings["text"] = "Look";
+        title.motion.params["pos_x"] = -30.0;
+        title.motion.params["pos_y"] = 10.0;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 1}, title).ok);
+        Clip& t = trackAt(s, {TrackKind::Video, 1})->clips.at(0);
+        const Clip& footage = trackAt(s, {TrackKind::Video, 0})->clips.at(0);
+        QVERIFY(footageBeneath(p, s, t, 0) == &footage);
+        QVERIFY(!footageBeneath(p, s, footage, 0));
+        std::vector<FollowKey> keys;
+        std::string err;
+        QVERIFY2(trackClipFollow(p, s, t, 0, true, MotionModel::Similarity, 0.3, keys, {}, nullptr, &err), err.c_str());
+        QCOMPARE(int(keys.size()), 25);
+        QCOMPARE(keys.front().t, FrameTime(0));
+        double worst = 0;
+        for (const FollowKey& k : keys) {
+            // Local frame k.t is footage frame 10 + k.t.
+            worst = std::max({worst, std::fabs(k.x + 30 - (jitter[size_t(10 + k.t)].x - jitter[10].x)),
+                              std::fabs(k.y - 10 - (jitter[size_t(10 + k.t)].y - jitter[10].y))});
+            QVERIFY(std::fabs(k.scale - 100) < 2 && std::fabs(k.rotation) < 1);  // the camera only shifts
+        }
+        QVERIFY2(worst < 1.0, qPrintable(QString::number(worst)));
+        // Position only: scale and rotation stay as they were.
+        applyFollow(t, keys, MotionModel::Translation);
+        QCOMPARE(t.motion.params["pos_x"].keys.size(), size_t(25));
+        QVERIFY(!t.motion.params["scale"].animated());
+        QVERIFY(std::fabs(t.motion.p("pos_x", 20) + 30 - (jitter[30].x - jitter[10].x)) < 1.0);
+        // Backwards from the end: keys down to the first frame.
+        QVERIFY2(trackClipFollow(p, s, t, 24, false, MotionModel::Translation, 0.3, keys, {}, nullptr, &err), err.c_str());
+        QCOMPARE(keys.front().t, FrameTime(24));
+        QCOMPARE(keys.back().t, FrameTime(0));
+        // Nothing beneath: an error.
+        QVERIFY(!trackClipFollow(p, s, footage, 0, true, MotionModel::Translation, 0.3, keys, {}, nullptr, &err));
+        QVERIFY(!err.empty());
+    }
+
     void planarTracking() {
         // A homography from point pairs, a fifth of them wrong.
         Homography truth;

@@ -318,6 +318,41 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
             auto* reset = smallButton(nullptr, QStringLiteral("↺"), tr("Reset Transform"));
             QFormLayout* t = addSection(tr("Transform"), reset);
             addParamRows(t, *info, target(clip.motion.id));
+            // Follow: the clip moves with what is under its position in the footage beneath
+            // (a title on a moving car, a blur on a face), like Final Cut's object tracker.
+            auto* row = new QWidget(content_);
+            auto* rh = new QHBoxLayout(row);
+            rh->setContentsMargins(0, 0, 0, 0);
+            auto* back = new QToolButton(row);
+            back->setText(tr("◀ Follow"));
+            back->setObjectName(QStringLiteral("followBack"));
+            back->setToolTip(tr("Move this clip with the footage beneath it, backwards from the playhead"));
+            auto* fwd = new QToolButton(row);
+            fwd->setText(tr("Follow ▶"));
+            fwd->setObjectName(QStringLiteral("followForward"));
+            fwd->setToolTip(tr("Move this clip with the footage beneath it, from the playhead on.\n"
+                               "Put its Position on what it should follow first; Anchor then offsets it from that point."));
+            auto* model = new QComboBox(row);
+            model->setObjectName(QStringLiteral("followModel"));
+            model->addItems({tr("Position"), tr("Position & Scale"), tr("Position, Scale & Rotation")});
+            auto* size = new QComboBox(row);
+            size->setObjectName(QStringLiteral("followSize"));
+            size->setToolTip(tr("How much around the point to follow"));
+            size->addItem(tr("Small"), 0.1);
+            size->addItem(tr("Medium"), 0.2);
+            size->addItem(tr("Large"), 0.35);
+            size->setCurrentIndex(1);
+            rh->addWidget(back);
+            rh->addWidget(fwd);
+            rh->addWidget(model, 1);
+            rh->addWidget(size);
+            t->addRow(tr("Follow:"), row);
+            for (auto [button, forward] : {std::pair{back, false}, std::pair{fwd, true}})
+                connect(button, &QToolButton::clicked, this, [this, clipId, model, size, forward = forward] {
+                    const int m = model->currentIndex();
+                    const double sz = size->currentData().toDouble();
+                    QTimer::singleShot(0, this, [this, clipId, forward, m, sz] { followFootage(clipId, forward, m, sz); });
+                });
             Id mid = clip.motion.id;
             connect(reset, &QToolButton::clicked, this, [this, clipId, mid] {
                 state_->edit(tr("Reset Transform"), [clipId, mid](Project&, Sequence& s) {
@@ -1209,6 +1244,30 @@ void InspectorWidget::trackCorners(Id clip, Id effect, bool forward) {
         return true;
     });
     state_->message(tr("Tracked %n frame(s)", "", int(keys.size())), 4000);
+}
+
+void InspectorWidget::followFootage(Id clip, bool forward, int model, double size) {
+    const Sequence* s = state_->sequence();
+    const Clip* c = s ? edit::clipById(*s, clip) : nullptr;
+    if (!c) return;
+    auto project = std::make_shared<const Project>(state_->project());
+    const Id seqId = s->id;
+    const FrameTime from = std::clamp<FrameTime>(state_->playhead() - c->start, 0, c->duration - 1);
+    const MotionModel m = model == 0 ? MotionModel::Translation : model == 1 ? MotionModel::TranslationScale : MotionModel::Similarity;
+    std::vector<FollowKey> keys;
+    const bool ok = runAnalysis(tr("Following the footage..."), [&, project, seqId](const auto& progress, const auto* cancel, std::string* err) {
+        const Sequence* sq = project->findSequence(seqId);
+        const Clip* cl = sq ? edit::clipById(*sq, clip) : nullptr;
+        return cl && trackClipFollow(*project, *sq, *cl, from, forward, m, size, keys, progress, cancel, err);
+    });
+    if (!ok) return;
+    state_->edit(tr("Follow"), [clip, keys, m](Project&, Sequence& sq) {
+        Clip* cl = edit::clipById(sq, clip);
+        if (!cl) return false;
+        applyFollow(*cl, keys, m);
+        return true;
+    });
+    state_->message(tr("Followed for %n frame(s)", "", int(keys.size())), 4000);
 }
 
 void InspectorWidget::trackObject(Id clip, Id effect, bool forward) {

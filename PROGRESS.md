@@ -131,7 +131,7 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
     - the footage tracked is the clip beneath the pinned one (else its own), with corners mapped through both clips' transforms;
     - the Program monitor shows the corners to drag (keyed at the playhead when animated), and the Inspector has ◀ Track / Track ▶.
   - Planar tests: a homography recovered exactly with a fifth of the pairs wrong; a card turning in perspective over a still background tracked within 1 px on every frame forwards and backwards; the sequence workflow (a picture over the footage keyed from the playhead to the end, then back to the start); and the app's handles and buttons.
-  - Still to do: attaching a track to a title or clip's position.
+  - Follow (Transform › Follow ◀ / ▶, like Final Cut's object tracker): the footage beneath a clip is tracked around where its Position puts it (a square of a chosen size), and the clip's position, plus scale and rotation if chosen, are keyed to follow; Anchor offsets the picture from the followed point. Tested against the known jitter of synthetic footage (within 1 px on every frame), forwards and backwards, with an error when nothing is beneath, and from the Inspector.
 - [x] 17. LV2 hosting (M):
   - Through lilv (optional; installed in CI and the macOS and Windows packages). Bundles are loaded from wherever the scan found them.
   - Ports: control inputs become parameters (range, default, stepped). Audio is mono or stereo, in blocks of the activated size. Atom and CV ports are connected to scratch buffers.

@@ -117,7 +117,7 @@ bool mapQuad(const Project& p, const Sequence& s, const Clip& from, const Clip& 
 
 }  // namespace
 
-const Clip* cornerTrackSource(const Project& p, const Sequence& s, const Clip& c, FrameTime local) {
+const Clip* footageBeneath(const Project& p, const Sequence& s, const Clip& c, FrameTime local) {
     const auto loc = edit::locate(s, c.id);
     const FrameTime t = c.start + local;
     if (loc && loc->track.kind == TrackKind::Video)
@@ -127,6 +127,11 @@ const Clip* cornerTrackSource(const Project& p, const Sequence& s, const Clip& c
             const Clip* below = edit::clipAt(s, TrackRef{TrackKind::Video, i}, t);
             if (below && hasPicture(p, *below)) return below;
         }
+    return nullptr;
+}
+
+const Clip* cornerTrackSource(const Project& p, const Sequence& s, const Clip& c, FrameTime local) {
+    if (const Clip* below = footageBeneath(p, s, c, local)) return below;
     return hasPicture(p, c) ? &c : nullptr;
 }
 
@@ -194,6 +199,77 @@ void applyCornerTrack(Effect& e, const std::vector<std::pair<FrameTime, TrackQua
                            prm.keys.end());
             for (const auto& [t, q] : keys) prm.addKey(t, axis == 0 ? q.p[k].x : q.p[k].y, Interp::Linear);
         }
+}
+
+// ---- Following -----------------------------------------------------------------------
+
+bool trackClipFollow(const Project& p, const Sequence& s, const Clip& c, FrameTime fromLocal, bool forward,
+                     MotionModel model, double size, std::vector<FollowKey>& keys, const TrackProgress& progress,
+                     const std::atomic<bool>* cancel, std::string* error) {
+    keys.clear();
+    fromLocal = std::clamp<FrameTime>(fromLocal, 0, c.duration - 1);
+    const Clip* src = footageBeneath(p, s, c, fromLocal);
+    if (!src) {
+        if (error) *error = "Nothing to follow: put this clip on a track above video";
+        return false;
+    }
+    const MediaItem* m = p.findMedia(src->mediaId);
+    const FrameTime from = c.start + fromLocal;
+    const FrameTime to = forward ? std::min(c.end(), src->end()) - 1 : std::max(c.start, src->start);
+    if (from == to) {
+        if (error) *error = forward ? "Already at the last frame to track" : "Already at the first frame to track";
+        return false;
+    }
+    // Where the clip's anchor point lands on screen, and a square around it, in the footage's frame.
+    const double x0 = c.motion.p("pos_x", fromLocal), y0 = c.motion.p("pos_y", fromLocal);
+    const double scale0 = c.motion.p("scale", fromLocal, 100), rot0 = c.motion.p("rotation", fromLocal);
+    const double cx = s.width / 2.0 + x0, cy = s.height / 2.0 + y0, half = std::clamp(size, 0.02, 1.0) * s.height / 2;
+    double u, v, ux, vx, uy, vy;
+    if (!sequenceToClipFrame(p, s, *src, from, cx, cy, u, v) || !sequenceToClipFrame(p, s, *src, from, cx + half, cy, ux, vx) ||
+        !sequenceToClipFrame(p, s, *src, from, cx, cy + half, uy, vy)) {
+        if (error) *error = "The footage beneath has no picture there";
+        return false;
+    }
+    const TrackRegion start{u, v, 2 * std::hypot(ux - u, vx - v), 2 * std::hypot(uy - u, vy - v), 0};
+    const double fromSec = sourceSeconds(s, *src, from - src->start), toSec = sourceSeconds(s, *src, to - src->start);
+    const auto regions = trackRegion(m->path, fromSec, toSec, start, model, progress, cancel, error);
+    if (regions.size() < 2) {
+        if (error && error->empty()) *error = "Lost straight away: put the clip's position on something with detail";
+        return false;
+    }
+    const double fps = m->fps.valid() ? m->fps.toDouble() : s.fpsValue();
+    const double dir = toSec >= fromSec ? 1 : -1;
+    for (size_t k = 0; k < regions.size(); ++k) {
+        const FrameTime t = src->start + FrameTime(std::llround(localFrame(s, *src, fromSec + dir * double(k) / fps)));
+        if (t < c.start || t >= c.end() || t < src->start || t >= src->end()) continue;
+        double x, y;
+        if (!clipFrameToSequence(p, s, *src, t, regions[k].x, regions[k].y, x, y)) continue;
+        FollowKey key{t - c.start, x - s.width / 2.0, y - s.height / 2.0, scale0 * regions[k].w / std::max(1e-9, start.w),
+                      rot0 + regions[k].rotation - start.rotation};
+        if (!keys.empty() && keys.back().t == key.t) keys.back() = key;  // several media frames per sequence frame
+        else keys.push_back(key);
+    }
+    if (keys.size() < 2 && error) *error = "Lost straight away: put the clip's position on something with detail";
+    return keys.size() >= 2;
+}
+
+void applyFollow(Clip& c, const std::vector<FollowKey>& keys, MotionModel model) {
+    if (keys.empty()) return;
+    FrameTime lo = keys.front().t, hi = lo;
+    for (const FollowKey& k : keys) {
+        lo = std::min(lo, k.t);
+        hi = std::max(hi, k.t);
+    }
+    auto write = [&](const char* name, double FollowKey::*field) {
+        Param& prm = c.motion.params[name];
+        prm.keys.erase(std::remove_if(prm.keys.begin(), prm.keys.end(), [&](const Keyframe& k) { return k.t >= lo && k.t <= hi; }),
+                       prm.keys.end());
+        for (const FollowKey& k : keys) prm.addKey(k.t, k.*field, Interp::Linear);
+    };
+    write("pos_x", &FollowKey::x);
+    write("pos_y", &FollowKey::y);
+    if (model != MotionModel::Translation) write("scale", &FollowKey::scale);
+    if (model == MotionModel::Similarity) write("rotation", &FollowKey::rotation);
 }
 
 // ---- Object masks ---------------------------------------------------------------

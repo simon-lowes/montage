@@ -51,6 +51,25 @@ bool trackClipCorners(const Project& p, const Sequence& s, const Clip& c, const 
 TrackQuad cornerPinQuad(const Effect& e, FrameTime t);
 void applyCornerTrack(Effect& e, const std::vector<std::pair<FrameTime, TrackQuad>>& keys);
 
+// ---- Following (titles and graphics that move with the footage) ---------------
+// The topmost video clip beneath `c` on a lower track at clip-local `local`; null if none.
+const Clip* footageBeneath(const Project& p, const Sequence& s, const Clip& c, FrameTime local);
+struct FollowKey {
+    FrameTime t = 0;  // clip-local
+    double x = 0, y = 0, scale = 100, rotation = 0;  // the clip's pos_x, pos_y, scale and rotation
+};
+// Moves clip `c` with what is under its position (where its anchor point lands)
+// in the footage beneath it: a square `size` (a fraction of the frame height)
+// wide around that point is tracked from clip-local `fromLocal` to the end
+// (forward) or start of whichever clip stops first. Keys carry position, and
+// scale and rotation as the model allows (else as they were).
+bool trackClipFollow(const Project& p, const Sequence& s, const Clip& c, FrameTime fromLocal, bool forward,
+                     MotionModel model, double size, std::vector<FollowKey>& keys, const TrackProgress& progress = {},
+                     const std::atomic<bool>* cancel = nullptr, std::string* error = nullptr);
+// Writes the keys into the clip's position (and scale and rotation for those
+// models), replacing the keyframes in the tracked range.
+void applyFollow(Clip& c, const std::vector<FollowKey>& keys, MotionModel model);
+
 // ---- Object masks (media/Segmenter.h) -----------------------------------------
 // Frames are the media's own (ObjectMask::fps), so trims, speed changes and
 // splits keep the segmentation lined up with the picture.
