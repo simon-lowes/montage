@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include "Compositor.h"
+#include "core/EditOps.h"
 #include "media/Decoder.h"
 #include "media/Segmenter.h"
 
@@ -89,6 +91,109 @@ void applyMaskTrack(Effect& e, const std::vector<std::pair<FrameTime, TrackRegio
     write("mask.w", &TrackRegion::w);
     write("mask.h", &TrackRegion::h);
     write("mask.rotation", &TrackRegion::rotation);
+}
+
+// ---- Corner pins -------------------------------------------------------------------
+
+namespace {
+
+const char* const kCornerParams[4][2] = {{"tl_x", "tl_y"}, {"tr_x", "tr_y"}, {"br_x", "br_y"}, {"bl_x", "bl_y"}};
+
+bool hasPicture(const Project& p, const Clip& c) {
+    const MediaItem* m = c.mediaId ? p.findMedia(c.mediaId) : nullptr;
+    return c.enabled && m && m->kind == MediaKind::Video && m->hasVideo && !m->path.empty();
+}
+
+// Corners from one clip's frame into another's through the sequence frame at timeline frame t.
+bool mapQuad(const Project& p, const Sequence& s, const Clip& from, const Clip& to, FrameTime t, TrackQuad& q) {
+    if (from.id == to.id) return true;
+    for (Point2& pt : q.p) {
+        double x, y;
+        if (!clipFrameToSequence(p, s, from, t, pt.x, pt.y, x, y) || !sequenceToClipFrame(p, s, to, t, x, y, pt.x, pt.y))
+            return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+const Clip* cornerTrackSource(const Project& p, const Sequence& s, const Clip& c, FrameTime local) {
+    const auto loc = edit::locate(s, c.id);
+    const FrameTime t = c.start + local;
+    if (loc && loc->track.kind == TrackKind::Video)
+        for (int i = loc->track.index - 1; i >= 0; --i) {
+            const Track& tr = s.videoTracks[size_t(i)];
+            if (tr.muted) continue;
+            const Clip* below = edit::clipAt(s, TrackRef{TrackKind::Video, i}, t);
+            if (below && hasPicture(p, *below)) return below;
+        }
+    return hasPicture(p, c) ? &c : nullptr;
+}
+
+TrackQuad cornerPinQuad(const Effect& e, FrameTime t) {
+    TrackQuad q;
+    for (int k = 0; k < 4; ++k) q.p[k] = {e.p(kCornerParams[k][0], t, q.p[k].x), e.p(kCornerParams[k][1], t, q.p[k].y)};
+    return q;
+}
+
+bool trackClipCorners(const Project& p, const Sequence& s, const Clip& c, const Effect& e, FrameTime fromLocal,
+                      bool forward, std::vector<std::pair<FrameTime, TrackQuad>>& keys, const TrackProgress& progress,
+                      const std::atomic<bool>* cancel, std::string* error) {
+    keys.clear();
+    fromLocal = std::clamp<FrameTime>(fromLocal, 0, c.duration - 1);
+    const Clip* src = cornerTrackSource(p, s, c, fromLocal);
+    if (!src) {
+        if (error) *error = "Nothing to track: put the clip over video of the surface, or use a video clip";
+        return false;
+    }
+    const MediaItem* m = p.findMedia(src->mediaId);
+    // Timeline frames: from the playhead to the end (start) of whichever clip stops first.
+    const FrameTime from = c.start + fromLocal;
+    const FrameTime to = forward ? std::min(c.end(), src->end()) - 1 : std::max(c.start, src->start);
+    if (from == to) {
+        if (error) *error = forward ? "Already at the last frame to track" : "Already at the first frame to track";
+        return false;
+    }
+    TrackQuad start = cornerPinQuad(e, fromLocal);
+    if (!mapQuad(p, s, c, *src, from, start)) {
+        if (error) *error = "The clips have no picture to track";
+        return false;
+    }
+    const double fromSec = sourceSeconds(s, *src, from - src->start), toSec = sourceSeconds(s, *src, to - src->start);
+    const auto quads = trackQuad(m->path, fromSec, toSec, start, progress, cancel, error);
+    if (quads.size() < 2) {
+        if (error && error->empty()) *error = "The surface was lost straight away";
+        return false;
+    }
+    const double fps = m->fps.valid() ? m->fps.toDouble() : s.fpsValue();
+    const double dir = toSec >= fromSec ? 1 : -1;
+    for (size_t k = 0; k < quads.size(); ++k) {
+        const FrameTime t = src->start + FrameTime(std::llround(localFrame(s, *src, fromSec + dir * double(k) / fps)));
+        if (t < c.start || t >= c.end() || t < src->start || t >= src->end()) continue;
+        TrackQuad q = quads[k];
+        if (!mapQuad(p, s, *src, c, t, q)) continue;
+        const FrameTime lt = t - c.start;
+        if (!keys.empty() && keys.back().first == lt) keys.back().second = q;  // several media frames per sequence frame
+        else keys.push_back({lt, q});
+    }
+    if (keys.size() < 2 && error) *error = "The surface was lost straight away";
+    return keys.size() >= 2;
+}
+
+void applyCornerTrack(Effect& e, const std::vector<std::pair<FrameTime, TrackQuad>>& keys) {
+    if (keys.empty()) return;
+    FrameTime lo = keys.front().first, hi = lo;
+    for (const auto& kv : keys) {
+        lo = std::min(lo, kv.first);
+        hi = std::max(hi, kv.first);
+    }
+    for (int k = 0; k < 4; ++k)
+        for (int axis = 0; axis < 2; ++axis) {
+            Param& prm = e.params[kCornerParams[k][axis]];
+            prm.keys.erase(std::remove_if(prm.keys.begin(), prm.keys.end(), [&](const Keyframe& kf) { return kf.t >= lo && kf.t <= hi; }),
+                           prm.keys.end());
+            for (const auto& [t, q] : keys) prm.addKey(t, axis == 0 ? q.p[k].x : q.p[k].y, Interp::Linear);
+        }
 }
 
 // ---- Object masks ---------------------------------------------------------------

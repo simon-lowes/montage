@@ -32,6 +32,25 @@ bool trackClipMask(const Project& p, const Sequence& s, const Clip& c, const Eff
 // replacing the keyframes in the tracked range.
 void applyMaskTrack(Effect& e, const std::vector<std::pair<FrameTime, TrackRegion>>& keys);
 
+// ---- Corner pins (planar tracking) -------------------------------------------
+// The footage a Corner Pin on `c` follows at clip-local frame `local`: the
+// topmost video clip under it on a lower track (the screen or sign being
+// replaced), or `c` itself when nothing with a picture is underneath. Null
+// if neither has video.
+const Clip* cornerTrackSource(const Project& p, const Sequence& s, const Clip& c, FrameTime local);
+// Follows the quad the corners of `e` make at clip-local `fromLocal` across
+// that footage, to the end (forward) or start of whichever of the two clips
+// ends first, as (clip-local frame, corners) keys. Corners stay in `c`'s own
+// frame, mapped through both clips' transforms.
+bool trackClipCorners(const Project& p, const Sequence& s, const Clip& c, const Effect& e, FrameTime fromLocal,
+                      bool forward, std::vector<std::pair<FrameTime, TrackQuad>>& keys,
+                      const TrackProgress& progress = {}, const std::atomic<bool>* cancel = nullptr,
+                      std::string* error = nullptr);
+// The effect's corners at clip-local `t`, and writing tracked keys into its
+// eight corner parameters (replacing the keyframes in the tracked range).
+TrackQuad cornerPinQuad(const Effect& e, FrameTime t);
+void applyCornerTrack(Effect& e, const std::vector<std::pair<FrameTime, TrackQuad>>& keys);
+
 // ---- Object masks (media/Segmenter.h) -----------------------------------------
 // Frames are the media's own (ObjectMask::fps), so trims, speed changes and
 // splits keep the segmentation lined up with the picture.

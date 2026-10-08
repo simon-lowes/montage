@@ -56,6 +56,10 @@ public:
     void trackMask(Id clip, Id effect, bool forward, int model);
     // Follows the object of `effect`'s Object mask from the playhead to the clip's end (or start).
     void trackObject(Id clip, Id effect, bool forward);
+    // Follows the surface under the corners of Corner Pin `effect` on `clip`
+    // (in the clip beneath it, or its own footage) from the playhead to the
+    // clip's end (forward) or start, keying the corners.
+    void trackCorners(Id clip, Id effect, bool forward);
 
 private:
     // Runs `work` off the UI thread behind a progress dialog with Cancel;

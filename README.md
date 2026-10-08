@@ -28,7 +28,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Curves with presets, HSL/vibrance, `.cube` 3D/1D LUTs, black & white, invert
 - Chroma key with spill suppression, and luma key
 - Levels, Posterize, Glow, Film Grain (new each frame, strongest in the mid-tones), Directional Blur, Chromatic Aberration, Lens Distortion (barrel or pincushion), Letterbox (2.39, 2, 1.85, 4:3, 1:1, 9:16)
-- Corner Pin: four keyframeable corners map the picture onto any quadrilateral, for screen replacements
+- Corner Pin: four keyframeable corners map the picture onto any quadrilateral, for screen replacements. The corners show in the Program monitor to drag onto the surface.
 - Masks on every video effect:
   - An ellipse or rectangle with feather, expansion, rotation, opacity and invert, all keyframeable. Drag it in the Program monitor to move it, or pull its handles to resize it.
   - An HSL qualifier selects by hue, saturation and luma with softness, for example to grade only skin or only the sky. Show Mask displays the selection.
@@ -43,7 +43,8 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Tracking and stabilisation (built in; no OpenCV):
   - **Stabilize** effect: analyses the clip's camera movement when added, then smooths it (or locks the shot). It can correct position, scale and rotation, and zooms to keep the edges hidden. Smoothness can be changed at any time without analysing again.
   - **Mask tracking**: ◀ Track / Track ▶ in any mask section follows what the mask covers from the playhead to the clip's start or end. It tracks position, scale and rotation, and writes keyframes.
-  - Under the hood: pyramidal Lucas–Kanade on Shi–Tomasi corners with forward–backward checks, and RANSAC similarity fits.
+  - **Planar tracking** (screen replacement, like Mocha or Resolve's planar tracker): put a picture on the track above a phone, monitor or sign, add Corner Pin, drag its corners onto the surface, and press ◀ Track / Track ▶. The corners follow the surface in perspective and are keyed on every frame. A blank screen is held by its bezel.
+  - Under the hood: pyramidal Lucas–Kanade on Shi–Tomasi corners with forward–backward checks, RANSAC similarity fits, and RANSAC homographies fitted against the first frame, so planar tracks do not drift.
 - Gaussian blur, sharpen, vignette, mosaic, mirror, drop shadow
 - **Adjustment layers** (Clip › New Adjustment Layer, or Generators in the Effects panel): the effects, opacity, transform and blend mode on the layer apply to everything on the tracks below it, for a grade or a look over many clips at once.
 - Keyframes on every parameter: linear, hold or smooth, with previous/next navigation

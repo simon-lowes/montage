@@ -469,6 +469,30 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
             connect(analyze, &QPushButton::clicked, this,
                     [this, owner, eid] { QTimer::singleShot(0, this, [this, owner, eid] { analyzeStabilize(owner, eid); }); });
         }
+        if (e.type == "corner_pin" && onClip) {
+            // Planar tracking: the corners follow a flat surface (a screen, a sign) in the footage.
+            auto* row = new QWidget(content_);
+            auto* rh = new QHBoxLayout(row);
+            rh->setContentsMargins(0, 0, 0, 0);
+            auto* back = new QToolButton(row);
+            back->setText(tr("◀ Track"));
+            back->setObjectName(QStringLiteral("trackCornersBack"));
+            back->setToolTip(tr("Track the surface under the corners backwards from the playhead"));
+            auto* fwd = new QToolButton(row);
+            fwd->setText(tr("Track ▶"));
+            fwd->setObjectName(QStringLiteral("trackCornersForward"));
+            fwd->setToolTip(tr("Track the surface under the corners from the playhead on.\n"
+                               "Drag the corners onto it in the Program monitor first; the clip beneath "
+                               "this one is tracked, or this clip's own footage if nothing is beneath."));
+            rh->addWidget(back);
+            rh->addWidget(fwd);
+            rh->addStretch(1);
+            f->addRow(tr("Track:"), row);
+            for (auto [button, forward] : {std::pair{back, false}, std::pair{fwd, true}})
+                connect(button, &QToolButton::clicked, this, [this, owner, eid, forward = forward] {
+                    QTimer::singleShot(0, this, [this, owner, eid, forward] { trackCorners(owner, eid, forward); });
+                });
+        }
         if (kind == TrackKind::Video && supportsMask(e.type)) {
             // Shape masks and the HSL qualifier; folded away until one is used.
             QFormLayout* mf = addSection(tr("%1 Mask").arg(QString::fromStdString(info->displayName)), nullptr,
@@ -1157,6 +1181,31 @@ void InspectorWidget::trackMask(Id clip, Id effect, bool forward, int model) {
         Effect* ef = edit::ownedEffect(sq, clip, effect);
         if (!ef) return false;
         applyMaskTrack(*ef, keys);
+        return true;
+    });
+    state_->message(tr("Tracked %n frame(s)", "", int(keys.size())), 4000);
+}
+
+void InspectorWidget::trackCorners(Id clip, Id effect, bool forward) {
+    const Sequence* s = state_->sequence();
+    const Clip* c = s ? edit::clipById(*s, clip) : nullptr;
+    const Effect* e = s ? edit::ownedEffect(const_cast<Sequence&>(*s), clip, effect) : nullptr;
+    if (!c || !e) return;
+    auto project = std::make_shared<const Project>(state_->project());
+    const Id seqId = s->id;
+    const FrameTime from = std::clamp<FrameTime>(state_->playhead() - c->start, 0, c->duration - 1);
+    std::vector<std::pair<FrameTime, TrackQuad>> keys;
+    const bool ok = runAnalysis(tr("Tracking the surface..."), [&, project, seqId](const auto& progress, const auto* cancel, std::string* err) {
+        const Sequence* sq = project->findSequence(seqId);
+        const Clip* cl = sq ? edit::clipById(*sq, clip) : nullptr;
+        const Effect* ef = sq ? edit::ownedEffect(const_cast<Sequence&>(*sq), clip, effect) : nullptr;
+        return cl && ef && trackClipCorners(*project, *sq, *cl, *ef, from, forward, keys, progress, cancel, err);
+    });
+    if (!ok) return;
+    state_->edit(tr("Track Corners"), [clip, effect, keys](Project&, Sequence& sq) {
+        Effect* ef = edit::ownedEffect(sq, clip, effect);
+        if (!ef) return false;
+        applyCornerTrack(*ef, keys);
         return true;
     });
     state_->message(tr("Tracked %n frame(s)", "", int(keys.size())), 4000);

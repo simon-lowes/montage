@@ -54,6 +54,34 @@ std::vector<MaskOverlay::Shape> MaskOverlay::shapes() const {
     return out;
 }
 
+std::vector<MaskOverlay::Pin> MaskOverlay::pins() const {
+    std::vector<Pin> out;
+    const Sequence* s = state_->sequence();
+    const FrameTime t = state_->playhead();
+    if (!s) return out;
+    for (Id id : state_->selectedClips()) {
+        auto loc = edit::locate(*s, id);
+        if (!loc || loc->track.kind != TrackKind::Video) continue;
+        const Clip& c = trackAt(*s, loc->track)->clips[loc->index];
+        if (!c.contains(t)) continue;
+        for (const Effect& e : c.effects) {
+            if (!e.enabled || e.type != "corner_pin") continue;
+            const TrackQuad q = cornerPinQuad(e, t - c.start);
+            Pin pin{c.id, e.id};
+            for (int k = 0; k < 4; ++k) {
+                pin.u[k] = q.p[k].x;
+                pin.v[k] = q.p[k].y;
+            }
+            out.push_back(pin);
+        }
+    }
+    return out;
+}
+
+bool MaskOverlay::cornerHandle(const Pin& pin, int k, QPointF& out) const {
+    return k >= 0 && k < 4 && toWidget(pin.clip, pin.u[k], pin.v[k], out);
+}
+
 void MaskOverlay::localToFrame(const Shape& s, double lx, double ly, double& u, double& v) const {
     const Sequence* seq = state_->sequence();
     const Clip* c = seq ? edit::clipById(*seq, s.clip) : nullptr;
@@ -146,7 +174,55 @@ void MaskOverlay::paint(QPainter& p, const QRectF&) const {
         }
     }
     p.restore();
+    paintPins(p);
     paintObjects(p);
+}
+
+void MaskOverlay::paintPins(QPainter& p) const {
+    const auto all = pins();
+    if (all.empty()) return;
+    p.save();
+    p.setRenderHint(QPainter::Antialiasing);
+    for (const Pin& pin : all) {
+        QPointF c[4];
+        bool ok = true;
+        for (int k = 0; k < 4; ++k) ok = ok && cornerHandle(pin, k, c[k]);
+        if (!ok) continue;
+        QPolygonF quad;
+        for (const QPointF& pt : c) quad << pt;
+        quad << c[0];
+        p.setBrush(Qt::NoBrush);
+        p.setPen(QPen(QColor(0, 0, 0, 160), 3));
+        p.drawPolyline(quad);
+        p.setPen(QPen(QColor(90, 200, 255), 1.5, Qt::DashLine));
+        p.drawPolyline(quad);
+        p.setBrush(QColor(90, 200, 255));
+        p.setPen(QPen(QColor(0, 0, 0, 160), 1));
+        for (const QPointF& pt : c) p.drawEllipse(pt, 5, 5);
+    }
+    p.restore();
+}
+
+void MaskOverlay::applyPin(const Pin& pin) {
+    const Sequence* seq = state_->sequence();
+    const Clip* c = seq ? edit::clipById(*seq, pin.clip) : nullptr;
+    if (!c) return;
+    const FrameTime lt = state_->playhead() - c->start;
+    state_->edit(tr("Adjust Corner Pin"), [pin, lt](Project&, Sequence& sq) {
+        Clip* cl = edit::clipById(sq, pin.clip);
+        if (!cl) return false;
+        static const char* const names[4][2] = {{"tl_x", "tl_y"}, {"tr_x", "tr_y"}, {"br_x", "br_y"}, {"bl_x", "bl_y"}};
+        for (Effect& e : cl->effects)
+            if (e.id == pin.effect) {
+                // Keyframed corners get a key at the playhead; others change outright.
+                for (int k = 0; k < 4; ++k) {
+                    e.params[names[k][0]].set(lt, pin.u[k]);
+                    e.params[names[k][1]].set(lt, pin.v[k]);
+                }
+                return true;
+            }
+        return false;
+    }, QStringLiteral("pin-%1-%2").arg(pin.effect).arg(dragSerial_));
 }
 
 // ---- Object masks ------------------------------------------------------------------
@@ -376,6 +452,17 @@ bool MaskOverlay::eventFilter(QObject* obj, QEvent* e) {
         auto* me = static_cast<QMouseEvent*>(e);
         if (me->button() != Qt::LeftButton) return false;
         const QPointF pos = me->position();
+        for (const Pin& pin : pins())
+            for (int k = 0; k < 4; ++k) {
+                QPointF h;
+                if (cornerHandle(pin, k, h) && QLineF(pos, h).length() <= kHandleRadius) {
+                    grab_ = Grab::Corner;
+                    draggedPin_ = pin;
+                    grabCorner_ = k;
+                    ++dragSerial_;
+                    return true;
+                }
+            }
         for (const Shape& s : shapes()) {
             QPointF ctr, wh, hh;
             if (!handles(s, ctr, wh, hh)) continue;
@@ -432,9 +519,22 @@ bool MaskOverlay::eventFilter(QObject* obj, QEvent* e) {
                     (QLineF(me->position(), wh).length() <= kHandleRadius || QLineF(me->position(), hh).length() <= kHandleRadius))
                     over = true;
             }
+            for (const Pin& pin : pins())
+                for (int k = 0; k < 4; ++k) {
+                    QPointF h;
+                    if (cornerHandle(pin, k, h) && QLineF(me->position(), h).length() <= kHandleRadius) over = true;
+                }
             if (over) viewer_->setCursor(Qt::SizeAllCursor);
             else viewer_->unsetCursor();
             return false;
+        }
+        if (grab_ == Grab::Corner) {
+            double u, v;
+            if (!fromWidget(draggedPin_.clip, me->position(), u, v)) return true;
+            draggedPin_.u[grabCorner_] = std::clamp(u, -1.0, 2.0);
+            draggedPin_.v[grabCorner_] = std::clamp(v, -1.0, 2.0);
+            applyPin(draggedPin_);
+            return true;
         }
         double u, v;
         if (!fromWidget(dragged_, me->position(), u, v)) return true;

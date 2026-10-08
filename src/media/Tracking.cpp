@@ -454,6 +454,255 @@ std::vector<TrackRegion> trackRegion(const std::string& path, double from, doubl
     return out;
 }
 
+// ---- Planar tracking -------------------------------------------------------------
+
+Point2 Homography::apply(Point2 p) const {
+    const double w = h[6] * p.x + h[7] * p.y + h[8];
+    if (std::fabs(w) < 1e-12) return {1e12, 1e12};
+    return {(h[0] * p.x + h[1] * p.y + h[2]) / w, (h[3] * p.x + h[4] * p.y + h[5]) / w};
+}
+
+namespace {
+
+// Moves the points' centroid to the origin and their mean distance from it to
+// sqrt(2), which keeps the least-squares system well conditioned (Hartley).
+void normaliser(const std::vector<Point2>& pts, const std::vector<int>& idx, double& cx, double& cy, double& k) {
+    meanPoint(pts, idx, cx, cy);
+    double d = 0;
+    for (int i : idx) d += std::hypot(pts[size_t(i)].x - cx, pts[size_t(i)].y - cy);
+    d /= double(idx.size());
+    k = d > 1e-12 ? std::sqrt(2.0) / d : 1.0;
+}
+
+// The homography through the chosen pairs (exact for 4, least squares for more).
+bool solveHomography(const std::vector<Point2>& a, const std::vector<Point2>& b, const std::vector<int>& idx, Homography& out) {
+    if (idx.size() < 4) return false;
+    double ax, ay, ak, bx, by, bk;
+    normaliser(a, idx, ax, ay, ak);
+    normaliser(b, idx, bx, by, bk);
+    // Normal equations of the DLT with h8 = 1: two rows per pair.
+    double M[8][9] = {};
+    for (int i : idx) {
+        const double x = (a[size_t(i)].x - ax) * ak, y = (a[size_t(i)].y - ay) * ak;
+        const double u = (b[size_t(i)].x - bx) * bk, v = (b[size_t(i)].y - by) * bk;
+        const double r1[9] = {x, y, 1, 0, 0, 0, -x * u, -y * u, u};
+        const double r2[9] = {0, 0, 0, x, y, 1, -x * v, -y * v, v};
+        for (const double* r : {r1, r2})
+            for (int j = 0; j < 8; ++j)
+                for (int k = 0; k < 9; ++k) M[j][k] += r[j] * r[k];
+    }
+    // Gaussian elimination with partial pivoting.
+    for (int c = 0; c < 8; ++c) {
+        int piv = c;
+        for (int r = c + 1; r < 8; ++r)
+            if (std::fabs(M[r][c]) > std::fabs(M[piv][c])) piv = r;
+        if (std::fabs(M[piv][c]) < 1e-12) return false;  // degenerate (three points in a line)
+        if (piv != c)
+            for (int k = 0; k < 9; ++k) std::swap(M[c][k], M[piv][k]);
+        for (int r = 0; r < 8; ++r) {
+            if (r == c) continue;
+            const double f = M[r][c] / M[c][c];
+            for (int k = c; k < 9; ++k) M[r][k] -= f * M[c][k];
+        }
+    }
+    double hn[9];
+    for (int j = 0; j < 8; ++j) hn[j] = M[j][8] / M[j][j];
+    hn[8] = 1;
+    // Undo the normalisations: H = Tb^-1 * Hn * Ta.
+    const double Ta[9] = {ak, 0, -ak * ax, 0, ak, -ak * ay, 0, 0, 1};
+    const double Tbi[9] = {1 / bk, 0, bx, 0, 1 / bk, by, 0, 0, 1};
+    double t[9], h[9];
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c) {
+            t[r * 3 + c] = 0;
+            for (int k = 0; k < 3; ++k) t[r * 3 + c] += hn[r * 3 + k] * Ta[k * 3 + c];
+        }
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c) {
+            h[r * 3 + c] = 0;
+            for (int k = 0; k < 3; ++k) h[r * 3 + c] += Tbi[r * 3 + k] * t[k * 3 + c];
+        }
+    if (std::fabs(h[8]) < 1e-12) return false;
+    for (int k = 0; k < 9; ++k) {
+        out.h[k] = h[k] / h[8];
+        if (!std::isfinite(out.h[k])) return false;
+    }
+    return true;
+}
+
+double quadArea(const Point2 q[4]) {
+    double a = 0;
+    for (int i = 0; i < 4; ++i) a += q[i].x * q[(i + 1) % 4].y - q[(i + 1) % 4].x * q[i].y;
+    return a / 2;
+}
+
+bool insideQuad(const Point2 q[4], Point2 p) {
+    bool in = false;  // even-odd crossings, so a bow-tie still works
+    for (int i = 0, j = 3; i < 4; j = i++)
+        if ((q[i].y > p.y) != (q[j].y > p.y) && p.x < (q[j].x - q[i].x) * (p.y - q[i].y) / (q[j].y - q[i].y) + q[i].x)
+            in = !in;
+    return in;
+}
+
+}  // namespace
+
+bool fitHomography(const std::vector<Point2>& from, const std::vector<Point2>& to, Homography& out, int* inliersOut) {
+    const int n = int(std::min(from.size(), to.size()));
+    if (n < 4) return false;
+    std::mt19937 rng(12345);
+    std::uniform_int_distribution<int> pick(0, n - 1);
+    const double thr = 1.5;
+    auto inliers = [&](const Homography& H) {
+        std::vector<int> in;
+        for (int i = 0; i < n; ++i) {
+            const Point2 p = H.apply(from[size_t(i)]);
+            if (std::hypot(p.x - to[size_t(i)].x, p.y - to[size_t(i)].y) < thr) in.push_back(i);
+        }
+        return in;
+    };
+    std::vector<int> best;
+    for (int it = 0; it < 400; ++it) {
+        std::vector<int> sample;
+        for (int guard = 0; sample.size() < 4 && guard < 32; ++guard) {
+            const int j = pick(rng);
+            if (std::find(sample.begin(), sample.end(), j) == sample.end()) sample.push_back(j);
+        }
+        Homography H;
+        if (sample.size() < 4 || !solveHomography(from, to, sample, H)) continue;
+        auto in = inliers(H);
+        if (in.size() > best.size()) best = std::move(in);
+        if (int(best.size()) == n) break;
+    }
+    if (int(best.size()) < std::max(4, std::min(n, 6))) return false;
+    // Refine on the inliers, then once more on the inliers of the refined fit.
+    Homography H;
+    if (!solveHomography(from, to, best, H)) return false;
+    auto again = inliers(H);
+    if (again.size() >= best.size() && solveHomography(from, to, again, H)) best = std::move(again);
+    out = H;
+    if (inliersOut) *inliersOut = int(best.size());
+    return true;
+}
+
+std::vector<TrackQuad> trackQuad(const std::string& path, double from, double to, const TrackQuad& start,
+                                 const TrackProgress& progress, const std::atomic<bool>* cancel, std::string* error) {
+    FrameSource src;
+    if (!src.open(path, error)) return {};
+    std::vector<TrackQuad> out{start};
+    const double dir = to >= from ? 1 : -1;
+    const int frames = int(std::floor(std::fabs(to - from) * src.fps + 1e-6));
+    GrayImage cur, next;
+    if (!src.frame(from, cur)) {
+        if (error) *error = "Cannot read the clip's frames";
+        return {};
+    }
+    const double W = src.w, H = src.h;
+    Point2 q0[4], q[4];
+    for (int k = 0; k < 4; ++k) q0[k] = q[k] = {start.p[k].x * W, start.p[k].y * H};
+    const double area0 = std::fabs(quadArea(q0));
+    if (area0 < 16) {
+        if (error) *error = "The corners are too close together to track";
+        return {};
+    }
+    // Every frame is fitted against the first (features' first-frame positions
+    // to where they are now), so errors do not pile up from frame to frame and
+    // points off the surface stand out more the further it moves.
+    std::vector<Point2> ref, at;  // first-frame and current positions of the features followed
+    Homography Hc;                // first frame -> current frame
+    const double side = std::sqrt(area0);
+    const double spacing = std::max(3.0, side / 16);
+    auto seed = [&] {
+        Point2 c{0, 0}, grown[4];
+        for (const Point2& p : q) {
+            c.x += p.x / 4;
+            c.y += p.y / 4;
+        }
+        double x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+        for (int k = 0; k < 4; ++k) {
+            // The quad grown by a fifth about its centre: the surface and its edges (a blank screen's bezel).
+            grown[k] = {c.x + (q[k].x - c.x) * 1.2, c.y + (q[k].y - c.y) * 1.2};
+            x0 = std::min(x0, grown[k].x);
+            y0 = std::min(y0, grown[k].y);
+            x1 = std::max(x1, grown[k].x);
+            y1 = std::max(y1, grown[k].y);
+        }
+        // Back to the first frame through the inverse (the adjugate) of Hc.
+        const double* m = Hc.h;
+        Homography inv;
+        const double a[9] = {m[4] * m[8] - m[5] * m[7], m[2] * m[7] - m[1] * m[8], m[1] * m[5] - m[2] * m[4],
+                             m[5] * m[6] - m[3] * m[8], m[0] * m[8] - m[2] * m[6], m[2] * m[3] - m[0] * m[5],
+                             m[3] * m[7] - m[4] * m[6], m[1] * m[6] - m[0] * m[7], m[0] * m[4] - m[1] * m[3]};
+        std::copy(a, a + 9, inv.h);
+        // The surface's own features; the margin only when the surface is too plain to hold (a blank screen).
+        const auto found = goodFeatures(cur, 300, spacing, std::max(0.0, x0), std::max(0.0, y0), std::min(W, x1), std::min(H, y1));
+        for (int pass = 0; pass < 2; ++pass) {
+            if (pass == 1 && at.size() >= 20) break;
+            for (const Point2& p : found) {
+                if (pass == 0 ? !insideQuad(q, p) : (insideQuad(q, p) || !insideQuad(grown, p))) continue;
+                bool taken = false;
+                for (const Point2& o : at)
+                    if (std::hypot(o.x - p.x, o.y - p.y) < spacing) {
+                        taken = true;
+                        break;
+                    }
+                if (taken) continue;
+                at.push_back(p);
+                ref.push_back(inv.apply(p));
+            }
+        }
+    };
+    seed();
+    size_t wanted = at.size();
+    for (int i = 1; i <= frames; ++i) {
+        if (cancel && cancel->load()) break;
+        if (!src.frame(from + dir * i / src.fps, next)) break;
+        if (at.size() < std::max<size_t>(12, wanted * 2 / 3)) {
+            seed();  // top up as features are lost or leave
+            wanted = std::max(wanted, at.size());
+        }
+        if (at.size() < 6) {
+            if (error && out.size() == 1) *error = "Nothing to track: put the corners on a surface with some detail";
+            break;
+        }
+        std::vector<Point2> moved;
+        std::vector<bool> ok;
+        trackPoints(cur, next, at, moved, ok);
+        std::vector<Point2> r, b;
+        for (size_t k = 0; k < at.size(); ++k)
+            if (ok[k]) {
+                r.push_back(ref[k]);
+                b.push_back(moved[k]);
+            }
+        Homography Hm;
+        if (b.size() < 6 || !fitHomography(r, b, Hm)) break;  // lost
+        Point2 nq[4];
+        for (int k = 0; k < 4; ++k) nq[k] = Hm.apply(q0[k]);
+        // A surface does not flip over or change size by half in one frame: that is a bad fit.
+        const double area = quadArea(nq), was = quadArea(q);
+        if (area * was <= 0 || std::fabs(area) > 2 * std::fabs(was) || std::fabs(area) < 0.5 * std::fabs(was)) break;
+        // Points well off the fit are not on the surface (or have slipped): stop following them.
+        ref.clear();
+        at.clear();
+        for (size_t k = 0; k < b.size(); ++k) {
+            const Point2 e = Hm.apply(r[k]);
+            if (std::hypot(e.x - b[k].x, e.y - b[k].y) < 3.0) {
+                ref.push_back(r[k]);
+                at.push_back(b[k]);
+            }
+        }
+        Hc = Hm;
+        TrackQuad t;
+        for (int k = 0; k < 4; ++k) {
+            q[k] = nq[k];
+            t.p[k] = {q[k].x / W, q[k].y / H};
+        }
+        out.push_back(t);
+        std::swap(cur, next);
+        if (progress && frames > 0) progress(double(i) / frames);
+    }
+    return out;
+}
+
 std::string cameraMotionToString(const CameraMotion& m) {
     std::ostringstream o;
     o.precision(9);

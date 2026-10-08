@@ -1,7 +1,9 @@
 // Montage — on-screen mask editing in the Program monitor: the ellipse and
 // rectangle masks of the selected clip's effects are drawn over the picture,
 // and can be moved by dragging inside them and resized with their handles.
-// Object masks are picked here too: click the object (Alt-click: not the
+// Corner Pin effects show their four corners, to drag onto the surface a
+// picture is pinned to (then track it from the Inspector). Object masks are
+// picked here too: click the object (Alt-click: not the
 // object, drag: a box around it, Ctrl/Cmd-click a point: remove it), and the
 // model segments that frame in the background.
 #pragma once
@@ -41,6 +43,17 @@ public:
     // Widget positions of a mask's centre and of its width and height handles.
     bool handles(const Shape& s, QPointF& center, QPointF& widthHandle, QPointF& heightHandle) const;
 
+    // The selected clip's Corner Pin effects at the playhead, with their corners
+    // as fractions of the clip's frame: top left, top right, bottom right, bottom left.
+    struct Pin {
+        Id clip = 0;
+        Id effect = 0;
+        double u[4] = {0, 1, 1, 0}, v[4] = {0, 0, 1, 1};
+    };
+    std::vector<Pin> pins() const;
+    // Widget position of corner `k` of a pin.
+    bool cornerHandle(const Pin& pin, int k, QPointF& out) const;
+
     // The selected clip's effects with an Object mask, at the playhead.
     struct ObjectTarget {
         Id clip = 0;
@@ -60,7 +73,7 @@ protected:
     bool eventFilter(QObject* obj, QEvent* e) override;
 
 private:
-    enum class Grab { None, Move, Width, Height };
+    enum class Grab { None, Move, Width, Height, Corner };
     void paint(QPainter& p, const QRectF& r) const;
     // Widget point <-> clip frame fractions (u, v) for the clip of `s`.
     bool toWidget(const Shape& s, double u, double v, QPointF& out) const;
@@ -68,6 +81,8 @@ private:
     // A point of the mask outline (local coordinates in the clip's pixels) as clip fractions.
     void localToFrame(const Shape& s, double lx, double ly, double& u, double& v) const;
     void apply(const Shape& s);
+    void applyPin(const Pin& pin);
+    void paintPins(QPainter& p) const;
     bool toWidget(Id clip, double u, double v, QPointF& out) const;
     bool fromWidget(Id clip, const QPointF& pt, double& u, double& v) const;
     void paintObjects(QPainter& p) const;
@@ -78,6 +93,8 @@ private:
     ViewerWidget* viewer_;
     Grab grab_ = Grab::None;
     Shape dragged_;
+    Pin draggedPin_;
+    int grabCorner_ = 0;
     double grabDu_ = 0, grabDv_ = 0;  // pointer offset from the centre when moving
     int dragSerial_ = 0;              // one undo step per drag
     // Object picking: the press, and where the pointer is while dragging a box.

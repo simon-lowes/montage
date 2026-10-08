@@ -1463,6 +1463,76 @@ private slots:
         return jitter;
     }
 
+    // A textured card turning in perspective (a Corner Pin keyed from one quad
+    // to another) over a still, duller background; 320 x 180 at 25 fps.
+    // Returns the card's corners in each frame, as fractions of the frame.
+    std::vector<TrackQuad> writeCardVideo(const std::string& file, int frames) {
+        auto texture = [&](const char* name, QColor base, int seed, int count, int lo, int hi, int cmin, int cmax) {
+            QImage img(480, 270, QImage::Format_RGB32);
+            img.fill(base);
+            QPainter pa(&img);
+            std::mt19937 rng(seed);
+            std::uniform_int_distribution<int> x(0, 470), y(0, 260), sz(lo, hi), c(cmin, cmax);
+            for (int i = 0; i < count; ++i) pa.fillRect(x(rng), y(rng), sz(rng), sz(rng), QColor(c(rng), c(rng), c(rng)));
+            pa.end();
+            const QString png = QString::fromStdString(path(name));
+            img.save(png);
+            return png.toStdString();
+        };
+        const std::string card = texture("card.png", QColor(120, 120, 120), 11, 140, 12, 60, 0, 255);
+        const std::string backdrop = texture("backdrop.png", QColor(40, 40, 40), 5, 120, 8, 40, 20, 90);
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320;
+        s.height = 180;
+        s.fps = {25, 1};
+        MediaItem bm = probeOrFail(p, backdrop), cm = probeOrFail(p, card);
+        p.media.push_back(bm);
+        p.media.push_back(cm);
+        Clip bc = makeClip(p, bm, TrackKind::Video, s);
+        bc.duration = frames;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, bc);
+        Clip cc = makeClip(p, cm, TrackKind::Video, s);
+        cc.duration = frames;
+        const TrackQuad a{{{0.25, 0.2}, {0.7, 0.25}, {0.72, 0.8}, {0.22, 0.75}}};
+        const TrackQuad b{{{0.3, 0.26}, {0.78, 0.2}, {0.75, 0.86}, {0.28, 0.78}}};
+        Effect pin = makeEffect(p, "corner_pin");
+        const char* names[4][2] = {{"tl_x", "tl_y"}, {"tr_x", "tr_y"}, {"br_x", "br_y"}, {"bl_x", "bl_y"}};
+        for (int k = 0; k < 4; ++k) {
+            pin.params[names[k][0]] = Param();
+            pin.params[names[k][1]] = Param();
+            pin.params[names[k][0]].addKey(0, a.p[k].x, Interp::Linear);
+            pin.params[names[k][0]].addKey(frames - 1, b.p[k].x, Interp::Linear);
+            pin.params[names[k][1]].addKey(0, a.p[k].y, Interp::Linear);
+            pin.params[names[k][1]].addKey(frames - 1, b.p[k].y, Interp::Linear);
+        }
+        cc.effects.push_back(pin);
+        edit::overwrite(p, s, {TrackKind::Video, 1}, cc);
+        ExportSettings st;
+        st.path = file;
+        st.audioCodec = "none";
+        st.crf = 12;
+        st.preset = "ultrafast";
+        std::string err;
+        if (!exportSequence(p, s, st, nullptr, nullptr, &err)) qWarning("export failed: %s", err.c_str());
+        std::vector<TrackQuad> out;
+        for (int i = 0; i < frames; ++i) {
+            const double f = double(i) / (frames - 1);
+            TrackQuad q;
+            for (int k = 0; k < 4; ++k) q.p[k] = {a.p[k].x + (b.p[k].x - a.p[k].x) * f, a.p[k].y + (b.p[k].y - a.p[k].y) * f};
+            out.push_back(q);
+        }
+        return out;
+    }
+
+    // The largest corner error between two quads, in pixels of a 320 x 180 frame.
+    static double quadError(const TrackQuad& a, const TrackQuad& b) {
+        double worst = 0;
+        for (int k = 0; k < 4; ++k)
+            worst = std::max({worst, std::fabs(a.p[k].x - b.p[k].x) * 320, std::fabs(a.p[k].y - b.p[k].y) * 180});
+        return worst;
+    }
+
     // A shaded red ball (70 x 50 px radii) crossing textured ground, 640 x 360 at
     // 25 fps; returns its centre in each frame.
     std::vector<Point2> writeBallVideo(const std::string& file, int frames) {
@@ -1802,6 +1872,93 @@ private slots:
         QCOMPARE(keys.back().first, FrameTime(0));
         const double shift = (keys.back().second.x - keys.front().second.x) * 320, truth = jitter[10].x - jitter[34].x;
         QVERIFY2(std::fabs(shift - truth) < 1.0, qPrintable(QString("%1 vs %2").arg(shift).arg(truth)));
+    }
+
+    void planarTracking() {
+        // A homography from point pairs, a fifth of them wrong.
+        Homography truth;
+        const double th[9] = {1.1, 0.08, 12, -0.05, 0.95, 7, 0.0004, -0.0002, 1};
+        std::copy(th, th + 9, truth.h);
+        std::mt19937 rng(1);
+        std::uniform_real_distribution<double> u(0, 300);
+        std::vector<Point2> from, to;
+        for (int i = 0; i < 50; ++i) {
+            from.push_back({u(rng), u(rng)});
+            to.push_back(i % 5 == 0 ? Point2{u(rng), u(rng)} : truth.apply(from.back()));
+        }
+        Homography h;
+        int inliers = 0;
+        QVERIFY(fitHomography(from, to, h, &inliers));
+        QCOMPARE(inliers, 40);
+        for (int i = 0; i < 50; ++i)
+            if (i % 5) {
+                const Point2 q = h.apply(from[size_t(i)]);
+                QVERIFY(std::hypot(q.x - to[size_t(i)].x, q.y - to[size_t(i)].y) < 1e-6);
+            }
+        QVERIFY(!fitHomography({from[1], from[2], from[3]}, {to[1], to[2], to[3]}, h));
+
+        // A card turning in perspective, followed through the clip and back.
+        const std::string video = path("card.mp4");
+        const int frames = 30;
+        const auto corners = writeCardVideo(video, frames);
+        std::string err;
+        auto track = trackQuad(video, 0, (frames - 1) / 25.0, corners[0], {}, nullptr, &err);
+        QCOMPARE(int(track.size()), frames);
+        double worst = 0;
+        for (int i = 0; i < frames; ++i) worst = std::max(worst, quadError(track[size_t(i)], corners[size_t(i)]));
+        QVERIFY2(worst < 1.0, qPrintable(QString::number(worst)));
+        auto back = trackQuad(video, (frames - 1) / 25.0, 0, corners.back(), {}, nullptr, &err);
+        QCOMPARE(int(back.size()), frames);
+        worst = 0;
+        for (int k = 0; k < frames; ++k) worst = std::max(worst, quadError(back[size_t(k)], corners[size_t(frames - 1 - k)]));
+        QVERIFY2(worst < 1.0, qPrintable(QString::number(worst)));
+        // Corners on nothing (the black corner of a blank frame) cannot be tracked.
+        const TrackQuad blank{{{0.0, 0.0}, {0.02, 0.0}, {0.02, 0.02}, {0.0, 0.02}}};
+        QVERIFY(trackQuad(video, 0, 1, blank, {}, nullptr, &err).size() < 2);
+
+        // In a sequence: a picture pinned over the card's footage follows it.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320;
+        s.height = 180;
+        s.fps = {25, 1};
+        MediaItem mv = probeOrFail(p, video), mi = probeOrFail(p, path("backdrop.png"));
+        p.media.push_back(mv);
+        p.media.push_back(mi);
+        QVERIFY(edit::placeMedia(p, s, mv.id, 0, 0, frames, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Clip pic = makeClip(p, mi, TrackKind::Video, s);
+        pic.duration = frames;
+        Effect pin = makeEffect(p, "corner_pin");
+        const char* names[4][2] = {{"tl_x", "tl_y"}, {"tr_x", "tr_y"}, {"br_x", "br_y"}, {"bl_x", "bl_y"}};
+        for (int k = 0; k < 4; ++k) {
+            pin.params[names[k][0]] = Param(corners[5].p[k].x);
+            pin.params[names[k][1]] = Param(corners[5].p[k].y);
+        }
+        pic.effects.push_back(pin);
+        edit::overwrite(p, s, {TrackKind::Video, 1}, pic);
+        const Clip& under = trackAt(s, {TrackKind::Video, 0})->clips.at(0);
+        const Clip& over = trackAt(s, {TrackKind::Video, 1})->clips.at(0);
+        QVERIFY(cornerTrackSource(p, s, over, 5) == &under);
+        QVERIFY(cornerTrackSource(p, s, under, 5) == &under);  // nothing beneath: its own footage
+        QVERIFY(quadError(cornerPinQuad(pin, 5), corners[5]) < 1e-9);
+        std::vector<std::pair<FrameTime, TrackQuad>> keys;
+        QVERIFY2(trackClipCorners(p, s, over, pin, 5, true, keys, {}, nullptr, &err), err.c_str());
+        QCOMPARE(int(keys.size()), frames - 5);
+        QCOMPARE(keys.front().first, FrameTime(5));
+        QCOMPARE(keys.back().first, FrameTime(frames - 1));
+        applyCornerTrack(pin, keys);
+        QCOMPARE(pin.params["br_x"].keys.size(), size_t(frames - 5));
+        worst = 0;
+        for (int f = 5; f < frames; ++f) worst = std::max(worst, quadError(cornerPinQuad(pin, f), corners[size_t(f)]));
+        QVERIFY2(worst < 1.0, qPrintable(QString::number(worst)));
+        // Backwards to the start adds the earlier keys and keeps the later ones.
+        QVERIFY2(trackClipCorners(p, s, over, pin, 5, false, keys, {}, nullptr, &err), err.c_str());
+        QCOMPARE(keys.back().first, FrameTime(0));
+        applyCornerTrack(pin, keys);
+        QCOMPARE(pin.params["br_x"].keys.size(), size_t(frames));
+        QVERIFY2(quadError(cornerPinQuad(pin, 0), corners[0]) < 1.0, qPrintable(QString::number(quadError(cornerPinQuad(pin, 0), corners[0]))));
+        // Not past the end.
+        QVERIFY(!trackClipCorners(p, s, over, pin, frames - 1, true, keys, {}, nullptr, &err));
     }
 
     void multicamSpeakerSwitchAndAudioAngles() {

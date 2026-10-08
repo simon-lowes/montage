@@ -124,7 +124,14 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
     - keyed to media time, so trims and speed changes keep working.
   - Mask tracking from the playhead, forwards or backwards, with three motion models; it writes keyframes, as one undo step.
   - Tested on synthetic shaky footage with known jitter: sub-pixel per-frame motion, a camera path within 0.6 px, region tracks within 1 px, and stabilised frame-to-frame change cut by more than 65 %.
-  - Still to do: planar (corner-pin) tracking, and attaching a track to a title or clip's position.
+  - Planar tracking for Corner Pin:
+    - homographies by RANSAC over 4-point solutions, refined by least squares in Hartley-normalised coordinates;
+    - each frame fitted against the first frame (features' first positions to where they are now), so error does not pile up and off-surface points stand out as the surface moves; points off the fit by 3 px are dropped and fresh ones seeded and mapped back through the inverse;
+    - features from inside the quad, or from a margin a fifth wider when the surface is plain (a blank screen's bezel);
+    - the footage tracked is the clip beneath the pinned one (else its own), with corners mapped through both clips' transforms;
+    - the Program monitor shows the corners to drag (keyed at the playhead when animated), and the Inspector has ◀ Track / Track ▶.
+  - Planar tests: a homography recovered exactly with a fifth of the pairs wrong; a card turning in perspective over a still background tracked within 1 px on every frame forwards and backwards; the sequence workflow (a picture over the footage keyed from the playhead to the end, then back to the start); and the app's handles and buttons.
+  - Still to do: attaching a track to a title or clip's position.
 - [x] 17. LV2 hosting (M):
   - Through lilv (optional; installed in CI and the macOS and Windows packages). Bundles are loaded from wherever the scan found them.
   - Ports: control inputs become parameters (range, default, stepped). Audio is mono or stereo, in blocks of the activated size. Atom and CV ports are connected to scratch buffers.

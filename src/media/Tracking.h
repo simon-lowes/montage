@@ -69,6 +69,30 @@ std::vector<TrackRegion> trackRegion(const std::string& path, double from, doubl
                                      MotionModel model, const TrackProgress& progress = {},
                                      const std::atomic<bool>* cancel = nullptr, std::string* error = nullptr);
 
+// ---- Planar tracking (corner pins) --------------------------------------------
+// p' = H p in homogeneous coordinates (row-major, h[8] = 1): how a flat
+// surface moves under any camera move, perspective included.
+struct Homography {
+    double h[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+    Point2 apply(Point2 p) const;
+};
+// Robust fit of from -> to (RANSAC over 4-point solutions, then least squares
+// on the inliers, in Hartley-normalised coordinates). Needs 4 pairs or more.
+bool fitHomography(const std::vector<Point2>& from, const std::vector<Point2>& to, Homography& out,
+                   int* inliers = nullptr);
+
+// Four corners in fractions of the frame: top left, top right, bottom right, bottom left.
+struct TrackQuad {
+    Point2 p[4] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
+};
+// Follows the flat surface `start` outlines (at media time `from`) frame by
+// frame to `to`, as trackRegion does: features in and just around the quad
+// (so a blank screen is held by its bezel), a homography per frame. One quad
+// per frame, the first being `start`; shorter if the surface is lost.
+std::vector<TrackQuad> trackQuad(const std::string& path, double from, double to, const TrackQuad& start,
+                                 const TrackProgress& progress = {}, const std::atomic<bool>* cancel = nullptr,
+                                 std::string* error = nullptr);
+
 // ---- Stabilisation -------------------------------------------------------------
 struct CameraMotion {
     double fps = 0;       // media frame rate the samples are at

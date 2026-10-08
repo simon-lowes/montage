@@ -1604,6 +1604,39 @@ private slots:
         QCOMPARE(blur->params.at("mask.x").keys.back().t, edit::clipById(*state()->sequence(), clip)->duration - 1);
         state()->undo();
         QVERIFY(!maskX() || !maskX()->animated());
+
+        // A Corner Pin's corners follow the surface they sit on (here the clip's own footage).
+        state()->edit("Pin", [clip](Project& p, Sequence& s) {
+            Effect e = makeEffect(p, "corner_pin");
+            e.params["tl_x"] = Param(0.3);
+            e.params["tl_y"] = Param(0.3);
+            e.params["tr_x"] = Param(0.7);
+            e.params["tr_y"] = Param(0.3);
+            e.params["br_x"] = Param(0.7);
+            e.params["br_y"] = Param(0.7);
+            e.params["bl_x"] = Param(0.3);
+            e.params["bl_y"] = Param(0.7);
+            edit::clipById(s, clip)->effects.push_back(e);
+            return true;
+        });
+        QApplication::processEvents();
+        QToolButton* pinFwd = nullptr;
+        for (auto* b : win_->findChildren<QToolButton*>("trackCornersForward"))
+            if (b->isVisibleTo(win_.get())) pinFwd = b;
+        QVERIFY(pinFwd);
+        pinFwd->click();
+        auto corner = [&](const char* name) -> const Param* {
+            const Effect* e = effectOf("corner_pin");
+            auto it = e ? e->params.find(name) : decltype(e->params.end()){};
+            return e && it != e->params.end() ? &it->second : nullptr;
+        };
+        QTRY_VERIFY_WITH_TIMEOUT(corner("br_y") && corner("br_y")->animated(), 30000);
+        QCOMPARE(corner("tl_x")->keys.front().t, FrameTime(5));
+        QCOMPARE(corner("tl_x")->keys.back().t, edit::clipById(*state()->sequence(), clip)->duration - 1);
+        // The camera only shakes: the corners stay within a few pixels of where they were put.
+        for (const Keyframe& k : corner("tl_x")->keys) QVERIFY(std::fabs(k.v - 0.3) < 0.06);
+        state()->undo();
+        QVERIFY(!corner("tl_x")->animated());
         state()->newProject();
         win_->activateWindow();
         QVERIFY(QTest::qWaitForWindowActive(win_.get()));
@@ -1981,6 +2014,29 @@ private slots:
         const Effect& undone = edit::clipById(*state()->sequence(), red)->effects.back();
         QVERIFY(std::fabs(undone.p("mask.w", 10, 0.4) - 0.4) < 1e-6);
         QVERIFY(std::fabs(undone.p("mask.x", 10) - 0.6) < 0.02);  // the move stays
+
+        // A Corner Pin shows its corners; dragging one moves it.
+        QVERIFY(state()->edit("Pin", [red](Project& p, Sequence& s) {
+            edit::clipById(s, red)->effects.push_back(makeEffect(p, "corner_pin"));
+            return true;
+        }));
+        const auto pins = overlay->pins();
+        QCOMPARE(pins.size(), size_t(1));
+        QPointF tl, br;
+        QVERIFY(overlay->cornerHandle(pins[0], 0, tl) && overlay->cornerHandle(pins[0], 2, br));
+        QVERIFY(std::fabs(tl.x() - r.left()) < 1.5 && std::fabs(br.y() - r.bottom()) < 1.5);
+        const QPoint c0 = tl.toPoint() + QPoint(1, 1), c1 = (tl + QPointF(r.width() * 0.1, r.height() * 0.2)).toPoint();
+        QTest::mousePress(viewer, Qt::LeftButton, Qt::NoModifier, c0);
+        QMouseEvent move3(QEvent::MouseMove, QPointF(c1), viewer->mapToGlobal(QPointF(c1)), Qt::NoButton, Qt::LeftButton,
+                          Qt::NoModifier);
+        QApplication::sendEvent(viewer, &move3);
+        QTest::mouseRelease(viewer, Qt::LeftButton, Qt::NoModifier, c1);
+        const Effect& pin = edit::clipById(*state()->sequence(), red)->effects.back();
+        QVERIFY2(std::fabs(pin.p("tl_x", 10) - 0.1) < 0.02 && std::fabs(pin.p("tl_y", 10) - 0.2) < 0.02,
+                 qPrintable(QString("%1 %2").arg(pin.p("tl_x", 10)).arg(pin.p("tl_y", 10))));
+        QVERIFY(std::fabs(pin.p("br_x", 10) - 1) < 1e-9);  // the others stay
+        state()->undo();
+        QVERIFY(std::fabs(edit::clipById(*state()->sequence(), red)->effects.back().p("tl_x", 10)) < 1e-9);
         state()->setSelection({}, false);
     }
 
