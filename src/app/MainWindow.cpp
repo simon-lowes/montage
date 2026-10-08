@@ -814,6 +814,14 @@ void MainWindow::buildMenus() {
     clipM->addSeparator();
     add(clipM, tr("&Insert from Source"), QKeySequence(Qt::Key_Comma), [this] { state_->insertFromSource(false); });
     add(clipM, tr("&Overwrite from Source"), QKeySequence(Qt::Key_Period), [this] { state_->insertFromSource(true); });
+    add(clipM, tr("Place on Top"), QKeySequence(Qt::Key_F12), [this] { state_->sourceEdit(EditorState::SourceEdit::PlaceOnTop); })
+        ->setObjectName(QStringLiteral("placeOnTop"));
+    add(clipM, tr("Append at End"), QKeySequence("Shift+F12"), [this] { state_->sourceEdit(EditorState::SourceEdit::Append); })
+        ->setObjectName(QStringLiteral("appendAtEnd"));
+    add(clipM, tr("Ripple Overwrite"), QKeySequence("Shift+F10"), [this] { state_->sourceEdit(EditorState::SourceEdit::RippleOverwrite); })
+        ->setObjectName(QStringLiteral("rippleOverwrite"));
+    add(clipM, tr("Smart Insert"), QKeySequence(), [this] { state_->sourceEdit(EditorState::SourceEdit::SmartInsert); })
+        ->setObjectName(QStringLiteral("smartInsert"));
     add(clipM, tr("&Match Frame"), QKeySequence(Qt::Key_F), [this] { matchFrame(); });
     {
         QAction* sub = add(clipM, tr("Make S&ubclip"), QKeySequence("Ctrl+U"), [this] { makeSubclip(); });

@@ -5744,6 +5744,26 @@ private slots:
             QVERIFY(std::fabs(last.sourceIn - 1) < 1e-6);
             QCOMPARE(last.duration, FrameTime(4));
         }
+        // Edit modes: place on top of the clip at 20 s, then replace that clip with a longer range, rippling.
+        r = tool("montage_place_media", QJsonObject{{"project", project}, {"media", ball}, {"at", 20}, {"in", 0}, {"out", 0.2}, {"mode", "place_on_top"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = tool("montage_place_media", QJsonObject{{"project", project}, {"media", ball}, {"at", 20.08}, {"in", 0}, {"out", 0.4}, {"mode", "ripple_overwrite"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        {
+            Project edited;
+            QVERIFY(loadProject(project.toStdString(), edited));
+            const Sequence& es = *edited.active();
+            const Clip& last = es.videoTracks.at(0).clips.back();
+            QCOMPARE(last.start, FrameTime(500));
+            QCOMPARE(last.duration, FrameTime(10));
+            QVERIFY(std::any_of(es.videoTracks.begin() + 1, es.videoTracks.end(), [](const Track& t) {
+                return std::any_of(t.clips.begin(), t.clips.end(), [](const Clip& c) { return c.start == 500 && c.duration == 5; });
+            }));
+        }
+        r = tool("montage_place_media", QJsonObject{{"project", project}, {"media", ball}, {"at", 900}, {"mode", "ripple_overwrite"}});
+        QVERIFY(r.value("isError").toBool() && text(r).contains("No clip"));
+        r = tool("montage_place_media", QJsonObject{{"project", project}, {"media", ball}, {"mode", "sideways"}});
+        QVERIFY(r.value("isError").toBool() && text(r).contains("mode"));
         r = tool("montage_project_info", QJsonObject{{"project", project}});
         QCOMPARE(r.value("structuredContent").toObject().value("media").toArray().at(0).toObject().value("rating").toInt(), 4);
         QVERIFY(loadProject(project.toStdString(), saved));

@@ -2613,6 +2613,48 @@ private slots:
         QCOMPARE(fx.s().videoTracks.size(), size_t(3));
     }
 
+    void sourceEditsOnTopAndRipple() {
+        // Two linked 60-frame clips (an edit at 60), then 20-frame source ranges edited in around them.
+        Fixture fx;
+        QVERIFY(placeMedia(fx.p, fx.s(), fx.media, 0, 0, 60, V1, A1, false).ok);
+        const Result second = placeMedia(fx.p, fx.s(), fx.media, 60, 0, 60, V1, A1, false);
+        QVERIFY(second.ok && second.created.size() == 2);
+        // Place on Top over 30-50: the track above V1, and the first audio track free there (A1 is taken).
+        Result top = placeOnTop(fx.p, fx.s(), fx.media, 30, 100, 120, V1, A1);
+        QVERIFY2(top.ok, top.error.c_str());
+        QCOMPARE(top.created.size(), size_t(2));
+        for (Id id : top.created) {
+            const auto loc = locate(fx.s(), id);
+            QVERIFY(loc && loc->track.index == 1);
+            QCOMPARE(clipById(fx.s(), id)->start, FrameTime(30));
+            QCOMPARE(clipById(fx.s(), id)->duration, FrameTime(20));
+        }
+        QCOMPARE(fx.v1().clips.size(), size_t(2));
+        QCOMPARE(fx.a1().clips.size(), size_t(2));
+        QCOMPARE(fx.s().duration(), FrameTime(120));
+        // Again over the same stretch: the next tracks up (made if missing).
+        top = placeOnTop(fx.p, fx.s(), fx.media, 35, 100, 120, V1, A1);
+        QVERIFY(top.ok);
+        for (Id id : top.created) QCOMPARE(locate(fx.s(), id)->track.index, 2);
+        // Ripple Overwrite of the second clip: its video and sound give way to the 20 frames and the end pulls in.
+        const Result ro = rippleOverwrite(fx.p, fx.s(), second.created[0], fx.media, 200, 220, V1, A1);
+        QVERIFY2(ro.ok, ro.error.c_str());
+        QCOMPARE(fx.v1().clips.size(), size_t(2));
+        QCOMPARE(fx.v1().clips[1].start, FrameTime(60));
+        QCOMPARE(fx.v1().clips[1].duration, FrameTime(20));
+        QCOMPARE(fx.v1().clips[1].sourceIn, 200.0);
+        QCOMPARE(fx.a1().clips[1].duration, FrameTime(20));
+        QVERIFY(fx.v1().clips[1].linkGroup && fx.v1().clips[1].linkGroup == fx.a1().clips[1].linkGroup);
+        QCOMPARE(fx.s().duration(), FrameTime(80));
+        QVERIFY(!rippleOverwrite(fx.p, fx.s(), 999999, fx.media, 0, 20, V1, A1).ok);
+        // Smart Insert's point: the nearest clip edge, or the frame itself on an empty track.
+        QCOMPARE(nearestEdit(fx.s(), V1, 55), FrameTime(60));
+        QCOMPARE(nearestEdit(fx.s(), V1, 25), FrameTime(0));
+        QCOMPARE(nearestEdit(fx.s(), V1, 75), FrameTime(80));
+        fx.s().videoTracks.push_back(Track{});
+        QCOMPARE(nearestEdit(fx.s(), {TrackKind::Video, int(fx.s().videoTracks.size()) - 1}, 42), FrameTime(42));
+    }
+
     void effectPresets() {
         // A clip's blur and a keyframed brightness saved as a preset, read back and put on another clip.
         Fixture fx;

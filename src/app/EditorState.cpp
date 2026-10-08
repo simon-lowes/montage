@@ -9,6 +9,7 @@
 #include <QStandardPaths>
 #include <QtConcurrent>
 #include <algorithm>
+#include <limits>
 #include <utility>
 
 #include "core/MediaLog.h"
@@ -466,7 +467,9 @@ void EditorState::setSourceOut(FrameTime t) {
     emit sourceChanged();
 }
 
-bool EditorState::insertFromSource(bool overwriteMode) {
+bool EditorState::insertFromSource(bool overwriteMode) { return sourceEdit(overwriteMode ? SourceEdit::Overwrite : SourceEdit::Insert); }
+
+bool EditorState::sourceEdit(SourceEdit mode) {
     const MediaItem* m = project_.findMedia(sourceMedia_);
     const Sequence* s = sequence();
     if (!m || !s) {
@@ -482,11 +485,35 @@ bool EditorState::insertFromSource(bool overwriteMode) {
     double out = sourceOut_ >= 0 ? double(sourceOut_ + 1) : -1.0;
     TrackRef vt{TrackKind::Video, std::min(targetVideo_, int(s->videoTracks.size()) - 1)};
     TrackRef at_{TrackKind::Audio, std::min(targetAudio_, int(s->audioTracks.size()) - 1)};
+    const bool insertMode = mode == SourceEdit::Insert || mode == SourceEdit::SmartInsert;
+    // Ripple Overwrite replaces the clip under the playhead on the target video track (else the audio one).
+    Id replaced = 0;
+    if (mode == SourceEdit::RippleOverwrite) {
+        const Clip* c = edit::clipAt(*s, vt, s->playhead);
+        if (!c) c = edit::clipAt(*s, at_, s->playhead);
+        if (!c) {
+            message(tr("Put the playhead over the clip to replace"));
+            return false;
+        }
+        replaced = c->id;
+    } else if (mode == SourceEdit::SmartInsert) {
+        at = edit::nearestEdit(*s, vt, s->playhead);
+    } else if (mode == SourceEdit::Append) {
+        at = s->duration();
+    }
     std::vector<Id> created;
     bool matched = false;
-    bool ok = apply(overwriteMode ? tr("Overwrite") : tr("Insert"), [&](Project& p, Sequence& sq) {
+    const QString label = mode == SourceEdit::Overwrite         ? tr("Overwrite")
+                          : mode == SourceEdit::Append          ? tr("Append at End")
+                          : mode == SourceEdit::PlaceOnTop      ? tr("Place on Top")
+                          : mode == SourceEdit::RippleOverwrite ? tr("Ripple Overwrite")
+                          : mode == SourceEdit::SmartInsert     ? tr("Smart Insert")
+                                                                : tr("Insert");
+    bool ok = apply(label, [&](Project& p, Sequence& sq) {
         matched = edit::matchSequenceToMedia(sq, *m);
-        auto r = edit::placeMedia(p, sq, m->id, at, in, out, vt, at_, !overwriteMode);
+        edit::Result r = mode == SourceEdit::PlaceOnTop        ? edit::placeOnTop(p, sq, m->id, at, in, out, vt, at_)
+                         : mode == SourceEdit::RippleOverwrite ? edit::rippleOverwrite(p, sq, replaced, m->id, in, out, vt, at_)
+                                                               : edit::placeMedia(p, sq, m->id, at, in, out, vt, at_, insertMode);
         created = r.created;
         return r;
     });

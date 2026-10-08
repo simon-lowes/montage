@@ -3679,6 +3679,68 @@ const auto seq = [this] { return state()->sequence(); };
         state()->newProject();
     }
 
+    void sourceEditModes() {
+        state()->newProject();
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/faces/jfk-color.jpg")});
+        QCOMPARE(ids.size(), size_t(1));
+        // Two 60-frame stills on V1 (an edit at 60), and a 20-frame source range.
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids[0], 0, 0, 60, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok &&
+                   edit::placeMedia(p, s, ids[0], 60, 0, 60, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        const auto seq = [this] { return state()->sequence(); };
+        const auto v1 = [&] { return seq()->videoTracks[0].clips.size(); };
+        state()->setSourceMedia(ids[0]);
+        state()->setSourceIn(0);
+        state()->setSourceOut(19);
+        for (const char* name : {"appendAtEnd", "placeOnTop", "rippleOverwrite", "smartInsert"}) QVERIFY2(win_->findChild<QAction*>(name), name);
+        // Append at End: after the last clip, whatever the playhead.
+        state()->setPlayhead(10);
+        QVERIFY(state()->sourceEdit(EditorState::SourceEdit::Append));
+        QCOMPARE(seq()->duration(), FrameTime(140));
+        QCOMPARE(seq()->videoTracks[0].clips.back().start, FrameTime(120));
+        QCOMPARE(state()->playhead(), FrameTime(140));
+        state()->undo();
+        // Place on Top: the first free track above V1, then the next one above that; nothing below moves.
+        state()->setPlayhead(30);
+        QVERIFY(state()->sourceEdit(EditorState::SourceEdit::PlaceOnTop));
+        QCOMPARE(state()->playhead(), FrameTime(50));
+        state()->setPlayhead(30);
+        QVERIFY(state()->sourceEdit(EditorState::SourceEdit::PlaceOnTop));
+        QVERIFY(seq()->videoTracks.size() >= 3);
+        for (int i : {1, 2}) {
+            QCOMPARE(seq()->videoTracks[size_t(i)].clips.size(), size_t(1));
+            QCOMPARE(seq()->videoTracks[size_t(i)].clips[0].start, FrameTime(30));
+            QCOMPARE(seq()->videoTracks[size_t(i)].clips[0].duration, FrameTime(20));
+        }
+        QCOMPARE(v1(), size_t(2));
+        QCOMPARE(seq()->duration(), FrameTime(120));
+        state()->undo();
+        state()->undo();
+        // Ripple Overwrite: the 60-frame clip under the playhead becomes the 20-frame range and the end pulls in.
+        state()->setPlayhead(70);
+        QVERIFY(state()->sourceEdit(EditorState::SourceEdit::RippleOverwrite));
+        QCOMPARE(v1(), size_t(2));
+        QCOMPARE(seq()->videoTracks[0].clips[1].start, FrameTime(60));
+        QCOMPARE(seq()->videoTracks[0].clips[1].duration, FrameTime(20));
+        QCOMPARE(seq()->duration(), FrameTime(80));
+        state()->undo();
+        QCOMPARE(seq()->duration(), FrameTime(120));
+        // With the playhead over nothing it is refused.
+        state()->setPlayhead(500);
+        QVERIFY(!state()->sourceEdit(EditorState::SourceEdit::RippleOverwrite));
+        // Smart Insert: at 55 the nearest edit is 60, so the range goes in there rather than splitting the first clip.
+        state()->setPlayhead(55);
+        QVERIFY(state()->sourceEdit(EditorState::SourceEdit::SmartInsert));
+        QCOMPARE(v1(), size_t(3));
+        QCOMPARE(seq()->videoTracks[0].clips[0].duration, FrameTime(60));
+        QCOMPARE(seq()->videoTracks[0].clips[1].start, FrameTime(60));
+        QCOMPARE(seq()->videoTracks[0].clips[2].start, FrameTime(80));
+        QCOMPARE(state()->playhead(), FrameTime(80));
+        state()->setSourceMedia(0);
+        state()->newProject();
+    }
+
     void effectPresetsSaveAndApply() {
         loadDemo();
         const Id red = clipNamed(*state()->sequence(), "Red")->id, blue = clipNamed(*state()->sequence(), "Blue")->id;

@@ -110,6 +110,12 @@ public:
     // Three-point edits from the source monitor into the timeline at the
     // playhead (or the sequence In point), on the targeted tracks.
     bool insertFromSource(bool overwriteMode);
+    // Source edits beyond insert and overwrite (Resolve's Cut and Edit pages, Final Cut's): the Source monitor's In to
+    // Out appended at the end of the sequence, placed on top (the first free tracks above the targets at the
+    // playhead), in place of the clip under the playhead with the difference rippled (Ripple Overwrite), or inserted
+    // at the edit nearest the playhead (Smart Insert). Each one undo step.
+    enum class SourceEdit { Insert, Overwrite, Append, PlaceOnTop, RippleOverwrite, SmartInsert };
+    bool sourceEdit(SourceEdit mode);
     // Saves a range of a media item (frames of the active sequence, Out
     // inclusive) as a subclip in the bin; returns its id, or 0.
     Id makeSubclip(Id media, FrameTime in, FrameTime out, const QString& name = QString());

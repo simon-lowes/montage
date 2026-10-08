@@ -323,6 +323,72 @@ Result placeMedia(Project& p, Sequence& s, Id mediaId, FrameTime at, double srcI
     return res;
 }
 
+// A dry run of placing the media range on new tracks of a copy: how long the edit is and which kinds it puts down.
+namespace {
+struct Placed {
+    Result result;
+    FrameTime length = 1;
+    bool video = false, audio = false;
+};
+Placed dryPlace(const Project& p, const Sequence& s, Id mediaId, FrameTime at, double srcIn, double srcOut) {
+    Project tp = p;
+    Sequence ts = s;
+    const TrackRef dv = addTrack(tp, ts, TrackKind::Video), da = addTrack(tp, ts, TrackKind::Audio);
+    Placed out;
+    out.result = placeMedia(tp, ts, mediaId, std::max<FrameTime>(0, at), srcIn, srcOut, dv, da, false);
+    for (Id id : out.result.created)
+        if (const Clip* c = clipById(ts, id)) out.length = std::max(out.length, c->duration);
+    out.video = !trackAt(ts, dv)->clips.empty();
+    out.audio = !trackAt(ts, da)->clips.empty();
+    return out;
+}
+}  // namespace
+
+Result placeOnTop(Project& p, Sequence& s, Id mediaId, FrameTime at, double srcIn, double srcOut, TrackRef videoTrack,
+                  TrackRef audioTrack) {
+    const Placed dry = dryPlace(p, s, mediaId, at, srcIn, srcOut);
+    if (!dry.result.ok) return dry.result;
+    at = std::max<FrameTime>(0, at);
+    auto freeTrack = [&](TrackKind kind, int from) {
+        const auto& list = listFor(s, kind);
+        for (int i = std::max(0, from); i < int(list.size()); ++i)
+            if (!list[size_t(i)].locked && trackEmpty(list[size_t(i)], at, at + dry.length)) return TrackRef{kind, i};
+        return addTrack(p, s, kind);
+    };
+    if (dry.video) videoTrack = freeTrack(TrackKind::Video, videoTrack.index + 1);
+    if (dry.audio) audioTrack = freeTrack(TrackKind::Audio, audioTrack.index);
+    return placeMedia(p, s, mediaId, at, srcIn, srcOut, videoTrack, audioTrack, false);
+}
+
+Result rippleOverwrite(Project& p, Sequence& s, Id clipId, Id mediaId, double srcIn, double srcOut, TrackRef videoTrack,
+                       TrackRef audioTrack) {
+    const Clip* c = clipById(s, clipId);
+    if (!c) return Result::fail("Unknown clip");
+    const FrameTime a = c->start, b = c->end();
+    const Placed dry = dryPlace(p, s, mediaId, a, srcIn, srcOut);
+    if (!dry.result.ok) return dry.result;
+    // The replaced clips' tracks close up or open by the difference after the old end; other sync-locked tracks
+    // follow where they can (a clip across the old end stays put).
+    const std::vector<Id> replaced = linkedClips(s, clipId);
+    std::vector<TrackRef> primary;
+    for (Id id : replaced)
+        if (auto loc = locate(s, id); loc && std::find(primary.begin(), primary.end(), loc->track) == primary.end())
+            primary.push_back(loc->track);
+    Result r = removeClips(p, s, replaced, false);
+    if (!r.ok) return r;
+    rippleShift(s, rippleTracks(s, primary), primary, b, dry.length - (b - a));
+    return placeMedia(p, s, mediaId, a, srcIn, srcOut, videoTrack, audioTrack, false);
+}
+
+FrameTime nearestEdit(const Sequence& s, TrackRef t, FrameTime frame) {
+    FrameTime best = frame, dist = std::numeric_limits<FrameTime>::max();
+    if (const Track* tr = trackAt(s, t))
+        for (const Clip& c : tr->clips)
+            for (FrameTime e : {c.start, c.end()})
+                if (std::llabs(e - frame) < dist) dist = std::llabs(e - frame), best = e;
+    return best;
+}
+
 Result razor(Project& p, Sequence& s, TrackRef r, FrameTime frame) {
     Track* t = trackAt(s, r);
     if (!editable(t)) return Result::fail("Track is locked");

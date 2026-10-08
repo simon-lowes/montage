@@ -16,6 +16,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - **Two-up trim view** (as in Premiere, Resolve, Avid and Final Cut): while an edit is trimmed, rolled, slipped or slid, the Program monitor shows the frames either side of it side by side, each labelled with its clip and timecode (a slip shows the clip's first and last frames). Playback › Two-Up Trim View turns it off.
 - Insert, overwrite, lift, extract, ripple delete, close gap, nudge, duplicate, copy / paste / paste-insert. **Gaps** (Premiere's, Resolve's): click the empty stretch between two clips to select it and press Delete to close it, rippling what follows.
 - Three-point editing from the Source monitor (I / O marks, `,` insert, `.` overwrite, drag from the viewer)
+- The Cut page's other source edits (Clip menu): **Append at End** (Shift+F12), **Place on Top** (F12: the first tracks above the target with room, new ones if none, nothing below moves), **Ripple Overwrite** (Shift+F10: the clip under the playhead becomes the source range and everything after moves by the difference) and **Smart Insert** (insert at the edit nearest the playhead, so a cut never lands mid-clip). The MCP `montage_place_media` tool takes the same as `mode`.
 - **Source monitor waveform** (as Premiere 26.2 shows): a clip with sound shows its audio waveform on the Source monitor's scrub bar, so a line or a beat can be marked by eye
 - **Record Voiceover** (Sequence menu, Ctrl+Alt+R): record from any audio input onto an audio track where the playhead is, with a level meter and a 3-second countdown, while the picture plays along. Punch In records from In to Out and stops by itself. Each take is saved as a WAV in a Voiceover folder beside the project, filed in the media bin and placed on the track as one undo step.
 - **Track folders** (Resolve 21's Fairlight folders): right-click a track header › Folder to put tracks in a new or existing folder. A folder's header collapses its tracks (their clips shown in outline on its row), and its M and S (or ◉ for video) buttons mute, solo or hide all of them; member tracks carry an amber stripe. Rename or remove a folder from its header's menu. An audio folder also gets a **VCA fader** in the Audio Mixer (as in Fairlight and Pro Tools): its level is added to each of its tracks' faders in the mix and in exports, so a group of dialogue tracks can be ridden together. Saved with the sequence.
@@ -324,6 +325,7 @@ The first clip placed in an empty sequence sets the sequence's frame size and ra
 | Step frame | ← / → | Previous / next edit | ↑ / ↓ |
 | Mark In / Out | I / O | Go to In / Out | Shift+I / Shift+O |
 | Insert / overwrite | , / . | Lift / extract | ; / ' |
+| Place on Top / Append at End | F12 / Shift+F12 | Ripple Overwrite | Shift+F10 |
 | Add edit | Ctrl+K | Add edit (all tracks) | Ctrl+Shift+K |
 | Delete / ripple delete | Del / Shift+Del | Default transition | Ctrl+D |
 | Audio crossfade | Ctrl+Shift+D | Speed / duration | Ctrl+R |

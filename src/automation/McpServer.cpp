@@ -521,7 +521,9 @@ void McpServer::Impl::addTools() {
 
     add("montage_place_media", "Place media",
         "Put a media file (or part of it) on the timeline at a time, with its sound linked on the audio track. "
-        "Overwrite replaces what is there; insert pushes later clips along.",
+        "Overwrite replaces what is there; insert pushes later clips along; place_on_top puts it on the first tracks "
+        "above with room; ripple_overwrite replaces the clip at that time and moves later clips by the difference; "
+        "smart_insert inserts at the edit nearest that time.",
         R"json({"type":"object","properties":{
             "project":{"type":"string"},"media":{"type":"string","description":"Media file, or the name of a subclip in the project"},
             "at":{"type":["number","string"],"description":"Timeline time; default: the end of the sequence"},
@@ -529,7 +531,9 @@ void McpServer::Impl::addTools() {
             "audio_track":{"type":"string","description":"Audio track, default A1"},
             "in":{"type":["number","string"],"description":"Source in, seconds (of the subclip, for one)"},
             "out":{"type":["number","string"],"description":"Source out, seconds (of the subclip, for one)"},
-            "insert":{"type":"boolean","default":false}},
+            "insert":{"type":"boolean","default":false},
+            "mode":{"type":"string","enum":["overwrite","insert","place_on_top","ripple_overwrite","smart_insert"],
+                    "description":"Default overwrite (insert, when insert is true)"}},
             "required":["project","media"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
@@ -541,7 +545,10 @@ void McpServer::Impl::addTools() {
             const std::string subName = sub ? sub->name : std::string();
             const Id media = sub ? sub->subclipOf : mediaFor(l.project, need(a, "media"));
             const double base = sub ? sub->subclipIn : 0;
-            const FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : s.duration();
+            const QString mode = str(a, "mode", a.value("insert").toBool() ? "insert" : "overwrite");
+            static const QStringList modes{"overwrite", "insert", "place_on_top", "ripple_overwrite", "smart_insert"};
+            if (!modes.contains(mode)) throw ArgError{QStringLiteral("Unknown mode \"%1\"").arg(mode)};
+            FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : s.duration();
             const TrackRef v = trackArg(str(a, "track", "V1"), s, true, &l.project, &s);
             const TrackRef au = trackArg(str(a, "audio_track", "A1"), s, true, &l.project, &s);
             auto seconds = [&](const char* k, double def) {
@@ -554,7 +561,19 @@ void McpServer::Impl::addTools() {
             const double in = (base + seconds("in", 0)) * s.fpsValue();
             const double outSec = seconds("out", -1);
             const double out = outSec >= 0 ? (base + outSec) * s.fpsValue() : sub ? sub->subclipOut * s.fpsValue() : -1.0;
-            const auto r = edit::placeMedia(l.project, s, media, at, in, out, v, au, a.value("insert").toBool());
+            edit::Result r;
+            if (mode == "place_on_top") {
+                r = edit::placeOnTop(l.project, s, media, at, in, out, v, au);
+            } else if (mode == "ripple_overwrite") {
+                const Clip* c = edit::clipAt(s, v, at);
+                if (!c) c = edit::clipAt(s, au, at);
+                if (!c) throw ArgError{QStringLiteral("No clip at %1 to replace").arg(tc(at, s))};
+                at = c->start;
+                r = edit::rippleOverwrite(l.project, s, c->id, media, in, out, v, au);
+            } else {
+                if (mode == "smart_insert") at = edit::nearestEdit(s, v, at);
+                r = edit::placeMedia(l.project, s, media, at, in, out, v, au, mode != "overwrite");
+            }
             check(r);
             if (sub)
                 for (Id id : r.created)

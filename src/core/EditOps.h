@@ -66,6 +66,16 @@ Result insert(Project& p, Sequence& s, TrackRef t, Clip clip);
 // srcIn / srcOut are in sequence frames; srcOut < 0 means "to the end".
 Result placeMedia(Project& p, Sequence& s, Id mediaId, FrameTime at, double srcIn, double srcOut,
                   TrackRef videoTrack, TrackRef audioTrack, bool insertMode);
+// Place on Top: the media on the first tracks above the video target (the audio target or after it) with nothing
+// over its length, new tracks when none have room. Nothing already in the sequence moves.
+Result placeOnTop(Project& p, Sequence& s, Id mediaId, FrameTime at, double srcIn, double srcOut, TrackRef videoTrack,
+                  TrackRef audioTrack);
+// Ripple Overwrite: the clip and the clips linked to it give way to the media range at its start, and everything
+// after moves by the difference in length.
+Result rippleOverwrite(Project& p, Sequence& s, Id clipId, Id mediaId, double srcIn, double srcOut, TrackRef videoTrack,
+                       TrackRef audioTrack);
+// Smart Insert's point: the clip start or end on the track nearest the frame (the frame itself on an empty track).
+FrameTime nearestEdit(const Sequence& s, TrackRef t, FrameTime frame);
 Result razor(Project& p, Sequence& s, TrackRef t, FrameTime frame);
 Result razorAll(Project& p, Sequence& s, FrameTime frame);
 Result removeClips(Project& p, Sequence& s, const std::vector<Id>& ids, bool ripple);
