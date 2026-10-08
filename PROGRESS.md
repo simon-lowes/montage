@@ -627,3 +627,27 @@ All 15 items are in (October 2026). The near misses listed in the roadmap are th
   - **Tests:**
     - a synthetic dome: normals pointing outwards and flat on the backdrop; light from the left brightening its left side and from the right its right; camera-facing surfaces unchanged; a short reach leaving the far edge unlit;
     - on the Armstrong portrait: the helmet's lit side following the light.
+- [x] Generate Voiceover: text to speech (core/G2p, media/TextToSpeech, app/SpeechDialog):
+  - **Model:** Kokoro-82M v1.0 (Hexgrad, Apache-2.0) as onnx-community's fp16 export, 163 MB. The fp32 export (326 MB) runs no faster on a CPU, and the int8 one is four times slower. Ten voices, six American and four British, as their style vectors (one per input length).
+  - **Phonemes:** Kokoro was trained on misaki's phonemes, so misaki's US and UK dictionaries (gold, then silver) are used. They are read from misaki's own release wheel (Apache-2.0, pinned and checked) with core/Zip.
+  - **The C++ port of misaki's lexicon covers:**
+    - dictionary growth;
+    - lookup with the "None" variant before a pause;
+    - the stress rules;
+    - spelling out initials;
+    - a/an/the/to/am by what follows;
+    - -s, -ed and -ing stems with misaki's sound changes;
+    - numbers through a num2words port: cardinals, ordinals, years, decimals, versions, money in dollars, pounds and euros, and suffixes;
+    - %, &, + and @;
+    - abbreviations the dictionary knows ("Dr.");
+    - curly quotes.
+  - **Without misaki's spaCy tagger:** words with several pronunciations take the usual one ("read" is /rid/). Unknown words are split into known words (voice+over), then sounded out by English spelling patterns, and spelt only if they are short capitals.
+  - **Synthesis:** misaki's phonemes go to the vocabulary ids, padded, with the voice's style row for the input's length and the speed. Text is cut into pieces of at most 400 phonemes at sentence, then clause, then word breaks, and joined with 120 ms gaps. The output is 24 kHz mono.
+  - **Where to find it:** Sequence › Generate Voiceover (text at the playhead, or a caption track cue by cue, re-spoken up to 1.6x faster to fit a short cue; one undo step; WAVs in the Voiceover folder and bin folder), `montage-cli speak` (and `--phonemes`), MCP `montage_generate_speech` (46 tools), `montage-cli models`, `scripts/fetch-models.sh` and the CI caches.
+  - **Tests:**
+    - the phonemes for five US sentences (money, percent, thousands, versions, decades, ordinals, years, acronyms, initials, titles, quotes, "an") and a UK one are identical to misaki 0.7.4 with spaCy;
+    - num2words, ordinals, years and stress moves;
+    - speech length, level and speed;
+    - Whisper hears "hello", "welcome" and "Montage" in the speech;
+    - MCP from a caption track (each cue fitting before the next) and from text on A2;
+    - the dialog, with undo.

@@ -11,6 +11,7 @@ add_library(montage_engine STATIC
   core/ScriptCut.h core/ScriptCut.cpp
   core/Cfb.h core/Cfb.cpp
   core/Zip.h core/Zip.cpp
+  core/G2p.h core/G2p.cpp
   core/Checkerboard.h core/Checkerboard.cpp
   core/Bleep.h core/Bleep.cpp
   core/FaceIndex.h core/FaceIndex.cpp
@@ -31,6 +32,7 @@ add_library(montage_engine STATIC
   media/Faces.h media/Faces.cpp
   media/DepthMap.h media/DepthMap.cpp
   media/Matting.h media/Matting.cpp
+  media/TextToSpeech.h media/TextToSpeech.cpp
   media/ValueMap.h
   media/Rife.h media/Rife.cpp
   media/HwAccel.h media/HwAccel.cpp

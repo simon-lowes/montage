@@ -38,6 +38,7 @@
 #include "media/DepthMap.h"
 #include "media/Rife.h"
 #include "media/Matting.h"
+#include "media/TextToSpeech.h"
 #include "media/Transcriber.h"
 #endif
 #include "render/ColorSpace.h"
@@ -86,6 +87,7 @@ int usage() {
                  "  montage-cli models\n"
                  "  montage-cli shots <project.montage> \"a red car at night\" [--max N]   (find shots by description)\n"
                  "  montage-cli people <project.montage> [--person NAME|ID]   (who is in the footage, and where)\n"
+                 "  montage-cli speak \"text\" -o voice.wav [--voice af_heart] [--speed 1]   (a voiceover from text; --phonemes prints them)\n"
                  "  montage-cli mcp                       (Model Context Protocol server on stdio, for AI agents)\n"
                  "  montage-cli captions <project.montage> [-o out.srt|out.vtt|out.scc] [--transcribe MODEL]\n"
                  "                     [--generate] [--import file.srt] [--save]\n"
@@ -637,6 +639,10 @@ int cmdModels() {
     else
         std::printf("  %-22s %6.1f MB  %s\n", mattingModel().id.c_str(), double(mattingModel().bytes()) / 1e6,
                     mattingModel().installed() ? "downloaded" : "");
+    std::printf("\nSpeech model (Kokoro-82M with misaki's dictionaries, for voiceovers from text; folder: %s)\n", ttsModel().directory().c_str());
+    if (!ttsAvailable()) std::printf("  unavailable: this build has no ONNX Runtime\n");
+    else
+        std::printf("  %-22s %6.1f MB  %s\n", ttsModel().id.c_str(), double(ttsModel().bytes()) / 1e6, ttsModel().installed() ? "downloaded" : "");
     return 0;
 }
 
@@ -989,6 +995,40 @@ int cmdPeople(const std::vector<std::string>& args) {
     return 1;
 }
 
+// Speaks text into a WAV file (Kokoro), or prints its phonemes.
+int cmdSpeak(const std::vector<std::string>& args) {
+    if (args.empty()) return usage();
+    std::string out, voice = "af_heart";
+    double speed = 1;
+    bool phonemesOnly = false;
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (args[i] == "-o" && i + 1 < args.size()) out = args[++i];
+        else if (args[i] == "--voice" && i + 1 < args.size()) voice = args[++i];
+        else if (args[i] == "--speed" && i + 1 < args.size()) speed = std::atof(args[++i].c_str());
+        else if (args[i] == "--phonemes") phonemesOnly = true;
+        else return usage();
+    }
+    std::string err;
+    if (phonemesOnly) {
+        const TtsVoice* v = findTtsVoice(voice);
+        std::string ps;
+        if (!textToPhonemes(args[0], v && v->british, ps, &err)) {
+            std::fprintf(stderr, "error: %s\n", err.c_str());
+            return 1;
+        }
+        std::printf("%s\n", ps.c_str());
+        return 0;
+    }
+    if (out.empty()) return usage();
+    std::vector<float> samples;
+    if (!synthesizeSpeech(args[0], voice, speed, samples, &err) || !writeSpeechWav(out, samples, &err)) {
+        std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
+    }
+    std::printf("Wrote %s (%.1f s)\n", out.c_str(), double(samples.size()) / kTtsSampleRate);
+    return 0;
+}
+
 int cmdPresets() {
     for (const auto& p : exportPresets())
         std::printf("%-28s .%-5s %s\n", p.name.c_str(), p.extension.c_str(), p.description.c_str());
@@ -1036,6 +1076,7 @@ int main(int argc, char** argv) {
 #endif
     if (cmd == "shots") return cmdShots(args);
     if (cmd == "people") return cmdPeople(args);
+    if (cmd == "speak") return cmdSpeak(args);
     if (cmd == "mcp") {
         // A Model Context Protocol server on stdin/stdout: stdout carries only protocol messages.
         McpServer server;

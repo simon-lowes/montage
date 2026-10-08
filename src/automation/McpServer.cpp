@@ -3,6 +3,7 @@
 #include <QBuffer>
 #include <QColor>
 #include <QFile>
+#include <QDir>
 #include <QFileInfo>
 #include <QImage>
 #include <QJsonArray>
@@ -44,6 +45,7 @@
 #include "media/DepthMap.h"
 #include "media/Matting.h"
 #include "media/Rife.h"
+#include "media/TextToSpeech.h"
 #include "media/Transcriber.h"
 #include "media/VisualSearch.h"
 #include "render/ClipAnalysis.h"
@@ -1467,6 +1469,74 @@ void McpServer::Impl::addTools() {
             if (text.isEmpty()) throw ArgError{"Give name or same_as"};
             save(l);
             return ok(text, QJsonObject{{"id", id}, {"name", QString::fromStdString(personName(l.project, id))}});
+        });
+
+    add("montage_generate_speech", "Generate a voiceover",
+        "Speak English text with an AI voice on this computer (Kokoro) and place it on an audio track: text at a time "
+        "(default the start), or a caption track spoken cue by cue at each cue's time, a little faster where a cue is "
+        "short. Voices: af_heart, af_bella, af_sarah, am_michael, am_adam, am_puck (American), bf_emma, bf_isabella, "
+        "bm_george, bm_lewis (British). The WAV files go in a Voiceover folder beside the project.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"text":{"type":"string"},
+            "captions":{"type":"integer","description":"Caption track index to speak instead of text"},
+            "voice":{"type":"string","default":"af_heart"},"speed":{"type":"number","default":1},
+            "at":{"type":["number","string"]},"track":{"type":"string","description":"Audio track, default A1"}},
+            "required":["project"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            if (!ttsAvailable()) return fail("This build of Montage cannot speak (no ONNX Runtime)");
+            if (!ttsModel().installed())
+                return fail("The speech model is not downloaded: run `scripts/fetch-models.sh` or generate a voiceover once in the app");
+            const std::string voice = str(a, "voice", "af_heart").toStdString();
+            if (!findTtsVoice(voice)) throw ArgError{QStringLiteral("Unknown voice \"%1\"").arg(QString::fromStdString(voice))};
+            const double speed = std::clamp(a.value("speed").toDouble(1), 0.5, 2.0);
+            struct Line {
+                std::string text;
+                FrameTime at, fit;
+            };
+            std::vector<Line> lines;
+            if (a.contains("captions")) {
+                const int index = a.value("captions").toInt();
+                if (index < 0 || index >= int(s.captionTracks.size())) throw ArgError{"No such caption track"};
+                const auto& caps = s.captionTracks[size_t(index)].captions;
+                for (size_t i = 0; i < caps.size(); ++i) {
+                    std::string t = caps[i].text;
+                    std::replace(t.begin(), t.end(), '\n', ' ');
+                    if (!t.empty()) lines.push_back({t, caps[i].start, (i + 1 < caps.size() ? caps[i + 1].start : caps[i].end) - caps[i].start});
+                }
+            } else {
+                lines.push_back({need(a, "text").toStdString(), a.contains("at") ? timeArg(a.value("at"), s, "at") : 0, -1});
+            }
+            if (lines.empty()) return fail("Nothing to say");
+            const TrackRef au = trackArg(str(a, "track", "A1"), s, true, &l.project, &s);
+            const QString folder = QFileInfo(absolute(need(a, "project"))).absolutePath() + QStringLiteral("/Voiceover");
+            QDir().mkpath(folder);
+            QJsonArray placed;
+            double total = 0;
+            int n = 1;
+            for (size_t i = 0; i < lines.size(); ++i) {
+                std::vector<float> audio;
+                std::string err;
+                progress(double(i) / lines.size(), QStringLiteral("Speaking"));
+                if (!synthesizeSpeech(lines[i].text, voice, speed, audio, &err)) return fail(QString::fromStdString(err));
+                const double room = lines[i].fit > 0 ? lines[i].fit / s.fpsValue() : 0, said = double(audio.size()) / kTtsSampleRate;
+                if (room > 0 && said > room * 1.02) {
+                    const double faster = std::min(1.6, speed * said / room);
+                    if (faster > speed * 1.02 && !synthesizeSpeech(lines[i].text, voice, faster, audio, &err)) return fail(QString::fromStdString(err));
+                }
+                QString path;
+                do path = folder + '/' + QString::fromStdString(s.name) + QStringLiteral(" Speech ") + QString::number(n++) + QStringLiteral(".wav");
+                while (QFileInfo::exists(path));
+                if (!writeSpeechWav(path.toStdString(), audio, &err)) return fail(QString::fromStdString(err));
+                const Id media = mediaFor(l.project, path);
+                check(edit::placeMedia(l.project, s, media, lines[i].at, 0, -1, {TrackKind::Video, 0}, au, false));
+                total += double(audio.size()) / kTtsSampleRate;
+                placed.append(QJsonObject{{"file", path}, {"at_seconds", lines[i].at / s.fpsValue()},
+                                          {"seconds", double(audio.size()) / kTtsSampleRate}});
+            }
+            save(l);
+            return ok(QStringLiteral("Placed %1 voiceover clip(s), %2 s in all").arg(lines.size()).arg(total, 0, 'f', 1),
+                      QJsonObject{{"clips", placed}});
         });
 
     add("montage_log_media", "Log media",

@@ -10,6 +10,7 @@
 #   <dir>/depth          depth effects      (MONTAGE_DEPTH_MODEL)
 #   <dir>/rife           AI slow motion     (MONTAGE_RIFE_MODEL)
 #   <dir>/matte          Remove Background  (MONTAGE_MATTE_MODEL)
+#   <dir>/tts            Generate Voiceover (MONTAGE_TTS_MODEL)
 #
 #   scripts/fetch-models.sh [dir]      (default: ./models)
 set -euo pipefail
@@ -66,4 +67,20 @@ fetch rife RIFEv4.26_0921.zip \
 fetch matte modnet.onnx \
   https://huggingface.co/Xenova/modnet/resolve/fa2fa546052fba4c08921230a26cc69a333fca12/onnx/model.onnx \
   07c308cf0fc7e6e8b2065a12ed7fc07e1de8febb7dc7839d7b7f15dd66584df9
-echo "Models in $DIR: MONTAGE_OBJECT_MODEL=$DIR/edgetam-video MONTAGE_SPEAKER_MODEL=$DIR/speakers MONTAGE_VISUAL_MODEL=$DIR/clip-vit-b32 MONTAGE_SPEECH_MODEL=$DIR/speech-enhance MONTAGE_UPSCALE_MODEL=$DIR/upscale MONTAGE_FACE_MODEL=$DIR/faces MONTAGE_DEPTH_MODEL=$DIR/depth MONTAGE_RIFE_MODEL=$DIR/rife MONTAGE_MATTE_MODEL=$DIR/matte"
+KOKORO=https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/1939ad2a8e416c0acfeecc08a694d14ef25f2231
+fetch tts kokoro-v1.0-fp16.onnx "$KOKORO/onnx/model_fp16.onnx" ba4527a874b42b21e35f468c10d326fdff3c7fc8cac1f85e9eb6c0dfc35c334a
+fetch tts tokenizer.json "$KOKORO/tokenizer.json" 77a02c8e164413299b4b4c403b14f8e0e1c1b727db4d46a09d6327b861060a34
+fetch tts misaki-0.7.4-py3-none-any.whl \
+  https://files.pythonhosted.org/packages/06/e9/f092172a37c0994bf1e57e0d2f3b16bd18f63b98744d6039f18a055c2ad5/misaki-0.7.4-py3-none-any.whl \
+  f9cf1afc0a2c0e77dadf02ae8203d3a7c312ee67b235d3b658c08367919b17c1
+fetch tts af_heart.bin "$KOKORO/voices/af_heart.bin" d583ccff3cdca2f7fae535cb998ac07e9fcb90f09737b9a41fa2734ec44a8f0b
+fetch tts af_bella.bin "$KOKORO/voices/af_bella.bin" f69d836209b78eb8c66e75e3cda491e26ea838a3674257e9d4e5703cbaf55c8b
+fetch tts af_sarah.bin "$KOKORO/voices/af_sarah.bin" 4409fbc125afabacc615d94db5398d847006a737b0247d6892b7a9a0007a2f0a
+fetch tts am_michael.bin "$KOKORO/voices/am_michael.bin" 1d1f21dd8da39c30705cd4c75d039d265e9bc4a2a93ed09bc9e1b1225eb95ba1
+fetch tts am_adam.bin "$KOKORO/voices/am_adam.bin" 162b035ed91cfc48b6046982184c645f72edcdd1b82843347f605d7bf7b15716
+fetch tts am_puck.bin "$KOKORO/voices/am_puck.bin" fcf73c989033e9233e0b98713eca600c8c74dcc1614b37009d5450ff4a2274a0
+fetch tts bf_emma.bin "$KOKORO/voices/bf_emma.bin" 669fe0647f9dd04fcab92f1439a40eeb4c8b4ab1f82e4996fe3d918ce4a63b73
+fetch tts bf_isabella.bin "$KOKORO/voices/bf_isabella.bin" 3754352c4aaa46d17f27654ab7518d65b62ad6163a0f55a5f4330c2da2c4e94f
+fetch tts bm_george.bin "$KOKORO/voices/bm_george.bin" c4b235a4c1f2cd3b939fed08b899ce9385638b763f7b73a59616c4fc9bd6c9bc
+fetch tts bm_lewis.bin "$KOKORO/voices/bm_lewis.bin" b8f671cef828c30e66fdf0b0756a76bba58f6bb3398cbbf27058642acbcedb97
+echo "Models in $DIR: MONTAGE_OBJECT_MODEL=$DIR/edgetam-video MONTAGE_SPEAKER_MODEL=$DIR/speakers MONTAGE_VISUAL_MODEL=$DIR/clip-vit-b32 MONTAGE_SPEECH_MODEL=$DIR/speech-enhance MONTAGE_UPSCALE_MODEL=$DIR/upscale MONTAGE_FACE_MODEL=$DIR/faces MONTAGE_DEPTH_MODEL=$DIR/depth MONTAGE_RIFE_MODEL=$DIR/rife MONTAGE_MATTE_MODEL=$DIR/matte MONTAGE_TTS_MODEL=$DIR/tts"

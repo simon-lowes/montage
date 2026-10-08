@@ -23,6 +23,7 @@
 #include "core/Transcript.h"
 #include "core/TranscriptEdit.h"
 #include "core/Zip.h"
+#include "core/G2p.h"
 
 using namespace montage;
 using namespace montage::edit;
@@ -75,6 +76,32 @@ struct Fixture {
 class TestCore : public QObject {
     Q_OBJECT
 private slots:
+    void numbersAndStressForSpeech() {
+        QCOMPARE(numberWords(0), std::string("zero"));
+        QCOMPARE(numberWords(42), std::string("forty-two"));
+        QCOMPARE(numberWords(1200), std::string("one thousand, two hundred"));
+        QCOMPARE(numberWords(1000001), std::string("one million and one"));
+        QCOMPARE(numberWords(-7), std::string("minus seven"));
+        QCOMPARE(ordinalWords(3), std::string("third"));
+        QCOMPARE(ordinalWords(21), std::string("twenty-first"));
+        QCOMPARE(ordinalWords(40), std::string("fortieth"));
+        QCOMPARE(ordinalWords(112), std::string("one hundred and twelfth"));
+        QCOMPARE(yearWords(2026), std::string("twenty twenty-six"));
+        QCOMPARE(yearWords(1905), std::string("nineteen oh-five"));
+        QCOMPARE(yearWords(2005), std::string("two thousand and five"));
+        QCOMPARE(yearWords(1900), std::string("nineteen hundred"));
+        QCOMPARE(yearWords(2000), std::string("two thousand"));
+        // misaki's stress moves: marks go before their vowel.
+        QCOMPARE(applyStress("hələ", 2), std::string("hˈələ"));
+        QCOMPARE(applyStress("ˈhOm", -1), std::string("ˌhOm"));
+        QCOMPARE(applyStress("ˈhOm", -2), std::string("hOm"));
+        QCOMPARE(applyStress("bˌæk", 1), std::string("bˈæk"));
+        QCOMPARE(applyStress("mm", 2), std::string("mm"));  // no vowel, nothing to stress
+        // Unknown words sounded out, the first syllable stressed.
+        QCOMPARE(spellingToPhonemes("zorblat"), std::string("zˈɔɹblæt"));
+        QCOMPARE(spellingToPhonemes("chime"), std::string("ʧˈIm"));
+    }
+
     void zipReaderAndInflate() {
         // Raw DEFLATE from Qt's zlib stream: without its length prefix, header and checksum.
         auto deflate = [](const QByteArray& data, int level) {

@@ -57,6 +57,7 @@
 #include "media/DepthMap.h"
 #include "media/Rife.h"
 #include "media/Matting.h"
+#include "media/TextToSpeech.h"
 #include "media/VisualSearch.h"
 #include "automation/McpServer.h"
 #ifdef MONTAGE_WITH_WHISPER
@@ -2417,6 +2418,90 @@ private slots:
         const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
         const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
         QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+    }
+
+    void textToSpeech() {
+        if (!ttsAvailable() || !ttsModel().installed()) QSKIP("Set MONTAGE_TTS_MODEL to the Kokoro speech pack");
+        // Phonemes as misaki itself gives them (checked against misaki 0.7.4 with spaCy).
+        const std::pair<const char*, const char*> us[] = {
+            {"Hello, world! This is Montage, a video editor.", "həlˈO, wˈɜɹld! ðˌɪs ɪz mɑntˈɑʒ, ɐ vˈɪdiO ˈɛdəɾəɹ."},
+            {"It costs $4.50 or £3, about 75% of 1,200 units.",
+             "ˌɪt kˈɔsts fˈɔɹ dˈɑləɹz ænd fˈɪfti sˈɛnts ɔɹ θɹˈi pˈWndz, əbˈWt sˈɛvənti fˈIv pəɹsˈɛnt ʌv wˈʌn θˈWzᵊnd tˈu hˈʌndɹəd jˈunəts."},
+            {"Version 2.1.3 shipped in the 1990s; the 21st century began in 2001.",
+             "vˈɜɹʒən tˈu wˈʌn θɹˈi ʃˈɪpt ɪn ðə nˌIntˈin nˈIndiz; ðə twˈɛnti fˈɜɹst sˈɛnʧəɹi bəɡˈæn ɪn tˈu θˈWzᵊnd wˈʌn."},
+            {"NASA and the U.S. sent 3 men. Dr. Smith said: \"It works!\"",
+             "nˈæsə ænd ðə jˌuˈɛs sˈɛnt θɹˈi mˈɛn. dˈɑktəɹ smˈɪθ sˈɛd: “ˌɪt wˈɜɹks!”"},
+            {"An AI voice reads it to everyone in 12.5 seconds.", "ɐn ˈAˌI vˈYs ɹˈidz ɪt tʊ ˈɛvɹiwən ɪn twˈɛlv pYnt fˈIv sˈɛkəndz."}};
+        std::string ps, err;
+        for (const auto& [text, want] : us) {
+            QVERIFY2(textToPhonemes(text, false, ps, &err), err.c_str());
+            QCOMPARE(QString::fromStdString(ps), QString::fromUtf8(want));
+        }
+        QVERIFY(textToPhonemes("Good evening from London. The weather is rather grey today.", true, ps, &err));
+        QCOMPARE(QString::fromStdString(ps), QString::fromUtf8("ɡˈʊd ˈiːvnɪŋ fɹɒm lˈʌndən. ðə wˈɛðə ɪz ɹˈɑːðə ɡɹˈA tədˈA."));
+        // A word the dictionaries lack, split into ones they know.
+        QVERIFY(textToPhonemes("voiceover", false, ps, &err));
+        QCOMPARE(QString::fromStdString(ps), QString::fromUtf8("vˈYsˌOvəɹ"));
+
+        // Speech: about as long as it takes to say, loud enough, slower when asked.
+        std::vector<float> audio, slow;
+        QVERIFY2(synthesizeSpeech("Hello and welcome to Montage.", "af_heart", 1.0, audio, &err), err.c_str());
+        const double seconds = double(audio.size()) / kTtsSampleRate;
+        QVERIFY2(seconds > 1.2 && seconds < 4, qPrintable(QString::number(seconds)));
+        float peak = 0;
+        for (float v : audio) peak = std::max(peak, std::abs(v));
+        QVERIFY(peak > 0.1f && peak <= 1.0f);
+        QVERIFY(synthesizeSpeech("Hello and welcome to Montage.", "bm_george", 0.7, slow, &err));
+        QVERIFY(slow.size() > audio.size() * 1.2);
+        QVERIFY(!synthesizeSpeech("Hello", "nobody", 1, audio, &err));
+        const std::string wav = path("tts.wav");
+        QVERIFY(synthesizeSpeech("Hello and welcome to Montage.", "af_heart", 1.0, audio, &err));
+        QVERIFY(writeSpeechWav(wav, audio, &err));
+        // Heard back by Whisper as what was written.
+        if (const QByteArray model = qgetenv("MONTAGE_TEST_WHISPER_MODEL"); !model.isEmpty()) {
+            TranscribeOptions opts;
+            opts.model = model.toStdString();
+            Transcript t;
+            QVERIFY2(transcribeMedia(wav, opts, t, {}, nullptr, &err), err.c_str());
+            const QString heard = QString::fromStdString(t.text()).toLower();
+            QVERIFY2(heard.contains("hello") && heard.contains("welcome") && heard.contains("montage"), qPrintable(heard));
+        }
+
+        // Through MCP: text at a time, and a caption track cue by cue.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        CaptionTrack track;
+        track.id = p.newId();
+        track.captions = {{0, 60, "First line of the script.", {}}, {90, 150, "And the second one.", {}}};
+        s.captionTracks.push_back(track);
+        const QString project = QString::fromStdString(path("speech.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_generate_speech"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call({{"project", project}, {"captions", 0}, {"voice", "bf_emma"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("clips").toArray().size(), 2);
+        r = call({{"project", project}, {"text", "The end."}, {"at", 10}, {"track", "A2"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(call({{"project", project}, {"text", "x"}, {"voice", "nobody"}}).value("isError").toBool());
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back, &err));
+        const Sequence& bs = *back.active();
+        QCOMPARE(int(bs.audioTracks[0].clips.size()), 2);
+        QCOMPARE(bs.audioTracks[0].clips[0].start, FrameTime(0));
+        QCOMPARE(bs.audioTracks[0].clips[1].start, FrameTime(90));
+        // Each fits before the next cue.
+        QVERIFY(bs.audioTracks[0].clips[0].end() <= 92);
+        QCOMPARE(int(bs.audioTracks[1].clips.size()), 1);
+        QCOMPARE(bs.audioTracks[1].clips[0].start, FrameTime(std::llround(10 * bs.fpsValue())));
+        QVERIFY(QFileInfo::exists(QFileInfo(project).absolutePath() + "/Voiceover"));
     }
 
     void peopleSearch() {

@@ -65,6 +65,7 @@
 #include "MaskOverlay.h"
 #include "ShotSearchPanel.h"
 #include "PeoplePanel.h"
+#include "SpeechDialog.h"
 #include "TranscriptPanel.h"
 #include "MonitorPanel.h"
 #include "PlaybackController.h"
@@ -610,6 +611,11 @@ void MainWindow::buildMenus() {
         voiceover_->show();
         voiceover_->raise();
     })->setObjectName(QStringLiteral("recordVoiceover"));
+    add(seqM, tr("&Generate Voiceover…"), QKeySequence("Ctrl+Alt+G"), [this] {
+        if (!state_->sequence()) return;
+        SpeechDialog dlg(state_, this);
+        dlg.exec();
+    })->setObjectName(QStringLiteral("generateVoiceover"));
     add(seqM, tr("Render In to Out"), QKeySequence(Qt::Key_Return), [this] { renderInToOut(); })
         ->setObjectName(QStringLiteral("renderInToOut"));
     add(seqM, tr("Delete Render Files"), QKeySequence(), [this] { deleteRenderFiles(); })

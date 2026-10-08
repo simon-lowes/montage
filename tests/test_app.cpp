@@ -1,6 +1,7 @@
 // Application integration tests: drive the real main window offscreen —
 // timeline mouse gestures, tools, undo, inspector, monitors and playback.
 #include <QtTest>
+#include <QPlainTextEdit>
 
 #include <QAbstractScrollArea>
 #include <QAction>
@@ -70,6 +71,8 @@
 #include "media/DepthMap.h"
 #include "media/Rife.h"
 #include "media/Matting.h"
+#include "media/TextToSpeech.h"
+#include "SpeechDialog.h"
 #include "ShotSearchPanel.h"
 #include "PeoplePanel.h"
 #include "media/Segmenter.h"
@@ -1666,6 +1669,30 @@ private slots:
         QVERIFY(listed);
         if (!faceSearchAvailable() || !faceModel().installed()) QSKIP("Set MONTAGE_FACE_MODEL to test with the model");
         QVERIFY(ensureEffectModel(win_.get(), "face_refine"));
+    }
+
+    void generateVoiceover() {
+        loadDemo();
+        QAction* act = win_->findChild<QAction*>("generateVoiceover");
+        QVERIFY(act);
+        if (!ttsAvailable() || !ttsModel().installed()) QSKIP("Set MONTAGE_TTS_MODEL to the Kokoro speech pack");
+        state()->setPlayhead(15);
+        SpeechDialog dlg(state(), win_.get());
+        dlg.findChild<QPlainTextEdit*>("speechText")->setPlainText("Testing the voiceover.");
+        auto* voice = dlg.findChild<QComboBox*>("speechVoice");
+        voice->setCurrentIndex(voice->findData("am_michael"));
+        const int track = dlg.findChild<QComboBox*>("speechTrack")->currentData().toInt();
+        const auto clips = dlg.generate();
+        QCOMPARE(int(clips.size()), 1);
+        const Clip* c = edit::clipById(*state()->sequence(), clips[0]);
+        QVERIFY(c);
+        QCOMPARE(c->start, FrameTime(15));
+        QCOMPARE(edit::locate(*state()->sequence(), clips[0])->track.index, track);
+        const MediaItem* m = state()->project().findMedia(c->mediaId);
+        QVERIFY(m && m->bin == "Voiceover" && QFileInfo::exists(QString::fromStdString(m->path)));
+        // One undo step takes it away.
+        state()->undo();
+        QVERIFY(!edit::clipById(*state()->sequence(), clips[0]));
     }
 
     void peopleMaskOffersItsModel() {

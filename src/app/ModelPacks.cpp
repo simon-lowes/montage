@@ -18,6 +18,7 @@
 #include "media/Matting.h"
 #include "media/Faces.h"
 #include "media/Rife.h"
+#include "media/TextToSpeech.h"
 #include "media/SuperScale.h"
 #include "media/SpeechEnhance.h"
 
@@ -201,6 +202,11 @@ bool ensureEffectModel(QWidget* parent, const std::string& type) {
         }
         return ensureModelPack(parent, mattingModel(), QObject::tr("Remove Background"),
                                QObject::tr("Cutting people out uses MODNet (Apache-2.0), a portrait matting model that runs on this computer."));
+    }
+    if (type == "tts") {
+        if (!ttsAvailable()) return false;
+        return ensureModelPack(parent, ttsModel(), QObject::tr("Generate Voiceover"),
+                               QObject::tr("Voiceovers from text use Kokoro (Apache-2.0), which runs on this computer."));
     }
     if (type == "rife") {
         if (!rifeAvailable()) {
