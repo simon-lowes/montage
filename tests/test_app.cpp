@@ -44,6 +44,7 @@
 #include "PluginEditorWindow.h"
 #include "audio/PluginEffect.h"
 #include "KeyframePanel.h"
+#include "Keymap.h"
 #include "MaskOverlay.h"
 #include "media/Diarizer.h"
 #include "media/VisualSearch.h"
@@ -1414,6 +1415,93 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(fitted && fitted->start == 0 && fitted->duration == 30);
         QCOMPARE(fitted->speed, 2.0);
         state()->newProject();
+    }
+
+    void keyboardShortcuts() {
+        QWidget* w = win_.get();
+        keymap::resetAll(w);
+        const auto all = keymap::actions(w);
+        QVERIFY(all.size() > 100);
+        // Every command has its own id, and no key does two things.
+        QSet<QString> ids;
+        QMap<QString, QString> used;
+        auto checkUnique = [&](const QString& when) {
+            used.clear();
+            for (QAction* a : keymap::actions(w))
+                for (const QKeySequence& k : a->shortcuts()) {
+                    const QString key = k.toString(QKeySequence::PortableText);
+                    QVERIFY2(!used.contains(key), qPrintable(QString("%1: %2 is on %3 and %4").arg(when, key, used.value(key), keymap::idOf(a))));
+                    used[key] = keymap::idOf(a);
+                }
+        };
+        for (QAction* a : all) {
+            QVERIFY2(!ids.contains(keymap::idOf(a)), qPrintable(keymap::idOf(a)));
+            ids.insert(keymap::idOf(a));
+        }
+        checkUnique("Montage");
+        // Every preset names real commands and leaves no key on two of them.
+        for (const QString& preset : keymap::presets()) {
+            const QJsonObject keys = keymap::presetKeys(preset);
+            for (auto it = keys.begin(); it != keys.end(); ++it)
+                QVERIFY2(keymap::find(w, it.key()), qPrintable(preset + ": " + it.key()));
+            QVERIFY(keymap::applyPreset(w, preset));
+            checkUnique(preset);
+            for (auto it = keys.begin(); it != keys.end(); ++it)
+                QCOMPARE(keymap::find(w, it.key())->shortcut().toString(QKeySequence::PortableText), it.value().toString());
+        }
+        keymap::resetAll(w);
+        // Resetting brings back every key, the second ones too.
+        QAction* redo = keymap::find(w, "Edit/Redo");
+        QVERIFY(redo && redo->shortcuts().size() == 2);
+        // A key in use moves only when asked.
+        QAction* trim = keymap::find(w, "Sequence/Ripple Trim Previous Edit to Playhead");
+        QAction* marker = keymap::find(w, "Sequence/Add Marker");
+        QVERIFY(trim && marker);
+        QCOMPARE(trim->shortcut(), QKeySequence(Qt::Key_Q));
+        QCOMPARE(keymap::conflict(w, QKeySequence(Qt::Key_Q), marker), trim);
+        QVERIFY(!keymap::assign(w, "Sequence/Add Marker", QKeySequence(Qt::Key_Q), false));
+        QCOMPARE(marker->shortcut(), QKeySequence(Qt::Key_M));
+        QVERIFY(keymap::assign(w, "Sequence/Add Marker", QKeySequence(Qt::Key_Q), true));
+        QCOMPARE(marker->shortcut(), QKeySequence(Qt::Key_Q));
+        QVERIFY(trim->shortcut().isEmpty());
+        // Kept between sessions: only the changes are stored, and load() puts them back.
+        QSettings settings;
+        QCOMPARE(settings.value("keymap/Sequence/Add Marker").toString(), QString("Q"));
+        QCOMPARE(settings.value("keymap/Sequence/Ripple Trim Previous Edit to Playhead").toString(), QString("none"));
+        QVERIFY(!settings.contains("keymap/Sequence/Lift"));
+        marker->setShortcut(QKeySequence(Qt::Key_M));
+        keymap::load(w);
+        QCOMPARE(marker->shortcut(), QKeySequence(Qt::Key_Q));
+        // Saved to a file and read back.
+        const QJsonObject layout = keymap::save(w);
+        keymap::resetAll(w);
+        QCOMPARE(marker->shortcut(), QKeySequence(Qt::Key_M));
+        QVERIFY(keymap::restore(w, layout));
+        QCOMPARE(marker->shortcut(), QKeySequence(Qt::Key_Q));
+        QVERIFY(!keymap::restore(w, QJsonObject{{"something", 1}}));
+        // The dialog: search, pick, set (taking the key over).
+        keymap::resetAll(w);
+        {
+            keymap::Dialog dlg(w);
+            dlg.setFilter("marker");
+            QVERIFY(dlg.select("Sequence/Add Marker"));
+            QVERIFY(!dlg.select("Sequence/Lift"));  // filtered out
+            QVERIFY(dlg.setSelectedKey(QKeySequence(Qt::Key_F7)));
+            QCOMPARE(marker->shortcut(), QKeySequence(Qt::Key_F7));
+            QVERIFY(dlg.setSelectedKey(QKeySequence(Qt::Key_Q)));
+            QVERIFY(trim->shortcut().isEmpty());
+        }
+        // The shortcut works: Q now adds a marker (with the Program monitor the one in use).
+        state()->newProject();
+        state()->setPlayhead(12);
+        win_->activateWindow();
+        for (auto* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Program) m->viewer()->setFocus();
+        QApplication::processEvents();
+        const size_t markers = state()->sequence()->markers.size();
+        QTest::keyClick(win_.get(), Qt::Key_Q);
+        QCOMPARE(state()->sequence()->markers.size(), markers + 1);
+        keymap::resetAll(w);
     }
 
     void renderQueueInTheBackground() {

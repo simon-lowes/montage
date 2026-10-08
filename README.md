@@ -20,6 +20,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Linked audio/video, linking and unlinking, snapping, markers, match frame, compound (nested) clips
 - Constant speed changes and reverse, with optional ripple
 - Snapshot undo/redo for every operation; drags and slider edits merge into one undo step
+- **Keyboard Shortcuts** (Help › Keyboard Shortcuts, F1): every menu command can take any key, found by name or key. A key already in use moves only after asking. Keys can be reset one by one or all together, and layouts can be exported to or imported from a JSON file. Presets follow Premiere Pro (Montage's own), Final Cut Pro, DaVinci Resolve or Avid Media Composer.
 - Scene-cut detection that cuts a clip at every shot change
 
 **Effects and colour**

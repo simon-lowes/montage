@@ -1,5 +1,7 @@
 #include "MainWindow.h"
 
+#include "Keymap.h"
+
 #include <QAction>
 #include <QCheckBox>
 #include <QActionGroup>
@@ -90,6 +92,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     buildPanels();
     buildActions();
     buildMenus();
+    keymap::load(this);
 
     // Crash safety: find sessions that did not exit cleanly before starting ours.
     recovery_ = new RecoveryManager(state_, QString(), this);
@@ -325,6 +328,7 @@ void MainWindow::buildMenus() {
         a->setShortcutContext(Qt::WindowShortcut);
         connect(a, &QAction::triggered, this, fn);
         addAction(a);  // keep shortcuts alive even when menus are hidden
+        keymap::registerAction(a, menu->title(), text);  // its key can be changed (Keyboard Shortcuts)
         return a;
     };
     auto withSeq = [this](auto fn) {
@@ -1906,33 +1910,7 @@ void MainWindow::applyFromBrowser(const QString& typeQ, EffectCategory category)
 // Help
 
 void MainWindow::showShortcuts() {
-    QDialog dlg(this);
-    dlg.setWindowTitle(tr("Keyboard Shortcuts"));
-    auto* lay = new QVBoxLayout(&dlg);
-    auto* table = new QTableWidget(&dlg);
-    table->setColumnCount(2);
-    table->setHorizontalHeaderLabels({tr("Command"), tr("Shortcut")});
-    table->horizontalHeader()->setStretchLastSection(true);
-    table->verticalHeader()->hide();
-    table->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    QList<QAction*> acts = actions();
-    for (QAction* a : acts) {
-        if (a->shortcut().isEmpty()) continue;
-        int row = table->rowCount();
-        table->insertRow(row);
-        QString text = a->text();
-        text.remove('&');
-        table->setItem(row, 0, new QTableWidgetItem(text));
-        QStringList keys;
-        for (const auto& k : a->shortcuts()) keys << k.toString(QKeySequence::NativeText);
-        table->setItem(row, 1, new QTableWidgetItem(keys.join(", ")));
-    }
-    table->resizeColumnToContents(0);
-    lay->addWidget(table);
-    auto* bb = new QDialogButtonBox(QDialogButtonBox::Close, &dlg);
-    connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
-    lay->addWidget(bb);
-    dlg.resize(520, 640);
+    keymap::Dialog dlg(this);
     dlg.exec();
 }
 

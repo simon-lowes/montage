@@ -378,3 +378,8 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
   - Fit to Fill: the source In-Out range overwrites the timeline In-Out range at the speed that fits.
   - Select Clips After Playhead (A) and on the target track (Shift+A), like Track Select Forward.
   - Tested in core (exact frames, sources and speeds for each, plus errors) and through the app's actions.
+- [x] Keyboard Shortcuts editor (app/Keymap):
+  - Every menu command gets a stable id ("Sequence/Add Marker") when the menus are built; Montage's own keys (all of them, e.g. Redo's Ctrl+Shift+Z and Ctrl+Y) are kept as the defaults, and only changes are stored (QSettings keymap/<id>, "none" for no key).
+  - Help › Keyboard Shortcuts (F1) replaces the read-only list: commands by menu, search by name or key, a key field, None and Default buttons, Reset All, a preset menu, and Import / Export as JSON. A key in use is moved only after asking.
+  - Presets: Montage (Premiere Pro), Final Cut Pro (A/B/T tools, W insert, D overwrite, Ctrl+B blade, N snapping, Alt+F hold), DaVinci Resolve (F9/F10/F11 edits, Shift+F11 fit to fill, Ctrl+B razor, Shift+R freeze, Y select forward) and Avid Media Composer (V splice, B overwrite, Z lift, X extract, E/R marks, T mark clip, H add edit).
+  - Tested: unique ids; no key on two commands by default or in any preset; every preset id exists; take-over only when asked; stored changes, load, reset (second keys included), JSON round trip and a bad file; the dialog's search, selection and setting; and a rebound key (Q adds a marker) working in the window.
