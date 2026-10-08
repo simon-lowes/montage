@@ -1259,6 +1259,7 @@ struct AudioMixer::State {
     fx::NoiseGate gate;
     fx::Reverb reverb;
     fx::DeHum dehum;
+    fx::MultibandCompressor multiband;
     fx::ModDelay modDelay;
     fx::Phaser phaser;
     fx::Tremolo tremolo;
@@ -1443,6 +1444,16 @@ void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameT
         } else if (e.type == "reverb") {
             st->reverb.process(buf, frames, sr, e.p("size", lt, 50) / 100, e.p("damping", lt, 50) / 100, e.p("width", lt, 100) / 100,
                                e.p("mix", lt, 25) / 100);
+        } else if (e.type == "multiband") {
+            fx::BandSettings b[3];
+            const char* names[3] = {"low", "mid", "high"};
+            const double ratios[3] = {3, 2.5, 3};
+            for (int k = 0; k < 3; ++k) {
+                const std::string n(names[k]);
+                b[k] = {e.p(n + "_threshold_db", lt, -24), e.p(n + "_ratio", lt, ratios[k]), e.p(n + "_gain_db", lt, 0)};
+            }
+            st->multiband.process(buf, frames, sr, e.p("low_hz", lt, 200), e.p("high_hz", lt, 2500), b, e.p("attack_ms", lt, 10),
+                                  e.p("release_ms", lt, 150), e.p("output_db", lt, 0));
         } else if (e.type == "dehum") {
             st->dehum.process(buf, frames, sr, e.p("mains", lt, 0) > 0.5 ? 60 : 50, int(std::lround(e.p("harmonics", lt, 6))),
                               e.p("reduction_db", lt, 30), e.p("width_hz", lt, 2));

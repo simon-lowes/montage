@@ -135,7 +135,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Peak meters with hold and clip indicators
 - Effects:
   - EQ: 3-band and 5-band parametric EQ (low shelf, three bells, high shelf), high/low-pass.
-  - Dynamics: compressor, limiter, de-esser (split-band), noise gate (threshold, range, attack, hold, release).
+  - Dynamics: compressor, limiter, de-esser (split-band), noise gate (threshold, range, attack, hold, release), and a three-band **multiband compressor** (Linkwitz-Riley splits that add back up flat; each band's threshold, ratio and gain, with a soft knee).
   - Space: reverb (Freeverb design) and delay.
   - Modulation: chorus, flanger (with feedback), phaser (4 to 12 stages) and tremolo or auto-pan (sine, triangle or square), with a stereo spread.
   - Saturation: tape, tube (adds even harmonics) or hard clip, with anti-aliasing (antiderivative), so a hard-clipped 5 kHz tone folds 26 dB less back into the audio band. Drive keeps the level, with a tone control and mix.

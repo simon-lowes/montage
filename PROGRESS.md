@@ -755,4 +755,8 @@ All 15 items are in (October 2026). The near misses listed in the roadmap are th
   - **Image sequences:** the image2 muxer with a frame number put before the extension (from 0); PNG is RGB or RGBA, TIFF 16-bit RGB. They refuse an audio codec.
   - **Social presets:** H.264 with loudness normalisation to -14 LUFS (TikTok, Reels and Shorts at 256 kbps AAC; YouTube).
   - **Tests:** a GIF of bars with a moving square is 480 × 270, 2 s long, and within 1.7 % mean difference of the rendered frames; a five-frame PNG range writes exactly five numbered files, the first matching the picture; the TIFFs are 16 bits a sample; sound is refused for sequences.
+- [x] Multiband compressor (render/AudioFx `MultibandCompressor`):
+  - Two LR4 crossovers split low, mid and high; the low band also goes through the upper crossover's all-pass (its low plus high halves), so the three add back to an all-pass, flat in level.
+  - Each band has its own peak envelope (shared attack and release), a 6 dB soft knee, ratio and gain.
+  - **Tests:** flat within 0.1 dB at 60 Hz, both crossovers, 1 kHz and 9 kHz when idle; a loud 80 Hz squeezed 16 dB while a quiet 6 kHz beside it moves 0.00 dB; +6 dB of mid gain lifting 900 Hz and not 8 kHz; in the mixer.
 

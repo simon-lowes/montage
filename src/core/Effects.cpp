@@ -366,6 +366,15 @@ std::vector<EffectInfo> buildCatalog() {
                   num("b3_q", "Band 3 Q", 0.1, 20, 1), num("high_hz", "High Shelf (Hz)", 1000, 20000, 10000, 1),
                   num("high_db", "High Shelf (dB)", -24, 24, 0, 0.1), num("output_db", "Output (dB)", -24, 24, 0, 0.1)},
                  {}});
+    c.push_back({"multiband", "Multiband Compressor", EffectCategory::AudioFilter, "Dynamics",
+                 {num("low_hz", "Low / Mid Split (Hz)", 40, 2000, 200, 1), num("high_hz", "Mid / High Split (Hz)", 500, 16000, 2500, 1),
+                  num("low_threshold_db", "Low Threshold (dB)", -60, 0, -24, 0.1), num("low_ratio", "Low Ratio", 1, 20, 3, 0.1),
+                  num("low_gain_db", "Low Gain (dB)", -24, 24, 0, 0.1), num("mid_threshold_db", "Mid Threshold (dB)", -60, 0, -24, 0.1),
+                  num("mid_ratio", "Mid Ratio", 1, 20, 2.5, 0.1), num("mid_gain_db", "Mid Gain (dB)", -24, 24, 0, 0.1),
+                  num("high_threshold_db", "High Threshold (dB)", -60, 0, -24, 0.1), num("high_ratio", "High Ratio", 1, 20, 3, 0.1),
+                  num("high_gain_db", "High Gain (dB)", -24, 24, 0, 0.1), num("attack_ms", "Attack (ms)", 0.1, 200, 10, 0.1),
+                  num("release_ms", "Release (ms)", 5, 2000, 150, 1), num("output_db", "Output (dB)", -24, 24, 0, 0.1)},
+                 {}});
     c.push_back({"deesser", "De-Esser", EffectCategory::AudioFilter, "Dynamics",
                  {num("hz", "Frequency (Hz)", 2000, 12000, 6000, 10), num("threshold_db", "Threshold (dB)", -60, 0, -30, 0.1),
                   num("reduction_db", "Max Reduction (dB)", 0, 24, 10, 0.1)},

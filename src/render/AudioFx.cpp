@@ -205,6 +205,51 @@ void channelTools(float* buf, int frames, int mode, bool invertLeft, bool invert
     }
 }
 
+// ---- Multiband compressor -----------------------------------------------------
+
+void MultibandCompressor::process(float* buf, int frames, double sr, double lowHz, double highHz, const BandSettings bands[3],
+                                  double attackMs, double releaseMs, double outputDb) {
+    highHz = std::max(highHz, lowHz * 1.5);
+    if (sr != sr_ || lowHz != lowHz_ || highHz != highHz_) {
+        for (int k = 0; k < 2; ++k) {
+            lo1_[k].lowPass(sr, lowHz), hi1_[k].highPass(sr, lowHz);
+            lo2_[k].lowPass(sr, highHz), hi2_[k].highPass(sr, highHz);
+            apLo_[k].lowPass(sr, highHz), apHi_[k].highPass(sr, highHz);
+        }
+        sr_ = sr, lowHz_ = lowHz, highHz_ = highHz;
+    }
+    const double att = std::exp(-1.0 / (std::max(0.05, attackMs) / 1000 * sr));
+    const double rel = std::exp(-1.0 / (std::max(1.0, releaseMs) / 1000 * sr));
+    const float out = dbToLin(outputDb);
+    constexpr double knee = 6;
+    for (int i = 0; i < frames; ++i) {
+        float* d = buf + i * 2;
+        float band[3][2];
+        for (int ch = 0; ch < 2; ++ch) {
+            const float x = d[ch];
+            const float low = lo1_[1].process(ch, lo1_[0].process(ch, x));
+            const float rest = hi1_[1].process(ch, hi1_[0].process(ch, x));
+            // The low band through the upper crossover's all-pass (its low half plus its high half).
+            band[0][ch] = apLo_[1].process(ch, apLo_[0].process(ch, low)) + apHi_[1].process(ch, apHi_[0].process(ch, low));
+            band[1][ch] = lo2_[1].process(ch, lo2_[0].process(ch, rest));
+            band[2][ch] = hi2_[1].process(ch, hi2_[0].process(ch, rest));
+        }
+        float sum[2] = {0, 0};
+        for (int b = 0; b < 3; ++b) {
+            const double level = std::max(std::fabs(band[b][0]), std::fabs(band[b][1]));
+            env_[b] = level > env_[b] ? att * env_[b] + (1 - att) * level : rel * env_[b] + (1 - rel) * level;
+            const double over = 20 * std::log10(env_[b] + 1e-9) - bands[b].thresholdDb;
+            const double slope = 1 - 1 / std::max(1.0, bands[b].ratio);
+            // Soft knee: the reduction grows smoothly over the 6 dB round the threshold.
+            const double reduce = over <= -knee / 2 ? 0 : over >= knee / 2 ? over * slope : slope * (over + knee / 2) * (over + knee / 2) / (2 * knee);
+            const float g = dbToLin(bands[b].gainDb - reduce);
+            sum[0] += band[b][0] * g, sum[1] += band[b][1] * g;
+        }
+        d[0] = sum[0] * out;
+        d[1] = sum[1] * out;
+    }
+}
+
 // ---- De-hum ------------------------------------------------------------------
 
 void DeHum::process(float* buf, int frames, double sr, double mainsHz, int harmonics, double reductionDb, double widthHz) {

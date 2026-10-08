@@ -744,7 +744,7 @@ private slots:
         p.media.push_back(m);
         QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
         Clip& c = s.audioTracks[0].clips.front();
-        for (const char* type : {"dehum", "chorus", "flanger", "phaser", "tremolo", "saturation", "stereo_width"}) {
+        for (const char* type : {"dehum", "chorus", "flanger", "phaser", "tremolo", "saturation", "stereo_width", "multiband"}) {
             QVERIFY2(findEffectInfo(type), type);
             c.effects.push_back(makeEffect(p, type));
         }
@@ -757,6 +757,43 @@ private slots:
             energy += double(v) * v;
         }
         QVERIFY(energy > 1);
+    }
+
+    void multibandCompressor() {
+        constexpr int sr = 48000;
+        auto tones = [](std::initializer_list<std::pair<double, double>> parts) {
+            std::vector<float> b(size_t(sr) * 2 * 2);
+            for (size_t i = 0; i < b.size() / 2; ++i) {
+                double v = 0;
+                for (const auto& [hz, amp] : parts) v += amp * std::sin(2 * M_PI * hz * double(i) / sr);
+                b[i * 2] = b[i * 2 + 1] = float(v);
+            }
+            return b;
+        };
+        auto db = [](double a, double b) { return 20 * std::log10(a / b); };
+        // Doing nothing, the three bands add back up flat, crossovers included.
+        const fx::BandSettings idle[3] = {{0, 1, 0}, {0, 1, 0}, {0, 1, 0}};
+        for (double hz : {60.0, 200.0, 1000.0, 2500.0, 9000.0}) {
+            fx::MultibandCompressor mb;
+            auto b = tones({{hz, 0.2}});
+            mb.process(b.data(), 2 * sr, sr, 200, 2500, idle, 10, 150, 0);
+            const double change = db(toneLevel(b, 0, hz, sr), 0.2);
+            QVERIFY2(std::fabs(change) < 0.1, qPrintable(QString("%1 Hz: %2 dB").arg(hz).arg(change)));
+        }
+        // A loud bass is squeezed while a quiet treble beside it is left alone.
+        const fx::BandSettings bass[3] = {{-30, 4, 0}, {0, 1, 0}, {0, 1, 0}};
+        fx::MultibandCompressor mb;
+        auto b = tones({{80, 0.5}, {6000, 0.03}});
+        mb.process(b.data(), 2 * sr, sr, 200, 2500, bass, 10, 150, 0);
+        const double low = db(toneLevel(b, 0, 80, sr), 0.5), high = db(toneLevel(b, 0, 6000, sr), 0.03);
+        qInfo("multiband: bass %.1f dB, treble %.2f dB", low, high);
+        QVERIFY(low < -12 && std::fabs(high) < 0.5);
+        // A band's gain lifts only that band.
+        const fx::BandSettings lift[3] = {{0, 1, 0}, {0, 1, 6}, {0, 1, 0}};
+        fx::MultibandCompressor up;
+        b = tones({{900, 0.1}, {8000, 0.1}});
+        up.process(b.data(), 2 * sr, sr, 200, 2500, lift, 10, 150, 0);
+        QVERIFY(std::fabs(db(toneLevel(b, 0, 900, sr), 0.1) - 6) < 0.4 && std::fabs(db(toneLevel(b, 0, 8000, sr), 0.1)) < 0.3);
     }
 
     void pitchShifting() {

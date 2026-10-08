@@ -169,6 +169,24 @@ private:
     double hz_ = -1, sr_ = 0;
 };
 
+// Three-band compressor: split at `lowHz` and `highHz` by Linkwitz-Riley
+// crossovers (the low band also goes through the upper crossover's all-pass,
+// so the bands add back up flat), each band compressed on its own with a soft
+// knee, then given its own gain.
+struct BandSettings {
+    double thresholdDb = 0, ratio = 1, gainDb = 0;
+};
+class MultibandCompressor {
+public:
+    void process(float* buf, int frames, double sr, double lowHz, double highHz, const BandSettings bands[3], double attackMs,
+                 double releaseMs, double outputDb);
+
+private:
+    Biquad lo1_[2], hi1_[2], lo2_[2], hi2_[2], apLo_[2], apHi_[2];
+    double sr_ = 0, lowHz_ = -1, highHz_ = -1;
+    double env_[3] = {0, 0, 0};
+};
+
 // mode: 0 stereo, 1 mono (the average), 2 left to both, 3 right to both, 4 swap.
 void channelTools(float* buf, int frames, int mode, bool invertLeft, bool invertRight);
 
