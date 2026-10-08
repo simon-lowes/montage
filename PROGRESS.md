@@ -281,4 +281,12 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
     - the classifier on synthetic embeddings: keywords, shares, runs, a range, a subclip, undecided samples and the "no people" label;
     - with the model: label embeddings are unit vectors, each nearest its own descriptions, and footage described as a close-up is tagged Close-up;
     - the app (keywords, undo) and the MCP tool.
+- [x] Auto Duck Music (Premiere's Auto Ducking, Resolve's ducking):
+  - Speech on the chosen dialogue tracks comes from transcripts' words where a clip's media is transcribed. Otherwise it is any 50 ms over a threshold (default -40 dBFS, after the clip's gain), with blips under 0.2 s dropped. The source-to-timeline mapping follows speed and time remapping, and muted tracks and disabled clips are skipped.
+  - Pauses shorter than the fades need (or than 1 s) stay ducked. The music dips by the chosen amount from its own level, with fades of 0.3 s down and 0.8 s up, written as volume keyframes. Redundant keys are dropped, and a clip no speech reaches keeps a flat level.
+  - Clip › Auto Duck Music… (dialogue tracks preselected; amount, fades, threshold, transcripts), as one undo step with cancellable analysis. MCP `montage_auto_duck`.
+  - Tested:
+    - synthetic speech with a short pause and a knock: spans within 60 ms, levels at each point, fades and idempotence;
+    - transcript words following the clip's position, muted tracks, and the MCP tool;
+    - the dialog's defaults and undo in the app.
 

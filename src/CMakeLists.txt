@@ -24,6 +24,7 @@ add_library(montage_engine STATIC
   media/Loudness.h media/Loudness.cpp
   media/AudioSync.h media/AudioSync.cpp
   media/SpeakerSwitch.h media/SpeakerSwitch.cpp
+  media/AutoDuck.h media/AutoDuck.cpp
   media/Tracking.h media/Tracking.cpp
   media/ModelFiles.h media/ModelFiles.cpp
   media/Segmenter.h media/Segmenter.cpp

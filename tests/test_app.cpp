@@ -26,6 +26,7 @@
 #include <cmath>
 #include <cstring>
 
+#include "AutoDuckDialog.h"
 #include "CaptionsPanel.h"
 #include "EditorState.h"
 #include "EffectsBrowser.h"
@@ -1135,6 +1136,42 @@ private slots:
         QVERIFY(state()->project().media.empty());
         state()->undo();
         QCOMPARE(state()->project().media.size(), size_t(2));
+        state()->newProject();
+    }
+
+    void autoDuckFromTheClipMenu() {
+        // JFK's speech on A1 and, as "music", the same file on A2.
+        state()->newProject();
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        QVERIFY(state()->apply("Dialogue", [media](Project& p, Sequence& s) { return edit::placeMedia(p, s, media, 0, 0, -1, V1, A1, false); }));
+        QVERIFY(state()->apply("Music", [media](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, media, 0, 0, -1, V1, {TrackKind::Audio, 1}, false);
+        }));
+        const Id music = trackAt(*state()->sequence(), {TrackKind::Audio, 1})->clips.front().id;
+        // The dialog takes the other tracks with sound as dialogue.
+        AutoDuckDialog dlg(state(), {music}, win_.get());
+        QCOMPARE(dlg.dialogueTracks(), std::vector<int>{0});
+        QCOMPARE(dlg.options().amountDb, -15.0);
+        dlg.findChild<QDoubleSpinBox*>("duckAmount")->setValue(-12);
+        QCOMPARE(dlg.options().amountDb, -12.0);
+        // Applying writes the music's volume keyframes as one undo step.
+        QCOMPARE(AutoDuckDialog::apply(state(), {music}, dlg.dialogueTracks(), dlg.options(), win_.get()), 1);
+        const Param& g = edit::clipById(*state()->sequence(), music)->audio.params.at("gain_db");
+        QVERIFY(g.animated());
+        double lowest = 0;
+        for (const Keyframe& k : g.keys) lowest = std::min(lowest, k.v);
+        QCOMPARE(lowest, -12.0);
+        QCOMPARE(state()->undoText(), QString("Auto Duck"));
+        state()->undo();
+        QVERIFY(!edit::clipById(*state()->sequence(), music)->audio.params.count("gain_db") ||
+                !edit::clipById(*state()->sequence(), music)->audio.params.at("gain_db").animated());
+        QCOMPARE(AutoDuckDialog::apply(state(), {music}, {}, dlg.options(), win_.get()), -1);  // no dialogue tracks
+        auto* action = win_->findChild<QAction*>("autoDuck");
+        QVERIFY(action);
+        state()->clearSelection();
+        action->trigger();  // nothing selected: a message, no dialog
         state()->newProject();
     }
 

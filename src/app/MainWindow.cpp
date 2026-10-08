@@ -44,6 +44,7 @@
 #include "EffectsBrowser.h"
 #include "ExportDialog.h"
 #include "InspectorWidget.h"
+#include "AutoDuckDialog.h"
 #include "MediaBinWidget.h"
 #include "MixerPanel.h"
 #include "MulticamPanel.h"
@@ -400,6 +401,18 @@ void MainWindow::buildMenus() {
     });
     add(clipM, tr("Detect &Scene Cuts"), QKeySequence(), [this] { detectScenes(); });
     add(clipM, tr("Normalize &Loudness…"), QKeySequence(), [this] { normalizeLoudness(); });
+    add(clipM, tr("Auto &Duck Music…"), QKeySequence(), withSeq([this] {
+            // The selected audio clips are the music.
+            std::vector<Id> music;
+            for (Id id : state_->selectedClips())
+                if (auto loc = edit::locate(*state_->sequence(), id); loc && loc->track.kind == TrackKind::Audio) music.push_back(id);
+            if (music.empty()) {
+                statusBar()->showMessage(tr("Select the music clips to duck"), 5000);
+                return;
+            }
+            AutoDuckDialog dlg(state_, music, this);
+            if (dlg.exec() == QDialog::Accepted) AutoDuckDialog::apply(state_, music, dlg.dialogueTracks(), dlg.options(), this);
+        }))->setObjectName(QStringLiteral("autoDuck"));
     add(clipM, tr("Auto &Colour"), QKeySequence("Ctrl+Alt+C"), [this] { autoColor(); });
     add(clipM, tr("S&ynchronize by Audio"), QKeySequence(), [this] { syncByAudio(); });
     clipM->addSeparator();

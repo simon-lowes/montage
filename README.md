@@ -78,6 +78,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 
 **Audio**
 - Clip gain and pan, both keyframeable
+- **Auto Duck Music** (Clip menu): select music clips, tick the dialogue tracks, and the music dips under speech, fading down before it and back up after it. Speech is found from transcripts' words, or from loudness. The result is volume keyframes you can adjust on the clip's line.
 - Track faders, pan, mute and solo in a mixer panel
 - Insert effects on audio tracks, buses (submixes) and the master, including plugins. Use a strip's FX button to edit them in the Inspector, route tracks to buses from the strip's output menu, and add buses with + Bus. Track effects keep running past the last clip, so reverb and echo tails ring out.
 - Plugin delay compensation: the latency plugins report is compensated on clips, tracks, buses and the master, so everything stays in sync with the picture and with other tracks, including straight after a seek.
@@ -256,6 +257,7 @@ Its tools work on `.montage` files by path. Each edit is saved at once, and the 
 - transcribe (with speaker labels) and find spoken phrases in the cut;
 - find shots by description;
 - log media (ratings, labels, keywords, metadata fields, bins), make subclips, auto-tag shots, and find media by text or smart-bin rules, optionally saving the rules as a smart bin;
+- duck music under dialogue;
 - return a rendered frame as an image so the agent can check its work;
 - render with any preset, with progress;
 - export and import EDL, OTIO, FCP 7 XML and FCPXML.

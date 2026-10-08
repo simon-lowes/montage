@@ -17,12 +17,13 @@
 
 #include "core/AutoTag.h"
 #include "core/EditOps.h"
-#include "core/MediaLog.h"
 #include "core/Effects.h"
 #include "core/History.h"
 #include "core/Interchange.h"
+#include "core/MediaLog.h"
 #include "core/ProjectIO.h"
 #include "core/TranscriptEdit.h"
+#include "media/AutoDuck.h"
 #include "media/Decoder.h"
 #include "media/Transcriber.h"
 #include "media/VisualSearch.h"
@@ -920,6 +921,53 @@ void McpServer::Impl::addTools() {
             }
             if (changed) save(l);
             return ok(text.isEmpty() ? QStringLiteral("No videos") : text, QJsonObject{{"media", list}});
+        });
+
+    add("montage_auto_duck", "Duck music under dialogue",
+        "Lower music under speech: wherever someone speaks on the dialogue tracks (transcript words where the media is "
+        "transcribed, else loudness), the music clips' volume dips by amount_db, fading down before and up after. Written as "
+        "volume keyframes on the music clips (existing volume keyframes on them are replaced).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "music_track":{"type":"string","description":"Audio track with the music, e.g. A2 (or give clips)"},
+            "clips":{"type":"array","items":{"type":"number"},"description":"Music clip ids"},
+            "dialogue_tracks":{"type":"array","items":{"type":"string"},"description":"Audio tracks with dialogue, e.g. [\"A1\"]"},
+            "amount_db":{"type":"number","default":-15},"fade_down":{"type":"number","default":0.3},
+            "fade_up":{"type":"number","default":0.8},"threshold_db":{"type":"number","default":-40}},
+            "required":["project","dialogue_tracks"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            std::vector<Id> music;
+            for (const QJsonValue& v : a.value("clips").toArray()) music.push_back(clipArg(l, QJsonObject{{"clip", v}}).id);
+            if (a.contains("music_track")) {
+                const TrackRef t = trackArg(str(a, "music_track"), s, false);
+                if (t.kind != TrackKind::Audio) throw ArgError{"\"music_track\" must be an audio track"};
+                for (const Clip& c : trackAt(s, t)->clips) music.push_back(c.id);
+            }
+            if (music.empty()) throw ArgError{"Give the music as \"music_track\" or \"clips\""};
+            std::vector<int> tracks;
+            for (const QJsonValue& v : a.value("dialogue_tracks").toArray()) {
+                const TrackRef t = trackArg(v.toString(), s, false);
+                if (t.kind != TrackKind::Audio) throw ArgError{"Dialogue tracks must be audio tracks"};
+                tracks.push_back(t.index);
+            }
+            if (tracks.empty()) throw ArgError{"\"dialogue_tracks\" is required"};
+            DuckOptions o;
+            if (a.value("amount_db").isDouble()) o.amountDb = std::clamp(a.value("amount_db").toDouble(), -60.0, 0.0);
+            if (a.value("fade_down").isDouble()) o.fadeDown = std::max(0.0, a.value("fade_down").toDouble());
+            if (a.value("fade_up").isDouble()) o.fadeUp = std::max(0.0, a.value("fade_up").toDouble());
+            if (a.value("threshold_db").isDouble()) o.thresholdDb = a.value("threshold_db").toDouble();
+            std::string err;
+            const Spans spans = dialogueSpans(l.project, s, tracks, o, &err);
+            if (!err.empty()) return fail(QString::fromStdString(err));
+            int changed = 0;
+            for (Id id : music)
+                if (Clip* c = edit::clipById(s, id)) changed += duckClip(*c, s, spans, o) ? 1 : 0;
+            if (changed) save(l);
+            QJsonArray list;
+            for (const auto& [from, to] : spans) list.append(QJsonObject{{"start_seconds", from}, {"end_seconds", to}});
+            return ok(QStringLiteral("Ducked %1 clip(s) under %2 stretch(es) of dialogue").arg(changed).arg(spans.size()),
+                      QJsonObject{{"dialogue", list}, {"clips_changed", changed}});
         });
 
     add("montage_render_frame", "Look at a frame",

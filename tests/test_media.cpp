@@ -24,6 +24,7 @@
 #include "audio/SpeechCleanup.h"
 #include "media/Analysis.h"
 #include "media/AudioSync.h"
+#include "media/AutoDuck.h"
 #include "media/Decoder.h"
 #include "media/HwAccel.h"
 #include "media/Loudness.h"
@@ -863,6 +864,94 @@ private slots:
         described.step = 1;
         for (int k = 0; k < 4; ++k) described.add(k, clip->text("an extreme close-up shot", &err));
         QCOMPARE(autoTags(described, labels).keywords.front(), std::string("Close-up"));
+    }
+
+    void autoDuckMusic() {
+        // Dialogue: speech at 2-4 s, then 6-6.5 and 6.8-7.3 s (one pause too short to come back up), and a 0.1 s knock at 10 s.
+        const std::string talk = path("duck-dialogue.wav"), music = path("duck-music.wav");
+        writeVoiceWav(talk, 12, 220, [](double t) { return (t >= 2 && t < 4) || (t >= 6 && t < 6.5) || (t >= 6.8 && t < 7.3) || (t >= 10 && t < 10.1); },
+                      [](double) { return false; });
+        writeWav(music, 48000, 12, 0.3f, 0.3f);
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = {25, 1};
+        MediaItem dm = probeOrFail(p, talk), mm = probeOrFail(p, music);
+        p.media.push_back(dm);
+        p.media.push_back(mm);
+        const TrackRef A1{TrackKind::Audio, 0}, A2{TrackKind::Audio, 1};
+        QVERIFY(edit::placeMedia(p, s, dm.id, 0, 0, -1, {TrackKind::Video, 0}, A1, false).ok);
+        QVERIFY(edit::placeMedia(p, s, mm.id, 0, 0, -1, {TrackKind::Video, 0}, A2, false).ok);
+        const Id musicClip = trackAt(s, A2)->clips.front().id;
+
+        DuckOptions o;
+        std::string err;
+        Spans spans = dialogueSpans(p, s, {0}, o, &err);
+        QVERIFY2(err.empty(), err.c_str());
+        QString shown;
+        for (const auto& [a, b] : spans) shown += QString("[%1, %2] ").arg(a).arg(b);
+        QCOMPARE(int(spans.size()), 2);
+        QVERIFY2(std::fabs(spans[0].first - 2) < 0.06 && std::fabs(spans[0].second - 4) < 0.06, qPrintable(shown));
+        QVERIFY2(std::fabs(spans[1].first - 6) < 0.06 && std::fabs(spans[1].second - 7.3) < 0.06, qPrintable(shown));
+
+        // The music dips from its own level, fading down before and up after.
+        Clip& mc = *edit::clipById(s, musicClip);
+        mc.audio.params["gain_db"] = Param(-3);
+        QVERIFY(duckClip(mc, s, spans, o));
+        const Param& g = mc.audio.params.at("gain_db");
+        auto at = [&](double sec) { return g.at(FrameTime(std::llround(sec * 25))); };
+        QVERIFY(std::fabs(at(1) + 3) < 1e-6);
+        QVERIFY(std::fabs(at(3) + 18) < 1e-6);
+        QVERIFY(std::fabs(at(5) + 3) < 1e-6);
+        QVERIFY(std::fabs(at(6.6) + 18) < 1e-6);  // the short pause stays down
+        QVERIFY(std::fabs(at(11) + 3) < 1e-6);   // the knock does not duck
+        QVERIFY2(std::fabs(at(4.4) + 10.5) < 1.0, qPrintable(QString::number(at(4.4))));  // halfway up
+        QVERIFY2(at(1.85) < -3 && at(1.85) > -18, qPrintable(QString::number(at(1.85))));  // on the way down
+        QVERIFY(!duckClip(mc, s, spans, o));  // the same again changes nothing
+        // Nothing to duck under: the keys go, the level stays.
+        QVERIFY(duckClip(mc, s, {}, o));
+        QVERIFY(!mc.audio.params.at("gain_db").animated());
+        QCOMPARE(mc.audio.params.at("gain_db").value, -3.0);
+
+        // A transcript's words mark speech instead, following where the clip sits and starts.
+        Transcript t;
+        t.segments.push_back({2, 4, "well then", {{2.0, 2.5, "well", 1, {}}, {3.5, 4.0, "then", 1, {}}}, -1});
+        p.findMedia(dm.id)->transcript = std::make_shared<const Transcript>(t);
+        Clip& dc = trackAt(s, A1)->clips.front();
+        dc.start = 25;  // one second later on the timeline
+        spans = dialogueSpans(p, s, {0}, o, &err);
+        QCOMPARE(int(spans.size()), 1);  // the 1 s gap is shorter than the fades need
+        QVERIFY(std::fabs(spans[0].first - 3) < 1e-6 && std::fabs(spans[0].second - 5) < 1e-6);
+        o.useTranscripts = false;
+        QVERIFY(dialogueSpans(p, s, {0}, o, &err).size() >= 2);  // loudness again
+        o.useTranscripts = true;
+        QVERIFY(dialogueSpans(p, s, {1}, o, &err).size() == 1);  // the music track is loud throughout
+        trackAt(s, A1)->muted = true;
+        QVERIFY(dialogueSpans(p, s, {0}, o, &err).empty());
+        trackAt(s, A1)->muted = false;
+
+        // The MCP tool.
+        const QString project = QString::fromStdString(path("duck.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_auto_duck"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call(QJsonObject{{"project", project}, {"music_track", "A2"}, {"dialogue_tracks", QJsonArray{"A1"}}, {"amount_db", -20}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("clips_changed").toInt(), 1);
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Param& bg = edit::clipById(*back.active(), musicClip)->audio.params.at("gain_db");
+        QVERIFY(std::fabs(bg.at(4 * 25) + 23) < 1e-6);  // -3 dB, down 20
+        r = call(QJsonObject{{"project", project}, {"music_track", "V1"}, {"dialogue_tracks", QJsonArray{"A1"}}});
+        QVERIFY(r.value("isError").toBool());
+        r = call(QJsonObject{{"project", project}, {"music_track", "A2"}});
+        QVERIFY(r.value("isError").toBool());
     }
 
     void mcpServerEditsProjects() {
