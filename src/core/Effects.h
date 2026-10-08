@@ -88,8 +88,9 @@ std::string pluginParamMeta(const ParamInfo& p);
 
 // The mask every video filter can have (params "mask.*", absent = no mask):
 // an ellipse or rectangle in the clip's source frame (centre and size as
-// fractions of the frame, feather and expansion in sequence pixels), the
-// people in the picture (shape 4, media/Matting.h), an HSL
+// fractions of the frame, feather and expansion in sequence pixels), a drawn
+// Bézier path in that box (shape 5, core/MaskPath.h), a gradient across it
+// (shape 6), the people in the picture (shape 4, media/Matting.h), an HSL
 // qualifier that selects colours, and/or a depth qualifier that selects a
 // range of distances. The filter is applied through it.
 const EffectInfo& maskInfo();

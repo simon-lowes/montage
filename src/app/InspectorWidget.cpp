@@ -35,9 +35,11 @@
 #include "Theme.h"
 #include "audio/PluginEffect.h"
 #include "core/EditOps.h"
+#include "core/MaskPath.h"
 #include "ColorWheel.h"
 #include "CurveEditor.h"
 #include "render/ClipAnalysis.h"
+#include "render/Compositor.h"
 #include "render/Ocio.h"
 
 namespace montage {
@@ -122,9 +124,11 @@ QString InspectorWidget::signature() const {
         return sig;
     }
     QString sig = QString("C%1:%2").arg(c->id).arg(QString::fromStdString(c->generator.type));
-    // Object masks have their own controls: rebuild when one is chosen.
-    for (const auto& e : c->effects)
-        sig += QString(":%1%2%3").arg(e.id).arg(e.enabled ? "+" : "-").arg(std::lround(e.p("mask.shape", 0)) == 3 ? "o" : "");
+    // Object and Bézier masks have their own controls: rebuild when one is chosen.
+    for (const auto& e : c->effects) {
+        const long shape = std::lround(e.p("mask.shape", 0));
+        sig += QString(":%1%2%3").arg(e.id).arg(e.enabled ? "+" : "-").arg(shape == 3 ? "o" : shape == 5 ? "p" : "");
+    }
     return sig;
 }
 
@@ -596,6 +600,81 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
                     });
                 });
                 mf->addRow(tr("People:"), get);
+            }
+            if (onClip && std::lround(e.p("mask.shape", localTime())) == 5) {
+                // A path drawn in the viewer, and animated as a whole.
+                auto* status = new QLabel(content_);
+                status->setObjectName(QStringLiteral("maskPathStatus"));
+                status->setWordWrap(true);
+                auto current = [this, owner, eid]() -> const Effect* {
+                    const Sequence* sq = state_->sequence();
+                    return sq ? edit::ownedEffect(const_cast<Sequence&>(*sq), owner, eid) : nullptr;
+                };
+                auto row = new QWidget(content_);
+                auto* rh = new QHBoxLayout(row);
+                rh->setContentsMargins(0, 0, 0, 0);
+                auto* close = new QToolButton(row);
+                close->setText(tr("Close Path"));
+                close->setObjectName(QStringLiteral("closeMaskPath"));
+                close->setToolTip(tr("Finish drawing: join the last point to the first"));
+                auto* redraw = new QToolButton(row);
+                redraw->setText(tr("Redraw"));
+                redraw->setObjectName(QStringLiteral("redrawMaskPath"));
+                redraw->setToolTip(tr("Remove the path's points and draw it again"));
+                auto* animate = new QCheckBox(tr("Animate Path"), row);
+                animate->setObjectName(QStringLiteral("animateMaskPath"));
+                animate->setToolTip(tr("Key the whole path at the playhead: moving a point on another frame keys it there too"));
+                rh->addWidget(close);
+                rh->addWidget(redraw);
+                rh->addWidget(animate);
+                rh->addStretch(1);
+                auto refresh = [this, status, close, animate, current, localTime] {
+                    const Effect* ef = current();
+                    if (!ef) return;
+                    const int n = maskPathCount(*ef);
+                    const bool open = n < 3 || ef->p("mask.open", localTime()) > 0.5;
+                    status->setText(open ? tr("Click in the viewer to place points, dragging to curve them. Click the first point to close the path.")
+                                         : tr("%1 points. Drag points and handles; click the outline to add a point; Alt-click a point: corner or smooth; Ctrl-click: remove it.")
+                                               .arg(n));
+                    close->setEnabled(open && n >= 3);
+                    QSignalBlocker b(animate);
+                    animate->setChecked(maskPathAnimated(*ef));
+                    animate->setEnabled(n > 0);
+                };
+                refresh();
+                refreshers_.push_back(refresh);
+                mf->addRow(QString(), status);
+                mf->addRow(tr("Path:"), row);
+                auto editPath = [this, owner, eid](const QString& label, std::function<bool(Effect&, FrameTime, double, double)> fn) {
+                    const Sequence* sq = state_->sequence();
+                    const Clip* cl = sq ? edit::clipById(*sq, owner) : nullptr;
+                    double mw = 1, mh = 1;
+                    if (!cl || !clipFrameSize(state_->project(), *sq, *cl, mw, mh)) return;
+                    const FrameTime lt = state_->playhead() - cl->start;
+                    state_->edit(label, [owner, eid, lt, mw, mh, fn](Project&, Sequence& s) {
+                        Effect* ef = edit::ownedEffect(s, owner, eid);
+                        return ef && fn(*ef, lt, mw, mh);
+                    });
+                };
+                connect(close, &QToolButton::clicked, this, [editPath] {
+                    editPath(tr("Close Mask Path"), [](Effect& ef, FrameTime lt, double mw, double mh) { return closeMaskPath(ef, lt, mw, mh); });
+                });
+                connect(redraw, &QToolButton::clicked, this, [editPath] {
+                    editPath(tr("Redraw Mask Path"), [](Effect& ef, FrameTime lt, double, double) {
+                        if (maskPathCount(ef) == 0) return false;
+                        setMaskPathAnimated(ef, lt, false);
+                        setMaskPath(ef, lt, {});
+                        ef.params["mask.open"] = Param(1);
+                        return true;
+                    });
+                });
+                connect(animate, &QCheckBox::toggled, this, [editPath](bool on) {
+                    editPath(on ? tr("Animate Mask Path") : tr("Stop Animating Mask Path"), [on](Effect& ef, FrameTime lt, double, double) {
+                        if (maskPathCount(ef) == 0 || maskPathAnimated(ef) == on) return false;
+                        setMaskPathAnimated(ef, lt, on);
+                        return true;
+                    });
+                });
             }
             if (onClip && std::lround(e.p("mask.shape", localTime())) == 3) {
                 // An object picked in the viewer, then followed through the clip.

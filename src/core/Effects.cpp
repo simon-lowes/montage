@@ -684,7 +684,7 @@ std::vector<EffectInfo> buildCatalog() {
 const EffectInfo& maskInfo() {
     static const EffectInfo info = [] {
         EffectInfo m{"mask", "Mask", EffectCategory::Fixed, "Mask", {}, {}, true};
-        m.params = {choice("mask.shape", "Shape", {"None", "Ellipse", "Rectangle", "Object", "People"}, 0),
+        m.params = {choice("mask.shape", "Shape", {"None", "Ellipse", "Rectangle", "Object", "People", "Bézier", "Gradient"}, 0),
                     num("mask.x", "Center X", -0.5, 1.5, 0.5, 0.001),
                     num("mask.y", "Center Y", -0.5, 1.5, 0.5, 0.001),
                     num("mask.w", "Width", 0.001, 2, 0.4, 0.001),

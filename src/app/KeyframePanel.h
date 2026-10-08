@@ -91,6 +91,8 @@ private:
     double xForFrame(FrameTime t) const;
     FrameTime frameAtX(int x) const;
     bool keyAt(const QPoint& pos, Key& key) const;
+    // The keys with those a Mask Path row stands for (every coordinate of the path).
+    std::set<Key> linked(const std::set<Key>& keys) const;
     FrameTime clampShift(FrameTime delta) const;
     double xForFrameD(double t) const;
     double frameAtXD(double x) const;  // unclamped, in fractions of a frame

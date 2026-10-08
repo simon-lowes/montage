@@ -4,6 +4,7 @@
 #include "Ocio.h"
 #include "VideoFx.h"
 #include "core/Effects.h"
+#include "core/MaskPath.h"
 #include "media/DepthMap.h"
 #include "media/Matting.h"
 #include "media/Inpaint.h"
@@ -640,29 +641,12 @@ std::vector<float> distanceTransform(const std::vector<uint8_t>& seed, int w, in
     return out;
 }
 
-std::vector<float> objectMatte(const std::vector<float>& logits, int W, int H, double feather, double expand) {
-    std::vector<float> matte(size_t(W) * size_t(H), 0.f);
-    constexpr int G = kObjectGrid;
-    if (logits.size() != size_t(G) * G || W <= 0 || H <= 0) return matte;
-    // The logits resampled to the image (bilinear, pixel centres aligned as the model's upsampling is).
-    std::vector<float> L(size_t(W) * size_t(H));
-    parallelRows(H, [&](int y0, int y1) {
-        for (int y = y0; y < y1; ++y) {
-            const double gy = std::clamp((y + 0.5) * G / H - 0.5, 0.0, G - 1.0);
-            const int ya = int(gy), yb = std::min(ya + 1, G - 1);
-            const float fy = float(gy - ya);
-            for (int x = 0; x < W; ++x) {
-                const double gx = std::clamp((x + 0.5) * G / W - 0.5, 0.0, G - 1.0);
-                const int xa = int(gx), xb = std::min(xa + 1, G - 1);
-                const float fx = float(gx - xa);
-                const float a = logits[size_t(ya) * G + size_t(xa)] + (logits[size_t(ya) * G + size_t(xb)] - logits[size_t(ya) * G + size_t(xa)]) * fx;
-                const float b = logits[size_t(yb) * G + size_t(xa)] + (logits[size_t(yb) * G + size_t(xb)] - logits[size_t(yb) * G + size_t(xa)]) * fx;
-                L[size_t(y) * size_t(W) + size_t(x)] = a + (b - a) * fy;
-            }
-        }
-    });
+// A matte from a field that is positive inside and crosses zero at the edge,
+// feathered and expanded by signed distance to that edge.
+std::vector<float> fieldMatte(const std::vector<float>& L, int W, int H, double feather, double expand) {
+    std::vector<float> matte(L.size(), 0.f);
     // Signed distance to the edge (negative inside). Next to the edge it comes
-    // from the logit field's zero crossing (sub-pixel, so the edge is smooth);
+    // from the field's zero crossing (sub-pixel, so the edge is smooth);
     // further away from an exact distance transform, needed only when the edge
     // is expanded, contracted or feathered beyond a couple of pixels.
     const bool far = std::fabs(expand) > 0.25 || feather > 2.5;
@@ -693,6 +677,30 @@ std::vector<float> objectMatte(const std::vector<float>& logits, int W, int H, d
             }
     });
     return matte;
+}
+
+std::vector<float> objectMatte(const std::vector<float>& logits, int W, int H, double feather, double expand) {
+    std::vector<float> matte(size_t(W) * size_t(H), 0.f);
+    constexpr int G = kObjectGrid;
+    if (logits.size() != size_t(G) * G || W <= 0 || H <= 0) return matte;
+    // The logits resampled to the image (bilinear, pixel centres aligned as the model's upsampling is).
+    std::vector<float> L(size_t(W) * size_t(H));
+    parallelRows(H, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y) {
+            const double gy = std::clamp((y + 0.5) * G / H - 0.5, 0.0, G - 1.0);
+            const int ya = int(gy), yb = std::min(ya + 1, G - 1);
+            const float fy = float(gy - ya);
+            for (int x = 0; x < W; ++x) {
+                const double gx = std::clamp((x + 0.5) * G / W - 0.5, 0.0, G - 1.0);
+                const int xa = int(gx), xb = std::min(xa + 1, G - 1);
+                const float fx = float(gx - xa);
+                const float a = logits[size_t(ya) * G + size_t(xa)] + (logits[size_t(ya) * G + size_t(xb)] - logits[size_t(ya) * G + size_t(xa)]) * fx;
+                const float b = logits[size_t(yb) * G + size_t(xa)] + (logits[size_t(yb) * G + size_t(xb)] - logits[size_t(yb) * G + size_t(xa)]) * fx;
+                L[size_t(y) * size_t(W) + size_t(x)] = a + (b - a) * fy;
+            }
+        }
+    });
+    return fieldMatte(L, W, H, feather, expand);
 }
 
 namespace {
@@ -736,6 +744,55 @@ void refineMatte(std::vector<float>& matte, int W, int H, double expand, double 
     for (size_t i = 0; i < matte.size(); ++i) matte[i] = m.px[i * 4];
 }
 
+// How much of each pixel a polygon (pixel coordinates, non-zero winding)
+// covers: four scanlines a row, each span's ends to a fraction of a pixel.
+std::vector<float> polygonCoverage(const std::vector<std::pair<double, double>>& poly, int W, int H) {
+    std::vector<float> cov(size_t(W) * size_t(H), 0.f);
+    const size_t n = poly.size();
+    if (n < 3 || W <= 0 || H <= 0) return cov;
+    constexpr int kSub = 4;
+    parallelRows(H, [&](int y0, int y1) {
+        std::vector<std::pair<double, int>> xs;
+        for (int y = y0; y < y1; ++y) {
+            float* out = &cov[size_t(y) * size_t(W)];
+            for (int s = 0; s < kSub; ++s) {
+                const double sy = y + (s + 0.5) / kSub;
+                xs.clear();
+                for (size_t i = 0; i < n; ++i) {
+                    const auto& [ax, ay] = poly[i];
+                    const auto& [bx, by] = poly[(i + 1) % n];
+                    if ((ay <= sy) == (by <= sy)) continue;
+                    xs.emplace_back(ax + (sy - ay) * (bx - ax) / (by - ay), by > ay ? 1 : -1);
+                }
+                std::sort(xs.begin(), xs.end());
+                int winding = 0;
+                double start = 0;
+                for (const auto& [x, dir] : xs) {
+                    const int before = winding;
+                    winding += dir;
+                    if (before == 0 && winding != 0) {
+                        start = x;
+                    } else if (before != 0 && winding == 0) {
+                        const double a = std::clamp(start, 0.0, double(W)), b = std::clamp(x, 0.0, double(W));
+                        if (b <= a) continue;
+                        const int ia = int(a), ib = int(b);
+                        constexpr float w = 1.0f / kSub;
+                        if (ia == ib) {
+                            out[std::min(ia, W - 1)] += float(b - a) * w;
+                            continue;
+                        }
+                        out[ia] += float(ia + 1 - a) * w;
+                        for (int i = ia + 1; i < ib; ++i) out[i] += w;
+                        if (ib < W) out[ib] += float(b - ib) * w;
+                    }
+                }
+            }
+            for (int x = 0; x < W; ++x) out[x] = std::min(out[x], 1.0f);
+        }
+    });
+    return cov;
+}
+
 std::vector<float> effectMatte(const Effect& e, FrameTime t, const Image& img, double pixelScale, double sourceSeconds) {
     std::vector<float> matte;
     if (img.empty() || !hasMask(e, t)) return matte;
@@ -760,6 +817,42 @@ std::vector<float> effectMatte(const Effect& e, FrameTime t, const Image& img, d
         } else {
             std::fill(matte.begin(), matte.end(), 0.f);
         }
+    }
+    if (shape == 5) {
+        // A drawn path, in the mask's box: nothing until it has three points.
+        const std::vector<PathPoint> pts = maskPath(e, t);
+        std::fill(matte.begin(), matte.end(), 0.f);
+        if (pts.size() >= 3) {
+            const MaskBox box = maskBox(e, t);
+            std::vector<std::pair<double, double>> poly = flattenMaskPath(pts, true, 24);
+            for (auto& [x, y] : poly) {
+                double u = 0, v = 0;
+                boxToFrame(box, W, H, x, y, u, v);
+                x = u * W;
+                y = v * H;
+            }
+            std::vector<float> field = polygonCoverage(poly, W, H);
+            for (float& f : field) f -= 0.5f;
+            matte = fieldMatte(field, W, H, e.p("mask.feather", t, 20) * pixelScale, e.p("mask.expansion", t) * pixelScale);
+        }
+    }
+    if (shape == 6) {
+        // A gradient across the box: all of the effect above its top edge, none
+        // below its bottom edge (in its rotated axes), widened by the feather.
+        const double cy = e.p("mask.y", t, 0.5) * H, cx = e.p("mask.x", t, 0.5) * W;
+        const double b = std::max(0.5, e.p("mask.h", t, 0.4) * H / 2);
+        const double rot = e.p("mask.rotation", t) * M_PI / 180.0, cr = std::cos(rot), sr = std::sin(rot);
+        const double span = 2 * b + std::max(0.0, e.p("mask.feather", t, 20) * pixelScale);
+        const double expand = e.p("mask.expansion", t) * pixelScale;
+        parallelRows(H, [&](int y0, int y1) {
+            for (int y = y0; y < y1; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const double px = x + 0.5 - cx, py = y + 0.5 - cy;
+                    const double v = -px * sr + py * cr - expand;
+                    const double k = std::clamp(0.5 - v / span, 0.0, 1.0);
+                    matte[size_t(y) * size_t(W) + size_t(x)] = float(k * k * (3 - 2 * k));
+                }
+        });
     }
     if (shape == 1 || shape == 2) {
         // Image pixels, centred on the mask and rotated into its axes.

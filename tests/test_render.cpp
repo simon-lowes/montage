@@ -11,6 +11,7 @@
 #include "core/Captions.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
+#include "core/MaskPath.h"
 #include "render/ColorSpace.h"
 #include "render/Compositor.h"
 #include "render/Exporter.h"
@@ -688,6 +689,64 @@ colorspaces:
         outer.colorSpace = "rec2100hlg";
         rgb(renderProgramFrame(p, outer, 5, o), 32, 18, c);
         QVERIFY2(near(c[0], 0.75f, 0.005f), qPrintable(QString::number(c[0])));
+    }
+
+    void drawnAndGradientMasks() {
+        // Coverage is exact across a pixel: a 10.5 x 10 rectangle with its sides a quarter into pixels.
+        const std::vector<float> cov = polygonCoverage({{10.25, 10}, {20.75, 10}, {20.75, 20}, {10.25, 20}}, 32, 32);
+        double total = 0;
+        for (float v : cov) total += v;
+        QVERIFY(std::fabs(total - 105) < 1e-3);
+        QVERIFY(std::fabs(cov[15 * 32 + 10] - 0.75f) < 1e-5 && std::fabs(cov[15 * 32 + 20] - 0.75f) < 1e-5);
+        QCOMPARE(cov[15 * 32 + 15], 1.0f);
+
+        // A triangle drawn on a 100 x 50 frame: (10, 5.5) (90, 5.5) (50, 45.5), so 1600 px.
+        Image img = solid(100, 50, 0.2f, 0.2f, 0.2f);
+        Effect e = makeEffect("invert", 1);
+        setMaskPathFromFrame(e, {{0.1, 0.11}, {0.9, 0.11}, {0.5, 0.91}}, 100, 50, false);
+        e.params["mask.feather"] = 0.0;
+        std::vector<float> m = effectMatte(e, 0, img, 1.0);
+        double area = 0;
+        for (float v : m) area += v;
+        QVERIFY2(std::fabs(area - 1600) < 20, qPrintable(QString::number(area)));
+        QCOMPARE(m[20 * 100 + 50], 1.0f);
+        QCOMPARE(m[40 * 100 + 20], 0.0f);
+        QCOMPARE(m[2 * 100 + 50], 0.0f);
+        QVERIFY2(std::fabs(m[5 * 100 + 50] - 0.5f) < 0.05f, qPrintable(QString::number(m[5 * 100 + 50])));  // the edge halves row 5
+        QCOMPARE(m[8 * 100 + 15], 1.0f);
+        Image fx = img;
+        applyVideoEffect(e, 0, fx, 1.0);
+        QVERIFY(std::fabs(fx.at(50, 20)[0] - 0.8f) < 0.01f);
+        QVERIFY(std::fabs(fx.at(5, 40)[0] - 0.2f) < 0.01f);
+        // Feathered, it fades out past the edge.
+        e.params["mask.feather"] = 10.0;
+        m = effectMatte(e, 0, img, 1.0);
+        QCOMPARE(m[25 * 100 + 50], 1.0f);
+        QVERIFY2(m[2 * 100 + 50] > 0.02f && m[2 * 100 + 50] < 0.5f, qPrintable(QString::number(m[2 * 100 + 50])));
+        // The box carries the path: turned half round, the triangle points up.
+        e.params["mask.feather"] = 0.0;
+        e.params["mask.rotation"] = 180.0;
+        m = effectMatte(e, 0, img, 1.0);
+        QCOMPARE(m[8 * 100 + 15], 0.0f);
+        QCOMPARE(m[42 * 100 + 15], 1.0f);
+        // Fewer than three points select nothing.
+        setMaskPath(e, 0, {{0, 0}, {0.5, 0.5}});
+        m = effectMatte(e, 0, img, 1.0);
+        QCOMPARE(*std::max_element(m.begin(), m.end()), 0.0f);
+
+        // A gradient: all above the box, none below, half way in its middle; turned, it runs across.
+        Effect g = makeEffect("invert", 1);
+        g.params["mask.shape"] = 6.0;
+        g.params["mask.feather"] = 0.0;
+        m = effectMatte(g, 0, img, 1.0);
+        QCOMPARE(m[5 * 100 + 50], 1.0f);
+        QCOMPARE(m[45 * 100 + 50], 0.0f);
+        QVERIFY2(std::fabs(m[25 * 100 + 50] - 0.5f) < 0.06f, qPrintable(QString::number(m[25 * 100 + 50])));
+        for (int y = 1; y < 50; ++y) QVERIFY(m[size_t(y) * 100 + 50] <= m[size_t(y - 1) * 100 + 50]);
+        g.params["mask.rotation"] = 90.0;
+        m = effectMatte(g, 0, img, 1.0);
+        QCOMPARE(m[25 * 100 + 95], 1.0f);
+        QCOMPARE(m[25 * 100 + 5], 0.0f);
     }
 
     void effectMasks() {

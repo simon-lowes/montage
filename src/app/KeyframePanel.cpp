@@ -16,10 +16,14 @@
 #include "core/EditOps.h"
 #include "core/Effects.h"
 #include "core/History.h"
+#include "core/MaskPath.h"
 
 namespace montage {
 
 namespace {
+// A drawn mask's path is keyed as a whole, shown as one row: its first coordinate.
+bool isPathRow(const ParamAddress& a) { return a.slot == ParamSlot::Effect && a.param == kMaskPathParam; }
+
 std::vector<int> graphRowsAll(size_t n) {
     std::vector<int> all(n);
     for (size_t i = 0; i < n; ++i) all[i] = int(i);
@@ -97,11 +101,12 @@ void KeyframePanel::rebuild() {
             if (!effect || effect->empty()) continue;
             const EffectInfo* info = findEffectInfo(effect->type);
             for (const auto& [name, param] : effect->params) {
-                if (!param.animated()) continue;
+                if (!param.animated() || (isMaskPathParam(name) && name != kMaskPathParam)) continue;
                 QString label = QString::fromStdString(name);
                 if (info)
                     for (const ParamInfo& pi : info->params)
                         if (pi.name == name) label = QString::fromStdString(pi.label);
+                if (name == kMaskPathParam) label = tr("Mask Path");
                 ParamAddress a = addr;
                 a.param = name;
                 rows_.push_back({QString::fromStdString(info ? info->displayName : effect->type) + QStringLiteral(" · ") + label, a});
@@ -180,11 +185,27 @@ void KeyframePanel::select(const std::set<Key>& keys) {
     update();
 }
 
+std::set<KeyframePanel::Key> KeyframePanel::linked(const std::set<Key>& keys) const {
+    std::set<Key> out = keys;
+    const Clip* c = currentClip();
+    if (!c) return out;
+    for (const Key& k : keys) {
+        if (!isPathRow(k.address)) continue;
+        if (const Effect* e = paramOwner(*c, k.address))
+            for (const std::string& name : maskPathParams(*e)) {
+                ParamAddress a = k.address;
+                a.param = name;
+                out.insert({a, k.t});
+            }
+    }
+    return out;
+}
+
 FrameTime KeyframePanel::clampShift(FrameTime delta) const {
     const Clip* c = currentClip();
     if (!c) return 0;
     std::map<ParamAddress, std::vector<FrameTime>> byParam;
-    for (const Key& k : selection_) byParam[k.address].push_back(k.t);
+    for (const Key& k : linked(selection_)) byParam[k.address].push_back(k.t);
     for (const auto& [addr, times] : byParam)
         if (const Param* p = findParam(*c, addr)) {
             const auto [down, up] = shiftRange(*p, times, c->duration - 1);
@@ -197,7 +218,7 @@ bool KeyframePanel::shiftSelected(FrameTime delta) {
     delta = clampShift(delta);
     if (delta == 0 || selection_.empty()) return false;
     std::map<ParamAddress, std::vector<FrameTime>> byParam;
-    for (const Key& k : selection_) byParam[k.address].push_back(k.t);
+    for (const Key& k : linked(selection_)) byParam[k.address].push_back(k.t);
     const Id id = clip_;
     // The selection moves first: the edit rebuilds the rows and keeps only keys that exist.
     const std::set<Key> before = selection_;
@@ -217,7 +238,7 @@ bool KeyframePanel::shiftSelected(FrameTime delta) {
 
 bool KeyframePanel::deleteSelected() {
     if (selection_.empty()) return false;
-    const auto keys = selection_;
+    const auto keys = linked(selection_);
     const Id id = clip_;
     const bool ok = state_->edit(tr("Delete Keyframes"), [id, keys](Project&, Sequence& s) {
         Clip* c = edit::clipById(s, id);
@@ -233,7 +254,7 @@ bool KeyframePanel::deleteSelected() {
 
 bool KeyframePanel::setInterpolation(Interp interp) {
     if (selection_.empty()) return false;
-    const auto keys = selection_;
+    const auto keys = linked(selection_);
     const Id id = clip_;
     return state_->edit(tr("Keyframe Interpolation"), [id, keys, interp](Project&, Sequence& s) {
         Clip* c = edit::clipById(s, id);
@@ -252,7 +273,7 @@ bool KeyframePanel::setInterpolation(Interp interp) {
 
 bool KeyframePanel::easeSelected(bool in, bool out) {
     if (selection_.empty()) return false;
-    const auto keys = selection_;
+    const auto keys = linked(selection_);
     const Id id = clip_;
     return state_->edit(in && out ? tr("Easy Ease") : in ? tr("Ease In") : tr("Ease Out"), [id, keys, in, out](Project&, Sequence& s) {
         Clip* c = edit::clipById(s, id);
@@ -267,9 +288,14 @@ bool KeyframePanel::easeSelected(bool in, bool out) {
 // ---- The value graph ----------------------------------------------------------
 
 std::vector<int> KeyframePanel::graphRows() const {
-    if (graphRow_ >= 0 && graphRow_ < int(rows_.size())) return {graphRow_};
-    std::vector<int> all(rows_.size());
-    for (int i = 0; i < int(all.size()); ++i) all[size_t(i)] = i;
+    // A mask path has no one value to plot.
+    std::vector<int> all;
+    if (graphRow_ >= 0 && graphRow_ < int(rows_.size())) {
+        if (!isPathRow(rows_[size_t(graphRow_)].address)) all.push_back(graphRow_);
+        return all;
+    }
+    for (int i = 0; i < int(rows_.size()); ++i)
+        if (!isPathRow(rows_[size_t(i)].address)) all.push_back(i);
     return all;
 }
 
@@ -597,7 +623,7 @@ void KeyframePanel::mouseMoveEvent(QMouseEvent* e) {
             FrameTime delta = raw;
             if (oc) {
                 std::map<ParamAddress, std::vector<FrameTime>> byParam;
-                for (const Key& k : base) byParam[k.address].push_back(k.t);
+                for (const Key& k : linked(base)) byParam[k.address].push_back(k.t);
                 for (const auto& [addr, times] : byParam)
                     if (const Param* p = findParam(*oc, addr)) {
                         const auto [down, up] = shiftRange(*p, times, oc->duration - 1);
@@ -713,6 +739,13 @@ void KeyframePanel::mouseDoubleClickEvent(QMouseEvent* e) {
     const Id id = clip_;
     if (state_->edit(tr("Add Keyframe"), [id, addr, t](Project&, Sequence& s) {
             Clip* cc = edit::clipById(s, id);
+            if (isPathRow(addr)) {
+                // The whole path, as it is there.
+                Effect* e = cc ? paramOwner(*cc, addr) : nullptr;
+                if (!e || e->params[kMaskPathParam].keyAt(t)) return false;
+                setMaskPathAnimated(*e, t, true);
+                return true;
+            }
             Param* p = cc ? findParam(*cc, addr) : nullptr;
             if (!p || p->keyAt(t)) return false;
             p->addKey(t, p->at(t));
@@ -765,7 +798,7 @@ void KeyframePanel::contextMenuEvent(QContextMenuEvent* e) {
 bool KeyframePanel::setRepeat(Repeat repeat) {
     if (selection_.empty() || !clip_) return false;
     std::set<ParamAddress> params;
-    for (const Key& k : selection_) params.insert(k.address);
+    for (const Key& k : linked(selection_)) params.insert(k.address);
     const Id id = clip_;
     return state_->edit(tr("Keyframe Repeat"), [id, params, repeat](Project&, Sequence& s) {
         Clip* c = edit::clipById(s, id);
@@ -793,7 +826,7 @@ bool KeyframePanel::copySelected() {
     const Clip* c = currentClip();
     if (!c || selection_.empty()) return false;
     std::vector<std::pair<ParamAddress, FrameTime>> keys;
-    for (const Key& k : selection_) keys.push_back({k.address, k.t});
+    for (const Key& k : linked(selection_)) keys.push_back({k.address, k.t});
     CopiedKeys copied = copyKeys(*c, keys);
     if (copied.empty()) return false;
     size_t n = 0;

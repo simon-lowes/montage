@@ -19,6 +19,7 @@
 #include "core/Interchange.h"
 #include "core/MarkerList.h"
 #include "core/KeyframeEdit.h"
+#include "core/MaskPath.h"
 #include "core/MediaLog.h"
 #include "core/Multicam.h"
 #include "core/TimelineCompare.h"
@@ -2976,6 +2977,125 @@ private slots:
         QCOMPARE(lost.size(), size_t(1));
         QVERIFY(lost[0].kind == ChangeKind::Removed && lost[0].before == c2);
         QCOMPARE(std::string(changeKindName(ChangeKind::Trimmed)), std::string("Trimmed"));
+    }
+
+    void maskPathModel() {
+        auto near = [](double a, double b, double tol = 1e-9) { return std::fabs(a - b) <= tol; };
+        QVERIFY(isMaskPathParam("mask.p0.x") && isMaskPathParam("mask.p12.oy"));
+        QVERIFY(!isMaskPathParam("mask.x") && !isMaskPathParam("mask.p.x") && !isMaskPathParam("mask.p0.z") && !isMaskPathParam("mask.p0"));
+        // A square, then a triangle: the fourth point's parameters go.
+        Effect e;
+        e.type = "invert";
+        const std::vector<PathPoint> sq = {{-0.5, -0.5}, {0.5, -0.5}, {0.5, 0.5}, {-0.5, 0.5}};
+        setMaskPath(e, 0, sq);
+        QCOMPARE(maskPathCount(e), 4);
+        QVERIFY(maskPath(e, 0) == sq);
+        setMaskPath(e, 0, {sq[0], sq[1], sq[2]});
+        QCOMPARE(maskPathCount(e), 3);
+        QVERIFY(!e.params.count("mask.p3.x"));
+        QCOMPARE(maskPathParams(e).size(), size_t(18));
+
+        // Animated as a whole: every coordinate keyed together, a change on another frame keys it there.
+        setMaskPath(e, 0, sq);
+        setMaskPathAnimated(e, 0, true);
+        QVERIFY(maskPathAnimated(e));
+        for (const std::string& n : maskPathParams(e)) QVERIFY(e.params[n].keyAt(0));
+        std::vector<PathPoint> moved = sq;
+        for (PathPoint& pt : moved) pt.x += 0.2;
+        setMaskPath(e, 20, moved);
+        QCOMPARE(maskPathKeyTimes(e), (std::vector<FrameTime>{0, 20}));
+        QVERIFY(near(maskPath(e, 10)[1].x, 0.6));
+        // A point added on the straight top edge: a corner on it at every key.
+        QCOMPARE(insertMaskPoint(e, 10, 0, 0.5), 1);
+        QCOMPARE(maskPathCount(e), 5);
+        QCOMPARE(maskPathKeyTimes(e), (std::vector<FrameTime>{0, 20}));
+        const auto at0 = maskPath(e, 0);
+        QVERIFY(near(at0[1].y, -0.5) && at0[1].x > -0.5 && at0[1].x < 0.5 && !at0[1].smooth());
+        QVERIFY(near(maskPath(e, 20)[1].x, at0[1].x + 0.2));
+        QVERIFY(removeMaskPoint(e, 0, 1));
+        QVERIFY(maskPath(e, 0) == sq);
+        QVERIFY(maskPath(e, 20) == moved);
+        // Stopping keeps the path as it is at the playhead.
+        setMaskPathAnimated(e, 10, false);
+        QVERIFY(!maskPathAnimated(e));
+        QVERIFY(maskPathKeyTimes(e).empty());
+        QVERIFY(near(maskPath(e, 0)[0].x, -0.4));
+
+        // Smooth points; a point added on a curve keeps its shape (de Casteljau).
+        Effect c;
+        setMaskPath(c, 0, {{0, -0.5}, {0.5, 0.5}, {-0.5, 0.5}});
+        toggleMaskPointSmooth(c, 0, 0);
+        const auto before = maskPath(c, 0);
+        QVERIFY(before[0].smooth() && near(before[0].oy, 0) && before[0].ox > 0 && near(before[0].ix, -before[0].ox));
+        QCOMPARE(insertMaskPoint(c, 0, 0, 0.3), 1);
+        const auto after = maskPath(c, 0);
+        const auto split = segmentPoint(before[0], before[1], 0.3);
+        QVERIFY(near(after[1].x, split.first) && near(after[1].y, split.second));
+        for (double s : {0.1, 0.2}) {
+            const auto o = segmentPoint(before[0], before[1], s), n = segmentPoint(after[0], after[1], s / 0.3);
+            QVERIFY(near(o.first, n.first, 1e-12) && near(o.second, n.second, 1e-12));
+        }
+        for (double s : {0.5, 0.8}) {
+            const auto o = segmentPoint(before[0], before[1], s), n = segmentPoint(after[1], after[2], (s - 0.3) / 0.7);
+            QVERIFY(near(o.first, n.first, 1e-12) && near(o.second, n.second, 1e-12));
+        }
+        toggleMaskPointSmooth(c, 0, 0);
+        QVERIFY(!maskPath(c, 0)[0].smooth());
+        QVERIFY(removeMaskPoint(c, 0, 1));
+        QVERIFY(!removeMaskPoint(c, 0, 0));  // a path keeps three points
+        QCOMPARE(maskPathCount(c), 3);
+
+        // Fitting the box to the path keeps it where it is in the frame (a turned box, a 16:9 frame).
+        const MaskBox box{0.4, 0.6, 0.5, 0.3, 30};
+        const std::vector<PathPoint> pts = {{-0.2, -0.3, 0, 0, 0.1, 0}, {0.4, -0.1}, {0.1, 0.45}};
+        MaskBox fitted = box;
+        std::vector<PathPoint> fp = pts;
+        QVERIFY(fitMaskBox(fitted, fp, 1920, 1080));
+        QCOMPARE(fitted.rotation, 30.0);
+        for (size_t i = 0; i < pts.size(); ++i) {
+            double u0, v0, u1, v1;
+            boxToFrame(box, 1920, 1080, pts[i].x, pts[i].y, u0, v0);
+            boxToFrame(fitted, 1920, 1080, fp[i].x, fp[i].y, u1, v1);
+            QVERIFY(near(u0, u1, 1e-9) && near(v0, v1, 1e-9));
+            double bx, by;
+            frameToBox(fitted, 1920, 1080, u1, v1, bx, by);
+            QVERIFY(near(bx, fp[i].x, 1e-9) && near(by, fp[i].y, 1e-9));
+        }
+        double hu0, hv0, hu1, hv1;
+        boxToFrame(box, 1920, 1080, pts[0].x + 0.1, pts[0].y, hu0, hv0);
+        boxToFrame(fitted, 1920, 1080, fp[0].x + fp[0].ox, fp[0].y + fp[0].oy, hu1, hv1);
+        QVERIFY(near(hu0, hu1, 1e-9) && near(hv0, hv1, 1e-9));
+        double x0 = 1, x1 = -1, y0 = 1, y1 = -1;
+        for (const auto& [x, y] : flattenMaskPath(fp, true)) {
+            x0 = std::min(x0, x), x1 = std::max(x1, x), y0 = std::min(y0, y), y1 = std::max(y1, y);
+        }
+        QVERIFY(near(x0, -0.5) && near(x1, 0.5) && near(y0, -0.5) && near(y1, 0.5));
+
+        // From frame fractions: the box frames the path; each point lands where it was given.
+        Effect f;
+        const std::vector<PathPoint> given = {{0.2, 0.2}, {0.6, 0.25}, {0.4, 0.7}};
+        setMaskPathFromFrame(f, given, 1920, 1080, false);
+        QCOMPARE(f.p("mask.shape", 0), 5.0);
+        const MaskBox fb = maskBox(f, 0);
+        QVERIFY(near(fb.x, 0.4) && near(fb.y, 0.45) && near(fb.w, 0.4) && near(fb.h, 0.5));
+        const auto got = maskPath(f, 0);
+        for (size_t i = 0; i < given.size(); ++i) {
+            double u, v;
+            boxToFrame(fb, 1920, 1080, got[i].x, got[i].y, u, v);
+            QVERIFY(near(u, given[i].x) && near(v, given[i].y));
+        }
+        setMaskPathFromFrame(f, given, 1920, 1080, true);
+        QVERIFY(maskPath(f, 0)[0].smooth());
+
+        // Closing a path being drawn fits the box around it.
+        Effect d;
+        d.params["mask.open"] = Param(1);
+        setMaskPath(d, 0, {{-0.4, -0.4}, {0, -0.4}, {0, 0}});
+        QVERIFY(closeMaskPath(d, 0, 1920, 1080));
+        QVERIFY(!d.params.count("mask.open"));
+        const MaskBox db = maskBox(d, 0);
+        QVERIFY(near(db.w, 0.16) && near(db.h, 0.16) && near(db.x, 0.42) && near(db.y, 0.42));
+        QVERIFY(!closeMaskPath(d, 0, 1920, 1080));
     }
 
     void transitionDurationLimits() {

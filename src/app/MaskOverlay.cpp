@@ -46,9 +46,22 @@ std::vector<MaskOverlay::Shape> MaskOverlay::shapes() const {
         const FrameTime lt = t - c.start;
         for (const Effect& e : c.effects) {
             const int shape = int(std::lround(e.p("mask.shape", lt)));
-            if (!e.enabled || (shape != 1 && shape != 2)) continue;
-            out.push_back({c.id, e.id, shape, e.p("mask.x", lt, 0.5), e.p("mask.y", lt, 0.5), e.p("mask.w", lt, 0.4),
-                           e.p("mask.h", lt, 0.4), e.p("mask.rotation", lt)});
+            if (!e.enabled || (shape != 1 && shape != 2 && shape != 5 && shape != 6)) continue;
+            Shape sh;
+            sh.clip = c.id;
+            sh.effect = e.id;
+            sh.shape = shape;
+            const MaskBox b = maskBox(e, lt);
+            sh.x = b.x;
+            sh.y = b.y;
+            sh.w = b.w;
+            sh.h = b.h;
+            sh.rotation = b.rotation;
+            if (shape == 5) {
+                sh.path = maskPath(e, lt);
+                sh.open = e.p("mask.open", lt) > 0.5;
+            }
+            out.push_back(std::move(sh));
         }
     }
     return out;
@@ -130,12 +143,136 @@ bool MaskOverlay::handles(const Shape& s, QPointF& center, QPointF& widthHandle,
     return toWidget(s, u, v, heightHandle);
 }
 
+bool MaskOverlay::frameSize(const Shape& s, double& mw, double& mh) const {
+    const Sequence* seq = state_->sequence();
+    const Clip* c = seq ? edit::clipById(*seq, s.clip) : nullptr;
+    return c && clipFrameSize(state_->project(), *seq, *c, mw, mh);
+}
+
+bool MaskOverlay::boxToWidget(const Shape& s, double bx, double by, QPointF& out) const {
+    double mw = 1, mh = 1, u = 0, v = 0;
+    if (!frameSize(s, mw, mh)) return false;
+    boxToFrame(s.box(), mw, mh, bx, by, u, v);
+    return toWidget(s, u, v, out);
+}
+
+bool MaskOverlay::widgetToBox(const Shape& s, const QPointF& pt, double& bx, double& by) const {
+    double mw = 1, mh = 1, u = 0, v = 0;
+    if (!frameSize(s, mw, mh) || !fromWidget(s, pt, u, v)) return false;
+    frameToBox(s.box(), mw, mh, u, v, bx, by);
+    return true;
+}
+
+bool MaskOverlay::rotateHandle(const Shape& s, QPointF& out) const {
+    QPointF ctr, top;
+    if (s.drawing() || !boxToWidget(s, 0, 0, ctr) || !boxToWidget(s, 0, -0.5, top)) return false;
+    QPointF d = top - ctr;
+    const double len = std::hypot(d.x(), d.y());
+    d = len > 1 ? d / len : QPointF(0, -1);
+    out = top + d * 22;
+    return true;
+}
+
+QPolygonF MaskOverlay::pathPolygon(const Shape& s) const {
+    QPolygonF poly;
+    for (const auto& [x, y] : flattenMaskPath(s.path, !s.open, 24)) {
+        QPointF w;
+        if (boxToWidget(s, x, y, w)) poly << w;
+    }
+    return poly;
+}
+
+void MaskOverlay::paintPath(QPainter& p, const Shape& s) const {
+    if (s.path.empty()) return;
+    QPolygonF poly = pathPolygon(s);
+    const bool closed = !s.drawing();
+    if (closed && !poly.isEmpty()) poly << poly.front();
+    p.setBrush(Qt::NoBrush);
+    p.setPen(QPen(QColor(0, 0, 0, 160), 3));
+    p.drawPolyline(poly);
+    p.setPen(QPen(QColor(255, 214, 90), 1.5));
+    p.drawPolyline(poly);
+    for (size_t i = 0; i < s.path.size(); ++i) {
+        const PathPoint& pt = s.path[i];
+        QPointF a;
+        if (!boxToWidget(s, pt.x, pt.y, a)) continue;
+        if (closed && pt.smooth())
+            for (bool out : {false, true}) {
+                QPointF h;
+                if (!boxToWidget(s, pt.x + (out ? pt.ox : pt.ix), pt.y + (out ? pt.oy : pt.iy), h)) continue;
+                p.setPen(QPen(QColor(255, 214, 90, 200), 1));
+                p.drawLine(a, h);
+                p.setBrush(QColor(255, 214, 90));
+                p.setPen(QPen(QColor(0, 0, 0, 160), 1));
+                p.drawEllipse(h, 3.5, 3.5);
+            }
+        p.setPen(QPen(QColor(0, 0, 0, 160), 1));
+        // Corners are squares, smooth points circles; the first point is larger while drawing (click it to close).
+        p.setBrush(QColor(255, 214, 90));
+        const double r = (!closed && i == 0 && s.path.size() >= 3) ? 6 : 4;
+        if (pt.smooth()) p.drawEllipse(a, r, r);
+        else p.drawRect(QRectF(a.x() - r, a.y() - r, 2 * r, 2 * r));
+    }
+    if (!closed) return;
+    QPointF ctr, rot;
+    if (boxToWidget(s, 0, 0, ctr) && rotateHandle(s, rot)) {
+        p.setPen(QPen(QColor(0, 0, 0, 160), 1));
+        p.drawLine(ctr + QPointF(-6, 0), ctr + QPointF(6, 0));
+        p.drawLine(ctr + QPointF(0, -6), ctr + QPointF(0, 6));
+        p.setBrush(QColor(255, 214, 90));
+        p.drawEllipse(rot, 4.5, 4.5);
+    }
+}
+
+void MaskOverlay::paintGradient(QPainter& p, const Shape& s) const {
+    // The middle of the ramp, its two ends (dashed) and an arrow towards the side the effect covers.
+    const double reach = 4 / std::max(0.01, s.w);
+    p.save();
+    p.setClipRect(viewer_->imageRect());
+    p.setBrush(Qt::NoBrush);
+    for (double by : {-0.5, 0.0, 0.5}) {
+        QPointF a, b;
+        if (!boxToWidget(s, -reach, by, a) || !boxToWidget(s, reach, by, b)) continue;
+        p.setPen(QPen(QColor(0, 0, 0, 160), 3));
+        p.drawLine(a, b);
+        p.setPen(QPen(QColor(255, 214, 90), 1.5, by == 0 ? Qt::SolidLine : Qt::DashLine));
+        p.drawLine(a, b);
+    }
+    p.restore();
+    QPointF ctr, top, wh, hh, rot;
+    if (!boxToWidget(s, 0, 0, ctr) || !boxToWidget(s, 0, -0.5, top) || !handles(s, ctr, wh, hh)) return;
+    p.setPen(QPen(QColor(255, 214, 90), 1.5));
+    p.drawLine(ctr, top);
+    QPointF d = top - ctr;
+    const double len = std::hypot(d.x(), d.y());
+    if (len > 8) {
+        d /= len;
+        const QPointF n(-d.y(), d.x());
+        p.setBrush(QColor(255, 214, 90));
+        p.drawPolygon(QPolygonF({top, top - d * 8 + n * 4, top - d * 8 - n * 4}));
+    }
+    p.setBrush(QColor(255, 214, 90));
+    p.setPen(QPen(QColor(0, 0, 0, 160), 1));
+    p.drawRect(QRectF(hh.x() - 4, hh.y() - 4, 8, 8));
+    if (rotateHandle(s, rot)) p.drawEllipse(rot, 4.5, 4.5);
+    p.drawLine(ctr + QPointF(-6, 0), ctr + QPointF(6, 0));
+    p.drawLine(ctr + QPointF(0, -6), ctr + QPointF(0, 6));
+}
+
 void MaskOverlay::paint(QPainter& p, const QRectF&) const {
     const Sequence* seq = state_->sequence();
     if (!seq) return;
     p.save();
     p.setRenderHint(QPainter::Antialiasing);
     for (const Shape& s : shapes()) {
+        if (s.shape == 5) {
+            paintPath(p, s);
+            continue;
+        }
+        if (s.shape == 6) {
+            paintGradient(p, s);
+            continue;
+        }
         const Clip* c = edit::clipById(*seq, s.clip);
         double mw = 1, mh = 1;
         if (!c || !clipFrameSize(state_->project(), *seq, *c, mw, mh)) continue;
@@ -169,6 +306,7 @@ void MaskOverlay::paint(QPainter& p, const QRectF&) const {
             p.setBrush(QColor(255, 214, 90));
             p.setPen(QPen(QColor(0, 0, 0, 160), 1));
             for (const QPointF& h : {wh, hh}) p.drawRect(QRectF(h.x() - 4, h.y() - 4, 8, 8));
+            if (QPointF rot; rotateHandle(s, rot)) p.drawEllipse(rot, 4.5, 4.5);
             p.drawLine(ctr + QPointF(-6, 0), ctr + QPointF(6, 0));
             p.drawLine(ctr + QPointF(0, -6), ctr + QPointF(0, 6));
         }
@@ -440,10 +578,154 @@ void MaskOverlay::apply(const Shape& s) {
                 e.params["mask.y"].set(lt, s.y);
                 e.params["mask.w"].set(lt, s.w);
                 e.params["mask.h"].set(lt, s.h);
+                e.params["mask.rotation"].set(lt, s.rotation);
                 return true;
             }
         return false;
     }, QStringLiteral("mask-%1-%2").arg(s.effect).arg(dragSerial_));
+}
+
+bool MaskOverlay::editMask(const Shape& s, const QString& label, const std::function<bool(Effect&, FrameTime)>& fn) {
+    const Sequence* seq = state_->sequence();
+    const Clip* c = seq ? edit::clipById(*seq, s.clip) : nullptr;
+    if (!c) return false;
+    const FrameTime lt = state_->playhead() - c->start;
+    const Id clip = s.clip, effect = s.effect;
+    return state_->edit(label, [clip, effect, lt, fn](Project&, Sequence& sq) {
+        Effect* e = edit::ownedEffect(sq, clip, effect);
+        return e && fn(*e, lt);
+    }, QStringLiteral("mask-%1-%2").arg(effect).arg(dragSerial_));
+}
+
+std::optional<MaskOverlay::Shape> MaskOverlay::refreshed(const Shape& s) const {
+    for (const Shape& now : shapes())
+        if (now.clip == s.clip && now.effect == s.effect) return now;
+    return std::nullopt;
+}
+
+void MaskOverlay::applyPath(const Shape& s) {
+    editMask(s, tr("Adjust Mask Path"), [path = s.path](Effect& e, FrameTime lt) {
+        setMaskPath(e, lt, path);
+        return true;
+    });
+}
+
+bool MaskOverlay::pathPress(const QPointF& pos, Qt::KeyboardModifiers mods) {
+    for (const Shape& s : shapes()) {
+        if (s.shape != 5) continue;
+        const int n = int(s.path.size());
+        const bool drawing = s.drawing();
+        // Handles first (they can sit over the outline), then the points.
+        if (!drawing)
+            for (int i = 0; i < n; ++i) {
+                const PathPoint& pt = s.path[size_t(i)];
+                if (!pt.smooth()) continue;
+                for (bool out : {true, false}) {
+                    QPointF h;
+                    if (!boxToWidget(s, pt.x + (out ? pt.ox : pt.ix), pt.y + (out ? pt.oy : pt.iy), h) ||
+                        QLineF(pos, h).length() > kHandleRadius)
+                        continue;
+                    grab_ = Grab::PathHandle;
+                    dragged_ = s;
+                    grabIndex_ = i;
+                    grabOut_ = out;
+                    ++dragSerial_;
+                    return true;
+                }
+            }
+        for (int i = 0; i < n; ++i) {
+            QPointF a;
+            const PathPoint& pt = s.path[size_t(i)];
+            if (!boxToWidget(s, pt.x, pt.y, a) || QLineF(pos, a).length() > kHandleRadius) continue;
+            ++dragSerial_;
+            if (drawing && i == 0 && n >= 3) {
+                double mw = 1, mh = 1;
+                if (frameSize(s, mw, mh))
+                    editMask(s, tr("Close Mask Path"), [mw, mh](Effect& e, FrameTime lt) { return closeMaskPath(e, lt, mw, mh); });
+                return true;
+            }
+            if (!drawing && (mods & (Qt::ControlModifier | Qt::MetaModifier))) {
+                if (!editMask(s, tr("Remove Mask Point"), [i](Effect& e, FrameTime lt) { return removeMaskPoint(e, lt, i); }))
+                    state_->message(tr("A mask path needs at least three points"), 4000);
+                return true;
+            }
+            if (!drawing && (mods & Qt::AltModifier)) {
+                editMask(s, tr("Smooth Mask Point"), [i](Effect& e, FrameTime lt) {
+                    toggleMaskPointSmooth(e, lt, i);
+                    return true;
+                });
+                return true;
+            }
+            double bx = 0, by = 0;
+            if (!widgetToBox(s, pos, bx, by)) return true;
+            grab_ = Grab::PathPoint;
+            dragged_ = s;
+            grabIndex_ = i;
+            grabBx_ = bx - pt.x;
+            grabBy_ = by - pt.y;
+            return true;
+        }
+        double bx = 0, by = 0;
+        if (drawing) {
+            // The next point: a corner, or a curve if the pointer is dragged before letting go.
+            if (!widgetToBox(s, pos, bx, by)) continue;
+            ++dragSerial_;
+            const bool added = editMask(s, tr("Draw Mask Point"), [bx, by](Effect& e, FrameTime lt) {
+                editMaskPath(e, lt, [bx, by](std::vector<PathPoint>& pts) { pts.push_back({bx, by}); });
+                e.params["mask.open"] = Param(1);
+                return true;
+            });
+            if (auto now = refreshed(s); added && now && !now->path.empty()) {
+                grab_ = Grab::NewPoint;
+                dragged_ = *now;
+                grabIndex_ = int(now->path.size()) - 1;
+            }
+            return true;
+        }
+        // On the outline: a new point there, held to drag.
+        int seg = -1;
+        double at = 0, best = 6;
+        constexpr int kSteps = 24;
+        for (int i = 0; i < n; ++i) {
+            const PathPoint& a = s.path[size_t(i)];
+            const PathPoint& b = s.path[size_t(i + 1) % size_t(n)];
+            QPointF prev;
+            for (int k = 0; k <= kSteps; ++k) {
+                const auto [x, y] = segmentPoint(a, b, double(k) / kSteps);
+                QPointF w;
+                if (!boxToWidget(s, x, y, w)) break;
+                if (k > 0) {
+                    const QPointF d = w - prev;
+                    const double len2 = QPointF::dotProduct(d, d);
+                    const double f = len2 > 0 ? std::clamp(QPointF::dotProduct(pos - prev, d) / len2, 0.0, 1.0) : 0.0;
+                    const double dist = QLineF(pos, prev + d * f).length();
+                    if (dist < best) {
+                        best = dist;
+                        seg = i;
+                        at = (k - 1 + f) / kSteps;
+                    }
+                }
+                prev = w;
+            }
+        }
+        if (seg < 0) continue;
+        ++dragSerial_;
+        int index = -1;
+        if (!editMask(s, tr("Add Mask Point"), [seg, at, &index](Effect& e, FrameTime lt) {
+                index = insertMaskPoint(e, lt, seg, at);
+                return index >= 0;
+            }))
+            return true;
+        if (auto now = refreshed(s); now && index >= 0 && index < int(now->path.size()) && widgetToBox(*now, pos, bx, by)) {
+            grab_ = Grab::PathPoint;
+            dragged_ = *now;
+            grabIndex_ = index;
+            grabBx_ = bx - now->path[size_t(index)].x;
+            grabBy_ = by - now->path[size_t(index)].y;
+        }
+        return true;
+    }
+    return false;
 }
 
 bool MaskOverlay::eventFilter(QObject* obj, QEvent* e) {
@@ -463,13 +745,22 @@ bool MaskOverlay::eventFilter(QObject* obj, QEvent* e) {
                     return true;
                 }
             }
+        if (pathPress(pos, me->modifiers())) return true;
         for (const Shape& s : shapes()) {
-            QPointF ctr, wh, hh;
-            if (!handles(s, ctr, wh, hh)) continue;
+            QPointF ctr, wh, hh, rot;
+            if (s.drawing() || !handles(s, ctr, wh, hh)) continue;
             Grab g = Grab::None;
-            if (QLineF(pos, wh).length() <= kHandleRadius) g = Grab::Width;
-            else if (QLineF(pos, hh).length() <= kHandleRadius) g = Grab::Height;
-            else {
+            if (rotateHandle(s, rot) && QLineF(pos, rot).length() <= kHandleRadius) g = Grab::Rotate;
+            else if (s.shape != 5 && s.shape != 6 && QLineF(pos, wh).length() <= kHandleRadius) g = Grab::Width;
+            else if (s.shape != 5 && QLineF(pos, hh).length() <= kHandleRadius) g = Grab::Height;
+            else if (s.shape == 5) {
+                double u, v;
+                if (pathPolygon(s).containsPoint(pos, Qt::WindingFill) && fromWidget(s, pos, u, v)) {
+                    g = Grab::Move;
+                    grabDu_ = u - s.x;
+                    grabDv_ = v - s.y;
+                }
+            } else {
                 // Inside the shape moves it.
                 double u, v;
                 if (fromWidget(s, pos, u, v)) {
@@ -513,11 +804,19 @@ bool MaskOverlay::eventFilter(QObject* obj, QEvent* e) {
         if (grab_ == Grab::None) {
             // Hover feedback.
             bool over = false;
+            bool draw = false;
             for (const Shape& s : shapes()) {
-                QPointF ctr, wh, hh;
-                if (handles(s, ctr, wh, hh) &&
-                    (QLineF(me->position(), wh).length() <= kHandleRadius || QLineF(me->position(), hh).length() <= kHandleRadius))
+                QPointF ctr, wh, hh, rot;
+                if (s.drawing()) draw = true;
+                if (!s.drawing() && handles(s, ctr, wh, hh) &&
+                    ((s.shape != 5 && s.shape != 6 && QLineF(me->position(), wh).length() <= kHandleRadius) ||
+                     (s.shape != 5 && QLineF(me->position(), hh).length() <= kHandleRadius) ||
+                     (rotateHandle(s, rot) && QLineF(me->position(), rot).length() <= kHandleRadius)))
                     over = true;
+                for (const PathPoint& pt : s.path) {
+                    QPointF a;
+                    if (boxToWidget(s, pt.x, pt.y, a) && QLineF(me->position(), a).length() <= kHandleRadius) over = true;
+                }
             }
             for (const Pin& pin : pins())
                 for (int k = 0; k < 4; ++k) {
@@ -525,6 +824,7 @@ bool MaskOverlay::eventFilter(QObject* obj, QEvent* e) {
                     if (cornerHandle(pin, k, h) && QLineF(me->position(), h).length() <= kHandleRadius) over = true;
                 }
             if (over) viewer_->setCursor(Qt::SizeAllCursor);
+            else if (draw) viewer_->setCursor(Qt::CrossCursor);
             else viewer_->unsetCursor();
             return false;
         }
@@ -536,10 +836,50 @@ bool MaskOverlay::eventFilter(QObject* obj, QEvent* e) {
             applyPin(draggedPin_);
             return true;
         }
+        if (grab_ == Grab::PathPoint || grab_ == Grab::PathHandle || grab_ == Grab::NewPoint) {
+            double bx = 0, by = 0;
+            if (!widgetToBox(dragged_, me->position(), bx, by)) return true;
+            Shape s = dragged_;
+            if (grabIndex_ < 0 || grabIndex_ >= int(s.path.size())) return true;
+            PathPoint& pt = s.path[size_t(grabIndex_)];
+            if (grab_ == Grab::PathPoint) {
+                pt.x = bx - grabBx_;
+                pt.y = by - grabBy_;
+            } else if (grab_ == Grab::NewPoint) {
+                // Pulling out a new point's handles, both ways.
+                pt.ox = bx - pt.x;
+                pt.oy = by - pt.y;
+                pt.ix = -pt.ox;
+                pt.iy = -pt.oy;
+            } else {
+                double& hx = grabOut_ ? pt.ox : pt.ix;
+                double& hy = grabOut_ ? pt.oy : pt.iy;
+                hx = bx - pt.x;
+                hy = by - pt.y;
+                if (!(me->modifiers() & Qt::AltModifier)) {
+                    // The other handle turns with it, keeping its length (Alt breaks the curve into a corner).
+                    double& kx = grabOut_ ? pt.ix : pt.ox;
+                    double& ky = grabOut_ ? pt.iy : pt.oy;
+                    const double keep = std::hypot(kx, ky), len = std::hypot(hx, hy);
+                    if (len > 1e-9) {
+                        kx = -hx / len * keep;
+                        ky = -hy / len * keep;
+                    }
+                }
+            }
+            applyPath(s);
+            return true;
+        }
         double u, v;
         if (!fromWidget(dragged_, me->position(), u, v)) return true;
         Shape s = dragged_;
-        if (grab_ == Grab::Move) {
+        if (grab_ == Grab::Rotate) {
+            double mw = 1, mh = 1;
+            if (!frameSize(s, mw, mh)) return true;
+            double a = std::atan2((v - s.y) * mh, (u - s.x) * mw) * 180.0 / M_PI + 90.0;
+            if (me->modifiers() & Qt::ShiftModifier) a = std::round(a / 15.0) * 15.0;
+            s.rotation = std::remainder(a, 360.0);
+        } else if (grab_ == Grab::Move) {
             s.x = u - grabDu_;
             s.y = v - grabDv_;
         } else {

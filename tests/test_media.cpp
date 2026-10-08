@@ -26,6 +26,7 @@
 #include "core/Bleep.h"
 #include "core/AutoTag.h"
 #include "core/Cfb.h"
+#include "core/MaskPath.h"
 #include "core/Automation.h"
 #include "core/EditOps.h"
 #include "core/MediaLog.h"
@@ -5665,6 +5666,33 @@ private slots:
         QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
         r = tool("montage_add_effect", QJsonObject{{"project", project}, {"clip", second}, {"effect", "gaussian_blur"}, {"params", QJsonObject{{"no_such", 1}}}});
         QVERIFY(r.value("isError").toBool() && text(r).contains("no_such"));
+        // A drawn Bezier mask from frame fractions (a curved point among corners); too few points refused.
+        r = tool("montage_add_effect",
+                 QJsonObject{{"project", project}, {"clip", second}, {"effect", "gaussian_blur"},
+                             {"mask_path", QJsonArray{QJsonArray{0.2, 0.2}, QJsonArray{0.8, 0.2},
+                                                      QJsonObject{{"x", 0.5}, {"y", 0.8}, {"in", QJsonArray{0.1, 0}}, {"out", QJsonArray{-0.1, 0}}}}}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        {
+            const Id fxId = Id(r.value("structuredContent").toObject().value("effect_id").toDouble());
+            Project masked;
+            QVERIFY(loadProject(project.toStdString(), masked));
+            const Clip* c = edit::clipById(*masked.active(), Id(second));
+            QVERIFY(c);
+            const Effect* e = nullptr;
+            for (const Effect& ef : c->effects)
+                if (ef.id == fxId) e = &ef;
+            QVERIFY(e);
+            QCOMPARE(e->p("mask.shape", 0), 5.0);
+            const auto pts = maskPath(*e, 0);
+            QCOMPARE(pts.size(), size_t(3));
+            QVERIFY(pts[2].smooth() && !pts[0].smooth());
+            double u = 0, v = 0;
+            boxToFrame(maskBox(*e, 0), 640, 360, pts[2].x, pts[2].y, u, v);
+            QVERIFY2(std::fabs(u - 0.5) < 1e-9 && std::fabs(v - 0.8) < 1e-9, qPrintable(QString("%1 %2").arg(u).arg(v)));
+        }
+        r = tool("montage_add_effect", QJsonObject{{"project", project}, {"clip", second}, {"effect", "invert"},
+                                                   {"mask_path", QJsonArray{QJsonArray{0.2, 0.2}, QJsonArray{0.8, 0.2}}}});
+        QVERIFY(r.value("isError").toBool() && text(r).contains("three"));
         r = tool("montage_add_title", QJsonObject{{"project", project}, {"text", "Hello"}, {"at", "00:00:00:00"}, {"duration", 0.3}});
         QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
         QCOMPARE(r.value("structuredContent").toObject().value("text").toString(), QString("Hello"));

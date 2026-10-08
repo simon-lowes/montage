@@ -55,6 +55,7 @@
 #include "SmartBinDialog.h"
 #include "ScriptCutDialog.h"
 #include "core/KeyframeEdit.h"
+#include "core/MaskPath.h"
 #include "core/MediaLog.h"
 #include "InspectorWidget.h"
 #include "core/Bleep.h"
@@ -4975,6 +4976,121 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(std::fabs(pin.p("br_x", 10) - 1) < 1e-9);  // the others stay
         state()->undo();
         QVERIFY(std::fabs(edit::clipById(*state()->sequence(), red)->effects.back().p("tl_x", 10)) < 1e-9);
+        state()->setSelection({}, false);
+    }
+
+    void drawnMaskInProgramMonitor() {
+        loadDemo();
+        // A blur limited to a Bezier mask on the red clip, drawn in the viewer.
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        QVERIFY(state()->edit("Mask", [red](Project& p, Sequence& s) {
+            Effect e = makeEffect(p, "gaussian_blur");
+            e.params["mask.shape"] = 5.0;
+            edit::clipById(s, red)->effects.push_back(e);
+            return true;
+        }));
+        state()->setSelection({red}, false);
+        state()->setPlayhead(10);
+        MonitorPanel* program = nullptr;
+        for (auto* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Program) program = m;
+        QVERIFY(program);
+        ViewerWidget* viewer = program->viewer();
+        QTRY_VERIFY_WITH_TIMEOUT(!viewer->image().isNull(), 5000);
+        auto* overlay = viewer->findChild<MaskOverlay*>();
+        QVERIFY(overlay);
+        QCOMPARE(overlay->shapes().size(), size_t(1));
+        QVERIFY(overlay->shapes()[0].drawing());
+        const QRectF r = viewer->imageRect();
+        auto at = [&r](double u, double v) { return QPointF(r.left() + u * r.width(), r.top() + v * r.height()).toPoint(); };
+        auto fx = [&]() -> const Effect& { return edit::clipById(*state()->sequence(), red)->effects.back(); };
+        const double W = state()->sequence()->width, H = state()->sequence()->height;
+        // Where point i is, as a fraction of the frame.
+        auto where = [&](int i) {
+            const auto pts = maskPath(fx(), 10);
+            double u = -1, v = -1;
+            if (i < int(pts.size())) boxToFrame(maskBox(fx(), 10), W, H, pts[size_t(i)].x, pts[size_t(i)].y, u, v);
+            return QPointF(u, v);
+        };
+        auto close = [&r](QPointF a, double u, double v) { return std::fabs(a.x() - u) * r.width() < 2 && std::fabs(a.y() - v) * r.height() < 2; };
+        auto drag = [&](QPoint from, QPoint to, Qt::KeyboardModifiers mods = Qt::NoModifier) {
+            QTest::mousePress(viewer, Qt::LeftButton, mods, from);
+            QMouseEvent move(QEvent::MouseMove, QPointF(to), viewer->mapToGlobal(QPointF(to)), Qt::NoButton, Qt::LeftButton, mods);
+            QApplication::sendEvent(viewer, &move);
+            QTest::mouseRelease(viewer, Qt::LeftButton, mods, to);
+        };
+
+        // Three clicks place corners; clicking the first point closes the path.
+        for (QPoint p : {at(0.3, 0.3), at(0.7, 0.3), at(0.5, 0.7)}) QTest::mouseClick(viewer, Qt::LeftButton, Qt::NoModifier, p);
+        QCOMPARE(maskPathCount(fx()), 3);
+        QVERIFY(fx().p("mask.open", 10) > 0.5);
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::NoModifier, at(0.3, 0.3));
+        QVERIFY(!fx().params.count("mask.open"));
+        QVERIFY(!overlay->shapes()[0].drawing());
+        // The box now frames the path, and the points are where they were clicked.
+        const MaskBox b = maskBox(fx(), 10);
+        QVERIFY2(std::fabs(b.x - 0.5) < 0.01 && std::fabs(b.y - 0.5) < 0.01 && std::fabs(b.w - 0.4) < 0.01 && std::fabs(b.h - 0.4) < 0.01,
+                 qPrintable(QString("%1 %2 %3 %4").arg(b.x).arg(b.y).arg(b.w).arg(b.h)));
+        QVERIFY(close(where(0), 0.3, 0.3) && close(where(1), 0.7, 0.3) && close(where(2), 0.5, 0.7));
+        // The mask limits the blur: rendered, the effect has a matte inside the triangle only.
+        const std::vector<float> m = effectMatte(fx(), 10, Image(64, 36), 0.05);
+        QVERIFY(m[size_t(14 * 64 + 32)] > 0.9f && m[size_t(2 * 64 + 2)] < 0.01f);
+
+        // Dragging a point moves it (one undo step).
+        drag(at(0.5, 0.7), at(0.5, 0.8));
+        QVERIFY(close(where(2), 0.5, 0.8));
+        state()->undo();
+        QVERIFY(close(where(2), 0.5, 0.7));
+        // Clicking the outline adds a point there; Ctrl-click removes it.
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::NoModifier, at(0.5, 0.3));
+        QCOMPARE(maskPathCount(fx()), 4);
+        QVERIFY(close(where(1), 0.5, 0.3));
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::ControlModifier, at(0.5, 0.3));
+        QCOMPARE(maskPathCount(fx()), 3);
+        // Alt-click makes a point smooth, and back.
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::AltModifier, at(0.5, 0.7));
+        QVERIFY(maskPath(fx(), 10)[2].smooth());
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::AltModifier, at(0.5, 0.7));
+        QVERIFY(!maskPath(fx(), 10)[2].smooth());
+        // Dragging inside moves the whole path.
+        drag(at(0.5, 0.42), at(0.6, 0.42));
+        QVERIFY2(close(where(0), 0.4, 0.3) && close(where(2), 0.6, 0.7), qPrintable(QString("%1 %2").arg(where(0).x()).arg(where(0).y())));
+        state()->undo();
+        // The handle above the box turns it: dragged level with the centre to its right, a quarter turn.
+        QPointF rot, ctr;
+        QVERIFY(overlay->rotateHandle(overlay->shapes()[0], rot) && overlay->boxToWidget(overlay->shapes()[0], 0, 0, ctr));
+        QVERIFY(rot.y() < ctr.y());
+        drag(rot.toPoint(), (ctr + QPointF(r.width() * 0.3, 0)).toPoint());
+        QVERIFY2(std::fabs(fx().p("mask.rotation", 10) - 90) < 2, qPrintable(QString::number(fx().p("mask.rotation", 10))));
+        state()->undo();
+
+        // Animate Path in the Inspector keys the whole path; the keyframe panel shows it as one row.
+        QCheckBox* animate = nullptr;
+        QTRY_VERIFY((animate = win_->findChild<QCheckBox*>("animateMaskPath")) != nullptr);
+        QVERIFY(!animate->isChecked());
+        animate->click();
+        QVERIFY(maskPathAnimated(fx()));
+        QCOMPARE(maskPathKeyTimes(fx()), (std::vector<FrameTime>{10}));
+        state()->setPlayhead(30);
+        drag(at(0.5, 0.7), at(0.5, 0.8));
+        QCOMPARE(maskPathKeyTimes(fx()), (std::vector<FrameTime>{10, 30}));
+        QVERIFY(std::fabs(maskPath(fx(), 20)[2].y - (maskPath(fx(), 10)[2].y + maskPath(fx(), 30)[2].y) / 2) < 1e-9);
+        auto* panel = win_->findChild<KeyframePanel*>();
+        QVERIFY(panel);
+        int pathRows = 0;
+        for (const auto& row : panel->rows()) {
+            QVERIFY(!isMaskPathParam(row.address.param) || row.address.param == kMaskPathParam);
+            if (row.address.param == kMaskPathParam) {
+                ++pathRows;
+                QCOMPARE(row.label.section(QStringLiteral(" · "), 1), QStringLiteral("Mask Path"));
+                // Moving its key moves every coordinate's.
+                panel->select({{row.address, 30}});
+                QVERIFY(panel->shiftSelected(5));
+            }
+        }
+        QCOMPARE(pathRows, 1);
+        QCOMPARE(maskPathKeyTimes(fx()), (std::vector<FrameTime>{10, 35}));
+        for (const std::string& n : maskPathParams(fx())) QVERIFY(fx().params.at(n).keyAt(35));
         state()->setSelection({}, false);
     }
 

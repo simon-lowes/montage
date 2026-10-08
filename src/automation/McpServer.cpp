@@ -23,6 +23,7 @@
 #include "core/Captions.h"
 #include "core/Chapters.h"
 #include "core/MarkerList.h"
+#include "core/MaskPath.h"
 #include "core/Bleep.h"
 #include "core/Checkerboard.h"
 #include "core/EditOps.h"
@@ -859,13 +860,18 @@ void McpServer::Impl::addTools() {
     add("montage_add_effect", "Add an effect",
         "Add an effect to a clip (see montage_list_effects), with parameter values. Video effects can be limited to a "
         "mask: mask.shape 1 ellipse or 2 rectangle, mask.x / mask.y centre and mask.w / mask.h size as fractions of the frame; "
+        "6 a gradient across that box (full effect above it, none below, mask.rotation turning it); or a drawn Bézier "
+        "path through `mask_path` (points as frame fractions, [x, y] or {x, y, in: [dx, dy], out: [dx, dy]} with handles; "
+        "`mask_smooth` gives points without handles smooth automatic ones); "
         "or to a range of distances: mask.depth 1, with mask.depth_low and mask.depth_high from 0 (farthest) to 100 (nearest). "
         "depth_blur (lens blur keeping one distance sharp), depth_fog, depth_map and relight (a virtual light) work from "
         "the picture's depth. "
         "remove_background cuts people out (keep 1 keeps the background instead), and mask.shape 4 limits any effect to "
         "the people in the picture. object_removal paints out whatever its mask covers and fills it in.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},"effect":{"type":"string"},
-            "params":{"type":"object","additionalProperties":{"type":"number"}}},"required":["project","clip","effect"]})json",
+            "params":{"type":"object","additionalProperties":{"type":"number"}},
+            "mask_path":{"type":"array","items":{"type":["array","object"]},"description":"A closed Bezier mask: three or more points, fractions of the clip's frame"},
+            "mask_smooth":{"type":"boolean","default":false}},"required":["project","clip","effect"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
             Clip& c = clipArg(l, a);
@@ -885,6 +891,36 @@ void McpServer::Impl::addTools() {
                                    (name.rfind("mask.", 0) == 0 && supportsMask(type));
                 if (!known) throw ArgError{QStringLiteral("\"%1\" has no parameter \"%2\"").arg(QString::fromStdString(type), it.key())};
                 e.params[name] = Param(it.value().toDouble());
+            }
+            if (a.contains("mask_path")) {
+                if (!supportsMask(type)) throw ArgError{QStringLiteral("\"%1\" cannot have a mask").arg(QString::fromStdString(type))};
+                const QJsonArray arr = a.value("mask_path").toArray();
+                if (arr.size() < 3) throw ArgError{QStringLiteral("mask_path needs at least three points")};
+                std::vector<PathPoint> pts;
+                auto pair = [](const QJsonValue& v, double& x, double& y) {
+                    const QJsonArray xy = v.toArray();
+                    if (xy.size() != 2) return false;
+                    x = xy[0].toDouble();
+                    y = xy[1].toDouble();
+                    return true;
+                };
+                for (const QJsonValue& v : arr) {
+                    PathPoint p;
+                    if (v.isArray()) {
+                        if (!pair(v, p.x, p.y)) throw ArgError{QStringLiteral("Each mask_path point is [x, y] or {x, y, in, out}")};
+                    } else {
+                        const QJsonObject o = v.toObject();
+                        if (!o.contains("x") || !o.contains("y")) throw ArgError{QStringLiteral("Each mask_path point needs x and y")};
+                        p.x = o.value("x").toDouble();
+                        p.y = o.value("y").toDouble();
+                        if (o.contains("in") && !pair(o.value("in"), p.ix, p.iy)) throw ArgError{QStringLiteral("A point's \"in\" handle is [dx, dy]")};
+                        if (o.contains("out") && !pair(o.value("out"), p.ox, p.oy)) throw ArgError{QStringLiteral("A point's \"out\" handle is [dx, dy]")};
+                    }
+                    pts.push_back(p);
+                }
+                double fw = 1, fh = 1;
+                if (!clipFrameSize(l.project, l.seq(), c, fw, fh)) fw = l.seq().width, fh = l.seq().height;
+                setMaskPathFromFrame(e, pts, fw, fh, a.value("mask_smooth").toBool());
             }
             if (type == "object_removal" && (!inpaintAvailable() || !inpaintModel().installed()))
                 return fail("Object Removal needs its model: run `scripts/fetch-models.sh` or add it once in the app");

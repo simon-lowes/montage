@@ -3,6 +3,7 @@
 
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "core/Model.h"
@@ -74,6 +75,10 @@ std::vector<float> distanceTransform(const std::vector<uint8_t>& seed, int w, in
 
 // An object mask's matte at w x h from its logits (ObjectMask.h grid): a
 // sub-pixel edge, moved out by `expand` px and softened over `feather` px.
+// A matte from a field positive inside and crossing zero at the edge (feather and expansion in pixels).
+std::vector<float> fieldMatte(const std::vector<float>& field, int w, int h, double feather, double expand);
+// How much of each pixel a polygon (pixel coordinates, non-zero winding) covers, 0 to 1.
+std::vector<float> polygonCoverage(const std::vector<std::pair<double, double>>& poly, int w, int h);
 std::vector<float> objectMatte(const std::vector<float>& logits, int w, int h, double feather, double expand);
 
 // 3D LUT loaded from a .cube file.
