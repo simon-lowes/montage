@@ -3,6 +3,8 @@
 #include <QString>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <deque>
 #include <mutex>
 
 #include "Decoder.h"
@@ -250,6 +252,50 @@ std::vector<float> FaceModel::embed(const Frame16& frame, const DetectedFace& fa
 }
 
 #endif
+
+std::shared_ptr<const std::vector<FaceBox>> cachedFaces(const Image& img) {
+    if (img.empty()) return nullptr;
+    uint64_t key = 1469598103934665603ULL;
+    auto mix = [&](uint64_t v) { key = (key ^ v) * 1099511628211ULL; };
+    mix(uint64_t(img.width)), mix(uint64_t(img.height));
+    const size_t step = std::max<size_t>(1, img.px.size() / 8192);
+    for (size_t i = 0; i < img.px.size(); i += step) {
+        uint32_t bits;
+        std::memcpy(&bits, &img.px[i], 4);
+        mix(bits);
+    }
+    static std::mutex m;
+    static std::deque<std::pair<uint64_t, std::shared_ptr<const std::vector<FaceBox>>>> cache;
+    {
+        std::lock_guard lock(m);
+        for (const auto& [k, f] : cache)
+            if (k == key) return f;
+    }
+    auto model = FaceModel::load();
+    if (!model) return nullptr;
+    // Straight-alpha 16-bit, as the detector reads frames.
+    Frame16 frame;
+    frame.width = img.width;
+    frame.height = img.height;
+    frame.px.resize(img.px.size());
+    for (size_t i = 0; i < img.px.size(); i += 4) {
+        const float a = img.px[i + 3];
+        for (int c = 0; c < 3; ++c)
+            frame.px[i + size_t(c)] = uint16_t(std::lround(std::clamp(a > 1e-6f ? img.px[i + size_t(c)] / a : 0.0f, 0.0f, 1.0f) * 65535));
+        frame.px[i + 3] = uint16_t(std::lround(std::clamp(a, 0.0f, 1.0f) * 65535));
+    }
+    auto faces = std::make_shared<std::vector<FaceBox>>();
+    for (const DetectedFace& d : model->detect(frame)) {
+        FaceBox b;
+        b.x = d.x / img.width, b.y = d.y / img.height, b.w = d.w / img.width, b.h = d.h / img.height, b.score = d.score;
+        for (int k = 0; k < 5; ++k) b.landmarks[2 * k] = d.landmarks[2 * k] / img.width, b.landmarks[2 * k + 1] = d.landmarks[2 * k + 1] / img.height;
+        faces->push_back(b);
+    }
+    std::lock_guard lock(m);
+    cache.emplace_front(key, faces);
+    if (cache.size() > 8) cache.pop_back();
+    return faces;
+}
 
 bool indexFaces(const std::string& path, double duration, FaceIndex& out, double step, int perFrame, int minSize,
                 const std::function<void(double)>& progress, const std::atomic<bool>* cancel, std::string* error) {

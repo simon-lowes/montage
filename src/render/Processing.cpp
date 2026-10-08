@@ -6,6 +6,7 @@
 #include "core/Effects.h"
 #include "media/DepthMap.h"
 #include "media/Matting.h"
+#include "FaceRefine.h"
 #include "media/Tracking.h"
 
 #include <algorithm>
@@ -642,7 +643,12 @@ std::vector<float> objectMatte(const std::vector<float>& logits, int W, int H, d
 namespace {
 thread_local std::shared_ptr<const DepthMap> tDepth;
 thread_local std::shared_ptr<const ValueMap> tPerson;
+thread_local std::shared_ptr<const std::vector<FaceBox>> tFaces;
 }  // namespace
+
+const std::vector<FaceBox>* currentFaces() { return tFaces.get(); }
+FaceScope::FaceScope(std::shared_ptr<const std::vector<FaceBox>> faces) : previous_(std::move(tFaces)) { tFaces = std::move(faces); }
+FaceScope::~FaceScope() { tFaces = std::move(previous_); }
 
 const DepthMap* currentDepth() { return tDepth.get(); }
 DepthScope::DepthScope(std::shared_ptr<const DepthMap> depth) : previous_(std::move(tDepth)) { tDepth = std::move(depth); }
@@ -993,7 +999,17 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
     else if (ty == "posterize") vfx::posterize(e, t, img);
     else if (ty == "depth_map" || ty == "depth_fog" || ty == "depth_blur")
         depthEffect(e, t, img, pixelScale);
-    else if (ty == "remove_background") {
+    else if (ty == "face_refine") {
+        if (const std::vector<FaceBox>* faces = currentFaces()) {
+            FaceRefineSettings fs;
+            fs.smooth = e.p("smooth", t, 40) / 100;
+            fs.lighten = e.p("lighten", t) / 100;
+            fs.eyesBright = e.p("eyes_bright", t, 20) / 100;
+            fs.eyesSharp = e.p("eyes_sharp", t, 30) / 100;
+            fs.showMask = e.p("show", t) > 0.5;
+            refineFaces(img, *faces, fs);
+        }
+    } else if (ty == "remove_background") {
         // Transparent where no one is (or where someone is, keeping the background); nothing without the model.
         const ValueMap* person = currentPersonMatte();
         if (person && !person->empty()) {

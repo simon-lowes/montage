@@ -193,6 +193,12 @@ std::vector<EffectInfo> buildCatalog() {
                  {num("threshold", "Threshold", 0, 1, 0.1), num("softness", "Softness", 0, 1, 0.05),
                   boolean("invert", "Key Out Brights")},
                  {}});
+    // The faces in the frame (YuNet, found again each frame) touched up within a soft mask.
+    c.push_back({"face_refine", "Face Refinement", EffectCategory::VideoFilter, "Refine",
+                 {pct("smooth", "Smooth Skin", 0, 100, 40), pct("lighten", "Lighten Face", 0, 100, 0),
+                  pct("eyes_bright", "Brighten Eyes", 0, 100, 20), pct("eyes_sharp", "Sharpen Eyes", 0, 100, 30),
+                  boolean("show", "Show Face Mask")},
+                 {}});
     // People cut out of their background (MODNet on the clip's source frame), keeping hair and soft edges.
     c.push_back({"remove_background", "Remove Background", EffectCategory::VideoFilter, "Keying",
                  {choice("keep", "Keep", {"People", "Background"}), num("shift", "Edge Shift (px)", -20, 20, 0, 0.5),
@@ -504,6 +510,8 @@ bool supportsMask(const std::string& effectType) {
 bool hasMask(const Effect& e, FrameTime t) {
     return e.p("mask.shape", t) > 0.5 || e.p("mask.qualify", t) > 0.5 || e.p("mask.depth", t) > 0.5;
 }
+
+bool needsFaces(const Effect& e) { return e.enabled && e.type == "face_refine"; }
 
 bool needsPersonMatte(const Effect& e, FrameTime t) {
     if (!e.enabled) return false;

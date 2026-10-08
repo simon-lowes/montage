@@ -45,6 +45,19 @@ public:
 private:
     std::shared_ptr<const ValueMap> previous_;
 };
+// And the faces in the frame (media/Faces.h), for Face Refinement.
+struct FaceBox;
+const std::vector<FaceBox>* currentFaces();
+class FaceScope {
+public:
+    explicit FaceScope(std::shared_ptr<const std::vector<FaceBox>> faces);
+    ~FaceScope();
+    FaceScope(const FaceScope&) = delete;
+    FaceScope& operator=(const FaceScope&) = delete;
+
+private:
+    std::shared_ptr<const std::vector<FaceBox>> previous_;
+};
 // A soft matte's edge moved out by `expand` px (re-edged by distance, softened over
 // `feather`), or else blurred by `blur` px; unchanged when both are zero.
 void refineMatte(std::vector<float>& matte, int w, int h, double expand, double feather, double blur);

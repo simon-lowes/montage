@@ -29,6 +29,7 @@
 #include "media/MediaPool.h"
 #include "media/DepthMap.h"
 #include "media/Matting.h"
+#include "media/Faces.h"
 #include "media/Rife.h"
 #include "media/SuperScale.h"
 
@@ -601,6 +602,12 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
         mattingModel().installed())
         people = cachedPersonMatte(src);
     PersonScope personScope(people);
+    // And the faces, for Face Refinement.
+    std::shared_ptr<const std::vector<FaceBox>> faces;
+    if (std::any_of(c.effects.begin(), c.effects.end(), [](const Effect& e) { return needsFaces(e); }) && faceSearchAvailable() &&
+        faceModel().installed())
+        faces = cachedFaces(src);
+    FaceScope faceScope(faces);
     for (const auto& e : c.effects)
         if (e.type != "video_denoise" && e.type != "super_scale") applyVideoEffect(e, lt, src, pixelScale, sourceSeconds);  // those ran on the source
     if (identityLayer(src, g, SW, SH, o.scale)) return src;  // a full-frame clip: no copy

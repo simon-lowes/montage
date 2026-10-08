@@ -42,6 +42,7 @@
 #include "media/Beats.h"
 #include "render/AafExport.h"
 #include "render/Retime.h"
+#include "render/FaceRefine.h"
 #include "render/AudioFx.h"
 #include "render/AutoMix.h"
 #include "render/VideoDenoise.h"
@@ -2316,6 +2317,93 @@ private slots:
         Project back;
         QVERIFY(loadProject(project.toStdString(), back, &err));
         QVERIFY(isRed(renderSequenceFrame(back, *back.active(), 0, {}), 0.03, 0.03));
+    }
+
+    void faceRefinement() {
+        if (!faceSearchAvailable() || !faceModel().installed()) QSKIP("Set MONTAGE_FACE_MODEL to the YuNet and SFace models");
+        const std::string still = MONTAGE_TEST_DATA_DIR "/faces/jfk-color.jpg";
+        VideoDecoder dec;
+        std::string err;
+        QVERIFY2(dec.open(still, &err), err.c_str());
+        const Image img = toImage(*dec.frameAt(0));
+        auto faces = cachedFaces(img);
+        QVERIFY(faces);
+        QCOMPARE(int(faces->size()), 1);
+        const FaceBox f = faces->front();
+        // Where OpenCV's YuNet puts it (77, 88, 123 x 156 of 320 x 415).
+        QVERIFY(std::abs(f.x * 320 - 77) < 4 && std::abs(f.w * 320 - 123) < 4 && std::abs(f.y * 415 - 88) < 4);
+        QVERIFY(cachedFaces(img) == faces);
+        // The skin mask: the cheeks in, the eyes, mouth and backdrop out.
+        const std::vector<float> mask = faceSkinMask(f, 320, 415);
+        auto at = [&](double x, double y) { return mask[size_t(y) * 320 + size_t(x)]; };
+        const double cheekX = (f.landmarks[0] * 0.5 + f.landmarks[6] * 0.5) * 320, cheekY = (f.landmarks[1] * 0.4 + f.landmarks[7] * 0.6) * 415;
+        QVERIFY2(at(cheekX, cheekY) > 0.9f, qPrintable(QString::number(at(cheekX, cheekY))));
+        QCOMPARE(at(f.landmarks[0] * 320, f.landmarks[1] * 415), 0.0f);
+        QCOMPARE(at((f.landmarks[6] + f.landmarks[8]) / 2 * 320, (f.landmarks[7] + f.landmarks[9]) / 2 * 415), 0.0f);
+        QCOMPARE(at(10, 10), 0.0f);
+
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320;
+        s.height = 415;
+        MediaItem m = probeOrFail(p, still);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Clip& clip = s.videoTracks[0].clips.at(0);
+        const Image plain = renderSequenceFrame(p, s, 0, {});
+        auto texture = [](const Image& im, double cx, double cy) {  // mean Laplacian over 13 x 13
+            auto l = [&](int x, int y) {
+                const float* q = im.at(x, y);
+                return 0.2126 * q[0] + 0.7152 * q[1] + 0.0722 * q[2];
+            };
+            double sum = 0;
+            for (int y = int(cy) - 6; y <= int(cy) + 6; ++y)
+                for (int x = int(cx) - 6; x <= int(cx) + 6; ++x)
+                    sum += std::abs(4 * l(x, y) - l(x - 1, y) - l(x + 1, y) - l(x, y - 1) - l(x, y + 1));
+            return sum / 169;
+        };
+        auto luma = [](const Image& im, double x, double y) {
+            const float* q = im.at(int(x), int(y));
+            return 0.2126 * q[0] + 0.7152 * q[1] + 0.0722 * q[2];
+        };
+        Effect refine = makeEffect(p, "face_refine");
+        refine.params["smooth"] = Param(100.0);
+        refine.params["eyes_bright"] = Param(100.0);
+        clip.effects.push_back(refine);
+        const Image done = renderSequenceFrame(p, s, 0, {});
+        // Smoother skin, brighter eyes, the backdrop and suit untouched.
+        QVERIFY2(texture(done, cheekX, cheekY) < 0.7 * texture(plain, cheekX, cheekY),
+                 qPrintable(QString("%1 vs %2").arg(texture(done, cheekX, cheekY)).arg(texture(plain, cheekX, cheekY))));
+        const double eyeX = f.landmarks[0] * 320, eyeY = f.landmarks[1] * 415;
+        auto eye = [&](const Image& im) {  // the eye's mean luma over 5 x 5
+            double sum = 0;
+            for (int dy = -2; dy <= 2; ++dy)
+                for (int dx = -2; dx <= 2; ++dx) sum += luma(im, eyeX + dx, eyeY + dy);
+            return sum / 25;
+        };
+        QVERIFY2(eye(done) > eye(plain) * 1.08, qPrintable(QString("%1 vs %2").arg(eye(done)).arg(eye(plain))));
+        for (auto [x, y] : {std::pair{10, 10}, std::pair{300, 30}, std::pair{160, 400}})
+            for (int c = 0; c < 4; ++c) QCOMPARE(done.at(x, y)[c], plain.at(x, y)[c]);
+        // Show Face Mask.
+        clip.effects.back().params["show"] = Param(1.0);
+        const Image shown = renderSequenceFrame(p, s, 0, {});
+        QVERIFY(luma(shown, cheekX, cheekY) > 0.5);
+        QVERIFY(luma(shown, eyeX, eyeY) < 0.05);
+        clip.effects.clear();
+
+        // Through MCP.
+        const QString project = QString::fromStdString(path("refine.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_add_effect"},
+                                                     {"arguments", QJsonObject{{"project", project}, {"clip", double(clip.id)}, {"effect", "face_refine"},
+                                                                               {"params", QJsonObject{{"smooth", 80}}}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
     }
 
     void peopleSearch() {

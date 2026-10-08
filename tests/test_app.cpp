@@ -1657,6 +1657,17 @@ private slots:
         QTRY_VERIFY(!win_->findChild<QPushButton*>("getDepthModel"));
     }
 
+    void faceRefinementInTheBrowser() {
+        auto* browser = win_->findChild<EffectsBrowser*>();
+        browser->reload();
+        bool listed = false;
+        for (QTreeWidgetItem* item : browser->findChild<QTreeWidget*>()->findItems("Refine", Qt::MatchRecursive))
+            for (int i = 0; i < item->childCount(); ++i) listed |= item->child(i)->data(0, Qt::UserRole).toString() == "face_refine";
+        QVERIFY(listed);
+        if (!faceSearchAvailable() || !faceModel().installed()) QSKIP("Set MONTAGE_FACE_MODEL to test with the model");
+        QVERIFY(ensureEffectModel(win_.get(), "face_refine"));
+    }
+
     void peopleMaskOffersItsModel() {
         if (!mattingAvailable()) QSKIP("Built without ONNX Runtime");
         loadDemo();

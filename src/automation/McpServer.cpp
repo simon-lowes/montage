@@ -772,6 +772,8 @@ void McpServer::Impl::addTools() {
                 if (!known) throw ArgError{QStringLiteral("\"%1\" has no parameter \"%2\"").arg(QString::fromStdString(type), it.key())};
                 e.params[name] = Param(it.value().toDouble());
             }
+            if (needsFaces(e) && (!faceSearchAvailable() || !faceModel().installed()))
+                return fail("Face Refinement needs the face models: run `scripts/fetch-models.sh` or add it once in the app");
             if (needsPersonMatte(e, 0) && (!mattingAvailable() || !mattingModel().installed()))
                 return fail("Remove Background and People masks need their model: run `scripts/fetch-models.sh` or add one once in the app");
             if (needsDepth(e, 0) && (!depthAvailable() || !depthModel().installed()))

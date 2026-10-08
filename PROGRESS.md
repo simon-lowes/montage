@@ -606,3 +606,16 @@ All 15 items are in (October 2026). The near misses listed in the roadmap are th
     - over a red track: the red showing round him and his face kept; keeping the background instead; Edge Shift widening the cut;
     - a People mask darkening only him, and inverted;
     - MCP, and the Inspector's download offer.
+- [x] Face Refinement (render/FaceRefine):
+  - **Faces:** YuNet on each frame (`cachedFaces`, by content), as fractions with their five landmarks.
+  - **Mask:** an ellipse from the box, feathered over its outer fifth. The eyes (11 % of the face's width round each eye landmark) and the mouth (an ellipse between its corners) are left out.
+  - **Smooth Skin:** the face minus its blur (2.5 % of its width), taken out where the difference is small (a Gaussian in luma at 0.08), so edges stay. Gated by a soft YCbCr skin box and the mask.
+  - **Eyes:** brightened (up to 35 %) and unsharp-masked within a soft circle (7.5 % of the face's width). Skin-coloured pixels get half, so the eyelids do not glow.
+  - **Also:** Lighten Face, Show Face Mask, MCP `montage_add_effect` (refusing without the face models).
+  - **Tests:** on the JFK portrait:
+    - the box against OpenCV's;
+    - the mask (cheek in, eye, mouth and backdrop out);
+    - cheek texture (mean Laplacian) down by over 30 %;
+    - the eyes over 8 % brighter;
+    - backdrop and suit pixels identical;
+    - the mask view, MCP, and the browser's Refine group.

@@ -50,6 +50,15 @@ private:
 // moved onto the standard ones by the closest rotation, scale and shift.
 std::vector<float> alignFace(const Frame16& frame, const DetectedFace& face);
 
+// The faces in a picture (premultiplied RGBA), as fractions of it, best first; the last few
+// pictures' are remembered by content. Null without the model.
+struct FaceBox {
+    float x = 0, y = 0, w = 0, h = 0;
+    float score = 0;
+    float landmarks[10] = {};  // as DetectedFace's, in fractions
+};
+std::shared_ptr<const std::vector<FaceBox>> cachedFaces(const Image& img);
+
 // Faces every `step` seconds of a video (0: every 2 s, or every second for
 // clips under 20 s), or in a still; at most `perFrame` per frame, at least
 // `minSize` pixels tall.
