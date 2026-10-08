@@ -31,6 +31,7 @@ class MixerPanel;
 class CaptionsPanel;
 class TranscriptPanel;
 class ShotSearchPanel;
+class PeoplePanel;
 class MulticamPanel;
 class AudioMeterWidget;
 class LoudnessReadout;
@@ -179,6 +180,7 @@ private:
     CaptionsPanel* captions_ = nullptr;
     TranscriptPanel* transcript_ = nullptr;
     ShotSearchPanel* shots_ = nullptr;
+    PeoplePanel* people_ = nullptr;
     AudioMeterWidget* meter_ = nullptr;
     LoudnessReadout* loudness_ = nullptr;
     VoiceoverDialog* voiceover_ = nullptr;
@@ -195,6 +197,7 @@ private:
     QDockWidget* captionsDock_ = nullptr;
     QDockWidget* transcriptDock_ = nullptr;
     QDockWidget* shotsDock_ = nullptr;
+    QDockWidget* peopleDock_ = nullptr;
     QDockWidget* multicamDock_ = nullptr;
     QDockWidget* queueDock_ = nullptr;
     QDockWidget* keyframesDock_ = nullptr;

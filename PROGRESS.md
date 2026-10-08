@@ -553,3 +553,14 @@ All 15 items are in (October 2026). The near misses listed in the roadmap are th
     - a caption masked by word time;
     - in the mix, Goertzel: the 300 Hz source intact around the word and gone under it, the 1 kHz tone at -12 dB, silence mode silent, and still on the word after a trim;
     - the panel with undo, and MCP.
+- [x] People search (media/Faces, core/FaceIndex, app/PeoplePanel):
+  - **Faces:** YuNet 2023mar (MIT) on a 640x640 letterbox, its stride 8/16/32 outputs decoded as OpenCV does (score √(cls·obj), NMS at IoU 0.3). Each face is aligned to SFace's 112x112 template by the least-squares similarity of its five landmarks, and SFace 2021dec (Apache 2.0) gives a 128-value identity, stored at 8 bits. Videos are sampled every 2 s (1 s under 20 s), decoded with the long side at most 1280; stills once. At most 8 faces a frame, at least 32 px tall.
+  - **People:** faces are grouped across the project by cosine similarity (0.42) to each group's mean, clearest faces first. It is incremental: faces already grouped stay with their person, so names and merges survive new footage, and a full regroup keeps the ids most faces had. A person can be named, merged into another (Same Person As), and found again: `findPerson` joins samples into moments, with the frame where their face is largest. Smart bin rules naming a person follow renames and merges.
+  - **Where to find it:** the People panel (faces as round icons, double-click to name, moments that open in the Source monitor with In and Out, subclips named after the person, a smart bin per person); a People smart bin rule (includes, does not include, empty); names in the bin search; `montage-cli people` (and `models`); MCP `montage_find_people` and `montage_name_person` (45 tools). The models are in `scripts/fetch-models.sh` and the CI caches. The face index and the people are saved in the project.
+  - **Bug found on the way:** FFmpeg's image demuxer reports a JPEG as finished after a seek, and the decoder always sought before a still's first picture, so every JPEG still (imports, thumbnails, the visual index) decoded to nothing. A still is now read as opened, then after a seek, then from a fresh open, with a regression test.
+  - **Tests:** three public-domain portraits (two of John F. Kennedy, one of Neil Armstrong):
+    - YuNet's boxes within 4 px of OpenCV's own, and embeddings at 0.66 for the same man against 0.16 and 0.19 for different men;
+    - grouping into two people with ids kept, incremental placement, merge and full regroup;
+    - the smart bin rule, the search, rule names following renames and merges, and saving;
+    - MCP from an unindexed project;
+    - the panel: face icons, moments, naming in place, a smart bin, merge with undo.

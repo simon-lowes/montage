@@ -40,6 +40,7 @@
 #include "media/Analysis.h"
 #include "media/AutoDuck.h"
 #include "media/Decoder.h"
+#include "media/Faces.h"
 #include "media/Transcriber.h"
 #include "media/VisualSearch.h"
 #include "render/ClipAnalysis.h"
@@ -356,6 +357,17 @@ struct McpServer::Impl {
     // Indexes the videos (all, or these and subclips' media) that have no visual index; an error message or "".
     QString indexMissing(Project& p, const std::vector<Id>& only, bool& changed);
 };
+
+namespace {
+// A person by id or (case-insensitively) by name.
+int personId(const Project& p, const QJsonValue& v) {
+    for (const PersonSummary& s : peopleIn(p))
+        if ((v.isDouble() && v.toInt() == s.id) || (v.isString() && QString::fromStdString(s.name).compare(v.toString().trimmed(), Qt::CaseInsensitive) == 0) ||
+            (v.isString() && v.toString().trimmed() == QString::number(s.id)))
+            return s.id;
+    throw ArgError{QStringLiteral("No person \"%1\" (montage_find_people lists them)").arg(v.isDouble() ? QString::number(v.toInt()) : v.toString())};
+}
+}  // namespace
 
 QString McpServer::Impl::indexMissing(Project& p, const std::vector<Id>& only, bool& changed) {
     std::vector<Id> want;
@@ -1342,6 +1354,90 @@ void McpServer::Impl::addTools() {
                             .arg(double(h.score), 0, 'f', 3);
             }
             return ok(text.isEmpty() ? QStringLiteral("No indexed video") : text, QJsonObject{{"moments", list}});
+        });
+
+    add("montage_find_people", "Find people",
+        "Find who is in the project's footage, on this computer: faces in the videos and stills not looked through yet "
+        "are found (YuNet) and told apart (SFace), then grouped into people across the project (saved in the project). "
+        "Lists everyone, most seen first, with an id and a name (\"Person N\" until named with montage_name_person). "
+        "Give person (an id or name) for the moments they are seen: media file and media times.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "person":{"type":["integer","string"],"description":"A person's id or name"},
+            "max":{"type":"integer","default":50,"description":"At most this many moments"}},"required":["project"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            if (!faceSearchAvailable()) return fail("This build of Montage cannot find people (no ONNX Runtime)");
+            bool changed = false;
+            for (MediaItem& m : l.project.media) {
+                if ((m.kind != MediaKind::Video && m.kind != MediaKind::Image) || !m.hasVideo || m.path.empty() || m.subclipOf || m.faces)
+                    continue;
+                if (!faceModel().installed())
+                    return fail("The face models are not downloaded: run `scripts/fetch-models.sh` or use Find People in the app once");
+                FaceIndex f;
+                std::string err;
+                if (!indexFaces(m.path, m.kind == MediaKind::Image ? 0.0 : m.duration, f, 0, 8, 32,
+                                [&](double x) { progress(x, QStringLiteral("Looking for faces in %1").arg(QString::fromStdString(m.name))); },
+                                nullptr, &err))
+                    return fail(QString::fromStdString(m.name + ": " + err));
+                m.faces = std::make_shared<const FaceIndex>(std::move(f));
+                changed = true;
+            }
+            if (changed) {
+                groupPeople(l.project);
+                save(l);
+            }
+            const auto people = peopleIn(l.project);
+            QJsonArray list;
+            QString text;
+            for (const PersonSummary& s : people) {
+                list.append(QJsonObject{{"id", s.id}, {"name", QString::fromStdString(s.name)}, {"clips", s.media}, {"faces", s.faces}});
+                text += QStringLiteral("%1 (id %2): in %3 clip(s)\n").arg(QString::fromStdString(s.name)).arg(s.id).arg(s.media);
+            }
+            QJsonObject out{{"people", list}};
+            if (a.contains("person")) {
+                const int id = personId(l.project, a.value("person"));
+                QJsonArray moments;
+                const auto found = findPerson(l.project, id);
+                const size_t max = size_t(std::clamp(a.value("max").toInt(50), 1, 1000));
+                text += QStringLiteral("\n%1 is seen in:\n").arg(QString::fromStdString(personName(l.project, id)));
+                for (size_t i = 0; i < found.size() && i < max; ++i) {
+                    const PersonMoment& pm = found[i];
+                    const MediaItem* m = l.project.findMedia(pm.media);
+                    if (!m) continue;
+                    moments.append(QJsonObject{{"media", QString::fromStdString(m->path)}, {"start_seconds", pm.start},
+                                               {"end_seconds", pm.end}, {"best_seconds", pm.best}});
+                    text += QStringLiteral("%1  %2-%3 s\n").arg(QString::fromStdString(m->name)).arg(pm.start, 0, 'f', 1).arg(pm.end, 0, 'f', 1);
+                }
+                out["moments"] = moments;
+            }
+            return ok(text.isEmpty() ? QStringLiteral("No faces found") : text, out);
+        });
+
+    add("montage_name_person", "Name a person",
+        "Name a person found by montage_find_people (\"\" goes back to \"Person N\"), or, with same_as, join them with another "
+        "person found separately (the same person in different light, say). Smart bins that name them follow.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "person":{"type":["integer","string"],"description":"Their id or current name"},
+            "name":{"type":"string"},
+            "same_as":{"type":["integer","string"],"description":"Another person's id or name: merge into them"}},
+            "required":["project","person"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            int id = personId(l.project, a.value("person"));
+            QString text;
+            if (a.contains("same_as")) {
+                const int into = personId(l.project, a.value("same_as"));
+                if (!mergePeople(l.project, id, into)) return fail("Those are the same person");
+                text = QStringLiteral("Joined with %1").arg(QString::fromStdString(personName(l.project, into)));
+                id = into;
+            }
+            if (a.contains("name")) {
+                renamePerson(l.project, id, a.value("name").toString().trimmed().toStdString());
+                text += (text.isEmpty() ? "" : "; ") + QStringLiteral("named %1").arg(QString::fromStdString(personName(l.project, id)));
+            }
+            if (text.isEmpty()) throw ArgError{"Give name or same_as"};
+            save(l);
+            return ok(text, QJsonObject{{"id", id}, {"name", QString::fromStdString(personName(l.project, id))}});
         });
 
     add("montage_log_media", "Log media",

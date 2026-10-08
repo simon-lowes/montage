@@ -178,6 +178,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
   - On the command line: `montage-cli shots project.montage "a red car at night"`.
   - Right-click a result to save it as a subclip named after the search.
 - **Find Similar Shots** (Clip menu, or right-click a video in the bin): the moments across the project that look like the frame at the playhead (the other takes of a shot, cutaways of the same place), from the same CLIP index, leaving out the moment you are on.
+- **People** panel (like the people search in Photos and Final Cut Pro's people analysis): Find People looks through the project's videos (a frame every 1-2 s) and stills for faces and groups them into people across the project. Everyone is listed with their face; double-click to name them, or right-click to join two groups that are one person (Same Person As) or make a smart bin of the clips they are in. Choosing someone lists every moment they are seen; opening one marks it with In and Out in the Source monitor, and right-click saves it as a subclip named after them. Names also work in the bin's search and in smart bin rules (People includes...). It runs locally: YuNet (MIT) finds faces and SFace (Apache 2.0) tells them apart, a 39 MB one-time download. Faces found later join the person they look like; people already found keep their faces.
 - **Auto-Tag Shots** (right-click videos in the media bin): adds keywords for what each shot shows, using the same index. The keywords are Close-up, Medium shot or Wide shot; Interior or Exterior; Day or Night; and People. They work in searches and smart bins, and a subclip is tagged from its own range.
 - Edit by transcript (Transcript panel):
   - **Sequence mode** shows what the cut says, with the word under the playhead highlighted. Click a word to go there. Select words and press Delete to cut them out of every track; the gap closes and the captions move with it.
@@ -236,7 +237,7 @@ CMake options:
 - `-DMONTAGE_REQUIRE_ONNXRUNTIME=ON` stops the configure step if ONNX Runtime is missing (release builds use it).
 - `-DMONTAGE_WITH_THORVG=OFF` leaves out Lottie and SVG import (ThorVG 1.1.2, MIT, is fetched and compiled at configure time).
 
-The object mask, speaker and visual search tests need their models: `scripts/fetch-models.sh ~/montage-models`, then set `MONTAGE_OBJECT_MODEL=~/montage-models/edgetam-video`, `MONTAGE_SPEAKER_MODEL=~/montage-models/speakers` and `MONTAGE_VISUAL_MODEL=~/montage-models/clip-vit-b32` (the app reads the same variables). The speech tests read `MONTAGE_TEST_WHISPER_MODEL`.
+The object mask, speaker and visual search tests need their models: `scripts/fetch-models.sh ~/montage-models`, then set `MONTAGE_OBJECT_MODEL=~/montage-models/edgetam-video`, `MONTAGE_SPEAKER_MODEL=~/montage-models/speakers` and `MONTAGE_VISUAL_MODEL=~/montage-models/clip-vit-b32`; the people tests `MONTAGE_FACE_MODEL=~/montage-models/faces` (the app reads the same variables). The speech tests read `MONTAGE_TEST_WHISPER_MODEL`.
 
 ## Using the editor
 
@@ -278,6 +279,7 @@ montage-cli scenes interview.mp4 --sensitivity 0.6           # list shot changes
 montage-cli proxy a.mov -o a_proxy.mp4 --width 960
 montage-cli loudness mix.wav                                 # integrated LUFS and peak
 montage-cli upscale old-sd.mp4 -o hd.mov --factor 3          # Super Scale copy (Real-ESRGAN)
+montage-cli people project.montage --person "Jane"          # where someone is seen (YuNet + SFace)
 montage-cli edl cut.montage -o cut.edl                       # CMX 3600 EDL
 montage-cli otio cut.montage -o cut.otio                     # OpenTimelineIO
 montage-cli aaf cut.montage -o cut.aaf                       # AAF + WAVs for Pro Tools / Fairlight
@@ -309,7 +311,7 @@ Its tools work on `.montage` files by path. Each edit is saved at once, and the 
 - place media, split, remove (with ripple), move, trim and change the speed of clips;
 - add titles, effects (including masked ones), transitions and markers;
 - transcribe (with speaker labels), translate caption tracks, find spoken phrases in the cut, cut by transcript (phrases, filler words, long pauses, optionally with Smooth Cuts), and build a cut from a script;
-- find shots by description;
+- find shots by description, and find, name and join the people in the footage;
 - log media (ratings, labels, keywords, metadata fields, bins), make subclips, auto-tag shots, and find media by text or smart-bin rules, optionally saving the rules as a smart bin;
 - add shape layers (drawn on if asked), and write Super Scale copies of videos and stills;
 - make a first mix (roles, levels, dialogue rides, ducking), set up a 5.1 or 7.1 mix and place tracks in it, match voices to a reference, mark a music clip's bars or beats and fit music to a length, duck music under dialogue, match clips' colour to a shot, add adjustment layers, and make a reframed copy of the cut at another aspect ratio;
@@ -345,4 +347,4 @@ Notes on the design:
 
 ## Roadmap
 
-Phases 2 and 3 are ranked in [`docs/research/phase2-roadmap.md`](docs/research/phase2-roadmap.md) and [`docs/research/phase3-roadmap.md`](docs/research/phase3-roadmap.md) and tracked in [`PROGRESS.md`](PROGRESS.md); both are complete apart from the GPU compositor. Next up: the GPU compositor, and Phase 3's near misses (bleeping words from the transcript, checkerboarding dialogue by speaker, Find Similar shots, people search, depth maps, better slow motion).
+Phases 2 and 3 are ranked in [`docs/research/phase2-roadmap.md`](docs/research/phase2-roadmap.md) and [`docs/research/phase3-roadmap.md`](docs/research/phase3-roadmap.md) and tracked in [`PROGRESS.md`](PROGRESS.md); both are complete apart from the GPU compositor. Of Phase 3's near misses, bleeping words, checkerboarding dialogue by speaker, Find Similar shots and people search are in. Next up: the GPU compositor, depth maps and better slow motion.

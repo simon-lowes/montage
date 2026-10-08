@@ -64,6 +64,7 @@
 #include "CaptionsPanel.h"
 #include "MaskOverlay.h"
 #include "ShotSearchPanel.h"
+#include "PeoplePanel.h"
 #include "TranscriptPanel.h"
 #include "MonitorPanel.h"
 #include "PlaybackController.h"
@@ -255,6 +256,19 @@ void MainWindow::buildPanels() {
         state_->setSourceOut(out);
         source_->seek(at);
     });
+    people_ = new PeoplePanel(state_, this);
+    connect(people_, &PeoplePanel::openRequested, this, [this](Id media, FrameTime in, FrameTime out, FrameTime at) {
+        openInSource(media);
+        if (in >= 0 && out >= in) {
+            state_->setSourceIn(in);
+            state_->setSourceOut(out);
+        }
+        source_->seek(at);
+    });
+    connect(people_, &PeoplePanel::smartBinCreated, this, [this](Id id) {
+        bin_->showSmartBin(id);
+        binDock_->raise();
+    });
     meter_ = new AudioMeterWidget(this);
     multicam_ = new MulticamPanel(state_, program_, this);
 
@@ -268,6 +282,7 @@ void MainWindow::buildPanels() {
     captionsDock_ = makeDock(tr("Captions"), "captions", captions_);
     transcriptDock_ = makeDock(tr("Transcript"), "transcript", transcript_);
     shotsDock_ = makeDock(tr("Find Shots"), "shots", shots_);
+    peopleDock_ = makeDock(tr("People"), "people", people_);
     multicamDock_ = makeDock(tr("Multicam"), "multicam", multicam_);
     keyframesDock_ = makeDock(tr("Keyframes"), "keyframes", new KeyframePanel(state_, this));
     queue_ = new RenderQueue(this);
@@ -337,6 +352,7 @@ void MainWindow::resetLayout() {
     tabifyDockWidget(binDock_, effectsDock_);
     tabifyDockWidget(binDock_, transcriptDock_);
     tabifyDockWidget(binDock_, shotsDock_);
+    tabifyDockWidget(binDock_, peopleDock_);
     tabifyDockWidget(binDock_, queueDock_);
     binDock_->raise();
     addDockWidget(Qt::RightDockWidgetArea, meterDock_);

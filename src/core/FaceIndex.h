@@ -50,7 +50,8 @@ struct Person {
 // Returns the number of people.
 int groupPeople(Project& p, float threshold = 0.42f, bool regroup = false);
 // Makes `from` the same person as `into` (who keeps their name, or takes
-// `from`'s if they had none). False if either has no faces.
+// `from`'s if they had none). False if either has no faces. Smart bin rules
+// naming a person follow these changes.
 bool mergePeople(Project& p, int from, int into);
 // False if there is no such person or the name is unchanged; "" for "Person N".
 bool renamePerson(Project& p, int person, const std::string& name);
@@ -69,7 +70,8 @@ struct PersonSummary {
 // Everyone found, most seen first.
 std::vector<PersonSummary> peopleIn(const Project& p);
 
-// Where a person is seen: runs of samples with their face, joined across gaps of up to one step.
+// Where a person is seen: runs of samples with their face, joined across gaps
+// of up to one step (a still: 0 to 0).
 struct PersonMoment {
     uint64_t media = 0;
     double start = 0, end = 0;  // media seconds

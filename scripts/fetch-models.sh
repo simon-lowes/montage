@@ -6,6 +6,7 @@
 #   <dir>/clip-vit-b32   Find Shots         (MONTAGE_VISUAL_MODEL)
 #   <dir>/speech-enhance Enhance Speech     (MONTAGE_SPEECH_MODEL)
 #   <dir>/upscale        Super Scale        (MONTAGE_UPSCALE_MODEL)
+#   <dir>/faces          Find People        (MONTAGE_FACE_MODEL)
 #
 #   scripts/fetch-models.sh [dir]      (default: ./models)
 set -euo pipefail
@@ -47,4 +48,10 @@ fetch speech-enhance deepfilternet3.onnx \
 fetch upscale realesr-general-x4v3.onnx \
   https://huggingface.co/jonathanst29/tinier-upscale-models/resolve/899dc1e4b22bbf1955c2f1739c085edc080cb366/realesr-general-x4v3.onnx \
   924ebad6532777303582d4ce7811849b88869231a3ae7093e0f21200249df8d5
-echo "Models in $DIR: MONTAGE_OBJECT_MODEL=$DIR/edgetam-video MONTAGE_SPEAKER_MODEL=$DIR/speakers MONTAGE_VISUAL_MODEL=$DIR/clip-vit-b32 MONTAGE_SPEECH_MODEL=$DIR/speech-enhance MONTAGE_UPSCALE_MODEL=$DIR/upscale"
+fetch faces face_detection_yunet_2023mar.onnx \
+  https://huggingface.co/opencv/face_detection_yunet/resolve/3cc26e7f1014a5ee5d74a42acee58bafc9d0a310/face_detection_yunet_2023mar.onnx \
+  8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4
+fetch faces face_recognition_sface_2021dec.onnx \
+  https://huggingface.co/opencv/face_recognition_sface/resolve/3d7082438a6e4551e840c9b2bb60b71e8da4b524/face_recognition_sface_2021dec.onnx \
+  0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79
+echo "Models in $DIR: MONTAGE_OBJECT_MODEL=$DIR/edgetam-video MONTAGE_SPEAKER_MODEL=$DIR/speakers MONTAGE_VISUAL_MODEL=$DIR/clip-vit-b32 MONTAGE_SPEECH_MODEL=$DIR/speech-enhance MONTAGE_UPSCALE_MODEL=$DIR/upscale MONTAGE_FACE_MODEL=$DIR/faces"

@@ -2112,6 +2112,53 @@ private slots:
         QCOMPARE(groupPeople(p, 0.42f, true), 2);
         QCOMPARE(p.media[0].faces->faces[0].person, jfk);
         QVERIFY(p.media[2].faces->faces[0].person != jfk);
+        // A smart bin naming someone follows them to a new name, and into a merge.
+        const int armstrong = p.media[2].faces->faces[0].person;
+        SmartBin named;
+        named.id = p.newId();
+        named.rules.push_back({"people", "includes", personName(p, armstrong)});
+        p.smartBins.push_back(named);
+        QVERIFY(renamePerson(p, armstrong, "Buzz"));
+        QCOMPARE(p.smartBins.back().rules[0].value, std::string("Buzz"));
+        QCOMPARE(smartBinMedia(p, p.smartBins.back()), std::vector<Id>{p.media[2].id});
+        QVERIFY(mergePeople(p, armstrong, jfk));
+        QCOMPARE(p.smartBins.back().rules[0].value, std::string("JFK"));
+
+        // Through MCP: found, named and joined.
+        const QString project = QString::fromStdString(path("people-mcp.montage"));
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonArray stills;
+        for (const Ref& r : refs) stills.append(QString(MONTAGE_TEST_DATA_DIR "/faces/") + r.file);
+        QJsonObject r = call("montage_create_project", {{"project", project}, {"media", stills}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        r = call("montage_find_people", {{"project", project}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QJsonArray found = r.value("structuredContent").toObject().value("people").toArray();
+        QCOMPARE(found.size(), 2);
+        QCOMPARE(found[0].toObject().value("clips").toInt(), 2);
+        const int first = found[0].toObject().value("id").toInt(), second = found[1].toObject().value("id").toInt();
+        r = call("montage_name_person", {{"project", project}, {"person", first}, {"name", "John Kennedy"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        r = call("montage_find_people", {{"project", project}, {"person", "john kennedy"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonArray seen = r.value("structuredContent").toObject().value("moments").toArray();
+        QCOMPARE(seen.size(), 2);
+        QVERIFY(seen[0].toObject().value("media").toString().contains("jfk"));
+        QVERIFY(call("montage_find_people", {{"project", project}, {"person", "Nobody"}}).value("isError").toBool());
+        r = call("montage_name_person", {{"project", project}, {"person", second}, {"same_as", "John Kennedy"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        Project afterMcp;
+        QVERIFY(loadProject(project.toStdString(), afterMcp, &err));
+        QCOMPARE(int(peopleIn(afterMcp).size()), 1);
+        QCOMPARE(peopleIn(afterMcp)[0].name, std::string("John Kennedy"));
     }
 
     void visualSearch() {

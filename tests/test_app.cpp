@@ -66,7 +66,9 @@
 #include "MaskOverlay.h"
 #include "media/Diarizer.h"
 #include "media/VisualSearch.h"
+#include "media/Faces.h"
 #include "ShotSearchPanel.h"
+#include "PeoplePanel.h"
 #include "media/Segmenter.h"
 #include "MonitorPanel.h"
 #include "PlaybackController.h"
@@ -3334,6 +3336,58 @@ const auto seq = [this] { return state()->sequence(); };
         state()->undo();
         QVERIFY(std::fabs(edit::clipById(*state()->sequence(), red)->effects.back().p("tl_x", 10)) < 1e-9);
         state()->setSelection({}, false);
+    }
+
+    void peoplePanel() {
+        state()->newProject();
+        const QString faces = QStringLiteral(MONTAGE_TEST_DATA_DIR "/faces/");
+        const auto ids = state()->importFiles({faces + "jfk-color.jpg", faces + "jfk-looking-up.jpg", faces + "armstrong.jpg"});
+        QCOMPARE(ids.size(), size_t(3));
+        auto* panel = win_->findChild<PeoplePanel*>();
+        QVERIFY(panel);
+        auto* status = panel->findChild<QLabel*>("peopleStatus");
+        if (!faceSearchAvailable() || !faceModel().installed()) QSKIP("Needs ONNX Runtime and the face models (MONTAGE_FACE_MODEL)");
+        QTRY_VERIFY(status->text().contains("0 of 3"));
+        QVERIFY(panel->findChild<QPushButton*>("findPeople")->isEnabled());
+        QVERIFY(panel->findPeople());
+        QTRY_VERIFY(status->text().contains("3 of 3"));
+        QVERIFY(!panel->findChild<QPushButton*>("findPeople")->isEnabled());
+        QCOMPARE(int(panel->people().size()), 2);
+        auto* list = panel->findChild<QListWidget*>("peopleList");
+        QCOMPARE(list->count(), 2);
+        // Their faces load as icons.
+        QTRY_VERIFY(!list->item(0)->icon().isNull());
+        // Kennedy (in two stills) first; choosing him lists both.
+        QCOMPARE(panel->selectPerson(0), 2);
+        QCOMPARE(panel->findChild<QListWidget*>("personMoments")->count(), 2);
+        const int jfk = panel->currentPerson();
+        // Named in place, as one undo step.
+        list->item(0)->setText("Jack");
+        QTRY_COMPARE(QString::fromStdString(personName(state()->project(), jfk)), QString("Jack"));
+        QCOMPARE(panel->currentPerson(), jfk);
+        // A smart bin of the stills he is in.
+        const Id bin = panel->makeSmartBin(jfk);
+        QVERIFY(bin);
+        auto* binWidget = win_->findChild<MediaBinWidget*>();
+        QCOMPARE(binWidget->currentSmartBin(), bin);
+        QCOMPARE(int(smartBinMedia(state()->project(), *findSmartBin(state()->project(), bin)).size()), 2);
+        // Opening a still loads it in the Source monitor.
+        panel->open(0);
+        QVERIFY(state()->sourceMedia() == ids[0] || state()->sourceMedia() == ids[1]);
+        QCOMPARE(panel->makeSubclip(0), Id(0));  // no subclips of stills
+        // Same Person As: joined, the smart bin follows, and undo splits them again.
+        const int neil = panel->people()[1].id;
+        QVERIFY(panel->merge(neil, jfk));
+        QCOMPARE(int(panel->people().size()), 1);
+        QCOMPARE(int(smartBinMedia(state()->project(), *findSmartBin(state()->project(), bin)).size()), 3);
+        state()->undo();
+        QCOMPARE(int(panel->people().size()), 2);
+        state()->undo();  // the smart bin
+        state()->undo();  // the name
+        QCOMPARE(QString::fromStdString(personName(state()->project(), jfk)), QString("Person %1").arg(jfk));
+        // The bin's search finds people by name.
+        QVERIFY(panel->rename(neil, "Neil Armstrong"));
+        QVERIFY(mediaMatchesSearch(*state()->project().findMedia(ids[2]), "neil", &state()->project()));
     }
 
     void objectMaskFromViewer() {

@@ -4,6 +4,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <map>
 #include <set>
@@ -176,6 +177,19 @@ int groupPeople(Project& p, float threshold, bool regroup) {
     return int(people.size());
 }
 
+namespace {
+// Smart bin rules that name a person follow them to a new name.
+void renameInRules(Project& p, const std::string& from, const std::string& to) {
+    auto lower = [](std::string s) {
+        for (char& c : s) c = char(std::tolower(static_cast<unsigned char>(c)));
+        return s;
+    };
+    for (SmartBin& b : p.smartBins)
+        for (SmartRule& r : b.rules)
+            if (r.field == "people" && lower(r.value) == lower(from)) r.value = to;
+}
+}  // namespace
+
 bool mergePeople(Project& p, int from, int into) {
     if (from == into || from <= 0 || into <= 0) return false;
     bool any = false, hasInto = false;
@@ -192,12 +206,14 @@ bool mergePeople(Project& p, int from, int into) {
     }
     if (!any || !hasInto) return false;
     // The name kept is the one they were merged into, or else theirs.
+    const std::string fromName = personName(p, from);
     std::string name;
     for (const Person& x : p.people)
         if (x.id == from) name = x.name;
     for (Person& x : p.people)
         if (x.id == into && x.name.empty()) x.name = name;
     p.people.erase(std::remove_if(p.people.begin(), p.people.end(), [&](const Person& x) { return x.id == from; }), p.people.end());
+    renameInRules(p, fromName, personName(p, into));
     return true;
 }
 
@@ -205,7 +221,9 @@ bool renamePerson(Project& p, int person, const std::string& name) {
     for (Person& x : p.people)
         if (x.id == person) {
             if (x.name == name) return false;
+            const std::string before = personName(p, person);
             x.name = name;
+            renameInRules(p, before, personName(p, person));
             return true;
         }
     return false;
@@ -272,8 +290,11 @@ std::vector<PersonMoment> findPerson(const Project& p, int person) {
             out.back().end = f->time;
             if (f->w * f->h > bestSize) bestSize = f->w * f->h, out.back().best = f->time;
         }
-        for (PersonMoment& pm : out)
-            if (pm.media == m.id) pm.end = m.duration > 0 ? std::min(m.duration, pm.end + step / 2) : pm.end + step / 2;
+        for (PersonMoment& pm : out) {
+            if (pm.media != m.id) continue;
+            if (m.faces->step <= 0) pm.start = pm.end = pm.best = 0;  // a still
+            else pm.end = m.duration > 0 ? std::min(m.duration, pm.end + step / 2) : pm.end + step / 2;
+        }
     }
     return out;
 }

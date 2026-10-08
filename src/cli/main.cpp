@@ -34,6 +34,7 @@
 #include "media/SuperScale.h"
 #include "media/Translator.h"
 #include "media/VisualSearch.h"
+#include "media/Faces.h"
 #include "media/Transcriber.h"
 #endif
 #include "render/ColorSpace.h"
@@ -81,6 +82,7 @@ int usage() {
                  "                     [--srt out.srt] [--vtt out.vtt] [--json out.json] [--txt out.txt]\n"
                  "  montage-cli models\n"
                  "  montage-cli shots <project.montage> \"a red car at night\" [--max N]   (find shots by description)\n"
+                 "  montage-cli people <project.montage> [--person NAME|ID]   (who is in the footage, and where)\n"
                  "  montage-cli mcp                       (Model Context Protocol server on stdio, for AI agents)\n"
                  "  montage-cli captions <project.montage> [-o out.srt|out.vtt|out.scc] [--transcribe MODEL]\n"
                  "                     [--generate] [--import file.srt] [--save]\n"
@@ -612,6 +614,11 @@ int cmdModels() {
     else
         std::printf("  %-22s %6.1f MB  %s\n", upscaleModel().id.c_str(), double(upscaleModel().bytes()) / 1e6,
                     upscaleModel().installed() ? "downloaded" : "");
+    std::printf("\nFace models (YuNet and SFace, for Find People; folder: %s)\n", faceModel().directory().c_str());
+    if (!faceSearchAvailable()) std::printf("  unavailable: this build has no ONNX Runtime\n");
+    else
+        std::printf("  %-22s %6.1f MB  %s\n", faceModel().id.c_str(), double(faceModel().bytes()) / 1e6,
+                    faceModel().installed() ? "downloaded" : "");
     return 0;
 }
 
@@ -905,6 +912,65 @@ int cmdShots(const std::vector<std::string>& args) {
     return 0;
 }
 
+// Lists the people in the footage, finding faces in media not looked through yet (and saving them).
+int cmdPeople(const std::vector<std::string>& args) {
+    if (args.empty()) return usage();
+    std::string who;
+    for (size_t i = 1; i < args.size(); ++i)
+        if (args[i] == "--person" && i + 1 < args.size()) who = args[++i];
+        else return usage();
+    Project p;
+    if (!load(args[0], p)) return 1;
+    if (!faceSearchAvailable()) {
+        std::fprintf(stderr, "error: this build has no ONNX Runtime\n");
+        return 1;
+    }
+    std::string err;
+    bool changed = false;
+    for (MediaItem& m : p.media) {
+        if ((m.kind != MediaKind::Video && m.kind != MediaKind::Image) || !m.hasVideo || m.path.empty() || m.subclipOf || m.faces) continue;
+        FaceIndex f;
+        const bool ok = indexFaces(
+            m.path, m.kind == MediaKind::Image ? 0.0 : m.duration, f, 0, 8, 32,
+            [&](double x) {
+                std::fprintf(stderr, "\rLooking for faces in %s... %5.1f%%", m.name.c_str(), x * 100);
+                std::fflush(stderr);
+            },
+            nullptr, &err);
+        std::fprintf(stderr, "\n");
+        if (!ok) {
+            std::fprintf(stderr, "error: %s: %s\n", m.name.c_str(), err.c_str());
+            return 1;
+        }
+        m.faces = std::make_shared<const FaceIndex>(std::move(f));
+        changed = true;
+    }
+    if (changed) {
+        groupPeople(p);
+        if (!saveProject(p, args[0], &err)) {
+            std::fprintf(stderr, "error: %s\n", err.c_str());
+            return 1;
+        }
+    }
+    const auto people = peopleIn(p);
+    if (who.empty()) {
+        for (const PersonSummary& s : people) std::printf("%4d  %-30s %d clip(s)\n", s.id, s.name.c_str(), s.media);
+        if (people.empty()) std::printf("No faces found\n");
+        return 0;
+    }
+    for (const PersonSummary& s : people) {
+        if (std::to_string(s.id) != who && QString::fromStdString(s.name).compare(QString::fromStdString(who), Qt::CaseInsensitive) != 0) continue;
+        for (const PersonMoment& pm : findPerson(p, s.id))
+            if (const MediaItem* m = p.findMedia(pm.media)) {
+                if (m->kind == MediaKind::Image) std::printf("%-30s still\n", m->name.c_str());
+                else std::printf("%-30s %8.2f - %8.2f s\n", m->name.c_str(), pm.start, pm.end);
+            }
+        return 0;
+    }
+    std::fprintf(stderr, "error: no person \"%s\"\n", who.c_str());
+    return 1;
+}
+
 int cmdPresets() {
     for (const auto& p : exportPresets())
         std::printf("%-28s .%-5s %s\n", p.name.c_str(), p.extension.c_str(), p.description.c_str());
@@ -951,6 +1017,7 @@ int main(int argc, char** argv) {
     }
 #endif
     if (cmd == "shots") return cmdShots(args);
+    if (cmd == "people") return cmdPeople(args);
     if (cmd == "mcp") {
         // A Model Context Protocol server on stdin/stdout: stdout carries only protocol messages.
         McpServer server;
