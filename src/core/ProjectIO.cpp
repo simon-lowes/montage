@@ -427,6 +427,11 @@ QJsonObject sequenceToJson(const Sequence& s) {
     }
     if (s.masterVolumeDb != 0) o["masterVolumeDb"] = s.masterVolumeDb;
     if (s.multicam) o["multicam"] = true;
+    if (!s.folderGains.empty()) {
+        QJsonObject gains;
+        for (const auto& [k, db] : s.folderGains) gains[qs(k)] = db;
+        o["folderGains"] = gains;
+    }
     if (!s.collapsedFolders.empty()) {
         QJsonArray folders;
         for (const std::string& f : s.collapsedFolders) folders.append(qs(f));
@@ -453,6 +458,8 @@ Sequence sequenceFromJson(const QJsonObject& o) {
     s.playhead = i64(o.value("playhead"), 0);
     s.multicam = o.value("multicam").toBool(false);
     for (const auto& f : o.value("collapsedFolders").toArray()) s.collapsedFolders.push_back(f.toString().toStdString());
+    const QJsonObject gains = o.value("folderGains").toObject();
+    for (auto it = gains.begin(); it != gains.end(); ++it) s.folderGains[it.key().toStdString()] = it.value().toDouble();
     s.colorSpace = o.contains("colorSpace") ? ss(o.value("colorSpace")) : "rec709";
     s.hdrPeakNits = std::clamp(o.value("hdrPeakNits").toDouble(1000), 100.0, 10000.0);
     s.audioLayout = o.contains("audioLayout") ? ss(o.value("audioLayout")) : "stereo";

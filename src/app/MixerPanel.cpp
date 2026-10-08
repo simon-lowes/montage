@@ -383,11 +383,64 @@ MixerPanel::Strip MixerPanel::makeStrip(int index) {
     return s;
 }
 
+std::vector<std::string> MixerPanel::audioFolders() const {
+    std::vector<std::string> out;
+    if (const Sequence* seq = state_->sequence())
+        for (const Track& t : seq->audioTracks)
+            if (!t.folder.empty() && std::find(out.begin(), out.end(), t.folder) == out.end()) out.push_back(t.folder);
+    return out;
+}
+
+// A folder's fader: a VCA adding its level to every track in the folder, as Fairlight's and Pro Tools' VCAs do.
+MixerPanel::FolderStrip MixerPanel::makeFolderStrip(const std::string& folder) {
+    FolderStrip f;
+    f.folder = folder;
+    auto* box = new QFrame(stripHost_);
+    box->setObjectName(QStringLiteral("mixerFolderStrip"));
+    box->setFixedWidth(kStripWidth);
+    box->setStyleSheet(QStringLiteral("#mixerFolderStrip { border-top: 3px solid #d8a85a; }"));
+    f.box = box;
+    auto* v = new QVBoxLayout(box);
+    v->setContentsMargins(4, 4, 4, 4);
+    v->setSpacing(3);
+    f.name = smallLabel(box, 11);
+    QFont nf = f.name->font();
+    nf.setBold(true);
+    f.name->setFont(nf);
+    f.name->setText(f.name->fontMetrics().elidedText(QString::fromStdString(folder), Qt::ElideRight, kStripWidth - 12));
+    f.name->setToolTip(tr("Folder %1: its fader raises or lowers all of its tracks").arg(QString::fromStdString(folder)));
+    v->addWidget(f.name);
+    auto* tag = smallLabel(box);
+    tag->setText(tr("VCA"));
+    v->addWidget(tag);
+    f.fader = new QSlider(Qt::Vertical, box);
+    f.fader->setObjectName(QStringLiteral("folderFader"));
+    f.fader->setRange(kFaderMin, kFaderMax);
+    f.fader->setPageStep(30);
+    f.fader->setMinimumHeight(80);
+    f.fader->setToolTip(tr("Folder level, added to each of its tracks (double-click for 0 dB)"));
+    f.fader->installEventFilter(this);
+    v->addWidget(f.fader, 1, Qt::AlignHCenter);
+    f.dbLabel = smallLabel(box);
+    v->addWidget(f.dbLabel);
+    connect(f.fader, &QSlider::valueChanged, this, [this, folder](int value) {
+        const double db = value / 10.0;
+        state_->edit(tr("Folder Level"), [folder, db](Project&, Sequence& s) {
+            if (edit::folderGain(s, TrackKind::Audio, folder) == db) return false;
+            edit::setFolderGain(s, TrackKind::Audio, folder, db);
+            return true;
+        }, QStringLiteral("folder-volume-") + QString::fromStdString(folder));
+    });
+    return f;
+}
+
 void MixerPanel::syncToProject() {
     const Sequence* seq = state_->sequence();
     const size_t count = seq ? seq->audioTracks.size() : 0;
     const size_t buses = seq ? seq->buses.size() : 0;
-    if (count != strips_.size() || buses != busStrips_.size())
+    std::vector<std::string> shown;
+    for (const FolderStrip& f : folderStrips_) shown.push_back(f.folder);
+    if (count != strips_.size() || buses != busStrips_.size() || shown != audioFolders())
         rebuild();
     else
         refresh();
@@ -406,6 +459,12 @@ void MixerPanel::rebuild() {
         b.box->deleteLater();
     }
     busStrips_.clear();
+    for (FolderStrip& f : folderStrips_) {
+        stripLayout_->removeWidget(f.box);
+        f.box->hide();
+        f.box->deleteLater();
+    }
+    folderStrips_.clear();
     if (!addBus_) {
         addBus_ = new QToolButton(stripHost_);
         addBus_->setObjectName(QStringLiteral("addBus"));
@@ -422,6 +481,10 @@ void MixerPanel::rebuild() {
         strips_.push_back(makeStrip(i));
         stripLayout_->insertWidget(stripLayout_->count() - 1, strips_.back().box);  // before the stretch
     }
+    for (const std::string& folder : audioFolders()) {
+        folderStrips_.push_back(makeFolderStrip(folder));
+        stripLayout_->insertWidget(stripLayout_->count() - 1, folderStrips_.back().box);
+    }
     if (seq)
         for (const Bus& b : seq->buses) {
             busStrips_.push_back(makeBusStrip(b.id));
@@ -436,6 +499,14 @@ void MixerPanel::refresh() {
     const Sequence* seq = state_->sequence();
     if (!seq)
         return;
+    for (FolderStrip& f : folderStrips_) {
+        const double db = edit::folderGain(*seq, TrackKind::Audio, f.folder);
+        if (!f.fader->isSliderDown()) {
+            const QSignalBlocker block(f.fader);
+            f.fader->setValue(int(std::lround(std::clamp(db, -60.0, 12.0) * 10.0)));
+        }
+        f.dbLabel->setText(dbText(db));
+    }
     for (size_t i = 0; i < strips_.size() && i < seq->audioTracks.size(); ++i) {
         const Track& t = seq->audioTracks[i];
         Strip& s = strips_[i];

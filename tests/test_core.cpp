@@ -2638,9 +2638,16 @@ private slots:
         QVERIFY(projectFromJson(projectToJson(fx.p), back));
         QCOMPARE(back.active()->audioTracks[2].folder, std::string("Dial"));
         QVERIFY(folderCollapsed(*back.active(), TrackKind::Audio, "Dial"));
+        // A folder fader, saved with the sequence.
+        setFolderGain(fx.s(), TrackKind::Audio, "Dial", -3.5);
+        Project gained;
+        QVERIFY(projectFromJson(projectToJson(fx.p), gained));
+        QCOMPARE(folderGain(*gained.active(), TrackKind::Audio, "Dial"), -3.5);
+        QCOMPARE(folderGain(*gained.active(), TrackKind::Video, "Dial"), 0.0);
         // Emptied, the folder is forgotten.
         QVERIFY(setTrackFolder(fx.s(), {{TrackKind::Audio, 1}, {TrackKind::Audio, 2}}, "").ok);
         QVERIFY(fx.s().collapsedFolders.empty());
+        QVERIFY(fx.s().folderGains.empty());
     }
 
     void auditions() {

@@ -1582,11 +1582,13 @@ Result setTrackFolder(Sequence& s, const std::vector<TrackRef>& tracks, const st
     for (TrackRef r : tracks)
         if (!trackAt(s, r)) return Result::fail("No such track");
     for (TrackRef r : tracks) trackAt(s, r)->folder = folder;
-    // Forget collapsed folders that no longer have tracks.
-    std::erase_if(s.collapsedFolders, [&](const std::string& key) {
+    // Forget the settings of folders that no longer have tracks.
+    auto gone = [&](const std::string& key) {
         const TrackKind kind = key.rfind("V/", 0) == 0 ? TrackKind::Video : TrackKind::Audio;
         return folderTracks(s, kind, key.substr(2)).empty();
-    });
+    };
+    std::erase_if(s.collapsedFolders, gone);
+    std::erase_if(s.folderGains, [&](const auto& kv) { return gone(kv.first); });
     return {};
 }
 
@@ -1610,15 +1612,30 @@ void setFolderCollapsed(Sequence& s, TrackKind kind, const std::string& folder, 
     if (collapsed && !folder.empty()) s.collapsedFolders.push_back(key);
 }
 
+double folderGain(const Sequence& s, TrackKind kind, const std::string& folder) {
+    if (folder.empty()) return 0;
+    const auto it = s.folderGains.find(folderKey(kind, folder));
+    return it == s.folderGains.end() ? 0.0 : it->second;
+}
+
+void setFolderGain(Sequence& s, TrackKind kind, const std::string& folder, double db) {
+    if (folder.empty()) return;
+    if (std::fabs(db) < 1e-9) s.folderGains.erase(folderKey(kind, folder));
+    else s.folderGains[folderKey(kind, folder)] = db;
+}
+
 Result renameFolder(Sequence& s, TrackKind kind, const std::string& from, const std::string& to) {
     if (to.empty() || to.find('/') != std::string::npos) return Result::fail("Give the folder a name without a slash");
     if (to != from && !folderTracks(s, kind, to).empty()) return Result::fail("There is already a folder called " + to);
     const std::vector<int> members = folderTracks(s, kind, from);
     if (members.empty()) return Result::fail("No such folder");
     const bool collapsed = folderCollapsed(s, kind, from);
+    const double gain = folderGain(s, kind, from);
     for (int i : members) trackAt(s, {kind, i})->folder = to;
     setFolderCollapsed(s, kind, from, false);
     setFolderCollapsed(s, kind, to, collapsed);
+    setFolderGain(s, kind, from, 0);
+    setFolderGain(s, kind, to, gain);
     return {};
 }
 

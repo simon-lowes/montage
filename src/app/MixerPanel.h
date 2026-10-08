@@ -36,6 +36,12 @@ public:
     void playbackStopped(FrameTime t);
     bool recordingAutomation() const { return !recording_.empty(); }
     QSlider* trackFader(int index) const { return index >= 0 && index < int(strips_.size()) ? strips_[size_t(index)].fader : nullptr; }
+    // A track folder's fader (a VCA over its tracks), shown after the track strips; nullptr if no such folder.
+    QSlider* folderFader(const QString& folder) const {
+        for (const FolderStrip& f : folderStrips_)
+            if (f.folder == folder.toStdString()) return f.fader;
+        return nullptr;
+    }
     QDial* trackPan(int index) const { return index >= 0 && index < int(strips_.size()) ? strips_[size_t(index)].pan : nullptr; }
     QComboBox* trackAutomationMode(int index) const {
         return index >= 0 && index < int(strips_.size()) ? strips_[size_t(index)].automation : nullptr;
@@ -81,6 +87,16 @@ private:
         SurroundPanner* surround = nullptr;
     };
 
+    struct FolderStrip {
+        QWidget* box = nullptr;
+        QLabel* name = nullptr;
+        QSlider* fader = nullptr;
+        QLabel* dbLabel = nullptr;
+        std::string folder;
+    };
+    FolderStrip makeFolderStrip(const std::string& folder);
+    std::vector<std::string> audioFolders() const;  // in track order
+
     void syncToProject();  // rebuild if the audio track count changed, else refresh
     void rebuild();
     void refresh();
@@ -105,6 +121,7 @@ private:
     QHBoxLayout* stripLayout_ = nullptr;
     std::vector<Strip> strips_;
     std::vector<BusStrip> busStrips_;
+    std::vector<FolderStrip> folderStrips_;
     QToolButton* addBus_ = nullptr;
     AudioMeterWidget* masterMeter_ = nullptr;
     QToolButton* masterFx_ = nullptr;

@@ -161,6 +161,9 @@ Result setTrackFolder(Sequence& s, const std::vector<TrackRef>& tracks, const st
 std::vector<int> folderTracks(const Sequence& s, TrackKind kind, const std::string& folder);
 bool folderCollapsed(const Sequence& s, TrackKind kind, const std::string& folder);
 void setFolderCollapsed(Sequence& s, TrackKind kind, const std::string& folder, bool collapsed);
+// A folder's fader (a VCA: added to each of its tracks' faders in the mix), dB; 0 when unset.
+double folderGain(const Sequence& s, TrackKind kind, const std::string& folder);
+void setFolderGain(Sequence& s, TrackKind kind, const std::string& folder, double db);
 // Renames a folder (its tracks follow); fails if the new name is taken or empty.
 Result renameFolder(Sequence& s, TrackKind kind, const std::string& from, const std::string& to);
 

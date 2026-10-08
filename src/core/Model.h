@@ -312,6 +312,7 @@ struct Sequence {
     double masterVolumeDb = 0;
     bool multicam = false;              // a multicam clip's sequence: video tracks are angles (Multicam.h)
     std::vector<std::string> collapsedFolders;  // track folders shown collapsed: "V/name" or "A/name"
+    std::map<std::string, double> folderGains;  // audio track folders' faders (a VCA over their tracks), dB, by "A/name"
     std::string colorSpace = "rec709";  // working and delivery space (ColorSpace.h id)
     double hdrPeakNits = 1000;          // mastering peak for HDR spaces
     FrameTime inPoint = -1;   // In / Out marks; both frames are included, -1 = unset

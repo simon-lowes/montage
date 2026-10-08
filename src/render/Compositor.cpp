@@ -1861,6 +1861,7 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
             }
             tg = 1;
         }
+        tg *= dbToLin(edit::folderGain(seq, TrackKind::Audio, track.folder));  // its folder's fader (a VCA)
         MeterLevels lv;
         if (surround && bus == busBufs.end()) {
             // Straight to the speakers through the track's surround panner.

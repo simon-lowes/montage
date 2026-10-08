@@ -4619,7 +4619,17 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(!state()->sequence()->audioTracks[3].muted);
         QTest::mouseClick(tl->viewport(), Qt::LeftButton, {}, mute);
         QVERIFY(!state()->sequence()->audioTracks[1].muted && !state()->sequence()->audioTracks[2].muted);
+
+        // The mixer shows the folder's fader (a VCA); moving it is one undoable level for the folder.
+        auto* mixer = win_->findChild<MixerPanel*>();
+        QTRY_VERIFY(mixer->folderFader("Dialogue"));
+        mixer->folderFader("Dialogue")->setValue(-60);  // -6.0 dB
+        QCOMPARE(edit::folderGain(*state()->sequence(), TrackKind::Audio, "Dialogue"), -6.0);
+        state()->undo();
+        QCOMPARE(edit::folderGain(*state()->sequence(), TrackKind::Audio, "Dialogue"), 0.0);
+        QTRY_COMPARE(mixer->folderFader("Dialogue")->value(), 0);
         state()->newProject();
+        QTRY_VERIFY(!mixer->folderFader("Dialogue"));
     }
 
     void quadScopes() {

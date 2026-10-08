@@ -592,6 +592,37 @@ private slots:
                  qPrintable(QString("%1 %2").arg(out[4000 * 2]).arg(out[4000 * 2 + 1])));
     }
 
+    void folderFaderInTheMix() {
+        // A steady signal on A1, which is in a folder: the folder's fader lowers it, as a VCA.
+        const std::string wav = path("vca.wav");
+        writeWav(wav, 48000, 1.0, 0.5f, 0.5f);
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        MediaItem m = probeOrFail(p, wav);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        auto level = [&]() {
+            AudioMixer mixer;
+            std::vector<float> out(64 * 2);
+            mixer.mix(p, s, 12000, 64, out.data());
+            return double(out[0]);
+        };
+        const double base = level();
+        QVERIFY(base > 0.1);
+        QVERIFY(edit::setTrackFolder(s, {{TrackKind::Audio, 0}}, "Dialogue").ok);
+        edit::setFolderGain(s, TrackKind::Audio, "Dialogue", -6.0);
+        QVERIFY2(std::fabs(20 * std::log10(level() / base) + 6) < 0.05, qPrintable(QString::number(level() / base)));
+        // With the track's own fader: the two add up.
+        s.audioTracks[0].volumeDb = -4;
+        QVERIFY(std::fabs(20 * std::log10(level() / base) + 10) < 0.05);
+        // Renamed, it keeps its level; out of the folder, the track is back to its own fader.
+        QVERIFY(edit::renameFolder(s, TrackKind::Audio, "Dialogue", "Dial").ok);
+        QCOMPARE(edit::folderGain(s, TrackKind::Audio, "Dial"), -6.0);
+        QVERIFY(edit::setTrackFolder(s, {{TrackKind::Audio, 0}}, "").ok);
+        QVERIFY(s.folderGains.empty());
+        QVERIFY(std::fabs(20 * std::log10(level() / base) + 4) < 0.05);
+    }
+
     void trackAutomationInTheMix() {
         // A steady signal on A1 under a volume lane rising from -60 dB to 0 over a second, and a pan lane.
         const std::string wav = path("steady.wav");
