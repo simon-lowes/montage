@@ -9,6 +9,7 @@
 #include <QVBoxLayout>
 
 #include "EditorState.h"
+#include "Theme.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
 #include "core/History.h"
@@ -21,7 +22,7 @@ SequenceIndexPanel::SequenceIndexPanel(EditorState* state, QWidget* parent) : QW
     auto* top = new QHBoxLayout;
     filter_ = new QLineEdit(this);
     filter_->setObjectName(QStringLiteral("indexFilter"));
-    filter_->setPlaceholderText(tr("Search clips and markers (name, track, media, effects…)"));
+    filter_->setPlaceholderText(tr("Search clips and markers (name, colour, track, media, effects…)"));
     filter_->setClearButtonEnabled(true);
     top->addWidget(filter_, 1);
     count_ = new QLabel(this);
@@ -31,7 +32,7 @@ SequenceIndexPanel::SequenceIndexPanel(EditorState* state, QWidget* parent) : QW
     table_ = new QTableWidget(0, Columns, this);
     table_->setObjectName(QStringLiteral("sequenceIndex"));
     table_->setHorizontalHeaderLabels(
-        {tr("Name"), tr("Kind"), tr("Track"), tr("Start"), tr("End"), tr("Duration"), tr("Source In"), tr("Media"), tr("Effects")});
+        {tr("Name"), tr("Kind"), tr("Colour"), tr("Track"), tr("Start"), tr("End"), tr("Duration"), tr("Source In"), tr("Media"), tr("Effects")});
     table_->setSelectionBehavior(QAbstractItemView::SelectRows);
     table_->setEditTriggers(QAbstractItemView::EditKeyPressed | QAbstractItemView::SelectedClicked);
     table_->verticalHeader()->hide();
@@ -66,11 +67,13 @@ void SequenceIndexPanel::rebuild() {
     if (s) {
         const Project& p = state_->project();
         auto tc = [&](FrameTime f) { return QString::fromStdString(formatTimecode(f, s->fps)); };
-        auto addRow = [&](const Row& row, const QStringList& cells) {
+        auto addRow = [&](const Row& row, QStringList cells) {
             const int r = table_->rowCount();
             table_->insertRow(r);
+            cells.insert(Color, row.color > 0 ? QString::fromUtf8(theme::labelName(row.color)) : QString());
             for (int c = 0; c < Columns; ++c) {
                 auto* item = new QTableWidgetItem(cells.value(c));
+                if (c == Color && row.color > 0) item->setData(Qt::DecorationRole, theme::labelColor(row.color));
                 if (c != Name) item->setFlags(item->flags() & ~Qt::ItemIsEditable);
                 if (c == Name) item->setData(Qt::UserRole, int(rows_.size()));
                 table_->setItem(r, c, item);
@@ -91,6 +94,7 @@ void SequenceIndexPanel::rebuild() {
                 Row row;
                 row.clip = c.id;
                 row.start = c.start;
+                row.color = c.colorLabel;
                 addRow(row, {name, kind, label, tc(c.start), tc(c.end()), tc(c.duration), c.isGenerator() ? QString() : tc(FrameTime(std::llround(c.sourceIn))),
                              media, fx.join(QStringLiteral(", "))});
                 // The clip's markers, where the clip shows them.
@@ -103,6 +107,7 @@ void SequenceIndexPanel::rebuild() {
                     mr.clip = c.id;
                     mr.markerIndex = int(i);
                     mr.start = at;
+                    mr.color = mk.color;
                     addRow(mr, {QString::fromStdString(mk.name), tr("Clip Marker"), label, tc(at), tc(at + mk.duration), tc(mk.duration), tc(mk.t), media,
                                 QString::fromStdString(mk.comment)});
                 }
@@ -116,6 +121,7 @@ void SequenceIndexPanel::rebuild() {
             row.marker = true;
             row.markerIndex = int(i);
             row.start = mk.t;
+            row.color = mk.color;
             addRow(row, {QString::fromStdString(mk.name), mk.chapter ? tr("Chapter") : tr("Marker"), QString(), tc(mk.t), tc(mk.t + mk.duration), tc(mk.duration), QString(),
                          QString(), QString::fromStdString(mk.comment)});
         }

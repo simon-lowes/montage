@@ -27,11 +27,14 @@ int main(int argc, char** argv) {
     QCommandLineOption select("select-at", "Select the clip under the playhead on track V<n>.", "n");
     QCommandLineOption tool("source", "Open media item <index> (1-based) in the source monitor.", "index");
     QCommandLineOption panel("panel", "Bring the named panel(s) to the front (comma separated).", "names");
-    parser.addOptions({screenshot, frame, select, tool, panel});
+    QCommandLineOption workspace("workspace", "Open in workspace <name> (Editing, Colour, Audio, Effects, Captions, Logging or a saved one).", "name");
+    parser.addOptions({screenshot, frame, select, tool, panel, workspace});
     parser.process(app);
 
     montage::MainWindow w;
     w.show();
+    if (parser.isSet(workspace) && !w.applyWorkspace(parser.value(workspace)))
+        qWarning("No workspace called %s", qPrintable(parser.value(workspace)));
     QStringList media;
     for (const QString& arg : parser.positionalArguments()) {
         if (arg.endsWith(".montage")) w.openProject(QFileInfo(arg).absoluteFilePath());

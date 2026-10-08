@@ -14,6 +14,7 @@
 #include "media/Image.h"
 
 class QAction;
+class QActionGroup;
 class QDockWidget;
 class QLabel;
 class QMenu;
@@ -124,6 +125,15 @@ public:
     int renderInToOut();
     void deleteRenderFiles();
     void refreshRenderBar(bool wait = false);
+    // Workspaces (Premiere's workspaces, Resolve's pages): the panels laid out for a task. Built in: Editing, Colour,
+    // Audio, Effects, Captions and Logging (Alt+Shift+1 to 6, Window › Workspaces, or the bar in the status bar). A
+    // layout of one's own is saved under a name and comes back as it was saved; the current workspace is remembered.
+    static const QStringList& builtInWorkspaces();
+    QStringList workspaces() const;  // the built-in ones, then saved ones by name
+    QString currentWorkspace() const { return workspace_; }
+    bool applyWorkspace(const QString& name);
+    bool saveWorkspace(const QString& name);    // false for an empty name, a built-in's or one with a slash
+    bool deleteWorkspace(const QString& name);  // saved ones only
 
 protected:
     void closeEvent(QCloseEvent* e) override;
@@ -135,7 +145,13 @@ private:
     void buildActions();
     void buildMenus();
     void restoreLayout();
-    void resetLayout();
+    void resetLayout();  // the current workspace as it was saved (a built-in one as it comes)
+    // Lays the panels out afresh: groups across the top, down the left and down the right, each group's panels as tabs
+    // with its first in front. Panels in no group are hidden, tabbed behind the first top group for Window to bring back.
+    using DockGroups = std::vector<std::vector<QDockWidget*>>;
+    void arrangeDocks(const DockGroups& top, const DockGroups& left, const DockGroups& right);
+    void layOutBuiltIn(const QString& name);
+    void syncWorkspaceUi();
     void syncProgram();
     void syncSequenceTabs();
     void rebuildSourceProject();
@@ -252,6 +268,14 @@ private:
     QAction* trimView_ = nullptr;  // Playback › Two-Up Trim View
     QMenu* recentMenu_ = nullptr;
     QMenu* windowMenu_ = nullptr;
+    QString workspace_ = QStringLiteral("Editing");
+    QTabBar* workspaceBar_ = nullptr;
+    QMenu* workspaceMenu_ = nullptr;
+    QMenu* deleteWorkspaceMenu_ = nullptr;
+    QAction* workspaceCustomEnd_ = nullptr;  // saved workspaces are listed before this separator
+    std::vector<QAction*> workspaceActions_;
+    QActionGroup* workspaceGroup_ = nullptr;
+    bool syncingWorkspace_ = false;
     QLabel* statusInfo_ = nullptr;
     Monitor active_ = Monitor::Program;
     std::vector<edit::ClipboardItem> clipboard_;

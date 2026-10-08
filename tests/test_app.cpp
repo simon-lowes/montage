@@ -4280,12 +4280,67 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(peak(program->heard(4800, 4800)) > 0.1f);
     }
 
+    void workspaces() {
+        auto dock = [this](const char* name) { return win_->findChild<QDockWidget*>(name); };
+        // On screen: shown and in front (Qt moves the panels behind a tab out of sight rather than hiding them).
+        auto shown = [&](const char* name) { return dock(name)->isVisible() && !dock(name)->visibleRegion().isEmpty(); };
+        auto* bar = win_->findChild<QTabBar*>("workspaceBar");
+        QVERIFY(bar && dock("scopes") && dock("mixer") && dock("source") && dock("meters"));
+        QCOMPARE(win_->workspaces().mid(0, 6), MainWindow::builtInWorkspaces());
+        QCOMPARE(win_->findChild<QAction*>("workspaceColour")->shortcut(), QKeySequence("Alt+Shift+2"));
+
+        // Colour: the scopes and the Program monitor across the top, the Inspector beside them; no Source monitor.
+        win_->findChild<QAction*>("workspaceColour")->trigger();
+        QCOMPARE(win_->currentWorkspace(), QString("Colour"));
+        QCOMPARE(bar->tabText(bar->currentIndex()), QString("Colour"));
+        QVERIFY(shown("scopes") && shown("program") && shown("inspector"));
+        QVERIFY(!shown("source") && !shown("mixer"));
+        QVERIFY(dock("scopes")->geometry().right() < dock("program")->geometry().left());
+        QVERIFY(dock("inspector")->geometry().left() > dock("program")->geometry().left());
+
+        // Audio from the bar: the mixer in front where the Source monitor was.
+        bar->setCurrentIndex(int(win_->workspaces().indexOf("Audio")));
+        QCOMPARE(win_->currentWorkspace(), QString("Audio"));
+        QVERIFY(shown("mixer") && shown("meters"));
+        QVERIFY(!shown("scopes"));
+        QVERIFY(!shown("source"));  // tabbed behind the mixer
+        QVERIFY(dock("mixer")->geometry().right() < dock("program")->geometry().left());
+        QVERIFY(win_->findChild<QAction*>("workspaceAudio")->isChecked());
+
+        // A layout of one's own, saved by name, comes back as it was.
+        QVERIFY(win_->applyWorkspace("Editing"));
+        QVERIFY(shown("source") && shown("meters"));
+        dock("meters")->hide();
+        QVERIFY(!win_->saveWorkspace("Colour"));  // a built-in's name
+        QVERIFY(!win_->saveWorkspace("  "));
+        QVERIFY(win_->saveWorkspace("No Meters"));
+        QCOMPARE(win_->currentWorkspace(), QString("No Meters"));
+        QVERIFY(win_->workspaces().contains("No Meters"));
+        QCOMPARE(bar->count(), 7);
+        QVERIFY(win_->applyWorkspace("Editing"));
+        QVERIFY(shown("meters"));
+        QVERIFY(win_->applyWorkspace("No Meters"));
+        QVERIFY(!shown("meters") && shown("source"));
+        // Reset puts the current workspace back as saved.
+        dock("source")->hide();
+        win_->findChild<QAction*>("resetWorkspace")->trigger();
+        QVERIFY(shown("source") && !shown("meters"));
+        QVERIFY(!win_->deleteWorkspace("Editing"));
+        QVERIFY(win_->deleteWorkspace("No Meters"));
+        QVERIFY(!win_->workspaces().contains("No Meters"));
+        QCOMPARE(bar->count(), 6);
+        QVERIFY(!win_->applyWorkspace("No Meters"));
+        QVERIFY(win_->applyWorkspace("Editing"));
+        QVERIFY(shown("source") && shown("program") && shown("meters"));
+    }
+
     void sequenceIndexPanel() {
         loadDemo();
         state()->edit("Marker", [](Project&, Sequence& s) {
             Marker m;
             m.t = 30;
             m.name = "Chorus";
+            m.color = 7;  // Rose
             s.markers.push_back(m);
             return true;
         });
@@ -4305,6 +4360,11 @@ const auto seq = [this] { return state()->sequence(); };
         panel->setFilter("V2");
         QCOMPARE(panel->rowCount(), 1);
         QCOMPARE(panel->cell(0, SequenceIndexPanel::Kind), QString("Title"));
+        // A colour's name finds what carries it.
+        panel->setFilter("rose");
+        QCOMPARE(panel->rowCount(), 1);
+        QCOMPARE(panel->cell(0, SequenceIndexPanel::Name), QString("Chorus"));
+        QCOMPARE(panel->cell(0, SequenceIndexPanel::Color), QString("Rose"));
         // Activating a row selects the clip and moves the playhead to it.
         panel->setFilter("blue");
         panel->activate(0);

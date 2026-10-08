@@ -399,7 +399,7 @@ void MainWindow::buildPanels() {
     resetLayout();
 }
 
-void MainWindow::resetLayout() {
+void MainWindow::arrangeDocks(const DockGroups& top, const DockGroups& left, const DockGroups& right) {
     for (QDockWidget* d : docks_) {
         removeDockWidget(d);
         d->setFloating(false);
@@ -408,35 +408,181 @@ void MainWindow::resetLayout() {
     setCorner(Qt::TopRightCorner, Qt::TopDockWidgetArea);
     setCorner(Qt::BottomLeftCorner, Qt::LeftDockWidgetArea);
     setCorner(Qt::BottomRightCorner, Qt::RightDockWidgetArea);
-    addDockWidget(Qt::TopDockWidgetArea, sourceDock_);
-    splitDockWidget(sourceDock_, programDock_, Qt::Horizontal);
-    tabifyDockWidget(sourceDock_, inspectorDock_);
-    tabifyDockWidget(sourceDock_, scopesDock_);
-    tabifyDockWidget(sourceDock_, mixerDock_);
-    tabifyDockWidget(sourceDock_, captionsDock_);
-    tabifyDockWidget(sourceDock_, multicamDock_);
-    tabifyDockWidget(sourceDock_, keyframesDock_);
-    sourceDock_->raise();
-    addDockWidget(Qt::LeftDockWidgetArea, binDock_);
-    tabifyDockWidget(binDock_, effectsDock_);
-    tabifyDockWidget(binDock_, transcriptDock_);
-    tabifyDockWidget(binDock_, shotsDock_);
-    tabifyDockWidget(binDock_, peopleDock_);
-    tabifyDockWidget(binDock_, indexDock_);
-    tabifyDockWidget(binDock_, queueDock_);
-    binDock_->raise();
-    addDockWidget(Qt::RightDockWidgetArea, meterDock_);
-    for (QDockWidget* d : docks_) d->show();
-    resizeDocks({binDock_}, {380}, Qt::Horizontal);
-    resizeDocks({meterDock_}, {70}, Qt::Horizontal);
-    resizeDocks({sourceDock_, programDock_}, {720, 860}, Qt::Horizontal);
-    resizeDocks({sourceDock_}, {height() / 2 + 40}, Qt::Vertical);
+    std::vector<QDockWidget*> placed;
+    auto place = [&](Qt::DockWidgetArea area, const DockGroups& groups, Qt::Orientation split) {
+        // Split before tabbing: a split beside a tabbed panel only adds another tab.
+        QDockWidget* prev = nullptr;
+        for (const auto& g : groups) {
+            if (g.empty()) continue;
+            if (prev) splitDockWidget(prev, g[0], split);
+            else addDockWidget(area, g[0]);
+            prev = g[0];
+        }
+        for (const auto& g : groups) {
+            for (size_t i = 1; i < g.size(); ++i) tabifyDockWidget(g[0], g[i]);
+            for (QDockWidget* d : g) {
+                d->show();
+                placed.push_back(d);
+            }
+        }
+    };
+    place(Qt::TopDockWidgetArea, top, Qt::Horizontal);
+    place(Qt::LeftDockWidgetArea, left, Qt::Vertical);
+    place(Qt::RightDockWidgetArea, right, Qt::Vertical);
+    QDockWidget* home = top.front().front();
+    for (QDockWidget* d : docks_)
+        if (std::find(placed.begin(), placed.end(), d) == placed.end()) {
+            tabifyDockWidget(home, d);
+            d->hide();
+        }
+    for (const DockGroups* area : {&top, &left, &right})
+        for (const auto& g : *area)
+            if (!g.empty()) g[0]->raise();
+}
+
+const QStringList& MainWindow::builtInWorkspaces() {
+    static const QStringList names = {QStringLiteral("Editing"), QStringLiteral("Colour"),   QStringLiteral("Audio"),
+                                      QStringLiteral("Effects"), QStringLiteral("Captions"), QStringLiteral("Logging")};
+    return names;
+}
+
+void MainWindow::layOutBuiltIn(const QString& name) {
+    const int h = height();
+    if (name == "Colour") {
+        // A large Program monitor between the scopes and the Inspector (Premiere's Color workspace).
+        arrangeDocks({{scopesDock_}, {programDock_}}, {{binDock_, effectsDock_, indexDock_}}, {{inspectorDock_, keyframesDock_}});
+        setCorner(Qt::TopRightCorner, Qt::RightDockWidgetArea);  // the Inspector the full height
+        resizeDocks({binDock_}, {260}, Qt::Horizontal);
+        resizeDocks({inspectorDock_}, {400}, Qt::Horizontal);
+        resizeDocks({scopesDock_, programDock_}, {520, 900}, Qt::Horizontal);
+        resizeDocks({scopesDock_}, {h * 3 / 5}, Qt::Vertical);
+    } else if (name == "Audio") {
+        // The mixer where the Source monitor was, wide meters (Premiere's Audio workspace, Resolve's Fairlight page).
+        arrangeDocks({{mixerDock_, sourceDock_}, {programDock_}}, {{binDock_, effectsDock_}}, {{meterDock_}});
+        resizeDocks({mixerDock_, programDock_}, {900, 640}, Qt::Horizontal);
+        resizeDocks({mixerDock_}, {h / 2 + 40}, Qt::Vertical);
+        resizeDocks({meterDock_}, {110}, Qt::Horizontal);
+        resizeDocks({binDock_}, {320}, Qt::Horizontal);
+    } else if (name == "Effects") {
+        arrangeDocks({{inspectorDock_, keyframesDock_, sourceDock_}, {programDock_}}, {{effectsDock_, binDock_, indexDock_}}, {{meterDock_}});
+        resizeDocks({effectsDock_}, {360}, Qt::Horizontal);
+        resizeDocks({meterDock_}, {70}, Qt::Horizontal);
+        resizeDocks({inspectorDock_, programDock_}, {640, 900}, Qt::Horizontal);
+        resizeDocks({inspectorDock_}, {h / 2 + 40}, Qt::Vertical);
+    } else if (name == "Captions") {
+        arrangeDocks({{captionsDock_, sourceDock_}, {programDock_}}, {{transcriptDock_, binDock_, indexDock_}}, {{meterDock_}});
+        resizeDocks({transcriptDock_}, {400}, Qt::Horizontal);
+        resizeDocks({meterDock_}, {70}, Qt::Horizontal);
+        resizeDocks({captionsDock_, programDock_}, {640, 900}, Qt::Horizontal);
+        resizeDocks({captionsDock_}, {h / 2 + 40}, Qt::Vertical);
+    } else if (name == "Logging") {
+        // A wide bin to log and search in, the Source monitor to mark in (Premiere's Assembly, Resolve's Media page).
+        arrangeDocks({{sourceDock_, inspectorDock_}, {programDock_}}, {{binDock_, shotsDock_, peopleDock_, transcriptDock_, indexDock_}}, {});
+        resizeDocks({binDock_}, {760}, Qt::Horizontal);
+        resizeDocks({sourceDock_, programDock_}, {560, 280}, Qt::Horizontal);
+        resizeDocks({sourceDock_}, {h / 2 + 40}, Qt::Vertical);
+    } else {  // Editing
+        arrangeDocks({{sourceDock_, inspectorDock_, scopesDock_, mixerDock_, captionsDock_, multicamDock_, keyframesDock_}, {programDock_}},
+                     {{binDock_, effectsDock_, transcriptDock_, shotsDock_, peopleDock_, indexDock_, queueDock_}}, {{meterDock_}});
+        resizeDocks({binDock_}, {380}, Qt::Horizontal);
+        resizeDocks({meterDock_}, {70}, Qt::Horizontal);
+        resizeDocks({sourceDock_, programDock_}, {720, 860}, Qt::Horizontal);
+        resizeDocks({sourceDock_}, {h / 2 + 40}, Qt::Vertical);
+    }
+}
+
+void MainWindow::resetLayout() {
+    if (!builtInWorkspaces().contains(workspace_) && applyWorkspace(workspace_)) return;
+    layOutBuiltIn(builtInWorkspaces().contains(workspace_) ? workspace_ : QStringLiteral("Editing"));
+}
+
+QStringList MainWindow::workspaces() const {
+    QStringList names = builtInWorkspaces();
+    QSettings s = appSettings();
+    s.beginGroup(QStringLiteral("workspaces"));
+    QStringList saved = s.childKeys();
+    saved.sort(Qt::CaseInsensitive);
+    for (const QString& n : saved)
+        if (!names.contains(n)) names << n;
+    return names;
+}
+
+bool MainWindow::applyWorkspace(const QString& name) {
+    if (builtInWorkspaces().contains(name)) {
+        layOutBuiltIn(name);
+    } else {
+        QSettings s = appSettings();
+        const QByteArray layout = s.value(QStringLiteral("workspaces/") + name).toByteArray();
+        if (name.isEmpty() || layout.isEmpty() || !restoreState(layout, 1)) return false;
+    }
+    workspace_ = name;
+    appSettings().setValue(QStringLiteral("window/workspace"), name);
+    syncWorkspaceUi();
+    return true;
+}
+
+bool MainWindow::saveWorkspace(const QString& name) {
+    const QString n = name.trimmed();
+    if (n.isEmpty() || builtInWorkspaces().contains(n, Qt::CaseInsensitive) || n.contains('/') || n.contains('\\')) return false;
+    {
+        QSettings s = appSettings();
+        s.setValue(QStringLiteral("workspaces/") + n, saveState(1));
+    }
+    workspace_ = n;
+    appSettings().setValue(QStringLiteral("window/workspace"), n);
+    syncWorkspaceUi();
+    return true;
+}
+
+bool MainWindow::deleteWorkspace(const QString& name) {
+    if (builtInWorkspaces().contains(name) || !workspaces().contains(name)) return false;
+    {
+        QSettings s = appSettings();
+        s.remove(QStringLiteral("workspaces/") + name);
+    }
+    if (workspace_ == name) workspace_ = QStringLiteral("Editing");  // the panels stay where they are
+    syncWorkspaceUi();
+    return true;
+}
+
+// The workspace bar, and the saved workspaces in Window › Workspaces, follow the list and the current one.
+void MainWindow::syncWorkspaceUi() {
+    if (!workspaceBar_ || !workspaceMenu_) return;
+    syncingWorkspace_ = true;
+    const QStringList names = workspaces();
+    while (workspaceBar_->count() > 0) workspaceBar_->removeTab(0);
+    for (const QString& n : names) workspaceBar_->addTab(n);
+    workspaceBar_->setCurrentIndex(int(names.indexOf(workspace_)));
+    std::erase_if(workspaceActions_, [this](QAction* a) {
+        if (builtInWorkspaces().contains(a->data().toString())) return false;
+        workspaceGroup_->removeAction(a);
+        delete a;
+        return true;
+    });
+    deleteWorkspaceMenu_->clear();
+    for (const QString& n : names) {
+        if (builtInWorkspaces().contains(n)) continue;
+        auto* a = new QAction(n, workspaceMenu_);
+        a->setData(n);
+        a->setCheckable(true);
+        connect(a, &QAction::triggered, this, [this, n] { applyWorkspace(n); });
+        workspaceMenu_->insertAction(workspaceCustomEnd_, a);
+        workspaceGroup_->addAction(a);
+        workspaceActions_.push_back(a);
+        deleteWorkspaceMenu_->addAction(n, this, [this, n] { deleteWorkspace(n); });
+    }
+    deleteWorkspaceMenu_->setEnabled(!deleteWorkspaceMenu_->isEmpty());
+    for (QAction* a : workspaceActions_) a->setChecked(a->data().toString() == workspace_);
+    syncingWorkspace_ = false;
 }
 
 void MainWindow::restoreLayout() {
     QSettings s = appSettings();
     if (s.contains("window/geometry")) restoreGeometry(s.value("window/geometry").toByteArray());
     if (s.contains("window/state")) restoreState(s.value("window/state").toByteArray(), 1);
+    const QString ws = s.value("window/workspace").toString();
+    if (workspaces().contains(ws)) workspace_ = ws;  // laid out as it was left, by the state above
+    syncWorkspaceUi();
 }
 
 // ---------------------------------------------------------------------------
@@ -946,7 +1092,35 @@ void MainWindow::buildMenus() {
     windowMenu_ = menuBar()->addMenu(tr("&Window"));
     for (QDockWidget* d : docks_) windowMenu_->addAction(d->toggleViewAction());
     windowMenu_->addSeparator();
-    add(windowMenu_, tr("&Reset Layout"), QKeySequence(), [this] { resetLayout(); });
+    workspaceMenu_ = windowMenu_->addMenu(tr("&Workspaces"));
+    workspaceGroup_ = new QActionGroup(this);
+    for (int i = 0; i < builtInWorkspaces().size(); ++i) {
+        const QString n = builtInWorkspaces()[i];
+        QAction* a = add(workspaceMenu_, n, QKeySequence(QStringLiteral("Alt+Shift+%1").arg(i + 1)), [this, n] { applyWorkspace(n); });
+        a->setObjectName(QStringLiteral("workspace") + n);
+        a->setData(n);
+        a->setCheckable(true);
+        workspaceGroup_->addAction(a);
+        workspaceActions_.push_back(a);
+    }
+    workspaceCustomEnd_ = workspaceMenu_->addSeparator();
+    add(workspaceMenu_, tr("&Save as New Workspace…"), QKeySequence(), [this] {
+        bool ok = false;
+        const QString n = QInputDialog::getText(this, tr("Save Workspace"), tr("Name:"), QLineEdit::Normal, QString(), &ok);
+        if (ok && !saveWorkspace(n)) state_->message(tr("Choose a name other than a built-in workspace's"), 4000);
+    })->setObjectName(QStringLiteral("saveWorkspace"));
+    deleteWorkspaceMenu_ = workspaceMenu_->addMenu(tr("&Delete Workspace"));
+    add(windowMenu_, tr("&Reset Workspace to Saved Layout"), QKeySequence(), [this] { resetLayout(); })->setObjectName(QStringLiteral("resetWorkspace"));
+    workspaceBar_ = new QTabBar(this);
+    workspaceBar_->setObjectName(QStringLiteral("workspaceBar"));
+    workspaceBar_->setDrawBase(false);
+    workspaceBar_->setExpanding(false);
+    workspaceBar_->setToolTip(tr("Workspaces: the panels laid out for a task (Alt+Shift+1 to 6)"));
+    statusBar()->insertPermanentWidget(0, workspaceBar_);
+    connect(workspaceBar_, &QTabBar::currentChanged, this, [this](int i) {
+        if (!syncingWorkspace_ && i >= 0) applyWorkspace(workspaceBar_->tabText(i));
+    });
+    syncWorkspaceUi();
     QMenu* help = menuBar()->addMenu(tr("&Help"));
     add(help, tr("&Keyboard Shortcuts"), QKeySequence(Qt::Key_F1), [this] { showShortcuts(); });
     add(help, tr("&About Montage"), QKeySequence(), [this] { about(); });
@@ -1188,6 +1362,7 @@ void MainWindow::closeEvent(QCloseEvent* e) {
     QSettings s = appSettings();
     s.setValue("window/geometry", saveGeometry());
     s.setValue("window/state", saveState(1));
+    s.setValue("window/workspace", workspace_);
     e->accept();
 }
 
