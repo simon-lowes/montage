@@ -403,6 +403,13 @@ void MainWindow::buildPanels() {
     connect(&renderBarTimer_, &QTimer::timeout, this, [this] { refreshRenderBar(); });
     for (auto sig : {&EditorState::projectChanged, &EditorState::sequenceSwitched})
         connect(state_, sig, &renderBarTimer_, qOverload<>(&QTimer::start));
+    // Background render waits for a quiet spell after edits and playback.
+    backgroundTimer_.setSingleShot(true);
+    backgroundTimer_.setInterval(4000);
+    connect(&backgroundTimer_, &QTimer::timeout, this, &MainWindow::startBackgroundRender);
+    for (auto sig : {&EditorState::projectChanged, &EditorState::sequenceSwitched})
+        connect(state_, sig, this, &MainWindow::stopBackgroundRender);
+    connect(program_, &PlaybackController::playingChanged, this, &MainWindow::stopBackgroundRender);
     resetLayout();
 }
 
@@ -877,6 +884,14 @@ void MainWindow::buildMenus() {
         ->setObjectName(QStringLiteral("renderInToOut"));
     add(seqM, tr("Delete Render Files"), QKeySequence(), [this] { deleteRenderFiles(); })
         ->setObjectName(QStringLiteral("deleteRenderFiles"));
+    {
+        QAction* bg = add(seqM, tr("&Background Render"), QKeySequence(), [this](bool on) { setBackgroundRender(on); });
+        bg->setCheckable(true);
+        bg->setObjectName(QStringLiteral("backgroundRender"));
+        bg->setToolTip(tr("Render stretches with effects, titles or transitions while you are not editing or playing"));
+        backgroundRender_ = appSettings().value("render/background", false).toBool();
+        bg->setChecked(backgroundRender_);
+    }
     add(seqM, tr("Add &Video Track"), QKeySequence(), [this] {
         state_->edit(tr("Add Video Track"), [](Project& p, Sequence& s) {
             edit::addTrack(p, s, TrackKind::Video);
@@ -1411,6 +1426,8 @@ void MainWindow::closeEvent(QCloseEvent* e) {
     }
     queue_->stop();
     queue_->waitForIdle();
+    backgroundRender_ = false;
+    if (backgroundCancel_) *backgroundCancel_ = true;  // a background render stops at its next frame
     program_->pause();
     source_->pause();
     recovery_->endSession();  // a clean exit: nothing to recover next time
@@ -2678,6 +2695,60 @@ int MainWindow::renderInToOut() {
     if (!ok) return -1;
     state_->message(rendered ? tr("Rendered %n frame(s)", "", rendered) : tr("Everything there is already rendered"), 4000);
     return rendered;
+}
+
+void MainWindow::setBackgroundRender(bool on) {
+    backgroundRender_ = on;
+    appSettings().setValue("render/background", on);
+    stopBackgroundRender();
+}
+
+void MainWindow::setBackgroundRenderDelay(int ms) {
+    backgroundTimer_.setInterval(std::max(0, ms));
+    stopBackgroundRender();
+}
+
+void MainWindow::stopBackgroundRender() {
+    if (backgroundCancel_) *backgroundCancel_ = true;
+    backgroundTimer_.stop();
+    if (backgroundRender_) backgroundTimer_.start();
+}
+
+void MainWindow::startBackgroundRender() {
+    const Sequence* s = state_->sequence();
+    if (!backgroundRender_ || !s || backgroundBusy_) return;
+    if (program_->isPlaying()) {
+        backgroundTimer_.start();
+        return;
+    }
+    auto ranges = rangesToRender(*s);
+    if (ranges.empty()) return;
+    auto project = std::make_shared<const Project>(state_->project());
+    const Id seqId = s->id;
+    const RenderOptions o = program_->renderOptions();
+    auto cancel = std::make_shared<std::atomic<bool>>(false);
+    backgroundCancel_ = cancel;
+    backgroundBusy_ = true;
+    auto* watcher = new QFutureWatcher<int>(this);
+    connect(watcher, &QFutureWatcherBase::finished, this, [this, watcher, cancel] {
+        const int rendered = watcher->result();
+        watcher->deleteLater();
+        backgroundBusy_ = false;
+        if (backgroundCancel_ == cancel) backgroundCancel_.reset();
+        if (rendered > 0) refreshRenderBar();
+        if (rendered < 0 && backgroundRender_ && !backgroundTimer_.isActive()) backgroundTimer_.start();  // stopped: try again later
+    });
+    watcher->setFuture(QtConcurrent::run([project, seqId, o, ranges, cancel] {
+        const Sequence* sq = project->findSequence(seqId);
+        if (!sq) return 0;
+        int total = 0;
+        for (const auto& [a, b] : ranges) {
+            const int n = renderToCache(*project, *sq, a, std::min(b, sq->duration()) - 1, o, RenderCache::instance(), {}, cancel.get());
+            if (n < 0) return -1;
+            total += n;
+        }
+        return total;
+    }));
 }
 
 void MainWindow::deleteRenderFiles() {

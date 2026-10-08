@@ -5011,6 +5011,38 @@ const auto seq = [this] { return state()->sequence(); };
         state()->newProject();
     }
 
+    void backgroundRenderWhenIdle() {
+        loadDemo();
+        RenderCache::instance().clear();
+        win_->refreshRenderBar(true);
+        // A blur on Blue: the only stretch worth rendering ahead besides the title.
+        const Clip* blue = clipNamed(*state()->sequence(), "Blue");
+        const Id blueId = blue->id;
+        const FrameTime blueStart = blue->start, blueEnd = blue->end();
+        QVERIFY(state()->edit("Blur", [blueId](Project& p, Sequence& s) {
+            Clip* c = edit::clipById(s, blueId);
+            Effect e = makeEffect("gaussian_blur", p.newId());
+            c->effects.push_back(e);
+            return true;
+        }));
+        const auto ranges = rangesToRender(*state()->sequence());
+        QVERIFY(std::any_of(ranges.begin(), ranges.end(), [&](const auto& r) { return r.first <= blueStart && r.second >= blueEnd; }));
+        auto* action = win_->findChild<QAction*>("backgroundRender");
+        QVERIFY(action);
+        win_->setBackgroundRenderDelay(50);
+        if (!action->isChecked()) action->trigger();
+        QVERIFY(win_->backgroundRender());
+        // After the quiet spell the blurred clip is rendered, and the render bar shows it.
+        QTRY_VERIFY_WITH_TIMEOUT(!win_->backgroundRendering() && RenderCache::instance().count() >= int(blueEnd - blueStart), 30000);
+        // An edit stops it and it starts again later; turning it off leaves the rendered frames.
+        // Turned off again (and the setting with it).
+        action->trigger();
+        QVERIFY(!win_->backgroundRender());
+        win_->setBackgroundRenderDelay(4000);
+        RenderCache::instance().clear();
+        state()->newProject();
+    }
+
     void inspectorEditsAllSelected() {
         loadDemo();
         const Id red = clipNamed(*state()->sequence(), "Red")->id, blue = clipNamed(*state()->sequence(), "Blue")->id;

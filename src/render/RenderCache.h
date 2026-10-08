@@ -53,6 +53,9 @@ using RenderProgress = std::function<void(double fraction)>;
 // returns how many were rendered (-1 if cancelled).
 int renderToCache(const Project& p, const Sequence& seq, FrameTime from, FrameTime to, const RenderOptions& o,
                   RenderCache& cache, const RenderProgress& progress = {}, const std::atomic<bool>* cancel = nullptr);
+// The stretches of the sequence worth rendering ahead (Final Cut's background render): frames under a video clip
+// with effects or a generated picture (titles, shapes), or inside a transition, as merged [first, end) ranges.
+std::vector<std::pair<FrameTime, FrameTime>> rangesToRender(const Sequence& seq);
 // The cached stretches of frames [from, to) as [first, end) ranges, for the render bar.
 std::vector<std::pair<FrameTime, FrameTime>> cachedRanges(const Project& p, const Sequence& seq, FrameTime from, FrameTime to,
                                                           const RenderOptions& o, const RenderCache& cache);

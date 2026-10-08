@@ -209,6 +209,28 @@ qint64 RenderCache::bytes() const {
     return total;
 }
 
+std::vector<std::pair<FrameTime, FrameTime>> rangesToRender(const Sequence& seq) {
+    std::vector<std::pair<FrameTime, FrameTime>> spans;
+    for (const Track& t : seq.videoTracks) {
+        if (t.muted) continue;
+        for (const Clip& c : t.clips)
+            if (c.enabled && (!c.effects.empty() || (c.isGenerator() && c.generator.type != "color" && c.generator.type != "adjustment")))
+                spans.push_back({c.start, c.end()});
+        for (const Transition& tr : t.transitions) {
+            FrameTime a = 0, b = 0;
+            if (edit::transitionRange(t, tr, a, b)) spans.push_back({a, b});
+        }
+    }
+    std::sort(spans.begin(), spans.end());
+    std::vector<std::pair<FrameTime, FrameTime>> merged;
+    for (const auto& r : spans) {
+        if (r.second <= r.first) continue;
+        if (!merged.empty() && r.first <= merged.back().second) merged.back().second = std::max(merged.back().second, r.second);
+        else merged.push_back(r);
+    }
+    return merged;
+}
+
 int renderToCache(const Project& p, const Sequence& seq, FrameTime from, FrameTime to, const RenderOptions& o, RenderCache& cache,
                   const RenderProgress& progress, const std::atomic<bool>* cancel) {
     int rendered = 0;

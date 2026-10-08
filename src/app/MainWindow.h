@@ -4,6 +4,8 @@
 
 #include <QMainWindow>
 #include <QPointer>
+#include <atomic>
+#include <memory>
 #include <optional>
 #include <QTimer>
 #include <vector>
@@ -137,6 +139,12 @@ public:
     int renderInToOut();
     void deleteRenderFiles();
     void refreshRenderBar(bool wait = false);
+    // Background render (Final Cut's): after a few quiet seconds, the stretches with effects, titles or transitions
+    // are rendered into the render cache off the UI thread; editing or playing stops it until the next quiet spell.
+    void setBackgroundRender(bool on);
+    bool backgroundRender() const { return backgroundRender_; }
+    void setBackgroundRenderDelay(int ms);
+    bool backgroundRendering() const { return backgroundBusy_; }
     // Workspaces (Premiere's workspaces, Resolve's pages): the panels laid out for a task. Built in: Editing, Colour,
     // Audio, Effects, Captions and Logging (Alt+Shift+1 to 6, Window › Workspaces, or the bar in the status bar). A
     // layout of one's own is saved under a name and comes back as it was saved; the current workspace is remembered.
@@ -253,6 +261,11 @@ private:
     VoiceoverDialog* voiceover_ = nullptr;
     QPointer<LinkMediaDialog> linkMedia_;
     QTimer renderBarTimer_;
+    QTimer backgroundTimer_;
+    bool backgroundRender_ = false, backgroundBusy_ = false;
+    std::shared_ptr<std::atomic<bool>> backgroundCancel_;
+    void startBackgroundRender();
+    void stopBackgroundRender();  // cancels a running job and waits for the next quiet spell
     int renderBarGeneration_ = 0;
     std::vector<QDockWidget*> docks_;
     QDockWidget* sourceDock_ = nullptr;
