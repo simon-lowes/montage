@@ -31,7 +31,10 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Primary colour correction: lift, gamma and gain per channel, plus exposure, contrast, pivot, saturation, temperature, tint and offset
 - One-click Auto Colour (grey-world balance and level stretch)
 - **Match Colour** (shot matching, like Premiere's Color Match or Resolve's Shot Match): park on the look you want and choose Clip › Set Colour Reference, then select clips and choose Clip › Match Colour to Reference (Ctrl+Alt+Shift+C). Each clip gets a Color Correct whose per-channel lift, gain and gamma put its shadows, mid-tones and highlights on the reference's.
-- Curves with presets, HSL/vibrance, `.cube` 3D/1D LUTs, black & white, invert
+- Curves you drag in the Inspector (click to add a point, double-click to remove one), with presets, HSL/vibrance, `.cube` 3D/1D LUTs, black & white, invert
+- **Hue Curves** (like Lumetri's or Resolve's): Hue vs Hue, Hue vs Saturation, Hue vs Luma, Luma vs Saturation and Saturation vs Saturation, each drawn over its own scale; leave a stretch flat and those colours are untouched
+- **Colour wheels** for Lift, Gamma and Gain on Color Correct: drag a puck towards a hue to push the shadows, mid-tones or highlights that way; double-click to centre it
+- **Compare with Reference** (Clip menu): the colour reference beside the current frame in the Program monitor, split by a divider you drag
 - Chroma key with spill suppression, and luma key
 - Levels, Posterize, Glow, Film Grain (new each frame, strongest in the mid-tones), Directional Blur, Chromatic Aberration, Lens Distortion (barrel or pincushion), Letterbox (2.39, 2, 1.85, 4:3, 1:1, 9:16)
 - Corner Pin: four keyframeable corners map the picture onto any quadrilateral, for screen replacements. The corners show in the Program monitor to drag onto the surface.

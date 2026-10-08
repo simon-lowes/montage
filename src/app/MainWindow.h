@@ -56,6 +56,8 @@ public:
     // many clips were matched.
     void setColourReference();
     bool hasColourReference() const { return !colourRef_.empty(); }
+    // Split-screen compare in the Program monitor: the reference beside the current frame.
+    void setCompareWithReference(bool on);
     int matchColour();
     // Auto Reframe: a copy of the current sequence at aspect w:h with every
     // picture clip following its subject (speed 0 slower, 1 default, 2 faster),
@@ -180,6 +182,8 @@ private:
     RenderQueue* queue_ = nullptr;
     Image colourRef_;       // the look Match Colour aims for
     QString colourRefName_;
+    QImage colourRefView_;  // the reference at display size, for the compare
+    QAction* compareRef_ = nullptr;
     QMenu* recentMenu_ = nullptr;
     QMenu* windowMenu_ = nullptr;
     QLabel* statusInfo_ = nullptr;

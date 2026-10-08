@@ -41,7 +41,9 @@ struct ParamInfo {
 
 // Dynamic: an editable list whose entries depend on the effect's other
 // settings (the colour spaces of the chosen OCIO config, for example).
-enum class StringKind { Text, MultilineText, File, Font, Choice, Curve, Dynamic };
+// Curve: a tone curve (in -> out). HueCurve and LevelCurve: a change against
+// hue (wrapping round) or against luma/saturation, 0.5 meaning none.
+enum class StringKind { Text, MultilineText, File, Font, Choice, Curve, Dynamic, HueCurve, LevelCurve };
 
 struct StringParamInfo {
     std::string name;

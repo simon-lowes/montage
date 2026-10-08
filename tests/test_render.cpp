@@ -965,6 +965,66 @@ colorspaces:
         QVERIFY(lo < 0.05f && hi > 0.9f);                         // levels stretched
     }
 
+    void hueCurves() {
+        // Flat curves: nothing set is the middle, one point is a level, the ends wrap (hue) or hold (levels).
+        for (float v : buildFlatCurve("", 360)) QCOMPARE(v, 0.5f);
+        for (float v : buildFlatCurve("0.2,0.8", 360)) QCOMPARE(v, 0.8f);
+        const auto wrap = buildFlatCurve("0.1,0.3 0.4,0.8 0.7,0.5", 360, true);
+        QVERIFY(std::fabs(wrap.front() - wrap.back()) < 1e-5);
+        QVERIFY(std::fabs(wrap[144] - 0.8f) < 1e-4);  // x = 0.4
+        const auto held = buildFlatCurve("0.3,0.2 0.7,0.9", 360, false);
+        QVERIFY(std::fabs(held.front() - 0.2f) < 1e-4 && std::fabs(held.back() - 0.9f) < 1e-4);
+        for (int i = 0; i < 108; ++i) QVERIFY(std::fabs(held[size_t(i)] - 0.2f) < 1e-4);
+
+        // A red, a green, a blue, a grey and a dark red.
+        const float colours[5][3] = {{0.8f, 0.1f, 0.1f}, {0.1f, 0.8f, 0.1f}, {0.1f, 0.1f, 0.8f}, {0.5f, 0.5f, 0.5f}, {0.3f, 0.05f, 0.05f}};
+        Image src(5, 1);
+        for (int i = 0; i < 5; ++i) {
+            std::copy(colours[i], colours[i] + 3, src.at(i, 0));
+            src.at(i, 0)[3] = 1;
+        }
+        auto run = [&](const char* curve, const char* points, double mix = 100) {
+            Effect e = makeEffect("hue_curves", 1);
+            e.strings[curve] = points;
+            e.params["mix"] = mix;
+            Image img = src;
+            applyVideoEffect(e, 0, img, 1);
+            return img;
+        };
+        auto same = [&](const Image& img, int i) {
+            for (int k = 0; k < 3; ++k)
+                if (std::fabs(img.at(i, 0)[k] - colours[i][k]) > 1e-3) return false;
+            return true;
+        };
+        // A neutral curve changes nothing.
+        Image img = run("hue_hue", "0,0.5 0.25,0.5 0.5,0.5 0.75,0.5");
+        for (int i = 0; i < 5; ++i) QVERIFY(same(img, i));
+        // Hue vs Hue: reds turned a third of the way round become green; blue and grey stay.
+        const char* redOnly = "0,0.8333 0.1,0.5 0.3,0.5 0.5,0.5 0.7,0.5 0.9,0.5";
+        img = run("hue_hue", redOnly);
+        QVERIFY(img.at(0, 0)[1] > 0.7f && img.at(0, 0)[0] < 0.2f);
+        QVERIFY(same(img, 2) && same(img, 3));
+        // Hue vs Saturation: greens taken to grey, red kept.
+        img = run("hue_sat", "0,0.5 0.2,0.5 0.3333,0 0.45,0.5 0.6,0.5 0.7,0.5 0.9,0.5");
+        QVERIFY(std::fabs(img.at(1, 0)[0] - img.at(1, 0)[1]) < 0.01 && std::fabs(img.at(1, 0)[1] - img.at(1, 0)[2]) < 0.01);
+        QVERIFY(same(img, 0) && same(img, 2));
+        // Hue vs Luma: reds darkened (by their saturation), greys untouched.
+        img = run("hue_luma", "0,0.25 0.1,0.5 0.3,0.5 0.5,0.5 0.7,0.5 0.9,0.5");
+        QVERIFY(img.at(0, 0)[0] < 0.5f);
+        QVERIFY(same(img, 3) && same(img, 1));
+        // Luma vs Saturation: the shadows drained of colour, bright colours kept.
+        img = run("luma_sat", "0,0 0.12,0 0.3,0.5 1,0.5");
+        QVERIFY(std::fabs(img.at(4, 0)[0] - img.at(4, 0)[1]) < 0.01);
+        QVERIFY(same(img, 3));
+        // Saturation vs Saturation: the most saturated pulled back.
+        img = run("sat_sat", "0,0.5 0.5,0.5 1,0.3");
+        const float s0 = (img.at(0, 0)[0] - img.at(0, 0)[2]) / img.at(0, 0)[0];
+        QVERIFY(s0 < 0.8f && s0 > 0.2f);
+        // Mix 0 is the picture as it was.
+        img = run("hue_hue", redOnly, 0);
+        for (int i = 0; i < 5; ++i) QVERIFY(same(img, i));
+    }
+
     void colorMatch() {
         // Random coloured blocks over a gradient, 160 x 90 (another seed: the same kind of scene, framed differently).
         auto texture = [](unsigned seed) {

@@ -43,6 +43,11 @@ std::shared_ptr<const Lut3D> loadCubeLut(const std::string& path, std::string* e
 
 // Monotone cubic curve through "x,y x,y ..." points, sampled into `n` entries.
 std::vector<float> buildCurve(const std::string& points, int n = 1024);
+// A Hue Curves curve: points "x,y" with x in 0..1 (hue, or luma/saturation) and
+// y in 0..1, 0.5 meaning no change; smooth through the points without overshoot,
+// wrapping round when `cyclic` (hue), flat past the ends otherwise. No points:
+// 0.5 throughout. n + 1 samples over 0..1.
+std::vector<float> buildFlatCurve(const std::string& points, int n = 360, bool cyclic = true);
 
 // Composites `src` over `dst` (same size) with a blend mode and opacity.
 void blendOnto(Image& dst, const Image& src, const std::string& mode, float opacity);

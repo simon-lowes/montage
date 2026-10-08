@@ -32,6 +32,8 @@
 #include "Theme.h"
 #include "audio/PluginEffect.h"
 #include "core/EditOps.h"
+#include "ColorWheel.h"
+#include "CurveEditor.h"
 #include "render/ClipAnalysis.h"
 #include "render/Ocio.h"
 
@@ -483,6 +485,7 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
                            static_cast<QWidget*>(reset), static_cast<QWidget*>(del)})
             th->addWidget(w);
         QFormLayout* f = addSection(QString::fromStdString(info->displayName), tools);
+        if (e.type == "color_correct") addColorWheels(f, target(eid));
         addParamRows(f, *info, target(eid));
         const bool onClip = state_->sequence() && edit::clipById(*state_->sequence(), owner);
         if (e.type == "stabilize" && onClip) {
@@ -796,6 +799,59 @@ void InspectorWidget::addParamRows(QFormLayout* form, const EffectInfo& info, co
     for (const auto& si : info.strings) addStringRow(form, si, target);
 }
 
+void InspectorWidget::addColorWheels(QFormLayout* form, const Target& target) {
+    // Each wheel sets its three channel controls; the part they share (set with
+    // the channel sliders) is kept, so a wheel only shifts the balance.
+    struct Wheel {
+        const char* title;
+        const char* names[3];
+        double scale, neutral;
+    };
+    static const Wheel wheels[3] = {{QT_TR_NOOP("Lift"), {"lift_r", "lift_g", "lift_b"}, 0.25, 0},
+                                    {QT_TR_NOOP("Gamma"), {"gamma_r", "gamma_g", "gamma_b"}, 0.5, 0},
+                                    {QT_TR_NOOP("Gain"), {"gain_r", "gain_g", "gain_b"}, 0.5, 1}};
+    auto* row = new QWidget(content_);
+    auto* h = new QHBoxLayout(row);
+    h->setContentsMargins(0, 0, 0, 0);
+    h->setSpacing(4);
+    for (const Wheel& w : wheels) {
+        auto* wheel = new ColorWheel(tr(w.title), w.scale, row);
+        wheel->setObjectName(QStringLiteral("wheel_") + QString::fromLatin1(w.names[0]).section('_', 0, 0));
+        wheel->setMinimumSize(80, 96);
+        h->addWidget(wheel, 1);
+        auto read = [this, target, w](double v[3]) {
+            const Sequence* s = state_->sequence();
+            Effect* e = s ? target.resolve(const_cast<Sequence&>(*s)) : nullptr;
+            for (int i = 0; i < 3; ++i) v[i] = (e ? e->p(w.names[i], target.time(), w.neutral) : w.neutral) - w.neutral;
+        };
+        const QString label = tr("%1 Balance").arg(tr(w.title));
+        const QString mergeKey = target.key + ":wheel:" + QString::fromLatin1(w.names[0]);
+        connect(wheel, &ColorWheel::changed, this, [this, target, w, read, label, mergeKey](double r, double g, double b, bool) {
+            double now[3];
+            read(now);
+            const double common = (now[0] + now[1] + now[2]) / 3;
+            const double v[3] = {common + r + w.neutral, common + g + w.neutral, common + b + w.neutral};
+            const FrameTime t = target.time();
+            state_->edit(label, [target, w, v, t](Project&, Sequence& s) {
+                Effect* e = target.resolve(s);
+                if (!e) return false;
+                for (int i = 0; i < 3; ++i) e->params[w.names[i]].set(t, v[i]);
+                if (target.afterWrite) target.afterWrite(s);
+                return true;
+            }, mergeKey);
+        });
+        auto refresh = [wheel, read] {
+            if (wheel->isDragging()) return;
+            double v[3];
+            read(v);
+            wheel->setBalance(v[0], v[1], v[2]);
+        };
+        refresh();
+        refreshers_.push_back(refresh);
+    }
+    form->addRow(row);
+}
+
 void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const Target& target) {
     auto* row = new QWidget(content_);
     auto* h = new QHBoxLayout(row);
@@ -1063,7 +1119,39 @@ void InspectorWidget::addStringRow(QFormLayout* form, const StringParamInfo& si,
             });
             break;
         }
+        case StringKind::HueCurve:
+        case StringKind::LevelCurve: {
+            // Shaped by hand: a flat line changes nothing.
+            auto* box = new QWidget(content_);
+            auto* v = new QVBoxLayout(box);
+            v->setContentsMargins(0, 0, 0, 0);
+            auto* editor = new CurveEditor(si.kind == StringKind::HueCurve ? CurveEditor::Mode::Hue : CurveEditor::Mode::Level, box);
+            editor->setObjectName(QString::fromStdString("curve_" + name));
+            auto* reset = new QToolButton(box);
+            reset->setText(tr("Reset"));
+            v->addWidget(editor);
+            v->addWidget(reset, 0, Qt::AlignRight);
+            form->addRow(label, box);
+            connect(editor, &CurveEditor::edited, this, [write](const QString& pts, bool) { write(pts); });
+            connect(reset, &QToolButton::clicked, this, [editor, write] {
+                editor->setPoints(QString());
+                write(QString());
+            });
+            refreshers_.push_back([editor, read] {
+                if (!editor->dragging() && editor->points() != read()) editor->setPoints(read());
+            });
+            break;
+        }
         case StringKind::Curve: {
+            // The curve to drag, and its points as text below it.
+            auto* editor = new CurveEditor(CurveEditor::Mode::Tone, content_);
+            editor->setObjectName(QString::fromStdString("curve_" + name));
+            form->addRow(label, editor);
+            connect(editor, &CurveEditor::edited, this, [write](const QString& pts, bool) { write(pts); });
+            refreshers_.push_back([editor, read] {
+                const QString pts = read().isEmpty() ? QStringLiteral("0,0 1,1") : read();
+                if (!editor->dragging() && editor->points() != pts) editor->setPoints(pts);
+            });
             auto* row = new QWidget(content_);
             auto* h = new QHBoxLayout(row);
             h->setContentsMargins(0, 0, 0, 0);
@@ -1081,7 +1169,7 @@ void InspectorWidget::addStringRow(QFormLayout* form, const StringParamInfo& si,
             for (const auto& [n, v] : list) presets->addItem(tr(n), QString(v));
             h->addWidget(line, 1);
             h->addWidget(presets);
-            form->addRow(label, row);
+            form->addRow(QString(), row);
             connect(line, &QLineEdit::editingFinished, this, [line, write] { write(line->text()); });
             connect(presets, &QComboBox::activated, this, [presets, write](int idx) {
                 if (idx > 0) write(presets->itemData(idx).toString());

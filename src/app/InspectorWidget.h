@@ -40,6 +40,8 @@ private:
     void buildTransition(const Transition& t, TrackKind kind);
     QFormLayout* addSection(const QString& title, QWidget* headerExtra = nullptr, bool startCollapsed = false);
     void addParamRows(QFormLayout* form, const EffectInfo& info, const Target& target);
+    // Lift, Gamma and Gain wheels over Color Correct's per-channel controls.
+    void addColorWheels(QFormLayout* form, const Target& target);
     void addParamRow(QFormLayout* form, const ParamInfo& pi, const Target& target);
     void addStringRow(QFormLayout* form, const StringParamInfo& si, const Target& target);
     // The effect stack of a clip, audio track, bus or master (by owner id), with its Add menu.

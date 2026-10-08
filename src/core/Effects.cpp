@@ -129,6 +129,15 @@ std::vector<EffectInfo> buildCatalog() {
                   str("red", "Red", StringKind::Curve, "0,0 1,1"),
                   str("green", "Green", StringKind::Curve, "0,0 1,1"),
                   str("blue", "Blue", StringKind::Curve, "0,0 1,1")}});
+    // Secondary grading without masks: change colours by their hue, brightness or saturation.
+    {
+        auto curve = [](const char* n, const char* label, StringKind k) { return str(n, label, k, ""); };
+        c.push_back({"hue_curves", "Hue Curves", EffectCategory::VideoFilter, "Color",
+                     {pct("mix", "Mix", 0, 100, 100)},
+                     {curve("hue_hue", "Hue vs Hue", StringKind::HueCurve), curve("hue_sat", "Hue vs Saturation", StringKind::HueCurve),
+                      curve("hue_luma", "Hue vs Luma", StringKind::HueCurve), curve("luma_sat", "Luma vs Saturation", StringKind::LevelCurve),
+                      curve("sat_sat", "Saturation vs Saturation", StringKind::LevelCurve)}});
+    }
     c.push_back({"hue_sat", "Hue / Saturation / Lightness", EffectCategory::VideoFilter, "Color",
                  {angle("hue", "Hue Shift"), num("saturation", "Saturation", 0, 3, 1),
                   num("lightness", "Lightness", -1, 1, 0), num("vibrance", "Vibrance", -1, 1, 0)},

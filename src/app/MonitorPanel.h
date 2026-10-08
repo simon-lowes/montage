@@ -32,6 +32,16 @@ public:
     QRectF imageRect() const;
     QSize sizeHint() const override { return {480, 270}; }
 
+    // Split-screen compare: `reference` on the left of the divider, the
+    // picture on the right. Drag the divider to wipe between them.
+    void setCompare(const QImage& reference, const QString& label = QString());
+    void clearCompare();
+    bool comparing() const { return !compare_.isNull(); }
+    double split() const { return split_; }
+    void setSplit(double s);
+    // The divider's x position in the widget.
+    double dividerX() const;
+
 signals:
     void dragRequested();
 
@@ -39,9 +49,14 @@ protected:
     void paintEvent(QPaintEvent*) override;
     void mousePressEvent(QMouseEvent* e) override;
     void mouseMoveEvent(QMouseEvent* e) override;
+    void mouseReleaseEvent(QMouseEvent* e) override;
 
 private:
     QImage image_;
+    QImage compare_;
+    QString compareLabel_;
+    double split_ = 0.5;
+    bool draggingSplit_ = false;
     QString placeholder_;
     bool safe_ = false;
     bool dragSource_ = false;

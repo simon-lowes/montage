@@ -23,11 +23,14 @@
 #include <QTreeView>
 #include <QTreeWidget>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 
 #include "AutoDuckDialog.h"
 #include "CaptionsPanel.h"
+#include "ColorWheel.h"
+#include "CurveEditor.h"
 #include "EditorState.h"
 #include "EffectsBrowser.h"
 #include "ExportDialog.h"
@@ -1204,6 +1207,176 @@ private slots:
         QCOMPARE(state()->sequence()->videoTracks.back().clips.at(0).generator.type, std::string("adjustment"));
         state()->undo();
         QCOMPARE(state()->sequence()->videoTracks.size(), tracks);
+    }
+
+    void gradingCurvesWheelsAndCompare() {
+        auto mouse = [](QWidget* w, QEvent::Type type, QPointF pos, Qt::MouseButtons held) {
+            QMouseEvent ev(type, pos, w->mapToGlobal(pos), type == QEvent::MouseMove ? Qt::NoButton : Qt::LeftButton, held, Qt::NoModifier);
+            QApplication::sendEvent(w, &ev);
+        };
+        // A hue curve: click the line to add a point, drag it, double-click to remove it.
+        {
+            CurveEditor ed(CurveEditor::Mode::Hue);
+            ed.resize(372, 112);
+            QSignalSpy spy(&ed, &CurveEditor::edited);
+            QCOMPARE(ed.count(), 0);
+            const QPointF at = ed.toWidget({1.0 / 3, 0.5});
+            mouse(&ed, QEvent::MouseButtonPress, at, Qt::LeftButton);
+            QCOMPARE(ed.count(), 1);
+            QVERIFY(ed.dragging());
+            mouse(&ed, QEvent::MouseMove, ed.toWidget({1.0 / 3, 0.9}), Qt::LeftButton);
+            mouse(&ed, QEvent::MouseButtonRelease, ed.toWidget({1.0 / 3, 0.9}), Qt::NoButton);
+            QVERIFY(!ed.dragging());
+            QVERIFY(spy.size() >= 3);
+            QCOMPARE(spy.last().at(1).toBool(), true);
+            QVERIFY(std::fabs(ed.valueAt(1.0 / 3) - 0.9) < 0.02);
+            // One point is a level everywhere (and round the wrap).
+            QVERIFY(std::fabs(ed.valueAt(0.9) - ed.valueAt(1.0 / 3)) < 1e-3);
+            mouse(&ed, QEvent::MouseButtonDblClick, ed.toWidget({1.0 / 3, ed.valueAt(1.0 / 3)}), Qt::LeftButton);
+            QCOMPARE(ed.count(), 0);
+            QCOMPARE(spy.last().at(0).toString(), QString());
+        }
+        // A tone curve keeps its ends: they move up and down but not across, and cannot be removed.
+        {
+            CurveEditor ed(CurveEditor::Mode::Tone);
+            ed.resize(212, 140);
+            QCOMPARE(ed.points(), QString("0,0 1,1"));
+            mouse(&ed, QEvent::MouseButtonPress, ed.toWidget({0, 0}), Qt::LeftButton);
+            mouse(&ed, QEvent::MouseMove, ed.toWidget({0.2, 0.1}), Qt::LeftButton);
+            mouse(&ed, QEvent::MouseButtonRelease, ed.toWidget({0.2, 0.1}), Qt::NoButton);
+            QVERIFY(ed.points().startsWith("0,0.1"));
+            mouse(&ed, QEvent::MouseButtonDblClick, ed.toWidget({1, 1}), Qt::LeftButton);
+            QCOMPARE(ed.count(), 2);
+        }
+        // Wheel geometry: a puck maps to balanced offsets and back.
+        {
+            double r, g, b;
+            ColorWheel::puckToRgb({0.3, 0.4}, 0.25, r, g, b);
+            QVERIFY(std::fabs(r + g + b) < 1e-9);
+            const QPointF back = ColorWheel::rgbToPuck(r + 0.1, g + 0.1, b + 0.1, 0.25);  // the shared part is ignored
+            QVERIFY(std::fabs(back.x() - 0.3) < 1e-9 && std::fabs(back.y() - 0.4) < 1e-9);
+            ColorWheel::puckToRgb({1, 0}, 0.5, r, g, b);
+            QVERIFY(std::fabs(r - 0.5) < 1e-9 && std::fabs(g + 0.25) < 1e-9 && std::fabs(b + 0.25) < 1e-9);
+        }
+
+        // In the Inspector: Hue Curves and Color Correct on a clip.
+        QImage frame(320, 180, QImage::Format_RGB32);
+        frame.fill(QColor(200, 60, 40));
+        const QString png = dir_.path() + "/grade.png";
+        QVERIFY(frame.save(png));
+        state()->newProject();
+        const auto ids = state()->importFiles({png});
+        QCOMPARE(ids.size(), size_t(1));
+        state()->apply("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids[0], 0, 0, 30, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        });
+        const Id clip = state()->sequence()->videoTracks[0].clips.at(0).id;
+        state()->edit("Grade", [clip](Project& p, Sequence& s) {
+            Clip* c = edit::clipById(s, clip);
+            c->effects.push_back(makeEffect(p, "hue_curves"));
+            Effect cc = makeEffect(p, "color_correct");
+            for (const char* n : {"gain_r", "gain_g", "gain_b"}) cc.params[n] = Param(1.2);
+            c->effects.push_back(cc);
+            return true;
+        });
+        state()->setSelection({clip}, false);
+        win_->findChild<QDockWidget*>("inspector")->show();
+        win_->findChild<QDockWidget*>("inspector")->raise();
+        QApplication::processEvents();
+        auto effectOf = [&](const char* type) -> const Effect* {
+            for (const Effect& e : edit::clipById(*state()->sequence(), clip)->effects)
+                if (e.type == type) return &e;
+            return nullptr;
+        };
+        auto visible = [&]<typename W>(const char* name) -> W* {
+            for (auto* w : win_->findChildren<W*>(name))
+                if (w->isVisibleTo(win_.get())) return w;
+            return nullptr;
+        };
+        auto* hueSat = visible.template operator()<CurveEditor>("curve_hue_sat");
+        QVERIFY(hueSat);
+        QVERIFY(hueSat->width() > 40 && hueSat->height() > 40);
+        // Drag the reds' saturation down: one undoable change.
+        mouse(hueSat, QEvent::MouseButtonPress, hueSat->toWidget({0.02, 0.5}), Qt::LeftButton);
+        for (double y : {0.4, 0.3, 0.2})
+            mouse(hueSat, QEvent::MouseMove, hueSat->toWidget({0.02, y}), Qt::LeftButton);
+        mouse(hueSat, QEvent::MouseButtonRelease, hueSat->toWidget({0.02, 0.2}), Qt::NoButton);
+        QApplication::processEvents();
+        QVERIFY(!effectOf("hue_curves")->s("hue_sat").empty());
+        RenderOptions o;
+        o.displaySpace = "rec709";
+        auto centre = [&] {
+            const Image img = renderProgramFrame(state()->project(), *state()->sequence(), 5, o);
+            const float* p = img.at(img.width / 2, img.height / 2);
+            return std::array<float, 3>{p[0], p[1], p[2]};
+        };
+        const auto graded = centre();
+        QVERIFY2(graded[0] - graded[2] < 0.5f, qPrintable(QString("%1 %2 %3").arg(graded[0]).arg(graded[1]).arg(graded[2])));
+        state()->undo();
+        QVERIFY(effectOf("hue_curves")->s("hue_sat").empty());
+        QVERIFY(centre()[0] - centre()[2] > graded[0] - graded[2] + 0.1f);
+        state()->redo();
+        QApplication::processEvents();
+
+        // The Gain wheel pushed to red at the rim: the channels split about where they were.
+        auto* gain = visible.template operator()<ColorWheel>("wheel_gain");
+        QVERIFY(gain && visible.template operator()<ColorWheel>("wheel_lift") && visible.template operator()<ColorWheel>("wheel_gamma"));
+        gain->setPuck({1, 0}, true);
+        const Effect* cc = effectOf("color_correct");
+        QVERIFY(std::fabs(cc->p("gain_r", 0) - 1.7) < 1e-6);
+        QVERIFY(std::fabs(cc->p("gain_g", 0) - 0.95) < 1e-6);
+        QVERIFY(std::fabs(cc->p("gain_b", 0) - 0.95) < 1e-6);
+        QApplication::processEvents();
+        gain = visible.template operator()<ColorWheel>("wheel_gain");
+        QVERIFY(std::fabs(gain->puck().x() - 1) < 1e-6 && std::fabs(gain->puck().y()) < 1e-6);
+        state()->undo();
+        QVERIFY(std::fabs(effectOf("color_correct")->p("gain_r", 0) - 1.2) < 1e-6);
+        state()->redo();
+        QApplication::processEvents();
+        // Back to the centre (double-click): only the balance goes, the shared 1.2 stays.
+        gain = visible.template operator()<ColorWheel>("wheel_gain");
+        mouse(gain, QEvent::MouseButtonDblClick, QPointF(gain->width() / 2.0, 10), Qt::LeftButton);
+        cc = effectOf("color_correct");
+        for (const char* n : {"gain_r", "gain_g", "gain_b"}) QVERIFY(std::fabs(cc->p(n, 0) - 1.2) < 1e-6);
+
+        // Compare with Reference: off until there is a reference.
+        auto* compare = win_->findChild<QAction*>("compareReference");
+        QVERIFY(compare && compare->isCheckable());
+        ViewerWidget* program = nullptr;
+        for (auto* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Program) program = m->viewer();
+        QVERIFY(program);
+        compare->trigger();
+        QVERIFY(!compare->isChecked() && !program->comparing());
+        state()->setPlayhead(5);
+        win_->findChild<QAction*>("setColourReference")->trigger();
+        compare->trigger();
+        QVERIFY(compare->isChecked() && program->comparing());
+        // The reference left of the divider, the picture right of it.
+        QImage blue(320, 180, QImage::Format_RGB32);
+        blue.fill(QColor(20, 40, 220));
+        program->setImage(blue);
+        program->resize(400, 225);
+        QCOMPARE(program->split(), 0.5);
+        auto shot = [&] { return program->grab().toImage(); };
+        const QRectF r = program->imageRect();
+        QImage img = shot();
+        const QColor left = img.pixelColor(int(r.left() + r.width() * 0.25), int(r.center().y()));
+        const QColor right = img.pixelColor(int(r.left() + r.width() * 0.75), int(r.center().y()));
+        QVERIFY2(left.red() > left.blue() && right.blue() > right.red(), qPrintable(left.name() + " " + right.name()));
+        // Dragging the divider wipes further across.
+        const QPointF div(program->dividerX(), r.center().y());
+        mouse(program, QEvent::MouseButtonPress, div, Qt::LeftButton);
+        mouse(program, QEvent::MouseMove, QPointF(r.left() + r.width() * 0.8, r.center().y()), Qt::LeftButton);
+        mouse(program, QEvent::MouseButtonRelease, QPointF(r.left() + r.width() * 0.8, r.center().y()), Qt::NoButton);
+        QVERIFY(std::fabs(program->split() - 0.8) < 0.02);
+        img = shot();
+        const QColor nowLeft = img.pixelColor(int(r.left() + r.width() * 0.75), int(r.center().y()));
+        QVERIFY(nowLeft.red() > nowLeft.blue());
+        compare->trigger();
+        QVERIFY(!compare->isChecked() && !program->comparing());
+        program->setSplit(0.5);
+        state()->newProject();
     }
 
     void matchColourToAReference() {

@@ -64,7 +64,57 @@ void ViewerWidget::paintEvent(QPaintEvent*) {
         p.drawLine(QPointF(r.center().x() - 10, r.center().y()), QPointF(r.center().x() + 10, r.center().y()));
         p.drawLine(QPointF(r.center().x(), r.center().y() - 10), QPointF(r.center().x(), r.center().y() + 10));
     }
+    if (!compare_.isNull()) {
+        // The reference fitted to the same area, shown left of the divider.
+        const QSizeF fs = QSizeF(compare_.size()).scaled(r.size(), Qt::KeepAspectRatio);
+        const QRectF rr(r.center().x() - fs.width() / 2, r.center().y() - fs.height() / 2, fs.width(), fs.height());
+        const double x = dividerX();
+        p.save();
+        p.setClipRect(QRectF(r.left(), r.top(), x - r.left(), r.height()));
+        p.fillRect(r, QColor(0x0e, 0x0f, 0x11));
+        p.drawImage(rr, compare_);
+        p.restore();
+        p.setPen(QPen(QColor(255, 255, 255, 200), 1));
+        p.drawLine(QPointF(x, r.top()), QPointF(x, r.bottom()));
+        p.setBrush(QColor(255, 255, 255, 220));
+        p.drawEllipse(QPointF(x, r.center().y()), 4, 4);
+        QFont f = p.font();
+        f.setPointSizeF(std::max(7.0, f.pointSizeF() - 1));
+        p.setFont(f);
+        const QFontMetrics fm(f);
+        auto tag = [&](const QString& text, bool left) {
+            const QSizeF ts(fm.horizontalAdvance(text) + 10, fm.height() + 4);
+            const QRectF box(left ? r.left() + 6 : r.right() - 6 - ts.width(), r.top() + 6, ts.width(), ts.height());
+            p.fillRect(box, QColor(0, 0, 0, 150));
+            p.setPen(QColor(235, 235, 235));
+            p.drawText(box, Qt::AlignCenter, text);
+        };
+        tag(compareLabel_.isEmpty() ? tr("Reference") : compareLabel_, true);
+        tag(tr("Current"), false);
+    }
     if (overlay_) overlay_(p, r);
+}
+
+void ViewerWidget::setCompare(const QImage& reference, const QString& label) {
+    compare_ = reference;
+    compareLabel_ = label;
+    update();
+}
+
+void ViewerWidget::clearCompare() {
+    compare_ = QImage();
+    draggingSplit_ = false;
+    update();
+}
+
+void ViewerWidget::setSplit(double s) {
+    split_ = std::clamp(s, 0.0, 1.0);
+    update();
+}
+
+double ViewerWidget::dividerX() const {
+    const QRectF r = imageRect();
+    return r.left() + r.width() * split_;
 }
 
 QRectF ViewerWidget::imageRect() const {
@@ -75,10 +125,31 @@ QRectF ViewerWidget::imageRect() const {
 
 void ViewerWidget::mousePressEvent(QMouseEvent* e) {
     pressPos_ = e->pos();
+    if (comparing() && e->button() == Qt::LeftButton && !image_.isNull() && std::fabs(e->position().x() - dividerX()) <= 6) {
+        draggingSplit_ = true;
+        setCursor(Qt::SplitHCursor);
+        e->accept();
+        return;
+    }
     QWidget::mousePressEvent(e);
 }
 
+void ViewerWidget::mouseReleaseEvent(QMouseEvent* e) {
+    if (draggingSplit_) {
+        draggingSplit_ = false;
+        unsetCursor();
+        e->accept();
+        return;
+    }
+    QWidget::mouseReleaseEvent(e);
+}
+
 void ViewerWidget::mouseMoveEvent(QMouseEvent* e) {
+    if (draggingSplit_) {
+        const QRectF r = imageRect();
+        if (r.width() > 0) setSplit((e->position().x() - r.left()) / r.width());
+        return;
+    }
     if (dragSource_ && (e->buttons() & Qt::LeftButton) &&
         (e->pos() - pressPos_).manhattanLength() > QApplication::startDragDistance())
         emit dragRequested();

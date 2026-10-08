@@ -470,6 +470,9 @@ void MainWindow::buildMenus() {
         ->setObjectName(QStringLiteral("setColourReference"));
     add(clipM, tr("Match Colour to Reference"), QKeySequence("Ctrl+Alt+Shift+C"), [this] { matchColour(); })
         ->setObjectName(QStringLiteral("matchColour"));
+    compareRef_ = add(clipM, tr("Compare with Reference"), QKeySequence(), [this] { setCompareWithReference(compareRef_->isChecked()); });
+    compareRef_->setCheckable(true);
+    compareRef_->setObjectName(QStringLiteral("compareReference"));
     add(clipM, tr("Auto Reframe"), QKeySequence(), [this] { autoReframeClips(); })->setObjectName(QStringLiteral("autoReframeClips"));
     add(clipM, tr("Add Frame &Hold"), QKeySequence("Shift+F"), [this] { addFrameHold(); })->setObjectName(QStringLiteral("addFrameHold"));
     add(clipM, tr("Replace with Source Clip"), QKeySequence(), [this] { replaceWithSource(); })
@@ -1306,6 +1309,14 @@ void MainWindow::setColourReference() {
     }
     const FrameTime t = std::clamp<FrameTime>(state_->playhead(), 0, s->duration() - 1);
     colourRef_ = colourReferenceFrame(state_->project(), *s, t);
+    {
+        RenderOptions o;
+        o.scale = std::min(1.0, 1280.0 / std::max(1, s->width));
+        o.displaySpace = "rec709";
+        const Image view = renderProgramFrame(state_->project(), *s, t, o);
+        colourRefView_ = QImage(view.width, view.height, QImage::Format_RGBA8888);
+        toRgba8(view, colourRefView_.bits(), size_t(colourRefView_.bytesPerLine()));
+    }
     // Named after the top clip with a picture at the playhead.
     colourRefName_ = QString::fromStdString(s->name);
     for (int i = int(s->videoTracks.size()) - 1; i >= 0; --i)
@@ -1316,6 +1327,21 @@ void MainWindow::setColourReference() {
     state_->message(tr("Colour reference: %1 at %2. Select clips and choose Match Colour to Reference.")
                         .arg(colourRefName_, QString::fromStdString(formatTimecode(t, s->fps))),
                     6000);
+    if (compareRef_ && compareRef_->isChecked()) setCompareWithReference(true);
+}
+
+void MainWindow::setCompareWithReference(bool on) {
+    if (on && colourRefView_.isNull()) {
+        state_->message(tr("Park on the look to compare with and choose Clip › Set Colour Reference first"), 5000);
+        on = false;
+    }
+    if (compareRef_) {
+        QSignalBlocker b(compareRef_);
+        compareRef_->setChecked(on);
+    }
+    if (!programPanel_) return;
+    if (on) programPanel_->viewer()->setCompare(colourRefView_, tr("Reference: %1").arg(colourRefName_));
+    else programPanel_->viewer()->clearCompare();
 }
 
 int MainWindow::matchColour() {

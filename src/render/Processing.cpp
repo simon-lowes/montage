@@ -107,6 +107,8 @@ void curves(const Effect& e, FrameTime t, Image& img) {
     });
 }
 
+void hueCurves(const Effect& e, FrameTime t, Image& img);  // below, beside the curve building
+
 void hueSat(const Effect& e, FrameTime t, Image& img) {
     float hue = float(e.p("hue", t)) * float(M_PI) / 180.0f;
     float sat = float(e.p("saturation", t, 1));
@@ -829,6 +831,7 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
     const std::string& ty = e.type;
     if (ty == "color_correct") colorCorrect(e, t, img);
     else if (ty == "curves") curves(e, t, img);
+    else if (ty == "hue_curves") hueCurves(e, t, img);
     else if (ty == "hue_sat") hueSat(e, t, img);
     else if (ty == "lut") applyLut(e, t, img);
     else if (ty == "color_space_transform") {
@@ -971,6 +974,118 @@ std::shared_ptr<const Lut3D> loadCubeLut(const std::string& path, std::string* e
     cache[path] = lut;
     return lut;
 }
+
+std::vector<float> buildFlatCurve(const std::string& pointsStr, int n, bool cyclic) {
+    std::vector<std::pair<double, double>> pts;
+    std::istringstream is(pointsStr);
+    std::string tok;
+    while (is >> tok) {
+        auto comma = tok.find(',');
+        if (comma == std::string::npos) continue;
+        try {
+            pts.push_back({std::clamp(std::stod(tok.substr(0, comma)), 0.0, 1.0), std::clamp(std::stod(tok.substr(comma + 1)), 0.0, 1.0)});
+        } catch (...) {
+        }
+    }
+    std::sort(pts.begin(), pts.end());
+    pts.erase(std::unique(pts.begin(), pts.end(), [](auto& a, auto& b) { return std::fabs(a.first - b.first) < 1e-9; }), pts.end());
+    std::vector<float> lut(size_t(n) + 1, 0.5f);
+    if (pts.empty()) return lut;
+    if (pts.size() == 1) {
+        std::fill(lut.begin(), lut.end(), float(pts[0].second));
+        return lut;
+    }
+    // Neighbours beyond the ends: the points again a turn away (hue), or the end held (levels).
+    std::vector<std::pair<double, double>> ext;
+    const size_t k = pts.size();
+    if (cyclic) {
+        ext.push_back({pts[k - 2].first - 1, pts[k - 2].second});
+        ext.push_back({pts[k - 1].first - 1, pts[k - 1].second});
+        ext.insert(ext.end(), pts.begin(), pts.end());
+        ext.push_back({pts[0].first + 1, pts[0].second});
+        ext.push_back({pts[1].first + 1, pts[1].second});
+    } else {
+        ext.push_back({-1.0, pts[0].second});
+        ext.push_back({std::min(-1e-6, pts[0].first - 1e-6), pts[0].second});
+        ext.insert(ext.end(), pts.begin(), pts.end());
+        ext.push_back({std::max(1 + 1e-6, pts[k - 1].first + 1e-6), pts[k - 1].second});
+        ext.push_back({2.0, pts[k - 1].second});
+    }
+    for (int i = 0; i <= n; ++i) {
+        const double x = double(i) / n;
+        size_t j = 1;
+        while (j + 2 < ext.size() && ext[j + 1].first < x) ++j;
+        // A Hermite segment between ext[j] and ext[j + 1] with monotone tangents (harmonic
+        // means of the neighbouring slopes, flat at a peak): no overshoot, so a stretch
+        // left flat changes nothing.
+        const auto& p0 = ext[j - 1];
+        const auto& p1 = ext[j];
+        const auto& p2 = ext[j + 1];
+        const auto& p3 = ext[std::min(j + 2, ext.size() - 1)];
+        const double dx = std::max(1e-9, p2.first - p1.first);
+        const double u = std::clamp((x - p1.first) / dx, 0.0, 1.0);
+        auto slope = [](const std::pair<double, double>& a, const std::pair<double, double>& b) {
+            return (b.second - a.second) / std::max(1e-9, b.first - a.first);
+        };
+        auto tangent = [](double d0, double d1) { return d0 * d1 <= 0 ? 0.0 : 2 * d0 * d1 / (d0 + d1); };
+        const double d0 = slope(p0, p1), d1 = slope(p1, p2), d2 = slope(p2, p3);
+        const double m1 = tangent(d0, d1) * dx, m2 = tangent(d1, d2) * dx;
+        const double u2 = u * u, u3 = u2 * u;
+        const double y = (2 * u3 - 3 * u2 + 1) * p1.second + (u3 - 2 * u2 + u) * m1 + (-2 * u3 + 3 * u2) * p2.second + (u3 - u2) * m2;
+        lut[size_t(i)] = float(std::clamp(y, 0.0, 1.0));
+    }
+    return lut;
+}
+
+namespace {
+
+void hueCurves(const Effect& e, FrameTime t, Image& img) {
+    const std::string hh = e.s("hue_hue"), hs = e.s("hue_sat"), hl = e.s("hue_luma"), ls = e.s("luma_sat"), ss = e.s("sat_sat");
+    if (hh.empty() && hs.empty() && hl.empty() && ls.empty() && ss.empty()) return;
+    constexpr int n = 360;
+    const auto lHH = buildFlatCurve(hh, n, true), lHS = buildFlatCurve(hs, n, true), lHL = buildFlatCurve(hl, n, true);
+    const auto lLS = buildFlatCurve(ls, n, false), lSS = buildFlatCurve(ss, n, false);
+    const float mix = float(std::clamp(e.p("mix", t, 100) / 100.0, 0.0, 1.0));
+    auto look = [](const std::vector<float>& lut, float x) {
+        const float f = clamp01(x) * float(n);
+        const int i = std::min(n - 1, int(f));
+        return lut[size_t(i)] + (lut[size_t(i) + 1] - lut[size_t(i)]) * (f - float(i));
+    };
+    perPixel(img, [&](float& r, float& g, float& b, float&) {
+        const float v = std::max({r, g, b}), mn = std::min({r, g, b}), c = v - mn;
+        if (v <= 0) return;
+        const float s = c / v;
+        float h = 0;
+        if (c > 1e-6f) {
+            if (v == r) h = std::fmod((g - b) / c + 6.0f, 6.0f);
+            else if (v == g) h = (b - r) / c + 2;
+            else h = (r - g) / c + 4;
+            h /= 6;
+        }
+        const float l = luma(r, g, b);
+        // Hue turned by up to half a turn, saturation scaled up to twice, brightness with the colour's saturation.
+        float nh = h + (look(lHH, h) - 0.5f);
+        nh -= std::floor(nh);
+        const float ns = std::clamp(s * 2 * look(lHS, h) * 2 * look(lLS, l) * 2 * look(lSS, s), 0.0f, 1.0f);
+        const float nv = v * std::max(0.0f, 1 + (look(lHL, h) - 0.5f) * 2 * s);
+        // Back from hue, saturation and value.
+        const float cc = nv * ns, hp = nh * 6, xx = cc * (1 - std::fabs(std::fmod(hp, 2.0f) - 1)), m = nv - cc;
+        float rr, gg, bb;
+        switch (int(hp) % 6) {
+            case 0: rr = cc, gg = xx, bb = 0; break;
+            case 1: rr = xx, gg = cc, bb = 0; break;
+            case 2: rr = 0, gg = cc, bb = xx; break;
+            case 3: rr = 0, gg = xx, bb = cc; break;
+            case 4: rr = xx, gg = 0, bb = cc; break;
+            default: rr = cc, gg = 0, bb = xx; break;
+        }
+        r += (rr + m - r) * mix;
+        g += (gg + m - g) * mix;
+        b += (bb + m - b) * mix;
+    });
+}
+
+}  // namespace
 
 std::vector<float> buildCurve(const std::string& pointsStr, int n) {
     std::vector<std::pair<double, double>> pts;

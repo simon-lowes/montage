@@ -428,7 +428,11 @@ The second gap analysis (`docs/research/phase3-roadmap.md`, October 2026) ranks 
   - ExportSettings::burnIn holds the timecode, the top clip's name, any text (stacked in a dark box in one of six corners at a chosen size), and a watermark image with its own corner, width and opacity. They are drawn after captions in the sequence's colour space; a missing watermark fails the export.
   - The Export dialog has a Burn in row (Timecode, Clip name, corner), a text field and a Watermark row, all remembered. `montage-cli render --burn-timecode --burn-clip-name --burn-text --burn-corner --watermark --watermark-corner --watermark-opacity`; MCP `montage_render` takes `burn_in`.
   - Tested: text in the chosen corner only, the timecode changing frame to frame, more lines for clip name and text, a watermark at the right opacity; an exported and decoded review copy (white text on a dark box top left, red logo bottom right, picture untouched in the middle); the missing-logo error; and MCP with a bad corner refused.
-- [ ] 4. Grading essentials: hue/luma/sat curves, colour wheels, split-screen compare (S–M)
+- [x] 4. Grading essentials (S–M):
+  - Hue Curves effect (`hue_curves`): five flat curves (Hue vs Hue/Sat/Luma wrap round; Luma vs Sat and Sat vs Sat hold their ends), built by `buildFlatCurve` with monotone tangents so a flat stretch changes nothing; applied in HSV with a mix.
+  - CurveEditor in the Inspector for these and for Curves (tone curves keep their two ends); edits merge into one undo step per drag.
+  - ColorWheel: Lift, Gamma and Gain wheels above Color Correct's sliders. The puck sets balanced channel offsets (rim: lift 0.25, gamma 0.5 stops, gain 0.5), keeping whatever the channels share.
+  - Clip › Compare with Reference: the Program viewer shows the colour reference left of a draggable divider.
 - [ ] 5. Build a cut from a script (M)
 - [ ] 6. Speech enhancement and stem separation (M)
 - [ ] 7. Beat markers and fitting music to length (M)
