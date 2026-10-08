@@ -10,6 +10,7 @@
 #include <QtConcurrent>
 #include <algorithm>
 #include <limits>
+#include <set>
 #include <utility>
 
 #include "core/MediaLog.h"
@@ -292,6 +293,13 @@ void EditorState::setSnapping(bool on) {
 // Media
 
 void EditorState::watchMediaFiles() {
+    // Decoders stay open only on this project's files (and proxies); a closed project's files are let go.
+    std::set<std::string> open;
+    for (const MediaItem& m : project_.media) {
+        if (!m.path.empty()) open.insert(m.path);
+        if (!m.proxyPath.empty()) open.insert(m.proxyPath);
+    }
+    MediaPool::instance().setOpenFiles(std::move(open));
     QStringList wanted;
     for (const MediaItem& m : project_.media)
         if (!m.path.empty() && m.kind != MediaKind::Sequence && !m.subclipOf) {

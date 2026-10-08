@@ -73,11 +73,34 @@ void MediaPool::release(VideoDecoder* d) {
     std::lock_guard lock(m_);
     auto it = decoders_.find(d->path());
     if (it == decoders_.end()) return;
+    if (openFiles_ && !openFiles_->count(it->first)) {
+        // Not one of the open project's files: closed rather than kept.
+        std::erase_if(it->second, [d](const Slot& s) { return s.dec.get() == d; });
+        if (it->second.empty()) decoders_.erase(it);
+        return;
+    }
     for (auto& s : it->second)
         if (s.dec.get() == d) {
             s.busy = false;
             s.lastUsed = ++useClock_;
         }
+}
+
+size_t MediaPool::openDecoders() const {
+    std::lock_guard lock(m_);
+    size_t n = 0;
+    for (const auto& [path, slots] : decoders_) n += slots.size();
+    return n;
+}
+
+void MediaPool::setOpenFiles(std::optional<std::set<std::string>> paths) {
+    std::lock_guard lock(m_);
+    openFiles_ = std::move(paths);
+    if (!openFiles_) return;
+    for (auto it = decoders_.begin(); it != decoders_.end();) {
+        if (!openFiles_->count(it->first)) std::erase_if(it->second, [](const Slot& s) { return !s.busy; });
+        it = it->second.empty() ? decoders_.erase(it) : std::next(it);
+    }
 }
 
 Frame16Ptr MediaPool::videoFrame(const std::string& path, double t, int w, int h, bool highQuality) {

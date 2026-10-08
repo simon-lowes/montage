@@ -5535,6 +5535,31 @@ private slots:
         QVERIFY(r.value("isError").toBool());
     }
 
+    void mediaPoolKeepsOnlyOpenFiles() {
+        // Two files decoded; then only the first belongs to the open project, then none (a project closed).
+        const std::string a = path("pool-a.mp4"), b = path("pool-b.mp4");
+        writeBallVideo(a, 6);
+        writeBallVideo(b, 6);
+        MediaPool& pool = MediaPool::instance();
+        pool.clear();
+        pool.setOpenFiles(std::nullopt);
+        QVERIFY(pool.videoFrame(a, 0.0, 64, 36));
+        QVERIFY(pool.videoFrame(b, 0.0, 64, 36));
+        QCOMPARE(pool.openDecoders(), size_t(2));
+        // b's idle decoder is closed at once, and its next one as soon as it is released.
+        pool.setOpenFiles(std::set<std::string>{a});
+        QCOMPARE(pool.openDecoders(), size_t(1));
+        QVERIFY(pool.videoFrame(b, 0.1, 64, 36));
+        QCOMPARE(pool.openDecoders(), size_t(1));
+        pool.setOpenFiles(std::set<std::string>{});
+        QCOMPARE(pool.openDecoders(), size_t(0));
+        // No limit again: decoders are kept for reuse.
+        pool.setOpenFiles(std::nullopt);
+        QVERIFY(pool.videoFrame(b, 0.2, 64, 36));
+        QCOMPARE(pool.openDecoders(), size_t(1));
+        pool.clear();
+    }
+
     void mcpCompareSequences() {
         // Two versions of a cut of the same (not decoded) file: the second trims the first shot and adds a third.
         Project p = makeDefaultProject();

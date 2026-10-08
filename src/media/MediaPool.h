@@ -4,6 +4,8 @@
 #include <functional>
 #include <list>
 #include <map>
+#include <optional>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -34,6 +36,11 @@ public:
     void clear();
     // Drops everything cached for one file (decoded frames, idle decoders, audio and peaks), after it changed on disk.
     void forget(const std::string& path);
+    // The files idle decoders may stay open on (the open project's media). Any other file's decoders are closed now
+    // if idle, or as soon as they are released, so a closed project's files are let go even while background jobs
+    // finish (on Windows an open file stops its folder being moved or renamed). nullopt (the start) lifts the limit.
+    void setOpenFiles(std::optional<std::set<std::string>> paths);
+    size_t openDecoders() const;  // decoders open now, busy or idle
     // Called (from any thread) when audio/peaks for a path become available.
     void setReadyCallback(std::function<void(const std::string&)> cb);
 
@@ -71,6 +78,7 @@ private:
 
     mutable std::mutex m_;
     std::map<std::string, std::vector<Slot>> decoders_;
+    std::optional<std::set<std::string>> openFiles_;  // setOpenFiles; nullopt = no limit
     std::list<std::pair<FrameKey, Frame16Ptr>> lru_;
     std::unordered_map<FrameKey, decltype(lru_)::iterator, FrameKeyHash> index_;
     size_t cacheBytes_ = 0;
