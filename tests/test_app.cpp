@@ -420,6 +420,15 @@ private slots:
             QVERIFY(chapters->isEnabled());
             preset->setCurrentIndex(presetIndex("gif"));
             QVERIFY(!chapters->isEnabled());
+            // Smart rendering is offered for ProRes and DNxHR only.
+            auto* smart = ed.findChild<QCheckBox*>("exportSmartRender");
+            QVERIFY(smart && !smart->isEnabled());
+            for (size_t i = 0; i < exportPresets().size(); ++i)
+                if (exportPresets()[i].settings.videoCodec == "prores_ks") {
+                    preset->setCurrentIndex(int(i));
+                    break;
+                }
+            QVERIFY(smart->isEnabled());
         }
         // One undo step each.
         state()->undo();

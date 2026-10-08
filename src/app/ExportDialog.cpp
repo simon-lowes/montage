@@ -197,6 +197,10 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     chapters_->setObjectName(QStringLiteral("exportChapters"));
     chapters_->setChecked(appSettings().value("export/chapters", true).toBool());
     form->addRow(tr("Chapters:"), chapters_);
+    smart_ = new QCheckBox(tr("Copy untouched footage (smart render)"), form_);
+    smart_->setObjectName(QStringLiteral("exportSmartRender"));
+    smart_->setChecked(appSettings().value("export/smartRender", true).toBool());
+    form->addRow(QString(), smart_);
     color_ = new QComboBox(form_);
     color_->setObjectName(QStringLiteral("exportColor"));
     color_->addItem(tr("Same as sequence (%1)").arg(QString::fromStdString(seq ? sequenceColorSpace(*seq).label : "Rec.709")),
@@ -461,6 +465,11 @@ void ExportDialog::updateControls() {
                              ext == QLatin1String("mkv") || ext == QLatin1String("webm");
     const bool anyChapters = seq && std::any_of(seq->markers.begin(), seq->markers.end(), [](const Marker& m) { return m.chapter; });
     chapters_->setEnabled(chapterFile && anyChapters);
+    const bool intra = p && (p->settings.videoCodec == "prores_ks" || p->settings.videoCodec == "dnxhd");
+    smart_->setEnabled(intra);
+    smart_->setToolTip(intra ? tr("Frames that are one untouched clip already in this ProRes or DNxHR flavour, size and rate are copied from "
+                                  "the source instead of being encoded again: faster, and exactly the original pictures")
+                             : tr("Smart rendering works with ProRes and DNxHR"));
     chapters_->setToolTip(!chapterFile ? tr("Chapters can be written into MP4, MOV and MKV files")
                           : anyChapters ? tr("Players and YouTube show the chapter markers as chapters")
                                         : tr("Add chapter markers (Sequence > Add Chapter Marker) to export chapters"));
@@ -585,6 +594,8 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
     settings.setValue("export/captions", captions_->currentIndex());
     s.chapters = chapters_->isChecked();
     settings.setValue("export/chapters", chapters_->isChecked());
+    s.smartRender = smart_->isChecked();
+    settings.setValue("export/smartRender", smart_->isChecked());
     if (hasVideo(s)) s.colorSpace = color_->currentData().toString().toStdString();
     if (hasAudio(s) && loudness_->currentIndex() > 0) {
         const QPointF target = loudness_->currentData().toPointF();

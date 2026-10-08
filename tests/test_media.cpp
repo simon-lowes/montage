@@ -2862,6 +2862,83 @@ private slots:
         QVERIFY2(std::fabs(out[200] - 0.2f) < 0.01f, qPrintable(QString::number(out[200])));
     }
 
+    void smartRendering() {
+        // The source: one second of a changing ramp in ProRes 422 HQ, 128 x 72 at 25 fps.
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 128, gs.height = 72, gs.fps = Rational{25, 1};
+        Clip ramp = makeGeneratorClip(gen, "color", 25);
+        ramp.generator.params["color.r"].addKey(0, 0.1);
+        ramp.generator.params["color.r"].addKey(24, 0.9);
+        ramp.generator.params["color.g"] = 0.4;
+        edit::overwrite(gen, gs, {TrackKind::Video, 0}, ramp);
+        ExportSettings st;
+        st.videoCodec = "prores_ks";
+        st.profile = "hq";
+        st.audioCodec = "none";
+        st.path = path("smart-source.mov");
+        std::string err;
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        // A cut of it: the first 15 frames as they are, the rest inverted.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 128, s.height = 72, s.fps = Rational{25, 1};
+        MediaItem m = probeOrFail(p, st.path);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(edit::razor(p, s, {TrackKind::Video, 0}, 15).ok);
+        s.videoTracks[0].clips[1].effects.push_back(makeEffect(p, "invert"));
+        ExportSettings ex = st;
+        ex.path = path("smart.mov");
+        int copied = -1;
+        QVERIFY2(exportSequence(p, s, ex, nullptr, nullptr, &err, nullptr, &copied), err.c_str());
+        QCOMPARE(copied, 15);
+        // The copied frames are the source's own, byte for byte; the rest decode inverted.
+        auto packets = [](const std::string& file) {
+            std::vector<QByteArray> out;
+            AVFormatContext* fmt = nullptr;
+            if (avformat_open_input(&fmt, file.c_str(), nullptr, nullptr) < 0) return out;
+            AVPacket* pkt = av_packet_alloc();
+            while (av_read_frame(fmt, pkt) >= 0) {
+                if (fmt->streams[pkt->stream_index]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
+                    out.push_back(QByteArray(reinterpret_cast<const char*>(pkt->data), pkt->size));
+                av_packet_unref(pkt);
+            }
+            av_packet_free(&pkt);
+            avformat_close_input(&fmt);
+            return out;
+        };
+        const auto source = packets(st.path), smart = packets(ex.path);
+        QCOMPARE(smart.size(), size_t(25));
+        for (int i = 0; i < 15; ++i) QVERIFY2(smart[size_t(i)] == source[size_t(i)], qPrintable(QString::number(i)));
+        QVERIFY(smart[20] != source[20]);
+        VideoDecoder a, b;
+        QVERIFY(a.open(st.path, &err) && b.open(ex.path, &err));
+        const Frame16Ptr fa = a.frameAt(20 / 25.0, 0, 0), fb = b.frameAt(20 / 25.0, 0, 0);
+        QVERIFY(fa && fb);
+        const size_t mid = (size_t(36) * 128 + 64) * 4;
+        QVERIFY2(std::fabs(fa->px[mid] / 65535.0 + fb->px[mid] / 65535.0 - 1.0) < 0.02, qPrintable(QString("%1 %2").arg(fa->px[mid]).arg(fb->px[mid])));
+        const Frame16Ptr ca = a.frameAt(5 / 25.0, 0, 0), cb = b.frameAt(5 / 25.0, 0, 0);
+        QVERIFY(ca && cb && ca->px == cb->px);
+        // Nothing is copied when smart rendering is off, for another flavour, or where the clip is moved.
+        ex.smartRender = false;
+        QVERIFY(exportSequence(p, s, ex, nullptr, nullptr, &err, nullptr, &copied));
+        QCOMPARE(copied, 0);
+        ex.smartRender = true;
+        ex.profile = "proxy";
+        QVERIFY(exportSequence(p, s, ex, nullptr, nullptr, &err, nullptr, &copied));
+        QCOMPARE(copied, 0);
+        ex.profile = "hq";
+        s.videoTracks[0].clips[0].motion.params["scale"] = 90.0;
+        QVERIFY(exportSequence(p, s, ex, nullptr, nullptr, &err, nullptr, &copied));
+        QCOMPARE(copied, 0);
+        // Burn-ins change every frame: nothing copied.
+        s.videoTracks[0].clips[0].motion.params["scale"] = 100.0;
+        ex.burnIn.timecode = true;
+        QVERIFY(exportSequence(p, s, ex, nullptr, nullptr, &err, nullptr, &copied));
+        QCOMPARE(copied, 0);
+    }
+
     void exportedChapters() {
         Project p = makeDefaultProject();
         Sequence& s = *p.active();

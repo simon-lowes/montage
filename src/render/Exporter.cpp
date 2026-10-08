@@ -11,11 +11,13 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <memory>
 
 #include "ColorSpace.h"
 #include "Compositor.h"
 #include "core/EditOps.h"
+#include "core/Effects.h"
 #include "Processing.h"
 #include "media/HwAccel.h"
 #include "media/Loudness.h"
@@ -478,8 +480,181 @@ void addChapters(AVFormatContext* oc, const Sequence& seq, FrameTime in, FrameTi
     }
 }
 
+// ---- Smart rendering --------------------------------------------------------------------------------------------
+// Frames that are one untouched clip of footage already in the export's intra-frame codec (ProRes, DNxHR) are
+// copied from the source file instead of being decoded and encoded again, as Premiere's and Final Cut's smart
+// rendering do: faster, and exactly the original pictures.
+
+bool isIntraCodec(const std::string& encoder) { return encoder == "prores_ks" || encoder == "dnxhd"; }
+
+// The clip's transform leaves the picture as it is at clip frame `local` (the source fills the frame 1:1).
+bool identityMotion(const Clip& c, FrameTime local) {
+    const EffectInfo* info = findEffectInfo(c.motion.empty() ? "transform" : c.motion.type);
+    if (!info) return false;
+    for (const ParamInfo& pi : info->params) {
+        if (pi.name == "fit") continue;  // any fit is 1:1 when the sizes match (checked by the caller)
+        if (pi.kind == ParamKind::Color) {
+            if (std::fabs(c.motion.p(pi.name + ".r", local, pi.def) - pi.def) > 1e-9 ||
+                std::fabs(c.motion.p(pi.name + ".g", local, pi.defG) - pi.defG) > 1e-9 ||
+                std::fabs(c.motion.p(pi.name + ".b", local, pi.defB) - pi.defB) > 1e-9)
+                return false;
+            continue;
+        }
+        if (std::fabs(c.motion.p(pi.name, local, pi.def) - pi.def) > 1e-9) return false;
+    }
+    return true;
+}
+
+class SmartRenderer {
+public:
+    // `profile` is the export's ProRes or DNxHR profile option ("hq", "4444", "dnxhr_sq"...).
+    SmartRenderer(const Project& p, const Sequence& seq, const ColorSpace& seqSpace, AVCodecContext* vctx, AVStream* vst, bool alpha,
+                  const std::string& profile)
+        : p_(p), seq_(seq), seqSpace_(seqSpace), vctx_(vctx), vst_(vst), alpha_(alpha) {
+        // The FourCC a ProRes flavour is stored under, and DNxHR's profile numbers.
+        static const std::map<std::string, uint32_t> prores{{"proxy", MKTAG('a', 'p', 'c', 'o')}, {"lt", MKTAG('a', 'p', 'c', 's')},
+                                                            {"standard", MKTAG('a', 'p', 'c', 'n')}, {"hq", MKTAG('a', 'p', 'c', 'h')},
+                                                            {"4444", MKTAG('a', 'p', '4', 'h')}, {"4444xq", MKTAG('a', 'p', '4', 'x')}};
+        static const std::map<std::string, int> dnxhr{{"dnxhr_lb", 1}, {"dnxhr_sq", 2}, {"dnxhr_hq", 3}, {"dnxhr_hqx", 4}, {"dnxhr_444", 5}};
+        if (vctx->codec_id == AV_CODEC_ID_PRORES) {
+            auto it = prores.find(profile.empty() ? "hq" : profile);
+            tag_ = it != prores.end() ? it->second : 0;
+        } else {
+            auto it = dnxhr.find(profile.empty() ? "dnxhr_hq" : profile);
+            profile_ = it != dnxhr.end() ? it->second : -1;
+        }
+    }
+    ~SmartRenderer() {
+        for (auto& [id, src] : sources_)
+            if (src.fmt) avformat_close_input(&src.fmt);
+        av_packet_free(&pkt_);
+    }
+    int copied() const { return copied_; }
+
+    // Copies frame f's picture from its source into the output if it can; true if it did.
+    bool copy(FrameTime f, FrameTime in, AVFormatContext* oc) {
+        const Clip* c = onlyClip(f);
+        if (!c) return false;
+        Source* src = source(*c);
+        if (!src) return false;
+        const double srcFrame = c->sourceFrameAt(f);  // the media's frame, in sequence frames (same rate)
+        const int64_t index = std::llround(srcFrame);
+        if (std::fabs(srcFrame - double(index)) > 1e-6 || index < 0) return false;
+        if (!readFrame(*src, index)) return false;
+        pkt_->stream_index = vst_->index;
+        pkt_->pts = pkt_->dts = av_rescale_q(f - in, vctx_->time_base, vst_->time_base);
+        pkt_->duration = av_rescale_q(1, vctx_->time_base, vst_->time_base);
+        pkt_->flags |= AV_PKT_FLAG_KEY;
+        pkt_->pos = -1;
+        if (av_interleaved_write_frame(oc, pkt_) < 0) return false;
+        ++copied_;
+        return true;
+    }
+
+private:
+    struct Source {
+        AVFormatContext* fmt = nullptr;
+        int stream = -1;
+        AVRational tb{1, 1};
+        int64_t start = 0;
+        int64_t ticksPerFrame = 1;  // in tb
+        int64_t next = -1;          // the frame index a plain read returns next
+        bool usable = false;
+    };
+
+    // The one visible clip at f when nothing else in the program touches it.
+    const Clip* onlyClip(FrameTime f) const {
+        const Clip* found = nullptr;
+        for (size_t i = 0; i < seq_.videoTracks.size(); ++i) {
+            const Track& t = seq_.videoTracks[i];
+            if (t.muted) continue;
+            for (const Clip& c : t.clips) {
+                if (!c.contains(f) || !c.enabled) continue;
+                if (found) return nullptr;
+                found = &c;
+            }
+            for (const Transition& tr : t.transitions) {
+                FrameTime a, b;
+                if (edit::transitionRange(t, tr, a, b) && f >= a && f < b) return nullptr;
+            }
+        }
+        if (!found || found->isGenerator() || !found->effects.empty() || found->blendMode != "normal" || found->speed != 1.0 ||
+            found->reverse || found->ramped() || !identityMotion(*found, f - found->start))
+            return nullptr;
+        return found;
+    }
+
+    Source* source(const Clip& c) {
+        auto it = sources_.find(c.mediaId);
+        if (it != sources_.end()) return it->second.usable ? &it->second : nullptr;
+        Source& src = sources_[c.mediaId];
+        const MediaItem* m = p_.findMedia(c.mediaId);
+        if (!m || m->kind != MediaKind::Video || m->path.empty()) return nullptr;
+        if (mediaColorSpace(*m).id != seqSpace_.id) return nullptr;  // would be converted
+        if (avformat_open_input(&src.fmt, m->path.c_str(), nullptr, nullptr) < 0) return nullptr;
+        if (avformat_find_stream_info(src.fmt, nullptr) < 0) return nullptr;
+        src.stream = av_find_best_stream(src.fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+        if (src.stream < 0) return nullptr;
+        const AVStream* st = src.fmt->streams[src.stream];
+        const AVCodecParameters* par = st->codecpar;
+        const AVRational rate = st->avg_frame_rate.num > 0 ? st->avg_frame_rate : st->r_frame_rate;
+        const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(AVPixelFormat(par->format));
+        // The same pictures the encoder would make: codec, size, sampling, rate, progressive, the same flavour.
+        const bool same = par->codec_id == vctx_->codec_id && par->width == vctx_->width && par->height == vctx_->height &&
+                          par->format == vctx_->pix_fmt && av_cmp_q(rate, vctx_->framerate) == 0 &&
+                          (par->field_order == AV_FIELD_PROGRESSIVE || par->field_order == AV_FIELD_UNKNOWN) &&
+                          (alpha_ || !(d && (d->flags & AV_PIX_FMT_FLAG_ALPHA))) && sameFlavour(*par);
+        if (!same || seq_.width != par->width || seq_.height != par->height) return nullptr;
+        src.tb = st->time_base;
+        src.start = st->start_time != AV_NOPTS_VALUE ? st->start_time : 0;
+        src.ticksPerFrame = av_rescale_q(1, av_inv_q(rate), src.tb);
+        if (src.ticksPerFrame <= 0) return nullptr;
+        if (!pkt_) pkt_ = av_packet_alloc();
+        src.usable = true;
+        return &src;
+    }
+
+    // ProRes and DNxHR come in flavours (Proxy, LT, 422, HQ, 4444; SQ, HQ, HQX, 444): only the same one may mix.
+    bool sameFlavour(const AVCodecParameters& par) const {
+        if (vctx_->codec_id == AV_CODEC_ID_PRORES) return tag_ && par.codec_tag == tag_;
+        return profile_ >= 0 && par.profile == profile_;
+    }
+
+    bool readFrame(Source& src, int64_t index) {
+        const int64_t want = src.start + index * src.ticksPerFrame;
+        if (src.next != index) {
+            if (av_seek_frame(src.fmt, src.stream, want, AVSEEK_FLAG_BACKWARD) < 0) return false;
+            src.next = -1;
+        }
+        for (int guard = 0; guard < 10000; ++guard) {
+            av_packet_unref(pkt_);
+            if (av_read_frame(src.fmt, pkt_) < 0) return false;
+            if (pkt_->stream_index != src.stream) continue;
+            const int64_t ts = pkt_->pts != AV_NOPTS_VALUE ? pkt_->pts : pkt_->dts;
+            if (ts == AV_NOPTS_VALUE) return false;
+            if (ts + src.ticksPerFrame / 2 < want) continue;  // before the frame (after a backward seek)
+            if (ts - src.ticksPerFrame / 2 > want) return false;  // a gap in the source
+            src.next = index + 1;
+            return true;
+        }
+        return false;
+    }
+
+    const Project& p_;
+    const Sequence& seq_;
+    const ColorSpace& seqSpace_;
+    AVCodecContext* vctx_;
+    AVStream* vst_;
+    bool alpha_;
+    std::map<Id, Source> sources_;
+    AVPacket* pkt_ = nullptr;
+    int copied_ = 0;
+    uint32_t tag_ = 0;
+    int profile_ = -1;
+};
+
 bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
-                const std::atomic<bool>* cancel, std::string* error, bool& opened, std::string* encoderUsed) {
+                const std::atomic<bool>* cancel, std::string* error, bool& opened, std::string* encoderUsed, int* smartRendered) {
     auto fail = [&](const std::string& msg) {
         if (error) *error = msg;
         return false;
@@ -549,6 +724,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         o.vctx->colorspace = tags.matrix;
         o.vctx->color_range = c == "mjpeg" ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
         o.vctx->thread_count = 0;
+        // Smart rendering interleaves copied packets with encoded ones, so the encoder must not hold frames back.
+        if (s.smartRender && isIntraCodec(c)) o.vctx->thread_type = FF_THREAD_SLICE;
         if (s.videoBitrate > 0) o.vctx->bit_rate = s.videoBitrate;
         if (o.oc->oformat->flags & AVFMT_GLOBALHEADER) o.vctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
         AVDictionary* opts = nullptr;
@@ -874,10 +1051,17 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     ro.scale = double(W) / seq.width;
     ro.highQuality = true;
     ro.useProxies = s.useProxies;
+    // Smart rendering: only where nothing would change the source's pictures for the whole export.
+    std::unique_ptr<SmartRenderer> smart;
+    if (wantVideo && s.smartRender && o.vctx && isIntraCodec(o.vctx->codec ? o.vctx->codec->name : "") && W == seq.width && H == seq.height &&
+        !s.useProxies && !s.burnInCaptions && !s.burnIn.any() && outSpace.id == seqSpace.id)
+        smart = std::make_unique<SmartRenderer>(p, seq, seqSpace, o.vctx, o.vst, s.alpha, s.profile);
     for (FrameTime f = in; f < out; ++f) {
         if (cancel && cancel->load()) return fail("Export cancelled");
         if (!writeCaptions(f + 1)) return fail("Writing captions failed");
-        if (wantVideo) {
+        if (wantVideo && smart && smart->copy(f, in, o.oc)) {
+            // copied from the source
+        } else if (wantVideo) {
             Image img = s.alpha ? renderSequenceFrame(p, seq, f, ro) : renderProgramFrame(p, seq, f, ro);
             if (s.burnInCaptions && captions) drawCaption(img, *captions, f, &seqSpace);
             if (s.burnIn.any()) drawBurnIns(img, p, seq, f, s.burnIn, watermark.isNull() ? nullptr : &watermark, &seqSpace);
@@ -929,15 +1113,17 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     }
     if ((rc = av_write_trailer(o.oc)) < 0) return fail("Cannot finalise file: " + averr(rc));
     if (o.oc->pb && o.oc->pb->error < 0) return fail("Writing the file failed: " + averr(o.oc->pb->error));
+    if (smartRendered) *smartRendered = smart ? smart->copied() : 0;
     return true;
 }
 
 }  // namespace
 
 bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
-                    const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed) {
+                    const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed, int* smartRendered) {
     bool opened = false;
-    bool ok = exportImpl(p, seq, s, progress, cancel, error, opened, encoderUsed);
+    if (smartRendered) *smartRendered = 0;
+    bool ok = exportImpl(p, seq, s, progress, cancel, error, opened, encoderUsed, smartRendered);
     // Never leave a truncated file behind (the output is closed by now), but
     // don't touch an existing file if we failed before writing to it.
     if (!ok && opened) std::remove(s.path.c_str());

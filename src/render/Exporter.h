@@ -67,6 +67,9 @@ struct ExportSettings {
     std::vector<bool> audioTracks;
     // The sequence's chapter markers become chapters in MP4, MOV and MKV files (players and YouTube read them).
     bool chapters = true;
+    // Smart rendering: with ProRes or DNxHR, frames that are one untouched clip of footage already in the same
+    // flavour, size and rate are copied from the source, not re-encoded.
+    bool smartRender = true;
 };
 
 struct ExportPreset {
@@ -96,7 +99,8 @@ bool exportStems(const Project& p, const Sequence& seq, const ExportSettings& s,
                  const ExportProgress& progress = {}, const std::atomic<bool>* cancel = nullptr, std::string* error = nullptr);
 
 bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
-                    const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed = nullptr);
+                    const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed = nullptr,
+                    int* smartRendered = nullptr);  // frames copied by smart rendering
 
 // Renders an audio clip's sound with its effects (not its volume, pan or
 // fades) to a 24-bit WAV, from its first frame to its last.
