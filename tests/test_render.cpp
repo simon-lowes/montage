@@ -946,6 +946,183 @@ colorspaces:
         QVERIFY2((at(10, 10, 10), near(c[0], 1) && near(c[2], 0)), qPrintable(at(10, 10, 10)));
     }
 
+    void distortAndStylize() {
+        Project p;
+        auto fx = [&](const char* type, std::initializer_list<std::pair<const char*, double>> params) {
+            if (!findEffectInfo(type)) qFatal("no effect %s", type);
+            Effect e = makeEffect(p, type);
+            for (const auto& [k, v] : params) e.params[k] = v;
+            return e;
+        };
+        Effect e;
+        float c[4];
+        // Wave Warp: a white line across the middle becomes a sine, a wave height off at a quarter wave.
+        Image line(160, 90);
+        for (int x = 0; x < 160; ++x) std::fill_n(line.at(x, 45), 4, 1.0f);
+        for (int y = 0; y < 90; ++y)
+            for (int x = 0; x < 160; ++x) line.at(x, y)[3] = 1;
+        auto rowOfLine = [](const Image& img, int x) {
+            int best = 0;
+            for (int y = 0; y < img.height; ++y)
+                if (img.at(x, y)[0] > img.at(x, best)[0]) best = y;
+            return best;
+        };
+        Image waved = line;
+        e = fx("wave_warp", {{"height", 10.0}, {"width", 40.0}});
+        applyVideoEffect(e, 0, waved, 1);
+        QVERIFY2(std::abs(rowOfLine(waved, 10) - rowOfLine(waved, 30)) >= 18, qPrintable(QString("%1 %2").arg(rowOfLine(waved, 10)).arg(rowOfLine(waved, 30))));
+        QVERIFY(std::abs(rowOfLine(waved, 20) - 45) <= 1);  // where the wave crosses
+        // Twirl: the middle stays, a mark off-centre turns round it.
+        auto spot = [](int sx, int sy) {
+            Image img = solid(160, 90, 0, 0, 0);
+            for (int y = sy - 2; y <= sy + 2; ++y)
+                for (int x = sx - 2; x <= sx + 2; ++x) std::fill_n(img.at(x, y), 3, 1.0f);
+            return img;
+        };
+        auto centroid = [](const Image& img, double& cx, double& cy) {
+            double s = 0;
+            cx = cy = 0;
+            for (int y = 0; y < img.height; ++y)
+                for (int x = 0; x < img.width; ++x) s += img.at(x, y)[0], cx += x * img.at(x, y)[0], cy += y * img.at(x, y)[0];
+            cx /= s, cy /= s;
+        };
+        Image tw = spot(100, 45);
+        applyVideoEffect(fx("twirl", {{"angle", 90.0}, {"radius", 100.0}}), 0, tw, 1);
+        double mx, my;
+        centroid(tw, mx, my);
+        QVERIFY2(std::fabs(std::hypot(mx - 80, my - 45) - 20) < 2.5 && std::fabs(my - 45) > 5, qPrintable(QString("%1 %2").arg(mx).arg(my)));
+        // Spherize: bulging magnifies the middle (a ramp flattens there), pinching does the opposite.
+        auto ramp = [] {
+            Image img(160, 90);
+            for (int y = 0; y < 90; ++y)
+                for (int x = 0; x < 160; ++x) {
+                    float* q = img.at(x, y);
+                    q[0] = q[1] = q[2] = (x + 0.5f) / 160;
+                    q[3] = 1;
+                }
+            return img;
+        };
+        Image bulge = ramp(), pinch = ramp();
+        applyVideoEffect(fx("spherize", {{"amount", 80.0}, {"radius", 100.0}}), 0, bulge, 1);
+        applyVideoEffect(fx("spherize", {{"amount", -80.0}, {"radius", 100.0}}), 0, pinch, 1);
+        const float plain = (95 + 0.5f) / 160;
+        QVERIFY2(std::fabs(bulge.at(95, 45)[0] - 0.5f) < std::fabs(plain - 0.5f) * 0.7f && std::fabs(pinch.at(95, 45)[0] - 0.5f) > std::fabs(plain - 0.5f) * 1.2f,
+                 qPrintable(QString("%1 %2 %3").arg(bulge.at(95, 45)[0]).arg(plain).arg(pinch.at(95, 45)[0])));
+        // Ripple: rings move the ramp; frame to frame they travel.
+        Image r0 = ramp(), r5 = ramp();
+        e = fx("ripple", {{"amplitude", 6.0}, {"wavelength", 30.0}});
+        applyVideoEffect(e, 0, r0, 1);
+        applyVideoEffect(e, 5, r5, 1);
+        QVERIFY(r0.px != ramp().px && r0.px != r5.px);
+        // Turbulent Displace: moves pixels by about the amount; the same frame the same, evolution changes it.
+        Image d1 = ramp(), d2 = ramp(), d3 = ramp();
+        e = fx("turbulent_displace", {{"amount", 10.0}, {"size", 40.0}});
+        applyVideoEffect(e, 3, d1, 1);
+        applyVideoEffect(e, 3, d2, 1);
+        e.params["evolution"] = 90.0;
+        applyVideoEffect(e, 3, d3, 1);
+        double moved = 0;
+        for (int x = 20; x < 140; ++x) moved += std::fabs(d1.at(x, 45)[0] - ramp().at(x, 45)[0]) * 160;
+        moved /= 120;
+        QVERIFY2(moved > 1 && moved < 10, qPrintable(QString::number(moved)));
+        QVERIFY(d1.px == d2.px && d1.px != d3.px);
+        // Motion Tile: half-size tiles repeat the frame twice across.
+        Image tiles = ramp();
+        applyVideoEffect(fx("motion_tile", {{"tile_width", 50.0}, {"tile_height", 50.0}}), 0, tiles, 1);
+        QVERIFY(std::fabs(tiles.at(30, 20)[0] - tiles.at(110, 20)[0]) < 0.02f && std::fabs(tiles.at(30, 20)[0] - tiles.at(30, 65)[0]) < 0.02f);
+        // Find Edges: flat goes white, a step a dark line.
+        Image step = solid(40, 20, 0.2f, 0.2f, 0.2f);
+        for (int y = 0; y < 20; ++y)
+            for (int x = 20; x < 40; ++x) std::fill_n(step.at(x, y), 3, 0.9f);
+        Image edges = step;
+        applyVideoEffect(fx("find_edges", {}), 0, edges, 1);
+        QVERIFY(near(edges.at(5, 10)[0], 1) && near(edges.at(35, 10)[0], 1) && edges.at(20, 10)[0] < 0.6f);
+        // Emboss: flat is mid-grey; the step stands out light on one side.
+        Image emb = step;
+        applyVideoEffect(fx("emboss", {}), 0, emb, 1);
+        QVERIFY(near(emb.at(5, 10)[0], 0.5f) && std::fabs(emb.at(20, 10)[0] - 0.5f) > 0.3f);
+        // Halftone: black dots on white, as much ink as the tone.
+        Image ht = solid(160, 90, 0.5f, 0.5f, 0.5f);
+        applyVideoEffect(fx("halftone", {{"dot_size", 10.0}}), 0, ht, 1);
+        double mean = 0;
+        int extreme = 0;
+        for (int y = 0; y < 90; ++y)
+            for (int x = 0; x < 160; ++x) mean += ht.at(x, y)[0], extreme += ht.at(x, y)[0] < 0.05f || ht.at(x, y)[0] > 0.95f;
+        mean /= 160 * 90;
+        QVERIFY2(std::fabs(mean - 0.5) < 0.06 && extreme > 160 * 90 * 0.7, qPrintable(QString("%1 %2").arg(mean).arg(extreme)));
+        // Duotone: black to the shadow colour, white to the highlight colour.
+        Image dt = step;
+        e = fx("duotone", {{"shadows.r", 0.0}, {"shadows.g", 0.0}, {"shadows.b", 1.0}, {"highlights.r", 1.0}, {"highlights.g", 1.0}, {"highlights.b", 0.0}});
+        Image bw = solid(2, 1, 0, 0, 0);
+        std::fill_n(bw.at(1, 0), 3, 1.0f);
+        applyVideoEffect(e, 0, bw, 1);
+        QVERIFY(near(bw.at(0, 0)[2], 1) && near(bw.at(0, 0)[0], 0) && near(bw.at(1, 0)[0], 1) && near(bw.at(1, 0)[2], 0));
+        // VHS: changes the picture, the same for the same frame; nothing at no amount.
+        Image v1 = ramp(), v2 = ramp(), v0 = ramp();
+        e = fx("vhs", {});
+        applyVideoEffect(e, 7, v1, 1);
+        applyVideoEffect(e, 7, v2, 1);
+        e.params["amount"] = 0.0;
+        applyVideoEffect(e, 7, v0, 1);
+        QVERIFY(v1.px != ramp().px && v1.px == v2.px && v0.px == ramp().px);
+        // Tilt-Shift: the band in focus keeps its detail, the top loses it.
+        Image checks(160, 90);
+        for (int y = 0; y < 90; ++y)
+            for (int x = 0; x < 160; ++x) {
+                float* q = checks.at(x, y);
+                q[0] = q[1] = q[2] = ((x / 2 + y / 2) & 1) ? 1.0f : 0.0f;
+                q[3] = 1;
+            }
+        Image ts = checks;
+        applyVideoEffect(fx("tilt_shift", {{"saturation", 100.0}}), 0, ts, 1);
+        auto detail = [](const Image& img, int y) {
+            double d = 0;
+            for (int x = 1; x < img.width; ++x) d += std::fabs(img.at(x, y)[0] - img.at(x - 1, y)[0]);
+            return d;
+        };
+        QVERIFY2(detail(ts, 45) > detail(checks, 45) * 0.95 && detail(ts, 5) < detail(checks, 5) * 0.2,
+                 qPrintable(QString("%1 %2").arg(detail(ts, 45) / detail(checks, 45)).arg(detail(ts, 5) / detail(checks, 5))));
+        // Camera Shake: frames move by about the amplitude, the same frame the same, no edges showing.
+        Image s1 = spot(80, 45), s2 = s1, s3 = s1;
+        e = fx("camera_shake", {{"amplitude", 10.0}, {"rotation", 0.0}});
+        applyVideoEffect(e, 4, s1, 1);
+        applyVideoEffect(e, 4, s2, 1);
+        applyVideoEffect(e, 20, s3, 1);
+        double ax, ay, bx, by;
+        centroid(s1, ax, ay);
+        centroid(s3, bx, by);
+        QVERIFY(s1.px == s2.px && std::hypot(ax - bx, ay - by) > 0.5 && std::hypot(ax - 80.5, ay - 45.5) < 20);
+        Image frame = solid(160, 90, 0.3f, 0.6f, 0.9f);
+        applyVideoEffect(fx("camera_shake", {{"amplitude", 20.0}, {"rotation", 3.0}}), 9, frame, 1);
+        rgb(frame, 0, 0, c);
+        QVERIFY(near(c[3], 1) && near(c[1], 0.6f));
+    }
+
+    void stopMotion() {
+        // A colour fading up over 30 frames, held 4 frames at a time.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 32;
+        s.height = 18;
+        Clip c = colorClip(p, 0, 0, 0, 0, 30);
+        c.generator.params["color.r"].addKey(0, 0.0);
+        c.generator.params["color.r"].addKey(29, 1.0);
+        Effect hold = makeEffect(p, "stop_motion");
+        hold.params["hold"] = 4.0;
+        c.effects.push_back(hold);
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, c).ok);
+        RenderOptions o;
+        auto red = [&](FrameTime t) {
+            float px[4];
+            rgb(renderProgramFrame(p, s, t, o), 5, 5, px);
+            return px[0];
+        };
+        QCOMPARE(red(0), red(3));
+        QCOMPARE(red(4), red(7));
+        QVERIFY(red(4) > red(3) + 0.05f);
+        QCOMPARE(red(9), red(8));
+    }
+
     void curvesAndLuts() {
         auto id = buildCurve("0,0 1,1", 256);
         QVERIFY(near(id[128], 128.0f / 256, 0.002f));

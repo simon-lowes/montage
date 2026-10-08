@@ -724,4 +724,24 @@ All 15 items are in (October 2026). The near misses listed in the roadmap are th
   - The effect only marks the clip; compositing does the work. Before drawing, each track's clip at the frame is checked for the key, and the tracks it uses as mattes (and hides) are noted.
   - The fill's layer is multiplied by the matte track's own layer at that frame (its alpha, or its premultiplied luma; Reverse flips it). Nothing on the matte track then means nothing shows (or everything, reversed); naming the clip's own track or one that does not exist turns the key off.
   - **Tests:** red only inside a white square on the track above, which is not seen; reversed; with the square gone; not hidden; luma from a mid-grey square letting half through; an explicit track number, and its own track turning the key off.
+- [x] Distort and stylize effects (render/StyleFx), Stop Motion (render/Compositor `clipLayer`):
+  - **Distort** effects remap with bilinear sampling and clamped (Motion Tile: wrapped) edges. Twirl turns by angle·(1 − r/R)²; Spherize samples at R·(r/R)^k (k above 1 bulges, below pinches); Ripple moves along the radius by a sine dying away to the radius; Turbulent Displace uses fractal value noise (quintic, 3D so evolution is smooth) in source pixels.
+  - **Stylize:** Find Edges is a per-colour Sobel (a full step reads 1); Emboss is grey from luma differences along the light; Halftone sizes each dot's area to its cell's ink, with a 1 px soft edge; VHS uses per-line wobble, a rolling tracking band, head-switching tear, soft luma, colour averaged over the bleed behind it, streaky noise and dropouts, lifted blacks and scanlines.
+  - **Tilt-Shift** blends towards a blur outside the band, over as far again; **Camera Shake** uses three octaves of noise per axis and rotation, with zoom from the amplitude and angle.
+  - **Stop Motion** steps the frame the clip is drawn at, so its source and effects hold together.
+  - **Tests:**
+    - Wave Warp: a line becoming a sine (20 rows between a crest and a trough), crossing where it should;
+    - Twirl: a mark turning round the middle at its radius;
+    - Spherize: bulge flattening a ramp at the middle and pinch steepening it;
+    - Ripple: moving and changing frame to frame;
+    - Turbulent Displace: moving 1–10 px for 10, the same frame the same, evolution changing it;
+    - Motion Tile: half-size tiles repeating;
+    - Find Edges: flat white, the step dark;
+    - Emboss: flat mid-grey, the step raised;
+    - Halftone: 50 % grey to within 6 % ink, mostly pure black and white;
+    - Duotone: black and white to the two colours;
+    - VHS: changed, the same for the same frame, untouched at no amount;
+    - Tilt-Shift: the band's detail kept, the top's cut by 80 %;
+    - Camera Shake: moving by about the amplitude, the same frame the same, no edges at 20 px and 3°;
+    - Stop Motion: a fade held four frames at a time through the compositor.
 

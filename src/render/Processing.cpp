@@ -10,6 +10,7 @@
 #include "FaceRefine.h"
 #include "Relight.h"
 #include "FilmLook.h"
+#include "StyleFx.h"
 #include "media/Tracking.h"
 
 #include <algorithm>
@@ -1068,6 +1069,19 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
     else if (ty == "corner_pin") vfx::cornerPin(e, t, img);
     else if (ty == "letterbox") vfx::letterbox(e, t, img);
     else if (ty == "posterize") vfx::posterize(e, t, img);
+    else if (ty == "wave_warp") sfx::waveWarp(e, t, img, pixelScale);
+    else if (ty == "twirl") sfx::twirl(e, t, img, pixelScale);
+    else if (ty == "spherize") sfx::spherize(e, t, img, pixelScale);
+    else if (ty == "ripple") sfx::ripple(e, t, img, pixelScale);
+    else if (ty == "turbulent_displace") sfx::turbulentDisplace(e, t, img, pixelScale);
+    else if (ty == "motion_tile") sfx::motionTile(e, t, img, pixelScale);
+    else if (ty == "find_edges") sfx::findEdges(e, t, img);
+    else if (ty == "emboss") sfx::emboss(e, t, img, pixelScale);
+    else if (ty == "halftone") sfx::halftone(e, t, img, pixelScale);
+    else if (ty == "duotone") sfx::duotone(e, t, img);
+    else if (ty == "vhs") sfx::vhs(e, t, img, pixelScale);
+    else if (ty == "tilt_shift") sfx::tiltShift(e, t, img, pixelScale);
+    else if (ty == "camera_shake") sfx::cameraShake(e, t, img, pixelScale);
     else if (ty == "depth_map" || ty == "depth_fog" || ty == "depth_blur")
         depthEffect(e, t, img, pixelScale);
     else if (ty == "relight") {

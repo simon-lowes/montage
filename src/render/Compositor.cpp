@@ -456,6 +456,12 @@ void sourceSize(const Geometry& g, double scale, int nativeW, int nativeH, int& 
 // `below` is what the tracks under the clip have made so far, for adjustment layers.
 Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o,
                 const Image* below = nullptr) {
+    // Stop Motion: the clip steps, each frame held for a few.
+    for (const Effect& e : c.effects)
+        if (e.enabled && e.type == "stop_motion") {
+            const FrameTime hold = std::max<FrameTime>(1, FrameTime(std::lround(e.p("hold", t - c.start, 3))));
+            t -= (t - c.start) % hold;
+        }
     const FrameTime lt = t - c.start;
     const int SW = seq.width, SH = seq.height;
     Image src;

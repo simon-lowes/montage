@@ -436,6 +436,66 @@ std::vector<EffectInfo> buildCatalog() {
         c.push_back(plugin);
     }
 
+    // Distort and stylize (render/StyleFx.h). Sizes in source pixels; centres as offsets from the middle.
+    {
+        auto centre = [](std::vector<ParamInfo> ps) {
+            ps.push_back(num("center_x", "Center X (px)", -8000, 8000, 0, 1));
+            ps.push_back(num("center_y", "Center Y (px)", -8000, 8000, 0, 1));
+            return ps;
+        };
+        c.push_back({"wave_warp", "Wave Warp", EffectCategory::VideoFilter, "Distort",
+                     {choice("shape", "Wave Type", {"Sine", "Triangle", "Square"}, 0), num("height", "Wave Height (px)", -500, 500, 10, 0.5),
+                      num("width", "Wave Width (px)", 1, 4000, 40, 1), angle("direction", "Direction", 0), angle("phase", "Phase", 0),
+                      num("speed", "Speed (° per frame)", -180, 180, 0, 0.5)},
+                     {}});
+        c.push_back({"twirl", "Twirl", EffectCategory::VideoFilter, "Distort",
+                     centre({angle("angle", "Angle", 90), pct("radius", "Radius", 1, 100, 50)}), {}});
+        c.push_back({"spherize", "Spherize", EffectCategory::VideoFilter, "Distort",
+                     centre({pct("amount", "Amount (Bulge + / Pinch -)", -100, 100, 50), pct("radius", "Radius", 1, 100, 50)}), {}});
+        c.push_back({"ripple", "Ripple", EffectCategory::VideoFilter, "Distort",
+                     centre({num("amplitude", "Amplitude (px)", 0, 200, 8, 0.5), num("wavelength", "Wavelength (px)", 2, 2000, 40, 1),
+                             num("speed", "Speed (° per frame)", -180, 180, 20, 0.5), pct("radius", "Radius", 1, 100, 100)}),
+                     {}});
+        c.push_back({"turbulent_displace", "Turbulent Displace", EffectCategory::VideoFilter, "Distort",
+                     {num("amount", "Amount (px)", 0, 500, 20, 0.5), num("size", "Size (px)", 2, 2000, 100, 1),
+                      num("complexity", "Complexity", 1, 8, 3, 1), num("evolution", "Evolution (°)", -36000, 36000, 0, 1),
+                      num("speed", "Evolution Speed (° per frame)", -90, 90, 0, 0.1), num("seed", "Random Seed", 0, 9999, 0, 1)},
+                     {}});
+        c.push_back({"motion_tile", "Motion Tile", EffectCategory::VideoFilter, "Distort",
+                     {pct("tile_width", "Tile Width", 1, 100, 100), pct("tile_height", "Tile Height", 1, 100, 100),
+                      num("offset_x", "Offset X (px)", -8000, 8000, 0, 1), num("offset_y", "Offset Y (px)", -8000, 8000, 0, 1),
+                      boolean("mirror", "Mirror Edges")},
+                     {}});
+        c.push_back({"find_edges", "Find Edges", EffectCategory::VideoFilter, "Stylize",
+                     {boolean("invert", "Invert", true), pct("blend", "Blend With Original", 0, 100, 0)}, {}});
+        c.push_back({"emboss", "Emboss", EffectCategory::VideoFilter, "Stylize",
+                     {angle("direction", "Direction", 135), num("relief", "Relief (px)", 0.25, 50, 2, 0.25), pct("contrast", "Contrast", 0, 500, 100),
+                      pct("blend", "Blend With Original", 0, 100, 0)},
+                     {}});
+        c.push_back({"halftone", "Halftone", EffectCategory::VideoFilter, "Stylize",
+                     {num("dot_size", "Dot Size (px)", 2, 200, 8, 0.5), angle("angle", "Angle", 45),
+                      choice("mode", "Ink", {"Black", "Colour (CMY)"}, 0)},
+                     {}});
+        c.push_back({"duotone", "Duotone", EffectCategory::VideoFilter, "Stylize",
+                     {color("shadows", "Shadows", 0.08, 0.1, 0.35), color("highlights", "Highlights", 1, 0.85, 0.6), pct("mix", "Mix", 0, 100, 100)},
+                     {}});
+        c.push_back({"vhs", "VHS", EffectCategory::VideoFilter, "Stylize",
+                     {pct("amount", "Amount", 0, 100, 100), num("bleed", "Colour Bleed (px)", 0, 40, 4, 0.5), pct("noise", "Noise", 0, 100, 30),
+                      pct("scanlines", "Scanlines", 0, 100, 30), pct("tracking", "Tracking Errors", 0, 100, 30)},
+                     {}});
+        // Holds each frame for a few (handled where the clip's frame is chosen).
+        c.push_back({"stop_motion", "Stop Motion", EffectCategory::VideoFilter, "Stylize",
+                     {num("hold", "Hold Each Frame For (frames)", 1, 30, 3, 1)}, {}});
+        c.push_back({"tilt_shift", "Tilt-Shift Blur", EffectCategory::VideoFilter, "Blur & Sharpen",
+                     {pct("focus", "Focus Position", 0, 100, 50), pct("width", "Focus Width", 0, 100, 20), num("blur", "Blur (px)", 0, 200, 12, 0.5),
+                      angle("angle", "Angle", 0), pct("saturation", "Saturation", 0, 200, 120)},
+                     {}});
+        c.push_back({"camera_shake", "Camera Shake", EffectCategory::VideoFilter, "Transform",
+                     {num("amplitude", "Amplitude (px)", 0, 500, 10, 0.5), num("rotation", "Rotation (°)", 0, 45, 1, 0.1),
+                      pct("speed", "Speed", 0, 100, 50), boolean("zoom", "Zoom to Hide Edges", true), num("seed", "Random Seed", 0, 9999, 0, 1)},
+                     {}});
+    }
+
     // ---- Generators -------------------------------------------------------
     c.push_back({"color", "Color Matte", EffectCategory::Generator, "Generators",
                  {color("color", "Color", 0.1, 0.1, 0.1), pct("alpha", "Alpha", 0, 100, 100)},
