@@ -466,6 +466,20 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
             }
         }
     }
+    // Trim mode: a bracket on each side being trimmed, ']' on the outgoing clip's end, '[' on the incoming clip's start.
+    if (trimSide_ >= 0) {
+        p.setPen(QPen(QColor(255, 70, 70), 3));
+        auto bracket = [&](Id id, bool outgoing) {
+            QRect r;
+            if (!id || !clipRect(id, r)) return;
+            const int x = outgoing ? r.right() - 1 : r.left() + 1, arm = outgoing ? -7 : 7;
+            p.drawLine(x, r.top() + 1, x, r.bottom() - 1);
+            p.drawLine(x, r.top() + 1, x + arm, r.top() + 1);
+            p.drawLine(x, r.bottom() - 1, x + arm, r.bottom() - 1);
+        };
+        if (trimSide_ != 2) bracket(trimOut_, true);
+        if (trimSide_ != 1) bracket(trimIn_, false);
+    }
     paintCaptionLanes(p);
     // Divider between video and audio.
     int dy = dividerY();
@@ -676,6 +690,16 @@ void TimelineWidget::paintClip(QPainter& p, const Row& row, const Clip& c, const
 
 void TimelineWidget::setShowVolumeLines(bool on) {
     showVolume_ = on;
+    viewport()->update();
+}
+
+void TimelineWidget::setTrimEdit(Id outgoing, Id incoming, int side) {
+    trimOut_ = outgoing, trimIn_ = incoming, trimSide_ = side;
+    viewport()->update();
+}
+
+void TimelineWidget::clearTrimEdit() {
+    trimSide_ = -1;
     viewport()->update();
 }
 

@@ -12,6 +12,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 **Editing**
 - Multi-track timeline: unlimited video and audio tracks, with lock, sync-lock, mute, solo, hide and track targeting
 - Tools: Selection (V), Razor (C), Ripple (B), Roll (N), Slip (Y), Slide (U), Hand (H)
+- **Trim mode** (Avid's and Premiere's keyboard trimming): `Shift+T` selects the edit nearest the playhead on the target video track, `Alt+T` switches between both sides (a roll), the outgoing side and the incoming side (ripple trims), and `Ctrl+Left`/`Ctrl+Right` trim a frame at a time (five with `Shift`). Red brackets mark the sides being trimmed, the playhead and the two-up view follow the edit, each trim is one undo step, and `Esc` ends it.
 - **Two-up trim view** (as in Premiere, Resolve, Avid and Final Cut): while an edit is trimmed, rolled, slipped or slid, the Program monitor shows the frames either side of it side by side, each labelled with its clip and timecode (a slip shows the clip's first and last frames). Playback › Two-Up Trim View turns it off.
 - Insert, overwrite, lift, extract, ripple delete, close gap, nudge, duplicate, copy / paste / paste-insert
 - Three-point editing from the Source monitor (I / O marks, `,` insert, `.` overwrite, drag from the viewer)

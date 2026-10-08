@@ -52,6 +52,10 @@ public:
     bool showVolumeLines() const { return showVolume_; }
     // Audio rows show their track's volume automation (core/Automation.h) across the row instead of clip lines:
     // drag a key or the line, Ctrl/Cmd-click to add a key, Alt-click a key to delete it.
+    // Trim mode's selected edit, drawn as brackets on the sides being trimmed (side 0 both, 1 outgoing, 2 incoming).
+    void setTrimEdit(Id outgoing, Id incoming, int side);
+    void clearTrimEdit();
+    bool trimEditShown() const { return trimSide_ >= 0; }
     void setShowTrackAutomation(bool on);
     bool showTrackAutomation() const { return showTrackAuto_; }
     // Where audio track `index`'s automation line is at frame f, in viewport pixels (testing aid); (-1, -1) if hidden.
@@ -220,6 +224,8 @@ private:
     QPoint hoverPos_;
     bool showVolume_ = true;
     bool showTrackAuto_ = false;
+    Id trimOut_ = 0, trimIn_ = 0;
+    int trimSide_ = -1;
     bool showOpacity_ = false;
     std::vector<std::pair<FrameTime, FrameTime>> rendered_;
 };

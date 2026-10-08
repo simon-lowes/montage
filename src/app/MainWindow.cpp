@@ -764,6 +764,15 @@ void MainWindow::buildMenus() {
             state_->apply(tr("Extract"), [a, b](Project& p, Sequence& s) { return edit::extractRange(p, s, a, b, allTracks(s)); });
         }));
     seqM->addSeparator();
+    add(seqM, tr("Select Nearest Edit (Trim Mode)"), QKeySequence("Shift+T"), [this] { selectNearestEdit(); })->setObjectName(QStringLiteral("selectEdit"));
+    add(seqM, tr("Cycle Trim Side"), QKeySequence("Alt+T"), [this] { cycleTrimSide(); })->setObjectName(QStringLiteral("cycleTrimSide"));
+    add(seqM, tr("Trim Backward"), QKeySequence("Ctrl+Left"), [this] { trimSelectedEdit(-1); })->setObjectName(QStringLiteral("trimBackward"));
+    add(seqM, tr("Trim Forward"), QKeySequence("Ctrl+Right"), [this] { trimSelectedEdit(1); })->setObjectName(QStringLiteral("trimForward"));
+    add(seqM, tr("Trim Backward Five Frames"), QKeySequence("Ctrl+Shift+Left"), [this] { trimSelectedEdit(-5); })
+        ->setObjectName(QStringLiteral("trimBackward5"));
+    add(seqM, tr("Trim Forward Five Frames"), QKeySequence("Ctrl+Shift+Right"), [this] { trimSelectedEdit(5); })
+        ->setObjectName(QStringLiteral("trimForward5"));
+    add(seqM, tr("End Trim Mode"), QKeySequence(Qt::Key_Escape), [this] { endTrimMode(); })->setObjectName(QStringLiteral("endTrim"));
     add(seqM, tr("Ripple Trim Previous Edit to Playhead"), QKeySequence(Qt::Key_Q), [this] { rippleTrimToPlayhead(true); })
         ->setObjectName(QStringLiteral("rippleTrimPrevious"));
     add(seqM, tr("Ripple Trim Next Edit to Playhead"), QKeySequence(Qt::Key_W), [this] { rippleTrimToPlayhead(false); })
@@ -1356,6 +1365,88 @@ void MainWindow::addChapterMarker() {
         edit::addMarker(s, Marker{t, 0, "Chapter " + std::to_string(n), "", 0, true});
         return true;
     });
+}
+
+bool MainWindow::selectNearestEdit() {
+    const Sequence* s = state_->sequence();
+    const int vt = state_->targetVideoTrack();
+    if (!s || vt < 0 || vt >= int(s->videoTracks.size())) return false;
+    const Track& t = s->videoTracks[size_t(vt)];
+    const FrameTime at = state_->playhead();
+    // Every clip start and end on the target track is an edit point; the nearest wins.
+    FrameTime best = -1;
+    for (const Clip& c : t.clips)
+        for (FrameTime f : {c.start, c.end()})
+            if (best < 0 || std::llabs(f - at) < std::llabs(best - at)) best = f;
+    if (best < 0) {
+        statusBar()->showMessage(tr("No edit on the target video track"), 4000);
+        return false;
+    }
+    TrimEdit e;
+    e.track = {TrackKind::Video, vt};
+    for (const Clip& c : t.clips) {
+        if (c.end() == best) e.outgoing = c.id;
+        if (c.start == best) e.incoming = c.id;
+    }
+    e.side = e.outgoing && e.incoming ? 0 : e.outgoing ? 1 : 2;
+    trimEdit_ = e;
+    state_->setPlayhead(best);
+    showTrimEdit();
+    return true;
+}
+
+void MainWindow::cycleTrimSide() {
+    if (!trimEdit_) return;
+    // Roll, then the outgoing side, then the incoming side (sides only where there is a clip).
+    for (int i = 0; i < 3; ++i) {
+        trimEdit_->side = (trimEdit_->side + 1) % 3;
+        const int side = trimEdit_->side;
+        if ((side == 0 && trimEdit_->outgoing && trimEdit_->incoming) || (side == 1 && trimEdit_->outgoing) || (side == 2 && trimEdit_->incoming)) break;
+    }
+    showTrimEdit();
+}
+
+bool MainWindow::trimSelectedEdit(FrameTime delta) {
+    if (!trimEdit_) {
+        statusBar()->showMessage(tr("Select an edit to trim first (Shift+T)"), 4000);
+        return false;
+    }
+    const TrimEdit e = *trimEdit_;
+    const bool ok = state_->apply(tr("Trim"), [e, delta](Project& p, Sequence& s) {
+        if (e.side == 0) return edit::roll(p, s, e.outgoing, e.incoming, delta);
+        if (e.side == 1) return edit::trim(p, s, e.outgoing, edit::Edge::Out, delta, edit::TrimMode::Ripple);
+        return edit::trim(p, s, e.incoming, edit::Edge::In, delta, edit::TrimMode::Ripple);
+    });
+    showTrimEdit();
+    return ok;
+}
+
+void MainWindow::endTrimMode() {
+    if (!trimEdit_) return;
+    trimEdit_.reset();
+    timeline_->clearTrimEdit();
+    programPanel_->endTrimView();
+}
+
+void MainWindow::showTrimEdit() {
+    const Sequence* s = state_->sequence();
+    const Clip* out = s && trimEdit_ && trimEdit_->outgoing ? edit::clipById(*s, trimEdit_->outgoing) : nullptr;
+    const Clip* in = s && trimEdit_ && trimEdit_->incoming ? edit::clipById(*s, trimEdit_->incoming) : nullptr;
+    if (!trimEdit_ || (!out && !in)) {
+        endTrimMode();
+        return;
+    }
+    timeline_->setTrimEdit(trimEdit_->outgoing, trimEdit_->incoming, trimEdit_->side);
+    // The playhead and the two-up follow the edit: the outgoing side's last frame and the incoming side's first.
+    const FrameTime cut = trimEdit_->side == 2 && in ? in->start : out ? out->end() : in->start;
+    const FrameTime left = trimEdit_->side == 2 && in ? in->start - 1 : cut - 1, right = trimEdit_->side == 1 && out ? out->end() : cut;
+    state_->setPlayhead(cut);
+    auto label = [&](const Clip* c, FrameTime f) {
+        return (c ? QString::fromStdString(c->name) + QStringLiteral("  ") : QString()) + QString::fromStdString(formatTimecode(f, s->fps));
+    };
+    emit timeline_->trimViewChanged(left, right, label(out, left), label(in, right));
+    const char* sides[] = {QT_TR_NOOP("both sides (roll)"), QT_TR_NOOP("the outgoing side"), QT_TR_NOOP("the incoming side")};
+    statusBar()->showMessage(tr("Trimming %1: Ctrl+Left/Right a frame, with Shift five; Alt+T changes side; Esc ends").arg(tr(sides[trimEdit_->side])), 6000);
 }
 
 void MainWindow::addClipMarker() {

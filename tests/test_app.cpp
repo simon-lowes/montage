@@ -820,6 +820,67 @@ private slots:
         QVERIFY(!win_->runProjectManager(ConsolidateOptions{}));  // no folder
     }
 
+    void trimMode() {
+        loadDemo();
+        auto act = [&](const char* name) {
+            auto* a = win_->findChild<QAction*>(name);
+            QVERIFY2(a, name);
+            a->trigger();
+        };
+        auto clip = [&](const char* name) { return clipNamed(*state()->sequence(), name); };
+        MonitorPanel* program = nullptr;
+        for (auto* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Program) program = m;
+        auto* twoUp = win_->findChild<QAction*>("twoUpTrim");
+        QVERIFY(program && twoUp);
+        if (!twoUp->isChecked()) twoUp->trigger();
+        // Without an edit selected, trimming says how to start.
+        act("trimForward");
+        QVERIFY(win_->statusBar()->currentMessage().contains("Shift+T"));
+        // The edit nearest the playhead on V1: Red into Blue at 60, both sides (a roll).
+        state()->setPlayhead(55);
+        act("selectEdit");
+        QVERIFY(win_->trimEdit());
+        QCOMPARE(win_->trimEdit()->side, 0);
+        QCOMPARE(state()->playhead(), FrameTime(60));
+        QVERIFY(timeline()->trimEditShown());
+        QVERIFY(program->trimViewShown());
+        act("trimForward");
+        QCOMPARE(clip("Red")->end(), FrameTime(61));
+        QCOMPARE(clip("Blue")->start, FrameTime(61));
+        QCOMPARE(state()->playhead(), FrameTime(61));
+        // The outgoing side, five frames: a ripple that pushes Blue along.
+        act("cycleTrimSide");
+        QCOMPARE(win_->trimEdit()->side, 1);
+        act("trimForward5");
+        QCOMPARE(clip("Red")->end(), FrameTime(66));
+        QCOMPARE(clip("Blue")->start, FrameTime(66));
+        QCOMPARE(clip("Blue")->duration, FrameTime(59));
+        // The incoming side, a frame back: Blue gets a frame longer at its head.
+        act("cycleTrimSide");
+        QCOMPARE(win_->trimEdit()->side, 2);
+        act("trimBackward");
+        QCOMPARE(clip("Blue")->duration, FrameTime(60));
+        QCOMPARE(clip("Red")->end(), clip("Blue")->start);
+        // One undo step each.
+        state()->undo();
+        QCOMPARE(clip("Blue")->duration, FrameTime(59));
+        // Esc ends trim mode.
+        act("endTrim");
+        QVERIFY(!win_->trimEdit());
+        QVERIFY(!timeline()->trimEditShown());
+        QVERIFY(!program->trimViewShown());
+        // At the end of the track there is only an outgoing side.
+        state()->setPlayhead(200);
+        act("selectEdit");
+        QVERIFY(win_->trimEdit());
+        QCOMPARE(win_->trimEdit()->incoming, Id(0));
+        QCOMPARE(win_->trimEdit()->side, 1);
+        act("cycleTrimSide");
+        QCOMPARE(win_->trimEdit()->side, 1);
+        act("endTrim");
+    }
+
     void razorTool() {
         loadDemo();
         timeline()->setTool(TimelineWidget::Tool::Razor);

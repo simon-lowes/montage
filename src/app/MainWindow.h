@@ -3,6 +3,7 @@
 #pragma once
 
 #include <QMainWindow>
+#include <optional>
 #include <QTimer>
 #include <vector>
 
@@ -100,6 +101,18 @@ public:
     bool exportClipLut(const QString& path, int size = 33);
     // File › Project Manager: copies the project and its media (render/ProjectManager.h), with progress.
     bool runProjectManager(const ConsolidateOptions& o);
+    // Trim mode (Avid's and Premiere's keyboard trimming): the edit point nearest the playhead on the target video
+    // track is selected and trimmed a frame (or five) at a time on its outgoing side, its incoming side, or both (a roll).
+    struct TrimEdit {
+        TrackRef track;
+        Id outgoing = 0, incoming = 0;  // the clips either side (0 = a gap)
+        int side = 0;                   // 0 both (roll), 1 outgoing (A side), 2 incoming (B side)
+    };
+    bool selectNearestEdit();
+    void cycleTrimSide();
+    bool trimSelectedEdit(FrameTime delta);
+    void endTrimMode();
+    const std::optional<TrimEdit>& trimEdit() const { return trimEdit_; }
     bool swapClip(bool withNext);                     // the selected clip (or the one under the playhead) with its neighbour
     bool replaceWithSource();                         // the selected clip, or the one under the playhead
     bool fitToFill();
@@ -192,6 +205,8 @@ private:
     TimelineWidget* timeline_ = nullptr;
     // Open sequences as tabs above the timeline (Premiere's and Resolve's timeline tabs).
     QTabBar* sequenceTabs_ = nullptr;
+    std::optional<TrimEdit> trimEdit_;
+    void showTrimEdit();
     std::vector<Id> openSequences_;
     MonitorPanel* sourcePanel_ = nullptr;
     MonitorPanel* programPanel_ = nullptr;
