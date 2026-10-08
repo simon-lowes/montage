@@ -36,6 +36,7 @@
 #include "media/Translator.h"
 #include "render/AafExport.h"
 #include "render/AutoMix.h"
+#include "render/Highlights.h"
 #include "render/MusicEdit.h"
 #include "render/VoiceMatch.h"
 #include "media/Analysis.h"
@@ -1025,6 +1026,46 @@ void McpServer::Impl::addTools() {
             save(l);
             return ok(QStringLiteral("%1 marker(s) at %2 BPM").arg(n).arg(g.tempo, 0, 'f', 1),
                       QJsonObject{{"markers", n}, {"tempo", g.tempo}});
+        });
+
+    add("montage_highlights", "Make a highlight edit",
+        "Find the liveliest moments of long footage and lay them out as a new sequence of about `seconds`: each half "
+        "second is scored by how much louder it is than the clip usually is, how much moves in the picture and, with "
+        "`look_for` and indexed footage, how much it looks like that description. Moments play in the order they "
+        "happened, cut off words. `media` defaults to every video in the project.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"media":{"type":"array","items":{"type":"number"}},
+            "seconds":{"type":"number","default":30},"look_for":{"type":"string"},"name":{"type":"string","default":"Highlights"}},
+            "required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            std::vector<Id> media;
+            for (const QJsonValue& v : a.value("media").toArray()) media.push_back(Id(v.toDouble()));
+            if (media.empty())
+                for (const MediaItem& m : l.project.media)
+                    if (m.kind == MediaKind::Video) media.push_back(m.id);
+            HighlightOptions o;
+            o.seconds = std::max(2.0, a.value("seconds").toDouble(30));
+            std::string err;
+            if (const QString look = a.value("look_for").toString(); !look.isEmpty()) {
+                if (!visualSearchAvailable() || !visualModel().installed())
+                    return fail("look_for needs the visual search model: run `scripts/fetch-models.sh`");
+                auto clip = ClipModel::load(&err);
+                if (!clip) return fail(QString::fromStdString(err));
+                o.lookFor = clip->text(look.toStdString(), &err);
+            }
+            const std::vector<HighlightMoment> moments = findHighlights(l.project, media, o, {}, nullptr, &err);
+            if (moments.empty()) return fail(QString::fromStdString(err));
+            const Id seq = makeHighlightSequence(l.project, moments, a.value("name").toString(QStringLiteral("Highlights")).toStdString());
+            if (!seq) return fail("The highlights could not be laid out");
+            save(l);
+            QJsonArray list;
+            double total = 0;
+            for (const HighlightMoment& m : moments) {
+                list.append(QJsonObject{{"media", double(m.media)}, {"in", m.in}, {"out", m.out}, {"score", m.score}});
+                total += m.out - m.in;
+            }
+            return ok(QStringLiteral("%1 moment(s), %2 s, in a new sequence").arg(moments.size()).arg(total, 0, 'f', 1),
+                      QJsonObject{{"sequence", double(seq)}, {"seconds", total}, {"moments", list}});
         });
 
     add("montage_cut_to_beat", "Cut clips to the beat",

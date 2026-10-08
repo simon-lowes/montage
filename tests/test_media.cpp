@@ -51,6 +51,7 @@
 #include "render/AudioFx.h"
 #include "audio/AudioRepair.h"
 #include "render/MusicEdit.h"
+#include "render/Highlights.h"
 #include "render/AutoMix.h"
 #include "render/VideoDenoise.h"
 #include "render/VoiceMatch.h"
@@ -3679,6 +3680,88 @@ private slots:
         // Nothing to go on: an error, not an empty sequence.
         r = call(QJsonObject{{"project", project}, {"script", "Lines nobody ever said."}});
         QVERIFY(r.value("isError").toBool());
+    }
+
+    void autoHighlights() {
+        // Thirty seconds of grey: a square moves only from 8 to 12 s, and the sound bursts from 20 to 23 s.
+        std::string err;
+        std::vector<float> sound(size_t(48000) * 30);
+        std::mt19937 rng(3);
+        std::normal_distribution<float> hiss(0, 0.003f);
+        for (size_t i = 0; i < sound.size(); ++i) {
+            const double t = double(i) / 48000;
+            sound[i] = hiss(rng) + (t >= 20 && t < 23 ? float(0.5 * std::sin(2 * M_PI * 440 * t)) : 0.0f);
+        }
+        const std::string wav = path("highlight-sound.wav");
+        QVERIFY(writeMonoWav(wav, sound, 48000));
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 320;
+        gs.height = 180;
+        gs.fps = {25, 1};
+        Clip bg = makeGeneratorClip(gen, "color", 750);
+        bg.generator.params["color.r"] = bg.generator.params["color.g"] = bg.generator.params["color.b"] = Param(0.4);
+        edit::overwrite(gen, gs, {TrackKind::Video, 0}, bg);
+        Clip sq = makeGeneratorClip(gen, "shape", 750);
+        sq.generator.params["width"] = sq.generator.params["height"] = Param(40.0);
+        sq.generator.params["pos_x"].addKey(0, -100.0);
+        sq.generator.params["pos_x"].addKey(200, -100.0);
+        sq.generator.params["pos_x"].addKey(300, 100.0);
+        sq.generator.params["pos_x"].addKey(749, 100.0);
+        edit::overwrite(gen, gs, {TrackKind::Video, 1}, sq);
+        MediaItem audio = probeOrFail(gen, wav);
+        gen.media.push_back(audio);
+        QVERIFY(edit::placeMedia(gen, gs, audio.id, 0, 0, -1, {TrackKind::Video, 2}, {TrackKind::Audio, 0}, false).ok);
+        ExportSettings st = findExportPreset("Apple ProRes 422 HQ")->settings;
+        st.path = path("highlight-footage.mov");
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+
+        Project p = makeDefaultProject();
+        MediaItem m = probeOrFail(p, st.path);
+        p.media.push_back(m);
+        HighlightOptions o;
+        o.seconds = 7;
+        o.minLength = 2;
+        o.maxLength = 4;
+        const std::vector<HighlightMoment> moments = findHighlights(p, {m.id}, o, {}, nullptr, &err);
+        QVERIFY2(!moments.empty(), err.c_str());
+        double total = 0;
+        bool motion = false, loud = false;
+        for (const HighlightMoment& h : moments) {
+            qInfo("highlight %.1f to %.1f s (score %.2f)", h.in, h.out, h.score);
+            total += h.out - h.in;
+            motion |= h.in < 12 && h.out > 8;
+            loud |= h.in < 23 && h.out > 20;
+            // Nothing from the still, quiet stretches.
+            QVERIFY(!(h.out <= 7.5) && !(h.in >= 13 && h.out <= 19.5) && !(h.in >= 24));
+        }
+        QVERIFY(motion && loud);
+        QVERIFY2(total >= 6 && total <= 8.5, qPrintable(QString::number(total)));
+        for (size_t i = 1; i < moments.size(); ++i) QVERIFY(moments[i].in >= moments[i - 1].out);
+        // Laid out in a new sequence, back to back with their sound.
+        const Id seq = makeHighlightSequence(p, moments);
+        QVERIFY(seq);
+        const Sequence* hs = p.findSequence(seq);
+        QCOMPARE(hs->videoTracks[0].clips.size(), moments.size());
+        QCOMPARE(hs->audioTracks[0].clips.size(), moments.size());
+        QVERIFY(std::fabs(double(hs->duration()) / hs->fpsValue() - total) < 0.2);
+        // Over MCP.
+        Project q = makeDefaultProject();
+        q.media.push_back(m);
+        const QString project = QString::fromStdString(path("highlights.montage"));
+        QVERIFY(saveProject(q, project.toStdString()));
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_highlights"}, {"arguments", QJsonObject{{"project", project}, {"seconds", 7}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject res = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.sequences.size(), size_t(2));
+        QCOMPARE(back.sequences.back().name, std::string("Highlights"));
     }
 
     void cutToTheBeat() {

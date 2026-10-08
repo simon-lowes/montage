@@ -22,6 +22,7 @@
 #include <QHeaderView>
 #include <QInputDialog>
 #include <QLabel>
+#include <QLineEdit>
 #include <QLocale>
 #include <QFutureWatcher>
 #include <QMenuBar>
@@ -65,6 +66,8 @@
 #include "MaskOverlay.h"
 #include "SequenceIndexPanel.h"
 #include "ShotSearchPanel.h"
+#include "ModelPacks.h"
+#include "media/VisualSearch.h"
 #include "PeoplePanel.h"
 #include "SpeechDialog.h"
 #include "TranscriptPanel.h"
@@ -85,6 +88,7 @@
 #include "render/ClipAnalysis.h"
 #include "render/RenderCache.h"
 #include "render/Compositor.h"
+#include "render/Highlights.h"
 #include "render/MusicEdit.h"
 #include "render/VoiceMatch.h"
 #include "render/Exporter.h"
@@ -550,6 +554,7 @@ void MainWindow::buildMenus() {
     add(clipM, tr("Fit Music to Length…"), QKeySequence(), [this] { fitMusicDialog(); })->setObjectName(QStringLiteral("fitMusic"));
     add(clipM, tr("Cut Selected Media to the Beat"), QKeySequence(), [this] { cutMediaToBeat(1, true); })
         ->setObjectName(QStringLiteral("cutToBeat"));
+    add(clipM, tr("Make Highlights…"), QKeySequence(), [this] { highlightsDialog(); })->setObjectName(QStringLiteral("makeHighlights"));
     add(clipM, tr("S&ynchronize by Audio"), QKeySequence(), [this] { syncByAudio(); });
     clipM->addSeparator();
     add(clipM, tr("&Insert from Source"), QKeySequence(Qt::Key_Comma), [this] { state_->insertFromSource(false); });
@@ -1698,6 +1703,70 @@ int MainWindow::addBeatMarkers(bool everyBeat) {
     });
     state_->message(tr("%n marker(s) at %1 BPM", "", n).arg(grid.tempo, 0, 'f', 1), 5000);
     return n;
+}
+
+Id MainWindow::makeHighlights(double seconds, const QString& lookFor) {
+    std::vector<Id> media;
+    for (Id id : bin_ ? bin_->selectedMedia() : std::vector<Id>{})
+        if (const MediaItem* m = state_->project().findMedia(id); m && m->kind == MediaKind::Video) media.push_back(id);
+    if (media.empty())
+        for (const MediaItem& m : state_->project().media)
+            if (m.kind == MediaKind::Video) media.push_back(m.id);
+    if (media.empty()) {
+        state_->message(tr("Import some video to make highlights from"));
+        return 0;
+    }
+    HighlightOptions o;
+    o.seconds = seconds;
+    std::string err;
+    if (!lookFor.trimmed().isEmpty() && visualSearchAvailable()) {
+        if (!ensureModelPack(this, visualModel(), tr("Make Highlights"),
+                             tr("Looking for something in the footage uses CLIP, which runs on this computer.")))
+            return 0;
+        if (!indexVideos(state_, media, this)) return 0;
+        if (auto clip = ClipModel::load(&err)) o.lookFor = clip->text(lookFor.trimmed().toStdString(), &err);
+    }
+    auto project = std::make_shared<const Project>(state_->project());
+    std::vector<HighlightMoment> moments;
+    if (!runWithProgress(this, state_, tr("Finding the highlights..."), [&, project](const auto& progress, const auto* cancel, std::string* e) {
+            moments = findHighlights(*project, media, o, progress, cancel, e);
+            return !moments.empty();
+        }))
+        return 0;
+    Id seq = 0;
+    state_->edit(tr("Make Highlights"), [&](Project& p, Sequence&) {
+        seq = makeHighlightSequence(p, moments);
+        return seq != 0;
+    });
+    if (seq) {
+        state_->setActiveSequence(seq);
+        state_->message(tr("%n moment(s) in a new Highlights sequence", "", int(moments.size())), 6000);
+    }
+    return seq;
+}
+
+void MainWindow::highlightsDialog() {
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Make Highlights"));
+    auto* form = new QFormLayout(&dlg);
+    auto* secs = new QDoubleSpinBox(&dlg);
+    secs->setObjectName(QStringLiteral("highlightSeconds"));
+    secs->setRange(5, 600);
+    secs->setValue(30);
+    secs->setSuffix(tr(" s"));
+    form->addRow(tr("Length:"), secs);
+    auto* look = new QLineEdit(&dlg);
+    look->setObjectName(QStringLiteral("highlightLookFor"));
+    look->setPlaceholderText(tr("Optional: what to look for, e.g. \"people dancing\""));
+    form->addRow(tr("Look for:"), look);
+    form->addRow(new QLabel(tr("Uses the videos selected in the Media bin, or every video. The liveliest moments (loud, moving, "
+                               "or like your description) go into a new sequence in the order they happened."),
+                            &dlg));
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    form->addRow(buttons);
+    if (dlg.exec() == QDialog::Accepted) makeHighlights(secs->value(), look->text());
 }
 
 int MainWindow::cutMediaToBeat(int every, bool bars) {
