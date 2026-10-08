@@ -113,6 +113,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
   - Both process the clip's whole source audio in the background and cache the result. Playback uses the original audio until the cleaned copy is ready (usually a few seconds); exports always wait for it.
 - Crossfades: equal power or constant gain
 - Loudness normalisation to -14, -16, -23 or -24 LUFS (ITU-R BS.1770 / EBU R128 gated measurement)
+- **Live loudness meter** under the audio meters while playing: momentary (400 ms), short-term (3 s) and integrated LUFS, loudness range (LU) and true peak (dBTP). The integrated value turns green on the chosen target (EBU R128 -23, ATSC A/85 -24, streaming -14, Apple and podcasts -16), amber within 2 LU, and red otherwise; true peak turns red above -1 dBTP. Reset starts a new measurement.
 - Waveforms on the timeline
 
 **Organising media**

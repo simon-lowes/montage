@@ -62,6 +62,8 @@ public slots:
     void seek(montage::FrameTime t);  // also renders the frame when paused
     void step(int frames);
     void requestFrame();          // re-render the current frame (after edits)
+    // Starts the loudness measurement again (it otherwise runs on across plays of a sequence).
+    void resetLoudness();
 
 signals:
     void positionChanged(montage::FrameTime t);
@@ -69,6 +71,8 @@ signals:
     // Peak levels of the last audio block: master L/R and per-track
     // interleaved L,R pairs (linear, 0..1+).
     void audioLevels(float masterL, float masterR, const QVector<float>& trackPeaks);
+    // Loudness of what is heard (LUFS, LU and dBTP; -200 for nothing yet), ten times a second.
+    void loudness(double momentary, double shortTerm, double integrated, double range, double truePeak);
     void playingChanged(bool playing);
 
 private slots:

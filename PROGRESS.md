@@ -389,3 +389,8 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
   - MCP `montage_add_title` takes a template.
   - Existing titles render as before (every new setting defaults to off).
   - Tested by measuring the rendered ink: placement inside the safe area at 16:9 and 9:16, the bar and second-line colours, a slide moving into place, a fade gone on the last frame, pop growing, typewriter a third typed at a third of the way, a wipe revealing from the left, and a plain title constant over time.
+- [x] Live loudness meter (Premiere's Loudness Meter, Fairlight's loudness):
+  - LoudnessMeter gains momentary (400 ms) and short-term (3 s) readings with their maxima, loudness range (EBU Tech 3342: short-term blocks every 100 ms, gated at -70 LUFS and 20 LU below their mean, 10th to 95th percentile), seconds measured, and reset.
+  - Playback feeds what is heard into it (in the audio thread, ten reports a second); it integrates across plays of a sequence until reset.
+  - The Meters panel shows M, S, I, LRA and TP under the peak meters, with a target (-23, -24, -14, -16; remembered) colouring the integrated value and a red true peak above -1 dBTP.
+  - Tested: on a steady tone momentary, short-term and integrated agree within 0.1 LU and the range is under 0.5; a +9.5 dB step shows in momentary at once and only part way in short-term; tones alternating 10 dB give a range of 10 ± 1 LU; reset; and the readout's values, colours by target and reset. (The playback feed itself has no automated test: the test machines have no audio output.)

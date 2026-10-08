@@ -1,5 +1,7 @@
 #include "PlaybackController.h"
 
+#include "media/Loudness.h"
+
 #include <QAudioDevice>
 #include <QAudioFormat>
 #include <QAudioSink>
@@ -143,11 +145,24 @@ public:
 
     void configure(std::shared_ptr<const Project> p, Id seq, int64_t startSample, bool int16) {
         QMutexLocker lock(&m_);
+        const Sequence* s = p ? p->findSequence(seq) : nullptr;
         project_ = std::move(p);
         seq_ = seq;
         sample_ = startSample;
         int16_ = int16;
         mixer_.reset();
+        // Loudness keeps integrating across plays of the same sequence until reset.
+        QMutexLocker meterLock(&meterM_);
+        const int rate = s ? s->sampleRate : 48000;
+        if (!meter_ || seq != meterSeq_ || rate != meterRate_) {
+            meter_ = std::make_unique<LoudnessMeter>(rate);
+            meterSeq_ = seq;
+            meterRate_ = rate;
+        }
+    }
+    void resetLoudness() {
+        QMutexLocker lock(&meterM_);
+        if (meter_) meter_->reset();
     }
     void setProject(std::shared_ptr<const Project> p) {
         QMutexLocker lock(&m_);
@@ -158,6 +173,7 @@ public:
 
 signals:
     void levels(float l, float r, const QVector<float>& tracks);
+    void loudness(double momentary, double shortTerm, double integrated, double range, double truePeak);
 
 protected:
     qint64 readData(char* data, qint64 maxlen) override {
@@ -190,6 +206,20 @@ protected:
             tracks << lv.peakL << lv.peakR;
         }
         emit levels(pl, pr, tracks);
+        // Loudness of what is heard, reported ten times a second.
+        {
+            QMutexLocker lock(&meterM_);
+            if (meter_) {
+                meter_->add(buf_.data(), frames);
+                sinceReport_ += frames;
+                if (sinceReport_ >= meterRate_ / 10) {
+                    sinceReport_ = 0;
+                    const LoudnessResult r = meter_->result();
+                    emit loudness(meter_->momentary(), meter_->shortTerm(), r.valid ? r.integrated : -200.0, meter_->loudnessRange(),
+                                  r.truePeakDb);
+                }
+            }
+        }
         return qint64(frames) * bytesPerFrame;
     }
     qint64 writeData(const char*, qint64) override { return -1; }
@@ -202,6 +232,11 @@ private:
     bool int16_ = false;
     AudioMixer mixer_;
     std::vector<float> buf_;
+    QMutex meterM_;
+    std::unique_ptr<LoudnessMeter> meter_;
+    Id meterSeq_ = 0;
+    int meterRate_ = 48000;
+    int64_t sinceReport_ = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -217,6 +252,7 @@ PlaybackController::PlaybackController(QObject* parent) : QObject(parent) {
     renderThread_->start();
     device_ = new MixerDevice(this);
     connect(device_, &MixerDevice::levels, this, &PlaybackController::audioLevels);
+    connect(device_, &MixerDevice::loudness, this, &PlaybackController::loudness);
     timer_.setTimerType(Qt::PreciseTimer);
     timer_.setInterval(8);
     connect(&timer_, &QTimer::timeout, this, &PlaybackController::tick);
@@ -448,6 +484,8 @@ void PlaybackController::stopAudio() {
     sink_->deleteLater();
     sink_ = nullptr;
 }
+
+void PlaybackController::resetLoudness() { device_->resetLoudness(); }
 
 }  // namespace montage
 

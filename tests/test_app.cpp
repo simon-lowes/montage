@@ -45,6 +45,7 @@
 #include "audio/PluginEffect.h"
 #include "KeyframePanel.h"
 #include "Keymap.h"
+#include "LoudnessReadout.h"
 #include "MaskOverlay.h"
 #include "media/Diarizer.h"
 #include "media/VisualSearch.h"
@@ -1502,6 +1503,36 @@ const auto seq = [this] { return state()->sequence(); };
         QTest::keyClick(win_.get(), Qt::Key_Q);
         QCOMPARE(state()->sequence()->markers.size(), markers + 1);
         keymap::resetAll(w);
+    }
+
+    void loudnessReadout() {
+        auto* readout = win_->findChild<LoudnessReadout*>("loudness");
+        QVERIFY(readout);
+        readout->setTargetIndex(0);  // EBU R128, -23
+        QCOMPARE(readout->target(), -23.0);
+        readout->setReading(-22.8, -23.4, -23.2, 4.1, -2.0);
+        QCOMPARE(readout->text("M"), QString("-22.8"));
+        QCOMPARE(readout->text("I"), QString("-23.2"));
+        QCOMPARE(readout->text("LRA"), QString("4.1"));
+        QCOMPARE(readout->text("TP"), QString("-2.0"));
+        QCOMPARE(readout->integratedStatus(), 0);  // on target
+        readout->setTargetIndex(2);  // streaming, -14: well off
+        QCOMPARE(readout->integratedStatus(), 2);
+        readout->setTargetIndex(1);  // -24: within 1 LU too
+        QCOMPARE(readout->integratedStatus(), 0);
+        readout->setTargetIndex(0);
+        readout->setReading(-21.6, -21.6, -21.6, 4.1, -2.0);  // 1.4 LU over -23: near
+        QCOMPARE(readout->integratedStatus(), 1);
+        readout->setReading(-200, -200, -200, 0, -200);  // nothing measured yet
+        QCOMPARE(readout->text("I"), QString("—"));
+        QCOMPARE(readout->text("LRA"), QString("0.0"));
+        // Reset clears it and asks for a new measurement.
+        readout->setReading(-20, -20, -20, 1, -0.5);
+        QSignalSpy reset(readout, &LoudnessReadout::resetRequested);
+        readout->findChild<QToolButton*>("loudnessReset")->click();
+        QCOMPARE(reset.count(), 1);
+        QCOMPARE(readout->text("M"), QString("—"));
+        readout->setTargetIndex(0);
     }
 
     void renderQueueInTheBackground() {

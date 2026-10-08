@@ -1,6 +1,7 @@
 #include "MainWindow.h"
 
 #include "Keymap.h"
+#include "LoudnessReadout.h"
 
 #include <QAction>
 #include <QCheckBox>
@@ -274,7 +275,21 @@ void MainWindow::buildPanels() {
         captionsDock_->raise();
         captions_->editCaption(track, index);
     });
-    meterDock_ = makeDock(tr("Meters"), "meters", meter_);
+    // The peak meters with the loudness readout beneath them.
+    loudness_ = new LoudnessReadout(this);
+    loudness_->setObjectName(QStringLiteral("loudness"));
+    auto* meters = new QWidget(this);
+    auto* ml = new QVBoxLayout(meters);
+    ml->setContentsMargins(0, 0, 0, 0);
+    ml->setSpacing(2);
+    ml->addWidget(meter_, 1);
+    ml->addWidget(loudness_);
+    for (PlaybackController* pc : {program_, source_}) connect(pc, &PlaybackController::loudness, loudness_, &LoudnessReadout::setReading);
+    connect(loudness_, &LoudnessReadout::resetRequested, this, [this] {
+        program_->resetLoudness();
+        source_->resetLoudness();
+    });
+    meterDock_ = makeDock(tr("Meters"), "meters", meters);
     resetLayout();
 }
 

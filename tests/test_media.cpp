@@ -397,6 +397,41 @@ private slots:
                  qPrintable(QString("%1 %2").arg(out[4000 * 2]).arg(out[4000 * 2 + 1])));
     }
 
+    void liveLoudness() {
+        const int rate = 48000;
+        auto tone = [&](double amp, double seconds) {
+            std::vector<float> v(size_t(rate * seconds) * 2);
+            for (size_t i = 0; i < v.size() / 2; ++i) v[i * 2] = v[i * 2 + 1] = float(amp * std::sin(2 * M_PI * 1000.0 * double(i) / rate));
+            return v;
+        };
+        LoudnessMeter m(rate);
+        QVERIFY(m.momentary() <= -70 && m.shortTerm() <= -70 && m.loudnessRange() == 0.0);
+        // A steady tone: momentary, short-term and integrated agree.
+        auto quiet = tone(0.1, 4);
+        m.add(quiet.data(), int64_t(quiet.size() / 2));
+        const double integrated = m.result().integrated;
+        QVERIFY2(std::fabs(m.momentary() - integrated) < 0.1 && std::fabs(m.shortTerm() - integrated) < 0.1,
+                 qPrintable(QString("%1 %2 %3").arg(m.momentary()).arg(m.shortTerm()).arg(integrated)));
+        QVERIFY(m.loudnessRange() < 0.5);
+        QVERIFY(std::fabs(m.seconds() - 4) < 0.01);
+        // Three times louder (+9.5 dB) for a second: momentary follows at once, short-term only part way.
+        auto loud = tone(0.3, 1);
+        m.add(loud.data(), int64_t(loud.size() / 2));
+        QVERIFY2(std::fabs(m.momentary() - (integrated + 9.54)) < 0.2, qPrintable(QString::number(m.momentary() - integrated)));
+        QVERIFY(m.shortTerm() > integrated + 2 && m.shortTerm() < integrated + 7);
+        QVERIFY(m.maxMomentary() >= m.momentary() - 1e-9 && m.maxShortTerm() >= m.shortTerm() - 1e-9);
+        // Alternating 10 dB every 6 s for a minute: a range of about 10 LU.
+        LoudnessMeter r(rate);
+        for (int k = 0; k < 10; ++k) {
+            auto part = tone(k % 2 ? 0.316 : 0.1, 6);
+            r.add(part.data(), int64_t(part.size() / 2));
+        }
+        QVERIFY2(std::fabs(r.loudnessRange() - 10) < 1.0, qPrintable(QString::number(r.loudnessRange())));
+        r.reset();
+        QCOMPARE(r.seconds(), 0.0);
+        QVERIFY(r.momentary() <= -70);
+    }
+
     void peakLimiter() {
         // A quiet tone with a loud burst in the middle: the burst is held under the ceiling, the rest passes untouched.
         const int rate = 48000, n = rate;

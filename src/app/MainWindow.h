@@ -33,6 +33,7 @@ class TranscriptPanel;
 class ShotSearchPanel;
 class MulticamPanel;
 class AudioMeterWidget;
+class LoudnessReadout;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -149,6 +150,7 @@ private:
     TranscriptPanel* transcript_ = nullptr;
     ShotSearchPanel* shots_ = nullptr;
     AudioMeterWidget* meter_ = nullptr;
+    LoudnessReadout* loudness_ = nullptr;
     std::vector<QDockWidget*> docks_;
     QDockWidget* sourceDock_ = nullptr;
     QDockWidget* programDock_ = nullptr;

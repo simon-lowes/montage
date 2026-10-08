@@ -28,6 +28,18 @@ public:
     ~LoudnessMeter();
     void add(const float* stereo, int64_t frames);
     LoudnessResult result() const;
+    // Live readings (EBU R128): the last 400 ms and the last 3 s, in LUFS
+    // (-70 or below for silence or before any sound), and their highest so far.
+    double momentary() const;
+    double shortTerm() const;
+    double maxMomentary() const;
+    double maxShortTerm() const;
+    // Loudness range (EBU Tech 3342), in LU: the spread of the short-term
+    // loudness, 10th to 95th percentile after gating; 0 until there is enough.
+    double loudnessRange() const;
+    // Seconds measured so far.
+    double seconds() const;
+    void reset();
 
 private:
     struct Impl;

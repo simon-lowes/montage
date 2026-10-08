@@ -76,7 +76,20 @@ struct LoudnessMeter::Impl {
     double peak = 0;
     std::array<std::array<double, kTaps>, 2> history{};  // recent samples per channel, for oversampling
     size_t hpos = 0;
+    double maxM = -200, maxS = -200;
+    // The mean square of the last `count` steps (fewer at the start).
+    double window(size_t count) const {
+        if (steps.empty()) return 0;
+        const size_t from = steps.size() > count ? steps.size() - count : 0;
+        double sum = 0;
+        for (size_t i = from; i < steps.size(); ++i) sum += steps[i];
+        return sum / double(steps.size() - from);
+    }
 };
+
+namespace {
+double toLufs(double ms) { return ms > 0 ? -0.691 + 10.0 * std::log10(ms) : -200.0; }
+}  // namespace
 
 LoudnessMeter::LoudnessMeter(int sampleRate) : d_(std::make_unique<Impl>(sampleRate)) {}
 LoudnessMeter::~LoudnessMeter() = default;
@@ -103,6 +116,8 @@ void LoudnessMeter::add(const float* stereo, int64_t frames) {
             d.steps.push_back(d.acc / double(d.step));
             d.acc = 0;
             d.n = 0;
+            if (d.steps.size() >= 4) d.maxM = std::max(d.maxM, toLufs(d.window(4)));
+            if (d.steps.size() >= 30) d.maxS = std::max(d.maxS, toLufs(d.window(30)));
         }
     }
 }
@@ -143,6 +158,39 @@ LoudnessResult LoudnessMeter::result() const {
     r.valid = true;
     return r;
 }
+
+double LoudnessMeter::momentary() const { return std::max(-200.0, toLufs(d_->window(4))); }
+double LoudnessMeter::shortTerm() const { return std::max(-200.0, toLufs(d_->window(30))); }
+double LoudnessMeter::maxMomentary() const { return d_->maxM; }
+double LoudnessMeter::maxShortTerm() const { return d_->maxS; }
+double LoudnessMeter::seconds() const { return double(d_->steps.size()) * 0.1 + double(d_->n) / d_->fs; }
+
+double LoudnessMeter::loudnessRange() const {
+    // Short-term (3 s) blocks at every 100 ms step (Tech 3342 asks for at least ten a second).
+    const auto& st = d_->steps;
+    if (st.size() < 30) return 0;
+    std::vector<double> blocks;
+    for (size_t i = 29; i < st.size(); ++i) {
+        double sum = 0;
+        for (size_t j = i - 29; j <= i; ++j) sum += st[j];
+        const double l = toLufs(sum / 30);
+        if (l > -70) blocks.push_back(l);
+    }
+    if (blocks.size() < 2) return 0;
+    // Relative gate 20 LU below the (energy) mean of what passed the absolute gate.
+    double e = 0;
+    for (double l : blocks) e += std::pow(10.0, (l + 0.691) / 10);
+    const double gate = toLufs(e / double(blocks.size())) - 20;
+    std::vector<double> kept;
+    for (double l : blocks)
+        if (l > gate) kept.push_back(l);
+    if (kept.size() < 2) return 0;
+    std::sort(kept.begin(), kept.end());
+    auto pct = [&](double q) { return kept[size_t(std::lround(q * double(kept.size() - 1)))]; };
+    return pct(0.95) - pct(0.10);
+}
+
+void LoudnessMeter::reset() { d_ = std::make_unique<Impl>(int(d_->fs)); }
 
 LoudnessResult measureLoudness(const AudioBuffer& buf, int64_t first, int64_t count) {
     const int64_t total = buf.frames();
