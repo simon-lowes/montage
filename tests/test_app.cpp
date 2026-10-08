@@ -1962,6 +1962,36 @@ private slots:
         state()->newProject();
     }
 
+    void sourceMonitorShowsTheWaveform() {
+        state()->newProject();
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        MonitorPanel *source = nullptr, *program = nullptr;
+        for (auto* m : win_->findChildren<MonitorPanel*>())
+            (m->mode() == MonitorPanel::Mode::Source ? source : program) = m;
+        QVERIFY(source && program);
+        QVERIFY(!source->scrubBar()->hasWaveform());
+
+        // Opened in the Source monitor, its audio shows on the scrub bar once decoded, which grows to fit it.
+        state()->setSourceMedia(ids[0]);
+        QTRY_VERIFY_WITH_TIMEOUT(source->scrubBar()->hasWaveform(), 20000);
+        QVERIFY(!program->scrubBar()->hasWaveform());
+        QCOMPARE(source->scrubBar()->height(), 40);
+        const QImage img = source->scrubBar()->grab().toImage();
+        int wave = 0;
+        for (int y = 0; y < img.height(); ++y)
+            for (int x = 0; x < img.width(); ++x) {
+                QColor c = img.pixelColor(x, y);
+                if (c.green() > 110 && c.green() > c.red() + 30 && c.green() > c.blue() + 10) ++wave;
+            }
+        QVERIFY2(wave > img.width(), qPrintable(QString::number(wave)));
+
+        state()->setSourceMedia(0);
+        QVERIFY(!source->scrubBar()->hasWaveform());
+        QCOMPARE(source->scrubBar()->height(), 18);
+        state()->newProject();
+    }
+
     void subclipsFromTheSourceMonitor() {
         state()->newProject();
         const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});

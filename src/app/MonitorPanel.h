@@ -4,6 +4,7 @@
 #include <QImage>
 #include <QWidget>
 #include <functional>
+#include <memory>
 
 #include "core/Model.h"
 
@@ -16,6 +17,7 @@ namespace montage {
 
 class EditorState;
 class PlaybackController;
+struct Peaks;
 
 // Letterboxed frame display with optional safe-area guides.
 class ViewerWidget : public QWidget {
@@ -94,7 +96,11 @@ public:
     void setPosition(FrameTime t);
     void setMarks(FrameTime in, FrameTime out);
     void setMarkers(std::vector<FrameTime> markers);
-    QSize sizeHint() const override { return {300, 18}; }
+    // An audio waveform behind the bar (the Source monitor's, as Premiere shows over its mini timeline): min/max
+    // peaks, each frame `secondsPerFrame` long. Null clears it; the bar is taller while one is shown.
+    void setWaveform(std::shared_ptr<const Peaks> peaks, double secondsPerFrame);
+    bool hasWaveform() const { return bool(peaks_); }
+    QSize sizeHint() const override { return {300, height()}; }
 
 signals:
     void seekRequested(montage::FrameTime t);
@@ -110,6 +116,8 @@ private:
     FrameTime pos_ = 0;
     FrameTime in_ = -1, out_ = -1;
     std::vector<FrameTime> markers_;
+    std::shared_ptr<const Peaks> peaks_;
+    double secondsPerFrame_ = 1.0 / 30;
 };
 
 class MonitorPanel : public QWidget {
@@ -119,6 +127,7 @@ public:
     MonitorPanel(Mode mode, EditorState* state, PlaybackController* controller, QWidget* parent = nullptr);
 
     ViewerWidget* viewer() const { return viewer_; }
+    ScrubBar* scrubBar() const { return scrub_; }
     PlaybackController* controller() const { return controller_; }
     Mode mode() const { return mode_; }
     // Re-reads duration, marks and timecode from the state / controller.
@@ -146,6 +155,7 @@ private:
     FrameTime duration() const;
     FrameTime inPoint() const;
     FrameTime outPoint() const;
+    void updateWaveform();  // Source: the media's audio waveform on the scrub bar
 
     Mode mode_;
     EditorState* state_;
@@ -157,6 +167,7 @@ private:
     QToolButton* playButton_;
     QComboBox* resolution_ = nullptr;
     QComboBox* exposure_ = nullptr;  // exposure check (ExposureView.h)
+    std::string waveformRequested_;  // the media whose audio decode this monitor started
 
     void renderTrimView();
     bool trimView_ = false, trimBusy_ = false, trimPending_ = false;

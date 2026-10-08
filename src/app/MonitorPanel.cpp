@@ -25,6 +25,7 @@
 #include "EditorState.h"
 #include "PlaybackController.h"
 #include "media/Image.h"
+#include "media/MediaPool.h"
 #include "render/Compositor.h"
 #include "Theme.h"
 
@@ -242,6 +243,16 @@ void ScrubBar::setMarkers(std::vector<FrameTime> markers) {
     update();
 }
 
+void ScrubBar::setWaveform(std::shared_ptr<const Peaks> peaks, double secondsPerFrame) {
+    if (peaks && peaks->minmax.empty()) peaks = nullptr;
+    if (secondsPerFrame <= 0) secondsPerFrame = 1.0 / 30;
+    if (peaks == peaks_ && secondsPerFrame == secondsPerFrame_) return;
+    peaks_ = std::move(peaks);
+    secondsPerFrame_ = secondsPerFrame;
+    setFixedHeight(peaks_ ? 40 : 18);
+    update();
+}
+
 FrameTime ScrubBar::frameAt(int x) const {
     double u = std::clamp(double(x - 4) / std::max(1, width() - 8), 0.0, 1.0);
     return FrameTime(std::llround(u * double(duration_)));
@@ -252,7 +263,30 @@ void ScrubBar::paintEvent(QPaintEvent*) {
     p.fillRect(rect(), theme::kPanel);
     int w = width() - 8;
     auto xOf = [&](FrameTime t) { return 4 + int(double(t) / double(duration_) * w); };
-    p.fillRect(QRect(4, height() / 2 - 2, w, 4), theme::kBorder);
+    if (peaks_) {
+        // Each pixel column shows the loudest swing of the audio under it.
+        const double rate = peaks_->sampleRate, perBucket = peaks_->samplesPerBucket;
+        const size_t buckets = peaks_->minmax.size() / 2;
+        const double mid = height() / 2.0, half = height() / 2.0 - 2;
+        p.fillRect(QRect(4, 1, w, height() - 2), theme::kWindow);
+        p.setPen(QColor(theme::kAudioClip.red(), theme::kAudioClip.green(), theme::kAudioClip.blue(), 200));
+        for (int x = 0; x < w; ++x) {
+            double fA = double(x) / w * double(duration_), fB = double(x + 1) / w * double(duration_);
+            size_t bA = size_t(fA * secondsPerFrame_ * rate / perBucket);
+            size_t bB = std::max(bA + 1, size_t(fB * secondsPerFrame_ * rate / perBucket));
+            if (bA >= buckets) break;
+            bB = std::min(bB, buckets);
+            float lo = 0, hi = 0;
+            for (size_t b = bA; b < bB; ++b) {
+                lo = std::min(lo, peaks_->minmax[b * 2]);
+                hi = std::max(hi, peaks_->minmax[b * 2 + 1]);
+            }
+            int y1 = int(mid - std::min(1.0f, hi) * half), y2 = int(mid - std::max(-1.0f, lo) * half);
+            p.drawLine(4 + x, y1, 4 + x, std::max(y1, y2));
+        }
+    } else {
+        p.fillRect(QRect(4, height() / 2 - 2, w, 4), theme::kBorder);
+    }
     if (in_ >= 0 || out_ >= 0) {
         int a = xOf(std::max<FrameTime>(0, in_)), b = xOf(out_ >= 0 ? out_ : duration_);
         p.fillRect(QRect(a, 2, std::max(1, b - a), height() - 4), QColor(61, 139, 255, 80));
@@ -428,6 +462,7 @@ MonitorPanel::MonitorPanel(Mode mode, EditorState* state, PlaybackController* co
     });
     connect(state_, &EditorState::projectChanged, this, &MonitorPanel::refresh);
     connect(state_, &EditorState::sourceChanged, this, &MonitorPanel::refresh);
+    if (mode_ == Mode::Source) connect(state_, &EditorState::mediaReady, this, [this] { refresh(); });
     refresh();
 }
 
@@ -515,6 +550,7 @@ void MonitorPanel::refresh() {
         for (const auto& mk : state_->sequence()->markers) m.push_back(mk.t);
         scrub_->setMarkers(m);
     }
+    if (mode_ == Mode::Source) updateWaveform();
     if (!timecode_->hasFocus()) timecode_->setText(timecodeString(s, controller_->position()));
     FrameTime in = inPoint(), out = outPoint();
     QString dur = timecodeString(s, d);
@@ -523,6 +559,21 @@ void MonitorPanel::refresh() {
         dur = tr("In–Out %1").arg(timecodeString(s, std::max<FrameTime>(0, b - a)));
     }
     durationLabel_->setText(dur);
+}
+
+void MonitorPanel::updateWaveform() {
+    const Sequence* s = controller_->sequence();
+    const MediaItem* m = state_->project().findMedia(state_->sourceMedia());
+    if (!s || !m || !m->hasAudio || m->path.empty() || m->kind == MediaKind::Image || m->kind == MediaKind::Sequence) {
+        scrub_->setWaveform(nullptr, 0);
+        return;
+    }
+    PeaksPtr pk = MediaPool::instance().peaksIfReady(m->path);
+    if (!pk && waveformRequested_ != m->path) {  // decoded once in the background; mediaReady brings it in
+        waveformRequested_ = m->path;
+        state_->startAudioDecode(*m);
+    }
+    scrub_->setWaveform(pk, 1.0 / s->fpsValue());
 }
 
 void MonitorPanel::markIn() {

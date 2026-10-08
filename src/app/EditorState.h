@@ -127,6 +127,8 @@ public:
     // Emits projectChanged() after a direct mutation of mutableProject().
     void notifyChanged() { emit projectChanged(); }
     void message(const QString& text, int timeoutMs = 4000) { emit statusMessage(text, timeoutMs); }
+    // Decodes the media's audio (and its waveform peaks) in the background; mediaReady follows.
+    void startAudioDecode(const MediaItem& m);
 
 signals:
     void projectChanged();            // anything in the project changed
@@ -141,7 +143,6 @@ signals:
 
 private:
     void pruneSelection();
-    void startAudioDecode(const MediaItem& m);
 
     Project project_;
     History history_;
