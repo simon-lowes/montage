@@ -4541,6 +4541,52 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(peak(program->heard(4800, 4800)) > 0.1f);
     }
 
+    void trackFoldersOnTheTimeline() {
+        loadDemo();
+        // Four audio tracks, A2 and A3 in a "Dialogue" folder, each with a clip.
+        state()->edit("Tracks", [](Project& p, Sequence& s) {
+            while (s.audioTracks.size() < 4) edit::addTrack(p, s, TrackKind::Audio);
+            return true;
+        });
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        Id onA2 = 0;
+        QVERIFY(state()->apply("Place", [&](Project& p, Sequence& s) {
+            auto r = edit::placeMedia(p, s, ids[0], 0, 0, 60, {TrackKind::Video, 0}, {TrackKind::Audio, 1}, false);
+            if (r.ok && !r.created.empty()) onA2 = r.created.back();
+            return r;
+        }));
+        QVERIFY(onA2);
+        QVERIFY(state()->apply("Folder", [](Project&, Sequence& s) {
+            return edit::setTrackFolder(s, {{TrackKind::Audio, 1}, {TrackKind::Audio, 2}}, "Dialogue");
+        }));
+        TimelineWidget* tl = win_->timeline();
+        const QRect header = tl->folderHeaderRect(TrackKind::Audio, "Dialogue");
+        QVERIFY(header.isValid());
+        QVERIFY(tl->trackShown({TrackKind::Audio, 1}) && tl->trackShown({TrackKind::Audio, 3}));
+        QVERIFY(tl->clipBounds(onA2).top() > header.bottom());  // under its header
+
+        // Clicking the arrow collapses it: its tracks are hidden, the rest move up; one undo step.
+        QTest::mouseClick(tl->viewport(), Qt::LeftButton, {}, QPoint(12, header.center().y()));
+        QVERIFY(edit::folderCollapsed(*state()->sequence(), TrackKind::Audio, "Dialogue"));
+        QVERIFY(!tl->trackShown({TrackKind::Audio, 1}) && !tl->trackShown({TrackKind::Audio, 2}));
+        QVERIFY(tl->trackShown({TrackKind::Audio, 3}));
+        QVERIFY(tl->clipBounds(onA2).isNull());
+        state()->undo();
+        QVERIFY(tl->trackShown({TrackKind::Audio, 1}));
+        state()->redo();
+
+        // The folder's M button mutes both of its tracks, and again unmutes them.
+        const QRect h2 = tl->folderHeaderRect(TrackKind::Audio, "Dialogue");
+        const QPoint mute(h2.right() - 10 - 3 * 20 + 10, h2.top() + 10);
+        QTest::mouseClick(tl->viewport(), Qt::LeftButton, {}, mute);
+        QVERIFY(state()->sequence()->audioTracks[1].muted && state()->sequence()->audioTracks[2].muted);
+        QVERIFY(!state()->sequence()->audioTracks[3].muted);
+        QTest::mouseClick(tl->viewport(), Qt::LeftButton, {}, mute);
+        QVERIFY(!state()->sequence()->audioTracks[1].muted && !state()->sequence()->audioTracks[2].muted);
+        state()->newProject();
+    }
+
     void quadScopes() {
         // A frame with a ramp and colour bars, in all four scopes at once.
         QImage frame(320, 180, QImage::Format_RGB32);

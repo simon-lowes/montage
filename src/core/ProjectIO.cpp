@@ -280,6 +280,7 @@ QJsonObject trackToJson(const Track& t) {
     if (t.volumeAuto.animated()) o["volumeAuto"] = paramToJson(t.volumeAuto);
     if (t.panAuto.animated()) o["panAuto"] = paramToJson(t.panAuto);
     if (t.automation != 1) o["automation"] = t.automation;
+    if (!t.folder.empty()) o["folder"] = qs(t.folder);
     return o;
 }
 
@@ -313,6 +314,7 @@ Track trackFromJson(const QJsonObject& o, TrackKind kind) {
     if (o.contains("volumeAuto")) t.volumeAuto = paramFromJson(o.value("volumeAuto"));
     if (o.contains("panAuto")) t.panAuto = paramFromJson(o.value("panAuto"));
     t.automation = std::clamp(o.value("automation").toInt(1), 0, 4);
+    t.folder = ss(o.value("folder"));
     std::sort(t.clips.begin(), t.clips.end(), [](const Clip& a, const Clip& b) { return a.start < b.start; });
     return t;
 }
@@ -421,6 +423,11 @@ QJsonObject sequenceToJson(const Sequence& s) {
     }
     if (s.masterVolumeDb != 0) o["masterVolumeDb"] = s.masterVolumeDb;
     if (s.multicam) o["multicam"] = true;
+    if (!s.collapsedFolders.empty()) {
+        QJsonArray folders;
+        for (const std::string& f : s.collapsedFolders) folders.append(qs(f));
+        o["collapsedFolders"] = folders;
+    }
     if (s.colorSpace != "rec709") o["colorSpace"] = qs(s.colorSpace);
     if (s.hdrPeakNits != 1000) o["hdrPeakNits"] = s.hdrPeakNits;
     if (s.audioLayout != "stereo") o["audioLayout"] = qs(s.audioLayout);
@@ -441,6 +448,7 @@ Sequence sequenceFromJson(const QJsonObject& o) {
     s.outPoint = i64(o.value("out"), -1);
     s.playhead = i64(o.value("playhead"), 0);
     s.multicam = o.value("multicam").toBool(false);
+    for (const auto& f : o.value("collapsedFolders").toArray()) s.collapsedFolders.push_back(f.toString().toStdString());
     s.colorSpace = o.contains("colorSpace") ? ss(o.value("colorSpace")) : "rec709";
     s.hdrPeakNits = std::clamp(o.value("hdrPeakNits").toDouble(1000), 100.0, 10000.0);
     s.audioLayout = o.contains("audioLayout") ? ss(o.value("audioLayout")) : "stereo";

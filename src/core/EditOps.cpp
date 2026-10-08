@@ -1570,6 +1570,58 @@ std::map<Id, std::vector<DuplicateSpan>> duplicateFrames(const Sequence& s) {
     return out;
 }
 
+// ---- Track folders ------------------------------------------------------------------
+
+namespace {
+std::string folderKey(TrackKind kind, const std::string& folder) { return (kind == TrackKind::Video ? "V/" : "A/") + folder; }
+}  // namespace
+
+Result setTrackFolder(Sequence& s, const std::vector<TrackRef>& tracks, const std::string& folder) {
+    if (tracks.empty()) return Result::fail("No tracks");
+    if (folder.find('/') != std::string::npos) return Result::fail("Folder names cannot have a slash");
+    for (TrackRef r : tracks)
+        if (!trackAt(s, r)) return Result::fail("No such track");
+    for (TrackRef r : tracks) trackAt(s, r)->folder = folder;
+    // Forget collapsed folders that no longer have tracks.
+    std::erase_if(s.collapsedFolders, [&](const std::string& key) {
+        const TrackKind kind = key.rfind("V/", 0) == 0 ? TrackKind::Video : TrackKind::Audio;
+        return folderTracks(s, kind, key.substr(2)).empty();
+    });
+    return {};
+}
+
+std::vector<int> folderTracks(const Sequence& s, TrackKind kind, const std::string& folder) {
+    std::vector<int> out;
+    if (folder.empty()) return out;
+    const auto& tracks = kind == TrackKind::Video ? s.videoTracks : s.audioTracks;
+    for (size_t i = 0; i < tracks.size(); ++i)
+        if (tracks[i].folder == folder) out.push_back(int(i));
+    return out;
+}
+
+bool folderCollapsed(const Sequence& s, TrackKind kind, const std::string& folder) {
+    const std::string key = folderKey(kind, folder);
+    return std::find(s.collapsedFolders.begin(), s.collapsedFolders.end(), key) != s.collapsedFolders.end();
+}
+
+void setFolderCollapsed(Sequence& s, TrackKind kind, const std::string& folder, bool collapsed) {
+    const std::string key = folderKey(kind, folder);
+    std::erase(s.collapsedFolders, key);
+    if (collapsed && !folder.empty()) s.collapsedFolders.push_back(key);
+}
+
+Result renameFolder(Sequence& s, TrackKind kind, const std::string& from, const std::string& to) {
+    if (to.empty() || to.find('/') != std::string::npos) return Result::fail("Give the folder a name without a slash");
+    if (to != from && !folderTracks(s, kind, to).empty()) return Result::fail("There is already a folder called " + to);
+    const std::vector<int> members = folderTracks(s, kind, from);
+    if (members.empty()) return Result::fail("No such folder");
+    const bool collapsed = folderCollapsed(s, kind, from);
+    for (int i : members) trackAt(s, {kind, i})->folder = to;
+    setFolderCollapsed(s, kind, from, false);
+    setFolderCollapsed(s, kind, to, collapsed);
+    return {};
+}
+
 // ---- Through edits -----------------------------------------------------------------
 
 namespace {

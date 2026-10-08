@@ -270,6 +270,9 @@ struct Track {
     // AutomationMode (0 Off, 1 Read, 2 Write, 3 Latch, 4 Touch).
     Param volumeAuto, panAuto;
     int automation = 1;
+    // Track folder (Resolve's Fairlight folders): tracks of a kind with the same folder, next to each other, show under
+    // one header that can collapse them and mute, solo or hide them together. "" = none.
+    std::string folder;
     bool operator==(const Track&) const = default;
 };
 
@@ -302,6 +305,7 @@ struct Sequence {
     std::vector<Effect> masterEffects;        // on the final mix, before the master fader
     double masterVolumeDb = 0;
     bool multicam = false;              // a multicam clip's sequence: video tracks are angles (Multicam.h)
+    std::vector<std::string> collapsedFolders;  // track folders shown collapsed: "V/name" or "A/name"
     std::string colorSpace = "rec709";  // working and delivery space (ColorSpace.h id)
     double hdrPeakNits = 1000;          // mastering peak for HDR spaces
     FrameTime inPoint = -1;   // In / Out marks; both frames are included, -1 = unset

@@ -2584,6 +2584,34 @@ private slots:
         QCOMPARE(d[fx.v1().clips[3].id].front().group, 1);
     }
 
+    void trackFolders() {
+        Fixture fx;
+        for (int k = 0; k < 3; ++k) addTrack(fx.p, fx.s(), TrackKind::Audio);
+        QVERIFY(fx.s().audioTracks.size() >= 4);
+        // A2 and A3 in "Dialogue".
+        QVERIFY(!setTrackFolder(fx.s(), {}, "Dialogue").ok);
+        QVERIFY(!setTrackFolder(fx.s(), {{TrackKind::Audio, 1}}, "A/B").ok);
+        QVERIFY(setTrackFolder(fx.s(), {{TrackKind::Audio, 1}, {TrackKind::Audio, 2}}, "Dialogue").ok);
+        QCOMPARE(folderTracks(fx.s(), TrackKind::Audio, "Dialogue"), (std::vector<int>{1, 2}));
+        QVERIFY(folderTracks(fx.s(), TrackKind::Video, "Dialogue").empty());
+        // Collapsed, renamed (still collapsed), saved and read back.
+        setFolderCollapsed(fx.s(), TrackKind::Audio, "Dialogue", true);
+        QVERIFY(folderCollapsed(fx.s(), TrackKind::Audio, "Dialogue"));
+        QVERIFY(!folderCollapsed(fx.s(), TrackKind::Video, "Dialogue"));
+        QVERIFY(renameFolder(fx.s(), TrackKind::Audio, "Dialogue", "Dial").ok);
+        QVERIFY(folderCollapsed(fx.s(), TrackKind::Audio, "Dial"));
+        QCOMPARE(fx.s().audioTracks[1].folder, std::string("Dial"));
+        QVERIFY(setTrackFolder(fx.s(), {{TrackKind::Audio, 3}}, "Music").ok);
+        QVERIFY(!renameFolder(fx.s(), TrackKind::Audio, "Dial", "Music").ok);  // taken
+        Project back;
+        QVERIFY(projectFromJson(projectToJson(fx.p), back));
+        QCOMPARE(back.active()->audioTracks[2].folder, std::string("Dial"));
+        QVERIFY(folderCollapsed(*back.active(), TrackKind::Audio, "Dial"));
+        // Emptied, the folder is forgotten.
+        QVERIFY(setTrackFolder(fx.s(), {{TrackKind::Audio, 1}, {TrackKind::Audio, 2}}, "").ok);
+        QVERIFY(fx.s().collapsedFolders.empty());
+    }
+
     void auditions() {
         // The clip plays the fixture's media from 10; take B (picture and sound) and C (sound only) are other files.
         Fixture fx;

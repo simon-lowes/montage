@@ -2,6 +2,7 @@
 #pragma once
 
 #include <QAbstractScrollArea>
+#include <QMenu>
 #include <QList>
 #include <optional>
 #include <vector>
@@ -60,6 +61,17 @@ public:
     void setShowDuplicateFrames(bool on);
     bool showDuplicateFrames() const { return showDuplicates_; }
     const std::vector<edit::DuplicateSpan>& duplicateSpans(Id clip) const;  // as drawn
+    // Track folders: where a folder's header is drawn (empty when not shown), and opening or closing it as its
+    // arrow does.
+    QRect folderHeaderRect(TrackKind kind, const QString& folder) const;
+    void toggleFolder(TrackKind kind, const QString& folder);
+    // Whether a track's row is shown (not inside a collapsed folder).
+    bool trackShown(TrackRef ref) const;
+    // Where a clip is drawn, in viewport pixels (empty when its row is not shown).
+    QRect clipBounds(Id clip) const {
+        QRect r;
+        return clipRect(clip, r) ? r : QRect();
+    }
     // Whether a through edit follows this clip (edit::throughEdits), as marked on the timeline.
     bool isThroughEdit(Id clip) const;
     void setShowTrackAutomation(bool on);
@@ -108,8 +120,22 @@ private:
         int y = 0;
         int h = 0;
     };
+    // A track folder's header row (its tracks' rows follow unless it is collapsed).
+    struct FolderRow {
+        TrackKind kind = TrackKind::Audio;
+        std::string name;
+        int y = 0, h = 0;
+        bool collapsed = false;
+        std::vector<int> tracks;  // by index, in display order
+    };
+    // Lays out the track and folder rows top to bottom; where the video/audio divider and the last row end.
+    void layoutRows(std::vector<Row>* rows, std::vector<FolderRow>* folders, int* divider, int* bottom) const;
+    std::vector<FolderRow> folderRows() const;
+    std::optional<FolderRow> folderRowAt(int y) const;
+    void paintFolderRow(QPainter& p, const FolderRow& f, bool header);
+    void folderMenu(QMenu& menu, TrackKind kind, const std::string& folder);
     enum class HitKind { None, Ruler, Header, Body, ClipBody, ClipIn, ClipOut, Transition, CaptionLane, Caption, CaptionIn, CaptionOut };
-    enum class HeaderButton { None, Target, Visible, Lock, Mute, Solo, Name };
+    enum class HeaderButton { None, Target, Visible, Lock, Mute, Solo, Name, Folder };
     struct Hit {
         HitKind kind = HitKind::None;
         std::optional<TrackRef> track;
@@ -119,6 +145,8 @@ private:
         FrameTime frame = 0;
         Id captionTrack = 0;
         int caption = -1;
+        std::string folder;  // a track folder's header (with folderKind)
+        TrackKind folderKind = TrackKind::Audio;
     };
     enum class DragKind { None, Scrub, Move, Trim, Roll, Slip, Slide, Rubber, Pan, CaptionMove, CaptionIn, CaptionOut, Line, LineKey, TrackLine, TrackKey };
     struct DragState {

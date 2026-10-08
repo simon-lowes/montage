@@ -154,6 +154,16 @@ struct DuplicateSpan {
 };
 std::map<Id, std::vector<DuplicateSpan>> duplicateFrames(const Sequence& s);
 
+// ---- Track folders (Resolve's Fairlight folders) -----------------------------------
+// Puts tracks in a folder ("" takes them out). Fails for no tracks or a folder name with a slash.
+Result setTrackFolder(Sequence& s, const std::vector<TrackRef>& tracks, const std::string& folder);
+// The tracks of a kind in the folder, by index.
+std::vector<int> folderTracks(const Sequence& s, TrackKind kind, const std::string& folder);
+bool folderCollapsed(const Sequence& s, TrackKind kind, const std::string& folder);
+void setFolderCollapsed(Sequence& s, TrackKind kind, const std::string& folder, bool collapsed);
+// Renames a folder (its tracks follow); fails if the new name is taken or empty.
+Result renameFolder(Sequence& s, TrackKind kind, const std::string& from, const std::string& to);
+
 // ---- Through edits (Premiere's through edit indicators and Join Through Edits) ----
 // An edit the picture or sound runs straight through: the next clip starts where this one ends and plays the same
 // media at the same speed from exactly where this one leaves off, with the same kind of effects and no transition

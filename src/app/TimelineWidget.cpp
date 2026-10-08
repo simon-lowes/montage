@@ -47,6 +47,7 @@ constexpr int kEdgeGrab = 6;
 constexpr int kSnapPx = 9;
 constexpr int kNameStrip = 16;
 constexpr int kBtn = 20;
+constexpr int kFolderH = 24;  // a track folder's header row
 
 // A clip's line parameter (generic over the timeline's private Lane type).
 template <class L>
@@ -159,40 +160,97 @@ int TimelineWidget::captionLanesHeight() const {
     return s ? int(s->captionTracks.size()) * kCaptionH : 0;
 }
 
+void TimelineWidget::layoutRows(std::vector<Row>* rowsOut, std::vector<FolderRow>* foldersOut, int* divider, int* bottom) const {
+    const Sequence* s = state_->sequence();
+    int y = kRulerH - verticalScrollBar()->value() + captionLanesHeight();
+    if (!s) {
+        if (divider) *divider = y;
+        if (bottom) *bottom = y + kDividerH;
+        return;
+    }
+    // Video tracks top-down (V1 nearest the divider), audio tracks downwards; a run of tracks in one folder goes
+    // under its header, hidden while the folder is collapsed.
+    auto lay = [&](TrackKind kind, const std::vector<Track>& tracks, bool topDown) {
+        const int n = int(tracks.size());
+        auto at = [&](int k) { return topDown ? n - 1 - k : k; };
+        for (int k = 0; k < n;) {
+            const Track& t = tracks[size_t(at(k))];
+            if (t.folder.empty()) {
+                if (rowsOut) rowsOut->push_back({{kind, at(k)}, y, trackHeight(t)});
+                y += trackHeight(t);
+                ++k;
+                continue;
+            }
+            FolderRow f{kind, t.folder, y, kFolderH, edit::folderCollapsed(*s, kind, t.folder), {}};
+            for (; k < n && tracks[size_t(at(k))].folder == t.folder; ++k) f.tracks.push_back(at(k));
+            y += kFolderH;
+            if (!f.collapsed)
+                for (int i : f.tracks) {
+                    if (rowsOut) rowsOut->push_back({{kind, i}, y, trackHeight(tracks[size_t(i)])});
+                    y += trackHeight(tracks[size_t(i)]);
+                }
+            if (foldersOut) foldersOut->push_back(std::move(f));
+        }
+    };
+    lay(TrackKind::Video, s->videoTracks, true);
+    if (divider) *divider = y;
+    y += kDividerH;
+    lay(TrackKind::Audio, s->audioTracks, false);
+    if (bottom) *bottom = y;
+}
+
 std::vector<TimelineWidget::Row> TimelineWidget::rows() const {
     std::vector<Row> out;
-    const Sequence* s = state_->sequence();
-    if (!s) return out;
-    int y = kRulerH - verticalScrollBar()->value() + captionLanesHeight();
-    for (int i = int(s->videoTracks.size()) - 1; i >= 0; --i) {
-        int h = trackHeight(s->videoTracks[size_t(i)]);
-        out.push_back({{TrackKind::Video, i}, y, h});
-        y += h;
-    }
-    y += kDividerH;
-    for (int i = 0; i < int(s->audioTracks.size()); ++i) {
-        int h = trackHeight(s->audioTracks[size_t(i)]);
-        out.push_back({{TrackKind::Audio, i}, y, h});
-        y += h;
-    }
+    layoutRows(&out, nullptr, nullptr, nullptr);
     return out;
 }
 
+std::vector<TimelineWidget::FolderRow> TimelineWidget::folderRows() const {
+    std::vector<FolderRow> out;
+    layoutRows(nullptr, &out, nullptr, nullptr);
+    return out;
+}
+
+std::optional<TimelineWidget::FolderRow> TimelineWidget::folderRowAt(int y) const {
+    for (const FolderRow& f : folderRows())
+        if (y >= f.y && y < f.y + f.h) return f;
+    return std::nullopt;
+}
+
 int TimelineWidget::contentHeight() const {
-    const Sequence* s = state_->sequence();
-    if (!s) return 0;
-    int h = kDividerH + 40 + captionLanesHeight();
-    for (const auto& t : s->videoTracks) h += trackHeight(t);
-    for (const auto& t : s->audioTracks) h += trackHeight(t);
-    return h;
+    if (!state_->sequence()) return 0;
+    int bottom = 0;
+    layoutRows(nullptr, nullptr, nullptr, &bottom);
+    return bottom - (kRulerH - verticalScrollBar()->value()) + 40;
 }
 
 int TimelineWidget::dividerY() const {
-    const Sequence* s = state_->sequence();
-    int y = kRulerH - verticalScrollBar()->value() + captionLanesHeight();
-    if (s)
-        for (const auto& t : s->videoTracks) y += trackHeight(t);
+    int y = 0;
+    layoutRows(nullptr, nullptr, &y, nullptr);
     return y;
+}
+
+QRect TimelineWidget::folderHeaderRect(TrackKind kind, const QString& folder) const {
+    for (const FolderRow& f : folderRows())
+        if (f.kind == kind && f.name == folder.toStdString()) return QRect(0, f.y, kHeaderW, f.h);
+    return {};
+}
+
+void TimelineWidget::toggleFolder(TrackKind kind, const QString& folder) {
+    const std::string name = folder.toStdString();
+    const Sequence* s = state_->sequence();
+    if (!s || edit::folderTracks(*s, kind, name).empty()) return;
+    const bool collapse = !edit::folderCollapsed(*s, kind, name);
+    state_->edit(collapse ? tr("Collapse Folder") : tr("Expand Folder"), [kind, name, collapse](Project&, Sequence& sq) {
+        edit::setFolderCollapsed(sq, kind, name, collapse);
+        return true;
+    });
+}
+
+bool TimelineWidget::trackShown(TrackRef ref) const {
+    for (const Row& r : rows())
+        if (r.ref == ref) return true;
+    return false;
 }
 
 std::optional<TimelineWidget::Row> TimelineWidget::rowAt(int y) const {
@@ -310,6 +368,21 @@ TimelineWidget::Hit TimelineWidget::hitTest(const QPoint& pos) const {
             if (h.kind != HitKind::CaptionLane) break;
             h.caption = -1;
         }
+        return h;
+    }
+    if (const auto f = folderRowAt(pos.y())) {
+        // A track folder's header: its arrow opens or closes it, its buttons act on all its tracks.
+        h.folder = f->name;
+        h.folderKind = f->kind;
+        if (pos.x() >= kHeaderW) return h;
+        h.kind = HitKind::Header;
+        const Row fake{{f->kind, 0}, f->y, f->h};
+        const bool video = f->kind == TrackKind::Video;
+        if (pos.x() < 26) h.button = HeaderButton::Folder;
+        else if (video && headerButtonRect(fake, HeaderButton::Visible).contains(pos)) h.button = HeaderButton::Visible;
+        else if (!video && headerButtonRect(fake, HeaderButton::Solo).contains(pos)) h.button = HeaderButton::Solo;
+        else if (!video && headerButtonRect(fake, HeaderButton::Mute).contains(pos)) h.button = HeaderButton::Mute;
+        else h.button = HeaderButton::Folder;  // the name opens or closes it too
         return h;
     }
     auto row = rowAt(pos.y());
@@ -468,6 +541,7 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
             }
         }
     }
+    for (const FolderRow& f : folderRows()) paintFolderRow(p, f, false);
     // Trim mode: a bracket on each side being trimmed, ']' on the outgoing clip's end, '[' on the incoming clip's start.
     if (trimSide_ >= 0) {
         p.setPen(QPen(QColor(255, 70, 70), 3));
@@ -1279,6 +1353,7 @@ void TimelineWidget::paintHeaders(QPainter& p, const std::vector<Row>& rs) {
         const Track* t = trackAt(*s, r.ref);
         QRect hr(0, r.y, kHeaderW, r.h);
         p.fillRect(hr, (r.ref.index % 2) ? theme::kPanelAlt : theme::kPanelAlt.darker(106));
+        if (!t->folder.empty()) p.fillRect(QRect(0, r.y, 3, r.h), QColor(0xd8, 0xa8, 0x5a));  // in a folder
         p.setPen(QColor(0, 0, 0, 120));
         p.drawLine(0, r.y + r.h - 1, kHeaderW, r.y + r.h - 1);
         bool video = r.ref.kind == TrackKind::Video;
@@ -1299,6 +1374,23 @@ void TimelineWidget::paintHeaders(QPainter& p, const std::vector<Row>& rs) {
             p.drawText(info, Qt::AlignLeft | Qt::AlignVCenter, detail);
         }
     }
+    for (const FolderRow& f : folderRows()) {
+        paintFolderRow(p, f, true);
+        // Its buttons show the state of all its tracks (on when all are).
+        bool muted = !f.tracks.empty(), solo = !f.tracks.empty();
+        for (int i : f.tracks) {
+            const Track* t = trackAt(*s, {f.kind, i});
+            muted &= t->muted;
+            solo &= t->solo;
+        }
+        const Row fake{{f.kind, 0}, f.y, f.h};
+        if (f.kind == TrackKind::Video) {
+            button(headerButtonRect(fake, HeaderButton::Visible), muted ? QStringLiteral("—") : QStringLiteral("◉"), !muted, QColor(0x4a, 0x80, 0xc8));
+        } else {
+            button(headerButtonRect(fake, HeaderButton::Mute), QStringLiteral("M"), muted, QColor(0xc8, 0x46, 0x46));
+            button(headerButtonRect(fake, HeaderButton::Solo), QStringLiteral("S"), solo, QColor(0xd8, 0xc2, 0x3a));
+        }
+    }
     int dy = dividerY();
     p.fillRect(QRect(0, dy, kHeaderW, kDividerH), QColor(0x14, 0x15, 0x18));
     p.setPen(theme::kBorder);
@@ -1306,10 +1398,83 @@ void TimelineWidget::paintHeaders(QPainter& p, const std::vector<Row>& rs) {
     p.restore();
 }
 
+void TimelineWidget::folderMenu(QMenu& menu, TrackKind kind, const std::string& folder) {
+    const Sequence* s = state_->sequence();
+    if (!s) return;
+    const QString name = QString::fromStdString(folder);
+    menu.addAction(edit::folderCollapsed(*s, kind, folder) ? tr("Expand Folder") : tr("Collapse Folder"), this,
+                   [this, kind, name] { toggleFolder(kind, name); });
+    menu.addAction(tr("Rename Folder..."), this, [this, kind, folder, name] {
+        bool ok = false;
+        const QString to = QInputDialog::getText(this, tr("Rename Folder"), tr("Folder name:"), QLineEdit::Normal, name, &ok);
+        if (!ok || to.trimmed().isEmpty()) return;
+        state_->apply(tr("Rename Folder"), [kind, folder, to](Project&, Sequence& sq) {
+            return edit::renameFolder(sq, kind, folder, to.trimmed().toStdString());
+        });
+    });
+    menu.addAction(tr("Remove Folder (Keep Tracks)"), this, [this, kind, folder] {
+        state_->apply(tr("Remove Folder"), [kind, folder](Project&, Sequence& sq) {
+            std::vector<TrackRef> refs;
+            for (int i : edit::folderTracks(sq, kind, folder)) refs.push_back({kind, i});
+            return edit::setTrackFolder(sq, refs, {});
+        });
+    });
+}
+
+// A folder's row: in the header, its arrow and name; across the timeline, a band (with its tracks' clips in outline
+// while it is collapsed).
+void TimelineWidget::paintFolderRow(QPainter& p, const FolderRow& f, bool header) {
+    const Sequence* s = state_->sequence();
+    const QColor band(0x33, 0x2c, 0x22);
+    if (header) {
+        const QRect hr(0, f.y, kHeaderW, f.h);
+        p.fillRect(hr, band.lighter(115));
+        p.setPen(QColor(0xd8, 0xa8, 0x5a));
+        p.drawText(QRect(6, f.y, 18, f.h), Qt::AlignCenter, f.collapsed ? QStringLiteral("▸") : QStringLiteral("▾"));
+        p.setPen(theme::kText);
+        const QString label = tr("%1 (%2)").arg(QString::fromStdString(f.name)).arg(f.tracks.size());
+        p.drawText(QRect(26, f.y, kHeaderW - 30 - 3 * kBtn, f.h), Qt::AlignVCenter | Qt::AlignLeft,
+                   p.fontMetrics().elidedText(label, Qt::ElideRight, kHeaderW - 30 - 3 * kBtn));
+        p.setPen(QColor(0, 0, 0, 120));
+        p.drawLine(0, f.y + f.h - 1, kHeaderW, f.y + f.h - 1);
+        return;
+    }
+    const int W = viewport()->width();
+    p.fillRect(QRect(kHeaderW, f.y, W - kHeaderW, f.h), band);
+    if (f.collapsed && s)
+        for (int i : f.tracks)
+            for (const Clip& c : trackAt(*s, {f.kind, i})->clips) {
+                const int xs = std::max(kHeaderW, xForFrame(c.start)), xe = std::min(W, xForFrame(c.end()));
+                if (xe > xs) p.fillRect(QRect(xs, f.y + 5, xe - xs, f.h - 10), QColor(0xd8, 0xa8, 0x5a, 90));
+            }
+    p.setPen(QColor(0, 0, 0, 90));
+    p.drawLine(kHeaderW, f.y + f.h - 1, W, f.y + f.h - 1);
+}
+
 // ---------------------------------------------------------------------------
 // Mouse
 
 void TimelineWidget::handleHeaderClick(const Hit& hit) {
+    if (!hit.folder.empty()) {
+        const TrackKind kind = hit.folderKind;
+        const std::string name = hit.folder;
+        if (hit.button == HeaderButton::Folder) {
+            toggleFolder(kind, QString::fromStdString(name));
+            return;
+        }
+        if (hit.button == HeaderButton::None) return;
+        // Mute (or hide) and solo the folder's tracks together: on for all unless all are on already.
+        const bool solo = hit.button == HeaderButton::Solo;
+        state_->edit(solo ? tr("Solo Folder") : kind == TrackKind::Video ? tr("Toggle Folder Output") : tr("Mute Folder"),
+                     [kind, name, solo](Project&, Sequence& s) {
+                         const std::vector<int> members = edit::folderTracks(s, kind, name);
+                         bool all = true;
+                         for (int i : members) all &= solo ? trackAt(s, {kind, i})->solo : trackAt(s, {kind, i})->muted;
+                         for (int i : members) (solo ? trackAt(s, {kind, i})->solo : trackAt(s, {kind, i})->muted) = !all;
+                         return !members.empty();
+                     });
+        return;
+    }
     if (!hit.track) return;
     TrackRef ref = *hit.track;
     switch (hit.button) {
@@ -1957,9 +2122,35 @@ void TimelineWidget::contextMenuEvent(QContextMenuEvent* e) {
         menu.addAction(tr("Delete Transition"), this, [this, id] {
             state_->apply(tr("Delete Transition"), [id](Project&, Sequence& s) { return edit::removeTransition(s, id); });
         });
+    } else if (h.kind == HitKind::Header && !h.folder.empty()) {
+        folderMenu(menu, h.folderKind, h.folder);
     } else if (h.kind == HitKind::Header && h.track) {
         TrackRef ref = *h.track;
         bool video = ref.kind == TrackKind::Video;
+        // Track folders: into a new or existing folder, or out of one.
+        {
+            QMenu* folders = menu.addMenu(tr("Folder"));
+            folders->setObjectName(QStringLiteral("trackFolderMenu"));
+            const Sequence* s = state_->sequence();
+            const std::string current = trackAt(*s, ref)->folder;
+            auto moveTo = [this, ref](const std::string& name) {
+                state_->apply(name.empty() ? tr("Remove from Folder") : tr("Move to Folder"),
+                              [ref, name](Project&, Sequence& sq) { return edit::setTrackFolder(sq, {ref}, name); });
+            };
+            folders->addAction(tr("New Folder..."), this, [this, moveTo] {
+                bool ok = false;
+                const QString name = QInputDialog::getText(this, tr("New Folder"), tr("Folder name:"), QLineEdit::Normal, tr("Folder"), &ok);
+                if (ok && !name.trimmed().isEmpty()) moveTo(name.trimmed().toStdString());
+            });
+            std::vector<std::string> names;
+            for (const Track& t : video ? s->videoTracks : s->audioTracks)
+                if (!t.folder.empty() && t.folder != current && std::find(names.begin(), names.end(), t.folder) == names.end())
+                    names.push_back(t.folder);
+            for (const std::string& n : names)
+                folders->addAction(tr("Move to %1").arg(QString::fromStdString(n)), this, [moveTo, n] { moveTo(n); });
+            if (!current.empty()) folders->addAction(tr("Remove from Folder"), this, [moveTo] { moveTo({}); });
+            menu.addSeparator();
+        }
         menu.addAction(video ? tr("Add Video Track") : tr("Add Audio Track"), this, [this, ref] {
             state_->edit(tr("Add Track"), [ref](Project& p, Sequence& s) {
                 edit::addTrack(p, s, ref.kind);
