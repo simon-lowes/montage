@@ -691,3 +691,27 @@ All 15 items are in (October 2026). The near misses listed in the roadmap are th
     - Light Leak adding warm light over a plain dissolve;
     - Luma Wipe dark first, and bright first;
     - Clock Wipe's quadrants.
+- [x] Audio repair and creative effects (render/AudioFx, audio/AudioRepair):
+  - **De-Click** (a source effect): AR(32) prediction errors forwards and backwards, per 2048-sample block, in units of the block's median error.
+    - A click's core is where both are over the threshold (16x at sensitivity 0, 8x at 50, 4x at 100); cores closer than the longest click are one click.
+    - A click runs from the first sample before its core that the past cannot predict to the last one after it that the future cannot. A burst of crackle predicts itself inside, but not its own start and end.
+    - The edges then grow while the error stays over a third of the threshold, since crackle dies away rather than stops, plus a 2–3 sample margin. Clicks longer than Longest Click are left as part of the sound.
+    - Each is rebuilt by least-squares AR interpolation (Toeplitz normal equations, Cholesky) with a predictor fitted to 1024 samples either side.
+  - **De-Hum:** RBJ peaking cuts at the mains frequency and its harmonics, the same width in hertz at each.
+  - **Chorus and Flanger:** one modulated delay line with cubic interpolation and feedback, the right channel's sweep up to a quarter turn later.
+  - **Phaser:** first-order all-passes swept exponentially between Low and High, with feedback.
+  - **Tremolo / Auto-Pan:** sine, triangle or soft-edged square; auto-pan at constant power.
+  - **Saturation:** tanh, a biased tanh (DC blocked) or a hard clip, with first-order antiderivative anti-aliasing. The dry sound is delayed half a sample to line up with it, and the gain keeps a -12 dBFS peak where it was.
+  - **Stereo Width:** mid/side. Mono bass uses an LR4 crossover on the side, with the mid through the crossover's all-pass, so the two stay in phase.
+  - **Pitch Shift** (a source effect): a phase vocoder (2048-point frames, quarter-frame hop, identity phase locking) stretches by the ratio, then a windowed-sinc resampler (Blackman, 16 zero crossings, low-passed when compressing) brings it back. Frames are centred, so nothing is delayed.
+  - **Tests:**
+    - De-Hum: four hum components down over 25 dB, and 440 Hz and 1 kHz within 0.2 dB;
+    - De-Click: 40 clicks and scratches on a swelling chord all found, their error down 42 dB (scratches' tails included), every other sample identical, clean audio untouched; on the JFK clip, 80 clicks down 65 dB, with 4 false finds on the clean speech changing it by -35 dB;
+    - flanger: a still comb cancelling 500 Hz and ringing 1 kHz up to 1.5x with feedback;
+    - chorus: channels apart, and no change at zero mix;
+    - phaser: notches at 1000 tan 22.5° and tan 67.5° Hz;
+    - tremolo and auto-pan: gains at known phases, power kept;
+    - saturation: tape odd harmonics only, tube even harmonics, level held at 24 dB of drive, aliasing 26 dB below a plain clip;
+    - stereo width: mono, identity, double, and mono bass below 150 Hz;
+    - pitch shift: a 200 Hz harmonic tone to within 0.03 Hz at +4 and -5 semitones, level within 1 dB, onsets within 5 ms, an octave up through the mixer;
+    - all of them as clip effects in the mixer.

@@ -338,6 +338,13 @@ std::vector<EffectInfo> buildCatalog() {
 #ifndef MONTAGE_WITH_ONNXRUNTIME
     c.back().hidden = true;  // needs ONNX Runtime
 #endif
+    c.push_back({"declick", "De-Click", EffectCategory::AudioFilter, "Restoration",
+                 {pct("sensitivity", "Sensitivity", 0, 100, 50), num("max_ms", "Longest Click (ms)", 0.1, 10, 2, 0.1)},
+                 {}});
+    c.push_back({"dehum", "De-Hum", EffectCategory::AudioFilter, "Restoration",
+                 {choice("mains", "Mains", {"50 Hz", "60 Hz"}, 0), num("harmonics", "Harmonics", 1, 16, 6, 1),
+                  num("reduction_db", "Reduction (dB)", 0, 60, 30, 0.5), num("width_hz", "Notch Width (Hz)", 0.5, 10, 2, 0.1)},
+                 {}});
     c.push_back({"parametric_eq", "Parametric EQ", EffectCategory::AudioFilter, "EQ",
                  {num("low_hz", "Low Shelf (Hz)", 20, 1000, 100, 1), num("low_db", "Low Shelf (dB)", -24, 24, 0, 0.1),
                   num("b1_hz", "Band 1 (Hz)", 20, 20000, 250, 1), num("b1_db", "Band 1 (dB)", -24, 24, 0, 0.1),
@@ -372,6 +379,35 @@ std::vector<EffectInfo> buildCatalog() {
     c.push_back({"channels", "Channel Tools", EffectCategory::AudioFilter, "Channels",
                  {choice("mode", "Channels", {"Stereo", "Mono (Sum)", "Left to Both", "Right to Both", "Swap Left and Right"}, 0),
                   boolean("invert_l", "Invert Left Polarity"), boolean("invert_r", "Invert Right Polarity")},
+                 {}});
+    c.push_back({"stereo_width", "Stereo Width", EffectCategory::AudioFilter, "Channels",
+                 {pct("width", "Width", 0, 200, 100), num("bass_mono_hz", "Mono Bass Below (Hz)", 0, 500, 0, 1)},
+                 {}});
+    c.push_back({"chorus", "Chorus", EffectCategory::AudioFilter, "Modulation",
+                 {num("rate", "Rate (Hz)", 0.02, 5, 0.8, 0.01), num("depth_ms", "Depth (ms)", 0, 10, 3, 0.1),
+                  num("delay_ms", "Delay (ms)", 5, 40, 15, 0.1), pct("spread", "Stereo Spread", 0, 100, 100), pct("mix", "Mix", 0, 100, 50)},
+                 {}});
+    c.push_back({"flanger", "Flanger", EffectCategory::AudioFilter, "Modulation",
+                 {num("rate", "Rate (Hz)", 0.02, 5, 0.25, 0.01), num("depth_ms", "Depth (ms)", 0, 5, 2, 0.05),
+                  num("delay_ms", "Delay (ms)", 0.1, 10, 1, 0.05), pct("feedback", "Feedback", -95, 95, 50),
+                  pct("spread", "Stereo Spread", 0, 100, 50), pct("mix", "Mix", 0, 100, 50)},
+                 {}});
+    c.push_back({"phaser", "Phaser", EffectCategory::AudioFilter, "Modulation",
+                 {choice("stages", "Stages", {"4", "6", "8", "12"}, 0), num("low_hz", "Low (Hz)", 20, 5000, 300, 1),
+                  num("high_hz", "High (Hz)", 100, 16000, 3000, 1), num("rate", "Rate (Hz)", 0.02, 5, 0.4, 0.01),
+                  pct("feedback", "Feedback", -95, 95, 30), pct("spread", "Stereo Spread", 0, 100, 50), pct("mix", "Mix", 0, 100, 50)},
+                 {}});
+    c.push_back({"tremolo", "Tremolo / Auto-Pan", EffectCategory::AudioFilter, "Modulation",
+                 {choice("mode", "Mode", {"Tremolo", "Auto-Pan"}, 0), choice("shape", "Shape", {"Sine", "Triangle", "Square"}, 0),
+                  num("rate", "Rate (Hz)", 0.05, 20, 5, 0.01), pct("depth", "Depth", 0, 100, 50)},
+                 {}});
+    c.push_back({"saturation", "Saturation", EffectCategory::AudioFilter, "Distortion",
+                 {choice("type", "Type", {"Tape", "Tube", "Hard Clip"}, 0), num("drive_db", "Drive (dB)", 0, 36, 6, 0.1),
+                  pct("tone", "Tone", -100, 100, 0), pct("mix", "Mix", 0, 100, 100), num("output_db", "Output (dB)", -24, 24, 0, 0.1)},
+                 {}});
+    // Processed on the clip's whole source audio (audio/AudioRepair.h): no latency, and a fine shift.
+    c.push_back({"pitch_shift", "Pitch Shift", EffectCategory::AudioFilter, "Pitch",
+                 {num("semitones", "Semitones", -24, 24, 0, 1), num("cents", "Fine (cents)", -100, 100, 0, 1)},
                  {}});
     c.push_back({"highpass", "High-Pass Filter", EffectCategory::AudioFilter, "EQ",
                  {num("hz", "Cutoff (Hz)", 20, 2000, 80, 1)}, {}});

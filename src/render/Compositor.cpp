@@ -1114,6 +1114,12 @@ struct AudioMixer::State {
     fx::DeEsser deesser;
     fx::NoiseGate gate;
     fx::Reverb reverb;
+    fx::DeHum dehum;
+    fx::ModDelay modDelay;
+    fx::Phaser phaser;
+    fx::Tremolo tremolo;
+    fx::Saturator saturator;
+    fx::StereoWidth width;
     std::vector<double> lastParams;
     double env = 0;
     double gain = 1;
@@ -1293,6 +1299,27 @@ void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameT
         } else if (e.type == "reverb") {
             st->reverb.process(buf, frames, sr, e.p("size", lt, 50) / 100, e.p("damping", lt, 50) / 100, e.p("width", lt, 100) / 100,
                                e.p("mix", lt, 25) / 100);
+        } else if (e.type == "dehum") {
+            st->dehum.process(buf, frames, sr, e.p("mains", lt, 0) > 0.5 ? 60 : 50, int(std::lround(e.p("harmonics", lt, 6))),
+                              e.p("reduction_db", lt, 30), e.p("width_hz", lt, 2));
+        } else if (e.type == "chorus" || e.type == "flanger") {
+            const bool chorus = e.type == "chorus";
+            st->modDelay.process(buf, frames, sr, e.p("delay_ms", lt, chorus ? 15 : 1), e.p("depth_ms", lt, chorus ? 3 : 2),
+                                 e.p("rate", lt, chorus ? 0.8 : 0.25), chorus ? 0.0 : e.p("feedback", lt, 50) / 100,
+                                 e.p("spread", lt, chorus ? 100 : 50) / 100, e.p("mix", lt, 50) / 100);
+        } else if (e.type == "phaser") {
+            static const int kStages[4] = {4, 6, 8, 12};
+            st->phaser.process(buf, frames, sr, kStages[std::clamp(int(std::lround(e.p("stages", lt, 0))), 0, 3)], e.p("low_hz", lt, 300),
+                               e.p("high_hz", lt, 3000), e.p("rate", lt, 0.4), e.p("feedback", lt, 30) / 100, e.p("spread", lt, 50) / 100,
+                               e.p("mix", lt, 50) / 100);
+        } else if (e.type == "tremolo") {
+            st->tremolo.process(buf, frames, sr, e.p("rate", lt, 5), e.p("depth", lt, 50) / 100, int(std::lround(e.p("shape", lt, 0))),
+                                e.p("mode", lt, 0) > 0.5);
+        } else if (e.type == "saturation") {
+            st->saturator.process(buf, frames, sr, int(std::lround(e.p("type", lt, 0))), e.p("drive_db", lt, 6), e.p("tone", lt, 0) / 100,
+                                  e.p("mix", lt, 100) / 100, e.p("output_db", lt, 0));
+        } else if (e.type == "stereo_width") {
+            st->width.process(buf, frames, sr, e.p("width", lt, 100) / 100, e.p("bass_mono_hz", lt, 0));
         } else if (e.type == "channels") {
             fx::channelTools(buf, frames, int(e.p("mode", lt, 0)), e.p("invert_l", lt) > 0.5, e.p("invert_r", lt) > 0.5);
         } else if (e.type == "plugin") {

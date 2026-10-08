@@ -16,7 +16,8 @@
 
 namespace montage {
 
-// Effect types processed this way ("denoise", "voice_isolate", "enhance_speech").
+// Effect types processed this way ("denoise", "voice_isolate", "enhance_speech",
+// and "declick" and "pitch_shift" from AudioRepair.h).
 bool isSourceAudioEffect(const std::string& type);
 // True if this build includes the RNNoise voice model.
 bool hasVoiceIsolation();

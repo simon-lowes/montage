@@ -20,11 +20,14 @@ extern "C" {
 #include <rnnoise.h>
 #endif
 
+#include "AudioRepair.h"
 #include "media/SpeechEnhance.h"
 
 namespace montage {
 
-bool isSourceAudioEffect(const std::string& type) { return type == "denoise" || type == "voice_isolate" || type == "enhance_speech"; }
+bool isSourceAudioEffect(const std::string& type) {
+    return type == "denoise" || type == "voice_isolate" || type == "enhance_speech" || type == "declick" || type == "pitch_shift";
+}
 
 bool hasVoiceIsolation() {
 #ifdef MONTAGE_WITH_RNNOISE
@@ -328,6 +331,12 @@ AudioBufferPtr process(const AudioBufferPtr& source, const std::vector<Effect>& 
             ok = isolateVoice(*cur, *out, e.p("amount", 0, 100));
         } else if (e.type == "enhance_speech") {
             ok = enhanceSpeech(*cur, *out, e.p("amount", 0, 100), e.p("max_reduction_db", 0, 100), e.p("keep", 0) > 0.5);
+        } else if (e.type == "declick") {
+            declick(*cur, *out, e.p("sensitivity", 0, 50), e.p("max_ms", 0, 2));
+            ok = true;
+        } else if (e.type == "pitch_shift") {
+            pitchShift(*cur, *out, e.p("semitones", 0, 0) + e.p("cents", 0, 0) / 100);
+            ok = true;
         }
         if (ok) cur = out;
     }

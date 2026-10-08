@@ -13,6 +13,7 @@
 #include <fstream>
 #include <functional>
 #include <random>
+#include <complex>
 #include <sstream>
 #include <cstdio>
 
@@ -44,6 +45,7 @@
 #include "render/Retime.h"
 #include "render/FaceRefine.h"
 #include "render/AudioFx.h"
+#include "audio/AudioRepair.h"
 #include "render/AutoMix.h"
 #include "render/VideoDenoise.h"
 #include "render/VoiceMatch.h"
@@ -268,6 +270,27 @@ bool writeMonoWav(const std::string& path, const std::vector<float>& x, int rate
     return std::fclose(f) == 0;
 }
 
+// Amplitude of `hz` in channel `ch` of interleaved stereo, over samples [from, to).
+double toneLevel(const std::vector<float>& b, int ch, double hz, size_t from, size_t to = 0, int rate = 48000) {
+    if (!to) to = b.size() / 2;
+    std::complex<double> acc = 0;
+    for (size_t i = from; i < to; ++i) acc += double(b[i * 2 + size_t(ch)]) * std::polar(1.0, -2 * M_PI * hz * double(i) / rate);
+    return 2 * std::abs(acc) / double(to - from);
+}
+
+// The fundamental of a steady sound (mono, from channel 0), by autocorrelation.
+double pitchOf(const std::vector<float>& b, size_t from, size_t to, int rate = 48000) {
+    const int lo = rate / 1000, hi = rate / 60;
+    std::vector<double> r(size_t(hi) + 2, 0.0);
+    for (int lag = lo - 1; lag <= hi + 1; ++lag)
+        for (size_t i = from; i + size_t(lag) < to; ++i) r[size_t(lag)] += double(b[i * 2]) * b[(i + size_t(lag)) * 2];
+    int best = lo;
+    for (int lag = lo; lag <= hi; ++lag)
+        if (r[size_t(lag)] > r[size_t(best)]) best = lag;
+    const double a = r[size_t(best - 1)], c = r[size_t(best)], d = r[size_t(best + 1)];
+    return rate / (best + 0.5 * (a - d) / (a - 2 * c + d));
+}
+
 }  // namespace
 
 class TestMedia : public QObject {
@@ -469,6 +492,338 @@ private slots:
         mixer.mix(p, s, 12000, 4800, out.data());
         QVERIFY2(std::fabs(out[4000 * 2] - out[4000 * 2 + 1]) < 1e-5f && out[4000 * 2] > 0.4f,
                  qPrintable(QString("%1 %2").arg(out[4000 * 2]).arg(out[4000 * 2 + 1])));
+    }
+
+    void audioRepair() {
+        constexpr int sr = 48000;
+        // Amplitude of `hz` in channel `ch` of interleaved stereo, from sample `from` on.
+        auto level = [](const std::vector<float>& b, int ch, double hz, size_t from) {
+            std::complex<double> acc = 0;
+            const size_t n = b.size() / 2;
+            for (size_t i = from; i < n; ++i) acc += double(b[i * 2 + size_t(ch)]) * std::polar(1.0, -2 * M_PI * hz * double(i) / sr);
+            return 2 * std::abs(acc) / double(n - from);
+        };
+        // De-Hum: 50 Hz mains and its harmonics out of a 440 Hz and 1 kHz tone.
+        std::vector<float> b(size_t(sr) * 3 * 2);
+        const double hum[4][2] = {{50, 0.05}, {100, 0.03}, {150, 0.02}, {250, 0.015}};
+        for (size_t i = 0; i < b.size() / 2; ++i) {
+            const double t = double(i) / sr;
+            double v = 0.1 * std::sin(2 * M_PI * 440 * t) + 0.1 * std::sin(2 * M_PI * 1000 * t);
+            for (const auto& h : hum) v += h[1] * std::sin(2 * M_PI * h[0] * t);
+            b[i * 2] = b[i * 2 + 1] = float(v);
+        }
+        const auto withHum = b;
+        fx::DeHum dh;
+        dh.process(b.data(), sr * 3, sr, 50, 6, 30, 2);
+        for (const auto& h : hum) {
+            const double down = 20 * std::log10(level(b, 0, h[0], sr * 3 / 2) / level(withHum, 0, h[0], sr * 3 / 2));
+            QVERIFY2(down < -25, qPrintable(QString("%1 Hz: %2 dB").arg(h[0]).arg(down)));
+        }
+        for (double hz : {440.0, 1000.0}) {
+            const double kept = 20 * std::log10(level(b, 1, hz, sr * 3 / 2) / level(withHum, 1, hz, sr * 3 / 2));
+            QVERIFY2(std::fabs(kept) < 0.2, qPrintable(QString("%1 Hz: %2 dB").arg(hz).arg(kept)));
+        }
+
+        // De-Click: a chord that swells, with a little hiss, and 40 clicks of two kinds.
+        AudioBuffer clean;
+        clean.sampleRate = sr;
+        clean.samples.resize(size_t(sr) * 2 * 2);
+        std::mt19937 rng(7);
+        std::normal_distribution<double> hiss(0, 0.001);
+        for (size_t i = 0; i < clean.samples.size() / 2; ++i) {
+            const double t = double(i) / sr;
+            const double chord = std::sin(2 * M_PI * 220 * t) + 0.6 * std::sin(2 * M_PI * 330 * t) + 0.4 * std::sin(2 * M_PI * 495 * t) +
+                                 0.3 * std::sin(2 * M_PI * 660 * t);
+            for (int c = 0; c < 2; ++c) clean.samples[i * 2 + size_t(c)] = float(0.2 * chord * (0.6 + 0.4 * std::sin(2 * M_PI * 0.7 * t + c)) + hiss(rng));
+        }
+        AudioBuffer clicked = clean;
+        std::vector<int64_t> at;
+        int expected = 0;
+        for (int k = 0; k < 40; ++k) {
+            const int64_t t = 1000 + int64_t(k) * 2300 + int64_t(rng() % 500);
+            at.push_back(t);
+            const bool both = k % 2 == 0, burst = k % 3 == 0;
+            const float sign = rng() % 2 ? 1.0f : -1.0f;
+            for (int c = 0; c < (both ? 2 : 1); ++c) {
+                if (burst)  // a scratch: 0.3 ms of decaying crackle
+                    for (int j = 0; j < 15; ++j) clicked.samples[size_t(t + j) * 2 + size_t(c)] += sign * 0.3f * std::exp(-j / 5.0f) * (j % 2 ? -1.0f : 1.0f);
+                else
+                    clicked.samples[size_t(t) * 2 + size_t(c)] += sign * 0.4f;
+                ++expected;
+            }
+        }
+        AudioBuffer fixed;
+        int found = 0;
+        declick(clicked, fixed, 50, 2, &found);
+        QVERIFY2(found >= expected && found <= expected + 2, qPrintable(QString("%1 of %2").arg(found).arg(expected)));
+        // Round each click the error is gone (over 35 dB down; scratches' tails too); away from them nothing changed.
+        double before = 0, after = 0;
+        std::vector<bool> near(size_t(clean.frames()), false);
+        for (int64_t t : at)
+            for (int64_t j = t - 40; j < t + 60; ++j) {
+                near[size_t(j)] = true;
+                for (int c = 0; c < 2; ++c) {
+                    const size_t i = size_t(j) * 2 + size_t(c);
+                    before += std::pow(clicked.samples[i] - clean.samples[i], 2);
+                    after += std::pow(fixed.samples[i] - clean.samples[i], 2);
+                }
+            }
+        qInfo("chord: %d of %d clicks found, error %.1f dB", found, expected, 10 * std::log10(after / before));
+        QVERIFY2(10 * std::log10(after / before) < -35, qPrintable(QString::number(10 * std::log10(after / before))));
+        for (int64_t j = 0; j < clean.frames(); ++j)
+            if (!near[size_t(j)])
+                for (int c = 0; c < 2; ++c) QCOMPARE(fixed.samples[size_t(j) * 2 + size_t(c)], clicked.samples[size_t(j) * 2 + size_t(c)]);
+        // Clean audio is left alone.
+        AudioBuffer untouched;
+        declick(clean, untouched, 50, 2, &found);
+        QCOMPARE(found, 0);
+        QVERIFY(untouched.samples == clean.samples);
+
+        // On speech: clicks out of the JFK clip, and the speech itself barely touched.
+        std::string err;
+        AudioBufferPtr speech = decodeAudio(MONTAGE_TEST_DATA_DIR "/jfk.wav", sr, &err);
+        QVERIFY2(speech, err.c_str());
+        AudioBuffer jfkClicked = *speech;
+        std::vector<int64_t> jat;
+        for (int64_t t = sr / 2; t < speech->frames() - sr / 2; t += sr / 4) {
+            jat.push_back(t);
+            for (int c = 0; c < 2; ++c) jfkClicked.samples[size_t(t) * 2 + size_t(c)] += (t / (sr / 4)) % 2 ? 0.3f : -0.3f;
+        }
+        AudioBuffer jfkFixed, jfkClean;
+        declick(jfkClicked, jfkFixed, 50, 2, &found);
+        int falseAlarms = 0;
+        declick(*speech, jfkClean, 50, 2, &falseAlarms);
+        double cb = 0, ca = 0, sig = 0, changed = 0;
+        for (int64_t t : jat)
+            for (int64_t j = t - 40; j < t + 60; ++j) {
+                const size_t i = size_t(j) * 2;
+                cb += std::pow(jfkClicked.samples[i] - speech->samples[i], 2);
+                ca += std::pow(jfkFixed.samples[i] - speech->samples[i], 2);
+            }
+        for (size_t i = 0; i < speech->samples.size(); ++i) {
+            sig += std::pow(speech->samples[i], 2);
+            changed += std::pow(jfkClean.samples[i] - speech->samples[i], 2);
+        }
+        qInfo("jfk: %d found for %d clicks, %.1f dB, %d on clean speech, change %.1f dB", found, int(jat.size()) * 2,
+              10 * std::log10(ca / cb), falseAlarms, 10 * std::log10(changed / sig + 1e-30));
+        QVERIFY(found >= int(jat.size()) * 2 * 9 / 10 && falseAlarms <= 6);
+        QVERIFY2(10 * std::log10(ca / cb) < -15, qPrintable(QString::number(10 * std::log10(ca / cb))));
+        QVERIFY2(10 * std::log10(changed / sig + 1e-30) < -30, qPrintable(QString::number(10 * std::log10(changed / sig + 1e-30))));
+    }
+
+    void creativeAudioEffects() {
+        constexpr int sr = 48000;
+        auto tone = [](double hz, double amp) {
+            std::vector<float> b(size_t(sr) * 2);
+            for (int i = 0; i < sr; ++i) b[size_t(i) * 2] = b[size_t(i) * 2 + 1] = float(amp * std::sin(2 * M_PI * hz * i / sr));
+            return b;
+        };
+        auto db = [](double a, double b) { return 20 * std::log10(a / b); };
+        // A flanger held still is a comb: 1 ms at half mix cancels 500 Hz and passes 1 kHz;
+        // feedback makes 1 kHz ring up (to 1.5 times at 50 %).
+        {
+            fx::ModDelay fl;
+            auto b = tone(500, 0.2);
+            fl.process(b.data(), sr, sr, 1.0, 0, 0, 0, 0, 0.5);
+            QVERIFY2(db(toneLevel(b, 0, 500, sr / 2), 0.2) < -30, qPrintable(QString::number(db(toneLevel(b, 0, 500, sr / 2), 0.2))));
+            fx::ModDelay pass;
+            b = tone(1000, 0.2);
+            pass.process(b.data(), sr, sr, 1.0, 0, 0, 0, 0, 0.5);
+            QVERIFY(std::fabs(db(toneLevel(b, 0, 1000, sr / 2), 0.2)) < 0.3);
+            fx::ModDelay ring;
+            b = tone(1000, 0.2);
+            ring.process(b.data(), sr, sr, 1.0, 0, 0, 0.5, 0, 0.5);
+            QVERIFY2(std::fabs(db(toneLevel(b, 0, 1000, sr / 2), 0.3)) < 0.3, qPrintable(QString::number(toneLevel(b, 0, 1000, sr / 2))));
+        }
+        // Chorus: the copy wanders in time, the two sides differently; with no mix nothing changes.
+        {
+            fx::ModDelay ch;
+            auto b = tone(1000, 0.2);
+            ch.process(b.data(), sr, sr, 15, 3, 0.8, 0, 1, 0.5);
+            double diff = 0, energy = 0;
+            for (size_t i = size_t(sr) / 2; i < size_t(sr); ++i) diff += std::fabs(b[i * 2] - b[i * 2 + 1]), energy += std::fabs(b[i * 2]);
+            QVERIFY(diff > energy * 0.1);
+            fx::ModDelay dry;
+            b = tone(1000, 0.2);
+            const auto before = b;
+            dry.process(b.data(), sr, sr, 15, 3, 0.8, 0, 1, 0);
+            QCOMPARE(b, before);
+        }
+        // Phaser held at 1 kHz: four all-passes there cancel 414 Hz and 2414 Hz (tan 22.5° and 67.5°) and pass 1 kHz.
+        {
+            for (double hz : {1000 * std::tan(M_PI / 8), 1000 * std::tan(3 * M_PI / 8)}) {
+                fx::Phaser ph;
+                auto b = tone(hz, 0.2);
+                ph.process(b.data(), sr, sr, 4, 1000, 3000, 0, 0, 0, 0.5);
+                QVERIFY2(db(toneLevel(b, 0, hz, sr / 2), 0.2) < -30, qPrintable(QString("%1 Hz %2 dB").arg(hz).arg(db(toneLevel(b, 0, hz, sr / 2), 0.2))));
+            }
+            fx::Phaser ph;
+            auto b = tone(1000, 0.2);
+            ph.process(b.data(), sr, sr, 4, 1000, 3000, 0, 0, 0, 0.5);
+            QVERIFY(std::fabs(db(toneLevel(b, 0, 1000, sr / 2), 0.2)) < 0.3);
+        }
+        // Tremolo at 4 Hz, full depth: silent at three quarters of each cycle, full at a quarter. Auto-pan keeps the power.
+        {
+            fx::Tremolo tr;
+            std::vector<float> b(size_t(sr) * 2, 0.5f);
+            tr.process(b.data(), sr, sr, 4, 1, 0, false);
+            QVERIFY(std::fabs(b[size_t(sr / 16) * 2] - 0.5f) < 1e-3f && std::fabs(b[size_t(3 * sr / 16) * 2]) < 1e-3f);
+            fx::Tremolo pan;
+            std::vector<float> c(size_t(sr) * 2, 0.5f);
+            pan.process(c.data(), sr, sr, 4, 1, 0, true);
+            QVERIFY(std::fabs(c[size_t(sr / 16) * 2]) < 1e-3f && c[size_t(sr / 16) * 2 + 1] > 0.7f);
+            for (size_t i = 0; i < c.size(); i += 2) QVERIFY(std::fabs(c[i] * c[i] + c[i + 1] * c[i + 1] - 0.5f) < 1e-4f);
+        }
+        // Saturation: tape adds odd harmonics only, tube even ones too; the level of -12 dBFS holds.
+        {
+            fx::Saturator tape;
+            auto b = tone(1000, 0.5);
+            tape.process(b.data(), sr, sr, 0, 18, 0, 1, 0);
+            const double f1 = toneLevel(b, 0, 1000, sr / 2);
+            QVERIFY2(db(toneLevel(b, 0, 3000, sr / 2), f1) > -30, qPrintable(QString::number(db(toneLevel(b, 0, 3000, sr / 2), f1))));
+            QVERIFY2(db(toneLevel(b, 0, 2000, sr / 2), f1) < -80, qPrintable(QString::number(db(toneLevel(b, 0, 2000, sr / 2), f1))));
+            fx::Saturator tube;
+            b = tone(1000, 0.5);
+            tube.process(b.data(), sr, sr, 1, 18, 0, 1, 0);
+            QVERIFY2(db(toneLevel(b, 0, 2000, sr / 2), toneLevel(b, 0, 1000, sr / 2)) > -40,
+                     qPrintable(QString::number(db(toneLevel(b, 0, 2000, sr / 2), toneLevel(b, 0, 1000, sr / 2)))));
+            fx::Saturator level;
+            b = tone(1000, 0.25);
+            level.process(b.data(), sr, sr, 0, 24, 0, 1, 0);
+            float peak = 0;
+            for (size_t i = size_t(sr); i < b.size(); i += 2) peak = std::max(peak, std::fabs(b[i]));
+            QVERIFY2(std::fabs(peak - 0.25f) < 0.0125f, qPrintable(QString::number(peak)));
+            // Anti-aliasing: a hard-clipped 5 kHz tone's 9th harmonic (45 kHz) folds to 3 kHz; less of it than a plain clip.
+            fx::Saturator clip;
+            b = tone(5000, 0.9);
+            auto naive = b;
+            clip.process(b.data(), sr, sr, 2, 24, 0, 1, 0);
+            for (float& v : naive) v = std::clamp(v * 15.85f, -1.0f, 1.0f);
+            const double alias = db(toneLevel(b, 0, 3000, sr / 2), toneLevel(b, 0, 5000, sr / 2));
+            const double plain = db(toneLevel(naive, 0, 3000, sr / 2), toneLevel(naive, 0, 5000, sr / 2));
+            qInfo("hard clip: 3 kHz alias at %.1f dB, %.1f dB plain", alias, plain);
+            QVERIFY2(alias < plain - 15, qPrintable(QString("%1 against %2").arg(alias).arg(plain)));
+        }
+        // Stereo width: none is mono, double makes a left-only sound 1.5 and -0.5, bass can be made mono.
+        {
+            std::vector<float> lr{0.4f, 0.0f, -0.2f, 0.1f};
+            auto b = lr;
+            fx::StereoWidth w0;
+            w0.process(b.data(), 2, sr, 0, 0);
+            QVERIFY(b[0] == b[1] && b[2] == b[3]);
+            b = lr;
+            fx::StereoWidth w1;
+            w1.process(b.data(), 2, sr, 1, 0);
+            for (size_t i = 0; i < b.size(); ++i) QVERIFY(std::fabs(b[i] - lr[i]) < 1e-7f);
+            b = {1.0f, 0.0f};
+            fx::StereoWidth w2;
+            w2.process(b.data(), 1, sr, 2, 0);
+            QVERIFY(std::fabs(b[0] - 1.5f) < 1e-6f && std::fabs(b[1] + 0.5f) < 1e-6f);
+            for (double hz : {50.0, 2000.0}) {
+                std::vector<float> left(size_t(sr) * 2, 0.0f);
+                for (int i = 0; i < sr; ++i) left[size_t(i) * 2] = float(0.3 * std::sin(2 * M_PI * hz * i / sr));
+                fx::StereoWidth bass;
+                bass.process(left.data(), sr, sr, 1, 150);
+                const double l = toneLevel(left, 0, hz, sr / 2), r = toneLevel(left, 1, hz, sr / 2);
+                if (hz < 100) QVERIFY2(std::fabs(db(l, r)) < 0.5, qPrintable(QString("%1 %2").arg(l).arg(r)));
+                else QVERIFY2(r < l * 0.03, qPrintable(QString("%1 %2").arg(l).arg(r)));
+            }
+        }
+        // In the mixer, as clip effects.
+        const std::string wav = path("creative.wav");
+        std::vector<float> mono(static_cast<size_t>(sr));
+        for (int i = 0; i < sr; ++i) mono[size_t(i)] = float(0.3 * std::sin(2 * M_PI * 440 * i / sr));
+        QVERIFY(writeMonoWav(wav, mono, sr));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        MediaItem m = probeOrFail(p, wav);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Clip& c = s.audioTracks[0].clips.front();
+        for (const char* type : {"dehum", "chorus", "flanger", "phaser", "tremolo", "saturation", "stereo_width"}) {
+            QVERIFY2(findEffectInfo(type), type);
+            c.effects.push_back(makeEffect(p, type));
+        }
+        AudioMixer mixer;
+        std::vector<float> out(4800 * 2);
+        mixer.mix(p, s, 12000, 4800, out.data());
+        double energy = 0;
+        for (float v : out) {
+            QVERIFY(std::isfinite(v));
+            energy += double(v) * v;
+        }
+        QVERIFY(energy > 1);
+    }
+
+    void pitchShifting() {
+        constexpr int sr = 48000;
+        // A 200 Hz tone with eight harmonics: up 4 semitones and down 5, the fundamental moves; length and level stay.
+        AudioBuffer in;
+        in.sampleRate = sr;
+        in.samples.resize(size_t(sr) * 2 * 2);
+        for (size_t i = 0; i < in.samples.size() / 2; ++i) {
+            double v = 0;
+            for (int k = 1; k <= 8; ++k) v += 0.15 / k * std::sin(2 * M_PI * 200 * k * double(i) / sr);
+            in.samples[i * 2] = in.samples[i * 2 + 1] = float(v);
+        }
+        auto rms = [](const AudioBuffer& b, size_t from, size_t to) {
+            double s = 0;
+            for (size_t i = from; i < to; ++i) s += double(b.samples[i * 2]) * b.samples[i * 2];
+            return std::sqrt(s / double(to - from));
+        };
+        for (double st : {4.0, -5.0}) {
+            AudioBuffer out;
+            pitchShift(in, out, st);
+            QCOMPARE(out.frames(), in.frames());
+            const double f = pitchOf(out.samples, sr / 2, sr / 2 + sr / 4), want = 200 * std::pow(2.0, st / 12);
+            qInfo("%+.0f semitones: %.2f Hz (wanted %.2f)", st, f, want);
+            QVERIFY2(std::fabs(f / want - 1) < 0.005, qPrintable(QString("%1 Hz, wanted %2").arg(f).arg(want)));
+            const double change = 20 * std::log10(rms(out, sr / 2, sr * 3 / 2) / rms(in, sr / 2, sr * 3 / 2));
+            QVERIFY2(std::fabs(change) < 1, qPrintable(QString::number(change)));
+        }
+        AudioBuffer same;
+        pitchShift(in, same, 0);
+        QVERIFY(same.samples == in.samples);
+        // Timing holds: a note starting half a second in still starts there.
+        AudioBuffer burst;
+        burst.sampleRate = sr;
+        burst.samples.assign(size_t(sr) * 2 * 2, 0.0f);
+        for (size_t i = size_t(sr) / 2; i < size_t(sr) * 3 / 2; ++i) burst.samples[i * 2] = burst.samples[i * 2 + 1] = float(0.3 * std::sin(2 * M_PI * 330 * double(i) / sr));
+        for (double st : {7.0, -7.0}) {
+            AudioBuffer out;
+            pitchShift(burst, out, st);
+            // The middle of the rise, on a 5 ms envelope.
+            size_t onset = 0;
+            double env = 0;
+            for (size_t i = 0; i < size_t(out.frames()); ++i) {
+                env = env * 0.996 + std::fabs(out.samples[i * 2]) * 0.004;
+                if (env > 0.3 * 2 / M_PI / 2) {
+                    onset = i;
+                    break;
+                }
+            }
+            const double ms = (double(onset) - sr / 2) * 1000 / sr;
+            qInfo("%+.0f semitones: onset %.1f ms off", st, ms);
+            QVERIFY2(std::fabs(ms) < 10, qPrintable(QString("%1 ms").arg(ms)));
+        }
+        // Through the mixer: an octave up.
+        const std::string wav = path("pitch.wav");
+        std::vector<float> mono(size_t(sr) * 2);
+        for (size_t i = 0; i < mono.size(); ++i) mono[i] = float(0.3 * std::sin(2 * M_PI * 440 * double(i) / sr));
+        QVERIFY(writeMonoWav(wav, mono, sr));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        MediaItem m = probeOrFail(p, wav);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Effect up = makeEffect(p, "pitch_shift");
+        up.params["semitones"] = 12.0;
+        s.audioTracks[0].clips.front().effects.push_back(up);
+        AudioMixer mixer;
+        std::vector<float> out(9600 * 2);
+        mixer.mix(p, s, 24000, 9600, out.data());
+        QVERIFY2(toneLevel(out, 0, 880, 0) > 10 * toneLevel(out, 0, 440, 0),
+                 qPrintable(QString("%1 %2").arg(toneLevel(out, 0, 880, 0)).arg(toneLevel(out, 0, 440, 0))));
     }
 
     void liveLoudness() {

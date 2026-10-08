@@ -1,7 +1,9 @@
 // Montage — built-in audio effects past EQ3, compressor, limiter and delay:
 // a five-band parametric EQ, a de-esser, a noise gate, a reverb (Freeverb's
-// design), and channel tools (fill left or right, mono, swap, polarity). All
-// work in place on interleaved stereo and keep their state between blocks.
+// design), channel tools (fill left or right, mono, swap, polarity), a
+// de-hummer, chorus and flanger, a phaser, tremolo and auto-pan, saturation
+// and stereo width. All work in place on interleaved stereo and keep their
+// state between blocks.
 #pragma once
 
 #include <array>
@@ -90,6 +92,81 @@ private:
     double sr_ = 0;
     std::array<std::array<Comb, 8>, 2> combs_;
     std::array<std::array<AllPass, 4>, 2> allpasses_;
+};
+
+// Takes out mains hum: a narrow notch at the mains frequency and at each of
+// its first `harmonics` multiples, `widthHz` wide, `reductionDb` deep.
+class DeHum {
+public:
+    void process(float* buf, int frames, double sr, double mainsHz, int harmonics, double reductionDb, double widthHz);
+
+private:
+    std::array<Biquad, 16> notches_;
+    int count_ = 0;
+    double sr_ = 0, hz_ = 0, db_ = 0, width_ = 0;
+};
+
+// Chorus and flanger: the sound mixed with a copy delayed by `delayMs`, the
+// delay swept `depthMs` either way by a sine at `rateHz`. `feedback` (-0.95..0.95)
+// feeds the delayed copy back in (a flanger's resonance); `spread` (0..1) puts
+// the right channel's sweep up to a quarter turn after the left's.
+class ModDelay {
+public:
+    void process(float* buf, int frames, double sr, double delayMs, double depthMs, double rateHz, double feedback, double spread,
+                 double mix);
+
+private:
+    std::vector<float> line_;  // interleaved stereo
+    size_t pos_ = 0;
+    double phase_ = 0, sr_ = 0;
+};
+
+// Phaser: `stages` first-order all-passes whose corner sweeps from `lowHz` to
+// `highHz` and back at `rateHz`, mixed with the dry sound so the notches move.
+class Phaser {
+public:
+    void process(float* buf, int frames, double sr, int stages, double lowHz, double highHz, double rateHz, double feedback,
+                 double spread, double mix);
+
+private:
+    float state_[2][12] = {};
+    float last_[2] = {0, 0};
+    double phase_ = 0;
+};
+
+// Tremolo (level) or auto-pan (position) moved by an LFO: shape 0 sine,
+// 1 triangle, 2 square (with soft edges, so it does not click).
+class Tremolo {
+public:
+    void process(float* buf, int frames, double sr, double rateHz, double depth, int shape, bool pan);
+
+private:
+    double phase_ = 0;
+};
+
+// Saturation: type 0 tape (tanh), 1 tube (asymmetric, so even harmonics too),
+// 2 hard clip. Antiderivative anti-aliasing keeps the harmonics a waveshaper
+// makes above Nyquist from folding back down. The level of a -12 dBFS sound is
+// kept as the drive goes up; `tone` (-1..1) darkens or brightens what comes out.
+class Saturator {
+public:
+    void process(float* buf, int frames, double sr, int type, double driveDb, double tone, double mix, double outputDb);
+
+private:
+    double prev_[2] = {0, 0}, prevDry_[2] = {0, 0};
+    Biquad dc_, tone_;
+    double sr_ = 0, toneSet_ = -9;
+};
+
+// Stereo width (mid/side): 0 mono, 1 as recorded, 2 twice as wide. With
+// `bassMonoHz` > 0 the sides below it are taken out, as for vinyl or clubs.
+class StereoWidth {
+public:
+    void process(float* buf, int frames, double sr, double width, double bassMonoHz);
+
+private:
+    Biquad low_[2], high_[2];  // LR4 crossover: mid on channel 0, side on 1
+    double hz_ = -1, sr_ = 0;
 };
 
 // mode: 0 stereo, 1 mono (the average), 2 left to both, 3 right to both, 4 swap.
