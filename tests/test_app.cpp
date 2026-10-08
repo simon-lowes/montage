@@ -1393,6 +1393,89 @@ private slots:
         QVERIFY(isSourceAudioEffect("enhance_speech"));
     }
 
+    void beatMarkersAndFittingMusic() {
+        // A 128 BPM song: kick on each bar, a tick on every beat, chords changing by bar.
+        const int rate = 48000;
+        const double beat = 60.0 / 128, bar = 4 * beat, lead = 0.5;
+        const std::vector<int> barChord = {0, 0, 1, 2, 1, 2, 0, 3, 0, 3, 1, 2, 1, 2, 0, 3, 0, 3, 3, 3};
+        const std::vector<std::vector<double>> hz = {{261.6, 329.6, 392.0}, {220.0, 261.6, 329.6}, {174.6, 220.0, 261.6}, {196.0, 246.9, 293.7}};
+        const int bars = int(barChord.size());
+        const double total = lead + bars * bar + 1.0;
+        std::vector<float> x(size_t(total * rate), 0.0f);
+        unsigned seed = 3;
+        for (int b = 0; b < bars; ++b) {
+            for (int k = 0; k < 4; ++k) {
+                const size_t i0 = size_t((lead + b * bar + k * beat) * rate);
+                for (size_t i = 0; i < size_t(0.03 * rate); ++i) {
+                    seed = seed * 1664525u + 1013904223u;
+                    x[i0 + i] += float((double(seed >> 8) / (1 << 24) - 0.5) * 0.3 * std::exp(-double(i) / (0.008 * rate)));
+                }
+                if (k == 0)
+                    for (size_t i = 0; i < size_t(0.2 * rate); ++i)
+                        x[i0 + i] += float(0.6 * std::sin(2 * M_PI * 55 * double(i) / rate) * std::exp(-double(i) / (0.06 * rate)));
+            }
+            for (size_t i = 0; i < size_t(bar * rate); ++i) {
+                const double t = lead + b * bar + double(i) / rate;
+                double v = 0;
+                for (double f : hz[size_t(barChord[size_t(b)])]) v += std::sin(2 * M_PI * f * t);
+                x[size_t((lead + b * bar) * rate) + i] += float(0.06 * v);
+            }
+        }
+        const QString wav = dir_.path() + "/song.wav";
+        {
+            WavWriter w;
+            QVERIFY(w.open(wav, rate, 1));
+            w.write(x.data(), qint64(x.size()));
+            QVERIFY(w.close());
+        }
+        state()->newProject();
+        const auto ids = state()->importFiles({wav});
+        QCOMPARE(ids.size(), size_t(1));
+        state()->apply("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        });
+        const Sequence* s = state()->sequence();
+        const double fps = s->fpsValue();
+        QCOMPARE(s->audioTracks[0].clips.size(), size_t(1));
+        const Id clip = s->audioTracks[0].clips[0].id;
+        state()->setSelection({clip}, false);
+
+        // Bar markers on every bar, each on a bar of the music; beat markers four times as many.
+        QVERIFY(win_->findChild<QAction*>("addBarMarkers") && win_->findChild<QAction*>("fitMusic"));
+        // (The chords stopping dead at the end make one more hit: a final bar, as songs often end.)
+        const int barMarks = win_->addBeatMarkers(false);
+        QVERIFY2(barMarks == bars || barMarks == bars + 1, qPrintable(QString::number(barMarks)));
+        for (const Marker& m : state()->sequence()->markers) {
+            QVERIFY(QString::fromStdString(m.name).startsWith("Bar "));
+            QVERIFY2(std::fabs(std::remainder(m.t / fps - lead, bar)) <= 0.5 / fps + 0.01, qPrintable(QString::number(m.t)));
+        }
+        QCOMPARE(state()->sequence()->markers.front().name, std::string("Bar 1"));
+        QVERIFY(win_->addBeatMarkers(true) >= 4 * bars - 1);
+        QVERIFY(state()->sequence()->markers.size() >= size_t(4 * bars - 1));  // the bar markers were replaced
+        QCOMPARE(state()->sequence()->markers[1].name, std::string("1.2"));
+
+        // Fit to 30 s: pieces back to back, crossfaded, each join a whole number of bars apart in the music.
+        QVERIFY(win_->fitMusicToLength(FrameTime(30 * fps)));
+        s = state()->sequence();
+        const auto& pieces = s->audioTracks[0].clips;
+        QVERIFY(pieces.size() >= 2);
+        const FrameTime length = pieces.back().end() - pieces.front().start;
+        QVERIFY2(std::fabs(length / fps - 30) <= bar / 2 + 1.0 / fps, qPrintable(QString::number(length / fps)));
+        QCOMPARE(s->audioTracks[0].transitions.size(), pieces.size() - 1);
+        for (size_t i = 0; i + 1 < pieces.size(); ++i) {
+            QCOMPARE(pieces[i + 1].start, pieces[i].end());
+            const double cut = (pieces[i].sourceIn + double(pieces[i].duration)) / fps, resume = pieces[i + 1].sourceIn / fps;
+            QVERIFY2(std::fabs(std::remainder(resume - cut, bar)) < 0.02, qPrintable(QString("%1 -> %2").arg(cut).arg(resume)));
+            QVERIFY(std::fabs(std::remainder(cut - lead, bar)) < 0.03 + 0.5 / fps);
+        }
+        QCOMPARE(pieces.front().sourceIn, 0.0);
+        // One undo puts the clip back whole.
+        state()->undo();
+        QCOMPARE(state()->sequence()->audioTracks[0].clips.size(), size_t(1));
+        QCOMPARE(state()->sequence()->audioTracks[0].clips[0].id, clip);
+        state()->newProject();
+    }
+
     void buildACutFromAScript() {
         state()->newProject();
         const Id before = state()->sequence()->id;

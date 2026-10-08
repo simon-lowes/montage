@@ -15,6 +15,7 @@
 #include <QEventLoop>
 #include <QFormLayout>
 #include <QDockWidget>
+#include <QDoubleSpinBox>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -78,6 +79,7 @@
 #include "render/ClipAnalysis.h"
 #include "render/RenderCache.h"
 #include "render/Compositor.h"
+#include "render/MusicEdit.h"
 #include "render/Exporter.h"
 #include "render/Processing.h"
 
@@ -479,6 +481,9 @@ void MainWindow::buildMenus() {
     add(clipM, tr("Replace with Source Clip"), QKeySequence(), [this] { replaceWithSource(); })
         ->setObjectName(QStringLiteral("replaceWithSource"));
     add(clipM, tr("Fit to Fill"), QKeySequence(), [this] { fitToFill(); })->setObjectName(QStringLiteral("fitToFill"));
+    add(clipM, tr("Add Bar Markers"), QKeySequence(), [this] { addBeatMarkers(false); })->setObjectName(QStringLiteral("addBarMarkers"));
+    add(clipM, tr("Add Beat Markers"), QKeySequence(), [this] { addBeatMarkers(true); })->setObjectName(QStringLiteral("addBeatMarkers"));
+    add(clipM, tr("Fit Music to Length…"), QKeySequence(), [this] { fitMusicDialog(); })->setObjectName(QStringLiteral("fitMusic"));
     add(clipM, tr("S&ynchronize by Audio"), QKeySequence(), [this] { syncByAudio(); });
     clipM->addSeparator();
     add(clipM, tr("&Insert from Source"), QKeySequence(Qt::Key_Comma), [this] { state_->insertFromSource(false); });
@@ -1522,6 +1527,113 @@ const Clip* MainWindow::clipForCommand() const {
     for (int i = int(s->videoTracks.size()) - 1; i >= 0; --i)
         if (const Clip* c = edit::clipAt(*s, {TrackKind::Video, i}, t)) return c;
     return nullptr;
+}
+
+const Clip* MainWindow::musicClip() const {
+    const Sequence* s = state_->sequence();
+    if (!s) return nullptr;
+    for (Id id : state_->selectedClips())
+        if (auto loc = edit::locate(*s, id); loc && loc->track.kind == TrackKind::Audio) return edit::clipById(*s, id);
+    const FrameTime t = state_->playhead();
+    for (int i = int(s->audioTracks.size()) - 1; i >= 0; --i)
+        if (const Clip* c = edit::clipAt(*s, {TrackKind::Audio, i}, t)) return c;
+    return nullptr;
+}
+
+int MainWindow::addBeatMarkers(bool everyBeat) {
+    const Clip* c = musicClip();
+    if (!c) {
+        state_->message(tr("Select a music clip"));
+        return 0;
+    }
+    const Id clip = c->id, media = c->mediaId;
+    auto project = std::make_shared<const Project>(state_->project());
+    BeatGrid grid;
+    if (!runWithProgress(this, state_, tr("Finding the beat..."), [&, project](const auto&, const auto* cancel, std::string* err) {
+            return mediaBeats(*project, media, grid, cancel, err);
+        }))
+        return 0;
+    int n = 0;
+    state_->edit(everyBeat ? tr("Add Beat Markers") : tr("Add Bar Markers"), [&](Project&, Sequence& s) {
+        const Clip* k = edit::clipById(s, clip);
+        if (!k) return false;
+        n = montage::addBeatMarkers(s, *k, grid, everyBeat);
+        return n > 0;
+    });
+    state_->message(tr("%n marker(s) at %1 BPM", "", n).arg(grid.tempo, 0, 'f', 1), 5000);
+    return n;
+}
+
+bool MainWindow::fitMusicToLength(FrameTime target) {
+    const Clip* c = musicClip();
+    const Sequence* s = state_->sequence();
+    if (!c || !s) {
+        state_->message(tr("Select a music clip"));
+        return false;
+    }
+    const Id clip = c->id, seqId = s->id;
+    auto project = std::make_shared<const Project>(state_->project());
+    MusicFit fit;
+    if (!runWithProgress(this, state_, tr("Listening to the music..."), [&, project](const auto&, const auto* cancel, std::string* err) {
+            const Sequence* sq = project->findSequence(seqId);
+            const Clip* k = sq ? edit::clipById(*sq, clip) : nullptr;
+            return k && analyzeMusicFit(*project, *sq, *k, target, fit, cancel, err);
+        }))
+        return false;
+    QString error;
+    const bool ok = state_->apply(tr("Fit Music to Length"), [&](Project& p, Sequence& sq) {
+        edit::Result r = applyMusicFit(p, sq, clip, fit);
+        if (!r.ok) error = QString::fromStdString(r.error);
+        return r;
+    });
+    if (!ok) {
+        if (!error.isEmpty()) state_->message(error, 5000);
+        return false;
+    }
+    state_->message(tr("The music now lasts %1 s (%n join(s))", "", int(fit.segments.size()) - 1).arg(fit.duration, 0, 'f', 1), 6000);
+    return true;
+}
+
+void MainWindow::fitMusicDialog() {
+    const Sequence* s = state_->sequence();
+    const Clip* c = musicClip();
+    if (!s || !c) {
+        state_->message(tr("Select a music clip"));
+        return;
+    }
+    const double fps = s->fpsValue();
+    // Suggested lengths: In to Out, the picture, and the clip's own.
+    FrameTime picture = 0;
+    for (const Track& t : s->videoTracks)
+        for (const Clip& k : t.clips) picture = std::max(picture, k.end());
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Fit Music to Length"));
+    auto* lay = new QVBoxLayout(&dlg);
+    auto* intro = new QLabel(tr("Shortens or lengthens \"%1\" by whole bars where the music repeats itself, keeping its "
+                                "start and its ending. Joins are crossfaded on the beat.").arg(QString::fromStdString(c->name)), &dlg);
+    intro->setWordWrap(true);
+    lay->addWidget(intro);
+    auto* form = new QFormLayout;
+    auto* length = new QDoubleSpinBox(&dlg);
+    length->setObjectName(QStringLiteral("fitMusicLength"));
+    length->setRange(5, 3600);
+    length->setDecimals(2);
+    length->setSuffix(tr(" s"));
+    auto* preset = new QComboBox(&dlg);
+    if (s->inPoint >= 0 && s->outPoint > s->inPoint) preset->addItem(tr("In to Out"), double(s->outPoint - s->inPoint + 1) / fps);
+    if (picture > 0) preset->addItem(tr("The picture"), double(picture - c->start) / fps);
+    for (int secs : {15, 30, 60}) preset->addItem(tr("%1 s").arg(secs), double(secs));
+    connect(preset, &QComboBox::currentIndexChanged, &dlg, [preset, length](int i) { length->setValue(preset->itemData(i).toDouble()); });
+    length->setValue(preset->count() ? preset->itemData(0).toDouble() : double(c->duration) / fps);
+    form->addRow(tr("Length:"), length);
+    form->addRow(tr("Use:"), preset);
+    lay->addLayout(form);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    lay->addWidget(buttons);
+    if (dlg.exec() != QDialog::Accepted) return;
+    fitMusicToLength(FrameTime(std::llround(length->value() * fps)));
 }
 
 bool MainWindow::addFrameHold() {

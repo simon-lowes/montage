@@ -26,6 +26,7 @@
 #include "core/ScriptCut.h"
 #include "core/TranscriptEdit.h"
 #include "media/SpeechEnhance.h"
+#include "render/MusicEdit.h"
 #include "media/AutoDuck.h"
 #include "media/Decoder.h"
 #include "media/Transcriber.h"
@@ -869,6 +870,49 @@ void McpServer::Impl::addTools() {
                           .arg(r.missing),
                       QJsonObject{{"sequence", name}, {"placed", r.placed}, {"alternates", r.alternates}, {"missing", r.missing},
                                   {"duration", tc(s.duration(), s)}, {"lines", report}});
+        });
+
+    add("montage_beat_markers", "Mark the beat",
+        "Find the beat of a music clip and put sequence markers on its bars (\"Bar 12\"), or on every beat (\"12.3\" = bar 12, "
+        "beat 3), where the clip plays them. Use the markers to cut picture on the beat. Returns the tempo.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
+            "every_beat":{"type":"boolean","default":false}},"required":["project","clip"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            const Clip& c = clipArg(l, a);
+            BeatGrid g;
+            std::string err;
+            if (!mediaBeats(l.project, c.mediaId, g, nullptr, &err)) return fail(QString::fromStdString(err));
+            const int n = addBeatMarkers(l.seq(), c, g, a.value("every_beat").toBool());
+            save(l);
+            return ok(QStringLiteral("%1 marker(s) at %2 BPM").arg(n).arg(g.tempo, 0, 'f', 1),
+                      QJsonObject{{"markers", n}, {"tempo", g.tempo}});
+        });
+
+    add("montage_fit_music", "Fit music to a length",
+        "Re-edit a music clip (audio, normal speed, not linked to picture) to last about `seconds`: whole bars are skipped "
+        "or repeated where the music matches itself best, keeping its start and ending, with short crossfades on the beat. "
+        "The result is within about half a bar of the length asked for.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
+            "seconds":{"type":"number"}},"required":["project","clip","seconds"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            const Clip c = clipArg(l, a);
+            Sequence& s = l.seq();
+            const double secs = a.value("seconds").toDouble();
+            if (secs < 5) return fail("seconds must be 5 or more");
+            MusicFit fit;
+            std::string err;
+            if (!analyzeMusicFit(l.project, s, c, FrameTime(std::llround(secs * s.fpsValue())), fit, nullptr, &err))
+                return fail(QString::fromStdString(err));
+            const edit::Result r = applyMusicFit(l.project, s, c.id, fit);
+            if (!r.ok) return fail(QString::fromStdString(r.error));
+            save(l);
+            QJsonArray pieces;
+            for (const MusicSegment& seg : fit.segments) pieces.append(QJsonArray{seg.in, seg.out});
+            return ok(QStringLiteral("The music now lasts %1 s in %2 piece(s)").arg(fit.duration, 0, 'f', 2).arg(fit.segments.size()),
+                      QJsonObject{{"seconds", fit.duration}, {"pieces", pieces}, {"clips", int(r.created.size())},
+                                  {"join_similarity", fit.similarity}});
         });
 
     add("montage_find_shots", "Find shots by description",

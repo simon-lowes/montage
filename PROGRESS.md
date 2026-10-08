@@ -442,7 +442,13 @@ The second gap analysis (`docs/research/phase3-roadmap.md`, October 2026) ranks 
   - media/SpeechEnhance: DeepFilterNet3 as torchDF's single streaming ONNX graph (480 samples at 48 kHz in, a 45,304-float state carried between frames), 1440 samples of delay compensated. The model's own attenuation limit mixes in the undelayed input (comb filtering), so the cap is applied after, lined up. About 6x real time per channel; stereo channels run in parallel, identical ones once.
   - Enhance Speech, a source-audio effect: Keep (Speech, or Everything but Speech = the original less the speech), Amount, Max Reduction. The model pack downloads when the effect is first added (Inspector or drag and drop); `montage-cli models` lists it, `scripts/fetch-models.sh` fetches it, MCP refuses the effect without it.
   - Stem separation (vocals, drums, bass, other) is deferred: Spleeter's and Demucs' code is MIT, but neither publishes explicit terms for its pretrained weights (Demucs' author has called them research-only; both are trained on MUSDB18, which is non-commercial). Revisit if weights with a clear licence appear.
-- [ ] 7. Beat markers and fitting music to length (M)
+- [x] 7. Beat markers and fitting music to length (M), with signal processing only:
+  - media/Beats: onset envelope = log-mel spectral flux (46 ms windows every 5.8 ms, a 17 ms lead compensated); tempo from its autocorrelation with a log-normal prior at 120 BPM; Ellis' dynamic-programming beat tracker (tightness 100); bars (4/4) at the phase where bass onsets and chord changes line up. A line fitted through the beats gives the tempo (single frame gaps would round it).
+  - fitMusic: beat-synchronous chroma (100 Hz-4 kHz) and z-scored 20-band timbre; a join from one bar start to another is scored over a bar either side. A dynamic programme over (bar, bars played, jumps used) finds the path from the first bar to the last with the best joins and length; jumps stay out of the first and last 8 s.
+  - render/MusicEdit: beat grids cached per file; Bar/Beat markers (re-adding replaces them); applyMusicFit lays the pieces back to back, carrying the sub-frame remainder of each cut into the next piece's source in-point so the beat runs on, with 80 ms equal-power crossfades.
+  - Clip menu: Add Bar Markers, Add Beat Markers, Fit Music to Length... (In to Out, the picture, 15/30/60 s). MCP `montage_beat_markers`, `montage_fit_music` (35 tools).
+  - Beats were checked against synthetic songs (128 BPM within 0.01, every beat within 4 ms, bars right), and fits to 50 s and 110 s land within half a bar, joining bars with the same chords. Real recordings are untested here.
+  - Later: "Cut to the beat" (cutting picture clips on bar markers automatically) and 3/4 time.
 - [ ] 8. One-click mix: classify, ride and match dialogue (M)
 - [ ] 9. Caption and transcript translation on the device (M)
 - [ ] 10. Bézier keyframes and a graph editor (M)

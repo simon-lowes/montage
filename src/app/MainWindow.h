@@ -60,6 +60,11 @@ public:
     // Split-screen compare in the Program monitor: the reference beside the current frame.
     void setCompareWithReference(bool on);
     void scriptCutDialog();  // Sequence › Build Cut from Script…
+    // Music: markers on the music clip's bars or beats (returns how many), and
+    // re-editing it to a length by whole bars (false if it could not).
+    int addBeatMarkers(bool everyBeat);
+    bool fitMusicToLength(FrameTime target);
+    void fitMusicDialog();
     // Auto Reframe: a copy of the current sequence at aspect w:h with every
     // picture clip following its subject (speed 0 slower, 1 default, 2 faster),
     // made current; 0 if cancelled or nothing to do. The dialog asks for both.
@@ -129,6 +134,8 @@ private:
     // The video clip a clip command acts on: the selected one under the playhead, else the
     // top one under the playhead on the targeted track (or any).
     const Clip* clipForCommand() const;
+    // The music clip a music command acts on: the selected audio clip, else the one under the playhead.
+    const Clip* musicClip() const;
     void syncByAudio();
     enum class Interchange { Edl, Otio, Fcp7Xml, FcpXml };
     void exportInterchange(Interchange format);

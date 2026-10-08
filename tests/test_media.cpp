@@ -32,6 +32,7 @@
 #include "media/MediaPool.h"
 #include "media/SpeakerSwitch.h"
 #include "media/Tracking.h"
+#include "media/Beats.h"
 #include "media/Segmenter.h"
 #include "media/SpeechEnhance.h"
 #include "media/Reframe.h"
@@ -193,6 +194,56 @@ float meanAbs(const std::vector<float>& v, int ch, size_t from, size_t to) {
     double acc = 0;
     for (size_t i = from; i < to; ++i) acc += std::fabs(v[i * 2 + size_t(ch)]);
     return float(acc / double(to - from));
+}
+
+// A song at 128 BPM starting `lead` seconds in: a kick on each bar's first beat, a
+// tick on every beat, and a chord per bar (0 C, 1 Am, 2 F, 3 G), then a second of silence.
+constexpr double kSongBeat = 60.0 / 128, kSongBar = 4 * kSongBeat;
+std::vector<float> testSong(int rate, double lead, const std::vector<int>& barChord) {
+    static const std::vector<std::vector<double>> chordHz = {
+        {261.6, 329.6, 392.0}, {220.0, 261.6, 329.6}, {174.6, 220.0, 261.6}, {196.0, 246.9, 293.7}};
+    const int bars = int(barChord.size());
+    std::vector<float> x(size_t((lead + bars * kSongBar + 1.0) * rate), 0.0f);
+    unsigned seed = 7;
+    for (int b = 0; b < bars; ++b) {
+        for (int k = 0; k < 4; ++k) {
+            const size_t i0 = size_t((lead + b * kSongBar + k * kSongBeat) * rate);
+            for (size_t i = 0; i < size_t(0.03 * rate); ++i) {
+                seed = seed * 1664525u + 1013904223u;
+                x[i0 + i] += float((double(seed >> 8) / (1 << 24) - 0.5) * 0.3 * std::exp(-double(i) / (0.008 * rate)));
+            }
+            if (k == 0)
+                for (size_t i = 0; i < size_t(0.2 * rate); ++i)
+                    x[i0 + i] += float(0.6 * std::sin(2 * M_PI * 55 * double(i) / rate) * std::exp(-double(i) / (0.06 * rate)));
+        }
+        for (size_t i = 0; i < size_t(kSongBar * rate); ++i) {
+            const double t = double(i) / rate;
+            double v = 0;
+            for (double hz : chordHz[size_t(barChord[size_t(b)])]) v += std::sin(2 * M_PI * hz * (lead + b * kSongBar + t));
+            x[size_t((lead + b * kSongBar) * rate) + i] += float(0.06 * v * std::min(1.0, t / 0.02));
+        }
+    }
+    return x;
+}
+
+// 16-bit mono WAV.
+bool writeMonoWav(const std::string& path, const std::vector<float>& x, int rate) {
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) return false;
+    const uint32_t bytes = uint32_t(x.size() * 2);
+    auto u32 = [&](uint32_t v) { std::fwrite(&v, 4, 1, f); };
+    auto u16 = [&](uint16_t v) { std::fwrite(&v, 2, 1, f); };
+    std::fwrite("RIFF", 1, 4, f);
+    u32(36 + bytes);
+    std::fwrite("WAVEfmt ", 1, 8, f);
+    u32(16), u16(1), u16(1), u32(uint32_t(rate)), u32(uint32_t(rate) * 2), u16(2), u16(16);
+    std::fwrite("data", 1, 4, f);
+    u32(bytes);
+    for (float v : x) {
+        const int16_t s = int16_t(std::lround(std::clamp(v, -1.0f, 1.0f) * 32767));
+        std::fwrite(&s, 2, 1, f);
+    }
+    return std::fclose(f) == 0;
 }
 
 }  // namespace
@@ -1259,6 +1310,50 @@ private slots:
         QCOMPARE(s.markers.size(), size_t(2));
         // Nothing to go on: an error, not an empty sequence.
         r = call(QJsonObject{{"project", project}, {"script", "Lines nobody ever said."}});
+        QVERIFY(r.value("isError").toBool());
+    }
+
+    void mcpMarksTheBeatAndFitsMusic() {
+        const double lead = 0.5;
+        const std::vector<int> chords = {0, 0, 1, 2, 1, 2, 0, 3, 0, 3, 1, 2, 1, 2, 0, 3, 0, 3, 3, 3};
+        const std::string wav = path("mcp-song.wav");
+        QVERIFY(writeMonoWav(wav, testSong(48000, lead, chords), 48000));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        MediaItem m;
+        std::string err;
+        QVERIFY2(probeMedia(wav, m, &err), err.c_str());
+        m.id = p.newId();
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Id clip = s.audioTracks[0].clips.at(0).id;
+        const QString project = QString::fromStdString(path("song.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call("montage_beat_markers", {{"project", project}, {"clip", double(clip)}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(std::fabs(r.value("structuredContent").toObject().value("tempo").toDouble() - 128) < 1);
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QVERIFY(back.active()->markers.size() >= chords.size());
+        r = call("montage_fit_music", {{"project", project}, {"clip", double(clip)}, {"seconds", 30}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const double secs = r.value("structuredContent").toObject().value("seconds").toDouble();
+        QVERIFY(std::fabs(secs - 30) <= kSongBar / 2);
+        QVERIFY(loadProject(project.toStdString(), back));
+        const auto& pieces = back.active()->audioTracks[0].clips;
+        QVERIFY(pieces.size() >= 2);
+        QCOMPARE(back.active()->audioTracks[0].transitions.size(), pieces.size() - 1);
+        // Too short a length is refused.
+        r = call("montage_fit_music", {{"project", project}, {"clip", double(pieces[0].id)}, {"seconds", 2}});
         QVERIFY(r.value("isError").toBool());
     }
 
@@ -2722,6 +2817,65 @@ private slots:
         // caption at 2 s; FFmpeg's decoder shows it as soon as the line is read.
         for (const auto& e : events)
             if (e.text.contains("HELLO")) QVERIFY2(e.start > 1.4 && e.start < 2.05, qPrintable(QString::number(e.start)));
+    }
+
+    void beatsAndFittingMusic() {
+        // A song: intro (C), verse (Am F), chorus (C G) twice, outro (G).
+        const int rate = 44100;
+        const double beat = kSongBeat, bar = kSongBar, lead = 0.5;
+        struct Section { std::vector<int> chords; int bars; };  // chord ids, cycled bar by bar
+        const std::vector<Section> song = {{{0}, 4}, {{1, 2}, 8}, {{0, 3}, 8}, {{1, 2}, 8}, {{0, 3}, 8}, {{3}, 4}};
+        std::vector<int> barChord;
+        for (const auto& sec : song)
+            for (int b = 0; b < sec.bars; ++b) barChord.push_back(sec.chords[size_t(b) % sec.chords.size()]);
+        const int bars = int(barChord.size());
+        const std::vector<float> x = testSong(rate, lead, barChord);
+        const double total = double(x.size()) / rate;
+        const BeatGrid g = detectBeats(x, rate);
+        qInfo("tempo %.2f BPM, %zu beats, %zu bars; beats %.3f %.3f ... %.3f %.3f; bars %.3f ... %.3f", g.tempo, g.beats.size(),
+              g.downbeats.size(), g.beats[0], g.beats[1], g.beats[g.beats.size() - 2], g.beats.back(), g.downbeats.front(), g.downbeats.back());
+        QVERIFY(std::fabs(g.tempo - 128) < 1);
+        QVERIFY(g.beats.size() >= size_t(4 * bars - 4) && g.beats.size() <= size_t(4 * bars + 1));
+        double worst = 0;
+        double meanOff = 0;
+        for (double b : g.beats) {
+            meanOff += std::remainder(b - lead, beat) / double(g.beats.size());
+            worst = std::max(worst, std::fabs(std::remainder(b - lead, beat)));
+        }
+        qInfo("beats are %.1f ms off on average, %.1f ms at worst", meanOff * 1000, worst * 1000);
+        QVERIFY(std::fabs(meanOff) < 0.006);
+        QVERIFY2(worst < 0.015, qPrintable(QString::number(worst)));
+        int onBar = 0;
+        for (double d : g.downbeats) onBar += std::fabs(std::remainder(d - lead, bar)) < 0.03;
+        QVERIFY2(onBar >= int(g.downbeats.size()) - 1, qPrintable(QString("%1 of %2").arg(onBar).arg(g.downbeats.size())));
+
+        auto barOf = [&](double t) { return int(std::lround((t - lead) / bar)); };
+        auto check = [&](const MusicFit& f, double target) {
+            QVERIFY(f.ok());
+            qInfo("fit to %.1f s: %.2f s in %zu pieces, worst join %.2f", target, f.duration, f.segments.size(), f.similarity);
+            QVERIFY(std::fabs(f.duration - target) <= bar / 2 + 1e-6);
+            QCOMPARE(f.segments.front().in, 0.0);
+            QVERIFY(std::fabs(f.segments.back().out - total) < 1e-6);
+            // Every join is from a bar start to a bar start in the same place in the chords.
+            for (size_t i = 0; i + 1 < f.segments.size(); ++i) {
+                const int from = barOf(f.segments[i].out), to = barOf(f.segments[i + 1].in);
+                QVERIFY(std::fabs(std::remainder(f.segments[i].out - lead, bar)) < 0.03);
+                QVERIFY(std::fabs(std::remainder(f.segments[i + 1].in - lead, bar)) < 0.03);
+                QVERIFY2(barChord[size_t(from)] == barChord[size_t(to)] && barChord[size_t(from - 1)] == barChord[size_t(to - 1)],
+                         qPrintable(QString("bar %1 -> %2").arg(from).arg(to)));
+                QVERIFY(f.segments[i].out >= 8 - 1e-6 && f.segments[i + 1].in <= total - 8 + 1e-6);
+            }
+        };
+        const MusicFit shorter = fitMusic(x, rate, g, 50);
+        check(shorter, 50);
+        QVERIFY(shorter.segments.size() >= 2);
+        const MusicFit longer = fitMusic(x, rate, g, 110);
+        check(longer, 110);
+        // Already the right length: left whole.
+        const MusicFit same = fitMusic(x, rate, g, total);
+        QCOMPARE(same.segments.size(), size_t(1));
+        // No beat, no fit.
+        QVERIFY(detectBeats(std::vector<float>(size_t(rate) * 5, 0.0f), rate).empty());
     }
 
     void noiseReductionAndVoiceIsolation() {
