@@ -1008,6 +1008,17 @@ void MainWindow::buildMenus() {
                          "point, Alt-click a point to delete it"));
     }
     {
+        const bool durations = appSettings().value("timeline/clipDurations", false).toBool();
+        timeline_->setShowClipDurations(durations);
+        QAction* a = add(seqM, tr("Show Clip &Durations"), QKeySequence(), [this](bool on) {
+            timeline_->setShowClipDurations(on);
+            appSettings().setValue("timeline/clipDurations", on);
+        });
+        a->setCheckable(true);
+        a->setChecked(durations);
+        a->setObjectName(QStringLiteral("showClipDurations"));
+    }
+    {
         const bool dups = appSettings().value("timeline/duplicateFrames", false).toBool();
         timeline_->setShowDuplicateFrames(dups);
         QAction* a = add(seqM, tr("Show &Duplicate Frame Markers"), QKeySequence(), [this](bool on) {

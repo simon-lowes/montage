@@ -57,6 +57,9 @@ public:
     void setTrimEdit(Id outgoing, Id incoming, int side);
     void clearTrimEdit();
     bool trimEditShown() const { return trimSide_ >= 0; }
+    // Each clip's duration in its name strip (Resolve 21.1's view option).
+    void setShowClipDurations(bool on);
+    bool showClipDurations() const { return showDurations_; }
     // Duplicate frame markers (Premiere's): a coloured stripe under video frames that another clip also shows.
     void setShowDuplicateFrames(bool on);
     bool showDuplicateFrames() const { return showDuplicates_; }
@@ -259,6 +262,7 @@ private:
     bool showVolume_ = true;
     bool showTrackAuto_ = false;
     bool showDuplicates_ = false;
+    bool showDurations_ = false;
     mutable bool duplicatesDirty_ = true;
     mutable bool throughDirty_ = true;
     mutable std::vector<Id> through_;

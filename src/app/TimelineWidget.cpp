@@ -698,6 +698,8 @@ void TimelineWidget::paintClip(QPainter& p, const Row& row, const Clip& c, const
     if (c.ramped()) badges += tr(" ramp");
     if (!c.effects.empty()) badges += " fx";
     if (!c.takes.empty()) badges += tr(" take %1/%2").arg(c.take + 1).arg(c.takes.size());  // an audition
+    if (showDurations_ && state_->sequence())  // Resolve 21.1's clip durations view option
+        badges += QStringLiteral("  ") + QString::fromStdString(formatTimecode(c.duration, state_->sequence()->fps));
     QFont f = p.font();
     f.setPointSize(8);
     p.setFont(f);
@@ -794,6 +796,11 @@ void TimelineWidget::setTrimEdit(Id outgoing, Id incoming, int side) {
 
 void TimelineWidget::clearTrimEdit() {
     trimSide_ = -1;
+    viewport()->update();
+}
+
+void TimelineWidget::setShowClipDurations(bool on) {
+    showDurations_ = on;
     viewport()->update();
 }
 

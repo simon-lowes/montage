@@ -2137,6 +2137,18 @@ private slots:
         dups->trigger();
         QVERIFY(!win_->timeline()->showDuplicateFrames());
 
+        // Clip durations in the name strips, as a view option.
+        auto* durations = win_->findChild<QAction*>("showClipDurations");
+        QVERIFY(durations);
+        if (durations->isChecked()) durations->trigger();  // off to start with, whatever an earlier run left
+        QVERIFY(!win_->timeline()->showClipDurations());
+        for (int k = 0; k < 4; ++k) win_->timeline()->zoomIn();  // clips wide enough for the badge
+        const QImage plain = win_->timeline()->viewport()->grab().toImage();
+        durations->trigger();
+        QVERIFY(win_->timeline()->showClipDurations());
+        QVERIFY(win_->timeline()->viewport()->grab().toImage() != plain);
+        durations->trigger();
+
         // A razor cut is marked as a through edit; Join Through Edits puts the clip back together.
         const Id again = state()->sequence()->videoTracks[0].clips[1].id;
         state()->setSelection({});
