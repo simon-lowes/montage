@@ -52,6 +52,7 @@ int usage() {
                  "  montage-cli info <project.montage>\n"
                  "  montage-cli render <project.montage> -o <output> [--preset NAME] [--in TC] [--out TC]\n"
                  "                     [--width W] [--height H] [--crf N] [--vcodec C] [--acodec C] [--proxies]\n"
+                 "                     [--loudness LUFS [--ceiling dBTP]]  (e.g. --loudness -14: normalise the mix)\n"
                  "                     [--burn-captions] [--embed-captions] [--color-space ID]\n"
                  "  montage-cli frame <project.montage> --at TC -o <image.png>\n"
                  "  montage-cli presets\n"
@@ -247,6 +248,7 @@ int cmdRender(const std::vector<std::string>& args) {
     int width = 0, height = 0, crf = -1;
     std::string vcodec, acodec;
     bool proxies = false;
+    double loudness = 0, ceiling = -1;
     for (size_t i = 1; i < args.size(); ++i) {
         const std::string& a = args[i];
         auto next = [&]() -> std::string { return i + 1 < args.size() ? args[++i] : std::string(); };
@@ -263,9 +265,11 @@ int cmdRender(const std::vector<std::string>& args) {
         else if (a == "--burn-captions") st.burnInCaptions = true;
         else if (a == "--embed-captions") st.embedCaptions = true;
         else if (a == "--color-space") st.colorSpace = next();
+        else if (a == "--loudness") loudness = std::atof(next().c_str());
+        else if (a == "--ceiling") ceiling = std::atof(next().c_str());
         else return usage();
     }
-    if (outPath.empty()) return usage();
+    if (outPath.empty() || loudness > 0) return usage();
     const ExportPreset* pr = findExportPreset(presetName);
     if (!pr) {
         std::fprintf(stderr, "error: unknown preset \"%s\" (see `montage-cli presets`)\n", presetName.c_str());
@@ -292,6 +296,8 @@ int cmdRender(const std::vector<std::string>& args) {
     if (!vcodec.empty()) st.videoCodec = vcodec;
     if (!acodec.empty()) st.audioCodec = acodec;
     st.useProxies = proxies;
+    st.loudnessTarget = loudness;
+    st.peakCeiling = ceiling;
     if (!inTc.empty() && !parseTimecode(inTc, s->fps, st.in)) return usage();
     if (!outTc.empty() && !parseTimecode(outTc, s->fps, st.out)) return usage();
     if (st.in < 0 && s->inPoint >= 0) st.in = s->inPoint;

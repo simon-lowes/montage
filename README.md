@@ -119,6 +119,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Images as stills
 - Proxy workflow: 960 px intra-frame proxies, toggled in the Program monitor
 - Preview resolution: Full, 1/2, 1/4, 1/8
+- Loudness for delivery (Export › Loudness, or `--loudness -14`): the whole mix is measured first (ITU-R BS.1770 / EBU R128) and set to -14, -16, -23 or -24 LUFS. A look-ahead limiter keeps true peaks under -1 or -2 dBTP.
 - Export presets: H.264 (x264), H.265 (x265, 8- and 10-bit), hardware H.264/H.265 (VideoToolbox, NVENC, Quick Sync, AMF or Media Foundation, falling back to x264/x265), Apple ProRes 422 HQ/LT/4444 (with alpha), Avid DNxHR, VP9, AV1 (SVT-AV1), WAV and AAC; exports either the whole sequence or In–Out
 - Still frame export
 - Transcription that runs on your computer (whisper.cpp; nothing is uploaded):

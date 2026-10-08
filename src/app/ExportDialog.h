@@ -76,6 +76,7 @@ private:
     QSpinBox* quality_ = nullptr;
     QComboBox* captions_ = nullptr;
     QComboBox* color_ = nullptr;
+    QComboBox* loudness_ = nullptr;
     QLabel* summary_ = nullptr;
     QProgressBar* progress_ = nullptr;
     QLabel* eta_ = nullptr;

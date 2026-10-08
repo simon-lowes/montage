@@ -36,6 +36,11 @@ struct ExportSettings {
     // An HDR sequence delivered in SDR is tone mapped. HDR output is 10-bit,
     // tagged, and PQ carries HDR10 mastering and light-level metadata.
     std::string colorSpace;
+    // Loudness normalisation: the mix is measured first (ITU-R BS.1770) and
+    // brought to this integrated loudness, with a limiter holding peaks under
+    // the ceiling. 0 = off; e.g. -14 LUFS for streaming, -23 for EBU R128.
+    double loudnessTarget = 0;
+    double peakCeiling = -1;  // dBTP, when normalising
 };
 
 struct ExportPreset {

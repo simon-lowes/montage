@@ -294,4 +294,13 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
   - Clip › New Adjustment Layer puts 5 s at the playhead on the track above the targeted one, adding a track at the top. It is also under Generators in the Effects panel. MCP `montage_add_adjustment_layer`.
   - Interchange exports leave adjustment layers (and their transitions) out, since other editors would read them as solid mattes.
   - Tested: inversion of the tracks below but not above, opacity mix, disabled, nothing below, blend mode, the menu action and track creation, the MCP tool, and the exports.
+- [x] Loudness-normalised delivery (Premiere's and Resolve's loudness normalisation on export):
+  - The loudness meter streams (LoudnessMeter, the same result as the whole-buffer measure). Its peak is now a true peak: 4× oversampling with a windowed-sinc interpolator, as BS.1770-4 Annex 2 describes.
+  - Export first mixes the range once and measures it, then plays the mix through a gain and a look-ahead peak limiter (5 ms look-ahead, 80 ms release, 0.5 dB under the ceiling for inter-sample peaks). The limiter is primed so its delay costs no sync or length.
+  - Targets: -14 LUFS / -1 dBTP (YouTube, Spotify, TikTok), -16 / -1 (Apple Podcasts), -23 / -1 (EBU R128), -24 / -2 (ATSC A/85). Set in the export dialog, `montage-cli render --loudness N [--ceiling dB]`, or the MCP render tool's `loudness_lufs`.
+  - Tested:
+    - pieces against the whole, and true peak 3 dB above the samples' peak on a 12 kHz sine;
+    - the limiter: ceiling, delay, untouched audio and recovery;
+    - exports: -14 LUFS within 0.3 LU with the same length and onset, and a hot target held under -1 dBTP;
+    - the dialog's targets.
 

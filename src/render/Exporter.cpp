@@ -6,12 +6,14 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 
 #include "ColorSpace.h"
 #include "Compositor.h"
 #include "core/EditOps.h"
 #include "Processing.h"
 #include "media/HwAccel.h"
+#include "media/Loudness.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -468,6 +470,34 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     int64_t audioPts = 0;
     int64_t audioCursor = int64_t(std::llround(double(in) * mixRate / seq.fpsValue()));
     std::vector<uint16_t> rgba16;
+    // Loudness normalisation: measure the whole mix first, then play it through a gain and a limiter.
+    double normGain = 1;
+    std::unique_ptr<PeakLimiter> limiter;
+    int64_t limiterDelay = 0;
+    if (wantAudio && s.loudnessTarget < 0) {
+        AudioMixer meterMixer;
+        LoudnessMeter meter(mixRate);
+        const int64_t end = int64_t(std::llround(double(out) * mixRate / seq.fpsValue()));
+        std::vector<float> chunk(size_t(8192) * 2);
+        for (int64_t pos = audioCursor; pos < end;) {
+            if (cancel && cancel->load()) return fail("Cancelled");
+            const int n = int(std::min<int64_t>(8192, end - pos));
+            meterMixer.mix(p, mixSeq, pos, n, chunk.data());
+            meter.add(chunk.data(), n);
+            pos += n;
+        }
+        const LoudnessResult measured = meter.result();
+        if (measured.valid) normGain = std::pow(10.0, (s.loudnessTarget - measured.integrated) / 20.0);
+        // A little under the ceiling: the limiter sees samples, and true peaks fall between them.
+        limiter = std::make_unique<PeakLimiter>(mixRate, s.peakCeiling - 0.5);
+        limiterDelay = limiter->latency();
+        // Fill the limiter's look-ahead so its output starts at the first sample.
+        std::vector<float> prime(size_t(limiterDelay) * 2);
+        mixer.mix(p, mixSeq, audioCursor, int(limiterDelay), prime.data());
+        for (float& v : prime) v = float(v * normGain);
+        limiter->process(prime.data(), prime.data(), int(limiterDelay));
+        audioCursor += limiterDelay;
+    }
 
     auto encodeAudio = [&](bool final) -> bool {
         while (fifo.size() >= size_t(audioFrameSize) * 2 || (final && !fifo.empty())) {
@@ -589,11 +619,15 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             if ((rc = drain(o, o.vctx, o.vst)) < 0) return fail("Writing video failed: " + averr(rc));
         }
         if (wantAudio) {
-            int64_t target = int64_t(std::llround(double(f + 1) * mixRate / seq.fpsValue()));
+            int64_t target = int64_t(std::llround(double(f + 1) * mixRate / seq.fpsValue())) + limiterDelay;
             int n = int(target - audioCursor);
             if (n > 0) {
                 mixBuf.resize(size_t(n) * 2);
                 mixer.mix(p, mixSeq, audioCursor, n, mixBuf.data());
+                if (limiter) {
+                    for (float& v : mixBuf) v = float(v * normGain);
+                    limiter->process(mixBuf.data(), mixBuf.data(), n);
+                }
                 audioCursor = target;
                 fifo.insert(fifo.end(), mixBuf.begin(), mixBuf.end());
                 if (!encodeAudio(false)) return fail("Audio encoding failed");

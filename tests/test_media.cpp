@@ -271,6 +271,87 @@ private slots:
         QVERIFY(!measureLoudness(quiet).valid);
         LoudnessResult part = measureLoudness(buf, 48000, 48000 * 2);
         QVERIFY(std::fabs(part.integrated + 23.0) < 0.3);
+        // Fed in pieces, the meter gives the same answer.
+        LoudnessMeter pieces(48000);
+        for (int64_t at = 0; at < buf.frames(); at += 1000) pieces.add(buf.samples.data() + at * 2, std::min<int64_t>(1000, buf.frames() - at));
+        QCOMPARE(pieces.result().integrated, r.integrated);
+        QCOMPARE(pieces.result().truePeakDb, r.truePeakDb);
+        // True peak finds what falls between samples: a 12 kHz sine sampled 45° off its peaks reads 3 dB low as samples.
+        AudioBuffer between;
+        between.sampleRate = 48000;
+        for (int i = 0; i < 48000; ++i) {
+            const float v = float(0.5 * std::sin(M_PI / 2 * i + M_PI / 4));
+            between.samples.push_back(v);
+            between.samples.push_back(v);
+        }
+        const double tp = measureLoudness(between).truePeakDb;
+        QVERIFY2(std::fabs(tp - 20 * std::log10(0.5)) < 0.3, qPrintable(QString::number(tp)));
+    }
+
+    void peakLimiter() {
+        // A quiet tone with a loud burst in the middle: the burst is held under the ceiling, the rest passes untouched.
+        const int rate = 48000, n = rate;
+        std::vector<float> in(size_t(n) * 2), out(in.size());
+        for (int i = 0; i < n; ++i) {
+            const double a = (i >= 24000 && i < 24480) ? 1.6 : 0.2;
+            in[size_t(i) * 2] = in[size_t(i) * 2 + 1] = float(a * std::sin(2 * M_PI * 440.0 * i / rate));
+        }
+        PeakLimiter lim(rate, -1.0);
+        const int delay = lim.latency();
+        QCOMPARE(delay, 240);  // 5 ms
+        // In two pieces, as an export feeds it.
+        lim.process(in.data(), out.data(), 10000);
+        lim.process(in.data() + 20000, out.data() + 20000, n - 10000);
+        const float ceiling = float(std::pow(10.0, -1.0 / 20));
+        float peak = 0;
+        for (float v : out) peak = std::max(peak, std::fabs(v));
+        QVERIFY2(peak <= ceiling + 1e-6f, qPrintable(QString::number(peak)));
+        QVERIFY(peak > ceiling * 0.95f);
+        // Delayed by the look-ahead, and untouched before the burst (in both pieces).
+        for (int i : {1000, 9000, 21000})
+            QVERIFY2(std::fabs(out[size_t(i + delay) * 2] - in[size_t(i) * 2]) < 1e-6f, qPrintable(QString::number(i)));
+        // The gain recovers over the release after the burst: well down soon after, nearly back 5 releases later.
+        QVERIFY(std::fabs(out[size_t(25000 + delay) * 2]) < 0.9f * std::fabs(in[size_t(25000) * 2]) + 1e-6f || std::fabs(in[size_t(25000) * 2]) < 0.01f);
+        for (int i = 45000; i < 45100; ++i) QVERIFY(std::fabs(out[size_t(i + delay) * 2] - in[size_t(i) * 2]) < 0.002f);
+    }
+
+    void loudnessNormalisedExport() {
+        // A 220 Hz tone (about -10.6 LUFS) from 1 s to 4 s, normalised to -14 LUFS, then pushed past a -1 dBTP ceiling.
+        const std::string tone = path("norm-tone.wav");
+        writeVoiceWav(tone, 4, 220, [](double t) { return t >= 1; }, [](double) { return false; });
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        MediaItem m = probeOrFail(p, tone);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        ExportSettings st = findExportPreset("Audio - WAV 24-bit")->settings;
+        std::string err;
+        auto render = [&](double target, const char* name) {
+            st.path = path(name);
+            st.loudnessTarget = target;
+            if (!exportSequence(p, s, st, nullptr, nullptr, &err)) return AudioBufferPtr();
+            return decodeAudio(st.path, 48000, &err);
+        };
+        const AudioBufferPtr plain = render(0, "plain.wav"), normal = render(-14, "normal.wav");
+        QVERIFY2(plain && normal, err.c_str());
+        const LoudnessResult before = measureLoudness(*plain), after = measureLoudness(*normal);
+        QVERIFY2(std::fabs(after.integrated + 14) < 0.3, qPrintable(QString::number(after.integrated)));
+        QVERIFY2(before.integrated > -12, qPrintable(QString::number(before.integrated)));
+        // Same length, and the sound starts where it did.
+        QCOMPARE(normal->frames(), plain->frames());
+        auto onset = [](const AudioBuffer& b) {
+            for (int64_t i = 0; i < b.frames(); ++i)
+                if (std::fabs(b.samples[size_t(i) * 2]) > 0.05f) return i;
+            return int64_t(-1);
+        };
+        QVERIFY(std::llabs(onset(*normal) - onset(*plain)) <= 48);  // 1 ms
+        // Asking for more than the ceiling allows: limited, never over -1 dBTP.
+        st.peakCeiling = -1;
+        const AudioBufferPtr hot = render(-0.5, "hot.wav");
+        QVERIFY2(hot, err.c_str());
+        const LoudnessResult limited = measureLoudness(*hot);
+        QVERIFY2(limited.truePeakDb <= -1.0 + 0.1, qPrintable(QString::number(limited.truePeakDb)));
+        QVERIFY(limited.integrated > -6);
     }
 
     void audioSyncFindsOffset() {

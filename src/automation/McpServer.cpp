@@ -1038,9 +1038,12 @@ void McpServer::Impl::addTools() {
         });
 
     add("montage_render", "Render",
-        "Render the active sequence (or its in-out range) to a file with an export preset (default \"H.264 - High Quality\").",
+        "Render the active sequence (or its in-out range) to a file with an export preset (default \"H.264 - High Quality\"), "
+        "optionally normalising the mix's loudness for where it is going.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"output":{"type":"string"},
-            "preset":{"type":"string"},"in":{"type":["number","string"]},"out":{"type":["number","string"]}},
+            "preset":{"type":"string"},"in":{"type":["number","string"]},"out":{"type":["number","string"]},
+            "loudness_lufs":{"type":"number","description":"Normalise the mix to this loudness, e.g. -14 (streaming) or -23 (EBU R128)"},
+            "peak_ceiling":{"type":"number","default":-1,"description":"True peak ceiling (dBTP) when normalising"}},
             "required":["project","output"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
@@ -1051,6 +1054,11 @@ void McpServer::Impl::addTools() {
             st.path = absolute(need(a, "output")).toStdString();
             if (a.contains("in")) st.in = timeArg(a.value("in"), s, "in");
             if (a.contains("out")) st.out = timeArg(a.value("out"), s, "out");
+            if (a.value("loudness_lufs").isDouble()) {
+                st.loudnessTarget = a.value("loudness_lufs").toDouble();
+                if (st.loudnessTarget >= 0 || st.loudnessTarget < -70) throw ArgError{"\"loudness_lufs\" must be between -70 and 0"};
+                st.peakCeiling = std::min(0.0, a.value("peak_ceiling").toDouble(-1));
+            }
             std::string err;
             if (!exportSequence(l.project, s, st, [this](double f, FrameTime) { progress(f, "Rendering"); }, nullptr, &err))
                 return fail(QString::fromStdString(err));

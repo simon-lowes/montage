@@ -14,6 +14,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
+#include <QPointF>
 #include <QProgressBar>
 #include <QPushButton>
 #include <QRegularExpression>
@@ -192,6 +193,18 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     color_->setToolTip(tr("Deliver in another colour space: an HDR sequence delivered in Rec.709 is tone mapped.\n"
                           "HDR output is 10-bit and tagged; PQ carries HDR10 metadata."));
     form->addRow(tr("Colour:"), color_);
+    // Loudness for where it is going: (target LUFS, true peak ceiling dBTP).
+    loudness_ = new QComboBox(form_);
+    loudness_->setObjectName(QStringLiteral("exportLoudness"));
+    loudness_->addItem(tr("As mixed"), QPointF(0, 0));
+    loudness_->addItem(tr("-14 LUFS, -1 dBTP (YouTube, Spotify, TikTok)"), QPointF(-14, -1));
+    loudness_->addItem(tr("-16 LUFS, -1 dBTP (Apple Podcasts, Amazon Music)"), QPointF(-16, -1));
+    loudness_->addItem(tr("-23 LUFS, -1 dBTP (EBU R128 broadcast)"), QPointF(-23, -1));
+    loudness_->addItem(tr("-24 LKFS, -2 dBTP (ATSC A/85, US broadcast)"), QPointF(-24, -2));
+    loudness_->setCurrentIndex(std::clamp(appSettings().value("export/loudness", 0).toInt(), 0, loudness_->count() - 1));
+    loudness_->setToolTip(tr("Measures the whole mix first, then sets its level to the target, with a limiter "
+                             "keeping peaks under the ceiling"));
+    form->addRow(tr("Loudness:"), loudness_);
     form->addRow(tr("Summary:"), summary_);
 
     progress_ = new QProgressBar(this);
@@ -351,6 +364,7 @@ void ExportDialog::updateControls() {
     width_->setEnabled(video && !matchSize_->isChecked());
     height_->setEnabled(video && !matchSize_->isChecked());
     color_->setEnabled(video);
+    loudness_->setEnabled(p && hasAudio(p->settings));
     quality_->setEnabled(p && usesCrf(p->settings.videoCodec));
     const Sequence* seq = state_ ? state_->sequence() : nullptr;
     const CaptionTrack* ct = seq ? captionTrackFor(*seq) : nullptr;
@@ -470,6 +484,12 @@ void ExportDialog::startExport() {
     }
     settings.setValue("export/captions", captions_->currentIndex());
     if (hasVideo(s)) s.colorSpace = color_->currentData().toString().toStdString();
+    if (hasAudio(s) && loudness_->currentIndex() > 0) {
+        const QPointF target = loudness_->currentData().toPointF();
+        s.loudnessTarget = target.x();
+        s.peakCeiling = target.y();
+    }
+    settings.setValue("export/loudness", loudness_->currentIndex());
     if (rangeIsInOut()) {
         s.in = in;
         s.out = out;

@@ -1270,6 +1270,12 @@ private slots:
         QVERIFY(color);
         QCOMPARE(color->count(), int(displayColorSpaces().size()) + 1);
         QVERIFY(color->itemText(0).contains("HLG"));
+        // Loudness targets for delivery, as (LUFS, dBTP).
+        auto* loudness = ed.findChild<QComboBox*>("exportLoudness");
+        QVERIFY(loudness && loudness->count() == 5);
+        QCOMPARE(loudness->itemData(0).toPointF(), QPointF(0, 0));
+        QCOMPARE(loudness->itemData(1).toPointF(), QPointF(-14, -1));
+        QCOMPARE(loudness->itemData(3).toPointF(), QPointF(-23, -1));
         state()->newProject();
         win_->activateWindow();  // the context menu took the focus
         QVERIFY(QTest::qWaitForWindowActive(win_.get()));
