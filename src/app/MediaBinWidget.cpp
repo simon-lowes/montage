@@ -14,6 +14,7 @@
 #include <QHeaderView>
 #include <QInputDialog>
 #include <QKeyEvent>
+#include <QMouseEvent>
 #include <QLineEdit>
 #include <QListView>
 #include <QMenu>
@@ -268,6 +269,8 @@ MediaBinWidget::MediaBinWidget(EditorState* state, QWidget* parent) : QWidget(pa
     icons_->setUniformItemSizes(true);
     icons_->setTextElideMode(Qt::ElideMiddle);
     icons_->setEditTriggers(QAbstractItemView::EditKeyPressed);
+    icons_->viewport()->setMouseTracking(true);  // hover scrub
+    hoverScrub_ = QSettings(QStringLiteral("Montage"), QStringLiteral("Montage")).value(QStringLiteral("bin/hoverScrub"), true).toBool();
     list_ = new QTreeView(stack_);
     list_->setObjectName(QStringLiteral("mediaList"));
     list_->setModel(proxy_);
@@ -689,7 +692,39 @@ void MediaBinWidget::addKeywordsDialog(const std::vector<Id>& ids) {
     addKeywords(ids, parseKeywords(dlg.textValue().toStdString()));
 }
 
+void MediaBinWidget::setHoverScrub(bool on) {
+    hoverScrub_ = on;
+    if (!on) model_->clearSkim();
+    QSettings(QStringLiteral("Montage"), QStringLiteral("Montage")).setValue(QStringLiteral("bin/hoverScrub"), on);
+}
+
+void MediaBinWidget::skimAt(const QPoint& pos) {
+    const QModelIndex vi = icons_->indexAt(pos);
+    const Id id = vi.isValid() ? vi.data(MediaBinModel::IdRole).toULongLong() : 0;
+    const MediaItem* m = id ? state_->project().findMedia(id) : nullptr;
+    if (!m || m->kind != MediaKind::Video || m->duration <= 0) {
+        model_->clearSkim();
+        return;
+    }
+    // Across the thumbnail, centred at the top of the item's cell.
+    const QRect cell = icons_->visualRect(vi);
+    const double x0 = cell.center().x() - MediaBinModel::kThumbW / 2.0;
+    const double u = std::clamp((pos.x() - x0) / MediaBinModel::kThumbW, 0.0, 1.0);
+    const bool sub = m->subclipOut > m->subclipIn;
+    const double start = sub ? m->subclipIn : 0.0, span = sub ? m->subclipOut - m->subclipIn : m->duration;
+    model_->setSkim(id, start + u * span * 0.999, u);
+}
+
 bool MediaBinWidget::eventFilter(QObject* watched, QEvent* event) {
+    // Hover scrub over the icon view's thumbnails (not while dragging).
+    if (watched == icons_->viewport()) {
+        if (event->type() == QEvent::MouseMove && hoverScrub_) {
+            auto* me = static_cast<QMouseEvent*>(event);
+            if (!(me->buttons() & Qt::LeftButton)) skimAt(me->position().toPoint());
+        } else if (event->type() == QEvent::Leave) {
+            model_->clearSkim();
+        }
+    }
     const bool view = watched == icons_ || watched == list_;
     // Rating keys: 0–5 and X (reject), over the window's shortcuts while a view has the focus.
     if (view && (event->type() == QEvent::ShortcutOverride || event->type() == QEvent::KeyPress)) {
@@ -1014,6 +1049,9 @@ void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos)
     menu.addSeparator();
     menu.addAction(tr("New Bin"), this, [this] { newBin(smart_ ? QString() : bin_); });
     menu.addAction(tr("Import..."), this, &MediaBinWidget::importDialog);
+    QAction* scrub = menu.addAction(tr("Hover Scrub"), this, [this](bool on) { setHoverScrub(on); });
+    scrub->setCheckable(true);
+    scrub->setChecked(hoverScrub_);
     menu.exec(view->viewport()->mapToGlobal(pos));
 }
 

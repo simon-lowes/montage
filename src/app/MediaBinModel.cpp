@@ -111,7 +111,56 @@ bool MediaBinModel::setField(const std::vector<Id>& ids, const std::string& key,
     });
 }
 
+void MediaBinModel::setSkim(Id id, double seconds, double fraction) {
+    const MediaItem* m = id ? state_->project().findMedia(id) : nullptr;
+    if (!m || m->kind != MediaKind::Video) {
+        clearSkim();
+        return;
+    }
+    if (id != skimId_) {
+        clearSkim();
+        skimFrame_ = QImage();
+    }
+    skimId_ = id;
+    skimSeconds_ = seconds;
+    skimFraction_ = std::clamp(fraction, 0.0, 1.0);
+    if (const int row = rowOf(id); row >= 0) emit dataChanged(index(row, 0), index(row, 0), {Qt::DecorationRole});
+}
+
+void MediaBinModel::clearSkim() {
+    const Id was = skimId_;
+    skimId_ = 0;
+    skimShown_ = false;
+    if (const int row = rowOf(was); was && row >= 0) emit dataChanged(index(row, 0), index(row, 0), {Qt::DecorationRole});
+}
+
+QPixmap MediaBinModel::skimmedThumbnail(const MediaItem& m) const {
+    const double aspect = m.width > 0 && m.height > 0 ? double(m.width) / m.height : 16.0 / 9;
+    int w = kThumbW, h = int(kThumbW / aspect);
+    if (h > kThumbH) {
+        h = kThumbH;
+        w = int(kThumbH * aspect);
+    }
+    // Up to about 48 distinct frames across a clip, and never finer than a frame.
+    const double span = m.subclipOut > m.subclipIn ? m.subclipOut - m.subclipIn : m.duration;
+    const double quantum = std::max(span / 48.0, m.fps.num > 0 && m.fps.den > 0 ? double(m.fps.den) / m.fps.num : 1.0 / 30);
+    const QImage img = ThumbnailCache::instance().get(QString::fromStdString(m.path), skimSeconds_, std::max(2, w), std::max(2, h), quantum);
+    skimShown_ = !img.isNull();
+    if (!img.isNull()) skimFrame_ = img;
+    if (skimFrame_.isNull()) return thumbnail(m);
+    QPixmap pm(kThumbW, kThumbH);
+    pm.fill(Qt::black);
+    QPainter pa(&pm);
+    pa.drawImage(QPoint((kThumbW - skimFrame_.width()) / 2, (kThumbH - skimFrame_.height()) / 2), skimFrame_);
+    const int x = std::clamp(int(std::lround(skimFraction_ * kThumbW)), 1, kThumbW - 2);
+    pa.setPen(QPen(theme::kPlayhead, 2));
+    pa.drawLine(x, 0, x, kThumbH);
+    return pm;
+}
+
 void MediaBinModel::refreshThumbnails() {
+    if (skimId_)
+        if (const int row = rowOf(skimId_); row >= 0) emit dataChanged(index(row, 0), index(row, 0), {Qt::DecorationRole});
     bool any = false;
     for (Id id : ids_) {
         if (thumbs_.count(id)) continue;
@@ -234,7 +283,7 @@ QVariant MediaBinModel::data(const QModelIndex& index, int role) const {
             if (key == "rating") return QString::number(m->rating);
             return QString::fromStdString(mediaFieldText(*m, key, &usage_));
         case Qt::DecorationRole:
-            if (key == "name") return decorated(*m);
+            if (key == "name") return m->id == skimId_ ? skimmedThumbnail(*m) : decorated(*m);
             if (key == "label" && m->label > 0) {
                 QPixmap sw(10, 10);
                 sw.fill(theme::labelColor(m->label));

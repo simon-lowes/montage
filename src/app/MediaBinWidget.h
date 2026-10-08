@@ -94,6 +94,10 @@ public:
     // interior or exterior, day or night, people), indexing them first if
     // needed; one undo step. Returns how many items got new keywords.
     int autoTag(const std::vector<Id>& ids);
+    // Hover scrub (Premiere's, Final Cut's skimming): moving the pointer across a video's thumbnail in the icon view
+    // shows its frames, left to right. On unless turned off (the bin's context menu); remembered.
+    void setHoverScrub(bool on);
+    bool hoverScrub() const { return hoverScrub_; }
 
 public slots:
     void importDialog();
@@ -124,6 +128,7 @@ private:
     void createSuperScaleCopies(const std::vector<Id>& ids, int factor);
     void transcribe(const std::vector<Id>& ids);
     void saveColumns();
+    void skimAt(const QPoint& viewportPos);
 
     EditorState* state_;
     MediaBinModel* model_;
@@ -137,6 +142,7 @@ private:
     QToolButton* iconsBtn_;
     QToolButton* listBtn_;
     View view_ = View::Icons;
+    bool hoverScrub_ = true;
     QString bin_;
     Id smart_ = 0;
     bool treeUpdating_ = false;

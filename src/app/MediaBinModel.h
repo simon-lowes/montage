@@ -40,6 +40,13 @@ public:
     bool setField(const std::vector<Id>& ids, const std::string& key, const QString& value);
     // Picks up new thumbnails.
     void refreshThumbnails();
+    // Hover scrub (Premiere's hover scrub, Final Cut's skimming): the item's thumbnail shows its media's frame at
+    // `seconds`, with a playhead line `fraction` of the way across, until clearSkim(). Videos only.
+    void setSkim(Id id, double seconds, double fraction);
+    void clearSkim();
+    Id skimmed() const { return skimId_; }
+    double skimSeconds() const { return skimSeconds_; }
+    bool skimFrameShown() const { return skimShown_; }  // the frame at skimSeconds() has arrived and is drawn
 
     int rowCount(const QModelIndex& parent = {}) const override;
     int columnCount(const QModelIndex& parent = {}) const override;
@@ -66,6 +73,11 @@ private:
         QPixmap pixmap;
     };
     mutable std::map<Id, Badge> decorated_;
+    QPixmap skimmedThumbnail(const MediaItem& m) const;
+    Id skimId_ = 0;
+    double skimSeconds_ = 0, skimFraction_ = 0;
+    mutable QImage skimFrame_;  // the latest frame decoded for the skimmed item, shown until the next arrives
+    mutable bool skimShown_ = false;
 };
 
 }  // namespace montage

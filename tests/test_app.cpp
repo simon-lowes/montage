@@ -13,6 +13,7 @@
 #include <QDoubleSpinBox>
 #include <QLineEdit>
 #include <QLabel>
+#include <QListView>
 #include <QListWidget>
 #include <QMimeData>
 #include <QScrollBar>
@@ -1631,6 +1632,76 @@ private slots:
         QCOMPARE(*back.findMedia(id)->transcript, *transcript);
         state()->newProject();
         QVERIFY(QTest::qWaitForWindowActive(win_.get()));  // the window has the focus back
+    }
+
+    void hoverScrubInTheBin() {
+        // A video red for its first second and blue for its second.
+        const QString path = dir_.path() + "/skim.mp4";
+        {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 160;
+            gs.height = 90;
+            for (int k = 0; k < 2; ++k) {
+                Clip c = makeGeneratorClip(gen, "color", 30);
+                c.generator.params["color.r"] = Param(k ? 0.0 : 0.9);
+                c.generator.params["color.g"] = Param(0.0);
+                c.generator.params["color.b"] = Param(k ? 0.9 : 0.0);
+                c.start = 30 * k;
+                edit::overwrite(gen, gs, {TrackKind::Video, 0}, c);
+            }
+            ExportSettings st;
+            st.path = path.toStdString();
+            st.audioCodec = "none";
+            st.preset = "ultrafast";
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        state()->newProject();
+        const auto ids = state()->importFiles({path});
+        QCOMPARE(ids.size(), size_t(1));
+        auto* bin = win_->findChild<MediaBinWidget*>();
+        win_->raisePanel("media");
+        bin->setView(MediaBinWidget::View::Icons);
+        bin->setHoverScrub(true);
+        auto* icons = bin->findChild<QListView*>("mediaIcons");
+        QVERIFY(icons && icons->isVisible());
+        QTRY_COMPARE(bin->shownMedia(), ids);
+        const QModelIndex vi = icons->model()->index(0, 0);
+        const QRect cell = icons->visualRect(vi);
+        auto move = [&](double u) {
+            const QPoint pos(int(cell.center().x() - MediaBinModel::kThumbW / 2.0 + u * MediaBinModel::kThumbW), cell.top() + 20);
+            QMouseEvent ev(QEvent::MouseMove, QPointF(pos), QPointF(icons->viewport()->mapToGlobal(pos)), Qt::NoButton, Qt::NoButton, Qt::NoModifier);
+            QCoreApplication::sendEvent(icons->viewport(), &ev);
+        };
+        // The thumbnail's colour away from the playhead line.
+        auto shown = [&](double u) {
+            const QPixmap pm = bin->model()->index(0, 0).data(Qt::DecorationRole).value<QPixmap>();
+            const int x = u < 0.5 ? MediaBinModel::kThumbW - 20 : 20;
+            return pm.toImage().pixelColor(x, MediaBinModel::kThumbH / 2);
+        };
+        MediaBinModel* model = bin->model();
+
+        // Near the left: the red second, with the playhead line drawn; near the right: the blue one.
+        move(0.1);
+        QCOMPARE(model->skimmed(), ids[0]);
+        QVERIFY2(model->skimSeconds() > 0.1 && model->skimSeconds() < 0.3, qPrintable(QString::number(model->skimSeconds())));
+        QTRY_VERIFY(shown(0.1).red() > 150 && model->skimFrameShown());
+        QVERIFY(shown(0.1).blue() < 80);
+        move(0.9);
+        QVERIFY(model->skimSeconds() > 1.7 && model->skimSeconds() < 2.0);
+        QTRY_VERIFY(shown(0.9).blue() > 150 && model->skimFrameShown());
+        QVERIFY(shown(0.9).red() < 80);
+        // Leaving puts the poster frame back.
+        QEvent leave(QEvent::Leave);
+        QCoreApplication::sendEvent(icons->viewport(), &leave);
+        QCOMPARE(model->skimmed(), Id(0));
+        // Off, moving over it does nothing.
+        bin->setHoverScrub(false);
+        move(0.9);
+        QCOMPARE(model->skimmed(), Id(0));
+        bin->setHoverScrub(true);
+        state()->newProject();
     }
 
     void mediaBinLogging() {

@@ -185,6 +185,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 
 **Organising media**
 - Bins, nested to any depth: drag media or bins onto a bin in the bin tree, and drop files on a bin to import into it. Deleting a bin keeps its media.
+- **Hover scrub** (Premiere's hover scrub, Final Cut's skimming): move the pointer across a video's thumbnail in the icon view to see its frames, with a playhead line where you are; it goes back to the poster frame when the pointer leaves. Turn it off in the bin's context menu.
 - Icon view, or a list view with sortable columns: rating, label, duration, type, resolution, frame rate, start timecode, codecs, keywords, usage in sequences, scene, shot, take, camera, camera model, description, comment, recording date, colour space, transcript, proxy, bin and file. Right-click the header to choose columns.
 - Logging:
   - Ratings: press 1–5 for stars, 0 to clear, and X to reject.
