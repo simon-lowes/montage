@@ -26,7 +26,8 @@ extern "C" {
 namespace montage {
 
 bool isSourceAudioEffect(const std::string& type) {
-    return type == "denoise" || type == "voice_isolate" || type == "enhance_speech" || type == "declick" || type == "pitch_shift";
+    return type == "denoise" || type == "voice_isolate" || type == "enhance_speech" || type == "declick" || type == "pitch_shift" ||
+           type == "dereverb";
 }
 
 bool hasVoiceIsolation() {
@@ -159,6 +160,136 @@ void reduceNoise(const AudioBuffer& in, AudioBuffer& out, double reductionDb, do
             for (int k = 0; k < bins; ++k) {
                 spec[size_t(k)].re *= smooth[size_t(k)];
                 spec[size_t(k)].im *= smooth[size_t(k)];
+            }
+            inv.fn(inv.ctx, timeOut.data(), spec.data(), sizeof(AVComplexFloat));
+            for (int i = 0; i < N; ++i) {
+                const int64_t s = f * hop - N + i;
+                if (s >= 0 && s < frames) acc[size_t(s)] += timeOut[size_t(i)] * window[size_t(i)];
+            }
+        }
+        for (int64_t s = 0; s < frames; ++s)
+            out.samples[size_t(s) * 2 + size_t(ch)] = norm[size_t(s)] > 1e-6f ? acc[size_t(s)] / norm[size_t(s)] : 0.0f;
+    }
+}
+
+// ---- De-reverb ------------------------------------------------------------------
+
+double estimateReverbTime(const AudioBuffer& in) {
+    // The level in 10 ms steps (500 Hz to 4 kHz, smoothed over 50 ms). After each loud moment that stops, the
+    // level falls at the room's rate once the direct sound has gone; the time to fall from 5 to 25 dB below the
+    // peak, times three, is that fall's RT60 (as T20 is measured on an impulse response). Sound that fades by itself
+    // falls more slowly than the room allows, so the faster falls measure the room.
+    const int sr = std::max(8000, in.sampleRate);
+    const int64_t frames = in.frames();
+    const int step = sr / 100;
+    if (frames < step * 100) return 0;
+    const double ah = std::exp(-2 * M_PI * 500.0 / sr), al = std::exp(-2 * M_PI * std::min(4000.0, 0.45 * sr) / sr);
+    double hpPrevIn = 0, hp = 0, lp = 0, acc = 0;
+    std::vector<double> level;
+    for (int64_t s = 0; s < frames; ++s) {
+        const double x = 0.5 * (double(in.samples[size_t(s) * 2]) + in.samples[size_t(s) * 2 + 1]);
+        hp = ah * (hp + x - hpPrevIn);
+        hpPrevIn = x;
+        lp = (1 - al) * hp + al * lp;
+        acc += lp * lp;
+        if ((s + 1) % step == 0) {
+            level.push_back(10 * std::log10(acc / step + 1e-20));
+            acc = 0;
+        }
+    }
+    const size_t n = level.size();
+    std::vector<double> sm(n);
+    for (size_t i = 0; i < n; ++i) {
+        double sum = 0;
+        int c = 0;
+        for (int d = -2; d <= 2; ++d)
+            if (i + size_t(d) < n) sum += level[i + size_t(d)], ++c;
+        sm[i] = sum / c;
+    }
+    const double loudest = *std::max_element(sm.begin(), sm.end());
+    std::vector<double> times;
+    for (size_t p = 5; p + 5 < n; ++p) {
+        if (sm[p] < loudest - 30) continue;
+        bool peak = true;
+        for (size_t k = 1; k <= 5 && peak; ++k) peak = sm[p] >= sm[p - k] && sm[p] >= sm[p + k];
+        if (!peak) continue;
+        // Follow the fall until the sound starts again (3 dB above the lowest so far) or two seconds pass.
+        double lowest = sm[p];
+        size_t t5 = 0, t25 = 0;
+        for (size_t j = p + 1; j < n && j < p + 200; ++j) {
+            if (sm[j] > lowest + 3) break;
+            lowest = std::min(lowest, sm[j]);
+            if (!t5 && sm[j] <= sm[p] - 5) t5 = j;
+            if (!t25 && sm[j] <= sm[p] - 25) {
+                t25 = j;
+                break;
+            }
+        }
+        if (t5 && t25 && t25 > t5 + 2) times.push_back(3.0 * double(t25 - t5) * 0.01);
+    }
+    if (times.size() < 3) return 0;
+    std::sort(times.begin(), times.end());
+    return std::clamp(times[size_t(double(times.size() - 1) * 0.25)], 0.1, 5.0);
+}
+
+void dereverb(const AudioBuffer& in, AudioBuffer& out, double amount, double reverbTime, double maxReductionDb,
+              const std::atomic<bool>* cancel) {
+    out.sampleRate = in.sampleRate;
+    out.samples.assign(in.samples.size(), 0.0f);
+    const int64_t frames = in.frames();
+    const int sr = std::max(8000, in.sampleRate);
+    int N = 2048;
+    while (N > 256 && double(N) / sr > 0.04) N /= 2;
+    while (double(N) / sr < 0.02) N *= 2;
+    const int hop = N / 4, bins = N / 2 + 1;
+    amount = std::clamp(amount, 0.0, 100.0) / 100.0;
+    if (reverbTime <= 0) reverbTime = estimateReverbTime(in);
+    if (reverbTime <= 0) reverbTime = 0.5;
+    Tx fwd(N, false), inv(N, true);
+    if (frames < N || amount <= 0 || !fwd.ctx || !inv.ctx) {
+        out.samples = in.samples;
+        return;
+    }
+    std::vector<float> window(static_cast<size_t>(N));
+    for (int i = 0; i < N; ++i) window[size_t(i)] = float(0.5 - 0.5 * std::cos(2 * M_PI * (i + 0.5) / N));
+    const int64_t nFrames = (frames + N) / hop + 1;
+    // Late reverberation starts about 50 ms after the direct sound; by then the room has decayed by this much.
+    const double frameSec = double(hop) / sr;
+    const int delayFrames = std::max(1, int(std::lround(0.05 / frameSec)));
+    const double decay = std::exp(-2 * 3 * std::log(10.0) / reverbTime * delayFrames * frameSec);
+    const double minGain = std::pow(10.0, -std::clamp(maxReductionDb, 0.0, 60.0) / 20.0);
+    AlignedBuf<float> frame(static_cast<size_t>(N)), timeOut(static_cast<size_t>(N));
+    AlignedBuf<AVComplexFloat> spec(static_cast<size_t>(bins) + 1);
+    std::vector<float> norm(size_t(frames) + size_t(N), 0.0f);
+    for (int64_t f = 0; f < nFrames; ++f)
+        for (int i = 0; i < N; ++i) {
+            const int64_t s = f * hop - N + i;
+            if (s >= 0 && s < frames) norm[size_t(s)] += window[size_t(i)] * window[size_t(i)];
+        }
+    for (int ch = 0; ch < 2; ++ch) {
+        auto sampleAt = [&](int64_t s) { return s >= 0 && s < frames ? in.samples[size_t(s) * 2 + size_t(ch)] : 0.0f; };
+        // The power spectrum of every frame, smoothed over about 50 ms, kept for the delay.
+        std::vector<float> smooth(size_t(nFrames) * size_t(bins), 0.0f);
+        std::vector<float> acc(size_t(frames) + size_t(N), 0.0f), prevGain(size_t(bins), 1.0f);
+        for (int64_t f = 0; f < nFrames; ++f) {
+            if (cancel && cancel->load()) return;
+            for (int i = 0; i < N; ++i) frame[size_t(i)] = sampleAt(f * hop - N + i) * window[size_t(i)];
+            fwd.fn(fwd.ctx, spec.data(), frame.data(), sizeof(float));
+            float* sp = &smooth[size_t(f) * size_t(bins)];
+            const float* before = f > 0 ? &smooth[size_t(f - 1) * size_t(bins)] : nullptr;
+            const float* late = f >= delayFrames ? &smooth[size_t(f - delayFrames) * size_t(bins)] : nullptr;
+            for (int k = 0; k < bins; ++k) {
+                const double p = double(spec[size_t(k)].re) * spec[size_t(k)].re + double(spec[size_t(k)].im) * spec[size_t(k)].im;
+                sp[k] = float(before ? 0.85 * before[k] + 0.15 * p : p);
+                // Over-subtracting a little (1.3) takes more of the tail for little cost to the voice.
+                double g = 1;
+                if (late) g = std::sqrt(std::max(minGain * minGain, 1.0 - 1.3 * decay * late[k] / std::max(1e-20, p)));
+                // Gains recover gradually, so the tail does not flicker ("musical noise").
+                g = std::max(g, double(prevGain[size_t(k)]) * 0.5);
+                prevGain[size_t(k)] = float(g);
+                const float gg = float(1.0 - amount * (1.0 - g));
+                spec[size_t(k)].re *= gg;
+                spec[size_t(k)].im *= gg;
             }
             inv.fn(inv.ctx, timeOut.data(), spec.data(), sizeof(AVComplexFloat));
             for (int i = 0; i < N; ++i) {
@@ -333,6 +464,9 @@ AudioBufferPtr process(const AudioBufferPtr& source, const std::vector<Effect>& 
             ok = enhanceSpeech(*cur, *out, e.p("amount", 0, 100), e.p("max_reduction_db", 0, 100), e.p("keep", 0) > 0.5);
         } else if (e.type == "declick") {
             declick(*cur, *out, e.p("sensitivity", 0, 50), e.p("max_ms", 0, 2));
+            ok = true;
+        } else if (e.type == "dereverb") {
+            dereverb(*cur, *out, e.p("amount", 0, 80), e.p("reverb_time", 0, 0), e.p("max_reduction_db", 0, 18));
             ok = true;
         } else if (e.type == "pitch_shift") {
             pitchShift(*cur, *out, e.p("semitones", 0, 0) + e.p("cents", 0, 0) / 100);

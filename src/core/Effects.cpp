@@ -373,6 +373,11 @@ std::vector<EffectInfo> buildCatalog() {
     c.push_back({"declick", "De-Click", EffectCategory::AudioFilter, "Restoration",
                  {pct("sensitivity", "Sensitivity", 0, 100, 50), num("max_ms", "Longest Click (ms)", 0.1, 10, 2, 0.1)},
                  {}});
+    // On the clip's whole source audio (audio/SpeechCleanup.h dereverb).
+    c.push_back({"dereverb", "De-Reverb", EffectCategory::AudioFilter, "Restoration",
+                 {pct("amount", "Amount", 0, 100, 80), num("reverb_time", "Room Reverb Time (s, 0 = auto)", 0, 5, 0, 0.05),
+                  num("max_reduction_db", "Max Reduction (dB)", 0, 40, 18, 0.5)},
+                 {}});
     c.push_back({"dehum", "De-Hum", EffectCategory::AudioFilter, "Restoration",
                  {choice("mains", "Mains", {"50 Hz", "60 Hz"}, 0), num("harmonics", "Harmonics", 1, 16, 6, 1),
                   num("reduction_db", "Reduction (dB)", 0, 60, 30, 0.5), num("width_hz", "Notch Width (Hz)", 0.5, 10, 2, 0.1)},

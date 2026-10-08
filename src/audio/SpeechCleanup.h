@@ -29,6 +29,16 @@ bool hasVoiceIsolation();
 void reduceNoise(const AudioBuffer& in, AudioBuffer& out, double reductionDb, double sensitivity,
                  const std::atomic<bool>* cancel = nullptr);
 
+// De-reverb (like iZotope RX De-reverb, Premiere's Reduce Reverb, Fairlight's De-Reverb): the late reverberation
+// of a room is estimated from the sound itself, as what was heard a little earlier decaying at the room's rate
+// (Lebart, Boucher and Denbigh's model), and taken out by spectral subtraction. `reverbTime` is the room's RT60 in
+// seconds (0: estimated from how fast the sound dies away after it stops); `amount` 0..100 mixes the result with
+// the original, and nothing is turned down by more than `maxReductionDb`.
+void dereverb(const AudioBuffer& in, AudioBuffer& out, double amount, double reverbTime, double maxReductionDb,
+              const std::atomic<bool>* cancel = nullptr);
+// The room's reverberation time (RT60, seconds) from the fastest free decays in the sound; 0 if none was found.
+double estimateReverbTime(const AudioBuffer& in);
+
 // Keeps speech and removes everything else with RNNoise (Xiph, BSD), mixed
 // with the original by `amount` (0..100). False if unavailable.
 bool isolateVoice(const AudioBuffer& in, AudioBuffer& out, double amount, const std::atomic<bool>* cancel = nullptr);

@@ -681,6 +681,91 @@ private slots:
         QVERIFY2(qualityCheck(p, s, 0, speechEnd, q).empty(), qPrintable(describe(qualityCheck(p, s, 0, speechEnd, q))));
     }
 
+    void dereverbSpeech() {
+        constexpr int sr = 16000;
+        std::string err;
+        AudioBufferPtr dry = decodeAudio(MONTAGE_TEST_DATA_DIR "/jfk.wav", sr, &err);
+        QVERIFY2(dry, err.c_str());
+        // A room: the direct sound, then velvet-noise reflections from 5 ms decaying to -60 dB at rt60, with the
+        // reverberant energy `drrDb` below the direct sound's.
+        auto room = [&](double rt60, double drrDb, bool lateOnly = false, bool earlyOnly = false) {
+            std::mt19937 rng(7);
+            std::uniform_real_distribution<double> u(0, 1);
+            std::vector<std::pair<int, float>> taps;
+            const int len = int(rt60 * sr * 1.2), density = 2000;
+            double energy = 0;
+            for (int m = 0;; ++m) {
+                const int at = int(sr * 0.005) + int((m + u(rng)) * sr / density);
+                if (at >= len) break;
+                const float g = float((u(rng) < 0.5 ? -1 : 1) * std::pow(10.0, -3.0 * at / (rt60 * sr)));
+                taps.push_back({at, g});
+                energy += double(g) * g;
+            }
+            const float scale = float(std::sqrt(std::pow(10.0, -drrDb / 10) / energy));
+            AudioBuffer wet;
+            wet.sampleRate = sr;
+            wet.samples = dry->samples;
+            const int64_t n = dry->frames();
+            for (const auto& [at, g] : taps) {
+                if ((earlyOnly && at >= sr / 20) || (lateOnly && at < sr / 20)) continue;
+                for (int64_t i = 0; i + at < n; ++i)
+                    for (int c = 0; c < 2; ++c) wet.samples[size_t(i + at) * 2 + size_t(c)] += dry->samples[size_t(i) * 2 + size_t(c)] * g * scale;
+            }
+            return wet;
+        };
+        // How far the speech with its early reflections (the first 50 ms, which De-Reverb keeps) stands above
+        // everything else in `b` (dB), at the best scale.
+        AudioBuffer target;
+        auto srr = [&](const AudioBuffer& b) {
+            double xy = 0, xx = 0, yy = 0;
+            for (size_t i = 0; i < b.samples.size(); ++i) {
+                xy += double(b.samples[i]) * target.samples[i];
+                xx += double(target.samples[i]) * target.samples[i];
+                yy += double(b.samples[i]) * b.samples[i];
+            }
+            const double k = xy / xx;
+            return 10 * std::log10(k * k * xx / std::max(1e-12, yy - 2 * k * xy + k * k * xx));
+        };
+        target = room(0.8, 0, false, true);
+        const AudioBuffer wet = room(0.8, 0);
+        const double before = srr(wet);
+        AudioBuffer fixedKnown, fixedAuto, gentle;
+        dereverb(wet, fixedKnown, 100, 0.8, 30);
+        dereverb(wet, fixedAuto, 100, 0, 30);
+        dereverb(wet, gentle, 40, 0.8, 30);
+        const double known = srr(fixedKnown), autoT = srr(fixedAuto), mild = srr(gentle);
+        const double est06 = estimateReverbTime(room(0.6, 0)), est08 = estimateReverbTime(wet), est15 = estimateReverbTime(room(1.5, 0));
+        const double estDry = estimateReverbTime(*dry);
+        AudioBuffer dryOut;
+        dereverb(*dry, dryOut, 100, 0, 30);
+        target = *dry;
+        const double dryKept = srr(dryOut);
+        target = room(1.5, -3, false, true);
+        const AudioBuffer big = room(1.5, -3);
+        AudioBuffer bigOut;
+        dereverb(big, bigOut, 100, 0, 30);
+        const QString got = QString::asprintf("wet %.2f, known %.2f, auto %.2f, gentle %.2f; dry %.2f; big room %.2f -> %.2f; RT60 %.2f %.2f %.2f, dry %.2f",
+                                              before, known, autoT, mild, dryKept, srr(big), srr(bigOut), est06, est08, est15, estDry);
+        // The room's reverberation time is found from the speech within 15 %, and a dry recording reads as dry.
+        QVERIFY2(est06 > 0.51 && est06 < 0.69 && est08 > 0.68 && est08 < 0.92 && est15 > 1.27 && est15 < 1.73 && estDry < 0.35, qPrintable(got));
+        // The late reverberation comes down (2.6 dB more speech over what is left in a 0.8 s room, 3.2 dB in a
+        // 1.5 s one), estimated or told the room; a lower amount does less; dry speech goes through almost untouched.
+        QVERIFY2(known - before > 2.2 && std::fabs(autoT - known) < 0.3, qPrintable(got));
+        QVERIFY2(mild > before + 0.5 && mild < known, qPrintable(got));
+        QVERIFY2(srr(bigOut) - srr(big) > 2.7, qPrintable(got));
+        QVERIFY2(dryKept > 23, qPrintable(got));
+        // As a clip effect it runs on the source audio, like the other repairs.
+        QVERIFY(isSourceAudioEffect("dereverb"));
+        Project p = makeDefaultProject();
+        Effect e = makeEffect(p, "dereverb");
+        e.params["reverb_time"] = 0.8;
+        auto wetPtr = std::make_shared<AudioBuffer>(wet);
+        AudioBufferPtr cleaned = cleanedAudio("wet-room", wetPtr, {&e}, true);
+        QVERIFY(cleaned && cleaned != wetPtr);
+        target = room(0.8, 0, false, true);
+        QVERIFY2(srr(*cleaned) > before + 2, qPrintable(QString::number(srr(*cleaned))));
+    }
+
     void audioRepair() {
         constexpr int sr = 48000;
         // Amplitude of `hz` in channel `ch` of interleaved stereo, from sample `from` on.
