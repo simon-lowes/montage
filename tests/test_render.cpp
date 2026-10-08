@@ -2334,14 +2334,19 @@ colorspaces:
                 }
             return img;
         };
+        // Box-Muller on the raw generator, so every platform gets the same noise (std::normal_distribution's
+        // algorithm differs between standard libraries, and the edge check below depends on the exact noise).
         std::mt19937 rng(7);
-        std::normal_distribution<float> gauss(0.0f, float(sigma));
+        auto gauss = [&rng, sigma] {
+            const double u1 = (double(rng()) + 1.0) / 4294967296.0, u2 = double(rng()) / 4294967296.0;
+            return float(sigma * std::sqrt(-2.0 * std::log(u1)) * std::cos(2.0 * M_PI * u2));
+        };
         std::vector<Image> truth, noisy;
         for (int t = 0; t < 5; ++t) {
             truth.push_back(clean(t));
             Image n = truth.back();
             for (size_t i = 0; i < n.px.size(); ++i)
-                if (i % 4 != 3) n.px[i] += gauss(rng);
+                if (i % 4 != 3) n.px[i] += gauss();
             noisy.push_back(n);
         }
         // RMS error against the clean frame, away from the borders (where the picture slides in).
@@ -2405,9 +2410,18 @@ colorspaces:
         QCOMPARE(chain.size(), size_t(4));
         for (size_t i = 0; i < 4; ++i) {
             QVERIFY(bool(chain[i]));
-            const Point2 d = chain[i](60, 50);
-            QVERIFY2(std::fabs(d.x - 2 * offsets[i]) < 0.35 && std::fabs(d.y - offsets[i]) < 0.35,
-                     qPrintable(QString("%1: %2 %3").arg(offsets[i]).arg(d.x).arg(d.y)));
+            // The median over the inside of the picture (one point can sit where an edge leaves the flow ambiguous).
+            std::vector<double> dx, dy;
+            for (int y = 20; y <= 88; y += 4)
+                for (int x = 24; x <= 168; x += 4) {
+                    const Point2 d = chain[i](x, y);
+                    dx.push_back(d.x), dy.push_back(d.y);
+                }
+            std::nth_element(dx.begin(), dx.begin() + long(dx.size() / 2), dx.end());
+            std::nth_element(dy.begin(), dy.begin() + long(dy.size() / 2), dy.end());
+            const double mx = dx[dx.size() / 2], my = dy[dy.size() / 2];
+            QVERIFY2(std::fabs(mx - 2 * offsets[i]) < 0.35 && std::fabs(my - offsets[i]) < 0.35,
+                     qPrintable(QString("%1: %2 %3").arg(offsets[i]).arg(mx).arg(my)));
         }
         const double chained = rmse(denoiseFrame(noisy[2], around, temporal, chain), truth[2]);
         QVERIFY2(chained < 1.1 * motion, qPrintable(QString("%1 %2").arg(chained).arg(motion)));

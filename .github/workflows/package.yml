@@ -105,14 +105,29 @@ jobs:
             && { echo "MONTAGE_OBJECT_MODEL=$(cygpath -m "$dir/edgetam-video")"; echo "MONTAGE_SPEAKER_MODEL=$(cygpath -m "$dir/speakers")"; echo "MONTAGE_VISUAL_MODEL=$(cygpath -m "$dir/clip-vit-b32")"; echo "MONTAGE_SPEECH_MODEL=$(cygpath -m "$dir/speech-enhance")"; echo "MONTAGE_UPSCALE_MODEL=$(cygpath -m "$dir/upscale")"; echo "MONTAGE_FACE_MODEL=$(cygpath -m "$dir/faces")"; echo "MONTAGE_DEPTH_MODEL=$(cygpath -m "$dir/depth")"; echo "MONTAGE_RIFE_MODEL=$(cygpath -m "$dir/rife")"; echo "MONTAGE_MATTE_MODEL=$(cygpath -m "$dir/matte")"; echo "MONTAGE_TTS_MODEL=$(cygpath -m "$dir/tts")"; echo "MONTAGE_INPAINT_MODEL=$(cygpath -m "$dir/inpaint")"; } >> "$GITHUB_ENV" \
             || echo "::warning::Could not download the AI models; AI model tests will be skipped"
       - name: Test
-        # A failing Qt Test binary is run again directly so its own log shows.
+        # Qt Test's console output does not reach this log on Windows, so a failing binary is run again writing its
+        # results to a file; every failure is printed (and annotated) with where and why, and the log in full is kept.
         run: |
           ctest --test-dir build --output-on-failure || {
             for t in $(ctest --test-dir build --rerun-failed --show-only=json-v1 | sed -n 's/.*"name" *: *"\(test_[a-z]*\)".*/\1/p' | sort -u); do
-              echo "::group::$t"; (cd build/tests && QT_QPA_PLATFORM=offscreen "./$t.exe" -maxwarnings 0; echo "exit code $?"); echo "::endgroup::"
+              log="build/tests/$t-results.txt"
+              code=0
+              (cd build/tests && QT_QPA_PLATFORM=offscreen "./$t.exe" -maxwarnings 0 -o "$t-results.txt,txt") || code=$?
+              echo "::group::$t (exit code $code)"; cat "$log" 2>/dev/null || echo "no results were written"; echo "::endgroup::"
+              { grep -A3 '^FAIL!' "$log" | tr -d '\r' | awk '/^FAIL!/ { if (m) print m; m = $0; next } /^[ \t]/ { m = m " " $0 } END { if (m) print m }' |
+                  while read -r line; do echo "::error title=$t::$line"; done; } 2>/dev/null || true
+              if ! grep -q '^Totals' "$log" 2>/dev/null; then
+                echo "::error title=$t::stopped before the end (crashed?); last lines: $(tail -n 3 "$log" 2>/dev/null | tr -d '\r' | tr '\n' ' ')"
+              fi
             done
             exit 1
           }
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: test-results-windows
+          path: build/tests/*-results.txt
+          if-no-files-found: ignore
       - name: Package (portable zip)
         run: scripts/package-windows.sh build
       - name: Package (installer)
