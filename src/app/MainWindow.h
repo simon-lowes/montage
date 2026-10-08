@@ -22,6 +22,7 @@ class EditorState;
 class PlaybackController;
 class MonitorPanel;
 class MediaBinWidget;
+class RenderQueue;
 class EffectsBrowser;
 class InspectorWidget;
 class ScopesWidget;
@@ -40,6 +41,7 @@ public:
 
     EditorState* state() const { return state_; }
     TimelineWidget* timeline() const { return timeline_; }
+    RenderQueue* renderQueue() const { return queue_; }
     bool openProject(const QString& path);
     // Waits for pending renders and saves a screenshot of the window (testing aid).
     void scheduleScreenshot(const QString& path, int delayMs);
@@ -131,7 +133,9 @@ private:
     QDockWidget* transcriptDock_ = nullptr;
     QDockWidget* shotsDock_ = nullptr;
     QDockWidget* multicamDock_ = nullptr;
+    QDockWidget* queueDock_ = nullptr;
     QDockWidget* meterDock_ = nullptr;
+    RenderQueue* queue_ = nullptr;
     QMenu* recentMenu_ = nullptr;
     QMenu* windowMenu_ = nullptr;
     QLabel* statusInfo_ = nullptr;

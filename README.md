@@ -119,6 +119,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Images as stills
 - Proxy workflow: 960 px intra-frame proxies, toggled in the Program monitor
 - Preview resolution: Full, 1/2, 1/4, 1/8
+- **Render queue** (as in Media Encoder and Resolve): Add to Queue in the Export dialog. Queued exports render one after another in the background while you edit, each from the project as it was when queued. The Render Queue panel has Start, Stop, Retry, Remove, Clear Finished and Show File.
 - Loudness for delivery (Export › Loudness, or `--loudness -14`): the whole mix is measured first (ITU-R BS.1770 / EBU R128) and set to -14, -16, -23 or -24 LUFS. A look-ahead limiter keeps true peaks under -1 or -2 dBTP.
 - Export presets: H.264 (x264), H.265 (x265, 8- and 10-bit), hardware H.264/H.265 (VideoToolbox, NVENC, Quick Sync, AMF or Media Foundation, falling back to x264/x265), Apple ProRes 422 HQ/LT/4444 (with alpha), Avid DNxHR, VP9, AV1 (SVT-AV1), WAV and AAC; exports either the whole sequence or In–Out
 - Still frame export

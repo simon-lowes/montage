@@ -51,6 +51,8 @@
 #include "MonitorPanel.h"
 #include "PlaybackController.h"
 #include "Recovery.h"
+#include "RenderQueue.h"
+#include "RenderQueuePanel.h"
 #include "TimelineWidget.h"
 #include "TranscribeDialog.h"
 #include "TranscriptPanel.h"
@@ -1197,6 +1199,76 @@ private slots:
         QCOMPARE(state()->sequence()->videoTracks.back().clips.at(0).generator.type, std::string("adjustment"));
         state()->undo();
         QCOMPARE(state()->sequence()->videoTracks.size(), tracks);
+    }
+
+    void renderQueueInTheBackground() {
+        loadDemo();
+        RenderQueue* queue = win_->renderQueue();
+        QVERIFY(queue && queue->jobs().empty());
+        // From the Export dialog: Add to Queue hands the export over and closes.
+        {
+            ExportDialog ed(state(), win_.get());
+            ed.setQueue(queue);
+            auto* add = ed.findChild<QPushButton*>("addToQueue");
+            auto* path = ed.findChild<QLineEdit*>("exportPath");
+            QVERIFY(add && path && !add->isHidden());
+            path->setText(dir_.path() + "/queued-a.mp4");
+            add->click();
+            QCOMPARE(ed.result(), int(QDialog::Accepted));
+        }
+        QCOMPARE(queue->jobs().size(), size_t(1));
+        QCOMPARE(queue->jobs()[0].status, RenderQueue::Status::Waiting);
+        QVERIFY(!queue->running());
+        // Two more: one that cannot be written, one fast preset. Each renders the project as it was when added.
+        ExportSettings st = findExportPreset("H.264 - High Quality")->settings;
+        st.preset = "ultrafast";
+        st.path = (dir_.path() + "/no-such-folder/b.mp4").toStdString();
+        const Id seq = state()->sequence()->id;
+        const int bad = queue->add("Bad", "H.264", state()->project(), seq, st);
+        st.path = (dir_.path() + "/queued-c.mp4").toStdString();
+        const int good = queue->add("Good", "H.264", state()->project(), seq, st);
+        QVERIFY(state()->apply("Clear", [](Project& p, Sequence& s) {
+            std::vector<Id> all;
+            for (TrackRef r : allTracks(s))
+                for (const Clip& c : trackAt(s, r)->clips) all.push_back(c.id);
+            return edit::removeClips(p, s, all, false);
+        }));
+        auto* panel = win_->findChild<RenderQueuePanel*>();
+        QVERIFY(panel);
+        auto* startButton = panel->findChild<QPushButton*>("queueStart");
+        QVERIFY(startButton->isEnabled());
+        startButton->click();
+        QVERIFY(queue->running());
+        QTRY_VERIFY_WITH_TIMEOUT(!queue->running(), 60000);
+        QCOMPARE(queue->jobs()[0].status, RenderQueue::Status::Done);
+        QCOMPARE(queue->job(bad)->status, RenderQueue::Status::Failed);
+        QVERIFY(!queue->job(bad)->error.isEmpty());
+        QCOMPARE(queue->job(good)->status, RenderQueue::Status::Done);
+        MediaItem m;
+        QVERIFY(probeMedia((dir_.path() + "/queued-c.mp4").toStdString(), m));
+        QVERIFY2(std::fabs(m.duration - 4.0) < 0.1, qPrintable(QString::number(m.duration)));  // the 120 frames as they were
+        QVERIFY(QFileInfo::exists(dir_.path() + "/queued-a.mp4"));
+        // Retry puts a job back; Remove and Clear Finished tidy up.
+        QVERIFY(queue->retry(bad));
+        QCOMPARE(queue->job(bad)->status, RenderQueue::Status::Waiting);
+        QVERIFY(queue->remove(bad));
+        queue->clearFinished();
+        QVERIFY(queue->jobs().empty());
+        // Stopping cancels the job rendering and leaves no partial file.
+        state()->undo();
+        QVERIFY(state()->edit("Long", [](Project&, Sequence& s) {
+            s.videoTracks[0].clips.back().duration = 3000;
+            return true;
+        }));
+        st.path = (dir_.path() + "/long.mp4").toStdString();
+        const int longJob = queue->add("Long", "H.264", state()->project(), seq, st);
+        queue->start();
+        QTRY_VERIFY(queue->job(longJob)->progress > 0);
+        queue->stop();
+        QTRY_VERIFY_WITH_TIMEOUT(queue->job(longJob)->status == RenderQueue::Status::Cancelled, 30000);
+        QVERIFY(!queue->running());
+        QVERIFY(!QFileInfo::exists(dir_.path() + "/long.mp4"));
+        QVERIFY(queue->remove(longJob));
     }
 
     void colourManagementUi() {

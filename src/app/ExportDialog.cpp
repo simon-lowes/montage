@@ -26,6 +26,7 @@
 #include <exception>
 
 #include "EditorState.h"
+#include "RenderQueue.h"
 #include "SequenceSettingsDialog.h"
 #include "Theme.h"
 #include "core/History.h"
@@ -127,6 +128,7 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     presetDescription_->setPalette(dim);
 
     path_ = new QLineEdit(form_);
+    path_->setObjectName(QStringLiteral("exportPath"));
     path_->setMinimumWidth(340);
     path_->setClearButtonEnabled(true);
     browse_ = new QPushButton(tr("Browse..."), form_);
@@ -218,6 +220,11 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
 
     auto* buttons = new QDialogButtonBox(this);
     exportButton_ = buttons->addButton(tr("Export"), QDialogButtonBox::AcceptRole);
+    queueButton_ = buttons->addButton(tr("Add to Queue"), QDialogButtonBox::ActionRole);
+    queueButton_->setObjectName(QStringLiteral("addToQueue"));
+    queueButton_->setToolTip(tr("Render it later from the Render Queue panel, and keep editing"));
+    queueButton_->hide();  // until there is a queue (setQueue)
+    connect(queueButton_, &QPushButton::clicked, this, &ExportDialog::addToQueue);
     closeButton_ = buttons->addButton(QDialogButtonBox::Close);
     exportButton_->setDefault(true);
     connect(exportButton_, &QPushButton::clicked, this, [this] { exporting_ ? requestCancel() : startExport(); });
@@ -375,6 +382,12 @@ void ExportDialog::updateControls() {
     FrameTime in = 0, out = 0;
     const bool canExport = p && state_ && state_->sequence() && rangeFrames(in, out) && !path_->text().trimmed().isEmpty();
     exportButton_->setEnabled(exporting_ ? !cancel_.load() : canExport);
+    queueButton_->setEnabled(!exporting_ && canExport);
+}
+
+void ExportDialog::setQueue(RenderQueue* queue) {
+    queue_ = queue;
+    queueButton_->setVisible(queue != nullptr);
 }
 
 void ExportDialog::updateSummary() {
@@ -429,16 +442,17 @@ void ExportDialog::updateSummary() {
     summary_->setText(lines.join('\n'));
 }
 
-void ExportDialog::startExport() {
+// The settings the dialog shows, with the output path checked (and an existing file confirmed).
+bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
     const Sequence* seq = state_ ? state_->sequence() : nullptr;
     const ExportPreset* p = currentPreset();
-    FrameTime in = 0, out = 0;
-    if (!seq || !p || exporting_ || !rangeFrames(in, out)) return;
+    in = out = 0;
+    if (!seq || !p || exporting_ || !rangeFrames(in, out)) return false;
 
     QSettings settings = appSettings();
     const QString ext = QString::fromStdString(p->extension);
     QString path = path_->text().trimmed();
-    if (path.isEmpty()) return;
+    if (path.isEmpty()) return false;
     if (QFileInfo(path).isRelative()) {
         QString dir = settings.value(kSettingsDir).toString();
         if (dir.isEmpty()) dir = QDir::homePath();
@@ -455,22 +469,22 @@ void ExportDialog::startExport() {
     const QFileInfo fi(path);
     if (fi.isDir()) {
         QMessageBox::warning(this, tr("Export"), tr("%1 is a folder. Choose a file name.").arg(QDir::toNativeSeparators(path)));
-        return;
+        return false;
     }
     if (!fi.absoluteDir().exists()) {
         QMessageBox::warning(this, tr("Export"),
                              tr("The folder %1 does not exist.").arg(QDir::toNativeSeparators(fi.absolutePath())));
-        return;
+        return false;
     }
     if (fi.exists() && path != confirmedPath_) {
         const auto answer = QMessageBox::question(
             this, tr("Export"), tr("%1 already exists.\nDo you want to replace it?").arg(fi.fileName()),
             QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
-        if (answer != QMessageBox::Yes) return;
+        if (answer != QMessageBox::Yes) return false;
         confirmedPath_ = path;
     }
 
-    ExportSettings s = p->settings;
+    s = p->settings;
     s.path = path.toStdString();
     if (hasVideo(s) && !matchSize_->isChecked()) {
         s.width = width_->value();
@@ -497,6 +511,27 @@ void ExportDialog::startExport() {
 
     settings.setValue(kSettingsPreset, preset_->currentText());
     settings.setValue(kSettingsDir, fi.absolutePath());
+    return true;
+}
+
+void ExportDialog::addToQueue() {
+    ExportSettings s;
+    FrameTime in = 0, out = 0;
+    if (!queue_ || !prepare(s, in, out)) return;
+    const Sequence* seq = state_->sequence();
+    const QString preset = preset_->currentText();
+    queue_->add(QString::fromStdString(seq->name), preset, state_->project(), seq->id, s);
+    state_->message(tr("Added %1 to the render queue").arg(QFileInfo(QString::fromStdString(s.path)).fileName()), 5000);
+    accept();
+}
+
+void ExportDialog::startExport() {
+    ExportSettings s;
+    FrameTime in = 0, out = 0;
+    if (!prepare(s, in, out)) return;
+    const Sequence* seq = state_->sequence();
+    const QString path = QString::fromStdString(s.path);
+    const QFileInfo fi(path);
 
     exportPath_ = path;
     exportIn_ = in;

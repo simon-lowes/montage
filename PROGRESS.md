@@ -303,4 +303,9 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
     - the limiter: ceiling, delay, untouched audio and recovery;
     - exports: -14 LUFS within 0.3 LU with the same length and onset, and a hot target held under -1 dBTP;
     - the dialog's targets.
+- [x] Render queue (Adobe Media Encoder's queue, Resolve's Render Queue):
+  - The Export dialog's Add to Queue (with the same checks and overwrite confirmation as Export) keeps a snapshot of the project, so later edits do not change a queued render.
+  - The Render Queue panel (tabbed with Media) lists each job with its preset, output and live status. It has Start Queue, Stop (cancels the current job and stops), Retry, Remove, Clear Finished and Show File.
+  - Jobs render one at a time on a worker thread while editing goes on. A failed or cancelled job removes only the file it wrote. The status bar reports each result, and quitting during renders asks first.
+  - Tested: queue from the dialog, a failed job beside good ones, the snapshot rendering the original 4 s after the clips were deleted, retry, remove, clear, and stop cancelling with no partial file.
 

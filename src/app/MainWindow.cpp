@@ -46,6 +46,8 @@
 #include "InspectorWidget.h"
 #include "AutoDuckDialog.h"
 #include "MediaBinWidget.h"
+#include "RenderQueue.h"
+#include "RenderQueuePanel.h"
 #include "MixerPanel.h"
 #include "MulticamPanel.h"
 #include "CaptionsPanel.h"
@@ -242,6 +244,15 @@ void MainWindow::buildPanels() {
     transcriptDock_ = makeDock(tr("Transcript"), "transcript", transcript_);
     shotsDock_ = makeDock(tr("Find Shots"), "shots", shots_);
     multicamDock_ = makeDock(tr("Multicam"), "multicam", multicam_);
+    queue_ = new RenderQueue(this);
+    queueDock_ = makeDock(tr("Render Queue"), "renderqueue", new RenderQueuePanel(queue_, this));
+    connect(queue_, &RenderQueue::jobFinished, this, [this](int id, bool ok) {
+        const RenderQueue::Job* j = queue_->job(id);
+        if (!j) return;
+        const QString file = QDir::toNativeSeparators(QString::fromStdString(j->settings.path));
+        if (ok) statusBar()->showMessage(tr("Rendered %1").arg(file), 8000);
+        else if (j->status == RenderQueue::Status::Failed) statusBar()->showMessage(tr("Render failed: %1 (%2)").arg(file, j->error), 10000);
+    });
     // 1–9 cut to an angle (live while playing); Shift cuts at the playhead when stopped.
     for (int i = 0; i < 9; ++i) {
         auto* sw = new QShortcut(QKeySequence(Qt::Key_1 + i), this);
@@ -279,6 +290,7 @@ void MainWindow::resetLayout() {
     tabifyDockWidget(binDock_, effectsDock_);
     tabifyDockWidget(binDock_, transcriptDock_);
     tabifyDockWidget(binDock_, shotsDock_);
+    tabifyDockWidget(binDock_, queueDock_);
     binDock_->raise();
     addDockWidget(Qt::RightDockWidgetArea, meterDock_);
     for (QDockWidget* d : docks_) d->show();
@@ -834,7 +846,12 @@ void MainWindow::exportMedia() {
         return;
     }
     ExportDialog dlg(state_, this);
+    dlg.setQueue(queue_);
     dlg.exec();
+    if (!queue_->jobs().empty() && queue_->jobs().back().status == RenderQueue::Status::Waiting && !queue_->running()) {
+        queueDock_->show();
+        queueDock_->raise();
+    }
 }
 
 void MainWindow::exportFrame() {
@@ -851,10 +868,18 @@ void MainWindow::exportFrame() {
 }
 
 void MainWindow::closeEvent(QCloseEvent* e) {
+    if (queue_->running() &&
+        QMessageBox::question(this, tr("Render Queue"), tr("Renders are in progress. Stop them and quit?"),
+                              QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) {
+        e->ignore();
+        return;
+    }
     if (!maybeSave()) {
         e->ignore();
         return;
     }
+    queue_->stop();
+    queue_->waitForIdle();
     program_->pause();
     source_->pause();
     recovery_->endSession();  // a clean exit: nothing to recover next time

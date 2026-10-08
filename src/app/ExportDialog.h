@@ -22,6 +22,7 @@ class QSpinBox;
 namespace montage {
 
 class EditorState;
+class RenderQueue;
 
 class ExportDialog : public QDialog {
     Q_OBJECT
@@ -30,6 +31,8 @@ public:
     ~ExportDialog() override;
 
     bool isExporting() const { return exporting_; }
+    // Shows Add to Queue, which hands the export to this queue instead.
+    void setQueue(RenderQueue* queue);
 
 public slots:
     // Closing (Close button, Esc, window close) mid-export cancels the render
@@ -44,6 +47,8 @@ private:
     };
 
     const ExportPreset* currentPreset() const;
+    bool prepare(ExportSettings& s, FrameTime& in, FrameTime& out);
+    void addToQueue();
     void presetChanged();
     void browse();
     void widthChanged(int w);
@@ -77,6 +82,8 @@ private:
     QComboBox* captions_ = nullptr;
     QComboBox* color_ = nullptr;
     QComboBox* loudness_ = nullptr;
+    QPushButton* queueButton_ = nullptr;
+    RenderQueue* queue_ = nullptr;
     QLabel* summary_ = nullptr;
     QProgressBar* progress_ = nullptr;
     QLabel* eta_ = nullptr;
