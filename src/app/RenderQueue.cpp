@@ -127,7 +127,7 @@ void RenderQueue::next() {
             r.ok = exportSequence(*project, *s, settings, [progress, share](double f, FrameTime) { *progress = f * share; }, cancel,
                                   &r.error, &r.encoder);
             if (r.ok && stems)
-                r.ok = exportStems(*project, *s, settings, stems == 2, nullptr,
+                r.ok = exportStems(*project, *s, settings, stems, nullptr,
                                    [progress](double f, FrameTime) { *progress = 0.5 + f * 0.5; }, cancel, &r.error);
         } catch (const std::exception& e) {
             r.error = e.what();

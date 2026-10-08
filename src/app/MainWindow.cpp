@@ -56,6 +56,7 @@
 #include "media/HwAccel.h"
 #include "media/MediaPool.h"
 #include "media/Faces.h"
+#include "render/AutoMix.h"
 #include "EditorState.h"
 #include "EffectsBrowser.h"
 #include "ExportDialog.h"
@@ -785,6 +786,67 @@ void MainWindow::buildMenus() {
     add(clipM, tr("Swap with Next Clip"), QKeySequence("Ctrl+Shift+."), [this] { swapClip(true); })->setObjectName(QStringLiteral("swapNext"));
     add(clipM, tr("Join Through Edits"), QKeySequence(), [this] { joinThroughEdits(); })->setObjectName(QStringLiteral("joinThroughEdits"));
     add(clipM, tr("Close Up"), QKeySequence(), [this] { closeUp(); })->setObjectName(QStringLiteral("closeUp"));
+    // Audio roles (Final Cut's roles): what a clip is, for muting a role and stems by role.
+    roleMenu_ = clipM->addMenu(tr("Audio Role"));
+    roleMenu_->setObjectName(QStringLiteral("audioRoleMenu"));
+    add(roleMenu_, tr("Dialogue"), QKeySequence("Ctrl+Alt+1"), [this] { setSelectedRole(QStringLiteral("Dialogue")); })
+        ->setObjectName(QStringLiteral("roleDialogue"));
+    add(roleMenu_, tr("Music"), QKeySequence("Ctrl+Alt+2"), [this] { setSelectedRole(QStringLiteral("Music")); })
+        ->setObjectName(QStringLiteral("roleMusic"));
+    add(roleMenu_, tr("Effects"), QKeySequence("Ctrl+Alt+3"), [this] { setSelectedRole(QStringLiteral("Effects")); })
+        ->setObjectName(QStringLiteral("roleEffects"));
+    roleMenu_->addSeparator()->setObjectName(QStringLiteral("customRolesStart"));
+    roleMenu_->addSeparator();
+    add(roleMenu_, tr("New Role…"), QKeySequence(), [this] {
+        bool ok = false;
+        const QString name = QInputDialog::getText(this, tr("New Role"), tr("Role name:"), QLineEdit::Normal, QString(), &ok).trimmed();
+        if (ok && !name.isEmpty()) setSelectedRole(name);
+    })->setObjectName(QStringLiteral("roleNew"));
+    add(roleMenu_, tr("No Role"), QKeySequence(), [this] { setSelectedRole(QString()); })->setObjectName(QStringLiteral("roleNone"));
+    add(roleMenu_, tr("Detect Roles by Listening"), QKeySequence(), [this] { detectRoles(); })->setObjectName(QStringLiteral("detectRoles"));
+    connect(roleMenu_, &QMenu::aboutToShow, this, [this] {
+        // The sequence's own roles between the standard ones and the rest, and a tick on the selection's role.
+        const Sequence* s = state_->sequence();
+        for (QAction* a : roleMenu_->actions())
+            if (a->property("customRole").isValid()) delete a;
+        std::string current;
+        bool mixed = false;
+        if (s)
+            for (Id id : edit::expandLinks(*s, state_->selectedClips()))
+                if (auto loc = edit::locate(*s, id); loc && loc->track.kind == TrackKind::Audio) {
+                    const std::string& r = edit::clipById(*s, id)->role;
+                    if (!current.empty() && r != current) mixed = true;
+                    current = r;
+                }
+        QAction* before = nullptr;
+        bool afterStart = false;
+        for (QAction* a : roleMenu_->actions()) {
+            if (afterStart) {
+                before = a;
+                break;
+            }
+            afterStart = a->objectName() == QLatin1String("customRolesStart");
+        }
+        if (s)
+            for (const std::string& r : edit::sequenceRoles(*s)) {
+                if (std::find(edit::kStandardRoles.begin(), edit::kStandardRoles.end(), r) != edit::kStandardRoles.end()) continue;
+                const QString name = QString::fromStdString(r);
+                auto* a = new QAction(name, roleMenu_);
+                a->setProperty("customRole", name);
+                connect(a, &QAction::triggered, this, [this, name] { setSelectedRole(name); });
+                roleMenu_->insertAction(before, a);
+            }
+        for (QAction* a : roleMenu_->actions()) {
+            const QString role = a->property("customRole").isValid() ? a->property("customRole").toString()
+                                 : a->objectName() == QLatin1String("roleDialogue") ? QStringLiteral("Dialogue")
+                                 : a->objectName() == QLatin1String("roleMusic")    ? QStringLiteral("Music")
+                                 : a->objectName() == QLatin1String("roleEffects")  ? QStringLiteral("Effects")
+                                                                                    : QString();
+            if (role.isEmpty()) continue;
+            a->setCheckable(true);
+            a->setChecked(!mixed && role.toStdString() == current);
+        }
+    });
     add(clipM, tr("Save Effects as Preset…"), QKeySequence(), [this] {
         const Clip* c = state_->primaryClip();
         bool ok = false;
@@ -1203,7 +1265,7 @@ void MainWindow::buildMenus() {
     sep2->setSeparator(true);
     auto* sep3 = new QAction(this);
     sep3->setSeparator(true);
-    timeline_->setClipContextActions({cut, copy, pasteA, dup, sep1, del, rdel, sep2, enable, link, unlink, speed, trans, nest, sep3});
+    timeline_->setClipContextActions({cut, copy, pasteA, dup, sep1, del, rdel, sep2, enable, link, unlink, speed, trans, nest, roleMenu_->menuAction(), sep3});
     auto* closeGap = new QAction(tr("Close Gap"), this);
     connect(closeGap, &QAction::triggered, this, [this] {
         auto t = timeline_->contextTrack();
@@ -2079,6 +2141,56 @@ bool runWithProgress(QWidget* parent, EditorState* state, const QString& title,
 }
 
 }  // namespace
+
+int MainWindow::setSelectedRole(const QString& role) {
+    const std::vector<Id> sel = state_->selectedClips();
+    if (sel.empty()) {
+        state_->message(tr("Select the clips to give a role"));
+        return 0;
+    }
+    int changed = 0;
+    state_->edit(role.isEmpty() ? tr("Clear Audio Role") : tr("Audio Role: %1").arg(role), [&](Project&, Sequence& s) {
+        changed = edit::setClipRole(s, sel, role.toStdString());
+        return changed > 0;
+    });
+    if (changed) state_->message(role.isEmpty() ? tr("Cleared the role of %n audio clip(s)", nullptr, changed)
+                                                : tr("%1 on %n audio clip(s)", nullptr, changed).arg(role));
+    else state_->message(tr("No audio clips selected to change"));
+    return changed;
+}
+
+int MainWindow::detectRoles() {
+    // Listens to the audio (Auto Mix's classifier): the selected clips get what they are heard as; with nothing
+    // selected, every audio clip without a role does.
+    const Sequence* seq = state_->sequence();
+    if (!seq) return 0;
+    const std::vector<Id> sel = state_->selectedClips().empty() ? std::vector<Id>{} : edit::expandLinks(*seq, state_->selectedClips());
+    const Project snap = state_->project();
+    const Sequence s = *seq;
+    std::vector<ClipMix> plan;
+    const bool ok = runWithProgress(this, state_, tr("Listening to the audio…"), [&](const auto& progress, const std::atomic<bool>* cancel, std::string* err) {
+        plan = planMix(snap, s, MixOptions{}, progress, cancel, err);
+        if (plan.empty() && err->empty()) *err = "There is no audio to listen to";
+        return !plan.empty();
+    });
+    if (!ok) return 0;
+    int changed = 0;
+    state_->edit(tr("Detect Roles"), [&](Project&, Sequence& sq) {
+        for (const ClipMix& m : plan) {
+            if (m.guess.role == AudioRole::Silence) continue;
+            Clip* c = edit::clipById(sq, m.clip);
+            if (!c) continue;
+            const bool chosen = sel.empty() ? c->role.empty() : std::find(sel.begin(), sel.end(), c->id) != sel.end();
+            const std::string role = audioRoleName(m.guess.role);
+            if (!chosen || c->role == role) continue;
+            c->role = role;
+            ++changed;
+        }
+        return changed > 0;
+    });
+    state_->message(changed ? tr("Gave %n clip(s) a role", nullptr, changed) : tr("No clips needed a role"), 6000);
+    return changed;
+}
 
 bool MainWindow::rippleTrimToPlayhead(bool previous) {
     const Sequence* s = state_->sequence();

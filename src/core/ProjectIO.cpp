@@ -198,6 +198,7 @@ QJsonObject clipToJson(const Clip& c) {
     if (!c.enabled) o["enabled"] = false;
     if (c.linkGroup) o["link"] = double(c.linkGroup);
     if (c.colorLabel) o["label"] = c.colorLabel;
+    if (!c.role.empty()) o["role"] = qs(c.role);
     if (c.blendMode != "normal") o["blend"] = qs(c.blendMode);
     if (!c.generator.empty()) o["generator"] = effectToJson(c.generator);
     if (!c.motion.empty()) o["motion"] = effectToJson(c.motion);
@@ -234,6 +235,7 @@ Clip clipFromJson(const QJsonObject& o) {
     c.enabled = o.value("enabled").toBool(true);
     c.linkGroup = Id(i64(o.value("link")));
     c.colorLabel = o.value("label").toInt(0);
+    c.role = ss(o.value("role"));
     c.blendMode = o.contains("blend") ? ss(o.value("blend")) : "normal";
     c.generator = effectFromJson(o.value("generator"));
     c.motion = effectFromJson(o.value("motion"));
@@ -432,6 +434,11 @@ QJsonObject sequenceToJson(const Sequence& s) {
         for (const auto& [k, db] : s.folderGains) gains[qs(k)] = db;
         o["folderGains"] = gains;
     }
+    if (!s.mutedRoles.empty()) {
+        QJsonArray roles;
+        for (const std::string& r : s.mutedRoles) roles.append(qs(r));
+        o["mutedRoles"] = roles;
+    }
     if (!s.collapsedFolders.empty()) {
         QJsonArray folders;
         for (const std::string& f : s.collapsedFolders) folders.append(qs(f));
@@ -458,6 +465,7 @@ Sequence sequenceFromJson(const QJsonObject& o) {
     s.playhead = i64(o.value("playhead"), 0);
     s.multicam = o.value("multicam").toBool(false);
     for (const auto& f : o.value("collapsedFolders").toArray()) s.collapsedFolders.push_back(f.toString().toStdString());
+    for (const auto& r : o.value("mutedRoles").toArray()) s.mutedRoles.push_back(r.toString().toStdString());
     const QJsonObject gains = o.value("folderGains").toObject();
     for (auto it = gains.begin(); it != gains.end(); ++it) s.folderGains[it.key().toStdString()] = it.value().toDouble();
     s.colorSpace = o.contains("colorSpace") ? ss(o.value("colorSpace")) : "rec709";

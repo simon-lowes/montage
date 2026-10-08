@@ -280,6 +280,9 @@ std::vector<ClipMix> planMix(const Project& p, const Sequence& s, const MixOptio
             mix.shortTerm.push_back({std::clamp<FrameTime>(FrameTime(std::llround(clipFrame)), 0, c.duration - 1), meter.shortTerm()});
         }
         mix.role = mix.guess.role;
+        // A role the editor gave the clip (Clip::role) stands over what is heard, when it is one of these.
+        for (AudioRole r : {AudioRole::Dialogue, AudioRole::Music, AudioRole::Effects})
+            if (whole.valid && c.role == audioRoleName(r)) mix.role = r;
         replanClip(mix, o);
         plan.push_back(std::move(mix));
     }
@@ -299,6 +302,7 @@ int applyMix(Project& p, Sequence& s, const std::vector<ClipMix>& plan, const Mi
         Param gain(m.gainDb);
         for (const auto& [f, db] : m.ride) gain.addKey(f, m.gainDb + db);
         c->audio.params["gain_db"] = gain;
+        if (c->role.empty()) c->role = audioRoleName(m.role);  // remembered, for muting and stems by role
         ++changed;
         if (m.role == AudioRole::Dialogue && std::find(dialogueTracks.begin(), dialogueTracks.end(), loc->track.index) == dialogueTracks.end())
             dialogueTracks.push_back(loc->track.index);

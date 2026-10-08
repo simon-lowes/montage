@@ -74,6 +74,14 @@ Result placeOnTop(Project& p, Sequence& s, Id mediaId, FrameTime at, double srcI
 // after moves by the difference in length.
 Result rippleOverwrite(Project& p, Sequence& s, Id clipId, Id mediaId, double srcIn, double srcOut, TrackRef videoTrack,
                        TrackRef audioTrack);
+// Audio roles (Clip::role). The standard ones, then any others the sequence's clips use, in that order.
+extern const std::vector<std::string> kStandardRoles;  // Dialogue, Music, Effects
+std::vector<std::string> sequenceRoles(const Sequence& s);
+// Gives the audio clips among `clips`, and the audio clips linked to video ones among them, the role ("" clears it).
+// Returns how many changed.
+int setClipRole(Sequence& s, const std::vector<Id>& clips, const std::string& role);
+bool roleMuted(const Sequence& s, const std::string& role);
+void setRoleMuted(Sequence& s, const std::string& role, bool muted);
 // Smart Insert's point: the clip start or end on the track nearest the frame (the frame itself on an empty track).
 FrameTime nearestEdit(const Sequence& s, TrackRef t, FrameTime frame);
 Result razor(Project& p, Sequence& s, TrackRef t, FrameTime frame);

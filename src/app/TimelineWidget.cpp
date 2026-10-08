@@ -739,6 +739,9 @@ void TimelineWidget::paintClip(QPainter& p, const Row& row, const Clip& c, const
     if (c.ramped()) badges += tr(" ramp");
     if (!c.effects.empty()) badges += " fx";
     if (!c.takes.empty()) badges += tr(" take %1/%2").arg(c.take + 1).arg(c.takes.size());  // an audition
+    if (!c.role.empty() && row.ref.kind == TrackKind::Audio && state_->sequence())  // its audio role, and if it is muted
+        badges.prepend(QStringLiteral(" ") + QString::fromStdString(c.role) +
+                       (edit::roleMuted(*state_->sequence(), c.role) ? tr(" (muted)") : QString()));
     if (showDurations_ && state_->sequence())  // Resolve 21.1's clip durations view option
         badges += QStringLiteral("  ") + QString::fromStdString(formatTimecode(c.duration, state_->sequence()->fps));
     QFont f = p.font();

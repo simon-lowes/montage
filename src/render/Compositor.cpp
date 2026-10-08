@@ -1628,7 +1628,7 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
     std::vector<float> clipBuf(size_t(frames) * 2);
     bool any = false;
     for (const Clip& c : track.clips) {
-        if (!c.enabled) continue;
+        if (!c.enabled || edit::roleMuted(seq, c.role)) continue;
         int64_t cs = int64_t(std::llround(c.start * sr / fps)), ce = int64_t(std::llround(c.end() * sr / fps));
         // Transitions extend the playable range and add fades.
         int64_t ps = cs, pe = ce;

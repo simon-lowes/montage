@@ -55,7 +55,8 @@ struct ClipMix {
     std::vector<std::pair<FrameTime, double>> shortTerm;  // measured: clip-relative frame, LUFS (3 s)
 };
 
-// Listens to every audio clip of the sequence (not muted tracks) and works out the mix.
+// Listens to every audio clip of the sequence (not muted tracks) and works out the mix. A clip's own role
+// (Clip::role: Dialogue, Music or Effects) is kept over the guess.
 std::vector<ClipMix> planMix(const Project& p, const Sequence& s, const MixOptions& o,
                              const std::function<void(double)>& progress = {}, const std::atomic<bool>* cancel = nullptr,
                              std::string* error = nullptr);
@@ -63,8 +64,9 @@ std::vector<ClipMix> planMix(const Project& p, const Sequence& s, const MixOptio
 // Re-works the levels and ride for clips whose role was changed by hand (no listening needed).
 void replanClip(ClipMix& m, const MixOptions& o);
 
-// Writes the plan into the clips' volume (level, ride keyframes), then ducks
-// the music under the dialogue clips. Returns how many clips changed.
+// Writes the plan into the clips' volume (level, ride keyframes), gives clips
+// without a role the one they were mixed as, then ducks the music under the
+// dialogue clips. Returns how many clips changed.
 int applyMix(Project& p, Sequence& s, const std::vector<ClipMix>& plan, const MixOptions& o);
 
 }  // namespace montage

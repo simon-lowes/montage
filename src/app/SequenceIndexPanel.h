@@ -28,7 +28,12 @@ public:
     void activate(int row);              // as a double-click
     bool rename(int row, const QString& name);  // a clip or marker, as one undo step
 
-    enum Column { Name, Kind, Color, Track, Start, End, Duration, SourceIn, Media, Effects, Columns };
+    enum Column { Name, Kind, Color, Role, Track, Start, End, Duration, SourceIn, Media, Effects, Columns };
+
+    // Roles (Final Cut's Timeline Index): a box per audio role, unticked = the role is muted (one undo step each).
+    QStringList roles() const;
+    bool roleHeard(const QString& role) const;
+    bool setRoleHeard(const QString& role, bool heard);
 
 private:
     struct Row {
@@ -37,7 +42,9 @@ private:
         int markerIndex = -1;
         FrameTime start = 0;
         int color = 0;  // the clip's or marker's colour label, shown as a swatch
+        QString role;   // an audio clip's role
     };
+    void rebuildRoles();
     void rebuild();
     void applyFilter();
 
@@ -45,6 +52,7 @@ private:
     QLineEdit* filter_ = nullptr;
     QTableWidget* table_ = nullptr;
     QLabel* count_ = nullptr;
+    QWidget* rolesBar_ = nullptr;
     std::vector<Row> rows_;  // by the table's item data, not position (sorting moves rows)
     bool building_ = false;
 };

@@ -193,6 +193,9 @@ struct Clip {
     bool enabled = true;
     Id linkGroup = 0;            // clips sharing a non-zero link group act as one
     int colorLabel = 0;
+    // Audio role (Final Cut's roles, Premiere's clip types): "Dialogue", "Music", "Effects" or the editor's own; ""
+    // = none. A sequence can mute a role, and stems can be split by role.
+    std::string role;
     std::string blendMode = "normal";
     Effect generator;            // non-empty type => clip is generated, not decoded
     Effect motion;               // fixed "transform" attributes (video clips)
@@ -313,6 +316,7 @@ struct Sequence {
     bool multicam = false;              // a multicam clip's sequence: video tracks are angles (Multicam.h)
     std::vector<std::string> collapsedFolders;  // track folders shown collapsed: "V/name" or "A/name"
     std::map<std::string, double> folderGains;  // audio track folders' faders (a VCA over their tracks), dB, by "A/name"
+    std::vector<std::string> mutedRoles;  // audio roles not heard (clip roles, see Clip::role)
     std::string colorSpace = "rec709";  // working and delivery space (ColorSpace.h id)
     double hdrPeakNits = 1000;          // mastering peak for HDR spaces
     FrameTime inPoint = -1;   // In / Out marks; both frames are included, -1 = unset

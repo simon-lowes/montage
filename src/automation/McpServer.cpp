@@ -197,6 +197,7 @@ QJsonObject clipJson(const Project& p, const Sequence& s, const Clip& c) {
     if (c.speed != 1.0 || c.reverse) o["speed"] = (c.reverse ? -1 : 1) * c.speed;
     if (!c.enabled) o["enabled"] = false;
     if (c.linkGroup) o["linked_group"] = double(c.linkGroup);
+    if (!c.role.empty()) o["role"] = QString::fromStdString(c.role);
     QJsonArray fx;
     for (const Effect& e : c.effects) fx.append(QJsonObject{{"id", double(e.id)}, {"type", QString::fromStdString(e.type)}});
     if (!fx.isEmpty()) o["effects"] = fx;
@@ -249,7 +250,7 @@ QJsonObject projectJson(const Project& p) {
         logJson(m, mo);
         media.append(mo);
     }
-    return QJsonObject{{"sequence", QString::fromStdString(s.name)},
+    QJsonObject out{{"sequence", QString::fromStdString(s.name)},
                        {"width", s.width},
                        {"height", s.height},
                        {"fps", s.fpsValue()},
@@ -258,6 +259,12 @@ QJsonObject projectJson(const Project& p) {
                        {"tracks", tracks},
                        {"markers", markers},
                        {"media", media}};
+    if (!s.mutedRoles.empty()) {
+        QJsonArray muted;
+        for (const std::string& r : s.mutedRoles) muted.append(QString::fromStdString(r));
+        out["muted_roles"] = muted;
+    }
+    return out;
 }
 
 // Adds a media file to the project (or finds it there).
@@ -1620,6 +1627,57 @@ void McpServer::Impl::addTools() {
             return ok(QStringLiteral("Mixed %1 clip(s)").arg(n), QJsonObject{{"clips", clips}, {"changed", n}});
         });
 
+    add("montage_set_roles", "Set audio roles",
+        "Audio roles, as in Final Cut: tag audio clips Dialogue, Music, Effects or a role of your own (a video clip's "
+        "linked sound takes it), mute or unmute a role across the sequence, or detect the roles of untagged clips by "
+        "listening. Roles drive stems by role (montage_export stems roles) and are kept by montage_auto_mix.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "clips":{"type":"array","items":{"type":"number"},"description":"Clip ids to tag with role"},
+            "role":{"type":"string","description":"Dialogue, Music, Effects or any name; empty clears"},
+            "mute":{"type":"array","items":{"type":"string"},"description":"Roles to mute"},
+            "unmute":{"type":"array","items":{"type":"string"},"description":"Roles to hear again"},
+            "detect":{"type":"boolean","default":false,"description":"Listen to untagged audio clips and tag them"}},
+            "required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            QStringList done;
+            if (a.contains("clips")) {
+                if (!a.contains("role")) throw ArgError{"\"role\" is needed with \"clips\""};
+                std::vector<Id> ids;
+                for (const QJsonValue& v : a.value("clips").toArray()) {
+                    if (!edit::clipById(s, Id(v.toDouble()))) throw ArgError{QStringLiteral("No clip %1 in the active sequence").arg(qulonglong(v.toDouble()))};
+                    ids.push_back(Id(v.toDouble()));
+                }
+                const int n = edit::setClipRole(s, ids, str(a, "role").trimmed().toStdString());
+                done << QStringLiteral("tagged %1 audio clip(s)").arg(n);
+            }
+            for (const QJsonValue& v : a.value("mute").toArray()) edit::setRoleMuted(s, v.toString().toStdString(), true);
+            for (const QJsonValue& v : a.value("unmute").toArray()) edit::setRoleMuted(s, v.toString().toStdString(), false);
+            if (a.contains("mute") || a.contains("unmute")) done << QStringLiteral("%1 role(s) muted").arg(s.mutedRoles.size());
+            if (a.value("detect").toBool()) {
+                std::string err;
+                const auto plan = planMix(l.project, s, MixOptions{}, {}, nullptr, &err);
+                int n = 0;
+                for (const ClipMix& m : plan)
+                    if (Clip* c = edit::clipById(s, m.clip); c && c->role.empty() && m.guess.role != AudioRole::Silence) {
+                        c->role = audioRoleName(m.guess.role);
+                        ++n;
+                    }
+                done << QStringLiteral("detected %1 role(s)").arg(n);
+            }
+            if (done.isEmpty()) throw ArgError{"Give clips and a role, mute, unmute or detect"};
+            save(l);
+            QJsonArray roles;
+            for (const std::string& r : edit::sequenceRoles(s)) {
+                int clips = 0;
+                for (const Track& t : s.audioTracks)
+                    for (const Clip& c : t.clips) clips += c.role == r;
+                roles.append(QJsonObject{{"role", QString::fromStdString(r)}, {"clips", clips}, {"muted", edit::roleMuted(s, r)}});
+            }
+            return ok(done.join(QStringLiteral("; ")), QJsonObject{{"roles", roles}});
+        });
+
     add("montage_bleep", "Bleep words",
         "Cover spoken words with a bleep tone (or silence), as broadcasters do: every swear word in the transcribed "
         "dialogue (profanity), every time a phrase is said, or given stretches of the timeline. Kept on each clip in source "
@@ -2518,8 +2576,8 @@ void McpServer::Impl::addTools() {
                 "watermark_corner":{"type":"string","enum":["top_left","top_centre","top_right","bottom_left","bottom_centre","bottom_right"],"default":"bottom_right"},
                 "watermark_opacity":{"type":"number","default":0.6}}},
             "downmix_stereo":{"type":"boolean","default":false,"description":"A 5.1/7.1 sequence: fold the mix down to stereo"},
-            "stems":{"type":"string","enum":["none","tracks","buses"],"default":"none",
-                "description":"Also write 24-bit WAV stems beside the output, one per audio track or per bus (plus Main)"}},
+            "stems":{"type":"string","enum":["none","tracks","buses","roles"],"default":"none",
+                "description":"Also write 24-bit WAV stems beside the output, one per audio track, per bus (plus Main) or per audio role"}},
             "required":["project","output"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
@@ -2554,7 +2612,8 @@ void McpServer::Impl::addTools() {
             }
             st.downmixStereo = a.value("downmix_stereo").toBool();
             const QString stems = str(a, "stems", "none");
-            if (stems != "none" && stems != "tracks" && stems != "buses") throw ArgError{"\"stems\" must be none, tracks or buses"};
+            if (stems != "none" && stems != "tracks" && stems != "buses" && stems != "roles")
+                throw ArgError{"\"stems\" must be none, tracks, buses or roles"};
             std::string err;
             if (!exportSequence(l.project, s, st, [this](double f, FrameTime) { progress(f, "Rendering"); }, nullptr, &err))
                 return fail(QString::fromStdString(err));
@@ -2562,7 +2621,7 @@ void McpServer::Impl::addTools() {
             QString text = QStringLiteral("Wrote %1").arg(QString::fromStdString(st.path));
             if (stems != "none") {
                 std::vector<StemFile> files;
-                if (!exportStems(l.project, s, st, stems == "buses", &files, [this](double f, FrameTime) { progress(f, "Stems"); },
+                if (!exportStems(l.project, s, st, stems == "buses" ? StemsByBus : stems == "roles" ? StemsByRole : StemsByTrack, &files, [this](double f, FrameTime) { progress(f, "Stems"); },
                                  nullptr, &err))
                     return fail(QString::fromStdString(err));
                 QJsonArray list;

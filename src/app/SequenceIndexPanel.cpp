@@ -1,5 +1,6 @@
 #include "SequenceIndexPanel.h"
 
+#include <QCheckBox>
 #include <QFileInfo>
 #include <QHBoxLayout>
 #include <QHeaderView>
@@ -29,10 +30,16 @@ SequenceIndexPanel::SequenceIndexPanel(EditorState* state, QWidget* parent) : QW
     count_->setObjectName(QStringLiteral("indexCount"));
     top->addWidget(count_);
     lay->addLayout(top);
+    rolesBar_ = new QWidget(this);
+    rolesBar_->setObjectName(QStringLiteral("indexRoles"));
+    rolesBar_->setToolTip(tr("Audio roles: untick one to mute every clip with it"));
+    auto* rolesLay = new QHBoxLayout(rolesBar_);
+    rolesLay->setContentsMargins(0, 0, 0, 0);
+    lay->addWidget(rolesBar_);
     table_ = new QTableWidget(0, Columns, this);
     table_->setObjectName(QStringLiteral("sequenceIndex"));
     table_->setHorizontalHeaderLabels(
-        {tr("Name"), tr("Kind"), tr("Colour"), tr("Track"), tr("Start"), tr("End"), tr("Duration"), tr("Source In"), tr("Media"), tr("Effects")});
+        {tr("Name"), tr("Kind"), tr("Colour"), tr("Role"), tr("Track"), tr("Start"), tr("End"), tr("Duration"), tr("Source In"), tr("Media"), tr("Effects")});
     table_->setSelectionBehavior(QAbstractItemView::SelectRows);
     table_->setEditTriggers(QAbstractItemView::EditKeyPressed | QAbstractItemView::SelectedClicked);
     table_->verticalHeader()->hide();
@@ -71,6 +78,7 @@ void SequenceIndexPanel::rebuild() {
             const int r = table_->rowCount();
             table_->insertRow(r);
             cells.insert(Color, row.color > 0 ? QString::fromUtf8(theme::labelName(row.color)) : QString());
+            cells.insert(Role, row.role);
             for (int c = 0; c < Columns; ++c) {
                 auto* item = new QTableWidgetItem(cells.value(c));
                 if (c == Color && row.color > 0) item->setData(Qt::DecorationRole, theme::labelColor(row.color));
@@ -95,6 +103,7 @@ void SequenceIndexPanel::rebuild() {
                 row.clip = c.id;
                 row.start = c.start;
                 row.color = c.colorLabel;
+                if (!video) row.role = QString::fromStdString(c.role);
                 addRow(row, {name, kind, label, tc(c.start), tc(c.end()), tc(c.duration), c.isGenerator() ? QString() : tc(FrameTime(std::llround(c.sourceIn))),
                              media, fx.join(QStringLiteral(", "))});
                 // The clip's markers, where the clip shows them.
@@ -129,6 +138,52 @@ void SequenceIndexPanel::rebuild() {
     table_->setSortingEnabled(true);
     building_ = false;
     applyFilter();
+    rebuildRoles();
+}
+
+void SequenceIndexPanel::rebuildRoles() {
+    auto* lay = static_cast<QHBoxLayout*>(rolesBar_->layout());
+    while (QLayoutItem* item = lay->takeAt(0)) {
+        if (QWidget* w = item->widget()) {
+            w->hide();
+            w->deleteLater();  // a box may be the one whose toggle brought us here
+        }
+        delete item;
+    }
+    const Sequence* s = state_->sequence();
+    rolesBar_->setVisible(s && !s->audioTracks.empty());
+    if (!s) return;
+    lay->addWidget(new QLabel(tr("Roles:"), rolesBar_));
+    for (const std::string& r : edit::sequenceRoles(*s)) {
+        const QString name = QString::fromStdString(r);
+        auto* box = new QCheckBox(name, rolesBar_);
+        box->setObjectName(QStringLiteral("role_") + name);
+        box->setChecked(!edit::roleMuted(*s, r));
+        connect(box, &QCheckBox::toggled, this, [this, name](bool on) { setRoleHeard(name, on); });
+        lay->addWidget(box);
+    }
+    lay->addStretch(1);
+}
+
+QStringList SequenceIndexPanel::roles() const {
+    QStringList out;
+    if (const Sequence* s = state_->sequence())
+        for (const std::string& r : edit::sequenceRoles(*s)) out << QString::fromStdString(r);
+    return out;
+}
+
+bool SequenceIndexPanel::roleHeard(const QString& role) const {
+    const Sequence* s = state_->sequence();
+    return s && !edit::roleMuted(*s, role.toStdString());
+}
+
+bool SequenceIndexPanel::setRoleHeard(const QString& role, bool heard) {
+    const std::string r = role.toStdString();
+    return state_->edit(heard ? tr("Unmute Role %1").arg(role) : tr("Mute Role %1").arg(role), [&](Project&, Sequence& s) {
+        if (edit::roleMuted(s, r) == !heard) return false;
+        edit::setRoleMuted(s, r, !heard);
+        return true;
+    });
 }
 
 void SequenceIndexPanel::applyFilter() {

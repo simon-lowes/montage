@@ -1130,13 +1130,32 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
     return ok;
 }
 
-bool exportStems(const Project& p, const Sequence& seq, const ExportSettings& s, bool byBus, std::vector<StemFile>* written,
+bool exportStems(const Project& p, const Sequence& seq, const ExportSettings& s, int grouping, std::vector<StemFile>* written,
                  const ExportProgress& progress, const std::atomic<bool>* cancel, std::string* error) {
-    // The groups: each track, or each bus's tracks (and the ones going straight to the master).
+    // The groups: each track, each bus's tracks (and the ones going straight to the master), or each role.
     std::vector<std::pair<std::string, std::vector<bool>>> groups;
     const size_t n = seq.audioTracks.size();
     auto hasClips = [&](size_t i) { return !seq.audioTracks[i].muted && !seq.audioTracks[i].clips.empty(); };
-    if (!byBus) {
+    // By role: every track plays, with every role but the stem's muted ("No Role" standing for clips without one).
+    static const std::string kNoRole = "No Role";
+    Sequence byRole;
+    std::vector<std::string> roles;
+    if (grouping == StemsByRole) {
+        byRole = seq;
+        for (Track& t : byRole.audioTracks)
+            for (Clip& c : t.clips)
+                if (c.role.empty()) c.role = kNoRole;
+        for (const std::string& r : edit::sequenceRoles(byRole)) {
+            if (edit::roleMuted(seq, r)) continue;
+            bool used = false;
+            for (size_t i = 0; i < n && !used; ++i)
+                if (hasClips(i))
+                    for (const Clip& c : byRole.audioTracks[i].clips) used = used || (c.enabled && c.role == r);
+            if (!used) continue;
+            roles.push_back(r);
+            groups.push_back({r, {}});
+        }
+    } else if (grouping != StemsByBus) {
         for (size_t i = 0; i < n; ++i) {
             if (!hasClips(i)) continue;
             std::vector<bool> mask(n, false);
@@ -1184,7 +1203,12 @@ bool exportStems(const Project& p, const Sequence& seq, const ExportSettings& s,
         one.audioTracks = groups[g].second;
         const ExportProgress part = progress ? ExportProgress([&, g](double f, FrameTime t) { progress((double(g) + f) / double(groups.size()), t); })
                                              : ExportProgress();
-        if (!exportSequence(p, seq, one, part, cancel, error)) return false;
+        if (grouping == StemsByRole) {
+            byRole.mutedRoles.clear();
+            for (const std::string& r : edit::sequenceRoles(byRole))
+                if (r != roles[g]) byRole.mutedRoles.push_back(r);
+        }
+        if (!exportSequence(p, grouping == StemsByRole ? byRole : seq, one, part, cancel, error)) return false;
         if (written) written->push_back({groups[g].first, one.path});
     }
     return true;

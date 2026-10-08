@@ -380,6 +380,45 @@ Result rippleOverwrite(Project& p, Sequence& s, Id clipId, Id mediaId, double sr
     return placeMedia(p, s, mediaId, a, srcIn, srcOut, videoTrack, audioTrack, false);
 }
 
+const std::vector<std::string> kStandardRoles{"Dialogue", "Music", "Effects"};
+
+std::vector<std::string> sequenceRoles(const Sequence& s) {
+    std::vector<std::string> out = kStandardRoles;
+    for (const Track& t : s.audioTracks)
+        for (const Clip& c : t.clips)
+            if (!c.role.empty() && std::find(out.begin(), out.end(), c.role) == out.end()) out.push_back(c.role);
+    for (const std::string& r : s.mutedRoles)
+        if (std::find(out.begin(), out.end(), r) == out.end()) out.push_back(r);
+    return out;
+}
+
+int setClipRole(Sequence& s, const std::vector<Id>& clips, const std::string& role) {
+    std::vector<Id> ids;
+    for (Id id : clips)
+        for (Id l : linkedClips(s, id))
+            if (std::find(ids.begin(), ids.end(), l) == ids.end()) ids.push_back(l);
+    int changed = 0;
+    for (Track& t : s.audioTracks)
+        for (Clip& c : t.clips)
+            if (std::find(ids.begin(), ids.end(), c.id) != ids.end() && c.role != role) {
+                c.role = role;
+                ++changed;
+            }
+    return changed;
+}
+
+bool roleMuted(const Sequence& s, const std::string& role) {
+    return !role.empty() && std::find(s.mutedRoles.begin(), s.mutedRoles.end(), role) != s.mutedRoles.end();
+}
+
+void setRoleMuted(Sequence& s, const std::string& role, bool muted) {
+    if (role.empty() || roleMuted(s, role) == muted) return;
+    if (muted)
+        s.mutedRoles.push_back(role);
+    else
+        std::erase(s.mutedRoles, role);
+}
+
 FrameTime nearestEdit(const Sequence& s, TrackRef t, FrameTime frame) {
     FrameTime best = frame, dist = std::numeric_limits<FrameTime>::max();
     if (const Track* tr = trackAt(s, t))

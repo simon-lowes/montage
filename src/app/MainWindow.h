@@ -134,6 +134,10 @@ public:
     // Close Up (Resolve's Cut page): a punched-in copy (zoom times) of the video clip under the playhead, over In to
     // Out or the whole clip, on the track above, framed on the face found in it (else the middle). Its id, or 0.
     Id closeUp(double zoom = 1.5);
+    // Audio roles: the selected clips' (and their linked audio's) role, "" for none; listening for the roles of the
+    // selected clips, or of every audio clip without one. Return how many clips changed.
+    int setSelectedRole(const QString& role);
+    int detectRoles();
     int joinThroughEdits();  // the selected clips' through edits, else all of the sequence's; how many (one undo step)
     bool swapClip(bool withNext);                     // the selected clip (or the one under the playhead) with its neighbour
     bool replaceWithSource();                         // the selected clip, or the one under the playhead
@@ -303,6 +307,7 @@ private:
     QMenu* windowMenu_ = nullptr;
     QString workspace_ = QStringLiteral("Editing");
     QTabBar* workspaceBar_ = nullptr;
+    QMenu* roleMenu_ = nullptr;
     QMenu* workspaceMenu_ = nullptr;
     QMenu* deleteWorkspaceMenu_ = nullptr;
     QAction* workspaceCustomEnd_ = nullptr;  // saved workspaces are listed before this separator

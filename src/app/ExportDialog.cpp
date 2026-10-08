@@ -238,7 +238,8 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     stems_->addItem(tr("None"));
     stems_->addItem(tr("Also one WAV per audio track"));
     stems_->addItem(tr("Also one WAV per bus (and Main)"));
-    stems_->setToolTip(tr("Stems for delivery: each track's or bus's part of the mix, exactly as it plays in it,\n"
+    stems_->addItem(tr("Also one WAV per role (Dialogue, Music, Effects...)"));
+    stems_->setToolTip(tr("Stems for delivery: each track's, bus's or role's part of the mix, exactly as it plays in it,\n"
                           "written beside the export as \"<name> - <track>.wav\". Together they add up to the mix."));
     form->addRow(tr("Stems:"), stems_);
     // Burn-ins: what a review copy carries in the picture.
@@ -691,7 +692,7 @@ void ExportDialog::startExport() {
                 snap, *sq, s, [&](double f, FrameTime t) { onProgress(f * share, t); }, cancel, &error, &encoder);
             if (r.ok && stems > 0)
                 r.ok = exportStems(
-                    snap, *sq, s, stems == 2, nullptr, [&](double f, FrameTime t) { onProgress(0.5 + f * 0.5, t); }, cancel, &error);
+                    snap, *sq, s, stems, nullptr, [&](double f, FrameTime t) { onProgress(0.5 + f * 0.5, t); }, cancel, &error);
             r.error = QString::fromStdString(error);
             r.encoder = QString::fromStdString(encoder);
         } catch (const std::exception& e) {

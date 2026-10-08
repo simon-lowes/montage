@@ -86,16 +86,19 @@ using ExportProgress = std::function<void(double fraction, FrameTime frame)>;
 // videoCodec "hw_h264" / "hw_hevc" picks this machine's hardware encoder
 // (VideoToolbox, NVENC, Quick Sync, AMF, Media Foundation) and falls back to
 // x264 / x265; `encoderUsed` receives the encoder that ran.
-// Stems for delivery (split-track masters): one 24-bit WAV per audio track, or
+// Stems for delivery (split-track masters): one 24-bit WAV per audio track,
 // per bus (the tracks routed to it, and "Main" for those going straight to
-// the master), each through its own effects, fader and pan exactly as in the
-// full mix, in the sequence's channel layout (or stereo with downmixStereo).
-// Written beside `s.path` as "<name> - <stem>.wav"; silent groups are skipped.
+// the master) or per audio role (Final Cut's role stems: Dialogue, Music,
+// Effects and the editor's own, "No Role" for clips without one), each
+// through its effects, fader and pan exactly as in the full mix, in the
+// sequence's channel layout (or stereo with downmixStereo). Written beside
+// `s.path` as "<name> - <stem>.wav"; silent and muted groups are skipped.
+enum StemGroups : int { StemsByTrack = 1, StemsByBus = 2, StemsByRole = 3 };
 struct StemFile {
     std::string name;
     std::string path;
 };
-bool exportStems(const Project& p, const Sequence& seq, const ExportSettings& s, bool byBus, std::vector<StemFile>* written,
+bool exportStems(const Project& p, const Sequence& seq, const ExportSettings& s, int groups, std::vector<StemFile>* written,
                  const ExportProgress& progress = {}, const std::atomic<bool>* cancel = nullptr, std::string* error = nullptr);
 
 bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,

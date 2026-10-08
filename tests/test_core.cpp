@@ -2655,6 +2655,37 @@ private slots:
         QCOMPARE(nearestEdit(fx.s(), {TrackKind::Video, int(fx.s().videoTracks.size()) - 1}, 42), FrameTime(42));
     }
 
+    void audioRoles() {
+        // A video clip with linked sound, and a second sound clip: roles go on the sound only.
+        Fixture fx;
+        const Result placed = placeMedia(fx.p, fx.s(), fx.media, 0, 0, 60, V1, A1, false);
+        QVERIFY(placed.ok && placed.created.size() == 2);
+        const Id video = placed.created[0], sound = placed.created[1];
+        const Id music = fx.put({TrackKind::Audio, 1}, 0, 30);
+        QCOMPARE(setClipRole(fx.s(), {video}, "Dialogue"), 1);
+        QCOMPARE(clipById(fx.s(), sound)->role, std::string("Dialogue"));
+        QVERIFY(clipById(fx.s(), video)->role.empty());
+        QCOMPARE(setClipRole(fx.s(), {video}, "Dialogue"), 0);  // no change
+        QCOMPARE(setClipRole(fx.s(), {music}, "Score"), 1);
+        // The standard roles first, then the sequence's own.
+        QCOMPARE(sequenceRoles(fx.s()), (std::vector<std::string>{"Dialogue", "Music", "Effects", "Score"}));
+        QVERIFY(!roleMuted(fx.s(), "Score"));
+        setRoleMuted(fx.s(), "Score", true);
+        setRoleMuted(fx.s(), "Score", true);
+        QCOMPARE(fx.s().mutedRoles.size(), size_t(1));
+        QVERIFY(roleMuted(fx.s(), "Score") && !roleMuted(fx.s(), "") && !roleMuted(fx.s(), "Dialogue"));
+        // Saved and read back.
+        Project back;
+        QVERIFY(projectFromJson(projectToJson(fx.p), back));
+        QCOMPARE(clipById(*back.active(), music)->role, std::string("Score"));
+        QCOMPARE(clipById(*back.active(), sound)->role, std::string("Dialogue"));
+        QVERIFY(roleMuted(*back.active(), "Score"));
+        setRoleMuted(fx.s(), "Score", false);
+        QVERIFY(fx.s().mutedRoles.empty());
+        QCOMPARE(setClipRole(fx.s(), {music, video}, ""), 2);  // cleared
+        QCOMPARE(sequenceRoles(fx.s()).size(), size_t(3));
+    }
+
     void effectPresets() {
         // A clip's blur and a keyframed brightness saved as a preset, read back and put on another clip.
         Fixture fx;

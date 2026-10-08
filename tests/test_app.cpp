@@ -1262,7 +1262,7 @@ private slots:
             QVERIFY(channels && stems);
             QVERIFY(!channels->isHidden());
             QVERIFY(channels->itemText(0).contains("5.1") && channels->itemText(0).contains("6"));
-            QCOMPARE(stems->count(), 3);
+            QCOMPARE(stems->count(), 4);  // none, tracks, buses, roles
             auto* preset = ed.findChild<QComboBox*>("exportPreset");
             auto* path = ed.findChild<QLineEdit*>("exportPath");
             QVERIFY(preset && path);
@@ -3738,6 +3738,57 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(seq()->videoTracks[0].clips[2].start, FrameTime(80));
         QCOMPARE(state()->playhead(), FrameTime(80));
         state()->setSourceMedia(0);
+        state()->newProject();
+    }
+
+    void audioRolesMenuAndIndex() {
+        state()->newProject();
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids[0], 0, 0, -1, V1, {TrackKind::Audio, 0}, false).ok &&
+                   edit::placeMedia(p, s, ids[0], 0, 0, 90, V1, {TrackKind::Audio, 1}, false).ok;
+        }));
+        const Id speech = state()->sequence()->audioTracks[0].clips.at(0).id, other = state()->sequence()->audioTracks[1].clips.at(0).id;
+        auto role = [&](Id id) { return edit::clipById(*state()->sequence(), id)->role; };
+        state()->setSelection({});
+        QCOMPARE(win_->setSelectedRole(QStringLiteral("Music")), 0);  // nothing selected
+        state()->setSelection({other});
+        QVERIFY(win_->findChild<QAction*>("roleMusic"));
+        win_->findChild<QAction*>("roleMusic")->trigger();
+        QCOMPARE(role(other), std::string("Music"));
+        // The Sequence Index shows the role, and its Music box mutes the role (one undo step).
+        auto* panel = win_->findChild<SequenceIndexPanel*>();
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        panel->setFilter(QStringLiteral("Music"));
+        QCOMPARE(panel->rowCount(), 1);
+        QCOMPARE(panel->cell(0, SequenceIndexPanel::Role), QString("Music"));
+        panel->setFilter(QString());
+        auto* box = panel->findChild<QCheckBox*>(QStringLiteral("role_Music"));
+        QVERIFY(box && box->isChecked());
+        box->click();
+        QVERIFY(edit::roleMuted(*state()->sequence(), "Music"));
+        QVERIFY(!panel->roleHeard(QStringLiteral("Music")));
+        state()->undo();
+        QVERIFY(!edit::roleMuted(*state()->sequence(), "Music"));
+        // A role of the editor's own: listed in the index and the menu, ticked for the selection.
+        QCOMPARE(win_->setSelectedRole(QStringLiteral("Room Tone")), 1);
+        QVERIFY(panel->roles().contains(QStringLiteral("Room Tone")));
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        QVERIFY(panel->findChild<QCheckBox*>(QStringLiteral("role_Room Tone")));
+        auto* menu = win_->findChild<QMenu*>(QStringLiteral("audioRoleMenu"));
+        QVERIFY(menu);
+        emit menu->aboutToShow();
+        QAction* custom = nullptr;
+        for (QAction* a : menu->actions())
+            if (a->property("customRole").toString() == QLatin1String("Room Tone")) custom = a;
+        QVERIFY(custom && custom->isChecked());
+        QVERIFY(!win_->findChild<QAction*>("roleMusic")->isChecked());
+        // Detect Roles with nothing selected: the untagged speech is heard as dialogue; the tagged clip keeps its role.
+        state()->setSelection({});
+        QCOMPARE(win_->detectRoles(), 1);
+        QCOMPARE(role(speech), std::string("Dialogue"));
+        QCOMPARE(role(other), std::string("Room Tone"));
         state()->newProject();
     }
 

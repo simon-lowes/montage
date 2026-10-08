@@ -1378,7 +1378,7 @@ private slots:
         st.path = path("show.wav");
         QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
         std::vector<StemFile> stems;
-        QVERIFY2(exportStems(p, s, st, false, &stems, {}, nullptr, &err), err.c_str());
+        QVERIFY2(exportStems(p, s, st, StemsByTrack, &stems, {}, nullptr, &err), err.c_str());
         QCOMPARE(stems.size(), size_t(2));
         QCOMPARE(QString::fromStdString(std::filesystem::path(stems[0].path).filename().string()), QString("show - Dialogue.wav"));
         const AudioBufferPtr whole = decodeAudio(st.path, rate, &err), a = decodeAudio(stems[0].path, rate, &err),
@@ -1395,14 +1395,50 @@ private slots:
         s.buses.push_back(bus);
         s.audioTracks[1].output = bus.id;
         stems.clear();
-        QVERIFY2(exportStems(p, s, st, true, &stems, {}, nullptr, &err), err.c_str());
+        QVERIFY2(exportStems(p, s, st, StemsByBus, &stems, {}, nullptr, &err), err.c_str());
         QCOMPARE(stems.size(), size_t(2));
         QCOMPARE(stems[0].name, std::string("Main"));
         QCOMPARE(stems[1].name, std::string("Music Bus"));
 
-        // Through MCP: 5.1, dialogue in the centre, the music round the back; a stereo fold-down with track stems.
+        // By role: A1 tagged Dialogue, A2 untagged ("No Role"); they add up to the mix too.
         s.audioTracks[1].output = 0;
         s.buses.clear();
+        s.audioTracks[0].clips[0].role = "Dialogue";
+        stems.clear();
+        QVERIFY2(exportStems(p, s, st, StemsByRole, &stems, {}, nullptr, &err), err.c_str());
+        QCOMPARE(stems.size(), size_t(2));
+        QCOMPARE(stems[0].name, std::string("Dialogue"));
+        QCOMPARE(stems[1].name, std::string("No Role"));
+        QCOMPARE(QString::fromStdString(std::filesystem::path(stems[0].path).filename().string()), QString("show - Dialogue.wav"));
+        {
+            const AudioBufferPtr d = decodeAudio(stems[0].path, rate, &err), rest = decodeAudio(stems[1].path, rate, &err);
+            QVERIFY(d && rest);
+            double sum = 0, alone = 0;
+            for (size_t i = 0; i < whole->samples.size(); i += 13) {
+                sum = std::max(sum, double(std::fabs(d->samples[i] + rest->samples[i] - whole->samples[i])));
+                alone = std::max(alone, double(std::fabs(d->samples[i] - a->samples[i])));  // the dialogue stem is A1's sound
+            }
+            QVERIFY2(sum < 1e-4 && alone < 1e-4, qPrintable(QStringLiteral("%1 %2").arg(sum).arg(alone)));
+        }
+        // A muted role is not heard and gets no stem; with every role muted, nothing plays.
+        s.audioTracks[1].clips[0].role = "Music";
+        edit::setRoleMuted(s, "Music", true);
+        stems.clear();
+        QVERIFY2(exportStems(p, s, st, StemsByRole, &stems, {}, nullptr, &err), err.c_str());
+        QCOMPARE(stems.size(), size_t(1));
+        edit::setRoleMuted(s, "Dialogue", true);
+        {
+            AudioMixer quiet;
+            std::vector<float> buf(size_t(rate / 4) * 2);
+            quiet.mix(p, s, rate / 2, rate / 4, buf.data());
+            QVERIFY(std::all_of(buf.begin(), buf.end(), [](float v) { return v == 0.0f; }));
+        }
+        QVERIFY(!exportStems(p, s, st, StemsByRole, &stems, {}, nullptr, &err));
+        s.mutedRoles.clear();
+        s.audioTracks[0].clips[0].role.clear();
+        s.audioTracks[1].clips[0].role.clear();
+
+        // Through MCP: 5.1, dialogue in the centre, the music round the back; a stereo fold-down with track stems.
         const QString project = QString::fromStdString(path("surround.montage"));
         QVERIFY(saveProject(p, project.toStdString()));
         McpServer server;
@@ -1437,6 +1473,28 @@ private slots:
         QCOMPARE(stemList.size(), 2);
         QVERIFY(probeMedia(stemList[1].toObject().value("path").toString().toStdString(), out));
         QCOMPARE(out.channels, 2);  // the stems follow the fold-down
+        // Roles through MCP: A1 tagged, then the untagged A2 heard and tagged; a role muted; stems by role.
+        const double a1 = double(back.active()->audioTracks[0].clips[0].id);
+        r = call("montage_set_roles", {{"project", project}, {"clips", QJsonArray{a1}}, {"role", "Dialogue"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        r = call("montage_set_roles", {{"project", project}, {"detect", true}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.active()->audioTracks[0].clips[0].role, std::string("Dialogue"));  // kept
+        const std::string heardAs = back.active()->audioTracks[1].clips[0].role;
+        QVERIFY2(heardAs == "Music" || heardAs == "Effects", heardAs.c_str());  // a steady tone is not speech
+        r = call("montage_set_roles", {{"project", project}, {"mute", QJsonArray{QString::fromStdString(heardAs)}}});
+        QVERIFY(r.value("content").toArray().at(0).toObject().value("text").toString().contains("1 role(s) muted"));
+        r = call("montage_render", {{"project", project}, {"output", wav}, {"preset", "Audio - WAV 24-bit"},
+                                    {"downmix_stereo", true}, {"stems", "roles"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("stems").toArray().size(), 1);
+        r = call("montage_project_info", {{"project", project}});
+        QCOMPARE(r.value("structuredContent").toObject().value("muted_roles").toArray().size(), 1);
+        r = call("montage_set_roles", {{"project", project}, {"clips", QJsonArray{a1}}});
+        QVERIFY(r.value("isError").toBool());
+        r = call("montage_render", {{"project", project}, {"output", wav}, {"stems", "sideways"}});
+        QVERIFY(r.value("isError").toBool());
     }
 
     void lottieAndSvgMedia() {
@@ -7123,12 +7181,27 @@ private slots:
         const double underSpeech = g.at(FrameTime(2.0 * s.fpsValue())), base = mus->gainDb;
         QVERIFY2(std::fabs(underSpeech - (base + o.duckDb)) < 0.5, qPrintable(QString("%1 vs %2").arg(underSpeech).arg(base)));
         QVERIFY(edit::clipById(s, soft->clip)->audio.params.at("gain_db").animated());
+        // The clips remember what they were mixed as (their audio role), and a role given by hand wins over the ear.
+        QCOMPARE(bedClip->role, std::string("Music"));
+        QCOMPARE(edit::clipById(s, loud->clip)->role, std::string("Dialogue"));
+        {
+            Sequence tagged = s;
+            edit::clipById(tagged, loud->clip)->role = "Effects";
+            for (const ClipMix& m : planMix(p, tagged, o))
+                if (m.clip == loud->clip) {
+                    QCOMPARE(int(m.role), int(AudioRole::Effects));
+                    QCOMPARE(int(m.guess.role), int(AudioRole::Dialogue));
+                }
+        }
 
         // Through MCP: a dry run lists the roles; calling the music "effects" puts it at the effects level.
         const QString project = QString::fromStdString(path("mix.montage"));
         Project fresh = p;
         for (Track& t : fresh.active()->audioTracks)
-            for (Clip& c : t.clips) c.audio.params.erase("gain_db");
+            for (Clip& c : t.clips) {
+                c.audio.params.erase("gain_db");
+                c.role.clear();
+            }
         QVERIFY(saveProject(fresh, project.toStdString()));
         McpServer server;
         auto call = [&](const QJsonObject& args) {
