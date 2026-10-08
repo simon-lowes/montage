@@ -1,5 +1,7 @@
 #include "Compositor.h"
 
+#include "core/Automation.h"
+
 #include <QFont>
 #include <QFontMetricsF>
 #include <QImage>
@@ -1809,6 +1811,23 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
         if (!track.effects.empty())
             processChain(track.effects, track.id, frameAt(start + downstream + trackLat), sr, trackBuf.data(), frames);
         float tg = dbToLin(track.volumeDb), tl, tr;
+        // Fader automation (core/Automation.h): the gain ramps smoothly between frames; pan steps every 64 samples.
+        const bool readsLanes = trackAutomation(track) != AutomationMode::Off && trackAutomation(track) != AutomationMode::Write;
+        const bool volumeAuto = readsLanes && track.volumeAuto.animated(), panAuto = readsLanes && track.panAuto.animated();
+        const int64_t heard = start + downstream;  // the timeline sample the fader acts on now
+        if (volumeAuto) {
+            for (int i = 0; i < frames; i += 64) {
+                const int e = std::min(frames, i + 64);
+                const float g0 = dbToLin(trackVolumeAt(track, double(heard + i) * fps / sr));
+                const float g1 = dbToLin(trackVolumeAt(track, double(heard + e) * fps / sr));
+                for (int k = i; k < e; ++k) {
+                    const float g = g0 + (g1 - g0) * float(k - i) / float(e - i);
+                    trackBuf[size_t(k) * 2] *= g;
+                    trackBuf[size_t(k) * 2 + 1] *= g;
+                }
+            }
+            tg = 1;
+        }
         MeterLevels lv;
         if (surround && bus == busBufs.end()) {
             // Straight to the speakers through the track's surround panner.
@@ -1821,6 +1840,7 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
             panGains(track.pan, tl, tr);
             float* dest = bus != busBufs.end() ? bus->second.data() : master.data();
             for (int i = 0; i < frames; ++i) {
+                if (panAuto && i % 64 == 0) panGains(trackPanAt(track, double(heard + i) * fps / sr), tl, tr);
                 float l = trackBuf[size_t(i) * 2] * tg * tl, r = trackBuf[size_t(i) * 2 + 1] * tg * tr;
                 dest[i * 2] += l;
                 dest[i * 2 + 1] += r;

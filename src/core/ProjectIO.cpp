@@ -237,6 +237,9 @@ QJsonObject trackToJson(const Track& t) {
     }
     if (t.output) o["output"] = double(t.output);
     if (const QJsonValue sp = surroundToJson(t.surround); !sp.isUndefined()) o["surround"] = sp;
+    if (t.volumeAuto.animated()) o["volumeAuto"] = paramToJson(t.volumeAuto);
+    if (t.panAuto.animated()) o["panAuto"] = paramToJson(t.panAuto);
+    if (t.automation != 1) o["automation"] = t.automation;
     return o;
 }
 
@@ -267,6 +270,9 @@ Track trackFromJson(const QJsonObject& o, TrackKind kind) {
     for (const auto& e : o.value("effects").toArray()) t.effects.push_back(effectFromJson(e));
     t.output = Id(i64(o.value("output")));
     if (o.contains("surround")) t.surround = surroundFromJson(o.value("surround"));
+    if (o.contains("volumeAuto")) t.volumeAuto = paramFromJson(o.value("volumeAuto"));
+    if (o.contains("panAuto")) t.panAuto = paramFromJson(o.value("panAuto"));
+    t.automation = std::clamp(o.value("automation").toInt(1), 0, 4);
     std::sort(t.clips.begin(), t.clips.end(), [](const Clip& a, const Clip& b) { return a.start < b.start; });
     return t;
 }

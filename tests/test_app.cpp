@@ -80,6 +80,7 @@
 #include "ShotSearchPanel.h"
 #include "PeoplePanel.h"
 #include "SequenceIndexPanel.h"
+#include "core/Automation.h"
 #include "core/History.h"
 #include "media/Segmenter.h"
 #include "MonitorPanel.h"
@@ -473,6 +474,79 @@ private slots:
         QVERIFY(ranged.runCheck());
         QCOMPARE(ranged.issues().size(), size_t(1));
         QVERIFY(ranged.issues()[0].start == 60 && ranged.issues()[0].end == 120);
+    }
+
+    void mixerAutomation() {
+        loadDemo();
+        auto* mixer = win_->findChild<MixerPanel*>();
+        QVERIFY(mixer);
+        QTRY_VERIFY(mixer->trackFader(0));
+        QSlider* fader = mixer->trackFader(0);
+        QComboBox* mode = mixer->trackAutomationMode(0);
+        auto a1 = [&]() -> const Track& { return state()->sequence()->audioTracks.at(0); };
+        QCOMPARE(mode->currentIndex(), int(AutomationMode::Read));
+        mode->setCurrentIndex(int(AutomationMode::Write));
+        QCOMPARE(a1().automation, int(AutomationMode::Write));
+        // A Write pass: 0 dB, then -12 dB from frame 20. The mix hears the fader while it writes.
+        mixer->playbackStarted(0);
+        QVERIFY(mixer->recordingAutomation());
+        QVERIFY(!mode->isEnabled());
+        for (FrameTime f = 0; f <= 60; ++f) {
+            if (f == 20) fader->setValue(-120);
+            mixer->playbackPosition(f);
+            if (f == 30) QCOMPARE(a1().volumeDb, -12.0);
+        }
+        mixer->playbackStopped(60);
+        QVERIFY(!mixer->recordingAutomation());
+        QVERIFY(a1().volumeAuto.animated());
+        QCOMPARE(a1().volumeAuto.at(10), 0.0);
+        QCOMPARE(a1().volumeAuto.at(40), -12.0);
+        QCOMPARE(a1().volumeAuto.at(61), 0.0);
+        QCOMPARE(a1().volumeDb, 0.0);          // the fader's own level is left alone
+        QVERIFY(!a1().panAuto.animated());     // the pan was not moved
+        QCOMPARE(a1().automation, int(AutomationMode::Touch));  // Write hands over to Touch
+        QCOMPARE(mode->currentIndex(), int(AutomationMode::Touch));
+        QVERIFY(mode->isEnabled());
+        // The fader follows the automation at the playhead.
+        state()->setPlayhead(40);
+        QCOMPARE(fader->value(), -120);
+        state()->setPlayhead(10);
+        QCOMPARE(fader->value(), 0);
+        // One undo step.
+        state()->undo();
+        QVERIFY(!a1().volumeAuto.animated());
+        QCOMPARE(a1().automation, int(AutomationMode::Write));
+        state()->redo();
+        QCOMPARE(a1().volumeAuto.at(40), -12.0);
+        // A Touch pass: held at -3 dB over frames 5-14, then gliding back to the -12 dB written before.
+        mixer->playbackStarted(0);
+        for (FrameTime f = 0; f <= 60; ++f) {
+            if (f == 5) {
+                fader->setSliderDown(true);
+                fader->setValue(-30);
+            }
+            if (f == 15) fader->setSliderDown(false);
+            mixer->playbackPosition(f);
+            if (f == 50) QCOMPARE(fader->value(), -120);  // let go: back to what is there
+        }
+        mixer->playbackStopped(60);
+        QCOMPARE(a1().volumeAuto.at(10), -3.0);
+        QVERIFY(a1().volumeAuto.at(30) < -3.0 && a1().volumeAuto.at(30) > -12.0);
+        QCOMPARE(a1().volumeAuto.at(50), -12.0);
+        QCOMPARE(a1().volumeAuto.at(2), 0.0);
+        // Stopped, on a track reading its lane, the fader sets the lane at the playhead.
+        mode->setCurrentIndex(int(AutomationMode::Read));
+        state()->setPlayhead(50);
+        fader->setValue(-60);
+        QVERIFY(a1().volumeAuto.keyAt(50));
+        QCOMPARE(a1().volumeAuto.keyAt(50)->v, -6.0);
+        QCOMPARE(a1().volumeDb, 0.0);
+        // Nothing armed: playing writes nothing.
+        const size_t keys = a1().volumeAuto.keys.size();
+        mixer->playbackStarted(0);
+        QVERIFY(!mixer->recordingAutomation());
+        mixer->playbackStopped(30);
+        QCOMPARE(a1().volumeAuto.keys.size(), keys);
     }
 
     void razorTool() {

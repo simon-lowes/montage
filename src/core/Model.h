@@ -238,6 +238,10 @@ struct Track {
     std::vector<Effect> effects;  // audio track inserts, before the fader (keyframes in timeline frames)
     Id output = 0;                // audio: the bus the track feeds, 0 = master
     SurroundPan surround;         // audio, in 5.1 and 7.1 sequences
+    // Fader automation (core/Automation.h): volume (dB) and pan lanes keyed in timeline frames, and the
+    // AutomationMode (0 Off, 1 Read, 2 Write, 3 Latch, 4 Touch).
+    Param volumeAuto, panAuto;
+    int automation = 1;
     bool operator==(const Track&) const = default;
 };
 

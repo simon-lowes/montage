@@ -26,6 +26,7 @@
 #include "core/Bleep.h"
 #include "core/AutoTag.h"
 #include "core/Cfb.h"
+#include "core/Automation.h"
 #include "core/EditOps.h"
 #include "core/MediaLog.h"
 #include "core/Multicam.h"
@@ -586,6 +587,63 @@ private slots:
         mixer.mix(p, s, 12000, 4800, out.data());
         QVERIFY2(std::fabs(out[4000 * 2] - out[4000 * 2 + 1]) < 1e-5f && out[4000 * 2] > 0.4f,
                  qPrintable(QString("%1 %2").arg(out[4000 * 2]).arg(out[4000 * 2 + 1])));
+    }
+
+    void trackAutomationInTheMix() {
+        // A steady signal on A1 under a volume lane rising from -60 dB to 0 over a second, and a pan lane.
+        const std::string wav = path("steady.wav");
+        writeWav(wav, 48000, 2.0, 0.5f, 0.5f);
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = Rational{30, 1};
+        s.sampleRate = 48000;
+        MediaItem m = probeOrFail(p, wav);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        auto levelAt = [&](double seconds, int channel) {
+            AudioMixer mixer;
+            std::vector<float> out(64 * 2);
+            mixer.mix(p, s, int64_t(seconds * 48000), 64, out.data());
+            return double(out[size_t(channel)]);
+        };
+        const double base = levelAt(0.5, 0);
+        QVERIFY(base > 0.1);
+        Track& a1 = s.audioTracks[0];
+        a1.volumeAuto.addKey(0, -60);
+        a1.volumeAuto.addKey(30, 0);
+        auto db = [&](double v) { return 20 * std::log10(std::max(1e-9, v / base)); };
+        QVERIFY2(std::fabs(db(levelAt(0.5, 0)) + 30) < 0.3, qPrintable(QString::number(db(levelAt(0.5, 0)))));
+        QVERIFY(std::fabs(db(levelAt(0.25, 0)) + 45) < 0.3);
+        QVERIFY(std::fabs(db(levelAt(1.5, 0))) < 0.05);
+        // Smooth between frames: no steps of a frame's size within a block.
+        {
+            AudioMixer mixer;
+            std::vector<float> out(4800 * 2);
+            mixer.mix(p, s, 12000, 4800, out.data());
+            double worst = 0;
+            for (size_t i = 1; i < 4800; ++i) worst = std::max(worst, double(std::fabs(out[i * 2] - out[(i - 1) * 2])));
+            QVERIFY2(worst < 1e-3, qPrintable(QString::number(worst)));
+        }
+        // Off (and Write) play the fader instead.
+        a1.automation = int(AutomationMode::Off);
+        QVERIFY(std::fabs(levelAt(0.5, 0) - base) < 1e-4);
+        a1.automation = int(AutomationMode::Read);
+        // Pan hard left from frame 30.
+        a1.panAuto.addKey(0, 0);
+        a1.panAuto.addKey(30, -1);
+        QVERIFY(levelAt(1.5, 1) < 1e-4 && levelAt(1.5, 0) > base);
+        QVERIFY(std::fabs(levelAt(0.0, 0) - levelAt(0.0, 1)) < 1e-6);
+        // Exports hear it too.
+        ExportSettings st;
+        st.path = path("automated.wav");
+        st.videoCodec = "none";
+        st.audioCodec = "pcm_s16le";
+        std::string err;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        AudioBufferPtr back = decodeAudio(st.path, 48000, &err);
+        QVERIFY2(back, err.c_str());
+        QVERIFY(std::fabs(back->samples[size_t(12000) * 2]) < 0.05 * base);  // 0.25 s: -45 dB
+        QVERIFY(std::fabs(back->samples[size_t(72000) * 2 + 1]) < 1e-3);     // 1.5 s: hard left
     }
 
     void qualityCheckSound() {
@@ -5044,6 +5102,21 @@ private slots:
             const auto& mk = checked.active()->markers;
             QVERIFY(std::any_of(mk.begin(), mk.end(), [](const Marker& m) { return m.name == "QC: Silence" && m.color == 11; }));
         }
+        QVERIFY(!tool("montage_undo", QJsonObject{{"project", project}}).value("isError").toBool());
+        // Track automation: a mode and volume points.
+        r = tool("montage_automate_track", QJsonObject{{"project", project}, {"track", "A1"}, {"mode", "latch"},
+                                                       {"volume", QJsonArray{QJsonArray{0, -20}, QJsonArray{0.2, 0}}}});
+        QVERIFY2(!r.value("isError").toBool() && text(r).contains("Latch automation") && text(r).contains("-20.00 dB"), qPrintable(text(r)));
+        {
+            Project automated;
+            QVERIFY(loadProject(project.toStdString(), automated));
+            const Track& t = automated.active()->audioTracks.at(0);
+            QCOMPARE(t.automation, int(AutomationMode::Latch));
+            QCOMPARE(t.volumeAuto.keys.size(), size_t(2));
+            QCOMPARE(t.volumeAuto.keys[0].v, -20.0);
+        }
+        QVERIFY(tool("montage_automate_track", QJsonObject{{"project", project}, {"track", "V1"}, {"mode", "read"}}).value("isError").toBool());
+        QVERIFY(tool("montage_automate_track", QJsonObject{{"project", project}, {"mode", "loud"}}).value("isError").toBool());
         QVERIFY(!tool("montage_undo", QJsonObject{{"project", project}}).value("isError").toBool());
         r = tool("montage_add_marker", QJsonObject{{"project", project}, {"at", 0.1}, {"name", "Look"}});
         QVERIFY(!r.value("isError").toBool());

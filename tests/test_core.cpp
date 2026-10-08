@@ -6,6 +6,7 @@
 #include <QJsonObject>
 
 #include "core/AutoTag.h"
+#include "core/Automation.h"
 #include "core/Captions.h"
 #include "core/Bleep.h"
 #include "core/Cfb.h"
@@ -2251,6 +2252,107 @@ private slots:
         QVERIFY(!slateFromTranscript(said("Let's take a break and come back.")));
         QVERIFY(!slateFromTranscript(said("Scene 4 take 2", 30.0)));
         QVERIFY(slateFromTranscript(said("Scene 4 take 2", 30.0), 40.0));
+    }
+
+    void trackAutomation() {
+        // Playing a lane: Read follows it (between whole frames too); Off and Write use the fader.
+        Track t;
+        t.kind = TrackKind::Audio;
+        t.volumeDb = -6;
+        t.volumeAuto.addKey(0, -60);
+        t.volumeAuto.addKey(30, 0);
+        QCOMPARE(trackVolumeAt(t, 15), -30.0);
+        QCOMPARE(trackVolumeAt(t, 15.5), -29.0);
+        QCOMPARE(trackPanAt(t, 15), 0.0);
+        t.automation = int(AutomationMode::Off);
+        QCOMPARE(trackVolumeAt(t, 15), -6.0);
+        t.automation = int(AutomationMode::Write);
+        QCOMPARE(trackVolumeAt(t, 15), -6.0);
+        t.automation = int(AutomationMode::Touch);
+        QCOMPARE(trackVolumeAt(t, 15), -30.0);
+        // Thinning keeps only the turns.
+        std::vector<Keyframe> ramp;
+        for (int i = 0; i <= 100; ++i) ramp.push_back({i, i <= 50 ? i * 0.1 : 10 - i * 0.1});
+        thinKeys(ramp, 0.01);
+        QCOMPARE(ramp.size(), size_t(3));
+        QCOMPARE(ramp[1].t, FrameTime(50));
+
+        // Write: from play to stop, with the level either side kept.
+        {
+            AutomationRecorder r(AutomationMode::Write, Param(), -6, 10);
+            for (FrameTime f = 10; f <= 40; ++f) QCOMPARE(r.tick(f, f < 20 ? -6.0 : -12.0, false), f < 20 ? -6.0 : -12.0);
+            QVERIFY(r.writing());
+            Param lane = r.finish(40, 0.05);
+            QVERIFY(lane.animated());
+            QCOMPARE(lane.at(5), -6.0);
+            QCOMPARE(lane.at(15), -6.0);
+            QCOMPARE(lane.at(30), -12.0);
+            QCOMPARE(lane.at(40), -12.0);
+            QCOMPARE(lane.at(41), -6.0);
+            QVERIFY(lane.keys.size() <= 6);  // thinned
+        }
+        // An untouched pan written flat adds no lane.
+        {
+            AutomationRecorder r(AutomationMode::Write, Param(), 0.25, 0);
+            for (FrameTime f = 0; f < 20; ++f) r.tick(f, 0.25, false);
+            const Param lane = r.finish(20, 0.005);
+            QVERIFY(!lane.animated());
+            QCOMPARE(lane.value, 0.25);
+        }
+        Param flat;
+        flat.addKey(0, -10);
+        flat.addKey(100, -10);
+        // Latch: plays the lane until the fader moves, then writes to the stop.
+        {
+            AutomationRecorder r(AutomationMode::Latch, flat, 0, 0);
+            for (FrameTime f = 0; f <= 60; ++f) {
+                const bool held = f >= 20 && f <= 30;
+                const double shown = r.tick(f, f < 20 ? 0.0 : -3.0, held);
+                if (f < 20) QCOMPARE(shown, -10.0);
+                else QCOMPARE(shown, -3.0);  // latched after letting go
+            }
+            const Param lane = r.finish(60, 0.05);
+            QCOMPARE(lane.at(10), -10.0);
+            QCOMPARE(lane.at(25), -3.0);
+            QCOMPARE(lane.at(55), -3.0);
+            QCOMPARE(lane.at(61), -10.0);
+            QVERIFY(lane.keyAt(100));
+        }
+        // Touch: writes while held, then glides back to the lane over the glide time.
+        {
+            AutomationRecorder r(AutomationMode::Touch, flat, 0, 0, 10);
+            for (FrameTime f = 0; f <= 60; ++f) {
+                const bool held = f >= 20 && f <= 30;
+                const double shown = r.tick(f, held ? -3.0 : 0.0, held);
+                QCOMPARE(shown, held ? -3.0 : -10.0);
+                QCOMPARE(r.writing(), held);
+            }
+            const Param lane = r.finish(60, 0.05);
+            QCOMPARE(lane.at(19), -10.0);
+            QCOMPARE(lane.at(25), -3.0);
+            QCOMPARE(lane.at(30), -3.0);
+            QVERIFY(lane.at(35) < -3.0 && lane.at(35) > -10.0);
+            QCOMPARE(lane.at(40), -10.0);
+            QCOMPARE(lane.at(60), -10.0);
+        }
+        // Read never writes.
+        {
+            AutomationRecorder r(AutomationMode::Read, flat, 0, 0);
+            for (FrameTime f = 0; f < 30; ++f) QCOMPARE(r.tick(f, 5.0, true), -10.0);
+            QVERIFY(!r.wrote());
+            QCOMPARE(r.finish(30, 0.05), flat);
+        }
+        // Saved with the project.
+        Project p = makeDefaultProject();
+        Track& a1 = p.active()->audioTracks.at(0);
+        a1.volumeAuto = flat;
+        a1.panAuto.addKey(5, -0.5);
+        a1.panAuto.addKey(10, 0.5);
+        a1.automation = int(AutomationMode::Latch);
+        Project back;
+        QVERIFY(projectFromJson(projectToJson(p), back));
+        QCOMPARE(back.active()->audioTracks.at(0), a1);
+        QCOMPARE(back.active()->audioTracks.at(1).automation, int(AutomationMode::Read));
     }
 
     void chapterMarkers() {

@@ -27,6 +27,12 @@ namespace montage {
 
 namespace {
 
+// Whether a track plays its automation lanes (and its fader edits them).
+bool readsLanes(const Track& t) {
+    const AutomationMode m = trackAutomation(t);
+    return m == AutomationMode::Read || m == AutomationMode::Latch || m == AutomationMode::Touch;
+}
+
 constexpr int kStripWidth = 80;
 constexpr int kMasterWidth = 68;
 constexpr int kFaderMin = -600;  // tenths of a dB
@@ -93,6 +99,7 @@ MixerPanel::MixerPanel(EditorState* state, QWidget* parent) : QWidget(parent), s
 
     connect(state_, &EditorState::projectChanged, this, &MixerPanel::syncToProject);
     connect(state_, &EditorState::sequenceSwitched, this, &MixerPanel::syncToProject);
+    connect(state_, &EditorState::playheadChanged, this, [this] { followAutomation(); });
     rebuild();
 }
 
@@ -288,6 +295,13 @@ MixerPanel::Strip MixerPanel::makeStrip(int index) {
     of.setPixelSize(10);
     s.output->setFont(of);
     v->addWidget(s.output);
+    s.automation = new QComboBox(box);
+    s.automation->setObjectName(QStringLiteral("automationMode"));
+    for (int m = 0; m <= 4; ++m) s.automation->addItem(tr(automationModeName(AutomationMode(m))));
+    s.automation->setToolTip(tr("Fader automation: Off ignores it; Read plays it; Write records the fader and pan from play to stop; "
+                                "Latch from the first move to stop; Touch while you hold them"));
+    s.automation->setFont(of);
+    v->addWidget(s.automation);
 
     s.pan = new QDial(box);
     s.pan->setRange(-100, 100);
@@ -353,6 +367,7 @@ MixerPanel::Strip MixerPanel::makeStrip(int index) {
     connect(s.pan, &QDial::valueChanged, this, [this, index](int value) { setPan(index, value / 100.0); });
     connect(s.mute, &QToolButton::toggled, this, [this, index](bool on) { setMute(index, on); });
     connect(s.solo, &QToolButton::toggled, this, [this, index](bool on) { setSolo(index, on); });
+    connect(s.automation, &QComboBox::currentIndexChanged, this, [this, index](int m) { setAutomationMode(index, m); });
     connect(s.fx, &QToolButton::clicked, this, [this, index] {
         const Sequence* seq = state_->sequence();
         if (seq && index < int(seq->audioTracks.size())) inspect(seq->audioTracks[size_t(index)].id);
@@ -427,16 +442,23 @@ void MixerPanel::refresh() {
         const QString name = t.name.empty() ? tr("A%1").arg(i + 1) : QString::fromStdString(t.name);
         s.name->setText(s.name->fontMetrics().elidedText(name, Qt::ElideRight, kStripWidth - 12));
         s.name->setToolTip(name);
-        {
+        // The automation at the playhead on tracks that read it; a fader being held stays where the hand is.
+        const double db = trackVolumeAt(t, double(state_->playhead())), pan = trackPanAt(t, double(state_->playhead()));
+        if (!s.fader->isSliderDown()) {
             const QSignalBlocker block(s.fader);
-            s.fader->setValue(int(std::lround(std::clamp(t.volumeDb, -60.0, 12.0) * 10.0)));
+            s.fader->setValue(int(std::lround(std::clamp(db, -60.0, 12.0) * 10.0)));
+            s.dbLabel->setText(dbText(db));
         }
-        s.dbLabel->setText(dbText(t.volumeDb));
-        {
+        if (!s.pan->isSliderDown()) {
             const QSignalBlocker block(s.pan);
-            s.pan->setValue(int(std::lround(std::clamp(t.pan, -1.0, 1.0) * 100.0)));
+            s.pan->setValue(int(std::lround(std::clamp(pan, -1.0, 1.0) * 100.0)));
         }
         s.panLabel->setText(panText(s.pan->value()));
+        {
+            const QSignalBlocker block(s.automation);
+            s.automation->setCurrentIndex(int(trackAutomation(t)));
+        }
+        s.automation->setEnabled(recording_.empty());
         // In surround, a track going straight to the master is placed among the speakers;
         // one going to a bus is panned in stereo into it.
         const bool surround = layoutChannels(seq->audioLayout) > 2 && !t.output;
@@ -495,12 +517,27 @@ void MixerPanel::refresh() {
 void MixerPanel::setVolume(int index, double db) {
     if (index < int(strips_.size()))
         strips_[index].dbLabel->setText(dbText(db));
+    // While automation is written the recorder samples the faders; nothing else is edited meanwhile.
+    if (!recording_.empty()) {
+        if (std::none_of(recording_.begin(), recording_.end(), [&](const Recording& r) { return r.track == index; })) refresh();
+        return;
+    }
+    // On a track playing its volume lane, the fader sets the lane at the playhead.
+    const FrameTime at = state_->playhead();
     const bool ok = state_->edit(
         tr("Track Volume"),
-        [index, db](Project&, Sequence& s) {
-            if (index >= int(s.audioTracks.size()) || s.audioTracks[index].volumeDb == db)
+        [index, db, at](Project&, Sequence& s) {
+            if (index >= int(s.audioTracks.size()))
                 return false;
-            s.audioTracks[index].volumeDb = db;
+            Track& t = s.audioTracks[size_t(index)];
+            if (t.volumeAuto.animated() && readsLanes(t)) {
+                if (t.volumeAuto.at(at) == db && t.volumeAuto.keyAt(at)) return false;
+                t.volumeAuto.set(at, db);
+                return true;
+            }
+            if (t.volumeDb == db)
+                return false;
+            t.volumeDb = db;
             return true;
         },
         QStringLiteral("track-volume-%1").arg(index));
@@ -511,17 +548,162 @@ void MixerPanel::setVolume(int index, double db) {
 void MixerPanel::setPan(int index, double pan) {
     if (index < int(strips_.size()))
         strips_[index].panLabel->setText(panText(int(std::lround(pan * 100.0))));
+    if (!recording_.empty()) {
+        if (std::none_of(recording_.begin(), recording_.end(), [&](const Recording& r) { return r.track == index; })) refresh();
+        return;
+    }
+    const FrameTime at = state_->playhead();
     const bool ok = state_->edit(
         tr("Track Pan"),
-        [index, pan](Project&, Sequence& s) {
-            if (index >= int(s.audioTracks.size()) || s.audioTracks[index].pan == pan)
+        [index, pan, at](Project&, Sequence& s) {
+            if (index >= int(s.audioTracks.size()))
                 return false;
-            s.audioTracks[index].pan = pan;
+            Track& t = s.audioTracks[size_t(index)];
+            if (t.panAuto.animated() && readsLanes(t)) {
+                if (t.panAuto.at(at) == pan && t.panAuto.keyAt(at)) return false;
+                t.panAuto.set(at, pan);
+                return true;
+            }
+            if (t.pan == pan)
+                return false;
+            t.pan = pan;
             return true;
         },
         QStringLiteral("track-pan-%1").arg(index));
     if (!ok)
         refresh();
+}
+
+void MixerPanel::setAutomationMode(int index, int mode) {
+    state_->edit(tr("Automation Mode"), [index, mode](Project&, Sequence& s) {
+        if (index >= int(s.audioTracks.size()) || s.audioTracks[size_t(index)].automation == mode) return false;
+        s.audioTracks[size_t(index)].automation = mode;
+        return true;
+    });
+}
+
+void MixerPanel::followAutomation() {
+    if (!recording_.empty()) return;
+    const Sequence* seq = state_->sequence();
+    if (!seq) return;
+    const double at = double(state_->playhead());
+    for (size_t i = 0; i < strips_.size() && i < seq->audioTracks.size(); ++i) {
+        const Track& t = seq->audioTracks[i];
+        if (!readsLanes(t) || (!t.volumeAuto.animated() && !t.panAuto.animated())) continue;
+        Strip& s = strips_[i];
+        if (!s.fader->isSliderDown()) {
+            const double db = trackVolumeAt(t, at);
+            const QSignalBlocker block(s.fader);
+            s.fader->setValue(int(std::lround(std::clamp(db, -60.0, 12.0) * 10.0)));
+            s.dbLabel->setText(dbText(db));
+        }
+        if (!s.pan->isSliderDown()) {
+            const QSignalBlocker block(s.pan);
+            s.pan->setValue(int(std::lround(std::clamp(trackPanAt(t, at), -1.0, 1.0) * 100.0)));
+            s.panLabel->setText(panText(s.pan->value()));
+        }
+    }
+}
+
+void MixerPanel::playbackStarted(FrameTime t) {
+    const Sequence* seq = state_->sequence();
+    if (!recording_.empty() || !seq || state_->inGesture()) return;
+    for (size_t i = 0; i < seq->audioTracks.size() && i < strips_.size(); ++i) {
+        const Track& tr = seq->audioTracks[i];
+        const AutomationMode m = trackAutomation(tr);
+        if (m != AutomationMode::Write && m != AutomationMode::Latch && m != AutomationMode::Touch) continue;
+        const FrameTime glide = FrameTime(std::lround(seq->fpsValue()));  // a second back to what was there
+        recording_.push_back({int(i), m, AutomationRecorder(m, tr.volumeAuto, tr.volumeDb, t, glide),
+                              AutomationRecorder(m, tr.panAuto, tr.pan, t, glide), tr.volumeDb, tr.pan, tr.volumeAuto, tr.panAuto});
+    }
+    if (recording_.empty()) return;
+    state_->beginGesture(tr("Write Automation"));
+    liveState_.clear();
+    for (Strip& s : strips_) s.automation->setEnabled(false);
+    playbackPosition(t);
+}
+
+void MixerPanel::playbackPosition(FrameTime t) {
+    if (recording_.empty()) {
+        followAutomation();
+        return;
+    }
+    struct Live {
+        int track;
+        bool volume, pan;
+        double db, panValue;
+    };
+    std::vector<Live> live;
+    QString key;
+    for (Recording& r : recording_) {
+        Strip& st = strips_[size_t(r.track)];
+        const double db = st.fader->value() / 10.0, pan = st.pan->value() / 100.0;
+        const double showDb = r.volume.tick(t, db, st.fader->isSliderDown());
+        const double showPan = r.pan.tick(t, pan, st.pan->isSliderDown());
+        // Not writing: the fader shows (and the mix plays) the automation that was there.
+        if (!r.volume.writing() && !st.fader->isSliderDown()) {
+            const QSignalBlocker block(st.fader);
+            st.fader->setValue(int(std::lround(std::clamp(showDb, -60.0, 12.0) * 10.0)));
+            st.dbLabel->setText(dbText(showDb));
+        }
+        if (!r.pan.writing() && !st.pan->isSliderDown()) {
+            const QSignalBlocker block(st.pan);
+            st.pan->setValue(int(std::lround(std::clamp(showPan, -1.0, 1.0) * 100.0)));
+            st.panLabel->setText(panText(st.pan->value()));
+        }
+        live.push_back({r.track, r.volume.writing(), r.pan.writing(), db, pan});
+        key += QStringLiteral("%1:%2%3%4,%5;").arg(r.track).arg(int(r.volume.writing())).arg(int(r.pan.writing())).arg(db).arg(pan);
+    }
+    if (key == liveState_) return;
+    liveState_ = key;
+    // What plays meanwhile: the fader on a lane being written, the lanes as they were otherwise.
+    state_->updateGesture([live](Project&, Sequence& s) {
+        for (const Live& l : live) {
+            if (l.track >= int(s.audioTracks.size())) continue;
+            Track& tr = s.audioTracks[size_t(l.track)];
+            if (l.volume) tr.volumeAuto = Param(), tr.volumeDb = l.db;
+            if (l.pan) tr.panAuto = Param(), tr.pan = l.panValue;
+        }
+    });
+}
+
+void MixerPanel::playbackStopped(FrameTime t) {
+    if (recording_.empty()) return;
+    struct Done {
+        int track;
+        Param volume, pan;
+        double db, panValue;
+        bool fromWrite;
+    };
+    std::vector<Done> done;
+    bool wrote = false;
+    for (Recording& r : recording_) {
+        const bool v = r.volume.wrote(), p = r.pan.wrote();
+        wrote = wrote || v || p;
+        done.push_back({r.track, v ? r.volume.finish(t, 0.1) : r.volumeLane, p ? r.pan.finish(t, 0.005) : r.panLane, r.volumeDb, r.panValue,
+                        r.mode == AutomationMode::Write});
+    }
+    recording_.clear();
+    liveState_.clear();
+    if (!wrote) {
+        state_->endGesture(false);
+        refresh();
+        return;
+    }
+    // Write hands over to Touch, so the next pass does not write over this one unless a fader is moved.
+    state_->updateGesture([done](Project&, Sequence& s) {
+        for (const Done& d : done) {
+            if (d.track >= int(s.audioTracks.size())) continue;
+            Track& tr = s.audioTracks[size_t(d.track)];
+            tr.volumeAuto = d.volume;
+            tr.panAuto = d.pan;
+            tr.volumeDb = d.db;
+            tr.pan = d.panValue;
+            if (d.fromWrite) tr.automation = int(AutomationMode::Touch);
+        }
+    });
+    state_->endGesture(true);
+    refresh();
 }
 
 void MixerPanel::setSurround(int index, const SurroundPan& pan, bool) {

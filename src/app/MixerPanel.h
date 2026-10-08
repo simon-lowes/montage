@@ -7,6 +7,7 @@
 #include <QWidget>
 #include <vector>
 
+#include "core/Automation.h"
 #include "core/Model.h"
 
 class QDial;
@@ -27,6 +28,18 @@ class MixerPanel : public QWidget {
     Q_OBJECT
 public:
     explicit MixerPanel(EditorState* state, QWidget* parent = nullptr);
+
+    // Fader automation (core/Automation.h). Playback starting and stopping, and each frame it plays: tracks in
+    // Write, Latch or Touch record their fader and pan, kept as one undo step when playback stops.
+    void playbackStarted(FrameTime t);
+    void playbackPosition(FrameTime t);
+    void playbackStopped(FrameTime t);
+    bool recordingAutomation() const { return !recording_.empty(); }
+    QSlider* trackFader(int index) const { return index >= 0 && index < int(strips_.size()) ? strips_[size_t(index)].fader : nullptr; }
+    QDial* trackPan(int index) const { return index >= 0 && index < int(strips_.size()) ? strips_[size_t(index)].pan : nullptr; }
+    QComboBox* trackAutomationMode(int index) const {
+        return index >= 0 && index < int(strips_.size()) ? strips_[size_t(index)].automation : nullptr;
+    }
 
 signals:
     // The user asked to see a track's, bus's or the master's effects (now in the Inspector).
@@ -56,6 +69,7 @@ private:
         QToolButton* solo = nullptr;
         QToolButton* fx = nullptr;     // shows the inserts in the Inspector
         QComboBox* output = nullptr;   // master or a bus
+        QComboBox* automation = nullptr;  // AutomationMode
     };
     struct BusStrip {
         QWidget* box = nullptr;
@@ -81,6 +95,9 @@ private:
     void setSurround(int index, const SurroundPan& pan, bool final);
     void setMute(int index, bool on);
     void setSolo(int index, bool on);
+    void setAutomationMode(int index, int mode);
+    // Faders and pans show the automation at the playhead on tracks that read it.
+    void followAutomation();
 
     EditorState* state_;
     QScrollArea* scroll_ = nullptr;
@@ -94,6 +111,15 @@ private:
     QSlider* masterFader_ = nullptr;
     QLabel* masterDb_ = nullptr;
     QLabel* emptyLabel_ = nullptr;
+    struct Recording {
+        int track = 0;
+        AutomationMode mode = AutomationMode::Read;
+        AutomationRecorder volume, pan;
+        double volumeDb = 0, panValue = 0;  // the fader and pan before
+        Param volumeLane, panLane;          // the lanes before
+    };
+    std::vector<Recording> recording_;
+    QString liveState_;  // what the gesture last applied, to skip repeats
 };
 
 }  // namespace montage

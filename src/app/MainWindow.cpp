@@ -143,7 +143,16 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     });
     connect(program_, &PlaybackController::positionChanged, this, [this](FrameTime t) {
         state_->setPlayhead(t);
-        if (program_->isPlaying()) timeline_->followPlayhead(t);
+        if (program_->isPlaying()) {
+            timeline_->followPlayhead(t);
+            if (mixer_) mixer_->playbackPosition(t);
+        }
+    });
+    // Fader automation is written while the program plays.
+    connect(program_, &PlaybackController::playingChanged, this, [this](bool playing) {
+        if (!mixer_) return;
+        if (playing) mixer_->playbackStarted(program_->position());
+        else mixer_->playbackStopped(program_->position());
     });
     connect(state_, &EditorState::sourceChanged, this, &MainWindow::rebuildSourceProject);
     connect(state_, &EditorState::historyChanged, this, &MainWindow::updateActions);

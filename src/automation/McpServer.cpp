@@ -19,6 +19,7 @@
 #include <sstream>
 
 #include "core/AutoTag.h"
+#include "core/Automation.h"
 #include "core/Captions.h"
 #include "core/Chapters.h"
 #include "core/Bleep.h"
@@ -918,6 +919,57 @@ void McpServer::Impl::addTools() {
             const std::string text = youtubeChapters(s, from, to, &warning);
             if (text.empty()) return fail(QString::fromStdString(warning));
             return ok(QString::fromStdString(text) + (warning.empty() ? QString() : QStringLiteral("\nNote: ") + QString::fromStdString(warning)));
+        });
+
+    add("montage_automate_track", "Automate a track's fader",
+        "Set an audio track's fader automation, as written from the mixer: its mode (off, read, write, latch, touch) and "
+        "volume (dB) and pan (-1 left to 1 right) points at times; points replace the lane's points between the first and last "
+        "given. clear removes the lanes. Lists the lanes afterwards.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"track":{"type":"string","default":"A1"},
+            "mode":{"type":"string","enum":["off","read","write","latch","touch"]},
+            "volume":{"type":"array","items":{"type":"array","items":{"type":["number","string"]},"minItems":2,"maxItems":2},
+                      "description":"[[time, dB], ...]"},
+            "pan":{"type":"array","items":{"type":"array","items":{"type":["number","string"]},"minItems":2,"maxItems":2},
+                   "description":"[[time, pan], ...]"},
+            "clear":{"type":"boolean","default":false}},"required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const TrackRef ref = trackArg(str(a, "track", "A1"), s, false);
+            if (ref.kind != TrackKind::Audio) throw ArgError{QStringLiteral("Automation is for audio tracks (A1, A2...)")};
+            Track& t = s.audioTracks.at(size_t(ref.index));
+            if (a.value("clear").toBool()) t.volumeAuto = Param(), t.panAuto = Param();
+            if (a.contains("mode")) {
+                const QString m = str(a, "mode").toLower();
+                const QStringList names{"off", "read", "write", "latch", "touch"};
+                if (!names.contains(m)) throw ArgError{QStringLiteral("\"mode\" must be off, read, write, latch or touch")};
+                t.automation = int(names.indexOf(m));
+            }
+            auto points = [&](const char* key, Param& lane, double lo, double hi) {
+                const QJsonArray pts = a.value(key).toArray();
+                if (pts.isEmpty()) return;
+                std::vector<Keyframe> keys;
+                for (const auto& v : pts) {
+                    const QJsonArray pt = v.toArray();
+                    if (pt.size() != 2) throw ArgError{QStringLiteral("\"%1\" points are [time, value]").arg(QString::fromLatin1(key))};
+                    keys.push_back({timeArg(pt.at(0), s, key), std::clamp(pt.at(1).toDouble(), lo, hi)});
+                }
+                std::sort(keys.begin(), keys.end(), [](const Keyframe& x, const Keyframe& y) { return x.t < y.t; });
+                std::erase_if(lane.keys, [&](const Keyframe& k) { return k.t >= keys.front().t && k.t <= keys.back().t; });
+                for (const Keyframe& k : keys) lane.keys.push_back(k);
+                std::sort(lane.keys.begin(), lane.keys.end(), [](const Keyframe& x, const Keyframe& y) { return x.t < y.t; });
+            };
+            points("volume", t.volumeAuto, -60, 12);
+            points("pan", t.panAuto, -1, 1);
+            save(l);
+            auto describe = [&](const Param& lane, const char* unit) {
+                QStringList parts;
+                for (const Keyframe& k : lane.keys) parts << QStringLiteral("%1 %2%3").arg(tc(k.t, s)).arg(k.v, 0, 'f', 2).arg(QString::fromLatin1(unit));
+                return parts.isEmpty() ? QStringLiteral("none") : parts.join(QStringLiteral(", "));
+            };
+            return ok(QStringLiteral("%1: %2 automation\nVolume: %3\nPan: %4")
+                          .arg(str(a, "track", "A1"), QString::fromLatin1(automationModeName(trackAutomation(t))), describe(t.volumeAuto, " dB"),
+                               describe(t.panAuto, "")));
         });
 
     add("montage_quality_check", "Quality check",
