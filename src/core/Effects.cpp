@@ -481,6 +481,18 @@ std::vector<EffectInfo> buildCatalog() {
                  {num("softness", "Softness", 0, 1, 0.05)}, {}});
     c.push_back({"zoom", "Cross Zoom", EffectCategory::VideoTransition, "Zoom",
                  {num("strength", "Strength", 0, 4, 1)}, {}});
+    // Creator transitions: fast moves smeared along their motion, and stylised cuts.
+    c.push_back({"whip_pan", "Whip Pan", EffectCategory::VideoTransition, "Motion",
+                 {choice("direction", "Direction", {"Left", "Right", "Up", "Down"}), num("strength", "Blur", 0, 2, 1, 0.05)}, {}});
+    c.push_back({"zoom_blur", "Zoom Blur", EffectCategory::VideoTransition, "Motion", {num("strength", "Strength", 0, 3, 1, 0.05)}, {}});
+    c.push_back({"spin", "Spin", EffectCategory::VideoTransition, "Motion",
+                 {num("turn", "Turn (degrees)", -720, 720, 180, 1), num("strength", "Blur", 0, 2, 1, 0.05)}, {}});
+    c.push_back({"glitch", "Glitch", EffectCategory::VideoTransition, "Stylize", {num("strength", "Strength", 0, 2, 1, 0.05)}, {}});
+    c.push_back({"light_leak", "Light Leak", EffectCategory::VideoTransition, "Stylize",
+                 {color("color", "Color", 1.0, 0.55, 0.2), num("strength", "Strength", 0, 3, 1, 0.05)}, {}});
+    c.push_back({"luma_wipe", "Luma Wipe", EffectCategory::VideoTransition, "Wipe",
+                 {num("softness", "Softness", 0, 1, 0.1), boolean("invert", "Brights First")}, {}});
+    c.push_back({"clock_wipe", "Clock Wipe", EffectCategory::VideoTransition, "Wipe", {num("softness", "Softness", 0, 1, 0.03)}, {}});
     c.push_back({"crossfade", "Crossfade (Equal Power)", EffectCategory::AudioTransition, "Crossfade", {}, {}});
     c.push_back({"crossfade_linear", "Crossfade (Constant Gain)", EffectCategory::AudioTransition, "Crossfade", {}, {}});
 

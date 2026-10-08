@@ -1459,6 +1459,22 @@ Image transitionMix(const std::string& type, const Effect& params, const Image& 
     const int dir = int(params.p("direction", 0, 0));
     const float ang = float(params.p("angle", 0, 0)) * float(M_PI) / 180.0f;
     const float strength = float(params.p("strength", 0, 1));
+    const float pi = float(M_PI);
+    const float bell = std::sin(pi * uf);  // 0 at the ends, 1 halfway
+    auto zero = [](float o[4]) { o[0] = o[1] = o[2] = o[3] = 0; };
+    auto sampleOr = [&](const Image& img, float sx, float sy, float o[4]) {
+        if (img.empty()) zero(o);
+        else sample(img, sx, sy, o);
+    };
+    auto lumaOf = [](const float* p) { return p[3] > 1e-6f ? (0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2]) / p[3] : 0.0f; };
+    auto hashf = [](uint32_t x) {
+        x ^= x >> 16, x *= 0x7feb352dU, x ^= x >> 15, x *= 0x846ca68bU, x ^= x >> 16;
+        return float(x & 0xffffff) / float(0xffffff);
+    };
+    const float turn = float(params.p("turn", 0, 180)) * pi / 180;
+    const float leak[3] = {float(params.p("color.r", 0, 1.0)), float(params.p("color.g", 0, 0.55)), float(params.p("color.b", 0, 0.2))};
+    const bool brightsFirst = params.p("invert", 0) > 0.5;
+    const uint32_t glitchSeed = uint32_t(uf * 40);  // the pattern jumps a few times through the transition
     parallelRows(h, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y) {
             for (int x = 0; x < w; ++x) {
@@ -1522,6 +1538,106 @@ Image transitionMix(const std::string& type, const Effect& params, const Image& 
                     if (!b.empty()) sample(b, cx + (fxp - cx) / sb, cy + (fyp - cy) / sb, pb);
                     else pb[0] = pb[1] = pb[2] = pb[3] = 0;
                     for (int c = 0; c < 4; ++c) o[c] = pa[c] * (1 - uf) + pb[c] * uf;
+                } else if (type == "whip_pan") {
+                    // A pushed out and B pushed in, fast in the middle, smeared along the move.
+                    const bool horiz = dir <= 1;
+                    const float sign = (dir == 0 || dir == 2) ? -1.f : 1.f;  // which way the pictures travel
+                    const float span = horiz ? float(w) : float(h);
+                    const float e = uf * uf * (3 - 2 * uf);
+                    const float travel = sign * e * span, blur = strength * 0.25f * span * bell;
+                    // Enough samples that the smear has no visible steps (one every 1.5 px).
+                    const int kTaps = std::clamp(int(blur / 1.5f) + 1, 1, 48);
+                    float sa[4] = {0, 0, 0, 0}, sb[4] = {0, 0, 0, 0};
+                    for (int k = 0; k < kTaps; ++k) {
+                        const float s = (kTaps > 1 ? (float(k) / (kTaps - 1) - 0.5f) * blur : 0.f);
+                        float qa[4], qb[4];
+                        const float ax = horiz ? x + 0.5f - travel - s : x + 0.5f, ay = horiz ? y + 0.5f : y + 0.5f - travel - s;
+                        const float bx = horiz ? ax + sign * span : ax, by = horiz ? ay : ay + sign * span;
+                        sampleOr(a, ax, ay, qa);
+                        sampleOr(b, bx, by, qb);
+                        for (int c = 0; c < 4; ++c) sa[c] += qa[c] / kTaps, sb[c] += qb[c] / kTaps;
+                    }
+                    for (int c = 0; c < 4; ++c) o[c] = sb[c] + sa[c] * (1 - sb[3]);
+                } else if (type == "zoom_blur" || type == "spin") {
+                    // A first, then B, each moved (zoomed in, or turned) and smeared along that motion,
+                    // most at the cut; a short dissolve hides the cut itself.
+                    const float cx = w * 0.5f, cy = h * 0.5f, fxp = x + 0.5f - cx, fyp = y + 0.5f - cy;
+                    auto moved = [&](const Image& img, float k, float out[4]) {  // k: 0 at rest, 1 at the cut
+                        zero(out);
+                        if (img.empty()) return;
+                        const float smear = strength * k;
+                        // Samples by how far this pixel's smear reaches (one every 1.5 px).
+                        const float reach = type == "zoom_blur" ? 0.25f * smear * std::hypot(fxp, fyp)
+                                                                : 0.075f * smear * std::fabs(turn) * k * std::hypot(fxp, fyp);
+                        const int kTaps = std::clamp(int(reach / 1.5f) + 1, 1, 48);
+                        for (int t = 0; t < kTaps; ++t) {
+                            const float f = kTaps > 1 ? float(t) / (kTaps - 1) : 0.f;
+                            float q[4], sx, sy;
+                            if (type == "zoom_blur") {
+                                const float sc = 1 + k * (1 + strength) * (1 + 0.25f * smear * f);
+                                sx = cx + fxp / sc, sy = cy + fyp / sc;
+                            } else {
+                                const float ang = k * 0.5f * turn * (1 + 0.15f * smear * f);
+                                const float sc = 1 - 0.15f * k;
+                                const float cs = std::cos(-ang), sn = std::sin(-ang);
+                                sx = cx + (fxp * cs - fyp * sn) / sc, sy = cy + (fxp * sn + fyp * cs) / sc;
+                            }
+                            sample(img, sx, sy, q);
+                            for (int c = 0; c < 4; ++c) out[c] += q[c] / kTaps;
+                        }
+                    };
+                    float qa[4], qb[4];
+                    moved(a, std::min(1.f, uf * 2), qa);
+                    moved(b, std::min(1.f, (1 - uf) * 2), qb);
+                    const float mix = smoothstep(0.45f, 0.55f, uf);
+                    for (int c = 0; c < 4; ++c) o[c] = qa[c] * (1 - mix) + qb[c] * mix;
+                } else if (type == "glitch") {
+                    // Bands of rows thrown sideways, colours split, pieces of B flashing in early and A late.
+                    const float amount = strength * (1 - std::fabs(2 * uf - 1));
+                    const int band = y / std::max(2, h / 24);
+                    const float r1 = hashf(uint32_t(band) * 2654435761U ^ glitchSeed * 40503U);
+                    const float r2 = hashf(uint32_t(band) * 97U ^ glitchSeed * 2246822519U);
+                    const float shift = (r1 < amount * 0.6f) ? (r2 - 0.5f) * 0.25f * w * amount : 0.f;
+                    const bool flip = hashf(uint32_t(band) * 31U ^ glitchSeed * 3266489917U) < amount * 0.35f;
+                    const Image& src = ((uf >= 0.5f) != flip) ? b : a;
+                    const float split = 0.02f * w * amount;
+                    float qr[4], qg[4], qbb[4];
+                    sampleOr(src, x + 0.5f - shift + split, y + 0.5f, qr);
+                    sampleOr(src, x + 0.5f - shift, y + 0.5f, qg);
+                    sampleOr(src, x + 0.5f - shift - split, y + 0.5f, qbb);
+                    o[0] = qr[0], o[1] = qg[1], o[2] = qbb[2], o[3] = std::max({qr[3], qg[3], qbb[3]});
+                } else if (type == "light_leak") {
+                    // A warm light sweeping across while the pictures dissolve beneath it.
+                    px(a, x, y, pa);
+                    px(b, x, y, pb);
+                    const float mix = smoothstep(0.3f, 0.7f, uf);
+                    for (int c = 0; c < 4; ++c) o[c] = pa[c] * (1 - mix) + pb[c] * mix;
+                    const float nx = (x + 0.5f) / w, ny = (y + 0.5f) / h;
+                    const float c1 = -0.3f + 1.6f * uf, c2 = 1.2f - 1.4f * uf;
+                    const float l = strength * bell *
+                                    (std::exp(-((nx - c1) * (nx - c1) / 0.08f + (ny - 0.35f) * (ny - 0.35f) / 0.3f)) +
+                                     0.6f * std::exp(-((nx - c2) * (nx - c2) / 0.05f + (ny - 0.8f) * (ny - 0.8f) / 0.15f)));
+                    for (int c = 0; c < 3; ++c) o[c] += l * leak[c];
+                    o[3] = std::min(1.f, o[3] + l);
+                } else if (type == "luma_wipe") {
+                    // B shows through A's darkest parts first (or brightest), spreading to the rest.
+                    px(a, x, y, pa);
+                    px(b, x, y, pb);
+                    float la = lumaOf(pa);
+                    if (brightsFirst) la = 1 - la;
+                    const float s = std::max(1e-3f, soft), tt = uf * (1 + 2 * s) - s;
+                    const float mb = 1 - smoothstep(tt, tt + s, la);
+                    for (int c = 0; c < 4; ++c) o[c] = pa[c] * (1 - mb) + pb[c] * mb;
+                } else if (type == "clock_wipe") {
+                    // A hand sweeping round from twelve o'clock.
+                    const float dx = x + 0.5f - w * 0.5f, dy = y + 0.5f - h * 0.5f;
+                    float ang = std::atan2(dx, -dy) / (2 * pi);
+                    if (ang < 0) ang += 1;
+                    const float s = std::max(1e-3f, soft), tt = uf * (1 + s);
+                    const float mb = 1 - smoothstep(tt - s, tt, ang);
+                    px(a, x, y, pa);
+                    px(b, x, y, pb);
+                    for (int c = 0; c < 4; ++c) o[c] = pa[c] * (1 - mb) + pb[c] * mb;
                 } else {  // cross_dissolve and fallback
                     px(a, x, y, pa);
                     px(b, x, y, pb);

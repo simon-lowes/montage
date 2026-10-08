@@ -675,3 +675,19 @@ All 15 items are in (October 2026). The near misses listed in the roadmap are th
     - weave moving a dot by up to 2.5 px between frames (none without it);
     - the vignette only at the corners, the fade lifting black, softness softening an edge, flicker within a few percent, aberration splitting colours at an edge;
     - the effect through `applyVideoEffect`.
+- [x] Creator transitions (render/Processing `transitionMix`):
+  - **Whip Pan:** a push that is fast in the middle, smeared along the move with a sample every 1.5 px.
+  - **Zoom Blur and Spin:** A moves (zooms in, or turns and shrinks a little) towards the cut and B moves back from it, each smeared radially or round the centre by how far the pixel travels; a short dissolve hides the cut.
+  - **Glitch:** bands of rows thrown sideways and the colours split, with pieces of B early and of A late. The pattern changes a few times and peaks halfway.
+  - **Light Leak:** two warm light blobs sweep across a dissolve.
+  - **Luma Wipe:** B through A's darkest parts first, or its brightest.
+  - **Clock Wipe:** from twelve o'clock.
+  - **Tests:**
+    - every one exactly A at the start and B at the end, and neither halfway;
+    - Whip Pan with A left and B right and A's stripes smeared away;
+    - Zoom Blur with the centre still A and the edges smeared;
+    - Spin moving a mark;
+    - Glitch shifting rows;
+    - Light Leak adding warm light over a plain dissolve;
+    - Luma Wipe dark first, and bright first;
+    - Clock Wipe's quadrants.

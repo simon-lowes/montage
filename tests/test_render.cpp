@@ -59,6 +59,99 @@ Clip colorClip(Project& p, float r, float g, float b, FrameTime start, FrameTime
 class TestRender : public QObject {
     Q_OBJECT
 private slots:
+    void creatorTransitions() {
+        const int W = 160, H = 120;
+        // A: warm with vertical stripes, B: cool with horizontal stripes.
+        Image A(W, H), B(W, H);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                float* a = A.at(x, y);
+                a[0] = 0.8f, a[1] = 0.3f + 0.2f * float((x / 4) % 2), a[2] = 0.1f, a[3] = 1;
+                float* b = B.at(x, y);
+                b[0] = 0.1f, b[1] = 0.3f + 0.2f * float((y / 4) % 2), b[2] = 0.8f, b[3] = 1;
+            }
+        auto maxDiff = [](const Image& x, const Image& y) {
+            float d = 0;
+            for (size_t i = 0; i < x.px.size(); ++i) d = std::max(d, std::abs(x.px[i] - y.px[i]));
+            return d;
+        };
+        Project p;
+        for (const char* type : {"whip_pan", "zoom_blur", "spin", "glitch", "light_leak", "luma_wipe", "clock_wipe"}) {
+            const EffectInfo* info = findEffectInfo(type);
+            QVERIFY2(info && info->category == EffectCategory::VideoTransition, type);
+            const Effect e = makeEffect(p, type);
+            QVERIFY2(maxDiff(transitionMix(type, e, A, B, 0.0, W, H), A) < 1e-3f, type);
+            QVERIFY2(maxDiff(transitionMix(type, e, A, B, 1.0, W, H), B) < 1e-3f, type);
+            const Image mid = transitionMix(type, e, A, B, 0.5, W, H);
+            QVERIFY2(maxDiff(mid, A) > 0.1f && maxDiff(mid, B) > 0.1f, type);
+        }
+        auto redness = [](const float* q) { return q[0] - q[2]; };
+        // Whip Pan left: A on the left going out, B on the right coming in, smeared sideways.
+        {
+            Effect e = makeEffect(p, "whip_pan");
+            const Image m = transitionMix("whip_pan", e, A, B, 0.5, W, H);
+            QVERIFY(redness(m.at(20, 60)) > 0.3f && redness(m.at(140, 60)) < -0.3f);
+            // A's vertical stripes are smeared away along the move.
+            QVERIFY(std::abs(m.at(20, 60)[1] - m.at(22, 60)[1]) < 0.05f);
+        }
+        // Zoom Blur: early on, the centre still A, the edges smeared outward.
+        {
+            Effect e = makeEffect(p, "zoom_blur");
+            const Image m = transitionMix("zoom_blur", e, A, B, 0.25, W, H);
+            QVERIFY(redness(m.at(80, 60)) > 0.5f);
+            QVERIFY(std::abs(m.at(4, 60)[1] - m.at(6, 60)[1]) < 0.1f);
+        }
+        // Spin: a mark on A moves round the centre.
+        {
+            Image marked = A;
+            for (int y = 10; y < 20; ++y)
+                for (int x = 75; x < 85; ++x) std::fill_n(marked.at(x, y), 3, 1.0f);
+            Effect e = makeEffect(p, "spin");
+            e.params["strength"] = Param(0.0);
+            const Image m = transitionMix("spin", e, marked, B, 0.25, W, H);
+            QVERIFY(m.at(80, 15)[2] < 0.5f);  // no longer where it was
+        }
+        // Glitch: rows thrown about halfway, and colours split.
+        {
+            Effect e = makeEffect(p, "glitch");
+            e.params["strength"] = Param(2.0);
+            const Image m = transitionMix("glitch", e, A, B, 0.4, W, H);
+            int changed = 0;
+            for (int y = 0; y < H; y += 5) changed += maxDiff(transitionMix("glitch", e, A, B, 0.0, W, H), m) > 0.1f;
+            QVERIFY(changed > 0);
+        }
+        // Light Leak: brighter and warmer than a plain dissolve halfway.
+        {
+            Effect e = makeEffect(p, "light_leak");
+            const Image m = transitionMix("light_leak", e, A, B, 0.5, W, H);
+            Effect plain = makeEffect(p, "cross_dissolve");
+            const Image d = transitionMix("cross_dissolve", plain, A, B, 0.5, W, H);
+            double added[3] = {0, 0, 0};
+            for (size_t i = 0; i < m.px.size(); i += 4)
+                for (int c = 0; c < 3; ++c) added[c] += m.px[i + c] - d.px[i + c];
+            QVERIFY(added[0] > 0 && added[0] > added[2] * 2);
+        }
+        // Luma Wipe: B through A's dark half first; brights first reverses it.
+        {
+            Image split = A;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W / 2; ++x) std::fill_n(split.at(x, y), 3, 0.05f);
+            Effect e = makeEffect(p, "luma_wipe");
+            Image m = transitionMix("luma_wipe", e, split, B, 0.3, W, H);
+            QVERIFY(redness(m.at(20, 60)) < -0.3f && redness(m.at(140, 60)) > 0.3f);
+            e.params["invert"] = Param(1.0);
+            m = transitionMix("luma_wipe", e, split, B, 0.6, W, H);
+            QVERIFY(std::abs(redness(m.at(20, 60))) < 0.01f && redness(m.at(140, 60)) < -0.3f);
+        }
+        // Clock Wipe: a quarter of the way, the top right shows B, the rest A.
+        {
+            Effect e = makeEffect(p, "clock_wipe");
+            const Image m = transitionMix("clock_wipe", e, A, B, 0.27, W, H);
+            QVERIFY(redness(m.at(130, 30)) < -0.3f);
+            QVERIFY(redness(m.at(30, 30)) > 0.3f && redness(m.at(30, 100)) > 0.3f && redness(m.at(130, 100)) > 0.3f);
+        }
+    }
+
     void filmLookParts() {
         auto none = [] {
             FilmLookSettings s;
