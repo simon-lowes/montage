@@ -124,10 +124,14 @@ TimelineWidget::TimelineWidget(EditorState* state, QWidget* parent) : QAbstractS
     verticalScrollBar()->setSingleStep(20);
     connect(state_, &EditorState::projectChanged, this, [this] {
         duplicatesDirty_ = throughDirty_ = true;
+        gap_.reset();
         updateScrollBars();
         viewport()->update();
     });
-    connect(state_, &EditorState::selectionChanged, viewport(), qOverload<>(&QWidget::update));
+    connect(state_, &EditorState::selectionChanged, this, [this] {
+        if (!state_->selectedClips().empty()) gap_.reset();
+        viewport()->update();
+    });
     connect(state_, &EditorState::playheadChanged, viewport(), qOverload<>(&QWidget::update));
     connect(state_, &EditorState::sequenceSwitched, this, [this] {
         duplicatesDirty_ = throughDirty_ = true;
@@ -245,6 +249,32 @@ void TimelineWidget::toggleFolder(TrackKind kind, const QString& folder) {
         edit::setFolderCollapsed(sq, kind, name, collapse);
         return true;
     });
+}
+
+bool TimelineWidget::selectGapAt(TrackRef track, FrameTime frame) {
+    const Sequence* s = state_->sequence();
+    const Track* t = s ? trackAt(*s, track) : nullptr;
+    gap_.reset();
+    if (!t || frame < 0) {
+        viewport()->update();
+        return false;
+    }
+    FrameTime from = 0;
+    for (const Clip& c : t->clips) {
+        if (c.contains(frame)) break;  // on a clip, not a gap
+        if (c.start > frame) {
+            if (c.start > from) gap_ = Gap{track, from, c.start};
+            break;
+        }
+        from = c.end();
+    }
+    viewport()->update();
+    return gap_.has_value();
+}
+
+void TimelineWidget::clearGap() {
+    gap_.reset();
+    viewport()->update();
 }
 
 bool TimelineWidget::trackShown(TrackRef ref) const {
@@ -542,6 +572,15 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
         }
     }
     for (const FolderRow& f : folderRows()) paintFolderRow(p, f, false);
+    if (gap_)
+        for (const Row& r : rs)
+            if (r.ref == gap_->track) {
+                const QRect gr(xForFrame(gap_->from), r.y + 2, std::max(2, xForFrame(gap_->to) - xForFrame(gap_->from)), r.h - 5);
+                p.fillRect(gr, QColor(61, 139, 255, 70));
+                p.setPen(QPen(theme::kAccent, 1, Qt::DashLine));
+                p.setBrush(Qt::NoBrush);
+                p.drawRect(gr.adjusted(0, 0, -1, -1));
+            }
     // Trim mode: a bracket on each side being trimmed, ']' on the outgoing clip's end, '[' on the incoming clip's start.
     if (trimSide_ >= 0) {
         p.setPen(QPen(QColor(255, 70, 70), 3));
@@ -1974,6 +2013,11 @@ void TimelineWidget::mouseReleaseEvent(QMouseEvent* e) {
     if (gesture) state_->endGesture(true);
     if (drag_.started && (drag_.kind == DragKind::Trim || drag_.kind == DragKind::Roll || drag_.kind == DragKind::Slip || drag_.kind == DragKind::Slide))
         emit trimViewEnded();
+    // A click (not a drag) on empty track space selects the gap there.
+    if (drag_.kind == DragKind::Rubber && !drag_.started && drag_.pressTrack && e->button() == Qt::LeftButton && tool_ == Tool::Select)
+        selectGapAt(*drag_.pressTrack, drag_.pressFrame);
+    else if (drag_.kind != DragKind::None && drag_.kind != DragKind::Pan)
+        gap_.reset();
     drag_ = DragState{};
     snapIndicator_ = -1;
     viewport()->update();

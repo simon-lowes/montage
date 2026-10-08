@@ -68,6 +68,15 @@ public:
     // arrow does.
     QRect folderHeaderRect(TrackKind kind, const QString& folder) const;
     void toggleFolder(TrackKind kind, const QString& folder);
+    // Gaps (Premiere's and Resolve's): a click on the empty stretch between two clips selects it, and Delete closes
+    // it, rippling what follows. The selected gap's track and frames [from, to), if any.
+    struct Gap {
+        TrackRef track;
+        FrameTime from = 0, to = 0;
+    };
+    const std::optional<Gap>& selectedGap() const { return gap_; }
+    bool selectGapAt(TrackRef track, FrameTime frame);  // false if there is no gap there
+    void clearGap();
     // Whether a track's row is shown (not inside a collapsed folder).
     bool trackShown(TrackRef ref) const;
     // Where a clip is drawn, in viewport pixels (empty when its row is not shown).
@@ -261,6 +270,7 @@ private:
     QPoint hoverPos_;
     bool showVolume_ = true;
     bool showTrackAuto_ = false;
+    std::optional<Gap> gap_;
     bool showDuplicates_ = false;
     bool showDurations_ = false;
     mutable bool duplicatesDirty_ = true;

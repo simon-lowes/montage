@@ -2066,6 +2066,38 @@ private slots:
         state()->newProject();
     }
 
+    void rippleDeleteAGap() {
+        loadDemo();
+        const Clip* red = clipNamed(*state()->sequence(), "Red");
+        const Id redId = red->id, blueId = clipNamed(*state()->sequence(), "Blue")->id;
+        const FrameTime redEnd = red->end();
+        // Blue moved half a second later leaves a gap after Red.
+        QVERIFY(state()->apply("Move", [blueId](Project& p, Sequence& s) { return edit::moveClips(p, s, {blueId}, 15, 0, 0); }));
+        TimelineWidget* tl = win_->timeline();
+        const QRect r = tl->clipBounds(redId), b = tl->clipBounds(blueId);
+        QVERIFY(b.left() > r.right() + 4);
+        // A click in it selects it (and only that); Delete closes it, rippling Blue back.
+        QTest::mouseClick(tl->viewport(), Qt::LeftButton, {}, QPoint((r.right() + b.left()) / 2, r.center().y()));
+        QVERIFY(tl->selectedGap());
+        QCOMPARE(tl->selectedGap()->from, redEnd);
+        QCOMPARE(tl->selectedGap()->to, redEnd + 15);
+        QVERIFY(state()->selectedClips().empty());
+        QAction* lift = nullptr;  // Edit › Delete (Delete / Backspace)
+        for (QAction* a : win_->findChildren<QAction*>())
+            if (a->text() == "&Delete (Lift)") lift = a;
+        QVERIFY(lift);
+        lift->trigger();
+        QCOMPARE(edit::clipById(*state()->sequence(), blueId)->start, redEnd);
+        QVERIFY(!tl->selectedGap());
+        state()->undo();
+        QCOMPARE(edit::clipById(*state()->sequence(), blueId)->start, redEnd + 15);
+        // On a clip there is no gap; selecting a clip drops a selected gap.
+        QVERIFY(!tl->selectGapAt({TrackKind::Video, 0}, 5));
+        QVERIFY(tl->selectGapAt({TrackKind::Video, 0}, redEnd + 3));
+        state()->setSelection({redId});
+        QVERIFY(!tl->selectedGap());
+    }
+
     void auditionsFromTheBin() {
         // Two takes of a shot: the first in the cut, the second added from the bin as a take.
         QStringList files;

@@ -1468,7 +1468,16 @@ void MainWindow::deleteSelection(bool ripple) {
         return;
     }
     auto sel = state_->selectedClips();
-    if (sel.empty()) return;
+    if (sel.empty()) {
+        // A selected gap closes, rippling what follows.
+        if (const auto& gap = timeline_->selectedGap()) {
+            const TrackRef track = gap->track;
+            const FrameTime at = gap->from;
+            state_->apply(tr("Ripple Delete Gap"), [track, at](Project& p, Sequence& s) { return edit::closeGap(p, s, track, at); });
+            timeline_->clearGap();
+        }
+        return;
+    }
     state_->apply(ripple ? tr("Ripple Delete") : tr("Delete"), [sel, ripple](Project& p, Sequence& s) {
         return edit::removeClips(p, s, sel, ripple);
     });
