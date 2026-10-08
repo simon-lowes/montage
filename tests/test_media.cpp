@@ -3887,6 +3887,49 @@ private slots:
         QVERIFY(r.value("isError").toBool());
     }
 
+    void mcpRemovesRetakes() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = {25, 1};
+        MediaItem m;
+        m.id = p.newId();
+        m.kind = MediaKind::Video;
+        m.name = "piece to camera";
+        m.path = path("retakes.mp4");
+        m.hasVideo = m.hasAudio = true;
+        m.duration = 20;
+        auto t = std::make_shared<Transcript>();
+        TranscriptSegment seg;
+        // "Welcome back to the, uh, welcome back to the channel."
+        seg.words = {{1.0, 1.3, "Welcome", 1}, {1.4, 1.6, "back", 1}, {1.7, 1.8, "to", 1}, {1.9, 2.0, "the,", 1}, {2.3, 2.5, "uh,", 1},
+                     {3.0, 3.3, "welcome", 1}, {3.4, 3.6, "back", 1}, {3.7, 3.8, "to", 1}, {3.9, 4.0, "the", 1}, {4.1, 4.6, "channel.", 1}};
+        t->segments.push_back(seg);
+        m.transcript = t;
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 250, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const QString project = QString::fromStdString(path("retakes.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_cut_speech"}, {"arguments", QJsonObject{{"project", project}, {"retakes", true}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject sc = r.value("structuredContent").toObject();
+        QCOMPARE(sc.value("retakes").toInt(), 1);
+        // From the first "Welcome" (1.0 s) to the second (3.0 s).
+        QVERIFY2(std::fabs(sc.value("removed_seconds").toDouble() - 2.0) < 0.05, QJsonDocument(sc).toJson().constData());
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const auto words = sequenceTranscriptWords(back, *back.active());
+        // The kept take only: "welcome back to the channel."
+        QCOMPARE(int(words.size()), 5);
+        QCOMPARE(words[0].text, std::string("welcome"));
+        QCOMPARE(words[4].text, std::string("channel."));
+    }
+
     void mcpCutsBySpeech() {
         // An interview clip with a filler, a long pause and a phrase to lose.
         Project p = makeDefaultProject();

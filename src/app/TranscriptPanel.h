@@ -41,6 +41,7 @@ public:
 public slots:
     void deleteSelection();     // Sequence: ripple-delete the selected words
     void removeFillerWords();   // Sequence
+    void removeRetakes();       // Sequence: keep only the last take where the speaker started again
     void bleepSelection();      // Sequence: a tone over the selected words, masked in the captions
     void bleepProfanity();      // Sequence: the same for every swear word found
     void removePauses(double minPause = 1.0, double keep = 0.3);  // Sequence
@@ -79,6 +80,7 @@ private:
     QLabel* status_;
     QToolButton* deleteBtn_;
     QToolButton* fillersBtn_;
+    QToolButton* retakesBtn_;
     QToolButton* pausesBtn_;
     QToolButton* bleepBtn_;
     QToolButton* insertBtn_;

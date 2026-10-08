@@ -209,6 +209,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Edit by transcript (Transcript panel):
   - **Sequence mode** shows what the cut says, with the word under the playhead highlighted. Click a word to go there. Select words and press Delete to cut them out of every track; the gap closes and the captions move with it.
   - Remove Fillers cuts um, uh, er and similar words in one step. Shorten Pauses trims silences between words to a length you choose.
+  - Remove Retakes (like Descript's): where the speaker broke off and started the same words again ("So today we're going to, um, so today we're going to talk about..."), only the last take stays. A finished sentence said twice for effect is kept.
   - With **Smooth Cuts** on, each join these leave in the picture gets a Smooth Cut, so the speaker does not jump.
   - Find searches the words; the last word may be partly typed.
   - **Source mode** shows the Source monitor clip's transcript. Select words to set In and Out, then Insert or Overwrite them into the timeline.
@@ -337,7 +338,7 @@ Its tools work on `.montage` files by path. Each edit is saved at once, and the 
 - probe media, create projects and list a project's timeline;
 - place media, split, remove (with ripple), move, trim and change the speed of clips;
 - add titles, effects (including masked ones), transitions and markers;
-- transcribe (with speaker labels), translate caption tracks, find spoken phrases in the cut, cut by transcript (phrases, filler words, long pauses, optionally with Smooth Cuts), and build a cut from a script;
+- transcribe (with speaker labels), translate caption tracks, find spoken phrases in the cut, cut by transcript (phrases, filler words, retakes, long pauses, optionally with Smooth Cuts), and build a cut from a script;
 - find shots by description, and find, name and join the people in the footage;
 - generate voiceovers from text or from a caption track;
 - log media (ratings, labels, keywords, metadata fields, bins), make subclips, auto-tag shots, and find media by text or smart-bin rules, optionally saving the rules as a smart bin;

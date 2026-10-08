@@ -81,6 +81,8 @@ TranscriptPanel::TranscriptPanel(EditorState* state, QWidget* parent) : QWidget(
     auto* bottom = new QHBoxLayout;
     deleteBtn_ = button(this, tr("Delete"), tr("Cut the selected words out of the sequence and close the gap (Delete)"));
     fillersBtn_ = button(this, tr("Remove Fillers"), tr("Cut out um, uh, er and similar filler words"));
+    retakesBtn_ = button(this, tr("Remove Retakes"), tr("Where the speaker broke off and started again, keep only the last take"));
+    retakesBtn_->setObjectName(QStringLiteral("removeRetakes"));
     pausesBtn_ = button(this, tr("Shorten Pauses..."), tr("Shorten silences between words"));
     bleepBtn_ = button(this, tr("Bleep"), tr("Cover words with a bleep tone, and mask them in the captions"));
     bleepBtn_->setObjectName(QStringLiteral("bleepButton"));
@@ -108,7 +110,7 @@ TranscriptPanel::TranscriptPanel(EditorState* state, QWidget* parent) : QWidget(
     smoothBtn_->setCheckable(true);
     smoothBtn_->setChecked(QSettings().value(QStringLiteral("transcript/smoothCuts"), false).toBool());
     connect(smoothBtn_, &QToolButton::toggled, this, [](bool on) { QSettings().setValue(QStringLiteral("transcript/smoothCuts"), on); });
-    for (QToolButton* b : {deleteBtn_, fillersBtn_, pausesBtn_, bleepBtn_, insertBtn_, overwriteBtn_}) bottom->addWidget(b);
+    for (QToolButton* b : {deleteBtn_, fillersBtn_, retakesBtn_, pausesBtn_, bleepBtn_, insertBtn_, overwriteBtn_}) bottom->addWidget(b);
     bottom->addStretch();
     bottom->addWidget(smoothBtn_);
     lay->addLayout(bottom);
@@ -124,6 +126,7 @@ TranscriptPanel::TranscriptPanel(EditorState* state, QWidget* parent) : QWidget(
     });
     connect(deleteBtn_, &QToolButton::clicked, this, &TranscriptPanel::deleteSelection);
     connect(fillersBtn_, &QToolButton::clicked, this, &TranscriptPanel::removeFillerWords);
+    connect(retakesBtn_, &QToolButton::clicked, this, &TranscriptPanel::removeRetakes);
     connect(pausesBtn_, &QToolButton::clicked, this, [this] {
         QDialog dlg(this);
         dlg.setWindowTitle(tr("Shorten Pauses"));
@@ -185,7 +188,7 @@ void TranscriptPanel::setMode(Mode m) {
     mode_ = m;
     modeBox_->setCurrentIndex(m == Mode::Sequence ? 0 : 1);
     const bool seq = m == Mode::Sequence;
-    for (QToolButton* b : {deleteBtn_, fillersBtn_, pausesBtn_, bleepBtn_}) b->setVisible(seq);
+    for (QToolButton* b : {deleteBtn_, fillersBtn_, retakesBtn_, pausesBtn_, bleepBtn_}) b->setVisible(seq);
     for (QToolButton* b : {insertBtn_, overwriteBtn_}) b->setVisible(!seq);
     signature_.clear();
     current_ = -1;
@@ -276,6 +279,7 @@ void TranscriptPanel::rebuild() {
     insertBtn_->setEnabled(false);
     overwriteBtn_->setEnabled(false);
     fillersBtn_->setEnabled(fillers > 0);
+    retakesBtn_->setEnabled(mode_ == Mode::Sequence && !retakeRanges(words_, fps()).empty());
     pausesBtn_->setEnabled(words_.size() > 1);
     if (!search_->text().isEmpty()) find(search_->text());
     refreshHighlights();
@@ -499,6 +503,18 @@ void TranscriptPanel::removeFillerWords() {
     const int n = int(std::count_if(words_.begin(), words_.end(), [](const TranscriptWord& w) { return isFillerWord(w.text); }));
     if (state_->apply(tr("Remove Filler Words"), [ranges, smooth = smoothCutFrames()](Project& p, Sequence& s) { return rippleDeleteRanges(p, s, ranges, smooth); }))
         state_->message(tr("Removed %n filler word(s)", "", n));
+}
+
+void TranscriptPanel::removeRetakes() {
+    if (mode_ != Mode::Sequence) return;
+    std::vector<std::pair<size_t, size_t>> takes;
+    const auto ranges = retakeRanges(words_, fps(), 3, 30, &takes);
+    if (ranges.empty()) {
+        state_->message(tr("No retakes found"));
+        return;
+    }
+    if (state_->apply(tr("Remove Retakes"), [ranges, smooth = smoothCutFrames()](Project& p, Sequence& s) { return rippleDeleteRanges(p, s, ranges, smooth); }))
+        state_->message(tr("Removed %n broken-off take(s)", "", int(takes.size())));
 }
 
 void TranscriptPanel::removePauses(double minPause, double keep) {

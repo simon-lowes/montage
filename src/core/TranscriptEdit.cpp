@@ -1,5 +1,7 @@
 #include "TranscriptEdit.h"
 
+#include <cctype>
+
 #include <QRegularExpression>
 #include <QSet>
 #include <QString>
@@ -147,6 +149,71 @@ std::vector<FrameRange> fillerWordRanges(const std::vector<TranscriptWord>& word
         // Take the short breath after the filler too, so the next word starts cleanly.
         if (i + 1 < words.size() && words[i + 1].start - end < 0.25) end = words[i + 1].start;
         out.emplace_back(FrameTime(std::llround(words[i].start * fps)), FrameTime(std::llround(end * fps)));
+    }
+    return mergeRanges(out);
+}
+
+namespace {
+
+// Lower case, letters, digits and apostrophes only.
+std::string plainWord(const std::string& w) {
+    std::string out;
+    for (unsigned char c : w)
+        if (std::isalnum(c) || c == '\'' || c >= 0x80) out += char(std::tolower(c));
+    return out;
+}
+
+bool endsSentence(const std::string& w) {
+    for (auto it = w.rbegin(); it != w.rend(); ++it) {
+        if (*it == '.' || *it == '!' || *it == '?') return true;
+        if (std::isalnum(static_cast<unsigned char>(*it))) return false;
+    }
+    return false;
+}
+
+}  // namespace
+
+std::vector<FrameRange> retakeRanges(const std::vector<TranscriptWord>& words, double fps, int minWords, int maxWords,
+                                     std::vector<std::pair<size_t, size_t>>* takes) {
+    std::vector<std::string> w;
+    for (const TranscriptWord& t : words) w.push_back(plainWord(t.text));
+    const size_t n = w.size(), m = size_t(std::max(2, minWords));
+    auto same = [&](size_t a, size_t b) {
+        if (b + m > n) return false;
+        bool content = false;
+        for (size_t k = 0; k < m; ++k) {
+            if (w[a + k].empty() || w[a + k] != w[b + k]) return false;
+            content |= w[a + k].size() >= 4;
+        }
+        return content;
+    };
+    // An attempt broken off: no sentence finished in it, or a filler or an apology in it.
+    auto unfinished = [&](size_t from, size_t to) {
+        bool finished = false;
+        for (size_t k = from; k < to; ++k) {
+            if (isFillerWord(words[k].text) || w[k] == "sorry" || w[k] == "again" || (w[k] == "let" && k + 1 < to && w[k + 1] == "me"))
+                return true;
+            finished |= endsSentence(words[k].text);
+        }
+        return !finished;
+    };
+    std::vector<FrameRange> out;
+    size_t k = 0;
+    while (k < n) {
+        // The earliest attempt within reach that this one restarts, chained back through attempts in between.
+        size_t first = k;
+        for (size_t i = k > size_t(maxWords) ? k - size_t(maxWords) : 0; i < k; ++i)
+            if (i + m <= k && same(i, k) && unfinished(i, k)) {
+                first = i;
+                break;
+            }
+        if (first < k) {
+            if (takes) takes->push_back({first, k});
+            out.emplace_back(FrameTime(std::llround(words[first].start * fps)), FrameTime(std::llround(words[k].start * fps)));
+            k += m;
+        } else {
+            ++k;
+        }
     }
     return mergeRanges(out);
 }

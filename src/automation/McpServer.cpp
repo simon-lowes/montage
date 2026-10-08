@@ -879,12 +879,14 @@ void McpServer::Impl::addTools() {
 
     add("montage_cut_speech", "Cut by transcript",
         "Edit the cut by what is said, as in a text-based editor: remove every place a phrase is spoken, the filler words "
-        "(um, uh, er...) and/or pauses longer than pauses_longer_than seconds (shortened to keep_pause). Every track is cut "
+        "(um, uh, er...), retakes (broken-off attempts the speaker started again) and/or pauses longer than "
+        "pauses_longer_than seconds (shortened to keep_pause). Every track is cut "
         "the same way and closed up, captions included. smooth_cuts puts a Smooth Cut (an optical-flow morph) on each join "
         "in the picture, to hide the jump. One undoable edit; use montage_find_phrase first to see what a phrase matches.",
         R"json({"type":"object","properties":{"project":{"type":"string"},
             "phrases":{"type":"array","items":{"type":"string"},"description":"Phrases to cut, every time they are said"},
             "fillers":{"type":"boolean","default":false},
+            "retakes":{"type":"boolean","default":false,"description":"Where the speaker broke off and started the same words again, keep only the last take"},
             "pauses_longer_than":{"type":"number","description":"Seconds; omit to keep pauses"},
             "keep_pause":{"type":"number","default":0.3},
             "smooth_cuts":{"type":"boolean","default":false}},"required":["project"]})json",
@@ -919,6 +921,12 @@ void McpServer::Impl::addTools() {
                 for (const FrameRange& r : fillerWordRanges(words, fps)) ranges.push_back(r);
                 fillers = int(std::count_if(words.begin(), words.end(), [](const TranscriptWord& w) { return isFillerWord(w.text); }));
             }
+            int retakes = 0;
+            if (a.value("retakes").toBool()) {
+                std::vector<std::pair<size_t, size_t>> takes;
+                for (const FrameRange& r : retakeRanges(words, fps, 3, 30, &takes)) ranges.push_back(r);
+                retakes = int(takes.size());
+            }
             int pauses = 0;
             if (a.value("pauses_longer_than").isDouble()) {
                 const double longer = std::max(0.1, a.value("pauses_longer_than").toDouble());
@@ -936,13 +944,14 @@ void McpServer::Impl::addTools() {
             for (const Track& t : s.videoTracks)
                 joins += int(std::count_if(t.transitions.begin(), t.transitions.end(), [](const Transition& tr) { return tr.type == "smooth_cut"; }));
             const double secs = double(r.applied) / fps;
-            return ok(QStringLiteral("Cut %1 s: %2 phrase match(es), %3 filler word(s), %4 pause(s)%5")
+            return ok(QStringLiteral("Cut %1 s: %2 phrase match(es), %3 filler word(s), %6 retake(s), %4 pause(s)%5")
                           .arg(secs, 0, 'f', 2)
                           .arg(std::accumulate(found.begin(), found.end(), 0, [](int n, const QJsonValue& v) { return n + v.toObject().value("times").toInt(); }))
                           .arg(fillers)
                           .arg(pauses)
-                          .arg(smooth ? QStringLiteral(", with Smooth Cuts") : QString()),
-                      QJsonObject{{"phrases", found}, {"fillers", fillers}, {"pauses", pauses}, {"removed_seconds", secs},
+                          .arg(smooth ? QStringLiteral(", with Smooth Cuts") : QString())
+                          .arg(retakes),
+                      QJsonObject{{"phrases", found}, {"fillers", fillers}, {"retakes", retakes}, {"pauses", pauses}, {"removed_seconds", secs},
                                   {"smooth_cuts", joins}, {"duration", tc(s.duration(), s)}});
         });
 

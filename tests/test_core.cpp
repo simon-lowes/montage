@@ -375,6 +375,42 @@ private slots:
         QVERIFY(r->reverse);
     }
 
+    void retakes() {
+        // Words at 0.4 s each, from `at`.
+        auto say = [](const char* text, double at = 0) {
+            std::vector<TranscriptWord> out;
+            for (const QString& w : QString(text).split(' ', Qt::SkipEmptyParts)) {
+                out.push_back({at, at + 0.35, w.toStdString(), 1});
+                at += 0.4;
+            }
+            return out;
+        };
+        // Broken off with a filler, then said again: the first attempt goes, up to where the kept take starts.
+        std::vector<std::pair<size_t, size_t>> takes;
+        auto w = say("So today we're going to, um, so today we're going to talk about the budget.");
+        auto r = retakeRanges(w, 25, 3, 30, &takes);
+        QCOMPARE(takes.size(), size_t(1));
+        QCOMPARE(takes[0], (std::pair<size_t, size_t>{0, 6}));
+        QCOMPARE(r.size(), size_t(1));
+        QCOMPARE(r[0], (FrameRange{0, FrameTime(std::llround(6 * 0.4 * 25))}));
+        // Three attempts: only the last stays.
+        takes.clear();
+        w = say("The plan is the plan is, sorry, the plan is simple.");
+        r = retakeRanges(w, 25, 3, 30, &takes);
+        QCOMPARE(r.size(), size_t(1));
+        QCOMPARE(r[0].first, FrameTime(0));
+        QCOMPARE(r[0].second, FrameTime(std::llround(7 * 0.4 * 25)));  // "the" of the third "the plan is"
+        // A finished sentence said again for effect is kept, as is a repeat of little words.
+        QVERIFY(retakeRanges(say("We need to act. We need to act now."), 25).empty());
+        QVERIFY(retakeRanges(say("it is in it is in the box"), 25).empty());
+        // Too far apart to be a retake.
+        std::vector<TranscriptWord> far = say("today we're going to");
+        for (int i = 0; i < 40; ++i) far.push_back({far.back().end + 0.05, far.back().end + 0.4, "word" + std::to_string(i), 1});
+        const auto again = say("today we're going to", far.back().end + 0.1);
+        far.insert(far.end(), again.begin(), again.end());
+        QVERIFY(retakeRanges(far, 25).empty());
+    }
+
     void editingByTranscript() {
         Project p = makeDefaultProject();
         Sequence& s = *p.active();

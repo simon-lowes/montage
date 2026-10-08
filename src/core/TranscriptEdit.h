@@ -41,4 +41,15 @@ std::vector<FrameRange> fillerWordRanges(const std::vector<TranscriptWord>& word
 std::vector<FrameRange> pauseRanges(const std::vector<TranscriptWord>& words, double fps, double minPause = 1.0,
                                     double keep = 0.3);
 
+// Retakes (like Descript's): where a speaker breaks off and starts the same
+// words again ("So today we're going to, um, so today we're going to talk
+// about..."), the broken-off attempts, from the first attempt to the start of
+// the last. A repeat counts when at least `minWords` words match (one of them
+// four letters or more) within `maxWords` words, and the attempt before was
+// left unfinished: it did not end a sentence, or it held a filler or "sorry",
+// "again", "let me". A finished sentence said twice for effect is kept.
+// `takes`, if given, gets the (first attempt, kept take) word indices.
+std::vector<FrameRange> retakeRanges(const std::vector<TranscriptWord>& words, double fps, int minWords = 3, int maxWords = 30,
+                                     std::vector<std::pair<size_t, size_t>>* takes = nullptr);
+
 }  // namespace montage
