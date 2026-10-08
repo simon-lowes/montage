@@ -750,4 +750,9 @@ All 15 items are in (October 2026). The near misses listed in the roadmap are th
   - **Tests** (on exported ProRes footage):
     - a white square moving 16 px a frame: 24 soft pixels along its path at 360° (none without), none across it, and identical with the shutter shut;
     - a gradient flickering ±0.2 stops each frame while brightening 0.02 stops a frame: frame-to-frame jitter down 2,400×, with the brightening kept to 0.1 %.
+- [x] GIF, image sequences and social presets (render/Exporter):
+  - **Animated GIF:** pass 1 renders up to 32 frames spread over the range into a 5-bit-a-channel histogram, and median cut (widest weighted box first, split at the weighted median) makes the palette. Pass 2 maps every frame through a 32,768-entry nearest-colour table after 8 × 8 Bayer dithering (fixed in place, so it does not crawl), and FFmpeg's GIF encoder writes PAL8 frames. Sequences in HDR or scene-referred spaces are delivered in Rec.709.
+  - **Image sequences:** the image2 muxer with a frame number put before the extension (from 0); PNG is RGB or RGBA, TIFF 16-bit RGB. They refuse an audio codec.
+  - **Social presets:** H.264 with loudness normalisation to -14 LUFS (TikTok, Reels and Shorts at 256 kbps AAC; YouTube).
+  - **Tests:** a GIF of bars with a moving square is 480 × 270, 2 s long, and within 1.7 % mean difference of the rendered frames; a five-frame PNG range writes exactly five numbered files, the first matching the picture; the TIFFs are 16 bits a sample; sound is refused for sequences.
 

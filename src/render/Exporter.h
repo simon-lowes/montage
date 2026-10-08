@@ -27,10 +27,14 @@ struct BurnIn {
 
 struct ExportSettings {
     std::string path;
-    std::string videoCodec = "libx264";  // libx264, libx265, hw_h264, hw_hevc, prores_ks, dnxhd, libvpx-vp9, libsvtav1, mjpeg, none
+    // libx264, libx265, hw_h264, hw_hevc, prores_ks, dnxhd, libvpx-vp9, libsvtav1, mjpeg, none; also
+    // gif (an animated GIF: its own palette, dithered) and png or tiff (an image sequence: the
+    // path gets a frame number, name_000000.png, unless it already has a printf pattern).
+    std::string videoCodec = "libx264";
     std::string audioCodec = "aac";      // aac, pcm_s16le, pcm_s24le, libopus, none
-    int width = 0;                       // 0 = sequence size
-    int height = 0;
+    int width = 0;                       // 0 = sequence size (a GIF: at most 480 wide)
+    int height = 0;                      // 0 = in proportion to the width
+    double fps = 0;                      // GIF frame rate; 0 = 15 (or the sequence's, if lower)
     int crf = 18;
     int gop = 0;                         // keyframe interval in frames; 0 = 2 seconds
     int64_t videoBitrate = 0;            // bits/s; 0 = constant quality (crf)

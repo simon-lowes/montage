@@ -12,6 +12,10 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <QImage>
+#include <QDir>
+#include <QFileInfo>
+#include <QFile>
 #include <random>
 #include <complex>
 #include <sstream>
@@ -1670,6 +1674,88 @@ private slots:
         QVERIFY(vm.hasAudio);
         QCOMPARE(vm.videoCodec, std::string("prores"));
         QVERIFY(std::fabs(vm.duration - 0.4) < 0.05);
+    }
+
+    void gifAndImageSequences() {
+        // Two seconds: colour bars with a white square moving across them.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 640;
+        s.height = 360;
+        s.fps = {30, 1};
+        edit::overwrite(p, s, {TrackKind::Video, 0}, makeGeneratorClip(p, "bars", 60));
+        Clip sq = makeGeneratorClip(p, "shape", 60);
+        sq.generator.params["width"] = Param(60.0);
+        sq.generator.params["height"] = Param(60.0);
+        sq.generator.params["fill_color.r"] = sq.generator.params["fill_color.g"] = sq.generator.params["fill_color.b"] = Param(1.0);
+        sq.generator.params["pos_x"].addKey(0, -250.0);
+        sq.generator.params["pos_x"].addKey(59, 250.0);
+        edit::overwrite(p, s, {TrackKind::Video, 1}, sq);
+        std::string err;
+        // Animated GIF: 480 wide, 15 fps, and close to the picture despite 256 colours.
+        ExportSettings gif = findExportPreset("Animated GIF")->settings;
+        gif.path = path("export.gif");
+        QVERIFY2(exportSequence(p, s, gif, nullptr, nullptr, &err), err.c_str());
+        Project probe = makeDefaultProject();
+        MediaItem m = probeOrFail(probe, gif.path);
+        QCOMPARE(m.width, 480);
+        QCOMPARE(m.height, 270);
+        QVERIFY2(std::fabs(m.duration - 2.0) < 0.15, qPrintable(QString::number(m.duration)));
+        for (double at : {0.5, 1.5}) {
+            Frame16Ptr f = MediaPool::instance().videoFrame(gif.path, at + 0.01, 480, 270, true);
+            QVERIFY(f);
+            const Image got = toImage(*f);
+            RenderOptions ro;
+            ro.scale = 480.0 / 640;
+            const Image want = renderProgramFrame(p, s, FrameTime(std::lround(at * 30)), ro);
+            double diff = 0;
+            for (int y = 0; y < 270; ++y)
+                for (int x = 0; x < 480; ++x)
+                    for (int k = 0; k < 3; ++k) diff += std::fabs(got.at(x, y)[k] - want.at(x, std::min(y, want.height - 1))[k]);
+            diff /= 480.0 * 270 * 3;
+            qInfo("GIF frame at %.1f s: mean difference %.4f", at, diff);
+            QVERIFY2(diff < 0.04, qPrintable(QString::number(diff)));
+        }
+        // A PNG sequence: one numbered file a frame, the first matching the picture exactly (8-bit).
+        ExportSettings png = findExportPreset("PNG Sequence")->settings;
+        png.path = path("frames/shot.png");
+        png.in = 10;
+        png.out = 15;
+        QDir().mkpath(QString::fromStdString(path("frames")));
+        QVERIFY2(exportSequence(p, s, png, nullptr, nullptr, &err), err.c_str());
+        for (int i = 0; i < 5; ++i) QVERIFY2(QFileInfo::exists(QString::fromStdString(path("frames")) + QString("/shot_%1.png").arg(i, 6, 10, QChar('0'))), qPrintable(QString::number(i)));
+        QVERIFY(!QFileInfo::exists(QString::fromStdString(path("frames/shot_000005.png"))));
+        QImage first(QString::fromStdString(path("frames/shot_000000.png")));
+        QCOMPARE(first.size(), QSize(640, 360));
+        const Image frame10 = renderProgramFrame(p, s, 10, {});
+        const QRgb px = first.pixel(320, 180);
+        QVERIFY(std::abs(qRed(px) - int(std::lround(frame10.at(320, 180)[0] * 255))) <= 2);
+        // TIFF: 16 bits a channel. And image sequences refuse sound.
+        ExportSettings tiff = findExportPreset("TIFF Sequence (16-bit)")->settings;
+        tiff.path = path("frames/grade.tif");
+        tiff.in = 0;
+        tiff.out = 2;
+        QVERIFY2(exportSequence(p, s, tiff, nullptr, nullptr, &err), err.c_str());
+        {
+            // BitsPerSample (tag 258) from the first directory of the little-endian TIFF.
+            QFile f(QString::fromStdString(path("frames/grade_000001.tif")));
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            const QByteArray b = f.readAll();
+            auto u16 = [&](int at) { return int(uint8_t(b[at])) | int(uint8_t(b[at + 1])) << 8; };
+            auto u32 = [&](int at) { return u16(at) | u16(at + 2) << 16; };
+            QVERIFY(b.startsWith("II*"));
+            const int ifd = u32(4), n = u16(ifd);
+            int bits = 0;
+            for (int i = 0; i < n; ++i) {
+                const int e = ifd + 2 + i * 12;
+                if (u16(e) == 258) bits = u32(e + 4) > 2 ? u16(u32(e + 8)) : u16(e + 8);
+            }
+            QCOMPARE(bits, 16);
+        }
+        tiff.audioCodec = "aac";
+        QVERIFY(!exportSequence(p, s, tiff, nullptr, nullptr, &err));
+        // The social presets normalise to -14 LUFS.
+        QCOMPARE(findExportPreset("Social - TikTok / Reels / Shorts")->settings.loudnessTarget, -14.0);
     }
 
     void motionBlurAndDeflicker() {

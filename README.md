@@ -182,6 +182,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Loudness for delivery (Export › Loudness, or `--loudness -14`): the whole mix is measured first (ITU-R BS.1770 / EBU R128) and set to -14, -16, -23 or -24 LUFS. A look-ahead limiter keeps true peaks under -1 or -2 dBTP.
 - **Burn-ins for review copies** (Export › Burn in, or `--burn-timecode`, `--burn-clip-name`, `--burn-text`, `--watermark`): timecode, the clip's name and any text in a box in a chosen corner, plus a logo or watermark image with its own corner and opacity.
 - Export presets: H.264 (x264), H.265 (x265, 8- and 10-bit), hardware H.264/H.265 (VideoToolbox, NVENC, Quick Sync, AMF or Media Foundation, falling back to x264/x265), Apple ProRes 422 HQ/LT/4444 (with alpha), Avid DNxHR, VP9, AV1 (SVT-AV1), WAV and AAC; exports either the whole sequence or In–Out
+- More ways out: **Animated GIF** (480 px, 15 fps, looping; a 256-colour palette made for the clip by median cut, with ordered dithering that stays still from frame to frame), **PNG Sequence** (with transparency) and **16-bit TIFF Sequence** (numbered files, `name_000000.png`), and social presets for TikTok, Reels and Shorts and for YouTube, normalised to the platforms' -14 LUFS
 - Still frame export
 - Transcription that runs on your computer (whisper.cpp; nothing is uploaded):
   - Right-click clips in the media bin › Transcribe…, pick a model (Tiny to Large v3 Turbo, English-only or 99 languages) and a language, or translate to English. The model downloads once.

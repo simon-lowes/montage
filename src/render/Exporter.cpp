@@ -5,6 +5,7 @@
 #include <QImage>
 #include <QString>
 #include <algorithm>
+#include <array>
 #include <filesystem>
 #include <cmath>
 #include <cstdio>
@@ -17,6 +18,7 @@
 #include "Processing.h"
 #include "media/HwAccel.h"
 #include "media/Loudness.h"
+#include "media/SuperScale.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -71,7 +73,8 @@ AVPixelFormat defaultPixFmt(const ExportSettings& s, const std::string& c) {
                                                           : AV_PIX_FMT_YUV422P;
     if (c == "mjpeg") return AV_PIX_FMT_YUVJ420P;
     if (c == "libvpx-vp9" && s.alpha) return AV_PIX_FMT_YUVA420P;
-    if (c == "png") return AV_PIX_FMT_RGBA;
+    if (c == "png") return s.alpha ? AV_PIX_FMT_RGBA : AV_PIX_FMT_RGB24;
+    if (c == "tiff") return AV_PIX_FMT_RGB48LE;
     return AV_PIX_FMT_YUV420P;
 }
 
@@ -218,6 +221,30 @@ const std::vector<ExportPreset>& exportPresets() {
         v.push_back(preset("Avid DNxHR HQ", "mov", "Avid-friendly 8-bit 4:2:2 intermediate", "dnxhd", "pcm_s24le", 0, "", "dnxhr_hq"));
         v.push_back(preset("VP9 (WebM)", "webm", "Open web format, Opus audio", "libvpx-vp9", "libopus", 32, "good"));
         v.push_back(preset("AV1 (SVT-AV1)", "mp4", "Next-generation efficiency", "libsvtav1", "aac", 32, "8"));
+        {
+            // Short-form social video: the platforms' -14 LUFS loudness, kept under -1 dBTP.
+            ExportPreset p = preset("Social - TikTok / Reels / Shorts", "mp4",
+                                    "H.264 at the platforms' loudness (-14 LUFS); for a vertical video, Auto Reframe the sequence first",
+                                    "libx264", "aac", 18, "medium");
+            p.settings.loudnessTarget = -14;
+            p.settings.audioBitrate = 256000;
+            v.push_back(p);
+            ExportPreset y = preset("Social - YouTube (-14 LUFS)", "mp4", "H.264 for YouTube, normalised to its -14 LUFS", "libx264", "aac",
+                                    18, "slow");
+            y.settings.loudnessTarget = -14;
+            v.push_back(y);
+        }
+        {
+            ExportPreset g = preset("Animated GIF", "gif", "Loops; 480 px wide, 15 fps, its own 256-colour palette, dithered", "gif",
+                                    "none", 0, "");
+            v.push_back(g);
+            ExportPreset png = preset("PNG Sequence", "png", "One numbered PNG a frame, with transparency (name_000000.png...)", "png",
+                                      "none", 0, "");
+            png.settings.alpha = true;
+            v.push_back(png);
+            v.push_back(preset("TIFF Sequence (16-bit)", "tif", "One numbered 16-bit TIFF a frame, for finishing and VFX", "tiff", "none", 0,
+                               ""));
+        }
         v.push_back(preset("Audio - WAV 24-bit", "wav", "Uncompressed mixdown", "none", "pcm_s24le", 0, ""));
         v.push_back(preset("Audio - AAC (M4A)", "m4a", "Compressed mixdown", "none", "aac", 0, ""));
         return v;
@@ -233,6 +260,176 @@ const ExportPreset* findExportPreset(const std::string& name) {
 
 namespace {
 
+// ---- Animated GIF -----------------------------------------------------------------
+
+// Median cut over a 5-bit-a-channel histogram: up to `colours` entries, each its box's weighted mean.
+std::vector<std::array<uint8_t, 3>> medianCut(const std::vector<uint32_t>& hist, int colours) {
+    struct Bin {
+        uint8_t c[3];
+        uint32_t n;
+    };
+    std::vector<Bin> bins;
+    for (uint32_t i = 0; i < hist.size(); ++i)
+        if (hist[i]) bins.push_back({{uint8_t(i >> 10), uint8_t((i >> 5) & 31), uint8_t(i & 31)}, hist[i]});
+    std::vector<std::pair<size_t, size_t>> boxes{{0, bins.size()}};  // ranges of `bins`
+    while (int(boxes.size()) < colours) {
+        // The box with the widest spread (weighted by how much it holds) is split at its median.
+        double best = -1;
+        size_t which = 0;
+        int axis = 0;
+        for (size_t b = 0; b < boxes.size(); ++b) {
+            const auto [lo, hi] = boxes[b];
+            if (hi - lo < 2) continue;
+            int mn[3] = {31, 31, 31}, mx[3] = {0, 0, 0};
+            double count = 0;
+            for (size_t i = lo; i < hi; ++i) {
+                for (int k = 0; k < 3; ++k) mn[k] = std::min<int>(mn[k], bins[i].c[k]), mx[k] = std::max<int>(mx[k], bins[i].c[k]);
+                count += bins[i].n;
+            }
+            for (int k = 0; k < 3; ++k) {
+                const double score = (mx[k] - mn[k]) * std::sqrt(count);
+                if (score > best) best = score, which = b, axis = k;
+            }
+        }
+        if (best <= 0) break;
+        auto [lo, hi] = boxes[which];
+        std::sort(bins.begin() + long(lo), bins.begin() + long(hi), [axis](const Bin& a, const Bin& b) { return a.c[axis] < b.c[axis]; });
+        double total = 0, run = 0;
+        for (size_t i = lo; i < hi; ++i) total += bins[i].n;
+        size_t cut = lo + 1;
+        for (size_t i = lo; i < hi - 1; ++i) {
+            run += bins[i].n;
+            cut = i + 1;
+            if (run >= total / 2) break;
+        }
+        boxes[which] = {lo, cut};
+        boxes.push_back({cut, hi});
+    }
+    std::vector<std::array<uint8_t, 3>> palette;
+    for (const auto& [lo, hi] : boxes) {
+        double acc[3] = {0, 0, 0}, n = 0;
+        for (size_t i = lo; i < hi; ++i)
+            for (int k = 0; k < 3; ++k) acc[k] += (bins[i].c[k] * 8 + 4.0) * bins[i].n;
+        for (size_t i = lo; i < hi; ++i) n += bins[i].n;
+        if (n > 0) palette.push_back({uint8_t(std::lround(acc[0] / n)), uint8_t(std::lround(acc[1] / n)), uint8_t(std::lround(acc[2] / n))});
+    }
+    if (palette.empty()) palette.push_back({0, 0, 0});
+    return palette;
+}
+
+// The frame as 8-bit RGB in the display space, at W x H.
+std::vector<uint8_t> gifFrame(const Project& p, const Sequence& seq, FrameTime f, int W, int H, const ColorSpace& outSpace) {
+    RenderOptions ro;
+    ro.scale = double(W) / seq.width;
+    ro.highQuality = true;
+    Image img = renderProgramFrame(p, seq, f, ro);
+    if (img.width != W || img.height != H) img = resizeImage(img, W, H);
+    convertColor(img, sequenceColorSpace(seq), outSpace, std::clamp(seq.hdrPeakNits, 100.0, 10000.0));
+    std::vector<uint8_t> rgb(size_t(W) * size_t(H) * 3);
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            const float* q = img.at(x, y);
+            for (int k = 0; k < 3; ++k) rgb[(size_t(y) * W + x) * 3 + k] = uint8_t(std::lround(std::clamp(q[k], 0.0f, 1.0f) * 255));
+        }
+    return rgb;
+}
+
+bool exportGif(const Project& p, const Sequence& seq, const ExportSettings& s, FrameTime in, FrameTime out, const ExportProgress& progress,
+               const std::atomic<bool>* cancel, std::string* error, bool& opened) {
+    auto fail = [&](const std::string& msg) {
+        if (error) *error = msg;
+        return false;
+    };
+    const int W = std::max(2, s.width > 0 ? s.width : std::min(seq.width, 480));
+    const int H = std::max(2, s.height > 0 ? s.height : int(std::lround(double(W) * seq.height / seq.width)));
+    const double fps = s.fps > 0 ? s.fps : std::min(15.0, seq.fpsValue());
+    const double step = seq.fpsValue() / fps;  // sequence frames per GIF frame
+    const int64_t frames = std::max<int64_t>(1, int64_t(std::floor(double(out - in) / step + 1e-9)));
+    const ColorSpace* chosen = findColorSpace(s.colorSpace);
+    const ColorSpace& seqSpace = sequenceColorSpace(seq);
+    const ColorSpace& outSpace = chosen && !chosen->sceneReferred && !chosen->hdr() ? *chosen
+                                 : !seqSpace.sceneReferred && !seqSpace.hdr()      ? seqSpace
+                                                                                    : *findColorSpace("rec709");
+    auto frameAt = [&](int64_t k) { return in + FrameTime(std::floor(double(k) * step + 1e-9)); };
+    // Pass 1: the palette, from up to 32 frames spread over the range.
+    std::vector<uint32_t> hist(1 << 15, 0);
+    const int64_t samples = std::min<int64_t>(32, frames);
+    for (int64_t i = 0; i < samples; ++i) {
+        if (cancel && cancel->load()) return fail("Export cancelled");
+        const std::vector<uint8_t> rgb = gifFrame(p, seq, frameAt(i * frames / samples), W, H, outSpace);
+        for (size_t j = 0; j < rgb.size(); j += 3) ++hist[size_t(rgb[j] >> 3) << 10 | size_t(rgb[j + 1] >> 3) << 5 | size_t(rgb[j + 2] >> 3)];
+        if (progress) progress(0.1 * double(i + 1) / double(samples), in);
+    }
+    const auto palette = medianCut(hist, 256);
+    // Every 5-bit colour's nearest palette entry.
+    std::vector<uint8_t> nearest(1 << 15);
+    for (int i = 0; i < (1 << 15); ++i) {
+        const int r = (i >> 10) * 8 + 4, g = ((i >> 5) & 31) * 8 + 4, b = (i & 31) * 8 + 4;
+        int best = 0, bestD = 1 << 30;
+        for (size_t k = 0; k < palette.size(); ++k) {
+            const int dr = r - palette[k][0], dg = g - palette[k][1], db = b - palette[k][2];
+            const int d = 2 * dr * dr + 4 * dg * dg + db * db;
+            if (d < bestD) bestD = d, best = int(k);
+        }
+        nearest[size_t(i)] = uint8_t(best);
+    }
+    Output o;
+    int rc = avformat_alloc_output_context2(&o.oc, nullptr, "gif", s.path.c_str());
+    if (rc < 0 || !o.oc) return fail("Cannot write a GIF to " + s.path);
+    o.pkt = av_packet_alloc();
+    const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_GIF);
+    if (!codec) return fail("This build of FFmpeg has no GIF encoder");
+    o.vst = avformat_new_stream(o.oc, nullptr);
+    o.vctx = avcodec_alloc_context3(codec);
+    o.vctx->width = W;
+    o.vctx->height = H;
+    o.vctx->time_base = av_inv_q(av_d2q(fps, 100000));
+    o.vctx->framerate = av_d2q(fps, 100000);
+    o.vctx->pix_fmt = AV_PIX_FMT_PAL8;
+    if ((rc = avcodec_open2(o.vctx, codec, nullptr)) < 0) return fail("Cannot open the GIF encoder: " + averr(rc));
+    avcodec_parameters_from_context(o.vst->codecpar, o.vctx);
+    o.vst->time_base = o.vctx->time_base;
+    if ((rc = avio_open(&o.oc->pb, s.path.c_str(), AVIO_FLAG_WRITE)) < 0) return fail("Cannot write " + s.path + ": " + averr(rc));
+    opened = true;
+    if ((rc = avformat_write_header(o.oc, nullptr)) < 0) return fail("Cannot write header: " + averr(rc));
+    o.headerWritten = true;
+    o.vframe = av_frame_alloc();
+    o.vframe->format = AV_PIX_FMT_PAL8;
+    o.vframe->width = W;
+    o.vframe->height = H;
+    if (av_frame_get_buffer(o.vframe, 0) < 0) return fail("Out of memory");
+    // Ordered (Bayer) dithering: the pattern stays put from frame to frame, so it does not crawl.
+    static const uint8_t bayer[8][8] = {{0, 32, 8, 40, 2, 34, 10, 42},  {48, 16, 56, 24, 50, 18, 58, 26}, {12, 44, 4, 36, 14, 46, 6, 38},
+                                        {60, 28, 52, 20, 62, 30, 54, 22}, {3, 35, 11, 43, 1, 33, 9, 41},  {51, 19, 59, 27, 49, 17, 57, 25},
+                                        {15, 47, 7, 39, 13, 45, 5, 37},  {63, 31, 55, 23, 61, 29, 53, 21}};
+    for (int64_t k = 0; k < frames; ++k) {
+        if (cancel && cancel->load()) return fail("Export cancelled");
+        const std::vector<uint8_t> rgb = gifFrame(p, seq, frameAt(k), W, H, outSpace);
+        if (av_frame_make_writable(o.vframe) < 0) return fail("Out of memory");
+        auto* pal = reinterpret_cast<uint32_t*>(o.vframe->data[1]);
+        for (int i = 0; i < 256; ++i) {
+            const auto& c = palette[size_t(std::min<int>(i, int(palette.size()) - 1))];
+            pal[i] = 0xff000000u | uint32_t(c[0]) << 16 | uint32_t(c[1]) << 8 | c[2];
+        }
+        for (int y = 0; y < H; ++y) {
+            uint8_t* row = o.vframe->data[0] + size_t(y) * size_t(o.vframe->linesize[0]);
+            for (int x = 0; x < W; ++x) {
+                const int d = (bayer[y & 7][x & 7] - 32) / 4;  // -8..7: about a 5-bit step
+                const uint8_t* q = &rgb[(size_t(y) * W + x) * 3];
+                auto ch = [&](int v) { return std::clamp(v + d, 0, 255) >> 3; };
+                row[x] = nearest[size_t(ch(q[0])) << 10 | size_t(ch(q[1])) << 5 | size_t(ch(q[2]))];
+            }
+        }
+        o.vframe->pts = k;
+        if ((rc = avcodec_send_frame(o.vctx, o.vframe)) < 0) return fail("GIF encoding failed: " + averr(rc));
+        if ((rc = drain(o, o.vctx, o.vst)) < 0) return fail("Writing the GIF failed: " + averr(rc));
+        if (progress) progress(0.1 + 0.9 * double(k + 1) / double(frames), frameAt(k));
+    }
+    if ((rc = avcodec_send_frame(o.vctx, nullptr)) < 0 || (rc = drain(o, o.vctx, o.vst)) < 0) return fail("Finishing the GIF failed: " + averr(rc));
+    if ((rc = av_write_trailer(o.oc)) < 0) return fail("Cannot finalise file: " + averr(rc));
+    return true;
+}
+
 bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
                 const std::atomic<bool>* cancel, std::string* error, bool& opened, std::string* encoderUsed) {
     auto fail = [&](const std::string& msg) {
@@ -246,9 +443,22 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     const bool wantAudio = s.audioCodec != "none" && !s.audioCodec.empty();
     if (!wantVideo && !wantAudio) return fail("No video or audio codec selected");
 
+    if (s.videoCodec == "gif") return exportGif(p, seq, s, in, out, progress, cancel, error, opened);
+    // Image sequences: numbered files, no sound.
+    const bool imageSequence = s.videoCodec == "png" || s.videoCodec == "tiff";
+    std::string outPath = s.path;
+    if (imageSequence) {
+        if (wantAudio) return fail("An image sequence has no sound: choose no audio codec");
+        if (outPath.find('%') == std::string::npos) {
+            const size_t slash = outPath.find_last_of("/\\"), dot = outPath.find_last_of('.');
+            const size_t at = dot != std::string::npos && (slash == std::string::npos || dot > slash) ? dot : outPath.size();
+            outPath.insert(at, "_%06d");
+        }
+    }
     Output o;
-    int rc = avformat_alloc_output_context2(&o.oc, nullptr, nullptr, s.path.c_str());
+    int rc = avformat_alloc_output_context2(&o.oc, nullptr, imageSequence ? "image2" : nullptr, outPath.c_str());
     if (rc < 0 || !o.oc) return fail("Unknown output format for " + s.path);
+    if (imageSequence) av_opt_set_int(o.oc->priv_data, "start_number", 0, 0);
     o.pkt = av_packet_alloc();
     const AVRational fps{seq.fps.num, seq.fps.den};
     int W = s.width > 0 ? s.width : seq.width;
