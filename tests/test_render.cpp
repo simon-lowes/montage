@@ -17,6 +17,7 @@
 #include "render/Ocio.h"
 #include "render/Processing.h"
 #include "render/QualityCheck.h"
+#include "render/LutExport.h"
 #include "render/Relight.h"
 #include "render/Deconvolve.h"
 #include "render/FilmLook.h"
@@ -2508,6 +2509,86 @@ colorspaces:
         // Cancelled: nothing.
         std::atomic<bool> cancel{true};
         QVERIFY(qualityCheck(p, s, 0, -1, q, {}, &cancel).empty());
+    }
+
+    void lutExport() {
+        Project p = makeDefaultProject();
+        QTemporaryDir dir;
+        // No grade: the identity lattice, red varying fastest.
+        const Lut3D id = bakeLut({}, 0, 5);
+        QCOMPARE(id.size, 5);
+        for (int b = 0; b < 5; ++b)
+            for (int g = 0; g < 5; ++g)
+                for (int r = 0; r < 5; ++r) {
+                    const float* v = &id.data[(size_t(r) + 5 * (size_t(g) + 5 * size_t(b))) * 3];
+                    QVERIFY(std::fabs(v[0] - r / 4.0f) < 1e-6f && std::fabs(v[1] - g / 4.0f) < 1e-6f && std::fabs(v[2] - b / 4.0f) < 1e-6f);
+                }
+        // A grade: Color Correct (warmer, more contrast and saturation), Curves and a hue turn.
+        Effect cc = makeEffect(p, "color_correct");
+        cc.params["temperature"] = 0.3;
+        cc.params["saturation"] = 1.3;
+        cc.params["gamma"] = 0.9;
+        cc.params["lift"] = 0.03;
+        Effect curves = makeEffect(p, "curves");
+        curves.strings["master"] = "0,0 0.3,0.25 0.7,0.78 1,1";
+        Effect hs = makeEffect(p, "hue_sat");
+        hs.params["hue"] = 15.0;
+        const std::vector<Effect> grade{cc, curves, hs};
+        const std::string path = (dir.path() + "/grade.cube").toStdString();
+        std::string err;
+        const Lut3D baked = bakeLut(grade, 0, 33);
+        QVERIFY2(writeCubeLut(baked, path, "Grade", &err), err.c_str());
+        // Read back exactly (to the six decimals written), with its size and title.
+        const auto loaded = loadCubeLut(path, &err);
+        QVERIFY2(loaded, err.c_str());
+        QCOMPARE(loaded->size, 33);
+        float worstRead = 0;
+        for (size_t i = 0; i < baked.data.size(); ++i) worstRead = std::max(worstRead, std::fabs(loaded->data[i] - baked.data[i]));
+        QVERIFY(worstRead < 1e-5f);
+        {
+            std::ifstream f(path);
+            const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            QVERIFY(text.find("TITLE \"Grade\"") != std::string::npos && text.find("LUT_3D_SIZE 33") != std::string::npos);
+        }
+        // A picture through the LUT effect looks like the picture through the grade itself.
+        std::mt19937 rng(3);
+        std::uniform_real_distribution<float> u(0, 1);
+        Image direct(64, 32);
+        for (size_t i = 0; i < direct.px.size(); i += 4) direct.px[i] = u(rng), direct.px[i + 1] = u(rng), direct.px[i + 2] = u(rng), direct.px[i + 3] = 1;
+        Image viaLut = direct;
+        for (const Effect& e : grade) applyVideoEffect(e, 0, direct, 1);
+        Effect lutFx = makeEffect(p, "lut");
+        lutFx.strings["path"] = path;
+        applyVideoEffect(lutFx, 0, viaLut, 1);
+        float worst = 0;
+        double mean = 0;
+        for (size_t i = 0; i < direct.px.size(); ++i) {
+            worst = std::max(worst, std::fabs(direct.px[i] - viaLut.px[i]));
+            mean += std::fabs(direct.px[i] - viaLut.px[i]);
+        }
+        mean /= double(direct.px.size());
+        QVERIFY2(worst < 0.02f && mean < 0.002, qPrintable(QString("%1 %2").arg(worst).arg(mean)));
+        // Spatial and masked effects are left out and named; disabled ones are ignored.
+        Effect blur = makeEffect(p, "gaussian_blur");
+        Effect masked = cc;
+        masked.params["mask.shape"] = 1.0;
+        Effect off = hs;
+        off.enabled = false;
+        std::vector<std::string> skipped;
+        const Lut3D partial = bakeLut({cc, blur, masked, off}, 0, 9, &skipped);
+        QCOMPARE(skipped.size(), size_t(2));
+        QCOMPARE(QString::fromStdString(skipped[0]), QString::fromStdString(findEffectInfo("gaussian_blur")->displayName));
+        QCOMPARE(partial.data, bakeLut({cc}, 0, 9).data);
+        // Rewriting the file is picked up by clips using it.
+        QVERIFY(writeCubeLut(id, path));
+        Image same(8, 8);
+        for (size_t i = 0; i < same.px.size(); i += 4) same.px[i] = 0.25f, same.px[i + 1] = 0.5f, same.px[i + 2] = 0.75f, same.px[i + 3] = 1;
+        const Image before = same;
+        applyVideoEffect(lutFx, 0, same, 1);
+        float moved = 0;
+        for (size_t i = 0; i < same.px.size(); ++i) moved = std::max(moved, std::fabs(same.px[i] - before.px[i]));
+        QVERIFY2(moved < 1e-4f, qPrintable(QString::number(moved)));
+        QVERIFY(!writeCubeLut(Lut3D{}, path));
     }
 
     void titlesRender() {

@@ -85,6 +85,7 @@
 #include "core/Slate.h"
 #include "render/PaperEdit.h"
 #include "render/QualityCheck.h"
+#include "render/LutExport.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -644,6 +645,42 @@ private slots:
         QVERIFY2(back, err.c_str());
         QVERIFY(std::fabs(back->samples[size_t(12000) * 2]) < 0.05 * base);  // 0.25 s: -45 dB
         QVERIFY(std::fabs(back->samples[size_t(72000) * 2 + 1]) < 1e-3);     // 1.5 s: hard left
+    }
+
+    void lutExportOverMcp() {
+        // A matte graded to black and white, with a blur a LUT cannot hold.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        Clip c = makeGeneratorClip(p, "color", 30);
+        Effect bw = makeEffect(p, "color_correct");
+        bw.params["saturation"] = 0.0;
+        c.effects.push_back(bw);
+        c.effects.push_back(makeEffect(p, "gaussian_blur"));
+        edit::overwrite(p, s, {TrackKind::Video, 0}, c);
+        const Id id = s.videoTracks[0].clips.front().id;
+        const QString project = QString::fromStdString(path("lut.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_export_lut"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        const QString cube = QString::fromStdString(path("bw.cube"));
+        const QJsonObject r = call({{"project", project}, {"clip", double(id)}, {"path", cube}, {"size", 17}});
+        const QString text = r.value("content").toArray().at(0).toObject().value("text").toString();
+        QVERIFY2(!r.value("isError").toBool() && text.contains("17-point") && text.contains("left out"), qPrintable(text));
+        std::string err;
+        const auto lut = loadCubeLut(cube.toStdString(), &err);
+        QVERIFY2(lut && lut->size == 17, err.c_str());
+        // Pure red comes out grey.
+        float rr = 1, gg = 0, bb = 0;
+        lut->apply(rr, gg, bb);
+        QVERIFY2(std::fabs(rr - gg) < 1e-3f && std::fabs(gg - bb) < 1e-3f && rr > 0.05f, qPrintable(QString("%1 %2 %3").arg(rr).arg(gg).arg(bb)));
+        QVERIFY(call({{"project", project}, {"clip", 999999.0}, {"path", cube}}).value("isError").toBool());
     }
 
     void qualityCheckSound() {

@@ -46,6 +46,7 @@
 #include "media/AutoDuck.h"
 #include "core/Slate.h"
 #include "render/PaperEdit.h"
+#include "render/LutExport.h"
 #include "render/QualityCheck.h"
 #include "media/Decoder.h"
 #include "media/Faces.h"
@@ -970,6 +971,31 @@ void McpServer::Impl::addTools() {
             return ok(QStringLiteral("%1: %2 automation\nVolume: %3\nPan: %4")
                           .arg(str(a, "track", "A1"), QString::fromLatin1(automationModeName(trackAutomation(t))), describe(t.volumeAuto, " dB"),
                                describe(t.panAuto, "")));
+        });
+
+    add("montage_export_lut", "Export a clip's grade as a LUT",
+        "Bake a clip's colour effects (Color Correct, Curves, Hue Curves, Levels, LUTs, colour space transforms...) into a "
+        ".cube 3D LUT for monitors, cameras or other applications. Spatial and masked effects cannot be held by a LUT and "
+        "are listed as left out.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
+            "path":{"type":"string","description":"The .cube file to write"},
+            "at":{"type":["number","string"],"description":"Sequence time for keyframed grades (default: the clip's start)"},
+            "size":{"type":"integer","default":33,"minimum":2,"maximum":129}},"required":["project","clip","path"]})json",
+        true, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            const Sequence& s = l.seq();
+            const Clip& c = clipArg(l, a);
+            const FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : c.start;
+            const FrameTime t = std::clamp<FrameTime>(at - c.start, 0, std::max<FrameTime>(0, c.duration - 1));
+            std::vector<std::string> skipped;
+            const Lut3D lut = bakeLut(c.effects, t, a.value("size").toInt(33), &skipped);
+            const QString path = absolute(need(a, "path"));
+            std::string err;
+            if (!writeCubeLut(lut, path.toStdString(), c.name, &err)) return fail(QString::fromStdString(err));
+            QStringList left;
+            for (const std::string& n : skipped) left << QString::fromStdString(n);
+            return ok(QStringLiteral("Wrote %1 (%2-point cube)%3").arg(path).arg(lut.size)
+                          .arg(left.isEmpty() ? QString() : QStringLiteral("; left out: ") + left.join(QStringLiteral(", "))));
         });
 
     add("montage_quality_check", "Quality check",

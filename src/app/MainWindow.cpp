@@ -49,6 +49,7 @@
 #include "AudioMeterWidget.h"
 #include "audio/PluginEffect.h"
 #include "core/Chapters.h"
+#include "render/LutExport.h"
 #include "media/Decoder.h"
 #include "media/HwAccel.h"
 #include "media/MediaPool.h"
@@ -516,6 +517,14 @@ void MainWindow::buildMenus() {
         state_->apply(tr("Nest"), [sel, name](Project& p, Sequence& s) { return edit::makeCompound(p, s, sel, name.toStdString()); });
     });
     add(clipM, tr("Detect &Scene Cuts"), QKeySequence(), [this] { detectScenes(); });
+    add(clipM, tr("Export &LUT from Grade…"), QKeySequence(), [this] {
+        if (!clipForCommand()) {
+            statusBar()->showMessage(tr("Select a graded clip under the playhead to export its LUT"), 5000);
+            return;
+        }
+        const QString path = QFileDialog::getSaveFileName(this, tr("Export LUT"), QString(), tr("LUT files (*.cube)"));
+        if (!path.isEmpty()) exportClipLut(path.endsWith(QLatin1String(".cube"), Qt::CaseInsensitive) ? path : path + QStringLiteral(".cube"));
+    })->setObjectName(QStringLiteral("exportLut"));
     add(clipM, tr("Find Similar S&hots"), QKeySequence(), [this] { findSimilarShots(); })->setObjectName(QStringLiteral("findSimilarShots"));
     add(clipM, tr("Checkerboard Dialogue by Speaker"), QKeySequence(), withSeq([this] {
             // The selected audio clips, each split where the speaker changes, a track per person.
@@ -1679,6 +1688,26 @@ bool MainWindow::removeAttributes(unsigned what) {
         return false;
     }
     return state_->apply(tr("Remove Attributes"), [&](Project& p, Sequence& s) { return edit::removeAttributes(p, s, ids, what); });
+}
+
+bool MainWindow::exportClipLut(const QString& path, int size) {
+    const Clip* c = clipForCommand();
+    if (!c) return false;
+    const FrameTime t = std::clamp<FrameTime>(state_->playhead() - c->start, 0, std::max<FrameTime>(0, c->duration - 1));
+    std::vector<std::string> skipped;
+    const Lut3D lut = bakeLut(c->effects, t, size, &skipped);
+    std::string err;
+    if (!writeCubeLut(lut, path.toStdString(), c->name, &err)) {
+        statusBar()->showMessage(QString::fromStdString(err), 6000);
+        return false;
+    }
+    QStringList left;
+    for (const std::string& n : skipped) left << QString::fromStdString(n);
+    statusBar()->showMessage(left.isEmpty() ? tr("Exported the grade of \"%1\" as %2").arg(QString::fromStdString(c->name), QFileInfo(path).fileName())
+                                            : tr("Exported the grade as %1, without %2 (a LUT holds only colour changes)")
+                                                  .arg(QFileInfo(path).fileName(), left.join(QStringLiteral(", "))),
+                             8000);
+    return true;
 }
 
 const Clip* MainWindow::clipForCommand() const {

@@ -86,6 +86,8 @@ struct Lut3D {
     void apply(float& r, float& g, float& b) const;
 };
 std::shared_ptr<const Lut3D> loadCubeLut(const std::string& path, std::string* error = nullptr);
+// Drops a cached .cube so the next load reads the file again (after it was rewritten).
+void forgetCubeLut(const std::string& path);
 
 // Monotone cubic curve through "x,y x,y ..." points, sampled into `n` entries.
 std::vector<float> buildCurve(const std::string& points, int n = 1024);

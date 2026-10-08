@@ -1204,9 +1204,19 @@ void Lut3D::apply(float& r, float& g, float& b) const {
     b = out[2];
 }
 
+namespace {
+std::mutex gLutMutex;
+std::map<std::string, std::shared_ptr<const Lut3D>> gLutCache;
+}  // namespace
+
+void forgetCubeLut(const std::string& path) {
+    std::lock_guard lock(gLutMutex);
+    gLutCache.erase(path);
+}
+
 std::shared_ptr<const Lut3D> loadCubeLut(const std::string& path, std::string* error) {
-    static std::mutex m;
-    static std::map<std::string, std::shared_ptr<const Lut3D>> cache;
+    auto& m = gLutMutex;
+    auto& cache = gLutCache;
     {
         std::lock_guard lock(m);
         auto it = cache.find(path);

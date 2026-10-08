@@ -82,6 +82,7 @@
 #include "SequenceIndexPanel.h"
 #include "core/Automation.h"
 #include "core/History.h"
+#include "render/Processing.h"
 #include "media/Segmenter.h"
 #include "MonitorPanel.h"
 #include "PlaybackController.h"
@@ -591,6 +592,43 @@ private slots:
         toggle->trigger();
         QVERIFY(!timeline()->showTrackAutomation());
         QCOMPARE(lane(30), QPoint(-1, -1));
+    }
+
+    void exportLutFromGrade() {
+        loadDemo();
+        QVERIFY(win_->findChild<QAction*>("exportLut"));
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        state()->edit("Grade", [red](Project& p, Sequence& s) {
+            Clip* c = edit::clipById(s, red);
+            Effect e = makeEffect(p, "color_correct");
+            e.params["saturation"] = 0.0;
+            c->effects.push_back(e);
+            return true;
+        });
+        state()->setSelection({red});
+        state()->setPlayhead(30);
+        const QString cube = dir_.path() + "/red.cube";
+        QVERIFY(win_->exportClipLut(cube, 9));
+        QVERIFY(win_->statusBar()->currentMessage().contains("red.cube"));
+        std::string err;
+        const auto lut = loadCubeLut(cube.toStdString(), &err);
+        QVERIFY2(lut && lut->size == 9, err.c_str());
+        float r = 0.8f, g = 0, b = 0;
+        lut->apply(r, g, b);
+        QVERIFY(std::fabs(r - g) < 1e-3f && std::fabs(g - b) < 1e-3f);
+        // A spatial effect is named as left out.
+        state()->edit("Blur", [red](Project& p, Sequence& s) {
+            edit::clipById(s, red)->effects.push_back(makeEffect(p, "gaussian_blur"));
+            return true;
+        });
+        QVERIFY(win_->exportClipLut(cube, 9));
+        QVERIFY2(win_->statusBar()->currentMessage().contains(QString::fromStdString(findEffectInfo("gaussian_blur")->displayName)),
+                 qPrintable(win_->statusBar()->currentMessage()));
+        // Nothing under the playhead: nothing written.
+        state()->clearSelection();
+        state()->setPlayhead(5000);
+        QVERIFY(!win_->exportClipLut(dir_.path() + "/none.cube"));
+        QVERIFY(!QFileInfo::exists(dir_.path() + "/none.cube"));
     }
 
     void razorTool() {
