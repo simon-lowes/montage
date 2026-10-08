@@ -564,3 +564,19 @@ All 15 items are in (October 2026). The near misses listed in the roadmap are th
     - the smart bin rule, the search, rule names following renames and merges, and saving;
     - MCP from an unindexed project;
     - the panel: face icons, moments, naming in place, a smart bin, merge with undo.
+- [x] Depth maps (media/DepthMap, render/Processing):
+  - **Model:** Depth Anything V2 Small (Apache-2.0; the Base and Large weights are non-commercial) from onnx-community's fp32 export, 99 MB. The 4-bit export (27 MB) was tried: it correlates at 0.995 but its maps differ by 4 % of the range on average.
+  - **Input:** the picture with its short side at 518 px and both sides multiples of 14, ImageNet normalisation.
+  - **Output:** disparity, stretched between its 1st and 99th percentiles to 0 (far) and 1 (near).
+  - **Accuracy:** the C++ map matches the Python reference on the test still at a correlation of 0.9998 (mean difference 0.007; resampling).
+  - **In the compositor:** when any of a clip's effects needs depth, it is worked out once from the clip's source picture (cached by content, the last eight) and handed to its effects through a per-thread `DepthScope`.
+  - **Effects:** Lens Blur (Depth): five blur levels, each pixel between the two nearest its blur, set by its distance from the focus beyond half the range, over the falloff. Depth Fog: a colour mixed in by `amount * ((start - depth) / start)^curve`. Depth Map: grey, near white or far white.
+  - **Depth Qualifier:** on every video filter's mask (From, To, Softness, combined with a shape and the HSL qualifier). It selects nothing without the model; the Inspector offers the download.
+  - **Where to find it:** Effects › Depth; MCP `montage_add_effect` (the depth effects and `mask.depth*` parameters, refusing without the model); `montage-cli models`, `scripts/fetch-models.sh` and the CI caches.
+  - **Tests:** on the Armstrong portrait:
+    - the map's size and values against the reference at the backdrop, face, helmet and table, and the cache;
+    - Depth Map, inverted;
+    - fog on the far backdrop only;
+    - the qualifier darkening only the near half, also through MCP;
+    - lens blur focused on the helmet cutting the face's fine detail (mean Laplacian) to under 30 % while the helmet keeps 90 %;
+    - the browser's Depth group, and the Inspector's download offer.

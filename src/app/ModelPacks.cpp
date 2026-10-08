@@ -14,6 +14,7 @@
 #include <QTimer>
 
 #include "media/Segmenter.h"
+#include "media/DepthMap.h"
 #include "media/SuperScale.h"
 #include "media/SpeechEnhance.h"
 
@@ -169,6 +170,16 @@ bool ensureEffectModel(QWidget* parent, const std::string& type) {
         }
         return ensureModelPack(parent, upscaleModel(), QObject::tr("Super Scale"),
                                QObject::tr("Super Scale uses Real-ESRGAN (BSD-3-Clause), an image model that runs on this computer."));
+    }
+    if (type == "depth_blur" || type == "depth_fog" || type == "depth_map" || type == "mask.depth") {
+        if (!depthAvailable()) {
+            QMessageBox::information(parent, QObject::tr("Depth"),
+                                     QObject::tr("This build of Montage cannot see depth: it was built without ONNX Runtime."));
+            return false;
+        }
+        return ensureModelPack(parent, depthModel(), QObject::tr("Depth"),
+                               QObject::tr("Depth effects use Depth Anything V2 Small (Apache-2.0), a model that works out how near each "
+                                           "part of the picture is. It runs on this computer."));
     }
     if (type != "enhance_speech") return true;
     if (!speechEnhancerAvailable()) {

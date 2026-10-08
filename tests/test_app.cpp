@@ -67,6 +67,7 @@
 #include "media/Diarizer.h"
 #include "media/VisualSearch.h"
 #include "media/Faces.h"
+#include "media/DepthMap.h"
 #include "ShotSearchPanel.h"
 #include "PeoplePanel.h"
 #include "media/Segmenter.h"
@@ -1618,6 +1619,40 @@ private slots:
         QVERIFY(!compare->isChecked() && !program->comparing());
         program->setSplit(0.5);
         state()->newProject();
+    }
+
+    void depthEffectsInTheApp() {
+        // Listed under Depth in the effects browser.
+        auto* browser = win_->findChild<EffectsBrowser*>();
+        QVERIFY(browser);
+        browser->reload();
+        QSet<QString> listed;
+        for (QTreeWidgetItem* item : browser->findChild<QTreeWidget*>()->findItems("Depth", Qt::MatchRecursive))
+            for (int i = 0; i < item->childCount(); ++i) listed.insert(item->child(i)->data(0, Qt::UserRole).toString());
+        QVERIFY2(listed.contains("depth_blur") && listed.contains("depth_fog") && listed.contains("depth_map"), qPrintable(QStringList(listed.values()).join(",")));
+        if (!depthAvailable()) QSKIP("Built without ONNX Runtime");
+        // A depth qualifier offers the model while it is missing.
+        loadDemo();
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        QVERIFY(state()->edit("Depth", [red](Project& p, Sequence& s) {
+            Effect e = makeEffect(p, "color_correct");
+            e.params["mask.depth"] = Param(1.0);
+            edit::clipById(s, red)->effects.push_back(e);
+            return true;
+        }));
+        const QByteArray saved = qgetenv("MONTAGE_DEPTH_MODEL");
+        qputenv("MONTAGE_DEPTH_MODEL", (dir_.path() + "/no-depth-model").toUtf8());
+        state()->setSelection({});
+        state()->setSelection({red});
+        QTRY_VERIFY(win_->findChild<QPushButton*>("getDepthModel"));
+        if (saved.isEmpty()) qunsetenv("MONTAGE_DEPTH_MODEL");
+        else qputenv("MONTAGE_DEPTH_MODEL", saved);
+        if (!depthModel().installed()) QSKIP("Set MONTAGE_DEPTH_MODEL to test with the model");
+        QVERIFY(ensureEffectModel(win_.get(), "depth_blur"));
+        QVERIFY(ensureEffectModel(win_.get(), "mask.depth"));
+        state()->setSelection({});
+        state()->setSelection({red});
+        QTRY_VERIFY(!win_->findChild<QPushButton*>("getDepthModel"));
     }
 
     void enhanceSpeechAsksForItsModel() {

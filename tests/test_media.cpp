@@ -52,6 +52,7 @@
 #include "media/Reframe.h"
 #include "media/Diarizer.h"
 #include "media/Faces.h"
+#include "media/DepthMap.h"
 #include "media/VisualSearch.h"
 #include "automation/McpServer.h"
 #ifdef MONTAGE_WITH_WHISPER
@@ -1990,6 +1991,118 @@ private slots:
         MediaItem m;
         QVERIFY2(probeMedia(MONTAGE_TEST_DATA_DIR "/faces/armstrong.jpg", m, &err), err.c_str());
         QCOMPARE(int(m.kind), int(MediaKind::Image));
+    }
+
+    void depthMaps() {
+        if (!depthAvailable() || !depthModel().installed()) QSKIP("Set MONTAGE_DEPTH_MODEL to Depth Anything V2 Small");
+        const std::string still = MONTAGE_TEST_DATA_DIR "/faces/armstrong.jpg";
+        VideoDecoder dec;
+        std::string err;
+        QVERIFY2(dec.open(still, &err), err.c_str());
+        Frame16Ptr f = dec.frameAt(0);
+        QVERIFY(f);
+        const Image img = toImage(*f);
+        DepthMap d;
+        QVERIFY2(estimateDepth(img, d, 518, &err), err.c_str());
+        // The short side at 518, both multiples of 14, as the model was trained.
+        QCOMPARE(d.width, 518);
+        QCOMPARE(d.height, 644);
+        // Near is 1, far 0, as the Python reference gives (0.02 and 0.05 for the dark backdrop, 0.43 for the
+        // face, 0.83 for the helmet in front of him, 1 for the table edge).
+        auto at = [&](double u, double v) { return d.at(u, v); };
+        QVERIFY2(at(0.08, 0.08) < 0.12f && at(0.92, 0.06) < 0.15f, qPrintable(QString("%1 %2").arg(at(0.08, 0.08)).arg(at(0.92, 0.06))));
+        QVERIFY2(std::abs(at(0.62, 0.22) - 0.43f) < 0.1f, qPrintable(QString::number(at(0.62, 0.22))));
+        QVERIFY2(std::abs(at(0.25, 0.75) - 0.83f) < 0.1f, qPrintable(QString::number(at(0.25, 0.75))));
+        QVERIFY(at(0.05, 0.95) > 0.9f);
+        QCOMPARE(*std::max_element(d.values.begin(), d.values.end()), 1.0f);
+        QCOMPARE(*std::min_element(d.values.begin(), d.values.end()), 0.0f);
+        // Cached by content.
+        auto c1 = cachedDepth(img), c2 = cachedDepth(img);
+        QVERIFY(c1 && c1 == c2);
+
+        // Through the compositor, on the still in a sequence of its own shape.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320;
+        s.height = 400;
+        MediaItem m = probeOrFail(p, still);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Clip& clip = s.videoTracks[0].clips.at(0);
+        const Image plain = renderSequenceFrame(p, s, 0, {});
+        auto lum = [](const Image& im, double u, double v) {
+            const float* q = im.at(int(u * im.width), int(v * im.height));
+            return 0.2126f * q[0] + 0.7152f * q[1] + 0.0722f * q[2];
+        };
+        // Depth Map: the depth as grey, near white.
+        clip.effects.push_back(makeEffect(p, "depth_map"));
+        Image shown = renderSequenceFrame(p, s, 0, {});
+        QVERIFY(lum(shown, 0.25, 0.75) > 0.7f && lum(shown, 0.08, 0.08) < 0.15f);
+        clip.effects.back().params["invert"] = Param(1.0);
+        shown = renderSequenceFrame(p, s, 0, {});
+        QVERIFY(lum(shown, 0.25, 0.75) < 0.3f && lum(shown, 0.08, 0.08) > 0.85f);
+        clip.effects.clear();
+        // Depth Fog: the far backdrop turns to the fog colour; the helmet in front is untouched.
+        Effect fog = makeEffect(p, "depth_fog");
+        fog.params["amount"] = Param(100.0);
+        clip.effects.push_back(fog);
+        shown = renderSequenceFrame(p, s, 0, {});
+        QVERIFY2(lum(shown, 0.08, 0.08) > 0.6f, qPrintable(QString::number(lum(shown, 0.08, 0.08))));
+        QVERIFY(std::abs(lum(shown, 0.25, 0.75) - lum(plain, 0.25, 0.75)) < 0.01f);
+        clip.effects.clear();
+        // A depth qualifier: an effect on the near half only (here, turning it black).
+        Effect dark = makeEffect(p, "color_correct");
+        dark.params["exposure"] = Param(-10.0);
+        dark.params["mask.depth"] = Param(1.0);
+        dark.params["mask.depth_low"] = Param(60.0);
+        dark.params["mask.depth_soft"] = Param(5.0);
+        clip.effects.push_back(dark);
+        shown = renderSequenceFrame(p, s, 0, {});
+        QVERIFY2(lum(shown, 0.25, 0.75) < 0.02f, qPrintable(QString::number(lum(shown, 0.25, 0.75))));
+        QVERIFY(std::abs(lum(shown, 0.62, 0.22) - lum(plain, 0.62, 0.22)) < 0.01f);
+        clip.effects.clear();
+        // Lens Blur focused on the helmet: the face behind it loses its detail, the helmet keeps its edge.
+        // Fine detail: the mean Laplacian (a blurred edge keeps its total gradient, not its curvature).
+        auto detail = [](const Image& im, double u, double v) {
+            const int cx = int(u * im.width), cy = int(v * im.height);
+            auto l = [&](int x, int y) {
+                const float* q = im.at(x, y);
+                return 0.2126 * q[0] + 0.7152 * q[1] + 0.0722 * q[2];
+            };
+            double sum = 0;
+            int n = 0;
+            for (int y = cy - 8; y <= cy + 8; ++y)
+                for (int x = cx - 8; x <= cx + 8; ++x, ++n) sum += std::abs(4 * l(x, y) - l(x - 1, y) - l(x + 1, y) - l(x, y - 1) - l(x, y + 1));
+            return sum / n;
+        };
+        Effect lens = makeEffect(p, "depth_blur");
+        lens.params["focus"] = Param(83.0);
+        lens.params["radius"] = Param(8.0);
+        clip.effects.push_back(lens);
+        shown = renderSequenceFrame(p, s, 0, {});
+        QVERIFY2(detail(shown, 0.62, 0.24) < 0.3 * detail(plain, 0.62, 0.24),
+                 qPrintable(QString("%1 vs %2").arg(detail(shown, 0.62, 0.24)).arg(detail(plain, 0.62, 0.24))));
+        QVERIFY2(detail(shown, 0.25, 0.72) > 0.9 * detail(plain, 0.25, 0.72),
+                 qPrintable(QString("%1 vs %2").arg(detail(shown, 0.25, 0.72)).arg(detail(plain, 0.25, 0.72))));
+
+        // Through MCP: a depth qualifier on an effect.
+        clip.effects.clear();
+        const QString project = QString::fromStdString(path("depth.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_add_effect"},
+                                                     {"arguments", QJsonObject{{"project", project}, {"clip", double(clip.id)}, {"effect", "color_correct"},
+                                                                               {"params", QJsonObject{{"exposure", -10}, {"mask.depth", 1}, {"mask.depth_low", 60}}}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back, &err));
+        shown = renderSequenceFrame(back, *back.active(), 0, {});
+        QVERIFY(lum(shown, 0.25, 0.75) < 0.02f && std::abs(lum(shown, 0.62, 0.22) - lum(plain, 0.62, 0.22)) < 0.01f);
     }
 
     void peopleSearch() {

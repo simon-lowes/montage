@@ -17,8 +17,25 @@ namespace montage {
 // the footage, such as Stabilize); -1 when there is none.
 void applyVideoEffect(const Effect& e, FrameTime t, Image& img, double pixelScale, double sourceSeconds = -1);
 
+// The depth of the frame being worked on (media/DepthMap.h), for depth
+// effects and depth qualifiers: set by the compositor for the effects of one
+// clip on this thread, null when there is none.
+struct DepthMap;
+const DepthMap* currentDepth();
+class DepthScope {
+public:
+    explicit DepthScope(std::shared_ptr<const DepthMap> depth);
+    ~DepthScope();
+    DepthScope(const DepthScope&) = delete;
+    DepthScope& operator=(const DepthScope&) = delete;
+
+private:
+    std::shared_ptr<const DepthMap> previous_;
+};
+
 // The effect's mask (Effects.h maskInfo) over `img` as one value in 0..1 per
-// pixel; the qualifier reads the colours of `img`, an object mask the frame
+// pixel; the qualifier reads the colours of `img`, the depth qualifier
+// currentDepth() (selecting nothing without one), an object mask the frame
 // of the media at `sourceSeconds`. Empty when there is no mask.
 std::vector<float> effectMatte(const Effect& e, FrameTime t, const Image& img, double pixelScale, double sourceSeconds = -1);
 

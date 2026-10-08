@@ -4,6 +4,7 @@
 #include "Ocio.h"
 #include "VideoFx.h"
 #include "core/Effects.h"
+#include "media/DepthMap.h"
 #include "media/Tracking.h"
 
 #include <algorithm>
@@ -637,6 +638,14 @@ std::vector<float> objectMatte(const std::vector<float>& logits, int W, int H, d
     return matte;
 }
 
+namespace {
+thread_local std::shared_ptr<const DepthMap> tDepth;
+}  // namespace
+
+const DepthMap* currentDepth() { return tDepth.get(); }
+DepthScope::DepthScope(std::shared_ptr<const DepthMap> depth) : previous_(std::move(tDepth)) { tDepth = std::move(depth); }
+DepthScope::~DepthScope() { tDepth = std::move(previous_); }
+
 std::vector<float> effectMatte(const Effect& e, FrameTime t, const Image& img, double pixelScale, double sourceSeconds) {
     std::vector<float> matte;
     if (img.empty() || !hasMask(e, t)) return matte;
@@ -716,6 +725,23 @@ std::vector<float> effectMatte(const Effect& e, FrameTime t, const Image& img, d
                     matte[size_t(y) * size_t(W) + size_t(x)] *= float(mh * ms * ml);
                 }
         });
+    }
+    if (e.p("mask.depth", t) > 0.5) {
+        // A range of distances: 1 between From and To, falling to 0 over the softness either side.
+        const DepthMap* depth = currentDepth();
+        const double lo = e.p("mask.depth_low", t, 50) / 100, hi = e.p("mask.depth_high", t, 100) / 100;
+        const double ramp = std::max(1e-4, e.p("mask.depth_soft", t, 10) / 100);
+        if (!depth) {
+            std::fill(matte.begin(), matte.end(), 0.f);
+        } else {
+            const std::vector<float> d = depth->resized(W, H);
+            for (size_t i = 0; i < matte.size(); ++i) {
+                const double v = d[i];
+                const double out = v < lo ? lo - v : v > hi ? v - hi : 0.0;
+                const double k = std::clamp(1.0 - out / ramp, 0.0, 1.0);
+                matte[i] *= float(k * k * (3 - 2 * k));
+            }
+        }
     }
     const bool invert = e.p("mask.invert", t) > 0.5;
     const float opacity = float(std::clamp(e.p("mask.opacity", t, 100) / 100.0, 0.0, 1.0));
@@ -827,6 +853,70 @@ void applyVideoEffect(const Effect& e, FrameTime t, Image& img, double pixelScal
 }
 
 namespace {
+// Depth Map, Depth Fog and Lens Blur (Depth), from currentDepth(); nothing without one.
+void depthEffect(const Effect& e, FrameTime t, Image& img, double pixelScale) {
+    const DepthMap* depth = currentDepth();
+    if (!depth || depth->empty()) return;
+    const int W = img.width, H = img.height;
+    const std::vector<float> d = depth->resized(W, H);
+    if (e.type == "depth_map") {
+        const bool farWhite = e.p("invert", t) > 0.5;
+        const float mix = float(std::clamp(e.p("mix", t, 100) / 100, 0.0, 1.0));
+        for (size_t i = 0; i < d.size(); ++i) {
+            float* p = &img.px[i * 4];
+            const float g = (farWhite ? 1 - d[i] : d[i]) * p[3];
+            for (int c = 0; c < 3; ++c) p[c] += (g - p[c]) * mix;
+        }
+        return;
+    }
+    if (e.type == "depth_fog") {
+        // Thickening with distance beyond Starts At, towards the colour.
+        const double start = std::max(0.01, e.p("start", t, 60) / 100), amount = std::clamp(e.p("amount", t, 70) / 100, 0.0, 1.0);
+        const double curve = std::max(0.05, e.p("curve", t, 1.5));
+        const float col[3] = {float(e.p("color.r", t, 0.78)), float(e.p("color.g", t, 0.82)), float(e.p("color.b", t, 0.88))};
+        for (size_t i = 0; i < d.size(); ++i) {
+            const double far = std::clamp((start - d[i]) / start, 0.0, 1.0);
+            const float f = float(amount * std::pow(far, curve));
+            float* p = &img.px[i * 4];
+            for (int c = 0; c < 3; ++c) p[c] += (col[c] * p[3] - p[c]) * f;
+        }
+        return;
+    }
+    // Lens Blur: sharp within the focus range, blurring over the falloff to the full radius. The
+    // frame is blurred at a few radii and each pixel takes the two nearest its own.
+    const double focus = e.p("focus", t, 80) / 100, half = e.p("range", t, 10) / 200;
+    const double falloff = std::max(0.01, e.p("falloff", t, 30) / 100);
+    const bool blurNear = e.p("near", t, 1) > 0.5;
+    const double radius = std::max(0.0, e.p("radius", t, 12) * pixelScale);
+    if (radius < 0.25) return;
+    std::vector<float> amount(d.size());
+    for (size_t i = 0; i < d.size(); ++i) {
+        double off = std::fabs(d[i] - focus) - half;
+        if (!blurNear && d[i] > focus) off = 0;
+        amount[i] = float(std::clamp(off / falloff, 0.0, 1.0));
+    }
+    constexpr int kLevels = 5;  // 0, 1/4, 1/2, 3/4 and the full radius
+    std::vector<Image> levels(kLevels);
+    levels[0] = img;
+    for (int l = 1; l < kLevels; ++l) {
+        levels[size_t(l)] = img;
+        gaussianBlur(levels[size_t(l)], radius * l / (kLevels - 1));
+    }
+    parallelRows(H, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y)
+            for (int x = 0; x < W; ++x) {
+                const size_t i = size_t(y) * size_t(W) + size_t(x);
+                const float pos = amount[i] * (kLevels - 1);
+                const int a = std::min(kLevels - 2, int(pos));
+                const float f = pos - a;
+                const float* pa = &levels[size_t(a)].px[i * 4];
+                const float* pb = &levels[size_t(a + 1)].px[i * 4];
+                float* o = &img.px[i * 4];
+                for (int c = 0; c < 4; ++c) o[c] = pa[c] + (pb[c] - pa[c]) * f;
+            }
+    });
+}
+
 void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelScale) {
     const std::string& ty = e.type;
     if (ty == "color_correct") colorCorrect(e, t, img);
@@ -861,6 +951,8 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
     else if (ty == "corner_pin") vfx::cornerPin(e, t, img);
     else if (ty == "letterbox") vfx::letterbox(e, t, img);
     else if (ty == "posterize") vfx::posterize(e, t, img);
+    else if (ty == "depth_map" || ty == "depth_fog" || ty == "depth_blur")
+        depthEffect(e, t, img, pixelScale);
     else if (ty == "gaussian_blur") {
         int dir = int(e.p("direction", t));
         gaussianBlur(img, e.p("radius", t, 10) * pixelScale, dir != 2, dir != 1);

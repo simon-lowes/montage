@@ -211,6 +211,19 @@ std::vector<EffectInfo> buildCatalog() {
     c.push_back({"super_scale", "Super Scale", EffectCategory::VideoFilter, "Blur & Sharpen",
                  {pct("strength", "Strength", 0, 100, 100)},
                  {}});
+    // Depth (Depth Anything V2 on the clip's source frame): 0 is the farthest part of the picture, 100 the nearest.
+    c.push_back({"depth_blur", "Lens Blur (Depth)", EffectCategory::VideoFilter, "Depth",
+                 {pct("focus", "Focus Depth", 0, 100, 80), pct("range", "In Focus Range", 0, 100, 10),
+                  pct("falloff", "Falloff", 1, 100, 30), num("radius", "Blur (px)", 0, 100, 12, 0.5),
+                  boolean("near", "Blur Nearer Than Focus", true)},
+                 {}});
+    c.push_back({"depth_fog", "Depth Fog", EffectCategory::VideoFilter, "Depth",
+                 {color("color", "Color", 0.78, 0.82, 0.88), pct("amount", "Amount", 0, 100, 70), pct("start", "Starts At Depth", 0, 100, 60),
+                  num("curve", "Thickening", 0.2, 5, 1.5, 0.05)},
+                 {}});
+    c.push_back({"depth_map", "Depth Map", EffectCategory::VideoFilter, "Depth",
+                 {boolean("invert", "Far Is White"), pct("mix", "Mix", 0, 100, 100)},
+                 {}});
     c.push_back({"levels", "Levels", EffectCategory::VideoFilter, "Color",
                  {num("in_black", "Input Black", 0, 1, 0, 0.005), num("in_white", "Input White", 0, 1, 1, 0.005),
                   num("gamma", "Gamma", 0.1, 10, 1, 0.01), num("out_black", "Output Black", 0, 1, 0, 0.005),
@@ -467,6 +480,10 @@ const EffectInfo& maskInfo() {
                     pct("mask.lum_low", "Luma Low", 0, 100, 5),
                     pct("mask.lum_high", "Luma High", 0, 100, 100),
                     pct("mask.softness", "Softness", 0, 100, 20),
+                    boolean("mask.depth", "Depth Qualifier"),
+                    pct("mask.depth_low", "Depth From (far)", 0, 100, 50),
+                    pct("mask.depth_high", "Depth To (near)", 0, 100, 100),
+                    pct("mask.depth_soft", "Depth Softness", 0, 100, 10),
                     boolean("mask.show", "Show Mask")};
         return m;
     }();
@@ -478,7 +495,14 @@ bool supportsMask(const std::string& effectType) {
     return info && info->category == EffectCategory::VideoFilter;
 }
 
-bool hasMask(const Effect& e, FrameTime t) { return e.p("mask.shape", t) > 0.5 || e.p("mask.qualify", t) > 0.5; }
+bool hasMask(const Effect& e, FrameTime t) {
+    return e.p("mask.shape", t) > 0.5 || e.p("mask.qualify", t) > 0.5 || e.p("mask.depth", t) > 0.5;
+}
+
+bool needsDepth(const Effect& e, FrameTime t) {
+    if (!e.enabled) return false;
+    return e.type == "depth_blur" || e.type == "depth_fog" || e.type == "depth_map" || e.p("mask.depth", t) > 0.5;
+}
 
 const std::vector<EffectInfo>& effectCatalog() {
     static const std::vector<EffectInfo> catalog = buildCatalog();

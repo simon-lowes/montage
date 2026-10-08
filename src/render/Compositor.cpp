@@ -27,6 +27,7 @@
 #include "core/Surround.h"
 #include "core/History.h"
 #include "media/MediaPool.h"
+#include "media/DepthMap.h"
 #include "media/SuperScale.h"
 
 namespace montage {
@@ -583,6 +584,12 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
     if (src.empty()) return {};
     // Filters run in source space (before the fixed transform), like most NLEs.
     const double pixelScale = effectPixelScale(c, lt, g.sx, mw, src.width);
+    // The picture's depth, once, for the effects that work by distance.
+    std::shared_ptr<const DepthMap> depth;
+    if (std::any_of(c.effects.begin(), c.effects.end(), [&](const Effect& e) { return needsDepth(e, lt); }) && depthAvailable() &&
+        depthModel().installed())
+        depth = cachedDepth(src);
+    DepthScope depthScope(depth);
     for (const auto& e : c.effects)
         if (e.type != "video_denoise" && e.type != "super_scale") applyVideoEffect(e, lt, src, pixelScale, sourceSeconds);  // those ran on the source
     if (identityLayer(src, g, SW, SH, o.scale)) return src;  // a full-frame clip: no copy

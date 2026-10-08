@@ -28,6 +28,7 @@
 
 #include "EditorState.h"
 #include "ModelPacks.h"
+#include "media/DepthMap.h"
 #include "PluginEditorWindow.h"
 #include "Theme.h"
 #include "audio/PluginEffect.h"
@@ -536,6 +537,17 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
             QFormLayout* mf = addSection(tr("%1 Mask").arg(QString::fromStdString(info->displayName)), nullptr,
                                          !hasMask(e, localTime()));
             addParamRows(mf, maskInfo(), target(eid));
+            if (e.p("mask.depth", localTime()) > 0.5 && depthAvailable() && !depthModel().installed()) {
+                // The depth qualifier selects nothing until the model is here.
+                auto* get = new QPushButton(tr("Download Depth Model…"), content_);
+                get->setObjectName(QStringLiteral("getDepthModel"));
+                connect(get, &QPushButton::clicked, this, [this] {
+                    QTimer::singleShot(0, this, [this] {
+                        if (ensureEffectModel(window(), "mask.depth")) state_->amend([](Project&, Sequence&) { return true; });
+                    });
+                });
+                mf->addRow(tr("Depth:"), get);
+            }
             if (onClip && std::lround(e.p("mask.shape", localTime())) == 3) {
                 // An object picked in the viewer, then followed through the clip.
                 auto* status = new QLabel(content_);

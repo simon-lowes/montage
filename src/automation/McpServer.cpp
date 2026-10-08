@@ -41,6 +41,7 @@
 #include "media/AutoDuck.h"
 #include "media/Decoder.h"
 #include "media/Faces.h"
+#include "media/DepthMap.h"
 #include "media/Transcriber.h"
 #include "media/VisualSearch.h"
 #include "render/ClipAnalysis.h"
@@ -727,7 +728,9 @@ void McpServer::Impl::addTools() {
 
     add("montage_add_effect", "Add an effect",
         "Add an effect to a clip (see montage_list_effects), with parameter values. Video effects can be limited to a "
-        "mask: mask.shape 1 ellipse or 2 rectangle, mask.x / mask.y centre and mask.w / mask.h size as fractions of the frame.",
+        "mask: mask.shape 1 ellipse or 2 rectangle, mask.x / mask.y centre and mask.w / mask.h size as fractions of the frame; "
+        "or to a range of distances: mask.depth 1, with mask.depth_low and mask.depth_high from 0 (farthest) to 100 (nearest). "
+        "depth_blur (lens blur keeping one distance sharp), depth_fog and depth_map work from the picture's depth.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},"effect":{"type":"string"},
             "params":{"type":"object","additionalProperties":{"type":"number"}}},"required":["project","clip","effect"]})json",
         false, [](const QJsonObject& a) {
@@ -750,6 +753,8 @@ void McpServer::Impl::addTools() {
                 if (!known) throw ArgError{QStringLiteral("\"%1\" has no parameter \"%2\"").arg(QString::fromStdString(type), it.key())};
                 e.params[name] = Param(it.value().toDouble());
             }
+            if (needsDepth(e, 0) && (!depthAvailable() || !depthModel().installed()))
+                return fail("Depth effects need the depth model: run `scripts/fetch-models.sh` or add one once in the app");
             const auto loc = edit::locate(l.seq(), c.id);
             const bool audioClip = loc && loc->track.kind == TrackKind::Audio;
             if (audioClip != (info->category == EffectCategory::AudioFilter))
