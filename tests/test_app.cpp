@@ -2121,6 +2121,19 @@ private slots:
         c = edit::clipById(*state()->sequence(), clip);
         QVERIFY(c->takes.empty());
         QCOMPARE(c->mediaId, ids[1]);
+
+        // Duplicate frame markers: the same take again later is striped under its repeated frames, when shown.
+        QVERIFY(state()->edit("Again", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids[1], 60, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        auto* dups = win_->findChild<QAction*>("showDuplicateFrames");
+        QVERIFY(dups && !win_->timeline()->showDuplicateFrames());
+        dups->trigger();
+        QVERIFY(win_->timeline()->showDuplicateFrames());
+        QCOMPARE(win_->timeline()->duplicateSpans(clip).size(), size_t(1));
+        QCOMPARE(win_->timeline()->duplicateSpans(clip).front().from, FrameTime(0));
+        dups->trigger();
+        QVERIFY(!win_->timeline()->showDuplicateFrames());
         state()->newProject();
     }
 

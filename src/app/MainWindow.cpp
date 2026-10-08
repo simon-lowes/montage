@@ -1002,6 +1002,18 @@ void MainWindow::buildMenus() {
         a->setToolTip(tr("Draw each audio track's volume automation across its row: drag the line or a point, Ctrl/Cmd-click to add a "
                          "point, Alt-click a point to delete it"));
     }
+    {
+        const bool dups = appSettings().value("timeline/duplicateFrames", false).toBool();
+        timeline_->setShowDuplicateFrames(dups);
+        QAction* a = add(seqM, tr("Show &Duplicate Frame Markers"), QKeySequence(), [this](bool on) {
+            timeline_->setShowDuplicateFrames(on);
+            appSettings().setValue("timeline/duplicateFrames", on);
+        });
+        a->setCheckable(true);
+        a->setChecked(dups);
+        a->setObjectName(QStringLiteral("showDuplicateFrames"));
+        a->setToolTip(tr("Mark video frames used more than once in the sequence with a stripe, one colour per file"));
+    }
     add(seqM, tr("Zoom &In"), QKeySequence(Qt::Key_Equal), [this] { timeline_->zoomIn(); });
     add(seqM, tr("Zoom &Out"), QKeySequence(Qt::Key_Minus), [this] { timeline_->zoomOut(); });
     add(seqM, tr("Zoom to &Fit"), QKeySequence(Qt::Key_Backslash), [this] { timeline_->zoomToFit(); });

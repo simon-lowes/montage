@@ -2506,6 +2506,35 @@ private slots:
         QCOMPARE(int(std::count_if(back.active()->markers.begin(), back.active()->markers.end(), [](const Marker& m) { return m.chapter; })), 4);
     }
 
+    void duplicateFrameMarkers() {
+        // The same file used three times: frames 0-40, then 20-60 (sharing 20-40), then 100-120 (shared with nothing).
+        Fixture fx;
+        const Id a = fx.put(V1, 0, 40, 0), b = fx.put(V1, 50, 40, 20), c = fx.put(V1, 100, 20, 100);
+        auto d = duplicateFrames(fx.s());
+        QCOMPARE(d.size(), size_t(2));
+        QCOMPARE(d[a], (std::vector<DuplicateSpan>{{20, 40, 0}}));
+        QCOMPARE(d[b], (std::vector<DuplicateSpan>{{50, 70, 0}}));
+        QVERIFY(!d.count(c));
+        // At double speed, its shared source frames take half as long on the timeline.
+        clipById(fx.s(), b)->speed = 2.0;
+        d = duplicateFrames(fx.s());
+        QCOMPARE(d[b], (std::vector<DuplicateSpan>{{50, 60, 0}}));
+        // Audio and titles are not counted; other media are a group of their own.
+        MediaItem other = *fx.p.findMedia(fx.media);
+        other.id = fx.p.newId();
+        fx.p.media.push_back(other);
+        Clip o1 = makeClip(fx.p, other, TrackKind::Video, fx.s()), o2 = o1;
+        o1.start = 200, o1.duration = 10, o2.start = 220, o2.duration = 10;
+        o2.id = fx.p.newId();
+        QVERIFY(overwrite(fx.p, fx.s(), V1, o1).ok && overwrite(fx.p, fx.s(), V1, o2).ok);
+        Clip sound = makeClip(fx.p, *fx.p.findMedia(fx.media), TrackKind::Audio, fx.s());
+        sound.start = 300, sound.duration = 40;
+        QVERIFY(overwrite(fx.p, fx.s(), A1, sound).ok);
+        d = duplicateFrames(fx.s());
+        QCOMPARE(d.size(), size_t(4));
+        QCOMPARE(d[fx.v1().clips[3].id].front().group, 1);
+    }
+
     void auditions() {
         // The clip plays the fixture's media from 10; take B (picture and sound) and C (sound only) are other files.
         Fixture fx;

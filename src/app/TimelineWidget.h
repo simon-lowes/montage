@@ -56,6 +56,10 @@ public:
     void setTrimEdit(Id outgoing, Id incoming, int side);
     void clearTrimEdit();
     bool trimEditShown() const { return trimSide_ >= 0; }
+    // Duplicate frame markers (Premiere's): a coloured stripe under video frames that another clip also shows.
+    void setShowDuplicateFrames(bool on);
+    bool showDuplicateFrames() const { return showDuplicates_; }
+    const std::vector<edit::DuplicateSpan>& duplicateSpans(Id clip) const;  // as drawn
     void setShowTrackAutomation(bool on);
     bool showTrackAutomation() const { return showTrackAuto_; }
     // Where audio track `index`'s automation line is at frame f, in viewport pixels (testing aid); (-1, -1) if hidden.
@@ -224,6 +228,9 @@ private:
     QPoint hoverPos_;
     bool showVolume_ = true;
     bool showTrackAuto_ = false;
+    bool showDuplicates_ = false;
+    mutable bool duplicatesDirty_ = true;
+    mutable std::map<Id, std::vector<edit::DuplicateSpan>> duplicates_;
     Id trimOut_ = 0, trimIn_ = 0;
     int trimSide_ = -1;
     bool showOpacity_ = false;

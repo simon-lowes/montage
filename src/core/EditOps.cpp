@@ -1524,6 +1524,52 @@ Result makeCompound(Project& p, Sequence& s, const std::vector<Id>& ids, const s
     return placeMedia(p, sq, m.id, lo, 0, double(hi - lo), {TrackKind::Video, vIdx}, {TrackKind::Audio, aIdx}, false);
 }
 
+// ---- Duplicate frames -------------------------------------------------------------
+
+std::map<Id, std::vector<DuplicateSpan>> duplicateFrames(const Sequence& s) {
+    struct Use {
+        const Clip* clip;
+        double a, b;  // source frames shown, [a, b)
+    };
+    std::map<Id, std::vector<Use>> byMedia;
+    std::vector<Id> order;  // media in order of first use, for stable groups
+    for (const Track& t : s.videoTracks)
+        for (const Clip& c : t.clips) {
+            if (!c.mediaId || c.isGenerator()) continue;
+            const double x = c.sourceAt(0), y = c.sourceAt(double(c.duration));
+            if (!byMedia.count(c.mediaId)) order.push_back(c.mediaId);
+            byMedia[c.mediaId].push_back({&c, std::min(x, y), std::max(x, y)});
+        }
+    std::map<Id, std::vector<DuplicateSpan>> out;
+    for (size_t g = 0; g < order.size(); ++g) {
+        const std::vector<Use>& uses = byMedia[order[g]];
+        for (size_t i = 0; i < uses.size(); ++i)
+            for (size_t j = 0; j < uses.size(); ++j) {
+                if (i == j) continue;
+                const double lo = std::max(uses[i].a, uses[j].a), hi = std::min(uses[i].b, uses[j].b);
+                if (hi - lo < 0.5) continue;  // less than a frame in common
+                // The shared source frames back on clip i's timeline.
+                const Clip& c = *uses[i].clip;
+                const double l0 = c.localForSource(lo), l1 = c.localForSource(hi);
+                FrameTime from = c.start + FrameTime(std::floor(std::min(l0, l1) + 1e-6));
+                FrameTime to = c.start + FrameTime(std::ceil(std::max(l0, l1) - 1e-6));
+                from = std::clamp(from, c.start, c.end());
+                to = std::clamp(to, c.start, c.end());
+                if (to > from) out[c.id].push_back({from, to, int(g)});
+            }
+    }
+    for (auto& [id, spans] : out) {  // merged, in order
+        std::sort(spans.begin(), spans.end(), [](const DuplicateSpan& a, const DuplicateSpan& b) { return a.from < b.from; });
+        std::vector<DuplicateSpan> merged;
+        for (const DuplicateSpan& d : spans) {
+            if (!merged.empty() && d.from <= merged.back().to) merged.back().to = std::max(merged.back().to, d.to);
+            else merged.push_back(d);
+        }
+        spans = std::move(merged);
+    }
+    return out;
+}
+
 // ---- Auditions -----------------------------------------------------------------
 
 Result addTakes(Project& p, Sequence& s, Id clipId, const std::vector<std::pair<Id, double>>& media) {

@@ -144,6 +144,16 @@ Result fitToFill(Project& p, Sequence& s, Id mediaId, double srcIn, double srcOu
 // edges are removed.
 Result swapClip(Project& p, Sequence& s, Id clipId, bool withNext);
 
+// ---- Duplicate frames (Premiere's duplicate frame markers) ---------------------
+// Where a video clip shows source frames that another video clip in the sequence also shows: timeline frames
+// [from, to) of the clip, and a group number per media (the same group for every repeat of one file's frames).
+struct DuplicateSpan {
+    FrameTime from = 0, to = 0;
+    int group = 0;
+    bool operator==(const DuplicateSpan&) const = default;
+};
+std::map<Id, std::vector<DuplicateSpan>> duplicateFrames(const Sequence& s);
+
 // ---- Auditions (Final Cut's auditions, Resolve's take selector) ----------------
 // Adds media as alternative takes of a clip, each from a source in-point (sequence frames), the clip staying the
 // pick. Takes must have what the track plays (pictures on a video track, sound on an audio track).

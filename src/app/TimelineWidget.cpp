@@ -122,12 +122,14 @@ TimelineWidget::TimelineWidget(EditorState* state, QWidget* parent) : QAbstractS
     horizontalScrollBar()->setSingleStep(20);
     verticalScrollBar()->setSingleStep(20);
     connect(state_, &EditorState::projectChanged, this, [this] {
+        duplicatesDirty_ = true;
         updateScrollBars();
         viewport()->update();
     });
     connect(state_, &EditorState::selectionChanged, viewport(), qOverload<>(&QWidget::update));
     connect(state_, &EditorState::playheadChanged, viewport(), qOverload<>(&QWidget::update));
     connect(state_, &EditorState::sequenceSwitched, this, [this] {
+        duplicatesDirty_ = true;
         horizontalScrollBar()->setValue(0);
         zoomToFit();
     });
@@ -599,6 +601,15 @@ void TimelineWidget::paintClip(QPainter& p, const Row& row, const Clip& c, const
         for (int x = r.left() - r.height(); x < r.right(); x += 8) p.drawLine(x, r.bottom(), x + r.height(), r.top());
     }
     paintLane(p, c, row.ref.kind, r);
+    if (showDuplicates_ && row.ref.kind == TrackKind::Video) {
+        // Duplicate frame markers: a stripe in one colour per file under the frames used again elsewhere.
+        static const QColor kDup[] = {QColor(0xff, 0x5c, 0x8a), QColor(0x4c, 0xd9, 0xff), QColor(0xff, 0xc8, 0x3c),
+                                      QColor(0x9c, 0xff, 0x5c), QColor(0xc0, 0x7c, 0xff), QColor(0xff, 0x8c, 0x3c)};
+        for (const edit::DuplicateSpan& d : duplicateSpans(c.id)) {
+            const int x0 = std::max(r.left(), xForFrame(d.from)), x1 = std::min(r.right(), xForFrame(d.to));
+            if (x1 > x0) p.fillRect(QRect(x0, r.bottom() - 4, x1 - x0, 4), kDup[size_t(d.group) % std::size(kDup)]);
+        }
+    }
     // Name strip with badges.
     p.fillRect(QRect(r.left(), r.top(), r.width(), kNameStrip), QColor(0, 0, 0, 70));
     QString badges;
@@ -703,6 +714,22 @@ void TimelineWidget::setTrimEdit(Id outgoing, Id incoming, int side) {
 void TimelineWidget::clearTrimEdit() {
     trimSide_ = -1;
     viewport()->update();
+}
+
+void TimelineWidget::setShowDuplicateFrames(bool on) {
+    showDuplicates_ = on;
+    duplicatesDirty_ = true;
+    viewport()->update();
+}
+
+const std::vector<edit::DuplicateSpan>& TimelineWidget::duplicateSpans(Id clip) const {
+    static const std::vector<edit::DuplicateSpan> none;
+    if (duplicatesDirty_) {
+        duplicates_ = state_->sequence() ? edit::duplicateFrames(*state_->sequence()) : decltype(duplicates_){};
+        duplicatesDirty_ = false;
+    }
+    const auto it = duplicates_.find(clip);
+    return it == duplicates_.end() ? none : it->second;
 }
 
 void TimelineWidget::setShowTrackAutomation(bool on) {
