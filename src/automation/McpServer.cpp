@@ -1627,6 +1627,51 @@ void McpServer::Impl::addTools() {
             return ok(QStringLiteral("Mixed %1 clip(s)").arg(n), QJsonObject{{"clips", clips}, {"changed", n}});
         });
 
+    add("montage_layout", "Arrange clips in a layout",
+        "Make video clips share the frame: picture in picture (the lowest clip full frame, the others whole in the "
+        "corners), side by side, top and bottom, three across or a 2 x 2 grid (each filling its cell, cropped from the "
+        "middle), or back to full frame. Clips go from the lowest track up; by default the video clips at a time.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "layout":{"type":"string","enum":["picture_in_picture","side_by_side","top_and_bottom","three_across","grid","full_frame"]},
+            "clips":{"type":"array","items":{"type":"number"},"description":"Video clip ids; default: those at \"at\""},
+            "at":{"type":["number","string"],"description":"Timeline time whose video clips to arrange (default 0)"},
+            "gap":{"type":"number","default":0,"description":"Pixels between and around the cells"},
+            "corner":{"type":"string","enum":["top_left","top_right","bottom_left","bottom_right"],"default":"bottom_right"},
+            "size":{"type":"number","default":0.3,"description":"Picture in picture: share of the frame's width"}},
+            "required":["project","layout"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            static const QStringList names{"full_frame", "picture_in_picture", "side_by_side", "top_and_bottom", "three_across", "grid"};
+            const int li = int(names.indexOf(need(a, "layout")));
+            if (li < 0) throw ArgError{QStringLiteral("\"layout\" must be one of %1").arg(names.join(", "))};
+            std::vector<Id> ids;
+            if (a.contains("clips")) {
+                for (const QJsonValue& v : a.value("clips").toArray()) ids.push_back(Id(v.toDouble()));
+            } else {
+                const FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : 0;
+                for (int i = 0; i < int(s.videoTracks.size()); ++i)
+                    if (const Clip* c = edit::clipAt(s, {TrackKind::Video, i}, at)) ids.push_back(c->id);
+            }
+            static const QStringList corners{"top_left", "top_right", "bottom_left", "bottom_right"};
+            edit::LayoutOptions o;
+            o.gap = std::clamp(a.value("gap").toDouble(0), 0.0, double(std::min(s.width, s.height)) / 4);
+            o.corner = a.contains("corner") ? int(corners.indexOf(str(a, "corner"))) : 3;
+            if (o.corner < 0) throw ArgError{QStringLiteral("\"corner\" must be one of %1").arg(corners.join(", "))};
+            o.pipSize = std::clamp(a.value("size").toDouble(0.3), 0.05, 1.0);
+            check(edit::arrangeLayout(l.project, s, ids, edit::Layout(li), o));
+            save(l);
+            QJsonArray clips;
+            for (Id id : ids)
+                if (const Clip* c = edit::clipById(s, id))
+                    clips.append(QJsonObject{{"clip", double(id)},
+                                             {"scale", c->motion.p("scale", 0, 100)},
+                                             {"position", QJsonArray{c->motion.p("pos_x", 0), c->motion.p("pos_y", 0)}},
+                                             {"crop", QJsonArray{c->motion.p("crop_left", 0), c->motion.p("crop_right", 0),
+                                                                 c->motion.p("crop_top", 0), c->motion.p("crop_bottom", 0)}}});
+            return ok(QStringLiteral("Arranged %1 clip(s)").arg(clips.size()), QJsonObject{{"clips", clips}});
+        });
+
     add("montage_set_roles", "Set audio roles",
         "Audio roles, as in Final Cut: tag audio clips Dialogue, Music, Effects or a role of your own (a video clip's "
         "linked sound takes it), mute or unmute a role across the sequence, or detect the roles of untagged clips by "

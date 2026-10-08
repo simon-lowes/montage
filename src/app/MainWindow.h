@@ -140,6 +140,9 @@ public:
     int detectRoles();
     // Reverse Match Frame: the Source monitor's frame, found in the sequence (again: the next use).
     bool reverseMatchFrame();
+    // Video layouts (Clip › Layout): the selected video clips, or with fewer than two every video clip under the
+    // playhead, sharing the frame. Returns how many clips were arranged.
+    int arrangeLayout(edit::Layout layout, double gap = 0);
     int joinThroughEdits();  // the selected clips' through edits, else all of the sequence's; how many (one undo step)
     bool swapClip(bool withNext);                     // the selected clip (or the one under the playhead) with its neighbour
     bool replaceWithSource();                         // the selected clip, or the one under the playhead

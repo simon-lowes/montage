@@ -1704,6 +1704,113 @@ std::map<Id, std::vector<DuplicateSpan>> duplicateFrames(const Sequence& s) {
     return out;
 }
 
+// ---- Video layouts ------------------------------------------------------------------------
+
+std::vector<Cell> layoutCells(Layout layout, int n, int width, int height, const LayoutOptions& o) {
+    const double W = width, H = height, g = std::max(0.0, o.gap);
+    auto grid = [&](int cols, int rows) {
+        std::vector<Cell> out;
+        const double cw = (W - g * (cols + 1)) / cols, ch = (H - g * (rows + 1)) / rows;
+        for (int r = 0; r < rows; ++r)
+            for (int c = 0; c < cols; ++c) out.push_back({g + c * (cw + g), g + r * (ch + g), cw, ch});
+        return out;
+    };
+    switch (layout) {
+        case Layout::FullFrame: return std::vector<Cell>(size_t(std::max(1, n)), Cell{0, 0, W, H});
+        case Layout::SideBySide: return grid(2, 1);
+        case Layout::TopAndBottom: return grid(1, 2);
+        case Layout::ThreeAcross: return grid(3, 1);
+        case Layout::Grid: return grid(2, 2);
+        case Layout::PictureInPicture: {
+            std::vector<Cell> out{{0, 0, W, H}};
+            const double margin = std::max(g, 0.04 * std::min(W, H)), w = std::clamp(o.pipSize, 0.05, 1.0) * W;
+            // From the chosen corner, round the others: bottom right, bottom left, top right, top left.
+            static constexpr int kOrder[4] = {3, 2, 1, 0};
+            const int first = int(std::find(kOrder, kOrder + 4, std::clamp(o.corner, 0, 3)) - kOrder);
+            for (int i = 1; i < std::max(2, n); ++i) {
+                const int corner = kOrder[(first + i - 1) % 4];
+                // Height comes from the clip; the corner is kept by its edge, so y here marks top or bottom.
+                out.push_back({corner % 2 ? W - margin - w : margin, corner < 2 ? margin : H - margin, w, 0});
+            }
+            return out;
+        }
+    }
+    return {};
+}
+
+Result arrangeLayout(const Project& p, Sequence& s, const std::vector<Id>& clips, Layout layout, const LayoutOptions& o) {
+    // The video clips, from the lowest track up.
+    struct Item {
+        Clip* clip;
+        int track;
+    };
+    std::vector<Item> items;
+    for (Id id : clips)
+        if (auto loc = locate(s, id); loc && loc->track.kind == TrackKind::Video)
+            if (Clip* c = clipById(s, id); c && std::none_of(items.begin(), items.end(), [c](const Item& it) { return it.clip == c; }))
+                items.push_back({c, loc->track.index});
+    if (items.empty()) return Result::fail("Select the video clips to arrange");
+    std::stable_sort(items.begin(), items.end(), [](const Item& a, const Item& b) {
+        return a.track != b.track ? a.track < b.track : a.clip->start < b.clip->start;
+    });
+    const double W = s.width, H = s.height;
+    const std::vector<Cell> cells = layoutCells(layout, int(items.size()), s.width, s.height, o);
+    for (size_t i = 0; i < items.size(); ++i) {
+        Clip& c = *items[i].clip;
+        // The picture's own size, as the compositor sees it.
+        double mw = W, mh = H;
+        if (!c.isGenerator())
+            if (const MediaItem* m = p.findMedia(c.mediaId)) {
+                if (m->kind == MediaKind::Sequence) {
+                    if (const Sequence* n = p.findSequence(m->sequenceId)) mw = n->width, mh = n->height;
+                } else if (m->width > 0 && m->height > 0) {
+                    mw = m->width, mh = m->height;
+                }
+            }
+        const double fit = [&] {
+            switch (int(c.motion.p("fit", 0, 0))) {
+                case 1: return std::max(W / mw, H / mh);
+                case 2: return W / mw;  // Stretch: the width's factor (the height follows its own)
+                case 3: return 1.0;
+                default: return std::min(W / mw, H / mh);
+            }
+        }();
+        const double fitY = int(c.motion.p("fit", 0, 0)) == 2 ? H / mh : fit;
+        // Cells past the layout's count share the last one; picture in picture gives each corner the clip's shape.
+        Cell cell = cells[std::min(i, cells.size() - 1)];
+        double scale, cropX = 0, cropY = 0;
+        const double bw = mw * fit, bh = mh * fitY;  // its size at 100 %
+        if (layout == Layout::PictureInPicture && i > 0) {
+            scale = cell.w / bw;
+            cell.h = bh * scale;
+            if (cell.y >= H / 2) cell.y -= cell.h;  // a bottom corner: up from the margin
+        } else if (layout == Layout::FullFrame) {
+            scale = 1;
+        } else {
+            scale = std::max(cell.w / bw, cell.h / bh);  // cover the cell, then crop the overflow
+            cropX = std::max(0.0, (bw * scale - cell.w) / 2 / (bw * scale));
+            cropY = std::max(0.0, (bh * scale - cell.h) / 2 / (bh * scale));
+        }
+        auto set = [&](const char* k, double v) {
+            Param& prm = c.motion.params[k];
+            prm.keys.clear();
+            prm.value = v;
+        };
+        set("scale", scale * 100);
+        set("scale_x", 100);
+        set("scale_y", 100);
+        set("anchor_x", 0);
+        set("anchor_y", 0);
+        set("pos_x", layout == Layout::FullFrame ? 0 : cell.x + cell.w / 2 - W / 2);
+        set("pos_y", layout == Layout::FullFrame ? 0 : cell.y + cell.h / 2 - H / 2);
+        set("crop_left", cropX * 100);
+        set("crop_right", cropX * 100);
+        set("crop_top", cropY * 100);
+        set("crop_bottom", cropY * 100);
+    }
+    return {};
+}
+
 // ---- Close Up -------------------------------------------------------------------------
 
 Result closeUp(Project& p, Sequence& s, Id clipId, FrameTime from, FrameTime to, double zoom, double u, double v) {

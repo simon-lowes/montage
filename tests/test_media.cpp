@@ -5818,6 +5818,25 @@ private slots:
                 return std::any_of(t.clips.begin(), t.clips.end(), [](const Clip& c) { return c.start == 500 && c.duration == 5; });
             }));
         }
+        // The two clips at 20.08 s side by side, then the top one in the top left corner.
+        r = tool("montage_layout", QJsonObject{{"project", project}, {"layout", "side_by_side"}, {"at", 20.08}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        {
+            const QJsonArray placed = r.value("structuredContent").toObject().value("clips").toArray();
+            QCOMPARE(placed.size(), 2);
+            const double x0 = placed[0].toObject().value("position").toArray()[0].toDouble(),
+                         x1 = placed[1].toObject().value("position").toArray()[0].toDouble();
+            QVERIFY2(x0 < 0 && std::fabs(x0 + x1) < 1e-6, qPrintable(QStringLiteral("%1 %2").arg(x0).arg(x1)));
+        }
+        r = tool("montage_layout", QJsonObject{{"project", project}, {"layout", "picture_in_picture"}, {"at", 20.08}, {"corner", "top_left"}, {"size", 0.25}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY(std::fabs(r.value("structuredContent").toObject().value("clips").toArray()[1].toObject().value("scale").toDouble() - 25) < 1e-6);
+        r = tool("montage_layout", QJsonObject{{"project", project}, {"layout", "mosaic"}});
+        QVERIFY(r.value("isError").toBool() && text(r).contains("layout"));
+        r = tool("montage_layout", QJsonObject{{"project", project}, {"layout", "grid"}, {"at", 900}});
+        QVERIFY(r.value("isError").toBool());
+        r = tool("montage_layout", QJsonObject{{"project", project}, {"layout", "picture_in_picture"}, {"at", 20.08}, {"corner", "middle"}});
+        QVERIFY(r.value("isError").toBool() && text(r).contains("corner"));
         r = tool("montage_place_media", QJsonObject{{"project", project}, {"media", ball}, {"at", 900}, {"mode", "ripple_overwrite"}});
         QVERIFY(r.value("isError").toBool() && text(r).contains("No clip"));
         r = tool("montage_place_media", QJsonObject{{"project", project}, {"media", ball}, {"mode", "sideways"}});

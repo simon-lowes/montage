@@ -786,6 +786,18 @@ void MainWindow::buildMenus() {
     add(clipM, tr("Swap with Next Clip"), QKeySequence("Ctrl+Shift+."), [this] { swapClip(true); })->setObjectName(QStringLiteral("swapNext"));
     add(clipM, tr("Join Through Edits"), QKeySequence(), [this] { joinThroughEdits(); })->setObjectName(QStringLiteral("joinThroughEdits"));
     add(clipM, tr("Close Up"), QKeySequence(), [this] { closeUp(); })->setObjectName(QStringLiteral("closeUp"));
+    // Video layouts: the selected video clips (or those under the playhead) sharing the frame.
+    QMenu* layoutM = clipM->addMenu(tr("Layout"));
+    layoutM->setObjectName(QStringLiteral("layoutMenu"));
+    const std::tuple<edit::Layout, QString, const char*> layouts[] = {
+        {edit::Layout::PictureInPicture, tr("Picture in Picture"), "layoutPip"},
+        {edit::Layout::SideBySide, tr("Side by Side"), "layoutSideBySide"},
+        {edit::Layout::TopAndBottom, tr("Top and Bottom"), "layoutTopBottom"},
+        {edit::Layout::ThreeAcross, tr("Three Across"), "layoutThreeAcross"},
+        {edit::Layout::Grid, tr("2 × 2 Grid"), "layoutGrid"},
+        {edit::Layout::FullFrame, tr("Full Frame (Reset)"), "layoutFullFrame"}};
+    for (const auto& [layout, name, object] : layouts)
+        add(layoutM, name, QKeySequence(), [this, layout = layout] { arrangeLayout(layout); })->setObjectName(QLatin1String(object));
     // Audio roles (Final Cut's roles): what a clip is, for muting a role and stems by role.
     roleMenu_ = clipM->addMenu(tr("Audio Role"));
     roleMenu_->setObjectName(QStringLiteral("audioRoleMenu"));
@@ -2171,6 +2183,30 @@ bool runWithProgress(QWidget* parent, EditorState* state, const QString& title,
 }
 
 }  // namespace
+
+int MainWindow::arrangeLayout(edit::Layout layout, double gap) {
+    // The selected video clips; with fewer than two, every video clip under the playhead.
+    const Sequence* s = state_->sequence();
+    if (!s) return 0;
+    std::vector<Id> ids;
+    for (Id id : state_->selectedClips())
+        if (auto loc = edit::locate(*s, id); loc && loc->track.kind == TrackKind::Video) ids.push_back(id);
+    if (ids.size() < 2) {
+        ids.clear();
+        for (int i = 0; i < int(s->videoTracks.size()); ++i)
+            if (const Clip* c = edit::clipAt(*s, {TrackKind::Video, i}, state_->playhead()); c && !s->videoTracks[size_t(i)].muted)
+                ids.push_back(c->id);
+    }
+    if (ids.empty()) {
+        state_->message(tr("Select the video clips to arrange, or put the playhead over them"));
+        return 0;
+    }
+    edit::LayoutOptions o;
+    o.gap = gap;
+    const bool ok = state_->apply(tr("Layout"), [&](Project& p, Sequence& sq) { return edit::arrangeLayout(p, sq, ids, layout, o); });
+    if (ok) state_->setSelection(ids);
+    return ok ? int(ids.size()) : 0;
+}
 
 int MainWindow::setSelectedRole(const QString& role) {
     const std::vector<Id> sel = state_->selectedClips();

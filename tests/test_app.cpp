@@ -3947,6 +3947,31 @@ const auto seq = [this] { return state()->sequence(); };
         state()->newProject();
     }
 
+    void videoLayoutsFromTheMenu() {
+        // The demo: Red then Blue on V1, a title on V2 over 15-60. At 30, Side by Side takes the two clips there.
+        loadDemo();
+        const Id red = clipNamed(*state()->sequence(), "Red")->id, title = state()->sequence()->videoTracks[1].clips.at(0).id;
+        state()->setSelection({}, false);
+        state()->setPlayhead(30);
+        QVERIFY(win_->findChild<QAction*>("layoutSideBySide"));
+        win_->findChild<QAction*>("layoutSideBySide")->trigger();
+        auto m = [&](Id id, const char* k) { return edit::clipById(*state()->sequence(), id)->motion.p(k, 0); };
+        QCOMPARE(m(red, "pos_x"), -80.0);  // a 320-wide sequence
+        QCOMPARE(m(title, "pos_x"), 80.0);
+        QCOMPARE(state()->selectedClips().size(), size_t(2));
+        state()->undo();
+        QCOMPARE(m(red, "pos_x"), 0.0);
+        // Nothing under the playhead: refused.
+        state()->setSelection({}, false);
+        state()->setPlayhead(500);
+        QCOMPARE(win_->arrangeLayout(edit::Layout::Grid), 0);
+        // Picture in picture from a selection of both.
+        state()->setSelection({red, title}, false);
+        QCOMPARE(win_->arrangeLayout(edit::Layout::PictureInPicture), 2);
+        QCOMPARE(m(red, "scale"), 100.0);
+        QVERIFY(std::fabs(m(title, "scale") - 30) < 1e-9);
+    }
+
     void keyframePanelEditsKeys() {
         loadDemo();
         const Id red = clipNamed(*state()->sequence(), "Red")->id;

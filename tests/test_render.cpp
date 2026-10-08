@@ -1458,6 +1458,69 @@ colorspaces:
         QVERIFY(near(c[0], 1));
     }
 
+    void videoLayouts() {
+        // Red on V1, blue on V2, green on V3, all full frame over 0-30, in a 160 x 90 sequence.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 160;
+        s.height = 90;
+        while (s.videoTracks.size() < 3) edit::addTrack(p, s, TrackKind::Video);
+        const Clip red = colorClip(p, 1, 0, 0, 0, 30), blue = colorClip(p, 0, 0, 1, 0, 30), green = colorClip(p, 0, 1, 0, 0, 30);
+        edit::overwrite(p, s, {TrackKind::Video, 0}, red);
+        edit::overwrite(p, s, {TrackKind::Video, 1}, blue);
+        edit::overwrite(p, s, {TrackKind::Video, 2}, green);
+        RenderOptions o;
+        float c[4];
+        auto at = [&](int x, int y) {
+            rgb(renderSequenceFrame(p, s, 5, o), x, y, c);
+            return QString("%1 %2 %3 a%4").arg(c[0]).arg(c[1]).arg(c[2]).arg(c[3]);
+        };
+        // Side by side (red and blue): each fills its half.
+        QVERIFY(edit::arrangeLayout(p, s, {blue.id, red.id}, edit::Layout::SideBySide).ok);
+        s.videoTracks[2].muted = true;
+        at(40, 45);
+        QVERIFY2(near(c[0], 1) && near(c[2], 0), qPrintable(at(40, 45)));
+        at(120, 45);
+        QVERIFY2(near(c[2], 1) && near(c[0], 0), qPrintable(at(120, 45)));
+        at(78, 10);
+        QVERIFY(near(c[0], 1));  // the halves meet in the middle
+        // With a 10 px gap the edges and the middle are empty.
+        QVERIFY(edit::arrangeLayout(p, s, {red.id, blue.id}, edit::Layout::SideBySide, {10}).ok);
+        at(4, 45);
+        QVERIFY(near(c[3], 0));
+        at(80, 45);
+        QVERIFY(near(c[3], 0));
+        at(40, 45);
+        QVERIFY(near(c[0], 1));
+        // The grid: red, blue, green clockwise from the top left; the fourth cell empty.
+        s.videoTracks[2].muted = false;
+        QVERIFY(edit::arrangeLayout(p, s, {red.id, blue.id, green.id}, edit::Layout::Grid).ok);
+        at(40, 22);
+        QVERIFY(near(c[0], 1));
+        at(120, 22);
+        QVERIFY(near(c[2], 1));
+        at(40, 67);
+        QVERIFY(near(c[1], 1) && near(c[0], 0));
+        at(120, 67);
+        QVERIFY(near(c[3], 0));
+        // Picture in picture: red full frame, blue bottom right, green bottom left.
+        QVERIFY(edit::arrangeLayout(p, s, {red.id, blue.id, green.id}, edit::Layout::PictureInPicture).ok);
+        at(80, 30);
+        QVERIFY2(near(c[0], 1) && near(c[2], 0), qPrintable(at(80, 30)));
+        at(132, 73);
+        QVERIFY2(near(c[2], 1), qPrintable(at(132, 73)));
+        at(28, 73);
+        QVERIFY2(near(c[1], 1), qPrintable(at(28, 73)));
+        at(158, 88);
+        QVERIFY(near(c[0], 1));  // the margin shows the red
+        // Full frame: green on top covers it all again.
+        QVERIFY(edit::arrangeLayout(p, s, {red.id, blue.id, green.id}, edit::Layout::FullFrame).ok);
+        at(10, 10);
+        QVERIFY(near(c[1], 1) && near(c[0], 0));
+        at(150, 80);
+        QVERIFY(near(c[1], 1));
+    }
+
     void adjustmentLayers() {
         // Red on V1 for 60 frames, an inverting adjustment layer on V2 for frames 10-30, blue in a corner on V3.
         Project p = makeDefaultProject();

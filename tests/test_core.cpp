@@ -2788,6 +2788,63 @@ private slots:
         QVERIFY(!uses.empty() && uses[0].clip == a && uses[0].at == 1);
     }
 
+    void videoLayoutGeometry() {
+        // 1920 x 1080 clips in a 1920 x 1080 sequence.
+        Fixture fx;
+        fx.s().width = 1920, fx.s().height = 1080;
+        while (fx.s().videoTracks.size() < 2) addTrack(fx.p, fx.s(), TrackKind::Video);
+        const Id a = fx.put(V1, 0, 100), b = fx.put(V2, 0, 100);
+        clipById(fx.s(), b)->motion.params["scale"].addKey(0, 50);  // keys are replaced
+        auto m = [&](Id id, const char* k) { return clipById(fx.s(), id)->motion.p(k, 0); };
+        // Side by side: each covers its 960 x 1080 half at 100 %, a quarter cropped off each side, V1 on the left.
+        QVERIFY(arrangeLayout(fx.p, fx.s(), {b, a}, Layout::SideBySide).ok);
+        QCOMPARE(m(a, "scale"), 100.0);
+        QCOMPARE(m(a, "pos_x"), -480.0);
+        QCOMPARE(m(b, "pos_x"), 480.0);
+        QCOMPARE(m(a, "crop_left"), 25.0);
+        QCOMPARE(m(a, "crop_right"), 25.0);
+        QCOMPARE(m(a, "crop_top"), 0.0);
+        QVERIFY(!clipById(fx.s(), b)->motion.params.at("scale").animated());
+        // Top and bottom: 1920 x 540 cells, so 100 % with a quarter off top and bottom.
+        QVERIFY(arrangeLayout(fx.p, fx.s(), {a, b}, Layout::TopAndBottom).ok);
+        QCOMPARE(m(a, "pos_y"), -270.0);
+        QCOMPARE(m(b, "pos_y"), 270.0);
+        QCOMPARE(m(a, "crop_top"), 25.0);
+        QCOMPARE(m(a, "crop_left"), 0.0);
+        // The grid: 960 x 540 cells, 50 %, no crop (the same shape).
+        QVERIFY(arrangeLayout(fx.p, fx.s(), {a, b}, Layout::Grid).ok);
+        QCOMPARE(m(a, "scale"), 50.0);
+        QCOMPARE(m(b, "pos_x"), 480.0);
+        QCOMPARE(m(b, "pos_y"), -270.0);
+        QCOMPARE(m(b, "crop_left"), 0.0);
+        // Picture in picture: V1 full frame; V2 at 30 %, bottom right, 43.2 px (4 % of 1080) in from the edges.
+        QVERIFY(arrangeLayout(fx.p, fx.s(), {a, b}, Layout::PictureInPicture).ok);
+        QCOMPARE(m(a, "scale"), 100.0);
+        QCOMPARE(m(a, "pos_x"), 0.0);
+        QVERIFY(std::fabs(m(b, "scale") - 30) < 1e-9);
+        QVERIFY(std::fabs(m(b, "pos_x") - (1920 - 43.2 - 288 - 960)) < 1e-6);
+        QVERIFY(std::fabs(m(b, "pos_y") - (1080 - 43.2 - 162 - 540)) < 1e-6);
+        LayoutOptions topLeft;
+        topLeft.corner = 0;
+        QVERIFY(arrangeLayout(fx.p, fx.s(), {a, b}, Layout::PictureInPicture, topLeft).ok);
+        QVERIFY(std::fabs(m(b, "pos_x") - (43.2 + 288 - 960)) < 1e-6);
+        QVERIFY(std::fabs(m(b, "pos_y") - (43.2 + 162 - 540)) < 1e-6);
+        // Three across: 640 x 1080 cells, a third of the width kept.
+        QVERIFY(arrangeLayout(fx.p, fx.s(), {a, b}, Layout::ThreeAcross).ok);
+        QVERIFY(std::fabs(m(a, "crop_left") - 100.0 / 3) < 1e-9);
+        QCOMPARE(m(a, "pos_x"), -640.0);
+        QCOMPARE(m(b, "pos_x"), 0.0);
+        // Back to full frame; audio clips and nothing refused.
+        QVERIFY(arrangeLayout(fx.p, fx.s(), {a, b}, Layout::FullFrame).ok);
+        QCOMPARE(m(b, "scale"), 100.0);
+        QCOMPARE(m(b, "crop_left"), 0.0);
+        QCOMPARE(m(b, "pos_y"), 0.0);
+        const Id sound = fx.put(A1, 0, 10);
+        QVERIFY(!arrangeLayout(fx.p, fx.s(), {sound}, Layout::Grid).ok);
+        QVERIFY(!arrangeLayout(fx.p, fx.s(), {}, Layout::Grid).ok);
+        QCOMPARE(layoutCells(Layout::Grid, 4, 1920, 1080, {20}).at(3).x, 20 + 930 + 20.0);  // (1920 - 3 gaps) / 2 wide
+    }
+
     void keyframeRepeat() {
         // 0 at frame 10, 10 at frame 20.
         Param p;

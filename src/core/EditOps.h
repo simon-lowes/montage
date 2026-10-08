@@ -186,6 +186,28 @@ std::map<Id, std::vector<DuplicateSpan>> duplicateFrames(const Sequence& s);
 // frame, a little above it, without uncovering the frame's edges. Video only; its effects come with it.
 Result closeUp(Project& p, Sequence& s, Id clipId, FrameTime from, FrameTime to, double zoom, double u, double v);
 
+// ---- Video layouts (CapCut's layouts, Resolve's Video Collage, split-screen templates) -------------------------
+// Sets the video clips' size, position and crop so they share the frame. The clips are taken from the lowest track
+// up (and by start on a track). Side by side, top and bottom, three across and the 2 x 2 grid fill their cells,
+// cropping what spills over (centred); picture in picture leaves the lowest clip full frame and puts each other one,
+// whole, in a corner (`corner`: 0 top left, 1 top right, 2 bottom left, 3 bottom right; further clips go round
+// bottom right, bottom left, top right, top left from there), `pipSize` of
+// the frame's width; full frame puts them all back. `gap` is the space between and around cells, in pixels.
+// Keys on those parameters are replaced; rotation, opacity and effects stay.
+enum class Layout { FullFrame, PictureInPicture, SideBySide, TopAndBottom, ThreeAcross, Grid };
+struct LayoutOptions {
+    double gap = 0;
+    int corner = 3;
+    double pipSize = 0.3;
+};
+struct Cell {
+    double x = 0, y = 0, w = 0, h = 0;  // sequence pixels, from the top left
+};
+// The cells of a layout for `n` clips (picture in picture: the full frame then the corners, with each corner's
+// height to be set from its clip's shape).
+std::vector<Cell> layoutCells(Layout layout, int n, int width, int height, const LayoutOptions& o);
+Result arrangeLayout(const Project& p, Sequence& s, const std::vector<Id>& clips, Layout layout, const LayoutOptions& o = {});
+
 // ---- Track folders (Resolve's Fairlight folders) -----------------------------------
 // Puts tracks in a folder ("" takes them out). Fails for no tracks or a folder name with a slash.
 Result setTrackFolder(Sequence& s, const std::vector<TrackRef>& tracks, const std::string& folder);
