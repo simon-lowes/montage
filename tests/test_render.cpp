@@ -861,6 +861,56 @@ colorspaces:
         QVERIFY2(near(c[0], 0.16f) && near(c[1], 0.09f), qPrintable(QString("%1 %2").arg(c[0]).arg(c[1])));
     }
 
+    void smoothCut() {
+        // A jump cut: the same shot either side, the picture 14 px further right after the cut.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320;
+        s.height = 180;
+        auto bars = [&](FrameTime start, FrameTime len, double x) {
+            Clip c = makeGeneratorClip(p, "bars", len);
+            c.start = start;
+            c.motion.params["pos_x"] = x;
+            return c;
+        };
+        auto ra = edit::overwrite(p, s, {TrackKind::Video, 0}, bars(0, 30, 0));
+        edit::overwrite(p, s, {TrackKind::Video, 0}, bars(30, 30, 14));
+        QVERIFY(edit::addTransition(p, s, ra.created[0], edit::Edge::Out, "smooth_cut", 6).ok);
+        const Transition& tr = trackAt(s, {TrackKind::Video, 0})->transitions.at(0);
+        QCOMPARE(tr.type, std::string("smooth_cut"));
+        RenderOptions o;
+        // Mean difference from the picture shifted by `x`, away from the edges the shift uncovers.
+        auto error = [&](const Image& img, double x) {
+            Project ip = makeDefaultProject();
+            Sequence& is = *ip.active();
+            is.width = 320;
+            is.height = 180;
+            Clip c = makeGeneratorClip(ip, "bars", 10);
+            c.motion.params["pos_x"] = x;
+            edit::overwrite(ip, is, {TrackKind::Video, 0}, c);
+            const Image ideal = renderProgramFrame(ip, is, 0, o);
+            double d = 0;
+            for (int y = 0; y < 180; ++y)
+                for (int xx = 30; xx < 290; ++xx)
+                    for (int k = 0; k < 3; ++k) d += std::fabs(img.at(xx, y)[k] - ideal.at(xx, y)[k]);
+            return d / (180 * 260 * 3);
+        };
+        // Frames 27-32: the picture slides across instead of two pictures showing through each other.
+        for (FrameTime t = 27; t < 33; ++t) {
+            const double u = (double(t - 27) + 0.5) / 6;
+            const Image morph = renderProgramFrame(p, s, t, o);
+            const double em = error(morph, 14 * u);
+            Transition& live = trackAt(s, {TrackKind::Video, 0})->transitions.at(0);
+            live.type = "cross_dissolve";
+            const double ed = error(renderProgramFrame(p, s, t, o), 14 * u);
+            live.type = "smooth_cut";
+            QVERIFY2(em < 0.005 && em < ed * 0.25, qPrintable(QString("frame %1: %2 vs dissolve %3").arg(t).arg(em).arg(ed)));
+        }
+        // Outside the transition the clips play as they are.
+        QVERIFY(error(renderProgramFrame(p, s, 20, o), 0) < 1e-4);
+        QVERIFY(error(renderProgramFrame(p, s, 40, o), 14) < 1e-4);
+    }
+
     void compositorTransitionAndCrop() {
         Project p = makeDefaultProject();
         Sequence& s = *p.active();

@@ -1788,6 +1788,18 @@ private slots:
         QCOMPARE(state()->sequence()->duration(), full);
         QCOMPARE(panel->words().size(), size_t(8));
 
+        // Smooth Cuts is an option that stays set (sound-only here, so no transitions appear).
+        auto* smooth = panel->findChild<QToolButton*>("smoothCuts");
+        QVERIFY(smooth && smooth->isCheckable());
+        smooth->setChecked(true);
+        QVERIFY(QSettings().value("transcript/smoothCuts").toBool());
+        panel->selectWords(3, 4);
+        panel->deleteSelection();
+        QCOMPARE(state()->sequence()->duration(), full - cut);
+        for (const Track& t : state()->sequence()->audioTracks) QVERIFY(t.transitions.empty());
+        state()->undo();
+        smooth->setChecked(false);
+
         // Filler words and long pauses.
         panel->removeFillerWords();
         QCOMPARE(panel->words().size(), size_t(7));

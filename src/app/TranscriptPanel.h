@@ -59,6 +59,8 @@ private:
     void refreshHighlights();
     int wordAtPosition(int pos) const;
     double fps() const;
+    // Frames of Smooth Cut to put at the joins a deletion leaves (0 when off).
+    FrameTime smoothCutFrames() const;
 
     struct Span {
         int pos = 0, len = 0;
@@ -78,6 +80,7 @@ private:
     QToolButton* pausesBtn_;
     QToolButton* insertBtn_;
     QToolButton* overwriteBtn_;
+    QToolButton* smoothBtn_;
     std::vector<TranscriptWord> words_;
     std::vector<Span> spans_;
     QString signature_;

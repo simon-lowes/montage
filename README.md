@@ -57,7 +57,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
   - Alt-click a keyframe to delete it, or right-click it for Linear, Hold or Smooth.
   - Volume is drawn on a perceptual scale up to +6 dB.
 - Titles (font, outline, shadow, background box, alignment, tracking), colour mattes, gradients, SMPTE bars
-- Transitions: cross dissolve, dip to black/white, wipe, push, slide, iris, cross zoom
+- Transitions: cross dissolve, dip to black/white, wipe, push, slide, iris, cross zoom, and **Smooth Cut** (like Premiere's Morph Cut or Resolve's Smooth Cut), which hides a jump cut in an interview by morphing the outgoing frame into the incoming one along their optical flow
 - Scopes: waveform, RGB parade, vectorscope, histogram
 - Colour management and HDR:
   - Media spaces come from the file's tags, and Interpret Colour overrides them: Rec.709, sRGB, Rec.2020, Display P3, Rec.2100 PQ and HLG, Sony S-Log3, ARRI LogC3 and LogC4, Panasonic V-Log, Canon Log 3, ACEScct.
@@ -152,6 +152,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Edit by transcript (Transcript panel):
   - **Sequence mode** shows what the cut says, with the word under the playhead highlighted. Click a word to go there. Select words and press Delete to cut them out of every track; the gap closes and the captions move with it.
   - Remove Fillers cuts um, uh, er and similar words in one step. Shorten Pauses trims silences between words to a length you choose.
+  - With **Smooth Cuts** on, each join these leave in the picture gets a Smooth Cut, so the speaker does not jump.
   - Find searches the words; the last word may be partly typed.
   - **Source mode** shows the Source monitor clip's transcript. Select words to set In and Out, then Insert or Overwrite them into the timeline.
 - Captions:
@@ -268,7 +269,7 @@ Its tools work on `.montage` files by path. Each edit is saved at once, and the 
 - probe media, create projects and list a project's timeline;
 - place media, split, remove (with ripple), move, trim and change the speed of clips;
 - add titles, effects (including masked ones), transitions and markers;
-- transcribe (with speaker labels) and find spoken phrases in the cut;
+- transcribe (with speaker labels), find spoken phrases in the cut, and cut by transcript (phrases, filler words, long pauses, optionally with Smooth Cuts);
 - find shots by description;
 - log media (ratings, labels, keywords, metadata fields, bins), make subclips, auto-tag shots, and find media by text or smart-bin rules, optionally saving the rules as a smart bin;
 - duck music under dialogue, and add adjustment layers;

@@ -111,7 +111,9 @@ void TimelineBuilder::addTransition(TrackKind kind, int trackIndex, Id clipA, Id
     if (duration <= 0) return;
     Transition tr;
     tr.id = p_.newId();
-    tr.type = !type.empty() ? type : kind == TrackKind::Video ? "cross_dissolve" : "crossfade";
+    const EffectInfo* info = type.empty() ? nullptr : findEffectInfo(type);
+    const EffectCategory want = kind == TrackKind::Video ? EffectCategory::VideoTransition : EffectCategory::AudioTransition;
+    tr.type = info && info->category == want ? type : kind == TrackKind::Video ? "cross_dissolve" : "crossfade";
     tr.clipA = clipA;
     tr.clipB = clipB;
     tr.duration = duration;
@@ -240,8 +242,10 @@ ImportResult importOtio(Project& p, const std::string& json, const MediaProber& 
                 continue;
             }
             if (schema.startsWith("Transition.")) {
-                pendingTr = Pending{rtValue(item.value("in_offset"), rate), rtValue(item.value("out_offset"), rate),
-                                    item.value("transition_type").toString() == "SMPTE_Dissolve" ? std::string() : std::string()};
+                // A custom transition named after one of ours (as Montage writes them) comes back as itself.
+                std::string type;
+                if (item.value("transition_type").toString() != "SMPTE_Dissolve") type = item.value("name").toString().toStdString();
+                pendingTr = Pending{rtValue(item.value("in_offset"), rate), rtValue(item.value("out_offset"), rate), type};
                 continue;
             }
             if (schema.startsWith("Stack.") || schema.startsWith("Track.")) {
@@ -301,7 +305,7 @@ ImportResult importOtio(Project& p, const std::string& json, const MediaProber& 
                 const QJsonObject mm = item.value("metadata").toObject().value("montage").toObject();
                 if (mm.contains("blend_mode")) clip->blendMode = mm.value("blend_mode").toString().toStdString();
                 if (pendingTr && prev) {
-                    b.addTransition(kind, index, prev, clip->id, FrameTime(std::llround(pendingTr->in + pendingTr->out)), {});
+                    b.addTransition(kind, index, prev, clip->id, FrameTime(std::llround(pendingTr->in + pendingTr->out)), pendingTr->type);
                 }
                 prev = clip->id;
             } else {

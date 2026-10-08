@@ -96,7 +96,7 @@ void rippleCaptions(Sequence& s, FrameTime a, FrameTime b) {
     }
 }
 
-edit::Result rippleDeleteRanges(Project& p, Sequence& s, std::vector<FrameRange> ranges) {
+edit::Result rippleDeleteRanges(Project& p, Sequence& s, std::vector<FrameRange> ranges, FrameTime smoothCut) {
     ranges = mergeRanges(std::move(ranges));
     if (ranges.empty()) return edit::Result::fail("Nothing to delete");
     const auto tracks = allTracks(s);
@@ -108,6 +108,25 @@ edit::Result rippleDeleteRanges(Project& p, Sequence& s, std::vector<FrameRange>
     }
     edit::Result res;
     for (const auto& r : ranges) res.applied += r.second - r.first;
+    if (smoothCut > 0) {
+        // Where each range was, after the earlier ones closed up.
+        FrameTime removed = 0;
+        for (const auto& r : ranges) {
+            const FrameTime at = r.first - removed;
+            removed += r.second - r.first;
+            for (size_t ti = 0; ti < s.videoTracks.size(); ++ti) {
+                const Track& t = s.videoTracks[ti];
+                if (t.locked) continue;
+                for (size_t k = 0; k + 1 < t.clips.size(); ++k)
+                    if (t.clips[k].end() == at && t.clips[k + 1].start == at && !t.clips[k].isGenerator() &&
+                        !t.clips[k + 1].isGenerator()) {
+                        edit::addTransition(p, s, t.clips[k].id, edit::Edge::Out, "smooth_cut",
+                                            std::min({smoothCut, t.clips[k].duration, t.clips[k + 1].duration}));
+                        break;
+                    }
+            }
+        }
+    }
     return res;
 }
 

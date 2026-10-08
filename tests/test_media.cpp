@@ -21,6 +21,7 @@
 #include "core/Effects.h"
 #include "core/ProjectIO.h"
 #include "core/Transcript.h"
+#include "core/TranscriptEdit.h"
 #include "audio/SpeechCleanup.h"
 #include "media/Analysis.h"
 #include "media/AudioSync.h"
@@ -1140,6 +1141,71 @@ private slots:
         QVERIFY(r.value("isError").toBool());
         r = call(QJsonObject{{"project", project}, {"music_track", "A2"}});
         QVERIFY(r.value("isError").toBool());
+    }
+
+    void mcpCutsBySpeech() {
+        // An interview clip with a filler, a long pause and a phrase to lose.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = {25, 1};
+        MediaItem m;
+        m.id = p.newId();
+        m.kind = MediaKind::Video;
+        m.name = "interview";
+        m.path = path("interview.mp4");
+        m.hasVideo = m.hasAudio = true;
+        m.duration = 20;
+        auto t = std::make_shared<Transcript>();
+        TranscriptSegment seg;
+        seg.words = {{1.0, 1.3, "So", 1},     {1.4, 1.7, "um", 1},    {1.8, 2.1, "I", 1},      {2.2, 2.6, "think", 1},
+                     {5.0, 5.4, "we", 1},     {5.5, 5.9, "should", 1}, {6.0, 6.3, "go.", 1},   {6.4, 6.7, "You", 1},
+                     {6.8, 7.1, "know,", 1},  {7.2, 7.6, "really.", 1}};
+        t->segments.push_back(seg);
+        m.transcript = t;
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 250, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const QString project = QString::fromStdString(path("speech.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_cut_speech"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        // A phrase that is never said changes nothing.
+        QJsonObject r = call(QJsonObject{{"project", project}, {"phrases", QJsonArray{"never said"}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("removed_seconds").toDouble(), 0.0);
+        // "um" (1.4 s to "I" at 1.8 s), the pause after "think" (to 0.3 s), and "you know" (to "really." at 7.2 s).
+        r = call(QJsonObject{{"project", project}, {"phrases", QJsonArray{"you know"}}, {"fillers", true},
+                             {"pauses_longer_than", 1.0}, {"smooth_cuts", true}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject sc = r.value("structuredContent").toObject();
+        QCOMPARE(sc.value("fillers").toInt(), 1);
+        QCOMPARE(sc.value("pauses").toInt(), 1);
+        QCOMPARE(sc.value("phrases").toArray().at(0).toObject().value("times").toInt(), 1);
+        QCOMPARE(sc.value("smooth_cuts").toInt(), 3);
+        QVERIFY2(std::fabs(sc.value("removed_seconds").toDouble() - 82 / 25.0) < 1e-9, qPrintable(QString::number(sc.value("removed_seconds").toDouble())));
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Sequence& bs = *back.active();
+        QCOMPARE(bs.duration(), FrameTime(250 - 82));
+        QCOMPARE(bs.videoTracks[0].clips.size(), size_t(4));
+        QCOMPARE(bs.audioTracks[0].clips.size(), size_t(4));
+        QCOMPARE(bs.videoTracks[0].transitions.size(), size_t(3));
+        QVERIFY(bs.audioTracks[0].transitions.empty());
+        // What is left reads "So I think we should go. really."
+        std::string said;
+        for (const TranscriptWord& w : sequenceTranscriptWords(back, bs)) said += (said.empty() ? "" : " ") + w.text;
+        QCOMPARE(QString::fromStdString(said), QString("So I think we should go. really."));
+        // Without a transcript there is nothing to go on.
+        Project bare = makeDefaultProject();
+        const QString empty = QString::fromStdString(path("bare.montage"));
+        QVERIFY(saveProject(bare, empty.toStdString()));
+        QVERIFY(call(QJsonObject{{"project", empty}, {"fillers", true}}).value("isError").toBool());
     }
 
     void mcpServerEditsProjects() {

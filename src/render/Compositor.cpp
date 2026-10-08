@@ -403,9 +403,22 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
             const Clip* B = findClip(track, active->clipB);
             double u = (double(t - from) + 0.5) / double(std::max<FrameTime>(1, to - from));
             const Image* below = canvasEmpty ? nullptr : &canvas;
-            Image la = (A && A->enabled) ? clipLayer(p, seq, *A, t, o, below) : Image();
-            Image lb = (B && B->enabled) ? clipLayer(p, seq, *B, t, o, below) : Image();
-            Image mixed = transitionMix(active->type, active->params, la, lb, u, W, H);
+            Image mixed;
+            if (active->type == "smooth_cut" && A && A->enabled && B && B->enabled) {
+                // The first frame of the transition morphs into its last along their optical flow
+                // (the pair is the same throughout, so its flow is measured once).
+                Image la = clipLayer(p, seq, *A, from, o, below), lb = clipLayer(p, seq, *B, to - 1, o, below);
+                if (la.width == W && la.height == H && lb.width == W && lb.height == H)
+                    mixed = interpolateFrames(la, lb, u,
+                                              "smooth#" + std::to_string(active->id) + '@' + std::to_string(from) + '-' +
+                                                  std::to_string(to) + '#' + std::to_string(W) + 'x' + std::to_string(H));
+                else
+                    mixed = transitionMix("cross_dissolve", active->params, la, lb, u, W, H);
+            } else {
+                Image la = (A && A->enabled) ? clipLayer(p, seq, *A, t, o, below) : Image();
+                Image lb = (B && B->enabled) ? clipLayer(p, seq, *B, t, o, below) : Image();
+                mixed = transitionMix(active->type, active->params, la, lb, u, W, H);
+            }
             const Clip* top = B ? B : A;
             composite(std::move(mixed), top ? top->blendMode : "normal");
             continue;

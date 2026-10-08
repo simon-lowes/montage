@@ -282,8 +282,23 @@ private slots:
         ct.captions = {{20, 30, "before"}, {40, 45, "inside"}, {35, 60, "x"}, {120, 140, "after"}};
         normalizeCaptions(ct.captions);  // "inside" is cut short by the overlap rules: {20,30} {35,40} {40,45} {120,140}
         s.captionTracks.push_back(ct);
+        // With Smooth Cuts, each join in the picture gets one (and the sound none).
+        Project smooth = p;
+        QVERIFY(rippleDeleteRanges(smooth, *smooth.active(), {pauses[0], fillers[0]}, 5).ok);
+        const Track& sv = smooth.active()->videoTracks[0];
+        QCOMPARE(sv.transitions.size(), size_t(2));
+        QVERIFY(smooth.active()->audioTracks[0].transitions.empty());
+        for (const Transition& tr : sv.transitions) {
+            QCOMPARE(tr.type, std::string("smooth_cut"));
+            QCOMPARE(tr.duration, FrameTime(5));
+            const Clip* a = edit::clipById(*smooth.active(), tr.clipA);
+            const Clip* b = edit::clipById(*smooth.active(), tr.clipB);
+            QVERIFY(a && b && a->end() == b->start);
+            QVERIFY(a->end() == 38 || a->end() == 63 - 10);  // the filler's place, then the pause's less the filler
+        }
         auto r = rippleDeleteRanges(p, s, {pauses[0], fillers[0]});
         QVERIFY(r.ok);
+        QVERIFY(s.videoTracks[0].transitions.empty());
         QCOMPARE(r.applied, FrameTime(59));
         QCOMPARE(s.duration(), FrameTime(191));
         // Both tracks were cut the same way.
@@ -1495,6 +1510,16 @@ private slots:
             QCOMPARE(back.videoTracks[1].clips.at(0).generator.s("text"), std::string("Hello"));
             QCOMPARE(back.markers.size(), size_t(1));
             QCOMPARE(back.markers[0].comment, std::string("first beat"));
+            // Our own transition types come back as themselves; unknown custom ones as dissolves.
+            Sequence typed = original;
+            QVERIFY(!typed.videoTracks[0].transitions.empty());
+            typed.videoTracks[0].transitions[0].type = "smooth_cut";
+            ImportResult r2 = importOtio(fx.p, exportOtio(fx.p, typed));
+            QVERIFY2(r2.ok, r2.error.c_str());
+            QCOMPARE(fx.p.findSequence(r2.sequence)->videoTracks[0].transitions.at(0).type, std::string("smooth_cut"));
+            typed.videoTracks[0].transitions[0].type = "page_curl";
+            ImportResult r3 = importOtio(fx.p, exportOtio(fx.p, typed));
+            QCOMPARE(fx.p.findSequence(r3.sequence)->videoTracks[0].transitions.at(0).type, std::string("cross_dissolve"));
         }
         // EDL: one video track and the audio, cuts and dissolves.
         {

@@ -349,6 +349,9 @@ std::vector<EffectInfo> buildCatalog() {
     c.push_back({"cross_dissolve", "Cross Dissolve", EffectCategory::VideoTransition, "Dissolve", {}, {}});
     c.push_back({"dip_to_black", "Dip to Black", EffectCategory::VideoTransition, "Dissolve", {}, {}});
     c.push_back({"dip_to_white", "Dip to White", EffectCategory::VideoTransition, "Dissolve", {}, {}});
+    // Hides a jump cut (an interview with a pause taken out): the outgoing
+    // frame morphs into the incoming one along the optical flow between them.
+    c.push_back({"smooth_cut", "Smooth Cut", EffectCategory::VideoTransition, "Dissolve", {}, {}});
     c.push_back({"wipe", "Wipe", EffectCategory::VideoTransition, "Wipe",
                  {angle("angle", "Angle", 0), num("softness", "Softness", 0, 1, 0.05)}, {}});
     c.push_back({"push", "Push", EffectCategory::VideoTransition, "Slide",

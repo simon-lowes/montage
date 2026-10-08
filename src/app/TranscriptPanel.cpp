@@ -17,6 +17,7 @@
 #include <QMouseEvent>
 #include <QRegularExpression>
 #include <QScrollBar>
+#include <QSettings>
 #include <QTextBlock>
 #include <QTextCursor>
 #include <QTextEdit>
@@ -82,8 +83,16 @@ TranscriptPanel::TranscriptPanel(EditorState* state, QWidget* parent) : QWidget(
     pausesBtn_ = button(this, tr("Shorten Pauses..."), tr("Shorten silences between words"));
     insertBtn_ = button(this, tr("Insert"), tr("Insert the selected words into the timeline at the playhead"));
     overwriteBtn_ = button(this, tr("Overwrite"), tr("Overwrite the timeline at the playhead with the selected words"));
+    smoothBtn_ = button(this, tr("Smooth Cuts"),
+                        tr("Put a Smooth Cut at each join that Delete, Remove Fillers and Shorten Pauses leave,\n"
+                           "so the jump in the picture morphs across instead of cutting"));
+    smoothBtn_->setObjectName(QStringLiteral("smoothCuts"));
+    smoothBtn_->setCheckable(true);
+    smoothBtn_->setChecked(QSettings().value(QStringLiteral("transcript/smoothCuts"), false).toBool());
+    connect(smoothBtn_, &QToolButton::toggled, this, [](bool on) { QSettings().setValue(QStringLiteral("transcript/smoothCuts"), on); });
     for (QToolButton* b : {deleteBtn_, fillersBtn_, pausesBtn_, insertBtn_, overwriteBtn_}) bottom->addWidget(b);
     bottom->addStretch();
+    bottom->addWidget(smoothBtn_);
     lay->addLayout(bottom);
     status_ = new QLabel(this);
     status_->setStyleSheet(QStringLiteral("color: palette(mid);"));
@@ -427,8 +436,12 @@ void TranscriptPanel::deleteSelection() {
     }
     const FrameRange range{FrameTime(std::llround(a * f)), FrameTime(std::llround(b * f))};
     const int n = last - first + 1;
-    if (state_->apply(tr("Delete Words"), [range](Project& p, Sequence& s) { return rippleDeleteRanges(p, s, {range}); }))
+    if (state_->apply(tr("Delete Words"), [range, smooth = smoothCutFrames()](Project& p, Sequence& s) { return rippleDeleteRanges(p, s, {range}, smooth); }))
         state_->message(tr("Cut %n word(s)", "", n));
+}
+
+FrameTime TranscriptPanel::smoothCutFrames() const {
+    return smoothBtn_->isChecked() ? std::max<FrameTime>(2, FrameTime(std::lround(fps() * 0.2))) : 0;
 }
 
 void TranscriptPanel::removeFillerWords() {
@@ -439,7 +452,7 @@ void TranscriptPanel::removeFillerWords() {
         return;
     }
     const int n = int(std::count_if(words_.begin(), words_.end(), [](const TranscriptWord& w) { return isFillerWord(w.text); }));
-    if (state_->apply(tr("Remove Filler Words"), [ranges](Project& p, Sequence& s) { return rippleDeleteRanges(p, s, ranges); }))
+    if (state_->apply(tr("Remove Filler Words"), [ranges, smooth = smoothCutFrames()](Project& p, Sequence& s) { return rippleDeleteRanges(p, s, ranges, smooth); }))
         state_->message(tr("Removed %n filler word(s)", "", n));
 }
 
@@ -452,7 +465,7 @@ void TranscriptPanel::removePauses(double minPause, double keep) {
     }
     FrameTime total = 0;
     for (const auto& r : ranges) total += r.second - r.first;
-    if (state_->apply(tr("Shorten Pauses"), [ranges](Project& p, Sequence& s) { return rippleDeleteRanges(p, s, ranges); }))
+    if (state_->apply(tr("Shorten Pauses"), [ranges, smooth = smoothCutFrames()](Project& p, Sequence& s) { return rippleDeleteRanges(p, s, ranges, smooth); }))
         state_->message(tr("Shortened %n pause(s), %1 s shorter", "", int(ranges.size())).arg(double(total) / fps(), 0, 'f', 1));
 }
 

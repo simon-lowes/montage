@@ -24,8 +24,10 @@ using FrameRange = std::pair<FrameTime, FrameTime>;  // [first, end)
 std::vector<FrameRange> mergeRanges(std::vector<FrameRange> ranges);
 
 // Removes the frame ranges from every editable track and from the caption
-// tracks, closing the gaps (sync-locked ripple delete).
-edit::Result rippleDeleteRanges(Project& p, Sequence& s, std::vector<FrameRange> ranges);
+// tracks, closing the gaps (sync-locked ripple delete). With `smoothCut`
+// frames, each join this leaves between two video clips gets a Smooth Cut
+// transition that long, so the jump in the picture morphs across.
+edit::Result rippleDeleteRanges(Project& p, Sequence& s, std::vector<FrameRange> ranges, FrameTime smoothCut = 0);
 
 // Removes [a, b) from caption tracks: captions inside go, captions across the
 // range are shortened, and later captions move up.

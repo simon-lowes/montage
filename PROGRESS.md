@@ -352,4 +352,9 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
     - blur direction, aberration splitting red outwards of blue, and lens identity and barrel;
     - corner pin geometry and a degenerate quad;
     - letterbox and pillarbox.
-
+- [x] Smooth Cut transition (Premiere's Morph Cut, Resolve's Smooth Cut):
+  - The transition's first frame morphs into its last along the optical flow between them (the slow-motion interpolator, its flow measured once per transition and cached).
+  - The Transcript panel's Smooth Cuts option puts one on each join in the picture that Delete, Remove Fillers and Shorten Pauses leave (`rippleDeleteRanges` with a length).
+  - MCP `montage_cut_speech` (30 tools now): cut phrases, filler words and long pauses by transcript, with Smooth Cuts if asked, as one undoable edit.
+  - OTIO keeps its name as a custom transition and reads it back as a Smooth Cut (this also fixed wipes, pushes and the other Montage transitions coming back from OTIO as dissolves); EDL and the XML formats write it as a dissolve.
+  - Tested: a jump cut (colour bars 14 px apart) renders at the true in-between position on every transition frame, where a dissolve is 0.02-0.06 off on average; the joins after a transcript ripple get Smooth Cuts on picture tracks only; the panel option persists; the MCP tool cuts a filler, a pause and a phrase to the exact frames and leaves "So I think we should go. really."

@@ -13,6 +13,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <numeric>
 #include <sstream>
 
 #include "core/AutoTag.h"
@@ -724,6 +725,75 @@ void McpServer::Impl::addTools() {
             }
             if (seg.words.empty()) return ok("Nothing in the sequence is transcribed (use montage_transcribe with the project)");
             return ok(hits.isEmpty() ? QStringLiteral("Not found") : text, QJsonObject{{"hits", hits}});
+        });
+
+    add("montage_cut_speech", "Cut by transcript",
+        "Edit the cut by what is said, as in a text-based editor: remove every place a phrase is spoken, the filler words "
+        "(um, uh, er...) and/or pauses longer than pauses_longer_than seconds (shortened to keep_pause). Every track is cut "
+        "the same way and closed up, captions included. smooth_cuts puts a Smooth Cut (an optical-flow morph) on each join "
+        "in the picture, to hide the jump. One undoable edit; use montage_find_phrase first to see what a phrase matches.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "phrases":{"type":"array","items":{"type":"string"},"description":"Phrases to cut, every time they are said"},
+            "fillers":{"type":"boolean","default":false},
+            "pauses_longer_than":{"type":"number","description":"Seconds; omit to keep pauses"},
+            "keep_pause":{"type":"number","default":0.3},
+            "smooth_cuts":{"type":"boolean","default":false}},"required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const double fps = s.fpsValue();
+            const std::vector<TranscriptWord> words = sequenceTranscriptWords(l.project, s);
+            if (words.empty()) return fail("Nothing in the sequence is transcribed (use montage_transcribe with the project)");
+            std::vector<FrameRange> ranges;
+            QJsonArray found;
+            Transcript cut;
+            cut.segments.emplace_back();
+            cut.segments.back().words = words;
+            for (const QJsonValue& v : a.value("phrases").toArray()) {
+                int n = 0;
+                for (const auto& [from, to] : findPhrase(cut, v.toString().toStdString())) {
+                    // As the Transcript panel deletes words: up to the next word when the pause after is short.
+                    double end = to + 0.1;
+                    for (const TranscriptWord& w : words)
+                        if (w.start >= to - 1e-6) {
+                            end = w.start - end < 0.5 ? w.start : std::min(end, w.start);
+                            break;
+                        }
+                    ranges.emplace_back(FrameTime(std::llround(from * fps)), FrameTime(std::llround(end * fps)));
+                    ++n;
+                }
+                found.append(QJsonObject{{"phrase", v.toString()}, {"times", n}});
+            }
+            int fillers = 0;
+            if (a.value("fillers").toBool()) {
+                for (const FrameRange& r : fillerWordRanges(words, fps)) ranges.push_back(r);
+                fillers = int(std::count_if(words.begin(), words.end(), [](const TranscriptWord& w) { return isFillerWord(w.text); }));
+            }
+            int pauses = 0;
+            if (a.value("pauses_longer_than").isDouble()) {
+                const double longer = std::max(0.1, a.value("pauses_longer_than").toDouble());
+                const double keep = std::clamp(a.value("keep_pause").toDouble(0.3), 0.0, longer);
+                const auto p = pauseRanges(words, fps, longer, keep);
+                pauses = int(p.size());
+                ranges.insert(ranges.end(), p.begin(), p.end());
+            }
+            if (mergeRanges(ranges).empty()) return ok("Nothing to cut", QJsonObject{{"phrases", found}, {"removed_seconds", 0}});
+            const FrameTime smooth = a.value("smooth_cuts").toBool() ? std::max<FrameTime>(2, FrameTime(std::lround(fps * 0.2))) : 0;
+            const edit::Result r = rippleDeleteRanges(l.project, s, ranges, smooth);
+            if (!r.ok) return fail(QString::fromStdString(r.error));
+            save(l);
+            int joins = 0;
+            for (const Track& t : s.videoTracks)
+                joins += int(std::count_if(t.transitions.begin(), t.transitions.end(), [](const Transition& tr) { return tr.type == "smooth_cut"; }));
+            const double secs = double(r.applied) / fps;
+            return ok(QStringLiteral("Cut %1 s: %2 phrase match(es), %3 filler word(s), %4 pause(s)%5")
+                          .arg(secs, 0, 'f', 2)
+                          .arg(std::accumulate(found.begin(), found.end(), 0, [](int n, const QJsonValue& v) { return n + v.toObject().value("times").toInt(); }))
+                          .arg(fillers)
+                          .arg(pauses)
+                          .arg(smooth ? QStringLiteral(", with Smooth Cuts") : QString()),
+                      QJsonObject{{"phrases", found}, {"fillers", fillers}, {"pauses", pauses}, {"removed_seconds", secs},
+                                  {"smooth_cuts", joins}, {"duration", tc(s.duration(), s)}});
         });
 
     add("montage_find_shots", "Find shots by description",
