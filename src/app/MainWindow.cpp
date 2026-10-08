@@ -733,6 +733,7 @@ void MainWindow::buildMenus() {
         ->setObjectName(QStringLiteral("selectForwardTrack"));
     add(seqM, tr("Add &Marker"), QKeySequence(Qt::Key_M), [this] { addMarker(); });
     add(seqM, tr("Add C&hapter Marker"), QKeySequence("Alt+M"), [this] { addChapterMarker(); })->setObjectName(QStringLiteral("addChapter"));
+    add(seqM, tr("Add C&lip Marker"), QKeySequence("Shift+Alt+M"), [this] { addClipMarker(); })->setObjectName(QStringLiteral("addClipMarker"));
     add(seqM, tr("Copy Chapters for YouTube"), QKeySequence(), [this] { copyYoutubeChapters(); })->setObjectName(QStringLiteral("copyChapters"));
     add(seqM, tr("&Quality Check…"), QKeySequence(), [this] {
         if (!state_->sequence()) return;
@@ -1301,6 +1302,27 @@ void MainWindow::addChapterMarker() {
         edit::addMarker(s, Marker{t, 0, "Chapter " + std::to_string(n), "", 0, true});
         return true;
     });
+}
+
+void MainWindow::addClipMarker() {
+    const Sequence* s = state_->sequence();
+    if (!s) return;
+    const FrameTime t = state_->playhead();
+    // The selected clip under the playhead (picture or sound), else the picture there.
+    const Clip* target = nullptr;
+    for (Id id : state_->selectedClips())
+        if (const Clip* c = edit::clipById(*s, id); c && c->contains(t)) {
+            target = c;
+            break;
+        }
+    if (!target) target = clipForCommand();
+    if (!target) {
+        statusBar()->showMessage(tr("Select a clip under the playhead to mark it"), 5000);
+        return;
+    }
+    const Id id = target->id;
+    const std::string name = "Marker " + std::to_string(target->markers.size() + 1);
+    state_->edit(tr("Add Clip Marker"), [id, t, name](Project&, Sequence& sq) { return edit::addClipMarker(sq, id, t, Marker{0, 0, name, "", 0}); });
 }
 
 QString MainWindow::copyYoutubeChapters() {

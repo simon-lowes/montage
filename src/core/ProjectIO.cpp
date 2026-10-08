@@ -156,6 +156,32 @@ Effect effectFromJson(const QJsonValue& v) {
     return e;
 }
 
+QJsonArray markersToJson(const std::vector<Marker>& markers) {
+    QJsonArray m;
+    for (const auto& mk : markers) {
+        QJsonObject mo{{"t", double(mk.t)}, {"duration", double(mk.duration)}, {"name", qs(mk.name)}, {"comment", qs(mk.comment)}, {"color", mk.color}};
+        if (mk.chapter) mo["chapter"] = true;
+        m.append(mo);
+    }
+    return m;
+}
+
+std::vector<Marker> markersFromJson(const QJsonValue& v) {
+    std::vector<Marker> out;
+    for (const auto& mv : v.toArray()) {
+        QJsonObject mo = mv.toObject();
+        Marker mk;
+        mk.t = i64(mo.value("t"));
+        mk.duration = i64(mo.value("duration"));
+        mk.name = ss(mo.value("name"));
+        mk.comment = ss(mo.value("comment"));
+        mk.color = mo.value("color").toInt(0);
+        mk.chapter = mo.value("chapter").toBool(false);
+        out.push_back(mk);
+    }
+    return out;
+}
+
 QJsonObject clipToJson(const Clip& c) {
     QJsonObject o{{"id", double(c.id)},
                   {"media", double(c.mediaId)},
@@ -179,6 +205,7 @@ QJsonObject clipToJson(const Clip& c) {
     if (!c.unrendered.empty()) o["unrendered"] = qs(c.unrendered);
     if (c.angle != 0) o["angle"] = c.angle;
     if (c.audioAngle != -1) o["audioAngle"] = c.audioAngle;
+    if (!c.markers.empty()) o["markers"] = markersToJson(c.markers);
     return o;
 }
 
@@ -205,6 +232,7 @@ Clip clipFromJson(const QJsonObject& o) {
     c.unrendered = ss(o.value("unrendered"));
     c.angle = std::max(0, o.value("angle").toInt(0));
     c.audioAngle = std::max(-1, o.value("audioAngle").toInt(-1));
+    c.markers = markersFromJson(o.value("markers"));
     return c;
 }
 

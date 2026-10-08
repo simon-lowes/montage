@@ -168,6 +168,19 @@ double rtValue(const QJsonValue& v, double rate) {
     return r > 0 ? value * rate / r : value;  // in `rate` units
 }
 
+Marker otioMarker(const QJsonObject& m, double rate) {
+    const QJsonObject r = m.value("marked_range").toObject();
+    Marker mk;
+    mk.t = FrameTime(std::llround(rtValue(r.value("start_time"), rate)));
+    mk.duration = FrameTime(std::llround(rtValue(r.value("duration"), rate)));
+    mk.name = m.value("name").toString().toStdString();
+    mk.comment = m.value("comment").toString().toStdString();
+    const QJsonObject own = m.value("metadata").toObject().value("montage").toObject();
+    mk.chapter = own.value("chapter").toBool();
+    mk.color = std::clamp(own.value("color").toInt(0), 0, 11);
+    return mk;
+}
+
 QString pathFromUrl(const QString& url) {
     if (url.isEmpty()) return {};
     const QUrl u(url);
@@ -302,6 +315,7 @@ ImportResult importOtio(Project& p, const std::string& json, const MediaProber& 
             }
             if (clip) {
                 clip->enabled = item.value("enabled").toBool(true);
+                for (const auto& mv : item.value("markers").toArray()) clip->markers.push_back(otioMarker(mv.toObject(), rate));
                 const QJsonObject mm = item.value("metadata").toObject().value("montage").toObject();
                 if (mm.contains("blend_mode")) clip->blendMode = mm.value("blend_mode").toString().toStdString();
                 if (pendingTr && prev) {
@@ -315,16 +329,7 @@ ImportResult importOtio(Project& p, const std::string& json, const MediaProber& 
             cursor += dur;
         }
     }
-    for (const auto& mv : stack.value("markers").toArray()) {
-        const QJsonObject m = mv.toObject();
-        const QJsonObject r = m.value("marked_range").toObject();
-        Marker mk;
-        mk.t = FrameTime(std::llround(rtValue(r.value("start_time"), rate)));
-        mk.duration = FrameTime(std::llround(rtValue(r.value("duration"), rate)));
-        mk.name = m.value("name").toString().toStdString();
-        mk.comment = m.value("comment").toString().toStdString();
-        b.sequence().markers.push_back(mk);
-    }
+    for (const auto& mv : stack.value("markers").toArray()) b.sequence().markers.push_back(otioMarker(mv.toObject(), rate));
     return b.finish();
 }
 

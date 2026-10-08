@@ -631,6 +631,40 @@ private slots:
         QVERIFY(!QFileInfo::exists(dir_.path() + "/none.cube"));
     }
 
+    void clipMarkersFromTheMenu() {
+        loadDemo();
+        auto* add = win_->findChild<QAction*>("addClipMarker");
+        QVERIFY(add);
+        QCOMPARE(add->shortcut(), QKeySequence("Shift+Alt+M"));
+        const Id blue = clipNamed(*state()->sequence(), "Blue")->id;
+        state()->setSelection({blue});
+        state()->setPlayhead(75);
+        add->trigger();
+        auto markers = [&]() -> const std::vector<Marker>& { return edit::clipById(*state()->sequence(), blue)->markers; };
+        QCOMPARE(markers().size(), size_t(1));
+        QCOMPARE(markers()[0].t, FrameTime(15));  // 15 frames into Blue's source
+        QCOMPARE(QString::fromStdString(markers()[0].name), QString("Marker 1"));
+        QVERIFY(state()->sequence()->markers.empty());  // not a sequence marker
+        // The Sequence Index lists it where it shows, and renames it.
+        auto* panel = win_->findChild<SequenceIndexPanel*>();
+        panel->setFilter("clip marker");
+        QTRY_COMPARE(panel->rowCount(), 1);
+        QCOMPARE(panel->cell(0, SequenceIndexPanel::Start), QString::fromStdString(formatTimecode(75, state()->sequence()->fps)));
+        QVERIFY(panel->rename(0, "Hit"));
+        QCOMPARE(QString::fromStdString(markers()[0].name), QString("Hit"));
+        panel->setFilter("");
+        // Undone one step at a time.
+        state()->undo();
+        QCOMPARE(QString::fromStdString(markers()[0].name), QString("Marker 1"));
+        state()->undo();
+        QVERIFY(markers().empty());
+        // Nothing under the playhead: a message and no marker.
+        state()->clearSelection();
+        state()->setPlayhead(5000);
+        add->trigger();
+        QVERIFY(win_->statusBar()->currentMessage().contains("Select a clip"));
+    }
+
     void razorTool() {
         loadDemo();
         timeline()->setTool(TimelineWidget::Tool::Razor);

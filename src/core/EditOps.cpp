@@ -1317,6 +1317,24 @@ bool removeMarkerAt(Sequence& s, FrameTime frame) {
     return true;
 }
 
+bool addClipMarker(Sequence& s, Id id, FrameTime at, Marker m) {
+    Clip* c = clipById(s, id);
+    if (!c || !c->contains(at)) return false;
+    m.t = FrameTime(std::llround(c->sourceFrameAt(at)));
+    std::erase_if(c->markers, [&](const Marker& x) { return x.t == m.t; });
+    c->markers.push_back(std::move(m));
+    std::sort(c->markers.begin(), c->markers.end(), [](const Marker& a, const Marker& b) { return a.t < b.t; });
+    return true;
+}
+
+bool removeClipMarkerAt(Sequence& s, Id id, FrameTime at) {
+    Clip* c = clipById(s, id);
+    if (!c) return false;
+    const size_t before = c->markers.size();
+    std::erase_if(c->markers, [&](const Marker& m) { return c->markerFrame(m) == at; });
+    return c->markers.size() != before;
+}
+
 // ---------------------------------------------------------------------------
 // Snapping & navigation
 

@@ -893,15 +893,24 @@ void McpServer::Impl::addTools() {
 
     add("montage_add_marker", "Add a marker",
         "Add a timeline marker with a name and comment. A chapter marker also becomes a chapter in exported MP4, MOV and "
-        "MKV files and in montage_chapters' list.",
+        "MKV files and in montage_chapters' list. With a clip, the marker goes on the clip at the moment of its media shown "
+        "at `at`, and travels with the clip.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"at":{"type":["number","string"]},
-            "name":{"type":"string"},"comment":{"type":"string"},"chapter":{"type":"boolean","default":false}},"required":["project","at"]})json",
+            "name":{"type":"string"},"comment":{"type":"string"},"chapter":{"type":"boolean","default":false},
+            "clip":{"type":"number","description":"A clip id (montage_project_info) for a clip marker"}},"required":["project","at"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
             const FrameTime at = timeArg(a.value("at"), s, "at");
             const bool chapter = a.value("chapter").toBool();
-            edit::addMarker(s, Marker{at, 0, str(a, "name").toStdString(), str(a, "comment").toStdString(), 0, chapter});
+            const Marker m{at, 0, str(a, "name").toStdString(), str(a, "comment").toStdString(), 0, chapter};
+            if (a.contains("clip")) {
+                const Clip& c = clipArg(l, a);
+                if (!edit::addClipMarker(s, c.id, at, m)) throw ArgError{QStringLiteral("The clip is not at %1").arg(tc(at, s))};
+                save(l);
+                return ok(QStringLiteral("Clip marker on \"%1\" at %2").arg(QString::fromStdString(c.name), tc(at, s)));
+            }
+            edit::addMarker(s, m);
             save(l);
             return ok(QStringLiteral("%1 at %2").arg(chapter ? QStringLiteral("Chapter marker") : QStringLiteral("Marker"), tc(at, s)));
         });

@@ -5240,6 +5240,21 @@ private slots:
         QVERIFY(tool("montage_automate_track", QJsonObject{{"project", project}, {"track", "V1"}, {"mode", "read"}}).value("isError").toBool());
         QVERIFY(tool("montage_automate_track", QJsonObject{{"project", project}, {"mode", "loud"}}).value("isError").toBool());
         QVERIFY(!tool("montage_undo", QJsonObject{{"project", project}}).value("isError").toBool());
+        // A clip marker, on the clip rather than the sequence.
+        {
+            Project info;
+            QVERIFY(loadProject(project.toStdString(), info));
+            const Clip& first = info.active()->videoTracks.at(0).clips.at(0);
+            r = tool("montage_add_marker", QJsonObject{{"project", project}, {"at", double(first.start) / info.active()->fpsValue()}, {"name", "On clip"},
+                                                       {"clip", double(first.id)}});
+            QVERIFY2(!r.value("isError").toBool() && text(r).contains("Clip marker"), qPrintable(text(r)));
+            Project marked;
+            QVERIFY(loadProject(project.toStdString(), marked));
+            QCOMPARE(marked.active()->videoTracks.at(0).clips.at(0).markers.size(), size_t(1));
+            QCOMPARE(marked.active()->markers.size(), info.active()->markers.size());
+            QVERIFY(tool("montage_add_marker", QJsonObject{{"project", project}, {"at", 9999}, {"clip", double(first.id)}}).value("isError").toBool());
+            QVERIFY(!tool("montage_undo", QJsonObject{{"project", project}}).value("isError").toBool());
+        }
         r = tool("montage_add_marker", QJsonObject{{"project", project}, {"at", 0.1}, {"name", "Look"}});
         QVERIFY(!r.value("isError").toBool());
         Project saved;

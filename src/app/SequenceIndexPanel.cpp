@@ -93,6 +93,19 @@ void SequenceIndexPanel::rebuild() {
                 row.start = c.start;
                 addRow(row, {name, kind, label, tc(c.start), tc(c.end()), tc(c.duration), c.isGenerator() ? QString() : tc(FrameTime(std::llround(c.sourceIn))),
                              media, fx.join(QStringLiteral(", "))});
+                // The clip's markers, where the clip shows them.
+                for (size_t i = 0; i < c.markers.size(); ++i) {
+                    const Marker& mk = c.markers[i];
+                    const FrameTime at = c.markerFrame(mk);
+                    if (at < 0) continue;
+                    Row mr;
+                    mr.marker = true;
+                    mr.clip = c.id;
+                    mr.markerIndex = int(i);
+                    mr.start = at;
+                    addRow(mr, {QString::fromStdString(mk.name), tr("Clip Marker"), label, tc(at), tc(at + mk.duration), tc(mk.duration), tc(mk.t), media,
+                                QString::fromStdString(mk.comment)});
+                }
             }
         };
         for (size_t i = 0; i < s->videoTracks.size(); ++i) addTrack(s->videoTracks[i], QStringLiteral("V%1").arg(i + 1), true);
@@ -162,8 +175,14 @@ bool SequenceIndexPanel::rename(int row, const QString& name) {
     const std::string text = name.toStdString();
     return state_->edit(info.marker ? tr("Rename Marker") : tr("Rename Clip"), [&](Project&, Sequence& s) {
         if (info.marker) {
-            if (info.markerIndex < 0 || info.markerIndex >= int(s.markers.size()) || s.markers[size_t(info.markerIndex)].name == text) return false;
-            s.markers[size_t(info.markerIndex)].name = text;
+            std::vector<Marker>* list = &s.markers;
+            if (info.clip) {
+                Clip* c = edit::clipById(s, info.clip);
+                if (!c) return false;
+                list = &c->markers;
+            }
+            if (info.markerIndex < 0 || info.markerIndex >= int(list->size()) || (*list)[size_t(info.markerIndex)].name == text) return false;
+            (*list)[size_t(info.markerIndex)].name = text;
             return true;
         }
         Clip* c = edit::clipById(s, info.clip);

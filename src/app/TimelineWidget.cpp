@@ -644,6 +644,21 @@ void TimelineWidget::paintClip(QPainter& p, const Row& row, const Clip& c, const
             p.drawPolygon(d);
         }
     }
+    // Clip markers: small flags hanging from the top edge, where the clip shows their moment.
+    for (const Marker& m : c.markers) {
+        const FrameTime f = c.markerFrame(m);
+        if (f < 0) continue;
+        const int x = xForFrame(f);
+        QColor col = theme::labelColor(m.color);
+        if (!col.isValid()) col = m.chapter ? QColor(255, 149, 0) : QColor(126, 211, 33);
+        QPolygon flag;
+        flag << QPoint(x - 4, r.top() + 1) << QPoint(x + 4, r.top() + 1) << QPoint(x + 4, r.top() + 5) << QPoint(x, r.top() + 9)
+             << QPoint(x - 4, r.top() + 5);
+        p.setPen(QPen(QColor(0, 0, 0, 150), 1));
+        p.setBrush(col);
+        p.drawPolygon(flag);
+        if (m.duration > 0) p.fillRect(QRect(x, r.top() + 1, std::max(1, xForFrame(f + m.duration) - x), 2), col);
+    }
     p.restore();
     if (sel) {
         p.setPen(QPen(theme::kSelection, 2));

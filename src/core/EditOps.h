@@ -161,6 +161,11 @@ TrackRef addTrack(Project& p, Sequence& s, TrackKind kind);
 Result removeTrack(Sequence& s, TrackRef t);
 void addMarker(Sequence& s, Marker m);
 bool removeMarkerAt(Sequence& s, FrameTime frame);
+// A clip marker on clip `id` at timeline frame `at`, on the moment of the clip's source shown there (replacing one
+// already on that moment). False if the clip does not cover `at`.
+bool addClipMarker(Sequence& s, Id id, FrameTime at, Marker m);
+// Removes the clip's markers shown at timeline frame `at`.
+bool removeClipMarkerAt(Sequence& s, Id id, FrameTime at);
 
 // ---- Snapping & navigation -------------------------------------------------------------
 std::vector<FrameTime> snapPoints(const Sequence& s, const std::vector<Id>& exclude, bool includePlayhead = true);

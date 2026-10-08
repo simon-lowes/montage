@@ -146,6 +146,18 @@ QString otioColor(int label) {
     return colors[std::clamp(label, 0, 11)];
 }
 
+QJsonObject otioMarker(const Marker& m, double rate) {
+    // OTIO's colour names are coarser than Montage's labels: the label rides along in Montage's metadata.
+    QJsonObject own;
+    if (m.chapter) own["chapter"] = true;
+    if (m.color) own["color"] = m.color;
+    QJsonObject meta;
+    if (!own.isEmpty()) meta["montage"] = own;
+    return QJsonObject{{"OTIO_SCHEMA", "Marker.2"}, {"name", QString::fromStdString(m.name)},
+                       {"comment", QString::fromStdString(m.comment)}, {"color", otioColor(m.color)},
+                       {"marked_range", range(double(m.t), double(m.duration), rate)}, {"metadata", meta}};
+}
+
 QJsonObject clipJson(const Project& p, const Sequence& s, const Clip& c) {
     const double rate = s.fpsValue();
     QJsonObject o = item("Clip.2", QString::fromStdString(c.name));
@@ -168,6 +180,12 @@ QJsonObject clipJson(const Project& p, const Sequence& s, const Clip& c) {
         else ref["available_range"] = QJsonValue();
     } else {
         ref = QJsonObject{{"OTIO_SCHEMA", "MissingReference.1"}, {"name", ""}, {"metadata", QJsonObject()}, {"available_range", QJsonValue()}};
+    }
+    // Clip markers are in the clip's source time, as OTIO keeps them.
+    if (!c.markers.empty()) {
+        QJsonArray mk;
+        for (const Marker& m : c.markers) mk.append(otioMarker(m, rate));
+        o["markers"] = mk;
     }
     o["media_references"] = QJsonObject{{"DEFAULT_MEDIA", ref}};
     o["active_media_reference_key"] = "DEFAULT_MEDIA";
@@ -227,10 +245,7 @@ std::string exportOtio(const Project& p, const Sequence& sequence) {
     for (const auto& t : s.videoTracks) tracks.append(trackJson(p, s, t));
     for (const auto& t : s.audioTracks) tracks.append(trackJson(p, s, t));
     QJsonArray markers;
-    for (const auto& m : s.markers)
-        markers.append(QJsonObject{{"OTIO_SCHEMA", "Marker.2"}, {"name", QString::fromStdString(m.name)},
-                                   {"comment", QString::fromStdString(m.comment)}, {"color", otioColor(m.color)},
-                                   {"marked_range", range(double(m.t), double(m.duration), rate)}, {"metadata", QJsonObject()}});
+    for (const auto& m : s.markers) markers.append(otioMarker(m, rate));
     QJsonObject stack = item("Stack.1", "tracks");
     stack["children"] = tracks;
     stack["markers"] = markers;

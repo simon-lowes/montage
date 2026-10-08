@@ -2355,6 +2355,72 @@ private slots:
         QCOMPARE(back.active()->audioTracks.at(1).automation, int(AutomationMode::Read));
     }
 
+    void clipMarkers() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = Rational{30, 1};
+        Clip c = makeGeneratorClip(p, "color", 100);
+        c.start = 50;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, c);
+        const Id id = s.videoTracks[0].clips.front().id;
+        auto clip = [&]() -> Clip& { return *edit::clipById(s, id); };
+        // On the moment of the source shown at frame 80: 30 frames into the clip.
+        QVERIFY(edit::addClipMarker(s, id, 80, Marker{0, 0, "Look", "", 0}));
+        QVERIFY(!edit::addClipMarker(s, id, 10, Marker{}));  // not on the clip
+        QCOMPARE(clip().markers.size(), size_t(1));
+        QCOMPARE(clip().markers[0].t, FrameTime(30));
+        QCOMPARE(clip().markerFrame(clip().markers[0]), FrameTime(80));
+        // It travels with the clip, stays on its moment through a head trim, and hides when trimmed off.
+        clip().start = 200;
+        QCOMPARE(clip().markerFrame(clip().markers[0]), FrameTime(230));
+        clip().sourceIn = 10, clip().start = 210, clip().duration = 90;
+        QCOMPARE(clip().markerFrame(clip().markers[0]), FrameTime(230));
+        clip().sourceIn = 40, clip().start = 240, clip().duration = 60;
+        QCOMPARE(clip().markerFrame(clip().markers[0]), FrameTime(-1));
+        // Speed and reverse.
+        clip().sourceIn = 0, clip().start = 0, clip().duration = 50, clip().speed = 2;
+        QCOMPARE(clip().markerFrame(clip().markers[0]), FrameTime(15));
+        clip().speed = 1, clip().duration = 100, clip().reverse = true;
+        QCOMPARE(clip().markerFrame(clip().markers[0]), FrameTime(69));
+        clip().reverse = false;
+        // A split: both halves keep it, only the half showing its moment shows it.
+        QVERIFY(edit::razor(p, s, {TrackKind::Video, 0}, 20).ok);
+        const auto& halves = s.videoTracks[0].clips;
+        QCOMPARE(halves.size(), size_t(2));
+        QCOMPARE(halves[0].markerFrame(halves[0].markers.at(0)), FrameTime(-1));
+        QCOMPARE(halves[1].markerFrame(halves[1].markers.at(0)), FrameTime(30));
+        // Removed where it shows; a second one at the same moment replaces the first.
+        const Id second = halves[1].id;
+        QVERIFY(edit::addClipMarker(s, second, 30, Marker{0, 0, "Again", "", 3}));
+        QCOMPARE(edit::clipById(s, second)->markers.size(), size_t(1));
+        QCOMPARE(QString::fromStdString(edit::clipById(s, second)->markers[0].name), QString("Again"));
+        QVERIFY(edit::addClipMarker(s, second, 40, Marker{0, 5, "Chorus", "a note", 0, true}));
+        QVERIFY(!edit::removeClipMarkerAt(s, second, 41));
+        // Saved with the project.
+        Project back;
+        QVERIFY(projectFromJson(projectToJson(p), back));
+        QCOMPARE(back.active()->videoTracks[0].clips[1].markers, edit::clipById(s, second)->markers);
+        // OpenTimelineIO keeps them on the clip (and chapter markers as chapters).
+        s.markers.push_back(Marker{5, 0, "Part 1", "", 0, true});
+        Project otio = makeDefaultProject();
+        const ImportResult r = importOtio(otio, exportOtio(p, s));
+        QVERIFY2(r.ok, r.error.c_str());
+        const Sequence& imported = *otio.active();
+        QCOMPARE(imported.videoTracks.at(0).clips.at(1).markers, edit::clipById(s, second)->markers);
+        QVERIFY(imported.markers.at(0).chapter);
+        // FCPXML: clip markers inside their clip, chapter markers as chapter-marker, read back as chapters.
+        const std::string fcpx = exportFcpXml(p, s);
+        QVERIFY(fcpx.find("<chapter-marker") != std::string::npos);
+        QVERIFY(fcpx.find("value=\"Again\"") != std::string::npos);
+        Project fromXml = makeDefaultProject();
+        const ImportResult rx = importXmlTimeline(fromXml, fcpx);
+        QVERIFY2(rx.ok, rx.error.c_str());
+        const auto& xm = fromXml.active()->markers;
+        QVERIFY(std::any_of(xm.begin(), xm.end(), [](const Marker& m) { return m.chapter && m.name == "Part 1" && m.t == 5; }));
+        QVERIFY(edit::removeClipMarkerAt(s, second, 40));
+        QCOMPARE(edit::clipById(s, second)->markers.size(), size_t(1));
+    }
+
     void chapterMarkers() {
         Project p = makeDefaultProject();
         Sequence& s = *p.active();

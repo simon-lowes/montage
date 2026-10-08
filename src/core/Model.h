@@ -155,6 +155,17 @@ struct SmartBin {
 
 enum class TrackKind { Video, Audio };
 
+// A sequence marker (t in timeline frames) or a clip marker (Clip::markers: t in the clip's source frames).
+struct Marker {
+    FrameTime t = 0;
+    FrameTime duration = 0;
+    std::string name;
+    std::string comment;
+    int color = 0;
+    bool chapter = false;  // a chapter marker: a chapter in exported MP4 / MOV / MKV files and YouTube's list
+    bool operator==(const Marker&) const = default;
+};
+
 struct Clip {
     Id id = 0;
     Id mediaId = 0;              // 0 for generator clips (titles, colour mattes...)
@@ -195,6 +206,11 @@ struct Clip {
     double sourceOffset(double local) const;
     // The clip-local time showing source position `source` (sequence frames).
     double localForSource(double source) const;
+    // Clip markers (Premiere's and Final Cut's): on the clip's source, in source frames like sourceIn, so they stay
+    // on the same moment of the media through moves, trims and splits. Shown where that moment is in the clip.
+    std::vector<Marker> markers;
+    // Where marker m falls on the timeline, or -1 when the clip does not show that moment.
+    FrameTime markerFrame(const Marker& m) const;
     bool operator==(const Clip&) const = default;
 };
 
@@ -256,16 +272,6 @@ struct Bus {
     bool muted = false;
     SurroundPan surround;
     bool operator==(const Bus&) const = default;
-};
-
-struct Marker {
-    FrameTime t = 0;
-    FrameTime duration = 0;
-    std::string name;
-    std::string comment;
-    int color = 0;
-    bool chapter = false;  // a chapter marker: a chapter in exported MP4 / MOV / MKV files and YouTube's list
-    bool operator==(const Marker&) const = default;
 };
 
 struct Sequence {

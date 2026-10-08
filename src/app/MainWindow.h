@@ -140,6 +140,7 @@ private:
     void matchFrame();
     void addMarker();
     void addChapterMarker();
+    void addClipMarker();
     void jumpMarker(bool forward);
     void markClip();
     void detectScenes();

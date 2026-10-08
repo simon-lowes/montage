@@ -658,6 +658,9 @@ struct FcpxWriter {
         for (const Connected& k : connected) clip(*k.clip, k.lane, k.offset, false);
         for (const Marker& m : markersIn(c.start, c.end()))
             marker(m, (c.isGenerator() ? 0 : c.sourceIn) + double(m.t - c.start) * c.speed);
+        // Clip markers are already in the clip's own (source) time.
+        for (const Marker& m : c.markers)
+            if (c.markerFrame(m) >= 0) markerElement(m, double(m.t));
         w.writeEndElement();
     }
 
@@ -669,11 +672,16 @@ struct FcpxWriter {
     }
     void marker(const Marker& m, double local) {
         writtenMarkers.insert(m.t);
-        w.writeEmptyElement("marker");
+        markerElement(m, local);
+    }
+    // Chapter markers are FCPXML's own chapter-marker (with a poster frame at their start).
+    void markerElement(const Marker& m, double local) {
+        w.writeEmptyElement(m.chapter ? "chapter-marker" : "marker");
         w.writeAttribute("start", t(local));
         w.writeAttribute("duration", t(double(std::max<FrameTime>(1, m.duration))));
         w.writeAttribute("value", q(m.name));
         if (!m.comment.empty()) w.writeAttribute("note", q(m.comment));
+        if (m.chapter) w.writeAttribute("posterOffset", "0s");
     }
     std::set<FrameTime> writtenMarkers;
 
@@ -911,13 +919,15 @@ struct FcpxReader {
             // Lane n > 0 is V(n + 1); lane -n is A(n + 1) (A1 carries the storyline's own sound).
             element(k, kAt, l > 0 ? l : -1, l < 0 ? -l : -1, ignore, none);
         }
-        for (QDomElement m = e.firstChildElement("marker"); !m.isNull(); m = m.nextSiblingElement("marker")) {
-            Marker mk;
-            mk.t = frames(at + parseFcpTime(m.attribute("start")) - start);
-            mk.name = m.attribute("value").toStdString();
-            mk.comment = m.attribute("note").toStdString();
-            b.sequence().markers.push_back(mk);
-        }
+        for (const char* tag : {"marker", "chapter-marker"})
+            for (QDomElement m = e.firstChildElement(tag); !m.isNull(); m = m.nextSiblingElement(tag)) {
+                Marker mk;
+                mk.t = frames(at + parseFcpTime(m.attribute("start")) - start);
+                mk.name = m.attribute("value").toStdString();
+                mk.comment = m.attribute("note").toStdString();
+                mk.chapter = QLatin1String(tag) == QLatin1String("chapter-marker");
+                b.sequence().markers.push_back(mk);
+            }
     }
     static int lane(const QDomElement& e) { return e.attribute("lane", "0").toInt(); }
 };

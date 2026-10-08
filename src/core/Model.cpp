@@ -181,6 +181,12 @@ double Clip::sourceAt(double local) const {
 
 double Clip::sourceFrameAt(FrameTime t) const { return sourceAt(double(t - start)); }
 
+FrameTime Clip::markerFrame(const Marker& m) const {
+    const double local = localForSource(double(m.t));
+    const FrameTime f = FrameTime(std::llround(local));
+    return f >= 0 && f < duration ? start + f : -1;
+}
+
 double Clip::localForSource(double source) const {
     if (reverse) return double(duration - 1) - (source - sourceIn) / speed;
     const double want = source - sourceIn;
