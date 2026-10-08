@@ -60,8 +60,11 @@ std::vector<Id> usedMedia(const Project& p, const std::vector<Id>& sequences) {
     for (Id sid : keptSequences(p, sequences)) {
         const Sequence* s = p.findSequence(sid);
         for (TrackRef r : allTracks(*s))
-            for (const Clip& c : trackAt(*s, r)->clips)
+            for (const Clip& c : trackAt(*s, r)->clips) {
                 if (c.mediaId && p.findMedia(c.mediaId)) used.insert(c.mediaId);
+                for (const Take& t : c.takes)  // an audition's other takes
+                    if (p.findMedia(t.mediaId)) used.insert(t.mediaId);
+            }
     }
     return {used.begin(), used.end()};
 }
@@ -115,7 +118,13 @@ bool consolidateProject(const Project& p, const ConsolidateOptions& o, Consolida
                     first = std::min({first, a, b});
                     last = std::max({last, a, b});
                 }
-        const bool trimHere = o.trim && m.kind == MediaKind::Video && m.hasVideo && last > first;
+        // A take of an audition is copied whole: its clip may be trimmed to any part of it.
+        bool aTake = false;
+        for (const Sequence& s : q.sequences)
+            for (TrackRef r : allTracks(s))
+                for (const Clip& c : trackAt(s, r)->clips)
+                    for (size_t k = 0; k < c.takes.size(); ++k) aTake |= int(k) != c.take && c.takes[k].mediaId == m.id;
+        const bool trimHere = o.trim && m.kind == MediaKind::Video && m.hasVideo && last > first && !aTake;
         if (trimHere) {
             const double from = std::max(0.0, first - o.handles), to = m.duration > 0 ? std::min(m.duration, last + o.handles) : last + o.handles;
             const bool prores = o.codec != "libx264";

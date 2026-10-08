@@ -2506,6 +2506,80 @@ private slots:
         QCOMPARE(int(std::count_if(back.active()->markers.begin(), back.active()->markers.end(), [](const Marker& m) { return m.chapter; })), 4);
     }
 
+    void auditions() {
+        // The clip plays the fixture's media from 10; take B (picture and sound) and C (sound only) are other files.
+        Fixture fx;
+        auto media = [&](const char* name, bool video) {
+            MediaItem m = *fx.p.findMedia(fx.media);
+            m.id = fx.p.newId();
+            m.name = name;
+            m.path = std::string("/nonexistent/") + name;
+            m.hasVideo = video;
+            if (!video) m.kind = MediaKind::Audio;
+            fx.p.media.push_back(m);
+            return m.id;
+        };
+        const Id b = media("take2.mov", true), c = media("music.wav", false);
+        QVERIFY(placeMedia(fx.p, fx.s(), fx.media, 20, 10, 70, V1, A1, false).ok);
+        const Id clip = fx.v1().clips[0].id, sound = fx.a1().clips[0].id;
+        clipById(fx.s(), clip)->effects.push_back(makeEffect("brightness_contrast", fx.p.newId()));
+
+        // Takes need pictures on a video track; titles have none.
+        QVERIFY(!addTakes(fx.p, fx.s(), clip, {{c, 0.0}}).ok);
+        QVERIFY(!pickTake(fx.p, fx.s(), clip, 1).ok);  // not an audition yet
+        Result r = addTakes(fx.p, fx.s(), clip, {{b, 50.0}});
+        QVERIFY2(r.ok, r.error.c_str());
+        Clip* a = clipById(fx.s(), clip);
+        QCOMPARE(a->takes.size(), size_t(2));
+        QCOMPARE(a->takes[0].mediaId, fx.media);
+        QCOMPARE(a->takes[1].offset, 40.0);
+        QCOMPARE(a->take, 0);
+
+        // Picking B plays it from 50 in the same place, with the same effect; the linked sound follows.
+        QVERIFY(pickTake(fx.p, fx.s(), clip, 1).ok);
+        a = clipById(fx.s(), clip);
+        QCOMPARE(a->mediaId, b);
+        QCOMPARE(a->sourceIn, 50.0);
+        QCOMPARE(a->start, FrameTime(20));
+        QCOMPARE(a->duration, FrameTime(60));
+        QCOMPARE(a->name, std::string("take2.mov"));
+        QCOMPARE(a->effects.size(), size_t(1));
+        QCOMPARE(clipById(fx.s(), sound)->mediaId, b);
+        QCOMPARE(clipById(fx.s(), sound)->sourceIn, 50.0);
+        QCOMPARE(a->takes[0].offset, -40.0);
+
+        // A trimmed head carries the takes along: the first take now starts 5 frames later too.
+        QVERIFY(trim(fx.p, fx.s(), clip, Edge::In, 5, TrimMode::Normal, false).ok);
+        QCOMPARE(clipById(fx.s(), clip)->sourceIn, 55.0);
+        QVERIFY(cycleTake(fx.p, fx.s(), clip, 1).ok);  // round to the first
+        a = clipById(fx.s(), clip);
+        QCOMPARE(a->mediaId, fx.media);
+        QCOMPARE(a->sourceIn, 15.0);
+        QCOMPARE(a->take, 0);
+        QCOMPARE(a->name, std::string("clip.mov"));
+        QVERIFY(cycleTake(fx.p, fx.s(), clip, -1).ok);
+        QCOMPARE(clipById(fx.s(), clip)->take, 1);
+
+        // Split, both halves stay auditions with their own place in each take.
+        const Id right = splitClip(fx.p, fx.v1(), 0, 50);
+        QVERIFY(right);
+        QCOMPARE(clipById(fx.s(), right)->takes.size(), size_t(2));
+        QVERIFY(pickTake(fx.p, fx.s(), right, 0).ok);
+        QCOMPARE(clipById(fx.s(), right)->sourceIn, 15.0 + 25.0);
+
+        // Saved and read back.
+        Project back;
+        QVERIFY(projectFromJson(projectToJson(fx.p), back));
+        QCOMPARE(clipById(*back.active(), clip)->takes, clipById(fx.s(), clip)->takes);
+        QCOMPARE(clipById(*back.active(), clip)->take, 1);
+
+        // Finalized, the pick stays and the rest go.
+        QVERIFY(finalizeAudition(fx.p, fx.s(), clip).ok);
+        QVERIFY(clipById(fx.s(), clip)->takes.empty());
+        QCOMPARE(clipById(fx.s(), clip)->mediaId, b);
+        QVERIFY(!cycleTake(fx.p, fx.s(), clip, 1).ok);
+    }
+
     void swapClips() {
         // A (picture and sound), B (picture and sound), C (picture): A and B change places.
         Fixture fx;

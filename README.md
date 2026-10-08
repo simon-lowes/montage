@@ -18,6 +18,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Three-point editing from the Source monitor (I / O marks, `,` insert, `.` overwrite, drag from the viewer)
 - **Source monitor waveform** (as Premiere 26.2 shows): a clip with sound shows its audio waveform on the Source monitor's scrub bar, so a line or a beat can be marked by eye
 - **Record Voiceover** (Sequence menu, Ctrl+Alt+R): record from any audio input onto an audio track where the playhead is, with a level meter and a 3-second countdown, while the picture plays along. Punch In records from In to Out and stops by itself. Each take is saved as a WAV in a Voiceover folder beside the project, filed in the media bin and placed on the track as one undo step.
+- **Auditions** (Final Cut's auditions, Resolve's take selector; Clip › Audition): select a clip and the alternative takes in the Media bin (or one in the Source monitor from its In) and choose Add Selected Media as Takes (Ctrl+Alt+Y). Ctrl+Alt+Right and Left then try each take in the clip's place, keeping its length, effects and keyframes, with linked sound following; the clip shows "take 2/3". Trims and splits carry the takes along. Finalize Audition keeps the pick. Saved with the project; Project Manager keeps every take's media. MCP `montage_audition`.
 - Ripple Trim Previous / Next Edit to Playhead (Q / W), Select Clips After Playhead (A, Shift+A on the target track), Replace with Source Clip, Fit to Fill, Add Frame Hold (Shift+F; Time Remapping can also go to 0 % to hold mid-ramp), and Swap with Previous / Next Clip (Ctrl+Shift+, and Ctrl+Shift+.; like Resolve's swap and Final Cut 12.3's reorder: a clip and its neighbour change places with their linked sound, and a dissolve between them moves to the new edit; MCP `montage_swap_clip`)
 - Paste Attributes (Ctrl+Alt+V) and Remove Attributes: motion, opacity and blend, Time Remapping, volume and effects, keyframes included
 - Synchronise clips from separate cameras and recorders by audio waveform (cross-correlation, sub-frame accurate)
@@ -372,6 +373,7 @@ Its tools work on `.montage` files by path. Each edit is saved at once, and the 
 - export and import marker lists (CSV, Avid locators, Resolve EDL);
 - copy a project with its media to a new folder, whole or consolidated to the parts used;
 - list offline media and relink it, by searching a folder or file by file (Replace Footage too);
+- hold alternative takes on a clip (auditions), try them in place and keep one;
 - transcribe (with speaker labels), translate caption tracks, dub them into English, find spoken phrases in the cut, cut by transcript (phrases, filler words, retakes, long pauses, optionally with Smooth Cuts), and build a cut from a script;
 - find shots by description, and find, name and join the people in the footage;
 - generate voiceovers from text or from a caption track;

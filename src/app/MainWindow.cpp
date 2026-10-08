@@ -770,6 +770,12 @@ void MainWindow::buildMenus() {
     add(clipM, tr("Add Frame &Hold"), QKeySequence("Shift+F"), [this] { addFrameHold(); })->setObjectName(QStringLiteral("addFrameHold"));
     add(clipM, tr("Swap with Previous Clip"), QKeySequence("Ctrl+Shift+,"), [this] { swapClip(false); })->setObjectName(QStringLiteral("swapPrevious"));
     add(clipM, tr("Swap with Next Clip"), QKeySequence("Ctrl+Shift+."), [this] { swapClip(true); })->setObjectName(QStringLiteral("swapNext"));
+    QMenu* auditionM = clipM->addMenu(tr("Audition"));
+    add(auditionM, tr("Add Selected Media as Takes"), QKeySequence("Ctrl+Alt+Y"), [this] { addTakesFromBin(); })
+        ->setObjectName(QStringLiteral("addTakes"));
+    add(auditionM, tr("Next Take"), QKeySequence("Ctrl+Alt+Right"), [this] { cycleTake(1); })->setObjectName(QStringLiteral("nextTake"));
+    add(auditionM, tr("Previous Take"), QKeySequence("Ctrl+Alt+Left"), [this] { cycleTake(-1); })->setObjectName(QStringLiteral("previousTake"));
+    add(auditionM, tr("Finalize Audition"), QKeySequence(), [this] { finalizeAudition(); })->setObjectName(QStringLiteral("finalizeAudition"));
     add(clipM, tr("Replace with Source Clip"), QKeySequence(), [this] { replaceWithSource(); })
         ->setObjectName(QStringLiteral("replaceWithSource"));
     add(clipM, tr("Fit to Fill"), QKeySequence(), [this] { fitToFill(); })->setObjectName(QStringLiteral("fitToFill"));
@@ -2142,6 +2148,68 @@ bool MainWindow::runProjectManager(const ConsolidateOptions& o) {
     if (!res.missing.empty()) text += tr(", %n missing", nullptr, int(res.missing.size()));
     statusBar()->showMessage(text, 10000);
     return true;
+}
+
+namespace {
+// The clip an audition command acts on: the selected one, else the video clip under the playhead.
+const Clip* auditionClip(const EditorState* state, const Clip* underPlayhead) {
+    const Sequence* s = state->sequence();
+    if (!s) return nullptr;
+    for (Id id : state->selectedClips())
+        if (const Clip* c = edit::clipById(*s, id); c && !c->isGenerator()) return c;
+    return underPlayhead;
+}
+}  // namespace
+
+int MainWindow::addTakesFromBin() {
+    const Clip* c = auditionClip(state_, clipForCommand());
+    const Sequence* s = state_->sequence();
+    if (!c || !s) {
+        state_->message(tr("Select the clip to add takes to"));
+        return 0;
+    }
+    std::vector<Id> ids = bin_->selectedMedia();
+    if (ids.empty() && state_->sourceMedia()) ids.push_back(state_->sourceMedia());
+    std::vector<std::pair<Id, double>> media;
+    const double fps = s->fpsValue();
+    for (Id id : ids) {
+        const MediaItem* m = state_->project().findMedia(id);
+        if (!m) continue;
+        if (m->subclipOf) media.push_back({m->subclipOf, m->subclipIn * fps});
+        else if (id == state_->sourceMedia() && state_->sourceIn() >= 0) media.push_back({id, double(state_->sourceIn())});
+        else media.push_back({id, 0.0});
+    }
+    if (media.empty()) {
+        state_->message(tr("Select the takes in the Media bin, or open one in the Source monitor"));
+        return 0;
+    }
+    const Id clip = c->id;
+    if (!state_->apply(tr("Add Takes"), [clip, media](Project& p, Sequence& sq) { return edit::addTakes(p, sq, clip, media); }))
+        return 0;
+    const Clip* after = edit::clipById(*state_->sequence(), clip);
+    state_->message(tr("Audition: %n take(s) — Ctrl+Alt+Right and Left try them in place", "", after ? int(after->takes.size()) : 0), 5000);
+    return int(media.size());
+}
+
+bool MainWindow::cycleTake(int step) {
+    const Clip* c = auditionClip(state_, clipForCommand());
+    if (!c || c->takes.empty()) {
+        state_->message(tr("Select an audition (a clip with takes) to try its takes"));
+        return false;
+    }
+    const Id clip = c->id;
+    return state_->apply(step > 0 ? tr("Next Take") : tr("Previous Take"),
+                         [clip, step](Project& p, Sequence& s) { return edit::cycleTake(p, s, clip, step); });
+}
+
+bool MainWindow::finalizeAudition() {
+    const Clip* c = auditionClip(state_, clipForCommand());
+    if (!c || c->takes.empty()) {
+        state_->message(tr("Select an audition (a clip with takes) to finalize"));
+        return false;
+    }
+    const Id clip = c->id;
+    return state_->apply(tr("Finalize Audition"), [clip](Project& p, Sequence& s) { return edit::finalizeAudition(p, s, clip); });
 }
 
 const Clip* MainWindow::clipForCommand() const {

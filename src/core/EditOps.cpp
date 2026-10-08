@@ -1524,4 +1524,70 @@ Result makeCompound(Project& p, Sequence& s, const std::vector<Id>& ids, const s
     return placeMedia(p, sq, m.id, lo, 0, double(hi - lo), {TrackKind::Video, vIdx}, {TrackKind::Audio, aIdx}, false);
 }
 
+// ---- Auditions -----------------------------------------------------------------
+
+Result addTakes(Project& p, Sequence& s, Id clipId, const std::vector<std::pair<Id, double>>& media) {
+    const auto loc = locate(s, clipId);
+    Clip* c = clipById(s, clipId);
+    if (!loc || !c) return Result::fail("No such clip");
+    if (c->isGenerator() || !c->mediaId) return Result::fail("Titles and generators have no takes");
+    const bool video = loc->track.kind == TrackKind::Video;
+    std::vector<Take> added;
+    for (const auto& [id, in] : media) {
+        const MediaItem* m = p.findMedia(id);
+        if (!m || m->kind == MediaKind::Sequence) return Result::fail("Takes are media files");
+        if (video ? !(m->hasVideo || m->kind == MediaKind::Image) : !m->hasAudio)
+            return Result::fail(video ? m->name + " has no picture" : m->name + " has no sound");
+        added.push_back({id, in - c->sourceIn, m->name});
+    }
+    if (added.empty()) return Result::fail("No media to add as takes");
+    if (c->takes.empty()) {
+        const MediaItem* own = p.findMedia(c->mediaId);
+        c->takes.push_back({c->mediaId, 0, c->name.empty() && own ? own->name : c->name});
+        c->take = 0;
+    }
+    c->takes.insert(c->takes.end(), added.begin(), added.end());
+    return {};
+}
+
+Result pickTake(Project& p, Sequence& s, Id clipId, int index) {
+    Clip* c = clipById(s, clipId);
+    if (!c || c->takes.empty()) return Result::fail("That clip is not an audition");
+    if (index < 0 || index >= int(c->takes.size())) return Result::fail("No such take");
+    if (index == c->take) return {};
+    if (!p.findMedia(c->takes[size_t(index)].mediaId)) return Result::fail("That take's media is no longer in the project");
+    // Re-based on the new pick: every take's offset from the clip's new in-point.
+    const Take next = c->takes[size_t(index)];
+    const Id was = c->mediaId;
+    c->takes[size_t(c->take)].name = c->name;  // a rename stays with its take
+    for (Take& t : c->takes) t.offset -= next.offset;
+    for (Id id : linkedClips(s, clipId)) {
+        Clip* l = clipById(s, id);
+        if (l && id != clipId && l->mediaId == was && l->takes.empty()) {
+            l->mediaId = next.mediaId;
+            l->sourceIn += next.offset;
+        }
+    }
+    c->mediaId = next.mediaId;
+    c->sourceIn += next.offset;
+    c->name = next.name;
+    c->take = index;
+    return {};
+}
+
+Result cycleTake(Project& p, Sequence& s, Id clipId, int step) {
+    const Clip* c = clipById(s, clipId);
+    if (!c || c->takes.empty()) return Result::fail("That clip is not an audition");
+    const int n = int(c->takes.size());
+    return pickTake(p, s, clipId, ((c->take + step) % n + n) % n);
+}
+
+Result finalizeAudition(Project&, Sequence& s, Id clipId) {
+    Clip* c = clipById(s, clipId);
+    if (!c || c->takes.empty()) return Result::fail("That clip is not an audition");
+    c->takes.clear();
+    c->take = 0;
+    return {};
+}
+
 }  // namespace montage::edit

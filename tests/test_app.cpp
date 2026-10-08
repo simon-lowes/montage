@@ -2064,6 +2064,66 @@ private slots:
         state()->newProject();
     }
 
+    void auditionsFromTheBin() {
+        // Two takes of a shot: the first in the cut, the second added from the bin as a take.
+        QStringList files;
+        for (int k = 0; k < 2; ++k) {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 160;
+            gs.height = 90;
+            Clip c = makeGeneratorClip(gen, "color", 40);
+            c.generator.params["color.r"] = Param(k ? 0.0 : 0.9);
+            c.generator.params["color.b"] = Param(k ? 0.9 : 0.0);
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, c);
+            ExportSettings st;
+            st.path = (dir_.path() + QString("/aud%1.mp4").arg(k + 1)).toStdString();
+            st.audioCodec = "none";
+            st.preset = "ultrafast";
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+            files << QString::fromStdString(st.path);
+        }
+        state()->newProject();
+        const auto ids = state()->importFiles(files);
+        QCOMPARE(ids.size(), size_t(2));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        const Id clip = state()->sequence()->videoTracks[0].clips[0].id;
+        auto* bin = win_->findChild<MediaBinWidget*>();
+        auto* add = win_->findChild<QAction*>("addTakes");
+        auto* next = win_->findChild<QAction*>("nextTake");
+        QVERIFY(add && next && win_->findChild<QAction*>("previousTake") && win_->findChild<QAction*>("finalizeAudition"));
+        QCOMPARE(next->shortcut(), QKeySequence("Ctrl+Alt+Right"));
+        QVERIFY(!win_->cycleTake(1));  // not an audition yet
+        state()->setSelection({clip});
+        bin->selectMedia({ids[1]});
+        add->trigger();
+        const Clip* c = edit::clipById(*state()->sequence(), clip);
+        QCOMPARE(c->takes.size(), size_t(2));
+        // The next take plays in its place, red giving way to blue, as one undo step.
+        auto centre = [&]() {
+            const Image img = renderSequenceFrame(state()->project(), *state()->sequence(), 10, {});
+            const size_t i = (size_t(img.height / 2) * size_t(img.width) + size_t(img.width / 2)) * 4;
+            return std::make_pair(img.px[i], img.px[i + 2]);
+        };
+        QVERIFY(centre().first > 0.5f);
+        next->trigger();
+        c = edit::clipById(*state()->sequence(), clip);
+        QCOMPARE(c->mediaId, ids[1]);
+        QCOMPARE(c->take, 1);
+        QVERIFY(centre().second > 0.5f && centre().first < 0.2f);
+        state()->undo();
+        QCOMPARE(edit::clipById(*state()->sequence(), clip)->mediaId, ids[0]);
+        state()->redo();
+        QVERIFY(win_->finalizeAudition());
+        c = edit::clipById(*state()->sequence(), clip);
+        QVERIFY(c->takes.empty());
+        QCOMPARE(c->mediaId, ids[1]);
+        state()->newProject();
+    }
+
     void linkMediaOnOpen() {
         // A project whose card has moved since it was saved.
         const QString root = dir_.path() + "/link";

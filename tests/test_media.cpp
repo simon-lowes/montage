@@ -5571,6 +5571,37 @@ private slots:
             QVERIFY(tool("montage_add_marker", QJsonObject{{"project", project}, {"at", 9999}, {"clip", double(first.id)}}).value("isError").toBool());
             QVERIFY(!tool("montage_undo", QJsonObject{{"project", project}}).value("isError").toBool());
         }
+        {
+            // An audition on the first clip: a take added, picked, listed and kept (the project put back after).
+            const QString saved = project + ".before-audition";
+            QVERIFY(QFile::copy(project, saved));
+            Project info;
+            QVERIFY(loadProject(project.toStdString(), info));
+            const Clip* first = nullptr;
+            for (const Track& t : info.active()->videoTracks)
+                for (const Clip& c : t.clips)
+                    if (!first && c.mediaId) first = &c;
+            QVERIFY(first);
+            const MediaItem* fm = info.findMedia(first->mediaId);
+            const QJsonObject clipArgs{{"project", project}, {"clip", double(first->id)}};
+            QJsonObject args = clipArgs;
+            args["add"] = QJsonArray{QString::fromStdString(fm->path)};
+            args["in"] = 0.1;
+            r = tool("montage_audition", args);
+            QVERIFY2(!r.value("isError").toBool() && text(r).contains("Take 1 of 2"), qPrintable(text(r)));
+            args = clipArgs;
+            args["pick"] = "next";
+            r = tool("montage_audition", args);
+            QVERIFY2(!r.value("isError").toBool() && text(r).contains("Take 2 of 2"), qPrintable(text(r)));
+            args["pick"] = 5;
+            QVERIFY(tool("montage_audition", args).value("isError").toBool());
+            args = clipArgs;
+            args["finalize"] = true;
+            r = tool("montage_audition", args);
+            QVERIFY2(!r.value("isError").toBool() && text(r).contains("no other takes"), qPrintable(text(r)));
+            QVERIFY(text(tool("montage_audition", clipArgs)).contains("no takes"));
+            QVERIFY(QFile::remove(project) && QFile::rename(saved, project));
+        }
         // A copy of the project with its media in a new folder.
         r = tool("montage_consolidate", QJsonObject{{"project", project}, {"folder", QString::fromStdString(path("mcp-copy"))}, {"name", "Copy"}});
         QVERIFY2(!r.value("isError").toBool() && text(r).contains("Wrote"), qPrintable(text(r)));

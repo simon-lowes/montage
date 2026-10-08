@@ -119,6 +119,12 @@ public:
     bool trimSelectedEdit(FrameTime delta);
     void endTrimMode();
     const std::optional<TrimEdit>& trimEdit() const { return trimEdit_; }
+    // Auditions (Final Cut's auditions, Resolve's take selector): the bin's selected media (else the Source monitor's,
+    // from its In) added as takes of the selected clip (else the video clip under the playhead); then the next or
+    // previous take tried in its place, or the pick kept. Each one undo step.
+    int addTakesFromBin();  // how many takes were added
+    bool cycleTake(int step);
+    bool finalizeAudition();
     bool swapClip(bool withNext);                     // the selected clip (or the one under the playhead) with its neighbour
     bool replaceWithSource();                         // the selected clip, or the one under the playhead
     bool fitToFill();

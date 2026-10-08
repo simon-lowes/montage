@@ -144,6 +144,16 @@ Result fitToFill(Project& p, Sequence& s, Id mediaId, double srcIn, double srcOu
 // edges are removed.
 Result swapClip(Project& p, Sequence& s, Id clipId, bool withNext);
 
+// ---- Auditions (Final Cut's auditions, Resolve's take selector) ----------------
+// Adds media as alternative takes of a clip, each from a source in-point (sequence frames), the clip staying the
+// pick. Takes must have what the track plays (pictures on a video track, sound on an audio track).
+Result addTakes(Project& p, Sequence& s, Id clipId, const std::vector<std::pair<Id, double>>& media);
+// Makes take `index` the pick: the clip plays it in the same place, keeping its length, effects and keyframes; clips
+// linked to it that play the same media (its sound) follow.
+Result pickTake(Project& p, Sequence& s, Id clipId, int index);
+Result cycleTake(Project& p, Sequence& s, Id clipId, int step);  // the next (+1) or previous (-1) take, round
+Result finalizeAudition(Project& p, Sequence& s, Id clipId);     // keeps the pick, forgets the other takes
+
 // Clips that start at or after `frame` (Track Select Forward), on every track
 // or only `track`.
 std::vector<Id> clipsFrom(const Sequence& s, FrameTime frame, std::optional<TrackRef> track = {});

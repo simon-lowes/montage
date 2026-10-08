@@ -166,6 +166,15 @@ struct Marker {
     bool operator==(const Marker&) const = default;
 };
 
+// One take of an audition (Final Cut's auditions, Resolve's take selector): a piece of media, starting `offset`
+// sequence frames from the clip's own in-point, so trims and splits of the clip carry its takes along.
+struct Take {
+    Id mediaId = 0;
+    double offset = 0;
+    std::string name;
+    bool operator==(const Take&) const = default;
+};
+
 struct Clip {
     Id id = 0;
     Id mediaId = 0;              // 0 for generator clips (titles, colour mattes...)
@@ -211,6 +220,9 @@ struct Clip {
     std::vector<Marker> markers;
     // Where marker m falls on the timeline, or -1 when the clip does not show that moment.
     FrameTime markerFrame(const Marker& m) const;
+    // An audition (core/EditOps.h pickTake): every take, the clip's own included as takes[take]; empty for a plain clip.
+    std::vector<Take> takes;
+    int take = 0;
     bool operator==(const Clip&) const = default;
 };
 

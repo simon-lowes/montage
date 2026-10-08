@@ -206,6 +206,13 @@ QJsonObject clipToJson(const Clip& c) {
     if (c.angle != 0) o["angle"] = c.angle;
     if (c.audioAngle != -1) o["audioAngle"] = c.audioAngle;
     if (!c.markers.empty()) o["markers"] = markersToJson(c.markers);
+    if (!c.takes.empty()) {
+        QJsonArray takes;
+        for (const Take& t : c.takes)
+            takes.append(QJsonObject{{"media", qint64(t.mediaId)}, {"offset", t.offset}, {"name", qs(t.name)}});
+        o["takes"] = takes;
+        o["take"] = c.take;
+    }
     return o;
 }
 
@@ -233,6 +240,11 @@ Clip clipFromJson(const QJsonObject& o) {
     c.angle = std::max(0, o.value("angle").toInt(0));
     c.audioAngle = std::max(-1, o.value("audioAngle").toInt(-1));
     c.markers = markersFromJson(o.value("markers"));
+    for (const auto& tv : o.value("takes").toArray()) {
+        const QJsonObject t = tv.toObject();
+        c.takes.push_back({Id(i64(t.value("media"))), t.value("offset").toDouble(), ss(t.value("name"))});
+    }
+    c.take = c.takes.empty() ? 0 : std::clamp(o.value("take").toInt(), 0, int(c.takes.size()) - 1);
     return c;
 }
 

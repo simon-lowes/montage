@@ -1010,6 +1010,53 @@ void McpServer::Impl::addTools() {
                           .arg(left.isEmpty() ? QString() : QStringLiteral("; left out: ") + left.join(QStringLiteral(", "))));
         });
 
+    add("montage_audition", "Audition takes on a clip",
+        "Auditions (Final Cut's auditions, Resolve's take selector): alternative takes held by a clip and tried in its "
+        "place, keeping its position, length, effects and keyframes (linked sound follows). add puts media files in as "
+        "takes (from in seconds); pick chooses a take by number (1 = first) or \"next\"/\"previous\"; finalize keeps "
+        "the pick and drops the rest. Without these, lists the clip's takes.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
+            "add":{"type":"array","items":{"type":"string"},"description":"Media files to add as takes"},
+            "in":{"type":"number","default":0,"description":"Where the added takes start, in seconds of their media"},
+            "pick":{"type":["integer","string"],"description":"A take number (1 = first), or next / previous"},
+            "finalize":{"type":"boolean","default":false}},"required":["project","clip"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const Id clip = clipArg(l, a).id;
+            auto check = [](const edit::Result& r) {
+                if (!r.ok) throw ArgError{QString::fromStdString(r.error)};
+            };
+            bool changed = false;
+            if (a.contains("add")) {
+                std::vector<std::pair<Id, double>> media;
+                for (const QJsonValue& v : a.value("add").toArray())
+                    media.push_back({mediaFor(l.project, v.toString()), a.value("in").toDouble() * s.fpsValue()});
+                check(edit::addTakes(l.project, s, clip, media));
+                changed = true;
+            }
+            if (a.contains("pick")) {
+                const QJsonValue pv = a.value("pick");
+                if (pv.isString() && (pv.toString() == "next" || pv.toString() == "previous"))
+                    check(edit::cycleTake(l.project, s, clip, pv.toString() == "next" ? 1 : -1));
+                else
+                    check(edit::pickTake(l.project, s, clip, (pv.isString() ? pv.toString().toInt() : pv.toInt()) - 1));
+                changed = true;
+            }
+            if (a.value("finalize").toBool()) {
+                check(edit::finalizeAudition(l.project, s, clip));
+                changed = true;
+            }
+            if (changed) save(l);
+            const Clip* c = edit::clipById(s, clip);
+            if (c->takes.empty()) return ok(changed ? QStringLiteral("Kept %1; no other takes.").arg(QString::fromStdString(c->name))
+                                                    : QStringLiteral("That clip has no takes."));
+            QStringList lines;
+            for (size_t i = 0; i < c->takes.size(); ++i)
+                lines << QStringLiteral("%1%2. %3").arg(int(i) == c->take ? "* " : "  ").arg(i + 1).arg(QString::fromStdString(c->takes[i].name));
+            return ok(QStringLiteral("Take %1 of %2 is in the cut:\n").arg(c->take + 1).arg(c->takes.size()) + lines.join('\n'));
+        });
+
     add("montage_relink", "Find and relink offline media",
         "Media whose files have moved or gone show as Media Offline. Without arguments, lists them. With folder, looks "
         "there (and below) for their files by name, or by name with another extension for transcodes, checking each is "
