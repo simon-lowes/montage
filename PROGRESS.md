@@ -424,7 +424,10 @@ The second gap analysis (`docs/research/phase3-roadmap.md`, October 2026) ranks 
   - app/Voiceover: WavWriter (32-bit float WAV written as it goes, sizes filled in at the end); VoiceoverRecorder (QAudioSource at 48 kHz mono float, or the device's format converted from 16- or 32-bit integers) writes numbered takes ("<sequence> VO n.wav") to a Voiceover folder beside the project (Music/Montage when unsaved), then imports each into the bin's Voiceover folder and places it on the chosen audio track at the start frame. Punch-in caps the take at Out and stops by itself.
   - Sequence › Record Voiceover… (Ctrl+Alt+R): input, track, 3-second countdown, punch-in (In to Out), level meter, Record/Stop; the Program monitor plays along from the take's start.
   - Tested without a microphone (sound fed in): the WAV read back at the right length; a take placed on A2 at its start frame with the right length, file name and bin; undo; punch-in stopping at Out; an empty take leaving no file; the menu's dialog.
-- [ ] 3. Burn-ins on export: timecode, clip name, metadata, watermark (S)
+- [x] 3. Burn-ins on export (S):
+  - ExportSettings::burnIn holds the timecode, the top clip's name, any text (stacked in a dark box in one of six corners at a chosen size), and a watermark image with its own corner, width and opacity. They are drawn after captions in the sequence's colour space; a missing watermark fails the export.
+  - The Export dialog has a Burn in row (Timecode, Clip name, corner), a text field and a Watermark row, all remembered. `montage-cli render --burn-timecode --burn-clip-name --burn-text --burn-corner --watermark --watermark-corner --watermark-opacity`; MCP `montage_render` takes `burn_in`.
+  - Tested: text in the chosen corner only, the timecode changing frame to frame, more lines for clip name and text, a watermark at the right opacity; an exported and decoded review copy (white text on a dark box top left, red logo bottom right, picture untouched in the middle); the missing-logo error; and MCP with a bad corner refused.
 - [ ] 4. Grading essentials: hue/luma/sat curves, colour wheels, split-screen compare (S–M)
 - [ ] 5. Build a cut from a script (M)
 - [ ] 6. Speech enhancement and stem separation (M)

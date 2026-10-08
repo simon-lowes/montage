@@ -55,6 +55,9 @@ int usage() {
                  "                     [--loudness LUFS [--ceiling dBTP]]  (e.g. --loudness -14: normalise the mix)\n"
                  "                     [--burn-captions [--caption-animation none|word|highlight|pop|one-word]]\n"
                  "                     [--embed-captions] [--color-space ID]\n"
+                 "                     [--burn-timecode] [--burn-clip-name] [--burn-text TEXT] [--burn-corner 0-5]\n"
+                 "                     [--watermark IMAGE [--watermark-corner 0-5] [--watermark-opacity 0..1]]\n"
+                 "                     (corners: 0 top left, 1 top centre, 2 top right, 3-5 bottom)\n"
                  "  montage-cli frame <project.montage> --at TC -o <image.png>\n"
                  "  montage-cli presets\n"
                  "  montage-cli colorspaces\n"
@@ -251,6 +254,7 @@ int cmdRender(const std::vector<std::string>& args) {
     bool proxies = false;
     double loudness = 0, ceiling = -1;
     int captionAnimation = -1;  // -1: as the project has it
+    BurnIn burnIns;
     for (size_t i = 1; i < args.size(); ++i) {
         const std::string& a = args[i];
         auto next = [&]() -> std::string { return i + 1 < args.size() ? args[++i] : std::string(); };
@@ -274,6 +278,13 @@ int cmdRender(const std::vector<std::string>& args) {
             if (captionAnimation < 0) return usage();
         }
         else if (a == "--embed-captions") st.embedCaptions = true;
+        else if (a == "--burn-timecode") burnIns.timecode = true;
+        else if (a == "--burn-clip-name") burnIns.clipName = true;
+        else if (a == "--burn-text") burnIns.text = next();
+        else if (a == "--burn-corner") burnIns.corner = std::clamp(std::atoi(next().c_str()), 0, 5);
+        else if (a == "--watermark") burnIns.watermark = next();
+        else if (a == "--watermark-corner") burnIns.watermarkCorner = std::clamp(std::atoi(next().c_str()), 0, 5);
+        else if (a == "--watermark-opacity") burnIns.watermarkOpacity = std::clamp(std::atof(next().c_str()), 0.0, 1.0);
         else if (a == "--color-space") st.colorSpace = next();
         else if (a == "--loudness") loudness = std::atof(next().c_str());
         else if (a == "--ceiling") ceiling = std::atof(next().c_str());
@@ -295,6 +306,7 @@ int cmdRender(const std::vector<std::string>& args) {
     st.burnInCaptions = burn;
     st.embedCaptions = embed;
     st.colorSpace = colorSpace;
+    st.burnIn = burnIns;
     Project p;
     if (!load(projectPath, p)) return 1;
     if (captionAnimation >= 0)

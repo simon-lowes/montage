@@ -10,11 +10,13 @@
 
 #include "AudioFx.h"
 #include "ColorSpace.h"
+#include "Exporter.h"
 #include "Processing.h"
 #include "Retime.h"
 #include "audio/PluginEffect.h"
 #include "audio/SpeechCleanup.h"
 #include "core/EditOps.h"
+#include "core/History.h"
 #include "media/MediaPool.h"
 
 namespace montage {
@@ -754,6 +756,96 @@ int matchClipColour(Project& p, Sequence& s, const std::vector<Id>& clips, const
         ++n;
     }
     return n;
+}
+
+namespace {
+
+// Blends a premultiplied 8-bit patch over the float frame at (x0, y0), its
+// SDR colours first moved into the frame's space.
+void blendPatch(Image& img, const QImage& qi, int x0, int y0, const ColorSpace* space, float opacity = 1.0f) {
+    Image patch(qi.width(), qi.height());
+    for (int y = 0; y < patch.height; ++y) {
+        const uchar* s = qi.constScanLine(y);
+        float* d = patch.row(y);
+        for (int x = 0; x < patch.width * 4; ++x) d[x] = s[x] / 255.0f * opacity;
+    }
+    if (space && space->id != rec709Space().id) convertColor(patch, rec709Space(), *space);
+    for (int y = 0; y < patch.height; ++y) {
+        const int ty = y0 + y;
+        if (ty < 0 || ty >= img.height) continue;
+        const float* s = patch.row(y);
+        for (int x = 0; x < patch.width; ++x, s += 4) {
+            const int tx = x0 + x;
+            if (tx < 0 || tx >= img.width) continue;
+            float* d = img.at(tx, ty);
+            for (int c = 0; c < 4; ++c) d[c] = s[c] + d[c] * (1 - s[3]);
+        }
+    }
+}
+
+// Where a w x h block sits for corner c (0-2 top left/centre/right, 3-5 bottom), inside a 3 % margin.
+QPoint cornerPos(int c, int w, int h, int W, int H) {
+    const int mx = int(std::lround(0.03 * W)), my = int(std::lround(0.03 * H));
+    const int col = c % 3, row = c / 3;
+    const int x = col == 0 ? mx : col == 1 ? (W - w) / 2 : W - mx - w;
+    const int y = row == 0 ? my : H - my - h;
+    return {x, y};
+}
+
+}  // namespace
+
+void drawBurnIns(Image& img, const Project& p, const Sequence& seq, FrameTime t, const BurnIn& b, const QImage* watermark,
+                 const ColorSpace* space) {
+    if (img.width < 8 || img.height < 8) return;
+    // The logo first, so the text stays readable over it.
+    if (watermark && !watermark->isNull() && b.watermarkOpacity > 0) {
+        const int ww = std::max(1, int(std::lround(std::clamp(b.watermarkWidth, 0.01, 1.0) * img.width)));
+        const QImage logo = watermark->scaledToWidth(ww, Qt::SmoothTransformation).convertToFormat(QImage::Format_RGBA8888_Premultiplied);
+        const QPoint at = cornerPos(std::clamp(b.watermarkCorner, 0, 5), logo.width(), logo.height(), img.width, img.height);
+        blendPatch(img, logo, at.x(), at.y(), space, float(std::clamp(b.watermarkOpacity, 0.0, 1.0)));
+    }
+    QStringList lines;
+    if (b.timecode) lines << QString::fromStdString(formatTimecode(t, seq.fps));
+    if (b.clipName) {
+        for (int i = int(seq.videoTracks.size()) - 1; i >= 0; --i) {
+            if (seq.videoTracks[size_t(i)].muted) continue;
+            if (const Clip* c = edit::clipAt(seq, TrackRef{TrackKind::Video, i}, t); c && c->enabled) {
+                std::string name = c->name;
+                if (name.empty())
+                    if (const MediaItem* m = c->mediaId ? p.findMedia(c->mediaId) : nullptr) name = m->name;
+                lines << QString::fromStdString(name);
+                break;
+            }
+        }
+    }
+    if (!b.text.empty()) lines << QString::fromStdString(b.text);
+    if (lines.isEmpty()) return;
+    QFont f(QStringLiteral("Monospace"));
+    f.setStyleHint(QFont::TypeWriter);
+    f.setPixelSize(std::max(6, int(std::lround(std::clamp(b.size, 0.01, 0.2) * img.height))));
+    f.setBold(true);
+    const QFontMetrics fm(f);
+    const int pad = std::max(2, fm.height() / 4);
+    int w = 0;
+    for (const QString& l : lines) w = std::max(w, fm.horizontalAdvance(l));
+    const int lineH = fm.height();
+    const int bw = w + 2 * pad, bh = lineH * int(lines.size()) + 2 * pad;
+    QImage qi(bw, bh, QImage::Format_RGBA8888_Premultiplied);
+    qi.fill(QColor(0, 0, 0, 160));  // a dark box behind white text, readable on any picture
+    {
+        QPainter pa(&qi);
+        pa.setRenderHint(QPainter::TextAntialiasing);
+        pa.setFont(f);
+        pa.setPen(Qt::white);
+        const int corner = std::clamp(b.corner, 0, 5), col = corner % 3;
+        for (int i = 0; i < lines.size(); ++i) {
+            const int lw = fm.horizontalAdvance(lines[i]);
+            const int x = col == 0 ? pad : col == 1 ? (bw - lw) / 2 : bw - pad - lw;
+            pa.drawText(x, pad + i * lineH + fm.ascent(), lines[i]);
+        }
+    }
+    const QPoint at = cornerPos(std::clamp(b.corner, 0, 5), bw, bh, img.width, img.height);
+    blendPatch(img, qi, at.x(), at.y(), space);
 }
 
 Image renderMediaFrame(const Project& p, const MediaItem& m, double seconds, int w, int h) {

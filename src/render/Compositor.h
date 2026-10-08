@@ -9,6 +9,8 @@
 #include "core/Model.h"
 #include "media/Image.h"
 
+class QImage;
+
 namespace montage {
 
 struct RenderOptions {
@@ -43,6 +45,13 @@ bool clipFrameSize(const Project& p, const Sequence& seq, const Clip& c, double&
 // Captions are styled in SDR; `space` converts them into the picture's colour space.
 struct ColorSpace;
 void drawCaption(Image& img, const CaptionTrack& track, FrameTime t, const ColorSpace* space = nullptr);
+
+// Burn-ins (timecode, clip name, text, watermark) drawn over frame t of `seq`
+// in `img` (the whole frame, in colour space `space`; null = Rec.709).
+// `watermark` is the loaded logo (or null).
+struct BurnIn;
+void drawBurnIns(Image& img, const Project& p, const Sequence& seq, FrameTime t, const BurnIn& b, const QImage* watermark,
+                 const ColorSpace* space = nullptr);
 
 // Raw (unprocessed) frame of a media item at `seconds`, fitted into w x h; for the source monitor.
 Image renderMediaFrame(const Project& p, const MediaItem& m, double seconds, int w, int h);

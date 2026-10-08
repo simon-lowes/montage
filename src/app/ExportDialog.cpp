@@ -207,6 +207,53 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     loudness_->setToolTip(tr("Measures the whole mix first, then sets its level to the target, with a limiter "
                              "keeping peaks under the ceiling"));
     form->addRow(tr("Loudness:"), loudness_);
+    // Burn-ins: what a review copy carries in the picture.
+    {
+        QSettings st = appSettings();
+        const QStringList corners = {tr("Top left"), tr("Top centre"), tr("Top right"), tr("Bottom left"), tr("Bottom centre"), tr("Bottom right")};
+        auto* row = new QWidget(form_);
+        auto* rl = new QHBoxLayout(row);
+        rl->setContentsMargins(0, 0, 0, 0);
+        burnTimecode_ = new QCheckBox(tr("Timecode"), row);
+        burnTimecode_->setObjectName(QStringLiteral("burnTimecode"));
+        burnTimecode_->setChecked(st.value("export/burnTimecode", false).toBool());
+        burnClipName_ = new QCheckBox(tr("Clip name"), row);
+        burnClipName_->setObjectName(QStringLiteral("burnClipName"));
+        burnClipName_->setChecked(st.value("export/burnClipName", false).toBool());
+        burnCorner_ = new QComboBox(row);
+        burnCorner_->setObjectName(QStringLiteral("burnCorner"));
+        burnCorner_->addItems(corners);
+        burnCorner_->setCurrentIndex(std::clamp(st.value("export/burnCorner", 0).toInt(), 0, 5));
+        rl->addWidget(burnTimecode_);
+        rl->addWidget(burnClipName_);
+        rl->addWidget(burnCorner_, 1);
+        form->addRow(tr("Burn in:"), row);
+        burnText_ = new QLineEdit(form_);
+        burnText_->setObjectName(QStringLiteral("burnText"));
+        burnText_->setPlaceholderText(tr("Text, e.g. \"DRAFT - not for broadcast\""));
+        burnText_->setText(st.value("export/burnText").toString());
+        form->addRow(QString(), burnText_);
+        auto* wrow = new QWidget(form_);
+        auto* wl = new QHBoxLayout(wrow);
+        wl->setContentsMargins(0, 0, 0, 0);
+        watermark_ = new QLineEdit(wrow);
+        watermark_->setObjectName(QStringLiteral("watermark"));
+        watermark_->setPlaceholderText(tr("Logo or watermark image (optional)"));
+        watermark_->setText(st.value("export/watermark").toString());
+        auto* pick = new QPushButton(tr("Choose…"), wrow);
+        watermarkCorner_ = new QComboBox(wrow);
+        watermarkCorner_->setObjectName(QStringLiteral("watermarkCorner"));
+        watermarkCorner_->addItems(corners);
+        watermarkCorner_->setCurrentIndex(std::clamp(st.value("export/watermarkCorner", 5).toInt(), 0, 5));
+        wl->addWidget(watermark_, 1);
+        wl->addWidget(pick);
+        wl->addWidget(watermarkCorner_);
+        form->addRow(tr("Watermark:"), wrow);
+        connect(pick, &QPushButton::clicked, this, [this] {
+            const QString f = QFileDialog::getOpenFileName(this, tr("Watermark Image"), QString(), tr("Images (*.png *.jpg *.jpeg *.webp *.bmp)"));
+            if (!f.isEmpty()) watermark_->setText(f);
+        });
+    }
     form->addRow(tr("Summary:"), summary_);
 
     progress_ = new QProgressBar(this);
@@ -504,6 +551,24 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
         s.peakCeiling = target.y();
     }
     settings.setValue("export/loudness", loudness_->currentIndex());
+    if (hasVideo(s)) {
+        s.burnIn.timecode = burnTimecode_->isChecked();
+        s.burnIn.clipName = burnClipName_->isChecked();
+        s.burnIn.text = burnText_->text().trimmed().toStdString();
+        s.burnIn.corner = burnCorner_->currentIndex();
+        s.burnIn.watermark = watermark_->text().trimmed().toStdString();
+        s.burnIn.watermarkCorner = watermarkCorner_->currentIndex();
+        if (!s.burnIn.watermark.empty() && !QFileInfo::exists(watermark_->text().trimmed())) {
+            QMessageBox::warning(this, tr("Export"), tr("The watermark image %1 does not exist.").arg(watermark_->text().trimmed()));
+            return false;
+        }
+    }
+    settings.setValue("export/burnTimecode", burnTimecode_->isChecked());
+    settings.setValue("export/burnClipName", burnClipName_->isChecked());
+    settings.setValue("export/burnText", burnText_->text());
+    settings.setValue("export/burnCorner", burnCorner_->currentIndex());
+    settings.setValue("export/watermark", watermark_->text());
+    settings.setValue("export/watermarkCorner", watermarkCorner_->currentIndex());
     if (rangeIsInOut()) {
         s.in = in;
         s.out = out;

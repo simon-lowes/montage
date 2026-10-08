@@ -1302,6 +1302,72 @@ private slots:
         QVERIFY(call(QJsonObject{{"project", project}, {"reference_at", 0.4}, {"clips", QJsonArray{}}}).value("isError").toBool());
     }
 
+    void exportBurnIns() {
+        // Grey picture, 160 x 90; a review copy with timecode and text top left and a red logo bottom right.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 160;
+        s.height = 90;
+        s.fps = {25, 1};
+        Clip c = makeGeneratorClip(p, "color", 10);
+        c.generator.params["color.r"] = c.generator.params["color.g"] = c.generator.params["color.b"] = Param(0.5);
+        edit::overwrite(p, s, {TrackKind::Video, 0}, c);
+        QImage logo(40, 20, QImage::Format_ARGB32);
+        logo.fill(QColor(255, 0, 0));
+        const QString logoPath = QString::fromStdString(path("logo.png"));
+        QVERIFY(logo.save(logoPath));
+        ExportSettings st = findExportPreset("H.264 - High Quality")->settings;
+        st.path = path("review.mp4");
+        st.audioCodec = "none";
+        st.crf = 10;
+        st.burnIn.timecode = true;
+        st.burnIn.text = "DRAFT";
+        st.burnIn.size = 0.12;
+        st.burnIn.watermark = logoPath.toStdString();
+        st.burnIn.watermarkOpacity = 1.0;
+        st.burnIn.watermarkWidth = 0.25;
+        std::string err;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        VideoDecoder dec;
+        QVERIFY2(dec.open(st.path, &err), err.c_str());
+        const Image img = toImage(*dec.frameAt(0.2));
+        // Top left: white text on a dark box; bottom right: red; the middle: grey as it was.
+        float brightest = 0, darkest = 1;
+        for (int y = 3; y < 30; ++y)
+            for (int x = 5; x < 70; ++x) {
+                brightest = std::max(brightest, img.at(x, y)[1]);
+                darkest = std::min(darkest, img.at(x, y)[1]);
+            }
+        QVERIFY2(brightest > 0.8f && darkest < 0.35f, qPrintable(QString("%1 %2").arg(brightest).arg(darkest)));
+        const float* red = img.at(160 - 5 - 10, 90 - 3 - 5);
+        QVERIFY2(red[0] > 0.7f && red[1] < 0.3f, qPrintable(QString("%1 %2").arg(red[0]).arg(red[1])));
+        const float* mid = img.at(80, 50);
+        QVERIFY(std::fabs(mid[1] - 0.5f) < 0.08f);
+        // A missing logo is an error, not a silent copy without it.
+        st.burnIn.watermark = path("no-such-logo.png");
+        QVERIFY(!exportSequence(p, s, st, nullptr, nullptr, &err));
+        QVERIFY(QString::fromStdString(err).contains("watermark"));
+
+        // Over MCP.
+        const QString project = QString::fromStdString(path("review.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_render"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call(QJsonObject{{"project", project}, {"output", QString::fromStdString(path("review-mcp.mp4"))},
+                                         {"burn_in", QJsonObject{{"timecode", true}, {"watermark", logoPath}, {"corner", "bottom_left"}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(QFileInfo(QString::fromStdString(path("review-mcp.mp4"))).size() > 0);
+        r = call(QJsonObject{{"project", project}, {"output", QString::fromStdString(path("x.mp4"))}, {"burn_in", QJsonObject{{"corner", "middle"}}}});
+        QVERIFY(r.value("isError").toBool());
+    }
+
     void mcpServerEditsProjects() {
         writeBallVideo(path("mcp-ball.mp4"), 12);
         const QString project = QString::fromStdString(path("agent.montage"));

@@ -82,6 +82,13 @@ private:
     QComboBox* captions_ = nullptr;
     QComboBox* color_ = nullptr;
     QComboBox* loudness_ = nullptr;
+    // Burn-ins for review copies.
+    QCheckBox* burnTimecode_ = nullptr;
+    QCheckBox* burnClipName_ = nullptr;
+    QLineEdit* burnText_ = nullptr;
+    QComboBox* burnCorner_ = nullptr;
+    QLineEdit* watermark_ = nullptr;
+    QComboBox* watermarkCorner_ = nullptr;
     QPushButton* queueButton_ = nullptr;
     RenderQueue* queue_ = nullptr;
     QLabel* summary_ = nullptr;

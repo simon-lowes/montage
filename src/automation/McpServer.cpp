@@ -1176,7 +1176,13 @@ void McpServer::Impl::addTools() {
         R"json({"type":"object","properties":{"project":{"type":"string"},"output":{"type":"string"},
             "preset":{"type":"string"},"in":{"type":["number","string"]},"out":{"type":["number","string"]},
             "loudness_lufs":{"type":"number","description":"Normalise the mix to this loudness, e.g. -14 (streaming) or -23 (EBU R128)"},
-            "peak_ceiling":{"type":"number","default":-1,"description":"True peak ceiling (dBTP) when normalising"}},
+            "peak_ceiling":{"type":"number","default":-1,"description":"True peak ceiling (dBTP) when normalising"},
+            "burn_in":{"type":"object","description":"Overlays for a review copy","properties":{
+                "timecode":{"type":"boolean"},"clip_name":{"type":"boolean"},"text":{"type":"string"},
+                "corner":{"type":"string","enum":["top_left","top_centre","top_right","bottom_left","bottom_centre","bottom_right"],"default":"top_left"},
+                "watermark":{"type":"string","description":"Image file, e.g. a logo"},
+                "watermark_corner":{"type":"string","enum":["top_left","top_centre","top_right","bottom_left","bottom_centre","bottom_right"],"default":"bottom_right"},
+                "watermark_opacity":{"type":"number","default":0.6}}}},
             "required":["project","output"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
@@ -1191,6 +1197,23 @@ void McpServer::Impl::addTools() {
                 st.loudnessTarget = a.value("loudness_lufs").toDouble();
                 if (st.loudnessTarget >= 0 || st.loudnessTarget < -70) throw ArgError{"\"loudness_lufs\" must be between -70 and 0"};
                 st.peakCeiling = std::min(0.0, a.value("peak_ceiling").toDouble(-1));
+            }
+            if (a.value("burn_in").isObject()) {
+                const QJsonObject b = a.value("burn_in").toObject();
+                static const QStringList corners = {"top_left", "top_centre", "top_right", "bottom_left", "bottom_centre", "bottom_right"};
+                auto corner = [&](const char* key, int def) {
+                    if (!b.contains(key)) return def;
+                    const int i = int(corners.indexOf(b.value(key).toString()));
+                    if (i < 0) throw ArgError{QStringLiteral("\"%1\" must be one of %2").arg(key, corners.join(", "))};
+                    return i;
+                };
+                st.burnIn.timecode = b.value("timecode").toBool();
+                st.burnIn.clipName = b.value("clip_name").toBool();
+                st.burnIn.text = b.value("text").toString().toStdString();
+                st.burnIn.corner = corner("corner", 0);
+                if (b.contains("watermark")) st.burnIn.watermark = absolute(b.value("watermark").toString()).toStdString();
+                st.burnIn.watermarkCorner = corner("watermark_corner", 5);
+                st.burnIn.watermarkOpacity = std::clamp(b.value("watermark_opacity").toDouble(0.6), 0.0, 1.0);
             }
             std::string err;
             if (!exportSequence(l.project, s, st, [this](double f, FrameTime) { progress(f, "Rendering"); }, nullptr, &err))

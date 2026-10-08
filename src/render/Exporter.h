@@ -10,6 +10,21 @@
 
 namespace montage {
 
+// Review-copy overlays burned into the picture (after captions), as an
+// editor sends out for notes: timecode, the clip's name, any text, a logo.
+struct BurnIn {
+    bool timecode = false;          // the sequence's timecode
+    bool clipName = false;          // the name of the top clip on screen
+    std::string text;               // any text ("" = none)
+    int corner = 0;                 // 0 top left, 1 top centre, 2 top right, 3 bottom left, 4 bottom centre, 5 bottom right
+    double size = 0.035;            // text height, fraction of the frame height
+    std::string watermark;          // image file ("" = none), e.g. a logo with transparency
+    int watermarkCorner = 5;
+    double watermarkWidth = 0.15;   // fraction of the frame width
+    double watermarkOpacity = 0.6;
+    bool any() const { return timecode || clipName || !text.empty() || !watermark.empty(); }
+};
+
 struct ExportSettings {
     std::string path;
     std::string videoCodec = "libx264";  // libx264, libx265, hw_h264, hw_hevc, prores_ks, dnxhd, libvpx-vp9, libsvtav1, mjpeg, none
@@ -41,6 +56,7 @@ struct ExportSettings {
     // the ceiling. 0 = off; e.g. -14 LUFS for streaming, -23 for EBU R128.
     double loudnessTarget = 0;
     double peakCeiling = -1;  // dBTP, when normalising
+    BurnIn burnIn;
 };
 
 struct ExportPreset {

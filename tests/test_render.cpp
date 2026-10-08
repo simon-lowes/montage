@@ -13,6 +13,7 @@
 #include "core/Effects.h"
 #include "render/ColorSpace.h"
 #include "render/Compositor.h"
+#include "render/Exporter.h"
 #include "render/Ocio.h"
 #include "render/Processing.h"
 #include "render/RenderCache.h"
@@ -1230,6 +1231,57 @@ colorspaces:
         QVERIFY(single.highlight > lit.highlight);
         // Outside the caption nothing is drawn.
         QCOMPARE(draw(2, 40).amount, 0.0);
+    }
+
+    void burnInsOnFrames() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320;
+        s.height = 180;
+        s.fps = {25, 1};
+        Clip c = colorClip(p, 0.5f, 0.5f, 0.5f, 0, 50);
+        c.name = "Interview";
+        edit::overwrite(p, s, {TrackKind::Video, 0}, c);
+        auto frame = [&](const BurnIn& b, FrameTime t, const QImage* logo = nullptr) {
+            Image img(320, 180);
+            img.fill(0, 0, 0, 1);
+            drawBurnIns(img, p, s, t, b, logo);
+            return img;
+        };
+        auto inked = [](const Image& img, int x0, int y0, int x1, int y1) {
+            int n = 0;
+            for (int y = y0; y < y1; ++y)
+                for (int x = x0; x < x1; ++x) n += img.at(x, y)[0] > 0.5f ? 1 : 0;
+            return n;
+        };
+        BurnIn tc;
+        tc.timecode = true;
+        const Image a = frame(tc, 0), b = frame(tc, 1);
+        QVERIFY(inked(a, 0, 0, 160, 60) > 20);         // top left
+        QCOMPARE(inked(a, 160, 90, 320, 180), 0);       // nothing elsewhere
+        int differ = 0;
+        for (size_t i = 0; i < a.px.size(); ++i) differ += std::fabs(a.px[i] - b.px[i]) > 0.1f ? 1 : 0;
+        QVERIFY(differ > 0);  // the timecode moves on
+        // Clip name and text add lines; another corner puts them there.
+        BurnIn more = tc;
+        more.clipName = true;
+        more.text = "DRAFT";
+        more.corner = 5;
+        const Image m = frame(more, 10);
+        QVERIFY(inked(m, 160, 90, 320, 180) > inked(a, 0, 0, 160, 60));
+        QCOMPARE(inked(m, 0, 0, 160, 90), 0);
+        // A watermark at 60 % in the bottom right; a quarter of the width wide.
+        QImage logo(40, 20, QImage::Format_ARGB32);
+        logo.fill(QColor(255, 0, 0));
+        BurnIn wm;
+        wm.watermark = "logo";
+        wm.watermarkWidth = 0.25;
+        wm.watermarkOpacity = 0.6;
+        const Image w = frame(wm, 0, &logo);
+        const float* px = w.at(320 - int(0.03 * 320) - 10, 180 - int(0.03 * 180) - 10);
+        QVERIFY2(std::fabs(px[0] - 0.6f) < 0.03f && px[1] < 0.05f, qPrintable(QString::number(px[0])));
+        QVERIFY(w.at(100, 100)[0] < 0.01f);
+        QVERIFY(!BurnIn{}.any() && tc.any() && wm.any());
     }
 
     void titlesRender() {

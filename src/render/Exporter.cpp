@@ -589,6 +589,9 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     };
 
     const int64_t total = out - in;
+    // The burn-in logo, loaded once.
+    const QImage watermark = s.burnIn.watermark.empty() ? QImage() : QImage(QString::fromStdString(s.burnIn.watermark));
+    if (!s.burnIn.watermark.empty() && watermark.isNull()) return fail("Cannot read the watermark image " + s.burnIn.watermark);
     RenderOptions ro;
     ro.scale = double(W) / seq.width;
     ro.highQuality = true;
@@ -599,6 +602,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         if (wantVideo) {
             Image img = s.alpha ? renderSequenceFrame(p, seq, f, ro) : renderProgramFrame(p, seq, f, ro);
             if (s.burnInCaptions && captions) drawCaption(img, *captions, f, &seqSpace);
+            if (s.burnIn.any()) drawBurnIns(img, p, seq, f, s.burnIn, watermark.isNull() ? nullptr : &watermark, &seqSpace);
             convertColor(img, seqSpace, outSpace, peakNits);
             toRgba16(img, rgba16);
             AVPixelFormat srcFmt = AV_PIX_FMT_RGBA64LE;
