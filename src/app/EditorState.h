@@ -15,6 +15,9 @@
 #include "core/History.h"
 #include "core/Model.h"
 
+class QFileSystemWatcher;
+class QTimer;
+
 namespace montage {
 
 class EditorState : public QObject {
@@ -134,6 +137,9 @@ public:
     // painting asks often. Nested sequences and generators are never offline.
     bool isMediaOffline(Id media) const;
     void recheckOffline() { offlineChecked_.clear(); }  // after files moved or were relinked
+    // Media files changed on disk (a still re-saved, a graphic re-rendered) are reloaded by themselves, as Premiere
+    // and Resolve do: their cached frames, thumbnails and sound are dropped and their details re-read.
+    void reloadChangedMedia(const QStringList& paths);
 
 signals:
     void projectChanged();            // anything in the project changed
@@ -143,11 +149,16 @@ signals:
     void historyChanged();
     void sourceChanged();             // source monitor media or marks changed
     void mediaReady(const QString& path);  // audio peaks / thumbnails available
+    void mediaFileChanged(montage::Id media);  // its file changed on disk and was reloaded
     void statusMessage(const QString& text, int timeoutMs);
     void fileStateChanged();          // path or modified flag changed
 
 private:
     void pruneSelection();
+    void watchMediaFiles();  // keeps the watcher on the project's media files
+    QFileSystemWatcher* watcher_ = nullptr;
+    QTimer* reloadTimer_ = nullptr;
+    QStringList changedFiles_;
     mutable std::map<std::string, std::pair<bool, qint64>> offlineChecked_;  // path -> offline, when checked (ms)
 
     Project project_;

@@ -158,6 +158,12 @@ QPixmap MediaBinModel::skimmedThumbnail(const MediaItem& m) const {
     return pm;
 }
 
+void MediaBinModel::forgetThumbnail(Id id) {
+    thumbs_.erase(id);
+    decorated_.erase(id);
+    if (const int row = rowOf(id); row >= 0) emit dataChanged(index(row, 0), index(row, 0), {Qt::DecorationRole});
+}
+
 void MediaBinModel::refreshThumbnails() {
     if (skimId_)
         if (const int row = rowOf(skimId_); row >= 0) emit dataChanged(index(row, 0), index(row, 0), {Qt::DecorationRole});

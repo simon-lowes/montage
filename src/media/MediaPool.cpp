@@ -196,6 +196,29 @@ void MediaPool::clear() {
     peaks_.clear();
 }
 
+void MediaPool::forget(const std::string& path) {
+    {
+        std::lock_guard lock(m_);
+        for (auto it = lru_.begin(); it != lru_.end();) {
+            if (it->first.path == path) {
+                cacheBytes_ -= it->second->bytes();
+                index_.erase(it->first);
+                it = lru_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        if (auto d = decoders_.find(path); d != decoders_.end()) {
+            auto& slots = d->second;
+            slots.erase(std::remove_if(slots.begin(), slots.end(), [](const Slot& s) { return !s.busy; }), slots.end());
+            if (slots.empty()) decoders_.erase(d);
+        }
+    }
+    std::lock_guard lock(audioM_);
+    for (auto it = audio_.begin(); it != audio_.end();) it = it->first.first == path ? audio_.erase(it) : std::next(it);
+    peaks_.erase(path);
+}
+
 void MediaPool::setReadyCallback(std::function<void(const std::string&)> cb) {
     std::lock_guard lock(audioM_);
     readyCb_ = std::move(cb);

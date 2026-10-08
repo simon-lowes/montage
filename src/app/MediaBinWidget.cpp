@@ -353,6 +353,7 @@ MediaBinWidget::MediaBinWidget(EditorState* state, QWidget* parent) : QWidget(pa
     connect(state_, &EditorState::projectChanged, this, &MediaBinWidget::rebuild);
     connect(state_, &EditorState::sequenceSwitched, this, &MediaBinWidget::rebuild);
     connect(&ThumbnailCache::instance(), &ThumbnailCache::ready, model_, &MediaBinModel::refreshThumbnails);
+    connect(state_, &EditorState::mediaFileChanged, model_, &MediaBinModel::forgetThumbnail);
     rebuild();
 }
 
@@ -853,6 +854,10 @@ void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos)
                 const QString f = QFileDialog::getOpenFileName(this, tr("Replace Footage"));
                 QString why;
                 if (!f.isEmpty() && !replaceFootage(id, f, &why)) state_->message(tr("Could not replace the footage: %1").arg(why));
+            });
+        if (m && !m->path.empty() && m->kind != MediaKind::Sequence)
+            menu.addAction(tr("Edit Original"), this, [m] {  // in its own application; saved changes reload by themselves
+                QDesktopServices::openUrl(QUrl::fromLocalFile(QString::fromStdString(m->path)));
             });
         if (m && !m->path.empty())
             menu.addAction(tr("Reveal in File Manager"), this, [m] {

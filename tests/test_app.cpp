@@ -1,6 +1,7 @@
 // Application integration tests: drive the real main window offscreen —
 // timeline mouse gestures, tools, undo, inspector, monitors and playback.
 #include <QtTest>
+#include <QSignalSpy>
 #include <QPlainTextEdit>
 
 #include <QAbstractScrollArea>
@@ -2146,6 +2147,39 @@ private slots:
         QCOMPARE(state()->sequence()->videoTracks[0].clips.size(), size_t(2));
         state()->undo();
         QCOMPARE(state()->sequence()->videoTracks[0].clips.size(), size_t(3));
+        state()->newProject();
+    }
+
+    void changedMediaReloads() {
+        // A graphic in the cut, re-saved in another application.
+        const QString png = dir_.path() + "/graphic.png";
+        QImage img(64, 36, QImage::Format_RGB32);
+        img.fill(qRgb(220, 20, 20));
+        QVERIFY(img.save(png));
+        state()->newProject();
+        const auto ids = state()->importFiles({png});
+        QCOMPARE(ids.size(), size_t(1));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids[0], 0, 0, 60, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        auto centre = [&]() {
+            const Image f = renderSequenceFrame(state()->project(), *state()->sequence(), 10, {});
+            const size_t i = (size_t(f.height / 2) * size_t(f.width) + size_t(f.width / 2)) * 4;
+            return QColor::fromRgbF(std::clamp(f.px[i], 0.f, 1.f), std::clamp(f.px[i + 1], 0.f, 1.f), std::clamp(f.px[i + 2], 0.f, 1.f));
+        };
+        QVERIFY(centre().red() > 150);
+        QSignalSpy spy(state(), &EditorState::mediaFileChanged);
+        img.fill(qRgb(20, 20, 220));
+        QVERIFY(img.save(png));
+        QTRY_VERIFY_WITH_TIMEOUT(spy.count() > 0, 5000);
+        QCOMPARE(Id(spy.first().first().toULongLong()), ids[0]);
+        QVERIFY2(centre().blue() > 150 && centre().red() < 80, qPrintable(centre().name()));
+        // Saved larger: its new size is read.
+        QImage big(128, 72, QImage::Format_RGB32);
+        big.fill(qRgb(20, 200, 20));
+        QVERIFY(big.save(png));
+        QTRY_COMPARE_WITH_TIMEOUT(state()->project().findMedia(ids[0])->width, 128, 5000);
+        QVERIFY(centre().green() > 150);
         state()->newProject();
     }
 

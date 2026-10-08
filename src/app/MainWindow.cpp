@@ -297,6 +297,10 @@ void MainWindow::buildPanels() {
         shots_->searchSimilar(media, m->duration / 2);
     });
     connect(bin_, &MediaBinWidget::linkMediaRequested, this, [this] { showLinkMedia(); });
+    connect(state_, &EditorState::mediaFileChanged, this, [this] {  // a file changed on disk: show it as it is now
+        program_->requestFrame();
+        source_->requestFrame();
+    });
     connect(bin_, &MediaBinWidget::createMulticamRequested, this, [this](const std::vector<Id>& media) {
         if (MulticamPanel::createMulticamDialog(state_, media, this)) {
             multicamDock_->show();

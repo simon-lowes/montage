@@ -32,6 +32,8 @@ public:
     void setFrameCacheBudget(size_t bytes);
     size_t frameCacheBytes() const;
     void clear();
+    // Drops everything cached for one file (decoded frames, idle decoders, audio and peaks), after it changed on disk.
+    void forget(const std::string& path);
     // Called (from any thread) when audio/peaks for a path become available.
     void setReadyCallback(std::function<void(const std::string&)> cb);
 

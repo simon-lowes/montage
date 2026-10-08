@@ -4,15 +4,19 @@
 #include <QDir>
 #include <QPointer>
 #include <QFileInfo>
+#include <QFileSystemWatcher>
+#include <QTimer>
 #include <QStandardPaths>
 #include <QtConcurrent>
 #include <algorithm>
+#include <utility>
 
 #include "core/MediaLog.h"
 #include "core/ProjectIO.h"
 #include "media/Decoder.h"
 #include "media/MediaPool.h"
 #include "media/Relink.h"
+#include "ThumbnailCache.h"
 
 namespace montage {
 
@@ -29,6 +33,20 @@ EditorState::EditorState(QObject* parent) : QObject(parent), project_(makeDefaul
         }, Qt::QueuedConnection);
     });
     savedRevision_ = history_.revision();
+    // Changed media files are reloaded once they have been quiet for a moment (editors save in several writes).
+    watcher_ = new QFileSystemWatcher(this);
+    reloadTimer_ = new QTimer(this);
+    reloadTimer_->setSingleShot(true);
+    reloadTimer_->setInterval(400);
+    connect(watcher_, &QFileSystemWatcher::fileChanged, this, [this](const QString& path) {
+        if (!changedFiles_.contains(path)) changedFiles_ << path;
+        reloadTimer_->start();
+    });
+    connect(reloadTimer_, &QTimer::timeout, this, [this] {
+        const QStringList paths = std::exchange(changedFiles_, {});
+        reloadChangedMedia(paths);
+    });
+    connect(this, &EditorState::projectChanged, this, &EditorState::watchMediaFiles);
 }
 
 EditorState::~EditorState() { MediaPool::instance().setReadyCallback(nullptr); }
@@ -271,6 +289,56 @@ void EditorState::setSnapping(bool on) {
 
 // ---------------------------------------------------------------------------
 // Media
+
+void EditorState::watchMediaFiles() {
+    QStringList wanted;
+    for (const MediaItem& m : project_.media)
+        if (!m.path.empty() && m.kind != MediaKind::Sequence && !m.subclipOf) {
+            const QString p = QString::fromStdString(m.path);
+            if (!wanted.contains(p) && QFileInfo::exists(p)) wanted << p;
+        }
+    const QStringList watched = watcher_->files();
+    QStringList gone, added;
+    for (const QString& p : watched)
+        if (!wanted.contains(p)) gone << p;
+    for (const QString& p : wanted)
+        if (!watched.contains(p)) added << p;
+    if (!gone.isEmpty()) watcher_->removePaths(gone);
+    if (!added.isEmpty()) watcher_->addPaths(added);
+}
+
+void EditorState::reloadChangedMedia(const QStringList& paths) {
+    QStringList names;
+    std::vector<Id> reloaded;
+    for (const QString& path : paths) {
+        if (!QFileInfo::exists(path)) continue;  // gone (or being replaced): offline until it is back
+        if (!watcher_->files().contains(path)) watcher_->addPath(path);  // replaced by a new file: watch that
+        const std::string p = path.toStdString();
+        MediaPool::instance().forget(p);
+        ThumbnailCache::instance().forget(path);
+        MediaItem fresh;
+        if (!probeMedia(p, fresh)) continue;
+        for (MediaItem& m : project_.media) {
+            if (m.path != p) continue;
+            m.width = fresh.width, m.height = fresh.height, m.fps = fresh.fps;
+            m.hasVideo = fresh.hasVideo, m.hasAudio = fresh.hasAudio;
+            m.sampleRate = fresh.sampleRate, m.channels = fresh.channels;
+            m.videoCodec = fresh.videoCodec, m.audioCodec = fresh.audioCodec;
+            if (!m.subclipOf) {
+                m.duration = fresh.duration;
+                names << QString::fromStdString(m.name);
+            }
+            reloaded.push_back(m.id);
+        }
+        for (const MediaItem& m : project_.media)
+            if (m.path == p && !m.subclipOf) startAudioDecode(m);
+    }
+    offlineChecked_.clear();
+    if (reloaded.empty()) return;
+    for (Id id : reloaded) emit mediaFileChanged(id);
+    emit projectChanged();
+    message(tr("Reloaded %1, changed on disk").arg(names.join(QStringLiteral(", "))), 4000);
+}
 
 bool EditorState::isMediaOffline(Id media) const {
     const MediaItem* m = media ? project_.findMedia(media) : nullptr;

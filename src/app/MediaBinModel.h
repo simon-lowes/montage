@@ -40,6 +40,7 @@ public:
     bool setField(const std::vector<Id>& ids, const std::string& key, const QString& value);
     // Picks up new thumbnails.
     void refreshThumbnails();
+    void forgetThumbnail(Id id);  // its file changed: decode the thumbnail again
     // Hover scrub (Premiere's hover scrub, Final Cut's skimming): the item's thumbnail shows its media's frame at
     // `seconds`, with a playhead line `fraction` of the way across, until clearSkim(). Videos only.
     void setSkim(Id id, double seconds, double fraction);

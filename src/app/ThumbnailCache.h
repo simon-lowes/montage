@@ -20,6 +20,9 @@ public:
     // quantised to `quantum` to keep the cache small.
     QImage get(const QString& path, double seconds, int width, int height, double quantum = 0.0);
 
+    // Drops the file's thumbnails (it changed on disk).
+    void forget(const QString& path);
+
 signals:
     void ready();
 
