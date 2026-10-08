@@ -293,6 +293,7 @@ const std::vector<MediaField>& mediaFields() {
         {"channels", "Audio Channels", T::Number, false, false, true},
         {"colour", "Colour Space", T::Text, false, true, true},
         {"transcript", "Transcript", T::Text, false, true, true},
+        {"people", "People", T::Keywords, false, false, true},
         {"proxy", "Proxy", T::Text, false, true, true},
         {"bin", "Bin", T::Text, false, true, true},
         {"path", "File", T::Text, false, true, true},
@@ -366,6 +367,20 @@ std::optional<MediaItem> makeSubclip(const Project& p, Id media, double in, doub
         m.name = name;
     }
     return m;
+}
+
+std::vector<std::string> peopleSeen(const Project* p, const MediaItem& m) {
+    if (!p) return {};
+    const MediaItem* src = m.subclipOf ? p->findMedia(m.subclipOf) : &m;
+    if (!src || !src->faces) return {};
+    std::map<int, int> count;
+    for (const FaceIndex::Face& f : src->faces->faces)
+        if (f.person > 0 && (!m.subclipOf || (f.time >= m.subclipIn && f.time <= m.subclipOut))) ++count[f.person];
+    std::vector<std::pair<int, int>> order(count.begin(), count.end());
+    std::stable_sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    std::vector<std::string> out;
+    for (const auto& [id, n] : order) out.push_back(personName(*p, id));
+    return out;
 }
 
 std::string spokenText(const Project* p, const MediaItem& m) {
@@ -494,6 +509,7 @@ bool mediaMatchesSearch(const MediaItem& m, const std::string& query, const Proj
     QString text = qs(m.name);
     for (const std::string& k : m.keywords) text += "\n" + qs(k);
     for (const auto& [key, v] : m.metadata) text += "\n" + qs(v);
+    for (const std::string& name : peopleSeen(p, m)) text += "\n" + qs(name);
     const QString spoken = qs(spokenText(p, m));
     for (const QString& t : terms)
         if (!text.contains(t, Qt::CaseInsensitive) && !spoken.contains(t, Qt::CaseInsensitive)) return false;
@@ -529,6 +545,7 @@ QString ruleText(const MediaItem& m, const std::string& key, const std::map<Id, 
         for (const std::string& k : m.keywords) text += "\n" + qs(k);
         for (const auto& [k, v] : m.metadata) text += "\n" + qs(v);
         text += "\n" + qs(spokenText(p, m));
+        for (const std::string& name : peopleSeen(p, m)) text += "\n" + qs(name);
         return text;
     }
     return qs(mediaFieldText(m, key, &usage));
@@ -582,12 +599,13 @@ bool ruleMatches(const SmartRule& r, const MediaItem& m, const std::map<Id, int>
             return r.op == "is" ? same : r.op == "!is" ? !same : false;
         }
         case FieldType::Keywords: {
-            const bool has = std::any_of(m.keywords.begin(), m.keywords.end(),
+            const std::vector<std::string> list = r.field == "people" ? peopleSeen(p, m) : m.keywords;
+            const bool has = std::any_of(list.begin(), list.end(),
                                          [&](const std::string& k) { return sameText(k, qs(r.value).trimmed().toStdString()); });
             if (r.op == "includes") return has;
             if (r.op == "!includes") return !has;
-            if (r.op == "empty") return m.keywords.empty();
-            if (r.op == "!empty") return !m.keywords.empty();
+            if (r.op == "empty") return list.empty();
+            if (r.op == "!empty") return !list.empty();
             return false;
         }
     }

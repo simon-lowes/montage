@@ -12,6 +12,7 @@ add_library(montage_engine STATIC
   core/Cfb.h core/Cfb.cpp
   core/Checkerboard.h core/Checkerboard.cpp
   core/Bleep.h core/Bleep.cpp
+  core/FaceIndex.h core/FaceIndex.cpp
   core/Aaf.h core/Aaf.cpp core/AafMetaDictionary.inc
   core/Surround.h core/Surround.cpp
   core/Effects.h core/Effects.cpp
@@ -26,6 +27,7 @@ add_library(montage_engine STATIC
   media/Decoder.h media/Decoder.cpp
   media/Vector.h media/Vector.cpp
   media/SuperScale.h media/SuperScale.cpp
+  media/Faces.h media/Faces.cpp
   media/HwAccel.h media/HwAccel.cpp
   media/MediaPool.h media/MediaPool.cpp
   media/Analysis.h media/Analysis.cpp

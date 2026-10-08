@@ -51,6 +51,7 @@
 #include "media/SuperScale.h"
 #include "media/Reframe.h"
 #include "media/Diarizer.h"
+#include "media/Faces.h"
 #include "media/VisualSearch.h"
 #include "automation/McpServer.h"
 #ifdef MONTAGE_WITH_WHISPER
@@ -1968,6 +1969,149 @@ private slots:
         const QJsonObject first = r.value("structuredContent").toObject().value("moments").toArray()[0].toObject();
         QVERIFY(first.value("media").toString().endsWith("similar-a.mp4"));
         QVERIFY(first.value("best_seconds").toDouble() >= 4);
+    }
+
+    void jpegStillsDecode() {
+        // A JPEG still decodes, at any size (FFmpeg's image demuxer reads a JPEG as finished after a seek).
+        VideoDecoder dec;
+        std::string err;
+        QVERIFY2(dec.open(MONTAGE_TEST_DATA_DIR "/faces/jfk-color.jpg", &err), err.c_str());
+        QVERIFY(dec.isStill());
+        Frame16Ptr f = dec.frameAt(0);
+        QVERIFY(f);
+        QCOMPARE(f->width, 320);
+        QCOMPARE(f->height, 415);
+        Frame16Ptr half = dec.frameAt(1.5, 160, 208, true);
+        QVERIFY(half);
+        QCOMPARE(half->width, 160);
+        // Not black: the portrait's middle has colour.
+        const uint16_t* px = &half->px[(size_t(104) * 160 + 80) * 4];
+        QVERIFY(int(px[0]) + px[1] + px[2] > 3000);
+        MediaItem m;
+        QVERIFY2(probeMedia(MONTAGE_TEST_DATA_DIR "/faces/armstrong.jpg", m, &err), err.c_str());
+        QCOMPARE(int(m.kind), int(MediaKind::Image));
+    }
+
+    void peopleSearch() {
+        if (!faceSearchAvailable() || !faceModel().installed()) QSKIP("Set MONTAGE_FACE_MODEL to the YuNet and SFace models");
+        std::string err;
+        auto model = FaceModel::load(&err);
+        QVERIFY2(model, err.c_str());
+        auto still = [&](const char* name) {
+            VideoDecoder dec;
+            const std::string f = std::string(MONTAGE_TEST_DATA_DIR "/faces/") + name;
+            if (!dec.open(f, &err)) return Frame16Ptr();
+            return dec.frameAt(0, dec.displayWidth(), dec.displayHeight(), true);
+        };
+        // One face each, where OpenCV's own YuNet finds it (x, y, w, h at 320 px wide).
+        struct Ref { const char* file; float box[4]; };
+        const Ref refs[] = {{"jfk-color.jpg", {77, 88, 123, 156}},
+                            {"jfk-looking-up.jpg", {54, 67, 182, 218}},
+                            {"armstrong.jpg", {170, 76, 53, 70}}};
+        std::vector<std::vector<float>> ids;
+        for (const Ref& r : refs) {
+            Frame16Ptr f = still(r.file);
+            QVERIFY2(f, err.c_str());
+            QCOMPARE(f->width, 320);
+            const auto faces = model->detect(*f);
+            QCOMPARE(int(faces.size()), 1);
+            const DetectedFace& d = faces[0];
+            QVERIFY(d.score > 0.85f);
+            const float got[4] = {d.x, d.y, d.w, d.h};
+            for (int i = 0; i < 4; ++i)
+                QVERIFY2(std::abs(got[i] - r.box[i]) <= 4, qPrintable(QString("%1 %2: %3 vs %4").arg(r.file).arg(i).arg(got[i]).arg(r.box[i])));
+            // The eyes sit in the top half of the box, the mouth below the nose.
+            QVERIFY(d.landmarks[1] < d.y + d.h * 0.6f && d.landmarks[9] > d.landmarks[5]);
+            ids.push_back(model->embed(*f, d));
+            QCOMPARE(int(ids.back().size()), 128);
+        }
+        auto cosine = [](const std::vector<float>& a, const std::vector<float>& b) {
+            float s = 0;
+            for (size_t i = 0; i < a.size(); ++i) s += a[i] * b[i];
+            return s;
+        };
+        QVERIFY(std::abs(cosine(ids[0], ids[0]) - 1) < 1e-3f);
+        QVERIFY2(cosine(ids[0], ids[1]) > 0.5f, qPrintable(QString::number(cosine(ids[0], ids[1]))));
+        QVERIFY(cosine(ids[0], ids[2]) < 0.3f && cosine(ids[1], ids[2]) < 0.3f);
+
+        // Indexed in a project: Kennedy twice, Armstrong once.
+        Project p = makeDefaultProject();
+        for (const Ref& r : refs) {
+            const std::string f = std::string(MONTAGE_TEST_DATA_DIR "/faces/") + r.file;
+            MediaItem m = probeOrFail(p, f);
+            FaceIndex index;
+            QVERIFY2(indexFaces(f, 0, index, 0, 8, 32, {}, nullptr, &err), err.c_str());
+            QCOMPARE(int(index.faces.size()), 1);
+            QCOMPARE(index.model, faceModel().id);
+            QVERIFY(std::abs(index.faces[0].x - r.box[0] / 320.0f) < 0.02f);
+            m.faces = std::make_shared<const FaceIndex>(index);
+            p.media.push_back(m);
+        }
+        QCOMPARE(groupPeople(p), 2);
+        const auto people = peopleIn(p);
+        QCOMPARE(int(people.size()), 2);
+        QCOMPARE(people[0].faces, 2);
+        QCOMPARE(people[0].media, 2);
+        QCOMPARE(people[1].faces, 1);
+        const int jfk = people[0].id, neil = people[1].id;
+        QCOMPARE(p.media[0].faces->faces[0].person, jfk);
+        QCOMPARE(p.media[1].faces->faces[0].person, jfk);
+        QCOMPARE(p.media[2].faces->faces[0].person, neil);
+        QCOMPARE(QString::fromStdString(personName(p, neil)), QString("Person %1").arg(neil));
+
+        // Names and ids survive grouping again, and saving.
+        for (Person& person : p.people)
+            if (person.id == neil) person.name = "Neil Armstrong";
+        QCOMPARE(groupPeople(p), 2);
+        QCOMPARE(p.media[2].faces->faces[0].person, neil);
+        QCOMPARE(personName(p, neil), std::string("Neil Armstrong"));
+        const auto moments = findPerson(p, jfk);
+        QCOMPARE(int(moments.size()), 2);
+        QCOMPARE(moments[0].media, p.media[0].id);
+        QCOMPARE(moments[1].media, p.media[1].id);
+        QVERIFY(findPerson(p, 999).empty());
+
+        FaceIndex back;
+        QVERIFY(faceIndexFromJson(faceIndexToJson(*p.media[0].faces), back));
+        QCOMPARE(back.faces.size(), p.media[0].faces->faces.size());
+        QVERIFY(back == *p.media[0].faces);
+        const std::string file = path("people.montage");
+        QVERIFY(saveProject(p, file));
+        Project loaded;
+        QVERIFY(loadProject(file, loaded, &err));
+        QCOMPARE(int(loaded.people.size()), 2);
+        QVERIFY(loaded.people == p.people);
+        QVERIFY(loaded.media[2].faces && *loaded.media[2].faces == *p.media[2].faces);
+        QCOMPARE(personName(loaded, neil), std::string("Neil Armstrong"));
+
+        // Who is in what: the bin's search and a smart bin rule.
+        QCOMPARE(peopleSeen(&p, p.media[2]), std::vector<std::string>{"Neil Armstrong"});
+        QVERIFY(mediaMatchesSearch(p.media[2], "armstrong", &p));
+        QVERIFY(!mediaMatchesSearch(p.media[0], "armstrong", &p));
+        SmartBin bin;
+        bin.rules.push_back({"people", "includes", "neil armstrong"});
+        QCOMPARE(smartBinMedia(p, bin), std::vector<Id>{p.media[2].id});
+        bin.rules[0] = {"people", "!empty", ""};
+        QCOMPARE(int(smartBinMedia(p, bin).size()), 3);
+
+        // A new face joins the person it looks like; people already found keep theirs.
+        auto unsorted = std::make_shared<FaceIndex>(*p.media[1].faces);
+        unsorted->faces[0].person = 0;
+        p.media[1].faces = unsorted;
+        QCOMPARE(groupPeople(p), 2);
+        QCOMPARE(p.media[1].faces->faces[0].person, jfk);
+        // Merged by hand, they stay merged; starting again splits them.
+        QVERIFY(renamePerson(p, jfk, "JFK"));
+        QVERIFY(!renamePerson(p, 999, "Nobody"));
+        QVERIFY(mergePeople(p, neil, jfk));
+        QCOMPARE(int(p.people.size()), 1);
+        QCOMPARE(p.media[2].faces->faces[0].person, jfk);
+        QCOMPARE(personName(p, jfk), std::string("JFK"));
+        QVERIFY(!mergePeople(p, neil, jfk));
+        QCOMPARE(groupPeople(p), 1);
+        QCOMPARE(groupPeople(p, 0.42f, true), 2);
+        QCOMPARE(p.media[0].faces->faces[0].person, jfk);
+        QVERIFY(p.media[2].faces->faces[0].person != jfk);
     }
 
     void visualSearch() {

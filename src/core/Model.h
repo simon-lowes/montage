@@ -17,6 +17,7 @@
 #include "Captions.h"
 #include "ObjectMask.h"
 #include "Transcript.h"
+#include "FaceIndex.h"
 #include "VisualIndex.h"
 
 namespace montage {
@@ -118,6 +119,8 @@ struct MediaItem {
     std::shared_ptr<const Transcript> transcript;
     // What the footage shows, for search by description (shared like the transcript).
     std::shared_ptr<const VisualIndex> visual;
+    // The faces in it, for finding people (shared like the visual index).
+    std::shared_ptr<const FaceIndex> faces;
     // Logging (core/MediaLog.h): what the editor notes about the media to find it again.
     int rating = 0;                                // -1 rejected, 0 unrated, 1-5 stars
     int label = 0;                                 // colour label (core/MediaLog.h labelName), 0 = none
@@ -293,6 +296,7 @@ struct Project {
     std::vector<Sequence> sequences;
     std::vector<std::string> bins;  // bin paths ("Interviews/Day 1"), including empty ones
     std::vector<SmartBin> smartBins;
+    std::vector<Person> people;  // the people found in the footage (FaceIndex.h), with their names
     Id activeSequence = 0;
     Id nextId = 1;
 

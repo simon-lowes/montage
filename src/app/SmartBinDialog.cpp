@@ -175,7 +175,11 @@ void SmartBinDialog::fieldChanged(Row& row) {
             break;
         case FieldType::Keywords:
             row.choice->setEditable(true);
-            for (const std::string& k : projectKeywords(project_)) row.choice->addItem(QString::fromStdString(k), QString::fromStdString(k));
+            if (std::string(f->key) == "people")
+                for (const PersonSummary& person : peopleIn(project_))
+                    row.choice->addItem(QString::fromStdString(person.name), QString::fromStdString(person.name));
+            else
+                for (const std::string& k : projectKeywords(project_)) row.choice->addItem(QString::fromStdString(k), QString::fromStdString(k));
             break;
         default: choice = false;
     }

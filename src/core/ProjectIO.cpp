@@ -503,6 +503,8 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
             o["transcript"] = QJsonDocument::fromJson(QByteArray::fromStdString(transcriptToJson(*m.transcript))).object();
         if (m.visual && !m.visual->samples.empty())
             o["visual"] = QJsonDocument::fromJson(QByteArray::fromStdString(visualIndexToJson(*m.visual))).object();
+        if (m.faces && !m.faces->model.empty())
+            o["faces"] = QJsonDocument::fromJson(QByteArray::fromStdString(faceIndexToJson(*m.faces))).object();
         media.append(o);
     }
     root["media"] = media;
@@ -510,6 +512,11 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
         QJsonArray bins;
         for (const auto& b : p.bins) bins.append(qs(b));
         root["bins"] = bins;
+    }
+    if (!p.people.empty()) {
+        QJsonArray people;
+        for (const Person& person : p.people) people.append(QJsonObject{{"id", person.id}, {"name", qs(person.name)}});
+        root["people"] = people;
     }
     if (!p.smartBins.empty()) {
         QJsonArray smart;
@@ -570,6 +577,11 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
             if (visualIndexFromJson(QJsonDocument(o.value("visual").toObject()).toJson(QJsonDocument::Compact).toStdString(), v))
                 m.visual = std::make_shared<const VisualIndex>(std::move(v));
         }
+        if (o.contains("faces")) {
+            FaceIndex f;
+            if (faceIndexFromJson(QJsonDocument(o.value("faces").toObject()).toJson(QJsonDocument::Compact).toStdString(), f))
+                m.faces = std::make_shared<const FaceIndex>(std::move(f));
+        }
         m.duration = o.value("duration").toDouble();
         m.width = o.value("width").toInt();
         m.height = o.value("height").toInt();
@@ -598,6 +610,7 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
         p.media.push_back(m);
     }
     for (const auto& b : root.value("bins").toArray()) p.bins.push_back(ss(b));
+    for (const auto& pv : root.value("people").toArray()) p.people.push_back({pv.toObject().value("id").toInt(), ss(pv.toObject().value("name"))});
     for (const auto& bv : root.value("smartBins").toArray()) {
         const QJsonObject o = bv.toObject();
         SmartBin b;

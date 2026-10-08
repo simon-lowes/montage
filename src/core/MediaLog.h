@@ -53,6 +53,9 @@ std::optional<MediaItem> makeSubclip(const Project& p, Id media, double in, doub
 // What is said in the media: its transcript, or for a subclip the words of
 // its parent's transcript within its range (which needs the project).
 std::string spokenText(const Project* p, const MediaItem& m);
+// Who is seen in the media (core/FaceIndex.h): the names of the people its
+// faces were grouped into, most seen first; for a subclip, within its range.
+std::vector<std::string> peopleSeen(const Project* p, const MediaItem& m);
 
 // ---------------------------------------------------------------------------
 // Keywords.
@@ -101,7 +104,8 @@ bool setMediaField(MediaItem& m, const std::string& key, const std::string& valu
 // Search and smart bins.
 
 // The search box: every word must appear (case-insensitively) in the name,
-// keywords, metadata or speech (spokenText, so subclips need the project).
+// keywords, metadata, speech or the names of the people seen (spokenText and
+// peopleSeen, which need the project).
 bool mediaMatchesSearch(const MediaItem& m, const std::string& query, const Project* p = nullptr);
 
 struct RuleOp {

@@ -510,11 +510,15 @@ Frame16Ptr VideoDecoder::frameAt(double t, int targetW, int targetH, bool highQu
     if (still_) {
         if (!stillFrame_ || stillFrame_->width != targetW || stillFrame_->height != targetH) {
             if (!haveCur_) {
-                seek(0);
-                if (decodeNext(cur_)) {
-                    haveCur_ = true;
-                    curPts_ = 0;
+                // The picture as opened; else sought back to; else from a fresh open
+                // (FFmpeg's image demuxer reads a JPEG as finished after a seek).
+                haveCur_ = decodeNext(cur_);
+                if (!haveCur_) {
+                    seek(0);
+                    haveCur_ = decodeNext(cur_);
                 }
+                if (!haveCur_ && open(std::string(path_), nullptr)) haveCur_ = decodeNext(cur_);
+                if (haveCur_) curPts_ = 0;
             }
             if (!haveCur_) return nullptr;
             stillFrame_ = convert(cur_, 0, targetW, targetH, true);
