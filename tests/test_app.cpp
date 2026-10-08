@@ -745,6 +745,21 @@ private slots:
         QVERIFY(QTest::qWaitForWindowActive(win_.get()));
     }
 
+    void exportAafFromTheFileMenu() {
+        state()->newProject();
+        auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        QVERIFY(state()->apply("Place", [media](Project& p, Sequence& s) { return edit::placeMedia(p, s, media, 10, 25, 50, V1, A1, false); }));
+        QVERIFY(win_->findChild<QAction*>("exportAaf"));
+        QString summary;
+        QVERIFY(win_->exportAafTo(dir_.path() + "/turnover.aaf", &summary));
+        QVERIFY2(summary.contains("1 audio tracks") && summary.contains("1 clips"), qPrintable(summary));
+        QVERIFY(QFileInfo::exists(dir_.path() + "/turnover.aaf"));
+        QVERIFY(QFileInfo::exists(dir_.path() + "/turnover Media/jfk.wav"));
+        state()->newProject();
+    }
+
     void renderAndReplaceInTheTimeline() {
         state()->newProject();
         auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});

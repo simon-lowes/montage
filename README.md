@@ -110,6 +110,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - **Auto Duck Music** (Clip menu): select music clips, tick the dialogue tracks, and the music dips under speech, fading down before it and back up after it. Speech is found from transcripts' words, or from loudness. The result is volume keyframes you can adjust on the clip's line.
 - Track faders, pan, mute and solo in a mixer panel
 - **Surround (5.1 and 7.1)**: choose the sequence's audio channels in Sequence Settings, and each mixer strip gets a surround panner in place of its pan dial. Drag the sound among the speakers (towards the middle spreads it over all of them), scroll to narrow a stereo track to a point, and right-click for its width, an LFE send, Front, or the Centre speaker for dialogue. Tracks routed to a bus are placed by the bus. You hear the mix folded down to stereo (ITU-R BS.775); exports carry every channel (5.1 or 7.1 WAV, AAC, ProRes...) unless you pick the stereo fold-down, and loudness normalisation weights the surrounds as BS.1770 says.
+- **AAF for audio post** (File › Export AAF for Audio Post, `montage-cli aaf`, or MCP): the audio tracks as an AAF composition for Pro Tools, Fairlight, Nuendo or Media Composer. It links to mono 24-bit 48 kHz WAVs (one per channel of each source, in a "<name> Media" folder beside it). Clip positions and source offsets are exact, with whole sources so the mixer has every handle. Crossfades become AAF transitions, fades become fade lengths, and clip gain and its keyframes become Audio Gain operations. Clips that change speed or play backwards, and nested sequences, are rendered to their own files first. The file is checked by an independent AAF reader (pyaaf2) and a strict compound-file reader (olefile).
 - **Stems** (Export › Stems, or `--stems tracks|buses`): beside the export, a 24-bit WAV of each audio track, or of each bus plus "Main" for the tracks going straight to the master. Each is its part of the mix exactly as it plays there, so together they add up to the mix.
 - Insert effects on audio tracks, buses (submixes) and the master, including plugins. Use a strip's FX button to edit them in the Inspector, route tracks to buses from the strip's output menu, and add buses with + Bus. Track effects keep running past the last clip, so reverb and echo tails ring out.
 - Plugin delay compensation: the latency plugins report is compensated on clips, tracks, buses and the master, so everything stays in sync with the picture and with other tracks, including straight after a seek.
@@ -276,6 +277,7 @@ montage-cli loudness mix.wav                                 # integrated LUFS a
 montage-cli upscale old-sd.mp4 -o hd.mov --factor 3          # Super Scale copy (Real-ESRGAN)
 montage-cli edl cut.montage -o cut.edl                       # CMX 3600 EDL
 montage-cli otio cut.montage -o cut.otio                     # OpenTimelineIO
+montage-cli aaf cut.montage -o cut.aaf                       # AAF + WAVs for Pro Tools / Fairlight
 montage-cli xml cut.montage -o cut.xml                       # Final Cut Pro 7 XML (Premiere, Resolve)
 montage-cli fcpxml cut.montage -o cut.fcpxml                 # FCPXML (Final Cut Pro)
 montage-cli import edit.fcpxml -o edit.montage               # FCP XML, FCPXML, OTIO or EDL into a project
@@ -310,7 +312,7 @@ Its tools work on `.montage` files by path. Each edit is saved at once, and the 
 - make a first mix (roles, levels, dialogue rides, ducking), set up a 5.1 or 7.1 mix and place tracks in it, match voices to a reference, mark a music clip's bars or beats and fit music to a length, duck music under dialogue, match clips' colour to a shot, add adjustment layers, and make a reframed copy of the cut at another aspect ratio;
 - return a rendered frame as an image so the agent can check its work;
 - render with any preset, with progress, optionally folding surround down to stereo and writing stems;
-- export and import EDL, OTIO, FCP 7 XML and FCPXML.
+- export and import EDL, OTIO, FCP 7 XML and FCPXML, and export AAF for audio post.
 
 ```bash
 claude mcp add montage -- montage-cli mcp      # Claude Code
@@ -340,4 +342,4 @@ Notes on the design:
 
 ## Roadmap
 
-Phase 2 is ranked in [`docs/research/phase2-roadmap.md`](docs/research/phase2-roadmap.md) and tracked in [`PROGRESS.md`](PROGRESS.md). Next up: a GPU compositor, HDR monitoring, and more of Phase 3 (metadata, ratings and smart bins).
+Phases 2 and 3 are ranked in [`docs/research/phase2-roadmap.md`](docs/research/phase2-roadmap.md) and [`docs/research/phase3-roadmap.md`](docs/research/phase3-roadmap.md) and tracked in [`PROGRESS.md`](PROGRESS.md); both are complete apart from the GPU compositor. Next up: the GPU compositor, and Phase 3's near misses (bleeping words from the transcript, checkerboarding dialogue by speaker, Find Similar shots, people search, depth maps, better slow motion).

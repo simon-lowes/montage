@@ -415,6 +415,8 @@ Ranked by the research in `docs/research/phase2-roadmap.md` (impact versus effor
 
 The second gap analysis (`docs/research/phase3-roadmap.md`, October 2026) ranks what is still missing against Premiere 26.5, Resolve 21, Final Cut Pro 12.4, Media Composer 2026.8, CapCut and Descript.
 
+All 15 items are in (October 2026). The near misses listed in the roadmap are the next candidates.
+
 - [x] 1. Animated word-by-word captions (S):
   - Captions keep each word's start as a fraction of the caption, so moves, retimes and ripples keep them in step. Captions made from transcripts fill them; otherwise words are spread by their length. Saved with the project.
   - Caption styles add an animation (Word by Word, Highlight, Pop, One Word at a Time) and a highlight colour. The renderer lays out each word, keeping the line in place as it fills in, and pops the spoken word over its first three frames.
@@ -501,4 +503,31 @@ The second gap analysis (`docs/research/phase3-roadmap.md`, October 2026) ranks 
   - **Speed:** on four CPU cores, 480x270 to 1080p takes about 1.1 s per frame, and 1080p to 4K about 4.2 s.
   - **Tests:** lettering, lines and circles shrunk to a quarter come back 4.3 dB closer than with bilinear (24.7 dB against 20.4 dB), with as much edge energy as the original (6.3 times bilinear's). Half strength is half way. A tiled picture matches a single pass exactly. The effect runs in the compositor and is skipped in a quarter-size preview. A still copy at 4x, and a video copy at 2x through MCP that keeps its sound, are checked. The bin offers the copy.
   - **Left out:** temporal consistency between frames (Real-ESRGAN works on one frame at a time; video models such as BasicVSR++ are heavier and non-commercial), and GPU execution providers (ONNX Runtime here is CPU only).
-- [ ] 15. AAF export to Pro Tools and Fairlight (L)
+- [x] 15. AAF export to Pro Tools and Fairlight (L):
+  - **core/Cfb:** a Compound File Binary writer and reader ([MS-CFB] version 4, 4096-byte sectors; the mini stream for small streams; FAT and DIFAT; sibling trees built balanced and coloured so they are valid red-black trees).
+  - **core/Aaf:** AAF objects stored as the AAF SDK and pyaaf2 lay them out:
+    - per object, a storage with its class ID and a "properties" stream (byte order, version 32, pid/format/size entries);
+    - strong references as storages, with index streams for vectors and sets (keys and local keys);
+    - weak references as tags into the root's "referenced properties" table;
+    - Indirect values for parameters;
+    - the MetaDictionary (1,702 entries, the AAF object model) generated from pyaaf2 by `scripts/gen-aaf-metadict.py` and embedded compressed (29 KB).
+  - **render/AafExport, sources:** each source's audio becomes mono 24-bit 48 kHz WAVs (one per channel). Each WAV gets a file SourceMob (WAVEDescriptor with its RIFF summary, a NetworkLocator, and the AAF container), and each source a MasterMob with a slot per channel.
+  - **render/AafExport, the composition:** Usage_TopLevel, a timecode track, and a TimelineMobSlot per channel of each unmuted audio track at the sequence's edit rate (stereo tracks become L and R mono tracks, named and numbered).
+    - Clips are placed as Filler and SourceClips with exact source offsets.
+    - A crossfade is a Transition (Audio Dissolve) over the overlap; the clips run into their handles and the cut point is kept.
+    - Fades in and out are the clip's FadeIn/FadeOutLength (equal power or linear).
+    - Clip gain is an OperationGroup Audio Gain with a ConstantValue, or a VaryingValue whose linear control points are the clip's keyframes, timed as fractions of the operation.
+    - Clips that change speed or are reversed, and nested sequences, are rendered with `renderClipAudio` first.
+  - **Where to find it:** File › Export AAF for Audio Post (in the background, with progress), `montage-cli aaf`, and MCP `montage_export_timeline` format `aaf`.
+  - **Tests:**
+    - a CFB round trip with storages, the mini stream and a 300 KB stream;
+    - an export with mono speech and a stereo tone, a crossfade, keyframed and constant gain, a fade and a 2x clip, read back with the CFB reader (lengths, offsets, cut point, fade, control points);
+    - the same read with pyaaf2 when `MONTAGE_TEST_PYAAF2` names a Python that has it (`tests/tools/aaf_check.py`): compositions, tracks, transitions, gain values and WAV locators;
+    - every object checked by pyaaf2 against the model's required properties (none missing);
+    - olefile opens the file in strict mode, and every sibling tree is a valid red-black tree;
+    - the MCP and app paths.
+  - **Left out:**
+    - embedded media, which needs an AAF essence stream, so linked WAVs are used (Pro Tools and Resolve relink by path or by searching the folder);
+    - video tracks, because the turnover is for sound;
+    - track volume, pan and plugin effects, which the mixer redoes;
+    - testing against Pro Tools itself, which is not available here.

@@ -23,6 +23,7 @@
 #include "core/ProjectIO.h"
 #include "core/Transcript.h"
 #include "media/Analysis.h"
+#include "render/AafExport.h"
 #include "media/Decoder.h"
 #include "media/Loudness.h"
 #ifdef MONTAGE_WITH_WHISPER
@@ -71,6 +72,7 @@ int usage() {
                  "  montage-cli loudness <media>\n"
                  "  montage-cli edl <project.montage> [-o out.edl]\n"
                  "  montage-cli otio <project.montage> [-o out.otio]\n"
+                 "  montage-cli aaf <project.montage> -o <out.aaf>   (audio for Pro Tools, Fairlight; WAVs in \"<out> Media\")\n"
                  "  montage-cli xml <project.montage> [-o out.xml]       (Final Cut Pro 7 XML)\n"
                  "  montage-cli fcpxml <project.montage> [-o out.fcpxml]\n"
                  "  montage-cli import <timeline.xml|.fcpxml|.otio|.edl> -o <project.montage> [--fps N]\n"
@@ -517,6 +519,37 @@ int cmdInterchange(const std::vector<std::string>& args, const std::string& form
     return writeFile(out, text) ? 0 : 1;
 }
 
+int cmdAaf(const std::vector<std::string>& args) {
+    if (args.empty()) return usage();
+    std::string out;
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (args[i] == "-o" && i + 1 < args.size()) out = args[++i];
+        else return usage();
+    }
+    if (out.empty()) return usage();
+    Project p;
+    if (!load(args[0], p)) return 1;
+    std::signal(SIGINT, [](int) { gCancel = true; });
+    AafExportResult r;
+    std::string err;
+    const bool ok = exportAaf(
+        p, *p.active(), out, &r,
+        [](double f, FrameTime) {
+            std::fprintf(stderr, "\rAAF... %5.1f%%", f * 100.0);
+            std::fflush(stderr);
+        },
+        &gCancel, &err);
+    std::fprintf(stderr, "\n");
+    if (!ok) {
+        std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
+    }
+    for (const std::string& w : r.warnings) std::fprintf(stderr, "warning: %s\n", w.c_str());
+    std::printf("Wrote %s: %d audio tracks, %d clips, %d crossfades, %zu media files\n", out.c_str(), r.audioTracks, r.clips,
+                r.transitions, r.mediaFiles.size());
+    return 0;
+}
+
 int cmdBench(const std::vector<std::string>& args) {
     if (args.empty()) return usage();
     double scale = 0.5;
@@ -907,6 +940,7 @@ int main(int argc, char** argv) {
     if (cmd == "translate") return cmdTranslate(args);
     if (cmd == "import") return cmdImport(args);
     if (cmd == "edl" || cmd == "otio" || cmd == "xml" || cmd == "fcpxml") return cmdInterchange(args, cmd);
+    if (cmd == "aaf") return cmdAaf(args);
 #ifdef MONTAGE_WITH_WHISPER
     if (cmd == "transcribe") return cmdTranscribe(args);
     if (cmd == "models") return cmdModels();

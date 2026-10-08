@@ -9,6 +9,8 @@ add_library(montage_engine STATIC
   core/Captions.h core/Captions.cpp
   core/TranscriptEdit.h core/TranscriptEdit.cpp
   core/ScriptCut.h core/ScriptCut.cpp
+  core/Cfb.h core/Cfb.cpp
+  core/Aaf.h core/Aaf.cpp core/AafMetaDictionary.inc
   core/Surround.h core/Surround.cpp
   core/Effects.h core/Effects.cpp
   core/EditOps.h core/EditOps.cpp
@@ -42,6 +44,7 @@ add_library(montage_engine STATIC
   render/Retime.h render/Retime.cpp
   render/VideoDenoise.h render/VideoDenoise.cpp
   render/Shapes.h render/Shapes.cpp
+  render/AafExport.h render/AafExport.cpp
   render/ClipAnalysis.h render/ClipAnalysis.cpp
   render/MusicEdit.h render/MusicEdit.cpp
   render/AutoMix.h render/AutoMix.cpp

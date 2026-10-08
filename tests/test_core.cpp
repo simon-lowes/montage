@@ -1,11 +1,13 @@
 // Engine tests: keyframes, timecode, edit operations, undo, project I/O.
 #include <QtTest>
+#include <random>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 
 #include "core/AutoTag.h"
 #include "core/Captions.h"
+#include "core/Cfb.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
 #include "core/History.h"
@@ -1118,6 +1120,60 @@ private slots:
         unsure.add(0, mix({{0, 0}, {0, 1}}));
         unsure.add(1, mix({{3, 1}}));
         QVERIFY(autoTags(unsure, labels).keywords.empty());
+    }
+
+    void compoundFileRoundTrip() {
+        // Storages in storages, many small streams (the mini stream), a big one, and names that sort by length first.
+        CfbEntry root;
+        root.storage = true;
+        root.clsid[0] = 0xb3;
+        std::mt19937 rng(3);
+        for (int i = 0; i < 40; ++i) {
+            CfbEntry st;
+            st.storage = true;
+            st.name = "Storage " + std::to_string(i);
+            st.clsid[15] = uint8_t(i);
+            for (int k = 0; k < 5; ++k) {
+                CfbEntry s;
+                s.name = std::string(size_t(k + 1), char('a' + k)) + std::to_string(i);
+                s.data.resize(size_t(rng() % 300 + k * 7), char('0' + k));
+                st.children.push_back(s);
+            }
+            root.children.push_back(st);
+        }
+        CfbEntry big;
+        big.name = "big";
+        for (int i = 0; i < 300000; ++i) big.data += char(rng() & 0xff);
+        root.children.push_back(big);
+        CfbEntry empty;
+        empty.name = "empty";
+        root.children.push_back(empty);
+        QTemporaryDir dir;
+        const std::string path = (dir.path() + "/test.cfb").toStdString();
+        std::string err;
+        QVERIFY2(writeCompoundFile(path, root, &err), err.c_str());
+        CfbEntry back;
+        QVERIFY2(readCompoundFile(path, back, &err), err.c_str());
+        QCOMPARE(back.clsid[0], uint8_t(0xb3));
+        QCOMPARE(back.children.size(), root.children.size());
+        for (const CfbEntry& want : root.children) {
+            const CfbEntry* got = back.find(want.name);
+            QVERIFY2(got, want.name.c_str());
+            QCOMPARE(got->storage, want.storage);
+            QCOMPARE(got->data, want.data);
+            QCOMPARE(got->clsid, want.clsid);
+            for (const CfbEntry& w : want.children) {
+                const CfbEntry* g = got->find(w.name);
+                QVERIFY(g && g->data == w.data);
+            }
+        }
+        QVERIFY(back.at("Storage 7/ccc7") && back.at("Storage 7/ccc7")->data.size() > 0);
+        // Version 4: 4096-byte sectors.
+        QFile f(QString::fromStdString(path));
+        QVERIFY(f.open(QIODevice::ReadOnly));
+        const QByteArray head = f.read(32);
+        QCOMPARE(uint8_t(head[26]), uint8_t(4));
+        QCOMPARE(uint8_t(head[30]), uint8_t(12));
     }
 
     void surroundPanning() {

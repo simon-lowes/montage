@@ -77,6 +77,7 @@
 #include "media/AudioSync.h"
 #include "media/Loudness.h"
 #include "media/MediaPool.h"
+#include "render/AafExport.h"
 #include "render/ClipAnalysis.h"
 #include "render/RenderCache.h"
 #include "render/Compositor.h"
@@ -383,6 +384,8 @@ void MainWindow::buildMenus() {
     add(file, tr("Export &FCPXML (Final Cut Pro)…"), QKeySequence(), [this] { exportInterchange(Interchange::FcpXml); });
     add(file, tr("Export E&DL (CMX 3600)…"), QKeySequence(), [this] { exportInterchange(Interchange::Edl); });
     add(file, tr("Export &OpenTimelineIO…"), QKeySequence(), [this] { exportInterchange(Interchange::Otio); });
+    add(file, tr("Export &AAF for Audio Post (Pro Tools, Fairlight)…"), QKeySequence(), [this] { exportAafDialog(); })
+        ->setObjectName(QStringLiteral("exportAaf"));
     file->addSeparator();
     add(file, tr("&Quit"), QKeySequence::Quit, [this] { close(); });
 
@@ -1994,6 +1997,70 @@ void MainWindow::exportInterchange(Interchange format) {
     }
     st.setValue("lastExportDir", QFileInfo(path).absolutePath());
     statusBar()->showMessage(tr("Exported %1").arg(path), 4000);
+}
+
+bool MainWindow::exportAafTo(const QString& path, QString* summary) {
+    const Sequence* s = state_->sequence();
+    if (!s) return false;
+    // In the background on a copy of the project: decoding and writing the WAVs takes a while.
+    auto snap = std::make_shared<Project>(state_->project());
+    const Id seqId = s->id;
+    auto cancel = std::make_shared<std::atomic<bool>>(false);
+    auto progress = std::make_shared<std::atomic<double>>(0.0);
+    QProgressDialog dlg(tr("Exporting AAF and its audio files..."), tr("Cancel"), 0, 1000, this);
+    dlg.setWindowModality(Qt::WindowModal);
+    dlg.setMinimumDuration(300);
+    connect(&dlg, &QProgressDialog::canceled, this, [cancel] { *cancel = true; });
+    struct Outcome {
+        bool ok = false;
+        AafExportResult result;
+        std::string error;
+    };
+    QFutureWatcher<Outcome> watcher;
+    QEventLoop loop;
+    connect(&watcher, &QFutureWatcher<Outcome>::finished, &loop, &QEventLoop::quit);
+    QTimer poll;
+    connect(&poll, &QTimer::timeout, this, [&] { dlg.setValue(int(progress->load() * 1000)); });
+    poll.start(100);
+    watcher.setFuture(QtConcurrent::run([snap, seqId, path, cancel, progress]() {
+        Outcome o;
+        const Sequence* sq = snap->findSequence(seqId);
+        if (!sq) return o;
+        o.ok = exportAaf(*snap, *sq, path.toStdString(), &o.result, [progress](double f, FrameTime) { *progress = f; }, cancel.get(),
+                         &o.error);
+        return o;
+    }));
+    loop.exec();
+    poll.stop();
+    dlg.close();
+    const Outcome o = watcher.result();
+    if (!o.ok) {
+        if (!*cancel) QMessageBox::warning(this, tr("Export AAF"), QString::fromStdString(o.error));
+        return false;
+    }
+    QString text = tr("%1: %2 audio tracks, %3 clips, %4 crossfades; %5 WAV files in \"%6\"")
+                       .arg(QFileInfo(path).fileName())
+                       .arg(o.result.audioTracks)
+                       .arg(o.result.clips)
+                       .arg(o.result.transitions)
+                       .arg(o.result.mediaFiles.size())
+                       .arg(QFileInfo(path).completeBaseName() + tr(" Media"));
+    for (const std::string& w : o.result.warnings) text += "\n" + QString::fromStdString(w);
+    if (summary) *summary = text;
+    return true;
+}
+
+void MainWindow::exportAafDialog() {
+    const Sequence* s = state_->sequence();
+    if (!s) return;
+    QSettings st = appSettings();
+    const QString path = QFileDialog::getSaveFileName(
+        this, tr("Export AAF for Audio Post"), st.value("lastExportDir").toString() + "/" + QString::fromStdString(s->name) + ".aaf",
+        tr("AAF (*.aaf)"));
+    if (path.isEmpty()) return;
+    st.setValue("lastExportDir", QFileInfo(path).absolutePath());
+    QString summary;
+    if (exportAafTo(path, &summary)) statusBar()->showMessage(tr("Exported %1").arg(summary), 10000);
 }
 
 void MainWindow::importTimeline() {

@@ -31,6 +31,7 @@
 #include "media/SpeechEnhance.h"
 #include "media/SuperScale.h"
 #include "media/Translator.h"
+#include "render/AafExport.h"
 #include "render/AutoMix.h"
 #include "render/MusicEdit.h"
 #include "render/VoiceMatch.h"
@@ -1629,17 +1630,33 @@ void McpServer::Impl::addTools() {
         });
 
     add("montage_export_timeline", "Export the timeline",
-        "Write the active sequence as an EDL, OpenTimelineIO, Final Cut Pro 7 XML (Premiere, Resolve) or FCPXML (Final Cut Pro).",
-        R"json({"type":"object","properties":{"project":{"type":"string"},"format":{"type":"string","enum":["edl","otio","xml","fcpxml"]},
+        "Write the active sequence as an EDL, OpenTimelineIO, Final Cut Pro 7 XML (Premiere, Resolve), FCPXML (Final Cut "
+        "Pro) or AAF for audio post (Pro Tools, Fairlight: the audio tracks, linked to mono WAVs written to a \"<name> "
+        "Media\" folder beside it, with crossfades, fades and clip gain).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"format":{"type":"string","enum":["edl","otio","xml","fcpxml","aaf"]},
             "output":{"type":"string"}},"required":["project","format","output"]})json",
-        true, [](const QJsonObject& a) {
+        true, [this](const QJsonObject& a) {
             Loaded l = open(a);
             const QString f = need(a, "format");
+            if (f == "aaf") {
+                const QString out = absolute(need(a, "output"));
+                AafExportResult r;
+                std::string err;
+                if (!exportAaf(l.project, l.seq(), out.toStdString(), &r, [this](double x, FrameTime) { progress(x, "AAF"); }, nullptr, &err))
+                    return fail(QString::fromStdString(err));
+                QJsonArray files, warnings;
+                for (const std::string& m : r.mediaFiles) files.append(QString::fromStdString(m));
+                for (const std::string& w : r.warnings) warnings.append(QString::fromStdString(w));
+                return ok(QStringLiteral("Wrote %1: %2 audio tracks, %3 clips, %4 crossfades, %5 WAV files")
+                              .arg(out).arg(r.audioTracks).arg(r.clips).arg(r.transitions).arg(files.size()),
+                          QJsonObject{{"output", out}, {"audio_tracks", r.audioTracks}, {"clips", r.clips},
+                                      {"crossfades", r.transitions}, {"media", files}, {"warnings", warnings}});
+            }
             const std::string text = f == "otio" ? exportOtio(l.project, l.seq())
                                      : f == "xml" ? exportFcp7Xml(l.project, l.seq())
                                      : f == "fcpxml" ? exportFcpXml(l.project, l.seq())
                                      : f == "edl" ? exportEdl(l.project, l.seq())
-                                                  : throw ArgError{"format must be edl, otio, xml or fcpxml"};
+                                                  : throw ArgError{"format must be edl, otio, xml, fcpxml or aaf"};
             const QString out = absolute(need(a, "output"));
             QFile file(out);
             if (!file.open(QIODevice::WriteOnly) || file.write(text.data(), qint64(text.size())) != qint64(text.size()))
