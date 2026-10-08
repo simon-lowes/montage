@@ -7,6 +7,9 @@
 #include <QCloseEvent>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QComboBox>
+#include <QEventLoop>
+#include <QFormLayout>
 #include <QDockWidget>
 #include <QFile>
 #include <QFileDialog>
@@ -67,6 +70,7 @@
 #include "media/AudioSync.h"
 #include "media/Loudness.h"
 #include "media/MediaPool.h"
+#include "render/ClipAnalysis.h"
 #include "render/Compositor.h"
 #include "render/Exporter.h"
 #include "render/Processing.h"
@@ -433,6 +437,7 @@ void MainWindow::buildMenus() {
         ->setObjectName(QStringLiteral("setColourReference"));
     add(clipM, tr("Match Colour to Reference"), QKeySequence("Ctrl+Alt+Shift+C"), [this] { matchColour(); })
         ->setObjectName(QStringLiteral("matchColour"));
+    add(clipM, tr("Auto Reframe"), QKeySequence(), [this] { autoReframeClips(); })->setObjectName(QStringLiteral("autoReframeClips"));
     add(clipM, tr("S&ynchronize by Audio"), QKeySequence(), [this] { syncByAudio(); });
     clipM->addSeparator();
     add(clipM, tr("&Insert from Source"), QKeySequence(Qt::Key_Comma), [this] { state_->insertFromSource(false); });
@@ -476,6 +481,19 @@ void MainWindow::buildMenus() {
     QMenu* seqM = menuBar()->addMenu(tr("&Sequence"));
     add(seqM, tr("Sequence &Settings…"), QKeySequence(), [this] { SequenceSettingsDialog::editActive(state_, this); });
     add(seqM, tr("&New Sequence…"), QKeySequence("Ctrl+Alt+N"), [this] { newSequence(); });
+    add(seqM, tr("&Duplicate Sequence"), QKeySequence(), [this] {
+        const Sequence* s = state_->sequence();
+        if (!s) return;
+        Id made = 0;
+        const Id from = s->id;
+        state_->edit(tr("Duplicate Sequence"), [&made, from](Project& p, Sequence&) {
+            made = edit::duplicateSequence(p, from);
+            return made != 0;
+        });
+        if (made) state_->setActiveSequence(made);
+    })->setObjectName(QStringLiteral("duplicateSequence"));
+    add(seqM, tr("Auto &Reframe Sequence…"), QKeySequence(), [this] { autoReframeDialog(); })
+        ->setObjectName(QStringLiteral("autoReframeSequence"));
     add(seqM, tr("Add &Video Track"), QKeySequence(), [this] {
         state_->edit(tr("Add Video Track"), [](Project& p, Sequence& s) {
             edit::addTrack(p, s, TrackKind::Video);
@@ -1265,6 +1283,132 @@ int MainWindow::matchColour() {
     state_->message(tr("Matched %n clip(s) to %1", "", n).arg(colourRefName_), 5000);
     inspectorDock_->raise();
     return n;
+}
+
+namespace {
+
+// Runs `work` off the UI thread behind a progress dialog with Cancel; false if
+// it fails (the error shown in the status bar) or is cancelled.
+bool runWithProgress(QWidget* parent, EditorState* state, const QString& title,
+                     const std::function<bool(const std::function<void(double)>&, const std::atomic<bool>*, std::string*)>& work) {
+    QProgressDialog progress(title, QObject::tr("Cancel"), 0, 1000, parent);
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(400);
+    auto done = std::make_shared<std::atomic<double>>(0.0);
+    auto cancel = std::make_shared<std::atomic<bool>>(false);
+    QObject::connect(&progress, &QProgressDialog::canceled, parent, [cancel] { *cancel = true; });
+    QTimer tick;
+    QObject::connect(&tick, &QTimer::timeout, &progress, [&progress, done] { progress.setValue(int(*done * 1000)); });
+    tick.start(100);
+    using Out = std::pair<bool, std::string>;
+    QFutureWatcher<Out> watcher;
+    QEventLoop wait;
+    QObject::connect(&watcher, &QFutureWatcher<Out>::finished, &wait, &QEventLoop::quit);
+    watcher.setFuture(QtConcurrent::run([work, done, cancel] {
+        std::string err;
+        const bool ok = work([done](double f) { *done = f; }, cancel.get(), &err);
+        return Out{ok, err};
+    }));
+    if (!watcher.isFinished()) wait.exec();
+    tick.stop();
+    progress.disconnect(parent);
+    progress.close();
+    const Out r = watcher.result();
+    if (!r.first && !*cancel && !r.second.empty()) state->message(QString::fromStdString(r.second), 6000);
+    return r.first && !*cancel;
+}
+
+}  // namespace
+
+Id MainWindow::autoReframeSequence(int aspectW, int aspectH, int speed) {
+    const Sequence* s = state_->sequence();
+    if (!s || s->duration() == 0) {
+        state_->message(tr("Nothing to reframe"));
+        return 0;
+    }
+    auto project = std::make_shared<const Project>(state_->project());
+    const Id seqId = s->id;
+    std::map<Id, std::vector<ReframeKey>> paths;
+    const bool ok = runWithProgress(this, state_, tr("Finding the subject of each shot..."),
+                                    [&, project, seqId](const auto& progress, const auto* cancel, std::string* err) {
+                                        const Sequence* sq = project->findSequence(seqId);
+                                        return sq && analyzeSequenceReframe(*project, *sq, speed, paths, progress, cancel, err);
+                                    });
+    if (!ok) return 0;
+    int w = 0, h = 0;
+    reframeSize(*s, aspectW, aspectH, w, h);
+    Id made = 0;
+    state_->edit(tr("Auto Reframe Sequence"), [&](Project& p, Sequence&) {
+        made = makeReframedSequence(p, seqId, w, h, paths);
+        return made != 0;
+    });
+    if (!made) return 0;
+    state_->setActiveSequence(made);
+    state_->message(tr("Reframed %n clip(s) into %1 x %2", "", int(paths.size())).arg(w).arg(h), 5000);
+    return made;
+}
+
+void MainWindow::autoReframeDialog() {
+    if (!state_->sequence()) return;
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Auto Reframe Sequence"));
+    auto* form = new QFormLayout(&dlg);
+    auto* aspect = new QComboBox(&dlg);
+    aspect->setObjectName(QStringLiteral("reframeAspect"));
+    aspect->addItem(tr("Vertical 9:16"), QSize(9, 16));
+    aspect->addItem(tr("Square 1:1"), QSize(1, 1));
+    aspect->addItem(tr("Vertical 4:5"), QSize(4, 5));
+    aspect->addItem(tr("Horizontal 16:9"), QSize(16, 9));
+    auto* motion = new QComboBox(&dlg);
+    motion->setObjectName(QStringLiteral("reframeMotion"));
+    motion->addItems({tr("Slower Motion"), tr("Default"), tr("Faster Motion")});
+    motion->setCurrentIndex(1);
+    motion->setToolTip(tr("How closely the frame follows the subject: slower for interviews, faster for sport"));
+    form->addRow(tr("Aspect ratio:"), aspect);
+    form->addRow(tr("Motion:"), motion);
+    auto* note = new QLabel(tr("A copy of the sequence is made at the new shape; each clip follows its subject."), &dlg);
+    note->setWordWrap(true);
+    form->addRow(note);
+    auto* box = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    connect(box, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(box, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    form->addRow(box);
+    if (dlg.exec() != QDialog::Accepted) return;
+    const QSize a = aspect->currentData().toSize();
+    autoReframeSequence(a.width(), a.height(), motion->currentIndex());
+}
+
+int MainWindow::autoReframeClips(int speed) {
+    const Sequence* s = state_->sequence();
+    if (!s) return 0;
+    std::vector<Id> ids(state_->selectedClips().begin(), state_->selectedClips().end());
+    if (ids.empty()) {
+        state_->message(tr("Select the clips to reframe"));
+        return 0;
+    }
+    auto project = std::make_shared<const Project>(state_->project());
+    const Id seqId = s->id;
+    std::map<Id, std::vector<ReframeKey>> paths;
+    const bool ok = runWithProgress(this, state_, tr("Finding the subject..."), [&, project, seqId](const auto& progress, const auto* cancel, std::string* err) {
+        const Sequence* sq = project->findSequence(seqId);
+        if (!sq) return false;
+        for (size_t i = 0; i < ids.size(); ++i) {
+            const Clip* c = edit::clipById(*sq, ids[i]);
+            if (!c || (cancel && cancel->load())) continue;
+            std::vector<ReframeKey> path;
+            const auto part = [&](double f) { progress((double(i) + f) / double(ids.size())); };
+            if (analyzeClipReframe(*project, *sq, *c, speed, path, part, cancel, err)) paths[ids[i]] = std::move(path);
+        }
+        return !paths.empty();
+    });
+    if (!ok) return 0;
+    state_->edit(tr("Auto Reframe"), [&](Project& p, Sequence& sq) {
+        for (const auto& [id, path] : paths)
+            if (Clip* c = edit::clipById(sq, id)) applyReframe(p, sq, *c, path);
+        return true;
+    });
+    state_->message(tr("Reframed %n clip(s)", "", int(paths.size())), 4000);
+    return int(paths.size());
 }
 
 void MainWindow::syncByAudio() {

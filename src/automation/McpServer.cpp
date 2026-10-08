@@ -28,6 +28,7 @@
 #include "media/Decoder.h"
 #include "media/Transcriber.h"
 #include "media/VisualSearch.h"
+#include "render/ClipAnalysis.h"
 #include "render/Compositor.h"
 #include "render/Exporter.h"
 #include "render/Processing.h"
@@ -1086,6 +1087,40 @@ void McpServer::Impl::addTools() {
             if (n == 0) return fail("None of the clips has a picture to match");
             save(l);
             return ok(QStringLiteral("Matched %1 clip(s) to the picture at %2").arg(n).arg(tc(at, s)), QJsonObject{{"matched", n}});
+        });
+
+    add("montage_auto_reframe", "Auto reframe for another shape",
+        "Make the cut in another aspect ratio (9:16 for Reels, Shorts and TikTok; 1:1; 4:5; 16:9): a copy of the active "
+        "sequence at the new shape where every video and still clip fills the frame and follows its subject (found from "
+        "what moves and what stands out). The copy becomes the active sequence, so later edits and montage_render apply to "
+        "it. motion: slower (interviews), default, or faster (sport).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "aspect":{"type":"string","enum":["9:16","1:1","4:5","16:9"],"default":"9:16"},
+            "motion":{"type":"string","enum":["slower","default","faster"],"default":"default"},
+            "name":{"type":"string"}},"required":["project"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            const QString aspect = str(a, "aspect", "9:16");
+            const QStringList parts = aspect.split(':');
+            const int aw = parts.size() == 2 ? parts[0].toInt() : 0, ah = parts.size() == 2 ? parts[1].toInt() : 0;
+            if (aw <= 0 || ah <= 0) throw ArgError{"\"aspect\" must look like 9:16"};
+            const QString motion = str(a, "motion", "default");
+            const int speed = motion == "slower" ? 0 : motion == "faster" ? 2 : 1;
+            std::map<Id, std::vector<ReframeKey>> paths;
+            std::string err;
+            if (!analyzeSequenceReframe(l.project, l.seq(), speed, paths, [this](double f) { progress(f, "Finding subjects"); }, nullptr, &err))
+                return fail(QString::fromStdString(err));
+            int w = 0, h = 0;
+            reframeSize(l.seq(), aw, ah, w, h);
+            const Id made = makeReframedSequence(l.project, l.seq().id, w, h, paths, str(a, "name").toStdString());
+            if (!made) return fail("Could not copy the sequence");
+            l.project.activeSequence = made;
+            save(l);
+            const Sequence& s = l.seq();
+            return ok(QStringLiteral("Made \"%1\" (%2 x %3) with %4 clip(s) following their subject; it is now the active sequence")
+                          .arg(QString::fromStdString(s.name)).arg(w).arg(h).arg(paths.size()),
+                      QJsonObject{{"sequence", double(made)}, {"name", QString::fromStdString(s.name)}, {"width", w}, {"height", h},
+                                  {"clips_reframed", int(paths.size())}});
         });
 
     add("montage_render_frame", "Look at a frame",

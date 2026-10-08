@@ -1406,6 +1406,42 @@ private slots:
             QVERIFY(QString::fromStdString(xml).indexOf("Adjustment") < 0);
     }
 
+    void duplicateSequences() {
+        Fixture fx;
+        QVERIFY(placeMedia(fx.p, fx.s(), fx.media, 0, 30, 90, V1, A1, false).ok);  // linked picture and sound
+        Id a = fx.s().videoTracks[0].clips.at(0).id;
+        fx.put(V1, 60, 60, 120);
+        addTransition(fx.p, fx.s(), a, Edge::Out, "cross_dissolve", 10);
+        const Sequence& src = fx.s();
+        const size_t mediaBefore = fx.p.media.size();
+        std::map<Id, Id> ids;
+        const Id copy = duplicateSequence(fx.p, src.id, {}, &ids);
+        QVERIFY(copy && copy != fx.p.active()->id);
+        const Sequence& orig = *fx.p.active();
+        const Sequence& dup = *fx.p.findSequence(copy);
+        QCOMPARE(dup.name, orig.name + " Copy");
+        QCOMPARE(fx.p.media.size(), mediaBefore + 1);  // its bin item
+        QCOMPARE(fx.p.media.back().sequenceId, copy);
+        // Same timeline, fresh ids, references remapped.
+        QCOMPARE(dup.videoTracks[0].clips.size(), orig.videoTracks[0].clips.size());
+        QCOMPARE(dup.duration(), orig.duration());
+        for (size_t i = 0; i < orig.videoTracks[0].clips.size(); ++i) {
+            const Clip& o = orig.videoTracks[0].clips[i];
+            const Clip& d = dup.videoTracks[0].clips[i];
+            QVERIFY(d.id != o.id && ids.at(o.id) == d.id);
+            QVERIFY(d.motion.id != o.motion.id);
+            QCOMPARE(d.start, o.start);
+        }
+        const Transition& tr = dup.videoTracks[0].transitions.at(0);
+        QCOMPARE(tr.clipA, ids.at(orig.videoTracks[0].transitions[0].clipA));
+        QCOMPARE(tr.clipB, ids.at(orig.videoTracks[0].transitions[0].clipB));
+        // Linked picture and sound stay linked to each other, not to the original's.
+        const Clip& dv = dup.videoTracks[0].clips[0];
+        const Clip& da = dup.audioTracks[0].clips[0];
+        QVERIFY(dv.linkGroup != 0 && dv.linkGroup == da.linkGroup && dv.linkGroup != orig.videoTracks[0].clips[0].linkGroup);
+        QCOMPARE(duplicateSequence(fx.p, 987654), Id(0));
+    }
+
     void interchangeExports() {
         Fixture fx;
         Id a = fx.put(V1, 0, 60, 30);

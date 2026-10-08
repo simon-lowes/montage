@@ -26,6 +26,7 @@ add_library(montage_engine STATIC
   media/SpeakerSwitch.h media/SpeakerSwitch.cpp
   media/AutoDuck.h media/AutoDuck.cpp
   media/Tracking.h media/Tracking.cpp
+  media/Reframe.h media/Reframe.cpp
   media/ModelFiles.h media/ModelFiles.cpp
   media/Segmenter.h media/Segmenter.cpp
   media/Diarizer.h media/Diarizer.cpp

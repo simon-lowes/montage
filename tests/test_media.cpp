@@ -33,6 +33,7 @@
 #include "media/SpeakerSwitch.h"
 #include "media/Tracking.h"
 #include "media/Segmenter.h"
+#include "media/Reframe.h"
 #include "media/Diarizer.h"
 #include "media/VisualSearch.h"
 #include "automation/McpServer.h"
@@ -2044,6 +2045,89 @@ private slots:
         // Nothing beneath: an error.
         QVERIFY(!trackClipFollow(p, s, footage, 0, true, MotionModel::Translation, 0.3, keys, {}, nullptr, &err));
         QVERIFY(!err.empty());
+    }
+
+    void autoReframe() {
+        // A red ball crossing textured ground left to right (x 180 -> 516 of 640), bobbing up and down.
+        const std::string video = path("reframe-ball.mp4");
+        const int frames = 25;
+        const auto centres = writeBallVideo(video, frames);
+        std::string err;
+        // The subject of each frame is the ball (the first has no motion to go on, only contrast).
+        const auto pts = findSubject(video, 0, (frames - 1) / 25.0, 1 / 25.0, {}, nullptr, &err);
+        QCOMPARE(int(pts.size()), frames);
+        double worst = 0;
+        for (int i = 1; i < frames; ++i)
+            worst = std::max({worst, std::fabs(pts[size_t(i)].x * 640 - centres[size_t(i)].x), std::fabs(pts[size_t(i)].y * 360 - centres[size_t(i)].y)});
+        QVERIFY2(worst < 40, qPrintable(QString::number(worst)));
+        // Smoothing keeps the path but not the jitter; a still subject gives a still path.
+        const auto smooth = smoothSubjectPath(pts, 0.2);
+        QVERIFY(smooth.front().x < smooth.back().x);
+        std::vector<SubjectPoint> still(10);
+        for (int i = 0; i < 10; ++i) still[size_t(i)] = {i * 0.2, 0.5 + 0.01 * (i % 2), 0.4, 1};
+        const auto held = smoothSubjectPath(still, 0.2);
+        for (const SubjectPoint& q : held) QVERIFY(q.x == held[0].x && std::fabs(q.x - 0.505) < 0.003);
+
+        // The 16:9 cut made 9:16, following the ball.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 640;
+        s.height = 360;
+        s.fps = {25, 1};
+        MediaItem mi = probeOrFail(p, video);
+        p.media.push_back(mi);
+        QVERIFY(edit::placeMedia(p, s, mi.id, 0, 0, frames, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Id original = s.id;
+        int w = 0, h = 0;
+        reframeSize(s, 9, 16, w, h);
+        QCOMPARE(w, 360);
+        QCOMPARE(h, 640);
+        std::map<Id, std::vector<ReframeKey>> paths;
+        QVERIFY2(analyzeSequenceReframe(p, s, 2, paths, {}, nullptr, &err), err.c_str());
+        QCOMPARE(paths.size(), size_t(1));
+        const Id made = makeReframedSequence(p, original, w, h, paths);
+        const Sequence* vs = p.findSequence(made);
+        QVERIFY(vs && vs->id != original);
+        QCOMPARE(vs->name, std::string("Sequence 1 9:16"));
+        QCOMPARE(vs->width, 360);
+        QCOMPARE(vs->height, 640);
+        const Clip& c = vs->videoTracks[0].clips.at(0);
+        QVERIFY(c.id != p.findSequence(original)->videoTracks[0].clips.at(0).id);
+        QVERIFY(c.motion.params.at("pos_x").animated());
+        QVERIFY(!p.findSequence(original)->videoTracks[0].clips.at(0).motion.params["pos_x"].animated());  // the original is untouched
+        // Where the ball lands across the 360 px frame: the picture fills 640 px of height, so it is 1137.8 px wide.
+        const double dw = 640.0 * 640.0 / 360.0;
+        int inFrame = 0, centred = 0;
+        for (int i = 0; i < frames; ++i) {
+            const double x = 180 + c.motion.p("pos_x", i) + (centres[size_t(i)].x / 640 - 0.5) * dw;
+            if (x > 0 && x < 360) ++inFrame;
+            if (std::fabs(x - 180) < 90) ++centred;
+        }
+        // A centre crop would lose the ball for most of the shot.
+        QVERIFY2(inFrame == frames && centred >= frames - 2, qPrintable(QString("%1 in frame, %2 centred").arg(inFrame).arg(centred)));
+        int naive = 0;
+        for (int i = 0; i < frames; ++i) naive += std::fabs((centres[size_t(i)].x / 640 - 0.5) * dw) < 180 ? 1 : 0;
+        QVERIFY2(naive <= frames - 8, qPrintable(QString::number(naive)));  // 15 of 25
+
+        // Over MCP: a square version becomes the active sequence.
+        const QString project = QString::fromStdString(path("reframe.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_auto_reframe"},
+                                                     {"arguments", QJsonObject{{"project", project}, {"aspect", "1:1"}, {"motion", "faster"}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("width").toInt(), 360);
+        QCOMPARE(r.value("structuredContent").toObject().value("clips_reframed").toInt(), 1);
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.active()->name, std::string("Sequence 1 1:1"));
+        QCOMPARE(back.active()->height, 360);
+        QVERIFY(back.active()->videoTracks[0].clips.at(0).motion.params.at("pos_x").animated());
     }
 
     void planarTracking() {

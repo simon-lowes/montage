@@ -1267,6 +1267,64 @@ private slots:
         state()->newProject();
     }
 
+    void autoReframeASequence() {
+        // A still with its subject (a red disc) well right of centre.
+        QImage img(640, 360, QImage::Format_RGB32);
+        for (int y = 0; y < 360; ++y)
+            for (int x = 0; x < 640; ++x) img.setPixel(x, y, qRgb(90 + x / 16, 100, 110 - y / 12));
+        {
+            QPainter pa(&img);
+            pa.setRenderHint(QPainter::Antialiasing);
+            pa.setBrush(QColor(220, 40, 30));
+            pa.setPen(Qt::NoPen);
+            pa.drawEllipse(QPointF(520, 180), 45, 45);
+        }
+        const QString png = dir_.path() + "/subject.png";
+        QVERIFY(img.save(png));
+        state()->newProject();
+        state()->edit("Size", [](Project&, Sequence& s) {
+            s.width = 640;
+            s.height = 360;
+            return true;
+        });
+        const auto ids = state()->importFiles({png});
+        state()->apply("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids[0], 0, 0, 50, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        });
+        const Id original = state()->sequence()->id;
+        const size_t sequences = state()->project().sequences.size();
+        QVERIFY(win_->findChild<QAction*>("autoReframeSequence"));
+        const Id made = win_->autoReframeSequence(9, 16, 1);
+        QVERIFY(made);
+        QCOMPARE(state()->sequence()->id, made);
+        QCOMPARE(state()->project().sequences.size(), sequences + 1);
+        QCOMPARE(state()->sequence()->width, 360);
+        QCOMPARE(state()->sequence()->height, 640);
+        // The disc is brought to the middle: the picture (1138 px wide) moves left by about 355 px.
+        const Clip& c = state()->sequence()->videoTracks[0].clips.at(0);
+        QVERIFY2(c.motion.p("pos_x", 0) < -250, qPrintable(QString::number(c.motion.p("pos_x", 0))));
+        QCOMPARE(c.motion.p("fit", 0), 1.0);
+        // It shows in the media bin, and undo takes it away.
+        const auto bin = std::find_if(state()->project().media.begin(), state()->project().media.end(),
+                                      [made](const MediaItem& m) { return m.kind == MediaKind::Sequence && m.sequenceId == made; });
+        QVERIFY(bin != state()->project().media.end());
+        QCOMPARE(bin->width, 360);
+        // Within a sequence: Clip › Auto Reframe on the selection.
+        state()->setSelection({c.id}, false);
+        state()->edit("Centre", [id = c.id](Project&, Sequence& s) {
+            edit::clipById(s, id)->motion.params["pos_x"] = Param(0.0);
+            return true;
+        });
+        QCOMPARE(win_->autoReframeClips(), 1);
+        QVERIFY(state()->sequence()->videoTracks[0].clips.at(0).motion.p("pos_x", 0) < -250);
+        // Duplicate Sequence.
+        state()->setActiveSequence(original);
+        win_->findChild<QAction*>("duplicateSequence")->trigger();
+        QCOMPARE(state()->sequence()->name, std::string("Sequence 1 Copy"));
+        QVERIFY(state()->sequence()->id != original);
+        state()->newProject();
+    }
+
     void renderQueueInTheBackground() {
         loadDemo();
         RenderQueue* queue = win_->renderQueue();

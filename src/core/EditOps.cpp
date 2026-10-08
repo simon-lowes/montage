@@ -892,6 +892,67 @@ Result addTransition(Project& p, Sequence& s, Id clipId, Edge edge, const std::s
     return r;
 }
 
+Id duplicateSequence(Project& p, Id id, const std::string& name, std::map<Id, Id>* clipIds) {
+    const Sequence* src = p.findSequence(id);
+    if (!src) return 0;
+    Sequence s = *src;
+    s.id = p.newId();
+    s.name = name.empty() ? src->name + " Copy" : name;
+    std::map<Id, Id> clips, groups, buses;
+    auto renew = [&](Effect& e) {
+        if (e.id) e.id = p.newId();
+    };
+    for (Bus& b : s.buses) {
+        const Id fresh = p.newId();
+        buses[b.id] = fresh;
+        b.id = fresh;
+        for (Effect& e : b.effects) renew(e);
+    }
+    for (Effect& e : s.masterEffects) renew(e);
+    for (CaptionTrack& ct : s.captionTracks) ct.id = p.newId();
+    for (auto* tracks : {&s.videoTracks, &s.audioTracks})
+        for (Track& t : *tracks) {
+            t.id = p.newId();
+            if (t.output) t.output = buses.count(t.output) ? buses[t.output] : 0;
+            for (Effect& e : t.effects) renew(e);
+            for (Clip& c : t.clips) {
+                const Id fresh = p.newId();
+                clips[c.id] = fresh;
+                c.id = fresh;
+                if (c.linkGroup) {
+                    auto [it, added] = groups.try_emplace(c.linkGroup, 0);
+                    if (added) it->second = p.newId();
+                    c.linkGroup = it->second;
+                }
+                for (Effect* e : {&c.generator, &c.motion, &c.audio, &c.timing}) renew(*e);
+                for (Effect& e : c.effects) renew(e);
+            }
+            for (Transition& tr : t.transitions) {
+                tr.id = p.newId();
+                renew(tr.params);
+                if (tr.clipA) tr.clipA = clips.count(tr.clipA) ? clips[tr.clipA] : 0;
+                if (tr.clipB) tr.clipB = clips.count(tr.clipB) ? clips[tr.clipB] : 0;
+            }
+        }
+    const Id out = s.id;
+    // Its own item in the media bin, beside the original's.
+    MediaItem m;
+    m.id = p.newId();
+    m.kind = MediaKind::Sequence;
+    m.name = s.name;
+    m.sequenceId = out;
+    m.hasVideo = m.hasAudio = true;
+    m.width = s.width;
+    m.height = s.height;
+    m.fps = s.fps;
+    for (const MediaItem& o : p.media)
+        if (o.kind == MediaKind::Sequence && o.sequenceId == id) m.bin = o.bin;
+    p.sequences.push_back(std::move(s));
+    p.media.push_back(std::move(m));
+    if (clipIds) *clipIds = std::move(clips);
+    return out;
+}
+
 Result removeTransition(Sequence& s, Id transitionId) {
     for (TrackRef r : allTracks(s)) {
         Track* t = trackAt(s, r);

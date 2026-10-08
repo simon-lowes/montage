@@ -2,10 +2,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <numeric>
 
 #include "Compositor.h"
 #include "core/EditOps.h"
 #include "media/Decoder.h"
+#include "media/Reframe.h"
 #include "media/Segmenter.h"
 
 namespace montage {
@@ -270,6 +272,124 @@ void applyFollow(Clip& c, const std::vector<FollowKey>& keys, MotionModel model)
     write("pos_y", &FollowKey::y);
     if (model != MotionModel::Translation) write("scale", &FollowKey::scale);
     if (model == MotionModel::Similarity) write("rotation", &FollowKey::rotation);
+}
+
+// ---- Auto Reframe -----------------------------------------------------------------
+
+bool analyzeClipReframe(const Project& p, const Sequence& s, const Clip& c, int speed, std::vector<ReframeKey>& path,
+                        const TrackProgress& progress, const std::atomic<bool>* cancel, std::string* error) {
+    path.clear();
+    const MediaItem* m = c.mediaId ? p.findMedia(c.mediaId) : nullptr;
+    if (!m || (m->kind != MediaKind::Video && m->kind != MediaKind::Image) || m->path.empty()) {
+        if (error) *error = "Auto Reframe needs a video or still clip";
+        return false;
+    }
+    if (m->kind == MediaKind::Image) {
+        const auto pts = findSubject(m->path, 0, 0, 1, progress, cancel, error);
+        if (pts.empty()) return false;
+        path.push_back({0, pts[0].x, pts[0].y});
+        return true;
+    }
+    const double a = sourceSeconds(s, c, 0), b = sourceSeconds(s, c, c.duration - 1);
+    // Five samples a second of the clip as it plays (ten when following fast action).
+    const double every = speed >= 2 ? 0.1 : 0.2;
+    const double step = std::max(0.02, every * std::fabs(b - a) / std::max(1e-6, double(c.duration - 1) / s.fpsValue()));
+    const auto pts = findSubject(m->path, a, b, c.duration > 1 ? step : 1, progress, cancel, error);
+    if (pts.empty()) return false;
+    static const double smooth[3] = {1.6, 0.8, 0.35};  // seconds
+    const auto sm = smoothSubjectPath(pts, smooth[std::clamp(speed, 0, 2)] * std::max(0.05, std::fabs(b - a)) /
+                                               std::max(1e-6, double(std::max<FrameTime>(1, c.duration - 1)) / s.fpsValue()));
+    for (const SubjectPoint& q : sm) {
+        const FrameTime t = FrameTime(std::llround(localFrame(s, c, q.t)));
+        if (t < 0 || t >= c.duration) continue;
+        if (!path.empty() && path.back().t == t) continue;
+        path.push_back({t, q.x, q.y});
+    }
+    std::sort(path.begin(), path.end(), [](const ReframeKey& l, const ReframeKey& r) { return l.t < r.t; });
+    return !path.empty();
+}
+
+void applyReframe(const Project& p, const Sequence& s, Clip& c, const std::vector<ReframeKey>& path) {
+    if (path.empty()) return;
+    double mw = 0, mh = 0;
+    if (!clipFrameSize(p, s, c, mw, mh) || mw <= 0 || mh <= 0) return;
+    c.motion.params["fit"] = Param(1.0);  // fill the frame
+    const double scale = c.motion.p("scale", 0, 100) / 100.0;
+    const double fill = std::max(s.width / mw, s.height / mh) * scale;
+    const double dw = mw * fill * std::fabs(c.motion.p("scale_x", 0, 100) / 100.0);
+    const double dh = mh * fill * std::fabs(c.motion.p("scale_y", 0, 100) / 100.0);
+    const double slackX = std::max(0.0, (dw - s.width) / 2), slackY = std::max(0.0, (dh - s.height) / 2);
+    Param px, py;
+    bool moves = false;
+    for (const ReframeKey& k : path) {
+        const double x = std::clamp(-(k.x - 0.5) * dw, -slackX, slackX), y = std::clamp(-(k.y - 0.5) * dh, -slackY, slackY);
+        px.addKey(k.t, x, Interp::Linear);
+        py.addKey(k.t, y, Interp::Linear);
+        moves = moves || std::fabs(x - px.keys.front().v) > 0.5 || std::fabs(y - py.keys.front().v) > 0.5;
+    }
+    // A subject that stays put gives a still frame, not a row of identical keys.
+    c.motion.params["pos_x"] = moves ? px : Param(px.keys.front().v);
+    c.motion.params["pos_y"] = moves ? py : Param(py.keys.front().v);
+}
+
+bool analyzeSequenceReframe(const Project& p, const Sequence& s, int speed, std::map<Id, std::vector<ReframeKey>>& paths,
+                            const TrackProgress& progress, const std::atomic<bool>* cancel, std::string* error) {
+    paths.clear();
+    std::vector<const Clip*> clips;
+    for (const Track& t : s.videoTracks)
+        for (const Clip& c : t.clips) {
+            const MediaItem* m = c.mediaId ? p.findMedia(c.mediaId) : nullptr;
+            if (m && (m->kind == MediaKind::Video || m->kind == MediaKind::Image) && !m->path.empty()) clips.push_back(&c);
+        }
+    for (size_t i = 0; i < clips.size(); ++i) {
+        if (cancel && cancel->load()) return false;
+        std::vector<ReframeKey> path;
+        std::string err;
+        const auto part = [&](double f) {
+            if (progress) progress((double(i) + f) / double(clips.size()));
+        };
+        if (analyzeClipReframe(p, s, *clips[i], speed, path, part, cancel, &err)) paths[clips[i]->id] = std::move(path);
+        else if (error && error->empty()) *error = err;  // kept for the caller; other clips still go ahead
+    }
+    return !(cancel && cancel->load());
+}
+
+void reframeSize(const Sequence& s, int aspectW, int aspectH, int& width, int& height) {
+    const int shortSide = std::min(s.width, s.height);
+    auto even = [](double v) { return std::max(2, int(std::lround(v / 2)) * 2); };
+    if (aspectW >= aspectH) {
+        height = even(shortSide);
+        width = even(double(shortSide) * aspectW / std::max(1, aspectH));
+    } else {
+        width = even(shortSide);
+        height = even(double(shortSide) * aspectH / std::max(1, aspectW));
+    }
+}
+
+Id makeReframedSequence(Project& p, Id seq, int width, int height, const std::map<Id, std::vector<ReframeKey>>& paths,
+                        const std::string& name) {
+    const Sequence* src = p.findSequence(seq);
+    if (!src) return 0;
+    const int g = std::gcd(width, height);
+    const std::string label = name.empty() ? src->name + " " + std::to_string(width / std::max(1, g)) + ":" +
+                                                 std::to_string(height / std::max(1, g))
+                                           : name;
+    std::map<Id, Id> ids;
+    const Id out = edit::duplicateSequence(p, seq, label, &ids);
+    Sequence* s = p.findSequence(out);
+    s->width = width;
+    s->height = height;
+    for (MediaItem& m : p.media)
+        if (m.kind == MediaKind::Sequence && m.sequenceId == out) {
+            m.width = width;
+            m.height = height;
+        }
+    for (const auto& [oldId, path] : paths) {
+        auto it = ids.find(oldId);
+        if (it == ids.end()) continue;
+        if (Clip* c = edit::clipById(*s, it->second)) applyReframe(p, *s, *c, path);
+    }
+    return out;
 }
 
 // ---- Object masks ---------------------------------------------------------------

@@ -38,6 +38,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
     - ◀ Track / Track ▶ follow it through the clip, finding it again after it turns or is briefly hidden.
     - Feather, expansion, invert and Show Mask work as for the shapes, and the mask stays with the footage through trims and speed changes.
     - It runs locally with EdgeTAM, Meta's on-device model in the Segment Anything 2 family (Apache-2.0), on ONNX Runtime. The 65 MB model is downloaded on first use.
+- **Auto Reframe** (like Premiere's Auto Reframe or Resolve's Smart Reframe): Sequence › Auto Reframe Sequence… makes a copy of the cut at 9:16, 1:1, 4:5 or 16:9 where every clip fills the frame and follows its subject, found from what moves against the camera and what stands out. Motion can be slower (interviews), default or faster (sport). Clip › Auto Reframe does the same for selected clips, and Sequence › Duplicate Sequence copies a sequence as it is.
 - Speed ramps and slow motion:
   - **Time Remapping** gives every clip a keyframeable speed curve (linear, hold or eased) inside its length. Picture and linked sound follow it together.
   - **Frame Sampling** sets how in-between frames are made in slow motion: Nearest Frame, Frame Blending, or Optical Flow, which moves pixels along their motion instead of cross-fading.
@@ -274,7 +275,7 @@ Its tools work on `.montage` files by path. Each edit is saved at once, and the 
 - transcribe (with speaker labels), find spoken phrases in the cut, and cut by transcript (phrases, filler words, long pauses, optionally with Smooth Cuts);
 - find shots by description;
 - log media (ratings, labels, keywords, metadata fields, bins), make subclips, auto-tag shots, and find media by text or smart-bin rules, optionally saving the rules as a smart bin;
-- duck music under dialogue, match clips' colour to a shot, and add adjustment layers;
+- duck music under dialogue, match clips' colour to a shot, add adjustment layers, and make a reframed copy of the cut at another aspect ratio;
 - return a rendered frame as an image so the agent can check its work;
 - render with any preset, with progress;
 - export and import EDL, OTIO, FCP 7 XML and FCPXML.

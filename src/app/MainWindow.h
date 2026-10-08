@@ -55,6 +55,13 @@ public:
     void setColourReference();
     bool hasColourReference() const { return !colourRef_.empty(); }
     int matchColour();
+    // Auto Reframe: a copy of the current sequence at aspect w:h with every
+    // picture clip following its subject (speed 0 slower, 1 default, 2 faster),
+    // made current; 0 if cancelled or nothing to do. The dialog asks for both.
+    Id autoReframeSequence(int aspectW, int aspectH, int speed);
+    void autoReframeDialog();
+    // Reframes the selected clips within the current sequence; returns how many.
+    int autoReframeClips(int speed = 1);
 
 protected:
     void closeEvent(QCloseEvent* e) override;

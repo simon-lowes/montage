@@ -7,6 +7,7 @@
 // consistent state; they never need to be reversible themselves.
 #pragma once
 
+#include <map>
 #include <optional>
 #include <string>
 #include <utility>
@@ -96,6 +97,14 @@ Result removeTransition(Sequence& s, Id transitionId);
 Transition* transitionById(Sequence& s, Id id, TrackRef* where = nullptr);
 // Timeline range covered by a transition on a track.
 bool transitionRange(const Track& t, const Transition& tr, FrameTime& from, FrameTime& to);
+
+// ---- Sequences -------------------------------------------------------------------------
+// A copy of sequence `id` with fresh ids throughout (clips, tracks, effects,
+// transitions, link groups, buses, caption tracks), named `name` or
+// "<name> Copy", added to the project with its own media bin item. Returns
+// its id (0 if `id` is unknown).
+// `clipIds`, if given, receives old clip id -> new clip id.
+Id duplicateSequence(Project& p, Id id, const std::string& name = {}, std::map<Id, Id>* clipIds = nullptr);
 
 // ---- Tracks & markers ---------------------------------------------------------------
 TrackRef addTrack(Project& p, Sequence& s, TrackKind kind);

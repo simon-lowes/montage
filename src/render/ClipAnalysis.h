@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -69,6 +70,31 @@ bool trackClipFollow(const Project& p, const Sequence& s, const Clip& c, FrameTi
 // Writes the keys into the clip's position (and scale and rotation for those
 // models), replacing the keyframes in the tracked range.
 void applyFollow(Clip& c, const std::vector<FollowKey>& keys, MotionModel model);
+
+// ---- Auto Reframe (media/Reframe.h) ------------------------------------------------
+// The subject of a picture clip at clip-local frame t, in fractions of its frame.
+struct ReframeKey {
+    FrameTime t = 0;
+    double x = 0.5, y = 0.5;
+};
+// Finds the subject over the clip (five times a second) and smooths its path:
+// speed 0 follows gently, 1 as most shots want, 2 keeps up with fast action.
+bool analyzeClipReframe(const Project& p, const Sequence& s, const Clip& c, int speed, std::vector<ReframeKey>& path,
+                        const TrackProgress& progress = {}, const std::atomic<bool>* cancel = nullptr,
+                        std::string* error = nullptr);
+// Makes clip `c` fill sequence `s`'s frame and keys its position so the
+// subject stays as central as the picture allows (replacing position keys).
+void applyReframe(const Project& p, const Sequence& s, Clip& c, const std::vector<ReframeKey>& path);
+// Every video and still clip of `s`, analysed (by clip id). Fails only if cancelled.
+bool analyzeSequenceReframe(const Project& p, const Sequence& s, int speed, std::map<Id, std::vector<ReframeKey>>& paths,
+                            const TrackProgress& progress = {}, const std::atomic<bool>* cancel = nullptr,
+                            std::string* error = nullptr);
+// A copy of sequence `seq` at width x height (named `name`, or "<name> W:H")
+// with the analysed clips reframed; returns its id.
+Id makeReframedSequence(Project& p, Id seq, int width, int height, const std::map<Id, std::vector<ReframeKey>>& paths,
+                        const std::string& name = {});
+// The frame size for an aspect ratio (w:h) keeping `s`'s shorter side.
+void reframeSize(const Sequence& s, int aspectW, int aspectH, int& width, int& height);
 
 // ---- Object masks (media/Segmenter.h) -----------------------------------------
 // Frames are the media's own (ObjectMask::fps), so trims, speed changes and
