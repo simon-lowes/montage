@@ -2845,6 +2845,66 @@ private slots:
         QCOMPARE(layoutCells(Layout::Grid, 4, 1920, 1080, {20}).at(3).x, 20 + 930 + 20.0);  // (1920 - 3 gaps) / 2 wide
     }
 
+    void matchFrameThroughNesting() {
+        // Two cameras in a multicam (B a second after A), cut in at 100; a 60 fps nested sequence of A at 300 on V2.
+        Project p = makeDefaultProject();
+        auto addMedia = [&](const char* name) {
+            MediaItem m;
+            m.id = p.newId();
+            m.kind = MediaKind::Video;
+            m.name = name;
+            m.path = std::string("/nonexistent/") + name;
+            m.duration = 30.0;
+            m.width = 1920, m.height = 1080;
+            m.fps = {30, 1};
+            m.hasVideo = true;
+            p.media.push_back(m);
+            return m.id;
+        };
+        const Id camA = addMedia("A.mov"), camB = addMedia("B.mov");
+        std::string err;
+        const Id mcMedia = makeMulticam(p, {camA, camB}, {0.0, 1.0}, "Interview", &err);
+        QVERIFY2(mcMedia, err.c_str());
+        Sequence& s = *p.active();
+        const Result mcClip = placeMedia(p, s, mcMedia, 100, 0, 200, V1, A1, false);
+        QVERIFY(mcClip.ok);
+        Sequence nested = makeSequence(p, "Nest", 1920, 1080, {60, 1});
+        Clip inner = makeClip(p, *p.findMedia(camA), TrackKind::Video, nested);
+        inner.start = 0, inner.duration = 600;
+        nested.videoTracks[0].clips.push_back(inner);
+        MediaItem nm;
+        nm.id = p.newId();
+        nm.kind = MediaKind::Sequence;
+        nm.name = "Nest";
+        nm.sequenceId = nested.id;
+        nm.hasVideo = true;
+        nm.duration = 10;
+        p.sequences.push_back(nested);
+        p.media.push_back(nm);
+        Sequence& top = *p.active();
+        QVERIFY(placeMedia(p, top, nm.id, 300, 0, 100, V2, A1, false).ok);
+        // The multicam shows angle A: frame 160 is A's frame 60; switched to B, B's frame 30 (B starts a second in).
+        auto m = matchSource(p, top, 160);
+        QVERIFY(m && m->media == camA);
+        QCOMPARE(m->frame, 60.0);
+        QCOMPARE(m->clip, mcClip.created.at(0));
+        clipById(top, mcClip.created.at(0))->angle = 1;
+        m = matchSource(p, top, 160);
+        QVERIFY(m && m->media == camB);
+        QCOMPARE(m->frame, 30.0);
+        // Through the 60 fps nest: 10 frames in is a third of a second, A's frame 10 in this sequence's frames.
+        m = matchSource(p, top, 310);
+        QVERIFY(m && m->media == camA);
+        QVERIFY2(std::fabs(m->frame - 10) < 1e-9, qPrintable(QString::number(m->frame)));
+        // Nothing there; and a generator on top is looked through.
+        QVERIFY(!matchSource(p, top, 1000));
+        Clip title = makeGeneratorClip(p, "title", 20);
+        title.start = 150;
+        QVERIFY(overwrite(p, top, {TrackKind::Video, 2}, title).ok);
+        m = matchSource(p, top, 160);
+        QVERIFY(m && m->media == camB);
+    }
+
     void keyframeRepeat() {
         // 0 at frame 10, 10 at frame 20.
         Param p;

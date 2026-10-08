@@ -90,6 +90,15 @@ struct FrameUse {
     FrameTime at = 0;
 };
 std::vector<FrameUse> sourceFrameUses(const Sequence& s, Id mediaId, double srcFrame);
+// Match Frame through nested sequences and multicam clips (Resolve 21): the file shown at frame t of the sequence
+// and its frame (in `s`'s frames, as the Source monitor takes them), from the topmost visible video clip that is
+// not a generator, descending into a nested sequence's own topmost clip there (a multicam into its angle).
+struct SourceMatch {
+    Id media = 0;
+    double frame = 0;
+    Id clip = 0;  // the clip in `s` it was found under
+};
+std::optional<SourceMatch> matchSource(const Project& p, const Sequence& s, FrameTime t);
 // Smart Insert's point: the clip start or end on the track nearest the frame (the frame itself on an empty track).
 FrameTime nearestEdit(const Sequence& s, TrackRef t, FrameTime frame);
 Result razor(Project& p, Sequence& s, TrackRef t, FrameTime frame);

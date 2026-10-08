@@ -30,6 +30,10 @@
 #include <QMenuBar>
 #include <QPointer>
 #include <QProgressDialog>
+#include <QPageSize>
+#include <QDateTime>
+#include <QTextDocument>
+#include <QPdfWriter>
 #include <QPushButton>
 #include <QtConcurrent>
 #include <QMessageBox>
@@ -191,6 +195,14 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     connect(sourcePanel_, &MonitorPanel::activated, this, [this] { active_ = Monitor::Source; });
     connect(programPanel_, &MonitorPanel::activated, this, [this] { active_ = Monitor::Program; });
 
+    // The selection's length (Resolve 21's duration readout): how long the selected clips run, first start to last end.
+    selectionInfo_ = new QLabel(this);
+    selectionInfo_->setObjectName(QStringLiteral("selectionInfo"));
+    selectionInfo_->setStyleSheet(QString("color: %1; padding-right: 8px;").arg(theme::kText.name()));
+    statusBar()->addPermanentWidget(selectionInfo_);
+    auto showSelection = [this] { selectionInfo_->setText(selectionSummary()); };
+    connect(state_, &EditorState::selectionChanged, this, showSelection);
+    connect(state_, &EditorState::projectChanged, this, showSelection);
     statusInfo_ = new QLabel(this);
     statusInfo_->setStyleSheet(QString("color: %1; padding-right: 8px;").arg(theme::kTextDim.name()));
     statusBar()->addPermanentWidget(statusInfo_);
@@ -896,7 +908,7 @@ void MainWindow::buildMenus() {
         ->setObjectName(QStringLiteral("rippleOverwrite"));
     add(clipM, tr("Smart Insert"), QKeySequence(), [this] { state_->sourceEdit(EditorState::SourceEdit::SmartInsert); })
         ->setObjectName(QStringLiteral("smartInsert"));
-    add(clipM, tr("&Match Frame"), QKeySequence(Qt::Key_F), [this] { matchFrame(); });
+    add(clipM, tr("&Match Frame"), QKeySequence(Qt::Key_F), [this] { matchFrame(); })->setObjectName(QStringLiteral("matchFrame"));
     add(clipM, tr("Reverse Match Frame"), QKeySequence("Shift+R"), [this] { reverseMatchFrame(); })
         ->setObjectName(QStringLiteral("reverseMatchFrame"));
     {
@@ -1058,10 +1070,11 @@ void MainWindow::buildMenus() {
     add(seqM, tr("Export Markers…"), QKeySequence(), [this] {
         QString filter;
         const QString path = QFileDialog::getSaveFileName(this, tr("Export Markers"), QString(),
-                                                          tr("Marker list (*.csv);;Avid locators (*.txt);;Resolve marker EDL (*.edl)"), &filter);
+                                                          tr("Marker list (*.csv);;Avid locators (*.txt);;Resolve marker EDL (*.edl);;PDF with pictures (*.pdf)"), &filter);
         if (path.isEmpty()) return;
         QString file = path;
-        if (QFileInfo(file).suffix().isEmpty()) file += filter.contains("*.txt") ? ".txt" : filter.contains("*.edl") ? ".edl" : ".csv";
+        if (QFileInfo(file).suffix().isEmpty())
+            file += filter.contains("*.txt") ? ".txt" : filter.contains("*.edl") ? ".edl" : filter.contains("*.pdf") ? ".pdf" : ".csv";
         exportMarkers(file);
     })->setObjectName(QStringLiteral("exportMarkers"));
     add(seqM, tr("Import Markers…"), QKeySequence(), [this] {
@@ -1677,16 +1690,29 @@ void MainWindow::nudge(int frames) {
 void MainWindow::matchFrame() {
     const Sequence* s = state_->sequence();
     if (!s) return;
-    FrameTime t = state_->playhead();
-    for (int i = int(s->videoTracks.size()) - 1; i >= 0; --i) {
-        const Clip* c = edit::clipAt(*s, {TrackKind::Video, i}, t);
-        if (!c || c->isGenerator() || s->videoTracks[size_t(i)].muted) continue;
-        FrameTime srcFrame = FrameTime(std::floor(c->sourceFrameAt(t)));
-        openInSource(c->mediaId);
-        source_->seek(srcFrame);
+    // Through nested sequences and multicam clips to the file underneath (Resolve 21's Match Frame).
+    if (const auto match = edit::matchSource(state_->project(), *s, state_->playhead())) {
+        openInSource(match->media);
+        source_->seek(FrameTime(std::floor(match->frame + 1e-6)));
         return;
     }
     state_->message(tr("No video clip under the playhead"));
+}
+
+QString MainWindow::selectionSummary() const {
+    const Sequence* s = state_->sequence();
+    if (!s) return {};
+    FrameTime first = std::numeric_limits<FrameTime>::max(), last = std::numeric_limits<FrameTime>::min();
+    int n = 0;
+    for (Id id : state_->selectedClips())
+        if (const Clip* c = edit::clipById(*s, id)) {
+            first = std::min(first, c->start);
+            last = std::max(last, c->end());
+            ++n;
+        }
+    if (!n) return {};
+    const QString length = QString::fromStdString(formatTimecode(last - first, s->fps));
+    return n == 1 ? tr("1 clip selected · %1").arg(length) : tr("%1 clips selected · %2").arg(n).arg(length);
 }
 
 bool MainWindow::reverseMatchFrame() {
@@ -1852,9 +1878,70 @@ bool MainWindow::exportMarkers(const QString& path) {
     const Sequence* s = state_->sequence();
     if (!s) return false;
     const QString ext = QFileInfo(path).suffix().toLower();
+    if (ext == QLatin1String("pdf")) return exportMarkersPdf(path);
     const std::string text = ext == QLatin1String("txt") ? markersToAvidLocators(*s) : ext == QLatin1String("edl") ? markersToResolveEdl(*s) : markersToCsv(*s);
     QFile f(path);
     if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate) || f.write(text.data(), qint64(text.size())) != qint64(text.size())) {
+        statusBar()->showMessage(tr("Cannot write %1").arg(path), 6000);
+        return false;
+    }
+    statusBar()->showMessage(tr("Exported %n marker(s) to %1", nullptr, int(s->markers.size())).arg(QFileInfo(path).fileName()), 6000);
+    return true;
+}
+
+bool MainWindow::exportMarkersPdf(const QString& path) {
+    // Resolve 21.1's marker list as a PDF: a page header, then each marker with a picture of its frame, timecode,
+    // length, colour and notes, for a review or a client.
+    const Sequence* s = state_->sequence();
+    if (!s) return false;
+    QTextDocument doc;
+    const double fps = s->fpsValue();
+    auto tc = [&](FrameTime f) { return QString::fromStdString(formatTimecode(f, s->fps)); };
+    QString html = QStringLiteral("<h2>%1</h2><p style='color:#555'>%2 · %3 × %4 · %5 fps · %6</p>")
+                       .arg(QString(s->name.c_str()).toHtmlEscaped(),
+                            tr("%n marker(s)", nullptr, int(s->markers.size())))
+                       .arg(s->width)
+                       .arg(s->height)
+                       .arg(fps, 0, 'f', 3)
+                       .arg(QLocale().toString(QDateTime::currentDateTime(), QLocale::ShortFormat));
+    html += QStringLiteral("<table cellspacing='0' cellpadding='4' border='1' style='border-collapse:collapse' width='100%'>"
+                           "<tr style='background:#eee'><th></th><th>#</th><th>%1</th><th>%2</th><th>%3</th><th>%4</th><th>%5</th></tr>")
+                .arg(tr("Marker"), tr("Timecode"), tr("Duration"), tr("Colour"), tr("Notes"));
+    RenderOptions o;
+    o.scale = std::min(1.0, 192.0 / std::max(1, s->width));
+    o.displaySpace = "rec709";
+    for (size_t i = 0; i < s->markers.size(); ++i) {
+        const Marker& mk = s->markers[i];
+        QString picture;
+        if (s->duration() > 0) {
+            const Image view = renderProgramFrame(state_->project(), *s, std::clamp<FrameTime>(mk.t, 0, s->duration() - 1), o);
+            if (!view.empty()) {
+                QImage img(view.width, view.height, QImage::Format_RGBA8888);
+                toRgba8(view, img.bits(), size_t(img.bytesPerLine()));
+                const QUrl url(QStringLiteral("marker:%1").arg(i));
+                doc.addResource(QTextDocument::ImageResource, url, img);
+                picture = QStringLiteral("<img src='%1' width='%2'>").arg(url.toString()).arg(img.width());
+            }
+        }
+        const QColor colour = theme::labelColor(mk.color);
+        const QString swatch = colour.isValid() ? QStringLiteral("<span style='background:%1'>&nbsp;&nbsp;&nbsp;&nbsp;</span> %2")
+                                                      .arg(colour.name(), QString::fromUtf8(theme::labelName(mk.color)))
+                                                : QString();
+        html += QStringLiteral("<tr><td>%1</td><td>%2</td><td><b>%3</b>%4</td><td>%5</td><td>%6</td><td>%7</td><td>%8</td></tr>")
+                    .arg(picture)
+                    .arg(i + 1)
+                    .arg(QString::fromStdString(mk.name).toHtmlEscaped(), mk.chapter ? tr(" (chapter)") : QString(), tc(mk.t),
+                         mk.duration > 0 ? tc(mk.duration) : QString(), swatch, QString::fromStdString(mk.comment).toHtmlEscaped());
+    }
+    html += QStringLiteral("</table>");
+    doc.setHtml(html);
+    QPdfWriter writer(path);
+    writer.setPageSize(QPageSize(QPageSize::A4));
+    writer.setPageOrientation(QPageLayout::Landscape);
+    writer.setTitle(tr("Markers: %1").arg(QString::fromStdString(s->name)));
+    writer.setCreator(QStringLiteral("Montage"));
+    doc.print(&writer);
+    if (!QFileInfo(path).exists() || QFileInfo(path).size() == 0) {
         statusBar()->showMessage(tr("Cannot write %1").arg(path), 6000);
         return false;
     }

@@ -448,6 +448,37 @@ std::vector<FrameUse> sourceFrameUses(const Sequence& s, Id mediaId, double srcF
     return out;
 }
 
+namespace {
+// `t` in frames of `s`; returns the media and its frame in frames of `s` (times `toTop` for the top sequence).
+std::optional<SourceMatch> matchSourceIn(const Project& p, const Sequence& s, double t, int depth, int onlyTrack) {
+    if (depth > 8) return std::nullopt;
+    for (int i = int(s.videoTracks.size()) - 1; i >= 0; --i) {
+        if (onlyTrack >= 0 ? i != onlyTrack : s.videoTracks[size_t(i)].muted) continue;
+        const Clip* c = clipAt(s, {TrackKind::Video, i}, FrameTime(std::floor(t + 1e-6)));
+        if (!c || !c->enabled || c->isGenerator()) continue;
+        const MediaItem* m = p.findMedia(c->mediaId);
+        if (!m) continue;
+        const double src = c->sourceFrameAt(FrameTime(std::floor(t + 1e-6)));
+        if (m->kind != MediaKind::Sequence) return SourceMatch{m->id, src, c->id};
+        const Sequence* nested = p.findSequence(m->sequenceId);
+        if (!nested || nested->id == s.id) continue;
+        // Into the nested sequence, at its own frame rate; a multicam only through the angle shown.
+        const double k = nested->fpsValue() / s.fpsValue();
+        const int angle = nested->multicam ? std::clamp(c->angle, 0, std::max(0, int(nested->videoTracks.size()) - 1)) : -1;
+        if (auto inner = matchSourceIn(p, *nested, src * k, depth + 1, angle)) {
+            inner->frame /= k;
+            inner->clip = c->id;
+            return inner;
+        }
+    }
+    return std::nullopt;
+}
+}  // namespace
+
+std::optional<SourceMatch> matchSource(const Project& p, const Sequence& s, FrameTime t) {
+    return matchSourceIn(p, s, double(t), 0, -1);
+}
+
 FrameTime nearestEdit(const Sequence& s, TrackRef t, FrameTime frame) {
     FrameTime best = frame, dist = std::numeric_limits<FrameTime>::max();
     if (const Track* tr = trackAt(s, t))

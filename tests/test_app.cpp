@@ -779,6 +779,17 @@ private slots:
         QVERIFY(win_->exportMarkers(dir_.path() + "/markers.edl"));
         QFile edl(dir_.path() + "/markers.edl");
         QVERIFY(edl.open(QIODevice::ReadOnly) && edl.readAll().contains("|M:Two"));
+        // A PDF with a picture of each marker's frame (Red at 10, Blue at 40... both colour mattes, so at least one image).
+        const QString pdf = dir_.path() + "/markers.pdf";
+        QVERIFY(win_->exportMarkers(pdf));
+        {
+            QFile f(pdf);
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            const QByteArray data = f.readAll();
+            QVERIFY(data.startsWith("%PDF-"));
+            QVERIFY(data.contains("/Subtype /Image") || data.contains("/Subtype/Image"));
+            QVERIFY(data.contains("/Type /Page") || data.contains("/Type/Page"));
+        }
         const auto saved = state()->sequence()->markers;
         state()->edit("Clear", [](Project&, Sequence& s) {
             s.markers.clear();
@@ -3943,6 +3954,11 @@ const auto seq = [this] { return state()->sequence(); };
         act->trigger();
         act->trigger();
         QCOMPARE(state()->playhead(), FrameTime(5));
+        // Match Frame goes back: the second clip's frame 125 is the still's frame 35.
+        state()->setPlayhead(125);
+        win_->findChild<QAction*>("matchFrame")->trigger();
+        QCOMPARE(state()->sourceMedia(), ids[0]);
+        QTRY_COMPARE(source->position(), FrameTime(35));
         state()->setSourceMedia(0);
         state()->newProject();
     }
@@ -3967,9 +3983,15 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(win_->arrangeLayout(edit::Layout::Grid), 0);
         // Picture in picture from a selection of both.
         state()->setSelection({red, title}, false);
+        // The status bar reads the selection's length: Red (0-60) and the title (15-60) run 60 frames.
+        auto* readout = win_->findChild<QLabel*>(QStringLiteral("selectionInfo"));
+        QVERIFY(readout);
+        QCOMPARE(readout->text(), QString("2 clips selected · %1").arg(QString::fromStdString(formatTimecode(60, state()->sequence()->fps))));
         QCOMPARE(win_->arrangeLayout(edit::Layout::PictureInPicture), 2);
         QCOMPARE(m(red, "scale"), 100.0);
         QVERIFY(std::fabs(m(title, "scale") - 30) < 1e-9);
+        state()->setSelection({}, false);
+        QVERIFY(readout->text().isEmpty());
     }
 
     void keyframePanelEditsKeys() {

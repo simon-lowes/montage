@@ -101,6 +101,7 @@ public:
     // The sequence's markers as a CSV (.csv), Avid locators (.txt) or a Resolve marker EDL (.edl); markers from a CSV
     // or Avid locator file, as one undo step (returns how many).
     bool exportMarkers(const QString& path);
+    bool exportMarkersPdf(const QString& path);  // with a picture of each marker's frame
     int importMarkers(const QString& path);
     // Bakes the colour effects of the clip a command acts on, at the playhead, into a .cube file.
     bool exportClipLut(const QString& path, int size = 33);
@@ -140,6 +141,8 @@ public:
     int detectRoles();
     // Reverse Match Frame: the Source monitor's frame, found in the sequence (again: the next use).
     bool reverseMatchFrame();
+    // The status bar's selection readout: "3 clips selected · 00:00:12:05", the first start to the last end.
+    QString selectionSummary() const;
     // Video layouts (Clip › Layout): the selected video clips, or with fewer than two every video clip under the
     // playhead, sharing the frame. Returns how many clips were arranged.
     int arrangeLayout(edit::Layout layout, double gap = 0);
@@ -313,6 +316,7 @@ private:
     QString workspace_ = QStringLiteral("Editing");
     QTabBar* workspaceBar_ = nullptr;
     QMenu* roleMenu_ = nullptr;
+    QLabel* selectionInfo_ = nullptr;
     QMenu* workspaceMenu_ = nullptr;
     QMenu* deleteWorkspaceMenu_ = nullptr;
     QAction* workspaceCustomEnd_ = nullptr;  // saved workspaces are listed before this separator
