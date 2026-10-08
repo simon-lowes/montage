@@ -10,6 +10,7 @@
 #include "TimelineWidget.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
+#include "media/Image.h"
 
 class QAction;
 class QDockWidget;
@@ -47,6 +48,13 @@ public:
     void scheduleScreenshot(const QString& path, int delayMs);
     // Brings a panel to the front by its object name ("inspector", "scopes", "mixer", "effects"...).
     void raisePanel(const QString& name);
+    // Shot matching: remembers the Program monitor's picture at the playhead as
+    // the look to match, then grades the selected clips to it (a Color Correct
+    // first in each one's effects, replacing an earlier match). Returns how
+    // many clips were matched.
+    void setColourReference();
+    bool hasColourReference() const { return !colourRef_.empty(); }
+    int matchColour();
 
 protected:
     void closeEvent(QCloseEvent* e) override;
@@ -137,6 +145,8 @@ private:
     QDockWidget* keyframesDock_ = nullptr;
     QDockWidget* meterDock_ = nullptr;
     RenderQueue* queue_ = nullptr;
+    Image colourRef_;       // the look Match Colour aims for
+    QString colourRefName_;
     QMenu* recentMenu_ = nullptr;
     QMenu* windowMenu_ = nullptr;
     QLabel* statusInfo_ = nullptr;

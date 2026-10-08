@@ -47,6 +47,15 @@ void drawCaption(Image& img, const CaptionTrack& track, FrameTime t, const Color
 // Raw (unprocessed) frame of a media item at `seconds`, fitted into w x h; for the source monitor.
 Image renderMediaFrame(const Project& p, const MediaItem& m, double seconds, int w, int h);
 
+// Shot matching. The picture at timeline frame t as Match Colour compares it
+// (Rec.709, at most 480 px wide), to use as the reference:
+Image colourReferenceFrame(const Project& p, const Sequence& s, FrameTime t);
+// Grades picture clips to `reference`: each one's own media frame at timeline
+// frame `at` (its middle frame when `at` is outside it) is matched into a
+// Color Correct put first in its effects, replacing an earlier match. Returns
+// how many clips were matched.
+int matchClipColour(Project& p, Sequence& s, const std::vector<Id>& clips, const Image& reference, FrameTime at);
+
 // Renders a title / colour / gradient generator at the given size.
 Image renderGenerator(const Effect& g, FrameTime t, int w, int h, double scale);
 

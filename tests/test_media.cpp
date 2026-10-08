@@ -1208,6 +1208,64 @@ private slots:
         QVERIFY(call(QJsonObject{{"project", empty}, {"fillers", true}}).value("isError").toBool());
     }
 
+    void mcpMatchesColour() {
+        // A warm, lifted hero shot and a flat shot of the same scene.
+        QImage flat(320, 180, QImage::Format_RGB32), hero(320, 180, QImage::Format_RGB32);
+        std::mt19937 rng(4);
+        std::uniform_int_distribution<int> px(0, 300), sz(6, 30), col(10, 245);
+        flat.fill(QColor(110, 110, 110));
+        {
+            QPainter pa(&flat);
+            for (int i = 0; i < 200; ++i) pa.fillRect(px(rng), px(rng) * 180 / 300, sz(rng), sz(rng), QColor(col(rng), col(rng), col(rng)));
+        }
+        for (int y = 0; y < 180; ++y)
+            for (int x = 0; x < 320; ++x) {
+                const QRgb c = flat.pixel(x, y);
+                hero.setPixel(x, y, qRgb(std::min(255, 20 + qRed(c) * 9 / 10), qGreen(c), qBlue(c) * 3 / 4));
+            }
+        const std::string flatPng = path("mcp-flat.png"), heroPng = path("mcp-hero.png");
+        QVERIFY(flat.save(QString::fromStdString(flatPng)) && hero.save(QString::fromStdString(heroPng)));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320;
+        s.height = 180;
+        s.fps = {25, 1};
+        MediaItem hm = probeOrFail(p, heroPng), fm = probeOrFail(p, flatPng);
+        p.media.push_back(hm);
+        p.media.push_back(fm);
+        QVERIFY(edit::placeMedia(p, s, hm.id, 0, 0, 25, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(edit::placeMedia(p, s, fm.id, 25, 0, 25, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Id target = s.videoTracks[0].clips.at(1).id;
+        const QString project = QString::fromStdString(path("match.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_match_color"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call(QJsonObject{{"project", project}, {"reference_at", 0.4}, {"clips", QJsonArray{double(target)}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("matched").toInt(), 1);
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Clip* c = edit::clipById(*back.active(), target);
+        QVERIFY(c && c->effects.size() == 1 && c->effects[0].strings.count("match"));
+        // The flat shot now renders like the hero shot.
+        RenderOptions o;
+        o.displaySpace = "rec709";
+        const Image a = renderProgramFrame(back, *back.active(), 10, o), b = renderProgramFrame(back, *back.active(), 35, o);
+        double d = 0;
+        for (size_t i = 0; i < a.px.size(); i += 4)
+            for (int k = 0; k < 3; ++k) d += std::fabs(a.px[i + k] - b.px[i + k]);
+        d /= double(a.px.size() / 4 * 3);
+        QVERIFY2(d < 0.01, qPrintable(QString::number(d)));
+        QVERIFY(call(QJsonObject{{"project", project}, {"reference_at", 0.4}, {"clips", QJsonArray{}}}).value("isError").toBool());
+    }
+
     void mcpServerEditsProjects() {
         writeBallVideo(path("mcp-ball.mp4"), 12);
         const QString project = QString::fromStdString(path("agent.montage"));

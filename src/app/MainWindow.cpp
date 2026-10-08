@@ -429,6 +429,10 @@ void MainWindow::buildMenus() {
             if (dlg.exec() == QDialog::Accepted) AutoDuckDialog::apply(state_, music, dlg.dialogueTracks(), dlg.options(), this);
         }))->setObjectName(QStringLiteral("autoDuck"));
     add(clipM, tr("Auto &Colour"), QKeySequence("Ctrl+Alt+C"), [this] { autoColor(); });
+    add(clipM, tr("Set Colour &Reference"), QKeySequence(), [this] { setColourReference(); })
+        ->setObjectName(QStringLiteral("setColourReference"));
+    add(clipM, tr("Match Colour to Reference"), QKeySequence("Ctrl+Alt+Shift+C"), [this] { matchColour(); })
+        ->setObjectName(QStringLiteral("matchColour"));
     add(clipM, tr("S&ynchronize by Audio"), QKeySequence(), [this] { syncByAudio(); });
     clipM->addSeparator();
     add(clipM, tr("&Insert from Source"), QKeySequence(Qt::Key_Comma), [this] { state_->insertFromSource(false); });
@@ -1218,6 +1222,49 @@ void MainWindow::autoColor() {
         return true;
     });
     inspectorDock_->raise();
+}
+
+void MainWindow::setColourReference() {
+    const Sequence* s = state_->sequence();
+    if (!s || s->duration() == 0) {
+        state_->message(tr("Nothing to take a colour reference from"));
+        return;
+    }
+    const FrameTime t = std::clamp<FrameTime>(state_->playhead(), 0, s->duration() - 1);
+    colourRef_ = colourReferenceFrame(state_->project(), *s, t);
+    // Named after the top clip with a picture at the playhead.
+    colourRefName_ = QString::fromStdString(s->name);
+    for (int i = int(s->videoTracks.size()) - 1; i >= 0; --i)
+        if (const Clip* c = edit::clipAt(*s, TrackRef{TrackKind::Video, i}, t); c && !s->videoTracks[size_t(i)].muted) {
+            colourRefName_ = QString::fromStdString(c->name);
+            break;
+        }
+    state_->message(tr("Colour reference: %1 at %2. Select clips and choose Match Colour to Reference.")
+                        .arg(colourRefName_, QString::fromStdString(formatTimecode(t, s->fps))),
+                    6000);
+}
+
+int MainWindow::matchColour() {
+    if (!state_->sequence()) return 0;
+    if (colourRef_.empty()) {
+        state_->message(tr("Park on the look to match and choose Clip › Set Colour Reference first"), 5000);
+        return 0;
+    }
+    const std::vector<Id> clips(state_->selectedClips().begin(), state_->selectedClips().end());
+    const Image ref = colourRef_;
+    const FrameTime at = state_->playhead();
+    int n = 0;
+    state_->edit(tr("Match Colour"), [&](Project& p, Sequence& sq) {
+        n = matchClipColour(p, sq, clips, ref, at);
+        return n > 0;
+    });
+    if (n == 0) {
+        state_->message(tr("Select the video clips to match"));
+        return 0;
+    }
+    state_->message(tr("Matched %n clip(s) to %1", "", n).arg(colourRefName_), 5000);
+    inspectorDock_->raise();
+    return n;
 }
 
 void MainWindow::syncByAudio() {

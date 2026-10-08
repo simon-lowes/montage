@@ -25,6 +25,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - 13 blend modes
 - Primary colour correction: lift, gamma and gain per channel, plus exposure, contrast, pivot, saturation, temperature, tint and offset
 - One-click Auto Colour (grey-world balance and level stretch)
+- **Match Colour** (shot matching, like Premiere's Color Match or Resolve's Shot Match): park on the look you want and choose Clip › Set Colour Reference, then select clips and choose Clip › Match Colour to Reference (Ctrl+Alt+Shift+C). Each clip gets a Color Correct whose per-channel lift, gain and gamma put its shadows, mid-tones and highlights on the reference's.
 - Curves with presets, HSL/vibrance, `.cube` 3D/1D LUTs, black & white, invert
 - Chroma key with spill suppression, and luma key
 - Levels, Posterize, Glow, Film Grain (new each frame, strongest in the mid-tones), Directional Blur, Chromatic Aberration, Lens Distortion (barrel or pincushion), Letterbox (2.39, 2, 1.85, 4:3, 1:1, 9:16)
@@ -272,7 +273,7 @@ Its tools work on `.montage` files by path. Each edit is saved at once, and the 
 - transcribe (with speaker labels), find spoken phrases in the cut, and cut by transcript (phrases, filler words, long pauses, optionally with Smooth Cuts);
 - find shots by description;
 - log media (ratings, labels, keywords, metadata fields, bins), make subclips, auto-tag shots, and find media by text or smart-bin rules, optionally saving the rules as a smart bin;
-- duck music under dialogue, and add adjustment layers;
+- duck music under dialogue, match clips' colour to a shot, and add adjustment layers;
 - return a rendered frame as an image so the agent can check its work;
 - render with any preset, with progress;
 - export and import EDL, OTIO, FCP 7 XML and FCPXML.

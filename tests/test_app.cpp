@@ -1202,6 +1202,71 @@ private slots:
         QCOMPARE(state()->sequence()->videoTracks.size(), tracks);
     }
 
+    void matchColourToAReference() {
+        // The same scene twice: graded warm and lifted (the hero shot), and flat.
+        QImage flat(320, 180, QImage::Format_RGB32), hero(320, 180, QImage::Format_RGB32);
+        std::mt19937 rng(9);
+        std::uniform_int_distribution<int> px(0, 300), sz(6, 30), col(10, 245);
+        flat.fill(QColor(110, 110, 110));
+        {
+            QPainter pa(&flat);
+            for (int i = 0; i < 200; ++i) pa.fillRect(px(rng), px(rng) * 180 / 300, sz(rng), sz(rng), QColor(col(rng), col(rng), col(rng)));
+        }
+        for (int y = 0; y < 180; ++y)
+            for (int x = 0; x < 320; ++x) {
+                const QRgb c = flat.pixel(x, y);
+                auto f = [](int v) { return v / 255.0; };
+                const double r = 0.08 + 0.9 * f(qRed(c)), g = std::pow(f(qGreen(c)), 1.15), b = 0.78 * f(qBlue(c));
+                hero.setPixel(x, y, qRgb(int(std::lround(255 * std::min(1.0, r))), int(std::lround(255 * g)), int(std::lround(255 * b))));
+            }
+        const QString flatPng = dir_.path() + "/flat.png", heroPng = dir_.path() + "/hero.png";
+        QVERIFY(flat.save(flatPng) && hero.save(heroPng));
+        state()->newProject();
+        const auto ids = state()->importFiles({heroPng, flatPng});
+        QCOMPARE(ids.size(), size_t(2));
+        state()->apply("Place", [&](Project& p, Sequence& s) {
+            edit::placeMedia(p, s, ids[0], 0, 0, 30, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+            return edit::placeMedia(p, s, ids[1], 30, 0, 30, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        });
+        const Sequence& s = *state()->sequence();
+        QCOMPARE(s.videoTracks[0].clips.size(), size_t(2));
+        const Id target = s.videoTracks[0].clips[1].id;
+        auto* setRef = win_->findChild<QAction*>("setColourReference");
+        auto* match = win_->findChild<QAction*>("matchColour");
+        QVERIFY(setRef && match);
+        RenderOptions o;
+        o.displaySpace = "rec709";
+        auto diff = [&](FrameTime a, FrameTime b) {
+            const Image ia = renderProgramFrame(state()->project(), *state()->sequence(), a, o);
+            const Image ib = renderProgramFrame(state()->project(), *state()->sequence(), b, o);
+            double d = 0;
+            for (size_t i = 0; i < ia.px.size(); i += 4)
+                for (int k = 0; k < 3; ++k) d += std::fabs(ia.px[i + k] - ib.px[i + k]);
+            return d / double(ia.px.size() / 4 * 3);
+        };
+        const double before = diff(10, 40);
+        QVERIFY(before > 0.04);
+        // Park on the hero shot and take it as the reference; then match the flat one.
+        state()->setPlayhead(10);
+        setRef->trigger();
+        QVERIFY(win_->hasColourReference());
+        state()->setSelection({target}, false);
+        match->trigger();
+        const Clip* c = edit::clipById(*state()->sequence(), target);
+        QCOMPARE(c->effects.size(), size_t(1));
+        QCOMPARE(c->effects[0].type, std::string("color_correct"));
+        QVERIFY(c->effects[0].strings.count("match"));
+        const double after = diff(10, 40);
+        QVERIFY2(after < 0.01 && after < before * 0.2, qPrintable(QString("%1 -> %2").arg(before).arg(after)));
+        // Matching again replaces the match rather than stacking another; one undo removes it.
+        match->trigger();
+        QCOMPARE(edit::clipById(*state()->sequence(), target)->effects.size(), size_t(1));
+        state()->undo();
+        state()->undo();
+        QVERIFY(edit::clipById(*state()->sequence(), target)->effects.empty());
+        state()->newProject();
+    }
+
     void renderQueueInTheBackground() {
         loadDemo();
         RenderQueue* queue = win_->renderQueue();

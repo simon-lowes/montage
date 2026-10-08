@@ -960,6 +960,63 @@ colorspaces:
         QVERIFY(lo < 0.05f && hi > 0.9f);                         // levels stretched
     }
 
+    void colorMatch() {
+        // Random coloured blocks over a gradient, 160 x 90 (another seed: the same kind of scene, framed differently).
+        auto texture = [](unsigned seed) {
+            Image img(160, 90);
+            for (int y = 0; y < 90; ++y)
+                for (int x = 0; x < 160; ++x) {
+                    float* p = img.at(x, y);
+                    p[0] = p[1] = p[2] = 0.15f + 0.6f * float(x) / 159.0f;
+                    p[3] = 1;
+                }
+            unsigned st = seed;
+            auto rnd = [&st] {
+                st = st * 1664525u + 1013904223u;
+                return float(st >> 8) / float(1u << 24);
+            };
+            for (int i = 0; i < 300; ++i) {
+                const int x0 = int(rnd() * 150), y0 = int(rnd() * 82), w = 4 + int(rnd() * 12), h = 4 + int(rnd() * 9);
+                const float c[3] = {0.05f + 0.9f * rnd(), 0.05f + 0.9f * rnd(), 0.05f + 0.9f * rnd()};
+                for (int y = y0; y < std::min(90, y0 + h); ++y)
+                    for (int x = x0; x < std::min(160, x0 + w); ++x) std::copy(c, c + 3, img.at(x, y));
+            }
+            return img;
+        };
+        // A warm, lifted, contrasty grade.
+        Effect look = makeEffect("color_correct", 1);
+        look.params["lift_r"] = 0.06;
+        look.params["gain_b"] = 0.8;
+        look.params["gamma_g"] = 0.3;
+        look.params["gain"] = 1.1;
+        auto graded = [&](Image img, const Effect& e) {
+            applyVideoEffect(e, 0, img, 1);
+            return img;
+        };
+        auto diff = [](const Image& a, const Image& b) {
+            double d = 0;
+            for (size_t i = 0; i < a.px.size(); i += 4)
+                for (int k = 0; k < 3; ++k) d += std::fabs(a.px[i + k] - b.px[i + k]);
+            return d / double(a.px.size() / 4 * 3);
+        };
+        const Image a = texture(1), b = texture(2);
+        // The same shot graded and not: matching brings it onto the grade, and back.
+        const Image ga = graded(a, look);
+        QVERIFY(diff(a, ga) > 0.05);
+        double d = diff(graded(a, colorMatchCorrection(a, ga, 2)), ga);
+        QVERIFY2(d < 0.005, qPrintable(QString::number(d)));
+        d = diff(graded(ga, colorMatchCorrection(ga, a, 3)), a);
+        QVERIFY2(d < 0.005, qPrintable(QString::number(d)));
+        // Another shot under the same light: it comes out close to how the grade would have it.
+        const Image gb = graded(b, look);
+        d = diff(graded(b, colorMatchCorrection(b, ga, 4)), gb);
+        QVERIFY2(d < 0.035 && d < diff(b, gb) * 0.45, qPrintable(QString("%1 vs %2").arg(d).arg(diff(b, gb))));
+        // Nothing to go on: no change.
+        const Effect none = colorMatchCorrection(Image(), ga, 5);
+        QCOMPARE(none.p("gain_r", 0, 1), 1.0);
+        QCOMPARE(none.p("lift_g", 0, 0), 0.0);
+    }
+
     void titlesRender() {
         Project p;
         Effect t = makeEffect(p, "title");

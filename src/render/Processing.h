@@ -58,6 +58,11 @@ void gaussianBlur(Image& img, double radius, bool horizontal = true, bool vertic
 // Builds a primary colour correction that neutralises the image's colour
 // cast (grey world) and stretches its levels to 0.5 % / 99.5 % percentiles.
 Effect autoColorCorrection(const Image& img, Id effectId);
+// Builds a primary colour correction that makes `img` look like `reference`
+// (shot matching): per channel, lift and gain put its shadows and highlights
+// (5th and 95th percentiles) on the reference's and gamma its mid-tones
+// (medians). The pictures need not show the same thing, only similar light.
+Effect colorMatchCorrection(const Image& img, const Image& reference, Id effectId);
 
 // Flattens premultiplied RGBA over an opaque colour.
 void flattenOver(Image& img, float r, float g, float b);

@@ -424,6 +424,90 @@ Effect autoColorCorrection(const Image& img, Id effectId) {
     return e;
 }
 
+namespace {
+
+// Percentiles 5, 10, 20 ... 90, 95 of each unpremultiplied channel (opaque pixels, up to ~100k of them).
+constexpr int kMatchQuantiles = 11;
+bool channelPercentiles(const Image& img, double out[3][kMatchQuantiles]) {
+    if (img.empty()) return false;
+    const size_t n = img.px.size() / 4, stride = std::max<size_t>(1, n / 100000);
+    std::vector<float> ch[3];
+    for (size_t i = 0; i < n; i += stride) {
+        const float* p = &img.px[i * 4];
+        if (p[3] < 0.5f) continue;
+        for (int k = 0; k < 3; ++k) ch[k].push_back(p[k] / p[3]);
+    }
+    if (ch[0].size() < 16) return false;
+    static const double q[kMatchQuantiles] = {0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95};
+    for (int k = 0; k < 3; ++k) {
+        std::sort(ch[k].begin(), ch[k].end());
+        for (int j = 0; j < kMatchQuantiles; ++j) out[k][j] = ch[k][size_t(std::llround(q[j] * double(ch[k].size() - 1)))];
+    }
+    return true;
+}
+
+}  // namespace
+
+Effect colorMatchCorrection(const Image& img, const Image& reference, Id effectId) {
+    Effect e = makeEffect("color_correct", effectId);
+    double s[3][kMatchQuantiles], r[3][kMatchQuantiles];
+    if (!channelPercentiles(img, s) || !channelPercentiles(reference, r)) return e;
+    static const char* const names[3][3] = {{"lift_r", "gain_r", "gamma_r"}, {"lift_g", "gain_g", "gamma_g"}, {"lift_b", "gain_b", "gamma_b"}};
+    for (int c = 0; c < 3; ++c) {
+        // Color Correct does v * gain, then lift (v + lift * (1 - v)), then v^(1 / gamma): an affine map
+        // then a power. For a power, the affine part is the least-squares line from the image's
+        // percentiles to the reference's taken back through the power; the power is the one whose
+        // result lies closest to the reference's percentiles.
+        auto fit = [&](double gamma, double& a, double& b) {
+            double sx = 0, sy = 0, sxx = 0, sxy = 0;
+            for (int j = 0; j < kMatchQuantiles; ++j) {
+                const double x = s[c][j], y = std::pow(std::max(0.0, r[c][j]), gamma);
+                sx += x;
+                sy += y;
+                sxx += x * x;
+                sxy += x * y;
+            }
+            const double n = kMatchQuantiles, den = n * sxx - sx * sx;
+            a = den > 1e-12 ? (n * sxy - sx * sy) / den : 1.0;
+            b = (sy - a * sx) / n;
+            double err = 0;
+            for (int j = 0; j < kMatchQuantiles; ++j) {
+                const double v = a * s[c][j] + b;
+                const double out = v > 0 ? std::pow(v, 1 / gamma) : v;
+                err += (out - r[c][j]) * (out - r[c][j]);
+            }
+            return err;
+        };
+        // Golden-section search over gamma 0.5..2 (in log2, as the parameter is).
+        double lo = -1, hi = 1, a = 1, b = 0;
+        const double g = (std::sqrt(5.0) - 1) / 2;
+        double x1 = hi - g * (hi - lo), x2 = lo + g * (hi - lo);
+        double f1 = fit(std::exp2(x1), a, b), f2 = fit(std::exp2(x2), a, b);
+        for (int it = 0; it < 40; ++it) {
+            if (f1 < f2) {
+                hi = x2;
+                x2 = x1;
+                f2 = f1;
+                x1 = hi - g * (hi - lo);
+                f1 = fit(std::exp2(x1), a, b);
+            } else {
+                lo = x1;
+                x1 = x2;
+                f1 = f2;
+                x2 = lo + g * (hi - lo);
+                f2 = fit(std::exp2(x2), a, b);
+            }
+        }
+        const double lg = (lo + hi) / 2;
+        fit(std::exp2(lg), a, b);
+        const double lift = std::clamp(b, -1.0, 0.9);
+        e.params[names[c][0]] = lift;
+        e.params[names[c][1]] = std::clamp(a / (1 - lift), 0.0, 4.0);
+        e.params[names[c][2]] = lg;
+    }
+    return e;
+}
+
 void flattenOver(Image& img, float r, float g, float b) {
     parallelRows(img.height, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y) {

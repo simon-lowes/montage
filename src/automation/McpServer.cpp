@@ -1065,6 +1065,29 @@ void McpServer::Impl::addTools() {
             return ok(QStringLiteral("Adjustment layer %1 on V%2 from %3").arg(qulonglong(id)).arg(track.index + 1).arg(tc(at, s)), o);
         });
 
+    add("montage_match_color", "Match colour to a shot",
+        "Shot matching: grade clips so they look like the picture at reference_at (the cut as it plays there, with its "
+        "grade). Each clip's own frame at reference_at, or its middle frame, is matched per channel (shadows, mid-tones, "
+        "highlights) into a Color Correct put first in its effects, replacing an earlier match. Check the result with "
+        "montage_render_frame.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "reference_at":{"type":["number","string"],"description":"Timeline time of the look to match"},
+            "clips":{"type":"array","items":{"type":"number"},"description":"Clip ids to grade"}},
+            "required":["project","reference_at","clips"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const FrameTime at = timeArg(a.value("reference_at"), s, "reference_at");
+            std::vector<Id> clips;
+            for (const QJsonValue& v : a.value("clips").toArray()) clips.push_back(clipArg(l, QJsonObject{{"clip", v}}).id);
+            if (clips.empty()) throw ArgError{"\"clips\" is required"};
+            const Image ref = colourReferenceFrame(l.project, s, at);
+            const int n = matchClipColour(l.project, s, clips, ref, at);
+            if (n == 0) return fail("None of the clips has a picture to match");
+            save(l);
+            return ok(QStringLiteral("Matched %1 clip(s) to the picture at %2").arg(n).arg(tc(at, s)), QJsonObject{{"matched", n}});
+        });
+
     add("montage_render_frame", "Look at a frame",
         "Render the program at a timeline time and return it as an image (to check an edit), optionally saving a PNG.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"at":{"type":["number","string"]},

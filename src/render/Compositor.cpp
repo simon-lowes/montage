@@ -570,6 +570,37 @@ void drawCaption(Image& img, const CaptionTrack& track, FrameTime t, const Color
     }
 }
 
+Image colourReferenceFrame(const Project& p, const Sequence& s, FrameTime t) {
+    RenderOptions o;
+    o.scale = std::min(1.0, 480.0 / std::max(1, s.width));
+    o.displaySpace = "rec709";  // as renderMediaFrame gives the clips' own frames
+    return renderProgramFrame(p, s, std::clamp<FrameTime>(t, 0, std::max<FrameTime>(0, s.duration() - 1)), o);
+}
+
+int matchClipColour(Project& p, Sequence& s, const std::vector<Id>& clips, const Image& reference, FrameTime at) {
+    if (reference.empty()) return 0;
+    int n = 0;
+    for (Id id : clips) {
+        Clip* c = edit::clipById(s, id);
+        const MediaItem* m = c && c->mediaId ? p.findMedia(c->mediaId) : nullptr;
+        if (!m || (m->kind != MediaKind::Video && m->kind != MediaKind::Image)) continue;
+        const FrameTime t = c->contains(at) ? at : c->start + c->duration / 2;
+        const double sec = m->kind == MediaKind::Video ? std::max(0.0, c->sourceFrameAt(t) / s.fpsValue()) : 0.0;
+        Effect e = colorMatchCorrection(renderMediaFrame(p, *m, sec, 480, 270), reference, p.newId());
+        e.strings["match"] = "1";
+        auto it = std::find_if(c->effects.begin(), c->effects.end(),
+                               [](const Effect& x) { return x.type == "color_correct" && x.strings.count("match"); });
+        if (it != c->effects.end()) {
+            e.id = it->id;
+            *it = e;
+        } else {
+            c->effects.insert(c->effects.begin(), e);
+        }
+        ++n;
+    }
+    return n;
+}
+
 Image renderMediaFrame(const Project& p, const MediaItem& m, double seconds, int w, int h) {
     Image out(std::max(1, w), std::max(1, h));
     out.fill(0, 0, 0, 1);
