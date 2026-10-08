@@ -472,7 +472,15 @@ The second gap analysis (`docs/research/phase3-roadmap.md`, October 2026) ranks 
   - UI: Sequence Settings › Audio channels; a SurroundPanner in each mixer strip (drag, wheel for width, double-click for front, menu for width, LFE, Front and Centre), merged into one undo step per gesture; Export › Audio channels and Stems, also carried by the Render Queue.
   - `montage-cli render --downmix-stereo --stems tracks|buses`; MCP `montage_set_surround` (39 tools), `audio_layout` on `montage_create_project`, and `downmix_stereo` and `stems` on `montage_render`.
   - Left out: Atmos and other object-based formats (they need Dolby's renderer and ADM BWF; the market leaders that have them license it), and discrete multichannel source routing (a 6-channel source plays its fold-down on a track).
-- [ ] 12. Temporal video noise reduction (M)
+- [x] 12. Temporal video noise reduction (M):
+  - render/VideoDenoise: a motion-compensated temporal filter, then a spatial one. Each neighbour (0-3 frames each side) is warped onto the frame along the dense optical flow and weighted per pixel by its 3x3 patch distance from the frame, less the 2σ² that noise alone gives: exp(-max(d - 2σ², 0) / (2σ²·strength²)). Mismatches (occlusions, failed flow, frame edges) drop out instead of ghosting. The noise left at each pixel, σ·√Σw² / Σw, sets the spatial pass: bilateral filters on Rec.709 luma (5x5) and chroma (7x7, guided by luma so colour does not bleed).
+  - σ is measured from each frame with Donoho's estimator (the median finest diagonal Haar detail / 0.6745, per channel), or set by hand.
+  - The flows between consecutive frames are measured once (at 480 px wide, as for retiming) and chained, forwards and backwards with a fixed-point inverse. Playing on needs one new flow per frame instead of one per neighbour. A flow takes about 100 ms for 1080p on four cores, so at two frames each side this saves about 300 ms a frame (a whole frame measured 0.9 s with four flows).
+  - "Video Noise Reduction" clip effect (frames, motion compensation, temporal strength, spatial luma and chroma, noise level, blend). It runs on the decoded source frames before the input colour transform and the clip's other effects, under the effect's mask. On nested sequences and stills it is spatial only. It is available to MCP through `montage_add_effect`.
+  - Tests:
+    - synthetic footage moving (2, 1) px a frame with σ 0.04: measured within 20 %; temporal −8.6 dB, spatial −8.3 dB, both −12.2 dB; without motion compensation there is less gain but no ghosting; edges keep 98 % of their step; chained motion within 0.35 px; reuse is checked;
+    - ProRes film-grain footage through the compositor: neighbours used (including at the first frame), the colour unchanged, and the mask respected.
+  - Left out: a learned denoiser (no permissively licensed video model is small enough yet) and GPU kernels (the compositor is still on the CPU; see Phase 2 #15).
 - [ ] 13. Shape layers and Lottie motion graphics (M)
 - [ ] 14. AI upscaling (M)
 - [ ] 15. AAF export to Pro Tools and Fairlight (L)

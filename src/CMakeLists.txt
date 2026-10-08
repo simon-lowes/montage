@@ -38,6 +38,7 @@ add_library(montage_engine STATIC
   media/Translator.h media/Translator.cpp
   render/Processing.h render/Processing.cpp
   render/Retime.h render/Retime.cpp
+  render/VideoDenoise.h render/VideoDenoise.cpp
   render/ClipAnalysis.h render/ClipAnalysis.cpp
   render/MusicEdit.h render/MusicEdit.cpp
   render/AutoMix.h render/AutoMix.cpp

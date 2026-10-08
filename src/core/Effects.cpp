@@ -199,6 +199,13 @@ std::vector<EffectInfo> buildCatalog() {
     c.push_back({"sharpen", "Sharpen", EffectCategory::VideoFilter, "Blur & Sharpen",
                  {num("amount", "Amount", 0, 5, 1), num("radius", "Radius (px)", 0.5, 20, 1.5, 0.1)},
                  {}});
+    // Runs on the source frames before the clip's other effects (it needs the frames either side).
+    c.push_back({"video_denoise", "Video Noise Reduction", EffectCategory::VideoFilter, "Blur & Sharpen",
+                 {num("frames", "Temporal Frames Each Side", 0, 3, 2, 1), boolean("motion", "Motion Compensation", true),
+                  num("temporal", "Temporal Strength", 0, 3, 1, 0.05), num("luma", "Spatial Luma", 0, 1, 0.25, 0.01),
+                  num("chroma", "Spatial Chroma", 0, 1, 0.6, 0.01), num("noise", "Noise Level % (0 = auto)", 0, 20, 0, 0.1),
+                  num("blend", "Blend Original", 0, 1, 0, 0.01)},
+                 {}});
     c.push_back({"levels", "Levels", EffectCategory::VideoFilter, "Color",
                  {num("in_black", "Input Black", 0, 1, 0, 0.005), num("in_white", "Input White", 0, 1, 1, 0.005),
                   num("gamma", "Gamma", 0.1, 10, 1, 0.01), num("out_black", "Output Black", 0, 1, 0, 0.005),

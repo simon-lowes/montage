@@ -37,6 +37,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - **Compare with Reference** (Clip menu): the colour reference beside the current frame in the Program monitor, split by a divider you drag
 - Chroma key with spill suppression, and luma key
 - Levels, Posterize, Glow, Film Grain (new each frame, strongest in the mid-tones), Directional Blur, Chromatic Aberration, Lens Distortion (barrel or pincushion), Letterbox (2.39, 2, 1.85, 4:3, 1:1, 9:16)
+- **Video Noise Reduction** (like Resolve's temporal and spatial NR): up to three frames either side are warped onto the frame along the optical flow and averaged where they match it, so moving pictures are cleaned without ghosting; then an edge-preserving pass on luma and chroma takes out what is left, more where the temporal pass could not help. The noise level is measured from each frame, or set by hand. It runs on the source frames before the clip's other effects, and works under a mask (for example only the sky or a face). On a test clip, temporal and spatial together cut the noise by 12 dB, and edges keep 98 % of their contrast. It is heavy: use Render In to Out for real-time playback.
 - Corner Pin: four keyframeable corners map the picture onto any quadrilateral, for screen replacements. The corners show in the Program monitor to drag onto the surface.
 - Masks on every video effect:
   - An ellipse or rectangle with feather, expansion, rotation, opacity and invert, all keyframeable. Drag it in the Program monitor to move it, or pull its handles to resize it.

@@ -37,6 +37,7 @@
 #include "media/Beats.h"
 #include "render/AudioFx.h"
 #include "render/AutoMix.h"
+#include "render/VideoDenoise.h"
 #include "render/VoiceMatch.h"
 #include "media/Segmenter.h"
 #include "media/Translator.h"
@@ -687,6 +688,83 @@ private slots:
         QCOMPARE(stemList.size(), 2);
         QVERIFY(probeMedia(stemList[1].toObject().value("path").toString().toStdString(), out));
         QCOMPARE(out.channels, 2);  // the stems follow the fold-down
+    }
+
+    void videoNoiseReductionOnFootage() {
+        // Grainy footage: a flat colour with fresh film grain on every frame, kept by ProRes 422 HQ.
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 320;
+        gs.height = 180;
+        gs.fps = {25, 1};
+        Clip c = makeGeneratorClip(gen, "color", 20);
+        c.generator.params["color.r"] = Param(0.45);
+        c.generator.params["color.g"] = Param(0.5);
+        c.generator.params["color.b"] = Param(0.4);
+        Effect grain = makeEffect(gen, "film_grain");
+        grain.params["amount"] = Param(0.35);
+        grain.params["size"] = Param(0.5);
+        grain.params["color"] = Param(1.0);
+        c.effects.push_back(grain);
+        edit::overwrite(gen, gs, {TrackKind::Video, 0}, c);
+        ExportSettings st = findExportPreset("Apple ProRes 422 HQ")->settings;
+        st.path = path("grain.mov");
+        st.audioCodec = "none";
+        std::string err;
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320;
+        s.height = 180;
+        s.fps = {25, 1};
+        MediaItem m = probeOrFail(p, st.path);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Clip& clip = s.videoTracks[0].clips.at(0);
+        auto mean = [](const Image& img, int x0, int x1) {
+            double acc = 0;
+            for (int y = 0; y < img.height; ++y)
+                for (int x = x0; x < x1; ++x) acc += img.at(x, y)[1];
+            return acc / (double(img.height) * (x1 - x0));
+        };
+        auto noiseIn = [](const Image& img, int x0, int x1) {
+            Image part(x1 - x0, img.height);
+            for (int y = 0; y < img.height; ++y) std::copy_n(img.at(x0, y), size_t(x1 - x0) * 4, part.at(0, y));
+            return estimateNoise(part);
+        };
+        const Image raw = renderSequenceFrame(p, s, 10, {});
+        const double before = estimateNoise(raw);
+        QVERIFY2(before > 0.02, qPrintable(QString::number(before)));
+        // Temporal only (two frames either side): the grain falls towards 1/sqrt(5) of itself; the colour stays.
+        Effect nr = makeEffect(p, "video_denoise");
+        nr.params["luma"] = Param(0.0);
+        nr.params["chroma"] = Param(0.0);
+        clip.effects.push_back(nr);
+        const Image temporal = renderSequenceFrame(p, s, 10, {});
+        const double afterTemporal = estimateNoise(temporal);
+        QVERIFY2(afterTemporal < 0.6 * before, qPrintable(QString("%1 -> %2").arg(before).arg(afterTemporal)));
+        QVERIFY(std::fabs(mean(temporal, 0, 320) - mean(raw, 0, 320)) < 0.01);
+        // At the first frame there are only frames after it, and it still works.
+        QVERIFY(estimateNoise(renderSequenceFrame(p, s, 0, {})) < 0.75 * before);
+        // No frames either side and no spatial pass: nothing changes.
+        clip.effects.back().params["frames"] = Param(0.0);
+        QVERIFY(std::fabs(estimateNoise(renderSequenceFrame(p, s, 10, {})) - before) < 0.02 * before);
+        // The defaults (temporal and spatial) go further.
+        clip.effects.back() = makeEffect(p, "video_denoise");
+        const double afterBoth = estimateNoise(renderSequenceFrame(p, s, 10, {}));
+        QVERIFY2(afterBoth < afterTemporal, qPrintable(QString("%1 %2").arg(afterBoth).arg(afterTemporal)));
+        // Under a mask (the left half), only the left half is cleaned.
+        Effect& masked = clip.effects.back();
+        masked.params["mask.shape"] = Param(2.0);
+        masked.params["mask.x"] = Param(0.25);
+        masked.params["mask.w"] = Param(0.5);
+        masked.params["mask.h"] = Param(2.0);
+        masked.params["mask.feather"] = Param(0.0);
+        const Image half = renderSequenceFrame(p, s, 10, {});
+        QVERIFY2(noiseIn(half, 8, 150) < 0.6 * noiseIn(half, 170, 312),
+                 qPrintable(QString("%1 %2").arg(noiseIn(half, 8, 150)).arg(noiseIn(half, 170, 312))));
+        QVERIFY(std::fabs(noiseIn(half, 170, 312) - noiseIn(raw, 170, 312)) < 0.05 * noiseIn(raw, 170, 312));
     }
 
     void loudnessNormalisedExport() {

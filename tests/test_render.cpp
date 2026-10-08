@@ -17,7 +17,9 @@
 #include "render/Ocio.h"
 #include "render/Processing.h"
 #include "render/RenderCache.h"
+#include "render/VideoDenoise.h"
 #include "render/VideoFx.h"
+#include <random>
 
 using namespace montage;
 
@@ -1342,6 +1344,115 @@ colorspaces:
         QVERIFY2(std::fabs(px[0] - 0.6f) < 0.03f && px[1] < 0.05f, qPrintable(QString::number(px[0])));
         QVERIFY(w.at(100, 100)[0] < 0.01f);
         QVERIFY(!BurnIn{}.any() && tc.any() && wm.any());
+    }
+
+    void videoNoiseReduction() {
+        // A picture with flat areas, soft gradients, hard edges and fine texture, moving 2 px right and 1 px down a
+        // frame, with fresh noise (sigma 0.04 in each channel) on every frame.
+        const int W = 192, H = 108;
+        const double sigma = 0.04;
+        auto clean = [&](int t) {
+            Image img(W, H);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const double u = x - 2.0 * t, v = y - 1.0 * t;
+                    double r = 0.3 + 0.3 * u / W, g = 0.45, b = 0.35 + 0.25 * v / H;
+                    if (std::fmod(std::floor(u / 24) + std::floor(v / 24) + 200, 2.0) < 1) g += 0.25;  // edges
+                    if (u > 120 && u < 170) r += 0.08 * std::sin(u * 0.9) * std::sin(v * 0.7);         // texture
+                    float* p = img.at(x, y);
+                    p[0] = float(r), p[1] = float(g), p[2] = float(b), p[3] = 1;
+                }
+            return img;
+        };
+        std::mt19937 rng(7);
+        std::normal_distribution<float> gauss(0.0f, float(sigma));
+        std::vector<Image> truth, noisy;
+        for (int t = 0; t < 5; ++t) {
+            truth.push_back(clean(t));
+            Image n = truth.back();
+            for (size_t i = 0; i < n.px.size(); ++i)
+                if (i % 4 != 3) n.px[i] += gauss(rng);
+            noisy.push_back(n);
+        }
+        // RMS error against the clean frame, away from the borders (where the picture slides in).
+        auto rmse = [&](const Image& a, const Image& b) {
+            double acc = 0;
+            int count = 0;
+            for (int y = 8; y < H - 8; ++y)
+                for (int x = 8; x < W - 8; ++x)
+                    for (int c = 0; c < 3; ++c, ++count) acc += std::pow(double(a.at(x, y)[c]) - b.at(x, y)[c], 2);
+            return std::sqrt(acc / count);
+        };
+        const double before = rmse(noisy[2], truth[2]);
+        QVERIFY(std::fabs(before - sigma) < 0.003);
+        // The noise is measured from the frame.
+        const double measured = estimateNoise(noisy[2]);
+        QVERIFY2(std::fabs(measured - sigma) < 0.2 * sigma, qPrintable(QString::number(measured)));
+        QVERIFY(estimateNoise(truth[2]) < 0.005);
+
+        const std::vector<const Image*> around = {&noisy[0], &noisy[1], &noisy[3], &noisy[4]};
+        // Temporal only, following the motion: close to the sqrt(5) of averaging five frames.
+        DenoiseSettings temporal;
+        temporal.spatialLuma = temporal.spatialChroma = 0;
+        double used = 0;
+        const double motion = rmse(denoiseFrame(noisy[2], around, temporal, {}, &used), truth[2]);
+        QVERIFY2(motion < 0.45 * before, qPrintable(QString::number(motion / before)));
+        QVERIFY(std::fabs(used - measured) < 1e-9);
+        // Without motion compensation the moving picture mostly does not match, so less is averaged (but nothing ghosts).
+        DenoiseSettings still = temporal;
+        still.motion = false;
+        const double stillErr = rmse(denoiseFrame(noisy[2], around, still), truth[2]);
+        QVERIFY2(stillErr > 1.4 * motion && stillErr < 0.8 * before, qPrintable(QString("%1 %2").arg(stillErr).arg(motion)));
+        // Spatial only: less noise, edges kept (the step between checker squares stays within 10 % of its height).
+        DenoiseSettings spatial;
+        spatial.temporal = 0;
+        spatial.spatialLuma = 0.6;
+        spatial.spatialChroma = 0.8;
+        const Image sp = denoiseFrame(noisy[2], {}, spatial);
+        const double spatialErr = rmse(sp, truth[2]);
+        QVERIFY2(spatialErr < 0.5 * before, qPrintable(QString::number(spatialErr / before)));
+        auto step = [&](const Image& img) {
+            // Green across the vertical edge at u = 24 (x = 28 on frame 2), averaged down rows 10-30.
+            double left = 0, right = 0;
+            for (int y = 10; y < 30; ++y) {
+                left += img.at(26, y)[1];
+                right += img.at(29, y)[1];
+            }
+            return std::fabs(right - left) / 20;
+        };
+        QVERIFY2(std::fabs(step(sp) - step(truth[2])) < 0.1 * step(truth[2]),
+                 qPrintable(QString("%1 %2").arg(step(sp)).arg(step(truth[2]))));
+        // Both together beat either alone.
+        DenoiseSettings both;
+        both.spatialLuma = 0.6;
+        both.spatialChroma = 0.8;
+        const double bothErr = rmse(denoiseFrame(noisy[2], around, both), truth[2]);
+        QVERIFY2(bothErr < 0.3 * before && bothErr < motion && bothErr < spatialErr, qPrintable(QString("%1 %2 %3").arg(bothErr).arg(motion).arg(spatialErr)));
+        // Motion chained from the flows between consecutive frames: (2, 1) px a frame, and each flow measured once.
+        auto frame = [&](int64_t i) -> const Image* { return i >= 0 && i < 5 ? &noisy[size_t(i)] : nullptr; };
+        const std::vector<int> offsets = {-2, -1, 1, 2};
+        const std::vector<MotionFn> chain = chainedMotion("nr-test", 2, offsets, frame);
+        QCOMPARE(chain.size(), size_t(4));
+        for (size_t i = 0; i < 4; ++i) {
+            QVERIFY(bool(chain[i]));
+            const Point2 d = chain[i](60, 50);
+            QVERIFY2(std::fabs(d.x - 2 * offsets[i]) < 0.35 && std::fabs(d.y - offsets[i]) < 0.35,
+                     qPrintable(QString("%1: %2 %3").arg(offsets[i]).arg(d.x).arg(d.y)));
+        }
+        const double chained = rmse(denoiseFrame(noisy[2], around, temporal, chain), truth[2]);
+        QVERIFY2(chained < 1.1 * motion, qPrintable(QString("%1 %2").arg(chained).arg(motion)));
+        // The next frame reuses them all (no frames given, so nothing could be measured).
+        const std::vector<MotionFn> next = chainedMotion("nr-test", 3, {-2, -1, 1}, [](int64_t) { return nullptr; });
+        QVERIFY(next[0] && next[1] && next[2]);
+        QVERIFY(!chainedMotion("nr-test", 3, {2}, [](int64_t) { return nullptr; })[0]);  // 4 -> 5 was never measured
+        // Blend Original at 1 gives the frame back; a clean frame comes back unchanged.
+        DenoiseSettings back = both;
+        back.blend = 1;
+        QVERIFY(rmse(denoiseFrame(noisy[2], around, back), noisy[2]) < 1e-6);
+        QVERIFY(rmse(denoiseFrame(truth[2], {&truth[1], &truth[3]}, both), truth[2]) < 0.004);
+
+        // As a clip effect on a still image: the spatial pass, under a mask when it has one.
+        QVERIFY(findEffectInfo("video_denoise") && findEffectInfo("video_denoise")->category == EffectCategory::VideoFilter);
     }
 
     void titlesRender() {

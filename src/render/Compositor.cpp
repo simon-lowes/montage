@@ -13,9 +13,11 @@
 #include "Exporter.h"
 #include "Processing.h"
 #include "Retime.h"
+#include "VideoDenoise.h"
 #include "audio/PluginEffect.h"
 #include "audio/SpeechCleanup.h"
 #include "core/EditOps.h"
+#include "core/Effects.h"
 #include "core/Surround.h"
 #include "core/History.h"
 #include "media/MediaPool.h"
@@ -233,6 +235,48 @@ struct Geometry {
     double opacity = 1;
 };
 
+// Sequence pixels to this image's pixels, for pixel-sized effect parameters.
+double effectPixelScale(const Clip& c, FrameTime lt, double sx, double mw, int srcWidth) {
+    const double fitX = std::fabs(sx) / std::max(1e-9, std::fabs(c.motion.p("scale", lt, 100) / 100.0 *
+                                                                 c.motion.p("scale_x", lt, 100) / 100.0));
+    return srcWidth / std::max(1.0, mw * fitX);
+}
+
+const Effect* denoiseEffect(const Clip& c) {
+    for (const Effect& e : c.effects)
+        if (e.type == "video_denoise" && e.enabled) return &e;
+    return nullptr;
+}
+
+// Video Noise Reduction on the source frame, under the effect's mask if it has one.
+void applyDenoise(const Effect& e, FrameTime lt, Image& src, const std::vector<Image>& around, const std::vector<MotionFn>& motion,
+                  double pixelScale, double sourceSeconds) {
+    DenoiseSettings ds;
+    ds.motion = e.p("motion", lt, 1) > 0.5;
+    ds.temporal = std::max(0.0, e.p("temporal", lt, 1));
+    ds.spatialLuma = e.p("luma", lt, 0.25);
+    ds.spatialChroma = e.p("chroma", lt, 0.6);
+    ds.noise = std::max(0.0, e.p("noise", lt, 0)) / 100;
+    ds.blend = e.p("blend", lt, 0);
+    std::vector<const Image*> nb;
+    for (const Image& im : around) nb.push_back(&im);
+    if (!hasMask(e, lt)) {
+        src = denoiseFrame(src, nb, ds, motion);
+        return;
+    }
+    const std::vector<float> matte = effectMatte(e, lt, src, pixelScale, sourceSeconds);
+    if (e.p("mask.show", lt) > 0.5) {
+        for (size_t i = 0; i < matte.size(); ++i) {
+            float* q = &src.px[i * 4];
+            q[0] = q[1] = q[2] = matte[i] * q[3];
+        }
+        return;
+    }
+    const Image clean = denoiseFrame(src, nb, ds, motion);
+    for (size_t i = 0; i < matte.size() && i * 4 < src.px.size(); ++i)
+        for (int k = 0; k < 4; ++k) src.px[i * 4 + size_t(k)] += (clean.px[i * 4 + size_t(k)] - src.px[i * 4 + size_t(k)]) * matte[i];
+}
+
 Geometry geometryFor(const Effect& motion, FrameTime lt, double mw, double mh, int SW, int SH) {
     Geometry g;
     g.mw = std::max(1.0, mw);
@@ -396,6 +440,8 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             if (nested->multicam) no.soloVideoTrack = std::clamp(c.angle, 0, std::max(0, int(nested->videoTracks.size()) - 1));
             FrameTime nf = FrameTime(std::floor(c.sourceFrameAt(t) * nested->fpsValue() / seq.fpsValue() + 1e-6));
             src = renderSequenceFrame(p, *nested, nf, no);
+            if (const Effect* nr = denoiseEffect(c); nr && !src.empty())
+                applyDenoise(*nr, lt, src, {}, {}, effectPixelScale(c, lt, g.sx, mw, src.width), -1);
             convertColor(src, sequenceColorSpace(*nested), sequenceColorSpace(seq), seq.hdrPeakNits);
         } else if (m->kind == MediaKind::Video || m->kind == MediaKind::Image) {
             if (!m->hasVideo && m->kind != MediaKind::Image) return {};
@@ -415,6 +461,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             if (!f) return {};
             if (m->kind == MediaKind::Video) sourceSeconds = sec;
             src = toImage(*f);
+            Image decoded;  // the source frame itself, when src is an in-between
             // Slow motion between two source frames: blend them or follow the motion.
             const int sampling = c.timing.empty() ? 0 : int(c.timing.p("sampling", lt, 0));
             if (sampling > 0 && m->kind == MediaKind::Video && m->fps.valid()) {
@@ -424,12 +471,44 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                     Frame16Ptr fa = MediaPool::instance().videoFrame(path, (base + 0.25) / mf, w, h, o.highQuality);
                     Frame16Ptr fb = MediaPool::instance().videoFrame(path, next, w, h, o.highQuality);
                     if (fa && fb) {
+                        if (denoiseEffect(c)) decoded = src;
                         const Image a = toImage(*fa), b = toImage(*fb);
                         src = sampling == 1 ? blendFrames(a, b, frac)
                                             : interpolateFrames(a, b, frac, path + '#' + std::to_string(int64_t(base)) + '@' +
                                                                                 std::to_string(w) + 'x' + std::to_string(h));
                     }
                 }
+            }
+            // Noise reduction, on the source frames with the frames either side (Resolve's temporal NR).
+            if (const Effect* nr = denoiseEffect(c)) {
+                std::vector<Image> around;
+                std::vector<int> offsets;
+                std::vector<MotionFn> motion;
+                const int r = std::clamp(int(std::lround(nr->p("frames", lt, 2))), 0, 3);
+                if (m->kind == MediaKind::Video && m->fps.valid() && r > 0 && nr->p("temporal", lt, 1) > 0) {
+                    const double mf = m->fps.toDouble();
+                    const int64_t base = int64_t(std::floor(sec * mf + 1e-6));
+                    for (int k = -r; k <= r; ++k) {
+                        const double at = (double(base + k) + 0.25) / mf;
+                        if (k == 0 || at < 0 || at >= m->duration) continue;
+                        if (Frame16Ptr nf = MediaPool::instance().videoFrame(path, at, w, h, o.highQuality)) {
+                            around.push_back(toImage(*nf));
+                            offsets.push_back(k);
+                        }
+                    }
+                    if (nr->p("motion", lt, 1) > 0.5) {
+                        const Image* self = decoded.empty() ? &src : &decoded;
+                        motion = chainedMotion(path + '@' + std::to_string(w) + 'x' + std::to_string(h), base, offsets,
+                                               [&](int64_t i) -> const Image* {
+                                                   if (i == base) return self;
+                                                   for (size_t j = 0; j < offsets.size(); ++j)
+                                                       if (base + offsets[j] == i) return &around[j];
+                                                   return nullptr;
+                                               });
+                    }
+                }
+                applyDenoise(*nr, lt, src, around, motion, effectPixelScale(c, lt, g.sx, mw, src.width),
+                             m->kind == MediaKind::Video ? sec : -1);
             }
             // Input transform: the media's space into the sequence's working space.
             convertColor(src, mediaColorSpace(*m), sequenceColorSpace(seq), seq.hdrPeakNits);
@@ -439,10 +518,9 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
     }
     if (src.empty()) return {};
     // Filters run in source space (before the fixed transform), like most NLEs.
-    double fitX = std::fabs(g.sx) / std::max(1e-9, std::fabs(c.motion.p("scale", lt, 100) / 100.0 *
-                                                                c.motion.p("scale_x", lt, 100) / 100.0));
-    double pixelScale = src.width / std::max(1.0, mw * fitX);
-    for (const auto& e : c.effects) applyVideoEffect(e, lt, src, pixelScale, sourceSeconds);
+    const double pixelScale = effectPixelScale(c, lt, g.sx, mw, src.width);
+    for (const auto& e : c.effects)
+        if (e.type != "video_denoise") applyVideoEffect(e, lt, src, pixelScale, sourceSeconds);  // that ran on the source
     if (identityLayer(src, g, SW, SH, o.scale)) return src;  // a full-frame clip: no copy
     return transformLayer(src, g, SW, SH, o.scale);
 }
