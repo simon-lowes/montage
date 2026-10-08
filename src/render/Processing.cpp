@@ -7,6 +7,7 @@
 #include "media/DepthMap.h"
 #include "media/Matting.h"
 #include "FaceRefine.h"
+#include "Relight.h"
 #include "media/Tracking.h"
 
 #include <algorithm>
@@ -999,6 +1000,21 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
     else if (ty == "posterize") vfx::posterize(e, t, img);
     else if (ty == "depth_map" || ty == "depth_fog" || ty == "depth_blur")
         depthEffect(e, t, img, pixelScale);
+    else if (ty == "relight") {
+        if (const DepthMap* depth = currentDepth()) {
+            RelightSettings rs;
+            rs.azimuth = e.p("direction", t, 135);
+            rs.elevation = e.p("elevation", t, 35);
+            rs.color[0] = float(e.p("color.r", t, 1.0)), rs.color[1] = float(e.p("color.g", t, 0.95)), rs.color[2] = float(e.p("color.b", t, 0.85));
+            rs.intensity = e.p("intensity", t, 100) / 100;
+            rs.shadows = e.p("shadows", t, 50) / 100;
+            rs.relief = e.p("relief", t, 3);
+            rs.smoothness = e.p("smoothness", t, 8) * pixelScale;
+            rs.reach = e.p("reach", t, 100) / 100;
+            rs.showNormals = e.p("normals", t) > 0.5;
+            relight(img, *depth, rs);
+        }
+    }
     else if (ty == "face_refine") {
         if (const std::vector<FaceBox>* faces = currentFaces()) {
             FaceRefineSettings fs;

@@ -174,7 +174,7 @@ bool ensureEffectModel(QWidget* parent, const std::string& type) {
         return ensureModelPack(parent, upscaleModel(), QObject::tr("Super Scale"),
                                QObject::tr("Super Scale uses Real-ESRGAN (BSD-3-Clause), an image model that runs on this computer."));
     }
-    if (type == "depth_blur" || type == "depth_fog" || type == "depth_map" || type == "mask.depth") {
+    if (type == "depth_blur" || type == "depth_fog" || type == "depth_map" || type == "relight" || type == "mask.depth") {
         if (!depthAvailable()) {
             QMessageBox::information(parent, QObject::tr("Depth"),
                                      QObject::tr("This build of Montage cannot see depth: it was built without ONNX Runtime."));

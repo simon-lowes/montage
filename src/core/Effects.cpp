@@ -233,6 +233,13 @@ std::vector<EffectInfo> buildCatalog() {
                  {color("color", "Color", 0.78, 0.82, 0.88), pct("amount", "Amount", 0, 100, 70), pct("start", "Starts At Depth", 0, 100, 60),
                   num("curve", "Thickening", 0.2, 5, 1.5, 0.05)},
                  {}});
+    c.push_back({"relight", "Relight", EffectCategory::VideoFilter, "Depth",
+                 {angle("direction", "Light Direction", 135), num("elevation", "Light Height", 0, 90, 35, 0.5),
+                  color("color", "Light Color", 1.0, 0.95, 0.85), pct("intensity", "Intensity", 0, 300, 100),
+                  pct("shadows", "Shadows", 0, 100, 50), num("relief", "Relief", 0, 20, 3, 0.1),
+                  num("smoothness", "Surface Smoothing (px)", 0, 50, 8, 0.5), pct("reach", "Reach", 0, 100, 100),
+                  boolean("normals", "Show Surface Directions")},
+                 {}});
     c.push_back({"depth_map", "Depth Map", EffectCategory::VideoFilter, "Depth",
                  {boolean("invert", "Far Is White"), pct("mix", "Mix", 0, 100, 100)},
                  {}});
@@ -520,7 +527,7 @@ bool needsPersonMatte(const Effect& e, FrameTime t) {
 
 bool needsDepth(const Effect& e, FrameTime t) {
     if (!e.enabled) return false;
-    return e.type == "depth_blur" || e.type == "depth_fog" || e.type == "depth_map" || e.p("mask.depth", t) > 0.5;
+    return e.type == "depth_blur" || e.type == "depth_fog" || e.type == "depth_map" || e.type == "relight" || e.p("mask.depth", t) > 0.5;
 }
 
 const std::vector<EffectInfo>& effectCatalog() {

@@ -2089,6 +2089,19 @@ private slots:
         QVERIFY2(detail(shown, 0.25, 0.72) > 0.9 * detail(plain, 0.25, 0.72),
                  qPrintable(QString("%1 vs %2").arg(detail(shown, 0.25, 0.72)).arg(detail(plain, 0.25, 0.72))));
 
+        // Relight from the left, then the right: the helmet's lit side follows the light.
+        clip.effects.clear();
+        Effect light = makeEffect(p, "relight");
+        light.params["intensity"] = Param(120.0);
+        light.params["direction"] = Param(180.0);
+        clip.effects.push_back(light);
+        const Image fromLeft = renderSequenceFrame(p, s, 0, {});
+        clip.effects.back().params["direction"] = Param(0.0);
+        const Image fromRight = renderSequenceFrame(p, s, 0, {});
+        auto side = [&](const Image& im, double u) { return lum(im, u, 0.73) / std::max(1e-3f, lum(plain, u, 0.73)); };
+        QVERIFY2(side(fromLeft, 0.13) > side(fromRight, 0.13) && side(fromRight, 0.4) > side(fromLeft, 0.4),
+                 qPrintable(QString("%1 %2 %3 %4").arg(side(fromLeft, 0.13)).arg(side(fromRight, 0.13)).arg(side(fromLeft, 0.4)).arg(side(fromRight, 0.4))));
+
         // Through MCP: a depth qualifier on an effect.
         clip.effects.clear();
         const QString project = QString::fromStdString(path("depth.montage"));

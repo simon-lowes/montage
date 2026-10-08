@@ -16,6 +16,8 @@
 #include "render/Exporter.h"
 #include "render/Ocio.h"
 #include "render/Processing.h"
+#include "render/Relight.h"
+#include "media/DepthMap.h"
 #include "render/RenderCache.h"
 #include "render/Shapes.h"
 #include "render/VideoDenoise.h"
@@ -56,6 +58,54 @@ Clip colorClip(Project& p, float r, float g, float b, FrameTime start, FrameTime
 class TestRender : public QObject {
     Q_OBJECT
 private slots:
+    void relightFromDepth() {
+        // A dome rising out of a flat backdrop, on a mid-grey picture.
+        const int W = 200, H = 160;
+        DepthMap dome;
+        dome.width = W, dome.height = H;
+        dome.values.assign(size_t(W) * H, 0.0f);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const double r = std::hypot(x - 100.0, y - 80.0) / 60.0;
+                dome.values[size_t(y) * W + x] = r < 1 ? float(std::sqrt(1 - r * r)) : 0.0f;
+            }
+        // Normals point outwards on the dome and straight at the viewer on the backdrop.
+        const std::vector<float> n = depthNormals(dome, W, H, 3, 1);
+        auto normal = [&](int x, int y) { return &n[(size_t(y) * W + x) * 3]; };
+        QVERIFY(normal(60, 80)[0] < -0.3f);  // left side faces left
+        QVERIFY(normal(140, 80)[0] > 0.3f);  // right side faces right
+        QVERIFY(normal(100, 40)[1] < -0.3f);  // top faces up
+        QVERIFY(std::abs(normal(5, 5)[0]) < 1e-3f && normal(5, 5)[2] > 0.999f);
+        auto lit = [&](double azimuth) {
+            Image img(W, H);
+            img.fill(0.5f, 0.5f, 0.5f, 1.0f);
+            RelightSettings s;
+            s.azimuth = azimuth;
+            s.color[0] = s.color[1] = s.color[2] = 1;
+            s.smoothness = 1;
+            relight(img, dome, s);
+            return img;
+        };
+        // From the left (180 degrees), the dome's left side is brighter than its right; from the right, the reverse.
+        const Image left = lit(180), right = lit(0);
+        QVERIFY(left.at(60, 80)[0] > left.at(140, 80)[0] + 0.1f);
+        QVERIFY(right.at(140, 80)[0] > right.at(60, 80)[0] + 0.1f);
+        // The flat backdrop gets the same light either way.
+        QVERIFY(std::abs(left.at(5, 5)[0] - right.at(5, 5)[0]) < 1e-5f);
+        // Surfaces facing the camera keep their light; a short reach lights only the nearer parts.
+        QCOMPARE(left.at(5, 5)[0], 0.5f);
+        QVERIFY(std::abs(left.at(100, 80)[0] - 0.5f) < 0.02f);
+        Image img(W, H);
+        img.fill(0.5f, 0.5f, 0.5f, 1.0f);
+        RelightSettings s;
+        s.azimuth = 90;  // from above
+        s.reach = 0.3;
+        s.color[0] = s.color[1] = s.color[2] = 1;
+        relight(img, dome, s);
+        QVERIFY(img.at(100, 55)[0] > 0.55f);    // the upper slope, near
+        QCOMPARE(img.at(100, 138)[0], 0.5f);  // the bottom edge, as far as the backdrop: unlit
+    }
+
     void colorTransfers() {
         // Published reference values.
         QVERIFY(near(float(fromLinear(Transfer::Pq, 100 / 203.0)), 0.5081f, 0.0005f));  // 100 nits

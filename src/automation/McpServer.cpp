@@ -747,7 +747,8 @@ void McpServer::Impl::addTools() {
         "Add an effect to a clip (see montage_list_effects), with parameter values. Video effects can be limited to a "
         "mask: mask.shape 1 ellipse or 2 rectangle, mask.x / mask.y centre and mask.w / mask.h size as fractions of the frame; "
         "or to a range of distances: mask.depth 1, with mask.depth_low and mask.depth_high from 0 (farthest) to 100 (nearest). "
-        "depth_blur (lens blur keeping one distance sharp), depth_fog and depth_map work from the picture's depth. "
+        "depth_blur (lens blur keeping one distance sharp), depth_fog, depth_map and relight (a virtual light) work from "
+        "the picture's depth. "
         "remove_background cuts people out (keep 1 keeps the background instead), and mask.shape 4 limits any effect to "
         "the people in the picture.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},"effect":{"type":"string"},

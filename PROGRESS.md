@@ -619,3 +619,11 @@ All 15 items are in (October 2026). The near misses listed in the roadmap are th
     - the eyes over 8 % brighter;
     - backdrop and suit pixels identical;
     - the mask view, MCP, and the browser's Refine group.
+- [x] Relight (render/Relight), from the depth map:
+  - **Normals:** from the depth at the picture's size, smoothed (8 px by default) so texture does not read as shape. Slopes are scaled by Relief per half the short side, so the look does not depend on resolution.
+  - **Shading:** against a surface facing the camera, which keeps its light. Turned towards the light, a surface is brightened by `intensity * colour * (n·L - n_flat·L)`; turned away, darkened by `shadows * (n_flat·L - n·L)`.
+  - **Reach:** limits it to the nearer part of the depth range.
+  - **Also:** Show Surface Directions, and a Depth effect in the browser, MCP and the model prompt.
+  - **Tests:**
+    - a synthetic dome: normals pointing outwards and flat on the backdrop; light from the left brightening its left side and from the right its right; camera-facing surfaces unchanged; a short reach leaving the far edge unlit;
+    - on the Armstrong portrait: the helmet's lit side following the light.
