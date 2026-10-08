@@ -115,6 +115,7 @@ const std::vector<Preset>& presetTable() {
              {"Clip/Replace with Source Clip", "F11"},
              {"Clip/Fit to Fill", "Shift+F11"},
              {"Clip/Add Frame Hold", "Shift+R"},
+             {"Clip/Reverse Match Frame", ""},
              {"Sequence/Snapping", "N"},
              {"Sequence/Select Clips After Playhead", "Alt+Y"},
              {"Sequence/Select Clips After Playhead on Target Track", "Y"},

@@ -82,6 +82,14 @@ std::vector<std::string> sequenceRoles(const Sequence& s);
 int setClipRole(Sequence& s, const std::vector<Id>& clips, const std::string& role);
 bool roleMuted(const Sequence& s, const std::string& role);
 void setRoleMuted(Sequence& s, const std::string& role, bool muted);
+// Reverse Match Frame (Premiere's): where the timeline shows a source frame (in sequence frames of the media) of a
+// media item: per enabled clip playing it, on any track, the timeline frame nearest it; by time, then track.
+struct FrameUse {
+    Id clip = 0;
+    TrackRef track;
+    FrameTime at = 0;
+};
+std::vector<FrameUse> sourceFrameUses(const Sequence& s, Id mediaId, double srcFrame);
 // Smart Insert's point: the clip start or end on the track nearest the frame (the frame itself on an empty track).
 FrameTime nearestEdit(const Sequence& s, TrackRef t, FrameTime frame);
 Result razor(Project& p, Sequence& s, TrackRef t, FrameTime frame);

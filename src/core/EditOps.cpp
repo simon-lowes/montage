@@ -419,6 +419,35 @@ void setRoleMuted(Sequence& s, const std::string& role, bool muted) {
         std::erase(s.mutedRoles, role);
 }
 
+std::vector<FrameUse> sourceFrameUses(const Sequence& s, Id mediaId, double srcFrame) {
+    std::vector<FrameUse> out;
+    for (TrackRef r : allTracks(s)) {
+        const Track* t = trackAt(s, r);
+        for (const Clip& c : t->clips) {
+            if (!c.enabled || c.mediaId != mediaId || c.isGenerator()) continue;
+            if (!c.ramped()) {
+                // A straight clip plays a straight stretch of the source: skip it when the frame is outside.
+                double a = c.sourceFrameAt(c.start), b = c.sourceFrameAt(c.end() - 1);
+                if (a > b) std::swap(a, b);
+                if (srcFrame < a - 1 || srcFrame > b + 1 + c.speed) continue;
+            }
+            FrameTime best = -1;
+            double bestDist = 1e300, step = 1;
+            for (FrameTime f = c.start; f < c.end(); ++f) {
+                const double here = c.sourceFrameAt(f), d = std::fabs(here - srcFrame);
+                if (d < bestDist) {
+                    bestDist = d;
+                    best = f;
+                    step = std::max(1.0, std::fabs(c.sourceFrameAt(f + 1) - here));
+                }
+            }
+            if (best >= 0 && bestDist < step) out.push_back({c.id, r, best});
+        }
+    }
+    std::stable_sort(out.begin(), out.end(), [](const FrameUse& a, const FrameUse& b) { return a.at < b.at; });
+    return out;
+}
+
 FrameTime nearestEdit(const Sequence& s, TrackRef t, FrameTime frame) {
     FrameTime best = frame, dist = std::numeric_limits<FrameTime>::max();
     if (const Track* tr = trackAt(s, t))

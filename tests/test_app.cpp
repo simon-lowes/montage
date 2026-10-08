@@ -3910,6 +3910,43 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(panel->pasteAtPlayhead(), 2);
     }
 
+    void reverseMatchFrameFromSource() {
+        // The same still twice in the sequence (at 0 and 100): Shift+R finds the Source monitor's frame in each in turn.
+        state()->newProject();
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/faces/jfk-color.jpg")});
+        QCOMPARE(ids.size(), size_t(1));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids[0], 0, 0, 60, V1, {TrackKind::Audio, 0}, false).ok &&
+                   edit::placeMedia(p, s, ids[0], 100, 10, 70, V1, {TrackKind::Audio, 0}, false).ok;
+        }));
+        auto* act = win_->findChild<QAction*>("reverseMatchFrame");
+        QVERIFY(act);
+        state()->setSourceMedia(0);
+        QVERIFY(!win_->reverseMatchFrame());  // nothing in the Source monitor
+        state()->setSourceMedia(ids[0]);
+        auto* source = win_->findChild<PlaybackController*>(QStringLiteral("sourcePlayback"));
+        QVERIFY(source);
+        source->seek(30);
+        QTRY_COMPARE(source->position(), FrameTime(30));
+        state()->setPlayhead(0);
+        act->trigger();
+        QCOMPARE(state()->playhead(), FrameTime(30));
+        const Id first = state()->sequence()->videoTracks[0].clips[0].id, second = state()->sequence()->videoTracks[0].clips[1].id;
+        QCOMPARE(state()->selectedClips(), std::vector<Id>{first});
+        act->trigger();  // again: the second use (source 30 is the second clip's frame 20)
+        QCOMPARE(state()->playhead(), FrameTime(120));
+        QCOMPARE(state()->selectedClips(), std::vector<Id>{second});
+        act->trigger();  // and round to the first
+        QCOMPARE(state()->playhead(), FrameTime(30));
+        source->seek(5);  // only in the first clip
+        QTRY_COMPARE(source->position(), FrameTime(5));
+        act->trigger();
+        act->trigger();
+        QCOMPARE(state()->playhead(), FrameTime(5));
+        state()->setSourceMedia(0);
+        state()->newProject();
+    }
+
     void keyframePanelEditsKeys() {
         loadDemo();
         const Id red = clipNamed(*state()->sequence(), "Red")->id;

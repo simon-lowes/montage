@@ -885,6 +885,8 @@ void MainWindow::buildMenus() {
     add(clipM, tr("Smart Insert"), QKeySequence(), [this] { state_->sourceEdit(EditorState::SourceEdit::SmartInsert); })
         ->setObjectName(QStringLiteral("smartInsert"));
     add(clipM, tr("&Match Frame"), QKeySequence(Qt::Key_F), [this] { matchFrame(); });
+    add(clipM, tr("Reverse Match Frame"), QKeySequence("Shift+R"), [this] { reverseMatchFrame(); })
+        ->setObjectName(QStringLiteral("reverseMatchFrame"));
     {
         QAction* sub = add(clipM, tr("Make S&ubclip"), QKeySequence("Ctrl+U"), [this] { makeSubclip(); });
         sub->setToolTip(tr("Save the Source monitor's In to Out as a subclip in the media bin"));
@@ -1673,6 +1675,34 @@ void MainWindow::matchFrame() {
         return;
     }
     state_->message(tr("No video clip under the playhead"));
+}
+
+bool MainWindow::reverseMatchFrame() {
+    // The Source monitor's frame, found in the sequence: the first use after the playhead (round to the first), so
+    // pressing it again steps through every use.
+    const Sequence* s = state_->sequence();
+    const Id media = state_->sourceMedia();
+    if (!s || !media) {
+        state_->message(tr("Open a clip in the Source monitor first"));
+        return false;
+    }
+    const auto uses = edit::sourceFrameUses(*s, media, double(source_->position()));
+    if (uses.empty()) {
+        state_->message(tr("This frame is not used in %1").arg(QString::fromStdString(s->name)));
+        return false;
+    }
+    const FrameTime now = state_->playhead();
+    auto it = std::find_if(uses.begin(), uses.end(), [now](const edit::FrameUse& u) { return u.at > now; });
+    if (it == uses.end()) it = uses.begin();
+    state_->setPlayhead(it->at);
+    state_->setSelection({it->clip});
+    active_ = Monitor::Program;
+    programDock_->raise();
+    state_->message(uses.size() > 1 ? tr("Use %1 of %2 of this frame; Reverse Match Frame again for the next")
+                                          .arg(int(it - uses.begin()) + 1)
+                                          .arg(uses.size())
+                                    : tr("Found the frame at %1").arg(QString::fromStdString(formatTimecode(it->at, s->fps))));
+    return true;
 }
 
 void MainWindow::addMarker() {

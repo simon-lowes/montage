@@ -2759,6 +2759,35 @@ private slots:
         QCOMPARE(pasteKeys(ca, CopiedKeys{}, 0), 0);
     }
 
+    void reverseMatchFrameUses() {
+        // Source frames 30-89 at 0; 50-69 at 100 (twice as fast: 40 frames of source in 20); a disabled clip at 200.
+        Fixture fx;
+        const Id a = fx.put(V1, 0, 60, 30), b = fx.put(V1, 100, 20, 50);
+        clipById(fx.s(), b)->speed = 2.0;
+        const Id off = fx.put(V1, 200, 60, 30);
+        clipById(fx.s(), off)->enabled = false;
+        const Id sound = fx.put(A1, 300, 60, 30);
+        auto uses = sourceFrameUses(fx.s(), fx.media, 60);
+        QCOMPARE(uses.size(), size_t(3));
+        QCOMPARE(uses[0].clip, a);
+        QCOMPARE(uses[0].at, FrameTime(30));
+        QCOMPARE(uses[1].clip, b);
+        QCOMPARE(uses[1].at, FrameTime(105));  // 50 + 2 * 5
+        QCOMPARE(uses[2].clip, sound);
+        QCOMPARE(uses[2].track.kind, TrackKind::Audio);
+        QCOMPARE(uses[2].at, FrameTime(330));
+        // Frame 61 falls between two of b's frames (60, 62): the nearest one.
+        uses = sourceFrameUses(fx.s(), fx.media, 61);
+        QCOMPARE(uses[1].at, FrameTime(105));
+        // Outside every clip's stretch; and another media item.
+        QVERIFY(sourceFrameUses(fx.s(), fx.media, 5).empty());
+        QVERIFY(sourceFrameUses(fx.s(), 999, 60).empty());
+        // Reversed: the stretch runs backwards.
+        clipById(fx.s(), a)->reverse = true;
+        uses = sourceFrameUses(fx.s(), fx.media, 88);
+        QVERIFY(!uses.empty() && uses[0].clip == a && uses[0].at == 1);
+    }
+
     void keyframeRepeat() {
         // 0 at frame 10, 10 at frame 20.
         Param p;
