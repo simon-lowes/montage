@@ -7,6 +7,7 @@
 #include <QString>
 #include <QStringList>
 #include <functional>
+#include <map>
 #include <optional>
 #include <vector>
 
@@ -129,6 +130,10 @@ public:
     void message(const QString& text, int timeoutMs = 4000) { emit statusMessage(text, timeoutMs); }
     // Decodes the media's audio (and its waveform peaks) in the background; mediaReady follows.
     void startAudioDecode(const MediaItem& m);
+    // Whether the media's file is missing (media/Relink.h), each file checked at most every two seconds, since
+    // painting asks often. Nested sequences and generators are never offline.
+    bool isMediaOffline(Id media) const;
+    void recheckOffline() { offlineChecked_.clear(); }  // after files moved or were relinked
 
 signals:
     void projectChanged();            // anything in the project changed
@@ -143,6 +148,7 @@ signals:
 
 private:
     void pruneSelection();
+    mutable std::map<std::string, std::pair<bool, qint64>> offlineChecked_;  // path -> offline, when checked (ms)
 
     Project project_;
     History history_;

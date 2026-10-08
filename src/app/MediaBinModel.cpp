@@ -173,6 +173,7 @@ void MediaBinModel::refreshThumbnails() {
 }
 
 QPixmap MediaBinModel::thumbnail(const MediaItem& m) const {
+    if (state_->isMediaOffline(m.id)) return tile(tr("OFFLINE"), QColor(0x9a, 0x1c, 0x1c));
     if (m.kind == MediaKind::Audio) return tile(tr("AUDIO"), theme::kAudioClip);
     if (m.kind == MediaKind::Sequence) return tile(tr("SEQUENCE"), theme::kCompoundClip);
     if (const auto it = thumbs_.find(m.id); it != thumbs_.end()) return it->second;
@@ -196,9 +197,10 @@ QPixmap MediaBinModel::thumbnail(const MediaItem& m) const {
 
 // The thumbnail with the label as a bar along the bottom and the rating in the corner.
 QPixmap MediaBinModel::decorated(const MediaItem& m) const {
+    const bool offline = state_->isMediaOffline(m.id);
     const qint64 thumb = thumbs_.count(m.id) ? thumbs_.at(m.id).cacheKey() : 0;
-    if (const auto it = decorated_.find(m.id);
-        it != decorated_.end() && it->second.rating == m.rating && it->second.label == m.label && it->second.thumb == thumb)
+    if (const auto it = decorated_.find(m.id); it != decorated_.end() && it->second.rating == m.rating &&
+                                               it->second.label == m.label && it->second.thumb == thumb && it->second.offline == offline)
         return it->second.pixmap;
     QPixmap pm = thumbnail(m);
     if (m.rating != 0 || m.label > 0) {
@@ -222,13 +224,15 @@ QPixmap MediaBinModel::decorated(const MediaItem& m) const {
             p.drawText(r, Qt::AlignCenter, stars);
         }
     }
-    decorated_[m.id] = {m.rating, m.label, thumb, pm};
+    decorated_[m.id] = {m.rating, m.label, thumb, offline, pm};
     return pm;
 }
 
 QString MediaBinModel::toolTip(const MediaItem& m) const {
     const QString name = QString::fromStdString(m.name);
     QString tip = QString("<b>%1</b><br>%2").arg(name.toHtmlEscaped(), kindLabel(m));
+    if (state_->isMediaOffline(m.id))
+        tip += QString("<br><span style='color:#ff6060'>%1</span> %2").arg(tr("Media offline:"), QString::fromStdString(m.path).toHtmlEscaped());
     if (m.hasVideo && m.width > 0)
         tip += QString("<br>%1×%2 @ %3 fps, %4")
                    .arg(m.width)

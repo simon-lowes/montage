@@ -43,6 +43,7 @@
 #include "media/HwAccel.h"
 #include "media/Loudness.h"
 #include "media/MediaPool.h"
+#include "media/Relink.h"
 #include "media/SpeakerSwitch.h"
 #include "media/Tracking.h"
 #include "media/Vector.h"
@@ -2914,6 +2915,97 @@ private slots:
         QVERIFY2(std::fabs(out[200] - 0.2f) < 0.01f, qPrintable(QString::number(out[200])));
     }
 
+    void relinkOfflineMedia() {
+        // A: a red second at 64 x 36; B: two seconds at 64 x 36; C: a second at 32 x 18; and a sound.
+        QDir().mkpath(QString::fromStdString(path("relink/orig")));
+        auto video = [&](const char* name, int w, int h, int frames) {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = w, gs.height = h, gs.fps = Rational{25, 1};
+            Clip c = makeGeneratorClip(gen, "color", frames);
+            c.generator.params["color.r"] = Param(0.0);
+            c.generator.params["color.g"] = Param(0.7);
+            c.generator.params["color.b"] = Param(0.2);
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, c);
+            ExportSettings st;
+            st.audioCodec = "none";
+            st.preset = "ultrafast";
+            st.path = path(name);
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        };
+        video("relink/orig/a.mp4", 64, 36, 25);
+        video("relink/orig/b.mp4", 64, 36, 50);
+        video("relink/c.mp4", 32, 18, 25);
+        writeWav(path("relink/orig/voice.wav"), 48000, 1.0, 0.2f, 0.2f);
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64, s.height = 36, s.fps = Rational{25, 1};
+        MediaItem a = probeOrFail(p, path("relink/orig/a.mp4")), b = probeOrFail(p, path("relink/orig/b.mp4"));
+        MediaItem voice = probeOrFail(p, path("relink/orig/voice.wav"));
+        a.rating = 4;
+        p.media.push_back(a), p.media.push_back(b), p.media.push_back(voice);
+        const auto sub = makeSubclip(p, a.id, 0.2, 0.6);
+        QVERIFY(sub);
+        MediaItem subItem = *sub;
+        subItem.id = p.newId();
+        p.media.push_back(subItem);
+        QVERIFY(edit::placeMedia(p, s, a.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(offlineMedia(p).empty());
+
+        // The card moves: everything is offline (the subclip with its media), and the clip shows Media Offline.
+        QVERIFY(QDir().mkpath(QString::fromStdString(path("relink/moved"))));
+        QVERIFY(QDir().rename(QString::fromStdString(path("relink/orig")), QString::fromStdString(path("relink/moved/card"))));
+        QCOMPARE(offlineMedia(p), (std::vector<Id>{a.id, b.id, voice.id}));
+        QVERIFY(isOffline(*p.findMedia(subItem.id)));
+        const Image slate = renderSequenceFrame(p, s, 5, {});
+        QCOMPARE(slate.width, 64);
+        auto px = [&](const Image& im, int x, int y, int ch) { return im.px[(size_t(y) * size_t(im.width) + size_t(x)) * 4 + size_t(ch)]; };
+        QVERIFY2(px(slate, 2, 2, 0) > 0.3f && px(slate, 2, 2, 1) < 0.12f, qPrintable(QString::number(px(slate, 2, 2, 0))));
+        bool text = false;
+        for (int y = 0; y < slate.height; ++y)
+            for (int x = 0; x < slate.width; ++x) text |= px(slate, x, y, 1) > 0.3f;
+        QVERIFY(text);  // "Media Offline" in white
+
+        // Only the same footage relinks: not a sound, another size or another length.
+        const std::string card = path("relink/moved/card/");
+        std::string why;
+        QVERIFY(!relinkMedia(p, a.id, card + "voice.wav", RelinkCheck::Strict, &why));
+        QVERIFY(!relinkMedia(p, a.id, path("relink/c.mp4"), RelinkCheck::Strict, &why));
+        QVERIFY2(QString::fromStdString(why).contains("32 x 18"), why.c_str());
+        QVERIFY(!relinkMedia(p, a.id, card + "b.mp4", RelinkCheck::Strict, &why));
+        QVERIFY(!relinkMedia(p, a.id, path("relink/nowhere.mp4"), RelinkCheck::Strict, &why));
+        QVERIFY(isOffline(*p.findMedia(a.id)));
+
+        // Searching the folder above finds all three a level down; the subclip follows; the logging stays.
+        Project found = p;
+        QCOMPARE(relinkFromFolder(found, path("relink/moved")), (std::vector<Id>{a.id, b.id, voice.id}));
+        QVERIFY(offlineMedia(found).empty());
+        QCOMPARE(found.findMedia(a.id)->path, card + "a.mp4");
+        QCOMPARE(found.findMedia(subItem.id)->path, card + "a.mp4");
+        QCOMPARE(found.findMedia(subItem.id)->subclipIn, 0.2);
+        QCOMPARE(found.findMedia(a.id)->rating, 4);
+        const Image back = renderSequenceFrame(found, *found.active(), 5, {});
+        QVERIFY(px(back, 2, 2, 1) > 0.3f && px(back, 2, 2, 0) < 0.1f);
+        // Too deep a search finds nothing; a transcode is found by its name with another extension.
+        Project shallow = p;
+        QVERIFY(relinkFromFolder(shallow, path("relink"), {}, 0).empty());
+        Project transcoded = p;
+        for (MediaItem& m : transcoded.media)
+            if (m.id == b.id) m.path = "D:\\Shoot\\Card 1\\b.mxf";
+        QCOMPARE(relinkFromFolder(transcoded, path("relink"), {b.id}), std::vector<Id>{b.id});
+        QCOMPARE(transcoded.findMedia(b.id)->path, card + "b.mp4");
+
+        // Replace Footage takes different footage, its details and name, keeping the clips.
+        Project replaced = p;
+        QVERIFY(!relinkMedia(replaced, a.id, card + "voice.wav", RelinkCheck::Replace, &why));
+        QVERIFY2(relinkMedia(replaced, a.id, path("relink/c.mp4"), RelinkCheck::Replace, &why), why.c_str());
+        QCOMPARE(replaced.findMedia(a.id)->width, 32);
+        QCOMPARE(replaced.findMedia(a.id)->name, std::string("c.mp4"));
+        QCOMPARE(replaced.findMedia(subItem.id)->path, path("relink/c.mp4"));
+        QCOMPARE(replaced.active()->videoTracks[0].clips.size(), size_t(1));
+    }
+
     void projectManager() {
         // A: four seconds of a changing ramp (ProRes, 96 x 54 at 25 fps); B: a sound nothing uses; C: a still.
         Project gen = makeDefaultProject();
@@ -5483,6 +5575,19 @@ private slots:
         r = tool("montage_consolidate", QJsonObject{{"project", project}, {"folder", QString::fromStdString(path("mcp-copy"))}, {"name", "Copy"}});
         QVERIFY2(!r.value("isError").toBool() && text(r).contains("Wrote"), qPrintable(text(r)));
         QVERIFY(QFileInfo::exists(QString::fromStdString(path("mcp-copy/Copy.montage"))));
+        {
+            // Its media moved away: listed as offline, then found again by searching a folder.
+            const QString copy = QString::fromStdString(path("mcp-copy/Copy.montage"));
+            QVERIFY(QDir().rename(QString::fromStdString(path("mcp-copy/Media")), QString::fromStdString(path("mcp-copy/Moved"))));
+            r = tool("montage_relink", QJsonObject{{"project", copy}});
+            QVERIFY2(!r.value("isError").toBool() && text(r).contains("offline:"), qPrintable(text(r)));
+            r = tool("montage_relink", QJsonObject{{"project", copy}, {"folder", QString::fromStdString(path("mcp-copy"))}});
+            QVERIFY2(!r.value("isError").toBool() && text(r).contains("No media is offline"), qPrintable(text(r)));
+            Project relinked;
+            QVERIFY(loadProject(copy.toStdString(), relinked));
+            QVERIFY(offlineMedia(relinked).empty());
+            QVERIFY(tool("montage_relink", QJsonObject{{"project", copy}, {"folder", "/no/such/folder"}}).value("isError").toBool());
+        }
         // Marker lists in and out.
         r = tool("montage_import_markers", QJsonObject{{"project", project}, {"text", "Timecode,Comment\n00:00:00:05,Check the title\n"}});
         QVERIFY2(!r.value("isError").toBool() && text(r).contains("Added 1"), qPrintable(text(r)));

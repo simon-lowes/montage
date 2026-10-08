@@ -70,6 +70,7 @@ private:
     struct Badge {
         int rating, label;
         qint64 thumb;
+        bool offline;
         QPixmap pixmap;
     };
     mutable std::map<Id, Badge> decorated_;

@@ -98,6 +98,8 @@ public:
     // shows its frames, left to right. On unless turned off (the bin's context menu); remembered.
     void setHoverScrub(bool on);
     bool hoverScrub() const { return hoverScrub_; }
+    // Replace Footage (Premiere's): the item takes another file, its clips keeping their edits; one undo step.
+    bool replaceFootage(Id id, const QString& path, QString* why = nullptr);
 
 public slots:
     void importDialog();
@@ -108,6 +110,7 @@ signals:
     void newTitleRequested();
     void newSequenceRequested();
     void createMulticamRequested(const std::vector<montage::Id>& media);
+    void linkMediaRequested();  // Link Media… for the offline items
     // Find Shots for moments like this video (its middle frame).
     void findSimilarRequested(montage::Id media);
 

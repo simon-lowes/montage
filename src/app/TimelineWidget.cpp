@@ -562,7 +562,8 @@ void TimelineWidget::paintCaptionLanes(QPainter& p) {
 
 void TimelineWidget::paintClip(QPainter& p, const Row& row, const Clip& c, const QRect& r) {
     const Project& proj = state_->project();
-    QColor base = clipColor(proj, c, row.ref.kind);
+    // Offline media in red, as the other editors show it.
+    QColor base = state_->isMediaOffline(c.mediaId) ? QColor(0x9a, 0x1c, 0x1c) : clipColor(proj, c, row.ref.kind);
     bool sel = state_->isSelected(c.id);
     p.setPen(Qt::NoPen);
     p.setBrush(sel ? base.lighter(125) : base);

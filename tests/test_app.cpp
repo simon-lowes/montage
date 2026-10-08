@@ -44,6 +44,7 @@
 #include "QualityCheckDialog.h"
 #include "ProjectManagerDialog.h"
 #include "MediaBinModel.h"
+#include "LinkMediaDialog.h"
 #include "MediaBinWidget.h"
 #include "SmartBinDialog.h"
 #include "ScriptCutDialog.h"
@@ -2060,6 +2061,75 @@ private slots:
         state()->setSourceMedia(0);
         QVERIFY(!source->scrubBar()->hasWaveform());
         QCOMPARE(source->scrubBar()->height(), 18);
+        state()->newProject();
+    }
+
+    void linkMediaOnOpen() {
+        // A project whose card has moved since it was saved.
+        const QString root = dir_.path() + "/link";
+        QVERIFY(QDir().mkpath(root + "/card"));
+        auto video = [&](const QString& file, double g, int frames) {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 160;
+            gs.height = 90;
+            Clip c = makeGeneratorClip(gen, "color", frames);
+            c.generator.params["color.g"] = Param(g);
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, c);
+            ExportSettings st;
+            st.path = file.toStdString();
+            st.audioCodec = "none";
+            st.preset = "ultrafast";
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        };
+        video(root + "/card/take.mp4", 0.8, 30);
+        video(root + "/other.mp4", 0.1, 90);
+        QVERIFY(QFile::copy(QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav"), root + "/card/jfk.wav"));
+        state()->newProject();
+        const auto ids = state()->importFiles({root + "/card/take.mp4", root + "/card/jfk.wav"});
+        QCOMPARE(ids.size(), size_t(2));
+        const Id take = ids[0], jfk = ids[1];
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, take, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        QVERIFY(state()->save(root + "/cut.montage"));
+        state()->newProject();
+        QVERIFY(QDir().rename(root + "/card", root + "/Card 2"));
+
+        // Opening it lists both files as offline, in the bin and on the timeline.
+        QVERIFY(win_->openProject(root + "/cut.montage"));
+        auto* dlg = win_->findChild<LinkMediaDialog*>("linkMedia");
+        QVERIFY(dlg && dlg->isVisible());
+        QCOMPARE(dlg->offline(), (std::vector<Id>{take, jfk}));
+        QCOMPARE(dlg->findChild<QTableWidget*>("linkMediaList")->rowCount(), 2);
+        QVERIFY(state()->isMediaOffline(take) && state()->isMediaOffline(jfk));
+        auto* bin = win_->findChild<MediaBinWidget*>();
+        const QModelIndex row = bin->model()->index(bin->model()->rowOf(take), 0);
+        QVERIFY(row.data(Qt::ToolTipRole).toString().contains("Media offline"));
+
+        // A file that is not the same footage is refused; locating the take finds the sound beside it, in one undo step.
+        QCOMPARE(dlg->locate(take, root + "/other.mp4"), 0);
+        QVERIFY(dlg->findChild<QLabel*>("linkStatus")->text().contains("does not match"));
+        QCOMPARE(dlg->locate(take, root + "/Card 2/take.mp4"), 2);
+        QTRY_VERIFY(!win_->findChild<LinkMediaDialog*>("linkMedia"));  // closed once everything was found
+        QVERIFY(!state()->isMediaOffline(take) && !state()->isMediaOffline(jfk));
+        QCOMPARE(state()->project().findMedia(jfk)->path, (root + "/Card 2/jfk.wav").toStdString());
+        state()->undo();
+        QVERIFY(state()->isMediaOffline(take) && state()->isMediaOffline(jfk));
+        // Or search a folder for all of them.
+        dlg = win_->showLinkMedia();
+        QVERIFY(dlg);
+        QCOMPARE(dlg->searchFolder(root), 2);
+        QTRY_VERIFY(!win_->findChild<LinkMediaDialog*>("linkMedia"));
+        QVERIFY(!win_->showLinkMedia());  // nothing offline
+        // Replace Footage swaps in other footage under the same clips.
+        QString why;
+        QVERIFY2(bin->replaceFootage(take, root + "/other.mp4", &why), qPrintable(why));
+        QCOMPARE(state()->project().findMedia(take)->name, std::string("other.mp4"));
+        QCOMPARE(state()->sequence()->videoTracks[0].clips.size(), size_t(1));
+        QCOMPARE(state()->sequence()->videoTracks[0].clips[0].mediaId, take);
+        QVERIFY(!bin->replaceFootage(take, root + "/Card 2/jfk.wav", &why));
         state()->newProject();
     }
 

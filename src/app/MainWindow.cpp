@@ -64,6 +64,8 @@
 #include "ScriptCutDialog.h"
 #include "QualityCheckDialog.h"
 #include "ProjectManagerDialog.h"
+#include "LinkMediaDialog.h"
+#include "media/Relink.h"
 #include "KeyframePanel.h"
 #include "MediaBinWidget.h"
 #include "RenderQueue.h"
@@ -294,6 +296,7 @@ void MainWindow::buildPanels() {
         shotsDock_->raise();
         shots_->searchSimilar(media, m->duration / 2);
     });
+    connect(bin_, &MediaBinWidget::linkMediaRequested, this, [this] { showLinkMedia(); });
     connect(bin_, &MediaBinWidget::createMulticamRequested, this, [this](const std::vector<Id>& media) {
         if (MulticamPanel::createMulticamDialog(state_, media, this)) {
             multicamDock_->show();
@@ -622,6 +625,7 @@ void MainWindow::buildMenus() {
         ProjectManagerDialog dlg(state_, this);
         if (dlg.exec() == QDialog::Accepted) runProjectManager(dlg.options());
     })->setObjectName(QStringLiteral("projectManager"));
+    add(file, tr("&Link Media…"), QKeySequence(), [this] { showLinkMedia(); })->setObjectName(QStringLiteral("linkMediaAction"));
     add(file, tr("Export &Frame…"), QKeySequence("Ctrl+Shift+E"), [this] { exportFrame(); });
     add(file, tr("&Import Timeline (FCP XML, FCPXML, OTIO, EDL)…"), QKeySequence(), [this] { importTimeline(); });
     add(file, tr("Export Final Cut Pro &7 XML (Premiere, Resolve)…"), QKeySequence(), [this] { exportInterchange(Interchange::Fcp7Xml); });
@@ -1265,7 +1269,24 @@ bool MainWindow::openProject(const QString& path) {
     appSettings().setValue("lastProjectDir", QFileInfo(path).absolutePath());
     timeline_->zoomToFit();
     statusBar()->showMessage(tr("Opened %1").arg(path), 4000);
+    if (!offlineMedia(state_->project()).empty()) showLinkMedia();
     return true;
+}
+
+LinkMediaDialog* MainWindow::showLinkMedia() {
+    if (offlineMedia(state_->project()).empty()) {
+        state_->message(tr("No media is offline"), 3000);
+        return nullptr;
+    }
+    if (!linkMedia_) {
+        linkMedia_ = new LinkMediaDialog(state_, this);
+        linkMedia_->setAttribute(Qt::WA_DeleteOnClose);
+    } else {
+        linkMedia_->refresh();
+    }
+    linkMedia_->show();
+    linkMedia_->raise();
+    return linkMedia_;
 }
 
 bool MainWindow::save() {

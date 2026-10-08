@@ -34,6 +34,7 @@
 #include "core/ScriptCut.h"
 #include "core/Surround.h"
 #include "core/TranscriptEdit.h"
+#include "media/Relink.h"
 #include "media/SpeechEnhance.h"
 #include "media/SuperScale.h"
 #include "media/Translator.h"
@@ -1007,6 +1008,47 @@ void McpServer::Impl::addTools() {
             for (const std::string& n : skipped) left << QString::fromStdString(n);
             return ok(QStringLiteral("Wrote %1 (%2-point cube)%3").arg(path).arg(lut.size)
                           .arg(left.isEmpty() ? QString() : QStringLiteral("; left out: ") + left.join(QStringLiteral(", "))));
+        });
+
+    add("montage_relink", "Find and relink offline media",
+        "Media whose files have moved or gone show as Media Offline. Without arguments, lists them. With folder, looks "
+        "there (and below) for their files by name, or by name with another extension for transcodes, checking each is "
+        "the same footage (kind, picture size, length), and relinks what it finds. With media and path, points one item "
+        "at a file; replace swaps in different footage (Replace Footage), keeping its clips' edits.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "folder":{"type":"string","description":"A folder to search for the offline files"},
+            "media":{"type":"string","description":"The item's last known file path, or its name"},
+            "path":{"type":"string","description":"The file to link it to"},
+            "replace":{"type":"boolean","default":false,"description":"Replace Footage: accept different footage"}},
+            "required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            auto list = [&]() {
+                QStringList lines;
+                for (Id id : offlineMedia(l.project))
+                    if (const MediaItem* m = l.project.findMedia(id))
+                        lines << QStringLiteral("%1 (%2)").arg(QString::fromStdString(m->name), QString::fromStdString(m->path));
+                return lines;
+            };
+            QString done;
+            if (a.contains("folder")) {
+                const QString folder = absolute(need(a, "folder"));
+                if (!QDir(folder).exists()) return fail(QStringLiteral("No folder %1").arg(folder));
+                const auto found = relinkFromFolder(l.project, folder.toStdString());
+                if (!found.empty()) save(l);
+                done = QStringLiteral("Relinked %1 from %2.").arg(found.size()).arg(folder);
+            } else if (a.contains("media") || a.contains("path")) {
+                MediaItem& m = projectMedia(l.project, need(a, "media"));
+                std::string why;
+                if (!relinkMedia(l.project, m.id, absolute(need(a, "path")).toStdString(),
+                                 a.value("replace").toBool() ? RelinkCheck::Replace : RelinkCheck::Strict, &why))
+                    return fail(QStringLiteral("Not relinked: %1").arg(QString::fromStdString(why)));
+                save(l);
+                done = QStringLiteral("Linked %1 to %2.").arg(QString::fromStdString(m.name), QString::fromStdString(m.path));
+            }
+            const QStringList offline = list();
+            if (offline.isEmpty()) return ok((done.isEmpty() ? QString() : done + ' ') + QStringLiteral("No media is offline."));
+            return ok((done.isEmpty() ? QString() : done + ' ') + QStringLiteral("%1 offline:\n").arg(offline.size()) + offline.join('\n'));
         });
 
     add("montage_quality_check", "Quality check",

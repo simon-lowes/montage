@@ -45,6 +45,7 @@
 #include "SmartBinDialog.h"
 #include "Theme.h"
 #include "ThumbnailCache.h"
+#include "media/Relink.h"
 #include "TranscribeDialog.h"
 #include "core/Slate.h"
 #include "core/MediaLog.h"
@@ -692,6 +693,16 @@ void MediaBinWidget::addKeywordsDialog(const std::vector<Id>& ids) {
     addKeywords(ids, parseKeywords(dlg.textValue().toStdString()));
 }
 
+bool MediaBinWidget::replaceFootage(Id id, const QString& path, QString* why) {
+    std::string reason;
+    const bool ok = state_->edit(tr("Replace Footage"), [&](Project& p, Sequence&) {
+        return relinkMedia(p, id, QDir::cleanPath(path).toStdString(), RelinkCheck::Replace, &reason);
+    });
+    state_->recheckOffline();
+    if (!ok && why) *why = QString::fromStdString(reason);
+    return ok;
+}
+
 void MediaBinWidget::setHoverScrub(bool on) {
     hoverScrub_ = on;
     if (!on) model_->clearSkim();
@@ -702,7 +713,7 @@ void MediaBinWidget::skimAt(const QPoint& pos) {
     const QModelIndex vi = icons_->indexAt(pos);
     const Id id = vi.isValid() ? vi.data(MediaBinModel::IdRole).toULongLong() : 0;
     const MediaItem* m = id ? state_->project().findMedia(id) : nullptr;
-    if (!m || m->kind != MediaKind::Video || m->duration <= 0) {
+    if (!m || m->kind != MediaKind::Video || m->duration <= 0 || state_->isMediaOffline(id)) {
         model_->clearSkim();
         return;
     }
@@ -837,6 +848,12 @@ void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos)
         } else {
             menu.addAction(tr("Open in Source Monitor"), this, [this, id] { emit openInSource(id); });
         }
+        if (m && !m->path.empty() && m->kind != MediaKind::Sequence)
+            menu.addAction(tr("Replace Footage..."), this, [this, id] {
+                const QString f = QFileDialog::getOpenFileName(this, tr("Replace Footage"));
+                QString why;
+                if (!f.isEmpty() && !replaceFootage(id, f, &why)) state_->message(tr("Could not replace the footage: %1").arg(why));
+            });
         if (m && !m->path.empty())
             menu.addAction(tr("Reveal in File Manager"), this, [m] {
                 QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(QString::fromStdString(m->path)).absolutePath()));
@@ -849,6 +866,8 @@ void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos)
             model_->setField({id}, "name", name);
         });
     }
+    if (std::any_of(ids.begin(), ids.end(), [this](Id i) { return state_->isMediaOffline(i); }))
+        menu.addAction(tr("Link Media..."), this, [this] { emit linkMediaRequested(); });
     if (!ids.empty()) {
         // Logging.
         menu.addSeparator();

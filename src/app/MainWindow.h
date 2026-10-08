@@ -3,6 +3,7 @@
 #pragma once
 
 #include <QMainWindow>
+#include <QPointer>
 #include <optional>
 #include <QTimer>
 #include <vector>
@@ -41,6 +42,7 @@ class MulticamPanel;
 class AudioMeterWidget;
 class LoudnessReadout;
 class VoiceoverDialog;
+class LinkMediaDialog;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -100,6 +102,9 @@ public:
     int importMarkers(const QString& path);
     // Bakes the colour effects of the clip a command acts on, at the playhead, into a .cube file.
     bool exportClipLut(const QString& path, int size = 33);
+    // File › Link Media: the dialog for the offline media (shown by itself when a project opens with some), or a
+    // message and nullptr when nothing is offline.
+    LinkMediaDialog* showLinkMedia();
     // File › Project Manager: copies the project and its media (render/ProjectManager.h), with progress.
     bool runProjectManager(const ConsolidateOptions& o);
     // Trim mode (Avid's and Premiere's keyboard trimming): the edit point nearest the playhead on the target video
@@ -239,6 +244,7 @@ private:
     AudioMeterWidget* meter_ = nullptr;
     LoudnessReadout* loudness_ = nullptr;
     VoiceoverDialog* voiceover_ = nullptr;
+    QPointer<LinkMediaDialog> linkMedia_;
     QTimer renderBarTimer_;
     int renderBarGeneration_ = 0;
     std::vector<QDockWidget*> docks_;

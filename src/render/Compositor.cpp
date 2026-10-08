@@ -30,6 +30,7 @@
 #include "core/Surround.h"
 #include "core/History.h"
 #include "media/MediaPool.h"
+#include "media/Relink.h"
 #include "media/DepthMap.h"
 #include "media/Matting.h"
 #include "media/Faces.h"
@@ -264,6 +265,37 @@ Image renderGenerator(const Effect& g, FrameTime t, int w, int h, double scale, 
 }
 
 namespace {
+
+// The picture of a clip whose file is gone: "Media Offline" on red, as the other editors show it.
+Frame16Ptr offlineSlate(int w, int h) {
+    static std::mutex m;
+    static Frame16Ptr last;
+    std::lock_guard lock(m);
+    if (last && last->width == w && last->height == h) return last;
+    QImage qi(std::max(1, w), std::max(1, h), QImage::Format_RGBA8888);
+    qi.fill(QColor(0x8c, 0x12, 0x12));
+    {
+        QPainter pa(&qi);
+        pa.setRenderHint(QPainter::TextAntialiasing);
+        QFont f;
+        f.setPixelSize(std::max(6, qi.height() / 12));
+        f.setBold(true);
+        pa.setFont(f);
+        pa.setPen(Qt::white);
+        pa.drawText(qi.rect(), Qt::AlignCenter, QStringLiteral("Media Offline"));
+    }
+    auto fr = std::make_shared<Frame16>();
+    fr->width = qi.width();
+    fr->height = qi.height();
+    fr->px.resize(size_t(fr->width) * size_t(fr->height) * 4);
+    for (int y = 0; y < fr->height; ++y) {
+        const uchar* s = qi.constScanLine(y);
+        uint16_t* d = fr->px.data() + size_t(y) * size_t(fr->width) * 4;
+        for (int x = 0; x < fr->width * 4; ++x) d[x] = uint16_t(s[x] * 257);
+    }
+    last = fr;
+    return last;
+}
 
 struct Geometry {
     double mw = 1, mh = 1;  // media logical size (pixels)
@@ -579,6 +611,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                 sec = std::clamp(sec, 0.0, std::max(0.0, m->duration - fd * 0.5));
             }
             Frame16Ptr f = MediaPool::instance().videoFrame(path, sec, w, h, o.highQuality);
+            if (!f && path == m->path && isOffline(*m)) f = offlineSlate(w, h);
             if (!f) return {};
             if (m->kind == MediaKind::Video) sourceSeconds = sec;
             src = toImage(*f);

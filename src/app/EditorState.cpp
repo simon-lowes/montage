@@ -12,6 +12,7 @@
 #include "core/ProjectIO.h"
 #include "media/Decoder.h"
 #include "media/MediaPool.h"
+#include "media/Relink.h"
 
 namespace montage {
 
@@ -271,6 +272,18 @@ void EditorState::setSnapping(bool on) {
 // ---------------------------------------------------------------------------
 // Media
 
+bool EditorState::isMediaOffline(Id media) const {
+    const MediaItem* m = media ? project_.findMedia(media) : nullptr;
+    if (!m || m->kind == MediaKind::Sequence || m->path.empty()) return false;
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    auto& [offline, when] = offlineChecked_[m->path];
+    if (when == 0 || now - when > 2000) {
+        offline = isOffline(*m);
+        when = now;
+    }
+    return offline;
+}
+
 void EditorState::startAudioDecode(const MediaItem& m) {
     if (!m.hasAudio || m.path.empty() || m.kind == MediaKind::Image) return;
     const Sequence* s = sequence();
@@ -493,6 +506,7 @@ bool EditorState::open(const QString& path, QString* error) {
     sourceMedia_ = 0;
     sourceIn_ = sourceOut_ = -1;
     targetVideo_ = targetAudio_ = 0;
+    offlineChecked_.clear();
     for (const auto& m : project_.media) startAudioDecode(m);
     emit sequenceSwitched();
     emit selectionChanged();
