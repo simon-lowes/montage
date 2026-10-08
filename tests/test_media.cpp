@@ -82,6 +82,7 @@
 #include "render/Processing.h"
 #include "media/CameraRaw.h"
 #include "core/Slate.h"
+#include "render/PaperEdit.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -3259,6 +3260,65 @@ private slots:
         QVERIFY(loadProject(project.toStdString(), back));
         QCOMPARE(QString::fromStdString(back.media[0].metadata["scene"]), QString("12"));
         QCOMPARE(QString::fromStdString(back.media[0].metadata["take"]), QString("3"));
+    }
+
+    void paperEdit() {
+        Project p = makeDefaultProject();
+        p.active()->fps = {25, 1};
+        MediaItem speech = probeOrFail(p, MONTAGE_TEST_DATA_DIR "/jfk.wav");
+        auto t = std::make_shared<Transcript>();
+        TranscriptSegment seg;
+        seg.words = {{0.3, 0.5, "And", 1}, {0.5, 0.7, "so,", 1}, {0.8, 1.0, "my", 1}, {1.0, 1.3, "fellow", 1}, {1.3, 2.0, "Americans,", 1},
+                     {3.0, 3.3, "ask", 1}, {3.3, 3.6, "not", 1}, {3.6, 3.8, "what", 1}, {3.8, 4.0, "your", 1}, {4.0, 4.5, "country", 1},
+                     {6.0, 6.3, "ask", 1}, {6.3, 6.5, "what", 1}, {6.5, 6.7, "you", 1}, {6.7, 6.9, "can", 1}, {6.9, 7.1, "do", 1}};
+        t->segments = {seg};
+        speech.transcript = t;
+        p.media.push_back(speech);
+        // Quotes found in the transcript, ignoring case and punctuation.
+        const auto a = findLine(p, speech.id, "my fellow americans");
+        QVERIFY(a && a->in == 0.8 && a->out == 2.0);
+        QCOMPARE(QString::fromStdString(a->text), QString("my fellow Americans,"));
+        const auto first = findLine(p, speech.id, "ask");
+        const auto second = findLine(p, speech.id, "ask what", 0);
+        QVERIFY(first && second && first->in == 3.0 && second->in == 6.0);
+        QVERIFY(findLine(p, speech.id, "ask", 5)->in == 6.0);
+        QVERIFY(!findLine(p, speech.id, "ask what your country"));
+        // Laid out in the order given, with 0.1 s of air.
+        const size_t sequences = p.sequences.size();
+        const Id id = makePaperEdit(p, {*second, *a}, "Quotes");
+        QVERIFY(id);
+        QCOMPARE(p.sequences.size(), sequences + 1);
+        const Sequence* s = p.findSequence(id);
+        QVERIFY(s && s->name == "Quotes" && p.active()->id != id);
+        const auto& clips = s->audioTracks.at(0).clips;
+        QCOMPARE(clips.size(), size_t(2));
+        QCOMPARE(FrameTime(clips[0].sourceIn), FrameTime(std::round(5.9 * 25)));
+        QCOMPARE(clips[0].duration, FrameTime(std::round(6.6 * 25) - std::round(5.9 * 25)));  // "ask what", with its air
+        QCOMPARE(FrameTime(clips[1].sourceIn), FrameTime(std::round(0.7 * 25)));
+        QCOMPARE(clips[1].start, clips[0].end());
+        QVERIFY(!makePaperEdit(p, {}, "Nothing"));
+
+        // Over MCP: quotes and a range.
+        const QString project = QString::fromStdString(path("paper.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_paper_edit"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call({{"project", project},
+                              {"lines", QJsonArray{QJsonObject{{"media", "jfk.wav"}, {"text", "Ask not what your country"}},
+                                                   QJsonObject{{"media", "jfk.wav"}, {"from", 0.3}, {"to", 0.7}}}},
+                              {"handle", 0.0}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("lines").toArray().size(), 2);
+        QVERIFY(std::abs(r.value("structuredContent").toObject().value("duration_seconds").toDouble() - 1.9) < 0.05);
+        r = call({{"project", project}, {"lines", QJsonArray{QJsonObject{{"media", "jfk.wav"}, {"text", "never said"}}}}});
+        QVERIFY(r.value("isError").toBool());
     }
 
     void mcpSwapsClips() {

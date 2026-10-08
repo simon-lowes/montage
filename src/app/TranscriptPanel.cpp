@@ -13,6 +13,7 @@
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
+#include <QListWidget>
 #include <QMenu>
 #include <QMouseEvent>
 #include <QRegularExpression>
@@ -110,10 +111,24 @@ TranscriptPanel::TranscriptPanel(EditorState* state, QWidget* parent) : QWidget(
     smoothBtn_->setCheckable(true);
     smoothBtn_->setChecked(QSettings().value(QStringLiteral("transcript/smoothCuts"), false).toBool());
     connect(smoothBtn_, &QToolButton::toggled, this, [](bool on) { QSettings().setValue(QStringLiteral("transcript/smoothCuts"), on); });
-    for (QToolButton* b : {deleteBtn_, fillersBtn_, retakesBtn_, pausesBtn_, bleepBtn_, insertBtn_, overwriteBtn_}) bottom->addWidget(b);
+    paperAddBtn_ = button(this, tr("Add to Paper Edit"), tr("Add the selected words to the Paper Edit list below; lines can come from any clip"));
+    paperAddBtn_->setObjectName(QStringLiteral("paperAdd"));
+    paperBuildBtn_ = button(this, tr("Assemble"), tr("Lay the Paper Edit's lines out, in the list's order, as a new sequence"));
+    paperBuildBtn_->setObjectName(QStringLiteral("paperAssemble"));
+    for (QToolButton* b : {deleteBtn_, fillersBtn_, retakesBtn_, pausesBtn_, bleepBtn_, insertBtn_, overwriteBtn_, paperAddBtn_, paperBuildBtn_})
+        bottom->addWidget(b);
     bottom->addStretch();
     bottom->addWidget(smoothBtn_);
     lay->addLayout(bottom);
+    // The Paper Edit: lines in order, dragged to reorder, Delete to remove.
+    paperList_ = new QListWidget(this);
+    paperList_->setObjectName(QStringLiteral("paperEdit"));
+    paperList_->setDragDropMode(QAbstractItemView::InternalMove);
+    paperList_->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    paperList_->setMaximumHeight(120);
+    paperList_->setToolTip(tr("Paper Edit: drag lines to reorder them, Delete removes them"));
+    paperList_->installEventFilter(this);
+    lay->addWidget(paperList_);
     status_ = new QLabel(this);
     status_->setStyleSheet(QStringLiteral("color: palette(mid);"));
     status_->setWordWrap(true);
@@ -149,6 +164,8 @@ TranscriptPanel::TranscriptPanel(EditorState* state, QWidget* parent) : QWidget(
         form->addRow(box);
         if (dlg.exec() == QDialog::Accepted) removePauses(longer->value(), std::min(keep->value(), longer->value()));
     });
+    connect(paperAddBtn_, &QToolButton::clicked, this, [this] { addToPaperEdit(); });
+    connect(paperBuildBtn_, &QToolButton::clicked, this, [this] { assemblePaperEdit(); });
     connect(insertBtn_, &QToolButton::clicked, this, [this] { insertSelection(false); });
     connect(overwriteBtn_, &QToolButton::clicked, this, [this] { insertSelection(true); });
     connect(text_, &QTextEdit::selectionChanged, this, [this] {
@@ -189,7 +206,8 @@ void TranscriptPanel::setMode(Mode m) {
     modeBox_->setCurrentIndex(m == Mode::Sequence ? 0 : 1);
     const bool seq = m == Mode::Sequence;
     for (QToolButton* b : {deleteBtn_, fillersBtn_, retakesBtn_, pausesBtn_, bleepBtn_}) b->setVisible(seq);
-    for (QToolButton* b : {insertBtn_, overwriteBtn_}) b->setVisible(!seq);
+    for (QToolButton* b : {insertBtn_, overwriteBtn_, paperAddBtn_, paperBuildBtn_}) b->setVisible(!seq);
+    paperList_->setVisible(!seq && paperList_->count() > 0);
     signature_.clear();
     current_ = -1;
     rebuild();
@@ -406,6 +424,14 @@ bool TranscriptPanel::renameSpeaker(const QString& from, const QString& to) {
 }
 
 bool TranscriptPanel::eventFilter(QObject* obj, QEvent* e) {
+    if (obj == paperList_ && e->type() == QEvent::KeyPress) {
+        const int key = static_cast<QKeyEvent*>(e)->key();
+        if (key == Qt::Key_Delete || key == Qt::Key_Backspace) {
+            for (QListWidgetItem* item : paperList_->selectedItems()) delete item;
+            if (paperList_->count() == 0) paperList_->setVisible(false);
+            return true;
+        }
+    }
     if (obj == text_->viewport() && e->type() == QEvent::ContextMenu && mode_ == Mode::Source) {
         auto* ce = static_cast<QContextMenuEvent*>(e);
         const int i = wordAtPosition(text_->cursorForPosition(ce->pos()).position());
@@ -547,6 +573,66 @@ void TranscriptPanel::insertSelection(bool overwrite) {
     if (mode_ != Mode::Source || selectedWords().first < 0) return;
     markSelection();
     state_->insertFromSource(overwrite);
+}
+
+int TranscriptPanel::addToPaperEdit() {
+    if (mode_ != Mode::Source) return paperList_->count();
+    const auto [first, last] = selectedWords();
+    const Id media = state_->sourceMedia();
+    const MediaItem* m = state_->project().findMedia(media);
+    if (first < 0 || !m) {
+        state_->message(tr("Select the words to add in the source clip's transcript"));
+        return paperList_->count();
+    }
+    QString text;
+    for (int i = first; i <= last; ++i) text += (i > first ? " " : "") + QString::fromStdString(words_[size_t(i)].text);
+    auto* item = new QListWidgetItem(QStringLiteral("%1 — %2").arg(QString::fromStdString(m->name), text), paperList_);
+    item->setData(Qt::UserRole, QVariant::fromValue<qlonglong>(qlonglong(media)));
+    item->setData(Qt::UserRole + 1, words_[size_t(first)].start);
+    item->setData(Qt::UserRole + 2, words_[size_t(last)].end);
+    item->setData(Qt::UserRole + 3, text);
+    item->setToolTip(text);
+    paperList_->setVisible(true);
+    status_->setText(tr("Paper Edit: %n line(s). Drag to reorder, then Assemble.", "", paperList_->count()));
+    return paperList_->count();
+}
+
+std::vector<PaperLine> TranscriptPanel::paperEdit() const {
+    std::vector<PaperLine> lines;
+    for (int i = 0; i < paperList_->count(); ++i) {
+        const QListWidgetItem* item = paperList_->item(i);
+        PaperLine l;
+        l.media = Id(item->data(Qt::UserRole).toLongLong());
+        l.in = item->data(Qt::UserRole + 1).toDouble();
+        l.out = item->data(Qt::UserRole + 2).toDouble();
+        l.text = item->data(Qt::UserRole + 3).toString().toStdString();
+        lines.push_back(l);
+    }
+    return lines;
+}
+
+void TranscriptPanel::clearPaperEdit() {
+    paperList_->clear();
+    paperList_->setVisible(false);
+}
+
+Id TranscriptPanel::assemblePaperEdit(const QString& name) {
+    const std::vector<PaperLine> lines = paperEdit();
+    if (lines.empty()) {
+        state_->message(tr("Add lines to the Paper Edit first: select words in a source clip's transcript"));
+        return 0;
+    }
+    Id made = 0;
+    const std::string title = (name.isEmpty() ? tr("Paper Edit") : name).toStdString();
+    state_->edit(tr("Assemble Paper Edit"), [&](Project& p, Sequence&) {
+        made = makePaperEdit(p, lines, title);
+        return made != 0;
+    });
+    if (made) {
+        state_->setActiveSequence(made);
+        state_->message(tr("Assembled %n line(s) into a new sequence", "", int(lines.size())));
+    }
+    return made;
 }
 
 void TranscriptPanel::setSourcePosition(FrameTime frame) {

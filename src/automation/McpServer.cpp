@@ -43,6 +43,7 @@
 #include "media/Analysis.h"
 #include "media/AutoDuck.h"
 #include "core/Slate.h"
+#include "render/PaperEdit.h"
 #include "media/Decoder.h"
 #include "media/Faces.h"
 #include "media/DepthMap.h"
@@ -1109,6 +1110,46 @@ void McpServer::Impl::addTools() {
             save(l);
             return ok(QStringLiteral("%1 marker(s) at %2 BPM").arg(n).arg(g.tempo, 0, 'f', 1),
                       QJsonObject{{"markers", n}, {"tempo", g.tempo}});
+        });
+
+    add("montage_paper_edit", "Assemble a paper edit",
+        "Build a new sequence from lines of the media's transcripts, in the order given, as Premiere's Paper Edit does: "
+        "each line is a quote (the words as said, found in that media's transcript; `after` seconds to skip an earlier "
+        "saying) or a from/to range in seconds, laid out back to back with picture and sound and `handle` seconds of air.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "lines":{"type":"array","items":{"type":"object","properties":{"media":{"type":"string"},"text":{"type":"string"},
+                "after":{"type":"number"},"from":{"type":"number"},"to":{"type":"number"}},"required":["media"]}},
+            "name":{"type":"string","default":"Paper Edit"},"handle":{"type":"number","default":0.1}},
+            "required":["project","lines"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            std::vector<PaperLine> lines;
+            for (const QJsonValue& v : a.value("lines").toArray()) {
+                const QJsonObject o = v.toObject();
+                const MediaItem& m = projectMedia(l.project, o.value("media").toString());
+                if (o.contains("text")) {
+                    if (!m.transcript) throw ArgError{QStringLiteral("%1 has no transcript: transcribe it first").arg(QString::fromStdString(m.name))};
+                    const auto line = findLine(l.project, m.id, o.value("text").toString().toStdString(), o.value("after").toDouble(0));
+                    if (!line)
+                        throw ArgError{QStringLiteral("\"%1\" is not said in %2").arg(o.value("text").toString(), QString::fromStdString(m.name))};
+                    lines.push_back(*line);
+                } else if (o.value("from").isDouble() && o.value("to").isDouble()) {
+                    lines.push_back({m.id, o.value("from").toDouble(), o.value("to").toDouble(), {}});
+                } else {
+                    throw ArgError{"Each line needs \"text\", or \"from\" and \"to\""};
+                }
+            }
+            if (lines.empty()) throw ArgError{"\"lines\" is empty"};
+            const Id id = makePaperEdit(l.project, lines, str(a, "name", "Paper Edit").toStdString(), std::max(0.0, a.value("handle").toDouble(0.1)));
+            if (!id) return fail("Nothing could be placed");
+            save(l);
+            const Sequence* s = l.project.findSequence(id);
+            QJsonArray placed;
+            for (const PaperLine& line : lines)
+                placed.append(QJsonObject{{"media", QString::fromStdString(l.project.findMedia(line.media)->name)}, {"from", line.in},
+                                          {"to", line.out}, {"text", QString::fromStdString(line.text)}});
+            return ok(QStringLiteral("Assembled %1 line(s) into \"%2\" (%3)").arg(lines.size()).arg(QString::fromStdString(s->name), tc(s->duration(), *s)),
+                      QJsonObject{{"sequence", double(id)}, {"lines", placed}, {"duration_seconds", s->duration() / s->fpsValue()}});
         });
 
     add("montage_highlights", "Make a highlight edit",

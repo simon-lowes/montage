@@ -10,10 +10,12 @@
 
 #include "core/Model.h"
 #include "core/Transcript.h"
+#include "render/PaperEdit.h"
 
 class QComboBox;
 class QLabel;
 class QLineEdit;
+class QListWidget;
 class QTextEdit;
 class QToolButton;
 
@@ -50,6 +52,12 @@ public slots:
     void setSourcePosition(montage::FrameTime frame);  // highlights the word under the source playhead
     // Source: renames a speaker of the source clip's transcript (one undo step).
     bool renameSpeaker(const QString& from, const QString& to);
+    // Paper Edit (Source): the selected words join the list (from any clip), which can be reordered and
+    // assembled into a new sequence, made active (one undo step). Returns the list's length / the new sequence.
+    int addToPaperEdit();
+    Id assemblePaperEdit(const QString& name = QString());
+    std::vector<PaperLine> paperEdit() const;  // in the list's order
+    void clearPaperEdit();
 
 signals:
     void sourceSeekRequested(montage::FrameTime frame);
@@ -86,6 +94,9 @@ private:
     QToolButton* insertBtn_;
     QToolButton* overwriteBtn_;
     QToolButton* smoothBtn_;
+    QToolButton* paperAddBtn_;
+    QToolButton* paperBuildBtn_;
+    QListWidget* paperList_;
     std::vector<TranscriptWord> words_;
     std::vector<Span> spans_;
     QString signature_;

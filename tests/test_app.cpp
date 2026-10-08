@@ -3386,6 +3386,54 @@ const auto seq = [this] { return state()->sequence(); };
         QApplication::processEvents();
     }
 
+    void paperEditInTranscriptPanel() {
+        state()->newProject();
+        auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        auto t = std::make_shared<Transcript>();
+        TranscriptSegment seg;
+        seg.words = {{1.0, 1.4, "My", 1}, {1.5, 1.9, "fellow", 1}, {2.0, 2.8, "Americans,", 1}, {6.0, 6.4, "ask", 1}, {6.5, 6.9, "not.", 1}};
+        t->segments = {seg};
+        QVERIFY(state()->edit("Transcript", [media, t](Project& p, Sequence&) {
+            p.findMedia(media)->transcript = t;
+            return true;
+        }));
+        auto* panel = win_->findChild<TranscriptPanel*>();
+        QVERIFY(panel);
+        state()->setSourceMedia(media);
+        panel->setMode(TranscriptPanel::Mode::Source);
+        QTRY_COMPARE(panel->words().size(), size_t(5));
+        auto* list = panel->findChild<QListWidget*>("paperEdit");
+        QVERIFY(list && panel->findChild<QToolButton*>("paperAdd") && panel->findChild<QToolButton*>("paperAssemble"));
+        panel->selectWords(0, 2);  // "My fellow Americans,"
+        QCOMPARE(panel->addToPaperEdit(), 1);
+        panel->selectWords(3, 4);  // "ask not."
+        QCOMPARE(panel->addToPaperEdit(), 2);
+        QVERIFY(list->isVisible());
+        // Reordered: "ask not." first.
+        list->insertItem(0, list->takeItem(1));
+        QCOMPARE(QString::fromStdString(panel->paperEdit()[0].text), QString("ask not."));
+        const Id before = state()->sequence()->id;
+        const Id made = panel->assemblePaperEdit("Quotes");
+        QVERIFY(made && made != before);
+        QCOMPARE(state()->sequence()->id, made);
+        const Sequence& s = *state()->sequence();
+        QCOMPARE(s.name, std::string("Quotes"));
+        QCOMPARE(trackAt(s, A1)->clips.size(), size_t(2));
+        const double fps = s.fpsValue();
+        QCOMPARE(FrameTime(trackAt(s, A1)->clips[0].sourceIn), FrameTime(std::round(5.9 * fps)));  // 0.1 s before "ask"
+        QCOMPARE(trackAt(s, A1)->clips[1].start, trackAt(s, A1)->clips[0].end());
+        // One undo step takes the sequence away.
+        state()->undo();
+        QVERIFY(!state()->project().findSequence(made));
+        panel->clearPaperEdit();
+        QCOMPARE(list->count(), 0);
+        panel->setMode(TranscriptPanel::Mode::Sequence);
+        state()->newProject();
+        QApplication::processEvents();
+    }
+
     void speakerLabelsInTranscriptPanel() {
         // Two people: the panel names them at each change, in both modes.
         state()->newProject();
