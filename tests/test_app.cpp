@@ -28,6 +28,7 @@
 #include <cstring>
 
 #include "AutoDuckDialog.h"
+#include "AutoMixDialog.h"
 #include "CaptionsPanel.h"
 #include "ColorWheel.h"
 #include "CurveEditor.h"
@@ -1391,6 +1392,46 @@ private slots:
         const EffectInfo* info = findEffectInfo("enhance_speech");
         QVERIFY(info && !info->hidden);
         QVERIFY(isSourceAudioEffect("enhance_speech"));
+    }
+
+    void autoMixDialog() {
+        state()->newProject();
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        state()->apply("Place", [&](Project& p, Sequence& s) {
+            edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+            return edit::placeMedia(p, s, ids[0], 60, 0, -1, {TrackKind::Video, 1}, {TrackKind::Audio, 1}, false);
+        });
+        QVERIFY(win_->findChild<QAction*>("autoMix"));
+        auto plan = planMix(state()->project(), *state()->sequence(), MixOptions{});
+        QCOMPARE(plan.size(), size_t(2));
+        AutoMixDialog dlg(state(), plan, win_.get());
+        auto* table = dlg.findChild<QTableWidget*>("autoMixClips");
+        QVERIFY(table);
+        QCOMPARE(table->rowCount(), 2);
+        auto* role0 = dlg.findChild<QComboBox*>("autoMixRole0");
+        QVERIFY(role0);
+        QCOMPARE(role0->currentText(), QString("Dialogue"));
+        const double web = dlg.plan()[0].gainDb;
+        QVERIFY(std::fabs(dlg.plan()[0].guess.loudness + web - (-18)) < 0.01);
+        // Broadcast levels: 7 dB lower all round.
+        dlg.findChild<QComboBox*>("autoMixPreset")->setCurrentIndex(2);
+        QVERIFY(std::fabs(dlg.plan()[0].gainDb - (web - 7)) < 0.01);
+        // Calling the second clip music sets it to the music level.
+        dlg.setRole(1, AudioRole::Music);
+        QCOMPARE(int(dlg.plan()[1].role), int(AudioRole::Music));
+        QVERIFY(std::fabs(dlg.plan()[1].guess.loudness + dlg.plan()[1].gainDb - dlg.options().musicLufs) < 0.01);
+        QCOMPARE(dlg.findChild<QComboBox*>("autoMixRole1")->currentText(), QString("Music"));
+        // Applied as one step: the music dips where the dialogue speaks.
+        QCOMPARE(AutoMixDialog::apply(state(), dlg.plan(), dlg.options()), 2);
+        const Sequence& s = *state()->sequence();
+        const Clip& music = s.audioTracks[1].clips[0];
+        QVERIFY(music.audio.params.at("gain_db").animated());
+        QVERIFY(std::fabs(s.audioTracks[0].clips[0].audio.params.at("gain_db").at(0) - dlg.plan()[0].gainDb) < 7);
+        state()->undo();
+        QVERIFY(!state()->sequence()->audioTracks[1].clips[0].audio.params.count("gain_db") ||
+                !state()->sequence()->audioTracks[1].clips[0].audio.params.at("gain_db").animated());
+        state()->newProject();
     }
 
     void beatMarkersAndFittingMusic() {

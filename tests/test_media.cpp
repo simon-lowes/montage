@@ -33,6 +33,7 @@
 #include "media/SpeakerSwitch.h"
 #include "media/Tracking.h"
 #include "media/Beats.h"
+#include "render/AutoMix.h"
 #include "media/Segmenter.h"
 #include "media/SpeechEnhance.h"
 #include "media/Reframe.h"
@@ -2817,6 +2818,125 @@ private slots:
         // caption at 2 s; FFmpeg's decoder shows it as soon as the line is read.
         for (const auto& e : events)
             if (e.text.contains("HELLO")) QVERIFY2(e.start > 1.4 && e.start < 2.05, qPrintable(QString::number(e.start)));
+    }
+
+    void audioRolesAndAutoMix() {
+        // Speech (the JFK clip), music (the test song), and effects (door slams over room tone, pink-ish noise).
+        std::vector<float> speech;
+        std::string err;
+        QVERIFY2(decodeMono(MONTAGE_TEST_DATA_DIR "/jfk.wav", 48000, speech, nullptr, &err), err.c_str());
+        const std::vector<int> chords = {0, 0, 1, 2, 1, 2, 0, 3, 0, 3, 1, 2};
+        const std::vector<float> music = testSong(48000, 0.2, chords);
+        std::vector<float> effects(size_t(48000 * 12), 0.0f);
+        unsigned seed = 11;
+        float lp = 0;
+        for (size_t i = 0; i < effects.size(); ++i) {
+            seed = seed * 1664525u + 1013904223u;
+            lp = 0.98f * lp + 0.02f * (float(seed >> 8) / float(1 << 24) - 0.5f);
+            effects[i] = 0.3f * lp;
+        }
+        for (double t : {1.3, 4.1, 8.7})  // slams
+            for (size_t i = 0; i < size_t(0.4 * 48000); ++i)
+                effects[size_t(t * 48000) + i] += float(0.7 * std::sin(2 * M_PI * 70 * double(i) / 48000) * std::exp(-double(i) / 2400.0));
+        const RoleGuess gs = classifyAudio(speech, 48000), gm = classifyAudio(music, 48000), ge = classifyAudio(effects, 48000);
+        for (const RoleGuess* g : {&gs, &gm, &ge})
+            qInfo("%s: speech %.2f music %.2f (pauses %.2f, syllabic %.2f, beat %.2f)", audioRoleName(g->role), g->speech, g->music,
+                  g->pauses, g->syllabic, g->beat);
+        QCOMPARE(int(gs.role), int(AudioRole::Dialogue));
+        QCOMPARE(int(gm.role), int(AudioRole::Music));
+        QCOMPARE(int(ge.role), int(AudioRole::Effects));
+        QCOMPARE(int(classifyAudio(std::vector<float>(48000 * 3, 0.0f), 48000).role), int(AudioRole::Silence));
+        // A transcript's words settle it.
+        QCOMPARE(int(classifyAudio(effects, 48000, 2.5).role), int(AudioRole::Dialogue));
+
+        // A sequence: JFK loud on A1, then JFK 12 dB quieter whose second half drops another 9 dB,
+        // and music under both on A2.
+        std::vector<float> quiet(speech.size());
+        for (size_t i = 0; i < speech.size(); ++i) quiet[i] = speech[i] * float(std::pow(10.0, (i < speech.size() / 2 ? -12 : -21) / 20.0));
+        const std::string loudWav = path("jfk-loud.wav"), quietWav = path("jfk-quiet.wav"), songWav = path("bed.wav");
+        QVERIFY(writeMonoWav(loudWav, speech, 48000) && writeMonoWav(quietWav, quiet, 48000));
+        std::vector<float> bed = testSong(48000, 0.0, std::vector<int>(14, 0));
+        QVERIFY(writeMonoWav(songWav, bed, 48000));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        auto add = [&](const std::string& file) -> Id {
+            MediaItem m;
+            if (!probeMedia(file, m)) return 0;
+            m.id = p.newId();
+            m.hasVideo = false;
+            p.media.push_back(m);
+            return m.id;
+        };
+        const Id loudId = add(loudWav), quietId = add(quietWav), bedId = add(songWav);
+        QVERIFY(loudId && quietId && bedId);
+        QVERIFY(edit::placeMedia(p, s, loudId, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const FrameTime second = s.audioTracks[0].clips[0].end() + FrameTime(2 * s.fpsValue());
+        QVERIFY(edit::placeMedia(p, s, quietId, second, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(edit::placeMedia(p, s, bedId, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 1}, false).ok);
+        MixOptions o;
+        std::string planErr;
+        const auto plan = planMix(p, s, o, {}, nullptr, &planErr);
+        QCOMPARE(plan.size(), size_t(3));
+        const ClipMix* loud = nullptr; const ClipMix* soft = nullptr; const ClipMix* mus = nullptr;
+        for (const ClipMix& m : plan) {
+            const Clip* c = edit::clipById(s, m.clip);
+            if (c->mediaId == loudId) loud = &m;
+            if (c->mediaId == quietId) soft = &m;
+            if (c->mediaId == bedId) mus = &m;
+        }
+        QVERIFY(loud && soft && mus);
+        QCOMPARE(int(loud->role), int(AudioRole::Dialogue));
+        QCOMPARE(int(soft->role), int(AudioRole::Dialogue));
+        QCOMPARE(int(mus->role), int(AudioRole::Music));
+        // Each clip is brought to its level: the quiet one gets about 12 dB more (a bit more, for its drop).
+        QVERIFY(std::fabs(loud->guess.loudness + loud->gainDb - o.dialogueLufs) < 0.01);
+        QVERIFY2(soft->gainDb - loud->gainDb > 12 && soft->gainDb - loud->gainDb < 18,
+                 qPrintable(QString::number(soft->gainDb - loud->gainDb)));
+        QVERIFY(std::fabs(mus->guess.loudness + mus->gainDb - o.musicLufs) < 0.01);
+        // The ride lifts the quiet half of the second clip, within the range.
+        QVERIFY(!soft->ride.empty());
+        double early = 0, late = 0;
+        const FrameTime half = edit::clipById(s, soft->clip)->duration / 2;
+        for (const auto& [f, db] : soft->ride) {
+            QVERIFY(std::fabs(db) <= o.rideRangeDb + 1e-9);
+            if (f < half - 60) early = db;
+            if (f > half + 90) late = std::max(late, db);
+        }
+        QVERIFY2(late - early > 4, qPrintable(QString("%1 -> %2").arg(early).arg(late)));
+        // Applied: levels and ride on the clips, and the music dips under the speech.
+        QCOMPARE(applyMix(p, s, plan, o), 3);
+        const Clip* bedClip = edit::clipById(s, mus->clip);
+        const Param& g = bedClip->audio.params.at("gain_db");
+        QVERIFY(g.animated());
+        const double underSpeech = g.at(FrameTime(2.0 * s.fpsValue())), base = mus->gainDb;
+        QVERIFY2(std::fabs(underSpeech - (base + o.duckDb)) < 0.5, qPrintable(QString("%1 vs %2").arg(underSpeech).arg(base)));
+        QVERIFY(edit::clipById(s, soft->clip)->audio.params.at("gain_db").animated());
+
+        // Through MCP: a dry run lists the roles; calling the music "effects" puts it at the effects level.
+        const QString project = QString::fromStdString(path("mix.montage"));
+        Project fresh = p;
+        for (Track& t : fresh.active()->audioTracks)
+            for (Clip& c : t.clips) c.audio.params.erase("gain_db");
+        QVERIFY(saveProject(fresh, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_auto_mix"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call({{"project", project}, {"dry_run", true}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("clips").toArray().size(), 3);
+        r = call({{"project", project}, {"roles", QJsonObject{{QString::number(mus->clip), "effects"}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Clip* bedBack = edit::clipById(*back.active(), mus->clip);
+        QVERIFY(std::fabs(bedBack->audio.params.at("gain_db").at(0) - (o.effectsLufs - mus->guess.loudness)) < 0.01);
+        QVERIFY(!bedBack->audio.params.at("gain_db").animated());  // effects are not ducked
     }
 
     void beatsAndFittingMusic() {

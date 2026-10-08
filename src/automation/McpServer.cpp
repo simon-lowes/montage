@@ -26,6 +26,7 @@
 #include "core/ScriptCut.h"
 #include "core/TranscriptEdit.h"
 #include "media/SpeechEnhance.h"
+#include "render/AutoMix.h"
 #include "render/MusicEdit.h"
 #include "media/AutoDuck.h"
 #include "media/Decoder.h"
@@ -913,6 +914,52 @@ void McpServer::Impl::addTools() {
             return ok(QStringLiteral("The music now lasts %1 s in %2 piece(s)").arg(fit.duration, 0, 'f', 2).arg(fit.segments.size()),
                       QJsonObject{{"seconds", fit.duration}, {"pieces", pieces}, {"clips", int(r.created.size())},
                                   {"join_similarity", fit.similarity}});
+        });
+
+    add("montage_auto_mix", "Mix the audio",
+        "A first mix in one step: every audio clip is recognised as dialogue, music or effects (from transcripts, the "
+        "rhythm of speech and a steady beat), set to a loudness for its kind, dialogue is evened out with volume keyframes, "
+        "and music dips under speech. Pass roles to correct what a clip is. dry_run returns the plan only.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "dialogue_lufs":{"type":"number","default":-18},"music_lufs":{"type":"number","default":-22},
+            "effects_lufs":{"type":"number","default":-24},"ride":{"type":"boolean","default":true},
+            "duck_db":{"type":"number","default":-12,"description":"0 = no ducking"},
+            "roles":{"type":"object","description":"clip id -> dialogue, music, effects or silence",
+                     "additionalProperties":{"type":"string","enum":["dialogue","music","effects","silence"]}},
+            "dry_run":{"type":"boolean","default":false}},"required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            MixOptions o;
+            o.dialogueLufs = std::clamp(a.value("dialogue_lufs").toDouble(-18), -40.0, -6.0);
+            o.musicLufs = std::clamp(a.value("music_lufs").toDouble(-22), -40.0, -6.0);
+            o.effectsLufs = std::clamp(a.value("effects_lufs").toDouble(-24), -40.0, -6.0);
+            o.ride = a.value("ride").toBool(true);
+            o.duckDb = std::clamp(a.value("duck_db").toDouble(-12), -30.0, 0.0);
+            o.duck = o.duckDb < 0;
+            std::string err;
+            auto plan = planMix(l.project, s, o, {}, nullptr, &err);
+            if (plan.empty()) return fail(err.empty() ? QStringLiteral("There is no audio to mix") : QString::fromStdString(err));
+            const QJsonObject roles = a.value("roles").toObject();
+            for (ClipMix& m : plan) {
+                const QString want = roles.value(QString::number(m.clip)).toString().toLower();
+                if (want.isEmpty()) continue;
+                for (AudioRole r : {AudioRole::Dialogue, AudioRole::Music, AudioRole::Effects, AudioRole::Silence})
+                    if (want == QString::fromLatin1(audioRoleName(r)).toLower()) m.role = r;
+                replanClip(m, o);
+            }
+            QJsonArray clips;
+            for (const ClipMix& m : plan) {
+                const Clip* c = edit::clipById(s, m.clip);
+                clips.append(QJsonObject{{"clip", double(m.clip)}, {"name", c ? QString::fromStdString(c->name) : QString()},
+                                         {"role", QString::fromLatin1(audioRoleName(m.role)).toLower()},
+                                         {"heard_as", QString::fromLatin1(audioRoleName(m.guess.role)).toLower()},
+                                         {"loudness", m.guess.loudness}, {"gain_db", m.gainDb}, {"ride_keys", int(m.ride.size())}});
+            }
+            if (a.value("dry_run").toBool()) return ok(QStringLiteral("Planned %1 clip(s)").arg(plan.size()), QJsonObject{{"clips", clips}});
+            const int n = applyMix(l.project, s, plan, o);
+            save(l);
+            return ok(QStringLiteral("Mixed %1 clip(s)").arg(n), QJsonObject{{"clips", clips}, {"changed", n}});
         });
 
     add("montage_find_shots", "Find shots by description",

@@ -98,6 +98,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 
 **Audio**
 - Clip gain and pan, both keyframeable
+- **Auto Mix** (Sequence menu, like Resolve's AI Audio Assistant): every audio clip is listened to and recognised as dialogue, music or effects (from transcripts where there are any, otherwise the pauses and syllable rhythm of speech and the steady beat of music); each can be corrected. Applying brings each kind to its level (presets for web and streaming, podcasts, or broadcast), evens out dialogue within each clip with volume keyframes (up to 6 dB either way), and dips the music under speech, all in one undo step as ordinary clip volume.
 - **Beat and bar markers** (Clip › Add Bar Markers / Add Beat Markers, like Final Cut's beat detection): the music clip's tempo and beats are found by listening to it (no model), and markers land on every bar ("Bar 12") or beat ("12.3") where the clip plays them, for cutting picture on the beat with snapping.
 - **Fit Music to Length** (Clip menu, like Premiere's Remix or Resolve's music editor): shortens or lengthens a music clip to In–Out, the picture, or any length, by skipping or repeating whole bars where the music matches itself best (harmony and timbre, a bar either side of each join). The start and the ending stay as they are, joins get short crossfades on the beat, and each piece starts a fraction of a frame in as needed so the beat runs on. The result is within half a bar of the length asked for.
 - **Auto Duck Music** (Clip menu): select music clips, tick the dialogue tracks, and the music dips under speech, fading down before it and back up after it. Speech is found from transcripts' words, or from loudness. The result is volume keyframes you can adjust on the clip's line.
@@ -291,7 +292,7 @@ Its tools work on `.montage` files by path. Each edit is saved at once, and the 
 - transcribe (with speaker labels), find spoken phrases in the cut, cut by transcript (phrases, filler words, long pauses, optionally with Smooth Cuts), and build a cut from a script;
 - find shots by description;
 - log media (ratings, labels, keywords, metadata fields, bins), make subclips, auto-tag shots, and find media by text or smart-bin rules, optionally saving the rules as a smart bin;
-- mark a music clip's bars or beats and fit music to a length, duck music under dialogue, match clips' colour to a shot, add adjustment layers, and make a reframed copy of the cut at another aspect ratio;
+- make a first mix (roles, levels, dialogue rides, ducking), mark a music clip's bars or beats and fit music to a length, duck music under dialogue, match clips' colour to a shot, add adjustment layers, and make a reframed copy of the cut at another aspect ratio;
 - return a rendered frame as an image so the agent can check its work;
 - render with any preset, with progress;
 - export and import EDL, OTIO, FCP 7 XML and FCPXML.

@@ -53,6 +53,7 @@
 #include "ExportDialog.h"
 #include "InspectorWidget.h"
 #include "AutoDuckDialog.h"
+#include "AutoMixDialog.h"
 #include "ScriptCutDialog.h"
 #include "KeyframePanel.h"
 #include "MediaBinWidget.h"
@@ -542,6 +543,7 @@ void MainWindow::buildMenus() {
         ->setObjectName(QStringLiteral("autoReframeSequence"));
     add(seqM, tr("Build Cut from &Script…"), QKeySequence(), [this] { scriptCutDialog(); })
         ->setObjectName(QStringLiteral("buildScriptCut"));
+    add(seqM, tr("Auto &Mix…"), QKeySequence(), [this] { AutoMixDialog::run(state_, this); })->setObjectName(QStringLiteral("autoMix"));
     add(seqM, tr("Record &Voiceover…"), QKeySequence("Ctrl+Alt+R"), [this] {
         if (!state_->sequence()) return;
         // One dialog, kept open beside the work while takes are recorded.

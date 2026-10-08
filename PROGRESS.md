@@ -449,7 +449,11 @@ The second gap analysis (`docs/research/phase3-roadmap.md`, October 2026) ranks 
   - Clip menu: Add Bar Markers, Add Beat Markers, Fit Music to Length... (In to Out, the picture, 15/30/60 s). MCP `montage_beat_markers`, `montage_fit_music` (35 tools).
   - Beats were checked against synthetic songs (128 BPM within 0.01, every beat within 4 ms, bars right), and fits to 50 s and 110 s land within half a bar, joining bars with the same chords. Real recordings are untested here.
   - Later: "Cut to the beat" (cutting picture clips on bar markers automatically) and 3/4 time.
-- [ ] 8. One-click mix: classify, ride and match dialogue (M)
+- [ ] 8. One-click mix (M), in progress:
+  - [x] render/AutoMix: classifyAudio (silence below -60 LUFS; speech from the share of 10 ms frames far below their second's average and the 2.5-8 Hz share of loudness modulation, music from onset autocorrelation at 40-200 BPM; transcript words per second decide speech when known). On the JFK clip, the test song and room tone with door slams: speech 0.90 / music 1.00 / effects with neither above 0.
+  - [x] planMix measures each clip's integrated loudness and 3 s loudness every 0.5 s; replanClip sets levels per role and a dialogue ride (smoothed, within +/-6 dB, keyframes only where the line bends); applyMix writes clip volume and ducks music under the dialogue tracks.
+  - [x] Sequence > Auto Mix... (roles can be corrected, presets web/podcast/broadcast, ride and duck switches), MCP `montage_auto_mix` (36 tools).
+  - [ ] Match Voice: EQ a dialogue clip to sound like a reference clip.
 - [ ] 9. Caption and transcript translation on the device (M)
 - [ ] 10. Bézier keyframes and a graph editor (M)
 - [ ] 11. Surround and multichannel deliverables (M–L)
