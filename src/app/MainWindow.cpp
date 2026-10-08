@@ -52,6 +52,7 @@
 #include "ExportDialog.h"
 #include "InspectorWidget.h"
 #include "AutoDuckDialog.h"
+#include "ScriptCutDialog.h"
 #include "KeyframePanel.h"
 #include "MediaBinWidget.h"
 #include "RenderQueue.h"
@@ -534,6 +535,8 @@ void MainWindow::buildMenus() {
     })->setObjectName(QStringLiteral("duplicateSequence"));
     add(seqM, tr("Auto &Reframe Sequence…"), QKeySequence(), [this] { autoReframeDialog(); })
         ->setObjectName(QStringLiteral("autoReframeSequence"));
+    add(seqM, tr("Build Cut from &Script…"), QKeySequence(), [this] { scriptCutDialog(); })
+        ->setObjectName(QStringLiteral("buildScriptCut"));
     add(seqM, tr("Record &Voiceover…"), QKeySequence("Ctrl+Alt+R"), [this] {
         if (!state_->sequence()) return;
         // One dialog, kept open beside the work while takes are recorded.
@@ -1299,6 +1302,22 @@ void MainWindow::autoColor() {
         return true;
     });
     inspectorDock_->raise();
+}
+
+void MainWindow::scriptCutDialog() {
+    ScriptCutDialog dlg(state_, bin_ ? bin_->selectedMedia() : std::vector<Id>{}, this);
+    if (dlg.exec() != QDialog::Accepted) return;
+    const ScriptCutResult r = ScriptCutDialog::build(state_, dlg.script(), dlg.options(), dlg.sequenceName());
+    if (!r.sequence) {
+        state_->message(tr("None of the script's lines were found in the transcribed takes"), 6000);
+        return;
+    }
+    state_->message(tr("Built %1: %2 line(s) placed, %3 alternate(s), %4 not found")
+                        .arg(dlg.sequenceName())
+                        .arg(r.placed)
+                        .arg(r.alternates)
+                        .arg(r.missing),
+                    8000);
 }
 
 void MainWindow::setColourReference() {

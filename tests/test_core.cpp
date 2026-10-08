@@ -14,6 +14,7 @@
 #include "core/MediaLog.h"
 #include "core/Multicam.h"
 #include "core/ProjectIO.h"
+#include "core/ScriptCut.h"
 #include "core/Transcript.h"
 #include "core/TranscriptEdit.h"
 
@@ -1116,6 +1117,125 @@ private slots:
         unsure.add(0, mix({{0, 0}, {0, 1}}));
         unsure.add(1, mix({{3, 1}}));
         QVERIFY(autoTags(unsure, labels).keywords.empty());
+    }
+
+    void scriptCut() {
+        // A screenplay: cues above the words, "Name:" lines, and things to skip.
+        const std::string script = "INT. KITCHEN - DAY\n\nJOHN\nI never thought we would make it this far.\n\n"
+                                   "MARY (V.O.)\n(quietly)\nNeither did I, but here we are.\n\nCUT TO:\n\n"
+                                   "Narrator: The end of a long road.\n\n[Music swells]\n\nSomething nobody said at all.\n";
+        const auto lines = parseScript(script);
+        QCOMPARE(lines.size(), size_t(4));
+        QCOMPARE(lines[0], (ScriptLine{"John", "I never thought we would make it this far."}));
+        QCOMPARE(lines[1], (ScriptLine{"Mary", "Neither did I, but here we are."}));
+        QCOMPARE(lines[2], (ScriptLine{"Narrator", "The end of a long road."}));
+        QCOMPARE(lines[3].speaker, std::string());
+        // A long paragraph is split at sentence ends.
+        std::string para;
+        for (int i = 0; i < 6; ++i) para += "This is sentence number " + std::to_string(i) + " of a long speech. ";
+        const auto split = parseScript(para);
+        QVERIFY(split.size() >= 2);
+        for (const auto& l : split) QVERIFY(QString::fromStdString(l.text).endsWith('.'));
+
+        // Two takes: the first flubs line one ("we we") and has line two; the second is clean
+        // and has line three, with "road" heard as "roads".
+        auto said = [](Transcript& t, double at, const std::string& text, int speaker = -1) {
+            TranscriptSegment seg;
+            seg.start = at;
+            seg.text = text;
+            seg.speaker = speaker;
+            for (const QString& w : QString::fromStdString(text).split(' ')) {
+                TranscriptWord word;
+                word.start = at;
+                word.end = at + 0.35;
+                word.text = w.toStdString();
+                seg.words.push_back(word);
+                at += 0.4;
+            }
+            seg.end = at;
+            t.segments.push_back(seg);
+        };
+        Fixture fx;
+        Project& p = fx.p;
+        Transcript t1, t2;
+        said(t1, 1.0, "um I never thought we we would make it this far", 0);
+        said(t1, 6.0, "neither did I but here we are", 0);
+        said(t2, 2.0, "I never thought we would make it this far", 0);
+        said(t2, 8.0, "the end of a long roads", 0);
+        p.findMedia(fx.media)->transcript = std::make_shared<const Transcript>(t1);
+        MediaItem m2 = *p.findMedia(fx.media);
+        m2.id = p.newId();
+        m2.name = "take2.mov";
+        m2.duration = 20;
+        m2.transcript = std::make_shared<const Transcript>(t2);
+        p.media.push_back(m2);
+
+        auto matches = matchScript(p, lines);
+        QCOMPARE(matches.size(), size_t(4));
+        QCOMPARE(matches[0].takes.size(), size_t(2));
+        QCOMPARE(matches[0].takes[0].mediaId, m2.id);  // the clean reading
+        QCOMPARE(matches[0].takes[0].extraWords, 0);
+        QCOMPARE(matches[0].takes[0].start, 2.0);
+        QVERIFY(std::fabs(matches[0].takes[0].end - (2.0 + 8 * 0.4 + 0.35)) < 1e-9);
+        QCOMPARE(matches[0].takes[1].mediaId, fx.media);
+        QCOMPARE(matches[0].takes[1].extraWords, 1);
+        QCOMPARE(matches[0].takes[1].start, 1.4);  // after the "um"
+        QCOMPARE(matches[1].takes.size(), size_t(1));
+        QCOMPARE(matches[1].takes[0].mediaId, fx.media);
+        QCOMPARE(matches[2].takes.size(), size_t(1));
+        QCOMPARE(matches[2].takes[0].coverage, 1.0);  // a near miss still counts
+        QVERIFY(matches[3].takes.empty());
+        // Only the media asked for is searched.
+        ScriptCutOptions only;
+        only.media = {fx.media};
+        QCOMPARE(matchScript(p, lines, only)[0].takes.size(), size_t(1));
+
+        // The cut: the chosen readings back to back on V1/A1, the alternate disabled above.
+        const auto res = buildScriptCut(p, matches, "Script Cut");
+        QVERIFY(res.sequence);
+        QCOMPARE(res.placed, 3);
+        QCOMPARE(res.missing, 1);
+        QCOMPARE(res.alternates, 1);
+        const Sequence* s = p.findSequence(res.sequence);
+        QVERIFY(s);
+        QCOMPARE(s->name, std::string("Script Cut"));
+        QCOMPARE(s->width, p.active()->width);
+        const auto& v1 = s->videoTracks[0].clips;
+        QCOMPARE(v1.size(), size_t(3));
+        QCOMPARE(v1[0].mediaId, m2.id);
+        QCOMPARE(v1[1].mediaId, fx.media);
+        QCOMPARE(v1[2].mediaId, m2.id);
+        QCOMPARE(v1[0].start, FrameTime(0));
+        QVERIFY(std::fabs(v1[0].sourceIn - (2.0 - 0.15) * 30) < 1e-6);
+        for (size_t i = 1; i < v1.size(); ++i) QCOMPARE(v1[i].start, v1[i - 1].start + v1[i - 1].duration);
+        for (const Clip& c : v1) QVERIFY(c.enabled);
+        QCOMPARE(s->audioTracks[0].clips.size(), size_t(3));
+        QVERIFY(s->videoTracks.size() >= 2);
+        QCOMPARE(s->videoTracks[1].clips.size(), size_t(1));
+        QCOMPARE(s->videoTracks[1].clips[0].mediaId, fx.media);
+        QVERIFY(!s->videoTracks[1].clips[0].enabled);
+        QVERIFY(!s->audioTracks[1].clips[0].enabled);
+        // A marker per line; the missing line marked where it would have gone.
+        QCOMPARE(s->markers.size(), size_t(4));
+        QCOMPARE(s->markers[0].name, std::string("John: I never thought we would make it this far."));
+        QVERIFY(QString::fromStdString(s->markers[3].name).startsWith("Missing: "));
+        QCOMPARE(s->markers[3].t, s->duration());
+        QVERIFY(std::any_of(p.media.begin(), p.media.end(), [&](const MediaItem& m) { return m.sequenceId == res.sequence; }));
+
+        // Named speakers: the script's John is the first take's speaker, so his reading wins
+        // despite the flub.
+        t1.speakerNames = {"John"};
+        t2.speakerNames = {"Mary"};
+        p.findMedia(fx.media)->transcript = std::make_shared<const Transcript>(t1);
+        p.findMedia(m2.id)->transcript = std::make_shared<const Transcript>(t2);
+        matches = matchScript(p, lines);
+        QCOMPARE(matches[0].takes[0].mediaId, fx.media);
+        QCOMPARE(matches[0].takes[0].speaker, std::string("John"));
+        QCOMPARE(matches[2].takes.size(), size_t(1));  // still found, just not preferred
+        // Nothing found: no sequence.
+        const auto none = buildScriptCut(p, matchScript(p, {ScriptLine{"", "words nobody spoke"}}), "Empty");
+        QCOMPARE(none.sequence, Id(0));
+        QCOMPARE(none.missing, 1);
     }
 
     void subclips() {

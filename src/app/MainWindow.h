@@ -56,9 +56,10 @@ public:
     // many clips were matched.
     void setColourReference();
     bool hasColourReference() const { return !colourRef_.empty(); }
+    int matchColour();
     // Split-screen compare in the Program monitor: the reference beside the current frame.
     void setCompareWithReference(bool on);
-    int matchColour();
+    void scriptCutDialog();  // Sequence › Build Cut from Script…
     // Auto Reframe: a copy of the current sequence at aspect w:h with every
     // picture clip following its subject (speed 0 slower, 1 default, 2 faster),
     // made current; 0 if cancelled or nothing to do. The dialog asks for both.

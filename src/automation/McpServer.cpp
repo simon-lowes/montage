@@ -23,6 +23,7 @@
 #include "core/Interchange.h"
 #include "core/MediaLog.h"
 #include "core/ProjectIO.h"
+#include "core/ScriptCut.h"
 #include "core/TranscriptEdit.h"
 #include "media/AutoDuck.h"
 #include "media/Decoder.h"
@@ -800,6 +801,71 @@ void McpServer::Impl::addTools() {
                           .arg(smooth ? QStringLiteral(", with Smooth Cuts") : QString()),
                       QJsonObject{{"phrases", found}, {"fillers", fillers}, {"pauses", pauses}, {"removed_seconds", secs},
                                   {"smooth_cuts", joins}, {"duration", tc(s.duration(), s)}});
+        });
+
+    add("montage_script_cut", "Build a cut from a script",
+        "Find each line of a script in the project's transcribed takes and build a new sequence with the best reading of "
+        "each line in script order on V1/A1 (most of the line said, fewest extra words, the named speaker when the "
+        "transcript names speakers), other readings disabled on the tracks above, and a marker per line. Pass the script "
+        "as text or a file (plain text, Fountain or Final Draft .fdx); a name in capitals above the words or \"Name:\" "
+        "before them gives the speaker. dry_run reports what was found without building. Transcribe the takes first.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "script":{"type":"string","description":"The script's text"},
+            "script_file":{"type":"string","description":"Or a file holding it"},
+            "name":{"type":"string","default":"Script Cut"},
+            "min_coverage":{"type":"number","default":0.6,"description":"Share of a line a reading must say (0.2-1)"},
+            "alternates":{"type":"integer","default":3},
+            "handle":{"type":"number","default":0.15,"description":"Seconds kept around each reading"},
+            "markers":{"type":"boolean","default":true},
+            "dry_run":{"type":"boolean","default":false}},"required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            std::string text = a.value("script").toString().toStdString();
+            if (const QString file = a.value("script_file").toString(); !file.isEmpty()) {
+                QFile f(absolute(file));
+                if (!f.open(QIODevice::ReadOnly)) return fail(QStringLiteral("Cannot open %1").arg(file));
+                text = f.readAll().toStdString();
+                if (file.endsWith(QStringLiteral(".fdx"), Qt::CaseInsensitive)) text = fdxToScript(text);
+            }
+            const auto lines = parseScript(text);
+            if (lines.empty()) return fail("No script lines (pass script or script_file)");
+            ScriptCutOptions o;
+            o.minCoverage = std::clamp(a.value("min_coverage").toDouble(0.6), 0.2, 1.0);
+            o.maxAlternates = std::clamp(a.value("alternates").toInt(3), 0, 8);
+            o.handle = std::clamp(a.value("handle").toDouble(0.15), 0.0, 2.0);
+            o.markers = a.value("markers").toBool(true);
+            const auto matches = matchScript(l.project, lines, o);
+            QJsonArray report;
+            int found = 0;
+            for (const ScriptMatch& m : matches) {
+                QJsonObject line{{"line", QString::fromStdString(m.line.text)}, {"takes", int(m.takes.size())}};
+                if (!m.line.speaker.empty()) line["speaker"] = QString::fromStdString(m.line.speaker);
+                if (!m.takes.empty()) {
+                    ++found;
+                    const ScriptTake& t = m.takes.front();
+                    const MediaItem* media = l.project.findMedia(t.mediaId);
+                    line["best"] = QJsonObject{{"media", media ? QString::fromStdString(media->name) : QString()},
+                                               {"start", t.start}, {"end", t.end}, {"extra_words", t.extraWords},
+                                               {"coverage", t.coverage}};
+                }
+                report.append(line);
+            }
+            if (a.value("dry_run").toBool())
+                return ok(QStringLiteral("Found %1 of %2 line(s)").arg(found).arg(matches.size()), QJsonObject{{"lines", report}});
+            if (found == 0) return fail("None of the lines were found in the transcribed takes (use montage_transcribe first)");
+            const QString name = a.value("name").toString(QStringLiteral("Script Cut"));
+            const ScriptCutResult r = buildScriptCut(l.project, matches, name.toStdString(), o);
+            if (!r.sequence) return fail("Nothing could be placed");
+            l.project.activeSequence = r.sequence;
+            save(l);
+            const Sequence& s = l.seq();
+            return ok(QStringLiteral("Built \"%1\": %2 line(s) placed, %3 alternate(s), %4 not found")
+                          .arg(name)
+                          .arg(r.placed)
+                          .arg(r.alternates)
+                          .arg(r.missing),
+                      QJsonObject{{"sequence", name}, {"placed", r.placed}, {"alternates", r.alternates}, {"missing", r.missing},
+                                  {"duration", tc(s.duration(), s)}, {"lines", report}});
         });
 
     add("montage_find_shots", "Find shots by description",

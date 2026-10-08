@@ -169,6 +169,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
   - With **Smooth Cuts** on, each join these leave in the picture gets a Smooth Cut, so the speaker does not jump.
   - Find searches the words; the last word may be partly typed.
   - **Source mode** shows the Source monitor clip's transcript. Select words to set In and Out, then Insert or Overwrite them into the timeline.
+- **Build Cut from Script** (Sequence menu, like Resolve's IntelliScript or Avid's ScriptSync): paste or open a script (plain text, Fountain or Final Draft `.fdx`) and each line is found in the transcribed takes, even with dropped, added or misheard words. The best reading of each line goes on V1/A1 in script order: the one that says most of the line with the fewest extra words, by the speaker the script names once speakers are named in the transcript. Up to eight other readings sit disabled on the tracks above, ready to swap in, and each line gets a marker (lines not found are marked in red). The dialog shows what was found as you type.
 - Captions:
   - Caption tracks on each sequence, shown as lanes above the video tracks. Drag captions to move them, drag their edges to retime them, and double-click one to edit its text in the Captions panel.
   - Generate captions from transcripts: words are placed where each clip plays them, following trims, speed changes and muted tracks, and are split into readable captions (42 characters per line, 2 lines and 7 seconds at most by default).
@@ -284,7 +285,7 @@ Its tools work on `.montage` files by path. Each edit is saved at once, and the 
 - probe media, create projects and list a project's timeline;
 - place media, split, remove (with ripple), move, trim and change the speed of clips;
 - add titles, effects (including masked ones), transitions and markers;
-- transcribe (with speaker labels), find spoken phrases in the cut, and cut by transcript (phrases, filler words, long pauses, optionally with Smooth Cuts);
+- transcribe (with speaker labels), find spoken phrases in the cut, cut by transcript (phrases, filler words, long pauses, optionally with Smooth Cuts), and build a cut from a script;
 - find shots by description;
 - log media (ratings, labels, keywords, metadata fields, bins), make subclips, auto-tag shots, and find media by text or smart-bin rules, optionally saving the rules as a smart bin;
 - duck music under dialogue, match clips' colour to a shot, add adjustment layers, and make a reframed copy of the cut at another aspect ratio;

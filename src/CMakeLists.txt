@@ -8,6 +8,7 @@ add_library(montage_engine STATIC
   core/Transcript.h core/Transcript.cpp
   core/Captions.h core/Captions.cpp
   core/TranscriptEdit.h core/TranscriptEdit.cpp
+  core/ScriptCut.h core/ScriptCut.cpp
   core/Effects.h core/Effects.cpp
   core/EditOps.h core/EditOps.cpp
   core/ImportBuilder.h core/InterchangeImport.cpp core/FcpXml.cpp

@@ -37,6 +37,7 @@
 #include "MediaBinModel.h"
 #include "MediaBinWidget.h"
 #include "SmartBinDialog.h"
+#include "ScriptCutDialog.h"
 #include "core/KeyframeEdit.h"
 #include "core/MediaLog.h"
 #include "SequenceSettingsDialog.h"
@@ -1376,6 +1377,67 @@ private slots:
         compare->trigger();
         QVERIFY(!compare->isChecked() && !program->comparing());
         program->setSplit(0.5);
+        state()->newProject();
+    }
+
+    void buildACutFromAScript() {
+        state()->newProject();
+        const Id before = state()->sequence()->id;
+        // Two transcribed takes (the files need not exist: the cut is built from transcripts).
+        auto take = [&](const char* name, std::vector<TranscriptWord> words) {
+            Id id = 0;
+            state()->edit("Take", [&](Project& p, Sequence&) {
+                MediaItem m;
+                m.id = id = p.newId();
+                m.kind = MediaKind::Video;
+                m.name = name;
+                m.path = (dir_.path() + "/" + name + ".mp4").toStdString();
+                m.hasVideo = m.hasAudio = true;
+                m.duration = 20;
+                m.width = 1280;
+                m.height = 720;
+                m.fps = {25, 1};
+                auto t = std::make_shared<Transcript>();
+                TranscriptSegment seg;
+                seg.words = std::move(words);
+                t->segments.push_back(seg);
+                m.transcript = t;
+                p.media.push_back(m);
+                return true;
+            });
+            return id;
+        };
+        const Id a = take("A", {{1.0, 1.3, "Hello", 1}, {1.4, 1.8, "there", 1}, {5.0, 5.3, "General", 1}, {5.4, 5.8, "Kenobi", 1}});
+        const Id b = take("B", {{2.0, 2.3, "Hello", 1}, {2.4, 2.8, "there", 1}});
+        QVERIFY(win_->findChild<QAction*>("buildScriptCut"));
+        ScriptCutDialog dlg(state(), {b}, win_.get());
+        dlg.setScript("OBI-WAN\nHello there.\n\nGRIEVOUS\nGeneral Kenobi.\n\nA line nobody said.");
+        // Searching only the selected take: one line found.
+        auto* preview = dlg.findChild<QTreeWidget*>("scriptPreview");
+        QVERIFY(preview);
+        QCOMPARE(preview->topLevelItemCount(), 3);
+        QCOMPARE(dlg.matches()[0].takes.size(), size_t(1));
+        QVERIFY(dlg.findChild<QLabel*>("scriptSummary")->text().contains("1 of 3"));
+        // Every take: two lines found, the first with two readings.
+        dlg.findChild<QComboBox*>("scriptScope")->setCurrentIndex(0);
+        QCOMPARE(dlg.matches()[0].takes.size(), size_t(2));
+        QCOMPARE(dlg.matches()[1].takes.front().mediaId, a);
+        QCOMPARE(preview->topLevelItem(2)->text(2), QString("Not found"));
+        QVERIFY(dlg.findChild<QLabel*>("scriptSummary")->text().contains("2 of 3"));
+        // Building makes a new sequence, sized like the one that was open, and opens it.
+        const ScriptCutResult r = ScriptCutDialog::build(state(), dlg.script(), dlg.options(), dlg.sequenceName());
+        QVERIFY(r.sequence);
+        QCOMPARE(r.placed, 2);
+        QCOMPARE(r.missing, 1);
+        QCOMPARE(r.alternates, 1);
+        QCOMPARE(state()->sequence()->id, r.sequence);
+        QCOMPARE(state()->sequence()->name, std::string("Script Cut"));
+        QCOMPARE(state()->sequence()->videoTracks[0].clips.size(), size_t(2));
+        QCOMPARE(state()->sequence()->markers.size(), size_t(3));
+        // One undo removes it.
+        state()->undo();
+        QVERIFY(!state()->project().findSequence(r.sequence));
+        QCOMPARE(state()->sequence()->id, before);
         state()->newProject();
     }
 

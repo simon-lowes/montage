@@ -433,7 +433,11 @@ The second gap analysis (`docs/research/phase3-roadmap.md`, October 2026) ranks 
   - CurveEditor in the Inspector for these and for Curves (tone curves keep their two ends); edits merge into one undo step per drag.
   - ColorWheel: Lift, Gamma and Gain wheels above Color Correct's sliders. The puck sets balanced channel offsets (rim: lift 0.25, gamma 0.5 stops, gain 0.5), keeping whatever the channels share.
   - Clip › Compare with Reference: the Program viewer shows the colour reference left of a draggable divider.
-- [ ] 5. Build a cut from a script (M)
+- [x] 5. Build a cut from a script (M):
+  - core/ScriptCut: `parseScript` (paragraphs, long ones split at sentences; cues in capitals or "Name:" give the speaker; headings, transitions, parentheticals and [directions] skipped) and `fdxToScript` for Final Draft.
+  - `matchScript`: Smith-Waterman over normalised words (2 for a word, 1 for a near miss, -1 for a mismatch or gap) in windows around the line's telling words, every reading in each window. Score = coverage x 100 - 4 per extra word, +5/-10 for a named speaker who matches or not; ties go to the later take.
+  - `buildScriptCut`: a new sequence sized like the active one; best readings back to back with handles on V1/A1, alternates disabled on the first free tracks above, a marker per line and a red one for each missing line.
+  - Sequence > Build Cut from Script... with a live preview, and MCP `montage_script_cut` (with `dry_run`).
 - [ ] 6. Speech enhancement and stem separation (M)
 - [ ] 7. Beat markers and fitting music to length (M)
 - [ ] 8. One-click mix: classify, ride and match dialogue (M)

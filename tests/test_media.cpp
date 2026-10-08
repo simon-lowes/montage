@@ -1179,6 +1179,88 @@ private slots:
         QVERIFY(r.value("isError").toBool());
     }
 
+    void mcpBuildsACutFromAScript() {
+        // Two takes of a two-line scene; the second take fluffs line one.
+        Project p = makeDefaultProject();
+        auto take = [&](const char* name, std::vector<TranscriptWord> words) {
+            MediaItem m;
+            m.id = p.newId();
+            m.kind = MediaKind::Video;
+            m.name = name;
+            m.path = path((std::string(name) + ".mp4").c_str());
+            m.hasVideo = m.hasAudio = true;
+            m.duration = 30;
+            auto t = std::make_shared<Transcript>();
+            TranscriptSegment seg;
+            seg.words = std::move(words);
+            t->segments.push_back(seg);
+            m.transcript = t;
+            p.media.push_back(m);
+            return m.id;
+        };
+        const Id t1 = take("take1", {{1.0, 1.3, "Where", 1}, {1.4, 1.6, "were", 1}, {1.7, 1.9, "you", 1}, {2.0, 2.4, "last", 1},
+                                     {2.5, 2.9, "night?", 1}, {4.0, 4.3, "Out.", 1}, {4.4, 4.7, "Walking.", 1}});
+        const Id t2 = take("take2", {{1.0, 1.3, "Where", 1}, {1.4, 1.6, "were", 1}, {1.7, 1.9, "uh", 1}, {2.0, 2.2, "you", 1},
+                                     {2.3, 2.7, "last", 1}, {2.8, 3.2, "night?", 1}});
+        const QString project = QString::fromStdString(path("scene.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        // The scene as a Final Draft file.
+        const QString fdx = QString::fromStdString(path("scene.fdx"));
+        {
+            QFile f(fdx);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(R"(<?xml version="1.0" encoding="UTF-8"?><FinalDraft DocumentType="Script" Version="5"><Content>
+<Paragraph Type="Scene Heading"><Text>INT. HALL - NIGHT</Text></Paragraph>
+<Paragraph Type="Character"><Text>ANNA</Text></Paragraph>
+<Paragraph Type="Dialogue"><Text>Where were you </Text><Text>last night?</Text></Paragraph>
+<Paragraph Type="Character"><Text>BEN</Text></Paragraph>
+<Paragraph Type="Parenthetical"><Text>(shrugs)</Text></Paragraph>
+<Paragraph Type="Dialogue"><Text>Out. Walking.</Text></Paragraph>
+<Paragraph Type="Action"><Text>She turns away.</Text></Paragraph>
+</Content></FinalDraft>)");
+        }
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_script_cut"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        // A dry run reports the lines and their best readings, and changes nothing.
+        QJsonObject r = call(QJsonObject{{"project", project}, {"script_file", fdx}, {"dry_run", true}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QJsonArray lines = r.value("structuredContent").toObject().value("lines").toArray();
+        QCOMPARE(lines.size(), 2);
+        QCOMPARE(lines[0].toObject().value("speaker").toString(), QString("Anna"));
+        QCOMPARE(lines[0].toObject().value("takes").toInt(), 2);
+        QCOMPARE(lines[0].toObject().value("best").toObject().value("media").toString(), QString("take1"));
+        QCOMPARE(lines[1].toObject().value("speaker").toString(), QString("Ben"));
+        QCOMPARE(lines[1].toObject().value("best").toObject().value("start").toDouble(), 4.0);
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.sequences.size(), size_t(1));
+        // The build: a new active sequence with both lines on V1, take 2 above line one.
+        r = call(QJsonObject{{"project", project}, {"script_file", fdx}, {"name", "Scene 4"}, {"handle", 0.0}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("placed").toInt(), 2);
+        QCOMPARE(r.value("structuredContent").toObject().value("alternates").toInt(), 1);
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Sequence& s = *back.active();
+        QCOMPARE(s.name, std::string("Scene 4"));
+        QCOMPARE(s.videoTracks[0].clips.size(), size_t(2));
+        QCOMPARE(s.videoTracks[0].clips[0].mediaId, t1);
+        QCOMPARE(s.videoTracks[0].clips[0].sourceIn, 1.0 * s.fpsValue());
+        QCOMPARE(s.videoTracks[1].clips.size(), size_t(1));
+        QCOMPARE(s.videoTracks[1].clips[0].mediaId, t2);
+        QVERIFY(!s.videoTracks[1].clips[0].enabled);
+        QCOMPARE(s.markers.size(), size_t(2));
+        // Nothing to go on: an error, not an empty sequence.
+        r = call(QJsonObject{{"project", project}, {"script", "Lines nobody ever said."}});
+        QVERIFY(r.value("isError").toBool());
+    }
+
     void mcpCutsBySpeech() {
         // An interview clip with a filler, a long pause and a phrase to lose.
         Project p = makeDefaultProject();
