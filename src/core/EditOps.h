@@ -154,6 +154,12 @@ struct DuplicateSpan {
 };
 std::map<Id, std::vector<DuplicateSpan>> duplicateFrames(const Sequence& s);
 
+// ---- Close Up (Resolve's Cut page) -------------------------------------------------
+// A punched-in copy of a video clip over [from, to) on the track above it (added if needed), scaled `zoom` times
+// its own size and moved so the point (u, v) of the media (fractions, e.g. a face) sits near the middle of the
+// frame, a little above it, without uncovering the frame's edges. Video only; its effects come with it.
+Result closeUp(Project& p, Sequence& s, Id clipId, FrameTime from, FrameTime to, double zoom, double u, double v);
+
 // ---- Track folders (Resolve's Fairlight folders) -----------------------------------
 // Puts tracks in a folder ("" takes them out). Fails for no tracks or a folder name with a slash.
 Result setTrackFolder(Sequence& s, const std::vector<TrackRef>& tracks, const std::string& folder);

@@ -2585,6 +2585,34 @@ private slots:
         QCOMPARE(d[fx.v1().clips[3].id].front().group, 1);
     }
 
+    void closeUpFraming() {
+        // A 1920 x 1080 clip in a 1920 x 1080 sequence, a face three quarters across.
+        Fixture fx;
+        fx.s().width = 1920, fx.s().height = 1080;
+        const Id clip = fx.put(V1, 0, 100, 10);
+        while (fx.s().videoTracks.size() > 1) fx.s().videoTracks.pop_back();
+        Result r = closeUp(fx.p, fx.s(), clip, 20, 60, 1.5, 0.75, 0.5);
+        QVERIFY2(r.ok, r.error.c_str());
+        QCOMPARE(fx.s().videoTracks.size(), size_t(2));  // a track added above
+        const Clip* c = clipById(fx.s(), r.created.at(0));
+        QVERIFY(c);
+        QCOMPARE(c->start, FrameTime(20));
+        QCOMPARE(c->duration, FrameTime(40));
+        QCOMPARE(c->sourceIn, 30.0);  // the same pictures
+        QCOMPARE(c->linkGroup, Id(0));
+        QCOMPARE(c->motion.p("scale", 0), 150.0);
+        // Moved towards the face, but no further than the picture still covers the frame (2880 wide: 480 each way).
+        QCOMPARE(c->motion.p("pos_x", 0), -480.0);
+        QCOMPARE(c->motion.p("pos_y", 0), -81.0);
+        // Within the clip only; titles and audio refused.
+        QVERIFY(!closeUp(fx.p, fx.s(), clip, 200, 300, 1.5, 0.5, 0.5).ok);
+        const Id sound = fx.put(A1, 0, 10);
+        QVERIFY(!closeUp(fx.p, fx.s(), sound, 0, 10, 1.5, 0.5, 0.5).ok);
+        // Again over the same stretch: V2 is taken, so another track.
+        QVERIFY(closeUp(fx.p, fx.s(), clip, 20, 60, 2.0, 0.5, 0.5).ok);
+        QCOMPARE(fx.s().videoTracks.size(), size_t(3));
+    }
+
     void effectPresets() {
         // A clip's blur and a keyframed brightness saved as a preset, read back and put on another clip.
         Fixture fx;

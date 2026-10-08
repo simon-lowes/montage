@@ -3655,6 +3655,30 @@ const auto seq = [this] { return state()->sequence(); };
         state()->newProject();
     }
 
+    void closeUpOnAFace() {
+        state()->newProject();
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/faces/jfk-color.jpg")});
+        QCOMPARE(ids.size(), size_t(1));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids[0], 0, 0, 90, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        state()->setPlayhead(30);
+        const size_t tracks = state()->sequence()->videoTracks.size();
+        QVERIFY(win_->findChild<QAction*>("closeUp"));
+        const Id id = win_->closeUp(1.5);
+        QVERIFY(id);
+        const Clip* c = edit::clipById(*state()->sequence(), id);
+        const auto loc = edit::locate(*state()->sequence(), id);
+        QVERIFY(c && loc && loc->track.index == 1);
+        QVERIFY(state()->sequence()->videoTracks.size() >= tracks);
+        QCOMPARE(c->motion.p("scale", 0), 150.0);
+        if (faceSearchAvailable() && faceModel().installed())
+            QVERIFY(std::fabs(c->motion.p("pos_x", 0)) + std::fabs(c->motion.p("pos_y", 0)) > 1);  // moved to the face
+        state()->undo();
+        QVERIFY(!edit::clipById(*state()->sequence(), id));
+        state()->newProject();
+    }
+
     void effectPresetsSaveAndApply() {
         loadDemo();
         const Id red = clipNamed(*state()->sequence(), "Red")->id, blue = clipNamed(*state()->sequence(), "Blue")->id;

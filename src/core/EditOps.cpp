@@ -1570,6 +1570,53 @@ std::map<Id, std::vector<DuplicateSpan>> duplicateFrames(const Sequence& s) {
     return out;
 }
 
+// ---- Close Up -------------------------------------------------------------------------
+
+Result closeUp(Project& p, Sequence& s, Id clipId, FrameTime from, FrameTime to, double zoom, double u, double v) {
+    const auto loc = locate(s, clipId);
+    if (!loc || loc->track.kind != TrackKind::Video) return Result::fail("Choose a video clip for the close-up");
+    const Clip src = s.videoTracks[size_t(loc->track.index)].clips[loc->index];
+    const MediaItem* m = p.findMedia(src.mediaId);
+    if (!m || src.isGenerator() || m->width <= 0 || m->height <= 0) return Result::fail("A close-up needs a picture from a file");
+    from = std::max(from, src.start);
+    to = std::min(to, src.end());
+    if (to <= from) return Result::fail("The close-up must be within the clip");
+    zoom = std::clamp(zoom, 1.05, 4.0);
+    Clip c = subClip(src, from, to);
+    c.id = p.newId();
+    c.linkGroup = 0;
+    c.name = src.name + " (Close Up)";
+    // Its framing, at the clip's own scale times `zoom`, keyed nowhere: a fixed punch-in.
+    const double fit = [&] {
+        switch (int(src.motion.p("fit", 0, 0))) {
+            case 1: return std::max(double(s.width) / m->width, double(s.height) / m->height);
+            case 2: return double(s.width) / m->width;
+            default: return std::min(double(s.width) / m->width, double(s.height) / m->height);
+        }
+    }();
+    const double scale = src.motion.p("scale", 0, 100) * zoom;
+    const double w = m->width * fit * scale / 100.0, h = m->height * fit * scale / 100.0;
+    double px = -(std::clamp(u, 0.0, 1.0) - 0.5) * w, py = -(std::clamp(v, 0.0, 1.0) - 0.45) * h;
+    // Keep the picture over the whole frame where it is big enough to.
+    if (w >= s.width) px = std::clamp(px, -(w - s.width) / 2, (w - s.width) / 2);
+    if (h >= s.height) py = std::clamp(py, -(h - s.height) / 2, (h - s.height) / 2);
+    for (const char* k : {"scale", "pos_x", "pos_y"}) c.motion.params[k].keys.clear();
+    c.motion.params["scale"] = Param(scale);
+    c.motion.params["pos_x"] = Param(px);
+    c.motion.params["pos_y"] = Param(py);
+    // On the track above, a new one if it is the top track or that stretch is taken.
+    int above = loc->track.index + 1;
+    if (above >= int(s.videoTracks.size()) || !trackEmpty(s.videoTracks[size_t(above)], from, to)) {
+        addTrack(p, s, TrackKind::Video);
+        above = int(s.videoTracks.size()) - 1;
+        if (!trackEmpty(s.videoTracks[size_t(above)], from, to)) return Result::fail("No room above the clip");
+    }
+    c.start = from;
+    Result r = overwrite(p, s, {TrackKind::Video, above}, c);
+    if (r.ok && r.created.empty()) r.created.push_back(c.id);
+    return r;
+}
+
 // ---- Track folders ------------------------------------------------------------------
 
 namespace {

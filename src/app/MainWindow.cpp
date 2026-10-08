@@ -55,6 +55,7 @@
 #include "media/Decoder.h"
 #include "media/HwAccel.h"
 #include "media/MediaPool.h"
+#include "media/Faces.h"
 #include "EditorState.h"
 #include "EffectsBrowser.h"
 #include "ExportDialog.h"
@@ -783,6 +784,7 @@ void MainWindow::buildMenus() {
     add(clipM, tr("Swap with Previous Clip"), QKeySequence("Ctrl+Shift+,"), [this] { swapClip(false); })->setObjectName(QStringLiteral("swapPrevious"));
     add(clipM, tr("Swap with Next Clip"), QKeySequence("Ctrl+Shift+."), [this] { swapClip(true); })->setObjectName(QStringLiteral("swapNext"));
     add(clipM, tr("Join Through Edits"), QKeySequence(), [this] { joinThroughEdits(); })->setObjectName(QStringLiteral("joinThroughEdits"));
+    add(clipM, tr("Close Up"), QKeySequence(), [this] { closeUp(); })->setObjectName(QStringLiteral("closeUp"));
     add(clipM, tr("Save Effects as Preset…"), QKeySequence(), [this] {
         const Clip* c = state_->primaryClip();
         bool ok = false;
@@ -2269,6 +2271,46 @@ int MainWindow::applyEffectPreset(const QString& file) {
         return true;
     });
     return int(targets.size());
+}
+
+Id MainWindow::closeUp(double zoom) {
+    const Sequence* s = state_->sequence();
+    const Clip* c = clipForCommand();
+    const MediaItem* m = c ? state_->project().findMedia(c->mediaId) : nullptr;
+    if (!s || !c || !m || m->kind == MediaKind::Sequence || m->kind == MediaKind::Audio) {
+        state_->message(tr("Put the playhead over a video clip for a close-up"));
+        return 0;
+    }
+    FrameTime from = c->start, to = c->end();
+    if (s->inPoint >= 0 && s->outPoint >= s->inPoint && s->inPoint < c->end() && s->outPoint >= c->start) {
+        from = std::max(s->inPoint, c->start);
+        to = std::min(s->outPoint + 1, c->end());
+    }
+    // The face in the middle frame of the stretch, if there is a face model.
+    double u = 0.5, v = 0.45;
+    bool face = false;
+    if (faceSearchAvailable() && faceModel().installed()) {
+        if (auto model = FaceModel::load()) {
+            const double sec = m->kind == MediaKind::Video ? c->sourceFrameAt((from + to) / 2) / s->fpsValue() : 0.0;
+            if (Frame16Ptr f = MediaPool::instance().videoFrame(m->path, sec, 0, 0)) {
+                const auto faces = model->detect(*f);
+                if (!faces.empty() && f->width > 0 && f->height > 0) {
+                    u = (faces.front().x + faces.front().w / 2) / f->width;
+                    v = (faces.front().y + faces.front().h / 2) / f->height;
+                    face = true;
+                }
+            }
+        }
+    }
+    const Id clip = c->id;
+    Id created = 0;
+    state_->apply(tr("Close Up"), [&](Project& p, Sequence& sq) {
+        edit::Result r = edit::closeUp(p, sq, clip, from, to, zoom, u, v);
+        if (r.ok && !r.created.empty()) created = r.created.front();
+        return r;
+    });
+    if (created) state_->message(face ? tr("Close-up framed on the face") : tr("No face found: the close-up is on the middle of the picture"), 4000);
+    return created;
 }
 
 int MainWindow::joinThroughEdits() {

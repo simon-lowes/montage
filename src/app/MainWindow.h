@@ -131,6 +131,9 @@ public:
     // or empty with a message), and a preset's effects added to the selected clips of its kind (how many clips).
     QString saveEffectsAsPreset(const QString& name);
     int applyEffectPreset(const QString& file);
+    // Close Up (Resolve's Cut page): a punched-in copy (zoom times) of the video clip under the playhead, over In to
+    // Out or the whole clip, on the track above, framed on the face found in it (else the middle). Its id, or 0.
+    Id closeUp(double zoom = 1.5);
     int joinThroughEdits();  // the selected clips' through edits, else all of the sequence's; how many (one undo step)
     bool swapClip(bool withNext);                     // the selected clip (or the one under the playhead) with its neighbour
     bool replaceWithSource();                         // the selected clip, or the one under the playhead
