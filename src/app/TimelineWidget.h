@@ -153,13 +153,14 @@ private:
     std::optional<FolderRow> folderRowAt(int y) const;
     void paintFolderRow(QPainter& p, const FolderRow& f, bool header);
     void folderMenu(QMenu& menu, TrackKind kind, const std::string& folder);
-    enum class HitKind { None, Ruler, Header, Body, ClipBody, ClipIn, ClipOut, Transition, CaptionLane, Caption, CaptionIn, CaptionOut };
+    enum class HitKind { None, Ruler, Header, Body, ClipBody, ClipIn, ClipOut, Transition, TransitionEdge, CaptionLane, Caption, CaptionIn, CaptionOut };
     enum class HeaderButton { None, Target, Visible, Lock, Mute, Solo, Name, Folder };
     struct Hit {
         HitKind kind = HitKind::None;
         std::optional<TrackRef> track;
         Id clip = 0;
         Id transition = 0;
+        bool rightEdge = false;  // TransitionEdge: the transition's end rather than its start
         HeaderButton button = HeaderButton::None;
         FrameTime frame = 0;
         Id captionTrack = 0;
@@ -167,7 +168,7 @@ private:
         std::string folder;  // a track folder's header (with folderKind)
         TrackKind folderKind = TrackKind::Audio;
     };
-    enum class DragKind { None, Scrub, Move, Trim, Roll, Slip, Slide, Rubber, Pan, CaptionMove, CaptionIn, CaptionOut, Line, LineKey, TrackLine, TrackKey };
+    enum class DragKind { None, Scrub, Move, Trim, Roll, Slip, Slide, Rubber, Pan, CaptionMove, CaptionIn, CaptionOut, Line, LineKey, TrackLine, TrackKey, TransitionEdge };
     struct DragState {
         DragKind kind = DragKind::None;
         QPoint pressPos;
@@ -190,6 +191,7 @@ private:
         FrameTime key = -1;     // the keyframe dragged (clip-local frame)
         double lineAtPress = 0;  // the line's value under the press
         int track = -1;          // the audio track whose automation is dragged
+        Id transition = 0;       // TransitionEdge: the transition resized (edge: In its start, Out its end)
     };
     struct TrackLaneHit {
         int track = -1;       // audio track index

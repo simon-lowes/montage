@@ -132,6 +132,9 @@ Result removeTransition(Sequence& s, Id transitionId);
 Transition* transitionById(Sequence& s, Id id, TrackRef* where = nullptr);
 // Timeline range covered by a transition on a track.
 bool transitionRange(const Track& t, const Transition& tr, FrameTime& from, FrameTime& to);
+// A transition's length (Premiere 26's transition handles on the timeline): at least 2 frames; a dissolve between
+// two clips stays centred on the edit and inside both, a fade inside its clip. Result::applied is the length set.
+Result setTransitionDuration(Sequence& s, Id transitionId, FrameTime duration);
 
 // ---- Editing staples -----------------------------------------------------------------
 // The nearest clip edge (a clip's start or end on any track) before / after

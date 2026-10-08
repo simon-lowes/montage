@@ -456,6 +456,21 @@ TimelineWidget::Hit TimelineWidget::hitTest(const QPoint& pos) const {
         FrameTime a, b;
         if (!edit::transitionRange(*t, tr, a, b)) continue;
         int xa = xForFrame(a), xb = xForFrame(b);
+        // Its edges drag its length (Premiere 26): a dissolve's either side, a fade's side away from the cut.
+        if (pos.y() >= row->y + row->h / 2 && xb - xa >= 8) {
+            const bool left = tr.clipA != 0, right = tr.clipB != 0;  // a fade-out's cut is its end, a fade-in's its start
+            if (left && std::abs(pos.x() - xa) <= 3) {
+                h.kind = HitKind::TransitionEdge;
+                h.transition = tr.id;
+                return h;
+            }
+            if (right && std::abs(pos.x() - xb) <= 3) {
+                h.kind = HitKind::TransitionEdge;
+                h.transition = tr.id;
+                h.rightEdge = true;
+                return h;
+            }
+        }
         if (pos.x() >= xa && pos.x() <= xb && pos.y() >= row->y + row->h / 2) {
             h.kind = HitKind::Transition;
             h.transition = tr.id;
@@ -1693,6 +1708,13 @@ void TimelineWidget::beginDrag(QMouseEvent* e, const Hit& hit) {
         state_->selectTransition(hit.transition);
         return;
     }
+    if (hit.kind == HitKind::TransitionEdge) {
+        state_->selectTransition(hit.transition);
+        drag_.kind = DragKind::TransitionEdge;
+        drag_.transition = hit.transition;
+        drag_.edge = hit.rightEdge ? edit::Edge::Out : edit::Edge::In;
+        return;
+    }
     if (hit.kind == HitKind::ClipBody || hit.kind == HitKind::ClipIn || hit.kind == HitKind::ClipOut) {
         Id id = hit.clip;
         // Selection.
@@ -1771,6 +1793,7 @@ void TimelineWidget::updateDrag(QMouseEvent* e) {
             case DragKind::LineKey: state_->beginGesture(tr("Move Keyframe")); break;
             case DragKind::TrackLine: state_->beginGesture(tr("Track Volume")); break;
             case DragKind::TrackKey: state_->beginGesture(tr("Move Automation Point")); break;
+            case DragKind::TransitionEdge: state_->beginGesture(tr("Transition Duration")); break;
             default: break;
         }
     }
@@ -1835,6 +1858,31 @@ void TimelineWidget::updateDrag(QMouseEvent* e) {
             FrameTime applied = 0;
             state_->updateGesture([&](Project& p, Sequence& sq) { applied = edit::roll(p, sq, a, b, delta).applied; });
             drag_.label = signedTc(applied);
+            break;
+        }
+        case DragKind::TransitionEdge: {
+            // The length follows the pointer: twice its distance from the cut for a dissolve (centred), the
+            // distance itself for a fade.
+            const Sequence* live = state_->sequence();
+            const Transition* t = nullptr;
+            const Track* onTrack = nullptr;
+            for (TrackRef r : allTracks(*live))
+                for (const Transition& x : trackAt(*live, r)->transitions)
+                    if (x.id == drag_.transition) t = &x, onTrack = trackAt(*live, r);
+            if (!t) break;
+            FrameTime cut = -1;
+            for (const Clip& c : onTrack->clips) {
+                if (t->clipA && c.id == t->clipA) cut = c.end();
+                if (!t->clipA && c.id == t->clipB) cut = c.start;
+            }
+            if (cut < 0) break;
+            const FrameTime f = frameAtX(pos.x());
+            const FrameTime reach = drag_.edge == edit::Edge::Out ? f - cut : cut - f;
+            const FrameTime want = t->clipA && t->clipB ? 2 * reach : reach;
+            const Id id = drag_.transition;
+            FrameTime applied = 0;
+            state_->updateGesture([&](Project&, Sequence& sq) { applied = edit::setTransitionDuration(sq, id, want).applied; });
+            drag_.label = tr("Transition %1").arg(QString::fromStdString(formatTimecode(applied, live->fps)));
             break;
         }
         case DragKind::Slip: {
@@ -2024,7 +2072,7 @@ void TimelineWidget::mouseMoveEvent(QMouseEvent* e) {
                 return;
             }
         if (h.kind == HitKind::ClipIn || h.kind == HitKind::ClipOut || h.kind == HitKind::CaptionIn ||
-            h.kind == HitKind::CaptionOut)
+            h.kind == HitKind::CaptionOut || h.kind == HitKind::TransitionEdge)
             viewport()->setCursor(Qt::SizeHorCursor);
         else if (tool_ == Tool::Select) viewport()->unsetCursor();
     }
@@ -2040,7 +2088,7 @@ void TimelineWidget::mouseReleaseEvent(QMouseEvent* e) {
                                      drag_.kind == DragKind::CaptionMove || drag_.kind == DragKind::CaptionIn ||
                                      drag_.kind == DragKind::CaptionOut || drag_.kind == DragKind::Line ||
                                      drag_.kind == DragKind::LineKey || drag_.kind == DragKind::TrackLine ||
-                                     drag_.kind == DragKind::TrackKey);
+                                     drag_.kind == DragKind::TrackKey || drag_.kind == DragKind::TransitionEdge);
     if (gesture) state_->endGesture(true);
     if (drag_.started && (drag_.kind == DragKind::Trim || drag_.kind == DragKind::Roll || drag_.kind == DragKind::Slip || drag_.kind == DragKind::Slide))
         emit trimViewEnded();

@@ -1431,6 +1431,25 @@ Transition* transitionById(Sequence& s, Id id, TrackRef* where) {
     return nullptr;
 }
 
+Result setTransitionDuration(Sequence& s, Id transitionId, FrameTime duration) {
+    TrackRef where;
+    Transition* tr = transitionById(s, transitionId, &where);
+    if (!tr) return Result::fail("Unknown transition");
+    Track* t = trackAt(s, where);
+    if (t->locked) return Result::fail("Track is locked");
+    // The room it has: half of each clip for a dissolve (it is centred on the cut), the whole clip for a fade.
+    FrameTime room = std::numeric_limits<FrameTime>::max();
+    for (const Clip& c : t->clips) {
+        if (c.id != tr->clipA && c.id != tr->clipB) continue;
+        room = std::min(room, tr->clipA && tr->clipB ? 2 * c.duration : c.duration);
+    }
+    if (room == std::numeric_limits<FrameTime>::max()) return Result::fail("The transition's clips are gone");
+    tr->duration = std::clamp<FrameTime>(duration, 2, std::max<FrameTime>(2, room));
+    Result r;
+    r.applied = tr->duration;
+    return r;
+}
+
 bool transitionRange(const Track& t, const Transition& tr, FrameTime& from, FrameTime& to) {
     FrameTime cut = -1;
     for (const auto& c : t.clips) {

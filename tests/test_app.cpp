@@ -4066,6 +4066,26 @@ const auto seq = [this] { return state()->sequence(); };
         state()->newProject();
     }
 
+    void transitionEdgesDragTheirLength() {
+        // Red (0-60) and Blue (60-120) with a 20-frame dissolve over 50-70: dragging its end out to 80 makes it 40.
+        loadDemo();
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        QVERIFY(state()->apply("Dissolve", [red](Project& p, Sequence& s) {
+            return edit::addTransition(p, s, red, edit::Edge::Out, "cross_dissolve", 20);
+        }));
+        const Id id = state()->sequence()->videoTracks[0].transitions.at(0).id;
+        auto length = [&] { return state()->sequence()->videoTracks[0].transitions.at(0).duration; };
+        drag(pointFor(70, V1), pointFor(80, V1));
+        QVERIFY2(std::llabs(length() - 40) <= 2, qPrintable(QString::number(length())));
+        QCOMPARE(state()->selectedTransition(), id);
+        state()->undo();
+        QCOMPARE(length(), FrameTime(20));
+        // The start edge works the same way, from the other side.
+        drag(pointFor(50, V1), pointFor(55, V1));
+        QVERIFY2(std::llabs(length() - 10) <= 2, qPrintable(QString::number(length())));
+        state()->undo();
+    }
+
     void keyframePanelEditsKeys() {
         loadDemo();
         const Id red = clipNamed(*state()->sequence(), "Red")->id;

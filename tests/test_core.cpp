@@ -2978,6 +2978,29 @@ private slots:
         QCOMPARE(std::string(changeKindName(ChangeKind::Trimmed)), std::string("Trimmed"));
     }
 
+    void transitionDurationLimits() {
+        // A 60-frame clip cut to a 20-frame one, with a dissolve; a fade-in on a third clip later.
+        Fixture fx;
+        const Id a = fx.put(V1, 0, 60), b = fx.put(V1, 60, 20), c = fx.put(V1, 200, 30);
+        const Result d = addTransition(fx.p, fx.s(), a, Edge::Out, "cross_dissolve", 10);
+        const Result f = addTransition(fx.p, fx.s(), c, Edge::In, "cross_dissolve", 10);
+        QVERIFY(d.ok && f.ok);
+        // Centred on the cut, half in each clip: at most twice the shorter clip's length, 40 here.
+        QCOMPARE(setTransitionDuration(fx.s(), d.created[0], 30).applied, FrameTime(30));
+        QCOMPARE(setTransitionDuration(fx.s(), d.created[0], 300).applied, FrameTime(40));
+        QCOMPARE(setTransitionDuration(fx.s(), d.created[0], 0).applied, FrameTime(2));
+        FrameTime from = 0, to = 0;
+        setTransitionDuration(fx.s(), d.created[0], 40);
+        QVERIFY(transitionRange(fx.v1(), *transitionById(fx.s(), d.created[0]), from, to));
+        QVERIFY(from == 40 && to == 80);  // exactly fills the short clip
+        // A fade fits its clip.
+        QCOMPARE(setTransitionDuration(fx.s(), f.created[0], 100).applied, FrameTime(30));
+        QVERIFY(!setTransitionDuration(fx.s(), 999999, 10).ok);
+        fx.v1().locked = true;
+        QVERIFY(!setTransitionDuration(fx.s(), f.created[0], 10).ok);
+        (void)b;
+    }
+
     void keyframeRepeat() {
         // 0 at frame 10, 10 at frame 20.
         Param p;
