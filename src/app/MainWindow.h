@@ -214,6 +214,7 @@ private:
     std::vector<double> voiceRef_;  // Match Voice's reference spectrum
     QString voiceRefName_;
     QAction* compareRef_ = nullptr;
+    QAction* trimView_ = nullptr;  // Playback › Two-Up Trim View
     QMenu* recentMenu_ = nullptr;
     QMenu* windowMenu_ = nullptr;
     QLabel* statusInfo_ = nullptr;

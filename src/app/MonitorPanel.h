@@ -42,6 +42,15 @@ public:
     // The divider's x position in the widget.
     double dividerX() const;
 
+    // Two-up (trimming): two pictures side by side, each fitted to its half and
+    // labelled underneath, in place of the picture. A null image shows black.
+    void setTwoUp(const QImage& left, const QImage& right, const QString& leftLabel, const QString& rightLabel);
+    void clearTwoUp();
+    bool twoUp() const { return twoUp_; }
+    QString twoUpLabel(bool right) const { return twoUpLabels_[right ? 1 : 0]; }
+    // Where each half's picture is drawn.
+    QRectF twoUpRect(bool right) const;
+
 signals:
     void dragRequested();
 
@@ -55,6 +64,9 @@ private:
     QImage image_;
     QImage compare_;
     QString compareLabel_;
+    bool twoUp_ = false;
+    QImage twoUpImages_[2];
+    QString twoUpLabels_[2];
     double split_ = 0.5;
     bool draggingSplit_ = false;
     QString placeholder_;
@@ -102,6 +114,13 @@ public:
     Mode mode() const { return mode_; }
     // Re-reads duration, marks and timecode from the state / controller.
     void refresh();
+    // Two-up trim view (as in Premiere, Resolve, Avid and Final Cut): while an
+    // edit is trimmed, the program frames either side of it (-1: none, shown
+    // black) side by side, each labelled. Rendered in the background at the
+    // viewer's size, the latest request winning; the picture comes back when it ends.
+    void showTrimView(FrameTime left, FrameTime right, const QString& leftLabel, const QString& rightLabel);
+    void endTrimView();
+    bool trimViewShown() const { return trimView_; }
 
 signals:
     void activated();  // the user interacted with this monitor
@@ -128,6 +147,11 @@ private:
     QLabel* durationLabel_;
     QToolButton* playButton_;
     QComboBox* resolution_ = nullptr;
+
+    void renderTrimView();
+    bool trimView_ = false, trimBusy_ = false, trimPending_ = false;
+    FrameTime trimFrames_[2] = {-1, -1};
+    QString trimLabels_[2];
 };
 
 }  // namespace montage

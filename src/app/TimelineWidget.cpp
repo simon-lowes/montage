@@ -1468,7 +1468,48 @@ void TimelineWidget::updateDrag(QMouseEvent* e) {
         }
         default: break;
     }
+    if (drag_.kind == DragKind::Trim || drag_.kind == DragKind::Roll || drag_.kind == DragKind::Slip || drag_.kind == DragKind::Slide)
+        emitTrimView();
     viewport()->update();
+}
+
+void TimelineWidget::emitTrimView() {
+    const Sequence* s = state_->sequence();
+    const auto at = s ? edit::locate(*s, drag_.clip) : std::nullopt;
+    if (!at) return;
+    const Track& track = *trackAt(*s, at->track);
+    const Clip& c = track.clips[size_t(at->index)];
+    // The clip on the same track covering a frame, for the labels.
+    auto nameAt = [&](FrameTime f) -> QString {
+        for (const Clip& k : track.clips)
+            if (f >= k.start && f < k.end()) return QString::fromStdString(k.name);
+        return QString();
+    };
+    auto label = [&](FrameTime f) {
+        if (f < 0) return QString();
+        const QString name = nameAt(f), tc = timecodeString(s, f);
+        return name.isEmpty() ? tc : name + QStringLiteral("  ") + tc;
+    };
+    // Outgoing frame on the left, incoming on the right; a slip shows the clip's own first and last frames.
+    FrameTime left = -1, right = -1;
+    switch (drag_.kind) {
+        case DragKind::Trim:
+            left = drag_.edge == edit::Edge::Out ? c.end() - 1 : c.start - 1;
+            right = drag_.edge == edit::Edge::Out ? c.end() : c.start;
+            break;
+        case DragKind::Roll: {
+            // The edit between the two clips, wherever it is now.
+            const Clip* a = edit::clipById(*s, drag_.clip);
+            const Clip* b = edit::clipById(*s, drag_.neighbor);
+            const FrameTime cut = a && b ? (a->start < b->start ? a->end() : b->end()) : c.end();
+            left = cut - 1, right = cut;
+            break;
+        }
+        case DragKind::Slip: left = c.start, right = c.end() - 1; break;
+        case DragKind::Slide: left = c.start - 1, right = c.end(); break;
+        default: return;
+    }
+    emit trimViewChanged(left, right, label(left), label(right));
 }
 
 void TimelineWidget::mouseMoveEvent(QMouseEvent* e) {
@@ -1503,6 +1544,8 @@ void TimelineWidget::mouseReleaseEvent(QMouseEvent* e) {
                                      drag_.kind == DragKind::CaptionOut || drag_.kind == DragKind::Line ||
                                      drag_.kind == DragKind::LineKey);
     if (gesture) state_->endGesture(true);
+    if (drag_.started && (drag_.kind == DragKind::Trim || drag_.kind == DragKind::Roll || drag_.kind == DragKind::Slip || drag_.kind == DragKind::Slide))
+        emit trimViewEnded();
     drag_ = DragState{};
     snapIndicator_ = -1;
     viewport()->update();

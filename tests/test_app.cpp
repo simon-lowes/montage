@@ -278,6 +278,67 @@ private slots:
         state()->setSnapping(true);
     }
 
+    void twoUpTrimView() {
+        loadDemo();
+        state()->setSnapping(false);
+        QAction* option = win_->findChild<QAction*>("twoUpTrim");
+        QVERIFY(option && option->isChecked());
+        MonitorPanel* program = nullptr;
+        for (MonitorPanel* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Program) program = m;
+        QVERIFY(program);
+        ViewerWidget* viewer = program->viewer();
+        // What a half shows, a little in from its corner (clear of the title in the middle).
+        auto colourIn = [&](bool right) {
+            const QRectF r = viewer->twoUpRect(right);
+            const QImage shot = viewer->grab().toImage();
+            const qreal dpr = shot.devicePixelRatio();
+            return shot.pixelColor(int((r.left() + r.width() * 0.1) * dpr), int((r.top() + r.height() * 0.15) * dpr));
+        };
+        auto move = [&](QPoint to) {
+            QMouseEvent m(QEvent::MouseMove, to, viewport()->mapToGlobal(to), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+            QApplication::sendEvent(viewport(), &m);
+        };
+        // Ripple-trimming red's end 10 frames earlier: red's new last frame beside blue's first.
+        timeline()->setTool(TimelineWidget::Tool::Ripple);
+        const QPoint edge = pointFor(60, V1) - QPoint(2, 0);
+        QTest::mousePress(viewport(), Qt::LeftButton, Qt::NoModifier, edge);
+        move(edge - QPoint(int(5 * ppf_), 0));
+        move(edge - QPoint(int(10 * ppf_), 0));
+        QTRY_VERIFY(program->trimViewShown() && viewer->twoUp());
+        QTRY_VERIFY_WITH_TIMEOUT(colourIn(false).red() > 150 && colourIn(false).blue() < 60, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(colourIn(true).blue() > 150 && colourIn(true).red() < 60, 5000);
+        QVERIFY2(viewer->twoUpLabel(false).startsWith("Red") && viewer->twoUpLabel(true).startsWith("Blue"),
+                 qPrintable(viewer->twoUpLabel(false) + " | " + viewer->twoUpLabel(true)));
+        const FrameTime cut = clipNamed(*state()->sequence(), "Blue")->start;
+        QVERIFY(viewer->twoUpLabel(true).endsWith(timecodeString(state()->sequence(), cut)));
+        // Letting go brings the picture back.
+        QTest::mouseRelease(viewport(), Qt::LeftButton, Qt::NoModifier, edge - QPoint(int(10 * ppf_), 0));
+        QVERIFY(!program->trimViewShown() && !viewer->twoUp());
+        // A slip shows the clip's own first and last frames: blue on both sides.
+        state()->undo();
+        timeline()->setTool(TimelineWidget::Tool::Slip);
+        const QPoint body = pointFor(90, V1);
+        QTest::mousePress(viewport(), Qt::LeftButton, Qt::NoModifier, body);
+        move(body + QPoint(int(4 * ppf_), 0));
+        move(body + QPoint(int(8 * ppf_), 0));
+        QTRY_VERIFY(viewer->twoUp());
+        QTRY_VERIFY_WITH_TIMEOUT(colourIn(false).blue() > 150 && colourIn(true).blue() > 150, 5000);
+        QTest::mouseRelease(viewport(), Qt::LeftButton, Qt::NoModifier, body + QPoint(int(8 * ppf_), 0));
+        // Turned off, trimming leaves the picture alone.
+        option->trigger();
+        QVERIFY(!option->isChecked());
+        timeline()->setTool(TimelineWidget::Tool::Ripple);
+        QTest::mousePress(viewport(), Qt::LeftButton, Qt::NoModifier, edge);
+        move(edge - QPoint(int(5 * ppf_), 0));
+        move(edge - QPoint(int(10 * ppf_), 0));
+        QVERIFY(!program->trimViewShown() && !viewer->twoUp());
+        QTest::mouseRelease(viewport(), Qt::LeftButton, Qt::NoModifier, edge - QPoint(int(10 * ppf_), 0));
+        option->trigger();
+        timeline()->setTool(TimelineWidget::Tool::Select);
+        state()->setSnapping(true);
+    }
+
     void razorTool() {
         loadDemo();
         timeline()->setTool(TimelineWidget::Tool::Razor);

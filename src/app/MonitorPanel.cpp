@@ -17,8 +17,13 @@
 #include <cmath>
 #include <utility>
 
+#include <QFutureWatcher>
+#include <QtConcurrent>
+
 #include "EditorState.h"
 #include "PlaybackController.h"
+#include "media/Image.h"
+#include "render/Compositor.h"
 #include "Theme.h"
 
 namespace montage {
@@ -46,9 +51,45 @@ void ViewerWidget::setSafeMargins(bool on) {
     update();
 }
 
+QRectF ViewerWidget::twoUpRect(bool right) const {
+    // Each half fitted to the picture's shape (the sequence's, from whichever image there is).
+    const double gap = 6, labelH = fontMetrics().height() + 8;
+    const QRectF half(right ? width() / 2.0 + gap / 2 : 0, 0, width() / 2.0 - gap / 2, std::max(1.0, height() - labelH));
+    QSize shape = twoUpImages_[0].isNull() ? twoUpImages_[1].size() : twoUpImages_[0].size();
+    if (shape.isEmpty()) shape = image_.isNull() ? QSize(16, 9) : image_.size();
+    const QSizeF fs = QSizeF(shape).scaled(half.size(), Qt::KeepAspectRatio);
+    return QRectF(half.center().x() - fs.width() / 2, half.center().y() - fs.height() / 2, fs.width(), fs.height());
+}
+
+void ViewerWidget::setTwoUp(const QImage& left, const QImage& right, const QString& leftLabel, const QString& rightLabel) {
+    twoUp_ = true;
+    twoUpImages_[0] = left, twoUpImages_[1] = right;
+    twoUpLabels_[0] = leftLabel, twoUpLabels_[1] = rightLabel;
+    update();
+}
+
+void ViewerWidget::clearTwoUp() {
+    twoUp_ = false;
+    twoUpImages_[0] = twoUpImages_[1] = QImage();
+    update();
+}
+
 void ViewerWidget::paintEvent(QPaintEvent*) {
     QPainter p(this);
     p.fillRect(rect(), QColor(0x0e, 0x0f, 0x11));
+    if (twoUp_) {
+        p.setRenderHint(QPainter::SmoothPixmapTransform);
+        for (int i = 0; i < 2; ++i) {
+            const QRectF r = twoUpRect(i == 1);
+            if (twoUpImages_[i].isNull()) p.fillRect(r, Qt::black);
+            else p.drawImage(r, twoUpImages_[i]);
+            p.setPen(QPen(QColor(255, 255, 255, 60), 1));
+            p.drawRect(r.adjusted(-0.5, -0.5, 0.5, 0.5));
+            p.setPen(QColor(235, 235, 235));
+            p.drawText(QRectF(r.left(), r.bottom() + 2, r.width(), fontMetrics().height() + 4), Qt::AlignCenter, twoUpLabels_[i]);
+        }
+        return;
+    }
     if (image_.isNull()) {
         p.setPen(theme::kTextDim);
         p.drawText(rect(), Qt::AlignCenter, placeholder_);
@@ -378,6 +419,61 @@ FrameTime MonitorPanel::outPoint() const {
     if (mode_ == Mode::Source) return state_->sourceOut();
     const Sequence* s = state_->sequence();
     return s ? s->outPoint : -1;
+}
+
+void MonitorPanel::showTrimView(FrameTime left, FrameTime right, const QString& leftLabel, const QString& rightLabel) {
+    trimView_ = true;
+    trimFrames_[0] = left, trimFrames_[1] = right;
+    trimLabels_[0] = leftLabel, trimLabels_[1] = rightLabel;
+    if (!viewer_->twoUp()) viewer_->setTwoUp({}, {}, leftLabel, rightLabel);
+    if (trimBusy_) trimPending_ = true;
+    else renderTrimView();
+}
+
+void MonitorPanel::endTrimView() {
+    trimView_ = trimPending_ = false;
+    viewer_->clearTwoUp();
+}
+
+void MonitorPanel::renderTrimView() {
+    const std::shared_ptr<const Project> project = controller_->snapshot();
+    const Sequence* s = controller_->sequence();
+    if (!project || !s) return;
+    // Each half at about the size it is shown.
+    const double scale = std::clamp(viewer_->width() * viewer_->devicePixelRatioF() / 2.0 / std::max(1, s->width), 0.1, 1.0);
+    const Id seq = s->id;
+    const bool proxies = controller_->useProxies();
+    const FrameTime frames[2] = {trimFrames_[0], trimFrames_[1]};
+    const QString labels[2] = {trimLabels_[0], trimLabels_[1]};
+    trimBusy_ = true;
+    auto* watcher = new QFutureWatcher<std::pair<QImage, QImage>>(this);
+    connect(watcher, &QFutureWatcher<std::pair<QImage, QImage>>::finished, this, [this, watcher, labels] {
+        const auto images = watcher->result();
+        watcher->deleteLater();
+        trimBusy_ = false;
+        if (!trimView_) return;
+        if (trimPending_) {
+            trimPending_ = false;
+            renderTrimView();  // newer frames wanted: these are already stale
+            return;
+        }
+        viewer_->setTwoUp(images.first, images.second, labels[0], labels[1]);
+    });
+    watcher->setFuture(QtConcurrent::run([project, seq, frames, scale, proxies] {
+        auto one = [&](FrameTime t) -> QImage {
+            const Sequence* sq = project->findSequence(seq);
+            if (!sq || t < 0 || t >= sq->duration()) return {};
+            RenderOptions o;
+            o.scale = scale;
+            o.useProxies = proxies;
+            o.displaySpace = "rec709";
+            const Image img = renderProgramFrame(*project, *sq, t, o);
+            QImage out(img.width, img.height, QImage::Format_RGBA8888);
+            toRgba8(img, out.bits(), size_t(out.bytesPerLine()));
+            return out;
+        };
+        return std::pair<QImage, QImage>{one(frames[0]), one(frames[1])};
+    }));
 }
 
 void MonitorPanel::refresh() {

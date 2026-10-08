@@ -64,6 +64,10 @@ signals:
     void toolChanged(montage::TimelineWidget::Tool tool);
     void clipActivated(montage::Id clip);  // double-click
     void captionActivated(montage::Id track, int index);  // double-click on a caption
+    // While an edit is trimmed, rolled, slipped or slid: the frames either side of it
+    // (timeline frames, -1 for none) and their labels, for a two-up view; then the end.
+    void trimViewChanged(montage::FrameTime left, montage::FrameTime right, const QString& leftLabel, const QString& rightLabel);
+    void trimViewEnded();
 
 protected:
     void paintEvent(QPaintEvent* e) override;
@@ -82,6 +86,7 @@ protected:
     void leaveEvent(QEvent* e) override;
 
 private:
+    void emitTrimView();
     struct Row {
         TrackRef ref;
         int y = 0;

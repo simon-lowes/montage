@@ -224,6 +224,14 @@ void MainWindow::buildPanels() {
     programPanel_ = new MonitorPanel(MonitorPanel::Mode::Program, state_, program_, this);
     new MaskOverlay(state_, programPanel_->viewer());
     connect(programPanel_, &MonitorPanel::exportFrameRequested, this, &MainWindow::exportFrame);
+    connect(timeline_, &TimelineWidget::trimViewChanged, this,
+            [this](FrameTime left, FrameTime right, const QString& leftLabel, const QString& rightLabel) {
+                if (trimView_ && !trimView_->isChecked()) return;
+                // The program's copy of the project is brought up to date a moment later; the two-up needs this update.
+                if (const Sequence* s = state_->sequence()) program_->setProject(state_->project(), s->id);
+                programPanel_->showTrimView(left, right, leftLabel, rightLabel);
+            });
+    connect(timeline_, &TimelineWidget::trimViewEnded, programPanel_, &MonitorPanel::endTrimView);
     bin_ = new MediaBinWidget(state_, this);
     connect(bin_, &MediaBinWidget::openInSource, this, &MainWindow::openInSource);
     connect(bin_, &MediaBinWidget::newTitleRequested, this, &MainWindow::addTitle);
@@ -759,6 +767,12 @@ void MainWindow::buildMenus() {
                          "(VideoToolbox, D3D11, NVDEC, VAAPI) where supported"));
         play->addSeparator();
     }
+    trimView_ = add(play, tr("Two-Up Trim View"), QKeySequence(), [](bool on) { appSettings().setValue("playback/twoUpTrim", on); });
+    trimView_->setObjectName(QStringLiteral("twoUpTrim"));
+    trimView_->setCheckable(true);
+    trimView_->setChecked(appSettings().value("playback/twoUpTrim", true).toBool());
+    trimView_->setToolTip(tr("While trimming, rolling, slipping or sliding, show the frames either side of the edit side by side"));
+    play->addSeparator();
     add(play, tr("&Play / Pause"), QKeySequence(Qt::Key_Space), [this] { activeController()->togglePlay(); });
     add(play, tr("Shuttle &Reverse"), QKeySequence(Qt::Key_J), [this] { activeController()->shuttle(-1); });
     add(play, tr("&Stop"), QKeySequence(Qt::Key_K), [this] { activeController()->shuttle(0); });
