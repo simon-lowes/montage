@@ -81,6 +81,7 @@
 #include "render/RenderCache.h"
 #include "render/Compositor.h"
 #include "render/MusicEdit.h"
+#include "render/VoiceMatch.h"
 #include "render/Exporter.h"
 #include "render/Processing.h"
 
@@ -482,6 +483,8 @@ void MainWindow::buildMenus() {
     add(clipM, tr("Replace with Source Clip"), QKeySequence(), [this] { replaceWithSource(); })
         ->setObjectName(QStringLiteral("replaceWithSource"));
     add(clipM, tr("Fit to Fill"), QKeySequence(), [this] { fitToFill(); })->setObjectName(QStringLiteral("fitToFill"));
+    add(clipM, tr("Set Voice Reference"), QKeySequence(), [this] { setVoiceReference(); })->setObjectName(QStringLiteral("setVoiceReference"));
+    add(clipM, tr("Match Voice to Reference"), QKeySequence(), [this] { matchVoice(); })->setObjectName(QStringLiteral("matchVoice"));
     add(clipM, tr("Add Bar Markers"), QKeySequence(), [this] { addBeatMarkers(false); })->setObjectName(QStringLiteral("addBarMarkers"));
     add(clipM, tr("Add Beat Markers"), QKeySequence(), [this] { addBeatMarkers(true); })->setObjectName(QStringLiteral("addBeatMarkers"));
     add(clipM, tr("Fit Music to Length…"), QKeySequence(), [this] { fitMusicDialog(); })->setObjectName(QStringLiteral("fitMusic"));
@@ -1540,6 +1543,70 @@ const Clip* MainWindow::musicClip() const {
     for (int i = int(s->audioTracks.size()) - 1; i >= 0; --i)
         if (const Clip* c = edit::clipAt(*s, {TrackKind::Audio, i}, t)) return c;
     return nullptr;
+}
+
+bool MainWindow::setVoiceReference() {
+    const Clip* c = musicClip();
+    const Sequence* s = state_->sequence();
+    if (!c || !s) {
+        state_->message(tr("Select the audio clip whose voice is right"));
+        return false;
+    }
+    const Id clip = c->id, seqId = s->id;
+    const QString name = QString::fromStdString(c->name);
+    auto project = std::make_shared<const Project>(state_->project());
+    std::vector<double> spectrum;
+    if (!runWithProgress(this, state_, tr("Listening to the voice..."), [&, project](const auto&, const auto*, std::string* err) {
+            const Sequence* sq = project->findSequence(seqId);
+            const Clip* k = sq ? edit::clipById(*sq, clip) : nullptr;
+            return k && clipSpeechSpectrum(*project, *sq, *k, spectrum, err);
+        }))
+        return false;
+    voiceRef_ = spectrum;
+    voiceRefName_ = name;
+    state_->message(tr("Voice reference: %1. Select dialogue clips and choose Match Voice to Reference.").arg(name), 6000);
+    return true;
+}
+
+int MainWindow::matchVoice() {
+    const Sequence* s = state_->sequence();
+    if (!s) return 0;
+    if (voiceRef_.empty()) {
+        state_->message(tr("Select the clip whose voice is right and choose Clip › Set Voice Reference first"), 5000);
+        return 0;
+    }
+    std::vector<Id> clips;
+    for (Id id : state_->selectedClips())
+        if (auto loc = edit::locate(*s, id); loc && loc->track.kind == TrackKind::Audio) clips.push_back(id);
+    if (clips.empty()) {
+        state_->message(tr("Select the audio clips to match"));
+        return 0;
+    }
+    auto project = std::make_shared<const Project>(state_->project());
+    const Id seqId = s->id;
+    const std::vector<double> reference = voiceRef_;
+    std::map<Id, VoiceEq> fits;
+    if (!runWithProgress(this, state_, tr("Matching voices..."), [&, project](const auto& progress, const auto* cancel, std::string* err) {
+            const Sequence* sq = project->findSequence(seqId);
+            if (!sq) return false;
+            for (size_t i = 0; i < clips.size(); ++i) {
+                if (cancel && cancel->load()) return false;
+                progress(double(i) / double(clips.size()));
+                std::vector<double> spectrum;
+                if (const Clip* k = edit::clipById(*sq, clips[i]); k && clipSpeechSpectrum(*project, *sq, *k, spectrum, err))
+                    fits[clips[i]] = fitVoiceEq(spectrum, reference);
+            }
+            return !fits.empty();
+        }))
+        return 0;
+    state_->edit(tr("Match Voice"), [&](Project& p, Sequence& sq) {
+        for (const auto& [id, eq] : fits)
+            if (Clip* k = edit::clipById(sq, id)) applyVoiceEq(p, *k, eq);
+        return true;
+    });
+    state_->message(tr("Matched %n clip(s) to %1", "", int(fits.size())).arg(voiceRefName_), 5000);
+    inspectorDock_->raise();
+    return int(fits.size());
 }
 
 int MainWindow::addBeatMarkers(bool everyBeat) {

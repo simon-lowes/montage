@@ -62,6 +62,11 @@ public:
     void scriptCutDialog();  // Sequence › Build Cut from Script…
     // Music: markers on the music clip's bars or beats (returns how many), and
     // re-editing it to a length by whole bars (false if it could not).
+    // Match Voice: the selected (or playing) audio clip's voice as the reference, then
+    // EQ the selected audio clips to sound like it. Returns how many were matched.
+    bool setVoiceReference();
+    bool hasVoiceReference() const { return !voiceRef_.empty(); }
+    int matchVoice();
     int addBeatMarkers(bool everyBeat);
     bool fitMusicToLength(FrameTime target);
     void fitMusicDialog();
@@ -191,6 +196,8 @@ private:
     Image colourRef_;       // the look Match Colour aims for
     QString colourRefName_;
     QImage colourRefView_;  // the reference at display size, for the compare
+    std::vector<double> voiceRef_;  // Match Voice's reference spectrum
+    QString voiceRefName_;
     QAction* compareRef_ = nullptr;
     QMenu* recentMenu_ = nullptr;
     QMenu* windowMenu_ = nullptr;

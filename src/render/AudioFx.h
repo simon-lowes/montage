@@ -17,6 +17,8 @@ struct Biquad {
     void highShelf(double fs, double f0, double db);
     void highPass(double fs, double f0, double q = 0.70710678);
     void lowPass(double fs, double f0, double q = 0.70710678);
+    // The filter's gain at `hz`, in dB.
+    double responseDb(double fs, double hz) const;
     float process(int ch, float x) {
         const double y = b0 * x + z1[ch];
         z1[ch] = b1 * x - a1 * y + z2[ch];
@@ -36,9 +38,12 @@ class ParametricEq {
 public:
     void set(double sr, const EqBand& low, const EqBand& b1, const EqBand& b2, const EqBand& b3, const EqBand& high, double outputDb);
     void process(float* buf, int frames);
+    // The whole EQ's gain at `hz`, in dB (output gain included).
+    double responseDb(double hz) const;
 
 private:
     std::array<Biquad, 5> bands_;
+    double sr_ = 48000;
     float output_ = 1;
 };
 

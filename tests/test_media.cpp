@@ -33,7 +33,9 @@
 #include "media/SpeakerSwitch.h"
 #include "media/Tracking.h"
 #include "media/Beats.h"
+#include "render/AudioFx.h"
 #include "render/AutoMix.h"
+#include "render/VoiceMatch.h"
 #include "media/Segmenter.h"
 #include "media/SpeechEnhance.h"
 #include "media/Reframe.h"
@@ -2937,6 +2939,69 @@ private slots:
         const Clip* bedBack = edit::clipById(*back.active(), mus->clip);
         QVERIFY(std::fabs(bedBack->audio.params.at("gain_db").at(0) - (o.effectsLufs - mus->guess.loudness)) < 0.01);
         QVERIFY(!bedBack->audio.params.at("gain_db").animated());  // effects are not ducked
+    }
+
+    void matchVoiceEq() {
+        // JFK as recorded, and as if on a thin, bright microphone: lows down 8 dB, presence up 6 dB.
+        std::vector<float> ref;
+        std::string err;
+        QVERIFY2(decodeMono(MONTAGE_TEST_DATA_DIR "/jfk.wav", 48000, ref, nullptr, &err), err.c_str());
+        fx::ParametricEq mic;
+        mic.set(48000, {120, -8, 1}, {300, 0, 0.9}, {1200, 0, 0.9}, {4000, 6, 0.9}, {8000, 0, 1}, 0);
+        std::vector<float> stereo(ref.size() * 2);
+        for (size_t i = 0; i < ref.size(); ++i) stereo[i * 2] = stereo[i * 2 + 1] = ref[i];
+        mic.process(stereo.data(), int(ref.size()));
+        std::vector<float> other(ref.size());
+        for (size_t i = 0; i < ref.size(); ++i) other[i] = stereo[i * 2];
+        const auto a = speechSpectrum(ref, 48000), b = speechSpectrum(other, 48000);
+        const VoiceEq eq = fitVoiceEq(b, a);
+        qInfo("match voice: low %+.1f, 300 Hz %+.1f, 1.2 kHz %+.1f, 4 kHz %+.1f, high %+.1f dB; %.1f -> %.1f dB apart", eq.lowDb,
+              eq.b1Db, eq.b2Db, eq.b3Db, eq.highDb, eq.beforeDb, eq.afterDb);
+        QVERIFY(eq.beforeDb > 2);
+        QVERIFY(eq.afterDb < 0.5);
+        QVERIFY(std::fabs(eq.lowDb - 8) < 2);
+        QVERIFY(std::fabs(eq.b3Db + 6) < 2);
+        for (double v : {eq.b1Db, eq.b2Db, eq.highDb}) QVERIFY(std::fabs(v) < 2.5);
+        // The same voice needs nothing.
+        const VoiceEq same = fitVoiceEq(a, a);
+        QVERIFY(same.afterDb < 0.05 && std::fabs(same.lowDb) < 0.1 && std::fabs(same.b3Db) < 0.1);
+        // As an effect, tagged so matching again replaces it.
+        Project p = makeDefaultProject();
+        const Effect e = voiceEqEffect(p, eq);
+        QCOMPARE(e.type, std::string("parametric_eq"));
+        QCOMPARE(e.s("match"), std::string("voice"));
+        QCOMPARE(e.p("b3_db", 0), eq.b3Db);
+
+        // Through MCP: the thin clip matched to the reference clip.
+        const std::string refWav = path("voice-ref.wav"), thinWav = path("voice-thin.wav");
+        QVERIFY(writeMonoWav(refWav, ref, 48000) && writeMonoWav(thinWav, other, 48000));
+        Sequence& s = *p.active();
+        Id ids[2];
+        for (int i = 0; i < 2; ++i) {
+            MediaItem m;
+            QVERIFY(probeMedia(i == 0 ? refWav : thinWav, m));
+            m.id = ids[i] = p.newId();
+            p.media.push_back(m);
+            QVERIFY(edit::placeMedia(p, s, m.id, i * 400, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        }
+        const Id refClip = s.audioTracks[0].clips[0].id, thinClip = s.audioTracks[0].clips[1].id;
+        const QString project = QString::fromStdString(path("voices.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_match_voice"},
+                                                     {"arguments", QJsonObject{{"project", project}, {"reference", double(refClip)},
+                                                                               {"clips", QJsonArray{double(thinClip)}}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Clip* matched = edit::clipById(*back.active(), thinClip);
+        QVERIFY(matched && !matched->effects.empty() && matched->effects[0].s("match") == "voice");
+        QVERIFY(std::fabs(matched->effects[0].p("b3_db", 0) + 6) < 2);
     }
 
     void beatsAndFittingMusic() {

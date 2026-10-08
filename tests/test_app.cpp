@@ -44,6 +44,8 @@
 #include "SequenceSettingsDialog.h"
 #include "audio/Plugins.h"
 #include "MainWindow.h"
+#include "media/Beats.h"
+#include "render/AudioFx.h"
 #include "audio/SpeechCleanup.h"
 #include "media/SpeechEnhance.h"
 #include "ModelPacks.h"
@@ -1392,6 +1394,60 @@ private slots:
         const EffectInfo* info = findEffectInfo("enhance_speech");
         QVERIFY(info && !info->hidden);
         QVERIFY(isSourceAudioEffect("enhance_speech"));
+    }
+
+    void matchVoiceToAReference() {
+        // JFK, and JFK as if on a thin, bright microphone.
+        std::vector<float> ref;
+        std::string err;
+        QVERIFY2(decodeMono(MONTAGE_TEST_DATA_DIR "/jfk.wav", 48000, ref, nullptr, &err), err.c_str());
+        fx::ParametricEq mic;
+        mic.set(48000, {120, -8, 1}, {300, 0, 0.9}, {1200, 0, 0.9}, {4000, 6, 0.9}, {8000, 0, 1}, 0);
+        std::vector<float> st(ref.size() * 2);
+        for (size_t i = 0; i < ref.size(); ++i) st[i * 2] = st[i * 2 + 1] = ref[i];
+        mic.process(st.data(), int(ref.size()));
+        std::vector<float> thin(ref.size());
+        for (size_t i = 0; i < ref.size(); ++i) thin[i] = st[i * 2];
+        const QString wav = dir_.path() + "/thin.wav";
+        {
+            WavWriter w;
+            QVERIFY(w.open(wav, 48000, 1));
+            w.write(thin.data(), qint64(thin.size()));
+            QVERIFY(w.close());
+        }
+        state()->newProject();
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav"), wav});
+        QCOMPARE(ids.size(), size_t(2));
+        state()->apply("Place", [&](Project& p, Sequence& s) {
+            edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+            return edit::placeMedia(p, s, ids[1], 400, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        });
+        const Sequence& s = *state()->sequence();
+        QCOMPARE(s.audioTracks[0].clips.size(), size_t(2));
+        const Id good = s.audioTracks[0].clips[0].id, other = s.audioTracks[0].clips[1].id;
+        QVERIFY(win_->findChild<QAction*>("setVoiceReference") && win_->findChild<QAction*>("matchVoice"));
+        // No reference yet: nothing happens.
+        state()->setSelection({other}, false);
+        QCOMPARE(win_->matchVoice(), 0);
+        state()->setSelection({good}, false);
+        QVERIFY(win_->setVoiceReference());
+        state()->setSelection({other}, false);
+        QCOMPARE(win_->matchVoice(), 1);
+        auto eqOf = [&] {
+            const Clip* c = edit::clipById(*state()->sequence(), other);
+            return c && !c->effects.empty() && c->effects[0].type == "parametric_eq" ? &c->effects[0] : nullptr;
+        };
+        QVERIFY(eqOf());
+        QCOMPARE(eqOf()->s("match"), std::string("voice"));
+        QVERIFY2(std::fabs(eqOf()->p("low_db", 0) - 8) < 2, qPrintable(QString::number(eqOf()->p("low_db", 0))));
+        QVERIFY(std::fabs(eqOf()->p("b3_db", 0) + 6) < 2);
+        // Matching again replaces the EQ; one undo takes it off.
+        QCOMPARE(win_->matchVoice(), 1);
+        QCOMPARE(edit::clipById(*state()->sequence(), other)->effects.size(), size_t(1));
+        state()->undo();
+        state()->undo();
+        QVERIFY(edit::clipById(*state()->sequence(), other)->effects.empty());
+        state()->newProject();
     }
 
     void autoMixDialog() {

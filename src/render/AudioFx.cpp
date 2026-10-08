@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <complex>
 
 namespace montage::fx {
 
@@ -38,6 +39,12 @@ void Biquad::highShelf(double fs, double f0, double db) {
         (A + 1) - (A - 1) * cs + sa, 2 * ((A - 1) - (A + 1) * cs), (A + 1) - (A - 1) * cs - sa);
 }
 
+double Biquad::responseDb(double fs, double hz) const {
+    const std::complex<double> z1 = std::polar(1.0, -2 * M_PI * hz / fs), z2 = z1 * z1;
+    const std::complex<double> h = (b0 + b1 * z1 + b2 * z2) / (1.0 + a1 * z1 + a2 * z2);
+    return 20 * std::log10(std::max(1e-12, std::abs(h)));
+}
+
 void Biquad::lowPass(double fs, double f0, double q) {
     const double w0 = 2 * M_PI * clampHz(f0, fs) / fs, cs = std::cos(w0), al = std::sin(w0) / (2 * q);
     set((1 - cs) / 2, 1 - cs, (1 - cs) / 2, 1 + al, -2 * cs, 1 - al);
@@ -58,6 +65,13 @@ void ParametricEq::set(double sr, const EqBand& low, const EqBand& b1, const EqB
     bands_[3].peaking(sr, b3.hz, b3.q, b3.db);
     bands_[4].highShelf(sr, high.hz, high.db);
     output_ = dbToLin(outputDb);
+    sr_ = sr;
+}
+
+double ParametricEq::responseDb(double hz) const {
+    double db = 20 * std::log10(std::max(1e-12f, output_));
+    for (const Biquad& b : bands_) db += b.responseDb(sr_, hz);
+    return db;
 }
 
 void ParametricEq::process(float* buf, int frames) {

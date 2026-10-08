@@ -28,6 +28,7 @@
 #include "media/SpeechEnhance.h"
 #include "render/AutoMix.h"
 #include "render/MusicEdit.h"
+#include "render/VoiceMatch.h"
 #include "media/AutoDuck.h"
 #include "media/Decoder.h"
 #include "media/Transcriber.h"
@@ -960,6 +961,39 @@ void McpServer::Impl::addTools() {
             const int n = applyMix(l.project, s, plan, o);
             save(l);
             return ok(QStringLiteral("Mixed %1 clip(s)").arg(n), QJsonObject{{"clips", clips}, {"changed", n}});
+        });
+
+    add("montage_match_voice", "Match voices",
+        "Make dialogue recorded on another microphone or in another room sound like a reference clip: each clip gets a "
+        "Parametric EQ (first in its effects, replacing an earlier match) fitted to the difference between the voices' "
+        "long-term spectra. Levels are left alone (see montage_auto_mix).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"reference":{"type":"number","description":"The clip that sounds right"},
+            "clips":{"type":"array","items":{"type":"number"}}},"required":["project","reference","clips"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const Clip& ref = clipArg(l, a, "reference");
+            std::vector<double> reference;
+            std::string err;
+            if (!clipSpeechSpectrum(l.project, s, ref, reference, &err)) return fail(QString::fromStdString(err));
+            QJsonArray out;
+            int n = 0;
+            for (const QJsonValue& v : a.value("clips").toArray()) {
+                Clip* c = edit::clipById(s, Id(v.toDouble()));
+                auto loc = c ? edit::locate(s, c->id) : std::nullopt;
+                if (!c || !loc || loc->track.kind != TrackKind::Audio) throw ArgError{QStringLiteral("%1 is not an audio clip").arg(v.toDouble())};
+                std::vector<double> spectrum;
+                if (!clipSpeechSpectrum(l.project, s, *c, spectrum, &err)) return fail(QString::fromStdString(err));
+                const VoiceEq eq = fitVoiceEq(spectrum, reference);
+                applyVoiceEq(l.project, *c, eq);
+                ++n;
+                out.append(QJsonObject{{"clip", double(c->id)}, {"low_db", eq.lowDb}, {"b300_db", eq.b1Db}, {"b1200_db", eq.b2Db},
+                                       {"b4000_db", eq.b3Db}, {"high_db", eq.highDb}, {"difference_before_db", eq.beforeDb},
+                                       {"difference_after_db", eq.afterDb}});
+            }
+            if (n == 0) return fail("No clips to match");
+            save(l);
+            return ok(QStringLiteral("Matched %1 clip(s) to %2").arg(n).arg(QString::fromStdString(ref.name)), QJsonObject{{"clips", out}});
         });
 
     add("montage_find_shots", "Find shots by description",
