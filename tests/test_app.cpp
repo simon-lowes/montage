@@ -45,6 +45,7 @@
 #include "QualityCheckDialog.h"
 #include "ProjectManagerDialog.h"
 #include "MediaBinModel.h"
+#include "ScopesWidget.h"
 #include "LinkMediaDialog.h"
 #include "MediaBinWidget.h"
 #include "SmartBinDialog.h"
@@ -4538,6 +4539,37 @@ const auto seq = [this] { return state()->sequence(); };
         mute->trigger();
         QVERIFY(!program->globalMute());
         QVERIFY(peak(program->heard(4800, 4800)) > 0.1f);
+    }
+
+    void quadScopes() {
+        // A frame with a ramp and colour bars, in all four scopes at once.
+        QImage frame(320, 180, QImage::Format_RGB32);
+        for (int y = 0; y < 180; ++y)
+            for (int x = 0; x < 320; ++x)
+                frame.setPixel(x, y, y < 90 ? qRgb(x * 255 / 319, x * 255 / 319, x * 255 / 319)
+                                            : QColor::fromHsv((x / 40) * 45 % 360, 200, 220).rgb());
+        ScopesWidget scopes;
+        scopes.resize(640, 420);
+        scopes.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&scopes));
+        scopes.setMode(ScopesWidget::Mode::Quad);
+        QCOMPARE(scopes.findChild<QComboBox*>()->currentText(), QString("All Four"));
+        scopes.setFrame(frame, 0);
+        QTRY_VERIFY(scopes.hasSignal());
+        const QImage img = scopes.grab().toImage();
+        // Every quarter holds a trace.
+        const QRect quarters[4] = {QRect(0, 30, 320, 195), QRect(320, 30, 320, 195), QRect(0, 225, 320, 195), QRect(320, 225, 320, 195)};
+        for (const QRect& q : quarters) {
+            int lit = 0;
+            for (int y = q.top(); y <= q.bottom(); ++y)
+                for (int x = q.left(); x <= q.right(); ++x) {
+                    const QColor c = img.pixelColor(x, y);
+                    lit += std::max({c.red(), c.green(), c.blue()}) > 160;
+                }
+            QVERIFY2(lit > 40, qPrintable(QStringLiteral("%1,%2: %3").arg(q.x()).arg(q.y()).arg(lit)));
+        }
+        scopes.setMode(ScopesWidget::Mode::Waveform);
+        QVERIFY(scopes.hasSignal());
     }
 
     void workspaces() {

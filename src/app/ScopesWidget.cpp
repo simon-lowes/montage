@@ -103,6 +103,7 @@ ScopesWidget::ScopesWidget(QWidget* parent) : QWidget(parent) {
     modeBox_->addItem(tr("RGB Parade"));
     modeBox_->addItem(tr("Vectorscope"));
     modeBox_->addItem(tr("Histogram"));
+    modeBox_->addItem(tr("All Four"));
     modeBox_->setSizeAdjustPolicy(QComboBox::AdjustToContents);
     modeBox_->setToolTip(tr("Scope type"));
     row->addWidget(modeBox_);
@@ -189,6 +190,15 @@ void ScopesWidget::computeTrace() {
     case Mode::Parade: analyzeWaveform(true); break;
     case Mode::Vectorscope: analyzeVectorscope(); break;
     case Mode::Histogram: analyzeHistogram(); break;
+    case Mode::Quad:
+        analyzeWaveform(false);
+        quad_[0] = trace_;
+        analyzeWaveform(true);
+        quad_[1] = trace_;
+        analyzeVectorscope();
+        quad_[2] = trace_;
+        analyzeHistogram();
+        break;
     }
 }
 
@@ -320,6 +330,22 @@ void ScopesWidget::paintEvent(QPaintEvent*) {
     case Mode::Parade: paintWaveform(p, area, true); break;
     case Mode::Vectorscope: paintVectorscope(p, area); break;
     case Mode::Histogram: paintHistogram(p, area); break;
+    case Mode::Quad: {
+        // Waveform and parade above, vectorscope and histogram below.
+        const int w2 = area.width() / 2, h2 = area.height() / 2;
+        const QRect cells[4] = {QRect(area.left(), area.top(), w2 - 3, h2 - 3), QRect(area.left() + w2 + 3, area.top(), area.width() - w2 - 3, h2 - 3),
+                                QRect(area.left(), area.top() + h2 + 3, w2 - 3, area.height() - h2 - 3),
+                                QRect(area.left() + w2 + 3, area.top() + h2 + 3, area.width() - w2 - 3, area.height() - h2 - 3)};
+        const QImage single = trace_;
+        for (int i = 0; i < 3; ++i) {
+            trace_ = quad_[size_t(i)];
+            if (i == 2) paintVectorscope(p, cells[2]);
+            else paintWaveform(p, cells[i], i == 1);
+        }
+        trace_ = single;
+        paintHistogram(p, cells[3]);
+        break;
+    }
     }
     if (!haveData_) {
         p.setPen(theme::kTextDim);
