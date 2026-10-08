@@ -832,6 +832,68 @@ colorspaces:
         QVERIFY(near(c[0], 0.8f));
     }
 
+    void toneControls() {
+        Project p;
+        // A grey ramp, 0 to 1.2 across 121 pixels (a little over white, as footage can be).
+        auto ramp = [] {
+            Image img(121, 1);
+            for (int x = 0; x <= 120; ++x) {
+                float* q = img.at(x, 0);
+                q[0] = q[1] = q[2] = x / 100.0f;
+                q[3] = 1;
+            }
+            return img;
+        };
+        auto at = [](const Image& img, float v) { return img.at(int(std::lround(v * 100)), 0)[1]; };
+        auto toned = [&](const char* name, double v) {
+            Image img = ramp();
+            Effect cc = makeEffect(p, "color_correct");
+            cc.params[name] = v;
+            applyVideoEffect(cc, 0, img, 1);
+            return img;
+        };
+        const Image plain = ramp();
+        {
+            Image same = plain;
+            applyVideoEffect(makeEffect(p, "color_correct"), 0, same, 1);
+            for (int x = 0; x <= 120; ++x) QVERIFY(std::fabs(same.at(x, 0)[1] - plain.at(x, 0)[1]) < 1e-6f);
+        }
+        // Each moves its own part of the range and leaves the far end alone.
+        const Image shadowsUp = toned("shadows", 100), highlightsDown = toned("highlights", -100);
+        const Image blacksDown = toned("blacks", -100), whitesUp = toned("whites", 100);
+        QVERIFY2(at(shadowsUp, 0.25f) - 0.25f > 0.15f && std::fabs(at(shadowsUp, 0.9f) - 0.9f) < 0.005f,
+                 qPrintable(QString("%1 %2").arg(at(shadowsUp, 0.25f)).arg(at(shadowsUp, 0.9f))));
+        QVERIFY2(0.75f - at(highlightsDown, 0.75f) > 0.15f && std::fabs(at(highlightsDown, 0.1f) - 0.1f) < 0.005f,
+                 qPrintable(QString("%1 %2").arg(at(highlightsDown, 0.75f)).arg(at(highlightsDown, 0.1f))));
+        QVERIFY(0.05f - at(blacksDown, 0.05f) > 0.08f && std::fabs(at(blacksDown, 0.6f) - 0.6f) < 1e-4f);
+        QVERIFY(at(whitesUp, 0.95f) - 0.95f > 0.08f && std::fabs(at(whitesUp, 0.4f) - 0.4f) < 1e-4f);
+        // Never turns tones over, even with everything pulled against each other.
+        Image fight = ramp();
+        Effect cc = makeEffect(p, "color_correct");
+        cc.params["shadows"] = -100.0, cc.params["blacks"] = 100.0, cc.params["highlights"] = 100.0, cc.params["whites"] = -100.0;
+        applyVideoEffect(cc, 0, fight, 1);
+        for (int x = 1; x <= 120; ++x) QVERIFY2(fight.at(x, 0)[1] >= fight.at(x - 1, 0)[1] - 1e-6f, qPrintable(QString::number(x)));
+        // Colour holds while brightness moves: an orange in the shadows stays the same orange, lighter.
+        Image orange = solid(2, 2, 0.3f, 0.15f, 0.05f);
+        Effect lift = makeEffect(p, "color_correct");
+        lift.params["shadows"] = 100.0;
+        applyVideoEffect(lift, 0, orange, 1);
+        float c[4];
+        rgb(orange, 0, 0, c);
+        QVERIFY2(c[0] > 0.33f && std::fabs(c[1] / c[0] - 0.5f) < 0.01f && std::fabs(c[2] / c[0] - 1 / 6.0f) < 0.01f,
+                 qPrintable(QString("%1 %2 %3").arg(c[0]).arg(c[1]).arg(c[2])));
+        // Vibrance lifts a muted colour much more than a saturated one.
+        auto chroma = [](const float* q) { return std::max({q[0], q[1], q[2]}) - std::min({q[0], q[1], q[2]}); };
+        Image muted = solid(2, 2, 0.5f, 0.45f, 0.4f), vivid = solid(2, 2, 0.8f, 0.1f, 0.05f);
+        Effect vib = makeEffect(p, "color_correct");
+        vib.params["vibrance"] = 100.0;
+        const float m0 = chroma(muted.at(0, 0)), v0 = chroma(vivid.at(0, 0));
+        applyVideoEffect(vib, 0, muted, 1);
+        applyVideoEffect(vib, 0, vivid, 1);
+        QVERIFY2(chroma(muted.at(0, 0)) / m0 > 1.6f && chroma(vivid.at(0, 0)) / v0 < 1.1f,
+                 qPrintable(QString("%1 %2").arg(chroma(muted.at(0, 0)) / m0).arg(chroma(vivid.at(0, 0)) / v0)));
+    }
+
     void curvesAndLuts() {
         auto id = buildCurve("0,0 1,1", 256);
         QVERIFY(near(id[128], 128.0f / 256, 0.002f));

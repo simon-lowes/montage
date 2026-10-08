@@ -122,6 +122,12 @@ std::vector<EffectInfo> buildCatalog() {
                      num("gain_g", "Gain G", 0, 4, 1, 0.005),
                      num("gain_b", "Gain B", 0, 4, 1, 0.005),
                      num("offset", "Offset", -1, 1, 0, 0.005),
+                     // Tone, as in Lumetri's Basic Correction: each moves its own part of the range.
+                     num("highlights", "Highlights", -100, 100, 0, 0.5),
+                     num("shadows", "Shadows", -100, 100, 0, 0.5),
+                     num("whites", "Whites", -100, 100, 0, 0.5),
+                     num("blacks", "Blacks", -100, 100, 0, 0.5),
+                     num("vibrance", "Vibrance", -100, 100, 0, 0.5),
                  },
                  {}});
     c.push_back({"curves", "Curves", EffectCategory::VideoFilter, "Color",

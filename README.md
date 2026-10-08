@@ -33,6 +33,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - **Match Colour** (shot matching, like Premiere's Color Match or Resolve's Shot Match): park on the look you want and choose Clip › Set Colour Reference, then select clips and choose Clip › Match Colour to Reference (Ctrl+Alt+Shift+C). Each clip gets a Color Correct whose per-channel lift, gain and gamma put its shadows, mid-tones and highlights on the reference's.
 - Curves you drag in the Inspector (click to add a point, double-click to remove one), with presets, HSL/vibrance, `.cube` 3D/1D LUTs, black & white, invert
 - **Hue Curves** (like Lumetri's or Resolve's): Hue vs Hue, Hue vs Saturation, Hue vs Luma, Luma vs Saturation and Saturation vs Saturation, each drawn over its own scale; leave a stretch flat and those colours are untouched
+- **Tone controls** on Color Correct, as in Lumetri's Basic Correction: Highlights, Shadows, Whites and Blacks each move their own part of the range and leave the far end alone, keeping each colour's hue as it gets lighter or darker; no combination can turn tones over. Vibrance lifts muted colours much more than already-saturated ones.
 - **Colour wheels** for Lift, Gamma and Gain on Color Correct: drag a puck towards a hue to push the shadows, mid-tones or highlights that way; double-click to centre it
 - **Compare with Reference** (Clip menu): the colour reference beside the current frame in the Program monitor, split by a divider you drag
 - Chroma key with spill suppression, and luma key

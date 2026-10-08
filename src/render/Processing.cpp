@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <array>
 #include <mutex>
 #include <sstream>
 
@@ -55,6 +56,21 @@ void perPixel(Image& img, F fn) {
     });
 }
 
+// A smooth bump: 1 at `centre`, falling to 0 at `width` either side.
+inline float bump(float x, float centre, float width) {
+    const float d = (x - centre) / width;
+    return d * d >= 1 ? 0.0f : (1 - d * d) * (1 - d * d);
+}
+
+// Luma after the tone controls (-1..1 each): shadows and highlights are broad bumps
+// round a quarter and three quarters, blacks and whites reach in from the ends.
+float toneShift(float l, float highlights, float shadows, float whites, float blacks) {
+    const float x = std::max(0.0f, l);
+    const float wBlacks = x < 0.4f ? (1 - x / 0.4f) * (1 - x / 0.4f) : 0.0f;
+    const float wWhites = x > 0.6f ? std::min(1.0f, ((x - 0.6f) / 0.4f) * ((x - 0.6f) / 0.4f)) : 0.0f;
+    return l + 0.25f * (shadows * bump(x, 0.25f, 0.4f) + highlights * bump(x, 0.75f, 0.4f)) + 0.15f * (blacks * wBlacks + whites * wWhites);
+}
+
 void colorCorrect(const Effect& e, FrameTime t, Image& img) {
     const float exposure = std::pow(2.0f, float(e.p("exposure", t)));
     const float contrast = float(e.p("contrast", t, 1));
@@ -74,6 +90,25 @@ void colorCorrect(const Effect& e, FrameTime t, Image& img) {
     float wb[3] = {1 + 0.3f * temp + 0.1f * tint, 1 - 0.25f * tint, 1 - 0.3f * temp + 0.1f * tint};
     float wl = luma(wb[0], wb[1], wb[2]);
     for (float& w : wb) w /= wl;
+    const float highlights = float(e.p("highlights", t)) / 100, shadows = float(e.p("shadows", t)) / 100;
+    const float whites = float(e.p("whites", t)) / 100, blacks = float(e.p("blacks", t)) / 100;
+    const float vibrance = float(e.p("vibrance", t)) / 100;
+    const bool tone = highlights != 0 || shadows != 0 || whites != 0 || blacks != 0;
+    // As a table over 0..2, kept rising, so no setting can turn tones over.
+    constexpr int kTone = 1024;
+    std::array<float, kTone + 1> toneLut{};
+    if (tone)
+        for (int i = 0; i <= kTone; ++i) {
+            toneLut[size_t(i)] = toneShift(2.0f * float(i) / kTone, highlights, shadows, whites, blacks);
+            if (i) toneLut[size_t(i)] = std::max(toneLut[size_t(i)], toneLut[size_t(i - 1)]);
+        }
+    auto toneAt = [&](float l) {
+        if (l <= 0) return l + toneLut[0];
+        if (l >= 2) return l - 2 + toneLut[kTone];
+        const float x = l * kTone / 2;
+        const int i = std::min(kTone - 1, int(x));
+        return toneLut[size_t(i)] + (toneLut[size_t(i + 1)] - toneLut[size_t(i)]) * (x - float(i));
+    };
     perPixel(img, [&](float& r, float& g, float& b, float&) {
         float c[3] = {r, g, b};
         for (int i = 0; i < 3; ++i) {
@@ -85,9 +120,23 @@ void colorCorrect(const Effect& e, FrameTime t, Image& img) {
             c[i] = v;
         }
         float l = luma(c[0], c[1], c[2]);
-        r = l + (c[0] - l) * sat;
-        g = l + (c[1] - l) * sat;
-        b = l + (c[2] - l) * sat;
+        if (tone) {
+            const float to = toneAt(l);
+            // Brightness moves, colour stays: scaled where there is light to scale, shifted in the deepest blacks.
+            const float m = smoothstep(0.02f, 0.08f, l), k = l > 1e-4f ? std::min(8.0f, to / l) : 1.0f;
+            for (float& v : c) v = (v * k) * m + (v + to - l) * (1 - m);
+            l = to;
+        }
+        float s = sat;
+        if (vibrance != 0) {
+            // Muted colours move most, already-saturated ones (and skin, mostly) least.
+            const float mx = std::max({c[0], c[1], c[2]}), mn = std::min({c[0], c[1], c[2]});
+            const float cur = mx > 1e-4f ? clamp01((mx - mn) / mx) : 0.0f;
+            s *= std::max(0.0f, 1 + vibrance * (1 - cur) * (1 - cur));
+        }
+        r = l + (c[0] - l) * s;
+        g = l + (c[1] - l) * s;
+        b = l + (c[2] - l) * s;
     });
 }
 

@@ -715,3 +715,9 @@ All 15 items are in (October 2026). The near misses listed in the roadmap are th
     - stereo width: mono, identity, double, and mono bass below 150 Hz;
     - pitch shift: a 200 Hz harmonic tone to within 0.03 Hz at +4 and -5 semitones, level within 1 dB, onsets within 5 ms, an octave up through the mixer;
     - all of them as clip effects in the mixer.
+- [x] Tone controls on Color Correct (render/Processing `colorCorrect`):
+  - Highlights and Shadows are bumps of luma round 0.75 and 0.25 (0.4 either side, up to 0.25 of a stop's worth); Blacks and Whites reach in from the ends (0.4 wide, up to 0.15).
+  - The shift is built per frame as a table over 0..2 kept rising, so no combination turns tones over; brightness is scaled (shifted in the deepest blacks), so hue and saturation hold.
+  - Vibrance scales saturation by (1 - saturation)², so muted colours move most.
+  - **Tests:** neutral by default; each control moving its own range and leaving the far end within 0.005; a monotonic ramp with all four fighting; an orange in the shadows lightened with its ratios kept; vibrance lifting a muted colour 1.6x and a vivid one under 1.1x.
+
