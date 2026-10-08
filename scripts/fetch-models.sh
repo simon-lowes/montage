@@ -5,6 +5,7 @@
 #   <dir>/speakers       speaker labels     (MONTAGE_SPEAKER_MODEL)
 #   <dir>/clip-vit-b32   Find Shots         (MONTAGE_VISUAL_MODEL)
 #   <dir>/speech-enhance Enhance Speech     (MONTAGE_SPEECH_MODEL)
+#   <dir>/upscale        Super Scale        (MONTAGE_UPSCALE_MODEL)
 #
 #   scripts/fetch-models.sh [dir]      (default: ./models)
 set -euo pipefail
@@ -43,4 +44,7 @@ fetch clip-vit-b32 merges.txt "$CLIP/merges.txt" 9fd691f7c8039210e0fced15865466c
 fetch speech-enhance deepfilternet3.onnx \
   https://huggingface.co/kimtos-labs/denoiser-dfn3/resolve/888f33c41851d7168ae31c3637c323b9e2f3c2a4/denoiser_model.onnx \
   fe5eb64fa2e4154c83f8e4935e82871c850c154387ee892e0ab65fe179e7d8c9
-echo "Models in $DIR: MONTAGE_OBJECT_MODEL=$DIR/edgetam-video MONTAGE_SPEAKER_MODEL=$DIR/speakers MONTAGE_VISUAL_MODEL=$DIR/clip-vit-b32 MONTAGE_SPEECH_MODEL=$DIR/speech-enhance"
+fetch upscale realesr-general-x4v3.onnx \
+  https://huggingface.co/jonathanst29/tinier-upscale-models/resolve/899dc1e4b22bbf1955c2f1739c085edc080cb366/realesr-general-x4v3.onnx \
+  924ebad6532777303582d4ce7811849b88869231a3ae7093e0f21200249df8d5
+echo "Models in $DIR: MONTAGE_OBJECT_MODEL=$DIR/edgetam-video MONTAGE_SPEAKER_MODEL=$DIR/speakers MONTAGE_VISUAL_MODEL=$DIR/clip-vit-b32 MONTAGE_SPEECH_MODEL=$DIR/speech-enhance MONTAGE_UPSCALE_MODEL=$DIR/upscale"

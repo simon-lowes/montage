@@ -29,10 +29,12 @@
 #include "core/Surround.h"
 #include "core/TranscriptEdit.h"
 #include "media/SpeechEnhance.h"
+#include "media/SuperScale.h"
 #include "media/Translator.h"
 #include "render/AutoMix.h"
 #include "render/MusicEdit.h"
 #include "render/VoiceMatch.h"
+#include "media/Analysis.h"
 #include "media/AutoDuck.h"
 #include "media/Decoder.h"
 #include "media/Transcriber.h"
@@ -722,6 +724,8 @@ void McpServer::Impl::addTools() {
                 throw ArgError{QStringLiteral("Unknown effect \"%1\" (see montage_list_effects)").arg(QString::fromStdString(type))};
             if (type == "enhance_speech" && (!speechEnhancerAvailable() || !speechModel().installed()))
                 return fail("Enhance Speech needs its model: run `scripts/fetch-models.sh` or add the effect once in the app");
+            if (type == "super_scale" && (!upscalerAvailable() || !upscaleModel().installed()))
+                return fail("Super Scale needs its model: run `scripts/fetch-models.sh` or add the effect once in the app");
             Effect e = makeEffect(l.project, type);
             const QJsonObject params = a.value("params").toObject();
             for (auto it = params.begin(); it != params.end(); ++it) {
@@ -1120,6 +1124,30 @@ void McpServer::Impl::addTools() {
             return ok(QStringLiteral("%1 mix, %2 track(s) placed").arg(QString::fromStdString(s.audioLayout)).arg(out.size()),
                       QJsonObject{{"layout", QString::fromStdString(s.audioLayout)},
                                   {"channels", layoutChannels(s.audioLayout)}, {"tracks", out}});
+        });
+
+    add("montage_super_scale", "Super Scale a file",
+        "Write a copy of a video or still enlarged 2, 3 or 4 times with Real-ESRGAN, which redraws edges and texture "
+        "instead of blurring them. A video keeps its sound (output .mov is ProRes 422 HQ, others H.264); a still is "
+        "written as the output's image type (.png, .jpg, .tif). For clips in a project, montage_add_effect "
+        "\"super_scale\" enlarges them in place whenever they are shown larger than they were shot. Needs the model "
+        "(scripts/fetch-models.sh, or the app downloads it).",
+        R"json({"type":"object","properties":{"input":{"type":"string"},"output":{"type":"string"},
+            "factor":{"type":"integer","enum":[2,3,4],"default":2},
+            "strength":{"type":"number","default":1,"description":"0..1: how much of the model, the rest plain scaling"}},
+            "required":["input","output"]})json",
+        false, [this](const QJsonObject& a) {
+            const std::string in = absolute(need(a, "input")).toStdString(), out = absolute(need(a, "output")).toStdString();
+            const int factor = a.value("factor").toInt(2);
+            if (factor < 2 || factor > 4) throw ArgError{"\"factor\" must be 2, 3 or 4"};
+            std::string err;
+            if (!createSuperScaled(in, out, factor, std::clamp(a.value("strength").toDouble(1), 0.0, 1.0),
+                                   [this](double f) { progress(f, "Super Scale"); }, nullptr, &err))
+                return fail(QString::fromStdString(err));
+            MediaItem m;
+            probeMedia(out, m);
+            return ok(QStringLiteral("Wrote %1 (%2 x %3)").arg(QString::fromStdString(out)).arg(m.width).arg(m.height),
+                      QJsonObject{{"output", QString::fromStdString(out)}, {"width", m.width}, {"height", m.height}});
         });
 
     add("montage_translate_captions", "Translate captions",

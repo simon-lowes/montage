@@ -206,6 +206,11 @@ std::vector<EffectInfo> buildCatalog() {
                   num("chroma", "Spatial Chroma", 0, 1, 0.6, 0.01), num("noise", "Noise Level % (0 = auto)", 0, 20, 0, 0.1),
                   num("blend", "Blend Original", 0, 1, 0, 0.01)},
                  {}});
+    // Real-ESRGAN on the source frames when the clip is shown larger than it was shot (scaled up, or in a
+    // bigger sequence); nothing happens at its own size or smaller.
+    c.push_back({"super_scale", "Super Scale", EffectCategory::VideoFilter, "Blur & Sharpen",
+                 {pct("strength", "Strength", 0, 100, 100)},
+                 {}});
     c.push_back({"levels", "Levels", EffectCategory::VideoFilter, "Color",
                  {num("in_black", "Input Black", 0, 1, 0, 0.005), num("in_white", "Input White", 0, 1, 1, 0.005),
                   num("gamma", "Gamma", 0.1, 10, 1, 0.01), num("out_black", "Output Black", 0, 1, 0, 0.005),

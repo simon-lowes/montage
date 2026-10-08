@@ -118,6 +118,8 @@ private:
     void addKeywordsDialog(const std::vector<Id>& ids);
     void importInto(const QStringList& files, const QString& bin);
     void createProxies(const std::vector<Id>& ids);
+    // Enlarged copies (2-4x) of videos and stills, written beside them and added to the bin.
+    void createSuperScaleCopies(const std::vector<Id>& ids, int factor);
     void transcribe(const std::vector<Id>& ids);
     void saveColumns();
 

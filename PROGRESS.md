@@ -493,5 +493,12 @@ The second gap analysis (`docs/research/phase3-roadmap.md`, October 2026) ranks 
     - `.lottie` (dotLottie zip) files: ThorVG reads only the JSON, and unzipping them needs a ZIP reader.
     - Lottie text with fonts that are not embedded.
     - Editable vector paths drawn with a pen tool: the shape set covers the common motion graphics.
-- [ ] 14. AI upscaling (M)
+- [x] 14. AI upscaling (M):
+  - **Model:** media/SuperScale runs Real-ESRGAN's realesr-general-x4v3 (SRVGGNetCompact, 1.2M parameters, BSD-3-Clause) on ONNX Runtime. The ONNX export is pinned by revision and SHA-256, and was checked against the official v0.2.5.0 checkpoint run directly in NumPy (largest difference 4e-6).
+  - **Tiling:** tiles are 320 px with 34 px of context, which is the network's whole reach (34 3x3 layers), so tiles join with no difference at all. Alpha is enlarged smoothly and the colour is un-premultiplied for the model. Sizes between 1x and 4x are the model's 4x averaged down; Strength mixes in plain scaling.
+  - **Super Scale clip effect:** at the source stage, the frame is decoded at the media's own size, denoised if asked, then enlarged to the size it is shown. It only runs when that size is larger than the media, and not on proxies, so smaller previews stay fast. The last two results are cached by a sample of their input.
+  - **Copies on disk:** `createSuperScaled` renders a video through a sequence of the new size (ProRes 422 HQ for .mov, else H.264, with its sound), or writes a still as PNG, JPEG or TIFF. It is used by Media bin › Create Super Scale Copy (2x, 3x, 4x, added to the bin), `montage-cli upscale`, and MCP `montage_super_scale` (41 tools). The model is in `scripts/fetch-models.sh`, `montage-cli models` and the CI caches.
+  - **Speed:** on four CPU cores, 480x270 to 1080p takes about 1.1 s per frame, and 1080p to 4K about 4.2 s.
+  - **Tests:** lettering, lines and circles shrunk to a quarter come back 4.3 dB closer than with bilinear (24.7 dB against 20.4 dB), with as much edge energy as the original (6.3 times bilinear's). Half strength is half way. A tiled picture matches a single pass exactly. The effect runs in the compositor and is skipped in a quarter-size preview. A still copy at 4x, and a video copy at 2x through MCP that keeps its sound, are checked. The bin offers the copy.
+  - **Left out:** temporal consistency between frames (Real-ESRGAN works on one frame at a time; video models such as BasicVSR++ are heavier and non-commercial), and GPU execution providers (ONNX Runtime here is CPU only).
 - [ ] 15. AAF export to Pro Tools and Fairlight (L)

@@ -30,6 +30,7 @@
 #include "media/Diarizer.h"
 #include "media/Segmenter.h"
 #include "media/SpeechEnhance.h"
+#include "media/SuperScale.h"
 #include "media/Translator.h"
 #include "media/VisualSearch.h"
 #include "media/Transcriber.h"
@@ -66,6 +67,7 @@ int usage() {
                  "  montage-cli colorspaces\n"
                  "  montage-cli scenes <video> [--sensitivity 0..1]\n"
                  "  montage-cli proxy <video> -o <proxy.mp4> [--width 960]\n"
+                 "  montage-cli upscale <video|image> -o <output> [--factor 2|3|4] [--strength 0..1]  (Super Scale)\n"
                  "  montage-cli loudness <media>\n"
                  "  montage-cli edl <project.montage> [-o out.edl]\n"
                  "  montage-cli otio <project.montage> [-o out.otio]\n"
@@ -572,6 +574,41 @@ int cmdModels() {
     else
         std::printf("  %-22s %6.0f MB  %s\n", speechModel().id.c_str(), double(speechModel().bytes()) / 1e6,
                     speechModel().installed() ? "downloaded" : "");
+    std::printf("\nSuper Scale model (Real-ESRGAN general x4v3; folder: %s)\n", upscaleModel().directory().c_str());
+    if (!upscalerAvailable()) std::printf("  unavailable: this build has no ONNX Runtime\n");
+    else
+        std::printf("  %-22s %6.1f MB  %s\n", upscaleModel().id.c_str(), double(upscaleModel().bytes()) / 1e6,
+                    upscaleModel().installed() ? "downloaded" : "");
+    return 0;
+}
+
+int cmdUpscale(const std::vector<std::string>& args) {
+    if (args.empty()) return usage();
+    std::string out;
+    int factor = 2;
+    double strength = 1;
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (args[i] == "-o" && i + 1 < args.size()) out = args[++i];
+        else if (args[i] == "--factor" && i + 1 < args.size()) factor = std::atoi(args[++i].c_str());
+        else if (args[i] == "--strength" && i + 1 < args.size()) strength = std::atof(args[++i].c_str());
+        else return usage();
+    }
+    if (out.empty() || factor < 2 || factor > 4) return usage();
+    std::signal(SIGINT, [](int) { gCancel = true; });
+    std::string err;
+    const bool ok = createSuperScaled(
+        args[0], out, factor, std::clamp(strength, 0.0, 1.0),
+        [](double f) {
+            std::fprintf(stderr, "\rSuper Scale... %5.1f%%", f * 100.0);
+            std::fflush(stderr);
+        },
+        &gCancel, &err);
+    std::fprintf(stderr, "\n");
+    if (!ok) {
+        std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
+    }
+    std::printf("Wrote %s\n", out.c_str());
     return 0;
 }
 
@@ -864,6 +901,7 @@ int main(int argc, char** argv) {
     if (cmd == "scenes") return cmdScenes(args);
     if (cmd == "proxy") return cmdProxy(args);
     if (cmd == "loudness") return cmdLoudness(args);
+    if (cmd == "upscale") return cmdUpscale(args);
     if (cmd == "bench") return cmdBench(args);
     if (cmd == "captions") return cmdCaptions(args);
     if (cmd == "translate") return cmdTranslate(args);

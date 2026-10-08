@@ -44,6 +44,7 @@
 #include "media/Segmenter.h"
 #include "media/Translator.h"
 #include "media/SpeechEnhance.h"
+#include "media/SuperScale.h"
 #include "media/Reframe.h"
 #include "media/Diarizer.h"
 #include "media/VisualSearch.h"
@@ -836,6 +837,158 @@ private slots:
         QCOMPARE(shape.generator.p("trim_end", 0), 0.0);
         QCOMPARE(shape.generator.p("trim_end", FrameTime(std::llround(bs.fpsValue()))), 100.0);
         QVERIFY(std::fabs(shape.generator.p("stroke_color.g", 0) - 0x88 / 255.0) < 1e-6);
+    }
+
+    void superScaleUpscaling() {
+        if (!upscalerAvailable()) QSKIP("Built without ONNX Runtime");
+        if (!upscaleModel().installed()) QSKIP("Set MONTAGE_UPSCALE_MODEL to the Super Scale model");
+        // A picture with lettering, lines, circles and a soft gradient, shrunk to a quarter and enlarged back.
+        const int W = 256, H = 192;
+        QImage qi(W, H, QImage::Format_RGBA8888_Premultiplied);
+        {
+            QLinearGradient bg(0, 0, W, H);
+            bg.setColorAt(0, QColor(235, 240, 250));
+            bg.setColorAt(1, QColor(250, 230, 210));
+            QPainter pa(&qi);
+            pa.setRenderHint(QPainter::Antialiasing);
+            pa.fillRect(qi.rect(), bg);
+            QFont font("Sans Serif");
+            font.setPixelSize(44);
+            font.setBold(true);
+            pa.setFont(font);
+            pa.setPen(QColor(20, 20, 30));
+            pa.drawText(QRect(0, 10, W, 60), Qt::AlignCenter, "Montage");
+            pa.setPen(QPen(QColor(200, 40, 40), 5));
+            pa.drawEllipse(QPointF(70, 130), 40, 40);
+            pa.setPen(QPen(QColor(30, 90, 200), 6));
+            for (int i = 0; i < 4; ++i) pa.drawLine(130 + i * 28, 95, 150 + i * 28, 175);
+        }
+        Image truth(W, H);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W * 4; ++x) truth.row(y)[x] = qi.constScanLine(y)[x] / 255.0f;
+        const Image small = resizeImage(truth, W / 4, H / 4);
+        QCOMPARE(small.width, 64);
+        const Image plain = resizeImage(small, W, H);
+        Image ai;
+        std::string err;
+        QVERIFY2(superScale(small, W, H, ai, 1.0, &err), err.c_str());
+        QCOMPARE(ai.width, W);
+        auto psnr = [&](const Image& a) {
+            double acc = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x)
+                    for (int c = 0; c < 3; ++c) acc += std::pow(double(a.at(x, y)[c]) - truth.at(x, y)[c], 2);
+            return 10 * std::log10(1.0 / (acc / (double(W) * H * 3)));
+        };
+        // Edges: the sum of squared differences between neighbours (blur lowers it).
+        auto edges = [&](const Image& a) {
+            double acc = 0;
+            for (int y = 0; y < H - 1; ++y)
+                for (int x = 0; x < W - 1; ++x)
+                    for (int c = 0; c < 3; ++c)
+                        acc += std::pow(double(a.at(x + 1, y)[c]) - a.at(x, y)[c], 2) + std::pow(double(a.at(x, y + 1)[c]) - a.at(x, y)[c], 2);
+            return acc;
+        };
+        const double pPlain = psnr(plain), pAi = psnr(ai);
+        QVERIFY2(pAi > pPlain + 1.0, qPrintable(QString("plain %1 dB, Super Scale %2 dB").arg(pPlain).arg(pAi)));
+        QVERIFY2(edges(ai) > 1.3 * edges(plain) && edges(ai) < 1.2 * edges(truth),
+                 qPrintable(QString("%1 %2 %3").arg(edges(plain)).arg(edges(ai)).arg(edges(truth))));
+        // Half strength is half way between plain scaling and the model.
+        Image half;
+        QVERIFY(superScale(small, W, H, half, 0.5));
+        QVERIFY(std::fabs(half.at(100, 40)[0] - 0.5f * (plain.at(100, 40)[0] + ai.at(100, 40)[0])) < 1e-5f);
+        // Not larger than it is: plain resizing, the model not used.
+        Image same;
+        QVERIFY(superScale(small, 64, 48, same));
+        QCOMPARE(same.px, small.px);
+
+        // Tiles join without seams: a picture wider than a tile matches a single pass over a part of it.
+        Image wide(400, 60);
+        for (int y = 0; y < 60; ++y)
+            for (int x = 0; x < 400; ++x) {
+                float* p = wide.at(x, y);
+                p[0] = 0.5f + 0.4f * float(std::sin(x * 0.37) * std::cos(y * 0.23));
+                p[1] = (x / 7 + y / 5) % 2 ? 0.8f : 0.2f;
+                p[2] = float(x) / 400;
+                p[3] = 1;
+            }
+        Image tiled, part;
+        QVERIFY(superScale4x(wide, tiled, &err));
+        Image crop(150, 60);
+        for (int y = 0; y < 60; ++y) std::copy_n(wide.at(250, y), 150 * 4, crop.at(0, y));
+        QVERIFY(superScale4x(crop, part, &err));
+        double worst = 0;
+        for (int y = 0; y < 240; ++y)
+            for (int x = (290 - 250) * 4; x < 600; ++x)  // past the crop's own edge effects, across the tile join at 320
+                for (int c = 0; c < 3; ++c) worst = std::max(worst, double(std::fabs(part.at(x, y)[c] - tiled.at(1000 + x, y)[c])));
+        QVERIFY2(worst < 1e-3, qPrintable(QString::number(worst)));
+
+        // As a clip effect: a still shown four times its size goes through the model; without it, plain scaling.
+        const QString png = QString::fromStdString(path("small.png"));
+        {
+            QImage q(64, 48, QImage::Format_RGBA8888);
+            for (int y = 0; y < 48; ++y)
+                for (int x = 0; x < 64; ++x) {
+                    const float* p = small.at(x, y);
+                    q.setPixelColor(x, y, QColor::fromRgbF(p[0], p[1], p[2], 1));
+                }
+            QVERIFY(q.save(png));
+        }
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = W;
+        s.height = H;
+        MediaItem m = probeOrFail(p, png.toStdString());
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 30, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Image without = renderSequenceFrame(p, s, 5, {});
+        s.videoTracks[0].clips[0].effects.push_back(makeEffect(p, "super_scale"));
+        const Image with = renderSequenceFrame(p, s, 5, {});
+        QVERIFY2(psnr(with) > psnr(without) + 1.0, qPrintable(QString("%1 %2").arg(psnr(without)).arg(psnr(with))));
+        QVERIFY2(edges(with) > 1.3 * edges(without), qPrintable(QString("%1 %2").arg(edges(without)).arg(edges(with))));
+        // A quarter-size preview does not run it (the clip is not shown larger than it is there).
+        RenderOptions quarter;
+        quarter.scale = 0.25;
+        const Image preview = renderSequenceFrame(p, s, 5, quarter);
+        QCOMPARE(preview.width, 64);
+
+        // A copy on disk: the still four times larger, as a PNG.
+        const std::string bigPng = path("small (Super Scale 4x).png");
+        QVERIFY2(createSuperScaled(png.toStdString(), bigPng, 4, 1.0, {}, nullptr, &err), err.c_str());
+        MediaItem bm;
+        QVERIFY(probeMedia(bigPng, bm));
+        QCOMPARE(bm.width, W);
+        QCOMPARE(bm.height, H);
+        // A short video, twice as large, its sound kept: through MCP.
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 96;
+        gs.height = 64;
+        gs.fps = {25, 1};
+        edit::overwrite(gen, gs, {TrackKind::Video, 0}, makeGeneratorClip(gen, "bars", 10));
+        MediaItem tone = probeOrFail(gen, MONTAGE_TEST_DATA_DIR "/jfk.wav");
+        gen.media.push_back(tone);
+        QVERIFY(edit::placeMedia(gen, gs, tone.id, 0, 0, 10, {TrackKind::Video, 1}, {TrackKind::Audio, 0}, false).ok);
+        ExportSettings vs = findExportPreset("H.264 - High Quality")->settings;
+        vs.path = path("bars.mp4");
+        QVERIFY2(exportSequence(gen, gs, vs, nullptr, nullptr, &err), err.c_str());
+        McpServer server;
+        const QString out = QString::fromStdString(path("bars-2x.mov"));
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_super_scale"},
+                                                     {"arguments", QJsonObject{{"input", QString::fromStdString(vs.path)}, {"output", out}, {"factor", 2}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        MediaItem vm;
+        QVERIFY(probeMedia(out.toStdString(), vm));
+        QCOMPARE(vm.width, 192);
+        QCOMPARE(vm.height, 128);
+        QVERIFY(vm.hasAudio);
+        QCOMPARE(vm.videoCodec, std::string("prores"));
+        QVERIFY(std::fabs(vm.duration - 0.4) < 0.05);
     }
 
     void videoNoiseReductionOnFootage() {

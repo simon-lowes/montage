@@ -14,6 +14,7 @@
 #include <QTimer>
 
 #include "media/Segmenter.h"
+#include "media/SuperScale.h"
 #include "media/SpeechEnhance.h"
 
 namespace montage {
@@ -160,6 +161,15 @@ bool ensureObjectModel(QWidget* parent) {
 }
 
 bool ensureEffectModel(QWidget* parent, const std::string& type) {
+    if (type == "super_scale") {
+        if (!upscalerAvailable()) {
+            QMessageBox::information(parent, QObject::tr("Super Scale"),
+                                     QObject::tr("This build of Montage cannot use Super Scale: it was built without ONNX Runtime."));
+            return false;
+        }
+        return ensureModelPack(parent, upscaleModel(), QObject::tr("Super Scale"),
+                               QObject::tr("Super Scale uses Real-ESRGAN (BSD-3-Clause), an image model that runs on this computer."));
+    }
     if (type != "enhance_speech") return true;
     if (!speechEnhancerAvailable()) {
         QMessageBox::information(parent, QObject::tr("Enhance Speech"),

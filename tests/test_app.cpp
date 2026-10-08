@@ -713,7 +713,36 @@ private slots:
             QVERIFY(std::fabs(m->duration - 2.0) < 1e-6);
             QCOMPARE(m->fps.num, 25);
         }
+        // Stills and footage offer a Super Scale copy (2x, 3x, 4x); graphics drawn at any size do not.
+        const QString png = dir_.path() + "/still.png";
+        {
+            QImage q(32, 24, QImage::Format_RGB32);
+            q.fill(Qt::darkCyan);
+            QVERIFY(q.save(png));
+        }
+        const auto still = state()->importFiles({png});
+        QCOMPARE(still.size(), size_t(1));
+        auto* bin = win_->findChild<MediaBinWidget*>();
+        auto* icons = bin->findChild<QAbstractItemView*>("mediaIcons");
+        QVERIFY(bin && icons);
+        bin->setView(MediaBinWidget::View::Icons);
+        auto superScaleChoices = [&](Id id) {
+            bin->selectMedia({id});
+            int found = -1;
+            QTimer::singleShot(0, this, [&] {
+                auto* menu = qobject_cast<QMenu*>(QApplication::activePopupWidget());
+                if (!menu) return;
+                auto* sub = menu->findChild<QMenu*>("superScaleMenu");
+                found = sub && sub->menuAction()->isVisible() ? int(sub->actions().size()) : 0;
+                menu->close();
+            });
+            emit icons->customContextMenuRequested(icons->visualRect(icons->currentIndex()).center());
+            return found;
+        };
+        QCOMPARE(superScaleChoices(still[0]), 3);
         state()->newProject();
+        win_->activateWindow();  // the context menu took the focus
+        QVERIFY(QTest::qWaitForWindowActive(win_.get()));
     }
 
     void renderAndReplaceInTheTimeline() {

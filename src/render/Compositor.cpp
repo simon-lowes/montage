@@ -7,6 +7,10 @@
 #include <QPainterPath>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <deque>
+#include <memory>
+#include <mutex>
 
 #include "AudioFx.h"
 #include "ColorSpace.h"
@@ -22,6 +26,7 @@
 #include "core/Surround.h"
 #include "core/History.h"
 #include "media/MediaPool.h"
+#include "media/SuperScale.h"
 
 namespace montage {
 
@@ -245,6 +250,44 @@ double effectPixelScale(const Clip& c, FrameTime lt, double sx, double mw, int s
     return srcWidth / std::max(1.0, mw * fitX);
 }
 
+const Effect* superScaleEffect(const Clip& c) {
+    for (const Effect& e : c.effects)
+        if (e.type == "super_scale" && e.enabled) return &e;
+    return nullptr;
+}
+
+// The last few Super Scale results, by what went in (sampled) and the size asked for: a paused or
+// repainted frame is not run through the model again.
+bool cachedSuperScale(const Image& in, int w, int h, double strength, Image& out) {
+    uint64_t key = 1469598103934665603ULL;
+    auto mix = [&](uint64_t v) { key = (key ^ v) * 1099511628211ULL; };
+    mix(uint64_t(in.width)), mix(uint64_t(in.height)), mix(uint64_t(w)), mix(uint64_t(h)), mix(uint64_t(std::lround(strength * 1000)));
+    const size_t step = std::max<size_t>(1, in.px.size() / 8192);
+    for (size_t i = 0; i < in.px.size(); i += step) {
+        uint32_t bits;
+        std::memcpy(&bits, &in.px[i], 4);
+        mix(bits);
+    }
+    static std::mutex m;
+    static std::deque<std::pair<uint64_t, std::shared_ptr<const Image>>> cache;
+    {
+        std::lock_guard lock(m);
+        for (const auto& [k, img] : cache)
+            if (k == key) {
+                out = *img;
+                return true;
+            }
+    }
+    Image result;
+    if (!superScale(in, w, h, result, strength)) return false;
+    auto shared = std::make_shared<const Image>(result);
+    std::lock_guard lock(m);
+    cache.emplace_front(key, shared);
+    if (cache.size() > 2) cache.pop_back();
+    out = std::move(result);
+    return true;
+}
+
 const Effect* denoiseEffect(const Clip& c) {
     for (const Effect& e : c.effects)
         if (e.type == "video_denoise" && e.enabled) return &e;
@@ -454,6 +497,18 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             g = geometryFor(c.motion, lt, mw, mh, SW, SH);
             int w, h;
             sourceSize(g, o.scale, int(mw), int(mh), w, h);
+            // Super Scale: shown larger than it was shot, the frame is decoded at its own size and enlarged by
+            // the model at the end (not on proxies, which are for speed).
+            const Effect* ss = superScaleEffect(c);
+            // The size it is shown at (decoding stops at the media's own size), up to four times that.
+            const int outW = int(std::ceil(std::clamp(g.mw * std::fabs(g.sx) * o.scale, 1.0, 4.0 * mw)));
+            const int outH = int(std::ceil(std::clamp(g.mh * std::fabs(g.sy) * o.scale, 1.0, 4.0 * mh)));
+            const bool upscale = ss && path == m->path && (outW > int(mw) + 1 || outH > int(mh) + 1) &&
+                                 ss->p("strength", lt, 100) > 0 && upscalerAvailable() && upscaleModel().installed();
+            if (upscale) {
+                w = int(mw);
+                h = int(mh);
+            }
             double sec = 0;
             if (m->kind == MediaKind::Video) {
                 sec = c.sourceFrameAt(t) / seq.fpsValue();
@@ -513,6 +568,11 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                 applyDenoise(*nr, lt, src, around, motion, effectPixelScale(c, lt, g.sx, mw, src.width),
                              m->kind == MediaKind::Video ? sec : -1);
             }
+            if (upscale) {
+                Image big;
+                src = cachedSuperScale(src, outW, outH, ss->p("strength", lt, 100) / 100, big) ? std::move(big)
+                                                                                                : resizeImage(src, outW, outH);
+            }
             // Input transform: the media's space into the sequence's working space.
             convertColor(src, mediaColorSpace(*m), sequenceColorSpace(seq), seq.hdrPeakNits);
         } else {
@@ -523,7 +583,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
     // Filters run in source space (before the fixed transform), like most NLEs.
     const double pixelScale = effectPixelScale(c, lt, g.sx, mw, src.width);
     for (const auto& e : c.effects)
-        if (e.type != "video_denoise") applyVideoEffect(e, lt, src, pixelScale, sourceSeconds);  // that ran on the source
+        if (e.type != "video_denoise" && e.type != "super_scale") applyVideoEffect(e, lt, src, pixelScale, sourceSeconds);  // those ran on the source
     if (identityLayer(src, g, SW, SH, o.scale)) return src;  // a full-frame clip: no copy
     return transformLayer(src, g, SW, SH, o.scale);
 }

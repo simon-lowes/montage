@@ -37,6 +37,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - **Compare with Reference** (Clip menu): the colour reference beside the current frame in the Program monitor, split by a divider you drag
 - Chroma key with spill suppression, and luma key
 - Levels, Posterize, Glow, Film Grain (new each frame, strongest in the mid-tones), Directional Blur, Chromatic Aberration, Lens Distortion (barrel or pincushion), Letterbox (2.39, 2, 1.85, 4:3, 1:1, 9:16)
+- **Super Scale** (like Resolve's Super Scale): Real-ESRGAN (BSD-3-Clause, 4.6 MB, downloaded the first time) enlarges footage and stills up to four times, redrawing edges and texture instead of blurring them. As a clip effect it works whenever the clip is shown larger than it was shot (scaled up, or SD or HD in a bigger sequence), and does nothing in smaller previews. Media bin › Create Super Scale Copy (2x, 3x, 4x) writes an enlarged copy beside the original (ProRes for video, with its sound; PNG for stills), as does `montage-cli upscale`. On a test picture shrunk to a quarter, it restores 4.3 dB more than plain scaling and as much edge detail as the original had. It is slow on a CPU (on four cores, about 1 s a frame from 480x270 and 4 s from 960x540, since the model always works at 4x), so render with Render In to Out or make a copy.
 - **Video Noise Reduction** (like Resolve's temporal and spatial NR): up to three frames either side are warped onto the frame along the optical flow and averaged where they match it, so moving pictures are cleaned without ghosting; then an edge-preserving pass on luma and chroma takes out what is left, more where the temporal pass could not help. The noise level is measured from each frame, or set by hand. It runs on the source frames before the clip's other effects, and works under a mask (for example only the sky or a face). On a test clip, temporal and spatial together cut the noise by 12 dB, and edges keep 98 % of their contrast. It is heavy: use Render In to Out for real-time playback.
 - Corner Pin: four keyframeable corners map the picture onto any quadrilateral, for screen replacements. The corners show in the Program monitor to drag onto the surface.
 - Masks on every video effect:
@@ -272,6 +273,7 @@ montage-cli frame cut.montage --at 00:00:05:12 -o poster.png
 montage-cli scenes interview.mp4 --sensitivity 0.6           # list shot changes
 montage-cli proxy a.mov -o a_proxy.mp4 --width 960
 montage-cli loudness mix.wav                                 # integrated LUFS and peak
+montage-cli upscale old-sd.mp4 -o hd.mov --factor 3          # Super Scale copy (Real-ESRGAN)
 montage-cli edl cut.montage -o cut.edl                       # CMX 3600 EDL
 montage-cli otio cut.montage -o cut.otio                     # OpenTimelineIO
 montage-cli xml cut.montage -o cut.xml                       # Final Cut Pro 7 XML (Premiere, Resolve)
@@ -304,7 +306,7 @@ Its tools work on `.montage` files by path. Each edit is saved at once, and the 
 - transcribe (with speaker labels), translate caption tracks, find spoken phrases in the cut, cut by transcript (phrases, filler words, long pauses, optionally with Smooth Cuts), and build a cut from a script;
 - find shots by description;
 - log media (ratings, labels, keywords, metadata fields, bins), make subclips, auto-tag shots, and find media by text or smart-bin rules, optionally saving the rules as a smart bin;
-- add shape layers (drawn on if asked);
+- add shape layers (drawn on if asked), and write Super Scale copies of videos and stills;
 - make a first mix (roles, levels, dialogue rides, ducking), set up a 5.1 or 7.1 mix and place tracks in it, match voices to a reference, mark a music clip's bars or beats and fit music to a length, duck music under dialogue, match clips' colour to a shot, add adjustment layers, and make a reframed copy of the cut at another aspect ratio;
 - return a rendered frame as an image so the agent can check its work;
 - render with any preset, with progress, optionally folding surround down to stereo and writing stems;

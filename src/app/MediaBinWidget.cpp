@@ -965,6 +965,16 @@ void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos)
         menu.addAction(tr("Create Multicam Clip..."), this, [this, sources] { emit createMulticamRequested(sources); })
             ->setObjectName(QStringLiteral("createMulticam"));
     }
+    std::vector<Id> scalable;  // footage and stills, not graphics drawn at any size
+    for (Id id : pictures)
+        if (const MediaItem* m = state_->project().findMedia(id); m && m->videoCodec != "svg" && m->videoCodec != "lottie")
+            scalable.push_back(id);
+    if (!scalable.empty()) {
+        menu.addSeparator();
+        QMenu* ss = menu.addMenu(tr("Create Super Scale Copy"));
+        ss->setObjectName(QStringLiteral("superScaleMenu"));
+        for (int f : {2, 3, 4}) ss->addAction(tr("%1x Larger").arg(f), this, [this, scalable, f] { createSuperScaleCopies(scalable, f); });
+    }
     if (!videos.empty()) {
         menu.addSeparator();
         menu.addAction(tr("Create Proxy Media"), this, [this, videos] { createProxies(videos); });
@@ -995,6 +1005,62 @@ void MediaBinWidget::transcribe(const std::vector<Id>& ids) {
     TranscribeDialog dlg(int(ids.size()), this);
     if (dlg.exec() != QDialog::Accepted) return;
     startTranscription(state_, ids, dlg.options(), this);
+}
+
+void MediaBinWidget::createSuperScaleCopies(const std::vector<Id>& ids, int factor) {
+    if (!ensureEffectModel(window(), "super_scale")) return;
+    struct Job {
+        std::string src, dst;
+    };
+    std::vector<Job> jobs;
+    for (Id id : ids) {
+        const MediaItem* m = state_->project().findMedia(id);
+        if (!m) continue;
+        // Beside the original: "<name> (Super Scale 2x).mov", or .png for a still.
+        const QFileInfo fi(QString::fromStdString(m->path));
+        const QString dst = fi.absolutePath() + "/" + fi.completeBaseName() + tr(" (Super Scale %1x)").arg(factor) +
+                            (m->kind == MediaKind::Image ? ".png" : ".mov");
+        jobs.push_back({m->path, dst.toStdString()});
+    }
+    if (jobs.empty()) return;
+    auto* dlg = new QProgressDialog(tr("Super Scale..."), tr("Cancel"), 0, 1000, this);
+    dlg->setWindowModality(Qt::WindowModal);
+    dlg->setMinimumDuration(300);
+    auto cancel = std::make_shared<std::atomic<bool>>(false);
+    connect(dlg, &QProgressDialog::canceled, this, [cancel] { *cancel = true; });
+    auto* watcher = new QFutureWatcher<QStringList>(this);
+    const QString bin = smart_ ? QString() : bin_;
+    connect(watcher, &QFutureWatcher<QStringList>::finished, this, [this, watcher, dlg, jobs, bin] {
+        const QStringList errors = watcher->result();
+        dlg->close();
+        dlg->deleteLater();
+        watcher->deleteLater();
+        QStringList made;
+        for (const auto& j : jobs)
+            if (QFileInfo::exists(QString::fromStdString(j.dst))) made << QString::fromStdString(j.dst);
+        if (!made.isEmpty()) importInto(made, bin);
+        if (!errors.isEmpty()) QMessageBox::warning(this, tr("Super Scale"), errors.join("\n"));
+        else state_->message(tr("Super Scale: %n copy/copies added to the bin", "", int(made.size())), 6000);
+    });
+    QPointer<QProgressDialog> guard(dlg);
+    watcher->setFuture(QtConcurrent::run([jobs, cancel, guard, factor]() {
+        QStringList errors;
+        for (size_t i = 0; i < jobs.size(); ++i) {
+            std::string err;
+            auto progress = [&](double f) {
+                const int v = int((double(i) + f) / double(jobs.size()) * 1000);
+                QMetaObject::invokeMethod(qApp, [guard, v] {
+                    if (guard) guard->setValue(v);
+                }, Qt::QueuedConnection);
+            };
+            if (!createSuperScaled(jobs[i].src, jobs[i].dst, factor, 1.0, progress, cancel.get(), &err)) {
+                QFile::remove(QString::fromStdString(jobs[i].dst));
+                if (*cancel) break;
+                errors << QString::fromStdString(err);
+            }
+        }
+        return errors;
+    }));
 }
 
 void MediaBinWidget::createProxies(const std::vector<Id>& ids) {
