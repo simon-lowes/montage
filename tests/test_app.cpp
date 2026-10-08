@@ -3609,6 +3609,29 @@ const auto seq = [this] { return state()->sequence(); };
         state()->newProject();
     }
 
+    void keyframeRepeatFromThePanel() {
+        loadDemo();
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        QVERIFY(state()->edit("Keys", [red](Project&, Sequence& s) {
+            Clip* c = edit::clipById(s, red);
+            c->motion.params["rotation"].addKey(0, 0);
+            c->motion.params["rotation"].addKey(10, 90);
+            return true;
+        }));
+        state()->setSelection({red}, false);
+        win_->raisePanel("keyframes");
+        auto* panel = win_->findChild<KeyframePanel*>();
+        QTRY_COMPARE(panel->clip(), red);
+        QVERIFY(!panel->setRepeat(Repeat::Loop));  // nothing selected
+        panel->select({{panel->rows().front().address, 10}});
+        QVERIFY(panel->setRepeat(Repeat::Offset));
+        const Param& rot = edit::clipById(*state()->sequence(), red)->motion.params.at("rotation");
+        QCOMPARE(rot.repeat, Repeat::Offset);
+        QCOMPARE(rot.at(25), 225.0);  // spinning on: 180 + half of 90
+        state()->undo();
+        QCOMPARE(edit::clipById(*state()->sequence(), red)->motion.params.at("rotation").repeat, Repeat::Hold);
+    }
+
     void keyframePanelEditsKeys() {
         loadDemo();
         const Id red = clipNamed(*state()->sequence(), "Red")->id;

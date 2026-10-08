@@ -35,8 +35,9 @@ void keyHandles(const std::vector<Keyframe>& keys, size_t i, double& inDt, doubl
     }
 }
 
-double Param::at(FrameTime t) const {
-    if (keys.empty()) return value;
+namespace {
+// The value of keys at t, holding the first and last values outside them.
+double evalKeys(const std::vector<Keyframe>& keys, FrameTime t) {
     if (t <= keys.front().t) return keys.front().v;
     if (t >= keys.back().t) return keys.back().v;
     auto it = std::upper_bound(keys.begin(), keys.end(), t,
@@ -68,6 +69,23 @@ double Param::at(FrameTime t) const {
     }
     if (a.interp == Interp::Smooth) u = u * u * (3.0 - 2.0 * u);
     return a.v + (b.v - a.v) * u;
+}
+
+}  // namespace
+
+double Param::at(FrameTime t) const {
+    if (keys.empty()) return value;
+    if (repeat != Repeat::Hold && keys.size() >= 2 && t > keys.back().t && keys.back().t > keys.front().t) {
+        const FrameTime first = keys.front().t, span = keys.back().t - first;
+        const FrameTime cycle = (t - first) / span, into = (t - first) % span;
+        switch (repeat) {
+            case Repeat::Loop: return evalKeys(keys, first + into);
+            case Repeat::PingPong: return evalKeys(keys, cycle % 2 ? keys.back().t - into : first + into);
+            case Repeat::Offset: return evalKeys(keys, first + into) + double(cycle) * (keys.back().v - keys.front().v);
+            default: break;
+        }
+    }
+    return evalKeys(keys, t);
 }
 
 void Param::addKey(FrameTime t, double v, Interp interp) {

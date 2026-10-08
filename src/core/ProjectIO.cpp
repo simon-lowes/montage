@@ -76,7 +76,9 @@ QJsonValue paramToJson(const Param& p) {
         if (k.inDt != 0 || k.inDv != 0 || k.outDt != 0 || k.outDv != 0) a << k.inDt << k.inDv << k.outDt << k.outDv;  // Bezier handles
         keys.append(a);
     }
-    return QJsonObject{{"value", p.value}, {"keys", keys}};
+    QJsonObject o{{"value", p.value}, {"keys", keys}};
+    if (p.repeat != Repeat::Hold) o["repeat"] = p.repeat == Repeat::Loop ? "loop" : p.repeat == Repeat::PingPong ? "pingpong" : "offset";
+    return o;
 }
 
 Param paramFromJson(const QJsonValue& v) {
@@ -87,6 +89,8 @@ Param paramFromJson(const QJsonValue& v) {
     }
     QJsonObject o = v.toObject();
     p.value = o.value("value").toDouble();
+    const QString repeat = o.value("repeat").toString();
+    p.repeat = repeat == "loop" ? Repeat::Loop : repeat == "pingpong" ? Repeat::PingPong : repeat == "offset" ? Repeat::Offset : Repeat::Hold;
     for (const auto& kv : o.value("keys").toArray()) {
         QJsonArray a = kv.toArray();
         if (a.size() < 2) continue;

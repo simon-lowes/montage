@@ -53,9 +53,15 @@ struct Keyframe {
 // The handles key i actually uses (its own, or the automatic ones).
 void keyHandles(const std::vector<Keyframe>& keys, size_t i, double& inDt, double& inDv, double& outDt, double& outDv);
 
+// What an animation does after its last keyframe (After Effects' loopOut, Resolve 21's keyframe loop and ping pong).
+enum class Repeat { Hold, Loop, PingPong, Offset };
+
 struct Param {
     double value = 0;              // used when there are no keyframes
     std::vector<Keyframe> keys;    // sorted by t
+    // After the last key: hold its value, play the keys again (Loop), back and forth (PingPong), or again carrying
+    // on from where the last cycle ended (Offset: a value climbing by the same step each cycle). Needs two keys.
+    Repeat repeat = Repeat::Hold;
 
     Param() = default;
     Param(double v) : value(v) {}  // NOLINT(google-explicit-constructor)

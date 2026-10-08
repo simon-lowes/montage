@@ -51,6 +51,8 @@ public:
     bool setInterpolation(Interp interp);
     bool shiftSelected(FrameTime delta);
     bool easeSelected(bool in, bool out);
+    // After the last keyframe, for the parameters of the selected keys: hold, loop, ping-pong or offset.
+    bool setRepeat(Repeat repeat);
 
     // The value graph.
     void setGraph(bool on);

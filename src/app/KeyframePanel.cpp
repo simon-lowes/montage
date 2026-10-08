@@ -741,8 +741,34 @@ void KeyframePanel::contextMenuEvent(QContextMenuEvent* e) {
     menu.addAction(tr("Ease Out"), this, [this] { easeSelected(false, true); })->setObjectName(QStringLiteral("easeOut"));
     menu.addAction(tr("Easy Ease"), this, [this] { easeSelected(true, true); })->setObjectName(QStringLiteral("easyEase"));
     menu.addSeparator();
+    QMenu* after = menu.addMenu(tr("After Last Keyframe"));
+    after->setObjectName(QStringLiteral("keyframeRepeat"));
+    const std::pair<Repeat, QString> repeats[] = {{Repeat::Hold, tr("Hold")},
+                                                  {Repeat::Loop, tr("Loop")},
+                                                  {Repeat::PingPong, tr("Ping-Pong")},
+                                                  {Repeat::Offset, tr("Loop and Offset")}};
+    for (const auto& [rep, name] : repeats) after->addAction(name, this, [this, rep = rep] { setRepeat(rep); });
+    menu.addSeparator();
     menu.addAction(tr("Delete"), this, [this] { deleteSelected(); });
     menu.exec(e->globalPos());
+}
+
+bool KeyframePanel::setRepeat(Repeat repeat) {
+    if (selection_.empty() || !clip_) return false;
+    std::set<ParamAddress> params;
+    for (const Key& k : selection_) params.insert(k.address);
+    const Id id = clip_;
+    return state_->edit(tr("Keyframe Repeat"), [id, params, repeat](Project&, Sequence& s) {
+        Clip* c = edit::clipById(s, id);
+        if (!c) return false;
+        bool changed = false;
+        for (const ParamAddress& a : params)
+            if (Param* p = findParam(*c, a); p && p->repeat != repeat) {
+                p->repeat = repeat;
+                changed = true;
+            }
+        return changed;
+    });
 }
 
 bool KeyframePanel::event(QEvent* e) {

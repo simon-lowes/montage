@@ -2584,6 +2584,37 @@ private slots:
         QCOMPARE(d[fx.v1().clips[3].id].front().group, 1);
     }
 
+    void keyframeRepeat() {
+        // 0 at frame 10, 10 at frame 20.
+        Param p;
+        p.addKey(10, 0.0);
+        p.addKey(20, 10.0);
+        QCOMPARE(p.at(25), 10.0);  // held
+        p.repeat = Repeat::Loop;
+        QCOMPARE(p.at(25), 5.0);
+        QCOMPARE(p.at(30), 0.0);
+        QCOMPARE(p.at(5), 0.0);  // before the first key: still held
+        p.repeat = Repeat::PingPong;
+        QCOMPARE(p.at(25), 5.0);
+        QCOMPARE(p.at(28), 2.0);  // on the way back
+        QCOMPARE(p.at(32), 2.0);  // forwards again
+        p.repeat = Repeat::Offset;
+        QCOMPARE(p.at(25), 15.0);
+        QCOMPARE(p.at(42), 32.0);
+        // Saved and read back; one key alone holds whatever the setting.
+        Fixture fx;
+        const Id clip = fx.put(V1, 0, 100);
+        Clip* c = clipById(fx.s(), clip);
+        c->motion.params["rotation"] = p;
+        Project back;
+        QVERIFY(projectFromJson(projectToJson(fx.p), back));
+        QCOMPARE(clipById(*back.active(), clip)->motion.params.at("rotation").repeat, Repeat::Offset);
+        Param one;
+        one.addKey(10, 3.0);
+        one.repeat = Repeat::Loop;
+        QCOMPARE(one.at(50), 3.0);
+    }
+
     void trackFolders() {
         Fixture fx;
         for (int k = 0; k < 3; ++k) addTrack(fx.p, fx.s(), TrackKind::Audio);
