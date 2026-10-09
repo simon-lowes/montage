@@ -70,6 +70,7 @@
 #include "render/Highlights.h"
 #include "render/Shorts.h"
 #include "media/Psd.h"
+#include "media/MicBleed.h"
 #include "render/ProjectManager.h"
 #include "PsdWriter.h"
 #include "render/AutoBroll.h"
@@ -6652,6 +6653,81 @@ private slots:
         QVERIFY(loadProject(project.toStdString(), back));
         QCOMPARE(back.sequences.size(), size_t(2));
         QCOMPARE(back.sequences.back().name, std::string("Highlights"));
+    }
+
+    void removeMicBleed() {
+        // Two mics, each hearing the other speaker 18 dB down: A speaks 1-3 s and 6-7.5 s, B 3.5-5.5 s and 6.5-8.5 s.
+        const int rate = 48000;
+        const double seconds = 12;
+        auto speech = [](double t, double hz, std::initializer_list<std::pair<double, double>> turns) {
+            for (const auto& [a, b] : turns)
+                if (t >= a && t < b) return 0.3 * std::sin(2 * M_PI * hz * t) * (0.6 + 0.4 * std::sin(2 * M_PI * 3 * t));
+            return 0.0;
+        };
+        std::vector<float> micA(size_t(rate * seconds)), micB(micA.size());
+        std::mt19937 rng(5);
+        std::normal_distribution<float> hiss(0, 0.0005f);
+        for (size_t i = 0; i < micA.size(); ++i) {
+            const double t = double(i) / rate;
+            const double a = speech(t, 300, {{1, 3}, {6, 7.5}}), b = speech(t, 520, {{3.5, 5.5}, {6.5, 8.5}});
+            micA[i] = float(a + b / 8) + hiss(rng);
+            micB[i] = float(b + a / 8) + hiss(rng);
+        }
+        QVERIFY(writeMonoWav(path("mic-a.wav"), micA, rate));
+        QVERIFY(writeMonoWav(path("mic-b.wav"), micB, rate));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = {25, 1};
+        MediaItem ma = probeOrFail(p, path("mic-a.wav")), mb = probeOrFail(p, path("mic-b.wav"));
+        p.media.push_back(ma);
+        p.media.push_back(mb);
+        QVERIFY(edit::placeMedia(p, s, ma.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(edit::placeMedia(p, s, mb.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 1}, false).ok);
+        std::string err;
+        BleedOptions o;
+        const std::vector<Spans> dips = bleedSpans(p, s, {0, 1}, o, &err);
+        QVERIFY2(dips.size() == 2, err.c_str());
+        QCOMPARE(montage::removeMicBleed(s, {0, 1}, dips, o), 2);
+        auto gain = [&](int track, double t) { return s.audioTracks[size_t(track)].clips.at(0).audio.p("gain_db", FrameTime(std::llround(t * 25))); };
+        auto down = [&](int track, double t) { return std::fabs(gain(track, t) - o.reductionDb) < 0.5; };
+        auto up = [&](int track, double t) { return std::fabs(gain(track, t)) < 0.5; };
+        // A's mic: open while A speaks (and while both do), down while B speaks alone and in the silences.
+        QVERIFY(up(0, 2.0) && up(0, 6.25) && up(0, 7.0));
+        QVERIFY2(down(0, 4.5), qPrintable(QString::number(gain(0, 4.5))));
+        QVERIFY(down(0, 0.5) && down(0, 8.0) && down(0, 10.0));
+        // B's mic the other way round.
+        QVERIFY(up(1, 4.5) && up(1, 7.0) && up(1, 8.0));
+        QVERIFY(down(1, 2.0) && down(1, 10.0));
+        // Open again by the time its speaker starts, and still open just after they stop (the hold).
+        QVERIFY(up(1, 3.55) && up(0, 3.1));
+        // A deeper dip when asked; one track refused.
+        BleedOptions deeper;
+        deeper.reductionDb = -40;
+        QCOMPARE(montage::removeMicBleed(s, {0, 1}, bleedSpans(p, s, {0, 1}, deeper, &err), deeper), 2);
+        QVERIFY(std::fabs(gain(0, 4.5) + 40) < 0.5);
+        QVERIFY(bleedSpans(p, s, {0}, o, &err).empty());
+        QVERIFY(QString::fromStdString(err).contains("two tracks"));
+        // Over MCP.
+        Project q = makeDefaultProject();
+        Sequence& qs = *q.active();
+        q.media.push_back(ma);
+        q.media.push_back(mb);
+        QVERIFY(edit::placeMedia(q, qs, ma.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(edit::placeMedia(q, qs, mb.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 1}, false).ok);
+        const QString project = QString::fromStdString(path("bleed.montage"));
+        QVERIFY(saveProject(q, project.toStdString()));
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_remove_bleed"}, {"arguments", QJsonObject{{"project", project}, {"tracks", QJsonArray{"A1", "A2"}}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject res = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        QCOMPARE(res.value("structuredContent").toObject().value("clips_changed").toInt(), 2);
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QVERIFY(!back.active()->audioTracks[0].clips.at(0).audio.params.at("gain_db").keys.empty());
     }
 
     void embeddedClosedCaptions() {

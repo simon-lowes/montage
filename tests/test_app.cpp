@@ -3164,6 +3164,46 @@ private slots:
         state()->newProject();
     }
 
+    void removeMicBleedFromTheMenu() {
+        // Two mics: the first speaker loud on one and 18 dB down on the other, then the second speaker the other way.
+        const int rate = 48000;
+        std::vector<float> a(size_t(rate) * 6), b(a.size());
+        for (size_t i = 0; i < a.size(); ++i) {
+            const double t = double(i) / rate;
+            const double one = t >= 0.5 && t < 2.5 ? 0.3 * std::sin(2 * M_PI * 300 * t) : 0.0;
+            const double two = t >= 3 && t < 5 ? 0.3 * std::sin(2 * M_PI * 500 * t) : 0.0;
+            a[i] = float(one + two / 8);
+            b[i] = float(two + one / 8);
+        }
+        auto writeWav = [](const QString& file, const std::vector<float>& x) {
+            WavWriter w;
+            if (!w.open(file, 48000, 1)) return false;
+            w.write(x.data(), int64_t(x.size()));
+            return w.close();
+        };
+        QVERIFY(writeWav(dir_.path() + "/host.wav", a));
+        QVERIFY(writeWav(dir_.path() + "/guest.wav", b));
+        state()->newProject();
+        QVERIFY(win_->findChild<QAction*>("removeMicBleed"));
+        QCOMPARE(win_->removeMicBleed(), 0);  // nothing on the tracks
+        const auto ids = state()->importFiles({dir_.path() + "/host.wav", dir_.path() + "/guest.wav"});
+        QCOMPARE(ids.size(), size_t(2));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok &&
+                   edit::placeMedia(p, s, ids[1], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 1}, false).ok;
+        }));
+        QCOMPARE(win_->removeMicBleed(), 2);
+        const Sequence* s = state()->sequence();
+        const double fps = s->fpsValue();
+        auto gain = [&](int track, double t) { return s->audioTracks[size_t(track)].clips.at(0).audio.p("gain_db", FrameTime(std::llround(t * fps))); };
+        QVERIFY(std::fabs(gain(0, 4.0) + 24) < 0.5);  // the host's mic down while the guest speaks
+        QVERIFY(std::fabs(gain(1, 1.5) + 24) < 0.5);
+        QVERIFY(std::fabs(gain(0, 1.5)) < 0.5 && std::fabs(gain(1, 4.0)) < 0.5);
+        state()->undo();
+        QVERIFY(state()->sequence()->audioTracks[0].clips.at(0).audio.params.at("gain_db").keys.empty());
+        state()->newProject();
+    }
+
     void importEmbeddedClosedCaptions() {
         // A clip whose file carries CEA-608 captions.
         Project gen = makeDefaultProject();

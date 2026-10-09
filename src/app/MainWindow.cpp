@@ -123,6 +123,7 @@
 #include "render/AutoBroll.h"
 #include "render/Highlights.h"
 #include "render/Shorts.h"
+#include "media/MicBleed.h"
 #include "render/MusicEdit.h"
 #include "render/VoiceMatch.h"
 #include "render/Exporter.h"
@@ -803,6 +804,7 @@ void MainWindow::buildMenus() {
             AutoDuckDialog dlg(state_, music, this);
             if (dlg.exec() == QDialog::Accepted) AutoDuckDialog::apply(state_, music, dlg.dialogueTracks(), dlg.options(), this);
         }))->setObjectName(QStringLiteral("autoDuck"));
+    add(clipM, tr("Remove Mic &Bleed…"), QKeySequence(), withSeq([this] { micBleedDialog(); }))->setObjectName(QStringLiteral("removeMicBleed"));
     add(clipM, tr("Auto &Colour"), QKeySequence("Ctrl+Alt+C"), [this] { autoColor(); });
     add(clipM, tr("Set Colour &Reference"), QKeySequence(), [this] { setColourReference(); })
         ->setObjectName(QStringLiteral("setColourReference"));
@@ -3549,6 +3551,77 @@ int MainWindow::importEmbeddedCaptions() {
     });
     state_->message(tr("%n closed caption(s) imported as a caption track", "", int(placed.size())), 5000);
     return int(placed.size());
+}
+
+int MainWindow::removeMicBleed(std::vector<int> tracks, double reductionDb) {
+    const Sequence* s = state_->sequence();
+    if (!s) return 0;
+    if (tracks.empty())
+        for (size_t i = 0; i < s->audioTracks.size(); ++i)
+            if (!s->audioTracks[i].muted && !s->audioTracks[i].clips.empty()) tracks.push_back(int(i));
+    if (tracks.size() < 2) {
+        state_->message(tr("Remove Mic Bleed works across two audio tracks or more, a mic on each speaker"), 6000);
+        return 0;
+    }
+    BleedOptions o;
+    o.reductionDb = std::clamp(reductionDb, -60.0, -3.0);
+    auto project = std::make_shared<const Project>(state_->project());
+    const Id seqId = s->id;
+    std::vector<Spans> dips;
+    if (!runWithProgress(this, state_, tr("Listening to each mic..."), [&, project](const auto&, const auto* cancel, std::string* e) {
+            const Sequence* sq = project->findSequence(seqId);
+            dips = sq ? bleedSpans(*project, *sq, tracks, o, e, cancel) : std::vector<Spans>{};
+            return !dips.empty();
+        }))
+        return 0;
+    int changed = 0;
+    state_->edit(tr("Remove Mic Bleed"), [&](Project&, Sequence& sq) {
+        changed = montage::removeMicBleed(sq, tracks, dips, o);
+        return changed > 0;
+    });
+    size_t stretches = 0;
+    for (const Spans& d : dips) stretches += d.size();
+    state_->message(changed ? tr("Each mic dips while it is not its speaker's turn: %n clip(s), %1 stretch(es)", "", changed).arg(stretches)
+                            : tr("No mic bleed to remove: every mic is its speaker's throughout"),
+                    6000);
+    return changed;
+}
+
+void MainWindow::micBleedDialog() {
+    const Sequence* s = state_->sequence();
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Remove Mic Bleed"));
+    auto* form = new QFormLayout(&dlg);
+    form->addRow(new QLabel(tr("For talk recorded with a mic on each speaker: each track dips while it is not its speaker's turn, "
+                               "so the others' voices it picked up go quiet. Two people talking at once both stay up."),
+                            &dlg));
+    std::vector<QCheckBox*> boxes;
+    for (size_t i = 0; i < s->audioTracks.size(); ++i) {
+        const Track& t = s->audioTracks[i];
+        auto* box = new QCheckBox(QStringLiteral("A%1 %2").arg(i + 1).arg(QString::fromStdString(t.name)), &dlg);
+        box->setChecked(!t.muted && !t.clips.empty());
+        box->setEnabled(!t.clips.empty());
+        form->addRow(boxes.empty() ? tr("Mics:") : QString(), box);
+        boxes.push_back(box);
+    }
+    auto* amount = new QDoubleSpinBox(&dlg);
+    amount->setRange(-60, -3);
+    amount->setValue(-24);
+    amount->setSuffix(tr(" dB"));
+    form->addRow(tr("Dip by:"), amount);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    form->addRow(buttons);
+    if (dlg.exec() != QDialog::Accepted) return;
+    std::vector<int> tracks;
+    for (size_t i = 0; i < boxes.size(); ++i)
+        if (boxes[i]->isChecked()) tracks.push_back(int(i));
+    if (tracks.size() < 2) {
+        state_->message(tr("Choose two mics or more"), 5000);
+        return;
+    }
+    removeMicBleed(tracks, amount->value());
 }
 
 std::vector<Id> MainWindow::shortsSource() const {

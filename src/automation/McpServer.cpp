@@ -62,6 +62,7 @@
 #include "render/VoiceMatch.h"
 #include "media/Analysis.h"
 #include "media/AutoDuck.h"
+#include "media/MicBleed.h"
 #include "core/Slate.h"
 #include "render/PaperEdit.h"
 #include "render/LutExport.h"
@@ -3375,6 +3376,46 @@ void McpServer::Impl::addTools() {
             for (const auto& [from, to] : spans) list.append(QJsonObject{{"start_seconds", from}, {"end_seconds", to}});
             return ok(QStringLiteral("Ducked %1 clip(s) under %2 stretch(es) of dialogue").arg(changed).arg(spans.size()),
                       QJsonObject{{"dialogue", list}, {"clips_changed", changed}});
+        });
+
+    add("montage_remove_bleed", "Remove mic bleed from multitrack talk",
+        "For talk recorded with a mic on each speaker (podcasts, interviews): each of the audio `tracks` dips by "
+        "`reduction_db` wherever it is not its speaker's turn (more than `margin_db` below the loudest mic at that moment, "
+        "or at its own noise floor), fading out after its speaker stops and back just before they start; two people "
+        "talking at once both stay up. Written as volume keyframes on the clips (replacing theirs). `tracks` defaults to "
+        "every unmuted audio track with clips.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"tracks":{"type":"array","items":{"type":"string"},"description":"e.g. [\"A1\",\"A2\"]"},
+            "reduction_db":{"type":"number","default":-24},"margin_db":{"type":"number","default":10},
+            "floor_db":{"type":"number","default":-50}},"required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            std::vector<int> tracks;
+            for (const QJsonValue& v : a.value("tracks").toArray()) {
+                const TrackRef t = trackArg(v.toString(), s, false);
+                if (t.kind != TrackKind::Audio) throw ArgError{"\"tracks\" are audio tracks"};
+                tracks.push_back(t.index);
+            }
+            if (tracks.empty())
+                for (size_t i = 0; i < s.audioTracks.size(); ++i)
+                    if (!s.audioTracks[i].muted && !s.audioTracks[i].clips.empty()) tracks.push_back(int(i));
+            BleedOptions o;
+            if (a.value("reduction_db").isDouble()) o.reductionDb = std::clamp(a.value("reduction_db").toDouble(), -60.0, -3.0);
+            if (a.value("margin_db").isDouble()) o.marginDb = std::clamp(a.value("margin_db").toDouble(), 1.0, 40.0);
+            if (a.value("floor_db").isDouble()) o.floorDb = a.value("floor_db").toDouble();
+            std::string err;
+            const std::vector<Spans> dips = bleedSpans(l.project, s, tracks, o, &err);
+            if (dips.empty()) return fail(QString::fromStdString(err));
+            const int changed = removeMicBleed(s, tracks, dips, o);
+            if (changed) save(l);
+            QJsonArray list;
+            for (size_t i = 0; i < tracks.size(); ++i) {
+                QJsonArray spans;
+                for (const auto& [from, to] : dips[i]) spans.append(QJsonObject{{"start_seconds", from}, {"end_seconds", to}});
+                list.append(QJsonObject{{"track", QStringLiteral("A%1").arg(tracks[i] + 1)}, {"dips", spans}});
+            }
+            return ok(QStringLiteral("Mic bleed removed: %1 clip(s) dip while it is not their speaker's turn").arg(changed),
+                      QJsonObject{{"tracks", list}, {"clips_changed", changed}});
         });
 
     add("montage_add_adjustment_layer", "Add an adjustment layer",

@@ -112,6 +112,11 @@ public:
     // Clip › Import Embedded Captions: the CEA-608 captions inside the selected video clip's file (else the clip under
     // the playhead on the target video track) as a new caption track where the clip plays them. How many captions.
     int importEmbeddedCaptions();
+    // Clip › Remove Mic Bleed: on multitrack talk (a mic per speaker), each track dips while it is not its speaker's
+    // turn (media/MicBleed.h), as volume keyframes, one undo step. `tracks` empty = every unmuted audio track with
+    // clips. How many clips changed (0 with a message when nothing applies).
+    int removeMicBleed(std::vector<int> tracks = {}, double reductionDb = -24);
+    void micBleedDialog();
     // Suggest Chapters: chapter markers where the talk moves on, titled with what each part is about (replacing the
     // chapter markers there were); `ask` shows them first to rename, drop or re-space. How many were added.
     int suggestChapterMarkers(double minSeconds = 30, bool ask = true);
