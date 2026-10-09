@@ -5,6 +5,7 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QPalette>
+#include <QProxyStyle>
 #include <QStyleFactory>
 #include <algorithm>
 #include <iterator>
@@ -104,8 +105,20 @@ QIcon icon(const char* nameC) {
     return result;
 }
 
+namespace {
+// Fusion, with tab names never shortened to "Tra…": a crowded dock shows scroll arrows instead.
+class Style : public QProxyStyle {
+public:
+    Style() : QProxyStyle(QStyleFactory::create("Fusion")) {}
+    int styleHint(StyleHint hint, const QStyleOption* option, const QWidget* widget, QStyleHintReturn* ret) const override {
+        if (hint == SH_TabBar_ElideMode) return Qt::ElideNone;
+        return QProxyStyle::styleHint(hint, option, widget, ret);
+    }
+};
+}  // namespace
+
 void apply(QApplication& app) {
-    app.setStyle(QStyleFactory::create("Fusion"));
+    app.setStyle(new Style);
     QPalette p;
     p.setColor(QPalette::Window, kWindow);
     p.setColor(QPalette::WindowText, kText);

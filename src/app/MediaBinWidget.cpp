@@ -236,6 +236,7 @@ MediaBinWidget::MediaBinWidget(EditorState* state, QWidget* parent) : QWidget(pa
     binMenu->addAction(tr("New Smart Bin…"), this, [this] { newSmartBinDialog(); });
     binBtn->setMenu(binMenu);
     binBtn->setPopupMode(QToolButton::MenuButtonPopup);
+    binBtn->setMinimumWidth(binBtn->fontMetrics().horizontalAdvance(binBtn->text()) + 30);  // room for the arrow beside it
     iconsBtn_ = addButton(QStringLiteral("▦"), tr("Icon view"));
     listBtn_ = addButton(QStringLiteral("☰"), tr("List view, with metadata columns"));
     iconsBtn_->setObjectName(QStringLiteral("iconViewButton"));

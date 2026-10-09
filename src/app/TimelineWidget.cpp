@@ -766,7 +766,7 @@ void TimelineWidget::paintClip(QPainter& p, const Row& row, const Clip& c, const
     p.setPen(theme::kText);
     QRect nameR = r.adjusted(5, 1, -4, 0);
     nameR.setHeight(kNameStrip - 2);
-    QString name = QString::fromStdString(c.name);
+    QString name = QString::fromStdString(c.name).replace('\n', ' ');  // a title's lines on one
     if (const Sequence* mc = multicamSequence(proj, c)) {
         // Multicam: the angle (or audio source) this part plays.
         if (row.ref.kind == TrackKind::Video) {

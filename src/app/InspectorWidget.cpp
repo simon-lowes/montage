@@ -95,7 +95,8 @@ QIcon colorIcon(const QColor& c) {
 
 InspectorWidget::InspectorWidget(EditorState* state, QWidget* parent) : QScrollArea(parent), state_(state) {
     setWidgetResizable(true);
-    setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    // A narrow dock scrolls sideways rather than cutting off the right of each row.
+    setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
     connect(state_, &EditorState::selectionChanged, this, &InspectorWidget::rebuild);
     connect(state_, &EditorState::sequenceSwitched, this, &InspectorWidget::rebuild);
     connect(state_, &EditorState::projectChanged, this, [this] {

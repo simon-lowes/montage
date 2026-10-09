@@ -45,6 +45,7 @@
 #include <QShortcut>
 #include <QStatusBar>
 #include <QTableWidget>
+#include <QChildEvent>
 #include <QTabBar>
 #include <QToolBar>
 #include <QVBoxLayout>
@@ -1656,6 +1657,15 @@ void MainWindow::deleteSelection(bool ripple) {
     state_->apply(ripple ? tr("Ripple Delete") : tr("Delete"), [sel, ripple](Project& p, Sequence& s) {
         return edit::removeClips(p, s, sel, ripple);
     });
+}
+
+void MainWindow::childEvent(QChildEvent* e) {
+    QMainWindow::childEvent(e);
+    if (e->type() == QEvent::ChildPolished)
+        if (auto* bar = qobject_cast<QTabBar*>(e->child())) {
+            bar->setElideMode(Qt::ElideNone);
+            bar->setUsesScrollButtons(true);
+        }
 }
 
 void MainWindow::clearOrRestoreSolo() {

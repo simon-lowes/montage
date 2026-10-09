@@ -180,6 +180,8 @@ public:
 
 protected:
     void closeEvent(QCloseEvent* e) override;
+    // Dock tab bars: whole names, with scroll arrows when crowded (Qt shortens them to "Tra…" by default).
+    void childEvent(QChildEvent* e) override;
 
 private:
     enum class Monitor { Source, Program };
