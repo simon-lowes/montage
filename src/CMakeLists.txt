@@ -86,6 +86,7 @@ add_library(montage_engine STATIC
   media/Beats.h media/Beats.cpp
   media/Translator.h media/Translator.cpp
   render/Processing.h render/Processing.cpp
+  render/Ofx.h render/Ofx.cpp
   render/FaceRefine.h render/FaceRefine.cpp
   render/Relight.h render/Relight.cpp
   render/FilmLook.h render/FilmLook.cpp
@@ -133,6 +134,8 @@ add_library(montage_engine STATIC
 )
 target_include_directories(montage_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(montage_engine PRIVATE ${PROJECT_SOURCE_DIR}/third_party/clap/include)
+# OpenFX 1.5 headers (BSD-3-Clause, the ASWF's), for hosting video plugins (render/Ofx).
+target_include_directories(montage_engine PRIVATE ${PROJECT_SOURCE_DIR}/third_party/openfx/include)
 
 if(MONTAGE_WITH_VST3)
   # The VST 3 interfaces and the few SDK host helpers Montage uses (MIT).

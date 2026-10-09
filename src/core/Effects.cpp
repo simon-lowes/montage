@@ -515,6 +515,12 @@ std::vector<EffectInfo> buildCatalog() {
         plugin.hidden = true;
         c.push_back(plugin);
     }
+    {
+        // An OpenFX video plugin; see render/Ofx.h.
+        EffectInfo ofx{"ofx", "OpenFX Plugin", EffectCategory::VideoFilter, "OpenFX", {}, {}};
+        ofx.hidden = true;
+        c.push_back(ofx);
+    }
 
     // Distort and stylize (render/StyleFx.h). Sizes in source pixels; centres as offsets from the middle.
     {
@@ -806,12 +812,55 @@ std::vector<const EffectInfo*> effectsInCategory(EffectCategory c) {
 }
 
 std::string pluginParamMeta(const ParamInfo& p) {
-    return p.label + "\t" + std::to_string(p.min) + "\t" + std::to_string(p.max) + "\t" + std::to_string(p.def) + "\t" +
-           (p.step >= 1 ? "1" : "0");
+    std::string meta = p.label + "\t" + std::to_string(p.min) + "\t" + std::to_string(p.max) + "\t" + std::to_string(p.def) + "\t" +
+                       (p.step >= 1 ? "1" : "0");
+    // Beyond the number: how it is shown (a choice, a switch, a colour, an angle), as OpenFX parameters need.
+    if (p.kind != ParamKind::Number || !p.keyframeable) {
+        std::string choices;
+        for (const std::string& c : p.choices) choices += (choices.empty() ? "" : "|") + c;
+        meta += "\t" + std::to_string(int(p.kind)) + "\t" + choices + "\t" + std::to_string(p.defG) + "\t" + std::to_string(p.defB) +
+                "\t" + (p.keyframeable ? "1" : "0");
+    }
+    return meta;
 }
 
+namespace {
+
+std::vector<std::string> metaFields(const std::string& meta) {
+    std::vector<std::string> f;
+    size_t start = 0;
+    for (size_t tab; (tab = meta.find('\t', start)) != std::string::npos; start = tab + 1) f.push_back(meta.substr(start, tab - start));
+    f.push_back(meta.substr(start));
+    return f;
+}
+
+void applyMeta(ParamInfo& p, const std::vector<std::string>& f) {
+    if (f.size() < 5) return;
+    p.label = f[0];
+    p.min = std::atof(f[1].c_str());
+    p.max = std::atof(f[2].c_str());
+    p.def = std::atof(f[3].c_str());
+    p.step = f[4] == "1" ? 1.0 : (p.max - p.min) / 1000.0;
+    if (f.size() >= 10) {
+        p.kind = ParamKind(std::clamp(std::atoi(f[5].c_str()), 0, int(ParamKind::Color)));
+        p.choices.clear();
+        for (size_t start = 0; !f[6].empty() && start <= f[6].size();) {
+            const size_t bar = f[6].find('|', start);
+            p.choices.push_back(f[6].substr(start, bar == std::string::npos ? std::string::npos : bar - start));
+            if (bar == std::string::npos) break;
+            start = bar + 1;
+        }
+        p.defG = std::atof(f[7].c_str());
+        p.defB = std::atof(f[8].c_str());
+        p.keyframeable = f[9] == "1";
+        if (p.kind == ParamKind::Choice || p.kind == ParamKind::Bool) p.step = 1;
+    }
+}
+
+}  // namespace
+
 std::vector<ParamInfo> effectParams(const Effect& e) {
-    if (e.type != "plugin") {
+    if (e.type != "plugin" && e.type != "ofx") {
         const EffectInfo* info = findEffectInfo(e.type);
         return info ? info->params : std::vector<ParamInfo>{};
     }
@@ -822,20 +871,22 @@ std::vector<ParamInfo> effectParams(const Effect& e) {
         p.name = key;
         p.label = key.substr(6);
         auto meta = e.strings.find("meta." + key.substr(6));
-        if (meta != e.strings.end()) {
-            std::vector<std::string> f;
-            size_t start = 0;
-            for (size_t tab; (tab = meta->second.find('\t', start)) != std::string::npos; start = tab + 1)
-                f.push_back(meta->second.substr(start, tab - start));
-            f.push_back(meta->second.substr(start));
-            if (f.size() >= 5) {
-                p.label = f[0];
-                p.min = std::atof(f[1].c_str());
-                p.max = std::atof(f[2].c_str());
-                p.def = std::atof(f[3].c_str());
-                p.step = f[4] == "1" ? 1.0 : (p.max - p.min) / 1000.0;
+        if (meta == e.strings.end() && key.size() > 8 && key[key.size() - 2] == '.') {
+            // A colour's channels: one row, named for the colour, at its red channel.
+            const std::string stem = key.substr(6, key.size() - 8);
+            auto colour = e.strings.find("meta." + stem);
+            if (colour != e.strings.end()) {
+                ParamInfo c;
+                applyMeta(c, metaFields(colour->second));
+                if (c.kind == ParamKind::Color) {
+                    if (key.back() != 'r') continue;
+                    c.name = "param." + stem;
+                    out.push_back(c);
+                    continue;
+                }
             }
         }
+        if (meta != e.strings.end()) applyMeta(p, metaFields(meta->second));
         out.push_back(p);
     }
     return out;

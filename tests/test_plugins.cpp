@@ -1,8 +1,15 @@
 // Audio plugin tests: discovery, out-of-process scanning with cache and
 // blocklist, CLAP hosting, and plugin effects in the mixer.
 #include <QtTest>
+#include <QDir>
 #include <QFileInfo>
+#include <QImage>
+#include <QJsonObject>
+#include <QJsonDocument>
+#include <QJsonArray>
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 
@@ -13,6 +20,9 @@
 #include "core/ProjectIO.h"
 #include "media/Decoder.h"
 #include "render/Compositor.h"
+#include "render/Ofx.h"
+#include "media/ImageSequence.h"
+#include "automation/McpServer.h"
 
 using namespace montage;
 using namespace montage::plugins;
@@ -274,6 +284,179 @@ private slots:
         auto dirs = e.searchPaths(Format::Clap);
         QVERIFY(dirs.size() > 1);
         QCOMPARE(QString::fromStdString(dirs.back()), QString("/extra/clap/folder"));
+    }
+
+    void hostsOpenFxVideoPlugins() {
+        const std::string good = MONTAGE_TEST_OFX_DIR "/good", crash = MONTAGE_TEST_OFX_DIR "/crash";
+        QCOMPARE(ofx::findBinaries({good, crash}).size(), size_t(2));
+        // Scanned in the probe: the good bundle's two filters described, the one that crashes blocklisted.
+        ofx::Registry& reg = ofx::Registry::instance();
+        reg.setCachePath(path("ofx-cache.json").toStdString());
+        reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
+        reg.setSearchPaths({good, crash});
+        std::vector<std::string> log;
+        QCOMPARE(reg.scan(&log), 2);
+        QCOMPARE(reg.blocked().size(), size_t(1));
+        // (A crash on Linux and macOS; on Windows the test plugin ends its process without the crash dialog.)
+        QVERIFY2(reg.blocked()[0].first.find("MontageTestOfxCrash") != std::string::npos &&
+                     (reg.blocked()[0].second.find("Crashed") != std::string::npos || reg.blocked()[0].second.find("Could not be loaded") != std::string::npos),
+                 reg.blocked()[0].second.c_str());
+        QCOMPARE(log.size(), size_t(2));
+        // Unchanged files come from the cache, without the probe.
+        log.clear();
+        QCOMPARE(reg.scan(&log), 2);
+        QVERIFY(std::all_of(log.begin(), log.end(), [](const std::string& l) { return l.rfind("cached", 0) == 0; }));
+        QCOMPARE(ofx::instancesCreated(), 0);  // nothing loaded in this process yet
+        ofx::PluginDesc invert, temporal;
+        QVERIFY(reg.find("org.montage.test.invert/1", invert) && reg.find("org.montage.test.temporal/1", temporal));
+        QCOMPARE(invert.label, std::string("Test Invert"));
+        QCOMPARE(invert.group, std::string("Montage Test"));
+        QVERIFY(!invert.temporal && temporal.temporal && invert.floatImages);
+        QCOMPARE(invert.params.size(), size_t(4));
+        QCOMPARE(invert.params[0].name, std::string("amount"));
+        QCOMPARE(invert.params[0].def.at(0), 1.0);
+        QCOMPARE(invert.params[1].choices, (std::vector<std::string>{"Invert", "Pass"}));
+        QCOMPARE(invert.params[2].dimensions(), 3);
+        QCOMPARE(invert.params[3].stringDefault, std::string("hello"));
+        // As a clip effect: a slider, a choice and a colour in the Inspector; the text kept as a string.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64, s.height = 36, s.fps = Rational{25, 1};
+        Effect e = ofx::makeEffect(p, invert);
+        QCOMPARE(e.type, std::string("ofx"));
+        QCOMPARE(ofx::effectName(e), std::string("Test Invert"));
+        QCOMPARE(e.s("str.note"), std::string("hello"));
+        const std::vector<montage::ParamInfo> shown = effectParams(e);
+        QCOMPARE(shown.size(), size_t(3));
+        auto row = [&](const std::string& name) {
+            for (const montage::ParamInfo& pi : shown)
+                if (pi.name == name) return pi;
+            return montage::ParamInfo{};
+        };
+        QCOMPARE(row("param.amount").label, std::string("Amount"));
+        QCOMPARE(int(row("param.mode").kind), int(ParamKind::Choice));
+        QCOMPARE(row("param.mode").choices.size(), size_t(2));
+        QCOMPARE(int(row("param.tint").kind), int(ParamKind::Color));
+        QCOMPARE(row("param.tint").defG, 1.0);
+        // On a colour matte: inverted, by an amount that is keyframed, through a tint; Pass leaves it.
+        Clip matte = makeGeneratorClip(p, "color", 25);
+        matte.generator.params["color.r"] = Param(0.2);
+        matte.generator.params["color.g"] = Param(0.4);
+        matte.generator.params["color.b"] = Param(0.6);
+        matte.effects.push_back(e);
+        edit::overwrite(p, s, {TrackKind::Video, 0}, matte);
+        RenderOptions o;
+        auto at = [&](FrameTime t) {
+            const Image img = renderSequenceFrame(p, s, t, o);
+            const float* px = img.at(32, 18);
+            return std::array<float, 3>{px[0], px[1], px[2]};
+        };
+        auto near = [](std::array<float, 3> a, std::array<float, 3> b) {
+            return std::fabs(a[0] - b[0]) < 0.01 && std::fabs(a[1] - b[1]) < 0.01 && std::fabs(a[2] - b[2]) < 0.01;
+        };
+        QVERIFY2(near(at(3), {0.8f, 0.6f, 0.4f}), qPrintable(QString("%1 %2 %3").arg(at(3)[0]).arg(at(3)[1]).arg(at(3)[2])));
+        QVERIFY(ofx::instancesCreated() >= 1);
+        Effect& placed = s.videoTracks[0].clips[0].effects[0];
+        placed.params["param.amount"].addKey(0, 0.0);
+        placed.params["param.amount"].addKey(10, 1.0);
+        QVERIFY2(near(at(5), {0.5f, 0.5f, 0.5f}), qPrintable(QString("%1 %2 %3").arg(at(5)[0]).arg(at(5)[1]).arg(at(5)[2])));
+        QVERIFY(near(at(0), {0.2f, 0.4f, 0.6f}));
+        placed.params["param.amount"] = Param(1.0);
+        placed.params["param.tint.g"] = Param(0.5);
+        QVERIFY(near(at(3), {0.8f, 0.3f, 0.4f}));
+        placed.params["param.mode"] = Param(1.0);
+        QVERIFY(near(at(3), {0.2f, 0.4f, 0.6f}));
+        placed.params["param.mode"] = Param(0.0);
+        // Saved and loaded: the plugin effect with its settings.
+        QVERIFY(saveProject(p, path("ofx.montage").toStdString()));
+        Project back;
+        QVERIFY(loadProject(path("ofx.montage").toStdString(), back));
+        QVERIFY(near([&] {
+            const float* px = renderSequenceFrame(back, *back.active(), 3, o).at(32, 18);
+            return std::array<float, 3>{px[0], px[1], px[2]};
+        }(), {0.8f, 0.3f, 0.4f}));
+        // The temporal plugin reads the frames either side through the host.
+        Effect avg = ofx::makeEffect(p, temporal);
+        Image frame(8, 8);
+        frame.fill(0.9f, 0.9f, 0.9f, 1.0f);
+        int fetched = 0;
+        const ofx::FrameFetch fetch = [&](double t, Image& out) {
+            ++fetched;
+            out = Image(8, 8);
+            out.fill(t < 5 ? 0.3f : 0.6f, 0.3f, 0.3f, 1.0f);
+            return true;
+        };
+        std::string err;
+        QVERIFY2(ofx::applyEffect(avg, 5, frame, 1.0, fetch, &err), err.c_str());
+        QCOMPARE(fetched, 2);
+        QVERIFY2(std::fabs(frame.at(4, 4)[0] - (0.3f + 0.9f + 0.6f) / 3) < 1e-4, qPrintable(QString::number(frame.at(4, 4)[0])));
+        QVERIFY(std::fabs(frame.at(4, 4)[1] - 0.5f) < 1e-4);
+        // Over MCP: listed with the video effects and added to a clip by its type, parameters by their own names.
+        {
+            Project mp = makeDefaultProject();
+            Sequence& ms = *mp.active();
+            ms.width = 64, ms.height = 36;
+            edit::overwrite(mp, ms, {TrackKind::Video, 0}, makeGeneratorClip(mp, "color", 25));
+            const Id clip = ms.videoTracks[0].clips[0].id;
+            const QString project = path("ofx-mcp.montage");
+            QVERIFY(saveProject(mp, project.toStdString()));
+            McpServer server;
+            auto call = [&](const QString& tool, const QJsonObject& args) {
+                const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"}, {"params", QJsonObject{{"name", tool}, {"arguments", args}}}};
+                const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+                return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+            };
+            QJsonObject r = call("montage_list_effects", {{"kind", "video"}});
+            bool listed = false;
+            for (const QJsonValue& v : r.value("structuredContent").toObject().value("effects").toArray())
+                listed |= v.toObject().value("type").toString() == "ofx:org.montage.test.invert/1";
+            QVERIFY(listed);
+            r = call("montage_add_effect", {{"project", project}, {"clip", double(clip)}, {"effect", "ofx:org.montage.test.invert/1"},
+                                            {"params", QJsonObject{{"amount", 0.25}, {"tint.g", 0.5}}}, {"strings", QJsonObject{{"note", "set over MCP"}}}});
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            Project added;
+            QVERIFY(loadProject(project.toStdString(), added));
+            const Effect& fx = added.active()->videoTracks[0].clips[0].effects.at(0);
+            QVERIFY(fx.type == "ofx" && fx.s("ofx_id") == "org.montage.test.invert/1" && fx.s("str.note") == "set over MCP");
+            QCOMPARE(fx.params.at("param.amount").value, 0.25);
+            QCOMPARE(fx.params.at("param.tint.g").value, 0.5);
+            r = call("montage_add_effect", {{"project", project}, {"clip", double(clip)}, {"effect", "ofx:org.montage.test.invert/1"},
+                                            {"params", QJsonObject{{"nonsense", 1}}}});
+            QVERIFY(r.value("isError").toBool());
+        }
+        // In a sequence, the temporal plugin gets the clip's own frames either side: three stills played as a sequence.
+        {
+            const QString frames = path("ofx-frames");
+            QDir().mkpath(frames);
+            const int reds[] = {25, 128, 153};
+            for (int n = 0; n < 3; ++n) {
+                QImage q(16, 16, QImage::Format_RGB32);
+                q.fill(qRgb(reds[n], 64, 64));
+                QVERIFY(q.save(frames + QStringLiteral("/f%1.png").arg(n + 1)));
+            }
+            ImageSequence run;
+            QVERIFY(detectImageSequence((frames + "/f1.png").toStdString(), run));
+            run.fps = Rational{25, 1};
+            Project tp = makeDefaultProject();
+            Sequence& ts = *tp.active();
+            ts.width = 16, ts.height = 16, ts.fps = Rational{25, 1};
+            MediaItem m;
+            m.id = tp.newId();
+            QVERIFY(probeMedia(imageSequencePath(run), m));
+            tp.media.push_back(m);
+            QVERIFY(edit::placeMedia(tp, ts, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+            ts.videoTracks[0].clips[0].effects.push_back(ofx::makeEffect(tp, temporal));
+            const float middle = renderSequenceFrame(tp, ts, 1, o).at(8, 8)[0];
+            QVERIFY2(std::fabs(middle - (25 + 128 + 153) / 3.0f / 255.0f) < 0.01f, qPrintable(QString::number(middle)));
+        }
+        // A missing plugin leaves the picture as it was and says why.
+        Effect gone = e;
+        gone.strings["ofx_id"] = "org.example.missing/1";
+        gone.strings["ofx_description"] = "[]";
+        Image keep(4, 4);
+        keep.fill(0.1f, 0.2f, 0.3f, 1.0f);
+        QVERIFY(!ofx::applyEffect(gone, 0, keep, 1.0, {}, &err));
+        QVERIFY(err.find("not installed") != std::string::npos && std::fabs(keep.at(1, 1)[0] - 0.1f) < 1e-6);
     }
 
 #ifdef __APPLE__

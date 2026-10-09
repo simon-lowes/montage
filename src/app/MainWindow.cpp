@@ -1,6 +1,7 @@
 #include "MainWindow.h"
 #include "LiveBridge.h"
 #include "LiveLink.h"
+#include "render/Ofx.h"
 #include "AssistantPanel.h"
 #include "CleanFeed.h"
 #include "Settings.h"
@@ -5437,7 +5438,11 @@ void MainWindow::scanPluginsInBackground() {
         if (blocked > 0)
             state_->message(tr("%n audio plugin(s) failed to load and were blocked (Tools › Audio Plugins)", "", blocked), 8000);
     });
-    watcher->setFuture(QtConcurrent::run([] { return plugins::Registry::instance().scan(); }));
+    watcher->setFuture(QtConcurrent::run([] {
+        plugins::ScanReport report = plugins::Registry::instance().scan();
+        ofx::Registry::instance().scan();  // and the OpenFX video plugins
+        return report;
+    }));
 }
 
 void MainWindow::applyFromBrowser(const QString& typeQ, EffectCategory category) {
@@ -5449,7 +5454,7 @@ void MainWindow::applyFromBrowser(const QString& typeQ, EffectCategory category)
     }
     std::string type = typeQ.toStdString();
     const EffectInfo* info = findEffectInfo(type);
-    if (!info && !plugins::isPluginType(type)) return;
+    if (!info && !plugins::isPluginType(type) && !ofx::isOfxType(type)) return;
     const QString name = QString::fromStdString(plugins::effectTypeName(type));
     if (category == EffectCategory::Generator) {
         FrameTime at = s->playhead, len = FrameTime(std::llround(5 * s->fpsValue()));

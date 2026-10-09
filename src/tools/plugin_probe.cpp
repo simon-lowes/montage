@@ -7,12 +7,26 @@
 #include <string>
 
 #include "audio/Plugins.h"
+#include "render/Ofx.h"
 
 int main(int argc, char** argv) {
     using namespace montage::plugins;
     if (argc != 3) {
-        std::fprintf(stderr, "usage: montage-plugin-probe <CLAP|VST3|LV2|AU> <path>\n");
+        std::fprintf(stderr, "usage: montage-plugin-probe <CLAP|VST3|LV2|AU|OFX> <path>\n");
         return 2;
+    }
+    // OpenFX video plugins: the image effects in one binary, described as filters.
+    if (std::string(argv[1]) == "OFX") {
+        std::string error;
+        const auto effects = montage::ofx::describeBinary(argv[2], &error);
+        if (effects.empty()) {
+            std::fprintf(stderr, "%s\n", error.c_str());
+            return 1;
+        }
+        const std::string json = montage::ofx::descriptionsToJson(effects);
+        std::fwrite(json.data(), 1, json.size(), stdout);
+        std::fputc('\n', stdout);
+        return 0;
     }
     auto format = formatFromName(argv[1]);
     if (!format) {

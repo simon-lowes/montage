@@ -1,4 +1,5 @@
 #include "Compositor.h"
+#include "Ofx.h"
 
 #include "core/ColorGroups.h"
 #include "core/Automation.h"
@@ -680,6 +681,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
     double mw = SW, mh = SH;
     Geometry g;
     double sourceSeconds = -1;  // media time of the frame, for effects that follow the footage
+    ofx::FrameFetch ofxFetch;   // the clip's source at other clip frames, for OpenFX plugins that ask (render/Ofx.h)
     if (c.isGenerator() && c.generator.type == "adjustment") {
         // An adjustment layer's picture is the composite beneath it (already in the working space).
         if (!below || below->empty()) return {};
@@ -756,6 +758,20 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             if (!f && path == m->path && isOffline(*m)) f = offlineSlate(w, h);
             if (!f) return {};
             if (m->kind == MediaKind::Video) sourceSeconds = sec;
+            if (m->kind == MediaKind::Video && std::any_of(c.effects.begin(), c.effects.end(), [](const Effect& e) { return e.type == "ofx" && e.enabled; })) {
+                const double duration = m->duration, frameSeconds = m->fps.valid() ? 1.0 / m->fps.toDouble() : 1.0 / 30, seqFps = seq.fpsValue();
+                const bool hq = o.highQuality;
+                const Clip clipCopy = c;
+                ofxFetch = [path, w, h, hq, clipCopy, duration, frameSeconds, seqFps](double at, Image& out) {
+                    const FrameTime local = FrameTime(std::floor(at + 1e-6));
+                    if (local < 0 || local >= clipCopy.duration) return false;
+                    const double s = std::clamp(clipCopy.sourceFrameAt(clipCopy.start + local) / seqFps, 0.0, std::max(0.0, duration - frameSeconds * 0.5));
+                    Frame16Ptr frame = MediaPool::instance().videoFrame(path, s, w, h, hq);
+                    if (!frame) return false;
+                    out = toImage(*frame);
+                    return true;
+                };
+            }
             src = toImage(*f);
             Image decoded;  // the source frame itself, when src is an in-between
             // Slow motion between two source frames: blend them or follow the motion.
@@ -901,6 +917,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
         faceModel().installed())
         faces = cachedFaces(src);
     FaceScope faceScope(faces);
+    ofx::FetchScope fetchScope(ofxFetch);
     for (const Effect* e : chain)
         if (e->type != "video_denoise" && e->type != "super_scale" && e->type != "reframe_360")  // those ran on the source
             applyVideoEffect(*e, lt, src, pixelScale, sourceSeconds);

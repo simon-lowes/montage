@@ -14,6 +14,7 @@
 #include <QDockWidget>
 #include <QDoubleSpinBox>
 #include <QRadioButton>
+#include <QTreeWidgetItemIterator>
 #include <atomic>
 #include <thread>
 #include <sstream>
@@ -62,6 +63,7 @@
 #include "core/Interpretation.h"
 #include "LiveBridge.h"
 #include "LiveLink.h"
+#include "render/Ofx.h"
 #include "Assistant.h"
 #include "AssistantPanel.h"
 #include "media/SpeechSearch.h"
@@ -5480,6 +5482,45 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(panel->transcriptText().contains("The playhead is at 3 seconds."));
         disconnect(connection);
         session->setConfig(AssistantConfig{});
+        state()->newProject();
+    }
+
+    void openFxPluginsInTheBrowserAndInspector() {
+        ofx::Registry& reg = ofx::Registry::instance();
+        reg.setCachePath(dir_.filePath("ofx-cache.json").toStdString());
+        reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
+        reg.setSearchPaths({MONTAGE_TEST_OFX_DIR "/good"});
+        QCOMPARE(reg.scan(), 2);
+        auto* browser = win_->findChild<EffectsBrowser*>();
+        QVERIFY(browser);
+        browser->reload();
+        auto* tree = browser->findChild<QTreeWidget*>();
+        QTreeWidgetItem* leaf = nullptr;
+        for (QTreeWidgetItemIterator it(tree); *it; ++it)
+            if ((*it)->data(0, Qt::UserRole).toString() == "ofx:org.montage.test.invert/1") leaf = *it;
+        QVERIFY(leaf);
+        QCOMPARE(leaf->text(0), QString("Test Invert"));
+        QVERIFY(leaf->parent() && leaf->parent()->text(0) == "Montage Test" && leaf->parent()->parent()->text(0) == "Video Plugins");
+        // Applied to the selected clip from the browser: an "ofx" effect, shown in the Inspector with its controls.
+        state()->newProject();
+        QVERIFY(state()->edit("Matte", [](Project& p, Sequence& s) {
+            return edit::overwrite(p, s, {TrackKind::Video, 0}, makeGeneratorClip(p, "color", 50)).ok;
+        }));
+        const Id clip = state()->sequence()->videoTracks[0].clips.front().id;
+        state()->setSelection({clip}, false);
+        emit browser->applyRequested("ofx:org.montage.test.invert/1", EffectCategory::VideoFilter);
+        const Clip* c = edit::clipById(*state()->sequence(), clip);
+        QCOMPARE(c->effects.size(), size_t(1));
+        QCOMPARE(c->effects[0].type, std::string("ofx"));
+        QCOMPARE(state()->undoText(), QString("Add Test Invert"));
+        auto titled = [&] {
+            for (QLabel* l : win_->findChild<InspectorWidget*>()->findChildren<QLabel*>())
+                if (l->text().contains("Test Invert")) return true;
+            return false;
+        };
+        QTRY_VERIFY(titled());
+        state()->undo();
+        QVERIFY(edit::clipById(*state()->sequence(), clip)->effects.empty());
         state()->newProject();
     }
 

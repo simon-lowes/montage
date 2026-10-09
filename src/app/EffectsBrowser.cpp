@@ -1,5 +1,6 @@
 // Montage — effects browser.
 #include "EffectsBrowser.h"
+#include "render/Ofx.h"
 
 #include "EffectPresetStore.h"
 
@@ -320,6 +321,37 @@ void EffectsBrowser::populate() {
         leaf->setData(0, kSearchRole, QStringList{name, vendor, QString::fromStdString(d.category), tr("plugin")}.join(' '));
     }
     if (pluginsTop) pluginsTop->setExpanded(true);
+    // Installed OpenFX video plugins, by the plugin's own grouping, after the video effects.
+    QTreeWidgetItem* ofxTop = nullptr;
+    QHash<QString, QTreeWidgetItem*> ofxGroups;
+    for (const ofx::PluginDesc& d : ofx::Registry::instance().plugins()) {
+        if (!ofxTop) {
+            ofxTop = new QTreeWidgetItem(QStringList{tr("Video Plugins")});
+            ofxTop->setIcon(0, folderIcon);
+            ofxTop->setFlags(folderFlags);
+            tree_->insertTopLevelItem(1, ofxTop);
+        }
+        const QString group = d.group.empty() ? tr("Other") : QString::fromStdString(d.group).replace('/', QStringLiteral(" › "));
+        QTreeWidgetItem*& folder = ofxGroups[group];
+        if (!folder) {
+            folder = new QTreeWidgetItem(ofxTop, QStringList{group});
+            folder->setIcon(0, folderIcon);
+            folder->setFlags(folderFlags);
+        }
+        const QString name = QString::fromStdString(d.label);
+        auto* leaf = new QTreeWidgetItem(folder, QStringList{name});
+        leaf->setFlags(leafFlags);
+        leaf->setIcon(0, categoryIcon(EffectCategory::VideoFilter));
+        QStringList details{QStringLiteral("OpenFX"), group, tr("version %1.%2").arg(d.versionMajor).arg(d.versionMinor)};
+        if (d.temporal) details << tr("uses neighbouring frames");
+        leaf->setToolTip(0, QStringLiteral("<b>%1</b><br>%2%3")
+                                .arg(name.toHtmlEscaped(), details.join(QStringLiteral(" · ")).toHtmlEscaped(),
+                                     d.description.empty() ? QString() : "<br>" + QString::fromStdString(d.description).toHtmlEscaped()));
+        leaf->setData(0, kTypeRole, QString::fromStdString(ofx::kTypePrefix + d.id));
+        leaf->setData(0, kCategoryRole, int(EffectCategory::VideoFilter));
+        leaf->setData(0, kSearchRole, QStringList{name, group, QStringLiteral("openfx ofx plugin")}.join(' '));
+    }
+    if (ofxTop) ofxTop->setExpanded(true);
     // Effect presets saved on this computer, first.
     const auto saved = presets::all();
     if (!saved.empty()) {

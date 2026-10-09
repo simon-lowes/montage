@@ -21,9 +21,10 @@ if(MONTAGE_BUILD_APP)
   montage_copy_runtime(test_app)
   add_test(NAME test_app COMMAND test_app)
   set_tests_properties(test_app PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;MONTAGE_NO_PLUGIN_SCAN=1;MONTAGE_NO_RECOVERY_PROMPT=1;MONTAGE_RECOVERY_DIR=${CMAKE_CURRENT_BINARY_DIR}/recovery-test" TIMEOUT 300)
-  add_dependencies(test_app montage_test_plugins montage-plugin-probe)
+  add_dependencies(test_app montage_test_plugins montage_test_ofx montage-plugin-probe)
   target_compile_definitions(test_app PRIVATE
     MONTAGE_TEST_CLAP_DIR="${CMAKE_CURRENT_BINARY_DIR}/clap"
+    MONTAGE_TEST_OFX_DIR="${CMAKE_CURRENT_BINARY_DIR}/ofx"
     MONTAGE_PLUGIN_PROBE="$<TARGET_FILE:montage-plugin-probe>"
     MONTAGE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 endif()
@@ -44,10 +45,33 @@ montage_test_clap(montage_test_crash MontageTestCrash crash plugins/test_clap_mi
 target_compile_definitions(montage_test_crash PRIVATE MONTAGE_TEST_CRASH)
 montage_test_clap(montage_test_latency MontageTestLatency latency plugins/test_clap_latency.c)
 
+# ---- Video plugins: test OpenFX plugins built as *.ofx.bundle folders ----
+if(WIN32)
+  set(MONTAGE_OFX_ARCH Win64)
+elseif(APPLE)
+  set(MONTAGE_OFX_ARCH MacOS)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+  set(MONTAGE_OFX_ARCH Linux-aarch64)
+else()
+  set(MONTAGE_OFX_ARCH Linux-x86-64)
+endif()
+function(montage_test_ofx target output dir)
+  add_library(${target} MODULE plugins/test_ofx_plugins.c)
+  target_include_directories(${target} PRIVATE ${PROJECT_SOURCE_DIR}/third_party/openfx/include)
+  set_target_properties(${target} PROPERTIES PREFIX "" SUFFIX ".ofx" OUTPUT_NAME ${output}
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/ofx/${dir}/${output}.ofx.bundle/Contents/${MONTAGE_OFX_ARCH}
+    C_VISIBILITY_PRESET hidden)
+endfunction()
+montage_test_ofx(montage_test_ofx MontageTestOfx good)
+montage_test_ofx(montage_test_ofx_crash MontageTestOfxCrash crash)
+target_compile_definitions(montage_test_ofx_crash PRIVATE MONTAGE_TEST_OFX_CRASH)
+
 montage_test(test_plugins)
-add_dependencies(test_plugins montage_test_plugins montage_test_hang montage_test_crash montage_test_latency montage-plugin-probe)
+add_dependencies(test_plugins montage_test_plugins montage_test_hang montage_test_crash montage_test_latency montage-plugin-probe
+  montage_test_ofx montage_test_ofx_crash)
 target_compile_definitions(test_plugins PRIVATE
   MONTAGE_TEST_CLAP_DIR="${CMAKE_CURRENT_BINARY_DIR}/clap"
+  MONTAGE_TEST_OFX_DIR="${CMAKE_CURRENT_BINARY_DIR}/ofx"
   MONTAGE_PLUGIN_PROBE="$<TARGET_FILE:montage-plugin-probe>")
 
 if(TARGET PkgConfig::LILV)

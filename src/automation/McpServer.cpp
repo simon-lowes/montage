@@ -15,6 +15,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <numeric>
 #include <sstream>
 
@@ -35,6 +36,7 @@
 #include "media/TextReader.h"
 #include "media/ImageSequence.h"
 #include "media/Interpret.h"
+#include "render/Ofx.h"
 #include "media/Psd.h"
 #include "core/AutoTag.h"
 #include "core/Automation.h"
@@ -250,6 +252,23 @@ void logJson(const MediaItem& m, QJsonObject& o) {
         o["subclip_start_seconds"] = m.subclipIn;
         o["subclip_end_seconds"] = m.subclipOut;
     }
+}
+
+// OpenFX plugins installed here (render/Ofx.h), found once per process.
+const std::vector<ofx::PluginDesc>& openFxPlugins() {
+    static const std::vector<ofx::PluginDesc> found = [] {
+        if (ofx::Registry::instance().plugins().empty()) ofx::Registry::instance().scan();
+        return ofx::Registry::instance().plugins();
+    }();
+    return found;
+}
+bool openFxPlugin(const std::string& id, ofx::PluginDesc& out) {
+    for (const ofx::PluginDesc& d : openFxPlugins())
+        if (d.id == id) {
+            out = d;
+            return true;
+        }
+    return ofx::Registry::instance().find(id, out);
 }
 
 // How a media item is read (Interpret Footage), for reports; empty as the file says.
@@ -1346,6 +1365,29 @@ void McpServer::Impl::addTools() {
                 list.append(QJsonObject{{"type", QString::fromStdString(e.type)}, {"name", QString::fromStdString(e.displayName)},
                                         {"group", QString::fromStdString(e.group)}, {"params", params}});
             }
+            // OpenFX video plugins installed on this computer.
+            if (kind == "video") {
+                Project scratch = makeDefaultProject();
+                for (const ofx::PluginDesc& d : openFxPlugins()) {
+                    const Effect e = ofx::makeEffect(scratch, d);
+                    QJsonArray params;
+                    for (const ParamInfo& pi : effectParams(e)) {
+                        QJsonObject po{{"name", QString::fromStdString(pi.name)}, {"label", QString::fromStdString(pi.label)},
+                                       {"min", pi.min}, {"max", pi.max}, {"default", pi.def}};
+                        if (!pi.choices.empty()) {
+                            QJsonArray ch;
+                            for (const auto& c : pi.choices) ch.append(QString::fromStdString(c));
+                            po["choices"] = ch;
+                        }
+                        if (pi.kind == ParamKind::Color) po["channels"] = QJsonArray{QString::fromStdString(pi.name + ".r"), QString::fromStdString(pi.name + ".g"),
+                                                                                      QString::fromStdString(pi.name + ".b")};
+                        params.append(po);
+                    }
+                    list.append(QJsonObject{{"type", QString::fromStdString(ofx::kTypePrefix + d.id)}, {"name", QString::fromStdString(d.label)},
+                                            {"group", QString::fromStdString("OpenFX" + (d.group.empty() ? std::string() : "/" + d.group))},
+                                            {"params", params}});
+                }
+            }
             const QJsonObject o{{"effects", list}};
             return ok(json(o), o);
         });
@@ -1373,19 +1415,31 @@ void McpServer::Impl::addTools() {
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
             Clip& c = clipArg(l, a);
-            const std::string type = need(a, "effect").toStdString();
+            std::string type = need(a, "effect").toStdString();
+            // An OpenFX video plugin ("ofx:<id>", see montage_list_effects) is an "ofx" effect with the plugin's parameters.
+            std::optional<Effect> plugin;
+            if (ofx::isOfxType(type)) {
+                ofx::PluginDesc d;
+                if (!openFxPlugin(type.substr(std::char_traits<char>::length(ofx::kTypePrefix)), d))
+                    throw ArgError{QStringLiteral("No OpenFX plugin \"%1\" is installed (see montage_list_effects)").arg(QString::fromStdString(type))};
+                plugin = ofx::makeEffect(l.project, d);
+                type = "ofx";
+            }
             const EffectInfo* info = findEffectInfo(type);
-            if (!info || info->hidden || (info->category != EffectCategory::VideoFilter && info->category != EffectCategory::AudioFilter))
+            if (!info || (info->hidden && !plugin) || (info->category != EffectCategory::VideoFilter && info->category != EffectCategory::AudioFilter))
                 throw ArgError{QStringLiteral("Unknown effect \"%1\" (see montage_list_effects)").arg(QString::fromStdString(type))};
+            const std::string displayName = plugin ? ofx::effectName(*plugin) : info->displayName;
             if (type == "enhance_speech" && (!speechEnhancerAvailable() || !speechModel().installed()))
                 return fail("Enhance Speech needs its model: run `scripts/fetch-models.sh` or add the effect once in the app");
             if (type == "super_scale" && (!upscalerAvailable() || !upscaleModel().installed()))
                 return fail("Super Scale needs its model: run `scripts/fetch-models.sh` or add the effect once in the app");
-            Effect e = makeEffect(l.project, type);
+            Effect e = plugin ? *plugin : makeEffect(l.project, type);
             const QJsonObject params = a.value("params").toObject();
             for (auto it = params.begin(); it != params.end(); ++it) {
-                const std::string name = it.key().toStdString();
-                const bool known = std::any_of(info->params.begin(), info->params.end(), [&](const ParamInfo& p) { return p.name == name; }) ||
+                std::string name = it.key().toStdString();
+                if (plugin && name.rfind("param.", 0) != 0 && name.rfind("mask.", 0) != 0) name = "param." + name;  // "amount" for "param.amount"
+                const bool known = (plugin ? e.params.count(name) > 0
+                                           : std::any_of(info->params.begin(), info->params.end(), [&](const ParamInfo& p) { return p.name == name; })) ||
                                    (name.rfind("mask.", 0) == 0 && supportsMask(type));
                 if (!known) throw ArgError{QStringLiteral("\"%1\" has no parameter \"%2\"").arg(QString::fromStdString(type), it.key())};
                 e.params[name] = Param(it.value().toDouble());
@@ -1393,6 +1447,13 @@ void McpServer::Impl::addTools() {
             const QJsonObject strings = a.value("strings").toObject();
             for (auto it = strings.begin(); it != strings.end(); ++it) {
                 const std::string name = it.key().toStdString();
+                if (plugin) {
+                    const std::string key = name.rfind("str.", 0) == 0 ? name : "str." + name;
+                    if (!e.strings.count(key))
+                        throw ArgError{QStringLiteral("\"%1\" has no text setting \"%2\"").arg(QString::fromStdString(displayName), it.key())};
+                    e.strings[key] = it.value().toString().toStdString();
+                    continue;
+                }
                 const auto si = std::find_if(info->strings.begin(), info->strings.end(), [&](const StringParamInfo& x) { return x.name == name; });
                 if (si == info->strings.end())
                     throw ArgError{QStringLiteral("\"%1\" has no text setting \"%2\"").arg(QString::fromStdString(type), it.key())};
@@ -1455,7 +1516,7 @@ void McpServer::Impl::addTools() {
                     throw ArgError{"A colour group takes picture effects that work the same on each clip"};
                 (stage == "pre" ? g->pre : g->post).push_back(e);
                 save(l);
-                return ok(QStringLiteral("Added %1 to the %2-clip grade of %3").arg(QString::fromStdString(info->displayName), stage, QString::fromStdString(g->name)),
+                return ok(QStringLiteral("Added %1 to the %2-clip grade of %3").arg(QString::fromStdString(displayName), stage, QString::fromStdString(g->name)),
                           QJsonObject{{"effect_id", double(e.id)}});
             }
             if (type == "stabilize" || type == "rolling_shutter") {
@@ -1466,12 +1527,12 @@ void McpServer::Impl::addTools() {
                 e.strings["motion"] = motion;
                 c.effects.insert(c.effects.begin(), e);
                 save(l);
-                return ok(QStringLiteral("Added %1 to %2").arg(QString::fromStdString(info->displayName), QString::fromStdString(c.name)),
+                return ok(QStringLiteral("Added %1 to %2").arg(QString::fromStdString(displayName), QString::fromStdString(c.name)),
                           QJsonObject{{"effect_id", double(e.id)}});
             }
             c.effects.push_back(e);
             save(l);
-            return ok(QStringLiteral("Added %1 to %2").arg(QString::fromStdString(info->displayName), QString::fromStdString(c.name)),
+            return ok(QStringLiteral("Added %1 to %2").arg(QString::fromStdString(displayName), QString::fromStdString(c.name)),
                       QJsonObject{{"effect_id", double(e.id)}});
         });
 

@@ -1,4 +1,5 @@
 #include "PluginEffect.h"
+#include "render/Ofx.h"
 
 #include <QByteArray>
 
@@ -41,6 +42,15 @@ bool isPluginType(const std::string& type) { return type.rfind(kPluginTypePrefix
 std::string pluginType(const Descriptor& d) { return kPluginTypePrefix + d.id; }
 
 std::optional<Effect> makeEffectOfType(Project& p, const std::string& type, std::string* error) {
+    if (ofx::isOfxType(type)) {
+        // An OpenFX video plugin (render/Ofx.h).
+        ofx::PluginDesc d;
+        if (!ofx::Registry::instance().find(type.substr(std::char_traits<char>::length(ofx::kTypePrefix)), d)) {
+            if (error) *error = "the OpenFX plugin is not installed";
+            return std::nullopt;
+        }
+        return ofx::makeEffect(p, d);
+    }
     if (!isPluginType(type)) return makeEffect(p, type);
     auto d = Registry::instance().find(type.substr(std::char_traits<char>::length(kPluginTypePrefix)));
     if (!d) {
@@ -51,6 +61,10 @@ std::optional<Effect> makeEffectOfType(Project& p, const std::string& type, std:
 }
 
 std::string effectTypeName(const std::string& type) {
+    if (ofx::isOfxType(type)) {
+        ofx::PluginDesc d;
+        return ofx::Registry::instance().find(type.substr(std::char_traits<char>::length(ofx::kTypePrefix)), d) ? d.label : type;
+    }
     if (isPluginType(type)) {
         auto d = Registry::instance().find(type.substr(std::char_traits<char>::length(kPluginTypePrefix)));
         return d ? d->name : type;
@@ -60,6 +74,7 @@ std::string effectTypeName(const std::string& type) {
 }
 
 std::string effectName(const Effect& e) {
+    if (e.type == "ofx") return ofx::effectName(e);
     if (e.type == "plugin") {
         const std::string fmt = e.s("plugin_format");
         return e.s("plugin_name", "Audio Plugin") + (fmt.empty() ? "" : " (" + fmt + ")");

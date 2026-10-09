@@ -1,4 +1,5 @@
 #include "Processing.h"
+#include "Ofx.h"
 
 #include "ColorSpace.h"
 #include "Ocio.h"
@@ -1352,6 +1353,8 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
         if (from && to) convertColor(img, *from, *to);
     } else if (ty == "ocio")
         applyOcio(e, img);
+    else if (ty == "ofx")
+        ofx::applyEffect(e, double(t), img, pixelScale, ofx::currentFetch());
     else if (ty == "chroma_key") chromaKey(e, t, img);
     else if (ty == "screen_key") screenKey(e, t, img, pixelScale);
     else if (ty == "luma_key") lumaKey(e, t, img);
