@@ -145,6 +145,10 @@ std::vector<EffectInfo> buildCatalog() {
                       curve("hue_luma", "Hue vs Luma", StringKind::HueCurve), curve("luma_sat", "Luma vs Saturation", StringKind::LevelCurve),
                       curve("sat_sat", "Saturation vs Saturation", StringKind::LevelCurve)}});
     }
+    // Colour Warper (Resolve's): a hue-by-saturation mesh whose points pull colours to others (core/ColorWarp.h).
+    c.push_back({"color_warper", "Colour Warper", EffectCategory::VideoFilter, "Color",
+                 {pct("mix", "Mix", 0, 100, 100), boolean("preserve_luma", "Preserve Luminance")},
+                 {str("mesh", "Hue / Saturation", StringKind::ColorWarp, "")}});
     c.push_back({"hue_sat", "Hue / Saturation / Lightness", EffectCategory::VideoFilter, "Color",
                  {angle("hue", "Hue Shift"), num("saturation", "Saturation", 0, 3, 1),
                   num("lightness", "Lightness", -1, 1, 0), num("vibrance", "Vibrance", -1, 1, 0)},

@@ -5693,6 +5693,21 @@ private slots:
         r = tool("montage_add_effect", QJsonObject{{"project", project}, {"clip", second}, {"effect", "invert"},
                                                    {"mask_path", QJsonArray{QJsonArray{0.2, 0.2}, QJsonArray{0.8, 0.2}}}});
         QVERIFY(r.value("isError").toBool() && text(r).contains("three"));
+        // Text settings: the Colour Warper's mesh, checked; unknown settings refused.
+        r = tool("montage_add_effect", QJsonObject{{"project", project}, {"clip", second}, {"effect", "color_warper"},
+                                                   {"strings", QJsonObject{{"mesh", "0,4,30,0,0;6,4,-20,0.1,0"}}}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY(tool("montage_add_effect", QJsonObject{{"project", project}, {"clip", second}, {"effect", "color_warper"},
+                                                       {"strings", QJsonObject{{"mesh", "0,9,30,0,0"}}}}).value("isError").toBool());
+        QVERIFY(tool("montage_add_effect", QJsonObject{{"project", project}, {"clip", second}, {"effect", "color_warper"},
+                                                       {"strings", QJsonObject{{"nope", "x"}}}}).value("isError").toBool());
+        {
+            Project warped;
+            QVERIFY(loadProject(project.toStdString(), warped));
+            const Clip* c = edit::clipById(*warped.active(), Id(second));
+            QVERIFY(c && c->effects.back().type == "color_warper");
+            QCOMPARE(c->effects.back().s("mesh"), std::string("0,4,30,0,0;6,4,-20,0.1,0"));
+        }
         // Rolling Shutter Repair measures the camera's movement as it is added, and goes first.
         r = tool("montage_add_effect", QJsonObject{{"project", project}, {"clip", second}, {"effect", "rolling_shutter"},
                                                    {"params", QJsonObject{{"readout", 60}}}});

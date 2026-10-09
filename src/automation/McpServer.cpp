@@ -22,6 +22,7 @@
 #include "core/Automation.h"
 #include "core/CaptionTools.h"
 #include "core/Captions.h"
+#include "core/ColorWarp.h"
 #include "core/Chapters.h"
 #include "core/MarkerList.h"
 #include "core/MaskPath.h"
@@ -873,6 +874,7 @@ void McpServer::Impl::addTools() {
         "the camera's movement when added.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},"effect":{"type":"string"},
             "params":{"type":"object","additionalProperties":{"type":"number"}},
+            "strings":{"type":"object","additionalProperties":{"type":"string"},"description":"Text settings: curves (\"x,y x,y\"), hue curves, a LUT file, the Colour Warper's mesh (\"spoke,ring,hue,sat,luma;...\": spokes 0-11 every 30 degrees from red, rings 1-4 for saturation 25-100 %, hue moved in degrees, saturation in 0-1 units, brightness in stops)..."},
             "mask_path":{"type":"array","items":{"type":["array","object"]},"description":"A closed Bezier mask: three or more points, fractions of the clip's frame"},
             "mask_smooth":{"type":"boolean","default":false}},"required":["project","clip","effect"]})json",
         false, [](const QJsonObject& a) {
@@ -894,6 +896,19 @@ void McpServer::Impl::addTools() {
                                    (name.rfind("mask.", 0) == 0 && supportsMask(type));
                 if (!known) throw ArgError{QStringLiteral("\"%1\" has no parameter \"%2\"").arg(QString::fromStdString(type), it.key())};
                 e.params[name] = Param(it.value().toDouble());
+            }
+            const QJsonObject strings = a.value("strings").toObject();
+            for (auto it = strings.begin(); it != strings.end(); ++it) {
+                const std::string name = it.key().toStdString();
+                const auto si = std::find_if(info->strings.begin(), info->strings.end(), [&](const StringParamInfo& x) { return x.name == name; });
+                if (si == info->strings.end())
+                    throw ArgError{QStringLiteral("\"%1\" has no text setting \"%2\"").arg(QString::fromStdString(type), it.key())};
+                const std::string value = it.value().toString().toStdString();
+                if (si->kind == StringKind::ColorWarp) {
+                    ColorWarp w;
+                    if (!parseColorWarp(value, w)) throw ArgError{QStringLiteral("The mesh is \"spoke,ring,hue,sat,luma\" groups separated by ';'")};
+                }
+                e.strings[name] = value;
             }
             if (a.contains("mask_path")) {
                 if (!supportsMask(type)) throw ArgError{QStringLiteral("\"%1\" cannot have a mask").arg(QString::fromStdString(type))};

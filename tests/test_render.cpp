@@ -750,6 +750,38 @@ colorspaces:
         QCOMPARE(m[25 * 100 + 5], 0.0f);
     }
 
+    void colourWarper() {
+        // Red, a grey and a blue: red's full-saturation point moved a third of the way round makes it green.
+        const float colours[3][3] = {{1, 0, 0}, {0.5f, 0.5f, 0.5f}, {0, 0, 1}};
+        Image src(3, 1);
+        for (int i = 0; i < 3; ++i) {
+            std::copy(colours[i], colours[i] + 3, src.at(i, 0));
+            src.at(i, 0)[3] = 1;
+        }
+        Effect e = makeEffect("color_warper", 1);
+        e.strings["mesh"] = "0,4,120,0,0";
+        Image img = src;
+        applyVideoEffect(e, 0, img, 1);
+        QVERIFY(img.at(0, 0)[0] < 0.01f && img.at(0, 0)[1] > 0.99f && img.at(0, 0)[2] < 0.01f);
+        for (int i : {1, 2})
+            for (int c = 0; c < 3; ++c) QVERIFY(std::fabs(img.at(i, 0)[c] - colours[i][c]) < 1e-5f);
+        // Half mixed; at red's brightness (the green as light as the red was); a point that darkens by a stop.
+        e.params["mix"] = 50.0;
+        img = src;
+        applyVideoEffect(e, 0, img, 1);
+        QVERIFY(std::fabs(img.at(0, 0)[0] - 0.5f) < 0.01f && std::fabs(img.at(0, 0)[1] - 0.5f) < 0.01f);
+        e.params["mix"] = 100.0;
+        e.params["preserve_luma"] = 1.0;
+        img = src;
+        applyVideoEffect(e, 0, img, 1);
+        QVERIFY2(std::fabs(img.at(0, 0)[1] - 0.2126f / 0.7152f) < 0.005f, qPrintable(QString::number(img.at(0, 0)[1])));
+        e.params["preserve_luma"] = 0.0;
+        e.strings["mesh"] = "8,4,0,0,-1";  // blue's point, a stop darker
+        img = src;
+        applyVideoEffect(e, 0, img, 1);
+        QVERIFY(std::fabs(img.at(2, 0)[2] - 0.5f) < 0.005f && std::fabs(img.at(0, 0)[0] - 1) < 1e-5f);
+    }
+
     void rollingShutterRepair() {
         // The picture moves right by a tenth of the width a frame; read out over 80 % of a frame, a vertical bar
         // leans (lower rows were read later, so further on): 20 px a frame, 16 px from top to bottom of 200 x 100.

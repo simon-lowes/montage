@@ -9,6 +9,7 @@
 #include "core/Automation.h"
 #include "core/CaptionTools.h"
 #include "core/Captions.h"
+#include "core/ColorWarp.h"
 #include "core/Bleep.h"
 #include "core/Cfb.h"
 #include "core/Chapters.h"
@@ -3221,6 +3222,48 @@ private slots:
         QCOMPARE(lost.size(), size_t(1));
         QVERIFY(lost[0].kind == ChangeKind::Removed && lost[0].before == c2);
         QCOMPARE(std::string(changeKindName(ChangeKind::Trimmed)), std::string("Trimmed"));
+    }
+
+    void colorWarpMesh() {
+        auto near = [](double a, double b) { return std::fabs(a - b) < 1e-9; };
+        ColorWarp w;
+        QVERIFY(parseColorWarp("0,4,30,0,0; 3,2,-15,0.1,0.5", w));
+        QCOMPARE(w.points.size(), size_t(2));
+        QCOMPARE(w.at(3, 2).ds, 0.1);
+        QCOMPARE(colorWarpToString(w), std::string("3,2,-15,0.1,0.5;0,4,30,0,0"));
+        ColorWarp back;
+        QVERIFY(parseColorWarp(colorWarpToString(w), back) && back.points == w.points);
+        QVERIFY(!parseColorWarp("1,9,0,0,0", back) && !parseColorWarp("0,0,5,0,0", back) && !parseColorWarp("x", back));
+        QVERIFY(parseColorWarp("", back) && back.empty());
+        w.set({3, 2});  // back where it was: forgotten
+        QCOMPARE(w.points.size(), size_t(1));
+
+        // Red at full saturation moves 30 degrees towards orange; half way to the next ring in, half as far;
+        // half way to the next spoke, half as far; other hues, and greys, stay.
+        double h = 0, s = 0, k = 0;
+        warpHueSat(w, 0, 1, h, s, k);
+        QVERIFY(near(h, 30.0 / 360) && near(s, 1) && near(k, 1));
+        warpHueSat(w, 0, 0.875, h, s, k);
+        QVERIFY(near(h, 15.0 / 360));
+        warpHueSat(w, 15.0 / 360, 1, h, s, k);
+        QVERIFY(near(h, 30.0 / 360));
+        warpHueSat(w, 60.0 / 360, 1, h, s, k);
+        QVERIFY(near(h, 60.0 / 360));
+        warpHueSat(w, 0.3, 0, h, s, k);
+        QVERIFY(near(h, 0.3) && near(s, 0));
+        // Round the wheel the short way; saturation and brightness moves.
+        w.set({0, 4, -30, -0.5, 1});
+        warpHueSat(w, 0, 1, h, s, k);
+        QVERIFY(near(h, 330.0 / 360) && near(s, 0.5) && near(k, 2));
+        // The per-pixel table agrees.
+        const WarpField field(w);
+        for (double hue : {0.0, 0.02, 0.5, 0.97})
+            for (double sat : {0.1, 0.6, 1.0}) {
+                double h2, s2, k2;
+                warpHueSat(w, hue, sat, h, s, k);
+                field.apply(hue, sat, h2, s2, k2);
+                QVERIFY(near(h, h2) && near(s, s2) && near(k, k2));
+            }
     }
 
     void maskPathModel() {

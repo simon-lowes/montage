@@ -38,6 +38,7 @@
 #include "media/MediaPool.h"
 #include "AutoMixDialog.h"
 #include "CaptionsPanel.h"
+#include "ColorWarperEditor.h"
 #include "ColorWheel.h"
 #include "CurveEditor.h"
 #include "EditorState.h"
@@ -56,6 +57,7 @@
 #include "ScriptCutDialog.h"
 #include "core/KeyframeEdit.h"
 #include "core/CaptionTools.h"
+#include "core/ColorWarp.h"
 #include "core/MaskPath.h"
 #include "core/MediaLog.h"
 #include "InspectorWidget.h"
@@ -5059,6 +5061,62 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(state()->project().media.at(0).visual && !state()->project().media.at(0).visual->samples.empty());
         win_->activateWindow();
         QVERIFY(QTest::qWaitForWindowActive(win_.get()));
+    }
+
+    void colourWarperInInspector() {
+        loadDemo();
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        Id fx = 0;
+        QVERIFY(state()->edit("Warper", [&](Project& p, Sequence& s) {
+            Effect e = makeEffect(p, "color_warper");
+            fx = e.id;
+            edit::clipById(s, red)->effects.push_back(e);
+            return true;
+        }));
+        state()->setSelection({red}, false);
+        auto* editor = win_->findChild<ColorWarperEditor*>("warp_mesh");
+        QTRY_VERIFY(editor && editor->isVisible());
+        editor->resize(240, 240);
+        auto mesh = [&] { return edit::ownedEffect(const_cast<Sequence&>(*state()->sequence()), red, fx)->s("mesh"); };
+        // Drag red's full-saturation point to where orange (30 degrees) is: one undo step.
+        const QPoint from = editor->pointPos(0, 4).toPoint(), to = editor->colourPos(30.0 / 360, 1).toPoint();
+        QTest::mousePress(editor, Qt::LeftButton, {}, from);
+        for (int i = 1; i <= 4; ++i) {
+            const QPoint at = from + (to - from) * i / 4;
+            QMouseEvent move(QEvent::MouseMove, QPointF(at), editor->mapToGlobal(QPointF(at)), Qt::NoButton, Qt::LeftButton, {});
+            QApplication::sendEvent(editor, &move);
+        }
+        QTest::mouseRelease(editor, Qt::LeftButton, {}, to);
+        ColorWarp w;
+        QVERIFY(parseColorWarp(mesh(), w));
+        QVERIFY2(std::fabs(w.at(0, 4).dh - 30) < 2.5 && std::fabs(w.at(0, 4).ds) < 0.03, mesh().c_str());
+        QCOMPARE(editor->selectedSpoke(), 0);
+        // The selected point's brightness from the spin box.
+        auto* luma = win_->findChild<QDoubleSpinBox*>("warpLuma");
+        QVERIFY(luma && luma->isEnabled());
+        luma->setValue(-0.5);
+        QVERIFY(parseColorWarp(mesh(), w) && std::fabs(w.at(0, 4).dl + 0.5) < 1e-9);
+        // The picture changes: Red's red turns towards orange.
+        const Image frame = renderSequenceFrame(state()->project(), *state()->sequence(), 10, {});
+        QVERIFY(frame.at(frame.width / 2, frame.height / 2)[1] > 0.05f);
+        // Undone (with the drag when it came straight after it, as curve edits run together).
+        state()->undo();
+        QVERIFY(parseColorWarp(mesh(), w) && w.at(0, 4).dl == 0);
+        QVERIFY(state()->edit("Mesh", [&](Project&, Sequence& s) {
+            edit::ownedEffect(s, red, fx)->strings["mesh"] = "0,4,30,0,0";
+            return true;
+        }));
+        // Double-clicking puts a point back; Reset All clears the mesh.
+        QTRY_VERIFY(std::fabs(editor->warp().at(0, 4).dh - 30) < 1e-9);
+        QTest::mouseDClick(editor, Qt::LeftButton, {}, editor->pointPos(0, 4).toPoint());
+        QVERIFY(mesh().empty());  // the moved point, not spoke 1's that it now covers
+        state()->undo();
+        QVERIFY(!mesh().empty());
+        auto* resetAll = win_->findChild<QToolButton*>("warpResetAll");
+        QVERIFY(resetAll);
+        resetAll->click();
+        QVERIFY(mesh().empty());
+        state()->setSelection({}, false);
     }
 
     void maskOverlayInProgramMonitor() {

@@ -4,6 +4,7 @@
 #include "Ocio.h"
 #include "VideoFx.h"
 #include "core/Effects.h"
+#include "core/ColorWarp.h"
 #include "core/MaskPath.h"
 #include "media/DepthMap.h"
 #include "media/Matting.h"
@@ -167,6 +168,7 @@ void curves(const Effect& e, FrameTime t, Image& img) {
 }
 
 void hueCurves(const Effect& e, FrameTime t, Image& img);  // below, beside the curve building
+void colorWarper(const Effect& e, FrameTime t, Image& img);  // below, as hue curves
 
 void hueSat(const Effect& e, FrameTime t, Image& img) {
     float hue = float(e.p("hue", t)) * float(M_PI) / 180.0f;
@@ -1178,6 +1180,7 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
     if (ty == "color_correct") colorCorrect(e, t, img);
     else if (ty == "curves") curves(e, t, img);
     else if (ty == "hue_curves") hueCurves(e, t, img);
+    else if (ty == "color_warper") colorWarper(e, t, img);
     else if (ty == "hue_sat") hueSat(e, t, img);
     else if (ty == "lut") applyLut(e, t, img);
     else if (ty == "color_space_transform") {
@@ -1514,6 +1517,51 @@ void hueCurves(const Effect& e, FrameTime t, Image& img) {
         r += (rr + m - r) * mix;
         g += (gg + m - g) * mix;
         b += (bb + m - b) * mix;
+    });
+}
+
+void colorWarper(const Effect& e, FrameTime t, Image& img) {
+    ColorWarp w;
+    if (!parseColorWarp(e.s("mesh"), w) || w.empty()) return;
+    const WarpField field(w);
+    const float mix = float(std::clamp(e.p("mix", t, 100) / 100.0, 0.0, 1.0));
+    const bool keepLuma = e.p("preserve_luma", t) > 0.5;
+    perPixel(img, [&](float& r, float& g, float& b, float&) {
+        const float v = std::max({r, g, b}), mn = std::min({r, g, b}), c = v - mn;
+        if (v <= 0) return;
+        const float s = c / v;
+        float h = 0;
+        if (c > 1e-6f) {
+            if (v == r) h = std::fmod((g - b) / c + 6.0f, 6.0f);
+            else if (v == g) h = (b - r) / c + 2;
+            else h = (r - g) / c + 4;
+            h /= 6;
+        }
+        double nhd, nsd, k;
+        field.apply(h, s, nhd, nsd, k);
+        const float nh = float(nhd), ns = float(nsd), nv = v * float(k);
+        const float cc = nv * ns, hp = nh * 6, xx = cc * (1 - std::fabs(std::fmod(hp, 2.0f) - 1)), m = nv - cc;
+        float rr, gg, bb;
+        switch (int(hp) % 6) {
+            case 0: rr = cc, gg = xx, bb = 0; break;
+            case 1: rr = xx, gg = cc, bb = 0; break;
+            case 2: rr = 0, gg = cc, bb = xx; break;
+            case 3: rr = 0, gg = xx, bb = cc; break;
+            case 4: rr = xx, gg = 0, bb = cc; break;
+            default: rr = cc, gg = 0, bb = xx; break;
+        }
+        rr += m, gg += m, bb += m;
+        if (keepLuma) {
+            // The new colour at the old brightness (times the point's own brightness change).
+            const float before = luma(r, g, b) * float(k), after = luma(rr, gg, bb);
+            if (after > 1e-6f) {
+                const float f = before / after;
+                rr *= f, gg *= f, bb *= f;
+            }
+        }
+        r += (rr - r) * mix;
+        g += (gg - g) * mix;
+        b += (bb - b) * mix;
     });
 }
 

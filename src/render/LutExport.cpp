@@ -11,7 +11,7 @@
 namespace montage {
 
 bool isColorOnlyEffect(const Effect& e, FrameTime t) {
-    static const std::set<std::string> kinds{"color_correct", "curves", "hue_curves", "hue_sat",      "lut", "color_space_transform",
+    static const std::set<std::string> kinds{"color_correct", "curves", "hue_curves", "color_warper", "hue_sat",      "lut", "color_space_transform",
                                              "ocio",          "levels", "invert",     "black_white", "broadcast_safe"};
     if (!kinds.count(e.type) || hasMask(e, t)) return false;
     if (e.type == "broadcast_safe" && e.p("highlight", t, 0) >= 0.5) return false;  // the stripes are drawn in place

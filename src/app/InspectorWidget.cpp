@@ -37,6 +37,7 @@
 #include "core/EditOps.h"
 #include "core/MaskPath.h"
 #include "ColorWheel.h"
+#include "ColorWarperEditor.h"
 #include "CurveEditor.h"
 #include "render/ClipAnalysis.h"
 #include "render/Compositor.h"
@@ -1314,6 +1315,57 @@ void InspectorWidget::addStringRow(QFormLayout* form, const StringParamInfo& si,
             });
             refreshers_.push_back([editor, read] {
                 if (!editor->dragging() && editor->points() != read()) editor->setPoints(read());
+            });
+            break;
+        }
+        case StringKind::ColorWarp: {
+            // The mesh to drag, the selected point's brightness, and putting points back.
+            auto* box = new QWidget(content_);
+            auto* v = new QVBoxLayout(box);
+            v->setContentsMargins(0, 0, 0, 0);
+            auto* editor = new ColorWarperEditor(box);
+            editor->setObjectName(QString::fromStdString("warp_" + name));
+            auto* row = new QWidget(box);
+            auto* h = new QHBoxLayout(row);
+            h->setContentsMargins(0, 0, 0, 0);
+            auto* luma = new QDoubleSpinBox(row);
+            luma->setObjectName(QStringLiteral("warpLuma"));
+            luma->setRange(-2, 2);
+            luma->setSingleStep(0.05);
+            luma->setDecimals(2);
+            luma->setSuffix(tr(" stops"));
+            luma->setToolTip(tr("Brighten or darken the selected point's colours"));
+            luma->setEnabled(false);
+            auto* resetPoint = new QToolButton(row);
+            resetPoint->setText(tr("Reset Point"));
+            resetPoint->setEnabled(false);
+            auto* resetAll = new QToolButton(row);
+            resetAll->setText(tr("Reset All"));
+            resetAll->setObjectName(QStringLiteral("warpResetAll"));
+            h->addWidget(new QLabel(tr("Brightness:"), row));
+            h->addWidget(luma);
+            h->addStretch(1);
+            h->addWidget(resetPoint);
+            h->addWidget(resetAll);
+            v->addWidget(editor);
+            v->addWidget(row);
+            form->addRow(label, box);
+            connect(editor, &ColorWarperEditor::edited, this, [write](const QString& mesh, bool) { write(mesh); });
+            connect(editor, &ColorWarperEditor::selectionChanged, this, [editor, luma, resetPoint] {
+                const bool on = editor->selectedSpoke() >= 0;
+                QSignalBlocker b(luma);
+                luma->setEnabled(on);
+                resetPoint->setEnabled(on);
+                luma->setValue(on ? editor->warp().at(editor->selectedSpoke(), editor->selectedRing()).dl : 0.0);
+            });
+            connect(luma, &QDoubleSpinBox::valueChanged, this, [editor](double stops) { editor->setSelectedLuma(stops); });
+            connect(resetPoint, &QToolButton::clicked, editor, &ColorWarperEditor::resetSelected);
+            connect(resetAll, &QToolButton::clicked, this, [editor, write] {
+                editor->setMesh(QString());
+                write(QString());
+            });
+            refreshers_.push_back([editor, read] {
+                if (!editor->dragging() && editor->mesh() != read()) editor->setMesh(read());
             });
             break;
         }
