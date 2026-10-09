@@ -17,7 +17,9 @@
 #include "core/ProjectIO.h"
 #include "media/Decoder.h"
 #include "media/MediaPool.h"
+#include "media/ImageSequence.h"
 #include "media/Relink.h"
+#include "Settings.h"
 #include "ThumbnailCache.h"
 
 namespace montage {
@@ -388,15 +390,64 @@ void EditorState::startAudioDecode(const MediaItem& m) {
     (void)QtConcurrent::run([path, rate] { MediaPool::instance().audio(path, rate); });
 }
 
+Id EditorState::importImageSequence(const QString& frame, Rational fps, QString* error) {
+    ImageSequence seq;
+    if (!detectImageSequence(frame.toStdString(), seq)) {
+        if (error) *error = tr("%1 is not part of a numbered sequence").arg(QFileInfo(frame).fileName());
+        return 0;
+    }
+    seq.fps = fps.valid() ? fps : Rational{24, 1};
+    MediaItem m;
+    std::string err;
+    if (!probeMedia(imageSequencePath(seq), m, &err)) {
+        if (error) *error = QString::fromStdString(err);
+        return 0;
+    }
+    Id id = 0;
+    edit(tr("Import %1").arg(QString::fromStdString(m.name)), [&](Project& p, Sequence&) {
+        m.id = id = p.newId();
+        p.media.push_back(m);
+        return true;
+    });
+    return id;
+}
+
 std::vector<Id> EditorState::importFiles(const QStringList& paths, QStringList* errors, const QString& bin) {
     std::vector<MediaItem> items;
+    // Numbered frames in render formats, two or more of a run chosen: one image sequence each.
+    std::map<std::string, std::pair<ImageSequence, int>> runs;
+    if (appSettings().value(QStringLiteral("import/imageSequences"), true).toBool())
+        for (const QString& path : paths)
+            if (ImageSequence seq; isFrameFormat(path.toStdString()) && detectImageSequence(QFileInfo(path).absoluteFilePath().toStdString(), seq)) {
+                auto& run = runs[seq.pattern];
+                run.first = seq;
+                ++run.second;
+            }
+    std::set<std::string> made;
+    std::vector<Id> fromFolders;  // what folders brought in, each a step of its own
+    const Rational rate = sequence() && sequence()->fps.valid() ? sequence()->fps : Rational{24, 1};
     for (const QString& path : paths) {
         QFileInfo fi(path);
+        if (ImageSequence seq; !fi.isDir() && isFrameFormat(path.toStdString()) &&
+                               detectImageSequence(fi.absoluteFilePath().toStdString(), seq) && runs.count(seq.pattern) &&
+                               runs[seq.pattern].second >= 2) {
+            if (!made.insert(seq.pattern).second) continue;  // already made from another of its frames
+            seq.fps = rate;
+            MediaItem m;
+            std::string err;
+            if (!probeMedia(imageSequencePath(seq), m, &err)) {
+                if (errors) *errors << QString::fromStdString(err);
+                continue;
+            }
+            m.bin = bin.toStdString();
+            items.push_back(m);
+            continue;
+        }
         if (fi.isDir()) {
             QStringList children;
             for (const QFileInfo& c : QDir(path).entryInfoList(QDir::Files, QDir::Name)) children << c.absoluteFilePath();
-            auto ids = importFiles(children, errors, bin.isEmpty() ? fi.fileName() : bin + "/" + fi.fileName());
-            (void)ids;
+            const auto inFolder = importFiles(children, errors, bin.isEmpty() ? fi.fileName() : bin + "/" + fi.fileName());
+            fromFolders.insert(fromFolders.end(), inFolder.begin(), inFolder.end());
             continue;
         }
         MediaItem m;
@@ -408,7 +459,7 @@ std::vector<Id> EditorState::importFiles(const QStringList& paths, QStringList* 
         m.bin = bin.toStdString();
         items.push_back(m);
     }
-    std::vector<Id> ids;
+    std::vector<Id> ids = fromFolders;
     if (items.empty()) return ids;
     edit(items.size() == 1 ? tr("Import %1").arg(QString::fromStdString(items[0].name)) : tr("Import %n Files", "", int(items.size())),
          [&](Project& p, Sequence&) {

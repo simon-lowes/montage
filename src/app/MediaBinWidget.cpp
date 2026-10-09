@@ -55,6 +55,7 @@
 #include "TranscribeDialog.h"
 #include "core/Slate.h"
 #include "core/AudioChannels.h"
+#include "media/ImageSequence.h"
 #include "core/MediaLog.h"
 #include "core/AutoTag.h"
 #include "media/Analysis.h"
@@ -423,6 +424,26 @@ void MediaBinWidget::importDialog() {
     if (files.isEmpty()) return;
     settings.setValue("lastImportDir", QFileInfo(files.first()).absolutePath());
     importInto(files, smart_ ? QString() : bin_);
+}
+
+void MediaBinWidget::importImageSequenceDialog() {
+    QSettings settings = appSettings();
+    const QString file = QFileDialog::getOpenFileName(this, tr("Import Image Sequence"), settings.value("lastImportDir").toString(),
+                                                      tr("Frames (*.exr *.dpx *.png *.tif *.tiff *.tga *.bmp *.jpg *.jpeg *.webp);;All files (*)"));
+    if (file.isEmpty()) return;
+    settings.setValue("lastImportDir", QFileInfo(file).absolutePath());
+    const Sequence* s = state_->sequence();
+    bool ok = false;
+    const double fps = QInputDialog::getDouble(this, tr("Import Image Sequence"), tr("Frames per second:"),
+                                               s && s->fps.valid() ? s->fps.toDouble() : 24.0, 1, 240, 3, &ok);
+    if (!ok) return;
+    QString why;
+    if (!state_->importImageSequence(file, rateFor(fps), &why)) QMessageBox::warning(this, tr("Import Image Sequence"), why);
+}
+
+bool MediaBinWidget::setImageSequenceRate(Id media, double fps) {
+    const Rational rate = rateFor(fps);
+    return state_->apply(tr("Interpret Frame Rate"), [media, rate](Project& p, Sequence&) { return edit::setImageSequenceRate(p, media, rate); });
 }
 
 void MediaBinWidget::importInto(const QStringList& files, const QString& bin) {
@@ -1145,6 +1166,14 @@ void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos)
             a->setChecked(current == cs.id);
             a->setData(QString::fromStdString(cs.id));
         }
+        // An image sequence's frame rate (Interpret Footage).
+        if (pictures.size() == 1)
+            if (const MediaItem* m = state_->project().findMedia(pictures.front()); m && isImageSequencePath(m->path))
+                menu.addAction(tr("Interpret Frame Rate…"), this, [this, id = m->id, fps = m->fps.toDouble()] {
+                    bool ok = false;
+                    const double v = QInputDialog::getDouble(this, tr("Interpret Frame Rate"), tr("Frames per second:"), fps, 1, 240, 3, &ok);
+                    if (ok) setImageSequenceRate(id, v);
+                })->setObjectName(QStringLiteral("interpretFrameRate"));
         // 360° footage: placed in a flat sequence as a view out of the sphere (Reframe 360°).
         bool all360 = true;
         for (Id id : pictures) all360 = all360 && state_->project().findMedia(id)->projection == "equirect";

@@ -601,7 +601,7 @@ private:
         const MediaItem* m = p_.findMedia(c.mediaId);
         if (!m || m->kind != MediaKind::Video || m->path.empty()) return nullptr;
         if (mediaColorSpace(*m).id != seqSpace_.id) return nullptr;  // would be converted
-        if (avformat_open_input(&src.fmt, m->path.c_str(), nullptr, nullptr) < 0) return nullptr;
+        if (openMediaInput(&src.fmt, m->path) < 0) return nullptr;
         if (avformat_find_stream_info(src.fmt, nullptr) < 0) return nullptr;
         src.stream = av_find_best_stream(src.fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
         if (src.stream < 0) return nullptr;

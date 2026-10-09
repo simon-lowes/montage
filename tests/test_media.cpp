@@ -58,6 +58,7 @@
 #include "media/Beats.h"
 #include "render/Spherical.h"
 #include "render/ClipPlacement.h"
+#include "media/ImageSequence.h"
 #include "render/AudioReactive.h"
 #include "render/VfxPull.h"
 #include "render/AafExport.h"
@@ -1814,6 +1815,134 @@ private slots:
         const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
         QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
         QVERIFY(r.value("structuredContent").toObject().value("keys").toInt() >= 2);
+    }
+
+    void imageSequences() {
+        // 48 frames, shot_1001.png to shot_1048.png, each its own red; and a run with a gap.
+        const QString dir = QString::fromStdString(path("frames"));
+        QDir().mkpath(dir);
+        auto red = [](int n) { return (n - 1001) * 5; };
+        for (int n = 1001; n <= 1048; ++n) {
+            QImage q(64, 36, QImage::Format_RGB32);
+            q.fill(qRgb(red(n), 40, 200));
+            QVERIFY(q.save(dir + QStringLiteral("/shot_%1.png").arg(n)));
+        }
+        const QString gapDir = QString::fromStdString(path("gapped"));
+        QDir().mkpath(gapDir);
+        for (int n : {1, 2, 3, 4, 5, 7, 8}) {
+            QImage q(16, 16, QImage::Format_RGB32);
+            q.fill(Qt::white);
+            QVERIFY(q.save(gapDir + QStringLiteral("/f%1.png").arg(n)));
+        }
+        ImageSequence seq;
+        QVERIFY(detectImageSequence((dir + "/shot_1010.png").toStdString(), seq));
+        QCOMPARE(seq.first, 1001);
+        QCOMPARE(seq.last, 1048);
+        QVERIFY(QString::fromStdString(seq.pattern).endsWith("shot_%d.png"));  // written without padding
+        QCOMPARE(imageSequenceName(seq), std::string("shot_[1001-1048].png"));
+        QCOMPARE(imageSequenceFrame(seq, 1031), (dir + "/shot_1031.png").toStdString());
+        ImageSequence gap;
+        QVERIFY(detectImageSequence((gapDir + "/f2.png").toStdString(), gap));
+        QVERIFY(gap.first == 1 && gap.last == 5);  // the gap ends the run
+        QVERIFY(!detectImageSequence((gapDir + "/f6.png").toStdString(), gap));
+        // Padded numbers: frame_0098 to frame_0102 (crossing a hundred) are one run, named padded.
+        for (int n = 98; n <= 102; ++n) {
+            QImage q(16, 16, QImage::Format_RGB32);
+            q.fill(Qt::black);
+            QVERIFY(q.save(gapDir + QStringLiteral("/frame_%1.png").arg(n, 4, 10, QLatin1Char('0'))));
+        }
+        ImageSequence padded;
+        QVERIFY(detectImageSequence((gapDir + "/frame_0100.png").toStdString(), padded));
+        QVERIFY2(padded.first == 98 && padded.last == 102 && QString::fromStdString(padded.pattern).endsWith("frame_%04d.png"), qPrintable(QString("%1 %2 %3").arg(padded.first).arg(padded.last).arg(QString::fromStdString(padded.pattern))));
+        QCOMPARE(imageSequenceName(padded), std::string("frame_[0098-0102].png"));
+        padded.fps = Rational{25, 1};
+        MediaItem pm;
+        QVERIFY(probeMedia(imageSequencePath(padded), pm));
+        QCOMPARE(pm.duration, 0.2);
+        QVERIFY(isFrameFormat("a.exr") && isFrameFormat("b.DPX") && !isFrameFormat("c.jpg"));
+        QCOMPARE(rateFor(23.976), (Rational{24000, 1001}));
+        QCOMPARE(rateFor(25), (Rational{25, 1}));
+        // Probed as a movie: 48 frames at 24 fps are 2 s.
+        seq.fps = Rational{24, 1};
+        const std::string key = imageSequencePath(seq);
+        ImageSequence back;
+        QVERIFY(parseImageSequencePath(key, back) && back.first == 1001 && back.last == 1048 && back.fps == seq.fps);
+        MediaItem m;
+        std::string err;
+        QVERIFY2(probeMedia(key, m, &err), err.c_str());
+        QCOMPARE(m.kind, MediaKind::Video);
+        QCOMPARE(m.duration, 2.0);
+        QCOMPARE(m.fps, (Rational{24, 1}));
+        QCOMPARE(m.width, 64);
+        QCOMPARE(m.name, std::string("shot_[1001-1048].png"));
+        QVERIFY(!isOffline(m));
+        QCOMPARE(mediaFileOnDisk(key), (dir + "/shot_1001.png").toStdString());
+        // Frame 30 (1.25 s) is shot_1031.
+        Frame16Ptr f = MediaPool::instance().videoFrame(key, 30.0 / 24 + 0.01, 0, 0);
+        QVERIFY(f);
+        QVERIFY2(std::abs(int(toImage(*f).at(5, 5)[0] * 255 + 0.5) - red(1031)) <= 2, qPrintable(QString::number(toImage(*f).at(5, 5)[0] * 255)));
+        // On the timeline at 24 fps: frame 10 shows shot_1011.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64;
+        s.height = 36;
+        s.fps = Rational{24, 1};
+        m.id = p.newId();
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QCOMPARE(s.videoTracks[0].clips.at(0).duration, FrameTime(48));
+        RenderOptions o;
+        auto redAt = [&](FrameTime t) { return int(renderSequenceFrame(p, s, t, o).at(5, 5)[0] * 255 + 0.5); };
+        QVERIFY2(std::abs(redAt(10) - red(1011)) <= 2, qPrintable(QString::number(redAt(10))));
+        // Saved and loaded.
+        QVERIFY(saveProject(p, path("frames.montage")));
+        Project loaded;
+        QVERIFY(loadProject(path("frames.montage"), loaded));
+        QCOMPARE(loaded.findMedia(m.id)->path, key);
+        // Interpreted at 12 fps: 4 s long, and the clip still starts on its first frame (frame 10 is now shot_1006).
+        QVERIFY(edit::setImageSequenceRate(p, m.id, Rational{12, 1}).ok);
+        QCOMPARE(p.findMedia(m.id)->duration, 4.0);
+        QVERIFY2(std::abs(redAt(10) - red(1006)) <= 2, qPrintable(QString::number(redAt(10))));
+        QVERIFY(!edit::setImageSequenceRate(p, m.id, Rational{12, 1}).ok);  // no change
+        // Collected into a project folder: every frame copied, the path following.
+        ConsolidateOptions co;
+        co.folder = path("collected");
+        co.name = "Frames";
+        ConsolidateResult cr;
+        QVERIFY2(consolidateProject(p, co, &cr, {}, nullptr, &err), err.c_str());
+        QCOMPARE(cr.copied, 1);
+        Project collected;
+        QVERIFY(loadProject(cr.projectPath, collected));
+        const std::string moved = collected.findMedia(m.id)->path;
+        QVERIFY2(moved.find("collected") != std::string::npos && isImageSequencePath(moved), moved.c_str());
+        QVERIFY(QFileInfo::exists(QString::fromStdString(mediaFileOnDisk(moved))));
+        ImageSequence ms;
+        QVERIFY(parseImageSequencePath(moved, ms) && QFileInfo::exists(QString::fromStdString(imageSequenceFrame(ms, 1048))));
+        // Relinked to any frame of the copy: the whole run there, at the rate it had.
+        QVERIFY2(relinkMedia(p, m.id, imageSequenceFrame(ms, 1020), RelinkCheck::Strict, &err), err.c_str());
+        ImageSequence relinked;
+        QVERIFY(parseImageSequencePath(p.findMedia(m.id)->path, relinked));
+        QVERIFY(relinked.pattern == ms.pattern && relinked.fps == (Rational{12, 1}) && relinked.first == 1001 && relinked.last == 1048);
+        QVERIFY(!relinkMedia(p, m.id, (gapDir + "/f6.png").toStdString(), RelinkCheck::Strict));
+        // Over MCP: place a whole run from one of its frames.
+        Project mp = makeDefaultProject();
+        mp.active()->fps = Rational{25, 1};
+        const QString project = QString::fromStdString(path("frames-mcp.montage"));
+        QVERIFY(saveProject(mp, project.toStdString()));
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_place_media"},
+                                                     {"arguments", QJsonObject{{"project", project}, {"media", dir + "/shot_1020.png"}, {"image_sequence", true}, {"at", 0}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(loadProject(project.toStdString(), loaded));
+        QCOMPARE(loaded.active()->videoTracks[0].clips.at(0).duration, FrameTime(48));  // 48 frames at the sequence's 25 fps
+        // Its first frame gone: offline.
+        QVERIFY(QFile::remove(dir + "/shot_1001.png"));
+        QVERIFY(isOffline(m));
     }
 
     void mcpTransformAndAlign() {

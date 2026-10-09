@@ -1,4 +1,5 @@
 #include "Relink.h"
+#include "ImageSequence.h"
 
 #include <QDir>
 #include <QDirIterator>
@@ -70,7 +71,8 @@ void takeDetails(MediaItem& m, const MediaItem& n, bool replace) {
 }  // namespace
 
 bool isOffline(const MediaItem& m) {
-    return m.kind != MediaKind::Sequence && !m.path.empty() && !QFileInfo::exists(QString::fromStdString(m.path));
+    // An image sequence is there while its first frame is.
+    return m.kind != MediaKind::Sequence && !m.path.empty() && !QFileInfo::exists(QString::fromStdString(mediaFileOnDisk(m.path)));
 }
 
 std::vector<Id> offlineMedia(const Project& p) {
@@ -96,7 +98,17 @@ bool relinkMedia(Project& p, Id id, const std::string& path, RelinkCheck check, 
     }
     MediaItem n;
     std::string err;
-    if (!probeMedia(QDir::cleanPath(fi.absoluteFilePath()).toStdString(), n, &err)) {
+    std::string target = QDir::cleanPath(fi.absoluteFilePath()).toStdString();
+    // An image sequence relinks to the run the chosen frame belongs to, at its rate.
+    if (ImageSequence old, found; parseImageSequencePath(m->path, old)) {
+        if (!detectImageSequence(target, found)) {
+            if (why) *why = "That file is not part of a numbered sequence";
+            return false;
+        }
+        found.fps = old.fps;
+        target = imageSequencePath(found);
+    }
+    if (!probeMedia(target, n, &err)) {
         if (why) *why = err.empty() ? "It cannot be read" : err;
         return false;
     }
@@ -126,7 +138,7 @@ std::vector<Id> relinkFromFolder(Project& p, const std::string& folder, std::vec
     for (Id id : ids) {
         const MediaItem* m = p.findMedia(id);
         if (!m || !isOffline(*m)) continue;
-        const QString name = fileNameOf(m->path).toLower();
+        const QString name = fileNameOf(mediaFileOnDisk(m->path)).toLower();  // a sequence by its first frame
         std::vector<QString> candidates;
         for (auto [a, b] = byName.equal_range(name); a != b; ++a) candidates.push_back(a->second);
         if (candidates.empty())

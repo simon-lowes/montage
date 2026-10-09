@@ -11,6 +11,7 @@
 #include "core/ProjectIO.h"
 #include "core/Transcript.h"
 #include "media/Decoder.h"
+#include "media/ImageSequence.h"
 
 namespace montage {
 
@@ -104,11 +105,28 @@ bool consolidateProject(const Project& p, const ConsolidateOptions& o, Consolida
         MediaItem& m = q.media[i];
         if (progress) progress(double(i) / double(total));
         if (m.kind == MediaKind::Sequence || m.subclipOf || m.path.empty()) continue;
-        if (!fs::exists(u8path(m.path), ec)) {
-            res.missing.push_back(m.path);
+        ImageSequence frames;
+        const bool imageSequence = parseImageSequencePath(m.path, frames);
+        if (!fs::exists(u8path(mediaFileOnDisk(m.path)), ec)) {
+            res.missing.push_back(mediaFileOnDisk(m.path));
             continue;
         }
-        const fs::path src = u8path(m.path);
+        const fs::path src = u8path(mediaFileOnDisk(m.path));
+        if (imageSequence && !o.trim) {
+            // Every frame into a folder of its own, named as they were.
+            const fs::path folder = uniqueIn(mediaDir, utf8(src.stem()), "", taken);
+            fs::create_directories(folder, ec);
+            for (int n = frames.first; n <= frames.last; ++n) {
+                const fs::path from = u8path(imageSequenceFrame(frames, n)), to = folder / from.filename();
+                if (!fs::copy_file(from, to, fs::copy_options::overwrite_existing, ec)) return fail("Cannot copy " + utf8(from) + ": " + ec.message());
+                res.bytes += int64_t(fs::file_size(to, ec));
+            }
+            frames.pattern = utf8(folder / u8path(frames.pattern).filename());
+            m.path = imageSequencePath(frames);
+            m.proxyPath.clear();
+            res.copied++;
+            continue;
+        }
         // The span the kept sequences use, in media seconds.
         double first = 1e18, last = -1e18;
         for (const Sequence& s : q.sequences)

@@ -97,6 +97,10 @@ public:
     // Probes and adds files; returns ids of the new media. Errors are
     // appended to `errors`. Starts background audio decoding for waveforms.
     std::vector<Id> importFiles(const QStringList& paths, QStringList* errors = nullptr, const QString& bin = QString());
+    // A numbered image sequence (media/ImageSequence.h) from any of its frames, played at `fps`; one undo step.
+    // Importing two or more frames of a run in a render format (EXR, DPX, PNG, TIFF...) with importFiles makes one
+    // too, unless Preferences turn it off ("import/imageSequences").
+    Id importImageSequence(const QString& frame, Rational fps, QString* error = nullptr);
     bool removeMedia(Id id, QString* error = nullptr);
 
     // The media item loaded in the source monitor and its marks

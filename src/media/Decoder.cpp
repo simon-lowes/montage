@@ -3,6 +3,7 @@
 #include "Decoder.h"
 
 #include "FieldRecorder.h"
+#include "ImageSequence.h"
 
 #include <algorithm>
 #include <cmath>
@@ -46,6 +47,7 @@ std::string averr(int code) {
 bool isStillFormat(const AVFormatContext* fmt) {
     if (!fmt || !fmt->iformat || !fmt->iformat->name) return false;
     std::string n = fmt->iformat->name;
+    if (n == "image2" && fmt->url && av_filename_number_test(fmt->url)) return false;  // a numbered sequence plays
     if (n == "image2" || n == "image2pipe") return true;
     return n.size() > 5 && n.compare(n.size() - 5, 5, "_pipe") == 0;
 }
@@ -117,6 +119,21 @@ AVPixelFormat dejpeg(AVPixelFormat f, bool& fullRange) {
 // ---------------------------------------------------------------------------
 // Probe
 
+int openMediaInput(AVFormatContext** fmt, const std::string& path) {
+    ImageSequence seq;
+    if (parseImageSequencePath(path, seq)) {
+        // A numbered image sequence: FFmpeg's image2 reader from its first number at its frame rate.
+        AVDictionary* o = nullptr;
+        av_dict_set_int(&o, "start_number", seq.first, 0);
+        av_dict_set(&o, "framerate", (std::to_string(seq.fps.num) + "/" + std::to_string(seq.fps.den)).c_str(), 0);
+        av_dict_set(&o, "pattern_type", "sequence", 0);
+        const int rc = avformat_open_input(fmt, seq.pattern.c_str(), av_find_input_format("image2"), &o);
+        av_dict_free(&o);
+        return rc;
+    }
+    return avformat_open_input(fmt, path.c_str(), nullptr, nullptr);
+}
+
 bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
     if (isVectorPath(path)) {
         VectorInfo vi;
@@ -159,9 +176,9 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         return true;
     }
     AVFormatContext* fmt = nullptr;
-    int rc = avformat_open_input(&fmt, path.c_str(), nullptr, nullptr);
+    int rc = openMediaInput(&fmt, path);
     if (rc < 0) {
-        if (error) *error = "Cannot open " + path + ": " + averr(rc);
+        if (error) *error = "Cannot open " + mediaFileOnDisk(path) + ": " + averr(rc);
         return false;
     }
     rc = avformat_find_stream_info(fmt, nullptr);
@@ -253,6 +270,13 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         m.kind = MediaKind::Audio;
         m.duration = dur;
     }
+    // A numbered image sequence: its frames at the rate it was given.
+    if (ImageSequence seq; parseImageSequencePath(path, seq) && m.hasVideo) {
+        m.kind = MediaKind::Video;
+        m.fps = seq.fps;
+        m.duration = seq.frames() / seq.fps.toDouble();
+        if (out.name.empty()) m.name = imageSequenceName(seq);
+    }
     // A field recorder's WAV: its timecode stamp, scene, take, notes and channel names.
     if (fmt->iformat && std::strstr(fmt->iformat->name, "wav")) {
         FieldRecording rec;
@@ -337,7 +361,7 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
         curPts_ = nextPts_ = -1;
         return true;
     }
-    int rc = avformat_open_input(&fmt_, path.c_str(), nullptr, nullptr);
+    int rc = openMediaInput(&fmt_, path);
     if (rc < 0) {
         if (error) *error = "Cannot open " + path + ": " + averr(rc);
         return false;
@@ -774,7 +798,7 @@ namespace {
 bool decodeAudioStream(const std::string& path, int sampleRate, int ordinal, std::vector<float>& samples, int& channels,
                        std::string* error, const std::atomic<bool>* cancel) {
     AVFormatContext* fmt = nullptr;
-    int rc = avformat_open_input(&fmt, path.c_str(), nullptr, nullptr);
+    int rc = openMediaInput(&fmt, path);
     if (rc < 0) {
         if (error) *error = averr(rc);
         return false;
@@ -909,7 +933,7 @@ AudioBufferPtr decodeAudio(const std::string& path, int sampleRate, std::string*
     std::vector<int> streams;  // channels per audio stream
     {
         AVFormatContext* fmt = nullptr;
-        if (int rc = avformat_open_input(&fmt, path.c_str(), nullptr, nullptr); rc < 0) {
+        if (int rc = openMediaInput(&fmt, path); rc < 0) {
             if (error) *error = averr(rc);
             return nullptr;
         }

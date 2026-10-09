@@ -658,6 +658,7 @@ void MainWindow::buildMenus() {
     add(file, tr("Open Auto-Save S&napshot…"), QKeySequence(), [this] { openSnapshot(); });
     file->addSeparator();
     add(file, tr("&Import Media…"), QKeySequence("Ctrl+I"), [this] { bin_->importDialog(); });
+    add(file, tr("Import Image Sequence…"), QKeySequence(), [this] { bin_->importImageSequenceDialog(); })->setObjectName(QStringLiteral("importImageSequence"));
     add(file, tr("&Export Media…"), QKeySequence("Ctrl+M"), [this] { exportMedia(); });
     add(file, tr("Project &Manager…"), QKeySequence(), [this] {
         ProjectManagerDialog dlg(state_, this);

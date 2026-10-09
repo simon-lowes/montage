@@ -23,6 +23,7 @@
 #include "core/AudioChannels.h"
 #include "render/Spherical.h"
 #include "render/ClipPlacement.h"
+#include "media/ImageSequence.h"
 #include "core/AutoTag.h"
 #include "core/Automation.h"
 #include "core/CaptionTools.h"
@@ -645,6 +646,8 @@ void McpServer::Impl::addTools() {
             "in":{"type":["number","string"],"description":"Source in, seconds (of the subclip, for one)"},
             "out":{"type":["number","string"],"description":"Source out, seconds (of the subclip, for one)"},
             "insert":{"type":"boolean","default":false},
+            "image_sequence":{"type":"boolean","default":false,"description":"media is one frame of a numbered image sequence (EXR, DPX, PNG...): place the whole run"},
+            "fps":{"type":"number","description":"The image sequence's frame rate; default the sequence's"},
             "mode":{"type":"string","enum":["overwrite","insert","place_on_top","ripple_overwrite","smart_insert"],
                     "description":"Default overwrite (insert, when insert is true)"}},
             "required":["project","media"]})json",
@@ -656,7 +659,25 @@ void McpServer::Impl::addTools() {
             for (const MediaItem& m : l.project.media)
                 if (m.subclipOf && m.name == need(a, "media").toStdString()) sub = &m;
             const std::string subName = sub ? sub->name : std::string();
-            const Id media = sub ? sub->subclipOf : mediaFor(l.project, need(a, "media"));
+            Id media = 0;
+            if (a.value("image_sequence").toBool()) {
+                ImageSequence seq;
+                if (!detectImageSequence(absolute(need(a, "media")).toStdString(), seq))
+                    throw ArgError{QStringLiteral("%1 is not part of a numbered sequence").arg(need(a, "media"))};
+                seq.fps = a.contains("fps") ? rateFor(a.value("fps").toDouble()) : s.fps;
+                const std::string key = imageSequencePath(seq);
+                for (const MediaItem& m : l.project.media)
+                    if (m.path == key) media = m.id;
+                if (!media) {
+                    MediaItem m;
+                    std::string err;
+                    if (!probeMedia(key, m, &err)) throw ArgError{QString::fromStdString(err)};
+                    m.id = media = l.project.newId();
+                    l.project.media.push_back(m);
+                }
+            } else {
+                media = sub ? sub->subclipOf : mediaFor(l.project, need(a, "media"));
+            }
             const double base = sub ? sub->subclipIn : 0;
             const QString mode = str(a, "mode", a.value("insert").toBool() ? "insert" : "overwrite");
             static const QStringList modes{"overwrite", "insert", "place_on_top", "ripple_overwrite", "smart_insert"};

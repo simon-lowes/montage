@@ -88,6 +88,7 @@
 #include "MaskOverlay.h"
 #include "TransformOverlay.h"
 #include "render/ClipPlacement.h"
+#include "media/ImageSequence.h"
 #include "media/Diarizer.h"
 #include "media/VisualSearch.h"
 #include "media/Faces.h"
@@ -2493,6 +2494,45 @@ private slots:
         QCOMPARE(blue()->start, FrameTime(70));
         win_->endTrimMode();
         state()->undo();
+    }
+
+    void importImageSequences() {
+        const QString dir = dir_.path() + "/plate";
+        QDir().mkpath(dir);
+        for (int n = 1; n <= 10; ++n) {
+            QImage q(32, 18, QImage::Format_RGB32);
+            q.fill(qRgb(n * 20, 0, 0));
+            QVERIFY(q.save(dir + QStringLiteral("/plate_%1.png").arg(n, 3, 10, QLatin1Char('0'))));
+        }
+        state()->newProject();
+        // The folder: one clip of ten frames at the sequence's rate, not ten stills.
+        auto ids = state()->importFiles({dir});
+        QCOMPARE(ids.size(), size_t(1));
+        const MediaItem* m = state()->project().findMedia(ids[0]);
+        QVERIFY(isImageSequencePath(m->path));
+        QCOMPARE(m->name, std::string("plate_[001-010].png"));
+        QVERIFY(std::fabs(m->duration - 10 / state()->sequence()->fpsValue()) < 1e-9);
+        // One frame on its own is a still; Import Image Sequence makes the run from it at a chosen rate.
+        ids = state()->importFiles({dir + "/plate_004.png"});
+        QCOMPARE(state()->project().findMedia(ids.at(0))->kind, MediaKind::Image);
+        QVERIFY(win_->findChild<QAction*>("importImageSequence"));
+        const Id seq = state()->importImageSequence(dir + "/plate_004.png", Rational{25, 1});
+        QVERIFY(seq);
+        QCOMPARE(state()->project().findMedia(seq)->duration, 0.4);
+        QString why;
+        QVERIFY(!state()->importImageSequence(dir_.path() + "/nothing.png", Rational{25, 1}, &why));
+        QVERIFY(!why.isEmpty());
+        // Interpret Frame Rate from the bin: ten frames at 5 fps are 2 s, one undo step.
+        auto* bin = win_->findChild<MediaBinWidget*>();
+        QVERIFY(bin->setImageSequenceRate(seq, 5));
+        QCOMPARE(state()->project().findMedia(seq)->duration, 2.0);
+        state()->undo();
+        QCOMPARE(state()->project().findMedia(seq)->duration, 0.4);
+        // With grouping turned off, frames come in as stills.
+        appSettings().setValue("import/imageSequences", false);
+        ids = state()->importFiles({dir});
+        appSettings().remove("import/imageSequences");
+        QCOMPARE(ids.size(), size_t(10));
     }
 
     void transitionsToSelection() {

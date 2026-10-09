@@ -112,9 +112,12 @@ public:
     bool setAudioChannelMode(const std::vector<Id>& media, const std::string& mode);
     // Marks pictures as 360° footage ("equirect") or flat (""), as Premiere's Modify > VR Properties; one undo step.
     bool setMediaProjection(const std::vector<Id>& media, const std::string& projection);
+    // Interpret Footage on an image sequence (media/ImageSequence.h): its frames at `fps`; one undo step.
+    bool setImageSequenceRate(Id media, double fps);
 
 public slots:
     void importDialog();
+    void importImageSequenceDialog();
     void mergeClipsDialog(Id video, const std::vector<Id>& sounds);
     void rebuild();
 
