@@ -7816,13 +7816,25 @@ private slots:
                                                   {"motion", "crawl_left"}, {"track", "V4"}});
         QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
         QVERIFY(tool("montage_add_title", QJsonObject{{"project", project}, {"text", "x"}, {"at", 0}, {"motion", "sideways"}}).value("isError").toBool());
+        // Words popping on one at a time, and leaving the same way.
+        r = tool("montage_add_title", QJsonObject{{"project", project}, {"text", "One two three"}, {"at", 0.5}, {"duration", 0.2},
+                                                  {"text_animation", "pop"}, {"animate_by", "word"}, {"animation_seconds", 0.5},
+                                                  {"animate_out", true}, {"track", "V4"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY(tool("montage_add_title", QJsonObject{{"project", project}, {"text", "x"}, {"at", 0}, {"text_animation", "spin"}}).value("isError").toBool());
+        QVERIFY(tool("montage_add_title", QJsonObject{{"project", project}, {"text", "x"}, {"at", 0}, {"text_animation", "rise"},
+                                                      {"animate_by", "page"}}).value("isError").toBool());
         {
             Project withCredits;
             QVERIFY(loadProject(project.toStdString(), withCredits));
             const auto& v4 = withCredits.active()->videoTracks.at(3).clips;
-            QCOMPARE(v4.size(), size_t(2));
+            QCOMPARE(v4.size(), size_t(3));
             QCOMPARE(v4[0].generator.p("motion", 0), 1.0);
             QCOMPARE(v4[1].generator.p("motion", 0), 2.0);
+            QCOMPARE(v4[2].generator.p("text_anim", 0), 3.0);
+            QCOMPARE(v4[2].generator.p("text_anim_by", 0), 1.0);
+            QCOMPARE(v4[2].generator.p("text_anim_dur", 0), 0.5);
+            QCOMPARE(v4[2].generator.p("text_anim_out", 0), 1.0);
         }
         // Chapters: none yet, then YouTube's list (with a warning: fewer than three).
         QVERIFY(tool("montage_chapters", QJsonObject{{"project", project}}).value("isError").toBool());

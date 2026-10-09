@@ -1002,7 +1002,11 @@ void McpServer::Impl::addTools() {
         R"json({"type":"object","properties":{"project":{"type":"string"},"text":{"type":"string"},
             "at":{"type":["number","string"]},"duration":{"type":["number","string"],"default":3},
             "track":{"type":"string"},"size":{"type":"number","description":"Font size in pixels"},
-            "template":{"type":"string","enum":["plain","lower_third","lower_third_box","centred","chapter","callout","typewriter","end_card","credits","crawl"],"default":"plain"},
+            "template":{"type":"string","enum":["plain","lower_third","lower_third_box","centred","chapter","callout","typewriter","cascade","pop_words","drop","wave","decode","end_card","credits","crawl"],"default":"plain"},
+            "text_animation":{"type":"string","enum":["none","rise","fade","pop","drop","wave","scramble"],"description":"The text coming on a letter, word or line at a time"},
+            "animate_by":{"type":"string","enum":["letter","word","line"],"default":"letter"},
+            "animation_seconds":{"type":"number","default":1,"description":"How long the text animation takes across the whole text"},
+            "animate_out":{"type":"boolean","default":false,"description":"The text animation also plays out at the end"},
             "motion":{"type":"string","enum":["still","roll","crawl_left","crawl_right"],"description":"Move the whole title through the frame over its duration (credits, a ticker)"}},
             "required":["project","text","at"]})json",
         false, [](const QJsonObject& a) {
@@ -1023,6 +1027,18 @@ void McpServer::Impl::addTools() {
             Clip c = makeGeneratorClip(l.project, type, std::max<FrameTime>(1, len));
             c.generator.strings["text"] = need(a, "text").toStdString();
             if (a.value("size").isDouble()) c.generator.params["size"] = Param(a.value("size").toDouble());
+            if (a.contains("text_animation")) {
+                const QStringList kinds{"none", "rise", "fade", "pop", "drop", "wave", "scramble"};
+                const int k = int(kinds.indexOf(str(a, "text_animation")));
+                if (k < 0) throw ArgError{"\"text_animation\" is none, rise, fade, pop, drop, wave or scramble"};
+                c.generator.params["text_anim"] = Param(double(k));
+                const QStringList units{"letter", "word", "line"};
+                const int by = int(units.indexOf(str(a, "animate_by", "letter")));
+                if (by < 0) throw ArgError{"\"animate_by\" is letter, word or line"};
+                c.generator.params["text_anim_by"] = Param(double(by));
+                if (a.value("animation_seconds").isDouble()) c.generator.params["text_anim_dur"] = Param(std::clamp(a.value("animation_seconds").toDouble(), 0.1, 10.0));
+                c.generator.params["text_anim_out"] = Param(a.value("animate_out").toBool() ? 1.0 : 0.0);
+            }
             if (a.contains("motion")) {
                 const QStringList kinds{"still", "roll", "crawl_left", "crawl_right"};
                 const int m = int(kinds.indexOf(str(a, "motion")));

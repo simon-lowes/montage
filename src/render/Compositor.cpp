@@ -7,6 +7,7 @@
 #include <QImage>
 #include <QPainter>
 #include <QPainterPath>
+#include <QTransform>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -163,19 +164,129 @@ Image renderTitle(const Effect& g, FrameTime t, int w, int h, double scale, Fram
             }
         }
 
-        // The text (typed so far), first line and the rest apart.
+        // The text (typed so far), first line and the rest apart; with a text animation (CapCut's and Descript's), each
+        // letter, word or line on its own, moved, scaled and faded by how far through its turn it is.
+        struct Piece {
+            QPainterPath path;
+            double opacity = 1;
+            bool sub = false;
+        };
+        std::vector<Piece> pieces;
         int totalChars = 0;
-        for (const QString& l : lines) totalChars += int(l.size());
+        std::vector<int> lineStart;
+        for (const QString& l : lines) lineStart.push_back(totalChars), totalChars += int(l.size());
         int budget = int(std::floor(typed * totalChars + 1e-9));
-        QPainterPath mainPath, subPath;
-        for (int i = 0; i < lines.size(); ++i) {
-            const QString shown = lines[i].left(std::max(0, budget));
-            budget -= int(lines[i].size());
-            if (shown.isEmpty()) continue;
+        const int textAnim = int(std::lround(g.p("text_anim", t)));
+        auto lineX = [&](int i) {
             const double lw = widths[size_t(i)];
-            const double x = align == 0 ? left : (align == 2 ? left + blockW - lw : cx - lw / 2);
-            const double y = top + tops[size_t(i)] + ascents[size_t(i)];
-            (i > 0 && sub ? subPath : mainPath).addText(QPointF(x, y), fontOf(i), shown);
+            return align == 0 ? left : (align == 2 ? left + blockW - lw : cx - lw / 2);
+        };
+        auto plain = [&] {
+            QPainterPath mainPath, subPath;
+            for (int i = 0; i < lines.size(); ++i) {
+                const QString shown = lines[i].left(std::max(0, budget - lineStart[size_t(i)]));
+                if (shown.isEmpty()) continue;
+                const double y = top + tops[size_t(i)] + ascents[size_t(i)];
+                (i > 0 && sub ? subPath : mainPath).addText(QPointF(lineX(i), y), fontOf(i), shown);
+            }
+            pieces.clear();
+            pieces.push_back({mainPath, 1, false});
+            pieces.push_back({subPath, 1, true});
+        };
+        if (textAnim == 0) {
+            plain();
+        } else {
+            bool settled = true;  // every unit in place: drawn as the plain title is, kerned across the units
+            const int by = int(std::lround(g.p("text_anim_by", t)));  // 0 letters, 1 words, 2 lines
+            const double across = std::max(0.1, g.p("text_anim_dur", t, 1.0));
+            const bool animateOut = g.p("text_anim_out", t) > 0.5;
+            struct Unit {
+                int line, from, len;
+            };
+            std::vector<Unit> units;
+            for (int i = 0; i < lines.size(); ++i) {
+                const QString& ln = lines[i];
+                if (by == 2) {
+                    if (!ln.trimmed().isEmpty()) units.push_back({i, 0, int(ln.size())});
+                    continue;
+                }
+                for (int k = 0; k < ln.size();) {
+                    if (ln[k].isSpace()) {
+                        ++k;
+                        continue;
+                    }
+                    int e = k + 1;
+                    if (by == 1)
+                        while (e < ln.size() && !ln[e].isSpace()) ++e;
+                    units.push_back({i, k, e - k});
+                    k = e;
+                }
+            }
+            const int n = int(units.size());
+            // Each unit takes a share of the time, starting one after another so the last ends `across` in.
+            const double unitDur = std::clamp(across * (n > 1 ? 0.45 : 1.0), 0.08, across);
+            const double stagger = n > 1 ? (across - unitDur) / (n - 1) : 0;
+            static const QString noise = QStringLiteral("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789#$%&*@");
+            for (int u = 0; u < n; ++u) {
+                const Unit& un = units[size_t(u)];
+                const int typedHere = budget - lineStart[size_t(un.line)] - un.from;
+                if (typedHere <= 0) continue;  // not typed on yet
+                QString shown = lines[un.line].mid(un.from, std::min(un.len, typedHere));
+                const QFont& font = fontOf(un.line);
+                const QFontMetricsF fm(font);
+                const double x0 = lineX(un.line) + fm.horizontalAdvance(lines[un.line].left(un.from));
+                const double y = top + tops[size_t(un.line)] + ascents[size_t(un.line)];
+                const double uw = fm.horizontalAdvance(shown), uh = heights[size_t(un.line)];
+                double pr = std::clamp((sec - u * stagger) / unitDur, 0.0, 1.0);
+                if (animateOut && duration > 0) {
+                    const double remaining = double(duration - 1 - t) / fps;  // the last unit leaves last
+                    pr = std::min(pr, std::clamp((remaining - (n - 1 - u) * stagger) / unitDur, 0.0, 1.0));
+                }
+                const double e = easeOut(pr);
+                double dyU = 0, scU = 1, opU = 1;
+                switch (textAnim) {
+                    case 1: dyU = (1 - e) * 0.6 * uh, opU = e; break;  // rise into place
+                    case 2: opU = e; break;                             // fade in
+                    case 3: {                                           // pop, overshooting a little
+                        const double c1 = 1.70158, c3 = c1 + 1;
+                        scU = pr <= 0 ? 0 : 1 + c3 * std::pow(pr - 1, 3) + c1 * std::pow(pr - 1, 2);
+                        opU = std::min(1.0, 2 * pr);
+                        break;
+                    }
+                    case 4: {  // drop in from above and bounce
+                        double b = pr;
+                        const double n1 = 7.5625, d1 = 2.75;
+                        if (b < 1 / d1) b = n1 * b * b;
+                        else if (b < 2 / d1) b -= 1.5 / d1, b = n1 * b * b + 0.75;
+                        else if (b < 2.5 / d1) b -= 2.25 / d1, b = n1 * b * b + 0.9375;
+                        else b -= 2.625 / d1, b = n1 * b * b + 0.984375;
+                        dyU = -(1 - b) * 1.2 * uh;
+                        opU = std::min(1.0, 3 * pr);
+                        break;
+                    }
+                    case 5: dyU = 0.12 * uh * std::sin(2 * M_PI * (sec * 0.8 - u * 0.09)); break;  // a wave running through
+                    case 6:  // letters shuffling until they settle
+                        if (pr < 1)
+                            for (int k = 0; k < shown.size(); ++k)
+                                if (!shown[k].isSpace()) {
+                                    const uint32_t hsh = uint32_t(u + 1) * 73856093u ^ uint32_t(k + 1) * 19349663u ^ uint32_t(t / 2 + 1) * 83492791u;
+                                    shown[k] = noise[int(hsh % uint32_t(noise.size()))];
+                                }
+                        break;
+                    default: break;
+                }
+                if (dyU != 0 || scU != 1 || opU != 1 || (textAnim == 6 && pr < 1)) settled = false;
+                if (opU <= 0 || scU <= 0) continue;
+                QPainterPath path;
+                path.addText(QPointF(x0, y), font, shown);
+                const double pcx = x0 + uw / 2, pcy = y - fm.ascent() * 0.35;
+                QTransform tr;
+                tr.translate(pcx, pcy + dyU);
+                tr.scale(scU, scU);
+                tr.translate(-pcx, -pcy);
+                pieces.push_back({tr.map(path), opU, un.line > 0 && sub});
+            }
+            if (settled) plain();
         }
         auto col = [&](const char* base, double a) {
             std::string b(base);
@@ -197,15 +308,11 @@ Image renderTitle(const Effect& g, FrameTime t, int w, int h, double scale, Fram
         const double sh = g.p("shadow", t, 4) * scale;
         const double shOp = g.p("shadow_opacity", t, 50) / 100.0;
         if (sh > 0 && shOp > 0)
-            for (const QPainterPath* path : {&mainPath, &subPath}) pa.fillPath(path->translated(sh, sh), QColor::fromRgbF(0, 0, 0, float(shOp)));
+            for (const Piece& pc : pieces) pa.fillPath(pc.path.translated(sh, sh), QColor::fromRgbF(0, 0, 0, float(shOp * pc.opacity)));
         const double ow = g.p("outline", t) * scale;
-        if (ow > 0) {
-            QPen pen(col("outline_color", 1.0), ow * 2, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
-            pa.strokePath(mainPath, pen);
-            pa.strokePath(subPath, pen);
-        }
-        pa.fillPath(mainPath, col("color", 1.0));
-        pa.fillPath(subPath, col("sub_color", 1.0));
+        if (ow > 0)
+            for (const Piece& pc : pieces) pa.strokePath(pc.path, QPen(col("outline_color", pc.opacity), ow * 2, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        for (const Piece& pc : pieces) pa.fillPath(pc.path, col(pc.sub ? "sub_color" : "color", pc.opacity));
     }
     Image img(w, h);
     const float k = 1.0f / 255.0f;

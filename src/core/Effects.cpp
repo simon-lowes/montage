@@ -654,6 +654,11 @@ std::vector<EffectInfo> buildCatalog() {
                              num("anim_in_dur", "In Duration (s)", 0.05, 10, 0.5, 0.05),
                              choice("anim_out", "Animate Out", {"None", "Fade", "Slide Up", "Slide Down", "Slide Left", "Slide Right", "Pop", "Typewriter", "Wipe"}, 0),
                              num("anim_out_dur", "Out Duration (s)", 0.05, 10, 0.5, 0.05),
+                             // Text coming on a letter, word or line at a time (CapCut's and Descript's text animations).
+                             choice("text_anim", "Text Animation", {"None", "Rise", "Fade", "Pop", "Drop", "Wave", "Scramble"}, 0),
+                             choice("text_anim_by", "Animate By", {"Letter", "Word", "Line"}, 0),
+                             num("text_anim_dur", "Across (s)", 0.1, 10, 1.0, 0.05),
+                             boolean("text_anim_out", "Animate Out Too"),
                              // Credits: the whole block moves through the frame over the clip's length, at a
                              // steady speed after easing in and before easing out.
                              choice("motion", "Roll / Crawl", {"Still", "Roll Up", "Crawl Left", "Crawl Right"}, 0),
@@ -854,6 +859,14 @@ const std::vector<TitleTemplate>& titleTemplates() {
         {"title_typewriter", "Typewriter",
          {{"size", 72}, {"bold", 0}, {"shadow", 2}, {"anim_in", 7}, {"anim_in_dur", 1.5}, {"anim_out", 1}, {"anim_out_dur", 0.5}},
          {{"text", "Once upon a time..."}, {"font", "Monospace"}}},
+        // text_anim 0 None, 1 Rise, 2 Fade, 3 Pop, 4 Drop, 5 Wave, 6 Scramble; text_anim_by 0 Letter, 1 Word, 2 Line.
+        {"title_cascade", "Cascade", {{"size", 110}, {"shadow", 4}, {"text_anim", 1}, {"text_anim_dur", 1.0}, {"text_anim_out", 1}}, {{"text", "Cascade"}}},
+        {"title_pop_words", "Pop Words",
+         {{"size", 96}, {"shadow", 0}, {"outline", 6}, {"text_anim", 3}, {"text_anim_by", 1}, {"text_anim_dur", 0.8}},
+         {{"text", "Every word pops"}}},
+        {"title_drop", "Drop In", {{"size", 120}, {"shadow", 6}, {"text_anim", 4}, {"text_anim_dur", 1.2}}, {{"text", "Drop In"}}},
+        {"title_wave", "Wave", {{"size", 110}, {"shadow", 3}, {"text_anim", 5}}, {{"text", "Making waves"}}},
+        {"title_decode", "Decode", {{"size", 96}, {"bold", 1}, {"text_anim", 6}, {"text_anim_dur", 1.2}}, {{"text", "ACCESS GRANTED"}, {"font", "Monospace"}}},
         {"title_end_card", "End Card",
          {{"size", 110}, {"sub_style", 1}, {"sub_scale", 50}, {"anim_in", 1}, {"anim_in_dur", 0.8}, {"anim_out", 1}, {"anim_out_dur", 0.8}},
          {{"text", "Thanks for watching\nSee you next time"}}},

@@ -3136,6 +3136,71 @@ colorspaces:
         QVERIFY(QString::fromStdString(err).startsWith("Transcribe"));
     }
 
+    void titleTextAnimations() {
+        // "HELLO" coming on a letter at a time across one second of a three-second title at 30 fps.
+        Project p;
+        auto title = [&](int anim, int by = 0, bool out = false) {
+            Effect t = makeEffect(p, "title");
+            t.strings["text"] = "HELLO WORLD";
+            t.params["size"] = 40.0;
+            t.params["shadow"] = 0.0;
+            t.params["text_anim"] = double(anim);
+            t.params["text_anim_by"] = double(by);
+            t.params["text_anim_dur"] = 1.0;
+            t.params["text_anim_out"] = out ? 1.0 : 0.0;
+            return t;
+        };
+        auto render = [&](const Effect& t, FrameTime f) { return renderGenerator(t, f, 320, 180, 1.0, 90, 30); };
+        auto ink = [](const Image& img, int x0, int x1) {
+            double a = 0;
+            for (int y = 0; y < img.height; ++y)
+                for (int x = x0; x < x1; ++x) a += img.at(x, y)[3];
+            return a;
+        };
+        auto diff = [](const Image& a, const Image& b) {
+            double d = 0;
+            for (size_t i = 0; i < a.px.size(); ++i) d += std::fabs(a.px[i] - b.px[i]);
+            return d / double(a.px.size());
+        };
+        const Image still = render(title(0), 45);
+        const double full = ink(still, 0, 320);
+        QVERIFY(full > 100);
+        // Rise: nothing at the start, the first letters before the last half way, all in place once done.
+        const Effect rise = title(1);
+        QVERIFY(ink(render(rise, 0), 0, 320) < 1);
+        const Image half = render(rise, 15);
+        // Half way: the first letters (left) all but in, the last (right) still well short of theirs.
+        QVERIFY2(ink(half, 0, 160) > 0.9 * ink(still, 0, 160) && ink(half, 160, 320) < 0.75 * ink(still, 160, 320),
+                 qPrintable(QString("%1 %2").arg(ink(half, 0, 160) / ink(still, 0, 160)).arg(ink(half, 160, 320) / ink(still, 160, 320))));
+        QVERIFY(diff(render(rise, 45), still) < 1e-4);
+        // Each kind, by letter, word and line, ends as the plain title does; animating out empties it by the end.
+        for (int anim = 1; anim <= 6; ++anim)
+            for (int by = 0; by <= 2; ++by) {
+                if (anim == 5) continue;  // a wave never settles
+                QVERIFY2(diff(render(title(anim, by), 45), still) < 1e-4, qPrintable(QString("kind %1 by %2").arg(anim).arg(by)));
+            }
+        const Effect both = title(1, 0, true);
+        QVERIFY(diff(render(both, 45), still) < 1e-4);
+        QVERIFY(ink(render(both, 89), 0, 320) < 1);
+        QVERIFY(ink(render(both, 75), 0, 320) < full * 0.9);  // on its way out
+        // Pop and drop are part way at the start of their turn; scramble shows other letters until it settles.
+        QVERIFY(diff(render(title(3, 1), 8), still) > 1e-3);
+        QVERIFY(diff(render(title(4), 10), still) > 1e-3);
+        const Image scrambled = render(title(6), 5);
+        QVERIFY(ink(scrambled, 0, 320) > full * 0.5 && diff(scrambled, still) > 1e-3);
+        // Wave keeps moving.
+        QVERIFY(diff(render(title(5), 40), render(title(5), 50)) > 1e-4);
+        // Word by word: the first word in before the second.
+        const Image words = render(title(1, 1), 12);
+        QVERIFY(ink(words, 0, 160) / ink(still, 0, 160) > ink(words, 160, 320) / ink(still, 160, 320) + 0.2);
+        // The templates using them render.
+        for (const char* id : {"title_cascade", "title_pop_words", "title_drop", "title_wave", "title_decode"}) {
+            QVERIFY(findTitleTemplate(id));
+            Effect t = makeEffect(p, id);
+            QVERIFY2(ink(renderGenerator(t, 60, 640, 360, 1.0, 90, 30), 0, 640) > 50, id);
+        }
+    }
+
     void titlesRender() {
         Project p;
         Effect t = makeEffect(p, "title");
