@@ -62,6 +62,7 @@
 #include "render/Versions.h"
 #include "render/ClipPlacement.h"
 #include "media/ImageSequence.h"
+#include "media/Interpret.h"
 #include "render/AudioReactive.h"
 #include "render/VfxPull.h"
 #include "render/AafExport.h"
@@ -1611,6 +1612,202 @@ private slots:
         const Image frame = renderSequenceFrame(back, *back.active(), 5, ro);
         QVERIFY2(frame.at(10, 10)[3] < 0.03f, qPrintable(QString::number(frame.at(10, 10)[3])));
         QVERIFY(frame.at(160, 90)[3] > 0.97f);
+    }
+
+    void interpretFootage() {
+        // A second at 120 fps (160 x 90 ProRes): red climbing from 0 at the first frame to 1 at the last, with a 1 kHz tone.
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 160, gs.height = 90, gs.fps = Rational{120, 1};
+        Clip ramp = makeGeneratorClip(gen, "color", 120);
+        ramp.generator.params["color.r"].addKey(0, 0.0);
+        ramp.generator.params["color.r"].addKey(119, 1.0);
+        ramp.generator.params["color.g"] = 0.2;
+        ramp.generator.params["color.b"] = 0.4;
+        edit::overwrite(gen, gs, {TrackKind::Video, 0}, ramp);
+        std::vector<float> tone(48000);
+        for (size_t i = 0; i < tone.size(); ++i) tone[i] = float(0.5 * std::sin(2 * M_PI * 1000.0 * double(i) / 48000));
+        QVERIFY(writeMonoWav(path("if-tone.wav"), tone, 48000));
+        MediaItem toneItem = probeOrFail(gen, path("if-tone.wav"));
+        gen.media.push_back(toneItem);
+        QVERIFY(edit::placeMedia(gen, gs, toneItem.id, 0, 0, -1, {TrackKind::Video, 1}, {TrackKind::Audio, 0}, false).ok);
+        ExportSettings st;
+        st.path = path("hfr.mov");
+        st.videoCodec = "prores_ks";
+        st.audioCodec = "pcm_s16le";
+        std::string err;
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 160, s.height = 90, s.fps = Rational{24, 1};
+        MediaItem m = probeOrFail(p, st.path);
+        QCOMPARE(m.fps, (Rational{120, 1}));
+        QVERIFY(std::fabs(m.duration - 1.0) < 0.02);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Clip& placed = s.videoTracks[0].clips.at(0);
+        QCOMPARE(placed.duration, FrameTime(24));
+        placed.markers.push_back(Marker{12, 0, "half", "", 0, false});
+        MediaItem sub = m;
+        sub.id = p.newId();
+        sub.subclipOf = m.id, sub.subclipIn = 0.25, sub.subclipOut = 0.5;
+        p.media.push_back(sub);
+        auto said = std::make_shared<Transcript>();
+        said->segments.push_back({0.5, 0.6, "hello", {{0.5, 0.6, "hello"}}});
+        p.findMedia(m.id)->transcript = said;
+        RenderOptions o;
+        auto frameShown = [&](FrameTime t) { return renderSequenceFrame(p, s, t, o).at(80, 45)[0] * 119; };  // the file's frame
+        QVERIFY2(std::fabs(frameShown(10) - 50) < 1, qPrintable(QString::number(frameShown(10))));  // 10/24 s: frame 50
+
+        // Conformed to 24 fps: five times as long, each file frame a sequence frame; the clip keeps its frames and length.
+        Interpretation slow;
+        slow.fps = Rational{24, 1};
+        QVERIFY(edit::interpretFootage(p, m.id, slow).ok);
+        const MediaItem* now = p.findMedia(m.id);
+        QCOMPARE(now->fps, (Rational{24, 1}));
+        QVERIFY2(std::fabs(now->duration - 5.0) < 0.1, qPrintable(QString::number(now->duration)));
+        QVERIFY(interpretationOf(*now).conformed() && interpretationOf(*now).fileFps == (Rational{120, 1}));
+        QCOMPARE(uninterpretedPath(now->path), st.path);
+        QCOMPARE(fileFrameRate(*now), (Rational{120, 1}));
+        QCOMPARE(placed.duration, FrameTime(24));
+        QVERIFY2(std::fabs(frameShown(10) - 10) < 1, qPrintable(QString::number(frameShown(10))));
+        QVERIFY2(std::fabs(frameShown(23) - 23) < 1, qPrintable(QString::number(frameShown(23))));
+        QCOMPARE(placed.markers.at(0).t, FrameTime(60));  // the same moment of the footage
+        QCOMPARE(p.findMedia(sub.id)->subclipIn, 1.25);
+        QCOMPARE(p.findMedia(sub.id)->subclipOut, 2.5);
+        QCOMPARE(now->transcript->segments.at(0).words.at(0).start, 2.5);
+        QVERIFY(!edit::interpretFootage(p, m.id, slow).ok);  // nothing changes
+        // The sound plays at the new speed: five times as long, the tone at 200 Hz.
+        AudioBufferPtr slowed = MediaPool::instance().audio(now->path, 48000);
+        QVERIFY(slowed);
+        QVERIFY2(std::abs(slowed->frames() - 5 * 48000) < 2400, qPrintable(QString::number(slowed->frames())));
+        QVERIFY2(toneLevel(slowed->samples, 0, 200, 48000, 96000) > 0.25, qPrintable(QString::number(toneLevel(slowed->samples, 0, 200, 48000, 96000))));
+        QVERIFY(toneLevel(slowed->samples, 0, 1000, 48000, 96000) < 0.05);
+        // Keeping its pitch: as long, still at 1 kHz.
+        slow.keepPitch = true;
+        QVERIFY(edit::interpretFootage(p, m.id, slow).ok);
+        AudioBufferPtr kept = MediaPool::instance().audio(p.findMedia(m.id)->path, 48000);
+        QVERIFY(kept && std::abs(kept->frames() - 5 * 48000) < 2400);
+        QVERIFY2(toneLevel(kept->samples, 0, 1000, 48000, 96000) > 0.25, qPrintable(QString::number(toneLevel(kept->samples, 0, 1000, 48000, 96000))));
+        // Saved and loaded with how it is read.
+        QVERIFY(saveProject(p, path("interpret.montage")));
+        Project loaded;
+        QVERIFY(loadProject(path("interpret.montage"), loaded));
+        QCOMPARE(loaded.findMedia(m.id)->path, p.findMedia(m.id)->path);
+        // Relinked to the same file: still read the same way.
+        QVERIFY2(relinkMedia(p, m.id, st.path, RelinkCheck::Strict, &err), err.c_str());
+        QVERIFY(interpretationOf(*p.findMedia(m.id)).conformed());
+        // Back to the file's own rate: a second again, the clip back on frame 50 at 10.
+        Interpretation asFile;
+        QVERIFY(edit::interpretFootage(p, m.id, asFile).ok);
+        QCOMPARE(p.findMedia(m.id)->path, st.path);
+        QVERIFY(std::fabs(p.findMedia(m.id)->duration - 1.0) < 0.02);
+        QVERIFY2(std::fabs(frameShown(10) - 50) < 1, qPrintable(QString::number(frameShown(10))));
+
+        // Pixel aspect 2 (an anamorphic squeeze): 320 wide, filling a 320 x 90 sequence instead of a pillarbox.
+        s.width = 320;
+        QVERIFY(renderSequenceFrame(p, s, 0, o).at(300, 45)[2] < 0.05f);  // pillarboxed
+        Interpretation wide;
+        wide.par = 2;
+        QVERIFY(edit::interpretFootage(p, m.id, wide).ok);
+        QCOMPARE(p.findMedia(m.id)->width, 320);
+        QCOMPARE(p.findMedia(m.id)->height, 90);
+        QVERIFY2(renderSequenceFrame(p, s, 0, o).at(300, 45)[2] > 0.3f, qPrintable(QString::number(renderSequenceFrame(p, s, 0, o).at(300, 45)[2])));
+        Frame16Ptr decoded = MediaPool::instance().videoFrame(p.findMedia(m.id)->path, 0, 0, 0);
+        QVERIFY(decoded && decoded->width == 320 && decoded->height == 90);
+        QVERIFY(!edit::interpretFootage(p, m.id, Interpretation{Rational{0, 1}, Rational{0, 1}, 20}).ok);  // out of range
+
+        // Alpha: a PNG of dark red at half transparency.
+        QImage half(16, 16, QImage::Format_ARGB32);
+        half.fill(qRgba(128, 0, 0, 128));
+        QVERIFY(half.save(QString::fromStdString(path("half.png"))));
+        MediaItem still = probeOrFail(p, path("half.png"));
+        p.media.push_back(still);
+        auto pixel = [&](const std::string& how) {
+            Interpretation i;
+            i.alpha = how;
+            const std::string file = interpretedPath(path("half.png"), i);
+            Frame16Ptr f = MediaPool::instance().videoFrame(file, 0, 0, 0);
+            const Image img = toImage(*f);  // premultiplied
+            return std::array<float, 2>{img.at(8, 8)[0], img.at(8, 8)[3]};
+        };
+        auto near = [](float a, float b) { return std::fabs(a - b) < 0.01f; };
+        QVERIFY(near(pixel("")[0], 0.25f) && near(pixel("")[1], 0.5f));                   // straight: 0.5 red at half
+        QVERIFY(near(pixel("premultiplied")[0], 0.5f) && near(pixel("premultiplied")[1], 0.5f));  // its colour was multiplied
+        QVERIFY(near(pixel("ignore")[0], 0.5f) && near(pixel("ignore")[1], 1.0f));
+        QVERIFY(near(pixel("invert")[1], 127.0f / 255.0f));
+        Interpretation opaque;
+        opaque.alpha = "ignore";
+        opaque.fps = Rational{30, 1};  // a still has no frame rate: only the alpha is taken
+        QVERIFY(edit::interpretFootage(p, still.id, opaque).ok);
+        QVERIFY(!interpretationOf(*p.findMedia(still.id)).conformed() && interpretationOf(*p.findMedia(still.id)).alpha == "ignore");
+
+        // Fields: a progressive-flagged movie of alternate bright and dark lines.
+        const QString stripes = QString::fromStdString(path("stripes"));
+        QDir().mkpath(stripes);
+        QImage combed(64, 32, QImage::Format_RGB32);
+        for (int y = 0; y < 32; ++y)
+            for (int x = 0; x < 64; ++x) combed.setPixel(x, y, y % 2 ? qRgb(30, 30, 30) : qRgb(220, 220, 220));
+        for (int n = 1; n <= 4; ++n) QVERIFY(combed.save(stripes + QStringLiteral("/s%1.png").arg(n)));
+        ImageSequence frames;
+        QVERIFY(detectImageSequence((stripes + "/s1.png").toStdString(), frames));
+        frames.fps = Rational{25, 1};
+        Project sg = makeDefaultProject();
+        Sequence& ss = *sg.active();
+        ss.width = 64, ss.height = 32, ss.fps = Rational{25, 1};
+        MediaItem fm = probeOrFail(sg, imageSequencePath(frames));
+        sg.media.push_back(fm);
+        QVERIFY(edit::placeMedia(sg, ss, fm.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        ExportSettings ps;
+        ps.path = path("stripes.mov");
+        ps.videoCodec = "prores_ks";
+        ps.audioCodec = "none";
+        QVERIFY2(exportSequence(sg, ss, ps, nullptr, nullptr, &err), err.c_str());
+        auto mean = [&](const std::string& fields) {
+            Interpretation i;
+            i.fields = fields;
+            Frame16Ptr f = MediaPool::instance().videoFrame(interpretedPath(ps.path, i), 0.02, 0, 0);
+            double sum = 0;
+            for (size_t k = 0; k < f->px.size(); k += 4) sum += f->px[k + 1] / 65535.0;
+            return sum / double(f->px.size() / 4);
+        };
+        QVERIFY2(std::fabs(mean("") - 0.49) < 0.06, qPrintable(QString::number(mean(""))));  // left alone
+        QVERIFY2(std::fabs(mean("progressive") - mean("")) < 0.01, qPrintable(QString::number(mean("progressive"))));
+        QVERIFY2(mean("upper") > 0.75, qPrintable(QString::number(mean("upper"))));  // the bright (top) field kept
+        QVERIFY2(mean("lower") < 0.25, qPrintable(QString::number(mean("lower"))));  // the dark (bottom) field kept
+
+        // Over MCP: conformed by name, then back to the file's own rate.
+        Project mp = makeDefaultProject();
+        mp.active()->fps = Rational{24, 1};
+        MediaItem mm = probeOrFail(mp, st.path);
+        mp.media.push_back(mm);
+        const QString project = QString::fromStdString(path("interpret-mcp.montage"));
+        QVERIFY(saveProject(mp, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_interpret_media"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call({{"project", project}, {"media", QString::fromStdString(st.path)}, {"frame_rate", 24}, {"pixel_aspect", 1.5}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject item = r.value("structuredContent").toObject().value("media").toArray().at(0).toObject();
+        QVERIFY2(std::fabs(item.value("duration_seconds").toDouble() - 5.0) < 0.1, QJsonDocument(item).toJson().constData());
+        QCOMPARE(item.value("width").toInt(), 240);
+        QCOMPARE(item.value("path").toString().toStdString(), st.path);
+        QCOMPARE(item.value("interpretation").toObject().value("file_frame_rate").toDouble(), 120.0);
+        r = call({{"project", project}, {"media", "hfr.mov"}, {"frame_rate", "file"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QVERIFY(std::fabs(back.media.at(0).duration - 1.0) < 0.02);
+        QCOMPARE(interpretationOf(back.media.at(0)).par, 1.5);  // left as it was
+        r = call({{"project", project}, {"media", "hfr.mov"}, {"alpha", "sideways"}});
+        QVERIFY(r.value("isError").toBool());
     }
 
     void extendClipPastItsEnd() {

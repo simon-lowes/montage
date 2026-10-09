@@ -1,5 +1,6 @@
 #include "media/ImageSequence.h"
 #include "media/Psd.h"
+#include "core/Interpretation.h"
 
 #include <QDir>
 #include <QFileInfo>
@@ -66,7 +67,8 @@ std::string imageSequenceName(const ImageSequence& s) {
     return (file.left(m.capturedStart()) + QStringLiteral("[%1-%2]").arg(a, b) + file.mid(m.capturedEnd())).toStdString();
 }
 
-std::string mediaFileOnDisk(const std::string& path) {
+std::string mediaFileOnDisk(const std::string& decorated) {
+    const std::string path = uninterpretedPath(decorated);  // how it is read does not change where it is
     ImageSequence s;
     if (parseImageSequencePath(path, s)) return imageSequenceFrame(s, s.first);
     std::string file;
@@ -110,7 +112,7 @@ Result setImageSequenceRate(Project& p, Id media, Rational fps) {
     if (seq.fps == fps) return Result::fail("");
     const double ratio = seq.fps.toDouble() / fps.toDouble();  // media seconds now per media second before
     seq.fps = fps;
-    m->path = imageSequencePath(seq);
+    m->path = interpretedPath(imageSequencePath(seq), interpretationOf(*m));  // keeping how it is read otherwise
     m->fps = fps;
     m->duration = seq.frames() / fps.toDouble();
     for (Sequence& s : p.sequences)

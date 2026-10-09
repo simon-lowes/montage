@@ -7,6 +7,7 @@
 #include <set>
 
 #include "Exporter.h"
+#include "core/Interpretation.h"
 #include "core/EditOps.h"
 #include "core/ProjectIO.h"
 #include "core/Transcript.h"
@@ -109,6 +110,7 @@ bool consolidateProject(const Project& p, const ConsolidateOptions& o, Consolida
         if (m.kind == MediaKind::Sequence || m.subclipOf || m.path.empty()) continue;
         ImageSequence frames;
         const bool imageSequence = parseImageSequencePath(m.path, frames);
+        const Interpretation reading = interpretationOf(m);  // kept on the copy (Interpret Footage)
         if (!fs::exists(u8path(mediaFileOnDisk(m.path)), ec)) {
             res.missing.push_back(mediaFileOnDisk(m.path));
             continue;
@@ -124,7 +126,7 @@ bool consolidateProject(const Project& p, const ConsolidateOptions& o, Consolida
                 res.bytes += int64_t(fs::file_size(to, ec));
             }
             frames.pattern = utf8(folder / u8path(frames.pattern).filename());
-            m.path = imageSequencePath(frames);
+            m.path = interpretedPath(imageSequencePath(frames), reading);
             m.proxyPath.clear();
             res.copied++;
             continue;
@@ -214,14 +216,14 @@ bool consolidateProject(const Project& p, const ConsolidateOptions& o, Consolida
             int layer = -1;
             const bool psdLayer = parsePsdLayerPath(m.path, file, layer);
             if (const auto done = copiedFiles.find(utf8(src)); done != copiedFiles.end()) {
-                m.path = psdLayer ? psdLayerPath(done->second, layer) : done->second;
+                m.path = interpretedPath(psdLayer ? psdLayerPath(done->second, layer) : done->second, reading);
                 m.proxyPath.clear();
                 continue;
             }
             const fs::path dest = uniqueIn(mediaDir, utf8(src.stem()), utf8(src.extension()), taken);
             if (!fs::copy_file(src, dest, fs::copy_options::none, ec)) return fail("Cannot copy " + m.path + ": " + ec.message());
             copiedFiles[utf8(src)] = utf8(dest);
-            m.path = psdLayer ? psdLayerPath(utf8(dest), layer) : utf8(dest);
+            m.path = interpretedPath(psdLayer ? psdLayerPath(utf8(dest), layer) : utf8(dest), reading);
             m.proxyPath.clear();
             res.copied++;
             res.bytes += int64_t(fs::file_size(dest, ec));

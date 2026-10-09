@@ -13,6 +13,7 @@
 #include <QStatusBar>
 #include <QDockWidget>
 #include <QDoubleSpinBox>
+#include <QRadioButton>
 #include <QLineEdit>
 #include <QLabel>
 #include <QListView>
@@ -52,6 +53,7 @@
 #include "QualityCheckDialog.h"
 #include "SpellUi.h"
 #include "core/ColorGroups.h"
+#include "core/Interpretation.h"
 #include "media/SpeechSearch.h"
 #include "media/TextReader.h"
 #include "core/OnScreenText.h"
@@ -5121,6 +5123,97 @@ const auto seq = [this] { return state()->sequence(); };
         const Id greyClip = state()->sequence()->videoTracks[0].clips.back().id;
         state()->setSelection({greyClip}, false);
         QCOMPARE(win_->keyOutScreen(), 0);
+    }
+
+    void interpretFootageFromTheBin() {
+        // A second at 50 fps, 64 x 36 ProRes.
+        const QString video = dir_.filePath("fifty.mov");
+        {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 64, gs.height = 36, gs.fps = Rational{50, 1};
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, makeGeneratorClip(gen, "bars", 50));
+            ExportSettings st;
+            st.path = video.toStdString();
+            st.videoCodec = "prores_ks";
+            st.audioCodec = "none";
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        state()->newProject();
+        const auto ids = state()->importFiles({video});
+        QCOMPARE(ids.size(), size_t(1));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        const FrameTime placedLength = state()->sequence()->videoTracks[0].clips.front().duration;
+        auto* bin = win_->findChild<MediaBinWidget*>();
+        auto* icons = bin->findChild<QAbstractItemView*>("mediaIcons");
+        QVERIFY(bin && icons);
+        bin->setView(MediaBinWidget::View::Icons);
+        // The bin's context menu offers it.
+        bin->selectMedia({ids[0]});
+        bool offered = false;
+        QTimer::singleShot(0, this, [&] {
+            auto* menu = qobject_cast<QMenu*>(QApplication::activePopupWidget());
+            if (!menu) return;
+            for (QAction* a : menu->actions()) offered |= a->objectName() == "interpretFootage";
+            menu->close();
+        });
+        emit icons->customContextMenuRequested(icons->visualRect(icons->currentIndex()).center());
+        QVERIFY(offered);
+        win_->activateWindow();
+        QVERIFY(QTest::qWaitForWindowActive(win_.get()));
+        // The dialog: assume 25 fps and a 2x anamorphic squeeze.
+        bool shown = false;
+        QTimer::singleShot(0, this, [&] {
+            auto* dlg = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+            if (!dlg || dlg->objectName() != "interpretFootageDialog") return;
+            shown = true;
+            auto* fileRate = dlg->findChild<QRadioButton*>("interpretFileRate");
+            if (!fileRate || !fileRate->isChecked() || !fileRate->text().contains("50")) return dlg->reject();
+            dlg->findChild<QRadioButton*>("interpretAssumeRate")->setChecked(true);
+            dlg->findChild<QComboBox*>("interpretRate")->setCurrentText("25");
+            dlg->findChild<QRadioButton*>("interpretConformPar")->setChecked(true);
+            auto* preset = dlg->findChild<QComboBox*>("interpretParPreset");
+            preset->setCurrentIndex(preset->findText("Anamorphic 2x"));
+            dlg->findChild<QComboBox*>("interpretAlpha")->setCurrentIndex(2);  // ignore
+            dlg->accept();
+        });
+        bin->interpretFootageDialog({ids[0]});
+        QVERIFY(shown);
+        const MediaItem* m = state()->project().findMedia(ids[0]);
+        QCOMPARE(m->fps, (Rational{25, 1}));
+        QVERIFY2(std::fabs(m->duration - 2.0) < 0.05, qPrintable(QString::number(m->duration)));
+        QCOMPARE(m->width, 128);
+        const Interpretation in = interpretationOf(*m);
+        QVERIFY(in.conformed() && in.par == 2.0 && in.alpha == "ignore");
+        QCOMPARE(state()->sequence()->videoTracks[0].clips.front().duration, placedLength);  // the clip keeps its length
+        // One undo step back to the file's own reading.
+        state()->undo();
+        m = state()->project().findMedia(ids[0]);
+        QCOMPARE(m->fps, (Rational{50, 1}));
+        QCOMPARE(m->width, 64);
+        QVERIFY(interpretationOf(*m).empty());
+        // Opened again on the conformed footage, it starts from how it is read; Cancel changes nothing.
+        QVERIFY(bin->interpretFootage({ids[0]}, in));
+        QTimer::singleShot(0, this, [&] {
+            auto* dlg = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+            if (!dlg) return;
+            shown = dlg->findChild<QRadioButton*>("interpretAssumeRate")->isChecked() &&
+                    std::fabs(dlg->findChild<QDoubleSpinBox*>("interpretPar")->value() - 2.0) < 1e-9;
+            dlg->reject();
+        });
+        shown = false;
+        bin->interpretFootageDialog({ids[0]});
+        QVERIFY(shown);
+        QCOMPARE(state()->project().findMedia(ids[0])->fps, (Rational{25, 1}));
+        // A bad rate is refused with nothing changed.
+        Interpretation bad;
+        bad.fps = Rational{5000, 1};
+        QVERIFY(!bin->interpretFootage({ids[0]}, bad));
+        QCOMPARE(state()->project().findMedia(ids[0])->fps, (Rational{25, 1}));
+        state()->newProject();
     }
 
     void extendClipCommand() {

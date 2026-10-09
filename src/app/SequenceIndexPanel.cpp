@@ -1,4 +1,5 @@
 #include "SequenceIndexPanel.h"
+#include "media/ImageSequence.h"
 
 #include <QCheckBox>
 #include <QFileInfo>
@@ -92,7 +93,7 @@ void SequenceIndexPanel::rebuild() {
             for (const Clip& c : t.clips) {
                 const MediaItem* m = c.mediaId ? p.findMedia(c.mediaId) : nullptr;
                 QString name = QString::fromStdString(c.name);
-                const QString media = m ? QFileInfo(QString::fromStdString(m->path)).fileName() : QString();
+                const QString media = m ? QFileInfo(QString::fromStdString(mediaFileOnDisk(m->path))).fileName() : QString();
                 if (name.isEmpty()) name = media;
                 QString kind = c.isGenerator() ? (c.generator.type == "title" ? tr("Title") : tr("Generator")) : video ? tr("Video") : tr("Audio");
                 if (!c.enabled) kind += tr(" (off)");

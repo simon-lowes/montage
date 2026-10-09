@@ -1,4 +1,6 @@
 #include "MediaBinModel.h"
+#include "media/ImageSequence.h"
+#include "core/Interpretation.h"
 
 #include <QMimeData>
 #include <QPainter>
@@ -238,7 +240,7 @@ QString MediaBinModel::toolTip(const MediaItem& m) const {
     const QString name = QString::fromStdString(m.name);
     QString tip = QString("<b>%1</b><br>%2").arg(name.toHtmlEscaped(), kindLabel(m));
     if (state_->isMediaOffline(m.id))
-        tip += QString("<br><span style='color:#ff6060'>%1</span> %2").arg(tr("Media offline:"), QString::fromStdString(m.path).toHtmlEscaped());
+        tip += QString("<br><span style='color:#ff6060'>%1</span> %2").arg(tr("Media offline:"), QString::fromStdString(mediaFileOnDisk(m.path)).toHtmlEscaped());
     if (m.hasVideo && m.width > 0)
         tip += QString("<br>%1×%2 @ %3 fps, %4")
                    .arg(m.width)
@@ -248,6 +250,14 @@ QString MediaBinModel::toolTip(const MediaItem& m) const {
     if (m.hasVideo && m.kind != MediaKind::Sequence)
         tip += "<br>" + tr("Colour: %1").arg(QString::fromStdString(mediaColorSpace(m).label)) +
                (m.colorOverride.empty() ? QString() : tr(" (interpreted)"));
+    if (const Interpretation in = interpretationOf(m); !in.empty()) {
+        QStringList how;
+        if (in.conformed()) how << tr("%1 fps (the file's %2)").arg(in.fps.toDouble(), 0, 'f', 3).arg(in.fileFps.toDouble(), 0, 'f', 3);
+        if (in.par > 0) how << tr("pixel aspect %1").arg(in.par, 0, 'g', 4);
+        if (!in.alpha.empty()) how << tr("alpha %1").arg(QString::fromStdString(in.alpha));
+        if (!in.fields.empty()) how << tr("fields %1").arg(QString::fromStdString(in.fields));
+        tip += "<br>" + tr("Interpreted: %1").arg(how.join(QStringLiteral(", ")));
+    }
     if (m.hasAudio && m.sampleRate > 0)
         tip += QString("<br>%1 Hz, %2 ch, %3").arg(m.sampleRate).arg(m.channels).arg(QString::fromStdString(m.audioCodec));
     if (m.duration > 0) {
@@ -268,7 +278,7 @@ QString MediaBinModel::toolTip(const MediaItem& m) const {
     if (m.transcript)
         tip += "<br>" + tr("Transcript: %n word(s)", "", int(m.transcript->wordCount())) +
                (m.transcript->language.empty() ? QString() : QStringLiteral(" (%1)").arg(QString::fromStdString(m.transcript->language)));
-    if (!m.path.empty()) tip += "<br><i>" + QString::fromStdString(m.path).toHtmlEscaped() + "</i>";
+    if (!m.path.empty()) tip += "<br><i>" + QString::fromStdString(uninterpretedPath(m.path)).toHtmlEscaped() + "</i>";
     return tip;
 }
 

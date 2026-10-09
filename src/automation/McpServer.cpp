@@ -34,6 +34,7 @@
 #include "media/SpeechSearch.h"
 #include "media/TextReader.h"
 #include "media/ImageSequence.h"
+#include "media/Interpret.h"
 #include "media/Psd.h"
 #include "core/AutoTag.h"
 #include "core/Automation.h"
@@ -251,6 +252,28 @@ void logJson(const MediaItem& m, QJsonObject& o) {
     }
 }
 
+// How a media item is read (Interpret Footage), for reports; empty as the file says.
+QJsonObject interpretationJson(const MediaItem& m) {
+    const Interpretation i = interpretationOf(m);
+    QJsonObject o;
+    if (i.conformed()) {
+        o["frame_rate"] = i.fps.toDouble();
+        o["file_frame_rate"] = i.fileFps.toDouble();
+        if (i.keepPitch) o["keep_pitch"] = true;
+    }
+    if (i.par > 0) o["pixel_aspect"] = i.par;
+    if (!i.alpha.empty()) o["alpha"] = QString::fromStdString(i.alpha);
+    if (!i.fields.empty()) o["field_order"] = QString::fromStdString(i.fields);
+    return o;
+}
+
+// A media item's entry in reports: its file (without how it is read) and, when interpreted, how.
+void mediaPathJson(const MediaItem& m, QJsonObject& o) {
+    if (m.path.empty()) return;
+    o["path"] = QString::fromStdString(uninterpretedPath(m.path));
+    if (const QJsonObject i = interpretationJson(m); !i.isEmpty()) o["interpretation"] = i;
+}
+
 QJsonObject projectJson(const Project& p) {
     const Sequence& s = *p.active();
     QJsonArray tracks;
@@ -273,7 +296,7 @@ QJsonObject projectJson(const Project& p) {
     QJsonArray media;
     for (const MediaItem& m : p.media) {
         QJsonObject mo{{"id", double(m.id)}, {"name", QString::fromStdString(m.name)}, {"duration_seconds", m.duration}};
-        if (!m.path.empty()) mo["path"] = QString::fromStdString(m.path);
+        mediaPathJson(m, mo);
         if (m.transcript) mo["transcribed"] = true;
         logJson(m, mo);
         media.append(mo);
@@ -300,6 +323,8 @@ Id mediaFor(Project& p, const QString& path) {
     const std::string abs = absolute(path).toStdString();
     for (const MediaItem& m : p.media)
         if (m.path == abs) return m.id;
+    for (const MediaItem& m : p.media)  // the file, however it is read
+        if (!m.subclipOf && m.kind != MediaKind::Sequence && uninterpretedPath(m.path) == abs) return m.id;
     MediaItem m;
     m.id = p.newId();
     std::string err;
@@ -313,6 +338,8 @@ MediaItem& projectMedia(Project& p, const QString& ref) {
     const std::string abs = absolute(ref).toStdString(), name = ref.toStdString();
     for (MediaItem& m : p.media)
         if (!m.path.empty() && m.path == abs) return m;
+    for (MediaItem& m : p.media)
+        if (!m.path.empty() && !m.subclipOf && uninterpretedPath(m.path) == abs) return m;
     for (MediaItem& m : p.media)
         if (m.name == name) return m;
     throw ArgError{QStringLiteral("No media \"%1\" in the project (see montage_project_info)").arg(ref)};
@@ -3722,6 +3749,67 @@ void McpServer::Impl::addTools() {
                       QJsonObject{{"media", out}, {"from_slates", slates}});
         });
 
+    add("montage_interpret_media", "Interpret footage",
+        "Change how video files (or stills) are read, for every clip made from them, as Premiere's Interpret Footage, "
+        "Resolve's Clip Attributes and Final Cut's Conform Speed do: frame_rate conforms the footage (each of its frames "
+        "shown for 1/frame_rate of a second, so 120 fps footage at 24 plays five times slower as smooth slow motion, and "
+        "its sound with it, at the new speed or with keep_pitch time-stretched); pixel_aspect replaces the file's (2 for "
+        "a 2x anamorphic lens, 1.33, 1.5, 1.8, 0.9 for DV NTSC, 1 for square); alpha reads its transparency as straight, "
+        "premultiplied, ignore (opaque) or invert; field_order forces progressive, upper (top field first) or lower "
+        "(bottom field first) whatever the frames are flagged. Arguments left out keep their current setting; 0 or "
+        "\"file\" goes back to the file's own; reset puts everything back. Clips keep starting on the same frame and keep "
+        "their timeline length (shortened where the footage no longer reaches); subclips, clip markers and transcripts "
+        "follow.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "media":{"type":["string","array"],"items":{"type":"string"},"description":"Media files or names in the project"},
+            "frame_rate":{"type":["number","string"],"description":"Frames per second to play at (23.976, 25, 29.97...), or \"file\""},
+            "pixel_aspect":{"type":["number","string"],"description":"Pixel aspect ratio, or \"file\""},
+            "alpha":{"type":"string","enum":["file","straight","premultiplied","ignore","invert"]},
+            "field_order":{"type":"string","enum":["file","progressive","upper","lower"]},
+            "keep_pitch":{"type":"boolean","description":"A conformed sound keeps its pitch"},
+            "reset":{"type":"boolean","description":"Read the files as they are"}},"required":["project","media"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            std::vector<Id> ids;
+            const QJsonValue mv = a.value("media");
+            if (mv.isString()) ids.push_back(projectMedia(l.project, mv.toString()).id);
+            for (const QJsonValue& v : mv.toArray()) ids.push_back(projectMedia(l.project, v.toString()).id);
+            if (ids.empty()) throw ArgError{"\"media\" is required"};
+            auto fileOr = [&](const char* key, double& value) {
+                const QJsonValue v = a.value(key);
+                if (v.isUndefined() || v.isNull()) return false;
+                if (v.isString() && v.toString() == "file") value = 0;
+                else if (v.isDouble() && v.toDouble() >= 0) value = v.toDouble();
+                else throw ArgError{QStringLiteral("\"%1\" must be a number or \"file\"").arg(key)};
+                return true;
+            };
+            QJsonArray out;
+            int changed = 0;
+            for (Id id : ids) {
+                MediaItem* m = l.project.findMedia(id);
+                if (m->subclipOf) m = l.project.findMedia(m->subclipOf);
+                Interpretation i = a.value("reset").toBool() ? Interpretation{} : interpretationOf(*m);
+                if (ImageSequence seq; parseImageSequencePath(m->path, seq)) i.fps = seq.fps;
+                double fps = 0, par = 0;
+                if (fileOr("frame_rate", fps)) i.fps = fps > 0 ? rateFor(fps) : Rational{0, 1};
+                if (fileOr("pixel_aspect", par)) i.par = par;
+                if (a.contains("alpha")) i.alpha = str(a, "alpha") == "file" ? "" : str(a, "alpha").toStdString();
+                if (a.contains("field_order")) i.fields = str(a, "field_order") == "file" ? "" : str(a, "field_order").toStdString();
+                if (a.contains("keep_pitch")) i.keepPitch = a.value("keep_pitch").toBool();
+                const edit::Result r = edit::interpretFootage(l.project, m->id, i);
+                if (!r.ok && !r.error.empty()) throw ArgError{QStringLiteral("%1: %2").arg(QString::fromStdString(m->name), QString::fromStdString(r.error))};
+                changed += r.ok;
+                m = l.project.findMedia(m->id);
+                QJsonObject o{{"name", QString::fromStdString(m->name)}, {"frame_rate", m->fps.toDouble()}, {"duration_seconds", m->duration},
+                              {"width", m->width}, {"height", m->height}};
+                mediaPathJson(*m, o);
+                out.append(o);
+            }
+            if (changed) save(l);
+            return ok(changed ? QStringLiteral("Interpreted %1 media item(s)").arg(changed) : QStringLiteral("Nothing changed"),
+                      QJsonObject{{"media", out}, {"changed", changed}});
+        });
+
     add("montage_find_media", "Find media",
         "Find media in a project by text (names, keywords, metadata, speech; \"quoted phrases\") and/or rules on fields, as a "
         "smart bin does. Rule fields: any, name, rating, label, duration (seconds), kind (video, audio, image, sequence), "
@@ -3749,7 +3837,7 @@ void McpServer::Impl::addTools() {
             for (const MediaItem& m : l.project.media) {
                 if (!smartBinMatches(b, m, usage, &l.project) || !mediaMatchesSearch(m, text, &l.project)) continue;
                 QJsonObject o{{"name", QString::fromStdString(m.name)}, {"duration_seconds", m.duration}};
-                if (!m.path.empty()) o["path"] = QString::fromStdString(m.path);
+                mediaPathJson(m, o);
                 o["usage"] = usage.count(m.id) ? usage.at(m.id) : 0;
                 logJson(m, o);
                 list.append(o);

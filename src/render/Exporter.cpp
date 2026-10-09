@@ -2,6 +2,7 @@
 
 #include "core/ColorGroups.h"
 #include "core/ClipAnimation.h"
+#include "core/Interpretation.h"
 #include "core/Chapters.h"
 #include "core/Surround.h"
 
@@ -626,6 +627,7 @@ private:
         const MediaItem* m = p_.findMedia(c.mediaId);
         if (!m || m->kind != MediaKind::Video || m->path.empty()) return nullptr;
         if (mediaColorSpace(*m).id != seqSpace_.id) return nullptr;  // would be converted
+        if (!interpretationOf(*m).empty()) return nullptr;            // read differently from its packets
         if (openMediaInput(&src.fmt, m->path) < 0) return nullptr;
         if (avformat_find_stream_info(src.fmt, nullptr) < 0) return nullptr;
         src.stream = av_find_best_stream(src.fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);

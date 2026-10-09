@@ -1,4 +1,6 @@
 #include "MediaBinWidget.h"
+#include "InterpretFootageDialog.h"
+#include "media/Interpret.h"
 #include <QCoreApplication>
 #include "media/TextReader.h"
 #include "Settings.h"
@@ -448,6 +450,29 @@ void MediaBinWidget::importImageSequenceDialog() {
 bool MediaBinWidget::setImageSequenceRate(Id media, double fps) {
     const Rational rate = rateFor(fps);
     return state_->apply(tr("Interpret Frame Rate"), [media, rate](Project& p, Sequence&) { return edit::setImageSequenceRate(p, media, rate); });
+}
+
+bool MediaBinWidget::interpretFootage(const std::vector<Id>& media, const Interpretation& how) {
+    return state_->apply(tr("Interpret Footage"), [media, how](Project& p, Sequence&) {
+        edit::Result out = edit::Result::fail("");
+        for (Id id : media) {
+            const MediaItem* m = p.findMedia(id);
+            if (!m) continue;
+            Interpretation i = how;
+            if (m->kind == MediaKind::Image) i.fps = Rational{0, 1};
+            const edit::Result r = edit::interpretFootage(p, id, i);
+            if (!r.ok && !r.error.empty()) return edit::Result::fail(m->name + ": " + r.error);
+            if (r.ok) out = {};
+        }
+        return out;
+    });
+}
+
+void MediaBinWidget::interpretFootageDialog(const std::vector<Id>& media) {
+    const MediaItem* first = media.empty() ? nullptr : state_->project().findMedia(media.front());
+    if (!first) return;
+    InterpretFootageDialog dlg(*first, int(media.size()), this);
+    if (dlg.exec() == QDialog::Accepted) interpretFootage(media, dlg.interpretation());
 }
 
 void MediaBinWidget::importInto(const QStringList& files, const QString& bin) {
@@ -1007,11 +1032,11 @@ void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos)
             });
         if (m && !m->path.empty() && m->kind != MediaKind::Sequence)
             menu.addAction(tr("Edit Original"), this, [m] {  // in its own application; saved changes reload by themselves
-                QDesktopServices::openUrl(QUrl::fromLocalFile(QString::fromStdString(m->path)));
+                QDesktopServices::openUrl(QUrl::fromLocalFile(QString::fromStdString(mediaFileOnDisk(m->path))));
             });
         if (m && !m->path.empty())
             menu.addAction(tr("Reveal in File Manager"), this, [m] {
-                QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(QString::fromStdString(m->path)).absolutePath()));
+                QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(QString::fromStdString(mediaFileOnDisk(m->path))).absolutePath()));
             });
         menu.addAction(tr("Rename..."), this, [this, id, m] {
             bool ok = false;
@@ -1199,6 +1224,9 @@ void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos)
             a->setChecked(current == cs.id);
             a->setData(QString::fromStdString(cs.id));
         }
+        // How they are read: frame rate, pixel aspect, alpha, fields.
+        menu.addAction(tr("Interpret Footage…"), this, [this, pictures] { interpretFootageDialog(pictures); })
+            ->setObjectName(QStringLiteral("interpretFootage"));
         // An image sequence's frame rate (Interpret Footage).
         if (pictures.size() == 1)
             if (const MediaItem* m = state_->project().findMedia(pictures.front()); m && isImageSequencePath(m->path))
@@ -1320,7 +1348,7 @@ void MediaBinWidget::createSuperScaleCopies(const std::vector<Id>& ids, int fact
         const MediaItem* m = state_->project().findMedia(id);
         if (!m) continue;
         // Beside the original: "<name> (Super Scale 2x).mov", or .png for a still.
-        const QFileInfo fi(QString::fromStdString(m->path));
+        const QFileInfo fi(QString::fromStdString(mediaFileOnDisk(m->path)));
         const QString dst = fi.absolutePath() + "/" + fi.completeBaseName() + tr(" (Super Scale %1x)").arg(factor) +
                             (m->kind == MediaKind::Image ? ".png" : ".mov");
         jobs.push_back({m->path, dst.toStdString()});

@@ -1,4 +1,5 @@
 #include "Relink.h"
+#include "core/Interpretation.h"
 #include "ImageSequence.h"
 #include "Psd.h"
 
@@ -114,6 +115,7 @@ bool relinkMedia(Project& p, Id id, const std::string& path, RelinkCheck check, 
         int layer = -1;
         if (parsePsdLayerPath(m->path, file, layer)) target = psdLayerPath(target, layer);  // the same layer of the file chosen
     }
+    target = interpretedPath(target, interpretationOf(*m));  // read the same way (Interpret Footage)
     if (!probeMedia(target, n, &err)) {
         if (why) *why = err.empty() ? "It cannot be read" : err;
         return false;

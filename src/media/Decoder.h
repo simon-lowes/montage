@@ -43,17 +43,17 @@ public:
     void close();
     bool isOpen() const { return ctx_ != nullptr || vector_ != nullptr || raw_ != nullptr; }
 
-    // Frame displayed at media time `t` (seconds from the start of the file),
-    // converted to RGBA16 at exactly targetW x targetH (0 = native display size).
+    // Frame displayed at media time `t` (seconds from the start of the file; of the conformed file when the path carries
+    // an interpretation, core/Interpretation.h), converted to RGBA16 at exactly targetW x targetH (0 = native display size).
     Frame16Ptr frameAt(double t, int targetW = 0, int targetH = 0, bool highQuality = false);
 
     int displayWidth() const { return dispW_; }
     int displayHeight() const { return dispH_; }
-    double fps() const { return fps_; }
-    double duration() const { return duration_; }
+    double fps() const { return fps_ / timeScale_; }
+    double duration() const { return duration_ / timeScale_; }
     bool isStill() const { return still_; }
     // Media time of the most recently decoded frame (for pool scheduling).
-    double position() const { return curPts_; }
+    double position() const { return curPts_ / timeScale_; }
     // The hardware device decoding this stream ("videotoolbox", "d3d11va"...), or "" for software.
     const std::string& hardware() const { return hwName_; }
     const std::string& path() const { return path_; }
@@ -95,6 +95,11 @@ private:
     bool hwBroken_ = false;
     std::string hwName_;
     AVFrame* hwTransfer_ = nullptr;
+    // Interpret Footage (core/Interpretation.h): file seconds per media second, pixel aspect (0 = the file's), how alpha
+    // and fields are read.
+    double timeScale_ = 1;
+    double par_ = 0;
+    std::string alpha_, fields_;
     std::shared_ptr<VectorDocument> vector_;  // a Lottie animation or SVG, rendered instead of decoded
     AVFrame* raw_ = nullptr;                  // a camera raw still, developed once (RGB48)
 };
@@ -137,5 +142,9 @@ Frame16 rotateFrame(const Frame16& f, int degrees);
 bool deinterlaceFrame(AVFrame* f);
 // 0 progressive, 1 top field first, 2 bottom field first.
 int fieldDominance(const AVFrame* f);
+void setFieldDominance(AVFrame* f, int dominance);
+// Interpret Footage's alpha on a decoded frame (straight alpha): "ignore" makes it opaque, "invert" turns it over,
+// "premultiplied" divides the colour by it.
+void interpretAlpha(Frame16& f, const std::string& mode);
 
 }  // namespace montage

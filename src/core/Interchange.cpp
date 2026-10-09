@@ -12,6 +12,7 @@
 
 #include "EditOps.h"
 #include "Effects.h"
+#include "Interpretation.h"
 #include "History.h"
 
 namespace montage {
@@ -45,7 +46,7 @@ struct EdlWriter {
 
     void comment(const Clip& c) {
         out << "* FROM CLIP NAME: " << c.name << "\n";
-        if (const MediaItem* m = p.findMedia(c.mediaId); m && !m->path.empty()) out << "* SOURCE FILE: " << m->path << "\n";
+        if (const MediaItem* m = p.findMedia(c.mediaId); m && !m->path.empty()) out << "* SOURCE FILE: " << uninterpretedPath(m->path) << "\n";
         // A speed ramp is described by its average speed (EDL has no curves).
         const double speed = c.ramped() ? c.sourceExtent() / double(c.duration) : c.speed;
         if (speed != 1.0 || c.reverse)
@@ -174,7 +175,7 @@ QJsonObject clipJson(const Project& p, const Sequence& s, const Clip& c) {
                           {"parameters", params}, {"metadata", QJsonObject()}, {"available_range", QJsonValue()}};
     } else if (const MediaItem* m = p.findMedia(c.mediaId)) {
         ref = QJsonObject{{"OTIO_SCHEMA", "ExternalReference.1"}, {"name", QString::fromStdString(m->name)},
-                          {"target_url", QUrl::fromLocalFile(QString::fromStdString(m->path)).toString()},
+                          {"target_url", QUrl::fromLocalFile(QString::fromStdString(uninterpretedPath(m->path))).toString()},
                           {"metadata", QJsonObject()}};
         if (m->duration > 0) ref["available_range"] = range(0, std::floor(m->duration * rate), rate);
         else ref["available_range"] = QJsonValue();

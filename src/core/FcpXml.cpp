@@ -13,6 +13,7 @@
 
 #include "EditOps.h"
 #include "Effects.h"
+#include "Interpretation.h"
 #include "History.h"
 #include "ImportBuilder.h"
 #include "Interchange.h"
@@ -99,7 +100,7 @@ struct Fcp7Writer {
         w.writeStartElement("file");
         w.writeAttribute("id", id);
         w.writeTextElement("name", q(m.name));
-        QString url = fileUrl(m.path);
+        QString url = fileUrl(uninterpretedPath(m.path));
         url.replace("file:///", "file://localhost/");
         w.writeTextElement("pathurl", url);
         rate();

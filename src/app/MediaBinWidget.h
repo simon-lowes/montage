@@ -8,6 +8,7 @@
 #include <QWidget>
 #include <vector>
 
+#include "core/Interpretation.h"
 #include "core/Model.h"
 
 class QAbstractItemView;
@@ -117,6 +118,10 @@ public:
     bool setMediaProjection(const std::vector<Id>& media, const std::string& projection);
     // Interpret Footage on an image sequence (media/ImageSequence.h): its frames at `fps`; one undo step.
     bool setImageSequenceRate(Id media, double fps);
+    // Interpret Footage (core/Interpretation.h) on each of `media`; one undo step. False (with a message) if none changed.
+    bool interpretFootage(const std::vector<Id>& media, const Interpretation& how);
+    // The Interpret Footage dialog for `media`, applied when accepted.
+    void interpretFootageDialog(const std::vector<Id>& media);
 
 public slots:
     void importDialog();

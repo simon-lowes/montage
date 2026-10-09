@@ -1,4 +1,5 @@
 #include "ProjectIO.h"
+#include "Interpretation.h"
 
 #include <QDir>
 #include <QFile>
@@ -761,9 +762,11 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
         m.name = ss(o.value("name"));
         m.path = ss(o.value("path"));
         // Relink: prefer the relative path if the absolute one is gone.
-        if (!m.path.empty() && !QFileInfo::exists(qs(m.path)) && o.contains("relPath") && !projectPath.empty()) {
-            QString rel = base.absoluteFilePath(o.value("relPath").toString());
-            if (QFileInfo::exists(rel)) m.path = QDir::cleanPath(rel).toStdString();
+        // (An interpretation, core/Interpretation.h, rides after the file name.)
+        if (!m.path.empty() && !QFileInfo::exists(qs(uninterpretedPath(m.path))) && o.contains("relPath") && !projectPath.empty()) {
+            const std::string rel = base.absoluteFilePath(o.value("relPath").toString()).toStdString();
+            if (QFileInfo::exists(qs(uninterpretedPath(rel))))
+                m.path = interpretedPath(QDir::cleanPath(qs(uninterpretedPath(rel))).toStdString(), interpretationOf(m));
         }
         m.proxyPath = ss(o.value("proxy"));
         if (o.contains("transcript")) {

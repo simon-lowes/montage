@@ -5,6 +5,8 @@
 #include "FieldRecorder.h"
 #include "ImageSequence.h"
 #include "Psd.h"
+#include "audio/TimeStretch.h"
+#include "core/Interpretation.h"
 
 #include <algorithm>
 #include <cmath>
@@ -120,7 +122,9 @@ AVPixelFormat dejpeg(AVPixelFormat f, bool& fullRange) {
 // ---------------------------------------------------------------------------
 // Probe
 
-int openMediaInput(AVFormatContext** fmt, const std::string& path) {
+int openMediaInput(AVFormatContext** fmt, const std::string& decorated) {
+    // An interpretation (core/Interpretation.h) changes how frames are read, not which file is opened.
+    const std::string path = uninterpretedPath(decorated);
     ImageSequence seq;
     if (parseImageSequencePath(path, seq)) {
         // A numbered image sequence: FFmpeg's image2 reader from its first number at its frame rate.
@@ -192,18 +196,24 @@ bool readEmbeddedCaptions(const std::string& path, Rational fps, std::vector<Cap
     std::stable_sort(pairs.begin(), pairs.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
     const bool any = std::any_of(pairs.begin(), pairs.end(), [](const auto& p) { return (p.second & 0x7f7f) != 0; });
     if (!any) return fail("The video carries no CEA-608 captions");
+    // A conformed video's captions keep to its frames.
+    if (Interpretation in; parseInterpretation(path, in) && in.conformed())
+        for (auto& pair : pairs) pair.first /= in.timeScale();
     std::string err;
     if (!captionsFrom608(pairs, fps, out, &err)) return fail("The video's CEA-608 data holds no captions");
     return true;
 }
 
 bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
-    if (isVectorPath(path)) {
+    Interpretation in;
+    parseInterpretation(path, in);
+    const std::string file = uninterpretedPath(path);
+    if (isVectorPath(file)) {
         VectorInfo vi;
-        if (!openVector(path, vi, error)) return false;
+        if (!openVector(file, vi, error)) return false;
         MediaItem m = out;
         m.path = path;
-        if (m.name.empty()) m.name = path.substr(path.find_last_of("/\\") + 1);
+        if (m.name.empty()) m.name = file.substr(file.find_last_of("/\\") + 1);
         m.hasVideo = true;
         m.hasAudio = false;
         m.width = vi.width;
@@ -245,12 +255,12 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
             return true;
         }
     }
-    if (rawAvailable() && isRawPath(path)) {
+    if (rawAvailable() && isRawPath(file)) {
         RawInfo ri;
-        if (!probeRaw(path, ri, error)) return false;
+        if (!probeRaw(file, ri, error)) return false;
         MediaItem m = out;
         m.path = path;
-        if (m.name.empty()) m.name = path.substr(path.find_last_of("/\\") + 1);
+        if (m.name.empty()) m.name = file.substr(file.find_last_of("/\\") + 1);
         m.kind = MediaKind::Image;
         m.hasVideo = true;
         m.hasAudio = false;
@@ -277,7 +287,7 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
     MediaItem m = out;
     m.path = path;
     // Not std::filesystem: on Windows it would read the UTF-8 path in the ANSI code page.
-    if (m.name.empty()) m.name = path.substr(path.find_last_of("/\\") + 1);
+    if (m.name.empty()) m.name = file.substr(file.find_last_of("/\\") + 1);
     int v = bestVideoStream(fmt);
     int a = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
     m.hasVideo = v >= 0;
@@ -318,12 +328,18 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         if (m.colorSpace == "rec709") m.colorSpace.clear();
         int w = st->codecpar->width, h = st->codecpar->height;
         AVRational sar = st->sample_aspect_ratio.num ? st->sample_aspect_ratio : st->codecpar->sample_aspect_ratio;
-        if (sar.num > 0 && sar.den > 0 && sar.num != sar.den) w = int(std::lround(double(w) * sar.num / sar.den));
+        if (in.par > 0) w = int(std::lround(double(w) * in.par));  // Interpret Footage's pixel aspect
+        else if (sar.num > 0 && sar.den > 0 && sar.num != sar.den) w = int(std::lround(double(w) * sar.num / sar.den));
         if (streamRotation(st) % 180 != 0) std::swap(w, h);
-        m.width = w;
+        m.width = std::max(1, w);
         m.height = h;
         AVRational fr = av_guess_frame_rate(fmt, st, nullptr);
         if (fr.num > 0 && fr.den > 0) m.fps = Rational{fr.num, fr.den};
+        // Conformed: each frame shown for 1 / the new rate, and the start timecode still names the same frame.
+        if (in.conformed()) {
+            m.fps = in.fps;
+            fr = AVRational{in.fps.num, in.fps.den};
+        }
         // Start timecode (camera files carry it in the stream, the container or a tmcd track).
         const AVDictionaryEntry* tc = av_dict_get(st->metadata, "timecode", nullptr, 0);
         if (!tc) tc = av_dict_get(fmt->metadata, "timecode", nullptr, 0);
@@ -352,7 +368,7 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         m.hasAudio = false;
     } else if (m.hasVideo) {
         m.kind = MediaKind::Video;
-        m.duration = dur;
+        m.duration = dur / in.timeScale();
     } else {
         m.kind = MediaKind::Audio;
         m.duration = dur;
@@ -407,9 +423,15 @@ void VideoDecoder::close() {
 bool VideoDecoder::open(const std::string& path, std::string* error) {
     close();
     path_ = path;
-    if (isVectorPath(path)) {
+    Interpretation in;
+    parseInterpretation(path, in);
+    timeScale_ = in.timeScale();
+    par_ = in.par;
+    alpha_ = in.alpha;
+    fields_ = in.fields;
+    if (isVectorPath(uninterpretedPath(path))) {
         VectorInfo vi;
-        vector_ = openVector(path, vi, error);
+        vector_ = openVector(uninterpretedPath(path), vi, error);
         if (!vector_) return false;
         dispW_ = vi.width;
         dispH_ = vi.height;
@@ -454,9 +476,9 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
             return true;
         }
     }
-    if (rawAvailable() && isRawPath(path)) {
+    if (rawAvailable() && isRawPath(uninterpretedPath(path))) {
         RawImage img;
-        if (!developRaw(path, img, error)) return false;
+        if (!developRaw(uninterpretedPath(path), img, error)) return false;
         raw_ = av_frame_alloc();
         if (!raw_) return false;
         raw_->format = AV_PIX_FMT_RGB48;  // host byte order, as LibRaw writes it
@@ -517,7 +539,8 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
     rotation_ = streamRotation(st);
     int w = st->codecpar->width, h = st->codecpar->height;
     AVRational sar = st->sample_aspect_ratio.num ? st->sample_aspect_ratio : st->codecpar->sample_aspect_ratio;
-    if (sar.num > 0 && sar.den > 0 && sar.num != sar.den) w = int(std::lround(double(w) * sar.num / sar.den));
+    if (par_ > 0) w = int(std::lround(double(w) * par_));
+    else if (sar.num > 0 && sar.den > 0 && sar.num != sar.den) w = int(std::lround(double(w) * sar.num / sar.den));
     if (rotation_ % 180 != 0) std::swap(w, h);
     dispW_ = std::max(1, w);
     dispH_ = std::max(1, h);
@@ -628,6 +651,33 @@ bool VideoDecoder::seek(double t) {
     return rc >= 0;
 }
 
+void setFieldDominance(AVFrame* f, int dominance) {
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(58, 7, 100)
+    f->flags &= ~(AV_FRAME_FLAG_INTERLACED | AV_FRAME_FLAG_TOP_FIELD_FIRST);
+    if (dominance) f->flags |= AV_FRAME_FLAG_INTERLACED | (dominance == 1 ? AV_FRAME_FLAG_TOP_FIELD_FIRST : 0);
+#else
+    f->interlaced_frame = dominance != 0;
+    f->top_field_first = dominance == 1;
+#endif
+}
+
+void interpretAlpha(Frame16& f, const std::string& mode) {
+    const bool ignore = mode == "ignore", invert = mode == "invert", premultiplied = mode == "premultiplied";
+    if (!ignore && !invert && !premultiplied) return;
+    parallelRows(f.height, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y) {
+            uint16_t* p = f.px.data() + size_t(y) * size_t(f.width) * 4;
+            for (int x = 0; x < f.width; ++x, p += 4) {
+                if (ignore) p[3] = 65535;
+                else if (invert) p[3] = uint16_t(65535 - p[3]);
+                else if (p[3] == 0) p[0] = p[1] = p[2] = 0;
+                else if (p[3] < 65535)  // colour that was multiplied by alpha, back to straight
+                    for (int c = 0; c < 3; ++c) p[c] = uint16_t(std::min<uint32_t>(65535, (uint32_t(p[c]) * 65535 + p[3] / 2) / p[3]));
+            }
+        }
+    });
+}
+
 int fieldDominance(const AVFrame* f) {
 #if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(58, 7, 100)
     if (!(f->flags & AV_FRAME_FLAG_INTERLACED)) return 0;
@@ -684,8 +734,11 @@ Frame16Ptr VideoDecoder::convert(const AVFrame* in, double pts, int w, int h, bo
     // Interlaced pictures are deinterlaced on a copy first, in their own format.
     std::unique_ptr<AVFrame, void (*)(AVFrame*)> deint(nullptr, [](AVFrame* fr) { av_frame_free(&fr); });
     const AVFrame* f = in;
-    if (fieldDominance(in)) {
+    // Interpret Footage can say the frames are progressive, or which field comes first, whatever their flags say.
+    const int dominance = fields_ == "progressive" ? 0 : fields_ == "upper" ? 1 : fields_ == "lower" ? 2 : fieldDominance(in);
+    if (dominance) {
         deint.reset(av_frame_clone(in));
+        if (deint) setFieldDominance(deint.get(), dominance);
         if (deint && deinterlaceFrame(deint.get())) f = deint.get();
     }
     if (w <= 0) w = dispW_;
@@ -761,9 +814,11 @@ Frame16Ptr VideoDecoder::convert(const AVFrame* in, double pts, int w, int h, bo
         av_frame_free(&dstFrame);
     }
     if (!converted) sws_scale(sws_, f->data, f->linesize, 0, f->height, dst, dstStride);
+    if (!alpha_.empty()) interpretAlpha(*out, alpha_);
+    out->pts = pts / timeScale_;
     if (rotation_) {
         auto rotated = std::make_shared<Frame16>(rotateFrame(*out, rotation_));
-        rotated->pts = pts;
+        rotated->pts = out->pts;
         return rotated;
     }
     return out;
@@ -782,6 +837,7 @@ Frame16Ptr VideoDecoder::frameAt(double t, int targetW, int targetH, bool highQu
         curPts_ = 0;
         return stillFrame_;
     }
+    t *= timeScale_;  // a conformed file's own time
     if (hwBroken_) {
         // A hardware frame could not be read back: continue in software.
         hwBroken_ = false;
@@ -1042,6 +1098,31 @@ bool decodeAudioStream(const std::string& path, int sampleRate, int ordinal, std
 
 AudioBufferPtr decodeAudio(const std::string& path, int sampleRate, std::string* error, const std::atomic<bool>* cancel,
                            const std::vector<int>& channels) {
+    // A conformed video's sound plays with its frames: at the new speed, or stretched to the new length with its pitch
+    // kept (core/Interpretation.h).
+    if (Interpretation in; parseInterpretation(path, in) && in.conformed()) {
+        const double k = in.timeScale();  // seconds of the file per second of media time
+        const std::string file = uninterpretedPath(path);
+        if (!in.keepPitch) {
+            // Read as if recorded at sampleRate / k: each second of the file becomes 1 / k seconds here.
+            const int rate = int(std::clamp(std::llround(sampleRate / k), 1000LL, 1LL << 30));
+            AudioBufferPtr played = decodeAudio(file, rate, error, cancel, channels);
+            if (!played) return nullptr;
+            auto out = std::make_shared<AudioBuffer>(*played);
+            out->sampleRate = sampleRate;
+            return out;
+        }
+        AudioBufferPtr src = decodeAudio(file, sampleRate, error, cancel, channels);
+        if (!src) return nullptr;
+        const int hop = stretchHop(sampleRate);
+        const int64_t outFrames = int64_t(std::llround(double(src->frames()) / k));
+        std::vector<double> positions(size_t(outFrames / hop + 2));
+        for (size_t j = 0; j < positions.size(); ++j) positions[j] = double(j) * hop * k;
+        auto out = std::make_shared<AudioBuffer>();
+        wsolaStretch(*src, positions, hop, outFrames, *out);
+        out->sampleRate = sampleRate;
+        return out;
+    }
     auto buf = std::make_shared<AudioBuffer>();
     buf->sampleRate = sampleRate;
     int n = 0;

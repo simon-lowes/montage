@@ -9,6 +9,7 @@
 #include <map>
 
 #include "core/Aaf.h"
+#include "core/Interpretation.h"
 #include "core/EditOps.h"
 #include "media/Decoder.h"
 #include "media/MediaPool.h"
@@ -234,7 +235,7 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
             sourceOf[c.id] = key;
             Source& s = sources[key];
             if (s.name.empty()) {
-                s.name = render ? (c.name.empty() ? "Clip" : c.name) + " (rendered)" : QFileInfo(QString::fromStdString(m->path)).completeBaseName().toStdString();
+                s.name = render ? (c.name.empty() ? "Clip" : c.name) + " (rendered)" : QFileInfo(QString::fromStdString(uninterpretedPath(m->path))).completeBaseName().toStdString();
                 if (!render && !c.channels.empty()) {
                     s.name += " ch";
                     for (size_t i = 0; i < c.channels.size(); ++i) s.name += (i ? "+" : " ") + std::to_string(c.channels[i] + 1);

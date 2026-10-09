@@ -1,4 +1,5 @@
 #include "LinkMediaDialog.h"
+#include "media/ImageSequence.h"
 
 #include <QCheckBox>
 #include <QDir>
@@ -61,7 +62,7 @@ LinkMediaDialog::LinkMediaDialog(EditorState* state, QWidget* parent) : QDialog(
         const Id id = offline_[size_t(row)];
         const MediaItem* m = state_->project().findMedia(id);
         if (!m) return;
-        const QString name = QFileInfo(QString::fromStdString(m->path)).fileName();
+        const QString name = QFileInfo(QString::fromStdString(mediaFileOnDisk(m->path))).fileName();
         const QString f = QFileDialog::getOpenFileName(this, tr("Locate %1").arg(name), QString(), tr("%1;;All files (*)").arg(name));
         if (!f.isEmpty()) locate(id, f);
     };

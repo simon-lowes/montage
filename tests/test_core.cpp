@@ -9,6 +9,7 @@
 #include "core/TranscriptCorrect.h"
 #include "core/SpellCheck.h"
 #include "core/ColorGroups.h"
+#include "core/Interpretation.h"
 #include "core/SpokenSearch.h"
 #include "core/OnScreenText.h"
 #include "core/AutoTag.h"
@@ -3685,6 +3686,54 @@ private slots:
         QVERIFY(std::any_of(xm.begin(), xm.end(), [](const Marker& m) { return m.chapter && m.name == "Part 1" && m.t == 5; }));
         QVERIFY(edit::removeClipMarkerAt(s, second, 40));
         QCOMPARE(edit::clipById(s, second)->markers.size(), size_t(1));
+    }
+
+    void interpretationPaths() {
+        // Carried after the file name, read back the same; empty when nothing is overridden.
+        Interpretation i;
+        QVERIFY(i.empty() && i.timeScale() == 1.0);
+        QCOMPARE(interpretedPath("/f/clip.mov", i), std::string("/f/clip.mov"));
+        i.fps = Rational{24000, 1001};
+        i.fileFps = Rational{25, 1};
+        i.par = 1.5;
+        i.alpha = "premultiplied";
+        i.fields = "lower";
+        i.keepPitch = true;
+        const std::string path = interpretedPath("/f/clip.mov", i);
+        QVERIFY(path.rfind("/f/clip.mov\x1d", 0) == 0);
+        QVERIFY(path.find('/', path.find('\x1d')) == std::string::npos && path.find('-') == std::string::npos);  // no "/" or "-" after the name
+        Interpretation back;
+        QVERIFY(parseInterpretation(path, back));
+        QVERIFY(back == i);
+        QVERIFY(std::fabs(back.timeScale() - 24000.0 / 1001 / 25) < 1e-12);
+        QCOMPARE(uninterpretedPath(path), std::string("/f/clip.mov"));
+        // Replaced, not stacked; and gone when emptied.
+        Interpretation par;
+        par.par = 2;
+        QCOMPARE(interpretedPath(path, par), std::string("/f/clip.mov\x1dpar=2"));
+        QCOMPARE(interpretedPath(path, Interpretation{}), std::string("/f/clip.mov"));
+        // The same rate as the file's is no conform; "straight" alpha is the file's own.
+        Interpretation same;
+        same.fps = same.fileFps = Rational{30, 1};
+        same.alpha = "straight";
+        QVERIFY(!same.conformed());
+        QCOMPARE(interpretedPath("/a.mov", same), std::string("/a.mov"));
+        QVERIFY(!parseInterpretation("/a.mov", back) && back.empty());
+        QVERIFY(!parseInterpretation("/a.mov\x1d" "alpha=sideways;fields=diagonal", back));  // unknown choices ignored
+        QVERIFY(validAlphaMode("invert") && !validAlphaMode("sideways") && validFieldOrder("upper") && !validFieldOrder("left"));
+        // On a media item, and through a project file.
+        Project p = makeDefaultProject();
+        MediaItem m;
+        m.id = p.newId();
+        m.path = interpretedPath("/footage/a.mov", par);
+        p.media.push_back(m);
+        QCOMPARE(interpretationOf(p.media.back()).par, 2.0);
+        const QString file = QDir::temp().filePath("interpretation-test.montage");
+        QVERIFY(saveProject(p, file.toStdString()));
+        Project loaded;
+        QVERIFY(loadProject(file.toStdString(), loaded));
+        QCOMPARE(loaded.media.back().path, m.path);
+        QFile::remove(file);
     }
 
     void deleteGaps() {
