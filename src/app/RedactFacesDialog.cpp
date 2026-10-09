@@ -118,6 +118,10 @@ void RedactFacesDialog::loadFromClip() {
         if (e.type != "redact_faces") continue;
         style_->setCurrentIndex(std::clamp(int(std::lround(e.p("style", 0))), 0, 2));
         auto t = std::make_shared<FaceTracks>();
+        if (!e.s("media").empty() && e.s("media") != std::to_string(m->id)) {
+            info_->setText(tr("The faces on this clip were found in other footage: find them again here."));
+            return;
+        }
         if (faceTracksFromString(e.s("tracks"), *t)) {
             tracks_ = t;
             groups_ = groupFaceTracks(*tracks_);
@@ -259,7 +263,8 @@ bool RedactFacesDialog::apply() {
         e->enabled = true;
         e->strings["tracks"] = tracks;
         e->strings["keep"] = keepText;
-        if (tracks.empty()) e->strings.erase("tracks");
+        e->strings["media"] = std::to_string(c->mediaId);
+        if (tracks.empty()) e->strings.erase("tracks"), e->strings.erase("media");
         if (keepText.empty()) e->strings.erase("keep");
         e->params["style"].set(0, style);
         return created || !(before == *e);

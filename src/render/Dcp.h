@@ -10,7 +10,7 @@
 // (render/DcpMxf.h), described by a Composition Playlist (ST 429-7, with the ST 429-16 metadata the SMPTE Bv2.1
 // profile asks for), a Packing List with each file's SHA-1 (ST 429-8), an Asset Map and a Volume Index (ST 429-9), in
 // a folder named by the Digital Cinema Naming Convention. 23.976 and 29.97 sequences play at 24 and 30, the sound
-// following, as cinema servers need whole frame rates.
+// following, as cinema servers need whole frame rates; 50 and 59.94/60 ones at 25 and 30 from every other frame.
 #pragma once
 
 #include <functional>
@@ -49,6 +49,8 @@ struct DcpResult {
 bool dcpContainer(const std::string& container, int& width, int& height);
 std::string defaultDcpContainer(const Sequence& s);
 int dcpFrameRate(const Sequence& s, int requested);
+// How many sequence frames make a DCP frame at `rate`: 2 for 50 and 60 (59.94) at 25 and 30, else 1.
+int dcpFrameStep(const Sequence& s, int rate);
 // "Title_FTR_F_EN-XX_XX_51_2K_DI_20261009_MTG_SMPTE_OV": title in camel case (14 characters at most), content kind,
 // aspect, language and subtitles, territory, audio, resolution, studio, date, facility, standard, package type (the
 // ISDCF Digital Cinema Naming Convention; studio and facility only when given).
@@ -63,7 +65,8 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& settings,
 // packing list's hashes, each composition's assets in the packing list with durations within them, the picture
 // track files readable as JPEG 2000 X'Y'Z' at a DCI size with as many frames as the composition says and within
 // 250 Mbit/s, the sound 24-bit 48 kHz. An empty list means it passed.
-std::vector<std::string> verifyDcp(const std::string& folder);
+// `progress` (0..1) may return false to stop (the list then ends with "Stopped").
+std::vector<std::string> verifyDcp(const std::string& folder, const std::function<bool(double)>& progress = {});
 
 // Frame `index` of a DCP picture track file decoded to 12-bit X'Y'Z' (three per pixel), for checks and tests.
 bool readDcpFrame(const std::string& mxf, int index, std::vector<uint16_t>& xyz, int& width, int& height, std::string* error = nullptr);

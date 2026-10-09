@@ -40,12 +40,17 @@ QString urn(const dcp::Uuid& u) { return QStringLiteral("urn:uuid:") + QString::
 QString isoNow() { return QDateTime::currentDateTimeUtc().toString(QStringLiteral("yyyy-MM-ddTHH:mm:ss")) + QStringLiteral("+00:00"); }
 
 // SHA-1 of a file, base64, as packing lists give it.
-QString fileHash(const QString& path, qint64* size = nullptr) {
+// `read` (if given) hears of each mebibyte read and may return false to stop (the hash is then empty).
+QString fileHash(const QString& path, qint64* size = nullptr, const std::function<bool(qint64)>& read = {}) {
     QFile f(path);
     if (!f.open(QIODevice::ReadOnly)) return {};
     if (size) *size = f.size();
     QCryptographicHash h(QCryptographicHash::Sha1);
-    while (!f.atEnd()) h.addData(f.read(1 << 20));
+    while (!f.atEnd()) {
+        const QByteArray chunk = f.read(1 << 20);
+        h.addData(chunk);
+        if (read && !read(chunk.size())) return {};
+    }
     return QString::fromLatin1(h.result().toBase64());
 }
 
@@ -193,6 +198,7 @@ public:
                         if (todo_.empty()) return;
                         job = std::move(todo_.front());
                         todo_.pop_front();
+                        ++busy_;
                     }
                     std::vector<uint8_t> cs;
                     if (!ok || !enc.encode(job.second, job.first, cs, &err)) {
@@ -204,6 +210,7 @@ public:
                         return;
                     }
                     std::lock_guard<std::mutex> lock(m_);
+                    --busy_;
                     done_map_[job.first] = std::move(cs);
                     done_.notify_all();
                 }
@@ -219,12 +226,17 @@ public:
         for (std::thread& t : workers_)
             if (t.joinable()) t.join();
     }
-    // Waits while `limit` frames are in hand.
-    void push(int64_t index, std::vector<uint16_t>&& xyz, size_t limit) {
-        std::unique_lock<std::mutex> lock(m_);
-        done_.wait(lock, [&] { return !error_.empty() || todo_.size() + done_map_.size() < limit; });
+    // Frames are taken in the order they are pushed, so the earliest not yet taken back is always being worked on or
+    // next in line: waiting for it always ends. The caller keeps the frames in hand (pending()) bounded by taking
+    // that one before pushing more.
+    void push(int64_t index, std::vector<uint16_t>&& xyz) {
+        std::lock_guard<std::mutex> lock(m_);
         todo_.emplace_back(index, std::move(xyz));
         work_.notify_one();
+    }
+    size_t pending() {
+        std::lock_guard<std::mutex> lock(m_);
+        return todo_.size() + size_t(busy_) + done_map_.size();
     }
     // The codestream for `index` when it is ready (false after a failure).
     bool take(int64_t index, std::vector<uint8_t>& out, bool wait) {
@@ -253,6 +265,7 @@ private:
     std::map<int64_t, std::vector<uint8_t>> done_map_;
     std::vector<std::thread> workers_;
     std::string error_;
+    int busy_ = 0;
     bool stop_ = false;
     bool openjpeg_ = true;
 };
@@ -300,12 +313,16 @@ int dcpFrameRate(const Sequence& s, int requested) {
     static const int rates[] = {24, 25, 30, 48};
     for (int r : rates)
         if (r == requested) return r;
-    const double fps = s.fpsValue();
+    // 50, 59.94 and 60 play at half the rate, every other frame (so at their own speed), as 2K cinema runs at 24 to 48.
+    double fps = s.fpsValue();
+    if (fps > 49 && std::fabs(fps - 48) > 1) fps /= 2;
     int best = 24;
     for (int r : rates)
         if (std::fabs(r - fps) < std::fabs(best - fps)) best = r;
     return best;
 }
+
+int dcpFrameStep(const Sequence& s, int rate) { return rate > 0 ? std::max(1, int(std::lround(s.fpsValue() / rate))) : 1; }
 
 std::string dcpName(const DcpSettings& settings, int channels, const std::string& date) {
     static const std::map<std::string, QString> kinds = {{"feature", "FTR"}, {"short", "SHR"},     {"trailer", "TLR"},      {"teaser", "TSR"},
@@ -342,10 +359,11 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& settings,
     if (!dcpContainer(settings.container, cw, ch)) return fail("The container is flat, scope or full");
     if (s.width <= 0 || s.height <= 0) return fail("The sequence has no picture size");
     const int fps = dcpFrameRate(s, settings.fps);
+    const int step = dcpFrameStep(s, fps);  // sequence frames to a DCP frame
     FrameTime first = 0, end = s.duration();
-    if (settings.inOut && s.inPoint >= 0 && s.outPoint > s.inPoint) first = s.inPoint, end = s.outPoint;
+    if (settings.inOut && s.inPoint >= 0 && s.outPoint >= s.inPoint) first = s.inPoint, end = s.outPoint + 1;  // both included
     if (end <= first) return fail("The sequence is empty");
-    const int64_t frames = end - first;
+    const int64_t frames = (end - first) / step;
     if (frames < fps) return fail("A DCP must last at least a second (cinema servers refuse shorter reels)");
     const int seqChannels = layoutChannels(s.audioLayout);
     const int channels = seqChannels == 8 ? 8 : 6;
@@ -370,14 +388,16 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& settings,
     const QString soundFile = QStringLiteral("pcm_%1.mxf").arg(QString::fromStdString(dcp::uuidString(soundId)));
 
     // Sound first (quick): the mix at 48 kHz, a picture frame's worth at a time. A 23.976 sequence plays at 24, so its
-    // sound is mixed at the rate that makes each sequence frame 2000 samples, and plays 0.1 % faster.
+    // sound is mixed at the rate that makes each sequence frame 2000 samples, and plays 0.1 % faster (a 59.94 one, at
+    // 30 from every other frame, 1600 samples to two frames).
     {
         dcp::SoundMxfWriter sound;
         std::string err;
         if (!sound.open(QDir(folder).filePath(soundFile).toStdString(), soundId, fps, channels, settings.language, &err)) return fail(err);
         Sequence mixSeq = s;
         const int perFrame = kSampleRate / fps;
-        mixSeq.sampleRate = int(std::lround(perFrame * s.fpsValue()));
+        mixSeq.sampleRate = int(std::lround(perFrame * s.fpsValue() / step));
+        const int64_t firstSample = int64_t(std::llround(double(first) * perFrame / step));
         AudioMixer mixer;
         std::vector<float> mix(size_t(perFrame) * size_t(std::max(2, seqChannels))), out(size_t(perFrame) * size_t(channels));
         // Where each of the sequence's channels goes: stereo to L and R; 5.1 as it is; 7.1 (L R C LFE Lb Rb Ls Rs, as
@@ -387,7 +407,7 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& settings,
         else if (seqChannels == 6) route = {0, 1, 2, 3, 4, 5};
         else route = {0, 1};
         for (int64_t k = 0; k < frames; ++k) {
-            const int64_t start = (first + k) * perFrame;
+            const int64_t start = firstSample + k * perFrame;
             if (seqChannels > 2) mixer.mixLayout(p, mixSeq, start, perFrame, mix.data());
             else mixer.mix(p, mixSeq, start, perFrame, mix.data());
             std::fill(out.begin(), out.end(), 0.0f);
@@ -431,15 +451,19 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& settings,
             }
             return pool.error().empty();
         };
+        const size_t inHand = size_t(threads) * 2;
         for (int64_t k = 0; k < frames; ++k) {
-            Image frame = renderProgramFrame(p, s, first + k, o);
+            Image frame = renderProgramFrame(p, s, first + k * step, o);
             if (frame.width != fw || frame.height != fh) frame = resizeImage(frame, fw, fh);
             if (space != &sequenceColorSpace(s)) convertColor(frame, sequenceColorSpace(s), *space, s.hdrPeakNits);
             Image boxed(cw, ch);  // black around it
             for (int y = 0; y < fh; ++y) std::copy(frame.row(y), frame.row(y) + size_t(fw) * 4, boxed.row(y + oy) + size_t(ox) * 4);
             std::vector<uint16_t> codes;
             xyz.convert(boxed, codes);
-            pool.push(k, std::move(codes), size_t(threads) * 2);
+            // Room for it: the earliest frame written first when enough are in hand.
+            while (pool.pending() >= inHand && written < k)
+                if (!writeReady(true)) return fail(err.empty() ? pool.error() : err);
+            pool.push(k, std::move(codes));
             if (!writeReady(false)) return fail(err.empty() ? pool.error() : err);
             if (progress && !progress(0.05 + 0.9 * double(written) / double(frames))) return fail("Stopped");
         }
@@ -460,8 +484,17 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& settings,
     const QString cplFile = QStringLiteral("CPL_%1.xml").arg(QString::fromStdString(dcp::uuidString(cplId)));
     const QString pklFile = QStringLiteral("PKL_%1.xml").arg(QString::fromStdString(dcp::uuidString(pklId)));
     qint64 pictureSize = 0, soundSize = 0;
-    const QString pictureHash = fileHash(QDir(folder).filePath(pictureFile), &pictureSize);
-    const QString soundHash = fileHash(QDir(folder).filePath(soundFile), &soundSize);
+    const qint64 toHash = std::max<qint64>(1, QFileInfo(QDir(folder).filePath(pictureFile)).size() + QFileInfo(QDir(folder).filePath(soundFile)).size());
+    qint64 hashed = 0;
+    bool stopped = false;
+    auto hashing = [&](qint64 n) {
+        hashed += n;
+        stopped = progress && !progress(0.95 + 0.05 * double(hashed) / double(toHash));
+        return !stopped;
+    };
+    const QString pictureHash = fileHash(QDir(folder).filePath(pictureFile), &pictureSize, hashing);
+    const QString soundHash = pictureHash.isEmpty() ? QString() : fileHash(QDir(folder).filePath(soundFile), &soundSize, hashing);
+    if (pictureHash.isEmpty() || soundHash.isEmpty()) return fail(stopped ? "Stopped" : "Cannot read the track files back");
     auto writeXml = [&](const QString& file, const std::function<void(QXmlStreamWriter&)>& body) {
         QFile f(QDir(folder).filePath(file));
         if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) return false;
@@ -685,7 +718,7 @@ struct TrackInfo {
     int64_t packets = 0, largest = 0;
 };
 
-TrackInfo probeTrack(const std::string& path) {
+TrackInfo probeTrack(const std::string& path, const std::function<bool(qint64)>& read = {}) {
     TrackInfo t;
     AVFormatContext* fmt = nullptr;
     if (avformat_open_input(&fmt, path.c_str(), nullptr, nullptr) < 0) return t;
@@ -698,13 +731,18 @@ TrackInfo probeTrack(const std::string& path) {
         t.channels = cp->ch_layout.nb_channels;
         t.bits = cp->bits_per_raw_sample ? cp->bits_per_raw_sample : cp->bits_per_coded_sample;
         AVPacket* pkt = av_packet_alloc();
-        while (av_read_frame(fmt, pkt) >= 0) {
+        qint64 since = 0;
+        bool going = true;
+        while (going && av_read_frame(fmt, pkt) >= 0) {
             if (pkt->stream_index == 0) {
                 ++t.packets;
                 t.largest = std::max<int64_t>(t.largest, pkt->size);
             }
+            since += pkt->size;
+            if (read && since >= (1 << 20)) going = read(since), since = 0;
             av_packet_unref(pkt);
         }
+        if (read && going && since) read(since);
         av_packet_free(&pkt);
         t.ok = true;
     }
@@ -714,7 +752,7 @@ TrackInfo probeTrack(const std::string& path) {
 
 }  // namespace
 
-std::vector<std::string> verifyDcp(const std::string& folderPath) {
+std::vector<std::string> verifyDcp(const std::string& folderPath, const std::function<bool(double)>& progress) {
     std::vector<std::string> issues;
     auto issue = [&](const QString& s) { issues.push_back(s.toStdString()); };
     const QDir dir(QString::fromStdString(folderPath));
@@ -773,10 +811,24 @@ std::vector<std::string> verifyDcp(const std::string& folderPath) {
         }
     }
     if (packingLists == 0) issue("The asset map names no packing list");
+    // Every file is read twice (hashed, then its frames counted): progress by bytes.
+    qint64 total = 1, read = 0;
+    for (auto& [id, a] : assets)
+        if (!a.packingList && !a.hash.isEmpty()) total += 2 * QFileInfo(dir.filePath(a.path)).size();
+    bool stopped = false;
+    auto reading = [&](qint64 n) {
+        read += n;
+        if (progress && !progress(std::min(1.0, double(read) / double(total)))) stopped = true;
+        return !stopped;
+    };
     for (auto& [id, a] : assets) {
         if (a.packingList || a.hash.isEmpty()) continue;
         qint64 size = 0;
-        const QString hash = fileHash(dir.filePath(a.path), &size);
+        const QString hash = fileHash(dir.filePath(a.path), &size, reading);
+        if (stopped) {
+            issue("Stopped");
+            return issues;
+        }
         if (hash != a.hash) issue(QStringLiteral("%1 does not match its hash in the packing list (damaged or changed)").arg(a.path));
         if (a.size >= 0 && size != a.size) issue(QStringLiteral("%1 is %2 bytes; the packing list says %3").arg(a.path).arg(size).arg(a.size));
     }
@@ -814,7 +866,11 @@ std::vector<std::string> verifyDcp(const std::string& folderPath) {
             const int64_t duration = r.duration >= 0 ? r.duration : r.intrinsic - r.entry;
             if (r.intrinsic >= 0 && r.entry + duration > r.intrinsic) issue(QStringLiteral("%1 %2 plays past its end").arg(r.kind, r.id));
             const std::string file = dir.filePath(assets[r.id].path).toStdString();
-            const TrackInfo t = probeTrack(file);
+            const TrackInfo t = probeTrack(file, reading);
+            if (stopped) {
+                issue("Stopped");
+                return issues;
+            }
             if (r.kind == "MainPicture") {
                 picture = true;
                 const bool dci = (t.width == 1998 && t.height == 1080) || (t.width == 2048 && t.height == 858) || (t.width == 2048 && t.height == 1080) ||

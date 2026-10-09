@@ -4307,11 +4307,24 @@ QString MainWindow::exportDcpTo(const QString& parent, const DcpSettings& settin
     QTimer tick;
     connect(&tick, &QTimer::timeout, this, [&] { progress.setValue(done.load()); });
     tick.start(100);
+    // Then checked as a server would, reading every file back (also off the UI thread: a feature is many gigabytes).
+    std::vector<std::string> issues;
+    std::atomic<bool> checking{false};
+    connect(&tick, &QTimer::timeout, this, [&] {
+        if (checking.load()) progress.setLabelText(tr("Checking the DCP of %1...").arg(QString::fromStdString(seq.name)));
+    });
     watcher.setFuture(QtConcurrent::run([&] {
-        return exportDcp(project, seq, settings, parent.toStdString(), &result, [&](double f) {
-            done = int(f * 1000);
+        if (!exportDcp(project, seq, settings, parent.toStdString(), &result, [&](double f) {
+                done = int(f * 850);
+                return !cancel.load();
+            }, &err))
+            return false;
+        checking = true;
+        issues = verifyDcp(result.folder, [&](double f) {
+            done = 850 + int(f * 150);
             return !cancel.load();
-        }, &err);
+        });
+        return true;
     }));
     if (!watcher.isFinished()) loop.exec();
     tick.stop();
@@ -4320,7 +4333,10 @@ QString MainWindow::exportDcpTo(const QString& parent, const DcpSettings& settin
         state_->message(cancel ? tr("DCP cancelled") : tr("No DCP: %1").arg(QString::fromStdString(err)), 8000);
         return {};
     }
-    const std::vector<std::string> issues = verifyDcp(result.folder);
+    if (cancel.load() && !issues.empty() && issues.back() == "Stopped") {
+        state_->message(tr("DCP %1 made; its check was stopped").arg(QString::fromStdString(result.name)), 8000);
+        return QString::fromStdString(result.folder);
+    }
     QStringList found;
     for (const std::string& i : issues) found << QString::fromStdString(i);
     if (problems) *problems = found;

@@ -181,6 +181,41 @@ private slots:
             applyVideoEffect(e, 0, out, 1.0, 0.5);
             QVERIFY(same(out, 100, 57));
         }
+        // Even a frame past the seconds analysed finds the frame's faces too, while the tracked ones are still held.
+        {
+            FaceScope scope(std::make_shared<const std::vector<FaceBox>>(std::vector<FaceBox>{f}));
+            QVERIFY(redactNeedsLiveFaces(e, 1.0 + 2 / 25.0));
+            out = img;
+            applyVideoEffect(e, 0, out, 1.0, 1.0 + 2 / 25.0);
+            QCOMPARE(out.at(100, 57)[1], 1.0f);
+            QCOMPARE(out.at(40, 60)[1], 1.0f);
+            QVERIFY(same(out, 140, 60));
+        }
+        // An analysis of other footage (the effect pasted onto another clip, or its media replaced), or of a 360° frame
+        // before it was reframed, is not used: the frame's own faces are.
+        e.strings["media"] = "7";
+        {
+            TrackedSourceScope source(7, false);
+            QVERIFY(!redactNeedsLiveFaces(e, 0.5));
+        }
+        for (auto [media, reframed] : {std::pair<uint64_t, bool>{8, false}, {7, true}}) {
+            TrackedSourceScope source(media, reframed);
+            FaceScope scope(std::make_shared<const std::vector<FaceBox>>(std::vector<FaceBox>{f}));
+            QVERIFY(redactNeedsLiveFaces(e, 0.5));
+            out = img;
+            applyVideoEffect(e, 0, out, 1.0, 0.5);
+            QCOMPARE(out.at(100, 57)[1], 1.0f);
+            QVERIFY(same(out, 40, 60));
+        }
+        e.strings.erase("media");
+        // An analysis that found nobody leaves it to the frame's faces.
+        {
+            FaceTracks none = tr;
+            none.tracks.clear();
+            Effect empty = e;
+            empty.strings["tracks"] = faceTracksToString(none);
+            QVERIFY(redactNeedsLiveFaces(empty, 0.5));
+        }
         // With no analysis at all: the frame's faces.
         Effect live = makeEffect("redact_faces", 2);
         QVERIFY(redactNeedsLiveFaces(live, 0.5));
@@ -3314,6 +3349,44 @@ colorspaces:
         brief.inPoint = 0, brief.outPoint = 12;
         st.inOut = true;
         QVERIFY(!exportDcp(p, brief, st, dir.path().toStdString(), nullptr, {}, &err) && err.find("second") != std::string::npos);
+        // A 60 fps sequence plays at 30 from every other frame, at its own speed; In to Out takes both ends; one encoder
+        // falling behind the renderer still finishes (frames taken back in order before more are pushed).
+        {
+            Sequence sixty = s;
+            sixty.fps = Rational{60, 1};
+            sixty.videoTracks[0].clips[0].duration = 120;
+            sixty.audioTracks[0].clips[0].duration = 60;
+            sixty.inPoint = 0, sixty.outPoint = 59;
+            QCOMPARE(dcpFrameRate(sixty, 0), 30);
+            QCOMPARE(dcpFrameStep(sixty, 30), 2);
+            DcpSettings fast = st;
+            fast.title = "Sixty";
+            fast.threads = 1;
+            DcpResult r60;
+            QVERIFY2(exportDcp(p, sixty, fast, dir.path().toStdString(), &r60, {}, &err), err.c_str());
+            QVERIFY(r60.fps == 30 && r60.frames == 30);
+            const QDir out60(QString::fromStdString(r60.folder));
+            AudioBufferPtr tone = decodeAudio(out60.filePath(out60.entryList({"pcm_*.mxf"}).value(0)).toStdString(), 48000, &err, nullptr, {0});
+            QVERIFY2(tone, err.c_str());
+            QVERIFY2(std::abs(tone->frames() - 48000) < 10, qPrintable(QString::number(tone->frames())));
+            int crossings = 0;
+            for (int64_t i = 1; i < 40000; ++i) crossings += (tone->samples[size_t(i - 1) * 2] < 0) != (tone->samples[size_t(i) * 2] < 0);  // (stereo)
+            QVERIFY2(std::abs(crossings - 1667) < 20, qPrintable(QString::number(crossings)));  // still 1 kHz (not slowed to 800 Hz)
+        }
+        Sequence fifty = s;
+        fifty.fps = Rational{50, 1};
+        QVERIFY(dcpFrameRate(fifty, 0) == 25 && dcpFrameStep(fifty, 25) == 2);
+        fifty.fps = Rational{60000, 1001};
+        QVERIFY(dcpFrameRate(fifty, 0) == 30 && dcpFrameStep(fifty, 30) == 2);
+        fifty.fps = Rational{48, 1};
+        QVERIFY(dcpFrameRate(fifty, 0) == 48 && dcpFrameStep(fifty, 48) == 1);
+        // Checking reports its progress and stops when asked.
+        double seen = 0;
+        issues = verifyDcp(r.folder, [&](double f) {
+            seen = std::max(seen, f);
+            return f < 0.3;
+        });
+        QVERIFY(!issues.empty() && issues.back() == "Stopped" && seen >= 0.3 && seen < 1);
         // 23.976 plays at 24; Flat and Full containers.
         Sequence ntsc = s;
         ntsc.fps = Rational{24000, 1001};

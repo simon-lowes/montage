@@ -3132,7 +3132,8 @@ void McpServer::Impl::addTools() {
             clipMediaSpan(s, *c, m->kind == MediaKind::Image, start, end);
             FaceTracks tracks;
             const Effect* existing = redactFacesEffectOf(l.project, *c, false);
-            bool have = existing && faceTracksFromString(existing->s("tracks"), tracks);
+            bool have = existing && faceTracksFromString(existing->s("tracks"), tracks) &&
+                        (existing->s("media").empty() || existing->s("media") == std::to_string(m->id));
             if (have && tracks.step > 0 && (start < tracks.start - 1 / tracks.fps || end > tracks.end + 1 / tracks.fps)) have = false;
             bool analysed = false;
             if (!have || a.value("reanalyse").toBool()) {
@@ -3176,6 +3177,7 @@ void McpServer::Impl::addTools() {
             Effect* e = redactFacesEffectOf(l.project, *c, true);
             e->enabled = true;
             e->strings["tracks"] = faceTracksToString(tracks);
+            e->strings["media"] = std::to_string(m->id);
             if (keep.empty()) e->strings.erase("keep");
             else e->strings["keep"] = trackIdsToString(keep);
             if (!styleName.isEmpty()) e->params["style"] = Param(styleName == "blur" ? 0.0 : styleName == "pixelate" ? 1.0 : 2.0);

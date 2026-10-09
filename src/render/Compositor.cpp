@@ -681,6 +681,8 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
     double mw = SW, mh = SH;
     Geometry g;
     double sourceSeconds = -1;  // media time of the frame, for effects that follow the footage
+    uint64_t sourceMedia = 0;   // and its media, and whether it was reframed from 360°, for analyses made from it
+    bool reframed = false;
     ofx::FrameFetch ofxFetch;   // the clip's source at other clip frames, for OpenFX plugins that ask (render/Ofx.h)
     if (c.isGenerator() && c.generator.type == "adjustment") {
         // An adjustment layer's picture is the composite beneath it (already in the working space).
@@ -758,6 +760,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             if (!f && path == m->path && isOffline(*m)) f = offlineSlate(w, h);
             if (!f) return {};
             if (m->kind == MediaKind::Video) sourceSeconds = sec;
+            sourceMedia = m->id;
             if (m->kind == MediaKind::Video && std::any_of(c.effects.begin(), c.effects.end(), [](const Effect& e) { return e.type == "ofx" && e.enabled; })) {
                 const double duration = m->duration, frameSeconds = m->fps.valid() ? 1.0 / m->fps.toDouble() : 1.0 / 30, seqFps = seq.fpsValue();
                 const bool hq = o.highQuality;
@@ -891,6 +894,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                 src = cachedSuperScale(src, outW, outH, ss->p("strength", lt, 100) / 100, big) ? std::move(big)
                                                                                                 : resizeImage(src, outW, outH);
             }
+            if (vr) reframed = true;
             if (vr)
                 src = reframeEquirect(src, vr->p("yaw", lt, 0), vr->p("pitch", lt, 0), vr->p("roll", lt, 0), vrFov, vrView, viewW, viewH);
             // Input transform: the media's space into the sequence's working space.
@@ -917,6 +921,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
         people = cachedPersonMatte(src);
     PersonScope personScope(people);
     // And the faces, for Face Refinement, Blemish Remover and Redact Faces.
+    TrackedSourceScope trackedSource(sourceMedia, reframed);
     std::shared_ptr<const std::vector<FaceBox>> faces;
     // (Redact Faces only where its analysis does not reach.)
     if (std::any_of(chain.begin(), chain.end(),
@@ -926,8 +931,11 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
         faces = cachedFaces(src);
     FaceScope faceScope(faces);
     ofx::FetchScope fetchScope(ofxFetch);
+    // Faces are covered first, where they are in the source, whatever moves the picture after (Stabilize, transforms).
     for (const Effect* e : chain)
-        if (e->type != "video_denoise" && e->type != "super_scale" && e->type != "reframe_360")  // those ran on the source
+        if (e->type == "redact_faces") applyVideoEffect(*e, lt, src, pixelScale, sourceSeconds);
+    for (const Effect* e : chain)
+        if (e->type != "video_denoise" && e->type != "super_scale" && e->type != "reframe_360" && e->type != "redact_faces")  // those ran already
             applyVideoEffect(*e, lt, src, pixelScale, sourceSeconds);
     if (identityLayer(src, g, SW, SH, o.scale)) return src;  // a full-frame clip: no copy
     return transformLayer(src, g, SW, SH, o.scale);

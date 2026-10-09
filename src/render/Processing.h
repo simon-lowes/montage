@@ -62,6 +62,20 @@ private:
 // Redact Faces follows the faces its analysis found (media/FaceTracks.h) within the media seconds analysed; outside
 // them, or with no analysis, it covers the faces found in the frame itself, so needs them detected.
 bool redactNeedsLiveFaces(const Effect& e, double sourceSeconds);
+// The media the frame comes from (its id) and whether it was reframed from 360° first, for the duration of a scope:
+// an analysis is used only on the media it was made from (not on footage its effect was pasted onto, or replaced
+// with) and not on a reframed view of it.
+class TrackedSourceScope {
+public:
+    TrackedSourceScope(uint64_t media, bool reframed);
+    ~TrackedSourceScope();
+    TrackedSourceScope(const TrackedSourceScope&) = delete;
+    TrackedSourceScope& operator=(const TrackedSourceScope&) = delete;
+
+private:
+    uint64_t previousMedia_;
+    bool previousReframed_;
+};
 // A soft matte's edge moved out by `expand` px (re-edged by distance, softened over
 // `feather`), or else blurred by `blur` px; unchanged when both are zero.
 void refineMatte(std::vector<float>& matte, int w, int h, double expand, double feather, double blur);

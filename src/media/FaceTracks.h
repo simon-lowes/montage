@@ -55,8 +55,8 @@ struct FaceSighting {
 };
 // Links the sightings of successive frames into tracks: a face joins the track whose last box is nearest it (allowing
 // for how long ago that was, up to `maxGap` seconds) and of a like size, unless both identities are known and are
-// clearly different people. Tracks seen only once with a weak score are dropped as false finds.
-std::vector<FaceTrack> linkFaceTracks(const std::vector<std::vector<FaceSighting>>& frames, double maxGap, bool keepSingles = false);
+// different people (below SFace's 0.36). Every find makes or joins a track, even one seen once.
+std::vector<FaceTrack> linkFaceTracks(const std::vector<std::vector<FaceSighting>>& frames, double maxGap);
 
 // Analyses media seconds `start`..`end` of a video (every frame up to 30 per second) or a still. `progress` (0..1)
 // may return false to stop.

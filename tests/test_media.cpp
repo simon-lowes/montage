@@ -7411,7 +7411,8 @@ private slots:
 
     void faceTracksLinkHoldAndGroup() {
         // 30 frames at 25 fps. A drifts right and is lost for frames 10-14, then leaves after frame 20; B stays put;
-        // at frame 22 someone else (C) steps in where A was; a weak find at frame 5 is seen once.
+        // at frame 22 someone else (C, only a little like A) steps in where A was; a faint find (D) at frame 5 is seen
+        // once and kept all the same.
         const double dt = 0.04;
         auto unit = [](int axis) {
             std::vector<float> v(128, 0.0f);
@@ -7430,18 +7431,22 @@ private slots:
             };
             if (i <= 20 && (i < 10 || i > 14)) add(0.1f + 0.005f * i, 0.3f, 0);
             add(0.7f, 0.3f, 1);
-            if (i >= 22) add(0.2f, 0.3f, 2);
+            if (i >= 22) {
+                add(0.2f, 0.3f, 2);
+                if (!f.back().identity.empty()) f.back().identity[0] = 0.3f, f.back().identity[2] = std::sqrt(1 - 0.09f);  // cosine 0.3 with A
+            }
             if (i == 5) add(0.4f, 0.7f, 3, 0.75f);
             frames.push_back(f);
         }
         const std::vector<FaceTrack> tracks = linkFaceTracks(frames, 1.0);
-        QCOMPARE(int(tracks.size()), 3);
+        QCOMPARE(int(tracks.size()), 4);
+        QVERIFY(tracks[2].boxes.size() == 1 && std::fabs(tracks[2].score - 0.75f) < 1e-6f);  // D
         const FaceTrack& A = tracks[0];
         QCOMPARE(int(A.boxes.size()), 16);  // across the gap
         QCOMPARE(A.boxes.back().time, 20 * dt);
         QVERIFY(A.identity.size() == 128 && A.identity[0] > 0.99f);
         QCOMPARE(int(tracks[1].boxes.size()), 30);
-        QVERIFY(tracks[2].identity[2] > 0.99f && std::fabs(tracks[2].boxes.front().time - 22 * dt) < 1e-9);  // not A's
+        QVERIFY(tracks[3].identity[2] > 0.9f && std::fabs(tracks[3].boxes.front().time - 22 * dt) < 1e-9);  // C: not A's
 
         FaceTracks t;
         t.fps = 25, t.start = 0, t.end = 29 * dt, t.step = dt;
@@ -7463,7 +7468,7 @@ private slots:
         QVERIFY(at(13, 2, 1) && std::fabs(at(13, 2, 1)->x - (0.1f + 0.005f * 15)) < 1e-4f);
         // Held beyond a track's ends, and between frames.
         QVERIFY(at(23, 12, 1) && !at(23, 2, 1));
-        QVERIFY(!at(21, 0, 3) && at(21, 2, 3));
+        QVERIFY(!at(21, 0, 4) && at(21, 2, 4));
         QCOMPARE(int(trackedFacesAt(t, 7.5 * dt, 0).size()), 2);  // A and B, half way between frames
 
         // Kept as text, the same in every locale.
@@ -7472,8 +7477,8 @@ private slots:
         QVERIFY(faceTracksFromString(text, back));
         QCOMPARE(back.fps, 25.0);
         QCOMPARE(back.step, dt);
-        QCOMPARE(int(back.tracks.size()), 3);
-        for (size_t i = 0; i < 3; ++i) {
+        QCOMPARE(int(back.tracks.size()), 4);
+        for (size_t i = 0; i < 4; ++i) {
             QCOMPARE(back.tracks[i].id, t.tracks[i].id);
             QCOMPARE(back.tracks[i].boxes.size(), t.tracks[i].boxes.size());
             for (size_t k = 0; k < back.tracks[i].boxes.size(); ++k) {
@@ -7499,7 +7504,7 @@ private slots:
         for (auto& b : B2.boxes) b.time += 2;
         t.tracks.push_back(B2);
         const std::vector<FaceGroup> groups = groupFaceTracks(t);
-        QCOMPARE(int(groups.size()), 3);
+        QCOMPARE(int(groups.size()), 4);
         QCOMPARE((std::set<int>(groups[0].tracks.begin(), groups[0].tracks.end())), (std::set<int>{2, 9}));
         QVERIFY(std::fabs(groups[0].seconds - 2 * 30 * dt) < 1e-6);
         QCOMPARE(groups[1].tracks, std::vector<int>{1});

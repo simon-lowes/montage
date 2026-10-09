@@ -872,6 +872,9 @@ thread_local std::shared_ptr<const ValueMap> tPerson;
 thread_local std::shared_ptr<const std::vector<FaceBox>> tFaces;
 // The media time of the frame applyVideoEffect() is working on, for the effects that follow the footage.
 thread_local double tSourceSeconds = -1;
+// The media it comes from (0: not known) and whether it was reframed from 360° (TrackedSourceScope).
+thread_local uint64_t tSourceMedia = 0;
+thread_local bool tReframed = false;
 }  // namespace
 
 const std::vector<FaceBox>* currentFaces() { return tFaces.get(); }
@@ -1195,24 +1198,38 @@ std::shared_ptr<const FaceTracks> faceTracksOf(const Effect& e) {
     return slot;
 }
 
-// Whether the analysis covers the frame: a still's always does; a video's within the seconds analysed (half a frame
-// either side, and the hold).
+// Whether the analysis is of this picture: made from this media (when the effect says which) and not reframed since.
+bool tracksOfThisSource(const Effect& e) {
+    if (tReframed) return false;
+    const std::string& media = e.s("media");
+    return media.empty() || !tSourceMedia || media == std::to_string(tSourceMedia);
+}
+
+// Whether the analysis decides the frame alone: it found faces, it is of this picture, and the frame is within the
+// seconds analysed (a still's: always). Beyond them, even by a frame, the frame's own faces are found as well.
 bool tracksCover(const FaceTracks& tr, const Effect& e, double sourceSeconds) {
+    if (tr.tracks.empty() || !tracksOfThisSource(e)) return false;
     if (tr.step <= 0) return true;
     if (sourceSeconds < 0) return false;
-    const double slack = 0.5 / tr.fps + std::max(0.0, e.p("hold", 0, 12)) / tr.fps;
+    const double slack = 0.5 / tr.fps + 0.5 * tr.step;
     return sourceSeconds >= tr.start - slack && sourceSeconds <= tr.end + slack;
 }
 
 void redactFacesEffect(const Effect& e, FrameTime t, Image& img, double sourceSeconds) {
     std::vector<FaceBox> covered, shown;
     auto tracks = faceTracksOf(e);
+    const int hold = int(std::lround(e.p("hold", t, 12)));
     if (tracks && tracksCover(*tracks, e, sourceSeconds)) {
         const std::set<int> keep = trackIdsFromString(e.s("keep"));
-        for (const TrackedFace& f : trackedFacesAt(*tracks, sourceSeconds, int(std::lround(e.p("hold", t, 12)))))
-            (keep.count(f.track) ? shown : covered).push_back(f.box);
-    } else if (const std::vector<FaceBox>* faces = currentFaces()) {
-        covered = *faces;
+        for (const TrackedFace& f : trackedFacesAt(*tracks, sourceSeconds, hold)) (keep.count(f.track) ? shown : covered).push_back(f.box);
+    } else {
+        if (const std::vector<FaceBox>* faces = currentFaces()) covered = *faces;
+        // Just past the analysis, the faces it followed are still held there too.
+        if (tracks && tracksOfThisSource(e) && tracks->step > 0 && sourceSeconds >= 0) {
+            const std::set<int> keep = trackIdsFromString(e.s("keep"));
+            for (const TrackedFace& f : trackedFacesAt(*tracks, sourceSeconds, hold))
+                if (!keep.count(f.track)) covered.push_back(f.box);
+        }
     }
     RedactSettings rs;
     rs.style = int(std::lround(e.p("style", t)));
@@ -1280,6 +1297,15 @@ void stabilize(const Effect& e, FrameTime t, Image& img, double sourceSeconds) {
     });
 }
 }  // namespace
+
+TrackedSourceScope::TrackedSourceScope(uint64_t media, bool reframed) : previousMedia_(tSourceMedia), previousReframed_(tReframed) {
+    tSourceMedia = media;
+    tReframed = reframed;
+}
+TrackedSourceScope::~TrackedSourceScope() {
+    tSourceMedia = previousMedia_;
+    tReframed = previousReframed_;
+}
 
 bool redactNeedsLiveFaces(const Effect& e, double sourceSeconds) {
     if (!e.enabled || e.type != "redact_faces") return false;

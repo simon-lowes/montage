@@ -147,7 +147,7 @@ bool faceTracksFromString(const std::string& text, FaceTracks& out) {
     return true;
 }
 
-std::vector<FaceTrack> linkFaceTracks(const std::vector<std::vector<FaceSighting>>& frames, double maxGap, bool keepSingles) {
+std::vector<FaceTrack> linkFaceTracks(const std::vector<std::vector<FaceSighting>>& frames, double maxGap) {
     struct Building {
         FaceTrack track;
         std::vector<float> sum;    // of identities
@@ -186,7 +186,7 @@ std::vector<FaceTrack> linkFaceTracks(const std::vector<std::vector<FaceSighting
                     std::vector<float> mean = who;
                     normalise(mean);
                     const float c = cosine(mean, f.identity);
-                    if (c < 0.2f) continue;  // someone else, though in the same place
+                    if (c < 0.36f) continue;  // someone else (SFace's threshold), though in the same place
                     cost -= 0.25 * c;
                 }
                 pairs.push_back({cost, ti, fi});
@@ -224,7 +224,7 @@ std::vector<FaceTrack> linkFaceTracks(const std::vector<std::vector<FaceSighting
     std::vector<FaceTrack> out;
     int id = 1;
     for (Building& b : all) {
-        if (b.seen < 2 && !keepSingles && b.track.score < 0.9f) continue;  // a passing false find
+        // Every find is kept, even once and faint: covering a false find for a moment is better than showing a face.
         b.track.identity = b.sum;
         normalise(b.track.identity);
         b.track.id = id++;
@@ -286,7 +286,7 @@ bool trackFaces(const std::string& path, double start, double end, FaceTracks& o
         frames.push_back(std::move(sightings));
     }
     if (progress) progress(1.0);
-    result.tracks = linkFaceTracks(frames, 1.0, still);
+    result.tracks = linkFaceTracks(frames, 1.0);
     out = std::move(result);
     return true;
 }
