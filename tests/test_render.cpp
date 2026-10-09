@@ -8,6 +8,7 @@
 #include <fstream>
 #include <tuple>
 
+#include "core/ClipAnimation.h"
 #include "core/Captions.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
@@ -1604,6 +1605,46 @@ colorspaces:
         QVERIFY(near(c[0], 0));
         rgb(boxed, 80, 2, c);
         QVERIFY(near(c[0], 1));
+    }
+
+    void clipAnimationsRendered() {
+        // A red matte that slides in from the right over a second, wiggles, and fades out over its last second.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 160;
+        s.height = 90;
+        s.fps = Rational{25, 1};
+        const Clip red = colorClip(p, 1, 0, 0, 0, 100);
+        edit::overwrite(p, s, {TrackKind::Video, 0}, red);
+        QVERIFY(edit::setClipAnimation(s, red.id, AnimationSlot::In, "slide_left", 1.0).ok);
+        QVERIFY(edit::setClipAnimation(s, red.id, AnimationSlot::Out, "fade", 1.0).ok);
+        RenderOptions o;
+        float c[4];
+        // How much of the frame is red, and where its left edge is.
+        auto redShare = [&](FrameTime t, int* leftEdge = nullptr) {
+            const Image img = renderSequenceFrame(p, s, t, o);
+            int n = 0, left = 160;
+            for (int y = 0; y < 90; ++y)
+                for (int x = 0; x < 160; ++x)
+                    if (img.at(x, y)[0] > 0.5f) ++n, left = std::min(left, x);  // premultiplied: red and opaque
+            if (leftEdge) *leftEdge = left;
+            return double(n) / (160 * 90);
+        };
+        int edge = 0;
+        QCOMPARE(redShare(0), 0.0);  // still off to the right
+        const double partway = redShare(5, &edge);
+        QVERIFY2(partway > 0.2 && partway < 0.95 && edge > 5, qPrintable(QString("%1 at %2").arg(partway).arg(edge)));
+        QVERIFY(redShare(30) > 0.99);
+        // Fading out: half red by the middle of the last second, nothing on the last frame's end.
+        rgb(renderSequenceFrame(p, s, 87, o), 80, 45, c);
+        QVERIFY2(c[3] > 0.2 && c[3] < 0.8, qPrintable(QString::number(c[3])));  // seen through: its alpha
+        rgb(renderSequenceFrame(p, s, 50, o), 80, 45, c);
+        QVERIFY(c[3] > 0.99);
+        // A combo pulse makes it bigger than the frame some of the time (still full red); a swing turns it.
+        QVERIFY(edit::setClipAnimation(s, red.id, AnimationSlot::Combo, "swing", 1.0).ok);
+        double least = 1;
+        for (FrameTime t = 30; t < 60; t += 3) least = std::min(least, redShare(t));
+        QVERIFY2(least < 0.97, qPrintable(QString::number(least)));  // the corners show while it swings
     }
 
     void videoLayouts() {

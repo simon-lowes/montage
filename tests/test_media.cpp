@@ -38,6 +38,7 @@
 #include "core/TranscriptEdit.h"
 #include "audio/SpeechCleanup.h"
 #include "audio/TimeStretch.h"
+#include "core/ClipAnimation.h"
 #include "core/MergeClips.h"
 #include "media/DualSystem.h"
 #include "media/FieldRecorder.h"
@@ -1374,6 +1375,41 @@ private slots:
             QVERIFY(loadProject(project.toStdString(), back));
             QVERIFY(back.active()->audioTracks[0].clips.front().timing.p("maintain_pitch", 1) < 0.5);
         }
+    }
+
+    void clipAnimationOverMcp() {
+        Project q = makeDefaultProject();
+        Clip c = makeGeneratorClip(q, "color", 90);
+        edit::overwrite(q, *q.active(), {TrackKind::Video, 0}, c);
+        const double id = double(q.active()->videoTracks[0].clips.front().id);
+        const QString project = QString::fromStdString(path("animate.montage"));
+        QVERIFY(saveProject(q, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_animate_clip"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call({{"project", project}, {"clip", id}, {"in", "pop"}, {"in_seconds", 0.4}, {"out", "slide_down"}, {"combo", "float"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject anim = r.value("structuredContent").toObject().value("animation").toObject();
+        QCOMPARE(anim.value("in").toObject().value("type").toString(), QString("pop"));
+        QCOMPARE(anim.value("in").toObject().value("seconds").toDouble(), 0.4);
+        QCOMPARE(anim.value("combo").toObject().value("seconds").toDouble(), 1.0);
+        {
+            Project back;
+            QVERIFY(loadProject(project.toStdString(), back));
+            const Clip& k = back.active()->videoTracks[0].clips.front();
+            QCOMPARE(k.animOut, (ClipAnimation{"slide_down", 0.5}));
+        }
+        QVERIFY(call({{"project", project}, {"clip", id}, {"in", "teleport"}}).value("isError").toBool());
+        QVERIFY(call({{"project", project}, {"clip", id}}).value("isError").toBool());  // nothing asked
+        r = call({{"project", project}, {"clip", id}, {"combo", "none"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(!r.value("structuredContent").toObject().value("animation").toObject().contains("combo"));
     }
 
     void dualSystemSound() {

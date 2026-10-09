@@ -18,6 +18,7 @@
 #include <numeric>
 #include <sstream>
 
+#include "core/ClipAnimation.h"
 #include "core/AutoTag.h"
 #include "core/Automation.h"
 #include "core/CaptionTools.h"
@@ -775,6 +776,44 @@ void McpServer::Impl::addTools() {
             save(l);
             const Clip* c = edit::clipById(s, id);
             return ok(QStringLiteral("Trimmed by %1 frame(s)").arg(r.applied), c ? clipJson(l.project, s, *c) : QJsonObject{});
+        });
+
+    add("montage_animate_clip", "Animate a clip",
+        "Give a picture clip (video, still, title, shape) an animation preset, as CapCut's In / Out / Combo: in plays "
+        "over its first seconds, out over its last, combo repeats all through. Drawn on top of the clip's own transform, "
+        "so it survives moves and trims. In and out: fade, slide_left (in from the right, out to the left), slide_right, "
+        "slide_up, slide_down, zoom_in, zoom_out, pop, spin, drop, rise. Combo: wiggle, pulse, shake, float, swing, "
+        "push_in. none removes one. *_seconds: how long (in, out) or each repeat (combo), 0.1-10 s.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
+            "in":{"type":"string"},"out":{"type":"string"},"combo":{"type":"string"},
+            "in_seconds":{"type":"number","default":0.5},"out_seconds":{"type":"number","default":0.5},
+            "combo_seconds":{"type":"number","default":1}},
+            "required":["project","clip"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            const Id id = clipArg(l, a).id;
+            int changed = 0;
+            const struct {
+                const char* key;
+                const char* seconds;
+                AnimationSlot slot;
+                double def;
+            } parts[] = {{"in", "in_seconds", AnimationSlot::In, 0.5}, {"out", "out_seconds", AnimationSlot::Out, 0.5},
+                         {"combo", "combo_seconds", AnimationSlot::Combo, 1.0}};
+            for (const auto& part : parts) {
+                if (!a.contains(part.key)) continue;
+                const edit::Result r = edit::setClipAnimation(l.seq(), id, part.slot, a.value(part.key).toString().toStdString(),
+                                                              a.value(part.seconds).toDouble(part.def));
+                if (!r.ok && !r.error.empty()) throw ArgError{QString::fromStdString(r.error)};
+                changed += r.ok;
+            }
+            if (!changed) return fail("Nothing to change: give in, out or combo (or they are set already)");
+            save(l);
+            const Clip* c = edit::clipById(l.seq(), id);
+            QJsonObject anim;
+            for (const auto& [key, ca] : {std::pair{"in", c->animIn}, std::pair{"out", c->animOut}, std::pair{"combo", c->animLoop}})
+                if (!ca.type.empty()) anim[key] = QJsonObject{{"type", QString::fromStdString(ca.type)}, {"seconds", ca.seconds}};
+            return ok(QStringLiteral("Animated \"%1\"").arg(QString::fromStdString(c->name)), QJsonObject{{"animation", anim}});
         });
 
     add("montage_speed_ramp", "Speed ramp a clip",

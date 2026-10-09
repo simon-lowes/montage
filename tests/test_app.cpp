@@ -110,6 +110,7 @@
 #include "TranscribeDialog.h"
 #include "TranscriptPanel.h"
 #include "core/AutoTag.h"
+#include "core/ClipAnimation.h"
 #include "core/EditOps.h"
 #include "core/MergeClips.h"
 #include "core/Effects.h"
@@ -2206,6 +2207,36 @@ private slots:
         bullet->trigger();
         QVERIFY(!edit::clipById(*state()->sequence(), id)->ramped());
         state()->newProject();
+    }
+
+    void clipAnimationInInspector() {
+        loadDemo();
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        state()->setSelection({red}, false);
+        QApplication::processEvents();
+        auto* in = win_->findChild<QComboBox*>("animIn");
+        auto* inSecs = win_->findChild<QDoubleSpinBox*>("animInSeconds");
+        auto* combo = win_->findChild<QComboBox*>("animCombo");
+        QVERIFY(in && inSecs && combo && win_->findChild<QComboBox*>("animOut"));
+        QCOMPARE(in->currentIndex(), 0);  // None
+        // Slide Left over 0.8 s: one undo step.
+        inSecs->setValue(0.8);
+        in->setCurrentIndex(in->findData(QStringLiteral("slide_left")));
+        emit in->activated(in->currentIndex());
+        const Clip* c = clipNamed(*state()->sequence(), "Red");
+        QCOMPARE(c->animIn, (ClipAnimation{"slide_left", 0.8}));
+        QCOMPARE(state()->undoText(), tr("Clip Animation"));
+        combo->setCurrentIndex(combo->findData(QStringLiteral("pulse")));
+        emit combo->activated(combo->currentIndex());
+        QCOMPARE(clipNamed(*state()->sequence(), "Red")->animLoop.type, std::string("pulse"));
+        state()->undo();
+        QVERIFY(clipNamed(*state()->sequence(), "Red")->animLoop.type.empty());
+        state()->undo();
+        QVERIFY(!hasClipAnimation(*clipNamed(*state()->sequence(), "Red")));
+        // The Inspector follows: back to None.
+        QApplication::processEvents();
+        QCOMPARE(win_->findChild<QComboBox*>("animIn")->currentIndex(), 0);
+        state()->setSelection({}, false);
     }
 
     void speedWithMaintainedPitch() {

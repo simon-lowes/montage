@@ -27,6 +27,7 @@
 #include "audio/TimeStretch.h"
 #include "core/ProjectIO.h"
 #include "core/Bleep.h"
+#include "core/ClipAnimation.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
 #include "core/Surround.h"
@@ -444,6 +445,21 @@ Geometry geometryFor(const Effect& motion, FrameTime lt, double mw, double mh, i
     return g;
 }
 
+// The clip's transform at clip-local frame lt with its animation presets on top (core/ClipAnimation.h).
+Geometry clipGeometry(const Clip& c, FrameTime lt, double mw, double mh, int SW, int SH, double fps) {
+    Geometry g = geometryFor(c.motion, lt, mw, mh, SW, SH);
+    if (hasClipAnimation(c)) {
+        const AnimationPose a = clipAnimationPose(c, double(lt), fps);
+        g.px += a.dx * SW;
+        g.py += a.dy * SH;
+        g.sx *= a.scale;
+        g.sy *= a.scale;
+        g.rot += a.rotation * M_PI / 180.0;
+        g.opacity = std::clamp(g.opacity * a.opacity, 0.0, 1.0);
+    }
+    return g;
+}
+
 // Draws `src` (which depicts the media at any resolution) onto a canvas of
 // W x H (sequence size * scale) according to the geometry.
 // True when the layer maps one source pixel to one output pixel, unmoved,
@@ -557,10 +573,10 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
     if (c.isGenerator() && c.generator.type == "adjustment") {
         // An adjustment layer's picture is the composite beneath it (already in the working space).
         if (!below || below->empty()) return {};
-        g = geometryFor(c.motion, lt, SW, SH, SW, SH);
+        g = clipGeometry(c, lt, SW, SH, SW, SH, seq.fpsValue());
         src = *below;
     } else if (c.isGenerator()) {
-        g = geometryFor(c.motion, lt, SW, SH, SW, SH);
+        g = clipGeometry(c, lt, SW, SH, SW, SH, seq.fpsValue());
         int w, h;
         sourceSize(g, o.scale, int(SW * 4), int(SH * 4), w, h);
         src = renderGenerator(c.generator, lt, w, h, double(w) / SW, c.duration, seq.fpsValue());
@@ -574,7 +590,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             if (!nested || o.depth >= kMaxDepth || nested->id == seq.id) return {};
             mw = nested->width;
             mh = nested->height;
-            g = geometryFor(c.motion, lt, mw, mh, SW, SH);
+            g = clipGeometry(c, lt, mw, mh, SW, SH, seq.fpsValue());
             int w, h;
             sourceSize(g, o.scale, nested->width, nested->height, w, h);
             RenderOptions no = o;
@@ -591,7 +607,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             std::string path = (o.useProxies && !m->proxyPath.empty()) ? m->proxyPath : m->path;
             mw = m->width > 0 ? m->width : SW;
             mh = m->height > 0 ? m->height : SH;
-            g = geometryFor(c.motion, lt, mw, mh, SW, SH);
+            g = clipGeometry(c, lt, mw, mh, SW, SH, seq.fpsValue());
             int w, h;
             sourceSize(g, o.scale, int(mw), int(mh), w, h);
             // Super Scale: shown larger than it was shot, the frame is decoded at its own size and enlarged by
@@ -929,7 +945,7 @@ bool clipGeometry(const Project& p, const Sequence& seq, const Clip& c, FrameTim
             if (m->height > 0) mh = m->height;
         }
     }
-    g = geometryFor(c.motion, t - c.start, mw, mh, seq.width, seq.height);
+    g = clipGeometry(c, t - c.start, mw, mh, seq.width, seq.height, seq.fpsValue());
     return g.sx != 0 && g.sy != 0;
 }
 }  // namespace

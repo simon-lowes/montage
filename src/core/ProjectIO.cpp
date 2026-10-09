@@ -218,6 +218,12 @@ QJsonObject clipToJson(const Clip& c) {
         o["takes"] = takes;
         o["take"] = c.take;
     }
+    // Animations: {"in": ["slide_left", 0.5], ...}.
+    QJsonObject anim;
+    if (!c.animIn.type.empty()) anim["in"] = QJsonArray{qs(c.animIn.type), c.animIn.seconds};
+    if (!c.animOut.type.empty()) anim["out"] = QJsonArray{qs(c.animOut.type), c.animOut.seconds};
+    if (!c.animLoop.type.empty()) anim["combo"] = QJsonArray{qs(c.animLoop.type), c.animLoop.seconds};
+    if (!anim.isEmpty()) o["animation"] = anim;
     return o;
 }
 
@@ -251,6 +257,14 @@ Clip clipFromJson(const QJsonObject& o) {
         c.takes.push_back({Id(i64(t.value("media"))), t.value("offset").toDouble(), ss(t.value("name"))});
     }
     c.take = c.takes.empty() ? 0 : std::clamp(o.value("take").toInt(), 0, int(c.takes.size()) - 1);
+    const QJsonObject anim = o.value("animation").toObject();
+    auto readAnim = [&](const char* key, ClipAnimation& a) {
+        const QJsonArray v = anim.value(key).toArray();
+        if (v.size() >= 1) a = {ss(v.at(0)), std::clamp(v.at(1).toDouble(0.5), 0.1, 10.0)};
+    };
+    readAnim("in", c.animIn);
+    readAnim("out", c.animOut);
+    readAnim("combo", c.animLoop);
     return c;
 }
 

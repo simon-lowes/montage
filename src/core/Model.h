@@ -181,6 +181,13 @@ struct Take {
     bool operator==(const Take&) const = default;
 };
 
+// A clip animation preset (core/ClipAnimation.h): its kind ("" = none) and how long it lasts, in seconds.
+struct ClipAnimation {
+    std::string type;
+    double seconds = 0.5;
+    bool operator==(const ClipAnimation&) const = default;
+};
+
 struct Clip {
     Id id = 0;
     Id mediaId = 0;              // 0 for generator clips (titles, colour mattes...)
@@ -232,6 +239,8 @@ struct Clip {
     // An audition (core/EditOps.h pickTake): every take, the clip's own included as takes[take]; empty for a plain clip.
     std::vector<Take> takes;
     int take = 0;
+    // Animation presets (core/ClipAnimation.h): an entrance, an exit and a repeating motion on top of the transform.
+    ClipAnimation animIn, animOut, animLoop;
     bool operator==(const Clip&) const = default;
 };
 

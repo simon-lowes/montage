@@ -119,6 +119,9 @@ Clip subClip(const Clip& c, FrameTime from, FrameTime to) {
     else
         out.sourceIn = c.sourceIn + c.sourceOffset(double(from - c.start));  // follows a speed ramp
     shiftKeyframes(out, -(from - c.start));
+    // A part that no longer starts (ends) where the clip did loses its entrance (exit) animation.
+    if (from > c.start) out.animIn = {};
+    if (to < c.end()) out.animOut = {};
     return out;
 }
 
@@ -1163,6 +1166,9 @@ Result pasteAttributes(Project& p, Sequence& s, const Clip& from, TrackKind from
             for (const auto& [name, prm] : from.motion.params)
                 if (!isOpacityParam(name)) c.motion.params[name] = prm;
             c.motion.id = keep;
+            c.animIn = from.animIn;  // animation presets go with the motion
+            c.animOut = from.animOut;
+            c.animLoop = from.animLoop;
             changed = true;
         }
         if (video && (what & AttrOpacity)) {
@@ -1212,6 +1218,7 @@ Result removeAttributes(Project& p, Sequence& s, const std::vector<Id>& ids, uns
                 else it = c.motion.params.erase(it);
             for (const auto& [name, prm] : fresh.params)
                 if (!isOpacityParam(name)) c.motion.params[name] = prm;
+            c.animIn = c.animOut = c.animLoop = {};
         }
         if (video && (what & AttrOpacity)) {
             const Effect fresh = makeEffect("transform", 0);

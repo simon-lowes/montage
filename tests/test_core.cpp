@@ -8,6 +8,7 @@
 #include "core/AutoTag.h"
 #include "core/Automation.h"
 #include "core/CaptionTools.h"
+#include "core/ClipAnimation.h"
 #include "core/Captions.h"
 #include "core/ColorWarp.h"
 #include "core/Bleep.h"
@@ -689,6 +690,91 @@ private slots:
         Project back;
         QVERIFY(projectFromJson(projectToJson(p), back));
         QVERIFY(isMergedClip(back, merged));
+    }
+
+    void clipAnimationPresets() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = Rational{25, 1};
+        Clip c = makeGeneratorClip(p, "color", 100);
+        edit::overwrite(p, s, {TrackKind::Video, 0}, c);
+        const Id id = s.videoTracks[0].clips.front().id;
+        auto clip = [&]() -> Clip& { return *edit::clipById(s, id); };
+        auto pose = [&](double local) { return clipAnimationPose(clip(), local, 25); };
+        QVERIFY(!hasClipAnimation(clip()));
+        QCOMPARE(pose(0).opacity, 1.0);
+        // Slide Left in over half a second: from a frame to the right, eased into place.
+        QVERIFY(edit::setClipAnimation(s, id, AnimationSlot::In, "slide_left", 0.5).ok);
+        QCOMPARE(pose(0).dx, 1.0);
+        QVERIFY(pose(6).dx > 0 && pose(6).dx < 0.5);  // eased: most of the way by the middle
+        QCOMPARE(pose(12.5).dx, 0.0);
+        QCOMPARE(pose(50).dx, 0.0);
+        // Out: Slide Left leaves to the left; Fade ends invisible.
+        QVERIFY(edit::setClipAnimation(s, id, AnimationSlot::Out, "slide_left", 1.0).ok);
+        QCOMPARE(pose(100).dx, -1.0);
+        QVERIFY(pose(80).dx < 0 && pose(80).dx > -0.5);
+        QCOMPARE(pose(70).dx, 0.0);
+        QVERIFY(edit::setClipAnimation(s, id, AnimationSlot::Out, "fade", 1.0).ok);
+        QCOMPARE(pose(100).opacity, 0.0);
+        QCOMPARE(pose(75).opacity, 1.0);
+        // Pop overshoots; Spin turns; Drop starts above.
+        QVERIFY(edit::setClipAnimation(s, id, AnimationSlot::In, "pop", 1.0).ok);
+        double most = 0;
+        for (int f = 0; f <= 25; ++f) most = std::max(most, pose(f).scale);
+        QVERIFY(most > 1.05 && most < 1.15);
+        QCOMPARE(pose(0).scale, 0.0);
+        QVERIFY(edit::setClipAnimation(s, id, AnimationSlot::In, "spin", 1.0).ok);
+        QCOMPARE(pose(0).rotation, -180.0);
+        QVERIFY(edit::setClipAnimation(s, id, AnimationSlot::In, "drop", 1.0).ok);
+        QVERIFY(pose(0).dy < -0.5);
+        // Combo: a wiggle stays within four degrees; a push in reaches 110 % at the end.
+        QVERIFY(edit::setClipAnimation(s, id, AnimationSlot::Combo, "wiggle", 1.0).ok);
+        double turn = 0;
+        for (int f = 30; f < 70; ++f) turn = std::max(turn, std::fabs(pose(f).rotation));
+        QVERIFY(turn > 3.5 && turn <= 4.0 + 1e-9);
+        QVERIFY(edit::setClipAnimation(s, id, AnimationSlot::Combo, "push_in", 1.0).ok);
+        QVERIFY(std::fabs(pose(100).scale - 1.1) < 1e-9);
+        // In and out longer than the clip share it: 20 frames with a second each meet in the middle.
+        Clip shortClip = clip();
+        shortClip.duration = 20;
+        shortClip.animIn = {"slide_up", 1.0};
+        shortClip.animOut = {"slide_down", 1.0};
+        shortClip.animLoop = {};
+        QCOMPARE(clipAnimationPose(shortClip, 10, 25).dy, 0.0);
+        QVERIFY(clipAnimationPose(shortClip, 5, 25).dy > 0);
+        // Refusals, and the same again is no change; none removes.
+        QVERIFY(!edit::setClipAnimation(s, id, AnimationSlot::Combo, "slide_left").ok);  // not a combo
+        QVERIFY(!edit::setClipAnimation(s, id, AnimationSlot::In, "teleport").ok);
+        QVERIFY(!edit::setClipAnimation(s, id, AnimationSlot::In, "fade", 20).ok);
+        QVERIFY(!edit::setClipAnimation(s, id, AnimationSlot::In, "drop", 1.0).ok);
+        QVERIFY(edit::setClipAnimation(s, id, AnimationSlot::Combo, "none").ok);
+        QVERIFY(clip().animLoop.type.empty());
+        // Saved in projects.
+        Project back;
+        QVERIFY(projectFromJson(projectToJson(p), back));
+        QCOMPARE(edit::clipById(*back.active(), id)->animIn, (ClipAnimation{"drop", 1.0}));
+        QCOMPARE(edit::clipById(*back.active(), id)->animOut, (ClipAnimation{"fade", 1.0}));
+        // Split: the left part keeps the entrance, the right the exit.
+        QVERIFY(edit::razor(p, s, {TrackKind::Video, 0}, 50).ok);
+        const Clip& left = s.videoTracks[0].clips[0];
+        const Clip& right = s.videoTracks[0].clips[1];
+        QVERIFY(!left.animIn.type.empty() && left.animOut.type.empty());
+        QVERIFY(right.animIn.type.empty() && !right.animOut.type.empty());
+        // Paste Attributes carries them with the motion; Remove Attributes clears them.
+        QVERIFY(edit::pasteAttributes(p, s, left, TrackKind::Video, {right.id}, edit::AttrMotion).ok);
+        QCOMPARE(s.videoTracks[0].clips[1].animIn, (ClipAnimation{"drop", 1.0}));
+        QVERIFY(edit::removeAttributes(p, s, {s.videoTracks[0].clips[1].id}, edit::AttrMotion).ok);
+        QVERIFY(!hasClipAnimation(s.videoTracks[0].clips[1]));
+        // Sound clips have no picture to move.
+        MediaItem m;
+        m.id = p.newId();
+        m.kind = MediaKind::Audio;
+        m.hasAudio = true;
+        m.duration = 4;
+        m.path = "/x.wav";
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 200, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(!edit::setClipAnimation(s, s.audioTracks[0].clips.back().id, AnimationSlot::In, "fade").ok);
     }
 
     void captionsFromClipTranscripts() {

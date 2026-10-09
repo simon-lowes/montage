@@ -34,6 +34,7 @@
 #include "PluginEditorWindow.h"
 #include "Theme.h"
 #include "audio/PluginEffect.h"
+#include "core/ClipAnimation.h"
 #include "core/EditOps.h"
 #include "core/MaskPath.h"
 #include "ColorWheel.h"
@@ -412,6 +413,50 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
                     c->motion = makeEffect("transform", mid);
                     return true;
                 });
+            });
+        }
+        // Animation presets (CapCut's In / Out / Combo): a kind and how long it lasts, for each.
+        QFormLayout* an = addSection(tr("Animation"), nullptr, !hasClipAnimation(clip));
+        const struct {
+            AnimationSlot slot;
+            QString label;
+            const char* object;
+        } animSlots[] = {{AnimationSlot::In, tr("In"), "animIn"}, {AnimationSlot::Out, tr("Out"), "animOut"}, {AnimationSlot::Combo, tr("Combo"), "animCombo"}};
+        for (const auto& sl : animSlots) {
+            auto* row = new QWidget(content_);
+            auto* rh = new QHBoxLayout(row);
+            rh->setContentsMargins(0, 0, 0, 0);
+            auto* kindBox = new QComboBox(row);
+            kindBox->setObjectName(QString::fromLatin1(sl.object));
+            kindBox->addItem(tr("None"), QString());
+            for (const AnimationPreset& a : animationPresets(sl.slot)) kindBox->addItem(tr(a.name), QString::fromLatin1(a.id));
+            auto* secs = new QDoubleSpinBox(row);
+            secs->setObjectName(QString::fromLatin1(sl.object) + QStringLiteral("Seconds"));
+            secs->setRange(0.1, 10);
+            secs->setSingleStep(0.1);
+            secs->setDecimals(1);
+            secs->setSuffix(tr(" s"));
+            secs->setToolTip(sl.slot == AnimationSlot::Combo ? tr("How long each repeat takes") : tr("How long it lasts"));
+            rh->addWidget(kindBox, 1);
+            rh->addWidget(secs);
+            an->addRow(sl.label, row);
+            const AnimationSlot slot = sl.slot;
+            auto apply = [this, clipId, slot, kindBox, secs] {
+                const std::string type = kindBox->currentData().toString().toStdString();
+                const double sec = secs->value();
+                state_->apply(tr("Clip Animation"), [clipId, slot, type, sec](Project&, Sequence& s) {
+                    return edit::setClipAnimation(s, clipId, slot, type, sec);
+                });
+            };
+            connect(kindBox, &QComboBox::activated, this, apply);
+            connect(secs, &QDoubleSpinBox::editingFinished, this, apply);
+            refreshers_.push_back([=, this] {
+                const Clip* c = clipNow();
+                if (!c) return;
+                const ClipAnimation& a = slot == AnimationSlot::In ? c->animIn : slot == AnimationSlot::Out ? c->animOut : c->animLoop;
+                QSignalBlocker b1(kindBox), b2(secs);
+                kindBox->setCurrentIndex(std::max(0, kindBox->findData(QString::fromStdString(a.type))));
+                secs->setValue(a.type.empty() ? (slot == AnimationSlot::Combo ? 1.0 : 0.5) : a.seconds);
             });
         }
     } else if (const EffectInfo* info = findEffectInfo("volume")) {

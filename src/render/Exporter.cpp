@@ -1,5 +1,6 @@
 #include "Exporter.h"
 
+#include "core/ClipAnimation.h"
 #include "core/Chapters.h"
 #include "core/Surround.h"
 
@@ -489,6 +490,7 @@ bool isIntraCodec(const std::string& encoder) { return encoder == "prores_ks" ||
 
 // The clip's transform leaves the picture as it is at clip frame `local` (the source fills the frame 1:1).
 bool identityMotion(const Clip& c, FrameTime local) {
+    if (hasClipAnimation(c)) return false;  // animated on top of its transform
     const EffectInfo* info = findEffectInfo(c.motion.empty() ? "transform" : c.motion.type);
     if (!info) return false;
     for (const ParamInfo& pi : info->params) {
