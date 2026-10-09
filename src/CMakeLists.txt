@@ -90,6 +90,9 @@ add_library(montage_engine STATIC
   render/Processing.h render/Processing.cpp
   render/Ofx.h render/Ofx.cpp
   render/FaceRefine.h render/FaceRefine.cpp
+  render/Jpeg2000.h render/Jpeg2000.cpp
+  render/PackageFiles.h render/PackageFiles.cpp
+  render/Imf.h render/Imf.cpp
   render/Relight.h render/Relight.cpp
   render/FilmLook.h render/FilmLook.cpp
   render/Retime.h render/Retime.cpp
@@ -192,6 +195,16 @@ if(MONTAGE_WITH_LIBRAW)
     target_compile_definitions(montage_engine PRIVATE MONTAGE_WITH_LIBRAW)
   else()
     message(STATUS "LibRaw not found: camera raw stills are not read")
+  endif()
+endif()
+if(MONTAGE_WITH_OPENJPEG)
+  pkg_check_modules(OPENJPEG IMPORTED_TARGET GLOBAL libopenjp2>=2.5)
+  if(OPENJPEG_FOUND)
+    message(STATUS "OpenJPEG ${OPENJPEG_VERSION}: IMF export enabled")
+    target_link_libraries(montage_engine PRIVATE PkgConfig::OPENJPEG)
+    target_compile_definitions(montage_engine PRIVATE MONTAGE_WITH_OPENJPEG)
+  else()
+    message(STATUS "OpenJPEG 2.5 not found: IMF masters cannot be made")
   endif()
 endif()
 if(MONTAGE_WITH_OCIO)

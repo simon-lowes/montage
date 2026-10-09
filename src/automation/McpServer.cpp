@@ -30,6 +30,7 @@
 #include "render/RoomTone.h"
 #include "render/Versions.h"
 #include "render/Dcp.h"
+#include "render/Imf.h"
 #include "render/LightLevel.h"
 #include "render/Spherical.h"
 #include "render/ClipPlacement.h"
@@ -4540,6 +4541,72 @@ void McpServer::Impl::addTools() {
             QJsonArray found;
             for (const std::string& i : verifyDcp(folder.toStdString())) found.append(QString::fromStdString(i));
             return ok(found.isEmpty() ? QStringLiteral("The DCP checks out") : QStringLiteral("%1 problem(s): %2").arg(found.size()).arg(found.at(0).toString()),
+                      QJsonObject{{"problems", found}, {"ok", found.isEmpty()}});
+        });
+
+    add("montage_export_imf", "Export an IMF master",
+        "Make an IMF (Interoperable Master Format) package of the active sequence, as Netflix, Amazon, Disney+ and "
+        "broadcasters ask for: Application #2E (SMPTE ST 2067-21:2021), JPEG 2000 pictures in the IMF profiles (lossless "
+        "by default) as full-range RGB 4:4:4 of 10 or 12 bits in Rec.709, P3-D65 PQ, Rec.2020 PQ or Rec.2020 HLG (HDR "
+        "with mastering display metadata), 24-bit 48 kHz sound in stereo, 5.1 or 7.1 DS with multichannel labels, a "
+        "composition playlist with the essence descriptors, packing list with hashes and asset map, in a new folder under "
+        "`folder`. The package is checked when done (as montage_verify_imf).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"folder":{"type":"string","description":"Where to make the IMF folder"},
+            "title":{"type":"string"},"kind":{"type":"string","enum":["feature","episode","short","trailer","teaser","advertisement","promotion","test"],"default":"feature"},
+            "colour":{"type":"string","enum":["rec709","p3d65-pq","rec2020-pq","rec2020-hlg"],"description":"Default: as the sequence is graded"},
+            "size":{"type":"string","enum":["sequence","hd","uhd","4k"],"default":"sequence"},
+            "bits":{"type":"integer","enum":[10,12],"description":"Default: 10 for SDR, 12 for HDR"},
+            "lossless":{"type":"boolean","default":true},"megabits_per_second":{"type":"number","description":"Lossy: the cap (default 400)"},
+            "mastering_peak":{"type":"number","description":"HDR: the mastering display's peak, cd/m^2"},
+            "language":{"type":"string","default":"en"},"issuer":{"type":"string"},
+            "in_out":{"type":"boolean","default":false,"description":"Only In to Out"}},"required":["project","folder"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            const Sequence& s = l.seq();
+            if (s.duration() == 0) return fail("The sequence is empty");
+            ImfSettings st;
+            st.title = str(a, "title", QFileInfo(need(a, "project")).completeBaseName()).toStdString();
+            st.kind = str(a, "kind", "feature").toStdString();
+            st.colour = str(a, "colour").toStdString();
+            st.size = str(a, "size", "sequence").toStdString();
+            st.bits = a.value("bits").toInt(0);
+            st.lossless = a.value("lossless").toBool(true);
+            st.megabitsPerSecond = a.value("megabits_per_second").toDouble(400);
+            st.masteringPeak = a.value("mastering_peak").toDouble(0);
+            st.language = str(a, "language", "en").toStdString();
+            st.issuer = str(a, "issuer", "Montage").toStdString();
+            st.inOut = a.value("in_out").toBool();
+            const QString folder = absolute(need(a, "folder"));
+            QDir().mkpath(folder);
+            ImfResult r;
+            std::string err;
+            if (!exportImf(l.project, s, st, folder.toStdString(), &r, [this](double f) {
+                    progress(f, "Making the IMF package");
+                    return true;
+                }, &err))
+                return fail(QString::fromStdString(err));
+            QJsonArray found;
+            for (const std::string& i : verifyImf(r.folder)) found.append(QString::fromStdString(i));
+            const QJsonObject out{{"folder", QString::fromStdString(r.folder)}, {"cpl", QString::fromStdString(r.cpl)},
+                                  {"frames", double(r.frames)}, {"edit_rate", QStringLiteral("%1/%2").arg(r.rateNum).arg(r.rateDen)},
+                                  {"width", r.width}, {"height", r.height}, {"bits", r.bits}, {"channels", r.channels},
+                                  {"colour", QString::fromStdString(r.colour)}, {"rsiz", r.rsiz}, {"problems", found}};
+            const QString name = QFileInfo(QString::fromStdString(r.folder)).fileName();
+            return ok(found.isEmpty() ? QStringLiteral("Made %1 and checked it: no problems").arg(name)
+                                      : QStringLiteral("Made %1; the check found %2 problem(s)").arg(name).arg(found.size()),
+                      out);
+        });
+
+    add("montage_verify_imf", "Check an IMF package",
+        "Check an IMF package folder: asset map, every file present at its size, packing list hashes, each composition's "
+        "resources in the package with their essence descriptors and durations, the Application #2E identification, "
+        "picture track files JPEG 2000 in an IMF profile with the right number of frames, sound 24-bit 48 kHz with the "
+        "right number of samples. Returns the problems found (none: it passed).",
+        R"json({"type":"object","properties":{"folder":{"type":"string"}},"required":["folder"]})json", true, [](const QJsonObject& a) {
+            const QString folder = absolute(need(a, "folder"));
+            QJsonArray found;
+            for (const std::string& i : verifyImf(folder.toStdString())) found.append(QString::fromStdString(i));
+            return ok(found.isEmpty() ? QStringLiteral("The IMF package checks out") : QStringLiteral("%1 problem(s): %2").arg(found.size()).arg(found.at(0).toString()),
                       QJsonObject{{"problems", found}, {"ok", found.isEmpty()}});
         });
 

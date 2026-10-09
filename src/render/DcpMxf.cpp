@@ -1,4 +1,5 @@
 #include "DcpMxf.h"
+#include "Jpeg2000.h"
 
 #include <algorithm>
 #include <cctype>
@@ -205,6 +206,17 @@ const PrimerEntry kSoundPrimer[] = {
     {0xfffd, "060e2b340101010e0103070105000000"}, {0xfffe, "060e2b340101010e0103070101000000"},
 };
 
+Bytes primerOf(const std::vector<PrimerEntry>& entries) {
+    Bytes v;
+    put32(v, entries.size());
+    put32(v, 18);
+    for (const PrimerEntry& e : entries) {
+        put16(v, e.tag);
+        putUl(v, e.ul);
+    }
+    return klv(ul("060e2b34020501010d01020101050100"), v);
+}
+
 template <size_t N, size_t M>
 Bytes primer(const PrimerEntry (&common)[N], const PrimerEntry (&extra)[M]) {
     Bytes v;
@@ -221,7 +233,32 @@ Bytes primer(const PrimerEntry (&common)[N], const PrimerEntry (&extra)[M]) {
     return klv(ul("060e2b34020501010d01020101050100"), v);
 }
 
+// IMF (AS-02): the colour items, J2CLayout and mastering display the picture descriptors add, and the ST 2067-2
+// multichannel label items (numbered as asdcplib numbers them in its IMF files).
+const PrimerEntry kImfPicturePrimer[] = {
+    {0x320d, "060e2b34010101020401030205000000"}, {0x3210, "060e2b34010101020401020101010200"},
+    {0x3219, "060e2b34010101090401020101060100"}, {0x321a, "060e2b34010101020401020101030100"},
+    {0x3405, "060e2b34010101050401040401000000"}, {0xfff1, "060e2b340101010e040106030e000000"},
+    {0xfff0, "060e2b340101010e0420040101010000"}, {0xffef, "060e2b340101010e0420040101020000"},
+    {0xffee, "060e2b340101010e0420040101030000"}, {0xffed, "060e2b340101010e0420040101040000"},
+};
+const PrimerEntry kImfSoundPrimer[] = {
+    {0x3d01, "060e2b34010101040402030304000000"}, {0x3d02, "060e2b34010101040402030104000000"},
+    {0x3d03, "060e2b34010101050402030101010000"}, {0x3d07, "060e2b34010101050402010104000000"},
+    {0x3d09, "060e2b34010101050402030305000000"}, {0x3d0a, "060e2b34010101050402030201000000"},
+    {0x3d32, "060e2b34010101070402010105000000"}, {0xfff4, "060e2b340101010e0103070106000000"},
+    {0xfff5, "060e2b340101010e0103040a00000000"}, {0xfff6, "060e2b340101010e0302010221000000"},
+    {0xfff7, "060e2b340101010e0302010220000000"}, {0xfff8, "060e2b340101010e0105110000000000"},
+    {0xfff9, "060e2b340101010e0105100000000000"}, {0xfffa, "060e2b340101010d0301010203150000"},
+    {0xfffb, "060e2b340101010e0103070103000000"}, {0xfffc, "060e2b340101010e0103070102000000"},
+    {0xfffd, "060e2b340101010e0103070105000000"}, {0xfffe, "060e2b340101010e0103070101000000"},
+};
+
 constexpr const char* kOpAtom = "060e2b34040101020d01020110000000";
+constexpr const char* kOp1a = "060e2b34040101010d01020101010100";
+constexpr const char* kImfJ2kContainer = "060e2b340401010d0d010301020c0600";  // JPEG 2000, progressive frames (P1)
+constexpr const char* kImfWaveContainer = "060e2b34040101010d01030102060200";  // Broadcast Wave, clip wrapped
+constexpr const char* kImfSoundElement = "060e2b34010201010d01030116010201";   // a wave clip
 constexpr const char* kGenericContainer = "060e2b34040101030d010301027f0100";  // MXF-GC, multiple mappings
 constexpr const char* kJ2kContainer = "060e2b34040101070d010301020c0100";      // JPEG 2000, frame wrapped
 constexpr const char* kWaveContainer = "060e2b34040101010d01030102060100";     // Broadcast Wave, frame wrapped
@@ -403,10 +440,162 @@ Bytes packages(const std::array<Uuid, 48>& ids, const Uuid& asset, int fps, int6
     return out;
 }
 
+void indexBase(Set& s, EditRate rate, int64_t start, int64_t duration, uint32_t editUnitBytes);
+
+// The same for an IMF (AS-02, OP1a) file: one track in each package, no timecode, a rational edit rate.
+Bytes packagesImf(const std::array<Uuid, 48>& ids, const Uuid& asset, EditRate rate, int64_t duration, const std::string& created,
+                  const char* container, const char* dataDef, const std::string& trackName, uint32_t trackNumber,
+                  const std::string& packageName) {
+    Bytes out;
+    {
+        Set s;
+        s.uuid(0x3c0a, ids[kPreface]);
+        s.item(0x3b02, stamp(created));
+        s.u16(0x3b05, 0x0103);
+        s.u32(0x3b07, 1);
+        s.uuid(0x3b08, ids[kSource]);
+        s.refs(0x3b06, {ids[kIdentification]});
+        s.uuid(0x3b03, ids[kStorage]);
+        s.label(0x3b09, kOp1a);
+        Bytes ecs;
+        put32(ecs, 2);
+        put32(ecs, 16);
+        putUl(ecs, kGenericContainer);
+        putUl(ecs, container);
+        s.item(0x3b0a, ecs);
+        Bytes none;
+        put32(none, 0);
+        put32(none, 16);
+        s.item(0x3b0b, none);
+        putBytes(out, setKlv(0x2f, s));
+    }
+    {
+        Set s;
+        s.uuid(0x3c0a, ids[kIdentification]);
+        s.uuid(0x3c09, ids[kGeneration]);
+        s.text(0x3c01, "Montage");
+        s.text(0x3c02, "Montage");
+        s.item(0x3c03, productVersion());
+        s.text(0x3c04, "0.2.0");
+        s.uuid(0x3c05, kProductUid);
+        s.item(0x3c06, stamp(created));
+        s.item(0x3c07, productVersion());
+#ifdef _WIN32
+        s.text(0x3c08, "win32");
+#else
+        s.text(0x3c08, "unix");
+#endif
+        putBytes(out, setKlv(0x30, s));
+    }
+    {
+        Set s;
+        s.uuid(0x3c0a, ids[kStorage]);
+        s.refs(0x1901, {ids[kSource], ids[kMaterial]});
+        s.refs(0x1902, {ids[kContainerData]});
+        putBytes(out, setKlv(0x18, s));
+    }
+    {
+        Set s;
+        s.uuid(0x3c0a, ids[kContainerData]);
+        s.item(0x2701, umid(asset));
+        s.u32(0x3f06, kIndexSid);
+        s.u32(0x3f07, kBodySid);
+        putBytes(out, setKlv(0x23, s));
+    }
+    auto track = [&](Id self, Id seq, uint32_t number) {
+        Set s;
+        s.uuid(0x3c0a, ids[self]);
+        s.u32(0x4801, 1);
+        s.u32(0x4804, number);
+        s.text(0x4802, trackName);
+        s.uuid(0x4803, ids[seq]);
+        s.rational(0x4b01, rate.num, rate.den);
+        s.i64(0x4b02, 0);
+        putBytes(out, setKlv(0x3b, s));
+    };
+    auto sequence = [&](Id self, Id component) {
+        Set s;
+        s.uuid(0x3c0a, ids[self]);
+        s.label(0x0201, dataDef);
+        s.i64(0x0202, duration);
+        s.refs(0x1001, {ids[component]});
+        putBytes(out, setKlv(0x0f, s));
+    };
+    auto clip = [&](Id self, const Bytes& sourcePackage, uint32_t sourceTrack) {
+        Set s;
+        s.uuid(0x3c0a, ids[self]);
+        s.label(0x0201, dataDef);
+        s.i64(0x0202, duration);
+        s.i64(0x1201, 0);
+        s.item(0x1101, sourcePackage);
+        s.u32(0x1102, sourceTrack);
+        putBytes(out, setKlv(0x11, s));
+    };
+    {
+        Set s;
+        s.uuid(0x3c0a, ids[kMaterial]);
+        s.item(0x4401, umid(ids[kMaterialUmid]));
+        s.text(0x4402, "Material Package");
+        s.item(0x4405, stamp(created));
+        s.item(0x4404, stamp(created));
+        s.refs(0x4403, {ids[kMpTrack]});
+        putBytes(out, setKlv(0x36, s));
+    }
+    track(kMpTrack, kMpSeq, 0);
+    sequence(kMpSeq, kMpClip);
+    clip(kMpClip, umid(asset), 1);
+    {
+        Set s;
+        s.uuid(0x3c0a, ids[kSource]);
+        s.item(0x4401, umid(asset));
+        s.text(0x4402, packageName);
+        s.item(0x4405, stamp(created));
+        s.item(0x4404, stamp(created));
+        s.refs(0x4403, {ids[kFpTrack]});
+        s.uuid(0x4701, ids[kDescriptor]);
+        putBytes(out, setKlv(0x37, s));
+    }
+    track(kFpTrack, kFpSeq, trackNumber);
+    sequence(kFpSeq, kFpClip);
+    clip(kFpClip, Bytes(32, 0), 0);
+    return out;
+}
+
+// Frame offsets as index table segments (5000 entries to a segment), every frame a random access point.
+Bytes vbrIndex(const std::vector<uint64_t>& offsets, EditRate rate) {
+    Bytes out;
+    const int64_t n = int64_t(offsets.size());
+    for (int64_t first = 0; first < n || (n == 0 && first == 0); first += int64_t(kEntriesPerSegment)) {
+        const int64_t count = std::min<int64_t>(int64_t(kEntriesPerSegment), n - first);
+        Set s;
+        indexBase(s, rate, first, count, 0);
+        Bytes delta;
+        put32(delta, 1);
+        put32(delta, 6);
+        put8(delta, 0);
+        put8(delta, 0);
+        put32(delta, 0);
+        s.item(0x3f09, delta);
+        Bytes entries;
+        put32(entries, uint64_t(count));
+        put32(entries, 11);
+        for (int64_t k = first; k < first + count; ++k) {
+            put8(entries, 0);
+            put8(entries, 0);
+            put8(entries, 0x80);
+            put64(entries, offsets[size_t(k)]);
+        }
+        s.item(0x3f0a, entries);
+        putBytes(out, klv(ul("060e2b34025301010d01020101100100"), s.body));
+        if (n == 0) break;
+    }
+    return out;
+}
+
 // An index table segment's common items.
-void indexBase(Set& s, int fps, int64_t start, int64_t duration, uint32_t editUnitBytes) {
+void indexBase(Set& s, EditRate rate, int64_t start, int64_t duration, uint32_t editUnitBytes) {
     s.uuid(0x3c0a, newUuid());
-    s.rational(0x3f0b, uint32_t(fps), 1);
+    s.rational(0x3f0b, rate.num, rate.den);
     s.i64(0x3f0c, start);
     s.i64(0x3f0d, duration);
     s.u32(0x3f05, editUnitBytes);
@@ -500,10 +689,30 @@ TrackFileWriter::~TrackFileWriter() {
     if (f_) std::fclose(f_);
 }
 
+bool TrackFileWriter::openImfFile(const std::string& path, const Uuid& asset, EditRate rate, std::string* error) {
+    imf_ = true;
+    if (!openFile(path, asset, int(std::lround(rate.value())), error)) return false;
+    rate_ = rate;
+    return true;
+}
+
+bool TrackFileWriter::writeRaw(const uint8_t* data, size_t size, std::string* error) {
+    if (!f_) return false;
+    if (size && std::fwrite(data, 1, size, f_) != size) {
+        if (error) *error = "Cannot write " + path_ + " (is the disk full?)";
+        return false;
+    }
+    essenceBytes_ += size;
+    return true;
+}
+
+const Uuid& TrackFileWriter::descriptorId() const { return ids_[kDescriptor]; }
+
 bool TrackFileWriter::openFile(const std::string& path, const Uuid& asset, int fps, std::string* error) {
     path_ = path;
     asset_ = asset;
     fps_ = fps;
+    rate_ = {uint32_t(fps), 1};
     for (Uuid& u : ids_) u = newUuid();
     created_ = nowStamp();
 #ifdef _WIN32
@@ -528,9 +737,9 @@ bool TrackFileWriter::openFile(const std::string& path, const Uuid& asset, int f
 std::vector<uint8_t> TrackFileWriter::partitionPack(const uint8_t key[16], uint64_t thisPartition, uint64_t previous, uint64_t footer,
                                                    uint64_t headerBytes, uint64_t indexBytes, uint32_t indexSid, uint32_t bodySid) const {
     Bytes v;
-    put16(v, 1);  // major
-    put16(v, 2);  // minor
-    put32(v, 1);  // KAG
+    put16(v, 1);              // major
+    put16(v, imf_ ? 3 : 2);   // minor
+    put32(v, 1);              // KAG
     put64(v, thisPartition);
     put64(v, previous);
     put64(v, footer);
@@ -539,7 +748,7 @@ std::vector<uint8_t> TrackFileWriter::partitionPack(const uint8_t key[16], uint6
     put32(v, indexSid);
     put64(v, 0);  // body offset
     put32(v, bodySid);
-    putUl(v, kOpAtom);
+    putUl(v, imf_ ? kOp1a : kOpAtom);
     put32(v, 2);
     put32(v, 16);
     putUl(v, kGenericContainer);
@@ -572,6 +781,43 @@ bool TrackFileWriter::close(std::string* error) {
         return false;
     };
     const uint64_t bodyStart = kHeaderSize;
+    if (imf_) {
+        // AS-02: the index in a partition of its own after the essence, then an empty footer; the body partition
+        // pack learns where the footer is.
+        if (clipLengthAt_ >= 0) {
+            Bytes len;
+            put8(len, 0x87);
+            const uint64_t n = essenceBytes_ - clipStart_;
+            for (int k = 6; k >= 0; --k) put8(len, (n >> (8 * k)) & 0xff);
+            if (std::fseek(f_, long(clipLengthAt_), SEEK_SET) != 0 || std::fwrite(len.data(), 1, len.size(), f_) != len.size()) return fail();
+        }
+        const uint64_t indexAt = bodyStart + 140 + essenceBytes_;
+        const Bytes index = indexSegments();
+        const uint64_t footerAt = indexAt + 140 + index.size();
+        Bytes tail = partitionPack(ul("060e2b34020501010d01020101030400").data(), indexAt, bodyStart, footerAt, 0, index.size(), kIndexSid, 0);
+        putBytes(tail, index);
+        putBytes(tail, partitionPack(ul("060e2b34020501010d01020101040400").data(), footerAt, indexAt, footerAt, 0, 0, 0, 0));
+        Bytes rip;
+        for (auto [sid, at] : {std::pair<uint32_t, uint64_t>{0, 0}, {kBodySid, bodyStart}, {0, indexAt}, {0, footerAt}}) {
+            put32(rip, sid);
+            put64(rip, at);
+        }
+        put32(rip, 16 + 4 + rip.size() + 4);
+        putBytes(tail, klv(ul("060e2b34020501010d01020101110100"), rip));
+        if (std::fseek(f_, 0, SEEK_END) != 0 || std::fwrite(tail.data(), 1, tail.size(), f_) != tail.size()) return fail();
+        Bytes body = partitionPack(ul("060e2b34020501010d01020101030400").data(), bodyStart, 0, footerAt, 0, 0, 0, kBodySid);
+        if (std::fseek(f_, long(bodyStart), SEEK_SET) != 0 || std::fwrite(body.data(), 1, body.size(), f_) != body.size()) return fail();
+        Bytes head = partitionPack(ul("060e2b34020501010d01020101020400").data(), 0, 0, footerAt, kHeaderSize - 140, 0, 0, 0);
+        putBytes(head, headerMetadata(duration()));
+        if (head.size() + 20 > kHeaderSize) return fail();
+        Bytes fill(kHeaderSize - head.size() - 20, 0);
+        putBytes(head, klv(ul("060e2b34010101020301021001000000"), fill));
+        if (std::fseek(f_, 0, SEEK_SET) != 0 || std::fwrite(head.data(), 1, head.size(), f_) != head.size()) return fail();
+        const bool ok = std::fclose(f_) == 0;
+        f_ = nullptr;
+        if (!ok && error) *error = "Cannot finish " + path_;
+        return ok;
+    }
     const uint64_t footerAt = bodyStart + 20 + 120 + essenceBytes_;
     const Bytes index = indexSegments();
     Bytes tail = partitionPack(ul("060e2b34020501010d01020101040400").data(), footerAt, bodyStart, footerAt, 0, index.size(), kIndexSid, 0);
@@ -587,7 +833,7 @@ bool TrackFileWriter::close(std::string* error) {
     if (std::fseek(f_, 0, SEEK_END) != 0 || std::fwrite(tail.data(), 1, tail.size(), f_) != tail.size()) return fail();
     // The header, now the duration and the footer are known.
     Bytes head = partitionPack(ul("060e2b34020501010d01020101020400").data(), 0, 0, footerAt, kHeaderSize - 140, 0, 0, 0);
-    putBytes(head, headerMetadata(frames()));
+    putBytes(head, headerMetadata(duration()));
     if (head.size() + 20 > kHeaderSize) return fail();
     Bytes fill(kHeaderSize - head.size() - 20, 0);
     putBytes(head, klv(ul("060e2b34010101020301021001000000"), fill));
@@ -669,7 +915,7 @@ std::vector<uint8_t> PictureMxfWriter::indexSegments() const {
     for (int64_t first = 0; first < n || (n == 0 && first == 0); first += int64_t(kEntriesPerSegment)) {
         const int64_t count = std::min<int64_t>(int64_t(kEntriesPerSegment), n - first);
         Set s;
-        indexBase(s, fps_, first, count, 0);
+        indexBase(s, rate_, first, count, 0);
         Bytes delta;
         put32(delta, 1);
         put32(delta, 6);
@@ -795,7 +1041,249 @@ std::vector<uint8_t> SoundMxfWriter::headerMetadata(int64_t duration) const {
 
 std::vector<uint8_t> SoundMxfWriter::indexSegments() const {
     Set s;
-    indexBase(s, fps_, 0, frames(), uint32_t(20 + size_t(samplesPerFrame()) * size_t(channels_) * 3));
+    indexBase(s, rate_, 0, frames(), uint32_t(20 + size_t(samplesPerFrame()) * size_t(channels_) * 3));
+    Bytes entries;
+    put32(entries, 0);
+    put32(entries, 11);
+    s.item(0x3f0a, entries);
+    return klv(ul("060e2b34025301010d01020101100100"), s.body);
+}
+
+// ---- IMF picture ---------------------------------------------------------------------------------------------------
+
+bool ImfPictureWriter::open(const std::string& path, const Uuid& asset, EditRate rate, int bits, const ImfColour& colour, uint32_t aspectNum,
+                            uint32_t aspectDen, std::string* error) {
+    bits_ = bits;
+    colour_ = colour;
+    aspectNum_ = aspectNum;
+    aspectDen_ = aspectDen;
+    return openImfFile(path, asset, rate, error);
+}
+
+bool ImfPictureWriter::write(const uint8_t* codestream, size_t size, std::string* error) {
+    if (!haveHeader_) {
+        if (!parseJ2kHeader(codestream, size, j2k_)) {
+            if (error) *error = "Not a JPEG 2000 codestream";
+            return false;
+        }
+        haveHeader_ = true;
+    }
+    return writeElement(ul(kPictureElement).data(), codestream, size, error);
+}
+
+const Uuid& ImfPictureWriter::subDescriptorId() const { return ids_[kSub]; }
+
+std::array<uint8_t, 16> ImfPictureWriter::essenceContainer() const { return ul(kImfJ2kContainer); }
+
+std::vector<uint8_t> ImfPictureWriter::headerMetadata(int64_t duration) const {
+    std::vector<PrimerEntry> entries(std::begin(kCommonPrimer), std::end(kCommonPrimer));
+    entries.insert(entries.end(), std::begin(kPicturePrimer), std::end(kPicturePrimer));
+    entries.insert(entries.end(), std::begin(kImfPicturePrimer), std::end(kImfPicturePrimer));
+    Bytes out = primerOf(entries);
+    putBytes(out, packagesImf(ids_, asset_, rate_, duration, created_, kImfJ2kContainer, kPictureDef, "Image Track", 0x15010801,
+                              "File Package: SMPTE ST 422 / ST 2067-5 frame wrapping of JPEG 2000 codestreams"));
+    const uint32_t w = j2k_.xsiz - j2k_.xosiz, h = j2k_.ysiz - j2k_.yosiz;
+    uint8_t coding[16];
+    imfPictureCoding(j2k_.rsiz, coding);
+    Bytes layout(16, 0);  // R, G, B and their bits
+    layout[0] = 'R', layout[1] = uint8_t(bits_), layout[2] = 'G', layout[3] = uint8_t(bits_), layout[4] = 'B', layout[5] = uint8_t(bits_);
+    {
+        Set s;
+        s.uuid(0x3c0a, ids_[kDescriptor]);
+        s.refs(0xffff, {ids_[kSub]});
+        s.u32(0x3006, 1);
+        s.rational(0x3001, rate_.num, rate_.den);
+        s.i64(0x3002, duration);
+        s.label(0x3004, kImfJ2kContainer);
+        s.u8(0x320c, 0);  // full frame
+        s.u32(0x3203, w);
+        s.u32(0x3202, h);
+        s.rational(0x320e, aspectNum_, aspectDen_);
+        s.label(0x3210, colour_.transfer.c_str());
+        s.item(0x3201, Bytes(coding, coding + 16));
+        if (!colour_.codingEquations.empty()) s.label(0x321a, colour_.codingEquations.c_str());
+        s.label(0x3219, colour_.primaries.c_str());
+        Bytes lines;
+        put32(lines, 2);
+        put32(lines, 4);
+        put32(lines, 0);
+        put32(lines, 0);
+        s.item(0x320d, lines);
+        if (colour_.hdr) {
+            // Chromaticities in steps of 0.00002, luminance in steps of 0.0001 cd/m^2.
+            auto xy = [](double v) { return uint64_t(std::clamp(std::lround(v / 0.00002), 0L, 50000L)); };
+            Bytes primaries;
+            for (int i = 0; i < 6; ++i) put16(primaries, xy(colour_.display[i]));
+            s.item(0xfff0, primaries);
+            Bytes white;
+            put16(white, xy(colour_.display[6]));
+            put16(white, xy(colour_.display[7]));
+            s.item(0xffef, white);
+            s.u32(0xffee, uint64_t(std::llround(colour_.maxLuminance * 10000)));
+            s.u32(0xffed, uint64_t(std::llround(colour_.minLuminance * 10000)));
+        }
+        s.u32(0x3406, (1u << bits_) - 1);
+        s.u32(0x3407, 0);
+        s.u8(0x3405, 0);
+        s.item(0x3401, layout);
+        putBytes(out, setKlv(0x29, s));
+    }
+    {
+        Set s;
+        s.uuid(0x3c0a, ids_[kSub]);
+        s.u16(0xfffe, j2k_.rsiz);
+        s.u32(0xfffd, j2k_.xsiz);
+        s.u32(0xfffc, j2k_.ysiz);
+        s.u32(0xfffb, j2k_.xosiz);
+        s.u32(0xfffa, j2k_.yosiz);
+        s.u32(0xfff9, j2k_.xtsiz);
+        s.u32(0xfff8, j2k_.ytsiz);
+        s.u32(0xfff7, j2k_.xtosiz);
+        s.u32(0xfff6, j2k_.ytosiz);
+        s.u16(0xfff5, j2k_.csiz);
+        Bytes sizing;
+        put32(sizing, j2k_.components.size());
+        put32(sizing, 3);
+        for (const auto& c : j2k_.components) putBytes(sizing, c.data(), 3);
+        s.item(0xfff4, sizing);
+        s.item(0xfff3, j2k_.cod);
+        s.item(0xfff2, j2k_.qcd);
+        s.item(0xfff1, layout);
+        putBytes(out, setKlv(0x5a, s));
+    }
+    return out;
+}
+
+std::vector<uint8_t> ImfPictureWriter::indexSegments() const { return vbrIndex(offsets_, rate_); }
+
+// ---- IMF sound -----------------------------------------------------------------------------------------------------
+
+McaLabel imfSoundfield(int channels) {
+    if (channels == 2) return {"sgST", "Standard Stereo", "060e2b340401010d0302022001000000"};
+    if (channels == 8) return {"sg71", "7.1DS", "060e2b340401010d0302020200000000"};
+    return {"sg51", "5.1", "060e2b340401010d0302020100000000"};
+}
+
+std::vector<McaLabel> imfChannels(int channels) {
+    std::vector<McaLabel> c = {{"chL", "Left", "060e2b340401010d0302010100000000"}, {"chR", "Right", "060e2b340401010d0302010200000000"}};
+    if (channels == 2) return c;
+    c.push_back({"chC", "Center", "060e2b340401010d0302010300000000"});
+    c.push_back({"chLFE", "LFE", "060e2b340401010d0302010400000000"});
+    if (channels == 8) {
+        c.push_back({"chLss", "Left Side Surround", "060e2b340401010d0302010700000000"});
+        c.push_back({"chRss", "Right Side Surround", "060e2b340401010d0302010800000000"});
+        c.push_back({"chLrs", "Left Rear Surround", "060e2b340401010d0302010900000000"});
+        c.push_back({"chRrs", "Right Rear Surround", "060e2b340401010d0302010a00000000"});
+    } else {
+        c.push_back({"chLs", "Left Surround", "060e2b340401010d0302010500000000"});
+        c.push_back({"chRs", "Right Surround", "060e2b340401010d0302010600000000"});
+    }
+    return c;
+}
+
+bool ImfSoundWriter::open(const std::string& path, const Uuid& asset, int channels, const std::string& language, const std::string& title,
+                          const std::string& titleVersion, std::string* error) {
+    if (channels != 2 && channels != 6 && channels != 8) {
+        if (error) *error = "IMF sound here is stereo, 5.1 or 7.1";
+        return false;
+    }
+    channels_ = channels;
+    language_ = language.empty() ? "en" : language;
+    title_ = title.empty() ? "Untitled" : title;
+    version_ = titleVersion.empty() ? "1" : titleVersion;
+    if (!openImfFile(path, asset, {48000, 1}, error)) return false;
+    // The one KLV the sound is wrapped in: its length (an eight-byte BER) is written when the file is closed.
+    Bytes kl;
+    putUl(kl, kImfSoundElement);
+    clipLengthAt_ = long(kHeaderSize + 140 + 16);
+    kl.insert(kl.end(), 8, 0);
+    kl[16] = 0x87;
+    if (!writeRaw(kl.data(), kl.size(), error)) return false;
+    clipStart_ = essenceBytes_;
+    return true;
+}
+
+bool ImfSoundWriter::write(const float* samples, size_t frames, std::string* error) {
+    const size_t n = frames * size_t(channels_);
+    buf_.resize(n * 3);
+    for (size_t i = 0; i < n; ++i) {
+        const int32_t s = int32_t(std::lround(std::clamp(double(samples[i]), -1.0, 1.0) * 8388607.0));
+        buf_[i * 3] = uint8_t(s);
+        buf_[i * 3 + 1] = uint8_t(s >> 8);
+        buf_[i * 3 + 2] = uint8_t(s >> 16);
+    }
+    if (!writeRaw(buf_.data(), buf_.size(), error)) return false;
+    samples_ += int64_t(frames);
+    return true;
+}
+
+const Uuid& ImfSoundWriter::soundfieldId() const { return ids_[kSub]; }
+const Uuid& ImfSoundWriter::soundfieldLink() const { return ids_[kSoundfieldLink]; }
+const Uuid& ImfSoundWriter::channelId(int c) const { return ids_[kChannelSet0 + size_t(c)]; }
+const Uuid& ImfSoundWriter::channelLink(int c) const { return ids_[kChannelLink0 + size_t(c)]; }
+
+std::array<uint8_t, 16> ImfSoundWriter::essenceContainer() const { return ul(kImfWaveContainer); }
+
+std::vector<uint8_t> ImfSoundWriter::headerMetadata(int64_t duration) const {
+    std::vector<PrimerEntry> entries(std::begin(kCommonPrimer), std::end(kCommonPrimer));
+    entries.insert(entries.end(), std::begin(kImfSoundPrimer), std::end(kImfSoundPrimer));
+    Bytes out = primerOf(entries);
+    putBytes(out, packagesImf(ids_, asset_, rate_, duration, created_, kImfWaveContainer, kSoundDef, "Sound Track", 0x16010201,
+                              "File Package: SMPTE 382M clip wrapping of wave audio"));
+    const std::vector<McaLabel> labels = imfChannels(channels_);
+    std::vector<Uuid> subs = {ids_[kSub]};
+    for (int c = 0; c < channels_; ++c) subs.push_back(ids_[kChannelSet0 + size_t(c)]);
+    {
+        Set s;
+        s.uuid(0x3c0a, ids_[kDescriptor]);
+        s.refs(0xffff, subs);
+        s.u32(0x3006, 1);
+        s.rational(0x3001, 48000, 1);
+        s.i64(0x3002, duration);
+        s.label(0x3004, kImfWaveContainer);
+        s.rational(0x3d03, 48000, 1);
+        s.u8(0x3d02, 0);
+        s.u32(0x3d07, uint32_t(channels_));
+        s.u32(0x3d01, 24);
+        s.u16(0x3d0a, uint32_t(3 * channels_));
+        s.u32(0x3d09, uint32_t(48000 * 3 * channels_));
+        s.label(0x3d32, "060e2b340401010d0402021004010000");  // ST 2067-2: multichannel labels
+        putBytes(out, setKlv(0x48, s));
+    }
+    const Bytes language(language_.begin(), language_.end());
+    const McaLabel field = imfSoundfield(channels_);
+    {
+        Set s;
+        s.uuid(0x3c0a, ids_[kSub]);
+        s.label(0xfffe, field.dictionary);
+        s.uuid(0xfffd, ids_[kSoundfieldLink]);
+        s.text(0xfffc, field.symbol);
+        s.text(0xfffb, field.name);
+        s.item(0xfffa, language);
+        s.text(0xfff9, title_);
+        s.text(0xfff8, version_);
+        s.text(0xfff7, "PRM");   // the primary programme
+        s.text(0xfff6, "FCMP");  // its full mix
+        putBytes(out, setKlv(0x6c, s));
+    }
+    for (int c = 0; c < channels_; ++c) {
+        Set s;
+        s.uuid(0x3c0a, ids_[kChannelSet0 + size_t(c)]);
+        s.label(0xfffe, labels[size_t(c)].dictionary);
+        s.uuid(0xfffd, ids_[kChannelLink0 + size_t(c)]);
+        s.text(0xfffc, labels[size_t(c)].symbol);
+        s.text(0xfffb, labels[size_t(c)].name);
+        s.u32(0xfff5, uint32_t(c + 1));
+        s.item(0xfffa, language);
+        s.uuid(0xfff4, ids_[kSoundfieldLink]);
+        putBytes(out, setKlv(0x6b, s));
+    }
+    return out;
+}
+
+std::vector<uint8_t> ImfSoundWriter::indexSegments() const {
+    Set s;
+    indexBase(s, rate_, 0, samples_, uint32_t(3 * channels_));
     Bytes entries;
     put32(entries, 0);
     put32(entries, 11);

@@ -23,6 +23,8 @@
 #include "render/ColorSpace.h"
 #include "render/Compositor.h"
 #include "render/Dcp.h"
+#include "render/Imf.h"
+#include "render/Jpeg2000.h"
 #include "render/DcpMxf.h"
 #include "media/Decoder.h"
 #include "render/Exporter.h"
@@ -3245,6 +3247,152 @@ colorspaces:
         // Cancelled: nothing.
         std::atomic<bool> cancel{true};
         QVERIFY(qualityCheck(p, s, 0, -1, q, {}, &cancel).empty());
+    }
+
+    void exportsImfMaster() {
+        if (!openJpegAvailable()) QSKIP("Built without OpenJPEG 2.5");
+        QTemporaryDir dir;
+        // A second of a colour matte at 23.976 with a 1 kHz tone, as an IMF Application #2E master.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = Rational{24000, 1001};
+        s.videoTracks[0].clips.push_back(colorClip(p, 0.5f, 0.25f, 0.75f, 0, 24));
+        {
+            const QString wav = dir.filePath("tone.wav");
+            QFile f(wav);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            const int n = 48000;
+            QByteArray d;
+            auto u32 = [&](uint32_t v) { d.append(reinterpret_cast<const char*>(&v), 4); };
+            auto u16 = [&](uint16_t v) { d.append(reinterpret_cast<const char*>(&v), 2); };
+            d.append("RIFF");
+            u32(36 + n * 2);
+            d.append("WAVEfmt ");
+            u32(16), u16(1), u16(1), u32(48000), u32(96000), u16(2), u16(16);
+            d.append("data");
+            u32(n * 2);
+            for (int i = 0; i < n; ++i) u16(uint16_t(int16_t(std::lround(0.5 * 32767 * std::sin(2 * M_PI * 1000 * i / 48000.0)))));
+            f.write(d);
+            f.close();
+            MediaItem m;
+            m.id = p.newId();
+            QVERIFY(probeMedia(wav.toStdString(), m));
+            p.media.push_back(m);
+            Clip a = makeClip(p, m, TrackKind::Audio, s);
+            a.duration = 24;
+            s.audioTracks[0].clips.push_back(a);
+        }
+        ImfSettings st;
+        st.title = "Test master: one";
+        st.threads = 2;
+        ImfResult r;
+        std::string err;
+        QVERIFY2(exportImf(p, s, st, dir.path().toStdString(), &r, {}, &err), err.c_str());
+        QVERIFY(r.frames == 24 && r.rateNum == 24000 && r.rateDen == 1001 && r.width == 320 && r.height == 180);
+        QVERIFY(r.bits == 10 && r.channels == 2 && r.colour == "rec709");
+        QCOMPARE(int(r.rsiz), 0x0701);  // the reversible 2K IMF profile, main level 1
+        const QDir out(QString::fromStdString(r.folder));
+        QVERIFY2(out.dirName().startsWith("Test_master_one_IMF_"), qPrintable(out.dirName()));
+        const QStringList videos = out.entryList({"VIDEO_*.mxf"}), audios = out.entryList({"AUDIO_*.mxf"}), cpls = out.entryList({"CPL_*.xml"});
+        QVERIFY(videos.size() == 1 && audios.size() == 1 && cpls.size() == 1 && out.entryList({"PKL_*.xml"}).size() == 1 && out.exists("ASSETMAP.xml"));
+        std::vector<std::string> issues = verifyImf(r.folder);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+        // The composition: Application #2E, the rate, both resources with their essence descriptors (as the files'), the
+        // picture's profile, colour and component layout, the sound's stereo labels.
+        QFile cplFile(out.filePath(cpls[0]));
+        QVERIFY(cplFile.open(QIODevice::ReadOnly));
+        const QString cpl = QString::fromUtf8(cplFile.readAll());
+        for (const char* want : {"http://www.smpte-ra.org/ns/2067-21/2021</cc:ApplicationIdentification>", "<EditRate>24000 1001</EditRate>",
+                                 "<IntrinsicDuration>24</IntrinsicDuration>", "<IntrinsicDuration>48048</IntrinsicDuration>",
+                                 "<EditRate>48000 1</EditRate>", "<r1:Rsiz>1793</r1:Rsiz>", "<r2:Code>CompRed</r2:Code>",
+                                 "<r1:ComponentMaxRef>1023</r1:ComponentMaxRef>", "060e2b34.04010106.04010101.03030000",
+                                 "<r1:PictureCompression>urn:smpte:ul:060e2b34.0401010d.04010202.03010502</r1:PictureCompression>",
+                                 "<r1:MCATagSymbol>sgST</r1:MCATagSymbol>", "<r1:MCATagSymbol>chR</r1:MCATagSymbol>",
+                                 ">feature</ContentKind>", "<ContentTitle language=\"en\">Test master: one</ContentTitle>"})
+            QVERIFY2(cpl.contains(want), want);
+        QVERIFY(!cpl.contains("MasteringDisplay"));
+        // The picture, lossless: the matte's own codes in the middle of frame 5.
+        std::vector<uint16_t> rgb;
+        int w = 0, h = 0, bits = 0;
+        QVERIFY2(readImfFrame(out.filePath(videos[0]).toStdString(), 5, rgb, w, h, bits, &err), err.c_str());
+        QVERIFY(w == 320 && h == 180 && bits == 10);
+        const uint16_t* mid = &rgb[(size_t(90) * 320 + 160) * 3];
+        QVERIFY2(std::abs(mid[0] - 512) <= 1 && std::abs(mid[1] - 256) <= 1 && std::abs(mid[2] - 767) <= 1,
+                 qPrintable(QString("%1 %2 %3").arg(mid[0]).arg(mid[1]).arg(mid[2])));
+        // The sound: as many samples as the frames last at 23.976 (48048), the tone on both sides.
+        AudioBufferPtr tone = decodeAudio(out.filePath(audios[0]).toStdString(), 48000, &err);
+        QVERIFY2(tone, err.c_str());
+        QVERIFY2(std::abs(tone->frames() - 48048) < 4, qPrintable(QString::number(tone->frames())));
+        int crossings = 0;
+        for (int64_t i = 1; i < 24000; ++i) crossings += (tone->samples[size_t(i - 1) * 2] < 0) != (tone->samples[size_t(i) * 2] < 0);
+        QVERIFY2(std::abs(crossings - 1000) < 10, qPrintable(QString::number(crossings)));
+        // A damaged file is caught; the same package again is refused; stopping leaves nothing.
+        {
+            QFile f(out.filePath(audios[0]));
+            QVERIFY(f.open(QIODevice::Append));
+            f.write("x");
+        }
+        issues = verifyImf(r.folder);
+        QVERIFY(std::any_of(issues.begin(), issues.end(), [](const std::string& i) { return i.find("hash") != std::string::npos; }));
+        QVERIFY(!exportImf(p, s, st, dir.path().toStdString(), nullptr, {}, &err) && err.find("already") != std::string::npos);
+        st.title = "Stopped";
+        int calls = 0;
+        QVERIFY(!exportImf(p, s, st, dir.path().toStdString(), nullptr, [&](double) { return ++calls < 3; }, &err));
+        QVERIFY(QDir(dir.path()).entryList({"Stopped_*"}, QDir::Dirs).isEmpty());
+
+        // HDR: P3-D65 PQ at 12 bits with the mastering display, no coding equations; lossy within its cap at main level
+        // 1, sub level 1; a 5.1 mix with its labels.
+        st.title = "HDR";
+        st.colour = "p3d65-pq";
+        st.lossless = false;
+        st.megabitsPerSecond = 50;
+        st.masteringPeak = 4000;
+        Sequence surround = s;
+        surround.audioLayout = "5.1";
+        ImfResult hdr;
+        QVERIFY2(exportImf(p, surround, st, dir.path().toStdString(), &hdr, {}, &err), err.c_str());
+        QVERIFY(hdr.bits == 12 && hdr.channels == 6 && hdr.colour == "p3d65-pq");
+        QCOMPARE(int(hdr.rsiz), 0x0411);
+        issues = verifyImf(hdr.folder);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+        const QDir hout(QString::fromStdString(hdr.folder));
+        QFile hcpl(hout.filePath(hout.entryList({"CPL_*.xml"}).value(0)));
+        QVERIFY(hcpl.open(QIODevice::ReadOnly));
+        const QString htext = QString::fromUtf8(hcpl.readAll());
+        for (const char* want : {"<r1:MasteringDisplayMaximumLuminance>40000000</r1:MasteringDisplayMaximumLuminance>", "<r2:X>34000</r2:X>",
+                                 "060e2b34.0401010d.04010101.010a0000", "060e2b34.0401010d.04010101.03060000", "<r1:MCATagSymbol>sg51</r1:MCATagSymbol>",
+                                 "<r1:MCATagSymbol>chLFE</r1:MCATagSymbol>", "<r1:ComponentMaxRef>4095</r1:ComponentMaxRef>"})
+            QVERIFY2(htext.contains(want), want);
+        QVERIFY(!htext.contains("CodingEquations"));
+        QVERIFY(readImfFrame(hout.filePath(hout.entryList({"VIDEO_*.mxf"}).value(0)).toStdString(), 0, rgb, w, h, bits, &err) && bits == 12);
+        mid = &rgb[(size_t(90) * 320 + 160) * 3];
+        QVERIFY(mid[0] > mid[1] && mid[2] > mid[0] && mid[2] < 4095);  // the matte in PQ, its order kept
+        // Refused: an unknown colour, a frame rate Application #2E does not take, a picture larger than 4096 x 3112.
+        st.colour = "sepia";
+        QVERIFY(!exportImf(p, s, st, dir.path().toStdString(), nullptr, {}, &err) && err.find("colour") != std::string::npos);
+        st.colour.clear();
+        Sequence odd = s;
+        odd.fps = Rational{48, 1};
+        QVERIFY(!imfFrameRateAllowed(odd) && !exportImf(p, odd, st, dir.path().toStdString(), nullptr, {}, &err));
+        odd.fps = Rational{60000, 1001};
+        QVERIFY(imfFrameRateAllowed(odd));
+        int iw = 0, ih = 0;
+        Sequence big = s;
+        big.width = 7680, big.height = 4320;
+        QVERIFY(!imfPictureSize(big, "sequence", iw, ih, &err) && imfPictureSize(big, "uhd", iw, ih) && iw == 3840 && ih == 2160);
+        QCOMPARE(defaultImfColour(s), std::string("rec709"));
+        big.colorSpace = "rec2100pq";
+        QCOMPARE(defaultImfColour(big), std::string("rec2020-pq"));
+        // The IMF profiles and levels: 4K above 2048 x 1556, main levels by samples per second, sub levels by bit rate.
+        QCOMPARE(int(imfRsiz(3840, 2160, 3, 24000.0 / 1001, true)), 0x0806);
+        QCOMPARE(int(imfRsiz(1920, 1080, 3, 24, true)), 0x0703);
+        QCOMPARE(int(imfRsiz(3840, 2160, 3, 24, false, 400)), 0x0526);
+        QCOMPARE(int(imfRsiz(16384, 8640, 3, 24, true)), 0);
+        uint8_t ul[16];
+        imfPictureCoding(0x0806, ul);
+        QVERIFY(ul[14] == 0x06 && ul[15] == 0x0f);
+        imfPictureCoding(0x0526, ul);
+        QVERIFY(ul[14] == 0x03 && ul[15] == 0x11);
     }
 
     void exportsDigitalCinemaPackage() {

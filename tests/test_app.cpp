@@ -3502,6 +3502,49 @@ private slots:
         state()->newProject();
     }
 
+    void exportImfFromTheFileMenu() {
+        state()->newProject();
+        QVERIFY(win_->findChild<QAction*>("exportImf"));
+        if (!openJpegAvailable()) QSKIP("Built without OpenJPEG 2.5");
+        QVERIFY(state()->edit("Matte", [&](Project& p, Sequence& s) {
+            s.width = 128, s.height = 72, s.fps = Rational{25, 1};
+            Clip c = makeGeneratorClip(p, "color", 25);
+            c.generator.params["color.g"] = 0.6;
+            return edit::overwrite(p, s, V1, c).ok;
+        }));
+        ImfSettings st;
+        st.title = "Menu Master";
+        st.threads = 2;
+        QStringList problems;
+        const QString folder = win_->exportImfTo(dir_.path(), st, &problems);
+        QVERIFY2(!folder.isEmpty(), qPrintable(win_->statusBar()->currentMessage()));
+        QVERIFY2(problems.isEmpty(), qPrintable(problems.join("; ")));
+        QVERIFY(QFileInfo(folder).fileName().startsWith("Menu_Master_IMF_"));
+        QVERIFY2(win_->statusBar()->currentMessage().contains("checked"), qPrintable(win_->statusBar()->currentMessage()));
+        // Over MCP: made (HDR, 12-bit, lossy) and checked; a package missing its asset map reported.
+        QVERIFY(state()->save(dir_.filePath("imf.montage")));
+        McpServer server;
+        auto call = [&](const QString& tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"}, {"params", QJsonObject{{"name", tool}, {"arguments", args}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-imf")}, {"title", "Over MCP"},
+                                                   {"kind", "episode"}, {"colour", "rec2020-pq"}, {"lossless", false}, {"megabits_per_second", 100}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject made = r.value("structuredContent").toObject();
+        QVERIFY(made.value("problems").toArray().isEmpty() && made.value("frames").toInt() == 25 && made.value("bits").toInt() == 12);
+        QVERIFY(made.value("colour").toString() == "rec2020-pq" && made.value("edit_rate").toString() == "25/1" && made.value("rsiz").toInt() == 0x0411);
+        r = call("montage_verify_imf", {{"folder", made.value("folder").toString()}});
+        QVERIFY(r.value("structuredContent").toObject().value("ok").toBool());
+        QFile::remove(QDir(made.value("folder").toString()).filePath("ASSETMAP.xml"));
+        r = call("montage_verify_imf", {{"folder", made.value("folder").toString()}});
+        QVERIFY(!r.value("structuredContent").toObject().value("ok").toBool());
+        QVERIFY(call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-imf")}, {"colour", "sepia"}})
+                    .value("isError").toBool());
+        state()->newProject();
+    }
+
     void spectralRepairFromTheClipMenu() {
         // Three seconds of a 440 Hz voice with a 3 kHz whistle from 1.0 to 1.5 s.
         const int rate = 48000;

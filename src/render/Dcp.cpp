@@ -26,6 +26,7 @@ extern "C" {
 #include "ColorSpace.h"
 #include "Compositor.h"
 #include "DcpMxf.h"
+#include "PackageFiles.h"
 #include "core/Surround.h"
 #include "media/SuperScale.h"
 
@@ -37,21 +38,10 @@ constexpr int kSampleRate = 48000;
 
 QString urn(const dcp::Uuid& u) { return QStringLiteral("urn:uuid:") + QString::fromStdString(dcp::uuidString(u)); }
 
-QString isoNow() { return QDateTime::currentDateTimeUtc().toString(QStringLiteral("yyyy-MM-ddTHH:mm:ss")) + QStringLiteral("+00:00"); }
+QString isoNow() { return packageTimestamp(); }
 
-// SHA-1 of a file, base64, as packing lists give it.
-// `read` (if given) hears of each mebibyte read and may return false to stop (the hash is then empty).
 QString fileHash(const QString& path, qint64* size = nullptr, const std::function<bool(qint64)>& read = {}) {
-    QFile f(path);
-    if (!f.open(QIODevice::ReadOnly)) return {};
-    if (size) *size = f.size();
-    QCryptographicHash h(QCryptographicHash::Sha1);
-    while (!f.atEnd()) {
-        const QByteArray chunk = f.read(1 << 20);
-        h.addData(chunk);
-        if (read && !read(chunk.size())) return {};
-    }
-    return QString::fromLatin1(h.result().toBase64());
+    return packageFileHash(path, size, read);
 }
 
 // ---- Picture: sequence colour to DCI X'Y'Z' -------------------------------------------------------------------------
@@ -686,30 +676,9 @@ struct XmlAsset {
     bool packingList = false;
 };
 
-// Flattens the elements of an XML file into (path of element names, text) pairs, enough to read DCP documents.
-std::vector<std::pair<QString, QString>> xmlItems(const QString& file, QString* root = nullptr) {
-    std::vector<std::pair<QString, QString>> out;
-    QFile f(file);
-    if (!f.open(QIODevice::ReadOnly)) return out;
-    QXmlStreamReader r(&f);
-    QStringList stack;
-    while (!r.atEnd()) {
-        r.readNext();
-        if (r.isStartElement()) {
-            if (stack.isEmpty() && root) *root = r.name().toString();
-            stack << r.name().toString();
-            out.push_back({stack.join('/'), {}});
-        } else if (r.isCharacters() && !r.isWhitespace() && !out.empty()) {
-            out.back().second += r.text().toString().trimmed();
-        } else if (r.isEndElement()) {
-            if (!stack.isEmpty()) stack.removeLast();
-        }
-    }
-    if (r.hasError()) out.clear();
-    return out;
-}
+std::vector<std::pair<QString, QString>> xmlItems(const QString& file, QString* root = nullptr) { return packageXmlItems(file, root); }
 
-QString bareId(QString id) { return id.remove(QStringLiteral("urn:uuid:")).toLower(); }
+QString bareId(QString id) { return packageBareId(std::move(id)); }
 
 struct TrackInfo {
     bool ok = false;

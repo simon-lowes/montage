@@ -200,6 +200,7 @@ const std::vector<ColorSpace>& colorSpaces() {
         {"p3d65", "Display P3", Primaries::P3D65, Transfer::Srgb, false},
         {"rec2100pq", "Rec.2100 PQ (HDR10)", Primaries::Bt2020, Transfer::Pq, false},
         {"rec2100hlg", "Rec.2100 HLG", Primaries::Bt2020, Transfer::Hlg, false},
+        {"p3d65pq", "P3-D65 PQ (HDR mastering)", Primaries::P3D65, Transfer::Pq, false},
         {"slog3-sgamut3cine", "Sony S-Log3 / S-Gamut3.Cine", Primaries::SGamut3Cine, Transfer::SLog3, true},
         {"logc3-awg3", "ARRI LogC3 / ALEXA Wide Gamut 3", Primaries::AlexaWideGamut3, Transfer::LogC3, true},
         {"logc4-awg4", "ARRI LogC4 / ALEXA Wide Gamut 4", Primaries::AlexaWideGamut4, Transfer::LogC4, true},

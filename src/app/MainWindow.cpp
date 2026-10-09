@@ -690,6 +690,7 @@ void MainWindow::buildMenus() {
     add(file, tr("Export &Versions…"), QKeySequence(), [this] { exportVersionsDialog(); })->setObjectName(QStringLiteral("exportVersions"));
     add(file, tr("Export for Re&view…"), QKeySequence(), [this] { exportForReviewDialog(); })->setObjectName(QStringLiteral("exportForReview"));
     add(file, tr("Export &DCP (Digital Cinema)…"), QKeySequence(), [this] { exportDcpDialog(); })->setObjectName(QStringLiteral("exportDcp"));
+    add(file, tr("Export &IMF Master…"), QKeySequence(), [this] { exportImfDialog(); })->setObjectName(QStringLiteral("exportImf"));
     add(file, tr("Import Review Notes…"), QKeySequence(), [this] {
         const QString path = QFileDialog::getOpenFileName(this, tr("Import Review Notes"), appSettings().value(QStringLiteral("export/lastDirectory")).toString(),
                                                           tr("Review notes (*.json);;Marker lists (*.csv *.txt *.tsv)"));
@@ -4356,6 +4357,182 @@ QString MainWindow::exportDcpTo(const QString& parent, const DcpSettings& settin
                             .arg(result.channels),
                         12000);
     return folder;
+}
+
+QString MainWindow::exportImfTo(const QString& parent, const ImfSettings& settings, QStringList* problems) {
+    const Sequence* s = state_->sequence();
+    if (!s || s->duration() == 0) {
+        state_->message(tr("Nothing to export"));
+        return {};
+    }
+    // Made from a copy, off the UI thread, then checked there too (every frame is compressed, every file read back).
+    const Project project = state_->project();
+    const Sequence seq = *s;
+    QProgressDialog progress(tr("Making the IMF master of %1...").arg(QString::fromStdString(seq.name)), tr("Cancel"), 0, 1000, this);
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(400);
+    std::atomic<int> done{0};
+    std::atomic<bool> cancel{false}, checking{false};
+    connect(&progress, &QProgressDialog::canceled, this, [&cancel] { cancel = true; });
+    ImfResult result;
+    std::string err;
+    std::vector<std::string> issues;
+    QFutureWatcher<bool> watcher;
+    QEventLoop loop;
+    connect(&watcher, &QFutureWatcher<bool>::finished, &loop, &QEventLoop::quit);
+    QTimer tick;
+    connect(&tick, &QTimer::timeout, this, [&] {
+        progress.setValue(done.load());
+        if (checking.load()) progress.setLabelText(tr("Checking the IMF master of %1...").arg(QString::fromStdString(seq.name)));
+    });
+    tick.start(100);
+    watcher.setFuture(QtConcurrent::run([&] {
+        if (!exportImf(project, seq, settings, parent.toStdString(), &result, [&](double f) {
+                done = int(f * 850);
+                return !cancel.load();
+            }, &err))
+            return false;
+        checking = true;
+        issues = verifyImf(result.folder, [&](double f) {
+            done = 850 + int(f * 150);
+            return !cancel.load();
+        });
+        return true;
+    }));
+    if (!watcher.isFinished()) loop.exec();
+    tick.stop();
+    progress.close();
+    if (!watcher.result()) {
+        state_->message(cancel ? tr("IMF master cancelled") : tr("No IMF master: %1").arg(QString::fromStdString(err)), 8000);
+        return {};
+    }
+    const QString folder = QString::fromStdString(result.folder);
+    const QString name = QFileInfo(folder).fileName();
+    if (cancel.load() && !issues.empty() && issues.back() == "Stopped") {
+        state_->message(tr("IMF master %1 made; its check was stopped").arg(name), 8000);
+        return folder;
+    }
+    QStringList found;
+    for (const std::string& i : issues) found << QString::fromStdString(i);
+    if (problems) *problems = found;
+    if (!found.isEmpty())
+        state_->message(tr("IMF master %1 made, but the check found: %2").arg(name, found.join("; ")), 12000);
+    else
+        state_->message(tr("IMF master %1 made and checked (%2 x %3, %4-bit %5, %6 channels)")
+                            .arg(name)
+                            .arg(result.width)
+                            .arg(result.height)
+                            .arg(result.bits)
+                            .arg(QString::fromStdString(result.colour))
+                            .arg(result.channels),
+                        12000);
+    return folder;
+}
+
+void MainWindow::exportImfDialog() {
+    const Sequence* s = state_->sequence();
+    if (!s || s->duration() == 0) {
+        state_->message(tr("Nothing to export"));
+        return;
+    }
+    if (!openJpegAvailable()) {
+        state_->message(tr("This build of Montage cannot make IMF masters: it was built without OpenJPEG 2.5"), 8000);
+        return;
+    }
+    QDialog dlg(this);
+    dlg.setObjectName(QStringLiteral("exportImfDialog"));
+    dlg.setWindowTitle(tr("Export IMF Master"));
+    auto* form = new QFormLayout(&dlg);
+    auto* intro = new QLabel(tr("An IMF (Interoperable Master Format) package of %1, Application #2E, as streaming services and broadcasters "
+                                "ask for: JPEG 2000 pictures (lossless by default), 24-bit sound with channel labels, checked when it is done.")
+                                 .arg(QString::fromStdString(s->name)),
+                             &dlg);
+    intro->setWordWrap(true);
+    form->addRow(intro);
+    auto* title = new QLineEdit(&dlg);
+    title->setObjectName(QStringLiteral("imfTitle"));
+    const QString file = state_->filePath();
+    title->setText(file.isEmpty() ? QString::fromStdString(s->name) : QFileInfo(file).completeBaseName());
+    form->addRow(tr("Title:"), title);
+    auto* kind = new QComboBox(&dlg);
+    kind->setObjectName(QStringLiteral("imfKind"));
+    for (const auto& [label, value] : std::vector<std::pair<QString, QString>>{{tr("Feature"), "feature"}, {tr("Episode"), "episode"},
+                                                                             {tr("Short"), "short"}, {tr("Trailer"), "trailer"},
+                                                                             {tr("Teaser"), "teaser"}, {tr("Advertisement"), "advertisement"},
+                                                                             {tr("Promotion"), "promotion"}, {tr("Test"), "test"}})
+        kind->addItem(label, value);
+    form->addRow(tr("Kind:"), kind);
+    auto* size = new QComboBox(&dlg);
+    size->setObjectName(QStringLiteral("imfSize"));
+    size->addItem(tr("As the sequence (%1 x %2)").arg(s->width).arg(s->height), "sequence");
+    size->addItem(tr("HD (1920 x 1080)"), "hd");
+    size->addItem(tr("UHD (3840 x 2160)"), "uhd");
+    size->addItem(tr("4K (4096 x 2160)"), "4k");
+    form->addRow(tr("Picture:"), size);
+    auto* colour = new QComboBox(&dlg);
+    colour->setObjectName(QStringLiteral("imfColour"));
+    colour->addItem(tr("Rec.709 (SDR)"), "rec709");
+    colour->addItem(tr("P3-D65 PQ (HDR)"), "p3d65-pq");
+    colour->addItem(tr("Rec.2020 PQ (HDR10)"), "rec2020-pq");
+    colour->addItem(tr("Rec.2020 HLG"), "rec2020-hlg");
+    colour->setCurrentIndex(colour->findData(QString::fromStdString(defaultImfColour(*s))));
+    form->addRow(tr("Colour:"), colour);
+    auto* bits = new QComboBox(&dlg);
+    bits->setObjectName(QStringLiteral("imfBits"));
+    bits->addItem(tr("Automatic (10-bit SDR, 12-bit HDR)"), 0);
+    bits->addItem(tr("10-bit"), 10);
+    bits->addItem(tr("12-bit"), 12);
+    form->addRow(tr("Depth:"), bits);
+    auto* coding = new QComboBox(&dlg);
+    coding->setObjectName(QStringLiteral("imfCoding"));
+    coding->addItem(tr("Lossless"), 0);
+    for (int mbps : {800, 400, 200}) coding->addItem(tr("Lossy, %1 Mbit/s").arg(mbps), mbps);
+    form->addRow(tr("JPEG 2000:"), coding);
+    auto* language = new QLineEdit(QStringLiteral("en"), &dlg);
+    language->setObjectName(QStringLiteral("imfLanguage"));
+    form->addRow(tr("Sound language:"), language);
+    auto* issuer = new QLineEdit(appSettings().value(QStringLiteral("imf/issuer"), QStringLiteral("Montage")).toString(), &dlg);
+    issuer->setObjectName(QStringLiteral("imfIssuer"));
+    form->addRow(tr("Issuer:"), issuer);
+    const bool marked = s->inPoint >= 0 && s->outPoint >= s->inPoint;
+    auto* range = new QCheckBox(tr("Only In to Out"), &dlg);
+    range->setObjectName(QStringLiteral("imfRange"));
+    range->setEnabled(marked);
+    form->addRow(QString(), range);
+    auto* folder = new QLineEdit(&dlg);
+    folder->setObjectName(QStringLiteral("imfFolder"));
+    QString start = appSettings().value(QStringLiteral("export/lastDirectory")).toString();
+    if (start.isEmpty()) start = QStandardPaths::writableLocation(QStandardPaths::MoviesLocation);
+    folder->setText(start);
+    auto* browse = new QPushButton(tr("Choose…"), &dlg);
+    connect(browse, &QPushButton::clicked, &dlg, [&] {
+        const QString d = QFileDialog::getExistingDirectory(&dlg, tr("Make the IMF Master In"), folder->text());
+        if (!d.isEmpty()) folder->setText(d);
+    });
+    auto* row = new QHBoxLayout;
+    row->addWidget(folder, 1);
+    row->addWidget(browse);
+    form->addRow(tr("Make it in:"), row);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    buttons->button(QDialogButtonBox::Ok)->setText(tr("Make IMF Master"));
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    form->addRow(buttons);
+    if (dlg.exec() != QDialog::Accepted) return;
+    ImfSettings st;
+    st.title = title->text().trimmed().toStdString();
+    st.kind = kind->currentData().toString().toStdString();
+    st.size = size->currentData().toString().toStdString();
+    st.colour = colour->currentData().toString().toStdString();
+    st.bits = bits->currentData().toInt();
+    st.lossless = coding->currentData().toInt() == 0;
+    if (!st.lossless) st.megabitsPerSecond = coding->currentData().toInt();
+    st.language = language->text().trimmed().toStdString();
+    st.issuer = issuer->text().trimmed().toStdString();
+    st.inOut = range->isChecked() && marked;
+    appSettings().setValue(QStringLiteral("export/lastDirectory"), folder->text());
+    appSettings().setValue(QStringLiteral("imf/issuer"), issuer->text().trimmed());
+    exportImfTo(folder->text(), st);
 }
 
 void MainWindow::exportDcpDialog() {

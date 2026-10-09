@@ -19,6 +19,8 @@
 #include "render/Shorts.h"
 #include "render/ReviewExport.h"
 #include "render/Dcp.h"
+#include "render/Imf.h"
+#include "render/Jpeg2000.h"
 #include "render/ExtendClip.h"
 #include "render/RoomTone.h"
 #include "render/Versions.h"
@@ -177,6 +179,8 @@ public:
     // progress bar and checked when done. The folder it made ("" if it failed or was cancelled); what the check found.
     QString exportDcpTo(const QString& parent, const DcpSettings& settings, QStringList* problems = nullptr);
     void exportDcpDialog();
+    QString exportImfTo(const QString& parent, const ImfSettings& settings, QStringList* problems = nullptr);
+    void exportImfDialog();
     bool addToColorGroup(Id group);
     bool removeFromColorGroup();
     // Suggest Chapters: chapter markers where the talk moves on, titled with what each part is about (replacing the
