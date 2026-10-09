@@ -29,6 +29,7 @@ add_library(montage_engine STATIC
   core/Effects.h core/Effects.cpp
   core/EditOps.h core/EditOps.cpp
   core/TimelineCompare.h core/TimelineCompare.cpp
+  core/MergeClips.h core/MergeClips.cpp
   core/ImportBuilder.h core/InterchangeImport.cpp core/FcpXml.cpp
   core/Multicam.h core/Multicam.cpp
   core/History.h core/History.cpp
@@ -53,6 +54,8 @@ add_library(montage_engine STATIC
   media/Analysis.h media/Analysis.cpp
   media/Loudness.h media/Loudness.cpp
   media/AudioSync.h media/AudioSync.cpp
+  media/FieldRecorder.h media/FieldRecorder.cpp
+  media/DualSystem.h media/DualSystem.cpp
   media/SpeakerSwitch.h media/SpeakerSwitch.cpp
   media/AutoDuck.h media/AutoDuck.cpp
   media/Tracking.h media/Tracking.cpp

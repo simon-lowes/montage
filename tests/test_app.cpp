@@ -111,6 +111,7 @@
 #include "TranscriptPanel.h"
 #include "core/AutoTag.h"
 #include "core/EditOps.h"
+#include "core/MergeClips.h"
 #include "core/Effects.h"
 #include "core/Multicam.h"
 #include "core/ProjectIO.h"
@@ -1659,6 +1660,63 @@ private slots:
         QCOMPARE(*back.findMedia(id)->transcript, *transcript);
         state()->newProject();
         QVERIFY(QTest::qWaitForWindowActive(win_.get()));  // the window has the focus back
+    }
+
+    void mergeClipsAndSyncDailies() {
+        // A camera clip whose own sound is JFK's speech from two seconds in, and the speech as the recorder's file.
+        const QString video = dir_.path() + "/A002.mp4";
+        {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 160;
+            gs.height = 90;
+            Clip picture = makeGeneratorClip(gen, "color", 120);
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, picture);
+            MediaItem src;
+            src.id = gen.newId();
+            std::string err;
+            QVERIFY(probeMedia(MONTAGE_TEST_DATA_DIR "/jfk.wav", src, &err));
+            gen.media.push_back(src);
+            Clip scratch = makeClip(gen, src, TrackKind::Audio, gs);
+            scratch.sourceIn = 60;  // two seconds in at 30 fps
+            scratch.duration = 120;
+            edit::overwrite(gen, gs, {TrackKind::Audio, 0}, scratch);
+            ExportSettings st;
+            st.path = video.toStdString();
+            st.preset = "ultrafast";
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        state()->newProject();
+        const auto ids = state()->importFiles({video, QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(2));
+        auto* bin = win_->findChild<MediaBinWidget*>();
+        QVERIFY(bin);
+        const size_t before = state()->project().media.size();
+        // Sync Dailies: no timecode, so by the sound; one undo step.
+        QStringList report;
+        const auto made = bin->syncDailies(ids, true, &report);
+        QCOMPARE(made.size(), size_t(1));
+        QVERIFY2(report.join(" ").contains("waveform"), qPrintable(report.join(" ")));
+        const MediaItem* merged = state()->project().findMedia(made[0]);
+        QVERIFY(merged && isMergedClip(state()->project(), made[0]));
+        const Sequence* inside = state()->project().findSequence(merged->sequenceId);
+        QVERIFY(inside && inside->audioTracks.size() == 2 && inside->audioTracks[1].muted);
+        const Clip& sound = inside->audioTracks[0].clips.at(0);
+        QVERIFY2(std::abs(FrameTime(sound.sourceIn) - 60) <= 1, qPrintable(QString::number(sound.sourceIn)));  // two seconds in
+        QCOMPARE(state()->project().media.size(), before + 1);
+        state()->undo();
+        QCOMPARE(state()->project().media.size(), before);
+        // Merge Clips by their starts, without the camera's sound; by timecode refused with why.
+        QString why;
+        const Id starts = bin->mergeClips(ids[0], {ids[1]}, 3, false, "Starts", &why);
+        QVERIFY2(starts, qPrintable(why));
+        QCOMPARE(state()->project().findMedia(starts)->name, std::string("Starts"));
+        const Sequence* s2 = state()->project().findSequence(state()->project().findMedia(starts)->sequenceId);
+        QCOMPARE(s2->audioTracks.size(), size_t(1));
+        QCOMPARE(FrameTime(s2->audioTracks[0].clips.at(0).sourceIn), FrameTime(0));
+        QVERIFY(!bin->mergeClips(ids[0], {ids[1]}, 1, true, {}, &why));
+        QVERIFY2(why.contains("timecode"), qPrintable(why));
+        state()->newProject();
     }
 
     void hoverScrubInTheBin() {

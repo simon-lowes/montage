@@ -20,6 +20,7 @@
 #include "core/History.h"
 #include "core/Interchange.h"
 #include "core/MarkerList.h"
+#include "core/MergeClips.h"
 #include "core/KeyframeEdit.h"
 #include "core/MaskPath.h"
 #include "core/MediaLog.h"
@@ -606,6 +607,88 @@ private slots:
         QCOMPARE(captionKeypad(under[3]), 2);
         QCOMPARE(captionKeypad(under[4]), 2);
         QCOMPARE(raiseCaptionsOverTitles(under, seq), 0);
+    }
+
+    void mergedClipsFromSeparateSound() {
+        Project p = makeDefaultProject();
+        auto add = [&](const char* name, MediaKind kind, double seconds, double timecode, bool video, bool audio) {
+            MediaItem m;
+            m.id = p.newId();
+            m.kind = kind;
+            m.name = name;
+            m.path = std::string("/footage/") + name;
+            m.duration = seconds;
+            m.timecode = timecode;
+            m.hasVideo = video;
+            m.hasAudio = audio;
+            if (video) m.width = 1920, m.height = 1080, m.fps = Rational{25, 1};
+            if (audio) m.sampleRate = 48000, m.channels = 2;
+            p.media.push_back(m);
+            return m.id;
+        };
+        const Id cam = add("A001.mov", MediaKind::Video, 10, 36000, true, true);
+        const Id rec = add("T03.wav", MediaKind::Audio, 20, 35995, false, true);
+        p.findMedia(rec)->metadata = {{"scene", "12A"}, {"take", "3"}};
+        p.findMedia(cam)->metadata = {{"take", "4"}};
+        // By timecode: the recorder rolled five seconds before the camera.
+        double off = 0;
+        QVERIFY(timecodeOffset(p, cam, rec, off));
+        QCOMPARE(off, -5.0);
+        std::string why;
+        const Id merged = mergeClips(p, cam, {rec}, {off}, {}, &why);
+        QVERIFY2(merged, why.c_str());
+        const MediaItem& m = *p.findMedia(merged);
+        QCOMPARE(m.name, std::string("A001.mov (merged)"));
+        QVERIFY(m.kind == MediaKind::Sequence && m.hasVideo && m.hasAudio && isMergedClip(p, merged));
+        QCOMPARE(m.duration, 10.0);
+        QCOMPARE(m.timecode, 36000.0);
+        QCOMPARE(m.metadata.at("scene"), std::string("12A"));  // from the recorder
+        QCOMPARE(m.metadata.at("take"), std::string("4"));     // the camera's own wins
+        const Sequence& seq = *p.findSequence(m.sequenceId);
+        QCOMPARE(seq.fps, (Rational{25, 1}));
+        QCOMPARE(seq.videoTracks[0].clips.size(), size_t(1));
+        QCOMPARE(seq.audioTracks.size(), size_t(2));
+        const Clip& sound = seq.audioTracks[0].clips.at(0);
+        QCOMPARE(sound.mediaId, rec);
+        QCOMPARE(sound.start, FrameTime(0));
+        QCOMPARE(FrameTime(sound.sourceIn), FrameTime(125));  // five seconds into the recording
+        QCOMPARE(sound.duration, FrameTime(250));             // cut to the picture
+        QVERIFY(!seq.audioTracks[0].muted);
+        QCOMPARE(seq.audioTracks[1].clips.at(0).mediaId, cam);  // the camera's sound, muted
+        QVERIFY(seq.audioTracks[1].muted);
+        // A sound starting after the picture, without the camera's sound.
+        MergeOptions o;
+        o.keepCameraAudio = false;
+        o.name = "Late";
+        const Id late = mergeClips(p, cam, {rec}, {2.0}, o, &why);
+        QVERIFY(late);
+        const Sequence& ls = *p.findSequence(p.findMedia(late)->sequenceId);
+        QCOMPARE(ls.audioTracks.size(), size_t(1));
+        QCOMPARE(ls.audioTracks[0].clips.at(0).start, FrameTime(50));
+        QCOMPARE(ls.audioTracks[0].clips.at(0).duration, FrameTime(200));
+        // Refused: no overlap, a sound as the picture, a picture as the sound, nothing to merge.
+        QVERIFY(!mergeClips(p, cam, {rec}, {12.0}, o, &why));
+        QCOMPARE(why, std::string("The sound does not overlap the picture"));
+        QVERIFY(!mergeClips(p, rec, {rec}, {0.0}, o, &why));
+        QVERIFY(!mergeClips(p, cam, {cam}, {0.0}, o, &why));
+        QVERIFY(!mergeClips(p, cam, {}, {}, o, &why));
+        // Across midnight, and no overlap at all.
+        const Id night = add("B001.mov", MediaKind::Video, 30, 86390, true, false);
+        const Id after = add("T09.wav", MediaKind::Audio, 60, 5, false, true);
+        QVERIFY(timecodeOffset(p, night, after, off));
+        QCOMPARE(off, 15.0);
+        const Id far = add("T10.wav", MediaKind::Audio, 5, 40000, false, true);
+        QVERIFY(!timecodeOffset(p, cam, far, off));
+        // Each picture with the sound overlapping it most.
+        const auto pairs = matchByTimecode(p, {cam, night}, {rec, after, far});
+        QCOMPARE(pairs.size(), size_t(2));
+        QCOMPARE(pairs[0].sound, rec);
+        QCOMPARE(pairs[1].sound, after);
+        QCOMPARE(pairs[1].offset, 15.0);
+        // Saved and read back as a merged clip.
+        Project back;
+        QVERIFY(projectFromJson(projectToJson(p), back));
+        QVERIFY(isMergedClip(back, merged));
     }
 
     void captionsFromClipTranscripts() {

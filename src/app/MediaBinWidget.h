@@ -100,9 +100,17 @@ public:
     bool hoverScrub() const { return hoverScrub_; }
     // Replace Footage (Premiere's): the item takes another file, its clips keeping their edits; one undo step.
     bool replaceFootage(Id id, const QString& path, QString* why = nullptr);
+    // Dual-system sound (media/DualSystem.h). Merge Clips: a camera clip and recorder files joined into one clip,
+    // lined up by `syncBy` (0 timecode or else sound, 1 timecode, 2 sound, 3 their starts), the camera's own sound
+    // kept muted under them when asked; one undo step; the merged clip, or 0 and why. Sync Dailies: every picture
+    // among `media` merged with the sound file that belongs to it; one undo step; the merged clips.
+    Id mergeClips(Id video, const std::vector<Id>& sounds, int syncBy, bool keepCameraAudio, const QString& name = {},
+                  QString* why = nullptr);
+    std::vector<Id> syncDailies(const std::vector<Id>& media, bool keepCameraAudio, QStringList* report = nullptr);
 
 public slots:
     void importDialog();
+    void mergeClipsDialog(Id video, const std::vector<Id>& sounds);
     void rebuild();
 
 signals:

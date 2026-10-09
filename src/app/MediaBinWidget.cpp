@@ -2,6 +2,10 @@
 #include "Settings.h"
 
 #include <QApplication>
+#include <QFormLayout>
+#include <QDialogButtonBox>
+#include <QDialog>
+#include <QCheckBox>
 #include <QComboBox>
 #include <QCompleter>
 #include <QCryptographicHash>
@@ -40,6 +44,7 @@
 #include <memory>
 
 #include "EditorState.h"
+#include "media/DualSystem.h"
 #include "MediaBinModel.h"
 #include "ModelPacks.h"
 #include "ShotSearchPanel.h"
@@ -696,6 +701,76 @@ void MediaBinWidget::addKeywordsDialog(const std::vector<Id>& ids) {
     addKeywords(ids, parseKeywords(dlg.textValue().toStdString()));
 }
 
+Id MediaBinWidget::mergeClips(Id video, const std::vector<Id>& sounds, int syncBy, bool keepCameraAudio, const QString& name, QString* why) {
+    const Project& proj = state_->project();
+    std::vector<double> offsets;
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    for (Id a : sounds) {
+        SoundSync found;
+        if (syncBy == 3) found.found = true;  // the starts together
+        else found = syncSound(proj, video, a, syncBy == 1 ? SyncBy::Timecode : syncBy == 2 ? SyncBy::Waveform : SyncBy::Auto);
+        if (!found.found) {
+            QApplication::restoreOverrideCursor();
+            const MediaItem* m = proj.findMedia(a);
+            if (why)
+                *why = syncBy == 1 ? tr("%1 and the picture have no timecode in common").arg(m ? QString::fromStdString(m->name) : QString())
+                                   : tr("Could not line up %1 with the picture by its sound").arg(m ? QString::fromStdString(m->name) : QString());
+            return 0;
+        }
+        offsets.push_back(found.offset);
+    }
+    QApplication::restoreOverrideCursor();
+    Id made = 0;
+    std::string err;
+    MergeOptions o;
+    o.name = name.trimmed().toStdString();
+    o.keepCameraAudio = keepCameraAudio;
+    state_->edit(tr("Merge Clips"), [&](Project& p, Sequence&) { return (made = montage::mergeClips(p, video, sounds, offsets, o, &err)) != 0; });
+    if (!made && why) *why = QString::fromStdString(err);
+    return made;
+}
+
+std::vector<Id> MediaBinWidget::syncDailies(const std::vector<Id>& media, bool keepCameraAudio, QStringList* report) {
+    std::vector<std::string> lines;
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    const std::vector<DailiesMatch> matches = matchDailies(state_->project(), media, &lines);
+    QApplication::restoreOverrideCursor();
+    std::vector<Id> made;
+    if (!matches.empty())
+        state_->edit(tr("Sync Dailies"), [&](Project& p, Sequence&) {
+            made = mergeDailies(p, matches, keepCameraAudio, &lines);
+            return !made.empty();
+        });
+    if (report)
+        for (const std::string& l : lines) *report << QString::fromStdString(l);
+    return made;
+}
+
+void MediaBinWidget::mergeClipsDialog(Id video, const std::vector<Id>& sounds) {
+    const MediaItem* v = state_->project().findMedia(video);
+    if (!v) return;
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Merge Clips"));
+    auto* form = new QFormLayout(&dlg);
+    auto* name = new QLineEdit(QString::fromStdString(v->name) + tr(" (merged)"), &dlg);
+    form->addRow(tr("Name:"), name);
+    auto* by = new QComboBox(&dlg);
+    by->addItems({tr("Timecode, or else sound"), tr("Timecode"), tr("Sound (waveform)"), tr("Their starts")});
+    by->setToolTip(tr("How to line up the recorder's sound with the picture"));
+    form->addRow(tr("Synchronise by:"), by);
+    auto* keep = new QCheckBox(tr("Keep the camera's sound (muted)"), &dlg);
+    keep->setChecked(true);
+    form->addRow(QString(), keep);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    form->addRow(buttons);
+    if (dlg.exec() != QDialog::Accepted) return;
+    QString why;
+    if (!mergeClips(video, sounds, by->currentIndex(), keep->isChecked(), name->text(), &why))
+        state_->message(tr("Could not merge the clips: %1").arg(why), 8000);
+}
+
 bool MediaBinWidget::replaceFootage(Id id, const QString& path, QString* why) {
     std::string reason;
     const bool ok = state_->edit(tr("Replace Footage"), [&](Project& p, Sequence&) {
@@ -875,6 +950,26 @@ void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos)
     }
     if (std::any_of(ids.begin(), ids.end(), [this](Id i) { return state_->isMediaOffline(i); }))
         menu.addAction(tr("Link Media..."), this, [this] { emit linkMediaRequested(); });
+    {
+        // Dual-system sound: camera clips with a recorder's files.
+        std::vector<Id> pictures, sounds;
+        for (Id id : ids)
+            if (const MediaItem* m = state_->project().findMedia(id)) {
+                if (m->kind == MediaKind::Video && m->hasVideo) pictures.push_back(id);
+                else if (m->kind == MediaKind::Audio && m->hasAudio) sounds.push_back(id);
+            }
+        if (pictures.size() == 1 && !sounds.empty())
+            menu.addAction(tr("Merge Clips…"), this, [this, pictures, sounds] { mergeClipsDialog(pictures.front(), sounds); })
+                ->setObjectName(QStringLiteral("mergeClips"));
+        if (!pictures.empty() && !sounds.empty())
+            menu.addAction(tr("Sync Dailies"), this, [this, ids] {
+                QStringList report;
+                const auto made = syncDailies(ids, true, &report);
+                state_->message(made.empty() ? tr("No picture could be matched with a sound file")
+                                             : tr("Merged %n clip(s): %1", "", int(made.size())).arg(report.join(QStringLiteral("; "))),
+                                8000);
+            })->setObjectName(QStringLiteral("syncDailies"));
+    }
     if (!ids.empty()) {
         // Logging.
         menu.addSeparator();

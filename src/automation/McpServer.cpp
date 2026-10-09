@@ -38,6 +38,7 @@
 #include "core/ScriptCut.h"
 #include "core/Surround.h"
 #include "core/TranscriptEdit.h"
+#include "media/DualSystem.h"
 #include "media/Relink.h"
 #include "media/SpeechEnhance.h"
 #include "media/SuperScale.h"
@@ -518,6 +519,100 @@ void McpServer::Impl::addTools() {
             save(l);
             const QJsonObject o = projectJson(l.project);
             return ok(QStringLiteral("Created %1 (%2)").arg(l.path, tc(s.duration(), s)), o);
+        });
+
+    add("montage_merge_clips", "Merge picture and separate sound",
+        "Dual-system sound (Premiere's Merge Clips, Resolve's Auto Sync Audio): join a camera clip's picture with a "
+        "field recorder's sound files into one merged clip in the bin, lined up by `sync`: auto (timecode when both are "
+        "stamped and overlap, else by matching the camera's own sound), timecode, waveform or starts (both start "
+        "together). The recorder's sound is trimmed to the picture; the camera's sound is kept, muted, unless "
+        "keep_camera_audio is false. A recorder's BWF/iXML timecode, scene, take and channel names are read on import. "
+        "Files are paths (imported if new) or names in the project. place appends the merged clip to the sequence.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"video":{"type":"string"},
+            "sounds":{"type":"array","items":{"type":"string"}},
+            "sync":{"type":"string","enum":["auto","timecode","waveform","starts"],"default":"auto"},
+            "keep_camera_audio":{"type":"boolean","default":true},"name":{"type":"string"},"place":{"type":"boolean","default":false}},
+            "required":["project","video","sounds"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            auto ref = [&](const QString& r) {
+                const std::string name = r.toStdString();
+                for (const MediaItem& m : l.project.media)
+                    if (m.name == name) return m.id;
+                return mediaFor(l.project, r);
+            };
+            const Id video = ref(need(a, "video"));
+            std::vector<Id> sounds;
+            for (const QJsonValue& v : a.value("sounds").toArray()) sounds.push_back(ref(v.toString()));
+            if (sounds.empty()) throw ArgError{"\"sounds\" lists the recorder's files"};
+            const QString by = a.value("sync").toString("auto");
+            if (by != "auto" && by != "timecode" && by != "waveform" && by != "starts") throw ArgError{"sync is auto, timecode, waveform or starts"};
+            std::vector<double> offsets;
+            QJsonArray how;
+            for (Id s : sounds) {
+                SoundSync found;
+                if (by == "starts") found.found = true;
+                else found = syncSound(l.project, video, s, by == "timecode" ? SyncBy::Timecode : by == "waveform" ? SyncBy::Waveform : SyncBy::Auto);
+                if (!found.found)
+                    return fail(QStringLiteral("Could not line up %1 with the picture by %2")
+                                    .arg(QString::fromStdString(l.project.findMedia(s)->name), by == "timecode" ? "timecode" : "timecode or sound"));
+                offsets.push_back(found.offset);
+                how.append(QJsonObject{{"sound", QString::fromStdString(l.project.findMedia(s)->name)},
+                                       {"offset", std::round(found.offset * 1000) / 1000},
+                                       {"by", by == "starts" ? "starts" : found.byTimecode ? "timecode" : "waveform"}});
+            }
+            MergeOptions o;
+            o.name = a.value("name").toString().toStdString();
+            o.keepCameraAudio = a.value("keep_camera_audio").toBool(true);
+            std::string err;
+            const Id made = mergeClips(l.project, video, sounds, offsets, o, &err);
+            if (!made) return fail(QString::fromStdString(err));
+            if (a.value("place").toBool()) {
+                Sequence& s = l.seq();
+                check(edit::placeMedia(l.project, s, made, s.duration(), 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false));
+            }
+            save(l);
+            QJsonObject o2 = mediaJson(*l.project.findMedia(made));
+            o2["synced"] = how;
+            return ok(QStringLiteral("Merged \"%1\"").arg(QString::fromStdString(l.project.findMedia(made)->name)), o2);
+        });
+
+    add("montage_sync_dailies", "Sync dailies",
+        "Merge every camera clip with the field recorder file that belongs to it, in one go (Resolve's Auto Sync Audio "
+        "on a bin): pairs found by timecode overlap, else by matching each camera's own sound against the sound files. "
+        "`media` limits it to those items (paths or names; default: every video and sound file in the project). The "
+        "camera's sound is kept, muted, unless keep_camera_audio is false. place appends the merged clips to the sequence "
+        "in order (a synced dailies reel).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"media":{"type":"array","items":{"type":"string"}},
+            "keep_camera_audio":{"type":"boolean","default":true},"place":{"type":"boolean","default":false}},
+            "required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            std::vector<Id> media;
+            if (a.contains("media")) {
+                for (const QJsonValue& v : a.value("media").toArray()) {
+                    const std::string name = v.toString().toStdString();
+                    Id id = 0;
+                    for (const MediaItem& m : l.project.media)
+                        if (m.name == name) id = m.id;
+                    media.push_back(id ? id : mediaFor(l.project, v.toString()));
+                }
+            } else {
+                for (const MediaItem& m : l.project.media) media.push_back(m.id);
+            }
+            std::vector<std::string> report;
+            const std::vector<Id> made = syncDailies(l.project, media, a.value("keep_camera_audio").toBool(true), &report);
+            QStringList lines;
+            for (const std::string& r : report) lines << QString::fromStdString(r);
+            if (made.empty()) return fail(QStringLiteral("No camera clip could be matched with a sound file") + (lines.isEmpty() ? "" : ":\n" + lines.join('\n')));
+            if (a.value("place").toBool()) {
+                Sequence& s = l.seq();
+                for (Id id : made) check(edit::placeMedia(l.project, s, id, s.duration(), 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false));
+            }
+            save(l);
+            QJsonArray items;
+            for (Id id : made) items.append(mediaJson(*l.project.findMedia(id)));
+            return ok(QStringLiteral("Merged %1 clips:\n%2").arg(made.size()).arg(lines.join('\n')), QJsonObject{{"merged", items}});
         });
 
     add("montage_project_info", "Project info",

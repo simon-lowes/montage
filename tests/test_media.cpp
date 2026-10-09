@@ -38,6 +38,9 @@
 #include "core/TranscriptEdit.h"
 #include "audio/SpeechCleanup.h"
 #include "audio/TimeStretch.h"
+#include "core/MergeClips.h"
+#include "media/DualSystem.h"
+#include "media/FieldRecorder.h"
 #include "media/Analysis.h"
 #include "media/AudioSync.h"
 #include "media/AutoDuck.h"
@@ -130,6 +133,34 @@ void writeWav(const std::string& path, int rate, double seconds, float left, flo
         std::fwrite(&l, 2, 1, f);
         std::fwrite(&r, 2, 1, f);
     }
+    std::fclose(f);
+}
+
+// A field recorder's 16-bit stereo WAV: a bext chunk (time reference and a
+// description with sSCENE lines) before the sound, an iXML chunk after it.
+void writeBwf(const std::string& path, const AudioBuffer& sound, uint64_t timeReference, const std::string& description,
+              const std::string& ixml) {
+    std::string bext(602, '\0');
+    bext.replace(0, std::min<size_t>(description.size(), 256), description.substr(0, 256));
+    for (int i = 0; i < 8; ++i) bext[338 + size_t(i)] = char((timeReference >> (8 * i)) & 0xff);
+    std::string x = ixml;
+    if (x.size() % 2) x += ' ';
+    const int rate = sound.sampleRate;
+    std::string data;
+    for (float v : sound.samples) {
+        const int16_t q = int16_t(std::lround(std::clamp(v, -1.0f, 1.0f) * 32767));
+        data.append(reinterpret_cast<const char*>(&q), 2);
+    }
+    auto u32 = [](uint32_t v) { return std::string(reinterpret_cast<const char*>(&v), 4); };
+    auto u16 = [](uint16_t v) { return std::string(reinterpret_cast<const char*>(&v), 2); };
+    const std::string fmt = u16(1) + u16(2) + u32(uint32_t(rate)) + u32(uint32_t(rate) * 4) + u16(4) + u16(16);
+    const std::string chunks = "fmt " + u32(16) + fmt + "bext" + u32(uint32_t(bext.size())) + bext + "data" + u32(uint32_t(data.size())) +
+                               data + "iXML" + u32(uint32_t(x.size())) + x;
+    FILE* f = std::fopen(path.c_str(), "wb");
+    QVERIFY(f);
+    const std::string head = "RIFF" + u32(uint32_t(4 + chunks.size())) + "WAVE";
+    std::fwrite(head.data(), 1, head.size(), f);
+    std::fwrite(chunks.data(), 1, chunks.size(), f);
     std::fclose(f);
 }
 
@@ -1343,6 +1374,123 @@ private slots:
             QVERIFY(loadProject(project.toStdString(), back));
             QVERIFY(back.active()->audioTracks[0].clips.front().timing.p("maintain_pitch", 1) < 0.5);
         }
+    }
+
+    void dualSystemSound() {
+        // The field recorder: JFK's speech, stamped two seconds before 10:00:00, logged in iXML (after the sound).
+        std::string err;
+        AudioBufferPtr speech = decodeAudio(MONTAGE_TEST_DATA_DIR "/jfk.wav", 48000, &err);
+        QVERIFY2(speech, err.c_str());
+        const std::string rec = path("T03.wav");
+        const std::string ixml =
+            "<?xml version=\"1.0\"?><BWFXML><PROJECT>Inauguration</PROJECT><SCENE>12A</SCENE><TAKE>3</TAKE><TAPE>D001</TAPE>"
+            "<CIRCLED>TRUE</CIRCLED><NOTE>wind on take 2</NOTE><SPEED><TIMECODE_RATE>25/1</TIMECODE_RATE><TIMECODE_FLAG>NDF</TIMECODE_FLAG>"
+            "</SPEED><TRACK_LIST><TRACK_COUNT>2</TRACK_COUNT><TRACK><CHANNEL_INDEX>1</CHANNEL_INDEX><NAME>Boom</NAME></TRACK>"
+            "<TRACK><CHANNEL_INDEX>2</CHANNEL_INDEX><NAME>Lav</NAME></TRACK></TRACK_LIST></BWFXML>";
+        writeBwf(rec, *speech, uint64_t(35998) * 48000, "sSCENE=99\r\nsTAKE=1\r\n", ixml);
+        FieldRecording f;
+        QVERIFY(readFieldRecording(rec, f));
+        QCOMPARE(f.startSeconds, 35998.0);
+        QCOMPARE(f.scene, std::string("12A"));  // iXML over bext
+        QCOMPARE(f.trackNames, (std::vector<std::string>{"Boom", "Lav"}));
+        QVERIFY(f.circled);
+        QVERIFY(!readFieldRecording(MONTAGE_TEST_DATA_DIR "/jfk.wav", f));  // a plain WAV
+        // Read on import.
+        Project p = makeDefaultProject();
+        MediaItem sound = probeOrFail(p, rec);
+        QCOMPARE(sound.timecode, 35998.0);
+        QCOMPARE(sound.metadata["scene"], std::string("12A"));
+        QCOMPARE(sound.metadata["take"], std::string("3"));
+        QCOMPARE(sound.metadata["tape"], std::string("D001"));
+        QCOMPARE(sound.metadata["comment"], std::string("wind on take 2"));
+        QCOMPARE(sound.metadata["tracks"], std::string("Boom, Lav"));
+        QCOMPARE(sound.metadata["circled"], std::string("Yes"));
+        QCOMPARE(sound.metadata["timecode_rate"], std::string("25/1"));
+        QVERIFY(sound.duration > 10);
+        // The camera: six seconds of picture whose own sound is the speech from two seconds in.
+        {
+            Project cam = makeDefaultProject();
+            Sequence& s = *cam.active();
+            s.width = 320;
+            s.height = 180;
+            s.fps = Rational{25, 1};
+            Clip picture = makeGeneratorClip(cam, "color", 150);
+            edit::overwrite(cam, s, {TrackKind::Video, 0}, picture);
+            MediaItem src = probeOrFail(cam, MONTAGE_TEST_DATA_DIR "/jfk.wav");
+            cam.media.push_back(src);
+            Clip scratch = makeClip(cam, src, TrackKind::Audio, s);
+            scratch.sourceIn = 50;  // two seconds in
+            scratch.duration = 150;
+            edit::overwrite(cam, s, {TrackKind::Audio, 0}, scratch);
+            ExportSettings st;
+            st.path = path("A001.mp4");
+            QVERIFY2(exportSequence(cam, s, st, nullptr, nullptr, &err), err.c_str());
+        }
+        MediaItem camera = probeOrFail(p, path("A001.mp4"));
+        camera.timecode = 36000;  // 10:00:00:00
+        p.media.push_back(camera);
+        p.media.push_back(sound);
+        // By timecode and by the sound: both two seconds early.
+        SoundSync byTc = syncSound(p, camera.id, sound.id, SyncBy::Timecode);
+        QVERIFY(byTc.found && byTc.byTimecode);
+        QVERIFY(std::fabs(byTc.offset + 2) < 1e-6);
+        SoundSync byWave = syncSound(p, camera.id, sound.id, SyncBy::Waveform);
+        QVERIFY2(byWave.found && !byWave.byTimecode && std::fabs(byWave.offset + 2) < 0.03,
+                 qPrintable(QString("%1 (%2)").arg(byWave.offset).arg(byWave.confidence)));
+        // Merged by the sound: at a second in, the merged clip plays what the recorder had three seconds in.
+        std::string why;
+        const Id merged = mergeClips(p, camera.id, {sound.id}, {byWave.offset}, {}, &why);
+        QVERIFY2(merged, why.c_str());
+        Sequence& s = *p.active();
+        s.width = 320;
+        s.height = 180;
+        s.fps = Rational{25, 1};
+        QVERIFY(edit::placeMedia(p, s, merged, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        AudioMixer mixer;
+        std::vector<float> out(24000 * 2);
+        mixer.mix(p, s, 48000, 24000, out.data());
+        double dot = 0, a2 = 0, b2 = 0;
+        for (size_t i = 0; i < 24000; ++i) {
+            const double x = out[i * 2], y = speech->samples[(size_t(3 * 48000) + i) * 2];
+            dot += x * y, a2 += x * x, b2 += y * y;
+        }
+        const double corr = dot / std::sqrt(a2 * b2 + 1e-12);
+        QVERIFY2(corr > 0.95, qPrintable(QString::number(corr)));  // the recorder's sound, lined up (the camera's is muted)
+        // Sync Dailies over the bin: paired by timecode.
+        std::vector<std::string> report;
+        const auto made = syncDailies(p, {camera.id, sound.id}, false, &report);
+        QCOMPARE(made.size(), size_t(1));
+        QVERIFY2(!report.empty() && report.back().find("timecode") != std::string::npos, report.empty() ? "" : report.back().c_str());
+        // Over MCP: merged by waveform and placed; then dailies for the whole project.
+        Project q = makeDefaultProject();
+        const QString project = QString::fromStdString(path("dailies.montage"));
+        QVERIFY(saveProject(q, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call("montage_merge_clips", {{"project", project}, {"video", QString::fromStdString(path("A001.mp4"))},
+                                                     {"sounds", QJsonArray{QString::fromStdString(rec)}}, {"sync", "waveform"}, {"place", true}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject synced = r.value("structuredContent").toObject().value("synced").toArray().at(0).toObject();
+        QVERIFY(std::fabs(synced.value("offset").toDouble() + 2) < 0.03 && synced.value("by").toString() == "waveform");
+        {
+            Project back;
+            QVERIFY(loadProject(project.toStdString(), back));
+            QCOMPARE(back.active()->videoTracks[0].clips.size(), size_t(1));
+            QVERIFY(isMergedClip(back, back.active()->videoTracks[0].clips[0].mediaId));
+        }
+        r = call("montage_merge_clips", {{"project", project}, {"video", QString::fromStdString(path("A001.mp4"))},
+                                         {"sounds", QJsonArray{QString::fromStdString(rec)}}, {"sync", "timecode"}});
+        QVERIFY(r.value("isError").toBool());  // the camera file carries no timecode
+        r = call("montage_sync_dailies", {{"project", project}, {"place", true}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("merged").toArray().size(), 1);
     }
 
     void liveLoudness() {

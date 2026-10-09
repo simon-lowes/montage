@@ -277,6 +277,7 @@ const std::vector<MediaField>& mediaFields() {
         {"scene", "Scene", T::Text, true, true, true},
         {"shot", "Shot", T::Text, true, true, true},
         {"take", "Take", T::Text, true, true, true},
+        {"tape", "Tape / Roll", T::Text, true, true, true},
         {"camera", "Camera", T::Text, true, true, true},
         {"device", "Camera Model", T::Text, true, true, true},
         {"description", "Description", T::Text, true, true, true},
@@ -291,6 +292,7 @@ const std::vector<MediaField>& mediaFields() {
         {"audio", "Audio", T::Text, false, true, false},
         {"audioCodec", "Audio Codec", T::Text, false, false, true},
         {"channels", "Audio Channels", T::Number, false, false, true},
+        {"tracks", "Channel Names", T::Text, false, true, true},
         {"colour", "Colour Space", T::Text, false, true, true},
         {"transcript", "Transcript", T::Text, false, true, true},
         {"people", "People", T::Keywords, false, false, true},
@@ -308,7 +310,7 @@ const MediaField* mediaField(const std::string& key) {
 }
 
 const std::vector<std::string>& metadataKeys() {
-    static const std::vector<std::string> keys{"scene", "shot", "take", "camera", "device", "description", "comment"};
+    static const std::vector<std::string> keys{"scene", "shot", "take", "tape", "camera", "device", "description", "comment", "tracks"};
     return keys;
 }
 

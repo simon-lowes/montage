@@ -2,6 +2,8 @@
 #include "CameraRaw.h"
 #include "Decoder.h"
 
+#include "FieldRecorder.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -227,6 +229,11 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
     } else {
         m.kind = MediaKind::Audio;
         m.duration = dur;
+    }
+    // A field recorder's WAV: its timecode stamp, scene, take, notes and channel names.
+    if (fmt->iformat && std::strstr(fmt->iformat->name, "wav")) {
+        FieldRecording rec;
+        if (readFieldRecording(path, rec)) applyFieldRecording(rec, m);
     }
     avformat_close_input(&fmt);
     out = m;
