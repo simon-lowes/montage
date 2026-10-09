@@ -55,6 +55,7 @@
 #include "SmartBinDialog.h"
 #include "ScriptCutDialog.h"
 #include "core/KeyframeEdit.h"
+#include "core/CaptionTools.h"
 #include "core/MaskPath.h"
 #include "core/MediaLog.h"
 #include "InspectorWidget.h"
@@ -2946,6 +2947,69 @@ private slots:
             }
             panel->setCurrentTrack(track);
         }
+        state()->newProject();
+    }
+
+    void captionsPanelChecksAndTools() {
+        auto* panel = win_->findChild<CaptionsPanel*>();
+        QVERIFY(panel);
+        state()->newProject();
+        Id track = 0;
+        QVERIFY(state()->edit("Captions", [&](Project& p, Sequence& s) {
+            CaptionTrack t;
+            t.id = track = p.newId();
+            const FrameTime sec = FrameTime(std::llround(s.fpsValue()));
+            t.captions = {{0, 2 * sec, "Fine", {}},
+                          {2 * sec + 1, 2 * sec + 6, "Far too many words for this little time on the screen", {}},
+                          {5 * sec, 6 * sec, "Teh end", {}}};
+            s.captionTracks.push_back(t);
+            return true;
+        }));
+        panel->setCurrentTrack(track);
+        const CaptionLimits saved = panel->limits();
+        panel->setLimits(CaptionLimits{});
+        auto caps = [&] { return state()->sequence()->captionTracks.front().captions; };
+        // The second caption is flagged, with why in its tooltip, and the first runs into it.
+        auto* table = panel->findChild<QTableWidget*>();
+        QVERIFY(table && table->columnCount() == 4);
+        const std::vector<unsigned> issues = panel->issues();
+        QVERIFY(issues[0] == kCaptionGapTooSmall && (issues[1] & kCaptionTooFast) && (issues[1] & kCaptionLineTooLong) && issues[2] == 0);
+        QVERIFY(table->item(1, 3)->text() == QString(QChar(0x26A0)));
+        QVERIFY2(table->item(1, 3)->toolTip().contains("characters a second"), qPrintable(table->item(1, 3)->toolTip()));
+        QVERIFY(table->item(2, 3)->text().isEmpty());
+        auto* summary = panel->findChild<QLabel*>("captionCheckSummary");
+        QVERIFY(summary && summary->text().startsWith("2 of 3 captions"));
+        // Fix Timing from the menu: one undo step.
+        QAction* fix = panel->findChild<QAction*>("fixCaptionTiming");
+        QVERIFY(fix);
+        fix->trigger();
+        QCOMPARE(caps()[0].end, caps()[1].start - 2);
+        QVERIFY(caps()[1].end > caps()[1].start + 5);
+        QVERIFY(!(panel->issues()[1] & kCaptionTooFast));
+        state()->undo();
+        QCOMPARE(caps()[0].end, caps()[1].start - 1);
+        // Shift only the selected caption; then all of them.
+        table->clearSelection();
+        table->selectRow(2);
+        QCOMPARE(panel->selectedCaptions(), std::vector<size_t>{2});
+        const FrameTime third = caps()[2].start;
+        QVERIFY(panel->shiftCaptions(12));
+        QCOMPARE(caps()[2].start, third + 12);
+        QCOMPARE(caps()[0].start, FrameTime(0));
+        table->clearSelection();
+        QVERIFY(panel->shiftCaptions(10));
+        QCOMPARE(caps()[0].start, FrameTime(10));
+        // Find and replace a typo across the track.
+        QCOMPARE(panel->findReplace("teh", "The", false, true), 1);
+        QCOMPARE(caps()[2].text, std::string("The end"));
+        // Sync: the first caption to 0 and the last to twice its time.
+        const FrameTime lastStart = caps()[2].start;
+        QVERIFY(panel->syncToTwoPoints(0, 2 * (lastStart - 10)));
+        QCOMPARE(caps()[0].start, FrameTime(0));
+        QCOMPARE(caps()[2].start, 2 * (lastStart - 10));
+        state()->undo();
+        QCOMPARE(caps()[0].start, FrameTime(10));
+        panel->setLimits(saved);
         state()->newProject();
     }
 

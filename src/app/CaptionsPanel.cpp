@@ -81,6 +81,16 @@ CaptionsPanel::CaptionsPanel(EditorState* state, QWidget* parent) : QWidget(pare
     menu->addAction(tr("Dub into English..."), this, &CaptionsPanel::dubDialog)->setObjectName(QStringLiteral("dubCaptions"));
     menu->addSeparator();
     menu->addAction(tr("Style..."), this, &CaptionsPanel::styleDialog);
+    menu->addSeparator();
+    menu->addAction(tr("Fix Timing"), this, [this] {
+        const int n = fixTiming();
+        state_->message(n ? tr("Retimed %1 captions").arg(n) : tr("No caption needed retiming"), 3000);
+    })->setObjectName(QStringLiteral("fixCaptionTiming"));
+    menu->addAction(tr("Shift Captions..."), this, &CaptionsPanel::shiftDialog)->setObjectName(QStringLiteral("shiftCaptions"));
+    menu->addAction(tr("Sync to Two Points..."), this, &CaptionsPanel::syncDialog)->setObjectName(QStringLiteral("syncCaptions"));
+    menu->addAction(tr("Find and Replace..."), this, &CaptionsPanel::findReplaceDialog)->setObjectName(QStringLiteral("replaceCaptions"));
+    menu->addAction(tr("Reading Limits..."), this, &CaptionsPanel::limitsDialog)->setObjectName(QStringLiteral("captionLimits"));
+    menu->addSeparator();
     menu->addAction(tr("Rename Track..."), this, [this] {
         const CaptionTrack* t = track();
         if (!t) return;
@@ -121,16 +131,21 @@ CaptionsPanel::CaptionsPanel(EditorState* state, QWidget* parent) : QWidget(pare
     lay->addLayout(top);
 
     table_ = new QTableWidget(this);
-    table_->setColumnCount(3);
-    table_->setHorizontalHeaderLabels({tr("In"), tr("Out"), tr("Text")});
-    table_->horizontalHeader()->setStretchLastSection(true);
+    table_->setColumnCount(4);
+    table_->setHorizontalHeaderLabels({tr("In"), tr("Out"), tr("Text"), QString()});
     table_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
     table_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    table_->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
+    table_->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
+    table_->horizontalHeaderItem(3)->setToolTip(tr("Captions that break the reading limits (More › Reading Limits)"));
     table_->verticalHeader()->hide();
     table_->setSelectionBehavior(QAbstractItemView::SelectRows);
     table_->setEditTriggers(QAbstractItemView::DoubleClicked | QAbstractItemView::EditKeyPressed);
     table_->setWordWrap(true);
     lay->addWidget(table_, 1);
+    summary_ = new QLabel(this);
+    summary_->setObjectName(QStringLiteral("captionCheckSummary"));
+    lay->addWidget(summary_);
 
     auto* bottom = new QHBoxLayout;
     auto* add = button(this, tr("Add"), tr("Add a caption at the playhead"));
@@ -209,6 +224,12 @@ void CaptionsPanel::rebuild() {
     visible_->setChecked(t && t->visible);
     const int keepRow = table_->currentRow();
     table_->setRowCount(0);
+    const CaptionLimits lim = limits();
+    const std::vector<unsigned> problems = t && s ? checkCaptions(t->captions, s->fps, lim) : std::vector<unsigned>();
+    const int flagged = int(std::count_if(problems.begin(), problems.end(), [](unsigned v) { return v != 0; }));
+    summary_->setText(!t || t->captions.empty() ? QString()
+                      : flagged            ? tr("%1 of %2 captions break the reading limits").arg(flagged).arg(t->captions.size())
+                                           : tr("All %1 captions are within the reading limits").arg(t->captions.size()));
     if (t && s) {
         table_->setRowCount(int(t->captions.size()));
         for (size_t i = 0; i < t->captions.size(); ++i) {
@@ -216,10 +237,18 @@ void CaptionsPanel::rebuild() {
             auto* in = new QTableWidgetItem(QString::fromStdString(formatTimecode(c.start, s->fps)));
             auto* out = new QTableWidgetItem(QString::fromStdString(formatTimecode(c.end, s->fps)));
             auto* text = new QTableWidgetItem(QString::fromStdString(c.text));
-            for (auto* item : {in, out, text}) item->setData(kIndexRole, int(i));
+            // What it breaks, if anything: a warning sign with the details as its tooltip.
+            auto* check = new QTableWidgetItem(problems[i] ? QStringLiteral("\u26A0") : QString());
+            check->setFlags(check->flags() & ~Qt::ItemIsEditable);
+            if (problems[i]) {
+                check->setToolTip(QString::fromStdString(describeCaptionIssues(problems[i], c, s->fps, lim)));
+                check->setForeground(QColor(230, 160, 40));
+            }
+            for (auto* item : {in, out, text, check}) item->setData(kIndexRole, int(i));
             table_->setItem(int(i), 0, in);
             table_->setItem(int(i), 1, out);
             table_->setItem(int(i), 2, text);
+            table_->setItem(int(i), 3, check);
         }
         table_->resizeRowsToContents();
         if (keepRow >= 0 && keepRow < table_->rowCount()) table_->setCurrentCell(keepRow, 2);
@@ -258,6 +287,7 @@ void CaptionsPanel::itemChanged(QTableWidgetItem* item) {
     const Sequence* s = state_->sequence();
     if (!s) return;
     const QString value = item->text();
+    if (item->column() == 3) return;
     if (item->column() == 2) {
         editTrack(tr("Edit Caption"), [i, value](CaptionTrack& t) {
             if (size_t(i) >= t.captions.size()) return false;
@@ -818,6 +848,225 @@ void CaptionsPanel::splitAtPlayhead() {
         t.captions.insert(t.captions.begin() + long(i) + 1, second);
         return true;
     });
+}
+
+// ---- Subtitle tools ---------------------------------------------------------------
+
+CaptionLimits CaptionsPanel::limits() const {
+    QSettings st = appSettings();
+    CaptionLimits l;
+    l.maxCps = st.value("captions/maxCps", l.maxCps).toDouble();
+    l.maxLineChars = st.value("captions/maxLineChars", l.maxLineChars).toInt();
+    l.maxLines = st.value("captions/maxLines", l.maxLines).toInt();
+    l.minSeconds = st.value("captions/minSeconds", l.minSeconds).toDouble();
+    l.maxSeconds = st.value("captions/maxSeconds", l.maxSeconds).toDouble();
+    l.minGapFrames = st.value("captions/minGapFrames", l.minGapFrames).toInt();
+    return l;
+}
+
+void CaptionsPanel::setLimits(const CaptionLimits& l) {
+    QSettings st = appSettings();
+    st.setValue("captions/maxCps", l.maxCps);
+    st.setValue("captions/maxLineChars", l.maxLineChars);
+    st.setValue("captions/maxLines", l.maxLines);
+    st.setValue("captions/minSeconds", l.minSeconds);
+    st.setValue("captions/maxSeconds", l.maxSeconds);
+    st.setValue("captions/minGapFrames", l.minGapFrames);
+    rebuild();
+}
+
+std::vector<unsigned> CaptionsPanel::issues() const {
+    const CaptionTrack* t = track();
+    const Sequence* s = state_->sequence();
+    return t && s ? checkCaptions(t->captions, s->fps, limits()) : std::vector<unsigned>();
+}
+
+std::vector<size_t> CaptionsPanel::selectedCaptions() const {
+    std::vector<size_t> rows;
+    for (const QModelIndex& i : table_->selectionModel()->selectedRows()) rows.push_back(size_t(i.row()));
+    std::sort(rows.begin(), rows.end());
+    return rows;
+}
+
+int CaptionsPanel::fixTiming() {
+    const Sequence* s = state_->sequence();
+    if (!s) return 0;
+    const Rational fps = s->fps;
+    const CaptionLimits l = limits();
+    int changed = 0;
+    editTrack(tr("Fix Caption Timing"), [&](CaptionTrack& t) { return (changed = fixCaptionTiming(t.captions, fps, l)) > 0; });
+    return changed;
+}
+
+bool CaptionsPanel::shiftCaptions(FrameTime delta) {
+    const std::vector<size_t> rows = selectedCaptions();
+    return editTrack(tr("Shift Captions"), [&](CaptionTrack& t) { return montage::shiftCaptions(t.captions, rows, delta); });
+}
+
+bool CaptionsPanel::syncToTwoPoints(FrameTime first, FrameTime last) {
+    const CaptionTrack* t = track();
+    if (!t || t->captions.size() < 2) return false;
+    std::vector<size_t> rows = selectedCaptions();
+    if (rows.size() < 2) rows = {0, t->captions.size() - 1};
+    const FrameTime fromA = t->captions[rows.front()].start, fromB = t->captions[rows.back()].start;
+    return editTrack(tr("Sync Captions"), [&](CaptionTrack& ct) { return syncCaptions(ct.captions, fromA, first, fromB, last); });
+}
+
+int CaptionsPanel::findReplace(const QString& find, const QString& replace, bool caseSensitive, bool wholeWords) {
+    const std::vector<size_t> rows = selectedCaptions();
+    int n = 0;
+    editTrack(tr("Replace in Captions"), [&](CaptionTrack& t) {
+        return (n = replaceInCaptions(t.captions, rows, find.toStdString(), replace.toStdString(), caseSensitive, wholeWords)) > 0;
+    });
+    return n;
+}
+
+void CaptionsPanel::shiftDialog() {
+    const Sequence* s = state_->sequence();
+    if (!track() || !s) return;
+    bool ok = false;
+    const QString scope = selectedCaptions().empty() ? tr("all captions") : tr("the %1 selected captions").arg(selectedCaptions().size());
+    const QString text = QInputDialog::getText(this, tr("Shift Captions"),
+                                               tr("Move %1 by (seconds, or frames, negative for earlier):").arg(scope),
+                                               QLineEdit::Normal, QStringLiteral("0.5s"), &ok);
+    if (!ok || text.trimmed().isEmpty()) return;
+    FrameTime delta = 0;
+    if (!parseTimecode(text.trimmed().toStdString(), s->fps, delta)) {
+        // "-1.5s": parseTimecode takes seconds unsigned.
+        const QString t = text.trimmed();
+        bool okNum = false;
+        const double sec = (t.endsWith('s') ? t.chopped(1) : t).toDouble(&okNum);
+        if (!okNum) {
+            state_->message(tr("Not a time: %1").arg(text));
+            return;
+        }
+        delta = FrameTime(std::llround(sec * s->fpsValue()));
+    }
+    if (!shiftCaptions(delta)) state_->message(tr("Nothing to shift"), 3000);
+}
+
+void CaptionsPanel::syncDialog() {
+    const CaptionTrack* t = track();
+    const Sequence* s = state_->sequence();
+    if (!t || !s || t->captions.size() < 2) {
+        state_->message(tr("Syncing needs at least two captions"), 3000);
+        return;
+    }
+    std::vector<size_t> rows = selectedCaptions();
+    if (rows.size() < 2) rows = {0, t->captions.size() - 1};
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Sync to Two Points"));
+    auto* form = new QFormLayout(&dlg);
+    auto* help = new QLabel(tr("Say where two captions should start; the others are moved and stretched to match "
+                               "(subtitles timed for another cut or frame rate). Tip: put the playhead on the line and "
+                               "copy the timecode."), &dlg);
+    help->setWordWrap(true);
+    form->addRow(help);
+    const Caption& a = t->captions[rows.front()];
+    const Caption& b = t->captions[rows.back()];
+    auto* first = new QLineEdit(QString::fromStdString(formatTimecode(a.start, s->fps)), &dlg);
+    auto* last = new QLineEdit(QString::fromStdString(formatTimecode(b.start, s->fps)), &dlg);
+    auto clip = [](const std::string& text) { return QString::fromStdString(text).replace('\n', ' ').left(40); };
+    form->addRow(tr("\"%1\" starts at:").arg(clip(a.text)), first);
+    form->addRow(tr("\"%1\" starts at:").arg(clip(b.text)), last);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    form->addRow(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    if (dlg.exec() != QDialog::Accepted) return;
+    FrameTime fa = 0, fb = 0;
+    if (!parseTimecode(first->text().toStdString(), s->fps, fa) || !parseTimecode(last->text().toStdString(), s->fps, fb)) {
+        state_->message(tr("Give both times as timecodes"));
+        return;
+    }
+    syncToTwoPoints(fa, fb);
+}
+
+void CaptionsPanel::findReplaceDialog() {
+    if (!track()) return;
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Find and Replace in Captions"));
+    auto* form = new QFormLayout(&dlg);
+    auto* find = new QLineEdit(&dlg);
+    auto* with = new QLineEdit(&dlg);
+    auto* matchCase = new QCheckBox(tr("Match case"), &dlg);
+    auto* whole = new QCheckBox(tr("Whole words"), &dlg);
+    form->addRow(tr("Find:"), find);
+    form->addRow(tr("Replace with:"), with);
+    form->addRow(QString(), matchCase);
+    form->addRow(QString(), whole);
+    form->addRow(new QLabel(selectedCaptions().empty() ? tr("In every caption of the track.")
+                                                        : tr("In the %1 selected captions.").arg(selectedCaptions().size()),
+                            &dlg));
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    buttons->button(QDialogButtonBox::Ok)->setText(tr("Replace All"));
+    form->addRow(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    if (dlg.exec() != QDialog::Accepted || find->text().isEmpty()) return;
+    const int n = findReplace(find->text(), with->text(), matchCase->isChecked(), whole->isChecked());
+    state_->message(n ? tr("Replaced %1").arg(n) : tr("\"%1\" was not found").arg(find->text()), 3000);
+}
+
+void CaptionsPanel::limitsDialog() {
+    CaptionLimits l = limits();
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Reading Limits"));
+    auto* form = new QFormLayout(&dlg);
+    auto* preset = new QComboBox(&dlg);
+    preset->addItems({tr("Custom"), tr("Netflix (adults)"), tr("Netflix (children)"), tr("BBC")});
+    auto* cps = new QDoubleSpinBox(&dlg);
+    cps->setRange(5, 40);
+    cps->setDecimals(1);
+    auto* chars = new QSpinBox(&dlg);
+    chars->setRange(10, 80);
+    auto* lines = new QSpinBox(&dlg);
+    lines->setRange(1, 4);
+    auto* minDur = new QDoubleSpinBox(&dlg);
+    minDur->setRange(0.1, 5);
+    minDur->setDecimals(2);
+    minDur->setSuffix(tr(" s"));
+    auto* maxDur = new QDoubleSpinBox(&dlg);
+    maxDur->setRange(1, 30);
+    maxDur->setDecimals(1);
+    maxDur->setSuffix(tr(" s"));
+    auto* gap = new QSpinBox(&dlg);
+    gap->setRange(0, 25);
+    gap->setSuffix(tr(" frames"));
+    auto show = [&](const CaptionLimits& v) {
+        cps->setValue(v.maxCps);
+        chars->setValue(v.maxLineChars);
+        lines->setValue(v.maxLines);
+        minDur->setValue(v.minSeconds);
+        maxDur->setValue(v.maxSeconds);
+        gap->setValue(v.minGapFrames);
+    };
+    show(l);
+    connect(preset, &QComboBox::activated, &dlg, [&](int i) {
+        CaptionLimits v;  // Netflix adults by default
+        if (i == 2) v.maxCps = 17;
+        if (i == 3) v.maxCps = 15, v.maxLineChars = 37, v.minSeconds = 1.0, v.maxSeconds = 8.0;  // about 180 words a minute
+        if (i > 0) show(v);
+    });
+    form->addRow(tr("Preset:"), preset);
+    form->addRow(tr("Characters a second:"), cps);
+    form->addRow(tr("Characters a line:"), chars);
+    form->addRow(tr("Lines:"), lines);
+    form->addRow(tr("Shortest on screen:"), minDur);
+    form->addRow(tr("Longest on screen:"), maxDur);
+    form->addRow(tr("Gap between captions:"), gap);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    form->addRow(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    if (dlg.exec() != QDialog::Accepted) return;
+    l.maxCps = cps->value();
+    l.maxLineChars = chars->value();
+    l.maxLines = lines->value();
+    l.minSeconds = minDur->value();
+    l.maxSeconds = maxDur->value();
+    l.minGapFrames = gap->value();
+    setLimits(l);
 }
 
 }  // namespace montage

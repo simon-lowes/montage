@@ -7141,6 +7141,39 @@ private slots:
                 QCOMPARE(tracks[i].captions[k].end, ct.captions[k].end);
             }
         }
+        // Checking and fixing through montage_edit_captions.
+        auto edit = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 2}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_edit_captions"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        r = edit({{"project", project}, {"action", "check"}, {"max_cps", 5}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonArray flagged = r.value("structuredContent").toObject().value("issues").toArray();
+        QCOMPARE(flagged.size(), 2);  // "First caption" and "Second\ncaption" in two seconds each: 6.5 and 7 a second
+        QVERIFY(flagged[0].toObject().value("issues").toString().contains("characters a second"));
+        r = edit({{"project", project}, {"action", "shift"}, {"by", -0.5}, {"captions", QJsonArray{1}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        r = edit({{"project", project}, {"action", "replace"}, {"find", "caption"}, {"replace", "line"}, {"whole_words", true}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        r = edit({{"project", project}, {"action", "fix_timing"}, {"max_cps", 3}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        {
+            Project fixed;
+            QVERIFY(loadProject(project.toStdString(), fixed));
+            const auto& c = fixed.active()->captionTracks.front().captions;
+            const FrameTime half = FrameTime(std::llround(fixed.active()->fpsValue() / 2));
+            QCOMPARE(c[1].start, FrameTime(120) - half);
+            QCOMPARE(c[0].text, std::string("First line"));
+            QCOMPARE(c[1].text, std::string("Second\nline"));
+            QCOMPARE(c[0].end, c[1].start - 2);  // stretched for a slow reader up to the gap
+        }
+        QVERIFY(edit({{"project", project}, {"action", "spin"}}).value("isError").toBool());
+        QVERIFY(edit({{"project", project}, {"action", "replace"}, {"find", "zebra"}, {"replace", "x"}}).value("isError").toBool());
+
         // An unknown format and a missing track are refused.
         r = call({{"project", project}, {"export", QString::fromStdString(path("x.docx"))}});
         QVERIFY(r.value("isError").toBool());

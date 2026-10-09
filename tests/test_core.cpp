@@ -7,6 +7,7 @@
 
 #include "core/AutoTag.h"
 #include "core/Automation.h"
+#include "core/CaptionTools.h"
 #include "core/Captions.h"
 #include "core/Bleep.h"
 #include "core/Cfb.h"
@@ -386,6 +387,77 @@ private slots:
         QVERIFY(exportCaptions(track, seq, ".dfxp").find("<tt ") != std::string::npos);
         QVERIFY(exportCaptions(track, seq, ".stl").substr(3, 8) == "STL25.01");
         QVERIFY(exportCaptions(track, seq, ".docx").empty());
+    }
+
+    void captionChecksAndTools() {
+        const Rational fps{24, 1};
+        std::vector<Caption> caps = {{0, 48, "Short and fine"},
+                                     {49, 60, "Way too many characters for such a short line"},
+                                     {200, 400, "One\nTwo\nThree"},
+                                     {410, 440, "Last"}};
+        // Netflix's limits by default: what each caption breaks.
+        const std::vector<unsigned> issues = checkCaptions(caps, fps);
+        QCOMPARE(issues[0], unsigned(kCaptionGapTooSmall));  // one frame before the next
+        QCOMPARE(issues[1], unsigned(kCaptionTooFast | kCaptionLineTooLong | kCaptionTooShort));
+        QCOMPARE(issues[2], unsigned(kCaptionTooManyLines | kCaptionTooLong));
+        QCOMPARE(issues[3], 0u);
+        QVERIFY(std::fabs(captionCps(caps[1], fps) - 45 / (11 / 24.0)) < 1e-9);
+        const std::string why = describeCaptionIssues(issues[1], caps[1], fps);
+        QVERIFY2(why.find("98.2 characters a second (20 at most)") != std::string::npos, why.c_str());
+        QVERIFY2(why.find("a line of 45 characters (42 at most)") != std::string::npos, why.c_str());
+        QVERIFY2(why.find("on screen 0.46 s (0.83 s at least)") != std::string::npos, why.c_str());
+        // Other limits.
+        CaptionLimits kids;
+        kids.maxCps = 5;
+        QVERIFY(checkCaptions(caps, fps, kids)[0] & kCaptionTooFast);
+
+        // Fix Timing: the first ends two frames before the next, the fast one stays up long enough to read
+        // (45 characters at 20 a second: 54 frames), a short pause before the last closes to two frames.
+        QCOMPARE(fixCaptionTiming(caps, fps), 3);
+        QCOMPARE(caps[0].end, FrameTime(47));
+        QCOMPARE(caps[1].end, FrameTime(103));
+        QCOMPARE(caps[2].end, FrameTime(408));
+        QCOMPARE(caps[3].end, FrameTime(440));
+        const std::vector<unsigned> after = checkCaptions(caps, fps);
+        QCOMPARE(after[0], 0u);
+        QCOMPARE(after[1], unsigned(kCaptionLineTooLong));  // only the text can fix that
+        QCOMPARE(fixCaptionTiming(caps, fps), 0);
+        // It never runs into the next caption: a slow reader's limits stop at the gap.
+        std::vector<Caption> tight = {{0, 10, "Some words to read"}, {20, 40, "Next"}};
+        fixCaptionTiming(tight, fps, kids);
+        QCOMPARE(tight[0].end, FrameTime(18));
+
+        // Shift: chosen captions, all of them, never before the start.
+        std::vector<Caption> moved = caps;
+        QVERIFY(shiftCaptions(moved, {3}, 10));
+        QCOMPARE(moved[3].start, FrameTime(420));
+        QCOMPARE(moved[2].start, FrameTime(200));
+        QVERIFY(shiftCaptions(moved, {}, 24));
+        QCOMPARE(moved[0].start, FrameTime(24));
+        QVERIFY(shiftCaptions(moved, {}, -100));  // only as far as frame 0
+        QCOMPARE(moved[0].start, FrameTime(0));
+        QCOMPARE(moved[3].start, FrameTime(420));
+        QVERIFY(!shiftCaptions(moved, {}, -5));
+
+        // Sync to two points: 24 -> 48 and 240 -> 480 doubles the times around them.
+        std::vector<Caption> synced = {{24, 48, "a"}, {120, 168, "b"}, {240, 264, "c"}};
+        QVERIFY(syncCaptions(synced, 24, 48, 240, 480));
+        QCOMPARE(synced[0].start, FrameTime(48));
+        QCOMPARE(synced[0].end, FrameTime(96));
+        QCOMPARE(synced[1].start, FrameTime(240));
+        QCOMPARE(synced[2].start, FrameTime(480));
+        QVERIFY(!syncCaptions(synced, 10, 0, 10, 20));
+
+        // Find and replace: any case by default, whole words when asked, only the chosen captions.
+        std::vector<Caption> words = {{0, 10, "Way too many"}, {20, 30, "Toots TOO"}};
+        QCOMPARE(replaceInCaptions(words, {}, "too", "so", false, true), 2);
+        QCOMPARE(words[0].text, std::string("Way so many"));
+        QCOMPARE(words[1].text, std::string("Toots so"));
+        QCOMPARE(replaceInCaptions(words, {1}, "o", "0", true, false), 3);
+        QCOMPARE(words[0].text, std::string("Way so many"));
+        QCOMPARE(words[1].text, std::string("T00ts s0"));
+        QCOMPARE(replaceInCaptions(words, {}, "a.b", "x"), 0);  // literal, not a pattern
+        QCOMPARE(replaceInCaptions(words, {}, "$", "\\1"), 0);
     }
 
     void captionsFromClipTranscripts() {

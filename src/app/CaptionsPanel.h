@@ -1,14 +1,18 @@
 // Montage — caption tracks of the active sequence: generate them from
-// transcripts, import or export SubRip / WebVTT / SCC, edit the text and
-// timing of each caption, and style how they are drawn.
+// transcripts, import or export them (SubRip, WebVTT, SCC, TTML, EBU STL,
+// ASS), edit the text and timing of each caption, check them against reading
+// limits and fix, shift, sync or search them as a whole, and style how they
+// are drawn.
 #pragma once
 
 #include <QWidget>
 
+#include "core/CaptionTools.h"
 #include "core/Captions.h"
 #include "core/Model.h"
 
 class QCheckBox;
+class QLabel;
 class QComboBox;
 class QTableWidget;
 class QTableWidgetItem;
@@ -49,6 +53,20 @@ public:
     };
     DubResult dub(const std::string& voice, double duckDb = -18, QString* error = nullptr);
 
+    // Subtitle tools. The reading limits (remembered between sessions) and what each caption of the current
+    // track breaks; the selected captions (rows), or all of them when none are.
+    CaptionLimits limits() const;
+    void setLimits(const CaptionLimits& limits);
+    std::vector<unsigned> issues() const;
+    std::vector<size_t> selectedCaptions() const;
+    // Each one undo step on the current track: Fix Timing (how many changed), shifting the selected captions (or
+    // all), syncing so the first and last of the selection (or the track) start at `first` and `last`, and find and
+    // replace in the selected captions (or all; how many replaced).
+    int fixTiming();
+    bool shiftCaptions(FrameTime delta);
+    bool syncToTwoPoints(FrameTime first, FrameTime last);
+    int findReplace(const QString& find, const QString& replace, bool caseSensitive, bool wholeWords);
+
 public slots:
     void generateDialog();
     void importDialog();
@@ -57,6 +75,10 @@ public slots:
     void addTrack();
     void translateDialog();
     void dubDialog();
+    void shiftDialog();
+    void syncDialog();
+    void findReplaceDialog();
+    void limitsDialog();
 
 private:
     void rebuild();
@@ -75,6 +97,7 @@ private:
     QComboBox* tracks_;
     QCheckBox* visible_;
     QTableWidget* table_;
+    QLabel* summary_ = nullptr;  // how many captions break the reading limits
     bool rebuilding_ = false;
 };
 

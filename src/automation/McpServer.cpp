@@ -20,6 +20,7 @@
 
 #include "core/AutoTag.h"
 #include "core/Automation.h"
+#include "core/CaptionTools.h"
 #include "core/Captions.h"
 #include "core/Chapters.h"
 #include "core/MarkerList.h"
@@ -2057,6 +2058,96 @@ void McpServer::Impl::addTools() {
                 return fail(QStringLiteral("Cannot write %1").arg(path));
             return ok(QStringLiteral("Wrote %1 captions to %2").arg(t->captions.size()).arg(path),
                       QJsonObject{{"path", path}, {"captions", int(t->captions.size())}, {"bytes", double(data.size())}});
+        });
+
+    add("montage_edit_captions", "Check and fix captions",
+        "Check a caption track against reading limits (by default the Netflix Timed Text Style Guide's: 20 characters a "
+        "second, 42 characters a line, two lines, 5/6 s to 7 s on screen, 2 frames between captions) or change it as a "
+        "whole. `action`: check (what each caption breaks), fix_timing (short or fast captions stay up longer into the "
+        "time after them, each ends the minimum gap before the next, short pauses close up), shift (by `by`: seconds or a "
+        "timecode, negative for earlier), sync (the first and last of `captions`, or of the track, start at `first` and "
+        "`last`, the rest stretched between: subtitles timed for another cut or frame rate) or replace (`find` with "
+        "`replace`, optionally `case_sensitive` and `whole_words`). `captions` (indices) limits shift and replace. Limits "
+        "can be changed: max_cps, max_line_chars, max_lines, min_seconds, max_seconds, min_gap_frames.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"track":{"type":"integer","default":0},
+            "action":{"type":"string","enum":["check","fix_timing","shift","sync","replace"]},
+            "captions":{"type":"array","items":{"type":"integer"}},"by":{"type":["number","string"]},
+            "first":{"type":["number","string"]},"last":{"type":["number","string"]},
+            "find":{"type":"string"},"replace":{"type":"string"},"case_sensitive":{"type":"boolean"},"whole_words":{"type":"boolean"},
+            "max_cps":{"type":"number"},"max_line_chars":{"type":"integer"},"max_lines":{"type":"integer"},
+            "min_seconds":{"type":"number"},"max_seconds":{"type":"number"},"min_gap_frames":{"type":"integer"}},
+            "required":["project","action"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const int index = a.value("track").toInt(0);
+            if (index < 0 || index >= int(s.captionTracks.size())) return fail("No such caption track");
+            CaptionTrack& t = s.captionTracks[size_t(index)];
+            CaptionLimits lim;
+            if (a.contains("max_cps")) lim.maxCps = a.value("max_cps").toDouble();
+            if (a.contains("max_line_chars")) lim.maxLineChars = a.value("max_line_chars").toInt();
+            if (a.contains("max_lines")) lim.maxLines = a.value("max_lines").toInt();
+            if (a.contains("min_seconds")) lim.minSeconds = a.value("min_seconds").toDouble();
+            if (a.contains("max_seconds")) lim.maxSeconds = a.value("max_seconds").toDouble();
+            if (a.contains("min_gap_frames")) lim.minGapFrames = a.value("min_gap_frames").toInt();
+            std::vector<size_t> chosen;
+            for (const QJsonValue& v : a.value("captions").toArray()) {
+                const int i = v.toInt(-1);
+                if (i < 0 || i >= int(t.captions.size())) throw ArgError{QStringLiteral("No caption %1").arg(v.toInt())};
+                chosen.push_back(size_t(i));
+            }
+            const QString action = need(a, "action");
+            if (action == "check") {
+                const std::vector<unsigned> issues = checkCaptions(t.captions, s.fps, lim);
+                QJsonArray list;
+                QStringList lines;
+                for (size_t i = 0; i < issues.size(); ++i) {
+                    if (!issues[i]) continue;
+                    const QString what = QString::fromStdString(describeCaptionIssues(issues[i], t.captions[i], s.fps, lim));
+                    list.append(QJsonObject{{"caption", int(i)}, {"at", tc(t.captions[i].start, s)},
+                                            {"text", QString::fromStdString(t.captions[i].text)}, {"issues", what}});
+                    lines << QStringLiteral("#%1 %2: %3").arg(i).arg(tc(t.captions[i].start, s), QString(what).replace('\n', QStringLiteral("; ")));
+                }
+                const QString head = list.isEmpty() ? QStringLiteral("All %1 captions are within the limits").arg(t.captions.size())
+                                                     : QStringLiteral("%1 of %2 captions break the limits:").arg(list.size()).arg(t.captions.size());
+                return ok(lines.isEmpty() ? head : head + "\n" + lines.join('\n'),
+                          QJsonObject{{"captions", int(t.captions.size())}, {"issues", list}});
+            }
+            QString done;
+            if (action == "fix_timing") {
+                const int n = fixCaptionTiming(t.captions, s.fps, lim);
+                if (!n) return ok(QStringLiteral("No caption needed retiming"), QJsonObject{{"changed", 0}});
+                done = QStringLiteral("Retimed %1 captions").arg(n);
+            } else if (action == "shift") {
+                if (!a.contains("by")) throw ArgError{QStringLiteral("shift needs \"by\"")};
+                const QJsonValue by = a.value("by");
+                FrameTime delta = 0;
+                if (by.isString() && by.toString().trimmed().startsWith('-'))
+                    delta = -timeArg(QJsonValue(by.toString().trimmed().mid(1)), s, "by");
+                else
+                    delta = timeArg(by, s, "by");
+                if (!shiftCaptions(t.captions, chosen, delta)) return fail("Nothing to shift");
+                done = QStringLiteral("Shifted %1 captions by %2 frames").arg(chosen.empty() ? t.captions.size() : chosen.size()).arg(delta);
+            } else if (action == "sync") {
+                if (t.captions.size() < 2) return fail("Syncing needs at least two captions");
+                if (chosen.size() < 2) chosen = {0, t.captions.size() - 1};
+                const FrameTime fromA = t.captions[chosen.front()].start, fromB = t.captions[chosen.back()].start;
+                if (!syncCaptions(t.captions, fromA, timeArg(a.value("first"), s, "first"), fromB, timeArg(a.value("last"), s, "last")))
+                    return fail("The two captions start together");
+                done = QStringLiteral("Synced %1 captions").arg(t.captions.size());
+            } else if (action == "replace") {
+                const int n = replaceInCaptions(t.captions, chosen, need(a, "find").toStdString(), a.value("replace").toString().toStdString(),
+                                                a.value("case_sensitive").toBool(), a.value("whole_words").toBool());
+                if (!n) return fail(QStringLiteral("\"%1\" was not found").arg(a.value("find").toString()));
+                done = QStringLiteral("Replaced %1").arg(n);
+            } else {
+                throw ArgError{QStringLiteral("Unknown action \"%1\"").arg(action)};
+            }
+            save(l);
+            int flagged = 0;
+            for (unsigned v : checkCaptions(t.captions, s.fps, lim)) flagged += v != 0;
+            return ok(done + QStringLiteral("; %1 captions still break the limits").arg(flagged),
+                      QJsonObject{{"captions", int(t.captions.size())}, {"still_flagged", flagged}});
         });
 
     add("montage_translate_captions", "Translate captions",
