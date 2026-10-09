@@ -436,4 +436,72 @@ void cameraShake(const Effect& e, FrameTime t, Image& img, double pixelScale) {
     });
 }
 
+void lensFlare(const Effect& e, FrameTime t, Image& img) {
+    const int W = img.width, H = img.height;
+    if (W <= 0 || H <= 0) return;
+    const double px = e.p("pos_x", t, 0.3) * W, py = e.p("pos_y", t, 0.3) * H;
+    const double bright = std::max(0.0, e.p("brightness", t, 100) / 100), ghostAmt = std::max(0.0, e.p("ghosts", t, 100) / 100);
+    const int lens = std::clamp(int(e.p("lens", t, 0)), 0, 3);  // 50-300mm zoom, 35mm prime, 105mm prime, anamorphic
+    const float tint[3] = {float(e.p("color.r", t, 1.0)), float(e.p("color.g", t, 0.9)), float(e.p("color.b", t, 0.75))};
+    if (bright <= 0) return;
+    const double R = std::hypot(W, H) / 2, cx = W / 2.0, cy = H / 2.0;
+    // Ghosts: discs along the line from the light through the centre, at these fractions of the way.
+    struct Ghost {
+        double at, radius, strength;
+        float rgb[3];
+    };
+    static const Ghost kZoom[] = {{0.45, 0.035, 0.10, {0.6f, 1.0f, 0.6f}}, {0.75, 0.09, 0.06, {0.7f, 0.5f, 1.0f}}, {1.25, 0.025, 0.14, {1.0f, 0.8f, 0.4f}},
+                                  {1.55, 0.13, 0.05, {0.5f, 0.8f, 1.0f}}, {1.9, 0.06, 0.08, {1.0f, 0.5f, 0.6f}},  {2.3, 0.17, 0.04, {0.6f, 1.0f, 0.8f}}};
+    static const Ghost kPrime[] = {{0.6, 0.05, 0.08, {0.8f, 0.9f, 1.0f}}, {1.3, 0.08, 0.06, {1.0f, 0.85f, 0.6f}}, {2.0, 0.12, 0.05, {0.7f, 1.0f, 0.8f}}};
+    static const Ghost kAnamorphic[] = {{0.5, 0.05, 0.08, {0.4f, 0.6f, 1.0f}}, {1.4, 0.09, 0.06, {0.5f, 0.7f, 1.0f}}, {2.1, 0.14, 0.04, {0.4f, 0.5f, 1.0f}}};
+    const Ghost* ghosts = lens == 0 ? kZoom : lens == 3 ? kAnamorphic : kPrime;
+    const int nGhosts = lens == 0 ? 6 : 3;
+    const int spokes = lens == 1 ? 6 : lens == 2 ? 8 : 4;
+    parallelRows(H, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y) {
+            float* p = img.row(y);
+            for (int x = 0; x < W; ++x, p += 4) {
+                const double dx = x + 0.5 - px, dy = y + 0.5 - py, d = std::hypot(dx, dy) / R;
+                double light[3] = {0, 0, 0};
+                // The core and its halo.
+                const double core = 1.6 * std::exp(-(d / 0.025) * (d / 0.025)) + 0.35 * std::exp(-d / 0.1);
+                for (int c = 0; c < 3; ++c) light[c] += core * (c == 0 ? 1.0 : 0.5 + 0.5 * tint[c] / std::max(0.01f, tint[0]));
+                if (lens == 3) {
+                    // A long horizontal streak, blue.
+                    const double streak = std::exp(-(dy / (0.006 * R)) * (dy / (0.006 * R))) * std::exp(-std::fabs(dx) / (0.8 * R));
+                    light[0] += 0.25 * streak, light[1] += 0.45 * streak, light[2] += 0.9 * streak;
+                } else {
+                    // A star of rays, fading with distance.
+                    const double a = std::atan2(dy, dx);
+                    const double ray = std::pow(std::fabs(std::cos(spokes * 0.5 * a)), lens == 0 ? 60.0 : 120.0) * std::exp(-d / (lens == 0 ? 0.25 : 0.35));
+                    for (int c = 0; c < 3; ++c) light[c] += 0.5 * ray;
+                }
+                if (lens == 0) {
+                    // The zoom's rainbow ring: each colour at a slightly different radius.
+                    for (int c = 0; c < 3; ++c) {
+                        const double ring = (d - (0.33 + 0.012 * c)) / 0.012;
+                        light[c] += 0.07 * std::exp(-ring * ring);
+                    }
+                }
+                for (int k = 0; k < nGhosts; ++k) {
+                    const Ghost& g = ghosts[k];
+                    const double gx = px + (cx - px) * g.at, gy = py + (cy - py) * g.at;  // 1 = the centre, 2 = opposite the light
+                    double gd = std::hypot((x + 0.5 - gx) / (lens == 3 ? 1.6 : 1.0), y + 0.5 - gy) / R / g.radius;
+                    if (gd >= 1.15) continue;
+                    // A soft-edged disc, a little brighter at its rim.
+                    const double disc = (1 - std::clamp((gd - 0.85) / 0.3, 0.0, 1.0)) * (0.7 + 0.3 * std::min(1.0, gd));
+                    for (int c = 0; c < 3; ++c) light[c] += ghostAmt * g.strength * disc * g.rgb[c];
+                }
+                double lum = 0;
+                for (int c = 0; c < 3; ++c) {
+                    const float add = float(bright * light[c] * tint[c]);
+                    p[c] += add;
+                    lum = std::max(lum, double(add));
+                }
+                p[3] = std::min(1.0f, p[3] + float(lum));  // light shows on transparent areas too
+            }
+        }
+    });
+}
+
 }  // namespace montage::sfx

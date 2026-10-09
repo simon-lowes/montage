@@ -553,6 +553,11 @@ std::vector<EffectInfo> buildCatalog() {
                      {pct("amount", "Amount", 0, 100, 100), num("bleed", "Colour Bleed (px)", 0, 40, 4, 0.5), pct("noise", "Noise", 0, 100, 30),
                       pct("scanlines", "Scanlines", 0, 100, 30), pct("tracking", "Tracking Errors", 0, 100, 30)},
                      {}});
+        c.push_back({"lens_flare", "Lens Flare", EffectCategory::VideoFilter, "Stylize",
+                     {num("pos_x", "Light X", -0.5, 1.5, 0.3, 0.001), num("pos_y", "Light Y", -0.5, 1.5, 0.3, 0.001),
+                      pct("brightness", "Brightness", 0, 300, 100), choice("lens", "Lens", {"50-300mm Zoom", "35mm Prime", "105mm Prime", "Anamorphic"}, 0),
+                      color("color", "Colour", 1, 0.9, 0.75), pct("ghosts", "Ghosts", 0, 200, 100)},
+                     {}});
         // Holds each frame for a few (handled where the clip's frame is chosen).
         c.push_back({"stop_motion", "Stop Motion", EffectCategory::VideoFilter, "Stylize",
                      {num("hold", "Hold Each Frame For (frames)", 1, 30, 3, 1)}, {}});

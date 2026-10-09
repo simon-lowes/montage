@@ -1252,6 +1252,26 @@ colorspaces:
         e.params["amount"] = 0.0;
         applyVideoEffect(e, 7, v0, 1);
         QVERIFY(v1.px != ramp().px && v1.px == v2.px && v0.px == ramp().px);
+        // Lens Flare: light at its source, ghosts on the far side of the centre, an anamorphic streak across, nothing at no brightness.
+        {
+            Image dark = solid(320, 180, 0, 0, 0);
+            Image fl = dark;
+            applyVideoEffect(fx("lens_flare", {{"pos_x", 0.25}, {"pos_y", 0.25}}), 0, fl, 1);
+            QVERIFY(fl.at(80, 45)[0] > 1.0f);                                              // the hot core at the light
+            QVERIFY(fl.at(300, 170)[0] < 0.05f && fl.at(300, 10)[0] < 0.05f);              // far corners stay dark
+            // The zoom's ghosts: at 1.55 of the way from the light (80, 45) to past the centre (160, 90): (204, 115).
+            QVERIFY2(fl.at(204, 115)[2] > 0.02f, qPrintable(QString::number(fl.at(204, 115)[2])));
+            Image none = dark;
+            applyVideoEffect(fx("lens_flare", {{"pos_x", 0.25}, {"pos_y", 0.25}, {"ghosts", 0.0}}), 0, none, 1);
+            QVERIFY(none.at(204, 115)[2] < fl.at(204, 115)[2] * 0.5f);
+            Image ana = dark;
+            applyVideoEffect(fx("lens_flare", {{"pos_x", 0.5}, {"pos_y", 0.5}, {"lens", 3.0}}), 0, ana, 1);
+            QVERIFY(ana.at(30, 90)[2] > 0.1f && ana.at(30, 90)[2] > ana.at(30, 90)[0]);     // the streak, blue, far to the side
+            QVERIFY(ana.at(160, 20)[2] < 0.05f);                                           // but not above
+            Image off = dark;
+            applyVideoEffect(fx("lens_flare", {{"brightness", 0.0}}), 0, off, 1);
+            QVERIFY(off.px == dark.px);
+        }
         // Tilt-Shift: the band in focus keeps its detail, the top loses it.
         Image checks(160, 90);
         for (int y = 0; y < 90; ++y)

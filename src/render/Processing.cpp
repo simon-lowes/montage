@@ -1227,6 +1227,7 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
     else if (ty == "halftone") sfx::halftone(e, t, img, pixelScale);
     else if (ty == "duotone") sfx::duotone(e, t, img);
     else if (ty == "vhs") sfx::vhs(e, t, img, pixelScale);
+    else if (ty == "lens_flare") sfx::lensFlare(e, t, img);
     else if (ty == "tilt_shift") sfx::tiltShift(e, t, img, pixelScale);
     else if (ty == "camera_shake") sfx::cameraShake(e, t, img, pixelScale);
     else if (ty == "depth_map" || ty == "depth_fog" || ty == "depth_blur")

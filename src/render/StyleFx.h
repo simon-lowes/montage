@@ -25,6 +25,10 @@ void duotone(const Effect& e, FrameTime t, Image& img);
 void vhs(const Effect& e, FrameTime t, Image& img, double pixelScale);
 void tiltShift(const Effect& e, FrameTime t, Image& img, double pixelScale);
 void cameraShake(const Effect& e, FrameTime t, Image& img, double pixelScale);
+// Lens Flare (Premiere's, Resolve's Lens Flare): light from a point (on or off the frame) as a lens would scatter
+// it: a hot core and halo, a star of rays (or an anamorphic streak), a ring, and ghosts strung along the line
+// through the frame's centre. Added to the picture.
+void lensFlare(const Effect& e, FrameTime t, Image& img);
 
 // Smooth noise in 3D, about -1..1 (value noise, quintic-smoothed).
 double valueNoise(double x, double y, double z, uint32_t seed = 0);
