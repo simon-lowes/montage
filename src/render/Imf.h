@@ -46,9 +46,13 @@ struct ImfResult {
 };
 
 // The colour a sequence is mastered in, and whether IMF Application #2E takes its frame rate (24, 23.976, 25, 29.97,
-// 30, 50, 59.94, 60, and 120 above HD).
+// 30, 50, 59.94, 60, and 120 above HD). At 29.97 and 59.94 a master is padded with black and silence to a multiple of
+// five frames, so the sound fills whole frames.
 std::string defaultImfColour(const Sequence& s);
 bool imfFrameRateAllowed(const Sequence& s);
+// The same for a picture of width x height at `fps`; `canonical`, if given, receives the rate as IMF writes it
+// (24000/1001 rather than 48000/2002).
+bool imfFrameRateAllowed(Rational fps, int width, int height, Rational* canonical = nullptr);
 // The picture size for `size`, or false (with the reason) when it is too large for Application #2E.
 bool imfPictureSize(const Sequence& s, const std::string& size, int& width, int& height, std::string* error = nullptr);
 

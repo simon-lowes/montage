@@ -63,8 +63,8 @@ void imfPictureCoding(uint16_t rsiz, uint8_t out[16]) {
         default: return;
     }
     // The level byte counts on through the sub levels each main level allows.
-    static const int base[] = {0, 0x02, 0x04, 0x06, 0x08, 0x0b, 0x0f, 0x14, 0x1a};
-    if (main < 1 || main > 8 || sub > kMaxSubLevel[main]) return;
+    static const int base[] = {0, 0x02, 0x04, 0x06, 0x08, 0x0b, 0x0f, 0x14, 0x1a, 0x21, 0x29, 0x32};
+    if (main < 1 || main > 11 || sub > kMaxSubLevel[main]) return;
     const uint8_t ul[16] = {0x06, 0x0e, 0x2b, 0x34, 0x04, 0x01, 0x01, 0x0d, 0x04, 0x01, 0x02, 0x02, 0x03, 0x01, kind,
                             uint8_t(base[main] + sub)};
     std::memcpy(out, ul, 16);

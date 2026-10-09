@@ -4629,8 +4629,8 @@ void McpServer::Impl::addTools() {
             "colour":{"type":"string","enum":["rec709","p3d65-pq","rec2020-pq","rec2020-hlg"],"description":"Default: as the sequence is graded"},
             "size":{"type":"string","enum":["sequence","hd","uhd","4k"],"default":"sequence"},
             "bits":{"type":"integer","enum":[10,12],"description":"Default: 10 for SDR, 12 for HDR"},
-            "lossless":{"type":"boolean","default":true},"megabits_per_second":{"type":"number","description":"Lossy: the cap (default 400)"},
-            "mastering_peak":{"type":"number","description":"HDR: the mastering display's peak, cd/m^2"},
+            "lossless":{"type":"boolean","default":true},"megabits_per_second":{"type":"number","minimum":20,"maximum":6400,"description":"Lossy: the cap (default 400)"},
+            "mastering_peak":{"type":"number","minimum":100,"maximum":10000,"description":"HDR: the mastering display's peak, cd/m^2"},
             "language":{"type":"string","default":"en"},"issuer":{"type":"string"},
             "in_out":{"type":"boolean","default":false,"description":"Only In to Out"}},"required":["project","folder"]})json",
         false, [this](const QJsonObject& a) {

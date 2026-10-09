@@ -100,7 +100,15 @@ public:
                     }
                     std::vector<uint8_t> cs;
                     std::string err;
-                    const bool ok = encodeJpeg2000(job.second.data(), w, h, bits, rsiz, maxBytes, cs, &err);
+                    bool ok = false;
+                    try {
+                        ok = encodeJpeg2000(job.second.data(), w, h, bits, rsiz, maxBytes, cs, &err);
+                    } catch (const std::bad_alloc&) {
+                        err = "Out of memory coding the pictures: try fewer encoders at once";
+                    } catch (const std::exception& e) {
+                        err = e.what();
+                    }
+                    job.second = {};
                     std::lock_guard<std::mutex> lock(m_);
                     --busy_;
                     if (!ok) {
@@ -321,12 +329,17 @@ std::string defaultImfColour(const Sequence& s) {
     return "rec709";
 }
 
-bool imfFrameRateAllowed(const Sequence& s) {
+bool imfFrameRateAllowed(Rational fps, int width, int height, Rational* canonical) {
     static const Rational rates[] = {{24, 1}, {24000, 1001}, {25, 1}, {30, 1}, {30000, 1001}, {50, 1}, {60, 1}, {60000, 1001}, {120, 1}};
     for (const Rational& r : rates)
-        if (int64_t(s.fps.num) * r.den == int64_t(r.num) * s.fps.den) return r.num != 120 || s.width > 1920 || s.height > 1080;
+        if (int64_t(fps.num) * r.den == int64_t(r.num) * fps.den) {
+            if (canonical) *canonical = r;
+            return r.num != 120 || width > 1920 || height > 1080;
+        }
     return false;
 }
+
+bool imfFrameRateAllowed(const Sequence& s) { return imfFrameRateAllowed(s.fps, s.width, s.height); }
 
 bool imfPictureSize(const Sequence& s, const std::string& size, int& width, int& height, std::string* error) {
     if (size == "hd") width = 1920, height = 1080;
@@ -356,10 +369,12 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
     };
     if (!openJpegAvailable()) return fail("This build of Montage has no OpenJPEG, which IMF masters are coded with");
     if (!validKind(settings.kind)) return fail("Unknown content kind " + settings.kind);
-    if (!imfFrameRateAllowed(s)) return fail("IMF Application #2E takes 23.976, 24, 25, 29.97, 30, 50, 59.94 or 60 fps (120 above HD)");
     int W = 0, H = 0;
     std::string err;
     if (!imfPictureSize(s, settings.size, W, H, &err)) return fail(err);
+    Rational canonical;
+    if (!imfFrameRateAllowed(s.fps, W, H, &canonical))
+        return fail("IMF Application #2E takes 23.976, 24, 25, 29.97, 30, 50, 59.94 or 60 fps (120 above HD)");
     const std::string colourId = settings.colour.empty() ? defaultImfColour(s) : settings.colour;
     const ImfColourSpec* spec = colourSpec(colourId);
     if (!spec) return fail("The colour is rec709, p3d65-pq, rec2020-pq or rec2020-hlg");
@@ -369,14 +384,22 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
     const int bits = settings.bits ? settings.bits : (hdrOut ? 12 : 10);
     if (bits != 10 && bits != 12) return fail("IMF pictures here are 10 or 12 bits");
     if (!settings.lossless && !(settings.megabitsPerSecond >= 20)) return fail("A lossy master needs at least 20 Mbit/s");
-    const dcp::EditRate rate{uint32_t(s.fps.num), uint32_t(s.fps.den)};
+    const dcp::EditRate rate{uint32_t(canonical.num), uint32_t(canonical.den)};  // as written, not as the sequence stores it
     const double fps = rate.value();
     FrameTime first = 0, end = s.duration();
     if (settings.inOut && s.inPoint >= 0 && s.outPoint >= s.inPoint) first = s.inPoint, end = s.outPoint + 1;
     if (end <= first) return fail("The sequence is empty");
-    const int64_t frames = end - first;
+    // The sound must be a whole number of samples at every frame boundary of the composition: at 29.97 and 59.94 that
+    // takes a multiple of 5 frames, so the programme is padded with black and silence to one.
+    const int64_t programme = end - first;
+    int64_t frames = programme;
+    while ((frames * 48000 * int64_t(rate.den)) % int64_t(rate.num) != 0) ++frames;
     const uint16_t rsiz = imfRsiz(W, H, 3, fps, settings.lossless, settings.megabitsPerSecond);
     if (!rsiz) return fail("No JPEG 2000 IMF profile takes that picture at that rate");
+    uint8_t coding[16];
+    imfPictureCoding(rsiz, coding);
+    if (std::all_of(std::begin(coding), std::end(coding), [](uint8_t b) { return b == 0; }))
+        return fail("No JPEG 2000 IMF profile takes that picture at that bit rate");
     const size_t maxBytes = settings.lossless ? 0 : size_t(settings.megabitsPerSecond * 1e6 / 8 / fps);
     const int seqChannels = layoutChannels(s.audioLayout);
     const int channels = seqChannels == 8 ? 8 : seqChannels == 6 ? 6 : 2;
@@ -407,7 +430,8 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         Sequence mixSeq = s;
         mixSeq.sampleRate = 48000;
         const int64_t firstSample = int64_t(std::llround(double(first) * 48000.0 * rate.den / rate.num));
-        const int64_t total = int64_t(std::llround(double(frames) * 48000.0 * rate.den / rate.num));
+        const int64_t total = frames * 48000 * int64_t(rate.den) / int64_t(rate.num);
+        const int64_t heard = int64_t(std::llround(double(programme) * 48000.0 * rate.den / rate.num));  // then silence
         const int chunk = 4800;
         const int in = std::max(2, seqChannels);
         std::vector<float> mix(size_t(chunk) * size_t(in)), out(size_t(chunk) * size_t(channels));
@@ -422,7 +446,8 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
             if (seqChannels > 2) mixer.mixLayout(p, mixSeq, firstSample + done, n, mix.data());
             else mixer.mix(p, mixSeq, firstSample + done, n, mix.data());
             for (int i = 0; i < n; ++i)
-                for (size_t c = 0; c < route.size(); ++c) out[size_t(i) * size_t(channels) + size_t(route[c])] = mix[size_t(i) * size_t(in) + c];
+                for (size_t c = 0; c < route.size(); ++c)
+                    out[size_t(i) * size_t(channels) + size_t(route[c])] = done + i < heard ? mix[size_t(i) * size_t(in) + c] : 0.0f;
             if (!sound.write(out.data(), size_t(n), &err)) return fail(err);
             if (progress && (done / chunk) % 20 == 0 && !progress(0.05 * double(done) / double(total))) return fail("Stopped");
         }
@@ -442,10 +467,15 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         // A P3-D65 mastering display (as HDR grading monitors are), at the master's peak.
         const double p3[8] = {0.680, 0.320, 0.265, 0.690, 0.150, 0.060, 0.3127, 0.3290};
         std::copy(std::begin(p3), std::end(p3), colour.display);
-        colour.maxLuminance = settings.masteringPeak > 0 ? settings.masteringPeak : std::max(1000.0, s.hdrPeakNits);
+        colour.maxLuminance = std::clamp(settings.masteringPeak > 0 ? settings.masteringPeak : std::max(1000.0, s.hdrPeakNits), 100.0, 10000.0);
         colour.minLuminance = 0.0001;
     }
-    const int threads = settings.threads > 0 ? settings.threads : std::max(1, int(std::thread::hardware_concurrency()));
+    const double peakNits = std::clamp(s.hdrPeakNits, 100.0, 10000.0);
+    // Encoders at once, within about 4 GiB for the frames waiting and being coded (an encode holds roughly 30 bytes a
+    // pixel, a waiting frame 6, two waiting per encoder): a dozen at UHD, more at HD.
+    const double perEncoder = double(W) * double(H) * (30.0 + 2 * 6.0);
+    const int memoryCap = std::max(1, int(4294967296.0 / perEncoder));
+    const int threads = std::min(memoryCap, settings.threads > 0 ? settings.threads : std::max(1, int(std::thread::hardware_concurrency())));
     dcp::ImfPictureWriter picture;
     {
         const int g = std::gcd(W, H);
@@ -476,11 +506,14 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         };
         const size_t inHand = size_t(threads) * 2;
         for (int64_t k = 0; k < frames; ++k) {
-            Image frame = renderProgramFrame(p, s, first + k, o);
-            if (frame.width != fw || frame.height != fh) frame = resizeImage(frame, fw, fh);
-            if (target != &seqSpace) convertColor(frame, seqSpace, *target, s.hdrPeakNits);
-            std::vector<uint16_t> rgb(size_t(W) * size_t(H) * 3, 0);  // black round it
-            for (int y = 0; y < fh; ++y) {
+            std::vector<uint16_t> rgb(size_t(W) * size_t(H) * 3, 0);  // black round it (and after the programme)
+            Image frame;
+            if (k < programme) {
+                frame = renderProgramFrame(p, s, first + k, o);
+                if (frame.width != fw || frame.height != fh) frame = resizeImage(frame, fw, fh);
+                if (target != &seqSpace) convertColor(frame, seqSpace, *target, peakNits);
+            }
+            for (int y = 0; y < fh && !frame.empty(); ++y) {
                 const float* src = frame.row(y);
                 uint16_t* d = rgb.data() + (size_t(y + oy) * size_t(W) + size_t(ox)) * 3;
                 for (int x = 0; x < fw; ++x, src += 4, d += 3)

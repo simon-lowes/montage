@@ -3473,6 +3473,83 @@ colorspaces:
         QVERIFY(ul[14] == 0x06 && ul[15] == 0x0f);
         imfPictureCoding(0x0526, ul);
         QVERIFY(ul[14] == 0x03 && ul[15] == 0x11);
+        // Above 6400 Mbit/s the levels go past main level 8, and the label with them.
+        QCOMPARE(int(imfRsiz(3840, 2160, 3, 24, false, 12800)), 0x0579);
+        imfPictureCoding(0x0579, ul);
+        QVERIFY(ul[14] == 0x03 && ul[15] == 0x28);
+        // 120 fps only above HD, judged on the picture written; a rate as the sequence happens to store it is written
+        // reduced.
+        QVERIFY(!imfFrameRateAllowed(Rational{120, 1}, 1920, 1080) && imfFrameRateAllowed(Rational{120, 1}, 3840, 2160));
+        Rational canonical;
+        QVERIFY(imfFrameRateAllowed(Rational{48000, 2002}, 320, 180, &canonical) && canonical == (Rational{24000, 1001}));
+        {
+            Sequence oddRate = s;
+            oddRate.fps = Rational{48000, 2002};
+            st = ImfSettings{};
+            st.title = "Reduced";
+            st.threads = 1;
+            ImfResult rr;
+            QVERIFY2(exportImf(p, oddRate, st, dir.path().toStdString(), &rr, {}, &err), err.c_str());
+            QVERIFY(rr.rateNum == 24000 && rr.rateDen == 1001);
+        }
+        // At 29.97 the sound fills whole frames only every five: seven frames are padded to ten, with 16016 samples.
+        {
+            Sequence ntsc = s;
+            ntsc.fps = Rational{30000, 1001};
+            ntsc.videoTracks[0].clips = {colorClip(p, 0.5f, 0.25f, 0.75f, 0, 7)};
+            ntsc.audioTracks[0].clips.clear();
+            st = ImfSettings{};
+            st.title = "NTSC";
+            st.threads = 1;
+            ImfResult nr;
+            QVERIFY2(exportImf(p, ntsc, st, dir.path().toStdString(), &nr, {}, &err), err.c_str());
+            QCOMPARE(nr.frames, int64_t(10));
+            issues = verifyImf(nr.folder);
+            QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+            const QDir nout(QString::fromStdString(nr.folder));
+            QFile ncpl(nout.filePath(nout.entryList({"CPL_*.xml"}).value(0)));
+            QVERIFY(ncpl.open(QIODevice::ReadOnly));
+            const QString ntext = QString::fromUtf8(ncpl.readAll());
+            QVERIFY(ntext.contains("<IntrinsicDuration>10</IntrinsicDuration>") && ntext.contains("<IntrinsicDuration>16016</IntrinsicDuration>"));
+            // The padding is black.
+            QVERIFY(readImfFrame(nout.filePath(nout.entryList({"VIDEO_*.mxf"}).value(0)).toStdString(), 8, rgb, w, h, bits, &err));
+            QVERIFY(rgb[(size_t(90) * 320 + 160) * 3 + 2] == 0);
+        }
+        // A frame of 16 MiB or more (lossless UHD can be) gets the 8-byte length, and the file still walks as KLV to its end.
+        {
+            std::vector<uint16_t> grey(16 * 16 * 3, 512);
+            std::vector<uint8_t> cs;
+            QVERIFY(encodeJpeg2000(grey.data(), 16, 16, 10, 0x0701, 0, cs, &err));
+            std::vector<uint8_t> huge = cs;
+            huge.resize(cs.size() + (size_t(17) << 20), 0);
+            const QString path = dir.filePath("huge.mxf");
+            dcp::ImfPictureWriter wr;
+            QVERIFY(wr.open(path.toStdString(), dcp::newUuid(), dcp::EditRate{24, 1}, 10, dcp::ImfColour{}, 16, 9, &err));
+            QVERIFY(wr.write(cs.data(), cs.size(), &err) && wr.write(huge.data(), huge.size(), &err));
+            QVERIFY2(wr.close(&err), err.c_str());
+            QFile f(path);
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            const QByteArray all = f.readAll();
+            const auto* d = reinterpret_cast<const uint8_t*>(all.constData());
+            const uint8_t element[12] = {0x06, 0x0e, 0x2b, 0x34, 0x01, 0x02, 0x01, 0x01, 0x0d, 0x01, 0x03, 0x01};
+            std::vector<uint64_t> frames;
+            size_t at = 0;
+            while (at + 17 <= size_t(all.size())) {
+                const uint8_t* key = d + at;
+                size_t pos = at + 16;
+                uint64_t len = d[pos++];
+                if (len & 0x80) {
+                    const int n = int(len & 0x7f);
+                    len = 0;
+                    for (int i = 0; i < n; ++i) len = (len << 8) | d[pos++];
+                }
+                if (std::memcmp(key, element, 12) == 0 && key[12] == 0x15) frames.push_back(len);
+                at = pos + size_t(len);
+            }
+            QCOMPARE(at, size_t(all.size()));
+            QCOMPARE(frames.size(), size_t(2));
+            QCOMPARE(frames[1], uint64_t(huge.size()));
+        }
     }
 
     void exportsDigitalCinemaPackage() {

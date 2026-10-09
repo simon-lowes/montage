@@ -2,6 +2,7 @@
 #include "Jpeg2000.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -71,10 +72,16 @@ Bytes utf16(const std::string& s) {
 }
 
 void putBer4(Bytes& b, size_t n) {
+    assert(n < (size_t(1) << 24));  // larger values need the 8-byte form (putBer8)
     b.push_back(0x83);
     b.push_back(uint8_t(n >> 16));
     b.push_back(uint8_t(n >> 8));
     b.push_back(uint8_t(n));
+}
+
+void putBer8(Bytes& b, uint64_t n) {
+    b.push_back(0x87);
+    for (int i = 6; i >= 0; --i) b.push_back(uint8_t(n >> (8 * i)));
 }
 
 Bytes klv(const std::array<uint8_t, 16>& key, const Bytes& value) {
@@ -762,7 +769,9 @@ std::vector<uint8_t> TrackFileWriter::partitionPack(const uint8_t key[16], uint6
 bool TrackFileWriter::writeElement(const uint8_t key[16], const uint8_t* data, size_t size, std::string* error) {
     if (!f_) return false;
     Bytes kl(key, key + 16);
-    putBer4(kl, size);
+    // A frame of 16 MiB or more (lossless UHD and 4K can be) needs the 8-byte length.
+    if (size < (size_t(1) << 24)) putBer4(kl, size);
+    else putBer8(kl, size);
     if (std::fwrite(kl.data(), 1, kl.size(), f_) != kl.size() || (size && std::fwrite(data, 1, size, f_) != size)) {
         if (error) *error = "Cannot write " + path_ + " (is the disk full?)";
         return false;
