@@ -37,6 +37,7 @@
 #include "core/MediaLog.h"
 #include "core/Multicam.h"
 #include "core/TimelineCompare.h"
+#include "core/Reconform.h"
 #include "core/ProjectIO.h"
 #include "core/ScriptCut.h"
 #include "core/Surround.h"
@@ -4434,6 +4435,145 @@ private slots:
         QCOMPARE(lost.size(), size_t(1));
         QVERIFY(lost[0].kind == ChangeKind::Removed && lost[0].before == c2);
         QCOMPARE(std::string(changeKindName(ChangeKind::Trimmed)), std::string("Trimmed"));
+    }
+
+    void reconformToNewCut() {
+        // The old cut: A 0-60 (from 0), B 60-100 (from 0), A 100-150 (from 100), B 150-180 (from 100).
+        Fixture fx;
+        fx.p.sequences.reserve(8);  // `old` stays put as sequences are added
+        MediaItem b = *fx.p.findMedia(fx.media);
+        b.id = fx.p.newId();
+        b.name = "b.mov";
+        b.path = "/nonexistent/b.mov";
+        fx.p.media.push_back(b);
+        auto shot = [&](Sequence& s, Id media, FrameTime at, FrameTime len, double in) {
+            Clip c = makeClip(fx.p, *fx.p.findMedia(media), TrackKind::Video, s);
+            c.start = at, c.duration = len, c.sourceIn = in;
+            c.name = fx.p.findMedia(media)->name;
+            QVERIFY(overwrite(fx.p, s, V1, c).ok);
+        };
+        Sequence& old = fx.s();
+        old.name = "Cut 1";
+        shot(old, fx.media, 0, 60, 0);
+        shot(old, b.id, 60, 40, 0);
+        shot(old, fx.media, 100, 50, 100);
+        shot(old, b.id, 150, 30, 100);
+        const CutChanges none = cutChanges(fx.p, old, old);
+        QCOMPARE(none.events.size(), size_t(1));  // one stretch, unchanged
+        QVERIFY(none.events[0].kind == CutEventKind::Same && none.events[0].shots == 4 && none.changed() == 0);
+        // The new cut: the first shot 10 frames shorter at the head, the third before the second, the second 10 frames
+        // longer, the fourth gone and a new shot at the end.
+        Sequence cut = makeSequence(fx.p, "Cut 2", 1920, 1080, Rational{30, 1});
+        shot(cut, fx.media, 0, 50, 10);
+        shot(cut, fx.media, 50, 50, 100);
+        shot(cut, b.id, 100, 50, 0);
+        shot(cut, fx.media, 150, 20, 250);
+        fx.p.sequences.push_back(cut);
+        const CutChanges ch = cutChanges(fx.p, old, cut);
+        using K = CutEventKind;
+        const std::vector<K> kinds{K::Trimmed, K::Same, K::Same, K::Deleted, K::Moved, K::Extended, K::Inserted};
+        QCOMPARE(ch.events.size(), kinds.size());
+        for (size_t i = 0; i < kinds.size(); ++i) QCOMPARE(int(ch.events[i].kind), int(kinds[i]));
+        QCOMPARE(ch.changed(), 5);
+        auto is = [&](size_t i, FrameTime oi, FrameTime oo, FrameTime ni, FrameTime no) {
+            const CutEvent& e = ch.events[i];
+            return e.oldIn == oi && e.oldOut == oo && e.newIn == ni && e.newOut == no;
+        };
+        QVERIFY(is(0, 0, 10, 0, 0));
+        QVERIFY(is(1, 10, 60, 0, 50) && ch.events[1].shift() == -10 && ch.events[1].shot == "clip.mov");
+        QVERIFY(is(2, 100, 150, 50, 100));
+        QVERIFY(is(3, 150, 180, 100, 100) && ch.events[3].shot == "b.mov");
+        QVERIFY(is(4, 60, 100, 100, 140) && ch.events[4].shift() == 40);
+        QVERIFY(ch.events[5].newIn == 140 && ch.events[5].newOut == 150 && ch.events[5].shot == "b.mov");
+        QVERIFY(ch.events[6].newIn == 150 && ch.events[6].newOut == 170 && ch.events[6].length() == 20);
+        std::string error;
+        Sequence fast = cut;
+        fast.fps = {25, 1};
+        QVERIFY(cutChanges(fx.p, old, fast, &error).events.empty() && !error.empty());
+
+        // The lists.
+        const std::string csv = changeListCsv(ch);
+        QCOMPARE(int(std::count(csv.begin(), csv.end(), '\n')), 8);
+        QVERIFY(csv.find("5,Moved,b.mov,1,00:00:02:00,00:00:03:10,00:00:03:10,00:00:04:20,40,+40") != std::string::npos);
+        const std::string edl = changeEdl(ch);
+        QVERIFY(edl.find("001  OLDCUT   V     C        00:00:00:10 00:00:02:00 00:00:00:00 00:00:01:20") != std::string::npos);
+        QVERIFY(edl.find("NEWCUT   V     C        00:00:05:00 00:00:05:20 00:00:05:00 00:00:05:20") != std::string::npos);
+        QVERIFY(edl.find("* DELETED: b.mov 00:00:05:00 00:00:06:00") != std::string::npos);
+        QVERIFY(edl.find("* CHANGE: MOVED (+40 FRAMES)") != std::string::npos);
+
+        // A mix laid out against the old cut: one music clip under all of it with the fader riding down, a title with
+        // a fade in over the third shot, a marker and a caption.
+        Sequence mix = old;
+        mix.id = fx.p.newId();
+        mix.name = "Mix";
+        Clip music = makeClip(fx.p, *fx.p.findMedia(fx.media), TrackKind::Audio, mix);
+        music.start = 0, music.duration = 180, music.sourceIn = 0;
+        QVERIFY(overwrite(fx.p, mix, A1, music).ok);
+        mix.audioTracks[0].volumeAuto.addKey(0, 0);
+        mix.audioTracks[0].volumeAuto.addKey(180, -18);
+        Clip title = makeGeneratorClip(fx.p, "title", 30);
+        title.start = 110;
+        QVERIFY(overwrite(fx.p, mix, V2, title).ok);
+        mix.videoTracks[1].transitions.push_back(Transition{fx.p.newId(), "cross_dissolve", 0, title.id, 10, {}});
+        mix.markers.push_back(Marker{120, 0, "Hit", "", 0});
+        CaptionTrack subs;
+        subs.id = fx.p.newId();
+        subs.captions.push_back(Caption{20, 40, "Hello", {}});
+        mix.captionTracks.push_back(subs);
+        fx.p.sequences.push_back(mix);
+        QVERIFY(!reconformSequence(fx.p, mix.id, CutChanges{}, cut.id).sequence);  // nothing to conform to
+        CutChanges at25 = ch;
+        at25.fps = {25, 1};
+        QVERIFY(!reconformSequence(fx.p, mix.id, at25, cut.id).sequence);
+        const ReconformResult r = reconformSequence(fx.p, mix.id, ch, cut.id, {}, &error);
+        QVERIFY2(r.sequence, error.c_str());
+        QCOMPARE(r.pieces, 3);
+        QCOMPARE(r.inserts, 2);
+        const Sequence& out = *fx.p.findSequence(r.sequence);
+        QCOMPARE(out.name, std::string("Mix (Conformed)"));
+        // The picture: the kept stretches where the new cut has them, and its new material (labelled) after them.
+        const auto& v = out.videoTracks[0].clips;
+        QCOMPARE(v.size(), size_t(5));
+        const FrameTime starts[] = {0, 50, 100, 140, 150}, lengths[] = {50, 50, 40, 10, 20};
+        const double ins[] = {10, 100, 0, 40, 250};
+        for (size_t i = 0; i < 5; ++i) {
+            QCOMPARE(v[i].start, starts[i]);
+            QCOMPARE(v[i].duration, lengths[i]);
+            QCOMPARE(v[i].sourceIn, ins[i]);
+            QCOMPARE(v[i].colorLabel != 0, i >= 3);
+        }
+        // The music cut with them, the fader's ride carried along (at 120 it is where the old cut was at 80).
+        const Track& a = out.audioTracks[0];
+        QCOMPARE(a.clips.size(), size_t(3));
+        QCOMPARE(a.clips[2].start, FrameTime(100));
+        QCOMPARE(a.clips[2].sourceIn, 60.0);
+        QVERIFY(std::fabs(a.volumeAuto.at(120) - -8.0) < 1e-6);
+        QVERIFY(std::fabs(a.volumeAuto.at(25) - -3.5) < 1e-6);
+        QVERIFY(std::fabs(a.volumeAuto.at(70) - -12.0) < 1e-6);
+        // The title over the third shot, with its fade; the marker and the caption with their stretches.
+        const Track& v2 = out.videoTracks[1];
+        QCOMPARE(v2.clips.size(), size_t(1));
+        QCOMPARE(v2.clips[0].start, FrameTime(60));
+        QCOMPARE(v2.transitions.size(), size_t(1));
+        QCOMPARE(v2.transitions[0].clipB, v2.clips[0].id);
+        QVERIFY(v2.clips[0].id != title.id);
+        const auto hit = std::find_if(out.markers.begin(), out.markers.end(), [](const Marker& m) { return m.name == "Hit"; });
+        QVERIFY(hit != out.markers.end() && hit->t == 70);
+        QCOMPARE(out.markers.size(), size_t(5));  // and one for each insert and each cut
+        QCOMPARE(out.captionTracks[0].captions.size(), size_t(1));
+        QCOMPARE(out.captionTracks[0].captions[0].start, FrameTime(10));
+        QCOMPARE(out.captionTracks[0].captions[0].end, FrameTime(30));
+        // The source is untouched; without filling, the new material is a gap.
+        QCOMPARE(fx.p.findSequence(mix.id)->videoTracks[0].clips.size(), size_t(4));
+        ReconformOptions bare;
+        bare.fillFromNewCut = false;
+        bare.markers = false;
+        bare.name = "Bare";
+        const ReconformResult r2 = reconformSequence(fx.p, mix.id, ch, cut.id, bare);
+        const Sequence& out2 = *fx.p.findSequence(r2.sequence);
+        QCOMPARE(out2.videoTracks[0].clips.size(), size_t(3));
+        QCOMPARE(out2.markers.size(), size_t(1));
+        QCOMPARE(out2.duration(), FrameTime(140));
     }
 
     void colorWarpMesh() {

@@ -6504,6 +6504,77 @@ const auto seq = [this] { return state()->sequence(); };
         state()->newProject();
     }
 
+    void reconformFromCompareDialog() {
+        // Version 2 of the demo: Blue first, then Red, and no title.
+        loadDemo();
+        const Id first = state()->sequence()->id;
+        const size_t sequences = state()->project().sequences.size();
+        Sequence v2 = *state()->sequence();
+        QVERIFY(state()->edit("Version 2", [&](Project& p, Sequence&) {
+            v2.id = p.newId();
+            v2.name = "Version 2";
+            std::swap(v2.videoTracks[0].clips[0].start, v2.videoTracks[0].clips[1].start);
+            std::swap(v2.videoTracks[0].clips[0], v2.videoTracks[0].clips[1]);
+            v2.videoTracks[1].clips.clear();
+            p.sequences.push_back(v2);
+            return true;
+        }));
+        state()->setActiveSequence(v2.id);
+        CompareDialog* dlg = win_->compareWith(first);
+        QVERIFY(dlg);
+        dlg->showTab(1);
+        // Blue kept its place in the order; Red's first 15 frames (the rest were under the title) moved after it and
+        // run on; the title is gone.
+        QCOMPARE(dlg->cutRowCount(), 4);
+        QCOMPARE(dlg->cutCell(0, CompareDialog::CutKind), QString("Same"));
+        QCOMPARE(dlg->cutCell(0, CompareDialog::CutShot), QString("Blue"));
+        QCOMPARE(dlg->cutCell(0, CompareDialog::CutShift), QString("-60"));
+        QCOMPARE(dlg->cutCell(1, CompareDialog::CutKind), QString("Moved"));
+        QCOMPARE(dlg->cutCell(1, CompareDialog::CutOldIn), QString::fromStdString(formatTimecode(0, Rational{30, 1})));
+        QCOMPARE(dlg->cutCell(2, CompareDialog::CutKind), QString("Deleted"));
+        QCOMPARE(dlg->cutCell(3, CompareDialog::CutKind), QString("Extended"));
+        QVERIFY(dlg->cutCell(3, CompareDialog::CutOldIn).isEmpty());
+        QVERIFY(dlg->findChild<QLabel*>("cutSummary")->text().contains("1 moved"));
+        dlg->activateCut(3);
+        QCOMPARE(state()->playhead(), FrameTime(75));
+        // Both lists.
+        const QString edl = dir_.filePath("changes.edl"), csv = dir_.filePath("changes.csv");
+        QVERIFY(dlg->exportChangeList(edl) && dlg->exportChangeList(csv));
+        QFile e(edl);
+        QVERIFY(e.open(QIODevice::ReadOnly));
+        const QByteArray edlText = e.readAll();
+        QVERIFY(edlText.contains("001  OLDCUT") && edlText.contains("* CHANGE: MOVED") && edlText.contains("NEWCUT"));
+        QFile c(csv);
+        QVERIFY(c.open(QIODevice::ReadOnly));
+        QVERIFY(c.readAll().startsWith("Event,Change,Shot"));
+        // The old version re-conformed: Blue then Red's first 15 frames from it, the rest of Red from Version 2
+        // (labelled), a marker where the title was taken out and one on the new material; one undo step.
+        QVERIFY(dlg->findChild<QPushButton*>("compareReconform")->isEnabled());
+        const Id made = dlg->reconform(first);
+        QVERIFY(made);
+        QCOMPARE(state()->sequence()->id, made);
+        const Sequence& out = *state()->sequence();
+        QCOMPARE(out.name, std::string("Sequence 1 (Conformed)"));
+        const auto& v = out.videoTracks[0].clips;
+        QCOMPARE(v.size(), size_t(3));
+        QCOMPARE(v[0].name, std::string("Blue"));
+        QCOMPARE(v[1].name, std::string("Red"));
+        QCOMPARE(v[1].duration, FrameTime(15));
+        QCOMPARE(v[2].start, FrameTime(75));
+        QVERIFY(v[2].colorLabel != 0 && v[1].colorLabel == 0);
+        QVERIFY(out.videoTracks[1].clips.empty());
+        QCOMPARE(out.markers.size(), size_t(2));
+        QCOMPARE(state()->project().sequences.size(), sequences + 2);
+        state()->undo();
+        QCOMPARE(state()->project().sequences.size(), sequences + 1);
+        // Going to a change brings Version 2 back.
+        state()->setActiveSequence(first);
+        dlg->activateCut(0);
+        QCOMPARE(state()->sequence()->id, v2.id);
+        dlg->close();
+        state()->newProject();
+    }
+
     void normalizeWaveformsOption() {
         // The JFK clip turned down 20 dB: drawn at a tenth normally, at its own peak's full height when normalised.
         state()->newProject();

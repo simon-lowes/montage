@@ -55,6 +55,7 @@
 #include "core/Checkerboard.h"
 #include "core/EditOps.h"
 #include "core/TimelineCompare.h"
+#include "core/Reconform.h"
 #include "core/Effects.h"
 #include "core/History.h"
 #include "core/Interchange.h"
@@ -2853,6 +2854,77 @@ void McpServer::Impl::addTools() {
             }
             return ok(changes.empty() ? QStringLiteral("No differences") : QStringLiteral("%1 change(s)").arg(changes.size()),
                       QJsonObject{{"changes", list}});
+        });
+
+    add("montage_reconform", "Change list and re-conform to a new cut",
+        "The picture of a new version of a cut matched frame by frame to the old one (Avid's Change List tool, the "
+        "Conformalizer): the stretches it keeps (in their old order, or moved, and how far they slid), its new material "
+        "(inserted shots, extended shots) and what it took out (deleted shots, trimmed ones). `path` writes the list as a "
+        "change EDL (.edl: CMX 3600 with the old cut as reel OLDCUT, new material as NEWCUT) or a CSV. With `source` (a "
+        "sequence cut to the old version: a mix, a grade, effects and titles) it also makes a new sequence of it rebuilt to "
+        "play against the new cut, every track carried over with fades, automation, markers and captions, the new "
+        "material filled in from the new cut unless fill is false.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "before":{"type":"string","description":"The old cut's sequence name"},
+            "after":{"type":"string","description":"The new cut's sequence name (default: the active one)"},
+            "path":{"type":"string","description":"Write the change list here (.edl or .csv)"},
+            "source":{"type":"string","description":"The sequence to re-conform (cut to the old version)"},
+            "name":{"type":"string","description":"The re-conformed sequence's name (default: \"<source> (Conformed)\")"},
+            "fill":{"type":"boolean","default":true},"markers":{"type":"boolean","default":true}},
+            "required":["project","before"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            auto byName = [&](const QString& name) -> Sequence* {
+                for (Sequence& sq : l.project.sequences)
+                    if (QString::fromStdString(sq.name) == name) return &sq;
+                throw ArgError{QStringLiteral("No sequence named \"%1\"").arg(name)};
+            };
+            const Sequence* before = byName(need(a, "before"));
+            const Sequence* after = a.contains("after") ? byName(str(a, "after")) : &l.seq();
+            if (before == after) throw ArgError{"Compare two different sequences"};
+            std::string err;
+            const CutChanges changes = cutChanges(l.project, *before, *after, &err);
+            if (!err.empty()) return fail(QString::fromStdString(err));
+            QJsonArray list;
+            for (const CutEvent& e : changes.events) {
+                QJsonObject o{{"change", QString::fromLatin1(cutEventName(e.kind)).toLower()},
+                              {"shot", QString::fromStdString(e.shot)},
+                              {"shots", e.shots},
+                              {"new_in", tc(e.newIn, *after)},
+                              {"new_out", tc(e.newOut, *after)},
+                              {"length", double(e.length())}};
+                if (e.kind != CutEventKind::Inserted && e.kind != CutEventKind::Extended) {
+                    o["old_in"] = tc(e.oldIn, *after);
+                    o["old_out"] = tc(e.oldOut, *after);
+                }
+                if (e.kind == CutEventKind::Same || e.kind == CutEventKind::Moved) o["shift"] = double(e.shift());
+                list.append(o);
+            }
+            QJsonObject result{{"events", list}, {"changed", changes.changed()}};
+            if (a.contains("path")) {
+                const QString file = absolute(need(a, "path"));
+                const std::string text = QFileInfo(file).suffix().compare("edl", Qt::CaseInsensitive) == 0 ? changeEdl(changes) : changeListCsv(changes);
+                QFile f(file);
+                if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate) || f.write(text.data(), qint64(text.size())) != qint64(text.size()))
+                    return fail(QStringLiteral("Cannot write %1").arg(f.fileName()));
+                result["path"] = f.fileName();
+            }
+            QString message = changes.changed() ? QStringLiteral("%1 change(s)").arg(changes.changed()) : QStringLiteral("The picture is the same");
+            if (a.contains("source")) {
+                const Id source = byName(need(a, "source"))->id, newCut = after->id;
+                ReconformOptions o;
+                o.name = str(a, "name").toStdString();
+                o.fillFromNewCut = a.value("fill").toBool(true);
+                o.markers = a.value("markers").toBool(true);
+                const ReconformResult r = reconformSequence(l.project, source, changes, newCut, o, &err);
+                if (!r.sequence) return fail(QString::fromStdString(err));
+                const Sequence* made = l.project.findSequence(r.sequence);
+                result["sequence"] = QString::fromStdString(made->name);
+                result["clips"] = r.clips;
+                save(l);
+                message += QStringLiteral("; made %1").arg(QString::fromStdString(made->name));
+            }
+            return ok(message, result);
         });
 
     add("montage_layout", "Arrange clips in a layout",

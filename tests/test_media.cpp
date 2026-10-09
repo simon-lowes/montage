@@ -9341,6 +9341,41 @@ private slots:
         QVERIFY(r.value("isError").toBool());
         r = call({{"project", project}, {"before", "Cut 9"}});
         QVERIFY(r.value("isError").toBool());
+
+        // The picture's change list, written as a change EDL, and Cut 1 re-conformed to Cut 2.
+        auto reconform = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 2}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_reconform"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        const QString edl = QString::fromStdString(path("changes.edl"));
+        r = reconform({{"project", project}, {"before", "Cut 1"}, {"path", edl}, {"source", "Cut 1"}, {"name", "Mix 2"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject out = r.value("structuredContent").toObject();
+        const QJsonArray events = out.value("events").toArray();
+        // Shot 1 to 40 (its last 20 frames gone, black instead), shot 2 where it was, black, then the new shot.
+        QStringList kinds;
+        for (const auto& e : events) kinds << e.toObject().value("change").toString();
+        QCOMPARE(kinds.join(","), QString("same,trimmed,inserted,same,inserted,inserted"));
+        QCOMPARE(events[3].toObject().value("shift").toDouble(), 0.0);
+        QCOMPARE(events[5].toObject().value("new_in").toString(), QString("00:00:06:20"));
+        QVERIFY(!events[5].toObject().contains("old_in"));
+        QCOMPARE(out.value("sequence").toString(), QString("Mix 2"));
+        QFile f(edl);
+        QVERIFY(f.open(QIODevice::ReadOnly) && f.readAll().contains("OLDCUT"));
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Sequence* mix = nullptr;
+        for (const Sequence& sq : back.sequences)
+            if (sq.name == "Mix 2") mix = &sq;
+        QVERIFY(mix);
+        QCOMPARE(mix->videoTracks[0].clips.size(), size_t(3));
+        QCOMPARE(mix->markers.size(), size_t(4));  // on each insert and where shot 1 was trimmed
+        QCOMPARE(mix->videoTracks[0].clips[2].start, FrameTime(200));
+        r = reconform({{"project", project}, {"before", "Cut 1"}, {"source", "Cut 9"}});
+        QVERIFY(r.value("isError").toBool());
     }
 
     void mcpServerEditsProjects() {
