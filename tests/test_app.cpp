@@ -3164,6 +3164,38 @@ private slots:
         state()->newProject();
     }
 
+    void removeLetterboxFromTheMenu() {
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 320, gs.height = 180, gs.fps = {25, 1};
+        Clip box = makeGeneratorClip(gen, "shape", 25);
+        box.generator.params["width"] = Param(320.0);
+        box.generator.params["height"] = Param(120.0);
+        edit::overwrite(gen, gs, {TrackKind::Video, 0}, box);
+        ExportSettings st;
+        st.path = (dir_.path() + "/bars.mp4").toStdString();
+        st.audioCodec = "none";
+        st.preset = "ultrafast";
+        std::string err;
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        state()->newProject();
+        QVERIFY(win_->findChild<QAction*>("removeLetterbox"));
+        QCOMPARE(win_->removeLetterbox(), 0);  // nothing selected
+        const auto ids = state()->importFiles({QString::fromStdString(st.path)});
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids.at(0), 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        const Id clip = state()->sequence()->videoTracks[0].clips.at(0).id;
+        state()->setSelection({clip}, false);
+        QCOMPARE(win_->removeLetterbox(), 1);
+        const Clip* c = edit::clipById(*state()->sequence(), clip);
+        QVERIFY(c->motion.p("crop_top", 0) > 15 && c->motion.p("crop_bottom", 0) > 15);
+        QVERIFY(c->motion.p("scale", 0) > 140);
+        state()->undo();
+        QCOMPARE(edit::clipById(*state()->sequence(), clip)->motion.p("crop_top", 0), 0.0);
+        state()->newProject();
+    }
+
     void removeMicBleedFromTheMenu() {
         // Two mics: the first speaker loud on one and 18 dB down on the other, then the second speaker the other way.
         const int rate = 48000;

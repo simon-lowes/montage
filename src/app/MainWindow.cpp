@@ -123,6 +123,7 @@
 #include "render/AutoBroll.h"
 #include "render/Highlights.h"
 #include "render/Shorts.h"
+#include "render/Letterbox.h"
 #include "media/MicBleed.h"
 #include "render/MusicEdit.h"
 #include "render/VoiceMatch.h"
@@ -805,6 +806,7 @@ void MainWindow::buildMenus() {
             if (dlg.exec() == QDialog::Accepted) AutoDuckDialog::apply(state_, music, dlg.dialogueTracks(), dlg.options(), this);
         }))->setObjectName(QStringLiteral("autoDuck"));
     add(clipM, tr("Remove Mic &Bleed…"), QKeySequence(), withSeq([this] { micBleedDialog(); }))->setObjectName(QStringLiteral("removeMicBleed"));
+    add(clipM, tr("Remove Letterbo&x"), QKeySequence(), withSeq([this] { removeLetterbox(); }))->setObjectName(QStringLiteral("removeLetterbox"));
     add(clipM, tr("Auto &Colour"), QKeySequence("Ctrl+Alt+C"), [this] { autoColor(); });
     add(clipM, tr("Set Colour &Reference"), QKeySequence(), [this] { setColourReference(); })
         ->setObjectName(QStringLiteral("setColourReference"));
@@ -3622,6 +3624,47 @@ void MainWindow::micBleedDialog() {
         return;
     }
     removeMicBleed(tracks, amount->value());
+}
+
+int MainWindow::removeLetterbox() {
+    const Sequence* s = state_->sequence();
+    if (!s) return 0;
+    struct Job {
+        Id clip;
+        std::string path;
+        double from, to;
+    };
+    std::vector<Job> jobs;
+    const double fps = s->fpsValue();
+    for (Id id : state_->selectedClips())
+        for (const Track& t : s->videoTracks)
+            for (const Clip& c : t.clips)
+                if (c.id == id && c.mediaId)
+                    if (const MediaItem* m = state_->project().findMedia(c.mediaId); m && m->kind == MediaKind::Video)
+                        jobs.push_back({c.id, m->path, std::min(c.sourceAt(0), c.sourceAt(double(c.duration))) / fps,
+                                        std::max(c.sourceAt(0), c.sourceAt(double(c.duration))) / fps});
+    if (jobs.empty()) {
+        state_->message(tr("Select the video clips with black bars to remove"));
+        return 0;
+    }
+    std::vector<Bars> bars(jobs.size());
+    if (!runWithProgress(this, state_, tr("Looking for black bars..."), [&](const auto& progress, const auto* cancel, std::string* e) {
+            for (size_t i = 0; i < jobs.size(); ++i) {
+                if (!detectBars(jobs[i].path, jobs[i].from, jobs[i].to, bars[i], e, 9, cancel)) return false;
+                progress(double(i + 1) / double(jobs.size()));
+            }
+            return true;
+        }))
+        return 0;
+    int changed = 0;
+    state_->apply(tr("Remove Letterbox"), [&](Project& p, Sequence& sq) {
+        edit::Result all = edit::Result::fail("");
+        for (size_t i = 0; i < jobs.size(); ++i)
+            if (bars[i].any() && edit::removeLetterbox(p, sq, jobs[i].clip, bars[i]).ok) ++changed, all = {};
+        return all;
+    });
+    state_->message(changed ? tr("Cropped the black bars off %n clip(s)", "", changed) : tr("No black bars found round the pictures"), 5000);
+    return changed;
 }
 
 std::vector<Id> MainWindow::shortsSource() const {

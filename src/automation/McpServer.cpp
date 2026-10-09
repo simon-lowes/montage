@@ -81,6 +81,7 @@
 #include "render/Compositor.h"
 #include "render/Exporter.h"
 #include "render/Shorts.h"
+#include "render/Letterbox.h"
 #include "render/Processing.h"
 
 namespace montage {
@@ -3768,7 +3769,8 @@ void McpServer::Impl::addTools() {
             "rotation":{"type":"number"},"opacity":{"type":"number"},"crop_left":{"type":"number"},"crop_right":{"type":"number"},
             "crop_top":{"type":"number"},"crop_bottom":{"type":"number"},"fit":{"type":"string","enum":["fit","fill","stretch","none"]},
             "align":{"type":"string","enum":["center","top","bottom","left","right","top_left","top_right","bottom_left","bottom_right"]},
-            "inset":{"type":"number","default":0.05}},"required":["project","clip"]})json",
+            "inset":{"type":"number","default":0.05},
+            "remove_letterbox":{"type":"boolean","default":false,"description":"Find black bars baked into the picture (letterbox, pillarbox), crop them off and scale what is left to fill the frame"}},"required":["project","clip"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
@@ -3816,14 +3818,32 @@ void McpServer::Impl::addTools() {
                 check(edit::alignClip(l.project, s, id, t, where, a.value("inset").toDouble(0.05)));
                 ++changed;
             }
+            QJsonObject found;
+            if (a.value("remove_letterbox").toBool()) {
+                const MediaItem* m = c.mediaId ? l.project.findMedia(c.mediaId) : nullptr;
+                if (!m || m->kind != MediaKind::Video) throw ArgError{"remove_letterbox needs a video clip"};
+                const double fps = s.fpsValue();
+                const double from = std::min(c.sourceAt(0), c.sourceAt(double(c.duration))) / fps, to = std::max(c.sourceAt(0), c.sourceAt(double(c.duration))) / fps;
+                Bars bars;
+                std::string err;
+                if (!detectBars(m->path, from, to, bars, &err)) return fail(QString::fromStdString(err));
+                found = QJsonObject{{"left", bars.left}, {"right", bars.right}, {"top", bars.top}, {"bottom", bars.bottom}};
+                if (bars.any()) {
+                    check(edit::removeLetterbox(l.project, s, id, bars));
+                    ++changed;
+                } else if (!changed) {
+                    return ok("No black bars found round the picture", QJsonObject{{"bars", found}});
+                }
+            }
             if (!changed) throw ArgError{"Give a setting to change, or align"};
             save(l);
             std::array<double, 4> xs, ys;
             QJsonArray corners;
             if (clipFrameQuad(l.project, s, *edit::clipById(s, id), t, xs, ys))
                 for (int k = 0; k < 4; ++k) corners.append(QJsonArray{std::round(xs[size_t(k)] * 10) / 10, std::round(ys[size_t(k)] * 10) / 10});
-            return ok(QStringLiteral("The picture lies at %1").arg(QString::fromUtf8(QJsonDocument(corners).toJson(QJsonDocument::Compact))),
-                      QJsonObject{{"corners", corners}});
+            QJsonObject res{{"corners", corners}};
+            if (!found.isEmpty()) res["bars"] = found;
+            return ok(QStringLiteral("The picture lies at %1").arg(QString::fromUtf8(QJsonDocument(corners).toJson(QJsonDocument::Compact))), res);
         });
 
     add("montage_reframe_360", "Reframe 360° video",

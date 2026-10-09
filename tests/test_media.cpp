@@ -69,6 +69,7 @@
 #include "render/MusicEdit.h"
 #include "render/Highlights.h"
 #include "render/Shorts.h"
+#include "render/Letterbox.h"
 #include "media/Psd.h"
 #include "media/MicBleed.h"
 #include "render/ProjectManager.h"
@@ -6653,6 +6654,97 @@ private slots:
         QVERIFY(loadProject(project.toStdString(), back));
         QCOMPARE(back.sequences.size(), size_t(2));
         QCOMPARE(back.sequences.back().name, std::string("Highlights"));
+    }
+
+    void removeLetterboxBars() {
+        // Footage with bars baked in: a moving coloured picture 320 x 120 inside a black 320 x 180 frame (30 px bars top
+        // and bottom), and another 240 wide (40 px bars either side); both start with half a second of black.
+        auto footage = [&](int boxW, int boxH, const std::string& file) {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 320, gs.height = 180, gs.fps = {25, 1};
+            Clip box = makeGeneratorClip(gen, "shape", 75);
+            box.start = 12;
+            box.generator.params["width"] = Param(double(boxW));
+            box.generator.params["height"] = Param(double(boxH));
+            box.generator.params["color.r"].addKey(0, 0.9);
+            box.generator.params["color.r"].addKey(74, 0.2);
+            box.generator.params["color.g"] = Param(0.5);
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, box);
+            ExportSettings st;
+            st.path = file;
+            st.audioCodec = "none";
+            st.preset = "ultrafast";
+            st.crf = 10;
+            std::string err;
+            return exportSequence(gen, gs, st, nullptr, nullptr, &err);
+        };
+        const std::string wide = path("letterboxed.mp4"), narrow = path("pillarboxed.mp4");
+        QVERIFY(footage(320, 120, wide));
+        QVERIFY(footage(240, 180, narrow));
+        Bars bars;
+        std::string err;
+        QVERIFY2(detectBars(wide, 0, 3.5, bars, &err), err.c_str());
+        QVERIFY2(std::fabs(bars.top - 30 / 180.0) < 0.012 && std::fabs(bars.bottom - 30 / 180.0) < 0.012,
+                 qPrintable(QString("%1 %2").arg(bars.top).arg(bars.bottom)));
+        QCOMPARE(bars.left, 0.0);
+        QCOMPARE(bars.right, 0.0);
+        QVERIFY(detectBars(narrow, 0, 3.5, bars, &err));
+        QVERIFY2(std::fabs(bars.left - 40 / 320.0) < 0.01 && std::fabs(bars.right - 40 / 320.0) < 0.01, qPrintable(QString::number(bars.left)));
+        QCOMPARE(bars.top, 0.0);
+        // A clip of the letterboxed footage: cropped and scaled to fill the frame.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = {25, 1};
+        MediaItem m = probeOrFail(p, wide);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Id clip = s.videoTracks[0].clips.at(0).id;
+        QVERIFY(detectBars(wide, 0, 3.5, bars, &err));
+        QVERIFY(edit::removeLetterbox(p, s, clip, bars).ok);
+        const Clip& c = s.videoTracks[0].clips.at(0);
+        QVERIFY2(std::fabs(c.motion.p("scale", 0) - 150) < 3, qPrintable(QString::number(c.motion.p("scale", 0))));
+        QVERIFY(c.motion.p("crop_top", 0) > 15);
+        const Image frame = renderSequenceFrame(p, s, 40, {});
+        for (int y : {3, 90, 176}) {
+            const size_t i = (size_t(y) * size_t(frame.width) + 160) * 4;
+            QVERIFY2(frame.px[i + 1] > 0.3f, qPrintable(QString("row %1 is still dark").arg(y)));  // the picture's green reaches the edges
+        }
+        QVERIFY(!edit::removeLetterbox(p, s, clip, Bars{}).ok);  // nothing to do
+        // Footage without bars: none found.
+        Project g2 = makeDefaultProject();
+        Sequence& s2 = *g2.active();
+        s2.width = 160, s2.height = 90;
+        Clip full = makeGeneratorClip(g2, "color", 25);
+        full.generator.params["color.g"] = Param(0.6);
+        edit::overwrite(g2, s2, {TrackKind::Video, 0}, full);
+        ExportSettings st;
+        st.path = path("no-bars.mp4");
+        st.audioCodec = "none";
+        st.preset = "ultrafast";
+        QVERIFY(exportSequence(g2, s2, st, nullptr, nullptr, &err));
+        QVERIFY(detectBars(st.path, 0, 1, bars, &err));
+        QVERIFY(!bars.any());
+        // Over MCP.
+        Project q = makeDefaultProject();
+        q.active()->width = 320, q.active()->height = 180;
+        q.media.push_back(probeOrFail(q, narrow));
+        QVERIFY(edit::placeMedia(q, *q.active(), q.media.back().id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Id qclip = q.active()->videoTracks[0].clips.at(0).id;
+        const QString project = QString::fromStdString(path("letterbox.montage"));
+        QVERIFY(saveProject(q, project.toStdString()));
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_transform"}, {"arguments", QJsonObject{{"project", project}, {"clip", double(qclip)}, {"remove_letterbox", true}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject res = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        QVERIFY(res.value("structuredContent").toObject().value("bars").toObject().value("left").toDouble() > 0.1);
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QVERIFY(back.active()->videoTracks[0].clips.at(0).motion.p("crop_left", 0) > 10);
     }
 
     void removeMicBleed() {

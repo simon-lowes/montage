@@ -117,6 +117,9 @@ public:
     // clips. How many clips changed (0 with a message when nothing applies).
     int removeMicBleed(std::vector<int> tracks = {}, double reductionDb = -24);
     void micBleedDialog();
+    // Clip › Remove Letterbox: black bars baked into the selected video clips' pictures found, cropped off and the rest
+    // scaled to fill the frame (render/Letterbox.h), one undo step. How many clips changed.
+    int removeLetterbox();
     // Suggest Chapters: chapter markers where the talk moves on, titled with what each part is about (replacing the
     // chapter markers there were); `ask` shows them first to rename, drop or re-space. How many were added.
     int suggestChapterMarkers(double minSeconds = 30, bool ask = true);
