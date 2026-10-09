@@ -1113,6 +1113,39 @@ Result addTransition(Project& p, Sequence& s, Id clipId, Edge edge, const std::s
     return r;
 }
 
+Result addTransitionsToClips(Project& p, Sequence& s, const std::vector<Id>& clips, const std::string& videoType,
+                             const std::string& audioType, FrameTime duration) {
+    Result res;
+    std::string why = "Select clips on unlocked tracks";
+    std::set<std::pair<Id, Id>> done;  // edit points given one: (clip before, clip after), 0 for a gap
+    for (Id id : clips) {
+        for (Edge edge : {Edge::In, Edge::Out}) {
+            const auto loc = locate(s, id);
+            if (!loc) break;
+            const Track* t = trackAt(s, loc->track);
+            if (t->locked) {
+                why = "The clips' tracks are locked";
+                break;
+            }
+            const Clip& c = t->clips[loc->index];
+            std::pair<Id, Id> point{0, 0};
+            if (edge == Edge::Out) {
+                point.first = c.id;
+                if (loc->index + 1 < t->clips.size() && t->clips[loc->index + 1].start == c.end()) point.second = t->clips[loc->index + 1].id;
+            } else {
+                point.second = c.id;
+                if (loc->index > 0 && t->clips[loc->index - 1].end() == c.start) point.first = t->clips[loc->index - 1].id;
+            }
+            if (!done.insert(point).second) continue;
+            const bool audio = loc->track.kind == TrackKind::Audio;
+            const Result r = addTransition(p, s, id, edge, audio ? audioType : videoType, duration);
+            if (r.ok) res.created.insert(res.created.end(), r.created.begin(), r.created.end());
+            else why = r.error;
+        }
+    }
+    return res.created.empty() ? Result::fail(why) : res;
+}
+
 FrameTime previousClipEdge(const Sequence& s, FrameTime frame) {
     FrameTime best = -1;
     for (const auto* list : {&s.videoTracks, &s.audioTracks})

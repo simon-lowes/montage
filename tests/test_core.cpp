@@ -1,5 +1,6 @@
 // Engine tests: keyframes, timecode, edit operations, undo, project I/O.
 #include <QtTest>
+#include <set>
 #include <random>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -1403,6 +1404,34 @@ private slots:
         Id au = fx.put(A1, 0, 60);
         auto af = addTransition(fx.p, fx.s(), au, Edge::In, "wipe", 10);
         QCOMPARE(QString::fromStdString(transitionById(fx.s(), af.created[0])->type), QString("crossfade"));
+    }
+
+    void transitionsOnSelectedClips() {
+        Fixture fx;
+        // A | B | C butted together, D after a gap, and a sound clip under A.
+        const Id a = fx.put(V1, 0, 60, 30), b = fx.put(V1, 60, 60, 30), c = fx.put(V1, 120, 60, 30), d = fx.put(V1, 220, 60, 30);
+        const Id au = fx.put(A1, 0, 60, 30);
+        (void)c;
+        auto r = addTransitionsToClips(fx.p, fx.s(), {a, b, d, au}, "cross_dissolve", "crossfade", 10);
+        QVERIFY2(r.ok, r.error.c_str());
+        // A's head (a fade), A|B once, B|C, D's head and tail (fades), and the sound's two ends.
+        QCOMPARE(fx.v1().transitions.size(), size_t(5));
+        QCOMPARE(fx.a1().transitions.size(), size_t(2));
+        QCOMPARE(r.created.size(), size_t(7));
+        std::set<std::pair<Id, Id>> points;
+        for (const Transition& t : fx.v1().transitions) {
+            points.insert({t.clipA, t.clipB});
+            QCOMPARE(t.type, std::string("cross_dissolve"));
+        }
+        QVERIFY(points.count({0, a}) && points.count({a, b}) && points.count({b, c}) && points.count({0, d}) && points.count({d, 0}));
+        QCOMPARE(fx.a1().transitions.front().type, std::string("crossfade"));
+        // Again: the same edit points, replaced rather than doubled.
+        QVERIFY(addTransitionsToClips(fx.p, fx.s(), {a, b}, "wipe", "crossfade", 10).ok);
+        QCOMPARE(fx.v1().transitions.size(), size_t(5));
+        // Locked tracks are left alone; nothing to do is an error.
+        fx.v1().locked = true;
+        QVERIFY(!addTransitionsToClips(fx.p, fx.s(), {a}, "cross_dissolve", "crossfade", 10).ok);
+        QVERIFY(!addTransitionsToClips(fx.p, fx.s(), {}, "cross_dissolve", "crossfade", 10).ok);
     }
 
     void moveOverwritesAndClamps() {

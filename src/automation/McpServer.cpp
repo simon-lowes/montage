@@ -1176,15 +1176,30 @@ void McpServer::Impl::addTools() {
         });
 
     add("montage_add_transition", "Add a transition",
-        "Add a transition at a clip's start or end (cross_dissolve by default, centred on the cut).",
+        "Add a transition at a clip's start or end (cross_dissolve by default, centred on the cut). With `clips` "
+        "instead (Premiere's Apply Default Transitions to Selection), one at both ends of every clip listed: each edit "
+        "point once, a fade where a clip meets a gap; `type` on picture clips and `audio_type` (crossfade) on sound.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
+            "clips":{"type":"array","items":{"type":"number"}},
             "edge":{"type":"string","enum":["in","out"],"default":"in"},"type":{"type":"string","default":"cross_dissolve"},
-            "duration":{"type":["number","string"],"default":1}},"required":["project","clip"]})json",
+            "audio_type":{"type":"string","default":"crossfade"},
+            "duration":{"type":["number","string"],"default":1}},"required":["project"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
-            const Id id = clipArg(l, a).id;
             const FrameTime len = a.contains("duration") ? timeArg(a.value("duration"), s, "duration") : FrameTime(std::llround(s.fpsValue()));
+            if (a.contains("clips")) {
+                std::vector<Id> ids;
+                for (const QJsonValue& v : a.value("clips").toArray()) ids.push_back(Id(v.toDouble()));
+                const edit::Result r = edit::addTransitionsToClips(l.project, s, ids, str(a, "type", "cross_dissolve").toStdString(),
+                                                                   str(a, "audio_type", "crossfade").toStdString(), std::max<FrameTime>(1, len));
+                check(r);
+                save(l);
+                QJsonArray made;
+                for (Id t : r.created) made.append(double(t));
+                return ok(QStringLiteral("Added %1 transitions").arg(r.created.size()), QJsonObject{{"transitions", made}});
+            }
+            const Id id = clipArg(l, a).id;
             check(edit::addTransition(l.project, s, id, str(a, "edge", "in") == "out" ? edit::Edge::Out : edit::Edge::In,
                                       str(a, "type", "cross_dissolve").toStdString(), std::max<FrameTime>(1, len)));
             save(l);

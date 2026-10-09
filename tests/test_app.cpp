@@ -2457,6 +2457,27 @@ private slots:
         state()->setSelection({}, false);
     }
 
+    void transitionsToSelection() {
+        loadDemo();
+        const Id red = clipNamed(*state()->sequence(), "Red")->id, blue = clipNamed(*state()->sequence(), "Blue")->id;
+        state()->setSelection({red, blue}, false);
+        QAction* all = win_->findChild<QAction*>("transitionsToSelection");
+        QVERIFY(all);
+        QCOMPARE(all->shortcut(), QKeySequence("Shift+D"));
+        all->trigger();
+        // Red's head, the cut and Blue's tail, in one undo step.
+        QCOMPARE(trackAt(*state()->sequence(), V1)->transitions.size(), size_t(3));
+        state()->undo();
+        QCOMPARE(trackAt(*state()->sequence(), V1)->transitions.size(), size_t(0));
+        // Ctrl+D with both selected does the same for pictures.
+        win_->addTransitionsToSelection(TrackKind::Video);
+        QCOMPARE(trackAt(*state()->sequence(), V1)->transitions.size(), size_t(3));
+        state()->undo();
+        state()->setSelection({}, false);
+        all->trigger();  // nothing selected: a hint, no change
+        QCOMPARE(trackAt(*state()->sequence(), V1)->transitions.size(), size_t(0));
+    }
+
     void clipAnimationInInspector() {
         loadDemo();
         const Id red = clipNamed(*state()->sequence(), "Red")->id;

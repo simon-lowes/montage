@@ -734,6 +734,8 @@ void MainWindow::buildMenus() {
     add(clipM, tr("Add Edit to &All Tracks"), QKeySequence("Ctrl+Shift+K"), [this] { addEdit(true); });
     QAction* trans = add(clipM, tr("Apply Default &Transition"), QKeySequence("Ctrl+D"), [this] { addDefaultTransition(false); });
     add(clipM, tr("Apply Default Audio &Crossfade"), QKeySequence("Ctrl+Shift+D"), [this] { addDefaultTransition(true); });
+    add(clipM, tr("Apply Default Transitions to Selection"), QKeySequence("Shift+D"), [this] { addTransitionsToSelection(); })
+        ->setObjectName(QStringLiteral("transitionsToSelection"));
     QAction* nest = add(clipM, tr("&Nest (Compound Clip)…"), QKeySequence(), [this] {
         auto sel = state_->selectedClips();
         if (sel.empty()) return;
@@ -1784,9 +1786,33 @@ void MainWindow::addEdit(bool allTracks) {
     });
 }
 
+void MainWindow::addTransitionsToSelection(std::optional<TrackKind> only) {
+    const Sequence* s = state_->sequence();
+    if (!s) return;
+    std::vector<Id> clips;
+    for (Id id : state_->selectedClips())
+        if (const auto loc = edit::locate(*s, id); loc && (!only || loc->track.kind == *only)) clips.push_back(id);
+    if (clips.empty()) {
+        state_->message(tr("Select the clips to give transitions"));
+        return;
+    }
+    const FrameTime dur = FrameTime(std::llround(s->fpsValue()));
+    state_->apply(tr("Apply Default Transitions"), [clips, dur](Project& p, Sequence& sq) {
+        return edit::addTransitionsToClips(p, sq, clips, "cross_dissolve", "crossfade", dur);
+    });
+}
+
 void MainWindow::addDefaultTransition(bool audio) {
     const Sequence* s = state_->sequence();
     if (!s) return;
+    // Several clips of the kind selected: every edit point of each (Premiere and Final Cut do the same).
+    int selected = 0;
+    for (Id id : state_->selectedClips())
+        if (const auto loc = edit::locate(*s, id); loc && loc->track.kind == (audio ? TrackKind::Audio : TrackKind::Video)) ++selected;
+    if (selected > 1) {
+        addTransitionsToSelection(audio ? TrackKind::Audio : TrackKind::Video);
+        return;
+    }
     FrameTime t = state_->playhead();
     TrackRef ref{audio ? TrackKind::Audio : TrackKind::Video, audio ? state_->targetAudioTrack() : state_->targetVideoTrack()};
     // Prefer a selected clip's nearest edge; otherwise the edit point nearest the playhead on the targeted track.

@@ -137,6 +137,11 @@ Result pasteClips(Project& p, Sequence& s, const std::vector<ClipboardItem>& ite
 
 // ---- Transitions -----------------------------------------------------------------
 Result addTransition(Project& p, Sequence& s, Id clipId, Edge edge, const std::string& type, FrameTime duration);
+// Premiere's Apply Default Transitions to Selection, Final Cut's Add Transition on several clips: a transition at both
+// ends of each clip (one per edit point where two meet, a fade where a clip meets a gap), `videoType` on picture
+// clips and `audioType` on sound. Clips on locked tracks are left. The transitions are in `created`.
+Result addTransitionsToClips(Project& p, Sequence& s, const std::vector<Id>& clips, const std::string& videoType,
+                             const std::string& audioType, FrameTime duration);
 Result removeTransition(Sequence& s, Id transitionId);
 Transition* transitionById(Sequence& s, Id id, TrackRef* where = nullptr);
 // Timeline range covered by a transition on a track.

@@ -1815,6 +1815,32 @@ private slots:
         QVERIFY(r.value("structuredContent").toObject().value("keys").toInt() >= 2);
     }
 
+    void mcpTransitionsOnClips() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        Clip a = makeGeneratorClip(p, "color", 50), b = makeGeneratorClip(p, "color", 50);
+        b.start = 50;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, a);
+        edit::overwrite(p, s, {TrackKind::Video, 0}, b);
+        const QString project = QString::fromStdString(path("transitions-mcp.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_add_transition"},
+                                                     {"arguments", QJsonObject{{"project", project}, {"clips", QJsonArray{double(a.id), double(b.id)}},
+                                                                               {"type", "wipe"}, {"duration", 10}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("transitions").toArray().size(), 3);
+        Project after;
+        QVERIFY(loadProject(project.toStdString(), after));
+        QCOMPARE(after.active()->videoTracks[0].transitions.size(), size_t(3));
+        QCOMPARE(after.active()->videoTracks[0].transitions[0].type, std::string("wipe"));
+    }
+
     void reframe360() {
         // A coded sphere: red is the longitude (0 at -180°, 1 at +180°), green the latitude (0 at the top).
         Image sphere(720, 360);

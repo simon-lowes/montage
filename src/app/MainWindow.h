@@ -190,6 +190,8 @@ public:
     // or split each into a clip per channel (per pair with `pairs`); one undo step each.
     bool setSelectionChannels(const std::vector<int>& channels);
     bool splitSelectionChannels(bool pairs);
+    // Apply Default Transitions to Selection: both ends of every selected clip (of one kind with `only`); one undo step.
+    void addTransitionsToSelection(std::optional<TrackKind> only = std::nullopt);
     // Speed / Duration on the selected clips (each link group once), with Maintain Audio Pitch; one undo step.
     bool setSelectionSpeed(double speed, bool maintainPitch);
 
