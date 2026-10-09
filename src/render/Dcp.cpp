@@ -26,6 +26,7 @@ extern "C" {
 #include "ColorSpace.h"
 #include "Compositor.h"
 #include "DcpMxf.h"
+#include "Jpeg2000.h"
 #include "PackageFiles.h"
 #include "core/Surround.h"
 #include "media/SuperScale.h"
@@ -82,12 +83,21 @@ struct J2kEncoder {
     AVFrame* frame = nullptr;
     AVPacket* pkt = nullptr;
     bool openjpeg = false;
+    // OpenJPEG itself when Montage is built with it (render/Jpeg2000.h), else FFmpeg's libopenjpeg wrapper or, failing
+    // that, FFmpeg's own encoder (not in the DCI profile).
+    bool direct = false;
+    int w_ = 0, h_ = 0, fps_ = 24;
     ~J2kEncoder() {
         av_packet_free(&pkt);
         av_frame_free(&frame);
         avcodec_free_context(&ctx);
     }
     bool open(int w, int h, int fps, std::string* error) {
+        w_ = w, h_ = h, fps_ = fps;
+        if (openJpegAvailable()) {
+            direct = openjpeg = true;
+            return true;
+        }
         const AVCodec* codec = avcodec_find_encoder_by_name("libopenjpeg");
         openjpeg = codec != nullptr;
         if (!codec) codec = avcodec_find_encoder(AV_CODEC_ID_JPEG2000);
@@ -138,6 +148,8 @@ struct J2kEncoder {
         return true;
     }
     bool encode(const std::vector<uint16_t>& xyz, int64_t index, std::vector<uint8_t>& out, std::string* error) {
+        // The DCI 2K profile, each frame within 250 Mbit/s (the 48 fps limits for every rate above 24).
+        if (direct) return encodeJpeg2000(xyz.data(), w_, h_, 12, 0x0003, fps_ <= 24 ? 1302083 : 651041, out, error);
         if (av_frame_make_writable(frame) < 0) return false;
         for (int y = 0; y < ctx->height; ++y) {
             auto* d = reinterpret_cast<uint8_t*>(frame->data[0] + ptrdiff_t(y) * frame->linesize[0]);

@@ -153,13 +153,17 @@ bool encodeJpeg2000(const uint16_t* rgb, int width, int height, int bits, uint16
     opj_cparameters_t p;
     opj_set_default_encoder_parameters(&p);
     p.rsiz = rsiz;
-    p.tcp_mct = 1;  // RGB through the component transform, as the profiles allow
-    const bool lossless = (rsiz & 0xff00) >= 0x0700;
+    // The DCI cinema profiles (Rsiz 3 and 4) take X'Y'Z' as it is, 9-7 coded, each frame and component capped; the IMF
+    // ones RGB through the component transform.
+    const bool cinema = rsiz == 0x0003 || rsiz == 0x0004;
+    p.tcp_mct = cinema ? 0 : 1;
+    const bool lossless = !cinema && (rsiz & 0xff00) >= 0x0700;
     p.irreversible = lossless ? 0 : 1;
     p.tcp_numlayers = 1;
     p.tcp_rates[0] = 0;
     p.cp_disto_alloc = 1;
     if (!lossless && maxBytes > 0) p.max_cs_size = int(std::min<size_t>(maxBytes, size_t(INT32_MAX)));
+    if (cinema && maxBytes > 0) p.max_comp_size = int(std::min<size_t>(maxBytes / 5 * 4, size_t(INT32_MAX)));
     // OpenJPEG sets the profiles' coding itself for an IMF Rsiz (32 x 32 code-blocks, CPRL, 128 x 128 precincts at the
     // lowest resolution and 256 x 256 above, the decompositions the profile allows) and checks it: a picture it cannot
     // code in the profile comes out without it, which the caller sees in the Rsiz.

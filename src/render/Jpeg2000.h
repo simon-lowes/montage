@@ -20,7 +20,8 @@ uint16_t imfRsiz(int width, int height, int components, double fps, bool lossles
 void imfPictureCoding(uint16_t rsiz, uint8_t out[16]);
 
 // Encodes w x h RGB (three interleaved samples per pixel, `bits` 8 to 16) as a bare codestream in the IMF profile
-// `rsiz`; lossy profiles keep each frame within `maxBytes` (0: no cap).
+// `rsiz`; lossy profiles keep each frame within `maxBytes` (0: no cap). Rsiz 3 or 4 is the DCI 2K or 4K cinema profile
+// for 12-bit X'Y'Z' (no component transform, each component within four fifths of `maxBytes`).
 bool encodeJpeg2000(const uint16_t* rgb, int width, int height, int bits, uint16_t rsiz, size_t maxBytes, std::vector<uint8_t>& out,
                     std::string* error = nullptr);
 // Decodes a codestream to interleaved samples (up to four components).
