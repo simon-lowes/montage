@@ -797,6 +797,21 @@ void McpServer::Impl::addTools() {
             return ok(QStringLiteral("Removed %1 clip(s)").arg(ids.size()), projectJson(l.project));
         });
 
+    add("montage_delete_gaps", "Delete gaps",
+        "Close every stretch of the timeline where no track has anything (Resolve's Delete Gaps), so nothing slips out of "
+        "sync: what follows moves up with its captions, markers and track automation. With leading, the empty start too. "
+        "Gaps that a locked track's clips would have to cross stay.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"leading":{"type":"boolean","default":false}},"required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            int closed = 0;
+            FrameTime frames = 0;
+            check(edit::deleteGaps(l.project, l.seq(), a.value("leading").toBool(), &closed, &frames));
+            save(l);
+            return ok(QStringLiteral("Closed %1 gap(s), %2 in all").arg(closed).arg(tc(frames, l.seq())),
+                      QJsonObject{{"gaps", closed}, {"frames", double(frames)}, {"duration", tc(l.seq().duration(), l.seq())}});
+        });
+
     add("montage_move_clip", "Move a clip",
         "Move a clip (and the clips linked to it) to a new start time, optionally to another video track.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},

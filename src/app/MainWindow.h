@@ -142,6 +142,8 @@ public:
     // File › Export for Review (render/ReviewExport.h): the page written into `folder` and the review copy queued. The
     // page's path ("" if nothing was exported).
     QString exportForReview(const QString& folder, const ReviewExportOptions& options = {});
+    // Edit › Delete Gaps (core edit::deleteGaps): the stretches empty on every track closed in one undo step. How many.
+    int deleteGaps(bool leading = false);
     void exportForReviewDialog();
     bool addToColorGroup(Id group);
     bool removeFromColorGroup();

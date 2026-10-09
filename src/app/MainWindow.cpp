@@ -723,6 +723,7 @@ void MainWindow::buildMenus() {
     del->setShortcuts({QKeySequence::Delete, QKeySequence(Qt::Key_Backspace)});
     QAction* rdel = add(editM, tr("&Ripple Delete"), QKeySequence("Shift+Delete"), [this] { deleteSelection(true); });
     rdel->setShortcuts({QKeySequence("Shift+Delete"), QKeySequence("Shift+Backspace")});
+    add(editM, tr("Delete &Gaps"), QKeySequence(), [this] { deleteGaps(); })->setObjectName(QStringLiteral("deleteGaps"));
     editM->addSeparator();
     add(editM, tr("Select &All"), QKeySequence::SelectAll, withSeq([this] {
             std::vector<Id> all;
@@ -3950,6 +3951,16 @@ void MainWindow::exportVersionsDialog() {
     if (chosen.empty()) return;
     appSettings().setValue(QStringLiteral("export/lastDirectory"), folder->text());
     exportVersions(chosen, folder->text(), captions->isChecked(), loud->currentData().toDouble(), format->currentText());
+}
+
+int MainWindow::deleteGaps(bool leading) {
+    int closed = 0;
+    FrameTime frames = 0;
+    if (!state_->apply(tr("Delete Gaps"), [&](Project& p, Sequence& s) { return edit::deleteGaps(p, s, leading, &closed, &frames); }))
+        return 0;
+    const Sequence* s = state_->sequence();
+    state_->message(tr("Closed %n gap(s), %1 in all", "", closed).arg(QString::fromStdString(formatTimecode(frames, s->fps))), 5000);
+    return closed;
 }
 
 QString MainWindow::exportForReview(const QString& folder, const ReviewExportOptions& options) {

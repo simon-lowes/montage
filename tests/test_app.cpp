@@ -5028,6 +5028,26 @@ const auto seq = [this] { return state()->sequence(); };
         state()->newProject();
     }
 
+    void deleteGapsCommand() {
+        loadDemo();
+        QAction* action = win_->findChild<QAction*>("deleteGaps");
+        QVERIFY(action);
+        const FrameTime end = state()->sequence()->duration();
+        QVERIFY(state()->edit("Late clip", [&](Project& p, Sequence& s) {
+            Clip c = makeGeneratorClip(p, "color", 10);
+            c.start = end + 25;
+            return edit::overwrite(p, s, {TrackKind::Video, 0}, c).ok;
+        }));
+        const Id late = state()->sequence()->videoTracks[0].clips.back().id;
+        action->trigger();
+        QCOMPARE(edit::clipById(*state()->sequence(), late)->start, end);
+        QCOMPARE(state()->sequence()->duration(), end + 10);
+        state()->undo();
+        QCOMPARE(edit::clipById(*state()->sequence(), late)->start, end + 25);
+        QCOMPARE(win_->deleteGaps(), 1);
+        QCOMPARE(win_->deleteGaps(), 0);  // none left
+    }
+
     void broadcastMxfExport() {
         loadDemo();
         RenderQueue* queue = win_->renderQueue();

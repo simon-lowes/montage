@@ -1577,6 +1577,35 @@ private slots:
         QVERIFY(level(musik, 880) > 20 * level(musik, 440));
     }
 
+    void mcpDeleteGaps() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = Rational{25, 1};
+        Clip a = makeGeneratorClip(p, "color", 25), b = makeGeneratorClip(p, "color", 25);
+        b.start = 75;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, a).ok);
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, b).ok);
+        const QString project = QString::fromStdString(path("gaps.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&]() {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_delete_gaps"}, {"arguments", QJsonObject{{"project", project}}},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call();
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("gaps").toInt(), 1);
+        QCOMPARE(r.value("structuredContent").toObject().value("frames").toInt(), 50);
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.active()->duration(), FrameTime(50));
+        QVERIFY(call().value("isError").toBool());  // nothing left to close
+    }
+
     void broadcastMxf() {
         // Dialogue (440 Hz) on A1 and music (880 Hz) on A2 under two seconds of picture.
         constexpr int sr = 48000;

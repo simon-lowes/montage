@@ -3687,6 +3687,65 @@ private slots:
         QCOMPARE(edit::clipById(s, second)->markers.size(), size_t(1));
     }
 
+    void deleteGaps() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = Rational{25, 1};
+        auto place = [&](TrackRef t, FrameTime start, FrameTime len) {
+            Clip c = makeGeneratorClip(p, "color", len);
+            c.start = start;
+            QVERIFY(edit::overwrite(p, s, t, c).ok);
+        };
+        const TrackRef v1{TrackKind::Video, 0}, a1{TrackKind::Audio, 0};
+        // V1: 10-50, 80-130 and 150-200; A1 carries sound under the second gap (a J-cut), so only 50-80 is empty everywhere.
+        place(v1, 10, 40);
+        place(v1, 80, 50);
+        place(v1, 150, 50);
+        place(a1, 120, 50);
+        s.captionTracks.push_back(CaptionTrack{});
+        s.captionTracks[0].captions = {{20, 60, "reaches into the gap"}, {90, 110, "after"}};
+        s.markers = {Marker{65, 0, "in the gap", "", 0, false}, Marker{100, 0, "after", "", 0, false}};
+        trackAt(s, a1)->volumeAuto.addKey(60, -6);   // inside the gap: goes
+        trackAt(s, a1)->volumeAuto.addKey(140, -3);  // after it: moves up
+        s.inPoint = 90;
+        s.outPoint = 160;
+        int closed = 0;
+        FrameTime frames = 0;
+        QVERIFY(edit::deleteGaps(p, s, false, &closed, &frames).ok);
+        QCOMPARE(closed, 1);
+        QCOMPARE(frames, FrameTime(30));
+        const Track& v = *trackAt(s, v1);
+        QCOMPARE(v.clips[0].start, FrameTime(10));  // the empty start stays
+        QCOMPARE(v.clips[1].start, FrameTime(50));
+        QCOMPARE(v.clips[2].start, FrameTime(120));
+        QCOMPARE(trackAt(s, a1)->clips[0].start, FrameTime(90));  // still under the same picture
+        QCOMPARE(s.captionTracks[0].captions[0].end, FrameTime(50));
+        QCOMPARE(s.captionTracks[0].captions[1].start, FrameTime(60));
+        QCOMPARE(s.markers[0].t, FrameTime(50));
+        QCOMPARE(s.markers[1].t, FrameTime(70));
+        QCOMPARE(trackAt(s, a1)->volumeAuto.keys.size(), size_t(1));
+        QCOMPARE(trackAt(s, a1)->volumeAuto.keys[0].t, FrameTime(110));
+        QCOMPARE(s.inPoint, FrameTime(60));
+        QCOMPARE(s.outPoint, FrameTime(130));
+        // Nothing left but the start, which goes when asked.
+        QVERIFY(!edit::deleteGaps(p, s).ok);
+        QVERIFY(edit::deleteGaps(p, s, true, &closed, &frames).ok);
+        QCOMPARE(frames, FrameTime(10));
+        QCOMPARE(trackAt(s, v1)->clips[0].start, FrameTime(0));
+        // A locked track's clips after a gap hold it.
+        Project q = makeDefaultProject();
+        Sequence& t = *q.active();
+        Clip a = makeGeneratorClip(q, "color", 20), b = makeGeneratorClip(q, "color", 20);
+        b.start = 50;
+        QVERIFY(edit::overwrite(q, t, v1, a).ok);
+        QVERIFY(edit::overwrite(q, t, v1, b).ok);
+        trackAt(t, v1)->locked = true;
+        const edit::Result held = edit::deleteGaps(q, t);
+        QVERIFY(!held.ok);
+        QCOMPARE(held.error, std::string("The gaps are held by locked tracks"));
+        QCOMPARE(trackAt(t, v1)->clips[1].start, FrameTime(50));
+    }
+
     void reviewPages() {
         Project p = makeDefaultProject();
         Sequence& s = *p.active();

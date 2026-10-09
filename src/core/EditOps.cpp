@@ -996,6 +996,75 @@ Result insertGap(Project& p, Sequence& s, TrackRef r, FrameTime at, FrameTime le
     return {};
 }
 
+Result deleteGaps(Project& p, Sequence& s, bool leading, int* closed, FrameTime* frames) {
+    (void)p;
+    // What is covered on any track, merged.
+    std::vector<std::pair<FrameTime, FrameTime>> spans;
+    for (TrackRef r : allTracks(s))
+        if (const Track* t = trackAt(s, r))
+            for (const Clip& c : t->clips) spans.push_back({c.start, c.end()});
+    std::sort(spans.begin(), spans.end());
+    std::vector<std::pair<FrameTime, FrameTime>> covered;
+    for (const auto& sp : spans) {
+        if (!covered.empty() && sp.first <= covered.back().second) covered.back().second = std::max(covered.back().second, sp.second);
+        else covered.push_back(sp);
+    }
+    // The gaps between them (and before the first, when asked), last first so earlier ones keep their place.
+    std::vector<std::pair<FrameTime, FrameTime>> gaps;
+    if (leading && !covered.empty() && covered.front().first > 0) gaps.push_back({0, covered.front().first});
+    for (size_t i = 1; i < covered.size(); ++i) gaps.push_back({covered[i - 1].second, covered[i].first});
+    std::reverse(gaps.begin(), gaps.end());
+    auto lockedAfter = [&](FrameTime at) {
+        for (TrackRef r : allTracks(s))
+            if (const Track* t = trackAt(s, r); t && t->locked)
+                for (const Clip& c : t->clips)
+                    if (c.start >= at) return true;
+        return false;
+    };
+    auto shiftParam = [](Param& q, FrameTime from, FrameTime len) {
+        // Keys in the gap go; those after it move up.
+        std::erase_if(q.keys, [&](const Keyframe& k) { return k.t > from - len && k.t < from; });
+        for (Keyframe& k : q.keys)
+            if (k.t >= from) k.t -= len;
+    };
+    int count = 0;
+    FrameTime total = 0;
+    for (const auto& [a, b] : gaps) {
+        const FrameTime len = b - a;
+        if (len <= 0 || lockedAfter(b)) continue;
+        for (TrackRef r : allTracks(s)) {
+            Track* t = trackAt(s, r);
+            if (!t) continue;
+            for (Clip& c : t->clips)
+                if (c.start >= b) c.start -= len;
+            shiftParam(t->volumeAuto, b, len);
+            shiftParam(t->panAuto, b, len);
+            for (Effect& e : t->effects)
+                for (auto& [name, q] : e.params) shiftParam(q, b, len);
+        }
+        for (CaptionTrack& ct : s.captionTracks) {
+            for (Caption& c : ct.captions)
+                if (c.start >= b) {
+                    c.start -= len;
+                    c.end -= len;
+                } else if (c.end > a) {  // reaching into the gap: ends where it starts
+                    c.end = std::max(c.start + 1, std::min(c.end, a));
+                }
+        }
+        for (Marker& m : s.markers)
+            if (m.t >= b) m.t -= len;
+            else if (m.t > a) m.t = a;
+        if (s.inPoint >= b) s.inPoint -= len;
+        if (s.outPoint >= b) s.outPoint -= len;
+        ++count;
+        total += len;
+    }
+    if (closed) *closed = count;
+    if (frames) *frames = total;
+    if (count == 0) return Result::fail(gaps.empty() ? "There are no gaps" : "The gaps are held by locked tracks");
+    return {};
+}
+
 std::vector<Id> soloedTracks(const Sequence& s) {
     std::vector<Id> out;
     for (TrackRef r : allTracks(s))

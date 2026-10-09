@@ -123,6 +123,11 @@ Result closeGap(Project& p, Sequence& s, TrackRef t, FrameTime frame);
 // Pasting a copied gap (Resolve 21.1): `length` frames of empty space opened at `at` on the track, splitting a
 // clip there and pushing what follows (and the same on sync-locked tracks), as an insert edit does.
 Result insertGap(Project& p, Sequence& s, TrackRef t, FrameTime at, FrameTime length);
+// Delete Gaps (Resolve's Edit > Delete Gaps, Premiere's Close Gap on a whole sequence): every stretch where no track
+// has anything is closed, so nothing slips out of sync; what follows moves up, with the captions, sequence markers and
+// track automation after it. The empty start of the cut too when `leading`. A gap is left when a locked track has
+// clips after it (they could not move with the rest). `closed` receives how many gaps went and `frames` their total.
+Result deleteGaps(Project& p, Sequence& s, bool leading = false, int* closed = nullptr, FrameTime* frames = nullptr);
 // Clear Solo (Resolve 21.1): the soloed tracks (as track ids), and all of them soloed again.
 std::vector<Id> soloedTracks(const Sequence& s);
 Result setSoloedTracks(Sequence& s, const std::vector<Id>& tracks);
