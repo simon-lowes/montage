@@ -794,6 +794,18 @@ void MainWindow::buildMenus() {
     compareRef_->setObjectName(QStringLiteral("compareReference"));
     add(clipM, tr("Auto Reframe"), QKeySequence(), [this] { autoReframeClips(); })->setObjectName(QStringLiteral("autoReframeClips"));
     add(clipM, tr("Add Frame &Hold"), QKeySequence("Shift+F"), [this] { addFrameHold(); })->setObjectName(QStringLiteral("addFrameHold"));
+    {
+        // Speed ramp presets on the selected clips: the same footage in the same length, paced differently.
+        QMenu* ramps = clipM->addMenu(tr("Speed &Ramp"));
+        for (const edit::SpeedRampPreset& r : edit::speedRampPresets()) {
+            QAction* a = add(ramps, tr(r.name.c_str()), QKeySequence(), [this, id = r.id, name = r.name] { speedRamp(id, tr(name.c_str())); });
+            a->setObjectName(QString::fromStdString("ramp_" + r.id));
+            a->setStatusTip(tr(r.description.c_str()));
+        }
+        ramps->addSeparator();
+        add(ramps, tr("Remove Ramp"), QKeySequence(), [this] { speedRamp("none", tr("Remove Ramp")); })
+            ->setObjectName(QStringLiteral("ramp_none"));
+    }
     add(clipM, tr("Swap with Previous Clip"), QKeySequence("Ctrl+Shift+,"), [this] { swapClip(false); })->setObjectName(QStringLiteral("swapPrevious"));
     add(clipM, tr("Swap with Next Clip"), QKeySequence("Ctrl+Shift+."), [this] { swapClip(true); })->setObjectName(QStringLiteral("swapNext"));
     add(clipM, tr("Join Through Edits"), QKeySequence(), [this] { joinThroughEdits(); })->setObjectName(QStringLiteral("joinThroughEdits"));
@@ -3085,6 +3097,33 @@ bool MainWindow::swapClip(bool withNext) {
                                   [id, withNext](Project& p, Sequence& sq) { return edit::swapClip(p, sq, id, withNext); });
     if (ok) state_->setSelection(keep.empty() ? std::vector<Id>{id} : keep);
     return ok;
+}
+
+void MainWindow::speedRamp(const std::string& preset, const QString& name) {
+    const Sequence* s = state_->sequence();
+    if (!s) return;
+    // Each selected clip once (its linked sound follows it).
+    std::vector<Id> clips;
+    for (Id id : state_->selectedClips()) {
+        const Clip* c = edit::clipById(*s, id);
+        if (!c || c->isGenerator()) continue;
+        const std::vector<Id> group = edit::linkedClips(*s, id);
+        if (std::none_of(clips.begin(), clips.end(), [&](Id done) { return std::find(group.begin(), group.end(), done) != group.end(); }))
+            clips.push_back(id);
+    }
+    if (clips.empty()) {
+        state_->message(tr("Select clips to ramp"));
+        return;
+    }
+    state_->apply(preset == "none" ? name : tr("Speed Ramp: %1").arg(name), [clips, preset](Project& p, Sequence& sq) {
+        edit::Result last;
+        bool any = false;
+        for (Id id : clips) {
+            last = edit::applySpeedRamp(p, sq, id, preset);
+            any |= last.ok;
+        }
+        return any ? edit::Result{} : last;
+    });
 }
 
 bool MainWindow::addFrameHold() {

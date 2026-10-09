@@ -5693,6 +5693,27 @@ private slots:
         r = tool("montage_add_effect", QJsonObject{{"project", project}, {"clip", second}, {"effect", "invert"},
                                                    {"mask_path", QJsonArray{QJsonArray{0.2, 0.2}, QJsonArray{0.8, 0.2}}}});
         QVERIFY(r.value("isError").toBool() && text(r).contains("three"));
+        // A speed ramp keeps a clip's footage and length (this 7-frame clip is too short for one).
+        r = tool("montage_speed_ramp", QJsonObject{{"project", project}, {"clip", second}, {"preset", "bullet"}});
+        QVERIFY(r.value("isError").toBool() && text(r).contains("too short"));
+        {
+            const QString rampProject = QString::fromStdString(path("ramp.montage"));
+            r = tool("montage_create_project", QJsonObject{{"project", rampProject}, {"media", QJsonArray{QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")}}});
+            QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+            r = tool("montage_project_info", QJsonObject{{"project", rampProject}});
+            double speech = 0;
+            for (const QJsonValue& t : r.value("structuredContent").toObject().value("tracks").toArray())
+                if (const QJsonArray cl = t.toObject().value("clips").toArray(); !cl.isEmpty() && !speech) speech = cl.at(0).toObject().value("id").toDouble();
+            QVERIFY(speech);
+            r = tool("montage_speed_ramp", QJsonObject{{"project", rampProject}, {"clip", speech}, {"preset", "bullet"}});
+            QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+            const QJsonArray speeds = r.value("structuredContent").toObject().value("speeds").toArray();
+            QCOMPARE(speeds.size(), 5);
+            QVERIFY(speeds[2].toDouble() < speeds[0].toDouble() * 0.2);
+            QVERIFY(tool("montage_speed_ramp", QJsonObject{{"project", rampProject}, {"clip", speech}, {"preset", "warp"}}).value("isError").toBool());
+            r = tool("montage_speed_ramp", QJsonObject{{"project", rampProject}, {"clip", speech}, {"preset", "none"}});
+            QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        }
         // Text settings: the Colour Warper's mesh, checked; unknown settings refused.
         r = tool("montage_add_effect", QJsonObject{{"project", project}, {"clip", second}, {"effect", "color_warper"},
                                                    {"strings", QJsonObject{{"mesh", "0,4,30,0,0;6,4,-20,0.1,0"}}}});

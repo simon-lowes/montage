@@ -2118,6 +2118,34 @@ private slots:
         QVERIFY(!tl->selectedGap());
     }
 
+    void speedRampMenu() {
+        state()->newProject();
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        QVERIFY(state()->apply("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        }));
+        const Clip& placed = state()->sequence()->audioTracks[0].clips.at(0);
+        const Id id = placed.id;
+        const double extent = placed.sourceExtent();
+        state()->setSelection({id}, false);
+        QAction* bullet = win_->findChild<QAction*>("ramp_bullet");
+        QVERIFY(bullet && win_->findChild<QAction*>("ramp_none"));
+        bullet->trigger();
+        const Clip* c = edit::clipById(*state()->sequence(), id);
+        QVERIFY(c->ramped());
+        QVERIFY(std::fabs(c->sourceExtent() - extent) < 1e-6);
+        QVERIFY(c->speedAt(c->duration / 2.0) < 0.2 * c->speedAt(0));
+        QCOMPARE(state()->undoText(), tr("Speed Ramp: Bullet"));
+        state()->undo();
+        QVERIFY(!edit::clipById(*state()->sequence(), id)->ramped());
+        // Nothing selected: nothing changes.
+        state()->setSelection({}, false);
+        bullet->trigger();
+        QVERIFY(!edit::clipById(*state()->sequence(), id)->ramped());
+        state()->newProject();
+    }
+
     void gapsCutCopyPasteAndClearSolo() {
         loadDemo();
         const Clip* red = clipNamed(*state()->sequence(), "Red");

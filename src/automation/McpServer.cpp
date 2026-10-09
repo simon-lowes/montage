@@ -682,6 +682,30 @@ void McpServer::Impl::addTools() {
             return ok(QStringLiteral("Trimmed by %1 frame(s)").arg(r.applied), c ? clipJson(l.project, s, *c) : QJsonObject{});
         });
 
+    add("montage_speed_ramp", "Speed ramp a clip",
+        "Give a clip a speed ramp preset (CapCut's speed curves): its Time Remapping curve shaped and eased so it plays "
+        "the same footage in the same length, paced differently; linked sound follows. Presets: montage (quick, slow, "
+        "quick, slow, quick), hero (speeds up, lingers on the middle, speeds away), bullet (fast, almost stopped through "
+        "the middle, fast), jump_cut (a burst of speed in the middle), flash_in, flash_out, slow_in (eases into slow "
+        "motion), fast_out (out of it); none removes the ramp. For smooth slow parts set frames on montage_set_speed "
+        "(optical_flow or ai).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
+            "preset":{"type":"string","enum":["montage","hero","bullet","jump_cut","flash_in","flash_out","slow_in","fast_out","none"]}},
+            "required":["project","clip","preset"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            const Clip& c = clipArg(l, a);
+            const QString preset = need(a, "preset");
+            check(edit::applySpeedRamp(l.project, l.seq(), c.id, preset.toStdString()));
+            save(l);
+            const Clip* after = edit::clipById(l.seq(), c.id);
+            QJsonArray speeds;
+            for (int i = 0; i <= 4; ++i)
+                speeds.append(std::round(after->speedAt(double(after->duration - 1) * i / 4) * 1000) / 1000);
+            return ok(preset == "none" ? QStringLiteral("Removed the ramp") : QStringLiteral("Ramped \"%1\" (%2)").arg(QString::fromStdString(c.name), preset),
+                      QJsonObject{{"speeds", speeds}});
+        });
+
     add("montage_set_speed", "Set clip speed",
         "Change a clip's playback speed (1 = normal, 0.5 = half speed, 2 = double; negative plays backwards). "
         "Its length changes to match, and later clips ripple. frames picks how slow motion makes the frames between "

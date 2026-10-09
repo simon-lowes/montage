@@ -1239,6 +1239,56 @@ Result addFrameHold(Project& p, Sequence& s, Id clipId, FrameTime frame) {
     return r;
 }
 
+const std::vector<SpeedRampPreset>& speedRampPresets() {
+    static const std::vector<SpeedRampPreset> presets = {
+        {"montage", "Montage", "Quick, slow, quick, slow, quick: a rhythmic run of moments", {{0, 1.6}, {0.3, 0.4}, {0.55, 2.2}, {0.8, 0.4}, {1, 1.6}}},
+        {"hero", "Hero", "Speeds up, lingers on the moment in the middle, speeds away", {{0, 1}, {0.3, 2.5}, {0.5, 0.2}, {0.7, 2.5}, {1, 1}}},
+        {"bullet", "Bullet", "Fast in, almost stopped through the middle, fast out", {{0, 2.5}, {0.4, 0.12}, {0.6, 0.12}, {1, 2.5}}},
+        {"jump_cut", "Jump Cut", "A sudden burst of speed in the middle", {{0, 1}, {0.4, 1}, {0.5, 5}, {0.6, 1}, {1, 1}}},
+        {"flash_in", "Flash In", "Rushes in, then plays at an even pace", {{0, 5}, {0.35, 1}, {1, 1}}},
+        {"flash_out", "Flash Out", "Plays at an even pace, then rushes away", {{0, 1}, {0.65, 1}, {1, 5}}},
+        {"slow_in", "Ease into Slow Motion", "Slows gradually to a third of the pace", {{0, 1.6}, {1, 0.35}}},
+        {"fast_out", "Ease out of Slow Motion", "Starts in slow motion and gathers pace", {{0, 0.35}, {1, 1.6}}},
+    };
+    return presets;
+}
+
+Result applySpeedRamp(Project& p, Sequence& s, Id clipId, const std::string& preset) {
+    auto loc = locate(s, clipId);
+    if (!loc) return Result::fail("Unknown clip");
+    if (!editable(trackAt(s, loc->track))) return Result::fail("Track is locked");
+    const Clip base = trackAt(s, loc->track)->clips[loc->index];
+    if (base.isGenerator()) return Result::fail("Speed ramps need footage");
+    if (base.reverse) return Result::fail("Speed ramps need a clip that plays forwards");
+    Param curve(100.0);
+    if (preset != "none") {
+        const auto& all = speedRampPresets();
+        auto it = std::find_if(all.begin(), all.end(), [&](const SpeedRampPreset& r) { return r.id == preset; });
+        if (it == all.end()) return Result::fail("Unknown speed ramp \"" + preset + "\"");
+        if (base.duration < 8) return Result::fail("The clip is too short to ramp");
+        for (const auto& [u, v] : it->shape)
+            curve.addKey(FrameTime(std::llround(u * double(base.duration - 1))), v * 100, Interp::Smooth);
+        // The same footage in the same length: the curve scaled to play what the clip played before.
+        Clip trial = base;
+        if (trial.timing.empty()) trial.timing = makeEffect("time", 0);
+        trial.timing.params["speed"] = curve;
+        const double before = base.sourceExtent(), after = trial.sourceExtent();
+        if (after <= 0 || before <= 0) return Result::fail("The clip has no footage to ramp");
+        for (Keyframe& k : curve.keys) k.v *= before / after;
+    }
+    bool any = false;
+    for (Id id : linkedClips(s, clipId)) {
+        auto l = locate(s, id);
+        if (!l || !editable(trackAt(s, l->track))) continue;
+        Clip& c = trackAt(s, l->track)->clips[l->index];
+        if (c.start != base.start || c.duration != base.duration || c.reverse) continue;
+        if (c.timing.empty()) c.timing = makeEffect("time", p.newId());
+        c.timing.params["speed"] = curve;
+        any = true;
+    }
+    return any ? Result{} : Result::fail("Nothing to ramp");
+}
+
 Result replaceClip(Project& p, Sequence& s, Id clipId, Id mediaId, double srcAlign, FrameTime at) {
     const MediaItem* m = p.findMedia(mediaId);
     if (!m) return Result::fail("Unknown media");

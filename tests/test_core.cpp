@@ -1083,6 +1083,45 @@ private slots:
         QVERIFY(fx.v1().solo && fx.a1().solo);
     }
 
+    void speedRampPresetsKeepFootage() {
+        Fixture fx;
+        auto placed = placeMedia(fx.p, fx.s(), fx.media, 0, 0, 100, V1, A1, false);
+        QVERIFY(placed.ok && placed.created.size() == 2);
+        const Id v = placed.created[0], a = placed.created[1];
+        const double before = clipById(fx.s(), v)->sourceExtent();
+        QVERIFY(std::fabs(before - 100) < 1e-9);
+        // Hero: quick, lingering in the middle, quick; the same footage in the same length; the sound follows.
+        QVERIFY(applySpeedRamp(fx.p, fx.s(), v, "hero").ok);
+        const Clip* c = clipById(fx.s(), v);
+        QVERIFY(c->ramped());
+        QCOMPARE(c->duration, FrameTime(100));
+        QVERIFY2(std::fabs(c->sourceExtent() - before) < 1e-6, qPrintable(QString::number(c->sourceExtent())));
+        QVERIFY(c->speedAt(50) < 0.2 * c->speedAt(30));
+        QVERIFY(c->sourceAt(99) <= 100);
+        QVERIFY(clipById(fx.s(), a)->timing.params.at("speed") == c->timing.params.at("speed"));
+        // Every preset keeps the footage; Flash In starts fast, Ease into Slow Motion ends slow.
+        for (const SpeedRampPreset& r : speedRampPresets()) {
+            QVERIFY(applySpeedRamp(fx.p, fx.s(), v, r.id).ok);
+            QVERIFY2(std::fabs(clipById(fx.s(), v)->sourceExtent() - before) < 1e-6, r.id.c_str());
+        }
+        QVERIFY(applySpeedRamp(fx.p, fx.s(), v, "flash_in").ok);
+        QVERIFY(clipById(fx.s(), v)->speedAt(0) > 3 * clipById(fx.s(), v)->speedAt(80));
+        QVERIFY(applySpeedRamp(fx.p, fx.s(), v, "slow_in").ok);
+        QVERIFY(clipById(fx.s(), v)->speedAt(99) < 0.3 * clipById(fx.s(), v)->speedAt(0));
+        // None takes it away; unknown presets, short clips, reversed clips and generators are refused.
+        QVERIFY(applySpeedRamp(fx.p, fx.s(), v, "none").ok);
+        QVERIFY(!clipById(fx.s(), v)->ramped() && !clipById(fx.s(), a)->ramped());
+        QVERIFY(!applySpeedRamp(fx.p, fx.s(), v, "warp").ok);
+        const Id tiny = fx.put(V1, 200, 5);
+        QVERIFY(!applySpeedRamp(fx.p, fx.s(), tiny, "hero").ok);
+        clipById(fx.s(), v)->reverse = true;
+        QVERIFY(!applySpeedRamp(fx.p, fx.s(), v, "hero").ok);
+        Clip g = makeGeneratorClip(fx.p, "color", 60);
+        g.start = 400;
+        const Id gen = overwrite(fx.p, fx.s(), V1, g).created.at(0);
+        QVERIFY(!applySpeedRamp(fx.p, fx.s(), gen, "hero").ok);
+    }
+
     void copyPasteAndDuplicate() {
         Fixture fx;
         auto r = placeMedia(fx.p, fx.s(), fx.media, 0, 0, 30, V1, A1, false);

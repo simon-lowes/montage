@@ -171,6 +171,15 @@ Result removeAttributes(Project& p, Sequence& s, const std::vector<Id>& ids, uns
 // Freezes video clip `clipId` from `frame` on: it is split there and the rest
 // holds that frame (0 % Time Remapping). Returns the held part's id.
 Result addFrameHold(Project& p, Sequence& s, Id clipId, FrameTime frame);
+// Speed ramp presets (CapCut's speed curves, Final Cut's ramps): the clip's Time Remapping curve given a shape,
+// eased between its points and scaled so the clip still plays the same stretch of footage in the same length
+// (and so never runs past it); its linked clips of the same length follow. "none" takes the ramp away.
+struct SpeedRampPreset {
+    std::string id, name, description;
+    std::vector<std::pair<double, double>> shape;  // (place in the clip 0..1, relative speed)
+};
+const std::vector<SpeedRampPreset>& speedRampPresets();
+Result applySpeedRamp(Project& p, Sequence& s, Id clipId, const std::string& preset);
 
 // Replace Edit: clip `clipId` shows media `mediaId` instead, in the same place
 // and length with its effects and transform, the media's frame `srcAlign`

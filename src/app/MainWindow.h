@@ -217,6 +217,8 @@ private:
     void deleteSelection(bool ripple);
     // Clear Solo (Resolve 21.1): clears every solo, remembering them; with none soloed, restores them.
     void clearOrRestoreSolo();
+    // A speed ramp preset (edit::speedRampPresets, or "none") on the selected clips, one undo step.
+    void speedRamp(const std::string& preset, const QString& name);
     void addEdit(bool allTracks);
     void addDefaultTransition(bool audio);
     void speedDialog();
