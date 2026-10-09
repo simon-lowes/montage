@@ -1,5 +1,6 @@
 #include "Exporter.h"
 
+#include "core/ColorGroups.h"
 #include "core/ClipAnimation.h"
 #include "core/Chapters.h"
 #include "core/Surround.h"
@@ -588,7 +589,9 @@ private:
                 if (edit::transitionRange(t, tr, a, b) && f >= a && f < b) return nullptr;
             }
         }
-        if (!found || found->isGenerator() || !found->effects.empty() || found->blendMode != "normal" || found->speed != 1.0 ||
+        const ColorGroup* group = found ? colorGroupOf(seq_, *found) : nullptr;
+        if (!found || found->isGenerator() || !found->effects.empty() || (group && (!group->pre.empty() || !group->post.empty())) ||
+            found->blendMode != "normal" || found->speed != 1.0 ||
             found->reverse || found->ramped() || !identityMotion(*found, f - found->start))
             return nullptr;
         return found;

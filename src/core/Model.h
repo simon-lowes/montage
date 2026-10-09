@@ -264,7 +264,19 @@ struct Clip {
     // Grade versions (core/GradeVersions.h): empty for a clip with one grade; the shown one's effects are in `effects`.
     std::vector<GradeVersion> gradeVersions;
     int gradeVersion = 0;
+    Id colorGroup = 0;  // the colour group it is graded with (Sequence::colorGroups), 0 = none
     bool operator==(const Clip&) const = default;
+};
+
+// A colour group (Resolve's groups, core/ColorGroups.h): clips graded together. Its pre-clip grade runs on each member
+// before the clip's own effects (to match the shots), its post-clip grade after them (the group's look). Keyframes in
+// either are timed from each clip's start.
+struct ColorGroup {
+    Id id = 0;      // also the owner of its pre-clip effects (edit::effectChain)
+    Id postId = 0;  // the owner of its post-clip effects
+    std::string name;
+    std::vector<Effect> pre, post;
+    bool operator==(const ColorGroup&) const = default;
 };
 
 struct Transition {
@@ -349,6 +361,7 @@ struct Sequence {
     std::vector<std::string> collapsedFolders;  // track folders shown collapsed: "V/name" or "A/name"
     std::map<std::string, double> folderGains;  // audio track folders' faders (a VCA over their tracks), dB, by "A/name"
     std::vector<std::string> mutedRoles;  // audio roles not heard (clip roles, see Clip::role)
+    std::vector<ColorGroup> colorGroups;   // clips graded together (core/ColorGroups.h)
     std::string colorSpace = "rec709";  // working and delivery space (ColorSpace.h id)
     double hdrPeakNits = 1000;          // mastering peak for HDR spaces
     double hdrMaxCll = 0, hdrMaxFall = 0;  // measured light levels (Analyse HDR Light Levels), nits; 0 = not measured

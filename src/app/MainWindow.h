@@ -125,6 +125,11 @@ public:
     // and saved with it (render/LightLevel.h), one undo step, for exports that state them up front; `ask` shows the
     // result with a way to the brightest frame. False (with a message) for SDR sequences or when cancelled.
     bool analyseHdrLightLevels(bool ask = true);
+    // Clip › Colour Group (core/ColorGroups.h), each one undo step: a new group of the selected video clips (its id, 0
+    // with a message when none are selected), the selection joining a group, or leaving its group.
+    Id newColorGroup(const QString& name = {});
+    bool addToColorGroup(Id group);
+    bool removeFromColorGroup();
     // Suggest Chapters: chapter markers where the talk moves on, titled with what each part is about (replacing the
     // chapter markers there were); `ask` shows them first to rename, drop or re-space. How many were added.
     int suggestChapterMarkers(double minSeconds = 30, bool ask = true);

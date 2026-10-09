@@ -51,6 +51,7 @@
 #include "ExposureView.h"
 #include "QualityCheckDialog.h"
 #include "SpellUi.h"
+#include "core/ColorGroups.h"
 #include "ProjectManagerDialog.h"
 #include "MediaBinModel.h"
 #include "ScopesWidget.h"
@@ -6698,6 +6699,59 @@ const auto seq = [this] { return state()->sequence(); };
         }
         scopes.setMode(ScopesWidget::Mode::Waveform);
         QVERIFY(scopes.hasSignal());
+    }
+
+    void colorGroupsFromTheMenu() {
+        state()->newProject();
+        QVERIFY(state()->edit("Shots", [](Project& p, Sequence& s) {
+            for (int i = 0; i < 3; ++i) {
+                Clip c = makeGeneratorClip(p, "color", 10);
+                c.start = i * 10;
+                if (!edit::overwrite(p, s, {TrackKind::Video, 0}, c).ok) return false;
+            }
+            return true;
+        }));
+        const auto& clips = state()->sequence()->videoTracks[0].clips;
+        const Id a = clips[0].id, b = clips[1].id, c = clips[2].id;
+        QVERIFY(win_->findChild<QMenu*>("colorGroupMenu"));
+        state()->setSelection({}, false);
+        QCOMPARE(win_->newColorGroup("Nothing"), Id(0));  // nothing selected
+        state()->setSelection({a, b}, false);
+        const Id group = win_->newColorGroup("Interview");
+        QVERIFY(group);
+        QCOMPARE(colorGroupMembers(*state()->sequence(), group), (std::vector<Id>{a, b}));
+        // The Inspector shows the group's grades for a member, and they run on every member.
+        state()->setSelection({a}, false);
+        auto* inspector = win_->findChild<InspectorWidget*>();
+        QTRY_VERIFY(inspector->findChild<QLabel*>("colorGroupPre") && inspector->findChild<QLabel*>("colorGroupPost"));
+        QVERIFY2(inspector->findChild<QLabel*>("colorGroupPre")->text().contains("2 clip"), qPrintable(inspector->findChild<QLabel*>("colorGroupPre")->text()));
+        const Id post = findColorGroup(*state()->sequence(), group)->postId;
+        QVERIFY(state()->edit("Add", [post](Project& p, Sequence& s) {
+            edit::effectChain(s, post)->push_back(makeEffect(p, "invert"));
+            return true;
+        }));
+        QCOMPARE(gradeChain(*state()->sequence(), *edit::clipById(*state()->sequence(), b)).size(), size_t(1));
+        // The menu: a third clip joins, then leaves.
+        QMenu* menu = win_->findChild<QMenu*>("colorGroupMenu");
+        emit menu->aboutToShow();
+        QVERIFY(menu->findChild<QAction*>("newColorGroup"));
+        state()->setSelection({c}, false);
+        QVERIFY(win_->addToColorGroup(group));
+        QCOMPARE(colorGroupMembers(*state()->sequence(), group).size(), size_t(3));
+        QVERIFY(win_->removeFromColorGroup());
+        QVERIFY(!win_->removeFromColorGroup());
+        QCOMPARE(colorGroupMembers(*state()->sequence(), group).size(), size_t(2));
+        // A clip outside the group shows no group sections.
+        QTRY_VERIFY(!inspector->findChild<QLabel*>("colorGroupPre"));
+        // Undo takes it all back, a step at a time.
+        state()->undo();  // remove
+        state()->undo();  // add
+        state()->undo();  // the effect
+        QVERIFY(findColorGroup(*state()->sequence(), group)->post.empty());
+        state()->undo();  // the group
+        QVERIFY(state()->sequence()->colorGroups.empty());
+        QCOMPARE(edit::clipById(*state()->sequence(), a)->colorGroup, Id(0));
+        state()->newProject();
     }
 
     void spellCheckInCaptionsAndTitles() {

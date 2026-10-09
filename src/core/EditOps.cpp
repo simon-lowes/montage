@@ -1795,6 +1795,10 @@ std::vector<Effect>* effectChain(Sequence& s, Id owner, FrameTime* origin) {
         if (origin) *origin = c->start;
         return &c->effects;
     }
+    for (auto& g : s.colorGroups) {
+        if (g.id == owner) return &g.pre;
+        if (g.postId == owner) return &g.post;
+    }
     return nullptr;
 }
 

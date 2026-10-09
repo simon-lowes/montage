@@ -100,6 +100,7 @@
 #include "render/AudioFx.h"
 #include "render/Compositor.h"
 #include "render/Exporter.h"
+#include "core/ColorGroups.h"
 #include "render/Processing.h"
 #include "media/CameraRaw.h"
 #include "core/Slate.h"
@@ -2042,6 +2043,69 @@ private slots:
         QVERIFY(call({{"x", 5}, {"at", 99}}).value("isError").toBool());
         QVERIFY(call({}).value("isError").toBool());
         QVERIFY(call({{"align", "sideways"}}).value("isError").toBool());
+    }
+
+    void mcpColorGroups() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        for (int i = 0; i < 3; ++i) {
+            Clip c = makeGeneratorClip(p, "color", 10);
+            c.start = i * 10;
+            edit::overwrite(p, s, {TrackKind::Video, 0}, c);
+        }
+        const double a = double(s.videoTracks[0].clips[0].id), b = double(s.videoTracks[0].clips[1].id), c = double(s.videoTracks[0].clips[2].id);
+        const QString project = QString::fromStdString(path("groups-mcp.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        int rid = 1;
+        auto call = [&](const char* name, QJsonObject args) {
+            args["project"] = project;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", rid++}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", name}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) {
+            QString t;
+            for (const QJsonValue& v : r.value("content").toArray()) t += v.toObject().value("text").toString();
+            return t;
+        };
+        QJsonObject r = call("montage_color_group", {});
+        QVERIFY2(!r.value("isError").toBool() && text(r).contains("No colour groups"), qPrintable(text(r)));
+        r = call("montage_color_group", {{"action", "create"}, {"clips", QJsonArray{a, b}}, {"name", "Interview"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        const double group = r.value("structuredContent").toObject().value("group").toDouble();
+        QVERIFY(group > 0);
+        // Grades for the whole group, before and after each clip's own.
+        r = call("montage_add_effect", {{"clip", a}, {"effect", "color_correct"}, {"params", QJsonObject{{"gain", 1.5}}}, {"group_stage", "pre"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = call("montage_add_effect", {{"clip", b}, {"effect", "film_look"}, {"group_stage", "post"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY(call("montage_add_effect", {{"clip", c}, {"effect", "invert"}, {"group_stage", "pre"}}).value("isError").toBool());  // in no group
+        QVERIFY(call("montage_add_effect", {{"clip", a}, {"effect", "invert"}, {"group_stage", "middle"}}).value("isError").toBool());
+        r = call("montage_color_group", {{"action", "add"}, {"clips", QJsonArray{c}}, {"group", "interview"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        const QJsonObject listed = r.value("structuredContent").toObject().value("groups").toArray().at(0).toObject();
+        QCOMPARE(listed.value("clips").toArray().size(), 3);
+        QCOMPARE(listed.value("pre").toArray().at(0).toObject().value("type").toString(), QString("color_correct"));
+        QCOMPARE(listed.value("post").toArray().at(0).toObject().value("type").toString(), QString("film_look"));
+        {
+            Project q;
+            QVERIFY(loadProject(project.toStdString(), q));
+            const Clip* qc = edit::clipById(*q.active(), Id(c));
+            QVERIFY(qc && qc->effects.empty());  // the clip's own grade untouched
+            QCOMPARE(gradeChain(*q.active(), *qc).size(), size_t(2));
+        }
+        r = call("montage_color_group", {{"action", "remove"}, {"clips", QJsonArray{c}}});
+        QCOMPARE(r.value("structuredContent").toObject().value("groups").toArray().at(0).toObject().value("clips").toArray().size(), 2);
+        r = call("montage_color_group", {{"action", "rename"}, {"group", group}, {"name", "Day Interview"}});
+        QVERIFY(text(r).contains("Day Interview"));
+        QVERIFY(call("montage_color_group", {{"action", "delete"}, {"group", "nope"}}).value("isError").toBool());
+        r = call("montage_color_group", {{"action", "delete"}, {"group", "Day Interview"}});
+        QVERIFY(!r.value("isError").toBool() && text(r).contains("No colour groups"));
+        QVERIFY(call("montage_color_group", {{"action", "create"}, {"clips", QJsonArray{}}}).value("isError").toBool());
     }
 
     void mcpSpellCheck() {

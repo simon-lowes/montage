@@ -8,6 +8,7 @@
 
 #include "core/TranscriptCorrect.h"
 #include "core/SpellCheck.h"
+#include "core/ColorGroups.h"
 #include "core/AutoTag.h"
 #include "core/Automation.h"
 #include "core/CaptionTools.h"
@@ -1259,6 +1260,63 @@ private slots:
         QCOMPARE(words.size(), size_t(3));  // the filler is gone
         QVERIFY(std::fabs(words.back().start - (4.7 - 59 / 25.0)) < 0.05);
         QVERIFY(!rippleDeleteRanges(p, s, {}).ok);
+    }
+
+    void colorGroups() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        std::vector<Id> clips;
+        for (int i = 0; i < 3; ++i) {
+            Clip c = makeGeneratorClip(p, "color", 10);
+            c.start = i * 10;
+            QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, c).ok);
+            clips.push_back(s.videoTracks[0].clips.back().id);
+        }
+        Clip own = *edit::clipById(s, clips[1]);
+        // A group of the first two, named by itself; nothing selected refused.
+        QVERIFY(!edit::makeColorGroup(p, s, {}, "").ok);
+        Id g1 = 0;
+        QVERIFY(edit::makeColorGroup(p, s, {clips[0], clips[1]}, "", &g1).ok);
+        QVERIFY(g1);
+        const ColorGroup* g = findColorGroup(s, g1);
+        QVERIFY(g && g->name == "Group 1" && g->postId && g->postId != g->id);
+        QCOMPARE(colorGroupMembers(s, g1), (std::vector<Id>{clips[0], clips[1]}));
+        QCOMPARE(colorGroupOf(s, *edit::clipById(s, clips[2])), (const ColorGroup*)nullptr);
+        // Its grades are effect chains the Inspector edits like any other; the clip's grade sits between them.
+        edit::effectChain(s, g1)->push_back(makeEffect(p, "color_correct"));
+        edit::effectChain(s, g->postId)->push_back(makeEffect(p, "invert"));
+        edit::clipById(s, clips[1])->effects.push_back(makeEffect(p, "blur"));
+        QVERIFY(edit::ownedEffect(s, g->postId, g->post[0].id));
+        const auto chain = gradeChain(s, *edit::clipById(s, clips[1]));
+        QCOMPARE(chain.size(), size_t(3));
+        QVERIFY(chain[0]->type == "color_correct" && chain[1]->type == "blur" && chain[2]->type == "invert");
+        QCOMPARE(gradeChain(s, *edit::clipById(s, clips[2])).size(), size_t(0));
+        // A second group takes a clip from the first; joining, leaving, renaming.
+        Id g2 = 0;
+        QVERIFY(edit::makeColorGroup(p, s, {clips[1], clips[2]}, "Exteriors", &g2).ok);
+        QCOMPARE(colorGroupMembers(s, g1), std::vector<Id>{clips[0]});
+        QCOMPARE(colorGroupMembers(s, g2).size(), size_t(2));
+        QVERIFY(edit::addToColorGroup(s, {clips[0]}, g2).ok);
+        QVERIFY(!edit::addToColorGroup(s, {clips[0]}, g2).ok);  // already in it
+        QVERIFY(!edit::addToColorGroup(s, {clips[0]}, 999999).ok);
+        QVERIFY(edit::removeFromColorGroup(s, {clips[0]}).ok);
+        QVERIFY(!edit::removeFromColorGroup(s, {clips[0]}).ok);
+        QVERIFY(edit::renameColorGroup(s, g2, "Night Exteriors").ok);
+        // Kept with the project, and its ids counted (new ids never clash with them).
+        const std::string file = (QDir::tempPath() + "/montage-colour-groups.montage").toStdString();
+        QVERIFY(saveProject(p, file));
+        Project back;
+        QVERIFY(loadProject(file, back));
+        QFile::remove(QString::fromStdString(file));
+        QCOMPARE(back.active()->colorGroups, s.colorGroups);
+        QCOMPARE(edit::clipById(*back.active(), clips[1])->colorGroup, g2);
+        QVERIFY(back.nextId > findColorGroup(s, g1)->post[0].id && back.nextId > findColorGroup(s, g2)->postId);
+        // Deleting a group leaves its clips with their own grades.
+        QVERIFY(edit::deleteColorGroup(s, g2).ok);
+        QCOMPARE(s.colorGroups.size(), size_t(1));
+        QCOMPARE(edit::clipById(s, clips[1])->colorGroup, Id(0));
+        QCOMPARE(edit::clipById(s, clips[1])->effects.size(), own.effects.size() + 1);
+        QVERIFY(!edit::deleteColorGroup(s, g2).ok);
     }
 
     void spellChecking() {

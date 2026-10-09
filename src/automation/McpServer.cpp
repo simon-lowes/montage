@@ -23,6 +23,7 @@
 #include "core/AudioChannels.h"
 #include "core/TranscriptCorrect.h"
 #include "core/SpellCheck.h"
+#include "core/ColorGroups.h"
 #include "render/LightLevel.h"
 #include "render/Spherical.h"
 #include "render/ClipPlacement.h"
@@ -1175,7 +1176,9 @@ void McpServer::Impl::addTools() {
             "params":{"type":"object","additionalProperties":{"type":"number"}},
             "strings":{"type":"object","additionalProperties":{"type":"string"},"description":"Text settings: curves (\"x,y x,y\"), hue curves, a LUT file, the Colour Warper's mesh (\"spoke,ring,hue,sat,luma;...\": spokes 0-11 every 30 degrees from red, rings 1-4 for saturation 25-100 %, hue moved in degrees, saturation in 0-1 units, brightness in stops)..."},
             "mask_path":{"type":"array","items":{"type":["array","object"]},"description":"A closed Bezier mask: three or more points, fractions of the clip's frame"},
-            "mask_smooth":{"type":"boolean","default":false}},"required":["project","clip","effect"]})json",
+            "mask_smooth":{"type":"boolean","default":false},
+            "group_stage":{"type":"string","enum":["pre","post"],"description":"Add it to the clip's colour group instead: its pre-clip grade (before each member's own effects) or post-clip grade (after them)"}},
+            "required":["project","clip","effect"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
             Clip& c = clipArg(l, a);
@@ -1252,6 +1255,18 @@ void McpServer::Impl::addTools() {
             if (audioClip != (info->category == EffectCategory::AudioFilter))
                 throw ArgError{audioClip ? QStringLiteral("That is an audio clip: choose an audio effect")
                                          : QStringLiteral("That is a video clip: choose a video effect")};
+            if (a.contains("group_stage")) {
+                const QString stage = str(a, "group_stage");
+                ColorGroup* g = findColorGroup(l.seq(), c.colorGroup);
+                if (!g) throw ArgError{"That clip is in no colour group (see montage_color_group)"};
+                if (stage != "pre" && stage != "post") throw ArgError{"\"group_stage\" is pre or post"};
+                if (audioClip || type == "stabilize" || type == "rolling_shutter")
+                    throw ArgError{"A colour group takes picture effects that work the same on each clip"};
+                (stage == "pre" ? g->pre : g->post).push_back(e);
+                save(l);
+                return ok(QStringLiteral("Added %1 to the %2-clip grade of %3").arg(QString::fromStdString(info->displayName), stage, QString::fromStdString(g->name)),
+                          QJsonObject{{"effect_id", double(e.id)}});
+            }
             if (type == "stabilize" || type == "rolling_shutter") {
                 // They work from the camera's movement, measured now, and move the whole frame (so they go first).
                 std::string motion, err;
@@ -1406,6 +1421,59 @@ void McpServer::Impl::addTools() {
                 save(l);
             }
             return ok(text, out);
+        });
+
+    add("montage_color_group", "Colour groups",
+        "Grade shots together, as Resolve's groups do: a colour group's pre-clip grade runs on each member before the "
+        "clip's own effects (to match the shots) and its post-clip grade after them (the group's look). `action`: list "
+        "(the groups, their members and grades), create (a group of `clips`, named `name`), add (`clips` join `group`), "
+        "remove (`clips` leave their groups), rename (`group` to `name`) or delete (`group`; its clips keep their own "
+        "grades). Add grades with montage_add_effect and `group_stage`.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"action":{"type":"string","enum":["list","create","add","remove","rename","delete"],"default":"list"},
+            "clips":{"type":"array","items":{"type":"number"}},"group":{"type":["number","string"],"description":"Its id or name"},
+            "name":{"type":"string"}},"required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const QString action = str(a, "action", "list");
+            std::vector<Id> clips;
+            for (const QJsonValue& v : a.value("clips").toArray()) clips.push_back(Id(v.toDouble()));
+            auto groupArg = [&]() -> Id {
+                const QJsonValue v = a.value("group");
+                for (const ColorGroup& g : s.colorGroups)
+                    if ((v.isDouble() && g.id == Id(v.toDouble())) || (v.isString() && QString::fromStdString(g.name).compare(v.toString(), Qt::CaseInsensitive) == 0))
+                        return g.id;
+                throw ArgError{"No such colour group (see action list)"};
+            };
+            if (action == "create") {
+                Id created = 0;
+                check(edit::makeColorGroup(l.project, s, clips, str(a, "name").toStdString(), &created));
+                save(l);
+                return ok(QStringLiteral("Made the colour group %1").arg(QString::fromStdString(findColorGroup(s, created)->name)),
+                          QJsonObject{{"group", double(created)}});
+            }
+            if (action == "add") check(edit::addToColorGroup(s, clips, groupArg()));
+            else if (action == "remove") check(edit::removeFromColorGroup(s, clips));
+            else if (action == "rename") {
+                const Id g = groupArg();
+                const std::string name = need(a, "name").toStdString();
+                const edit::Result r = edit::renameColorGroup(s, g, name);
+                if (!r.ok && !r.error.empty()) return fail(QString::fromStdString(r.error));
+            } else if (action == "delete") check(edit::deleteColorGroup(s, groupArg()));
+            else if (action != "list") throw ArgError{"\"action\" is list, create, add, remove, rename or delete"};
+            if (action != "list") save(l);
+            QJsonArray groups;
+            QString text = s.colorGroups.empty() ? QStringLiteral("No colour groups.") : QString();
+            for (const ColorGroup& g : s.colorGroups) {
+                QJsonArray members, pre, post;
+                for (Id id : colorGroupMembers(s, g.id)) members.append(double(id));
+                for (const Effect& e : g.pre) pre.append(QJsonObject{{"id", double(e.id)}, {"type", QString::fromStdString(e.type)}});
+                for (const Effect& e : g.post) post.append(QJsonObject{{"id", double(e.id)}, {"type", QString::fromStdString(e.type)}});
+                groups.append(QJsonObject{{"id", double(g.id)}, {"name", QString::fromStdString(g.name)}, {"clips", members}, {"pre", pre}, {"post", post}});
+                text += QStringLiteral("%1 (%2): %3 clip(s), %4 pre-clip and %5 post-clip effect(s)\n")
+                            .arg(QString::fromStdString(g.name)).arg(g.id).arg(members.size()).arg(pre.size()).arg(post.size());
+            }
+            return ok(text.trimmed(), QJsonObject{{"groups", groups}});
         });
 
     add("montage_spell_check", "Check spelling",

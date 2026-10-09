@@ -241,6 +241,7 @@ QJsonObject clipToJson(const Clip& c) {
         o["gradeVersions"] = versions;
         o["gradeVersion"] = c.gradeVersion;
     }
+    if (c.colorGroup) o["colorGroup"] = double(c.colorGroup);
     return o;
 }
 
@@ -292,6 +293,7 @@ Clip clipFromJson(const QJsonObject& o) {
         c.gradeVersions.push_back(std::move(g));
     }
     c.gradeVersion = c.gradeVersions.empty() ? 0 : std::clamp(o.value("gradeVersion").toInt(), 0, int(c.gradeVersions.size()) - 1);
+    c.colorGroup = Id(i64(o.value("colorGroup")));
     return c;
 }
 
@@ -480,6 +482,16 @@ QJsonObject sequenceToJson(const Sequence& s) {
         for (const auto& e : s.masterEffects) fx.append(effectToJson(e));
         o["masterEffects"] = fx;
     }
+    if (!s.colorGroups.empty()) {
+        QJsonArray groups;
+        for (const ColorGroup& g : s.colorGroups) {
+            QJsonArray pre, post;
+            for (const auto& e : g.pre) pre.append(effectToJson(e));
+            for (const auto& e : g.post) post.append(effectToJson(e));
+            groups.append(QJsonObject{{"id", double(g.id)}, {"postId", double(g.postId)}, {"name", qs(g.name)}, {"pre", pre}, {"post", post}});
+        }
+        o["colorGroups"] = groups;
+    }
     if (s.masterVolumeDb != 0) o["masterVolumeDb"] = s.masterVolumeDb;
     if (s.multicam) o["multicam"] = true;
     if (!s.folderGains.empty()) {
@@ -558,6 +570,16 @@ Sequence sequenceFromJson(const QJsonObject& o) {
         s.buses.push_back(std::move(b));
     }
     for (const auto& e : o.value("masterEffects").toArray()) s.masterEffects.push_back(effectFromJson(e));
+    for (const auto& gv : o.value("colorGroups").toArray()) {
+        const QJsonObject go = gv.toObject();
+        ColorGroup g;
+        g.id = Id(i64(go.value("id")));
+        g.postId = Id(i64(go.value("postId")));
+        g.name = go.value("name").toString().toStdString();
+        for (const auto& e : go.value("pre").toArray()) g.pre.push_back(effectFromJson(e));
+        for (const auto& e : go.value("post").toArray()) g.post.push_back(effectFromJson(e));
+        if (g.id && g.postId) s.colorGroups.push_back(std::move(g));
+    }
     s.masterVolumeDb = o.value("masterVolumeDb").toDouble(0);
     return s;
 }
@@ -846,6 +868,12 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
         }
         for (const auto& e : s.masterEffects) bump(e.id);
         for (const auto& ct : s.captionTracks) bump(ct.id);
+        for (const auto& g : s.colorGroups) {
+            bump(g.id);
+            bump(g.postId);
+            for (const auto& e : g.pre) bump(e.id);
+            for (const auto& e : g.post) bump(e.id);
+        }
     }
     p.nextId = std::max(p.nextId, maxId + 1);
     out = std::move(p);

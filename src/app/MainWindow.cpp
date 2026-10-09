@@ -62,6 +62,7 @@
 
 #include "AudioMeterWidget.h"
 #include "audio/PluginEffect.h"
+#include "core/ColorGroups.h"
 #include "core/GradeVersions.h"
 #include "core/AudioChannels.h"
 #include "render/ClipPlacement.h"
@@ -838,6 +839,47 @@ void MainWindow::buildMenus() {
         }))->setObjectName(QStringLiteral("autoDuck"));
     add(clipM, tr("Remove Mic &Bleed…"), QKeySequence(), withSeq([this] { micBleedDialog(); }))->setObjectName(QStringLiteral("removeMicBleed"));
     add(clipM, tr("Remove Letterbo&x"), QKeySequence(), withSeq([this] { removeLetterbox(); }))->setObjectName(QStringLiteral("removeLetterbox"));
+    // Colour groups: grade shots together, before and after each clip's own grade (core/ColorGroups.h).
+    QMenu* groupM = clipM->addMenu(tr("Colour &Group"));
+    groupM->setObjectName(QStringLiteral("colorGroupMenu"));
+    connect(groupM, &QMenu::aboutToShow, this, [this, groupM] {
+        groupM->clear();
+        const Sequence* s = state_->sequence();
+        if (!s) return;
+        groupM->addAction(tr("New Group from Selection…"), this, [this] {
+            bool ok = false;
+            const QString name = QInputDialog::getText(this, tr("New Colour Group"), tr("Name:"), QLineEdit::Normal, QString(), &ok);
+            if (ok) newColorGroup(name.trimmed());
+        })->setObjectName(QStringLiteral("newColorGroup"));
+        QMenu* join = groupM->addMenu(tr("Add Selection to Group"));
+        join->setEnabled(!s->colorGroups.empty());
+        for (const ColorGroup& g : s->colorGroups) {
+            const Id id = g.id;
+            join->addAction(QString::fromStdString(g.name), this, [this, id] { addToColorGroup(id); });
+        }
+        groupM->addAction(tr("Remove Selection from Group"), this, [this] { removeFromColorGroup(); })->setObjectName(QStringLiteral("removeFromColorGroup"));
+        if (s->colorGroups.empty()) return;
+        groupM->addSeparator();
+        QMenu* rename = groupM->addMenu(tr("Rename Group"));
+        QMenu* remove = groupM->addMenu(tr("Delete Group"));
+        QMenu* select = groupM->addMenu(tr("Select Group's Clips"));
+        for (const ColorGroup& g : s->colorGroups) {
+            const Id id = g.id;
+            const QString name = QString::fromStdString(g.name);
+            rename->addAction(name, this, [this, id, name] {
+                bool ok = false;
+                const QString to = QInputDialog::getText(this, tr("Rename Colour Group"), tr("Name:"), QLineEdit::Normal, name, &ok).trimmed();
+                if (ok && !to.isEmpty())
+                    state_->edit(tr("Rename Colour Group"), [id, to](Project&, Sequence& sq) { return edit::renameColorGroup(sq, id, to.toStdString()).ok; });
+            });
+            remove->addAction(name, this, [this, id] {
+                state_->edit(tr("Delete Colour Group"), [id](Project&, Sequence& sq) { return edit::deleteColorGroup(sq, id).ok; });
+            });
+            select->addAction(name, this, [this, id] {
+                if (const Sequence* sq = state_->sequence()) state_->setSelection(colorGroupMembers(*sq, id), false);
+            });
+        }
+    });
     add(clipM, tr("Auto &Colour"), QKeySequence("Ctrl+Alt+C"), [this] { autoColor(); });
     add(clipM, tr("Set Colour &Reference"), QKeySequence(), [this] { setColourReference(); })
         ->setObjectName(QStringLiteral("setColourReference"));
@@ -3697,6 +3739,31 @@ int MainWindow::removeLetterbox() {
     });
     state_->message(changed ? tr("Cropped the black bars off %n clip(s)", "", changed) : tr("No black bars found round the pictures"), 5000);
     return changed;
+}
+
+Id MainWindow::newColorGroup(const QString& name) {
+    const std::vector<Id> sel = state_->selectedClips();
+    Id created = 0;
+    std::string why;
+    state_->apply(tr("New Colour Group"), [&](Project& p, Sequence& s) {
+        const edit::Result r = edit::makeColorGroup(p, s, sel, name.toStdString(), &created);
+        why = r.error;
+        return r;
+    });
+    if (!created) state_->message(QString::fromStdString(why.empty() ? std::string("Select the video clips to group") : why), 4000);
+    else if (const ColorGroup* g = state_->sequence() ? findColorGroup(*state_->sequence(), created) : nullptr)
+        state_->message(tr("Made the colour group %1: its grades are in the Inspector").arg(QString::fromStdString(g->name)), 5000);
+    return created;
+}
+
+bool MainWindow::addToColorGroup(Id group) {
+    const std::vector<Id> sel = state_->selectedClips();
+    return state_->edit(tr("Add to Colour Group"), [&](Project&, Sequence& s) { return edit::addToColorGroup(s, sel, group).ok; });
+}
+
+bool MainWindow::removeFromColorGroup() {
+    const std::vector<Id> sel = state_->selectedClips();
+    return state_->edit(tr("Remove from Colour Group"), [&](Project&, Sequence& s) { return edit::removeFromColorGroup(s, sel).ok; });
 }
 
 bool MainWindow::analyseHdrLightLevels(bool ask) {

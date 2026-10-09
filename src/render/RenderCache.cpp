@@ -10,6 +10,7 @@
 #include <memory>
 
 #include "core/Captions.h"
+#include "core/ColorGroups.h"
 #include "core/EditOps.h"
 #include "core/ProjectIO.h"
 
@@ -74,6 +75,15 @@ bool addFrame(QCryptographicHash& h, const Project& p, const Sequence& seq, Fram
 void addClipAt(QCryptographicHash& h, const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o,
                int depth) {
     addClip(h, c);
+    // Its colour group's grades run on it too.
+    if (const ColorGroup* g = colorGroupOf(seq, c))
+        for (const auto* chain : {&g->pre, &g->post}) {
+            h.addData(chain == &g->pre ? QByteArray("|pre") : QByteArray("|post"));
+            for (Effect e : *chain) {
+                e.id = 0;
+                h.addData(QByteArray::fromStdString(effectToJsonString(e)));
+            }
+        }
     h.addData(QByteArray::number(qint64(t - c.start)));
     if (const MediaItem* m = c.mediaId ? p.findMedia(c.mediaId) : nullptr) {
         if (m->kind == MediaKind::Sequence) {

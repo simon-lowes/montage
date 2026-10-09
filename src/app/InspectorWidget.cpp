@@ -1,5 +1,6 @@
 #include "InspectorWidget.h"
 #include "SpellUi.h"
+#include "core/ColorGroups.h"
 
 #include <QAbstractItemView>
 #include <QCheckBox>
@@ -134,6 +135,14 @@ QString InspectorWidget::signature() const {
     for (const auto& e : c->effects) {
         const long shape = std::lround(e.p("mask.shape", 0));
         sig += QString(":%1%2%3").arg(e.id).arg(e.enabled ? "+" : "-").arg(shape == 3 ? "o" : shape == 5 ? "p" : "");
+    }
+    // Its colour group: rebuild when it joins or leaves one, or the group's effects change.
+    if (const ColorGroup* g = colorGroupOf(*s, *c)) {
+        sig += QString("|G%1:%2:").arg(g->id).arg(QString::fromStdString(g->name));
+        for (const auto* chain : {&g->pre, &g->post}) {
+            for (const auto& e : *chain) sig += QString(":%1%2").arg(e.id).arg(e.enabled ? "+" : "-");
+            sig += '/';
+        }
     }
     return sig;
 }
@@ -570,6 +579,25 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
     }
     // ---- Effect stack ------------------------------------------------------------
     buildEffectStack(clipId, kind, clip.effects, localTime);
+    // ---- Its colour group's grades, before and after its own (core/ColorGroups.h) --------
+    const Sequence* seqNow = state_->sequence();
+    if (const ColorGroup* g = kind == TrackKind::Video && seqNow ? colorGroupOf(*seqNow, clip) : nullptr) {
+        const QString name = QString::fromStdString(g->name);
+        const int members = int(colorGroupMembers(*seqNow, g->id).size());
+        const std::vector<Effect> pre = g->pre, post = g->post;  // copies: building can change the project
+        const Id preOwner = g->id, postOwner = g->postId;
+        for (int stage = 0; stage < 2; ++stage) {
+            QFormLayout* f = addSection(stage == 0 ? tr("Group Pre-Clip: %1").arg(name) : tr("Group Post-Clip: %1").arg(name));
+            auto* note = new QLabel(stage == 0 ? tr("Runs on each of the group's %n clip(s) before its own effects, to match the shots.", "", members)
+                                               : tr("Runs on each of the group's %n clip(s) after its own effects: the group's look.", "", members),
+                                    content_);
+            note->setObjectName(stage == 0 ? QStringLiteral("colorGroupPre") : QStringLiteral("colorGroupPost"));
+            note->setWordWrap(true);
+            note->setStyleSheet(QString("color: %1;").arg(theme::kTextDim.name()));
+            f->addRow(note);
+            buildEffectStack(stage == 0 ? preOwner : postOwner, TrackKind::Video, stage == 0 ? pre : post, localTime);
+        }
+    }
 }
 
 void InspectorWidget::buildChain(Id owner) {

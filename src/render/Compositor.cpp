@@ -1,5 +1,6 @@
 #include "Compositor.h"
 
+#include "core/ColorGroups.h"
 #include "core/Automation.h"
 
 #include <QFont>
@@ -880,27 +881,29 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
     if (src.empty()) return {};
     // Filters run in source space (before the fixed transform), like most NLEs.
     const double pixelScale = effectPixelScale(c, lt, g.sx, mw, src.width);
+    // Its colour group's pre-clip grade, its own effects, then the group's post-clip grade (core/ColorGroups.h).
+    const std::vector<const Effect*> chain = gradeChain(seq, c);
     // The picture's depth, once, for the effects that work by distance.
     std::shared_ptr<const DepthMap> depth;
-    if (std::any_of(c.effects.begin(), c.effects.end(), [&](const Effect& e) { return needsDepth(e, lt); }) && depthAvailable() &&
+    if (std::any_of(chain.begin(), chain.end(), [&](const Effect* e) { return needsDepth(*e, lt); }) && depthAvailable() &&
         depthModel().installed())
         depth = cachedDepth(src);
     DepthScope depthScope(depth);
     // And the people in it, for Remove Background and People masks.
     std::shared_ptr<const ValueMap> people;
-    if (std::any_of(c.effects.begin(), c.effects.end(), [&](const Effect& e) { return needsPersonMatte(e, lt); }) && mattingAvailable() &&
+    if (std::any_of(chain.begin(), chain.end(), [&](const Effect* e) { return needsPersonMatte(*e, lt); }) && mattingAvailable() &&
         mattingModel().installed())
         people = cachedPersonMatte(src);
     PersonScope personScope(people);
     // And the faces, for Face Refinement.
     std::shared_ptr<const std::vector<FaceBox>> faces;
-    if (std::any_of(c.effects.begin(), c.effects.end(), [](const Effect& e) { return needsFaces(e); }) && faceSearchAvailable() &&
+    if (std::any_of(chain.begin(), chain.end(), [](const Effect* e) { return needsFaces(*e); }) && faceSearchAvailable() &&
         faceModel().installed())
         faces = cachedFaces(src);
     FaceScope faceScope(faces);
-    for (const auto& e : c.effects)
-        if (e.type != "video_denoise" && e.type != "super_scale" && e.type != "reframe_360")  // those ran on the source
-            applyVideoEffect(e, lt, src, pixelScale, sourceSeconds);
+    for (const Effect* e : chain)
+        if (e->type != "video_denoise" && e->type != "super_scale" && e->type != "reframe_360")  // those ran on the source
+            applyVideoEffect(*e, lt, src, pixelScale, sourceSeconds);
     if (identityLayer(src, g, SW, SH, o.scale)) return src;  // a full-frame clip: no copy
     return transformLayer(src, g, SW, SH, o.scale);
 }

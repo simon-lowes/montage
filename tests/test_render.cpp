@@ -9,6 +9,7 @@
 #include <tuple>
 
 #include "core/ClipAnimation.h"
+#include "core/ColorGroups.h"
 #include "core/GradeVersions.h"
 #include "core/Captions.h"
 #include "core/EditOps.h"
@@ -3200,6 +3201,65 @@ colorspaces:
             Effect t = makeEffect(p, id);
             QVERIFY2(ink(renderGenerator(t, 60, 640, 360, 1.0, 90, 30), 0, 640) > 50, id);
         }
+    }
+
+    void colorGroupGrades() {
+        // Two grey shots in a group: its pre-clip grade (gain x2) before each one's own (invert on the second), its
+        // post-clip grade (tint) after.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64, s.height = 36;
+        for (int i = 0; i < 2; ++i) {
+            Clip c = makeGeneratorClip(p, "color", 10);
+            for (const char* k : {"color.r", "color.g", "color.b"}) c.generator.params[k] = 0.25;
+            c.start = i * 10;
+            QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, c).ok);
+        }
+        const Id a = s.videoTracks[0].clips[0].id, b = s.videoTracks[0].clips[1].id;
+        edit::clipById(s, b)->effects.push_back(makeEffect(p, "invert"));
+        Id group = 0;
+        QVERIFY(edit::makeColorGroup(p, s, {a, b}, "Interview", &group).ok);
+        ColorGroup* g = findColorGroup(s, group);
+        Effect gain = makeEffect(p, "color_correct");
+        gain.params["gain"] = 2.0;
+        g->pre.push_back(gain);
+        Effect warm = makeEffect(p, "color_correct");
+        warm.params["temperature"] = 40.0;
+        g->post.push_back(warm);
+        RenderOptions o;
+        auto px = [&](const Sequence& seq, FrameTime t) {
+            const Image img = renderProgramFrame(p, seq, t, o);
+            const float* v = img.at(32, 18);
+            return std::array<float, 3>{v[0], v[1], v[2]};
+        };
+        // The same as each clip with the chain written out on it.
+        Sequence flat = s;
+        flat.colorGroups.clear();
+        for (Clip& c : flat.videoTracks[0].clips) {
+            std::vector<Effect> chain = {gain};
+            chain.insert(chain.end(), c.effects.begin(), c.effects.end());
+            chain.push_back(warm);
+            c.effects = chain;
+            c.colorGroup = 0;
+        }
+        for (FrameTime t : {FrameTime(2), FrameTime(12)}) {
+            const auto grouped = px(s, t), written = px(flat, t);
+            for (int k = 0; k < 3; ++k) QVERIFY2(std::fabs(grouped[k] - written[k]) < 1e-5, qPrintable(QString::number(t)));
+        }
+        // The order matters: gain then invert is not invert then gain.
+        Sequence wrong = flat;
+        std::swap(wrong.videoTracks[0].clips[1].effects[0], wrong.videoTracks[0].clips[1].effects[1]);
+        QVERIFY(std::fabs(px(wrong, 12)[1] - px(s, 12)[1]) > 0.05);
+        // Warmer than neutral: the post-clip grade ran.
+        QVERIFY(px(s, 2)[0] > px(s, 2)[2] + 0.02);
+        // A change to the group's grade changes the rendered frames' cache key; ungrouped clips render as before.
+        const QByteArray before = frameKey(p, s, 2, o);
+        g->post[0].params["temperature"] = 10.0;
+        QVERIFY(frameKey(p, s, 2, o) != before);
+        Sequence none = s;
+        none.colorGroups.clear();
+        const float plain = px(none, 2)[1];
+        QVERIFY2(std::fabs(plain - 0.25f) < 0.02f, qPrintable(QString::number(plain)));
     }
 
     void qualityCheckSpelling() {
