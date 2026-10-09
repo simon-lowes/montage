@@ -224,6 +224,18 @@ QJsonObject clipToJson(const Clip& c) {
     if (!c.animOut.type.empty()) anim["out"] = QJsonArray{qs(c.animOut.type), c.animOut.seconds};
     if (!c.animLoop.type.empty()) anim["combo"] = QJsonArray{qs(c.animLoop.type), c.animLoop.seconds};
     if (!anim.isEmpty()) o["animation"] = anim;
+    if (!c.gradeVersions.empty()) {
+        QJsonArray versions;
+        for (const GradeVersion& v : c.gradeVersions) {
+            QJsonArray fx;
+            for (const Effect& e : v.effects) fx.append(effectToJson(e));
+            QJsonArray at;
+            for (int a : v.anchors) at.append(a);
+            versions.append(QJsonObject{{"name", qs(v.name)}, {"effects", fx}, {"anchors", at}});
+        }
+        o["gradeVersions"] = versions;
+        o["gradeVersion"] = c.gradeVersion;
+    }
     return o;
 }
 
@@ -265,6 +277,14 @@ Clip clipFromJson(const QJsonObject& o) {
     readAnim("in", c.animIn);
     readAnim("out", c.animOut);
     readAnim("combo", c.animLoop);
+    for (const auto& vv : o.value("gradeVersions").toArray()) {
+        const QJsonObject v = vv.toObject();
+        GradeVersion g{ss(v.value("name")), {}, {}};
+        for (const auto& e : v.value("effects").toArray()) g.effects.push_back(effectFromJson(e));
+        for (const auto& a : v.value("anchors").toArray()) g.anchors.push_back(a.toInt());
+        c.gradeVersions.push_back(std::move(g));
+    }
+    c.gradeVersion = c.gradeVersions.empty() ? 0 : std::clamp(o.value("gradeVersion").toInt(), 0, int(c.gradeVersions.size()) - 1);
     return c;
 }
 

@@ -181,6 +181,14 @@ struct Take {
     bool operator==(const Take&) const = default;
 };
 
+// A grade version (core/GradeVersions.h): its name and, while it is not the one shown, its colour effects.
+struct GradeVersion {
+    std::string name;
+    std::vector<Effect> effects;
+    std::vector<int> anchors;  // where each went in the stack: how many other effects came before it
+    bool operator==(const GradeVersion&) const = default;
+};
+
 // A clip animation preset (core/ClipAnimation.h): its kind ("" = none) and how long it lasts, in seconds.
 struct ClipAnimation {
     std::string type;
@@ -241,6 +249,9 @@ struct Clip {
     int take = 0;
     // Animation presets (core/ClipAnimation.h): an entrance, an exit and a repeating motion on top of the transform.
     ClipAnimation animIn, animOut, animLoop;
+    // Grade versions (core/GradeVersions.h): empty for a clip with one grade; the shown one's effects are in `effects`.
+    std::vector<GradeVersion> gradeVersions;
+    int gradeVersion = 0;
     bool operator==(const Clip&) const = default;
 };
 

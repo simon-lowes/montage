@@ -31,6 +31,7 @@ add_library(montage_engine STATIC
   core/TimelineCompare.h core/TimelineCompare.cpp
   core/MergeClips.h core/MergeClips.cpp
   core/ClipAnimation.h core/ClipAnimation.cpp
+  core/GradeVersions.h core/GradeVersions.cpp
   core/ImportBuilder.h core/InterchangeImport.cpp core/FcpXml.cpp
   core/Multicam.h core/Multicam.cpp
   core/History.h core/History.cpp

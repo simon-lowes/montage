@@ -4,6 +4,7 @@
 #include <QCheckBox>
 #include <QColorDialog>
 #include <QComboBox>
+#include <QInputDialog>
 #include <QDoubleSpinBox>
 #include <QFileDialog>
 #include <QFontComboBox>
@@ -35,6 +36,7 @@
 #include "Theme.h"
 #include "audio/PluginEffect.h"
 #include "core/ClipAnimation.h"
+#include "core/GradeVersions.h"
 #include "core/EditOps.h"
 #include "core/MaskPath.h"
 #include "ColorWheel.h"
@@ -332,6 +334,61 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
                 c->blendMode = mode;
                 return true;
             });
+        });
+        // Grade versions (Resolve's local versions): which grade is shown, and new ones.
+        auto* gradeRow = new QWidget(content_);
+        auto* gh = new QHBoxLayout(gradeRow);
+        gh->setContentsMargins(0, 0, 0, 0);
+        auto* versions = new QComboBox(gradeRow);
+        versions->setObjectName(QStringLiteral("gradeVersions"));
+        versions->setToolTip(tr("Grade versions: switch between this clip's grades"));
+        auto* more = new QToolButton(gradeRow);
+        more->setText(QStringLiteral("+"));
+        more->setObjectName(QStringLiteral("gradeVersionMenu"));
+        more->setPopupMode(QToolButton::InstantPopup);
+        auto* menu = new QMenu(more);
+        auto run = [this, clipId](const QString& label, auto fn) {
+            state_->apply(label, [clipId, fn](Project& p, Sequence& s) { return fn(p, s, clipId); });
+        };
+        menu->addAction(tr("New Version (Copy of This Grade)"), this, [run] {
+            run(tr("New Grade Version"), [](Project& p, Sequence& s, Id id) { return edit::addGradeVersion(p, s, id); });
+        })->setObjectName(QStringLiteral("newGradeVersion"));
+        menu->addAction(tr("New Empty Version"), this, [run] {
+            run(tr("New Grade Version"), [](Project& p, Sequence& s, Id id) { return edit::addGradeVersion(p, s, id, {}, true); });
+        });
+        menu->addAction(tr("Rename Version…"), this, [this, clipId, versions, clipNow] {
+            const Clip* c = clipNow();
+            if (!c || c->gradeVersions.empty()) return;
+            bool ok = false;
+            const QString name = QInputDialog::getText(this, tr("Rename Version"), tr("Name:"), QLineEdit::Normal, versions->currentText(), &ok);
+            const int index = c->gradeVersion;
+            if (ok && !name.trimmed().isEmpty())
+                state_->apply(tr("Rename Grade Version"), [clipId, index, n = name.trimmed().toStdString()](Project&, Sequence& s) {
+                    return edit::renameGradeVersion(s, clipId, index, n);
+                });
+        });
+        menu->addAction(tr("Delete Version"), this, [this, clipId, clipNow] {
+            const Clip* c = clipNow();
+            if (!c) return;
+            const int index = c->gradeVersion;
+            state_->apply(tr("Delete Grade Version"), [clipId, index](Project&, Sequence& s) { return edit::removeGradeVersion(s, clipId, index); });
+        });
+        more->setMenu(menu);
+        gh->addWidget(versions, 1);
+        gh->addWidget(more);
+        form->addRow(tr("Grade"), gradeRow);
+        connect(versions, &QComboBox::activated, this, [this, clipId](int index) {
+            state_->apply(tr("Switch Grade Version"), [clipId, index](Project&, Sequence& s) { return edit::switchGradeVersion(s, clipId, index); });
+        });
+        refreshers_.push_back([=, this] {
+            const Clip* c = clipNow();
+            if (!c) return;
+            QSignalBlocker b(versions);
+            versions->clear();
+            if (c->gradeVersions.empty()) versions->addItem(tr("Version 1"));
+            for (const GradeVersion& v : c->gradeVersions) versions->addItem(QString::fromStdString(v.name));
+            versions->setCurrentIndex(c->gradeVersions.empty() ? 0 : c->gradeVersion);
+            versions->setEnabled(c->gradeVersions.size() > 1);
         });
     }
     refreshers_.push_back([=, this] {

@@ -19,6 +19,7 @@
 #include <sstream>
 
 #include "core/ClipAnimation.h"
+#include "core/GradeVersions.h"
 #include "core/AutoTag.h"
 #include "core/Automation.h"
 #include "core/CaptionTools.h"
@@ -776,6 +777,44 @@ void McpServer::Impl::addTools() {
             save(l);
             const Clip* c = edit::clipById(s, id);
             return ok(QStringLiteral("Trimmed by %1 frame(s)").arg(r.applied), c ? clipJson(l.project, s, *c) : QJsonObject{});
+        });
+
+    add("montage_grade_version", "Grade versions",
+        "Several named grades on one picture clip (Resolve's local versions): `action` list, add (a copy of the current "
+        "grade, or none with `empty`; named `name`), switch (to `index`, from 0), remove (`index`) or rename (`index`, "
+        "`name`). A grade is the clip's colour effects (Color Correct, Curves, Hue Curves, Colour Warper, LUTs...); "
+        "switching swaps them and leaves its other effects alone.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
+            "action":{"type":"string","enum":["list","add","switch","remove","rename"]},"index":{"type":"integer"},
+            "name":{"type":"string"},"empty":{"type":"boolean"}},"required":["project","clip","action"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            const Id id = clipArg(l, a).id;
+            const QString action = need(a, "action");
+            edit::Result r;
+            if (action == "add") r = edit::addGradeVersion(l.project, l.seq(), id, a.value("name").toString().toStdString(), a.value("empty").toBool());
+            else if (action == "switch") r = edit::switchGradeVersion(l.seq(), id, a.value("index").toInt(-1));
+            else if (action == "remove") r = edit::removeGradeVersion(l.seq(), id, a.value("index").toInt(-1));
+            else if (action == "rename") r = edit::renameGradeVersion(l.seq(), id, a.value("index").toInt(-1), a.value("name").toString().toStdString());
+            else if (action != "list") throw ArgError{QStringLiteral("Unknown action \"%1\"").arg(action)};
+            if (!r.ok) return fail(r.error.empty() ? QStringLiteral("Nothing to change") : QString::fromStdString(r.error));
+            if (action != "list") save(l);
+            const Clip* c = edit::clipById(l.seq(), id);
+            QJsonArray list;
+            QStringList lines;
+            if (c->gradeVersions.empty()) list.append(QJsonObject{{"name", "Version 1"}, {"current", true}});
+            for (size_t i = 0; i < c->gradeVersions.size(); ++i) {
+                const bool cur = int(i) == c->gradeVersion;
+                int effects = 0;
+                if (cur) {
+                    for (const Effect& e : c->effects) effects += isGradeEffect(e);
+                } else {
+                    effects = int(c->gradeVersions[i].effects.size());
+                }
+                list.append(QJsonObject{{"name", QString::fromStdString(c->gradeVersions[i].name)}, {"current", cur}, {"effects", effects}});
+                lines << QStringLiteral("%1%2: %3 (%4 effects)").arg(cur ? "* " : "  ").arg(i).arg(QString::fromStdString(c->gradeVersions[i].name)).arg(effects);
+            }
+            return ok(lines.isEmpty() ? QStringLiteral("One grade (Version 1)") : lines.join('\n'), QJsonObject{{"versions", list}});
         });
 
     add("montage_animate_clip", "Animate a clip",

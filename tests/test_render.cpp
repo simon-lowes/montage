@@ -9,6 +9,7 @@
 #include <tuple>
 
 #include "core/ClipAnimation.h"
+#include "core/GradeVersions.h"
 #include "core/Captions.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
@@ -1605,6 +1606,28 @@ colorspaces:
         QVERIFY(near(c[0], 0));
         rgb(boxed, 80, 2, c);
         QVERIFY(near(c[0], 1));
+    }
+
+    void gradeVersionsRendered() {
+        // Red, inverted in version 1 (cyan), plain in version 2, a blur kept through both.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64;
+        s.height = 36;
+        Clip red = colorClip(p, 1, 0, 0, 0, 30);
+        red.effects = {makeEffect(p, "invert"), makeEffect(p, "gaussian_blur")};
+        edit::overwrite(p, s, {TrackKind::Video, 0}, red);
+        RenderOptions o;
+        float c[4];
+        rgb(renderSequenceFrame(p, s, 5, o), 32, 18, c);
+        QVERIFY(c[0] < 0.1f && c[1] > 0.9f && c[2] > 0.9f);
+        QVERIFY(edit::addGradeVersion(p, s, red.id, "Plain", true).ok);
+        rgb(renderSequenceFrame(p, s, 5, o), 32, 18, c);
+        QVERIFY(c[0] > 0.9f && c[1] < 0.1f);
+        QCOMPARE(edit::clipById(s, red.id)->effects.size(), size_t(1));  // the blur
+        QVERIFY(edit::switchGradeVersion(s, red.id, 0).ok);
+        rgb(renderSequenceFrame(p, s, 5, o), 32, 18, c);
+        QVERIFY(c[0] < 0.1f && c[1] > 0.9f);
     }
 
     void clipAnimationsRendered() {

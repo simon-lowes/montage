@@ -39,6 +39,7 @@
 #include "audio/SpeechCleanup.h"
 #include "audio/TimeStretch.h"
 #include "core/ClipAnimation.h"
+#include "core/GradeVersions.h"
 #include "core/MergeClips.h"
 #include "media/DualSystem.h"
 #include "media/FieldRecorder.h"
@@ -1527,6 +1528,41 @@ private slots:
         QCOMPARE(title, std::string("Musik"));
         QVERIFY2(lang == "ger" || lang == "deu", lang.c_str());
         QVERIFY(level(musik, 880) > 20 * level(musik, 440));
+    }
+
+    void gradeVersionsOverMcp() {
+        Project q = makeDefaultProject();
+        Clip c = makeGeneratorClip(q, "color", 30);
+        c.effects = {makeEffect(q, "curves")};
+        edit::overwrite(q, *q.active(), {TrackKind::Video, 0}, c);
+        const double id = double(q.active()->videoTracks[0].clips.front().id);
+        const QString project = QString::fromStdString(path("grades.montage"));
+        QVERIFY(saveProject(q, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_grade_version"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call({{"project", project}, {"clip", id}, {"action", "add"}, {"name", "Teal"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QJsonArray v = r.value("structuredContent").toObject().value("versions").toArray();
+        QCOMPARE(v.size(), 2);
+        QCOMPARE(v[1].toObject().value("name").toString(), QString("Teal"));
+        QVERIFY(v[1].toObject().value("current").toBool());
+        QCOMPARE(v[0].toObject().value("effects").toInt(), 1);
+        r = call({{"project", project}, {"clip", id}, {"action", "add"}, {"empty", true}});
+        QCOMPARE(r.value("structuredContent").toObject().value("versions").toArray().at(2).toObject().value("effects").toInt(), 0);
+        r = call({{"project", project}, {"clip", id}, {"action", "switch"}, {"index", 0}});
+        QVERIFY(r.value("structuredContent").toObject().value("versions").toArray().at(0).toObject().value("current").toBool());
+        QVERIFY(call({{"project", project}, {"clip", id}, {"action", "switch"}, {"index", 9}}).value("isError").toBool());
+        QVERIFY(call({{"project", project}, {"clip", id}, {"action", "paint"}}).value("isError").toBool());
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.active()->videoTracks[0].clips.front().gradeVersions.size(), size_t(3));
     }
 
     void captionStyleOverMcp() {

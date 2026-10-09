@@ -113,6 +113,7 @@
 #include "core/AutoTag.h"
 #include "core/ClipAnimation.h"
 #include "core/EditOps.h"
+#include "core/GradeVersions.h"
 #include "core/MergeClips.h"
 #include "core/Effects.h"
 #include "core/Multicam.h"
@@ -2245,6 +2246,43 @@ private slots:
         win_->findChild<QAction*>("fullScreenProgram")->trigger();
         QVERIFY(!win_->cleanFeed()->isVisible());
         state()->setPlayhead(0);
+    }
+
+    void gradeVersionsInInspectorAndMenu() {
+        loadDemo();
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        QVERIFY(state()->edit("Grade", [&](Project& p, Sequence& s) {
+            Effect cc = makeEffect(p, "color_correct");
+            cc.params["saturation"] = Param(0.0);
+            edit::clipById(s, red)->effects.push_back(cc);
+            return true;
+        }));
+        state()->setSelection({red}, false);
+        QApplication::processEvents();
+        auto* versions = win_->findChild<QComboBox*>("gradeVersions");
+        QVERIFY(versions && versions->count() == 1 && !versions->isEnabled());
+        // A new version from the Inspector's menu: a copy, shown, in one undo step.
+        win_->findChild<QAction*>("newGradeVersion")->trigger();
+        const Clip* c = clipNamed(*state()->sequence(), "Red");
+        QCOMPARE(c->gradeVersions.size(), size_t(2));
+        QCOMPARE(c->gradeVersion, 1);
+        QApplication::processEvents();
+        versions = win_->findChild<QComboBox*>("gradeVersions");
+        QVERIFY(versions->isEnabled() && versions->count() == 2 && versions->currentIndex() == 1);
+        // Back to version 1 from the combo; Clip > Grade Versions > Next Version on the selection.
+        emit versions->activated(0);
+        QCOMPARE(clipNamed(*state()->sequence(), "Red")->gradeVersion, 0);
+        win_->findChild<QAction*>("gradeNextVersion")->trigger();
+        QCOMPARE(clipNamed(*state()->sequence(), "Red")->gradeVersion, 1);
+        win_->findChild<QAction*>("gradeNextVersion")->trigger();  // round to the first
+        QCOMPARE(clipNamed(*state()->sequence(), "Red")->gradeVersion, 0);
+        state()->undo();
+        state()->undo();
+        state()->undo();
+        QCOMPARE(clipNamed(*state()->sequence(), "Red")->gradeVersion, 1);
+        state()->undo();
+        QVERIFY(clipNamed(*state()->sequence(), "Red")->gradeVersions.empty());
+        state()->setSelection({}, false);
     }
 
     void clipAnimationInInspector() {

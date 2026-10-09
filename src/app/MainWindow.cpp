@@ -58,6 +58,7 @@
 
 #include "AudioMeterWidget.h"
 #include "audio/PluginEffect.h"
+#include "core/GradeVersions.h"
 #include "core/Chapters.h"
 #include "core/MarkerList.h"
 #include "render/LutExport.h"
@@ -807,6 +808,35 @@ void MainWindow::buildMenus() {
         ramps->addSeparator();
         add(ramps, tr("Remove Ramp"), QKeySequence(), [this] { speedRamp("none", tr("Remove Ramp")); })
             ->setObjectName(QStringLiteral("ramp_none"));
+    }
+    {
+        // Grade versions on the selected picture clips: a new one each, or all to the next or previous one.
+        QMenu* grades = clipM->addMenu(tr("&Grade Versions"));
+        auto onSelected = [this](const QString& label, std::function<edit::Result(Project&, Sequence&, Id)> fn) {
+            const auto sel = state_->selectedClips();
+            state_->apply(label, [sel, fn](Project& p, Sequence& s) {
+                bool any = false;
+                for (Id id : sel) {
+                    bool video = false;
+                    for (const Track& t : s.videoTracks)
+                        for (const Clip& c : t.clips) video = video || c.id == id;
+                    if (video && fn(p, s, id).ok) any = true;
+                }
+                return any ? edit::Result{} : edit::Result::fail({});
+            });
+        };
+        add(grades, tr("New Version"), QKeySequence(), [onSelected] {
+            onSelected(tr("New Grade Version"), [](Project& p, Sequence& s, Id id) { return edit::addGradeVersion(p, s, id); });
+        })->setObjectName(QStringLiteral("gradeNewVersion"));
+        for (const int step : {1, -1})
+            add(grades, step > 0 ? tr("Next Version") : tr("Previous Version"), QKeySequence(), [onSelected, step] {
+                onSelected(tr("Switch Grade Version"), [step](Project&, Sequence& s, Id id) {
+                    const Clip* c = edit::clipById(s, id);
+                    if (!c || c->gradeVersions.size() < 2) return edit::Result::fail({});
+                    const int n = int(c->gradeVersions.size());
+                    return edit::switchGradeVersion(s, id, ((c->gradeVersion + step) % n + n) % n);
+                });
+            })->setObjectName(step > 0 ? QStringLiteral("gradeNextVersion") : QStringLiteral("gradePreviousVersion"));
     }
     add(clipM, tr("Swap with Previous Clip"), QKeySequence("Ctrl+Shift+,"), [this] { swapClip(false); })->setObjectName(QStringLiteral("swapPrevious"));
     add(clipM, tr("Swap with Next Clip"), QKeySequence("Ctrl+Shift+."), [this] { swapClip(true); })->setObjectName(QStringLiteral("swapNext"));

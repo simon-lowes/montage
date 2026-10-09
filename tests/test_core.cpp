@@ -16,6 +16,7 @@
 #include "core/Chapters.h"
 #include "core/Checkerboard.h"
 #include "core/EditOps.h"
+#include "core/GradeVersions.h"
 #include "core/EffectPresets.h"
 #include "core/Effects.h"
 #include "core/History.h"
@@ -802,6 +803,63 @@ private slots:
         // 54 px text: an outline of 3 px (6 %), a shadow of 6 px (12 %); outline magenta, back colour 60 % transparent black.
         QVERIFY2(ass.find("&H00BF1AD9,&H99000000,-1,0,0,0,100,100,0,0,1,3,6,2,") != std::string::npos, ass.c_str());
         QVERIFY2(ass.find(",,SHOUT IT") != std::string::npos, ass.c_str());
+    }
+
+    void gradeVersionsPerClip() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        Clip c = makeGeneratorClip(p, "color", 60);
+        Effect cc = makeEffect(p, "color_correct");
+        cc.params["saturation"] = Param(150.0);
+        Effect blur = makeEffect(p, "gaussian_blur");
+        Effect curves = makeEffect(p, "curves");
+        c.effects = {cc, blur, curves};
+        edit::overwrite(p, s, {TrackKind::Video, 0}, c);
+        const Id id = s.videoTracks[0].clips.front().id;
+        auto clip = [&]() -> Clip& { return *edit::clipById(s, id); };
+        QVERIFY(isGradeEffect(cc) && isGradeEffect(curves) && !isGradeEffect(blur));
+        // A copy as Version 2: the same grade with fresh ids, the blur left where it is.
+        QVERIFY(edit::addGradeVersion(p, s, id).ok);
+        QCOMPARE(clip().gradeVersions.size(), size_t(2));
+        QCOMPARE(clip().gradeVersions[0].name, std::string("Version 1"));
+        QCOMPARE(clip().gradeVersions[1].name, std::string("Version 2"));
+        QCOMPARE(clip().gradeVersion, 1);
+        QCOMPARE(clip().effects.size(), size_t(3));
+        QCOMPARE(clip().effects[0].type, std::string("color_correct"));
+        QVERIFY(clip().effects[0].id != cc.id);
+        QCOMPARE(clip().effects[1].type, std::string("gaussian_blur"));
+        // Changing version 2 leaves version 1 alone.
+        clip().effects[0].params["saturation"] = Param(20.0);
+        // An empty version: only the blur remains.
+        QVERIFY(edit::addGradeVersion(p, s, id, "Flat", true).ok);
+        QCOMPARE(clip().effects.size(), size_t(1));
+        QCOMPARE(clip().effects[0].type, std::string("gaussian_blur"));
+        QCOMPARE(clip().gradeVersions[2].name, std::string("Flat"));
+        // Back to version 1: its saturation, its ids, before the blur again.
+        QVERIFY(edit::switchGradeVersion(s, id, 0).ok);
+        QCOMPARE(clip().effects.size(), size_t(3));
+        QCOMPARE(clip().effects[0].id, cc.id);
+        QCOMPARE(clip().effects[0].p("saturation", 0), 150.0);
+        QCOMPARE(clip().effects[1].type, std::string("gaussian_blur"));
+        QVERIFY(clip().gradeVersions[0].effects.empty());  // shown, so in the stack
+        QVERIFY(!edit::switchGradeVersion(s, id, 0).ok);
+        QVERIFY(!edit::switchGradeVersion(s, id, 7).ok);
+        QVERIFY(edit::switchGradeVersion(s, id, 1).ok);
+        QCOMPARE(clip().effects[0].p("saturation", 0), 20.0);
+        // Renamed, saved, removed (the shown one gives way to the one before), down to one grade.
+        QVERIFY(edit::renameGradeVersion(s, id, 1, "Warm").ok);
+        QVERIFY(!edit::renameGradeVersion(s, id, 1, "").ok);
+        Project back;
+        QVERIFY(projectFromJson(projectToJson(p), back));
+        QVERIFY(*edit::clipById(*back.active(), id) == clip());
+        QVERIFY(edit::removeGradeVersion(s, id, 1).ok);
+        QCOMPARE(clip().gradeVersion, 0);
+        QCOMPARE(clip().effects[0].p("saturation", 0), 150.0);
+        QVERIFY(edit::removeGradeVersion(s, id, 1).ok);  // Flat
+        QVERIFY(clip().gradeVersions.empty());
+        QVERIFY(!edit::removeGradeVersion(s, id, 0).ok);
+        // Sound clips have no grade.
+        QVERIFY(!edit::addGradeVersion(p, s, 999999).ok);
     }
 
     void captionsFromClipTranscripts() {
