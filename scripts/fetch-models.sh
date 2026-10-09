@@ -12,6 +12,7 @@
 #   <dir>/matte          Remove Background  (MONTAGE_MATTE_MODEL)
 #   <dir>/tts            Generate Voiceover (MONTAGE_TTS_MODEL)
 #   <dir>/inpaint        Object Removal     (MONTAGE_INPAINT_MODEL)
+#   <dir>/minilm-qa      Find What's Said   (MONTAGE_SENTENCE_MODEL)
 #
 #   scripts/fetch-models.sh [dir]      (default: ./models)
 set -euo pipefail
@@ -87,4 +88,7 @@ fetch tts bm_lewis.bin "$KOKORO/voices/bm_lewis.bin" b8f671cef828c30e66fdf0b0756
 fetch inpaint lama_fp32.onnx \
   https://huggingface.co/Carve/LaMa-ONNX/resolve/c3c0c9e468934d62e79c329e35d82dd09ff8c444/lama_fp32.onnx \
   1faef5301d78db7dda502fe59966957ec4b79dd64e16f03ed96913c7a4eb68d6
-echo "Models in $DIR: MONTAGE_OBJECT_MODEL=$DIR/edgetam-video MONTAGE_SPEAKER_MODEL=$DIR/speakers MONTAGE_VISUAL_MODEL=$DIR/clip-vit-b32 MONTAGE_SPEECH_MODEL=$DIR/speech-enhance MONTAGE_UPSCALE_MODEL=$DIR/upscale MONTAGE_FACE_MODEL=$DIR/faces MONTAGE_DEPTH_MODEL=$DIR/depth MONTAGE_RIFE_MODEL=$DIR/rife MONTAGE_MATTE_MODEL=$DIR/matte MONTAGE_TTS_MODEL=$DIR/tts MONTAGE_INPAINT_MODEL=$DIR/inpaint"
+MINILM=https://huggingface.co/Xenova/multi-qa-MiniLM-L6-cos-v1/resolve/3c96c1df3fec9a98a5de76e80877c8bec18498f6
+fetch minilm-qa model_q4.onnx "$MINILM/onnx/model_q4.onnx" e798e950284f27b1cc028ab16b4175b997126dd3091304e4355e318c24c89bbc
+fetch minilm-qa vocab.txt "$MINILM/vocab.txt" 07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3
+echo "Models in $DIR: MONTAGE_OBJECT_MODEL=$DIR/edgetam-video MONTAGE_SPEAKER_MODEL=$DIR/speakers MONTAGE_VISUAL_MODEL=$DIR/clip-vit-b32 MONTAGE_SPEECH_MODEL=$DIR/speech-enhance MONTAGE_UPSCALE_MODEL=$DIR/upscale MONTAGE_FACE_MODEL=$DIR/faces MONTAGE_DEPTH_MODEL=$DIR/depth MONTAGE_RIFE_MODEL=$DIR/rife MONTAGE_MATTE_MODEL=$DIR/matte MONTAGE_TTS_MODEL=$DIR/tts MONTAGE_INPAINT_MODEL=$DIR/inpaint MONTAGE_SENTENCE_MODEL=$DIR/minilm-qa"

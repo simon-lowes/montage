@@ -52,6 +52,7 @@
 #include "QualityCheckDialog.h"
 #include "SpellUi.h"
 #include "core/ColorGroups.h"
+#include "media/SpeechSearch.h"
 #include "ProjectManagerDialog.h"
 #include "MediaBinModel.h"
 #include "ScopesWidget.h"
@@ -6699,6 +6700,55 @@ const auto seq = [this] { return state()->sequence(); };
         }
         scopes.setMode(ScopesWidget::Mode::Waveform);
         QVERIFY(scopes.hasSignal());
+    }
+
+    void findWhatIsSaid() {
+        if (!speechSearchAvailable() || !sentenceModel().installed()) QSKIP("Speech search model not installed (set MONTAGE_SENTENCE_MODEL)");
+        state()->newProject();
+        QVERIFY(state()->edit("Recordings", [](Project& p, Sequence&) {
+            MediaItem m;
+            m.id = p.newId();
+            m.name = "interview.wav";
+            m.kind = MediaKind::Audio;
+            m.hasAudio = true;
+            auto t = std::make_shared<Transcript>();
+            t->language = "en";
+            double at = 0;
+            for (const char* sentence : {"We ran out of money halfway through the shoot.", "The cat sat on the windowsill all afternoon."}) {
+                TranscriptSegment seg;
+                for (const QString& w : QString(sentence).split(' ')) {
+                    seg.words.push_back({at, at + 0.25, w.toStdString(), 1});
+                    at += 0.3;
+                }
+                t->segments.push_back(seg);
+                at += 1;
+            }
+            m.transcript = t;
+            p.media.push_back(m);
+            return true;
+        }));
+        auto* panel = win_->findChild<ShotSearchPanel*>();
+        QVERIFY(panel);
+        auto* mode = panel->findChild<QComboBox*>("findMode");
+        QVERIFY(mode);
+        mode->setCurrentIndex(1);
+        QCOMPARE(panel->mode(), ShotSearchPanel::Said);
+        QVERIFY(panel->findChild<QLabel*>("shotStatus")->text().contains("1 of 1"));
+        QVERIFY(panel->findChild<QPushButton*>("indexShots")->isHidden());
+        QVERIFY(panel->search("financial trouble") >= 1);
+        QVERIFY(panel->resultText(0).contains("money"));
+        auto* list = panel->findChild<QListWidget*>("shotResults");
+        QVERIFY(list->item(0)->text().contains("interview.wav") && list->item(0)->text().contains("money"));
+        // Opening it cues the Source monitor on the moment; a subclip can be made of it.
+        QSignalSpy opened(panel, &ShotSearchPanel::openRequested);
+        panel->open(0);
+        QCOMPARE(opened.count(), 1);
+        QCOMPARE(opened.at(0).at(1).value<FrameTime>(), FrameTime(0));
+        // Back to what's shown: the results go.
+        mode->setCurrentIndex(0);
+        QCOMPARE(list->count(), 0);
+        QVERIFY(panel->resultText(0).isEmpty());
+        state()->newProject();
     }
 
     void colorGroupsFromTheMenu() {

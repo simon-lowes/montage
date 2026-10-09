@@ -9,6 +9,7 @@
 #include "core/TranscriptCorrect.h"
 #include "core/SpellCheck.h"
 #include "core/ColorGroups.h"
+#include "core/SpokenSearch.h"
 #include "core/AutoTag.h"
 #include "core/Automation.h"
 #include "core/CaptionTools.h"
@@ -1260,6 +1261,56 @@ private slots:
         QCOMPARE(words.size(), size_t(3));  // the filler is gone
         QVERIFY(std::fabs(words.back().start - (4.7 - 59 / 25.0)) < 0.05);
         QVERIFY(!rippleDeleteRanges(p, s, {}).ok);
+    }
+
+    void spokenPassagesAndRanking() {
+        // Three sentences of 5, 12 and 3 words, then a 40-word ramble.
+        Transcript t;
+        TranscriptSegment seg;
+        double at = 0;
+        auto say = [&](const std::string& sentence) {
+            const QStringList w = QString::fromStdString(sentence).split(' ');
+            for (const QString& x : w) {
+                seg.words.push_back({at, at + 0.2, x.toStdString(), 1});
+                at += 0.25;
+            }
+        };
+        say("We shot it in Iceland.");
+        say("The light there lasts for hours and hours in the summer evenings.");
+        say("Truly magical, honestly.");
+        std::string ramble;
+        for (int i = 0; i < 40; ++i) ramble += (i ? " " : "") + std::string(i == 39 ? "end." : "word");
+        say(ramble);
+        t.segments.push_back(seg);
+        const std::vector<SpokenPassage> ps = spokenPassages(t, 15, 30);
+        // Each sentence of four words or more alone, and windows of 15 words or more from each sentence start.
+        auto has = [&](size_t first, size_t last) {
+            return std::any_of(ps.begin(), ps.end(), [&](const SpokenPassage& p) { return p.firstWord == first && p.lastWord == last; });
+        };
+        QVERIFY(has(0, 4));    // "We shot it in Iceland."
+        QVERIFY(has(0, 16));   // to the end of the second sentence (17 words)
+        QVERIFY(has(5, 16));   // the second alone (12 words)
+        QVERIFY(has(5, 19));   // with the third: 15 words
+        QVERIFY(!has(17, 19));  // the three-word sentence is never alone
+        QVERIFY(has(20, 49));  // the ramble, cut at 30 words
+        for (const SpokenPassage& p : ps) {
+            QVERIFY(p.lastWord - p.firstWord + 1 <= 30);
+            QCOMPARE(p.start, seg.words[p.firstWord].start);
+            QCOMPARE(p.end, seg.words[p.lastWord].end);
+        }
+        QCOMPARE(QString::fromStdString(ps.front().text), QString("We shot it in Iceland."));
+        QVERIFY(spokenPassages(Transcript{}).empty());
+        // Words in common: content words, stemmed.
+        QCOMPARE(sharedWords("the budget for editing", "We edited it on a tight budget"), 1.0f);
+        QCOMPARE(sharedWords("budget lighting", "the light was golden"), 0.5f);
+        QCOMPARE(sharedWords("the and of", "anything"), 0.0f);
+        // The best hits: overlapping ones of the same media thinned, other media kept, a floor and a limit.
+        std::vector<SpokenHit> hits = {{1, 0, 10, "a", 0.5f}, {1, 2, 12, "b", 0.6f}, {2, 0, 10, "c", 0.4f},
+                                       {1, 20, 30, "d", 0.3f}, {1, 40, 50, "e", 0.05f}};
+        const auto best = bestSpokenHits(hits, 10, 0.12f);
+        QCOMPARE(best.size(), size_t(3));
+        QVERIFY(best[0].text == "b" && best[1].text == "c" && best[2].text == "d");
+        QCOMPARE(bestSpokenHits(hits, 1).size(), size_t(1));
     }
 
     void colorGroups() {

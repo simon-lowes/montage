@@ -1,5 +1,6 @@
 #include "ShotSearchPanel.h"
 
+#include <QComboBox>
 #include <QEventLoop>
 #include <QFutureWatcher>
 #include <QHBoxLayout>
@@ -22,6 +23,7 @@
 #include "ModelPacks.h"
 #include "ThumbnailCache.h"
 #include "core/History.h"
+#include "media/SpeechSearch.h"
 #include "media/VisualSearch.h"
 
 namespace montage {
@@ -35,6 +37,12 @@ ShotSearchPanel::ShotSearchPanel(EditorState* state, QWidget* parent)
     auto* lay = new QVBoxLayout(this);
     lay->setContentsMargins(4, 4, 4, 4);
     auto* row = new QHBoxLayout;
+    mode_ = new QComboBox(this);
+    mode_->setObjectName(QStringLiteral("findMode"));
+    mode_->addItem(tr("What's Shown"));
+    mode_->addItem(tr("What's Said"));
+    mode_->setToolTip(tr("Search the footage by what it shows, or the transcripts by what is said (by meaning, not only the words)"));
+    row->addWidget(mode_);
     query_ = new QLineEdit(this);
     query_->setObjectName(QStringLiteral("shotQuery"));
     query_->setPlaceholderText(tr("Describe a shot: \"a dog running on a beach\""));
@@ -58,6 +66,7 @@ ShotSearchPanel::ShotSearchPanel(EditorState* state, QWidget* parent)
     list_->setIconSize(QSize(128, 72));
     list_->setUniformItemSizes(true);
     lay->addWidget(list_, 1);
+    connect(mode_, &QComboBox::currentIndexChanged, this, [this](int i) { setMode(Mode(i)); });
     connect(query_, &QLineEdit::returnPressed, this, [this] { search(query_->text()); });
     connect(searchBtn_, &QPushButton::clicked, this, [this] { search(query_->text()); });
     connect(indexBtn_, &QPushButton::clicked, this, [this] { QTimer::singleShot(0, this, [this] { indexMissing(); }); });
@@ -76,7 +85,94 @@ ShotSearchPanel::ShotSearchPanel(EditorState* state, QWidget* parent)
     refreshStatus();
 }
 
+ShotSearchPanel::Mode ShotSearchPanel::mode() const { return Mode(mode_->currentIndex()); }
+
+void ShotSearchPanel::setMode(Mode m) {
+    if (mode_->currentIndex() != int(m)) {
+        QSignalBlocker block(mode_);
+        mode_->setCurrentIndex(int(m));
+    }
+    query_->setPlaceholderText(m == Said ? tr("What is talked about: \"where they discuss the budget\"")
+                                         : tr("Describe a shot: \"a dog running on a beach\""));
+    results_.clear();
+    texts_.clear();
+    showResults();
+    refreshStatus();
+}
+
+QString ShotSearchPanel::resultText(int i) const {
+    return i >= 0 && size_t(i) < texts_.size() ? QString::fromStdString(texts_[size_t(i)]) : QString();
+}
+
+int ShotSearchPanel::searchSaid(const QString& queryText) {
+    const QString query = queryText.trimmed();
+    results_.clear();
+    texts_.clear();
+    if (query.isEmpty() || !speechSearchAvailable()) {
+        showResults();
+        return 0;
+    }
+    if (!ensureModelPack(window(), sentenceModel(), tr("Find What's Said"),
+                         tr("Searching what is said by meaning uses multi-qa-MiniLM (sentence-transformers, Apache-2.0), which runs on this computer.")))
+        return 0;
+    // The first search reads every transcript (later ones are immediate): in the background, with progress.
+    QProgressDialog progress(tr("Reading the transcripts…"), tr("Cancel"), 0, 1000, window());
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(500);
+    auto done = std::make_shared<std::atomic<double>>(0.0);
+    auto cancel = std::make_shared<std::atomic<bool>>(false);
+    connect(&progress, &QProgressDialog::canceled, &progress, [cancel] { *cancel = true; });
+    QTimer tick;
+    connect(&tick, &QTimer::timeout, &progress, [&progress, done] { progress.setValue(int(*done * 1000)); });
+    tick.start(100);
+    using Out = std::pair<std::vector<SpokenHit>, std::string>;
+    QFutureWatcher<Out> watcher;
+    QEventLoop wait;
+    connect(&watcher, &QFutureWatcher<Out>::finished, &wait, &QEventLoop::quit);
+    const Project project = state_->project();
+    const std::string q = query.toStdString();
+    watcher.setFuture(QtConcurrent::run([project, q, done, cancel] {
+        Out out;
+        SpokenSearchOptions o;
+        o.max = 30;
+        out.first = searchSpoken(project, q, o, &out.second, [done](double f) { *done = f; }, cancel.get());
+        return out;
+    }));
+    if (!watcher.isFinished()) wait.exec();
+    tick.stop();
+    disconnect(&progress, &QProgressDialog::canceled, nullptr, nullptr);
+    progress.close();
+    const Out r = watcher.result();
+    if (r.first.empty() && !r.second.empty() && !*cancel) state_->message(QString::fromStdString(r.second), 6000);
+    for (const SpokenHit& h : r.first) {
+        ShotMatch m;
+        m.media = h.media;
+        m.start = h.start, m.end = h.end, m.best = h.start;
+        m.score = h.score;
+        results_.push_back(m);
+        texts_.push_back(h.text);
+    }
+    lastQuery_ = query;
+    showResults();
+    return int(results_.size());
+}
+
 void ShotSearchPanel::refreshStatus() {
+    if (mode() == Said) {
+        int transcribed = 0, sounds = 0;
+        for (const MediaItem& m : state_->project().media)
+            if (!m.subclipOf && (m.hasAudio || m.transcript)) {
+                ++sounds;
+                transcribed += bool(m.transcript);
+            }
+        indexBtn_->setVisible(false);
+        searchBtn_->setEnabled(speechSearchAvailable());
+        status_->setText(!speechSearchAvailable() ? tr("This build of Montage cannot search speech by meaning (no ONNX Runtime).")
+                         : sounds == 0            ? tr("Import and transcribe recordings to search what is said.")
+                                                  : tr("%1 of %n recording(s) transcribed.", "", sounds).arg(transcribed));
+        return;
+    }
+    indexBtn_->setVisible(true);
     int videos = 0, indexed = 0;
     for (const MediaItem& m : state_->project().media)
         if (searchable(m)) {
@@ -166,8 +262,10 @@ bool indexVideos(EditorState* state, const std::vector<Id>& media, QWidget* pare
 }
 
 int ShotSearchPanel::search(const QString& queryText) {
+    if (mode() == Said) return searchSaid(queryText);
     const QString query = queryText.trimmed();
     results_.clear();
+    texts_.clear();
     if (query.isEmpty() || !visualSearchAvailable()) {
         showResults();
         return 0;
@@ -200,6 +298,7 @@ int ShotSearchPanel::searchSimilar(Id media, double seconds) {
         state_->message(QString::fromStdString(err), 6000);
         return 0;
     }
+    texts_.clear();
     results_ = findSimilarShots(state_->project(), q, media, seconds, 30);
     lastQuery_ = tr("Like %1").arg(QString::fromStdString(m->name));
     query_->setText(QString());
@@ -219,10 +318,16 @@ void ShotSearchPanel::showResults() {
         const QString range = QString::fromStdString(formatTimecode(FrameTime(std::floor(r.start * rate.toDouble())), rate)) +
                               QStringLiteral(" – ") +
                               QString::fromStdString(formatTimecode(FrameTime(std::ceil(r.end * rate.toDouble())), rate));
-        auto* item = new QListWidgetItem(QStringLiteral("%1\n%2").arg(QString::fromStdString(m->name), range), list_);
-        const QImage thumb = thumbs_->get(QString::fromStdString(m->path), r.best, 128, 72);
-        if (!thumb.isNull()) item->setIcon(QIcon(QPixmap::fromImage(thumb)));
-        item->setToolTip(tr("Match %1").arg(double(r.score), 0, 'f', 3));
+        const size_t i = size_t(&r - results_.data());
+        const QString said = i < texts_.size() ? QString::fromStdString(texts_[i]) : QString();
+        QString label = QStringLiteral("%1\n%2").arg(QString::fromStdString(m->name), range);
+        if (!said.isEmpty()) label += QStringLiteral("\n\u201c%1\u201d").arg(said.length() > 90 ? said.left(88) + QStringLiteral("\u2026") : said);
+        auto* item = new QListWidgetItem(label, list_);
+        if (m->hasVideo) {
+            const QImage thumb = thumbs_->get(QString::fromStdString(m->path), r.best, 128, 72);
+            if (!thumb.isNull()) item->setIcon(QIcon(QPixmap::fromImage(thumb)));
+        }
+        item->setToolTip(said.isEmpty() ? tr("Match %1").arg(double(r.score), 0, 'f', 3) : said);
     }
     if (keep >= 0 && keep < list_->count()) list_->setCurrentRow(keep);
 }

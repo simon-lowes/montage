@@ -2,7 +2,9 @@
 // a description ("a dog on a beach", "close-up of hands"); the best-matching
 // moments are listed with a thumbnail, and opening one loads it into the
 // Source monitor with In and Out around it. Videos are indexed once (CLIP,
-// media/VisualSearch.h) and the index is saved with the project.
+// media/VisualSearch.h) and the index is saved with the project. Switched to
+// What's Said, it finds moments of the transcripts by meaning instead
+// (media/SpeechSearch.h): "where they talk about money" finds "the budget was too tight".
 #pragma once
 
 #include <QWidget>
@@ -10,6 +12,7 @@
 
 #include "core/Model.h"
 
+class QComboBox;
 class QLabel;
 class QLineEdit;
 class QListWidget;
@@ -32,6 +35,14 @@ public:
 
     // Searches (indexing unindexed videos first, after asking). Returns the number of moments found.
     int search(const QString& query);
+    // What is searched: 0 what is shown (CLIP), 1 what is said (transcripts, by meaning).
+    enum Mode { Shown = 0, Said = 1 };
+    Mode mode() const;
+    void setMode(Mode m);
+    // Searches the transcripts by meaning (offering the model download first). Returns the number of moments found.
+    int searchSaid(const QString& query);
+    // A result's words, for What's Said results ("" for shots).
+    QString resultText(int i) const;
     // Searches for moments that look like `media` at `seconds` (CLIP image to image), leaving that moment out.
     int searchSimilar(Id media, double seconds);
     // Indexes the project's videos that have no index yet; false if cancelled or failed.
@@ -52,6 +63,8 @@ private:
     EditorState* state_;
     QLineEdit* query_;
     QPushButton* searchBtn_;
+    QComboBox* mode_ = nullptr;
+    std::vector<std::string> texts_;  // What's Said results' words
     QPushButton* indexBtn_;
     QLabel* status_;
     QListWidget* list_;

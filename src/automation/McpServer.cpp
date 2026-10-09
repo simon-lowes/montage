@@ -27,6 +27,7 @@
 #include "render/LightLevel.h"
 #include "render/Spherical.h"
 #include "render/ClipPlacement.h"
+#include "media/SpeechSearch.h"
 #include "media/ImageSequence.h"
 #include "media/Psd.h"
 #include "core/AutoTag.h"
@@ -1876,6 +1877,43 @@ void McpServer::Impl::addTools() {
             }
             if (seg.words.empty()) return ok("Nothing in the sequence is transcribed (use montage_transcribe with the project)");
             return ok(hits.isEmpty() ? QStringLiteral("Not found") : text, QJsonObject{{"hits", hits}});
+        });
+
+    add("montage_search_speech", "Search what is said by meaning",
+        "Find the moments of the project's transcripts that talk about something, by meaning rather than exact words "
+        "(\"where they talk about money\" finds \"the budget was too tight\"): passages of each transcript and the "
+        "query are compared by a sentence model (multi-qa-MiniLM, runs locally; downloaded on first use in the app or "
+        "by scripts/fetch-models.sh). Returns up to `max` moments, best first, with the media, its time range and the "
+        "words; `media` limits it to some media items (names or ids). For exact words use montage_find_phrase.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"query":{"type":"string"},
+            "max":{"type":"integer","default":10},"media":{"type":"array","items":{"type":["string","number"]}}},
+            "required":["project","query"]})json",
+        true, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            if (!speechSearchAvailable()) return fail("This build of Montage cannot search speech by meaning (no ONNX Runtime)");
+            if (!sentenceModel().installed())
+                return fail("Speech search needs its model: run `scripts/fetch-models.sh` or search What's Said once in the app");
+            SpokenSearchOptions o;
+            o.max = size_t(std::clamp(a.value("max").toInt(10), 1, 100));
+            for (const QJsonValue& v : a.value("media").toArray()) {
+                const MediaItem* byId = v.isDouble() ? l.project.findMedia(Id(v.toDouble())) : nullptr;
+                o.media.push_back(byId ? byId->id : projectMedia(l.project, v.toString()).id);
+            }
+            std::string err;
+            const std::vector<SpokenHit> hits = searchSpoken(l.project, need(a, "query").toStdString(), o, &err);
+            if (hits.empty() && !err.empty()) return fail(QString::fromStdString(err));
+            const Sequence& s = l.seq();
+            QJsonArray list;
+            QString text = hits.empty() ? QStringLiteral("Nothing said about that") : QString();
+            for (const SpokenHit& h : hits) {
+                const MediaItem* m = l.project.findMedia(h.media);
+                const QString name = m ? QString::fromStdString(m->name) : QString();
+                const FrameTime f0 = FrameTime(std::floor(h.start * s.fpsValue())), f1 = FrameTime(std::ceil(h.end * s.fpsValue()));
+                list.append(QJsonObject{{"media", name}, {"media_id", double(h.media)}, {"start_seconds", h.start}, {"end_seconds", h.end},
+                                        {"start", tc(f0, s)}, {"end", tc(f1, s)}, {"text", QString::fromStdString(h.text)}, {"score", double(h.score)}});
+                text += QStringLiteral("%1 %2-%3: %4\n").arg(name, tc(f0, s), tc(f1, s), QString::fromStdString(h.text));
+            }
+            return ok(text.trimmed(), QJsonObject{{"hits", list}});
         });
 
     add("montage_edit_transcript", "Correct transcripts",

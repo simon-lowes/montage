@@ -22,6 +22,7 @@
 #include "core/Interchange.h"
 #include "core/ProjectIO.h"
 #include "core/Transcript.h"
+#include "media/SpeechSearch.h"
 #include "media/Analysis.h"
 #include "render/AafExport.h"
 #include "media/Decoder.h"
@@ -649,6 +650,11 @@ int cmdModels() {
     if (!ttsAvailable()) std::printf("  unavailable: this build has no ONNX Runtime\n");
     else
         std::printf("  %-22s %6.1f MB  %s\n", ttsModel().id.c_str(), double(ttsModel().bytes()) / 1e6, ttsModel().installed() ? "downloaded" : "");
+    std::printf("\nSpeech search model (multi-qa-MiniLM, for finding what is said by meaning; folder: %s)\n", sentenceModel().directory().c_str());
+    if (!speechSearchAvailable()) std::printf("  unavailable: this build has no ONNX Runtime\n");
+    else
+        std::printf("  %-22s %6.1f MB  %s\n", sentenceModel().id.c_str(), double(sentenceModel().bytes()) / 1e6,
+                    sentenceModel().installed() ? "downloaded" : "");
     return 0;
 }
 

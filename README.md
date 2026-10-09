@@ -248,7 +248,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
     - Every word is labelled. The Transcript panel names the speaker at each change; rename them with a right-click.
     - Plain-text exports are split by speaker, WebVTT carries voice tags, and captions break where the speaker changes.
     - It runs locally: pyannote segmentation 3.0 (MIT) and the CAM++ voice model (Apache-2.0) on ONNX Runtime, a 36 MB one-time download.
-- **Find Shots**: search footage by what it shows ("a dog running on a beach", "close-up of hands").
+- **Find Shots**: search footage by what it shows ("a dog running on a beach", "close-up of hands"). Switched to **What's Said**, the same panel finds moments of the transcripts by meaning rather than exact words ("where they talk about money" finds "the budget was too tight"), using multi-qa-MiniLM (sentence-transformers, Apache-2.0; 55 MB, downloaded on first use, runs locally); results open in the Source monitor or become subclips. MCP `montage_search_speech`.
   - Videos are indexed once, a frame every two seconds, and the index is saved with the project.
   - Results show a thumbnail and the moment; opening one marks it with In and Out in the Source monitor.
   - It runs locally: CLIP ViT-B/32 (OpenAI, MIT) on ONNX Runtime, a 190 MB one-time download.

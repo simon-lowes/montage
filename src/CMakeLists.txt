@@ -38,6 +38,7 @@ add_library(montage_engine STATIC
   core/TranscriptCorrect.h core/TranscriptCorrect.cpp
   core/SpellCheck.h core/SpellCheck.cpp
   core/ColorGroups.h core/ColorGroups.cpp
+  core/SpokenSearch.h core/SpokenSearch.cpp
   core/ImportBuilder.h core/InterchangeImport.cpp core/FcpXml.cpp
   core/Multicam.h core/Multicam.cpp
   core/History.h core/History.cpp
@@ -75,6 +76,7 @@ add_library(montage_engine STATIC
   media/Segmenter.h media/Segmenter.cpp
   media/Diarizer.h media/Diarizer.cpp
   media/VisualSearch.h media/VisualSearch.cpp
+  media/SpeechSearch.h media/SpeechSearch.cpp
   media/SpeechEnhance.h media/SpeechEnhance.cpp
   media/Beats.h media/Beats.cpp
   media/Translator.h media/Translator.cpp

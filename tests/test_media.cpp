@@ -101,6 +101,7 @@
 #include "render/Compositor.h"
 #include "render/Exporter.h"
 #include "core/ColorGroups.h"
+#include "media/SpeechSearch.h"
 #include "render/Processing.h"
 #include "media/CameraRaw.h"
 #include "core/Slate.h"
@@ -2043,6 +2044,112 @@ private slots:
         QVERIFY(call({{"x", 5}, {"at", 99}}).value("isError").toBool());
         QVERIFY(call({}).value("isError").toBool());
         QVERIFY(call({{"align", "sideways"}}).value("isError").toBool());
+    }
+
+    // A transcript of the sentences, a second apart, each word 0.3 s.
+    static std::shared_ptr<Transcript> spokenTranscript(const std::vector<std::string>& sentences, double from = 0) {
+        auto t = std::make_shared<Transcript>();
+        t->language = "en";
+        double at = from;
+        for (const std::string& s : sentences) {
+            TranscriptSegment seg;
+            seg.start = at;
+            for (const QString& w : QString::fromStdString(s).split(' ', Qt::SkipEmptyParts)) {
+                seg.words.push_back({at, at + 0.25, w.toStdString(), 1});
+                at += 0.3;
+            }
+            seg.end = at;
+            seg.text = s;
+            t->segments.push_back(seg);
+            at += 1.0;
+        }
+        return t;
+    }
+
+    void speechSearchByMeaning() {
+        if (!speechSearchAvailable()) QSKIP("Built without ONNX Runtime");
+        if (!sentenceModel().installed()) QSKIP("Speech search model not installed (set MONTAGE_SENTENCE_MODEL)");
+        std::string err;
+        auto model = SentenceModel::load(&err);
+        QVERIFY2(model, err.c_str());
+        // BERT's uncased WordPiece, as the model's own tokenizer gives it: accents off, punctuation apart.
+        QCOMPARE(model->tokens("Hello, world! It's Montage's caf\u00e9 \u2014 na\u00efve r\u00e9sum\u00e9."),
+                 (std::vector<int64_t>{101, 7592, 1010, 2088, 999, 2009, 1005, 1055, 18318, 4270, 1005, 1055, 7668, 1517, 15743, 13746, 1012, 102}));
+        QCOMPARE(model->tokens("Where do they talk about money?"), (std::vector<int64_t>{101, 2073, 2079, 2027, 2831, 2055, 2769, 1029, 102}));
+        // The embedding the reference implementation gives (first values), unit length.
+        const auto e = model->embed({"Hello, world! It's Montage's caf\u00e9 \u2014 na\u00efve r\u00e9sum\u00e9."}, &err);
+        QVERIFY2(e.size() == 1 && e[0].size() == 384, err.c_str());
+        const float ref[4] = {-0.00897f, -0.0108f, 0.02198f, 0.02055f};
+        for (int i = 0; i < 4; ++i) QVERIFY2(std::fabs(e[0][size_t(i)] - ref[i]) < 3e-3f, qPrintable(QString::number(e[0][size_t(i)])));
+        double norm = 0;
+        for (float x : e[0]) norm += double(x) * x;
+        QVERIFY(std::fabs(norm - 1) < 1e-4);
+        // Two interviews; questions find the passages that answer them, though they share no words.
+        Project p = makeDefaultProject();
+        MediaItem a;
+        a.id = p.newId();
+        a.name = "director.wav";
+        a.kind = MediaKind::Audio;
+        a.transcript = spokenTranscript({"The budget was far too tight for the shoot, we ran out of cash by day three.",
+                                         "We walked the dog along the beach at sunset and the light was golden.",
+                                         "My grandmother taught me to bake bread when I was seven years old."});
+        MediaItem b;
+        b.id = p.newId();
+        b.name = "producer.wav";
+        b.kind = MediaKind::Audio;
+        b.transcript = spokenTranscript({"The camera kept overheating so we had to wait between takes.",
+                                         "Honestly I was terrified the night before the premiere."});
+        p.media = {a, b};
+        SpokenSearchOptions o;
+        o.max = 3;
+        struct Q {
+            const char* query;
+            Id media;
+            const char* says;
+        } const cases[] = {{"where do they talk about money", a.id, "budget"},     {"dogs at the seaside", a.id, "beach"},
+                           {"childhood memories", a.id, "grandmother"},           {"equipment trouble", b.id, "overheating"},
+                           {"nerves before opening night", b.id, "terrified"}};
+        for (const Q& c : cases) {
+            const std::vector<SpokenHit> hits = searchSpoken(p, c.query, o, &err);
+            QVERIFY2(!hits.empty(), c.query);
+            QVERIFY2(hits[0].media == c.media && QString::fromStdString(hits[0].text).contains(c.says),
+                     qPrintable(QString("%1 -> %2").arg(c.query, QString::fromStdString(hits[0].text))));
+        }
+        // The moment's times are its words'; one media item alone; a strict threshold; refusals.
+        const auto money = searchSpoken(p, "money", o, &err);
+        QCOMPARE(money[0].start, 0.0);
+        QVERIFY(money[0].end > 3 && money[0].end < 30);
+        o.media = {b.id};
+        for (const SpokenHit& h : searchSpoken(p, "money", o, &err)) QCOMPARE(h.media, b.id);
+        o.media.clear();
+        o.minScore = 0.9f;
+        QVERIFY(searchSpoken(p, "money", o, &err).empty());
+        QVERIFY(searchSpoken(p, "  ", {}, &err).empty() && !err.empty());
+        Project silent = makeDefaultProject();
+        QVERIFY(searchSpoken(silent, "money", {}, &err).empty() && QString::fromStdString(err).startsWith("Transcribe"));
+        // Over MCP.
+        const QString project = QString::fromStdString(path("speech-search.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](QJsonObject args) {
+            args["project"] = project;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_search_speech"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call({{"query", "stage fright"}, {"max", 2}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QJsonArray found = r.value("structuredContent").toObject().value("hits").toArray();
+        QVERIFY(!found.isEmpty() && found.size() <= 2);
+        QCOMPARE(found[0].toObject().value("media").toString(), QString("producer.wav"));
+        QVERIFY(found[0].toObject().value("text").toString().contains("terrified"));
+        r = call({{"query", "stage fright"}, {"media", QJsonArray{"director.wav"}}});
+        for (const QJsonValue& v : r.value("structuredContent").toObject().value("hits").toArray())
+            QCOMPARE(v.toObject().value("media").toString(), QString("director.wav"));
+        QVERIFY(call({{"query", "money"}, {"media", QJsonArray{"nobody.wav"}}}).value("isError").toBool());
     }
 
     void mcpColorGroups() {
