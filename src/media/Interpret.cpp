@@ -101,8 +101,6 @@ Result interpretFootage(Project& p, Id media, Interpretation i) {
                     const double available = m->duration * s.fpsValue() - c.sourceIn;
                     if (c.sourceExtent() > available) c.duration = std::max<FrameTime>(1, FrameTime(std::floor(available / c.speed)));
                 }
-        for (MediaItem& sub : p.media)
-            if (sub.subclipOf == media) sub.subclipIn *= ratio, sub.subclipOut *= ratio;
         if (m->transcript) m->transcript = retimed(*m->transcript, ratio);
         if (m->visual) {
             auto v = std::make_shared<VisualIndex>(*m->visual);
@@ -115,6 +113,20 @@ Result interpretFootage(Project& p, Id media, Interpretation i) {
             f->step *= ratio;
             for (FaceIndex::Face& face : f->faces) face.time *= ratio;
             m->faces = f;
+        }
+    }
+    // Its subclips are read the same way, over the same frames.
+    for (MediaItem& sub : p.media) {
+        if (sub.subclipOf != media) continue;
+        sub.subclipIn *= ratio, sub.subclipOut *= ratio;
+        sub.path = m->path;
+        sub.proxyPath.clear();
+        sub.width = m->width;
+        sub.height = m->height;
+        if (!still) {
+            sub.fps = m->fps;
+            sub.duration = sub.subclipOut - sub.subclipIn;
+            if (m->timecode >= 0) sub.timecode = m->timecode + sub.subclipIn;
         }
     }
     return {};

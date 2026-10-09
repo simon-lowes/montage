@@ -30,6 +30,7 @@ struct ParamDesc {
     std::vector<std::string> choices;
     std::string stringDefault;
     std::string doubleType;  // "OfxParamDoubleTypeAngle"...
+    bool normalised = false;  // a position or size kept as a fraction of the frame (the plugin's default coordinates)
     bool animates = true, secret = false;
     int dimensions() const;  // the numbers it holds
     bool numeric() const;
@@ -68,6 +69,7 @@ public:
     void setSearchPaths(const std::vector<std::string>& dirs);  // empty: the defaults
     // Finds and describes the plugins (new or changed binaries in the probe process). How many there are.
     int scan(std::vector<std::string>* log = nullptr);
+    void ensureScanned();  // scans if nothing has yet (renders outside the app, before its startup scan ends)
     std::vector<PluginDesc> plugins() const;
     std::vector<std::pair<std::string, std::string>> blocked() const;  // binary, why
     bool find(const std::string& id, PluginDesc& out) const;
@@ -75,6 +77,8 @@ public:
 private:
     Registry();
     mutable std::mutex mutex_;
+    std::mutex scanMutex_;
+    bool scanned_ = false;
     std::string cachePath_, probe_;
     std::vector<std::string> paths_;
     std::vector<PluginDesc> plugins_;
@@ -90,7 +94,8 @@ std::string effectName(const Effect& e);
 
 // Runs the effect's plugin on `img` (premultiplied RGBA float, rendered at `scale` of full size) at clip frame `t`.
 // `fetch` gives the source at another clip frame for plugins that ask (false: none; the current frame is given).
-// False (with `error`) when the plugin is missing or fails; `img` is then left as it was.
+// Runs only plug-ins the registry found and did not block (never a binary named in the project file). False (with
+// `error`) when the plugin is missing, blocked or fails; `img` is then left as it was.
 using FrameFetch = std::function<bool(double t, Image& out)>;
 bool applyEffect(const Effect& e, double t, Image& img, double scale, const FrameFetch& fetch = {}, std::string* error = nullptr);
 
@@ -108,7 +113,9 @@ private:
 };
 const FrameFetch& currentFetch();
 
-// Binaries loaded and instances made in this process (for crash reports and tests).
+// Instances made in this process, and those not yet destroyed (for crash reports and tests). Each clip effect has its
+// own; free ones past a small limit are destroyed, least recently used first.
 int instancesCreated();
+int instancesAlive();
 
 }  // namespace montage::ofx

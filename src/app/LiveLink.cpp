@@ -63,17 +63,25 @@ const char* kContextTool = R"json({"name":"montage_live_context","title":"What i
 "select":{"type":"array","items":{"type":"number"},"description":"Select these clips (ids)"}}},
 "annotations":{"readOnlyHint":false,"destructiveHint":false,"openWorldHint":false}})json";
 
+// Whether a tool works on an existing project (so it can work on the open one): not one whose "project" is the new
+// file it writes (Create a project, Import a timeline).
+bool readsProject(const QJsonObject& tool) {
+    const QJsonObject props = tool.value("inputSchema").toObject().value("properties").toObject();
+    return props.contains("project") && !props.value("project").toObject().value("description").toString().contains(QStringLiteral("file to write"));
+}
+
+constexpr qint64 kMaxRequest = 16 * 1024 * 1024;  // bytes: far beyond any tool call
+
 }  // namespace
 
 LiveLink::LiveLink(EditorState* state, QObject* parent)
-    : QObject(parent), state_(state), protocol_(std::make_unique<McpServer>()), worker_(std::make_unique<McpServer>()) {
+    : QObject(parent), state_(state), protocol_(std::make_unique<McpServer>()), worker_(std::make_shared<McpServer>()) {
     const QJsonObject list = QJsonDocument::fromJson(lastLine(protocol_->handle(
                                                          compact(QJsonObject{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/list"}}).toStdString())))
                                  .object();
     for (const QJsonValue& v : list.value("result").toObject().value("tools").toArray()) {
         const QJsonObject t = v.toObject();
-        tools_[t.value("name").toString()] = {t.value("title").toString(),
-                                              t.value("inputSchema").toObject().value("properties").toObject().contains("project")};
+        tools_[t.value("name").toString()] = {t.value("title").toString(), readsProject(t)};
     }
     // The connection file names the open project.
     connect(state_, &EditorState::fileStateChanged, this, [this] {
@@ -85,7 +93,10 @@ LiveLink::LiveLink(EditorState* state, QObject* parent)
     });
 }
 
-LiveLink::~LiveLink() { stop(); }
+LiveLink::~LiveLink() {
+    if (cancel_) *cancel_ = true;  // a tool still running finishes on its own and discards its copy
+    stop();
+}
 
 bool LiveLink::start(quint16 port, QString* error) {
     if (running()) return true;
@@ -115,6 +126,12 @@ bool LiveLink::start(quint16 port, QString* error) {
 
 void LiveLink::stop() {
     if (!server_) return;
+    // Agents' calls stop with the link: those waiting are dropped and a running one's result is not applied.
+    for (auto it = queue_.begin(); it != queue_.end();) {
+        if (it->external) it = queue_.erase(it);
+        else ++it;
+    }
+    if (cancel_ && runningExternal_) *cancel_ = true;
     server_->close();
     delete server_;
     server_ = nullptr;
@@ -144,7 +161,8 @@ void LiveLink::onConnection() {
 
 void LiveLink::respond(QTcpSocket* socket, int status, const QByteArray& body) {
     static const std::map<int, const char*> reasons = {{200, "OK"}, {202, "Accepted"}, {400, "Bad Request"}, {401, "Unauthorized"},
-                                                      {403, "Forbidden"}, {404, "Not Found"}, {405, "Method Not Allowed"}};
+                                                      {403, "Forbidden"}, {404, "Not Found"}, {405, "Method Not Allowed"},
+                                                      {413, "Payload Too Large"}};
     QByteArray head = "HTTP/1.1 " + QByteArray::number(status) + ' ' + reasons.at(status) + "\r\n";
     if (!body.isEmpty()) head += "Content-Type: application/json\r\n";
     if (status == 401) head += "WWW-Authenticate: Bearer\r\n";
@@ -169,24 +187,33 @@ void LiveLink::onReadable(QTcpSocket* socket) {
         const int colon = int(lines[i].indexOf(':'));
         if (colon > 0) headers[lines[i].left(colon).trimmed().toLower()] = lines[i].mid(colon + 1).trimmed();
     }
+    const QByteArray method = request.value(0), path = request.value(1);
+    // Checked as soon as the headers are in, before any body is kept. Only pages on this computer may call it (a web
+    // page elsewhere cannot, even through the browser).
+    auto refuse = [&](int status) {
+        buf.clear();
+        respond(socket, status, {});
+    };
+    if (headers.count("origin")) {
+        const QByteArray origin = headers["origin"];
+        if (!origin.startsWith("http://127.0.0.1") && !origin.startsWith("http://localhost")) return refuse(403);
+    }
+    if (path != "/mcp" && path != "/") return refuse(404);
+    if (headers["authorization"] != "Bearer " + token_.toUtf8()) return refuse(401);
+    if (method != "POST") return refuse(405);
     const qint64 length = headers.count("content-length") ? headers["content-length"].toLongLong() : 0;
+    if (length < 0 || length > kMaxRequest) return refuse(413);
     if (buf.size() - headerEnd - 4 < length) return;  // the rest of the body is on its way
     const QByteArray body = buf.mid(headerEnd + 4, length);
     buf.clear();
-    const QByteArray method = request.value(0), path = request.value(1);
-    // Only pages on this computer may call it (a web page elsewhere cannot, even through the browser).
-    if (headers.count("origin")) {
-        const QByteArray origin = headers["origin"];
-        if (!origin.startsWith("http://127.0.0.1") && !origin.startsWith("http://localhost")) return respond(socket, 403, {});
-    }
-    if (path != "/mcp" && path != "/") return respond(socket, 404, {});
-    if (headers["authorization"] != "Bearer " + token_.toUtf8()) return respond(socket, 401, {});
-    if (method != "POST") return respond(socket, 405, {});
     QPointer<QTcpSocket> alive(socket);
-    handle(body, [this, alive](QByteArray answer) {
-        if (!alive) return;
-        respond(alive, answer.isEmpty() ? 202 : 200, answer);
-    });
+    handle(
+        body,
+        [this, alive](QByteArray answer) {
+            if (!alive) return;
+            respond(alive, answer.isEmpty() ? 202 : 200, answer);
+        },
+        true);
 }
 
 // ---- MCP --------------------------------------------------------------------------------------------------------
@@ -199,7 +226,7 @@ QByteArray LiveLink::patchedToolList(const QByteArray& answer) const {
         QJsonObject t = v.toObject();
         QJsonObject schema = t.value("inputSchema").toObject();
         QJsonObject props = schema.value("properties").toObject();
-        if (props.contains("project")) {
+        if (readsProject(t)) {
             // The open project unless another file is named.
             props["project"] = QJsonObject{{"type", "string"}, {"description", "Leave out for the project open in Montage, or a .montage file to work on instead"}};
             schema["properties"] = props;
@@ -299,7 +326,7 @@ QJsonObject LiveLink::contextResult(const QJsonObject& args, bool& isError) {
     return toolResult(text, info, false);
 }
 
-void LiveLink::handle(const QByteArray& message, std::function<void(QByteArray)> done) {
+void LiveLink::handle(const QByteArray& message, std::function<void(QByteArray)> done, bool external) {
     const QJsonObject msg = QJsonDocument::fromJson(message).object();
     const QString method = msg.value("method").toString();
     if (method == "tools/list") {
@@ -335,7 +362,7 @@ void LiveLink::handle(const QByteArray& message, std::function<void(QByteArray)>
         state_->undo();
         return answer(toolResult(QStringLiteral("Undid %1").arg(last), {}, false));
     }
-    queue_.push_back({msg, std::move(done)});
+    queue_.push_back({msg, std::move(done), external});
     pump();
 }
 
@@ -372,18 +399,33 @@ void LiveLink::pump() {
         msg["params"] = params;
     }
     auto* watcher = new QFutureWatcher<std::string>(this);
-    McpServer* worker = worker_.get();
+    // The tool holds its server, so it can finish safely if the app quits or the link stops meanwhile; then its copy
+    // of the project is removed and nothing is applied.
+    std::shared_ptr<McpServer> worker = worker_;
+    auto cancel = std::make_shared<std::atomic<bool>>(false);
+    cancel_ = cancel;
+    runningExternal_ = job.external;
     const std::string line = compact(msg).toStdString();
-    connect(watcher, &QFutureWatcher<std::string>::finished, this, [this, watcher, job, tool, live, before, snapshot, path] {
+    connect(watcher, &QFutureWatcher<std::string>::finished, this, [this, watcher, job, tool, live, before, snapshot, path, cancel] {
         const std::string answer = watcher->result();
         watcher->deleteLater();
-        if (live) finish(job, tool, before, snapshot, path, answer);
-        else job.done(QByteArray::fromStdString(answer));
+        cancel_.reset();
+        if (*cancel) {
+            if (live) QFile::remove(path), QFile::remove(path + ".bak");
+            const QJsonObject r = toolResult(QStringLiteral("The agent link was turned off while %1 ran, so its result was not applied.").arg(tool), {}, true);
+            job.done(compact(QJsonObject{{"jsonrpc", "2.0"}, {"id", job.message.value("id")}, {"result", r}}));
+        } else if (live) {
+            finish(job, tool, before, snapshot, path, answer);
+        } else {
+            job.done(QByteArray::fromStdString(answer));
+        }
         busy_ = false;
         pump();
     });
-    watcher->setFuture(QtConcurrent::run([worker, line] {
+    const QString copy = live ? path : QString();
+    watcher->setFuture(QtConcurrent::run([worker, line, cancel, copy] {
         const std::vector<std::string> lines = worker->handle(line);
+        if (*cancel && !copy.isEmpty()) QFile::remove(copy), QFile::remove(copy + ".bak");
         return lines.empty() ? std::string() : lines.back();
     }));
 }

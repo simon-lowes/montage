@@ -21,6 +21,7 @@
 #include <QElapsedTimer>
 #include <QTcpServer>
 #include <QTcpSocket>
+#include <QThreadPool>
 #include <QLineEdit>
 #include <QLabel>
 #include <QListView>
@@ -5251,6 +5252,22 @@ const auto seq = [this] { return state()->sequence(); };
         return end < 0 ? QByteArray() : got.mid(end + 4);
     }
 
+    // A raw request to the agent link; the status it answers with (0: none).
+    int rawAgentStatus(quint16 port, const QByteArray& request) {
+        QTcpSocket s;
+        s.connectToHost(QHostAddress::LocalHost, port);
+        QElapsedTimer t;
+        t.start();
+        while (s.state() != QAbstractSocket::ConnectedState && t.elapsed() < 10000) QTest::qWait(5);
+        s.write(request);
+        QByteArray got;
+        while (t.elapsed() < 20000 && s.state() != QAbstractSocket::UnconnectedState && !got.contains("\r\n")) {
+            QTest::qWait(5);
+            got += s.readAll();
+        }
+        return got.split(' ').value(1).toInt();
+    }
+
     void agentLinkEditsTheOpenProject() {
         qputenv("MONTAGE_MCP_LIVE_FILE", dir_.filePath("mcp-live.json").toUtf8());
         QVERIFY(win_->findChild<QAction*>("agentLink") && win_->findChild<QAction*>("agentLinkDialog"));
@@ -5277,6 +5294,9 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(status, 401);
         agentPost(link->port(), R"({"jsonrpc":"2.0","id":1,"method":"ping"})", token, &status, "Origin: https://example.com\r\n");
         QCOMPARE(status, 403);
+        // Judged on the headers, before any body is kept: a huge body without the key, or too big with it.
+        QCOMPARE(rawAgentStatus(link->port(), "POST /mcp HTTP/1.1\r\nContent-Length: 4000000000\r\n\r\n"), 401);
+        QCOMPARE(rawAgentStatus(link->port(), "POST /mcp HTTP/1.1\r\nAuthorization: Bearer " + token + "\r\nContent-Length: 4000000000\r\n\r\n"), 413);
         // The tools: "project" may be left out, and the link's own context tool is there.
         const QJsonArray tools = rpc("tools/list").value("tools").toArray();
         QJsonObject title, context;
@@ -5286,6 +5306,10 @@ const auto seq = [this] { return state()->sequence(); };
         }
         QVERIFY(!title.isEmpty() && !context.isEmpty());
         QVERIFY(!title.value("inputSchema").toObject().value("required").toArray().contains("project"));
+        // Except where "project" is the new file a tool writes: never the open project.
+        for (const QJsonValue& v : tools)
+            if (v.toObject().value("name") == "montage_create_project" || v.toObject().value("name") == "montage_import_timeline")
+                QVERIFY(v.toObject().value("inputSchema").toObject().value("required").toArray().contains("project"));
         // A title added by the agent: one undo step, named for it.
         const int steps = int(state()->history().undoCount());
         QJsonObject r = call("montage_add_title", {{"text", "From the agent"}, {"at", 1}, {"duration", 2}});
@@ -5351,9 +5375,43 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(lines.size(), 2);
         QVERIFY(lines[0].contains("montage_live_context"));
         QVERIFY2(lines[1].contains("\"sequence\""), lines[1].constData());
+        // Off while an agent's tool runs: its result is not applied, and its calls still waiting are dropped.
+        auto markerCall = [](int id, const QString& name) {
+            return QJsonDocument(QJsonObject{{"jsonrpc", "2.0"}, {"id", id}, {"method", "tools/call"},
+                                             {"params", QJsonObject{{"name", "montage_add_marker"}, {"arguments", QJsonObject{{"at", 4}, {"name", name}}}}}})
+                .toJson(QJsonDocument::Compact);
+        };
+        auto hasMarker = [&](const QString& name) {
+            for (const Marker& m : state()->sequence()->markers)
+                if (QString::fromStdString(m.name) == name) return true;
+            return false;
+        };
+        QByteArray running, waiting;
+        link->handle(markerCall(10, "while turning off"), [&](QByteArray a) { running = a; }, true);
+        link->handle(markerCall(11, "queued"), [&](QByteArray a) { waiting = a; }, true);
+        QVERIFY(link->busy());
         // Off: the connection file goes, and the bridge says Montage is not reachable.
         QVERIFY(win_->setAgentLink(false));
         QVERIFY(!link->running() && !QFileInfo::exists(liveConnectionFile()));
+        QTRY_VERIFY_WITH_TIMEOUT(!running.isEmpty(), 30000);
+        QVERIFY2(running.contains("turned off"), running.constData());
+        QTRY_VERIFY(!link->busy());
+        QTest::qWait(100);
+        QVERIFY(waiting.isEmpty() && !hasMarker("while turning off") && !hasMarker("queued"));
+        QVERIFY(!QFileInfo::exists(dir_.filePath(".linked.agent.montage")));
+        // A link destroyed while its tool runs (the app quitting): the tool finishes by itself, nothing is applied and
+        // its copy of the project is removed.
+        {
+            auto* doomed = new LiveLink(state());
+            QByteArray never;
+            doomed->handle(markerCall(12, "after quitting"), [&](QByteArray a) { never = a; });
+            QVERIFY(doomed->busy());
+            delete doomed;
+            QVERIFY(QThreadPool::globalInstance()->waitForDone(30000));
+            QTest::qWait(50);
+            QVERIFY(never.isEmpty() && !hasMarker("after quitting"));
+            QVERIFY(!QFileInfo::exists(dir_.filePath(".linked.agent.montage")));
+        }
         std::istringstream in2(R"({"jsonrpc":"2.0","id":3,"method":"ping"})" "\n");
         std::ostringstream out2;
         runLiveBridge(in2, out2);
@@ -5454,11 +5512,11 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(fake.bodies.size(), 3);
         disconnect(failConnection);
         // An OpenAI-compatible endpoint (a local model): the context tool moves the playhead, then the answer.
+        // (A different service starts a new conversation: the earlier one is in Claude's form.)
         c.provider = "openai";
         c.model = "local-model";
         c.apiKey = "k";
         session->setConfig(c);
-        session->clear();
         const QJsonObject call{{"id", "c1"}, {"type", "function"},
                                {"function", QJsonObject{{"name", "montage_live_context"}, {"arguments", QStringLiteral("{\"playhead\":3}")}}}};
         const QJsonObject toolTurn{{"role", "assistant"}, {"content", QJsonValue()}, {"tool_calls", QJsonArray{call}}};
@@ -5474,6 +5532,7 @@ const auto seq = [this] { return state()->sequence(); };
         const QJsonObject openFirst = QJsonDocument::fromJson(fake.bodies[3]).object();
         QCOMPARE(openFirst.value("model").toString(), QString("local-model"));
         QCOMPARE(openFirst.value("messages").toArray().at(0).toObject().value("role").toString(), QString("system"));
+        QCOMPARE(openFirst.value("messages").toArray().size(), 2);  // the system prompt and this request only
         QCOMPARE(openFirst.value("tools").toArray().at(0).toObject().value("type").toString(), QString("function"));
         const QJsonArray openMessages = QJsonDocument::fromJson(fake.bodies[4]).object().value("messages").toArray();
         const QJsonObject toolMessage = openMessages.last().toObject();
@@ -5490,7 +5549,7 @@ const auto seq = [this] { return state()->sequence(); };
         reg.setCachePath(dir_.filePath("ofx-cache.json").toStdString());
         reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
         reg.setSearchPaths({MONTAGE_TEST_OFX_DIR "/good"});
-        QCOMPARE(reg.scan(), 2);
+        QCOMPARE(reg.scan(), 3);
         auto* browser = win_->findChild<EffectsBrowser*>();
         QVERIFY(browser);
         browser->reload();

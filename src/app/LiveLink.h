@@ -13,6 +13,7 @@
 #include <QJsonObject>
 #include <QObject>
 #include <QString>
+#include <atomic>
 #include <deque>
 #include <functional>
 #include <map>
@@ -36,7 +37,7 @@ public:
 
     // Listens on 127.0.0.1 (`port` 0: any free one) with a new key, and writes the connection file.
     bool start(quint16 port = 0, QString* error = nullptr);
-    void stop();  // and removes the connection file
+    void stop();  // and removes the connection file; agents' queued calls are dropped and one running is not applied
     bool running() const;
     quint16 port() const;
     QString token() const { return token_; }
@@ -45,7 +46,9 @@ public:
 
     // One JSON-RPC message, as the HTTP endpoint takes it; `done` gets the answer ("" for a notification), now or
     // once the tool has run.
-    void handle(const QByteArray& message, std::function<void(QByteArray)> done);
+    // `external`: from an agent outside the app (the HTTP endpoint), so dropped or not applied when the link stops;
+    // the Assistant panel's calls are not.
+    void handle(const QByteArray& message, std::function<void(QByteArray)> done, bool external = false);
 
 signals:
     void runningChanged(bool on);
@@ -56,10 +59,11 @@ private:
     struct Job {
         QJsonObject message;
         std::function<void(QByteArray)> done;
+        bool external = false;  // from an agent over HTTP (the Assistant panel calls in-process)
     };
     struct ToolInfo {
         QString title;
-        bool takesProject = false;
+        bool takesProject = false;  // works on a project (one it reads, not a new one it writes)
     };
     void onConnection();
     void onReadable(QTcpSocket* socket);
@@ -76,10 +80,12 @@ private:
     QTcpServer* server_ = nullptr;
     QString token_;
     std::unique_ptr<McpServer> protocol_;  // answers protocol messages on the UI thread
-    std::unique_ptr<McpServer> worker_;    // runs tools, one at a time, off it
+    std::shared_ptr<McpServer> worker_;    // runs tools, one at a time, off it (kept alive by a running tool)
     std::map<QString, ToolInfo> tools_;
     std::deque<Job> queue_;
     bool busy_ = false;
+    std::shared_ptr<std::atomic<bool>> cancel_;  // the running tool's: its result is not to be applied
+    bool runningExternal_ = false;
     std::map<QTcpSocket*, QByteArray> buffers_;
 };
 

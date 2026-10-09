@@ -108,6 +108,15 @@ void AssistantSession::stop() {
     done(tr("Stopped"));
 }
 
+void AssistantSession::setConfig(const AssistantConfig& c) {
+    stop();
+    if (c.provider != config_.provider) {
+        messages_ = QJsonArray();
+        steps_ = 0;
+    }
+    config_ = c;
+}
+
 void AssistantSession::clear() {
     stop();
     messages_ = QJsonArray();

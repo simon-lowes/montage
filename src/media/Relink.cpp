@@ -115,7 +115,15 @@ bool relinkMedia(Project& p, Id id, const std::string& path, RelinkCheck check, 
         int layer = -1;
         if (parsePsdLayerPath(m->path, file, layer)) target = psdLayerPath(target, layer);  // the same layer of the file chosen
     }
-    target = interpretedPath(target, interpretationOf(*m));  // read the same way (Interpret Footage)
+    // Read the same way (Interpret Footage), conformed from the new file's own rate: a replacement shot at another rate
+    // still plays at the rate the footage was set to.
+    Interpretation how = interpretationOf(*m);
+    if (how.conformed()) {
+        MediaItem plain;
+        if (probeMedia(target, plain) && plain.fps.valid()) how.fileFps = plain.fps;
+        if (!how.conformed()) how.fps = how.fileFps = Rational{0, 1}, how.keepPitch = false;
+    }
+    target = interpretedPath(target, how);
     if (!probeMedia(target, n, &err)) {
         if (why) *why = err.empty() ? "It cannot be read" : err;
         return false;

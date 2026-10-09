@@ -1,6 +1,9 @@
 /* Montage's test OpenFX plugins, built as an .ofx.bundle:
  *  - Test Invert: inverts the (premultiplied) picture by Amount, then multiplies by Tint; Mode "Pass" leaves it alone.
  *  - Test Temporal Average: the average of the frames before, at and after the one rendered (temporal clip access).
+ *  - Test Probe: shows what the host gave it. Mode "Centre" writes its Centre parameter (defined in normalised
+ *    coordinates, read in canonical pixels) as red = x / 1000, green = y / 1000; mode "Changes" writes red = the
+ *    times this instance was told Amount changed / 10.
  * With MONTAGE_TEST_OFX_CRASH defined it instead crashes while describing itself, for the scanner's blocklist. */
 #include <stdlib.h>
 #include <string.h>
@@ -92,6 +95,43 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, int invert) {
     return kOfxStatOK;
 }
 
+static OfxStatus describeProbe(OfxImageEffectHandle effect) {
+    OfxPropertySetHandle clip;
+    gEffect->clipDefine(effect, kOfxImageEffectSimpleSourceClipName, &clip);
+    gProp->propSetString(clip, kOfxImageEffectPropSupportedComponents, 0, kOfxImageComponentRGBA);
+    gEffect->clipDefine(effect, kOfxImageEffectOutputClipName, &clip);
+    gProp->propSetString(clip, kOfxImageEffectPropSupportedComponents, 0, kOfxImageComponentRGBA);
+    OfxParamSetHandle params;
+    gEffect->getParamSet(effect, &params);
+    OfxPropertySetHandle p;
+    gParam->paramDefine(params, kOfxParamTypeDouble2D, "centre", &p);
+    gProp->propSetString(p, kOfxPropLabel, 0, "Centre");
+    gProp->propSetString(p, kOfxParamPropDoubleType, 0, kOfxParamDoubleTypeXYAbsolute);
+    gProp->propSetString(p, kOfxParamPropDefaultCoordinateSystem, 0, kOfxParamCoordinatesNormalised);
+    gProp->propSetDouble(p, kOfxParamPropDefault, 0, 0.5);
+    gProp->propSetDouble(p, kOfxParamPropDefault, 1, 0.25);
+    gProp->propSetDouble(p, kOfxParamPropDisplayMin, 0, 0.0);
+    gProp->propSetDouble(p, kOfxParamPropDisplayMin, 1, 0.0);
+    gProp->propSetDouble(p, kOfxParamPropDisplayMax, 0, 1.0);
+    gProp->propSetDouble(p, kOfxParamPropDisplayMax, 1, 1.0);
+    gParam->paramDefine(params, kOfxParamTypeDouble, "amount", &p);
+    gProp->propSetString(p, kOfxPropLabel, 0, "Amount");
+    gProp->propSetDouble(p, kOfxParamPropDefault, 0, 0.5);
+    gParam->paramDefine(params, kOfxParamTypeChoice, "mode", &p);
+    gProp->propSetString(p, kOfxPropLabel, 0, "Mode");
+    gProp->propSetString(p, kOfxParamPropChoiceOption, 0, "Centre");
+    gProp->propSetString(p, kOfxParamPropChoiceOption, 1, "Changes");
+    return kOfxStatOK;
+}
+
+static int* changesOf(OfxImageEffectHandle effect) {
+    OfxPropertySetHandle props;
+    void* data = NULL;
+    gEffect->getPropertySet(effect, &props);
+    gProp->propGetPointer(props, kOfxPropInstanceData, 0, &data);
+    return (int*)data;
+}
+
 typedef struct {
     float* data;
     int x1, y1, x2, y2, rowBytes;
@@ -171,6 +211,67 @@ static OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle in, in
     return kOfxStatOK;
 }
 
+static OfxStatus renderProbe(OfxImageEffectHandle effect, OfxPropertySetHandle in) {
+    OfxTime time;
+    int window[4];
+    gProp->propGetDouble(in, kOfxPropTime, 0, &time);
+    gProp->propGetIntN(in, kOfxImageEffectPropRenderWindow, 4, window);
+    OfxImageClipHandle output;
+    gEffect->clipGetHandle(effect, kOfxImageEffectOutputClipName, &output, NULL);
+    OfxPropertySetHandle outImg = NULL;
+    if (gEffect->clipGetImage(output, time, NULL, &outImg) != kOfxStatOK) return kOfxStatFailed;
+    View o;
+    viewOf(outImg, &o);
+    OfxParamSetHandle params;
+    OfxParamHandle h;
+    double cx = 0, cy = 0;
+    int mode = 0;
+    gEffect->getParamSet(effect, &params);
+    gParam->paramGetHandle(params, "centre", &h, NULL);
+    gParam->paramGetValueAtTime(h, time, &cx, &cy);
+    gParam->paramGetHandle(params, "mode", &h, NULL);
+    gParam->paramGetValueAtTime(h, time, &mode);
+    const int* changes = changesOf(effect);
+    const float r = mode == 1 ? (changes ? (float)*changes / 10.0f : -1.0f) : (float)(cx / 1000.0);
+    const float g = mode == 1 ? 0.0f : (float)(cy / 1000.0);
+    for (int y = window[1]; y < window[3]; ++y)
+        for (int x = window[0]; x < window[2]; ++x) {
+            float* op = pixel(&o, x, y);
+            op[0] = r, op[1] = g, op[2] = 0, op[3] = 1;
+        }
+    gEffect->clipReleaseImage(outImg);
+    return kOfxStatOK;
+}
+
+static OfxStatus mainProbe(const char* action, const void* handle, OfxPropertySetHandle in, OfxPropertySetHandle out) {
+    (void)out;
+    OfxImageEffectHandle effect = (OfxImageEffectHandle)handle;
+    if (!strcmp(action, kOfxActionLoad)) return load();
+    if (!strcmp(action, kOfxActionDescribe)) return describe(effect, "Test Probe", 0);
+    if (!strcmp(action, kOfxImageEffectActionDescribeInContext)) return describeProbe(effect);
+    if (!strcmp(action, kOfxActionCreateInstance)) {
+        OfxPropertySetHandle props;
+        gEffect->getPropertySet(effect, &props);
+        gProp->propSetPointer(props, kOfxPropInstanceData, 0, calloc(1, sizeof(int)));
+        return kOfxStatOK;
+    }
+    if (!strcmp(action, kOfxActionDestroyInstance)) {
+        free(changesOf(effect));
+        return kOfxStatOK;
+    }
+    if (!strcmp(action, kOfxActionInstanceChanged)) {
+        char* type = NULL;
+        char* name = NULL;
+        gProp->propGetString(in, kOfxPropType, 0, &type);
+        gProp->propGetString(in, kOfxPropName, 0, &name);
+        int* changes = changesOf(effect);
+        if (changes && type && name && !strcmp(type, kOfxTypeParameter) && !strcmp(name, "amount")) ++*changes;
+        return kOfxStatOK;
+    }
+    if (!strcmp(action, kOfxImageEffectActionRender)) return renderProbe(effect, in);
+    return kOfxStatReplyDefault;
+}
+
 static OfxStatus mainInvert(const char* action, const void* handle, OfxPropertySetHandle in, OfxPropertySetHandle out) {
     (void)out;
     OfxImageEffectHandle effect = (OfxImageEffectHandle)handle;
@@ -193,11 +294,12 @@ static OfxStatus mainTemporal(const char* action, const void* handle, OfxPropert
 
 static OfxPlugin gInvert = {kOfxImageEffectPluginApi, 1, "org.montage.test.invert", 1, 0, setHost, mainInvert};
 static OfxPlugin gTemporal = {kOfxImageEffectPluginApi, 1, "org.montage.test.temporal", 1, 0, setHost, mainTemporal};
+static OfxPlugin gProbe = {kOfxImageEffectPluginApi, 1, "org.montage.test.probe", 1, 0, setHost, mainProbe};
 
 EXPORT int OfxGetNumberOfPlugins(void) {
-    return 2;
+    return 3;
 }
 
 EXPORT OfxPlugin* OfxGetPlugin(int nth) {
-    return nth == 0 ? &gInvert : nth == 1 ? &gTemporal : NULL;
+    return nth == 0 ? &gInvert : nth == 1 ? &gTemporal : nth == 2 ? &gProbe : NULL;
 }

@@ -20,9 +20,11 @@
 #include <cstring>
 #include <thread>
 #include <type_traits>
+#include <utility>
 
 #include "audio/DynLib.h"
 #include "core/Effects.h"
+#include "media/SuperScale.h"
 #include "ofxCore.h"
 #include "ofxImageEffect.h"
 #include "ofxMemory.h"
@@ -320,9 +322,13 @@ struct Instance {
     std::string error;
     bool floatImages = true;
     bool wrote = false;  // the plugin gave its output image back
+    double projectW = 1920, projectH = 1080;  // full-size frame, for parameters given as a fraction of it
+    Effect last;  // the effect's values at its last render here, for kOfxActionInstanceChanged
+    bool fresh = true;  // not rendered yet
 };
 
 std::atomic<int> gInstances{0};
+std::atomic<int> gLiveInstances{0};
 
 ParamSetObj* pset(OfxParamSetHandle h) { return reinterpret_cast<ParamSetObj*>(h); }
 ParamObj* param(OfxParamHandle h) { return reinterpret_cast<ParamObj*>(h); }
@@ -337,6 +343,18 @@ int dimensionsOf(const std::string& type) {
     if (type == kOfxParamTypeDouble2D || type == kOfxParamTypeInteger2D) return 2;
     if (type == kOfxParamTypeDouble || type == kOfxParamTypeInteger || type == kOfxParamTypeBoolean || type == kOfxParamTypeChoice) return 1;
     return 0;
+}
+
+// A spatial double whose defaults and ranges are a fraction of the project (kOfxParamCoordinatesNormalised): the axis
+// of dimension k (0 width, 1 height), else -1. Montage keeps such values as fractions, so they follow the frame size,
+// and hands the plugin canonical coordinates, as the API says values always are.
+int normalisedAxis(const PropertySet& props, int k) {
+    if (props.getString(kOfxParamPropDefaultCoordinateSystem) != kOfxParamCoordinatesNormalised) return -1;
+    const std::string t = props.getString(kOfxParamPropDoubleType);
+    if (t == kOfxParamDoubleTypeX || t == kOfxParamDoubleTypeXAbsolute) return 0;
+    if (t == kOfxParamDoubleTypeY || t == kOfxParamDoubleTypeYAbsolute) return 1;
+    if (t == kOfxParamDoubleTypeXY || t == kOfxParamDoubleTypeXYAbsolute) return k < 2 ? k : -1;
+    return -1;
 }
 bool integerType(const std::string& type) {
     return type == kOfxParamTypeInteger || type == kOfxParamTypeBoolean || type == kOfxParamTypeChoice || type == kOfxParamTypeInteger2D ||
@@ -439,12 +457,14 @@ OfxStatus paramGetPropertySet(OfxParamHandle h, OfxPropertySetHandle* props) {
 
 // The parameter's value at OFX time `t` (clip frames): the effect's keyframed value, else the plugin's own.
 double valueAt(const ParamObj& p, int k, double t) {
+    const int axis = normalisedAxis(p.props, k);
+    const double size = axis < 0 || !p.owner ? 1.0 : axis == 0 ? p.owner->projectW : p.owner->projectH;
     if (p.owner && p.owner->effect) {
         auto it = p.owner->effect->params.find(effectKey(p.type, p.name, k));
-        if (it != p.owner->effect->params.end()) return it->second.at(FrameTime(std::floor(t + 1e-6)));
+        if (it != p.owner->effect->params.end()) return it->second.at(FrameTime(std::floor(t + 1e-6))) * size;
     }
-    if (k < int(p.value.size())) return p.value[size_t(k)];
-    return p.props.getDouble(kOfxParamPropDefault, 0, k);
+    if (k < int(p.value.size())) return p.value[size_t(k)];  // as the plugin set it: canonical already
+    return p.props.getDouble(kOfxParamPropDefault, 0, k) * size;
 }
 std::string textOf(const ParamObj& p) {
     if (p.owner && p.owner->effect) {
@@ -640,6 +660,26 @@ OfxStatus clipGetPropertySet(OfxImageClipHandle h, OfxPropertySetHandle* props) 
     return kOfxStatOK;
 }
 
+std::atomic<uint64_t> gImageSerial{0};
+
+// kOfxImagePropUniqueIdentifier: a source picture is named by what it holds (its size and a hash of its pixels), so a
+// plugin that caches analysis per image finds it again for the same picture and not for another; outputs are each new.
+std::string imageIdentifier(const Image& from, bool isOutput) {
+    if (isOutput) return "out:" + std::to_string(++gImageSerial);
+    uint64_t h = 1469598103934665603ull ^ (uint64_t(uint32_t(from.width)) << 32 | uint32_t(from.height));
+    const size_t words = from.px.size() / 2;
+    const auto* data = reinterpret_cast<const unsigned char*>(from.px.data());
+    for (size_t i = 0; i < words; i += 7) {  // every seventh pair of floats: quick, and touches every row
+        uint64_t v;
+        std::memcpy(&v, data + i * 8, 8);
+        h = (h ^ v) * 0x100000001b3ull;
+        h ^= h >> 29;
+    }
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "src:%016llx", static_cast<unsigned long long>(h));
+    return buf;
+}
+
 // An image for the plugin, bottom row first as OFX counts, from a premultiplied float image.
 ImageObj* makeImage(const Instance& inst, const Image& from, bool isOutput) {
     auto* img = new ImageObj;
@@ -676,7 +716,7 @@ ImageObj* makeImage(const Instance& inst, const Image& from, bool isOutput) {
     p.setDouble(kOfxImageEffectPropRenderScale, {inst.scale, inst.scale});
     p.setDouble(kOfxImagePropPixelAspectRatio, {1.0});
     p.setString(kOfxImagePropField, {kOfxImageFieldNone});
-    p.setString(kOfxImagePropUniqueIdentifier, {std::to_string(reinterpret_cast<uintptr_t>(img))});
+    p.setString(kOfxImagePropUniqueIdentifier, {imageIdentifier(from, isOutput)});
     p.setPointer("montage.image", img);  // found again on release
     return img;
 }
@@ -697,12 +737,14 @@ OfxStatus clipGetImage(OfxImageClipHandle h, OfxTime time, const OfxRectD*, OfxP
         img->owner = inst;
     } else {
         Image other;
-        // Another frame, at the same size as this one (else this one stands in).
-        if (std::fabs(time - inst->time) > 1e-6 && inst->fetch && *inst->fetch && (*inst->fetch)(time, other) && other.width == inst->source->width &&
-            other.height == inst->source->height)
+        // Another frame, sized like this one (else this one stands in).
+        if (std::fabs(time - inst->time) > 1e-6 && inst->fetch && *inst->fetch && (*inst->fetch)(time, other) && !other.empty()) {
+            if (other.width != inst->source->width || other.height != inst->source->height)
+                other = resizeImage(other, inst->source->width, inst->source->height);
             img = makeImage(*inst, other, false);
-        else
+        } else {
             img = makeImage(*inst, *inst->source, false);
+        }
     }
     *imageHandle = handle(&img->props);
     return kOfxStatOK;
@@ -1031,6 +1073,7 @@ void describeParams(EffectObj& e, PluginDesc& d) {
         }
         pd.choices = p->props.strings(kOfxParamPropChoiceOption);
         pd.doubleType = p->props.getString(kOfxParamPropDoubleType);
+        pd.normalised = normalisedAxis(p->props, 0) >= 0;
         if (stringType(p->type)) pd.stringDefault = p->props.getString(kOfxParamPropDefault);
         d.params.push_back(pd);
     }
@@ -1110,7 +1153,7 @@ QJsonObject toJson(const PluginDesc& d) {
                                   {"type", QString::fromStdString(p.type)}, {"default", def}, {"min", p.min}, {"max", p.max},
                                   {"displayMin", p.displayMin}, {"displayMax", p.displayMax}, {"choices", choices},
                                   {"string", QString::fromStdString(p.stringDefault)}, {"doubleType", QString::fromStdString(p.doubleType)},
-                                  {"animates", p.animates}, {"secret", p.secret}});
+                                  {"normalised", p.normalised}, {"animates", p.animates}, {"secret", p.secret}});
     }
     return QJsonObject{{"id", QString::fromStdString(d.id)}, {"identifier", QString::fromStdString(d.identifier)},
                        {"versionMajor", d.versionMajor}, {"versionMinor", d.versionMinor}, {"label", QString::fromStdString(d.label)},
@@ -1147,6 +1190,7 @@ PluginDesc fromJson(const QJsonObject& o) {
         for (const QJsonValue& c : po.value("choices").toArray()) p.choices.push_back(c.toString().toStdString());
         p.stringDefault = po.value("string").toString().toStdString();
         p.doubleType = po.value("doubleType").toString().toStdString();
+        p.normalised = po.value("normalised").toBool();
         p.animates = po.value("animates").toBool(true);
         p.secret = po.value("secret").toBool();
         d.params.push_back(p);
@@ -1154,34 +1198,44 @@ PluginDesc fromJson(const QJsonObject& o) {
     return d;
 }
 
+// Plug-ins that failed to load in this process, by id, with why: not tried again on every frame until a rescan.
+std::map<std::string, std::string>& failedLoads() {
+    static std::map<std::string, std::string> f;
+    return f;
+}
+
 // The plug-in for `d`, loaded and described in this process.
 Loaded* loadPlugin(const PluginDesc& d, std::string* error) {
     std::lock_guard<std::mutex> lock(gLoadMutex);
     auto& all = loadedPlugins();
     if (auto it = all.find(d.id); it != all.end()) return it->second.get();
-    Binary* bin = openBinary(d.binary, error);
-    if (!bin) return nullptr;
+    if (auto f = failedLoads().find(d.id); f != failedLoads().end()) {
+        if (error) *error = f->second;
+        return nullptr;
+    }
+    auto failed = [&](const std::string& why) -> Loaded* {
+        failedLoads()[d.id] = why;
+        if (error) *error = why;
+        return nullptr;
+    };
+    std::string why;
+    Binary* bin = openBinary(d.binary, &why);
+    if (!bin) return failed(why.empty() ? d.label + " could not be opened" : why);
     const int n = bin->count();
     for (int i = 0; i < n; ++i) {
         OfxPlugin* p = bin->get(i);
         if (!p || !p->pluginIdentifier || p->pluginIdentifier != d.identifier || int(p->pluginVersionMajor) != d.versionMajor) continue;
-        auto l = describe(bin, i, error);
-        if (!l) return nullptr;
+        auto l = describe(bin, i, &why);
+        if (!l) return failed(why.empty() ? d.label + " failed to load" : why);
         Loaded* raw = l.get();
         all[d.id] = std::move(l);
         return raw;
     }
-    if (error) *error = d.label + " is no longer in " + d.binary;
-    return nullptr;
+    return failed(d.label + " is no longer in " + d.binary);
 }
 
-// One instance per plug-in and thread, made on first use (instances are not shared between threads).
-Instance* instanceFor(Loaded* l, std::string* error) {
-    static std::mutex m;
-    static std::map<std::pair<Loaded*, std::thread::id>, std::unique_ptr<Instance>> pool;
-    std::lock_guard<std::mutex> lock(m);
-    auto key = std::make_pair(l, std::this_thread::get_id());
-    if (auto it = pool.find(key); it != pool.end()) return it->second.get();
+// Makes an instance of `l` (kOfxActionCreateInstance) with the host's clip and parameter objects.
+std::unique_ptr<Instance> createInstance(Loaded* l, std::string* error) {
     auto inst = std::make_unique<Instance>();
     inst->plugin = l;
     inst->floatImages = l->desc.floatImages;
@@ -1230,9 +1284,114 @@ Instance* instanceFor(Loaded* l, std::string* error) {
         return nullptr;
     }
     ++gInstances;
+    return inst;
+}
+
+void destroyInstance(std::unique_ptr<Instance> inst) {
+    if (!inst) return;
+    inst->plugin->plugin->mainEntry(kOfxActionDestroyInstance, reinterpret_cast<OfxImageEffectHandle>(&inst->obj), nullptr, nullptr);
+    --gLiveInstances;
+}
+
+// Instances belong to one clip effect each (a plug-in's per-instance state, such as an analysis or a loaded profile,
+// never leaks between effects) and render one frame at a time: a render checks one out, making it if none of that
+// effect's is free, and gives it back after. Free instances beyond a limit are destroyed, least recently used first,
+// so threads coming and going do not pile them up.
+struct PoolEntry {
+    std::unique_ptr<Instance> inst;
+    Loaded* plugin = nullptr;
+    Id effect = 0;
+    bool busy = false;
+    uint64_t lastUse = 0;
+};
+std::mutex gPoolMutex;
+std::vector<PoolEntry>& instancePool() {
+    static std::vector<PoolEntry> pool;
+    return pool;
+}
+constexpr size_t kIdleInstances = 16;
+
+Instance* checkOut(Loaded* l, Id effect, std::string* error) {
+    {
+        std::lock_guard<std::mutex> lock(gPoolMutex);
+        for (PoolEntry& e : instancePool())
+            if (!e.busy && e.plugin == l && e.effect == effect) {
+                e.busy = true;
+                return e.inst.get();
+            }
+    }
+    auto inst = createInstance(l, error);
+    if (!inst) return nullptr;
+    ++gLiveInstances;
     Instance* raw = inst.get();
-    pool[key] = std::move(inst);
+    std::lock_guard<std::mutex> lock(gPoolMutex);
+    instancePool().push_back(PoolEntry{std::move(inst), l, effect, true, 0});
     return raw;
+}
+
+void checkIn(Instance* inst) {
+    static uint64_t clock = 0;
+    std::vector<std::unique_ptr<Instance>> retire;
+    {
+        std::lock_guard<std::mutex> lock(gPoolMutex);
+        auto& pool = instancePool();
+        size_t idle = 0;
+        for (PoolEntry& e : pool) {
+            if (e.inst.get() == inst) e.busy = false, e.lastUse = ++clock;
+            if (!e.busy) ++idle;
+        }
+        while (idle > kIdleInstances) {
+            auto oldest = pool.end();
+            for (auto it = pool.begin(); it != pool.end(); ++it)
+                if (!it->busy && (oldest == pool.end() || it->lastUse < oldest->lastUse)) oldest = it;
+            retire.push_back(std::move(oldest->inst));
+            pool.erase(oldest);
+            --idle;
+        }
+    }
+    for (auto& r : retire) destroyInstance(std::move(r));
+}
+
+// Tells the instance which of its parameters changed since it last rendered (kOfxActionInstanceChanged, as a user edit),
+// for plug-ins that cache work from their values.
+void announceChanges(Instance& inst, const Effect& e, double t) {
+    if (inst.fresh) {
+        inst.fresh = false;
+        inst.last = e;
+        return;
+    }
+    std::vector<std::string> changed;
+    auto differs = [&](const std::string& key) {
+        const auto a = e.params.find(key);
+        const auto b = std::as_const(inst.last.params).find(key);
+        return (a == e.params.end()) != (b == inst.last.params.end()) || (a != e.params.end() && !(a->second == b->second));
+    };
+    for (const auto& p : inst.obj.params.params) {
+        bool d = false;
+        if (stringType(p->type)) {
+            d = e.s("str." + p->name) != inst.last.s("str." + p->name);
+        } else {
+            for (int k = 0; k < dimensionsOf(p->type) && !d; ++k) d = differs(effectKey(p->type, p->name, k));
+        }
+        if (d) changed.push_back(p->name);
+    }
+    inst.last = e;
+    if (changed.empty()) return;
+    auto entry = inst.plugin->plugin->mainEntry;
+    const OfxImageEffectHandle h = reinterpret_cast<OfxImageEffectHandle>(&inst.obj);
+    PropertySet reason;
+    reason.setString(kOfxPropChangeReason, {kOfxChangeUserEdited});
+    entry(kOfxActionBeginInstanceChanged, h, handle(&reason), nullptr);
+    for (const std::string& name : changed) {
+        PropertySet args;
+        args.setString(kOfxPropType, {kOfxTypeParameter});
+        args.setString(kOfxPropName, {name});
+        args.setString(kOfxPropChangeReason, {kOfxChangeUserEdited});
+        args.setDouble(kOfxPropTime, {t});
+        args.setDouble(kOfxImageEffectPropRenderScale, {inst.scale, inst.scale});
+        entry(kOfxActionInstanceChanged, h, handle(&args), nullptr);
+    }
+    entry(kOfxActionEndInstanceChanged, h, handle(&reason), nullptr);
 }
 
 }  // namespace
@@ -1348,7 +1507,16 @@ void Registry::setSearchPaths(const std::vector<std::string>& dirs) {
     paths_ = dirs;
 }
 
+void Registry::ensureScanned() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (scanned_) return;
+    }
+    scan();
+}
+
 int Registry::scan(std::vector<std::string>* log) {
+    std::lock_guard<std::mutex> scanning(scanMutex_);  // one scan at a time
     std::string cachePath, probe;
     std::vector<std::string> dirs;
     {
@@ -1402,9 +1570,14 @@ int Registry::scan(std::vector<std::string>* log) {
         out.commit();
     }
     std::sort(found.begin(), found.end(), [](const PluginDesc& a, const PluginDesc& b) { return a.label < b.label; });
+    {
+        std::lock_guard<std::mutex> loading(gLoadMutex);
+        failedLoads().clear();  // tried again after a rescan
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     plugins_ = found;
     blocked_ = blocked;
+    scanned_ = true;
     return int(plugins_.size());
 }
 
@@ -1492,18 +1665,27 @@ bool applyEffect(const Effect& e, double t, Image& img, double scale, const Fram
         return false;
     };
     if (img.empty()) return true;
-    // The plug-in as it was described when the effect was made, found again where it is now if it moved.
+    // Only a plug-in this computer's scan found and did not block runs: never a binary named by the project file, which
+    // could be anything, or one that crashed the probe.
+    Registry& registry = Registry::instance();
+    registry.ensureScanned();
     PluginDesc d;
-    const std::string id = e.s("ofx_id");
-    if (!Registry::instance().find(id, d)) {
+    if (!registry.find(e.s("ofx_id"), d)) {
         const std::vector<PluginDesc> saved = descriptionsFromJson(e.s("ofx_description"));
-        if (saved.empty()) return fail("The OpenFX plugin is not installed");
-        d = saved.front();
+        const std::string name = effectName(e);
+        if (!saved.empty())
+            for (const auto& [binary, why] : registry.blocked())
+                if (binary == saved.front().binary) return fail(name + " is blocked: " + why);
+        return fail(name + " is not installed");
     }
     Loaded* l = loadPlugin(d, error ? error : nullptr);
     if (!l) return false;
-    Instance* inst = instanceFor(l, error);
+    Instance* inst = checkOut(l, e.id, error);
     if (!inst) return false;
+    struct Return {
+        Instance* inst;
+        ~Return() { checkIn(inst); }
+    } giveBack{inst};
     std::unique_lock<std::mutex> serial(l->renderMutex, std::defer_lock);
     if (l->unsafe) serial.lock();
     Image out(img.width, img.height);
@@ -1516,8 +1698,10 @@ bool applyEffect(const Effect& e, double t, Image& img, double scale, const Fram
     inst->error.clear();
     inst->wrote = false;
     const double fullW = img.width / inst->scale, fullH = img.height / inst->scale;
+    inst->projectW = fullW, inst->projectH = fullH;
     inst->obj.props.setDouble(kOfxImageEffectPropProjectSize, {fullW, fullH});
     inst->obj.props.setDouble(kOfxImageEffectPropProjectExtent, {fullW, fullH});
+    announceChanges(*inst, e, t);
     auto entry = l->plugin->mainEntry;
     const OfxImageEffectHandle h = reinterpret_cast<OfxImageEffectHandle>(&inst->obj);
     PropertySet seq;
@@ -1549,6 +1733,7 @@ bool applyEffect(const Effect& e, double t, Image& img, double scale, const Fram
 }
 
 int instancesCreated() { return gInstances.load(); }
+int instancesAlive() { return gLiveInstances.load(); }
 
 namespace {
 thread_local FrameFetch tFetch;

@@ -289,13 +289,13 @@ private slots:
     void hostsOpenFxVideoPlugins() {
         const std::string good = MONTAGE_TEST_OFX_DIR "/good", crash = MONTAGE_TEST_OFX_DIR "/crash";
         QCOMPARE(ofx::findBinaries({good, crash}).size(), size_t(2));
-        // Scanned in the probe: the good bundle's two filters described, the one that crashes blocklisted.
+        // Scanned in the probe: the good bundle's three filters described, the one that crashes blocklisted.
         ofx::Registry& reg = ofx::Registry::instance();
         reg.setCachePath(path("ofx-cache.json").toStdString());
         reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
         reg.setSearchPaths({good, crash});
         std::vector<std::string> log;
-        QCOMPARE(reg.scan(&log), 2);
+        QCOMPARE(reg.scan(&log), 3);
         QCOMPARE(reg.blocked().size(), size_t(1));
         // (A crash on Linux and macOS; on Windows the test plugin ends its process without the crash dialog.)
         QVERIFY2(reg.blocked()[0].first.find("MontageTestOfxCrash") != std::string::npos &&
@@ -304,7 +304,7 @@ private slots:
         QCOMPARE(log.size(), size_t(2));
         // Unchanged files come from the cache, without the probe.
         log.clear();
-        QCOMPARE(reg.scan(&log), 2);
+        QCOMPARE(reg.scan(&log), 3);
         QVERIFY(std::all_of(log.begin(), log.end(), [](const std::string& l) { return l.rfind("cached", 0) == 0; }));
         QCOMPARE(ofx::instancesCreated(), 0);  // nothing loaded in this process yet
         ofx::PluginDesc invert, temporal;
@@ -448,6 +448,53 @@ private slots:
             ts.videoTracks[0].clips[0].effects.push_back(ofx::makeEffect(tp, temporal));
             const float middle = renderSequenceFrame(tp, ts, 1, o).at(8, 8)[0];
             QVERIFY2(std::fabs(middle - (25 + 128 + 153) / 3.0f / 255.0f) < 0.01f, qPrintable(QString::number(middle)));
+            // Log footage: the frames either side are brought into the working space like the frame itself.
+            tp.media[0].colorOverride = "slog3-sgamut3cine";
+            const Effect kept = ts.videoTracks[0].clips[0].effects[0];
+            ts.videoTracks[0].clips[0].effects.clear();
+            float plain = 0;
+            for (FrameTime f = 0; f < 3; ++f) plain += renderSequenceFrame(tp, ts, f, o).at(8, 8)[0] / 3;
+            ts.videoTracks[0].clips[0].effects.push_back(kept);
+            const float logMiddle = renderSequenceFrame(tp, ts, 1, o).at(8, 8)[0];
+            QVERIFY2(std::fabs(logMiddle - plain) < 0.01f, qPrintable(QString("%1 %2").arg(logMiddle).arg(plain)));
+        }
+        // Each clip effect has its own instance, told when its parameters change; a position the plugin gives as a
+        // fraction of the frame is kept that way and reaches the plugin in pixels.
+        {
+            ofx::PluginDesc probe;
+            QVERIFY(reg.find("org.montage.test.probe/1", probe));
+            QVERIFY(probe.params.at(0).normalised && !probe.params.at(1).normalised);
+            Effect a = ofx::makeEffect(p, probe), b = ofx::makeEffect(p, probe);
+            QVERIFY(a.id != b.id);
+            QCOMPARE(a.params.at("param.centre.x").value, 0.5);
+            Image half(200, 100);  // a 400 x 200 frame at half size
+            QVERIFY2(ofx::applyEffect(a, 0, half, 0.5, {}, &err), err.c_str());
+            QVERIFY2(std::fabs(half.at(5, 5)[0] - 0.2f) < 1e-4 && std::fabs(half.at(5, 5)[1] - 0.05f) < 1e-4,
+                     qPrintable(QString("%1 %2").arg(half.at(5, 5)[0]).arg(half.at(5, 5)[1])));
+            a.params["param.centre.x"] = Param(0.25);
+            QVERIFY(ofx::applyEffect(a, 0, half, 0.5, {}, &err) && std::fabs(half.at(5, 5)[0] - 0.1f) < 1e-4);
+            auto changes = [&](const Effect& fx) {
+                Image i(8, 8);
+                if (!ofx::applyEffect(fx, 0, i, 1.0, {}, &err)) return -1.0f;
+                return i.at(1, 1)[0] * 10;
+            };
+            a.params["param.mode"] = Param(1.0);
+            b.params["param.mode"] = Param(1.0);
+            QCOMPARE(std::lround(changes(a)), 0L);  // the mode changed, not the amount
+            a.params["param.amount"] = Param(0.9);
+            QCOMPARE(std::lround(changes(a)), 1L);
+            QCOMPARE(std::lround(changes(a)), 1L);  // nothing new
+            a.params["param.amount"].addKey(0, 0.1);
+            QCOMPARE(std::lround(changes(a)), 2L);
+            QCOMPARE(std::lround(changes(b)), 0L);  // its own instance: nothing of a's
+            // Free instances are destroyed past a limit, least recently used first.
+            const int made = ofx::instancesCreated();
+            for (int k = 0; k < 20; ++k) {
+                Effect fx = ofx::makeEffect(p, probe);
+                QVERIFY(changes(fx) >= 0);
+            }
+            QVERIFY(ofx::instancesCreated() >= made + 20);
+            QVERIFY2(ofx::instancesAlive() <= 16, qPrintable(QString::number(ofx::instancesAlive())));
         }
         // A missing plugin leaves the picture as it was and says why.
         Effect gone = e;
@@ -457,6 +504,21 @@ private slots:
         keep.fill(0.1f, 0.2f, 0.3f, 1.0f);
         QVERIFY(!ofx::applyEffect(gone, 0, keep, 1.0, {}, &err));
         QVERIFY(err.find("not installed") != std::string::npos && std::fabs(keep.at(1, 1)[0] - 0.1f) < 1e-6);
+        // A binary named in the project file is never loaded: only what the scan found runs, and a blocked plugin
+        // says so rather than crashing the editor.
+        const int before = ofx::instancesCreated();
+        ofx::PluginDesc elsewhere = invert;
+        elsewhere.id = "org.example.elsewhere/1";
+        gone.strings["ofx_id"] = elsewhere.id;
+        gone.strings["ofx_description"] = ofx::descriptionsToJson({elsewhere});
+        QVERIFY(!ofx::applyEffect(gone, 0, keep, 1.0, {}, &err));
+        QVERIFY2(err.find("not installed") != std::string::npos, err.c_str());
+        elsewhere.binary = reg.blocked()[0].first;
+        gone.strings["ofx_description"] = ofx::descriptionsToJson({elsewhere});
+        QVERIFY(!ofx::applyEffect(gone, 0, keep, 1.0, {}, &err));
+        QVERIFY2(err.find("blocked") != std::string::npos, err.c_str());
+        QCOMPARE(ofx::instancesCreated(), before);
+        QVERIFY(std::fabs(keep.at(1, 1)[0] - 0.1f) < 1e-6);
     }
 
 #ifdef __APPLE__

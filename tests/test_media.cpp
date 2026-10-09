@@ -1676,6 +1676,10 @@ private slots:
         QCOMPARE(placed.markers.at(0).t, FrameTime(60));  // the same moment of the footage
         QCOMPARE(p.findMedia(sub.id)->subclipIn, 1.25);
         QCOMPARE(p.findMedia(sub.id)->subclipOut, 2.5);
+        // The subclip is read as its media is (thumbnails and its own decodes).
+        QCOMPARE(p.findMedia(sub.id)->path, now->path);
+        QCOMPARE(p.findMedia(sub.id)->fps, (Rational{24, 1}));
+        QCOMPARE(p.findMedia(sub.id)->duration, 1.25);
         QCOMPARE(now->transcript->segments.at(0).words.at(0).start, 2.5);
         QVERIFY(!edit::interpretFootage(p, m.id, slow).ok);  // nothing changes
         // The sound plays at the new speed: five times as long, the tone at 200 Hz.
@@ -1698,6 +1702,23 @@ private slots:
         // Relinked to the same file: still read the same way.
         QVERIFY2(relinkMedia(p, m.id, st.path, RelinkCheck::Strict, &err), err.c_str());
         QVERIFY(interpretationOf(*p.findMedia(m.id)).conformed());
+        // Replaced by a 30 fps take: still played at 24, now conformed from 30 (each of its frames a sequence frame).
+        {
+            Project g30 = makeDefaultProject();
+            Sequence& s30 = *g30.active();
+            s30.width = 160, s30.height = 90, s30.fps = Rational{30, 1};
+            edit::overwrite(g30, s30, {TrackKind::Video, 0}, makeGeneratorClip(g30, "color", 30));
+            ExportSettings st30;
+            st30.path = path("take30.mov");
+            st30.videoCodec = "prores_ks";
+            QVERIFY2(exportSequence(g30, s30, st30, nullptr, nullptr, &err), err.c_str());
+            Project rp = p;
+            QVERIFY2(relinkMedia(rp, m.id, st30.path, RelinkCheck::Replace, &err), err.c_str());
+            const Interpretation how = interpretationOf(*rp.findMedia(m.id));
+            QVERIFY(how.conformed() && how.fps == (Rational{24, 1}) && how.fileFps == (Rational{30, 1}));
+            QCOMPARE(rp.findMedia(m.id)->fps, (Rational{24, 1}));
+            QVERIFY2(std::fabs(rp.findMedia(m.id)->duration - 1.25) < 0.05, qPrintable(QString::number(rp.findMedia(m.id)->duration)));
+        }
         // Back to the file's own rate: a second again, the clip back on frame 50 at 10.
         Interpretation asFile;
         QVERIFY(edit::interpretFootage(p, m.id, asFile).ok);

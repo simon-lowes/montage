@@ -142,11 +142,16 @@ bool AssistantPanel::settingsDialog() {
     connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
     form->addRow(buttons);
     if (dlg.exec() != QDialog::Accepted) return false;
+    const bool newService = c.provider != provider->currentData().toString();
     c.provider = provider->currentData().toString();
     c.endpoint = endpoint->text().trimmed();
     c.model = model->text().trimmed();
     c.apiKey = key->text().trimmed();
     session_->setConfig(c);
+    if (newService) {
+        log_->clear();
+        append({}, tr("New conversation with %1").arg(provider->currentText().toHtmlEscaped()), QStringLiteral("#8a8f98"));
+    }
     AssistantSession::saveConfig(c);
     refreshHeader();
     return true;

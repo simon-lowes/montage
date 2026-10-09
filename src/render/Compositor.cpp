@@ -762,13 +762,18 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                 const double duration = m->duration, frameSeconds = m->fps.valid() ? 1.0 / m->fps.toDouble() : 1.0 / 30, seqFps = seq.fpsValue();
                 const bool hq = o.highQuality;
                 const Clip clipCopy = c;
-                ofxFetch = [path, w, h, hq, clipCopy, duration, frameSeconds, seqFps](double at, Image& out) {
+                // Neighbouring frames in the same working space as the frame the plugin is given.
+                const ColorSpace* from = &mediaColorSpace(*m);
+                const ColorSpace* to = &sequenceColorSpace(seq);
+                const double peak = seq.hdrPeakNits;
+                ofxFetch = [path, w, h, hq, clipCopy, duration, frameSeconds, seqFps, from, to, peak](double at, Image& out) {
                     const FrameTime local = FrameTime(std::floor(at + 1e-6));
                     if (local < 0 || local >= clipCopy.duration) return false;
                     const double s = std::clamp(clipCopy.sourceFrameAt(clipCopy.start + local) / seqFps, 0.0, std::max(0.0, duration - frameSeconds * 0.5));
                     Frame16Ptr frame = MediaPool::instance().videoFrame(path, s, w, h, hq);
                     if (!frame) return false;
                     out = toImage(*frame);
+                    convertColor(out, *from, *to, peak);
                     return true;
                 };
             }

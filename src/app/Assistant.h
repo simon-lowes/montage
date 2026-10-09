@@ -39,7 +39,9 @@ public:
 
     static AssistantConfig savedConfig();
     static void saveConfig(const AssistantConfig& c);
-    void setConfig(const AssistantConfig& c) { config_ = c; }
+    // New settings: a request in flight is stopped, and a different service starts a new conversation (each keeps it in
+    // its own form).
+    void setConfig(const AssistantConfig& c);
     const AssistantConfig& config() const { return config_; }
 
     // A request from the editor: the model works on it (calling tools as it needs) until it answers.
