@@ -18,6 +18,7 @@
 #include <thread>
 #include <sstream>
 #include <QElapsedTimer>
+#include <QTcpServer>
 #include <QTcpSocket>
 #include <QLineEdit>
 #include <QLabel>
@@ -61,6 +62,8 @@
 #include "core/Interpretation.h"
 #include "LiveBridge.h"
 #include "LiveLink.h"
+#include "Assistant.h"
+#include "AssistantPanel.h"
 #include "media/SpeechSearch.h"
 #include "media/TextReader.h"
 #include "core/OnScreenText.h"
@@ -5354,6 +5357,129 @@ const auto seq = [this] { return state()->sequence(); };
         runLiveBridge(in2, out2);
         QVERIFY2(QByteArray::fromStdString(out2.str()).contains("-32000"), out2.str().c_str());
         qunsetenv("MONTAGE_MCP_LIVE_FILE");
+        state()->newProject();
+    }
+
+    void assistantPanelEditsWithTools() {
+        // A stand-in for the model's service: answers each request with the next scripted reply, keeping what was asked.
+        struct FakeModel {
+            QTcpServer server;
+            QList<QByteArray> replies;
+            QList<QByteArray> heads, bodies;
+            bool hold = false;  // leave the next request unanswered
+        } fake;
+        QVERIFY(fake.server.listen(QHostAddress::LocalHost));
+        QObject::connect(&fake.server, &QTcpServer::newConnection, &fake.server, [&fake] {
+            QTcpSocket* s = fake.server.nextPendingConnection();
+            auto* buf = new QByteArray;
+            QObject::connect(s, &QTcpSocket::disconnected, s, [s, buf] {
+                delete buf;
+                s->deleteLater();
+            });
+            QObject::connect(s, &QTcpSocket::readyRead, s, [&fake, s, buf] {
+                *buf += s->readAll();
+                const int end = int(buf->indexOf("\r\n\r\n"));
+                if (end < 0) return;
+                const QByteArray head = buf->left(end).toLower();
+                const int at = int(head.indexOf("content-length:"));
+                const int length = at < 0 ? 0 : head.mid(at + 15, head.indexOf('\n', at) - at - 15).trimmed().toInt();
+                if (buf->size() - end - 4 < length) return;
+                fake.heads << buf->left(end);
+                fake.bodies << buf->mid(end + 4, length);
+                buf->clear();
+                if (fake.hold || fake.replies.isEmpty()) return;
+                const QByteArray body = fake.replies.takeFirst();
+                s->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + QByteArray::number(body.size()) +
+                         "\r\nConnection: close\r\n\r\n" + body);
+                s->disconnectFromHost();
+            });
+        });
+        const QString endpoint = QStringLiteral("http://127.0.0.1:%1").arg(fake.server.serverPort());
+        state()->newProject();
+        AssistantPanel* panel = win_->assistant();
+        QVERIFY(panel && win_->findChild<QDockWidget*>("assistant"));
+        AssistantSession* session = panel->session();
+        QVERIFY(session->toolCount() > 90);
+        // Claude: a title asked for, added with the title tool, then a word on what was done.
+        AssistantConfig c;
+        c.endpoint = endpoint;
+        c.apiKey = "test-key";
+        session->setConfig(c);
+        fake.replies << R"({"content":[{"type":"text","text":"Adding it."},{"type":"tool_use","id":"tu1","name":"montage_add_title","input":{"text":"Hello there","at":1}}],"stop_reason":"tool_use"})"
+                     << R"({"content":[{"type":"text","text":"Done: a title at 1 s."}],"stop_reason":"end_turn"})";
+        bool finished = false;
+        auto connection = connect(session, &AssistantSession::finished, this, [&] { finished = true; });
+        panel->ask("Put a title saying Hello there at one second");
+        QTRY_VERIFY_WITH_TIMEOUT(finished, 30000);
+        QCOMPARE(fake.bodies.size(), 2);
+        QVERIFY(fake.heads[0].startsWith("POST /v1/messages"));
+        QVERIFY(fake.heads[0].toLower().contains("x-api-key: test-key") && fake.heads[0].toLower().contains("anthropic-version: 2023-06-01"));
+        const QJsonObject first = QJsonDocument::fromJson(fake.bodies[0]).object();
+        QCOMPARE(first.value("model").toString(), QString("claude-opus-5-5"));
+        QVERIFY(!first.value("system").toString().isEmpty());
+        const QJsonArray tools = first.value("tools").toArray();
+        QVERIFY(tools.size() > 90 && tools.last().toObject().contains("cache_control"));
+        const QJsonArray messages = QJsonDocument::fromJson(fake.bodies[1]).object().value("messages").toArray();
+        QCOMPARE(messages.size(), 3);  // the ask, the model's turn, the tool's answer
+        const QJsonObject result = messages[2].toObject().value("content").toArray().at(0).toObject();
+        QVERIFY(result.value("type") == "tool_result" && result.value("tool_use_id") == "tu1" && !result.value("is_error").toBool());
+        bool titled = false;
+        for (const Track& t : state()->sequence()->videoTracks)
+            for (const Clip& clip : t.clips) titled |= clip.isGenerator();
+        QVERIFY(titled);
+        QVERIFY2(state()->undoText().startsWith("Assistant: "), qPrintable(state()->undoText()));
+        const QString log = panel->transcriptText();
+        QVERIFY2(log.contains("Adding it.") && log.contains("Done: a title at 1 s.") && log.contains("✓"), qPrintable(log));
+        // Stop: a request left unanswered is dropped and the conversation stays usable.
+        fake.hold = true;
+        finished = false;
+        panel->ask("And another");
+        QTRY_VERIFY_WITH_TIMEOUT(fake.bodies.size() == 3, 10000);
+        QVERIFY(session->busy());
+        session->stop();
+        QVERIFY(!session->busy() && finished);
+        QVERIFY(panel->transcriptText().contains("Stopped"));
+        fake.hold = false;
+        // No key: said so, nothing sent.
+        qunsetenv("ANTHROPIC_API_KEY");
+        c.apiKey.clear();
+        session->setConfig(c);
+        session->clear();
+        QString failure;
+        auto failConnection = connect(session, &AssistantSession::failed, this, [&](const QString& why) { failure = why; });
+        session->send("Anything");
+        QVERIFY2(failure.contains("API key"), qPrintable(failure));
+        QCOMPARE(fake.bodies.size(), 3);
+        disconnect(failConnection);
+        // An OpenAI-compatible endpoint (a local model): the context tool moves the playhead, then the answer.
+        c.provider = "openai";
+        c.model = "local-model";
+        c.apiKey = "k";
+        session->setConfig(c);
+        session->clear();
+        const QJsonObject call{{"id", "c1"}, {"type", "function"},
+                               {"function", QJsonObject{{"name", "montage_live_context"}, {"arguments", QStringLiteral("{\"playhead\":3}")}}}};
+        const QJsonObject toolTurn{{"role", "assistant"}, {"content", QJsonValue()}, {"tool_calls", QJsonArray{call}}};
+        const QJsonObject answerTurn{{"role", "assistant"}, {"content", "The playhead is at 3 seconds."}};
+        fake.replies << QJsonDocument(QJsonObject{{"choices", QJsonArray{QJsonObject{{"message", toolTurn}, {"finish_reason", "tool_calls"}}}}}).toJson(QJsonDocument::Compact)
+                     << QJsonDocument(QJsonObject{{"choices", QJsonArray{QJsonObject{{"message", answerTurn}, {"finish_reason", "stop"}}}}}).toJson(QJsonDocument::Compact);
+        finished = false;
+        panel->ask("Go to three seconds");
+        QTRY_VERIFY_WITH_TIMEOUT(finished, 30000);
+        QCOMPARE(fake.bodies.size(), 5);
+        QVERIFY(fake.heads[3].startsWith("POST /v1/chat/completions"));
+        QVERIFY(fake.heads[3].toLower().contains("authorization: bearer k"));
+        const QJsonObject openFirst = QJsonDocument::fromJson(fake.bodies[3]).object();
+        QCOMPARE(openFirst.value("model").toString(), QString("local-model"));
+        QCOMPARE(openFirst.value("messages").toArray().at(0).toObject().value("role").toString(), QString("system"));
+        QCOMPARE(openFirst.value("tools").toArray().at(0).toObject().value("type").toString(), QString("function"));
+        const QJsonArray openMessages = QJsonDocument::fromJson(fake.bodies[4]).object().value("messages").toArray();
+        const QJsonObject toolMessage = openMessages.last().toObject();
+        QVERIFY(toolMessage.value("role") == "tool" && toolMessage.value("tool_call_id") == "c1");
+        QCOMPARE(state()->playhead(), FrameTime(std::llround(3 * state()->sequence()->fpsValue())));
+        QVERIFY(panel->transcriptText().contains("The playhead is at 3 seconds."));
+        disconnect(connection);
+        session->setConfig(AssistantConfig{});
         state()->newProject();
     }
 

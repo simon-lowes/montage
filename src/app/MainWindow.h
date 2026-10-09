@@ -54,6 +54,7 @@ class LoudnessReadout;
 class VoiceoverDialog;
 class LinkMediaDialog;
 class LiveLink;
+class AssistantPanel;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -161,6 +162,7 @@ public:
     // Tools › Agent Link: AI agents edit the open project over MCP (app/LiveLink.h). On or off (remembered), and the
     // dialog with how to connect.
     LiveLink* liveLink() const { return liveLink_; }
+    AssistantPanel* assistant() const { return assistant_; }
     bool setAgentLink(bool on);
     void agentLinkDialog();
     void exportForReviewDialog();
@@ -425,6 +427,8 @@ private:
     QDockWidget* transcriptDock_ = nullptr;
     QDockWidget* shotsDock_ = nullptr;
     QDockWidget* peopleDock_ = nullptr;
+    QDockWidget* assistantDock_ = nullptr;
+    AssistantPanel* assistant_ = nullptr;
     QDockWidget* indexDock_ = nullptr;
     QDockWidget* multicamDock_ = nullptr;
     QDockWidget* queueDock_ = nullptr;

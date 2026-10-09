@@ -1,6 +1,7 @@
 #include "MainWindow.h"
 #include "LiveBridge.h"
 #include "LiveLink.h"
+#include "AssistantPanel.h"
 #include "CleanFeed.h"
 #include "Settings.h"
 
@@ -404,6 +405,8 @@ void MainWindow::buildPanels() {
     transcriptDock_ = makeDock(tr("Transcript"), "transcript", transcript_);
     shotsDock_ = makeDock(tr("Find Shots"), "shots", shots_);
     peopleDock_ = makeDock(tr("People"), "people", people_);
+    assistant_ = new AssistantPanel(liveLink_, this);
+    assistantDock_ = makeDock(tr("Assistant"), "assistant", assistant_);
     indexDock_ = makeDock(tr("Sequence Index"), "index", new SequenceIndexPanel(state_, this));
     multicamDock_ = makeDock(tr("Multicam"), "multicam", multicam_);
     keyframesDock_ = makeDock(tr("Keyframes"), "keyframes", new KeyframePanel(state_, this));
@@ -537,13 +540,13 @@ void MainWindow::layOutBuiltIn(const QString& name) {
         resizeDocks({captionsDock_}, {h / 2 + 40}, Qt::Vertical);
     } else if (name == "Logging") {
         // A wide bin to log and search in, the Source monitor to mark in (Premiere's Assembly, Resolve's Media page).
-        arrangeDocks({{sourceDock_, inspectorDock_}, {programDock_}}, {{binDock_, shotsDock_, peopleDock_, transcriptDock_, indexDock_}}, {});
+        arrangeDocks({{sourceDock_, inspectorDock_}, {programDock_}}, {{binDock_, shotsDock_, peopleDock_, transcriptDock_, indexDock_, assistantDock_}}, {});
         resizeDocks({binDock_}, {760}, Qt::Horizontal);
         resizeDocks({sourceDock_, programDock_}, {560, 280}, Qt::Horizontal);
         resizeDocks({sourceDock_}, {h / 2 + 40}, Qt::Vertical);
     } else {  // Editing
         arrangeDocks({{sourceDock_, inspectorDock_, scopesDock_, mixerDock_, captionsDock_, multicamDock_, keyframesDock_}, {programDock_}},
-                     {{binDock_, effectsDock_, transcriptDock_, shotsDock_, peopleDock_, indexDock_, queueDock_}}, {{meterDock_}});
+                     {{binDock_, effectsDock_, transcriptDock_, shotsDock_, peopleDock_, indexDock_, queueDock_, assistantDock_}}, {{meterDock_}});
         resizeDocks({binDock_}, {380}, Qt::Horizontal);
         resizeDocks({meterDock_}, {70}, Qt::Horizontal);
         resizeDocks({sourceDock_, programDock_}, {720, 860}, Qt::Horizontal);
