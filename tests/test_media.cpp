@@ -9372,7 +9372,8 @@ private slots:
             if (sq.name == "Mix 2") mix = &sq;
         QVERIFY(mix);
         QCOMPARE(mix->videoTracks[0].clips.size(), size_t(3));
-        QCOMPARE(mix->markers.size(), size_t(4));  // on each insert and where shot 1 was trimmed
+        QCOMPARE(mix->markers.size(), size_t(3));  // on each insert, the first sharing its frame with the trim
+        QCOMPARE(mix->markers[0].name, std::string("Trimmed: shot.mov / Inserted: Black"));
         QCOMPARE(mix->videoTracks[0].clips[2].start, FrameTime(200));
         r = reconform({{"project", project}, {"before", "Cut 1"}, {"source", "Cut 9"}});
         QVERIFY(r.value("isError").toBool());

@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <limits>
 #include <map>
+#include <set>
 #include <sstream>
 
 #include "Captions.h"
@@ -41,7 +42,10 @@ struct Segment {
     const Clip* clip = nullptr;
     std::string key;     // what it shows: the file (and multicam angle), a nested sequence, a generator and its settings
     bool still = false;  // the same picture throughout: a still image, or black
+    int id = -1;         // the key as a number
     std::string name() const { return clip ? clip->name : "Black"; }
+    // Pictures that look the same wherever they are: black, stills, titles, mattes and other generated ones.
+    bool weak() const { return still || !clip || clip->isGenerator(); }
 };
 
 const Clip* clipAt(const Track& t, FrameTime f) {
@@ -184,44 +188,60 @@ CutChanges cutChanges(const Project& pOld, const Sequence& oldCut, const Project
         if (error) *error = "The two cuts have different frame rates";
         return out;
     }
-    const std::vector<Segment> A = segments(pOld, oldCut, out.oldLength), B = segments(pNew, newCut, out.newLength);
-    std::map<std::string, std::vector<size_t>> byKey;
-    for (size_t i = 0; i < A.size(); ++i) byKey[A[i].key].push_back(i);
+    std::vector<Segment> A = segments(pOld, oldCut, out.oldLength), B = segments(pNew, newCut, out.newLength);
+    // Keys as numbers, and how many stretches of each cut show each.
+    std::map<std::string, int> ids;
+    for (auto* segs : {&A, &B})
+        for (Segment& g : *segs) g.id = ids.try_emplace(g.key, int(ids.size())).first->second;
+    std::vector<int> countA(ids.size(), 0), countB(ids.size(), 0);
+    for (const Segment& g : A) ++countA[size_t(g.id)];
+    for (const Segment& g : B) ++countB[size_t(g.id)];
+    std::vector<std::vector<size_t>> byKey(ids.size());
+    for (size_t i = 0; i < A.size(); ++i) byKey[size_t(A[i].id)].push_back(i);
 
     // Every stretch the new cut shares with the old, then the longest first (the nearest to where it was among equals),
-    // each new frame taken once. An old stretch may be taken twice (a shot used again).
+    // each new frame taken once; an old stretch may be taken twice (a shot used again). Stills and generated pictures
+    // (titles, mattes, slugs) look alike wherever they are, so they pair only when each cut has them once; black never.
     std::vector<Run> runs;
     for (const Segment& b : B) {
-        auto it = byKey.find(b.key);
-        if (it == byKey.end()) continue;
-        for (size_t ai : it->second) matchSegments(A[ai], b, runs);
+        if (b.weak() && (!b.clip || countA[size_t(b.id)] != 1 || countB[size_t(b.id)] != 1)) continue;
+        for (size_t ai : byKey[size_t(b.id)]) matchSegments(A[ai], b, runs);
     }
     std::stable_sort(runs.begin(), runs.end(), [](const Run& x, const Run& y) {
         if (x.length() != y.length()) return x.length() > y.length();
         if (std::llabs(x.d) != std::llabs(y.d)) return std::llabs(x.d) < std::llabs(y.d);
         return x.t0 < y.t0;
     });
-    std::vector<char> covered(size_t(std::max<FrameTime>(0, out.newLength)), 0);
+    const size_t newLen = size_t(std::max<FrameTime>(0, out.newLength)), oldLen = size_t(std::max<FrameTime>(0, out.oldLength));
+    std::vector<char> covered(newLen, 0);
+    std::vector<FrameTime> offset(newLen, 0);  // a covered new frame t shows old frame t + offset[t]
+    for (const Run& r : runs)
+        for (FrameTime t = r.t0; t < r.t1; ++t)
+            if (!covered[size_t(t)]) covered[size_t(t)] = 1, offset[size_t(t)] = r.d;
+    // Black, stills and generated pictures otherwise go with what is next to them: kept where the stretch before (or
+    // after) them puts them on the same picture in the old cut.
+    std::vector<int> keyOld(oldLen, -1), keyNew(newLen, -1);
+    for (const Segment& g : A)
+        for (FrameTime t = g.t0; t < g.t1; ++t) keyOld[size_t(t)] = g.id;
+    std::vector<char> weakNew(newLen, 0);
+    for (const Segment& g : B)
+        for (FrameTime t = g.t0; t < g.t1; ++t) keyNew[size_t(t)] = g.id, weakNew[size_t(t)] = g.weak();
+    auto extend = [&](size_t t, size_t from) {
+        if (covered[t] || !weakNew[t] || !covered[from]) return;
+        const FrameTime o = FrameTime(t) + offset[from];
+        if (o < 0 || o >= out.oldLength || keyOld[size_t(o)] != keyNew[t]) return;
+        covered[t] = 1;
+        offset[t] = offset[from];
+    };
+    for (size_t t = 1; t < newLen; ++t) extend(t, t - 1);
+    for (size_t t = newLen; t-- > 1;) extend(t - 1, t);
+    // The stretches: covered frames one after another at one offset.
     std::vector<Run> pieces;
-    for (const Run& r : runs) {
-        FrameTime start = -1;
-        for (FrameTime t = r.t0; t <= r.t1; ++t) {
-            const bool open = t < r.t1 && !covered[size_t(t)];
-            if (open && start < 0) start = t;
-            if (!open && start >= 0) {
-                pieces.push_back({start, t, r.d});
-                start = -1;
-            }
-        }
-        for (FrameTime t = r.t0; t < r.t1; ++t) covered[size_t(t)] = 1;
+    for (size_t t = 0; t < newLen; ++t) {
+        if (!covered[t]) continue;
+        if (!pieces.empty() && pieces.back().t1 == FrameTime(t) && pieces.back().d == offset[t]) ++pieces.back().t1;
+        else pieces.push_back({FrameTime(t), FrameTime(t) + 1, offset[t]});
     }
-    std::sort(pieces.begin(), pieces.end(), [](const Run& x, const Run& y) { return x.t0 < y.t0; });
-    std::vector<Run> merged;
-    for (const Run& r : pieces) {
-        if (!merged.empty() && merged.back().t1 == r.t0 && merged.back().d == r.d) merged.back().t1 = r.t1;
-        else merged.push_back(r);
-    }
-    pieces = std::move(merged);
 
     // The stretches still in their old order (the most frames, each after the last in the old cut) are the same; the
     // rest moved.
@@ -258,6 +278,7 @@ CutChanges cutChanges(const Project& pOld, const Sequence& oldCut, const Project
         const size_t first = segmentAt(B, r.t0), last = segmentAt(B, r.t1 - 1);
         e.shot = B[first].name();
         e.shots = int(last - first + 1);
+        e.black = !B[first].clip && first == last;
         out.events.push_back(e);
     }
     // New material: more of a shot the new cut otherwise keeps, or a shot (or black) the old cut did not have.
@@ -274,6 +295,7 @@ CutChanges cutChanges(const Project& pOld, const Sequence& oldCut, const Project
                 e.newOut = t;
                 e.oldIn = e.oldOut = -1;
                 e.shot = b.name();
+                e.black = !b.clip;
                 out.events.push_back(e);
                 start = -1;
             }
@@ -307,6 +329,7 @@ CutChanges cutChanges(const Project& pOld, const Sequence& oldCut, const Project
                 e.oldOut = t;
                 e.newIn = e.newOut = placeOf(start, t);
                 e.shot = a.name();
+                e.black = !a.clip;
                 out.events.push_back(e);
                 start = -1;
             }
@@ -351,14 +374,15 @@ std::string changeEdl(const CutChanges& c, const std::string& oldReel, const std
             continue;
         }
         const bool old = e.kind == CutEventKind::Same || e.kind == CutEventKind::Moved;
-        const bool black = !old && e.shot == "Black";
+        const bool black = !old && e.black;
         std::string reel = old ? oldReel : black ? std::string("BL") : newReel;
         if (reel.size() > 8) reel.resize(8);
         const FrameTime srcIn = old ? e.oldIn : black ? 0 : e.newIn;
         const FrameTime srcOut = srcIn + (e.newOut - e.newIn);
         char line[160];
-        std::snprintf(line, sizeof line, "%03d  %-8s V     C        %s %s %s %s\n", ++n, reel.c_str(), tc(srcIn).c_str(), tc(srcOut).c_str(),
-                      tc(e.newIn).c_str(), tc(e.newOut).c_str());
+        // CMX 3600 numbers events 001 to 999; longer lists count on from 001 again, as conform tools expect.
+        std::snprintf(line, sizeof line, "%03d  %-8s V     C        %s %s %s %s\n", n++ % 999 + 1, reel.c_str(), tc(srcIn).c_str(),
+                      tc(srcOut).c_str(), tc(e.newIn).c_str(), tc(e.newOut).c_str());
         out << line;
         out << "* FROM CLIP NAME: " << e.shot << (e.shots > 1 ? " (+" + std::to_string(e.shots - 1) + " more)" : "") << "\n";
         std::string change = cutEventName(e.kind);
@@ -382,37 +406,64 @@ struct Piece {
     FrameTime shift() const { return j0 - i0; }
 };
 
-// Timeline keyframes (track automation, track, bus and master effects) carried with the pieces: those inside each,
-// with keys at its ends holding the curve's values there.
+// Timeline keyframes (track automation, track, bus and master effects) carried with the pieces. Each piece keeps the
+// keys inside it, with keys at its ends holding the curve's values there; where an eased (Smooth or Bezier) stretch or a
+// repeating cycle is cut by a piece's end, the curve is sampled into straight steps so it keeps its shape. The last key
+// of a piece holds, so nothing ramps across material that came from elsewhere.
 Param remapParam(const Param& in, const std::vector<Piece>& pieces) {
     if (in.keys.empty()) return in;
     Param out = in;
     out.keys.clear();
     out.repeat = Repeat::Hold;
+    const std::vector<Keyframe>& keys = in.keys;
+    const FrameTime first = keys.front().t, last = keys.back().t;
+    const bool cycles = in.repeat != Repeat::Hold && keys.size() >= 2 && last > first;
+    auto lower = [&](FrameTime t) {
+        return std::lower_bound(keys.begin(), keys.end(), t, [](const Keyframe& k, FrameTime v) { return k.t < v; });
+    };
+    auto keyAt = [&](FrameTime t) -> const Keyframe* {
+        auto it = lower(t);
+        return it != keys.end() && it->t == t ? &*it : nullptr;
+    };
     for (const Piece& pc : pieces) {
-        const FrameTime last = pc.i1 - 1;
-        std::vector<Keyframe> inside;
-        Interp before = Interp::Linear;
-        for (const Keyframe& k : in.keys) {
-            if (k.t < pc.i0) before = k.interp;
-            if (k.t >= pc.i0 && k.t <= last) inside.push_back(k);
-        }
-        if (inside.empty() || inside.front().t != pc.i0) {
-            Keyframe k;
-            k.t = pc.i0;
-            k.v = in.at(pc.i0);
-            k.interp = before == Interp::Bezier ? Interp::Linear : before;
-            inside.insert(inside.begin(), k);
-        }
-        if (inside.back().t != last) {
-            Keyframe k;
-            k.t = last;
-            k.v = in.at(last);
-            inside.push_back(k);
-        }
-        for (Keyframe k : inside) {
-            k.t += pc.shift();
-            out.keys.push_back(k);
+        const FrameTime a = pc.i0, z = pc.i1 - 1, shift = pc.shift();
+        std::vector<FrameTime> points{a};
+        for (auto it = lower(a); it != keys.end() && it->t <= z; ++it)
+            if (it->t != a) points.push_back(it->t);
+        if (points.back() != z) points.push_back(z);
+        for (size_t i = 0; i < points.size(); ++i) {
+            const FrameTime p = points[i];
+            const Keyframe* k = keyAt(p);
+            Keyframe key = k ? *k : Keyframe{};
+            key.t = p + shift;
+            key.v = k ? k->v : in.at(p);
+            if (i + 1 == points.size()) {
+                key.interp = Interp::Hold;
+                out.keys.push_back(key);
+                break;
+            }
+            const FrameTime q = points[i + 1];
+            bool sample = false;
+            Interp interp = Interp::Hold;  // before the first key and after the last, the curve is level
+            if (p >= last) {
+                sample = cycles;
+            } else if (p >= first) {
+                const Keyframe& governing = *std::prev(std::upper_bound(keys.begin(), keys.end(), p,
+                                                                        [](FrameTime v, const Keyframe& x) { return v < x.t; }));
+                interp = governing.interp;
+                sample = (interp == Interp::Smooth || interp == Interp::Bezier) && !(k && keyAt(q));
+            }
+            key.interp = sample ? Interp::Linear : interp;
+            out.keys.push_back(key);
+            if (sample) {
+                const FrameTime step = std::max<FrameTime>(1, p >= last ? (last - first) / 32 : (q - p) / 16);
+                for (FrameTime t = p + step; t < q; t += step) {
+                    Keyframe s;
+                    s.t = t + shift;
+                    s.v = in.at(t);
+                    out.keys.push_back(s);
+                }
+            }
         }
     }
     std::stable_sort(out.keys.begin(), out.keys.end(), [](const Keyframe& a, const Keyframe& b) { return a.t < b.t; });
@@ -423,6 +474,18 @@ Param remapParam(const Param& in, const std::vector<Piece>& pieces) {
     }
     out.keys = std::move(unique);
     return out;
+}
+
+// A marker added where one already is joins it (one marker a frame, as edit::addMarker keeps them).
+void addMarkerMerged(std::vector<Marker>& markers, const Marker& m) {
+    for (Marker& o : markers)
+        if (o.t == m.t) {
+            o.name += " / " + m.name;
+            if (!m.comment.empty()) o.comment += (o.comment.empty() ? "" : "\n") + m.comment;
+            o.duration = std::max(o.duration, m.duration);
+            return;
+        }
+    markers.push_back(m);
 }
 
 void remapEffects(std::vector<Effect>& effects, const std::vector<Piece>& pieces) {
@@ -455,6 +518,15 @@ ReconformResult reconformSequence(Project& p, Id sourceId, const CutChanges& cha
         else if (e.kind == CutEventKind::Inserted || e.kind == CutEventKind::Extended) inserts.push_back(&e);
         else removals.push_back(&e);
     }
+    // What the source has after the old cut's last frame (a mix's tail) goes on with the stretch that ended the old cut,
+    // when that stretch also ends the new one.
+    if (const FrameTime sourceEnd = source.duration(); sourceEnd > changes.oldLength) {
+        FrameTime newEnd = 0;
+        for (const Piece& pc : pieces) newEnd = std::max(newEnd, pc.j0 + (pc.i1 - pc.i0));
+        for (const CutEvent* e : inserts) newEnd = std::max(newEnd, e->newOut);
+        for (Piece& pc : pieces)
+            if (pc.i1 == changes.oldLength && pc.j0 + (pc.i1 - pc.i0) == newEnd) pc.i1 = sourceEnd;
+    }
     const std::string name = options.name.empty() ? source.name + " (Conformed)" : options.name;
     const Id id = edit::duplicateSequence(p, sourceId, name);
     if (!id) return fail("No such sequence");
@@ -480,28 +552,41 @@ ReconformResult reconformSequence(Project& p, Id sourceId, const CutChanges& cha
     auto rebuild = [&](const Track& from, Track& to) {
         to.clips.clear();
         to.transitions.clear();
+        std::multimap<Id, const Transition*> byClip;  // each transition under its clips
+        for (const Transition& tr : from.transitions) {
+            if (tr.clipA) byClip.emplace(tr.clipA, &tr);
+            if (tr.clipB && tr.clipB != tr.clipA) byClip.emplace(tr.clipB, &tr);
+        }
         for (size_t k = 0; k < pieces.size(); ++k) {
             const Piece& pc = pieces[k];
-            std::map<Id, Id> ids;                         // a source clip -> its copy in this stretch
+            std::map<Id, Id> ids;                           // a source clip -> its copy in this stretch
             std::map<Id, std::pair<bool, bool>> wholeEnds;  // whether the copy keeps the clip's start, its end
-            for (const Clip& c : from.clips) {
-                if (c.end() <= pc.i0 || c.start >= pc.i1) continue;
+            // Clips are in order and never overlap, so their ends are in order too.
+            auto it = std::partition_point(from.clips.begin(), from.clips.end(), [&](const Clip& c) { return c.end() <= pc.i0; });
+            for (; it != from.clips.end() && it->start < pc.i1; ++it) {
+                const Clip& c = *it;
                 Clip piece = copyClip(c, std::max(c.start, pc.i0), std::min(c.end(), pc.i1), pc.shift(), k);
                 ids[c.id] = piece.id;
                 wholeEnds[c.id] = {c.start >= pc.i0, c.end() <= pc.i1};
                 to.clips.push_back(std::move(piece));
             }
             // A dissolve where both its clips came over; a fade in (out) where its clip's start (end) did.
-            for (const Transition& tr : from.transitions) {
-                const bool a = tr.clipA && ids.count(tr.clipA), b = tr.clipB && ids.count(tr.clipB);
-                const bool keep = tr.clipA && tr.clipB ? a && b : tr.clipA ? a && wholeEnds[tr.clipA].second : b && wholeEnds[tr.clipB].first;
-                if (!keep) continue;
-                Transition t = tr;
-                t.id = p.newId();
-                renew(t.params);
-                t.clipA = tr.clipA ? ids[tr.clipA] : 0;
-                t.clipB = tr.clipB ? ids[tr.clipB] : 0;
-                to.transitions.push_back(t);
+            std::set<Id> seen;
+            for (const auto& [clip, copy] : ids) {
+                for (auto [t0, t1] = byClip.equal_range(clip); t0 != t1; ++t0) {
+                    const Transition& tr = *t0->second;
+                    if (!seen.insert(tr.id).second) continue;
+                    const bool a = tr.clipA && ids.count(tr.clipA), b = tr.clipB && ids.count(tr.clipB);
+                    const bool keep =
+                        tr.clipA && tr.clipB ? a && b : tr.clipA ? a && wholeEnds[tr.clipA].second : b && wholeEnds[tr.clipB].first;
+                    if (!keep) continue;
+                    Transition t = tr;
+                    t.id = p.newId();
+                    renew(t.params);
+                    t.clipA = tr.clipA ? ids[tr.clipA] : 0;
+                    t.clipB = tr.clipB ? ids[tr.clipB] : 0;
+                    to.transitions.push_back(t);
+                }
             }
         }
         to.volumeAuto = remapParam(from.volumeAuto, pieces);
@@ -513,28 +598,53 @@ ReconformResult reconformSequence(Project& p, Id sourceId, const CutChanges& cha
     remapEffects(out.masterEffects, pieces);
     for (Bus& b : out.buses) remapEffects(b.effects, pieces);
 
-    // Markers and captions inside the stretches go with them.
-    out.markers.clear();
-    for (const Piece& pc : pieces)
-        for (const Marker& m : source.markers)
-            if (m.t >= pc.i0 && m.t < pc.i1) {
-                Marker c = m;
-                c.t += pc.shift();
-                c.duration = std::min(m.duration, pc.i1 - m.t);
-                out.markers.push_back(c);
-            }
-    for (size_t ct = 0; ct < out.captionTracks.size() && ct < source.captionTracks.size(); ++ct) {
-        std::vector<Caption> caps;
+    // Markers and captions inside the stretches go with them; a range marker that starts in what was taken out begins
+    // where the first stretch it runs into is placed.
+    std::vector<Marker> sourceMarkers = source.markers;
+    std::stable_sort(sourceMarkers.begin(), sourceMarkers.end(), [](const Marker& a, const Marker& b) { return a.t < b.t; });
+    std::vector<size_t> byOld(pieces.size());  // the pieces in the old cut's order
+    for (size_t i = 0; i < pieces.size(); ++i) byOld[i] = i;
+    std::sort(byOld.begin(), byOld.end(), [&](size_t a, size_t b) { return pieces[a].i0 < pieces[b].i0; });
+    std::vector<Marker> markers;
+    for (const Piece& pc : pieces) {
+        auto it = std::lower_bound(sourceMarkers.begin(), sourceMarkers.end(), pc.i0, [](const Marker& m, FrameTime t) { return m.t < t; });
+        for (; it != sourceMarkers.end() && it->t < pc.i1; ++it) {
+            Marker c = *it;
+            c.t += pc.shift();
+            c.duration = std::min(it->duration, pc.i1 - it->t);
+            addMarkerMerged(markers, c);
+        }
+    }
+    auto inPiece = [&](FrameTime t) {
         for (const Piece& pc : pieces)
-            for (const Caption& cap : source.captionTracks[ct].captions) {
-                if (cap.end <= pc.i0 || cap.start >= pc.i1) continue;
-                Caption c = cap;
-                const FrameTime s = std::max(cap.start, pc.i0), e = std::min(cap.end, pc.i1);
-                if (s != cap.start || e != cap.end) c.wordTimes.clear();  // timed across the whole caption
+            if (t >= pc.i0 && t < pc.i1) return true;
+        return false;
+    };
+    for (const Marker& m : sourceMarkers) {
+        if (m.duration <= 0 || inPiece(m.t)) continue;
+        auto next = std::find_if(byOld.begin(), byOld.end(), [&](size_t i) { return pieces[i].i0 > m.t; });
+        if (next == byOld.end() || pieces[*next].i0 >= m.t + m.duration) continue;
+        const Piece& pc = pieces[*next];
+        Marker c = m;
+        c.t = pc.j0;
+        c.duration = std::min(m.t + m.duration, pc.i1) - pc.i0;
+        addMarkerMerged(markers, c);
+    }
+    out.markers = std::move(markers);
+    for (size_t ct = 0; ct < out.captionTracks.size() && ct < source.captionTracks.size(); ++ct) {
+        const std::vector<Caption>& from = source.captionTracks[ct].captions;  // in order, never overlapping
+        std::vector<Caption> caps;
+        for (const Piece& pc : pieces) {
+            auto it = std::partition_point(from.begin(), from.end(), [&](const Caption& c) { return c.end <= pc.i0; });
+            for (; it != from.end() && it->start < pc.i1; ++it) {
+                Caption c = *it;
+                const FrameTime s = std::max(it->start, pc.i0), e = std::min(it->end, pc.i1);
+                if (s != it->start || e != it->end) c.wordTimes.clear();  // timed across the whole caption
                 c.start = s + pc.shift();
                 c.end = e + pc.shift();
                 caps.push_back(std::move(c));
             }
+        }
         std::stable_sort(caps.begin(), caps.end(), [](const Caption& a, const Caption& b) { return a.start < b.start; });
         out.captionTracks[ct].captions = std::move(caps);
     }
@@ -566,13 +676,14 @@ ReconformResult reconformSequence(Project& p, Id sourceId, const CutChanges& cha
 
     if (options.markers) {
         auto tc = [&](FrameTime f) { return formatTimecode(f, changes.fps); };
-        for (const CutEvent* e : inserts)
-            out.markers.push_back(Marker{e->newIn, e->newOut - e->newIn, std::string(cutEventName(e->kind)) + ": " + e->shot,
-                                         "New material from " + changes.newName,
-                                         std::max(0, labelFromName(e->kind == CutEventKind::Inserted ? "Forest" : "Yellow"))});
         for (const CutEvent* e : removals)
-            out.markers.push_back(Marker{e->newIn, 0, std::string(cutEventName(e->kind)) + ": " + e->shot,
-                                         "Was " + tc(e->oldIn) + " to " + tc(e->oldOut) + " in " + changes.oldName, std::max(0, labelFromName("Red"))});
+            addMarkerMerged(out.markers, Marker{e->newIn, 0, std::string(cutEventName(e->kind)) + ": " + e->shot,
+                                                "Was " + tc(e->oldIn) + " to " + tc(e->oldOut) + " in " + changes.oldName,
+                                                std::max(0, labelFromName("Red"))});
+        for (const CutEvent* e : inserts)
+            addMarkerMerged(out.markers, Marker{e->newIn, e->newOut - e->newIn, std::string(cutEventName(e->kind)) + ": " + e->shot,
+                                                "New material from " + changes.newName,
+                                                std::max(0, labelFromName(e->kind == CutEventKind::Inserted ? "Forest" : "Yellow"))});
     }
     std::stable_sort(out.markers.begin(), out.markers.end(), [](const Marker& a, const Marker& b) { return a.t < b.t; });
     out.inPoint = out.outPoint = -1;

@@ -6614,7 +6614,7 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(c.open(QIODevice::ReadOnly));
         QVERIFY(c.readAll().startsWith("Event,Change,Shot"));
         // The old version re-conformed: Blue then Red's first 15 frames from it, the rest of Red from Version 2
-        // (labelled), a marker where the title was taken out and one on the new material; one undo step.
+        // (labelled), a marker where the title was taken out and the new material begins; one undo step.
         QVERIFY(dlg->findChild<QPushButton*>("compareReconform")->isEnabled());
         const Id made = dlg->reconform(first);
         QVERIFY(made);
@@ -6629,7 +6629,9 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(v[2].start, FrameTime(75));
         QVERIFY(v[2].colorLabel != 0 && v[1].colorLabel == 0);
         QVERIFY(out.videoTracks[1].clips.empty());
-        QCOMPARE(out.markers.size(), size_t(2));
+        QCOMPARE(out.markers.size(), size_t(1));  // the title's removal and the new material share a frame
+        QVERIFY(QString::fromStdString(out.markers[0].name).startsWith("Deleted: ") &&
+                QString::fromStdString(out.markers[0].name).contains(" / Extended: Red"));
         QCOMPARE(state()->project().sequences.size(), sequences + 2);
         state()->undo();
         QCOMPARE(state()->project().sequences.size(), sequences + 1);
@@ -6637,6 +6639,13 @@ const auto seq = [this] { return state()->sequence(); };
         state()->setActiveSequence(first);
         dlg->activateCut(0);
         QCOMPARE(state()->sequence()->id, v2.id);
+        // An edit to Version 2 with the dialog open: the lists follow it (Red gone: Red and the title deleted, Blue the same).
+        QVERIFY(state()->edit("Drop Red", [&](Project&, Sequence& s) {
+            s.videoTracks[0].clips.pop_back();
+            return true;
+        }));
+        QTRY_COMPARE(dlg->cutRowCount(), 3);
+        QCOMPARE(dlg->cutCell(2, CompareDialog::CutKind), QString("Same"));
         dlg->close();
         state()->newProject();
     }

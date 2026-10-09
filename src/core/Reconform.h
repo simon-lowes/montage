@@ -26,6 +26,7 @@ struct CutEvent {
     FrameTime newIn = 0, newOut = 0;  // in the new cut; Deleted and Trimmed: where it would have been (in == out)
     std::string shot;                 // the first shot's clip name
     int shots = 1;                    // how many shots the stretch spans
+    bool black = false;               // nothing but black (a gap)
     FrameTime length() const { return std::max(newOut - newIn, oldOut - oldIn); }
     FrameTime shift() const { return newIn - oldIn; }  // Same and Moved: how far it slid
 };

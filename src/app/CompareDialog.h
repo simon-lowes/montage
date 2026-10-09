@@ -15,6 +15,8 @@
 class QTableWidget;
 class QLabel;
 class QTabWidget;
+class QPushButton;
+class QTimer;
 
 namespace montage {
 
@@ -42,11 +44,14 @@ public:
     void activateCut(int row);  // the playhead to where it is in this version
     enum CutColumn { CutNumber, CutKind, CutShot, CutOldIn, CutOldOut, CutNewIn, CutNewOut, CutLength, CutShift, CutColumns };
     static int labelFor(CutEventKind k);
-    // A change EDL (.edl) or a CSV (anything else); false (with a message) when it cannot be written.
-    bool exportChangeList(const QString& path);
+    // A change EDL (`format` 1) or a CSV (0); -1 by the file's extension (.edl, else CSV). The lists are brought up to
+    // date first. False (with a message) when it cannot be written.
+    bool exportChangeList(const QString& path, int format = -1);
     // A new sequence: `source` (cut to the older version) conformed to this one, made active; one undo step. 0 if not.
     Id reconform(Id source, const ReconformOptions& options = {});
     void showTab(int index);
+    // Both lists computed again from the versions as they are now (also done shortly after any edit).
+    void refresh();
 
 private:
     void exportChangeListDialog();
@@ -60,6 +65,11 @@ private:
     QTableWidget* table_ = nullptr;
     QTableWidget* cutTable_ = nullptr;
     QLabel* summary_ = nullptr;
+    QLabel* cutSummary_ = nullptr;
+    QPushButton* markersButton_ = nullptr;
+    QPushButton* exportButton_ = nullptr;
+    QPushButton* conformButton_ = nullptr;
+    QTimer* refreshTimer_ = nullptr;
 };
 
 }  // namespace montage

@@ -4576,6 +4576,105 @@ private slots:
         QCOMPARE(out2.duration(), FrameTime(140));
     }
 
+    void reconformEdgeCases() {
+        Fixture fx;
+        fx.p.sequences.reserve(8);
+        MediaItem b = *fx.p.findMedia(fx.media);
+        b.id = fx.p.newId();
+        b.name = "b.mov";
+        b.path = "/nonexistent/b.mov";
+        fx.p.media.push_back(b);
+        MediaItem c = b;
+        c.id = fx.p.newId();
+        c.name = "c.mov";
+        c.path = "/nonexistent/c.mov";
+        fx.p.media.push_back(c);
+        auto shot = [&](Sequence& s, Id media, FrameTime at, FrameTime len, double in) {
+            Clip k = makeClip(fx.p, *fx.p.findMedia(media), TrackKind::Video, s);
+            k.start = at, k.duration = len, k.sourceIn = in;
+            k.name = fx.p.findMedia(media)->name;
+            QVERIFY(overwrite(fx.p, s, V1, k).ok);
+        };
+        using K = CutEventKind;
+        // Black matches nothing on its own: the old cut's gap between A and B is taken out, and the new cut's black slug
+        // after B (where the old cut had none) is new, written from reel BL.
+        {
+            Sequence old = makeSequence(fx.p, "Old", 1920, 1080, Rational{25, 1});
+            shot(old, fx.media, 0, 60, 0);
+            shot(old, b.id, 108, 52, 0);
+            Sequence cut = makeSequence(fx.p, "New", 1920, 1080, Rational{25, 1});
+            shot(cut, fx.media, 0, 60, 0);
+            shot(cut, b.id, 60, 52, 0);
+            shot(cut, c.id, 160, 40, 0);
+            const CutChanges ch = cutChanges(fx.p, old, cut);
+            QStringList kinds;
+            for (const CutEvent& e : ch.events) kinds << cutEventName(e.kind);
+            QCOMPARE(kinds.join(","), QString("Same,Deleted,Same,Inserted,Inserted"));
+            QVERIFY(ch.events[1].black && ch.events[3].black && !ch.events[4].black);
+            QCOMPARE(ch.events[3].newIn, FrameTime(112));
+            const std::string edl = changeEdl(ch);
+            QVERIFY(edl.find("003  BL       V     C        00:00:00:00 00:00:01:23 00:00:04:12 00:00:06:10") != std::string::npos);
+            // A gap kept between the same two shots stays where it is (it goes with its neighbours).
+            Sequence same = old;
+            QCOMPARE(cutChanges(fx.p, old, same).events.size(), size_t(1));
+        }
+        // A sequence cut to the old version: its tail past the old cut's end goes on with the last stretch, and an eased
+        // fader ride keeps its shape where the stretches cut it.
+        {
+            Sequence old = makeSequence(fx.p, "Old", 1920, 1080, Rational{25, 1});
+            shot(old, fx.media, 0, 50, 0);
+            shot(old, b.id, 50, 50, 0);
+            Sequence cut = makeSequence(fx.p, "New", 1920, 1080, Rational{25, 1});
+            shot(cut, fx.media, 0, 40, 10);
+            shot(cut, b.id, 40, 50, 0);
+            fx.p.sequences.push_back(cut);
+            const Id cutId = cut.id;
+            Sequence mix = old;
+            mix.id = fx.p.newId();
+            mix.name = "Mix";
+            Clip music = makeClip(fx.p, *fx.p.findMedia(fx.media), TrackKind::Audio, mix);
+            music.start = 0, music.duration = 130, music.sourceIn = 0;
+            QVERIFY(overwrite(fx.p, mix, A1, music).ok);
+            Param& pan = mix.audioTracks[0].panAuto;
+            pan.addKey(0, -1, Interp::Smooth);
+            pan.addKey(100, 1);
+            fx.p.sequences.push_back(mix);
+            const Param original = pan;
+            const CutChanges ch = cutChanges(fx.p, old, *fx.p.findSequence(cutId));
+            const ReconformResult r = reconformSequence(fx.p, mix.id, ch, cutId);
+            QVERIFY(r.sequence);
+            const Track& a = fx.p.findSequence(r.sequence)->audioTracks[0];
+            // One stretch (the head trim aside), so the music is one clip, running on to 120 with what came after 100.
+            QCOMPARE(a.clips.size(), size_t(1));
+            QCOMPARE(a.clips[0].sourceIn, 10.0);
+            QCOMPARE(a.clips[0].end(), FrameTime(120));
+            for (FrameTime t : {0, 5, 20, 39, 45, 70, 89, 110})
+                QVERIFY2(std::fabs(a.panAuto.at(t) - original.at(t + 10)) < 0.01,
+                         qPrintable(QString("%1: %2 vs %3").arg(t).arg(a.panAuto.at(t)).arg(original.at(t + 10))));
+        }
+        // CMX 3600 counts events to 999, then from 001 again.
+        CutChanges many;
+        many.fps = {25, 1};
+        for (int i = 0; i < 1001; ++i) {
+            CutEvent e;
+            e.kind = K::Same;
+            e.oldIn = e.newIn = i;
+            e.oldOut = e.newOut = i + 1;
+            e.shot = "x";
+            many.events.push_back(e);
+        }
+        const std::string edl = changeEdl(many);
+        auto count = [&](const char* what) {
+            size_t n = 0;
+            for (size_t at = edl.find(what); at != std::string::npos; at = edl.find(what, at + 1)) ++n;
+            return n;
+        };
+        QCOMPARE(count("\n001  OLDCUT"), size_t(2));
+        QCOMPARE(count("\n002  OLDCUT"), size_t(2));
+        QCOMPARE(count("\n999  OLDCUT"), size_t(1));
+        QCOMPARE(count("\n1000"), size_t(0));
+    }
+
     void colorWarpMesh() {
         auto near = [](double a, double b) { return std::fabs(a - b) < 1e-9; };
         ColorWarp w;
