@@ -8,6 +8,7 @@
 #include <QAction>
 #include <QComboBox>
 #include <QCheckBox>
+#include <QFormLayout>
 #include <QClipboard>
 #include <QStatusBar>
 #include <QDockWidget>
@@ -215,6 +216,9 @@ class TestApp : public QObject {
 private slots:
     void initTestCase() {
         QVERIFY(dir_.isValid());
+        // Settings of their own: nothing the app saved (window layout, workspace, presets) leaks into the tests.
+        for (auto format : {QSettings::NativeFormat, QSettings::IniFormat})
+            QSettings::setPath(format, QSettings::UserScope, dir_.filePath(QStringLiteral("settings")));
         win_ = std::make_unique<MainWindow>();
         win_->resize(1600, 1000);
         win_->show();
@@ -5089,6 +5093,44 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(state()->project().media.at(0).visual && !state()->project().media.at(0).visual->samples.empty());
         win_->activateWindow();
         QVERIFY(QTest::qWaitForWindowActive(win_.get()));
+    }
+
+    void inspectorFitsASideDock() {
+        // The Colour workspace's Inspector is a side dock: a clip's rows must fit 380 px without sideways scrolling.
+        loadDemo();
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        // With effects whose sections are busiest: colour wheels, a mask with tracking, Stabilize, the Colour Warper.
+        QVERIFY(state()->edit("Effects", [red](Project& p, Sequence& s) {
+            Clip* c = edit::clipById(s, red);
+            c->effects.push_back(makeEffect(p, "color_correct"));
+            Effect blur = makeEffect(p, "gaussian_blur");
+            blur.params["mask.shape"] = Param(1.0);
+            c->effects.push_back(blur);
+            c->effects.push_back(makeEffect(p, "stabilize"));
+            c->effects.push_back(makeEffect(p, "color_warper"));
+            return true;
+        }));
+        state()->setSelection({red}, false);
+        auto* inspector = win_->findChild<InspectorWidget*>();
+        QVERIFY(inspector && inspector->widget());
+        QApplication::processEvents();
+        QString widest;
+        int most = 0;
+        for (QFormLayout* form : inspector->widget()->findChildren<QFormLayout*>())
+            for (int r = 0; r < form->rowCount(); ++r) {
+                QLayoutItem* label = form->itemAt(r, QFormLayout::LabelRole);
+                QLayoutItem* field = form->itemAt(r, QFormLayout::FieldRole);
+                if (!field) field = form->itemAt(r, QFormLayout::SpanningRole);
+                if (!field) continue;
+                const int w = (label ? label->minimumSize().width() + form->horizontalSpacing() : 0) + field->minimumSize().width();
+                if (w > most) {
+                    most = w;
+                    auto* l = label ? qobject_cast<QLabel*>(label->widget()) : nullptr;
+                    widest = l ? l->text() : QStringLiteral("row %1").arg(r);
+                }
+            }
+        QVERIFY2(most <= 340, qPrintable(QString("%1: %2 px").arg(widest).arg(most)));
+        state()->setSelection({}, false);
     }
 
     void colourWarperInInspector() {

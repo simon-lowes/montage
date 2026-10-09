@@ -196,6 +196,12 @@ void InspectorWidget::rebuild() {
         layout_->addWidget(l);
     }
     layout_->addStretch();
+    // Choices with long names ("Position, Scale & Rotation") would widen the whole Inspector: they take what room there
+    // is, and their lists still show everything.
+    for (QComboBox* box : content_->findChildren<QComboBox*>()) {
+        box->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+        box->setMinimumContentsLength(std::min(box->minimumContentsLength() > 0 ? box->minimumContentsLength() : 8, 8));
+    }
     setWidget(content_);
     refreshValues();
 }
@@ -257,6 +263,7 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
     auto* timing = new QLabel(content_);
     timing->setFont(theme::monoFont(9));
     timing->setStyleSheet(QString("color: %1;").arg(theme::kTextDim.name()));
+    timing->setWordWrap(true);  // in a narrow dock the length goes under the in and out
     form->addRow(tr("Timing"), timing);
     auto* speed = new QDoubleSpinBox(content_);
     speed->setRange(1, 10000);
@@ -267,13 +274,15 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
     auto* rippleSpeed = new QCheckBox(tr("Ripple"), content_);
     rippleSpeed->setChecked(true);
     rippleSpeed->setToolTip(tr("Shift following clips when the duration changes"));
+    // The speed, then its options on a row of their own (the Inspector stays narrow enough for a side dock).
+    form->addRow(tr("Speed"), speed);
     auto* speedRow = new QWidget(content_);
     auto* sh = new QHBoxLayout(speedRow);
     sh->setContentsMargins(0, 0, 0, 0);
-    sh->addWidget(speed, 1);
     sh->addWidget(reverse);
     sh->addWidget(rippleSpeed);
-    form->addRow(tr("Speed"), speedRow);
+    sh->addStretch(1);
+    form->addRow(QString(), speedRow);
     auto applySpeed = [this, clipId, speed, reverse, rippleSpeed] {
         double sp = speed->value() / 100.0;
         bool rev = reverse->isChecked(), rip = rippleSpeed->isChecked();
@@ -380,9 +389,15 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
             size->setCurrentIndex(1);
             rh->addWidget(back);
             rh->addWidget(fwd);
-            rh->addWidget(model, 1);
-            rh->addWidget(size);
+            rh->addStretch(1);
             t->addRow(tr("Follow:"), row);
+            // What it follows on a row of its own, so the Inspector stays narrow.
+            auto* how = new QWidget(content_);
+            auto* hh = new QHBoxLayout(how);
+            hh->setContentsMargins(0, 0, 0, 0);
+            hh->addWidget(model, 1);
+            hh->addWidget(size);
+            t->addRow(QString(), how);
             for (auto [button, forward] : {std::pair{back, false}, std::pair{fwd, true}})
                 connect(button, &QToolButton::clicked, this, [this, clipId, model, size, forward = forward] {
                     const int m = model->currentIndex();
@@ -1329,6 +1344,9 @@ void InspectorWidget::addStringRow(QFormLayout* form, const StringParamInfo& si,
             auto* row = new QWidget(box);
             auto* h = new QHBoxLayout(row);
             h->setContentsMargins(0, 0, 0, 0);
+            auto* buttons = new QWidget(box);
+            auto* bh = new QHBoxLayout(buttons);
+            bh->setContentsMargins(0, 0, 0, 0);
             auto* luma = new QDoubleSpinBox(row);
             luma->setObjectName(QStringLiteral("warpLuma"));
             luma->setRange(-2, 2);
@@ -1337,20 +1355,24 @@ void InspectorWidget::addStringRow(QFormLayout* form, const StringParamInfo& si,
             luma->setSuffix(tr(" stops"));
             luma->setToolTip(tr("Brighten or darken the selected point's colours"));
             luma->setEnabled(false);
-            auto* resetPoint = new QToolButton(row);
+            auto* resetPoint = new QToolButton(buttons);
             resetPoint->setText(tr("Reset Point"));
             resetPoint->setEnabled(false);
-            auto* resetAll = new QToolButton(row);
+            auto* resetAll = new QToolButton(buttons);
             resetAll->setText(tr("Reset All"));
             resetAll->setObjectName(QStringLiteral("warpResetAll"));
-            h->addWidget(new QLabel(tr("Brightness:"), row));
+            h->addWidget(new QLabel(tr("Selected point's brightness:"), row));
             h->addWidget(luma);
             h->addStretch(1);
-            h->addWidget(resetPoint);
-            h->addWidget(resetAll);
+            bh->addStretch(1);
+            bh->addWidget(resetPoint);
+            bh->addWidget(resetAll);
+            // The wheel across the whole Inspector, its title above it.
+            v->addWidget(new QLabel(label, box));
             v->addWidget(editor);
             v->addWidget(row);
-            form->addRow(label, box);
+            v->addWidget(buttons);
+            form->addRow(box);
             connect(editor, &ColorWarperEditor::edited, this, [write](const QString& mesh, bool) { write(mesh); });
             connect(editor, &ColorWarperEditor::selectionChanged, this, [editor, luma, resetPoint] {
                 const bool on = editor->selectedSpoke() >= 0;
