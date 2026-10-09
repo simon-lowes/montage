@@ -57,6 +57,7 @@
 #include "media/Vector.h"
 #include "media/Beats.h"
 #include "render/Spherical.h"
+#include "render/Versions.h"
 #include "render/ClipPlacement.h"
 #include "media/ImageSequence.h"
 #include "render/AudioReactive.h"
@@ -9345,6 +9346,125 @@ private slots:
         QCOMPARE(back.active()->name, std::string("Sequence 1 1:1"));
         QCOMPARE(back.active()->height, 360);
         QVERIFY(back.active()->videoTracks[0].clips.at(0).motion.params.at("pos_x").animated());
+    }
+
+    void exportVersions() {
+        // Shapes as people write them.
+        VersionShape shape;
+        QVERIFY(parseVersionShape("9:16", shape) && shape.aspectW == 9 && shape.aspectH == 16 && shape.label == "9x16");
+        QVERIFY(parseVersionShape(" 1X1 ", shape) && shape.label == "1x1");
+        QVERIFY(parseVersionShape("1920x1080", shape) && shape.label == "16x9");
+        QVERIFY(!parseVersionShape("wide", shape) && !parseVersionShape("0:1", shape) && !parseVersionShape("4:5:6", shape));
+        QCOMPARE(standardVersionShapes().size(), size_t(4));
+
+        const std::string video = path("versions-ball.mp4");
+        const int frames = 25;
+        writeBallVideo(video, frames);
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 640;
+        s.height = 360;
+        s.fps = {25, 1};
+        MediaItem mi = probeOrFail(p, video);
+        p.media.push_back(mi);
+        QVERIFY(edit::placeMedia(p, s, mi.id, 0, 0, frames, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        CaptionTrack ct;
+        ct.id = p.newId();
+        ct.language = "en";
+        ct.name = "Subtitles";
+        ct.captions = {{2, 20, "The ball rolls"}};
+        ct.style.position = 0.9;
+        s.captionTracks.push_back(ct);
+        const Id source = s.id;
+
+        // 16:9 is the cut itself; 9:16 and 1:1 are reframed copies, the tall one with its captions raised.
+        std::vector<Id> ids;
+        std::string err;
+        const std::vector<VersionShape> shapes{{16, 9, "16x9"}, {9, 16, "9x16"}, {1, 1, "1x1"}};
+        QVERIFY2(makeVersionSequences(p, source, shapes, ids, 2, {}, nullptr, &err), err.c_str());
+        QCOMPARE(ids.size(), size_t(3));
+        QCOMPARE(ids[0], source);
+        const Sequence* tall = p.findSequence(ids[1]);
+        const Sequence* square = p.findSequence(ids[2]);
+        QVERIFY(tall && square);
+        QCOMPARE(tall->name, std::string("Sequence 1 9x16"));
+        QCOMPARE(tall->width, 360);
+        QCOMPARE(tall->height, 640);
+        QCOMPARE(square->width, 360);
+        QCOMPARE(square->height, 360);
+        QVERIFY(tall->videoTracks[0].clips.at(0).motion.params.at("pos_x").animated());
+        QCOMPARE(tall->captionTracks.at(0).style.position, 0.75);
+        QCOMPARE(square->captionTracks.at(0).style.position, 0.9);
+        QCOMPARE(p.findSequence(source)->captionTracks.at(0).style.position, 0.9);  // the original is untouched
+        // Making them again replaces the versions rather than piling up copies.
+        const size_t sequences = p.sequences.size(), media = p.media.size();
+        QVERIFY2(makeVersionSequences(p, source, {{9, 16, "9x16"}}, ids, 2, {}, nullptr, &err), err.c_str());
+        QCOMPARE(p.sequences.size(), sequences);
+        QCOMPARE(p.media.size(), media);
+        QCOMPARE(int(std::count_if(p.sequences.begin(), p.sequences.end(), [](const Sequence& q) { return q.name == "Sequence 1 9x16"; })), 1);
+        // An empty sequence has nothing to version.
+        Sequence empty;
+        empty.id = p.newId();
+        empty.width = 1920;
+        empty.height = 1080;
+        p.sequences.push_back(empty);
+        QVERIFY(!makeVersionSequences(p, empty.id, shapes, ids, 1, {}, nullptr, &err));
+
+        // Settings: one file per version, named after it, at its own size.
+        ExportSettings base;
+        base.path = "/somewhere/else/cut.mov";
+        base.width = 1920;
+        base.height = 1080;
+        Sequence named = *p.findSequence(ids[0]);
+        named.name = "Ep 1: \"Pilot\"";
+        ExportSettings st = versionSettings(named, base, "/out", true, -14);
+        QCOMPARE(st.path, std::string("/out/Ep 1- -Pilot-.mov"));
+        QCOMPARE(st.width, 0);
+        QCOMPARE(st.height, 0);
+        QVERIFY(st.burnInCaptions);
+        QCOMPARE(st.loudnessTarget, -14.0);
+        named.captionTracks.clear();
+        QVERIFY(!versionSettings(named, base, "/out", true, 0).burnInCaptions);
+        QCOMPARE(versionSettings(named, base, "/out", true, 0).loudnessTarget, 0.0);
+
+        // Over MCP: both shapes rendered into a folder.
+        std::erase_if(p.sequences, [&](const Sequence& q) { return q.id == empty.id; });
+        const QString project = QString::fromStdString(path("versions.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        const QString folder = QString::fromStdString(path("versions-out"));
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_export_versions"},
+                                                     {"arguments", QJsonObject{{"project", project}, {"shapes", QJsonArray{"16:9", "9:16"}},
+                                                                               {"folder", folder}, {"loudness_lufs", 0}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonArray files = r.value("structuredContent").toObject().value("files").toArray();
+        QCOMPARE(files.size(), 2);
+        const int sizes[2][2] = {{640, 360}, {360, 640}};
+        for (int i = 0; i < 2; ++i) {
+            const QString file = files[i].toObject().value("path").toString();
+            QVERIFY2(QFileInfo(file).dir() == QDir(folder), qPrintable(file));
+            MediaItem out;
+            QVERIFY2(probeMedia(file.toStdString(), out), qPrintable(file));
+            QCOMPARE(out.width, sizes[i][0]);
+            QCOMPARE(out.height, sizes[i][1]);
+        }
+        QVERIFY(files[1].toObject().value("path").toString().endsWith("Sequence 1 9x16.mp4"));
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QVERIFY(std::any_of(back.sequences.begin(), back.sequences.end(), [](const Sequence& q) { return q.name == "Sequence 1 9x16"; }));
+        // Nonsense shapes are refused.
+        QJsonObject bad = req;
+        QJsonObject params = bad.value("params").toObject();
+        params["arguments"] = QJsonObject{{"project", project}, {"shapes", QJsonArray{"wide"}}, {"folder", folder}};
+        bad["params"] = params;
+        const auto badLines = server.handle(QJsonDocument(bad).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject br = QJsonDocument::fromJson(QByteArray::fromStdString(badLines.back())).object();
+        QVERIFY(br.contains("error") || br.value("result").toObject().value("isError").toBool());
     }
 
     void planarTracking() {

@@ -17,6 +17,7 @@
 #include "core/Effects.h"
 #include "media/Image.h"
 #include "render/Shorts.h"
+#include "render/Versions.h"
 
 class QAction;
 class QActionGroup;
@@ -132,6 +133,11 @@ public:
     // Clip › Colour Group (core/ColorGroups.h), each one undo step: a new group of the selected video clips (its id, 0
     // with a message when none are selected), the selection joining a group, or leaving its group.
     Id newColorGroup(const QString& name = {});
+    // File › Export Versions (render/Versions.h): the current sequence in several shapes, the reframed copies added in
+    // one undo step and every version queued to render into `folder` with the preset `presetName`. The versions' ids.
+    std::vector<Id> exportVersions(const std::vector<VersionShape>& shapes, const QString& folder, bool captions = true, double lufs = -14,
+                                   const QString& presetName = QStringLiteral("H.264 - High Quality"));
+    void exportVersionsDialog();
     bool addToColorGroup(Id group);
     bool removeFromColorGroup();
     // Suggest Chapters: chapter markers where the talk moves on, titled with what each part is about (replacing the

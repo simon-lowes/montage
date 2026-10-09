@@ -985,6 +985,8 @@ private slots:
 
     void keyboardEditing() {
         loadDemo();
+        win_->activateWindow();  // window shortcuts reach only the active window (a busy machine can be slow to give it)
+        QVERIFY(QTest::qWaitForWindowActive(win_.get()));
         state()->setPlayhead(30);
         // Ctrl+K cuts on the targeted tracks; Ctrl+Z undoes it.
         timeline()->setFocus();
@@ -1021,6 +1023,8 @@ private slots:
 
     void copyPasteViaShortcuts() {
         loadDemo();
+        win_->activateWindow();
+        QVERIFY(QTest::qWaitForWindowActive(win_.get()));
         state()->setSelection({clipNamed(*state()->sequence(), "Red")->id});
         QTest::keyClick(win_.get(), Qt::Key_C, Qt::ControlModifier);
         state()->setPlayhead(200);
@@ -2808,6 +2812,78 @@ private slots:
         QCOMPARE(square->width, square->height);
         QVERIFY(square->captionTracks.empty());
         QCOMPARE(win_->renderQueue()->jobs().size(), jobs);  // not queued
+    }
+
+    void exportVersionsQueued() {
+        loadDemo();
+        QVERIFY(win_->findChild<QAction*>("exportVersions"));
+        const Id source = state()->sequence()->id;
+        QVERIFY(state()->edit("Captions", [](Project& p, Sequence& s) {
+            CaptionTrack t;
+            t.id = p.newId();
+            t.name = "Subtitles";
+            t.captions = {{0, 24, "Hello"}};
+            t.style.position = 0.9;
+            s.captionTracks.push_back(t);
+            return true;
+        }));
+        const QString name = QString::fromStdString(state()->sequence()->name);
+        const size_t sequences = state()->project().sequences.size(), jobs = win_->renderQueue()->jobs().size();
+        const QString folder = dir_.filePath("versions");
+        const std::vector<Id> ids = win_->exportVersions({{16, 9, "16x9"}, {9, 16, "9x16"}, {1, 1, "1x1"}}, folder, true, -14);
+        QCOMPARE(ids.size(), size_t(3));
+        QCOMPARE(ids[0], source);  // the cut itself is the landscape version
+        QCOMPARE(state()->sequence()->id, source);
+        QCOMPARE(state()->project().sequences.size(), sequences + 2);
+        const Sequence* tall = state()->project().findSequence(ids[1]);
+        QVERIFY(tall && tall->height > tall->width);
+        QCOMPARE(QString::fromStdString(tall->name), name + " 9x16");
+        QCOMPARE(tall->captionTracks.at(0).style.position, 0.75);
+        const Sequence* square = state()->project().findSequence(ids[2]);
+        QVERIFY(square && square->height == square->width);
+        QVERIFY(QDir(folder).exists());
+        // A job each, named after its version, at its own size, captions burned in at -14 LUFS.
+        QCOMPARE(win_->renderQueue()->jobs().size(), jobs + 3);
+        for (size_t i = 0; i < 3; ++i) {
+            const RenderQueue::Job& job = win_->renderQueue()->jobs()[jobs + i];
+            QCOMPARE(job.sequence, ids[i]);
+            const Sequence* v = state()->project().findSequence(ids[i]);
+            QCOMPARE(QString::fromStdString(job.settings.path), QDir(folder).filePath(QString::fromStdString(v->name) + ".mp4"));
+            QCOMPARE(job.settings.width, 0);
+            QVERIFY(job.settings.burnInCaptions);
+            QCOMPARE(job.settings.loudnessTarget, -14.0);
+        }
+        for (size_t i = 0; i < 3; ++i) win_->renderQueue()->remove(win_->renderQueue()->jobs().back().id);
+        // One undo step takes the copies away; doing it again does not pile up versions.
+        state()->undo();
+        QCOMPARE(state()->project().sequences.size(), sequences);
+        win_->exportVersions({{9, 16, "9x16"}}, folder, false, 0);
+        win_->exportVersions({{9, 16, "9x16"}}, folder, false, 0);
+        QCOMPARE(state()->project().sequences.size(), sequences + 1);
+        QVERIFY(!win_->renderQueue()->jobs().back().settings.burnInCaptions);
+        QCOMPARE(win_->renderQueue()->jobs().back().settings.loudnessTarget, 0.0);
+        for (int i = 0; i < 2; ++i) win_->renderQueue()->remove(win_->renderQueue()->jobs().back().id);
+        // The dialog: 4:5 alone, as mixed, into a folder.
+        const QString other = dir_.filePath("feeds");
+        bool shown = false;
+        QTimer::singleShot(0, this, [&] {
+            auto* dlg = win_->findChild<QDialog*>("exportVersionsDialog");
+            QVERIFY(dlg);
+            shown = true;
+            QVERIFY(dlg->findChild<QCheckBox*>("version16x9")->isChecked());
+            dlg->findChild<QCheckBox*>("version16x9")->setChecked(false);
+            dlg->findChild<QCheckBox*>("version9x16")->setChecked(false);
+            dlg->findChild<QCheckBox*>("version4x5")->setChecked(true);
+            dlg->findChild<QLineEdit*>("versionsFolder")->setText(other);
+            dlg->accept();
+        });
+        win_->findChild<QAction*>("exportVersions")->trigger();
+        QVERIFY(shown);
+        const RenderQueue::Job& job = win_->renderQueue()->jobs().back();
+        const Sequence* feed = state()->project().findSequence(job.sequence);
+        QVERIFY(feed && std::abs(feed->width * 5 - feed->height * 4) <= 10);  // sizes are even (180 x 226)
+        QVERIFY(QString::fromStdString(job.settings.path).startsWith(other));
+        win_->renderQueue()->remove(job.id);
     }
 
     void transitionsToSelection() {

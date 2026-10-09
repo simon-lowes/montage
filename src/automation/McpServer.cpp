@@ -24,6 +24,7 @@
 #include "core/TranscriptCorrect.h"
 #include "core/SpellCheck.h"
 #include "core/ColorGroups.h"
+#include "render/Versions.h"
 #include "render/LightLevel.h"
 #include "render/Spherical.h"
 #include "render/ClipPlacement.h"
@@ -3873,6 +3874,50 @@ void McpServer::Impl::addTools() {
                 text += QString::fromStdString(p.name + " (." + p.extension + "): " + p.description) + "\n";
             }
             return ok(text, QJsonObject{{"presets", list}});
+        });
+
+    add("montage_export_versions", "Export versions in several shapes",
+        "Render the active sequence in several shapes at once (16:9, 9:16, 4:5, 1:1): each shape that is not the "
+        "sequence's own becomes a copy reframed to follow each shot's subject (captions raised clear of the platforms' "
+        "buttons when tall), kept in the project as \"<name> 9x16\" and so on, then every version is rendered into "
+        "`folder` with the export preset `preset` (default \"H.264 - High Quality\"), captions burned in when `captions` "
+        "(default true) and the sound brought to `loudness_lufs` (default -14; 0 leaves it). Returns the files.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"shapes":{"type":"array","items":{"type":"string"},"description":"e.g. [\"16:9\", \"9:16\"]"},
+            "folder":{"type":"string"},"preset":{"type":"string"},"captions":{"type":"boolean","default":true},
+            "loudness_lufs":{"type":"number","default":-14}},"required":["project","shapes","folder"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            std::vector<VersionShape> shapes;
+            for (const QJsonValue& v : a.value("shapes").toArray()) {
+                VersionShape shape;
+                if (!parseVersionShape(v.toString().toStdString(), shape)) throw ArgError{QStringLiteral("\"%1\" is not a shape like 16:9 or 9:16").arg(v.toString())};
+                shapes.push_back(shape);
+            }
+            if (shapes.empty()) throw ArgError{"\"shapes\" lists at least one shape"};
+            const ExportPreset* preset = findExportPreset(str(a, "preset", "H.264 - High Quality").toStdString());
+            if (!preset) throw ArgError{"Unknown preset (see montage_list_presets)"};
+            const QString folder = absolute(need(a, "folder"));
+            QDir().mkpath(folder);
+            std::vector<Id> ids;
+            std::string err;
+            const Id source = l.seq().id;
+            if (!makeVersionSequences(l.project, source, shapes, ids, 1, [this](double f) { progress(f * 0.3, "Reframing"); }, nullptr, &err))
+                return fail(QString::fromStdString(err));
+            save(l);
+            QJsonArray files;
+            QString text;
+            for (size_t i = 0; i < ids.size(); ++i) {
+                const Sequence* v = l.project.findSequence(ids[i]);
+                const ExportSettings st = versionSettings(*v, preset->settings, folder.toStdString(), a.value("captions").toBool(true),
+                                                          a.value("loudness_lufs").toDouble(-14));
+                const double base = 0.3 + 0.7 * double(i) / double(ids.size()), span = 0.7 / double(ids.size());
+                if (!exportSequence(l.project, *v, st, [&](double f, FrameTime) { progress(base + span * f, "Rendering"); }, nullptr, &err))
+                    return fail(QStringLiteral("%1: %2").arg(QString::fromStdString(v->name), QString::fromStdString(err)));
+                files.append(QJsonObject{{"shape", QString::fromStdString(shapes[i].label)}, {"sequence", QString::fromStdString(v->name)},
+                                         {"path", QString::fromStdString(st.path)}, {"width", v->width}, {"height", v->height}});
+                text += QStringLiteral("Wrote %1 (%2 x %3)\n").arg(QString::fromStdString(st.path)).arg(v->width).arg(v->height);
+            }
+            return ok(text.trimmed(), QJsonObject{{"files", files}});
         });
 
     add("montage_render", "Render",

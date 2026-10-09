@@ -129,6 +129,7 @@
 #include "render/Shorts.h"
 #include "render/Letterbox.h"
 #include "render/LightLevel.h"
+#include "render/Versions.h"
 #include "media/MicBleed.h"
 #include "render/MusicEdit.h"
 #include "render/VoiceMatch.h"
@@ -671,6 +672,7 @@ void MainWindow::buildMenus() {
     add(file, tr("Import Image Sequence…"), QKeySequence(), [this] { bin_->importImageSequenceDialog(); })->setObjectName(QStringLiteral("importImageSequence"));
     add(file, tr("Watch Folders…"), QKeySequence(), [this] { watchFoldersDialog(); })->setObjectName(QStringLiteral("watchFolders"));
     add(file, tr("&Export Media…"), QKeySequence("Ctrl+M"), [this] { exportMedia(); });
+    add(file, tr("Export &Versions…"), QKeySequence(), [this] { exportVersionsDialog(); })->setObjectName(QStringLiteral("exportVersions"));
     add(file, tr("Project &Manager…"), QKeySequence(), [this] {
         ProjectManagerDialog dlg(state_, this);
         if (dlg.exec() == QDialog::Accepted) runProjectManager(dlg.options());
@@ -3843,6 +3845,104 @@ bool MainWindow::addToColorGroup(Id group) {
 bool MainWindow::removeFromColorGroup() {
     const std::vector<Id> sel = state_->selectedClips();
     return state_->edit(tr("Remove from Colour Group"), [&](Project&, Sequence& s) { return edit::removeFromColorGroup(s, sel).ok; });
+}
+
+std::vector<Id> MainWindow::exportVersions(const std::vector<VersionShape>& shapes, const QString& folder, bool captions, double lufs,
+                                           const QString& presetName) {
+    const Sequence* s = state_->sequence();
+    if (!s || shapes.empty()) return {};
+    const ExportPreset* preset = findExportPreset(presetName.toStdString());
+    if (!preset) preset = findExportPreset("H.264 - High Quality");
+    // Reframing reads every shot: done on a copy, then the versions added in one undo step.
+    auto work = std::make_shared<Project>(state_->project());
+    const Id source = s->id;
+    std::vector<Id> ids;
+    if (!runWithProgress(this, state_, tr("Finding the subject of each shot..."), [&, work](const auto& progress, const auto* cancel, std::string* e) {
+            return makeVersionSequences(*work, source, shapes, ids, 1, [&](double f) { progress(f); }, cancel, e);
+        }))
+        return {};
+    if (std::any_of(ids.begin(), ids.end(), [&](Id id) { return id != source; }))
+        state_->edit(tr("Export Versions"), [&](Project& p, Sequence&) {
+            p.sequences = work->sequences;
+            p.media = work->media;
+            p.nextId = std::max(p.nextId, work->nextId);
+            return true;
+        });
+    QDir().mkpath(folder);
+    for (Id id : ids) {
+        const Sequence* v = state_->project().findSequence(id);
+        if (!v) continue;
+        const ExportSettings st = versionSettings(*v, preset ? preset->settings : ExportSettings{}, folder.toStdString(), captions, lufs);
+        queue_->add(QString::fromStdString(v->name), preset ? QString::fromStdString(preset->name) : QString(), state_->project(), id, st);
+    }
+    if (queueDock_) queueDock_->show();
+    state_->setActiveSequence(source);
+    state_->message(tr("%n version(s) queued to render into %1", "", int(ids.size())).arg(QDir::toNativeSeparators(folder)), 6000);
+    return ids;
+}
+
+void MainWindow::exportVersionsDialog() {
+    const Sequence* s = state_->sequence();
+    if (!s || s->duration() == 0) {
+        state_->message(tr("Nothing to export"));
+        return;
+    }
+    QDialog dlg(this);
+    dlg.setObjectName(QStringLiteral("exportVersionsDialog"));
+    dlg.setWindowTitle(tr("Export Versions"));
+    auto* form = new QFormLayout(&dlg);
+    form->addRow(new QLabel(tr("%1 in several shapes at once: each a copy reframed to follow its shots' subjects, then rendered.")
+                                .arg(QString::fromStdString(s->name)),
+                            &dlg));
+    std::vector<std::pair<QCheckBox*, VersionShape>> boxes;
+    const QStringList names = {tr("16:9 Landscape (YouTube)"), tr("9:16 Vertical (Shorts, Reels, TikTok)"), tr("4:5 Portrait (feeds)"), tr("1:1 Square")};
+    const std::vector<VersionShape> shapes = standardVersionShapes();
+    for (size_t i = 0; i < shapes.size(); ++i) {
+        auto* box = new QCheckBox(names[int(i)], &dlg);
+        box->setObjectName(QStringLiteral("version%1").arg(QString::fromStdString(shapes[i].label)));
+        box->setChecked(i < 2);
+        form->addRow(i == 0 ? tr("Shapes:") : QString(), box);
+        boxes.push_back({box, shapes[i]});
+    }
+    auto* folder = new QLineEdit(&dlg);
+    folder->setObjectName(QStringLiteral("versionsFolder"));
+    QString start = appSettings().value(QStringLiteral("export/lastDirectory")).toString();
+    if (start.isEmpty()) start = QStandardPaths::writableLocation(QStandardPaths::MoviesLocation);
+    folder->setText(start);
+    auto* browse = new QPushButton(tr("Choose…"), &dlg);
+    connect(browse, &QPushButton::clicked, &dlg, [&] {
+        const QString d = QFileDialog::getExistingDirectory(&dlg, tr("Export Versions To"), folder->text());
+        if (!d.isEmpty()) folder->setText(d);
+    });
+    auto* row = new QHBoxLayout;
+    row->addWidget(folder, 1);
+    row->addWidget(browse);
+    form->addRow(tr("Folder:"), row);
+    auto* captions = new QCheckBox(tr("Burn in captions"), &dlg);
+    captions->setChecked(!s->captionTracks.empty());
+    captions->setEnabled(!s->captionTracks.empty());
+    form->addRow(QString(), captions);
+    auto* loud = new QComboBox(&dlg);
+    loud->addItem(tr("Streaming: -14 LUFS"), -14.0);
+    loud->addItem(tr("Podcast: -16 LUFS"), -16.0);
+    loud->addItem(tr("As mixed"), 0.0);
+    form->addRow(tr("Loudness:"), loud);
+    auto* format = new QComboBox(&dlg);
+    for (const char* name : {"H.264 - High Quality", "H.265 / HEVC", "Apple ProRes 422 HQ"})
+        if (findExportPreset(name)) format->addItem(QString::fromLatin1(name));
+    form->addRow(tr("Format:"), format);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    buttons->button(QDialogButtonBox::Ok)->setText(tr("Queue Versions"));
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    form->addRow(buttons);
+    if (dlg.exec() != QDialog::Accepted) return;
+    std::vector<VersionShape> chosen;
+    for (const auto& [box, shape] : boxes)
+        if (box->isChecked()) chosen.push_back(shape);
+    if (chosen.empty()) return;
+    appSettings().setValue(QStringLiteral("export/lastDirectory"), folder->text());
+    exportVersions(chosen, folder->text(), captions->isChecked(), loud->currentData().toDouble(), format->currentText());
 }
 
 bool MainWindow::analyseHdrLightLevels(bool ask) {

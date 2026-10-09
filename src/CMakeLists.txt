@@ -96,6 +96,7 @@ add_library(montage_engine STATIC
   render/Shorts.h render/Shorts.cpp
   render/Letterbox.h render/Letterbox.cpp
   render/LightLevel.h render/LightLevel.cpp
+  render/Versions.h render/Versions.cpp
   render/PaperEdit.h render/PaperEdit.cpp
   render/VfxPull.h render/VfxPull.cpp
   render/Spherical.h render/Spherical.cpp
