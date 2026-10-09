@@ -86,6 +86,7 @@
 #include "LoudnessReadout.h"
 #include "Voiceover.h"
 #include "MaskOverlay.h"
+#include "TransformOverlay.h"
 #include "media/Diarizer.h"
 #include "media/VisualSearch.h"
 #include "media/Faces.h"
@@ -2476,6 +2477,98 @@ private slots:
         state()->setSelection({}, false);
         all->trigger();  // nothing selected: a hint, no change
         QCOMPARE(trackAt(*state()->sequence(), V1)->transitions.size(), size_t(0));
+    }
+
+    void transformInTheProgramMonitor() {
+        loadDemo();
+        MonitorPanel* program = nullptr;
+        for (auto* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Program) program = m;
+        QVERIFY(program);
+        ViewerWidget* viewer = program->viewer();
+        auto* overlay = viewer->findChild<TransformOverlay*>();
+        QVERIFY(overlay);
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        state()->setPlayhead(5);
+        state()->setSelection({red}, false);
+        QApplication::processEvents();
+        QCOMPARE(overlay->target(), red);
+        const QRectF pic = viewer->imageRect();
+        QVERIFY(pic.width() > 100);
+        std::array<QPointF, 4> c;
+        QPointF anchor;
+        QVERIFY(overlay->box(red, c, anchor));
+        QVERIFY(QLineF(c[0], pic.topLeft()).length() < 1.5 && QLineF(c[2], pic.bottomRight()).length() < 1.5);  // a full-frame matte
+        QVERIFY(QLineF(anchor, pic.center()).length() < 1.5);
+        const double perPixel = 320.0 / pic.width();  // sequence pixels per widget pixel
+        auto dragFromTo = [&](QPointF from, QPointF to, Qt::KeyboardModifiers mods = {}) {
+            QTest::mousePress(viewer, Qt::LeftButton, mods, from.toPoint());
+            QMouseEvent move(QEvent::MouseMove, to, viewer->mapToGlobal(to), Qt::NoButton, Qt::LeftButton, mods);
+            QApplication::sendEvent(viewer, &move);
+            QTest::mouseRelease(viewer, Qt::LeftButton, mods, to.toPoint());
+        };
+        auto motion = [&](const char* name, double def = 0) { return clipNamed(*state()->sequence(), "Red")->motion.p(name, 5, def); };
+        // Move: a quarter of the picture to the right, one undo step.
+        dragFromTo(pic.center(), pic.center() + QPointF(pic.width() / 4, 0));
+        QVERIFY2(std::fabs(motion("pos_x") - 80) < 2, qPrintable(QString::number(motion("pos_x"))));
+        QVERIFY(std::fabs(motion("pos_y")) < 1);
+        state()->undo();
+        QCOMPARE(motion("pos_x"), 0.0);
+        // A small move snaps back to the centre; Ctrl leaves it where it is.
+        dragFromTo(pic.center(), pic.center() + QPointF(3, 0));
+        QCOMPARE(motion("pos_x"), 0.0);
+        dragFromTo(pic.center(), pic.center() + QPointF(3, 0), Qt::ControlModifier);
+        QVERIFY2(std::fabs(motion("pos_x") - 3 * perPixel) < 1, qPrintable(QString::number(motion("pos_x"))));
+        state()->undo();
+        // Scale from a corner: half as far again from the anchor is 150 %.
+        QVERIFY(overlay->box(red, c, anchor));
+        dragFromTo(c[1], anchor + (c[1] - anchor) * 1.5);
+        QVERIFY2(std::fabs(motion("scale", 100) - 150) < 2, qPrintable(QString::number(motion("scale", 100))));
+        state()->undo();
+        // Stretch from the right edge: 120 % wide, height untouched.
+        const QPointF right = (c[1] + c[2]) / 2;
+        dragFromTo(right, anchor + (right - anchor) * 1.2);
+        QVERIFY2(std::fabs(motion("scale_x", 100) - 120) < 2, qPrintable(QString::number(motion("scale_x", 100))));
+        QCOMPARE(motion("scale_y", 100), 100.0);
+        state()->undo();
+        // Turn from just outside a corner: a quarter turn about the anchor; Shift rounds to 15°.
+        const QPointF out = c[1] + QPointF(10, -10);
+        const QPointF a = out - anchor;
+        dragFromTo(out, anchor + QPointF(-a.y(), a.x()));
+        QVERIFY2(std::fabs(motion("rotation") - 90) < 2, qPrintable(QString::number(motion("rotation"))));
+        state()->undo();
+        dragFromTo(out, anchor + QPointF(a.x() * std::cos(0.3) - a.y() * std::sin(0.3), a.x() * std::sin(0.3) + a.y() * std::cos(0.3)),
+                   Qt::ShiftModifier);
+        QCOMPARE(motion("rotation"), 15.0);  // 17° rounded
+        state()->undo();
+        // An animated setting is keyed at the playhead.
+        QVERIFY(state()->edit("Keys", [red](Project& p, Sequence& s) {
+            Clip* clip = edit::clipById(s, red);
+            if (clip->motion.empty()) clip->motion = makeEffect(p, "transform");
+            clip->motion.params["pos_x"].addKey(0, 0);
+            clip->motion.params["pos_x"].addKey(50, 0);
+            return true;
+        }));
+        dragFromTo(pic.center(), pic.center() + QPointF(pic.width() / 4, 0));
+        const Param& px = clipNamed(*state()->sequence(), "Red")->motion.params.at("pos_x");
+        QCOMPARE(px.keys.size(), size_t(3));
+        QVERIFY(std::fabs(px.at(5) - 80) < 2 && px.at(50) == 0);
+        state()->undo();
+        state()->undo();
+        // With nothing selected, a click on the picture selects the clip on top (the title over Red) and moves it.
+        state()->setSelection({}, false);
+        state()->setPlayhead(20);
+        QApplication::processEvents();
+        QCOMPARE(overlay->target(), Id(0));
+        const Clip* title = edit::clipAt(*state()->sequence(), {TrackKind::Video, 1}, 20);
+        QVERIFY(title);
+        const Id titleId = title->id;
+        dragFromTo(pic.center(), pic.center() + QPointF(0, pic.height() / 4));
+        QCOMPARE(state()->selectedClips(), std::vector<Id>{titleId});
+        QVERIFY(std::fabs(edit::clipById(*state()->sequence(), titleId)->motion.p("pos_y", 5) - 45) < 2);
+        state()->undo();
+        state()->setSelection({}, false);
+        state()->setPlayhead(0);
     }
 
     void clipAnimationInInspector() {

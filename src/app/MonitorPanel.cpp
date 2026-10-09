@@ -154,7 +154,7 @@ void ViewerWidget::paintEvent(QPaintEvent*) {
         tag(compareLabel_.isEmpty() ? tr("Reference") : compareLabel_, true);
         tag(tr("Current"), false);
     }
-    if (overlay_) overlay_(p, r);
+    for (const auto& paint : overlays_) paint(p, r);
 }
 
 void ViewerWidget::setCompare(const QImage& reference, const QString& label) {

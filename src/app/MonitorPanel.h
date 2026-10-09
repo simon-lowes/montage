@@ -34,8 +34,8 @@ public:
     // The picture as drawn (with the exposure check), for testing.
     QImage shownImage() const;
     void setDragSource(bool on) { dragSource_ = on; }
-    // Drawn over the picture; gets the rectangle the picture occupies.
-    void setOverlay(std::function<void(QPainter&, const QRectF&)> paint) { overlay_ = std::move(paint); }
+    // Drawn over the picture, in the order added; each gets the rectangle the picture occupies.
+    void addOverlay(std::function<void(QPainter&, const QRectF&)> paint) { overlays_.push_back(std::move(paint)); }
     QRectF imageRect() const;
     QSize sizeHint() const override { return {480, 270}; }
 
@@ -91,7 +91,7 @@ private:
     mutable int exposedMode_ = 0;
     bool dragSource_ = false;
     bool lookAround_ = false, looking_ = false;
-    std::function<void(QPainter&, const QRectF&)> overlay_;
+    std::vector<std::function<void(QPainter&, const QRectF&)>> overlays_;
     QPoint pressPos_;
 };
 

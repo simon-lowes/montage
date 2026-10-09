@@ -92,6 +92,7 @@
 #include "MulticamPanel.h"
 #include "CaptionsPanel.h"
 #include "MaskOverlay.h"
+#include "TransformOverlay.h"
 #include "SequenceIndexPanel.h"
 #include "ShotSearchPanel.h"
 #include "ModelPacks.h"
@@ -298,6 +299,8 @@ void MainWindow::buildPanels() {
     };
     sourcePanel_ = new MonitorPanel(MonitorPanel::Mode::Source, state_, source_, this);
     programPanel_ = new MonitorPanel(MonitorPanel::Mode::Program, state_, program_, this);
+    // The transform box first: mask and Corner Pin handles, installed after it, get the pointer before it.
+    new TransformOverlay(state_, programPanel_->viewer());
     new MaskOverlay(state_, programPanel_->viewer());
     connect(programPanel_, &MonitorPanel::exportFrameRequested, this, &MainWindow::exportFrame);
     connect(timeline_, &TimelineWidget::trimViewChanged, this,

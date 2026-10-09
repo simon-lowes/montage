@@ -27,7 +27,7 @@ MaskOverlay::MaskOverlay(EditorState* state, ViewerWidget* viewer) : QObject(vie
     pool_.setMaxThreadCount(1);
     viewer_->installEventFilter(this);
     viewer_->setMouseTracking(true);
-    viewer_->setOverlay([this](QPainter& p, const QRectF& r) { paint(p, r); });
+    viewer_->addOverlay([this](QPainter& p, const QRectF& r) { paint(p, r); });
     for (auto sig : {&EditorState::projectChanged, &EditorState::selectionChanged, &EditorState::sequenceSwitched})
         connect(state_, sig, viewer_, qOverload<>(&QWidget::update));
     connect(state_, &EditorState::playheadChanged, viewer_, qOverload<>(&QWidget::update));

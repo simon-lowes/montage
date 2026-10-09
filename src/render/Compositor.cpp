@@ -962,6 +962,8 @@ bool clipGeometry(const Project& p, const Sequence& seq, const Clip& c, FrameTim
             if (!m->hasVideo && m->kind != MediaKind::Image) return false;
             if (m->width > 0) mw = m->width;
             if (m->height > 0) mh = m->height;
+            // Reframe 360: a view at the sequence's shape (as clipLayer draws it).
+            if (enabledEffect(c, "reframe_360")) mw = std::max(1.0, std::round(mh * seq.width / std::max(1, seq.height)));
         }
     }
     g = clipGeometry(c, t - c.start, mw, mh, seq.width, seq.height, seq.fpsValue());
