@@ -30,7 +30,8 @@ struct ExportSettings {
     // libx264, libx265, hw_h264, hw_hevc, prores_ks, dnxhd, cfhd, ffv1, v210, libvpx-vp9, libsvtav1, mjpeg, none; also
     // gif (an animated GIF: its own palette, dithered) and png or tiff (an image sequence: the
     // path gets a frame number, name_000000.png, unless it already has a printf pattern).
-    std::string videoCodec = "libx264";
+    std::string videoCodec = "libx264";  // also exr (half float, scene-linear) and dpx (10-bit) image sequences
+    int startNumber = 0;                 // an image sequence's first frame number
     std::string audioCodec = "aac";      // aac, pcm_s16le, pcm_s24le, libopus, flac, none
     int width = 0;                       // 0 = sequence size (a GIF: at most 480 wide)
     int height = 0;                      // 0 = in proportion to the width

@@ -82,6 +82,8 @@ AVPixelFormat defaultPixFmt(const ExportSettings& s, const std::string& c) {
     if (c == "libvpx-vp9" && s.alpha) return AV_PIX_FMT_YUVA420P;
     if (c == "png") return s.alpha ? AV_PIX_FMT_RGBA : AV_PIX_FMT_RGB24;
     if (c == "tiff") return AV_PIX_FMT_RGB48LE;
+    if (c == "exr") return s.alpha ? AV_PIX_FMT_GBRAPF32LE : AV_PIX_FMT_GBRPF32LE;
+    if (c == "dpx") return AV_PIX_FMT_GBRP10LE;
     return AV_PIX_FMT_YUV420P;
 }
 
@@ -272,6 +274,11 @@ const std::vector<ExportPreset>& exportPresets() {
             v.push_back(png);
             v.push_back(preset("TIFF Sequence (16-bit)", "tif", "One numbered 16-bit TIFF a frame, for finishing and VFX", "tiff", "none", 0,
                                ""));
+            v.push_back(preset("OpenEXR Sequence (half float)", "exr",
+                               "One numbered half-float OpenEXR a frame in scene-linear light, values above white kept: for compositing",
+                               "exr", "none", 0, ""));
+            v.push_back(preset("DPX Sequence (10-bit)", "dpx", "One numbered 10-bit DPX a frame, for film and broadcast finishing", "dpx",
+                               "none", 0, ""));
         }
         v.push_back(preset("Audio - WAV 24-bit", "wav", "Uncompressed mixdown", "none", "pcm_s24le", 0, ""));
         v.push_back(preset("Audio - AAC (M4A)", "m4a", "Compressed mixdown", "none", "aac", 0, ""));
@@ -670,7 +677,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
 
     if (s.videoCodec == "gif") return exportGif(p, seq, s, in, out, progress, cancel, error, opened);
     // Image sequences: numbered files, no sound.
-    const bool imageSequence = s.videoCodec == "png" || s.videoCodec == "tiff";
+    const bool imageSequence = s.videoCodec == "png" || s.videoCodec == "tiff" || s.videoCodec == "exr" || s.videoCodec == "dpx";
+    const bool floatFrames = s.videoCodec == "exr";  // written straight from the float picture, not through 16 bits
     std::string outPath = s.path;
     if (imageSequence) {
         if (wantAudio) return fail("An image sequence has no sound: choose no audio codec");
@@ -683,7 +691,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     Output o;
     int rc = avformat_alloc_output_context2(&o.oc, nullptr, imageSequence ? "image2" : nullptr, outPath.c_str());
     if (rc < 0 || !o.oc) return fail("Unknown output format for " + s.path);
-    if (imageSequence) av_opt_set_int(o.oc->priv_data, "start_number", 0, 0);
+    if (imageSequence) av_opt_set_int(o.oc->priv_data, "start_number", s.startNumber, 0);
     o.pkt = av_packet_alloc();
     const AVRational fps{seq.fps.num, seq.fps.den};
     int W = s.width > 0 ? s.width : seq.width;
@@ -694,7 +702,12 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
 
     const ColorSpace& seqSpace = sequenceColorSpace(seq);
     const ColorSpace* chosen = findColorSpace(s.colorSpace);
-    const ColorSpace& outSpace = chosen && !chosen->sceneReferred ? *chosen : seqSpace;
+    // OpenEXR holds scene-linear light: Linear Rec.709 unless a linear (or any scene-referred) space is asked for.
+    // DPX can hold camera log too (a VFX pull of log footage stays log).
+    const bool logOk = s.videoCodec == "dpx";
+    const ColorSpace& outSpace = floatFrames ? (chosen ? *chosen : *findColorSpace("linear-rec709"))
+                                 : chosen && (logOk || !chosen->sceneReferred) ? *chosen
+                                                                               : seqSpace;
     const bool pq = outSpace.transfer == Transfer::Pq;
     const double peakNits = std::clamp(seq.hdrPeakNits, 100.0, 10000.0);
     const int maxFall = int(std::lround(std::min(peakNits, 400.0)));
@@ -785,6 +798,9 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             av_dict_set(&opts, "level", "3", 0);
             av_dict_set(&opts, "slicecrc", "1", 0);
             o.vctx->gop_size = 1;
+        } else if (c == "exr") {
+            av_dict_set(&opts, "format", "half", 0);  // 16-bit float, as VFX houses take plates
+            av_dict_set(&opts, "compression", "zip16", 0);
         } else if (c == "mjpeg") {
             o.vctx->flags |= AV_CODEC_FLAG_QSCALE;
             o.vctx->global_quality = FF_QP2LAMBDA * 3;
@@ -1132,6 +1148,28 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             if (s.burnInCaptions && captions) drawCaption(img, *captions, f, &seqSpace);
             if (s.burnIn.any()) drawBurnIns(img, p, seq, f, s.burnIn, watermark.isNull() ? nullptr : &watermark, &seqSpace);
             convertColor(img, seqSpace, outSpace, peakNits);
+            if (floatFrames && img.width == W && img.height == H) {
+                // Planar float, green-blue-red(-alpha), unpremultiplied, values above 1 kept.
+                if (av_frame_make_writable(o.vframe) < 0) return fail("Out of memory");
+                const bool alphaPlane = o.vctx->pix_fmt == AV_PIX_FMT_GBRAPF32LE;
+                for (int y = 0; y < H; ++y) {
+                    const float* src = img.row(y);
+                    auto* g = reinterpret_cast<float*>(o.vframe->data[0] + size_t(y) * size_t(o.vframe->linesize[0]));
+                    auto* b = reinterpret_cast<float*>(o.vframe->data[1] + size_t(y) * size_t(o.vframe->linesize[1]));
+                    auto* r = reinterpret_cast<float*>(o.vframe->data[2] + size_t(y) * size_t(o.vframe->linesize[2]));
+                    auto* a = alphaPlane ? reinterpret_cast<float*>(o.vframe->data[3] + size_t(y) * size_t(o.vframe->linesize[3])) : nullptr;
+                    for (int x = 0; x < W; ++x, src += 4) {
+                        const float al = src[3], k = al > 1e-6f ? 1.0f / al : 0.0f;
+                        r[x] = alphaPlane ? src[0] * k : src[0];
+                        g[x] = alphaPlane ? src[1] * k : src[1];
+                        b[x] = alphaPlane ? src[2] * k : src[2];
+                        if (a) a[x] = al;
+                    }
+                }
+                o.vframe->pts = f - in;
+                if ((rc = avcodec_send_frame(o.vctx, o.vframe)) < 0) return fail("Video encoding failed: " + averr(rc));
+                if ((rc = drain(o, o.vctx, o.vst)) < 0) return fail("Writing video failed: " + averr(rc));
+            } else {
             toRgba16(img, rgba16);
             AVPixelFormat srcFmt = AV_PIX_FMT_RGBA64LE;
             o.sws = sws_getCachedContext(o.sws, img.width, img.height, srcFmt, W, H, o.vctx->pix_fmt,
@@ -1149,6 +1187,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             o.vframe->pts = f - in;
             if ((rc = avcodec_send_frame(o.vctx, o.vframe)) < 0) return fail("Video encoding failed: " + averr(rc));
             if ((rc = drain(o, o.vctx, o.vst)) < 0) return fail("Writing video failed: " + averr(rc));
+            }
         }
         if (wantAudio) {
             int64_t target = int64_t(std::llround(double(f + 1) * mixRate / seq.fpsValue())) + limiterDelay;

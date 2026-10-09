@@ -42,6 +42,8 @@
 #include <QtConcurrent>
 #include <QMessageBox>
 #include <QScreen>
+#include <QDir>
+#include <QSpinBox>
 #include <QSettings>
 #include <QShortcut>
 #include <QStatusBar>
@@ -61,6 +63,7 @@
 #include "core/GradeVersions.h"
 #include "core/Chapters.h"
 #include "core/MarkerList.h"
+#include "render/VfxPull.h"
 #include "render/LutExport.h"
 #include "media/Decoder.h"
 #include "media/HwAccel.h"
@@ -656,6 +659,7 @@ void MainWindow::buildMenus() {
     })->setObjectName(QStringLiteral("projectManager"));
     add(file, tr("&Link Media…"), QKeySequence(), [this] { showLinkMedia(); })->setObjectName(QStringLiteral("linkMediaAction"));
     add(file, tr("Export &Frame…"), QKeySequence("Ctrl+Shift+E"), [this] { exportFrame(); });
+    add(file, tr("Export &VFX Pulls…"), QKeySequence(), [this] { vfxPullDialog(); })->setObjectName(QStringLiteral("vfxPulls"));
     add(file, tr("&Import Timeline (FCP XML, FCPXML, OTIO, EDL)…"), QKeySequence(), [this] { importTimeline(); });
     add(file, tr("Export Final Cut Pro &7 XML (Premiere, Resolve)…"), QKeySequence(), [this] { exportInterchange(Interchange::Fcp7Xml); });
     add(file, tr("Export &FCPXML (Final Cut Pro)…"), QKeySequence(), [this] { exportInterchange(Interchange::FcpXml); });
@@ -1832,6 +1836,60 @@ void MainWindow::speedDialog() {
     connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
     form->addRow(buttons);
     if (dlg.exec() == QDialog::Accepted) setSelectionSpeed(speed->value() / 100.0, pitch->isChecked());
+}
+
+void MainWindow::vfxPullDialog() {
+    const Sequence* s = state_->sequence();
+    if (!s) return;
+    std::vector<Id> clips = state_->selectedClips();
+    if (clips.empty()) {
+        state_->message(tr("Select the shots to pull on the timeline"), 5000);
+        return;
+    }
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Export VFX Pulls"));
+    auto* form = new QFormLayout(&dlg);
+    auto* format = new QComboBox(&dlg);
+    format->addItem(tr("OpenEXR (half float, linear)"), QStringLiteral("exr"));
+    format->addItem(tr("DPX (10-bit, the footage's own colour)"), QStringLiteral("dpx"));
+    format->addItem(tr("TIFF (16-bit)"), QStringLiteral("tiff"));
+    form->addRow(tr("Format:"), format);
+    auto* handles = new QSpinBox(&dlg);
+    handles->setRange(0, 100);
+    handles->setValue(appSettings().value("vfx/handles", 8).toInt());
+    handles->setSuffix(tr(" frames"));
+    form->addRow(tr("Handles:"), handles);
+    auto* cutIn = new QSpinBox(&dlg);
+    cutIn->setRange(0, 100000);
+    cutIn->setValue(1001);
+    form->addRow(tr("First frame of the cut:"), cutIn);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    form->addRow(buttons);
+    if (dlg.exec() != QDialog::Accepted) return;
+    const QString folder = QFileDialog::getExistingDirectory(this, tr("Folder for the Pulls"), appSettings().value("vfx/folder").toString());
+    if (folder.isEmpty()) return;
+    appSettings().setValue("vfx/folder", folder);
+    appSettings().setValue("vfx/handles", handles->value());
+    VfxPullOptions o;
+    o.folder = folder.toStdString();
+    o.format = format->currentData().toString().toStdString();
+    o.handles = handles->value();
+    o.cutIn = cutIn->value();
+    QProgressDialog progress(tr("Pulling shots..."), tr("Cancel"), 0, 1000, this);
+    progress.setWindowModality(Qt::WindowModal);
+    std::atomic<bool> cancel{false};
+    connect(&progress, &QProgressDialog::canceled, this, [&cancel] { cancel = true; });
+    std::vector<VfxShot> shots;
+    std::string err;
+    const bool ok = exportVfxPulls(state_->project(), *s, clips, o, &shots, [&](double f, FrameTime) {
+        progress.setValue(int(f * 1000));
+        QApplication::processEvents();
+    }, &cancel, &err);
+    progress.close();
+    if (!ok) QMessageBox::warning(this, tr("Export VFX Pulls"), QString::fromStdString(err));
+    else statusBar()->showMessage(tr("Pulled %n shot(s) with a pull list into %1", "", int(shots.size())).arg(QDir::toNativeSeparators(folder)), 8000);
 }
 
 CleanFeedWindow* MainWindow::showCleanFeed(int screenIndex) {

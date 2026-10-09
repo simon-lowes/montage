@@ -55,6 +55,7 @@
 #include "media/Tracking.h"
 #include "media/Vector.h"
 #include "media/Beats.h"
+#include "render/VfxPull.h"
 #include "render/AafExport.h"
 #include "render/Retime.h"
 #include "render/FaceRefine.h"
@@ -1528,6 +1529,128 @@ private slots:
         QCOMPARE(title, std::string("Musik"));
         QVERIFY2(lang == "ger" || lang == "deu", lang.c_str());
         QVERIFY(level(musik, 880) > 20 * level(musik, 440));
+    }
+
+    void vfxPullsWithHandles() {
+        // The footage: 2 s at 25 fps, red for the first second and blue for the second.
+        const std::string footage = path("plate.mov");
+        {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 64;
+            gs.height = 36;
+            gs.fps = Rational{25, 1};
+            for (int k = 0; k < 2; ++k) {
+                Clip c = makeGeneratorClip(gen, "color", 25);
+                c.generator.params["color.r"] = Param(k ? 0.0 : 0.9);
+                c.generator.params["color.g"] = Param(0.0);
+                c.generator.params["color.b"] = Param(k ? 0.9 : 0.0);
+                c.start = 25 * k;
+                edit::overwrite(gen, gs, {TrackKind::Video, 0}, c);
+            }
+            ExportSettings st;
+            st.path = footage;
+            st.videoCodec = "prores_ks";
+            st.audioCodec = "none";
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = Rational{25, 1};
+        MediaItem m = probeOrFail(p, footage);
+        p.media.push_back(m);
+        // Shot A: source frames 20-29 (red into blue); shot B: frames 3-7, only three frames of head handle.
+        Clip a = makeClip(p, m, TrackKind::Video, s);
+        a.name = "Shot A";
+        a.sourceIn = 20;
+        a.duration = 10;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, a);
+        Clip b = makeClip(p, m, TrackKind::Video, s);
+        b.name = "Shot B";
+        b.sourceIn = 3;
+        b.start = 20;
+        b.duration = 5;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, b);
+        VfxPullOptions o;
+        o.folder = path("pulls");
+        std::vector<VfxShot> shots;
+        std::string err;
+        QVERIFY2(exportVfxPulls(p, s, {a.id, b.id}, o, &shots, nullptr, nullptr, &err), err.c_str());
+        QCOMPARE(shots.size(), size_t(2));
+        QCOMPARE(shots[0].name, std::string("Shot_A"));
+        QCOMPARE(shots[0].firstFrame, 993);
+        QCOMPARE(shots[0].cutIn, 1001);
+        QCOMPARE(shots[0].cutOut, 1010);
+        QCOMPARE(shots[0].lastFrame, 1018);
+        QCOMPARE(shots[1].headHandle, 3);  // only three frames before it
+        QCOMPARE(shots[1].firstFrame, 998);
+        auto file = [&](const VfxShot& sh, int n, const char* ext) {
+            char buf[32];
+            std::snprintf(buf, sizeof buf, ".%04d.%s", n, ext);
+            return sh.folder + "/" + sh.name + buf;
+        };
+        QVERIFY(QFileInfo::exists(QString::fromStdString(file(shots[0], 993, "exr"))));
+        QVERIFY(QFileInfo::exists(QString::fromStdString(file(shots[0], 1018, "exr"))));
+        QVERIFY(!QFileInfo::exists(QString::fromStdString(file(shots[0], 1019, "exr"))));
+        QVERIFY(!QFileInfo::exists(QString::fromStdString(file(shots[0], 992, "exr"))));
+        // What is in them: frame 1001 (source 20) red, 1010 (source 29) blue, in linear light (0.9 -> about 0.78).
+        auto colour = [&](const std::string& f) {
+            VideoDecoder dec;
+            std::array<double, 3> c{-1, -1, -1};
+            if (!dec.open(f)) return c;
+            const Frame16Ptr fr = dec.frameAt(0);
+            if (!fr) return c;
+            const Image img = toImage(*fr);
+            for (int k = 0; k < 3; ++k) c[size_t(k)] = img.at(32, 18)[k];
+            return c;
+        };
+        const auto red = colour(file(shots[0], 1001, "exr")), blue = colour(file(shots[0], 1010, "exr"));
+        QVERIFY2(red[0] > 0.6 && red[0] < 0.9 && red[2] < 0.05, qPrintable(QString("%1 %2 %3").arg(red[0]).arg(red[1]).arg(red[2])));
+        QVERIFY2(blue[2] > 0.6 && blue[0] < 0.05, qPrintable(QString("%1 %2 %3").arg(blue[0]).arg(blue[1]).arg(blue[2])));
+        // The pull list.
+        QFile list(QString::fromStdString(o.folder + "/pull_list.csv"));
+        QVERIFY(list.open(QIODevice::ReadOnly));
+        const QStringList rows = QString::fromUtf8(list.readAll()).split('\n', Qt::SkipEmptyParts);
+        QCOMPARE(rows.size(), 3);
+        QVERIFY2(rows[1].startsWith("Shot_A,") && rows[1].contains(",8,8,993,1001,1010,1018,"), qPrintable(rows[1]));
+        // DPX, 10-bit, frames numbered from 1 for a two-frame-handle pull.
+        VfxPullOptions d;
+        d.folder = path("pulls-dpx");
+        d.format = "dpx";
+        d.handles = 2;
+        d.cutIn = 1;
+        QVERIFY2(exportVfxPulls(p, s, {b.id}, d, &shots, nullptr, nullptr, &err), err.c_str());
+        QCOMPARE(shots.size(), size_t(1));
+        QCOMPARE(shots[0].firstFrame, -1);
+        AVFormatContext* fmt = nullptr;
+        QVERIFY(avformat_open_input(&fmt, file(shots[0], 1, "dpx").c_str(), nullptr, nullptr) >= 0);
+        avformat_find_stream_info(fmt, nullptr);
+        QCOMPARE(QString(avcodec_get_name(fmt->streams[0]->codecpar->codec_id)), QString("dpx"));
+        QCOMPARE(fmt->streams[0]->codecpar->bits_per_raw_sample, 10);
+        avformat_close_input(&fmt);
+        // Nothing to pull.
+        Clip title = makeGeneratorClip(p, "title", 10);
+        title.start = 40;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, title);
+        QVERIFY(!exportVfxPulls(p, s, {title.id}, o, &shots, nullptr, nullptr, &err));
+        // Over MCP: every footage clip (the title skipped), as TIFF.
+        const QString project = QString::fromStdString(path("pulls.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_vfx_pull"},
+                                                     {"arguments", QJsonObject{{"project", project}, {"folder", QString::fromStdString(path("pulls-mcp"))},
+                                                                               {"format", "tiff"}, {"handles", 4}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonArray pulled = r.value("structuredContent").toObject().value("shots").toArray();
+        QCOMPARE(pulled.size(), 2);
+        QCOMPARE(pulled[0].toObject().value("first_frame").toInt(), 997);
+        QVERIFY(QFileInfo::exists(r.value("structuredContent").toObject().value("pull_list").toString()));
     }
 
     void gradeVersionsOverMcp() {

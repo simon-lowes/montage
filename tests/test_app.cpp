@@ -2217,6 +2217,15 @@ private slots:
         state()->newProject();
     }
 
+    void vfxPullsNeedASelection() {
+        loadDemo();
+        state()->setSelection({}, false);
+        QAction* pulls = win_->findChild<QAction*>("vfxPulls");
+        QVERIFY(pulls);
+        pulls->trigger();  // nothing selected: no dialog, a hint instead
+        QTRY_VERIFY(win_->statusBar()->currentMessage().contains("Select the shots"));
+    }
+
     void fullScreenVideoOutput() {
         loadDemo();
         QVERIFY(win_->findChild<QAction*>("fullScreenProgram") && win_->findChild<QMenu*>("videoOutputMenu"));

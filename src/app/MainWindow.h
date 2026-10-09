@@ -232,6 +232,7 @@ private:
     void addEdit(bool allTracks);
     void addDefaultTransition(bool audio);
     void speedDialog();
+    void vfxPullDialog();
     void nudge(int frames);
     void matchFrame();
     void addMarker();

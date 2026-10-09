@@ -45,6 +45,7 @@
 #include "media/SpeechEnhance.h"
 #include "media/SuperScale.h"
 #include "media/Translator.h"
+#include "render/VfxPull.h"
 #include "render/AafExport.h"
 #include "render/AutoMix.h"
 #include "render/AutoBroll.h"
@@ -3262,6 +3263,44 @@ void McpServer::Impl::addTools() {
                 o["stems"] = list;
             }
             return ok(text, o);
+        });
+
+    add("montage_vfx_pull", "VFX pulls",
+        "Pull shots for visual effects: each clip's source frames, untouched, at the footage's own size and rate, with "
+        "`handles` frames either side (default 8, as far as the footage goes), as an image sequence in a folder per shot "
+        "(format exr: half float in scene-linear light; dpx: 10-bit in the footage's own colour; tiff: 16-bit), numbered "
+        "so the cut's first frame is `cut_in` (default 1001), with a pull_list.csv. `clips` are clip ids (default: every "
+        "footage clip on the video tracks).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"folder":{"type":"string"},
+            "clips":{"type":"array","items":{"type":"number"}},"format":{"type":"string","enum":["exr","dpx","tiff"],"default":"exr"},
+            "handles":{"type":"integer","default":8},"cut_in":{"type":"integer","default":1001}},"required":["project","folder"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            VfxPullOptions o;
+            o.folder = absolute(need(a, "folder")).toStdString();
+            o.format = str(a, "format", "exr").toStdString();
+            o.handles = std::clamp(a.value("handles").toInt(8), 0, 1000);
+            o.cutIn = a.value("cut_in").toInt(1001);
+            std::vector<Id> clips;
+            for (const QJsonValue& v : a.value("clips").toArray()) clips.push_back(Id(v.toDouble()));
+            if (clips.empty())
+                for (const Track& t : l.seq().videoTracks)
+                    for (const Clip& c : t.clips) clips.push_back(c.id);
+            std::vector<VfxShot> shots;
+            std::string err;
+            if (!exportVfxPulls(l.project, l.seq(), clips, o, &shots, [this](double f, FrameTime) { progress(f, "Pulling"); }, nullptr, &err))
+                return fail(QString::fromStdString(err));
+            QJsonArray list;
+            QStringList lines;
+            for (const VfxShot& s : shots) {
+                list.append(QJsonObject{{"name", QString::fromStdString(s.name)}, {"folder", QString::fromStdString(s.folder)},
+                                        {"first_frame", s.firstFrame}, {"cut_in", s.cutIn}, {"cut_out", s.cutOut}, {"last_frame", s.lastFrame},
+                                        {"head_handle", s.headHandle}, {"tail_handle", s.tailHandle}});
+                lines << QStringLiteral("%1: frames %2-%3 (cut %4-%5)").arg(QString::fromStdString(s.name)).arg(s.firstFrame).arg(s.lastFrame).arg(s.cutIn).arg(s.cutOut);
+            }
+            const QString csv = QDir(QString::fromStdString(o.folder)).filePath("pull_list.csv");
+            return ok(QStringLiteral("Pulled %1 shots:\n%2\nPull list: %3").arg(shots.size()).arg(lines.join('\n'), csv),
+                      QJsonObject{{"shots", list}, {"pull_list", csv}});
         });
 
     add("montage_export_timeline", "Export the timeline",
