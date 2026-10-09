@@ -930,6 +930,33 @@ void McpServer::Impl::addTools() {
                                   {"frames", double(frames)}});
         });
 
+    add("montage_key_screen", "Key out a green or blue screen",
+        "Key a green or blue screen out of video clips: each gets the Keyer (Keylight-style: screen dominance with balance and "
+        "gain, matte clip black and white, shrink or grow, soften, despill with brightness restored, edge desaturation) set to "
+        "the screen colour read from its picture at `at` (default: the middle of each clip). Then montage_add_effect "
+        "or montage_set_effect_param can tune it (type screen_key).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clips":{"type":"array","items":{"type":"number"}},
+            "at":{"type":["number","string"]}},"required":["project","clips"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : -1;
+            QJsonArray keyed;
+            std::string err;
+            for (const QJsonValue& v : a.value("clips").toArray()) {
+                const Id id = Id(v.toDouble());
+                if (keyScreen(l.project, s, id, at, &err)) {
+                    const Clip* c = edit::clipById(s, id);
+                    const auto it = std::find_if(c->effects.begin(), c->effects.end(), [](const Effect& e) { return e.type == "screen_key"; });
+                    keyed.append(QJsonObject{{"clip", double(id)},
+                                             {"screen", QJsonArray{it->p("key.r", 0), it->p("key.g", 0), it->p("key.b", 0)}}});
+                }
+            }
+            if (keyed.isEmpty()) return fail(err.empty() ? QStringLiteral("No clips keyed") : QString::fromStdString(err));
+            save(l);
+            return ok(QStringLiteral("Keyed %1 clip(s)").arg(keyed.size()), QJsonObject{{"keyed", keyed}});
+        });
+
     add("montage_move_clip", "Move a clip",
         "Move a clip (and the clips linked to it) to a new start time, optionally to another video track.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},

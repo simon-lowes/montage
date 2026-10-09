@@ -1578,6 +1578,41 @@ private slots:
         QVERIFY(level(musik, 880) > 20 * level(musik, 440));
     }
 
+    void mcpKeyScreen() {
+        QImage shot(320, 180, QImage::Format_RGB32);
+        shot.fill(QColor::fromRgbF(0.1f, 0.25f, 0.8f));  // a blue screen
+        for (int y = 60; y < 120; ++y)
+            for (int x = 130; x < 190; ++x) shot.setPixelColor(x, y, QColor::fromRgbF(0.75f, 0.6f, 0.5f));
+        const QString png = QString::fromStdString(path("bluescreen.png"));
+        QVERIFY(shot.save(png));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = {25, 1};
+        MediaItem mi = probeOrFail(p, png.toStdString());
+        p.media.push_back(mi);
+        QVERIFY(edit::placeMedia(p, s, mi.id, 0, 0, 25, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Id clip = s.videoTracks[0].clips.at(0).id;
+        const QString project = QString::fromStdString(path("key.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_key_screen"}, {"arguments", QJsonObject{{"project", project}, {"clips", QJsonArray{double(clip)}}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonArray screenRgb = r.value("structuredContent").toObject().value("keyed").toArray().at(0).toObject().value("screen").toArray();
+        QVERIFY(screenRgb.at(2).toDouble() > 0.7 && screenRgb.at(0).toDouble() < 0.2);
+        // Rendered: the screen gone, the subject kept.
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        RenderOptions ro;
+        const Image frame = renderSequenceFrame(back, *back.active(), 5, ro);
+        QVERIFY2(frame.at(10, 10)[3] < 0.03f, qPrintable(QString::number(frame.at(10, 10)[3])));
+        QVERIFY(frame.at(160, 90)[3] > 0.97f);
+    }
+
     void extendClipPastItsEnd() {
         // A pan: a textured ground sliding left 4 px a frame for a second, over a steady room.
         const int frames = 25;

@@ -216,6 +216,16 @@ std::vector<EffectInfo> buildCatalog() {
                   num("softness", "Edge Softness", 0, 1, 0.1), num("spill", "Spill Suppression", 0, 1, 0.6),
                   num("choke", "Choke", -1, 1, 0), boolean("show_matte", "Show Matte")},
                  {}});
+    // A screen keyer in the manner of Keylight and Ultra Key: how much the screen's colour dominates a pixel, against the
+    // screen's own dominance, makes the matte (cleaner edges and hair than a colour distance); then matte levels,
+    // shrink or grow, soften, despill with the lost brightness put back, and the edges desaturated.
+    c.push_back({"screen_key", "Keyer (Green / Blue Screen)", EffectCategory::VideoFilter, "Keying",
+                 {color("key", "Screen Colour", 0.1, 0.75, 0.2), num("balance", "Screen Balance", 0, 1, 0.5),
+                  num("gain", "Screen Gain", 0.5, 2, 1.1), num("clip_black", "Clip Black", 0, 1, 0.05), num("clip_white", "Clip White", 0, 1, 1),
+                  num("shrink", "Shrink / Grow (px)", -10, 10, 0, 0.5), num("soften", "Soften (px)", 0, 20, 0, 0.5),
+                  pct("despill", "Despill", 0, 100, 100), pct("restore", "Restore Brightness", 0, 100, 50),
+                  pct("edge_desat", "Edge Desaturate", 0, 100, 0), choice("view", "View", {"Composite", "Matte", "Status"}, 0)},
+                 {}});
     // A title or graphic behind the people in the shot beneath it (handled when tracks are composited).
     c.push_back({"behind_people", "Behind People", EffectCategory::VideoFilter, "Keying",
                  {pct("amount", "Amount", 0, 100, 100), num("shift", "Edge Shift (px)", -20, 20, 1, 0.5),

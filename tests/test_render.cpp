@@ -1608,6 +1608,102 @@ colorspaces:
         QVERIFY(near(c[2], 1));
     }
 
+    void screenKeyer() {
+        Project p = makeDefaultProject();
+        // A green screen with a little noise, a skin-toned subject, a soft half-and-half edge and green spill on the
+        // subject's rim.
+        const int w = 200, h = 120;
+        Image img(w, h);
+        std::mt19937 rng(9);
+        std::normal_distribution<float> n(0, 0.015f);
+        const float screen[3] = {0.12f, 0.72f, 0.2f}, skin[3] = {0.8f, 0.58f, 0.47f};
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                const double d = std::hypot(x - 100.0, y - 60.0);
+                float c[3];
+                for (int k = 0; k < 3; ++k) {
+                    const float mix = d < 30 ? 1.0f : d < 34 ? 0.5f : 0.0f;  // subject, its soft edge, screen
+                    c[k] = mix * skin[k] + (1 - mix) * screen[k] + n(rng);
+                }
+                if (d >= 26 && d < 30) c[1] += 0.12f;  // spill on the rim
+                float* px = img.at(x, y);
+                px[0] = c[0], px[1] = c[1], px[2] = c[2], px[3] = 1;
+            }
+        // The screen colour read from the picture.
+        double picked[3];
+        QVERIFY(estimateScreenColor(img, picked));
+        for (int k = 0; k < 3; ++k) QVERIFY2(std::fabs(picked[k] - screen[k]) < 0.04, qPrintable(QString("%1: %2").arg(k).arg(picked[k])));
+        QVERIFY(!estimateScreenColor(solid(64, 64, 0.5f, 0.45f, 0.4f), picked));  // no screen
+        Effect key = makeEffect(p, "screen_key");
+        key.params["key.r"] = picked[0], key.params["key.g"] = picked[1], key.params["key.b"] = picked[2];
+        auto run = [&](const Effect& e) {
+            Image out = img;
+            applyVideoEffect(e, 0, out, 1.0);
+            return out;
+        };
+        auto alphaAt = [](const Image& im, int x, int y) { return im.at(x, y)[3]; };
+        const Image keyed = run(key);
+        QVERIFY2(alphaAt(keyed, 5, 5) < 0.03f && alphaAt(keyed, 190, 110) < 0.03f, qPrintable(QString::number(alphaAt(keyed, 5, 5))));
+        QVERIFY(alphaAt(keyed, 100, 60) > 0.97f);
+        QVERIFY2(std::fabs(alphaAt(keyed, 132, 60) - 0.5f) < 0.15f, qPrintable(QString::number(alphaAt(keyed, 132, 60))));
+        // The rim's green spill is gone (green no stronger than red or blue) and its brightness partly kept.
+        float c[4];
+        rgb(keyed, 128, 60, c);
+        QVERIFY2(c[1] <= std::max(c[0], c[2]) + 0.01f, qPrintable(QString("%1 %2 %3").arg(c[0]).arg(c[1]).arg(c[2])));
+        rgb(keyed, 100, 60, c);
+        QVERIFY(std::fabs(c[0] - skin[0]) < 0.05f && std::fabs(c[2] - skin[2]) < 0.05f);  // the subject's colour kept
+        // Views: the matte as grey, and the status (black, white, grey between).
+        Effect matte = key;
+        matte.params["view"] = 1;
+        const Image mv = run(matte);
+        QVERIFY(std::fabs(mv.at(132, 60)[0] - alphaAt(keyed, 132, 60)) < 1e-4f && mv.at(5, 5)[3] == 1.0f);
+        Effect status = key;
+        status.params["view"] = 2;
+        const Image sv = run(status);
+        QCOMPARE(sv.at(5, 5)[0], 0.0f);
+        QCOMPARE(sv.at(100, 60)[0], 1.0f);
+        QCOMPARE(sv.at(132, 60)[0], 0.5f);
+        // Shrinking takes pixels off the subject's edge; growing adds them; softening widens the edge.
+        auto opaque = [](const Image& im) {
+            int nOpaque = 0;
+            for (int y = 0; y < im.height; ++y)
+                for (int x = 0; x < im.width; ++x) nOpaque += im.at(x, y)[3] > 0.97f;
+            return nOpaque;
+        };
+        auto partial = [](const Image& im) {
+            int nPartial = 0;
+            for (int y = 0; y < im.height; ++y)
+                for (int x = 0; x < im.width; ++x) nPartial += im.at(x, y)[3] > 0.03f && im.at(x, y)[3] < 0.97f;
+            return nPartial;
+        };
+        Effect shrink = key, grow = key, soft = key;
+        shrink.params["shrink"] = 3;
+        grow.params["shrink"] = -3;
+        soft.params["soften"] = 8;
+        QVERIFY(opaque(run(shrink)) < opaque(keyed) - 200);
+        QVERIFY(opaque(run(grow)) > opaque(keyed) + 200);
+        QVERIFY(partial(run(soft)) > partial(keyed) * 2);
+        // Clip black makes the half-and-half edge clearer; more gain more transparent.
+        Effect clip = key;
+        clip.params["clip_black"] = 0.6;
+        QVERIFY(alphaAt(run(clip), 132, 60) < 0.05f);
+        Effect strong = key;
+        strong.params["gain"] = 1.6;
+        QVERIFY(alphaAt(run(strong), 132, 60) < alphaAt(keyed, 132, 60));
+        // A blue screen is found and keyed as well.
+        Image blue = solid(64, 64, 0.1f, 0.2f, 0.8f);
+        for (int y = 24; y < 40; ++y)
+            for (int x = 24; x < 40; ++x) {
+                float* px = blue.at(x, y);
+                px[0] = 0.7f, px[1] = 0.6f, px[2] = 0.5f;
+            }
+        QVERIFY(estimateScreenColor(blue, picked) && picked[2] > 0.7);
+        Effect bk = makeEffect(p, "screen_key");
+        bk.params["key.r"] = picked[0], bk.params["key.g"] = picked[1], bk.params["key.b"] = picked[2];
+        applyVideoEffect(bk, 0, blue, 1.0);
+        QVERIFY(blue.at(2, 2)[3] < 0.03f && blue.at(32, 32)[3] > 0.97f);
+    }
+
     void moreVideoEffects() {
         Project p = makeDefaultProject();
         auto fx = [&](const char* type, std::initializer_list<std::pair<const char*, double>> params) {

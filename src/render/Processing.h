@@ -121,6 +121,9 @@ Effect autoColorCorrection(const Image& img, Id effectId);
 // (5th and 95th percentiles) on the reference's and gamma its mid-tones
 // (medians). The pictures need not show the same thing, only similar light.
 Effect colorMatchCorrection(const Image& img, const Image& reference, Id effectId);
+// The colour of a green or blue screen in a picture: the cleaner half of the pixels where green (or blue, whichever
+// covers more) clearly leads the other two, as a median. False if neither screen colour covers 2 % of the picture.
+bool estimateScreenColor(const Image& img, double rgb[3]);
 
 // Flattens premultiplied RGBA over an opaque colour.
 void flattenOver(Image& img, float r, float g, float b);

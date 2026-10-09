@@ -1286,6 +1286,28 @@ Image colourReferenceFrame(const Project& p, const Sequence& s, FrameTime t) {
     return renderProgramFrame(p, s, std::clamp<FrameTime>(t, 0, std::max<FrameTime>(0, s.duration() - 1)), o);
 }
 
+bool keyScreen(Project& p, Sequence& s, Id clip, FrameTime at, std::string* error) {
+    Clip* c = edit::clipById(s, clip);
+    const MediaItem* m = c && c->mediaId ? p.findMedia(c->mediaId) : nullptr;
+    if (!m || (m->kind != MediaKind::Video && m->kind != MediaKind::Image)) {
+        if (error) *error = "Keying needs a video or picture clip";
+        return false;
+    }
+    const FrameTime t = c->contains(at) ? at : c->start + c->duration / 2;
+    const double sec = m->kind == MediaKind::Video ? std::max(0.0, c->sourceFrameAt(t) / s.fpsValue()) : 0.0;
+    double rgb[3];
+    if (!estimateScreenColor(renderMediaFrame(p, *m, sec, 480, 270), rgb)) {
+        if (error) *error = "No green or blue screen stands out in the clip";
+        return false;
+    }
+    auto it = std::find_if(c->effects.begin(), c->effects.end(), [](const Effect& e) { return e.type == "screen_key"; });
+    if (it == c->effects.end()) it = c->effects.insert(c->effects.begin(), makeEffect(p, "screen_key"));
+    it->params["key.r"] = Param(rgb[0]);
+    it->params["key.g"] = Param(rgb[1]);
+    it->params["key.b"] = Param(rgb[2]);
+    return true;
+}
+
 int matchClipColour(Project& p, Sequence& s, const std::vector<Id>& clips, const Image& reference, FrameTime at) {
     if (reference.empty()) return 0;
     int n = 0;

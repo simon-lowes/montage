@@ -265,6 +265,165 @@ void chromaKey(const Effect& e, FrameTime t, Image& img) {
     });
 }
 
+// Separable running minimum or maximum of a plane over a window of 2r + 1 pixels.
+void minMaxFilter(std::vector<float>& v, int w, int h, int r, bool maximum) {
+    if (r <= 0) return;
+    std::vector<float> tmp(v.size());
+    auto pick = [maximum](float a, float b) { return maximum ? std::max(a, b) : std::min(a, b); };
+    parallelRows(h, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y)
+            for (int x = 0; x < w; ++x) {
+                float m = v[size_t(y) * size_t(w) + size_t(x)];
+                for (int k = std::max(0, x - r); k <= std::min(w - 1, x + r); ++k) m = pick(m, v[size_t(y) * size_t(w) + size_t(k)]);
+                tmp[size_t(y) * size_t(w) + size_t(x)] = m;
+            }
+    });
+    parallelRows(h, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y)
+            for (int x = 0; x < w; ++x) {
+                float m = tmp[size_t(y) * size_t(w) + size_t(x)];
+                for (int k = std::max(0, y - r); k <= std::min(h - 1, y + r); ++k) m = pick(m, tmp[size_t(k) * size_t(w) + size_t(x)]);
+                v[size_t(y) * size_t(w) + size_t(x)] = m;
+            }
+    });
+}
+
+// Three box blurs of radius r: close to a Gaussian.
+void boxBlurPlane(std::vector<float>& v, int w, int h, int r) {
+    if (r <= 0) return;
+    std::vector<float> tmp(v.size());
+    for (int pass = 0; pass < 3; ++pass) {
+        parallelRows(h, [&](int y0, int y1) {
+            for (int y = y0; y < y1; ++y) {
+                const float* row = &v[size_t(y) * size_t(w)];
+                double acc = 0;
+                int n = 0;
+                for (int k = 0; k <= std::min(w - 1, r); ++k) acc += row[k], ++n;
+                for (int x = 0; x < w; ++x) {
+                    tmp[size_t(y) * size_t(w) + size_t(x)] = float(acc / n);
+                    if (x + r + 1 < w) acc += row[x + r + 1], ++n;
+                    if (x - r >= 0) acc -= row[x - r], --n;
+                }
+            }
+        });
+        parallelRows(w, [&](int x0, int x1) {
+            for (int x = x0; x < x1; ++x) {
+                double acc = 0;
+                int n = 0;
+                for (int k = 0; k <= std::min(h - 1, r); ++k) acc += tmp[size_t(k) * size_t(w) + size_t(x)], ++n;
+                for (int y = 0; y < h; ++y) {
+                    v[size_t(y) * size_t(w) + size_t(x)] = float(acc / n);
+                    if (y + r + 1 < h) acc += tmp[size_t(y + r + 1) * size_t(w) + size_t(x)], ++n;
+                    if (y - r >= 0) acc -= tmp[size_t(y - r) * size_t(w) + size_t(x)], --n;
+                }
+            }
+        });
+    }
+}
+
+void screenKey(const Effect& e, FrameTime t, Image& img, double pixelScale) {
+    const float sk[3] = {float(e.p("key.r", t, 0.1)), float(e.p("key.g", t, 0.75)), float(e.p("key.b", t, 0.2))};
+    const int dom = (sk[1] >= sk[0] && sk[1] >= sk[2]) ? 1 : (sk[2] >= sk[0] ? 2 : 0);
+    const int o1 = (dom + 1) % 3, o2 = (dom + 2) % 3;
+    const float balance = float(std::clamp(e.p("balance", t, 0.5), 0.0, 1.0));
+    const float gain = float(std::max(0.05, e.p("gain", t, 1.1)));
+    const float black = float(e.p("clip_black", t, 0.05)), white = float(std::max(e.p("clip_white", t, 1), e.p("clip_black", t, 0.05) + 0.01));
+    const float despill = float(e.p("despill", t, 100) / 100), restore = float(e.p("restore", t, 50) / 100);
+    const float edgeDesat = float(e.p("edge_desat", t, 0) / 100);
+    const int view = int(std::lround(e.p("view", t, 0)));
+    // The other two channels as one: Screen Balance weighs the larger against the smaller.
+    auto others = [&](const float* c) { return balance * std::max(c[o1], c[o2]) + (1 - balance) * std::min(c[o1], c[o2]); };
+    const float screen = std::max(1e-3f, sk[dom] - others(sk));
+    const int w = img.width, h = img.height;
+    std::vector<float> matte(size_t(w) * size_t(h));
+    parallelRows(h, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y) {
+            const float* p = img.row(y);
+            for (int x = 0; x < w; ++x, p += 4) {
+                const float a = p[3];
+                float m = 0;
+                if (a > 0) {
+                    const float c[3] = {p[0] / a, p[1] / a, p[2] / a};
+                    const float d = (c[dom] - others(c)) / screen;  // 1 on the screen, 0 or less on the subject
+                    m = std::clamp(1 - d * gain, 0.0f, 1.0f);
+                    m = std::clamp((m - black) / (white - black), 0.0f, 1.0f);
+                }
+                matte[size_t(y) * size_t(w) + size_t(x)] = m;
+            }
+        }
+    });
+    const double shrink = e.p("shrink", t, 0) * pixelScale, soften = e.p("soften", t, 0) * pixelScale;
+    if (std::lround(shrink) != 0) minMaxFilter(matte, w, h, int(std::lround(std::fabs(shrink))), shrink < 0);  // grow: maximum
+    boxBlurPlane(matte, w, h, int(std::lround(soften / 2)));
+    parallelRows(h, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y) {
+            float* p = img.row(y);
+            for (int x = 0; x < w; ++x, p += 4) {
+                const float a0 = p[3];
+                const float m = matte[size_t(y) * size_t(w) + size_t(x)];
+                const float na = a0 * m;
+                if (view == 1) {  // the matte
+                    p[0] = p[1] = p[2] = na;
+                    p[3] = 1;
+                    continue;
+                }
+                if (view == 2) {  // status: clean black and white, anything in between grey
+                    const float v = na < 0.02f ? 0.0f : na > 0.98f ? 1.0f : 0.5f;
+                    p[0] = p[1] = p[2] = v;
+                    p[3] = 1;
+                    continue;
+                }
+                if (a0 <= 0) continue;
+                float c[3] = {p[0] / a0, p[1] / a0, p[2] / a0};
+                // Despill: the screen's colour no stronger than the others, the brightness it took put back.
+                const float before = luma(c[0], c[1], c[2]);
+                const float limit = others(c);
+                if (c[dom] > limit) c[dom] -= (c[dom] - limit) * despill;
+                const float lost = (before - luma(c[0], c[1], c[2])) * restore;
+                for (float& v : c) v += lost;
+                if (edgeDesat > 0) {
+                    const float edge = 4 * m * (1 - m) * edgeDesat, l = luma(c[0], c[1], c[2]);
+                    for (float& v : c) v += (l - v) * edge;
+                }
+                p[0] = c[0] * na;
+                p[1] = c[1] * na;
+                p[2] = c[2] * na;
+                p[3] = na;
+            }
+        }
+    });
+}
+
+}  // namespace
+
+bool estimateScreenColor(const Image& img, double rgb[3]) {
+    if (img.width <= 0 || img.height <= 0) return false;
+    const size_t total = size_t(img.width) * size_t(img.height);
+    const size_t step = std::max<size_t>(1, total / 200000);
+    std::vector<std::array<float, 4>> green, blue;  // r, g, b, margin
+    size_t seen = 0;
+    for (size_t i = 0; i < total; i += step, ++seen) {
+        const float* p = &img.px[i * 4];
+        if (p[3] <= 0.5f) continue;
+        const float r = p[0] / p[3], g = p[1] / p[3], b = p[2] / p[3];
+        if (g - std::max(r, b) > 0.1f) green.push_back({r, g, b, g - std::max(r, b)});
+        else if (b - std::max(r, g) > 0.1f) blue.push_back({r, g, b, b - std::max(r, g)});
+    }
+    auto& pick = green.size() >= blue.size() ? green : blue;
+    if (seen == 0 || pick.size() < seen / 50) return false;
+    std::sort(pick.begin(), pick.end(), [](const auto& a, const auto& b) { return a[3] > b[3]; });
+    pick.resize(std::max<size_t>(1, pick.size() / 2));
+    for (int c = 0; c < 3; ++c) {
+        std::vector<float> v(pick.size());
+        for (size_t i = 0; i < pick.size(); ++i) v[i] = pick[i][size_t(c)];
+        std::nth_element(v.begin(), v.begin() + std::ptrdiff_t(v.size() / 2), v.end());
+        rgb[c] = v[v.size() / 2];
+    }
+    return true;
+}
+
+namespace {
+
 void lumaKey(const Effect& e, FrameTime t, Image& img) {
     float th = float(e.p("threshold", t, 0.1)), soft = float(e.p("softness", t, 0.05));
     bool invert = e.p("invert", t) > 0.5;
@@ -1194,6 +1353,7 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
     } else if (ty == "ocio")
         applyOcio(e, img);
     else if (ty == "chroma_key") chromaKey(e, t, img);
+    else if (ty == "screen_key") screenKey(e, t, img, pixelScale);
     else if (ty == "luma_key") lumaKey(e, t, img);
     else if (ty == "black_white") blackWhite(e, t, img);
     else if (ty == "invert") invert(e, t, img);

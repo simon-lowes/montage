@@ -5081,6 +5081,48 @@ const auto seq = [this] { return state()->sequence(); };
         state()->newProject();
     }
 
+    void keyOutGreenScreen() {
+        QAction* action = win_->findChild<QAction*>("keyScreen");
+        QVERIFY(action);
+        // A green screen still with a person-coloured block in the middle.
+        QImage shot(320, 180, QImage::Format_RGB32);
+        shot.fill(QColor::fromRgbF(0.12f, 0.72f, 0.2f));
+        for (int y = 50; y < 130; ++y)
+            for (int x = 120; x < 200; ++x) shot.setPixelColor(x, y, QColor::fromRgbF(0.8f, 0.58f, 0.47f));
+        const QString png = dir_.filePath("greenscreen.png");
+        QVERIFY(shot.save(png));
+        state()->newProject();
+        const auto ids = state()->importFiles({png});
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids[0], 0, 0, 50, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        const Id clip = state()->sequence()->videoTracks[0].clips.front().id;
+        state()->setSelection({clip}, false);
+        state()->setPlayhead(10);
+        action->trigger();
+        const Clip* c = edit::clipById(*state()->sequence(), clip);
+        QCOMPARE(c->effects.size(), size_t(1));
+        QCOMPARE(c->effects[0].type, std::string("screen_key"));
+        QVERIFY(std::fabs(c->effects[0].p("key.g", 0) - 0.72) < 0.03 && std::fabs(c->effects[0].p("key.r", 0) - 0.12) < 0.03);
+        // Run again: the same Keyer, re-read, not a second one (and no change, so no new undo step).
+        action->trigger();
+        QCOMPARE(edit::clipById(*state()->sequence(), clip)->effects.size(), size_t(1));
+        state()->undo();
+        QVERIFY(edit::clipById(*state()->sequence(), clip)->effects.empty());
+        // Nothing green to key: refused.
+        QImage grey(64, 64, QImage::Format_RGB32);
+        grey.fill(QColor(128, 120, 110));
+        const QString gp = dir_.filePath("grey.png");
+        QVERIFY(grey.save(gp));
+        const auto gid = state()->importFiles({gp});
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, gid[0], 100, 0, 20, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        const Id greyClip = state()->sequence()->videoTracks[0].clips.back().id;
+        state()->setSelection({greyClip}, false);
+        QCOMPARE(win_->keyOutScreen(), 0);
+    }
+
     void extendClipCommand() {
         QVERIFY(win_->findChild<QAction*>("extendClip1s"));
         QVERIFY(win_->findChild<QAction*>("extendClip2s"));

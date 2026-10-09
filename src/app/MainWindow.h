@@ -154,6 +154,9 @@ public:
     // as its motion settles), with room tone under its linked sound, pushing what follows when `ripple`. One undo step;
     // the new clips (the picture first).
     std::vector<Id> extendClip(Id clip, FrameTime frames, bool ripple = true);
+    // Clip › Key Out Green / Blue Screen: the selected clips (or the one under the playhead) keyed with the Keyer set to
+    // their screen's colour, read from the picture. How many.
+    int keyOutScreen();
     void exportForReviewDialog();
     bool addToColorGroup(Id group);
     bool removeFromColorGroup();

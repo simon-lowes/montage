@@ -894,6 +894,7 @@ void MainWindow::buildMenus() {
     add(clipM, tr("Auto &Colour"), QKeySequence("Ctrl+Alt+C"), [this] { autoColor(); });
     add(clipM, tr("Set Colour &Reference"), QKeySequence(), [this] { setColourReference(); })
         ->setObjectName(QStringLiteral("setColourReference"));
+    add(clipM, tr("&Key Out Green / Blue Screen"), QKeySequence(), [this] { keyOutScreen(); })->setObjectName(QStringLiteral("keyScreen"));
     add(clipM, tr("Match Colour to Reference"), QKeySequence("Ctrl+Alt+Shift+C"), [this] { matchColour(); })
         ->setObjectName(QStringLiteral("matchColour"));
     compareRef_ = add(clipM, tr("Compare with Reference"), QKeySequence(), [this] { setCompareWithReference(compareRef_->isChecked()); });
@@ -3033,6 +3034,25 @@ void MainWindow::setCompareWithReference(bool on) {
     if (!programPanel_) return;
     if (on) programPanel_->viewer()->setCompare(colourRefView_, tr("Reference: %1").arg(colourRefName_));
     else programPanel_->viewer()->clearCompare();
+}
+
+int MainWindow::keyOutScreen() {
+    if (!state_->sequence()) return 0;
+    std::vector<Id> clips(state_->selectedClips().begin(), state_->selectedClips().end());
+    if (clips.empty())
+        if (const Clip* c = clipForCommand()) clips.push_back(c->id);
+    const FrameTime at = state_->playhead();
+    int n = 0;
+    std::string err;
+    state_->edit(tr("Key Out Screen"), [&](Project& p, Sequence& sq) {
+        for (Id id : clips)
+            if (const auto loc = edit::locate(sq, id); loc && loc->track.kind == TrackKind::Video && keyScreen(p, sq, id, at, &err)) ++n;
+        return n > 0;
+    });
+    state_->message(n ? tr("Keyed %n clip(s): fine-tune the Keyer in the Inspector (View: Matte or Status shows the matte)", "", n)
+                      : (err.empty() ? tr("Select a green or blue screen clip") : QString::fromStdString(err)),
+                    6000);
+    return n;
 }
 
 int MainWindow::matchColour() {
