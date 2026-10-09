@@ -255,6 +255,25 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
             return true;
         }
     }
+    // A CinemaDNG run: numbered camera RAW frames, played as a video at the run's rate.
+    if (ImageSequence seq; rawAvailable() && parseImageSequencePath(file, seq) && isRawPath(seq.pattern)) {
+        RawInfo ri;
+        if (!probeRaw(imageSequenceFrame(seq, seq.first), ri, error)) return false;
+        MediaItem m = out;
+        m.path = path;
+        if (m.name.empty()) m.name = imageSequenceName(seq);
+        m.kind = MediaKind::Video;
+        m.hasVideo = true;
+        m.hasAudio = false;
+        m.width = ri.width;
+        m.height = ri.height;
+        m.fps = seq.fps;
+        m.duration = seq.frames() / seq.fps.toDouble();
+        m.videoCodec = "dng";
+        if (!ri.camera.empty() && !m.metadata.count("camera")) m.metadata["camera"] = ri.camera;
+        out = m;
+        return true;
+    }
     if (rawAvailable() && isRawPath(file)) {
         RawInfo ri;
         if (!probeRaw(file, ri, error)) return false;
@@ -418,6 +437,8 @@ void VideoDecoder::close() {
     stillFrame_.reset();
     vector_.reset();
     if (raw_) av_frame_free(&raw_);
+    rawSequence_.reset();
+    rawFrame_ = -1;
 }
 
 bool VideoDecoder::open(const std::string& path, std::string* error) {
@@ -476,25 +497,33 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
             return true;
         }
     }
+    rawSettings_ = RawSettings{in.rawExposure, in.rawTemperature, in.rawTint,
+                               in.rawHighlights == "blend" ? 1 : in.rawHighlights == "rebuild" ? 2 : 0, in.rawHalf};
+    // A CinemaDNG run (numbered camera RAW frames): each frame developed when it is shown.
+    if (ImageSequence seq; rawAvailable() && parseImageSequencePath(uninterpretedPath(path), seq) && isRawPath(seq.pattern)) {
+        RawInfo info;
+        if (!probeRaw(imageSequenceFrame(seq, seq.first), info, error)) return false;
+        rawSequence_ = std::make_unique<ImageSequence>(seq);
+        rawFrame_ = -1;
+        dispW_ = info.width;
+        dispH_ = info.height;
+        fps_ = seq.fps.toDouble();
+        duration_ = seq.frames() / fps_;
+        still_ = false;
+        rotation_ = 0;
+        origin_ = 0;
+        curPts_ = nextPts_ = -1;
+        return true;
+    }
     if (rawAvailable() && isRawPath(uninterpretedPath(path))) {
         RawImage img;
-        if (!developRaw(uninterpretedPath(path), img, error)) return false;
-        raw_ = av_frame_alloc();
-        if (!raw_) return false;
-        raw_->format = AV_PIX_FMT_RGB48;  // host byte order, as LibRaw writes it
-        raw_->width = img.width;
-        raw_->height = img.height;
-        raw_->color_range = AVCOL_RANGE_JPEG;
-        if (av_frame_get_buffer(raw_, 0) < 0) {
-            if (error) *error = "Out of memory developing " + path;
+        if (!developRaw(uninterpretedPath(path), img, error, rawSettings_) || !loadRaw(img, error)) {
             close();
             return false;
         }
-        for (int y = 0; y < img.height; ++y)
-            std::memcpy(raw_->data[0] + size_t(y) * size_t(raw_->linesize[0]), img.rgb.data() + size_t(y) * size_t(img.width) * 3,
-                        size_t(img.width) * 3 * sizeof(uint16_t));
-        dispW_ = img.width;
-        dispH_ = img.height;
+        // A half-size decode is shown at the full size.
+        dispW_ = rawSettings_.half ? img.width * 2 : img.width;
+        dispH_ = rawSettings_.half ? img.height * 2 : img.height;
         fps_ = 25.0;
         duration_ = 0;
         still_ = true;
@@ -824,7 +853,46 @@ Frame16Ptr VideoDecoder::convert(const AVFrame* in, double pts, int w, int h, bo
     return out;
 }
 
+bool VideoDecoder::loadRaw(const RawImage& img, std::string* error) {
+    if (!raw_ || raw_->width != img.width || raw_->height != img.height) {
+        if (raw_) av_frame_free(&raw_);
+        raw_ = av_frame_alloc();
+        if (!raw_) return false;
+        raw_->format = AV_PIX_FMT_RGB48;  // host byte order, as LibRaw writes it
+        raw_->width = img.width;
+        raw_->height = img.height;
+        raw_->color_range = AVCOL_RANGE_JPEG;
+        if (av_frame_get_buffer(raw_, 0) < 0) {
+            if (error) *error = "Out of memory developing " + path_;
+            av_frame_free(&raw_);
+            return false;
+        }
+    }
+    for (int y = 0; y < img.height; ++y)
+        std::memcpy(raw_->data[0] + size_t(y) * size_t(raw_->linesize[0]), img.rgb.data() + size_t(y) * size_t(img.width) * 3,
+                    size_t(img.width) * 3 * sizeof(uint16_t));
+    return true;
+}
+
 Frame16Ptr VideoDecoder::frameAt(double t, int targetW, int targetH, bool highQuality) {
+    if (rawSequence_) {
+        // The frame of the run shown at `t`, developed once and kept while it is asked for again.
+        const ImageSequence& seq = *rawSequence_;
+        const int n = seq.first + std::clamp(int(std::floor(std::max(0.0, t) * fps_ + 1e-6)), 0, seq.frames() - 1);
+        if (targetW <= 0) targetW = dispW_;
+        if (targetH <= 0) targetH = dispH_;
+        if (n != rawFrame_) {
+            RawImage img;
+            std::string err;
+            if (!developRaw(imageSequenceFrame(seq, n), img, &err, rawSettings_) || !loadRaw(img, &err)) return nullptr;
+            rawFrame_ = n;
+            stillFrame_.reset();
+        }
+        if (!stillFrame_ || stillFrame_->width != targetW || stillFrame_->height != targetH)
+            stillFrame_ = convert(raw_, double(n - seq.first) / fps_, targetW, targetH, true);
+        curPts_ = double(n - seq.first) / fps_;
+        return stillFrame_;
+    }
     if (vector_) {
         Frame16Ptr f = renderVector(*vector_, t, targetW, targetH);
         if (f) curPts_ = f->pts;

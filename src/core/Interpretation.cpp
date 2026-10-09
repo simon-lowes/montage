@@ -28,6 +28,8 @@ bool validFieldOrder(const std::string& fields) {
     return fields.empty() || fields == "progressive" || fields == "upper" || fields == "lower";
 }
 
+bool validRawHighlights(const std::string& mode) { return mode.empty() || mode == "clip" || mode == "blend" || mode == "rebuild"; }
+
 bool parseInterpretation(const std::string& path, Interpretation& out) {
     out = {};
     const size_t mark = path.find(kMark);
@@ -44,6 +46,11 @@ bool parseInterpretation(const std::string& path, Interpretation& out) {
         else if (key == "alpha" && validAlphaMode(value)) out.alpha = value == "straight" ? "" : value;
         else if (key == "fields" && validFieldOrder(value)) out.fields = value;
         else if (key == "pitch") out.keepPitch = value == "1";
+        else if (key == "rawexp") out.rawExposure = std::atof(value.c_str());
+        else if (key == "rawtemp") out.rawTemperature = std::max(0.0, std::atof(value.c_str()));
+        else if (key == "rawtint") out.rawTint = std::atof(value.c_str());
+        else if (key == "rawhl" && validRawHighlights(value)) out.rawHighlights = value == "clip" ? "" : value;
+        else if (key == "rawhalf") out.rawHalf = value == "1";
     }
     if (!out.conformed()) out.fps = out.fileFps = Rational{0, 1};
     return !out.empty();
@@ -71,6 +78,16 @@ std::string interpretedPath(const std::string& path, const Interpretation& i) {
     }
     if (!i.alpha.empty() && i.alpha != "straight") add("alpha=" + i.alpha);
     if (!i.fields.empty()) add("fields=" + i.fields);
+    auto number = [](double v) {
+        char buf[32];
+        std::snprintf(buf, sizeof buf, "%.6g", v);
+        return std::string(buf);
+    };
+    if (i.rawExposure != 0) add("rawexp=" + number(i.rawExposure));
+    if (i.rawTemperature > 0) add("rawtemp=" + number(i.rawTemperature));
+    if (i.rawTint != 0) add("rawtint=" + number(i.rawTint));
+    if (!i.rawHighlights.empty() && i.rawHighlights != "clip") add("rawhl=" + i.rawHighlights);
+    if (i.rawHalf) add("rawhalf=1");
     return items.empty() ? out : out + kMark + items;
 }
 

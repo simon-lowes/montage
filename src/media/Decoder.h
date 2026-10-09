@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "CameraRaw.h"
 #include "Image.h"
 #include "core/Model.h"
 
@@ -28,6 +29,8 @@ bool readEmbeddedCaptions(const std::string& path, Rational fps, std::vector<Cap
                           const std::function<void(double)>& progress = {}, const std::atomic<bool>* cancel = nullptr,
                           std::string* error = nullptr);
 
+struct ImageSequence;
+
 // Frame-accurate video decoder. Not thread safe: use one per thread
 // (MediaPool hands them out).
 class VectorDocument;
@@ -41,7 +44,7 @@ public:
 
     bool open(const std::string& path, std::string* error = nullptr);
     void close();
-    bool isOpen() const { return ctx_ != nullptr || vector_ != nullptr || raw_ != nullptr; }
+    bool isOpen() const { return ctx_ != nullptr || vector_ != nullptr || raw_ != nullptr || rawSequence_ != nullptr; }
 
     // Frame displayed at media time `t` (seconds from the start of the file; of the conformed file when the path carries
     // an interpretation, core/Interpretation.h), converted to RGBA16 at exactly targetW x targetH (0 = native display size).
@@ -101,7 +104,11 @@ private:
     double par_ = 0;
     std::string alpha_, fields_;
     std::shared_ptr<VectorDocument> vector_;  // a Lottie animation or SVG, rendered instead of decoded
-    AVFrame* raw_ = nullptr;                  // a camera raw still, developed once (RGB48)
+    AVFrame* raw_ = nullptr;                  // a camera raw still, developed once (RGB48), or a CinemaDNG run's current frame
+    std::unique_ptr<ImageSequence> rawSequence_;  // a run of camera raw frames (media/ImageSequence.h)
+    int rawFrame_ = -1;                       // the run's frame in raw_
+    RawSettings rawSettings_;                 // how raw pictures are developed (Interpret Footage)
+    bool loadRaw(const RawImage& img, std::string* error);
 };
 
 struct AudioBuffer {

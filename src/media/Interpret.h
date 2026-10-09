@@ -10,6 +10,8 @@ namespace montage {
 
 // The file's own frame rate, however `m` is read now (0 for a still).
 Rational fileFrameRate(const MediaItem& m);
+// A camera RAW still or a run of RAW frames (CinemaDNG), which take Camera RAW settings.
+bool isRawMedia(const MediaItem& m);
 
 namespace edit {
 

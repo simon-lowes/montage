@@ -35,6 +35,14 @@ private:
     QDoubleSpinBox* par_ = nullptr;
     QComboBox* alpha_ = nullptr;
     QComboBox* fields_ = nullptr;
+    // Camera RAW (stills and CinemaDNG).
+    QDoubleSpinBox* exposure_ = nullptr;
+    QComboBox* whiteBalance_ = nullptr;
+    QDoubleSpinBox* temperature_ = nullptr;
+    QDoubleSpinBox* tint_ = nullptr;
+    QComboBox* highlights_ = nullptr;
+    QCheckBox* half_ = nullptr;
+    bool raw_ = false;  // the settings apply (camera RAW media)
 };
 
 }  // namespace montage

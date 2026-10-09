@@ -1810,6 +1810,121 @@ private slots:
         QVERIFY(r.value("isError").toBool());
     }
 
+    void cameraRawSettingsAndCinemaDng() {
+        if (!rawAvailable()) QSKIP("Built without LibRaw");
+        // A grey card under daylight (the test camera sees linear sRGB, white balanced as shot).
+        const std::string still = path("card.dng");
+        QVERIFY(writeTestDng(still, 64, 48, [](int, int) { return std::array<double, 3>{0.25, 0.25, 0.25}; }));
+        auto decode = [&](const Interpretation& i) {
+            Frame16Ptr f = MediaPool::instance().videoFrame(interpretedPath(still, i), 0, 0, 0);
+            if (!f) return std::array<float, 3>{-1, -1, -1};
+            const Image img = toImage(*f);
+            return std::array<float, 3>{img.at(32, 24)[0], img.at(32, 24)[1], img.at(32, 24)[2]};
+        };
+        auto show = [](std::array<float, 3> c) { return QString("%1 %2 %3").arg(c[0]).arg(c[1]).arg(c[2]); };
+        const auto base = decode({});
+        QVERIFY2(base[1] > 0.2 && std::fabs(base[0] - base[2]) < 0.03, qPrintable(show(base)));
+        // Exposure in stops.
+        Interpretation brighter, darker;
+        brighter.rawExposure = 1;
+        darker.rawExposure = -1;
+        QVERIFY2(decode(brighter)[1] > base[1] * 1.2, qPrintable(show(base) + " / " + show(decode(brighter))));
+        QVERIFY2(decode(darker)[1] < base[1] * 0.85, qPrintable(show(decode(darker))));
+        // Beyond the -2 to +3 stops LibRaw shifts by itself.
+        Interpretation down2, down4;
+        down2.rawExposure = -2;
+        down4.rawExposure = -4;
+        const float g2 = decode(down2)[1], g4 = decode(down4)[1];
+        QVERIFY2(g4 > 0 && g4 < g2 * 0.7, qPrintable(QString("%1 %2").arg(g2).arg(g4)));
+        // White balance by the light's temperature: tungsten light corrected makes the daylit card blue, shade warm.
+        float mul[3];
+        const float srgbFromXyz[3][3] = {{3.2406f, -1.5372f, -0.4986f}, {-0.9689f, 1.8758f, 0.0415f}, {0.0557f, -0.2040f, 1.0570f}};
+        QVERIFY(whiteBalanceMultipliers(srgbFromXyz, 6504, 0, mul));
+        QVERIFY2(std::fabs(mul[0] - 1) < 0.08 && std::fabs(mul[2] - 1) < 0.08, qPrintable(QString("%1 %2").arg(mul[0]).arg(mul[2])));
+        QVERIFY(whiteBalanceMultipliers(srgbFromXyz, 3000, 0, mul) && mul[2] > 1.5 && mul[0] < 0.9);
+        Interpretation tungsten, shade, daylight, magenta;
+        tungsten.rawTemperature = 3000;
+        shade.rawTemperature = 9000;
+        daylight.rawTemperature = 6504;
+        magenta.rawTint = 60;
+        const auto t = decode(tungsten), sh = decode(shade), d = decode(daylight), mg = decode(magenta);
+        QVERIFY2(t[2] > t[0] * 1.2, qPrintable(show(t)));
+        QVERIFY2(sh[0] > sh[2] * 1.05, qPrintable(show(sh)));
+        QVERIFY2(std::fabs(d[0] - d[2]) < 0.06, qPrintable(show(d)));
+        QVERIFY2(mg[1] < (mg[0] + mg[2]) / 2 - 0.01, qPrintable(show(mg)));
+        // Half-size decode: shown at the full size.
+        Interpretation half;
+        half.rawHalf = true;
+        Frame16Ptr hf = MediaPool::instance().videoFrame(interpretedPath(still, half), 0, 0, 0);
+        QVERIFY(hf && hf->width == 64 && hf->height == 48);
+        // As Interpret Footage on the media item; refused for anything but camera RAW.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64, s.height = 48, s.fps = Rational{24, 1};
+        MediaItem card = probeOrFail(p, still);
+        p.media.push_back(card);
+        QVERIFY(isRawMedia(card));
+        QVERIFY(edit::interpretFootage(p, card.id, brighter).ok);
+        QCOMPARE(interpretationOf(*p.findMedia(card.id)).rawExposure, 1.0);
+        QImage png(8, 8, QImage::Format_RGB32);
+        png.fill(Qt::gray);
+        QVERIFY(png.save(QString::fromStdString(path("plain.png"))));
+        MediaItem plain = probeOrFail(p, path("plain.png"));
+        p.media.push_back(plain);
+        const edit::Result refused = edit::interpretFootage(p, plain.id, brighter);
+        QVERIFY(!refused.ok && refused.error.find("RAW") != std::string::npos);
+        Interpretation tooFar;
+        tooFar.rawExposure = 9;
+        QVERIFY(!edit::interpretFootage(p, card.id, tooFar).ok);
+
+        // CinemaDNG: six numbered frames, each brighter than the last, played as a video at 24 fps.
+        const QString dir = QString::fromStdString(path("cdng"));
+        QDir().mkpath(dir);
+        for (int k = 1; k <= 6; ++k) {
+            const double level = 0.1 * k;
+            QVERIFY(writeTestDng((dir + QStringLiteral("/A001_C002_%1.dng").arg(k, 6, 10, QLatin1Char('0'))).toStdString(), 64, 48,
+                                 [level](int, int) { return std::array<double, 3>{level, level, level}; }));
+        }
+        ImageSequence run;
+        QVERIFY(detectImageSequence((dir + "/A001_C002_000003.dng").toStdString(), run));
+        QVERIFY(run.first == 1 && run.last == 6);
+        run.fps = Rational{24, 1};
+        MediaItem clip = probeOrFail(p, imageSequencePath(run));
+        QCOMPARE(clip.kind, MediaKind::Video);
+        QCOMPARE(clip.videoCodec, std::string("dng"));
+        QCOMPARE(clip.width, 64);
+        QVERIFY(std::fabs(clip.duration - 0.25) < 1e-9);
+        QVERIFY(isRawMedia(clip));
+        p.media.push_back(clip);
+        QVERIFY(edit::placeMedia(p, s, clip.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QCOMPARE(s.videoTracks[0].clips.at(0).duration, FrameTime(6));
+        RenderOptions o;
+        auto green = [&](FrameTime f) { return renderSequenceFrame(p, s, f, o).at(32, 24)[1]; };
+        const float f1 = green(1), f4 = green(4);
+        QVERIFY2(f4 > f1 + 0.1, qPrintable(QString("%1 %2").arg(f1).arg(f4)));
+        QVERIFY(green(2) > f1 && green(5) > f4);
+        // Its exposure, like a still's.
+        QVERIFY(edit::interpretFootage(p, clip.id, brighter).ok);
+        QVERIFY2(green(1) > f1 * 1.15, qPrintable(QString("%1 %2").arg(f1).arg(green(1))));
+
+        // Over MCP.
+        Project mp = makeDefaultProject();
+        mp.media.push_back(probeOrFail(mp, still));
+        const QString project = QString::fromStdString(path("raw-mcp.montage"));
+        QVERIFY(saveProject(mp, project.toStdString()));
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_interpret_media"},
+                                                     {"arguments", QJsonObject{{"project", project}, {"media", "card.dng"}, {"raw_exposure", 0.5},
+                                                                               {"raw_temperature", 3200}, {"raw_highlights", "blend"}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject how = r.value("structuredContent").toObject().value("media").toArray().at(0).toObject().value("interpretation").toObject();
+        QVERIFY2(how.value("raw_exposure").toDouble() == 0.5 && how.value("raw_temperature").toDouble() == 3200 && how.value("raw_highlights") == "blend",
+                 QJsonDocument(how).toJson().constData());
+    }
+
     void extendClipPastItsEnd() {
         // A pan: a textured ground sliding left 4 px a frame for a second, over a steady room.
         const int frames = 25;

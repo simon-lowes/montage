@@ -28,6 +28,17 @@ struct RawImage {
     int width = 0, height = 0;
     std::vector<uint16_t> rgb;
 };
-bool developRaw(const std::string& path, RawImage& out, std::string* error = nullptr);
+// How it is developed (Interpret Footage's Camera RAW settings).
+struct RawSettings {
+    double exposure = 0;     // stops, -5 to +5
+    double temperature = 0;  // the light's colour temperature in kelvin (2000 to 25000); 0 = the camera's white balance
+    double tint = 0;         // + towards magenta, - towards green (-150 to 150)
+    int highlights = 0;      // 0 clipped, 1 blended, 2 rebuilt
+    bool half = false;       // half size: each 2x2 block of the sensor one pixel (quick, for playback)
+};
+bool developRaw(const std::string& path, RawImage& out, std::string* error = nullptr, const RawSettings& settings = {});
+// The white balance multipliers (red, green, blue, green = 1) that make light of `kelvin` with `tint` neutral for a camera
+// whose XYZ-to-camera matrix is `camFromXyz` (rows red, green, blue). False if the matrix is empty.
+bool whiteBalanceMultipliers(const float camFromXyz[3][3], double kelvin, double tint, float out[3]);
 
 }  // namespace montage

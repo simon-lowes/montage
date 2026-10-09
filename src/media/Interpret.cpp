@@ -4,6 +4,7 @@
 #include <cmath>
 #include <memory>
 
+#include "CameraRaw.h"
 #include "Decoder.h"
 #include "ImageSequence.h"
 
@@ -13,6 +14,12 @@ Rational fileFrameRate(const MediaItem& m) {
     if (m.kind != MediaKind::Video) return Rational{0, 1};
     const Interpretation now = interpretationOf(m);
     return now.conformed() ? now.fileFps : m.fps;
+}
+
+bool isRawMedia(const MediaItem& m) {
+    const std::string file = uninterpretedPath(m.path);
+    if (ImageSequence seq; parseImageSequencePath(file, seq)) return isRawPath(seq.pattern);
+    return isRawPath(file);
 }
 
 namespace edit {
@@ -44,6 +51,12 @@ Result interpretFootage(Project& p, Id media, Interpretation i) {
     if (!validAlphaMode(i.alpha)) return Result::fail("Alpha is straight, premultiplied, ignore or invert");
     if (!validFieldOrder(i.fields)) return Result::fail("Fields are progressive, upper or lower");
     if (i.alpha == "straight") i.alpha.clear();
+    if (!validRawHighlights(i.rawHighlights)) return Result::fail("Highlights are clip, blend or rebuild");
+    if (i.rawHighlights == "clip") i.rawHighlights.clear();
+    if (i.hasRaw() && !isRawMedia(*m)) return Result::fail("Camera RAW settings are for camera RAW stills and CinemaDNG");
+    if (i.rawExposure < -5 || i.rawExposure > 5) return Result::fail("Exposure must be -5 to +5 stops");
+    if (i.rawTemperature != 0 && (i.rawTemperature < 2000 || i.rawTemperature > 25000)) return Result::fail("The temperature must be 2000 to 25000 K");
+    if (i.rawTint < -150 || i.rawTint > 150) return Result::fail("The tint must be -150 to 150");
     const bool still = m->kind == MediaKind::Image;
     if (still) i.fps = Rational{0, 1}, i.fields.clear(), i.keepPitch = false;
     // An image sequence's rate is part of its own path.

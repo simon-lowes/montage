@@ -283,6 +283,11 @@ QJsonObject interpretationJson(const MediaItem& m) {
     if (i.par > 0) o["pixel_aspect"] = i.par;
     if (!i.alpha.empty()) o["alpha"] = QString::fromStdString(i.alpha);
     if (!i.fields.empty()) o["field_order"] = QString::fromStdString(i.fields);
+    if (i.rawExposure != 0) o["raw_exposure"] = i.rawExposure;
+    if (i.rawTemperature > 0) o["raw_temperature"] = i.rawTemperature;
+    if (i.rawTint != 0) o["raw_tint"] = i.rawTint;
+    if (!i.rawHighlights.empty()) o["raw_highlights"] = QString::fromStdString(i.rawHighlights);
+    if (i.rawHalf) o["raw_half"] = true;
     return o;
 }
 
@@ -3828,6 +3833,11 @@ void McpServer::Impl::addTools() {
             "alpha":{"type":"string","enum":["file","straight","premultiplied","ignore","invert"]},
             "field_order":{"type":"string","enum":["file","progressive","upper","lower"]},
             "keep_pitch":{"type":"boolean","description":"A conformed sound keeps its pitch"},
+            "raw_exposure":{"type":"number","description":"Camera RAW and CinemaDNG: exposure in stops (-5 to 5)"},
+            "raw_temperature":{"type":["number","string"],"description":"Camera RAW: the light's colour temperature in kelvin (2000 to 25000), or \"as_shot\""},
+            "raw_tint":{"type":"number","description":"Camera RAW: tint, + magenta, - green (-150 to 150)"},
+            "raw_highlights":{"type":"string","enum":["clip","blend","rebuild"]},
+            "raw_half":{"type":"boolean","description":"Camera RAW: decode at half size for speed"},
             "reset":{"type":"boolean","description":"Read the files as they are"}},"required":["project","media"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
@@ -3857,6 +3867,12 @@ void McpServer::Impl::addTools() {
                 if (a.contains("alpha")) i.alpha = str(a, "alpha") == "file" ? "" : str(a, "alpha").toStdString();
                 if (a.contains("field_order")) i.fields = str(a, "field_order") == "file" ? "" : str(a, "field_order").toStdString();
                 if (a.contains("keep_pitch")) i.keepPitch = a.value("keep_pitch").toBool();
+                if (a.contains("raw_exposure")) i.rawExposure = a.value("raw_exposure").toDouble();
+                if (a.contains("raw_temperature"))
+                    i.rawTemperature = a.value("raw_temperature").isString() ? 0.0 : a.value("raw_temperature").toDouble();
+                if (a.contains("raw_tint")) i.rawTint = a.value("raw_tint").toDouble();
+                if (a.contains("raw_highlights")) i.rawHighlights = str(a, "raw_highlights") == "clip" ? "" : str(a, "raw_highlights").toStdString();
+                if (a.contains("raw_half")) i.rawHalf = a.value("raw_half").toBool();
                 const edit::Result r = edit::interpretFootage(l.project, m->id, i);
                 if (!r.ok && !r.error.empty()) throw ArgError{QStringLiteral("%1: %2").arg(QString::fromStdString(m->name), QString::fromStdString(r.error))};
                 changed += r.ok;

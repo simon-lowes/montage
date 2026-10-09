@@ -156,6 +156,68 @@ InterpretFootageDialog::InterpretFootageDialog(const MediaItem& first, int count
     form->addRow(tr("Field order:"), fields_);
     lay->addLayout(form);
 
+    // Camera RAW: how the sensor data is developed.
+    auto* rawBox = new QGroupBox(tr("Camera RAW"), this);
+    rawBox->setObjectName(QStringLiteral("interpretRawBox"));
+    auto* rawForm = new QFormLayout(rawBox);
+    exposure_ = new QDoubleSpinBox(rawBox);
+    exposure_->setObjectName(QStringLiteral("interpretRawExposure"));
+    exposure_->setRange(-5, 5);
+    exposure_->setSingleStep(0.1);
+    exposure_->setDecimals(2);
+    exposure_->setSuffix(tr(" stops"));
+    exposure_->setValue(now.rawExposure);
+    whiteBalance_ = new QComboBox(rawBox);
+    whiteBalance_->setObjectName(QStringLiteral("interpretRawWhiteBalance"));
+    whiteBalance_->addItem(tr("As Shot"), 0.0);
+    whiteBalance_->addItem(tr("Tungsten (3200 K)"), 3200.0);
+    whiteBalance_->addItem(tr("Fluorescent (4000 K)"), 4000.0);
+    whiteBalance_->addItem(tr("Daylight (5500 K)"), 5500.0);
+    whiteBalance_->addItem(tr("Cloudy (6500 K)"), 6500.0);
+    whiteBalance_->addItem(tr("Shade (7500 K)"), 7500.0);
+    whiteBalance_->addItem(tr("Custom"), -1.0);
+    temperature_ = new QDoubleSpinBox(rawBox);
+    temperature_->setObjectName(QStringLiteral("interpretRawTemperature"));
+    temperature_->setRange(2000, 25000);
+    temperature_->setSingleStep(50);
+    temperature_->setDecimals(0);
+    temperature_->setSuffix(tr(" K"));
+    temperature_->setValue(now.rawTemperature > 0 ? now.rawTemperature : 5500);
+    tint_ = new QDoubleSpinBox(rawBox);
+    tint_->setObjectName(QStringLiteral("interpretRawTint"));
+    tint_->setRange(-150, 150);
+    tint_->setDecimals(0);
+    tint_->setValue(now.rawTint);
+    int wb = now.rawTemperature > 0 ? whiteBalance_->count() - 1 : 0;
+    for (int k = 1; k + 1 < whiteBalance_->count() && now.rawTemperature > 0; ++k)
+        if (std::fabs(whiteBalance_->itemData(k).toDouble() - now.rawTemperature) < 0.5) wb = k;
+    whiteBalance_->setCurrentIndex(wb);
+    auto syncWb = [this] {
+        const double v = whiteBalance_->currentData().toDouble();
+        if (v > 0) temperature_->setValue(v);
+        temperature_->setEnabled(v != 0);
+    };
+    connect(whiteBalance_, qOverload<int>(&QComboBox::currentIndexChanged), this, syncWb);
+    syncWb();
+    highlights_ = new QComboBox(rawBox);
+    highlights_->setObjectName(QStringLiteral("interpretRawHighlights"));
+    highlights_->addItem(tr("Clip"), QString());
+    highlights_->addItem(tr("Blend"), QStringLiteral("blend"));
+    highlights_->addItem(tr("Rebuild"), QStringLiteral("rebuild"));
+    highlights_->setCurrentIndex(std::max(0, highlights_->findData(QString::fromStdString(now.rawHighlights))));
+    half_ = new QCheckBox(tr("Decode at half size (faster playback)"), rawBox);
+    half_->setObjectName(QStringLiteral("interpretRawHalf"));
+    half_->setChecked(now.rawHalf);
+    rawForm->addRow(tr("Exposure:"), exposure_);
+    rawForm->addRow(tr("White balance:"), whiteBalance_);
+    rawForm->addRow(tr("Temperature:"), temperature_);
+    rawForm->addRow(tr("Tint:"), tint_);
+    rawForm->addRow(tr("Highlights:"), highlights_);
+    rawForm->addRow(QString(), half_);
+    raw_ = isRawMedia(first);
+    rawBox->setVisible(raw_);
+    lay->addWidget(rawBox);
+
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
     connect(buttons, &QDialogButtonBox::accepted, this, &QDialog::accept);
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
@@ -173,6 +235,13 @@ Interpretation InterpretFootageDialog::interpretation() const {
     if (conformPar_->isChecked()) i.par = par_->value();
     i.alpha = alpha_->currentData().toString().toStdString();
     i.fields = fields_->currentData().toString().toStdString();
+    if (raw_) {
+        i.rawExposure = exposure_->value();
+        i.rawTemperature = whiteBalance_->currentData().toDouble() == 0 ? 0 : temperature_->value();
+        i.rawTint = tint_->value();
+        i.rawHighlights = highlights_->currentData().toString().toStdString();
+        i.rawHalf = half_->isChecked();
+    }
     return i;
 }
 

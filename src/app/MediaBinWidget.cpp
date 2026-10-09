@@ -460,6 +460,7 @@ bool MediaBinWidget::interpretFootage(const std::vector<Id>& media, const Interp
             if (!m) continue;
             Interpretation i = how;
             if (m->kind == MediaKind::Image) i.fps = Rational{0, 1};
+            if (!isRawMedia(*m)) i.rawExposure = 0, i.rawTemperature = 0, i.rawTint = 0, i.rawHighlights.clear(), i.rawHalf = false;
             const edit::Result r = edit::interpretFootage(p, id, i);
             if (!r.ok && !r.error.empty()) return edit::Result::fail(m->name + ": " + r.error);
             if (r.ok) out = {};
