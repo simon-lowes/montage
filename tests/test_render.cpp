@@ -22,6 +22,7 @@
 #include "render/Processing.h"
 #include "render/QualityCheck.h"
 #include "render/LutExport.h"
+#include "render/LightLevel.h"
 #include "render/Relight.h"
 #include "render/Deconvolve.h"
 #include "render/FilmLook.h"
@@ -3199,6 +3200,95 @@ colorspaces:
             Effect t = makeEffect(p, id);
             QVERIFY2(ink(renderGenerator(t, 60, 640, 360, 1.0, 90, 30), 0, 640) > 50, id);
         }
+    }
+
+    void hdrLightLevels() {
+        const ColorSpace& sdr = *findColorSpace("rec709");
+        const ColorSpace& pq = *findColorSpace("rec2100pq");
+        const ColorSpace& hlg = *findColorSpace("rec2100hlg");
+        // Code values and nits: PQ reference white 203 and the 1000-nit level; HLG 75 % is 203 on a 1000-nit display;
+        // SDR white is 100; camera log and linear light have none.
+        QVERIFY(std::fabs(codeToNits(pq, 0.5807) - 203) < 1);
+        QVERIFY(std::fabs(nitsToCode(pq, 1000) - 0.7518) < 0.001);
+        QVERIFY(std::fabs(codeToNits(hlg, 0.75) - 203) < 2);
+        QVERIFY(std::fabs(codeToNits(hlg, 1.0) - 1000) < 0.5);
+        QVERIFY(std::fabs(codeToNits(sdr, 1.0) - 100) < 1e-6);
+        QVERIFY(codeToNits(*findColorSpace("slog3-sgamut3cine"), 0.5) < 0);
+        for (const ColorSpace* cs : {&sdr, &pq, &hlg})
+            for (double n : {1.0, 50.0, 100.0})
+                QVERIFY2(std::fabs(codeToNits(*cs, nitsToCode(*cs, n)) - n) < 0.01 * n, cs->id.c_str());
+        // A pixel's brightest channel: HLG's OOTF dims a saturated red against a neutral of the same code.
+        const float pqHot[3] = {float(nitsToCode(pq, 1000)), 0.1f, 0.1f};
+        QVERIFY(std::fabs(pixelMaxNits(pq, pqHot) - 1000) < 1);
+        const float hlgRed[3] = {1, 0, 0}, hlgWhite[3] = {1, 1, 1};
+        QVERIFY(std::fabs(pixelMaxNits(hlg, hlgWhite) - 1000) < 0.5);
+        QVERIFY(std::fabs(pixelMaxNits(hlg, hlgRed) - 1000 * std::pow(0.2627, 0.2)) < 1);
+
+        // A frame: a quarter at 1000 nits, the rest at 100.
+        Image img(20, 20);
+        for (int y = 0; y < 20; ++y)
+            for (int x = 0; x < 20; ++x) {
+                const float v = float(nitsToCode(pq, x < 10 && y < 10 ? 1000 : 100));
+                float* px = img.at(x, y);
+                px[0] = px[1] = px[2] = v, px[3] = 1;
+            }
+        const LightMeter meter(pq);
+        QVERIFY(meter.valid());
+        QVERIFY(!LightMeter(*findColorSpace("linear-rec709")).valid());
+        double peak = 0, average = 0;
+        meter.measure(img, peak, average);
+        QVERIFY2(std::fabs(peak - 1000) < 2 && std::fabs(average - 325) < 1, qPrintable(QString("%1 %2").arg(peak).arg(average)));
+        // The same light measured in HLG (the codes that give it there).
+        Image h(20, 20);
+        for (int y = 0; y < 20; ++y)
+            for (int x = 0; x < 20; ++x) {
+                const float v = float(nitsToCode(hlg, x < 10 && y < 10 ? 1000 : 100));
+                float* px = h.at(x, y);
+                px[0] = px[1] = px[2] = v, px[3] = 1;
+            }
+        LightMeter(hlg).measure(h, peak, average);
+        QVERIFY2(std::fabs(peak - 1000) < 2 && std::fabs(average - 325) < 1.5, qPrintable(QString("%1 %2").arg(peak).arg(average)));
+
+        // A sequence: mid grey for five frames, then a white title on black (brighter, but less light on average).
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 160, s.height = 90, s.fps = {25, 1};
+        s.colorSpace = "rec2100pq";
+        Clip grey = makeGeneratorClip(p, "color", 5);
+        for (const char* c : {"color.r", "color.g", "color.b"}) grey.generator.params[c] = 0.5;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, grey).ok);
+        Clip black = makeGeneratorClip(p, "color", 5);
+        for (const char* c : {"color.r", "color.g", "color.b"}) black.generator.params[c] = 0.0;
+        black.start = 5;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, black).ok);
+        Clip title = makeGeneratorClip(p, "title", 5);
+        title.generator.strings["text"] = "HDR";
+        title.generator.params["size"] = 40.0;
+        title.generator.params["shadow"] = 0.0;
+        title.start = 5;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 1}, title).ok);
+        LightLevels l;
+        std::string err;
+        QVERIFY2(measureLightLevels(p, s, 0, 0, l, &err), err.c_str());
+        QCOMPARE(l.frames, int64_t(10));
+        const double greyNits = 203 * std::pow(0.5, 2.4);  // Rec.709 mid grey placed in HDR
+        QVERIFY2(std::fabs(l.maxCll - 203) < 3, qPrintable(QString::number(l.maxCll)));
+        QCOMPARE(l.maxCllFrame, FrameTime(5));
+        QVERIFY2(std::fabs(l.maxFall - greyNits) < 1, qPrintable(QString::number(l.maxFall)));
+        QCOMPARE(l.maxFallFrame, FrameTime(0));
+        // Part of it, and in HDR10's terms.
+        QVERIFY(measureLightLevels(p, s, 5, 10, l, &err, 0.5));
+        QCOMPARE(l.frames, int64_t(5));
+        QVERIFY(l.maxFall < greyNits);
+        unsigned cll = 0, fall = 0;
+        hdr10LightLevels(LightLevels{203.4, 250, 0, 0, 1}, cll, fall);
+        QVERIFY(cll == 203u && fall == 203u);
+        hdr10LightLevels(LightLevels{}, cll, fall);
+        QVERIFY(cll == 1u && fall == 1u);
+        // An empty sequence has none.
+        Project empty = makeDefaultProject();
+        empty.active()->colorSpace = "rec2100pq";
+        QVERIFY(!measureLightLevels(empty, *empty.active(), 0, 0, l, &err) && err.find("empty") != std::string::npos);
     }
 
     void titlesRender() {

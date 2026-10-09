@@ -75,6 +75,9 @@ public slots:
 signals:
     void positionChanged(montage::FrameTime t);
     void frameRendered(const QImage& image, montage::FrameTime t);
+    // The same frame for the scopes: as delivered (code values in `space`, 16-bit for sequences outside Rec.709,
+    // whose frameRendered pictures are their SDR previews), with the sequence's mastering peak.
+    void scopeFrameRendered(const QImage& image, montage::FrameTime t, const QString& space, double peakNits);
     // Peak levels of the last audio block: master L/R and per-track
     // interleaved L,R pairs (linear, 0..1+).
     void audioLevels(float masterL, float masterR, const QVector<float>& trackPeaks);

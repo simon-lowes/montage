@@ -121,6 +121,10 @@ public:
     // scaled to fill the frame (render/Letterbox.h), one undo step. How many clips changed.
     int removeLetterbox();
     void watchFoldersDialog();  // File › Watch Folders… (EditorState::addWatchFolder)
+    // Sequence › Analyse HDR Light Levels: an HDR sequence's MaxCLL and MaxFALL measured over In to Out (or all of it)
+    // and saved with it (render/LightLevel.h), one undo step, for exports that state them up front; `ask` shows the
+    // result with a way to the brightest frame. False (with a message) for SDR sequences or when cancelled.
+    bool analyseHdrLightLevels(bool ask = true);
     // Suggest Chapters: chapter markers where the talk moves on, titled with what each part is about (replacing the
     // chapter markers there were); `ask` shows them first to rename, drop or re-space. How many were added.
     int suggestChapterMarkers(double minSeconds = 30, bool ask = true);

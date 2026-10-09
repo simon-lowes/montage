@@ -22,6 +22,7 @@
 #include "core/GradeVersions.h"
 #include "core/AudioChannels.h"
 #include "core/TranscriptCorrect.h"
+#include "render/LightLevel.h"
 #include "render/Spherical.h"
 #include "render/ClipPlacement.h"
 #include "media/ImageSequence.h"
@@ -1369,6 +1370,41 @@ void McpServer::Impl::addTools() {
             out["youtube"] = youtube;
             if (!warning.empty()) out["warning"] = QString::fromStdString(warning);
             return ok(QStringLiteral("%1 chapter marker(s) added:\n%2").arg(chapters.size()).arg(youtube), out);
+        });
+
+    add("montage_measure_hdr", "Measure HDR light levels",
+        "Measure an HDR (PQ or HLG) sequence's light levels as HDR10 states them: MaxCLL, the brightest channel of the "
+        "brightest pixel in any frame, and MaxFALL, the highest frame-average light, in nits (CTA-861.3), each with where "
+        "it happens, over `from` to `to` (default the whole sequence). With `save` (the default) they are kept with the "
+        "sequence so exports that state them before the first frame (x265, Matroska) use them; MP4 and MOV exports "
+        "measure what they render anyway. Warns when MaxCLL is above the sequence's mastering peak.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"from":{"type":["number","string"]},
+            "to":{"type":["number","string"]},"save":{"type":"boolean","default":true}},"required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            if (!sequenceColorSpace(s).hdr())
+                return fail(QStringLiteral("Light levels are measured on HDR sequences; this one is %1").arg(QString::fromStdString(sequenceColorSpace(s).label)));
+            const FrameTime from = a.contains("from") ? timeArg(a.value("from"), s, "from") : 0;
+            const FrameTime to = a.contains("to") ? timeArg(a.value("to"), s, "to") : 0;
+            LightLevels light;
+            std::string err;
+            if (!measureLightLevels(l.project, s, from, to, light, &err)) return fail(QString::fromStdString(err));
+            unsigned cll = 0, fall = 0;
+            hdr10LightLevels(light, cll, fall);
+            QJsonObject out{{"max_cll", int(cll)}, {"max_fall", int(fall)}, {"max_cll_at", tc(light.maxCllFrame, s)},
+                            {"max_fall_at", tc(light.maxFallFrame, s)}, {"frames", double(light.frames)}};
+            QString text = QStringLiteral("MaxCLL %1 nits (at %2), MaxFALL %3 nits (at %4)")
+                               .arg(cll).arg(tc(light.maxCllFrame, s)).arg(fall).arg(tc(light.maxFallFrame, s));
+            if (sequenceColorSpace(s).transfer == Transfer::Pq && cll > s.hdrPeakNits + 0.5) {
+                out["warning"] = QStringLiteral("Brighter than the %1-nit mastering peak").arg(s.hdrPeakNits);
+                text += QStringLiteral("; brighter than the %1-nit mastering peak").arg(s.hdrPeakNits);
+            }
+            if (a.value("save").toBool(true)) {
+                s.hdrMaxCll = cll, s.hdrMaxFall = fall;
+                save(l);
+            }
+            return ok(text, out);
         });
 
     add("montage_automate_track", "Automate a track's fader",
@@ -3652,10 +3688,17 @@ void McpServer::Impl::addTools() {
             if (stems != "none" && stems != "tracks" && stems != "buses" && stems != "roles")
                 throw ArgError{"\"stems\" must be none, tracks, buses or roles"};
             std::string err;
-            if (!exportSequence(l.project, s, st, [this](double f, FrameTime) { progress(f, "Rendering"); }, nullptr, &err))
+            LightLevels light;
+            if (!exportSequence(l.project, s, st, [this](double f, FrameTime) { progress(f, "Rendering"); }, nullptr, &err, nullptr, nullptr, &light))
                 return fail(QString::fromStdString(err));
             QJsonObject o{{"output", QString::fromStdString(st.path)}};
             QString text = QStringLiteral("Wrote %1").arg(QString::fromStdString(st.path));
+            if (light.frames > 0) {  // HDR: what was rendered, measured
+                unsigned cll = 0, fall = 0;
+                hdr10LightLevels(light, cll, fall);
+                o["max_cll"] = int(cll), o["max_fall"] = int(fall);
+                text += QStringLiteral("\nMaxCLL %1 nits, MaxFALL %2 nits").arg(cll).arg(fall);
+            }
             if (stems != "none") {
                 std::vector<StemFile> files;
                 if (!exportStems(l.project, s, st, stems == "buses" ? StemsByBus : stems == "roles" ? StemsByRole : StemsByTrack, &files, [this](double f, FrameTime) { progress(f, "Stems"); },

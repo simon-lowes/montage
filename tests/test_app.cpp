@@ -6698,6 +6698,95 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(scopes.hasSignal());
     }
 
+    void hdrScopesAndLightLevels() {
+        // A PQ frame: a quarter at 1000 nits, the rest at 100.
+        const ColorSpace& pq = *findColorSpace("rec2100pq");
+        auto frameAt = [](const ColorSpace& cs, double hiNits, double loNits) {
+            QImage f(160, 90, QImage::Format_RGBA64);
+            const quint16 hi = quint16(std::lround(nitsToCode(cs, hiNits) * 65535)), lo = quint16(std::lround(nitsToCode(cs, loNits) * 65535));
+            for (int y = 0; y < 90; ++y)
+                for (int x = 0; x < 160; ++x) {
+                    const quint16 v = x < 80 && y < 45 ? hi : lo;
+                    f.setPixelColor(x, y, QColor::fromRgba64(v, v, v, 65535));
+                }
+            return f;
+        };
+        ScopesWidget scopes;
+        scopes.resize(640, 420);
+        scopes.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&scopes));
+        auto* range = scopes.findChild<QComboBox*>("scopeRange");
+        auto* nits = scopes.findChild<QLabel*>("scopeNits");
+        QVERIFY(range && nits);
+        scopes.setSignal(frameAt(pq, 1000, 100), 0, "rec2100pq", 1000);
+        QTRY_VERIFY(scopes.hdr() && scopes.peakNits() > 0);
+        QVERIFY2(std::fabs(scopes.peakNits() - 1000) < 3 && std::fabs(scopes.averageNits() - 325) < 3,
+                 qPrintable(QString("%1 %2").arg(scopes.peakNits()).arg(scopes.averageNits())));
+        QVERIFY(range->isVisible() && nits->isVisible());
+        QVERIFY2(nits->text().contains("325"), qPrintable(nits->text()));
+        QVERIFY(nits->styleSheet().isEmpty());  // within the mastering peak
+        // The waveform's top brought down to 1000 nits shows the levels up to it.
+        QCOMPARE(scopes.traceRows(), 256);
+        range->setCurrentIndex(range->findData(1000));
+        QCOMPARE(scopes.nitsRange(), 1000.0);
+        QCOMPARE(scopes.traceRows(), int(std::lround(nitsToCode(pq, 1000) * 255)) + 1);
+        for (auto m : {ScopesWidget::Mode::Quad, ScopesWidget::Mode::Histogram, ScopesWidget::Mode::Parade}) {
+            scopes.setMode(m);
+            QVERIFY(!scopes.grab().toImage().isNull());
+        }
+        // Above a 400-nit mastering peak: warned.
+        scopes.setSignal(frameAt(pq, 1000, 100), 1, "rec2100pq", 400);
+        QTRY_VERIFY(!nits->styleSheet().isEmpty());
+        // HLG: nits on a 1000-nit display, no range to choose.
+        const ColorSpace& hlg = *findColorSpace("rec2100hlg");
+        scopes.setSignal(frameAt(hlg, 1000, 100), 2, "rec2100hlg", 1000);
+        QTRY_VERIFY(scopes.signalSpace() == "rec2100hlg" && !range->isVisible());
+        QVERIFY2(std::fabs(scopes.peakNits() - 1000) < 3 && std::fabs(scopes.averageNits() - 325) < 4, qPrintable(QString::number(scopes.averageNits())));
+        // Back to SDR: code values, no nits.
+        QImage sdr(160, 90, QImage::Format_RGB32);
+        sdr.fill(qRgb(128, 128, 128));
+        scopes.setMode(ScopesWidget::Mode::Waveform);
+        scopes.setFrame(sdr, 3);
+        QTRY_VERIFY(!scopes.hdr());
+        QCOMPARE(scopes.peakNits(), -1.0);
+        QVERIFY(!range->isVisible() && !nits->isVisible());
+        QCOMPARE(scopes.traceRows(), 256);
+
+        // The Program monitor gives the scopes an HDR sequence as delivered, not its SDR preview.
+        state()->newProject();
+        QVERIFY(state()->edit("HDR", [](Project& p, Sequence& s) {
+            s.colorSpace = "rec2100pq";
+            s.hdrPeakNits = 1000;
+            Clip c = makeGeneratorClip(p, "color", 10);
+            for (const char* k : {"color.r", "color.g", "color.b"}) c.generator.params[k] = 1.0;
+            return edit::overwrite(p, s, {TrackKind::Video, 0}, c).ok;
+        }));
+        auto* program = win_->findChild<PlaybackController*>("programPlayback");
+        QSignalSpy spy(program, &PlaybackController::scopeFrameRendered);
+        program->requestFrame();
+        auto delivered = [&] {  // the latest frame for the scopes, once one comes as delivered
+            for (int i = int(spy.size()) - 1; i >= 0; --i)
+                if (spy.at(i).at(2).toString() == "rec2100pq") return spy.at(i);
+            return QList<QVariant>{};
+        };
+        QTRY_VERIFY(!delivered().isEmpty());
+        const QList<QVariant> last = delivered();
+        const QImage signal = last.at(0).value<QImage>();
+        QCOMPARE(signal.format(), QImage::Format_RGBA64);
+        const double code = signal.pixelColor(signal.width() / 2, signal.height() / 2).redF();
+        QVERIFY2(std::fabs(code - 0.5807) < 0.002, qPrintable(QString::number(code)));  // graphics white: 203 nits
+        // Analyse HDR Light Levels: measured and kept with the sequence, one undo step.
+        QVERIFY(win_->findChild<QAction*>("analyseHdrLightLevels"));
+        QVERIFY(win_->analyseHdrLightLevels(false));
+        QCOMPARE(state()->sequence()->hdrMaxCll, 203.0);
+        QCOMPARE(state()->sequence()->hdrMaxFall, 203.0);
+        state()->undo();
+        QCOMPARE(state()->sequence()->hdrMaxCll, 0.0);
+        // Not for SDR.
+        state()->newProject();
+        QVERIFY(!win_->analyseHdrLightLevels(false));
+    }
+
     void workspaces() {
         auto dock = [this](const char* name) { return win_->findChild<QDockWidget*>(name); };
         // On screen: shown and in front (Qt moves the panels behind a tab out of sight rather than hiding them).

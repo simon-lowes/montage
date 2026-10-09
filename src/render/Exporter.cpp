@@ -664,7 +664,8 @@ private:
 };
 
 bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
-                const std::atomic<bool>* cancel, std::string* error, bool& opened, std::string* encoderUsed, int* smartRendered) {
+                const std::atomic<bool>* cancel, std::string* error, bool& opened, std::string* encoderUsed, int* smartRendered,
+                LightLevels* light) {
     auto fail = [&](const std::string& msg) {
         if (error) *error = msg;
         return false;
@@ -711,7 +712,14 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
                                                                                : seqSpace;
     const bool pq = outSpace.transfer == Transfer::Pq;
     const double peakNits = std::clamp(seq.hdrPeakNits, 100.0, 10000.0);
-    const int maxFall = int(std::lround(std::min(peakNits, 400.0)));
+    // Light levels stated up front: the sequence's analysed ones, else the mastering peak (and an average under it).
+    const bool analysed = seq.hdrMaxCll > 0;
+    const int maxCll = analysed ? int(std::clamp(std::lround(seq.hdrMaxCll), 1L, 10000L)) : int(std::lround(peakNits));
+    const int maxFall = analysed ? int(std::clamp(std::lround(seq.hdrMaxFall), 1L, long(maxCll))) : int(std::lround(std::min(peakNits, 400.0)));
+    // What is rendered is measured as it goes (HDR only): the file gets those where its format allows.
+    LightLevels measured;
+    const LightMeter meter(outSpace);
+    const bool measure = wantVideo && outSpace.hdr() && meter.valid();
     if (wantVideo) {
         std::string c = s.videoCodec;
         const bool hardware = c == "hw_h264" || c == "hw_hevc";
@@ -773,7 +781,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
                     std::snprintf(buf, sizeof buf,
                                   ":hdr10=1:repeat-headers=1:master-display=G(13250,34500)B(7500,3000)R(34000,16000)"
                                   "WP(15635,16450)L(%lld,1):max-cll=%d,%d",
-                                  static_cast<long long>(std::llround(peakNits * 10000)), int(std::lround(peakNits)), maxFall);
+                                  static_cast<long long>(std::llround(peakNits * 10000)), maxCll, maxFall);
                     params += buf;
                 }
                 av_dict_set(&opts, "x265-params", params.c_str(), 0);
@@ -852,7 +860,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             md.min_luminance = av_make_q(1, 10000);
             md.has_primaries = md.has_luminance = 1;
             AVContentLightMetadata cl{};
-            cl.MaxCLL = unsigned(std::lround(peakNits));
+            cl.MaxCLL = unsigned(maxCll);
             cl.MaxFALL = unsigned(maxFall);
             if (AVPacketSideData* sd = av_packet_side_data_new(&o.vst->codecpar->coded_side_data, &o.vst->codecpar->nb_coded_side_data,
                                                                AV_PKT_DATA_MASTERING_DISPLAY_METADATA, sizeof md, 0))
@@ -1203,6 +1211,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             if (s.burnInCaptions && captions) drawCaption(img, *captions, f, &seqSpace);
             if (s.burnIn.any()) drawBurnIns(img, p, seq, f, s.burnIn, watermark.isNull() ? nullptr : &watermark, &seqSpace);
             convertColor(img, seqSpace, outSpace, peakNits);
+            if (measure) meter.add(img, f, measured);
             if (floatFrames && img.width == W && img.height == H) {
                 // Planar float, green-blue-red(-alpha), unpremultiplied, values above 1 kept.
                 if (av_frame_make_writable(o.vframe) < 0) return fail("Out of memory");
@@ -1291,19 +1300,29 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         if ((rc = avcodec_send_frame(o.vctx, nullptr)) < 0 || (rc = drain(o, o.vctx, o.vst)) < 0)
             return fail("Finishing video failed: " + averr(rc));
     }
+    // HDR10 light levels as measured (MP4 and MOV write their clli box with the index, at the end).
+    if (pq && measured.frames > 0 && o.vst && !(smart && smart->copied() > 0))  // copied frames go unmeasured
+        if (const AVPacketSideData* sd = av_packet_side_data_get(o.vst->codecpar->coded_side_data, o.vst->codecpar->nb_coded_side_data,
+                                                                 AV_PKT_DATA_CONTENT_LIGHT_LEVEL)) {
+            auto* cl = reinterpret_cast<AVContentLightMetadata*>(sd->data);
+            hdr10LightLevels(measured, cl->MaxCLL, cl->MaxFALL);
+        }
     if ((rc = av_write_trailer(o.oc)) < 0) return fail("Cannot finalise file: " + averr(rc));
     if (o.oc->pb && o.oc->pb->error < 0) return fail("Writing the file failed: " + averr(o.oc->pb->error));
     if (smartRendered) *smartRendered = smart ? smart->copied() : 0;
+    if (light) *light = measured;
     return true;
 }
 
 }  // namespace
 
 bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
-                    const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed, int* smartRendered) {
+                    const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed, int* smartRendered,
+                    LightLevels* light) {
     bool opened = false;
     if (smartRendered) *smartRendered = 0;
-    bool ok = exportImpl(p, seq, s, progress, cancel, error, opened, encoderUsed, smartRendered);
+    if (light) *light = LightLevels{};
+    bool ok = exportImpl(p, seq, s, progress, cancel, error, opened, encoderUsed, smartRendered, light);
     // Never leave a truncated file behind (the output is closed by now), but
     // don't touch an existing file if we failed before writing to it.
     if (!ok && opened) std::remove(s.path.c_str());

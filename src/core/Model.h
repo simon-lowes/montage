@@ -351,6 +351,7 @@ struct Sequence {
     std::vector<std::string> mutedRoles;  // audio roles not heard (clip roles, see Clip::role)
     std::string colorSpace = "rec709";  // working and delivery space (ColorSpace.h id)
     double hdrPeakNits = 1000;          // mastering peak for HDR spaces
+    double hdrMaxCll = 0, hdrMaxFall = 0;  // measured light levels (Analyse HDR Light Levels), nits; 0 = not measured
     bool spherical = false;             // a 360° sequence (equirectangular): exports say so to players and YouTube
     FrameTime inPoint = -1;   // In / Out marks; both frames are included, -1 = unset
     FrameTime outPoint = -1;

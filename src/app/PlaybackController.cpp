@@ -18,6 +18,7 @@
 #include <iterator>
 #include <map>
 
+#include "render/ColorSpace.h"
 #include "render/Compositor.h"
 
 namespace montage {
@@ -51,8 +52,59 @@ public:
 
 signals:
     void rendered(const QImage& image, montage::FrameTime t);
+    void scopeRendered(const QImage& image, montage::FrameTime t, const QString& space, double peakNits);
 
 private:
+    // A frame for the viewer (Rec.709) and, for sequences in another space, a small copy as delivered (16-bit code
+    // values in the sequence's space) so the scopes measure what is exported, not its SDR preview.
+    struct Rendered {
+        QImage view, signal;
+    };
+    static constexpr int kSignalWidth = 480, kSignalHeight = 320;
+
+    static QImage signalImage(const Image& img) {
+        int w = img.width, h = img.height;
+        if (w > kSignalWidth || h > kSignalHeight) {
+            const double k = std::min(double(kSignalWidth) / w, double(kSignalHeight) / h);
+            w = std::max(1, int(w * k)), h = std::max(1, int(h * k));
+        }
+        QImage out(w, h, QImage::Format_RGBA64);
+        for (int y = 0; y < h; ++y) {
+            const float* row = img.row(std::min(img.height - 1, int((y + 0.5) * img.height / h)));
+            auto* o = reinterpret_cast<quint16*>(out.scanLine(y));
+            for (int x = 0; x < w; ++x) {
+                const float* px = row + 4 * size_t(std::min(img.width - 1, int((x + 0.5) * img.width / w)));
+                for (int c = 0; c < 4; ++c) o[4 * x + c] = quint16(std::lround(std::clamp(px[c], 0.0f, 1.0f) * 65535));
+            }
+        }
+        return out;
+    }
+
+    static bool ownSpace(const Sequence& s) { return sequenceColorSpace(s).id != "rec709"; }
+
+    // The frame as delivered alone (a preview from the render cache has only its SDR picture).
+    QImage renderSignal(const Request& r, FrameTime t) {
+        const Sequence* s = r.project->findSequence(r.sequence);
+        if (!s || !ownSpace(*s)) return {};
+        RenderOptions o;
+        o.scale = r.scale;
+        o.useProxies = r.proxies;
+        o.captions = r.captions;
+        return signalImage(renderProgramFrame(*r.project, *s, t, o));
+    }
+
+    void emitFrame(Rendered& img, const Request& r, FrameTime t) {
+        emit rendered(img.view, t);
+        const Sequence* s = r.project->findSequence(r.sequence);
+        if (!s) return;
+        if (!ownSpace(*s)) {
+            emit scopeRendered(img.view, t, QStringLiteral("rec709"), s->hdrPeakNits);
+            return;
+        }
+        if (img.signal.isNull() && r.direction == 0) img.signal = renderSignal(r, t);  // paused: worth the render
+        if (!img.signal.isNull()) emit scopeRendered(img.signal, t, QString::fromStdString(sequenceColorSpace(*s).id), s->hdrPeakNits);
+    }
+
     static constexpr int kAhead = 24;
     static constexpr size_t kMaxCached = 48;
 
@@ -61,7 +113,7 @@ private:
                r.captions == ctx_.captions;
     }
 
-    QImage render(const Request& r, FrameTime t) {
+    Rendered render(const Request& r, FrameTime t) {
         const Sequence* s = r.project->findSequence(r.sequence);
         if (!s) return {};
         RenderOptions o;
@@ -75,11 +127,20 @@ private:
         const QByteArray key = frameKey(*r.project, *s, t, co);
         if (RenderCache::instance().has(key)) {
             QImage cached = RenderCache::instance().load(key);
-            if (!cached.isNull()) return cached;
+            if (!cached.isNull()) return {cached, {}};
         }
-        Image img = renderProgramFrame(*r.project, *s, t, o);
-        QImage out(img.width, img.height, QImage::Format_RGBA8888);
-        toRgba8(img, out.bits(), size_t(out.bytesPerLine()));
+        // Rendered in the sequence's own space, kept for the scopes, then shown as Rec.709 (as displaySpace does).
+        Rendered out;
+        RenderOptions own = o;
+        const bool other = ownSpace(*s);
+        if (other) own.displaySpace.clear();
+        Image img = renderProgramFrame(*r.project, *s, t, own);
+        if (other) {
+            out.signal = signalImage(img);
+            convertColor(img, sequenceColorSpace(*s), rec709Space(), s->hdrPeakNits);
+        }
+        out.view = QImage(img.width, img.height, QImage::Format_RGBA8888);
+        toRgba8(img, out.view.bits(), size_t(out.view.bytesPerLine()));
         return out;
     }
 
@@ -99,10 +160,10 @@ private:
         ctx_.direction = r.direction;
         ctx_.frame = r.frame;
         auto it = cache_.find(r.frame);
-        QImage img = it != cache_.end() ? it->second : render(r, r.frame);
-        if (img.isNull()) return;
+        Rendered img = it != cache_.end() ? it->second : render(r, r.frame);
+        if (img.view.isNull()) return;
+        emitFrame(img, r, r.frame);
         cache_[r.frame] = img;
-        emit rendered(img, r.frame);
         trim();
         if (r.direction != 0) QMetaObject::invokeMethod(this, &RenderWorker::prefetch, Qt::QueuedConnection);
     }
@@ -122,8 +183,8 @@ private:
             FrameTime t = ctx_.frame + FrameTime(k) * ctx_.direction;
             if (t < 0 || t >= end) return;
             if (cache_.count(t)) continue;
-            QImage img = render(ctx_, t);
-            if (img.isNull()) return;
+            Rendered img = render(ctx_, t);
+            if (img.view.isNull()) return;
             cache_[t] = img;
             trim();
             QMetaObject::invokeMethod(this, &RenderWorker::prefetch, Qt::QueuedConnection);
@@ -144,7 +205,7 @@ private:
     Request pending_;
     bool has_ = false;
     Request ctx_;  // context of the cached frames (render-thread only)
-    std::map<FrameTime, QImage> cache_;
+    std::map<FrameTime, Rendered> cache_;
 };
 
 // ---------------------------------------------------------------------------
@@ -265,6 +326,7 @@ PlaybackController::PlaybackController(QObject* parent) : QObject(parent) {
     worker_->moveToThread(renderThread_);
     connect(renderThread_, &QThread::finished, worker_, &QObject::deleteLater);
     connect(worker_, &RenderWorker::rendered, this, &PlaybackController::frameRendered, Qt::QueuedConnection);
+    connect(worker_, &RenderWorker::scopeRendered, this, &PlaybackController::scopeFrameRendered, Qt::QueuedConnection);
     renderThread_->start();
     device_ = new MixerDevice(this);
     connect(device_, &MixerDevice::levels, this, &PlaybackController::audioLevels);

@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "core/Model.h"
+#include "render/LightLevel.h"
 
 namespace montage {
 
@@ -122,9 +123,13 @@ bool exportStems(const Project& p, const Sequence& seq, const ExportSettings& s,
 // in use (StemsByTrack or StemsByRole), each named for it and in the language of the sequence's first caption track.
 std::vector<ExportSettings::AudioStream> stemStreams(const Sequence& seq, int groups);
 
+// HDR exports measure their light levels as they render (`light`, when given); PQ files to MP4 and MOV carry the
+// measured MaxCLL and MaxFALL. Encoders that state them before the first frame (x265) use the sequence's analysed
+// levels, or the mastering peak when it has none.
 bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
                     const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed = nullptr,
-                    int* smartRendered = nullptr);  // frames copied by smart rendering
+                    int* smartRendered = nullptr,  // frames copied by smart rendering
+                    LightLevels* light = nullptr);
 
 // Renders an audio clip's sound with its effects (not its volume, pan or
 // fades) to a 24-bit WAV, from its first frame to its last.

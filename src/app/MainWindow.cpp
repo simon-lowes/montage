@@ -125,6 +125,7 @@
 #include "render/Highlights.h"
 #include "render/Shorts.h"
 #include "render/Letterbox.h"
+#include "render/LightLevel.h"
 #include "media/MicBleed.h"
 #include "render/MusicEdit.h"
 #include "render/VoiceMatch.h"
@@ -189,7 +190,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     connect(state_, &EditorState::fileStateChanged, this, &MainWindow::updateTitle);
     connect(state_, &EditorState::statusMessage, this, [this](const QString& text, int ms) { statusBar()->showMessage(text, ms); });
     connect(state_, &EditorState::mediaReady, this, [this] { program_->requestFrame(); });
-    connect(program_, &PlaybackController::frameRendered, scopes_, &ScopesWidget::setFrame);
+    connect(program_, &PlaybackController::scopeFrameRendered, scopes_, &ScopesWidget::setSignal);
     connect(program_, &PlaybackController::audioLevels, this, [this](float l, float r, const QVector<float>& tracks) {
         meter_->setLevels(l, r);
         mixer_->setLevels(l, r, tracks);
@@ -1202,6 +1203,7 @@ void MainWindow::buildMenus() {
         QualityCheckDialog dlg(state_, this);
         dlg.exec();
     })->setObjectName(QStringLiteral("qualityCheck"));
+    add(seqM, tr("Analyse HDR &Light Levels…"), QKeySequence(), [this] { analyseHdrLightLevels(); })->setObjectName(QStringLiteral("analyseHdrLightLevels"));
     add(seqM, tr("Next Marker"), QKeySequence("Shift+M"), [this] { jumpMarker(true); });
     add(seqM, tr("Previous Marker"), QKeySequence("Ctrl+Shift+M"), [this] { jumpMarker(false); });
     add(seqM, tr("Clear Marker at Playhead"), QKeySequence("Ctrl+Alt+M"), [this] {
@@ -3667,6 +3669,49 @@ int MainWindow::removeLetterbox() {
     });
     state_->message(changed ? tr("Cropped the black bars off %n clip(s)", "", changed) : tr("No black bars found round the pictures"), 5000);
     return changed;
+}
+
+bool MainWindow::analyseHdrLightLevels(bool ask) {
+    const Sequence* cur = state_->sequence();
+    if (!cur) return false;
+    if (!sequenceColorSpace(*cur).hdr()) {
+        state_->message(tr("Light levels are measured on HDR sequences (PQ or HLG); see Sequence Settings"), 6000);
+        return false;
+    }
+    // A copy to measure while the dialog runs.
+    const Project p = state_->project();
+    const Sequence s = *cur;
+    const bool marked = s.inPoint >= 0 && s.outPoint >= s.inPoint;
+    LightLevels l;
+    if (!runWithProgress(this, state_, tr("Measuring light levels..."), [&](const auto& progress, const auto* cancel, std::string* e) {
+            return measureLightLevels(p, s, marked ? s.inPoint : 0, marked ? s.outPoint + 1 : 0, l, e, 1.0,
+                                      [&](double f) { progress(f); }, cancel);
+        }))
+        return false;
+    unsigned cll = 0, fall = 0;
+    hdr10LightLevels(l, cll, fall);
+    state_->apply(tr("Analyse HDR Light Levels"), [&](Project&, Sequence& sq) {
+        sq.hdrMaxCll = cll, sq.hdrMaxFall = fall;
+        return edit::Result{};
+    });
+    const QLocale loc;
+    state_->message(tr("MaxCLL %1 nits, MaxFALL %2 nits").arg(loc.toString(cll), loc.toString(fall)), 8000);
+    if (!ask) return true;
+    QMessageBox box(QMessageBox::Information, tr("HDR Light Levels"),
+                    tr("MaxCLL %1 nits, the brightest pixel (at %2)\nMaxFALL %3 nits, the brightest frame on average (at %4)")
+                        .arg(loc.toString(cll), QString::fromStdString(formatTimecode(l.maxCllFrame, s.fps)), loc.toString(fall),
+                             QString::fromStdString(formatTimecode(l.maxFallFrame, s.fps))),
+                    QMessageBox::Close, this);
+    box.setObjectName(QStringLiteral("hdrLightLevelsDialog"));
+    QString more = tr("Saved with the sequence: HDR10 exports state them (MP4 and MOV also measure what they render).");
+    if (sequenceColorSpace(s).transfer == Transfer::Pq && cll > s.hdrPeakNits + 0.5)
+        more = tr("Brighter than the %1-nit mastering peak: highlights above it will be clipped or tone mapped by displays.\n\n")
+                   .arg(loc.toString(qRound(s.hdrPeakNits))) + more;
+    box.setInformativeText(more);
+    QPushButton* go = box.addButton(tr("Go to Brightest Frame"), QMessageBox::ActionRole);
+    box.exec();
+    if (box.clickedButton() == go) state_->setPlayhead(l.maxCllFrame);
+    return true;
 }
 
 void MainWindow::watchFoldersDialog() {

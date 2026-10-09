@@ -392,6 +392,37 @@ void primariesToXyz(Primaries p, double m[9]) {
     mul3(adapt, toXyz, m);
 }
 
+double codeToNits(const ColorSpace& space, double code) {
+    switch (space.transfer) {
+        case Transfer::Pq: return pqToNits(code);
+        case Transfer::Hlg: return kHlgPeak * std::pow(hlgInverseOetf(code), kHlgGamma);  // neutral: Ys is E
+        case Transfer::Bt1886:
+        case Transfer::Srgb: return 100 * toLinear(space.transfer, std::clamp(code, 0.0, 1.0));
+        default: return -1;
+    }
+}
+
+double nitsToCode(const ColorSpace& space, double nits) {
+    nits = std::max(0.0, nits);
+    switch (space.transfer) {
+        case Transfer::Pq: return nitsToPq(nits);
+        case Transfer::Hlg: return hlgOetf(std::pow(std::min(nits / kHlgPeak, 1.0), 1 / kHlgGamma));
+        case Transfer::Bt1886:
+        case Transfer::Srgb: return std::clamp(fromLinear(space.transfer, nits / 100), 0.0, 1.0);
+        default: return -1;
+    }
+}
+
+double pixelMaxNits(const ColorSpace& space, const float rgb[3]) {
+    const double mx = std::max({rgb[0], rgb[1], rgb[2]});
+    if (space.transfer != Transfer::Hlg) return codeToNits(space, mx);
+    // HLG: each channel's display light is the peak times the scene luminance to the gamma less one, times the channel.
+    double e[3];
+    for (int i = 0; i < 3; ++i) e[i] = hlgInverseOetf(rgb[i]);
+    const double ys = std::max(0.0, luminance2020(e[0], e[1], e[2]));
+    return kHlgPeak * std::pow(ys, kHlgGamma - 1) * std::max({e[0], e[1], e[2]});
+}
+
 void convertPixel(float rgb[3], const ColorSpace& from, const ColorSpace& to, double hdrPeakNits) {
     double m[9];
     primariesMatrix(from.primaries, to.primaries, m);

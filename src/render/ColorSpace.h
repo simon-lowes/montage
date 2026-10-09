@@ -78,6 +78,13 @@ void primariesToXyz(Primaries p, double m[9]);
 // sources get a filmic display rendering.
 void convertColor(Image& img, const ColorSpace& from, const ColorSpace& to, double hdrPeakNits = 1000);
 
+// Light in cd/m² (nits) for display spaces: PQ as coded, HLG on a 1000-nit display (its OOTF), SDR with white at
+// 100 nits. A neutral code value's light and back (scope graticules); `nits` below 0 for camera log and linear.
+double codeToNits(const ColorSpace& space, double code);
+double nitsToCode(const ColorSpace& space, double nits);
+// A pixel's brightest channel in nits (CTA-861.3's maxRGB, which MaxCLL and MaxFALL are made of).
+double pixelMaxNits(const ColorSpace& space, const float rgb[3]);
+
 // For tests and scopes: one pixel through the same conversion.
 void convertPixel(float rgb[3], const ColorSpace& from, const ColorSpace& to, double hdrPeakNits = 1000);
 

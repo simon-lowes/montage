@@ -2044,6 +2044,97 @@ private slots:
         QVERIFY(call({{"align", "sideways"}}).value("isError").toBool());
     }
 
+    void mcpMeasureHdr() {
+        // White graphics in an HDR10 sequence: reference white, 203 nits, on every frame.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 160, s.height = 90, s.fps = {25, 1};
+        s.colorSpace = "rec2100pq";
+        s.hdrPeakNits = 1000;
+        Clip c = makeGeneratorClip(p, "color", 10);
+        for (const char* k : {"color.r", "color.g", "color.b"}) c.generator.params[k] = 1.0;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, c);
+        const QString project = QString::fromStdString(path("hdr-mcp.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        int rid = 1;
+        auto call = [&](const char* name, QJsonObject args) {
+            args["project"] = project;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", rid++}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", name}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call("montage_measure_hdr", {});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject out = r.value("structuredContent").toObject();
+        QCOMPARE(out.value("max_cll").toInt(), 203);
+        QCOMPARE(out.value("max_fall").toInt(), 203);
+        QCOMPARE(out.value("max_cll_at").toString(), QString("00:00:00:00"));
+        QVERIFY(!out.contains("warning"));
+        {
+            Project q;
+            QVERIFY(loadProject(project.toStdString(), q));
+            QCOMPARE(q.active()->hdrMaxCll, 203.0);
+            QCOMPARE(q.active()->hdrMaxFall, 203.0);
+        }
+        // Over a part only, not saved: graphics are held to a lower mastering peak.
+        Project dim = p;
+        dim.active()->hdrPeakNits = 100;
+        QVERIFY(saveProject(dim, project.toStdString()));
+        r = call("montage_measure_hdr", {{"from", "00:00:00:05"}, {"to", "00:00:00:07"}, {"save", false}});
+        QCOMPARE(r.value("structuredContent").toObject().value("frames").toInt(), 2);
+        QCOMPARE(r.value("structuredContent").toObject().value("max_cll").toInt(), 100);
+        QVERIFY(!r.value("structuredContent").toObject().contains("warning"));
+        {
+            Project q;
+            QVERIFY(loadProject(project.toStdString(), q));
+            QCOMPARE(q.active()->hdrMaxCll, 0.0);
+        }
+        // PQ footage is not: a 1000-nit highlight over the sequence's 400-nit peak is warned about.
+        QImage hot(32, 18, QImage::Format_RGBA64);
+        hot.fill(QColor::fromRgba64(0, 0, 0, 65535));
+        const quint16 code = quint16(std::lround(0.7518 * 65535));
+        for (int y = 0; y < 4; ++y)
+            for (int x = 0; x < 4; ++x) hot.setPixelColor(x, y, QColor::fromRgba64(code, code, code, 65535));
+        const std::string hotPath = path("pq-highlight.png");
+        QVERIFY(hot.save(QString::fromStdString(hotPath)));
+        Project bright = makeDefaultProject();
+        Sequence& bs = *bright.active();
+        bs.width = 160, bs.height = 90, bs.fps = {25, 1};
+        bs.colorSpace = "rec2100pq";
+        bs.hdrPeakNits = 400;
+        MediaItem pm;
+        std::string err;
+        QVERIFY2(probeMedia(hotPath, pm, &err), err.c_str());
+        pm.id = bright.newId();
+        pm.colorSpace = "rec2100pq";
+        bright.media.push_back(pm);
+        Clip hc = makeClip(bright, bright.media.back(), TrackKind::Video, bs);
+        hc.duration = 3;
+        QVERIFY(edit::overwrite(bright, bs, {TrackKind::Video, 0}, hc).ok);
+        QVERIFY(saveProject(bright, project.toStdString()));
+        r = call("montage_measure_hdr", {});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY2(std::abs(r.value("structuredContent").toObject().value("max_cll").toInt() - 1000) <= 3, QJsonDocument(r).toJson().constData());
+        QVERIFY(r.value("structuredContent").toObject().value("warning").toString().contains("400"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        // Exports report what they measured.
+        if (avcodec_find_encoder_by_name("libx265")) {
+            r = call("montage_render", {{"output", QString::fromStdString(path("hdr-mcp.mp4"))}, {"preset", "H.265 / HEVC"}});
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            QCOMPARE(r.value("structuredContent").toObject().value("max_cll").toInt(), 203);
+        }
+        // SDR sequences have none.
+        Project sdr = p;
+        sdr.active()->colorSpace = "rec709";
+        QVERIFY(saveProject(sdr, project.toStdString()));
+        r = call("montage_measure_hdr", {});
+        QVERIFY(r.value("isError").toBool());
+    }
+
     void mcpEditTranscript() {
         Project p = makeDefaultProject();
         MediaItem m;
@@ -9102,9 +9193,13 @@ private slots:
         st.audioCodec = "none";
         st.preset = "ultrafast";
         std::string err;
-        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        LightLevels light;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err, nullptr, nullptr, &light), err.c_str());
+        // Measured as rendered: graphics white sits at reference white, 203 nits, all over every frame.
+        QCOMPARE(light.frames, int64_t(10));
+        QVERIFY2(std::fabs(light.maxCll - 203) < 2 && std::fabs(light.maxFall - 203) < 2, qPrintable(QString::number(light.maxCll)));
 
-        // 10-bit, tagged BT.2020 / PQ, with HDR10 mastering display and light levels.
+        // 10-bit, tagged BT.2020 / PQ, with HDR10 mastering display and the measured light levels.
         AVFormatContext* fmt = nullptr;
         QCOMPARE(avformat_open_input(&fmt, st.path.c_str(), nullptr, nullptr), 0);
         QVERIFY(avformat_find_stream_info(fmt, nullptr) >= 0);
@@ -9114,20 +9209,43 @@ private slots:
         const auto primaries = cp->color_primaries;
         const auto matrix = cp->color_space;
         double maxLum = 0;
-        unsigned maxCll = 0;
+        unsigned maxCll = 0, maxFall = 0;
         if (const AVPacketSideData* sd = av_packet_side_data_get(cp->coded_side_data, cp->nb_coded_side_data,
                                                                   AV_PKT_DATA_MASTERING_DISPLAY_METADATA))
             maxLum = av_q2d(reinterpret_cast<const AVMasteringDisplayMetadata*>(sd->data)->max_luminance);
         if (const AVPacketSideData* sd =
-                av_packet_side_data_get(cp->coded_side_data, cp->nb_coded_side_data, AV_PKT_DATA_CONTENT_LIGHT_LEVEL))
+                av_packet_side_data_get(cp->coded_side_data, cp->nb_coded_side_data, AV_PKT_DATA_CONTENT_LIGHT_LEVEL)) {
             maxCll = reinterpret_cast<const AVContentLightMetadata*>(sd->data)->MaxCLL;
+            maxFall = reinterpret_cast<const AVContentLightMetadata*>(sd->data)->MaxFALL;
+        }
         avformat_close_input(&fmt);
         QCOMPARE(format, int(AV_PIX_FMT_YUV420P10LE));
         QCOMPARE(trc, AVCOL_TRC_SMPTE2084);
         QCOMPARE(primaries, AVCOL_PRI_BT2020);
         QCOMPARE(matrix, AVCOL_SPC_BT2020_NCL);
         QCOMPARE(maxLum, 1000.0);
-        QCOMPARE(maxCll, 1000u);
+        QCOMPARE(maxCll, unsigned(std::lround(light.maxCll)));
+        QCOMPARE(maxFall, unsigned(std::lround(light.maxFall)));
+        // Matroska states its levels before the frames: the sequence's analysed levels, else the mastering peak.
+        auto mkvLevels = [&](const Sequence& seq) {
+            ExportSettings mk = st;
+            mk.path = path("hdr10.mkv");
+            std::string e;
+            if (!exportSequence(p, seq, mk, nullptr, nullptr, &e)) return std::pair<unsigned, unsigned>{0, 0};
+            AVFormatContext* f = nullptr;
+            std::pair<unsigned, unsigned> out{0, 0};
+            if (avformat_open_input(&f, mk.path.c_str(), nullptr, nullptr) == 0 && avformat_find_stream_info(f, nullptr) >= 0) {
+                const AVCodecParameters* c = f->streams[0]->codecpar;
+                if (const AVPacketSideData* sd = av_packet_side_data_get(c->coded_side_data, c->nb_coded_side_data, AV_PKT_DATA_CONTENT_LIGHT_LEVEL))
+                    out = {reinterpret_cast<const AVContentLightMetadata*>(sd->data)->MaxCLL, reinterpret_cast<const AVContentLightMetadata*>(sd->data)->MaxFALL};
+            }
+            avformat_close_input(&f);
+            return out;
+        };
+        QCOMPARE(mkvLevels(s), (std::pair<unsigned, unsigned>{1000, 400}));
+        Sequence analysed = s;
+        analysed.hdrMaxCll = 850, analysed.hdrMaxFall = 300;
+        QCOMPARE(mkvLevels(analysed), (std::pair<unsigned, unsigned>{850, 300}));
 
         // Montage reads it back as HDR10, at reference white (203 nits).
         MediaItem m;

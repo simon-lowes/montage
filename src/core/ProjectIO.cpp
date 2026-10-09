@@ -499,6 +499,8 @@ QJsonObject sequenceToJson(const Sequence& s) {
     }
     if (s.colorSpace != "rec709") o["colorSpace"] = qs(s.colorSpace);
     if (s.hdrPeakNits != 1000) o["hdrPeakNits"] = s.hdrPeakNits;
+    if (s.hdrMaxCll > 0) o["hdrMaxCll"] = s.hdrMaxCll;
+    if (s.hdrMaxFall > 0) o["hdrMaxFall"] = s.hdrMaxFall;
     if (s.spherical) o["spherical"] = true;
     if (s.audioLayout != "stereo") o["audioLayout"] = qs(s.audioLayout);
     return o;
@@ -524,6 +526,8 @@ Sequence sequenceFromJson(const QJsonObject& o) {
     for (auto it = gains.begin(); it != gains.end(); ++it) s.folderGains[it.key().toStdString()] = it.value().toDouble();
     s.colorSpace = o.contains("colorSpace") ? ss(o.value("colorSpace")) : "rec709";
     s.hdrPeakNits = std::clamp(o.value("hdrPeakNits").toDouble(1000), 100.0, 10000.0);
+    s.hdrMaxCll = std::clamp(o.value("hdrMaxCll").toDouble(0), 0.0, 10000.0);
+    s.hdrMaxFall = std::clamp(o.value("hdrMaxFall").toDouble(0), 0.0, s.hdrMaxCll);
     s.spherical = o.value("spherical").toBool(false);
     s.audioLayout = o.contains("audioLayout") ? ss(o.value("audioLayout")) : "stereo";
     if (s.audioLayout != "5.1" && s.audioLayout != "7.1") s.audioLayout = "stereo";
