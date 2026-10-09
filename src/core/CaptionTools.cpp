@@ -173,4 +173,45 @@ int replaceInCaptions(std::vector<Caption>& captions, const std::vector<size_t>&
     return count;
 }
 
+bool placeCaptions(std::vector<Caption>& captions, const std::vector<size_t>& indices, int vertical, int align) {
+    const std::vector<bool> on = chosen(captions.size(), indices);
+    bool any = false;
+    for (size_t i = 0; i < captions.size(); ++i)
+        if (on[i]) {
+            Caption& c = captions[i];
+            const int v = vertical < 0 ? c.vertical : vertical, a = align < 0 ? c.align : align;
+            if (c.vertical == v && c.align == a) continue;
+            c.vertical = v;
+            c.align = a;
+            any = true;
+        }
+    return any;
+}
+
+int raiseCaptionsOverTitles(std::vector<Caption>& captions, const Sequence& seq) {
+    // Where low titles are on screen.
+    std::vector<std::pair<FrameTime, FrameTime>> spans;
+    for (const Track& track : seq.videoTracks) {
+        if (track.muted) continue;
+        for (const Clip& c : track.clips) {
+            if (!c.enabled || c.generator.type != "title") continue;
+            // Lower Left, Centre or Right, or placed (with the clip's own position) below the middle fifth.
+            const int anchor = int(std::lround(c.generator.p("anchor", 0)));
+            const double y = c.generator.p("pos_y", 0) + c.motion.p("pos_y", 0);
+            const bool low = (anchor >= 1 && anchor <= 3) || (anchor == 0 && y > 0.1 * seq.height);
+            if (low && int(std::lround(c.generator.p("motion", 0))) != 1) spans.emplace_back(c.start, c.end());
+        }
+    }
+    int moved = 0;
+    for (Caption& cap : captions) {
+        if (cap.vertical == kCaptionTop) continue;
+        const bool covered = std::any_of(spans.begin(), spans.end(), [&](const auto& s) { return s.first < cap.end && cap.start < s.second; });
+        if (covered) {
+            cap.vertical = kCaptionTop;
+            ++moved;
+        }
+    }
+    return moved;
+}
+
 }  // namespace montage

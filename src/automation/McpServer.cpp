@@ -2118,11 +2118,14 @@ void McpServer::Impl::addTools() {
         "whole. `action`: check (what each caption breaks), fix_timing (short or fast captions stay up longer into the "
         "time after them, each ends the minimum gap before the next, short pauses close up), shift (by `by`: seconds or a "
         "timecode, negative for earlier), sync (the first and last of `captions`, or of the track, start at `first` and "
-        "`last`, the rest stretched between: subtitles timed for another cut or frame rate) or replace (`find` with "
-        "`replace`, optionally `case_sensitive` and `whole_words`). `captions` (indices) limits shift and replace. Limits "
+        "`last`, the rest stretched between: subtitles timed for another cut or frame rate), replace (`find` with "
+        "`replace`, optionally `case_sensitive` and `whole_words`), place (`place`: bottom, top or middle, and left, centre or "
+        "right, e.g. \"top left\": where the captions sit, kept in every caption format) or raise_over_titles (captions "
+        "shown over lower thirds and other low titles move to the top). `captions` (indices) limits shift, replace and place. Limits "
         "can be changed: max_cps, max_line_chars, max_lines, min_seconds, max_seconds, min_gap_frames.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"track":{"type":"integer","default":0},
-            "action":{"type":"string","enum":["check","fix_timing","shift","sync","replace"]},
+            "action":{"type":"string","enum":["check","fix_timing","shift","sync","replace","place","raise_over_titles"]},
+            "place":{"type":"string"},
             "captions":{"type":"array","items":{"type":"integer"}},"by":{"type":["number","string"]},
             "first":{"type":["number","string"]},"last":{"type":["number","string"]},
             "find":{"type":"string"},"replace":{"type":"string"},"case_sensitive":{"type":"boolean"},"whole_words":{"type":"boolean"},
@@ -2192,6 +2195,20 @@ void McpServer::Impl::addTools() {
                                                 a.value("case_sensitive").toBool(), a.value("whole_words").toBool());
                 if (!n) return fail(QStringLiteral("\"%1\" was not found").arg(a.value("find").toString()));
                 done = QStringLiteral("Replaced %1").arg(n);
+            } else if (action == "place") {
+                int vertical = 0, align = 0;
+                if (!parseCaptionPlace(need(a, "place").toStdString(), vertical, align))
+                    throw ArgError{QStringLiteral("Unknown place \"%1\" (bottom, top or middle; left, centre or right)").arg(a.value("place").toString())};
+                if (!placeCaptions(t.captions, chosen, vertical, align)) return fail("The captions are there already");
+                Caption where;
+                where.vertical = vertical;
+                where.align = align;
+                done = QStringLiteral("Placed %1 captions at the %2").arg(chosen.empty() ? t.captions.size() : chosen.size())
+                           .arg(QString::fromStdString(captionPlaceName(where)));
+            } else if (action == "raise_over_titles") {
+                const int n = raiseCaptionsOverTitles(t.captions, s);
+                if (!n) return ok(QStringLiteral("No caption is shown over a low title"), QJsonObject{{"changed", 0}});
+                done = QStringLiteral("Moved %1 captions to the top").arg(n);
             } else {
                 throw ArgError{QStringLiteral("Unknown action \"%1\"").arg(action)};
             }

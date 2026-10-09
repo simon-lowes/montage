@@ -2254,6 +2254,45 @@ colorspaces:
         QCOMPARE(renderToCache(p, s, 0, 59, o, again, {}, &stop), -1);
     }
 
+    void captionPlacementDrawn() {
+        // Where the ink of a caption falls: the usual bottom centre, the top left, the middle right.
+        CaptionTrack track;
+        track.style.boxOpacity = 0;
+        track.style.size = 0.08;
+        track.captions = {{0, 10, "Placed"}};
+        struct Ink {
+            int left = 1 << 30, right = -1, top = 1 << 30, bottom = -1;
+        };
+        auto draw = [&](int keypad) {
+            setCaptionKeypad(track.captions[0], keypad);
+            Image img(320, 180);
+            img.fill(0, 0, 0, 1);
+            drawCaption(img, track, 5);
+            Ink k;
+            for (int y = 0; y < 180; ++y)
+                for (int x = 0; x < 320; ++x)
+                    if (img.at(x, y)[0] > 0.5f) {
+                        k.left = std::min(k.left, x);
+                        k.right = std::max(k.right, x);
+                        k.top = std::min(k.top, y);
+                        k.bottom = std::max(k.bottom, y);
+                    }
+            return k;
+        };
+        const Ink usual = draw(2), topLeft = draw(7), middleRight = draw(6);
+        QVERIFY(usual.right > 0 && topLeft.right > 0 && middleRight.right > 0);
+        // Bottom centre: ending above 92 % of the height, centred.
+        QVERIFY2(usual.bottom <= 166 && usual.bottom > 140, qPrintable(QString::number(usual.bottom)));
+        QVERIFY(std::abs((usual.left + usual.right) / 2 - 160) <= 3);
+        // Top left: as far from the top as the usual place is from the bottom, starting at the 5 % margin.
+        QVERIFY2(topLeft.top >= 14 && topLeft.top < 30, qPrintable(QString::number(topLeft.top)));
+        QVERIFY2(std::abs(topLeft.left - 16) <= 3, qPrintable(QString::number(topLeft.left)));
+        QVERIFY(std::abs((topLeft.right - topLeft.left) - (usual.right - usual.left)) <= 2);  // the same text, placed elsewhere
+        // Middle right: centred on the height, ending at the right margin.
+        QVERIFY2(std::abs((middleRight.top + middleRight.bottom) / 2 - 90) <= 6, qPrintable(QString::number(middleRight.top)));
+        QVERIFY2(std::abs(middleRight.right - 304) <= 3, qPrintable(QString::number(middleRight.right)));
+    }
+
     void wordByWordCaptions() {
         CaptionTrack track;
         track.style.textR = track.style.textG = track.style.textB = 1;

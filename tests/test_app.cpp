@@ -3005,7 +3005,7 @@ private slots:
         auto caps = [&] { return state()->sequence()->captionTracks.front().captions; };
         // The second caption is flagged, with why in its tooltip, and the first runs into it.
         auto* table = panel->findChild<QTableWidget*>();
-        QVERIFY(table && table->columnCount() == 4);
+        QVERIFY(table && table->columnCount() == 5);
         const std::vector<unsigned> issues = panel->issues();
         QVERIFY(issues[0] == kCaptionGapTooSmall && (issues[1] & kCaptionTooFast) && (issues[1] & kCaptionLineTooLong) && issues[2] == 0);
         QVERIFY(table->item(1, 3)->text() == QString(QChar(0x26A0)));
@@ -3044,6 +3044,71 @@ private slots:
         state()->undo();
         QCOMPARE(caps()[0].start, FrameTime(10));
         panel->setLimits(saved);
+        state()->newProject();
+    }
+
+    void captionsPanelPlacement() {
+        auto* panel = win_->findChild<CaptionsPanel*>();
+        QVERIFY(panel);
+        state()->newProject();
+        Id track = 0;
+        QVERIFY(state()->edit("Captions", [&](Project& p, Sequence& s) {
+            CaptionTrack t;
+            t.id = track = p.newId();
+            t.captions = {{0, 30, "One", {}}, {40, 70, "Two", {}}, {80, 110, "Three", {}}};
+            s.captionTracks.push_back(t);
+            // A lower third over the third caption.
+            Clip lower = makeGeneratorClip(p, "title_lower_third", 40);
+            lower.start = 75;
+            edit::overwrite(p, s, {TrackKind::Video, 0}, lower);
+            return true;
+        }));
+        panel->setCurrentTrack(track);
+        auto caps = [&] { return state()->sequence()->captionTracks.front().captions; };
+        auto* table = panel->findChild<QTableWidget*>();
+        QVERIFY(table && panel->findChild<QToolButton*>("placeCaptions"));
+        // With nothing selected, the caption under the playhead goes to the top.
+        table->clearSelection();
+        state()->setPlayhead(50);
+        panel->findChild<QAction*>("placeTop")->trigger();
+        QCOMPARE(captionKeypad(caps()[1]), 8);
+        QCOMPARE(captionKeypad(caps()[0]), 2);
+        QCOMPARE(table->item(1, 4)->text(), QString(QChar(0x2191)));
+        QCOMPARE(table->item(1, 4)->toolTip(), QString("top"));
+        QVERIFY(table->item(0, 4)->text().isEmpty());
+        // Selected captions lined up left, keeping where they are up or down; one undo step.
+        table->selectRow(0);
+        table->selectionModel()->select(table->model()->index(1, 0), QItemSelectionModel::Select | QItemSelectionModel::Rows);
+        QCOMPARE(panel->selectedCaptions(), (std::vector<size_t>{0, 1}));
+        panel->findChild<QAction*>("placeLeft")->trigger();
+        QCOMPARE(captionKeypad(caps()[0]), 1);
+        QCOMPARE(captionKeypad(caps()[1]), 7);
+        state()->undo();
+        QCOMPARE(captionKeypad(caps()[0]), 2);
+        QCOMPARE(captionKeypad(caps()[1]), 8);
+        // Splitting keeps the place for both halves.
+        table->clearSelection();
+        state()->setPlayhead(55);
+        QVERIFY(panel->findChild<QToolButton*>() != nullptr);
+        for (QToolButton* b : panel->findChildren<QToolButton*>())
+            if (b->text() == "Split") b->click();
+        QCOMPARE(caps().size(), size_t(4));
+        QCOMPARE(captionKeypad(caps()[1]), 8);
+        QCOMPARE(captionKeypad(caps()[2]), 8);
+        // Move Above Titles lifts the caption under the lower third.
+        panel->findChild<QAction*>("raiseCaptions")->trigger();
+        QCOMPARE(captionKeypad(caps()[3]), 8);
+        QCOMPARE(captionKeypad(caps()[0]), 2);
+        QCOMPARE(panel->raiseOverTitles(), 0);
+        // The Program monitor draws it at the top: ink in the top half of the frame at frame 90.
+        Image img(320, 180);
+        img.fill(0, 0, 0, 1);
+        drawCaption(img, state()->sequence()->captionTracks.front(), 90);
+        int top = 0, bottom = 0;
+        for (int y = 0; y < 180; ++y)
+            for (int x = 0; x < 320; ++x)
+                if (img.at(x, y)[0] > 0.5f) (y < 90 ? top : bottom)++;
+        QVERIFY2(top > 20 && bottom == 0, qPrintable(QString("%1 %2").arg(top).arg(bottom)));
         state()->newProject();
     }
 

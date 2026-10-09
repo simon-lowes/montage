@@ -131,13 +131,15 @@ CaptionsPanel::CaptionsPanel(EditorState* state, QWidget* parent) : QWidget(pare
     lay->addLayout(top);
 
     table_ = new QTableWidget(this);
-    table_->setColumnCount(4);
-    table_->setHorizontalHeaderLabels({tr("In"), tr("Out"), tr("Text"), QString()});
+    table_->setColumnCount(5);
+    table_->setHorizontalHeaderLabels({tr("In"), tr("Out"), tr("Text"), QString(), QString()});
     table_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
     table_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
     table_->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
     table_->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
     table_->horizontalHeaderItem(3)->setToolTip(tr("Captions that break the reading limits (More › Reading Limits)"));
+    table_->horizontalHeader()->setSectionResizeMode(4, QHeaderView::ResizeToContents);
+    table_->horizontalHeaderItem(4)->setToolTip(tr("Where a caption sits when not at the bottom in the middle (Place)"));
     table_->verticalHeader()->hide();
     table_->setSelectionBehavior(QAbstractItemView::SelectRows);
     table_->setEditTriggers(QAbstractItemView::DoubleClicked | QAbstractItemView::EditKeyPressed);
@@ -152,7 +154,33 @@ CaptionsPanel::CaptionsPanel(EditorState* state, QWidget* parent) : QWidget(pare
     auto* split = button(this, tr("Split"), tr("Split the caption under the playhead"));
     auto* merge = button(this, tr("Merge"), tr("Join the selected caption with the next one"));
     auto* del = button(this, tr("Delete"), tr("Delete the selected captions"));
-    for (QToolButton* b : {add, split, merge, del}) bottom->addWidget(b);
+    auto* place = button(this, tr("Place"), tr("Move the selected captions to the top or middle, or line them up left or right"));
+    place->setObjectName(QStringLiteral("placeCaptions"));
+    place->setPopupMode(QToolButton::InstantPopup);
+    auto* placeMenu = new QMenu(place);
+    const struct {
+        const char* name;
+        QString text;
+        int vertical, align;
+    } places[] = {{"placeBottom", tr("Bottom"), kCaptionBottom, -1}, {"placeTop", tr("Top"), kCaptionTop, -1},
+                  {"placeMiddle", tr("Middle"), kCaptionMiddle, -1},  {nullptr, {}, 0, 0},
+                  {"placeLeft", tr("Left"), -1, kCaptionLeft},        {"placeCentre", tr("Centre"), -1, kCaptionCentre},
+                  {"placeRight", tr("Right"), -1, kCaptionRight}};
+    for (const auto& pl : places) {
+        if (!pl.name) {
+            placeMenu->addSeparator();
+            continue;
+        }
+        const int v = pl.vertical, a = pl.align;
+        placeMenu->addAction(pl.text, this, [this, v, a] { placeCaptions(v, a); })->setObjectName(QString::fromLatin1(pl.name));
+    }
+    placeMenu->addSeparator();
+    placeMenu->addAction(tr("Move Above Titles"), this, [this] {
+        const int n = raiseOverTitles();
+        state_->message(n ? tr("Moved %1 captions to the top, clear of titles").arg(n) : tr("No caption is over a low title"), 3000);
+    })->setObjectName(QStringLiteral("raiseCaptions"));
+    place->setMenu(placeMenu);
+    for (QToolButton* b : {add, split, merge, del, place}) bottom->addWidget(b);
     bottom->addStretch();
     lay->addLayout(bottom);
 
@@ -244,11 +272,18 @@ void CaptionsPanel::rebuild() {
                 check->setToolTip(QString::fromStdString(describeCaptionIssues(problems[i], c, s->fps, lim)));
                 check->setForeground(QColor(230, 160, 40));
             }
-            for (auto* item : {in, out, text, check}) item->setData(kIndexRole, int(i));
+            // Its place, when not the usual: arrows up or to the middle, and to a side.
+            QString where = c.vertical == kCaptionTop ? QStringLiteral("\u2191") : c.vertical == kCaptionMiddle ? QStringLiteral("\u2195") : QString();
+            where += c.align == kCaptionLeft ? QStringLiteral("\u2190") : c.align == kCaptionRight ? QStringLiteral("\u2192") : QString();
+            auto* placeItem = new QTableWidgetItem(where);
+            placeItem->setFlags(placeItem->flags() & ~Qt::ItemIsEditable);
+            if (!where.isEmpty()) placeItem->setToolTip(QString::fromStdString(captionPlaceName(c)));
+            for (auto* item : {in, out, text, check, placeItem}) item->setData(kIndexRole, int(i));
             table_->setItem(int(i), 0, in);
             table_->setItem(int(i), 1, out);
             table_->setItem(int(i), 2, text);
             table_->setItem(int(i), 3, check);
+            table_->setItem(int(i), 4, placeItem);
         }
         table_->resizeRowsToContents();
         if (keepRow >= 0 && keepRow < table_->rowCount()) table_->setCurrentCell(keepRow, 2);
@@ -287,7 +322,7 @@ void CaptionsPanel::itemChanged(QTableWidgetItem* item) {
     const Sequence* s = state_->sequence();
     if (!s) return;
     const QString value = item->text();
-    if (item->column() == 3) return;
+    if (item->column() >= 3) return;
     if (item->column() == 2) {
         editTrack(tr("Edit Caption"), [i, value](CaptionTrack& t) {
             if (size_t(i) >= t.captions.size()) return false;
@@ -792,7 +827,11 @@ void CaptionsPanel::addAtPlayhead() {
         const size_t next = captionIndexAt(t, at);
         const FrameTime end = next < t.captions.size() ? std::min(at + len, t.captions[next].start) : at + len;
         if (end <= at) return false;
-        t.captions.push_back({at, end, tr("Caption").toStdString()});
+        Caption c;
+        c.start = at;
+        c.end = end;
+        c.text = tr("Caption").toStdString();
+        t.captions.push_back(std::move(c));
         return true;
     });
     if (const CaptionTrack* t = track())
@@ -840,7 +879,10 @@ void CaptionsPanel::splitAtPlayhead() {
         QStringList words = QString::fromStdString(t.captions[i].text).simplified().split(' ');
         const double frac = double(at - c->start) / double(c->end - c->start);
         const int n = std::clamp(int(std::lround(words.size() * frac)), words.size() > 1 ? 1 : 0, int(words.size()));
-        Caption second{at, c->end, words.mid(n).join(' ').toStdString()};
+        Caption second = *c;  // in the same place
+        second.start = at;
+        second.text = words.mid(n).join(' ').toStdString();
+        second.wordTimes.clear();
         t.captions[i].end = at;
         t.captions[i].text = wrapCaptionText(words.mid(0, n).join(' ').toStdString());
         second.text = wrapCaptionText(second.text);
@@ -918,6 +960,28 @@ int CaptionsPanel::findReplace(const QString& find, const QString& replace, bool
     editTrack(tr("Replace in Captions"), [&](CaptionTrack& t) {
         return (n = replaceInCaptions(t.captions, rows, find.toStdString(), replace.toStdString(), caseSensitive, wholeWords)) > 0;
     });
+    return n;
+}
+
+bool CaptionsPanel::placeCaptions(int vertical, int align) {
+    const CaptionTrack* t = track();
+    if (!t) return false;
+    std::vector<size_t> rows = selectedCaptions();
+    if (rows.empty()) {
+        const Caption* at = captionAt(*t, state_->playhead());
+        if (!at) return false;
+        rows = {size_t(at - t->captions.data())};
+    }
+    const QString label = vertical == kCaptionTop ? tr("Captions to Top") : vertical >= 0 ? tr("Place Captions") : tr("Line Up Captions");
+    return editTrack(label, [&](CaptionTrack& ct) { return montage::placeCaptions(ct.captions, rows, vertical, align); });
+}
+
+int CaptionsPanel::raiseOverTitles() {
+    const Sequence* s = state_->sequence();
+    if (!s) return 0;
+    const Sequence seq = *s;
+    int n = 0;
+    editTrack(tr("Move Captions Above Titles"), [&](CaptionTrack& t) { return (n = raiseCaptionsOverTitles(t.captions, seq)) > 0; });
     return n;
 }
 

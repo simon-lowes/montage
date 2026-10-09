@@ -1013,11 +1013,20 @@ void drawCaption(Image& img, const CaptionTrack& track, FrameTime t, const Color
     double blockW = 0;
     for (const QString& l : lines) blockW = std::max(blockW, fm.horizontalAdvance(l));
     const double blockH = lineH * double(lines.size());
-    const double bottom = std::clamp(st.position, 0.05, 1.0) * img.height;
+    // Where the style puts captions, or at the top (as far from it as the style is from the bottom),
+    // or in the middle; centred, or lined up inside the graphics-safe margins (EBU R95: 5 %).
+    const double fromBottom = std::clamp(st.position, 0.05, 1.0) * img.height;
+    const double bottom = cap->vertical == kCaptionTop      ? std::min(img.height - fromBottom, img.height / 2.0 - blockH / 2) + blockH
+                          : cap->vertical == kCaptionMiddle ? (img.height + blockH) / 2
+                                                            : fromBottom;
+    const double margin = img.width * 0.05;
+    auto leftOf = [&](double w) {
+        return cap->align == kCaptionLeft ? margin : cap->align == kCaptionRight ? img.width - margin - w : img.width / 2.0 - w / 2;
+    };
     const double grow = anim == 3 ? 0.25 : 0.0;  // room for a popped word
     // Render only the caption's area, then blend it over the frame.
-    const int x0 = std::max(0, int(std::floor(img.width / 2.0 - blockW / 2 - padX - 2 - grow * px)));
-    const int x1 = std::min(img.width, int(std::ceil(img.width / 2.0 + blockW / 2 + padX + 2 + grow * px)));
+    const int x0 = std::max(0, int(std::floor(leftOf(blockW) - padX - 2 - grow * px)));
+    const int x1 = std::min(img.width, int(std::ceil(leftOf(blockW) + blockW + padX + 2 + grow * px)));
     const int y0 = std::max(0, int(std::floor(bottom - blockH - padY - 2 - grow * px)));
     const int y1 = std::min(img.height, int(std::ceil(bottom + padY + 2 + grow * px)));
     if (x1 <= x0 || y1 <= y0) return;
@@ -1034,7 +1043,7 @@ void drawCaption(Image& img, const CaptionTrack& track, FrameTime t, const Color
         QPainterPath text, said;
         for (int li = 0; li < lines.size(); ++li) {
             const double lw = fm.horizontalAdvance(lines[li]);
-            const double left = img.width / 2.0 - lw / 2;
+            const double left = leftOf(lw);
             const double top = bottom - blockH + li * lineH;
             const double baseline = top + (lineH - fm.height()) / 2 + fm.ascent();
             // Word by word: only what has been said so far, its box growing with it.

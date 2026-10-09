@@ -66,6 +66,11 @@ public:
     bool shiftCaptions(FrameTime delta);
     bool syncToTwoPoints(FrameTime first, FrameTime last);
     int findReplace(const QString& find, const QString& replace, bool caseSensitive, bool wholeWords);
+    // Moves the selected captions (else the one under the playhead) up or down (`vertical`, -1 to
+    // keep) and lines them up (`align`, -1 to keep); one undo step. False if none moved.
+    bool placeCaptions(int vertical, int align);
+    // Moves captions shown over low titles (lower thirds, crawls) to the top; how many moved.
+    int raiseOverTitles();
 
 public slots:
     void generateDialog();

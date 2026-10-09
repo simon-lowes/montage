@@ -35,6 +35,55 @@ size_t captionIndexAt(const CaptionTrack& track, FrameTime t) {
     return size_t(it - track.captions.begin());
 }
 
+int captionKeypad(const Caption& c) {
+    const int row = c.vertical == kCaptionTop ? 2 : c.vertical == kCaptionMiddle ? 1 : 0;
+    const int col = c.align == kCaptionLeft ? 0 : c.align == kCaptionRight ? 2 : 1;
+    return row * 3 + col + 1;
+}
+
+void setCaptionKeypad(Caption& c, int keypad) {
+    if (keypad < 1 || keypad > 9) keypad = 2;
+    const int row = (keypad - 1) / 3, col = (keypad - 1) % 3;
+    c.vertical = row == 2 ? kCaptionTop : row == 1 ? kCaptionMiddle : kCaptionBottom;
+    c.align = col == 0 ? kCaptionLeft : col == 2 ? kCaptionRight : kCaptionCentre;
+}
+
+int keypadFromAss(int alignment, bool legacy) {
+    if (!legacy) return alignment >= 1 && alignment <= 9 ? alignment : 0;
+    // SSA: 1-3 along the bottom, 4 more for the top, 8 more for the middle.
+    if (alignment >= 1 && alignment <= 3) return alignment;
+    if (alignment >= 5 && alignment <= 7) return alignment + 2;
+    if (alignment >= 9 && alignment <= 11) return alignment - 5;
+    return 0;
+}
+
+std::string captionPlaceName(const Caption& c) {
+    std::string name = c.vertical == kCaptionTop ? "top" : c.vertical == kCaptionMiddle ? "middle" : "bottom";
+    if (c.align == kCaptionLeft) name += " left";
+    else if (c.align == kCaptionRight) name += " right";
+    return name;
+}
+
+bool parseCaptionPlace(const std::string& words, int& vertical, int& align) {
+    QString w = QString::fromStdString(words).toLower();
+    w.replace('-', ' ').replace('_', ' ');
+    const QStringList parts = w.split(' ', Qt::SkipEmptyParts);
+    if (parts.isEmpty()) return false;
+    int v = kCaptionBottom, a = kCaptionCentre;
+    for (const QString& part : parts) {
+        if (part == QStringLiteral("top")) v = kCaptionTop;
+        else if (part == QStringLiteral("middle")) v = kCaptionMiddle;
+        else if (part == QStringLiteral("bottom") || part == QStringLiteral("default")) v = kCaptionBottom;
+        else if (part == QStringLiteral("left")) a = kCaptionLeft;
+        else if (part == QStringLiteral("right")) a = kCaptionRight;
+        else if (part == QStringLiteral("centre") || part == QStringLiteral("center")) a = kCaptionCentre;
+        else return false;
+    }
+    vertical = v;
+    align = a;
+    return true;
+}
+
 void normalizeCaptions(std::vector<Caption>& captions) {
     for (auto& c : captions) c.text = QString::fromStdString(c.text).trimmed().toStdString();
     captions.erase(std::remove_if(captions.begin(), captions.end(),
@@ -188,8 +237,39 @@ namespace {
 std::vector<Cue> toCues(const std::vector<Caption>& captions, Rational fps) {
     const double f = fps.valid() ? fps.toDouble() : 30.0;
     std::vector<Cue> cues;
-    for (const Caption& c : captions) cues.push_back({double(c.start) / f, double(c.end) / f, c.text});
+    for (const Caption& c : captions) cues.push_back({double(c.start) / f, double(c.end) / f, c.text, {}, {}});
     return cues;
+}
+
+// An ASS alignment tag in subtitle text ({\an8}, or SSA's {\a6}): its keypad digit, 0 for none.
+int alignmentTag(const QString& text) {
+    static const QRegularExpression re(QStringLiteral("\\\\(an?)(\\d+)"));
+    static const QRegularExpression block(QStringLiteral("\\{([^}]*)\\}"));
+    for (auto it = block.globalMatch(text); it.hasNext();) {
+        const auto m = re.match(it.next().captured(1));
+        if (m.hasMatch()) return keypadFromAss(m.captured(2).toInt(), m.captured(1) == QStringLiteral("a"));
+    }
+    return 0;
+}
+
+// Where WebVTT cue settings put a cue ("line:10%", "line:0", "align:left").
+void placeFromVtt(const QString& settings, Caption& c) {
+    for (const QString& setting : settings.split(QRegularExpression(QStringLiteral("\\s+")), Qt::SkipEmptyParts)) {
+        const QString key = setting.section(':', 0, 0), value = setting.section(':', 1).section(',', 0, 0);
+        if (key == QStringLiteral("line")) {
+            if (value.endsWith('%')) {
+                const double pct = value.chopped(1).toDouble();
+                c.vertical = pct < 30 ? kCaptionTop : pct < 70 ? kCaptionMiddle : kCaptionBottom;
+            } else if (value != QStringLiteral("auto")) {
+                const int line = value.toInt();  // lines from the top, or from the bottom when negative
+                c.vertical = line < 0 ? kCaptionBottom : line <= 3 ? kCaptionTop : kCaptionMiddle;
+            }
+        } else if (key == QStringLiteral("align")) {
+            c.align = (value == QStringLiteral("left") || value == QStringLiteral("start"))  ? kCaptionLeft
+                      : (value == QStringLiteral("right") || value == QStringLiteral("end")) ? kCaptionRight
+                                                                                               : kCaptionCentre;
+        }
+    }
 }
 
 // "01:02:03,456", "01:02:03.456" or "02:03.456" in seconds; -1 if malformed.
@@ -217,8 +297,26 @@ QString stripMarkup(QString s) {
 
 }  // namespace
 
-std::string captionsToSrt(const std::vector<Caption>& captions, Rational fps) { return cuesToSrt(toCues(captions, fps)); }
-std::string captionsToVtt(const std::vector<Caption>& captions, Rational fps) { return cuesToVtt(toCues(captions, fps)); }
+std::string captionsToSrt(const std::vector<Caption>& captions, Rational fps) {
+    // A caption out of its usual place leads with the {\an} tag players read in SubRip.
+    std::vector<Cue> cues = toCues(captions, fps);
+    for (size_t i = 0; i < cues.size(); ++i)
+        if (const int k = captionKeypad(captions[i]); k != 2) cues[i].text = "{\\an" + std::to_string(k) + "}" + cues[i].text;
+    return cuesToSrt(cues);
+}
+
+std::string captionsToVtt(const std::vector<Caption>& captions, Rational fps) {
+    std::vector<Cue> cues = toCues(captions, fps);
+    for (size_t i = 0; i < cues.size(); ++i) {
+        const Caption& c = captions[i];
+        std::string& s = cues[i].settings;
+        if (c.vertical == kCaptionTop) s = "line:10%";
+        else if (c.vertical == kCaptionMiddle) s = "line:50%,center";
+        if (c.align == kCaptionLeft) s += std::string(s.empty() ? "" : " ") + "position:10% align:left";
+        else if (c.align == kCaptionRight) s += std::string(s.empty() ? "" : " ") + "position:90% align:right";
+    }
+    return cuesToVtt(cues);
+}
 
 bool parseSubtitles(const std::string& text, Rational fps, std::vector<Caption>& out, std::string* error) {
     // The other formats, from what they start with.
@@ -249,12 +347,17 @@ bool parseSubtitles(const std::string& text, Rational fps, std::vector<Caption>&
         const double b = parseCueTime(parts[1].trimmed().section(QRegularExpression(QStringLiteral("\\s+")), 0, 0));
         if (a < 0 || b < 0) continue;
         QStringList body;
-        for (int i = timing + 1; i < lines.size(); ++i)
+        int keypad = 0;
+        for (int i = timing + 1; i < lines.size(); ++i) {
+            if (!keypad) keypad = alignmentTag(lines[i]);
             if (const QString l = stripMarkup(lines[i]); !l.isEmpty()) body << l;
+        }
         Caption c;
         c.start = FrameTime(std::llround(a * f));
         c.end = FrameTime(std::llround(b * f));
         c.text = body.join('\n').toStdString();
+        placeFromVtt(parts[1].trimmed().section(QRegularExpression(QStringLiteral("\\s+")), 1), c);
+        if (keypad) setCaptionKeypad(c, keypad);
         caps.push_back(std::move(c));
     }
     normalizeCaptions(caps);
@@ -368,8 +471,9 @@ const uint8_t kRowCode[16][2] = {{0, 0},       {0x11, 0x40}, {0x11, 0x60}, {0x12
                                  {0x15, 0x60}, {0x16, 0x40}, {0x16, 0x60}, {0x17, 0x40}, {0x17, 0x60}, {0x10, 0x40},
                                  {0x13, 0x40}, {0x13, 0x60}, {0x14, 0x40}, {0x14, 0x60}};
 
-// Builds the byte pairs that load one pop-on caption and display it.
-std::vector<Pair> popOnPairs(const std::string& text) {
+// Builds the byte pairs that load one pop-on caption and display it, in its place.
+std::vector<Pair> popOnPairs(const Caption& caption) {
+    const std::string& text = caption.text;
     std::vector<Pair> out;
     uint8_t pending = 0;  // a basic character waiting for its partner
     auto flushChar = [&] {
@@ -391,7 +495,7 @@ std::vector<Pair> popOnPairs(const std::string& text) {
     };
     control(0x14, 0x20);  // resume caption loading (pop-on)
     control(0x14, 0x2e);  // erase non-displayed memory
-    // Up to four rows of 32 characters, at the bottom of the screen.
+    // Up to four rows of 32 characters, at the bottom of the screen (or the top, or the middle).
     // The caption's own lines when they fit, else re-wrapped.
     QStringList rows = QString::fromStdString(text).split('\n', Qt::SkipEmptyParts);
     for (QString& r : rows) r = r.simplified();
@@ -409,10 +513,14 @@ std::vector<Pair> popOnPairs(const std::string& text) {
         fitted << r;
     }
     while (fitted.size() > 4) fitted.removeFirst();
-    const int firstRow = 16 - int(fitted.size());
-    for (int i = 0; i < fitted.size(); ++i) {
+    const int n = int(fitted.size());
+    const int firstRow = caption.vertical == kCaptionTop ? 2 : caption.vertical == kCaptionMiddle ? 8 - n / 2 : 16 - n;
+    for (int i = 0; i < n; ++i) {
         const QList<uint> chars = fitted[i].toUcs4();
-        const int col = std::max(0, (32 - int(chars.size())) / 2);
+        const int len = int(chars.size());
+        const int col = caption.align == kCaptionLeft    ? 0
+                        : caption.align == kCaptionRight ? std::max(0, 32 - len)
+                                                         : std::max(0, (32 - len) / 2);
         const int row = firstRow + i;
         control(kRowCode[row][0], uint8_t(kRowCode[row][1] + 0x10 + (col / 4) * 2));  // preamble: row, indent
         if (col % 4) control(0x17, uint8_t(0x20 + col % 4));                        // tab offset
@@ -454,7 +562,7 @@ std::string captionsToScc(const std::vector<Caption>& captions, Rational fps) {
     };
     std::vector<Block> blocks;
     for (const Caption& c : captions) {
-        Block b{popOnPairs(c.text), toScc(c.start), toScc(c.end)};
+        Block b{popOnPairs(c), toScc(c.start), toScc(c.end)};
         if (b.pairs.size() > 4) blocks.push_back(std::move(b));
     }
     std::string out = "Scenarist_SCC V1.0\n";
@@ -506,6 +614,32 @@ struct Screen608 {
             if (const QString l = line(rows[i]); !l.isEmpty()) lines << l;
         return lines.join('\n').toStdString();
     }
+    // The caption shown, placed by the rows and columns it is on: the top
+    // third or the middle, and left or right when its rows are not centred.
+    Caption caption(FrameTime start, FrameTime end) const {
+        Caption c{start, end, text(), {}};
+        int first = 0, last = 0;
+        bool centred = true, sameLeft = true, sameRight = true;
+        int left0 = -1, right0 = -1;
+        for (int i = 1; i < 16; ++i) {
+            const size_t a = rows[i].find_first_not_of(U' ');
+            if (a == std::u32string::npos) continue;
+            const int l = int(a), r = 32 - int(rows[i].find_last_not_of(U' ') + 1);  // margins left and right
+            if (!first) first = i, left0 = l, right0 = r;
+            last = i;
+            centred = centred && std::abs(l - r) <= 4;  // indents come in fours without tab offsets
+            sameLeft = sameLeft && l == left0;
+            sameRight = sameRight && r == right0;
+        }
+        if (!first) return c;
+        const double middle = (first + last) / 2.0;
+        c.vertical = middle <= 5 ? kCaptionTop : middle <= 10 ? kCaptionMiddle : kCaptionBottom;
+        if (!centred) {
+            if (sameLeft && (!sameRight || left0 < right0)) c.align = kCaptionLeft;
+            else if (sameRight) c.align = kCaptionRight;
+        }
+        return c;
+    }
 };
 
 int pacRow(uint8_t a, uint8_t b) {
@@ -548,7 +682,7 @@ bool parseScc(const std::string& text, Rational fps, std::vector<Caption>& out, 
     std::vector<Caption> caps;
     std::vector<size_t> open;  // roll-up lines still on screen
     auto commit = [&](double at) {
-        if (since >= 0 && !shown.empty() && at > since) caps.push_back({frames(since), frames(at), shown.text(), {}});
+        if (since >= 0 && !shown.empty() && at > since) caps.push_back(shown.caption(frames(since), frames(at)));
         since = -1;
     };
     auto closeOpen = [&](double at) {

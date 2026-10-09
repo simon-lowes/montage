@@ -7307,6 +7307,29 @@ private slots:
             QCOMPARE(c[1].text, std::string("Second\nline"));
             QCOMPARE(c[0].end, c[1].start - 2);  // stretched for a slow reader up to the gap
         }
+        // Placing captions: the second at the top left, kept when exported.
+        r = edit({{"project", project}, {"action", "place"}, {"place", "top left"}, {"captions", QJsonArray{1}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(edit({{"project", project}, {"action", "place"}, {"place", "upside down"}}).value("isError").toBool());
+        r = edit({{"project", project}, {"action", "raise_over_titles"}});
+        QVERIFY2(!r.value("isError").toBool() && r.value("structuredContent").toObject().value("changed").toInt(-1) == 0,
+                 QJsonDocument(r).toJson().constData());
+        {
+            Project placed;
+            QVERIFY(loadProject(project.toStdString(), placed));
+            const auto& c = placed.active()->captionTracks.front().captions;
+            QCOMPARE(captionKeypad(c[0]), 2);
+            QCOMPARE(captionKeypad(c[1]), 7);
+        }
+        const QString placedSrt = QString::fromStdString(path("placed.srt"));
+        r = call({{"project", project}, {"export", placedSrt}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        {
+            QFile f(placedSrt);
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            const QByteArray text = f.readAll();
+            QVERIFY2(text.contains("{\\an7}Second") && !text.contains("{\\an2}"), text.constData());
+        }
         QVERIFY(edit({{"project", project}, {"action", "spin"}}).value("isError").toBool());
         QVERIFY(edit({{"project", project}, {"action", "replace"}, {"find", "zebra"}, {"replace", "x"}}).value("isError").toBool());
 

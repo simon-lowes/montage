@@ -461,6 +461,153 @@ private slots:
         QCOMPARE(replaceInCaptions(words, {}, "$", "\\1"), 0);
     }
 
+    void captionPlacement() {
+        const Rational fps{25, 1};
+        // Keypad digits, words and back.
+        Caption c{0, 50, "Hello"};
+        QCOMPARE(captionKeypad(c), 2);
+        setCaptionKeypad(c, 7);
+        QCOMPARE(c.vertical, int(kCaptionTop));
+        QCOMPARE(c.align, int(kCaptionLeft));
+        QCOMPARE(captionPlaceName(c), std::string("top left"));
+        setCaptionKeypad(c, 6);
+        QCOMPARE(captionPlaceName(c), std::string("middle right"));
+        setCaptionKeypad(c, 0);
+        QCOMPARE(captionKeypad(c), 2);
+        QCOMPARE(keypadFromAss(6, true), 8);   // SSA: 6 is top centre
+        QCOMPARE(keypadFromAss(10, true), 5);  // middle centre
+        QCOMPARE(keypadFromAss(3, false), 3);
+        int v = -1, a = -1;
+        QVERIFY(parseCaptionPlace("Top-Right", v, a));
+        QCOMPARE(v, int(kCaptionTop));
+        QCOMPARE(a, int(kCaptionRight));
+        QVERIFY(parseCaptionPlace("center", v, a));
+        QCOMPARE(v, int(kCaptionBottom));
+        QCOMPARE(a, int(kCaptionCentre));
+        QVERIFY(!parseCaptionPlace("sideways", v, a));
+        QVERIFY(!parseCaptionPlace("", v, a));
+
+        // Three captions out of their usual place, and one in it.
+        auto placed = [](FrameTime s, FrameTime e, const char* text, int keypad) {
+            Caption x{s, e, text};
+            setCaptionKeypad(x, keypad);
+            return x;
+        };
+        const std::vector<Caption> caps = {placed(0, 50, "Top left", 7), placed(60, 110, "In the middle\non the right", 6),
+                                           placed(120, 170, "Usual", 2), placed(180, 230, "Top", 8)};
+        auto samePlaces = [&](const std::vector<Caption>& got, const char* format) {
+            QVERIFY2(got.size() == caps.size(), format);
+            for (size_t i = 0; i < caps.size(); ++i)
+                QVERIFY2(captionKeypad(got[i]) == captionKeypad(caps[i]),
+                         qPrintable(QString("%1 #%2: %3").arg(format).arg(i).arg(captionKeypad(got[i]))));
+        };
+        std::vector<Caption> back;
+        // SubRip: the {\an} tag, read back and not left in the text.
+        const std::string srt = captionsToSrt(caps, fps);
+        QVERIFY2(srt.find("{\\an7}Top left") != std::string::npos && srt.find("{\\an2}") == std::string::npos, srt.c_str());
+        QVERIFY(parseSubtitles(srt, fps, back));
+        samePlaces(back, "srt");
+        QCOMPARE(back[0].text, std::string("Top left"));
+        // WebVTT cue settings.
+        const std::string vtt = captionsToVtt(caps, fps);
+        QVERIFY2(vtt.find("00:00:00.000 --> 00:00:02.000 line:10% position:10% align:left\n") != std::string::npos, vtt.c_str());
+        QVERIFY(parseSubtitles(vtt, fps, back));
+        samePlaces(back, "vtt");
+        // Others' settings: line numbers from the top or the bottom, start and end.
+        QVERIFY(parseSubtitles("WEBVTT\n\n00:01.000 --> 00:02.000 line:0 align:end\nA\n\n00:03.000 --> 00:04.000 line:-1\nB\n\n"
+                               "00:05.000 --> 00:06.000 align:start\nC\n\n",
+                               fps, back));
+        QCOMPARE(captionKeypad(back[0]), 9);
+        QCOMPARE(captionKeypad(back[1]), 2);
+        QCOMPARE(captionKeypad(back[2]), 1);
+        // SubStation's old numbering in SubRip.
+        QVERIFY(parseSubtitles("1\n00:00:01,000 --> 00:00:02,000\n{\\a6}Up there\n\n", fps, back));
+        QCOMPARE(captionKeypad(back[0]), 8);
+        QCOMPARE(back[0].text, std::string("Up there"));
+        // SCC: the rows and columns.
+        const std::string scc = captionsToScc(caps, fps);
+        QVERIFY(parseScc(scc, fps, back));
+        samePlaces(back, "scc");
+        // TTML regions and alignment styles, and someone else's: a region near the top, a style aligned to the end.
+        const std::string ttml = captionsToTtml(caps, fps);
+        QVERIFY2(ttml.find("region=\"top\" style=\"left\"") != std::string::npos, ttml.c_str());
+        QVERIFY(parseTtml(ttml, fps, back));
+        samePlaces(back, "ttml");
+        const std::string foreign =
+            "<tt xmlns=\"http://www.w3.org/ns/ttml\" xmlns:tts=\"http://www.w3.org/ns/ttml#styling\"><head>"
+            "<styling><style xml:id=\"s1\" tts:textAlign=\"end\"/></styling>"
+            "<layout><region xml:id=\"r1\" tts:origin=\"10% 5%\" tts:extent=\"80% 20%\"/>"
+            "<region xml:id=\"r2\" tts:origin=\"10% 70%\" tts:extent=\"80% 20%\" tts:displayAlign=\"after\"/></layout></head>"
+            "<body region=\"r2\"><div><p begin=\"00:00:01.000\" end=\"00:00:02.000\" region=\"r1\" style=\"s1\">Up</p>"
+            "<p begin=\"00:00:03.000\" end=\"00:00:04.000\">Down</p></div></body></tt>";
+        QVERIFY(parseTtml(foreign, fps, back));
+        QCOMPARE(captionKeypad(back[0]), 9);
+        QCOMPARE(captionKeypad(back[1]), 2);
+        // EBU STL: vertical position and justification bytes.
+        const std::string stl = captionsToStl(caps, fps);
+        QCOMPARE(int(uint8_t(stl[1024 + 13])), 1);  // the first subtitle on the top row
+        QCOMPARE(int(uint8_t(stl[1024 + 14])), 1);  // left
+        QCOMPARE(int(uint8_t(stl[1024 + 128 + 14])), 3);
+        QCOMPARE(int(uint8_t(stl[1024 + 256 + 13])), 22);  // the usual bottom row
+        QVERIFY(parseStl(stl, fps, back));
+        samePlaces(back, "stl");
+        // ASS: the \an tag, and a style's own alignment (SSA's numbering in a [V4 Styles] section).
+        const std::string ass = captionsToAss(caps, fps, CaptionStyle{}, 1920, 1080);
+        QVERIFY2(ass.find(",,{\\an6}In the middle\\Non the right") != std::string::npos, ass.c_str());
+        QVERIFY(parseAss(ass, fps, back));
+        samePlaces(back, "ass");
+        QVERIFY(parseAss("[Script Info]\n[V4 Styles]\nFormat: Name, Fontname, Alignment\nStyle: Sign,Arial,6\n\n[Events]\n"
+                         "Format: Marked, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+                         "Dialogue: Marked=0,0:00:01.00,0:00:02.00,Sign,,0,0,0,,A sign\n"
+                         "Dialogue: Marked=0,0:00:03.00,0:00:04.00,Sign,,0,0,0,,{\\an1}Moved\n",
+                         fps, back));
+        QCOMPARE(captionKeypad(back[0]), 8);
+        QCOMPARE(captionKeypad(back[1]), 1);
+        // Saved in projects.
+        Project p = makeDefaultProject();
+        CaptionTrack t;
+        t.id = p.newId();
+        t.captions = caps;
+        p.active()->captionTracks.push_back(t);
+        Project loaded;
+        QVERIFY(projectFromJson(projectToJson(p), loaded));
+        samePlaces(loaded.active()->captionTracks[0].captions, "project");
+
+        // Placing chosen captions, one axis at a time.
+        std::vector<Caption> moved = caps;
+        QVERIFY(placeCaptions(moved, {2}, kCaptionTop, -1));
+        QCOMPARE(captionKeypad(moved[2]), 8);
+        QVERIFY(placeCaptions(moved, {0, 2}, -1, kCaptionRight));
+        QCOMPARE(captionKeypad(moved[0]), 9);
+        QCOMPARE(captionKeypad(moved[2]), 9);
+        QVERIFY(!placeCaptions(moved, {0}, kCaptionTop, kCaptionRight));
+        QVERIFY(placeCaptions(moved, {}, kCaptionBottom, kCaptionCentre));
+        for (const Caption& x : moved) QCOMPARE(captionKeypad(x), 2);
+
+        // Over titles: a lower third at 100-200 lifts the captions it overlaps; a centred title and a hidden lower
+        // third do not.
+        Sequence& seq = *p.active();
+        Clip lower = makeGeneratorClip(p, "title_lower_third", 100);
+        lower.start = 100;
+        edit::overwrite(p, seq, {TrackKind::Video, 0}, lower);
+        Clip centred = makeGeneratorClip(p, "title_centred", 100);
+        centred.start = 300;
+        edit::overwrite(p, seq, {TrackKind::Video, 0}, centred);
+        Clip off = makeGeneratorClip(p, "title_lower_third", 50);
+        off.start = 400;
+        off.enabled = false;
+        edit::overwrite(p, seq, {TrackKind::Video, 0}, off);
+        std::vector<Caption> under = {placed(40, 90, "before", 2), placed(90, 120, "into it", 3), placed(150, 250, "out of it", 2),
+                                      placed(320, 360, "centred title", 2), placed(410, 440, "disabled", 2)};
+        QCOMPARE(raiseCaptionsOverTitles(under, seq), 2);
+        QCOMPARE(captionKeypad(under[0]), 2);
+        QCOMPARE(captionKeypad(under[1]), 9);  // kept to the right
+        QCOMPARE(captionKeypad(under[2]), 8);
+        QCOMPARE(captionKeypad(under[3]), 2);
+        QCOMPARE(captionKeypad(under[4]), 2);
+        QCOMPARE(raiseCaptionsOverTitles(under, seq), 0);
+    }
+
     void captionsFromClipTranscripts() {
         Project p = makeDefaultProject();
         Sequence& s = *p.active();

@@ -64,6 +64,7 @@ struct Cue {
     double end = 0;
     std::string text;
     std::string voice;  // who speaks it, when the transcript knows (WebVTT <v>)
+    std::string settings;  // WebVTT cue settings ("line:10% align:left")
 };
 std::vector<Cue> transcriptCues(const Transcript& t, int maxChars = 42, double maxSeconds = 6.0);
 

@@ -58,4 +58,14 @@ bool syncCaptions(std::vector<Caption>& captions, FrameTime fromA, FrameTime toA
 int replaceInCaptions(std::vector<Caption>& captions, const std::vector<size_t>& indices, const std::string& find,
                       const std::string& replace, bool caseSensitive = false, bool wholeWords = false);
 
+// Puts the chosen captions (all when none are chosen) in a place: up or down
+// (`vertical`, or -1 to keep each one's) and lined up (`align`, or -1 to keep).
+// False if none moved.
+bool placeCaptions(std::vector<Caption>& captions, const std::vector<size_t>& indices, int vertical, int align);
+
+// Captions on screen while a title sits in the lower part of the frame (a lower
+// third, a crawl, a title placed low) move to the top, as subtitle style guides
+// ask, keeping their alignment. Returns how many moved.
+int raiseCaptionsOverTitles(std::vector<Caption>& captions, const Sequence& seq);
+
 }  // namespace montage

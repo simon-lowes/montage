@@ -120,9 +120,15 @@ std::string captionsToTtml(const std::vector<Caption>& captions, Rational fps, c
            "%\" tts:lineHeight=\"125%\" tts:textAlign=\"center\" tts:color=\"" + colour + "\"" +
            (style.boxOpacity > 0 ? std::string(" tts:backgroundColor=\"") + box + "\"" : std::string()) +
            (style.bold ? " tts:fontWeight=\"bold\"" : "") + "/>\n";
+    out += "      <style xml:id=\"left\" tts:textAlign=\"left\"/>\n      <style xml:id=\"right\" tts:textAlign=\"right\"/>\n";
     out += "    </styling>\n    <layout>\n";
+    // Captions sit at the bottom; ones moved to the top keep the same margin from it.
     out += "      <region xml:id=\"bottom\" tts:origin=\"10% 10%\" tts:extent=\"80% " + std::to_string(bottom - 10) +
-           "%\" tts:displayAlign=\"after\"/>\n";
+           "%\" tts:displayAlign=\"after\" tts:textAlign=\"center\"/>\n";
+    out += "      <region xml:id=\"top\" tts:origin=\"10% " + std::to_string(100 - bottom) + "%\" tts:extent=\"80% " +
+           std::to_string(bottom - 10) + "%\" tts:displayAlign=\"before\" tts:textAlign=\"center\"/>\n";
+    out += "      <region xml:id=\"middle\" tts:origin=\"10% 10%\" tts:extent=\"80% 80%\" tts:displayAlign=\"center\" "
+           "tts:textAlign=\"center\"/>\n";
     out += "    </layout>\n  </head>\n  <body region=\"bottom\">\n    <div>\n";
     int n = 0;
     for (const Caption& c : captions) {
@@ -130,8 +136,13 @@ std::string captionsToTtml(const std::vector<Caption>& captions, Rational fps, c
         if (lines.isEmpty() || c.end <= c.start) continue;
         std::string body;
         for (int i = 0; i < lines.size(); ++i) body += (i ? "<br/>" : "") + xmlEscape(lines[i].toStdString());
+        std::string place;
+        if (c.vertical == kCaptionTop) place += " region=\"top\"";
+        else if (c.vertical == kCaptionMiddle) place += " region=\"middle\"";
+        if (c.align == kCaptionLeft) place += " style=\"left\"";
+        else if (c.align == kCaptionRight) place += " style=\"right\"";
         out += "      <p xml:id=\"c" + std::to_string(++n) + "\" begin=\"" + ttmlClock(double(c.start) / f) + "\" end=\"" +
-               ttmlClock(double(c.end) / f) + "\"><span style=\"caption\">" + body + "</span></p>\n";
+               ttmlClock(double(c.end) / f) + "\"" + place + "><span style=\"caption\">" + body + "</span></p>\n";
     }
     out += "    </div>\n  </body>\n</tt>\n";
     return out;
@@ -145,11 +156,25 @@ bool parseTtml(const std::string& text, Rational fps, std::vector<Caption>& out,
     bool tickSet = false;
     struct Span {
         double begin, end;
+        QString region;  // the region its content goes to (inherited)
+        int align;       // its text alignment (inherited), -1 if none was given
     };
     std::vector<Span> stack;
     bool inP = false;
     QString buf;
     double pBegin = 0, pEnd = 0;
+    Caption placed;  // the paragraph's place
+    // Where each region puts text (the third of the frame it lands in) and each style's alignment.
+    std::map<QString, int> regionPlace, regionAlign, styleAlign;
+    auto alignOf = [](const QString& v) {
+        if (v == QStringLiteral("left") || v == QStringLiteral("start")) return int(kCaptionLeft);
+        if (v == QStringLiteral("right") || v == QStringLiteral("end")) return int(kCaptionRight);
+        return v.isEmpty() ? -1 : int(kCaptionCentre);
+    };
+    auto percent = [](const QString& pair, int i) {
+        const QStringList v = pair.split(' ', Qt::SkipEmptyParts);
+        return i < v.size() && v[i].endsWith('%') ? v[i].chopped(1).toDouble() : -1.0;
+    };
     bool sawTt = false;
     std::vector<Caption> caps;
     while (!x.atEnd()) {
@@ -177,12 +202,37 @@ bool parseTtml(const std::string& text, Rational fps, std::vector<Caption>& out,
             double end = parentEnd;
             if (!e.isEmpty() && ttmlTime(e, rate, sub, ticks) >= 0) end = std::min(parentEnd, parentBegin + ttmlTime(e, rate, sub, ticks));
             else if (!d.isEmpty() && ttmlTime(d, rate, sub, ticks) >= 0) end = std::min(parentEnd, begin + ttmlTime(d, rate, sub, ticks));
-            stack.push_back({begin, end});
+            const QString id = attr(a, "id");
+            if (name == QStringLiteral("region") && !id.isEmpty()) {
+                const double y = percent(attr(a, "origin"), 1), h = percent(attr(a, "extent"), 1);
+                if (y >= 0) {
+                    const QString display = attr(a, "displayAlign");
+                    const double at = display == QStringLiteral("after")    ? y + std::max(0.0, h)
+                                      : display == QStringLiteral("center") ? y + std::max(0.0, h) / 2
+                                                                            : y;
+                    regionPlace[id] = at < 33 ? kCaptionTop : at < 67 ? kCaptionMiddle : kCaptionBottom;
+                }
+                if (const int al = alignOf(attr(a, "textAlign")); al >= 0) regionAlign[id] = al;
+            } else if (name == QStringLiteral("style") && !id.isEmpty()) {
+                if (const int al = alignOf(attr(a, "textAlign")); al >= 0) styleAlign[id] = al;
+            }
+            Span span{begin, end, stack.empty() ? QString() : stack.back().region, stack.empty() ? -1 : stack.back().align};
+            if (const QString r = attr(a, "region"); !r.isEmpty()) span.region = r;
+            for (const QString& st : attr(a, "style").split(' ', Qt::SkipEmptyParts))
+                if (auto it = styleAlign.find(st); it != styleAlign.end()) span.align = it->second;
+            if (const int al = alignOf(attr(a, "textAlign")); al >= 0) span.align = al;
+            stack.push_back(span);
             if (name == QStringLiteral("p")) {
                 inP = true;
                 buf.clear();
                 pBegin = begin;
                 pEnd = end;
+                placed = {};
+                if (auto it = regionPlace.find(span.region); it != regionPlace.end()) placed.vertical = it->second;
+                int al = span.align;
+                if (al < 0)
+                    if (auto it = regionAlign.find(span.region); it != regionAlign.end()) al = it->second;
+                if (al >= 0) placed.align = al;
             } else if (name == QStringLiteral("br") && inP) {
                 buf += '\n';
             }
@@ -197,8 +247,13 @@ bool parseTtml(const std::string& text, Rational fps, std::vector<Caption>& out,
                 QStringList lines;
                 for (const QString& l : buf.split('\n'))
                     if (const QString s = l.simplified(); !s.isEmpty()) lines << s;
-                if (!lines.isEmpty() && std::isfinite(pEnd) && pEnd > pBegin)
-                    caps.push_back({toFrames(pBegin, f), toFrames(pEnd, f), lines.join('\n').toStdString(), {}});
+                if (!lines.isEmpty() && std::isfinite(pEnd) && pEnd > pBegin) {
+                    Caption c = placed;
+                    c.start = toFrames(pBegin, f);
+                    c.end = toFrames(pEnd, f);
+                    c.text = lines.join('\n').toStdString();
+                    caps.push_back(std::move(c));
+                }
             }
         }
     }
@@ -348,6 +403,7 @@ std::string captionsToStl(const std::vector<Caption>& captions, Rational fps, co
         int64_t in, out;
         int lines;
         std::string tf;
+        int vertical, align;
     };
     std::vector<Sub> subs;
     for (const Caption& c : captions) {
@@ -361,7 +417,7 @@ std::string captionsToStl(const std::vector<Caption>& captions, Rational fps, co
             if (i) tf += "\x8A\x8A";
             tf += "\x0D\x0B\x0B" + toIso6937(lines[i]) + "\x0A\x0A";
         }
-        subs.push_back({stlFrames(c.start), stlFrames(c.end), int(lines.size()), tf});
+        subs.push_back({stlFrames(c.start), stlFrames(c.end), int(lines.size()), tf, c.vertical, c.align});
     }
     size_t blocks = 0;
     for (const Sub& s : subs) blocks += std::max<size_t>(1, (s.tf.size() + 111) / 112);
@@ -413,8 +469,11 @@ std::string captionsToStl(const std::vector<Caption>& captions, Rational fps, co
             tti[4] = 0;                                // cumulative status: none
             putTimecode(tti, 5, s.in, rate);
             putTimecode(tti, 9, s.out, rate);
-            tti[13] = char(std::max(1, 22 - 2 * (s.lines - 1)));  // vertical position: the bottom rows
-            tti[14] = 2;                                          // centred
+            // Vertical position: the bottom rows (or the top, or the middle), each line double height.
+            tti[13] = char(s.vertical == kCaptionTop      ? 1
+                           : s.vertical == kCaptionMiddle ? 12 - (s.lines - 1)
+                                                          : std::max(1, 22 - 2 * (s.lines - 1)));
+            tti[14] = char(s.align == kCaptionLeft ? 1 : s.align == kCaptionRight ? 3 : 2);  // justification
             tti[15] = 0;                                          // not a comment
             std::string tf = s.tf.substr(k * 112, 112);
             tf.resize(112, '\x8F');
@@ -445,6 +504,7 @@ bool parseStl(const std::string& data, Rational fps, std::vector<Caption>& out, 
     struct Sub {
         double in, out;
         std::string tf;
+        int row, justification;
     };
     std::vector<Sub> subs;
     int current = -1;
@@ -455,7 +515,7 @@ bool parseStl(const std::string& data, Rational fps, std::vector<Caption>& out, 
         const uint8_t ebn = b[3];
         if (ebn == 0xFE || b[15] == 1) continue;  // user data, comments
         if (sn != current || done) {
-            subs.push_back({seconds(b + 5), seconds(b + 9), {}});
+            subs.push_back({seconds(b + 5), seconds(b + 9), {}, b[13], b[14]});
             current = sn;
         }
         subs.back().tf.append(reinterpret_cast<const char*>(b + 16), 112);
@@ -481,7 +541,11 @@ bool parseStl(const std::string& data, Rational fps, std::vector<Caption>& out, 
         for (const QString& l : text.split('\n'))
             if (const QString t = l.simplified(); !t.isEmpty()) lines << t;
         if (lines.isEmpty()) continue;
-        caps.push_back({toFrames(s.in - zero, f), toFrames(s.out - zero, f), lines.join('\n').toStdString(), {}});
+        Caption c{toFrames(s.in - zero, f), toFrames(s.out - zero, f), lines.join('\n').toStdString(), {}};
+        // Rows 0-23: the top few, the middle, the bottom; justification 1 left, 2 centred, 3 right.
+        c.vertical = s.row <= 6 ? kCaptionTop : s.row <= 14 ? kCaptionMiddle : kCaptionBottom;
+        c.align = s.justification == 1 ? kCaptionLeft : s.justification == 3 ? kCaptionRight : kCaptionCentre;
+        caps.push_back(std::move(c));
     }
     normalizeCaptions(caps);
     if (caps.empty()) {
@@ -548,6 +612,7 @@ std::string captionsToAss(const std::vector<Caption>& captions, Rational fps, co
         if (lines.isEmpty() || c.end <= c.start) continue;
         QString t = lines.join(QStringLiteral("\\N"));
         t.replace('{', '(').replace('}', ')');  // braces open override tags
+        if (const int k = captionKeypad(c); k != 2) t.prepend(QStringLiteral("{\\an%1}").arg(k));
         out += "Dialogue: 0," + assTime(double(c.start) / f) + "," + assTime(double(c.end) / f) + ",Default,,0,0,0,," +
                t.toStdString() + "\n";
     }
@@ -559,13 +624,30 @@ bool parseAss(const std::string& text, Rational fps, std::vector<Caption>& out, 
     QString all = QString::fromUtf8(text.data(), qsizetype(text.size()));
     if (all.startsWith(QChar(0xFEFF))) all.remove(0, 1);
     QStringList format = {"layer", "start", "end", "style", "name", "marginl", "marginr", "marginv", "effect", "text"};
-    bool events = false;
+    QStringList styleFormat;
+    std::map<QString, int> styleKeypad;  // each style's alignment
+    bool events = false, styles = false, legacy = false;
+    static const QRegularExpression an(QStringLiteral("\\\\(an?)(\\d+)"));
     static const QRegularExpression overrides(QStringLiteral("\\{[^}]*\\}"));
     std::vector<Caption> caps;
     for (QString line : all.split('\n')) {
         line = line.trimmed();
         if (line.startsWith('[')) {
             events = line.compare(QStringLiteral("[Events]"), Qt::CaseInsensitive) == 0;
+            styles = line.contains(QStringLiteral("Styles]"), Qt::CaseInsensitive);
+            if (styles) legacy = !line.contains('+');  // SSA's [V4 Styles] number alignments their own way
+            continue;
+        }
+        if (styles) {
+            if (line.startsWith(QStringLiteral("Format:"), Qt::CaseInsensitive)) {
+                styleFormat.clear();
+                for (const QString& name : line.mid(7).split(',')) styleFormat << name.trimmed().toLower();
+            } else if (line.startsWith(QStringLiteral("Style:"), Qt::CaseInsensitive)) {
+                const QStringList v = line.mid(6).split(',');
+                const int ni = styleFormat.indexOf(QStringLiteral("name")), ai = styleFormat.indexOf(QStringLiteral("alignment"));
+                if (ni >= 0 && ai >= 0 && ai < v.size() && ni < v.size())
+                    if (const int k = keypadFromAss(v[ai].trimmed().toInt(), legacy)) styleKeypad[v[ni].trimmed()] = k;
+            }
             continue;
         }
         if (!events) continue;
@@ -592,6 +674,13 @@ bool parseAss(const std::string& text, Rational fps, std::vector<Caption>& out, 
         const int ti = format.indexOf(QStringLiteral("text"));
         if (a < 0 || b <= a || ti < 0) continue;
         QString t = fields[ti];
+        // Its place: the style's, or an alignment tag in the text.
+        int keypad = 2;
+        if (const int si = format.indexOf(QStringLiteral("style")); si >= 0)
+            if (auto it = styleKeypad.find(fields[si].trimmed().remove('*')); it != styleKeypad.end()) keypad = it->second;
+        for (auto it = overrides.globalMatch(t); it.hasNext();)
+            if (const auto m = an.match(it.next().captured()); m.hasMatch())
+                if (const int k = keypadFromAss(m.captured(2).toInt(), m.captured(1) == QStringLiteral("a"))) keypad = k;
         t.remove(overrides);
         t.replace(QStringLiteral("\\N"), QStringLiteral("\n")).replace(QStringLiteral("\\n"), QStringLiteral("\n"));
         t.replace(QStringLiteral("\\h"), QStringLiteral(" "));
@@ -599,7 +688,9 @@ bool parseAss(const std::string& text, Rational fps, std::vector<Caption>& out, 
         for (const QString& l : t.split('\n'))
             if (const QString s = l.simplified(); !s.isEmpty()) lines << s;
         if (lines.isEmpty()) continue;
-        caps.push_back({toFrames(a, f), toFrames(b, f), lines.join('\n').toStdString(), {}});
+        Caption c{toFrames(a, f), toFrames(b, f), lines.join('\n').toStdString(), {}};
+        setCaptionKeypad(c, keypad);
+        caps.push_back(std::move(c));
     }
     normalizeCaptions(caps);
     if (caps.empty()) {

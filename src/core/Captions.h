@@ -33,6 +33,13 @@ struct CaptionStyle {
     bool operator==(const CaptionStyle&) const = default;
 };
 
+// Where a caption sits when not where the track's style puts every caption
+// (bottom centre): at the top (clear of lower thirds and other text in the
+// picture, as subtitle style guides ask) or in the middle, lined up left or
+// right (to show who speaks).
+enum CaptionVertical : int { kCaptionBottom = 0, kCaptionTop = 1, kCaptionMiddle = 2 };
+enum CaptionAlign : int { kCaptionCentre = 0, kCaptionLeft = 1, kCaptionRight = 2 };
+
 struct Caption {
     FrameTime start = 0;  // timeline frames; end is exclusive
     FrameTime end = 0;
@@ -40,8 +47,23 @@ struct Caption {
     // When each word of the text is said, as fractions of the caption's length
     // (so moves and retimes keep them); empty, or not one per word, when unknown.
     std::vector<double> wordTimes;
+    int vertical = kCaptionBottom;
+    int align = kCaptionCentre;
     bool operator==(const Caption&) const = default;
 };
+
+// A caption's place as a keypad digit, as ASS's \an tag and SubRip's {\an} write
+// it (1-3 bottom, 4-6 middle, 7-9 top; left, centre, right), and back (anything
+// but 1-9 is 2, bottom centre).
+int captionKeypad(const Caption& c);
+void setCaptionKeypad(Caption& c, int keypad);
+// The keypad digit for an ASS/SSA alignment: `legacy` for SSA's numbering (1-3
+// bottom, 5-7 top, 9-11 middle). 0 for none.
+int keypadFromAss(int alignment, bool legacy);
+// The place in words ("bottom", "top left", "middle right"), and a place from
+// words like those ("top-left", "center", "right"); false for words it does not know.
+std::string captionPlaceName(const Caption& c);
+bool parseCaptionPlace(const std::string& words, int& vertical, int& align);
 
 struct CaptionTrack {
     Id id = 0;

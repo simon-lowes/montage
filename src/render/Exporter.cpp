@@ -1028,7 +1028,9 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             sub.rects = static_cast<AVSubtitleRect**>(av_mallocz(sizeof(AVSubtitleRect*)));
             sub.rects[0] = static_cast<AVSubtitleRect*>(av_mallocz(sizeof(AVSubtitleRect)));
             sub.rects[0]->type = SUBTITLE_ASS;
-            sub.rects[0]->ass = av_strdup(("0,0,Default,,0,0,0,," + assText(c.text)).c_str());
+            const int keypad = captionKeypad(c);  // players that read alignment tags keep its place
+            sub.rects[0]->ass = av_strdup(
+                ("0,0,Default,,0,0,0,," + (keypad != 2 ? "{\\an" + std::to_string(keypad) + "}" : std::string()) + assText(c.text)).c_str());
             const int n = avcodec_encode_subtitle(o.sctx, subBuf.data(), int(subBuf.size()), &sub);
             avsubtitle_free(&sub);
             if (n < 0) return false;

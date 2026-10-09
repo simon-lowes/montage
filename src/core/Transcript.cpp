@@ -228,7 +228,7 @@ std::string cuesToSrt(const std::vector<Cue>& cues, double offset) {
 std::string cuesToVtt(const std::vector<Cue>& cues, double offset) {
     std::string out = "WEBVTT\n\n";
     for (const Cue& c : cues)
-        out += stamp(c.start + offset, '.') + " --> " + stamp(c.end + offset, '.') + "\n" +
+        out += stamp(c.start + offset, '.') + " --> " + stamp(c.end + offset, '.') + (c.settings.empty() ? "" : " " + c.settings) + "\n" +
                (c.voice.empty() ? std::string() : "<v " + c.voice + ">") + c.text + "\n\n";
     return out;
 }
