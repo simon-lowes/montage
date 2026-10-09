@@ -949,21 +949,34 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
 
 namespace {
 // Stabilize: the analysed camera path (strings["motion"]) smoothed, and the
-// frame moved by the difference, zoomed so no edge shows.
+// frame moved by the difference, zoomed so no edge shows. With a rolling
+// shutter readout (Stabilize's Rolling Shutter, or Rolling Shutter Repair on
+// its own), each row is first moved back to where the picture was mid-frame:
+// it was read out later (lower) or earlier (higher) by its share of the
+// readout, while the camera moved at the speed measured around that frame.
 struct StabilizePlan {
-    double fps = 0, start = 0, zoom = 1;
+    double fps = 0, start = 0, zoom = 1, readout = 0;
     std::vector<Similarity> corrections;
+    std::vector<Similarity> velocity;  // camera speed per frame (fractions of the width, radians)
 };
+
+double rollingReadout(const Effect& e, FrameTime t) {
+    if (e.type == "rolling_shutter") return std::clamp(e.p("readout", t, 50) / 100, 0.0, 1.0);
+    return std::clamp(e.p("rolling_shutter", t, 0) / 100, 0.0, 1.0);
+}
 std::shared_ptr<const StabilizePlan> stabilizePlan(const Effect& e, FrameTime t, double aspect) {
     static std::mutex m;
     static std::map<std::string, std::shared_ptr<const StabilizePlan>> cache;
     const std::string& data = e.s("motion");
     if (data.empty()) return nullptr;
+    const bool steady = e.type == "stabilize";
     const double smooth = e.p("smoothness", t, 1.5);
     const int method = int(e.p("method", t, 2));
     const bool fill = e.p("framing", t, 0) < 0.5;
-    char key[96];
-    std::snprintf(key, sizeof key, "|%.4f|%d|%d|%.4f|%zu", smooth, method, fill ? 1 : 0, aspect, std::hash<std::string>{}(data));
+    const double readout = rollingReadout(e, t);
+    char key[128];
+    std::snprintf(key, sizeof key, "%d|%.4f|%d|%d|%.4f|%.4f|%zu", steady ? 1 : 0, smooth, method, fill ? 1 : 0, aspect, readout,
+                  std::hash<std::string>{}(data));
     std::lock_guard lock(m);
     auto& slot = cache[key];
     if (slot) return slot;
@@ -973,8 +986,26 @@ std::shared_ptr<const StabilizePlan> stabilizePlan(const Effect& e, FrameTime t,
     plan->fps = motion.fps;
     plan->start = motion.start;
     const MotionModel model = method == 0 ? MotionModel::Translation : method == 1 ? MotionModel::TranslationScale : MotionModel::Similarity;
-    plan->corrections = stabilizationCorrections(motion, smooth, model);
-    plan->zoom = fill ? stabilizationZoom(plan->corrections, aspect) : 1.0;
+    plan->corrections = steady ? stabilizationCorrections(motion, smooth, model) : std::vector<Similarity>(motion.steps.size());
+    plan->zoom = fill && steady ? stabilizationZoom(plan->corrections, aspect) : 1.0;
+    plan->readout = readout;
+    if (readout > 0 && !motion.steps.empty()) {
+        // The speed at a frame: the mean of the steps into and out of it (steps[0] is the identity).
+        const size_t n = motion.steps.size();
+        plan->velocity.resize(n);
+        double reach = 0;  // the furthest a top or bottom row moves, as a share of the frame
+        for (size_t i = 0; i < n; ++i) {
+            const Similarity& in = motion.steps[std::min(std::max<size_t>(i, 1), n - 1)];
+            const Similarity& out = motion.steps[std::min(i + 1, n - 1)];
+            Similarity& v = plan->velocity[i];
+            v.tx = (in.tx + out.tx) / 2;
+            v.ty = (in.ty + out.ty) / 2;
+            v.angle = (in.angle + out.angle) / 2;
+            reach = std::max({reach, std::fabs(v.tx) * readout / 2, std::fabs(v.ty) * readout / 2 / std::max(1e-6, aspect),
+                              std::fabs(v.angle) * readout / 2 * 0.5 * std::hypot(1.0, aspect) / std::max(1e-6, aspect)});
+        }
+        if (fill) plan->zoom *= 1 + 2 * std::min(reach, 0.25);
+    }
     if (cache.size() > 32) cache.clear();
     slot = plan;
     return plan;
@@ -986,8 +1017,12 @@ void stabilize(const Effect& e, FrameTime t, Image& img, double sourceSeconds) {
     if (!plan || plan->corrections.empty()) return;
     const long i = std::clamp<long>(std::lround((sourceSeconds - plan->start) * plan->fps), 0, long(plan->corrections.size()) - 1);
     const Similarity& c = plan->corrections[size_t(i)];
-    const double zoom = plan->zoom * (1 + e.p("extra_zoom", t, 0) / 100);
-    if (std::fabs(c.tx) < 1e-7 && std::fabs(c.ty) < 1e-7 && std::fabs(c.angle) < 1e-9 && std::fabs(c.scale - 1) < 1e-9 && zoom == 1) return;
+    const double zoom = plan->zoom * (1 + (e.type == "stabilize" ? e.p("extra_zoom", t, 0) / 100 : 0.0));
+    const Similarity v = plan->velocity.empty() ? Similarity{} : plan->velocity[size_t(i)];
+    const bool rolling = plan->readout > 0 && (std::fabs(v.tx) > 1e-9 || std::fabs(v.ty) > 1e-9 || std::fabs(v.angle) > 1e-12);
+    if (!rolling && std::fabs(c.tx) < 1e-7 && std::fabs(c.ty) < 1e-7 && std::fabs(c.angle) < 1e-9 && std::fabs(c.scale - 1) < 1e-9 &&
+        zoom == 1)
+        return;
     // Output pixel q (centred, in widths) shows source point R(-a)/s * (q / zoom - t).
     const Image src = img;
     const double W = img.width, H = img.height;
@@ -997,7 +1032,16 @@ void stabilize(const Effect& e, FrameTime t, Image& img, double sourceSeconds) {
             float* o = img.row(y);
             for (int x = 0; x < img.width; ++x, o += 4) {
                 const double qx = ((x + 0.5) - W / 2) / W / zoom - c.tx, qy = ((y + 0.5) - H / 2) / W / zoom - c.ty;
-                const double sx = (co * qx - si * qy) * W + W / 2 - 0.5, sy = (si * qx + co * qy) * W + H / 2 - 0.5;
+                double sx = (co * qx - si * qy) * W + W / 2 - 0.5, sy = (si * qx + co * qy) * W + H / 2 - 0.5;
+                if (rolling) {
+                    // The row was read `dt` frames after (or before) the middle one: the picture had moved on by the
+                    // camera's speed times dt, so the point is taken from there.
+                    const double dt = ((sy + 0.5) / H - 0.5) * plan->readout;
+                    const double px = sx + 0.5 - W / 2, py = sy + 0.5 - H / 2;
+                    const double a = v.angle * dt, ca = std::cos(a), sa = std::sin(a);
+                    sx = ca * px - sa * py + v.tx * dt * W + W / 2 - 0.5;
+                    sy = sa * px + ca * py + v.ty * dt * W + H / 2 - 0.5;
+                }
                 if (sx < -1 || sy < -1 || sx > W || sy > H) {
                     o[0] = o[1] = o[2] = o[3] = 0;
                     continue;
@@ -1019,7 +1063,7 @@ void stabilize(const Effect& e, FrameTime t, Image& img, double sourceSeconds) {
 
 void applyVideoEffect(const Effect& e, FrameTime t, Image& img, double pixelScale, double sourceSeconds) {
     if (!e.enabled || img.empty()) return;
-    if (e.type == "stabilize") {
+    if (e.type == "stabilize" || e.type == "rolling_shutter") {
         stabilize(e, t, img, sourceSeconds);  // moves the whole frame: masks do not apply
         return;
     }

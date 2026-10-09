@@ -531,7 +531,7 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
         if (e.type == "color_correct") addColorWheels(f, target(eid));
         addParamRows(f, *info, target(eid));
         const bool onClip = state_->sequence() && edit::clipById(*state_->sequence(), owner);
-        if (e.type == "stabilize" && onClip) {
+        if ((e.type == "stabilize" || e.type == "rolling_shutter") && onClip) {
             // The analysis lives in the effect; it is redone on demand.
             auto* row = new QWidget(content_);
             auto* rh = new QHBoxLayout(row);
@@ -825,12 +825,12 @@ void InspectorWidget::addEffectMenu(TrackKind kind, Id owner) {
                 if (!chain) return false;
                 Effect e = makeEffect(p, type);
                 added = e.id;
-                // Stabilize moves the whole frame: it goes first, before any filter.
-                if (type == "stabilize") chain->insert(chain->begin(), e);
+                // Stabilize and Rolling Shutter Repair move the whole frame: they go first, before any filter.
+                if (type == "stabilize" || type == "rolling_shutter") chain->insert(chain->begin(), e);
                 else chain->push_back(e);
                 return true;
             });
-            if (type == "stabilize" && added && state_->sequence() && edit::clipById(*state_->sequence(), owner))
+            if ((type == "stabilize" || type == "rolling_shutter") && added && state_->sequence() && edit::clipById(*state_->sequence(), owner))
                 QTimer::singleShot(0, this, [this, owner, added] { analyzeStabilize(owner, added); });
         });
     }

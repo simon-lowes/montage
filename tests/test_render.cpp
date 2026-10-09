@@ -16,6 +16,7 @@
 #include "render/Compositor.h"
 #include "render/Exporter.h"
 #include "render/Ocio.h"
+#include "media/Tracking.h"
 #include "render/Processing.h"
 #include "render/QualityCheck.h"
 #include "render/LutExport.h"
@@ -747,6 +748,62 @@ colorspaces:
         m = effectMatte(g, 0, img, 1.0);
         QCOMPARE(m[25 * 100 + 95], 1.0f);
         QCOMPARE(m[25 * 100 + 5], 0.0f);
+    }
+
+    void rollingShutterRepair() {
+        // The picture moves right by a tenth of the width a frame; read out over 80 % of a frame, a vertical bar
+        // leans (lower rows were read later, so further on): 20 px a frame, 16 px from top to bottom of 200 x 100.
+        CameraMotion cm;
+        cm.fps = 25;
+        cm.steps.resize(10);
+        for (size_t i = 1; i < cm.steps.size(); ++i) cm.steps[i].tx = 0.1;
+        auto leaning = [] {
+            Image img(200, 100);
+            for (int y = 0; y < 100; ++y) {
+                const double centre = 100 + 20 * ((y + 0.5) / 100 - 0.5) * 0.8;
+                for (int x = 0; x < 200; ++x) {
+                    const float v = float(std::clamp(3 - std::fabs(x + 0.5 - centre), 0.0, 1.0));
+                    float* p = img.at(x, y);
+                    p[0] = p[1] = p[2] = v;
+                    p[3] = 1;
+                }
+            }
+            return img;
+        };
+        auto bar = [](const Image& img, int y) {
+            double sum = 0, at = 0;
+            for (int x = 0; x < img.width; ++x) {
+                sum += img.at(x, y)[0];
+                at += img.at(x, y)[0] * (x + 0.5);
+            }
+            return sum > 0 ? at / sum : -1.0;
+        };
+        Image img = leaning();
+        QVERIFY(bar(img, 95) - bar(img, 5) > 14);
+        Effect rs = makeEffect("rolling_shutter", 1);
+        rs.strings["motion"] = cameraMotionToString(cm);
+        rs.params["readout"] = Param(80.0);
+        rs.params["framing"] = Param(1.0);  // show edges: no zoom
+        applyVideoEffect(rs, 5, img, 1.0, 5 / 25.0);
+        for (int y : {5, 25, 50, 75, 95}) QVERIFY2(std::fabs(bar(img, y) - 100) < 0.5, qPrintable(QString("%1: %2").arg(y).arg(bar(img, y))));
+        // Too short a readout leaves some lean; Zoom to Fill enlarges just enough to hide the moved edges.
+        Image part = leaning();
+        rs.params["readout"] = Param(40.0);
+        applyVideoEffect(rs, 5, part, 1.0, 5 / 25.0);
+        QVERIFY2(std::fabs((bar(part, 95) - bar(part, 5)) - 7.2) < 0.6, qPrintable(QString::number(bar(part, 95) - bar(part, 5))));  // half of 14.4
+        Image filled = leaning();
+        rs.params["readout"] = Param(80.0);
+        rs.params["framing"] = Param(0.0);
+        applyVideoEffect(rs, 5, filled, 1.0, 5 / 25.0);
+        QVERIFY(std::fabs(bar(filled, 50) - 100) < 0.5);
+        QVERIFY(filled.at(0, 0)[3] > 0.99f && filled.at(199, 99)[3] > 0.99f);  // no empty corners
+        // Stabilize's own Rolling Shutter: off by default, so nothing straightens.
+        Effect stab = makeEffect("stabilize", 2);
+        stab.strings["motion"] = cameraMotionToString(cm);
+        stab.params["framing"] = Param(1.0);
+        Image still = leaning();
+        applyVideoEffect(stab, 5, still, 1.0, 5 / 25.0);
+        QVERIFY(bar(still, 95) - bar(still, 5) > 14);
     }
 
     void effectMasks() {

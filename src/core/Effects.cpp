@@ -168,7 +168,14 @@ std::vector<EffectInfo> buildCatalog() {
     c.push_back({"stabilize", "Stabilize", EffectCategory::VideoFilter, "Transform",
                  {num("smoothness", "Smoothness (s)", 0, 10, 1.5, 0.1),
                   choice("method", "Method", {"Position", "Position & Scale", "Position, Scale & Rotation"}, 2),
-                  choice("framing", "Framing", {"Zoom to Fill", "Show Edges"}, 0), pct("extra_zoom", "Extra Zoom", 0, 50, 0)},
+                  choice("framing", "Framing", {"Zoom to Fill", "Show Edges"}, 0), pct("extra_zoom", "Extra Zoom", 0, 50, 0),
+                  pct("rolling_shutter", "Rolling Shutter", 0, 100, 0)},
+                 {}});
+    for (auto& pi : c.back().params) pi.keyframeable = false;
+    // Rolling Shutter Repair (Premiere's, Final Cut's): the same analysis; each row is moved back to where the
+    // picture was mid-frame, from the camera's speed and how long the sensor takes to read out (a share of a frame).
+    c.push_back({"rolling_shutter", "Rolling Shutter Repair", EffectCategory::VideoFilter, "Transform",
+                 {pct("readout", "Readout (% of a frame)", 0, 100, 50), choice("framing", "Framing", {"Zoom to Fill", "Show Edges"}, 0)},
                  {}});
     for (auto& pi : c.back().params) pi.keyframeable = false;
     {

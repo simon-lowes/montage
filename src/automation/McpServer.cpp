@@ -868,7 +868,9 @@ void McpServer::Impl::addTools() {
         "depth_blur (lens blur keeping one distance sharp), depth_fog, depth_map and relight (a virtual light) work from "
         "the picture's depth. "
         "remove_background cuts people out (keep 1 keeps the background instead), and mask.shape 4 limits any effect to "
-        "the people in the picture. object_removal paints out whatever its mask covers and fills it in.",
+        "the people in the picture. object_removal paints out whatever its mask covers and fills it in. stabilize and "
+        "rolling_shutter (straightening the skew a rolling shutter gives pans; readout as a percentage of a frame) measure "
+        "the camera's movement when added.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},"effect":{"type":"string"},
             "params":{"type":"object","additionalProperties":{"type":"number"}},
             "mask_path":{"type":"array","items":{"type":["array","object"]},"description":"A closed Bezier mask: three or more points, fractions of the clip's frame"},
@@ -936,6 +938,17 @@ void McpServer::Impl::addTools() {
             if (audioClip != (info->category == EffectCategory::AudioFilter))
                 throw ArgError{audioClip ? QStringLiteral("That is an audio clip: choose an audio effect")
                                          : QStringLiteral("That is a video clip: choose a video effect")};
+            if (type == "stabilize" || type == "rolling_shutter") {
+                // They work from the camera's movement, measured now, and move the whole frame (so they go first).
+                std::string motion, err;
+                if (!analyzeClipStabilization(l.project, l.seq(), c, motion, {}, nullptr, &err))
+                    return fail(QStringLiteral("Could not measure the camera's movement: %1").arg(QString::fromStdString(err)));
+                e.strings["motion"] = motion;
+                c.effects.insert(c.effects.begin(), e);
+                save(l);
+                return ok(QStringLiteral("Added %1 to %2").arg(QString::fromStdString(info->displayName), QString::fromStdString(c.name)),
+                          QJsonObject{{"effect_id", double(e.id)}});
+            }
             c.effects.push_back(e);
             save(l);
             return ok(QStringLiteral("Added %1 to %2").arg(QString::fromStdString(info->displayName), QString::fromStdString(c.name)),

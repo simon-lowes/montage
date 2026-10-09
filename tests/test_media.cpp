@@ -5693,6 +5693,20 @@ private slots:
         r = tool("montage_add_effect", QJsonObject{{"project", project}, {"clip", second}, {"effect", "invert"},
                                                    {"mask_path", QJsonArray{QJsonArray{0.2, 0.2}, QJsonArray{0.8, 0.2}}}});
         QVERIFY(r.value("isError").toBool() && text(r).contains("three"));
+        // Rolling Shutter Repair measures the camera's movement as it is added, and goes first.
+        r = tool("montage_add_effect", QJsonObject{{"project", project}, {"clip", second}, {"effect", "rolling_shutter"},
+                                                   {"params", QJsonObject{{"readout", 60}}}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        {
+            Project withRs;
+            QVERIFY(loadProject(project.toStdString(), withRs));
+            const Clip* c = edit::clipById(*withRs.active(), Id(second));
+            QVERIFY(c && !c->effects.empty());
+            QCOMPARE(c->effects.front().type, std::string("rolling_shutter"));
+            QCOMPARE(c->effects.front().p("readout", 0), 60.0);
+            CameraMotion cm;
+            QVERIFY(cameraMotionFromString(c->effects.front().s("motion"), cm) && !cm.steps.empty());
+        }
         r = tool("montage_add_title", QJsonObject{{"project", project}, {"text", "Hello"}, {"at", "00:00:00:00"}, {"duration", 0.3}});
         QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
         QCOMPARE(r.value("structuredContent").toObject().value("text").toString(), QString("Hello"));
@@ -6403,6 +6417,92 @@ private slots:
         QVERIFY2(soft(blend) >= 18, qPrintable(QString::number(soft(blend))));
         QVERIFY2(soft(flow) <= 6, qPrintable(QString::number(soft(flow))));
         QVERIFY(soft(nearest) <= 4);
+    }
+
+    void rollingShutterFromFootage() {
+        // A textured card panning right at 6 px a frame, as a global shutter sees it and as a rolling shutter
+        // reading out over a whole frame does (sheared: the bottom row 6 px further on than the top).
+        QImage tex(480, 270, QImage::Format_RGB32);
+        tex.fill(QColor(90, 90, 90));
+        {
+            QPainter pa(&tex);
+            std::mt19937 rng(11);
+            std::uniform_int_distribution<int> x(0, 470), y(0, 260), sz(6, 40), c(0, 255);
+            for (int i = 0; i < 260; ++i) pa.fillRect(x(rng), y(rng), sz(rng), sz(rng), QColor(c(rng), c(rng), c(rng)));
+        }
+        // At 160 % the card is 512 x 288 in the 320 x 180 frame: 6 px across the 180 rows on screen.
+        const double shear = 6.0 / 180;
+        QImage sheared(480, 270, QImage::Format_RGB32);
+        sheared.fill(QColor(90, 90, 90));
+        {
+            QPainter pa(&sheared);
+            pa.setRenderHint(QPainter::SmoothPixmapTransform);
+            pa.setTransform(QTransform(1, 0, shear, 1, -shear * 135, 0));
+            pa.drawImage(0, 0, tex);
+        }
+        const int frames = 30;
+        auto write = [&](const QImage& card, const std::string& file) {
+            const QString png = QString::fromStdString(file + ".png");
+            card.save(png);
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            s.width = 320;
+            s.height = 180;
+            s.fps = {25, 1};
+            MediaItem m = probeOrFail(p, png.toStdString());
+            p.media.push_back(m);
+            Clip c = makeClip(p, m, TrackKind::Video, s);
+            c.duration = frames;
+            c.motion.params["scale"] = Param(160.0);
+            c.motion.params["pos_x"].addKey(0, -87);
+            c.motion.params["pos_x"].addKey(frames - 1, -87 + 6 * (frames - 1));
+            edit::overwrite(p, s, {TrackKind::Video, 0}, c);
+            ExportSettings st;
+            st.path = file;
+            st.audioCodec = "none";
+            st.crf = 10;
+            st.preset = "ultrafast";
+            std::string err;
+            QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        };
+        const std::string clean = path("pan-global.mp4"), rolling = path("pan-rolling.mp4");
+        write(tex, clean);
+        write(sheared, rolling);
+        auto project = [&](const std::string& file, Project& p) {
+            p = makeDefaultProject();
+            Sequence& s = *p.active();
+            s.width = 320;
+            s.height = 180;
+            s.fps = {25, 1};
+            MediaItem mi = probeOrFail(p, file);
+            p.media.push_back(mi);
+            QVERIFY(edit::placeMedia(p, s, mi.id, 0, 0, frames, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        };
+        Project pc, pr;
+        project(clean, pc);
+        project(rolling, pr);
+        Clip& clip = trackAt(*pr.active(), {TrackKind::Video, 0})->clips.at(0);
+        std::string motion, err;
+        QVERIFY2(analyzeClipStabilization(pr, *pr.active(), clip, motion, {}, nullptr, &err), err.c_str());
+        auto difference = [&](int frame) {
+            const Image a = renderProgramFrame(pc, *pc.active(), frame, {}), b = renderProgramFrame(pr, *pr.active(), frame, {});
+            double d = 0;
+            for (int y = 20; y < 160; ++y)
+                for (int x = 60; x < 260; ++x) d += std::fabs(a.at(x, y)[1] - b.at(x, y)[1]);
+            return d / (140 * 200);
+        };
+        const double skewed = difference(15);
+        Effect rs = makeEffect(pr, "rolling_shutter");
+        rs.strings["motion"] = motion;
+        rs.params["readout"] = Param(100.0);
+        rs.params["framing"] = Param(1.0);
+        clip.effects.insert(clip.effects.begin(), rs);
+        const double repaired = difference(15);
+        QVERIFY2(repaired < skewed * 0.4, qPrintable(QString("%1 -> %2").arg(skewed).arg(repaired)));
+        // Half the readout repairs about half of it.
+        clip.effects.front().params["readout"] = Param(50.0);
+        const double half = difference(15);
+        QVERIFY2(half > repaired && half < skewed, qPrintable(QString("%1 %2 %3").arg(skewed).arg(half).arg(repaired)));
     }
 
     void trackingAndStabilization() {
