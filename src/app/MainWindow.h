@@ -29,6 +29,7 @@ namespace montage {
 
 class EditorState;
 class CompareDialog;
+class CleanFeedWindow;
 struct ConsolidateOptions;
 class PlaybackController;
 class MonitorPanel;
@@ -177,6 +178,11 @@ public:
     bool applyWorkspace(const QString& name);
     bool saveWorkspace(const QString& name);    // false for an empty name, a built-in's or one with a slash
     bool deleteWorkspace(const QString& name);  // saved ones only
+    // Video output (Premiere's Mercury Transmit, Resolve's Video Clean Feed): the Program picture alone, full screen
+    // on screen `screen` (QGuiApplication::screens(), -1 = the window's own), following playback; Esc closes it.
+    CleanFeedWindow* showCleanFeed(int screen = -1);
+    void hideCleanFeed();
+    CleanFeedWindow* cleanFeed() const { return cleanFeed_; }
     // Speed / Duration on the selected clips (each link group once), with Maintain Audio Pitch; one undo step.
     bool setSelectionSpeed(double speed, bool maintainPitch);
 
@@ -281,6 +287,7 @@ private:
     EffectsBrowser* effects_ = nullptr;
     InspectorWidget* inspector_ = nullptr;
     ScopesWidget* scopes_ = nullptr;
+    CleanFeedWindow* cleanFeed_ = nullptr;
     MixerPanel* mixer_ = nullptr;
     MulticamPanel* multicam_ = nullptr;
     CaptionsPanel* captions_ = nullptr;

@@ -39,6 +39,7 @@
 #include "media/MediaPool.h"
 #include "AutoMixDialog.h"
 #include "CaptionsPanel.h"
+#include "CleanFeed.h"
 #include "ColorWarperEditor.h"
 #include "ColorWheel.h"
 #include "CurveEditor.h"
@@ -2207,6 +2208,37 @@ private slots:
         bullet->trigger();
         QVERIFY(!edit::clipById(*state()->sequence(), id)->ramped());
         state()->newProject();
+    }
+
+    void fullScreenVideoOutput() {
+        loadDemo();
+        QVERIFY(win_->findChild<QAction*>("fullScreenProgram") && win_->findChild<QMenu*>("videoOutputMenu"));
+        // On the first screen: full screen, the Program picture fitted in black, following the playhead.
+        CleanFeedWindow* feed = win_->showCleanFeed(0);
+        QVERIFY(feed && feed->isVisible() && feed->isFullScreen());
+        QCOMPARE(feed->geometry().size(), QGuiApplication::screens().at(0)->geometry().size());
+        QTRY_VERIFY(!feed->frame().isNull());
+        const QRect pic = feed->pictureRect();
+        QVERIFY(std::abs(double(pic.width()) / pic.height() - 16.0 / 9) < 0.02);
+        QVERIFY(feed->rect().contains(pic));
+        state()->setPlayhead(10);  // the red clip
+        QTRY_VERIFY(qRed(feed->frame().pixel(feed->frame().width() / 2, feed->frame().height() / 2)) > 200);
+        state()->setPlayhead(70);  // the blue one
+        QTRY_VERIFY(qBlue(feed->frame().pixel(feed->frame().width() / 2, feed->frame().height() / 2)) > 200);
+        // What it draws: black around the picture, the picture in the middle.
+        const QImage shot = feed->grab().toImage();
+        const QPoint mid = pic.center();
+        QVERIFY(qBlue(shot.pixel(mid)) > 200);
+        if (pic.top() > 2) QCOMPARE(shot.pixel(mid.x(), 0) & 0xffffff, 0u);
+        // Esc closes it; the editor's keys go to the main window.
+        QTest::keyClick(feed, Qt::Key_Escape);
+        QVERIFY(!feed->isVisible());
+        // The menu action toggles it.
+        win_->findChild<QAction*>("fullScreenProgram")->trigger();
+        QVERIFY(win_->cleanFeed()->isVisible());
+        win_->findChild<QAction*>("fullScreenProgram")->trigger();
+        QVERIFY(!win_->cleanFeed()->isVisible());
+        state()->setPlayhead(0);
     }
 
     void clipAnimationInInspector() {

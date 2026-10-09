@@ -1,4 +1,5 @@
 #include "MainWindow.h"
+#include "CleanFeed.h"
 #include "Settings.h"
 
 #include "CompareDialog.h"
@@ -1231,6 +1232,29 @@ void MainWindow::buildMenus() {
     trimView_->setCheckable(true);
     trimView_->setChecked(appSettings().value("playback/twoUpTrim", true).toBool());
     trimView_->setToolTip(tr("While trimming, rolling, slipping or sliding, show the frames either side of the edit side by side"));
+    // Video output: the Program picture alone, full screen here or on another display.
+    QAction* fullScreen = add(play, tr("Full Screen Program"), QKeySequence("Ctrl+Shift+F"), [this] {
+        if (cleanFeed_ && cleanFeed_->isVisible()) hideCleanFeed();
+        else showCleanFeed(-1);
+    });
+    fullScreen->setObjectName(QStringLiteral("fullScreenProgram"));
+    fullScreen->setToolTip(tr("The Program picture alone, full screen (Esc to leave)"));
+    QMenu* output = play->addMenu(tr("Video Output"));
+    output->setObjectName(QStringLiteral("videoOutputMenu"));
+    connect(output, &QMenu::aboutToShow, this, [this, output] {
+        output->clear();
+        QAction* off = output->addAction(tr("Off"), this, [this] { hideCleanFeed(); });
+        off->setCheckable(true);
+        off->setChecked(!cleanFeed_ || !cleanFeed_->isVisible());
+        const QList<QScreen*> screens = QGuiApplication::screens();
+        for (int i = 0; i < screens.size(); ++i) {
+            const QRect g = screens[i]->geometry();
+            QAction* a = output->addAction(tr("Screen %1: %2 (%3 × %4)").arg(i + 1).arg(screens[i]->name()).arg(g.width()).arg(g.height()),
+                                           this, [this, i] { showCleanFeed(i); });
+            a->setCheckable(true);
+            a->setChecked(cleanFeed_ && cleanFeed_->isVisible() && cleanFeed_->screen() == screens[i]);
+        }
+    });
     play->addSeparator();
     add(play, tr("&Play / Pause"), QKeySequence(Qt::Key_Space), [this] { activeController()->togglePlay(); });
     add(play, tr("Shuttle &Reverse"), QKeySequence(Qt::Key_J), [this] { activeController()->shuttle(-1); });
@@ -1778,6 +1802,31 @@ void MainWindow::speedDialog() {
     connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
     form->addRow(buttons);
     if (dlg.exec() == QDialog::Accepted) setSelectionSpeed(speed->value() / 100.0, pitch->isChecked());
+}
+
+CleanFeedWindow* MainWindow::showCleanFeed(int screenIndex) {
+    if (!cleanFeed_) {
+        cleanFeed_ = new CleanFeedWindow(this);
+        connect(program_, &PlaybackController::frameRendered, cleanFeed_, [this](const QImage& img, FrameTime) {
+            if (cleanFeed_->isVisible()) cleanFeed_->setFrame(img);
+        });
+        connect(cleanFeed_, &CleanFeedWindow::closed, this, [this] { statusBar()->showMessage(tr("Video output off"), 2000); });
+    }
+    const QList<QScreen*> screens = QGuiApplication::screens();
+    QScreen* target = screenIndex >= 0 && screenIndex < screens.size() ? screens[screenIndex] : screen();
+    if (target) {
+        cleanFeed_->setScreen(target);
+        cleanFeed_->setGeometry(target->geometry());
+    }
+    cleanFeed_->showFullScreen();
+    cleanFeed_->raise();
+    cleanFeed_->activateWindow();
+    program_->requestFrame();
+    return cleanFeed_;
+}
+
+void MainWindow::hideCleanFeed() {
+    if (cleanFeed_ && cleanFeed_->isVisible()) cleanFeed_->close();
 }
 
 bool MainWindow::setSelectionSpeed(double sp, bool maintainPitch) {
