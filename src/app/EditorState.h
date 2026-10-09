@@ -14,6 +14,7 @@
 
 #include "core/EditOps.h"
 #include "core/History.h"
+#include "media/Psd.h"
 #include "core/Model.h"
 
 class QFileSystemWatcher;
@@ -102,6 +103,10 @@ public:
     // Importing two or more frames of a run in a render format (EXR, DPX, PNG, TIFF...) with importFiles makes one
     // too, unless Preferences turn it off ("import/imageSequences").
     Id importImageSequence(const QString& frame, Rational fps, QString* error = nullptr);
+    // A Photoshop file brought in merged (one still), as a still per layer, or as a sequence of its layers
+    // (media/Psd.h), in one undo step: the ids made, the sequence's media item last; none with `error`. importFiles
+    // brings PSDs in the way the "import/psd" preference says (merged, layers or sequence; merged by default).
+    std::vector<Id> importPsd(const QString& path, PsdImport mode, QString* error = nullptr);
     bool removeMedia(Id id, QString* error = nullptr);
 
     // The media item loaded in the source monitor and its marks

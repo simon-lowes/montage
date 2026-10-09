@@ -1,4 +1,5 @@
 #include "media/ImageSequence.h"
+#include "media/Psd.h"
 
 #include <QDir>
 #include <QFileInfo>
@@ -67,7 +68,10 @@ std::string imageSequenceName(const ImageSequence& s) {
 
 std::string mediaFileOnDisk(const std::string& path) {
     ImageSequence s;
-    return parseImageSequencePath(path, s) ? imageSequenceFrame(s, s.first) : path;
+    if (parseImageSequencePath(path, s)) return imageSequenceFrame(s, s.first);
+    std::string file;
+    int layer = 0;
+    return parsePsdLayerPath(path, file, layer) ? file : path;
 }
 
 bool detectImageSequence(const std::string& file, ImageSequence& out) {

@@ -26,7 +26,7 @@ std::string imageSequencePath(const ImageSequence& s);
 std::string imageSequenceFrame(const ImageSequence& s, int n);
 // "shot_[1001-1048].exr".
 std::string imageSequenceName(const ImageSequence& s);
-// The file a media path is on disk: itself, or a sequence's first frame.
+// The file a media path is on disk: itself, a sequence's first frame, or a Photoshop layer's file.
 std::string mediaFileOnDisk(const std::string& path);
 
 // The unbroken numbered run `file` belongs to: the same folder, the same name either side of the number and the

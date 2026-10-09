@@ -12,6 +12,7 @@
 #include "core/Transcript.h"
 #include "media/Decoder.h"
 #include "media/ImageSequence.h"
+#include "media/Psd.h"
 
 namespace montage {
 
@@ -99,6 +100,7 @@ bool consolidateProject(const Project& p, const ConsolidateOptions& o, Consolida
     });
 
     std::set<std::string> taken;
+    std::map<std::string, std::string> copiedFiles;  // source file -> its copy
     const size_t total = std::max<size_t>(1, q.media.size());
     for (size_t i = 0; i < q.media.size(); ++i) {
         if (cancel && cancel->load()) return fail("Cancelled");
@@ -207,9 +209,19 @@ bool consolidateProject(const Project& p, const ConsolidateOptions& o, Consolida
             res.trimmed++;
             res.bytes += int64_t(fs::file_size(dest, ec));
         } else {
+            // A Photoshop layer is its file's: the file is copied once for all its layers.
+            std::string file;
+            int layer = -1;
+            const bool psdLayer = parsePsdLayerPath(m.path, file, layer);
+            if (const auto done = copiedFiles.find(utf8(src)); done != copiedFiles.end()) {
+                m.path = psdLayer ? psdLayerPath(done->second, layer) : done->second;
+                m.proxyPath.clear();
+                continue;
+            }
             const fs::path dest = uniqueIn(mediaDir, utf8(src.stem()), utf8(src.extension()), taken);
             if (!fs::copy_file(src, dest, fs::copy_options::none, ec)) return fail("Cannot copy " + m.path + ": " + ec.message());
-            m.path = utf8(dest);
+            copiedFiles[utf8(src)] = utf8(dest);
+            m.path = psdLayer ? psdLayerPath(utf8(dest), layer) : utf8(dest);
             m.proxyPath.clear();
             res.copied++;
             res.bytes += int64_t(fs::file_size(dest, ec));

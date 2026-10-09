@@ -4,6 +4,7 @@
 
 #include "FieldRecorder.h"
 #include "ImageSequence.h"
+#include "Psd.h"
 
 #include <algorithm>
 #include <cmath>
@@ -157,6 +158,30 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         }
         out = m;
         return true;
+    }
+    {
+        std::string file;
+        int layer = -1;
+        if (parsePsdLayerPath(path, file, layer)) {
+            PsdInfo info;
+            if (!readPsdInfo(file, info, error)) return false;
+            if (layer >= int(info.layers.size())) {
+                if (error) *error = "The Photoshop file has no layer " + std::to_string(layer);
+                return false;
+            }
+            MediaItem m = out;
+            m.path = path;
+            if (m.name.empty()) m.name = info.layers[size_t(layer)].name;
+            m.kind = MediaKind::Image;
+            m.hasVideo = true;
+            m.hasAudio = false;
+            m.width = info.width;
+            m.height = info.height;
+            m.duration = 0;
+            m.videoCodec = "psd";
+            out = m;
+            return true;
+        }
     }
     if (rawAvailable() && isRawPath(path)) {
         RawInfo ri;
@@ -333,6 +358,39 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
         origin_ = 0;
         curPts_ = nextPts_ = -1;
         return true;
+    }
+    {
+        std::string file;
+        int layer = -1;
+        if (parsePsdLayerPath(path, file, layer)) {
+            // One layer of a Photoshop file: a still the size of the canvas, transparent round the layer.
+            PsdInfo info;
+            std::vector<uint16_t> rgba;
+            if (!readPsdPixels(file, layer, info, rgba, error)) return false;
+            raw_ = av_frame_alloc();
+            if (!raw_) return false;
+            raw_->format = AV_PIX_FMT_RGBA64;  // host byte order
+            raw_->width = info.width;
+            raw_->height = info.height;
+            raw_->color_range = AVCOL_RANGE_JPEG;
+            if (av_frame_get_buffer(raw_, 0) < 0) {
+                if (error) *error = "Out of memory reading " + path;
+                close();
+                return false;
+            }
+            for (int y = 0; y < info.height; ++y)
+                std::memcpy(raw_->data[0] + size_t(y) * size_t(raw_->linesize[0]), rgba.data() + size_t(y) * size_t(info.width) * 4,
+                            size_t(info.width) * 4 * sizeof(uint16_t));
+            dispW_ = info.width;
+            dispH_ = info.height;
+            fps_ = 25.0;
+            duration_ = 0;
+            still_ = true;
+            rotation_ = 0;
+            origin_ = 0;
+            curPts_ = nextPts_ = -1;
+            return true;
+        }
     }
     if (rawAvailable() && isRawPath(path)) {
         RawImage img;

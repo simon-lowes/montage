@@ -67,6 +67,7 @@
 #include "InspectorWidget.h"
 #include "core/Bleep.h"
 #include "core/Transcript.h"
+#include "PsdWriter.h"
 #include "SequenceSettingsDialog.h"
 #include "media/Vector.h"
 #include "SurroundPanner.h"
@@ -3160,6 +3161,59 @@ private slots:
         QCOMPARE(state()->sequence()->videoTracks[0].clips.size(), size_t(2));
         state()->undo();
         QCOMPARE(state()->sequence()->videoTracks[0].clips.size(), size_t(3));
+        state()->newProject();
+    }
+
+    void layeredPsdImport() {
+        using Px = std::array<uint16_t, 4>;
+        auto write = [&](const QString& file, uint16_t red) {
+            std::vector<TestPsdLayer> layers(2);
+            layers[0].name = "Back", layers[0].right = 64, layers[0].bottom = 36;
+            layers[0].pixel = [](int, int) { return Px{0, 0, 0, 65535}; };
+            layers[1].name = "Badge", layers[1].left = 16, layers[1].top = 8, layers[1].right = 48, layers[1].bottom = 28, layers[1].compression = 1;
+            layers[1].pixel = [red](int, int) { return Px{red, 0, uint16_t(65535 - red), 65535}; };
+            return testpsd::write(file, 64, 36, 8, false, layers, [](int, int) { return Px{0, 0, 0, 65535}; });
+        };
+        const QString file = dir_.path() + "/badge.psd";
+        QVERIFY(write(file, 65535));
+        state()->newProject();
+        // As a sequence, one undo step.
+        const auto ids = state()->importPsd(file, PsdImport::Sequence);
+        QCOMPARE(ids.size(), size_t(3));
+        const MediaItem* seqItem = state()->project().findMedia(ids.back());
+        QCOMPARE(seqItem->kind, MediaKind::Sequence);
+        const Sequence* s = state()->project().findSequence(seqItem->sequenceId);
+        QCOMPARE(s->videoTracks.size(), size_t(2));
+        QCOMPARE(s->videoTracks[1].name, std::string("Badge"));
+        state()->undo();
+        QVERIFY(!state()->project().findMedia(ids.back()));
+        // importFiles follows the preference: merged by default, else layers or a sequence.
+        QCOMPARE(state()->importFiles({file}).size(), size_t(1));
+        appSettings().setValue("import/psd", "layers");
+        QCOMPARE(state()->importFiles({file}).size(), size_t(2));
+        appSettings().setValue("import/psd", "sequence");
+        const auto again = state()->importFiles({file});
+        appSettings().remove("import/psd");
+        QCOMPARE(again.size(), size_t(3));
+        QString why;
+        QVERIFY(state()->importPsd(dir_.path() + "/missing.psd", PsdImport::Layers, &why).empty());
+        QVERIFY(!why.isEmpty());
+        // A layer in the cut follows the file when it is saved again.
+        const Id badge = again[1];
+        QCOMPARE(state()->project().findMedia(badge)->name, std::string("badge - Badge"));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& sq) {
+            return edit::placeMedia(p, sq, badge, 0, 0, 30, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        auto centre = [&]() {
+            const Image f = renderSequenceFrame(state()->project(), *state()->sequence(), 5, {});
+            const size_t i = (size_t(f.height / 2) * size_t(f.width) + size_t(f.width / 2)) * 4;
+            return QColor::fromRgbF(std::clamp(f.px[i], 0.f, 1.f), std::clamp(f.px[i + 1], 0.f, 1.f), std::clamp(f.px[i + 2], 0.f, 1.f));
+        };
+        QVERIFY(centre().red() > 200);
+        QSignalSpy spy(state(), &EditorState::mediaFileChanged);
+        QVERIFY(write(file, 0));
+        QTRY_VERIFY_WITH_TIMEOUT(spy.count() > 0, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(centre().blue() > 200 && centre().red() < 50, 5000);
         state()->newProject();
     }
 

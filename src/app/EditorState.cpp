@@ -307,7 +307,7 @@ void EditorState::watchMediaFiles() {
     QStringList wanted;
     for (const MediaItem& m : project_.media)
         if (!m.path.empty() && m.kind != MediaKind::Sequence && !m.subclipOf) {
-            const QString p = QString::fromStdString(m.path);
+            const QString p = QString::fromStdString(mediaFileOnDisk(m.path));  // a Photoshop layer's file, a sequence's first frame
             if (!wanted.contains(p) && QFileInfo::exists(p)) wanted << p;
         }
     const QStringList watched = watcher_->files();
@@ -326,27 +326,32 @@ void EditorState::reloadChangedMedia(const QStringList& paths) {
     for (const QString& path : paths) {
         if (!QFileInfo::exists(path)) continue;  // gone (or being replaced): offline until it is back
         if (!watcher_->files().contains(path)) watcher_->addPath(path);  // replaced by a new file: watch that
-        const std::string p = path.toStdString();
-        MediaPool::instance().forget(p);
-        ThumbnailCache::instance().forget(path);
-        MediaItem fresh;
-        if (!probeMedia(p, fresh)) continue;
-        for (MediaItem& m : project_.media) {
-            if (m.path != p) continue;
-            m.width = fresh.width, m.height = fresh.height, m.fps = fresh.fps;
-            m.hasVideo = fresh.hasVideo, m.hasAudio = fresh.hasAudio;
-            m.sampleRate = fresh.sampleRate, m.channels = fresh.channels, m.audioStreams = fresh.audioStreams;
-            m.videoCodec = fresh.videoCodec, m.audioCodec = fresh.audioCodec;
-            if (!m.subclipOf) {
-                m.duration = fresh.duration;
-                names << QString::fromStdString(m.name);
-            }
-            reloaded.push_back(m.id);
-        }
+        // The media in that file: the file itself, or each of its layers.
+        std::set<std::string> mediaPaths;
         for (const MediaItem& m : project_.media)
-            if (m.path == p && !m.subclipOf) startAudioDecode(m);
-        for (auto it = clipAudioRequested_.begin(); it != clipAudioRequested_.end();)
-            it = audioKeyFile(it->first) == p ? clipAudioRequested_.erase(it) : std::next(it);
+            if (!m.path.empty() && mediaFileOnDisk(m.path) == path.toStdString()) mediaPaths.insert(m.path);
+        for (const std::string& p : mediaPaths) {
+            MediaPool::instance().forget(p);
+            ThumbnailCache::instance().forget(QString::fromStdString(p));
+            MediaItem fresh;
+            if (!probeMedia(p, fresh)) continue;
+            for (MediaItem& m : project_.media) {
+                if (m.path != p) continue;
+                m.width = fresh.width, m.height = fresh.height, m.fps = fresh.fps;
+                m.hasVideo = fresh.hasVideo, m.hasAudio = fresh.hasAudio;
+                m.sampleRate = fresh.sampleRate, m.channels = fresh.channels, m.audioStreams = fresh.audioStreams;
+                m.videoCodec = fresh.videoCodec, m.audioCodec = fresh.audioCodec;
+                if (!m.subclipOf) {
+                    m.duration = fresh.duration;
+                    names << QString::fromStdString(m.name);
+                }
+                reloaded.push_back(m.id);
+            }
+            for (const MediaItem& m : project_.media)
+                if (m.path == p && !m.subclipOf) startAudioDecode(m);
+            for (auto it = clipAudioRequested_.begin(); it != clipAudioRequested_.end();)
+                it = audioKeyFile(it->first) == p ? clipAudioRequested_.erase(it) : std::next(it);
+        }
     }
     offlineChecked_.clear();
     if (reloaded.empty()) return;
@@ -412,6 +417,21 @@ Id EditorState::importImageSequence(const QString& frame, Rational fps, QString*
     return id;
 }
 
+std::vector<Id> EditorState::importPsd(const QString& path, PsdImport mode, QString* error) {
+    std::vector<Id> ids;
+    std::string err;
+    const std::string file = QFileInfo(path).absoluteFilePath().toStdString();
+    const bool ok = edit(tr("Import %1").arg(QFileInfo(path).fileName()), [&](Project& p, Sequence&) {
+        ids = montage::importPsd(p, file, mode, 5, &err);
+        return !ids.empty();
+    });
+    if (!ok) {
+        if (error) *error = QString::fromStdString(err.empty() ? "The Photoshop file could not be read" : err);
+        return {};
+    }
+    return ids;
+}
+
 std::vector<Id> EditorState::importFiles(const QStringList& paths, QStringList* errors, const QString& bin) {
     std::vector<MediaItem> items;
     // Numbered frames in render formats, two or more of a run chosen: one image sequence each.
@@ -441,6 +461,15 @@ std::vector<Id> EditorState::importFiles(const QStringList& paths, QStringList* 
             }
             m.bin = bin.toStdString();
             items.push_back(m);
+            continue;
+        }
+        // A layered Photoshop file, in layers or as a sequence when so preferred (a step of its own).
+        if (const QString how = appSettings().value(QStringLiteral("import/psd"), QStringLiteral("merged")).toString();
+            !fi.isDir() && isPsdFile(path.toStdString()) && how != QLatin1String("merged")) {
+            QString err;
+            const auto layers = importPsd(path, how == QLatin1String("sequence") ? PsdImport::Sequence : PsdImport::Layers, &err);
+            if (layers.empty() && errors) *errors << err;
+            fromFolders.insert(fromFolders.end(), layers.begin(), layers.end());
             continue;
         }
         if (fi.isDir()) {

@@ -1,5 +1,6 @@
 #include "Relink.h"
 #include "ImageSequence.h"
+#include "Psd.h"
 
 #include <QDir>
 #include <QDirIterator>
@@ -107,6 +108,11 @@ bool relinkMedia(Project& p, Id id, const std::string& path, RelinkCheck check, 
         }
         found.fps = old.fps;
         target = imageSequencePath(found);
+    }
+    {
+        std::string file;
+        int layer = -1;
+        if (parsePsdLayerPath(m->path, file, layer)) target = psdLayerPath(target, layer);  // the same layer of the file chosen
     }
     if (!probeMedia(target, n, &err)) {
         if (why) *why = err.empty() ? "It cannot be read" : err;

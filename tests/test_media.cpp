@@ -69,6 +69,9 @@
 #include "render/MusicEdit.h"
 #include "render/Highlights.h"
 #include "render/Shorts.h"
+#include "media/Psd.h"
+#include "render/ProjectManager.h"
+#include "PsdWriter.h"
 #include "render/AutoBroll.h"
 #include "render/AutoMix.h"
 #include "render/VideoDenoise.h"
@@ -6649,6 +6652,185 @@ private slots:
         QVERIFY(loadProject(project.toStdString(), back));
         QCOMPARE(back.sequences.size(), size_t(2));
         QCOMPARE(back.sequences.back().name, std::string("Highlights"));
+    }
+
+    void layeredPsd() {
+        using Px = std::array<uint16_t, 4>;
+        auto rgb = [](int r, int g, int b) { return Px{uint16_t(r * 257), uint16_t(g * 257), uint16_t(b * 257), 65535}; };
+        // White; a red layer multiplied at 50 % offset to (40, 20); a hidden blue one; a group "Brand" holding a green
+        // logo (its right half masked off) and a magenta stripe clipped to it.
+        std::vector<TestPsdLayer> layers(7);
+        layers[0].name = "Background", layers[0].right = 160, layers[0].bottom = 90, layers[0].pixel = [&](int, int) { return rgb(255, 255, 255); };
+        layers[1].name = "Red", layers[1].left = 40, layers[1].top = 20, layers[1].right = 100, layers[1].bottom = 60;
+        layers[1].blend = "mul ", layers[1].opacity = 128, layers[1].compression = 1, layers[1].pixel = [&](int, int) { return rgb(255, 0, 0); };
+        layers[2].name = "Hidden", layers[2].left = 110, layers[2].top = 50, layers[2].right = 150, layers[2].bottom = 80;
+        layers[2].hidden = true, layers[2].compression = 2, layers[2].pixel = [&](int, int) { return rgb(0, 0, 255); };
+        layers[3].name = "</Layer group>", layers[3].section = 3;
+        layers[4].name = "Logó", layers[4].left = 10, layers[4].top = 10, layers[4].right = 30, layers[4].bottom = 30;
+        layers[4].compression = 3, layers[4].pixel = [&](int, int) { return rgb(0, 255, 0); };
+        layers[4].mask = true, layers[4].maskLeft = 10, layers[4].maskTop = 10, layers[4].maskRight = 20, layers[4].maskBottom = 30;
+        layers[4].maskValue = [](int, int) { return uint16_t(65535); };
+        layers[5].name = "Stripe", layers[5].top = 15, layers[5].right = 160, layers[5].bottom = 25, layers[5].clipped = true;
+        layers[5].compression = 1, layers[5].pixel = [&](int, int) { return rgb(255, 0, 255); };
+        layers[6].name = "Brand", layers[6].section = 1, layers[6].blend = "pass";
+        const std::string file = path("art.psd");
+        QVERIFY(testpsd::write(QString::fromStdString(file), 160, 90, 8, false, layers, [&](int, int) { return rgb(255, 255, 255); }));
+        // Read back: names (the Unicode one too), bounds, blend modes, opacity, visibility, clipping and the group.
+        PsdInfo info;
+        std::string err;
+        QVERIFY2(readPsdInfo(file, info, &err), err.c_str());
+        QCOMPARE(info.width, 160);
+        QCOMPARE(info.height, 90);
+        QCOMPARE(info.layers.size(), size_t(7));
+        QCOMPARE(info.layers[4].name, std::string("Logó"));
+        QCOMPARE(info.layers[1].blend, std::string("mul "));
+        QCOMPARE(psdBlendMode(info.layers[1].blend), std::string("multiply"));
+        QVERIFY(std::fabs(info.layers[1].opacity - 128 / 255.0) < 1e-9);
+        QCOMPARE(info.layers[1].left, 40);
+        QCOMPARE(info.layers[1].bottom, 60);
+        QVERIFY(!info.layers[2].visible && info.layers[1].visible);
+        QVERIFY(info.layers[5].clipped && !info.layers[4].clipped);
+        QVERIFY(info.layers[6].isGroup && info.layers[3].isGroupEnd && !info.layers[3].hasPixels());
+        QCOMPARE(info.layers[4].group, 6);
+        QCOMPARE(info.layers[5].group, 6);
+        QCOMPARE(info.layers[1].group, -1);
+        // A single layer: a still the canvas's size with the layer where it sits (PackBits, ZIP, ZIP with prediction,
+        // and a layer mask).
+        auto pixel = [&](const std::string& media, int x, int y) {
+            VideoDecoder dec;
+            if (!dec.open(media)) return std::array<float, 4>{-1, -1, -1, -1};
+            const Image img = toImage(*dec.frameAt(0));
+            const float* p = img.at(x, y);
+            return std::array<float, 4>{p[0], p[1], p[2], p[3]};
+        };
+        auto near = [](float a, float b) { return std::fabs(a - b) < 0.01f; };
+        std::array<float, 4> c = pixel(psdLayerPath(file, 1), 50, 30);
+        QVERIFY2(near(c[0], 1) && near(c[1], 0) && near(c[3], 1), qPrintable(QString("%1 %2 %3 %4").arg(c[0]).arg(c[1]).arg(c[2]).arg(c[3])));
+        QVERIFY(near(pixel(psdLayerPath(file, 1), 5, 5)[3], 0));  // transparent off the layer
+        QVERIFY(near(pixel(psdLayerPath(file, 2), 130, 60)[2], 1));  // ZIP
+        c = pixel(psdLayerPath(file, 4), 15, 20);
+        QVERIFY(near(c[1], 1) && near(c[3], 1));  // ZIP with prediction
+        QVERIFY(near(pixel(psdLayerPath(file, 4), 25, 20)[3], 0));  // masked off
+        MediaItem probed;
+        QVERIFY2(probeMedia(psdLayerPath(file, 1), probed, &err), err.c_str());
+        QCOMPARE(probed.kind, MediaKind::Image);
+        QCOMPARE(probed.width, 160);
+        QCOMPARE(probed.name, std::string("Red"));
+        QVERIFY(!probeMedia(psdLayerPath(file, 12), probed, &err));
+        std::vector<uint16_t> merged;
+        QVERIFY(readPsdPixels(file, -1, info, merged, &err));
+        QCOMPARE(merged[0], uint16_t(65535));
+        // As a sequence: a track per layer, bottom up, with its blend mode, opacity, visibility, group and clipping.
+        Project p = makeDefaultProject();
+        const std::vector<Id> ids = importPsd(p, file, PsdImport::Sequence, 2, &err);
+        QVERIFY2(ids.size() == 6, err.c_str());  // five layers with pixels and the sequence
+        const MediaItem* item = p.findMedia(ids.back());
+        QCOMPARE(item->kind, MediaKind::Sequence);
+        QCOMPARE(item->bin, std::string("art Layers"));
+        const Sequence* s = p.findSequence(item->sequenceId);
+        QCOMPARE(s->width, 160);
+        QCOMPARE(s->height, 90);
+        QCOMPARE(s->videoTracks.size(), size_t(5));
+        QCOMPARE(s->videoTracks[1].name, std::string("Red"));
+        QCOMPARE(s->videoTracks[3].folder, std::string("Brand"));
+        QCOMPARE(s->videoTracks[4].folder, std::string("Brand"));
+        const Clip& redClip = s->videoTracks[1].clips.at(0);
+        QCOMPARE(redClip.blendMode, std::string("multiply"));
+        QVERIFY(std::fabs(redClip.motion.p("opacity", 0, 100) - 50.2) < 0.06);
+        QVERIFY(!s->videoTracks[2].clips.at(0).enabled);
+        const Clip& stripe = s->videoTracks[4].clips.at(0);
+        QCOMPARE(stripe.effects.size(), size_t(1));
+        QCOMPARE(stripe.effects[0].type, std::string("track_matte"));
+        QCOMPARE(stripe.effects[0].p("track", 0), 4.0);  // the logo's V4
+        QCOMPARE(stripe.effects[0].p("hide", 0), 0.0);
+        QCOMPARE(s->duration(), FrameTime(2 * 30));
+        // It renders as the file looks.
+        const Image frame = renderSequenceFrame(p, *s, 0, {});
+        auto at = [&](int x, int y) {
+            const size_t i = (size_t(y) * size_t(frame.width) + size_t(x)) * 4;
+            return std::array<float, 3>{frame.px[i], frame.px[i + 1], frame.px[i + 2]};
+        };
+        auto white = [&](int x, int y) { const auto v = at(x, y); return v[0] > 0.97f && v[1] > 0.97f && v[2] > 0.97f; };
+        QVERIFY(white(5, 5));
+        const auto redArea = at(50, 40);
+        QVERIFY2(redArea[0] > 0.97f && redArea[1] > 0.2f && redArea[1] < 0.85f && std::fabs(redArea[1] - redArea[2]) < 0.01f,
+                 qPrintable(QString("%1 %2 %3").arg(redArea[0]).arg(redArea[1]).arg(redArea[2])));
+        const auto logo = at(15, 12), striped = at(15, 20);
+        QVERIFY(logo[1] > 0.9f && logo[0] < 0.1f && logo[2] < 0.1f);
+        QVERIFY(white(25, 12));  // the logo's masked half
+        QVERIFY2(striped[0] > 0.9f && striped[1] < 0.1f && striped[2] > 0.9f, "the stripe shows through the logo");
+        QVERIFY(white(120, 20));  // and nowhere else
+        QVERIFY(white(130, 60));  // the hidden layer
+        // As stills only; merged as one still.
+        Project q = makeDefaultProject();
+        QCOMPARE(importPsd(q, file, PsdImport::Layers, 2, &err).size(), size_t(5));
+        QCOMPARE(q.sequences.size(), size_t(1));
+        QCOMPARE(q.media[1].name, std::string("art - Red"));
+        QCOMPARE(importPsd(q, file, PsdImport::Merged, 2, &err).size(), size_t(1));
+        // On disk, offline and relinked by its file, collected once for all its layers.
+        QCOMPARE(mediaFileOnDisk(psdLayerPath(file, 1)), file);
+        QVERIFY(!isOffline(*p.findMedia(ids[1])));
+        const std::string moved = path("moved-art.psd");
+        QVERIFY(QFile::copy(QString::fromStdString(file), QString::fromStdString(moved)));
+        QVERIFY(relinkMedia(p, ids[1], moved, RelinkCheck::Strict, &err));
+        QCOMPARE(p.findMedia(ids[1])->path, psdLayerPath(moved, 1));
+        ConsolidateOptions co;
+        co.folder = path("psd-collected");
+        co.name = "Art";
+        ConsolidateResult cr;
+        QVERIFY2(consolidateProject(p, co, &cr, {}, nullptr, &err), err.c_str());
+        QCOMPARE(cr.copied, 2);  // the file and the moved copy one layer now uses
+        Project collected;
+        QVERIFY(loadProject(cr.projectPath, collected));
+        for (const MediaItem& m : collected.media) {
+            std::string f;
+            int layer = -1;
+            if (parsePsdLayerPath(m.path, f, layer)) QVERIFY2(QFileInfo::exists(QString::fromStdString(f)) && f.find("psd-collected") != std::string::npos, m.path.c_str());
+        }
+        // 16 bits, in a PSB.
+        std::vector<TestPsdLayer> deep(1);
+        deep[0].name = "Deep", deep[0].left = 2, deep[0].top = 3, deep[0].right = 12, deep[0].bottom = 8, deep[0].compression = 1;
+        deep[0].pixel = [](int x, int) { return Px{uint16_t(0x1234 + x), 0x8000, 0xfedc, 0xffff}; };
+        const std::string big = path("deep.psb");
+        QVERIFY(testpsd::write(QString::fromStdString(big), 16, 10, 16, true, deep, [](int, int) { return Px{0, 0, 0, 0xffff}; }));
+        PsdInfo deepInfo;
+        std::vector<uint16_t> px;
+        QVERIFY2(readPsdPixels(big, 0, deepInfo, px, &err), err.c_str());
+        QVERIFY(deepInfo.psb && deepInfo.depth == 16);
+        QCOMPARE(px[(size_t(4) * 16 + 5) * 4], uint16_t(0x1234 + 5));
+        QCOMPARE(px[(size_t(4) * 16 + 5) * 4 + 2], uint16_t(0xfedc));
+        QCOMPARE(px[(size_t(0) * 16 + 0) * 4 + 3], uint16_t(0));
+        std::vector<TestPsdLayer> zipDeep = deep;
+        zipDeep[0].compression = 3;
+        QVERIFY(testpsd::write(QString::fromStdString(big), 16, 10, 16, false, zipDeep, [](int, int) { return Px{0, 0, 0, 0xffff}; }));
+        QVERIFY2(readPsdPixels(big, 0, deepInfo, px, &err), err.c_str());
+        QCOMPARE(px[(size_t(4) * 16 + 9) * 4], uint16_t(0x1234 + 9));
+        // Over MCP: one layer, and the layers as a nested sequence.
+        Project mp = makeDefaultProject();
+        const QString project = QString::fromStdString(path("psd-mcp.montage"));
+        QVERIFY(saveProject(mp, project.toStdString()));
+        McpServer server;
+        int rid = 1;
+        auto call = [&](QJsonObject args) {
+            args["project"] = project;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", rid++}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_place_media"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call({{"media", QString::fromStdString(file)}, {"psd_mode", "layer"}, {"layer", "Red"}, {"at", 0}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        r = call({{"media", QString::fromStdString(file)}, {"psd_mode", "sequence"}, {"at", 0}, {"track", "V2"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(call({{"media", QString::fromStdString(file)}, {"psd_mode", "layer"}, {"layer", "Nope"}}).value("isError").toBool());
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.sequences.size(), size_t(2));
+        QCOMPARE(back.active()->videoTracks[0].clips.at(0).name, std::string("art - Red"));
+        const Clip& nested = back.active()->videoTracks[1].clips.at(0);
+        QCOMPARE(back.findMedia(nested.mediaId)->kind, MediaKind::Sequence);
     }
 
     void makeShortsFromFootage() {

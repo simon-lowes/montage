@@ -24,6 +24,7 @@
 #include <QListView>
 #include <QMenu>
 #include <QMessageBox>
+#include <QPushButton>
 #include <QMimeData>
 #include <QPointer>
 #include <QProgressDialog>
@@ -56,6 +57,7 @@
 #include "core/Slate.h"
 #include "core/AudioChannels.h"
 #include "media/ImageSequence.h"
+#include "media/Psd.h"
 #include "core/MediaLog.h"
 #include "core/AutoTag.h"
 #include "media/Analysis.h"
@@ -420,7 +422,7 @@ void MediaBinWidget::importDialog() {
         this, tr("Import Media"), dir,
         tr("Media (*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.mxf *.mts *.m2ts *.ts *.mpg *.mpeg *.wmv *.flv *.gif "
            "*.wav *.mp3 *.aac *.m4a *.flac *.ogg *.opus *.aif *.aiff *.png *.jpg *.jpeg *.tif *.tiff *.bmp *.webp *.exr *.svg *.json "
-           "*.dng *.cr2 *.cr3 *.nef *.arw *.raf *.rw2 *.orf *.pef *.srw *.3fr *.iiq);;All files (*)"));
+           "*.psd *.psb *.dng *.cr2 *.cr3 *.nef *.arw *.raf *.rw2 *.orf *.pef *.srw *.3fr *.iiq);;All files (*)"));
     if (files.isEmpty()) return;
     settings.setValue("lastImportDir", QFileInfo(files.first()).absolutePath());
     importInto(files, smart_ ? QString() : bin_);
@@ -447,8 +449,31 @@ bool MediaBinWidget::setImageSequenceRate(Id media, double fps) {
 }
 
 void MediaBinWidget::importInto(const QStringList& files, const QString& bin) {
-    QStringList errors;
-    state_->importFiles(files, &errors, bin);
+    QStringList errors, rest;
+    // Layered Photoshop files: merged, as a still per layer, or as a sequence of their layers (as Premiere asks).
+    QStringList psds;
+    for (const QString& f : files) (isPsdFile(f.toStdString()) ? psds : rest) << f;
+    if (!psds.isEmpty()) {
+        QMessageBox ask(QMessageBox::Question, tr("Import Layered File"),
+                        tr("How should %1 come in?").arg(psds.size() == 1 ? QFileInfo(psds.first()).fileName() : tr("these Photoshop files")),
+                        QMessageBox::Cancel, this);
+        ask.setObjectName(QStringLiteral("psdImportQuestion"));
+        QPushButton* merged = ask.addButton(tr("Merged"), QMessageBox::AcceptRole);
+        QPushButton* layers = ask.addButton(tr("Individual Layers"), QMessageBox::AcceptRole);
+        QPushButton* sequence = ask.addButton(tr("Sequence"), QMessageBox::AcceptRole);
+        merged->setObjectName(QStringLiteral("psdMerged"));
+        layers->setObjectName(QStringLiteral("psdLayers"));
+        sequence->setObjectName(QStringLiteral("psdSequence"));
+        ask.setDefaultButton(sequence);
+        ask.exec();
+        if (ask.clickedButton() == merged) rest << psds;
+        else if (ask.clickedButton() == layers || ask.clickedButton() == sequence)
+            for (const QString& f : psds) {
+                QString err;
+                if (state_->importPsd(f, ask.clickedButton() == sequence ? PsdImport::Sequence : PsdImport::Layers, &err).empty()) errors << err;
+            }
+    }
+    if (!rest.isEmpty()) state_->importFiles(rest, &errors, bin);
     if (!errors.isEmpty()) QMessageBox::warning(this, tr("Import"), errors.join("\n"));
 }
 
@@ -1174,6 +1199,18 @@ void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos)
                     const double v = QInputDialog::getDouble(this, tr("Interpret Frame Rate"), tr("Frames per second:"), fps, 1, 240, 3, &ok);
                     if (ok) setImageSequenceRate(id, v);
                 })->setObjectName(QStringLiteral("interpretFrameRate"));
+        // A merged Photoshop file: its layers as a sequence, or each a still.
+        if (pictures.size() == 1)
+            if (const MediaItem* m = state_->project().findMedia(pictures.front()); m && isPsdFile(m->path)) {
+                menu.addAction(tr("Import Layers as Sequence"), this, [this, path = QString::fromStdString(m->path)] {
+                    QString err;
+                    if (state_->importPsd(path, PsdImport::Sequence, &err).empty()) QMessageBox::warning(this, tr("Import Layers"), err);
+                })->setObjectName(QStringLiteral("psdLayersAsSequence"));
+                menu.addAction(tr("Import Layers as Stills"), this, [this, path = QString::fromStdString(m->path)] {
+                    QString err;
+                    if (state_->importPsd(path, PsdImport::Layers, &err).empty()) QMessageBox::warning(this, tr("Import Layers"), err);
+                })->setObjectName(QStringLiteral("psdLayersAsStills"));
+            }
         // 360° footage: placed in a flat sequence as a view out of the sphere (Reframe 360°).
         bool all360 = true;
         for (Id id : pictures) all360 = all360 && state_->project().findMedia(id)->projection == "equirect";

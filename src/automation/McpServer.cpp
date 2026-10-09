@@ -25,6 +25,7 @@
 #include "render/Spherical.h"
 #include "render/ClipPlacement.h"
 #include "media/ImageSequence.h"
+#include "media/Psd.h"
 #include "core/AutoTag.h"
 #include "core/Automation.h"
 #include "core/CaptionTools.h"
@@ -651,19 +652,56 @@ void McpServer::Impl::addTools() {
             "insert":{"type":"boolean","default":false},
             "image_sequence":{"type":"boolean","default":false,"description":"media is one frame of a numbered image sequence (EXR, DPX, PNG...): place the whole run"},
             "fps":{"type":"number","description":"The image sequence's frame rate; default the sequence's"},
+            "psd_mode":{"type":"string","enum":["merged","layer","sequence"],"default":"merged",
+                        "description":"A Photoshop file: merged as one still, one `layer` of it, or its layers as a nested sequence (a track per layer with its blend mode, opacity, visibility, group and clipping)"},
+            "layer":{"type":["number","string"],"description":"With psd_mode layer: the layer's name or index (0 = the bottom)"},
             "mode":{"type":"string","enum":["overwrite","insert","place_on_top","ripple_overwrite","smart_insert"],
                     "description":"Default overwrite (insert, when insert is true)"}},
             "required":["project","media"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
+            // A Photoshop file's layers (before the sequence is taken: a nested sequence adds one).
+            Id psdMedia = 0;
+            if (const QString pm = str(a, "psd_mode", "merged"); pm != QLatin1String("merged")) {
+                const std::string file = absolute(need(a, "media")).toStdString();
+                if (!isPsdFile(file)) throw ArgError{"psd_mode is for Photoshop files (.psd, .psb)"};
+                std::string err;
+                if (pm == QLatin1String("sequence")) {
+                    const std::vector<Id> ids = importPsd(l.project, file, PsdImport::Sequence, 5, &err);
+                    if (ids.empty()) throw ArgError{QString::fromStdString(err)};
+                    psdMedia = ids.back();
+                } else if (pm == QLatin1String("layer")) {
+                    PsdInfo info;
+                    if (!readPsdInfo(file, info, &err)) throw ArgError{QString::fromStdString(err)};
+                    const QJsonValue want = a.value("layer");
+                    int index = -1;
+                    for (const PsdLayer& layer : info.layers)
+                        if (layer.hasPixels() && (want.isDouble() ? layer.index == want.toInt() : QString::fromStdString(layer.name) == want.toString()))
+                            index = layer.index;
+                    if (index < 0) throw ArgError{QStringLiteral("No layer %1 with pixels in %2").arg(want.toVariant().toString(), need(a, "media"))};
+                    const std::string key = psdLayerPath(file, index);
+                    for (const MediaItem& m : l.project.media)
+                        if (m.path == key) psdMedia = m.id;
+                    if (!psdMedia) {
+                        MediaItem m;
+                        if (!probeMedia(key, m, &err)) throw ArgError{QString::fromStdString(err)};
+                        m.name = QFileInfo(QString::fromStdString(file)).completeBaseName().toStdString() + " - " + info.layers[size_t(index)].name;
+                        m.id = psdMedia = l.project.newId();
+                        l.project.media.push_back(m);
+                    }
+                } else {
+                    throw ArgError{"\"psd_mode\" is merged, layer or sequence"};
+                }
+            }
             Sequence& s = l.seq();
             // A subclip (by name) places its range of its media, under its name.
             const MediaItem* sub = nullptr;
             for (const MediaItem& m : l.project.media)
                 if (m.subclipOf && m.name == need(a, "media").toStdString()) sub = &m;
             const std::string subName = sub ? sub->name : std::string();
-            Id media = 0;
-            if (a.value("image_sequence").toBool()) {
+            Id media = psdMedia;
+            if (media) {
+            } else if (a.value("image_sequence").toBool()) {
                 ImageSequence seq;
                 if (!detectImageSequence(absolute(need(a, "media")).toStdString(), seq))
                     throw ArgError{QStringLiteral("%1 is not part of a numbered sequence").arg(need(a, "media"))};
