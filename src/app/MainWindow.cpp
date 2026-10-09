@@ -44,6 +44,7 @@
 #include <QScreen>
 #include <QDir>
 #include <QSpinBox>
+#include <QStandardPaths>
 #include <QSettings>
 #include <QShortcut>
 #include <QStatusBar>
@@ -120,6 +121,7 @@
 #include "render/Compositor.h"
 #include "render/AutoBroll.h"
 #include "render/Highlights.h"
+#include "render/Shorts.h"
 #include "render/MusicEdit.h"
 #include "render/VoiceMatch.h"
 #include "render/Exporter.h"
@@ -1041,6 +1043,7 @@ void MainWindow::buildMenus() {
     })->setObjectName(QStringLiteral("duplicateSequence"));
     add(seqM, tr("Auto &Reframe Sequence…"), QKeySequence(), [this] { autoReframeDialog(); })
         ->setObjectName(QStringLiteral("autoReframeSequence"));
+    add(seqM, tr("Make &Shorts…"), QKeySequence(), [this] { shortsDialog(); })->setObjectName(QStringLiteral("makeShorts"));
     add(seqM, tr("Build Cut from &Script…"), QKeySequence(), [this] { scriptCutDialog(); })
         ->setObjectName(QStringLiteral("buildScriptCut"));
     add(seqM, tr("Auto &Mix…"), QKeySequence(), [this] { AutoMixDialog::run(state_, this); })->setObjectName(QStringLiteral("autoMix"));
@@ -3336,6 +3339,220 @@ Id MainWindow::makeHighlights(double seconds, const QString& lookFor) {
         state_->message(tr("%n moment(s) in a new Highlights sequence", "", int(moments.size())), 6000);
     }
     return seq;
+}
+
+std::vector<Id> MainWindow::shortsSource() const {
+    std::vector<Id> media;
+    auto usable = [](const MediaItem* m) { return m && !m->subclipOf && m->transcript && !m->transcript->empty(); };
+    for (Id id : bin_ ? bin_->selectedMedia() : std::vector<Id>{})
+        if (usable(state_->project().findMedia(id))) media.push_back(id);
+    if (media.empty())
+        for (const MediaItem& m : state_->project().media)
+            if (usable(&m)) media.push_back(m.id);
+    return media;
+}
+
+std::vector<Id> MainWindow::makeShorts(const ShortsOptions& o, const ShortBuild& b, bool queue) {
+    const std::vector<Id> media = shortsSource();
+    if (media.empty()) {
+        state_->message(tr("Transcribe a video or recording first: shorts are found from what is said"), 6000);
+        return {};
+    }
+    auto project = std::make_shared<const Project>(state_->project());
+    std::vector<ShortMoment> moments;
+    if (!runWithProgress(this, state_, tr("Finding shorts..."), [&, project](const auto& progress, const auto* cancel, std::string* e) {
+            moments = findShorts(*project, media, o, progress, cancel, e);
+            return !moments.empty();
+        }))
+        return {};
+    return buildShorts(moments, b, queue);
+}
+
+std::vector<Id> MainWindow::buildShorts(const std::vector<ShortMoment>& moments, const ShortBuild& b, bool queue) {
+    if (moments.empty()) return {};
+    // Built on a copy while the footage is read (reframing looks at every shot), then added in one undo step.
+    auto work = std::make_shared<Project>(state_->project());
+    std::vector<Id> made;
+    std::map<Id, int> counts;
+    if (!runWithProgress(this, state_, tr("Building shorts..."), [&, work](const auto& progress, const auto* cancel, std::string* e) {
+            for (size_t i = 0; i < moments.size(); ++i) {
+                const MediaItem* m = work->findMedia(moments[i].media);
+                const std::string base = m ? QFileInfo(QString::fromStdString(m->name)).completeBaseName().toStdString() : "Short";
+                const std::string name = base + " - Short " + std::to_string(++counts[moments[i].media]);
+                const Id id = makeShortSequence(*work, moments[i], b, name, cancel, e);
+                if (!id) return false;
+                made.push_back(id);
+                progress(double(i + 1) / double(moments.size()));
+            }
+            return true;
+        }))
+        return {};
+    const bool ok = state_->edit(tr("Make Shorts"), [&](Project& p, Sequence&) {
+        for (Id id : made) {
+            p.sequences.push_back(*work->findSequence(id));
+            for (const MediaItem& m : work->media)
+                if (m.kind == MediaKind::Sequence && m.sequenceId == id) p.media.push_back(m);
+        }
+        p.nextId = std::max(p.nextId, work->nextId);
+        return true;
+    });
+    if (!ok) return {};
+    if (queue) {
+        const ExportPreset* preset = findExportPreset("Social - TikTok / Reels / Shorts");
+        QString folder = appSettings().value(QStringLiteral("export/lastDirectory")).toString();
+        if (folder.isEmpty() || !QDir(folder).exists()) folder = QStandardPaths::writableLocation(QStandardPaths::MoviesLocation);
+        if (folder.isEmpty()) folder = QDir::homePath();
+        for (Id id : made) {
+            const Sequence* s = state_->project().findSequence(id);
+            ExportSettings st = preset ? preset->settings : ExportSettings{};
+            st.burnInCaptions = !s->captionTracks.empty();
+            st.path = QDir(folder).filePath(QString::fromStdString(s->name) + QStringLiteral(".mp4")).toStdString();
+            queue_->add(QString::fromStdString(s->name), preset ? QString::fromStdString(preset->name) : QString(), state_->project(), id, st);
+        }
+        if (queueDock_) queueDock_->show();
+    }
+    state_->setActiveSequence(made.front());
+    state_->message(queue ? tr("%n short(s) made and queued to render", "", int(made.size())) : tr("%n short(s) made", "", int(made.size())), 6000);
+    return made;
+}
+
+void MainWindow::shortsDialog() {
+    if (shortsSource().empty()) {
+        state_->message(tr("Transcribe a video or recording first: shorts are found from what is said"), 6000);
+        return;
+    }
+    QDialog dlg(this);
+    dlg.setObjectName(QStringLiteral("shortsDialog"));
+    dlg.setWindowTitle(tr("Make Shorts"));
+    auto* lay = new QVBoxLayout(&dlg);
+    auto* form = new QFormLayout;
+    lay->addLayout(form);
+    QSettings st = appSettings();
+    auto* count = new QSpinBox(&dlg);
+    count->setObjectName(QStringLiteral("shortsCount"));
+    count->setRange(1, 30);
+    count->setValue(st.value(QStringLiteral("shorts/count"), 5).toInt());
+    form->addRow(tr("How many:"), count);
+    auto* shortest = new QSpinBox(&dlg), *longest = new QSpinBox(&dlg);
+    shortest->setObjectName(QStringLiteral("shortsMin"));
+    longest->setObjectName(QStringLiteral("shortsMax"));
+    shortest->setRange(1, 600);
+    longest->setRange(1, 600);
+    shortest->setSuffix(tr(" s"));
+    longest->setSuffix(tr(" s"));
+    shortest->setValue(st.value(QStringLiteral("shorts/min"), 15).toInt());
+    longest->setValue(st.value(QStringLiteral("shorts/max"), 60).toInt());
+    auto* range = new QHBoxLayout;
+    range->addWidget(shortest);
+    range->addWidget(new QLabel(tr("to"), &dlg));
+    range->addWidget(longest);
+    form->addRow(tr("Length:"), range);
+    auto* shape = new QComboBox(&dlg);
+    shape->setObjectName(QStringLiteral("shortsShape"));
+    shape->addItem(tr("Vertical 9:16 (TikTok, Reels, Shorts)"), QSize(9, 16));
+    shape->addItem(tr("Square 1:1"), QSize(1, 1));
+    shape->addItem(tr("Portrait 4:5"), QSize(4, 5));
+    shape->addItem(tr("Widescreen 16:9"), QSize(16, 9));
+    shape->setCurrentIndex(std::clamp(st.value(QStringLiteral("shorts/shape"), 0).toInt(), 0, 3));
+    form->addRow(tr("Shape:"), shape);
+    auto* looks = new QComboBox(&dlg);
+    looks->setObjectName(QStringLiteral("shortsLook"));
+    looks->addItem(tr("No captions"), QString());
+    for (const CaptionLook& l : captionLooks()) looks->addItem(QString::fromStdString(l.name), QString::fromStdString(l.id));
+    const int look = looks->findData(st.value(QStringLiteral("shorts/look"), QStringLiteral("creator_pop")).toString());
+    looks->setCurrentIndex(look < 0 ? 0 : look);
+    form->addRow(tr("Captions:"), looks);
+    auto* topic = new QLineEdit(&dlg);
+    topic->setPlaceholderText(tr("Optional: what they should be about, e.g. \"pricing, customers\""));
+    form->addRow(tr("Topic:"), topic);
+    auto* fillers = new QCheckBox(tr("Cut filler words"), &dlg), *pauses = new QCheckBox(tr("Shorten pauses"), &dlg);
+    auto* hook = new QCheckBox(tr("Show the opening line as a title"), &dlg), *follow = new QCheckBox(tr("Keep the speaker in frame"), &dlg);
+    fillers->setChecked(st.value(QStringLiteral("shorts/fillers"), true).toBool());
+    pauses->setChecked(st.value(QStringLiteral("shorts/pauses"), true).toBool());
+    hook->setChecked(st.value(QStringLiteral("shorts/hook"), false).toBool());
+    follow->setChecked(st.value(QStringLiteral("shorts/follow"), true).toBool());
+    for (QCheckBox* c : {fillers, pauses, hook, follow}) form->addRow(QString(), c);
+    auto* find = new QPushButton(tr("Find Moments"), &dlg);
+    find->setObjectName(QStringLiteral("shortsFind"));
+    lay->addWidget(find);
+    auto* table = new QTableWidget(0, 4, &dlg);
+    table->setObjectName(QStringLiteral("shortsTable"));
+    table->setHorizontalHeaderLabels({tr("Use"), tr("Length"), tr("Score"), tr("Opening line")});
+    table->horizontalHeader()->setStretchLastSection(true);
+    table->verticalHeader()->hide();
+    table->setSelectionBehavior(QAbstractItemView::SelectRows);
+    table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    table->setMinimumSize(560, 200);
+    lay->addWidget(table, 1);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Cancel, &dlg);
+    QPushButton* create = buttons->addButton(tr("Create Sequences"), QDialogButtonBox::AcceptRole);
+    QPushButton* createQueue = buttons->addButton(tr("Create and Queue"), QDialogButtonBox::AcceptRole);
+    create->setObjectName(QStringLiteral("shortsCreate"));
+    createQueue->setObjectName(QStringLiteral("shortsCreateQueue"));
+    create->setEnabled(false);
+    createQueue->setEnabled(false);
+    lay->addWidget(buttons);
+    std::vector<ShortMoment> moments;
+    bool queue = false;
+    connect(find, &QPushButton::clicked, &dlg, [&] {
+        ShortsOptions o;
+        o.count = count->value();
+        o.minSeconds = std::min(shortest->value(), longest->value());
+        o.maxSeconds = std::max(shortest->value(), longest->value());
+        o.topic = topic->text().toStdString();
+        o.fillers.custom = state_->project().fillerWords;
+        auto project = std::make_shared<const Project>(state_->project());
+        const std::vector<Id> media = shortsSource();
+        moments.clear();
+        runWithProgress(&dlg, state_, tr("Finding shorts..."), [&, project](const auto& progress, const auto* cancel, std::string* e) {
+            moments = findShorts(*project, media, o, progress, cancel, e);
+            return !moments.empty();
+        });
+        table->setRowCount(int(moments.size()));
+        for (int r = 0; r < int(moments.size()); ++r) {
+            const ShortMoment& m = moments[size_t(r)];
+            auto* use = new QTableWidgetItem;
+            use->setFlags(Qt::ItemIsUserCheckable | Qt::ItemIsEnabled);
+            use->setCheckState(Qt::Checked);
+            table->setItem(r, 0, use);
+            table->setItem(r, 1, new QTableWidgetItem(tr("%1 s").arg(m.out - m.in, 0, 'f', 0)));
+            table->setItem(r, 2, new QTableWidgetItem(QString::number(m.score, 'f', 2)));
+            auto* line = new QTableWidgetItem(QString::fromStdString(m.hookLine));
+            line->setToolTip(QString::fromStdString(m.text));
+            table->setItem(r, 3, line);
+        }
+        table->resizeColumnsToContents();
+        create->setEnabled(!moments.empty());
+        createQueue->setEnabled(!moments.empty());
+    });
+    connect(create, &QPushButton::clicked, &dlg, [&] { queue = false; });
+    connect(createQueue, &QPushButton::clicked, &dlg, [&] { queue = true; });
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    if (dlg.exec() != QDialog::Accepted) return;
+    st.setValue(QStringLiteral("shorts/count"), count->value());
+    st.setValue(QStringLiteral("shorts/min"), shortest->value());
+    st.setValue(QStringLiteral("shorts/max"), longest->value());
+    st.setValue(QStringLiteral("shorts/shape"), shape->currentIndex());
+    st.setValue(QStringLiteral("shorts/look"), looks->currentData().toString());
+    st.setValue(QStringLiteral("shorts/fillers"), fillers->isChecked());
+    st.setValue(QStringLiteral("shorts/pauses"), pauses->isChecked());
+    st.setValue(QStringLiteral("shorts/hook"), hook->isChecked());
+    st.setValue(QStringLiteral("shorts/follow"), follow->isChecked());
+    std::vector<ShortMoment> chosen;
+    for (int r = 0; r < table->rowCount(); ++r)
+        if (table->item(r, 0)->checkState() == Qt::Checked) chosen.push_back(moments[size_t(r)]);
+    ShortBuild b;
+    const QSize aspect = shape->currentData().toSize();
+    b.aspectW = aspect.width();
+    b.aspectH = aspect.height();
+    b.captionLook = looks->currentData().toString().toStdString();
+    b.removeFillers = fillers->isChecked();
+    b.removePauses = pauses->isChecked();
+    b.hookTitle = hook->isChecked();
+    b.reframe = follow->isChecked();
+    b.fillers.custom = state_->project().fillerWords;
+    buildShorts(chosen, b, queue);
 }
 
 int MainWindow::addBroll(double coverage) {

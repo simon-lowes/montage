@@ -28,6 +28,8 @@
 #include "media/DepthMap.h"
 #include "render/RenderCache.h"
 #include "render/Shapes.h"
+#include "render/Shorts.h"
+#include "core/Transcript.h"
 #include "render/VideoDenoise.h"
 #include "render/VideoFx.h"
 #include <random>
@@ -3046,6 +3048,92 @@ colorspaces:
         nz.params["color"] = 0.0;
         applyVideoEffect(nz, 3, same, 1);
         for (size_t i = 0; i < 400; i += 4) QVERIFY(same.px[i] == same.px[i + 1] && same.px[i + 1] == same.px[i + 2]);
+    }
+
+    void shortsFromTranscripts() {
+        // Twelve sentences, a word every 0.4 s and 0.7 s between sentences: chat, a hook and its follow-up, a
+        // second hook, a stretch thick with fillers, and more chat.
+        const std::vector<std::string> said = {
+            "Welcome back to the show, it is good to be here today.",
+            "So we spent the morning sorting out some boxes in the garage.",
+            "And then the weather turned and we went inside for lunch.",
+            "It was fine, nothing much happened after that really.",
+            "Did you know that most people price their work completely wrong?",
+            "They charge for hours when clients actually pay for results.",
+            "Here's the one thing that doubled our pricing overnight.",
+            "We stopped quoting days and started quoting outcomes.",
+            "um so uh we uh um then uh went um back uh to the um garage.",
+            "and it was uh um fine I uh guess.",
+            "Anyway the boxes were all still there when we got back.",
+            "Then we had some tea and called it a day."};
+        Project p = makeDefaultProject();
+        MediaItem m;
+        m.id = p.newId();
+        m.kind = MediaKind::Video;
+        m.name = "podcast.mov";
+        m.path = "/nowhere/podcast.mov";
+        m.duration = 120;
+        auto t = std::make_shared<Transcript>();
+        t->language = "en";
+        std::vector<TranscriptWord> words;
+        double at = 1;
+        for (const std::string& sentence : said) {
+            TranscriptSegment seg;
+            for (const QString& w : QString::fromStdString(sentence).split(' ')) {
+                seg.words.push_back({at, at + 0.3, w.toStdString(), 0.9f});
+                words.push_back(seg.words.back());
+                at += 0.4;
+            }
+            at += 0.7;
+            t->segments.push_back(seg);
+        }
+        m.transcript = t;
+        p.media.push_back(m);
+        // Hooks.
+        QVERIFY(hookScore(said[4]) >= 0.9);
+        QVERIFY(hookScore(said[6]) > 0.4 && hookScore(said[6]) < 0.8);
+        QCOMPARE(hookScore("and it was fine."), 0.0);
+        QVERIFY(hookScore("What would you do with a million dollars?") > hookScore("The meeting was moved to Tuesday."));
+        // The best windows: sentence-aligned, inside the length range, never overlapping, the hook first.
+        ShortsOptions o;
+        o.count = 3;
+        o.minSeconds = 6;  // two sentences or three
+        o.maxSeconds = 12;
+        o.liveliness = false;
+        std::string err;
+        const std::vector<ShortMoment> found = findShorts(p, {m.id}, o, {}, nullptr, &err);
+        QCOMPARE(found.size(), size_t(3));
+        auto endsSentence = [](const std::string& w) { return w.back() == '.' || w.back() == '?'; };
+        for (size_t i = 0; i < found.size(); ++i) {
+            const ShortMoment& f = found[i];
+            qInfo("short %.2f: %s", f.score, f.text.c_str());
+            const double length = words[f.lastWord].end - words[f.firstWord].start;
+            QVERIFY2(length >= o.minSeconds && length <= o.maxSeconds, qPrintable(QString::number(length)));
+            QVERIFY(f.firstWord == 0 || endsSentence(words[f.firstWord - 1].text));
+            QVERIFY(endsSentence(words[f.lastWord].text));
+            QVERIFY(f.in < words[f.firstWord].start && f.in >= (f.firstWord ? words[f.firstWord - 1].end : 0.0));
+            QVERIFY(f.out > words[f.lastWord].end && f.out <= words[f.lastWord + 1].start);
+            QVERIFY(QString::fromStdString(f.text).startsWith(QString::fromStdString(f.hookLine)));
+            for (size_t j = 0; j < i; ++j) QVERIFY(f.out <= found[j].in || f.in >= found[j].out);
+            if (i) QVERIFY(f.score <= found[i - 1].score);
+        }
+        QVERIFY(QString::fromStdString(found[0].hookLine).startsWith("Did you know"));
+        QVERIFY(QString::fromStdString(found[1].hookLine).startsWith("Here's the one thing"));
+        // The rambling stretch thick with fillers is never chosen.
+        for (const ShortMoment& f : found) QVERIFY(!QString::fromStdString(f.text).contains("uh we uh"));
+        // A topic pulls its moments up.
+        o.topic = "the garage and its boxes";
+        const std::vector<ShortMoment> garage = findShorts(p, {m.id}, o, {}, nullptr, &err);
+        QVERIFY(!garage.empty());
+        QVERIFY2(QString::fromStdString(garage[0].text).contains("garage"), garage[0].text.c_str());
+        // Nothing fits, or nothing is transcribed.
+        o.topic.clear();
+        o.minSeconds = 200, o.maxSeconds = 300;
+        QVERIFY(findShorts(p, {m.id}, o, {}, nullptr, &err).empty());
+        QVERIFY(QString::fromStdString(err).contains("200"));
+        p.media[0].transcript.reset();
+        QVERIFY(findShorts(p, {m.id}, o, {}, nullptr, &err).empty());
+        QVERIFY(QString::fromStdString(err).startsWith("Transcribe"));
     }
 
     void titlesRender() {

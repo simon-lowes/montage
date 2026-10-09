@@ -77,6 +77,7 @@
 #include "render/ClipAnalysis.h"
 #include "render/Compositor.h"
 #include "render/Exporter.h"
+#include "render/Shorts.h"
 #include "render/Processing.h"
 
 namespace montage {
@@ -1947,6 +1948,101 @@ void McpServer::Impl::addTools() {
             }
             return ok(QStringLiteral("%1 moment(s), %2 s, in a new sequence").arg(moments.size()).arg(total, 0, 'f', 1),
                       QJsonObject{{"sequence", double(seq)}, {"seconds", total}, {"moments", list}});
+        });
+
+    add("montage_make_shorts", "Make shorts from long footage",
+        "Cut a podcast, interview or talk into short clips ready to post (CapCut's long video to shorts). Sentence-aligned "
+        "windows of the transcripts between `min_seconds` and `max_seconds` are scored on how the first sentence hooks a "
+        "viewer (a question, \"you\", a number, \"the secret\"...), how lively the stretch is, how much it is about "
+        "`topic`, and how cleanly it starts and ends, with fillers and silence counting against it; the best `count` that "
+        "do not overlap each become a new sequence at `aspect`, framed round the subject, with fillers cut and pauses "
+        "shortened, captions in `caption_look` (\"none\" for none) and, with `hook_title`, the opening line as a title. "
+        "`preview` only lists the moments. With `render_folder`, each is rendered there as H.264 at -14 LUFS with its "
+        "captions burned in. `media` (names or paths) defaults to every transcribed media.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"media":{"type":"array","items":{"type":"string"}},
+            "count":{"type":"number","default":5},"min_seconds":{"type":"number","default":15},"max_seconds":{"type":"number","default":60},
+            "topic":{"type":"string"},"aspect":{"type":"string","enum":["9:16","1:1","4:5","16:9"],"default":"9:16"},
+            "caption_look":{"type":"string","default":"creator_pop"},"remove_fillers":{"type":"boolean","default":true},
+            "remove_pauses":{"type":"boolean","default":true},"hook_title":{"type":"boolean","default":false},
+            "reframe":{"type":"boolean","default":true},"liveliness":{"type":"boolean","default":true},
+            "preview":{"type":"boolean","default":false},"render_folder":{"type":"string"}},"required":["project"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            std::vector<Id> media;
+            for (const QJsonValue& v : a.value("media").toArray()) media.push_back(projectMedia(l.project, v.toString()).id);
+            if (media.empty())
+                for (const MediaItem& m : l.project.media)
+                    if (!m.subclipOf && m.transcript && !m.transcript->empty()) media.push_back(m.id);
+            ShortsOptions o;
+            o.count = std::clamp(a.value("count").toInt(5), 1, 50);
+            o.minSeconds = std::max(1.0, a.value("min_seconds").toDouble(15));
+            o.maxSeconds = std::max(o.minSeconds, a.value("max_seconds").toDouble(60));
+            o.topic = a.value("topic").toString().toStdString();
+            o.liveliness = a.value("liveliness").toBool(true);
+            o.fillers.custom = l.project.fillerWords;
+            ShortBuild b;
+            const QString aspect = str(a, "aspect", "9:16");
+            const QStringList wh = aspect.split(':');
+            if (wh.size() != 2 || wh[0].toInt() <= 0 || wh[1].toInt() <= 0) throw ArgError{"\"aspect\" is like 9:16"};
+            b.aspectW = wh[0].toInt();
+            b.aspectH = wh[1].toInt();
+            b.captionLook = str(a, "caption_look", "creator_pop").toStdString();
+            if (b.captionLook == "none") b.captionLook.clear();
+            if (!b.captionLook.empty() && !findCaptionLook(b.captionLook)) {
+                QStringList ids;
+                for (const CaptionLook& c : captionLooks()) ids << QString::fromStdString(c.id);
+                throw ArgError{QStringLiteral("No caption look \"%1\" (%2, or none)").arg(QString::fromStdString(b.captionLook), ids.join(", "))};
+            }
+            b.removeFillers = a.value("remove_fillers").toBool(true);
+            b.removePauses = a.value("remove_pauses").toBool(true);
+            b.hookTitle = a.value("hook_title").toBool(false);
+            b.reframe = a.value("reframe").toBool(true);
+            b.fillers.custom = l.project.fillerWords;
+            std::string err;
+            const std::vector<ShortMoment> moments = findShorts(l.project, media, o, [this](double f) { progress(f * 0.3, "Finding moments"); }, nullptr, &err);
+            if (moments.empty()) return fail(QString::fromStdString(err));
+            const bool preview = a.value("preview").toBool(false);
+            const QString folder = a.contains("render_folder") ? absolute(a.value("render_folder").toString()) : QString();
+            if (!folder.isEmpty() && !QDir().mkpath(folder)) return fail(QStringLiteral("Cannot make the folder %1").arg(folder));
+            QJsonArray list;
+            std::map<Id, int> counts;
+            int rendered = 0;
+            for (size_t i = 0; i < moments.size(); ++i) {
+                const ShortMoment& m = moments[i];
+                const MediaItem* src = l.project.findMedia(m.media);
+                QJsonObject row{{"media", QString::fromStdString(src->name)}, {"in", m.in}, {"out", m.out}, {"score", m.score},
+                                {"hook", m.hook}, {"hook_line", QString::fromStdString(m.hookLine)}, {"text", QString::fromStdString(m.text)}};
+                if (!preview) {
+                    const std::string name = QFileInfo(QString::fromStdString(src->name)).completeBaseName().toStdString() + " - Short " +
+                                             std::to_string(++counts[m.media]);
+                    const Id id = makeShortSequence(l.project, m, b, name, nullptr, &err);
+                    if (!id) return fail(QString::fromStdString(err));
+                    const Sequence* s = l.project.findSequence(id);
+                    row["sequence"] = double(id);
+                    row["name"] = QString::fromStdString(s->name);
+                    row["width"] = s->width;
+                    row["height"] = s->height;
+                    row["seconds"] = double(s->duration()) / s->fpsValue();
+                    row["captions"] = s->captionTracks.empty() ? 0 : int(s->captionTracks[0].captions.size());
+                    if (!folder.isEmpty()) {
+                        const ExportPreset* p = findExportPreset("Social - TikTok / Reels / Shorts");
+                        ExportSettings st = p ? p->settings : ExportSettings{};
+                        st.burnInCaptions = !s->captionTracks.empty();
+                        st.path = QDir(folder).filePath(QString::fromStdString(s->name) + ".mp4").toStdString();
+                        const double base = 0.3 + 0.7 * double(i) / double(moments.size()), span = 0.7 / double(moments.size());
+                        if (!exportSequence(l.project, *s, st, [&](double f, FrameTime) { progress(base + span * f, "Rendering"); }, nullptr, &err))
+                            return fail(QString::fromStdString(err));
+                        row["output"] = QString::fromStdString(st.path);
+                        ++rendered;
+                    }
+                }
+                list.append(row);
+            }
+            if (!preview) save(l);
+            const QString what = preview ? QStringLiteral("%1 moment(s) found").arg(moments.size())
+                                         : rendered ? QStringLiteral("%1 short(s) made and rendered to %2").arg(moments.size()).arg(folder)
+                                                    : QStringLiteral("%1 short(s) made as new sequences").arg(moments.size());
+            return ok(what, QJsonObject{{"shorts", list}});
         });
 
     add("montage_cut_to_beat", "Cut clips to the beat",

@@ -16,6 +16,7 @@
 #include "core/EditOps.h"
 #include "core/Effects.h"
 #include "media/Image.h"
+#include "render/Shorts.h"
 
 class QAction;
 class QActionGroup;
@@ -84,6 +85,13 @@ public:
     int cutMediaToBeat(int every, bool bars);  // the bin's selected media, cut on the music clip's beats
     Id makeHighlights(double seconds, const QString& lookFor = {});  // a new Highlights sequence; its id, or 0
     void highlightsDialog();
+    // Make Shorts: the best moments of the transcribed media selected in the bin (or of every transcribed media) as
+    // new sequences named "<media> - Short n", each with a render job when `queue`; their ids (none, with a message,
+    // when nothing is transcribed or fits). The dialog previews the moments to pick from.
+    std::vector<Id> makeShorts(const ShortsOptions& o, const ShortBuild& b, bool queue = false);
+    std::vector<Id> buildShorts(const std::vector<ShortMoment>& moments, const ShortBuild& b, bool queue = false);
+    std::vector<Id> shortsSource() const;
+    void shortsDialog();
     int addBroll(double coverage = 0.5);  // cutaways on V2 matching what is said; how many
     bool fitMusicToLength(FrameTime target);
     void fitMusicDialog();

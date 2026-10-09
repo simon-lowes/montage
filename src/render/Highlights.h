@@ -31,6 +31,12 @@ struct HighlightMoment {
     double score = 0;
 };
 
+// Each half second of a video scored as findHighlights scores it (sound above its usual level, movement, the look
+// asked for), smoothed over a second either side. Empty if it is not a video.
+constexpr double kHighlightStep = 0.5;
+std::vector<double> highlightCurve(const Project& p, const MediaItem& m, const HighlightOptions& o = {},
+                                   const std::atomic<bool>* cancel = nullptr);
+
 // The moments, in the order they happened (media in the order given). Empty
 // (with `error`) if nothing could be read.
 std::vector<HighlightMoment> findHighlights(const Project& p, const std::vector<Id>& media, const HighlightOptions& o,

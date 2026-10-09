@@ -68,6 +68,7 @@
 #include "audio/AudioRepair.h"
 #include "render/MusicEdit.h"
 #include "render/Highlights.h"
+#include "render/Shorts.h"
 #include "render/AutoBroll.h"
 #include "render/AutoMix.h"
 #include "render/VideoDenoise.h"
@@ -6569,6 +6570,153 @@ private slots:
         QVERIFY(loadProject(project.toStdString(), back));
         QCOMPARE(back.sequences.size(), size_t(2));
         QCOMPARE(back.sequences.back().name, std::string("Highlights"));
+    }
+
+    void makeShortsFromFootage() {
+        // Forty seconds of 320 x 180 footage with sound, and a transcript: chat, then a hook whose follow-up holds
+        // fillers and a long pause.
+        std::string err;
+        std::vector<float> sound(size_t(48000) * 40);
+        for (size_t i = 0; i < sound.size(); ++i) sound[i] = float(0.1 * std::sin(2 * M_PI * 220 * double(i) / 48000));
+        const std::string wav = path("shorts-sound.wav");
+        QVERIFY(writeMonoWav(wav, sound, 48000));
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 320;
+        gs.height = 180;
+        gs.fps = {25, 1};
+        Clip bg = makeGeneratorClip(gen, "color", 1000);
+        edit::overwrite(gen, gs, {TrackKind::Video, 0}, bg);
+        MediaItem audio = probeOrFail(gen, wav);
+        gen.media.push_back(audio);
+        QVERIFY(edit::placeMedia(gen, gs, audio.id, 0, 0, -1, {TrackKind::Video, 1}, {TrackKind::Audio, 0}, false).ok);
+        ExportSettings st = findExportPreset("Apple ProRes 422 HQ")->settings;
+        st.path = path("shorts-footage.mov");
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        const std::vector<std::string> said = {"Thanks for having me, it is lovely to be here.", "We drove up this morning and the traffic was fine.",
+                                               "Did you know that most people never back up their photos?",
+                                               "Um, you lose them all when the phone breaks.", "Back them up tonight, it takes two minutes.",
+                                               "Anyway, the drive was fine and we got here early."};
+        auto t = std::make_shared<Transcript>();
+        t->language = "en";
+        double at = 1;
+        for (size_t k = 0; k < said.size(); ++k) {
+            TranscriptSegment seg;
+            for (const QString& w : QString::fromStdString(said[k]).split(' ')) {
+                seg.words.push_back({at, at + 0.3, w.toStdString(), 0.9f});
+                at += 0.4;
+            }
+            at += k == 3 ? 2.0 : 0.6;  // a long pause after the fourth sentence
+            t->segments.push_back(seg);
+        }
+        Project p = makeDefaultProject();
+        MediaItem m = probeOrFail(p, st.path);
+        m.transcript = t;
+        p.media.push_back(m);
+        ShortsOptions o;
+        o.count = 2;
+        o.minSeconds = 8;
+        o.maxSeconds = 14;
+        const std::vector<ShortMoment> found = findShorts(p, {m.id}, o, {}, nullptr, &err);  // the footage read for liveliness
+        QVERIFY2(found.size() == 2, err.c_str());
+        QVERIFY(QString::fromStdString(found[0].hookLine).startsWith("Did you know"));
+        // Built: vertical at the sequence's 1080, the footage filling the frame, the filler and the pause cut, captions
+        // in the look, and the hook as a title.
+        ShortBuild b;
+        b.hookTitle = true;
+        const Id id = makeShortSequence(p, found[0], b, "Talk - Short 1", nullptr, &err);
+        QVERIFY2(id, err.c_str());
+        const Sequence* s = p.findSequence(id);
+        QCOMPARE(s->name, std::string("Talk - Short 1"));
+        QCOMPARE(s->width, 1080);
+        QCOMPARE(s->height, 1920);
+        QVERIFY(std::any_of(p.media.begin(), p.media.end(), [&](const MediaItem& x) { return x.sequenceId == id; }));
+        QVERIFY(!s->videoTracks[0].clips.empty());
+        for (const Clip& c : s->videoTracks[0].clips) QCOMPARE(c.motion.p("fit", 0), 1.0);
+        const std::vector<TranscriptWord> heard = sequenceTranscriptWords(p, *s);
+        QVERIFY(!heard.empty());
+        QCOMPARE(QString::fromStdString(heard.front().text), QString("Did"));
+        for (const TranscriptWord& w : heard) QVERIFY2(QString::fromStdString(w.text).toLower() != "um,", "the filler is cut");
+        for (size_t k = 1; k < heard.size(); ++k) QVERIFY2(heard[k].start - heard[k - 1].end < 0.6, "the long pause is shortened");
+        const double placed = found[0].out - found[0].in, now = double(s->duration()) / s->fpsValue();
+        QVERIFY2(now < placed - 1.5 && now > placed - 3.5, qPrintable(QString("%1 of %2").arg(now).arg(placed)));
+        QCOMPARE(s->captionTracks.size(), size_t(1));
+        const CaptionTrack& ct = s->captionTracks[0];
+        QVERIFY(!ct.captions.empty());
+        QCOMPARE(ct.style.animation, findCaptionLook("creator_pop")->style.animation);
+        QVERIFY(ct.style.position <= 0.75);  // clear of the platform's buttons
+        for (const Caption& c : ct.captions) QVERIFY(!QString::fromStdString(c.text).contains("Um,"));
+        QVERIFY(s->videoTracks.size() >= 2 && s->videoTracks[1].clips.size() == 1);
+        const Clip& title = s->videoTracks[1].clips[0];
+        QCOMPARE(title.generator.type, std::string("title"));
+        QVERIFY(QString::fromStdString(title.generator.s("text")).simplified().startsWith("Did you know"));
+        // Sound with no picture gets an audiogram; a square short keeps the shorter side.
+        Project a = makeDefaultProject();
+        MediaItem rec = probeOrFail(a, wav);
+        rec.transcript = t;
+        a.media.push_back(rec);
+        ShortMoment am = found[0];
+        am.media = rec.id;
+        b.aspectW = b.aspectH = 1;
+        b.hookTitle = false;
+        b.captionLook.clear();
+        const Id aid = makeShortSequence(a, am, b, "Recording - Short 1", nullptr, &err);
+        QVERIFY2(aid, err.c_str());
+        const Sequence* as = a.findSequence(aid);
+        QCOMPARE(as->width, 1080);
+        QCOMPARE(as->height, 1080);
+        QCOMPARE(as->videoTracks[0].clips.size(), size_t(1));
+        QCOMPARE(as->videoTracks[0].clips[0].generator.type, std::string("audio_viz"));
+        QVERIFY(as->captionTracks.empty());
+        b.captionLook = "no_such_look";
+        QVERIFY(!makeShortSequence(a, am, b, "x", nullptr, &err));
+        // Over MCP: a preview, then made and rendered (a small sequence so the render is quick).
+        Project q = makeDefaultProject();
+        q.active()->width = 320;
+        q.active()->height = 180;
+        q.media.push_back(p.media[0]);
+        const QString project = QString::fromStdString(path("shorts.montage"));
+        QVERIFY(saveProject(q, project.toStdString()));
+        McpServer server;
+        int rid = 1;
+        auto call = [&](QJsonObject args) {
+            args["project"] = project;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", rid++}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_make_shorts"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call({{"preview", true}, {"count", 2}, {"min_seconds", 8}, {"max_seconds", 14}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QJsonArray shorts = r.value("structuredContent").toObject().value("shorts").toArray();
+        QCOMPARE(shorts.size(), 2);
+        QVERIFY(shorts.at(0).toObject().value("hook_line").toString().startsWith("Did you know"));
+        QVERIFY(!shorts.at(0).toObject().contains("sequence"));
+        Project unchanged;
+        QVERIFY(loadProject(project.toStdString(), unchanged));
+        QCOMPARE(unchanged.sequences.size(), size_t(1));
+        QVERIFY(call({{"caption_look", "glitter"}}).value("isError").toBool());
+        const QString folder = QString::fromStdString(path("shorts-out"));
+        r = call({{"count", 1}, {"min_seconds", 8}, {"max_seconds", 14}, {"render_folder", folder}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        shorts = r.value("structuredContent").toObject().value("shorts").toArray();
+        QCOMPARE(shorts.size(), 1);
+        const QJsonObject made = shorts.at(0).toObject();
+        QCOMPARE(made.value("width").toInt(), 180);
+        QCOMPARE(made.value("height").toInt(), 320);
+        QVERIFY(made.value("captions").toInt() > 0);
+        QCOMPARE(made.value("name").toString(), QString("shorts-footage - Short 1"));
+        MediaItem out;
+        QVERIFY2(probeMedia(made.value("output").toString().toStdString(), out, &err), err.c_str());
+        QCOMPARE(out.width, 180);
+        QCOMPARE(out.height, 320);
+        QVERIFY(out.hasAudio);
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.sequences.size(), size_t(2));
+        QCOMPARE(back.sequences.back().captionTracks.size(), size_t(1));
     }
 
     void cutToTheBeat() {

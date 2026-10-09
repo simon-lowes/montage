@@ -11,7 +11,7 @@ namespace montage {
 
 namespace {
 
-constexpr double kStep = 0.5;  // seconds per score
+constexpr double kStep = kHighlightStep;  // seconds per score
 
 bool cancelled(const std::atomic<bool>* c) { return c && c->load(); }
 
@@ -86,6 +86,38 @@ double offWords(const Transcript* tr, double t, bool start) {
 
 }  // namespace
 
+std::vector<double> highlightCurve(const Project& p, const MediaItem& m, const HighlightOptions& o, const std::atomic<bool>* cancel) {
+    if (m.kind != MediaKind::Video || m.duration <= 0) return {};
+    const size_t windows = size_t(std::ceil(m.duration / kStep));
+    const std::vector<double> sound = m.hasAudio ? soundScores(m.path, windows) : std::vector<double>(windows, 0.0);
+    const std::vector<double> motion = motionScores(m.path, windows, cancel);
+    std::vector<double> look(windows, 0.0);
+    if (!o.lookFor.empty()) {
+        for (const ShotMatch& sm : findShots(p, o.lookFor, 50))
+            if (sm.media == m.id)
+                for (size_t w = size_t(std::max(0.0, sm.start / kStep)); w < windows && double(w) * kStep <= sm.end; ++w)
+                    look[w] = std::max(look[w], double(sm.score));
+        // Relative: the best match is 1, a poor one near 0.
+        const double hi = *std::max_element(look.begin(), look.end());
+        for (double& v : look) v = hi > 0 ? std::clamp((v - hi * 0.8) / (hi * 0.2), 0.0, 1.0) : 0.0;
+    }
+    std::vector<double> score(windows);
+    for (size_t w = 0; w < windows; ++w) score[w] = o.soundWeight * sound[w] + o.motionWeight * motion[w] + o.lookWeight * look[w];
+    // Smoothed over a second either side, so a moment is a stretch, not a spike.
+    std::vector<double> smooth(windows, 0.0);
+    for (size_t w = 0; w < windows; ++w) {
+        double acc = 0, n = 0;
+        for (int d = -2; d <= 2; ++d) {
+            const long j = long(w) + d;
+            if (j < 0 || j >= long(windows)) continue;
+            const double wt = 3 - std::abs(d);
+            acc += score[size_t(j)] * wt, n += wt;
+        }
+        smooth[w] = acc / n;
+    }
+    return smooth;
+}
+
 std::vector<HighlightMoment> findHighlights(const Project& p, const std::vector<Id>& media, const HighlightOptions& o,
                                             const std::function<void(double)>& progress, const std::atomic<bool>* cancel,
                                             std::string* error) {
@@ -99,37 +131,9 @@ std::vector<HighlightMoment> findHighlights(const Project& p, const std::vector<
         if (cancelled(cancel)) return {};
         const MediaItem* m = p.findMedia(media[i]);
         if (!m || m->kind != MediaKind::Video || m->duration < o.minLength) continue;
-        const size_t windows = size_t(std::ceil(m->duration / kStep));
-        const std::vector<double> sound = m->hasAudio ? soundScores(m->path, windows) : std::vector<double>(windows, 0.0);
-        if (progress) progress((double(i) + 0.3) / double(media.size()));
-        const std::vector<double> motion = motionScores(m->path, windows, cancel);
-        std::vector<double> look(windows, 0.0);
-        if (!o.lookFor.empty())
-            for (const ShotMatch& sm : findShots(p, o.lookFor, 50))
-                if (sm.media == m->id)
-                    for (size_t w = size_t(std::max(0.0, sm.start / kStep)); w < windows && double(w) * kStep <= sm.end; ++w)
-                        look[w] = std::max(look[w], double(sm.score));
-        if (!o.lookFor.empty()) {
-            // Relative: the best match is 1, a poor one near 0.
-            const double hi = *std::max_element(look.begin(), look.end());
-            for (double& v : look) v = hi > 0 ? std::clamp((v - hi * 0.8) / (hi * 0.2), 0.0, 1.0) : 0.0;
-        }
-        Scored s{m->id, std::vector<double>(windows), m->duration};
-        for (size_t w = 0; w < windows; ++w) s.score[w] = o.soundWeight * sound[w] + o.motionWeight * motion[w] + o.lookWeight * look[w];
-        // Smoothed over a second either side, so a moment is a stretch, not a spike.
-        std::vector<double> smooth(windows, 0.0);
-        for (size_t w = 0; w < windows; ++w) {
-            double acc = 0, n = 0;
-            for (int d = -2; d <= 2; ++d) {
-                const long j = long(w) + d;
-                if (j < 0 || j >= long(windows)) continue;
-                const double wt = 3 - std::abs(d);
-                acc += s.score[size_t(j)] * wt, n += wt;
-            }
-            smooth[w] = acc / n;
-        }
-        s.score = std::move(smooth);
-        all.push_back(std::move(s));
+        std::vector<double> curve = highlightCurve(p, *m, o, cancel);
+        if (curve.empty()) continue;
+        all.push_back({m->id, std::move(curve), m->duration});
         if (progress) progress(double(i + 1) / double(media.size()));
     }
     if (all.empty()) {

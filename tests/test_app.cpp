@@ -25,6 +25,8 @@
 #include <QPainter>
 #include <QTabBar>
 #include <QTableWidget>
+#include <QSpinBox>
+#include <QTimer>
 #include <QTextEdit>
 #include <QToolButton>
 #include <QTreeView>
@@ -2578,6 +2580,86 @@ private slots:
         QCOMPARE(text(), std::string("Welcome to Montaj, said John Smith."));
         panel->setMode(TranscriptPanel::Mode::Sequence);
         QCOMPARE(viewport()->width(), timelineWidth);  // switching modes never widens the panel over the timeline
+    }
+
+    void makeShortsFromTheMenu() {
+        state()->newProject();
+        QVERIFY(win_->findChild<QAction*>("makeShorts"));
+        ShortsOptions o;
+        o.count = 2;
+        o.minSeconds = 3;
+        o.maxSeconds = 7;  // each sentence on its own
+        o.liveliness = false;
+        ShortBuild b;
+        b.reframe = false;
+        QVERIFY(win_->makeShorts(o, b).empty());  // nothing transcribed yet
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        auto t = std::make_shared<Transcript>();
+        t->language = "en";
+        TranscriptSegment seg;
+        double at = 0.3;
+        for (const char* w : {"And", "so,", "my", "fellow", "Americans,", "ask", "not", "what", "your", "country", "can", "do",
+                              "for", "you.", "Ask", "what", "you", "can", "do", "for", "your", "country."}) {
+            seg.words.push_back({at, at + 0.3, w, 0.9f});
+            at += 0.45;
+        }
+        t->segments.push_back(seg);
+        QVERIFY(state()->edit("Transcript", [media, t](Project& p, Sequence&) {
+            p.findMedia(media)->transcript = t;
+            return true;
+        }));
+        const size_t sequences = state()->project().sequences.size(), jobs = win_->renderQueue()->jobs().size();
+        const std::vector<Id> made = win_->makeShorts(o, b, true);
+        QCOMPARE(made.size(), size_t(2));
+        QCOMPARE(state()->project().sequences.size(), sequences + 2);
+        QCOMPARE(state()->sequence()->id, made.front());
+        for (size_t i = 0; i < made.size(); ++i) {
+            const Sequence* s = state()->project().findSequence(made[i]);
+            QVERIFY(s && s->height > s->width);
+            QCOMPARE(QString::fromStdString(s->name), QStringLiteral("jfk - Short %1").arg(i + 1));
+            QCOMPARE(s->captionTracks.size(), size_t(1));
+            QCOMPARE(s->videoTracks[0].clips.at(0).generator.type, std::string("audio_viz"));  // sound alone gets an audiogram
+        }
+        // A render job each: H.264 at -14 LUFS with the captions burned in.
+        QCOMPARE(win_->renderQueue()->jobs().size(), jobs + 2);
+        const RenderQueue::Job& job = win_->renderQueue()->jobs().back();
+        QCOMPARE(job.sequence, made.back());
+        QVERIFY(job.settings.burnInCaptions);
+        QCOMPARE(job.settings.loudnessTarget, -14.0);
+        QVERIFY(QString::fromStdString(job.settings.path).endsWith("jfk - Short 2.mp4"));
+        // One undo step takes them all away.
+        state()->undo();
+        QCOMPARE(state()->project().sequences.size(), sequences);
+        QVERIFY(!state()->project().findSequence(made.front()));
+        const int last = win_->renderQueue()->jobs().back().id, before = win_->renderQueue()->jobs()[jobs].id;
+        for (int id : {before, last}) QVERIFY(win_->renderQueue()->remove(id));
+        // The dialog: find the moments, leave one out, create square shorts without captions.
+        int rows = 0;
+        QTimer::singleShot(0, this, [&] {
+            auto* dlg = win_->findChild<QDialog*>("shortsDialog");
+            QVERIFY(dlg);
+            auto* create = dlg->findChild<QPushButton*>("shortsCreate");
+            QVERIFY(!create->isEnabled());  // nothing found yet
+            dlg->findChild<QSpinBox*>("shortsMin")->setValue(3);
+            dlg->findChild<QSpinBox*>("shortsMax")->setValue(7);
+            dlg->findChild<QComboBox*>("shortsShape")->setCurrentIndex(1);
+            dlg->findChild<QComboBox*>("shortsLook")->setCurrentIndex(0);
+            dlg->findChild<QPushButton*>("shortsFind")->click();
+            auto* table = dlg->findChild<QTableWidget*>("shortsTable");
+            rows = table->rowCount();
+            if (rows == 2) table->item(1, 0)->setCheckState(Qt::Unchecked);
+            QVERIFY(create->isEnabled());
+            create->click();
+        });
+        win_->findChild<QAction*>("makeShorts")->trigger();
+        QCOMPARE(rows, 2);
+        QCOMPARE(state()->project().sequences.size(), sequences + 1);
+        const Sequence* square = state()->sequence();
+        QCOMPARE(square->width, square->height);
+        QVERIFY(square->captionTracks.empty());
+        QCOMPARE(win_->renderQueue()->jobs().size(), jobs);  // not queued
     }
 
     void transitionsToSelection() {
