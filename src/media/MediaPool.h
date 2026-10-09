@@ -15,6 +15,12 @@
 
 namespace montage {
 
+// The pool's name for some of a file's audio channels (Clip::channels): audio(), audioIfReady() and the peaks take it
+// in place of the path, decoding just those channels. With none it is the path itself.
+std::string audioKey(const std::string& path, const std::vector<int>& channels);
+// The file an audio key names, and (if asked) its channels.
+std::string audioKeyFile(const std::string& key, std::vector<int>* channels = nullptr);
+
 class MediaPool {
 public:
     static MediaPool& instance();
@@ -24,7 +30,7 @@ public:
     // Native display size of the video (0,0 if it cannot be opened).
     bool videoSize(const std::string& path, int& w, int& h);
 
-    // Fully decoded stereo audio at `sampleRate` (blocking on first use).
+    // Fully decoded stereo audio at `sampleRate` (blocking on first use), of a file or an audioKey.
     AudioBufferPtr audio(const std::string& path, int sampleRate);
     // Returns cached audio or nullptr without decoding.
     AudioBufferPtr audioIfReady(const std::string& path, int sampleRate);

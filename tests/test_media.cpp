@@ -22,6 +22,7 @@
 #include <sstream>
 #include <cstdio>
 
+#include "core/AudioChannels.h"
 #include "core/Aaf.h"
 #include "core/Bleep.h"
 #include "core/AutoTag.h"
@@ -1530,6 +1531,190 @@ private slots:
         QCOMPARE(title, std::string("Musik"));
         QVERIFY2(lang == "ger" || lang == "deu", lang.c_str());
         QVERIFY(level(musik, 880) > 20 * level(musik, 440));
+    }
+
+    void audioChannelMapping() {
+        constexpr int sr = 48000;
+        // A field recorder's four-channel WAV: 200, 300, 400 and 500 Hz on channels 1-4, the first two named in bext.
+        const std::string wav = path("poly.wav");
+        {
+            const double hz[4] = {200, 300, 400, 500};
+            std::string data;
+            for (int i = 0; i < sr * 2; ++i)
+                for (int ch = 0; ch < 4; ++ch) {
+                    const int16_t q = int16_t(std::lround(0.25 * std::sin(2 * M_PI * hz[ch] * i / sr) * 32767));
+                    data.append(reinterpret_cast<const char*>(&q), 2);
+                }
+            auto u32 = [](uint32_t v) { return std::string(reinterpret_cast<const char*>(&v), 4); };
+            auto u16 = [](uint16_t v) { return std::string(reinterpret_cast<const char*>(&v), 2); };
+            std::string bext(602, '\0');
+            const std::string desc = "sSCENE=4\r\nsTRK1=Boom\r\nsTRK2=Lav 1\r\n";
+            bext.replace(0, desc.size(), desc);
+            const std::string fmt = u16(1) + u16(4) + u32(sr) + u32(sr * 8) + u16(8) + u16(16);
+            const std::string chunks = "fmt " + u32(16) + fmt + "bext" + u32(uint32_t(bext.size())) + bext + "data" + u32(uint32_t(data.size())) + data;
+            FILE* f = std::fopen(wav.c_str(), "wb");
+            QVERIFY(f);
+            const std::string head = "RIFF" + u32(uint32_t(4 + chunks.size())) + "WAVE";
+            std::fwrite(head.data(), 1, head.size(), f);
+            std::fwrite(chunks.data(), 1, chunks.size(), f);
+            std::fclose(f);
+        }
+        auto level = [](const AudioBuffer& b, int ch, double hz) { return toneLevel(b.samples, ch, hz, 4800, 48000); };
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = Rational{25, 1};
+        MediaItem m = probeOrFail(p, wav);
+        QCOMPARE(m.channels, 4);
+        QCOMPARE(sourceChannelCount(m), 4);
+        QCOMPARE(sourceChannelNames(m), (std::vector<std::string>{"Boom", "Lav 1", "Channel 3", "Channel 4"}));
+        QCOMPARE(channelsLabel(m, {0}), std::string("Boom"));
+        QCOMPARE(channelsLabel(m, {2}), std::string("Ch 3"));
+        QCOMPARE(channelsLabel(m, {2, 3}), std::string("Ch 3+4"));
+        // Decoding chosen channels: one in the centre, two as left and right; a channel the file lacks refused.
+        AudioBufferPtr lav = decodeAudio(wav, sr, nullptr, nullptr, {1});
+        QVERIFY(lav && lav->frames() == sr * 2);
+        for (int ch : {0, 1}) {
+            QVERIFY2(std::fabs(level(*lav, ch, 300) - 0.25) < 0.01, qPrintable(QString::number(level(*lav, ch, 300))));
+            QVERIFY(level(*lav, ch, 200) < 0.005 && level(*lav, ch, 500) < 0.005);
+        }
+        AudioBufferPtr pair = decodeAudio(wav, sr, nullptr, nullptr, {2, 3});
+        QVERIFY(level(*pair, 0, 400) > 0.24 && level(*pair, 0, 500) < 0.005);
+        QVERIFY(level(*pair, 1, 500) > 0.24 && level(*pair, 1, 400) < 0.005);
+        std::string err;
+        QVERIFY(!decodeAudio(wav, sr, &err, nullptr, {4}));
+        QVERIFY2(QString::fromStdString(err).contains("channel 5"), err.c_str());
+        // The pool keys them apart from the whole file.
+        QCOMPARE(audioKeyFile(audioKey(wav, {1, 3})), wav);
+        std::vector<int> back;
+        audioKeyFile(audioKey(wav, {1, 3}), &back);
+        QCOMPARE(back, (std::vector<int>{1, 3}));
+        QCOMPARE(audioKey(wav, {}), wav);
+        // A clip playing the lav alone, mixed: 300 Hz on both sides, nothing of the others.
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Id clip = s.audioTracks[0].clips.at(0).id;
+        QVERIFY(edit::setClipChannels(p, s, clip, {1}).ok);
+        QVERIFY(!edit::setClipChannels(p, s, clip, {1}).ok);  // no change
+        QVERIFY(!edit::setClipChannels(p, s, clip, {4}).ok);
+        QVERIFY(!edit::setClipChannels(p, s, clip, {0, 0}).ok);
+        AudioMixer mixer;
+        auto mixed = [&](const Sequence& seq) {
+            AudioBuffer b;
+            b.samples.assign(size_t(sr) * 2, 0.0f);
+            mixer.mix(p, seq, 0, sr, b.samples.data());
+            return b;
+        };
+        {
+            const AudioBuffer b = mixed(s);
+            QVERIFY2(level(b, 0, 300) > 0.2 && level(b, 1, 300) > 0.2, qPrintable(QString::number(level(b, 0, 300))));
+            QVERIFY(level(b, 0, 200) < 0.005 && level(b, 1, 400) < 0.005);
+        }
+        // Saved and read back.
+        QVERIFY(saveProject(p, path("channels.montage")));
+        Project loaded;
+        QVERIFY(loadProject(path("channels.montage"), loaded));
+        QCOMPARE(loaded.active()->audioTracks[0].clips.at(0).channels, std::vector<int>{1});
+        // Split into mono clips: one per channel on A1-A4, linked, named for their channels; together all four play.
+        QVERIFY(!edit::splitAudioChannels(p, s, clip).ok);  // it plays one channel
+        QVERIFY(edit::setClipChannels(p, s, clip, {}).ok);
+        const edit::Result split = edit::splitAudioChannels(p, s, clip);
+        QVERIFY2(split.ok, split.error.c_str());
+        QCOMPARE(split.created.size(), size_t(3));
+        QCOMPARE(s.audioTracks.size(), size_t(4));
+        const std::string base = m.name;
+        const char* names[4] = {"Boom", "Lav 1", "Ch 3", "Ch 4"};
+        for (int t = 0; t < 4; ++t) {
+            const Clip& c = s.audioTracks[size_t(t)].clips.at(0);
+            QCOMPARE(c.channels, std::vector<int>{t});
+            QCOMPARE(c.name, base + " - " + names[t]);
+            QCOMPARE(c.linkGroup, s.audioTracks[0].clips.at(0).linkGroup);
+        }
+        QVERIFY(s.audioTracks[0].clips.at(0).linkGroup != 0);
+        {
+            const AudioBuffer b = mixed(s);
+            for (double hz : {200.0, 300.0, 400.0, 500.0}) QVERIFY2(level(b, 0, hz) > 0.2, qPrintable(QString::number(hz)));
+        }
+        // A split clip given another channel takes its name.
+        QVERIFY(edit::setClipChannels(p, s, s.audioTracks[3].clips.at(0).id, {2}).ok);
+        QCOMPARE(s.audioTracks[3].clips.at(0).name, base + " - Ch 3");
+        // Media set to stereo pairs: new clips come as 1+2 and 3+4 on two tracks.
+        p.findMedia(m.id)->audioChannelMode = kChannelsPairs;
+        Sequence& s2 = p.sequences.emplace_back(makeSequence(p, "Pairs", 320, 180, Rational{25, 1}, 1, 1));
+        s2.fps = Rational{25, 1};
+        QVERIFY(edit::placeMedia(p, s2, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QCOMPARE(s2.audioTracks.at(0).clips.at(0).channels, (std::vector<int>{0, 1}));
+        QCOMPARE(s2.audioTracks.at(1).clips.at(0).channels, (std::vector<int>{2, 3}));
+        // A file with two audio streams (a master with the mix and the music on its own): channels count across them.
+        {
+            Project q = makeDefaultProject();
+            Sequence& qs = *q.active();
+            qs.width = 160;
+            qs.height = 90;
+            qs.fps = Rational{25, 1};
+            while (qs.audioTracks.size() < 2) edit::addTrack(q, qs, TrackKind::Audio);
+            edit::overwrite(q, qs, {TrackKind::Video, 0}, makeGeneratorClip(q, "color", 50));
+            auto tone = [&](const char* name, double hz) {
+                std::vector<float> mono(size_t(sr) * 2);
+                for (size_t i = 0; i < mono.size(); ++i) mono[i] = float(0.3 * std::sin(2 * M_PI * hz * double(i) / sr));
+                writeMonoWav(path(name), mono, sr);
+                MediaItem t = probeOrFail(q, path(name));
+                q.media.push_back(t);
+                return t;
+            };
+            const MediaItem voice = tone("ch-voice.wav", 440), music = tone("ch-music.wav", 880);
+            edit::overwrite(q, qs, {TrackKind::Audio, 0}, makeClip(q, voice, TrackKind::Audio, qs));
+            edit::overwrite(q, qs, {TrackKind::Audio, 1}, makeClip(q, music, TrackKind::Audio, qs));
+            ExportSettings st;
+            st.path = path("two-streams.mkv");
+            st.preset = "ultrafast";
+            st.audioCodec = "flac";
+            st.extraAudio = stemStreams(qs, StemsByTrack);
+            QVERIFY2(exportSequence(q, qs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        MediaItem master;
+        QVERIFY(probeMedia(path("two-streams.mkv"), master));
+        QVERIFY2(master.audioStreams.size() == 3, qPrintable(QString::number(master.audioStreams.size())));
+        QCOMPARE(sourceChannelCount(master), 6);
+        AudioBufferPtr music = decodeAudio(master.path, sr, nullptr, nullptr, {4});  // stream 3's left: track 2 alone
+        QVERIFY(music && level(*music, 0, 880) > 0.1 && level(*music, 0, 440) < 0.01);
+        AudioBufferPtr voice = decodeAudio(master.path, sr, nullptr, nullptr, {2, 5});  // stream 2's left, stream 3's right
+        QVERIFY(level(*voice, 0, 440) > 0.1 && level(*voice, 0, 880) < 0.01);
+        QVERIFY(level(*voice, 1, 880) > 0.1 && level(*voice, 1, 440) < 0.01);
+        // Over MCP: list, set, split pairs, and a media's mode.
+        Project mp = makeDefaultProject();
+        MediaItem pm = probeOrFail(mp, wav);
+        mp.media.push_back(pm);
+        QVERIFY(edit::placeMedia(mp, *mp.active(), pm.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Id mclip = mp.active()->audioTracks[0].clips.at(0).id;
+        const QString project = QString::fromStdString(path("channels-mcp.montage"));
+        QVERIFY(saveProject(mp, project.toStdString()));
+        McpServer server;
+        int rid = 1;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", rid++}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_audio_channels"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call({{"project", project}, {"clip", double(mclip)}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("source_channels").toArray().at(1).toString(), QString("Lav 1"));
+        r = call({{"project", project}, {"clip", double(mclip)}, {"action", "set"}, {"channels", QJsonArray{1}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("clips").toArray().at(0).toObject().value("channels").toArray(), QJsonArray{1});
+        QVERIFY(call({{"project", project}, {"clip", double(mclip)}, {"action", "set"}, {"channels", QJsonArray{9}}}).value("isError").toBool());
+        call({{"project", project}, {"clip", double(mclip)}, {"action", "mix"}});
+        r = call({{"project", project}, {"clip", double(mclip)}, {"action", "split_pairs"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("created").toArray().size(), 1);
+        r = call({{"project", project}, {"media", double(pm.id)}, {"mode", "mono"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        Project after;
+        QVERIFY(loadProject(project.toStdString(), after));
+        QCOMPARE(after.findMedia(pm.id)->audioChannelMode, std::string("mono"));
+        QCOMPARE(after.active()->audioTracks.at(1).clips.at(0).channels, (std::vector<int>{2, 3}));
     }
 
     void audioVisualiserAndAnimateToAudio() {

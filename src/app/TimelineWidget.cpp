@@ -30,6 +30,7 @@
 #include "ThumbnailCache.h"
 #include "audio/PluginEffect.h"
 #include "core/Effects.h"
+#include "core/AudioChannels.h"
 #include "core/Automation.h"
 #include "core/KeyframeEdit.h"
 #include "core/Multicam.h"
@@ -755,6 +756,11 @@ void TimelineWidget::paintClip(QPainter& p, const Row& row, const Clip& c, const
     if (c.ramped()) badges += tr(" ramp");
     if (!c.effects.empty()) badges += " fx";
     if (!c.takes.empty()) badges += tr(" take %1/%2").arg(c.take + 1).arg(c.takes.size());  // an audition
+    if (!c.channels.empty() && row.ref.kind == TrackKind::Audio)  // the source channels it plays, unless its name says
+        if (const MediaItem* m = proj.findMedia(c.mediaId)) {
+            const std::string label = channelsLabel(*m, c.channels);
+            if (c.name.find(label) == std::string::npos) badges += QStringLiteral(" ") + QString::fromStdString(label);
+        }
     if (!c.role.empty() && row.ref.kind == TrackKind::Audio && state_->sequence())  // its audio role, and if it is muted
         badges.prepend(QStringLiteral(" ") + QString::fromStdString(c.role) +
                        (edit::roleMuted(*state_->sequence(), c.role) ? tr(" (muted)") : QString()));
@@ -876,7 +882,7 @@ double TimelineWidget::waveformScale(const Clip& c) const {
     const MediaItem* m = state_->project().findMedia(c.mediaId);
     if (!s || !m) return 0;
     if (auto it = clipPeaks_.find(c.id); it != clipPeaks_.end()) return it->second > 0 ? 1.0 / it->second : 0;
-    const PeaksPtr pk = MediaPool::instance().peaksIfReady(m->path);
+    const PeaksPtr pk = MediaPool::instance().peaksIfReady(audioKey(m->path, c.channels));
     if (!pk || pk->minmax.empty()) return 0;  // not cached: tried again once the peaks are read
     // The loudest sample over the stretch of source the clip plays.
     const double fps = s->fpsValue(), perBucket = pk->samplesPerBucket;
@@ -1297,7 +1303,7 @@ void TimelineWidget::paintWaveform(QPainter& p, const Clip& c, const QRect& r, c
     const Sequence* s = state_->sequence();
     const MediaItem* m = proj.findMedia(c.mediaId);
     if (!m || !s || r.height() < 6 || !m->hasAudio || m->kind == MediaKind::Sequence) return;
-    PeaksPtr pk = MediaPool::instance().peaksIfReady(m->path);
+    PeaksPtr pk = MediaPool::instance().peaksIfReady(audioKey(m->path, c.channels));
     if (!pk || pk->minmax.empty()) {
         p.setPen(QColor(255, 255, 255, 60));
         p.drawLine(r.left(), r.center().y(), r.right(), r.center().y());

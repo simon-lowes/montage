@@ -20,6 +20,7 @@
 
 #include "core/ClipAnimation.h"
 #include "core/GradeVersions.h"
+#include "core/AudioChannels.h"
 #include "core/AutoTag.h"
 #include "core/Automation.h"
 #include "core/CaptionTools.h"
@@ -3294,6 +3295,76 @@ void McpServer::Impl::addTools() {
             if (!e && c->generator.id == Id(a.value("effect").toDouble())) e = &c->generator;
             const int keys = e ? int(e->params.at(param).keys.size()) : 0;
             return ok(QStringLiteral("%1 follows the sound with %2 keys").arg(QString::fromStdString(param)).arg(keys), QJsonObject{{"keys", keys}});
+        });
+
+    add("montage_audio_channels", "Audio channels",
+        "Which of a file's audio channels a clip plays (Premiere's Modify > Audio Channels), for a lav and a boom on one "
+        "camera, a field recorder's polyphonic WAV or an MXF with a stream per channel. `action`: list (the clip's "
+        "source channels, with the recorder's names, and those it plays), set (`channels`, 1-based; one plays in the "
+        "centre, two as left and right), mix (back to the stereo mix), split (a mono clip per channel on the tracks "
+        "below, linked) or split_pairs (a stereo clip per pair). A picture clip acts on its linked sound. With "
+        "`media` and `mode` (mix, mono, pairs) instead, sets how new clips of that media take its channels.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
+            "action":{"type":"string","enum":["list","set","mix","split","split_pairs"]},
+            "channels":{"type":"array","items":{"type":"integer"}},
+            "media":{"type":"number"},"mode":{"type":"string","enum":["mix","mono","pairs"]}},"required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            if (a.contains("media")) {
+                MediaItem* m = l.project.findMedia(Id(a.value("media").toDouble()));
+                if (!m) throw ArgError{"No such media"};
+                const QString mode = str(a, "mode", "mix");
+                if (mode != "mix" && mode != "mono" && mode != "pairs") throw ArgError{"mode is mix, mono or pairs"};
+                if (sourceChannelCount(*m) < 2) return fail(QStringLiteral("%1 has one channel").arg(QString::fromStdString(m->name)));
+                m->audioChannelMode = mode == "mix" ? std::string() : mode.toStdString();
+                save(l);
+                return ok(QStringLiteral("New clips of %1 take %2").arg(QString::fromStdString(m->name),
+                                                                         mode == "mix" ? "the stereo mix" : mode == "mono" ? "a clip per channel" : "a clip per pair"),
+                          QJsonObject{{"mode", mode}});
+            }
+            const Id id = clipArg(l, a).id;
+            const QString action = str(a, "action", "list");
+            edit::Result r;
+            if (action == "set") {
+                std::vector<int> channels;
+                for (const QJsonValue& v : a.value("channels").toArray()) channels.push_back(v.toInt() - 1);
+                if (channels.empty()) throw ArgError{"channels lists the channels to play, from 1"};
+                r = edit::setClipChannels(l.project, l.seq(), id, channels);
+            } else if (action == "mix") {
+                r = edit::setClipChannels(l.project, l.seq(), id, {});
+            } else if (action == "split" || action == "split_pairs") {
+                r = edit::splitAudioChannels(l.project, l.seq(), id, action == "split_pairs");
+            } else if (action != "list") {
+                throw ArgError{QStringLiteral("Unknown action \"%1\"").arg(action)};
+            }
+            if (!r.ok) return fail(r.error.empty() ? QStringLiteral("Nothing to change") : QString::fromStdString(r.error));
+            if (action != "list") save(l);
+            // The clip's sound clips (with any made by a split), and what each plays.
+            QJsonArray clips;
+            QStringList lines;
+            std::vector<Id> sounds;
+            for (Id x : edit::linkedClips(l.seq(), id))
+                if (const auto loc = edit::locate(l.seq(), x); loc && loc->track.kind == TrackKind::Audio) sounds.push_back(x);
+            QJsonArray names;
+            for (Id x : sounds) {
+                const Clip* c = edit::clipById(l.seq(), x);
+                const MediaItem* m = l.project.findMedia(c->mediaId);
+                if (!m) continue;
+                if (names.isEmpty())
+                    for (const std::string& n : sourceChannelNames(*m)) names.append(QString::fromStdString(n));
+                QJsonArray playing;
+                for (int ch : c->channels) playing.append(ch + 1);
+                const std::string label = channelsLabel(*m, c->channels);
+                clips.append(QJsonObject{{"id", double(c->id)}, {"name", QString::fromStdString(c->name)},
+                                         {"track", edit::locate(l.seq(), x)->track.index + 1}, {"channels", playing}});
+                lines << QStringLiteral("A%1 %2: %3").arg(edit::locate(l.seq(), x)->track.index + 1).arg(QString::fromStdString(c->name),
+                                                              label.empty() ? QStringLiteral("stereo mix") : QString::fromStdString(label));
+            }
+            if (clips.isEmpty()) return fail("The clip has no sound");
+            QJsonArray created;
+            for (Id x : r.created) created.append(double(x));
+            return ok(QStringLiteral("Source channels: %1\n").arg(QJsonDocument(names).toJson(QJsonDocument::Compact).constData()) + lines.join('\n'),
+                      QJsonObject{{"source_channels", names}, {"clips", clips}, {"created", created}});
         });
 
     add("montage_vfx_pull", "VFX pulls",

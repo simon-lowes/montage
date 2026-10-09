@@ -186,6 +186,10 @@ public:
     // Animate to Audio on the selected picture clips: `param` of effect `effect` (0 = Transform) follows audio track
     // `track`'s level (0 = all) in a band (render/AudioReactive.h AudioBand), from `low` to `high`; one undo step.
     bool animateSelectionToAudio(Id effect, const std::string& param, int track, int band, double low, double high);
+    // Audio channels (core/AudioChannels.h) of the selected clips' sound: play `channels` (0-based; empty = the mix),
+    // or split each into a clip per channel (per pair with `pairs`); one undo step each.
+    bool setSelectionChannels(const std::vector<int>& channels);
+    bool splitSelectionChannels(bool pairs);
     // Speed / Duration on the selected clips (each link group once), with Maintain Audio Pitch; one undo step.
     bool setSelectionSpeed(double speed, bool maintainPitch);
 
@@ -237,6 +241,7 @@ private:
     void speedDialog();
     void vfxPullDialog();
     void animateToAudioDialog();
+    void audioChannelsDialog();
     void nudge(int frames);
     void matchFrame();
     void addMarker();

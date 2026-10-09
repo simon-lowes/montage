@@ -23,6 +23,8 @@
 namespace montage {
 
 EditorState::EditorState(QObject* parent) : QObject(parent), project_(makeDefaultProject()) {
+    // Clips playing chosen channels of a file need those decoded too (the whole file is decoded on import).
+    connect(this, &EditorState::projectChanged, this, &EditorState::startClipAudioDecodes);
     // Decodes finish on worker threads, possibly after this object is gone:
     // hop to the application object and re-check before emitting.
     QPointer<EditorState> self(this);
@@ -331,7 +333,7 @@ void EditorState::reloadChangedMedia(const QStringList& paths) {
             if (m.path != p) continue;
             m.width = fresh.width, m.height = fresh.height, m.fps = fresh.fps;
             m.hasVideo = fresh.hasVideo, m.hasAudio = fresh.hasAudio;
-            m.sampleRate = fresh.sampleRate, m.channels = fresh.channels;
+            m.sampleRate = fresh.sampleRate, m.channels = fresh.channels, m.audioStreams = fresh.audioStreams;
             m.videoCodec = fresh.videoCodec, m.audioCodec = fresh.audioCodec;
             if (!m.subclipOf) {
                 m.duration = fresh.duration;
@@ -341,6 +343,8 @@ void EditorState::reloadChangedMedia(const QStringList& paths) {
         }
         for (const MediaItem& m : project_.media)
             if (m.path == p && !m.subclipOf) startAudioDecode(m);
+        for (auto it = clipAudioRequested_.begin(); it != clipAudioRequested_.end();)
+            it = audioKeyFile(it->first) == p ? clipAudioRequested_.erase(it) : std::next(it);
     }
     offlineChecked_.clear();
     if (reloaded.empty()) return;
@@ -359,6 +363,21 @@ bool EditorState::isMediaOffline(Id media) const {
         when = now;
     }
     return offline;
+}
+
+void EditorState::startClipAudioDecodes() {
+    const Sequence* s = sequence();
+    const int rate = s ? s->sampleRate : 48000;
+    for (const Sequence& seq : project_.sequences)
+        for (const Track& t : seq.audioTracks)
+            for (const Clip& c : t.clips) {
+                if (c.channels.empty()) continue;
+                const MediaItem* m = project_.findMedia(c.mediaId);
+                if (!m || !m->hasAudio || m->path.empty()) continue;
+                std::string key = audioKey(m->path, c.channels);
+                if (!clipAudioRequested_.insert({key, rate}).second) continue;
+                (void)QtConcurrent::run([key, rate] { MediaPool::instance().audio(key, rate); });
+            }
 }
 
 void EditorState::startAudioDecode(const MediaItem& m) {

@@ -54,6 +54,7 @@
 #include "media/Relink.h"
 #include "TranscribeDialog.h"
 #include "core/Slate.h"
+#include "core/AudioChannels.h"
 #include "core/MediaLog.h"
 #include "core/AutoTag.h"
 #include "media/Analysis.h"
@@ -730,6 +731,18 @@ Id MediaBinWidget::mergeClips(Id video, const std::vector<Id>& sounds, int syncB
     return made;
 }
 
+bool MediaBinWidget::setAudioChannelMode(const std::vector<Id>& media, const std::string& mode) {
+    return state_->edit(tr("Audio Channels"), [media, mode](Project& p, Sequence&) {
+        bool any = false;
+        for (Id id : media)
+            if (MediaItem* m = p.findMedia(id); m && sourceChannelCount(*m) > 1 && m->audioChannelMode != mode) {
+                m->audioChannelMode = mode;
+                any = true;
+            }
+        return any;
+    });
+}
+
 std::vector<Id> MediaBinWidget::syncDailies(const std::vector<Id>& media, bool keepCameraAudio, QStringList* report) {
     std::vector<std::string> lines;
     QApplication::setOverrideCursor(Qt::WaitCursor);
@@ -1119,6 +1132,26 @@ void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos)
             a->setCheckable(true);
             a->setChecked(current == cs.id);
             a->setData(QString::fromStdString(cs.id));
+        }
+    }
+    // Audio Channels (Premiere's Modify > Audio Channels): how new clips of files with several channels take them.
+    std::vector<Id> multichannel;
+    for (Id id : files)
+        if (const MediaItem* m = state_->project().findMedia(id); m && sourceChannelCount(*m) > 1) multichannel.push_back(id);
+    if (!multichannel.empty()) {
+        QMenu* channels = menu.addMenu(tr("Audio Channels"));
+        channels->setObjectName(QStringLiteral("mediaAudioChannels"));
+        const std::string current = state_->project().findMedia(multichannel.front())->audioChannelMode;
+        bool mixed = false;
+        for (Id id : multichannel) mixed = mixed || state_->project().findMedia(id)->audioChannelMode != current;
+        const std::pair<QString, const char*> modes[] = {{tr("Stereo Mix"), kChannelsMix},
+                                                         {tr("Mono Clip per Channel"), kChannelsMono},
+                                                         {tr("Stereo Clip per Pair"), kChannelsPairs}};
+        for (const auto& [label, mode] : modes) {
+            QAction* a = channels->addAction(label, this, [this, multichannel, mode = std::string(mode)] { setAudioChannelMode(multichannel, mode); });
+            a->setCheckable(true);
+            a->setChecked(!mixed && current == mode);
+            a->setData(QString::fromLatin1(mode));
         }
     }
     std::vector<Id> sources;  // files a multicam clip can be made of

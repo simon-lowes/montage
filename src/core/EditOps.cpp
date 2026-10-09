@@ -8,6 +8,7 @@
 #include <map>
 #include <set>
 
+#include "AudioChannels.h"
 #include "Effects.h"
 
 namespace montage::edit {
@@ -322,6 +323,12 @@ Result placeMedia(Project& p, Sequence& s, Id mediaId, FrameTime at, double srcI
         a.linkGroup = group;
         Result r = overwrite(p, s, audioTrack, a);
         res.created.insert(res.created.end(), r.created.begin(), r.created.end());
+        // Media set to take its channels apart: a clip per channel or pair, on the tracks below.
+        if (r.ok && (m->audioChannelMode == kChannelsMono || m->audioChannelMode == kChannelsPairs) && sourceChannelCount(*m) > 1) {
+            const bool pairs = m->audioChannelMode == kChannelsPairs;
+            const Result split = splitAudioChannels(p, s, a.id, pairs);
+            res.created.insert(res.created.end(), split.created.begin(), split.created.end());
+        }
     }
     return res;
 }

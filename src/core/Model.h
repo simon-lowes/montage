@@ -114,6 +114,12 @@ struct MediaItem {
     bool hasAudio = false;
     int sampleRate = 0;
     int channels = 0;
+    // Channels in each audio stream, in file order (cameras writing MXF often carry a mono stream per channel).
+    // Clip::channels counts across them. Empty: one stream of `channels`.
+    std::vector<int> audioStreams;
+    // How new clips take its channels (core/AudioChannels.h): "" the main stream mixed to stereo, "mono" a clip per
+    // channel, "pairs" a stereo clip per pair (Premiere's Modify > Audio Channels on a project item).
+    std::string audioChannelMode;
     std::string videoCodec;
     std::string audioCodec;
     Id sequenceId = 0;       // for MediaKind::Sequence (compound clip)
@@ -220,6 +226,10 @@ struct Clip {
     std::string unrendered;      // after Render and Replace: the clip as it was (JSON), for Restore
     int angle = 0;               // multicam video clip: the angle shown (video track of the multicam sequence)
     int audioAngle = -1;         // multicam audio clip: the audio track played, -1 = all of them
+    // Source channels played (Premiere's Modify > Audio Channels): indexes into every channel of the file's audio
+    // streams, in order (MediaItem::audioStreams). Empty = the main audio stream mixed to stereo. One channel plays
+    // in the centre, two as left and right; with more, the first, third... go left and the others right.
+    std::vector<int> channels;
 
     FrameTime end() const { return start + duration; }
     bool contains(FrameTime t) const { return t >= start && t < end(); }

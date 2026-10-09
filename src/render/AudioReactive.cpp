@@ -24,7 +24,7 @@ std::vector<float> trackSoundAt(const Project& p, const Sequence& seq, int track
             if (!c.enabled || t < double(c.start) || t >= double(c.end()) || !c.mediaId) continue;
             const MediaItem* m = p.findMedia(c.mediaId);
             if (!m || !m->hasAudio || m->path.empty()) continue;
-            AudioBufferPtr buf = MediaPool::instance().audio(m->path, rate);
+            AudioBufferPtr buf = MediaPool::instance().audio(audioKey(m->path, c.channels), rate);
             if (!buf || buf->samples.empty()) continue;
             const int64_t n = buf->frames();
             const double centre = c.sourceAt(t - double(c.start)) * rate / fps;

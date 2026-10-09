@@ -5,6 +5,7 @@
 #include <map>
 
 #include "Decoder.h"
+#include "MediaPool.h"
 #include "core/Multicam.h"
 
 namespace montage {
@@ -79,9 +80,9 @@ std::vector<std::pair<FrameTime, int>> speakerAngleChanges(const Project& p, con
         for (const Clip& c : mc.audioTracks[size_t(track)].clips) {
             const MediaItem* m = p.findMedia(c.mediaId);
             if (!m || m->path.empty() || !m->hasAudio) continue;
-            AudioBufferPtr& buf = decoded[m->path];
+            AudioBufferPtr& buf = decoded[audioKey(m->path, c.channels)];
             std::string err;
-            if (!buf) buf = decodeAudio(m->path, kRate, &err, cancel);
+            if (!buf) buf = decodeAudio(m->path, kRate, &err, cancel, c.channels);
             if (cancel && cancel->load()) return fail("Cancelled");
             if (!buf) return fail("Cannot read the sound of " + m->name + (err.empty() ? "" : ": " + err));
             const int64_t n = buf->frames();

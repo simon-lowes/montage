@@ -3,10 +3,39 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <iterator>
 #include <utility>
 
 namespace montage {
+
+namespace {
+constexpr char kChannelMark = '\x1f';  // never in a file name
+}  // namespace
+
+std::string audioKey(const std::string& path, const std::vector<int>& channels) {
+    if (channels.empty()) return path;
+    std::string key = path + kChannelMark;
+    for (size_t i = 0; i < channels.size(); ++i) key += (i ? "," : "") + std::to_string(channels[i]);
+    return key;
+}
+
+std::string audioKeyFile(const std::string& key, std::vector<int>* channels) {
+    const size_t mark = key.find(kChannelMark);
+    if (channels) {
+        channels->clear();
+        if (mark != std::string::npos) {
+            size_t from = mark + 1;
+            while (from < key.size()) {
+                size_t comma = key.find(',', from);
+                if (comma == std::string::npos) comma = key.size();
+                channels->push_back(std::atoi(key.substr(from, comma - from).c_str()));
+                from = comma + 1;
+            }
+        }
+    }
+    return mark == std::string::npos ? key : key.substr(0, mark);
+}
 
 MediaPool& MediaPool::instance() {
     static MediaPool pool;
@@ -166,7 +195,9 @@ AudioBufferPtr MediaPool::audio(const std::string& path, int sampleRate) {
         auto it = audio_.find({path, sampleRate});
         if (it != audio_.end()) return it->second;
     }
-    AudioBufferPtr buf = decodeAudio(path, sampleRate);
+    std::vector<int> channels;
+    const std::string file = audioKeyFile(path, &channels);
+    AudioBufferPtr buf = decodeAudio(file, sampleRate, nullptr, nullptr, channels);
     if (!buf) buf = std::make_shared<AudioBuffer>();  // remember failures as silence
     PeaksPtr pk = computePeaks(*buf);
     std::function<void(const std::string&)> cb;
@@ -238,8 +269,8 @@ void MediaPool::forget(const std::string& path) {
         }
     }
     std::lock_guard lock(audioM_);
-    for (auto it = audio_.begin(); it != audio_.end();) it = it->first.first == path ? audio_.erase(it) : std::next(it);
-    peaks_.erase(path);
+    for (auto it = audio_.begin(); it != audio_.end();) it = audioKeyFile(it->first.first) == path ? audio_.erase(it) : std::next(it);
+    for (auto it = peaks_.begin(); it != peaks_.end();) it = audioKeyFile(it->first) == path ? peaks_.erase(it) : std::next(it);
 }
 
 void MediaPool::setReadyCallback(std::function<void(const std::string&)> cb) {

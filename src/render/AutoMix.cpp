@@ -9,6 +9,7 @@
 #include "core/EditOps.h"
 #include "media/AutoDuck.h"
 #include "media/Decoder.h"
+#include "media/MediaPool.h"
 #include "media/Loudness.h"
 
 namespace montage {
@@ -240,9 +241,9 @@ std::vector<ClipMix> planMix(const Project& p, const Sequence& s, const MixOptio
         const Clip& c = *clips[i];
         const MediaItem* m = p.findMedia(c.mediaId);
         if (!m || !m->hasAudio || m->path.empty()) continue;
-        AudioBufferPtr& buf = decoded[m->path];
+        AudioBufferPtr& buf = decoded[audioKey(m->path, c.channels)];
         std::string err;
-        if (!buf) buf = decodeAudio(m->path, kMixRate, &err, cancel);
+        if (!buf) buf = decodeAudio(m->path, kMixRate, &err, cancel, c.channels);
         if (!buf) {
             if (error && error->empty()) *error = err;
             continue;

@@ -115,6 +115,7 @@
 #include "core/EditOps.h"
 #include "core/GradeVersions.h"
 #include "core/MergeClips.h"
+#include "core/AudioChannels.h"
 #include "core/Effects.h"
 #include "core/Multicam.h"
 #include "core/ProjectIO.h"
@@ -2321,6 +2322,69 @@ private slots:
         QVERIFY2(lo >= 99.99 && lo < 105 && std::fabs(hi - 120) < 0.01, qPrintable(QString("%1 %2").arg(lo).arg(hi)));
         state()->undo();
         QVERIFY(!scaleAnimated());
+        state()->setSelection({}, false);
+    }
+
+    void audioChannelsOnTheSelection() {
+        // A camera file's four channels (a boom, a lav and two spare), 200-500 Hz.
+        const QString wav = dir_.path() + "/four-channels.wav";
+        {
+            QFile f(wav);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            const int frames = 48000;
+            QByteArray data;
+            QDataStream out(&data, QIODevice::WriteOnly);
+            out.setByteOrder(QDataStream::LittleEndian);
+            out.writeRawData("RIFF", 4);
+            out << quint32(36 + frames * 8);
+            out.writeRawData("WAVEfmt ", 8);
+            out << quint32(16) << quint16(1) << quint16(4) << quint32(48000) << quint32(48000 * 8) << quint16(8) << quint16(16);
+            out.writeRawData("data", 4);
+            out << quint32(frames * 8);
+            for (int i = 0; i < frames; ++i)
+                for (int ch = 0; ch < 4; ++ch) out << qint16(std::lround(8000 * std::sin(2 * M_PI * (200 + 100 * ch) * i / 48000.0)));
+            f.write(data);
+        }
+        state()->newProject();
+        const auto ids = state()->importFiles({wav});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        QCOMPARE(sourceChannelCount(*state()->project().findMedia(media)), 4);
+        QVERIFY(state()->apply("Place", [media](Project& p, Sequence& s) { return edit::placeMedia(p, s, media, 0, 0, -1, V1, A1, false); }));
+        const Id clip = trackAt(*state()->sequence(), A1)->clips.at(0).id;
+        state()->setSelection({clip}, false);
+        for (const char* name : {"audioChannels", "splitChannels", "splitChannelPairs", "channelsMix"}) QVERIFY2(win_->findChild<QAction*>(name), name);
+        // Channel 2 alone: one undo step, and decoded in the background for playback and the waveform.
+        QVERIFY(win_->setSelectionChannels({1}));
+        QCOMPARE(edit::clipById(*state()->sequence(), clip)->channels, std::vector<int>{1});
+        const std::string path = state()->project().findMedia(media)->path;
+        QTRY_VERIFY(MediaPool::instance().audioIfReady(audioKey(path, {1}), state()->sequence()->sampleRate));
+        QTRY_VERIFY(MediaPool::instance().peaksIfReady(audioKey(path, {1})));
+        QVERIFY(!win_->setSelectionChannels({7}));  // refused: the file has four
+        win_->findChild<QAction*>("channelsMix")->trigger();
+        QVERIFY(edit::clipById(*state()->sequence(), clip)->channels.empty());
+        state()->undo();
+        QCOMPARE(edit::clipById(*state()->sequence(), clip)->channels, std::vector<int>{1});
+        state()->undo();
+        QVERIFY(edit::clipById(*state()->sequence(), clip)->channels.empty());
+        // Split into mono clips from the menu: four clips on A1-A4, one undo step.
+        win_->findChild<QAction*>("splitChannels")->trigger();
+        const Sequence* s = state()->sequence();
+        QCOMPARE(s->audioTracks.size(), size_t(4));
+        for (int t = 0; t < 4; ++t) QCOMPARE(s->audioTracks[size_t(t)].clips.at(0).channels, std::vector<int>{t});
+        state()->undo();
+        QCOMPARE(state()->sequence()->audioTracks[1].clips.size(), size_t(0));
+        // The media bin's setting: new clips come a channel each.
+        auto* bin = win_->findChild<MediaBinWidget*>();
+        QVERIFY(bin->setAudioChannelMode({media}, kChannelsMono));
+        QVERIFY(!bin->setAudioChannelMode({media}, kChannelsMono));
+        QCOMPARE(state()->project().findMedia(media)->audioChannelMode, std::string("mono"));
+        QVERIFY(state()->apply("Place", [media](Project& p, Sequence& s) { return edit::placeMedia(p, s, media, 100, 0, -1, V1, A1, false); }));
+        for (int t = 0; t < 4; ++t) {
+            const Clip* c = edit::clipAt(*state()->sequence(), {TrackKind::Audio, t}, 110);
+            QVERIFY(c);
+            QCOMPARE(c->channels, std::vector<int>{t});
+        }
         state()->setSelection({}, false);
     }
 

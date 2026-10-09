@@ -100,8 +100,11 @@ using AudioBufferPtr = std::shared_ptr<const AudioBuffer>;
 
 // Decodes the whole first audio stream to stereo float at `sampleRate`,
 // aligned so that sample 0 is media time 0 (same origin as VideoDecoder).
+// With `channels` (indexes across every audio stream, Clip::channels), those
+// channels instead: one in the centre, two as left and right, more summed
+// alternately left and right.
 AudioBufferPtr decodeAudio(const std::string& path, int sampleRate, std::string* error = nullptr,
-                           const std::atomic<bool>* cancel = nullptr);
+                           const std::atomic<bool>* cancel = nullptr, const std::vector<int>& channels = {});
 
 // Min/max envelope for waveform drawing: one (min, max) pair per bucket.
 struct Peaks {

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <map>
 #include <thread>
 
 extern "C" {
@@ -218,6 +219,11 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         m.sampleRate = st->codecpar->sample_rate;
         m.channels = st->codecpar->ch_layout.nb_channels;
         if (dur <= 0 && st->duration > 0) dur = double(st->duration) * av_q2d(st->time_base);
+        m.audioStreams.clear();
+        for (unsigned i = 0; i < fmt->nb_streams; ++i)
+            if (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+                m.audioStreams.push_back(std::max(1, fmt->streams[i]->codecpar->ch_layout.nb_channels));
+        if (m.audioStreams.size() < 2) m.audioStreams.clear();
     }
     if (m.hasVideo && isStillFormat(fmt)) {
         m.kind = MediaKind::Image;
@@ -744,13 +750,17 @@ Frame16 rotateFrame(const Frame16& f, int degrees) {
 // ---------------------------------------------------------------------------
 // Audio
 
-AudioBufferPtr decodeAudio(const std::string& path, int sampleRate, std::string* error,
-                           const std::atomic<bool>* cancel) {
+namespace {
+
+// One audio stream decoded whole to float at `sampleRate`, aligned so sample 0 is media time 0: the best stream
+// mixed to stereo (ordinal -1), or the ordinal-th audio stream with its own channels. `channels` says how many.
+bool decodeAudioStream(const std::string& path, int sampleRate, int ordinal, std::vector<float>& samples, int& channels,
+                       std::string* error, const std::atomic<bool>* cancel) {
     AVFormatContext* fmt = nullptr;
     int rc = avformat_open_input(&fmt, path.c_str(), nullptr, nullptr);
     if (rc < 0) {
         if (error) *error = averr(rc);
-        return nullptr;
+        return false;
     }
     struct Cleanup {
         AVFormatContext** fmt;
@@ -768,13 +778,20 @@ AudioBufferPtr decodeAudio(const std::string& path, int sampleRate, std::string*
     } c{&fmt};
     if ((rc = avformat_find_stream_info(fmt, nullptr)) < 0) {
         if (error) *error = averr(rc);
-        return nullptr;
+        return false;
     }
     const AVCodec* codec = nullptr;
-    int stream = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, &codec, 0);
+    int stream = -1;
+    if (ordinal < 0) {
+        stream = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, &codec, 0);
+    } else {
+        for (unsigned i = 0, n = 0; i < fmt->nb_streams && stream < 0; ++i)
+            if (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && int(n++) == ordinal) stream = int(i);
+        if (stream >= 0) codec = avcodec_find_decoder(fmt->streams[stream]->codecpar->codec_id);
+    }
     if (stream < 0 || !codec) {
         if (error) *error = "No audio stream";
-        return nullptr;
+        return false;
     }
     for (unsigned i = 0; i < fmt->nb_streams; ++i)
         if (int(i) != stream) fmt->streams[i]->discard = AVDISCARD_ALL;
@@ -784,23 +801,24 @@ AudioBufferPtr decodeAudio(const std::string& path, int sampleRate, std::string*
     c.ctx->pkt_timebase = st->time_base;
     if ((rc = avcodec_open2(c.ctx, codec, nullptr)) < 0) {
         if (error) *error = averr(rc);
-        return nullptr;
+        return false;
     }
     if (c.ctx->ch_layout.order == AV_CHANNEL_ORDER_UNSPEC)
         av_channel_layout_default(&c.ctx->ch_layout, std::max(1, c.ctx->ch_layout.nb_channels));
     AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
-    rc = swr_alloc_set_opts2(&c.swr, &stereo, AV_SAMPLE_FMT_FLT, sampleRate, &c.ctx->ch_layout, c.ctx->sample_fmt,
+    const AVChannelLayout* outLayout = ordinal < 0 ? &stereo : &c.ctx->ch_layout;
+    channels = outLayout->nb_channels;
+    rc = swr_alloc_set_opts2(&c.swr, outLayout, AV_SAMPLE_FMT_FLT, sampleRate, &c.ctx->ch_layout, c.ctx->sample_fmt,
                              c.ctx->sample_rate, 0, nullptr);
     if (rc < 0 || swr_init(c.swr) < 0) {
         if (error) *error = "Cannot initialise resampler";
-        return nullptr;
+        return false;
     }
     c.pkt = av_packet_alloc();
     c.frame = av_frame_alloc();
-    auto buf = std::make_shared<AudioBuffer>();
-    buf->sampleRate = sampleRate;
-    if (st->duration > 0)
-        buf->samples.reserve(size_t(double(st->duration) * av_q2d(st->time_base) * sampleRate * 2.0 + 4096));
+    const size_t nch = size_t(channels);
+    samples.clear();
+    if (st->duration > 0) samples.reserve(size_t(double(st->duration) * av_q2d(st->time_base) * sampleRate * double(nch) + 4096));
     const double origin = fileOrigin(fmt);
     const double tb = av_q2d(st->time_base);
     bool first = true;
@@ -810,7 +828,7 @@ AudioBufferPtr decodeAudio(const std::string& path, int sampleRate, std::string*
     auto append = [&](const uint8_t** in, int nb) {
         int maxOut = swr_get_out_samples(c.swr, nb);
         if (maxOut <= 0) return;
-        tmp.resize(size_t(maxOut) * 2);
+        tmp.resize(size_t(maxOut) * nch);
         uint8_t* outPtr[1] = {reinterpret_cast<uint8_t*>(tmp.data())};
         int got = swr_convert(c.swr, outPtr, maxOut, in, nb);
         if (got <= 0) return;
@@ -819,7 +837,7 @@ AudioBufferPtr decodeAudio(const std::string& path, int sampleRate, std::string*
             start = std::min<int64_t>(dropLeading, got);
             dropLeading -= start;
         }
-        buf->samples.insert(buf->samples.end(), tmp.begin() + start * 2, tmp.begin() + int64_t(got) * 2);
+        samples.insert(samples.end(), tmp.begin() + start * int64_t(nch), tmp.begin() + int64_t(got) * int64_t(nch));
     };
     auto handleFrame = [&]() {
         if (first) {
@@ -828,7 +846,7 @@ AudioBufferPtr decodeAudio(const std::string& path, int sampleRate, std::string*
             if (ts == AV_NOPTS_VALUE) ts = c.frame->pts;
             double startSec = ts == AV_NOPTS_VALUE ? 0.0 : double(ts) * tb - origin;
             int64_t offset = int64_t(std::llround(startSec * sampleRate));
-            if (offset > 0) buf->samples.insert(buf->samples.end(), size_t(offset) * 2, 0.0f);
+            if (offset > 0) samples.insert(samples.end(), size_t(offset) * nch, 0.0f);
             else dropLeading = -offset;
         }
         append(const_cast<const uint8_t**>(c.frame->extended_data), c.frame->nb_samples);
@@ -836,7 +854,7 @@ AudioBufferPtr decodeAudio(const std::string& path, int sampleRate, std::string*
 
     bool eof = false;
     while (true) {
-        if (cancel && cancel->load()) return nullptr;
+        if (cancel && cancel->load()) return false;
         rc = avcodec_receive_frame(c.ctx, c.frame);
         if (rc == 0) {
             handleFrame();
@@ -855,7 +873,68 @@ AudioBufferPtr decodeAudio(const std::string& path, int sampleRate, std::string*
         av_packet_unref(c.pkt);
     }
     append(nullptr, 0);  // flush the resampler
-    buf->samples.shrink_to_fit();
+    samples.shrink_to_fit();
+    return true;
+}
+
+}  // namespace
+
+AudioBufferPtr decodeAudio(const std::string& path, int sampleRate, std::string* error, const std::atomic<bool>* cancel,
+                           const std::vector<int>& channels) {
+    auto buf = std::make_shared<AudioBuffer>();
+    buf->sampleRate = sampleRate;
+    int n = 0;
+    if (channels.empty()) {
+        if (!decodeAudioStream(path, sampleRate, -1, buf->samples, n, error, cancel)) return nullptr;
+        return buf;
+    }
+    // Chosen channels: each audio stream they come from, decoded with its own channels, then routed to stereo.
+    std::vector<int> streams;  // channels per audio stream
+    {
+        AVFormatContext* fmt = nullptr;
+        if (int rc = avformat_open_input(&fmt, path.c_str(), nullptr, nullptr); rc < 0) {
+            if (error) *error = averr(rc);
+            return nullptr;
+        }
+        if (avformat_find_stream_info(fmt, nullptr) >= 0)
+            for (unsigned i = 0; i < fmt->nb_streams; ++i)
+                if (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+                    streams.push_back(std::max(1, fmt->streams[i]->codecpar->ch_layout.nb_channels));
+        avformat_close_input(&fmt);
+    }
+    std::map<int, std::pair<std::vector<float>, int>> decoded;  // stream ordinal -> samples, channels
+    auto locate = [&](int ch, int& stream, int& local) {
+        for (stream = 0; stream < int(streams.size()); ++stream) {
+            if (ch < streams[size_t(stream)]) return (local = ch, true);
+            ch -= streams[size_t(stream)];
+        }
+        return false;
+    };
+    for (int ch : channels) {
+        int stream = 0, local = 0;
+        if (ch < 0 || !locate(ch, stream, local)) {
+            if (error) *error = "The file has no audio channel " + std::to_string(ch + 1);
+            return nullptr;
+        }
+        if (decoded.count(stream)) continue;
+        auto& [samples, count] = decoded[stream];
+        if (!decodeAudioStream(path, sampleRate, stream, samples, count, error, cancel)) return nullptr;
+    }
+    int64_t frames = 0;
+    for (const auto& [stream, d] : decoded) frames = std::max<int64_t>(frames, int64_t(d.first.size()) / std::max(1, d.second));
+    buf->samples.assign(size_t(frames) * 2, 0.0f);
+    for (size_t k = 0; k < channels.size(); ++k) {
+        int stream = 0, local = 0;
+        locate(channels[k], stream, local);
+        const auto& [samples, count] = decoded.at(stream);
+        const int64_t have = int64_t(samples.size()) / std::max(1, count);
+        const bool centre = channels.size() == 1;
+        for (int64_t i = 0; i < have; ++i) {
+            const float v = samples[size_t(i * count + local)];
+            if (centre || k % 2 == 0) buf->samples[size_t(i) * 2] += v;
+            if (centre || k % 2 == 1) buf->samples[size_t(i) * 2 + 1] += v;
+        }
+    }
     return buf;
 }
 

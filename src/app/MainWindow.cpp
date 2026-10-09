@@ -61,6 +61,7 @@
 #include "AudioMeterWidget.h"
 #include "audio/PluginEffect.h"
 #include "core/GradeVersions.h"
+#include "core/AudioChannels.h"
 #include "core/Chapters.h"
 #include "core/MarkerList.h"
 #include "render/AudioReactive.h"
@@ -844,6 +845,14 @@ void MainWindow::buildMenus() {
             })->setObjectName(step > 0 ? QStringLiteral("gradeNextVersion") : QStringLiteral("gradePreviousVersion"));
     }
     add(clipM, tr("Animate to Audio…"), QKeySequence(), [this] { animateToAudioDialog(); })->setObjectName(QStringLiteral("animateToAudio"));
+    {
+        QMenu* channels = clipM->addMenu(tr("Audio Channels"));
+        channels->setObjectName(QStringLiteral("audioChannelsMenu"));
+        add(channels, tr("Choose Channels…"), QKeySequence(), [this] { audioChannelsDialog(); })->setObjectName(QStringLiteral("audioChannels"));
+        add(channels, tr("Split into Mono Clips"), QKeySequence(), [this] { splitSelectionChannels(false); })->setObjectName(QStringLiteral("splitChannels"));
+        add(channels, tr("Split into Stereo Pairs"), QKeySequence(), [this] { splitSelectionChannels(true); })->setObjectName(QStringLiteral("splitChannelPairs"));
+        add(channels, tr("Play Stereo Mix"), QKeySequence(), [this] { setSelectionChannels({}); })->setObjectName(QStringLiteral("channelsMix"));
+    }
     add(clipM, tr("Swap with Previous Clip"), QKeySequence("Ctrl+Shift+,"), [this] { swapClip(false); })->setObjectName(QStringLiteral("swapPrevious"));
     add(clipM, tr("Swap with Next Clip"), QKeySequence("Ctrl+Shift+."), [this] { swapClip(true); })->setObjectName(QStringLiteral("swapNext"));
     add(clipM, tr("Join Through Edits"), QKeySequence(), [this] { joinThroughEdits(); })->setObjectName(QStringLiteral("joinThroughEdits"));
@@ -1861,6 +1870,85 @@ bool MainWindow::animateSelectionToAudio(Id effect, const std::string& param, in
     return ok;
 }
 
+bool MainWindow::setSelectionChannels(const std::vector<int>& channels) {
+    const auto sel = state_->selectedClips();
+    if (sel.empty()) return false;
+    return state_->apply(tr("Audio Channels"), [sel, channels](Project& p, Sequence& s) {
+        edit::Result last = edit::Result::fail(tr("Select clips with sound").toStdString());
+        bool any = false;
+        std::set<Id> done;  // each sound clip once (a picture and its sound are both selected)
+        for (Id id : sel) {
+            if (done.count(id)) continue;
+            for (Id l : edit::linkedClips(s, id)) done.insert(l);
+            const edit::Result r = edit::setClipChannels(p, s, id, channels);
+            if (r.ok) any = true;
+            else if (!r.error.empty() || !last.ok) last = r;
+        }
+        return any ? edit::Result{} : last;
+    });
+}
+
+bool MainWindow::splitSelectionChannels(bool pairs) {
+    const auto sel = state_->selectedClips();
+    if (sel.empty()) return false;
+    return state_->apply(pairs ? tr("Split into Stereo Pairs") : tr("Split into Mono Clips"), [sel, pairs](Project& p, Sequence& s) {
+        edit::Result last = edit::Result::fail(tr("Select clips with sound").toStdString()), all;
+        bool any = false;
+        std::set<Id> done;
+        for (Id id : sel) {
+            if (done.count(id) || !edit::clipById(s, id)) continue;
+            for (Id l : edit::linkedClips(s, id)) done.insert(l);
+            const edit::Result r = edit::splitAudioChannels(p, s, id, pairs);
+            if (r.ok) {
+                any = true;
+                all.created.insert(all.created.end(), r.created.begin(), r.created.end());
+            } else {
+                last = r;
+            }
+        }
+        return any ? all : last;
+    });
+}
+
+void MainWindow::audioChannelsDialog() {
+    const Clip* c = state_->primaryClip();
+    const Sequence* s = state_->sequence();
+    if (!c || !s) return;
+    // The sound clip: this one, or the sound linked to a picture.
+    const Clip* sound = nullptr;
+    for (Id id : edit::linkedClips(*s, c->id))
+        if (const auto loc = edit::locate(*s, id); loc && loc->track.kind == TrackKind::Audio && !sound) sound = edit::clipById(*s, id);
+    const MediaItem* m = sound ? state_->project().findMedia(sound->mediaId) : nullptr;
+    if (!m || sourceChannelCount(*m) == 0) {
+        state_->message(tr("Select a clip with sound"));
+        return;
+    }
+    QDialog dlg(this);
+    dlg.setObjectName(QStringLiteral("audioChannelsDialog"));
+    dlg.setWindowTitle(tr("Audio Channels"));
+    auto* layout = new QVBoxLayout(&dlg);
+    layout->addWidget(new QLabel(tr("Channels of %1 the clip plays (none ticked: the stereo mix).").arg(QString::fromStdString(m->name)), &dlg));
+    const std::vector<std::string> names = sourceChannelNames(*m);
+    std::vector<QCheckBox*> boxes;
+    for (size_t i = 0; i < names.size(); ++i) {
+        auto* box = new QCheckBox(tr("%1: %2").arg(i + 1).arg(QString::fromStdString(names[i])), &dlg);
+        box->setObjectName(QStringLiteral("channel%1").arg(i + 1));
+        box->setChecked(std::find(sound->channels.begin(), sound->channels.end(), int(i)) != sound->channels.end());
+        layout->addWidget(box);
+        boxes.push_back(box);
+    }
+    layout->addWidget(new QLabel(tr("One channel plays in the centre, two as left and right."), &dlg));
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    layout->addWidget(buttons);
+    if (dlg.exec() != QDialog::Accepted) return;
+    std::vector<int> chosen;
+    for (size_t i = 0; i < boxes.size(); ++i)
+        if (boxes[i]->isChecked()) chosen.push_back(int(i));
+    setSelectionChannels(chosen);
+}
+
 void MainWindow::animateToAudioDialog() {
     const Clip* c = state_->primaryClip();
     const Sequence* s = state_->sequence();
@@ -2434,7 +2522,7 @@ void MainWindow::normalizeLoudness() {
         const Clip* c = edit::clipById(*s, id);
         const MediaItem* m = c ? state_->project().findMedia(c->mediaId) : nullptr;
         if (!m || !m->hasAudio || m->path.empty()) continue;
-        AudioBufferPtr buf = MediaPool::instance().audio(m->path, s->sampleRate);
+        AudioBufferPtr buf = MediaPool::instance().audio(audioKey(m->path, c->channels), s->sampleRate);
         if (!buf) continue;
         double perFrame = double(s->sampleRate) / s->fpsValue();
         int64_t first = int64_t(std::llround(c->sourceIn * perFrame));
@@ -3654,7 +3742,7 @@ void MainWindow::syncByAudio() {
     }
     QApplication::setOverrideCursor(Qt::WaitCursor);
     const Clip* ref = edit::clipById(*s, items[0].id);
-    AudioBufferPtr refBuf = MediaPool::instance().audio(state_->project().findMedia(ref->mediaId)->path, s->sampleRate);
+    AudioBufferPtr refBuf = MediaPool::instance().audio(audioKey(state_->project().findMedia(ref->mediaId)->path, ref->channels), s->sampleRate);
     std::vector<std::pair<std::vector<Id>, FrameTime>> moves;
     QStringList failed;
     Id refGroup = ref->linkGroup;
@@ -3662,7 +3750,7 @@ void MainWindow::syncByAudio() {
         const Clip* o = edit::clipById(*s, items[i].id);
         if (refGroup && o->linkGroup == refGroup) continue;
         const MediaItem* om = state_->project().findMedia(o->mediaId);
-        AudioBufferPtr ob = MediaPool::instance().audio(om->path, s->sampleRate);
+        AudioBufferPtr ob = MediaPool::instance().audio(audioKey(om->path, o->channels), s->sampleRate);
         SyncResult r = refBuf && ob ? findAudioOffset(*refBuf, *ob) : SyncResult{};
         if (!r.found) {
             failed << QString::fromStdString(o->name);

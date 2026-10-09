@@ -11,6 +11,7 @@
 #include "core/Aaf.h"
 #include "core/EditOps.h"
 #include "media/Decoder.h"
+#include "media/MediaPool.h"
 
 namespace montage {
 
@@ -229,10 +230,16 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
             const MediaItem* m = c.mediaId ? p.findMedia(c.mediaId) : nullptr;
             if (!c.enabled || !m || (!m->hasAudio && m->kind != MediaKind::Sequence)) continue;
             const bool render = m->kind == MediaKind::Sequence || std::fabs(c.speed - 1) > 1e-9 || c.reverse || c.ramped();
-            const std::string key = render ? "clip:" + std::to_string(c.id) : m->path;
+            const std::string key = render ? "clip:" + std::to_string(c.id) : audioKey(m->path, c.channels);
             sourceOf[c.id] = key;
             Source& s = sources[key];
-            if (s.name.empty()) s.name = render ? (c.name.empty() ? "Clip" : c.name) + " (rendered)" : QFileInfo(QString::fromStdString(m->path)).completeBaseName().toStdString();
+            if (s.name.empty()) {
+                s.name = render ? (c.name.empty() ? "Clip" : c.name) + " (rendered)" : QFileInfo(QString::fromStdString(m->path)).completeBaseName().toStdString();
+                if (!render && !c.channels.empty()) {
+                    s.name += " ch";
+                    for (size_t i = 0; i < c.channels.size(); ++i) s.name += (i ? "+" : " ") + std::to_string(c.channels[i] + 1);
+                }
+            }
             any = true;
         }
         if (any) tracks.push_back(&t);
@@ -247,7 +254,8 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
     size_t done = 0;
     for (auto& [key, s] : sources) {
         if (cancelled()) return false;
-        std::string from = key;
+        std::vector<int> picked;  // the channels a clip plays, if it chose some
+        std::string from = key.rfind("clip:", 0) == 0 ? key : audioKeyFile(key, &picked);
         std::string temp;
         if (key.rfind("clip:", 0) == 0) {
             const Id clip = Id(std::stoull(key.substr(5)));
@@ -255,12 +263,12 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
             if (!renderClipAudio(p, seq, clip, temp, error)) return false;
             from = temp;
         }
-        AudioBufferPtr buf = decodeAudio(from, kRate, error);
+        AudioBufferPtr buf = decodeAudio(from, kRate, error, nullptr, picked);
         if (!temp.empty()) QFile::remove(QString::fromStdString(temp));
         if (!buf) return false;
         MediaItem probe;
         int channels = 2;
-        if (temp.empty() && probeMedia(from, probe) && probe.channels == 1) channels = 1;
+        if (picked.size() == 1 || (picked.empty() && temp.empty() && probeMedia(from, probe) && probe.channels == 1)) channels = 1;
         s.samples = buf->frames();
         s.frames = double(s.samples) * fps / kRate;
         std::string base = safeName(s.name);

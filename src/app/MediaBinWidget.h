@@ -107,6 +107,9 @@ public:
     Id mergeClips(Id video, const std::vector<Id>& sounds, int syncBy, bool keepCameraAudio, const QString& name = {},
                   QString* why = nullptr);
     std::vector<Id> syncDailies(const std::vector<Id>& media, bool keepCameraAudio, QStringList* report = nullptr);
+    // How new clips of the media take their channels (MediaItem::audioChannelMode: "", "mono", "pairs"); media with
+    // a single channel keep the mix. One undo step; false if nothing changed.
+    bool setAudioChannelMode(const std::vector<Id>& media, const std::string& mode);
 
 public slots:
     void importDialog();

@@ -210,6 +210,11 @@ QJsonObject clipToJson(const Clip& c) {
     if (!c.unrendered.empty()) o["unrendered"] = qs(c.unrendered);
     if (c.angle != 0) o["angle"] = c.angle;
     if (c.audioAngle != -1) o["audioAngle"] = c.audioAngle;
+    if (!c.channels.empty()) {
+        QJsonArray ch;
+        for (int i : c.channels) ch.append(i);
+        o["channels"] = ch;
+    }
     if (!c.markers.empty()) o["markers"] = markersToJson(c.markers);
     if (!c.takes.empty()) {
         QJsonArray takes;
@@ -263,6 +268,8 @@ Clip clipFromJson(const QJsonObject& o) {
     c.unrendered = ss(o.value("unrendered"));
     c.angle = std::max(0, o.value("angle").toInt(0));
     c.audioAngle = std::max(-1, o.value("audioAngle").toInt(-1));
+    for (const auto& v : o.value("channels").toArray())
+        if (v.toInt(-1) >= 0) c.channels.push_back(v.toInt());
     c.markers = markersFromJson(o.value("markers"));
     for (const auto& tv : o.value("takes").toArray()) {
         const QJsonObject t = tv.toObject();
@@ -623,6 +630,12 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
         if (!m.colorSpace.empty()) o["colorSpace"] = qs(m.colorSpace);
         if (!m.colorOverride.empty()) o["colorOverride"] = qs(m.colorOverride);
         if (m.timecode >= 0) o["timecode"] = m.timecode;
+        if (!m.audioChannelMode.empty()) o["audioChannelMode"] = qs(m.audioChannelMode);
+        if (m.audioStreams.size() > 1) {
+            QJsonArray st;
+            for (int n : m.audioStreams) st.append(n);
+            o["audioStreams"] = st;
+        }
         if (m.rating) o["rating"] = m.rating;
         if (m.label) o["label"] = m.label;
         if (!m.keywords.empty()) {
@@ -740,6 +753,8 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
         m.colorSpace = ss(o.value("colorSpace"));
         m.colorOverride = ss(o.value("colorOverride"));
         m.timecode = o.value("timecode").toDouble(-1);
+        for (const auto& v : o.value("audioStreams").toArray()) m.audioStreams.push_back(std::max(1, v.toInt(1)));
+        m.audioChannelMode = ss(o.value("audioChannelMode"));
         m.rating = std::clamp(o.value("rating").toInt(0), -1, 5);
         m.label = o.value("label").toInt(0);
         for (const auto& k : o.value("keywords").toArray()) m.keywords.push_back(ss(k));

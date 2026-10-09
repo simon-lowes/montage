@@ -225,7 +225,7 @@ bool clipSpeechSpectrum(const Project& p, const Sequence& s, const Clip& c, std:
         if (error) *error = "The clip has no sound";
         return false;
     }
-    AudioBufferPtr buf = decodeAudio(m->path, kRate, error);
+    AudioBufferPtr buf = decodeAudio(m->path, kRate, error, nullptr, c.channels);
     if (!buf) return false;
     const double fps = s.fpsValue();
     double a = c.sourceFrameAt(c.start) / fps, b = c.sourceFrameAt(c.end() - 1) / fps;

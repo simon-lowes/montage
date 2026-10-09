@@ -5,6 +5,7 @@
 #include <map>
 
 #include "Decoder.h"
+#include "MediaPool.h"
 
 namespace montage {
 
@@ -54,9 +55,9 @@ Spans dialogueSpans(const Project& p, const Sequence& s, const std::vector<int>&
                 continue;
             }
             // Otherwise loudness, 50 ms at a time.
-            AudioBufferPtr& buf = decoded[m->path];
+            AudioBufferPtr& buf = decoded[audioKey(m->path, c.channels)];
             std::string err;
-            if (!buf) buf = decodeAudio(m->path, kRate, &err, cancel);
+            if (!buf) buf = decodeAudio(m->path, kRate, &err, cancel, c.channels);
             if (cancel && cancel->load()) {
                 if (error) *error = "Cancelled";
                 return {};

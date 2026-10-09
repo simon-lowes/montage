@@ -50,6 +50,7 @@ void takeDetails(MediaItem& m, const MediaItem& n, bool replace) {
     m.hasAudio = n.hasAudio;
     m.sampleRate = n.sampleRate;
     m.channels = n.channels;
+    m.audioStreams = n.audioStreams;
     m.videoCodec = n.videoCodec;
     m.audioCodec = n.audioCodec;
     m.colorSpace = n.colorSpace;

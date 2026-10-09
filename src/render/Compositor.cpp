@@ -1729,8 +1729,9 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
             }
         } else {
             if (!m->hasAudio) continue;
-            AudioBufferPtr buf = nonBlocking_ ? MediaPool::instance().audioIfReady(m->path, int(sr))
-                                              : MediaPool::instance().audio(m->path, int(sr));
+            const std::string source = audioKey(m->path, c.channels);  // the file, or the channels the clip plays
+            AudioBufferPtr buf = nonBlocking_ ? MediaPool::instance().audioIfReady(source, int(sr))
+                                              : MediaPool::instance().audio(source, int(sr));
             if (!buf || buf->samples.empty()) continue;
             // Noise reduction and voice isolation work on the whole source (the
             // original plays until the cleaned copy is ready in real time).
@@ -1738,7 +1739,7 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
             for (const Effect& e : c.effects)
                 if (e.enabled && isSourceAudioEffect(e.type)) sourceFx.push_back(&e);
             if (!sourceFx.empty())
-                if (AudioBufferPtr clean = cleanedAudio(m->path, buf, sourceFx, !nonBlocking_)) buf = clean;
+                if (AudioBufferPtr clean = cleanedAudio(source, buf, sourceFx, !nonBlocking_)) buf = clean;
             const int64_t n = buf->frames();
             const float* src = buf->samples.data();
             // Maintain Audio Pitch: the clip's sound stretched along its time map (WSOLA), read sample for sample;

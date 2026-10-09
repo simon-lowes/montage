@@ -8,6 +8,7 @@
 #include <QStringList>
 #include <functional>
 #include <map>
+#include <set>
 #include <optional>
 #include <vector>
 
@@ -139,6 +140,8 @@ public:
     void message(const QString& text, int timeoutMs = 4000) { emit statusMessage(text, timeoutMs); }
     // Decodes the media's audio (and its waveform peaks) in the background; mediaReady follows.
     void startAudioDecode(const MediaItem& m);
+    // The same for the channels clips have chosen (Clip::channels), each once.
+    void startClipAudioDecodes();
     // Whether the media's file is missing (media/Relink.h), each file checked at most every two seconds, since
     // painting asks often. Nested sequences and generators are never offline.
     bool isMediaOffline(Id media) const;
@@ -166,6 +169,7 @@ private:
     QTimer* reloadTimer_ = nullptr;
     QStringList changedFiles_;
     mutable std::map<std::string, std::pair<bool, qint64>> offlineChecked_;  // path -> offline, when checked (ms)
+    std::set<std::pair<std::string, int>> clipAudioRequested_;  // audio keys and rates already decoding
 
     Project project_;
     History history_;
