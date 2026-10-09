@@ -57,6 +57,7 @@
 #include "media/Vector.h"
 #include "media/Beats.h"
 #include "render/Spherical.h"
+#include "render/ReviewExport.h"
 #include "render/Versions.h"
 #include "render/ClipPlacement.h"
 #include "media/ImageSequence.h"
@@ -9465,6 +9466,96 @@ private slots:
         const auto badLines = server.handle(QJsonDocument(bad).toJson(QJsonDocument::Compact).toStdString());
         const QJsonObject br = QJsonDocument::fromJson(QByteArray::fromStdString(badLines.back())).object();
         QVERIFY(br.contains("error") || br.value("result").toObject().value("isError").toBool());
+    }
+
+    void reviewPackages() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 640;
+        s.height = 360;
+        s.fps = {25, 1};
+        s.name = "Ep 1: Pilot";
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, makeGeneratorClip(p, "color", 50)).ok);
+        s.markers = {Marker{10, 0, "Check", "Too warm?", 8, false}};
+        CaptionTrack ct;
+        ct.id = p.newId();
+        ct.captions = {{0, 20, "Hello"}};
+        s.captionTracks.push_back(ct);
+
+        // The settings: a smaller H.264 copy with timecode, the watermark and the captions, named after the cut.
+        ReviewExportOptions o;
+        o.maxHeight = 180;
+        o.watermark = "Review copy";
+        o.note = "First cut";
+        const ReviewPackage pkg = reviewPackage(s, "/out", o);
+        QCOMPARE(pkg.videoPath, std::string("/out/Ep 1- Pilot - Review.mp4"));
+        QCOMPARE(pkg.pagePath, std::string("/out/Ep 1- Pilot - Review.html"));
+        QCOMPARE(pkg.settings.videoCodec, std::string("libx264"));
+        QCOMPARE(pkg.settings.width, 320);
+        QCOMPARE(pkg.settings.height, 180);
+        QVERIFY(pkg.settings.burnIn.timecode && pkg.settings.burnInCaptions);
+        QCOMPARE(pkg.settings.burnIn.text, std::string("Review copy"));
+        QCOMPARE(pkg.page.videoFile, std::string("Ep 1- Pilot - Review.mp4"));
+        QCOMPARE(pkg.page.width, 320);
+        QCOMPARE(pkg.page.note, std::string("First cut"));
+        o.maxHeight = 0;
+        o.timecode = false;
+        QCOMPARE(reviewPackage(s, "/out", o).settings.width, 0);  // the sequence's own size
+        QVERIFY(!reviewPackage(s, "/out", o).settings.burnIn.timecode);
+
+        // Over MCP: the copy rendered at 320 x 180 with the page beside it, the page's length the copy's.
+        const QString project = QString::fromStdString(path("review.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        const QString folder = QString::fromStdString(path("review-out"));
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call("montage_export_review", {{"project", project}, {"folder", folder}, {"max_height", 180}, {"note", "Notes by Friday"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject sc = r.value("structuredContent").toObject();
+        MediaItem copy;
+        QVERIFY(probeMedia(sc.value("video").toString().toStdString(), copy));
+        QCOMPARE(copy.width, 320);
+        QCOMPARE(copy.height, 180);
+        QVERIFY(std::fabs(copy.duration - 2.0) < 0.05);
+        QCOMPARE(sc.value("frames").toInt(), 50);
+        QFile page(sc.value("page").toString());
+        QVERIFY(page.open(QIODevice::ReadOnly));
+        const QByteArray html = page.readAll();
+        QVERIFY(html.contains("\"video\":\"Ep 1- Pilot - Review.mp4\""));
+        QVERIFY(html.contains("\"frames\":50"));
+        QVERIFY(html.contains("Notes by Friday"));
+        QVERIFY(html.contains("\"name\":\"Check\""));
+        // A range: half the cut.
+        r = call("montage_export_review", {{"project", project}, {"folder", folder}, {"in", "00:00:01:00"}, {"out", "00:00:02:00"}, {"markers", false}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("frames").toInt(), 25);
+        r = call("montage_export_review", {{"project", project}, {"folder", folder}, {"in", "00:00:01:00"}, {"out", "00:00:00:10"}});
+        QVERIFY(r.value("isError").toBool() || r.isEmpty());
+
+        // The notes come back as markers, named and coloured by reviewer.
+        const QString notes = QString::fromStdString(path("notes.json"));
+        QFile nf(notes);
+        QVERIFY(nf.open(QIODevice::WriteOnly));
+        nf.write(R"({"montageReview":1,"title":"Ep 1: Pilot","fps":[25,1],"notes":[
+            {"frame":30,"duration":0,"author":"Sam","text":"Hold this longer","done":false},
+            {"frame":12,"duration":5,"author":"Ana","text":"Flash frame?","done":false}]})");
+        nf.close();
+        r = call("montage_import_markers", {{"project", project}, {"path", notes}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const auto& ms = back.active()->markers;
+        QCOMPARE(ms.size(), size_t(3));
+        auto found = std::find_if(ms.begin(), ms.end(), [](const Marker& m) { return m.name == "Ana"; });
+        QVERIFY(found != ms.end() && found->t == 12 && found->duration == 5 && found->comment == "Flash frame?");
+        QVERIFY(std::any_of(ms.begin(), ms.end(), [](const Marker& m) { return m.name == "Sam" && m.t == 30; }));
     }
 
     void planarTracking() {

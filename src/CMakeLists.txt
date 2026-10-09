@@ -18,6 +18,7 @@ add_library(montage_engine STATIC
   core/TextStats.h core/TextStats.cpp
   core/Automation.h core/Automation.cpp
   core/MarkerList.h core/MarkerList.cpp
+  core/ReviewPage.h core/ReviewPage.cpp
   core/EffectPresets.h core/EffectPresets.cpp
   core/ScriptCut.h core/ScriptCut.cpp
   core/Cfb.h core/Cfb.cpp
@@ -97,6 +98,7 @@ add_library(montage_engine STATIC
   render/Letterbox.h render/Letterbox.cpp
   render/LightLevel.h render/LightLevel.cpp
   render/Versions.h render/Versions.cpp
+  render/ReviewExport.h render/ReviewExport.cpp
   render/PaperEdit.h render/PaperEdit.cpp
   render/VfxPull.h render/VfxPull.cpp
   render/Spherical.h render/Spherical.cpp

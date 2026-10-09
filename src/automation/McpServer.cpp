@@ -24,6 +24,7 @@
 #include "core/TranscriptCorrect.h"
 #include "core/SpellCheck.h"
 #include "core/ColorGroups.h"
+#include "render/ReviewExport.h"
 #include "render/Versions.h"
 #include "render/LightLevel.h"
 #include "render/Spherical.h"
@@ -1773,7 +1774,8 @@ void McpServer::Impl::addTools() {
 
     add("montage_import_markers", "Import markers",
         "Add markers from a marker list: a CSV with a header row (name, description or notes, in or timecode, out or duration, "
-        "type, colour), as review tools and Premiere write them, or Avid locator lines. Give the file's `path` or its `text`.",
+        "type, colour), as review tools and Premiere write them, Avid locator lines, or a notes file saved from a review "
+        "page (montage_export_review; one marker a note, named and coloured by reviewer). Give the file's `path` or its `text`.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"path":{"type":"string"},"text":{"type":"string"}},
             "required":["project"]})json",
         false, [](const QJsonObject& a) {
@@ -3918,6 +3920,44 @@ void McpServer::Impl::addTools() {
                 text += QStringLiteral("Wrote %1 (%2 x %3)\n").arg(QString::fromStdString(st.path)).arg(v->width).arg(v->height);
             }
             return ok(text.trimmed(), QJsonObject{{"files", files}});
+        });
+
+    add("montage_export_review", "Export for review",
+        "Send the cut out for notes without a review service (Frame.io's role): renders an H.264 review copy "
+        "(\"<name> - Review.mp4\", at most `max_height` lines, default 1080; timecode burned in unless `timecode` is "
+        "false; an optional `watermark` text; captions burned in) into `folder` with \"<name> - Review.html\", a "
+        "self-contained page that plays it in any browser, offline, where reviewers step to a frame or mark a range and "
+        "type notes, then save them as a notes file. montage_import_markers turns that file into markers coloured by "
+        "reviewer. `note` is a message shown to the reviewers; the sequence's markers are shown unless `markers` is "
+        "false; `in`/`out` (timecodes) limit it to a range. Returns both paths.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"folder":{"type":"string"},
+            "max_height":{"type":"integer","default":1080},"timecode":{"type":"boolean","default":true},
+            "watermark":{"type":"string"},"note":{"type":"string"},"markers":{"type":"boolean","default":true},
+            "in":{"type":"string"},"out":{"type":"string"}},"required":["project","folder"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            const Sequence& s = l.seq();
+            if (s.duration() == 0) return fail("The sequence is empty");
+            ReviewExportOptions o;
+            o.maxHeight = a.value("max_height").toInt(1080);
+            o.timecode = a.value("timecode").toBool(true);
+            o.watermark = str(a, "watermark").toStdString();
+            o.note = str(a, "note").toStdString();
+            o.markers = a.value("markers").toBool(true);
+            if (a.contains("in")) o.in = timeArg(a.value("in"), s, "in");
+            if (a.contains("out")) o.out = timeArg(a.value("out"), s, "out");
+            if (o.in >= 0 && o.out >= 0 && o.out <= o.in) throw ArgError{"\"out\" comes after \"in\""};
+            const QString folder = absolute(need(a, "folder"));
+            QDir().mkpath(folder);
+            const ReviewPackage pkg = reviewPackage(s, folder.toStdString(), o);
+            std::string err;
+            if (!exportSequence(l.project, s, pkg.settings, [this](double f, FrameTime) { progress(f, "Rendering"); }, nullptr, &err))
+                return fail(QString::fromStdString(err));
+            if (!writeReviewPage(pkg, &err)) return fail(QString::fromStdString(err));
+            return ok(QStringLiteral("Wrote %1 and %2: send both; the notes saved from the page import as markers.")
+                          .arg(QString::fromStdString(pkg.videoPath), QString::fromStdString(pkg.pagePath)),
+                      QJsonObject{{"video", QString::fromStdString(pkg.videoPath)}, {"page", QString::fromStdString(pkg.pagePath)},
+                                  {"width", pkg.page.width}, {"height", pkg.page.height}, {"frames", double(pkg.page.frames)}});
         });
 
     add("montage_render", "Render",

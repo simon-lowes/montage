@@ -29,6 +29,7 @@
 #include "core/History.h"
 #include "core/Interchange.h"
 #include "core/MarkerList.h"
+#include "core/ReviewPage.h"
 #include "core/MergeClips.h"
 #include "core/KeyframeEdit.h"
 #include "core/MaskPath.h"
@@ -3684,6 +3685,93 @@ private slots:
         QVERIFY(std::any_of(xm.begin(), xm.end(), [](const Marker& m) { return m.chapter && m.name == "Part 1" && m.t == 5; }));
         QVERIFY(edit::removeClipMarkerAt(s, second, 40));
         QCOMPARE(edit::clipById(s, second)->markers.size(), size_t(1));
+    }
+
+    void reviewPages() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = Rational{25, 1};
+        s.name = "Cut <A> & \"B\"";
+        edit::overwrite(p, s, {TrackKind::Video, 0}, makeGeneratorClip(p, "color", 250));
+        s.markers = {Marker{20, 0, "Too dark", "Lift it", 11, false}, Marker{200, 25, "End", "", 0, true}};
+        // The whole cut, with its markers; a range keeps only the markers inside it.
+        ReviewPageInfo info = reviewPageInfo(s, "Cut - Review.mp4");
+        QCOMPARE(info.frames, FrameTime(250));
+        QCOMPARE(info.offset, FrameTime(0));
+        QCOMPARE(info.markers.size(), size_t(2));
+        QVERIFY(!info.dropFrame);
+        QVERIFY(!info.id.empty());
+        const ReviewPageInfo part = reviewPageInfo(s, "x.mp4", 100, 300, true);
+        QCOMPARE(part.offset, FrameTime(100));
+        QCOMPARE(part.frames, FrameTime(150));  // the cut ends at 250
+        QCOMPARE(part.markers.size(), size_t(1));
+        QVERIFY(reviewPageInfo(s, "x.mp4", -1, -1, false).markers.empty());
+        Sequence ntsc = s;
+        ntsc.fps = Rational{30000, 1001};
+        QVERIFY(reviewPageInfo(ntsc, "x.mp4").dropFrame);
+
+        // The page: the title escaped, the settings readable as JSON, nothing fetched from elsewhere.
+        info.note = "Notes by Friday </script><b>";
+        const std::string html = reviewPageHtml(info);
+        QVERIFY(html.rfind("<!doctype html>", 0) == 0);
+        QVERIFY(html.find("<title>Cut &lt;A&gt; &amp; &quot;B&quot; - Review</title>") != std::string::npos);
+        QVERIFY(html.find("Cut <A>") == std::string::npos);
+        for (const char* outside : {"http://", "https://", "src=\"//", "@import"}) QVERIFY2(html.find(outside) == std::string::npos, outside);
+        const size_t a = html.find("<script type=\"application/json\" id=\"review-config\">");
+        QVERIFY(a != std::string::npos);
+        const size_t from = html.find('>', a) + 1, to = html.find("</script>", from);
+        QVERIFY(html.find("</script><b>") == std::string::npos);  // the message cannot end the script early
+        QJsonParseError pe;
+        const QJsonObject cfg = QJsonDocument::fromJson(QByteArray::fromStdString(html.substr(from, to - from)), &pe).object();
+        QVERIFY2(pe.error == QJsonParseError::NoError, qPrintable(pe.errorString()));
+        QCOMPARE(cfg.value("video").toString(), QStringLiteral("Cut - Review.mp4"));
+        QCOMPARE(cfg.value("frames").toInt(), 250);
+        QCOMPARE(cfg.value("fps").toArray().at(0).toInt(), 25);
+        QCOMPARE(cfg.value("note").toString(), QStringLiteral("Notes by Friday </script><b>"));
+        QCOMPARE(cfg.value("markers").toArray().size(), 2);
+        QCOMPARE(cfg.value("markers").toArray().at(0).toObject().value("name").toString(), QStringLiteral("Too dark"));
+
+        // Notes back: sorted by frame, each reviewer their own colour, resolved ones ticked.
+        const std::string notesJson = R"({"montageReview":1,"title":"Cut","fps":[25,1],"notes":[
+            {"frame":120,"duration":0,"author":"Sam","text":"Music too loud","done":false},
+            {"frame":40,"duration":25,"author":"Ana","text":"  Shorter here  ","done":true},
+            {"frame":60,"author":"Sam","text":"Typo in the title"},
+            {"timecode":"00:00:08:00","author":"","text":"From a timecode"},
+            {"frame":10,"author":"Ana","text":"   "}]})";
+        QVERIFY(isReviewNotes(notesJson));
+        QVERIFY(!isReviewNotes("Name,Comment\n"));
+        std::vector<ReviewNote> notes;
+        std::string title, err;
+        QVERIFY2(parseReviewNotes(notesJson, s.fps, notes, &title, &err), err.c_str());
+        QCOMPARE(title, std::string("Cut"));
+        QCOMPARE(notes.size(), size_t(4));  // the empty note is dropped
+        QCOMPARE(notes[0].frame, FrameTime(40));
+        QCOMPARE(notes[0].duration, FrameTime(25));
+        QCOMPARE(notes[0].text, std::string("Shorter here"));
+        QVERIFY(notes[0].done);
+        QCOMPARE(notes[2].frame, FrameTime(120));
+        QCOMPARE(notes[3].frame, FrameTime(200));
+        QCOMPARE(notes[3].author, std::string("Reviewer"));
+        const std::vector<Marker> markers = reviewNotesToMarkers(notes);
+        QCOMPARE(markers[0].name, std::string("\xE2\x9C\x93 Ana"));
+        QCOMPARE(markers[0].comment, std::string("Shorter here"));
+        QCOMPARE(markers[1].name, std::string("Sam"));
+        QVERIFY(markers[0].color != markers[1].color && markers[0].color > 0 && markers[1].color > 0);
+        QCOMPARE(markers[2].color, markers[1].color);
+        // At another rate: a 50 fps review copy's frames halve on a 25 fps sequence.
+        std::vector<ReviewNote> fast;
+        QVERIFY(parseReviewNotes(R"({"montageReview":1,"fps":[50,1],"notes":[{"frame":100,"duration":10,"author":"Sam","text":"x"}]})", s.fps, fast));
+        QCOMPARE(fast.at(0).frame, FrameTime(50));
+        QCOMPARE(fast.at(0).duration, FrameTime(5));
+        // Not notes, or none.
+        QVERIFY(!parseReviewNotes("{\"notes\":[]}", s.fps, fast, nullptr, &err));
+        QVERIFY(!parseReviewNotes(R"({"montageReview":1,"notes":[]})", s.fps, fast, nullptr, &err));
+        QCOMPARE(err, std::string("The notes file has no notes"));
+        // The marker import takes the notes file, replacing what it held.
+        std::vector<Marker> back = {Marker{1, 0, "old", "", 0, false}};
+        QVERIFY2(parseMarkerList("\xEF\xBB\xBF" + notesJson, s, back, &err), err.c_str());
+        QCOMPARE(back.size(), size_t(4));
+        QCOMPARE(back[3].comment, std::string("From a timecode"));
     }
 
     void markerLists() {

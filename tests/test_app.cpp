@@ -2886,6 +2886,73 @@ private slots:
         win_->renderQueue()->remove(job.id);
     }
 
+    void exportForReviewAndNotes() {
+        loadDemo();
+        QVERIFY(win_->findChild<QAction*>("exportForReview"));
+        QVERIFY(win_->findChild<QAction*>("importReviewNotes"));
+        const QString name = QString::fromStdString(state()->sequence()->name);
+        const size_t jobs = win_->renderQueue()->jobs().size();
+        ReviewExportOptions o;
+        o.watermark = "Review copy";
+        o.note = "Notes by Friday";
+        const QString folder = dir_.filePath("review");
+        const QString page = win_->exportForReview(folder, o);
+        QCOMPARE(page, QDir(folder).filePath(name + " - Review.html"));
+        QFile f(page);
+        QVERIFY(f.open(QIODevice::ReadOnly));
+        QVERIFY(f.readAll().contains("Notes by Friday"));
+        // The copy is queued: H.264 with timecode and the watermark burned in.
+        QCOMPARE(win_->renderQueue()->jobs().size(), jobs + 1);
+        const RenderQueue::Job& job = win_->renderQueue()->jobs().back();
+        QCOMPARE(job.sequence, state()->sequence()->id);
+        QCOMPARE(QString::fromStdString(job.settings.path), QDir(folder).filePath(name + " - Review.mp4"));
+        QCOMPARE(job.settings.videoCodec, std::string("libx264"));
+        QVERIFY(job.settings.burnIn.timecode);
+        QCOMPARE(job.settings.burnIn.text, std::string("Review copy"));
+        win_->renderQueue()->remove(job.id);
+
+        // Notes saved from the page come back as markers, one undo step.
+        const size_t markers = state()->sequence()->markers.size();
+        const QString notes = dir_.filePath("notes.json");
+        QFile nf(notes);
+        QVERIFY(nf.open(QIODevice::WriteOnly));
+        nf.write(R"({"montageReview":1,"fps":[30,1],"notes":[{"frame":15,"author":"Sam","text":"Tighter"},{"frame":45,"author":"Ana","text":"Louder","done":true}]})");
+        nf.close();
+        QCOMPARE(win_->importMarkers(notes), 2);
+        const auto& ms = state()->sequence()->markers;
+        QCOMPARE(ms.size(), markers + 2);
+        QVERIFY(std::any_of(ms.begin(), ms.end(), [](const Marker& m) { return m.name == "Sam" && m.comment == "Tighter"; }));
+        QVERIFY(std::any_of(ms.begin(), ms.end(), [](const Marker& m) { return m.name == "\xE2\x9C\x93 Ana"; }));
+        state()->undo();
+        QCOMPARE(state()->sequence()->markers.size(), markers);
+
+        // The dialog: 720p, no timecode, In to Out when marked.
+        state()->setInPoint(5);
+        state()->setOutPoint(20);
+        const QString other = dir_.filePath("review2");
+        bool shown = false;
+        QTimer::singleShot(0, this, [&] {
+            auto* dlg = win_->findChild<QDialog*>("exportForReviewDialog");
+            QVERIFY(dlg);
+            shown = true;
+            dlg->findChild<QLineEdit*>("reviewFolder")->setText(other);
+            dlg->findChild<QComboBox*>("reviewSize")->setCurrentIndex(1);
+            dlg->findChild<QCheckBox*>("reviewTimecode")->setChecked(false);
+            QVERIFY(dlg->findChild<QCheckBox*>("reviewRange")->isEnabled());
+            dlg->findChild<QCheckBox*>("reviewRange")->setChecked(true);
+            dlg->accept();
+        });
+        win_->findChild<QAction*>("exportForReview")->trigger();
+        QVERIFY(shown);
+        const RenderQueue::Job& j2 = win_->renderQueue()->jobs().back();
+        QVERIFY(QString::fromStdString(j2.settings.path).startsWith(other));
+        QVERIFY(!j2.settings.burnIn.timecode);
+        QCOMPARE(j2.settings.in, FrameTime(5));
+        QCOMPARE(j2.settings.out, FrameTime(21));
+        QVERIFY(QFileInfo::exists(QDir(other).filePath(name + " - Review.html")));
+        win_->renderQueue()->remove(j2.id);
+    }
+
     void transitionsToSelection() {
         loadDemo();
         const Id red = clipNamed(*state()->sequence(), "Red")->id, blue = clipNamed(*state()->sequence(), "Blue")->id;

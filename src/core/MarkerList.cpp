@@ -8,6 +8,7 @@
 
 #include "History.h"
 #include "MediaLog.h"
+#include "ReviewPage.h"
 
 namespace montage {
 
@@ -112,6 +113,12 @@ std::string markersToResolveEdl(const Sequence& s) {
 }
 
 bool parseMarkerList(const std::string& text, const Sequence& s, std::vector<Marker>& out, std::string* error) {
+    if (isReviewNotes(text)) {  // a notes file saved from a review page (core/ReviewPage.h)
+        std::vector<ReviewNote> notes;
+        if (!parseReviewNotes(text, s.fps, notes, nullptr, error)) return false;
+        out = reviewNotesToMarkers(notes);
+        return true;
+    }
     out.clear();
     std::vector<std::string> lines;
     {

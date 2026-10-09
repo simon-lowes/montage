@@ -19,7 +19,8 @@ std::string markersToResolveEdl(const Sequence& s);
 
 // Markers from a CSV with a header row (Name / Marker Name, Description / Comment / Notes, In / Start / Timecode,
 // Out, Duration, Marker Type, Color) or from Avid locator lines. When every time is an hour or more in and the
-// sequence is shorter than that, the list is taken to start at 01:00:00:00 (as Avid and Resolve timelines do).
+// sequence is shorter than that, the list is taken to start at 01:00:00:00 (as Avid and Resolve timelines do). A notes
+// file saved from a review page (core/ReviewPage.h) gives a marker a note, coloured by reviewer.
 // False (with `error`) if nothing could be read.
 bool parseMarkerList(const std::string& text, const Sequence& s, std::vector<Marker>& out, std::string* error = nullptr);
 

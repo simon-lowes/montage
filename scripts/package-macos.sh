@@ -80,6 +80,12 @@ STAGE=$(mktemp -d)
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
 rm -f "$DMG"
-hdiutil create -volname "Montage $VERSION" -srcfolder "$STAGE" -fs HFS+ -format UDZO -ov "$DMG"
+# hdiutil can fail with "Resource busy" while macOS's disk image helper is still busy (often on CI runners): retry.
+for attempt in 1 2 3 4 5; do
+  if hdiutil create -volname "Montage $VERSION" -srcfolder "$STAGE" -fs HFS+ -format UDZO -ov "$DMG"; then break; fi
+  if [ "$attempt" = 5 ]; then echo "hdiutil failed 5 times" >&2; exit 1; fi
+  echo "hdiutil failed (attempt $attempt); retrying in $((attempt * 5)) s" >&2
+  sleep $((attempt * 5))
+done
 rm -rf "$STAGE"
 echo "Wrote $DMG ($(du -h "$DMG" | cut -f1))"

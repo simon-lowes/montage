@@ -17,6 +17,7 @@
 #include "core/Effects.h"
 #include "media/Image.h"
 #include "render/Shorts.h"
+#include "render/ReviewExport.h"
 #include "render/Versions.h"
 
 class QAction;
@@ -138,6 +139,10 @@ public:
     std::vector<Id> exportVersions(const std::vector<VersionShape>& shapes, const QString& folder, bool captions = true, double lufs = -14,
                                    const QString& presetName = QStringLiteral("H.264 - High Quality"));
     void exportVersionsDialog();
+    // File › Export for Review (render/ReviewExport.h): the page written into `folder` and the review copy queued. The
+    // page's path ("" if nothing was exported).
+    QString exportForReview(const QString& folder, const ReviewExportOptions& options = {});
+    void exportForReviewDialog();
     bool addToColorGroup(Id group);
     bool removeFromColorGroup();
     // Suggest Chapters: chapter markers where the talk moves on, titled with what each part is about (replacing the

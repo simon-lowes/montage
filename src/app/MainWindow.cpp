@@ -39,6 +39,7 @@
 #include <QDateTime>
 #include <QTextDocument>
 #include <QPdfWriter>
+#include <QPlainTextEdit>
 #include <QPushButton>
 #include <QtConcurrent>
 #include <QMessageBox>
@@ -673,6 +674,12 @@ void MainWindow::buildMenus() {
     add(file, tr("Watch Folders…"), QKeySequence(), [this] { watchFoldersDialog(); })->setObjectName(QStringLiteral("watchFolders"));
     add(file, tr("&Export Media…"), QKeySequence("Ctrl+M"), [this] { exportMedia(); });
     add(file, tr("Export &Versions…"), QKeySequence(), [this] { exportVersionsDialog(); })->setObjectName(QStringLiteral("exportVersions"));
+    add(file, tr("Export for Re&view…"), QKeySequence(), [this] { exportForReviewDialog(); })->setObjectName(QStringLiteral("exportForReview"));
+    add(file, tr("Import Review Notes…"), QKeySequence(), [this] {
+        const QString path = QFileDialog::getOpenFileName(this, tr("Import Review Notes"), appSettings().value(QStringLiteral("export/lastDirectory")).toString(),
+                                                          tr("Review notes (*.json);;Marker lists (*.csv *.txt *.tsv)"));
+        if (!path.isEmpty()) importMarkers(path);
+    })->setObjectName(QStringLiteral("importReviewNotes"));
     add(file, tr("Project &Manager…"), QKeySequence(), [this] {
         ProjectManagerDialog dlg(state_, this);
         if (dlg.exec() == QDialog::Accepted) runProjectManager(dlg.options());
@@ -1270,7 +1277,7 @@ void MainWindow::buildMenus() {
         exportMarkers(file);
     })->setObjectName(QStringLiteral("exportMarkers"));
     add(seqM, tr("Import Markers…"), QKeySequence(), [this] {
-        const QString path = QFileDialog::getOpenFileName(this, tr("Import Markers"), QString(), tr("Marker lists (*.csv *.txt *.tsv)"));
+        const QString path = QFileDialog::getOpenFileName(this, tr("Import Markers"), QString(), tr("Marker lists and review notes (*.csv *.txt *.tsv *.json)"));
         if (!path.isEmpty()) importMarkers(path);
     })->setObjectName(QStringLiteral("importMarkers"));
     add(seqM, tr("&Quality Check…"), QKeySequence(), [this] {
@@ -3943,6 +3950,107 @@ void MainWindow::exportVersionsDialog() {
     if (chosen.empty()) return;
     appSettings().setValue(QStringLiteral("export/lastDirectory"), folder->text());
     exportVersions(chosen, folder->text(), captions->isChecked(), loud->currentData().toDouble(), format->currentText());
+}
+
+QString MainWindow::exportForReview(const QString& folder, const ReviewExportOptions& options) {
+    const Sequence* s = state_->sequence();
+    if (!s || s->duration() == 0) {
+        state_->message(tr("Nothing to export"));
+        return {};
+    }
+    QDir().mkpath(folder);
+    const ReviewPackage pkg = reviewPackage(*s, folder.toStdString(), options);
+    std::string err;
+    if (!writeReviewPage(pkg, &err)) {
+        state_->message(QString::fromStdString(err), 6000);
+        return {};
+    }
+    queue_->add(QString::fromStdString(s->name) + tr(" - Review"), tr("Review copy"), state_->project(), s->id, pkg.settings);
+    if (queueDock_) queueDock_->show();
+    const QString page = QString::fromStdString(pkg.pagePath);
+    state_->message(tr("Review copy queued; send it with %1. The notes saved from the page come back with File › Import Review Notes.")
+                        .arg(QFileInfo(page).fileName()),
+                    8000);
+    return page;
+}
+
+void MainWindow::exportForReviewDialog() {
+    const Sequence* s = state_->sequence();
+    if (!s || s->duration() == 0) {
+        state_->message(tr("Nothing to export"));
+        return;
+    }
+    QDialog dlg(this);
+    dlg.setObjectName(QStringLiteral("exportForReviewDialog"));
+    dlg.setWindowTitle(tr("Export for Review"));
+    auto* form = new QFormLayout(&dlg);
+    auto* intro = new QLabel(tr("A review copy of %1 and a page that plays it in any browser, offline. Reviewers pause on a frame or "
+                                "mark a range, type notes and save them as a file; import that file and each note becomes a marker.")
+                                 .arg(QString::fromStdString(s->name)),
+                             &dlg);
+    intro->setWordWrap(true);
+    form->addRow(intro);
+    auto* folder = new QLineEdit(&dlg);
+    folder->setObjectName(QStringLiteral("reviewFolder"));
+    QString start = appSettings().value(QStringLiteral("export/lastDirectory")).toString();
+    if (start.isEmpty()) start = QStandardPaths::writableLocation(QStandardPaths::MoviesLocation);
+    folder->setText(start);
+    auto* browse = new QPushButton(tr("Choose…"), &dlg);
+    connect(browse, &QPushButton::clicked, &dlg, [&] {
+        const QString d = QFileDialog::getExistingDirectory(&dlg, tr("Export for Review To"), folder->text());
+        if (!d.isEmpty()) folder->setText(d);
+    });
+    auto* row = new QHBoxLayout;
+    row->addWidget(folder, 1);
+    row->addWidget(browse);
+    form->addRow(tr("Folder:"), row);
+    auto* size = new QComboBox(&dlg);
+    size->setObjectName(QStringLiteral("reviewSize"));
+    size->addItem(tr("1080p"), 1080);
+    size->addItem(tr("720p (smaller file)"), 720);
+    size->addItem(tr("Sequence size (%1 x %2)").arg(s->width).arg(s->height), 0);
+    form->addRow(tr("Size:"), size);
+    auto* timecode = new QCheckBox(tr("Burn in timecode"), &dlg);
+    timecode->setObjectName(QStringLiteral("reviewTimecode"));
+    timecode->setChecked(true);
+    form->addRow(QString(), timecode);
+    auto* watermark = new QLineEdit(&dlg);
+    watermark->setObjectName(QStringLiteral("reviewWatermark"));
+    watermark->setPlaceholderText(tr("e.g. Review copy - not for broadcast"));
+    form->addRow(tr("Watermark:"), watermark);
+    auto* markers = new QCheckBox(tr("Show my markers on the page"), &dlg);
+    markers->setObjectName(QStringLiteral("reviewMarkers"));
+    markers->setChecked(!s->markers.empty());
+    markers->setEnabled(!s->markers.empty());
+    form->addRow(QString(), markers);
+    const bool marked = s->inPoint >= 0 && s->outPoint > s->inPoint;
+    auto* range = new QCheckBox(tr("Only In to Out"), &dlg);
+    range->setObjectName(QStringLiteral("reviewRange"));
+    range->setEnabled(marked);
+    form->addRow(QString(), range);
+    auto* note = new QPlainTextEdit(&dlg);
+    note->setObjectName(QStringLiteral("reviewNote"));
+    note->setPlaceholderText(tr("A message for the reviewers (optional)"));
+    note->setFixedHeight(note->fontMetrics().lineSpacing() * 4 + 12);
+    form->addRow(tr("Message:"), note);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    buttons->button(QDialogButtonBox::Ok)->setText(tr("Export"));
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    form->addRow(buttons);
+    if (dlg.exec() != QDialog::Accepted) return;
+    ReviewExportOptions o;
+    o.maxHeight = size->currentData().toInt();
+    o.timecode = timecode->isChecked();
+    o.watermark = watermark->text().trimmed().toStdString();
+    o.markers = markers->isChecked();
+    o.note = note->toPlainText().trimmed().toStdString();
+    if (range->isChecked() && marked) {
+        o.in = s->inPoint;
+        o.out = s->outPoint + 1;
+    }
+    appSettings().setValue(QStringLiteral("export/lastDirectory"), folder->text());
+    exportForReview(folder->text(), o);
 }
 
 bool MainWindow::analyseHdrLightLevels(bool ask) {
