@@ -319,6 +319,7 @@ MixerPanel::Strip MixerPanel::makeStrip(int index) {
     v->addWidget(s.panLabel);
     s.surround = new SurroundPanner(box);
     s.surround->setObjectName(QStringLiteral("surroundPanner"));
+    s.surround->setObjectsAllowed(true);
     s.surround->hide();
     v->addWidget(s.surround, 0, Qt::AlignHCenter);
     connect(s.surround, &SurroundPanner::changed, this, [this, index](const SurroundPan& pan, bool final) { setSurround(index, pan, final); });

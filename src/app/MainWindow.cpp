@@ -68,6 +68,7 @@
 
 #include "AudioMeterWidget.h"
 #include "audio/PluginEffect.h"
+#include "core/Surround.h"
 #include "core/ColorGroups.h"
 #include "core/GradeVersions.h"
 #include "core/AudioChannels.h"
@@ -691,6 +692,8 @@ void MainWindow::buildMenus() {
     add(file, tr("Export for Re&view…"), QKeySequence(), [this] { exportForReviewDialog(); })->setObjectName(QStringLiteral("exportForReview"));
     add(file, tr("Export &DCP (Digital Cinema)…"), QKeySequence(), [this] { exportDcpDialog(); })->setObjectName(QStringLiteral("exportDcp"));
     add(file, tr("Export &IMF Master…"), QKeySequence(), [this] { exportImfDialog(); })->setObjectName(QStringLiteral("exportImf"));
+    add(file, tr("Export Immersive Master (&ADM BWF)…"), QKeySequence(), [this] { exportAdmDialog(); })
+        ->setObjectName(QStringLiteral("exportAdm"));
     add(file, tr("Import Review Notes…"), QKeySequence(), [this] {
         const QString path = QFileDialog::getOpenFileName(this, tr("Import Review Notes"), appSettings().value(QStringLiteral("export/lastDirectory")).toString(),
                                                           tr("Review notes (*.json);;Marker lists (*.csv *.txt *.tsv)"));
@@ -4428,6 +4431,70 @@ QString MainWindow::exportImfTo(const QString& parent, const ImfSettings& settin
                             .arg(result.channels),
                         12000);
     return folder;
+}
+
+bool MainWindow::exportAdmTo(const QString& path, const AdmSettings& settings, AdmResult* resultOut) {
+    const Sequence* s = state_->sequence();
+    if (!s || s->duration() == 0) {
+        state_->message(tr("Nothing to export"));
+        return false;
+    }
+    // Mixed from a copy, off the UI thread.
+    const Project project = state_->project();
+    const Sequence seq = *s;
+    QProgressDialog progress(tr("Making the immersive master of %1...").arg(QString::fromStdString(seq.name)), tr("Cancel"), 0, 1000, this);
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(400);
+    std::atomic<int> done{0};
+    std::atomic<bool> cancel{false};
+    connect(&progress, &QProgressDialog::canceled, this, [&cancel] { cancel = true; });
+    AdmResult result;
+    std::string err;
+    QFutureWatcher<bool> watcher;
+    QEventLoop loop;
+    connect(&watcher, &QFutureWatcher<bool>::finished, &loop, &QEventLoop::quit);
+    QTimer tick;
+    connect(&tick, &QTimer::timeout, this, [&] { progress.setValue(done.load()); });
+    tick.start(100);
+    watcher.setFuture(QtConcurrent::run([&] {
+        return exportAdmBwf(project, seq, settings, path.toStdString(), &result, [&](double f) {
+            done = int(f * 1000);
+            return !cancel.load();
+        }, &err);
+    }));
+    if (!watcher.isFinished()) loop.exec();
+    tick.stop();
+    progress.close();
+    if (!watcher.result()) {
+        state_->message(cancel ? tr("Immersive master cancelled") : tr("No immersive master: %1").arg(QString::fromStdString(err)), 8000);
+        return false;
+    }
+    if (resultOut) *resultOut = result;
+    state_->message(tr("Immersive master %1 written: a %2 bed and %n object(s)", "", result.objects)
+                        .arg(QFileInfo(path).fileName(), QString::fromStdString(seq.audioLayout)),
+                    10000);
+    return true;
+}
+
+void MainWindow::exportAdmDialog() {
+    const Sequence* s = state_->sequence();
+    if (!s || s->duration() == 0) {
+        state_->message(tr("Nothing to export"));
+        return;
+    }
+    if (!immersiveLayout(s->audioLayout) && layoutChannels(s->audioLayout) <= 2 && admObjectTracks(*s).empty() &&
+        QMessageBox::question(this, tr("Export Immersive Master"),
+                              tr("%1 is mixed in stereo. Set an immersive layout (Sequence Settings) and mark tracks as audio "
+                                 "objects (right-click their panners) to make an immersive master.\n\nExport the stereo bed anyway?")
+                                  .arg(QString::fromStdString(s->name))) != QMessageBox::Yes)
+        return;
+    const QString path = QFileDialog::getSaveFileName(this, tr("Export Immersive Master (ADM BWF)"),
+                                                      QString::fromStdString(s->name) + QStringLiteral(".wav"), tr("ADM BWF (*.wav)"));
+    if (path.isEmpty()) return;
+    AdmSettings st;
+    st.title = s->name;
+    st.inOut = s->inPoint >= 0 && s->outPoint >= s->inPoint;
+    exportAdmTo(QFileInfo(path).suffix().isEmpty() ? path + QStringLiteral(".wav") : path, st);
 }
 
 void MainWindow::exportImfDialog() {

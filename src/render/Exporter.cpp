@@ -934,6 +934,12 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         AVChannelLayout layout = AV_CHANNEL_LAYOUT_STEREO;
         if (!s.downmixStereo && seq.audioLayout == "5.1") layout = AV_CHANNEL_LAYOUT_5POINT1;
         if (!s.downmixStereo && seq.audioLayout == "7.1") layout = AV_CHANNEL_LAYOUT_7POINT1;
+        if (!s.downmixStereo && immersiveLayout(seq.audioLayout)) {
+            // FFmpeg's names for the overhead layouts; 7.1.2's pair is at the sides (top side, not top front).
+            const char* name = seq.audioLayout == "7.1.2" ? "FL+FR+FC+LFE+BL+BR+SL+SR+TSL+TSR" : seq.audioLayout.c_str();
+            AVChannelLayout immersive{};
+            if (av_channel_layout_from_string(&immersive, name) == 0 && immersive.nb_channels == layoutChannels(seq.audioLayout)) layout = immersive;
+        }
         if (mono) layout = AV_CHANNEL_LAYOUT_MONO;
         av_channel_layout_copy(&actx->ch_layout, &layout);
         actx->sample_rate = sr;
@@ -990,7 +996,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     };
     std::vector<std::unique_ptr<ExtraAudio>> extras;
     // Channels mixed: the sequence's layout, or stereo.
-    const int layoutChannels = (!s.downmixStereo && seq.audioLayout == "5.1") ? 6 : (!s.downmixStereo && seq.audioLayout == "7.1") ? 8 : 2;
+    const int layoutChannels = s.downmixStereo ? 2 : montage::layoutChannels(seq.audioLayout);
     // Mono tracks (broadcast MXF): the mix's channels, each extra stream's, then silence.
     struct MonoOut {
         AVCodecContext* ctx = nullptr;
@@ -1007,7 +1013,13 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     const bool monoTracks = wantAudio && s.monoAudioTracks > 0;
     if (monoTracks) {
         static const char* const names[3][8] = {{"L", "R"}, {"L", "R", "C", "LFE", "Ls", "Rs"}, {"L", "R", "C", "LFE", "Lss", "Rss", "Lrs", "Rrs"}};
-        const char* const* channelNames = names[layoutChannels == 6 ? 1 : layoutChannels == 8 ? 2 : 0];
+        // Immersive layouts name their channels as core/Surround.h does.
+        const auto& speakers = layoutSpeakers(seq.audioLayout);
+        auto channelName = [&](int c) -> std::string {
+            if (layoutChannels == 2 || layoutChannels == 6 || layoutChannels == 8)
+                return names[layoutChannels == 6 ? 1 : layoutChannels == 8 ? 2 : 0][c];
+            return c < int(speakers.size()) ? speakers[size_t(c)].name : std::to_string(c + 1);
+        };
         const int used = layoutChannels * int(1 + s.extraAudio.size());
         const int count = std::max(s.monoAudioTracks, used);
         for (int i = 0; i < count; ++i) {
@@ -1016,8 +1028,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             m->frame = av_frame_alloc();
             const size_t stream = size_t(i / layoutChannels);
             if (i >= used) tagStream(m->st, "Silence", "");
-            else if (stream == 0) tagStream(m->st, (s.audioName.empty() ? std::string("Mix") : s.audioName) + " " + channelNames[i % layoutChannels], s.audioLanguage);
-            else tagStream(m->st, s.extraAudio[stream - 1].name + " " + channelNames[i % layoutChannels], s.extraAudio[stream - 1].language);
+            else if (stream == 0) tagStream(m->st, (s.audioName.empty() ? std::string("Mix") : s.audioName) + " " + channelName(i % layoutChannels), s.audioLanguage);
+            else tagStream(m->st, s.extraAudio[stream - 1].name + " " + channelName(i % layoutChannels), s.extraAudio[stream - 1].language);
             monos.push_back(std::move(m));
         }
     }

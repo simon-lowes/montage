@@ -16,41 +16,77 @@ double wrap(double a) {
 }  // namespace
 
 const std::vector<Speaker>& layoutSpeakers(const std::string& layout) {
-    static const std::vector<Speaker> stereo = {{"L", -30, false, 1.0}, {"R", 30, false, 1.0}};
-    static const std::vector<Speaker> five = {{"L", -30, false, 1.0},  {"R", 30, false, 1.0},  {"C", 0, false, 1.0},
-                                              {"LFE", 0, true, 0.0},   {"Ls", -110, false, 1.41}, {"Rs", 110, false, 1.41}};
-    static const std::vector<Speaker> seven = {{"L", -30, false, 1.0},   {"R", 30, false, 1.0},    {"C", 0, false, 1.0},
-                                               {"LFE", 0, true, 0.0},    {"Lb", -150, false, 1.41}, {"Rb", 150, false, 1.41},
-                                               {"Ls", -90, false, 1.41}, {"Rs", 90, false, 1.41}};
+    static const std::vector<Speaker> stereo = {{"L", -30, false, 1.0, 0, "M+030"}, {"R", 30, false, 1.0, 0, "M-030"}};
+    static const std::vector<Speaker> five = {{"L", -30, false, 1.0, 0, "M+030"},   {"R", 30, false, 1.0, 0, "M-030"},
+                                              {"C", 0, false, 1.0, 0, "M+000"},     {"LFE", 0, true, 0.0, 0, "LFE1"},
+                                              {"Ls", -110, false, 1.41, 0, "M+110"}, {"Rs", 110, false, 1.41, 0, "M-110"}};
+    static const std::vector<Speaker> seven = {{"L", -30, false, 1.0, 0, "M+030"},   {"R", 30, false, 1.0, 0, "M-030"},
+                                               {"C", 0, false, 1.0, 0, "M+000"},     {"LFE", 0, true, 0.0, 0, "LFE1"},
+                                               {"Lb", -150, false, 1.41, 0, "M+135"}, {"Rb", 150, false, 1.41, 0, "M-135"},
+                                               {"Ls", -90, false, 1.41, 0, "M+090"},  {"Rs", 90, false, 1.41, 0, "M-090"}};
+    // Immersive: BS.2051's positions (2+5+0, 4+5+0, 4+7+0; 7.1.2 as 0+7+0 with the pair above at the sides).
+    auto with = [](std::vector<Speaker> base, std::initializer_list<Speaker> extra) {
+        base.insert(base.end(), extra);
+        return base;
+    };
+    static const std::vector<Speaker> sevenBs = {{"L", -30, false, 1.0, 0, "M+030"},   {"R", 30, false, 1.0, 0, "M-030"},
+                                                 {"C", 0, false, 1.0, 0, "M+000"},     {"LFE", 0, true, 0.0, 0, "LFE1"},
+                                                 {"Lb", -135, false, 1.41, 0, "M+135"}, {"Rb", 135, false, 1.41, 0, "M-135"},
+                                                 {"Ls", -90, false, 1.41, 0, "M+090"},  {"Rs", 90, false, 1.41, 0, "M-090"}};
+    static const std::vector<Speaker> fiveTwo =
+        with(five, {{"Ltf", -30, false, 1.0, 30, "U+030"}, {"Rtf", 30, false, 1.0, 30, "U-030"}});
+    static const std::vector<Speaker> fiveFour = with(five, {{"Ltf", -30, false, 1.0, 30, "U+030"}, {"Rtf", 30, false, 1.0, 30, "U-030"},
+                                                             {"Ltr", -110, false, 1.0, 30, "U+110"}, {"Rtr", 110, false, 1.0, 30, "U-110"}});
+    static const std::vector<Speaker> sevenTwo =  // overhead at the sides ("top middle"), as Dolby's 7.1.2 bed
+        with(sevenBs, {{"Lts", -90, false, 1.0, 30, "U+090"}, {"Rts", 90, false, 1.0, 30, "U-090"}});
+    static const std::vector<Speaker> sevenFour = with(sevenBs, {{"Ltf", -45, false, 1.0, 30, "U+045"}, {"Rtf", 45, false, 1.0, 30, "U-045"},
+                                                                 {"Ltr", -135, false, 1.0, 30, "U+135"}, {"Rtr", 135, false, 1.0, 30, "U-135"}});
     if (layout == "5.1") return five;
     if (layout == "7.1") return seven;
+    if (layout == "5.1.2") return fiveTwo;
+    if (layout == "5.1.4") return fiveFour;
+    if (layout == "7.1.2") return sevenTwo;
+    if (layout == "7.1.4") return sevenFour;
     return stereo;
 }
 
 int layoutChannels(const std::string& layout) { return int(layoutSpeakers(layout).size()); }
 
 const std::vector<std::string>& audioLayouts() {
-    static const std::vector<std::string> l = {"stereo", "5.1", "7.1"};
+    static const std::vector<std::string> l = {"stereo", "5.1", "7.1", "5.1.2", "5.1.4", "7.1.2", "7.1.4"};
     return l;
 }
 
-std::vector<float> panGains(const std::string& layout, double angle, double distance) {
-    const auto& sp = layoutSpeakers(layout);
-    std::vector<float> g(sp.size(), 0.0f);
-    // The main speakers round the circle, by angle.
-    std::vector<size_t> ring;
-    for (size_t i = 0; i < sp.size(); ++i)
-        if (!sp[i].lfe) ring.push_back(i);
+bool immersiveLayout(const std::string& layout) {
+    for (const Speaker& sp : layoutSpeakers(layout))
+        if (sp.elevation > 0) return true;
+    return false;
+}
+
+std::string earLevelLayout(const std::string& layout) {
+    if (layout == "5.1.2" || layout == "5.1.4") return "5.1";
+    if (layout == "7.1.2" || layout == "7.1.4") return "7.1";
+    return layout;
+}
+
+namespace {
+
+// Gains round one ring of speakers: between the two either side of the angle (going round past the back), or for a
+// stereo pair between the two and held at their ends; nearer the middle, spread over all of them (power constant).
+void ringGains(const std::vector<Speaker>& sp, std::vector<size_t> ring, double angle, double distance, bool pairOnly, double scale,
+               std::vector<float>& g) {
+    if (ring.empty()) return;
     std::sort(ring.begin(), ring.end(), [&](size_t a, size_t b) { return sp[a].angle < sp[b].angle; });
     std::vector<double> pair(sp.size(), 0.0);
     angle = wrap(angle);
-    if (layout != "5.1" && layout != "7.1") {
-        // Stereo: the front pair only, held at its ends.
-        const double u = (std::clamp(angle, -30.0, 30.0) + 30) / 60;
+    if (ring.size() == 1) {
+        pair[ring.front()] = 1;
+    } else if (pairOnly) {
+        const double from = sp[ring.front()].angle, to = sp[ring.back()].angle;
+        const double u = (std::clamp(angle, from, to) - from) / (to - from);
         pair[ring.front()] = std::cos(u * M_PI / 2);
         pair[ring.back()] = std::sin(u * M_PI / 2);
     } else {
-        // Between the two speakers either side of the angle, going round past the back.
         const size_t n = ring.size();
         for (size_t k = 0; k < n; ++k) {
             const size_t a = ring[k], b = ring[(k + 1) % n];
@@ -66,9 +102,23 @@ std::vector<float> panGains(const std::string& layout, double angle, double dist
             }
         }
     }
-    // Nearer the middle, spread over every main speaker (power kept constant).
     const double r = std::clamp(distance, 0.0, 1.0);
-    for (size_t i : ring) g[i] = float(std::sqrt(r * pair[i] * pair[i] + (1 - r) / double(ring.size())));
+    for (size_t i : ring) g[i] = float(scale * std::sqrt(r * pair[i] * pair[i] + (1 - r) / double(ring.size())));
+}
+
+}  // namespace
+
+std::vector<float> panGains(const std::string& layout, double angle, double distance, double height) {
+    const auto& sp = layoutSpeakers(layout);
+    std::vector<float> g(sp.size(), 0.0f);
+    std::vector<size_t> ear, top;
+    for (size_t i = 0; i < sp.size(); ++i)
+        if (!sp[i].lfe) (sp[i].elevation > 0 ? top : ear).push_back(i);
+    // Stereo keeps to the front pair; a surround layout pans all the way round. Overhead, the same round the
+    // speakers above, crossfaded with the ear-level ring at constant power.
+    const double h = top.empty() ? 0.0 : std::clamp(height, 0.0, 1.0);
+    ringGains(sp, ear, angle, distance, sp.size() == 2, std::cos(h * M_PI / 2), g);
+    if (h > 0) ringGains(sp, top, angle, distance, false, std::sin(h * M_PI / 2), g);
     return g;
 }
 
@@ -78,8 +128,8 @@ SurroundGains surroundGains(const std::string& layout, const SurroundPan& p) {
     const double distance = std::min(1.0, std::hypot(p.x, p.y));
     const double width = std::clamp(p.width, 0.0, 1.0);
     const double half = 30 * width;
-    out.left = panGains(layout, angle - half, distance);
-    out.right = panGains(layout, angle + half, distance);
+    out.left = panGains(layout, angle - half, distance, p.z);
+    out.right = panGains(layout, angle + half, distance, p.z);
     // Drawn together, the two channels add up: a sound in both stays as loud as it was on two speakers.
     const float k = float(std::sqrt(0.5 + 0.5 * width));
     for (float& g : out.left) g *= k;

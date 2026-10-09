@@ -291,7 +291,8 @@ struct Transition {
 
 // Where a track or bus sits in a surround mix (core/Surround.h): its position
 // (x left to right, y back to front, both -1..1; the edge of the circle is at
-// the speakers, nearer the middle spreads it over all of them), how far apart
+// the speakers, nearer the middle spreads it over all of them; z its height in
+// immersive layouts), how far apart
 // its left and right channels are (1: as wide as the front pair, 0: one
 // point), and how much goes to the LFE. The default puts a stereo track on
 // the front left and right speakers, as in stereo.
@@ -300,6 +301,8 @@ struct SurroundPan {
     double y = 1;
     double width = 1;
     double lfeDb = -100;  // -100 = none
+    double z = 0;         // height in immersive layouts: 0 at the ear, 1 overhead
+    bool object = false;  // an audio object in immersive masters (render/Adm.h), not part of the bed
     bool operator==(const SurroundPan&) const = default;
 };
 

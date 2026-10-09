@@ -401,7 +401,7 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
     if (std::all_of(std::begin(coding), std::end(coding), [](uint8_t b) { return b == 0; }))
         return fail("No JPEG 2000 IMF profile takes that picture at that bit rate");
     const size_t maxBytes = settings.lossless ? 0 : size_t(settings.megabitsPerSecond * 1e6 / 8 / fps);
-    const int seqChannels = layoutChannels(s.audioLayout);
+    const int seqChannels = layoutChannels(earLevelLayout(s.audioLayout));  // immersive mixes fold their heights down
     const int channels = seqChannels == 8 ? 8 : seqChannels == 6 ? 6 : 2;
 
     // The folder.
@@ -428,6 +428,7 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         return fail(err);
     {
         Sequence mixSeq = s;
+        mixSeq.audioLayout = earLevelLayout(s.audioLayout);
         mixSeq.sampleRate = 48000;
         const int64_t firstSample = int64_t(std::llround(double(first) * 48000.0 * rate.den / rate.num));
         const int64_t total = frames * 48000 * int64_t(rate.den) / int64_t(rate.num);

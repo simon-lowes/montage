@@ -19,6 +19,7 @@
 #include "render/Shorts.h"
 #include "render/ReviewExport.h"
 #include "render/Dcp.h"
+#include "render/Adm.h"
 #include "render/Imf.h"
 #include "render/Jpeg2000.h"
 #include "render/ExtendClip.h"
@@ -181,6 +182,9 @@ public:
     void exportDcpDialog();
     QString exportImfTo(const QString& parent, const ImfSettings& settings, QStringList* problems = nullptr);
     void exportImfDialog();
+    // File › Export Immersive Master (ADM BWF)…: the bed and the audio objects (render/Adm.h), in the background.
+    bool exportAdmTo(const QString& path, const AdmSettings& settings, AdmResult* result = nullptr);
+    void exportAdmDialog();
     bool addToColorGroup(Id group);
     bool removeFromColorGroup();
     // Suggest Chapters: chapter markers where the talk moves on, titled with what each part is about (replacing the

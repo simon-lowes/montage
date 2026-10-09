@@ -1,7 +1,10 @@
 // Montage — a surround panner for a mixer strip: the speakers of the
-// sequence's layout round a circle, and the track as a dot (with its left
-// and right channels either side) to drag. The wheel narrows or widens it,
-// double-click puts it back, and the context menu sets its width and LFE.
+// sequence's layout round a circle (overhead ones hollow, further in), and the
+// track as a dot (with its left and right channels either side) to drag. The
+// wheel narrows or widens it, double-click puts it back, and the context menu
+// sets its width and LFE. In immersive layouts a bar on the right shows its
+// height (Alt+wheel or the menu sets it), and a track can be made an audio
+// object for ADM masters (drawn as a diamond).
 #pragma once
 
 #include <QWidget>
@@ -16,6 +19,8 @@ public:
     explicit SurroundPanner(QWidget* parent = nullptr);
 
     void setSpeakerLayout(const std::string& layout);
+    // Whether the menu offers "Audio object" (tracks yes, buses no).
+    void setObjectsAllowed(bool on) { objectsAllowed_ = on; }
     void setPan(const SurroundPan& p);  // does not emit
     const SurroundPan& pan() const { return pan_; }
     // Where a position (x, y in -1..1) is drawn, and the reverse.
@@ -42,6 +47,7 @@ private:
     std::string layout_ = "5.1";
     SurroundPan pan_;
     bool dragging_ = false;
+    bool objectsAllowed_ = false;
 };
 
 }  // namespace montage

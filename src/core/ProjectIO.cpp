@@ -1,4 +1,5 @@
 #include "ProjectIO.h"
+#include "Surround.h"
 #include "Interpretation.h"
 
 #include <QDir>
@@ -56,7 +57,10 @@ Interp interpFrom(const QString& s) {
 
 QJsonValue surroundToJson(const SurroundPan& p) {
     if (p == SurroundPan{}) return QJsonValue();
-    return QJsonObject{{"x", p.x}, {"y", p.y}, {"width", p.width}, {"lfeDb", p.lfeDb}};
+    QJsonObject o{{"x", p.x}, {"y", p.y}, {"width", p.width}, {"lfeDb", p.lfeDb}};
+    if (p.z != 0) o["z"] = p.z;
+    if (p.object) o["object"] = true;
+    return o;
 }
 
 SurroundPan surroundFromJson(const QJsonValue& v) {
@@ -66,6 +70,8 @@ SurroundPan surroundFromJson(const QJsonValue& v) {
     p.y = std::clamp(o.value("y").toDouble(1), -1.0, 1.0);
     p.width = std::clamp(o.value("width").toDouble(1), 0.0, 1.0);
     p.lfeDb = std::clamp(o.value("lfeDb").toDouble(-100), -100.0, 12.0);
+    p.z = std::clamp(o.value("z").toDouble(0), 0.0, 1.0);
+    p.object = o.value("object").toBool();
     return p;
 }
 
@@ -543,7 +549,7 @@ Sequence sequenceFromJson(const QJsonObject& o) {
     s.hdrMaxFall = std::clamp(o.value("hdrMaxFall").toDouble(0), 0.0, s.hdrMaxCll);
     s.spherical = o.value("spherical").toBool(false);
     s.audioLayout = o.contains("audioLayout") ? ss(o.value("audioLayout")) : "stereo";
-    if (s.audioLayout != "5.1" && s.audioLayout != "7.1") s.audioLayout = "stereo";
+    if (std::find(audioLayouts().begin(), audioLayouts().end(), s.audioLayout) == audioLayouts().end()) s.audioLayout = "stereo";
     for (const auto& t : o.value("video").toArray()) s.videoTracks.push_back(trackFromJson(t.toObject(), TrackKind::Video));
     for (const auto& t : o.value("audio").toArray()) s.audioTracks.push_back(trackFromJson(t.toObject(), TrackKind::Audio));
     for (const auto& mv : o.value("markers").toArray()) {

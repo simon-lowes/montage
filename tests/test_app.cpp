@@ -1389,6 +1389,62 @@ private slots:
         }
     }
 
+    void immersiveMixerAndAdmExport() {
+        loadDemo();
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        for (int t = 0; t < 2; ++t)
+            QVERIFY(state()->apply("Place", [media, t](Project& p, Sequence& s) {
+                return edit::placeMedia(p, s, media, 0, 0, 60, V1, {TrackKind::Audio, t}, false);
+            }));
+        // Sequence settings offer the immersive layouts.
+        {
+            SequenceSettingsDialog dlg(win_.get());
+            auto* layout = dlg.findChild<QComboBox*>("audioLayout");
+            for (const char* l : {"5.1.2", "5.1.4", "7.1.2", "7.1.4"}) QVERIFY2(layout->findData(QString(l)) >= 0, l);
+            layout->setCurrentIndex(layout->findData(QString("7.1.4")));
+            QCOMPARE(dlg.spec().audioLayout, std::string("7.1.4"));
+        }
+        QVERIFY(state()->edit("7.1.4", [](Project&, Sequence& s) {
+            s.audioLayout = "7.1.4";
+            return true;
+        }));
+        QApplication::processEvents();
+        auto* mixer = win_->findChild<MixerPanel*>();
+        std::vector<SurroundPanner*> panners;
+        for (auto* p : mixer->findChildren<SurroundPanner*>("surroundPanner"))
+            if (p->isVisibleTo(mixer)) panners.push_back(p);
+        QVERIFY(panners.size() >= 2);
+        // Alt+wheel raises the second track; the plain wheel still narrows it.
+        SurroundPanner* panner = panners[1];
+        QWheelEvent up(panner->rect().center(), panner->mapToGlobal(panner->rect().center()), {}, {0, 120}, Qt::NoButton, Qt::AltModifier,
+                       Qt::NoScrollPhase, false);
+        QApplication::sendEvent(panner, &up);
+        QApplication::sendEvent(panner, &up);
+        QVERIFY(std::fabs(state()->sequence()->audioTracks.at(1).surround.z - 0.2) < 1e-9);
+        QWheelEvent narrow(panner->rect().center(), panner->mapToGlobal(panner->rect().center()), {}, {0, -120}, Qt::NoButton, {},
+                           Qt::NoScrollPhase, false);
+        QApplication::sendEvent(panner, &narrow);
+        QVERIFY(std::fabs(state()->sequence()->audioTracks.at(1).surround.width - 0.9) < 1e-9);
+        // Made an object, it is written as one: a 7.1.4 bed (12 channels) and A2.
+        QVERIFY(state()->edit("Object", [](Project&, Sequence& s) {
+            s.audioTracks[1].surround.object = true;
+            return true;
+        }));
+        QVERIFY(win_->findChild<QAction*>("exportAdm"));
+        const QString path = dir_.filePath("immersive.wav");
+        AdmSettings st;
+        st.title = "App master";
+        AdmResult r;
+        QVERIFY(win_->exportAdmTo(path, st, &r));
+        QVERIFY(r.bedChannels == 12 && r.objects == 1 && r.bedPack == "AP_00010017");
+        BwfInfo info;
+        QVERIFY(readBwfInfo(path.toStdString(), info) && info.channels == 13 && info.chna.size() == 13);
+        QVERIFY(info.axml.find("audioObjectName=\"A2\"") != std::string::npos);
+        state()->newProject();
+    }
+
     void shapeLayersAndLottieInTheApp() {
         state()->newProject();
         // A Shape from the Effects browser lands at the playhead, selected, with its settings in the Inspector.

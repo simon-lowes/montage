@@ -153,6 +153,10 @@ SequenceSettingsDialog::SequenceSettingsDialog(QWidget* parent) : QDialog(parent
     audioLayout_->addItem(tr("Stereo"), QStringLiteral("stereo"));
     audioLayout_->addItem(tr("5.1 surround (L R C LFE Ls Rs)"), QStringLiteral("5.1"));
     audioLayout_->addItem(tr("7.1 surround (L R C LFE Lb Rb Ls Rs)"), QStringLiteral("7.1"));
+    audioLayout_->addItem(tr("5.1.2 immersive (5.1 and two overhead)"), QStringLiteral("5.1.2"));
+    audioLayout_->addItem(tr("5.1.4 immersive (5.1 and four overhead)"), QStringLiteral("5.1.4"));
+    audioLayout_->addItem(tr("7.1.2 immersive (7.1 and two overhead, the Atmos bed)"), QStringLiteral("7.1.2"));
+    audioLayout_->addItem(tr("7.1.4 immersive (7.1 and four overhead)"), QStringLiteral("7.1.4"));
     audioLayout_->setToolTip(tr("The speakers the sequence mixes to. Surround mixes are heard folded down to stereo,\n"
                                 "and each track and bus gets a surround panner in the mixer."));
 

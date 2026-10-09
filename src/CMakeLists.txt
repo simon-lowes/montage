@@ -94,6 +94,7 @@ add_library(montage_engine STATIC
   render/Jpeg2000.h render/Jpeg2000.cpp
   render/PackageFiles.h render/PackageFiles.cpp
   render/Imf.h render/Imf.cpp
+  render/Adm.h render/Adm.cpp
   render/Relight.h render/Relight.cpp
   render/FilmLook.h render/FilmLook.cpp
   render/Retime.h render/Retime.cpp

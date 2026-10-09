@@ -2732,6 +2732,69 @@ private slots:
         QCOMPARE(uint8_t(head[30]), uint8_t(12));
     }
 
+    void immersivePanning() {
+        // The layouts: BS.2051's speakers in FFmpeg's channel order.
+        QCOMPARE(layoutChannels("5.1.2"), 8);
+        QCOMPARE(layoutChannels("5.1.4"), 10);
+        QCOMPARE(layoutChannels("7.1.2"), 10);
+        QCOMPARE(layoutChannels("7.1.4"), 12);
+        QVERIFY(immersiveLayout("7.1.4") && immersiveLayout("5.1.2") && !immersiveLayout("7.1") && !immersiveLayout("stereo"));
+        QCOMPARE(earLevelLayout("7.1.4"), std::string("7.1"));
+        QCOMPARE(earLevelLayout("5.1.2"), std::string("5.1"));
+        QCOMPARE(earLevelLayout("5.1"), std::string("5.1"));
+        const auto& sp = layoutSpeakers("7.1.4");
+        QCOMPARE(std::string(sp[8].label), std::string("U+045"));
+        QCOMPARE(std::string(sp[4].label), std::string("M+135"));
+        QVERIFY(sp[8].elevation > 0 && sp[8].angle == -45 && sp[0].elevation == 0);
+        QCOMPARE(std::string(layoutSpeakers("7.1.2")[8].label), std::string("U+090"));
+        auto power = [](const std::vector<float>& g) {
+            double p = 0;
+            for (float v : g) p += double(v) * v;
+            return p;
+        };
+        for (const char* layout : {"5.1.2", "5.1.4", "7.1.2", "7.1.4"}) {
+            const auto& spk = layoutSpeakers(layout);
+            for (size_t i = 0; i < spk.size(); ++i) {
+                if (spk[i].lfe) continue;
+                // At a speaker's angle and height (at the ear, or overhead): that speaker alone.
+                const auto g = panGains(layout, spk[i].angle, 1, spk[i].elevation > 0 ? 1.0 : 0.0);
+                for (size_t j = 0; j < g.size(); ++j) QVERIFY2(std::fabs(g[j] - (i == j ? 1.0f : 0.0f)) < 1e-6, layout);
+            }
+            // Anywhere, at any distance and height: constant power, nothing to the LFE.
+            for (double a = -180; a <= 180; a += 15)
+                for (double d : {0.0, 0.5, 1.0})
+                    for (double h : {0.0, 0.3, 1.0}) QVERIFY(std::fabs(power(panGains(layout, a, d, h)) - 1) < 1e-5);
+        }
+        // Half way up: the power shared equally between the ear-level ring and the overhead one.
+        const auto half = panGains("7.1.4", -45, 1, 0.5);
+        double ear = 0, top = 0;
+        for (size_t j = 0; j < sp.size(); ++j) (sp[j].elevation > 0 ? top : ear) += double(half[j]) * half[j];
+        QVERIFY(std::fabs(ear - 0.5) < 1e-6 && std::fabs(top - 0.5) < 1e-6);
+        // Layouts without overhead speakers keep everything at the ear.
+        QCOMPARE(panGains("5.1", 20, 1, 1), panGains("5.1", 20, 1, 0));
+        QCOMPARE(panGains("stereo", 10, 1, 1), panGains("stereo", 10, 1, 0));
+        // A panner's height lifts its sound; the fold-down puts the overhead speakers into their side at -3 dB.
+        SurroundPan up;
+        up.x = M_SQRT1_2, up.y = M_SQRT1_2, up.width = 0, up.z = 1;  // 45 degrees right at the speakers, overhead
+        const SurroundGains g = surroundGains("7.1.4", up);
+        QVERIFY(std::fabs(g.left[9] - M_SQRT1_2) < 1e-5 && std::fabs(g.right[9] - M_SQRT1_2) < 1e-5);
+        float frame[12] = {};
+        frame[8] = 1;  // Ltf
+        float lr[2];
+        downmixToStereo("7.1.4", frame, 1, lr);
+        QVERIFY(std::fabs(lr[0] - 0.7071f) < 1e-4 && lr[1] == 0);
+        // Height and the object flag are saved.
+        Fixture fx;
+        fx.s().audioLayout = "7.1.4";
+        fx.s().audioTracks[0].surround.z = 0.75;
+        fx.s().audioTracks[0].surround.object = true;
+        Project back;
+        QVERIFY(projectFromJson(projectToJson(fx.p), back));
+        QCOMPARE(back.active()->audioLayout, std::string("7.1.4"));
+        QCOMPARE(back.active()->audioTracks[0].surround, fx.s().audioTracks[0].surround);
+        QCOMPARE(std::find(audioLayouts().begin(), audioLayouts().end(), std::string("7.1.2")) != audioLayouts().end(), true);
+    }
+
     void surroundPanning() {
         QCOMPARE(layoutChannels("stereo"), 2);
         QCOMPARE(layoutChannels("5.1"), 6);

@@ -30,6 +30,7 @@
 #include "render/RoomTone.h"
 #include "render/Versions.h"
 #include "render/Dcp.h"
+#include "render/Adm.h"
 #include "render/Imf.h"
 #include "render/LightLevel.h"
 #include "render/Spherical.h"
@@ -560,7 +561,7 @@ void McpServer::Impl::addTools() {
             "project":{"type":"string","description":"Path of the .montage file to write"},
             "media":{"type":"array","items":{"type":"string"},"description":"Media files, in order"},
             "width":{"type":"integer"},"height":{"type":"integer"},"fps":{"type":"number"},
-            "audio_layout":{"type":"string","enum":["stereo","5.1","7.1"],"default":"stereo"}},
+            "audio_layout":{"type":"string","enum":["stereo","5.1","7.1","5.1.2","5.1.4","7.1.2","7.1.4"],"default":"stereo"}},
             "required":["project"]})json",
         false, [](const QJsonObject& a) {
             Loaded l;
@@ -588,7 +589,7 @@ void McpServer::Impl::addTools() {
             if (a.contains("audio_layout")) {
                 const std::string layout = a.value("audio_layout").toString().toStdString();
                 if (std::find(audioLayouts().begin(), audioLayouts().end(), layout) == audioLayouts().end())
-                    throw ArgError{"\"audio_layout\" must be stereo, 5.1 or 7.1"};
+                    throw ArgError{"\"audio_layout\" must be stereo, 5.1, 7.1, 5.1.2, 5.1.4, 7.1.2 or 7.1.4"};
                 s.audioLayout = layout;
             }
             FrameTime at = 0;
@@ -3344,16 +3345,19 @@ void McpServer::Impl::addTools() {
         });
 
     add("montage_set_surround", "Set up a surround mix",
-        "Mix the active sequence in stereo, 5.1 (L R C LFE Ls Rs) or 7.1 (L R C LFE Lb Rb Ls Rs), and place audio tracks "
-        "among the speakers. A position is an angle (0 straight ahead, 90 right, -90 left, 180 behind) and a distance (1 at "
-        "the speakers, 0 spread over all of them); width narrows a stereo track to a point (0, e.g. dialogue in the centre "
-        "speaker); lfe_db sends it to the subwoofer (-100 off). A track routed to a bus is placed by its bus. Export with "
-        "montage_render (downmix_stereo for a stereo copy).",
+        "Mix the active sequence in stereo, 5.1 (L R C LFE Ls Rs), 7.1 (L R C LFE Lb Rb Ls Rs) or an immersive layout with "
+        "overhead speakers (5.1.2, 5.1.4, 7.1.2 as the Dolby Atmos bed, 7.1.4), and place audio tracks among the speakers. A "
+        "position is an angle (0 straight ahead, 90 right, -90 left, 180 behind) and a distance (1 at the speakers, 0 spread "
+        "over all of them); height (0 at the ear to 1 overhead) lifts it in immersive layouts; width narrows a stereo track "
+        "to a point (0, e.g. dialogue in the centre speaker); lfe_db sends it to the subwoofer (-100 off); object makes the "
+        "track an audio object of its own in ADM masters (montage_export_adm) instead of part of the bed. A track routed to "
+        "a bus is placed by its bus. Export with montage_render (downmix_stereo for a stereo copy).",
         R"json({"type":"object","properties":{"project":{"type":"string"},
-            "layout":{"type":"string","enum":["stereo","5.1","7.1"]},
+            "layout":{"type":"string","enum":["stereo","5.1","7.1","5.1.2","5.1.4","7.1.2","7.1.4"]},
             "tracks":{"type":"array","items":{"type":"object","properties":{
                 "track":{"type":"string","description":"Audio track, e.g. A1"},"angle":{"type":"number","default":0},
-                "distance":{"type":"number","default":1},"width":{"type":"number","default":1},"lfe_db":{"type":"number","default":-100}},
+                "distance":{"type":"number","default":1},"height":{"type":"number","default":0},"width":{"type":"number","default":1},
+                "lfe_db":{"type":"number","default":-100},"object":{"type":"boolean","default":false}},
                 "required":["track"]}}},"required":["project"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
@@ -3361,7 +3365,7 @@ void McpServer::Impl::addTools() {
             if (a.contains("layout")) {
                 const std::string layout = a.value("layout").toString().toStdString();
                 if (std::find(audioLayouts().begin(), audioLayouts().end(), layout) == audioLayouts().end())
-                    throw ArgError{"\"layout\" must be stereo, 5.1 or 7.1"};
+                    throw ArgError{"\"layout\" must be stereo, 5.1, 7.1, 5.1.2, 5.1.4, 7.1.2 or 7.1.4"};
                 s.audioLayout = layout;
             }
             QJsonArray out;
@@ -3377,13 +3381,43 @@ void McpServer::Impl::addTools() {
                 p.y = dist * std::cos(angle);
                 p.width = std::clamp(t.value("width").toDouble(1), 0.0, 1.0);
                 p.lfeDb = std::clamp(t.value("lfe_db").toDouble(-100), -100.0, 12.0);
-                out.append(QJsonObject{{"track", QString::fromStdString(tr->name)}, {"x", p.x}, {"y", p.y}, {"width", p.width},
-                                       {"lfe_db", p.lfeDb}});
+                p.z = std::clamp(t.value("height").toDouble(0), 0.0, 1.0);
+                p.object = t.value("object").toBool(false);
+                out.append(QJsonObject{{"track", QString::fromStdString(tr->name)}, {"x", p.x}, {"y", p.y}, {"z", p.z}, {"width", p.width},
+                                       {"lfe_db", p.lfeDb}, {"object", p.object}});
             }
             save(l);
             return ok(QStringLiteral("%1 mix, %2 track(s) placed").arg(QString::fromStdString(s.audioLayout)).arg(out.size()),
                       QJsonObject{{"layout", QString::fromStdString(s.audioLayout)},
                                   {"channels", layoutChannels(s.audioLayout)}, {"tracks", out}});
+        });
+
+    add("montage_export_adm", "Export an immersive master (ADM BWF)",
+        "Write the active sequence as an ADM BWF file (ITU-R BS.2076 metadata in a BS.2088 BW64 wave), the interchange "
+        "format of Dolby Atmos and the EBU ADM renderer: a bed of every track that is not an audio object, in the "
+        "sequence's layout (named by the BS.2094 common definitions), and one channel for each track marked as an object "
+        "(montage_set_surround object), with its position. 48 kHz, 24 bits. Returns what the file holds.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"path":{"type":"string","description":"The .wav to write"},
+            "title":{"type":"string"},"in_out":{"type":"boolean","default":false,"description":"Only In to Out"}},
+            "required":["project","path"]})json",
+        true, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            const Sequence& s = l.seq();
+            AdmSettings st;
+            st.title = str(a, "title", QString::fromStdString(s.name)).toStdString();
+            st.inOut = a.value("in_out").toBool();
+            const QString path = absolute(need(a, "path"));
+            AdmResult r;
+            std::string err;
+            if (!exportAdmBwf(l.project, s, st, path.toStdString(), &r, {}, &err)) return fail(QString::fromStdString(err));
+            BwfInfo info;
+            if (!readBwfInfo(r.path, info, &err)) return fail(QString::fromStdString(err));
+            QJsonArray objects;
+            for (int t : admObjectTracks(s)) objects.append(QString::fromStdString(s.audioTracks[size_t(t)].name));
+            return ok(QStringLiteral("Wrote a %1 bed and %2 object(s)").arg(QString::fromStdString(s.audioLayout)).arg(r.objects),
+                      QJsonObject{{"path", path}, {"layout", QString::fromStdString(s.audioLayout)}, {"bed_channels", r.bedChannels},
+                                  {"bed_pack", QString::fromStdString(r.bedPack)}, {"objects", objects}, {"channels", info.channels},
+                                  {"seconds", double(r.samples) / 48000.0}, {"chna_tracks", int(info.chna.size())}});
         });
 
     add("montage_super_scale", "Super Scale a file",

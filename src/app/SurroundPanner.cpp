@@ -16,7 +16,8 @@ SurroundPanner::SurroundPanner(QWidget* parent) : QWidget(parent) {
     setFixedSize(58, 58);
     setCursor(Qt::CrossCursor);
     setToolTip(tr("Surround: drag to place the track among the speakers (nearer the middle spreads it out).\n"
-                  "Wheel: narrower or wider. Double-click: front, as in stereo. Right-click: width and LFE."));
+                  "Wheel: narrower or wider; Alt+wheel: higher or lower (immersive layouts). Double-click: front, as in stereo.\n"
+                  "Right-click: width, LFE, height and audio object."));
 }
 
 void SurroundPanner::setSpeakerLayout(const std::string& layout) {
@@ -59,11 +60,21 @@ void SurroundPanner::paintEvent(QPaintEvent*) {
     // The speakers.
     for (const Speaker& sp : layoutSpeakers(layout_)) {
         if (sp.lfe) continue;
-        const double a = sp.angle * M_PI / 180;
-        const QPointF at = toWidget(std::sin(a), std::cos(a));
-        p.setPen(Qt::NoPen);
-        p.setBrush(theme::kTextDim);
+        const double a = sp.angle * M_PI / 180, k = sp.elevation > 0 ? 0.6 : 1.0;  // overhead ones further in
+        const QPointF at = toWidget(k * std::sin(a), k * std::cos(a));
+        p.setPen(sp.elevation > 0 ? QPen(theme::kTextDim, 1) : Qt::NoPen);
+        p.setBrush(sp.elevation > 0 ? QBrush(Qt::NoBrush) : QBrush(theme::kTextDim));
         p.drawRect(QRectF(at.x() - 2, at.y() - 2, 4, 4));
+    }
+    if (immersiveLayout(layout_)) {
+        // The height, a bar up the right-hand side.
+        const QRectF bar(width() - 4, 4, 3, height() - 8);
+        p.setPen(Qt::NoPen);
+        p.setBrush(QColor(0, 0, 0, 90));
+        p.drawRect(bar);
+        p.setBrush(theme::kAccent);
+        const double hgt = bar.height() * std::clamp(pan_.z, 0.0, 1.0);
+        p.drawRect(QRectF(bar.left(), bar.bottom() - hgt, bar.width(), hgt));
     }
     // The track: its two channels and the point between them.
     const double angle = std::atan2(pan_.x, pan_.y), dist = std::min(1.0, std::hypot(pan_.x, pan_.y));
@@ -77,7 +88,12 @@ void SurroundPanner::paintEvent(QPaintEvent*) {
     const QPointF at = toWidget(pan_.x, pan_.y);
     p.setPen(QPen(Qt::black, 1));
     p.setBrush(pan_.lfeDb > -99 ? QColor(255, 170, 90) : theme::kAccent);
-    p.drawEllipse(at, 4, 4);
+    if (pan_.object && objectsAllowed_) {
+        const QPointF d[4] = {at + QPointF(0, -5), at + QPointF(5, 0), at + QPointF(0, 5), at + QPointF(-5, 0)};
+        p.drawPolygon(d, 4);
+    } else {
+        p.drawEllipse(at, 4, 4);
+    }
 }
 
 void SurroundPanner::mousePressEvent(QMouseEvent* e) {
@@ -107,7 +123,10 @@ void SurroundPanner::mouseDoubleClickEvent(QMouseEvent*) {
 }
 
 void SurroundPanner::wheelEvent(QWheelEvent* e) {
-    pan_.width = std::clamp(pan_.width + (e->angleDelta().y() > 0 ? 0.1 : -0.1), 0.0, 1.0);
+    const int dy = e->angleDelta().y() != 0 ? e->angleDelta().y() : e->angleDelta().x();  // Alt turns the wheel sideways on some systems
+    const double step = dy > 0 ? 0.1 : -0.1;
+    if ((e->modifiers() & Qt::AltModifier) && immersiveLayout(layout_)) pan_.z = std::clamp(pan_.z + step, 0.0, 1.0);
+    else pan_.width = std::clamp(pan_.width + step, 0.0, 1.0);
     emitChange(true);
 }
 
@@ -131,9 +150,31 @@ void SurroundPanner::contextMenuEvent(QContextMenuEvent* e) {
         a->setCheckable(true);
         a->setChecked(std::lround(pan_.lfeDb) == db || (db <= -99 && pan_.lfeDb <= -99));
     }
+    if (immersiveLayout(layout_)) {
+        QMenu* h = menu.addMenu(tr("Height"));
+        for (int pct : {0, 25, 50, 75, 100}) {
+            QAction* a = h->addAction(pct == 0 ? tr("At the ear") : pct == 100 ? tr("Overhead") : tr("%1 %").arg(pct), this, [this, pct] {
+                pan_.z = pct / 100.0;
+                emitChange(true);
+            });
+            a->setCheckable(true);
+            a->setChecked(std::lround(pan_.z * 100) == pct);
+        }
+    }
+    if (objectsAllowed_) {
+        QAction* o = menu.addAction(tr("Audio Object (in ADM masters)"), this, [this](bool on) {
+            pan_.object = on;
+            emitChange(true);
+        });
+        o->setCheckable(true);
+        o->setChecked(pan_.object);
+        o->setToolTip(tr("Exported as an object of its own, at this position, instead of in the bed"));
+    }
     menu.addSeparator();
     menu.addAction(tr("Front (as in stereo)"), this, [this] {
+        const bool object = pan_.object;
         pan_ = SurroundPan{};
+        pan_.object = object;
         emitChange(true);
     });
     menu.addAction(tr("Centre speaker (dialogue)"), this, [this] {

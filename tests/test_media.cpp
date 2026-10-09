@@ -67,6 +67,7 @@
 #include "render/AudioReactive.h"
 #include "render/VfxPull.h"
 #include "render/AafExport.h"
+#include "render/Adm.h"
 #include "render/Retime.h"
 #include "render/FaceRefine.h"
 #include "render/AudioFx.h"
@@ -4129,6 +4130,175 @@ private slots:
         // The gain recovers over the release after the burst: well down soon after, nearly back 5 releases later.
         QVERIFY(std::fabs(out[size_t(25000 + delay) * 2]) < 0.9f * std::fabs(in[size_t(25000) * 2]) + 1e-6f || std::fabs(in[size_t(25000) * 2]) < 0.01f);
         for (int i = 45000; i < 45100; ++i) QVERIFY(std::fabs(out[size_t(i + delay) * 2] - in[size_t(i) * 2]) < 0.002f);
+    }
+
+    void immersiveMixAndAdmMaster() {
+        // 440 Hz on A1 (a point at front left, in the bed) and 1 kHz on A2 (a point overhead, front right, an object).
+        const int rate = 48000;
+        auto tone = [&](double hz, const char* name) {
+            std::vector<float> x(size_t(rate) * 2);
+            for (size_t i = 0; i < x.size(); ++i) x[i] = float(0.3 * std::sin(2 * M_PI * hz * double(i) / rate));
+            const std::string f = path(name);
+            writeMonoWav(f, x, rate);
+            return f;
+        };
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        for (const std::string& f : {tone(440, "i440.wav"), tone(1000, "i1k.wav")}) p.media.push_back(probeOrFail(p, f));
+        QVERIFY(edit::placeMedia(p, s, p.media[0].id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(edit::placeMedia(p, s, p.media[1].id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 1}, false).ok);
+        s.audioLayout = "7.1.4";  // L R C LFE Lb Rb Ls Rs Ltf Rtf Ltr Rtr
+        SurroundPan& bed = s.audioTracks[0].surround;
+        bed.x = -0.5, bed.y = std::sqrt(0.75), bed.width = 0;
+        SurroundPan& obj = s.audioTracks[1].surround;
+        obj.x = M_SQRT1_2, obj.y = M_SQRT1_2, obj.z = 1, obj.width = 0, obj.object = true;
+        auto rms = [&](const std::vector<float>& buf, int ch, int channels) {
+            double acc = 0;
+            const size_t frames = buf.size() / size_t(channels);
+            for (size_t i = 0; i < frames; ++i) acc += double(buf[i * size_t(channels) + size_t(ch)]) * buf[i * size_t(channels) + size_t(ch)];
+            return std::sqrt(acc / double(frames));
+        };
+        // Heard in 7.1.4: the 440 in L alone, the 1 kHz in Rtf alone.
+        AudioMixer mixer;
+        const int n = rate / 2;
+        std::vector<float> twelve(size_t(n) * 12);
+        mixer.mixLayout(p, s, rate / 2, n, twelve.data());
+        const double atSpeaker = rms(twelve, 0, 12);
+        QVERIFY2(atSpeaker > 0.1, qPrintable(QString::number(atSpeaker)));
+        QVERIFY(std::fabs(rms(twelve, 9, 12) - atSpeaker) < 0.01);
+        for (int c : {1, 2, 3, 4, 5, 6, 7, 8, 10, 11}) QVERIFY2(rms(twelve, c, 12) < 1e-4, qPrintable(QString::number(c)));
+        // The mixer's channel layout for files: FFmpeg's 7.1.4.
+        ExportSettings wav = findExportPreset("Audio - WAV 24-bit")->settings;
+        wav.path = path("mix714.wav");
+        std::string err;
+        QVERIFY2(exportSequence(p, s, wav, nullptr, nullptr, &err), err.c_str());
+        MediaItem m;
+        QVERIFY(probeMedia(wav.path, m));
+        QCOMPARE(m.channels, 12);
+
+        // The ADM master: the 7.1.4 bed (BS.2094's pack) and the object, 13 channels.
+        const std::string adm = path("master.wav");
+        AdmSettings st;
+        st.title = "Immersive test";
+        AdmResult r;
+        QVERIFY2(exportAdmBwf(p, s, st, adm, &r, {}, &err), err.c_str());
+        QVERIFY(r.bedChannels == 12 && r.objects == 1 && r.bedPack == "AP_00010017" && r.samples == 2 * rate);
+        BwfInfo info;
+        QVERIFY2(readBwfInfo(adm, info, &err), err.c_str());
+        QVERIFY(info.channels == 13 && info.sampleRate == 48000 && info.bits == 24 && info.frames == 2 * rate);
+        QCOMPARE(info.chna.size(), size_t(13));
+        QVERIFY(info.chna[0].index == 1 && info.chna[0].uid == "ATU_00000001" && info.chna[0].trackFormat == "AT_00010001_01" &&
+                info.chna[0].pack == "AP_00010017");
+        QVERIFY(info.chna[8].trackFormat == "AT_00010022_01");  // Ltf, U+045
+        QVERIFY(info.chna[12].trackFormat == "AT_00031001_01" && info.chna[12].pack == "AP_00031001");
+        for (const char* want : {"audioProgrammeName=\"Immersive test\"", "audioPackFormatIDRef>AP_00010017<", "typeDefinition=\"Objects\"",
+                                 "audioObjectName=\"A2\"", "<cartesian>1</cartesian>", "coordinate=\"Z\">1.000000<", "duration=\"00:00:02.00000\""})
+            QVERIFY2(info.axml.find(want) != std::string::npos, want);
+        // In the file: the 440 in the bed's L, nothing of the 1 kHz in the bed, the 1 kHz as the object at the level it has
+        // at a speaker.
+        auto fileRms = [&](const std::string& file, std::vector<double>& out) {
+            QFile f(QString::fromStdString(file));
+            if (!f.open(QIODevice::ReadOnly)) return false;
+            const QByteArray all = f.readAll();
+            const auto* d = reinterpret_cast<const uint8_t*>(all.constData());
+            auto u16 = [&](size_t at) { return int(d[at] | (d[at + 1] << 8)); };
+            auto u32 = [&](size_t at) { return uint32_t(d[at]) | (uint32_t(d[at + 1]) << 8) | (uint32_t(d[at + 2]) << 16) | (uint32_t(d[at + 3]) << 24); };
+            int channels = 0, bits = 0, tag = 0;
+            size_t dataAt = 0, dataLen = 0;
+            for (size_t at = 12; at + 8 <= size_t(all.size());) {
+                const std::string id(all.constData() + at, 4);
+                const size_t len = u32(at + 4);
+                if (id == "fmt ") {
+                    tag = u16(at + 8), channels = u16(at + 10), bits = u16(at + 22);
+                    if (tag == 0xFFFE) tag = u16(at + 8 + 24);
+                }
+                if (id == "data") dataAt = at + 8, dataLen = std::min(len, size_t(all.size()) - at - 8);
+                at += 8 + len + (len & 1);
+            }
+            if (!channels || !dataAt) return false;
+            const size_t bytes = size_t(bits / 8), frames = dataLen / (bytes * size_t(channels));
+            out.assign(size_t(channels), 0.0);
+            for (size_t i = 0; i < frames; ++i)
+                for (int c = 0; c < channels; ++c) {
+                    const uint8_t* q = d + dataAt + (i * size_t(channels) + size_t(c)) * bytes;
+                    double v = 0;
+                    if (bits == 24) v = double(int32_t(uint32_t(q[0]) << 8 | uint32_t(q[1]) << 16 | uint32_t(q[2]) << 24) >> 8) / 8388608.0;
+                    else if (bits == 16) v = double(int16_t(q[0] | (q[1] << 8))) / 32768.0;
+                    else if (bits == 32 && tag == 3) {
+                        float fv;
+                        std::memcpy(&fv, q, 4);
+                        v = fv;
+                    } else if (bits == 32) {
+                        int32_t iv;
+                        std::memcpy(&iv, q, 4);
+                        v = double(iv) / 2147483648.0;
+                    }
+                    out[size_t(c)] += v * v;
+                }
+            for (double& v : out) v = std::sqrt(v / double(std::max<size_t>(1, frames)));
+            return true;
+        };
+        std::vector<double> ch;
+        QVERIFY(fileRms(adm, ch) && ch.size() == 13);
+        QVERIFY(std::fabs(ch[0] - atSpeaker) < 0.01);
+        QVERIFY2(ch[9] < 1e-4, qPrintable(QString::number(ch[9])));
+        QVERIFY2(std::fabs(ch[12] - atSpeaker) < 0.01, qPrintable(QString("%1 vs %2").arg(ch[12]).arg(atSpeaker)));
+        // 7.1.2 has a pack of its own (Dolby's bed, its pair overhead at the sides); stereo uses BS.2094's.
+        Sequence atmos = s;
+        atmos.audioLayout = "7.1.2";
+        QVERIFY(exportAdmBwf(p, atmos, st, path("bed712.wav"), &r, {}, &err) && r.bedPack == "AP_00011001" && r.bedChannels == 10);
+        QVERIFY(readBwfInfo(path("bed712.wav"), info) && info.axml.find("audioChannelFormatIDRef>AC_00010013<") != std::string::npos);
+        Sequence two = s;
+        two.audioLayout = "stereo";
+        two.audioTracks[1].surround.object = false;
+        QVERIFY(exportAdmBwf(p, two, st, path("bed20.wav"), &r, {}, &err) && r.bedPack == "AP_00010002" && r.objects == 0);
+        // Stopping leaves no file.
+        QVERIFY(!exportAdmBwf(p, s, st, path("stopped.wav"), nullptr, [](double) { return false; }, &err));
+        QVERIFY(!QFileInfo::exists(QString::fromStdString(path("stopped.wav"))));
+        // IMF folds an immersive mix down to its ear-level layout.
+        QCOMPARE(layoutChannels(earLevelLayout(s.audioLayout)), 8);
+
+        // EBU's ADM renderer (ear), when there is one, reads the master and renders it to 4+7+0: the 440 in M+030, the
+        // object mostly in U-045 (front right, overhead), nothing else at ear level.
+        const QByteArray ear = qgetenv("MONTAGE_TEST_EAR");
+        if (!ear.isEmpty()) {
+            QProcess run;
+            const QString rendered = QString::fromStdString(path("ear714.wav"));
+            run.start(QString::fromLocal8Bit(ear), {"--strict", "-s", "4+7+0", QString::fromStdString(adm), rendered});
+            QVERIFY(run.waitForFinished(120000));
+            QVERIFY2(run.exitCode() == 0, run.readAllStandardError().constData());
+            std::vector<double> e;
+            QVERIFY(fileRms(rendered.toStdString(), e) && e.size() == 12);  // M+030 M-030 M+000 LFE1 M+090 M-090 M+135 M-135 U+045 U-045 U+135 U-135
+            QVERIFY2(e[0] > 0.1 && e[9] > 0.1, qPrintable(QString("%1 %2").arg(e[0]).arg(e[9])));
+            for (int c : {1, 2, 4, 5, 6, 7}) QVERIFY2(e[size_t(c)] < 0.02, qPrintable(QString("%1: %2").arg(c).arg(e[size_t(c)])));
+            // (BS.2127's allocentric panner lets a little of a corner object into the neighbouring overhead speakers.)
+            QVERIFY2(e[9] > 3 * std::max({e[8], e[10], e[11]}), qPrintable(QString("%1 %2 %3 %4").arg(e[8]).arg(e[9]).arg(e[10]).arg(e[11])));
+        }
+
+        // Over MCP: A2 back to the bed, then an object again (overhead), and the master written.
+        const QString project = QString::fromStdString(path("immersive.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject res = call("montage_set_surround", {{"project", project}, {"layout", "5.1.4"},
+                                                        {"tracks", QJsonArray{QJsonObject{{"track", "A2"}, {"angle", 110}, {"height", 1}, {"object", true}}}}});
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        QCOMPARE(res.value("structuredContent").toObject().value("channels").toInt(), 10);
+        res = call("montage_export_adm", {{"project", project}, {"path", QString::fromStdString(path("mcp.wav"))}});
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        const QJsonObject out = res.value("structuredContent").toObject();
+        QCOMPARE(out.value("bed_pack").toString(), QString("AP_00010005"));
+        QCOMPARE(out.value("channels").toInt(), 11);
+        QCOMPARE(out.value("objects").toArray().at(0).toString(), QString("A2"));
+        res = call("montage_set_surround", {{"project", project}, {"layout", "9.1"}});
+        QVERIFY(res.value("isError").toBool());
     }
 
     void surroundMixExportAndStems() {

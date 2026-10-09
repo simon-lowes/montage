@@ -367,7 +367,7 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& settings,
     if (end <= first) return fail("The sequence is empty");
     const int64_t frames = (end - first) / step;
     if (frames < fps) return fail("A DCP must last at least a second (cinema servers refuse shorter reels)");
-    const int seqChannels = layoutChannels(s.audioLayout);
+    const int seqChannels = layoutChannels(earLevelLayout(s.audioLayout));  // immersive mixes fold their heights down
     const int channels = seqChannels == 8 ? 8 : 6;
 
     // The folder.
@@ -397,6 +397,7 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& settings,
         std::string err;
         if (!sound.open(QDir(folder).filePath(soundFile).toStdString(), soundId, fps, channels, settings.language, &err)) return fail(err);
         Sequence mixSeq = s;
+        mixSeq.audioLayout = earLevelLayout(s.audioLayout);
         const int perFrame = kSampleRate / fps;
         mixSeq.sampleRate = int(std::lround(perFrame * s.fpsValue() / step));
         const int64_t firstSample = int64_t(std::llround(double(first) * perFrame / step));
