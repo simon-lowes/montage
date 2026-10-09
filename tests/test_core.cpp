@@ -1102,6 +1102,57 @@ private slots:
         QVERIFY(!rippleDeleteRanges(p, s, {}).ok);
     }
 
+    void fillerWordsInManyLanguages() {
+        // Hesitations by language; with none known, only sounds that are no word anywhere.
+        QVERIFY(isFillerWord("Euh,", "fr") && isFillerWord("euh"));
+        QVERIFY(isFillerWord("äh", "de") && isFillerWord("Ähm."));
+        QVERIFY(isFillerWord("er", "en") && !isFillerWord("er", "de") && !isFillerWord("er"));  // German "he"
+        QVERIFY(isFillerWord("ehm", "it") && isFillerWord("yyy", "pl") && isFillerWord("ээ", "ru"));
+        QVERIFY(isFillerWord("えーと") && isFillerWord("嗯", "zh") && isFillerWord("으음", "ko"));
+        QVERIFY(!isFillerWord("este", "es") && !isFillerWord("ну", "ru"));  // words: discourse fillers only
+        QVERIFY(isFillerWord("um", "en-GB"));  // a region is fine
+        auto w = [](double a, double b, const char* t) { return TranscriptWord{a, b, t, 1}; };
+        // "It was, like, huge." / "I like it" / "It's good, you know." / "So [pause] like [pause] we".
+        const std::vector<TranscriptWord> words = {w(0.0, 0.2, "It"),    w(0.25, 0.4, "was,"), w(0.45, 0.6, "like,"), w(0.65, 0.9, "huge."),
+                                                   w(1.5, 1.6, "I"),     w(1.65, 1.8, "like"), w(1.85, 2.0, "it."),
+                                                   w(3.0, 3.2, "It's"),  w(3.25, 3.5, "good,"), w(3.55, 3.7, "you"), w(3.75, 3.9, "know."),
+                                                   w(5.0, 5.2, "So"),    w(5.6, 5.8, "like"), w(6.2, 6.4, "we"),
+                                                   w(7.0, 7.2, "Okay"),  w(7.25, 7.4, "so"), w(7.45, 7.7, "today")};
+        FillerOptions o;
+        o.language = "en";
+        std::vector<bool> m = fillerWordMask(words, o);
+        QVERIFY(std::none_of(m.begin(), m.end(), [](bool b) { return b; }));
+        o.discourse = true;
+        m = fillerWordMask(words, o);
+        QVERIFY(m[2]);              // "was, like, huge"
+        QVERIFY(!m[5]);             // "I like it" is no filler
+        QVERIFY(m[9] && m[10]);     // ", you know."
+        QVERIFY(m[12]);             // pauses either side
+        QVERIFY(!m[14] && !m[15]);  // "okay so" is not one of them...
+        o.custom = {"okay so"};
+        m = fillerWordMask(words, o);
+        QVERIFY(m[14] && m[15] && !m[16]);  // ...unless the editor says so, set off or not
+        // A phrase is one cut, to the next word when it follows closely.
+        const auto ranges = fillerWordRanges(words, 100, o);
+        QVERIFY(std::find(ranges.begin(), ranges.end(), FrameRange(355, 390)) != ranges.end());
+        QVERIFY(std::find(ranges.begin(), ranges.end(), FrameRange(700, 745)) != ranges.end());
+        // Another language's discourse fillers: French "genre" set off.
+        const std::vector<TranscriptWord> fr = {w(0, 0.3, "C'était,"), w(0.35, 0.6, "genre,"), w(0.65, 1.0, "énorme.")};
+        FillerOptions ofr;
+        ofr.language = "fr";
+        ofr.discourse = true;
+        QVERIFY(fillerWordMask(fr, ofr)[1]);
+        // The project keeps its own filler words.
+        Project p = makeDefaultProject();
+        p.fillerWords = {"okay so", "you see"};
+        const std::string path = (QDir::tempPath() + "/montage-fillers.montage").toStdString();
+        QVERIFY(saveProject(p, path));
+        Project back;
+        QVERIFY(loadProject(path, back));
+        QCOMPARE(back.fillerWords, p.fillerWords);
+        QFile::remove(QString::fromStdString(path));
+    }
+
     void transcriptsCaptionsAndSearch() {
         Transcript t;
         t.language = "en";

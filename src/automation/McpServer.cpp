@@ -1576,13 +1576,17 @@ void McpServer::Impl::addTools() {
 
     add("montage_cut_speech", "Cut by transcript",
         "Edit the cut by what is said, as in a text-based editor: remove every place a phrase is spoken, the filler words "
-        "(um, uh, er...), retakes (broken-off attempts the speaker started again) and/or pauses longer than "
+        "(um, uh, er... in the transcript's language, from English to Japanese; with discourse_fillers also \"like\", "
+        "\"you know\", \"I mean\"... where set off by commas or pauses; plus the project's own filler_words, which "
+        "filler_words also sets), retakes (broken-off attempts the speaker started again) and/or pauses longer than "
         "pauses_longer_than seconds (shortened to keep_pause). Every track is cut "
         "the same way and closed up, captions included. smooth_cuts puts a Smooth Cut (an optical-flow morph) on each join "
         "in the picture, to hide the jump. One undoable edit; use montage_find_phrase first to see what a phrase matches.",
         R"json({"type":"object","properties":{"project":{"type":"string"},
             "phrases":{"type":"array","items":{"type":"string"},"description":"Phrases to cut, every time they are said"},
             "fillers":{"type":"boolean","default":false},
+            "discourse_fillers":{"type":"boolean","default":false},
+            "filler_words":{"type":"array","items":{"type":"string"},"description":"The project's own filler words or phrases (replaces the list)"},
             "retakes":{"type":"boolean","default":false,"description":"Where the speaker broke off and started the same words again, keep only the last take"},
             "pauses_longer_than":{"type":"number","description":"Seconds; omit to keep pauses"},
             "keep_pause":{"type":"number","default":0.3},
@@ -1614,9 +1618,19 @@ void McpServer::Impl::addTools() {
                 found.append(QJsonObject{{"phrase", v.toString()}, {"times", n}});
             }
             int fillers = 0;
+            if (a.contains("filler_words")) {
+                l.project.fillerWords.clear();
+                for (const QJsonValue& v : a.value("filler_words").toArray())
+                    if (!v.toString().trimmed().isEmpty()) l.project.fillerWords.push_back(v.toString().trimmed().toStdString());
+            }
             if (a.value("fillers").toBool()) {
-                for (const FrameRange& r : fillerWordRanges(words, fps)) ranges.push_back(r);
-                fillers = int(std::count_if(words.begin(), words.end(), [](const TranscriptWord& w) { return isFillerWord(w.text); }));
+                FillerOptions fo;
+                fo.language = sequenceTranscriptLanguage(l.project, s);
+                fo.discourse = a.value("discourse_fillers").toBool();
+                fo.custom = l.project.fillerWords;
+                for (const FrameRange& r : fillerWordRanges(words, fps, fo)) ranges.push_back(r);
+                const std::vector<bool> mask = fillerWordMask(words, fo);
+                fillers = int(std::count(mask.begin(), mask.end(), true));
             }
             int retakes = 0;
             if (a.value("retakes").toBool()) {
@@ -1632,7 +1646,10 @@ void McpServer::Impl::addTools() {
                 pauses = int(p.size());
                 ranges.insert(ranges.end(), p.begin(), p.end());
             }
-            if (mergeRanges(ranges).empty()) return ok("Nothing to cut", QJsonObject{{"phrases", found}, {"removed_seconds", 0}});
+            if (mergeRanges(ranges).empty()) {
+                if (a.contains("filler_words")) save(l);  // the list is kept for next time
+                return ok("Nothing to cut", QJsonObject{{"phrases", found}, {"removed_seconds", 0}});
+            }
             const FrameTime smooth = a.value("smooth_cuts").toBool() ? std::max<FrameTime>(2, FrameTime(std::lround(fps * 0.2))) : 0;
             const edit::Result r = rippleDeleteRanges(l.project, s, ranges, smooth);
             if (!r.ok) return fail(QString::fromStdString(r.error));

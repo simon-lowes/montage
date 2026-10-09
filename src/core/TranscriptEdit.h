@@ -17,6 +17,8 @@ namespace montage {
 // unmuted (or soloed) audio tracks, or from video clips when no audio clip
 // has a transcript. The same word from linked or stacked copies counts once.
 std::vector<TranscriptWord> sequenceTranscriptWords(const Project& p, const Sequence& seq);
+// The language (ISO 639-1) all the sequence's transcribed clips share, "" when they differ or none is known.
+std::string sequenceTranscriptLanguage(const Project& p, const Sequence& seq);
 
 using FrameRange = std::pair<FrameTime, FrameTime>;  // [first, end)
 
@@ -33,10 +35,19 @@ edit::Result rippleDeleteRanges(Project& p, Sequence& s, std::vector<FrameRange>
 // range are shortened, and later captions move up.
 void rippleCaptions(Sequence& s, FrameTime a, FrameTime b);
 
-// "um", "uh", "erm", "hmm"... (case and punctuation ignored).
-bool isFillerWord(const std::string& word);
+// Filler words (Descript's and Premiere's filler word removal), in English, Spanish, French, German, Italian,
+// Portuguese, Dutch, Swedish, Danish, Norwegian, Polish, Czech, Russian, Turkish, Japanese, Chinese and Korean.
+struct FillerOptions {
+    std::string language;             // ISO 639-1 of the speech; "" = any of them (only sounds that are never words)
+    bool discourse = false;           // also "like", "you know", "I mean", "genre", "halt"... when set off by commas or pauses
+    std::vector<std::string> custom;  // the editor's own words or phrases (Project::fillerWords), always
+};
+// Hesitations: "um", "uh", "euh", "äh", "eh", "えーと", "嗯"... (case and punctuation ignored).
+bool isFillerWord(const std::string& word, const std::string& language = {});
+// Which words are fillers; a phrase ("you know") marks each of its words.
+std::vector<bool> fillerWordMask(const std::vector<TranscriptWord>& words, const FillerOptions& o = {});
 // Frame ranges of the filler words (to the next word when it follows closely).
-std::vector<FrameRange> fillerWordRanges(const std::vector<TranscriptWord>& words, double fps);
+std::vector<FrameRange> fillerWordRanges(const std::vector<TranscriptWord>& words, double fps, const FillerOptions& o = {});
 // Silences between words longer than `minPause` seconds, shortened to `keep` seconds.
 std::vector<FrameRange> pauseRanges(const std::vector<TranscriptWord>& words, double fps, double minPause = 1.0,
                                     double keep = 0.3);

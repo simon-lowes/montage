@@ -368,6 +368,7 @@ struct Project {
     std::vector<std::string> bins;  // bin paths ("Interviews/Day 1"), including empty ones
     std::vector<SmartBin> smartBins;
     std::vector<Person> people;  // the people found in the footage (FaceIndex.h), with their names
+    std::vector<std::string> fillerWords;  // the editor's own filler words or phrases (core/TranscriptEdit.h)
     Id activeSequence = 0;
     Id nextId = 1;
 

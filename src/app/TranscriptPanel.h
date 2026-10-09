@@ -10,6 +10,7 @@
 
 #include "core/Model.h"
 #include "core/Transcript.h"
+#include "core/TranscriptEdit.h"
 #include "render/PaperEdit.h"
 
 class QComboBox;
@@ -39,6 +40,10 @@ public:
     std::pair<int, int> selectedWords() const;
     // Finds `text` (case-insensitive, whole words); returns the number of matches and selects the next one.
     int find(const QString& text, bool backwards = false);
+    // What counts as a filler here: the transcripts' language, "like" / "you know" when chosen, the project's own.
+    FillerOptions fillerOptions() const;
+    void setDiscourseFillers(bool on);
+    bool discourseFillers() const { return discourse_; }
 
 public slots:
     void deleteSelection();     // Sequence: ripple-delete the selected words
@@ -98,6 +103,8 @@ private:
     QToolButton* paperBuildBtn_;
     QListWidget* paperList_;
     std::vector<TranscriptWord> words_;
+    std::string language_;   // of the words' transcripts, "" when unknown or mixed
+    bool discourse_ = false;  // "like", "you know"... count as fillers too
     std::vector<Span> spans_;
     QString signature_;
     std::vector<std::pair<int, int>> found_;  // word ranges matching the search

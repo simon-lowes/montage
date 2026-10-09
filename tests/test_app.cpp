@@ -5326,6 +5326,33 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(panel);
         panel->setMode(TranscriptPanel::Mode::Sequence);
         QCOMPARE(panel->words().size(), size_t(8));
+        // What counts as a filler: the transcript's language, the discourse option, the project's own words.
+        QVERIFY(panel->fillerOptions().language.empty());
+        QVERIFY(state()->edit("Language", [media](Project& p, Sequence&) {
+            auto lt = std::make_shared<Transcript>(*p.findMedia(media)->transcript);
+            lt->language = "en";
+            p.findMedia(media)->transcript = lt;
+            return true;
+        }));
+        QApplication::processEvents();
+        QCOMPARE(panel->fillerOptions().language, std::string("en"));
+        QVERIFY(panel->findChild<QAction*>("discourseFillers") && panel->findChild<QAction*>("customFillers"));
+        panel->setDiscourseFillers(true);
+        QVERIFY(appSettings().value("transcript/discourseFillers").toBool());
+        QVERIFY(panel->fillerOptions().discourse && panel->findChild<QAction*>("discourseFillers")->isChecked());
+        panel->setDiscourseFillers(false);
+        QVERIFY(state()->edit("Fillers", [](Project& p, Sequence&) {
+            p.fillerWords = {"ask not"};
+            return true;
+        }));
+        QApplication::processEvents();
+        QCOMPARE(panel->fillerOptions().custom, std::vector<std::string>{"ask not"});
+        const std::vector<bool> mask = fillerWordMask(panel->words(), panel->fillerOptions());
+        QVERIFY(mask[2] && mask[6] && mask[7] && !mask[0] && !mask[1]);
+        state()->undo();
+        state()->undo();
+        QApplication::processEvents();
+        QVERIFY(panel->fillerOptions().custom.empty());
         // Search, including a partly typed last word.
         QCOMPARE(panel->find("fellow amer"), 1);
         QCOMPARE(panel->selectedWords(), std::make_pair(4, 5));

@@ -82,7 +82,37 @@ TranscriptPanel::TranscriptPanel(EditorState* state, QWidget* parent) : QWidget(
 
     auto* bottom = new QHBoxLayout;
     deleteBtn_ = button(this, tr("Delete"), tr("Cut the selected words out of the sequence and close the gap (Delete)"));
-    fillersBtn_ = button(this, tr("Remove Fillers"), tr("Cut out um, uh, er and similar filler words"));
+    fillersBtn_ = button(this, tr("Remove Fillers"), tr("Cut out um, uh, er and similar filler words, in the transcript's language"));
+    fillersBtn_->setObjectName(QStringLiteral("removeFillers"));
+    {
+        // Options: discourse fillers, and the project's own filler words.
+        auto* menu = new QMenu(fillersBtn_);
+        QAction* discourse = menu->addAction(tr("Include \u201clike\u201d, \u201cyou know\u201d, \u201cI mean\u201d\u2026"));
+        discourse->setObjectName(QStringLiteral("discourseFillers"));
+        discourse->setCheckable(true);
+        discourse->setToolTip(tr("Words that fill only when set off by commas or pauses, in the transcript's language"));
+        discourse_ = appSettings().value(QStringLiteral("transcript/discourseFillers"), false).toBool();
+        discourse->setChecked(discourse_);
+        connect(discourse, &QAction::toggled, this, &TranscriptPanel::setDiscourseFillers);
+        menu->addAction(tr("Custom Filler Words\u2026"), this, [this] {
+            bool ok = false;
+            QStringList now;
+            for (const std::string& w : state_->project().fillerWords) now << QString::fromStdString(w);
+            const QString text = QInputDialog::getMultiLineText(this, tr("Custom Filler Words"),
+                                                                tr("Words or phrases to remove as fillers, one per line:"), now.join('\n'), &ok);
+            if (!ok) return;
+            std::vector<std::string> words;
+            for (const QString& line : text.split('\n'))
+                if (!line.trimmed().isEmpty()) words.push_back(line.trimmed().toStdString());
+            state_->edit(tr("Custom Filler Words"), [words](Project& p, Sequence&) {
+                if (p.fillerWords == words) return false;
+                p.fillerWords = words;
+                return true;
+            });
+        })->setObjectName(QStringLiteral("customFillers"));
+        fillersBtn_->setMenu(menu);
+        fillersBtn_->setPopupMode(QToolButton::MenuButtonPopup);
+    }
     retakesBtn_ = button(this, tr("Remove Retakes"), tr("Where the speaker broke off and started again, keep only the last take"));
     retakesBtn_->setObjectName(QStringLiteral("removeRetakes"));
     pausesBtn_ = button(this, tr("Shorten Pauses..."), tr("Shorten silences between words"));
@@ -217,12 +247,17 @@ void TranscriptPanel::setMode(Mode m) {
 void TranscriptPanel::rebuild() {
     std::vector<TranscriptWord> words;
     QString empty;
+    std::string language;
     if (mode_ == Mode::Sequence) {
-        if (const Sequence* s = state_->sequence()) words = sequenceTranscriptWords(state_->project(), *s);
+        if (const Sequence* s = state_->sequence()) {
+            words = sequenceTranscriptWords(state_->project(), *s);
+            language = sequenceTranscriptLanguage(state_->project(), *s);
+        }
         empty = tr("Nothing in this sequence has been transcribed. Right-click clips in the Media panel and choose "
                    "Transcribe..., then edit the cut by editing its text here.");
     } else {
         const MediaItem* m = state_->project().findMedia(state_->sourceMedia());
+        if (m && m->transcript) language = m->transcript->language;
         if (m && m->transcript)
             for (const auto& seg : m->transcript->segments)
                 for (TranscriptWord w : seg.words) {
@@ -234,11 +269,15 @@ void TranscriptPanel::rebuild() {
                          .arg(QString::fromStdString(m->name));
     }
     // Rebuild the text only when the words or their timing changed.
-    QString sig = QString::number(int(mode_)) + QString::number(qulonglong(words.size()));
+    QString sig = QString::number(int(mode_)) + QString::number(qulonglong(words.size())) + QString::fromStdString(language) +
+                  QString::number(int(discourse_));
+    for (const std::string& w : state_->project().fillerWords) sig += QString::fromStdString(w) + QLatin1Char('|');
     for (const auto& w : words) sig += QString::fromStdString(w.text + w.speaker) + QString::number(std::lround(w.start * 100));
     if (sig == signature_) return;
     signature_ = sig;
     words_ = std::move(words);
+    language_ = language;
+    const std::vector<bool> fillerMask = fillerWordMask(words_, fillerOptions());
     spans_.clear();
     found_.clear();
     const int scroll = text_->verticalScrollBar()->value();
@@ -278,7 +317,7 @@ void TranscriptPanel::rebuild() {
             cur.insertText(QStringLiteral(" "), normal);
         }
         const QString t = QString::fromStdString(w.text);
-        const bool isFiller = isFillerWord(w.text);
+        const bool isFiller = fillerMask[i];
         fillers += isFiller ? 1 : 0;
         uncertain += w.probability < 0.4f ? 1 : 0;
         spans_.push_back({cur.position(), int(t.size()), int(i), w.start});
@@ -520,14 +559,33 @@ FrameTime TranscriptPanel::smoothCutFrames() const {
     return smoothBtn_->isChecked() ? std::max<FrameTime>(2, FrameTime(std::lround(fps() * 0.2))) : 0;
 }
 
+FillerOptions TranscriptPanel::fillerOptions() const {
+    FillerOptions o;
+    o.language = language_;
+    o.discourse = discourse_;
+    o.custom = state_->project().fillerWords;
+    return o;
+}
+
+void TranscriptPanel::setDiscourseFillers(bool on) {
+    if (discourse_ == on) return;
+    discourse_ = on;
+    appSettings().setValue(QStringLiteral("transcript/discourseFillers"), on);
+    if (auto* a = findChild<QAction*>(QStringLiteral("discourseFillers")); a && a->isChecked() != on) a->setChecked(on);
+    signature_.clear();
+    rebuild();
+}
+
 void TranscriptPanel::removeFillerWords() {
     if (mode_ != Mode::Sequence) return;
-    const auto ranges = fillerWordRanges(words_, fps());
+    const FillerOptions o = fillerOptions();
+    const auto ranges = fillerWordRanges(words_, fps(), o);
     if (ranges.empty()) {
         state_->message(tr("No filler words found"));
         return;
     }
-    const int n = int(std::count_if(words_.begin(), words_.end(), [](const TranscriptWord& w) { return isFillerWord(w.text); }));
+    const std::vector<bool> mask = fillerWordMask(words_, o);
+    const int n = int(std::count(mask.begin(), mask.end(), true));
     if (state_->apply(tr("Remove Filler Words"), [ranges, smooth = smoothCutFrames()](Project& p, Sequence& s) { return rippleDeleteRanges(p, s, ranges, smooth); }))
         state_->message(tr("Removed %n filler word(s)", "", n));
 }

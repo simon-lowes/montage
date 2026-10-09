@@ -6533,6 +6533,15 @@ private slots:
         std::string said;
         for (const TranscriptWord& w : sequenceTranscriptWords(back, bs)) said += (said.empty() ? "" : " ") + w.text;
         QCOMPARE(QString::fromStdString(said), QString("So I think we should go. really."));
+        // The project's own filler words: set, used and kept.
+        r = call(QJsonObject{{"project", project}, {"fillers", true}, {"discourse_fillers", true}, {"filler_words", QJsonArray{"really"}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("fillers").toInt(), 1);
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.fillerWords, std::vector<std::string>{"really"});
+        said.clear();
+        for (const TranscriptWord& w : sequenceTranscriptWords(back, *back.active())) said += (said.empty() ? "" : " ") + w.text;
+        QCOMPARE(QString::fromStdString(said), QString("So I think we should go."));
         // Without a transcript there is nothing to go on.
         Project bare = makeDefaultProject();
         const QString empty = QString::fromStdString(path("bare.montage"));

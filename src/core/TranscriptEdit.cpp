@@ -10,6 +10,19 @@
 
 namespace montage {
 
+std::string sequenceTranscriptLanguage(const Project& p, const Sequence& seq) {
+    std::string language;
+    bool mixed = false;
+    for (const Track& t : seq.audioTracks)
+        for (const Clip& c : t.clips) {
+            const MediaItem* m = p.findMedia(c.mediaId);
+            if (!m || !m->transcript || m->transcript->language.empty()) continue;
+            if (language.empty()) language = m->transcript->language;
+            else if (language != m->transcript->language) mixed = true;
+        }
+    return mixed ? std::string() : language;
+}
+
 std::vector<TranscriptWord> sequenceTranscriptWords(const Project& p, const Sequence& seq) {
     const double fps = seq.fpsValue() > 0 ? seq.fpsValue() : 30.0;
     // Every transcribed word heard in the cut, in timeline seconds.
@@ -132,23 +145,136 @@ edit::Result rippleDeleteRanges(Project& p, Sequence& s, std::vector<FrameRange>
     return res;
 }
 
-bool isFillerWord(const std::string& word) {
-    static const QSet<QString> fillers = {"um", "umm", "ummm", "uh", "uhh", "uhm", "er", "erm", "err", "ah", "ahh",
-                                          "hmm", "hm", "mm", "mmm", "mhm", "eh"};
+namespace {
+
+// A word as compared: lower case, letters only (any script).
+QString fillerKey(const std::string& word) {
     QString w = QString::fromStdString(word).toLower();
     static const QRegularExpression nonLetters(QStringLiteral("[^\\p{L}]"));
     w.remove(nonLetters);
-    return fillers.contains(w);
+    return w;
 }
 
-std::vector<FrameRange> fillerWordRanges(const std::vector<TranscriptWord>& words, double fps) {
+struct FillerLanguage {
+    const char* code;
+    std::vector<const char*> hesitations;  // sounds, never words in this language
+    std::vector<const char*> discourse;    // words and phrases that fill when set off ("like", "you know")
+    std::vector<const char*> safe;         // of the hesitations, those that are no word in any language either
+};
+
+const std::vector<FillerLanguage>& fillerLanguages() {
+    static const std::vector<FillerLanguage> all = {
+        {"en", {"um", "umm", "ummm", "uh", "uhh", "uhm", "er", "erm", "err", "ah", "ahh", "eh", "hmm", "hm", "mm", "mmm", "mhm"},
+         {"like", "you know", "i mean", "basically", "actually", "literally", "sort of", "kind of", "you see", "okay so", "right"},
+         {"um", "umm", "ummm", "uh", "uhh", "uhm", "erm", "ahh", "hmm", "hm", "mm", "mmm", "mhm"}},
+        {"es", {"eh", "ehh", "em", "emm", "mm", "mmm", "hmm"}, {"o sea", "este", "pues", "bueno", "digamos", "vale", "sabes", "tipo"}, {"ehh", "emm"}},
+        {"fr", {"euh", "euhh", "heu", "hum", "bah", "ben", "mm", "hmm"}, {"genre", "du coup", "en fait", "tu vois", "quoi", "voilà", "bon"},
+         {"euh", "euhh", "heu"}},
+        {"de", {"äh", "ähm", "äähm", "öh", "öhm", "hm", "hmm", "mm", "eh"}, {"also", "halt", "quasi", "sozusagen", "irgendwie", "ne", "naja", "genau"},
+         {"äh", "ähm", "äähm", "öh", "öhm"}},
+        {"it", {"ehm", "eh", "ehh", "mm", "mmm", "hmm"}, {"cioè", "tipo", "allora", "praticamente", "insomma", "diciamo", "comunque"}, {"ehm"}},
+        {"pt", {"hã", "ahn", "éé", "hum", "hmm", "mm", "eh"}, {"tipo", "né", "então", "sabe", "assim", "pois"}, {"ahn", "éé"}},
+        {"nl", {"eh", "ehm", "uh", "uhm", "hmm", "mm"}, {"zeg maar", "eigenlijk", "nou", "dus", "weet je"}, {"ehm"}},
+        {"sv", {"öh", "öhm", "eh", "äh", "hmm", "mm"}, {"liksom", "typ", "alltså", "ba", "asså"}, {"öh", "öhm"}},
+        {"da", {"øh", "øhm", "æh", "hmm", "mm"}, {"altså", "ligesom", "sådan", "ikke"}, {"øh", "øhm", "æh"}},
+        {"no", {"eh", "ehm", "øh", "hmm", "mm"}, {"liksom", "altså", "på en måte", "ikke sant"}, {"øh"}},
+        {"pl", {"yyy", "yy", "eee", "ee", "mmm", "hmm"}, {"no", "jakby", "wiesz", "znaczy", "po prostu", "tak jakby"}, {"yyy", "eee"}},
+        {"cs", {"ehm", "eee", "hmm", "mm"}, {"jako", "prostě", "vlastně", "takže", "no"}, {"eee"}},
+        {"ru", {"э", "ээ", "эээ", "эм", "мм", "хм", "ммм"}, {"ну", "типа", "как бы", "короче", "это самое", "вот", "значит"},
+         {"э", "ээ", "эээ", "эм", "мм", "хм", "ммм"}},
+        {"tr", {"ıı", "ııı", "ee", "eee", "hmm", "mm"}, {"şey", "yani", "işte", "hani"}, {"ııı", "eee"}},
+        {"ja", {"えー", "えーと", "えっと", "ええと", "あー", "うーん", "んー"}, {"あの", "あのー", "その", "なんか", "まあ"},
+         {"えー", "えーと", "えっと", "ええと", "うーん", "んー"}},
+        {"zh", {"嗯", "呃", "额", "啊", "唔"}, {"那个", "就是", "然后", "这个"}, {"嗯", "呃", "唔"}},
+        {"ko", {"음", "어", "어어", "으음", "음음"}, {"그", "저", "뭐", "그러니까", "약간"}, {"으음", "음음"}},
+    };
+    return all;
+}
+
+const FillerLanguage* fillerLanguage(const std::string& code) {
+    for (const FillerLanguage& l : fillerLanguages())
+        if (code.size() >= 2 && code.compare(0, 2, l.code) == 0) return &l;
+    return nullptr;
+}
+
+// The words of a phrase as compared.
+std::vector<QString> phraseKeys(const std::string& phrase) {
+    std::vector<QString> keys;
+    for (const QString& part : QString::fromStdString(phrase).split(QLatin1Char(' '), Qt::SkipEmptyParts))
+        if (const QString k = fillerKey(part.toStdString()); !k.isEmpty()) keys.push_back(k);
+    return keys;
+}
+
+bool endsWithComma(const std::string& w) {
+    for (auto it = w.rbegin(); it != w.rend(); ++it) {
+        if (*it == ',' || *it == '.' || *it == '!' || *it == '?' || *it == ';' || *it == ':') return true;
+        if (*it != ' ' && *it != '"' && *it != '\'') return false;
+    }
+    return false;
+}
+
+}  // namespace
+
+bool isFillerWord(const std::string& word, const std::string& language) {
+    const QString w = fillerKey(word);
+    if (w.isEmpty()) return false;
+    auto in = [&](const std::vector<const char*>& list) {
+        return std::any_of(list.begin(), list.end(), [&](const char* f) { return w == QString::fromUtf8(f); });
+    };
+    if (const FillerLanguage* l = fillerLanguage(language)) return in(l->hesitations);
+    // The language unknown: the hesitations that are no word anywhere.
+    for (const FillerLanguage& l : fillerLanguages())
+        if (in(l.safe)) return true;
+    return false;
+}
+
+std::vector<bool> fillerWordMask(const std::vector<TranscriptWord>& words, const FillerOptions& o) {
+    std::vector<bool> mask(words.size(), false);
+    std::vector<QString> keys;
+    keys.reserve(words.size());
+    for (const TranscriptWord& w : words) keys.push_back(fillerKey(w.text));
+    for (size_t i = 0; i < words.size(); ++i) mask[i] = isFillerWord(words[i].text, o.language);
+    // Phrases: the editor's own always, the language's discourse fillers only when set off (a comma or a pause either side).
+    auto mark = [&](const std::string& phrase, bool setOff) {
+        const std::vector<QString> p = phraseKeys(phrase);
+        if (p.empty()) return;
+        for (size_t i = 0; i + p.size() <= words.size(); ++i) {
+            bool match = true;
+            for (size_t k = 0; k < p.size() && match; ++k) match = keys[i + k] == p[k];
+            if (!match) continue;
+            const size_t last = i + p.size() - 1;
+            if (setOff) {
+                const bool before = i == 0 || endsWithComma(words[i - 1].text) || words[i].start - words[i - 1].end >= 0.3;
+                const bool after = last + 1 == words.size() || endsWithComma(words[last].text) || words[last + 1].start - words[last].end >= 0.3;
+                if (!before || !after) continue;
+            }
+            for (size_t k = i; k <= last; ++k) mask[k] = true;
+        }
+    };
+    for (const std::string& c : o.custom) mark(c, false);
+    if (o.discourse) {
+        if (const FillerLanguage* l = fillerLanguage(o.language)) {
+            for (const char* d : l->discourse) mark(d, true);
+        } else {
+            for (const FillerLanguage& l : fillerLanguages())
+                for (const char* d : l.discourse) mark(d, true);
+        }
+    }
+    return mask;
+}
+
+std::vector<FrameRange> fillerWordRanges(const std::vector<TranscriptWord>& words, double fps, const FillerOptions& o) {
+    const std::vector<bool> mask = fillerWordMask(words, o);
     std::vector<FrameRange> out;
     for (size_t i = 0; i < words.size(); ++i) {
-        if (!isFillerWord(words[i].text)) continue;
-        double end = words[i].end;
+        if (!mask[i]) continue;
+        size_t j = i;
+        while (j + 1 < words.size() && mask[j + 1]) ++j;  // a phrase, or fillers in a row, as one cut
+        double end = words[j].end;
         // Take the short breath after the filler too, so the next word starts cleanly.
-        if (i + 1 < words.size() && words[i + 1].start - end < 0.25) end = words[i + 1].start;
+        if (j + 1 < words.size() && words[j + 1].start - end < 0.25) end = words[j + 1].start;
         out.emplace_back(FrameTime(std::llround(words[i].start * fps)), FrameTime(std::llround(end * fps)));
+        i = j;
     }
     return mergeRanges(out);
 }
