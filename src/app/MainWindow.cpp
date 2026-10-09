@@ -62,6 +62,7 @@
 #include "audio/PluginEffect.h"
 #include "core/GradeVersions.h"
 #include "core/AudioChannels.h"
+#include "render/ClipPlacement.h"
 #include "core/Chapters.h"
 #include "core/MarkerList.h"
 #include "render/AudioReactive.h"
@@ -850,6 +851,19 @@ void MainWindow::buildMenus() {
             })->setObjectName(step > 0 ? QStringLiteral("gradeNextVersion") : QStringLiteral("gradePreviousVersion"));
     }
     add(clipM, tr("Animate to Audio…"), QKeySequence(), [this] { animateToAudioDialog(); })->setObjectName(QStringLiteral("animateToAudio"));
+    {
+        // Align in Frame: the selected pictures lined up with the frame, inside the action-safe margin.
+        QMenu* align = clipM->addMenu(tr("Align in Frame"));
+        align->setObjectName(QStringLiteral("alignMenu"));
+        const std::pair<QString, const char*> places[] = {{tr("Centre"), "center"},         {tr("Top"), "top"},
+                                                         {tr("Bottom"), "bottom"},         {tr("Left"), "left"},
+                                                         {tr("Right"), "right"},           {tr("Top Left"), "top_left"},
+                                                         {tr("Top Right"), "top_right"},   {tr("Bottom Left"), "bottom_left"},
+                                                         {tr("Bottom Right"), "bottom_right"}};
+        for (const auto& [label, name] : places)
+            add(align, label, QKeySequence(), [this, n = std::string(name)] { alignSelection(n); })
+                ->setObjectName(QStringLiteral("align_") + QString::fromLatin1(name));
+    }
     {
         QMenu* channels = clipM->addMenu(tr("Audio Channels"));
         channels->setObjectName(QStringLiteral("audioChannelsMenu"));
@@ -1897,6 +1911,28 @@ bool MainWindow::animateSelectionToAudio(Id effect, const std::string& param, in
     });
     QApplication::restoreOverrideCursor();
     return ok;
+}
+
+bool MainWindow::alignSelection(const std::string& where) {
+    Align a;
+    if (!parseAlign(where, a)) return false;
+    const auto sel = state_->selectedClips();
+    if (sel.empty()) return false;
+    const FrameTime playhead = state_->playhead();
+    return state_->apply(tr("Align in Frame"), [sel, a, playhead](Project& p, Sequence& s) {
+        edit::Result last = edit::Result::fail(tr("Select picture clips").toStdString());
+        bool any = false;
+        for (Id id : sel) {
+            const Clip* c = edit::clipById(s, id);
+            if (!c) continue;
+            // At the playhead when it is over the clip, else at its start.
+            const FrameTime t = c->contains(playhead) ? playhead : c->start;
+            const edit::Result r = edit::alignClip(p, s, id, t, a);
+            if (r.ok) any = true;
+            else last = r;
+        }
+        return any ? edit::Result{} : last;
+    });
 }
 
 bool MainWindow::setSelectionChannels(const std::vector<int>& channels) {

@@ -22,6 +22,7 @@
 #include "core/GradeVersions.h"
 #include "core/AudioChannels.h"
 #include "render/Spherical.h"
+#include "render/ClipPlacement.h"
 #include "core/AutoTag.h"
 #include "core/Automation.h"
 #include "core/CaptionTools.h"
@@ -3398,6 +3399,78 @@ void McpServer::Impl::addTools() {
             for (Id x : r.created) created.append(double(x));
             return ok(QStringLiteral("Source channels: %1\n").arg(QJsonDocument(names).toJson(QJsonDocument::Compact).constData()) + lines.join('\n'),
                       QJsonObject{{"source_channels", names}, {"clips", clips}, {"created", created}});
+        });
+
+    add("montage_transform", "Position, scale and crop a clip",
+        "Set a picture clip's transform, as the Program monitor's on-screen box does: `x` and `y` (pixels from the "
+        "frame's centre), `scale`, `scale_x`, `scale_y` (percent), `rotation` (degrees), `opacity` (percent), "
+        "`crop_left`/`crop_right`/`crop_top`/`crop_bottom` (percent) and `fit` (fit, fill, stretch, none). With `at` (a "
+        "sequence frame inside the clip) the values become keys there, so several calls animate it; otherwise "
+        "settings without keys take the value (animated ones are keyed at the clip's start). `align` then lines the "
+        "picture up with the frame (center, top, bottom, left, right, top_left, top_right, bottom_left, bottom_right), "
+        "`inset` (a share of the frame's height, default 0.05) in from the edges, for picture-in-picture, logos and "
+        "lower thirds. Returns the picture's corners in the frame.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},"at":{"type":"integer"},
+            "x":{"type":"number"},"y":{"type":"number"},"scale":{"type":"number"},"scale_x":{"type":"number"},"scale_y":{"type":"number"},
+            "rotation":{"type":"number"},"opacity":{"type":"number"},"crop_left":{"type":"number"},"crop_right":{"type":"number"},
+            "crop_top":{"type":"number"},"crop_bottom":{"type":"number"},"fit":{"type":"string","enum":["fit","fill","stretch","none"]},
+            "align":{"type":"string","enum":["center","top","bottom","left","right","top_left","top_right","bottom_left","bottom_right"]},
+            "inset":{"type":"number","default":0.05}},"required":["project","clip"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            Clip& c = clipArg(l, a);
+            const Id id = c.id;
+            const auto loc = edit::locate(s, id);
+            if (!loc || loc->track.kind != TrackKind::Video) throw ArgError{"Only picture clips have a transform"};
+            FrameTime t = c.start;
+            const bool keyed = a.contains("at");
+            if (keyed) {
+                t = FrameTime(a.value("at").toInteger());
+                if (t < c.start || t >= c.end()) throw ArgError{"at is a frame inside the clip"};
+            }
+            if (c.motion.empty()) c.motion = makeEffect(l.project, "transform");
+            const FrameTime lt = t - c.start;
+            static const std::pair<const char*, const char*> fields[] = {
+                {"x", "pos_x"},           {"y", "pos_y"},           {"scale", "scale"},       {"scale_x", "scale_x"},
+                {"scale_y", "scale_y"},   {"rotation", "rotation"}, {"opacity", "opacity"},   {"crop_left", "crop_left"},
+                {"crop_right", "crop_right"}, {"crop_top", "crop_top"}, {"crop_bottom", "crop_bottom"}};
+            int changed = 0;
+            for (const auto& [arg, param] : fields) {
+                if (!a.contains(arg)) continue;
+                double v = a.value(arg).toDouble();
+                if (std::string(param).rfind("crop", 0) == 0 || std::string(param) == "opacity") v = std::clamp(v, 0.0, 100.0);
+                if (std::string(param).rfind("scale", 0) == 0) v = std::max(0.0, v);
+                Param& prm = c.motion.params[param];
+                if (keyed) prm.addKey(lt, v, Interp::Smooth);
+                else prm.set(lt, v);
+                ++changed;
+            }
+            if (a.contains("fit")) {
+                static const QStringList fits = {"fit", "fill", "stretch", "none"};
+                const int k = int(fits.indexOf(a.value("fit").toString()));
+                if (k < 0) throw ArgError{"fit is fit, fill, stretch or none"};
+                c.motion.params["fit"] = Param(double(k));
+                ++changed;
+            }
+            if (a.contains("align")) {
+                Align where;
+                if (!parseAlign(a.value("align").toString().toStdString(), where)) throw ArgError{"Unknown align"};
+                if (keyed) {
+                    // A key at `at` first, so the move lands there only.
+                    for (const char* p : {"pos_x", "pos_y"}) c.motion.params[p].addKey(lt, c.motion.p(p, lt), Interp::Smooth);
+                }
+                check(edit::alignClip(l.project, s, id, t, where, a.value("inset").toDouble(0.05)));
+                ++changed;
+            }
+            if (!changed) throw ArgError{"Give a setting to change, or align"};
+            save(l);
+            std::array<double, 4> xs, ys;
+            QJsonArray corners;
+            if (clipFrameQuad(l.project, s, *edit::clipById(s, id), t, xs, ys))
+                for (int k = 0; k < 4; ++k) corners.append(QJsonArray{std::round(xs[size_t(k)] * 10) / 10, std::round(ys[size_t(k)] * 10) / 10});
+            return ok(QStringLiteral("The picture lies at %1").arg(QString::fromUtf8(QJsonDocument(corners).toJson(QJsonDocument::Compact))),
+                      QJsonObject{{"corners", corners}});
         });
 
     add("montage_reframe_360", "Reframe 360° video",

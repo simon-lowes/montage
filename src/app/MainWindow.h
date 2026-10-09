@@ -189,6 +189,9 @@ public:
     // Audio channels (core/AudioChannels.h) of the selected clips' sound: play `channels` (0-based; empty = the mix),
     // or split each into a clip per channel (per pair with `pairs`); one undo step each.
     bool setSelectionChannels(const std::vector<int>& channels);
+    // Align in Frame (render/ClipPlacement.h): the selected picture clips lined up with the frame inside the
+    // action-safe margin ("center", "top_left"...); one undo step.
+    bool alignSelection(const std::string& where);
     bool splitSelectionChannels(bool pairs);
     // Apply Default Transitions to Selection: both ends of every selected clip (of one kind with `only`); one undo step.
     void addTransitionsToSelection(std::optional<TrackKind> only = std::nullopt);

@@ -87,6 +87,7 @@
 #include "Voiceover.h"
 #include "MaskOverlay.h"
 #include "TransformOverlay.h"
+#include "render/ClipPlacement.h"
 #include "media/Diarizer.h"
 #include "media/VisualSearch.h"
 #include "media/Faces.h"
@@ -2553,6 +2554,20 @@ private slots:
         const Param& px = clipNamed(*state()->sequence(), "Red")->motion.params.at("pos_x");
         QCOMPARE(px.keys.size(), size_t(3));
         QVERIFY(std::fabs(px.at(5) - 80) < 2 && px.at(50) == 0);
+        state()->undo();
+        state()->undo();
+        // Clip > Align in Frame: half size, then to the top left corner inside the action-safe margin.
+        QVERIFY(state()->edit("Half", [red](Project& p, Sequence& s) {
+            Clip* clip = edit::clipById(s, red);
+            if (clip->motion.empty()) clip->motion = makeEffect(p, "transform");
+            clip->motion.params["scale"] = Param(50.0);
+            return true;
+        }));
+        QVERIFY(win_->findChild<QAction*>("align_top_left"));
+        win_->findChild<QAction*>("align_top_left")->trigger();
+        std::array<double, 4> xs, ys;
+        QVERIFY(clipFrameQuad(state()->project(), *state()->sequence(), *clipNamed(*state()->sequence(), "Red"), 5, xs, ys));
+        QVERIFY2(std::fabs(xs[0] - 9) < 0.01 && std::fabs(ys[0] - 9) < 0.01, qPrintable(QString("%1 %2").arg(xs[0]).arg(ys[0])));
         state()->undo();
         state()->undo();
         // With nothing selected, a click on the picture selects the clip on top (the title over Red) and moves it.

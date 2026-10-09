@@ -57,6 +57,7 @@
 #include "media/Vector.h"
 #include "media/Beats.h"
 #include "render/Spherical.h"
+#include "render/ClipPlacement.h"
 #include "render/AudioReactive.h"
 #include "render/VfxPull.h"
 #include "render/AafExport.h"
@@ -1813,6 +1814,70 @@ private slots:
         const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
         QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
         QVERIFY(r.value("structuredContent").toObject().value("keys").toInt() >= 2);
+    }
+
+    void mcpTransformAndAlign() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320;
+        s.height = 180;
+        s.fps = Rational{25, 1};
+        Clip matte = makeGeneratorClip(p, "color", 50);
+        matte.generator.params["color.r"] = 1.0;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, matte);
+        const QString project = QString::fromStdString(path("transform-mcp.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        int rid = 1;
+        auto call = [&](QJsonObject args) {
+            args["project"] = project;
+            args["clip"] = double(matte.id);
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", rid++}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_transform"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto corner = [](const QJsonObject& r, int k, int axis) {
+            return r.value("structuredContent").toObject().value("corners").toArray().at(k).toArray().at(axis).toDouble();
+        };
+        // Half size: the picture in the middle quarter.
+        QJsonObject r = call({{"scale", 50}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(corner(r, 0, 0), 80.0);
+        QCOMPARE(corner(r, 2, 1), 135.0);
+        // Bottom right, 5 % of the height (9 px) in: a picture-in-picture.
+        r = call({{"align", "bottom_right"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(corner(r, 2, 0), 311.0);
+        QCOMPARE(corner(r, 2, 1), 171.0);
+        QCOMPARE(corner(r, 0, 0), 151.0);
+        // As drawn: red inside the corners, nothing outside.
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        RenderOptions o;
+        Image f = renderSequenceFrame(back, *back.active(), 10, o);
+        QVERIFY(f.at(155, 85)[3] > 0.99 && f.at(305, 165)[3] > 0.99);
+        QVERIFY(f.at(145, 85)[3] < 0.01 && f.at(315, 175)[3] < 0.01 && f.at(160, 40)[3] < 0.01);
+        std::array<double, 4> xs, ys;
+        QVERIFY(clipFrameQuad(back, *back.active(), back.active()->videoTracks[0].clips[0], 10, xs, ys));
+        QCOMPARE(xs[1], 311.0);
+        // Crop the left half away: the left edge moves to the middle of the picture.
+        r = call({{"crop_left", 50}});
+        QCOMPARE(corner(r, 0, 0), 231.0);
+        // Keys: from the centre at frame 0 to 100 px right at frame 40.
+        call({{"x", 0}, {"at", 0}});
+        r = call({{"x", 100}, {"at", 40}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Param& px = back.active()->videoTracks[0].clips[0].motion.params.at("pos_x");
+        QCOMPARE(px.keys.size(), size_t(2));
+        QCOMPARE(px.at(40), 100.0);
+        // Refused: a key outside the clip, nothing to change, an unknown alignment.
+        QVERIFY(call({{"x", 5}, {"at", 99}}).value("isError").toBool());
+        QVERIFY(call({}).value("isError").toBool());
+        QVERIFY(call({{"align", "sideways"}}).value("isError").toBool());
     }
 
     void mcpTransitionsOnClips() {
