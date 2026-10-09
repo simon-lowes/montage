@@ -14,6 +14,8 @@ add_library(montage_engine STATIC
   core/TranscriptEdit.h core/TranscriptEdit.cpp
   core/Slate.h core/Slate.cpp
   core/Chapters.h core/Chapters.cpp
+  core/ChapterSuggest.h core/ChapterSuggest.cpp
+  core/TextStats.h core/TextStats.cpp
   core/Automation.h core/Automation.cpp
   core/MarkerList.h core/MarkerList.cpp
   core/EffectPresets.h core/EffectPresets.cpp

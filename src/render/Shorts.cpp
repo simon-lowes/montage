@@ -1,12 +1,12 @@
 #include "Shorts.h"
 
 #include <QString>
-#include <QStringList>
 #include <algorithm>
 #include <cmath>
 #include <set>
 
 #include "core/Captions.h"
+#include "core/TextStats.h"
 #include "core/EditOps.h"
 #include "core/Transcript.h"
 #include "render/ClipAnalysis.h"
@@ -18,43 +18,6 @@ namespace {
 
 bool cancelled(const std::atomic<bool>* c) { return c && c->load(); }
 
-// Lower case, letters, digits and apostrophes (curly ones made straight): "Here's" -> "here's".
-std::string key(const std::string& w) {
-    QString out;
-    for (QChar c : QString::fromStdString(w)) {
-        if (c == QChar(0x2019)) c = QLatin1Char('\'');
-        if (c.isLetterOrNumber() || c == QLatin1Char('\'')) out += c.toLower();
-    }
-    while (out.startsWith(QLatin1Char('\''))) out.remove(0, 1);
-    while (out.endsWith(QLatin1Char('\''))) out.chop(1);
-    return out.toStdString();
-}
-
-std::vector<std::string> keys(const std::string& text) {
-    std::vector<std::string> out;
-    for (const QString& part : QString::fromStdString(text).simplified().split(QLatin1Char(' '), Qt::SkipEmptyParts))
-        if (std::string k = key(part.toStdString()); !k.empty()) out.push_back(std::move(k));
-    return out;
-}
-
-// Whether the word ends a sentence: . ? ! … (and the CJK forms), past closing quotes and brackets; not "Mr." or "e.g.".
-bool endsSentence(const std::string& word) {
-    QString q = QString::fromStdString(word).trimmed();
-    static const QString closers = QStringLiteral("\"')]”’»");
-    while (!q.isEmpty() && closers.contains(q.back())) q.chop(1);
-    if (q.isEmpty()) return false;
-    static const QString enders = QStringLiteral(".?!…。？！");
-    if (!enders.contains(q.back())) return false;
-    static const std::set<std::string> abbreviations = {"mr", "mrs", "ms", "dr", "prof", "st", "vs", "eg", "ie", "jr", "sr"};
-    return !(q.back() == QLatin1Char('.') && abbreviations.count(key(q.toStdString())));
-}
-
-bool endsQuestion(const std::string& word) {
-    QString q = QString::fromStdString(word).trimmed();
-    while (!q.isEmpty() && QStringLiteral("\"')]”’»").contains(q.back())) q.chop(1);
-    return q.endsWith(QLatin1Char('?')) || q.endsWith(QChar(0xff1f));
-}
-
 bool isNumberWord(const std::string& k) {
     static const std::set<std::string> numbers = {"one",   "two",     "three",   "four",     "five",    "six",     "seven",
                                                   "eight", "nine",    "ten",     "eleven",   "twelve",  "twenty",  "thirty",
@@ -62,30 +25,6 @@ bool isNumberWord(const std::string& k) {
                                                   "first", "percent"};
     if (numbers.count(k)) return true;
     return std::any_of(k.begin(), k.end(), [](char c) { return c >= '0' && c <= '9'; });
-}
-
-// Words too common to say what something is about.
-bool isStopWord(const std::string& k) {
-    static const std::set<std::string> stop = {
-        "the",  "a",    "an",   "and",   "or",    "but",  "of",   "to",   "in",    "on",    "at",    "for",  "with", "about",
-        "is",   "are",  "was",  "were",  "be",    "been", "it",   "its",  "this",  "that",  "these", "those", "i",   "you",
-        "we",   "they", "he",   "she",   "my",    "your", "our",  "their", "what", "how",   "why",   "when", "who",  "do",
-        "does", "did",  "have", "has",   "had",   "can",  "will", "would", "should", "could", "not",  "so",   "as",   "by",
-        "from", "into", "than", "then",  "there", "here", "just", "really", "very", "all",   "any",   "some", "more", "most"};
-    return k.size() < 3 || stop.count(k);
-}
-
-// "stories" and "story", "editing" and "edit" alike, roughly.
-std::string stem(std::string k) {
-    for (const char* suffix : {"ing", "ies", "es", "ed", "s"}) {
-        const size_t n = std::char_traits<char>::length(suffix);
-        if (k.size() > n + 3 && k.compare(k.size() - n, n, suffix) == 0) {
-            k.resize(k.size() - n);
-            if (std::string(suffix) == "ies") k += 'y';
-            break;
-        }
-    }
-    return k;
 }
 
 struct Word {
@@ -97,7 +36,7 @@ struct Word {
 }  // namespace
 
 double hookScore(const std::string& sentence) {
-    const std::vector<std::string> ks = keys(sentence);
+    const std::vector<std::string> ks = wordKeys(sentence);
     if (ks.empty()) return 0;
     std::string joined = " ";
     for (const std::string& k : ks) joined += k + " ";
@@ -136,8 +75,8 @@ std::vector<ShortMoment> findShorts(const Project& p, const std::vector<Id>& med
                                     const std::function<void(double)>& progress, const std::atomic<bool>* cancel, std::string* error) {
     std::vector<ShortMoment> all;
     std::set<std::string> topic;
-    for (const std::string& k : keys(o.topic))
-        if (!isStopWord(k)) topic.insert(stem(k));
+    for (const std::string& k : wordKeys(o.topic))
+        if (!isStopWord(k)) topic.insert(stemWord(k));
     bool anyTranscript = false;
     for (size_t mi = 0; mi < media.size(); ++mi) {
         if (cancelled(cancel)) return {};
@@ -148,7 +87,7 @@ std::vector<ShortMoment> findShorts(const Project& p, const std::vector<Id>& med
         std::vector<TranscriptWord> plain;
         for (const TranscriptSegment& seg : m->transcript->segments)
             for (const TranscriptWord& w : seg.words) {
-                if (key(w.text).empty() && !endsSentence(w.text)) continue;
+                if (wordKey(w.text).empty() && !endsSentence(w.text)) continue;
                 words.push_back({w.start, w.end, w.text, seg.speaker});
                 plain.push_back(w);
             }
@@ -169,13 +108,7 @@ std::vector<ShortMoment> findShorts(const Project& p, const std::vector<Id>& med
             }
         }
         if (cancelled(cancel)) return {};
-        // Sentences: to a word ending one, or a long silence.
-        std::vector<std::pair<size_t, size_t>> sentences;
-        for (size_t i = 0, first = 0; i < n; ++i)
-            if (endsSentence(words[i].text) || i + 1 == n || words[i + 1].start - words[i].end >= 1.2) {
-                sentences.push_back({first, i});
-                first = i + 1;
-            }
+        const std::vector<std::pair<size_t, size_t>> sentences = sentenceSpans(plain);
         auto text = [&](size_t a, size_t b) {
             std::string out;
             for (size_t k = a; k <= b; ++k) out += (out.empty() ? "" : " ") + words[k].text;
@@ -205,7 +138,7 @@ std::vector<ShortMoment> findShorts(const Project& p, const std::vector<Id>& med
                     spoken += std::max(0.0, words[k].end - words[k].start);
                     if (words[k].speaker >= 0) speakers.insert(words[k].speaker);
                     if (!topic.empty())
-                        if (const std::string s = stem(key(words[k].text)); topic.count(s)) hits.insert(s);
+                        if (const std::string s = stemWord(wordKey(words[k].text)); topic.count(s)) hits.insert(s);
                 }
                 const double count = double(last - first + 1);
                 double score = 2 * hook - 3 * fillers / count;

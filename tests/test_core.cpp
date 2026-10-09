@@ -16,6 +16,7 @@
 #include "core/Bleep.h"
 #include "core/Cfb.h"
 #include "core/Chapters.h"
+#include "core/ChapterSuggest.h"
 #include "core/Checkerboard.h"
 #include "core/EditOps.h"
 #include "core/GradeVersions.h"
@@ -1026,6 +1027,114 @@ private slots:
         const auto again = say("today we're going to", far.back().end + 0.1);
         far.insert(far.end(), again.begin(), again.end());
         QVERIFY(retakeRanges(far, 25).empty());
+    }
+
+    void suggestingChapters() {
+        // Three talks of ten sentences each (cooking, football, astronomy), a word every 0.4 s and 0.6 s between sentences.
+        const std::vector<std::vector<std::string>> talks = {
+            {"Today we start in the kitchen with a simple pasta dish.", "Boil the pasta in plenty of salted water for ten minutes.",
+             "Meanwhile chop the garlic and warm the olive oil in a pan.", "Add the tomatoes to the garlic and let the sauce simmer.",
+             "A tomato sauce needs patience and fresh garlic.", "Stir the sauce now and then so the tomatoes break down.",
+             "Drain the pasta but keep a cup of the cooking water.", "Toss the pasta through the sauce with a splash of that water.",
+             "Finish the pasta with basil, olive oil and grated cheese.", "That is the whole recipe for a quick tomato pasta sauce."},
+            {"Now to the football match on Saturday afternoon.", "The team started slowly and the coach looked worried.",
+             "Their striker missed two chances in the opening half.", "Our defence held firm until the goalkeeper made a mistake.",
+             "The goal came from a corner just before half time.", "In the second half the coach changed the formation.",
+             "The new striker scored a brilliant goal from outside the box.", "The team pressed high and the defence stayed compact.",
+             "A late goal from the captain won the match for us.", "The coach praised the whole team after the match."},
+            {"Finally a word about astronomy and the night sky.", "This month the planets line up just after sunset.",
+             "Through a small telescope you can see the moons of Jupiter.", "Saturn and its rings look stunning in any telescope.",
+             "Away from city lights the galaxy stretches across the sky.", "The moon will be dark on Friday so the stars stand out.",
+             "Point the telescope at Orion to find a glowing nebula.", "The planets drift slowly against the background stars.",
+             "Patience at the telescope is rewarded on a clear night.", "Keep looking up and enjoy the stars and planets this month."}};
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = {25, 1};
+        MediaItem m;
+        m.id = p.newId();
+        m.kind = MediaKind::Video;
+        m.hasVideo = m.hasAudio = true;
+        auto t = std::make_shared<Transcript>();
+        double at = 0.5;
+        std::vector<double> joins;  // where each talk after the first begins
+        for (const auto& talk : talks) {
+            if (at > 1) joins.push_back(at);
+            for (const std::string& sentence : talk) {
+                TranscriptSegment seg;
+                for (const QString& w : QString::fromStdString(sentence).split(' ')) {
+                    seg.words.push_back({at, at + 0.3, w.toStdString(), 1});
+                    at += 0.4;
+                }
+                at += 0.6;
+                t->segments.push_back(seg);
+            }
+        }
+        m.duration = at + 1;
+        m.transcript = t;
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        std::string err;
+        const std::vector<SuggestedChapter> ch = suggestChapters(p, s, {}, &err);
+        QVERIFY2(ch.size() == 3, qPrintable(QString::fromStdString(err) + QString::number(ch.size())));
+        for (const SuggestedChapter& c : ch) qInfo("chapter at %.1f s: %s (%.2f)", c.start / 25.0, c.title.c_str(), c.depth);
+        QCOMPARE(ch[0].start, FrameTime(0));
+        // Each break within a sentence (about 4.6 s) of where the talk changed, and just before a word.
+        for (size_t i = 0; i < joins.size(); ++i) QVERIFY2(std::fabs(ch[i + 1].start / 25.0 - joins[i]) < 4.6, qPrintable(QString::number(ch[i + 1].start / 25.0)));
+        // Titled with what each talks about.
+        auto titled = [&](size_t i, const QStringList& topic) {
+            const QString title = QString::fromStdString(ch[i].title).toLower();
+            return std::any_of(topic.begin(), topic.end(), [&](const QString& w) { return title.contains(w); });
+        };
+        QVERIFY2(titled(0, {"pasta", "sauce", "tomato", "garlic"}), ch[0].title.c_str());
+        QVERIFY2(titled(1, {"match", "goal", "team", "coach", "striker", "defence", "football"}), ch[1].title.c_str());
+        QVERIFY2(titled(2, {"telescope", "planet", "star", "sky", "galaxy", "moon", "astronomy"}), ch[2].title.c_str());
+        QVERIFY(QString::fromStdString(ch[0].title).front().isUpper());
+        // Written as chapter markers, replacing the chapter markers there were and keeping the others; YouTube's list is valid.
+        edit::addMarker(s, Marker{100, 0, "Old chapter", {}, 0, true});
+        edit::addMarker(s, Marker{120, 0, "Note", {}, 0, false});
+        QVERIFY(edit::addSuggestedChapters(s, ch).ok);
+        QCOMPARE(s.markers.size(), size_t(4));
+        QVERIFY(std::none_of(s.markers.begin(), s.markers.end(), [](const Marker& mk) { return mk.name == "Old chapter"; }));
+        QVERIFY(std::any_of(s.markers.begin(), s.markers.end(), [](const Marker& mk) { return mk.name == "Note" && !mk.chapter; }));
+        std::string warning;
+        const std::string list = youtubeChapters(s, 0, -1, &warning);
+        QVERIFY2(warning.empty(), warning.c_str());
+        QVERIFY(QString::fromStdString(list).startsWith("0:00 " + QString::fromStdString(ch[0].title)));
+        // The shortest chapter holds: no chapter under a minute (or none, when no break leaves a minute either side).
+        ChapterOptions longer;
+        longer.minSeconds = 60;
+        const std::vector<SuggestedChapter> few = suggestChapters(p, s, longer, &err);
+        const double total = s.duration() / 25.0;
+        for (size_t i = 0; i < few.size(); ++i) {
+            const double end = i + 1 < few.size() ? few[i + 1].start / 25.0 : total;
+            QVERIFY(end - few[i].start / 25.0 >= 60);
+        }
+        ChapterOptions two;
+        two.maxChapters = 2;
+        QCOMPARE(suggestChapters(p, s, two, &err).size(), size_t(2));
+        // One subject throughout, or too little said.
+        Project q = makeDefaultProject();
+        Sequence& qs = *q.active();
+        MediaItem one = m;
+        auto same = std::make_shared<Transcript>();
+        at = 0.5;
+        for (int i = 0; i < 30; ++i) {
+            TranscriptSegment seg;
+            for (const char* w : {"We", "cook", "the", "pasta", "sauce", "with", "garlic", "and", "tomatoes", "again."}) {
+                seg.words.push_back({at, at + 0.3, w, 1});
+                at += 0.4;
+            }
+            at += 0.6;
+            same->segments.push_back(seg);
+        }
+        one.transcript = same;
+        q.media.push_back(one);
+        QVERIFY(edit::placeMedia(q, qs, one.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(suggestChapters(q, qs, {}, &err).empty());
+        QVERIFY2(QString::fromStdString(err).contains("one subject"), err.c_str());
+        Project empty = makeDefaultProject();
+        QVERIFY(suggestChapters(empty, *empty.active(), {}, &err).empty());
+        QVERIFY(QString::fromStdString(err).contains("transcribed"));
     }
 
     void editingByTranscript() {

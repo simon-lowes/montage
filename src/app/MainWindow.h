@@ -109,6 +109,9 @@ public:
     bool addFrameHold();                              // the clip under the playhead
     // Copies the chapter markers (within In to Out when set) as YouTube's chapter list; returns the text.
     QString copyYoutubeChapters();
+    // Suggest Chapters: chapter markers where the talk moves on, titled with what each part is about (replacing the
+    // chapter markers there were); `ask` shows them first to rename, drop or re-space. How many were added.
+    int suggestChapterMarkers(double minSeconds = 30, bool ask = true);
     // The sequence's markers as a CSV (.csv), Avid locators (.txt) or a Resolve marker EDL (.edl); markers from a CSV
     // or Avid locator file, as one undo step (returns how many).
     bool exportMarkers(const QString& path);

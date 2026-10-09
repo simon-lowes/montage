@@ -31,6 +31,7 @@
 #include "core/Captions.h"
 #include "core/ColorWarp.h"
 #include "core/Chapters.h"
+#include "core/ChapterSuggest.h"
 #include "core/MarkerList.h"
 #include "core/MaskPath.h"
 #include "core/Bleep.h"
@@ -1279,6 +1280,39 @@ void McpServer::Impl::addTools() {
             const std::string text = youtubeChapters(s, from, to, &warning);
             if (text.empty()) return fail(QString::fromStdString(warning));
             return ok(QString::fromStdString(text) + (warning.empty() ? QString() : QStringLiteral("\nNote: ") + QString::fromStdString(warning)));
+        });
+
+    add("montage_suggest_chapters", "Suggest chapters from what is said",
+        "Find where the talk in the sequence moves on to something new (TextTiling over the transcribed words of the "
+        "cut: the sentences either side of each break compared, the breaks where they share least taken, none closer than "
+        "`min_seconds`) and title each chapter with the phrase it says more than the others do. With `apply` (the "
+        "default) they become chapter markers, replacing the chapter markers there were unless `replace` is false. "
+        "Returns the chapters and YouTube's chapter list.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"min_seconds":{"type":"number","default":30},
+            "max_chapters":{"type":"number","default":0,"description":"0 = as many as the talk has"},
+            "apply":{"type":"boolean","default":true},"replace":{"type":"boolean","default":true}},"required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            ChapterOptions o;
+            o.minSeconds = std::max(10.0, a.value("min_seconds").toDouble(30));
+            o.maxChapters = std::max(0, a.value("max_chapters").toInt(0));
+            std::string err;
+            const std::vector<SuggestedChapter> chapters = suggestChapters(l.project, s, o, &err);
+            if (chapters.empty()) return fail(QString::fromStdString(err));
+            QJsonArray list;
+            for (const SuggestedChapter& c : chapters)
+                list.append(QJsonObject{{"start", c.start / s.fpsValue()}, {"timecode", tc(c.start, s)}, {"title", QString::fromStdString(c.title)}});
+            QJsonObject out{{"chapters", list}};
+            if (!a.value("apply").toBool(true)) return ok(QStringLiteral("%1 chapter(s) suggested").arg(chapters.size()), out);
+            const edit::Result r = edit::addSuggestedChapters(s, chapters, a.value("replace").toBool(true));
+            if (!r.ok) return fail(QString::fromStdString(r.error));
+            save(l);
+            std::string warning;
+            const QString youtube = QString::fromStdString(youtubeChapters(s, 0, -1, &warning));
+            out["youtube"] = youtube;
+            if (!warning.empty()) out["warning"] = QString::fromStdString(warning);
+            return ok(QStringLiteral("%1 chapter marker(s) added:\n%2").arg(chapters.size()).arg(youtube), out);
         });
 
     add("montage_automate_track", "Automate a track's fader",

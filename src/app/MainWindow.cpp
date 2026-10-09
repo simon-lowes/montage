@@ -65,6 +65,7 @@
 #include "core/AudioChannels.h"
 #include "render/ClipPlacement.h"
 #include "core/Chapters.h"
+#include "core/ChapterSuggest.h"
 #include "core/MarkerList.h"
 #include "render/AudioReactive.h"
 #include "render/VfxPull.h"
@@ -1151,6 +1152,7 @@ void MainWindow::buildMenus() {
     add(seqM, tr("Add C&hapter Marker"), QKeySequence("Alt+M"), [this] { addChapterMarker(); })->setObjectName(QStringLiteral("addChapter"));
     add(seqM, tr("Add C&lip Marker"), QKeySequence("Shift+Alt+M"), [this] { addClipMarker(); })->setObjectName(QStringLiteral("addClipMarker"));
     add(seqM, tr("Copy Chapters for YouTube"), QKeySequence(), [this] { copyYoutubeChapters(); })->setObjectName(QStringLiteral("copyChapters"));
+    add(seqM, tr("Suggest Chapters…"), QKeySequence(), [this] { suggestChapterMarkers(); })->setObjectName(QStringLiteral("suggestChapters"));
     add(seqM, tr("Compare with Sequence…"), QKeySequence(), [this] {
         // Another version of the cut, compared with this one (the older one picked from the project's sequences).
         const Sequence* now = state_->sequence();
@@ -2504,6 +2506,77 @@ int MainWindow::importMarkers(const QString& path) {
     });
     statusBar()->showMessage(tr("Imported %n marker(s)", nullptr, int(markers.size())), 6000);
     return int(markers.size());
+}
+
+int MainWindow::suggestChapterMarkers(double minSeconds, bool ask) {
+    const Sequence* s = state_->sequence();
+    if (!s) return 0;
+    std::string err;
+    auto find = [&](double secs) {
+        ChapterOptions o;
+        o.minSeconds = secs;
+        return montage::suggestChapters(state_->project(), *s, o, &err);
+    };
+    std::vector<SuggestedChapter> chapters = find(minSeconds);
+    if (chapters.empty()) {
+        state_->message(QString::fromStdString(err), 6000);
+        return 0;
+    }
+    bool replace = true;
+    if (ask) {
+        QDialog dlg(this);
+        dlg.setObjectName(QStringLiteral("suggestChaptersDialog"));
+        dlg.setWindowTitle(tr("Suggest Chapters"));
+        auto* lay = new QVBoxLayout(&dlg);
+        auto* form = new QFormLayout;
+        auto* shortest = new QSpinBox(&dlg);
+        shortest->setObjectName(QStringLiteral("chapterMinSeconds"));
+        shortest->setRange(10, 3600);
+        shortest->setSuffix(tr(" s"));
+        shortest->setValue(int(minSeconds));
+        form->addRow(tr("Shortest chapter:"), shortest);
+        lay->addLayout(form);
+        auto* table = new QTableWidget(0, 2, &dlg);
+        table->setObjectName(QStringLiteral("chapterTable"));
+        table->setHorizontalHeaderLabels({tr("Starts"), tr("Title (double-click to rename)")});
+        table->horizontalHeader()->setStretchLastSection(true);
+        table->verticalHeader()->hide();
+        table->setMinimumSize(420, 220);
+        lay->addWidget(table, 1);
+        auto* keep = new QCheckBox(tr("Keep the chapter markers already there"), &dlg);
+        keep->setObjectName(QStringLiteral("keepChapters"));
+        lay->addWidget(keep);
+        auto fill = [&] {
+            table->setRowCount(int(chapters.size()));
+            for (int r = 0; r < int(chapters.size()); ++r) {
+                auto* when = new QTableWidgetItem(QString::fromStdString(formatTimecode(chapters[size_t(r)].start, s->fps)));
+                when->setFlags(Qt::ItemIsEnabled | Qt::ItemIsSelectable);
+                table->setItem(r, 0, when);
+                table->setItem(r, 1, new QTableWidgetItem(QString::fromStdString(chapters[size_t(r)].title)));
+            }
+            table->resizeColumnToContents(0);
+        };
+        fill();
+        connect(shortest, &QSpinBox::valueChanged, &dlg, [&](int v) {
+            if (auto again = find(v); !again.empty()) {
+                chapters = std::move(again);
+                fill();
+            }
+        });
+        auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+        buttons->button(QDialogButtonBox::Ok)->setText(tr("Add Chapters"));
+        connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+        connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+        lay->addWidget(buttons);
+        if (dlg.exec() != QDialog::Accepted) return 0;
+        for (int r = 0; r < table->rowCount() && r < int(chapters.size()); ++r)
+            if (const QString t = table->item(r, 1)->text().trimmed(); !t.isEmpty()) chapters[size_t(r)].title = t.toStdString();
+        replace = !keep->isChecked();
+    }
+    if (!state_->edit(tr("Suggest Chapters"), [&](Project&, Sequence& sq) { return edit::addSuggestedChapters(sq, chapters, replace).ok; }))
+        return 0;
+    state_->message(tr("%n chapter marker(s) added; Copy Chapters for YouTube lists them", "", int(chapters.size())), 6000);
+    return int(chapters.size());
 }
 
 QString MainWindow::copyYoutubeChapters() {

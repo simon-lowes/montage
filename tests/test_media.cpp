@@ -487,6 +487,35 @@ double pitchOf(const std::vector<float>& b, size_t from, size_t to, int rate = 4
 
 }  // namespace
 
+// Three talks (cooking, football, astronomy) of eight sentences, a word every 0.4 s and 0.6 s between sentences.
+static std::shared_ptr<Transcript> threeTalks(double& end) {
+    const std::vector<std::vector<const char*>> talks = {
+        {"Boil the pasta in plenty of salted water.", "Chop the garlic and warm the olive oil.", "Add the tomatoes and let the sauce simmer.",
+         "A tomato sauce needs fresh garlic.", "Stir the sauce so the tomatoes break down.", "Drain the pasta and keep some water.",
+         "Toss the pasta through the sauce.", "Finish the pasta with basil and cheese."},
+        {"Now to the football match on Saturday.", "The team started slowly and the coach worried.", "Their striker missed two chances early.",
+         "Our defence held until the goalkeeper slipped.", "The goal came from a corner kick.", "The coach changed the formation at half time.",
+         "The new striker scored a brilliant goal.", "The coach praised the team after the match."},
+        {"Finally the night sky this month.", "The planets line up after sunset.", "A small telescope shows the moons of Jupiter.",
+         "Saturn and its rings shine in any telescope.", "The galaxy stretches across a dark sky.", "With no moon the stars stand out.",
+         "Point the telescope at the Orion nebula.", "Enjoy the stars and planets this month."}};
+    auto t = std::make_shared<Transcript>();
+    t->language = "en";
+    double at = 0.5;
+    for (const auto& talk : talks)
+        for (const char* sentence : talk) {
+            TranscriptSegment seg;
+            for (const QString& w : QString::fromLatin1(sentence).split(' ')) {
+                seg.words.push_back({at, at + 0.3, w.toStdString(), 1});
+                at += 0.4;
+            }
+            at += 0.6;
+            t->segments.push_back(seg);
+        }
+    end = at;
+    return t;
+}
+
 class TestMedia : public QObject {
     Q_OBJECT
     QTemporaryDir dir_;
@@ -2064,6 +2093,56 @@ private slots:
         Project q;
         QVERIFY(loadProject(project.toStdString(), q));
         QCOMPARE(q.vocabulary, (std::vector<std::string>{"Montage", "Kokoro"}));
+    }
+
+    void mcpSuggestChapters() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = {25, 1};
+        MediaItem m;
+        m.id = p.newId();
+        m.kind = MediaKind::Video;
+        m.name = "show.mov";
+        m.hasVideo = m.hasAudio = true;
+        double end = 0;
+        m.transcript = threeTalks(end);
+        m.duration = end + 1;
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const QString project = QString::fromStdString(path("chapters-mcp.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        int rid = 1;
+        auto call = [&](QJsonObject args) {
+            args["project"] = project;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", rid++}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_suggest_chapters"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        // Suggested only: nothing written.
+        QJsonObject r = call({{"apply", false}, {"min_seconds", 20}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QJsonArray chapters = r.value("structuredContent").toObject().value("chapters").toArray();
+        QCOMPARE(chapters.size(), 3);
+        QCOMPARE(chapters.at(0).toObject().value("start").toDouble(), 0.0);
+        QVERIFY(chapters.at(1).toObject().value("start").toDouble() > 25 && chapters.at(1).toObject().value("start").toDouble() < 40);
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QVERIFY(back.active()->markers.empty());
+        // Applied: chapter markers and YouTube's list.
+        r = call({{"min_seconds", 20}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QString youtube = r.value("structuredContent").toObject().value("youtube").toString();
+        QVERIFY2(youtube.startsWith("0:00 "), qPrintable(youtube));
+        QCOMPARE(youtube.trimmed().count('\n') + 1, 3);  // a line each
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.active()->markers.size(), size_t(3));
+        QVERIFY(std::all_of(back.active()->markers.begin(), back.active()->markers.end(), [](const Marker& mk) { return mk.chapter; }));
+        // Too long a shortest chapter for this cut.
+        QVERIFY(call({{"min_seconds", 60}}).value("isError").toBool());
     }
 
     void mcpTransitionsOnClips() {

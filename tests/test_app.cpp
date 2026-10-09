@@ -168,6 +168,35 @@ const Clip* clipNamed(const Sequence& s, const char* name) {
 
 }  // namespace
 
+// Three talks (cooking, football, astronomy) of eight sentences, a word every 0.4 s and 0.6 s between sentences.
+static std::shared_ptr<Transcript> threeTalks(double& end) {
+    const std::vector<std::vector<const char*>> talks = {
+        {"Boil the pasta in plenty of salted water.", "Chop the garlic and warm the olive oil.", "Add the tomatoes and let the sauce simmer.",
+         "A tomato sauce needs fresh garlic.", "Stir the sauce so the tomatoes break down.", "Drain the pasta and keep some water.",
+         "Toss the pasta through the sauce.", "Finish the pasta with basil and cheese."},
+        {"Now to the football match on Saturday.", "The team started slowly and the coach worried.", "Their striker missed two chances early.",
+         "Our defence held until the goalkeeper slipped.", "The goal came from a corner kick.", "The coach changed the formation at half time.",
+         "The new striker scored a brilliant goal.", "The coach praised the team after the match."},
+        {"Finally the night sky this month.", "The planets line up after sunset.", "A small telescope shows the moons of Jupiter.",
+         "Saturn and its rings shine in any telescope.", "The galaxy stretches across a dark sky.", "With no moon the stars stand out.",
+         "Point the telescope at the Orion nebula.", "Enjoy the stars and planets this month."}};
+    auto t = std::make_shared<Transcript>();
+    t->language = "en";
+    double at = 0.5;
+    for (const auto& talk : talks)
+        for (const char* sentence : talk) {
+            TranscriptSegment seg;
+            for (const QString& w : QString::fromLatin1(sentence).split(' ')) {
+                seg.words.push_back({at, at + 0.3, w.toStdString(), 1});
+                at += 0.4;
+            }
+            at += 0.6;
+            t->segments.push_back(seg);
+        }
+    end = at;
+    return t;
+}
+
 class TestApp : public QObject {
     Q_OBJECT
     QTemporaryDir dir_;
@@ -2581,6 +2610,49 @@ private slots:
         panel->setMode(TranscriptPanel::Mode::Sequence);
         QCOMPARE(viewport()->width(), timelineWidth);  // switching modes never widens the panel over the timeline
         QVERIFY2(panel->minimumSizeHint().width() < 320, qPrintable(QString::number(panel->minimumSizeHint().width())));  // buttons wrap
+    }
+
+    void suggestChaptersFromTheMenu() {
+        state()->newProject();
+        QVERIFY(win_->findChild<QAction*>("suggestChapters"));
+        QCOMPARE(win_->suggestChapterMarkers(20, false), 0);  // nothing transcribed
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        const Id media = ids[0];
+        double end = 0;
+        auto t = threeTalks(end);
+        QVERIFY(state()->edit("Transcript", [media, t, end](Project& p, Sequence& s) {
+            MediaItem* m = p.findMedia(media);
+            m->transcript = t;
+            m->duration = end + 1;  // as long as the talks (the test recording itself is short)
+            return edit::placeMedia(p, s, media, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        QCOMPARE(win_->suggestChapterMarkers(20, false), 3);
+        const auto& markers = state()->sequence()->markers;
+        QCOMPARE(markers.size(), size_t(3));
+        QCOMPARE(markers[0].t, FrameTime(0));
+        QVERIFY(std::all_of(markers.begin(), markers.end(), [](const Marker& mk) { return mk.chapter && !mk.name.empty(); }));
+        state()->undo();
+        QVERIFY(state()->sequence()->markers.empty());
+        // The dialog: rename the first chapter and keep a chapter marker already there.
+        QVERIFY(state()->edit("Marker", [](Project&, Sequence& s) {
+            edit::addMarker(s, Marker{10, 0, "Mine", {}, 0, true});
+            return true;
+        }));
+        QTimer::singleShot(0, this, [&] {
+            auto* dlg = win_->findChild<QDialog*>("suggestChaptersDialog");
+            QVERIFY(dlg);
+            dlg->findChild<QSpinBox*>("chapterMinSeconds")->setValue(20);
+            auto* table = dlg->findChild<QTableWidget*>("chapterTable");
+            QCOMPARE(table->rowCount(), 3);
+            table->item(0, 1)->setText("Cooking");
+            dlg->findChild<QCheckBox*>("keepChapters")->setChecked(true);
+            dlg->accept();
+        });
+        win_->findChild<QAction*>("suggestChapters")->trigger();
+        QCOMPARE(state()->sequence()->markers.size(), size_t(4));
+        QCOMPARE(state()->sequence()->markers[0].name, std::string("Cooking"));
+        QVERIFY(std::any_of(state()->sequence()->markers.begin(), state()->sequence()->markers.end(),
+                            [](const Marker& mk) { return mk.name == "Mine"; }));
     }
 
     void makeShortsFromTheMenu() {
