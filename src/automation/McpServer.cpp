@@ -2250,6 +2250,78 @@ void McpServer::Impl::addTools() {
                       QJsonObject{{"path", path}, {"captions", int(t->captions.size())}, {"bytes", double(data.size())}});
         });
 
+    add("montage_caption_style", "Style captions",
+        "Set how a caption track looks in the viewer, burn-ins and ASS files: a ready-made `look` (classic, broadcast, "
+        "bold_yellow, creator_pop, karaoke, one_word, minimal, paper, neon), then any of: font, size (% of the frame "
+        "height), bold, color, box_color, box_opacity (0-1), outline (% of the text), outline_color, shadow (% of the "
+        "text), all_caps, position (bottom edge, % down), animation (none, word, highlight, pop, one_word) and "
+        "highlight_color. Colours are \"#rrggbb\". With nothing to set it lists the looks.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"track":{"type":"integer","default":0},
+            "look":{"type":"string"},"font":{"type":"string"},"size":{"type":"number"},"bold":{"type":"boolean"},
+            "color":{"type":"string"},"box_color":{"type":"string"},"box_opacity":{"type":"number"},
+            "outline":{"type":"number"},"outline_color":{"type":"string"},"shadow":{"type":"number"},"all_caps":{"type":"boolean"},
+            "position":{"type":"number"},"animation":{"type":"string","enum":["none","word","highlight","pop","one_word"]},
+            "highlight_color":{"type":"string"}},"required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            QJsonArray looks;
+            for (const CaptionLook& lk : captionLooks())
+                looks.append(QJsonObject{{"id", QString::fromStdString(lk.id)}, {"name", QString::fromStdString(lk.name)}});
+            const int index = a.value("track").toInt(0);
+            if (index < 0 || index >= int(s.captionTracks.size())) return fail("No such caption track");
+            CaptionStyle st = s.captionTracks[size_t(index)].style;
+            bool any = false;
+            if (a.contains("look")) {
+                const CaptionLook* lk = findCaptionLook(a.value("look").toString().toStdString());
+                if (!lk) throw ArgError{QStringLiteral("Unknown look \"%1\"").arg(a.value("look").toString())};
+                st = lk->style;
+                any = true;
+            }
+            auto colour = [&](const char* key, double& r, double& g, double& b) {
+                if (!a.contains(key)) return;
+                const QColor c(a.value(key).toString());
+                if (!c.isValid()) throw ArgError{QStringLiteral("\"%1\" must be a colour like #ffcc00").arg(key)};
+                r = c.redF(), g = c.greenF(), b = c.blueF();
+                any = true;
+            };
+            auto number = [&](const char* key, double& v, double scale, double lo, double hi) {
+                if (!a.contains(key)) return;
+                const double x = a.value(key).toDouble(-1e9);
+                if (x < lo || x > hi) throw ArgError{QStringLiteral("\"%1\" must be between %2 and %3").arg(key).arg(lo).arg(hi)};
+                v = x * scale;
+                any = true;
+            };
+            if (a.contains("font")) st.font = a.value("font").toString().toStdString(), any = true;
+            if (a.contains("bold")) st.bold = a.value("bold").toBool(), any = true;
+            if (a.contains("all_caps")) st.allCaps = a.value("all_caps").toBool(), any = true;
+            number("size", st.size, 0.01, 1, 25);
+            number("box_opacity", st.boxOpacity, 1, 0, 1);
+            number("outline", st.outline, 0.01, 0, 30);
+            number("shadow", st.shadow, 0.01, 0, 30);
+            number("position", st.position, 0.01, 10, 100);
+            colour("color", st.textR, st.textG, st.textB);
+            colour("box_color", st.boxR, st.boxG, st.boxB);
+            colour("outline_color", st.outlineR, st.outlineG, st.outlineB);
+            colour("highlight_color", st.hiR, st.hiG, st.hiB);
+            if (a.contains("animation")) {
+                static const QStringList kinds = {"none", "word", "highlight", "pop", "one_word"};
+                const int k = int(kinds.indexOf(a.value("animation").toString()));
+                if (k < 0) throw ArgError{"animation is none, word, highlight, pop or one_word"};
+                st.animation = k;
+                any = true;
+            }
+            if (!any) return ok(QStringLiteral("Looks: %1").arg([&] {
+                QStringList ids;
+                for (const auto& v : looks) ids << v.toObject().value("id").toString();
+                return ids.join(", ");
+            }()), QJsonObject{{"looks", looks}});
+            s.captionTracks[size_t(index)].style = st;
+            save(l);
+            return ok(QStringLiteral("Styled \"%1\"").arg(QString::fromStdString(s.captionTracks[size_t(index)].name)),
+                      QJsonObject{{"style", QJsonDocument::fromJson(QByteArray::fromStdString(captionStyleToJsonString(st))).object()}});
+        });
+
     add("montage_edit_captions", "Check and fix captions",
         "Check a caption track against reading limits (by default the Netflix Timed Text Style Guide's: 20 characters a "
         "second, 42 characters a line, two lines, 5/6 s to 7 s on screen, 2 frames between captions) or change it as a "

@@ -352,6 +352,10 @@ QJsonObject captionTrackToJson(const CaptionTrack& t) {
     if (st.animation) style["animation"] = st.animation;
     const CaptionStyle def;
     if (st.hiR != def.hiR || st.hiG != def.hiG || st.hiB != def.hiB) style["highlight"] = QJsonArray{st.hiR, st.hiG, st.hiB};
+    if (st.outlineR != 0 || st.outlineG != 0 || st.outlineB != 0) style["outlineColor"] = QJsonArray{st.outlineR, st.outlineG, st.outlineB};
+    if (st.shadow != def.shadow) style["shadow"] = st.shadow;
+    if (st.shadowOpacity != def.shadowOpacity) style["shadowOpacity"] = st.shadowOpacity;
+    if (st.allCaps) style["allCaps"] = true;
     QJsonArray items;
     for (const Caption& c : t.captions) {
         QJsonArray item{double(c.start), double(c.end), qs(c.text)};
@@ -389,6 +393,11 @@ CaptionTrack captionTrackFromJson(const QJsonObject& o) {
     st.animation = so.value("animation").toInt(def.animation);
     const QJsonArray hc = so.value("highlight").toArray();
     if (hc.size() == 3) st.hiR = hc.at(0).toDouble(), st.hiG = hc.at(1).toDouble(), st.hiB = hc.at(2).toDouble();
+    const QJsonArray oc = so.value("outlineColor").toArray();
+    if (oc.size() == 3) st.outlineR = oc.at(0).toDouble(), st.outlineG = oc.at(1).toDouble(), st.outlineB = oc.at(2).toDouble();
+    st.shadow = so.value("shadow").toDouble(def.shadow);
+    st.shadowOpacity = so.value("shadowOpacity").toDouble(def.shadowOpacity);
+    st.allCaps = so.value("allCaps").toBool(false);
     for (const auto& v : o.value("captions").toArray()) {
         const QJsonArray a = v.toArray();
         if (a.size() < 3) continue;
@@ -521,6 +530,19 @@ Sequence sequenceFromJson(const QJsonObject& o) {
 }
 
 }  // namespace
+
+std::string captionStyleToJsonString(const CaptionStyle& st) {
+    CaptionTrack t;
+    t.style = st;
+    return QJsonDocument(captionTrackToJson(t).value("style").toObject()).toJson(QJsonDocument::Compact).toStdString();
+}
+
+bool captionStyleFromJsonString(const std::string& json, CaptionStyle& out) {
+    const QJsonDocument d = QJsonDocument::fromJson(QByteArray::fromStdString(json));
+    if (!d.isObject()) return false;
+    out = captionTrackFromJson(QJsonObject{{"style", d.object()}}).style;
+    return true;
+}
 
 std::string clipToJsonString(const Clip& c) {
     return QJsonDocument(clipToJson(c)).toJson(QJsonDocument::Compact).toStdString();

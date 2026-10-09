@@ -22,6 +22,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QMenu>
+#include <functional>
 #include <QMessageBox>
 #include <QPushButton>
 #include <QSaveFile>
@@ -34,6 +35,7 @@
 #include <algorithm>
 
 #include "EditorState.h"
+#include "core/ProjectIO.h"
 #include "ModelPacks.h"
 #include "SpeechDialog.h"
 #include "core/EditOps.h"
@@ -744,6 +746,14 @@ void CaptionsPanel::styleDialog() {
     QDialog dlg(this);
     dlg.setWindowTitle(tr("Caption Style"));
     auto* form = new QFormLayout(&dlg);
+    // A ready-made look to start from (or one saved earlier), then any changes.
+    auto* look = new QComboBox(&dlg);
+    look->setObjectName(QStringLiteral("captionLook"));
+    look->addItem(tr("Custom"), QString());
+    for (const CaptionLook& l : captionLooks()) look->addItem(tr(l.name.c_str()), QString::fromStdString(l.id));
+    for (const QString& name : savedLooks()) look->addItem(name, QStringLiteral("saved:") + name);
+    form->addRow(tr("Look:"), look);
+    std::vector<std::function<void()>> refresh;  // puts the controls back to `st`
     auto* font = new QFontComboBox(&dlg);
     font->setCurrentFont(QFont(QString::fromStdString(st.font)));
     auto* size = new QDoubleSpinBox(&dlg);
@@ -759,6 +769,7 @@ void CaptionsPanel::styleDialog() {
             btn->setStyleSheet(QStringLiteral("background-color: %1;").arg(QColor::fromRgbF(float(r), float(g), float(b)).name()));
         };
         paint();
+        refresh.push_back(paint);
         connect(btn, &QPushButton::clicked, &dlg, [&, paint] {
             const QColor c = QColorDialog::getColor(QColor::fromRgbF(float(r), float(g), float(b)), &dlg);
             if (!c.isValid()) return;
@@ -788,6 +799,17 @@ void CaptionsPanel::styleDialog() {
     form->addRow(tr("Background:"), box);
     form->addRow(tr("Background colour:"), colourButton(st.boxR, st.boxG, st.boxB));
     form->addRow(tr("Outline:"), outline);
+    form->addRow(tr("Outline colour:"), colourButton(st.outlineR, st.outlineG, st.outlineB));
+    auto* shadow = new QDoubleSpinBox(&dlg);
+    shadow->setObjectName(QStringLiteral("captionShadow"));
+    shadow->setRange(0, 30);
+    shadow->setSuffix(tr("% of text"));
+    shadow->setValue(st.shadow * 100);
+    form->addRow(tr("Shadow:"), shadow);
+    auto* caps = new QCheckBox(tr("All capitals"), &dlg);
+    caps->setObjectName(QStringLiteral("captionAllCaps"));
+    caps->setChecked(st.allCaps);
+    form->addRow(QString(), caps);
     form->addRow(tr("Bottom edge:"), position);
     // Word animation (from the words' timings when the captions came from a transcript).
     auto* animation = new QComboBox(&dlg);
@@ -797,6 +819,50 @@ void CaptionsPanel::styleDialog() {
     animation->setToolTip(tr("Animate captions word by word, as social video does"));
     form->addRow(tr("Animation:"), animation);
     form->addRow(tr("Highlight colour:"), colourButton(st.hiR, st.hiG, st.hiB));
+    refresh.push_back([&] {
+        font->setCurrentFont(QFont(QString::fromStdString(st.font)));
+        size->setValue(st.size * 100);
+        bold->setChecked(st.bold);
+        box->setValue(int(std::lround(st.boxOpacity * 100)));
+        outline->setValue(st.outline * 100);
+        shadow->setValue(st.shadow * 100);
+        caps->setChecked(st.allCaps);
+        position->setValue(int(std::lround(st.position * 100)));
+        animation->setCurrentIndex(std::clamp(st.animation, 0, 4));
+    });
+    connect(look, &QComboBox::activated, &dlg, [&](int i) {
+        const QString id = look->itemData(i).toString();
+        CaptionStyle chosen;
+        if (id.startsWith(QStringLiteral("saved:"))) {
+            if (!captionStyleFromJsonString(appSettings().value("captions/looks/" + id.mid(6)).toString().toStdString(), chosen)) return;
+        } else if (const CaptionLook* l = findCaptionLook(id.toStdString())) {
+            chosen = l->style;
+        } else {
+            return;
+        }
+        st = chosen;
+        for (auto& f : refresh) f();
+    });
+    auto* save = new QPushButton(tr("Save Look…"), &dlg);
+    save->setToolTip(tr("Keep these settings as a look of your own, for other tracks and projects"));
+    connect(save, &QPushButton::clicked, &dlg, [&] {
+        bool ok = false;
+        const QString name = QInputDialog::getText(&dlg, tr("Save Look"), tr("Name:"), QLineEdit::Normal, QString(), &ok).trimmed();
+        if (!ok || name.isEmpty()) return;
+        CaptionStyle now = st;
+        now.font = font->currentFont().family().toStdString();
+        now.size = size->value() / 100.0;
+        now.bold = bold->isChecked();
+        now.boxOpacity = box->value() / 100.0;
+        now.outline = outline->value() / 100.0;
+        now.shadow = shadow->value() / 100.0;
+        now.allCaps = caps->isChecked();
+        now.position = position->value() / 100.0;
+        now.animation = animation->currentIndex();
+        appSettings().setValue("captions/looks/" + name, QString::fromStdString(captionStyleToJsonString(now)));
+        look->addItem(name, QStringLiteral("saved:") + name);
+    });
+    form->addRow(QString(), save);
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
     connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
     connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
@@ -807,6 +873,8 @@ void CaptionsPanel::styleDialog() {
     st.bold = bold->isChecked();
     st.boxOpacity = box->value() / 100.0;
     st.outline = outline->value() / 100.0;
+    st.shadow = shadow->value() / 100.0;
+    st.allCaps = caps->isChecked();
     st.position = position->value() / 100.0;
     st.animation = animation->currentIndex();
     editTrack(tr("Caption Style"), [st](CaptionTrack& tr) {
@@ -961,6 +1029,34 @@ int CaptionsPanel::findReplace(const QString& find, const QString& replace, bool
         return (n = replaceInCaptions(t.captions, rows, find.toStdString(), replace.toStdString(), caseSensitive, wholeWords)) > 0;
     });
     return n;
+}
+
+QStringList CaptionsPanel::savedLooks() const {
+    QSettings st = appSettings();
+    st.beginGroup(QStringLiteral("captions/looks"));
+    QStringList names = st.childKeys();
+    names.sort(Qt::CaseInsensitive);
+    return names;
+}
+
+bool CaptionsPanel::applyLook(const QString& idOrName) {
+    CaptionStyle chosen;
+    if (const CaptionLook* l = findCaptionLook(idOrName.toStdString())) chosen = l->style;
+    else if (!captionStyleFromJsonString(appSettings().value("captions/looks/" + idOrName).toString().toStdString(), chosen) ||
+             !savedLooks().contains(idOrName))
+        return false;
+    return editTrack(tr("Caption Look"), [chosen](CaptionTrack& t) {
+        if (t.style == chosen) return false;
+        t.style = chosen;
+        return true;
+    });
+}
+
+bool CaptionsPanel::saveLook(const QString& name) {
+    const CaptionTrack* t = track();
+    if (!t || name.trimmed().isEmpty() || name.contains('/') || findCaptionLook(name.trimmed().toStdString())) return false;
+    appSettings().setValue("captions/looks/" + name.trimmed(), QString::fromStdString(captionStyleToJsonString(t->style)));
+    return true;
 }
 
 bool CaptionsPanel::placeCaptions(int vertical, int align) {

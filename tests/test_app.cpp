@@ -3217,6 +3217,44 @@ private slots:
         state()->newProject();
     }
 
+    void captionLooksInPanel() {
+        auto* panel = win_->findChild<CaptionsPanel*>();
+        QVERIFY(panel);
+        state()->newProject();
+        Id track = 0;
+        QVERIFY(state()->edit("Captions", [&](Project& p, Sequence& s) {
+            CaptionTrack t;
+            t.id = track = p.newId();
+            t.captions = {{0, 30, "One", {}}};
+            s.captionTracks.push_back(t);
+            return true;
+        }));
+        panel->setCurrentTrack(track);
+        auto style = [&] { return state()->sequence()->captionTracks.front().style; };
+        // A built-in look in one undo step; the same again is no edit.
+        QVERIFY(panel->applyLook("creator_pop"));
+        QVERIFY(style() == findCaptionLook("creator_pop")->style);
+        QVERIFY(!panel->applyLook("creator_pop"));
+        QVERIFY(!panel->applyLook("no_such_look"));
+        state()->undo();
+        QVERIFY(style() == CaptionStyle{});
+        // A look of one's own: saved from the track, offered by name, applied elsewhere.
+        QVERIFY(state()->edit("Tweak", [](Project&, Sequence& s) {
+            s.captionTracks.front().style.shadow = 0.1;
+            s.captionTracks.front().style.allCaps = true;
+            return true;
+        }));
+        QVERIFY(panel->saveLook("House Style"));
+        QVERIFY(!panel->saveLook("classic"));  // a built-in's name
+        QVERIFY(!panel->saveLook("a/b"));
+        QVERIFY(panel->savedLooks().contains("House Style"));
+        const CaptionStyle house = style();
+        QVERIFY(panel->applyLook("neon"));
+        QVERIFY(panel->applyLook("House Style"));
+        QVERIFY(style() == house);
+        state()->newProject();
+    }
+
     void captionsPanelPlacement() {
         auto* panel = win_->findChild<CaptionsPanel*>();
         QVERIFY(panel);

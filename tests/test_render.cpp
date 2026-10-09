@@ -2295,6 +2295,45 @@ colorspaces:
         QCOMPARE(renderToCache(p, s, 0, 59, o, again, {}, &stop), -1);
     }
 
+    void captionLooksDrawn() {
+        // White text over mid grey, so a shadow (darker) and a coloured outline both show.
+        CaptionTrack track;
+        track.style = findCaptionLook("broadcast")->style;
+        track.style.size = 0.12;
+        track.captions = {{0, 10, "shadow test"}};
+        auto draw = [&] {
+            Image img(320, 180);
+            img.fill(0.5f, 0.5f, 0.5f, 1);
+            drawCaption(img, track, 5);
+            return img;
+        };
+        auto count = [](const Image& img, auto pred) {
+            int n = 0;
+            for (int y = 0; y < 180; ++y)
+                for (int x = 0; x < 320; ++x)
+                    if (pred(img.at(x, y))) ++n;
+            return n;
+        };
+        auto dark = [](const float* p) { return p[0] < 0.25f && p[1] < 0.25f && p[2] < 0.25f; };
+        auto magenta = [](const float* p) { return p[0] > 0.6f && p[1] < 0.3f && p[2] > 0.5f; };
+        auto white = [](const float* p) { return p[0] > 0.9f && p[1] > 0.9f && p[2] > 0.9f; };
+        // The shadow and black outline darken more of the frame than the outline alone.
+        const int withShadow = count(draw(), dark);
+        track.style.shadow = 0;
+        const int outlineOnly = count(draw(), dark);
+        QVERIFY2(withShadow > outlineOnly * 1.2, qPrintable(QString("%1 %2").arg(withShadow).arg(outlineOnly)));
+        // A magenta outline instead of black.
+        track.style.outlineR = 0.9, track.style.outlineG = 0.1, track.style.outlineB = 0.8;
+        QVERIFY(count(draw(), magenta) > 100);
+        QVERIFY(count(draw(), dark) < outlineOnly / 4);
+        // Capitals take more room than lower case.
+        track.style.outline = 0;
+        const int lower = count(draw(), white);
+        track.style.allCaps = true;
+        const int upper = count(draw(), white);
+        QVERIFY2(upper > lower * 1.15, qPrintable(QString("%1 %2").arg(upper).arg(lower)));
+    }
+
     void captionPlacementDrawn() {
         // Where the ink of a caption falls: the usual bottom centre, the top left, the middle right.
         CaptionTrack track;

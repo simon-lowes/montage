@@ -30,8 +30,22 @@ struct CaptionStyle {
     // said, large).
     int animation = 0;
     double hiR = 1, hiG = 0.84, hiB = 0.1;  // highlight colour
+    double outlineR = 0, outlineG = 0, outlineB = 0;  // outline colour
+    double shadow = 0;            // drop shadow offset, fraction of the text height; 0 = none
+    double shadowOpacity = 0.6;
+    bool allCaps = false;         // shown in capitals (the text itself is unchanged)
     bool operator==(const CaptionStyle&) const = default;
 };
+
+// Ready-made caption looks (Descript's and CapCut's caption styles): from the
+// classic boxed subtitle to bold social-video captions with the spoken word
+// popping. A look sets the whole style.
+struct CaptionLook {
+    std::string id, name;
+    CaptionStyle style;
+};
+const std::vector<CaptionLook>& captionLooks();
+const CaptionLook* findCaptionLook(const std::string& id);
 
 // Where a caption sits when not where the track's style puts every caption
 // (bottom centre): at the top (clear of lower thirds and other text in the

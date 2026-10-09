@@ -1529,6 +1529,40 @@ private slots:
         QVERIFY(level(musik, 880) > 20 * level(musik, 440));
     }
 
+    void captionStyleOverMcp() {
+        Project q = makeDefaultProject();
+        CaptionTrack t;
+        t.id = q.newId();
+        t.captions = {{0, 30, "Hi"}};
+        q.active()->captionTracks.push_back(t);
+        const QString project = QString::fromStdString(path("styled.montage"));
+        QVERIFY(saveProject(q, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_caption_style"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        // Nothing to set: the looks.
+        QJsonObject r = call({{"project", project}});
+        QCOMPARE(r.value("structuredContent").toObject().value("looks").toArray().size(), 9);
+        // Karaoke, then larger, with a green highlight and capitals.
+        r = call({{"project", project}, {"look", "karaoke"}, {"size", 8}, {"highlight_color", "#33ff55"}, {"all_caps", true}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const CaptionStyle& st = back.active()->captionTracks.front().style;
+        QCOMPARE(st.animation, 2);
+        QVERIFY(std::fabs(st.size - 0.08) < 1e-9 && st.allCaps);
+        QVERIFY(std::fabs(st.hiG - 1.0) < 1e-6 && st.hiR < 0.25);
+        QVERIFY(call({{"project", project}, {"color", "not a colour"}}).value("isError").toBool());
+        QVERIFY(call({{"project", project}, {"look", "vaporwave"}}).value("isError").toBool());
+        QVERIFY(call({{"project", project}, {"size", 90}}).value("isError").toBool());
+    }
+
     void clipAnimationOverMcp() {
         Project q = makeDefaultProject();
         Clip c = makeGeneratorClip(q, "color", 90);

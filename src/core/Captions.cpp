@@ -84,6 +84,84 @@ bool parseCaptionPlace(const std::string& words, int& vertical, int& align) {
     return true;
 }
 
+const std::vector<CaptionLook>& captionLooks() {
+    static const std::vector<CaptionLook> looks = [] {
+        auto look = [](const char* id, const char* name, auto set) {
+            CaptionStyle st;
+            set(st);
+            return CaptionLook{id, name, st};
+        };
+        auto rgb = [](double& r, double& g, double& b, double R, double G, double B) { r = R, g = G, b = B; };
+        return std::vector<CaptionLook>{
+            look("classic", "Classic (boxed)", [](CaptionStyle&) {}),
+            look("broadcast", "Broadcast (outline and shadow)", [&](CaptionStyle& s) {
+                s.boxOpacity = 0;
+                s.outline = 0.05;
+                s.shadow = 0.06;
+            }),
+            look("bold_yellow", "Bold Yellow", [&](CaptionStyle& s) {
+                s.boxOpacity = 0;
+                s.bold = true;
+                rgb(s.textR, s.textG, s.textB, 1, 0.86, 0.1);
+                s.outline = 0.07;
+                s.shadow = 0.05;
+            }),
+            look("creator_pop", "Creator Pop", [&](CaptionStyle& s) {
+                s.boxOpacity = 0;
+                s.bold = true;
+                s.allCaps = true;
+                s.size = 0.075;
+                s.position = 0.72;
+                s.outline = 0.09;
+                s.shadow = 0.05;
+                s.animation = 3;  // pop the spoken word
+                rgb(s.hiR, s.hiG, s.hiB, 0.3, 1, 0.35);
+            }),
+            look("karaoke", "Karaoke", [&](CaptionStyle& s) {
+                s.boxOpacity = 0;
+                s.bold = true;
+                s.outline = 0.06;
+                s.animation = 2;  // highlight the spoken word
+                rgb(s.hiR, s.hiG, s.hiB, 1, 0.84, 0.1);
+            }),
+            look("one_word", "One Word", [&](CaptionStyle& s) {
+                s.boxOpacity = 0;
+                s.allCaps = true;
+                s.position = 0.6;
+                s.outline = 0.08;
+                s.animation = 4;
+            }),
+            look("minimal", "Minimal", [&](CaptionStyle& s) {
+                s.boxOpacity = 0;
+                s.size = 0.042;
+                s.shadow = 0.08;
+                s.shadowOpacity = 0.8;
+            }),
+            look("paper", "Paper (dark on light)", [&](CaptionStyle& s) {
+                rgb(s.textR, s.textG, s.textB, 0.08, 0.08, 0.08);
+                rgb(s.boxR, s.boxG, s.boxB, 1, 1, 1);
+                s.boxOpacity = 0.92;
+                s.bold = true;
+            }),
+            look("neon", "Neon", [&](CaptionStyle& s) {
+                s.boxOpacity = 0;
+                s.bold = true;
+                rgb(s.textR, s.textG, s.textB, 0.35, 0.95, 1);
+                rgb(s.outlineR, s.outlineG, s.outlineB, 0.85, 0.1, 0.75);
+                s.outline = 0.06;
+                s.shadow = 0.04;
+            }),
+        };
+    }();
+    return looks;
+}
+
+const CaptionLook* findCaptionLook(const std::string& id) {
+    for (const CaptionLook& l : captionLooks())
+        if (l.id == id) return &l;
+    return nullptr;
+}
+
 void normalizeCaptions(std::vector<Caption>& captions) {
     for (auto& c : captions) c.text = QString::fromStdString(c.text).trimmed().toStdString();
     captions.erase(std::remove_if(captions.begin(), captions.end(),

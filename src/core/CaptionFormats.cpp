@@ -593,7 +593,9 @@ std::string captionsToAss(const std::vector<Caption>& captions, Rational fps, co
     const bool box = style.boxOpacity > 0;
     const std::string text = assColour(style.textR, style.textG, style.textB, 1);
     const std::string back = box ? assColour(style.boxR, style.boxG, style.boxB, style.boxOpacity) : assColour(0, 0, 0, 0.5);
-    const std::string outline = box ? back : assColour(0, 0, 0, 1);
+    const std::string outline = box ? back : assColour(style.outlineR, style.outlineG, style.outlineB, 1);
+    // Without a box, ASS draws the shadow in the back colour.
+    const std::string shadowColour = assColour(0, 0, 0, style.shadowOpacity);
     const int border = box ? std::max(1, int(std::lround(size * 0.15))) : int(std::lround(style.outline * size));
     std::string font = style.font.empty() ? "Sans Serif" : style.font;
     std::replace(font.begin(), font.end(), ',', ' ');
@@ -602,8 +604,10 @@ std::string captionsToAss(const std::vector<Caption>& captions, Rational fps, co
     out += "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, "
            "Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, "
            "MarginV, Encoding\n";
-    out += "Style: Default," + font + "," + std::to_string(size) + "," + text + "," + text + "," + outline + "," + back + "," +
-           (style.bold ? "-1" : "0") + ",0,0,0,100,100,0,0," + (box ? "3" : "1") + "," + std::to_string(border) + ",0,2," +
+    const int shadow = box ? 0 : int(std::lround(style.shadow * size));
+    out += "Style: Default," + font + "," + std::to_string(size) + "," + text + "," + text + "," + outline + "," +
+           (box || shadow == 0 ? back : shadowColour) + "," + (style.bold ? "-1" : "0") + ",0,0,0,100,100,0,0," + (box ? "3" : "1") + "," +
+           std::to_string(border) + "," + std::to_string(shadow) + ",2," +
            std::to_string(W / 20) + "," + std::to_string(W / 20) + "," +
            std::to_string(std::max(0, int(std::lround((1 - style.position) * H)))) + ",1\n\n";
     out += "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n";
@@ -611,6 +615,7 @@ std::string captionsToAss(const std::vector<Caption>& captions, Rational fps, co
         const QStringList lines = captionLines(c.text);
         if (lines.isEmpty() || c.end <= c.start) continue;
         QString t = lines.join(QStringLiteral("\\N"));
+        if (style.allCaps) t = t.toUpper();  // the line breaks are \N already
         t.replace('{', '(').replace('}', ')');  // braces open override tags
         if (const int k = captionKeypad(c); k != 2) t.prepend(QStringLiteral("{\\an%1}").arg(k));
         out += "Dialogue: 0," + assTime(double(c.start) / f) + "," + assTime(double(c.end) / f) + ",Default,,0,0,0,," +

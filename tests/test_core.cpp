@@ -777,6 +777,33 @@ private slots:
         QVERIFY(!edit::setClipAnimation(s, s.audioTracks[0].clips.back().id, AnimationSlot::In, "fade").ok);
     }
 
+    void captionLooks() {
+        // Nine looks, each different, found by id; Creator Pop is bold capitals with the spoken word popping.
+        QCOMPARE(montage::captionLooks().size(), size_t(9));
+        for (size_t i = 0; i < montage::captionLooks().size(); ++i)
+            for (size_t j = i + 1; j < montage::captionLooks().size(); ++j)
+                QVERIFY(!(montage::captionLooks()[i].style == montage::captionLooks()[j].style));
+        const CaptionLook* pop = findCaptionLook("creator_pop");
+        QVERIFY(pop && pop->style.allCaps && pop->style.bold && pop->style.animation == 3 && pop->style.boxOpacity == 0);
+        QVERIFY(findCaptionLook("classic")->style == CaptionStyle{});
+        QVERIFY(!findCaptionLook("comic_sans"));
+        // The new settings saved in projects and as a look of one's own.
+        CaptionStyle st = findCaptionLook("neon")->style;
+        st.shadow = 0.12;
+        st.shadowOpacity = 0.4;
+        st.allCaps = true;
+        CaptionStyle back;
+        QVERIFY(captionStyleFromJsonString(captionStyleToJsonString(st), back));
+        QVERIFY(back == st);
+        QVERIFY(!captionStyleFromJsonString("not json", back));
+        // ASS: the outline's colour, the shadow's distance and opacity, capitals in the text.
+        std::vector<Caption> caps = {{0, 25, "Shout it"}};
+        const std::string ass = captionsToAss(caps, Rational{25, 1}, st, 1920, 1080);
+        // 54 px text: an outline of 3 px (6 %), a shadow of 6 px (12 %); outline magenta, back colour 60 % transparent black.
+        QVERIFY2(ass.find("&H00BF1AD9,&H99000000,-1,0,0,0,100,100,0,0,1,3,6,2,") != std::string::npos, ass.c_str());
+        QVERIFY2(ass.find(",,SHOUT IT") != std::string::npos, ass.c_str());
+    }
+
     void captionsFromClipTranscripts() {
         Project p = makeDefaultProject();
         Sequence& s = *p.active();

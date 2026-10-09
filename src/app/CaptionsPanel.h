@@ -71,6 +71,11 @@ public:
     bool placeCaptions(int vertical, int align);
     // Moves captions shown over low titles (lower thirds, crawls) to the top; how many moved.
     int raiseOverTitles();
+    // Caption looks: the built-in ones (by id) and the editor's own saved ones (by name, remembered between sessions).
+    // Applying one restyles the current track in one undo step; saving keeps the current track's style under a name.
+    QStringList savedLooks() const;
+    bool applyLook(const QString& idOrName);
+    bool saveLook(const QString& name);
 
 public slots:
     void generateDialog();

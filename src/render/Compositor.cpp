@@ -1001,7 +1001,7 @@ void drawCaption(Image& img, const CaptionTrack& track, FrameTime t, const Color
         double x = 0, w = 0;  // within the line
     };
     std::vector<Word> words;
-    QStringList lines = QString::fromStdString(cap->text).split('\n');
+    QStringList lines = (st.allCaps ? QString::fromStdString(cap->text).toUpper() : QString::fromStdString(cap->text)).split('\n');
     {
         int index = 0;
         for (int li = 0; li < lines.size(); ++li) {
@@ -1041,7 +1041,7 @@ void drawCaption(Image& img, const CaptionTrack& track, FrameTime t, const Color
     auto leftOf = [&](double w) {
         return cap->align == kCaptionLeft ? margin : cap->align == kCaptionRight ? img.width - margin - w : img.width / 2.0 - w / 2;
     };
-    const double grow = anim == 3 ? 0.25 : 0.0;  // room for a popped word
+    const double grow = (anim == 3 ? 0.25 : 0.0) + std::max(0.0, st.shadow) + std::max(0.0, st.outline);  // room for a popped word, shadow, outline
     // Render only the caption's area, then blend it over the frame.
     const int x0 = std::max(0, int(std::floor(leftOf(blockW) - padX - 2 - grow * px)));
     const int x1 = std::min(img.width, int(std::ceil(leftOf(blockW) + blockW + padX + 2 + grow * px)));
@@ -1100,8 +1100,19 @@ void drawCaption(Image& img, const CaptionTrack& track, FrameTime t, const Color
                 }
             }
         }
-        if (st.outline > 0 || anim == 4) {
-            const QPen pen(QColor(0, 0, 0), std::max(st.outline, anim == 4 ? 0.06 : 0.0) * px * 2, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+        const double outlineWidth = std::max(st.outline, anim == 4 ? 0.06 : 0.0) * px * 2;
+        if (st.shadow > 0) {
+            // A soft-edged drop shadow down and to the right, under the outline too.
+            const QPointF off(st.shadow * px, st.shadow * px);
+            QPainterPath both = text;
+            both.addPath(said);
+            both.translate(off);
+            const QColor sc = col(0, 0, 0, st.shadowOpacity);
+            if (outlineWidth > 0) pa.strokePath(both, QPen(sc, outlineWidth, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+            pa.fillPath(both, sc);
+        }
+        if (outlineWidth > 0) {
+            const QPen pen(col(st.outlineR, st.outlineG, st.outlineB, 1), outlineWidth, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
             pa.strokePath(text, pen);
             pa.strokePath(said, pen);
         }
