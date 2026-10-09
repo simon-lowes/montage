@@ -57,6 +57,7 @@
 #include "media/Vector.h"
 #include "media/Beats.h"
 #include "render/Spherical.h"
+#include "render/ExtendClip.h"
 #include "render/ReviewExport.h"
 #include "render/Versions.h"
 #include "render/ClipPlacement.h"
@@ -1575,6 +1576,136 @@ private slots:
         QCOMPARE(title, std::string("Musik"));
         QVERIFY2(lang == "ger" || lang == "deu", lang.c_str());
         QVERIFY(level(musik, 880) > 20 * level(musik, 440));
+    }
+
+    void extendClipPastItsEnd() {
+        // A pan: a textured ground sliding left 4 px a frame for a second, over a steady room.
+        const int frames = 25;
+        QImage ground(960, 360, QImage::Format_RGB32);
+        std::mt19937 rng(5);
+        std::normal_distribution<double> noise(0, 12);
+        for (int y = 0; y < 360; ++y)
+            for (int x = 0; x < 960; ++x) {
+                const double r = 90 + 50 * std::sin(x / 17.0) + 30 * std::cos(y / 11.0) + noise(rng);
+                const double g = 110 + 40 * std::sin((x + y) / 23.0) + noise(rng);
+                const double b = 120 + 45 * std::cos(x / 29.0 + y / 31.0) + noise(rng);
+                ground.setPixel(x, y, qRgb(std::clamp(int(r), 0, 255), std::clamp(int(g), 0, 255), std::clamp(int(b), 0, 255)));
+            }
+        const QString png = QString::fromStdString(path("pan-ground.png"));
+        QVERIFY(ground.save(png));
+        std::vector<float> room(size_t(48000) * 2);
+        std::normal_distribution<double> hiss(0, 0.01);
+        for (float& v : room) v = float(hiss(rng));
+        const std::string roomWav = path("pan-room.wav");
+        QVERIFY(writeMonoWav(roomWav, room, 48000));
+        const std::string video = path("pan.mov");
+        {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 640, gs.height = 360, gs.fps = {25, 1};
+            MediaItem mg = probeOrFail(gen, png.toStdString()), mr = probeOrFail(gen, roomWav);
+            gen.media.push_back(mg);
+            gen.media.push_back(mr);
+            Clip g = makeClip(gen, mg, TrackKind::Video, gs);
+            g.duration = frames;
+            g.motion = makeEffect(gen, "transform");
+            g.motion.params["scale"] = Param(150.0);  // the 960-wide ground at its own size (fitted, it would be 640 wide)
+            for (int i = 0; i < frames; ++i) g.motion.params["pos_x"].addKey(i, 160 - 4 * i, Interp::Hold);
+            QVERIFY(edit::overwrite(gen, gs, {TrackKind::Video, 0}, g).ok);
+            Clip a = makeClip(gen, mr, TrackKind::Audio, gs);
+            a.duration = frames;
+            QVERIFY(edit::overwrite(gen, gs, {TrackKind::Audio, 0}, a).ok);
+            ExportSettings st = findExportPreset("Apple ProRes 422")->settings;
+            st.path = video;
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 640, s.height = 360, s.fps = {25, 1};
+        MediaItem mi = probeOrFail(p, video);
+        p.media.push_back(mi);
+        QVERIFY(edit::placeMedia(p, s, mi.id, 0, 0, frames, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Id shot = s.videoTracks[0].clips.at(0).id;
+        // The motion at the end: 4 px a frame to the left.
+        EndMotion m;
+        std::string err;
+        QVERIFY2(measureEndMotion(p, s, *edit::clipById(s, shot), m, &err), err.c_str());
+        QVERIFY2(std::fabs(m.dx + 4) < 0.6 && std::fabs(m.dy) < 0.6 && std::fabs(m.zoom) < 0.005,
+                 qPrintable(QString("%1 %2 %3").arg(m.dx).arg(m.dy).arg(m.zoom)));
+        QVERIFY(m.samples > 0);
+        // A second more: the last frame held, carrying on left and settling, scaled to stay full.
+        Id made = 0;
+        QVERIFY2(extendClip(p, s, shot, 25, m, false, &made, &err), err.c_str());
+        const Clip& c = *edit::clipById(s, shot);
+        const Clip& e = *edit::clipById(s, made);
+        QCOMPARE(e.start, c.end());
+        QCOMPARE(e.duration, FrameTime(25));
+        QCOMPARE(e.timing.p("speed", 0, 100), 0.0);
+        QCOMPARE(e.sourceIn, c.sourceFrameAt(c.end() - 1));
+        QVERIFY(e.name.find("(extended)") != std::string::npos);
+        const double x0 = e.motion.p("pos_x", 0), x1 = e.motion.p("pos_x", 1), xEnd = e.motion.p("pos_x", 24);
+        QVERIFY2(std::fabs((x1 - x0) - m.dx * std::pow(24.0 / 25, 2)) < 1e-6, qPrintable(QString::number(x1 - x0)));
+        QVERIFY2(xEnd - x0 < -25 && xEnd - x0 > -38, qPrintable(QString::number(xEnd - x0)));
+        QVERIFY(std::fabs(e.motion.p("pos_x", 24) - e.motion.p("pos_x", 23)) < 0.1);  // at rest by the end
+        QCOMPARE(e.motion.p("scale", 0, 100), 100.0);
+        QVERIFY(e.motion.p("scale", 24, 100) > 105);
+        // The cut into the extension is seamless; its last frame still fills the screen.
+        RenderOptions ro;
+        const Image last = renderProgramFrame(p, s, c.end() - 1, ro), first = renderProgramFrame(p, s, e.start, ro);
+        double d = 0;
+        for (int y = 0; y < 360; ++y)
+            for (int x = 0; x < 640; ++x)
+                for (int k = 0; k < 3; ++k) d += std::fabs(last.at(x, y)[k] - first.at(x, y)[k]);
+        QVERIFY2(d / (640.0 * 360 * 3) < 0.01, qPrintable(QString::number(d / (640.0 * 360 * 3))));
+        const Image end = renderProgramFrame(p, s, e.end() - 1, ro);
+        for (int x : {0, 639}) {
+            double col = 0;
+            for (int y = 0; y < 360; ++y) col += end.at(x, y)[0] + end.at(x, y)[1] + end.at(x, y)[2];
+            QVERIFY2(col / 360 > 0.3, qPrintable(QString("column %1: %2").arg(x).arg(col / 360)));
+        }
+        // Something right after it: refused, unless rippling, which pushes it along.
+        Project q = p;
+        Sequence& qs = *q.active();
+        std::erase_if(qs.videoTracks[0].clips, [&](const Clip& x) { return x.id == made; });
+        Clip after = makeGeneratorClip(q, "color", 10);
+        after.start = c.end();
+        QVERIFY(edit::overwrite(q, qs, {TrackKind::Video, 0}, after).ok);
+        QVERIFY(!extendClip(q, qs, shot, 25, m, false, nullptr, &err));
+        QVERIFY(extendClip(q, qs, shot, 25, m, true, nullptr, &err));
+        QCOMPARE(edit::clipById(qs, after.id)->start, c.end() + 25);
+        // Over MCP: with the room's tone under the sound, linked to the picture.
+        const QString project = QString::fromStdString(path("extend.montage"));
+        Project fresh = makeDefaultProject();
+        Sequence& fs = *fresh.active();
+        fs.width = 640, fs.height = 360, fs.fps = {25, 1};
+        MediaItem fm = probeOrFail(fresh, video);
+        fresh.media.push_back(fm);
+        QVERIFY(edit::placeMedia(fresh, fs, fm.id, 0, 0, frames, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Id freshShot = fs.videoTracks[0].clips.at(0).id;
+        QVERIFY(saveProject(fresh, project.toStdString()));
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_extend_clip"},
+                                                     {"arguments", QJsonObject{{"project", project}, {"clip", double(freshShot)}, {"seconds", 0.6}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("clips").toArray().size(), 2);
+        QVERIFY(r.value("structuredContent").toObject().value("dx").toDouble() < -3);
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Track& v1 = back.active()->videoTracks[0];
+        const Track& a1 = back.active()->audioTracks[0];
+        QCOMPARE(v1.clips.size(), size_t(2));
+        QCOMPARE(a1.clips.size(), size_t(2));
+        QCOMPARE(v1.clips[1].duration, FrameTime(15));
+        QCOMPARE(a1.clips[1].start, FrameTime(frames));
+        QCOMPARE(a1.clips[1].duration, FrameTime(15));
+        QVERIFY(v1.clips[1].linkGroup != 0 && v1.clips[1].linkGroup == a1.clips[1].linkGroup);
+        QVERIFY(back.findMedia(a1.clips[1].mediaId)->path.find("Room Tone") != std::string::npos);
     }
 
     void roomToneFill() {

@@ -902,6 +902,24 @@ void MainWindow::buildMenus() {
     add(clipM, tr("Auto Reframe"), QKeySequence(), [this] { autoReframeClips(); })->setObjectName(QStringLiteral("autoReframeClips"));
     add(clipM, tr("Add Frame &Hold"), QKeySequence("Shift+F"), [this] { addFrameHold(); })->setObjectName(QStringLiteral("addFrameHold"));
     {
+        QMenu* extendM = clipM->addMenu(tr("E&xtend Clip"));
+        extendM->setObjectName(QStringLiteral("extendClipMenu"));
+        auto extendBy = [this](double seconds) {
+            const Clip* c = state_->primaryClip();
+            const Sequence* s = state_->sequence();
+            if (!c || !s) return state_->message(tr("Select a video clip to extend"));
+            extendClip(c->id, FrameTime(std::llround(seconds * s->fpsValue())));
+        };
+        add(extendM, tr("By 1 Second"), QKeySequence(), [extendBy] { extendBy(1); })->setObjectName(QStringLiteral("extendClip1s"));
+        add(extendM, tr("By 2 Seconds"), QKeySequence(), [extendBy] { extendBy(2); })->setObjectName(QStringLiteral("extendClip2s"));
+        add(extendM, tr("To the Playhead"), QKeySequence(), [this] {
+            const Clip* c = state_->primaryClip();
+            if (!c) return state_->message(tr("Select a video clip to extend"));
+            if (state_->playhead() <= c->end()) return state_->message(tr("Put the playhead after the clip's end"));
+            extendClip(c->id, state_->playhead() - c->end() + 1);
+        })->setObjectName(QStringLiteral("extendClipToPlayhead"));
+    }
+    {
         // Speed ramp presets on the selected clips: the same footage in the same length, paced differently.
         QMenu* ramps = clipM->addMenu(tr("Speed &Ramp"));
         for (const edit::SpeedRampPreset& r : edit::speedRampPresets()) {
@@ -4652,6 +4670,85 @@ void MainWindow::speedRamp(const std::string& preset, const QString& name) {
         }
         return any ? edit::Result{} : last;
     });
+}
+
+std::vector<Id> MainWindow::extendClip(Id clipId, FrameTime frames, bool ripple) {
+    const Sequence* s = state_->sequence();
+    const Clip* c = s ? edit::clipById(*s, clipId) : nullptr;
+    const auto loc = s ? edit::locate(*s, clipId) : std::nullopt;
+    if (!c || !loc || loc->track.kind != TrackKind::Video || frames <= 0) {
+        state_->message(tr("Select a video clip to extend"));
+        return {};
+    }
+    // How the picture moves at the end, and the room under the linked sound, measured off the UI thread.
+    const Project p = state_->project();
+    const Sequence seq = *s;
+    const Clip clip = *c;
+    std::vector<Clip> sounds;
+    for (Id id : edit::linkedClips(seq, clipId))
+        if (const auto l = edit::locate(seq, id); l && l->track.kind == TrackKind::Audio) sounds.push_back(*edit::clipById(seq, id));
+    EndMotion motion;
+    std::vector<RoomToneProfile> rooms(sounds.size());
+    if (!runWithProgress(this, state_, tr("Measuring the end of the shot..."), [&](const auto& progress, const auto* cancel, std::string* e) {
+            if (!measureEndMotion(p, seq, clip, motion, e, [&](double f) { progress(f * 0.7); }, cancel)) return false;
+            for (size_t i = 0; i < sounds.size(); ++i) clipRoomTone(p, seq, sounds[i], rooms[i], nullptr);  // silence: no fill
+            return true;
+        }))
+        return {};
+    // The room tone files, beside the project.
+    const QString project = state_->filePath();
+    const QString folder = (project.isEmpty() ? QStandardPaths::writableLocation(QStandardPaths::MusicLocation) + QStringLiteral("/Montage")
+                                              : QFileInfo(project).absolutePath()) +
+                           QStringLiteral("/Room Tone");
+    QStringList files;
+    std::vector<size_t> filled;
+    for (size_t i = 0; i < sounds.size(); ++i) {
+        if (!rooms[i].valid()) continue;
+        QDir().mkpath(folder);
+        QString path;
+        int n = 1;
+        do path = folder + '/' + QString::fromStdString(seq.name) + QStringLiteral(" Room Tone %1.wav").arg(n++);
+        while (QFileInfo::exists(path));
+        const int64_t samples = int64_t(std::llround(double(frames) / seq.fpsValue() * rooms[i].sampleRate));
+        if (!writeStereoWav(path.toStdString(), synthesizeRoomTone(rooms[i], samples, uint32_t(clipId + i)), rooms[i].sampleRate)) continue;
+        files << path;
+        filled.push_back(i);
+    }
+    const std::vector<Id> media = files.isEmpty() ? std::vector<Id>{} : state_->importFiles(files, nullptr, QStringLiteral("Room Tone"));
+    std::vector<Id> made;
+    std::string err;
+    const bool ok = state_->edit(tr("Extend Clip"), [&](Project& pr, Sequence& sq) {
+        Id video = 0;
+        if (!montage::extendClip(pr, sq, clipId, frames, motion, ripple, &video, &err)) return false;
+        made.push_back(video);
+        const Id group = pr.newId();
+        edit::clipById(sq, video)->linkGroup = group;
+        for (size_t k = 0; k < filled.size() && k < media.size(); ++k) {
+            const auto l = edit::locate(sq, sounds[filled[k]].id);
+            const Clip* a = edit::clipById(sq, sounds[filled[k]].id);
+            if (!l || !a) continue;
+            const FrameTime at = a->end();
+            const Track* tr = trackAt(sq, l->track);
+            const bool free = std::none_of(tr->clips.begin(), tr->clips.end(), [&](const Clip& o) { return o.start < at + frames && o.end() > at; });
+            if (!free || !edit::placeMedia(pr, sq, media[k], at, 0, frames, {TrackKind::Video, 0}, l->track, false).ok) continue;
+            for (Clip& o : trackAt(sq, l->track)->clips)
+                if (o.start == at && o.mediaId == media[k]) {
+                    o.linkGroup = group;
+                    made.push_back(o.id);
+                }
+        }
+        return true;
+    });
+    if (!ok) {
+        state_->message(QString::fromStdString(err), 6000);
+        return {};
+    }
+    state_->message(motion.samples ? tr("Extended %1 by %2, carrying on its motion").arg(QString::fromStdString(clip.name),
+                                                                                         QString::fromStdString(formatTimecode(frames, seq.fps)))
+                                   : tr("Extended %1 by %2 (held)").arg(QString::fromStdString(clip.name),
+                                                                         QString::fromStdString(formatTimecode(frames, seq.fps))),
+                    5000);
+    return made;
 }
 
 bool MainWindow::addFrameHold() {

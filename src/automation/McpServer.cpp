@@ -24,6 +24,7 @@
 #include "core/TranscriptCorrect.h"
 #include "core/SpellCheck.h"
 #include "core/ColorGroups.h"
+#include "render/ExtendClip.h"
 #include "render/ReviewExport.h"
 #include "render/RoomTone.h"
 #include "render/Versions.h"
@@ -859,6 +860,74 @@ void McpServer::Impl::addTools() {
                           .arg(20 * std::log10(prof.rms), 0, 'f', 1),
                       QJsonObject{{"clip", double(made)}, {"path", path}, {"level_db", 20 * std::log10(prof.rms)},
                                   {"start", tc(from, s)}, {"end", tc(end, s)}});
+        });
+
+    add("montage_extend_clip", "Extend a clip past its end",
+        "Carry a video clip on past the end of its media (a local counterpart to Premiere's Generative Extend): its last "
+        "frame is held while the camera's motion over the shot's final second (pan, drift, push) carries on and settles, "
+        "scaled so the frame stays filled, and the linked sound gets the room's own tone (a WAV in a Room Tone folder "
+        "beside the project). By `seconds` (default 1), or `to` a timecode. With `ripple` (default true) what follows "
+        "moves along; without it the space after the clip must be empty.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
+            "seconds":{"type":"number","default":1},"to":{"type":["number","string"]},"ripple":{"type":"boolean","default":true},
+            "sound":{"type":"boolean","default":true}},"required":["project","clip"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const Id id = clipArg(l, a).id;
+            const Clip* c = edit::clipById(s, id);
+            const auto loc = edit::locate(s, id);
+            if (!c || !loc || loc->track.kind != TrackKind::Video) throw ArgError{"\"clip\" is a video clip"};
+            FrameTime frames = FrameTime(std::llround(a.value("seconds").toDouble(1) * s.fpsValue()));
+            if (a.contains("to")) frames = timeArg(a.value("to"), s, "to") - c->end();
+            if (frames <= 0 || frames > FrameTime(std::llround(10 * s.fpsValue()))) throw ArgError{"Extend by more than nothing and at most 10 seconds"};
+            const Clip clip = *c;
+            EndMotion motion;
+            std::string err;
+            if (!measureEndMotion(l.project, s, clip, motion, &err, [this](double f) { progress(f * 0.8, "Measuring"); })) return fail(QString::fromStdString(err));
+            // The room under the linked sound.
+            std::vector<std::pair<Id, Id>> fills;  // audio clip, room tone media
+            if (a.value("sound").toBool(true)) {
+                const QString folder = QFileInfo(absolute(need(a, "project"))).absolutePath() + QStringLiteral("/Room Tone");
+                for (Id other : edit::linkedClips(s, id)) {
+                    const auto ol = edit::locate(s, other);
+                    if (!ol || ol->track.kind != TrackKind::Audio) continue;
+                    RoomToneProfile prof;
+                    if (!clipRoomTone(l.project, s, *edit::clipById(s, other), prof, nullptr)) continue;
+                    QDir().mkpath(folder);
+                    QString path;
+                    int n = 1;
+                    do path = folder + '/' + QString::fromStdString(s.name) + QStringLiteral(" Room Tone %1.wav").arg(n++);
+                    while (QFileInfo::exists(path));
+                    const int64_t samples = int64_t(std::llround(double(frames) / s.fpsValue() * prof.sampleRate));
+                    if (!writeStereoWav(path.toStdString(), synthesizeRoomTone(prof, samples, uint32_t(other)), prof.sampleRate, &err))
+                        return fail(QString::fromStdString(err));
+                    fills.push_back({other, mediaFor(l.project, path)});
+                }
+            }
+            Id video = 0;
+            if (!extendClip(l.project, s, id, frames, motion, a.value("ripple").toBool(true), &video, &err)) return fail(QString::fromStdString(err));
+            const Id group = l.project.newId();
+            edit::clipById(s, video)->linkGroup = group;
+            QJsonArray made{double(video)};
+            for (const auto& [audio, media] : fills) {
+                const auto al = edit::locate(s, audio);
+                const Clip* ac = edit::clipById(s, audio);
+                if (!al || !ac) continue;
+                const FrameTime at = ac->end();
+                const Track* tr = trackAt(s, al->track);
+                if (std::any_of(tr->clips.begin(), tr->clips.end(), [&](const Clip& o) { return o.start < at + frames && o.end() > at; })) continue;
+                check(edit::placeMedia(l.project, s, media, at, 0, frames, {TrackKind::Video, 0}, al->track, false));
+                for (Clip& o : trackAt(s, al->track)->clips)
+                    if (o.start == at && o.mediaId == media) o.linkGroup = group, made.append(double(o.id));
+            }
+            save(l);
+            return ok(QStringLiteral("Extended \"%1\" by %2 (%3)")
+                          .arg(QString::fromStdString(clip.name), tc(frames, s),
+                               motion.samples ? QStringLiteral("carrying on %1, %2 px a frame").arg(motion.dx, 0, 'f', 1).arg(motion.dy, 0, 'f', 1)
+                                              : QStringLiteral("held")),
+                      QJsonObject{{"clips", made}, {"dx", motion.dx}, {"dy", motion.dy}, {"zoom", motion.zoom}, {"turn", motion.turn},
+                                  {"frames", double(frames)}});
         });
 
     add("montage_move_clip", "Move a clip",

@@ -18,6 +18,7 @@
 #include "media/Image.h"
 #include "render/Shorts.h"
 #include "render/ReviewExport.h"
+#include "render/ExtendClip.h"
 #include "render/RoomTone.h"
 #include "render/Versions.h"
 
@@ -149,6 +150,10 @@ public:
     // when `to` is given, within the gap) with room tone learned from `source` (0 = the clip before the gap, or after
     // it). The new clip (0 if none).
     Id fillRoomTone(TrackRef track, FrameTime at, FrameTime to = 0, Id source = 0);
+    // Clip › Extend Clip (render/ExtendClip.h): the video clip carried on `frames` past its end (holding its last frame
+    // as its motion settles), with room tone under its linked sound, pushing what follows when `ripple`. One undo step;
+    // the new clips (the picture first).
+    std::vector<Id> extendClip(Id clip, FrameTime frames, bool ripple = true);
     void exportForReviewDialog();
     bool addToColorGroup(Id group);
     bool removeFromColorGroup();

@@ -5081,6 +5081,70 @@ const auto seq = [this] { return state()->sequence(); };
         state()->newProject();
     }
 
+    void extendClipCommand() {
+        QVERIFY(win_->findChild<QAction*>("extendClip1s"));
+        QVERIFY(win_->findChild<QAction*>("extendClip2s"));
+        QVERIFY(win_->findChild<QAction*>("extendClipToPlayhead"));
+        // A two-second shot with sound.
+        const QString video = dir_.filePath("shot.mp4");
+        {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 160;
+            gs.height = 90;
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, makeGeneratorClip(gen, "bars", 60));
+            MediaItem src;
+            src.id = gen.newId();
+            std::string err;
+            QVERIFY(probeMedia(MONTAGE_TEST_DATA_DIR "/jfk.wav", src, &err));
+            gen.media.push_back(src);
+            Clip sound = makeClip(gen, src, TrackKind::Audio, gs);
+            sound.duration = 60;
+            edit::overwrite(gen, gs, {TrackKind::Audio, 0}, sound);
+            ExportSettings st;
+            st.path = video.toStdString();
+            st.preset = "ultrafast";
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        state()->newProject();
+        const auto ids = state()->importFiles({video});
+        QCOMPARE(ids.size(), size_t(1));
+        const FrameTime len = 40;
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            if (!edit::placeMedia(p, s, ids[0], 0, 0, len, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok) return false;
+            Clip next = makeGeneratorClip(p, "color", 10);
+            next.start = len;
+            return edit::overwrite(p, s, {TrackKind::Video, 0}, next).ok;
+        }));
+        const Sequence* s = state()->sequence();
+        const Id shot = s->videoTracks[0].clips.front().id, next = s->videoTracks[0].clips.back().id;
+        const FrameTime second = FrameTime(std::llround(s->fpsValue()));
+        // Extended by a second: the picture held and the room under its sound, the next clip pushed along.
+        const std::vector<Id> made = win_->extendClip(shot, second);
+        QCOMPARE(made.size(), size_t(2));
+        s = state()->sequence();
+        const Clip* e = edit::clipById(*s, made[0]);
+        QVERIFY(e && e->start == len && e->duration == second);
+        QCOMPARE(e->timing.p("speed", 0, 100), 0.0);
+        const Clip* tone = edit::clipById(*s, made[1]);
+        QVERIFY(tone && tone->start == len && tone->duration == second);
+        QVERIFY(QString::fromStdString(state()->project().findMedia(tone->mediaId)->path).contains("Room Tone"));
+        QCOMPARE(edit::clipById(*s, next)->start, len + second);
+        // One undo step takes it all back.
+        state()->undo();
+        s = state()->sequence();
+        QVERIFY(!edit::clipById(*s, made[0]) && !edit::clipById(*s, made[1]));
+        QCOMPARE(edit::clipById(*s, next)->start, len);
+        // Without ripple there is no room; a generated clip cannot be extended this way.
+        QVERIFY(win_->extendClip(shot, second, false).empty());
+        QVERIFY(win_->extendClip(next, second).empty());
+        // To the playhead, from the menu.
+        state()->setSelection({shot}, false);
+        state()->setPlayhead(len + 4);
+        win_->findChild<QAction*>("extendClipToPlayhead")->trigger();
+        QCOMPARE(state()->sequence()->videoTracks[0].clips.at(1).duration, FrameTime(5));
+    }
+
     void roomToneGapFill() {
         state()->newProject();
         QVERIFY(win_->findChild<QAction*>("fillRoomTone"));
