@@ -2527,6 +2527,75 @@ private slots:
         state()->undo();
     }
 
+    void dynamicTrimWithJKL() {
+        loadDemo();
+        win_->setManualTrimShuttle(true);
+        const double fps = state()->sequence()->fpsValue();
+        auto red = [&] { return clipNamed(*state()->sequence(), "Red"); };
+        auto blue = [&] { return clipNamed(*state()->sequence(), "Blue"); };
+        QAction* J = win_->findChild<QAction*>("shuttleReverse");
+        QAction* K = win_->findChild<QAction*>("shuttleStop");
+        QAction* L = win_->findChild<QAction*>("shuttleForward");
+        QVERIFY(J && K && L);
+        QVERIFY(!win_->shuttleTrim(1));  // not in Trim mode: the keys are the transport's
+        state()->setPlayhead(55);
+        QVERIFY(win_->selectNearestEdit());  // the cut at 60
+        const size_t undos = state()->history().undoCount();
+        // Both sides (a roll): L plays on and the cut follows; K keeps it as one undo step.
+        L->trigger();
+        QVERIFY(win_->trimShuttling());
+        win_->advanceTrimShuttle(5 / fps);
+        QCOMPARE(win_->trimShuttleFrames(), FrameTime(5));
+        QCOMPARE(red()->end(), FrameTime(65));
+        QCOMPARE(blue()->start, FrameTime(65));
+        QCOMPARE(state()->playhead(), FrameTime(65));  // the two-up and playhead follow the edit
+        L->trigger();  // again: twice as fast
+        QCOMPARE(win_->trimShuttleSpeed(), 2);
+        win_->advanceTrimShuttle(2 / fps);
+        QCOMPARE(red()->end(), FrameTime(69));
+        J->trigger();  // the other way, at 1x
+        QCOMPARE(win_->trimShuttleSpeed(), -1);
+        win_->advanceTrimShuttle(1 / fps);
+        QCOMPARE(red()->end(), FrameTime(68));
+        K->trigger();
+        QVERIFY(!win_->trimShuttling());
+        QCOMPARE(state()->history().undoCount(), undos + 1);
+        QCOMPARE(red()->end(), FrameTime(68));
+        state()->undo();
+        QCOMPARE(red()->end(), FrameTime(60));
+        // The outgoing side: J plays back and shortens it, the incoming clip following (a ripple).
+        state()->setPlayhead(60);
+        QVERIFY(win_->selectNearestEdit());
+        while (win_->trimEdit()->side != 1) win_->cycleTrimSide();
+        J->trigger();
+        win_->advanceTrimShuttle(10 / fps);
+        K->trigger();
+        QCOMPARE(red()->end(), FrameTime(50));
+        QCOMPARE(blue()->start, FrameTime(50));
+        state()->undo();
+        // Esc puts a dynamic trim back and stays in Trim mode.
+        QVERIFY(win_->selectNearestEdit());
+        L->trigger();
+        win_->advanceTrimShuttle(3 / fps);
+        QCOMPARE(red()->end(), FrameTime(63));
+        win_->findChild<QAction*>("endTrim")->trigger();
+        QVERIFY(!win_->trimShuttling() && win_->trimEdit());
+        QCOMPARE(red()->end(), FrameTime(60));
+        QCOMPARE(state()->history().undoCount(), undos);
+        // The trim stops where it can go no further: the outgoing clip down to its last frame.
+        while (win_->trimEdit()->side != 1) win_->cycleTrimSide();
+        J->trigger();
+        win_->advanceTrimShuttle(100 / fps);
+        QCOMPARE(win_->trimShuttleSpeed(), 0);  // stopped
+        QCOMPARE(win_->trimShuttleFrames(), FrameTime(-59));
+        QCOMPARE(red()->duration, FrameTime(1));
+        win_->findChild<QAction*>("endTrim")->trigger();
+        QCOMPARE(red()->duration, FrameTime(60));
+        QCOMPARE(state()->history().undoCount(), undos);
+        win_->endTrimMode();
+        win_->setManualTrimShuttle(false);
+    }
+
     void importImageSequences() {
         const QString dir = dir_.path() + "/plate";
         QDir().mkpath(dir);

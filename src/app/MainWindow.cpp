@@ -1139,7 +1139,9 @@ void MainWindow::buildMenus() {
         ->setObjectName(QStringLiteral("trimBackward5"));
     add(seqM, tr("Trim Forward Five Frames"), QKeySequence("Ctrl+Shift+Right"), [this] { trimSelectedEdit(5); })
         ->setObjectName(QStringLiteral("trimForward5"));
-    add(seqM, tr("End Trim Mode"), QKeySequence(Qt::Key_Escape), [this] { endTrimMode(); })->setObjectName(QStringLiteral("endTrim"));
+    add(seqM, tr("End Trim Mode"), QKeySequence(Qt::Key_Escape), [this] {
+        if (!stopTrimShuttle(false)) endTrimMode();  // Esc while trimming dynamically puts the edit back first
+    })->setObjectName(QStringLiteral("endTrim"));
     add(seqM, tr("Ripple Trim Previous Edit to Playhead"), QKeySequence(Qt::Key_Q), [this] { rippleTrimToPlayhead(true); })
         ->setObjectName(QStringLiteral("rippleTrimPrevious"));
     add(seqM, tr("Ripple Trim Next Edit to Playhead"), QKeySequence(Qt::Key_W), [this] { rippleTrimToPlayhead(false); })
@@ -1328,9 +1330,16 @@ void MainWindow::buildMenus() {
     });
     play->addSeparator();
     add(play, tr("&Play / Pause"), QKeySequence(Qt::Key_Space), [this] { activeController()->togglePlay(); });
-    add(play, tr("Shuttle &Reverse"), QKeySequence(Qt::Key_J), [this] { activeController()->shuttle(-1); });
-    add(play, tr("&Stop"), QKeySequence(Qt::Key_K), [this] { activeController()->shuttle(0); });
-    add(play, tr("Shuttle &Forward"), QKeySequence(Qt::Key_L), [this] { activeController()->shuttle(1); });
+    // In Trim mode J, K and L trim the selected edit as it plays (dynamic trimming).
+    add(play, tr("Shuttle &Reverse"), QKeySequence(Qt::Key_J), [this] {
+        if (!shuttleTrim(-1)) activeController()->shuttle(-1);
+    })->setObjectName(QStringLiteral("shuttleReverse"));
+    add(play, tr("&Stop"), QKeySequence(Qt::Key_K), [this] {
+        if (!stopTrimShuttle()) activeController()->shuttle(0);
+    })->setObjectName(QStringLiteral("shuttleStop"));
+    add(play, tr("Shuttle &Forward"), QKeySequence(Qt::Key_L), [this] {
+        if (!shuttleTrim(1)) activeController()->shuttle(1);
+    })->setObjectName(QStringLiteral("shuttleForward"));
     play->addSeparator();
     add(play, tr("Step Back"), QKeySequence(Qt::Key_Left), [this] { activeController()->step(-1); });
     add(play, tr("Step Forward"), QKeySequence(Qt::Key_Right), [this] { activeController()->step(1); });
@@ -2363,7 +2372,90 @@ bool MainWindow::extendEdit() {
     });
 }
 
+bool MainWindow::shuttleTrim(int direction) {
+    if (!trimEdit_ || !state_->sequence() || direction == 0) return false;
+    if (!trimShuttle_) {
+        if (state_->inGesture()) return false;
+        activeController()->shuttle(0);
+        trimShuttle_.emplace();
+        state_->beginGesture(tr("Dynamic Trim"));
+        if (!trimShuttleTimer_) {
+            trimShuttleTimer_ = new QTimer(this);
+            trimShuttleTimer_->setInterval(20);
+            connect(trimShuttleTimer_, &QTimer::timeout, this, [this] {
+                const qint64 now = QDateTime::currentMSecsSinceEpoch();
+                advanceTrimShuttle(double(now - trimShuttleLast_) / 1000.0);
+                trimShuttleLast_ = now;
+            });
+        }
+    }
+    // Again the same way: faster (up to 8x); the other way: 1x that way.
+    int& v = trimShuttle_->speed;
+    v = (v > 0) == (direction > 0) && v != 0 ? std::clamp(v * 2, -8, 8) : direction;
+    trimShuttleLast_ = QDateTime::currentMSecsSinceEpoch();
+    if (!trimShuttleManual_) trimShuttleTimer_->start();
+    statusBar()->showMessage(tr("Dynamic trim at %1x: K keeps it, Esc puts it back").arg(v), 4000);
+    return true;
+}
+
+void MainWindow::advanceTrimShuttle(double seconds) {
+    const Sequence* s = state_->sequence();
+    if (!trimShuttle_ || !trimEdit_ || !s || trimShuttle_->speed == 0) return;
+    trimShuttle_->played += trimShuttle_->speed * seconds * s->fpsValue();
+    const FrameTime want = FrameTime(std::llround(trimShuttle_->played));
+    if (want == trimShuttle_->applied) return;
+    const TrimEdit e = *trimEdit_;
+    auto trim = [e](Project& p, Sequence& sq, FrameTime delta) {
+        if (delta == 0) return true;
+        if (e.side == 0) return edit::roll(p, sq, e.outgoing, e.incoming, delta).ok;
+        if (e.side == 1) return edit::trim(p, sq, e.outgoing, edit::Edge::Out, delta, edit::TrimMode::Ripple).ok;
+        return edit::trim(p, sq, e.incoming, edit::Edge::In, delta, edit::TrimMode::Ripple).ok;
+    };
+    // As far as the media (or the clip) allows: a frame at a time back towards the last trim that worked.
+    const FrameTime from = trimShuttle_->applied;
+    FrameTime reached = from;
+    // How far a trim really moved the edit (edits stop short at a clip's or its media's end).
+    auto moved = [e](const Sequence& before, const Sequence& after) -> FrameTime {
+        const Id id = e.side == 2 ? e.incoming : e.outgoing;
+        const Clip* a = edit::clipById(before, id);
+        const Clip* b = edit::clipById(after, id);
+        if (!a || !b) return 0;
+        return e.side == 2 ? a->duration - b->duration : b->end() - a->end();
+    };
+    state_->updateGesture([&](Project& p, Sequence& sq) {
+        for (FrameTime d = want; d != from; d += want > from ? -1 : 1) {
+            Project trial = p;
+            Sequence& ts = *trial.findSequence(sq.id);
+            if (trim(trial, ts, d)) {
+                reached = moved(sq, ts);
+                break;
+            }
+        }
+        trim(p, sq, reached);
+    });
+    trimShuttle_->applied = reached;
+    if (reached != want) {
+        trimShuttle_->played = double(reached);
+        trimShuttle_->speed = 0;
+        if (trimShuttleTimer_) trimShuttleTimer_->stop();
+        statusBar()->showMessage(tr("The trim can go no further: K keeps it, Esc puts it back"), 5000);
+    }
+    showTrimEdit();
+}
+
+bool MainWindow::stopTrimShuttle(bool keep) {
+    if (!trimShuttle_) return false;
+    if (trimShuttleTimer_) trimShuttleTimer_->stop();
+    const FrameTime applied = trimShuttle_->applied;
+    trimShuttle_.reset();
+    state_->endGesture(keep);
+    showTrimEdit();
+    if (keep && applied) statusBar()->showMessage(tr("Trimmed %1 frame(s)").arg(applied), 4000);
+    return true;
+}
+
 void MainWindow::endTrimMode() {
+    stopTrimShuttle(false);
     if (!trimEdit_) return;
     trimEdit_.reset();
     timeline_->clearTrimEdit();

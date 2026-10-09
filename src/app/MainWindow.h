@@ -139,6 +139,17 @@ public:
     bool extendEdit();
     void endTrimMode();
     const std::optional<TrimEdit>& trimEdit() const { return trimEdit_; }
+    // Dynamic trimming (Avid's dynamic trim, Resolve's dynamic trim mode, Premiere's JKL in Trim mode): with an edit
+    // selected, L plays its side forward through the edit and J back (again for faster, the other way at 1x), the
+    // edit following live; K stops and keeps the trim as one undo step (Esc puts it back). The shuttle's clock is a
+    // timer while it runs; advanceTrimShuttle moves it by hand.
+    bool shuttleTrim(int direction);
+    bool stopTrimShuttle(bool keep = true);
+    void advanceTrimShuttle(double seconds);
+    bool trimShuttling() const { return trimShuttle_.has_value(); }
+    FrameTime trimShuttleFrames() const { return trimShuttle_ ? trimShuttle_->applied : 0; }
+    int trimShuttleSpeed() const { return trimShuttle_ ? trimShuttle_->speed : 0; }
+    void setManualTrimShuttle(bool on) { trimShuttleManual_ = on; }  // no timer: only advanceTrimShuttle moves it
     // Auditions (Final Cut's auditions, Resolve's take selector): the bin's selected media (else the Source monitor's,
     // from its In) added as takes of the selected clip (else the video clip under the playhead); then the next or
     // previous take tried in its place, or the pick kept. Each one undo step.
@@ -308,6 +319,15 @@ private:
     // Open sequences as tabs above the timeline (Premiere's and Resolve's timeline tabs).
     QTabBar* sequenceTabs_ = nullptr;
     std::optional<TrimEdit> trimEdit_;
+    struct TrimShuttle {
+        int speed = 0;        // frames per frame of playback, signed
+        double played = 0;    // frames played since it started
+        FrameTime applied = 0;  // the trim shown (stops at the media's end)
+    };
+    std::optional<TrimShuttle> trimShuttle_;
+    QTimer* trimShuttleTimer_ = nullptr;
+    qint64 trimShuttleLast_ = 0;
+    bool trimShuttleManual_ = false;
     void showTrimEdit();
     std::vector<Id> openSequences_;
     MonitorPanel* sourcePanel_ = nullptr;

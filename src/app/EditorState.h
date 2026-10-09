@@ -60,6 +60,7 @@ public:
     void undo();
     void redo();
     bool canUndo() const { return history_.canUndo(); }
+    const History& history() const { return history_; }
     bool canRedo() const { return history_.canRedo(); }
     QString undoText() const { return QString::fromStdString(history_.undoLabel()); }
     QString redoText() const { return QString::fromStdString(history_.redoLabel()); }
