@@ -1550,7 +1550,17 @@ void MainWindow::buildMenus() {
         state_->setPlayhead(timeline_->contextFrame());
         paste(false);
     });
-    timeline_->setEmptyContextActions({pasteHere, closeGap});
+    auto* roomTone = new QAction(tr("Fill Gap with Room Tone"), this);
+    roomTone->setObjectName(QStringLiteral("fillRoomTone"));
+    connect(roomTone, &QAction::triggered, this, [this] {
+        auto t = timeline_->contextTrack();
+        if (!t || t->kind != TrackKind::Audio) {
+            state_->message(tr("Room tone fills a gap on an audio track"));
+            return;
+        }
+        fillRoomTone(*t, timeline_->contextFrame());
+    });
+    timeline_->setEmptyContextActions({pasteHere, closeGap, roomTone});
 }
 
 void MainWindow::updateActions() {
@@ -3951,6 +3961,69 @@ void MainWindow::exportVersionsDialog() {
     if (chosen.empty()) return;
     appSettings().setValue(QStringLiteral("export/lastDirectory"), folder->text());
     exportVersions(chosen, folder->text(), captions->isChecked(), loud->currentData().toDouble(), format->currentText());
+}
+
+Id MainWindow::fillRoomTone(TrackRef track, FrameTime at, FrameTime to, Id source) {
+    const Sequence* s = state_->sequence();
+    const Track* t = s ? trackAt(*s, track) : nullptr;
+    if (!t || track.kind != TrackKind::Audio) return 0;
+    // The gap around `at`, and the clips either side of it.
+    TrackGap gap;
+    if (!gapAt(*s, track, at, gap)) {
+        state_->message(tr("Room tone fills a gap: there is a clip here"));
+        return 0;
+    }
+    const FrameTime from = to > 0 ? at : gap.start;  // a range as given, else the whole gap
+    const FrameTime end = to > 0 ? std::min(to, gap.end) : gap.end;
+    if (end <= from) {
+        state_->message(tr("There is no gap to fill here"));
+        return 0;
+    }
+    const Clip* before = gap.before ? edit::clipById(*s, gap.before) : nullptr;
+    const Clip* after = gap.after ? edit::clipById(*s, gap.after) : nullptr;
+    const Clip* learnFrom = source ? edit::clipById(*s, source) : (before ? before : after);
+    if (!learnFrom) {
+        state_->message(tr("Room tone is learned from a clip on the track: there is none"));
+        return 0;
+    }
+    const Project p = state_->project();
+    const Sequence seq = *s;
+    const Clip clip = *learnFrom;
+    RoomToneProfile prof;
+    if (!runWithProgress(this, state_, tr("Learning the room tone..."), [&](const auto&, const auto*, std::string* e) {
+            return clipRoomTone(p, seq, clip, prof, e);
+        }))
+        return 0;
+    const int64_t samples = int64_t(std::llround(double(end - from) / seq.fpsValue() * prof.sampleRate));
+    const std::vector<float> tone = synthesizeRoomTone(prof, samples, uint32_t(from + 1));
+    const QString project = state_->filePath();
+    const QString folder = (project.isEmpty() ? QStandardPaths::writableLocation(QStandardPaths::MusicLocation) + QStringLiteral("/Montage")
+                                              : QFileInfo(project).absolutePath()) +
+                           QStringLiteral("/Room Tone");
+    QDir().mkpath(folder);
+    QString path;
+    int n = 1;
+    do path = folder + '/' + QString::fromStdString(seq.name) + QStringLiteral(" Room Tone %1.wav").arg(n++);
+    while (QFileInfo::exists(path));
+    std::string err;
+    if (!writeStereoWav(path.toStdString(), tone, prof.sampleRate, &err)) {
+        state_->message(QString::fromStdString(err), 6000);
+        return 0;
+    }
+    const std::vector<Id> media = state_->importFiles({path}, nullptr, QStringLiteral("Room Tone"));
+    if (media.empty()) return 0;
+    Id made = 0;
+    state_->edit(tr("Fill with Room Tone"), [&](Project& pr, Sequence& sq) {
+        if (!edit::placeMedia(pr, sq, media[0], from, 0, -1, {TrackKind::Video, 0}, track, false).ok) return false;
+        if (const Track* tr = trackAt(sq, track))
+            for (const Clip& c : tr->clips)
+                if (c.start == from && c.mediaId == media[0]) made = c.id;
+        return made != 0;
+    });
+    if (made) state_->message(tr("Filled %1 with room tone learned from %2").arg(QString::fromStdString(formatTimecode(end - from, seq.fps)),
+                                                                                  QString::fromStdString(clip.name)),
+                              5000);
+    return made;
 }
 
 int MainWindow::deleteGaps(bool leading) {

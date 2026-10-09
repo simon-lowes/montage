@@ -755,6 +755,10 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             if (c.empty()) c = family == "hevc" ? "libx265" : "libx264";  // no hardware encoder here
         }
         if (encoderUsed) *encoderUsed = c;
+        // FFmpeg's CineForm encoder reads memory it never wrote below a picture whose height is not a multiple of 8
+        // (Valgrind shows it at 320 x 180, not at 184 or 1080), so the same export came out different each time.
+        if (c == "cfhd" && H % 8 != 0)
+            return fail("CineForm needs a height divisible by 8 (1080, 720, 2160...): set the export size to one");
         const AVCodec* codec = avcodec_find_encoder_by_name(c.c_str());
         if (!codec) return fail("Video encoder not available: " + c);
         o.vst = avformat_new_stream(o.oc, nullptr);

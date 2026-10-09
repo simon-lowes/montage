@@ -1577,6 +1577,71 @@ private slots:
         QVERIFY(level(musik, 880) > 20 * level(musik, 440));
     }
 
+    void roomToneFill() {
+        // A room (low-passed noise near -40 dBFS) with someone talking (440 Hz) in every other quarter second.
+        constexpr int sr = 48000;
+        std::mt19937 rng(11);
+        std::normal_distribution<double> g(0, 1);
+        std::vector<float> take(size_t(sr) * 4);
+        double lp = 0, floorEnergy = 0;
+        for (size_t i = 0; i < take.size(); ++i) {
+            lp += 0.1 * (g(rng) - lp);
+            const double room = 0.03 * lp;
+            floorEnergy += room * room;
+            take[i] = float(room + ((i / (sr / 4)) % 2 == 0 ? 0.25 * std::sin(2 * M_PI * 440 * double(i) / sr) : 0));
+        }
+        // As Montage plays the take: a mono channel in the centre, 3 dB down on each side.
+        const double floorDb = 10 * std::log10(floorEnergy / double(take.size())) - 3.01;
+        const std::string wav = path("room-take.wav");
+        QVERIFY(writeMonoWav(wav, take, sr));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = Rational{25, 1};
+        MediaItem mi = probeOrFail(p, wav);
+        p.media.push_back(mi);
+        // A1: the take's first two seconds, a one-second hole, then its last second.
+        QVERIFY(edit::placeMedia(p, s, mi.id, 0, 0, 50, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(edit::placeMedia(p, s, mi.id, 75, 75, 100, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QCOMPARE(s.audioTracks[0].clips.size(), size_t(2));
+        const QString project = QString::fromStdString(path("room.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_fill_room_tone"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object();
+        };
+        QJsonObject r = call({{"project", project}, {"track", "A1"}, {"at", "00:00:02:10"}});
+        QJsonObject res = r.value("result").toObject();
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject sc = res.value("structuredContent").toObject();
+        QVERIFY2(std::fabs(sc.value("level_db").toDouble() - floorDb) < 2, qPrintable(QString("%1 vs %2").arg(sc.value("level_db").toDouble()).arg(floorDb)));
+        QCOMPARE(sc.value("start").toString(), QStringLiteral("00:00:02:00"));
+        QCOMPARE(sc.value("end").toString(), QStringLiteral("00:00:03:00"));
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Track& a1 = back.active()->audioTracks[0];
+        QCOMPARE(a1.clips.size(), size_t(3));
+        QCOMPARE(a1.clips[1].start, FrameTime(50));
+        QCOMPARE(a1.clips[1].duration, FrameTime(25));
+        // The fill sounds like the room: its level, and no voice in it.
+        const std::vector<float> fill = decodeAudioStream(sc.value("path").toString().toStdString(), 0);
+        QVERIFY(std::abs(int(fill.size()) - sr * 2) < 200);
+        double e = 0;
+        for (size_t i = size_t(sr / 20) * 2; i < fill.size() - size_t(sr / 20) * 2; ++i) e += double(fill[i]) * fill[i];
+        const double fillDb = 10 * std::log10(e / double(fill.size() - size_t(sr / 10) * 2));
+        QVERIFY2(std::fabs(fillDb - floorDb) < 2, qPrintable(QString::number(fillDb)));
+        QVERIFY(toneLevel(fill, 0, 440, 9600, sr) < 0.01);
+        // A clip there, or a range backwards, is refused.
+        r = call({{"project", project}, {"at", "00:00:00:10"}});
+        QVERIFY(r.value("result").toObject().value("isError").toBool() || r.contains("error"));
+        r = call({{"project", project}, {"at", "00:00:04:10"}, {"to", "00:00:04:00"}});
+        QVERIFY(r.value("result").toObject().value("isError").toBool() || r.contains("error"));
+    }
+
     void mcpDeleteGaps() {
         Project p = makeDefaultProject();
         Sequence& s = *p.active();
@@ -4507,10 +4572,11 @@ private slots:
     }
 
     void masteringCodecs() {
-        // A short sequence: colour bars, a title on transparency above, the JFK clip's sound.
+        // A short sequence: colour bars, a title on transparency above, the JFK clip's sound (176 lines: CineForm needs
+        // a multiple of 8).
         Project p = makeDefaultProject();
         Sequence& s = *p.active();
-        s.width = 320, s.height = 180, s.fps = {25, 1};
+        s.width = 320, s.height = 176, s.fps = {25, 1};
         Clip bars = makeGeneratorClip(p, "bars", 10);
         QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, bars).ok);
         MediaItem speech = probeOrFail(p, MONTAGE_TEST_DATA_DIR "/jfk.wav");
@@ -4590,6 +4656,15 @@ private slots:
             if (*w.profile) QVERIFY2(in.profile == w.profile, qPrintable(QString("%1: profile %2").arg(w.preset, in.profile.c_str())));
             const double d = meanDiff(st.path);
             QVERIFY2(d < w.tolerance, qPrintable(QString("%1: mean difference %2").arg(w.preset).arg(d)));
+        }
+        // CineForm refuses a height FFmpeg's encoder cannot fill (it would read memory it never wrote).
+        {
+            Sequence odd = s;
+            odd.height = 180;
+            ExportSettings st = findExportPreset("GoPro CineForm")->settings;
+            st.path = path("odd-cineform.mov");
+            QVERIFY(!exportSequence(p, odd, st, nullptr, nullptr, &err));
+            QVERIFY2(QString::fromStdString(err).contains("divisible by 8"), err.c_str());
         }
         // Transparency survives CineForm RGBA and ProRes 4444 XQ: clear round the title, solid on it.
         for (const char* name : {"GoPro CineForm (alpha)", "Apple ProRes 4444 XQ (alpha)"}) {

@@ -18,6 +18,7 @@
 #include "media/Image.h"
 #include "render/Shorts.h"
 #include "render/ReviewExport.h"
+#include "render/RoomTone.h"
 #include "render/Versions.h"
 
 class QAction;
@@ -144,6 +145,10 @@ public:
     QString exportForReview(const QString& folder, const ReviewExportOptions& options = {});
     // Edit › Delete Gaps (core edit::deleteGaps): the stretches empty on every track closed in one undo step. How many.
     int deleteGaps(bool leading = false);
+    // Fill Gap with Room Tone (render/RoomTone.h): the gap on an audio track around `at` filled (or from `at` to `to`
+    // when `to` is given, within the gap) with room tone learned from `source` (0 = the clip before the gap, or after
+    // it). The new clip (0 if none).
+    Id fillRoomTone(TrackRef track, FrameTime at, FrameTime to = 0, Id source = 0);
     void exportForReviewDialog();
     bool addToColorGroup(Id group);
     bool removeFromColorGroup();

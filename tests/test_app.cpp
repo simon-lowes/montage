@@ -5081,6 +5081,57 @@ const auto seq = [this] { return state()->sequence(); };
         state()->newProject();
     }
 
+    void roomToneGapFill() {
+        state()->newProject();
+        QVERIFY(win_->findChild<QAction*>("fillRoomTone"));
+        // A take with a steady room under a tone that comes and goes.
+        constexpr int sr = 48000;
+        const QString wav = dir_.filePath("take.wav");
+        {
+            std::vector<int16_t> pcm(size_t(sr) * 3);
+            uint32_t x = 1;
+            double lp = 0;
+            for (size_t i = 0; i < pcm.size(); ++i) {
+                x = x * 1664525u + 1013904223u;
+                lp += 0.1 * ((double(x >> 8) / double(1 << 24)) * 2 - 1 - lp);
+                const double v = 0.03 * lp + ((i / (sr / 4)) % 2 == 0 ? 0.2 * std::sin(2 * M_PI * 300 * double(i) / sr) : 0);
+                pcm[i] = int16_t(std::lround(v * 32767));
+            }
+            QFile f(wav);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            auto u32 = [&](uint32_t v) { f.write(reinterpret_cast<const char*>(&v), 4); };
+            auto u16 = [&](uint16_t v) { f.write(reinterpret_cast<const char*>(&v), 2); };
+            const uint32_t bytes = uint32_t(pcm.size() * 2);
+            f.write("RIFF", 4), u32(36 + bytes), f.write("WAVEfmt ", 8), u32(16), u16(1), u16(1), u32(sr), u32(sr * 2), u16(2), u16(16), f.write("data", 4), u32(bytes);
+            f.write(reinterpret_cast<const char*>(pcm.data()), qint64(bytes));
+        }
+        const auto ids = state()->importFiles({wav});
+        QCOMPARE(ids.size(), size_t(1));
+        const double fps = state()->sequence()->fpsValue();
+        const FrameTime second = FrameTime(std::llround(fps));
+        QVERIFY(state()->edit("Cut", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids[0], 0, 0, second, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok &&
+                   edit::placeMedia(p, s, ids[0], 2 * second, 2 * second, 3 * second, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        const TrackRef a1{TrackKind::Audio, 0};
+        QCOMPARE(win_->fillRoomTone(a1, second / 2), Id(0));  // a clip is there
+        const Id made = win_->fillRoomTone(a1, second + 3);
+        QVERIFY(made);
+        const Clip* c = edit::clipById(*state()->sequence(), made);
+        QVERIFY(c);
+        QCOMPARE(c->start, second);
+        QCOMPARE(c->duration, second);
+        const MediaItem* m = state()->project().findMedia(c->mediaId);
+        QVERIFY(m && QFileInfo::exists(QString::fromStdString(m->path)) && QString::fromStdString(m->path).contains("Room Tone"));
+        state()->undo();
+        QVERIFY(!edit::clipById(*state()->sequence(), made));
+        // Part of the gap, from a given clip.
+        const Id first = trackAt(*state()->sequence(), a1)->clips.front().id;
+        const Id part = win_->fillRoomTone(a1, second + 5, second + 10, first);
+        QVERIFY(part);
+        QCOMPARE(edit::clipById(*state()->sequence(), part)->duration, FrameTime(5));
+    }
+
     void deleteGapsCommand() {
         loadDemo();
         QAction* action = win_->findChild<QAction*>("deleteGaps");

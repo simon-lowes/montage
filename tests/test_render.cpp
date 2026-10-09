@@ -3,7 +3,11 @@
 #include <QTemporaryDir>
 
 #include <algorithm>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
 #include <cmath>
+#include <complex>
 #include <cstring>
 #include <fstream>
 #include <tuple>
@@ -18,6 +22,7 @@
 #include "render/ColorSpace.h"
 #include "render/Compositor.h"
 #include "render/Exporter.h"
+#include "render/RoomTone.h"
 #include "render/Ocio.h"
 #include "media/Tracking.h"
 #include "render/Processing.h"
@@ -70,6 +75,88 @@ Clip colorClip(Project& p, float r, float g, float b, FrameTime start, FrameTime
 class TestRender : public QObject {
     Q_OBJECT
 private slots:
+    void roomTone() {
+        constexpr int sr = 48000;
+        std::mt19937 rng(7);
+        std::normal_distribution<double> g(0, 1);
+        // A room: low-passed noise around -40 dBFS, the same in both ears; a voice (440 Hz) over half the time.
+        const int64_t n = sr * 4;
+        std::vector<float> clip(size_t(n) * 2);
+        double lp = 0;
+        double floorEnergy = 0;
+        for (int64_t i = 0; i < n; ++i) {
+            lp += 0.1 * (g(rng) - lp);
+            const double room = 0.03 * lp;
+            floorEnergy += room * room;
+            const bool talking = (i / (sr / 4)) % 2 == 0;
+            const double v = room + (talking ? 0.25 * std::sin(2 * M_PI * 440 * double(i) / sr) : 0);
+            clip[size_t(i) * 2] = clip[size_t(i) * 2 + 1] = float(v);
+        }
+        const double floorRms = std::sqrt(floorEnergy / double(n));
+        RoomToneProfile prof;
+        std::string err;
+        QVERIFY2(learnRoomTone(clip, sr, prof, &err), err.c_str());
+        auto db = [](double v) { return 20 * std::log10(v); };
+        QVERIFY2(std::fabs(db(prof.rms) - db(floorRms)) < 2, qPrintable(QString("%1 vs %2 dB").arg(db(prof.rms)).arg(db(floorRms))));
+        // Two seconds of it: the room's level, its dark tone, none of the voice, the same in both ears.
+        const std::vector<float> tone = synthesizeRoomTone(prof, sr * 2, 3);
+        QCOMPARE(tone.size(), size_t(sr * 2 * 2));
+        double e = 0, lr = 0, ll = 0, rr = 0;
+        for (size_t i = size_t(sr / 10); i < size_t(sr * 19 / 10); ++i) {
+            const double l = tone[i * 2], r = tone[i * 2 + 1];
+            e += 0.5 * (l * l + r * r);
+            lr += l * r, ll += l * l, rr += r * r;
+        }
+        const double toneRms = std::sqrt(e / double(sr * 18 / 10));
+        QVERIFY2(std::fabs(db(toneRms) - db(floorRms)) < 2, qPrintable(QString::number(db(toneRms))));
+        QVERIFY(lr / std::sqrt(ll * rr) > 0.95);
+        // Far more energy below 1 kHz than above 4 kHz, as in the room; the voice's 440 Hz no stronger than its neighbours.
+        auto bandRatio = [&](const std::vector<float>& x, int64_t from, int64_t count) {
+            // A crude DFT over a few bins in each band.
+            auto power = [&](double hz) {
+                std::complex<double> acc = 0;
+                for (int64_t i = 0; i < count; ++i)
+                    acc += double(x[size_t(from + i) * 2]) * std::polar(1.0, -2 * M_PI * hz * double(i) / sr);
+                return std::norm(acc);
+            };
+            double lo = 0, hi = 0;
+            for (double hz = 100; hz < 1000; hz += 150) lo += power(hz);
+            for (double hz = 4000; hz < 12000; hz += 1300) hi += power(hz);
+            return std::make_pair(lo, hi);
+        };
+        const auto [tl, th] = bandRatio(tone, sr / 2, sr / 4);
+        QVERIFY2(tl > 20 * th, qPrintable(QString("%1 %2").arg(tl).arg(th)));
+        auto toneAt = [&](double hz) {
+            std::complex<double> acc = 0;
+            for (int64_t i = 0; i < sr / 2; ++i) acc += double(tone[size_t(sr / 4 + i) * 2]) * std::polar(1.0, -2 * M_PI * hz * double(i) / sr);
+            return std::abs(acc);
+        };
+        QVERIFY(toneAt(440) < 4 * (toneAt(380) + toneAt(500)) / 2);
+        // Repeatable by seed; a wide room stays wide.
+        QVERIFY(synthesizeRoomTone(prof, 4800, 3) == synthesizeRoomTone(prof, 4800, 3));
+        QVERIFY(synthesizeRoomTone(prof, 4800, 3) != synthesizeRoomTone(prof, 4800, 4));
+        std::vector<float> wide(size_t(n) * 2);
+        for (int64_t i = 0; i < n; ++i) wide[size_t(i) * 2] = float(0.02 * g(rng)), wide[size_t(i) * 2 + 1] = float(0.02 * g(rng));
+        RoomToneProfile wp;
+        QVERIFY(learnRoomTone(wide, sr, wp, &err));
+        const std::vector<float> wt = synthesizeRoomTone(wp, sr, 5);
+        lr = ll = rr = 0;
+        for (int64_t i = 2000; i < sr - 2000; ++i) {
+            const double l = wt[size_t(i) * 2], r = wt[size_t(i) * 2 + 1];
+            lr += l * r, ll += l * l, rr += r * r;
+        }
+        QVERIFY(std::fabs(lr / std::sqrt(ll * rr)) < 0.2);
+        // Fades at both ends; nothing to learn from silence or a scrap.
+        QCOMPARE(tone[0], 0.0f);
+        QVERIFY(!learnRoomTone(std::vector<float>(size_t(sr) * 2, 0.0f), sr, wp, &err));
+        QVERIFY(!learnRoomTone(std::vector<float>(200, 0.1f), sr, wp, &err));
+        // A 24-bit stereo WAV.
+        const QString wav = QDir::temp().filePath("montage-roomtone-test.wav");
+        QVERIFY(writeStereoWav(wav.toStdString(), tone, sr, &err));
+        QCOMPARE(QFileInfo(wav).size(), qint64(44 + tone.size() * 3));
+        QFile::remove(wav);
+    }
+
     void creatorTransitions() {
         const int W = 160, H = 120;
         // A: warm with vertical stripes, B: cool with horizontal stripes.

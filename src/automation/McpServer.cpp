@@ -25,6 +25,7 @@
 #include "core/SpellCheck.h"
 #include "core/ColorGroups.h"
 #include "render/ReviewExport.h"
+#include "render/RoomTone.h"
 #include "render/Versions.h"
 #include "render/LightLevel.h"
 #include "render/Spherical.h"
@@ -810,6 +811,54 @@ void McpServer::Impl::addTools() {
             save(l);
             return ok(QStringLiteral("Closed %1 gap(s), %2 in all").arg(closed).arg(tc(frames, l.seq())),
                       QJsonObject{{"gaps", closed}, {"frames", double(frames)}, {"duration", tc(l.seq().duration(), l.seq())}});
+        });
+
+    add("montage_fill_room_tone", "Fill a gap with room tone",
+        "Fill a gap in a dialogue track with room tone (iZotope RX's Ambience Match): the background of a clip (`source`, "
+        "else the one before the gap, else after it) is learned from its quietest moments and new sound with the same "
+        "spectrum, width and level is written as a WAV in a Room Tone folder beside the project and placed in the gap "
+        "around `at` on `track` (or from `at` to `to`).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"track":{"type":"string","default":"A1"},
+            "at":{"type":["number","string"]},"to":{"type":["number","string"]},"source":{"type":"number","description":"Clip id to learn from"}},
+            "required":["project","at"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const TrackRef track = trackArg(str(a, "track", "A1"), s, false);
+            if (track.kind != TrackKind::Audio) throw ArgError{"Room tone goes on an audio track"};
+            const FrameTime at = timeArg(a.value("at"), s, "at");
+            TrackGap gap;
+            if (!gapAt(s, track, at, gap)) return fail("There is a clip there: room tone fills a gap");
+            const FrameTime from = a.contains("to") ? at : gap.start;
+            const FrameTime end = a.contains("to") ? std::min(timeArg(a.value("to"), s, "to"), gap.end) : gap.end;
+            if (end <= from) throw ArgError{"\"to\" comes after \"at\""};
+            const Id sourceId = a.contains("source") ? Id(a.value("source").toDouble()) : (gap.before ? gap.before : gap.after);
+            const Clip* source = sourceId ? edit::clipById(s, sourceId) : nullptr;
+            if (!source) return fail("There is no clip to learn the room from");
+            const QString sourceName = QString::fromStdString(source->name);  // placing the fill can move the track's clips
+            RoomToneProfile prof;
+            std::string err;
+            if (!clipRoomTone(l.project, s, *source, prof, &err)) return fail(QString::fromStdString(err));
+            const int64_t samples = int64_t(std::llround(double(end - from) / s.fpsValue() * prof.sampleRate));
+            const QString folder = QFileInfo(absolute(need(a, "project"))).absolutePath() + QStringLiteral("/Room Tone");
+            QDir().mkpath(folder);
+            QString path;
+            int n = 1;
+            do path = folder + '/' + QString::fromStdString(s.name) + QStringLiteral(" Room Tone %1.wav").arg(n++);
+            while (QFileInfo::exists(path));
+            if (!writeStereoWav(path.toStdString(), synthesizeRoomTone(prof, samples, uint32_t(from + 1)), prof.sampleRate, &err))
+                return fail(QString::fromStdString(err));
+            const Id media = mediaFor(l.project, path);
+            check(edit::placeMedia(l.project, s, media, from, 0, -1, {TrackKind::Video, 0}, track, false));
+            Id made = 0;
+            for (const Clip& c : trackAt(s, track)->clips)
+                if (c.start == from && c.mediaId == media) made = c.id;
+            save(l);
+            return ok(QStringLiteral("Filled %1 to %2 on %3 with room tone learned from %4 (%5 dBFS)")
+                          .arg(tc(from, s), tc(end, s), str(a, "track", "A1"), sourceName)
+                          .arg(20 * std::log10(prof.rms), 0, 'f', 1),
+                      QJsonObject{{"clip", double(made)}, {"path", path}, {"level_db", 20 * std::log10(prof.rms)},
+                                  {"start", tc(from, s)}, {"end", tc(end, s)}});
         });
 
     add("montage_move_clip", "Move a clip",
