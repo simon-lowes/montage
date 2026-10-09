@@ -831,28 +831,29 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     }
 
     int audioFrameSize = 1024;
-    if (wantAudio) {
+    // An audio encoder and its stream, in the sequence's layout (or stereo); "" or why not.
+    auto openAudio = [&](AVCodecContext*& actx, AVStream*& ast) -> std::string {
         const AVCodec* codec = avcodec_find_encoder_by_name(s.audioCodec.c_str());
-        if (!codec) return fail("Audio encoder not available: " + s.audioCodec);
-        o.ast = avformat_new_stream(o.oc, nullptr);
-        o.actx = avcodec_alloc_context3(codec);
+        if (!codec) return "Audio encoder not available: " + s.audioCodec;
+        ast = avformat_new_stream(o.oc, nullptr);
+        actx = avcodec_alloc_context3(codec);
         // The sequence's layout (the channel order core/Surround.h uses is FFmpeg's), or stereo.
         AVChannelLayout layout = AV_CHANNEL_LAYOUT_STEREO;
         if (!s.downmixStereo && seq.audioLayout == "5.1") layout = AV_CHANNEL_LAYOUT_5POINT1;
         if (!s.downmixStereo && seq.audioLayout == "7.1") layout = AV_CHANNEL_LAYOUT_7POINT1;
-        av_channel_layout_copy(&o.actx->ch_layout, &layout);
-        o.actx->sample_rate = sr;
-        if (s.audioCodec == "libopus" && sr != 48000) o.actx->sample_rate = 48000;
+        av_channel_layout_copy(&actx->ch_layout, &layout);
+        actx->sample_rate = sr;
+        if (s.audioCodec == "libopus" && sr != 48000) actx->sample_rate = 48000;
         // Pick a supported sample format, preferring float planar.
         AVSampleFormat want = AV_SAMPLE_FMT_FLTP;
         if (s.audioCodec == "pcm_s16le") want = AV_SAMPLE_FMT_S16;
         else if (s.audioCodec == "pcm_s24le") want = AV_SAMPLE_FMT_S32;
         else if (s.audioCodec == "libopus") want = AV_SAMPLE_FMT_FLT;
-        o.actx->sample_fmt = want;
+        actx->sample_fmt = want;
         const AVSampleFormat* fmts = nullptr;
 #if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(61, 13, 100)
         const void* cfg = nullptr;
-        if (avcodec_get_supported_config(o.actx, codec, AV_CODEC_CONFIG_SAMPLE_FORMAT, 0, &cfg, nullptr) >= 0)
+        if (avcodec_get_supported_config(actx, codec, AV_CODEC_CONFIG_SAMPLE_FORMAT, 0, &cfg, nullptr) >= 0)
             fmts = static_cast<const AVSampleFormat*>(cfg);
 #else
         fmts = codec->sample_fmts;
@@ -860,22 +861,80 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         if (fmts) {
             bool ok = false;
             for (const AVSampleFormat* f = fmts; *f != AV_SAMPLE_FMT_NONE; ++f) ok |= (*f == want);
-            if (!ok) o.actx->sample_fmt = fmts[0];
+            if (!ok) actx->sample_fmt = fmts[0];
         }
-        if (s.audioCodec == "aac" || s.audioCodec == "libopus") o.actx->bit_rate = s.audioBitrate;
-        o.actx->time_base = AVRational{1, o.actx->sample_rate};
-        if (o.oc->oformat->flags & AVFMT_GLOBALHEADER) o.actx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-        if ((rc = avcodec_open2(o.actx, codec, nullptr)) < 0) return fail("Cannot open audio encoder: " + averr(rc));
-        avcodec_parameters_from_context(o.ast->codecpar, o.actx);
-        o.ast->time_base = o.actx->time_base;
-        if (o.actx->frame_size > 0) audioFrameSize = o.actx->frame_size;
+        if (s.audioCodec == "aac" || s.audioCodec == "libopus") actx->bit_rate = s.audioBitrate;
+        actx->time_base = AVRational{1, actx->sample_rate};
+        if (o.oc->oformat->flags & AVFMT_GLOBALHEADER) actx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+        if ((rc = avcodec_open2(actx, codec, nullptr)) < 0) return "Cannot open audio encoder: " + averr(rc);
+        avcodec_parameters_from_context(ast->codecpar, actx);
+        ast->time_base = actx->time_base;
+        if (actx->frame_size > 0) audioFrameSize = actx->frame_size;
+        return {};
+    };
+    // A stream's title and language tag.
+    auto tagStream = [](AVStream* st, const std::string& title, const std::string& language) {
+        if (!title.empty()) {
+            av_dict_set(&st->metadata, "title", title.c_str(), 0);
+            av_dict_set(&st->metadata, "handler_name", title.c_str(), 0);  // MP4 and MOV keep a track's name there
+        }
+        if (const char* lang = iso639_2(language)) av_dict_set(&st->metadata, "language", lang, 0);
+    };
+    // Further audio streams (a master's M&E, dialogue, each dub): each hears its tracks, and only its role when given.
+    struct ExtraAudio {
+        AVCodecContext* ctx = nullptr;
+        AVStream* st = nullptr;
+        AVFrame* frame = nullptr;
+        AudioMixer mixer;
+        Sequence seq;
+        std::vector<float> fifo;
+        int64_t pts = 0, cursor = 0;
+        ~ExtraAudio() {
+            av_frame_free(&frame);
+            avcodec_free_context(&ctx);
+        }
+    };
+    std::vector<std::unique_ptr<ExtraAudio>> extras;
+    if (wantAudio) {
+        if (const std::string why = openAudio(o.actx, o.ast); !why.empty()) return fail(why);
         o.aframe = av_frame_alloc();
+        tagStream(o.ast, s.audioName, s.audioLanguage);
+        if (!s.extraAudio.empty()) o.ast->disposition |= AV_DISPOSITION_DEFAULT;
+        for (const ExportSettings::AudioStream& want : s.extraAudio) {
+            auto e = std::make_unique<ExtraAudio>();
+            if (const std::string why = openAudio(e->ctx, e->st); !why.empty()) return fail(why);
+            e->frame = av_frame_alloc();
+            tagStream(e->st, want.name, want.language);
+            e->mixer.setTrackMask(want.tracks);
+            e->seq = seq;
+            if (!want.role.empty())
+                for (Track& t : e->seq.audioTracks)
+                    for (Clip& c : t.clips)
+                        if ((c.role.empty() ? std::string("No Role") : c.role) != want.role) c.enabled = false;
+            extras.push_back(std::move(e));
+        }
     }
     if (o.actx && o.actx->sample_rate != sr && s.audioCodec != "libopus") return fail("Unsupported sample rate");
 
-    // Captions as a subtitle stream, in the text format the container takes.
+    // Captions as subtitle streams, in the text format the container takes: the chosen track, then any others asked for.
     const CaptionTrack* captions = (s.embedCaptions || s.burnInCaptions) ? captionTrackFor(seq, s.captionTrack) : nullptr;
-    if (s.embedCaptions && captions && !captions->captions.empty()) {
+    struct CaptionOut {
+        const CaptionTrack* track = nullptr;
+        AVCodecContext* ctx = nullptr;
+        AVStream* st = nullptr;
+        size_t next = 0;
+        ~CaptionOut() { avcodec_free_context(&ctx); }
+    };
+    std::vector<std::unique_ptr<CaptionOut>> captionOuts;
+    std::vector<const CaptionTrack*> embedded;
+    if (s.embedCaptions && captions && !captions->captions.empty()) embedded.push_back(captions);
+    if (s.embedCaptions)
+        for (Id id : s.extraCaptions)
+            for (const CaptionTrack& t : seq.captionTracks)
+                if (t.id == id && &t != captions && !t.captions.empty()) embedded.push_back(&t);
+    for (const CaptionTrack* track : embedded) {
+        auto out = std::make_unique<CaptionOut>();
+        out->track = track;
         AVCodecID id = AV_CODEC_ID_NONE;
         for (AVCodecID c : {AV_CODEC_ID_MOV_TEXT, AV_CODEC_ID_SUBRIP, AV_CODEC_ID_WEBVTT})
             if (avformat_query_codec(o.oc->oformat, c, FF_COMPLIANCE_NORMAL) == 1) {
@@ -885,19 +944,21 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         if (id == AV_CODEC_ID_NONE) return fail("This file type cannot hold captions; export them as a sidecar file instead");
         const AVCodec* codec = avcodec_find_encoder(id);
         if (!codec) return fail("Caption encoder not available");
-        o.sctx = avcodec_alloc_context3(codec);
-        o.sctx->time_base = AVRational{1, 1000};
+        out->ctx = avcodec_alloc_context3(codec);
+        out->ctx->time_base = AVRational{1, 1000};
         const size_t headerLen = std::char_traits<char>::length(kAssHeader);
-        o.sctx->subtitle_header = static_cast<uint8_t*>(av_mallocz(headerLen + 1));
-        std::copy(kAssHeader, kAssHeader + headerLen, o.sctx->subtitle_header);
-        o.sctx->subtitle_header_size = int(headerLen);
-        if (o.oc->oformat->flags & AVFMT_GLOBALHEADER) o.sctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-        if ((rc = avcodec_open2(o.sctx, codec, nullptr)) < 0) return fail("Cannot open caption encoder: " + averr(rc));
-        o.sst = avformat_new_stream(o.oc, nullptr);
-        avcodec_parameters_from_context(o.sst->codecpar, o.sctx);
-        o.sst->time_base = o.sctx->time_base;
-        if (const char* lang = iso639_2(captions->language)) av_dict_set(&o.sst->metadata, "language", lang, 0);
-        if (!captions->name.empty()) av_dict_set(&o.sst->metadata, "title", captions->name.c_str(), 0);
+        out->ctx->subtitle_header = static_cast<uint8_t*>(av_mallocz(headerLen + 1));
+        std::copy(kAssHeader, kAssHeader + headerLen, out->ctx->subtitle_header);
+        out->ctx->subtitle_header_size = int(headerLen);
+        if (o.oc->oformat->flags & AVFMT_GLOBALHEADER) out->ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+        if ((rc = avcodec_open2(out->ctx, codec, nullptr)) < 0) return fail("Cannot open caption encoder: " + averr(rc));
+        out->st = avformat_new_stream(o.oc, nullptr);
+        avcodec_parameters_from_context(out->st->codecpar, out->ctx);
+        out->st->time_base = out->ctx->time_base;
+        tagStream(out->st, track->name, track->language);
+        if (captionOuts.empty() && embedded.size() > 1) out->st->disposition |= AV_DISPOSITION_DEFAULT;
+        out->next = captionIndexAt(*track, in);
+        captionOuts.push_back(std::move(out));
     }
 
     if (!(o.oc->oformat->flags & AVFMT_NOFILE)) {
@@ -961,63 +1022,64 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         audioCursor += limiterDelay;
     }
 
-    auto encodeAudio = [&](bool final) -> bool {
+    auto encodeFifo = [&](AVCodecContext* actx, AVStream* ast, AVFrame* aframe, std::vector<float>& fifo, int64_t& audioPts,
+                          bool final) -> bool {
         const size_t nc = size_t(nch);
         while (fifo.size() >= size_t(audioFrameSize) * nc || (final && !fifo.empty())) {
             int n = std::min<int>(audioFrameSize, int(fifo.size() / nc));
-            av_frame_unref(o.aframe);
-            o.aframe->nb_samples = n;
-            o.aframe->format = o.actx->sample_fmt;
-            o.aframe->sample_rate = o.actx->sample_rate;
-            av_channel_layout_copy(&o.aframe->ch_layout, &o.actx->ch_layout);
-            if (av_frame_get_buffer(o.aframe, 0) < 0) return false;
+            av_frame_unref(aframe);
+            aframe->nb_samples = n;
+            aframe->format = actx->sample_fmt;
+            aframe->sample_rate = actx->sample_rate;
+            av_channel_layout_copy(&aframe->ch_layout, &actx->ch_layout);
+            if (av_frame_get_buffer(aframe, 0) < 0) return false;
             const float* srcp = fifo.data();
-            switch (o.actx->sample_fmt) {
+            switch (actx->sample_fmt) {
                 case AV_SAMPLE_FMT_FLTP:
                     for (size_t c = 0; c < nc; ++c) {
-                        auto* d = reinterpret_cast<float*>(o.aframe->data[c]);
+                        auto* d = reinterpret_cast<float*>(aframe->data[c]);
                         for (int i = 0; i < n; ++i) d[i] = srcp[size_t(i) * nc + c];
                     }
                     break;
                 case AV_SAMPLE_FMT_FLT:
-                    std::copy(srcp, srcp + size_t(n) * nc, reinterpret_cast<float*>(o.aframe->data[0]));
+                    std::copy(srcp, srcp + size_t(n) * nc, reinterpret_cast<float*>(aframe->data[0]));
                     break;
                 case AV_SAMPLE_FMT_S16: {
-                    auto* d = reinterpret_cast<int16_t*>(o.aframe->data[0]);
+                    auto* d = reinterpret_cast<int16_t*>(aframe->data[0]);
                     for (size_t i = 0; i < size_t(n) * nc; ++i) d[i] = int16_t(std::lround(std::clamp(srcp[i], -1.0f, 1.0f) * 32767.0f));
                     break;
                 }
                 case AV_SAMPLE_FMT_S32: {
-                    auto* d = reinterpret_cast<int32_t*>(o.aframe->data[0]);
+                    auto* d = reinterpret_cast<int32_t*>(aframe->data[0]);
                     for (size_t i = 0; i < size_t(n) * nc; ++i)
                         d[i] = int32_t(std::llround(double(std::clamp(srcp[i], -1.0f, 1.0f)) * 2147483647.0));
                     break;
                 }
                 case AV_SAMPLE_FMT_S16P:
                     for (size_t c = 0; c < nc; ++c) {
-                        auto* d = reinterpret_cast<int16_t*>(o.aframe->data[c]);
+                        auto* d = reinterpret_cast<int16_t*>(aframe->data[c]);
                         for (int i = 0; i < n; ++i) d[i] = int16_t(std::lround(std::clamp(srcp[size_t(i) * nc + c], -1.0f, 1.0f) * 32767.0f));
                     }
                     break;
                 default: return false;
             }
-            o.aframe->pts = audioPts;
+            aframe->pts = audioPts;
             audioPts += n;
             fifo.erase(fifo.begin(), fifo.begin() + long(size_t(n) * nc));
-            if (avcodec_send_frame(o.actx, o.aframe) < 0) return false;
-            if (drain(o, o.actx, o.ast) < 0) return false;
+            if (avcodec_send_frame(actx, aframe) < 0) return false;
+            if (drain(o, actx, ast) < 0) return false;
         }
         return true;
     };
+    auto encodeAudio = [&](bool final) { return encodeFifo(o.actx, o.ast, o.aframe, fifo, audioPts, final); };
 
-    // Writes the captions that start before frame `until` (export range only).
-    size_t nextCaption = captions && o.sst ? captionIndexAt(*captions, in) : 0;
+    // Writes the captions that start before frame `until` (export range only), on every caption stream.
     std::vector<uint8_t> subBuf(1 << 16);
     auto writeCaptions = [&](FrameTime until) -> bool {
-        if (!o.sst) return true;
         const double msPerFrame = 1000.0 / seq.fpsValue();
-        for (; nextCaption < captions->captions.size() && captions->captions[nextCaption].start < until; ++nextCaption) {
-            const Caption& c = captions->captions[nextCaption];
+        for (auto& co : captionOuts)
+        for (; co->next < co->track->captions.size() && co->track->captions[co->next].start < until; ++co->next) {
+            const Caption& c = co->track->captions[co->next];
             const FrameTime a = std::max(c.start, in), b = std::min(c.end, out);
             if (b <= a) continue;
             const int64_t startMs = std::llround(double(a - in) * msPerFrame);
@@ -1033,15 +1095,15 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             const int keypad = captionKeypad(c);  // players that read alignment tags keep its place
             sub.rects[0]->ass = av_strdup(
                 ("0,0,Default,,0,0,0,," + (keypad != 2 ? "{\\an" + std::to_string(keypad) + "}" : std::string()) + assText(c.text)).c_str());
-            const int n = avcodec_encode_subtitle(o.sctx, subBuf.data(), int(subBuf.size()), &sub);
+            const int n = avcodec_encode_subtitle(co->ctx, subBuf.data(), int(subBuf.size()), &sub);
             avsubtitle_free(&sub);
             if (n < 0) return false;
             av_packet_unref(o.pkt);
             if (av_new_packet(o.pkt, n) < 0) return false;
             std::copy(subBuf.begin(), subBuf.begin() + n, o.pkt->data);
-            o.pkt->pts = o.pkt->dts = av_rescale_q(startMs, AVRational{1, 1000}, o.sst->time_base);
-            o.pkt->duration = av_rescale_q(durMs, AVRational{1, 1000}, o.sst->time_base);
-            o.pkt->stream_index = o.sst->index;
+            o.pkt->pts = o.pkt->dts = av_rescale_q(startMs, AVRational{1, 1000}, co->st->time_base);
+            o.pkt->duration = av_rescale_q(durMs, AVRational{1, 1000}, co->st->time_base);
+            o.pkt->stream_index = co->st->index;
             if (av_interleaved_write_frame(o.oc, o.pkt) < 0) return false;
         }
         return true;
@@ -1102,6 +1164,19 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
                 fifo.insert(fifo.end(), mixBuf.begin(), mixBuf.end());
                 if (!encodeAudio(false)) return fail("Audio encoding failed");
             }
+            // The other streams, sample for sample with the mix (not normalised: stems keep their levels).
+            for (auto& e : extras) {
+                const int64_t until = int64_t(std::llround(double(f + 1) * mixRate / seq.fpsValue()));
+                const int m = int(until - e->cursor);
+                if (m <= 0) continue;
+                mixBuf.resize(size_t(m) * size_t(nch));
+                e->seq.sampleRate = mixRate;
+                if (nch > 2) e->mixer.mixLayout(p, e->seq, e->cursor, m, mixBuf.data());
+                else e->mixer.mix(p, e->seq, e->cursor, m, mixBuf.data());
+                e->cursor = until;
+                e->fifo.insert(e->fifo.end(), mixBuf.begin(), mixBuf.end());
+                if (!encodeFifo(e->ctx, e->st, e->frame, e->fifo, e->pts, false)) return fail("Audio encoding failed");
+            }
         }
         if (progress && ((f - in) % 5 == 0 || f + 1 == out)) progress(double(f - in + 1) / double(total), f);
     }
@@ -1110,6 +1185,11 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         if (!encodeAudio(true)) return fail("Audio encoding failed");
         if ((rc = avcodec_send_frame(o.actx, nullptr)) < 0 || (rc = drain(o, o.actx, o.ast)) < 0)
             return fail("Finishing audio failed: " + averr(rc));
+        for (auto& e : extras) {
+            if (!encodeFifo(e->ctx, e->st, e->frame, e->fifo, e->pts, true)) return fail("Audio encoding failed");
+            if ((rc = avcodec_send_frame(e->ctx, nullptr)) < 0 || (rc = drain(o, e->ctx, e->st)) < 0)
+                return fail("Finishing audio failed: " + averr(rc));
+        }
     }
     if (wantVideo) {
         if ((rc = avcodec_send_frame(o.vctx, nullptr)) < 0 || (rc = drain(o, o.vctx, o.vst)) < 0)
@@ -1132,6 +1212,35 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
     // don't touch an existing file if we failed before writing to it.
     if (!ok && opened) std::remove(s.path.c_str());
     return ok;
+}
+
+std::vector<ExportSettings::AudioStream> stemStreams(const Sequence& seq, int groups) {
+    std::vector<ExportSettings::AudioStream> out;
+    const std::string language = seq.captionTracks.empty() ? std::string() : seq.captionTracks.front().language;
+    const size_t n = seq.audioTracks.size();
+    auto hasClips = [&](size_t i) { return !seq.audioTracks[i].muted && !seq.audioTracks[i].clips.empty(); };
+    if (groups == StemsByRole) {
+        Sequence named = seq;
+        for (Track& t : named.audioTracks)
+            for (Clip& c : t.clips)
+                if (c.role.empty()) c.role = "No Role";
+        for (const std::string& r : edit::sequenceRoles(named)) {
+            if (edit::roleMuted(seq, r)) continue;
+            bool used = false;
+            for (size_t i = 0; i < n && !used; ++i)
+                if (hasClips(i))
+                    for (const Clip& c : named.audioTracks[i].clips) used = used || (c.enabled && c.role == r);
+            if (used) out.push_back({r, language, {}, r});
+        }
+    } else {
+        for (size_t i = 0; i < n; ++i) {
+            if (!hasClips(i)) continue;
+            std::vector<bool> mask(n, false);
+            mask[i] = true;
+            out.push_back({seq.audioTracks[i].name.empty() ? "A" + std::to_string(i + 1) : seq.audioTracks[i].name, language, mask, {}});
+        }
+    }
+    return out;
 }
 
 bool exportStems(const Project& p, const Sequence& seq, const ExportSettings& s, int grouping, std::vector<StemFile>* written,

@@ -450,6 +450,12 @@ private slots:
                     break;
                 }
             QVERIFY(smart->isEnabled());
+            // More audio streams in a master (a MOV with sound), not in a GIF; every caption language needs two tracks.
+            auto* streams = ed.findChild<QComboBox*>("exportAudioStreams");
+            QVERIFY(streams && streams->isEnabled() && streams->count() == 3);
+            preset->setCurrentIndex(presetIndex("gif"));
+            QVERIFY(!streams->isEnabled());
+            QVERIFY(!ed.findChild<QCheckBox*>("exportAllCaptions")->isEnabled());
         }
         // One undo step each.
         state()->undo();

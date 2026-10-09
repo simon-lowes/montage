@@ -98,6 +98,7 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+#include <libswresample/swresample.h>
 #include <libavutil/mastering_display_metadata.h>
 #include <libavutil/pixdesc.h>
 }
@@ -341,6 +342,59 @@ std::vector<SubEvent> readSubtitles(const std::string& path, const char* format,
         av_packet_unref(pkt);
     }
     av_packet_free(&pkt);
+    avcodec_free_context(&ctx);
+    avformat_close_input(&fmt);
+    return out;
+}
+
+// The n-th audio stream of a file as interleaved stereo float at 48 kHz, with its title and language tags.
+std::vector<float> decodeAudioStream(const std::string& path, int n, std::string* title = nullptr, std::string* language = nullptr) {
+    std::vector<float> out;
+    AVFormatContext* fmt = nullptr;
+    if (avformat_open_input(&fmt, path.c_str(), nullptr, nullptr) < 0) return out;
+    avformat_find_stream_info(fmt, nullptr);
+    int idx = -1;
+    for (unsigned i = 0, k = 0; i < fmt->nb_streams; ++i)
+        if (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && int(k++) == n) idx = int(i);
+    if (idx < 0) {
+        avformat_close_input(&fmt);
+        return out;
+    }
+    AVStream* st = fmt->streams[idx];
+    if (title) {
+        const AVDictionaryEntry* e = av_dict_get(st->metadata, "title", nullptr, 0);
+        if (!e) e = av_dict_get(st->metadata, "handler_name", nullptr, 0);  // MP4
+        *title = e ? e->value : "";
+    }
+    if (language)
+        if (const AVDictionaryEntry* e = av_dict_get(st->metadata, "language", nullptr, 0)) *language = e->value;
+    const AVCodec* codec = avcodec_find_decoder(st->codecpar->codec_id);
+    AVCodecContext* ctx = avcodec_alloc_context3(codec);
+    avcodec_parameters_to_context(ctx, st->codecpar);
+    avcodec_open2(ctx, codec, nullptr);
+    SwrContext* swr = nullptr;
+    AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
+    swr_alloc_set_opts2(&swr, &stereo, AV_SAMPLE_FMT_FLT, 48000, &ctx->ch_layout, ctx->sample_fmt, ctx->sample_rate, 0, nullptr);
+    swr_init(swr);
+    AVPacket* pkt = av_packet_alloc();
+    AVFrame* fr = av_frame_alloc();
+    auto drainFrames = [&] {
+        while (avcodec_receive_frame(ctx, fr) >= 0) {
+            std::vector<float> buf(size_t(fr->nb_samples + 256) * 2);
+            uint8_t* o[1] = {reinterpret_cast<uint8_t*>(buf.data())};
+            const int got = swr_convert(swr, o, fr->nb_samples + 256, const_cast<const uint8_t**>(fr->extended_data), fr->nb_samples);
+            if (got > 0) out.insert(out.end(), buf.begin(), buf.begin() + got * 2);
+        }
+    };
+    while (av_read_frame(fmt, pkt) >= 0) {
+        if (pkt->stream_index == idx && avcodec_send_packet(ctx, pkt) >= 0) drainFrames();
+        av_packet_unref(pkt);
+    }
+    avcodec_send_packet(ctx, nullptr);
+    drainFrames();
+    av_frame_free(&fr);
+    av_packet_free(&pkt);
+    swr_free(&swr);
     avcodec_free_context(&ctx);
     avformat_close_input(&fmt);
     return out;
@@ -1375,6 +1429,104 @@ private slots:
             QVERIFY(loadProject(project.toStdString(), back));
             QVERIFY(back.active()->audioTracks[0].clips.front().timing.p("maintain_pitch", 1) < 0.5);
         }
+    }
+
+    void multiStreamMaster() {
+        // Dialogue (440 Hz) on A1 and music (880 Hz) on A2, English and German captions.
+        constexpr int sr = 48000;
+        auto tone = [&](const char* name, double hz) {
+            std::vector<float> mono(size_t(sr) * 2);
+            for (size_t i = 0; i < mono.size(); ++i) mono[i] = float(0.3 * std::sin(2 * M_PI * hz * double(i) / sr));
+            const std::string f = path(name);
+            writeMonoWav(f, mono, sr);
+            return f;
+        };
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 160;
+        s.height = 90;
+        s.fps = Rational{25, 1};
+        while (s.audioTracks.size() < 2) edit::addTrack(p, s, TrackKind::Audio);
+        Clip picture = makeGeneratorClip(p, "color", 50);
+        edit::overwrite(p, s, {TrackKind::Video, 0}, picture);
+        MediaItem voice = probeOrFail(p, tone("voice.wav", 440)), music = probeOrFail(p, tone("music.wav", 880));
+        p.media.push_back(voice);
+        p.media.push_back(music);
+        Clip a = makeClip(p, voice, TrackKind::Audio, s);
+        a.role = "Dialogue";
+        edit::overwrite(p, s, {TrackKind::Audio, 0}, a);
+        Clip b = makeClip(p, music, TrackKind::Audio, s);
+        b.role = "Music";
+        edit::overwrite(p, s, {TrackKind::Audio, 1}, b);
+        for (const char* lang : {"en", "de"}) {
+            CaptionTrack t;
+            t.id = p.newId();
+            t.language = lang;
+            t.name = std::string("Subtitles ") + lang;
+            t.captions = {{5, 40, lang == std::string("en") ? "Hello" : "Hallo"}};
+            s.captionTracks.push_back(t);
+        }
+        // The streams by role: Dialogue then Music, in the captions' language.
+        const auto byRole = stemStreams(s, StemsByRole);
+        QCOMPARE(byRole.size(), size_t(2));
+        QCOMPARE(byRole[0].name, std::string("Dialogue"));
+        QCOMPARE(byRole[0].role, std::string("Dialogue"));
+        QCOMPARE(byRole[1].language, std::string("en"));
+        QCOMPARE(stemStreams(s, StemsByTrack).size(), size_t(2));
+        // An MKV master: the mix, each role, and both caption languages.
+        ExportSettings st;
+        st.path = path("master.mkv");
+        st.preset = "ultrafast";
+        st.audioCodec = "flac";
+        st.extraAudio = byRole;
+        st.audioName = "Mix";
+        st.audioLanguage = "en";
+        st.embedCaptions = true;
+        st.extraCaptions = {s.captionTracks[1].id};
+        std::string err;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        auto level = [](const std::vector<float>& v, double hz) { return toneLevel(v, 0, hz, 4800, 48000); };
+        std::string title, lang;
+        const std::vector<float> mix = decodeAudioStream(st.path, 0, &title, &lang);
+        QCOMPARE(title, std::string("Mix"));
+        QCOMPARE(lang, std::string("eng"));
+        QVERIFY(level(mix, 440) > 0.05 && level(mix, 880) > 0.05);
+        const std::vector<float> dialogue = decodeAudioStream(st.path, 1, &title, &lang);
+        QCOMPARE(title, std::string("Dialogue"));
+        QVERIFY2(level(dialogue, 440) > 20 * level(dialogue, 880), qPrintable(QString("%1 %2").arg(level(dialogue, 440)).arg(level(dialogue, 880))));
+        const std::vector<float> score = decodeAudioStream(st.path, 2, &title);
+        QCOMPARE(title, std::string("Music"));
+        QVERIFY(level(score, 880) > 20 * level(score, 440));
+        QVERIFY(decodeAudioStream(st.path, 3).empty());
+        // Both subtitle streams, each with its language.
+        AVFormatContext* fmt = nullptr;
+        QVERIFY(avformat_open_input(&fmt, st.path.c_str(), nullptr, nullptr) >= 0);
+        avformat_find_stream_info(fmt, nullptr);
+        QStringList subs;
+        for (unsigned i = 0; i < fmt->nb_streams; ++i)
+            if (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE)
+                if (const AVDictionaryEntry* e = av_dict_get(fmt->streams[i]->metadata, "language", nullptr, 0)) subs << e->value;
+        avformat_close_input(&fmt);
+        QVERIFY2(subs.size() == 2 && subs[0] == "eng" && (subs[1] == "ger" || subs[1] == "deu"), qPrintable(subs.join(' ')));  // B or T code
+        // Over MCP: an MP4 with a stream for A2 alone, named and in German.
+        const QString project = QString::fromStdString(path("streams.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_render"},
+                                                     {"arguments", QJsonObject{{"project", project}, {"output", QString::fromStdString(path("streams.mp4"))},
+                                                                               {"preset", "H.264 - Fast Draft"}, {"captions", "embed"}, {"all_captions", true},
+                                                                               {"audio_streams", QJsonArray{QJsonObject{{"name", "Musik"}, {"language", "de"},
+                                                                                                                        {"tracks", QJsonArray{"A2"}}}}}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const std::vector<float> musik = decodeAudioStream(path("streams.mp4"), 1, &title, &lang);
+        QCOMPARE(title, std::string("Musik"));
+        QVERIFY2(lang == "ger" || lang == "deu", lang.c_str());
+        QVERIFY(level(musik, 880) > 20 * level(musik, 440));
     }
 
     void clipAnimationOverMcp() {

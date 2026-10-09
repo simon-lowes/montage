@@ -193,6 +193,20 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     captions_->addItem(tr("Burn in and embed"), 3);
     captions_->setCurrentIndex(std::clamp(appSettings().value("export/captions", 0).toInt(), 0, 3));
     form->addRow(tr("Captions:"), captions_);
+    allCaptions_ = new QCheckBox(tr("Every caption track (a stream each)"), form_);
+    allCaptions_->setObjectName(QStringLiteral("exportAllCaptions"));
+    allCaptions_->setToolTip(tr("Embed each caption track as its own subtitle stream, tagged with its language, so players offer them all"));
+    allCaptions_->setChecked(appSettings().value("export/allCaptions", false).toBool());
+    form->addRow(QString(), allCaptions_);
+    streams_ = new QComboBox(form_);
+    streams_->setObjectName(QStringLiteral("exportAudioStreams"));
+    streams_->addItem(tr("The mix only"));
+    streams_->addItem(tr("The mix, then one per role"));
+    streams_->addItem(tr("The mix, then one per track"));
+    streams_->setToolTip(tr("A master with more audio streams after the mix (Dialogue, Music, Effects, or each track and dub), "
+                            "each named and tagged with its language"));
+    streams_->setCurrentIndex(std::clamp(appSettings().value("export/audioStreams", 0).toInt(), 0, 2));
+    form->addRow(tr("Audio streams:"), streams_);
     chapters_ = new QCheckBox(tr("From chapter markers"), form_);
     chapters_->setObjectName(QStringLiteral("exportChapters"));
     chapters_->setChecked(appSettings().value("export/chapters", true).toBool());
@@ -328,6 +342,7 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     connect(preset_, &QComboBox::currentIndexChanged, this, [this] { presetChanged(); });
     connect(browse_, &QPushButton::clicked, this, [this] { browse(); });
     connect(path_, &QLineEdit::textChanged, this, [this] { updateControls(); });
+    connect(captions_, &QComboBox::currentIndexChanged, this, [this] { updateControls(); });
     connect(range_, &QComboBox::currentIndexChanged, this, [this] {
         updateControls();
         updateSummary();
@@ -461,6 +476,12 @@ void ExportDialog::updateControls() {
     captions_->setEnabled(video && ct && !ct->captions.empty());
     captions_->setToolTip(captions_->isEnabled() ? tr("Uses the caption track \"%1\"").arg(QString::fromStdString(ct->name))
                                                  : tr("Add a visible caption track (Captions panel) to export captions"));
+    allCaptions_->setEnabled(captions_->isEnabled() && (captions_->currentData().toInt() & 2) && seq && seq->captionTracks.size() > 1);
+    {
+        const QString e = p ? QString::fromStdString(p->extension).toLower() : QString();
+        const bool container = e == QLatin1String("mp4") || e == QLatin1String("mov") || e == QLatin1String("mkv") || e == QLatin1String("mxf");
+        streams_->setEnabled(p && hasAudio(p->settings) && container);
+    }
     const QString ext = p ? QString::fromStdString(p->extension).toLower() : QString();
     const bool chapterFile = ext == QLatin1String("mp4") || ext == QLatin1String("mov") || ext == QLatin1String("m4v") ||
                              ext == QLatin1String("mkv") || ext == QLatin1String("webm");
@@ -593,6 +614,15 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
         s.embedCaptions = mode & 2;
     }
     settings.setValue("export/captions", captions_->currentIndex());
+    if (allCaptions_->isEnabled() && allCaptions_->isChecked() && state_->sequence())
+        for (const CaptionTrack& t : state_->sequence()->captionTracks) s.extraCaptions.push_back(t.id);
+    settings.setValue("export/allCaptions", allCaptions_->isChecked());
+    if (streams_->isEnabled() && streams_->currentIndex() > 0 && state_->sequence()) {
+        s.extraAudio = stemStreams(*state_->sequence(), streams_->currentIndex() == 1 ? StemsByRole : StemsByTrack);
+        s.audioName = "Mix";
+        if (!state_->sequence()->captionTracks.empty()) s.audioLanguage = state_->sequence()->captionTracks.front().language;
+    }
+    settings.setValue("export/audioStreams", streams_->currentIndex());
     s.chapters = chapters_->isChecked();
     settings.setValue("export/chapters", chapters_->isChecked());
     s.smartRender = smart_->isChecked();

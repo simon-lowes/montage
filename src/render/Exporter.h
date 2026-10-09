@@ -70,6 +70,20 @@ struct ExportSettings {
     // Smart rendering: with ProRes or DNxHR, frames that are one untouched clip of footage already in the same
     // flavour, size and rate are copied from the source, not re-encoded.
     bool smartRender = true;
+    // Masters with several audio streams (Resolve 21.1's separate output tracks, broadcast and streaming deliverables):
+    // the mix first (named and tagged with a language), then one stream for each of these, each hearing only its
+    // tracks (empty = all) and, when given, only clips of its role ("Dialogue", "Music", "Effects", "No Role"): an
+    // M&E, a dialogue stem, a dubbed language. They are not loudness-normalised.
+    struct AudioStream {
+        std::string name;
+        std::string language;  // ISO 639-1
+        std::vector<bool> tracks;
+        std::string role;
+    };
+    std::vector<AudioStream> extraAudio;
+    std::string audioName, audioLanguage;  // the mix's title and language
+    // With embedCaptions, these caption tracks too, each as its own subtitle stream (every language at once).
+    std::vector<Id> extraCaptions;
 };
 
 struct ExportPreset {
@@ -100,6 +114,9 @@ struct StemFile {
 };
 bool exportStems(const Project& p, const Sequence& seq, const ExportSettings& s, int groups, std::vector<StemFile>* written,
                  const ExportProgress& progress = {}, const std::atomic<bool>* cancel = nullptr, std::string* error = nullptr);
+// The streams a master can carry after its mix, split as stems are: one per audio track with clips, or one per role
+// in use (StemsByTrack or StemsByRole), each named for it and in the language of the sequence's first caption track.
+std::vector<ExportSettings::AudioStream> stemStreams(const Sequence& seq, int groups);
 
 bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
                     const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed = nullptr,

@@ -3058,7 +3058,13 @@ void McpServer::Impl::addTools() {
                 "watermark_opacity":{"type":"number","default":0.6}}},
             "downmix_stereo":{"type":"boolean","default":false,"description":"A 5.1/7.1 sequence: fold the mix down to stereo"},
             "stems":{"type":"string","enum":["none","tracks","buses","roles"],"default":"none",
-                "description":"Also write 24-bit WAV stems beside the output, one per audio track, per bus (plus Main) or per audio role"}},
+                "description":"Also write 24-bit WAV stems beside the output, one per audio track, per bus (plus Main) or per audio role"},
+            "captions":{"type":"string","enum":["none","burn","embed","both"],"default":"none","description":"The visible caption track, burned into the picture and/or embedded as a subtitle stream"},
+            "all_captions":{"type":"boolean","default":false,"description":"With embed: every caption track as its own subtitle stream, language tagged"},
+            "audio_streams":{"description":"More audio streams after the mix (a master's M&E, dialogue, dubs): \"roles\" (one per role), \"tracks\" (one per track), or a list of {name, language, tracks:[\"A2\",...], role}",
+                "anyOf":[{"type":"string","enum":["mix","roles","tracks"]},{"type":"array","items":{"type":"object","properties":{
+                    "name":{"type":"string"},"language":{"type":"string"},"tracks":{"type":"array","items":{"type":"string"}},"role":{"type":"string"}}}}]},
+            "audio_name":{"type":"string","description":"The mix stream's title"},"audio_language":{"type":"string","description":"The mix stream's language (ISO 639-1)"}},
             "required":["project","output"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
@@ -3092,6 +3098,38 @@ void McpServer::Impl::addTools() {
                 st.burnIn.watermarkOpacity = std::clamp(b.value("watermark_opacity").toDouble(0.6), 0.0, 1.0);
             }
             st.downmixStereo = a.value("downmix_stereo").toBool();
+            const QString cap = str(a, "captions", "none");
+            if (cap != "none" && cap != "burn" && cap != "embed" && cap != "both") throw ArgError{"\"captions\" must be none, burn, embed or both"};
+            st.burnInCaptions = cap == "burn" || cap == "both";
+            st.embedCaptions = cap == "embed" || cap == "both";
+            if (st.embedCaptions && a.value("all_captions").toBool())
+                for (const CaptionTrack& t : s.captionTracks) st.extraCaptions.push_back(t.id);
+            st.audioName = a.value("audio_name").toString().toStdString();
+            st.audioLanguage = a.value("audio_language").toString().toStdString();
+            const QJsonValue streams = a.value("audio_streams");
+            if (streams.isString() && streams.toString() != "mix") {
+                if (streams.toString() != "roles" && streams.toString() != "tracks") throw ArgError{"\"audio_streams\" is mix, roles, tracks or a list"};
+                st.extraAudio = stemStreams(s, streams.toString() == "roles" ? StemsByRole : StemsByTrack);
+            } else if (streams.isArray()) {
+                for (const QJsonValue& v : streams.toArray()) {
+                    const QJsonObject o = v.toObject();
+                    ExportSettings::AudioStream as;
+                    as.name = o.value("name").toString().toStdString();
+                    as.language = o.value("language").toString().toStdString();
+                    as.role = o.value("role").toString().toStdString();
+                    if (o.contains("tracks")) {
+                        as.tracks.assign(s.audioTracks.size(), false);
+                        for (const QJsonValue& t : o.value("tracks").toArray()) {
+                            const QString name = t.toString().trimmed().toUpper();
+                            const int i = name.startsWith('A') ? name.mid(1).toInt() - 1 : -1;
+                            if (i < 0 || i >= int(s.audioTracks.size())) throw ArgError{QStringLiteral("No audio track %1").arg(t.toString())};
+                            as.tracks[size_t(i)] = true;
+                        }
+                    }
+                    st.extraAudio.push_back(as);
+                }
+            }
+            if (!st.extraAudio.empty() && st.audioName.empty()) st.audioName = "Mix";
             const QString stems = str(a, "stems", "none");
             if (stems != "none" && stems != "tracks" && stems != "buses" && stems != "roles")
                 throw ArgError{"\"stems\" must be none, tracks, buses or roles"};

@@ -81,6 +81,8 @@ private:
     QSpinBox* quality_ = nullptr;
     QComboBox* captions_ = nullptr;
     QCheckBox* chapters_ = nullptr;
+    QComboBox* streams_ = nullptr;      // more audio streams after the mix: none, per role, per track
+    QCheckBox* allCaptions_ = nullptr;  // every caption track as its own subtitle stream
     QCheckBox* smart_ = nullptr;
     QComboBox* color_ = nullptr;
     QComboBox* loudness_ = nullptr;
