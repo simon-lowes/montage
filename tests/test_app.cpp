@@ -2974,6 +2974,59 @@ private slots:
         QCOMPARE(trackAt(*state()->sequence(), V1)->transitions.size(), size_t(0));
     }
 
+    void motionPathInTheProgramMonitor() {
+        loadDemo();
+        MonitorPanel* program = nullptr;
+        for (auto* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Program) program = m;
+        QVERIFY(program);
+        ViewerWidget* viewer = program->viewer();
+        auto* overlay = viewer->findChild<TransformOverlay*>();
+        QVERIFY(overlay);
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        const FrameTime last = clipNamed(*state()->sequence(), "Red")->duration - 1;
+        state()->setPlayhead(5);
+        state()->setSelection({red}, false);
+        QApplication::processEvents();
+        std::vector<QPointF> path;
+        std::vector<std::pair<FrameTime, QPointF>> keys;
+        QVERIFY(!overlay->motionPath(red, path, keys));  // a still position has no path
+        // Left to right across the clip.
+        QVERIFY(state()->edit("Keys", [red, last](Project& p, Sequence& s) {
+            Clip* clip = edit::clipById(s, red);
+            if (clip->motion.empty()) clip->motion = makeEffect(p, "transform");
+            clip->motion.params["pos_x"].addKey(0, -80);
+            clip->motion.params["pos_x"].addKey(last, 80);
+            return true;
+        }));
+        QApplication::processEvents();
+        QVERIFY(overlay->motionPath(red, path, keys));
+        QCOMPARE(path.size(), size_t(last + 1));  // a dot a frame
+        QCOMPARE(keys.size(), size_t(2));
+        const QRectF pic = viewer->imageRect();
+        const double perPixel = 320.0 / pic.width();
+        QVERIFY(std::fabs(keys[0].second.x() - (pic.center().x() - 80 / perPixel)) < 1.5);
+        QVERIFY(std::fabs(keys[1].second.x() - (pic.center().x() + 80 / perPixel)) < 1.5);
+        QCOMPARE(keys[1].first, last);
+        // Even steps for a linear move.
+        const double first = QLineF(path[0], path[1]).length(), mid = QLineF(path[size_t(last / 2)], path[size_t(last / 2 + 1)]).length();
+        QVERIFY(std::fabs(first - mid) < 0.05);
+        // Dragging the last keyframe 30 pixels up moves that keyframe only: one undo step.
+        const QPointF from = keys[1].second, to = from + QPointF(0, -30);
+        QTest::mousePress(viewer, Qt::LeftButton, {}, from.toPoint());
+        QMouseEvent move(QEvent::MouseMove, to, viewer->mapToGlobal(to), Qt::NoButton, Qt::LeftButton, {});
+        QApplication::sendEvent(viewer, &move);
+        QTest::mouseRelease(viewer, Qt::LeftButton, {}, to.toPoint());
+        const Clip* c = clipNamed(*state()->sequence(), "Red");
+        QVERIFY2(std::fabs(c->motion.p("pos_y", last) + 30 * perPixel) < 1, qPrintable(QString::number(c->motion.p("pos_y", last))));
+        QVERIFY(std::fabs(c->motion.p("pos_x", last) - 80) < 1);
+        QCOMPARE(c->motion.p("pos_x", 0), -80.0);
+        QCOMPARE(c->motion.params.at("pos_x").keys.size(), size_t(2));  // no key added at the playhead
+        state()->undo();
+        QCOMPARE(clipNamed(*state()->sequence(), "Red")->motion.p("pos_y", last), 0.0);
+        state()->undo();
+    }
+
     void transformInTheProgramMonitor() {
         loadDemo();
         MonitorPanel* program = nullptr;

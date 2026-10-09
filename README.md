@@ -54,6 +54,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 
 **Effects and colour**
 - Transform on every clip: position, scale, rotation, anchor, crop, opacity, flip, and fit/fill/stretch
+- **Motion paths** (After Effects' and Premiere's): an animated position shows its path over the Program monitor, a dot a frame so their spacing shows the speed and a square at each keyframe; drag a square to move that keyframe (one undo step) while the box still moves the clip at the playhead.
 - 13 blend modes
 - Primary colour correction: lift, gamma and gain per channel, plus exposure, contrast, pivot, saturation, temperature, tint and offset
 - One-click Auto Colour (grey-world balance and level stretch)

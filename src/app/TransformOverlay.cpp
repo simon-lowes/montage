@@ -76,10 +76,45 @@ QPointF TransformOverlay::toSequence(const QPointF& w) const {
     return {(w.x() - r.left()) * s->width / r.width(), (w.y() - r.top()) * s->height / r.height()};
 }
 
+bool TransformOverlay::motionPath(Id clip, std::vector<QPointF>& path, std::vector<std::pair<FrameTime, QPointF>>& keys) const {
+    path.clear();
+    keys.clear();
+    const Sequence* s = state_->sequence();
+    const Clip* c = s ? edit::clipById(*s, clip) : nullptr;
+    const QRectF r = viewer_->imageRect();
+    if (!c || r.isEmpty() || viewer_->comparing() || viewer_->twoUp()) return false;
+    const auto px = c->motion.params.find("pos_x"), py = c->motion.params.find("pos_y");
+    const bool ax = px != c->motion.params.end() && px->second.animated(), ay = py != c->motion.params.end() && py->second.animated();
+    if (!ax && !ay) return false;
+    auto at = [&](FrameTime lt) {
+        return QPointF(r.left() + (s->width / 2.0 + c->motion.p("pos_x", lt)) * r.width() / s->width,
+                       r.top() + (s->height / 2.0 + c->motion.p("pos_y", lt)) * r.height() / s->height);
+    };
+    const FrameTime len = std::max<FrameTime>(1, c->duration);
+    const FrameTime step = std::max<FrameTime>(1, len / 400);
+    for (FrameTime lt = 0; lt < len; lt += step) path.push_back(at(lt));
+    std::vector<FrameTime> times;
+    for (const auto& it : {px, py})
+        if (it != c->motion.params.end())
+            for (const Keyframe& k : it->second.keys)
+                if (k.t >= 0 && k.t < len) times.push_back(k.t);
+    std::sort(times.begin(), times.end());
+    times.erase(std::unique(times.begin(), times.end()), times.end());
+    for (FrameTime t : times) keys.push_back({t, at(t)});
+    return true;
+}
+
 TransformOverlay::Grab TransformOverlay::hit(Id clip, const QPointF& pos, int& corner) const {
     std::array<QPointF, 4> c;
     QPointF anchor;
     if (!box(clip, c, anchor)) return Grab::None;
+    std::vector<QPointF> path;
+    std::vector<std::pair<FrameTime, QPointF>> keys;
+    if (motionPath(clip, path, keys))
+        for (size_t k = 0; k < keys.size(); ++k)
+            // A keyframe under the anchor leaves the press to Move, which keys the playhead.
+            if (QLineF(pos, keys[k].second).length() <= kHandle && QLineF(keys[k].second, anchor).length() > kHandle)
+                return corner = int(k), Grab::PathKey;
     for (int k = 0; k < 4; ++k)
         if (QLineF(pos, c[size_t(k)]).length() <= kHandle) return corner = k, Grab::Corner;
     for (int k = 0; k < 4; ++k) {
@@ -130,6 +165,27 @@ void TransformOverlay::paint(QPainter& p, const QRectF&) const {
         if (snapY_ >= 0) {
             const double y = r.top() + snapY_ * r.height() / s->height;
             p.drawLine(QPointF(r.left(), y), QPointF(r.right(), y));
+        }
+    }
+    // The motion path: a dot a frame, a square a keyframe (the one at the playhead filled).
+    std::vector<QPointF> path;
+    std::vector<std::pair<FrameTime, QPointF>> keys;
+    if (motionPath(clip, path, keys)) {
+        const QColor pathColor(255, 196, 60);
+        p.setPen(QPen(pathColor, 1, Qt::DotLine));
+        p.setBrush(Qt::NoBrush);
+        p.drawPolyline(path.data(), int(path.size()));
+        if (path.size() <= 400) {
+            p.setPen(Qt::NoPen);
+            p.setBrush(pathColor);
+            for (const QPointF& q : path) p.drawEllipse(q, 1.3, 1.3);
+        }
+        const Clip* cc = s ? edit::clipById(*s, clip) : nullptr;
+        const FrameTime lt = cc ? state_->playhead() - cc->start : -1;
+        p.setPen(QPen(pathColor, 1.5));
+        for (const auto& [t, q] : keys) {
+            p.setBrush(t == lt ? pathColor : QColor(30, 30, 30));
+            p.drawRect(QRectF(q - QPointF(4, 4), QSizeF(8, 8)));
         }
     }
     p.setPen(QPen(QColor(90, 170, 255), 1.5));
@@ -205,17 +261,21 @@ void TransformOverlay::drag(const QPointF& pos, Qt::KeyboardModifiers mods) {
             if (mods & Qt::ShiftModifier) rotation = std::round(rotation / 15) * 15;
             break;
         }
+        case Grab::PathKey:
+            posX = posX_ + d.x();
+            posY = posY_ + d.y();
+            break;
         case Grab::None: return;
     }
     const Id clip = clip_;
-    const FrameTime lt = state_->playhead() - base->start;
+    const FrameTime lt = grab_ == Grab::PathKey ? pathKey_ : state_->playhead() - base->start;
     const Grab g = grab_;
     state_->updateGesture([=](Project& p, Sequence& seq) {
         Clip* c = edit::clipById(seq, clip);
         if (!c) return;
         if (c->motion.empty()) c->motion = makeEffect(p, "transform");
         auto set = [&](const char* name, double v) { c->motion.params[name].set(lt, v); };
-        if (g == Grab::Move) set("pos_x", posX), set("pos_y", posY);
+        if (g == Grab::Move || g == Grab::PathKey) set("pos_x", posX), set("pos_y", posY);
         if (g == Grab::Corner) set("scale", scale);
         if (g == Grab::EdgeX) set("scale_x", scaleX);
         if (g == Grab::EdgeY) set("scale_y", scaleY);
@@ -246,7 +306,13 @@ bool TransformOverlay::eventFilter(QObject* obj, QEvent* e) {
             QPointF anchor;
             std::array<QPointF, 4> corners;
             if (!c || !box(clip, corners, anchor)) return false;
-            const FrameTime lt = state_->playhead() - c->start;
+            FrameTime lt = state_->playhead() - c->start;
+            if (g == Grab::PathKey) {
+                std::vector<QPointF> path;
+                std::vector<std::pair<FrameTime, QPointF>> keys;
+                if (!motionPath(clip, path, keys) || corner < 0 || corner >= int(keys.size())) return false;
+                lt = pathKey_ = keys[size_t(corner)].first;
+            }
             clip_ = clip;
             grab_ = g;
             press_ = toSequence(pos);
@@ -255,7 +321,7 @@ bool TransformOverlay::eventFilter(QObject* obj, QEvent* e) {
             posX_ = c->motion.p("pos_x", lt), posY_ = c->motion.p("pos_y", lt);
             scale_ = c->motion.p("scale", lt, 100), scaleX_ = c->motion.p("scale_x", lt, 100), scaleY_ = c->motion.p("scale_y", lt, 100);
             rotation_ = c->motion.p("rotation", lt);
-            static const char* const kLabels[] = {"", "Move", "Scale", "Stretch", "Stretch", "Rotate"};
+            static const char* const kLabels[] = {"", "Move", "Scale", "Stretch", "Stretch", "Rotate", "Move Keyframe"};
             state_->beginGesture(tr(kLabels[int(g)]));
             return true;
         }
@@ -274,6 +340,7 @@ bool TransformOverlay::eventFilter(QObject* obj, QEvent* e) {
                 case Grab::EdgeX: viewer_->setCursor(Qt::SizeHorCursor); break;
                 case Grab::EdgeY: viewer_->setCursor(Qt::SizeVerCursor); break;
                 case Grab::Rotate: viewer_->setCursor(Qt::CrossCursor); break;
+                case Grab::PathKey: viewer_->setCursor(Qt::PointingHandCursor); break;
                 case Grab::None:
                     if (!viewer_->lookAround()) viewer_->unsetCursor();
                     break;
