@@ -108,8 +108,16 @@ struct J2kEncoder {
         ctx->thread_count = 1;  // frames are encoded side by side instead
         // X'Y'Z' as it is, when the encoder takes it; else as RGB (the numbers are the same).
         ctx->pix_fmt = AV_PIX_FMT_RGB48LE;
-        if (codec->pix_fmts)
-            for (const AVPixelFormat* f = codec->pix_fmts; *f != AV_PIX_FMT_NONE; ++f)
+        const AVPixelFormat* formats = nullptr;
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(61, 13, 100)
+        const void* cfg = nullptr;
+        if (avcodec_get_supported_config(ctx, codec, AV_CODEC_CONFIG_PIX_FORMAT, 0, &cfg, nullptr) >= 0)
+            formats = static_cast<const AVPixelFormat*>(cfg);
+#else
+        formats = codec->pix_fmts;
+#endif
+        if (formats)
+            for (const AVPixelFormat* f = formats; *f != AV_PIX_FMT_NONE; ++f)
                 if (*f == AV_PIX_FMT_XYZ12LE) ctx->pix_fmt = AV_PIX_FMT_XYZ12LE;
         av_opt_set(ctx->priv_data, "format", "j2k", 0);  // a bare codestream, not a JP2 file
         if (openjpeg) {
