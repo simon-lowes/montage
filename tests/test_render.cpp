@@ -1,5 +1,6 @@
 // Renderer tests: blending, transforms, effects, transitions, generators.
 #include <QtTest>
+#include <map>
 #include <QTemporaryDir>
 
 #include <algorithm>
@@ -1272,6 +1273,85 @@ colorspaces:
         QVERIFY(near(c[0], 0.2f));
         rgb(k10, 0, 0, c);
         QVERIFY(near(c[0], 0.8f));
+    }
+
+    void hdrPaletteZones() {
+        Project p;
+        float c[4];
+        auto graded = [&](Image img, const std::map<std::string, double>& set) {
+            Effect e = makeEffect(p, "hdr_palette");
+            for (const auto& [k, v] : set) e.params[k] = v;
+            applyVideoEffect(e, 0, img, 1);
+            return img;
+        };
+        // Untouched it changes nothing; a stop up in the shadows doubles the light of a dark grey (Rec.709, gamma 2.4)
+        // and leaves a bright one alone.
+        Image same = graded(solid(2, 2, 0.3f, 0.5f, 0.7f), {});
+        rgb(same, 0, 0, c);
+        QVERIFY(near(c[0], 0.3f, 1e-3f) && near(c[1], 0.5f, 1e-3f) && near(c[2], 0.7f, 1e-3f));
+        const float up = std::pow(2.0f, 1 / 2.4f);
+        rgb(graded(solid(2, 2, 0.2f, 0.2f, 0.2f), {{"shadow_exposure", 1.0}}), 0, 0, c);
+        QVERIFY2(near(c[0], 0.2f * up, 0.006f), qPrintable(QString::number(c[0])));
+        rgb(graded(solid(2, 2, 0.9f, 0.9f, 0.9f), {{"shadow_exposure", 1.0}}), 0, 0, c);
+        QVERIFY(near(c[0], 0.9f, 1e-3f));
+        // The global exposure moves everything.
+        rgb(graded(solid(2, 2, 0.5f, 0.5f, 0.5f), {{"exposure", 1.0}}), 0, 0, c);
+        QVERIFY(near(c[0], 0.5f * up, 0.003f));
+        // Warmer highlights: a bright grey turns warm, a dark one stays grey.
+        const std::map<std::string, double> warm{{"highlight_r", 0.3}, {"highlight_g", -0.1}, {"highlight_b", -0.2}};
+        rgb(graded(solid(2, 2, 0.98f, 0.98f, 0.98f), warm), 0, 0, c);
+        QVERIFY2(c[0] > c[1] + 0.01f && c[1] > c[2] + 0.01f, qPrintable(QString("%1 %2 %3").arg(c[0]).arg(c[1]).arg(c[2])));
+        rgb(graded(solid(2, 2, 0.15f, 0.15f, 0.15f), warm), 0, 0, c);
+        QVERIFY(near(c[0], c[1], 1e-3f) && near(c[1], c[2], 1e-3f));
+        // No colour left in the shadows; the highlights keep theirs.
+        rgb(graded(solid(2, 2, 0.25f, 0.1f, 0.05f), {{"shadow_saturation", 0.0}}), 0, 0, c);
+        QVERIFY(near(c[0], c[1], 0.003f) && near(c[1], c[2], 0.003f));
+        rgb(graded(solid(2, 2, 1.0f, 0.8f, 0.7f), {{"shadow_saturation", 0.0}}), 0, 0, c);
+        QVERIFY(c[0] - c[2] > 0.25f);
+        // Zones pulled hard against each other never turn tones over; a Mix of 0 is the original.
+        Image ramp(101, 1);
+        for (int x = 0; x <= 100; ++x) {
+            float* q = ramp.at(x, 0);
+            q[0] = q[1] = q[2] = x / 100.0f;
+            q[3] = 1;
+        }
+        const Image fight = graded(ramp, {{"shadow_exposure", 4.0}, {"light_exposure", -4.0}, {"contrast", 2.0}});
+        for (int x = 1; x <= 100; ++x) QVERIFY2(fight.at(x, 0)[1] >= fight.at(x - 1, 0)[1] - 1e-5f, qPrintable(QString::number(x)));
+        const Image none = graded(ramp, {{"exposure", 3.0}, {"mix", 0.0}});
+        for (int x = 0; x <= 100; ++x) QVERIFY(std::fabs(none.at(x, 0)[1] - ramp.at(x, 0)[1]) < 1e-5f);
+        // In an HDR sequence it works in nits: a stop up takes reference white (203 nits) to 406, and a highlight zone
+        // set from 2 stops above grey brings a 1000-nit specular down a stop while leaving reference white alone.
+        const ColorSpace& pq = *findColorSpace("rec2100pq");
+        {
+            const WorkingSpaceScope working(&pq);
+            const float white = float(nitsToCode(pq, 203));
+            rgb(graded(solid(2, 2, white, white, white), {{"exposure", 1.0}}), 0, 0, c);
+            QVERIFY2(std::fabs(codeToNits(pq, c[1]) / 406 - 1) < 0.02, qPrintable(QString::number(codeToNits(pq, c[1]))));
+            const float spec = float(nitsToCode(pq, 1000));
+            const std::map<std::string, double> tame{{"specular_exposure", -1.0}, {"specular_range", 3.5}, {"specular_falloff", 0.5}};
+            rgb(graded(solid(2, 2, spec, spec, spec), tame), 0, 0, c);
+            QVERIFY2(std::fabs(codeToNits(pq, c[1]) / 500 - 1) < 0.03, qPrintable(QString::number(codeToNits(pq, c[1]))));
+            rgb(graded(solid(2, 2, white, white, white), tame), 0, 0, c);
+            QVERIFY(std::fabs(codeToNits(pq, c[1]) / 203 - 1) < 0.01);
+        }
+        // The compositor says which space the sequence is in: a grey matte in a PQ sequence, a stop up, has twice the light.
+        Sequence seq = makeSequence(p, "HDR", 64, 36, Rational{25, 1});
+        seq.colorSpace = "rec2100pq";
+        Clip matte = makeGeneratorClip(p, "color", 10);
+        matte.generator.params["color.r"] = matte.generator.params["color.g"] = matte.generator.params["color.b"] = 0.5;
+        QVERIFY(edit::overwrite(p, seq, {TrackKind::Video, 0}, matte).ok);
+        RenderOptions o;
+        const Image before = renderSequenceFrame(p, seq, 2, o);
+        Effect stop = makeEffect(p, "hdr_palette");
+        stop.params["exposure"] = 1.0;
+        seq.videoTracks[0].clips[0].effects.push_back(stop);
+        const Image after = renderSequenceFrame(p, seq, 2, o);
+        const double ratio = codeToNits(pq, after.at(30, 18)[1]) / codeToNits(pq, before.at(30, 18)[1]);
+        QVERIFY2(std::fabs(ratio - 2) < 0.05, qPrintable(QString::number(ratio)));
+        // A grade a LUT can hold.
+        std::vector<std::string> skipped;
+        bakeLut({stop}, 0, 9, &skipped);
+        QVERIFY(skipped.empty());
     }
 
     void toneControls() {

@@ -993,6 +993,7 @@ void applyTrackMatte(Image& layer, const Image& matte, bool luma, bool reverse) 
 }  // namespace
 
 Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& opts) {
+    const WorkingSpaceScope working(&sequenceColorSpace(seq));  // effects that work in light know whose
     const int solo = opts.soloVideoTrack;
     RenderOptions o = opts;
     o.soloVideoTrack = -1;

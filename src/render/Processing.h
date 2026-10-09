@@ -76,6 +76,20 @@ private:
     uint64_t previousMedia_;
     bool previousReframed_;
 };
+// The colour space the frame being worked on is in (the sequence's, set by the compositor for each sequence it draws),
+// for effects that work in light rather than in code values (the HDR Palette); Rec.709 when none is set.
+struct ColorSpace;
+const ColorSpace& currentWorkingSpace();
+class WorkingSpaceScope {
+public:
+    explicit WorkingSpaceScope(const ColorSpace* space);
+    ~WorkingSpaceScope();
+    WorkingSpaceScope(const WorkingSpaceScope&) = delete;
+    WorkingSpaceScope& operator=(const WorkingSpaceScope&) = delete;
+
+private:
+    const ColorSpace* previous_;
+};
 // A soft matte's edge moved out by `expand` px (re-edged by distance, softened over
 // `feather`), or else blurred by `blur` px; unchanged when both are zero.
 void refineMatte(std::vector<float>& matte, int w, int h, double expand, double feather, double blur);

@@ -1869,6 +1869,7 @@ void McpServer::Impl::addTools() {
             const FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : c.start;
             const FrameTime t = std::clamp<FrameTime>(at - c.start, 0, std::max<FrameTime>(0, c.duration - 1));
             std::vector<std::string> skipped;
+            const WorkingSpaceScope working(&sequenceColorSpace(s));
             const Lut3D lut = bakeLut(c.effects, t, a.value("size").toInt(33), &skipped);
             const QString path = absolute(need(a, "path"));
             std::string err;

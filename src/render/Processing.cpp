@@ -172,6 +172,120 @@ void curves(const Effect& e, FrameTime t, Image& img) {
 void hueCurves(const Effect& e, FrameTime t, Image& img);  // below, beside the curve building
 void colorWarper(const Effect& e, FrameTime t, Image& img);  // below, as hue curves
 
+// A transfer function and its inverse as tables (the HDR Palette decodes and encodes every pixel): code values to
+// light over 0..1.25, light to code values over 2^-24..2^8 by its logarithm; beyond them the functions themselves, and
+// negative values mirrored.
+struct TransferTables {
+    static constexpr int kDecode = 4096, kEncode = 4096;
+    static constexpr float kDecodeMax = 1.25f, kLogMin = -24, kLogMax = 8;
+    Transfer tf;
+    std::vector<float> dec, enc;
+    explicit TransferTables(Transfer t) : tf(t), dec(kDecode + 1), enc(kEncode + 1) {
+        for (int i = 0; i <= kDecode; ++i) dec[size_t(i)] = float(toLinear(tf, double(kDecodeMax) * i / kDecode));
+        for (int i = 0; i <= kEncode; ++i)
+            enc[size_t(i)] = float(fromLinear(tf, std::exp2(double(kLogMin) + double(kLogMax - kLogMin) * i / kEncode)));
+    }
+    float decode(float v) const {
+        if (v < 0) return -decode(-v);
+        if (v >= kDecodeMax) return float(toLinear(tf, v));
+        const float x = v / kDecodeMax * kDecode;
+        const int i = std::min(kDecode - 1, int(x));
+        return dec[size_t(i)] + (dec[size_t(i + 1)] - dec[size_t(i)]) * (x - float(i));
+    }
+    float encode(float l) const {
+        if (l < 0) return -encode(-l);
+        if (l <= std::exp2(kLogMin)) return enc[0] * l / std::exp2(kLogMin);  // a straight line to black
+        const float lg = std::log2(l);
+        if (lg >= kLogMax) return float(fromLinear(tf, l));
+        const float x = (lg - kLogMin) / (kLogMax - kLogMin) * kEncode;
+        const int i = std::min(kEncode - 1, int(x));
+        return enc[size_t(i)] + (enc[size_t(i + 1)] - enc[size_t(i)]) * (x - float(i));
+    }
+};
+
+// HDR Palette: each pixel's brightness in stops from mid grey (0.18 of reference white, in the light the working space
+// shows: SDR white and HDR's 203 nits are both 1.0), moved by the global exposure and each zone's exposure as far as the
+// pixel is in it (the curve kept rising), then the contrast round its pivot; the channels shifted by the zones' colour
+// balance (stops per channel), the saturation scaled, the black offset added, and the result coded back.
+void hdrPalette(const Effect& e, FrameTime t, Image& img) {
+    const ColorSpace& space = currentWorkingSpace();
+    const TransferTables tables(space.transfer);
+    float kr = 0.2126f, kg = 0.7152f, kb = 0.0722f;
+    if (space.primaries == Primaries::Bt2020) kr = 0.2627f, kg = 0.6780f, kb = 0.0593f;
+    else if (space.primaries == Primaries::P3D65) kr = 0.2290f, kg = 0.6917f, kb = 0.0793f;
+    struct ZoneValues {
+        float exposure, saturation, balance[3], range, falloff;
+        bool dark;
+    };
+    std::vector<ZoneValues> zones;
+    for (const HdrZone& z : hdrZones()) {
+        const std::string n = z.name;
+        zones.push_back({float(e.p(n + "_exposure", t)),
+                         float(e.p(n + "_saturation", t, 1)),
+                         {float(e.p(n + "_r", t)), float(e.p(n + "_g", t)), float(e.p(n + "_b", t))},
+                         float(e.p(n + "_range", t, z.range)),
+                         std::max(0.05f, float(e.p(n + "_falloff", t, z.falloff))),
+                         z.dark});
+    }
+    const float exposure = float(e.p("exposure", t)), saturation = float(e.p("saturation", t, 1));
+    const float global[3] = {float(e.p("global_r", t)), float(e.p("global_g", t)), float(e.p("global_b", t))};
+    const float contrast = float(e.p("contrast", t, 1)), pivot = float(e.p("pivot", t));
+    const float blackOffset = float(e.p("black_offset", t)), mix = float(e.p("mix", t, 100)) / 100;
+    // Per stop of brightness, from -16 to +12 in 1/32 steps: the brightness out, the balance and the saturation.
+    constexpr float kEvMin = -16, kEvMax = 12;
+    constexpr int kSteps = int((kEvMax - kEvMin) * 32);
+    std::vector<float> evOut(kSteps + 1), sat(kSteps + 1), bal[3];
+    for (auto& b : bal) b.assign(kSteps + 1, 0.0f);
+    for (int i = 0; i <= kSteps; ++i) {
+        const float ev = kEvMin + (kEvMax - kEvMin) * float(i) / kSteps;
+        float stops = exposure, s = saturation;
+        float c[3] = {global[0], global[1], global[2]};
+        for (const ZoneValues& z : zones) {
+            const float up = smoothstep(z.range - z.falloff / 2, z.range + z.falloff / 2, ev);
+            const float w = z.dark ? 1 - up : up;
+            if (w <= 0) continue;
+            stops += w * z.exposure;
+            s *= 1 + w * (z.saturation - 1);
+            for (int k = 0; k < 3; ++k) c[k] += w * z.balance[k];
+        }
+        float out = (ev + stops - pivot) * contrast + pivot;
+        if (i) out = std::max(out, evOut[size_t(i - 1)]);
+        evOut[size_t(i)] = out;
+        sat[size_t(i)] = std::max(0.0f, s);
+        for (int k = 0; k < 3; ++k) bal[k][size_t(i)] = c[k];
+    }
+    auto lookup = [&](const std::vector<float>& table, float x) {
+        const int i = std::min(kSteps - 1, int(x));
+        return table[size_t(i)] + (table[size_t(i + 1)] - table[size_t(i)]) * (x - float(i));
+    };
+    constexpr float kGrey = 0.18f;
+    perPixel(img, [&](float& r, float& g, float& b, float& a) {
+        if (a <= 0) return;
+        const float un = a < 1 ? 1 / a : 1;
+        const float code[3] = {r * un, g * un, b * un};
+        float lin[3];
+        for (int k = 0; k < 3; ++k) lin[k] = tables.decode(code[k]);
+        const float y = kr * lin[0] + kg * lin[1] + kb * lin[2];
+        const float ev = y > 1e-9f ? std::log2(y / kGrey) : kEvMin;
+        const float x = (std::clamp(ev, kEvMin, kEvMax) - kEvMin) / (kEvMax - kEvMin) * kSteps;
+        // The gain taking the brightness to its new level; past the table's ends the nearest end's gain.
+        const float evClamped = std::clamp(ev, kEvMin, kEvMax);
+        const float gain = std::exp2(lookup(evOut, x) - evClamped);
+        float out[3];
+        for (int k = 0; k < 3; ++k) out[k] = lin[k] * gain * std::exp2(lookup(bal[k], x));
+        const float s = lookup(sat, x);
+        if (s != 1) {
+            const float y2 = kr * out[0] + kg * out[1] + kb * out[2];
+            for (float& v : out) v = y2 + (v - y2) * s;
+        }
+        for (int k = 0; k < 3; ++k) {
+            const float coded = tables.encode(out[k] + blackOffset);
+            out[k] = (code[k] + (coded - code[k]) * mix) * a;
+        }
+        r = out[0], g = out[1], b = out[2];
+    });
+}
+
 void hueSat(const Effect& e, FrameTime t, Image& img) {
     float hue = float(e.p("hue", t)) * float(M_PI) / 180.0f;
     float sat = float(e.p("saturation", t, 1));
@@ -1298,6 +1412,14 @@ void stabilize(const Effect& e, FrameTime t, Image& img, double sourceSeconds) {
 }
 }  // namespace
 
+namespace {
+thread_local const ColorSpace* tWorkingSpace = nullptr;
+}  // namespace
+
+const ColorSpace& currentWorkingSpace() { return tWorkingSpace ? *tWorkingSpace : rec709Space(); }
+WorkingSpaceScope::WorkingSpaceScope(const ColorSpace* space) : previous_(tWorkingSpace) { tWorkingSpace = space; }
+WorkingSpaceScope::~WorkingSpaceScope() { tWorkingSpace = previous_; }
+
 TrackedSourceScope::TrackedSourceScope(uint64_t media, bool reframed) : previousMedia_(tSourceMedia), previousReframed_(tReframed) {
     tSourceMedia = media;
     tReframed = reframed;
@@ -1436,6 +1558,7 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
     else if (ty == "curves") curves(e, t, img);
     else if (ty == "hue_curves") hueCurves(e, t, img);
     else if (ty == "color_warper") colorWarper(e, t, img);
+    else if (ty == "hdr_palette") hdrPalette(e, t, img);
     else if (ty == "hue_sat") hueSat(e, t, img);
     else if (ty == "lut") applyLut(e, t, img);
     else if (ty == "color_space_transform") {

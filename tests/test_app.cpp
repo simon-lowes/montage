@@ -3972,6 +3972,72 @@ private slots:
         QCOMPARE(state()->sequence()->videoTracks.size(), tracks);
     }
 
+    void hdrPaletteInInspector() {
+        // A dark grey still with the HDR Palette on it.
+        QImage frame(320, 180, QImage::Format_RGB32);
+        frame.fill(QColor(50, 50, 50));
+        const QString png = dir_.path() + "/palette.png";
+        QVERIFY(frame.save(png));
+        state()->newProject();
+        const auto ids = state()->importFiles({png});
+        QCOMPARE(ids.size(), size_t(1));
+        state()->apply("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids[0], 0, 0, 30, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        });
+        const Id clip = state()->sequence()->videoTracks[0].clips.at(0).id;
+        state()->edit("Palette", [clip](Project& p, Sequence& s) {
+            edit::clipById(s, clip)->effects.push_back(makeEffect(p, "hdr_palette"));
+            return true;
+        });
+        state()->setSelection({clip}, false);
+        win_->findChild<QDockWidget*>("inspector")->show();
+        win_->findChild<QDockWidget*>("inspector")->raise();
+        QApplication::processEvents();
+        auto visible = [&]<typename W>(const char* name) -> W* {
+            for (auto* w : win_->findChildren<W*>(name))
+                if (w->isVisibleTo(win_.get())) return w;
+            return nullptr;
+        };
+        auto shown = [&](const QString& text) {
+            for (QLabel* l : win_->findChildren<QLabel*>())
+                if (l->isVisibleTo(win_.get()) && l->text() == text) return true;
+            return false;
+        };
+        // Global first: its wheel and sliders, none of the zones'.
+        auto* zone = visible.template operator()<QComboBox>("hdrZone");
+        QVERIFY(zone);
+        QCOMPARE(zone->count(), 7);
+        QVERIFY(visible.template operator()<ColorWheel>("wheel_global"));
+        QVERIFY(shown("Global Exposure (stops)"));
+        QVERIFY(!shown("Shadow Exposure (stops)"));
+        // The Shadow zone: its own wheel and sliders.
+        zone->setCurrentIndex(3);
+        QTRY_VERIFY(shown("Shadow Exposure (stops)"));
+        QVERIFY(!shown("Global Exposure (stops)"));
+        QVERIFY(shown("Shadow Up To (stops)"));
+        QCOMPARE(visible.template operator()<QComboBox>("hdrZone")->currentText(), QString("Shadow"));
+        auto* wheel = visible.template operator()<ColorWheel>("wheel_shadow");
+        QVERIFY(wheel);
+        // Pushing the shadows towards red: balanced channel shifts, one undo step, a redder picture.
+        RenderOptions o;
+        o.displaySpace = "rec709";
+        auto centre = [&] {
+            const Image img = renderProgramFrame(state()->project(), *state()->sequence(), 5, o);
+            const float* p = img.at(img.width / 2, img.height / 2);
+            return std::array<float, 3>{p[0], p[1], p[2]};
+        };
+        const auto before = centre();
+        wheel->setPuck({0.8, 0});
+        const Effect* e = &edit::clipById(*state()->sequence(), clip)->effects.back();
+        QVERIFY(e->p("shadow_r", 0) > 0.2 && e->p("shadow_g", 0) < 0);
+        QVERIFY(std::fabs(e->p("shadow_r", 0) + e->p("shadow_g", 0) + e->p("shadow_b", 0)) < 1e-9);
+        const auto after = centre();
+        QVERIFY2(after[0] > before[0] + 0.02f && after[2] < before[2], qPrintable(QString("%1 %2").arg(after[0]).arg(after[2])));
+        state()->undo();
+        QCOMPARE(edit::clipById(*state()->sequence(), clip)->effects.back().p("shadow_r", 0), 0.0);
+        state()->newProject();
+    }
+
     void gradingCurvesWheelsAndCompare() {
         auto mouse = [](QWidget* w, QEvent::Type type, QPointF pos, Qt::MouseButtons held) {
             QMouseEvent ev(type, pos, w->mapToGlobal(pos), type == QEvent::MouseMove ? Qt::NoButton : Qt::LeftButton, held, Qt::NoModifier);

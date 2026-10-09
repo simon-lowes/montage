@@ -677,7 +677,8 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
             th->addWidget(w);
         QFormLayout* f = addSection(QString::fromStdString(info->displayName), tools);
         if (e.type == "color_correct") addColorWheels(f, target(eid));
-        addParamRows(f, *info, target(eid));
+        if (e.type == "hdr_palette") addHdrPalette(f, *info, target(eid));
+        else addParamRows(f, *info, target(eid));
         const bool onClip = state_->sequence() && edit::clipById(*state_->sequence(), owner);
         if ((e.type == "stabilize" || e.type == "rolling_shutter") && onClip) {
             // The analysis lives in the effect; it is redone on demand.
@@ -1088,12 +1089,54 @@ void InspectorWidget::addParamRows(QFormLayout* form, const EffectInfo& info, co
     for (const auto& si : info.strings) addStringRow(form, si, target);
 }
 
+ColorWheel* InspectorWidget::addWheel(QWidget* parent, const QString& title, const std::array<std::string, 3>& names, double scale,
+                                      double neutral, const Target& target) {
+    // The wheel sets its three channel controls; the part they share (set with the channel sliders) is kept, so a
+    // wheel only shifts the balance.
+    auto* wheel = new ColorWheel(title, scale, parent);
+    wheel->setObjectName(QStringLiteral("wheel_") + QString::fromStdString(names[0]).section('_', 0, 0));
+    wheel->setMinimumSize(80, 96);
+    auto read = [this, target, names, neutral](double v[3]) {
+        const Sequence* s = state_->sequence();
+        Effect* e = s ? target.resolve(const_cast<Sequence&>(*s)) : nullptr;
+        for (int i = 0; i < 3; ++i) v[i] = (e ? e->p(names[size_t(i)], target.time(), neutral) : neutral) - neutral;
+    };
+    const QString label = tr("%1 Balance").arg(title);
+    const QString mergeKey = target.key + ":wheel:" + QString::fromStdString(names[0]);
+    connect(wheel, &ColorWheel::changed, this, [this, target, names, neutral, read, label, mergeKey](double r, double g, double b, bool) {
+        double now[3];
+        read(now);
+        const double common = (now[0] + now[1] + now[2]) / 3;
+        const double v[3] = {common + r + neutral, common + g + neutral, common + b + neutral};
+        const FrameTime t = target.time();
+        const std::vector<Id> others = otherSelected(target);
+        const FrameTime playhead = state_->playhead();
+        state_->edit(label, [this, target, names, v, t, others, playhead](Project&, Sequence& s) {
+            Effect* e = target.resolve(s);
+            if (!e) return false;
+            for (int i = 0; i < 3; ++i) e->params[names[size_t(i)]].set(t, v[i]);
+            applyToOthers(s, target, others, playhead, [&](Effect& o, FrameTime ot) {
+                for (int i = 0; i < 3; ++i) o.params[names[size_t(i)]].set(ot, v[i]);
+            });
+            if (target.afterWrite) target.afterWrite(s);
+            return true;
+        }, mergeKey);
+    });
+    auto refresh = [wheel, read] {
+        if (wheel->isDragging()) return;
+        double v[3];
+        read(v);
+        wheel->setBalance(v[0], v[1], v[2]);
+    };
+    refresh();
+    refreshers_.push_back(refresh);
+    return wheel;
+}
+
 void InspectorWidget::addColorWheels(QFormLayout* form, const Target& target) {
-    // Each wheel sets its three channel controls; the part they share (set with
-    // the channel sliders) is kept, so a wheel only shifts the balance.
     struct Wheel {
         const char* title;
-        const char* names[3];
+        std::array<std::string, 3> names;
         double scale, neutral;
     };
     static const Wheel wheels[3] = {{QT_TR_NOOP("Lift"), {"lift_r", "lift_g", "lift_b"}, 0.25, 0},
@@ -1103,47 +1146,40 @@ void InspectorWidget::addColorWheels(QFormLayout* form, const Target& target) {
     auto* h = new QHBoxLayout(row);
     h->setContentsMargins(0, 0, 0, 0);
     h->setSpacing(4);
-    for (const Wheel& w : wheels) {
-        auto* wheel = new ColorWheel(tr(w.title), w.scale, row);
-        wheel->setObjectName(QStringLiteral("wheel_") + QString::fromLatin1(w.names[0]).section('_', 0, 0));
-        wheel->setMinimumSize(80, 96);
-        h->addWidget(wheel, 1);
-        auto read = [this, target, w](double v[3]) {
-            const Sequence* s = state_->sequence();
-            Effect* e = s ? target.resolve(const_cast<Sequence&>(*s)) : nullptr;
-            for (int i = 0; i < 3; ++i) v[i] = (e ? e->p(w.names[i], target.time(), w.neutral) : w.neutral) - w.neutral;
-        };
-        const QString label = tr("%1 Balance").arg(tr(w.title));
-        const QString mergeKey = target.key + ":wheel:" + QString::fromLatin1(w.names[0]);
-        connect(wheel, &ColorWheel::changed, this, [this, target, w, read, label, mergeKey](double r, double g, double b, bool) {
-            double now[3];
-            read(now);
-            const double common = (now[0] + now[1] + now[2]) / 3;
-            const double v[3] = {common + r + w.neutral, common + g + w.neutral, common + b + w.neutral};
-            const FrameTime t = target.time();
-            const std::vector<Id> others = otherSelected(target);
-            const FrameTime playhead = state_->playhead();
-            state_->edit(label, [this, target, w, v, t, others, playhead](Project&, Sequence& s) {
-                Effect* e = target.resolve(s);
-                if (!e) return false;
-                for (int i = 0; i < 3; ++i) e->params[w.names[i]].set(t, v[i]);
-                applyToOthers(s, target, others, playhead, [&](Effect& o, FrameTime ot) {
-                    for (int i = 0; i < 3; ++i) o.params[w.names[i]].set(ot, v[i]);
-                });
-                if (target.afterWrite) target.afterWrite(s);
-                return true;
-            }, mergeKey);
-        });
-        auto refresh = [wheel, read] {
-            if (wheel->isDragging()) return;
-            double v[3];
-            read(v);
-            wheel->setBalance(v[0], v[1], v[2]);
-        };
-        refresh();
-        refreshers_.push_back(refresh);
-    }
+    for (const Wheel& w : wheels) h->addWidget(addWheel(row, tr(w.title), w.names, w.scale, w.neutral, target), 1);
     form->addRow(row);
+}
+
+void InspectorWidget::addHdrPalette(QFormLayout* form, const EffectInfo& info, const Target& target) {
+    // One zone at a time (Global, then the six from Black to Specular): its colour wheel and its sliders.
+    auto* zone = new QComboBox(content_);
+    zone->setObjectName(QStringLiteral("hdrZone"));
+    zone->addItem(tr("Global"));
+    for (const HdrZone& z : hdrZones()) zone->addItem(tr(z.label));
+    hdrZone_ = std::clamp(hdrZone_, 0, zone->count() - 1);
+    zone->setCurrentIndex(hdrZone_);
+    connect(zone, &QComboBox::currentIndexChanged, this, [this](int i) {
+        hdrZone_ = i;
+        QTimer::singleShot(0, this, [this] { rebuild(); });  // not while the combo box is still signalling
+    });
+    form->addRow(tr("Zone"), zone);
+    std::string prefix = "global";
+    std::vector<std::string> names{"exposure", "saturation", "contrast", "pivot", "black_offset", "mix"};
+    if (hdrZone_ > 0) {
+        prefix = hdrZones()[size_t(hdrZone_ - 1)].name;
+        names.clear();
+        for (const char* n : {"_exposure", "_saturation", "_range", "_falloff"}) names.push_back(prefix + n);
+    }
+    auto* row = new QWidget(content_);
+    auto* h = new QHBoxLayout(row);
+    h->setContentsMargins(0, 0, 0, 0);
+    h->addStretch(1);
+    h->addWidget(addWheel(row, zone->currentText(), {prefix + "_r", prefix + "_g", prefix + "_b"}, 0.5, 0, target), 2);
+    h->addStretch(1);
+    form->addRow(row);
+    for (const std::string& n : names)
+        for (const ParamInfo& pi : info.params)
+            if (pi.name == n) addParamRow(form, pi, target);
 }
 
 std::vector<Id> InspectorWidget::otherSelected(const Target& target) const {

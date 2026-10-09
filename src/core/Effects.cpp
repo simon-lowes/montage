@@ -1,6 +1,7 @@
 #include "Effects.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 
@@ -151,6 +152,30 @@ std::vector<EffectInfo> buildCatalog() {
     c.push_back({"color_warper", "Colour Warper", EffectCategory::VideoFilter, "Color",
                  {pct("mix", "Mix", 0, 100, 100), boolean("preserve_luma", "Preserve Luminance")},
                  {str("mesh", "Hue / Saturation", StringKind::ColorWarp, "")}});
+    // HDR Palette (Resolve's HDR wheels): exposure, colour and saturation by zones of brightness measured in stops from
+    // mid grey, in the sequence's light (SDR or HDR alike); each zone reaches below (the dark three) or above (the bright
+    // three) its range with a soft falloff.
+    {
+        std::vector<ParamInfo> ps{num("exposure", "Global Exposure (stops)", -4, 4, 0),
+                                  num("saturation", "Global Saturation", 0, 2, 1),
+                                  num("global_r", "Global R", -1, 1, 0, 0.005),
+                                  num("global_g", "Global G", -1, 1, 0, 0.005),
+                                  num("global_b", "Global B", -1, 1, 0, 0.005),
+                                  num("contrast", "Contrast", 0.25, 3, 1),
+                                  num("pivot", "Contrast Pivot (stops)", -4, 4, 0),
+                                  num("black_offset", "Black Offset", -0.05, 0.05, 0, 0.0005),
+                                  pct("mix", "Mix", 0, 100, 100)};
+        for (const HdrZone& z : hdrZones()) {
+            const std::string n = z.name, l = z.label;
+            ps.push_back(num(n + "_exposure", l + " Exposure (stops)", -4, 4, 0));
+            ps.push_back(num(n + "_saturation", l + " Saturation", 0, 2, 1));
+            for (const char* ch : {"r", "g", "b"})
+                ps.push_back(num(n + "_" + ch, l + " " + char(std::toupper(ch[0])), -1, 1, 0, 0.005));
+            ps.push_back(num(n + "_range", l + (z.dark ? " Up To (stops)" : " From (stops)"), -8, 8, z.range, 0.05));
+            ps.push_back(num(n + "_falloff", l + " Falloff (stops)", 0.25, 6, z.falloff, 0.05));
+        }
+        c.push_back({"hdr_palette", "HDR Palette", EffectCategory::VideoFilter, "Color", ps, {}});
+    }
     c.push_back({"hue_sat", "Hue / Saturation / Lightness", EffectCategory::VideoFilter, "Color",
                  {angle("hue", "Hue Shift"), num("saturation", "Saturation", 0, 3, 1),
                   num("lightness", "Lightness", -1, 1, 0), num("vibrance", "Vibrance", -1, 1, 0)},
@@ -805,6 +830,13 @@ bool needsPersonMatte(const Effect& e, FrameTime t) {
 bool needsDepth(const Effect& e, FrameTime t) {
     if (!e.enabled) return false;
     return e.type == "depth_blur" || e.type == "depth_fog" || e.type == "depth_map" || e.type == "relight" || e.p("mask.depth", t) > 0.5;
+}
+
+const std::vector<HdrZone>& hdrZones() {
+    static const std::vector<HdrZone> zones{{"black", "Black", -4, 2, true},          {"dark", "Dark", -2.5, 1.5, true},
+                                            {"shadow", "Shadow", -1, 1.5, true},      {"light", "Light", 1, 1.5, false},
+                                            {"highlight", "Highlight", 2, 1.5, false}, {"specular", "Specular", 3.5, 1.5, false}};
+    return zones;
 }
 
 const std::vector<EffectInfo>& effectCatalog() {

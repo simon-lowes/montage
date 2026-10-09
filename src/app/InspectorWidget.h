@@ -3,6 +3,7 @@
 #pragma once
 
 #include <QScrollArea>
+#include <array>
 #include <functional>
 #include <vector>
 
@@ -15,6 +16,7 @@ class QFormLayout;
 namespace montage {
 
 class EditorState;
+class ColorWheel;
 
 class InspectorWidget : public QScrollArea {
     Q_OBJECT
@@ -47,8 +49,13 @@ private:
     void buildTransition(const Transition& t, TrackKind kind);
     QFormLayout* addSection(const QString& title, QWidget* headerExtra = nullptr, bool startCollapsed = false);
     void addParamRows(QFormLayout* form, const EffectInfo& info, const Target& target);
+    // A colour wheel over three channel controls of `target` (rim = `scale`, centre = `neutral`).
+    ColorWheel* addWheel(QWidget* parent, const QString& title, const std::array<std::string, 3>& names, double scale, double neutral,
+                         const Target& target);
     // Lift, Gamma and Gain wheels over Color Correct's per-channel controls.
     void addColorWheels(QFormLayout* form, const Target& target);
+    // The HDR Palette: a zone picker, the zone's wheel and its sliders.
+    void addHdrPalette(QFormLayout* form, const EffectInfo& info, const Target& target);
     void addParamRow(QFormLayout* form, const ParamInfo& pi, const Target& target);
     void addStringRow(QFormLayout* form, const StringParamInfo& si, const Target& target);
     // The effect stack of a clip, audio track, bus or master (by owner id), with its Add menu.
@@ -85,6 +92,7 @@ private:
     QVBoxLayout* layout_ = nullptr;
     QString signature_;
     std::vector<std::function<void()>> refreshers_;
+    int hdrZone_ = 0;  // the HDR Palette zone shown (0 Global, then Black to Specular)
 };
 
 }  // namespace montage

@@ -66,6 +66,16 @@ struct EffectInfo {
 };
 
 const std::vector<EffectInfo>& effectCatalog();
+
+// The HDR Palette's zones, darkest first: the dark three reach every tone below their range, the bright three every
+// tone above it (stops from mid grey), each fading out over its falloff.
+struct HdrZone {
+    const char* name;   // parameter prefix: "black", "dark", "shadow", "light", "highlight", "specular"
+    const char* label;
+    double range, falloff;
+    bool dark;
+};
+const std::vector<HdrZone>& hdrZones();
 const EffectInfo* findEffectInfo(const std::string& type);
 
 // Ready-made titles (lower thirds, call-outs...): listed as generators of
