@@ -106,7 +106,11 @@ std::string transcriptToJson(const Transcript& t) {
     for (const auto& s : t.segments) {
         QJsonArray words;
         for (const auto& w : s.words)
-            words.append(QJsonArray{QString::fromStdString(w.text), w.start, w.end, double(w.probability)});
+        {
+            QJsonArray a{QString::fromStdString(w.text), w.start, w.end, double(w.probability)};
+            if (!w.original.empty()) a.append(QString::fromStdString(w.original));
+            words.append(a);
+        }
         QJsonObject o{{"start", s.start}, {"end", s.end}, {"text", QString::fromStdString(s.text)}, {"words", words}};
         if (s.speaker >= 0) o["speaker"] = s.speaker;
         segs.append(o);
@@ -149,6 +153,7 @@ bool transcriptFromJson(const std::string& json, Transcript& out, std::string* e
             w.start = a.at(1).toDouble();
             w.end = a.at(2).toDouble();
             w.probability = float(a.at(3).toDouble(1));
+            if (a.size() > 4) w.original = a.at(4).toString().toStdString();
             s.words.push_back(w);
         }
         t.segments.push_back(std::move(s));

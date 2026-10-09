@@ -13,6 +13,9 @@ struct TranscriptWord {
     std::string text;  // without surrounding spaces
     float probability = 1;
     std::string speaker;  // in word lists made for display: who says it (not saved; segments hold the speaker)
+    // A corrected word (core/TranscriptCorrect.h): on the first word of a correction, what speech-to-text heard there;
+    // on the words after it in the same correction, "\x01". "" = as heard.
+    std::string original;
     bool operator==(const TranscriptWord&) const = default;
 };
 

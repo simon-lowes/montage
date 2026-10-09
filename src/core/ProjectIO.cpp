@@ -671,6 +671,11 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
         for (const auto& b : p.bins) bins.append(qs(b));
         root["bins"] = bins;
     }
+    if (!p.vocabulary.empty()) {
+        QJsonArray words;
+        for (const auto& w : p.vocabulary) words.append(qs(w));
+        root["vocabulary"] = words;
+    }
     if (!p.fillerWords.empty()) {
         QJsonArray words;
         for (const auto& w : p.fillerWords) words.append(qs(w));
@@ -777,6 +782,8 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
     }
     for (const auto& b : root.value("bins").toArray()) p.bins.push_back(ss(b));
     for (const auto& pv : root.value("people").toArray()) p.people.push_back({pv.toObject().value("id").toInt(), ss(pv.toObject().value("name"))});
+    for (const auto& w : root.value("vocabulary").toArray())
+        if (!w.toString().trimmed().isEmpty()) p.vocabulary.push_back(ss(w));
     for (const auto& w : root.value("fillerWords").toArray())
         if (!w.toString().trimmed().isEmpty()) p.fillerWords.push_back(ss(w));
     for (const auto& bv : root.value("smartBins").toArray()) {

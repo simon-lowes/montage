@@ -27,12 +27,15 @@
 #include <QVBoxLayout>
 #include <algorithm>
 #include <cmath>
+#include <limits>
+#include <map>
 
 #include "EditorState.h"
 #include "Theme.h"
 #include "core/History.h"
 #include "core/Bleep.h"
 #include "core/TranscriptEdit.h"
+#include "core/TranscriptCorrect.h"
 
 namespace montage {
 
@@ -133,6 +136,66 @@ TranscriptPanel::TranscriptPanel(EditorState* state, QWidget* parent) : QWidget(
         bleepBtn_->setMenu(menu);
         bleepBtn_->setPopupMode(QToolButton::InstantPopup);
     }
+    // Correcting what speech-to-text got wrong (core/TranscriptCorrect.h).
+    correctBtn_ = button(this, tr("Correct"), tr("Fix misheard words, names and terms in the transcripts"));
+    correctBtn_->setObjectName(QStringLiteral("correctButton"));
+    {
+        auto* menu = new QMenu(correctBtn_);
+        QAction* fix = menu->addAction(tr("Correct Selected Words\u2026"), this, [this] {
+            const auto [a, b] = selectedWords();
+            if (a < 0) return;
+            QStringList now;
+            for (int i = a; i <= b; ++i) now << QString::fromStdString(words_[size_t(i)].text);
+            bool ok = false;
+            const QString text = QInputDialog::getText(this, tr("Correct"), tr("What was said:"), QLineEdit::Normal, now.join(' '), &ok);
+            if (ok) correctSelection(text);
+        });
+        fix->setObjectName(QStringLiteral("correctSelection"));
+        QAction* revert = menu->addAction(tr("Revert to What Was Heard"), this, [this] { revertSelection(); });
+        revert->setObjectName(QStringLiteral("revertCorrection"));
+        menu->addAction(tr("Replace in All Transcripts\u2026"), this, [this] {
+            bool ok = false;
+            const QString find = QInputDialog::getText(this, tr("Replace in All Transcripts"), tr("Find (whole words):"), QLineEdit::Normal,
+                                                       QString(), &ok);
+            if (!ok || find.trimmed().isEmpty()) return;
+            const QString with = QInputDialog::getText(this, tr("Replace in All Transcripts"), tr("Replace with:"), QLineEdit::Normal, QString(), &ok);
+            if (!ok) return;
+            const int n = replaceInAllTranscripts(find, with);
+            state_->message(n ? tr("Replaced %n time(s)", "", n) : tr("\u201c%1\u201d is not in any transcript").arg(find));
+        })->setObjectName(QStringLiteral("replaceInTranscripts"));
+        menu->addSeparator();
+        menu->addAction(tr("Vocabulary\u2026"), this, [this] {
+            bool ok = false;
+            QStringList now;
+            for (const std::string& w : state_->project().vocabulary) now << QString::fromStdString(w);
+            const QString text = QInputDialog::getMultiLineText(this, tr("Vocabulary"),
+                                                                tr("Names and terms speech-to-text should expect, one per line\n"
+                                                                   "(used when transcribing, and to fix near misses):"),
+                                                                now.join('\n'), &ok);
+            if (!ok) return;
+            std::vector<std::string> words;
+            for (const QString& line : text.split('\n'))
+                if (!line.trimmed().isEmpty()) words.push_back(line.trimmed().toStdString());
+            state_->edit(tr("Vocabulary"), [words](Project& p, Sequence&) {
+                if (p.vocabulary == words) return false;
+                p.vocabulary = words;
+                return true;
+            });
+        })->setObjectName(QStringLiteral("vocabulary"));
+        QAction* near = menu->addAction(tr("Fix Near Misses of the Vocabulary"), this, [this] {
+            const int n = applyVocabulary();
+            state_->message(n ? tr("Corrected %n near miss(es)", "", n) : tr("No near misses of the vocabulary"));
+        });
+        near->setObjectName(QStringLiteral("applyVocabulary"));
+        connect(menu, &QMenu::aboutToShow, this, [this, fix, revert, near] {
+            const bool source = mode_ == Mode::Source && selectedWords().first >= 0;
+            fix->setEnabled(source);
+            revert->setEnabled(source);
+            near->setEnabled(!state_->project().vocabulary.empty());
+        });
+        correctBtn_->setMenu(menu);
+        correctBtn_->setPopupMode(QToolButton::InstantPopup);
+    }
     insertBtn_ = button(this, tr("Insert"), tr("Insert the selected words into the timeline at the playhead"));
     overwriteBtn_ = button(this, tr("Overwrite"), tr("Overwrite the timeline at the playhead with the selected words"));
     smoothBtn_ = button(this, tr("Smooth Cuts"),
@@ -146,7 +209,7 @@ TranscriptPanel::TranscriptPanel(EditorState* state, QWidget* parent) : QWidget(
     paperAddBtn_->setObjectName(QStringLiteral("paperAdd"));
     paperBuildBtn_ = button(this, tr("Assemble"), tr("Lay the Paper Edit's lines out, in the list's order, as a new sequence"));
     paperBuildBtn_->setObjectName(QStringLiteral("paperAssemble"));
-    for (QToolButton* b : {deleteBtn_, fillersBtn_, retakesBtn_, pausesBtn_, bleepBtn_, insertBtn_, overwriteBtn_, paperAddBtn_, paperBuildBtn_})
+    for (QToolButton* b : {deleteBtn_, fillersBtn_, retakesBtn_, pausesBtn_, bleepBtn_, correctBtn_, insertBtn_, overwriteBtn_, paperAddBtn_, paperBuildBtn_})
         bottom->addWidget(b);
     bottom->addStretch();
     bottom->addWidget(smoothBtn_);
@@ -236,8 +299,12 @@ void TranscriptPanel::setMode(Mode m) {
     mode_ = m;
     modeBox_->setCurrentIndex(m == Mode::Sequence ? 0 : 1);
     const bool seq = m == Mode::Sequence;
-    for (QToolButton* b : {deleteBtn_, fillersBtn_, retakesBtn_, pausesBtn_, bleepBtn_}) b->setVisible(seq);
-    for (QToolButton* b : {insertBtn_, overwriteBtn_, paperAddBtn_, paperBuildBtn_}) b->setVisible(!seq);
+    // Hide one mode's buttons before showing the other's: with both rows showing for a moment, the dock would widen
+    // to fit them all and keep that width, squeezing the timeline.
+    const std::vector<QToolButton*> sequenceButtons = {deleteBtn_, fillersBtn_, retakesBtn_, pausesBtn_, bleepBtn_},
+                                    sourceButtons = {insertBtn_, overwriteBtn_, paperAddBtn_, paperBuildBtn_};
+    for (QToolButton* b : seq ? sourceButtons : sequenceButtons) b->setVisible(false);
+    for (QToolButton* b : seq ? sequenceButtons : sourceButtons) b->setVisible(true);
     paperList_->setVisible(!seq && paperList_->count() > 0);
     signature_.clear();
     current_ = -1;
@@ -293,6 +360,9 @@ void TranscriptPanel::rebuild() {
     filler.setFontItalic(true);
     unsure.setUnderlineStyle(QTextCharFormat::DotLine);
     unsure.setUnderlineColor(QColor(0xd9, 0x9a, 0x2b));
+    QTextCharFormat corrected;  // fixed by hand: underlined in green
+    corrected.setUnderlineStyle(QTextCharFormat::SingleUnderline);
+    corrected.setUnderlineColor(QColor(0x4c, 0xaf, 0x50));
     int paragraphChars = 0, fillers = 0, uncertain = 0;
     Rational rate{int(std::lround(fps() * 1000)), 1000};
     if (const Sequence* s = state_->sequence()) rate = s->fps;
@@ -321,7 +391,7 @@ void TranscriptPanel::rebuild() {
         fillers += isFiller ? 1 : 0;
         uncertain += w.probability < 0.4f ? 1 : 0;
         spans_.push_back({cur.position(), int(t.size()), int(i), w.start});
-        cur.insertText(t, isFiller ? filler : w.probability < 0.4f ? unsure : normal);
+        cur.insertText(t, isFiller ? filler : !w.original.empty() ? corrected : w.probability < 0.4f ? unsure : normal);
         paragraphChars += int(t.size()) + 1;
     }
     text_->verticalScrollBar()->setValue(scroll);
@@ -557,6 +627,50 @@ void TranscriptPanel::bleepProfanity() {
 
 FrameTime TranscriptPanel::smoothCutFrames() const {
     return smoothBtn_->isChecked() ? std::max<FrameTime>(2, FrameTime(std::lround(fps() * 0.2))) : 0;
+}
+
+bool TranscriptPanel::correctSelection(const QString& text) {
+    const auto [a, b] = selectedWords();
+    const MediaItem* m = state_->project().findMedia(state_->sourceMedia());
+    if (mode_ != Mode::Source || a < 0 || !m || !m->transcript || text.trimmed().isEmpty()) return false;
+    const Id id = m->id;
+    const std::string typed = text.toStdString();
+    return state_->edit(tr("Correct Transcript"), [id, a, b, typed](Project& p, Sequence&) {
+        MediaItem* media = p.findMedia(id);
+        auto t = std::make_shared<Transcript>(*media->transcript);
+        if (!correctWords(*t, size_t(a), size_t(b), typed)) return false;
+        media->transcript = t;
+        return true;
+    });
+}
+
+bool TranscriptPanel::revertSelection() {
+    const auto [a, b] = selectedWords();
+    const MediaItem* m = state_->project().findMedia(state_->sourceMedia());
+    if (mode_ != Mode::Source || a < 0 || !m || !m->transcript) return false;
+    const Id id = m->id;
+    return state_->edit(tr("Revert Correction"), [id, a](Project& p, Sequence&) {
+        MediaItem* media = p.findMedia(id);
+        auto t = std::make_shared<Transcript>(*media->transcript);
+        if (!revertCorrection(*t, size_t(a))) return false;
+        media->transcript = t;
+        return true;
+    });
+}
+
+int TranscriptPanel::replaceInAllTranscripts(const QString& find, const QString& with) {
+    int n = 0;
+    const std::string f = find.toStdString(), w = with.toStdString();
+    state_->edit(tr("Replace in Transcripts"), [&](Project& p, Sequence&) { return (n = replaceInTranscripts(p, f, w)) > 0; });
+    return n;
+}
+
+int TranscriptPanel::applyVocabulary() {
+    int n = 0;
+    state_->edit(tr("Fix Near Misses"), [&](Project& p, Sequence&) {
+        return (n = applyVocabularySuggestions(p, vocabularySuggestions(p, p.vocabulary))) > 0;
+    });
+    return n;
 }
 
 FillerOptions TranscriptPanel::fillerOptions() const {

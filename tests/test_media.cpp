@@ -2009,6 +2009,62 @@ private slots:
         QVERIFY(call({{"align", "sideways"}}).value("isError").toBool());
     }
 
+    void mcpEditTranscript() {
+        Project p = makeDefaultProject();
+        MediaItem m;
+        m.id = p.newId();
+        m.name = "interview.wav";
+        m.path = path("interview.wav");
+        auto t = std::make_shared<Transcript>();
+        TranscriptSegment seg;
+        seg.words = {{0.5, 0.9, "Welcome", 1}, {1.0, 1.3, "to", 1}, {1.4, 1.9, "Montaj,", 1}, {2.0, 2.3, "says", 1},
+                     {2.4, 2.8, "Jon", 1},     {2.9, 3.4, "Smyth.", 1}};
+        t->segments.push_back(seg);
+        m.transcript = t;
+        p.media.push_back(m);
+        const QString project = QString::fromStdString(path("transcript-mcp.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        int rid = 1;
+        auto call = [&](QJsonObject args) {
+            args["project"] = project;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", rid++}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_edit_transcript"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [&] {
+            Project q;
+            loadProject(project.toStdString(), q);
+            return q.media[0].transcript->segments[0].text;
+        };
+        QJsonObject r = call({{"action", "correct"}, {"media", "interview.wav"}, {"first", 4}, {"last", 5}, {"text", "John Smith."}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(text(), std::string("Welcome to Montaj, says John Smith."));
+        QVERIFY(call({{"action", "revert"}, {"media", "interview.wav"}, {"first", 1}}).value("isError").toBool());  // never corrected
+        r = call({{"action", "revert"}, {"media", "interview.wav"}, {"first", 5}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(text(), std::string("Welcome to Montaj, says Jon Smyth."));
+        r = call({{"action", "replace"}, {"find", "Jon Smyth"}, {"replace", "John Smith"}});
+        QCOMPARE(r.value("structuredContent").toObject().value("replaced").toInt(), 1);
+        call({{"action", "vocabulary"}, {"terms", QJsonArray{"Montage", "Kokoro"}}});
+        r = call({{"action", "suggest"}});
+        const QJsonArray sug = r.value("structuredContent").toObject().value("suggestions").toArray();
+        QCOMPARE(sug.size(), 1);
+        QCOMPARE(sug.at(0).toObject().value("term").toString(), QString("Montage"));
+        r = call({{"action", "fix_vocabulary"}});
+        QCOMPARE(r.value("structuredContent").toObject().value("corrected").toInt(), 1);
+        QCOMPARE(text(), std::string("Welcome to Montage, says John Smith."));
+        r = call({{"action", "revert_all"}, {"media", "interview.wav"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(text(), std::string("Welcome to Montaj, says Jon Smyth."));
+        Project q;
+        QVERIFY(loadProject(project.toStdString(), q));
+        QCOMPARE(q.vocabulary, (std::vector<std::string>{"Montage", "Kokoro"}));
+    }
+
     void mcpTransitionsOnClips() {
         Project p = makeDefaultProject();
         Sequence& s = *p.active();

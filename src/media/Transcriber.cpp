@@ -14,6 +14,7 @@
 #include <whisper.h>
 #endif
 
+#include "core/TranscriptCorrect.h"
 #include "Decoder.h"
 #include "Diarizer.h"
 
@@ -126,6 +127,9 @@ bool transcribeSamples(const std::vector<float>& mono16k, const TranscribeOption
     params.language = !multilingual ? "en" : options.language.empty() ? "auto" : options.language.c_str();
     params.detect_language = false;
     params.token_timestamps = true;
+    // The terms to expect, as a glossary before the speech (whisper.cpp's initial prompt).
+    const std::string prompt = vocabularyPrompt(options.vocabulary);
+    if (!prompt.empty()) params.initial_prompt = prompt.c_str();
     params.print_progress = false;
     params.print_realtime = false;
     params.print_timestamps = false;

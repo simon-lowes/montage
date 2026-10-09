@@ -21,6 +21,7 @@
 #include "core/ClipAnimation.h"
 #include "core/GradeVersions.h"
 #include "core/AudioChannels.h"
+#include "core/TranscriptCorrect.h"
 #include "render/Spherical.h"
 #include "render/ClipPlacement.h"
 #include "media/ImageSequence.h"
@@ -1559,12 +1560,18 @@ void McpServer::Impl::addTools() {
         "speaks. With a project, the transcript is kept on that media item (for montage_find_phrase and captions).",
         R"json({"type":"object","properties":{"media":{"type":"string"},"project":{"type":"string"},
             "model":{"type":"string","default":"base.en","description":"A downloaded whisper model (montage-cli models)"},
-            "language":{"type":"string","default":"auto"},"speakers":{"type":"boolean","default":false}},"required":["media"]})json",
+            "language":{"type":"string","default":"auto"},"speakers":{"type":"boolean","default":false},
+            "vocabulary":{"type":"array","items":{"type":"string"},"description":"Names and terms to expect; default the project's"}},"required":["media"]})json",
         false, [this](const QJsonObject& a) {
             TranscribeOptions o;
             o.model = str(a, "model", "base.en").toStdString();
             o.language = str(a, "language", "auto").toStdString();
             o.speakers = a.value("speakers").toBool();
+            for (const QJsonValue& v : a.value("vocabulary").toArray()) o.vocabulary.push_back(v.toString().toStdString());
+            if (o.vocabulary.empty() && a.contains("project")) {
+                Project vp;
+                if (loadProject(absolute(str(a, "project")).toStdString(), vp)) o.vocabulary = vp.vocabulary;
+            }
             const QString media = absolute(need(a, "media"));
             auto t = std::make_shared<Transcript>();
             std::string err;
@@ -1605,6 +1612,84 @@ void McpServer::Impl::addTools() {
             }
             if (seg.words.empty()) return ok("Nothing in the sequence is transcribed (use montage_transcribe with the project)");
             return ok(hits.isEmpty() ? QStringLiteral("Not found") : text, QJsonObject{{"hits", hits}});
+        });
+
+    add("montage_edit_transcript", "Correct transcripts",
+        "Fix what speech-to-text got wrong, keeping each word's timing and what was heard. `action`: correct (words "
+        "`first` to `last` of `media`'s transcript, counted from 0 as montage_find_phrase reports, become `text`), "
+        "revert (the correction at word `first` back to what was heard), revert_all (on `media`), replace (every "
+        "whole-word `find` in every transcript of the project becomes `replace`), vocabulary (set the project's "
+        "names and terms, `terms`, used by montage_transcribe and here), suggest (the near misses of the vocabulary) or "
+        "fix_vocabulary (correct them all).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"media":{"type":"string"},
+            "action":{"type":"string","enum":["correct","revert","revert_all","replace","vocabulary","suggest","fix_vocabulary"]},
+            "first":{"type":"integer"},"last":{"type":"integer"},"text":{"type":"string"},
+            "find":{"type":"string"},"replace":{"type":"string"},
+            "terms":{"type":"array","items":{"type":"string"}}},"required":["project","action"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            const QString action = need(a, "action");
+            auto transcriptOf = [&]() -> MediaItem& {
+                MediaItem& m = projectMedia(l.project, need(a, "media"));
+                if (!m.transcript) throw ArgError{QStringLiteral("%1 has no transcript").arg(QString::fromStdString(m.name))};
+                return m;
+            };
+            auto wordsText = [](const Transcript& t, size_t from, size_t to) {
+                QStringList out;
+                size_t k = 0;
+                for (const auto& seg : t.segments)
+                    for (const auto& w : seg.words) {
+                        if (k >= from && k <= to) out << QString::fromStdString(w.text);
+                        ++k;
+                    }
+                return out.join(' ');
+            };
+            if (action == "correct" || action == "revert" || action == "revert_all") {
+                MediaItem& m = transcriptOf();
+                auto t = std::make_shared<Transcript>(*m.transcript);
+                const size_t first = size_t(std::max(0, a.value("first").toInt(-1)));
+                bool changed = false;
+                if (action == "correct") {
+                    const size_t last = size_t(std::max(a.value("last").toInt(int(first)), int(first)));
+                    changed = correctWords(*t, first, last, need(a, "text").toStdString());
+                    if (!changed) throw ArgError{"No such words, or no text"};
+                } else if (action == "revert") {
+                    changed = revertCorrection(*t, first);
+                    if (!changed) return fail("That word was never corrected");
+                } else {
+                    changed = revertAllCorrections(*t) > 0;
+                    if (!changed) return fail("Nothing in it was corrected");
+                }
+                m.transcript = t;
+                save(l);
+                return ok(QStringLiteral("Done"), QJsonObject{{"words", wordsText(*t, first > 3 ? first - 3 : 0, first + 6)}});
+            }
+            if (action == "replace") {
+                const int n = replaceInTranscripts(l.project, need(a, "find").toStdString(), need(a, "replace").toStdString());
+                if (n) save(l);
+                return ok(QStringLiteral("Replaced %1 time(s)").arg(n), QJsonObject{{"replaced", n}});
+            }
+            if (action == "vocabulary") {
+                l.project.vocabulary.clear();
+                for (const QJsonValue& v : a.value("terms").toArray())
+                    if (!v.toString().trimmed().isEmpty()) l.project.vocabulary.push_back(v.toString().trimmed().toStdString());
+                save(l);
+                return ok(QStringLiteral("%1 term(s)").arg(l.project.vocabulary.size()));
+            }
+            if (action == "suggest" || action == "fix_vocabulary") {
+                const auto found = vocabularySuggestions(l.project, l.project.vocabulary);
+                QJsonArray list;
+                for (const VocabularySuggestion& v : found) {
+                    const MediaItem* m = l.project.findMedia(v.media);
+                    list.append(QJsonObject{{"media", QString::fromStdString(m ? m->name : std::string())}, {"first", int(v.first)},
+                                            {"last", int(v.last)}, {"heard", QString::fromStdString(v.heard)}, {"term", QString::fromStdString(v.term)}});
+                }
+                if (action == "suggest") return ok(QStringLiteral("%1 near miss(es)").arg(found.size()), QJsonObject{{"suggestions", list}});
+                const int n = applyVocabularySuggestions(l.project, found);
+                if (n) save(l);
+                return ok(QStringLiteral("Corrected %1 near miss(es)").arg(n), QJsonObject{{"corrected", n}, {"suggestions", list}});
+            }
+            throw ArgError{QStringLiteral("Unknown action \"%1\"").arg(action)};
         });
 
     add("montage_cut_speech", "Cut by transcript",

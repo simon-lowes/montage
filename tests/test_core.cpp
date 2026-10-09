@@ -6,6 +6,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 
+#include "core/TranscriptCorrect.h"
 #include "core/AutoTag.h"
 #include "core/Automation.h"
 #include "core/CaptionTools.h"
@@ -1100,6 +1101,101 @@ private slots:
         QCOMPARE(words.size(), size_t(3));  // the filler is gone
         QVERIFY(std::fabs(words.back().start - (4.7 - 59 / 25.0)) < 0.05);
         QVERIFY(!rippleDeleteRanges(p, s, {}).ok);
+    }
+
+    void correctingTranscripts() {
+        auto w = [](double a, double b, const char* t) { return TranscriptWord{a, b, t, 0.5f}; };
+        Transcript t;
+        t.language = "en";
+        TranscriptSegment seg;
+        seg.words = {w(0, 0.2, "My"), w(0.25, 0.5, "name"), w(0.55, 0.7, "is"), w(1.0, 1.4, "Jon"), w(1.5, 2.0, "Smyth."),
+                     w(2.5, 2.8, "from"), w(2.9, 3.4, "Montaj.")};
+        t.segments.push_back(seg);
+        // "Jon Smyth." to "John Smith.": the span kept, split by length (4 : 6), what was heard kept.
+        QVERIFY(correctWords(t, 3, 4, "John Smith."));
+        const auto& ws = t.segments[0].words;
+        QCOMPARE(ws.size(), size_t(7));
+        QCOMPARE(ws[3].text, std::string("John"));
+        QCOMPARE(ws[4].text, std::string("Smith."));
+        QCOMPARE(ws[3].start, 1.0);
+        QCOMPARE(ws[4].end, 2.0);
+        QVERIFY(std::fabs(ws[3].end - 1.4) < 1e-9);  // 4 of 10 letters of the 1 s span
+        QCOMPARE(ws[3].original, std::string("Jon Smyth."));
+        QCOMPARE(t.segments[0].text, std::string("My name is John Smith. from Montaj."));
+        QVERIFY(ws[3].probability == 1.0f);
+        // Correcting part of a correction takes all of it, still remembering what was heard.
+        QVERIFY(correctWords(t, 4, 4, "Jonathan"));
+        QCOMPARE(t.segments[0].words.size(), size_t(6));
+        QCOMPARE(t.segments[0].words[3].text, std::string("Jonathan"));
+        QCOMPARE(t.segments[0].words[3].original, std::string("Jon Smyth."));
+        // Saved and read back with it.
+        Transcript back;
+        QVERIFY(transcriptFromJson(transcriptToJson(t), back));
+        QCOMPARE(back.segments[0].words[3].original, std::string("Jon Smyth."));
+        // Revert: as heard, over the same span.
+        QVERIFY(!revertCorrection(t, 1));
+        QVERIFY(revertCorrection(t, 3));
+        QCOMPARE(t.segments[0].text, std::string("My name is Jon Smyth. from Montaj."));
+        QVERIFY(t.segments[0].words[3].original.empty() && t.segments[0].words[4].end == 2.0);
+        QVERIFY(correctWords(t, 0, 0, "Our"));
+        QVERIFY(correctWords(t, 6, 6, "Montage."));
+        QCOMPARE(revertAllCorrections(t), 2);
+        QVERIFY(!correctWords(t, 2, 1, "x") && !correctWords(t, 0, 9, "x") && !correctWords(t, 0, 0, "  "));
+        // Replace in every transcript: whole words, punctuation kept.
+        Project p = makeDefaultProject();
+        for (const char* tail : {"Smyth.", "smyth,"}) {
+            MediaItem m;
+            m.id = p.newId();
+            m.name = tail;
+            auto tt = std::make_shared<Transcript>(t);
+            tt->segments[0].words[4].text = tail;
+            m.transcript = tt;
+            p.media.push_back(m);
+        }
+        QCOMPARE(replaceInTranscripts(p, "smyth", "Smith"), 2);
+        QCOMPARE(p.media[0].transcript->segments[0].words[4].text, std::string("Smith."));
+        QCOMPARE(p.media[1].transcript->segments[0].words[4].text, std::string("Smith,"));
+        QCOMPARE(p.media[1].transcript->segments[0].words[4].original, std::string("smyth,"));
+        QCOMPARE(replaceInTranscripts(p, "Jon Smith", "John Smith"), 2);  // two words
+        QCOMPARE(p.media[0].transcript->segments[0].words[3].text, std::string("John"));
+        QCOMPARE(replaceInTranscripts(p, "Smit", "x"), 0);  // whole words only
+        // The vocabulary: near misses found, exact ones not, and the prompt for speech-to-text.
+        const auto near = vocabularySuggestions(p, {"Montage", "Smith", "Kokoro TTS", "TV"});
+        QCOMPARE(near.size(), size_t(2));  // "Montaj." in both
+        QCOMPARE(near[0].heard, std::string("Montaj."));
+        QCOMPARE(near[0].term, std::string("Montage"));
+        QCOMPARE(near[0].first, size_t(6));
+        QCOMPARE(applyVocabularySuggestions(p, near), 2);
+        QCOMPARE(p.media[0].transcript->segments[0].words[6].text, std::string("Montage."));  // its full stop kept
+        QCOMPARE(p.media[0].transcript->segments[0].words[6].original, std::string("Montaj."));
+        QVERIFY(vocabularySuggestions(p, {"Montage"}).empty());
+        {  // a term of two words matches two words
+            Project q;
+            MediaItem m;
+            m.id = q.newId();
+            auto tt = std::make_shared<Transcript>();
+            TranscriptSegment sg;
+            sg.words = {w(0, 1, "using"), w(1, 2, "Kokoro"), w(2, 3, "TDS,"), w(3, 4, "today")};
+            tt->segments.push_back(sg);
+            m.transcript = tt;
+            q.media.push_back(m);
+            const auto two = vocabularySuggestions(q, {"Kokoro TTS"});
+            QCOMPARE(two.size(), size_t(1));
+            QCOMPARE(two[0].first, size_t(1));
+            QCOMPARE(two[0].last, size_t(2));
+            QCOMPARE(applyVocabularySuggestions(q, two), 1);
+            QCOMPARE(q.media[0].transcript->segments[0].text, std::string("using Kokoro TTS, today"));
+        }
+        QCOMPARE(vocabularyPrompt({"Montage", " Kokoro  TTS ", ""}), std::string("Glossary: Montage, Kokoro TTS."));
+        QCOMPARE(vocabularyPrompt({}), std::string());
+        // The project keeps its vocabulary.
+        p.vocabulary = {"Montage", "Kokoro TTS"};
+        const std::string file = (QDir::tempPath() + "/montage-vocabulary.montage").toStdString();
+        QVERIFY(saveProject(p, file));
+        Project loaded;
+        QVERIFY(loadProject(file, loaded));
+        QCOMPARE(loaded.vocabulary, p.vocabulary);
+        QFile::remove(QString::fromStdString(file));
     }
 
     void fillerWordsInManyLanguages() {

@@ -37,6 +37,7 @@ struct TranscribeOptions {
     int threads = 0;                 // 0 = automatic
     bool speakers = false;           // also tell the speakers apart (media/Diarizer.h)
     int speakerCount = 0;            // how many speak, 0 = find out
+    std::vector<std::string> vocabulary;  // names and terms to expect (Project::vocabulary), given as a prompt
 };
 
 using TranscribeProgress = std::function<void(double fraction)>;

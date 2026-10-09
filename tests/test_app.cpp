@@ -2535,6 +2535,51 @@ private slots:
         QCOMPARE(ids.size(), size_t(10));
     }
 
+    void correctTranscriptsInThePanel() {
+        state()->newProject();
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        auto t = std::make_shared<Transcript>();
+        TranscriptSegment seg;
+        seg.words = {{0.5, 0.9, "Welcome", 1}, {1.0, 1.3, "to", 1}, {1.4, 1.9, "Montaj,", 1}, {2.0, 2.3, "says", 1},
+                     {2.4, 2.8, "Jon", 1},     {2.9, 3.4, "Smyth.", 1}};
+        t->segments.push_back(seg);
+        QVERIFY(state()->edit("Transcript", [media, t](Project& p, Sequence&) {
+            p.findMedia(media)->transcript = t;
+            return true;
+        }));
+        auto* panel = win_->findChild<TranscriptPanel*>();
+        QVERIFY(panel && panel->findChild<QToolButton*>("correctButton"));
+        state()->setSourceMedia(media);
+        const int timelineWidth = viewport()->width();
+        panel->setMode(TranscriptPanel::Mode::Source);
+        auto text = [&] { return state()->project().findMedia(media)->transcript->segments[0].text; };
+        // Correct the selected words, one undo step; revert them.
+        panel->selectWords(4, 5);
+        QVERIFY(panel->correctSelection("John Smith."));
+        QCOMPARE(text(), std::string("Welcome to Montaj, says John Smith."));
+        QCOMPARE(panel->words().size(), size_t(6));
+        panel->selectWords(4, 4);
+        QVERIFY(panel->revertSelection());
+        QCOMPARE(text(), std::string("Welcome to Montaj, says Jon Smyth."));
+        state()->undo();
+        QCOMPARE(text(), std::string("Welcome to Montaj, says John Smith."));
+        // Replace across transcripts, and fix the vocabulary's near misses.
+        QCOMPARE(panel->replaceInAllTranscripts("says", "said"), 1);
+        QVERIFY(state()->edit("Vocabulary", [](Project& p, Sequence&) {
+            p.vocabulary = {"Montage"};
+            return true;
+        }));
+        QCOMPARE(panel->applyVocabulary(), 1);
+        QCOMPARE(text(), std::string("Welcome to Montage, said John Smith."));  // its comma kept
+        QCOMPARE(panel->applyVocabulary(), 0);
+        state()->undo();
+        QCOMPARE(text(), std::string("Welcome to Montaj, said John Smith."));
+        panel->setMode(TranscriptPanel::Mode::Sequence);
+        QCOMPARE(viewport()->width(), timelineWidth);  // switching modes never widens the panel over the timeline
+    }
+
     void transitionsToSelection() {
         loadDemo();
         const Id red = clipNamed(*state()->sequence(), "Red")->id, blue = clipNamed(*state()->sequence(), "Blue")->id;

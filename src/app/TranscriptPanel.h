@@ -44,6 +44,13 @@ public:
     FillerOptions fillerOptions() const;
     void setDiscourseFillers(bool on);
     bool discourseFillers() const { return discourse_; }
+    // Corrections (core/TranscriptCorrect.h), each one undo step: the selected words of the source clip's transcript
+    // replaced by `text`; the correction under the selection put back as heard; a phrase replaced in every transcript
+    // of the project; and the near misses of the project's vocabulary fixed. Counts or false when nothing changed.
+    bool correctSelection(const QString& text);
+    bool revertSelection();
+    int replaceInAllTranscripts(const QString& find, const QString& with);
+    int applyVocabulary();
 
 public slots:
     void deleteSelection();     // Sequence: ripple-delete the selected words
@@ -96,6 +103,7 @@ private:
     QToolButton* retakesBtn_;
     QToolButton* pausesBtn_;
     QToolButton* bleepBtn_;
+    QToolButton* correctBtn_ = nullptr;
     QToolButton* insertBtn_;
     QToolButton* overwriteBtn_;
     QToolButton* smoothBtn_;

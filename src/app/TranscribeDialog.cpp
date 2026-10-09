@@ -319,6 +319,7 @@ void runTranscription(EditorState* state, const std::vector<TranscribeJob>& jobs
 void startTranscription(EditorState* state, const std::vector<Id>& media, const TranscribeOptions& optionsIn,
                         QWidget* parent) {
     TranscribeOptions options = optionsIn;
+    if (options.vocabulary.empty()) options.vocabulary = state->project().vocabulary;  // the names and terms to expect
     // The speaker model first (asked for and fetched here); without it, words only.
     if (options.speakers &&
         !ensureModelPack(parent, speakerModel(), QObject::tr("Transcribe"),
