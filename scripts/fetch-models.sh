@@ -13,6 +13,7 @@
 #   <dir>/tts            Generate Voiceover (MONTAGE_TTS_MODEL)
 #   <dir>/inpaint        Object Removal     (MONTAGE_INPAINT_MODEL)
 #   <dir>/minilm-qa      Find What's Said   (MONTAGE_SENTENCE_MODEL)
+#   <dir>/ocr            Reading text       (MONTAGE_OCR_MODEL)
 #
 #   scripts/fetch-models.sh [dir]      (default: ./models)
 set -euo pipefail
@@ -91,4 +92,11 @@ fetch inpaint lama_fp32.onnx \
 MINILM=https://huggingface.co/Xenova/multi-qa-MiniLM-L6-cos-v1/resolve/3c96c1df3fec9a98a5de76e80877c8bec18498f6
 fetch minilm-qa model_q4.onnx "$MINILM/onnx/model_q4.onnx" e798e950284f27b1cc028ab16b4175b997126dd3091304e4355e318c24c89bbc
 fetch minilm-qa vocab.txt "$MINILM/vocab.txt" 07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3
-echo "Models in $DIR: MONTAGE_OBJECT_MODEL=$DIR/edgetam-video MONTAGE_SPEAKER_MODEL=$DIR/speakers MONTAGE_VISUAL_MODEL=$DIR/clip-vit-b32 MONTAGE_SPEECH_MODEL=$DIR/speech-enhance MONTAGE_UPSCALE_MODEL=$DIR/upscale MONTAGE_FACE_MODEL=$DIR/faces MONTAGE_DEPTH_MODEL=$DIR/depth MONTAGE_RIFE_MODEL=$DIR/rife MONTAGE_MATTE_MODEL=$DIR/matte MONTAGE_TTS_MODEL=$DIR/tts MONTAGE_INPAINT_MODEL=$DIR/inpaint MONTAGE_SENTENCE_MODEL=$DIR/minilm-qa"
+OCRDET=https://huggingface.co/SWHL/RapidOCR/resolve/1cfba2e90fc938db55889873735088de210cc173/PP-OCRv4
+OCRREC=https://huggingface.co/monkt/paddleocr-onnx/resolve/7b02d0a30a07ba2b92ad1ff5a8941ae2c633de65/languages
+fetch ocr ch_PP-OCRv4_det_infer.onnx "$OCRDET/ch_PP-OCRv4_det_infer.onnx" d2a7720d45a54257208b1e13e36a8479894cb74155a5efe29462512d42f49da9
+fetch ocr en_rec.onnx "$OCRREC/english/rec.onnx" 4e16deb22c4da6468bdca539b2cd3c8687825538b67109177c47d359ab994cd7
+fetch ocr en_dict.txt "$OCRREC/english/dict.txt" e025a66d31f327ba0c232e03f407ae8d105e1e709e7ccb3f408aa778c24e70d6
+fetch ocr latin_rec.onnx "$OCRREC/latin/rec.onnx" 614ffc2d6d3902d360fad7f1b0dd455ee45e877069d14c4e51a99dc4ef144409
+fetch ocr latin_dict.txt "$OCRREC/latin/dict.txt" 3c0a8a79b612653c25f765271714f71281e4e955962c153e272b7b8c1d2b13ff
+echo "Models in $DIR: MONTAGE_OBJECT_MODEL=$DIR/edgetam-video MONTAGE_SPEAKER_MODEL=$DIR/speakers MONTAGE_VISUAL_MODEL=$DIR/clip-vit-b32 MONTAGE_SPEECH_MODEL=$DIR/speech-enhance MONTAGE_UPSCALE_MODEL=$DIR/upscale MONTAGE_FACE_MODEL=$DIR/faces MONTAGE_DEPTH_MODEL=$DIR/depth MONTAGE_RIFE_MODEL=$DIR/rife MONTAGE_MATTE_MODEL=$DIR/matte MONTAGE_TTS_MODEL=$DIR/tts MONTAGE_INPAINT_MODEL=$DIR/inpaint MONTAGE_SENTENCE_MODEL=$DIR/minilm-qa MONTAGE_OCR_MODEL=$DIR/ocr"

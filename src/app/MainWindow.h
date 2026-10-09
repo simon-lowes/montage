@@ -112,6 +112,10 @@ public:
     // Clip › Import Embedded Captions: the CEA-608 captions inside the selected video clip's file (else the clip under
     // the playhead on the target video track) as a new caption track where the clip plays them. How many captions.
     int importEmbeddedCaptions();
+    // Clip › Read Burned-In Subtitles: the subtitles in the selected video clip's picture (`where`: 0 bottom, 1 top,
+    // 2 the whole picture) read off it (media/TextReader.h, "en" or another Latin-script `language`) into a new caption
+    // track where the clip plays them; `ask` shows the choices first. How many captions were made.
+    int readBurnedInSubtitles(int where = 0, const QString& language = QStringLiteral("en"), bool ask = true);
     // Clip › Remove Mic Bleed: on multitrack talk (a mic per speaker), each track dips while it is not its speaker's
     // turn (media/MicBleed.h), as volume keyframes, one undo step. `tracks` empty = every unmuted audio track with
     // clips. How many clips changed (0 with a message when nothing applies).

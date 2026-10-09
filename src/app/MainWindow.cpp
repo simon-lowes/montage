@@ -72,6 +72,7 @@
 #include "render/AudioReactive.h"
 #include "render/VfxPull.h"
 #include "render/LutExport.h"
+#include "media/TextReader.h"
 #include "media/Decoder.h"
 #include "media/HwAccel.h"
 #include "media/MediaPool.h"
@@ -1056,6 +1057,8 @@ void MainWindow::buildMenus() {
     add(clipM, tr("Make Highlights…"), QKeySequence(), [this] { highlightsDialog(); })->setObjectName(QStringLiteral("makeHighlights"));
     add(clipM, tr("Import Embedded Captions"), QKeySequence(), [this] { importEmbeddedCaptions(); })
         ->setObjectName(QStringLiteral("importEmbeddedCaptions"));
+    add(clipM, tr("Read Burned-In Subtitles…"), QKeySequence(), [this] { readBurnedInSubtitles(); })
+        ->setObjectName(QStringLiteral("readBurnedInSubtitles"));
     add(clipM, tr("Add B-Roll by What Is Said"), QKeySequence(), [this] { addBroll(); })->setObjectName(QStringLiteral("autoBroll"));
     add(clipM, tr("S&ynchronize by Audio"), QKeySequence(), [this] { syncByAudio(); });
     clipM->addSeparator();
@@ -3626,6 +3629,82 @@ int MainWindow::importEmbeddedCaptions() {
         return true;
     });
     state_->message(tr("%n closed caption(s) imported as a caption track", "", int(placed.size())), 5000);
+    return int(placed.size());
+}
+
+int MainWindow::readBurnedInSubtitles(int where, const QString& language, bool ask) {
+    const Sequence* s = state_->sequence();
+    if (!s) return 0;
+    // The selected video clip, else the one under the playhead on the target video track.
+    const Clip* clip = nullptr;
+    for (Id id : state_->selectedClips())
+        for (const Track& t : s->videoTracks)
+            for (const Clip& c : t.clips)
+                if (c.id == id && c.mediaId) clip = &c;
+    if (!clip)
+        if (const Track* t = trackAt(*s, {TrackKind::Video, state_->targetVideoTrack()}))
+            for (const Clip& c : t->clips)
+                if (c.mediaId && c.start <= state_->playhead() && state_->playhead() < c.end()) clip = &c;
+    const MediaItem* m = clip ? state_->project().findMedia(clip->mediaId) : nullptr;
+    if (!m || m->kind != MediaKind::Video) {
+        state_->message(tr("Select a video clip with subtitles in its picture"));
+        return 0;
+    }
+    QString lang = language;
+    if (ask) {
+        QDialog dlg(this);
+        dlg.setObjectName(QStringLiteral("burnedInDialog"));
+        dlg.setWindowTitle(tr("Read Burned-In Subtitles"));
+        auto* form = new QFormLayout(&dlg);
+        auto* place = new QComboBox(&dlg);
+        place->addItems({tr("Bottom of the picture"), tr("Top of the picture"), tr("Whole picture")});
+        place->setCurrentIndex(std::clamp(where, 0, 2));
+        auto* script = new QComboBox(&dlg);
+        script->addItem(tr("English"), QStringLiteral("en"));
+        script->addItem(tr("Other languages in Latin script (French, German, Spanish...)"), QStringLiteral("und"));
+        form->addRow(new QLabel(tr("The subtitles in the picture of %1 are read off it and become a caption track.").arg(QString::fromStdString(clip->name)), &dlg));
+        form->addRow(tr("Where they are:"), place);
+        form->addRow(tr("Language:"), script);
+        auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+        buttons->button(QDialogButtonBox::Ok)->setText(tr("Read"));
+        connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+        connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+        form->addRow(buttons);
+        if (dlg.exec() != QDialog::Accepted) return 0;
+        where = place->currentIndex();
+        lang = script->currentData().toString();
+    }
+    if (!ensureModelPack(this, ocrModel(), tr("Read Burned-In Subtitles"),
+                         tr("Reading text in the picture uses PP-OCR (PaddlePaddle, Apache-2.0), which runs on this computer.")))
+        return 0;
+    const TextRegion region = where == 1 ? TextRegion{0, 0, 1, 0.4} : where == 2 ? TextRegion{} : TextRegion{0, 0.6, 1, 1};
+    const std::string path = m->path;
+    const Rational fps = s->fps;
+    const Clip target = *clip;
+    // Only the part of the media the clip plays.
+    const double a = std::min(target.sourceAt(0), target.sourceAt(double(target.duration))) / fps.toDouble();
+    const double b = std::max(target.sourceAt(0), target.sourceAt(double(target.duration))) / fps.toDouble();
+    std::vector<Caption> found;
+    if (!runWithProgress(this, state_, tr("Reading the subtitles..."), [&](const auto& progress, const auto* cancel, std::string* e) {
+            return montage::readBurnedInSubtitles(path, a, b + 1.0 / fps.toDouble(), region, fps, found, lang.toStdString(), 4,
+                                                  [&](double f) { progress(f); }, cancel, e);
+        }))
+        return 0;
+    const std::vector<Caption> placed = captionsThroughClip(target, found);
+    if (placed.empty()) {
+        state_->message(tr("No subtitles were read in the clip's picture"), 5000);
+        return 0;
+    }
+    state_->edit(tr("Read Burned-In Subtitles"), [&](Project& p, Sequence& sq) {
+        CaptionTrack t;
+        t.id = p.newId();
+        t.name = "Burned-In - " + target.name;
+        t.language = lang == "und" ? "und" : "en";
+        t.captions = placed;
+        sq.captionTracks.push_back(std::move(t));
+        return true;
+    });
+    state_->message(tr("%n subtitle(s) read into a caption track", "", int(placed.size())), 5000);
     return int(placed.size());
 }
 

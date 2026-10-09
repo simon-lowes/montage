@@ -28,6 +28,7 @@
 #include "render/Spherical.h"
 #include "render/ClipPlacement.h"
 #include "media/SpeechSearch.h"
+#include "media/TextReader.h"
 #include "media/ImageSequence.h"
 #include "media/Psd.h"
 #include "core/AutoTag.h"
@@ -1877,6 +1878,110 @@ void McpServer::Impl::addTools() {
             }
             if (seg.words.empty()) return ok("Nothing in the sequence is transcribed (use montage_transcribe with the project)");
             return ok(hits.isEmpty() ? QStringLiteral("Not found") : text, QJsonObject{{"hits", hits}});
+        });
+
+    add("montage_read_text", "Read text in the picture",
+        "Read the text in pictures (OCR, PP-OCR, runs locally; downloaded on first use in the app or by "
+        "scripts/fetch-models.sh). `action`: frame (the lines of text in the sequence's frame at `at`, or in `media` at "
+        "`seconds`, each with its box as fractions of the picture), subtitles (the burned-in subtitles of video clip "
+        "`clip` read into a new caption track where the clip plays them; `where` bottom, top or whole) or slate (the "
+        "scene, shot and take on a slate in the first seconds of each of `media`, logged in their metadata). "
+        "`language`: en, or another language in Latin script (fr, de, es...).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"action":{"type":"string","enum":["frame","subtitles","slate"],"default":"frame"},
+            "at":{"type":["number","string"]},"media":{"type":["string","array"]},"seconds":{"type":"number","default":0},
+            "clip":{"type":"number"},"where":{"type":"string","enum":["bottom","top","whole"],"default":"bottom"},
+            "language":{"type":"string","default":"en"}},"required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            if (!ocrAvailable()) return fail("This build of Montage cannot read text in pictures (no ONNX Runtime)");
+            if (!ocrModel().installed()) return fail("Reading text needs its model: run `scripts/fetch-models.sh` or read text once in the app");
+            const QString action = str(a, "action", "frame");
+            const std::string language = str(a, "language", "en").toStdString();
+            std::string err;
+            if (action == "frame") {
+                auto reader = TextReader::load(language, &err);
+                if (!reader) return fail(QString::fromStdString(err));
+                std::vector<TextLine> lines;
+                if (a.value("media").isString()) {
+                    const MediaItem& m = projectMedia(l.project, str(a, "media"));
+                    if (m.kind != MediaKind::Video && m.kind != MediaKind::Image) throw ArgError{"That media has no picture"};
+                    VideoDecoder dec;
+                    if (!dec.open(m.path, &err)) return fail(QString::fromStdString(err));
+                    Frame16Ptr f = dec.frameAt(a.value("seconds").toDouble(0));
+                    if (!f) return fail("No picture there");
+                    lines = reader->read(*f, {}, &err);
+                } else {
+                    const FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : s.playhead;
+                    RenderOptions ro;
+                    ro.displaySpace = "rec709";
+                    const Image img = renderProgramFrame(l.project, s, at, ro);
+                    QImage q(img.width, img.height, QImage::Format_RGBA8888);
+                    toRgba8(img, q.bits(), size_t(q.bytesPerLine()));
+                    lines = reader->read(q, {}, &err);
+                }
+                if (lines.empty() && !err.empty()) return fail(QString::fromStdString(err));
+                QJsonArray list;
+                for (const TextLine& t : lines)
+                    list.append(QJsonObject{{"text", QString::fromStdString(t.text)}, {"confidence", double(t.confidence)},
+                                            {"box", QJsonArray{t.x0, t.y0, t.x1, t.y1}}});
+                return ok(lines.empty() ? QStringLiteral("No text there") : QString::fromStdString(textOf(lines, 0)), QJsonObject{{"lines", list}});
+            }
+            if (action == "subtitles") {
+                Clip& c = clipArg(l, a);
+                const MediaItem* m = l.project.findMedia(c.mediaId);
+                if (!m || m->kind != MediaKind::Video) throw ArgError{"That is not a video clip"};
+                const QString where = str(a, "where", "bottom");
+                if (where != "bottom" && where != "top" && where != "whole") throw ArgError{"\"where\" is bottom, top or whole"};
+                const TextRegion region = where == "top" ? TextRegion{0, 0, 1, 0.4} : where == "whole" ? TextRegion{} : TextRegion{0, 0.6, 1, 1};
+                const double fps = s.fpsValue();
+                const double from = std::min(c.sourceAt(0), c.sourceAt(double(c.duration))) / fps;
+                const double to = std::max(c.sourceAt(0), c.sourceAt(double(c.duration))) / fps + 1 / fps;
+                std::vector<Caption> found;
+                if (!readBurnedInSubtitles(m->path, from, to, region, s.fps, found, language, 4, {}, nullptr, &err))
+                    return fail(QString::fromStdString(err));
+                const std::vector<Caption> placed = captionsThroughClip(c, found);
+                if (placed.empty()) return ok("No subtitles were read in the clip's picture");
+                CaptionTrack t;
+                t.id = l.project.newId();
+                t.name = "Burned-In - " + c.name;
+                t.language = language;
+                t.captions = placed;
+                s.captionTracks.push_back(t);
+                save(l);
+                QJsonArray list;
+                QString text = QStringLiteral("%1 subtitle(s) read into the caption track \"%2\":").arg(placed.size()).arg(QString::fromStdString(t.name));
+                for (const Caption& cap : placed) {
+                    list.append(QJsonObject{{"start", tc(cap.start, s)}, {"end", tc(cap.end, s)}, {"text", QString::fromStdString(cap.text)}});
+                    text += QStringLiteral("\n%1  %2").arg(tc(cap.start, s), QString::fromStdString(cap.text));
+                }
+                return ok(text, QJsonObject{{"track", double(t.id)}, {"captions", list}});
+            }
+            if (action == "slate") {
+                std::vector<MediaItem*> items;
+                const QJsonValue mv = a.value("media");
+                if (mv.isString()) items.push_back(&projectMedia(l.project, mv.toString()));
+                for (const QJsonValue& v : mv.toArray()) items.push_back(&projectMedia(l.project, v.toString()));
+                if (items.empty()) throw ArgError{"\"media\" is required"};
+                QJsonArray list;
+                int logged = 0;
+                for (MediaItem* m : items) {
+                    SlateInfo slate;
+                    std::string why;
+                    const bool found = m->kind == MediaKind::Video && readSlateFromPicture(m->path, slate, &why);
+                    if (found) {
+                        if (!slate.scene.empty()) setMediaField(*m, "scene", slate.scene);
+                        if (!slate.shot.empty()) setMediaField(*m, "shot", slate.shot);
+                        if (!slate.take.empty()) setMediaField(*m, "take", slate.take);
+                        ++logged;
+                    }
+                    list.append(QJsonObject{{"media", QString::fromStdString(m->name)}, {"found", found}, {"scene", QString::fromStdString(slate.scene)},
+                                            {"shot", QString::fromStdString(slate.shot)}, {"take", QString::fromStdString(slate.take)}});
+                }
+                if (logged) save(l);
+                return ok(QStringLiteral("Logged %1 of %2 from their slates").arg(logged).arg(items.size()), QJsonObject{{"slates", list}});
+            }
+            throw ArgError{"\"action\" is frame, subtitles or slate"};
         });
 
     add("montage_search_speech", "Search what is said by meaning",

@@ -10,6 +10,7 @@
 #include "core/SpellCheck.h"
 #include "core/ColorGroups.h"
 #include "core/SpokenSearch.h"
+#include "core/OnScreenText.h"
 #include "core/AutoTag.h"
 #include "core/Automation.h"
 #include "core/CaptionTools.h"
@@ -1261,6 +1262,48 @@ private slots:
         QCOMPARE(words.size(), size_t(3));  // the filler is gone
         QVERIFY(std::fabs(words.back().start - (4.7 - 59 / 25.0)) < 0.05);
         QVERIFY(!rippleDeleteRanges(p, s, {}).ok);
+    }
+
+    void captionsFromReadText() {
+        QCOMPARE(readingSimilarity("Hello there", "hello, there!"), 1.0);
+        QVERIFY(readingSimilarity("Hello there", "He1lo there") > 0.85);
+        QCOMPARE(readingSimilarity("", ""), 1.0);
+        QCOMPARE(readingSimilarity("abc", ""), 0.0);
+        QVERIFY(readingSimilarity("The first line", "Something else entirely") < 0.5);
+        // Four readings a second: a line held, misread once, a gap, two lines on two rows, a flash too short to keep.
+        std::vector<std::pair<double, std::string>> r;
+        auto at = [&](double from, double to, const std::string& text) {
+            for (double t = from; t < to - 1e-9; t += 0.25) r.push_back({t, text});
+        };
+        at(0, 1.0, "The first line");
+        r.push_back({1.0, "The flrst line"});
+        at(1.25, 2.0, "The first line");
+        at(2.0, 3.0, "");
+        at(3.0, 4.5, "Two rows of text\nhere at once");
+        at(4.5, 4.75, "Blip");
+        at(4.75, 5.0, "");
+        const auto caps = captionsFromReadings(r, 0.25, Rational{25, 1});
+        QCOMPARE(caps.size(), size_t(2));
+        QCOMPARE(caps[0].text, std::string("The first line"));
+        QCOMPARE(caps[0].start, FrameTime(0));
+        QCOMPARE(caps[0].end, FrameTime(50));
+        QCOMPARE(caps[1].text, std::string("Two rows of text\nhere at once"));
+        QCOMPARE(caps[1].start, FrameTime(75));
+        QCOMPARE(caps[1].end, FrameTime(113));  // 4.5 s at 25 fps, rounded up
+        // The last reading runs to one step past it.
+        const auto tail = captionsFromReadings({{0, "End"}, {0.5, "End"}}, 0.5, Rational{25, 1});
+        QCOMPARE(tail.size(), size_t(1));
+        QCOMPARE(tail[0].end, FrameTime(25));
+        // Slates written on a board.
+        auto board = slateFromText("ROLL A004\nSCENE\n14B\nTAKE\n2");
+        QVERIFY(board);
+        QCOMPARE(board->scene, std::string("14"));
+        QCOMPARE(board->shot, std::string("B"));
+        QCOMPARE(board->take, std::string("2"));
+        board = slateFromText("SCENE 12 TAKE 3");
+        QVERIFY(board && board->scene == "12" && board->take == "3");
+        QVERIFY(!slateFromText("Hello there, how are you today?"));
+        QVERIFY(!slateFromText(""));
     }
 
     void spokenPassagesAndRanking() {

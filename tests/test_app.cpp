@@ -53,6 +53,8 @@
 #include "SpellUi.h"
 #include "core/ColorGroups.h"
 #include "media/SpeechSearch.h"
+#include "media/TextReader.h"
+#include "core/OnScreenText.h"
 #include "ProjectManagerDialog.h"
 #include "MediaBinModel.h"
 #include "ScopesWidget.h"
@@ -6700,6 +6702,59 @@ const auto seq = [this] { return state()->sequence(); };
         }
         scopes.setMode(ScopesWidget::Mode::Waveform);
         QVERIFY(scopes.hasSignal());
+    }
+
+    void readTextInPictures() {
+        if (!ocrAvailable() || !ocrModel().installed()) QSKIP("Text reading model not installed (set MONTAGE_OCR_MODEL)");
+        // A video with two subtitles burned in, and a slate card.
+        auto video = [&](const std::vector<std::pair<FrameTime, std::string>>& titles, int anchor, const QString& file) {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 640, gs.height = 360, gs.fps = {25, 1};
+            Clip bg = makeGeneratorClip(gen, "color", 100);
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, bg);
+            for (const auto& [at, text] : titles) {
+                Clip t = makeGeneratorClip(gen, "title", 40);
+                t.generator.strings["text"] = text;
+                t.generator.params["size"] = 32.0;
+                t.generator.params["anchor"] = double(anchor);
+                t.start = at;
+                edit::overwrite(gen, gs, {TrackKind::Video, 1}, t);
+            }
+            ExportSettings st;
+            st.path = (dir_.path() + "/" + file).toStdString();
+            st.audioCodec = "none";
+            st.preset = "ultrafast";
+            std::string err;
+            return exportSequence(gen, gs, st, nullptr, nullptr, &err) ? QString::fromStdString(st.path) : QString();
+        };
+        const QString subs = video({{0, "Where were you last night"}, {50, "I was at home, honestly"}}, 2, "subs.mp4");
+        const QString slate = video({{0, "SCENE 4\nTAKE 6"}}, 0, "slate4.mp4");
+        QVERIFY(!subs.isEmpty() && !slate.isEmpty());
+        state()->newProject();
+        QVERIFY(win_->findChild<QAction*>("readBurnedInSubtitles"));
+        QCOMPARE(win_->readBurnedInSubtitles(0, "en", false), 0);  // nothing selected or under the playhead
+        const auto ids = state()->importFiles({subs, slate});
+        QCOMPARE(ids.size(), size_t(2));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids.at(0), 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        state()->setSelection({state()->sequence()->videoTracks[0].clips.at(0).id}, false);
+        QCOMPARE(win_->readBurnedInSubtitles(0, "en", false), 2);
+        const CaptionTrack& t = state()->sequence()->captionTracks.back();
+        QVERIFY(QString::fromStdString(t.name).startsWith("Burned-In"));
+        QVERIFY2(readingSimilarity(t.captions[0].text, "Where were you last night") >= 0.9, t.captions[0].text.c_str());
+        QVERIFY(readingSimilarity(t.captions[1].text, "I was at home, honestly") >= 0.9);
+        state()->undo();
+        QVERIFY(state()->sequence()->captionTracks.empty());
+        // The slate logged from the picture, in the media bin.
+        auto* bin = win_->findChild<MediaBinWidget*>();
+        QCOMPARE(bin->logSlatesFromPicture({ids.at(1), ids.at(0)}), 1);
+        QCOMPARE(mediaFieldText(*state()->project().findMedia(ids.at(1)), "scene"), std::string("4"));
+        QCOMPARE(mediaFieldText(*state()->project().findMedia(ids.at(1)), "take"), std::string("6"));
+        state()->undo();
+        QCOMPARE(mediaFieldText(*state()->project().findMedia(ids.at(1)), "scene"), std::string());
+        state()->newProject();
     }
 
     void findWhatIsSaid() {

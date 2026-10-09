@@ -102,6 +102,8 @@
 #include "render/Exporter.h"
 #include "core/ColorGroups.h"
 #include "media/SpeechSearch.h"
+#include "media/TextReader.h"
+#include "core/OnScreenText.h"
 #include "render/Processing.h"
 #include "media/CameraRaw.h"
 #include "core/Slate.h"
@@ -2150,6 +2152,164 @@ private slots:
         for (const QJsonValue& v : r.value("structuredContent").toObject().value("hits").toArray())
             QCOMPARE(v.toObject().value("media").toString(), QString("director.wav"));
         QVERIFY(call({{"query", "money"}, {"media", QJsonArray{"nobody.wav"}}}).value("isError").toBool());
+    }
+
+    void readingTextInPictures() {
+        if (!ocrAvailable()) QSKIP("Built without ONNX Runtime");
+        if (!ocrModel().installed()) QSKIP("Text reading model not installed (set MONTAGE_OCR_MODEL)");
+        std::string err;
+        auto reader = TextReader::load("en", &err);
+        QVERIFY2(reader, err.c_str());
+        // A frame with a slate line at the top and a subtitle at the bottom.
+        QImage frame(640, 360, QImage::Format_RGB32);
+        frame.fill(QColor(20, 30, 40));
+        {
+            QPainter pa(&frame);
+            QFont f(QStringLiteral("DejaVu Sans"));
+            f.setPixelSize(28);
+            f.setBold(true);
+            pa.setFont(f);
+            pa.setPen(QColor(230, 230, 60));
+            pa.drawText(QRect(30, 20, 400, 40), Qt::AlignLeft | Qt::AlignVCenter, QStringLiteral("SCENE 12  TAKE 3"));
+            pa.setPen(Qt::white);
+            pa.drawText(QRect(0, 290, 640, 50), Qt::AlignCenter, QStringLiteral("Hello there, how are you today?"));
+        }
+        const std::vector<TextLine> lines = reader->read(frame, {}, &err);
+        QVERIFY2(lines.size() == 2, qPrintable(QString::fromStdString(textOf(lines, 0))));
+        QVERIFY2(readingSimilarity(lines[0].text, "SCENE 12 TAKE 3") >= 0.95, lines[0].text.c_str());
+        QVERIFY2(readingSimilarity(lines[1].text, "Hello there, how are you today?") >= 0.95, lines[1].text.c_str());
+        QVERIFY(lines[0].y1 < 0.25 && lines[1].y0 > 0.7);  // where they are
+        QVERIFY(lines[1].x0 > 0.1 && lines[1].x1 < 0.95 && lines[1].confidence > 0.8);
+        // Only the bottom band read.
+        const auto bottom = reader->read(frame, TextRegion{0, 0.6, 1, 1}, &err);
+        QCOMPARE(bottom.size(), size_t(1));
+        QVERIFY(bottom[0].y0 > 0.7);
+        // Other Latin-script languages read with their own recogniser: accents kept.
+        auto latin = TextReader::load("fr", &err);
+        QVERIFY2(latin, err.c_str());
+        QImage fr(640, 120, QImage::Format_RGB32);
+        fr.fill(Qt::black);
+        {
+            QPainter pa(&fr);
+            QFont f(QStringLiteral("DejaVu Sans"));
+            f.setPixelSize(30);
+            f.setBold(true);
+            pa.setFont(f);
+            pa.setPen(Qt::white);
+            pa.drawText(fr.rect(), Qt::AlignCenter, QStringLiteral("D\u00e9j\u00e0 vu \u00e0 l'\u00e9t\u00e9"));
+        }
+        const std::string read = textOf(latin->read(fr, {}, &err), 0);
+        QVERIFY2(QString::fromStdString(read).contains(QStringLiteral("\u00e9t\u00e9")), read.c_str());
+
+        // Burned-in subtitles of a video: three lines at the bottom over a moving background, each read once.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 640, s.height = 360, s.fps = {25, 1};
+        Clip bg = makeGeneratorClip(p, "gradient", 150);
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, bg).ok);
+        const struct {
+            FrameTime at, len;
+            const char* text;
+        } subs[] = {{0, 38, "The first line of dialogue"}, {50, 38, "And here is the second one"}, {100, 38, "Third and last, thank you"}};
+        for (const auto& sub : subs) {
+            Clip t = makeGeneratorClip(p, "title", sub.len);
+            t.generator.strings["text"] = sub.text;
+            t.generator.params["size"] = 30.0;
+            t.generator.params["anchor"] = 2.0;  // lower centre
+            t.start = sub.at;
+            QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 1}, t).ok);
+        }
+        ExportSettings st;
+        st.path = path("burned-in.mp4");
+        st.audioCodec = "none";
+        st.preset = "ultrafast";
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        std::vector<Caption> caps;
+        int ticks = 0;
+        QVERIFY2(readBurnedInSubtitles(st.path, 0, 0, TextRegion{0, 0.6, 1, 1}, s.fps, caps, "en", 4, [&](double) { ++ticks; }, nullptr, &err),
+                 err.c_str());
+        QVERIFY(ticks > 10);
+        QCOMPARE(caps.size(), size_t(3));
+        for (size_t i = 0; i < 3; ++i) {
+            QVERIFY2(readingSimilarity(caps[i].text, subs[i].text) >= 0.9, caps[i].text.c_str());
+            QVERIFY2(std::llabs(caps[i].start - subs[i].at) <= 7 && std::llabs(caps[i].end - (subs[i].at + subs[i].len)) <= 10,
+                     qPrintable(QString("%1-%2").arg(caps[i].start).arg(caps[i].end)));
+        }
+        // Part of it only.
+        QVERIFY(readBurnedInSubtitles(st.path, 2.0, 3.6, TextRegion{0, 0.6, 1, 1}, s.fps, caps, "en", 4, {}, nullptr, &err));
+        QCOMPARE(caps.size(), size_t(1));
+        QVERIFY(readingSimilarity(caps[0].text, subs[1].text) >= 0.9);
+        QVERIFY(!readBurnedInSubtitles(path("missing.mp4"), 0, 0, {}, s.fps, caps, "en", 4, {}, nullptr, &err));
+
+        // A slate card at the head of a take.
+        Project sp = makeDefaultProject();
+        Sequence& ss = *sp.active();
+        ss.width = 640, ss.height = 360, ss.fps = {25, 1};
+        Clip card = makeGeneratorClip(sp, "title", 50);
+        card.generator.strings["text"] = "SCENE 7B\nTAKE 2";
+        card.generator.params["size"] = 48.0;
+        QVERIFY(edit::overwrite(sp, ss, {TrackKind::Video, 0}, card).ok);
+        ExportSettings slateOut = st;
+        slateOut.path = path("slate.mp4");
+        QVERIFY2(exportSequence(sp, ss, slateOut, nullptr, nullptr, &err), err.c_str());
+        SlateInfo slate;
+        QVERIFY2(readSlateFromPicture(slateOut.path, slate, &err), err.c_str());
+        QVERIFY2(slate.scene == "7" && slate.shot == "B" && slate.take == "2", qPrintable(QString::fromStdString(slate.scene + "/" + slate.shot + "/" + slate.take)));
+        QVERIFY(slate.at >= 0 && slate.at < 2);
+        QVERIFY(!readSlateFromPicture(st.path, slate, &err));  // subtitles are no slate
+
+        // Over MCP: a frame's text, a clip's subtitles into a caption track, a slate logged.
+        Project mp = makeDefaultProject();
+        Sequence& ms = *mp.active();
+        ms.width = 640, ms.height = 360, ms.fps = {25, 1};
+        for (const std::string& file : {st.path, slateOut.path}) {
+            MediaItem m;
+            QVERIFY2(probeMedia(file, m, &err), err.c_str());
+            m.id = mp.newId();
+            mp.media.push_back(m);
+        }
+        Clip placed = makeClip(mp, mp.media[0], TrackKind::Video, ms);
+        QVERIFY(edit::overwrite(mp, ms, {TrackKind::Video, 0}, placed).ok);
+        const double clipId = double(ms.videoTracks[0].clips[0].id);
+        const QString project = QString::fromStdString(path("read-text.montage"));
+        QVERIFY(saveProject(mp, project.toStdString()));
+        McpServer server;
+        auto call = [&](QJsonObject args) {
+            args["project"] = project;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_read_text"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call({{"action", "frame"}, {"at", "00:00:02:20"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonArray seen = r.value("structuredContent").toObject().value("lines").toArray();
+        QVERIFY(seen.size() == 1 && readingSimilarity(seen[0].toObject().value("text").toString().toStdString(), subs[1].text) >= 0.9);
+        QVERIFY(seen[0].toObject().value("box").toArray().at(1).toDouble() > 0.6);
+        r = call({{"action", "frame"}, {"media", "slate.mp4"}, {"seconds", 1.0}});
+        QVERIFY2(QJsonDocument(r).toJson().contains("TAKE"), QJsonDocument(r).toJson().constData());
+        r = call({{"action", "subtitles"}, {"clip", clipId}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("captions").toArray().size(), 3);
+        {
+            Project q;
+            QVERIFY(loadProject(project.toStdString(), q));
+            QCOMPARE(q.active()->captionTracks.size(), size_t(1));
+            QCOMPARE(q.active()->captionTracks[0].captions.size(), size_t(3));
+        }
+        r = call({{"action", "slate"}, {"media", QJsonArray{"slate.mp4", "burned-in.mp4"}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonArray slates = r.value("structuredContent").toObject().value("slates").toArray();
+        QVERIFY(slates[0].toObject().value("found").toBool() && !slates[1].toObject().value("found").toBool());
+        {
+            Project q;
+            QVERIFY(loadProject(project.toStdString(), q));
+            QCOMPARE(mediaFieldText(q.media[1], "scene"), std::string("7"));
+            QCOMPARE(mediaFieldText(q.media[1], "take"), std::string("2"));
+        }
+        QVERIFY(call({{"action", "subtitles"}, {"clip", clipId}, {"where", "middle"}}).value("isError").toBool());
     }
 
     void mcpColorGroups() {

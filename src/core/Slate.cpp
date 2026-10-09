@@ -1,5 +1,8 @@
 #include "Slate.h"
 
+#include <QString>
+#include <QStringList>
+
 #include "MediaLog.h"
 
 #include <algorithm>
@@ -145,6 +148,23 @@ std::optional<SlateInfo> slateFromTranscript(const Transcript& tr, double within
         }
     }
     if (!any || (s.scene.empty() && s.take.empty())) return std::nullopt;
+    return s;
+}
+
+std::optional<SlateInfo> slateFromText(const std::string& text) {
+    // As if said, a word at a time; a written board's labels and values read the same way.
+    Transcript t;
+    TranscriptSegment seg;
+    double at = 0;
+    for (const QString& w : QString::fromStdString(text).simplified().split(' ', Qt::SkipEmptyParts)) {
+        seg.words.push_back({at, at + 0.1, w.toStdString(), 1});
+        at += 0.1;
+    }
+    if (seg.words.empty()) return std::nullopt;
+    seg.end = at;
+    t.segments.push_back(seg);
+    auto s = slateFromTranscript(t, 1e9);
+    if (s) s->at = -1;
     return s;
 }
 

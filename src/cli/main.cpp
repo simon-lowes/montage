@@ -23,6 +23,7 @@
 #include "core/ProjectIO.h"
 #include "core/Transcript.h"
 #include "media/SpeechSearch.h"
+#include "media/TextReader.h"
 #include "media/Analysis.h"
 #include "render/AafExport.h"
 #include "media/Decoder.h"
@@ -655,6 +656,10 @@ int cmdModels() {
     else
         std::printf("  %-22s %6.1f MB  %s\n", sentenceModel().id.c_str(), double(sentenceModel().bytes()) / 1e6,
                     sentenceModel().installed() ? "downloaded" : "");
+    std::printf("\nText reading model (PP-OCR, for burned-in subtitles and slates; folder: %s)\n", ocrModel().directory().c_str());
+    if (!ocrAvailable()) std::printf("  unavailable: this build has no ONNX Runtime\n");
+    else
+        std::printf("  %-22s %6.1f MB  %s\n", ocrModel().id.c_str(), double(ocrModel().bytes()) / 1e6, ocrModel().installed() ? "downloaded" : "");
     return 0;
 }
 

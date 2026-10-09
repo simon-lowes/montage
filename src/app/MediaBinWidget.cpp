@@ -1,4 +1,6 @@
 #include "MediaBinWidget.h"
+#include <QCoreApplication>
+#include "media/TextReader.h"
 #include "Settings.h"
 
 #include <QApplication>
@@ -1136,6 +1138,12 @@ void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos)
                                   : tr("No slate (\"Scene 12 apple, take 3\") was heard at the head of these clips"),
                                 5000);
             })->setObjectName(QStringLiteral("logFromSlate"));
+        bool anyVideo = false;
+        for (Id id : files)
+            if (const MediaItem* m = state_->project().findMedia(id)) anyVideo |= m->kind == MediaKind::Video;
+        if (anyVideo)
+            menu.addAction(tr("Log Slate from Picture"), this, [this, files] { logSlatesFromPicture(files); })
+                ->setObjectName(QStringLiteral("logSlateFromPicture"));
         if (anyTranscript)
             menu.addAction(tr("Remove Transcript"), this, [this, withSound] {
                 state_->edit(tr("Remove Transcript"), [withSound](Project& p, Sequence&) {
@@ -1417,6 +1425,41 @@ void MediaBinWidget::createProxies(const std::vector<Id>& ids) {
         }
         return errors;
     }));
+}
+
+int MediaBinWidget::logSlatesFromPicture(const std::vector<Id>& media) {
+    std::vector<std::pair<Id, std::string>> videos;
+    for (Id id : media)
+        if (const MediaItem* m = state_->project().findMedia(id); m && m->kind == MediaKind::Video && !m->path.empty()) videos.push_back({id, m->path});
+    if (videos.empty()) return 0;
+    if (!ensureModelPack(window(), ocrModel(), tr("Log Slate from Picture"),
+                         tr("Reading the slate uses PP-OCR (PaddlePaddle, Apache-2.0), which runs on this computer.")))
+        return 0;
+    QProgressDialog progress(tr("Reading slates…"), tr("Cancel"), 0, int(videos.size()), window());
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(400);
+    std::vector<std::pair<Id, SlateInfo>> found;
+    for (size_t i = 0; i < videos.size() && !progress.wasCanceled(); ++i) {
+        progress.setValue(int(i));
+        QCoreApplication::processEvents();
+        SlateInfo s;
+        if (readSlateFromPicture(videos[i].second, s)) found.push_back({videos[i].first, s});
+    }
+    progress.setValue(int(videos.size()));
+    if (!found.empty())
+        state_->edit(tr("Log Slate from Picture"), [found](Project& p, Sequence&) {
+            for (const auto& [id, s] : found)
+                if (MediaItem* m = p.findMedia(id)) {
+                    if (!s.scene.empty()) setMediaField(*m, "scene", s.scene);
+                    if (!s.shot.empty()) setMediaField(*m, "shot", s.shot);
+                    if (!s.take.empty()) setMediaField(*m, "take", s.take);
+                }
+            return true;
+        });
+    state_->message(found.empty() ? tr("No slate was found in the first seconds of these clips' pictures")
+                                  : tr("Logged scene, shot and take for %n clip(s) from their slates", nullptr, int(found.size())),
+                    5000);
+    return int(found.size());
 }
 
 }  // namespace montage

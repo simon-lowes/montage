@@ -72,6 +72,9 @@ public:
     std::vector<Id> shownMedia() const;  // in the order shown
     std::vector<Id> selectedMedia() const;
     void selectMedia(const std::vector<Id>& ids);
+    // Log Slate from Picture: the scene, shot and take on a slate in the first seconds of each video read off its
+    // picture (media/TextReader.h) into its metadata, one undo step. How many were logged.
+    int logSlatesFromPicture(const std::vector<Id>& media);
 
     // Logging, each one undo step.
     bool setRating(const std::vector<Id>& ids, int rating);
