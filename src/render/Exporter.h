@@ -28,7 +28,8 @@ struct BurnIn {
 
 struct ExportSettings {
     std::string path;
-    // libx264, libx265, hw_h264, hw_hevc, prores_ks, dnxhd, cfhd, ffv1, v210, libvpx-vp9, libsvtav1, mjpeg, none; also
+    // libx264, libx265, hw_h264, hw_hevc, prores_ks, dnxhd, cfhd, ffv1, v210, mpeg2video (XDCAM HD422), libvpx-vp9,
+    // libsvtav1, mjpeg, none; also
     // gif (an animated GIF: its own palette, dithered) and png or tiff (an image sequence: the
     // path gets a frame number, name_000000.png, unless it already has a printf pattern).
     std::string videoCodec = "libx264";  // also exr (half float, scene-linear) and dpx (10-bit) image sequences
@@ -41,7 +42,7 @@ struct ExportSettings {
     int gop = 0;                         // keyframe interval in frames; 0 = 2 seconds
     int64_t videoBitrate = 0;            // bits/s; 0 = constant quality (crf)
     std::string preset = "medium";       // encoder speed preset
-    std::string profile;                 // e.g. ProRes "hq" / "4444", DNxHR "dnxhr_hq"
+    std::string profile;                 // e.g. ProRes "hq" / "4444", DNxHR "dnxhr_hq", x264 "avci100" (AVC-Intra 100)
     std::string pixFmt;                  // empty = sensible default for the codec
     int audioBitrate = 320000;
     int sampleRate = 0;                  // 0 = sequence rate
@@ -87,6 +88,11 @@ struct ExportSettings {
     };
     std::vector<AudioStream> extraAudio;
     std::string audioName, audioLanguage;  // the mix's title and language
+    // Broadcast MXF (XDCAM HD422, AVC-Intra, DNxHR OP1a) carries each channel as its own mono track: the mix's channels,
+    // then each extra stream's, then silence up to this many (0 = the mix as one stream, as everywhere else).
+    int monoAudioTracks = 0;
+    // The file's starting timecode ("10:00:00:00"; "" = none), where the container keeps one (MXF, MOV).
+    std::string startTimecode;
     // With embedCaptions, these caption tracks too, each as its own subtitle stream (every language at once).
     std::vector<Id> extraCaptions;
 };

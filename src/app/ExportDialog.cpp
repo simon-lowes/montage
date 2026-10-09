@@ -217,6 +217,12 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     chapters_->setObjectName(QStringLiteral("exportChapters"));
     chapters_->setChecked(appSettings().value("export/chapters", true).toBool());
     form->addRow(tr("Chapters:"), chapters_);
+    startTc_ = new QLineEdit(form_);
+    startTc_->setObjectName(QStringLiteral("exportStartTimecode"));
+    startTc_->setPlaceholderText(QStringLiteral("00:00:00:00"));
+    startTc_->setToolTip(tr("The file's starting timecode, as broadcasters ask (often 10:00:00:00); MXF and MOV keep it"));
+    startTc_->setText(appSettings().value("export/startTimecode").toString());
+    form->addRow(tr("Start timecode:"), startTc_);
     smart_ = new QCheckBox(tr("Copy untouched footage (smart render)"), form_);
     smart_->setObjectName(QStringLiteral("exportSmartRender"));
     smart_->setChecked(appSettings().value("export/smartRender", true).toBool());
@@ -498,6 +504,7 @@ void ExportDialog::updateControls() {
                              ext == QLatin1String("mkv") || ext == QLatin1String("webm");
     const bool anyChapters = seq && std::any_of(seq->markers.begin(), seq->markers.end(), [](const Marker& m) { return m.chapter; });
     chapters_->setEnabled(chapterFile && anyChapters);
+    startTc_->setEnabled(ext == QLatin1String("mxf") || ext == QLatin1String("mov"));
     const bool intra = p && (p->settings.videoCodec == "prores_ks" || p->settings.videoCodec == "dnxhd");
     smart_->setEnabled(intra);
     smart_->setToolTip(intra ? tr("Frames that are one untouched clip already in this ProRes or DNxHR flavour, size and rate are copied from "
@@ -638,6 +645,16 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
     settings.setValue("export/audioStreams", streams_->currentIndex());
     s.chapters = chapters_->isChecked();
     settings.setValue("export/chapters", chapters_->isChecked());
+    if (startTc_->isEnabled() && !startTc_->text().trimmed().isEmpty() && state_->sequence()) {
+        FrameTime t = 0;
+        const Rational fps = state_->sequence()->fps;
+        if (!parseTimecode(startTc_->text().trimmed().toStdString(), fps, t) || t < 0) {
+            QMessageBox::warning(this, tr("Export"), tr("The start timecode should look like 10:00:00:00."));
+            return false;
+        }
+        s.startTimecode = formatTimecode(t, fps);
+    }
+    settings.setValue("export/startTimecode", startTc_->text().trimmed());
     s.smartRender = smart_->isChecked();
     settings.setValue("export/smartRender", smart_->isChecked());
     if (hasVideo(s)) s.colorSpace = color_->currentData().toString().toStdString();

@@ -251,6 +251,28 @@ const std::vector<ExportPreset>& exportPresets() {
         v.push_back(preset("FFV1 (lossless archive)", "mkv", "Mathematically lossless 10-bit 4:2:2 with FLAC sound, for archiving", "ffv1", "flac", 0,
                            "", "", "yuv422p10le"));
         v.push_back(preset("Uncompressed 10-bit (v210)", "mov", "Uncompressed 10-bit 4:2:2, for broadcast ingest", "v210", "pcm_s24le", 0, ""));
+        {
+            // Broadcast delivery in MXF OP1a: 1080 lines, 48 kHz 24-bit sound with each channel its own mono track.
+            auto broadcast = [](ExportPreset p, int tracks) {
+                p.settings.width = 1920;
+                p.settings.height = 1080;
+                p.settings.sampleRate = 48000;
+                p.settings.monoAudioTracks = tracks;
+                p.settings.smartRender = false;
+                return p;
+            };
+            v.push_back(broadcast(preset("XDCAM HD422 (MXF)", "mxf", "Sony's broadcast MPEG-2: 1080 lines, 4:2:2 at 50 Mb/s, eight mono 24-bit tracks",
+                                         "mpeg2video", "pcm_s24le", 0, "", "", "yuv422p"),
+                                  8));
+            v.push_back(broadcast(preset("AVC-Intra 100 (MXF)", "mxf", "10-bit 4:2:2 intra H.264 at 100 Mb/s, four mono 24-bit tracks (as the DPP's AS-11 asks)",
+                                         "libx264", "pcm_s24le", 0, "", "avci100", "yuv422p10le"),
+                                  4));
+            ExportPreset dnx = broadcast(preset("Avid DNxHR HQ (MXF)", "mxf", "DNxHR HQ in MXF OP1a, each channel a mono track (Avid's layout)", "dnxhd",
+                                                "pcm_s24le", 0, "", "dnxhr_hq"),
+                                         2);
+            dnx.settings.width = dnx.settings.height = 0;  // DNxHR takes any size
+            v.push_back(dnx);
+        }
         v.push_back(preset("VP9 (WebM)", "webm", "Open web format, Opus audio", "libvpx-vp9", "libopus", 32, "good"));
         v.push_back(preset("AV1 (SVT-AV1)", "mp4", "Next-generation efficiency", "libsvtav1", "aac", 32, "8"));
         {
@@ -675,6 +697,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     };
     FrameTime in = s.in >= 0 ? s.in : 0;
     FrameTime out = s.out >= 0 ? s.out : seq.duration();
+    if (seq.duration() > 0) out = std::min(out, seq.duration());  // nothing past the end of the cut
     if (out <= in) return fail("Nothing to export: the range is empty");
     const bool wantVideo = s.videoCodec != "none" && !s.videoCodec.empty();
     const bool wantAudio = s.audioCodec != "none" && !s.audioCodec.empty();
@@ -772,6 +795,24 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             if (hasSuffix(c, "_amf")) av_dict_set(&opts, "quality", "quality", 0);
             if (hasSuffix(c, "_mf")) av_dict_set(&opts, "hw_encoding", "1", 0);  // not Microsoft's software MFT
             if (c.rfind("hevc", 0) == 0) o.vctx->codec_tag = MKTAG('h', 'v', 'c', '1');
+        } else if (c == "libx264" && s.profile == "avci100") {
+            // AVC-Intra 100: x264 sets every encoding parameter the class requires (1080 or 720 lines, 10-bit 4:2:2).
+            av_dict_set(&opts, "avcintra-class", "100", 0);
+            o.vctx->gop_size = 1;
+        } else if (c == "mpeg2video") {
+            // XDCAM HD422: 4:2:2 MPEG-2 at a constant 50 Mb/s, a long GOP of 12 (15 at 30 and 60 frames a second), two
+            // B-frames, 10-bit DC precision, as Sony's discs and broadcasters' ingest expect.
+            const int64_t rate = s.videoBitrate > 0 ? s.videoBitrate : 50000000;
+            o.vctx->bit_rate = o.vctx->rc_min_rate = o.vctx->rc_max_rate = rate;
+            o.vctx->rc_buffer_size = 17825792;
+            o.vctx->rc_initial_buffer_occupancy = 17825792;
+            o.vctx->gop_size = s.gop > 0 ? s.gop : (std::lround(seq.fpsValue()) % 25 == 0 ? 12 : 15);
+            o.vctx->max_b_frames = 2;
+            o.vctx->intra_dc_precision = 2;
+            o.vctx->qmin = 1;
+            o.vctx->qmax = 28;  // the non-linear scale's largest code (a quantiser of 112)
+            av_dict_set(&opts, "intra_vlc", "1", 0);
+            av_dict_set(&opts, "non_linear_quant", "1", 0);
         } else if (c == "libx264" || c == "libx265") {
             if (s.cea608) av_dict_set(&opts, "a53cc", "1", 0);
             if (s.videoBitrate <= 0) av_dict_set_int(&opts, "crf", s.crf, 0);
@@ -878,7 +919,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
 
     int audioFrameSize = 1024;
     // An audio encoder and its stream, in the sequence's layout (or stereo); "" or why not.
-    auto openAudio = [&](AVCodecContext*& actx, AVStream*& ast) -> std::string {
+    auto openAudio = [&](AVCodecContext*& actx, AVStream*& ast, bool mono = false) -> std::string {
         const AVCodec* codec = avcodec_find_encoder_by_name(s.audioCodec.c_str());
         if (!codec) return "Audio encoder not available: " + s.audioCodec;
         ast = avformat_new_stream(o.oc, nullptr);
@@ -887,6 +928,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         AVChannelLayout layout = AV_CHANNEL_LAYOUT_STEREO;
         if (!s.downmixStereo && seq.audioLayout == "5.1") layout = AV_CHANNEL_LAYOUT_5POINT1;
         if (!s.downmixStereo && seq.audioLayout == "7.1") layout = AV_CHANNEL_LAYOUT_7POINT1;
+        if (mono) layout = AV_CHANNEL_LAYOUT_MONO;
         av_channel_layout_copy(&actx->ch_layout, &layout);
         actx->sample_rate = sr;
         if (s.audioCodec == "libopus" && sr != 48000) actx->sample_rate = 48000;
@@ -941,16 +983,52 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         }
     };
     std::vector<std::unique_ptr<ExtraAudio>> extras;
+    // Channels mixed: the sequence's layout, or stereo.
+    const int layoutChannels = (!s.downmixStereo && seq.audioLayout == "5.1") ? 6 : (!s.downmixStereo && seq.audioLayout == "7.1") ? 8 : 2;
+    // Mono tracks (broadcast MXF): the mix's channels, each extra stream's, then silence.
+    struct MonoOut {
+        AVCodecContext* ctx = nullptr;
+        AVStream* st = nullptr;
+        AVFrame* frame = nullptr;
+        std::vector<float> fifo;
+        int64_t pts = 0;
+        ~MonoOut() {
+            av_frame_free(&frame);
+            avcodec_free_context(&ctx);
+        }
+    };
+    std::vector<std::unique_ptr<MonoOut>> monos;
+    const bool monoTracks = wantAudio && s.monoAudioTracks > 0;
+    if (monoTracks) {
+        static const char* const names[3][8] = {{"L", "R"}, {"L", "R", "C", "LFE", "Ls", "Rs"}, {"L", "R", "C", "LFE", "Lss", "Rss", "Lrs", "Rrs"}};
+        const char* const* channelNames = names[layoutChannels == 6 ? 1 : layoutChannels == 8 ? 2 : 0];
+        const int used = layoutChannels * int(1 + s.extraAudio.size());
+        const int count = std::max(s.monoAudioTracks, used);
+        for (int i = 0; i < count; ++i) {
+            auto m = std::make_unique<MonoOut>();
+            if (const std::string why = openAudio(m->ctx, m->st, true); !why.empty()) return fail(why);
+            m->frame = av_frame_alloc();
+            const size_t stream = size_t(i / layoutChannels);
+            if (i >= used) tagStream(m->st, "Silence", "");
+            else if (stream == 0) tagStream(m->st, (s.audioName.empty() ? std::string("Mix") : s.audioName) + " " + channelNames[i % layoutChannels], s.audioLanguage);
+            else tagStream(m->st, s.extraAudio[stream - 1].name + " " + channelNames[i % layoutChannels], s.extraAudio[stream - 1].language);
+            monos.push_back(std::move(m));
+        }
+    }
     if (wantAudio) {
-        if (const std::string why = openAudio(o.actx, o.ast); !why.empty()) return fail(why);
-        o.aframe = av_frame_alloc();
-        tagStream(o.ast, s.audioName, s.audioLanguage);
-        if (!s.extraAudio.empty()) o.ast->disposition |= AV_DISPOSITION_DEFAULT;
+        if (!monoTracks) {
+            if (const std::string why = openAudio(o.actx, o.ast); !why.empty()) return fail(why);
+            o.aframe = av_frame_alloc();
+            tagStream(o.ast, s.audioName, s.audioLanguage);
+            if (!s.extraAudio.empty()) o.ast->disposition |= AV_DISPOSITION_DEFAULT;
+        }
         for (const ExportSettings::AudioStream& want : s.extraAudio) {
             auto e = std::make_unique<ExtraAudio>();
-            if (const std::string why = openAudio(e->ctx, e->st); !why.empty()) return fail(why);
-            e->frame = av_frame_alloc();
-            tagStream(e->st, want.name, want.language);
+            if (!monoTracks) {  // with mono tracks the stream's channels go to theirs
+                if (const std::string why = openAudio(e->ctx, e->st); !why.empty()) return fail(why);
+                e->frame = av_frame_alloc();
+                tagStream(e->st, want.name, want.language);
+            }
             e->mixer.setTrackMask(want.tracks);
             e->seq = seq;
             if (!want.role.empty())
@@ -1013,15 +1091,16 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         opened = true;
     }
     av_dict_set(&o.oc->metadata, "encoder", "Montage", 0);
+    if (!s.startTimecode.empty()) av_dict_set(&o.oc->metadata, "timecode", s.startTimecode.c_str(), 0);
     if (s.chapters) addChapters(o.oc, seq, in, out);
     if ((rc = avformat_write_header(o.oc, nullptr)) < 0) return fail("Cannot write header: " + averr(rc));
     o.headerWritten = true;
 
-    const int mixRate = o.actx ? o.actx->sample_rate : sr;
+    const int mixRate = o.actx ? o.actx->sample_rate : !monos.empty() ? monos[0]->ctx->sample_rate : sr;
     Sequence mixSeq = seq;  // mixer runs at the encoder's rate
     mixSeq.sampleRate = mixRate;
     // Channels written: the layout's, or 2 (a surround sequence folded down, or a stereo one).
-    const int nch = o.actx ? o.actx->ch_layout.nb_channels : 2;
+    const int nch = o.actx ? o.actx->ch_layout.nb_channels : !monos.empty() ? layoutChannels : 2;
     std::vector<double> weights;
     if (nch > 2)
         for (const Speaker& sp : layoutSpeakers(seq.audioLayout)) weights.push_back(sp.loudnessWeight);
@@ -1070,7 +1149,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
 
     auto encodeFifo = [&](AVCodecContext* actx, AVStream* ast, AVFrame* aframe, std::vector<float>& fifo, int64_t& audioPts,
                           bool final) -> bool {
-        const size_t nc = size_t(nch);
+        const size_t nc = size_t(actx->ch_layout.nb_channels);
         while (fifo.size() >= size_t(audioFrameSize) * nc || (final && !fifo.empty())) {
             int n = std::min<int>(audioFrameSize, int(fifo.size() / nc));
             av_frame_unref(aframe);
@@ -1269,8 +1348,19 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
                     limiter->process(mixBuf.data(), mixBuf.data(), n);
                 }
                 audioCursor = target;
-                fifo.insert(fifo.end(), mixBuf.begin(), mixBuf.end());
-                if (!encodeAudio(false)) return fail("Audio encoding failed");
+                if (monos.empty()) {
+                    fifo.insert(fifo.end(), mixBuf.begin(), mixBuf.end());
+                    if (!encodeAudio(false)) return fail("Audio encoding failed");
+                } else {
+                    // The mix's channels to their tracks; the tracks after every stream's get silence.
+                    const size_t used = size_t(nch) * (1 + extras.size());
+                    for (size_t k = 0; k < monos.size(); ++k) {
+                        std::vector<float>& q = monos[k]->fifo;
+                        if (k < size_t(nch))
+                            for (int i = 0; i < n; ++i) q.push_back(mixBuf[size_t(i) * size_t(nch) + k]);
+                        else if (k >= used) q.insert(q.end(), size_t(n), 0.0f);
+                    }
+                }
             }
             // The other streams, sample for sample with the mix (not normalised: stems keep their levels).
             for (auto& e : extras) {
@@ -1282,18 +1372,34 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
                 if (nch > 2) e->mixer.mixLayout(p, e->seq, e->cursor, m, mixBuf.data());
                 else e->mixer.mix(p, e->seq, e->cursor, m, mixBuf.data());
                 e->cursor = until;
+                if (!e->ctx) {
+                    const size_t first = size_t(nch) * size_t(1 + (&e - extras.data()));
+                    for (size_t c = 0; c < size_t(nch); ++c)
+                        for (int i = 0; i < m; ++i) monos[first + c]->fifo.push_back(mixBuf[size_t(i) * size_t(nch) + c]);
+                    continue;
+                }
                 e->fifo.insert(e->fifo.end(), mixBuf.begin(), mixBuf.end());
                 if (!encodeFifo(e->ctx, e->st, e->frame, e->fifo, e->pts, false)) return fail("Audio encoding failed");
             }
+            for (auto& mo : monos)
+                if (!encodeFifo(mo->ctx, mo->st, mo->frame, mo->fifo, mo->pts, false)) return fail("Audio encoding failed");
         }
         if (progress && ((f - in) % 5 == 0 || f + 1 == out)) progress(double(f - in + 1) / double(total), f);
     }
     // Flush the encoders; errors here (e.g. a full disk) must fail the export.
     if (wantAudio) {
-        if (!encodeAudio(true)) return fail("Audio encoding failed");
-        if ((rc = avcodec_send_frame(o.actx, nullptr)) < 0 || (rc = drain(o, o.actx, o.ast)) < 0)
-            return fail("Finishing audio failed: " + averr(rc));
+        if (o.actx) {
+            if (!encodeAudio(true)) return fail("Audio encoding failed");
+            if ((rc = avcodec_send_frame(o.actx, nullptr)) < 0 || (rc = drain(o, o.actx, o.ast)) < 0)
+                return fail("Finishing audio failed: " + averr(rc));
+        }
+        for (auto& mo : monos) {
+            if (!encodeFifo(mo->ctx, mo->st, mo->frame, mo->fifo, mo->pts, true)) return fail("Audio encoding failed");
+            if ((rc = avcodec_send_frame(mo->ctx, nullptr)) < 0 || (rc = drain(o, mo->ctx, mo->st)) < 0)
+                return fail("Finishing audio failed: " + averr(rc));
+        }
         for (auto& e : extras) {
+            if (!e->ctx) continue;
             if (!encodeFifo(e->ctx, e->st, e->frame, e->fifo, e->pts, true)) return fail("Audio encoding failed");
             if ((rc = avcodec_send_frame(e->ctx, nullptr)) < 0 || (rc = drain(o, e->ctx, e->st)) < 0)
                 return fail("Finishing audio failed: " + averr(rc));

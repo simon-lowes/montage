@@ -3962,7 +3962,8 @@ void McpServer::Impl::addTools() {
 
     add("montage_render", "Render",
         "Render the active sequence (or its in-out range) to a file with an export preset (default \"H.264 - High Quality\"), "
-        "optionally normalising the mix's loudness for where it is going.",
+        "optionally normalising the mix's loudness for where it is going. Broadcast deliveries: the XDCAM HD422, AVC-Intra 100 "
+        "and DNxHR MXF presets write MXF OP1a with each sound channel a mono track; start_timecode sets the file's timecode.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"output":{"type":"string"},
             "preset":{"type":"string"},"in":{"type":["number","string"]},"out":{"type":["number","string"]},
             "loudness_lufs":{"type":"number","description":"Normalise the mix to this loudness, e.g. -14 (streaming) or -23 (EBU R128)"},
@@ -3982,7 +3983,9 @@ void McpServer::Impl::addTools() {
             "audio_streams":{"description":"More audio streams after the mix (a master's M&E, dialogue, dubs): \"roles\" (one per role), \"tracks\" (one per track), or a list of {name, language, tracks:[\"A2\",...], role}",
                 "anyOf":[{"type":"string","enum":["mix","roles","tracks"]},{"type":"array","items":{"type":"object","properties":{
                     "name":{"type":"string"},"language":{"type":"string"},"tracks":{"type":"array","items":{"type":"string"}},"role":{"type":"string"}}}}]},
-            "audio_name":{"type":"string","description":"The mix stream's title"},"audio_language":{"type":"string","description":"The mix stream's language (ISO 639-1)"}},
+            "audio_name":{"type":"string","description":"The mix stream's title"},"audio_language":{"type":"string","description":"The mix stream's language (ISO 639-1)"},
+            "start_timecode":{"type":"string","description":"The file's starting timecode (MXF and MOV), e.g. 10:00:00:00 as broadcasters ask"},
+            "mono_tracks":{"type":"integer","description":"Write the mix (then each audio stream) as mono tracks, padded with silence to this many, as broadcast MXF takes it; the MXF presets set 8, 4 or 2"}},
             "required":["project","output"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
@@ -3991,6 +3994,16 @@ void McpServer::Impl::addTools() {
             if (!pr) throw ArgError{"Unknown preset (see montage_list_presets)"};
             ExportSettings st = pr->settings;
             st.path = absolute(need(a, "output")).toStdString();
+            if (a.contains("start_timecode")) {
+                FrameTime t = 0;
+                const std::string tc = str(a, "start_timecode").toStdString();
+                if (!parseTimecode(tc, s.fps, t) || t < 0) throw ArgError{"\"start_timecode\" is a timecode like 10:00:00:00"};
+                st.startTimecode = formatTimecode(t, s.fps);
+            }
+            if (a.contains("mono_tracks")) {
+                st.monoAudioTracks = a.value("mono_tracks").toInt();
+                if (st.monoAudioTracks < 0 || st.monoAudioTracks > 64) throw ArgError{"\"mono_tracks\" is 0 to 64"};
+            }
             if (a.contains("in")) st.in = timeArg(a.value("in"), s, "in");
             if (a.contains("out")) st.out = timeArg(a.value("out"), s, "out");
             if (a.value("loudness_lufs").isDouble()) {

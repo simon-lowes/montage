@@ -5028,6 +5028,38 @@ const auto seq = [this] { return state()->sequence(); };
         state()->newProject();
     }
 
+    void broadcastMxfExport() {
+        loadDemo();
+        RenderQueue* queue = win_->renderQueue();
+        const size_t jobs = queue->jobs().size();
+        int xdcam = -1, mp4 = -1;
+        for (size_t i = 0; i < exportPresets().size(); ++i) {
+            if (exportPresets()[i].name == "XDCAM HD422 (MXF)") xdcam = int(i);
+            if (mp4 < 0 && exportPresets()[i].extension == "mp4") mp4 = int(i);
+        }
+        QVERIFY(xdcam >= 0 && mp4 >= 0);
+        ExportDialog ed(state(), win_.get());
+        ed.setQueue(queue);
+        auto* preset = ed.findChild<QComboBox*>("exportPreset");
+        auto* tc = ed.findChild<QLineEdit*>("exportStartTimecode");
+        QVERIFY(tc);
+        preset->setCurrentIndex(mp4);
+        QVERIFY(!tc->isEnabled());  // MP4 keeps no timecode
+        preset->setCurrentIndex(xdcam);
+        QVERIFY(tc->isEnabled());
+        tc->setText("10:00:00:00");
+        ed.findChild<QLineEdit*>("exportPath")->setText(dir_.path() + "/delivery.mxf");
+        ed.findChild<QPushButton*>("addToQueue")->click();
+        QCOMPARE(ed.result(), int(QDialog::Accepted));
+        QCOMPARE(queue->jobs().size(), jobs + 1);
+        const RenderQueue::Job& job = queue->jobs().back();
+        QCOMPARE(job.settings.videoCodec, std::string("mpeg2video"));
+        QCOMPARE(job.settings.monoAudioTracks, 8);
+        QCOMPARE(job.settings.startTimecode, formatTimecode(FrameTime(std::llround(36000 * state()->sequence()->fpsValue())), state()->sequence()->fps));
+        QCOMPARE(job.settings.width, 1920);
+        queue->remove(job.id);
+    }
+
     void renderQueueInTheBackground() {
         loadDemo();
         RenderQueue* queue = win_->renderQueue();

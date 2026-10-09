@@ -1577,6 +1577,134 @@ private slots:
         QVERIFY(level(musik, 880) > 20 * level(musik, 440));
     }
 
+    void broadcastMxf() {
+        // Dialogue (440 Hz) on A1 and music (880 Hz) on A2 under two seconds of picture.
+        constexpr int sr = 48000;
+        auto tone = [&](const char* name, double hz) {
+            std::vector<float> mono(size_t(sr) * 2);
+            for (size_t i = 0; i < mono.size(); ++i) mono[i] = float(0.3 * std::sin(2 * M_PI * hz * double(i) / sr));
+            const std::string f = path(name);
+            writeMonoWav(f, mono, sr);
+            return f;
+        };
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320;
+        s.height = 180;
+        s.fps = Rational{25, 1};
+        while (s.audioTracks.size() < 2) edit::addTrack(p, s, TrackKind::Audio);
+        edit::overwrite(p, s, {TrackKind::Video, 0}, makeGeneratorClip(p, "color", 50));
+        MediaItem voice = probeOrFail(p, tone("mxf-voice.wav", 440)), music = probeOrFail(p, tone("mxf-music.wav", 880));
+        p.media.push_back(voice);
+        p.media.push_back(music);
+        Clip a = makeClip(p, voice, TrackKind::Audio, s);
+        a.role = "Dialogue";
+        edit::overwrite(p, s, {TrackKind::Audio, 0}, a);
+        Clip b = makeClip(p, music, TrackKind::Audio, s);
+        b.role = "Music";
+        edit::overwrite(p, s, {TrackKind::Audio, 1}, b);
+        auto probe = [](const std::string& file, std::vector<std::string>& streams, std::string& timecode, double& seconds) {
+            AVFormatContext* fmt = nullptr;
+            if (avformat_open_input(&fmt, file.c_str(), nullptr, nullptr) < 0) return false;
+            avformat_find_stream_info(fmt, nullptr);
+            streams.clear();
+            for (unsigned i = 0; i < fmt->nb_streams; ++i) {
+                const AVCodecParameters* cp = fmt->streams[i]->codecpar;
+                std::string d = avcodec_get_name(cp->codec_id);
+                if (cp->codec_type == AVMEDIA_TYPE_VIDEO) {
+                    const char* prof = avcodec_profile_name(cp->codec_id, cp->profile);
+                    d += QStringLiteral(" %1x%2 %3 %4").arg(cp->width).arg(cp->height).arg(av_get_pix_fmt_name(AVPixelFormat(cp->format))).arg(prof ? prof : "").toStdString();
+                } else if (cp->codec_type == AVMEDIA_TYPE_AUDIO) {
+                    d += QStringLiteral(" %1ch %2").arg(cp->ch_layout.nb_channels).arg(cp->sample_rate).toStdString();
+                }
+                streams.push_back(d);
+            }
+            const AVDictionaryEntry* e = av_dict_get(fmt->metadata, "timecode", nullptr, 0);
+            timecode = e ? e->value : "";
+            seconds = fmt->duration > 0 ? double(fmt->duration) / AV_TIME_BASE : 0;
+            avformat_close_input(&fmt);
+            return true;
+        };
+        auto level = [](const std::vector<float>& v, double hz) { return toneLevel(v, 0, hz, 4800, 48000); };
+        auto silent = [](const std::vector<float>& v) {
+            return !v.empty() && std::all_of(v.begin(), v.end(), [](float x) { return std::fabs(x) < 1e-6f; });
+        };
+
+        // XDCAM HD422 with the roles as stems: mix L/R, Dialogue L/R, Music L/R, then two silent tracks, from 10:00:00:00.
+        const ExportPreset* xd = findExportPreset("XDCAM HD422 (MXF)");
+        QVERIFY(xd);
+        ExportSettings st = xd->settings;
+        st.path = path("delivery.mxf");
+        st.extraAudio = stemStreams(s, StemsByRole);
+        st.startTimecode = "10:00:00:00";
+        st.out = 500;  // past the end: only the cut is rendered
+        std::string err;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        std::vector<std::string> streams;
+        std::string timecode;
+        double seconds = 0;
+        QVERIFY(probe(st.path, streams, timecode, seconds));
+        QCOMPARE(streams.size(), size_t(9));
+        QCOMPARE(QString::fromStdString(streams[0]), QStringLiteral("mpeg2video 1920x1080 yuv422p 4:2:2"));
+        for (size_t i = 1; i < 9; ++i) QCOMPARE(streams[i], std::string("pcm_s24le 1ch 48000"));
+        QCOMPARE(timecode, std::string("10:00:00:00"));
+        QVERIFY2(std::fabs(seconds - 2.0) < 0.05, qPrintable(QString::number(seconds)));
+        const auto mixL = decodeAudioStream(st.path, 0), mixR = decodeAudioStream(st.path, 1);
+        QVERIFY(level(mixL, 440) > 0.05 && level(mixL, 880) > 0.05 && level(mixR, 440) > 0.05);
+        const auto dialogue = decodeAudioStream(st.path, 2), score = decodeAudioStream(st.path, 5);
+        QVERIFY(level(dialogue, 440) > 20 * level(dialogue, 880));
+        QVERIFY(level(score, 880) > 20 * level(score, 440));
+        QVERIFY(silent(decodeAudioStream(st.path, 6)) && silent(decodeAudioStream(st.path, 7)));
+        // Two seconds of sound on every track, the silent ones too.
+        for (int i : {0, 7}) QVERIFY(std::abs(int(decodeAudioStream(st.path, i).size()) - 2 * 2 * 48000) <= 2 * 1024);
+
+        // AVC-Intra 100: the mix alone, padded to four tracks.
+        const ExportPreset* avci = findExportPreset("AVC-Intra 100 (MXF)");
+        QVERIFY(avci);
+        st = avci->settings;
+        st.path = path("delivery-avci.mxf");
+        st.out = 25;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        QVERIFY(probe(st.path, streams, timecode, seconds));
+        QCOMPARE(streams.size(), size_t(5));
+        QVERIFY2(QString::fromStdString(streams[0]).startsWith("h264 1920x1080 yuv422p10le High 4:2:2 Intra"), streams[0].c_str());
+        QVERIFY(level(decodeAudioStream(st.path, 1), 440) > 0.05);
+        QVERIFY(silent(decodeAudioStream(st.path, 2)) && silent(decodeAudioStream(st.path, 3)));
+
+        // DNxHR in MXF keeps the sequence's size, a mono track a channel.
+        const ExportPreset* dnx = findExportPreset("Avid DNxHR HQ (MXF)");
+        QVERIFY(dnx);
+        st = dnx->settings;
+        st.path = path("delivery-dnx.mxf");
+        st.out = 10;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        QVERIFY(probe(st.path, streams, timecode, seconds));
+        QCOMPARE(streams.size(), size_t(3));
+        QVERIFY2(QString::fromStdString(streams[0]).startsWith("dnxhd 320x180"), streams[0].c_str());
+
+        // Over MCP: a start timecode, and a bad one refused.
+        const QString project = QString::fromStdString(path("mxf.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_render"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object();
+        };
+        const QString mcpOut = QString::fromStdString(path("mcp.mxf"));
+        QJsonObject r = call({{"project", project}, {"output", mcpOut}, {"preset", "Avid DNxHR HQ (MXF)"}, {"out", "00:00:00:10"},
+                              {"start_timecode", "01:00:00:00"}, {"mono_tracks", 4}});
+        QVERIFY2(!r.value("result").toObject().value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(probe(mcpOut.toStdString(), streams, timecode, seconds));
+        QCOMPARE(timecode, std::string("01:00:00:00"));
+        QCOMPARE(streams.size(), size_t(5));
+        r = call({{"project", project}, {"output", mcpOut}, {"preset", "Avid DNxHR HQ (MXF)"}, {"start_timecode", "ten o'clock"}});
+        QVERIFY(r.contains("error") || r.value("result").toObject().value("isError").toBool());
+    }
+
     void audioChannelMapping() {
         constexpr int sr = 48000;
         // A field recorder's four-channel WAV: 200, 300, 400 and 500 Hz on channels 1-4, the first two named in bext.
