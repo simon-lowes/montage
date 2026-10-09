@@ -767,14 +767,25 @@ void McpServer::Impl::addTools() {
         });
 
     add("montage_trim_clip", "Trim a clip",
-        "Move a clip's in or out point by a number of seconds (positive: later). Ripple moves later clips with it.",
+        "Move a clip's in or out point by a number of seconds (positive: later). Ripple moves later clips with it. "
+        "With `extend_to` (a timeline time) instead, Extend Edit: the clip's edge nearest it moves there, rolling with "
+        "the clip that meets it or trimming into a gap.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
             "edge":{"type":"string","enum":["in","out"]},"by":{"type":"number","description":"Seconds"},
-            "ripple":{"type":"boolean","default":false}},"required":["project","clip","edge","by"]})json",
+            "ripple":{"type":"boolean","default":false},
+            "extend_to":{"type":["number","string"],"description":"Seconds or timecode on the timeline"}},"required":["project","clip"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
             const Id id = clipArg(l, a).id;
+            if (a.contains("extend_to")) {
+                const auto r = edit::extendEdit(l.project, s, id, timeArg(a.value("extend_to"), s, "extend_to"));
+                if (!r.ok) return fail(r.error.empty() ? QStringLiteral("The edge is already there") : QString::fromStdString(r.error));
+                save(l);
+                const Clip* c = edit::clipById(s, id);
+                return ok(QStringLiteral("Extended by %1 frame(s)").arg(r.applied), c ? clipJson(l.project, s, *c) : QJsonObject{});
+            }
+            if (!a.contains("edge") || !a.contains("by")) throw ArgError{"Give edge and by, or extend_to"};
             const FrameTime by = FrameTime(std::llround(a.value("by").toDouble() * s.fpsValue()));
             const auto r = edit::trim(l.project, s, id, str(a, "edge") == "in" ? edit::Edge::In : edit::Edge::Out, by,
                                       a.value("ripple").toBool() ? edit::TrimMode::Ripple : edit::TrimMode::Normal);

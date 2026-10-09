@@ -123,6 +123,9 @@ public:
     bool selectNearestEdit();
     void cycleTrimSide();
     bool trimSelectedEdit(FrameTime delta);
+    // Extend Edit (E): the selected edit (Trim mode), else the selected clips' nearest edges, else the edit nearest
+    // the playhead on the target video track, moved to the playhead; one undo step.
+    bool extendEdit();
     void endTrimMode();
     const std::optional<TrimEdit>& trimEdit() const { return trimEdit_; }
     // Auditions (Final Cut's auditions, Resolve's take selector): the bin's selected media (else the Source monitor's,

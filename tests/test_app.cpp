@@ -2459,6 +2459,42 @@ private slots:
         state()->setSelection({}, false);
     }
 
+    void extendEditAction() {
+        loadDemo();
+        QAction* extend = win_->findChild<QAction*>("extendEdit");
+        QVERIFY(extend);
+        QCOMPARE(extend->shortcut(), QKeySequence("E"));
+        auto red = [&] { return clipNamed(*state()->sequence(), "Red"); };
+        auto blue = [&] { return clipNamed(*state()->sequence(), "Blue"); };
+        // A selected clip: Blue's head, nearest the playhead, rolls on to it (the mattes start at their first frame,
+        // so they have nothing before it to roll back into).
+        state()->setSelection({blue()->id}, false);
+        state()->setPlayhead(70);
+        extend->trigger();
+        QCOMPARE(red()->end(), FrameTime(70));
+        QCOMPARE(blue()->start, FrameTime(70));
+        state()->undo();
+        QCOMPARE(blue()->start, FrameTime(60));
+        state()->setPlayhead(50);
+        extend->trigger();  // back is refused
+        QCOMPARE(blue()->start, FrameTime(60));
+        // Nothing selected: the edit nearest the playhead on the target track.
+        state()->setSelection({}, false);
+        state()->setPlayhead(68);
+        extend->trigger();
+        QCOMPARE(red()->end(), FrameTime(68));
+        state()->undo();
+        // Trim mode: the selected edit to the playhead.
+        state()->setPlayhead(55);
+        QVERIFY(win_->selectNearestEdit());
+        state()->setPlayhead(70);
+        extend->trigger();
+        QCOMPARE(red()->end(), FrameTime(70));
+        QCOMPARE(blue()->start, FrameTime(70));
+        win_->endTrimMode();
+        state()->undo();
+    }
+
     void transitionsToSelection() {
         loadDemo();
         const Id red = clipNamed(*state()->sequence(), "Red")->id, blue = clipNamed(*state()->sequence(), "Blue")->id;

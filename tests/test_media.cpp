@@ -1904,6 +1904,18 @@ private slots:
         QVERIFY(loadProject(project.toStdString(), after));
         QCOMPARE(after.active()->videoTracks[0].transitions.size(), size_t(3));
         QCOMPARE(after.active()->videoTracks[0].transitions[0].type, std::string("wipe"));
+        // Extend Edit over MCP: the cut between them rolled to 2 s (frame 60 at 30 fps).
+        const QJsonObject ext{{"jsonrpc", "2.0"}, {"id", 2}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_trim_clip"},
+                                                     {"arguments", QJsonObject{{"project", project}, {"clip", double(a.id)}, {"extend_to", 2.0}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto extLines = server.handle(QJsonDocument(ext).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject er = QJsonDocument::fromJson(QByteArray::fromStdString(extLines.back())).object().value("result").toObject();
+        QVERIFY2(!er.value("isError").toBool(), QJsonDocument(er).toJson().constData());
+        QVERIFY(loadProject(project.toStdString(), after));
+        QCOMPARE(after.active()->videoTracks[0].clips[0].end(), FrameTime(60));
+        QCOMPARE(after.active()->videoTracks[0].clips[1].start, FrameTime(60));
     }
 
     void reframe360() {

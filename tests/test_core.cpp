@@ -1457,6 +1457,36 @@ private slots:
         QCOMPARE(QString::fromStdString(transitionById(fx.s(), af.created[0])->type), QString("crossfade"));
     }
 
+    void extendEditToThePlayhead() {
+        Fixture fx;
+        // A | B butted, C after a gap; every clip starts 30 frames into its media.
+        const Id a = fx.put(V1, 0, 60, 30), b = fx.put(V1, 60, 60, 30), c = fx.put(V1, 200, 60, 30);
+        // Past A's end, where B meets it: the edit rolls.
+        QVERIFY(extendEdit(fx.p, fx.s(), a, 80).ok);
+        QCOMPARE(clipById(fx.s(), a)->end(), FrameTime(80));
+        QCOMPARE(clipById(fx.s(), b)->start, FrameTime(80));
+        QCOMPARE(clipById(fx.s(), b)->sourceIn, 50.0);
+        // Past B's end, into the gap: B's tail is trimmed out.
+        QVERIFY(extendEdit(fx.p, fx.s(), b, 150).ok);
+        QCOMPARE(clipById(fx.s(), b)->end(), FrameTime(150));
+        QCOMPARE(clipById(fx.s(), c)->start, FrameTime(200));
+        // Before C's start: its head comes back, as far as its media goes (30 frames).
+        auto r = extendEdit(fx.p, fx.s(), c, 160);
+        QVERIFY(r.ok);
+        QCOMPARE(clipById(fx.s(), c)->start, FrameTime(170));
+        QCOMPARE(r.applied, FrameTime(-30));
+        QCOMPARE(clipById(fx.s(), c)->sourceIn, 0.0);
+        QVERIFY(!extendEdit(fx.p, fx.s(), c, 150).ok);  // no more media before it
+        // Inside B near its head: the A|B edit rolls back to it.
+        QVERIFY(extendEdit(fx.p, fx.s(), b, 100).ok);
+        QCOMPARE(clipById(fx.s(), a)->end(), FrameTime(100));
+        QCOMPARE(clipById(fx.s(), b)->start, FrameTime(100));
+        // Already there, or a locked track: nothing.
+        QVERIFY(!extendEdit(fx.p, fx.s(), b, 100).ok);
+        fx.v1().locked = true;
+        QVERIFY(!extendEdit(fx.p, fx.s(), b, 120).ok);
+    }
+
     void transitionsOnSelectedClips() {
         Fixture fx;
         // A | B | C butted together, D after a gap, and a sound clip under A.

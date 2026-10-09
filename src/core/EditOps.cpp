@@ -799,6 +799,28 @@ Result trim(Project& p, Sequence& s, Id clipId, Edge edge, FrameTime delta, Trim
     return res;
 }
 
+Result extendEdit(Project& p, Sequence& s, Id clip, FrameTime target) {
+    const auto loc = locate(s, clip);
+    if (!loc) return Result::fail("Unknown clip");
+    const Track* t = trackAt(s, loc->track);
+    if (t->locked) return Result::fail("Track is locked");
+    const Clip c = t->clips[loc->index];
+    Edge edge = std::llabs(target - c.start) <= std::llabs(target - c.end()) ? Edge::In : Edge::Out;
+    if (target < c.start) edge = Edge::In;
+    if (target > c.end()) edge = Edge::Out;
+    const FrameTime delta = target - (edge == Edge::In ? c.start : c.end());
+    if (delta == 0) return Result::fail("");
+    if (edge == Edge::In ? target >= c.end() : target <= c.start) return Result::fail("That would leave nothing of the clip");
+    // The clip meeting that edge, if any: then the edit rolls.
+    const Clip* other = nullptr;
+    if (edge == Edge::Out && loc->index + 1 < t->clips.size() && t->clips[loc->index + 1].start == c.end()) other = &t->clips[loc->index + 1];
+    if (edge == Edge::In && loc->index > 0 && t->clips[loc->index - 1].end() == c.start) other = &t->clips[loc->index - 1];
+    Result r = other ? roll(p, s, edge == Edge::Out ? c.id : other->id, edge == Edge::Out ? other->id : c.id, delta)
+                     : trim(p, s, c.id, edge, delta, TrimMode::Normal);
+    if (r.ok && r.applied == 0 && delta != 0) return Result::fail("The media ends before there");
+    return r;
+}
+
 Result roll(Project& p, Sequence& s, Id leftClip, Id rightClip, FrameTime delta) {
     auto la = locate(s, leftClip);
     auto lb = locate(s, rightClip);

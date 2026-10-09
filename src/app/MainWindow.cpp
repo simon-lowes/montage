@@ -1127,6 +1127,7 @@ void MainWindow::buildMenus() {
     seqM->addSeparator();
     add(seqM, tr("Select Nearest Edit (Trim Mode)"), QKeySequence("Shift+T"), [this] { selectNearestEdit(); })->setObjectName(QStringLiteral("selectEdit"));
     add(seqM, tr("Cycle Trim Side"), QKeySequence("Alt+T"), [this] { cycleTrimSide(); })->setObjectName(QStringLiteral("cycleTrimSide"));
+    add(seqM, tr("Extend Edit"), QKeySequence("E"), [this] { extendEdit(); })->setObjectName(QStringLiteral("extendEdit"));
     add(seqM, tr("Trim Backward"), QKeySequence("Ctrl+Left"), [this] { trimSelectedEdit(-1); })->setObjectName(QStringLiteral("trimBackward"));
     add(seqM, tr("Trim Forward"), QKeySequence("Ctrl+Right"), [this] { trimSelectedEdit(1); })->setObjectName(QStringLiteral("trimForward"));
     add(seqM, tr("Trim Backward Five Frames"), QKeySequence("Ctrl+Shift+Left"), [this] { trimSelectedEdit(-5); })
@@ -2314,6 +2315,46 @@ bool MainWindow::trimSelectedEdit(FrameTime delta) {
     });
     showTrimEdit();
     return ok;
+}
+
+bool MainWindow::extendEdit() {
+    const Sequence* s = state_->sequence();
+    if (!s) return false;
+    const FrameTime target = state_->playhead();
+    // In Trim mode: the selected edit, on its side, to the playhead.
+    if (trimEdit_) {
+        const Clip* out = trimEdit_->outgoing ? edit::clipById(*s, trimEdit_->outgoing) : nullptr;
+        const Clip* in = trimEdit_->incoming ? edit::clipById(*s, trimEdit_->incoming) : nullptr;
+        if (!out && !in) return false;
+        const FrameTime cut = trimEdit_->side == 2 && in ? in->start : out ? out->end() : in->start;
+        return target != cut && trimSelectedEdit(target - cut);
+    }
+    // Else each selected clip's nearest edge, or the clip edge nearest the playhead on the target video track.
+    std::vector<Id> clips = state_->selectedClips();
+    if (clips.empty()) {
+        if (const Track* t = trackAt(*s, {TrackKind::Video, state_->targetVideoTrack()})) {
+            FrameTime best = std::numeric_limits<FrameTime>::max();
+            Id nearest = 0;
+            for (const Clip& c : t->clips)
+                for (FrameTime e : {c.start, c.end()})
+                    if (std::llabs(e - target) < best) best = std::llabs(e - target), nearest = c.id;
+            if (nearest) clips.push_back(nearest);
+        }
+    }
+    if (clips.empty()) {
+        state_->message(tr("Select a clip or an edit to extend to the playhead"));
+        return false;
+    }
+    return state_->apply(tr("Extend Edit"), [clips, target](Project& p, Sequence& sq) {
+        edit::Result last = edit::Result::fail(""), all;
+        bool any = false;
+        for (Id id : clips) {
+            const edit::Result r = edit::extendEdit(p, sq, id, target);
+            if (r.ok) any = true;
+            else if (!r.error.empty()) last = r;
+        }
+        return any ? all : last;
+    });
 }
 
 void MainWindow::endTrimMode() {

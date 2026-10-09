@@ -108,6 +108,10 @@ Result moveClips(Project& p, Sequence& s, const std::vector<Id>& ids, FrameTime 
                  int audioTrackDelta, bool insertMode = false);
 Result trim(Project& p, Sequence& s, Id clipId, Edge edge, FrameTime delta, TrimMode mode, bool includeLinked = true);
 Result roll(Project& p, Sequence& s, Id leftClip, Id rightClip, FrameTime delta);
+// Extend Edit (Premiere's and Resolve's E, Final Cut's Extend Edit, Avid's Extend): the clip's edge nearest `target`
+// (the one on that side when `target` is beyond it) moved to `target`: rolled with the clip that meets it there,
+// else trimmed into the gap or back. Linked clips follow; `applied` says how far it went (media can end sooner).
+Result extendEdit(Project& p, Sequence& s, Id clip, FrameTime target);
 Result slip(Project& p, Sequence& s, Id clipId, FrameTime delta);
 Result slide(Project& p, Sequence& s, Id clipId, FrameTime delta);
 Result setSpeed(Project& p, Sequence& s, Id clipId, double speed, bool ripple, bool reverse = false,
