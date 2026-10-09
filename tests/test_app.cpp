@@ -2580,6 +2580,7 @@ private slots:
         QCOMPARE(text(), std::string("Welcome to Montaj, said John Smith."));
         panel->setMode(TranscriptPanel::Mode::Sequence);
         QCOMPARE(viewport()->width(), timelineWidth);  // switching modes never widens the panel over the timeline
+        QVERIFY2(panel->minimumSizeHint().width() < 320, qPrintable(QString::number(panel->minimumSizeHint().width())));  // buttons wrap
     }
 
     void makeShortsFromTheMenu() {
@@ -5092,9 +5093,9 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(state()->selectedTransition(), id);
         state()->undo();
         QCOMPARE(length(), FrameTime(20));
-        // The start edge works the same way, from the other side.
-        drag(pointFor(50, V1), pointFor(55, V1));
-        QVERIFY2(std::llabs(length() - 10) <= 2, qPrintable(QString::number(length())));
+        // The start edge works the same way, from the other side (as far, so the drag clears the drag distance at any zoom).
+        drag(pointFor(50, V1), pointFor(40, V1));
+        QVERIFY2(std::llabs(length() - 40) <= 2, qPrintable(QString::number(length())));
         state()->undo();
     }
 

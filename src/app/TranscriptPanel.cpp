@@ -1,4 +1,5 @@
 #include "TranscriptPanel.h"
+#include "FlowLayout.h"
 #include "Settings.h"
 
 #include <QComboBox>
@@ -83,7 +84,8 @@ TranscriptPanel::TranscriptPanel(EditorState* state, QWidget* parent) : QWidget(
     text_->viewport()->setCursor(Qt::IBeamCursor);
     lay->addWidget(text_, 1);
 
-    auto* bottom = new QHBoxLayout;
+    // The buttons wrap onto more rows when the panel is docked narrow.
+    auto* bottom = new FlowLayout;
     deleteBtn_ = button(this, tr("Delete"), tr("Cut the selected words out of the sequence and close the gap (Delete)"));
     fillersBtn_ = button(this, tr("Remove Fillers"), tr("Cut out um, uh, er and similar filler words, in the transcript's language"));
     fillersBtn_->setObjectName(QStringLiteral("removeFillers"));
@@ -211,7 +213,6 @@ TranscriptPanel::TranscriptPanel(EditorState* state, QWidget* parent) : QWidget(
     paperBuildBtn_->setObjectName(QStringLiteral("paperAssemble"));
     for (QToolButton* b : {deleteBtn_, fillersBtn_, retakesBtn_, pausesBtn_, bleepBtn_, correctBtn_, insertBtn_, overwriteBtn_, paperAddBtn_, paperBuildBtn_})
         bottom->addWidget(b);
-    bottom->addStretch();
     bottom->addWidget(smoothBtn_);
     lay->addLayout(bottom);
     // The Paper Edit: lines in order, dragged to reorder, Delete to remove.
