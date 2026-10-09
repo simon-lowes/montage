@@ -29,6 +29,7 @@
 #include "render/ReviewExport.h"
 #include "render/RoomTone.h"
 #include "render/Versions.h"
+#include "render/Dcp.h"
 #include "render/LightLevel.h"
 #include "render/Spherical.h"
 #include "render/ClipPlacement.h"
@@ -4375,6 +4376,69 @@ void McpServer::Impl::addTools() {
                           .arg(QString::fromStdString(pkg.videoPath), QString::fromStdString(pkg.pagePath)),
                       QJsonObject{{"video", QString::fromStdString(pkg.videoPath)}, {"page", QString::fromStdString(pkg.pagePath)},
                                   {"width", pkg.page.width}, {"height", pkg.page.height}, {"frames", double(pkg.page.frames)}});
+        });
+
+    add("montage_export_dcp", "Export a DCP",
+        "Make a Digital Cinema Package of the active sequence for cinemas and festivals: SMPTE (Bv2.1), 2K JPEG 2000 "
+        "pictures in DCI X'Y'Z' in the Flat, Scope or full container (the frame fitted on black), 24-bit 48 kHz sound in "
+        "5.1 (7.1 DS from a 7.1 sequence; a stereo mix on left and right), a composition playlist, packing list with "
+        "hashes and asset map, in a folder under `folder` named by the Digital Cinema Naming Convention. 23.976 plays at "
+        "24. The package is checked when done (as montage_verify_dcp); returns its name, folder and anything the check found.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"folder":{"type":"string","description":"Where to make the DCP folder"},
+            "title":{"type":"string"},"kind":{"type":"string","enum":["feature","short","trailer","teaser","advertisement","test","rating","psa"],"default":"feature"},
+            "container":{"type":"string","enum":["flat","scope","full"],"description":"Default: Scope for sequences 2:1 or wider, else Flat"},
+            "fps":{"type":"integer","enum":[24,25,30,48],"description":"Default: the sequence's, to the nearest"},
+            "language":{"type":"string","default":"en"},"territory":{"type":"string","default":"XX"},
+            "issuer":{"type":"string"},"studio":{"type":"string"},"facility":{"type":"string"},
+            "in_out":{"type":"boolean","default":false,"description":"Only In to Out"}},"required":["project","folder"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            const Sequence& s = l.seq();
+            if (s.duration() == 0) return fail("The sequence is empty");
+            DcpSettings st;
+            st.title = str(a, "title", QFileInfo(need(a, "project")).completeBaseName()).toStdString();
+            st.kind = str(a, "kind", "feature").toStdString();
+            st.container = str(a, "container", QString::fromStdString(defaultDcpContainer(s))).toStdString();
+            st.fps = a.value("fps").toInt(0);
+            st.language = str(a, "language", "en").toStdString();
+            st.territory = str(a, "territory", "XX").toStdString();
+            st.issuer = str(a, "issuer", "Montage").toStdString();
+            st.studio = str(a, "studio").toStdString();
+            st.facility = str(a, "facility").toStdString();
+            st.inOut = a.value("in_out").toBool();
+            int cw = 0, ch = 0;
+            if (!dcpContainer(st.container, cw, ch)) throw ArgError{"container is flat, scope or full"};
+            const QString folder = absolute(need(a, "folder"));
+            QDir().mkpath(folder);
+            DcpResult r;
+            std::string err;
+            if (!exportDcp(l.project, s, st, folder.toStdString(), &r, [this](double f) {
+                    progress(f, "Making the DCP");
+                    return true;
+                }, &err))
+                return fail(QString::fromStdString(err));
+            QJsonArray found;
+            for (const std::string& i : verifyDcp(r.folder)) found.append(QString::fromStdString(i));
+            const QJsonObject out{{"name", QString::fromStdString(r.name)}, {"folder", QString::fromStdString(r.folder)},
+                                  {"cpl", QString::fromStdString(r.cpl)}, {"frames", double(r.frames)}, {"fps", r.fps},
+                                  {"width", r.width}, {"height", r.height}, {"channels", r.channels},
+                                  {"dci_profile", r.cinemaProfile}, {"problems", found}};
+            return ok(found.isEmpty() ? QStringLiteral("Made %1 and checked it: no problems").arg(QString::fromStdString(r.name))
+                                      : QStringLiteral("Made %1; the check found %2 problem(s)").arg(QString::fromStdString(r.name)).arg(found.size()),
+                      out);
+        });
+
+    add("montage_verify_dcp", "Check a DCP",
+        "Check a Digital Cinema Package folder as a server or festival would: asset map and volume index, every file "
+        "present at its size, packing list hashes, each composition's assets and durations, picture track files readable "
+        "as JPEG 2000 X'Y'Z' at a DCI size with the right number of frames and within 250 Mbit/s, sound 24-bit 48 kHz. "
+        "Returns the problems found (none: it passed).",
+        R"json({"type":"object","properties":{"folder":{"type":"string"}},"required":["folder"]})json", true, [](const QJsonObject& a) {
+            const QString folder = absolute(need(a, "folder"));
+            QJsonArray found;
+            for (const std::string& i : verifyDcp(folder.toStdString())) found.append(QString::fromStdString(i));
+            return ok(found.isEmpty() ? QStringLiteral("The DCP checks out") : QStringLiteral("%1 problem(s): %2").arg(found.size()).arg(found.at(0).toString()),
+                      QJsonObject{{"problems", found}, {"ok", found.isEmpty()}});
         });
 
     add("montage_render", "Render",

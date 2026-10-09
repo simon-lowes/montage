@@ -21,6 +21,9 @@
 #include "core/MaskPath.h"
 #include "render/ColorSpace.h"
 #include "render/Compositor.h"
+#include "render/Dcp.h"
+#include "render/DcpMxf.h"
+#include "media/Decoder.h"
 #include "render/Exporter.h"
 #include "render/RoomTone.h"
 #include "render/Ocio.h"
@@ -3083,6 +3086,131 @@ colorspaces:
         // Cancelled: nothing.
         std::atomic<bool> cancel{true};
         QVERIFY(qualityCheck(p, s, 0, -1, q, {}, &cancel).empty());
+    }
+
+    void exportsDigitalCinemaPackage() {
+        QTemporaryDir dir;
+        // A second of a mid-grey matte (Rec.709, 16:9) with a 1 kHz tone, as a 2K Scope DCP.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64, s.height = 36, s.fps = Rational{24, 1};
+        s.videoTracks[0].clips.push_back(colorClip(p, 0.5f, 0.5f, 0.5f, 0, 24));
+        {
+            const QString wav = dir.filePath("tone.wav");
+            QFile f(wav);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            const int n = 48000;
+            QByteArray d;
+            auto u32 = [&](uint32_t v) { d.append(reinterpret_cast<const char*>(&v), 4); };
+            auto u16 = [&](uint16_t v) { d.append(reinterpret_cast<const char*>(&v), 2); };
+            d.append("RIFF");
+            u32(36 + n * 2);
+            d.append("WAVEfmt ");
+            u32(16), u16(1), u16(1), u32(48000), u32(96000), u16(2), u16(16);
+            d.append("data");
+            u32(n * 2);
+            for (int i = 0; i < n; ++i) u16(uint16_t(int16_t(std::lround(0.5 * 32767 * std::sin(2 * M_PI * 1000 * i / 48000.0)))));
+            f.write(d);
+            f.close();
+            MediaItem m;
+            m.id = p.newId();
+            QVERIFY(probeMedia(wav.toStdString(), m));
+            p.media.push_back(m);
+            Clip a = makeClip(p, m, TrackKind::Audio, s);
+            a.duration = 24;
+            s.audioTracks[0].clips.push_back(a);
+        }
+        DcpSettings st;
+        st.title = "Test film: a short";
+        st.kind = "short";
+        st.container = "scope";
+        st.threads = 2;
+        DcpResult r;
+        std::string err;
+        QVERIFY2(exportDcp(p, s, st, dir.path().toStdString(), &r, {}, &err), err.c_str());
+        QCOMPARE(r.frames, int64_t(24));
+        QVERIFY(r.fps == 24 && r.width == 2048 && r.height == 858 && r.channels == 6);
+        const QString name = QString::fromStdString(r.name);
+        QVERIFY2(name.startsWith("TestFilmAShort_SHR_S_EN-XX_XX_51_2K_") && name.endsWith("_SMPTE_OV"), qPrintable(name));
+        QVERIFY2(r.cinemaProfile, "encoded in the DCI 2K profile");
+        const QDir out(QString::fromStdString(r.folder));
+        QVERIFY(out.exists("ASSETMAP.xml") && out.exists("VOLINDEX.xml"));
+        const QStringList pictures = out.entryList({"j2c_*.mxf"}), sounds = out.entryList({"pcm_*.mxf"}), cpls = out.entryList({"CPL_*.xml"});
+        QVERIFY(pictures.size() == 1 && sounds.size() == 1 && cpls.size() == 1 && out.entryList({"PKL_*.xml"}).size() == 1);
+        // It checks out as a server would read it.
+        std::vector<std::string> issues = verifyDcp(r.folder);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+        // The composition: 24 fps, 24 frames, Scope, 5.1, and the track files by the ids their names carry.
+        QFile cpl(out.filePath(cpls[0]));
+        QVERIFY(cpl.open(QIODevice::ReadOnly));
+        const QString text = QString::fromUtf8(cpl.readAll());
+        const QString pictureId = pictures[0].mid(4, 36), soundId = sounds[0].mid(4, 36);
+        QVERIFY(text.contains("<Id>urn:uuid:" + pictureId + "</Id>") && text.contains("<Id>urn:uuid:" + soundId + "</Id>"));
+        QVERIFY(text.contains("<EditRate>24 1</EditRate>") && text.contains("<IntrinsicDuration>24</IntrinsicDuration>"));
+        QVERIFY(text.contains("<AnnotationText>" + name + "</AnnotationText>"));
+        QVERIFY(text.contains("<ScreenAspectRatio>2048 858</ScreenAspectRatio>") && text.contains("51/L,R,C,LFE,Ls,Rs"));
+        QVERIFY(text.contains("SMPTE-RDD-52:2020-Bv2.1") && text.contains("<ContentKind>short</ContentKind>"));
+        // The picture: the grey as DCI X'Y'Z' in the middle (Rec.709 at gamma 2.4, D65 white kept, 48/52.37, 1/2.6),
+        // black on either side where the 16:9 frame is pillarboxed in Scope.
+        std::vector<uint16_t> xyz;
+        int w = 0, h = 0;
+        QVERIFY2(readDcpFrame(out.filePath(pictures[0]).toStdString(), 3, xyz, w, h, &err), err.c_str());
+        QVERIFY(w == 2048 && h == 858);
+        const double lin = std::pow(0.5, 2.4);
+        auto code = [](double v) { return 4095 * std::pow(v * 48 / 52.37, 1 / 2.6); };
+        const double want[3] = {code(0.9505 * lin), code(lin), code(1.0891 * lin)};
+        const uint16_t* mid = &xyz[(size_t(429) * 2048 + 1024) * 3];
+        for (int c = 0; c < 3; ++c) QVERIFY2(std::fabs(mid[c] - want[c]) < 12, qPrintable(QString("%1: %2, not %3").arg(c).arg(mid[c]).arg(want[c])));
+        const uint16_t* side = &xyz[(size_t(429) * 2048 + 100) * 3];
+        QVERIFY2(side[0] < 12 && side[1] < 12 && side[2] < 12, qPrintable(QString("%1 %2 %3").arg(side[0]).arg(side[1]).arg(side[2])));
+        // The sound: 24-bit 48 kHz, six channels, a second; the tone on the left (at the mix's level), the centre silent.
+        AudioBufferPtr lc = decodeAudio(out.filePath(sounds[0]).toStdString(), 48000, &err, nullptr, {0, 2});
+        QVERIFY2(lc, err.c_str());
+        QVERIFY2(std::abs(lc->frames() - 48000) < 10, qPrintable(QString::number(lc->frames())));
+        double left = 0, centre = 0;
+        for (int64_t i = 2000; i < 10000; ++i) left += double(lc->samples[size_t(i) * 2]) * lc->samples[size_t(i) * 2], centre += double(lc->samples[size_t(i) * 2 + 1]) * lc->samples[size_t(i) * 2 + 1];
+        left = std::sqrt(left / 8000), centre = std::sqrt(centre / 8000);
+        QVERIFY2(left > 0.2 && centre < 1e-3, qPrintable(QString("%1 %2").arg(left).arg(centre)));
+        // A damaged file is caught.
+        {
+            QFile f(out.filePath(sounds[0]));
+            QVERIFY(f.open(QIODevice::Append));
+            f.write("x");
+        }
+        issues = verifyDcp(r.folder);
+        QVERIFY(std::any_of(issues.begin(), issues.end(), [](const std::string& i) { return i.find("hash") != std::string::npos; }));
+        // The same package again is refused (the folder is there); stopping part way leaves nothing behind.
+        QVERIFY(!exportDcp(p, s, st, dir.path().toStdString(), nullptr, {}, &err) && err.find("already") != std::string::npos);
+        st.title = "Stopped";
+        int calls = 0;
+        QVERIFY(!exportDcp(p, s, st, dir.path().toStdString(), nullptr, [&](double) { return ++calls < 3; }, &err));
+        QVERIFY(QDir(dir.path()).entryList({"Stopped_*"}, QDir::Dirs).isEmpty());
+        // Under a second is refused.
+        Sequence brief = s;
+        brief.inPoint = 0, brief.outPoint = 12;
+        st.inOut = true;
+        QVERIFY(!exportDcp(p, brief, st, dir.path().toStdString(), nullptr, {}, &err) && err.find("second") != std::string::npos);
+        // 23.976 plays at 24; Flat and Full containers.
+        Sequence ntsc = s;
+        ntsc.fps = Rational{24000, 1001};
+        QCOMPARE(dcpFrameRate(ntsc, 0), 24);
+        ntsc.fps = Rational{30000, 1001};
+        QCOMPARE(dcpFrameRate(ntsc, 0), 30);
+        QCOMPARE(dcpFrameRate(ntsc, 25), 25);
+        int cw = 0, ch = 0;
+        QVERIFY(dcpContainer("flat", cw, ch) && cw == 1998 && ch == 1080);
+        Sequence wide = s;
+        wide.width = 2048, wide.height = 858;
+        QVERIFY(defaultDcpContainer(wide) == "scope" && defaultDcpContainer(s) == "flat");
+        // The full naming convention with a studio and a facility.
+        DcpSettings named;
+        named.title = "Midnight Run";
+        named.studio = "di";
+        named.facility = "Mtg";
+        named.language = "fr-CA";
+        named.territory = "ca";
+        QCOMPARE(dcpName(named, 8, "20261009"), std::string("MidnightRun_FTR_F_FR-XX_CA_71_2K_DI_20261009_MTG_SMPTE_OV"));
+        QVERIFY(dcpContainer("full", cw, ch) && cw == 2048 && ch == 1080 && !dcpContainer("imax", cw, ch));
     }
 
     void lutExport() {

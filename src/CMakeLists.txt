@@ -103,6 +103,8 @@ add_library(montage_engine STATIC
   render/LightLevel.h render/LightLevel.cpp
   render/Versions.h render/Versions.cpp
   render/ReviewExport.h render/ReviewExport.cpp
+  render/DcpMxf.h render/DcpMxf.cpp
+  render/Dcp.h render/Dcp.cpp
   render/RoomTone.h render/RoomTone.cpp
   render/ExtendClip.h render/ExtendClip.cpp
   render/PaperEdit.h render/PaperEdit.cpp

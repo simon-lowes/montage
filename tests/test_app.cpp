@@ -68,6 +68,7 @@
 #include "Assistant.h"
 #include "AssistantPanel.h"
 #include "SpectralRepairDialog.h"
+#include "automation/McpServer.h"
 #include "media/SpeechSearch.h"
 #include "media/TextReader.h"
 #include "core/OnScreenText.h"
@@ -3451,6 +3452,51 @@ private slots:
         QVERIFY(c->motion.p("scale", 0) > 140);
         state()->undo();
         QCOMPARE(edit::clipById(*state()->sequence(), clip)->motion.p("crop_top", 0), 0.0);
+        state()->newProject();
+    }
+
+    void exportDcpFromTheFileMenu() {
+        // A second of a colour matte in a 2.39:1 sequence: the dialog would pick Scope.
+        state()->newProject();
+        QVERIFY(win_->findChild<QAction*>("exportDcp"));
+        QVERIFY(state()->edit("Matte", [&](Project& p, Sequence& s) {
+            s.width = 96, s.height = 40, s.fps = Rational{24, 1};
+            Clip c = makeGeneratorClip(p, "color", 24);
+            c.generator.params["color.r"] = 0.8;
+            return edit::overwrite(p, s, V1, c).ok;
+        }));
+        QCOMPARE(defaultDcpContainer(*state()->sequence()), std::string("scope"));
+        DcpSettings st;
+        st.title = "Menu Test";
+        st.container = "scope";
+        st.threads = 2;
+        QStringList problems;
+        const QString folder = win_->exportDcpTo(dir_.path(), st, &problems);
+        QVERIFY2(!folder.isEmpty(), qPrintable(win_->statusBar()->currentMessage()));
+        QVERIFY2(problems.isEmpty(), qPrintable(problems.join("; ")));
+        QVERIFY(QFileInfo(folder).fileName().startsWith("MenuTest_FTR_S_EN-XX_XX_51_2K_"));
+        QVERIFY2(win_->statusBar()->currentMessage().contains("checked"), qPrintable(win_->statusBar()->currentMessage()));
+        // Over MCP: made and checked; a damaged package reported.
+        QVERIFY(state()->save(dir_.filePath("dcp.montage")));
+        McpServer server;
+        auto call = [&](const QString& tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"}, {"params", QJsonObject{{"name", tool}, {"arguments", args}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call("montage_export_dcp", {{"project", dir_.filePath("dcp.montage")}, {"folder", dir_.filePath("mcp")}, {"title", "Over MCP"},
+                                                   {"kind", "trailer"}, {"studio", "XY"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject made = r.value("structuredContent").toObject();
+        QVERIFY2(made.value("name").toString().startsWith("OverMCP_TLR_S_EN-XX_XX_51_2K_XY_"), qPrintable(made.value("name").toString()));
+        QVERIFY(made.value("problems").toArray().isEmpty() && made.value("frames").toInt() == 24 && made.value("width").toInt() == 2048);
+        r = call("montage_verify_dcp", {{"folder", made.value("folder").toString()}});
+        QVERIFY(r.value("structuredContent").toObject().value("ok").toBool());
+        QFile::remove(QDir(made.value("folder").toString()).filePath("VOLINDEX.xml"));
+        r = call("montage_verify_dcp", {{"folder", made.value("folder").toString()}});
+        QVERIFY(!r.value("structuredContent").toObject().value("ok").toBool());
+        QVERIFY(call("montage_export_dcp", {{"project", dir_.filePath("dcp.montage")}, {"folder", dir_.filePath("mcp")}, {"container", "imax"}})
+                    .value("isError").toBool());
         state()->newProject();
     }
 

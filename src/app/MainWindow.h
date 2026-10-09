@@ -18,6 +18,7 @@
 #include "media/Image.h"
 #include "render/Shorts.h"
 #include "render/ReviewExport.h"
+#include "render/Dcp.h"
 #include "render/ExtendClip.h"
 #include "render/RoomTone.h"
 #include "render/Versions.h"
@@ -170,6 +171,10 @@ public:
     bool setAgentLink(bool on);
     void agentLinkDialog();
     void exportForReviewDialog();
+    // File › Export DCP…: the sequence as a Digital Cinema Package (render/Dcp.h), made in the background with a
+    // progress bar and checked when done. The folder it made ("" if it failed or was cancelled); what the check found.
+    QString exportDcpTo(const QString& parent, const DcpSettings& settings, QStringList* problems = nullptr);
+    void exportDcpDialog();
     bool addToColorGroup(Id group);
     bool removeFromColorGroup();
     // Suggest Chapters: chapter markers where the talk moves on, titled with what each part is about (replacing the

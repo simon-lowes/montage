@@ -51,6 +51,7 @@
 #include <QDir>
 #include <QSpinBox>
 #include <QStandardPaths>
+#include <QTimer>
 #include <QSettings>
 #include <QShortcut>
 #include <QStatusBar>
@@ -687,6 +688,7 @@ void MainWindow::buildMenus() {
     add(file, tr("&Export Media…"), QKeySequence("Ctrl+M"), [this] { exportMedia(); });
     add(file, tr("Export &Versions…"), QKeySequence(), [this] { exportVersionsDialog(); })->setObjectName(QStringLiteral("exportVersions"));
     add(file, tr("Export for Re&view…"), QKeySequence(), [this] { exportForReviewDialog(); })->setObjectName(QStringLiteral("exportForReview"));
+    add(file, tr("Export &DCP (Digital Cinema)…"), QKeySequence(), [this] { exportDcpDialog(); })->setObjectName(QStringLiteral("exportDcp"));
     add(file, tr("Import Review Notes…"), QKeySequence(), [this] {
         const QString path = QFileDialog::getOpenFileName(this, tr("Import Review Notes"), appSettings().value(QStringLiteral("export/lastDirectory")).toString(),
                                                           tr("Review notes (*.json);;Marker lists (*.csv *.txt *.tsv)"));
@@ -4265,6 +4267,166 @@ void MainWindow::exportForReviewDialog() {
     }
     appSettings().setValue(QStringLiteral("export/lastDirectory"), folder->text());
     exportForReview(folder->text(), o);
+}
+
+QString MainWindow::exportDcpTo(const QString& parent, const DcpSettings& settings, QStringList* problems) {
+    const Sequence* s = state_->sequence();
+    if (!s || s->duration() == 0) {
+        state_->message(tr("Nothing to export"));
+        return {};
+    }
+    // Made from a copy, off the UI thread (a feature takes a while: every frame is compressed to JPEG 2000).
+    const Project project = state_->project();
+    const Sequence seq = *s;
+    QProgressDialog progress(tr("Making the DCP of %1...").arg(QString::fromStdString(seq.name)), tr("Cancel"), 0, 1000, this);
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(400);
+    std::atomic<int> done{0};
+    std::atomic<bool> cancel{false};
+    connect(&progress, &QProgressDialog::canceled, this, [&cancel] { cancel = true; });
+    DcpResult result;
+    std::string err;
+    QFutureWatcher<bool> watcher;
+    QEventLoop loop;
+    connect(&watcher, &QFutureWatcher<bool>::finished, &loop, &QEventLoop::quit);
+    QTimer tick;
+    connect(&tick, &QTimer::timeout, this, [&] { progress.setValue(done.load()); });
+    tick.start(100);
+    watcher.setFuture(QtConcurrent::run([&] {
+        return exportDcp(project, seq, settings, parent.toStdString(), &result, [&](double f) {
+            done = int(f * 1000);
+            return !cancel.load();
+        }, &err);
+    }));
+    if (!watcher.isFinished()) loop.exec();
+    tick.stop();
+    progress.close();
+    if (!watcher.result()) {
+        state_->message(cancel ? tr("DCP cancelled") : tr("No DCP: %1").arg(QString::fromStdString(err)), 8000);
+        return {};
+    }
+    const std::vector<std::string> issues = verifyDcp(result.folder);
+    QStringList found;
+    for (const std::string& i : issues) found << QString::fromStdString(i);
+    if (problems) *problems = found;
+    const QString folder = QString::fromStdString(result.folder);
+    if (!found.isEmpty())
+        state_->message(tr("DCP %1 made, but the check found: %2").arg(QString::fromStdString(result.name), found.join("; ")), 12000);
+    else if (!result.cinemaProfile)
+        state_->message(tr("DCP %1 made, but this FFmpeg has no OpenJPEG, so the pictures are not in the DCI profile most cinema servers need")
+                            .arg(QString::fromStdString(result.name)),
+                        12000);
+    else
+        state_->message(tr("DCP %1 made and checked (%2 fps, %3 x %4, %5 channels): copy the folder to a drive for the cinema")
+                            .arg(QString::fromStdString(result.name))
+                            .arg(result.fps)
+                            .arg(result.width)
+                            .arg(result.height)
+                            .arg(result.channels),
+                        12000);
+    return folder;
+}
+
+void MainWindow::exportDcpDialog() {
+    const Sequence* s = state_->sequence();
+    if (!s || s->duration() == 0) {
+        state_->message(tr("Nothing to export"));
+        return;
+    }
+    QDialog dlg(this);
+    dlg.setObjectName(QStringLiteral("exportDcpDialog"));
+    dlg.setWindowTitle(tr("Export DCP"));
+    auto* form = new QFormLayout(&dlg);
+    auto* intro = new QLabel(tr("A Digital Cinema Package of %1 for cinema servers and festivals (SMPTE, 2K JPEG 2000, 24-bit sound), "
+                                "checked when it is done. Copy the folder it makes to a drive (ext2/3 or NTFS) for the cinema.")
+                                 .arg(QString::fromStdString(s->name)),
+                             &dlg);
+    intro->setWordWrap(true);
+    form->addRow(intro);
+    auto* title = new QLineEdit(&dlg);
+    title->setObjectName(QStringLiteral("dcpTitle"));
+    const QString file = state_->filePath();
+    title->setText(file.isEmpty() ? QString::fromStdString(s->name) : QFileInfo(file).completeBaseName());
+    form->addRow(tr("Title:"), title);
+    auto* kind = new QComboBox(&dlg);
+    kind->setObjectName(QStringLiteral("dcpKind"));
+    for (const auto& [label, value] : std::vector<std::pair<QString, QString>>{{tr("Feature"), "feature"}, {tr("Short"), "short"},
+                                                                             {tr("Trailer"), "trailer"}, {tr("Teaser"), "teaser"},
+                                                                             {tr("Advertisement"), "advertisement"}, {tr("Test"), "test"},
+                                                                             {tr("Rating card"), "rating"}, {tr("Public service announcement"), "psa"}})
+        kind->addItem(label, value);
+    form->addRow(tr("Kind:"), kind);
+    auto* container = new QComboBox(&dlg);
+    container->setObjectName(QStringLiteral("dcpContainer"));
+    container->addItem(tr("Flat (1.85:1, 1998 x 1080)"), "flat");
+    container->addItem(tr("Scope (2.39:1, 2048 x 858)"), "scope");
+    container->addItem(tr("Full container (1.90:1, 2048 x 1080)"), "full");
+    container->setCurrentIndex(container->findData(QString::fromStdString(defaultDcpContainer(*s))));
+    form->addRow(tr("Picture:"), container);
+    auto* rate = new QComboBox(&dlg);
+    rate->setObjectName(QStringLiteral("dcpRate"));
+    rate->addItem(tr("As the sequence (%1 fps)").arg(dcpFrameRate(*s, 0)), 0);
+    for (int r : {24, 25, 30, 48}) rate->addItem(tr("%1 fps").arg(r), r);
+    form->addRow(tr("Frame rate:"), rate);
+    auto* language = new QLineEdit(QStringLiteral("en"), &dlg);
+    language->setObjectName(QStringLiteral("dcpLanguage"));
+    form->addRow(tr("Sound language:"), language);
+    auto* territory = new QLineEdit(QStringLiteral("XX"), &dlg);
+    territory->setObjectName(QStringLiteral("dcpTerritory"));
+    territory->setToolTip(tr("Where it will be shown (a two-letter country code; XX for anywhere)"));
+    form->addRow(tr("Territory:"), territory);
+    auto* issuer = new QLineEdit(appSettings().value(QStringLiteral("dcp/issuer"), QStringLiteral("Montage")).toString(), &dlg);
+    issuer->setObjectName(QStringLiteral("dcpIssuer"));
+    form->addRow(tr("Issuer:"), issuer);
+    auto* studio = new QLineEdit(appSettings().value(QStringLiteral("dcp/studio")).toString(), &dlg);
+    studio->setObjectName(QStringLiteral("dcpStudio"));
+    studio->setPlaceholderText(tr("optional short code, for the name"));
+    form->addRow(tr("Studio:"), studio);
+    auto* facility = new QLineEdit(appSettings().value(QStringLiteral("dcp/facility")).toString(), &dlg);
+    facility->setObjectName(QStringLiteral("dcpFacility"));
+    facility->setPlaceholderText(tr("optional short code, for the name"));
+    form->addRow(tr("Facility:"), facility);
+    const bool marked = s->inPoint >= 0 && s->outPoint > s->inPoint;
+    auto* range = new QCheckBox(tr("Only In to Out"), &dlg);
+    range->setObjectName(QStringLiteral("dcpRange"));
+    range->setEnabled(marked);
+    form->addRow(QString(), range);
+    auto* folder = new QLineEdit(&dlg);
+    folder->setObjectName(QStringLiteral("dcpFolder"));
+    QString start = appSettings().value(QStringLiteral("export/lastDirectory")).toString();
+    if (start.isEmpty()) start = QStandardPaths::writableLocation(QStandardPaths::MoviesLocation);
+    folder->setText(start);
+    auto* browse = new QPushButton(tr("Choose…"), &dlg);
+    connect(browse, &QPushButton::clicked, &dlg, [&] {
+        const QString d = QFileDialog::getExistingDirectory(&dlg, tr("Make the DCP In"), folder->text());
+        if (!d.isEmpty()) folder->setText(d);
+    });
+    auto* row = new QHBoxLayout;
+    row->addWidget(folder, 1);
+    row->addWidget(browse);
+    form->addRow(tr("Make it in:"), row);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    buttons->button(QDialogButtonBox::Ok)->setText(tr("Make DCP"));
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    form->addRow(buttons);
+    if (dlg.exec() != QDialog::Accepted) return;
+    DcpSettings st;
+    st.title = title->text().trimmed().toStdString();
+    st.kind = kind->currentData().toString().toStdString();
+    st.container = container->currentData().toString().toStdString();
+    st.fps = rate->currentData().toInt();
+    st.language = language->text().trimmed().toStdString();
+    st.territory = territory->text().trimmed().toStdString();
+    st.issuer = issuer->text().trimmed().toStdString();
+    st.studio = studio->text().trimmed().toStdString();
+    st.facility = facility->text().trimmed().toStdString();
+    st.inOut = range->isChecked() && marked;
+    appSettings().setValue(QStringLiteral("export/lastDirectory"), folder->text());
+    appSettings().setValue(QStringLiteral("dcp/issuer"), issuer->text().trimmed());
+    appSettings().setValue(QStringLiteral("dcp/studio"), studio->text().trimmed());
+    appSettings().setValue(QStringLiteral("dcp/facility"), facility->text().trimmed());
+    exportDcpTo(folder->text(), st);
 }
 
 bool MainWindow::analyseHdrLightLevels(bool ask) {
