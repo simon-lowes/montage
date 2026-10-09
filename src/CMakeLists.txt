@@ -55,6 +55,7 @@ add_library(montage_engine STATIC
   media/CameraRaw.h media/CameraRaw.cpp
   media/SuperScale.h media/SuperScale.cpp
   media/Faces.h media/Faces.cpp
+  media/FaceTracks.h media/FaceTracks.cpp
   media/DepthMap.h media/DepthMap.cpp
   media/Matting.h media/Matting.cpp
   media/TextToSpeech.h media/TextToSpeech.cpp

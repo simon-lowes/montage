@@ -91,6 +91,7 @@
 #include "media/Reframe.h"
 #include "media/Diarizer.h"
 #include "media/Faces.h"
+#include "media/FaceTracks.h"
 #include "media/DepthMap.h"
 #include "media/Rife.h"
 #include "media/Matting.h"
@@ -7406,6 +7407,276 @@ private slots:
         const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
         const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
         QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+    }
+
+    void faceTracksLinkHoldAndGroup() {
+        // 30 frames at 25 fps. A drifts right and is lost for frames 10-14, then leaves after frame 20; B stays put;
+        // at frame 22 someone else (C) steps in where A was; a weak find at frame 5 is seen once.
+        const double dt = 0.04;
+        auto unit = [](int axis) {
+            std::vector<float> v(128, 0.0f);
+            v[size_t(axis)] = 1;
+            return v;
+        };
+        std::vector<std::vector<FaceSighting>> frames;
+        for (int i = 0; i < 30; ++i) {
+            std::vector<FaceSighting> f;
+            auto add = [&](float x, float y, int who, float score = 0.95f) {
+                FaceSighting s;
+                s.time = i * dt;
+                s.x = x, s.y = y, s.w = 0.1f, s.h = 0.15f, s.score = score;
+                if (i % 7 != 3) s.identity = unit(who);  // (now and then too small to tell who)
+                f.push_back(s);
+            };
+            if (i <= 20 && (i < 10 || i > 14)) add(0.1f + 0.005f * i, 0.3f, 0);
+            add(0.7f, 0.3f, 1);
+            if (i >= 22) add(0.2f, 0.3f, 2);
+            if (i == 5) add(0.4f, 0.7f, 3, 0.75f);
+            frames.push_back(f);
+        }
+        const std::vector<FaceTrack> tracks = linkFaceTracks(frames, 1.0);
+        QCOMPARE(int(tracks.size()), 3);
+        const FaceTrack& A = tracks[0];
+        QCOMPARE(int(A.boxes.size()), 16);  // across the gap
+        QCOMPARE(A.boxes.back().time, 20 * dt);
+        QVERIFY(A.identity.size() == 128 && A.identity[0] > 0.99f);
+        QCOMPARE(int(tracks[1].boxes.size()), 30);
+        QVERIFY(tracks[2].identity[2] > 0.99f && std::fabs(tracks[2].boxes.front().time - 22 * dt) < 1e-9);  // not A's
+
+        FaceTracks t;
+        t.fps = 25, t.start = 0, t.end = 29 * dt, t.step = dt;
+        t.tracks = tracks;
+        auto at = [&](int frame, int hold, int track) -> const FaceBox* {
+            static std::vector<TrackedFace> faces;
+            faces = trackedFacesAt(t, frame * dt, hold);
+            for (const TrackedFace& f : faces)
+                if (f.track == track) return &f.box;
+            return nullptr;
+        };
+        // In the gap, held 12 frames: A's box moves from where it was last seen to where it is found again.
+        const FaceBox* mid = at(12, 12, 1);
+        QVERIFY(mid);
+        QVERIFY(std::fabs(mid->x - (0.1f + 0.005f * 12)) < 1e-4f);
+        // Held only 2 frames: just past each end of the gap, not its middle.
+        QVERIFY(!at(12, 2, 1));
+        QVERIFY(at(11, 2, 1) && std::fabs(at(11, 2, 1)->x - (0.1f + 0.005f * 9)) < 1e-4f);
+        QVERIFY(at(13, 2, 1) && std::fabs(at(13, 2, 1)->x - (0.1f + 0.005f * 15)) < 1e-4f);
+        // Held beyond a track's ends, and between frames.
+        QVERIFY(at(23, 12, 1) && !at(23, 2, 1));
+        QVERIFY(!at(21, 0, 3) && at(21, 2, 3));
+        QCOMPARE(int(trackedFacesAt(t, 7.5 * dt, 0).size()), 2);  // A and B, half way between frames
+
+        // Kept as text, the same in every locale.
+        const std::string text = faceTracksToString(t);
+        FaceTracks back;
+        QVERIFY(faceTracksFromString(text, back));
+        QCOMPARE(back.fps, 25.0);
+        QCOMPARE(back.step, dt);
+        QCOMPARE(int(back.tracks.size()), 3);
+        for (size_t i = 0; i < 3; ++i) {
+            QCOMPARE(back.tracks[i].id, t.tracks[i].id);
+            QCOMPARE(back.tracks[i].boxes.size(), t.tracks[i].boxes.size());
+            for (size_t k = 0; k < back.tracks[i].boxes.size(); ++k) {
+                QVERIFY(std::fabs(back.tracks[i].boxes[k].time - t.tracks[i].boxes[k].time) < 1e-9);
+                QVERIFY(std::fabs(back.tracks[i].boxes[k].x - t.tracks[i].boxes[k].x) < 1e-4f);
+            }
+            float c = 0;
+            for (size_t k = 0; k < 128; ++k) c += back.tracks[i].identity[k] * t.tracks[i].identity[k];
+            QVERIFY(c > 0.999f);
+        }
+        QVERIFY(text.find(',') == std::string::npos || text.find(',') > text.find('|'));
+        for (const char* bad : {"", "faces1 25 0 1", "faces1 25 1 0 0.04", "faces1 25 0 1 0.04\nx|", "faces1 25 0 1 0.04\n1 0.9 -|0 0 0 0 0",
+                                "faces1 25 0 1 0.04\n1 0.9 zz|0 0 0 0.1 0.1"}) {
+            FaceTracks junk;
+            QVERIFY2(!faceTracksFromString(bad, junk), bad);
+        }
+        QCOMPARE(trackIdsToString({7, 1, 4}), std::string("1,4,7"));
+        QCOMPARE(trackIdsFromString("4, 1,x,0,9"), (std::set<int>{1, 4, 9}));
+
+        // Grouped by person: A's and B's tracks apart; two tracks of B together.
+        FaceTrack B2 = t.tracks[1];
+        B2.id = 9;
+        for (auto& b : B2.boxes) b.time += 2;
+        t.tracks.push_back(B2);
+        const std::vector<FaceGroup> groups = groupFaceTracks(t);
+        QCOMPARE(int(groups.size()), 3);
+        QCOMPARE((std::set<int>(groups[0].tracks.begin(), groups[0].tracks.end())), (std::set<int>{2, 9}));
+        QVERIFY(std::fabs(groups[0].seconds - 2 * 30 * dt) < 1e-6);
+        QCOMPARE(groups[1].tracks, std::vector<int>{1});
+
+        // The media seconds a clip shows: from its source in point, at the sequence's rate; forwards or back.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = {25, 1};
+        Clip c;
+        c.start = 10, c.duration = 50, c.sourceIn = 25;
+        double from = 0, to = 0;
+        clipMediaSpan(s, c, false, from, to);
+        QCOMPARE(from, 1.0);
+        QCOMPARE(to, 74 / 25.0);
+        c.reverse = true;
+        clipMediaSpan(s, c, false, from, to);
+        QCOMPARE(from, 1.0);
+        QCOMPARE(to, 74 / 25.0);
+        clipMediaSpan(s, c, true, from, to);
+        QCOMPARE(to, 0.0);
+        QVERIFY(!redactFacesEffectOf(p, c, false));
+        c.effects.push_back(makeEffect(p, "color_correct"));
+        Effect* e = redactFacesEffectOf(p, c, true);
+        QVERIFY(e && e == &c.effects.front() && e->type == "redact_faces");
+        QCOMPARE(redactFacesEffectOf(p, c, true), e);
+        QCOMPARE(int(c.effects.size()), 2);
+    }
+
+    void redactFacesFollowsPeople() {
+        if (!faceSearchAvailable() || !faceModel().installed()) QSKIP("Set MONTAGE_FACE_MODEL to the YuNet and SFace models");
+        // Kennedy on the left, drifting right and hidden for frames 12-15; Armstrong on the right.
+        const std::string kennedyFile = MONTAGE_TEST_DATA_DIR "/faces/jfk-color.jpg", armstrongFile = MONTAGE_TEST_DATA_DIR "/faces/armstrong.jpg";
+        const std::string video = path("two-people.mp4");
+        {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 640, gs.height = 360, gs.fps = {25, 1};
+            while (gs.videoTracks.size() < 3) edit::addTrack(gen, gs, TrackKind::Video);
+            MediaItem km = probeOrFail(gen, kennedyFile), am = probeOrFail(gen, armstrongFile);
+            gen.media.push_back(km);
+            gen.media.push_back(am);
+            Clip k = makeClip(gen, km, TrackKind::Video, gs);
+            k.duration = 40;
+            k.motion = makeEffect(gen, "transform");
+            k.motion.params["pos_x"].addKey(0, -170.0);
+            k.motion.params["pos_x"].addKey(39, -131.0);
+            QVERIFY(edit::overwrite(gen, gs, {TrackKind::Video, 0}, k).ok);
+            Clip a = makeClip(gen, am, TrackKind::Video, gs);
+            a.duration = 40;
+            a.motion = makeEffect(gen, "transform");
+            a.motion.params["pos_x"] = Param(170.0);
+            QVERIFY(edit::overwrite(gen, gs, {TrackKind::Video, 1}, a).ok);
+            Clip cover = makeGeneratorClip(gen, "color", 4);
+            cover.start = 12;
+            cover.generator.params["color.r"] = Param(0.0);
+            cover.generator.params["color.g"] = Param(0.0);
+            cover.generator.params["color.b"] = Param(0.0);
+            cover.motion = makeEffect(gen, "transform");
+            cover.motion.params["scale"] = Param(45.0);
+            cover.motion.params["pos_x"] = Param(-176.0);
+            cover.motion.params["pos_y"] = Param(-36.0);
+            QVERIFY(edit::overwrite(gen, gs, {TrackKind::Video, 2}, cover).ok);
+            ExportSettings st;
+            st.audioCodec = "none";
+            st.preset = "ultrafast";
+            st.path = video;
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        FaceTracks t;
+        std::string err;
+        int calls = 0;
+        QVERIFY2(trackFaces(video, 0, 39 / 25.0, t, [&](double) { return ++calls > 0; }, &err), err.c_str());
+        QVERIFY(calls >= 40);
+        QCOMPARE(t.fps, 25.0);
+        QCOMPARE(t.step, 0.04);
+        std::vector<FaceGroup> groups = groupFaceTracks(t);
+        QString found;
+        for (const FaceTrack& tr : t.tracks)
+            found += QString("track %1: %2 boxes %3-%4 s at x %5\n").arg(tr.id).arg(tr.boxes.size()).arg(tr.boxes.front().time).arg(tr.boxes.back().time).arg(tr.boxes.front().x);
+        QVERIFY2(groups.size() == 2, qPrintable(found));
+        // Kennedy (larger, longer on screen... both are on screen throughout): told apart by where they are.
+        const FaceGroup& left = groups[0].best.x < groups[1].best.x ? groups[0] : groups[1];
+        const FaceGroup& right = &left == &groups[0] ? groups[1] : groups[0];
+        QVERIFY2(right.seconds > 1.4 && left.seconds > 1.4, qPrintable(found));
+        // Hidden for four frames, he is still covered there (held), and moving with him.
+        const double hidden = 13.5 / 25;
+        bool leftCovered = false;
+        for (const TrackedFace& f : trackedFacesAt(t, hidden, 12))
+            if (std::find(left.tracks.begin(), left.tracks.end(), f.track) != left.tracks.end()) leftCovered = true;
+        QVERIFY2(leftCovered, qPrintable(found));
+
+        // In a project: covered everywhere but Armstrong's face, who is left showing.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 640, s.height = 360, s.fps = {25, 1};
+        MediaItem m = probeOrFail(p, video);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Clip& clip = s.videoTracks[0].clips.at(0);
+        const Image plain = renderSequenceFrame(p, s, 25, {});
+        Effect* e = redactFacesEffectOf(p, clip, true);
+        e->strings["tracks"] = faceTracksToString(t);
+        e->strings["keep"] = trackIdsToString(std::set<int>(right.tracks.begin(), right.tracks.end()));
+        const Image done = renderSequenceFrame(p, s, 25, {});
+        auto detail = [](const Image& im, double u, double v) {
+            const int x0 = int(u * im.width) - 12, y0 = int(v * im.height) - 12;
+            double sum = 0;
+            for (int y = y0; y < y0 + 24; ++y)
+                for (int x = x0; x < x0 + 24; ++x) sum += std::fabs(im.at(x + 1, y)[1] - im.at(x, y)[1]) + std::fabs(im.at(x, y + 1)[1] - im.at(x, y)[1]);
+            return sum;
+        };
+        const double kennedyX = (131 + 25) / 640.0, kennedyY = 144 / 360.0, armstrongX = 523 / 640.0, armstrongY = 100 / 360.0;
+        qInfo("detail: Kennedy %.2f -> %.2f, Armstrong %.2f -> %.2f", detail(plain, kennedyX, kennedyY), detail(done, kennedyX, kennedyY),
+              detail(plain, armstrongX, armstrongY), detail(done, armstrongX, armstrongY));
+        QVERIFY(detail(done, kennedyX, kennedyY) < detail(plain, kennedyX, kennedyY) * 0.3);
+        QCOMPARE(detail(done, armstrongX, armstrongY), detail(plain, armstrongX, armstrongY));
+
+        // Through MCP: the first call analyses and covers everyone; then Armstrong, found by People search and named,
+        // is left showing by name.
+        clip.effects.clear();
+        FaceIndex index;
+        QVERIFY2(indexFaces(armstrongFile, 0, index, 0, 8, 32, {}, nullptr, &err), err.c_str());
+        MediaItem still = probeOrFail(p, armstrongFile);
+        still.faces = std::make_shared<const FaceIndex>(index);
+        p.media.push_back(still);
+        QCOMPARE(groupPeople(p), 1);
+        QVERIFY(renamePerson(p, peopleIn(p).front().id, "Neil Armstrong"));
+        const QString project = QString::fromStdString(path("redact.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_redact_faces"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        const double clipId = double(clip.id);
+        QJsonObject r = call({{"project", project}, {"clip", clipId}, {"style", "pixelate"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QJsonObject out = r.value("structuredContent").toObject();
+        QVERIFY(out.value("analysed").toBool());
+        QJsonArray list = out.value("groups").toArray();
+        QCOMPARE(list.size(), 2);
+        int named = -1;
+        for (int i = 0; i < 2; ++i) {
+            QVERIFY(list[i].toObject().value("covered").toBool());
+            if (list[i].toObject().value("person").toString() == "Neil Armstrong") named = i;
+        }
+        QVERIFY2(named >= 0, QJsonDocument(out).toJson().constData());
+        r = call({{"project", project}, {"clip", clipId}, {"show", QJsonArray{"neil armstrong"}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        out = r.value("structuredContent").toObject();
+        QVERIFY(!out.value("analysed").toBool());  // the analysis kept on the clip
+        list = out.value("groups").toArray();
+        QVERIFY(!list[named].toObject().value("covered").toBool() && list[1 - named].toObject().value("covered").toBool());
+        {
+            Project back;
+            QVERIFY(loadProject(project.toStdString(), back));
+            const Effect& fx = back.active()->videoTracks[0].clips.at(0).effects.front();
+            QCOMPARE(QString::fromStdString(fx.type), QString("redact_faces"));
+            QCOMPARE(fx.p("style", 0), 1.0);
+            QVERIFY(!fx.s("keep").empty());
+        }
+        // Cover only the other one; bad requests refused.
+        r = call({{"project", project}, {"clip", clipId}, {"cover_only", QJsonArray{2 - named}}, {"hold", 6}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        list = r.value("structuredContent").toObject().value("groups").toArray();
+        QVERIFY(!list[named].toObject().value("covered").toBool() && list[1 - named].toObject().value("covered").toBool());
+        for (const QJsonObject& bad : {QJsonObject{{"project", project}, {"clip", clipId}, {"show", QJsonArray{3}}},
+                                       QJsonObject{{"project", project}, {"clip", clipId}, {"show", QJsonArray{"Nobody"}}},
+                                       QJsonObject{{"project", project}, {"clip", clipId}, {"style", "smudge"}},
+                                       QJsonObject{{"project", project}, {"clip", clipId}, {"show", QJsonArray{1}}, {"cover_only", QJsonArray{2}}},
+                                       QJsonObject{{"project", project}, {"clip", 99999.0}}})
+            QVERIFY2(call(bad).value("isError").toBool(), QJsonDocument(bad).toJson().constData());
     }
 
     void peopleSearch() {

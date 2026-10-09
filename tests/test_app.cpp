@@ -1,6 +1,7 @@
 // Application integration tests: drive the real main window offscreen —
 // timeline mouse gestures, tools, undo, inspector, monitors and playback.
 #include <QtTest>
+#include <QPointer>
 #include <QSignalSpy>
 #include <QPlainTextEdit>
 
@@ -67,6 +68,7 @@
 #include "render/Ofx.h"
 #include "Assistant.h"
 #include "AssistantPanel.h"
+#include "RedactFacesDialog.h"
 #include "SpectralRepairDialog.h"
 #include "automation/McpServer.h"
 #include "media/SpeechSearch.h"
@@ -6013,6 +6015,86 @@ const auto seq = [this] { return state()->sequence(); };
         toggle->click();
         QVERIFY(!panel->graph());
         state()->newProject();
+    }
+
+    void redactFacesFromTheClipMenu() {
+        state()->newProject();
+        QVERIFY(win_->findChild<QAction*>("redactFaces"));
+        QVERIFY(!win_->redactFacesDialog());  // no clip
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/faces/jfk-color.jpg")});
+        QCOMPARE(ids.size(), size_t(1));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids[0], 0, 0, 90, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        const Id clip = state()->sequence()->videoTracks[0].clips.at(0).id;
+        state()->setSelection({clip}, false);
+        state()->setPlayhead(30);
+        RedactFacesDialog* dlg = win_->redactFacesDialog();
+        QVERIFY(dlg && dlg->isVisible());
+        QVERIFY(dlg->status().contains("Find the faces"));
+        auto effect = [&]() -> const Effect* {
+            for (const Effect& e : edit::clipById(*state()->sequence(), clip)->effects)
+                if (e.type == "redact_faces") return &e;
+            return nullptr;
+        };
+        if (!faceSearchAvailable() || !faceModel().installed()) {
+            QVERIFY(!dlg->findFaces(true));
+            // Still: every face found as it plays.
+            QVERIFY(dlg->apply());
+            QVERIFY(effect() && effect()->s("tracks").empty());
+            dlg->close();
+            state()->newProject();
+            QSKIP("Set MONTAGE_FACE_MODEL to the YuNet and SFace models for the rest");
+        }
+        // Kennedy's face, where the still is fitted in the frame.
+        const Sequence& seq = *state()->sequence();
+        const double k = seq.height / 415.0, left = (seq.width - 320 * k) / 2;
+        const int fx = int(left + 138 * k), fy = int(166 * k);
+        auto detail = [&](const Image& im) {
+            double sum = 0;
+            for (int y = fy - 20; y < fy + 20; ++y)
+                for (int x = fx - 20; x < fx + 20; ++x) sum += std::fabs(im.at(x + 1, y)[1] - im.at(x, y)[1]) + std::fabs(im.at(x, y + 1)[1] - im.at(x, y)[1]);
+            return sum;
+        };
+        const Image plain = renderSequenceFrame(state()->project(), seq, 30, {});
+        QVERIFY(dlg->findFaces(true));
+        QVERIFY(!dlg->busy());
+        QCOMPARE(dlg->groupCount(), 1);
+        QCOMPARE(dlg->list()->count(), 1);
+        QVERIFY(!dlg->list()->item(0)->icon().isNull());
+        QVERIFY(dlg->redacted(0));
+        QVERIFY2(dlg->status().contains("1 face") && dlg->status().contains("1 covered"), qPrintable(dlg->status()));
+        // Covered: one undoable step that puts the effect first on the clip, with the analysis.
+        QVERIFY(dlg->apply());
+        QVERIFY(effect() && !effect()->s("tracks").empty() && effect()->s("keep").empty());
+        QCOMPARE(&edit::clipById(*state()->sequence(), clip)->effects.front(), effect());
+        Image covered = renderSequenceFrame(state()->project(), *state()->sequence(), 30, {});
+        qInfo("face detail %.1f, covered %.1f", detail(plain), detail(covered));
+        QVERIFY(detail(covered) < detail(plain) * 0.3);
+        state()->undo();
+        QVERIFY(!effect());
+        state()->redo();
+        QVERIFY(effect());
+        // Left showing, pixelated next time: the clip as it was; reopened, the choice is remembered.
+        dlg->setRedacted(0, false);
+        dlg->setStyle(1);
+        QVERIFY(dlg->apply());
+        QVERIFY(!effect()->s("keep").empty());
+        QCOMPARE(effect()->p("style", 0), 1.0);
+        const Image shown = renderSequenceFrame(state()->project(), *state()->sequence(), 30, {});
+        QCOMPARE(detail(shown), detail(plain));
+        dlg->close();
+        QTest::qWait(10);
+        dlg = win_->redactFacesDialog();
+        QVERIFY(dlg);
+        QCOMPARE(dlg->groupCount(), 1);
+        QVERIFY(!dlg->redacted(0));
+        QVERIFY(dlg->status().contains("0 covered"));
+        // Another sequence closes it.
+        QPointer<RedactFacesDialog> guard(dlg);
+        state()->newProject();
+        QTest::qWait(10);
+        QVERIFY(!guard || !guard->isVisible());
     }
 
     void closeUpOnAFace() {

@@ -98,7 +98,7 @@ bool supportsMask(const std::string& effectType);
 bool hasMask(const Effect& e, FrameTime t);
 // The effect works from the picture's depth (a depth effect, or a depth qualifier).
 bool needsDepth(const Effect& e, FrameTime t);
-// The effect works from the faces in the picture (Face Refinement).
+// The effect works from the faces in the picture (Face Refinement, Blemish Remover, Redact Faces).
 bool needsFaces(const Effect& e);
 // The effect works from the people in the picture (Remove Background, or a People mask).
 bool needsPersonMatte(const Effect& e, FrameTime t);

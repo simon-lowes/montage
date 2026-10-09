@@ -916,9 +916,12 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
         mattingModel().installed())
         people = cachedPersonMatte(src);
     PersonScope personScope(people);
-    // And the faces, for Face Refinement.
+    // And the faces, for Face Refinement, Blemish Remover and Redact Faces.
     std::shared_ptr<const std::vector<FaceBox>> faces;
-    if (std::any_of(chain.begin(), chain.end(), [](const Effect* e) { return needsFaces(*e); }) && faceSearchAvailable() &&
+    // (Redact Faces only where its analysis does not reach.)
+    if (std::any_of(chain.begin(), chain.end(),
+                    [&](const Effect* e) { return e->type == "redact_faces" ? redactNeedsLiveFaces(*e, sourceSeconds) : needsFaces(*e); }) &&
+        faceSearchAvailable() &&
         faceModel().installed())
         faces = cachedFaces(src);
     FaceScope faceScope(faces);

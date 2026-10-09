@@ -256,6 +256,14 @@ std::vector<EffectInfo> buildCatalog() {
                  {pct("amount", "Amount", 0, 100, 100), pct("sensitivity", "Sensitivity", 0, 100, 50),
                   pct("size", "Largest Spot (% of face)", 1, 15, 6), boolean("show", "Show Spots Found")},
                  {}});
+    // Faces hidden: every face found in the clip (or everyone but the people left showing in Clip > Redact Faces,
+    // which follows them from frame to frame) blurred, pixelated or covered.
+    c.push_back({"redact_faces", "Redact Faces", EffectCategory::VideoFilter, "Privacy",
+                 {choice("style", "Style", {"Blur", "Pixelate", "Solid"}), pct("strength", "Strength", 0, 100, 70),
+                  choice("shape", "Shape", {"Ellipse", "Rectangle"}), pct("expand", "Expand", 0, 150, 30),
+                  pct("feather", "Feather", 0, 100, 15), num("hold", "Hold Lost Faces (frames)", 0, 60, 12, 1),
+                  color("color", "Solid Colour", 0, 0, 0), boolean("show", "Show Tracked Faces")},
+                 {}});
     // People cut out of their background (MODNet on the clip's source frame), keeping hair and soft edges.
     c.push_back({"remove_background", "Remove Background", EffectCategory::VideoFilter, "Keying",
                  {choice("keep", "Keep", {"People", "Background"}), num("shift", "Edge Shift (px)", -20, 20, 0, 0.5),
@@ -785,7 +793,9 @@ bool hasMask(const Effect& e, FrameTime t) {
     return e.p("mask.shape", t) > 0.5 || e.p("mask.qualify", t) > 0.5 || e.p("mask.depth", t) > 0.5;
 }
 
-bool needsFaces(const Effect& e) { return e.enabled && (e.type == "face_refine" || e.type == "blemish_remover"); }
+bool needsFaces(const Effect& e) {
+    return e.enabled && (e.type == "face_refine" || e.type == "blemish_remover" || e.type == "redact_faces");
+}
 
 bool needsPersonMatte(const Effect& e, FrameTime t) {
     if (!e.enabled) return false;

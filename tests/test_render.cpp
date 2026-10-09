@@ -10,6 +10,7 @@
 #include <complex>
 #include <cstring>
 #include <fstream>
+#include <set>
 #include <tuple>
 
 #include "core/ClipAnimation.h"
@@ -35,6 +36,8 @@
 #include "render/Relight.h"
 #include "render/Deconvolve.h"
 #include "render/FilmLook.h"
+#include "render/FaceRefine.h"
+#include "media/FaceTracks.h"
 #include "media/DepthMap.h"
 #include "render/RenderCache.h"
 #include "render/Shapes.h"
@@ -78,6 +81,127 @@ Clip colorClip(Project& p, float r, float g, float b, FrameTime start, FrameTime
 class TestRender : public QObject {
     Q_OBJECT
 private slots:
+    void redactFacesCoversTheFaces() {
+        // A busy picture (fine checks) and a face's box in the middle (40 x 36 px at 80, 42).
+        const int W = 200, H = 120;
+        Image img(W, H);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                float* p = img.at(x, y);
+                const float v = ((x / 2 + y / 2) % 2) ? 0.9f : 0.1f;
+                p[0] = v, p[1] = 0.5f * v, p[2] = 1 - v, p[3] = 1;
+            }
+        FaceBox f;
+        f.x = 0.4f, f.y = 0.35f, f.w = 0.2f, f.h = 0.3f;
+        auto detail = [](const Image& im, int x0, int y0, int x1, int y1) {
+            double sum = 0;
+            int n = 0;
+            for (int y = y0; y < y1; ++y)
+                for (int x = x0; x < x1 - 1; ++x, ++n) sum += std::fabs(im.at(x + 1, y)[0] - im.at(x, y)[0]);
+            return sum / n;
+        };
+        auto same = [&](const Image& a, int x, int y) {
+            for (int c = 0; c < 4; ++c)
+                if (a.at(x, y)[c] != img.at(x, y)[c]) return false;
+            return true;
+        };
+        const double before = detail(img, 90, 50, 110, 70);
+        // Blurred: the face's detail gone, the rest of the picture as it was.
+        RedactSettings rs;
+        Image blurred = img;
+        redactFaces(blurred, {f}, rs);
+        QVERIFY2(detail(blurred, 90, 50, 110, 70) < before * 0.05, qPrintable(QString::number(detail(blurred, 90, 50, 110, 70))));
+        for (int x : {0, 20, W - 1})
+            for (int y : {0, H - 1}) QVERIFY(same(blurred, x, y));
+        // Pixelated: flat blocks (4 px across this face at 70%), each the mean of what it covers (here all grey).
+        rs.style = 1;
+        Image blocks = img;
+        redactFaces(blocks, {f}, rs);
+        double cx, cy, rx, ry;
+        redactionShape(f, W, H, rs.expand, cx, cy, rx, ry);
+        std::set<float> values;
+        for (int y = int(cy) - 6; y < int(cy) + 6; ++y)
+            for (int x = int(cx) - 6; x < int(cx) + 6; ++x) values.insert(blocks.at(x, y)[0]);
+        QVERIFY2(values.size() <= 16, qPrintable(QString::number(values.size())));
+        QVERIFY(detail(blocks, 90, 50, 110, 70) < before * 0.05);
+        QVERIFY(std::fabs(blocks.at(int(cx), int(cy))[0] - 0.5f) < 0.15f);  // checks averaged to grey
+        // A solid colour, keeping the picture's alpha; the ellipse leaves its box's corners, a rectangle covers them.
+        rs.style = 2;
+        rs.color[0] = 1, rs.color[1] = 0, rs.color[2] = 0;
+        Image solid = img;
+        redactFaces(solid, {f}, rs);
+        QCOMPARE(solid.at(int(cx), int(cy))[0], 1.0f);
+        QCOMPARE(solid.at(int(cx), int(cy))[1], 0.0f);
+        QCOMPARE(solid.at(int(cx), int(cy))[3], 1.0f);
+        const int kx = int(cx - rx * 0.9), ky = int(cy - ry * 0.9);
+        QVERIFY(same(solid, kx, ky));
+        rs.ellipse = false;
+        solid = img;
+        redactFaces(solid, {f}, rs);
+        QCOMPARE(solid.at(kx, ky)[0], 1.0f);
+        // The face's box grown upward for the forehead and hair, and by Expand all round.
+        QVERIFY(cy < (f.y + f.h / 2) * H && ry > f.h * H / 2 * 1.3 && rx > f.w * W / 2 * 1.29);
+
+        // Through the effect: two tracked faces, the second left showing, covered in green.
+        FaceTracks tr;
+        tr.fps = 25, tr.start = 0, tr.end = 1, tr.step = 0.04;
+        FaceTrack a, b;
+        a.id = 1, b.id = 2;
+        for (int i = 0; i <= 25; ++i) {
+            a.boxes.push_back({i * 0.04, 0.1f, 0.35f, 0.2f, 0.3f});
+            b.boxes.push_back({i * 0.04, 0.6f, 0.35f, 0.2f, 0.3f});
+        }
+        tr.tracks = {a, b};
+        Effect e = makeEffect("redact_faces", 1);
+        QCOMPARE(e.p("hold", 0), 12.0);
+        e.strings["tracks"] = faceTracksToString(tr);
+        e.strings["keep"] = "2";
+        e.params["style"] = Param(2.0);
+        e.params["color.g"] = Param(1.0);
+        QVERIFY(needsFaces(e));
+        QVERIFY(!redactNeedsLiveFaces(e, 0.5));
+        QVERIFY(redactNeedsLiveFaces(e, 5.0));
+        Image out = img;
+        applyVideoEffect(e, 0, out, 1.0, 0.5);
+        QCOMPARE(out.at(40, 60)[1], 1.0f);
+        QCOMPARE(out.at(40, 60)[0], 0.0f);
+        QVERIFY(same(out, 140, 60));
+        // Beyond the seconds analysed only the frame's own faces are covered (none known here)...
+        out = img;
+        applyVideoEffect(e, 0, out, 1.0, 5.0);
+        QVERIFY(same(out, 40, 60));
+        // ...and when the frame's faces are known, all of them.
+        {
+            FaceScope scope(std::make_shared<const std::vector<FaceBox>>(std::vector<FaceBox>{f}));
+            out = img;
+            applyVideoEffect(e, 0, out, 1.0, 5.0);
+            QCOMPARE(out.at(100, 57)[1], 1.0f);
+            // (inside the analysis the tracks decide, not the frame's faces)
+            out = img;
+            applyVideoEffect(e, 0, out, 1.0, 0.5);
+            QVERIFY(same(out, 100, 57));
+        }
+        // With no analysis at all: the frame's faces.
+        Effect live = makeEffect("redact_faces", 2);
+        QVERIFY(redactNeedsLiveFaces(live, 0.5));
+        live.enabled = false;
+        QVERIFY(!redactNeedsLiveFaces(live, 0.5));
+        // Show Tracked Faces: red round the covered face, green round the one left showing.
+        e.params["show"] = Param(1.0);
+        out = img;
+        applyVideoEffect(e, 0, out, 1.0, 0.5);
+        FaceBox kept;
+        kept.x = 0.6f, kept.y = 0.35f, kept.w = 0.2f, kept.h = 0.3f;
+        redactionShape(kept, W, H, 0.3, cx, cy, rx, ry);
+        const float* edge = out.at(int(cx - rx), int(cy));
+        QVERIFY(edge[0] < 0.3f && edge[1] == 1.0f);
+        FaceBox gone;
+        gone.x = 0.1f, gone.y = 0.35f, gone.w = 0.2f, gone.h = 0.3f;
+        redactionShape(gone, W, H, 0.3, cx, cy, rx, ry);
+        edge = out.at(std::max(0, int(cx - rx)), int(cy));
+        QVERIFY(edge[0] == 1.0f && edge[1] < 0.3f);
+    }
+
     void roomTone() {
         constexpr int sr = 48000;
         std::mt19937 rng(7);

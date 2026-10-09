@@ -59,6 +59,9 @@ public:
 private:
     std::shared_ptr<const std::vector<FaceBox>> previous_;
 };
+// Redact Faces follows the faces its analysis found (media/FaceTracks.h) within the media seconds analysed; outside
+// them, or with no analysis, it covers the faces found in the frame itself, so needs them detected.
+bool redactNeedsLiveFaces(const Effect& e, double sourceSeconds);
 // A soft matte's edge moved out by `expand` px (re-edged by distance, softened over
 // `feather`), or else blurred by `blur` px; unchanged when both are zero.
 void refineMatte(std::vector<float>& matte, int w, int h, double expand, double feather, double blur);

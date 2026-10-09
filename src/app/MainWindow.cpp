@@ -106,6 +106,7 @@
 #include "MaskOverlay.h"
 #include "TransformOverlay.h"
 #include "SequenceIndexPanel.h"
+#include "RedactFacesDialog.h"
 #include "SpectralRepairDialog.h"
 #include "ShotSearchPanel.h"
 #include "ModelPacks.h"
@@ -864,6 +865,7 @@ void MainWindow::buildMenus() {
         }))->setObjectName(QStringLiteral("autoDuck"));
     add(clipM, tr("Remove Mic &Bleed…"), QKeySequence(), withSeq([this] { micBleedDialog(); }))->setObjectName(QStringLiteral("removeMicBleed"));
     add(clipM, tr("S&pectral Repair…"), QKeySequence(), withSeq([this] { spectralRepairDialog(); }))->setObjectName(QStringLiteral("spectralRepair"));
+    add(clipM, tr("Redact &Faces…"), QKeySequence(), withSeq([this] { redactFacesDialog(); }))->setObjectName(QStringLiteral("redactFaces"));
     add(clipM, tr("Remove Letterbo&x"), QKeySequence(), withSeq([this] { removeLetterbox(); }))->setObjectName(QStringLiteral("removeLetterbox"));
     // Colour groups: grade shots together, before and after each clip's own grade (core/ColorGroups.h).
     QMenu* groupM = clipM->addMenu(tr("Colour &Group"));
@@ -3880,6 +3882,19 @@ int MainWindow::removeMicBleed(std::vector<int> tracks, double reductionDb) {
                             : tr("No mic bleed to remove: every mic is its speaker's throughout"),
                     6000);
     return changed;
+}
+
+RedactFacesDialog* MainWindow::redactFacesDialog() {
+    const Clip* c = state_->primaryClip();
+    const MediaItem* m = c ? state_->project().findMedia(c->mediaId) : nullptr;
+    if (!m || (m->kind != MediaKind::Video && m->kind != MediaKind::Image)) {
+        state_->message(tr("Select the video clip whose faces to cover"));
+        return nullptr;
+    }
+    auto* dlg = new RedactFacesDialog(state_, c->id, this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    dlg->show();
+    return dlg;
 }
 
 SpectralRepairDialog* MainWindow::spectralRepairDialog() {

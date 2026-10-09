@@ -17,6 +17,7 @@
 #include "Deconvolve.h"
 #include "QualityCheck.h"
 #include "media/Tracking.h"
+#include "media/FaceTracks.h"
 
 #include <algorithm>
 #include <cmath>
@@ -869,6 +870,8 @@ namespace {
 thread_local std::shared_ptr<const DepthMap> tDepth;
 thread_local std::shared_ptr<const ValueMap> tPerson;
 thread_local std::shared_ptr<const std::vector<FaceBox>> tFaces;
+// The media time of the frame applyVideoEffect() is working on, for the effects that follow the footage.
+thread_local double tSourceSeconds = -1;
 }  // namespace
 
 const std::vector<FaceBox>* currentFaces() { return tFaces.get(); }
@@ -1173,6 +1176,61 @@ std::shared_ptr<const StabilizePlan> stabilizePlan(const Effect& e, FrameTime t,
     return plan;
 }
 
+// The analysis of a Redact Faces effect, read once per version of it.
+std::shared_ptr<const FaceTracks> faceTracksOf(const Effect& e) {
+    const std::string& text = e.s("tracks");
+    if (text.empty()) return nullptr;
+    static std::mutex m;
+    static std::map<size_t, std::shared_ptr<const FaceTracks>> cache;
+    const size_t key = std::hash<std::string>{}(text);
+    std::lock_guard lock(m);
+    auto& slot = cache[key];
+    if (!slot) {
+        auto t = std::make_shared<FaceTracks>();
+        if (!faceTracksFromString(text, *t)) return nullptr;
+        if (cache.size() > 32) cache.clear();
+        cache[key] = t;
+        return t;
+    }
+    return slot;
+}
+
+// Whether the analysis covers the frame: a still's always does; a video's within the seconds analysed (half a frame
+// either side, and the hold).
+bool tracksCover(const FaceTracks& tr, const Effect& e, double sourceSeconds) {
+    if (tr.step <= 0) return true;
+    if (sourceSeconds < 0) return false;
+    const double slack = 0.5 / tr.fps + std::max(0.0, e.p("hold", 0, 12)) / tr.fps;
+    return sourceSeconds >= tr.start - slack && sourceSeconds <= tr.end + slack;
+}
+
+void redactFacesEffect(const Effect& e, FrameTime t, Image& img, double sourceSeconds) {
+    std::vector<FaceBox> covered, shown;
+    auto tracks = faceTracksOf(e);
+    if (tracks && tracksCover(*tracks, e, sourceSeconds)) {
+        const std::set<int> keep = trackIdsFromString(e.s("keep"));
+        for (const TrackedFace& f : trackedFacesAt(*tracks, sourceSeconds, int(std::lround(e.p("hold", t, 12)))))
+            (keep.count(f.track) ? shown : covered).push_back(f.box);
+    } else if (const std::vector<FaceBox>* faces = currentFaces()) {
+        covered = *faces;
+    }
+    RedactSettings rs;
+    rs.style = int(std::lround(e.p("style", t)));
+    rs.strength = e.p("strength", t, 70) / 100;
+    rs.ellipse = e.p("shape", t) < 0.5;
+    rs.expand = e.p("expand", t, 30) / 100;
+    rs.feather = e.p("feather", t, 15) / 100;
+    rs.color[0] = float(e.p("color.r", t, 0)), rs.color[1] = float(e.p("color.g", t, 0)), rs.color[2] = float(e.p("color.b", t, 0));
+    redactFaces(img, covered, rs);
+    if (e.p("show", t) > 0.5) {
+        std::vector<FaceBox> all = covered;
+        all.insert(all.end(), shown.begin(), shown.end());
+        std::vector<bool> red(covered.size(), true);
+        red.resize(all.size(), false);
+        outlineFaces(img, all, red, rs.expand);
+    }
+}
+
 void stabilize(const Effect& e, FrameTime t, Image& img, double sourceSeconds) {
     if (sourceSeconds < 0 || img.empty()) return;
     auto plan = stabilizePlan(e, t, double(img.height) / img.width);
@@ -1223,8 +1281,19 @@ void stabilize(const Effect& e, FrameTime t, Image& img, double sourceSeconds) {
 }
 }  // namespace
 
+bool redactNeedsLiveFaces(const Effect& e, double sourceSeconds) {
+    if (!e.enabled || e.type != "redact_faces") return false;
+    auto tracks = faceTracksOf(e);
+    return !tracks || !tracksCover(*tracks, e, sourceSeconds);
+}
+
 void applyVideoEffect(const Effect& e, FrameTime t, Image& img, double pixelScale, double sourceSeconds) {
     if (!e.enabled || img.empty()) return;
+    struct SourceTime {
+        double previous;
+        explicit SourceTime(double s) : previous(tSourceSeconds) { tSourceSeconds = s; }
+        ~SourceTime() { tSourceSeconds = previous; }
+    } sourceTime(sourceSeconds);
     if (e.type == "stabilize" || e.type == "rolling_shutter") {
         stabilize(e, t, img, sourceSeconds);  // moves the whole frame: masks do not apply
         return;
@@ -1420,6 +1489,8 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
             fs.showMask = e.p("show", t) > 0.5;
             refineFaces(img, *faces, fs);
         }
+    } else if (ty == "redact_faces") {
+        redactFacesEffect(e, t, img, tSourceSeconds);
     } else if (ty == "blemish_remover") {
         if (const std::vector<FaceBox>* faces = currentFaces()) {
             BlemishSettings bs;

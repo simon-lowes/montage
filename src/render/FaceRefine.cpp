@@ -287,3 +287,104 @@ int removeBlemishes(Image& img, const std::vector<FaceBox>& faces, const Blemish
 }
 
 }  // namespace montage
+
+namespace montage {
+
+void redactionShape(const FaceBox& f, int w, int h, double expand, double& cx, double& cy, double& rx, double& ry) {
+    // A face's box runs from the brows to the chin: the shape reaches up for the forehead and hair.
+    cx = (f.x + f.w / 2.0) * w;
+    cy = (f.y + f.h / 2.0 - f.h * 0.06) * h;
+    rx = f.w * w / 2.0 * (1 + std::max(0.0, expand));
+    ry = f.h * h / 2.0 * (1 + std::max(0.0, expand)) * 1.12;
+}
+
+void redactFaces(Image& img, const std::vector<FaceBox>& faces, const RedactSettings& s) {
+    if (img.empty()) return;
+    const double feather = std::clamp(s.feather, 0.0, 1.0);
+    for (const FaceBox& f : faces) {
+        double cx, cy, rx, ry;
+        redactionShape(f, img.width, img.height, s.expand, cx, cy, rx, ry);
+        if (rx < 0.5 || ry < 0.5) continue;
+        const double ox = rx * (1 + feather), oy = ry * (1 + feather);
+        const int x0 = std::max(0, int(std::floor(cx - ox))), x1 = std::min(img.width, int(std::ceil(cx + ox)) + 1);
+        const int y0 = std::max(0, int(std::floor(cy - oy))), y1 = std::min(img.height, int(std::ceil(cy + oy)) + 1);
+        if (x0 >= x1 || y0 >= y1) continue;
+        // How much of each pixel is covered: 1 inside the shape, falling to 0 across the feather.
+        auto cover = [&](int x, int y) {
+            const double dx = (x + 0.5 - cx) / rx, dy = (y + 0.5 - cy) / ry;
+            const double d = s.ellipse ? std::hypot(dx, dy) : std::max(std::fabs(dx), std::fabs(dy));
+            if (d <= 1) return 1.0;
+            return feather > 0 ? std::max(0.0, 1 - (d - 1) / feather) : 0.0;
+        };
+        const double size = std::max(f.w * img.width, f.h * img.height);
+        // The covering picture for the area round the face.
+        Image cover0;
+        int cx0 = x0, cy0 = y0;
+        if (s.style == 0) {
+            const double radius = std::max(1.0, std::clamp(s.strength, 0.0, 1.0) * 0.5 * size);
+            const int m = int(std::ceil(radius * 1.5));
+            cx0 = std::max(0, x0 - m), cy0 = std::max(0, y0 - m);
+            const int cx1 = std::min(img.width, x1 + m), cy1 = std::min(img.height, y1 + m);
+            cover0 = Image(cx1 - cx0, cy1 - cy0, Image::Uninitialized{});
+            for (int y = cy0; y < cy1; ++y) std::copy(img.at(cx0, y), img.at(cx0, y) + size_t(cx1 - cx0) * 4, cover0.row(y - cy0));
+            gaussianBlur(cover0, radius);
+        } else if (s.style == 1) {
+            const double across = 24 - 19 * std::clamp(s.strength, 0.0, 1.0);
+            const int block = std::max(2, int(std::lround(size / across)));
+            cover0 = Image(x1 - x0, y1 - y0, Image::Uninitialized{});
+            for (int by = y0; by < y1; by += block)
+                for (int bx = x0; bx < x1; bx += block) {
+                    const int ex = std::min(x1, bx + block), ey = std::min(y1, by + block);
+                    double sum[4] = {0, 0, 0, 0};
+                    for (int y = by; y < ey; ++y)
+                        for (int x = bx; x < ex; ++x)
+                            for (int c = 0; c < 4; ++c) sum[c] += img.at(x, y)[c];
+                    const double n = double(ex - bx) * (ey - by);
+                    for (int y = by; y < ey; ++y)
+                        for (int x = bx; x < ex; ++x)
+                            for (int c = 0; c < 4; ++c) cover0.at(x - x0, y - y0)[c] = float(sum[c] / n);
+                }
+        }
+        parallelRows(y1 - y0, [&](int r0, int r1) {
+            for (int y = y0 + r0; y < y0 + r1; ++y)
+                for (int x = x0; x < x1; ++x) {
+                    const double k = cover(x, y);
+                    if (k <= 0) continue;
+                    float* p = img.at(x, y);
+                    float q[4];
+                    if (s.style == 2) {
+                        for (int c = 0; c < 3; ++c) q[c] = s.color[c] * p[3];
+                        q[3] = p[3];
+                    } else {
+                        const float* c0 = cover0.at(x - cx0, y - cy0);
+                        std::copy(c0, c0 + 4, q);
+                    }
+                    for (int c = 0; c < 4; ++c) p[c] = float(p[c] + (q[c] - p[c]) * k);
+                }
+        });
+    }
+}
+
+void outlineFaces(Image& img, const std::vector<FaceBox>& faces, const std::vector<bool>& covered, double expand) {
+    if (img.empty()) return;
+    const int t = std::max(1, int(std::lround(img.width / 640.0)));
+    for (size_t i = 0; i < faces.size(); ++i) {
+        double cx, cy, rx, ry;
+        redactionShape(faces[i], img.width, img.height, expand, cx, cy, rx, ry);
+        const bool red = i < covered.size() ? covered[i] : true;
+        const float col[3] = {red ? 1.0f : 0.2f, red ? 0.2f : 1.0f, red ? 0.2f : 0.4f};
+        const int x0 = std::max(0, int(cx - rx)), x1 = std::min(img.width - 1, int(cx + rx));
+        const int y0 = std::max(0, int(cy - ry)), y1 = std::min(img.height - 1, int(cy + ry));
+        auto put = [&](int x, int y) {
+            if (x < 0 || y < 0 || x >= img.width || y >= img.height) return;
+            float* p = img.at(x, y);
+            p[0] = col[0], p[1] = col[1], p[2] = col[2], p[3] = 1;
+        };
+        for (int k = 0; k < t; ++k) {
+            for (int x = x0; x <= x1; ++x) put(x, y0 + k), put(x, y1 - k);
+            for (int y = y0; y <= y1; ++y) put(x0 + k, y), put(x1 - k, y);
+        }
+    }
+}
+
+}  // namespace montage

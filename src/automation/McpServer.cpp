@@ -85,6 +85,7 @@
 #include "render/QualityCheck.h"
 #include "media/Decoder.h"
 #include "media/Faces.h"
+#include "media/FaceTracks.h"
 #include "media/DepthMap.h"
 #include "media/Matting.h"
 #include "media/Inpaint.h"
@@ -1505,7 +1506,7 @@ void McpServer::Impl::addTools() {
             if (type == "object_removal" && (!inpaintAvailable() || !inpaintModel().installed()))
                 return fail("Object Removal needs its model: run `scripts/fetch-models.sh` or add it once in the app");
             if (needsFaces(e) && (!faceSearchAvailable() || !faceModel().installed()))
-                return fail("Face Refinement needs the face models: run `scripts/fetch-models.sh` or add it once in the app");
+                return fail("Face Refinement, Blemish Remover and Redact Faces need the face models: run `scripts/fetch-models.sh` or add them once in the app");
             if ((needsPersonMatte(e, 0) || type == "behind_people") && (!mattingAvailable() || !mattingModel().installed()))
                 return fail("Remove Background, Behind People and People masks need their model: run `scripts/fetch-models.sh` or add one once in the app");
             if (needsDepth(e, 0) && (!depthAvailable() || !depthModel().installed()))
@@ -3094,6 +3095,105 @@ void McpServer::Impl::addTools() {
             QJsonObject out{{"regions", made}, {"total", int(all.size())}};
             if (!found.isEmpty()) out["found"] = found;
             return ok(QStringLiteral("%1 region(s) on the clip").arg(all.size()), out);
+        });
+
+    add("montage_redact_faces", "Redact faces",
+        "Hide faces in a video clip, as news and documentary editors must for people who have not agreed to be shown: "
+        "every face is found, followed from frame to frame (a face lost for a few frames stays covered) and grouped by "
+        "person, then blurred, pixelated or covered with a solid colour. The first call analyses the clip (kept on the "
+        "clip, so later calls are quick) and covers everyone; it reports the faces found as numbered groups, named when "
+        "they match people found by People search. Then \"show\" leaves the given groups (numbers, or names of people) "
+        "uncovered, or \"cover_only\" covers just them. reanalyse looks again (after the clip was lengthened).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "clip":{"type":"number","description":"Video clip id"},
+            "show":{"type":"array","items":{"type":["number","string"]},"description":"Groups (1-based) or people's names left uncovered"},
+            "cover_only":{"type":"array","items":{"type":["number","string"]},"description":"Only these groups or people are covered"},
+            "style":{"type":"string","enum":["blur","pixelate","solid"]},
+            "strength":{"type":"number","description":"0-100 (default 70)"},
+            "hold":{"type":"number","description":"Frames a lost face stays covered (default 12)"},
+            "reanalyse":{"type":"boolean"}},"required":["project","clip"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            Clip* c = edit::clipById(s, Id(a.value("clip").toDouble()));
+            if (!c || !c->mediaId) throw ArgError{"No such clip"};
+            const auto where = edit::locate(s, c->id);
+            const MediaItem* m = l.project.findMedia(c->mediaId);
+            if (!where || where->track.kind != TrackKind::Video || !m || (m->kind != MediaKind::Video && m->kind != MediaKind::Image))
+                throw ArgError{"Give a video clip"};
+            if (a.contains("show") && a.contains("cover_only")) throw ArgError{"Give \"show\" or \"cover_only\", not both"};
+            const QString styleName = a.value("style").toString();
+            if (!styleName.isEmpty() && styleName != "blur" && styleName != "pixelate" && styleName != "solid")
+                throw ArgError{"style is blur, pixelate or solid"};
+            if (a.contains("strength") && !(a.value("strength").toDouble() >= 0 && a.value("strength").toDouble() <= 100))
+                throw ArgError{"strength is 0 to 100"};
+            if (a.contains("hold") && !(a.value("hold").toDouble() >= 0 && a.value("hold").toDouble() <= 60)) throw ArgError{"hold is 0 to 60 frames"};
+            double start = 0, end = 0;
+            clipMediaSpan(s, *c, m->kind == MediaKind::Image, start, end);
+            FaceTracks tracks;
+            const Effect* existing = redactFacesEffectOf(l.project, *c, false);
+            bool have = existing && faceTracksFromString(existing->s("tracks"), tracks);
+            if (have && tracks.step > 0 && (start < tracks.start - 1 / tracks.fps || end > tracks.end + 1 / tracks.fps)) have = false;
+            bool analysed = false;
+            if (!have || a.value("reanalyse").toBool()) {
+                if (!faceSearchAvailable() || !faceModel().installed())
+                    return fail("Redact Faces needs the face models: run `scripts/fetch-models.sh` or add them once in the app");
+                std::string err;
+                if (!trackFaces(m->path, start, end, tracks, {}, &err)) return fail(QString::fromStdString("Could not look for faces: " + err));
+                analysed = true;
+            }
+            std::vector<FaceGroup> groups = groupFaceTracks(tracks);
+            matchProjectPeople(l.project, groups);
+            // Which groups the list names: a number, or a person's name.
+            auto pick = [&](const QJsonArray& list) {
+                std::set<size_t> chosen;
+                for (const QJsonValue& v : list) {
+                    if (v.isDouble()) {
+                        const int n = v.toInt();
+                        if (n < 1 || n > int(groups.size())) throw ArgError{QStringLiteral("There is no face group %1 (1 to %2)").arg(n).arg(groups.size())};
+                        chosen.insert(size_t(n - 1));
+                        continue;
+                    }
+                    const QString name = v.toString().trimmed();
+                    bool found = false;
+                    for (size_t g = 0; g < groups.size(); ++g)
+                        if (groups[g].person && QString::fromStdString(personName(l.project, groups[g].person)).compare(name, Qt::CaseInsensitive) == 0)
+                            chosen.insert(g), found = true;
+                    if (!found) throw ArgError{QStringLiteral("No face in the clip is %1").arg(name)};
+                }
+                return chosen;
+            };
+            std::set<int> keep;
+            if (a.contains("show")) {
+                for (size_t g : pick(a.value("show").toArray())) keep.insert(groups[g].tracks.begin(), groups[g].tracks.end());
+            } else if (a.contains("cover_only")) {
+                const std::set<size_t> cover = pick(a.value("cover_only").toArray());
+                for (size_t g = 0; g < groups.size(); ++g)
+                    if (!cover.count(g)) keep.insert(groups[g].tracks.begin(), groups[g].tracks.end());
+            } else if (existing && !analysed) {
+                keep = trackIdsFromString(existing->s("keep"));
+            }
+            Effect* e = redactFacesEffectOf(l.project, *c, true);
+            e->enabled = true;
+            e->strings["tracks"] = faceTracksToString(tracks);
+            if (keep.empty()) e->strings.erase("keep");
+            else e->strings["keep"] = trackIdsToString(keep);
+            if (!styleName.isEmpty()) e->params["style"] = Param(styleName == "blur" ? 0.0 : styleName == "pixelate" ? 1.0 : 2.0);
+            if (a.contains("strength")) e->params["strength"] = Param(a.value("strength").toDouble());
+            if (a.contains("hold")) e->params["hold"] = Param(std::round(a.value("hold").toDouble()));
+            save(l);
+            QJsonArray list;
+            int covered = 0;
+            for (size_t g = 0; g < groups.size(); ++g) {
+                const bool shown = std::all_of(groups[g].tracks.begin(), groups[g].tracks.end(), [&](int id) { return keep.count(id) > 0; });
+                covered += shown ? 0 : 1;
+                QJsonObject o{{"group", int(g + 1)}, {"seconds", std::round(groups[g].seconds * 10) / 10}, {"tracks", int(groups[g].tracks.size())},
+                              {"covered", !shown}, {"best_time", groups[g].bestTime}};
+                if (groups[g].person) o["person"] = QString::fromStdString(personName(l.project, groups[g].person));
+                list.append(o);
+            }
+            return ok(QStringLiteral("%1 face group(s) in the clip, %2 covered%3").arg(groups.size()).arg(covered).arg(analysed ? " (analysed)" : ""),
+                      QJsonObject{{"groups", list}, {"analysed", analysed}, {"source_start", tracks.start}, {"source_end", tracks.end}});
         });
 
     add("montage_checkerboard", "Split dialogue by speaker",

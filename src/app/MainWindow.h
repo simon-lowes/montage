@@ -34,6 +34,7 @@ class QTabBar;
 namespace montage {
 
 class SpectralRepairDialog;
+class RedactFacesDialog;
 
 class EditorState;
 class CompareDialog;
@@ -132,6 +133,7 @@ public:
     void micBleedDialog();
     // Clip › Spectral Repair…: the editor for the selected audio clip (or the one under the playhead), shown modeless.
     SpectralRepairDialog* spectralRepairDialog();
+    RedactFacesDialog* redactFacesDialog();
     // Clip › Remove Letterbox: black bars baked into the selected video clips' pictures found, cropped off and the rest
     // scaled to fill the frame (render/Letterbox.h), one undo step. How many clips changed.
     int removeLetterbox();
