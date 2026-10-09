@@ -126,6 +126,8 @@ struct MediaItem {
     std::string bin;         // bin path, "/" between nested bins ("Interviews/Day 1"), "" = the project root
     std::string colorSpace;     // detected from the file's colour tags (ColorSpace.h id), "" = Rec.709
     std::string colorOverride;  // Interpret Colour: the space to read it as, "" = as detected
+    // 360° footage: "equirect" (from the file's spherical metadata, or set by hand), "" = a flat picture.
+    std::string projection;
     double timecode = -1;       // start timecode in seconds (for multicam sync), -1 = none
     // Speech-to-text of the media's audio (shared: undo snapshots copy the pointer).
     std::shared_ptr<const Transcript> transcript;
@@ -349,6 +351,7 @@ struct Sequence {
     std::vector<std::string> mutedRoles;  // audio roles not heard (clip roles, see Clip::role)
     std::string colorSpace = "rec709";  // working and delivery space (ColorSpace.h id)
     double hdrPeakNits = 1000;          // mastering peak for HDR spaces
+    bool spherical = false;             // a 360° sequence (equirectangular): exports say so to players and YouTube
     FrameTime inPoint = -1;   // In / Out marks; both frames are included, -1 = unset
     FrameTime outPoint = -1;
     FrameTime playhead = 0;

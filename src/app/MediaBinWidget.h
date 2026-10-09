@@ -110,6 +110,8 @@ public:
     // How new clips of the media take their channels (MediaItem::audioChannelMode: "", "mono", "pairs"); media with
     // a single channel keep the mix. One undo step; false if nothing changed.
     bool setAudioChannelMode(const std::vector<Id>& media, const std::string& mode);
+    // Marks pictures as 360° footage ("equirect") or flat (""), as Premiere's Modify > VR Properties; one undo step.
+    bool setMediaProjection(const std::vector<Id>& media, const std::string& projection);
 
 public slots:
     void importDialog();

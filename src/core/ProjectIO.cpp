@@ -499,6 +499,7 @@ QJsonObject sequenceToJson(const Sequence& s) {
     }
     if (s.colorSpace != "rec709") o["colorSpace"] = qs(s.colorSpace);
     if (s.hdrPeakNits != 1000) o["hdrPeakNits"] = s.hdrPeakNits;
+    if (s.spherical) o["spherical"] = true;
     if (s.audioLayout != "stereo") o["audioLayout"] = qs(s.audioLayout);
     return o;
 }
@@ -523,6 +524,7 @@ Sequence sequenceFromJson(const QJsonObject& o) {
     for (auto it = gains.begin(); it != gains.end(); ++it) s.folderGains[it.key().toStdString()] = it.value().toDouble();
     s.colorSpace = o.contains("colorSpace") ? ss(o.value("colorSpace")) : "rec709";
     s.hdrPeakNits = std::clamp(o.value("hdrPeakNits").toDouble(1000), 100.0, 10000.0);
+    s.spherical = o.value("spherical").toBool(false);
     s.audioLayout = o.contains("audioLayout") ? ss(o.value("audioLayout")) : "stereo";
     if (s.audioLayout != "5.1" && s.audioLayout != "7.1") s.audioLayout = "stereo";
     for (const auto& t : o.value("video").toArray()) s.videoTracks.push_back(trackFromJson(t.toObject(), TrackKind::Video));
@@ -629,6 +631,7 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
         if (!m.bin.empty()) o["bin"] = qs(m.bin);
         if (!m.colorSpace.empty()) o["colorSpace"] = qs(m.colorSpace);
         if (!m.colorOverride.empty()) o["colorOverride"] = qs(m.colorOverride);
+        if (!m.projection.empty()) o["projection"] = qs(m.projection);
         if (m.timecode >= 0) o["timecode"] = m.timecode;
         if (!m.audioChannelMode.empty()) o["audioChannelMode"] = qs(m.audioChannelMode);
         if (m.audioStreams.size() > 1) {
@@ -752,6 +755,7 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
         m.bin = ss(o.value("bin"));
         m.colorSpace = ss(o.value("colorSpace"));
         m.colorOverride = ss(o.value("colorOverride"));
+        m.projection = ss(o.value("projection"));
         m.timecode = o.value("timecode").toDouble(-1);
         for (const auto& v : o.value("audioStreams").toArray()) m.audioStreams.push_back(std::max(1, v.toInt(1)));
         m.audioChannelMode = ss(o.value("audioChannelMode"));

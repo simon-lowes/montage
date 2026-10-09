@@ -3961,6 +3961,7 @@ void MainWindow::newSequence() {
             s.colorSpace = spec.colorSpace;
             s.hdrPeakNits = spec.hdrPeakNits;
             s.audioLayout = spec.audioLayout;
+            s.spherical = spec.spherical;
             return true;
         });
 }

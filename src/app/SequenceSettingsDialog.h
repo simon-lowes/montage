@@ -9,6 +9,7 @@
 
 #include "core/Model.h"
 
+class QCheckBox;
 class QComboBox;
 class QLabel;
 class QLineEdit;
@@ -27,6 +28,7 @@ struct NewSequenceSpec {
     std::string colorSpace = "rec709";
     double hdrPeakNits = 1000;
     std::string audioLayout = "stereo";  // "stereo", "5.1" or "7.1"
+    bool spherical = false;              // a 360° sequence (Sequence::spherical)
 };
 
 // Spin box that only accepts even values (most encoders need even frame sizes).
@@ -72,6 +74,7 @@ private:
     QComboBox* colorSpace_ = nullptr;
     QSpinBox* hdrPeak_ = nullptr;
     QComboBox* audioLayout_ = nullptr;
+    QCheckBox* spherical_ = nullptr;
     QLabel* summary_ = nullptr;
     QPushButton* okButton_ = nullptr;
     bool updating_ = false;

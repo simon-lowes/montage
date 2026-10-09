@@ -27,6 +27,7 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+#include <libavutil/spherical.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/mastering_display_metadata.h>
 #include <libavutil/opt.h>
@@ -811,6 +812,23 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         avcodec_parameters_from_context(o.vst->codecpar, o.vctx);
         o.vst->time_base = o.vctx->time_base;
         o.vst->avg_frame_rate = fps;
+        if (seq.spherical) {
+            // A 360° sequence: equirectangular spherical metadata, so players and YouTube show it as 360°
+            // (MP4/MOV sv3d and st3d boxes, which FFmpeg writes only when asked to go beyond the standard; Matroska
+            // Projection).
+            size_t size = 0;
+            if (AVSphericalMapping* map = av_spherical_alloc(&size)) {
+                map->projection = AV_SPHERICAL_EQUIRECTANGULAR;
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(60, 29, 100)
+                if (!av_packet_side_data_add(&o.vst->codecpar->coded_side_data, &o.vst->codecpar->nb_coded_side_data,
+                                             AV_PKT_DATA_SPHERICAL, map, size, 0))
+                    av_free(map);
+#else
+                if (av_stream_add_side_data(o.vst, AV_PKT_DATA_SPHERICAL, reinterpret_cast<uint8_t*>(map), size) < 0) av_free(map);
+#endif
+            }
+            o.oc->strict_std_compliance = FF_COMPLIANCE_UNOFFICIAL;
+        }
         o.vframe = av_frame_alloc();
         o.vframe->format = o.vctx->pix_fmt;
         o.vframe->width = W;

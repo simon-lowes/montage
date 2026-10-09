@@ -21,6 +21,7 @@
 #include "core/ClipAnimation.h"
 #include "core/GradeVersions.h"
 #include "core/AudioChannels.h"
+#include "render/Spherical.h"
 #include "core/AutoTag.h"
 #include "core/Automation.h"
 #include "core/CaptionTools.h"
@@ -3365,6 +3366,67 @@ void McpServer::Impl::addTools() {
             for (Id x : r.created) created.append(double(x));
             return ok(QStringLiteral("Source channels: %1\n").arg(QJsonDocument(names).toJson(QJsonDocument::Compact).constData()) + lines.join('\n'),
                       QJsonObject{{"source_channels", names}, {"clips", clips}, {"created", created}});
+        });
+
+    add("montage_reframe_360", "Reframe 360° video",
+        "Work with 360° (equirectangular) footage, as GoPro's Reframe and Insta360 Studio do. With `clip`: aim its "
+        "Reframe 360° view (added if missing): `yaw` (degrees right), `pitch` (degrees up), `roll`, `fov` (degrees "
+        "across; flat up to 170, little planet and tunnel up to 330) and `projection` (flat, little_planet, tunnel); "
+        "with `at` (a sequence frame inside the clip) the angles become smooth keys there, so several calls make a "
+        "camera move. With `media` and `is_360`: mark footage as 360° or flat (360° footage placed in a flat sequence "
+        "gets the view at once). With `sequence_360`: make the active sequence a 360° one, whose exports carry "
+        "spherical metadata for players and YouTube.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
+            "yaw":{"type":"number"},"pitch":{"type":"number"},"roll":{"type":"number"},"fov":{"type":"number"},
+            "projection":{"type":"string","enum":["flat","little_planet","tunnel"]},"at":{"type":"integer"},
+            "media":{"type":"number"},"is_360":{"type":"boolean"},"sequence_360":{"type":"boolean"}},"required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            QStringList done;
+            if (a.contains("media")) {
+                MediaItem* m = l.project.findMedia(Id(a.value("media").toDouble()));
+                if (!m || !m->hasVideo || m->kind == MediaKind::Sequence) throw ArgError{"No such picture media"};
+                m->projection = a.value("is_360").toBool(true) ? "equirect" : "";
+                done << QStringLiteral("%1 is %2").arg(QString::fromStdString(m->name), m->projection.empty() ? "flat" : "360° footage");
+            }
+            if (a.contains("sequence_360")) {
+                l.seq().spherical = a.value("sequence_360").toBool();
+                done << (l.seq().spherical ? QStringLiteral("The sequence is 360°") : QStringLiteral("The sequence is flat"));
+            }
+            QJsonObject view;
+            if (a.contains("clip")) {
+                const Clip& c = clipArg(l, a);
+                const Id id = c.id;
+                ReframeView v;
+                if (a.contains("yaw")) v.yaw = a.value("yaw").toDouble();
+                if (a.contains("pitch")) v.pitch = a.value("pitch").toDouble();
+                if (a.contains("roll")) v.roll = a.value("roll").toDouble();
+                if (a.contains("fov")) v.fov = a.value("fov").toDouble();
+                if (a.contains("projection")) {
+                    static const QStringList names = {"flat", "little_planet", "tunnel"};
+                    const int k = int(names.indexOf(a.value("projection").toString()));
+                    if (k < 0) throw ArgError{"projection is flat, little_planet or tunnel"};
+                    v.projection = SphereView(k);
+                }
+                FrameTime key = -1;
+                if (a.contains("at")) {
+                    key = FrameTime(a.value("at").toInteger()) - c.start;
+                    if (key < 0 || key >= c.duration) throw ArgError{"at is a frame inside the clip"};
+                }
+                check(edit::setReframe360(l.project, l.seq(), id, v, key));
+                const Clip* after = edit::clipById(l.seq(), id);
+                for (const Effect& e : after->effects)
+                    if (e.type == "reframe_360") {
+                        const FrameTime t = std::max<FrameTime>(0, key);
+                        view = QJsonObject{{"yaw", e.p("yaw", t)}, {"pitch", e.p("pitch", t)}, {"roll", e.p("roll", t)},
+                                           {"fov", e.p("fov", t, 100)}, {"keys", int(e.params.count("yaw") ? e.params.at("yaw").keys.size() : 0)}};
+                        done << QStringLiteral("View: yaw %1°, pitch %2°, fov %3°%4").arg(e.p("yaw", t)).arg(e.p("pitch", t)).arg(e.p("fov", t, 100))
+                                    .arg(key >= 0 ? QStringLiteral(" (key at frame %1)").arg(c.start + key) : QString());
+                    }
+            }
+            if (done.isEmpty()) throw ArgError{"Give clip, media or sequence_360"};
+            save(l);
+            return ok(done.join('\n'), QJsonObject{{"view", view}});
         });
 
     add("montage_vfx_pull", "VFX pulls",

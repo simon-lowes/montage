@@ -2,6 +2,7 @@
 #include "SequenceSettingsDialog.h"
 #include "Settings.h"
 
+#include <QCheckBox>
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QFormLayout>
@@ -170,6 +171,11 @@ SequenceSettingsDialog::SequenceSettingsDialog(QWidget* parent) : QDialog(parent
     form->addRow(tr("Audio channels:"), audioLayout_);
     form->addRow(tr("Colour space:"), colorSpace_);
     form->addRow(tr("HDR peak:"), hdrPeak_);
+    spherical_ = new QCheckBox(tr("360° video (equirectangular)"), this);
+    spherical_->setObjectName(QStringLiteral("sphericalSequence"));
+    spherical_->setToolTip(tr("Exports say they are 360° to players and YouTube; 360° footage comes in whole, not as a view.\n"
+                              "Use a 2:1 frame size such as 3840 x 1920 or 5760 x 2880."));
+    form->addRow(tr("Projection:"), spherical_);
     form->addRow(QString(), summary_);
 
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
@@ -207,6 +213,7 @@ void SequenceSettingsDialog::setSpec(const NewSequenceSpec& spec) {
     hdrPeak_->setValue(int(std::lround(spec.hdrPeakNits)));
     const int al = audioLayout_->findData(QString::fromStdString(spec.audioLayout));
     audioLayout_->setCurrentIndex(al >= 0 ? al : 0);
+    spherical_->setChecked(spec.spherical);
     updateSummary();
 }
 
@@ -221,6 +228,7 @@ NewSequenceSpec SequenceSettingsDialog::spec() const {
     s.colorSpace = colorSpace_->currentData().toString().toStdString();
     s.hdrPeakNits = hdrPeak_->value();
     s.audioLayout = audioLayout_->currentData().toString().toStdString();
+    s.spherical = spherical_->isChecked();
     return s;
 }
 
@@ -293,7 +301,7 @@ bool SequenceSettingsDialog::editActive(EditorState* state, QWidget* parent) {
     if (!state || !state->sequence()) return false;
     const Sequence& seq = *state->sequence();
     const NewSequenceSpec before{QString::fromStdString(seq.name), seq.width, seq.height, seq.fps, seq.sampleRate,
-                                 seq.colorSpace, seq.hdrPeakNits, seq.audioLayout};
+                                 seq.colorSpace, seq.hdrPeakNits, seq.audioLayout, seq.spherical};
 
     SequenceSettingsDialog dlg(parent);
     dlg.setWindowTitle(tr("Sequence Settings"));
@@ -308,7 +316,7 @@ bool SequenceSettingsDialog::editActive(EditorState* state, QWidget* parent) {
     const NewSequenceSpec after = dlg.spec();
     if (after.name == before.name && after.width == before.width && after.height == before.height &&
         after.fps == before.fps && after.sampleRate == before.sampleRate && after.colorSpace == before.colorSpace &&
-        after.hdrPeakNits == before.hdrPeakNits && after.audioLayout == before.audioLayout)
+        after.hdrPeakNits == before.hdrPeakNits && after.audioLayout == before.audioLayout && after.spherical == before.spherical)
         return false;
 
     const std::string name = after.name.toStdString();
@@ -321,6 +329,7 @@ bool SequenceSettingsDialog::editActive(EditorState* state, QWidget* parent) {
         s.colorSpace = after.colorSpace;
         s.hdrPeakNits = after.hdrPeakNits;
         s.audioLayout = after.audioLayout;
+        s.spherical = after.spherical;
         // Keep the media item that represents this sequence (for nesting) in sync.
         for (MediaItem& m : p.media) {
             if (m.kind != MediaKind::Sequence || m.sequenceId != s.id) continue;

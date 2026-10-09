@@ -184,6 +184,14 @@ std::vector<EffectInfo> buildCatalog() {
                  {pct("readout", "Readout (% of a frame)", 0, 100, 50), choice("framing", "Framing", {"Zoom to Fill", "Show Edges"}, 0)},
                  {}});
     for (auto& pi : c.back().params) pi.keyframeable = false;
+    // Reframe 360° (GoPro's Reframe, Insta360 Studio's keyframes, Premiere's VR Projection): a flat view out of
+    // equirectangular 360° footage, aimed and zoomed with keys, or the whole sphere as a little planet or a tunnel.
+    // The clip takes the sequence's shape (render/Spherical.h).
+    c.push_back({"reframe_360", "Reframe 360°", EffectCategory::VideoFilter, "Transform",
+                 {num("yaw", "Pan (°)", -360, 360, 0, 0.1), num("pitch", "Tilt (°)", -90, 90, 0, 0.1),
+                  num("roll", "Roll (°)", -180, 180, 0, 0.1), num("fov", "Field of View (°)", 20, 330, 100, 0.1),
+                  choice("projection", "Projection", {"Flat", "Little Planet", "Tunnel"}, 0)},
+                 {}});
     {
         // OpenColorIO transform from a config file, a built-in config or $OCIO (render/Ocio.h).
         EffectInfo ocio{"ocio", "OpenColorIO Transform", EffectCategory::VideoFilter, "Color",

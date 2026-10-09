@@ -731,6 +731,18 @@ Id MediaBinWidget::mergeClips(Id video, const std::vector<Id>& sounds, int syncB
     return made;
 }
 
+bool MediaBinWidget::setMediaProjection(const std::vector<Id>& media, const std::string& projection) {
+    return state_->edit(tr("360° Footage"), [media, projection](Project& p, Sequence&) {
+        bool any = false;
+        for (Id id : media)
+            if (MediaItem* m = p.findMedia(id); m && m->hasVideo && m->kind != MediaKind::Sequence && m->projection != projection) {
+                m->projection = projection;
+                any = true;
+            }
+        return any;
+    });
+}
+
 bool MediaBinWidget::setAudioChannelMode(const std::vector<Id>& media, const std::string& mode) {
     return state_->edit(tr("Audio Channels"), [media, mode](Project& p, Sequence&) {
         bool any = false;
@@ -1133,6 +1145,15 @@ void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos)
             a->setChecked(current == cs.id);
             a->setData(QString::fromStdString(cs.id));
         }
+        // 360° footage: placed in a flat sequence as a view out of the sphere (Reframe 360°).
+        bool all360 = true;
+        for (Id id : pictures) all360 = all360 && state_->project().findMedia(id)->projection == "equirect";
+        QAction* sphere = menu.addAction(tr("360° Footage"), this, [this, pictures, all360] {
+            setMediaProjection(pictures, all360 ? std::string() : std::string("equirect"));
+        });
+        sphere->setObjectName(QStringLiteral("mediaSpherical"));
+        sphere->setCheckable(true);
+        sphere->setChecked(all360);
     }
     // Audio Channels (Premiere's Modify > Audio Channels): how new clips of files with several channels take them.
     std::vector<Id> multichannel;

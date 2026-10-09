@@ -18,6 +18,7 @@ extern "C" {
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
+#include <libavutil/spherical.h>
 #include <libavutil/timecode.h>
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
@@ -63,6 +64,21 @@ int bestVideoStream(AVFormatContext* fmt) {
         }
     }
     return best;
+}
+
+// 360° footage: the stream's spherical mapping (MP4 sv3d, Matroska Projection), "equirect" for the whole sphere.
+std::string streamProjection(const AVStream* st) {
+    const uint8_t* data = nullptr;
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(60, 29, 100)
+    const AVPacketSideData* sd = av_packet_side_data_get(st->codecpar->coded_side_data,
+                                                         st->codecpar->nb_coded_side_data, AV_PKT_DATA_SPHERICAL);
+    if (sd) data = sd->data;
+#else
+    data = av_stream_get_side_data(st, AV_PKT_DATA_SPHERICAL, nullptr);
+#endif
+    if (!data) return {};
+    const auto* map = reinterpret_cast<const AVSphericalMapping*>(data);
+    return map->projection == AV_SPHERICAL_EQUIRECTANGULAR ? "equirect" : "";
 }
 
 int streamRotation(const AVStream* st) {
@@ -194,6 +210,7 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         const char* pri = av_color_primaries_name(st->codecpar->color_primaries);
         const char* trc = av_color_transfer_name(st->codecpar->color_trc);
         m.colorSpace = colorSpaceFromTags(pri ? pri : "", trc ? trc : "");
+        if (const std::string proj = streamProjection(st); !proj.empty()) m.projection = proj;
         if (m.colorSpace == "rec709") m.colorSpace.clear();
         int w = st->codecpar->width, h = st->codecpar->height;
         AVRational sar = st->sample_aspect_ratio.num ? st->sample_aspect_ratio : st->codecpar->sample_aspect_ratio;

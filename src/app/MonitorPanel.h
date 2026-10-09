@@ -57,9 +57,16 @@ public:
     QString twoUpLabel(bool right) const { return twoUpLabels_[right ? 1 : 0]; }
     // Where each half's picture is drawn.
     QRectF twoUpRect(bool right) const;
+    // Look around (a 360° view): dragging the picture reports how far it moved, as fractions of its width and
+    // height, instead of starting a drag.
+    void setLookAround(bool on);
+    bool lookAround() const { return lookAround_; }
 
 signals:
     void dragRequested();
+    void lookStarted();
+    void lookMoved(double dx, double dy);  // since the press
+    void lookFinished();
 
 protected:
     void paintEvent(QPaintEvent*) override;
@@ -83,6 +90,7 @@ private:
     mutable qint64 exposedKey_ = -1;
     mutable int exposedMode_ = 0;
     bool dragSource_ = false;
+    bool lookAround_ = false, looking_ = false;
     std::function<void(QPainter&, const QRectF&)> overlay_;
     QPoint pressPos_;
 };
@@ -139,6 +147,8 @@ public:
     void showTrimView(FrameTime left, FrameTime right, const QString& leftLabel, const QString& rightLabel);
     void endTrimView();
     bool trimViewShown() const { return trimView_; }
+    // Program: the selected clip whose Reframe 360° view a drag on the picture aims (0 = none).
+    Id lookClip() const { return lookClip_; }
 
 signals:
     void activated();  // the user interacted with this monitor
@@ -170,6 +180,10 @@ private:
     std::string waveformRequested_;  // the media whose audio decode this monitor started
 
     void renderTrimView();
+    void updateLookAround();
+    Id lookClip_ = 0;
+    double lookYaw_ = 0, lookPitch_ = 0, lookFov_ = 100;  // the view when the drag began
+    FrameTime lookAt_ = 0;                               // clip-local frame it is aimed at
     bool trimView_ = false, trimBusy_ = false, trimPending_ = false;
     FrameTime trimFrames_[2] = {-1, -1};
     QString trimLabels_[2];

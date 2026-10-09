@@ -56,6 +56,7 @@
 #include "media/Tracking.h"
 #include "media/Vector.h"
 #include "media/Beats.h"
+#include "render/Spherical.h"
 #include "render/AudioReactive.h"
 #include "render/VfxPull.h"
 #include "render/AafExport.h"
@@ -1812,6 +1813,156 @@ private slots:
         const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
         QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
         QVERIFY(r.value("structuredContent").toObject().value("keys").toInt() >= 2);
+    }
+
+    void reframe360() {
+        // A coded sphere: red is the longitude (0 at -180°, 1 at +180°), green the latitude (0 at the top).
+        Image sphere(720, 360);
+        for (int y = 0; y < 360; ++y)
+            for (int x = 0; x < 720; ++x) {
+                float* p = sphere.at(x, y);
+                p[0] = (x + 0.5f) / 720, p[1] = (y + 0.5f) / 360, p[2] = 0, p[3] = 1;
+            }
+        auto lonLat = [](const Image& img, int x, int y, double& lon, double& lat) {
+            lon = img.at(x, y)[0] * 360.0 - 180, lat = 90 - img.at(x, y)[1] * 180.0;
+        };
+        double lon, lat;
+        // Straight ahead, 90° across a 16:9 view: the centre is (0, 0), the right edge 45° right, the top 29.4° up.
+        Image v = reframeEquirect(sphere, 0, 0, 0, 90, SphereView::Flat, 320, 180);
+        QCOMPARE(v.width, 320);
+        lonLat(v, 160, 90, lon, lat);
+        QVERIFY2(std::fabs(lon) < 1 && std::fabs(lat) < 1, qPrintable(QString("%1 %2").arg(lon).arg(lat)));
+        lonLat(v, 319, 90, lon, lat);
+        QVERIFY2(std::fabs(lon - 45) < 1, qPrintable(QString::number(lon)));
+        lonLat(v, 160, 0, lon, lat);
+        QVERIFY2(std::fabs(lat - std::atan(9.0 / 16) * 180 / M_PI) < 1, qPrintable(QString::number(lat)));
+        // Turned 90° right, tilted 30° up: the centre follows.
+        v = reframeEquirect(sphere, 90, 30, 0, 90, SphereView::Flat, 320, 180);
+        lonLat(v, 160, 90, lon, lat);
+        QVERIFY2(std::fabs(lon - 90) < 1 && std::fabs(lat - 30) < 1, qPrintable(QString("%1 %2").arg(lon).arg(lat)));
+        // Rolled 90° clockwise: the right edge looks down.
+        v = reframeEquirect(sphere, 0, 0, 90, 90, SphereView::Flat, 320, 180);
+        lonLat(v, 319, 90, lon, lat);
+        QVERIFY2(std::fabs(lat + 45) < 1.5, qPrintable(QString::number(lat)));
+        // Little planet: the ground in the middle, the sky round the edge; the tunnel the other way.
+        v = reframeEquirect(sphere, 0, 0, 0, 270, SphereView::LittlePlanet, 200, 200);
+        lonLat(v, 100, 100, lon, lat);
+        QVERIFY2(lat < -85, qPrintable(QString::number(lat)));
+        lonLat(v, 0, 0, lon, lat);
+        QVERIFY2(lat > 30, qPrintable(QString::number(lat)));
+        v = reframeEquirect(sphere, 0, 0, 0, 270, SphereView::Tunnel, 200, 200);
+        lonLat(v, 100, 100, lon, lat);
+        QVERIFY2(lat > 85, qPrintable(QString::number(lat)));
+        double ex, ey;
+        equirectPoint(90, 45, 720, 360, ex, ey);
+        QCOMPARE(ex, 540.0);
+        QCOMPARE(ey, 90.0);
+
+        // The sphere as a 360° photo: placed in a flat sequence it comes in as a view, filling the frame.
+        const std::string still = path("sphere.png");
+        {
+            QImage q(720, 360, QImage::Format_RGB32);
+            for (int y = 0; y < 360; ++y)
+                for (int x = 0; x < 720; ++x) q.setPixel(x, y, qRgb(int(sphere.at(x, y)[0] * 255 + 0.5), int(sphere.at(x, y)[1] * 255 + 0.5), 0));
+            QVERIFY(q.save(QString::fromStdString(still)));
+        }
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320;
+        s.height = 180;
+        s.fps = Rational{25, 1};
+        MediaItem m = probeOrFail(p, still);
+        QVERIFY(m.projection.empty());  // a still says nothing of it
+        m.projection = "equirect";
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 50, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Id clip = s.videoTracks[0].clips.at(0).id;
+        QCOMPARE(s.videoTracks[0].clips.at(0).effects.at(0).type, std::string("reframe_360"));
+        RenderOptions o;
+        auto colourLonLat = [&](FrameTime t, int x, int y, double& lo, double& la) {
+            const Image f = renderSequenceFrame(p, s, t, o);
+            QVERIFY(f.at(0, 0)[3] > 0.99 && f.at(319, 179)[3] > 0.99);  // the view fills the frame
+            lonLat(f, x, y, lo, la);
+        };
+        colourLonLat(10, 160, 90, lon, lat);
+        QVERIFY2(std::fabs(lon) < 2 && std::fabs(lat) < 2, qPrintable(QString("%1 %2").arg(lon).arg(lat)));
+        // A camera move: keys at frames 0 and 40 from straight ahead to 120° right; halfway is about 60°.
+        QVERIFY(edit::setReframe360(p, s, clip, {0.0, 0.0, std::nullopt, 80.0, std::nullopt}, 0).ok);
+        QVERIFY(edit::setReframe360(p, s, clip, {120.0, 10.0, std::nullopt, std::nullopt, std::nullopt}, 40).ok);
+        QCOMPARE(edit::clipById(s, clip)->effects.size(), size_t(1));  // the same effect, aimed
+        colourLonLat(40, 160, 90, lon, lat);
+        QVERIFY2(std::fabs(lon - 120) < 2 && std::fabs(lat - 10) < 2, qPrintable(QString("%1 %2").arg(lon).arg(lat)));
+        colourLonLat(20, 160, 90, lon, lat);
+        QVERIFY2(std::fabs(lon - 60) < 3, qPrintable(QString::number(lon)));
+        QVERIFY(!edit::setReframe360(p, s, clip, {}, 500).ok);  // past the end
+        // Saved and loaded with its projection.
+        QVERIFY(saveProject(p, path("sphere.montage")));
+        Project loaded;
+        QVERIFY(loadProject(path("sphere.montage"), loaded));
+        QCOMPARE(loaded.findMedia(m.id)->projection, std::string("equirect"));
+        // A 360° sequence takes the footage whole, and its export says it is 360°.
+        const Id flatId = s.id;  // `s` does not outlive the new sequence's arrival
+        Sequence& vr = p.sequences.emplace_back(makeSequence(p, "VR", 512, 256, Rational{25, 1}, 1, 1));
+        vr.spherical = true;
+        QVERIFY(edit::placeMedia(p, vr, m.id, 0, 0, 10, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(vr.videoTracks[0].clips.at(0).effects.empty());
+        for (const char* name : {"vr.mp4", "vr.mkv"}) {
+            ExportSettings st;
+            st.path = path(name);
+            st.preset = "ultrafast";
+            std::string err;
+            QVERIFY2(exportSequence(p, vr, st, nullptr, nullptr, &err), err.c_str());
+            MediaItem back;
+            QVERIFY(probeMedia(st.path, back));
+            QVERIFY2(back.projection == "equirect", name);
+        }
+        // A flat export carries none.
+        {
+            ExportSettings st;
+            st.path = path("flat.mp4");
+            st.preset = "ultrafast";
+            std::string err;
+            QVERIFY2(exportSequence(p, *p.findSequence(flatId), st, nullptr, nullptr, &err), err.c_str());
+            MediaItem back;
+            QVERIFY(probeMedia(st.path, back));
+            QVERIFY(back.projection.empty());
+        }
+        // Over MCP: mark media, aim a view with keys, make a sequence 360°.
+        Project mp = makeDefaultProject();
+        MediaItem pm = probeOrFail(mp, still);
+        mp.media.push_back(pm);
+        QVERIFY(edit::placeMedia(mp, *mp.active(), pm.id, 0, 0, 60, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Id mclip = mp.active()->videoTracks[0].clips.at(0).id;
+        const QString project = QString::fromStdString(path("sphere-mcp.montage"));
+        QVERIFY(saveProject(mp, project.toStdString()));
+        McpServer server;
+        int rid = 1;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", rid++}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_reframe_360"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call({{"project", project}, {"media", double(pm.id)}, {"is_360", true}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        r = call({{"project", project}, {"clip", double(mclip)}, {"yaw", 0}, {"at", 0}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        r = call({{"project", project}, {"clip", double(mclip)}, {"yaw", -90}, {"fov", 120}, {"at", 30}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("view").toObject().value("keys").toInt(), 2);
+        QVERIFY(call({{"project", project}, {"clip", double(mclip)}, {"yaw", 0}, {"at", 999}}).value("isError").toBool());
+        QVERIFY(call({{"project", project}, {"clip", double(mclip)}, {"projection", "sideways"}}).value("isError").toBool());
+        r = call({{"project", project}, {"clip", double(mclip)}, {"projection", "little_planet"}, {"sequence_360", false}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        Project after;
+        QVERIFY(loadProject(project.toStdString(), after));
+        QCOMPARE(after.findMedia(pm.id)->projection, std::string("equirect"));
+        const Effect& e = after.active()->videoTracks[0].clips.at(0).effects.at(0);
+        QCOMPARE(e.type, std::string("reframe_360"));
+        QCOMPARE(e.p("yaw", 30), -90.0);
+        QCOMPARE(e.p("projection", 0), 1.0);
     }
 
     void vfxPullsWithHandles() {

@@ -2388,6 +2388,75 @@ private slots:
         state()->setSelection({}, false);
     }
 
+    void footage360() {
+        // A 2:1 still marked 360° from the media bin comes into a flat sequence as a view out of the sphere.
+        const QString png = dir_.path() + "/sphere.png";
+        {
+            QImage q(400, 200, QImage::Format_RGB32);
+            for (int y = 0; y < 200; ++y)
+                for (int x = 0; x < 400; ++x) q.setPixel(x, y, qRgb(x * 255 / 399, y * 255 / 199, 0));
+            QVERIFY(q.save(png));
+        }
+        state()->newProject();
+        const auto ids = state()->importFiles({png});
+        QCOMPARE(ids.size(), size_t(1));
+        auto* bin = win_->findChild<MediaBinWidget*>();
+        QVERIFY(bin->setMediaProjection(ids, "equirect"));
+        QVERIFY(!bin->setMediaProjection(ids, "equirect"));
+        QCOMPARE(state()->project().findMedia(ids[0])->projection, std::string("equirect"));
+        const Id media = ids[0];
+        QVERIFY(state()->apply("Place", [media](Project& p, Sequence& s) { return edit::placeMedia(p, s, media, 0, 0, 30, V1, A1, false); }));
+        const Clip& c = trackAt(*state()->sequence(), V1)->clips.at(0);
+        QCOMPARE(c.effects.at(0).type, std::string("reframe_360"));
+        QVERIFY(findEffectInfo("reframe_360"));
+        // Look around: selected, its picture in the Program monitor drags the view, one undo step.
+        const Id clip = c.id;
+        state()->setPlayhead(10);
+        state()->setSelection({clip}, false);
+        QApplication::processEvents();
+        MonitorPanel* program = nullptr;
+        for (auto* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Program) program = m;
+        QVERIFY(program);
+        QTRY_COMPARE(program->lookClip(), clip);
+        ViewerWidget* viewer = program->viewer();
+        QVERIFY(viewer->lookAround());
+        const QRectF pic = viewer->imageRect();
+        QVERIFY(pic.width() > 50);
+        const QPoint from = pic.center().toPoint(), to = from + QPoint(int(pic.width() / 4), 0);
+        QTest::mousePress(viewer, Qt::LeftButton, {}, from);
+        QMouseEvent move(QEvent::MouseMove, QPointF(to), viewer->mapToGlobal(QPointF(to)), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(viewer, &move);
+        QTest::mouseRelease(viewer, Qt::LeftButton, {}, to);
+        auto yaw = [&] {
+            for (const Effect& e : edit::clipById(*state()->sequence(), clip)->effects)
+                if (e.type == "reframe_360") return e.p("yaw", 0);
+            return 999.0;
+        };
+        QVERIFY2(std::fabs(yaw() + 25) < 2, qPrintable(QString::number(yaw())));  // a quarter of the width at 100°, turned left
+        state()->undo();
+        QCOMPARE(yaw(), 0.0);
+        state()->setSelection({}, false);
+        QApplication::processEvents();
+        QVERIFY(!viewer->lookAround());
+        state()->undo();
+        state()->undo();
+        QVERIFY(state()->project().findMedia(media)->projection.empty());
+        // Sequence settings: a 360° sequence.
+        SequenceSettingsDialog dlg(win_.get());
+        NewSequenceSpec spec;
+        spec.width = 3840;
+        spec.height = 1920;
+        spec.spherical = true;
+        dlg.setSpec(spec);
+        auto* sphere = dlg.findChild<QCheckBox*>("sphericalSequence");
+        QVERIFY(sphere && sphere->isChecked());
+        QVERIFY(dlg.spec().spherical);
+        sphere->setChecked(false);
+        QVERIFY(!dlg.spec().spherical);
+        state()->setSelection({}, false);
+    }
+
     void clipAnimationInInspector() {
         loadDemo();
         const Id red = clipNamed(*state()->sequence(), "Red")->id;

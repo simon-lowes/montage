@@ -54,6 +54,7 @@ void takeDetails(MediaItem& m, const MediaItem& n, bool replace) {
     m.videoCodec = n.videoCodec;
     m.audioCodec = n.audioCodec;
     m.colorSpace = n.colorSpace;
+    if (!n.projection.empty()) m.projection = n.projection;
     if (!m.subclipOf) m.duration = n.duration;
     if (replace) {
         m.timecode = n.timecode;

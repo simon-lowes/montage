@@ -28,6 +28,8 @@
 #include "media/Image.h"
 #include "media/MediaPool.h"
 #include "render/Compositor.h"
+#include "render/Spherical.h"
+#include "core/EditOps.h"
 #include "Theme.h"
 
 namespace montage {
@@ -183,8 +185,22 @@ QRectF ViewerWidget::imageRect() const {
     return QRectF((width() - s.width()) / 2, (height() - s.height()) / 2, s.width(), s.height());
 }
 
+void ViewerWidget::setLookAround(bool on) {
+    if (lookAround_ == on) return;
+    lookAround_ = on;
+    if (on) setCursor(Qt::OpenHandCursor);
+    else unsetCursor();
+}
+
 void ViewerWidget::mousePressEvent(QMouseEvent* e) {
     pressPos_ = e->pos();
+    if (lookAround_ && e->button() == Qt::LeftButton && !comparing() && !twoUp_ && imageRect().contains(e->position())) {
+        looking_ = true;
+        setCursor(Qt::ClosedHandCursor);
+        emit lookStarted();
+        e->accept();
+        return;
+    }
     if (comparing() && e->button() == Qt::LeftButton && !image_.isNull() && std::fabs(e->position().x() - dividerX()) <= 6) {
         draggingSplit_ = true;
         setCursor(Qt::SplitHCursor);
@@ -195,6 +211,13 @@ void ViewerWidget::mousePressEvent(QMouseEvent* e) {
 }
 
 void ViewerWidget::mouseReleaseEvent(QMouseEvent* e) {
+    if (looking_) {
+        looking_ = false;
+        setCursor(lookAround_ ? Qt::OpenHandCursor : Qt::ArrowCursor);
+        emit lookFinished();
+        e->accept();
+        return;
+    }
     if (draggingSplit_) {
         draggingSplit_ = false;
         unsetCursor();
@@ -205,6 +228,12 @@ void ViewerWidget::mouseReleaseEvent(QMouseEvent* e) {
 }
 
 void ViewerWidget::mouseMoveEvent(QMouseEvent* e) {
+    if (looking_) {
+        const QRectF r = imageRect();
+        if (r.width() > 0 && r.height() > 0)
+            emit lookMoved((e->position().x() - pressPos_.x()) / r.width(), (e->position().y() - pressPos_.y()) / r.height());
+        return;
+    }
     if (draggingSplit_) {
         const QRectF r = imageRect();
         if (r.width() > 0) setSplit((e->position().x() - r.left()) / r.width());
@@ -464,7 +493,60 @@ MonitorPanel::MonitorPanel(Mode mode, EditorState* state, PlaybackController* co
     connect(state_, &EditorState::projectChanged, this, &MonitorPanel::refresh);
     connect(state_, &EditorState::sourceChanged, this, &MonitorPanel::refresh);
     if (mode_ == Mode::Source) connect(state_, &EditorState::mediaReady, this, [this] { refresh(); });
+    if (mode_ == Mode::Program) {
+        // Look around: dragging the picture of a selected Reframe 360° clip pans and tilts its view, one undo step a
+        // drag; when the view is keyed, the drag keys it at the playhead.
+        connect(state_, &EditorState::selectionChanged, this, &MonitorPanel::updateLookAround);
+        connect(state_, &EditorState::projectChanged, this, &MonitorPanel::updateLookAround);
+        connect(controller_, &PlaybackController::positionChanged, this, &MonitorPanel::updateLookAround);
+        connect(viewer_, &ViewerWidget::lookStarted, this, [this] {
+            const Sequence* s = state_->sequence();
+            const Clip* c = s ? edit::clipById(*s, lookClip_) : nullptr;
+            if (!c) return;
+            lookAt_ = std::clamp<FrameTime>(controller_->position() - c->start, 0, c->duration - 1);
+            for (const Effect& e : c->effects)
+                if (e.type == "reframe_360") {
+                    lookYaw_ = e.p("yaw", lookAt_), lookPitch_ = e.p("pitch", lookAt_), lookFov_ = e.p("fov", lookAt_, 100);
+                    if (e.p("projection", lookAt_) > 0.5) lookFov_ = std::min(lookFov_, 120.0);  // a planet turns slower
+                }
+            state_->beginGesture(tr("Look Around"));
+        });
+        connect(viewer_, &ViewerWidget::lookMoved, this, [this](double dx, double dy) {
+            if (!state_->inGesture()) return;
+            const Sequence* s = state_->sequence();
+            const double aspect = s && s->width > 0 ? double(s->height) / s->width : 9.0 / 16;
+            // Grabbing the scene: dragging right turns the view left, dragging down tilts it up.
+            double yaw = lookYaw_ - dx * lookFov_, pitch = std::clamp(lookPitch_ + dy * lookFov_ * aspect, -90.0, 90.0);
+            yaw -= 360 * std::floor((yaw + 180) / 360);
+            const Id clip = lookClip_;
+            const FrameTime at = lookAt_;
+            state_->updateGesture([clip, at, yaw, pitch](Project& p, Sequence& seq) {
+                Clip* c = edit::clipById(seq, clip);
+                if (!c) return;
+                bool keyed = false;
+                for (const Effect& e : c->effects)
+                    if (e.type == "reframe_360")
+                        keyed = (e.params.count("yaw") && e.params.at("yaw").animated()) || (e.params.count("pitch") && e.params.at("pitch").animated());
+                edit::setReframe360(p, seq, clip, {yaw, pitch, std::nullopt, std::nullopt, std::nullopt}, keyed ? at : -1);
+            });
+        });
+        connect(viewer_, &ViewerWidget::lookFinished, this, [this] {
+            if (state_->inGesture()) state_->endGesture(true);
+        });
+    }
     refresh();
+}
+
+void MonitorPanel::updateLookAround() {
+    lookClip_ = 0;
+    const Sequence* s = state_->sequence();
+    const FrameTime t = controller_->position();
+    if (s)
+        for (Id id : state_->selectedClips())
+            if (const Clip* c = edit::clipById(*s, id); c && c->contains(t))
+                for (const Effect& e : c->effects)
+                    if (e.type == "reframe_360" && e.enabled) lookClip_ = id;
+    if (!state_->inGesture() || !lookClip_) viewer_->setLookAround(lookClip_ != 0);
 }
 
 FrameTime MonitorPanel::duration() const {

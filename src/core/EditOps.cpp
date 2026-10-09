@@ -314,6 +314,8 @@ Result placeMedia(Project& p, Sequence& s, Id mediaId, FrameTime at, double srcI
         Clip v = base;
         v.id = p.newId();
         v.linkGroup = group;
+        // 360° footage in a flat sequence comes in as a view out of the sphere (Reframe 360°), not a stretched panorama.
+        if (m->projection == "equirect" && !s.spherical) v.effects.push_back(makeEffect(p, "reframe_360"));
         Result r = overwrite(p, s, videoTrack, v);
         res.created.insert(res.created.end(), r.created.begin(), r.created.end());
     }

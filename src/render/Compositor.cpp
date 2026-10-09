@@ -28,6 +28,7 @@
 #include "core/ProjectIO.h"
 #include "core/Bleep.h"
 #include "core/ClipAnimation.h"
+#include "render/Spherical.h"
 #include "render/AudioReactive.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
@@ -609,16 +610,29 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             std::string path = (o.useProxies && !m->proxyPath.empty()) ? m->proxyPath : m->path;
             mw = m->width > 0 ? m->width : SW;
             mh = m->height > 0 ? m->height : SH;
+            // Reframe 360: the clip is a view, at the sequence's shape, out of the whole sphere.
+            const Effect* vr = enabledEffect(c, "reframe_360");
+            if (vr) mw = std::max(1.0, std::round(mh * SW / std::max(1, SH)));
             g = clipGeometry(c, lt, mw, mh, SW, SH, seq.fpsValue());
             int w, h;
             sourceSize(g, o.scale, int(mw), int(mh), w, h);
+            const int viewW = w, viewH = h;
+            const double vrFov = vr ? vr->p("fov", lt, 100) : 0;
+            const SphereView vrView = vr ? SphereView(std::clamp(int(vr->p("projection", lt, 0)), 0, 2)) : SphereView::Flat;
+            if (vr) {
+                // As much of the sphere as the view's pixels need: 360 / fov times its width, up to the footage's own.
+                const double across = vrView == SphereView::Flat ? std::clamp(vrFov, 20.0, 170.0) : 180.0;
+                const int full = m->width > 0 ? m->width : viewW * 2;
+                w = std::clamp(int(std::ceil(viewW * 360.0 / across)), 2, full);
+                h = std::max(1, int(std::lround(double(w) * (m->height > 0 ? m->height : full / 2) / full)));
+            }
             // Super Scale: shown larger than it was shot, the frame is decoded at its own size and enlarged by
             // the model at the end (not on proxies, which are for speed).
             const Effect* ss = superScaleEffect(c);
             // The size it is shown at (decoding stops at the media's own size), up to four times that.
             const int outW = int(std::ceil(std::clamp(g.mw * std::fabs(g.sx) * o.scale, 1.0, 4.0 * mw)));
             const int outH = int(std::ceil(std::clamp(g.mh * std::fabs(g.sy) * o.scale, 1.0, 4.0 * mh)));
-            const bool upscale = ss && path == m->path && (outW > int(mw) + 1 || outH > int(mh) + 1) &&
+            const bool upscale = ss && !vr && path == m->path && (outW > int(mw) + 1 || outH > int(mh) + 1) &&
                                  ss->p("strength", lt, 100) > 0 && upscalerAvailable() && upscaleModel().installed();
             if (upscale) {
                 w = int(mw);
@@ -748,6 +762,8 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                 src = cachedSuperScale(src, outW, outH, ss->p("strength", lt, 100) / 100, big) ? std::move(big)
                                                                                                 : resizeImage(src, outW, outH);
             }
+            if (vr)
+                src = reframeEquirect(src, vr->p("yaw", lt, 0), vr->p("pitch", lt, 0), vr->p("roll", lt, 0), vrFov, vrView, viewW, viewH);
             // Input transform: the media's space into the sequence's working space.
             convertColor(src, mediaColorSpace(*m), sequenceColorSpace(seq), seq.hdrPeakNits);
         } else {
@@ -776,7 +792,8 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
         faces = cachedFaces(src);
     FaceScope faceScope(faces);
     for (const auto& e : c.effects)
-        if (e.type != "video_denoise" && e.type != "super_scale") applyVideoEffect(e, lt, src, pixelScale, sourceSeconds);  // those ran on the source
+        if (e.type != "video_denoise" && e.type != "super_scale" && e.type != "reframe_360")  // those ran on the source
+            applyVideoEffect(e, lt, src, pixelScale, sourceSeconds);
     if (identityLayer(src, g, SW, SH, o.scale)) return src;  // a full-frame clip: no copy
     return transformLayer(src, g, SW, SH, o.scale);
 }
