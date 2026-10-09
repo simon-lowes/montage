@@ -3164,6 +3164,47 @@ private slots:
         state()->newProject();
     }
 
+    void watchFolderImports() {
+        const QString folder = dir_.path() + "/incoming";
+        QDir().mkpath(folder + "/day2");
+        auto png = [&](const QString& file, QRgb colour) {
+            QImage img(32, 18, QImage::Format_RGB32);
+            img.fill(colour);
+            return img.save(file);
+        };
+        QVERIFY(png(folder + "/first.png", qRgb(200, 0, 0)));
+        QFile junk(folder + "/notes.txt");
+        QVERIFY(junk.open(QIODevice::WriteOnly));
+        junk.write("not media");
+        junk.close();
+        state()->newProject();
+        QVERIFY(win_->findChild<QAction*>("watchFolders"));
+        const size_t before = state()->project().media.size();
+        // What is there comes in once it has settled; a text file never does.
+        QVERIFY(state()->addWatchFolder(folder));
+        QVERIFY(!state()->addWatchFolder(folder));  // already watched
+        QTRY_COMPARE_WITH_TIMEOUT(state()->project().media.size(), before + 1, 8000);
+        QCOMPARE(state()->project().media.back().name, std::string("first.png"));
+        QCOMPARE(state()->project().media.back().bin, std::string("Watch Folder - incoming"));
+        // A file arriving later, in a subfolder too.
+        QVERIFY(png(folder + "/day2/second.png", qRgb(0, 200, 0)));
+        QTRY_COMPARE_WITH_TIMEOUT(state()->project().media.size(), before + 2, 8000);
+        QCOMPARE(state()->project().media.back().name, std::string("second.png"));
+        // Kept with the project.
+        QVERIFY(state()->save(dir_.path() + "/watch.montage"));
+        state()->newProject();
+        QVERIFY(state()->open(dir_.path() + "/watch.montage"));
+        QCOMPARE(state()->project().watchFolders.size(), size_t(1));
+        QVERIFY(state()->scanWatchFolders().empty());  // nothing new
+        // No longer watched: nothing more comes in.
+        QVERIFY(state()->removeWatchFolder(folder));
+        const size_t now = state()->project().media.size();
+        QVERIFY(png(folder + "/third.png", qRgb(0, 0, 200)));
+        QTest::qWait(2500);
+        QCOMPARE(state()->project().media.size(), now);
+        state()->newProject();
+    }
+
     void removeLetterboxFromTheMenu() {
         Project gen = makeDefaultProject();
         Sequence& gs = *gen.active();

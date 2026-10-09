@@ -5,6 +5,8 @@
 #include <QPointer>
 #include <QFileInfo>
 #include <QFileSystemWatcher>
+#include <QDirIterator>
+#include <QDateTime>
 #include <QTimer>
 #include <QStandardPaths>
 #include <QtConcurrent>
@@ -53,6 +55,14 @@ EditorState::EditorState(QObject* parent) : QObject(parent), project_(makeDefaul
         reloadChangedMedia(paths);
     });
     connect(this, &EditorState::projectChanged, this, &EditorState::watchMediaFiles);
+    // Watch folders: a scan a moment after anything in them changes.
+    folderWatcher_ = new QFileSystemWatcher(this);
+    folderTimer_ = new QTimer(this);
+    folderTimer_->setSingleShot(true);
+    folderTimer_->setInterval(1100);
+    connect(folderWatcher_, &QFileSystemWatcher::directoryChanged, this, [this] { folderTimer_->start(); });
+    connect(folderTimer_, &QTimer::timeout, this, [this] { scanWatchFolders(); });
+    connect(this, &EditorState::projectChanged, this, &EditorState::watchFoldersChanged);
 }
 
 EditorState::~EditorState() { MediaPool::instance().setReadyCallback(nullptr); }
@@ -415,6 +425,105 @@ Id EditorState::importImageSequence(const QString& frame, Rational fps, QString*
         return true;
     });
     return id;
+}
+
+namespace {
+
+bool importableMedia(const QString& file) {
+    static const QStringList exts = {"mp4", "mov", "mkv",  "avi",  "webm", "m4v", "mxf", "mts", "m2ts", "ts",  "mpg", "mpeg", "wmv",
+                                     "flv", "gif", "wav",  "mp3",  "aac",  "m4a", "flac", "ogg", "opus", "aif", "aiff", "png", "jpg",
+                                     "jpeg", "tif", "tiff", "bmp", "webp", "exr", "dpx", "svg", "psd",  "psb", "heic", "dng", "cr2",
+                                     "cr3", "nef", "arw",  "raf",  "rw2",  "orf"};
+    return exts.contains(QFileInfo(file).suffix().toLower());
+}
+
+}  // namespace
+
+void EditorState::watchFoldersChanged() {
+    QStringList wanted;
+    for (const std::string& f : project_.watchFolders) {
+        // The folder and its subfolders, so files landing anywhere in it are noticed.
+        const QString root = QString::fromStdString(f);
+        if (!QFileInfo(root).isDir()) continue;
+        wanted << root;
+        QDirIterator it(root, QDir::Dirs | QDir::NoDotAndDotDot, QDirIterator::Subdirectories);
+        while (it.hasNext()) wanted << it.next();
+    }
+    const QStringList watched = folderWatcher_->directories();
+    QStringList gone, added;
+    for (const QString& d : watched)
+        if (!wanted.contains(d)) gone << d;
+    for (const QString& d : wanted)
+        if (!watched.contains(d)) added << d;
+    if (!gone.isEmpty()) folderWatcher_->removePaths(gone);
+    if (!added.isEmpty()) folderWatcher_->addPaths(added);
+}
+
+bool EditorState::addWatchFolder(const QString& folder) {
+    const QFileInfo fi(folder);
+    if (!fi.isDir()) return false;
+    const std::string path = QDir::cleanPath(fi.absoluteFilePath()).toStdString();
+    if (std::find(project_.watchFolders.begin(), project_.watchFolders.end(), path) != project_.watchFolders.end()) return false;
+    if (!edit(tr("Watch Folder"), [&](Project& p, Sequence&) {
+            p.watchFolders.push_back(path);
+            return true;
+        }))
+        return false;
+    scanWatchFolders();
+    return true;
+}
+
+bool EditorState::removeWatchFolder(const QString& folder) {
+    const std::string path = QDir::cleanPath(QFileInfo(folder).absoluteFilePath()).toStdString();
+    return edit(tr("Stop Watching Folder"), [&](Project& p, Sequence&) {
+        const auto before = p.watchFolders.size();
+        std::erase(p.watchFolders, path);
+        return p.watchFolders.size() != before;
+    });
+}
+
+std::vector<Id> EditorState::scanWatchFolders() {
+    std::vector<Id> ids;
+    // What the project already has: files, image sequences' runs, Photoshop layers' files.
+    std::set<std::string> have, runs;
+    for (const MediaItem& m : project_.media) {
+        if (m.path.empty()) continue;
+        have.insert(m.path);
+        have.insert(mediaFileOnDisk(m.path));
+        if (ImageSequence seq; parseImageSequencePath(m.path, seq)) runs.insert(seq.pattern);
+    }
+    bool waiting = false;
+    const QDateTime now = QDateTime::currentDateTime();
+    for (const std::string& folder : std::vector<std::string>(project_.watchFolders)) {
+        QStringList fresh;
+        QDirIterator it(QString::fromStdString(folder), QDir::Files | QDir::NoDotAndDotDot, QDirIterator::Subdirectories);
+        while (it.hasNext()) {
+            const QFileInfo fi(it.next());
+            if (fi.fileName().startsWith(QLatin1Char('.')) || !importableMedia(fi.fileName())) continue;
+            const std::string abs = QDir::cleanPath(fi.absoluteFilePath()).toStdString();
+            if (have.count(abs) || watchSkipped_.count(abs)) continue;
+            if (ImageSequence seq; isFrameFormat(abs) && detectImageSequence(abs, seq) && runs.count(seq.pattern)) continue;
+            if (fi.lastModified().msecsTo(now) < 1000) {  // still being written
+                waiting = true;
+                continue;
+            }
+            fresh << fi.absoluteFilePath();
+        }
+        if (fresh.isEmpty()) continue;
+        fresh.sort();
+        const QString bin = tr("Watch Folder - %1").arg(QFileInfo(QString::fromStdString(folder)).fileName());
+        QStringList errors;
+        const std::vector<Id> got = importFiles(fresh, &errors, bin);
+        ids.insert(ids.end(), got.begin(), got.end());
+        // Files that did not come in are not tried again.
+        std::set<std::string> now2;
+        for (const MediaItem& m : project_.media) now2.insert(mediaFileOnDisk(m.path));
+        for (const QString& f : fresh)
+            if (!now2.count(f.toStdString())) watchSkipped_.insert(f.toStdString());
+    }
+    if (waiting) folderTimer_->start();
+    if (!ids.empty()) message(tr("Imported %n file(s) from a watch folder", "", int(ids.size())), 5000);
+    return ids;
 }
 
 std::vector<Id> EditorState::importPsd(const QString& path, PsdImport mode, QString* error) {

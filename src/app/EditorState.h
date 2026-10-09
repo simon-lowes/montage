@@ -107,6 +107,13 @@ public:
     // (media/Psd.h), in one undo step: the ids made, the sequence's media item last; none with `error`. importFiles
     // brings PSDs in the way the "import/psd" preference says (merged, layers or sequence; merged by default).
     std::vector<Id> importPsd(const QString& path, PsdImport mode, QString* error = nullptr);
+    // Watch folders (Premiere's watch folder import, for cards being offloaded or renders landing): media files that
+    // arrive in them (subfolders too) are imported into a bin named for the folder once they have settled (not written
+    // to for a second); what is there when a folder is added comes in too. Saved with the project; each change one undo
+    // step, each import one too.
+    bool addWatchFolder(const QString& folder);
+    bool removeWatchFolder(const QString& folder);
+    std::vector<Id> scanWatchFolders();  // imports what has arrived and settled; the ids
     bool removeMedia(Id id, QString* error = nullptr);
 
     // The media item loaded in the source monitor and its marks
@@ -176,6 +183,10 @@ private:
     void pruneSelection();
     void watchMediaFiles();  // keeps the watcher on the project's media files
     QFileSystemWatcher* watcher_ = nullptr;
+    QFileSystemWatcher* folderWatcher_ = nullptr;  // the watch folders
+    QTimer* folderTimer_ = nullptr;                 // a scan once things settle
+    std::set<std::string> watchSkipped_;            // arrived but could not be imported: not tried again
+    void watchFoldersChanged();
     QTimer* reloadTimer_ = nullptr;
     QStringList changedFiles_;
     mutable std::map<std::string, std::pair<bool, qint64>> offlineChecked_;  // path -> offline, when checked (ms)

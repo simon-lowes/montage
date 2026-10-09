@@ -29,6 +29,7 @@
 #include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
+#include <QListWidget>
 #include <QLocale>
 #include <QFutureWatcher>
 #include <QMenuBar>
@@ -664,6 +665,7 @@ void MainWindow::buildMenus() {
     file->addSeparator();
     add(file, tr("&Import Media…"), QKeySequence("Ctrl+I"), [this] { bin_->importDialog(); });
     add(file, tr("Import Image Sequence…"), QKeySequence(), [this] { bin_->importImageSequenceDialog(); })->setObjectName(QStringLiteral("importImageSequence"));
+    add(file, tr("Watch Folders…"), QKeySequence(), [this] { watchFoldersDialog(); })->setObjectName(QStringLiteral("watchFolders"));
     add(file, tr("&Export Media…"), QKeySequence("Ctrl+M"), [this] { exportMedia(); });
     add(file, tr("Project &Manager…"), QKeySequence(), [this] {
         ProjectManagerDialog dlg(state_, this);
@@ -3665,6 +3667,42 @@ int MainWindow::removeLetterbox() {
     });
     state_->message(changed ? tr("Cropped the black bars off %n clip(s)", "", changed) : tr("No black bars found round the pictures"), 5000);
     return changed;
+}
+
+void MainWindow::watchFoldersDialog() {
+    QDialog dlg(this);
+    dlg.setObjectName(QStringLiteral("watchFoldersDialog"));
+    dlg.setWindowTitle(tr("Watch Folders"));
+    auto* lay = new QVBoxLayout(&dlg);
+    lay->addWidget(new QLabel(tr("Media files that arrive in these folders (a card being offloaded, renders landing) come into the "
+                                 "project by themselves, in a bin named for the folder. What is there now comes in too."),
+                              &dlg));
+    auto* list = new QListWidget(&dlg);
+    list->setObjectName(QStringLiteral("watchFolderList"));
+    auto refresh = [&] {
+        list->clear();
+        for (const std::string& f : state_->project().watchFolders) list->addItem(QString::fromStdString(f));
+    };
+    refresh();
+    lay->addWidget(list, 1);
+    auto* row = new QHBoxLayout;
+    auto* add = new QPushButton(tr("Add Folder…"), &dlg);
+    auto* remove = new QPushButton(tr("Stop Watching"), &dlg);
+    row->addWidget(add);
+    row->addWidget(remove);
+    row->addStretch();
+    lay->addLayout(row);
+    connect(add, &QPushButton::clicked, &dlg, [&] {
+        const QString dir = QFileDialog::getExistingDirectory(&dlg, tr("Watch Folder"), appSettings().value(QStringLiteral("lastImportDir")).toString());
+        if (!dir.isEmpty() && state_->addWatchFolder(dir)) refresh();
+    });
+    connect(remove, &QPushButton::clicked, &dlg, [&] {
+        if (QListWidgetItem* it = list->currentItem(); it && state_->removeWatchFolder(it->text())) refresh();
+    });
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, &dlg);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    lay->addWidget(buttons);
+    dlg.exec();
 }
 
 std::vector<Id> MainWindow::shortsSource() const {
