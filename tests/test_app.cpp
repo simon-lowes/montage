@@ -2294,6 +2294,36 @@ private slots:
         state()->setSelection({}, false);
     }
 
+    void animateToAudioOnTheSelection() {
+        loadDemo();
+        QVERIFY(win_->findChild<QAction*>("animateToAudio"));
+        QVERIFY(findEffectInfo("audio_viz"));
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        state()->setSelection({red}, false);
+        // No sound under the clip yet: refused, nothing changes.
+        QVERIFY(!win_->animateSelectionToAudio(0, "scale", 1, 0, 100, 120));
+        auto scaleAnimated = [&] {
+            const Clip* c = clipNamed(*state()->sequence(), "Red");
+            return c->motion.params.count("scale") && c->motion.params.at("scale").animated();
+        };
+        QVERIFY(!scaleAnimated());
+        // Speech on A1 under it: the scale follows it, in one undo step.
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        QVERIFY(state()->apply("Place", [media](Project& p, Sequence& s) { return edit::placeMedia(p, s, media, 0, 0, -1, V1, A1, false); }));
+        state()->setSelection({red}, false);
+        QVERIFY(win_->animateSelectionToAudio(0, "scale", 1, 0, 100, 120));
+        QVERIFY(scaleAnimated());
+        const Clip* c = clipNamed(*state()->sequence(), "Red");
+        double lo = 1e9, hi = -1e9;
+        for (FrameTime f = 0; f < c->duration; ++f) lo = std::min(lo, c->motion.p("scale", f)), hi = std::max(hi, c->motion.p("scale", f));
+        QVERIFY2(lo >= 99.99 && lo < 105 && std::fabs(hi - 120) < 0.01, qPrintable(QString("%1 %2").arg(lo).arg(hi)));
+        state()->undo();
+        QVERIFY(!scaleAnimated());
+        state()->setSelection({}, false);
+    }
+
     void clipAnimationInInspector() {
         loadDemo();
         const Id red = clipNamed(*state()->sequence(), "Red")->id;

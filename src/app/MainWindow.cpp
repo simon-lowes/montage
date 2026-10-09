@@ -63,6 +63,7 @@
 #include "core/GradeVersions.h"
 #include "core/Chapters.h"
 #include "core/MarkerList.h"
+#include "render/AudioReactive.h"
 #include "render/VfxPull.h"
 #include "render/LutExport.h"
 #include "media/Decoder.h"
@@ -842,6 +843,7 @@ void MainWindow::buildMenus() {
                 });
             })->setObjectName(step > 0 ? QStringLiteral("gradeNextVersion") : QStringLiteral("gradePreviousVersion"));
     }
+    add(clipM, tr("Animate to Audio…"), QKeySequence(), [this] { animateToAudioDialog(); })->setObjectName(QStringLiteral("animateToAudio"));
     add(clipM, tr("Swap with Previous Clip"), QKeySequence("Ctrl+Shift+,"), [this] { swapClip(false); })->setObjectName(QStringLiteral("swapPrevious"));
     add(clipM, tr("Swap with Next Clip"), QKeySequence("Ctrl+Shift+."), [this] { swapClip(true); })->setObjectName(QStringLiteral("swapNext"));
     add(clipM, tr("Join Through Edits"), QKeySequence(), [this] { joinThroughEdits(); })->setObjectName(QStringLiteral("joinThroughEdits"));
@@ -1836,6 +1838,77 @@ void MainWindow::speedDialog() {
     connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
     form->addRow(buttons);
     if (dlg.exec() == QDialog::Accepted) setSelectionSpeed(speed->value() / 100.0, pitch->isChecked());
+}
+
+bool MainWindow::animateSelectionToAudio(Id effect, const std::string& param, int track, int band, double low, double high) {
+    const auto sel = state_->selectedClips();
+    if (sel.empty()) return false;
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    const bool ok = state_->apply(tr("Animate to Audio"), [sel, effect, param, track, band, low, high](Project& p, Sequence& s) {
+        edit::Result last = edit::Result::fail("Select a picture clip");
+        bool any = false;
+        for (Id id : sel) {
+            bool video = false;
+            for (const Track& t : s.videoTracks)
+                for (const Clip& c : t.clips) video = video || c.id == id;
+            if (!video) continue;
+            last = edit::animateToAudio(p, s, id, effect, param, track, AudioBand(std::clamp(band, 0, 3)), low, high);
+            any = any || last.ok;
+        }
+        return any ? edit::Result{} : last;
+    });
+    QApplication::restoreOverrideCursor();
+    return ok;
+}
+
+void MainWindow::animateToAudioDialog() {
+    const Clip* c = state_->primaryClip();
+    const Sequence* s = state_->sequence();
+    if (!c || !s) return;
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Animate to Audio"));
+    auto* form = new QFormLayout(&dlg);
+    // What moves: the Transform's settings, then the clip's other effects' number settings.
+    auto* what = new QComboBox(&dlg);
+    auto addParams = [&](const Effect& e, const QString& prefix, Id id) {
+        if (const EffectInfo* info = findEffectInfo(e.type))
+            for (const ParamInfo& pi : info->params)
+                if (pi.kind == ParamKind::Number || pi.kind == ParamKind::Percent || pi.kind == ParamKind::Angle)
+                    what->addItem(prefix + QString::fromStdString(pi.label), QVariantList{QVariant::fromValue<qulonglong>(id), QString::fromStdString(pi.name)});
+    };
+    addParams(c->motion.empty() ? makeEffect("transform", 0) : c->motion, tr("Transform › "), 0);
+    if (c->isGenerator()) addParams(c->generator, QString::fromStdString(findEffectInfo(c->generator.type) ? findEffectInfo(c->generator.type)->displayName : c->generator.type) + " › ", c->generator.id);
+    for (const Effect& e : c->effects)
+        addParams(e, QString::fromStdString(findEffectInfo(e.type) ? findEffectInfo(e.type)->displayName : e.type) + " › ", e.id);
+    what->setCurrentIndex(std::max(0, what->findText(tr("Transform › Scale"), Qt::MatchStartsWith)));
+    form->addRow(tr("Setting:"), what);
+    auto* track = new QSpinBox(&dlg);
+    track->setRange(0, std::max(1, int(s->audioTracks.size())));
+    track->setValue(1);
+    track->setSpecialValueText(tr("All tracks"));
+    track->setPrefix(tr("A"));
+    form->addRow(tr("Audio track:"), track);
+    auto* band = new QComboBox(&dlg);
+    band->addItems({tr("All frequencies"), tr("Lows (beats, bass)"), tr("Mids (voices)"), tr("Highs (hi-hats, sibilance)")});
+    form->addRow(tr("Listen to:"), band);
+    auto* low = new QDoubleSpinBox(&dlg);
+    auto* high = new QDoubleSpinBox(&dlg);
+    for (auto* b : {low, high}) {
+        b->setRange(-100000, 100000);
+        b->setDecimals(2);
+    }
+    low->setValue(100);
+    high->setValue(115);
+    form->addRow(tr("When quiet:"), low);
+    form->addRow(tr("At the loudest:"), high);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    form->addRow(buttons);
+    if (dlg.exec() != QDialog::Accepted || what->currentIndex() < 0) return;
+    const QVariantList target = what->currentData().toList();
+    animateSelectionToAudio(Id(target.at(0).toULongLong()), target.at(1).toString().toStdString(), track->value(), band->currentIndex(),
+                            low->value(), high->value());
 }
 
 void MainWindow::vfxPullDialog() {

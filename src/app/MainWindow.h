@@ -183,6 +183,9 @@ public:
     CleanFeedWindow* showCleanFeed(int screen = -1);
     void hideCleanFeed();
     CleanFeedWindow* cleanFeed() const { return cleanFeed_; }
+    // Animate to Audio on the selected picture clips: `param` of effect `effect` (0 = Transform) follows audio track
+    // `track`'s level (0 = all) in a band (render/AudioReactive.h AudioBand), from `low` to `high`; one undo step.
+    bool animateSelectionToAudio(Id effect, const std::string& param, int track, int band, double low, double high);
     // Speed / Duration on the selected clips (each link group once), with Maintain Audio Pitch; one undo step.
     bool setSelectionSpeed(double speed, bool maintainPitch);
 
@@ -233,6 +236,7 @@ private:
     void addDefaultTransition(bool audio);
     void speedDialog();
     void vfxPullDialog();
+    void animateToAudioDialog();
     void nudge(int frames);
     void matchFrame();
     void addMarker();

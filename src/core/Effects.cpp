@@ -594,6 +594,19 @@ std::vector<EffectInfo> buildCatalog() {
                  {}});
     // Its effects, opacity and blend mode apply to everything on the tracks below it.
     c.push_back({"adjustment", "Adjustment Layer", EffectCategory::Generator, "Generators", {}, {}});
+    // Audio Visualiser (render/AudioReactive): an audio track's sound drawn each frame, for audiograms and music videos.
+    c.push_back({"audio_viz", "Audio Visualiser", EffectCategory::Generator, "Generators",
+                 {num("track", "Audio Track (0 = all)", 0, 32, 1, 1),
+                  choice("style", "Style", {"Bars", "Mirrored Bars", "Waveform", "Circle"}, 0),
+                  num("bars", "Bars", 4, 128, 32, 1),
+                  color("color", "Colour", 1, 1, 1),
+                  pct("width", "Width", 5, 100, 80),
+                  pct("height", "Height", 5, 100, 30),
+                  pct("center_y", "Centre Height", 0, 100, 70),
+                  num("sensitivity", "Sensitivity (dB)", -24, 24, 0, 0.5),
+                  num("window", "Response (ms)", 20, 250, 60, 1),
+                  pct("opacity", "Opacity", 0, 100, 100)},
+                 {}});
     {
         EffectInfo title{"title", "Title", EffectCategory::Generator, "Titles",
                          {

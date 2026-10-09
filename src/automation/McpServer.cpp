@@ -45,6 +45,7 @@
 #include "media/SpeechEnhance.h"
 #include "media/SuperScale.h"
 #include "media/Translator.h"
+#include "render/AudioReactive.h"
 #include "render/VfxPull.h"
 #include "render/AafExport.h"
 #include "render/AutoMix.h"
@@ -3263,6 +3264,36 @@ void McpServer::Impl::addTools() {
                 o["stems"] = list;
             }
             return ok(text, o);
+        });
+
+    add("montage_animate_to_audio", "Animate to audio",
+        "Make a clip's setting follow the sound (Resolve's Fairlight animator, After Effects' Convert Audio to "
+        "Keyframes): keys through the clip on `param` of the effect `effect` (an effect id; omitted = the clip's "
+        "Transform: scale, opacity, rotation, pos_x, pos_y...) from `low` when the audio track `track` (1-based, 0 = "
+        "all) is silent to `high` at its loudest under the clip, by its level in a `band` (all, low, mid, high), "
+        "thinned to the keys needed. For an audiogram add the generator audio_viz with montage_add_effect instead.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},"effect":{"type":"number"},
+            "param":{"type":"string"},"track":{"type":"integer","default":1},"band":{"type":"string","enum":["all","low","mid","high"],"default":"all"},
+            "low":{"type":"number"},"high":{"type":"number"}},"required":["project","clip","param","low","high"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            const Id id = clipArg(l, a).id;
+            static const QStringList bands = {"all", "low", "mid", "high"};
+            const int band = int(bands.indexOf(str(a, "band", "all")));
+            if (band < 0) throw ArgError{"band is all, low, mid or high"};
+            const std::string param = need(a, "param").toStdString();
+            check(edit::animateToAudio(l.project, l.seq(), id, Id(a.value("effect").toDouble(0)), param, a.value("track").toInt(1),
+                                       AudioBand(band), a.value("low").toDouble(), a.value("high").toDouble()));
+            save(l);
+            const Clip* c = edit::clipById(l.seq(), id);
+            const Effect* e = nullptr;
+            if (!a.contains("effect")) e = &c->motion;
+            else
+                for (const Effect& x : c->effects)
+                    if (x.id == Id(a.value("effect").toDouble())) e = &x;
+            if (!e && c->generator.id == Id(a.value("effect").toDouble())) e = &c->generator;
+            const int keys = e ? int(e->params.at(param).keys.size()) : 0;
+            return ok(QStringLiteral("%1 follows the sound with %2 keys").arg(QString::fromStdString(param)).arg(keys), QJsonObject{{"keys", keys}});
         });
 
     add("montage_vfx_pull", "VFX pulls",

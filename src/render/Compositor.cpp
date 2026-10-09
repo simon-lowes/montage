@@ -28,6 +28,7 @@
 #include "core/ProjectIO.h"
 #include "core/Bleep.h"
 #include "core/ClipAnimation.h"
+#include "render/AudioReactive.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
 #include "core/Surround.h"
@@ -579,7 +580,8 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
         g = clipGeometry(c, lt, SW, SH, SW, SH, seq.fpsValue());
         int w, h;
         sourceSize(g, o.scale, int(SW * 4), int(SH * 4), w, h);
-        src = renderGenerator(c.generator, lt, w, h, double(w) / SW, c.duration, seq.fpsValue());
+        src = c.generator.type == "audio_viz" ? renderAudioVisualiser(p, seq, c, t, w, h)
+                                              : renderGenerator(c.generator, lt, w, h, double(w) / SW, c.duration, seq.fpsValue());
         // Titles and mattes are authored in SDR: graphics white sits at HDR reference white.
         convertColor(src, rec709Space(), sequenceColorSpace(seq), seq.hdrPeakNits);
     } else {

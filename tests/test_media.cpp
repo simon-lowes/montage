@@ -55,6 +55,7 @@
 #include "media/Tracking.h"
 #include "media/Vector.h"
 #include "media/Beats.h"
+#include "render/AudioReactive.h"
 #include "render/VfxPull.h"
 #include "render/AafExport.h"
 #include "render/Retime.h"
@@ -1529,6 +1530,103 @@ private slots:
         QCOMPARE(title, std::string("Musik"));
         QVERIFY2(lang == "ger" || lang == "deu", lang.c_str());
         QVERIFY(level(musik, 880) > 20 * level(musik, 440));
+    }
+
+    void audioVisualiserAndAnimateToAudio() {
+        constexpr int sr = 48000;
+        // The FFT: a full-scale 1 kHz sine peaks at its bin, near 1.
+        std::vector<float> sine(4096);
+        for (size_t i = 0; i < sine.size(); ++i) sine[i] = float(std::sin(2 * M_PI * 1000 * double(i) / sr));
+        const std::vector<float> mag = spectrum(sine);
+        QCOMPARE(mag.size(), size_t(2048));
+        const size_t peak = size_t(std::max_element(mag.begin(), mag.end()) - mag.begin());
+        QVERIFY(std::abs(int(peak) - int(std::lround(1000.0 / (double(sr) / 4096)))) <= 1);
+        QVERIFY2(mag[peak] > 0.7 && mag[peak] < 1.1, qPrintable(QString::number(mag[peak])));
+        QVERIFY(spectrum(std::vector<float>(1000)).empty());  // not a power of two
+        // A 1 kHz tone quiet for its first two seconds and loud for the next two, on A1 from frame 10.
+        std::vector<float> mono(size_t(sr) * 4);
+        for (size_t i = 0; i < mono.size(); ++i) mono[i] = float((i < size_t(sr) * 2 ? 0.05 : 0.5) * std::sin(2 * M_PI * 1000 * double(i) / sr));
+        const std::string wav = path("viz.wav");
+        QVERIFY(writeMonoWav(wav, mono, sr));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320;
+        s.height = 180;
+        s.fps = Rational{25, 1};
+        MediaItem m = probeOrFail(p, wav);
+        p.media.push_back(m);
+        Clip tone = makeClip(p, m, TrackKind::Audio, s);
+        tone.start = 10;
+        edit::overwrite(p, s, {TrackKind::Audio, 0}, tone);
+        // The sound at a frame: nothing before the clip, the loud part 3 s into the sound.
+        QCOMPARE(trackSoundAt(p, s, 1, 5, 512), std::vector<float>(512, 0.0f));
+        const std::vector<float> loud = trackSoundAt(p, s, 1, 10 + 75, 2048);
+        QVERIFY(*std::max_element(loud.begin(), loud.end()) > 0.3f);  // 0.5 at -3 dB: mono plays on both channels
+        QCOMPARE(trackSoundAt(p, s, 2, 85, 64), std::vector<float>(64, 0.0f));  // no second track
+        // The visualiser: bars rise most around 1 kHz.
+        Clip viz = makeGeneratorClip(p, "audio_viz", 100);
+        viz.start = 10;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, viz);
+        RenderOptions o;
+        const Image frame = renderSequenceFrame(p, s, 85, o);
+        auto barHeight = [&](int bar) {
+            const double bw = 320 * 0.8, slot = bw / 32, x = 160 - bw / 2 + slot * bar + slot / 2;
+            int n = 0;
+            for (int y = 0; y < 180; ++y) n += frame.at(int(x), y)[3] > 0.5f;
+            return n;
+        };
+        const int kHz = barHeight(17), bass = barHeight(4), treble = barHeight(30);
+        QVERIFY2(kHz > 3 * std::max(1, bass) && kHz > 3 * std::max(1, treble), qPrintable(QString("%1 %2 %3").arg(bass).arg(kHz).arg(treble)));
+        // Quieter in the first two seconds.
+        const Image quiet = renderSequenceFrame(p, s, 30, o);
+        int lit = 0, litQuiet = 0;
+        for (int y = 0; y < 180; ++y)
+            for (int x = 0; x < 320; ++x) lit += frame.at(x, y)[3] > 0.5f, litQuiet += quiet.at(x, y)[3] > 0.5f;
+        QVERIFY2(litQuiet < lit, qPrintable(QString("%1 %2").arg(litQuiet).arg(lit)));
+        // The waveform and circle styles draw too.
+        for (double style : {2.0, 3.0}) {
+            edit::clipById(s, viz.id)->generator.params["style"] = Param(style);
+            const Image img = renderSequenceFrame(p, s, 85, o);
+            int n = 0;
+            for (int y = 0; y < 180; ++y)
+                for (int x = 0; x < 320; ++x) n += img.at(x, y)[3] > 0.1f;
+            QVERIFY2(n > 100, qPrintable(QString("style %1: %2").arg(style).arg(n)));
+        }
+        // Animate to Audio: a colour clip's scale from 100 when quiet to 120 at the loudest.
+        Clip matte = makeGeneratorClip(p, "color", 100);
+        matte.start = 10;
+        edit::overwrite(p, s, {TrackKind::Video, 1}, matte);
+        QVERIFY(edit::animateToAudio(p, s, matte.id, 0, "scale", 1, AudioBand::All, 100, 120).ok);
+        const Clip& animated = *edit::clipById(s, matte.id);
+        const Param& scale = animated.motion.params.at("scale");
+        QVERIFY(scale.animated());
+        QVERIFY2(scale.keys.size() < 20, qPrintable(QString::number(scale.keys.size())));  // thinned: two steady levels
+        QVERIFY2(std::fabs(animated.motion.p("scale", 25) - 102) < 1.5, qPrintable(QString::number(animated.motion.p("scale", 25))));
+        QVERIFY2(std::fabs(animated.motion.p("scale", 80) - 120) < 0.5, qPrintable(QString::number(animated.motion.p("scale", 80))));
+        // Only the lows: the 1 kHz tone barely moves them, so both levels stay near 100 (the jump at 2 s is the only low sound).
+        QVERIFY(edit::animateToAudio(p, s, matte.id, 0, "scale", 1, AudioBand::Low, 100, 120).ok);
+        QVERIFY(std::fabs(edit::clipById(s, matte.id)->motion.p("scale", 25) - 100) < 0.5);
+        QVERIFY(std::fabs(edit::clipById(s, matte.id)->motion.p("scale", 80) - 100) < 0.5);
+        // Silence is refused, as are unknown settings and tracks.
+        s.audioTracks[0].muted = true;
+        QVERIFY(!edit::animateToAudio(p, s, matte.id, 0, "scale", 1, AudioBand::All, 100, 120).ok);
+        s.audioTracks[0].muted = false;
+        QVERIFY(!edit::animateToAudio(p, s, matte.id, 0, "loudness", 1, AudioBand::All, 0, 1).ok);
+        QVERIFY(!edit::animateToAudio(p, s, matte.id, 0, "scale", 5, AudioBand::All, 0, 1).ok);
+        // Over MCP: opacity from 20 to 100.
+        const QString project = QString::fromStdString(path("reactive.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_animate_to_audio"},
+                                                     {"arguments", QJsonObject{{"project", project}, {"clip", double(matte.id)}, {"param", "opacity"},
+                                                                               {"low", 20}, {"high", 100}, {"band", "mid"}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(r.value("structuredContent").toObject().value("keys").toInt() >= 2);
     }
 
     void vfxPullsWithHandles() {
