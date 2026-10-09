@@ -1,4 +1,6 @@
 #include "MainWindow.h"
+#include "LiveBridge.h"
+#include "LiveLink.h"
 #include "CleanFeed.h"
 #include "Settings.h"
 
@@ -142,6 +144,7 @@ namespace montage {
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     state_ = new EditorState(this);
+    liveLink_ = new LiveLink(state_, this);
     program_ = new PlaybackController(this);
     program_->setObjectName(QStringLiteral("programPlayback"));
     source_ = new PlaybackController(this);
@@ -163,6 +166,10 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     } else {
         scanPluginsInBackground();
     }
+
+    // The agent link comes back on if it was on when Montage last closed.
+    connect(liveLink_, &LiveLink::applied, this, [this](const QString& label) { statusBar()->showMessage(label, 5000); });
+    if (appSettings().value(QStringLiteral("agentLink/enabled"), false).toBool()) setAgentLink(true);
 
     syncTimer_.setSingleShot(true);
     syncTimer_.setInterval(0);
@@ -1499,6 +1506,12 @@ void MainWindow::buildMenus() {
         for (auto& [tool, a] : toolActions_) a->setChecked(tool == t);
     });
     toolsM->addSeparator();
+    // AI agents on the open project (MCP over the agent link).
+    agentLinkAction_ = add(toolsM, tr("Let AI Agents Edit This Project"), QKeySequence(), [this] { setAgentLink(agentLinkAction_->isChecked()); });
+    agentLinkAction_->setObjectName(QStringLiteral("agentLink"));
+    agentLinkAction_->setCheckable(true);
+    agentLinkAction_->setToolTip(tr("Claude and other MCP clients edit the project open here, each change one undo step"));
+    add(toolsM, tr("Agent Link…"), QKeySequence(), [this] { agentLinkDialog(); })->setObjectName(QStringLiteral("agentLinkDialog"));
     add(toolsM, tr("Audio &Plugins…"), QKeySequence(), [this] {
         auto* dlg = new PluginManagerDialog(this);
         dlg->setAttribute(Qt::WA_DeleteOnClose);
@@ -3034,6 +3047,67 @@ void MainWindow::setCompareWithReference(bool on) {
     if (!programPanel_) return;
     if (on) programPanel_->viewer()->setCompare(colourRefView_, tr("Reference: %1").arg(colourRefName_));
     else programPanel_->viewer()->clearCompare();
+}
+
+bool MainWindow::setAgentLink(bool on) {
+    QString err;
+    const bool ok = on ? liveLink_->start(0, &err) : (liveLink_->stop(), true);
+    if (!ok) statusBar()->showMessage(tr("The agent link could not start: %1").arg(err), 8000);
+    const bool running = liveLink_->running();
+    appSettings().setValue(QStringLiteral("agentLink/enabled"), running);
+    if (agentLinkAction_) agentLinkAction_->setChecked(running);
+    if (ok && on) statusBar()->showMessage(tr("AI agents can now edit this project (montage-cli mcp --live, or %1)").arg(liveLink_->url()), 8000);
+    return ok;
+}
+
+void MainWindow::agentLinkDialog() {
+    QDialog dlg(this);
+    dlg.setObjectName(QStringLiteral("agentLinkWindow"));
+    dlg.setWindowTitle(tr("Agent Link"));
+    auto* lay = new QVBoxLayout(&dlg);
+    auto* intro = new QLabel(tr("With the agent link on, Claude and other MCP clients use Montage's tools on the project open here. "
+                                "Each change they make is one undo step named \"Assistant: …\", and they can read and move the playhead "
+                                "and selection. Only programs on this computer that have the key can connect."),
+                             &dlg);
+    intro->setWordWrap(true);
+    lay->addWidget(intro);
+    auto* enabled = new QCheckBox(tr("Let AI agents edit the project open in Montage"), &dlg);
+    enabled->setObjectName(QStringLiteral("agentLinkEnabled"));
+    enabled->setChecked(liveLink_->running());
+    lay->addWidget(enabled);
+    auto* form = new QFormLayout;
+    QString cli = QCoreApplication::applicationDirPath() + QStringLiteral("/montage-cli");
+#ifdef Q_OS_WIN
+    cli += QStringLiteral(".exe");
+#endif
+    auto* stdioCmd = new QLineEdit(&dlg);
+    stdioCmd->setObjectName(QStringLiteral("agentLinkStdio"));
+    stdioCmd->setReadOnly(true);
+    auto* httpCmd = new QLineEdit(&dlg);
+    httpCmd->setObjectName(QStringLiteral("agentLinkHttp"));
+    httpCmd->setReadOnly(true);
+    form->addRow(tr("Claude Code / Desktop:"), stdioCmd);
+    form->addRow(tr("HTTP clients:"), httpCmd);
+    lay->addLayout(form);
+    auto refresh = [&] {
+        stdioCmd->setText(QStringLiteral("claude mcp add montage-live -- \"%1\" mcp --live").arg(QDir::toNativeSeparators(cli)));
+        httpCmd->setText(liveLink_->running() ? QStringLiteral("claude mcp add --transport http montage-live %1 --header \"Authorization: Bearer %2\"")
+                                                    .arg(liveLink_->url(), liveLink_->token())
+                                              : tr("(off)"));
+    };
+    refresh();
+    connect(enabled, &QCheckBox::toggled, &dlg, [&](bool on) {
+        setAgentLink(on);
+        enabled->setChecked(liveLink_->running());
+        refresh();
+    });
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, &dlg);
+    QPushButton* copy = buttons->addButton(tr("Copy Command"), QDialogButtonBox::ActionRole);
+    connect(copy, &QPushButton::clicked, &dlg, [&] { QGuiApplication::clipboard()->setText(stdioCmd->text()); });
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    lay->addWidget(buttons);
+    dlg.resize(640, dlg.sizeHint().height());
+    dlg.exec();
 }
 
 int MainWindow::keyOutScreen() {

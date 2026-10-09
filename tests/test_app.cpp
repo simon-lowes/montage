@@ -14,6 +14,11 @@
 #include <QDockWidget>
 #include <QDoubleSpinBox>
 #include <QRadioButton>
+#include <atomic>
+#include <thread>
+#include <sstream>
+#include <QElapsedTimer>
+#include <QTcpSocket>
 #include <QLineEdit>
 #include <QLabel>
 #include <QListView>
@@ -54,6 +59,8 @@
 #include "SpellUi.h"
 #include "core/ColorGroups.h"
 #include "core/Interpretation.h"
+#include "LiveBridge.h"
+#include "LiveLink.h"
 #include "media/SpeechSearch.h"
 #include "media/TextReader.h"
 #include "core/OnScreenText.h"
@@ -5213,6 +5220,140 @@ const auto seq = [this] { return state()->sequence(); };
         bad.fps = Rational{5000, 1};
         QVERIFY(!bin->interpretFootage({ids[0]}, bad));
         QCOMPARE(state()->project().findMedia(ids[0])->fps, (Rational{25, 1}));
+        state()->newProject();
+    }
+
+    // One request to the agent link over HTTP, as a client sends it; the event loop runs meanwhile (the link lives on
+    // this thread). The body; `status` gets the HTTP status.
+    QByteArray agentPost(quint16 port, const QByteArray& body, const QByteArray& token, int* status, const QByteArray& extra = {}) {
+        QTcpSocket s;
+        s.connectToHost(QHostAddress::LocalHost, port);
+        QElapsedTimer t;
+        t.start();
+        while (s.state() != QAbstractSocket::ConnectedState && t.elapsed() < 10000) QTest::qWait(5);
+        QByteArray req = "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n" + extra;
+        if (!token.isEmpty()) req += "Authorization: Bearer " + token + "\r\n";
+        req += "Content-Length: " + QByteArray::number(body.size()) + "\r\n\r\n" + body;
+        s.write(req);
+        QByteArray got;
+        while (t.elapsed() < 60000 && s.state() != QAbstractSocket::UnconnectedState) {
+            QTest::qWait(5);
+            got += s.readAll();
+        }
+        got += s.readAll();
+        const int end = int(got.indexOf("\r\n\r\n"));
+        if (status) *status = got.split(' ').value(1).toInt();
+        return end < 0 ? QByteArray() : got.mid(end + 4);
+    }
+
+    void agentLinkEditsTheOpenProject() {
+        qputenv("MONTAGE_MCP_LIVE_FILE", dir_.filePath("mcp-live.json").toUtf8());
+        QVERIFY(win_->findChild<QAction*>("agentLink") && win_->findChild<QAction*>("agentLinkDialog"));
+        state()->newProject();
+        QVERIFY(state()->save(dir_.filePath("linked.montage")));
+        LiveLink* link = win_->liveLink();
+        QVERIFY(win_->setAgentLink(true));
+        QVERIFY(link->running() && win_->findChild<QAction*>("agentLink")->isChecked());
+        LiveConnection c;
+        QVERIFY(readLiveConnection(c));
+        QVERIFY(c.port == link->port() && c.token == link->token() && c.project == dir_.filePath("linked.montage"));
+        const QByteArray token = link->token().toUtf8();
+        auto rpc = [&](const QString& method, const QJsonObject& params = {}) {
+            QJsonObject m{{"jsonrpc", "2.0"}, {"id", 7}, {"method", method}};
+            if (!params.isEmpty()) m["params"] = params;
+            int status = 0;
+            const QByteArray body = agentPost(link->port(), QJsonDocument(m).toJson(QJsonDocument::Compact), token, &status);
+            return status == 200 ? QJsonDocument::fromJson(body).object().value("result").toObject() : QJsonObject{{"status", status}};
+        };
+        auto call = [&](const QString& tool, const QJsonObject& args = {}) { return rpc("tools/call", {{"name", tool}, {"arguments", args}}); };
+        // Without the key, or from a web page elsewhere: refused.
+        int status = 0;
+        agentPost(link->port(), R"({"jsonrpc":"2.0","id":1,"method":"ping"})", {}, &status);
+        QCOMPARE(status, 401);
+        agentPost(link->port(), R"({"jsonrpc":"2.0","id":1,"method":"ping"})", token, &status, "Origin: https://example.com\r\n");
+        QCOMPARE(status, 403);
+        // The tools: "project" may be left out, and the link's own context tool is there.
+        const QJsonArray tools = rpc("tools/list").value("tools").toArray();
+        QJsonObject title, context;
+        for (const QJsonValue& v : tools) {
+            if (v.toObject().value("name") == "montage_add_title") title = v.toObject();
+            if (v.toObject().value("name") == "montage_live_context") context = v.toObject();
+        }
+        QVERIFY(!title.isEmpty() && !context.isEmpty());
+        QVERIFY(!title.value("inputSchema").toObject().value("required").toArray().contains("project"));
+        // A title added by the agent: one undo step, named for it.
+        const int steps = int(state()->history().undoCount());
+        QJsonObject r = call("montage_add_title", {{"text", "From the agent"}, {"at", 1}, {"duration", 2}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(!QJsonDocument(r).toJson().contains(".agent.montage"));  // the answer names the open project
+        QCOMPARE(int(state()->history().undoCount()), steps + 1);
+        QVERIFY2(state()->undoText().startsWith("Assistant: "), qPrintable(state()->undoText()));
+        Id titleClip = 0;
+        for (const Track& t : state()->sequence()->videoTracks)
+            for (const Clip& clip : t.clips)
+                if (clip.isGenerator()) titleClip = clip.id;
+        QVERIFY(titleClip);
+        QVERIFY(!QFileInfo::exists(dir_.filePath(".linked.agent.montage")));  // the copy it worked on is gone
+        // Reading changes nothing.
+        r = call("montage_project_info");
+        QVERIFY(!r.value("isError").toBool() && r.value("structuredContent").toObject().contains("tracks"));
+        QCOMPARE(int(state()->history().undoCount()), steps + 1);
+        // The context: moving the playhead and selecting the new title for the editor to see.
+        r = call("montage_live_context", {{"playhead", 2.0}, {"select", QJsonArray{double(titleClip)}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(state()->playhead(), FrameTime(std::llround(2.0 * state()->sequence()->fpsValue())));
+        QCOMPARE(state()->selectedClips(), std::vector<Id>{titleClip});
+        const QJsonObject info = r.value("structuredContent").toObject();
+        QCOMPARE(info.value("selected_clips").toArray().at(0).toObject().value("id").toDouble(), double(titleClip));
+        QCOMPARE(info.value("project").toString(), dir_.filePath("linked.montage"));
+        // Undo takes back the agent's change; an editor's change it leaves alone.
+        r = call("montage_undo");
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(!edit::clipById(*state()->sequence(), titleClip));
+        QVERIFY(state()->edit("Editor's marker", [](Project&, Sequence& s) {
+            s.markers.push_back(Marker{5, 0, "mine", "", 0, false});
+            return true;
+        }));
+        r = call("montage_undo");
+        QVERIFY(r.value("isError").toBool());
+        QCOMPARE(state()->undoText(), QString("Editor's marker"));
+        // The editor changes the project while a tool runs: the tool's result is not applied.
+        QByteArray answer;
+        link->handle(QJsonDocument(QJsonObject{{"jsonrpc", "2.0"}, {"id", 9}, {"method", "tools/call"},
+                                               {"params", QJsonObject{{"name", "montage_add_marker"}, {"arguments", QJsonObject{{"at", 3}, {"name", "agent"}}}}}})
+                         .toJson(QJsonDocument::Compact),
+                     [&](QByteArray a) { answer = a; });
+        QVERIFY(state()->edit("Meanwhile", [](Project&, Sequence& s) {
+            s.markers.push_back(Marker{8, 0, "meanwhile", "", 0, false});
+            return true;
+        }));
+        QTRY_VERIFY_WITH_TIMEOUT(!answer.isEmpty(), 30000);
+        QVERIFY2(answer.contains("not applied"), answer.constData());
+        QCOMPARE(state()->undoText(), QString("Meanwhile"));
+        for (const Marker& m : state()->sequence()->markers) QVERIFY(m.name != "agent");
+        // The stdio bridge (montage-cli mcp --live) relays to the app.
+        std::istringstream in(R"({"jsonrpc":"2.0","id":1,"method":"tools/list"})" "\n"
+                              R"({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"montage_live_context","arguments":{}}})" "\n");
+        std::ostringstream out;
+        std::atomic<bool> bridged{false};
+        std::thread bridge([&] {
+            runLiveBridge(in, out);
+            bridged = true;
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(bridged.load(), 30000);
+        bridge.join();
+        const QList<QByteArray> lines = QByteArray::fromStdString(out.str()).trimmed().split('\n');
+        QCOMPARE(lines.size(), 2);
+        QVERIFY(lines[0].contains("montage_live_context"));
+        QVERIFY2(lines[1].contains("\"sequence\""), lines[1].constData());
+        // Off: the connection file goes, and the bridge says Montage is not reachable.
+        QVERIFY(win_->setAgentLink(false));
+        QVERIFY(!link->running() && !QFileInfo::exists(liveConnectionFile()));
+        std::istringstream in2(R"({"jsonrpc":"2.0","id":3,"method":"ping"})" "\n");
+        std::ostringstream out2;
+        runLiveBridge(in2, out2);
+        QVERIFY2(QByteArray::fromStdString(out2.str()).contains("-32000"), out2.str().c_str());
+        qunsetenv("MONTAGE_MCP_LIVE_FILE");
         state()->newProject();
     }
 

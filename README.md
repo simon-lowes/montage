@@ -426,6 +426,14 @@ claude mcp add montage -- montage-cli mcp      # Claude Code
 ```
 Other clients take the same command in their MCP settings, e.g. `{"mcpServers": {"montage": {"command": "/Applications/Montage.app/Contents/MacOS/montage-cli", "args": ["mcp"]}}}`. Reopen a project in the app to see changes an agent made.
 
+**Agent link: agents on the open project** (as Premiere 26's AI Assistant, Avid's agentic editing and Descript's Underlord work on the project in front of the editor). Turn on Tools › Let AI Agents Edit This Project, then connect with `montage-cli mcp --live` (Tools › Agent Link… shows the exact command and copies it):
+
+```bash
+claude mcp add montage-live -- montage-cli mcp --live
+```
+
+Every tool then works on the project open in Montage when its `project` is left out: each change appears at once and is one undo step named "Assistant: …" (Edit › Undo takes it back, and so does the agent's `montage_undo`, which leaves the editor's own changes alone). `montage_live_context` tells the agent what is open: the sequence, playhead, In and Out and the selected clips (ids for other tools), and moves the playhead or selects clips to show a result. Tools run off the UI thread on a copy saved beside the project, one at a time; if the editor changes the project while one runs, its result is not applied and the agent is told to try again. The link is MCP over HTTP on 127.0.0.1 only, with a key the app writes (readable by the user only) to `mcp-live.json` in Montage's configuration folder; HTTP clients can use it directly (`claude mcp add --transport http montage-live http://127.0.0.1:PORT/mcp --header "Authorization: Bearer KEY"`). Requests from web pages on other sites are refused.
+
 ## Architecture
 
 ```

@@ -30,6 +30,9 @@
 #include "media/Loudness.h"
 #ifdef MONTAGE_WITH_WHISPER
 #include "automation/McpServer.h"
+#ifdef MONTAGE_LIVE_BRIDGE
+#include "app/LiveBridge.h"
+#endif
 #include "media/Diarizer.h"
 #include "media/Segmenter.h"
 #include "media/SpeechEnhance.h"
@@ -91,7 +94,8 @@ int usage() {
                  "  montage-cli shots <project.montage> \"a red car at night\" [--max N]   (find shots by description)\n"
                  "  montage-cli people <project.montage> [--person NAME|ID]   (who is in the footage, and where)\n"
                  "  montage-cli speak \"text\" -o voice.wav [--voice af_heart] [--speed 1]   (a voiceover from text; --phonemes prints them)\n"
-                 "  montage-cli mcp                       (Model Context Protocol server on stdio, for AI agents)\n"
+                 "  montage-cli mcp [--live]              (Model Context Protocol server on stdio, for AI agents;\n"
+                 "                                        --live: on the project open in Montage, with Tools > Agent Link on)\n"
                  "  montage-cli captions <project.montage> [-o out.srt|.vtt|.scc|.ttml|.stl|.ass] [--transcribe MODEL]\n"
                  "                     [--generate] [--import file.srt|.vtt|.scc|.ttml|.stl|.ass] [--save]\n"
                  "  montage-cli translate <subtitles.srt|.vtt> --to LANG [--from LANG] [-o out.srt|out.vtt]\n"
@@ -1093,6 +1097,10 @@ int main(int argc, char** argv) {
     if (cmd == "people") return cmdPeople(args);
     if (cmd == "speak") return cmdSpeak(args);
     if (cmd == "mcp") {
+#ifdef MONTAGE_LIVE_BRIDGE
+        // --live: the tools work on the project open in the running app (Tools > Agent Link), relayed to it.
+        if (std::find(args.begin(), args.end(), "--live") != args.end()) return runLiveBridge(std::cin, std::cout);
+#endif
         // A Model Context Protocol server on stdin/stdout: stdout carries only protocol messages.
         McpServer server;
         return server.run(std::cin, std::cout);

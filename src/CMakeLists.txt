@@ -286,6 +286,12 @@ endif()
 
 add_executable(montage-cli cli/main.cpp)
 target_link_libraries(montage-cli PRIVATE montage_engine)
+if(MONTAGE_BUILD_APP)
+  # `montage-cli mcp --live`: the stdio bridge to a running app's agent link (app/LiveBridge).
+  target_sources(montage-cli PRIVATE app/LiveBridge.cpp app/LiveBridge.h)
+  target_link_libraries(montage-cli PRIVATE Qt6::Network)
+  target_compile_definitions(montage-cli PRIVATE MONTAGE_LIVE_BRIDGE=1)
+endif()
 montage_copy_runtime(montage-cli)
 set_target_properties(montage-cli PROPERTIES AUTOMOC OFF)
 install(TARGETS montage-cli RUNTIME DESTINATION bin)

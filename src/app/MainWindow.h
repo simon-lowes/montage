@@ -53,6 +53,7 @@ class AudioMeterWidget;
 class LoudnessReadout;
 class VoiceoverDialog;
 class LinkMediaDialog;
+class LiveLink;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -157,6 +158,11 @@ public:
     // Clip › Key Out Green / Blue Screen: the selected clips (or the one under the playhead) keyed with the Keyer set to
     // their screen's colour, read from the picture. How many.
     int keyOutScreen();
+    // Tools › Agent Link: AI agents edit the open project over MCP (app/LiveLink.h). On or off (remembered), and the
+    // dialog with how to connect.
+    LiveLink* liveLink() const { return liveLink_; }
+    bool setAgentLink(bool on);
+    void agentLinkDialog();
     void exportForReviewDialog();
     bool addToColorGroup(Id group);
     bool removeFromColorGroup();
@@ -364,6 +370,8 @@ private:
     void about();
 
     EditorState* state_;
+    LiveLink* liveLink_ = nullptr;
+    QAction* agentLinkAction_ = nullptr;
     PlaybackController* program_;
     PlaybackController* source_;
     TimelineWidget* timeline_ = nullptr;
