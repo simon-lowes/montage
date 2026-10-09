@@ -972,6 +972,44 @@ private slots:
         QVERIFY(!closeGap(fx.p, fx.s(), V1, 500).ok);
     }
 
+    void pasteGapsAndClearSolo() {
+        // A pasted gap opens empty space: the clip under it splits, what follows moves on, and so do sync-locked tracks.
+        Fixture fx;
+        const Id a = fx.put(V1, 0, 30), b = fx.put(V1, 30, 30);
+        const Id music = fx.put(A1, 20, 60);
+        QVERIFY(insertGap(fx.p, fx.s(), V1, 10, 15).ok);
+        QCOMPARE(fx.v1().clips.size(), size_t(3));
+        QCOMPARE(clipById(fx.s(), a)->duration, FrameTime(10));
+        QCOMPARE(fx.v1().clips[1].start, FrameTime(25));
+        QCOMPARE(fx.v1().clips[1].sourceIn, 10.0);
+        QCOMPARE(clipById(fx.s(), b)->start, FrameTime(45));
+        QCOMPARE(clipById(fx.s(), music)->start, FrameTime(35));  // sync-locked A1 moved too
+        // Without sync lock A1 stays; a locked track, nothing to paste and no such track are refused.
+        fx.a1().syncLock = false;
+        QVERIFY(insertGap(fx.p, fx.s(), V1, 0, 5).ok);
+        QCOMPARE(clipById(fx.s(), music)->start, FrameTime(35));
+        QCOMPARE(clipById(fx.s(), b)->start, FrameTime(50));
+        fx.v1().locked = true;
+        QVERIFY(!insertGap(fx.p, fx.s(), V1, 0, 5).ok);
+        fx.v1().locked = false;
+        QVERIFY(!insertGap(fx.p, fx.s(), V1, 0, 0).ok);
+        QVERIFY(!insertGap(fx.p, fx.s(), {TrackKind::Video, 9}, 0, 5).ok);
+        // Then closing it again puts things back.
+        QVERIFY(closeGap(fx.p, fx.s(), V1, 0).ok);
+        QCOMPARE(clipById(fx.s(), b)->start, FrameTime(45));
+
+        // Solo: the soloed tracks by id; cleared, and set again.
+        fx.v1().solo = true;
+        fx.a1().solo = true;
+        const std::vector<Id> soloed = soloedTracks(fx.s());
+        QCOMPARE(soloed, (std::vector<Id>{fx.v1().id, fx.a1().id}));
+        QVERIFY(setSoloedTracks(fx.s(), {}).ok);
+        QVERIFY(soloedTracks(fx.s()).empty());
+        QVERIFY(!setSoloedTracks(fx.s(), {}).ok);  // nothing to change
+        QVERIFY(setSoloedTracks(fx.s(), soloed).ok);
+        QVERIFY(fx.v1().solo && fx.a1().solo);
+    }
+
     void copyPasteAndDuplicate() {
         Fixture fx;
         auto r = placeMedia(fx.p, fx.s(), fx.media, 0, 0, 30, V1, A1, false);

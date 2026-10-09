@@ -113,6 +113,12 @@ Result slide(Project& p, Sequence& s, Id clipId, FrameTime delta);
 Result setSpeed(Project& p, Sequence& s, Id clipId, double speed, bool ripple, bool reverse = false,
                 bool includeLinked = true);
 Result closeGap(Project& p, Sequence& s, TrackRef t, FrameTime frame);
+// Pasting a copied gap (Resolve 21.1): `length` frames of empty space opened at `at` on the track, splitting a
+// clip there and pushing what follows (and the same on sync-locked tracks), as an insert edit does.
+Result insertGap(Project& p, Sequence& s, TrackRef t, FrameTime at, FrameTime length);
+// Clear Solo (Resolve 21.1): the soloed tracks (as track ids), and all of them soloed again.
+std::vector<Id> soloedTracks(const Sequence& s);
+Result setSoloedTracks(Sequence& s, const std::vector<Id>& tracks);
 Result liftRange(Project& p, Sequence& s, FrameTime a, FrameTime b, const std::vector<TrackRef>& tracks);
 Result extractRange(Project& p, Sequence& s, FrameTime a, FrameTime b, const std::vector<TrackRef>& tracks);
 Result linkClips(Project& p, Sequence& s, const std::vector<Id>& ids);

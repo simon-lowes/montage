@@ -938,6 +938,33 @@ Result closeGap(Project& p, Sequence& s, TrackRef r, FrameTime frame) {
     return {};
 }
 
+Result insertGap(Project& p, Sequence& s, TrackRef r, FrameTime at, FrameTime length) {
+    const Track* t = trackAt(s, r);
+    if (!t) return Result::fail("No such track");
+    if (!editable(t)) return Result::fail("Track is locked");
+    if (length <= 0) return Result::fail("No gap to paste");
+    rippleOpen(p, s, std::max<FrameTime>(0, at), length, rippleTracks(s, {r}));
+    return {};
+}
+
+std::vector<Id> soloedTracks(const Sequence& s) {
+    std::vector<Id> out;
+    for (TrackRef r : allTracks(s))
+        if (const Track* t = trackAt(s, r); t && t->solo) out.push_back(t->id);
+    return out;
+}
+
+Result setSoloedTracks(Sequence& s, const std::vector<Id>& tracks) {
+    bool changed = false;
+    for (TrackRef r : allTracks(s)) {
+        Track* t = trackAt(s, r);
+        const bool on = std::find(tracks.begin(), tracks.end(), t->id) != tracks.end();
+        if (t->solo != on) t->solo = on, changed = true;
+    }
+    if (!changed) return Result::fail(tracks.empty() ? "No track is soloed" : "Those tracks are soloed already");
+    return {};
+}
+
 Result liftRange(Project& p, Sequence& s, FrameTime a, FrameTime b, const std::vector<TrackRef>& tracks) {
     if (b <= a) return Result::fail("Set In and Out points first");
     for (TrackRef r : tracks) {

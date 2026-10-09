@@ -8,6 +8,7 @@
 #include <memory>
 #include <optional>
 #include <QTimer>
+#include <map>
 #include <vector>
 
 #include "Recovery.h"
@@ -214,6 +215,8 @@ private:
     void copySelection(bool cut);
     void paste(bool insertMode);
     void deleteSelection(bool ripple);
+    // Clear Solo (Resolve 21.1): clears every solo, remembering them; with none soloed, restores them.
+    void clearOrRestoreSolo();
     void addEdit(bool allTracks);
     void addDefaultTransition(bool audio);
     void speedDialog();
@@ -329,6 +332,11 @@ private:
     QLabel* statusInfo_ = nullptr;
     Monitor active_ = Monitor::Program;
     std::vector<edit::ClipboardItem> clipboard_;
+    // A copied gap (Resolve 21.1): its length and track, pasted as empty space when it was copied last.
+    FrameTime gapClipboard_ = 0;
+    TrackRef gapTrack_;
+    bool gapCopiedLast_ = false;
+    std::map<Id, std::vector<Id>> soloMemory_;  // per sequence: the tracks Clear Solo un-soloed
     Id sourceSequence_ = 0;
     RecoveryManager* recovery_ = nullptr;
     QTimer syncTimer_;

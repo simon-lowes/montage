@@ -986,6 +986,7 @@ void MainWindow::buildMenus() {
             state_->message(on ? tr("Global Mute: playback is silent (clips, tracks and exports are unchanged)") : tr("Global Mute off"), 4000);
         });
     }
+    add(seqM, tr("Clear Solo"), QKeySequence(), [this] { clearOrRestoreSolo(); })->setObjectName(QStringLiteral("clearSolo"));
     add(seqM, tr("Render In to Out"), QKeySequence(Qt::Key_Return), [this] { renderInToOut(); })
         ->setObjectName(QStringLiteral("renderInToOut"));
     add(seqM, tr("Delete Render Files"), QKeySequence(), [this] { deleteRenderFiles(); })
@@ -1583,13 +1584,35 @@ void MainWindow::closeEvent(QCloseEvent* e) {
 
 void MainWindow::copySelection(bool cut) {
     const Sequence* s = state_->sequence();
-    if (!s || state_->selectedClips().empty()) return;
+    if (!s) return;
+    if (state_->selectedClips().empty()) {
+        // A selected gap (Resolve 21.1): its length is kept to paste as empty space; cutting closes it.
+        if (const auto& gap = timeline_->selectedGap(); gap && gap->to > gap->from) {
+            gapClipboard_ = gap->to - gap->from;
+            gapTrack_ = gap->track;
+            gapCopiedLast_ = true;
+            const QString length = QString::fromStdString(formatTimecode(gapClipboard_, s->fps));
+            if (cut) deleteSelection(false);
+            statusBar()->showMessage(cut ? tr("Gap cut (%1)").arg(length) : tr("Gap copied (%1)").arg(length), 2000);
+        }
+        return;
+    }
+    gapCopiedLast_ = false;
     clipboard_ = edit::copyClips(*s, state_->selectedClips());
     if (cut) deleteSelection(false);
     statusBar()->showMessage(tr("%n clip(s) copied", "", int(clipboard_.size())), 2000);
 }
 
 void MainWindow::paste(bool insertMode) {
+    if (gapCopiedLast_ && gapClipboard_ > 0) {
+        // A gap pastes as empty space at the playhead, on the selected gap's track or the one it came from.
+        const auto& gap = timeline_->selectedGap();
+        const TrackRef track = gap ? gap->track : gapTrack_;
+        const FrameTime at = state_->playhead(), length = gapClipboard_;
+        if (state_->apply(tr("Paste Gap"), [track, at, length](Project& p, Sequence& s) { return edit::insertGap(p, s, track, at, length); }))
+            timeline_->clearGap();
+        return;
+    }
     if (clipboard_.empty()) return;
     auto items = clipboard_;
     FrameTime at = state_->playhead();
@@ -1621,6 +1644,27 @@ void MainWindow::deleteSelection(bool ripple) {
     state_->apply(ripple ? tr("Ripple Delete") : tr("Delete"), [sel, ripple](Project& p, Sequence& s) {
         return edit::removeClips(p, s, sel, ripple);
     });
+}
+
+void MainWindow::clearOrRestoreSolo() {
+    const Sequence* s = state_->sequence();
+    if (!s) return;
+    const Id seq = s->id;
+    if (const std::vector<Id> soloed = edit::soloedTracks(*s); !soloed.empty()) {
+        if (state_->apply(tr("Clear Solo"), [](Project&, Sequence& sq) { return edit::setSoloedTracks(sq, {}); })) {
+            soloMemory_[seq] = soloed;
+            state_->message(tr("Solo cleared: Clear Solo again brings it back"), 4000);
+        }
+        return;
+    }
+    auto it = soloMemory_.find(seq);
+    if (it == soloMemory_.end()) {
+        state_->message(tr("No track is soloed"), 3000);
+        return;
+    }
+    const std::vector<Id> tracks = it->second;
+    if (state_->apply(tr("Restore Solo"), [tracks](Project&, Sequence& sq) { return edit::setSoloedTracks(sq, tracks); }))
+        soloMemory_.erase(it);
 }
 
 void MainWindow::addEdit(bool allTracks) {

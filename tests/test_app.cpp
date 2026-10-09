@@ -2115,6 +2115,68 @@ private slots:
         QVERIFY(!tl->selectedGap());
     }
 
+    void gapsCutCopyPasteAndClearSolo() {
+        loadDemo();
+        const Clip* red = clipNamed(*state()->sequence(), "Red");
+        const Id redId = red->id, blueId = clipNamed(*state()->sequence(), "Blue")->id;
+        const FrameTime redEnd = red->end();
+        QVERIFY(state()->apply("Move", [blueId](Project& p, Sequence& s) { return edit::moveClips(p, s, {blueId}, 15, 0, 0); }));
+        TimelineWidget* tl = win_->timeline();
+        auto action = [this](const QString& text) {
+            for (QAction* a : win_->findChildren<QAction*>())
+                if (a->text() == text) return a;
+            return static_cast<QAction*>(nullptr);
+        };
+        QAction *copy = action("&Copy"), *cut = action("Cu&t"), *paste = action("&Paste");
+        QVERIFY(copy && cut && paste);
+        auto blue = [&] { return edit::clipById(*state()->sequence(), blueId)->start; };
+        // Copy the 15-frame gap after Red, and paste it inside Red: Red splits and Blue moves on by 15.
+        QVERIFY(tl->selectGapAt({TrackKind::Video, 0}, redEnd + 3));
+        copy->trigger();
+        state()->setPlayhead(5);
+        paste->trigger();
+        QCOMPARE(blue(), redEnd + 30);
+        QCOMPARE(edit::clipById(*state()->sequence(), redId)->end(), FrameTime(5));
+        QCOMPARE(state()->undoText(), tr("Paste Gap"));
+        state()->undo();
+        QCOMPARE(blue(), redEnd + 15);
+        // Cut closes it; pasting at Red's end brings it back.
+        QVERIFY(tl->selectGapAt({TrackKind::Video, 0}, redEnd + 3));
+        cut->trigger();
+        QCOMPARE(blue(), redEnd);
+        state()->setPlayhead(redEnd);
+        paste->trigger();
+        QCOMPARE(blue(), redEnd + 15);
+        // Copying clips makes Paste paste clips again.
+        state()->setSelection({redId});
+        copy->trigger();
+        const size_t clips = state()->sequence()->videoTracks[0].clips.size();
+        state()->setPlayhead(state()->sequence()->duration() + 10);
+        paste->trigger();
+        QCOMPARE(state()->sequence()->videoTracks[0].clips.size(), clips + 1);
+
+        // Clear Solo clears every solo and, used again, brings them back.
+        QAction* clearSolo = win_->findChild<QAction*>("clearSolo");
+        QVERIFY(clearSolo);
+        QVERIFY(state()->edit("Solo", [](Project&, Sequence& s) {
+            s.videoTracks[0].solo = true;
+            s.audioTracks[0].solo = true;
+            return true;
+        }));
+        const auto soloed = edit::soloedTracks(*state()->sequence());
+        QCOMPARE(soloed.size(), size_t(2));
+        clearSolo->trigger();
+        QVERIFY(edit::soloedTracks(*state()->sequence()).empty());
+        clearSolo->trigger();
+        QCOMPARE(edit::soloedTracks(*state()->sequence()), soloed);
+        // One undo step each.
+        state()->undo();
+        QVERIFY(edit::soloedTracks(*state()->sequence()).empty());
+        state()->undo();
+        QCOMPARE(edit::soloedTracks(*state()->sequence()), soloed);
+        state()->setSelection({}, false);
+    }
+
     void auditionsFromTheBin() {
         // Two takes of a shot: the first in the cut, the second added from the bin as a take.
         QStringList files;
