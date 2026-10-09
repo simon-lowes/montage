@@ -1029,6 +1029,54 @@ private slots:
         QVERIFY(retakeRanges(far, 25).empty());
     }
 
+    void cea608Schedule() {
+        // Two captions close together at 30 fps: the second loads while the first is up, and the first still comes off
+        // on time (the erase goes in between the second's pairs, not between a control code's two copies).
+        const std::vector<Caption> caps = {{30, 75, "Hello there", {}}, {90, 150, "A second caption\non two rows", {}}};
+        const std::vector<Cc608Pair> sched = captionsTo608(caps, {30, 1});
+        QVERIFY(!sched.empty());
+        std::vector<std::pair<double, uint16_t>> pairs;
+        for (size_t i = 0; i < sched.size(); ++i) {
+            if (i) QVERIFY(sched[i].frame > sched[i - 1].frame);  // one pair a frame
+            pairs.push_back({double(sched[i].frame) * 1001.0 / 30000.0, sched[i].pair});
+        }
+        const uint16_t erase = 0x942c;  // 14 2c with parity
+        auto control = [](uint16_t p) { return ((p >> 8) & 0x70) == 0x10; };
+        int erases = 0;
+        for (size_t i = 1; i + 2 < sched.size(); ++i)
+            if (sched[i].pair == erase && sched[i - 1].pair != erase) {
+                ++erases;
+                QCOMPARE(sched[i + 1].pair, erase);  // sent twice
+                // Not between a control code's first copy and its second.
+                const bool firstCopyBefore = control(sched[i - 1].pair) && (i < 2 || sched[i - 2].pair != sched[i - 1].pair);
+                QVERIFY(!(firstCopyBefore && sched[i + 2].pair == sched[i - 1].pair));
+            }
+        QVERIFY(erases >= 1);  // the first caption's erase, among the second's pairs
+        std::vector<Caption> back;
+        QVERIFY(captionsFrom608(pairs, {30, 1}, back));
+        QCOMPARE(back.size(), size_t(2));
+        QCOMPARE(back[0].text, caps[0].text);
+        QCOMPARE(back[1].text, caps[1].text);
+        for (size_t i = 0; i < 2; ++i) {
+            QVERIFY2(std::llabs(back[i].start - caps[i].start) <= 2, qPrintable(QString::number(back[i].start)));
+            QVERIFY2(std::llabs(back[i].end - caps[i].end) <= 2, qPrintable(QString::number(back[i].end)));
+        }
+        // The same through an SCC file.
+        std::vector<Caption> scc;
+        QVERIFY(parseScc(captionsToScc(caps, {30, 1}), {30, 1}, scc));
+        QCOMPARE(scc.size(), size_t(2));
+        QVERIFY(std::llabs(scc[0].end - 75) <= 2);
+        // A caption that ends after the next begins is replaced by it, not erased.
+        const std::vector<Caption> overlapping = {{30, 120, "First", {}}, {90, 150, "Second", {}}};
+        std::vector<std::pair<double, uint16_t>> op;
+        for (const Cc608Pair& c : captionsTo608(overlapping, {30, 1})) op.push_back({double(c.frame) * 1001.0 / 30000.0, c.pair});
+        QVERIFY(captionsFrom608(op, {30, 1}, back));
+        QCOMPARE(back.size(), size_t(2));
+        QVERIFY(std::llabs(back[1].start - 90) <= 2);
+        QVERIFY(std::llabs(back[1].end - 150) <= 2);
+        QVERIFY(!captionsFrom608({}, {30, 1}, back));
+    }
+
     void suggestingChapters() {
         // Three talks of ten sentences each (cooking, football, astronomy), a word every 0.4 s and 0.6 s between sentences.
         const std::vector<std::vector<std::string>> talks = {

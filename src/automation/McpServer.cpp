@@ -2558,13 +2558,38 @@ void McpServer::Impl::addTools() {
         "Write a caption track to a file in the format its extension names: .srt (SubRip), .vtt (WebVTT), .scc "
         "(Scenarist, CEA-608), .ttml / .xml / .dfxp (TTML, IMSC 1.1 Text profile, with the track's colours), .stl "
         "(EBU Tech 3264, 25 or 30 fps) or .ass / .ssa (SubStation Alpha, with the track's style); or read any of them "
-        "as a new caption track (`import`). `track` is a caption track index (default: the visible one).",
+        "as a new caption track (`import`), or the CEA-608 closed captions inside a video clip's file (`import_embedded`). "
+        "`track` is a caption track index (default: the visible one).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"export":{"type":"string","description":"A file to write"},
             "import":{"type":"string","description":"A file to read as a new track"},"track":{"type":"integer"},
+            "import_embedded":{"type":"number","description":"A video clip (id): the CEA-608 closed captions inside its file as a new track, where the clip plays them"},
             "language":{"type":"string","description":"ISO 639-1 code for an imported track"}},"required":["project"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
+            if (a.contains("import_embedded")) {
+                const Id id = Id(a.value("import_embedded").toDouble());
+                const Clip* c = edit::clipById(s, id);
+                const MediaItem* m = c && c->mediaId ? l.project.findMedia(c->mediaId) : nullptr;
+                if (!m || m->kind != MediaKind::Video) return fail("import_embedded names a video clip (see montage_project_info)");
+                std::vector<Caption> found;
+                std::string err;
+                if (!readEmbeddedCaptions(m->path, s.fps, found, {}, nullptr, &err)) return fail(QString::fromStdString(err));
+                CaptionTrack t;
+                t.id = l.project.newId();
+                t.name = "CC1 - " + c->name;
+                t.captions = captionsThroughClip(*c, found);
+                if (t.captions.empty()) return fail("None of the clip's closed captions fall within it");
+                const int n = int(t.captions.size());
+                const QString name = QString::fromStdString(t.name);
+                QJsonArray list;
+                for (const Caption& cap : t.captions)
+                    list.append(QJsonObject{{"start", tc(cap.start, s)}, {"end", tc(cap.end, s)}, {"text", QString::fromStdString(cap.text)}});
+                s.captionTracks.push_back(std::move(t));
+                save(l);
+                return ok(QStringLiteral("Imported %1 closed captions as \"%2\"").arg(n).arg(name),
+                          QJsonObject{{"track", int(s.captionTracks.size()) - 1}, {"name", name}, {"captions", list}});
+            }
             if (a.contains("import")) {
                 const QString path = need(a, "import");
                 QFile in(path);
@@ -3493,6 +3518,7 @@ void McpServer::Impl::addTools() {
             "stems":{"type":"string","enum":["none","tracks","buses","roles"],"default":"none",
                 "description":"Also write 24-bit WAV stems beside the output, one per audio track, per bus (plus Main) or per audio role"},
             "captions":{"type":"string","enum":["none","burn","embed","both"],"default":"none","description":"The visible caption track, burned into the picture and/or embedded as a subtitle stream"},
+            "cea608":{"type":"boolean","default":false,"description":"Also carry the caption track as CEA-608 closed captions inside H.264/HEVC video (A/53, as US broadcast and streaming deliveries ask)"},
             "all_captions":{"type":"boolean","default":false,"description":"With embed: every caption track as its own subtitle stream, language tagged"},
             "audio_streams":{"description":"More audio streams after the mix (a master's M&E, dialogue, dubs): \"roles\" (one per role), \"tracks\" (one per track), or a list of {name, language, tracks:[\"A2\",...], role}",
                 "anyOf":[{"type":"string","enum":["mix","roles","tracks"]},{"type":"array","items":{"type":"object","properties":{
@@ -3534,6 +3560,7 @@ void McpServer::Impl::addTools() {
             const QString cap = str(a, "captions", "none");
             if (cap != "none" && cap != "burn" && cap != "embed" && cap != "both") throw ArgError{"\"captions\" must be none, burn, embed or both"};
             st.burnInCaptions = cap == "burn" || cap == "both";
+            st.cea608 = a.value("cea608").toBool();
             st.embedCaptions = cap == "embed" || cap == "both";
             if (st.embedCaptions && a.value("all_captions").toBool())
                 for (const CaptionTrack& t : s.captionTracks) st.extraCaptions.push_back(t.id);

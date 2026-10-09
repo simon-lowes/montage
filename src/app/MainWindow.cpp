@@ -977,6 +977,8 @@ void MainWindow::buildMenus() {
     add(clipM, tr("Cut Selected Media to the Beat"), QKeySequence(), [this] { cutMediaToBeat(1, true); })
         ->setObjectName(QStringLiteral("cutToBeat"));
     add(clipM, tr("Make Highlights…"), QKeySequence(), [this] { highlightsDialog(); })->setObjectName(QStringLiteral("makeHighlights"));
+    add(clipM, tr("Import Embedded Captions"), QKeySequence(), [this] { importEmbeddedCaptions(); })
+        ->setObjectName(QStringLiteral("importEmbeddedCaptions"));
     add(clipM, tr("Add B-Roll by What Is Said"), QKeySequence(), [this] { addBroll(); })->setObjectName(QStringLiteral("autoBroll"));
     add(clipM, tr("S&ynchronize by Audio"), QKeySequence(), [this] { syncByAudio(); });
     clipM->addSeparator();
@@ -3504,6 +3506,49 @@ Id MainWindow::makeHighlights(double seconds, const QString& lookFor) {
         state_->message(tr("%n moment(s) in a new Highlights sequence", "", int(moments.size())), 6000);
     }
     return seq;
+}
+
+int MainWindow::importEmbeddedCaptions() {
+    const Sequence* s = state_->sequence();
+    if (!s) return 0;
+    // The selected video clip, else the one under the playhead on the target video track.
+    const Clip* clip = nullptr;
+    for (Id id : state_->selectedClips())
+        for (const Track& t : s->videoTracks)
+            for (const Clip& c : t.clips)
+                if (c.id == id && c.mediaId) clip = &c;
+    if (!clip)
+        if (const Track* t = trackAt(*s, {TrackKind::Video, state_->targetVideoTrack()}))
+            for (const Clip& c : t->clips)
+                if (c.mediaId && c.start <= state_->playhead() && state_->playhead() < c.end()) clip = &c;
+    const MediaItem* m = clip ? state_->project().findMedia(clip->mediaId) : nullptr;
+    if (!m || m->kind != MediaKind::Video) {
+        state_->message(tr("Select a video clip whose file carries closed captions"));
+        return 0;
+    }
+    const std::string path = m->path;
+    const Rational fps = s->fps;
+    const Clip target = *clip;
+    std::vector<Caption> found;
+    if (!runWithProgress(this, state_, tr("Reading closed captions..."), [&](const auto& progress, const auto* cancel, std::string* e) {
+            return readEmbeddedCaptions(path, fps, found, progress, cancel, e);
+        }))
+        return 0;
+    const std::vector<Caption> placed = captionsThroughClip(target, found);
+    if (placed.empty()) {
+        state_->message(tr("None of the clip's closed captions fall within it"));
+        return 0;
+    }
+    state_->edit(tr("Import Embedded Captions"), [&](Project& p, Sequence& sq) {
+        CaptionTrack t;
+        t.id = p.newId();
+        t.name = "CC1 - " + target.name;
+        t.captions = placed;
+        sq.captionTracks.push_back(std::move(t));
+        return true;
+    });
+    state_->message(tr("%n closed caption(s) imported as a caption track", "", int(placed.size())), 5000);
+    return int(placed.size());
 }
 
 std::vector<Id> MainWindow::shortsSource() const {

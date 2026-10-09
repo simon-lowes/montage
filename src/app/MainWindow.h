@@ -109,6 +109,9 @@ public:
     bool addFrameHold();                              // the clip under the playhead
     // Copies the chapter markers (within In to Out when set) as YouTube's chapter list; returns the text.
     QString copyYoutubeChapters();
+    // Clip › Import Embedded Captions: the CEA-608 captions inside the selected video clip's file (else the clip under
+    // the playhead on the target video track) as a new caption track where the clip plays them. How many captions.
+    int importEmbeddedCaptions();
     // Suggest Chapters: chapter markers where the talk moves on, titled with what each part is about (replacing the
     // chapter markers there were); `ask` shows them first to rename, drop or re-space. How many were added.
     int suggestChapterMarkers(double minSeconds = 30, bool ask = true);

@@ -198,6 +198,12 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     allCaptions_->setToolTip(tr("Embed each caption track as its own subtitle stream, tagged with its language, so players offer them all"));
     allCaptions_->setChecked(appSettings().value("export/allCaptions", false).toBool());
     form->addRow(QString(), allCaptions_);
+    cea608_ = new QCheckBox(tr("CEA-608 closed captions in the video (broadcast, streaming platforms)"), form_);
+    cea608_->setObjectName(QStringLiteral("exportCea608"));
+    cea608_->setToolTip(tr("The caption track as line-21 (A/53) captions inside H.264 or HEVC video, as US broadcast and "
+                           "streaming deliveries ask; players show them as CC1"));
+    cea608_->setChecked(appSettings().value("export/cea608", false).toBool());
+    form->addRow(QString(), cea608_);
     streams_ = new QComboBox(form_);
     streams_->setObjectName(QStringLiteral("exportAudioStreams"));
     streams_->addItem(tr("The mix only"));
@@ -478,6 +484,11 @@ void ExportDialog::updateControls() {
                                                  : tr("Add a visible caption track (Captions panel) to export captions"));
     allCaptions_->setEnabled(captions_->isEnabled() && (captions_->currentData().toInt() & 2) && seq && seq->captionTracks.size() > 1);
     {
+        const std::string vc = p ? p->settings.videoCodec : std::string();
+        const bool avc = vc == "libx264" || vc == "libx265" || vc == "hw_h264" || vc == "hw_hevc";
+        cea608_->setEnabled(video && ct && !ct->captions.empty() && avc);
+    }
+    {
         const QString e = p ? QString::fromStdString(p->extension).toLower() : QString();
         const bool container = e == QLatin1String("mp4") || e == QLatin1String("mov") || e == QLatin1String("mkv") || e == QLatin1String("mxf");
         streams_->setEnabled(p && hasAudio(p->settings) && container);
@@ -617,6 +628,8 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
     if (allCaptions_->isEnabled() && allCaptions_->isChecked() && state_->sequence())
         for (const CaptionTrack& t : state_->sequence()->captionTracks) s.extraCaptions.push_back(t.id);
     settings.setValue("export/allCaptions", allCaptions_->isChecked());
+    s.cea608 = cea608_->isEnabled() && cea608_->isChecked();
+    settings.setValue("export/cea608", cea608_->isChecked());
     if (streams_->isEnabled() && streams_->currentIndex() > 0 && state_->sequence()) {
         s.extraAudio = stemStreams(*state_->sequence(), streams_->currentIndex() == 1 ? StemsByRole : StemsByTrack);
         s.audioName = "Mix";

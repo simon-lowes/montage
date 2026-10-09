@@ -2,6 +2,7 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -19,6 +20,13 @@ namespace montage {
 
 // Fills `out` (kind, duration, dimensions, codecs...) from the file at `path`.
 bool probeMedia(const std::string& path, MediaItem& out, std::string* error = nullptr);
+
+// Captions carried inside a video as CEA-608 (the A/53 caption data of H.264, HEVC and MPEG-2 frames, as broadcast
+// and camera files carry them): caption channel 1, timed in frames at `fps` of the media's own time. The whole video
+// is read. False (with `error`) if it holds none.
+bool readEmbeddedCaptions(const std::string& path, Rational fps, std::vector<Caption>& out,
+                          const std::function<void(double)>& progress = {}, const std::atomic<bool>* cancel = nullptr,
+                          std::string* error = nullptr);
 
 // Frame-accurate video decoder. Not thread safe: use one per thread
 // (MediaPool hands them out).

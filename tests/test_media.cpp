@@ -6654,6 +6654,86 @@ private slots:
         QCOMPARE(back.sequences.back().name, std::string("Highlights"));
     }
 
+    void embeddedClosedCaptions() {
+        // A 6 s cut with two captions, written with CEA-608 captions inside the video and read back.
+        auto make = [&](Rational fps, const std::string& codec, const std::string& file, std::string* err) {
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            s.width = 160, s.height = 90, s.fps = fps;
+            const double f = fps.toDouble();
+            Clip bg = makeGeneratorClip(p, "color", FrameTime(std::llround(6 * f)));
+            edit::overwrite(p, s, {TrackKind::Video, 0}, bg);
+            CaptionTrack t;
+            t.id = p.newId();
+            t.captions = {{FrameTime(std::llround(1.0 * f)), FrameTime(std::llround(2.5 * f)), "Hello there", {}},
+                          {FrameTime(std::llround(3.0 * f)), FrameTime(std::llround(5.0 * f)), "A second caption\non two rows", {}}};
+            s.captionTracks.push_back(t);
+            ExportSettings st;
+            st.path = file;
+            st.videoCodec = codec;
+            st.audioCodec = "none";
+            st.preset = codec == "libx264" ? "ultrafast" : "medium";
+            st.cea608 = true;
+            return exportSequence(p, s, st, nullptr, nullptr, err);
+        };
+        std::string err;
+        for (const auto& [fps, codec] : std::vector<std::pair<Rational, std::string>>{{{30000, 1001}, "libx264"}, {{25, 1}, "libx264"}, {{24000, 1001}, "libx265"}}) {
+            const std::string file = path(("cc608-" + std::to_string(fps.num) + "-" + codec + ".mp4").c_str());
+            QVERIFY2(make(fps, codec, file, &err), err.c_str());
+            std::vector<Caption> back;
+            QVERIFY2(readEmbeddedCaptions(file, fps, back, {}, nullptr, &err), qPrintable(QString::fromStdString(codec + ": " + err)));
+            QCOMPARE(back.size(), size_t(2));
+            const double f = fps.toDouble();
+            QCOMPARE(back[0].text, std::string("Hello there"));
+            QCOMPARE(back[1].text, std::string("A second caption\non two rows"));
+            // Shown and cleared within a frame or two of when the captions say.
+            QVERIFY2(std::llabs(back[0].start - std::llround(1.0 * f)) <= 2, qPrintable(QString::number(back[0].start)));
+            QVERIFY2(std::llabs(back[0].end - std::llround(2.5 * f)) <= 2, qPrintable(QString::number(back[0].end)));
+            QVERIFY2(std::llabs(back[1].start - std::llround(3.0 * f)) <= 2, qPrintable(QString::number(back[1].start)));
+            QVERIFY2(std::llabs(back[1].end - std::llround(5.0 * f)) <= 2, qPrintable(QString::number(back[1].end)));
+        }
+        // Only H.264 and HEVC carry them.
+        QVERIFY(!make({25, 1}, "prores_ks", path("cc608.mov"), &err));
+        QVERIFY(QString::fromStdString(err).contains("H.264"));
+        // A video without captions.
+        Project plain = makeDefaultProject();
+        Sequence& ps = *plain.active();
+        ps.width = 160, ps.height = 90;
+        edit::overwrite(plain, ps, {TrackKind::Video, 0}, makeGeneratorClip(plain, "color", 30));
+        ExportSettings pst;
+        pst.path = path("no-cc.mp4");
+        pst.audioCodec = "none";
+        pst.preset = "ultrafast";
+        QVERIFY(exportSequence(plain, ps, pst, nullptr, nullptr, &err));
+        std::vector<Caption> none;
+        QVERIFY(!readEmbeddedCaptions(pst.path, {30, 1}, none, {}, nullptr, &err));
+        // Placed where a trimmed clip of the file plays them, over MCP.
+        Project q = makeDefaultProject();
+        Sequence& qs = *q.active();
+        qs.fps = {30000, 1001};
+        MediaItem m = probeOrFail(q, path("cc608-30000-libx264.mp4"));
+        q.media.push_back(m);
+        QVERIFY(edit::placeMedia(q, qs, m.id, 100, 15, 165, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);  // source 0.5-5.5 s at 100
+        const Id clip = qs.videoTracks[0].clips.at(0).id;
+        const QString project = QString::fromStdString(path("cc608.montage"));
+        QVERIFY(saveProject(q, project.toStdString()));
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_captions"}, {"arguments", QJsonObject{{"project", project}, {"import_embedded", double(clip)}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject res = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.active()->captionTracks.size(), size_t(1));
+        const auto& placed = back.active()->captionTracks[0].captions;
+        QCOMPARE(placed.size(), size_t(2));
+        QVERIFY2(std::llabs(placed[0].start - (100 + 30 - 15)) <= 2, qPrintable(QString::number(placed[0].start)));  // 1 s in the file
+        QVERIFY2(std::llabs(placed[1].end - (100 + 150 - 15)) <= 2, qPrintable(QString::number(placed[1].end)));     // 5 s in the file
+    }
+
     void layeredPsd() {
         using Px = std::array<uint16_t, 4>;
         auto rgb = [](int r, int g, int b) { return Px{uint16_t(r * 257), uint16_t(g * 257), uint16_t(b * 257), 65535}; };

@@ -3164,6 +3164,42 @@ private slots:
         state()->newProject();
     }
 
+    void importEmbeddedClosedCaptions() {
+        // A clip whose file carries CEA-608 captions.
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 160, gs.height = 90, gs.fps = {30, 1};
+        edit::overwrite(gen, gs, {TrackKind::Video, 0}, makeGeneratorClip(gen, "color", 150));
+        CaptionTrack ct;
+        ct.id = gen.newId();
+        ct.captions = {{30, 75, "Closed captions", {}}, {90, 140, "Second one", {}}};
+        gs.captionTracks.push_back(ct);
+        ExportSettings st;
+        st.path = (dir_.path() + "/cc.mp4").toStdString();
+        st.audioCodec = "none";
+        st.preset = "ultrafast";
+        st.cea608 = true;
+        std::string err;
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        state()->newProject();
+        QCOMPARE(win_->importEmbeddedCaptions(), 0);  // no clip
+        const auto ids = state()->importFiles({QString::fromStdString(st.path)});
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids.at(0), 60, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        state()->setPlayhead(100);
+        QVERIFY(win_->findChild<QAction*>("importEmbeddedCaptions"));
+        QCOMPARE(win_->importEmbeddedCaptions(), 2);
+        const Sequence* s = state()->sequence();
+        QCOMPARE(s->captionTracks.size(), size_t(1));
+        const double scale = s->fpsValue() / 30.0;
+        QVERIFY(std::llabs(s->captionTracks[0].captions[0].start - (60 + FrameTime(std::llround(30 * scale)))) <= 2);
+        QCOMPARE(s->captionTracks[0].captions[1].text, std::string("Second one"));
+        state()->undo();
+        QVERIFY(state()->sequence()->captionTracks.empty());
+        state()->newProject();
+    }
+
     void layeredPsdImport() {
         using Px = std::array<uint16_t, 4>;
         auto write = [&](const QString& file, uint16_t red) {

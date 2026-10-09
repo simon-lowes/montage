@@ -5,12 +5,14 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace montage {
 
 struct Project;
 struct Sequence;
+struct Clip;
 struct Rational;
 using FrameTime = int64_t;
 using Id = uint64_t;
@@ -142,6 +144,22 @@ bool parseSubtitles(const std::string& text, Rational fps, std::vector<Caption>&
 // Scenarist SCC: CEA-608 pop-on captions on channel 1 at 29.97 fps drop frame,
 // bottom rows, up to 32 characters per row.
 std::string captionsToScc(const std::vector<Caption>& captions, Rational fps);
+// CEA-608 (line 21) captions as they are sent: byte pairs (with parity) for caption channel 1, one per frame at
+// 29.97 a second, by frame of that rate (pop-on: loaded ahead, shown at a caption's start, cleared at its end); a
+// new burst of pairs starts a line of an SCC file. SCC files and embedded A/53 captions carry these.
+struct Cc608Pair {
+    int64_t frame = 0;
+    uint16_t pair = 0;
+    bool lineStart = false;
+};
+std::vector<Cc608Pair> captionsTo608(const std::vector<Caption>& captions, Rational fps);
+// Captions from caption channel 1 of CEA-608 byte pairs and when each came (seconds, in order), as a decoder shows
+// them (pop-on, paint-on and roll-up). False if no caption is found.
+// Captions timed in a clip's media (frames at the sequence's rate) placed where the clip plays them on the timeline,
+// cut to the clip (trims, speed and reverse followed).
+std::vector<Caption> captionsThroughClip(const Clip& c, const std::vector<Caption>& source);
+bool captionsFrom608(const std::vector<std::pair<double, uint16_t>>& pairs, Rational fps, std::vector<Caption>& out,
+                     std::string* error = nullptr);
 // Reads SCC: CEA-608 channel 1 pop-on, paint-on and roll-up captions (each
 // roll-up line becomes a caption, up until the next one).
 bool parseScc(const std::string& text, Rational fps, std::vector<Caption>& out, std::string* error = nullptr);

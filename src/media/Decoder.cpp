@@ -135,6 +135,68 @@ int openMediaInput(AVFormatContext** fmt, const std::string& path) {
     return avformat_open_input(fmt, path.c_str(), nullptr, nullptr);
 }
 
+bool readEmbeddedCaptions(const std::string& path, Rational fps, std::vector<Caption>& out, const std::function<void(double)>& progress,
+                          const std::atomic<bool>* cancel, std::string* error) {
+    auto fail = [&](const std::string& why) {
+        if (error) *error = why;
+        return false;
+    };
+    AVFormatContext* fmt = nullptr;
+    int rc = openMediaInput(&fmt, path);
+    if (rc < 0) return fail("Cannot open " + path + ": " + averr(rc));
+    std::unique_ptr<AVFormatContext, void (*)(AVFormatContext*)> fmtGuard(fmt, [](AVFormatContext* f) { avformat_close_input(&f); });
+    if ((rc = avformat_find_stream_info(fmt, nullptr)) < 0) return fail(averr(rc));
+    const int stream = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+    if (stream < 0) return fail("No video stream");
+    AVStream* st = fmt->streams[stream];
+    const AVCodec* codec = avcodec_find_decoder(st->codecpar->codec_id);
+    if (!codec) return fail("No decoder for the video");
+    std::unique_ptr<AVCodecContext, void (*)(AVCodecContext*)> ctx(avcodec_alloc_context3(codec), [](AVCodecContext* c) { avcodec_free_context(&c); });
+    avcodec_parameters_to_context(ctx.get(), st->codecpar);
+    ctx->thread_count = std::clamp(int(std::thread::hardware_concurrency()), 1, 8);
+    if ((rc = avcodec_open2(ctx.get(), codec, nullptr)) < 0) return fail("Cannot open the video decoder: " + averr(rc));
+    std::unique_ptr<AVPacket, void (*)(AVPacket*)> pkt(av_packet_alloc(), [](AVPacket* p) { av_packet_free(&p); });
+    std::unique_ptr<AVFrame, void (*)(AVFrame*)> frame(av_frame_alloc(), [](AVFrame* f) { av_frame_free(&f); });
+    const double tb = av_q2d(st->time_base);
+    const int64_t start = st->start_time != AV_NOPTS_VALUE ? st->start_time : 0;
+    const double duration = fmt->duration > 0 ? double(fmt->duration) / AV_TIME_BASE : 0;
+    std::vector<std::pair<double, uint16_t>> pairs;
+    auto take = [&] {
+        while (avcodec_receive_frame(ctx.get(), frame.get()) >= 0) {
+            const int64_t pts = frame->best_effort_timestamp != AV_NOPTS_VALUE ? frame->best_effort_timestamp : frame->pts;
+            const double t = pts == AV_NOPTS_VALUE ? 0 : double(pts - start) * tb;
+            if (const AVFrameSideData* sd = av_frame_get_side_data(frame.get(), AV_FRAME_DATA_A53_CC)) {
+                int k = 0;  // field-1 pairs in this frame, a 29.97th of a second apart
+                for (size_t i = 0; i + 2 < size_t(sd->size); i += 3) {
+                    const uint8_t head = sd->data[i];
+                    if (!(head & 0x04) || (head & 0x03) != 0) continue;  // not valid, or not field 1 (CC1/CC2)
+                    pairs.push_back({t + double(k++) * 1001.0 / 30000.0, uint16_t((sd->data[i + 1] << 8) | sd->data[i + 2])});
+                }
+            }
+            av_frame_unref(frame.get());
+        }
+    };
+    int64_t packets = 0;
+    while (av_read_frame(fmt, pkt.get()) >= 0) {
+        if (pkt->stream_index == stream) {
+            if ((++packets & 31) == 0) {
+                if (cancel && cancel->load()) return fail("Cancelled");
+                if (progress && duration > 0 && pkt->pts != AV_NOPTS_VALUE) progress(std::clamp(double(pkt->pts - start) * tb / duration, 0.0, 1.0));
+            }
+            if (avcodec_send_packet(ctx.get(), pkt.get()) >= 0) take();
+        }
+        av_packet_unref(pkt.get());
+    }
+    avcodec_send_packet(ctx.get(), nullptr);
+    take();
+    std::stable_sort(pairs.begin(), pairs.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    const bool any = std::any_of(pairs.begin(), pairs.end(), [](const auto& p) { return (p.second & 0x7f7f) != 0; });
+    if (!any) return fail("The video carries no CEA-608 captions");
+    std::string err;
+    if (!captionsFrom608(pairs, fps, out, &err)) return fail("The video's CEA-608 data holds no captions");
+    return true;
+}
+
 bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
     if (isVectorPath(path)) {
         VectorInfo vi;

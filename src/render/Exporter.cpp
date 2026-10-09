@@ -762,6 +762,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             if (hasSuffix(c, "_mf")) av_dict_set(&opts, "hw_encoding", "1", 0);  // not Microsoft's software MFT
             if (c.rfind("hevc", 0) == 0) o.vctx->codec_tag = MKTAG('h', 'v', 'c', '1');
         } else if (c == "libx264" || c == "libx265") {
+            if (s.cea608) av_dict_set(&opts, "a53cc", "1", 0);
             if (s.videoBitrate <= 0) av_dict_set_int(&opts, "crf", s.crf, 0);
             if (!s.preset.empty()) av_dict_set(&opts, "preset", s.preset.c_str(), 0);
             if (c == "libx265") {
@@ -1154,8 +1155,44 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     // Smart rendering: only where nothing would change the source's pictures for the whole export.
     std::unique_ptr<SmartRenderer> smart;
     if (wantVideo && s.smartRender && o.vctx && isIntraCodec(o.vctx->codec ? o.vctx->codec->name : "") && W == seq.width && H == seq.height &&
-        !s.useProxies && !s.burnInCaptions && !s.burnIn.any() && outSpace.id == seqSpace.id)
+        !s.useProxies && !s.burnInCaptions && !s.cea608 && !s.burnIn.any() && outSpace.id == seqSpace.id)
         smart = std::make_unique<SmartRenderer>(p, seq, seqSpace, o.vctx, o.vst, s.alpha, s.profile);
+    // CEA-608 captions in the video: the pairs due in each frame's span of the 29.97 Hz line-21 clock, padding between.
+    std::vector<Cc608Pair> cc608;
+    size_t ccNext = 0;
+    if (s.cea608 && wantVideo) {
+        const std::string vc = o.vctx && o.vctx->codec ? o.vctx->codec->name : "";
+        if (o.vctx->codec_id != AV_CODEC_ID_H264 && o.vctx->codec_id != AV_CODEC_ID_HEVC)
+            return fail("CEA-608 captions go in H.264 or HEVC video, not " + vc);
+        if (const CaptionTrack* t = captionTrackFor(seq, s.captionTrack)) {
+            std::vector<Caption> part;
+            for (Caption c : t->captions) {
+                if (c.end <= in || c.start >= out) continue;
+                c.start = std::max(c.start, in) - in;
+                c.end = std::min(c.end, out) - in;
+                part.push_back(std::move(c));
+            }
+            cc608 = captionsTo608(part, seq.fps);
+        }
+    }
+    auto attach608 = [&](FrameTime rel) {
+        if (!s.cea608) return true;
+        av_frame_remove_side_data(o.vframe, AV_FRAME_DATA_A53_CC);
+        const double rate = 30000.0 / 1001.0, fpsv = seq.fpsValue();
+        const int64_t from = int64_t(std::floor(double(rel) / fpsv * rate + 1e-6)), to = int64_t(std::floor(double(rel + 1) / fpsv * rate + 1e-6));
+        std::vector<uint8_t> cc;
+        for (int64_t slot = from; slot < to; ++slot) {
+            uint16_t pair = 0x8080;  // padding (null characters with parity)
+            while (ccNext < cc608.size() && cc608[ccNext].frame < slot) ++ccNext;
+            if (ccNext < cc608.size() && cc608[ccNext].frame == slot) pair = cc608[ccNext++].pair;
+            cc.insert(cc.end(), {uint8_t(0xfc), uint8_t(pair >> 8), uint8_t(pair & 0xff)});  // valid, field 1
+        }
+        if (cc.empty()) return true;
+        AVFrameSideData* sd = av_frame_new_side_data(o.vframe, AV_FRAME_DATA_A53_CC, cc.size());
+        if (!sd) return false;
+        std::memcpy(sd->data, cc.data(), cc.size());
+        return true;
+    };
     for (FrameTime f = in; f < out; ++f) {
         if (cancel && cancel->load()) return fail("Export cancelled");
         if (!writeCaptions(f + 1)) return fail("Writing captions failed");
@@ -1185,6 +1222,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
                     }
                 }
                 o.vframe->pts = f - in;
+                if (!attach608(f - in)) return fail("Out of memory");
                 if ((rc = avcodec_send_frame(o.vctx, o.vframe)) < 0) return fail("Video encoding failed: " + averr(rc));
                 if ((rc = drain(o, o.vctx, o.vst)) < 0) return fail("Writing video failed: " + averr(rc));
             } else {
@@ -1203,6 +1241,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             int srcStride[4] = {img.width * 8, 0, 0, 0};
             sws_scale(o.sws, srcData, srcStride, 0, img.height, o.vframe->data, o.vframe->linesize);
             o.vframe->pts = f - in;
+            if (!attach608(f - in)) return fail("Out of memory");
             if ((rc = avcodec_send_frame(o.vctx, o.vframe)) < 0) return fail("Video encoding failed: " + averr(rc));
             if ((rc = drain(o, o.vctx, o.vst)) < 0) return fail("Writing video failed: " + averr(rc));
             }

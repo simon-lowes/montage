@@ -630,7 +630,7 @@ std::string pairsText(const std::vector<Pair>& pairs) {
 
 }  // namespace
 
-std::string captionsToScc(const std::vector<Caption>& captions, Rational fps) {
+std::vector<Cc608Pair> captionsTo608(const std::vector<Caption>& captions, Rational fps) {
     const double f = fps.valid() ? fps.toDouble() : 30.0;
     const double sccRate = 30000.0 / 1001.0;
     auto toScc = [&](FrameTime t) { return int64_t(std::llround(double(t) / f * sccRate)); };
@@ -643,28 +643,91 @@ std::string captionsToScc(const std::vector<Caption>& captions, Rational fps) {
         Block b{popOnPairs(c), toScc(c.start), toScc(c.end)};
         if (b.pairs.size() > 4) blocks.push_back(std::move(b));
     }
-    std::string out = "Scenarist_SCC V1.0\n";
-    const std::vector<Pair> clearPairs = {pairOf(0x14, 0x2c), pairOf(0x14, 0x2c)};  // erase displayed memory
+    std::vector<Cc608Pair> out;
     int64_t cursor = 0;  // first free frame (one pair per frame)
-    for (size_t i = 0; i < blocks.size(); ++i) {
-        const Block& b = blocks[i];
+    bool fresh = true;   // the next pair starts a burst
+    auto send = [&](int64_t at, Pair pair) {
+        out.push_back({at, pair, fresh || at != cursor});
+        fresh = false;
+        cursor = at + 1;
+    };
+    const Pair clear = pairOf(0x14, 0x2c);  // erase displayed memory (sent twice)
+    int64_t pendingClear = -1;              // when the caption on screen comes off
+    auto flushClear = [&](int64_t at) {
+        at = std::max(at, cursor);
+        send(at, clear);
+        send(at + 1, clear);
+        pendingClear = -1;
+    };
+    auto control = [](Pair p) { return ((p >> 8) & 0x7f) >= 0x10 && ((p >> 8) & 0x7f) <= 0x1f; };
+    for (const Block& b : blocks) {
         const int64_t n = int64_t(b.pairs.size());
-        // Load early enough for the end-of-caption code to land on the start frame (decoders act on the
-        // first of the two copies of a control code).
-        const int64_t start = std::max(b.show - (n - 2), cursor);
-        out += "\n" + sccTimecode(start) + "\t" + pairsText(b.pairs) + "\n";
-        cursor = start + n;
-        const int64_t shown = cursor - 2;
-        const int64_t nextLoad = i + 1 < blocks.size()
-                                     ? blocks[i + 1].show - (int64_t(blocks[i + 1].pairs.size()) - 2)
-                                     : std::numeric_limits<int64_t>::max();
-        // Clear at the end unless the next caption replaces this one first.
-        const int64_t clearAt = std::max(b.clear, cursor);
-        if (b.clear > shown && clearAt + 2 <= nextLoad) {
-            out += "\n" + sccTimecode(clearAt) + "\t" + pairsText(clearPairs) + "\n";
-            cursor = clearAt + 2;
+        if (pendingClear >= b.show) pendingClear = -1;  // this caption replaces the one on screen anyway
+        // Load early enough for the end-of-caption code (the last two pairs) to land on the start frame: decoders act
+        // on the first of a control code's two copies.
+        int64_t start = std::max(b.show - (n - 2), cursor);
+        if (pendingClear >= 0 && pendingClear < start) {
+            flushClear(pendingClear);
+            start = std::max(start, cursor);
         }
+        fresh = true;
+        if (pendingClear >= 0) {
+            // The caption on screen comes off while this one loads (loading fills the memory not shown): the erase
+            // goes in between, the load starting two frames earlier, never between a control code's two copies.
+            int64_t at = std::max(b.show - (n - 2) - 2, cursor);
+            for (int64_t k = 0; k < n; ++k) {
+                const bool secondCopy = k > 0 && b.pairs[size_t(k)] == b.pairs[size_t(k - 1)] && control(b.pairs[size_t(k)]);
+                if (pendingClear >= 0 && at >= pendingClear && !secondCopy && k <= n - 2) {
+                    flushClear(at);
+                    at = cursor;
+                    fresh = true;
+                }
+                send(at++, b.pairs[size_t(k)]);
+            }
+            pendingClear = -1;  // shown by now: the new caption replaced it
+        } else {
+            for (int64_t k = 0; k < n; ++k) send(start + k, b.pairs[size_t(k)]);
+        }
+        const int64_t shown = cursor - 2;
+        if (b.clear > shown) pendingClear = std::max(b.clear, cursor);
+        fresh = true;
     }
+    if (pendingClear >= 0) flushClear(pendingClear);
+    return out;
+}
+
+std::vector<Caption> captionsThroughClip(const Clip& c, const std::vector<Caption>& source) {
+    std::vector<Caption> out;
+    for (const Caption& cap : source) {
+        double a = c.localForSource(double(cap.start)), b = c.localForSource(double(cap.end));
+        if (a > b) std::swap(a, b);
+        a = std::max(a, 0.0);
+        b = std::min(b, double(c.duration));
+        Caption t = cap;
+        t.start = c.start + FrameTime(std::llround(a));
+        t.end = c.start + FrameTime(std::llround(b));
+        if (t.end > t.start) out.push_back(std::move(t));
+    }
+    normalizeCaptions(out);
+    return out;
+}
+
+std::string captionsToScc(const std::vector<Caption>& captions, Rational fps) {
+    std::string out = "Scenarist_SCC V1.0\n";
+    std::vector<Pair> line;
+    int64_t at = 0;
+    auto flush = [&] {
+        if (!line.empty()) out += "\n" + sccTimecode(at) + "\t" + pairsText(line) + "\n";
+        line.clear();
+    };
+    for (const Cc608Pair& c : captionsTo608(captions, fps)) {
+        if (c.lineStart) {
+            flush();
+            at = c.frame;
+        }
+        line.push_back(c.pair);
+    }
+    flush();
     return out;
 }
 
@@ -749,7 +812,7 @@ bool sccFrame(const QString& tc, int64_t& out) {
 
 }  // namespace
 
-bool parseScc(const std::string& text, Rational fps, std::vector<Caption>& out, std::string* error) {
+bool captionsFrom608(const std::vector<std::pair<double, uint16_t>>& pairs, Rational fps, std::vector<Caption>& out, std::string* error) {
     const double f = fps.valid() ? fps.toDouble() : 30.0;
     auto frames = [f](double seconds) { return FrameTime(std::llround(seconds * f)); };
     enum class Mode { PopOn, PaintOn, RollUp } mode = Mode::PopOn;
@@ -841,12 +904,68 @@ bool parseScc(const std::string& text, Rational fps, std::vector<Caption>& out, 
         }
     };
 
-    QString all = QString::fromUtf8(text.data(), qsizetype(text.size()));
-    if (all.startsWith(QChar(0xFEFF))) all.remove(0, 1);
-    static const QRegularExpression ws(QStringLiteral("\\s+"));
     uint16_t lastControl = 0;
     int channel = 1;
     double last = 0;
+    const bool any = !pairs.empty();
+    for (const auto& [at, w] : pairs) {
+        last = at;
+        const uint8_t a = uint8_t((w >> 8) & 0x7f), b = uint8_t(w & 0x7f);
+        if (a == 0 && b == 0) continue;  // padding
+        if (a >= 0x10 && a <= 0x1f) {
+            if ((w & 0x7f7f) == lastControl) {  // control codes are sent twice
+                lastControl = 0;
+                continue;
+            }
+            lastControl = uint16_t(w & 0x7f7f);
+            channel = (a & 0x08) ? 2 : 1;
+            if (channel != 1) continue;
+            if ((a == 0x14 || a == 0x15) && b >= 0x20 && b <= 0x2f) misc(b, at);
+            else if (a == 0x17 && b >= 0x21 && b <= 0x23) col = std::min(col + (b - 0x20), 32);  // tab offset
+            else if (b >= 0x40) {
+                if (const int r = pacRow(a, b)) {
+                    if (mode == Mode::RollUp && r != row) {
+                        // The roll-up window moves to the new base row.
+                        for (int i = 0; i < rollRows; ++i)
+                            if (row - i >= 1 && r - i >= 1) std::swap(shown.rows[r - i], shown.rows[row - i]);
+                    }
+                    row = r;
+                    col = (b & 0x10) ? ((b & 0x0e) >> 1) * 4 : 0;
+                }
+            } else if (a == 0x11 && b >= 0x20 && b <= 0x2f) {
+                put(U' ', at);  // a mid-row style change shows as a space
+            } else if (a == 0x11 && b >= 0x30 && b <= 0x3f) {
+                put(kSpecial[b - 0x30] ? kSpecial[b - 0x30] : U' ', at);
+            } else if ((a == 0x12 || a == 0x13) && b >= 0x20 && b <= 0x3f) {
+                col = std::max(0, col - 1);  // replaces the basic character sent before it
+                put(extendedChar(a, b), at);
+            }
+            continue;
+        }
+        lastControl = 0;
+        if (channel != 1) continue;
+        if (a >= 0x20) put(basicChar(a), at);
+        if (b >= 0x20) put(basicChar(b), at);
+    }
+    // Whatever is still up at the end stays a few seconds.
+    const double end = last + 3;
+    commit(end);
+    if (mode == Mode::RollUp && lineStart >= 0) rollLine(end);
+    closeOpen(end);
+    normalizeCaptions(caps);
+    if (caps.empty()) {
+        if (error) *error = any ? "No captions found in the CEA-608 data" : "No CEA-608 data";
+        return false;
+    }
+    out = std::move(caps);
+    return true;
+}
+
+bool parseScc(const std::string& text, Rational fps, std::vector<Caption>& out, std::string* error) {
+    QString all = QString::fromUtf8(text.data(), qsizetype(text.size()));
+    if (all.startsWith(QChar(0xFEFF))) all.remove(0, 1);
+    static const QRegularExpression ws(QStringLiteral("\\s+"));
+    std::vector<std::pair<double, uint16_t>> pairs;
     bool any = false;
     for (const QString& rawLine : all.split('\n')) {
         const QStringList parts = rawLine.trimmed().split(ws, Qt::SkipEmptyParts);
@@ -856,58 +975,17 @@ bool parseScc(const std::string& text, Rational fps, std::vector<Caption>& out, 
         for (int k = 1; k < parts.size(); ++k) {
             bool ok = false;
             const uint16_t w = uint16_t(parts[k].toUInt(&ok, 16));
-            if (!ok) continue;
-            const double at = double(frame + k - 1) * 1001.0 / 30000.0;  // a pair a frame
-            last = at;
-            const uint8_t a = uint8_t((w >> 8) & 0x7f), b = uint8_t(w & 0x7f);
-            if (a == 0 && b == 0) continue;  // padding
-            if (a >= 0x10 && a <= 0x1f) {
-                if ((w & 0x7f7f) == lastControl) {  // control codes are sent twice
-                    lastControl = 0;
-                    continue;
-                }
-                lastControl = uint16_t(w & 0x7f7f);
-                channel = (a & 0x08) ? 2 : 1;
-                if (channel != 1) continue;
-                if ((a == 0x14 || a == 0x15) && b >= 0x20 && b <= 0x2f) misc(b, at);
-                else if (a == 0x17 && b >= 0x21 && b <= 0x23) col = std::min(col + (b - 0x20), 32);  // tab offset
-                else if (b >= 0x40) {
-                    if (const int r = pacRow(a, b)) {
-                        if (mode == Mode::RollUp && r != row) {
-                            // The roll-up window moves to the new base row.
-                            for (int i = 0; i < rollRows; ++i)
-                                if (row - i >= 1 && r - i >= 1) std::swap(shown.rows[r - i], shown.rows[row - i]);
-                        }
-                        row = r;
-                        col = (b & 0x10) ? ((b & 0x0e) >> 1) * 4 : 0;
-                    }
-                } else if (a == 0x11 && b >= 0x20 && b <= 0x2f) {
-                    put(U' ', at);  // a mid-row style change shows as a space
-                } else if (a == 0x11 && b >= 0x30 && b <= 0x3f) {
-                    put(kSpecial[b - 0x30] ? kSpecial[b - 0x30] : U' ', at);
-                } else if ((a == 0x12 || a == 0x13) && b >= 0x20 && b <= 0x3f) {
-                    col = std::max(0, col - 1);  // replaces the basic character sent before it
-                    put(extendedChar(a, b), at);
-                }
-                continue;
-            }
-            lastControl = 0;
-            if (channel != 1) continue;
-            if (a >= 0x20) put(basicChar(a), at);
-            if (b >= 0x20) put(basicChar(b), at);
+            if (ok) pairs.push_back({double(frame + k - 1) * 1001.0 / 30000.0, w});  // a pair a frame
         }
     }
-    // Whatever is still up at the end stays a few seconds.
-    const double end = last + 3;
-    commit(end);
-    if (mode == Mode::RollUp && lineStart >= 0) rollLine(end);
-    closeOpen(end);
-    normalizeCaptions(caps);
-    if (caps.empty()) {
-        if (error) *error = any ? "No captions found in the SCC file" : "Not a Scenarist SCC file";
+    if (!any) {
+        if (error) *error = "Not a Scenarist SCC file";
         return false;
     }
-    out = std::move(caps);
+    if (!captionsFrom608(pairs, fps, out, error)) {
+        if (error) *error = "No captions found in the SCC file";
+        return false;
+    }
     return true;
 }
 

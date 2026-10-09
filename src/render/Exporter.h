@@ -52,6 +52,9 @@ struct ExportSettings {
     bool burnInCaptions = false;         // drawn into the picture
     bool embedCaptions = false;          // as a subtitle stream (MP4/MOV mov_text, MKV SubRip, WebM WebVTT)
     Id captionTrack = 0;                 // 0 = the first visible caption track
+    // The caption track as CEA-608 line-21 captions inside the video (A/53, as US broadcast and streaming platforms
+    // take them): H.264 and HEVC only.
+    bool cea608 = false;
     // Delivery colour space (ColorSpace.h display space); "" = the sequence's.
     // An HDR sequence delivered in SDR is tone mapped. HDR output is 10-bit,
     // tagged, and PQ carries HDR10 mastering and light-level metadata.
