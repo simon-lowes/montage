@@ -430,13 +430,44 @@ namespace {
 struct Job {
     AudioBufferPtr result;
     bool done = false;
+    bool needed = false;  // an export (or other blocking caller) is waiting for it: never cancelled
+    std::atomic<bool> cancel{false};
 };
 
 std::mutex gCacheMutex;
 std::condition_variable gCacheDone;
 std::list<std::pair<std::string, std::shared_ptr<Job>>> gCache;  // most recently used first
 std::atomic<int> gRunning{0};
-constexpr size_t kMaxCached = 12;
+// Each cleaned copy is the whole recording, so the cache is bounded: a few versions of each file (the one heard and
+// the last few settings, for undo), twelve in all, and no more than 2 GiB of sound.
+constexpr size_t kMaxCached = 12, kMaxPerFile = 3;
+constexpr size_t kMaxBytes = size_t(2) << 30;
+
+std::string fileOfKey(const std::string& key) {
+    const size_t bar = key.find('|');
+    const size_t second = bar == std::string::npos ? bar : key.find('|', bar + 1);
+    return key.substr(0, second);  // the path and the rate
+}
+
+// Drops the least recently used entries past the limits; a job still running for nobody in particular stops.
+void trimCache() {
+    std::map<std::string, size_t> perFile;
+    size_t bytes = 0, count = 0;
+    for (auto it = gCache.begin(); it != gCache.end();) {
+        const size_t size = it->second->done && it->second->result ? it->second->result->samples.size() * sizeof(float) : 0;
+        const bool keep = it == gCache.begin() ||
+                          (count < kMaxCached && perFile[fileOfKey(it->first)] < kMaxPerFile && bytes + size <= kMaxBytes);
+        if (!keep) {
+            if (!it->second->done && !it->second->needed) it->second->cancel = true;
+            it = gCache.erase(it);
+            continue;
+        }
+        ++perFile[fileOfKey(it->first)];
+        bytes += size;
+        ++count;
+        ++it;
+    }
+}
 
 std::string keyFor(const std::string& path, int rate, const std::vector<const Effect*>& effects) {
     std::string key = path + "|" + std::to_string(rate);
@@ -452,34 +483,35 @@ std::string keyFor(const std::string& path, int rate, const std::vector<const Ef
     return key;
 }
 
-AudioBufferPtr process(const AudioBufferPtr& source, const std::vector<Effect>& effects) {
+AudioBufferPtr process(const AudioBufferPtr& source, const std::vector<Effect>& effects, const std::atomic<bool>* cancel) {
     AudioBufferPtr cur = source;
     for (const Effect& e : effects) {
+        if (cancel && cancel->load()) return source;
         auto out = std::make_shared<AudioBuffer>();
         bool ok = false;
         if (e.type == "denoise") {
-            reduceNoise(*cur, *out, e.p("reduction_db", 0, 15), e.p("sensitivity", 0, 50));
+            reduceNoise(*cur, *out, e.p("reduction_db", 0, 15), e.p("sensitivity", 0, 50), cancel);
             ok = true;
         } else if (e.type == "voice_isolate") {
-            ok = isolateVoice(*cur, *out, e.p("amount", 0, 100));
+            ok = isolateVoice(*cur, *out, e.p("amount", 0, 100), cancel);
         } else if (e.type == "enhance_speech") {
-            ok = enhanceSpeech(*cur, *out, e.p("amount", 0, 100), e.p("max_reduction_db", 0, 100), e.p("keep", 0) > 0.5);
+            ok = enhanceSpeech(*cur, *out, e.p("amount", 0, 100), e.p("max_reduction_db", 0, 100), e.p("keep", 0) > 0.5, cancel);
         } else if (e.type == "declick") {
-            declick(*cur, *out, e.p("sensitivity", 0, 50), e.p("max_ms", 0, 2));
+            declick(*cur, *out, e.p("sensitivity", 0, 50), e.p("max_ms", 0, 2), nullptr, cancel);
             ok = true;
         } else if (e.type == "dereverb") {
-            dereverb(*cur, *out, e.p("amount", 0, 80), e.p("reverb_time", 0, 0), e.p("max_reduction_db", 0, 18));
+            dereverb(*cur, *out, e.p("amount", 0, 80), e.p("reverb_time", 0, 0), e.p("max_reduction_db", 0, 18), cancel);
             ok = true;
         } else if (e.type == "spectral_repair") {
-            spectralRepair(*cur, *out, spectralRegionsFromString(e.s("regions")));
+            spectralRepair(*cur, *out, spectralRegionsFromString(e.s("regions")), cancel);
             ok = true;
         } else if (e.type == "pitch_shift") {
-            pitchShift(*cur, *out, e.p("semitones", 0, 0) + e.p("cents", 0, 0) / 100);
+            pitchShift(*cur, *out, e.p("semitones", 0, 0) + e.p("cents", 0, 0) / 100, cancel);
             ok = true;
         }
         if (ok) cur = out;
     }
-    return cur;
+    return cancel && cancel->load() ? source : cur;
 }
 
 }  // namespace
@@ -501,9 +533,10 @@ AudioBufferPtr cleanedAudio(const std::string& path, const AudioBufferPtr& sourc
         } else {
             job = std::make_shared<Job>();
             gCache.emplace_front(key, job);
-            while (gCache.size() > kMaxCached) gCache.pop_back();
             start = true;
         }
+        if (blocking) job->needed = true;
+        trimCache();
         if (!start) {
             if (job->done) return job->result;
             if (!blocking) return nullptr;
@@ -514,7 +547,7 @@ AudioBufferPtr cleanedAudio(const std::string& path, const AudioBufferPtr& sourc
     std::vector<Effect> copies;
     for (const Effect* e : effects) copies.push_back(*e);
     auto run = [job, source, copies] {
-        AudioBufferPtr r = process(source, copies);
+        AudioBufferPtr r = process(source, copies, &job->cancel);
         {
             std::lock_guard lock(gCacheMutex);
             job->result = r;

@@ -1,5 +1,6 @@
 // Montage — application entry point.
 #include <QApplication>
+#include <clocale>
 #include <QCommandLineParser>
 #include <QFileInfo>
 #include <QIcon>
@@ -11,6 +12,9 @@
 
 int main(int argc, char** argv) {
     QApplication app(argc, argv);
+    // QApplication takes the C library's locale from the environment; numbers in files must not follow it (a German
+    // system's printf writes 1,5 and its atof reads "0.5" as 0).
+    std::setlocale(LC_NUMERIC, "C");
     QApplication::setApplicationName("Montage");
     QApplication::setOrganizationName("Montage");
     QApplication::setApplicationVersion(MONTAGE_VERSION);

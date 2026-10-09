@@ -7,6 +7,7 @@
 #include <map>
 
 #include "core/Effects.h"
+#include "core/Numbers.h"
 
 extern "C" {
 #include <libavutil/mem.h>
@@ -56,17 +57,51 @@ double feathered(double x, double lo, double hi, double feather) {
     return 0.5 + 0.5 * std::cos(M_PI * d / feather);
 }
 
+// The mean level (dB) of each frequency bin over [a, b] seconds, frame by frame (nothing the length of the stretch is
+// kept), from frames every quarter window; empty for less than 10 ms.
+std::vector<double> meanLevelDb(const AudioBuffer& in, double a, double b, int channel) {
+    std::vector<double> mean;
+    const int rate = in.sampleRate;
+    if (rate <= 0 || b - a < 0.01) return mean;
+    const int N = fftSizeFor(rate), bins = N / 2 + 1, hop = N / 4;
+    Tx fwd(N, false);
+    if (!fwd.ctx) return mean;
+    std::vector<float> window(static_cast<size_t>(N));
+    for (int i = 0; i < N; ++i) window[size_t(i)] = float(0.5 - 0.5 * std::cos(2 * M_PI * i / N));
+    AlignedBuf<float> frame(static_cast<size_t>(N));
+    AlignedBuf<AVComplexFloat> spec(size_t(bins) + 1);
+    const int64_t frames = in.frames();
+    auto sampleAt = [&](int64_t s) -> float {
+        if (s < 0 || s >= frames) return 0.0f;
+        if (channel == 0 || channel == 1) return in.samples[size_t(s) * 2 + size_t(channel)];
+        return 0.5f * (in.samples[size_t(s) * 2] + in.samples[size_t(s) * 2 + 1]);
+    };
+    std::vector<double> power(size_t(bins), 0.0);
+    int64_t count = 0;
+    const int64_t c0 = int64_t(std::llround(a * rate)), c1 = int64_t(std::llround(b * rate));
+    for (int64_t c = c0; c <= std::max(c0, c1); c += hop) {
+        for (int i = 0; i < N; ++i) frame[size_t(i)] = sampleAt(c - N / 2 + i) * window[size_t(i)];
+        fwd.fn(fwd.ctx, spec.data(), frame.data(), sizeof(float));
+        for (int k = 0; k < bins; ++k) power[size_t(k)] += double(spec[size_t(k)].re) * spec[size_t(k)].re + double(spec[size_t(k)].im) * spec[size_t(k)].im;
+        ++count;
+    }
+    const double fullScale = N / 4.0;
+    mean.resize(size_t(bins));
+    for (int k = 0; k < bins; ++k) mean[size_t(k)] = 10 * std::log10(power[size_t(k)] / double(count) / (fullScale * fullScale) + 1e-15);
+    return mean;
+}
+
 }  // namespace
 
 bool validSpectralMode(const std::string& mode) { return mode == "heal" || mode == "attenuate"; }
 
 std::string spectralRegionsToString(const std::vector<SpectralRegion>& regions) {
     std::string out;
-    char buf[160];
     for (const SpectralRegion& r : regions) {
-        std::snprintf(buf, sizeof buf, "%.6g,%.6g,%.6g,%.6g,%s,%.6g,%d", r.start, r.end, r.low, r.high, r.mode.c_str(), r.gainDb, r.channel);
         if (!out.empty()) out += ';';
-        out += buf;
+        // Times to the microsecond however long the file; the same in every locale (core/Numbers.h).
+        out += formatNumber(r.start, 12) + ',' + formatNumber(r.end, 12) + ',' + formatNumber(r.low, 8) + ',' + formatNumber(r.high, 8) +
+               ',' + r.mode + ',' + formatNumber(r.gainDb, 6) + ',' + std::to_string(r.channel);
     }
     return out;
 }
@@ -87,13 +122,13 @@ std::vector<SpectralRegion> spectralRegionsFromString(const std::string& text) {
         }
         if (f.size() < 7) continue;
         SpectralRegion r;
-        r.start = std::atof(f[0].c_str());
-        r.end = std::atof(f[1].c_str());
-        r.low = std::atof(f[2].c_str());
-        r.high = std::atof(f[3].c_str());
+        r.start = parseNumber(f[0]);
+        r.end = parseNumber(f[1]);
+        r.low = parseNumber(f[2]);
+        r.high = parseNumber(f[3]);
         r.mode = f[4];
-        r.gainDb = std::atof(f[5].c_str());
-        r.channel = std::atoi(f[6].c_str());
+        r.gainDb = parseNumber(f[5]);
+        r.channel = int(parseNumber(f[6], 99));
         if (r.end > r.start && validSpectralMode(r.mode) && r.channel >= -1 && r.channel <= 1) out.push_back(r);
     }
     return out;
@@ -160,14 +195,29 @@ void spectralRepair(const AudioBuffer& in, AudioBuffer& out, const std::vector<S
             const int64_t first = core0 - feather - N;
             const int64_t count = (core1 + feather + N - first) / hop + 1;
             const int64_t last = first + (count - 1) * hop;
-            const int64_t origin = first - half;
-            std::vector<float> acc(size_t(last + half - origin), 0.0f);
+            const int64_t from = std::max<int64_t>(0, first + half), to = std::min<int64_t>(frames, last - half + 1);
+            // The sum, written back as each sample is complete (no later frame reaches it, nor reads it), so a long
+            // region needs no buffer its length.
+            std::vector<float> acc;
+            int64_t accStart = first - half, flushed = from;
+            auto flush = [&](int64_t upTo) {
+                upTo = std::min(upTo, to);
+                for (int64_t s = flushed; s < upTo; ++s) out.samples[size_t(s) * 2 + size_t(ch)] = acc[size_t(s - accStart)];
+                flushed = std::max(flushed, upTo);
+                const int64_t drop = std::min<int64_t>(int64_t(acc.size()), flushed - accStart);
+                if (drop > (1 << 16)) {
+                    acc.erase(acc.begin(), acc.begin() + drop);
+                    accStart += drop;
+                }
+            };
             for (int64_t f = 0; f < count; ++f) {
                 const int64_t c = first + f * hop;
+                if (int64_t(acc.size()) < c + half - accStart) acc.resize(size_t(c + half - accStart), 0.0f);
                 const double wt = feathered(double(c), double(core0), double(core1), double(feather));
-                float* dst = acc.data() + (c - half - origin);
+                float* dst = acc.data() + (c - half - accStart);
                 if (wt <= 0) {
                     for (int i = 0; i < N; ++i) dst[i] += sampleAt(c - half + i) * window[size_t(i)] * window[size_t(i)] * 0.5f;
+                    flush(c + hop - half);
                     continue;
                 }
                 analyse(c);
@@ -190,9 +240,9 @@ void spectralRepair(const AudioBuffer& in, AudioBuffer& out, const std::vector<S
                 }
                 inv.fn(inv.ctx, timeOut.data(), spec.data(), sizeof(AVComplexFloat));
                 for (int i = 0; i < N; ++i) dst[i] += timeOut[size_t(i)] * window[size_t(i)] * 0.5f;
+                flush(c + hop - half);  // nothing after this frame touches what lies before the next one's window
             }
-            const int64_t from = std::max<int64_t>(0, first + half), to = std::min<int64_t>(frames, last - half + 1);
-            for (int64_t s = from; s < to; ++s) out.samples[size_t(s) * 2 + size_t(ch)] = acc[size_t(s - origin)];
+            flush(to);
         }
     }
 }
@@ -238,18 +288,7 @@ std::vector<SpectralBand> prominentBands(const AudioBuffer& in, double start, do
     const double length = in.sampleRate > 0 ? double(in.frames()) / in.sampleRate : 0;
     start = std::max(0.0, start), end = std::min(length, end);
     if (end - start < 0.01) return out;
-    auto meanDb = [&](double a, double b) {
-        std::vector<double> mean;
-        if (b - a < 0.01) return mean;
-        const Spectrogram g = computeSpectrogram(in, a, b, std::max(4, int((b - a) * 60)), channel);
-        mean.assign(size_t(g.bins), 0.0);
-        for (int k = 0; k < g.bins; ++k) {
-            double power = 0;
-            for (int j = 0; j < g.columns; ++j) power += std::pow(10.0, g.at(j, k) / 10);
-            mean[size_t(k)] = 10 * std::log10(power / g.columns + 1e-15);
-        }
-        return mean;
-    };
+    auto meanDb = [&](double a, double b) { return meanLevelDb(in, a, b, channel); };
     const std::vector<double> inside = meanDb(start, end);
     const std::vector<double> before = meanDb(std::max(0.0, start - 1.0), start), after = meanDb(end, std::min(length, end + 1.0));
     if (inside.empty()) return out;
@@ -305,6 +344,8 @@ std::vector<SpectralRegion> spectralRegionsOf(const Clip& c) {
 
 double clipSourceSeconds(const Sequence& s, const Clip& c, double t) {
     const double fps = s.fpsValue();
+    // Played backwards, as the mixer reads it: the clip's end at its source in point.
+    if (c.reverse) return (double(c.sourceIn) + (double(c.end()) - t * fps) * c.speed) / fps;
     const double f = t * fps, base = std::floor(f);
     const double a = c.sourceFrameAt(FrameTime(base)), b = c.sourceFrameAt(FrameTime(base) + 1);
     return (a + (b - a) * (f - base)) / fps;

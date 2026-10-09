@@ -35,6 +35,8 @@ std::string mediaFileOnDisk(const std::string& path);
 bool detectImageSequence(const std::string& file, ImageSequence& out);
 // Formats rendered as frames (EXR, DPX, PNG, TIFF, TGA, BMP), grouped into sequences on import; camera stills
 // (JPEG, HEIC...) are grouped only when asked.
+// A DNG frame of a CinemaDNG clip (it carries the TimeCodes or FrameRate tag); its frame rate if it says.
+bool cinemaDng(const std::string& file, double* fps = nullptr);
 bool isFrameFormat(const std::string& file);
 // A frame rate as typed: whole numbers exact, the NTSC rates (23.976, 29.97, 59.94...) as n/1001.
 Rational rateFor(double fps);

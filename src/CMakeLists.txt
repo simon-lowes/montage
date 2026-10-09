@@ -40,6 +40,7 @@ add_library(montage_engine STATIC
   core/SpellCheck.h core/SpellCheck.cpp
   core/ColorGroups.h core/ColorGroups.cpp
   core/Interpretation.h core/Interpretation.cpp
+  core/Numbers.h core/Numbers.cpp
   core/SpokenSearch.h core/SpokenSearch.cpp
   core/OnScreenText.h core/OnScreenText.cpp
   core/ImportBuilder.h core/InterchangeImport.cpp core/FcpXml.cpp

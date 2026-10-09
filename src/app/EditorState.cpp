@@ -561,7 +561,8 @@ std::vector<Id> EditorState::importFiles(const QStringList& paths, QStringList* 
                                detectImageSequence(fi.absoluteFilePath().toStdString(), seq) && runs.count(seq.pattern) &&
                                runs[seq.pattern].second >= 2) {
             if (!made.insert(seq.pattern).second) continue;  // already made from another of its frames
-            seq.fps = rate;
+            double dngRate = 0;
+            seq.fps = cinemaDng(path.toStdString(), &dngRate) && dngRate > 0 ? rateFor(dngRate) : rate;  // CinemaDNG says its rate
             MediaItem m;
             std::string err;
             if (!probeMedia(imageSequencePath(seq), m, &err)) {

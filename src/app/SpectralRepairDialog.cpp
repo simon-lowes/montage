@@ -216,6 +216,8 @@ SpectralRepairDialog::SpectralRepairDialog(EditorState* state, Id clipId, QWidge
     connect(state_, &EditorState::projectChanged, this, [this] {
         if (clip() && regions() != shown_) refresh();
     });
+    // Another sequence or project: this clip's sound is no longer what is open.
+    connect(state_, &EditorState::sequenceSwitched, this, &QDialog::close);
 
     // The clip's own sound (its channel mapping), over the part of the source it plays (at most a minute, from the
     // playhead when it is longer).
@@ -305,7 +307,7 @@ bool SpectralRepairDialog::apply(const QString& label, const std::vector<Spectra
         spectralRepairEffect(p, *c, true)->strings["regions"] = spectralRegionsToString(rs);
         return true;
     });
-    refresh();
+    if (done && regions() != shown_) refresh();  // (normally already redrawn when the project changed)
     return done;
 }
 

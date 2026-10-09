@@ -1,4 +1,5 @@
 // Media tests: probing, frame-accurate decoding, audio mixing, export round trips.
+#include <clocale>
 #include <QtTest>
 #include <QPainter>
 #include <QProcess>
@@ -225,7 +226,10 @@ void writeVoiceWav(const std::string& path, double seconds, double hz, const std
 
 // A minimal uncompressed DNG: an RGGB Bayer mosaic of `scene` (linear RGB, 0..1) from a
 // "camera" whose sensor sees linear sRGB, so it develops back to the scene.
-bool writeTestDng(const std::string& path, int w, int h, const std::function<std::array<double, 3>(int, int)>& scene, int orientation = 1) {
+// `neutral`: the camera's response to the light (raw = scene x neutral, undone by its AsShotNeutral); `frameRate` > 0
+// marks it a CinemaDNG frame.
+bool writeTestDng(const std::string& path, int w, int h, const std::function<std::array<double, 3>(int, int)>& scene, int orientation = 1,
+                  std::array<double, 3> neutral = {1, 1, 1}, double frameRate = 0) {
     struct Entry {
         uint16_t tag, type;
         uint32_t count;
@@ -266,8 +270,9 @@ bool writeTestDng(const std::string& path, int w, int h, const std::function<std
     longs(50717, {65535});
     // XYZ to camera: the camera is linear sRGB.
     rationals(50721, 10, {3.2406, -1.5372, -0.4986, -0.9689, 1.8758, 0.0415, 0.0557, -0.2040, 1.0570});
-    rationals(50728, 5, {1, 1, 1});
+    rationals(50728, 5, {neutral[0], neutral[1], neutral[2]});
     shorts(50778, {21});
+    if (frameRate > 0) rationals(51044, 10, {frameRate});
     std::vector<uint8_t> file = {'I', 'I', 42, 0};
     const uint32_t ifd = 8 + dataBytes;
     file.insert(file.end(), reinterpret_cast<const uint8_t*>(&ifd), reinterpret_cast<const uint8_t*>(&ifd) + 4);
@@ -275,7 +280,7 @@ bool writeTestDng(const std::string& path, int w, int h, const std::function<std
         for (int x = 0; x < w; ++x) {
             const auto c = scene(x, y);
             const int ch = (y % 2 == 0) ? (x % 2 == 0 ? 0 : 1) : (x % 2 == 0 ? 1 : 2);
-            const uint16_t v = uint16_t(std::clamp(c[size_t(ch)] * 0.8, 0.0, 1.0) * 65535 + 0.5);
+            const uint16_t v = uint16_t(std::clamp(c[size_t(ch)] * neutral[size_t(ch)] * 0.8, 0.0, 1.0) * 65535 + 0.5);
             file.push_back(uint8_t(v & 0xff)), file.push_back(uint8_t(v >> 8));
         }
     // The IFD, then the values too long to sit in it.
@@ -1874,6 +1879,37 @@ private slots:
         QVERIFY2(sh[0] > sh[2] * 1.05, qPrintable(show(sh)));
         QVERIFY2(std::fabs(d[0] - d[2]) < 0.06, qPrintable(show(d)));
         QVERIFY2(mg[1] < (mg[0] + mg[2]) / 2 - 0.01, qPrintable(show(mg)));
+        // Highlight recovery keeps the exposure (LibRaw's highlight modes scale by the largest white balance multiplier,
+        // a stop darker under this light), and the settings survive a comma-decimal locale.
+        const std::string tinted = path("card-light.dng");
+        QVERIFY(writeTestDng(tinted, 64, 48, [](int, int) { return std::array<double, 3>{0.25, 0.25, 0.25}; }, 1, {0.5, 1, 0.7}));
+        auto decodeFile = [&](const std::string& file, const Interpretation& i) {
+            Frame16Ptr f = MediaPool::instance().videoFrame(interpretedPath(file, i), 0, 0, 0);
+            return f ? toImage(*f).at(32, 24)[1] : -1.0f;
+        };
+        Interpretation blend, rebuild;
+        blend.rawHighlights = "blend";
+        rebuild.rawHighlights = "rebuild";
+        const float asShot = decodeFile(tinted, {}), blended = decodeFile(tinted, blend), rebuilt = decodeFile(tinted, rebuild);
+        QVERIFY2(asShot > 0.2 && std::fabs(blended / asShot - 1) < 0.08 && std::fabs(rebuilt / asShot - 1) < 0.08,
+                 qPrintable(QString("%1 %2 %3").arg(asShot).arg(blended).arg(rebuilt)));
+        {
+            const char* before = std::setlocale(LC_NUMERIC, nullptr);
+            const std::string saved = before ? before : "C";
+            const bool comma = std::setlocale(LC_NUMERIC, "de_DE.UTF-8") || std::setlocale(LC_NUMERIC, "fr_FR.UTF-8") || std::setlocale(LC_NUMERIC, "de_DE");
+            Interpretation half;
+            half.rawExposure = 0.5;
+            half.rawTint = -12.5;
+            MediaItem decorated;
+            decorated.path = interpretedPath(still, half);
+            const Interpretation back = interpretationOf(decorated);
+            const std::vector<SpectralRegion> boxes{{1.5, 2.25, 2700.5, 3300, "heal", -20, -1}};
+            const std::string boxText = spectralRegionsToString(boxes);
+            std::setlocale(LC_NUMERIC, saved.c_str());
+            QVERIFY2(back.rawExposure == 0.5 && back.rawTint == -12.5, comma ? "under a comma locale" : "C locale");
+            QVERIFY2(spectralRegionsFromString(boxText) == boxes, boxText.c_str());
+            QVERIFY(boxText.find("1.5,2.25,2700.5") == 0);
+        }
         // Half-size decode: shown at the full size.
         Interpretation half;
         half.rawHalf = true;
@@ -1905,8 +1941,12 @@ private slots:
         for (int k = 1; k <= 6; ++k) {
             const double level = 0.1 * k;
             QVERIFY(writeTestDng((dir + QStringLiteral("/A001_C002_%1.dng").arg(k, 6, 10, QLatin1Char('0'))).toStdString(), 64, 48,
-                                 [level](int, int) { return std::array<double, 3>{level, level, level}; }));
+                                 [level](int, int) { return std::array<double, 3>{level, level, level}; }, 1, {1, 1, 1}, 24));
         }
+        // Recognised as CinemaDNG frames (so importing them makes one clip, at their own rate), unlike a DNG photo.
+        double dngRate = 0;
+        QVERIFY(cinemaDng((dir + "/A001_C002_000003.dng").toStdString(), &dngRate) && std::fabs(dngRate - 24) < 1e-9);
+        QVERIFY(isFrameFormat((dir + "/A001_C002_000003.dng").toStdString()) && !isFrameFormat(still) && !cinemaDng(still));
         ImageSequence run;
         QVERIFY(detectImageSequence((dir + "/A001_C002_000003.dng").toStdString(), run));
         QVERIFY(run.first == 1 && run.last == 6);
@@ -1945,6 +1985,11 @@ private slots:
         const QJsonObject how = r.value("structuredContent").toObject().value("media").toArray().at(0).toObject().value("interpretation").toObject();
         QVERIFY2(how.value("raw_exposure").toDouble() == 0.5 && how.value("raw_temperature").toDouble() == 3200 && how.value("raw_highlights") == "blend",
                  QJsonDocument(how).toJson().constData());
+        const QJsonObject badTemp{{"jsonrpc", "2.0"}, {"id", 2}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_interpret_media"},
+                                                         {"arguments", QJsonObject{{"project", project}, {"media", "card.dng"}, {"raw_temperature", "5600"}}}}}};
+        const auto badLines = server.handle(QJsonDocument(badTemp).toJson(QJsonDocument::Compact).toStdString());
+        QVERIFY(QJsonDocument::fromJson(QByteArray::fromStdString(badLines.back())).object().value("result").toObject().value("isError").toBool());
     }
 
     void spectralRepairHealsAndAttenuates() {
@@ -2000,6 +2045,12 @@ private slots:
         const double squeak = db(toneLevel(quieter.samples, 1, 7000, c0, c1), toneLevel(in.samples, 1, 7000, c0, c1));
         QVERIFY2(squeak < -18 && squeak > -22, qPrintable(QString::number(squeak)));
         for (size_t i = 0; i < in.samples.size(); i += 2) QCOMPARE(quieter.samples[i], in.samples[i]);
+        // A long region (written back as it goes): three seconds of every frequency 12 dB down, the rest as it was.
+        AudioBuffer longer;
+        spectralRepair(in, longer, {SpectralRegion{0.5, 3.5, 0, 0, "attenuate", -12, -1}});
+        const double down = db(toneLevel(longer.samples, 0, 440, size_t(1.0 * sr), size_t(3.0 * sr)), toneLevel(in.samples, 0, 440, size_t(1.0 * sr), size_t(3.0 * sr)));
+        QVERIFY2(down < -11.5 && down > -12.5, qPrintable(QString::number(down)));
+        for (size_t i = 0; i < size_t(0.4 * sr) * 2; ++i) QCOMPARE(longer.samples[i], in.samples[i]);
         // Kept as a string on the effect, in order; nonsense left out.
         const std::vector<SpectralRegion> both{{0.95, 1.55, 2700, 3300, "heal", -20, -1}, {2.45, 2.75, 6500, 7500, "attenuate", -20, 1}};
         QVERIFY(spectralRegionsFromString(spectralRegionsToString(both)) == both);
@@ -2024,6 +2075,9 @@ private slots:
         clip.start = 50;
         clip.duration = 50;
         QCOMPARE(clipSourceSeconds(s, clip, 2.5), 1.0);
+        clip.reverse = true;  // played backwards: its last moment is the source's in point, as the mixer reads it
+        QVERIFY(std::fabs(clipSourceSeconds(s, clip, 4.0) - 0.5) < 1e-9 && std::fabs(clipSourceSeconds(s, clip, 3.0) - 1.5) < 1e-9);
+        clip.reverse = false;
         QVERIFY(!spectralRepairEffect(p, clip, false));
         clip.effects.push_back(makeEffect(p, "volume"));
         Effect* fx = spectralRepairEffect(p, clip, true);
@@ -2073,6 +2127,9 @@ private slots:
         QVERIFY(!r.value("isError").toBool() && r.value("structuredContent").toObject().value("total").toInt() == 2);
         QVERIFY(call({{"project", project}, {"clip", clipId}, {"regions", QJsonArray{QJsonObject{{"start", 9}, {"end", 10}}}}}).value("isError").toBool());
         QVERIFY(call({{"project", project}, {"clip", clipId}, {"regions", QJsonArray{QJsonObject{{"start", 3.6}, {"end", 3.9}}}}}).value("isError").toBool());
+        QVERIFY(call({{"project", project}, {"clip", clipId}, {"regions", QJsonArray{QJsonObject{{"start", 2.5}, {"end", 2.6}, {"low_hz", 100}, {"high_hz", 200},
+                                                                                              {"mode", "attenuate"}, {"gain_db", 6}}}}}).value("isError").toBool());
+        QVERIFY(call({{"project", project}, {"clip", clipId}, {"regions", QJsonArray{QJsonObject{{"start", 2.5}, {"end", 2.6}, {"low_hz", 30000}}}}}).value("isError").toBool());
         r = call({{"project", project}, {"clip", clipId}, {"clear", true}});
         QVERIFY(!r.value("isError").toBool());
         Project cleared;

@@ -3,6 +3,7 @@
 #include "core/Interpretation.h"
 
 #include <QDir>
+#include <QFile>
 #include <QFileInfo>
 #include <QRegularExpression>
 #include <cmath>
@@ -136,9 +137,47 @@ Rational rateFor(double fps) {
     return Rational{int(std::lround(fps * 1000)), 1000};
 }
 
+bool cinemaDng(const std::string& file, double* fps) {
+    if (fps) *fps = 0;
+    QFile f(QString::fromStdString(file));
+    if (!f.open(QIODevice::ReadOnly)) return false;
+    const QByteArray head = f.read(8);
+    if (head.size() < 8 || !(head.startsWith("II*") || head.startsWith("MM\0*"))) return false;
+    const bool le = head[0] == 'I';
+    auto num = [&](const QByteArray& b, int at, int n) {
+        uint32_t v = 0;
+        for (int i = 0; i < n; ++i) v |= uint32_t(uint8_t(b[at + i])) << (8 * (le ? i : n - 1 - i));
+        return v;
+    };
+    if (!f.seek(num(head, 4, 4))) return false;
+    const QByteArray countBytes = f.read(2);
+    if (countBytes.size() < 2) return false;
+    const int count = int(num(countBytes, 0, 2));
+    const QByteArray entries = f.read(qint64(count) * 12);
+    if (entries.size() < count * 12) return false;
+    bool found = false;
+    for (int e = 0; e < count; ++e) {
+        const uint32_t tag = num(entries, e * 12, 2);
+        if (tag == 51043) found = true;  // TimeCodes
+        if (tag == 51044) {              // FrameRate (SRATIONAL)
+            found = true;
+            if (fps && f.seek(num(entries, e * 12 + 8, 4))) {
+                const QByteArray r = f.read(8);
+                if (r.size() == 8) {
+                    const double n = double(int32_t(num(r, 0, 4))), d = double(int32_t(num(r, 4, 4)));
+                    if (d > 0 && n > 0) *fps = n / d;
+                }
+            }
+        }
+    }
+    return found;
+}
+
 bool isFrameFormat(const std::string& file) {
     static const QStringList exts = {"exr", "dpx", "png", "tif", "tiff", "tga", "bmp", "cin", "sgi"};
-    return exts.contains(QFileInfo(QString::fromStdString(file)).suffix().toLower());
+    const QString ext = QFileInfo(QString::fromStdString(file)).suffix().toLower();
+    // A numbered run of DNG files is a CinemaDNG clip only when its frames say so (DNG photos are numbered too).
+    return exts.contains(ext) || (ext == "dng" && cinemaDng(file));
 }
 
 }  // namespace montage

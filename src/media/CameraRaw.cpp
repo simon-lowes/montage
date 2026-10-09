@@ -179,6 +179,19 @@ bool developRaw(const std::string& path, RawImage& out, std::string* error, cons
         }
     }
     p.highlight = settings.highlights == 1 ? 2 : settings.highlights == 2 ? 5 : 0;
+    if (p.highlight != 0) {
+        // To keep highlights LibRaw scales by the largest white balance multiplier instead of the smallest, which
+        // darkens the whole picture by their ratio (a stop or more); that is given back so the exposure holds.
+        const auto& col = raw->imgdata.color;
+        const float* mul = p.user_mul[0] > 0 ? p.user_mul : p.use_camera_wb && col.cam_mul[0] > 0 && col.cam_mul[1] > 0 ? col.cam_mul : col.pre_mul;
+        float lo = 0, hi = 0;
+        for (int c = 0; c < 4; ++c) {
+            if (mul[c] <= 0) continue;
+            lo = lo > 0 ? std::min(lo, mul[c]) : mul[c];
+            hi = std::max(hi, mul[c]);
+        }
+        if (lo > 0) p.bright *= hi / lo;
+    }
     if (settings.half) p.half_size = 1;
     int rc = raw->unpack();
     if (rc == LIBRAW_SUCCESS) rc = raw->dcraw_process();

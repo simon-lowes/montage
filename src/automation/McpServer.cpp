@@ -36,6 +36,7 @@
 #include "media/TextReader.h"
 #include "media/ImageSequence.h"
 #include "media/Interpret.h"
+#include "media/MediaPool.h"
 #include "render/Ofx.h"
 #include "media/Psd.h"
 #include "core/AutoTag.h"
@@ -3030,6 +3031,8 @@ void McpServer::Impl::addTools() {
             Sequence& s = l.seq();
             Clip* c = edit::clipById(s, Id(a.value("clip").toDouble()));
             if (!c || !c->mediaId) throw ArgError{"No such clip"};
+            const auto where = edit::locate(s, c->id);
+            if (!where || where->track.kind != TrackKind::Audio) throw ArgError{"Give an audio clip (its sound is on an audio track)"};
             const MediaItem* m = l.project.findMedia(c->mediaId);
             if (!m || !m->hasAudio) throw ArgError{"That clip has no sound"};
             const double fps = s.fpsValue(), clipStart = double(c->start) / fps, clipEnd = double(c->end()) / fps;
@@ -3037,9 +3040,8 @@ void McpServer::Impl::addTools() {
             AudioBufferPtr sound;
             auto source = [&]() -> const AudioBuffer& {
                 if (!sound) {
-                    std::string err;
-                    sound = decodeAudio(m->path, 48000, &err);
-                    if (!sound) throw ArgError{QStringLiteral("Cannot read the clip's sound: %1").arg(QString::fromStdString(err))};
+                    sound = MediaPool::instance().audio(audioKey(m->path, c->channels), 48000);  // as the clip plays it
+                    if (!sound) throw ArgError{"Cannot read the clip's sound"};
                 }
                 return *sound;
             };
@@ -3056,11 +3058,12 @@ void McpServer::Impl::addTools() {
                 r.mode = o.value("mode").toString("heal").toStdString();
                 if (!validSpectralMode(r.mode)) throw ArgError{"mode is heal or attenuate"};
                 r.gainDb = o.value("gain_db").toDouble(-20);
+                if (r.gainDb > 0) throw ArgError{"gain_db turns the region down: give a negative number of decibels"};
                 const QString ch = o.value("channel").toString("both");
                 r.channel = ch == "left" ? 0 : ch == "right" ? 1 : -1;
                 if (o.contains("low_hz") || o.contains("high_hz")) {
                     r.low = o.value("low_hz").toDouble(0), r.high = o.value("high_hz").toDouble(0);
-                    if (r.high > 0 && r.high <= r.low) throw ArgError{"high_hz must be above low_hz"};
+                    if (r.low < 0 || r.low >= 24000 || (r.high > 0 && r.high <= r.low)) throw ArgError{"low_hz and high_hz must be 0 to 24000 Hz, high above low"};
                 } else {
                     const std::vector<SpectralBand> bands = prominentBands(source(), r.start, r.end, 3, r.channel);
                     QJsonArray list;
@@ -3954,8 +3957,11 @@ void McpServer::Impl::addTools() {
                 if (a.contains("field_order")) i.fields = str(a, "field_order") == "file" ? "" : str(a, "field_order").toStdString();
                 if (a.contains("keep_pitch")) i.keepPitch = a.value("keep_pitch").toBool();
                 if (a.contains("raw_exposure")) i.rawExposure = a.value("raw_exposure").toDouble();
-                if (a.contains("raw_temperature"))
-                    i.rawTemperature = a.value("raw_temperature").isString() ? 0.0 : a.value("raw_temperature").toDouble();
+                if (a.contains("raw_temperature")) {
+                    const QJsonValue t = a.value("raw_temperature");
+                    if (t.isString() && t.toString() != "as_shot") throw ArgError{"raw_temperature is kelvin (a number) or \"as_shot\""};
+                    i.rawTemperature = t.isString() ? 0.0 : t.toDouble();
+                }
                 if (a.contains("raw_tint")) i.rawTint = a.value("raw_tint").toDouble();
                 if (a.contains("raw_highlights")) i.rawHighlights = str(a, "raw_highlights") == "clip" ? "" : str(a, "raw_highlights").toStdString();
                 if (a.contains("raw_half")) i.rawHalf = a.value("raw_half").toBool();

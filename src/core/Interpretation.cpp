@@ -1,5 +1,7 @@
 #include "Interpretation.h"
 
+#include "Numbers.h"
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -42,13 +44,13 @@ bool parseInterpretation(const std::string& path, Interpretation& out) {
         const std::string key = item.substr(0, eq), value = item.substr(eq + 1);
         if (key == "fps") parseRational(value, out.fps);
         else if (key == "file") parseRational(value, out.fileFps);
-        else if (key == "par") out.par = std::max(0.0, std::atof(value.c_str()));
+        else if (key == "par") out.par = std::max(0.0, parseNumber(value));
         else if (key == "alpha" && validAlphaMode(value)) out.alpha = value == "straight" ? "" : value;
         else if (key == "fields" && validFieldOrder(value)) out.fields = value;
         else if (key == "pitch") out.keepPitch = value == "1";
-        else if (key == "rawexp") out.rawExposure = std::atof(value.c_str());
-        else if (key == "rawtemp") out.rawTemperature = std::max(0.0, std::atof(value.c_str()));
-        else if (key == "rawtint") out.rawTint = std::atof(value.c_str());
+        else if (key == "rawexp") out.rawExposure = parseNumber(value);
+        else if (key == "rawtemp") out.rawTemperature = std::max(0.0, parseNumber(value));
+        else if (key == "rawtint") out.rawTint = parseNumber(value);
         else if (key == "rawhl" && validRawHighlights(value)) out.rawHighlights = value == "clip" ? "" : value;
         else if (key == "rawhalf") out.rawHalf = value == "1";
     }
@@ -71,18 +73,10 @@ std::string interpretedPath(const std::string& path, const Interpretation& i) {
         add("file=" + std::to_string(i.fileFps.num) + "," + std::to_string(i.fileFps.den));
         if (i.keepPitch) add("pitch=1");
     }
-    if (i.par > 0) {
-        char buf[32];
-        std::snprintf(buf, sizeof buf, "%.6g", i.par);
-        add(std::string("par=") + buf);
-    }
+    if (i.par > 0) add("par=" + formatNumber(i.par, 6));
     if (!i.alpha.empty() && i.alpha != "straight") add("alpha=" + i.alpha);
     if (!i.fields.empty()) add("fields=" + i.fields);
-    auto number = [](double v) {
-        char buf[32];
-        std::snprintf(buf, sizeof buf, "%.6g", v);
-        return std::string(buf);
-    };
+    auto number = [](double v) { return formatNumber(v, 6); };
     if (i.rawExposure != 0) add("rawexp=" + number(i.rawExposure));
     if (i.rawTemperature > 0) add("rawtemp=" + number(i.rawTemperature));
     if (i.rawTint != 0) add("rawtint=" + number(i.rawTint));
