@@ -7,6 +7,7 @@
 #include <QJsonObject>
 
 #include "core/TranscriptCorrect.h"
+#include "core/SpellCheck.h"
 #include "core/AutoTag.h"
 #include "core/Automation.h"
 #include "core/CaptionTools.h"
@@ -1258,6 +1259,66 @@ private slots:
         QCOMPARE(words.size(), size_t(3));  // the filler is gone
         QVERIFY(std::fabs(words.back().start - (4.7 - 59 / 25.0)) < 0.05);
         QVERIFY(!rippleDeleteRanges(p, s, {}).ok);
+    }
+
+    void spellChecking() {
+        QCOMPARE(SpellChecker::dictionaryFor("en_GB"), std::string("en-GB"));
+        QCOMPARE(SpellChecker::dictionaryFor("en-AU"), std::string("en-GB"));
+        QCOMPARE(SpellChecker::dictionaryFor("eng"), std::string("en-US"));
+        QCOMPARE(SpellChecker::dictionaryFor("fr"), std::string());
+        QVERIFY(!SpellChecker::forLanguage("fr"));
+        const SpellChecker* us = SpellChecker::forLanguage("en");
+        const SpellChecker* uk = SpellChecker::forLanguage("en-GB");
+        QVERIFY(us && uk && us != uk);
+        QVERIFY2(us->size() > 80000, qPrintable(QString::number(us->size())));
+        QCOMPARE(SpellChecker::forLanguage("en-US"), us);  // loaded once
+        // Case: as listed, capitalised (a sentence's first word) or in capitals; a name never in lower case.
+        for (const char* w : {"the", "The", "THE", "Paris", "PARIS", "don't", "editor's", "editors'"}) QVERIFY2(us->correct(w), w);
+        QVERIFY(us->correct("it\xe2\x80\x99s"));  // a typographic apostrophe
+        for (const char* w : {"paris", "teh", "recieve", "accomodate", "Montaj"}) QVERIFY2(!us->correct(w), w);
+        // American and British spellings, British with Oxford -ize too.
+        QVERIFY(!us->correct("colour") && us->correct("color"));
+        QVERIFY(uk->correct("colour") && !uk->correct("color"));
+        QVERIFY(uk->correct("organise") && uk->correct("organize"));
+        // Suggestions, best first, in the word's case.
+        QCOMPARE(us->suggest("teh").at(0), std::string("the"));
+        QCOMPARE(us->suggest("Teh").at(0), std::string("The"));
+        QCOMPARE(us->suggest("recieve").at(0), std::string("receive"));
+        QCOMPARE(us->suggest("accomodate").at(0), std::string("accommodate"));
+        QCOMPARE(us->suggest("paris").at(0), std::string("Paris"));
+        QCOMPARE(us->suggest("RECIEVE").at(0), std::string("RECEIVE"));
+        const auto alot = us->suggest("alot");
+        QVERIFY(std::find(alot.begin(), alot.end(), "a lot") != alot.end());
+        QCOMPARE(uk->suggest("colur").at(0), std::string("colour"));
+        // A text: positions in UTF-16 units; acronyms, numbers, addresses and hyphenated words' good parts left alone.
+        const QString text = QStringLiteral("Teh editor\u2019s cut \u2014 well-knwon and NASA-approved; see https://montage.example/x, "
+                                            "mail a@b.com, export mp4 files.");
+        const auto found = us->check(text, {}, true);
+        QCOMPARE(found.size(), size_t(2));
+        QCOMPARE(found[0].word, std::string("Teh"));
+        QCOMPARE(found[0].start, 0);
+        QCOMPARE(found[0].length, 3);
+        QCOMPARE(found[0].suggestions.at(0), std::string("The"));
+        QCOMPARE(found[1].word, std::string("knwon"));
+        QCOMPARE(found[1].start, int(text.indexOf("knwon")));
+        QCOMPARE(found[1].suggestions.at(0), std::string("known"));
+        QVERIFY(us->check(text, {}, false, false).size() == 2);  // NASA is listed anyway
+        QCOMPARE(us->check(QStringLiteral("We met the ABCD team.")).size(), size_t(0));
+        QCOMPARE(us->check(QStringLiteral("We met the ABCD team."), {}, false, false).size(), size_t(1));
+        // The project's words are right, terms of several words word by word, in any case.
+        const auto mine = us->check(std::string("Kokoro reads it to Montaj and kokoro's fans."), {"Kokoro TTS"});
+        QCOMPARE(mine.size(), size_t(1));
+        QCOMPARE(mine[0].word, std::string("Montaj"));
+        QVERIFY(us->correct("Montaj", {"Montaj"}));
+        // Learn and Forget keep the vocabulary.
+        Project p;
+        QVERIFY(learnWord(p, "Montaj"));
+        QVERIFY(!learnWord(p, "montaj"));
+        QCOMPARE(p.vocabulary.size(), size_t(1));
+        QVERIFY(us->check(std::string("Montaj"), p.vocabulary).empty());
+        QVERIFY(forgetWord(p, "MONTAJ"));
+        QVERIFY(!forgetWord(p, "Montaj"));
+        QVERIFY(p.vocabulary.empty());
     }
 
     void correctingTranscripts() {

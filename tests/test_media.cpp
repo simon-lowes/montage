@@ -2044,6 +2044,57 @@ private slots:
         QVERIFY(call({{"align", "sideways"}}).value("isError").toBool());
     }
 
+    void mcpSpellCheck() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        Clip title = makeGeneratorClip(p, "title", 50);
+        title.generator.strings["text"] = "Welcom to Montaj";
+        title.name = "Opening";
+        edit::overwrite(p, s, {TrackKind::Video, 0}, title);
+        CaptionTrack en;
+        en.id = p.newId();
+        en.captions = {{0, 50, "Teh show begins."}, {50, 100, "All good here."}};
+        s.captionTracks = {en};
+        const QString project = QString::fromStdString(path("spell-mcp.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        int rid = 1;
+        auto call = [&](QJsonObject args) {
+            args["project"] = project;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", rid++}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_spell_check"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto words = [](const QJsonObject& r) {
+            QStringList out;
+            for (const QJsonValue& v : r.value("structuredContent").toObject().value("misspellings").toArray()) out << v.toObject().value("word").toString();
+            return out;
+        };
+        QJsonObject r = call({});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(words(r), (QStringList{"Teh", "Welcom", "Montaj"}));
+        const QJsonObject first = r.value("structuredContent").toObject().value("misspellings").toArray().at(0).toObject();
+        QCOMPARE(first.value("caption").toInt(), 1);
+        QCOMPARE(first.value("suggestions").toArray().at(0).toString(), QString("The"));
+        QCOMPARE(words(call({{"scope", "captions"}})), QStringList{"Teh"});
+        // Learned: kept in the project's vocabulary, then right.
+        r = call({{"learn", QJsonArray{"Montaj"}}, {"scope", "titles"}});
+        QCOMPARE(words(r), QStringList{"Welcom"});
+        {
+            Project q;
+            QVERIFY(loadProject(project.toStdString(), q));
+            QCOMPARE(q.vocabulary, std::vector<std::string>{"Montaj"});
+        }
+        QCOMPARE(words(call({{"forget", QJsonArray{"montaj"}}, {"scope", "titles"}})), (QStringList{"Welcom", "Montaj"}));
+        // A text alone, in British English.
+        QCOMPARE(words(call({{"text", "The colour of the color"}, {"language", "en-GB"}})), QStringList{"color"});
+        QVERIFY(call({{"text", "Bonjour"}, {"language", "fr"}}).value("isError").toBool());
+        QVERIFY(call({{"scope", "everything"}}).value("isError").toBool());
+    }
+
     void mcpMeasureHdr() {
         // White graphics in an HDR10 sequence: reference white, 203 nits, on every frame.
         Project p = makeDefaultProject();

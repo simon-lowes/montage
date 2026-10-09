@@ -13,6 +13,7 @@
 
 class QCheckBox;
 class QLabel;
+class QMenu;
 class QComboBox;
 class QTableWidget;
 class QTableWidgetItem;
@@ -37,6 +38,8 @@ public:
     bool exportFile(const QString& path, QString* error = nullptr) const;
     // Shows the caption and starts editing its text.
     void editCaption(Id track, int index);
+    // The spelling menu for caption `row` (a submenu per misspelt word: suggestions, Add to Dictionary), or null.
+    QMenu* spellingMenu(int row);
     // A translated copy of the current track, as a new track (one undo step),
     // after downloading the models it needs if asked. Returns its id, or 0.
     Id translateTrack(const std::string& to, QString* error = nullptr);

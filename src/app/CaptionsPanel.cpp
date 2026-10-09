@@ -1,4 +1,6 @@
 #include "CaptionsPanel.h"
+#include "SpellUi.h"
+#include "core/SpellCheck.h"
 #include "Settings.h"
 
 #include <QCheckBox>
@@ -199,6 +201,19 @@ CaptionsPanel::CaptionsPanel(EditorState* state, QWidget* parent) : QWidget(pare
         });
     });
     connect(table_, &QTableWidget::itemChanged, this, &CaptionsPanel::itemChanged);
+    // Spelling: misspelt words underlined in the text, and on right-click the suggestions for each.
+    table_->setItemDelegateForColumn(2, new SpellDelegate(state_, [this](const QModelIndex&) {
+        const CaptionTrack* t = track();
+        return t ? QString::fromStdString(t->language) : QString();
+    }, table_));
+    table_->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(table_, &QWidget::customContextMenuRequested, this, [this](const QPoint& pt) {
+        const QModelIndex at = table_->indexAt(pt);
+        if (QMenu* menu = spellingMenu(at.row())) {
+            menu->setAttribute(Qt::WA_DeleteOnClose);
+            menu->popup(table_->viewport()->mapToGlobal(pt));
+        }
+    });
     connect(table_, &QTableWidget::cellClicked, this, [this](int row, int) {
         const CaptionTrack* t = track();
         if (t && row >= 0 && size_t(row) < t->captions.size()) state_->setPlayhead(t->captions[size_t(row)].start);
@@ -257,9 +272,19 @@ void CaptionsPanel::rebuild() {
     const CaptionLimits lim = limits();
     const std::vector<unsigned> problems = t && s ? checkCaptions(t->captions, s->fps, lim) : std::vector<unsigned>();
     const int flagged = int(std::count_if(problems.begin(), problems.end(), [](unsigned v) { return v != 0; }));
-    summary_->setText(!t || t->captions.empty() ? QString()
-                      : flagged            ? tr("%1 of %2 captions break the reading limits").arg(flagged).arg(t->captions.size())
-                                           : tr("All %1 captions are within the reading limits").arg(t->captions.size()));
+    // Misspelt words, caption by caption (in the track's language).
+    std::vector<std::vector<Misspelling>> spelling(t ? t->captions.size() : 0);
+    int misspelt = 0;
+    if (const SpellChecker* sc = t ? activeChecker(QString::fromStdString(t->language)) : nullptr)
+        for (size_t i = 0; i < t->captions.size(); ++i) {
+            spelling[i] = sc->check(t->captions[i].text, state_->project().vocabulary);
+            misspelt += !spelling[i].empty();
+        }
+    QString summary = !t || t->captions.empty() ? QString()
+                      : flagged                 ? tr("%1 of %2 captions break the reading limits").arg(flagged).arg(t->captions.size())
+                                                : tr("All %1 captions are within the reading limits").arg(t->captions.size());
+    if (misspelt) summary += tr("; %n with spelling mistakes", "", misspelt);
+    summary_->setText(summary);
     if (t && s) {
         table_->setRowCount(int(t->captions.size()));
         for (size_t i = 0; i < t->captions.size(); ++i) {
@@ -268,10 +293,17 @@ void CaptionsPanel::rebuild() {
             auto* out = new QTableWidgetItem(QString::fromStdString(formatTimecode(c.end, s->fps)));
             auto* text = new QTableWidgetItem(QString::fromStdString(c.text));
             // What it breaks, if anything: a warning sign with the details as its tooltip.
-            auto* check = new QTableWidgetItem(problems[i] ? QStringLiteral("\u26A0") : QString());
+            auto* check = new QTableWidgetItem(problems[i] || !spelling[i].empty() ? QStringLiteral("\u26A0") : QString());
             check->setFlags(check->flags() & ~Qt::ItemIsEditable);
-            if (problems[i]) {
-                check->setToolTip(QString::fromStdString(describeCaptionIssues(problems[i], c, s->fps, lim)));
+            if (problems[i] || !spelling[i].empty()) {
+                QStringList tip;
+                if (problems[i]) tip << QString::fromStdString(describeCaptionIssues(problems[i], c, s->fps, lim));
+                if (!spelling[i].empty()) {
+                    QStringList words;
+                    for (const Misspelling& m : spelling[i]) words << QString::fromStdString(m.word);
+                    tip << tr("Spelling: %1").arg(words.join(", "));
+                }
+                check->setToolTip(tip.join('\n'));
                 check->setForeground(QColor(230, 160, 40));
             }
             // Its place, when not the usual: arrows up or to the middle, and to a side.
@@ -308,6 +340,39 @@ void CaptionsPanel::followPlayhead(FrameTime t) {
             f.setBold(r == at);
             item->setFont(f);
         }
+}
+
+QMenu* CaptionsPanel::spellingMenu(int row) {
+    const CaptionTrack* t = track();
+    const SpellChecker* sc = t ? activeChecker(QString::fromStdString(t->language)) : nullptr;
+    if (!sc || row < 0 || size_t(row) >= t->captions.size()) return nullptr;
+    const std::vector<Misspelling> bad = sc->check(t->captions[size_t(row)].text, state_->project().vocabulary);
+    if (bad.empty()) return nullptr;
+    auto* menu = new QMenu(this);
+    menu->setObjectName(QStringLiteral("captionSpellingMenu"));
+    for (const Misspelling& m : bad) {
+        const QString word = QString::fromStdString(m.word);
+        QMenu* sub = menu->addMenu(word);
+        const std::vector<std::string> suggestions = sc->suggest(m.word);
+        for (const std::string& sug : suggestions) {
+            const QString with = QString::fromStdString(sug);
+            const int start = m.start, len = m.length;
+            sub->addAction(with, this, [this, row, start, len, word, with] {
+                editTrack(tr("Correct Spelling"), [row, start, len, word, with](CaptionTrack& tr) {
+                    if (size_t(row) >= tr.captions.size()) return false;
+                    QString text = QString::fromStdString(tr.captions[size_t(row)].text);
+                    if (text.mid(start, len).replace(QChar(0x2019), '\'') != QString(word).replace(QChar(0x2019), '\'')) return false;
+                    text.replace(start, len, with);
+                    tr.captions[size_t(row)].text = text.toStdString();
+                    return true;
+                });
+            });
+        }
+        if (suggestions.empty()) sub->addAction(tr("No suggestions"))->setEnabled(false);
+        sub->addSeparator();
+        sub->addAction(tr("Add to Dictionary"), this, [this, word] { learnSpelling(state_, word); })->setObjectName(QStringLiteral("learnSpelling"));
+    }
+    return menu;
 }
 
 void CaptionsPanel::editCaption(Id track, int index) {

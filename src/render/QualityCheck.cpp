@@ -6,6 +6,7 @@
 
 #include "ColorSpace.h"
 #include "Compositor.h"
+#include "core/SpellCheck.h"
 #include "media/Loudness.h"
 
 namespace montage {
@@ -56,6 +57,7 @@ const char* qcKindName(QcKind k) {
         case QcKind::Clipping: return "Clipping";
         case QcKind::Loudness: return "Loudness";
         case QcKind::TruePeak: return "True peak";
+        case QcKind::Spelling: return "Spelling";
     }
     return "";
 }
@@ -307,6 +309,41 @@ std::vector<QcIssue> qualityCheck(const Project& p, const Sequence& s, FrameTime
             if (r.valid && r.truePeakDb > q.peakCeiling + 0.05)
                 issues.push_back({QcKind::TruePeak, in, out, fmt("True peak %.1f dBTP; the ceiling is %.1f dBTP", r.truePeakDb, q.peakCeiling)});
         }
+    }
+    if (q.spelling) {
+        // The misspelt words and the first suggestion for each: "'teh' (the?), 'knwon' (known?)".
+        auto listed = [](const std::vector<Misspelling>& bad) {
+            std::string out;
+            for (const Misspelling& m : bad) {
+                if (!out.empty()) out += ", ";
+                out += "'" + m.word + "'";
+                if (!m.suggestions.empty()) out += " (" + m.suggestions.front() + "?)";
+            }
+            return out;
+        };
+        for (const CaptionTrack& t : s.captionTracks) {
+            const SpellChecker* sc = SpellChecker::forLanguage(t.language);
+            if (!sc) continue;
+            for (size_t i = 0; i < t.captions.size(); ++i) {
+                const Caption& c = t.captions[i];
+                if (c.end <= in || c.start >= out) continue;
+                const std::vector<Misspelling> bad = sc->check(c.text, p.vocabulary, true);
+                if (!bad.empty())
+                    issues.push_back({QcKind::Spelling, std::max(c.start, in), std::min(c.end, out),
+                                      "Spelling in caption " + std::to_string(i + 1) + " of " + t.name + ": " + listed(bad)});
+            }
+        }
+        if (const SpellChecker* sc = SpellChecker::forLanguage(q.titleLanguage))
+            for (const Track& t : s.videoTracks)
+                for (const Clip& c : t.clips) {
+                    const auto text = c.generator.strings.find("text");
+                    if (!c.enabled || c.generator.type.rfind("title", 0) != 0 || text == c.generator.strings.end()) continue;
+                    if (c.end() <= in || c.start >= out) continue;
+                    const std::vector<Misspelling> bad = sc->check(text->second, p.vocabulary, true);
+                    if (!bad.empty())
+                        issues.push_back({QcKind::Spelling, std::max(c.start, in), std::min(c.end(), out),
+                                          "Spelling in the title '" + (c.name.empty() ? text->second.substr(0, 40) : c.name) + "': " + listed(bad)});
+                }
     }
     std::stable_sort(issues.begin(), issues.end(), [](const QcIssue& a, const QcIssue& b) { return a.start < b.start; });
     if (progress) progress(1.0);

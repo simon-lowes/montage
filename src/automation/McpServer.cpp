@@ -22,6 +22,7 @@
 #include "core/GradeVersions.h"
 #include "core/AudioChannels.h"
 #include "core/TranscriptCorrect.h"
+#include "core/SpellCheck.h"
 #include "render/LightLevel.h"
 #include "render/Spherical.h"
 #include "render/ClipPlacement.h"
@@ -1407,6 +1408,70 @@ void McpServer::Impl::addTools() {
             return ok(text, out);
         });
 
+    add("montage_spell_check", "Check spelling",
+        "Check the spelling of the active sequence's captions (each track in its language) and titles (`language`, "
+        "default en-US), or of `text` alone, in English (US or UK; SCOWL's word lists). The project's vocabulary is "
+        "always right: `learn` adds words to it (Add to Dictionary) and `forget` takes them out, before checking. "
+        "Returns each misspelt word with where it is and suggestions, best first.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"text":{"type":"string"},
+            "language":{"type":"string","default":"en-US","description":"For titles and text: en, en-US, en-GB..."},
+            "scope":{"type":"string","enum":["all","captions","titles"],"default":"all"},
+            "learn":{"type":"array","items":{"type":"string"}},"forget":{"type":"array","items":{"type":"string"}}},
+            "required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            const Sequence& s = l.seq();
+            int changed = 0;
+            for (const QJsonValue& v : a.value("learn").toArray()) changed += learnWord(l.project, v.toString().toStdString());
+            for (const QJsonValue& v : a.value("forget").toArray()) changed += forgetWord(l.project, v.toString().toStdString());
+            if (changed) save(l);
+            const QString language = str(a, "language", "en-US");
+            const SpellChecker* main = SpellChecker::forLanguage(language.toStdString());
+            QJsonArray list;
+            auto report = [&](const std::vector<Misspelling>& bad, QJsonObject where) {
+                for (const Misspelling& m : bad) {
+                    QJsonArray sug;
+                    for (const std::string& x : m.suggestions) sug.append(QString::fromStdString(x));
+                    QJsonObject o = where;
+                    o["word"] = QString::fromStdString(m.word);
+                    o["suggestions"] = sug;
+                    list.append(o);
+                }
+            };
+            if (a.contains("text")) {
+                if (!main) return fail(QStringLiteral("No dictionary for \"%1\" (English, US or UK)").arg(language));
+                report(main->check(str(a, "text"), l.project.vocabulary, true), QJsonObject{});
+            } else {
+                const QString scope = str(a, "scope", "all");
+                if (scope != "all" && scope != "captions" && scope != "titles") throw ArgError{"\"scope\" is all, captions or titles"};
+                if (scope != "titles")
+                    for (const CaptionTrack& t : s.captionTracks) {
+                        const SpellChecker* sc = SpellChecker::forLanguage(t.language);
+                        if (!sc) continue;
+                        for (size_t i = 0; i < t.captions.size(); ++i)
+                            report(sc->check(t.captions[i].text, l.project.vocabulary, true),
+                                   QJsonObject{{"track", QString::fromStdString(t.name)}, {"caption", int(i + 1)}, {"at", tc(t.captions[i].start, s)}});
+                    }
+                if (scope != "captions" && main)
+                    for (const Track& t : s.videoTracks)
+                        for (const Clip& c : t.clips) {
+                            const auto it = c.generator.strings.find("text");
+                            if (c.generator.type.rfind("title", 0) != 0 || it == c.generator.strings.end()) continue;
+                            report(main->check(it->second, l.project.vocabulary, true),
+                                   QJsonObject{{"clip", double(c.id)}, {"title", QString::fromStdString(c.name)}, {"at", tc(c.start, s)}});
+                        }
+            }
+            QString text = list.isEmpty() ? QStringLiteral("No spelling mistakes found.") : QStringLiteral("%1 misspelt word(s):").arg(list.size());
+            for (const QJsonValue& v : list) {
+                const QJsonObject o = v.toObject();
+                QStringList sug;
+                for (const QJsonValue& x : o.value("suggestions").toArray()) sug << x.toString();
+                text += QStringLiteral("\n%1%2 (%3)").arg(o.contains("at") ? o.value("at").toString() + "  " : QString(), o.value("word").toString(),
+                                                         sug.isEmpty() ? QStringLiteral("no suggestions") : sug.join(", "));
+            }
+            return ok(text, QJsonObject{{"misspellings", list}, {"vocabulary", int(l.project.vocabulary.size())}});
+        });
+
     add("montage_automate_track", "Automate a track's fader",
         "Set an audio track's fader automation, as written from the mixer: its mode (off, read, write, latch, touch) and "
         "volume (dB) and pan (-1 left to 1 right) points at times; points replace the lane's points between the first and last "
@@ -1574,8 +1639,9 @@ void McpServer::Impl::addTools() {
     add("montage_quality_check", "Quality check",
         "Check the sequence (or from..to) before delivery, as broadcasters' QC does: flashing that can trigger seizures "
         "(ITU-R BT.1702 / Ofcom / WCAG: more than three flashes a second over a quarter of the screen, or saturated red), "
-        "levels outside EBU R103, black or frozen picture, silence, clipping, and loudness against a target. Lists each "
-        "problem with its timecodes; with markers, puts a red \"QC:\" marker on each (replacing earlier ones).",
+        "levels outside EBU R103, black or frozen picture, silence, clipping, loudness against a target, and spelling in "
+        "captions (each track's language) and titles (`title_language`, default en-US), the project's vocabulary allowed. "
+        "Lists each problem with its timecodes; with markers, puts a red \"QC:\" marker on each (replacing earlier ones).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"from":{"type":["number","string"]},
             "to":{"type":["number","string"]},"flashing":{"type":"boolean","default":true},"levels":{"type":"boolean","default":true},
             "black_seconds":{"type":"number","default":1,"description":"0 = not checked"},
@@ -1584,6 +1650,7 @@ void McpServer::Impl::addTools() {
             "clipping":{"type":"boolean","default":true},
             "loudness_target":{"type":"number","description":"LUFS, e.g. -14 (streaming) or -23 (EBU R128); omitted = not checked"},
             "peak_ceiling":{"type":"number","default":-1,"description":"dBTP, checked with the loudness"},
+            "spelling":{"type":"boolean","default":true},"title_language":{"type":"string","default":"en-US"},
             "markers":{"type":"boolean","default":false}},"required":["project"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
@@ -1599,6 +1666,8 @@ void McpServer::Impl::addTools() {
             q.clipping = a.value("clipping").toBool(true);
             q.loudnessTarget = a.value("loudness_target").toDouble(0);
             q.peakCeiling = a.value("peak_ceiling").toDouble(-1);
+            q.spelling = a.value("spelling").toBool(true);
+            q.titleLanguage = str(a, "title_language", "en-US").toStdString();
             const std::vector<QcIssue> issues = qualityCheck(l.project, s, from, to, q, [this](double f) { progress(f, "Checking"); });
             QString text;
             for (const QcIssue& i : issues)

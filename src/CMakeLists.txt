@@ -36,6 +36,7 @@ add_library(montage_engine STATIC
   core/GradeVersions.h core/GradeVersions.cpp
   core/AudioChannels.h core/AudioChannels.cpp
   core/TranscriptCorrect.h core/TranscriptCorrect.cpp
+  core/SpellCheck.h core/SpellCheck.cpp
   core/ImportBuilder.h core/InterchangeImport.cpp core/FcpXml.cpp
   core/Multicam.h core/Multicam.cpp
   core/History.h core/History.cpp
@@ -148,6 +149,9 @@ endif()
 target_compile_options(montage_engine PRIVATE
   $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wno-unused-parameter>)
 set_target_properties(montage_engine PROPERTIES AUTOMOC OFF)
+# Spelling word lists (core/SpellCheck.h), built in.
+qt_add_resources(montage_engine "dictionaries" PREFIX "/montage/dict" BASE "${CMAKE_CURRENT_SOURCE_DIR}/resources/dict"
+  FILES resources/dict/english.txt resources/dict/american.txt resources/dict/british.txt)
 
 if(MONTAGE_WITH_LV2)
   pkg_check_modules(LILV IMPORTED_TARGET GLOBAL lilv-0>=0.24)

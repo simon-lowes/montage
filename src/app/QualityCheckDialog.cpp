@@ -1,4 +1,5 @@
 #include "QualityCheckDialog.h"
+#include "SpellUi.h"
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -89,6 +90,10 @@ QualityCheckDialog::QualityCheckDialog(EditorState* state, QWidget* parent) : QD
     loudness_->addItem(tr("EBU R128: -23 LUFS, -1 dBTP"), QPointF(-23, -1));
     loudness_->addItem(tr("ATSC A/85: -24 LKFS, -2 dBTP"), QPointF(-24, -2));
     form->addRow(tr("Loudness:"), loudness_);
+    spelling_ = new QCheckBox(tr("Spelling in captions and titles"), this);
+    spelling_->setObjectName(QStringLiteral("qcSpelling"));
+    spelling_->setChecked(true);
+    form->addRow(tr("Text:"), spelling_);
     layout->addLayout(form);
 
     auto* check = new QPushButton(tr("Check"), this);
@@ -132,6 +137,8 @@ QcSettings QualityCheckDialog::settings() const {
     const QPointF target = loudness_->currentData().toPointF();
     q.loudnessTarget = target.x();
     q.peakCeiling = target.y();
+    q.spelling = spelling_->isChecked();
+    q.titleLanguage = titleSpellingLanguage().toStdString();
     return q;
 }
 

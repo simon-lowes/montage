@@ -50,6 +50,7 @@
 #include "ExportDialog.h"
 #include "ExposureView.h"
 #include "QualityCheckDialog.h"
+#include "SpellUi.h"
 #include "ProjectManagerDialog.h"
 #include "MediaBinModel.h"
 #include "ScopesWidget.h"
@@ -4067,9 +4068,10 @@ private slots:
         QVERIFY(issues[0] == kCaptionGapTooSmall && (issues[1] & kCaptionTooFast) && (issues[1] & kCaptionLineTooLong) && issues[2] == 0);
         QVERIFY(table->item(1, 3)->text() == QString(QChar(0x26A0)));
         QVERIFY2(table->item(1, 3)->toolTip().contains("characters a second"), qPrintable(table->item(1, 3)->toolTip()));
-        QVERIFY(table->item(2, 3)->text().isEmpty());
+        // The third keeps to the limits; only its spelling is flagged.
+        QCOMPARE(table->item(2, 3)->toolTip(), QString("Spelling: Teh"));
         auto* summary = panel->findChild<QLabel*>("captionCheckSummary");
-        QVERIFY(summary && summary->text().startsWith("2 of 3 captions"));
+        QVERIFY2(summary && summary->text() == "2 of 3 captions break the reading limits; 1 with spelling mistakes", qPrintable(summary->text()));
         // Fix Timing from the menu: one undo step.
         QAction* fix = panel->findChild<QAction*>("fixCaptionTiming");
         QVERIFY(fix);
@@ -6696,6 +6698,92 @@ const auto seq = [this] { return state()->sequence(); };
         }
         scopes.setMode(ScopesWidget::Mode::Waveform);
         QVERIFY(scopes.hasSignal());
+    }
+
+    void spellCheckInCaptionsAndTitles() {
+        setSpellCheckingOn(true);
+        setTitleSpellingLanguage("en-US");
+        state()->newProject();
+        QVERIFY(state()->edit("Captions", [](Project& p, Sequence& s) {
+            CaptionTrack t;
+            t.id = p.newId();
+            t.captions = {{0, 50, "Teh show begins."}, {60, 110, "All good here."}};
+            s.captionTracks = {t};
+            return true;
+        }));
+        auto* panel = win_->findChild<CaptionsPanel*>();
+        auto* table = panel->findChild<QTableWidget*>();
+        QTRY_COMPARE(table->rowCount(), 2);
+        // The caption with a mistake is flagged, with the word in its tooltip.
+        QCOMPARE(table->item(0, 3)->text(), QString("\u26A0"));
+        QVERIFY2(table->item(0, 3)->toolTip().contains("Spelling: Teh"), qPrintable(table->item(0, 3)->toolTip()));
+        QVERIFY(table->item(1, 3)->text().isEmpty());
+        QVERIFY(panel->findChild<QLabel*>("captionCheckSummary")->text().contains("spelling"));
+        QVERIFY(!panel->spellingMenu(1));  // nothing wrong there
+        // Corrected from the suggestions, one undo step.
+        std::unique_ptr<QMenu> menu(panel->spellingMenu(0));
+        QVERIFY(menu);
+        QMenu* teh = menu->actions().at(0)->menu();
+        QVERIFY(teh && teh->title() == "Teh");
+        QAction* the = nullptr;
+        for (QAction* a : teh->actions())
+            if (a->text() == "The") the = a;
+        QVERIFY(the);
+        the->trigger();
+        QCOMPARE(state()->sequence()->captionTracks[0].captions[0].text, std::string("The show begins."));
+        QVERIFY(!panel->spellingMenu(0));
+        state()->undo();
+        QCOMPARE(state()->sequence()->captionTracks[0].captions[0].text, std::string("Teh show begins."));
+        // Added to the dictionary: the project's vocabulary, then right everywhere.
+        menu.reset(panel->spellingMenu(0));
+        QAction* learn = menu->actions().at(0)->menu()->findChild<QAction*>("learnSpelling");
+        QVERIFY(learn);
+        learn->trigger();
+        QCOMPARE(state()->project().vocabulary, std::vector<std::string>{"Teh"});
+        QVERIFY(!panel->spellingMenu(0));
+        QTRY_VERIFY2(table->item(0, 3)->text().isEmpty(), qPrintable(table->item(0, 3)->toolTip()));
+        state()->undo();
+        QVERIFY(state()->project().vocabulary.empty());
+        // Turned off: nothing flagged.
+        auto* asYouType = win_->findChild<QAction*>("checkSpelling");
+        QVERIFY(asYouType && asYouType->isChecked());
+        asYouType->setChecked(false);
+        QVERIFY(!panel->spellingMenu(0));
+        QTRY_VERIFY(table->item(0, 3)->text().isEmpty());
+        asYouType->setChecked(true);
+        QVERIFY(panel->spellingMenu(0) != nullptr);
+        delete panel->spellingMenu(0);
+
+        // A title's text: misspelt words underlined, and corrected from the right-click menu.
+        QPlainTextEdit edit;
+        enableSpellCheck(&edit, state(), [] { return titleSpellingLanguage(); });
+        edit.setPlainText("Welcom home");
+        bool marked = false;
+        for (const QTextLayout::FormatRange& r : edit.document()->firstBlock().layout()->formats())
+            marked = marked || (r.start == 0 && r.length == 6 && r.format.underlineStyle() == QTextCharFormat::SpellCheckUnderline);
+        QVERIFY(marked);
+        QMenu titleMenu;
+        titleMenu.addAction("Copy");
+        QTextCursor in(edit.document());
+        in.setPosition(8);  // in "home"
+        QVERIFY(!addSpellingActions(&titleMenu, &edit, in, state(), "en-US"));
+        in.setPosition(2);
+        QVERIFY(addSpellingActions(&titleMenu, &edit, in, state(), "en-US"));
+        QCOMPARE(titleMenu.actions().at(0)->text(), QString("Welcome"));
+        titleMenu.actions().at(0)->trigger();
+        QCOMPARE(edit.toPlainText(), QString("Welcome home"));
+        // The dictionary for titles, from Edit > Spelling.
+        win_->findChild<QAction*>("spelling-en-GB")->trigger();
+        QCOMPARE(titleSpellingLanguage(), QString("en-GB"));
+        edit.setPlainText("Colour");
+        QVERIFY(edit.document()->firstBlock().layout()->formats().isEmpty());
+        win_->findChild<QAction*>("spelling-en-US")->trigger();
+        QCOMPARE(titleSpellingLanguage(), QString("en-US"));
+        // Quality Check offers it.
+        QualityCheckDialog dlg(state(), win_.get());
+        QVERIFY(dlg.findChild<QCheckBox*>("qcSpelling")->isChecked());
+        QCOMPARE(dlg.settings().titleLanguage, std::string("en-US"));
+        state()->newProject();
     }
 
     void hdrScopesAndLightLevels() {

@@ -1,4 +1,5 @@
 #include "TranscriptPanel.h"
+#include "SpellUi.h"
 #include "FlowLayout.h"
 #include "Settings.h"
 
@@ -82,6 +83,10 @@ TranscriptPanel::TranscriptPanel(EditorState* state, QWidget* parent) : QWidget(
     text_->viewport()->installEventFilter(this);
     text_->installEventFilter(this);
     text_->viewport()->setCursor(Qt::IBeamCursor);
+    // Misspelt words underlined (English transcripts in the dictionary chosen for titles).
+    new SpellHighlighter(text_->document(), state_, [this] {
+        return language_.empty() || language_ == "en" ? titleSpellingLanguage() : QString::fromStdString(language_);
+    });
     lay->addWidget(text_, 1);
 
     // The buttons wrap onto more rows when the panel is docked narrow.

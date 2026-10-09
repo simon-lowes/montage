@@ -1,4 +1,5 @@
 #include "InspectorWidget.h"
+#include "SpellUi.h"
 
 #include <QAbstractItemView>
 #include <QCheckBox>
@@ -1373,6 +1374,7 @@ void InspectorWidget::addStringRow(QFormLayout* form, const StringParamInfo& si,
         case StringKind::MultilineText: {
             auto* edit = new QPlainTextEdit(content_);
             edit->setFixedHeight(64);
+            enableSpellCheck(edit, state_, [] { return titleSpellingLanguage(); });
             form->addRow(label, edit);
             connect(edit, &QPlainTextEdit::textChanged, this, [edit, write] { write(edit->toPlainText()); });
             refreshers_.push_back([edit, read] {

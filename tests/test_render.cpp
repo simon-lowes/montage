@@ -3202,6 +3202,60 @@ colorspaces:
         }
     }
 
+    void qualityCheckSpelling() {
+        // Only text: no picture or sound checks.
+        QcSettings q;
+        q.flashing = q.levels = q.clipping = false;
+        q.blackSeconds = q.freezeSeconds = q.silenceSeconds = 0;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = {25, 1};
+        Clip bg = makeGeneratorClip(p, "color", 250);
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, bg).ok);
+        Clip title = makeGeneratorClip(p, "title", 50);
+        title.generator.strings["text"] = "Welcom to Montaj";
+        title.name = "Opening";
+        title.start = 100;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 1}, title).ok);
+        CaptionTrack en;
+        en.id = p.newId();
+        en.captions = {{0, 50, "Teh show begins."}, {50, 100, "All good here."}, {150, 200, "Its recieved well."}};
+        CaptionTrack fr;
+        fr.id = p.newId();
+        fr.name = "French";
+        fr.language = "fr";
+        fr.captions = {{0, 50, "Bonjour tout le monde."}};
+        s.captionTracks = {en, fr};
+        std::vector<QcIssue> issues = qualityCheck(p, s, 0, -1, q);
+        QCOMPARE(issues.size(), size_t(3));  // two captions and the title; French has no dictionary
+        for (const QcIssue& i : issues) QCOMPARE(i.kind, QcKind::Spelling);
+        QCOMPARE(issues[0].start, FrameTime(0));
+        QCOMPARE(issues[0].end, FrameTime(50));
+        QVERIFY2(QString::fromStdString(issues[0].text).contains("'Teh' (The?)"), issues[0].text.c_str());
+        QVERIFY2(QString::fromStdString(issues[1].text).contains("Opening") && QString::fromStdString(issues[1].text).contains("'Welcom'") &&
+                     QString::fromStdString(issues[1].text).contains("'Montaj'"),
+                 issues[1].text.c_str());
+        QVERIFY2(QString::fromStdString(issues[2].text).contains("caption 3") && QString::fromStdString(issues[2].text).contains("(received?)"),
+                 issues[2].text.c_str());
+        QCOMPARE(QString(qcKindName(QcKind::Spelling)), QString("Spelling"));
+        // The project's words are right; a range checks only what is in it; off checks nothing.
+        p.vocabulary = {"Montaj"};
+        issues = qualityCheck(p, s, 90, 160, q);
+        QCOMPARE(issues.size(), size_t(2));
+        QVERIFY(!QString::fromStdString(issues[0].text).contains("Montaj"));
+        QCOMPARE(issues[0].start, FrameTime(100));
+        q.spelling = false;
+        QVERIFY(qualityCheck(p, s, 0, -1, q).empty());
+        // Titles in British English: "colour" is right there, not in American.
+        q.spelling = true;
+        s.captionTracks.clear();
+        Clip* t = edit::clipById(s, s.videoTracks[1].clips[0].id);
+        t->generator.strings["text"] = "Colour grading";
+        QCOMPARE(qualityCheck(p, s, 0, -1, q).size(), size_t(1));
+        q.titleLanguage = "en-GB";
+        QVERIFY(qualityCheck(p, s, 0, -1, q).empty());
+    }
+
     void hdrLightLevels() {
         const ColorSpace& sdr = *findColorSpace("rec709");
         const ColorSpace& pq = *findColorSpace("rec2100pq");

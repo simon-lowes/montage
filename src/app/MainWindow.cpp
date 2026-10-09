@@ -108,6 +108,7 @@
 #include "PlaybackController.h"
 #include "PluginManagerDialog.h"
 #include "ScopesWidget.h"
+#include "SpellUi.h"
 #include "SequenceSettingsDialog.h"
 #include "Theme.h"
 #include "core/Checkerboard.h"
@@ -739,6 +740,33 @@ void MainWindow::buildMenus() {
             return any;
         });
     });
+    // Spelling: as you type in captions and titles, and the dictionary for titles.
+    editM->addSeparator();
+    QMenu* spellM = editM->addMenu(tr("Spe&lling"));
+    spellM->setObjectName(QStringLiteral("spellingMenu"));
+    QAction* asYouType = spellM->addAction(tr("Check Spelling as You Type"));
+    asYouType->setObjectName(QStringLiteral("checkSpelling"));
+    asYouType->setCheckable(true);
+    asYouType->setChecked(spellCheckingOn());
+    connect(asYouType, &QAction::toggled, this, [this](bool on) {
+        setSpellCheckingOn(on);
+        emit state_->projectChanged();  // marks redrawn
+    });
+    spellM->addSeparator();
+    auto* dictionaries = new QActionGroup(spellM);
+    for (const auto& [id, name] : {std::pair{"en-US", tr("English (US)")}, std::pair{"en-GB", tr("English (UK)")}}) {
+        QAction* a = spellM->addAction(name);
+        a->setObjectName(QStringLiteral("spelling-%1").arg(QLatin1String(id)));
+        a->setCheckable(true);
+        a->setChecked(titleSpellingLanguage() == QLatin1String(id));
+        a->setToolTip(tr("The dictionary for titles; captions use their track's language"));
+        dictionaries->addAction(a);
+        const QString lang = QLatin1String(id);
+        connect(a, &QAction::triggered, this, [this, lang] {
+            setTitleSpellingLanguage(lang);
+            emit state_->projectChanged();
+        });
+    }
 
     // ---- Clip
     QMenu* clipM = menuBar()->addMenu(tr("&Clip"));

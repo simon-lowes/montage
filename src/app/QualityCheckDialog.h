@@ -44,6 +44,7 @@ private:
     QCheckBox* silence_;
     QDoubleSpinBox* silenceSeconds_;
     QCheckBox* clipping_;
+    QCheckBox* spelling_ = nullptr;
     QComboBox* loudness_;
     QTableWidget* table_;
     QLabel* summary_;
