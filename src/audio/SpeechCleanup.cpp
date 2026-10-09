@@ -21,13 +21,14 @@ extern "C" {
 #endif
 
 #include "AudioRepair.h"
+#include "SpectralRepair.h"
 #include "media/SpeechEnhance.h"
 
 namespace montage {
 
 bool isSourceAudioEffect(const std::string& type) {
     return type == "denoise" || type == "voice_isolate" || type == "enhance_speech" || type == "declick" || type == "pitch_shift" ||
-           type == "dereverb";
+           type == "dereverb" || type == "spectral_repair";
 }
 
 bool hasVoiceIsolation() {
@@ -446,6 +447,7 @@ std::string keyFor(const std::string& path, int rate, const std::vector<const Ef
             std::snprintf(buf, sizeof buf, ":%s=%.4g", name.c_str(), param.at(0));
             key += buf;
         }
+        for (const auto& [name, text] : e->strings) key += ":" + name + "=" + text;  // Spectral Repair's regions
     }
     return key;
 }
@@ -467,6 +469,9 @@ AudioBufferPtr process(const AudioBufferPtr& source, const std::vector<Effect>& 
             ok = true;
         } else if (e.type == "dereverb") {
             dereverb(*cur, *out, e.p("amount", 0, 80), e.p("reverb_time", 0, 0), e.p("max_reduction_db", 0, 18));
+            ok = true;
+        } else if (e.type == "spectral_repair") {
+            spectralRepair(*cur, *out, spectralRegionsFromString(e.s("regions")));
             ok = true;
         } else if (e.type == "pitch_shift") {
             pitchShift(*cur, *out, e.p("semitones", 0, 0) + e.p("cents", 0, 0) / 100);

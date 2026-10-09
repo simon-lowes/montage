@@ -48,6 +48,7 @@
 #include "core/MarkerList.h"
 #include "core/MaskPath.h"
 #include "core/Bleep.h"
+#include "audio/SpectralRepair.h"
 #include "core/Checkerboard.h"
 #include "core/EditOps.h"
 #include "core/TimelineCompare.h"
@@ -3004,6 +3005,91 @@ void McpServer::Impl::addTools() {
                 words.append(QJsonObject{{"text", QString::fromStdString(w.text)}, {"start", w.start}, {"end", w.end}});
             return ok(QStringLiteral("Bleeped %1 word(s) on %2 clip(s)").arg(chosen.size()).arg(r.created.size()),
                       QJsonObject{{"words", words}, {"clips", int(r.created.size())}});
+        });
+
+    add("montage_spectral_repair", "Spectral repair",
+        "Take a sound out of an audio clip where it shares the moment with the dialogue but not its frequencies (a phone, a "
+        "squeak, a whistle, a siren, a hum that comes and goes), as Audition's spectral healing and iZotope RX's Spectral "
+        "Repair do: each region, a box of time and frequency, is healed (each frequency brought down to the level heard "
+        "just before and after) or turned down by gain_db, and everything outside it is left as it was. Times are timeline "
+        "seconds; regions are kept on the clip in source time. Leave out low_hz and high_hz to use the band that stands out "
+        "most in that stretch (reported back); find_only reports the bands without changing anything. clear removes the "
+        "clip's repairs first.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "clip":{"type":"number","description":"Audio clip id"},
+            "regions":{"type":"array","items":{"type":"object","properties":{
+                "start":{"type":"number","description":"Timeline seconds"},"end":{"type":"number"},
+                "low_hz":{"type":"number"},"high_hz":{"type":"number"},
+                "mode":{"type":"string","enum":["heal","attenuate"],"default":"heal"},
+                "gain_db":{"type":"number","description":"attenuate: how far down (default -20)"},
+                "channel":{"type":"string","enum":["both","left","right"],"default":"both"}},"required":["start","end"]}},
+            "find_only":{"type":"boolean"},
+            "clear":{"type":"boolean"}},"required":["project","clip"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            Clip* c = edit::clipById(s, Id(a.value("clip").toDouble()));
+            if (!c || !c->mediaId) throw ArgError{"No such clip"};
+            const MediaItem* m = l.project.findMedia(c->mediaId);
+            if (!m || !m->hasAudio) throw ArgError{"That clip has no sound"};
+            const double fps = s.fpsValue(), clipStart = double(c->start) / fps, clipEnd = double(c->end()) / fps;
+            const bool findOnly = a.value("find_only").toBool();
+            AudioBufferPtr sound;
+            auto source = [&]() -> const AudioBuffer& {
+                if (!sound) {
+                    std::string err;
+                    sound = decodeAudio(m->path, 48000, &err);
+                    if (!sound) throw ArgError{QStringLiteral("Cannot read the clip's sound: %1").arg(QString::fromStdString(err))};
+                }
+                return *sound;
+            };
+            std::vector<SpectralRegion> regions;
+            QJsonArray found, made;
+            for (const QJsonValue& v : a.value("regions").toArray()) {
+                const QJsonObject o = v.toObject();
+                const double t0 = o.value("start").toDouble(), t1 = o.value("end").toDouble();
+                if (!(t1 > t0)) throw ArgError{"Each region's end must be after its start"};
+                if (t1 <= clipStart || t0 >= clipEnd) throw ArgError{"A region is outside the clip"};
+                SpectralRegion r;
+                const double a0 = clipSourceSeconds(s, *c, std::max(t0, clipStart)), a1 = clipSourceSeconds(s, *c, std::min(t1, clipEnd));
+                r.start = std::min(a0, a1), r.end = std::max(a0, a1);
+                r.mode = o.value("mode").toString("heal").toStdString();
+                if (!validSpectralMode(r.mode)) throw ArgError{"mode is heal or attenuate"};
+                r.gainDb = o.value("gain_db").toDouble(-20);
+                const QString ch = o.value("channel").toString("both");
+                r.channel = ch == "left" ? 0 : ch == "right" ? 1 : -1;
+                if (o.contains("low_hz") || o.contains("high_hz")) {
+                    r.low = o.value("low_hz").toDouble(0), r.high = o.value("high_hz").toDouble(0);
+                    if (r.high > 0 && r.high <= r.low) throw ArgError{"high_hz must be above low_hz"};
+                } else {
+                    const std::vector<SpectralBand> bands = prominentBands(source(), r.start, r.end, 3, r.channel);
+                    QJsonArray list;
+                    for (const SpectralBand& b : bands) list.append(QJsonObject{{"low_hz", b.low}, {"high_hz", b.high}, {"excess_db", b.excessDb}});
+                    found.append(QJsonObject{{"start", t0}, {"end", t1}, {"bands", list}});
+                    if (bands.empty()) {
+                        if (findOnly) continue;
+                        throw ArgError{QStringLiteral("Nothing stands out between %1 and %2 s: give low_hz and high_hz").arg(t0).arg(t1)};
+                    }
+                    r.low = bands.front().low, r.high = bands.front().high;
+                }
+                regions.push_back(r);
+                made.append(QJsonObject{{"source_start", r.start}, {"source_end", r.end}, {"low_hz", r.low}, {"high_hz", r.high},
+                                        {"mode", QString::fromStdString(r.mode)}, {"gain_db", r.gainDb}});
+            }
+            if (findOnly) return ok(json(QJsonObject{{"found", found}}), QJsonObject{{"found", found}});
+            if (regions.empty() && !a.value("clear").toBool()) throw ArgError{"Give \"regions\" (or \"clear\")"};
+            std::vector<SpectralRegion> all = a.value("clear").toBool() ? std::vector<SpectralRegion>{} : spectralRegionsOf(*c);
+            all.insert(all.end(), regions.begin(), regions.end());
+            if (all.empty()) {
+                c->effects.erase(std::remove_if(c->effects.begin(), c->effects.end(), [](const Effect& e) { return e.type == "spectral_repair"; }),
+                                 c->effects.end());
+            } else {
+                spectralRepairEffect(l.project, *c, true)->strings["regions"] = spectralRegionsToString(all);
+            }
+            save(l);
+            QJsonObject out{{"regions", made}, {"total", int(all.size())}};
+            if (!found.isEmpty()) out["found"] = found;
+            return ok(QStringLiteral("%1 region(s) on the clip").arg(all.size()), out);
         });
 
     add("montage_checkerboard", "Split dialogue by speaker",

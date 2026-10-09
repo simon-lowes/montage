@@ -105,6 +105,7 @@
 #include "MaskOverlay.h"
 #include "TransformOverlay.h"
 #include "SequenceIndexPanel.h"
+#include "SpectralRepairDialog.h"
 #include "ShotSearchPanel.h"
 #include "ModelPacks.h"
 #include "media/VisualSearch.h"
@@ -860,6 +861,7 @@ void MainWindow::buildMenus() {
             if (dlg.exec() == QDialog::Accepted) AutoDuckDialog::apply(state_, music, dlg.dialogueTracks(), dlg.options(), this);
         }))->setObjectName(QStringLiteral("autoDuck"));
     add(clipM, tr("Remove Mic &Bleed…"), QKeySequence(), withSeq([this] { micBleedDialog(); }))->setObjectName(QStringLiteral("removeMicBleed"));
+    add(clipM, tr("S&pectral Repair…"), QKeySequence(), withSeq([this] { spectralRepairDialog(); }))->setObjectName(QStringLiteral("spectralRepair"));
     add(clipM, tr("Remove Letterbo&x"), QKeySequence(), withSeq([this] { removeLetterbox(); }))->setObjectName(QStringLiteral("removeLetterbox"));
     // Colour groups: grade shots together, before and after each clip's own grade (core/ColorGroups.h).
     QMenu* groupM = clipM->addMenu(tr("Colour &Group"));
@@ -3876,6 +3878,18 @@ int MainWindow::removeMicBleed(std::vector<int> tracks, double reductionDb) {
                             : tr("No mic bleed to remove: every mic is its speaker's throughout"),
                     6000);
     return changed;
+}
+
+SpectralRepairDialog* MainWindow::spectralRepairDialog() {
+    const Clip* c = musicClip();
+    if (!c || !c->mediaId) {
+        state_->message(tr("Select the audio clip to repair"));
+        return nullptr;
+    }
+    auto* dlg = new SpectralRepairDialog(state_, c->id, this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    dlg->show();
+    return dlg;
 }
 
 void MainWindow::micBleedDialog() {

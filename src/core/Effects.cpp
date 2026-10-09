@@ -424,6 +424,10 @@ std::vector<EffectInfo> buildCatalog() {
                  {pct("amount", "Amount", 0, 100, 80), num("reverb_time", "Room Reverb Time (s, 0 = auto)", 0, 5, 0, 0.05),
                   num("max_reduction_db", "Max Reduction (dB)", 0, 40, 18, 0.5)},
                  {}});
+    // Boxes of time and frequency healed or turned down on the clip's whole source audio (audio/SpectralRepair.h),
+    // drawn in the Spectral Repair editor (Clip menu) or set over MCP; kept in the "regions" string.
+    c.push_back({"spectral_repair", "Spectral Repair", EffectCategory::AudioFilter, "Restoration", {}, {}});
+    c.back().hidden = true;
     c.push_back({"dehum", "De-Hum", EffectCategory::AudioFilter, "Restoration",
                  {choice("mains", "Mains", {"50 Hz", "60 Hz"}, 0), num("harmonics", "Harmonics", 1, 16, 6, 1),
                   num("reduction_db", "Reduction (dB)", 0, 60, 30, 0.5), num("width_hz", "Notch Width (Hz)", 0.5, 10, 2, 0.1)},

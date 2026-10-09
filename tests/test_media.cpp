@@ -70,6 +70,7 @@
 #include "render/FaceRefine.h"
 #include "render/AudioFx.h"
 #include "audio/AudioRepair.h"
+#include "audio/SpectralRepair.h"
 #include "render/MusicEdit.h"
 #include "render/Highlights.h"
 #include "render/Shorts.h"
@@ -1944,6 +1945,139 @@ private slots:
         const QJsonObject how = r.value("structuredContent").toObject().value("media").toArray().at(0).toObject().value("interpretation").toObject();
         QVERIFY2(how.value("raw_exposure").toDouble() == 0.5 && how.value("raw_temperature").toDouble() == 3200 && how.value("raw_highlights") == "blend",
                  QJsonDocument(how).toJson().constData());
+    }
+
+    void spectralRepairHealsAndAttenuates() {
+        constexpr int sr = 48000;
+        // Four seconds: a 440 Hz "voice" and quiet noise throughout, a 3 kHz whistle from 1.0 to 1.5 s, and a 7 kHz
+        // squeak on the right only from 2.5 to 2.7 s.
+        AudioBuffer in;
+        in.sampleRate = sr;
+        in.samples.resize(size_t(sr) * 4 * 2);
+        std::mt19937 rng(3);
+        std::normal_distribution<double> noise(0, 0.003);
+        for (size_t i = 0; i < in.samples.size() / 2; ++i) {
+            const double t = double(i) / sr;
+            const double voice = 0.2 * std::sin(2 * M_PI * 440 * t) + noise(rng);
+            const double whistle = t >= 1.0 && t < 1.5 ? 0.3 * std::sin(2 * M_PI * 3000 * t) : 0;
+            const double squeak = t >= 2.5 && t < 2.7 ? 0.3 * std::sin(2 * M_PI * 7000 * t) : 0;
+            in.samples[i * 2] = float(voice + whistle);
+            in.samples[i * 2 + 1] = float(voice + whistle + squeak);
+        }
+        auto db = [](double x, double ref) { return 20 * std::log10(std::max(1e-9, x) / ref); };
+        // The spectrogram shows the whistle at 3 kHz, at its level.
+        const Spectrogram g = computeSpectrogram(in, 1.2, 1.3, 4, 0);
+        int peak = 1;
+        for (int k = 1; k < g.bins; ++k)
+            if (g.at(1, k) > g.at(1, peak)) peak = k;
+        QVERIFY2(std::fabs(g.hzOf(peak) - 3000) < 30 && std::fabs(g.at(1, peak) - db(0.3, 1)) < 2,
+                 qPrintable(QString("%1 Hz at %2 dB").arg(g.hzOf(peak)).arg(g.at(1, peak))));
+        // And it stands out from the second either side, in a narrow band; nothing does in a quiet stretch.
+        const std::vector<SpectralBand> bands = prominentBands(in, 1.0, 1.5);
+        QVERIFY(!bands.empty());
+        QVERIFY2(bands[0].low < 3000 && bands[0].high > 3000 && bands[0].high - bands[0].low < 250 && bands[0].excessDb > 20,
+                 qPrintable(QString("%1-%2 Hz +%3 dB").arg(bands[0].low).arg(bands[0].high).arg(bands[0].excessDb)));
+        QVERIFY(prominentBands(in, 3.2, 3.6).empty());
+        // Healed: the whistle gone, the voice in the same moment kept, the rest of the file untouched.
+        AudioBuffer healed;
+        spectralRepair(in, healed, {SpectralRegion{0.95, 1.55, 2700, 3300, "heal", 0, -1}});
+        const size_t a = size_t(1.1 * sr), b = size_t(1.4 * sr);
+        const double whistleLeft = db(toneLevel(healed.samples, 0, 3000, a, b), toneLevel(in.samples, 0, 3000, a, b));
+        const double whistleRight = db(toneLevel(healed.samples, 1, 3000, a, b), toneLevel(in.samples, 1, 3000, a, b));
+        const double voiceKept = db(toneLevel(healed.samples, 0, 440, a, b), toneLevel(in.samples, 0, 440, a, b));
+        QVERIFY2(whistleLeft < -30 && whistleRight < -30 && std::fabs(voiceKept) < 0.3,
+                 qPrintable(QString("whistle %1 / %2 dB, voice %3 dB").arg(whistleLeft).arg(whistleRight).arg(voiceKept)));
+        for (size_t i = 0; i < size_t(0.5 * sr) * 2; ++i) QCOMPARE(healed.samples[i], in.samples[i]);
+        for (size_t i = size_t(2.2 * sr) * 2; i < in.samples.size(); ++i) QCOMPARE(healed.samples[i], in.samples[i]);
+        // Just outside the box (in time and in frequency) the sound is as it was.
+        double worst = 0;
+        for (size_t i = size_t(0.6 * sr) * 2; i < size_t(0.75 * sr) * 2; ++i) worst = std::max(worst, double(std::fabs(healed.samples[i] - in.samples[i])));
+        QVERIFY2(worst < 1e-4, qPrintable(QString::number(worst)));
+        // Attenuated on the right only: the squeak 20 dB down, the left channel untouched.
+        AudioBuffer quieter;
+        spectralRepair(in, quieter, {SpectralRegion{2.45, 2.75, 6500, 7500, "attenuate", -20, 1}});
+        const size_t c0 = size_t(2.52 * sr), c1 = size_t(2.68 * sr);
+        const double squeak = db(toneLevel(quieter.samples, 1, 7000, c0, c1), toneLevel(in.samples, 1, 7000, c0, c1));
+        QVERIFY2(squeak < -18 && squeak > -22, qPrintable(QString::number(squeak)));
+        for (size_t i = 0; i < in.samples.size(); i += 2) QCOMPARE(quieter.samples[i], in.samples[i]);
+        // Kept as a string on the effect, in order; nonsense left out.
+        const std::vector<SpectralRegion> both{{0.95, 1.55, 2700, 3300, "heal", -20, -1}, {2.45, 2.75, 6500, 7500, "attenuate", -20, 1}};
+        QVERIFY(spectralRegionsFromString(spectralRegionsToString(both)) == both);
+        QCOMPARE(spectralRegionsFromString("1,0.5,0,0,heal,0,-1;2,3,0,0,blur,0,-1;garbage").size(), size_t(0));
+
+        // On a clip, through the source-audio cache: a different set of regions is a different result.
+        std::vector<float> mono(size_t(sr) * 3);
+        for (size_t i = 0; i < mono.size(); ++i) {
+            const double t = double(i) / sr;
+            mono[i] = float(0.2 * std::sin(2 * M_PI * 440 * t) + (t >= 1.0 && t < 1.5 ? 0.3 * std::sin(2 * M_PI * 3000 * t) : 0));
+        }
+        QVERIFY(writeMonoWav(path("whistle.wav"), mono, sr));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = Rational{25, 1};
+        MediaItem m = probeOrFail(p, path("whistle.wav"));
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Clip& clip = s.audioTracks[0].clips.at(0);
+        // Trimmed: starting half a second into the file, at 2 s on the timeline.
+        clip.sourceIn = 12.5;
+        clip.start = 50;
+        clip.duration = 50;
+        QCOMPARE(clipSourceSeconds(s, clip, 2.5), 1.0);
+        QVERIFY(!spectralRepairEffect(p, clip, false));
+        clip.effects.push_back(makeEffect(p, "volume"));
+        Effect* fx = spectralRepairEffect(p, clip, true);
+        QVERIFY(fx && clip.effects.front().type == "spectral_repair" && isSourceAudioEffect("spectral_repair"));
+        fx->strings["regions"] = spectralRegionsToString({SpectralRegion{0.95, 1.55, 2700, 3300, "heal", 0, -1}});
+        AudioBufferPtr source = decodeAudio(path("whistle.wav"), sr, nullptr);
+        QVERIFY(source);
+        AudioBufferPtr fixed = cleanedAudio(path("whistle.wav"), source, {fx}, true);
+        QVERIFY(fixed && fixed != source);
+        QVERIFY(toneLevel(fixed->samples, 0, 3000, a, b) < toneLevel(source->samples, 0, 3000, a, b) * 0.03);
+        fx->strings["regions"] = spectralRegionsToString({SpectralRegion{0.95, 1.55, 2700, 3300, "attenuate", -6, -1}});
+        AudioBufferPtr softer = cleanedAudio(path("whistle.wav"), source, {fx}, true);
+        const double six = db(toneLevel(softer->samples, 0, 3000, a, b), toneLevel(source->samples, 0, 3000, a, b));
+        QVERIFY2(six < -5 && six > -7, qPrintable(QString::number(six)));
+        clip.effects.erase(clip.effects.begin());
+
+        // Over MCP: found by itself in the stretch given in timeline seconds, healed, kept in source seconds.
+        const QString project = QString::fromStdString(path("spectral.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_spectral_repair"}, {"arguments", args}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        const double clipId = double(clip.id);
+        QJsonObject r = call({{"project", project}, {"clip", clipId}, {"find_only", true},
+                              {"regions", QJsonArray{QJsonObject{{"start", 2.5}, {"end", 3.0}}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject band = r.value("structuredContent").toObject().value("found").toArray().at(0).toObject().value("bands").toArray().at(0).toObject();
+        QVERIFY2(band.value("low_hz").toDouble() < 3000 && band.value("high_hz").toDouble() > 3000, QJsonDocument(band).toJson().constData());
+        Project unchanged;
+        QVERIFY(loadProject(project.toStdString(), unchanged));
+        QVERIFY(spectralRegionsOf(unchanged.active()->audioTracks[0].clips.at(0)).empty());
+        r = call({{"project", project}, {"clip", clipId}, {"regions", QJsonArray{QJsonObject{{"start", 2.45}, {"end", 3.05}}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        Project healedProject;
+        QVERIFY(loadProject(project.toStdString(), healedProject));
+        const std::vector<SpectralRegion> kept = spectralRegionsOf(healedProject.active()->audioTracks[0].clips.at(0));
+        QCOMPARE(kept.size(), size_t(1));
+        QVERIFY2(std::fabs(kept[0].start - 0.95) < 1e-6 && std::fabs(kept[0].end - 1.55) < 1e-6 && kept[0].low < 3000 && kept[0].high > 3000 &&
+                     kept[0].mode == "heal",
+                 qPrintable(QString::fromStdString(spectralRegionsToString(kept))));
+        r = call({{"project", project}, {"clip", clipId}, {"regions", QJsonArray{QJsonObject{{"start", 2.2}, {"end", 2.4}, {"low_hz", 100}, {"high_hz", 200},
+                                                                                             {"mode", "attenuate"}, {"gain_db", -12}, {"channel", "left"}}}}});
+        QVERIFY(!r.value("isError").toBool() && r.value("structuredContent").toObject().value("total").toInt() == 2);
+        QVERIFY(call({{"project", project}, {"clip", clipId}, {"regions", QJsonArray{QJsonObject{{"start", 9}, {"end", 10}}}}}).value("isError").toBool());
+        QVERIFY(call({{"project", project}, {"clip", clipId}, {"regions", QJsonArray{QJsonObject{{"start", 3.6}, {"end", 3.9}}}}}).value("isError").toBool());
+        r = call({{"project", project}, {"clip", clipId}, {"clear", true}});
+        QVERIFY(!r.value("isError").toBool());
+        Project cleared;
+        QVERIFY(loadProject(project.toStdString(), cleared));
+        for (const Effect& e : cleared.active()->audioTracks[0].clips.at(0).effects) QVERIFY(e.type != "spectral_repair");
     }
 
     void extendClipPastItsEnd() {

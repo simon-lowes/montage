@@ -67,6 +67,7 @@
 #include "render/Ofx.h"
 #include "Assistant.h"
 #include "AssistantPanel.h"
+#include "SpectralRepairDialog.h"
 #include "media/SpeechSearch.h"
 #include "media/TextReader.h"
 #include "core/OnScreenText.h"
@@ -3450,6 +3451,73 @@ private slots:
         QVERIFY(c->motion.p("scale", 0) > 140);
         state()->undo();
         QCOMPARE(edit::clipById(*state()->sequence(), clip)->motion.p("crop_top", 0), 0.0);
+        state()->newProject();
+    }
+
+    void spectralRepairFromTheClipMenu() {
+        // Three seconds of a 440 Hz voice with a 3 kHz whistle from 1.0 to 1.5 s.
+        const int rate = 48000;
+        std::vector<float> x(size_t(rate) * 3);
+        for (size_t i = 0; i < x.size(); ++i) {
+            const double t = double(i) / rate;
+            x[i] = float(0.2 * std::sin(2 * M_PI * 440 * t) + (t >= 1.0 && t < 1.5 ? 0.3 * std::sin(2 * M_PI * 3000 * t) : 0));
+        }
+        WavWriter w;
+        QVERIFY(w.open(dir_.path() + "/whistle.wav", rate, 1));
+        w.write(x.data(), int64_t(x.size()));
+        QVERIFY(w.close());
+        state()->newProject();
+        QVERIFY(win_->findChild<QAction*>("spectralRepair"));
+        QVERIFY(!win_->spectralRepairDialog());  // nothing to repair
+        const auto ids = state()->importFiles({dir_.path() + "/whistle.wav"});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) { return edit::placeMedia(p, s, media, 0, 0, -1, V1, A1, false).ok; }));
+        const Id clip = trackAt(*state()->sequence(), A1)->clips.at(0).id;
+        state()->setSelection({clip}, false);
+        SpectralRepairDialog* dlg = win_->spectralRepairDialog();
+        QVERIFY(dlg && dlg->isVisible());
+        // The spectrogram: the whistle bright at 3 kHz in its half second, dark there before it.
+        auto level = [&](double t, double hz) {
+            const QImage& im = dlg->view()->picture();
+            const double minHz = dlg->view()->minHz();
+            const int px = std::clamp(int(t / 3.0 * im.width()), 0, im.width() - 1);
+            const int py = std::clamp(int(std::lround((im.height() - 1) * (1 - std::log(hz / minHz) / std::log(24000 / minHz)))), 0, im.height() - 1);
+            return qGray(im.pixel(px, py));
+        };
+        const int whistle = level(1.25, 3000), before = level(0.5, 3000);
+        QVERIFY2(whistle > before + 80, qPrintable(QString("%1 %2").arg(whistle).arg(before)));
+        // A box across its moment, fitted to its frequencies, then healed: one undo step on the clip.
+        QVERIFY(!dlg->heal());  // nothing chosen yet
+        dlg->setSelection(1.0, 1.5, 0, 0);
+        QVERIFY(dlg->status().contains("all frequencies"));
+        QVERIFY(dlg->findFrequencies());
+        QVERIFY2(dlg->view()->selectionLow() < 3000 && dlg->view()->selectionHigh() > 3000 && dlg->view()->selectionHigh() - dlg->view()->selectionLow() < 400,
+                 qPrintable(dlg->status()));
+        QVERIFY(dlg->heal());
+        QCOMPARE(state()->undoText(), QString("Spectral Heal"));
+        const Clip* c = edit::clipById(*state()->sequence(), clip);
+        QVERIFY(c && c->effects.front().type == "spectral_repair");
+        QCOMPARE(dlg->regions().size(), size_t(1));
+        QVERIFY2(level(1.25, 3000) < whistle - 80, qPrintable(QString::number(level(1.25, 3000))));  // the picture shows it gone
+        QVERIFY(std::abs(level(1.25, 440) - level(0.5, 440)) < 30);  // the voice still there
+        // Undo and redo show in the editor.
+        state()->undo();
+        QVERIFY(dlg->regions().empty() && level(1.25, 3000) > whistle - 20);
+        state()->redo();
+        QCOMPARE(dlg->regions().size(), size_t(1));
+        // Attenuate the whole of a stretch, then take it back; Clear All removes the effect.
+        dlg->setSelection(2.0, 2.2, 0, 0);
+        dlg->setAllFrequencies(true);
+        QVERIFY(dlg->attenuate(-12));
+        QCOMPARE(dlg->regions().size(), size_t(2));
+        QVERIFY(dlg->regions()[1].mode == "attenuate" && dlg->regions()[1].gainDb == -12 && dlg->regions()[1].high == 0);
+        QVERIFY(dlg->removeLast());
+        QCOMPARE(dlg->regions().size(), size_t(1));
+        QVERIFY(dlg->clearAll());
+        c = edit::clipById(*state()->sequence(), clip);
+        QVERIFY(std::none_of(c->effects.begin(), c->effects.end(), [](const Effect& e) { return e.type == "spectral_repair"; }));
+        dlg->close();
         state()->newProject();
     }
 
