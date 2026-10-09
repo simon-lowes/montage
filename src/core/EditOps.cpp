@@ -912,6 +912,21 @@ Result setSpeed(Project& p, Sequence& s, Id clipId, double speed, bool ripple, b
     return {};
 }
 
+bool setMaintainPitch(Project& p, Sequence& s, Id clipId, bool on) {
+    if (!clipById(s, clipId)) return false;
+    bool changed = false;
+    for (Id id : linkedClips(s, clipId)) {
+        Clip* c = clipById(s, id);
+        if (!c || c->isGenerator()) continue;
+        if (c->timing.empty()) c->timing = makeEffect(p, "time");
+        const double v = on ? 1.0 : 0.0;
+        if (c->timing.p("maintain_pitch", 0) == v) continue;
+        c->timing.params["maintain_pitch"] = Param(v);
+        changed = true;
+    }
+    return changed;
+}
+
 Result closeGap(Project& p, Sequence& s, TrackRef r, FrameTime frame) {
     (void)p;
     Track* t = trackAt(s, r);

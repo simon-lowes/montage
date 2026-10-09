@@ -688,15 +688,17 @@ void McpServer::Impl::addTools() {
         "quick, slow, quick), hero (speeds up, lingers on the middle, speeds away), bullet (fast, almost stopped through "
         "the middle, fast), jump_cut (a burst of speed in the middle), flash_in, flash_out, slow_in (eases into slow "
         "motion), fast_out (out of it); none removes the ramp. For smooth slow parts set frames on montage_set_speed "
-        "(optical_flow or ai).",
+        "(optical_flow or ai); maintain_pitch keeps the sound at its pitch through the ramp.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
-            "preset":{"type":"string","enum":["montage","hero","bullet","jump_cut","flash_in","flash_out","slow_in","fast_out","none"]}},
+            "preset":{"type":"string","enum":["montage","hero","bullet","jump_cut","flash_in","flash_out","slow_in","fast_out","none"]},
+            "maintain_pitch":{"type":"boolean"}},
             "required":["project","clip","preset"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
             const Clip& c = clipArg(l, a);
             const QString preset = need(a, "preset");
             check(edit::applySpeedRamp(l.project, l.seq(), c.id, preset.toStdString()));
+            if (a.contains("maintain_pitch")) edit::setMaintainPitch(l.project, l.seq(), c.id, a.value("maintain_pitch").toBool());
             save(l);
             const Clip* after = edit::clipById(l.seq(), c.id);
             QJsonArray speeds;
@@ -709,9 +711,10 @@ void McpServer::Impl::addTools() {
     add("montage_set_speed", "Set clip speed",
         "Change a clip's playback speed (1 = normal, 0.5 = half speed, 2 = double; negative plays backwards). "
         "Its length changes to match, and later clips ripple. frames picks how slow motion makes the frames between "
-        "source frames: nearest (repeat), blend, optical_flow, or ai (RIFE, needs its model).",
+        "source frames: nearest (repeat), blend, optical_flow, or ai (RIFE, needs its model). maintain_pitch keeps the "
+        "sound (the clip's and its linked sound's) at its pitch instead of rising or falling with the speed.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},"speed":{"type":"number"},
-            "frames":{"type":"string","enum":["nearest","blend","optical_flow","ai"]}},
+            "frames":{"type":"string","enum":["nearest","blend","optical_flow","ai"]},"maintain_pitch":{"type":"boolean"}},
             "required":["project","clip","speed"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
@@ -727,6 +730,7 @@ void McpServer::Impl::addTools() {
                     return fail("AI frames need the RIFE model: run `scripts/fetch-models.sh` or choose them once in the app");
             }
             check(edit::setSpeed(l.project, l.seq(), id, std::fabs(sp), true, sp < 0));
+            if (a.contains("maintain_pitch")) edit::setMaintainPitch(l.project, l.seq(), id, a.value("maintain_pitch").toBool());
             if (sampling >= 0)
                 if (Clip* c = edit::clipById(l.seq(), id)) {
                     if (c->timing.empty()) c->timing = makeEffect(l.project, "time");

@@ -37,6 +37,7 @@
 #include "core/Transcript.h"
 #include "core/TranscriptEdit.h"
 #include "audio/SpeechCleanup.h"
+#include "audio/TimeStretch.h"
 #include "media/Analysis.h"
 #include "media/AudioSync.h"
 #include "media/AutoDuck.h"
@@ -1204,6 +1205,144 @@ private slots:
         mixer.mix(p, s, 24000, 9600, out.data());
         QVERIFY2(toneLevel(out, 0, 880, 0) > 10 * toneLevel(out, 0, 440, 0),
                  qPrintable(QString("%1 %2").arg(toneLevel(out, 0, 880, 0)).arg(toneLevel(out, 0, 440, 0))));
+    }
+
+    void maintainPitchOnSpeedChanges() {
+        constexpr int sr = 48000;
+        // A 200 Hz tone with harmonics, two seconds.
+        AudioBuffer in;
+        in.sampleRate = sr;
+        in.samples.resize(size_t(sr) * 2 * 2);
+        for (size_t i = 0; i < in.samples.size() / 2; ++i) {
+            double v = 0;
+            for (int k = 1; k <= 6; ++k) v += 0.15 / k * std::sin(2 * M_PI * 200 * k * double(i) / sr);
+            in.samples[i * 2] = in.samples[i * 2 + 1] = float(v);
+        }
+        auto rms = [](const AudioBuffer& b, size_t from, size_t to) {
+            double sum = 0;
+            for (size_t i = from; i < to; ++i) sum += double(b.samples[i * 2]) * b.samples[i * 2];
+            return std::sqrt(sum / double(to - from));
+        };
+        const int hop = stretchHop(sr);
+        auto along = [&](double speed, int64_t frames) {
+            std::vector<double> pos;
+            for (int64_t k = 0; k <= frames / hop + 2; ++k) pos.push_back(double(k * hop) * speed);
+            return pos;
+        };
+        // Twice as fast and half as fast: half and twice the length, the same pitch and level.
+        for (double speed : {2.0, 0.5, 1.37}) {
+            const int64_t frames = int64_t(std::llround(double(in.frames()) / speed));
+            AudioBuffer out;
+            wsolaStretch(in, along(speed, frames), hop, frames, out);
+            QCOMPARE(out.frames(), frames);
+            const size_t mid = size_t(frames / 2);
+            const double f = pitchOf(out.samples, mid - 4800, mid + 4800);
+            qInfo("speed %.2f: %.2f Hz", speed, f);
+            QVERIFY2(std::fabs(f / 200 - 1) < 0.01, qPrintable(QString("%1 Hz at %2x").arg(f).arg(speed)));
+            const double change = 20 * std::log10(rms(out, mid - 9600, mid + 9600) / rms(in, size_t(sr) / 2, size_t(sr) * 3 / 2));
+            QVERIFY2(std::fabs(change) < 1.5, qPrintable(QString("%1 dB at %2x").arg(change).arg(speed)));
+            // No clicks where grains join: the waveform never jumps further between samples than the tone does.
+            auto steepest = [](const AudioBuffer& b, size_t from, size_t to) {
+                double most = 0;
+                for (size_t i = from + 1; i < to; ++i) most = std::max(most, double(std::fabs(b.samples[i * 2] - b.samples[(i - 1) * 2])));
+                return most;
+            };
+            const double jump = steepest(out, 4800, size_t(frames) - 4800), tone = steepest(in, 4800, size_t(in.frames()) - 4800);
+            QVERIFY2(jump < 1.25 * tone, qPrintable(QString("%1 against %2 at %3x").arg(jump).arg(tone).arg(speed)));
+        }
+        // At normal speed it is the sound itself.
+        AudioBuffer same;
+        wsolaStretch(in, along(1.0, in.frames()), hop, in.frames(), same);
+        double worst = 0;
+        for (size_t i = 0; i < in.samples.size(); ++i) worst = std::max(worst, double(std::fabs(same.samples[i] - in.samples[i])));
+        QVERIFY2(worst < 1e-5, qPrintable(QString::number(worst)));
+        // Timing follows the map: a note half a second in starts a quarter of a second in at double speed.
+        AudioBuffer burst;
+        burst.sampleRate = sr;
+        burst.samples.assign(size_t(sr) * 2 * 2, 0.0f);
+        for (size_t i = size_t(sr) / 2; i < size_t(sr) * 3 / 2; ++i) burst.samples[i * 2] = burst.samples[i * 2 + 1] = float(0.3 * std::sin(2 * M_PI * 330 * double(i) / sr));
+        AudioBuffer fast;
+        wsolaStretch(burst, along(2.0, sr), hop, sr, fast);
+        size_t onset = 0;
+        for (size_t i = 0; i < size_t(fast.frames()); ++i)
+            if (std::fabs(fast.samples[i * 2]) > 0.15) {
+                onset = i;
+                break;
+            }
+        const double ms = (double(onset) - sr / 4.0) * 1000 / sr;
+        QVERIFY2(std::fabs(ms) < 15, qPrintable(QString("%1 ms").arg(ms)));
+
+        // Through the mixer: a 440 Hz clip at double speed rises an octave, unless its pitch is kept.
+        const std::string wav = path("keep-pitch.wav");
+        std::vector<float> mono(size_t(sr) * 4);
+        for (size_t i = 0; i < mono.size(); ++i) mono[i] = float(0.3 * std::sin(2 * M_PI * 440 * double(i) / sr));
+        QVERIFY(writeMonoWav(wav, mono, sr));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        MediaItem m = probeOrFail(p, wav);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Id clip = s.audioTracks[0].clips.front().id;
+        QVERIFY(edit::setSpeed(p, s, clip, 2.0, true).ok);
+        AudioMixer mixer;
+        std::vector<float> out(9600 * 2);
+        mixer.mix(p, s, 24000, 9600, out.data());
+        QVERIFY(toneLevel(out, 0, 880, 0) > 10 * toneLevel(out, 0, 440, 0));
+        QVERIFY(edit::setMaintainPitch(p, s, clip, true));
+        QVERIFY(!edit::setMaintainPitch(p, s, clip, true));
+        mixer.mix(p, s, 24000, 9600, out.data());
+        QVERIFY2(toneLevel(out, 0, 440, 0) > 10 * toneLevel(out, 0, 880, 0),
+                 qPrintable(QString("%1 %2").arg(toneLevel(out, 0, 440, 0)).arg(toneLevel(out, 0, 880, 0))));
+        // Under a speed ramp too: 440 Hz all the way through.
+        QVERIFY(edit::setSpeed(p, s, clip, 1.0, true).ok);
+        QVERIFY(edit::applySpeedRamp(p, s, clip, "hero").ok);
+        QVERIFY(edit::clipById(s, clip)->ramped());
+        const Clip& ramped = *edit::clipById(s, clip);
+        const int64_t total = int64_t(std::llround(double(ramped.duration) * sr / s.fpsValue()));
+        std::vector<float> whole(size_t(total) * 2);
+        mixer.mix(p, s, 0, total, whole.data());
+        for (int k = 1; k <= 4; ++k) {
+            const size_t at = size_t(total * k / 5);
+            const double f = pitchOf(whole, at - 2400, at + 2400);
+            QVERIFY2(std::fabs(f / 440 - 1) < 0.02, qPrintable(QString("%1 Hz at %2/5").arg(f).arg(k)));
+        }
+
+        // Over MCP: on the clip and its linked sound.
+        p.media.clear();
+        Project q = makeDefaultProject();
+        MediaItem qm = probeOrFail(q, wav);
+        q.media.push_back(qm);
+        QVERIFY(edit::placeMedia(q, *q.active(), qm.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const QString project = QString::fromStdString(path("keep-pitch.montage"));
+        QVERIFY(saveProject(q, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        const double qclip = double(q.active()->audioTracks[0].clips.front().id);
+        QJsonObject r = call("montage_set_speed", {{"project", project}, {"clip", qclip}, {"speed", 1.5}, {"maintain_pitch", true}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        {
+            Project back;
+            QVERIFY(loadProject(project.toStdString(), back));
+            const Clip& a = back.active()->audioTracks[0].clips.front();
+            QCOMPARE(a.speed, 1.5);
+            QVERIFY(a.timing.p("maintain_pitch", 0) > 0.5);
+            for (Id other : edit::linkedClips(*back.active(), a.id))
+                QVERIFY(edit::clipById(*back.active(), other)->timing.p("maintain_pitch", 0) > 0.5);
+        }
+        r = call("montage_speed_ramp", {{"project", project}, {"clip", qclip}, {"preset", "bullet"}, {"maintain_pitch", false}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        {
+            Project back;
+            QVERIFY(loadProject(project.toStdString(), back));
+            QVERIFY(back.active()->audioTracks[0].clips.front().timing.p("maintain_pitch", 1) < 0.5);
+        }
     }
 
     void liveLoudness() {

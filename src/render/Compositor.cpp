@@ -24,6 +24,8 @@
 #include "VideoDenoise.h"
 #include "audio/PluginEffect.h"
 #include "audio/SpeechCleanup.h"
+#include "audio/TimeStretch.h"
+#include "core/ProjectIO.h"
 #include "core/Bleep.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
@@ -1710,6 +1712,25 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
                 if (AudioBufferPtr clean = cleanedAudio(m->path, buf, sourceFx, !nonBlocking_)) buf = clean;
             const int64_t n = buf->frames();
             const float* src = buf->samples.data();
+            // Maintain Audio Pitch: the clip's sound stretched along its time map (WSOLA), read sample for sample;
+            // while that is being made for playback, the resampled sound plays.
+            AudioBufferPtr stretched;
+            if (!c.reverse && c.timing.p("maintain_pitch", 0) > 0.5 && (ramped || std::fabs(c.speed - 1) > 1e-9)) {
+                const int hop = stretchHop(int(sr));
+                // Named by the sound (cleaned or not) and everything the time map depends on.
+                char head[160];
+                std::snprintf(head, sizeof head, "|%g|%p|%lld|%.9g|%.9g|", double(sr), static_cast<const void*>(buf.get()), (long long)n,
+                              double(c.sourceIn), c.speed);
+                const std::string key = m->path + head + (ramped ? effectToJsonString(c.timing) : std::string());
+                stretched = stretchedAudio(key, buf, [&] {
+                    std::vector<double> positions;
+                    for (int64_t j = 0; j <= (ce - cs) / hop + 2; ++j) {
+                        const double local = double(j * hop);
+                        positions.push_back(ramped ? (c.sourceIn + c.sourceOffset(local * fps / sr)) * sr / fps : srcBase + local * c.speed);
+                    }
+                    return positions;
+                }, hop, ce - cs, !nonBlocking_);
+            }
             // Bleeps: stretches of source (as samples) covered by a tone or silence, with 5 ms ramps.
             std::vector<std::pair<double, double>> bleeps;
             bool bleepTone = true;
@@ -1728,11 +1749,18 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
                              : ramped  ? (c.sourceIn + c.sourceOffset(double(s - cs) * fps / sr)) * sr / fps
                                        : srcBase + double(s - cs) * c.speed;
                 if (pos < 0 || pos >= double(n - 1)) continue;
-                int64_t i = int64_t(pos);
-                float f = float(pos - double(i));
                 float* d = &clipBuf[size_t(s - rs) * 2];
-                d[0] = src[i * 2] + (src[i * 2 + 2] - src[i * 2]) * f;
-                d[1] = src[i * 2 + 1] + (src[i * 2 + 3] - src[i * 2 + 1]) * f;
+                if (stretched) {
+                    const int64_t j = s - cs;
+                    if (j < 0 || j >= stretched->frames()) continue;
+                    d[0] = stretched->samples[size_t(j) * 2];
+                    d[1] = stretched->samples[size_t(j) * 2 + 1];
+                } else {
+                    int64_t i = int64_t(pos);
+                    float f = float(pos - double(i));
+                    d[0] = src[i * 2] + (src[i * 2 + 2] - src[i * 2]) * f;
+                    d[1] = src[i * 2 + 1] + (src[i * 2 + 3] - src[i * 2 + 1]) * f;
+                }
                 if (!bleeps.empty()) {
                     double g = 0;
                     for (const auto& [a, b] : bleeps)

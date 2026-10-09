@@ -2150,6 +2150,49 @@ private slots:
         state()->newProject();
     }
 
+    void speedWithMaintainedPitch() {
+        state()->newProject();
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        QVERIFY(state()->apply("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        }));
+        const Id id = state()->sequence()->audioTracks[0].clips.at(0).id;
+        const FrameTime length = state()->sequence()->audioTracks[0].clips.at(0).duration;
+        state()->setSelection({id}, false);
+        // Speed / Duration at 150 % keeping the pitch: one undo step.
+        QVERIFY(win_->setSelectionSpeed(1.5, true));
+        const Clip* c = edit::clipById(*state()->sequence(), id);
+        QCOMPARE(c->speed, 1.5);
+        QVERIFY(c->duration < length);
+        QVERIFY(c->timing.p("maintain_pitch", 0) > 0.5);
+        // The Inspector's Time Remapping shows it.
+        auto* inspector = win_->findChild<InspectorWidget*>();
+        QApplication::processEvents();
+        bool shown = false;
+        for (QCheckBox* b : inspector->widget()->findChildren<QCheckBox*>()) shown = shown || b->text().contains("Maintain Audio Pitch");
+        for (QLabel* l : inspector->widget()->findChildren<QLabel*>()) shown = shown || l->text().contains("Maintain Audio Pitch");
+        QVERIFY(shown);
+        // Only the pitch changing is still an edit; the same again is not.
+        QVERIFY(win_->setSelectionSpeed(1.5, false));
+        QVERIFY(edit::clipById(*state()->sequence(), id)->timing.p("maintain_pitch", 0) < 0.5);
+        QVERIFY(!win_->setSelectionSpeed(1.5, false));
+        state()->undo();
+        QVERIFY(edit::clipById(*state()->sequence(), id)->timing.p("maintain_pitch", 0) > 0.5);
+        state()->undo();
+        QCOMPARE(edit::clipById(*state()->sequence(), id)->speed, 1.0);
+        QVERIFY(edit::clipById(*state()->sequence(), id)->timing.p("maintain_pitch", 0) < 0.5);
+        // It plays: the mix at 150 % kept pitch is made without waiting in exports and is sound, not silence.
+        QVERIFY(win_->setSelectionSpeed(1.5, true));
+        AudioMixer mixer;
+        std::vector<float> out(48000 * 2);
+        mixer.mix(state()->project(), *state()->sequence(), 48000, 48000, out.data());
+        double energy = 0;
+        for (float v : out) energy += double(v) * v;
+        QVERIFY(energy > 1);
+        state()->newProject();
+    }
+
     void gapsCutCopyPasteAndClearSolo() {
         loadDemo();
         const Clip* red = clipNamed(*state()->sequence(), "Red");

@@ -1760,23 +1760,44 @@ void MainWindow::addDefaultTransition(bool audio) {
 void MainWindow::speedDialog() {
     const Clip* c = state_->primaryClip();
     if (!c) return;
-    bool ok = false;
-    double pct = QInputDialog::getDouble(this, tr("Speed / Duration"), tr("Speed (%):"), c->speed * 100, 1, 10000, 1, &ok);
-    if (!ok) return;
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Speed / Duration"));
+    auto* form = new QFormLayout(&dlg);
+    auto* speed = new QDoubleSpinBox(&dlg);
+    speed->setRange(1, 10000);
+    speed->setDecimals(1);
+    speed->setSuffix(QStringLiteral(" %"));
+    speed->setValue(c->speed * 100);
+    form->addRow(tr("Speed:"), speed);
+    auto* pitch = new QCheckBox(tr("Maintain Audio Pitch"), &dlg);
+    pitch->setToolTip(tr("Sound played faster or slower keeps its pitch instead of rising or falling"));
+    pitch->setChecked(c->timing.p("maintain_pitch", 0) > 0.5);
+    form->addRow(QString(), pitch);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    form->addRow(buttons);
+    if (dlg.exec() == QDialog::Accepted) setSelectionSpeed(speed->value() / 100.0, pitch->isChecked());
+}
+
+bool MainWindow::setSelectionSpeed(double sp, bool maintainPitch) {
     auto sel = state_->selectedClips();
-    double sp = pct / 100.0;
-    state_->apply(tr("Speed / Duration"), [sel, sp](Project& p, Sequence& s) {
+    if (sel.empty()) return false;
+    return state_->apply(tr("Speed / Duration"), [sel, sp, maintainPitch](Project& p, Sequence& s) {
         // One call per link group: setSpeed changes linked partners itself and ripples once.
-        edit::Result last;
+        bool changed = false;
         std::set<Id> done;
         for (Id id : sel) {
             const Clip* cc = edit::clipById(s, id);
             if (!cc || done.count(id)) continue;
             for (Id l : edit::linkedClips(s, id)) done.insert(l);
-            last = edit::setSpeed(p, s, id, sp, true, cc->reverse);
-            if (!last.ok) return last;
+            changed = edit::setMaintainPitch(p, s, id, maintainPitch) || changed;
+            if (std::fabs(cc->speed - sp) < 1e-9) continue;
+            const edit::Result r = edit::setSpeed(p, s, id, sp, true, cc->reverse);
+            if (!r.ok) return r;
+            changed = true;
         }
-        return last;
+        return changed ? edit::Result{} : edit::Result::fail({});  // the same again is no edit
     });
 }
 

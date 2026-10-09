@@ -177,6 +177,8 @@ public:
     bool applyWorkspace(const QString& name);
     bool saveWorkspace(const QString& name);    // false for an empty name, a built-in's or one with a slash
     bool deleteWorkspace(const QString& name);  // saved ones only
+    // Speed / Duration on the selected clips (each link group once), with Maintain Audio Pitch; one undo step.
+    bool setSelectionSpeed(double speed, bool maintainPitch);
 
 protected:
     void closeEvent(QCloseEvent* e) override;

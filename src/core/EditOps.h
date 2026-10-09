@@ -112,6 +112,9 @@ Result slip(Project& p, Sequence& s, Id clipId, FrameTime delta);
 Result slide(Project& p, Sequence& s, Id clipId, FrameTime delta);
 Result setSpeed(Project& p, Sequence& s, Id clipId, double speed, bool ripple, bool reverse = false,
                 bool includeLinked = true);
+// Maintain Audio Pitch on a clip and the clips linked to it (its sound): sped-up or slowed sound keeps its pitch.
+// False if nothing changed (or no such clip).
+bool setMaintainPitch(Project& p, Sequence& s, Id clipId, bool on);
 Result closeGap(Project& p, Sequence& s, TrackRef t, FrameTime frame);
 // Pasting a copied gap (Resolve 21.1): `length` frames of empty space opened at `at` on the track, splitting a
 // clip there and pushing what follows (and the same on sync-locked tracks), as an insert edit does.

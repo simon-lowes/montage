@@ -97,6 +97,7 @@ add_library(montage_engine STATIC
   audio/PluginEffect.h audio/PluginEffect.cpp
   audio/SpeechCleanup.h audio/SpeechCleanup.cpp
   audio/AudioRepair.h audio/AudioRepair.cpp
+  audio/TimeStretch.h audio/TimeStretch.cpp
 )
 target_include_directories(montage_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(montage_engine PRIVATE ${PROJECT_SOURCE_DIR}/third_party/clap/include)
