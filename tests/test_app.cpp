@@ -2851,6 +2851,42 @@ private slots:
         state()->newProject();
     }
 
+    void captionsPanelFileFormats() {
+        // Each format the Captions panel writes, read back as a new track with the same captions.
+        auto* panel = win_->findChild<CaptionsPanel*>();
+        QVERIFY(panel);
+        state()->newProject();
+        Id track = 0;
+        QVERIFY(state()->edit("Captions", [&](Project& p, Sequence& s) {
+            CaptionTrack t;
+            t.id = track = p.newId();
+            t.captions = {{30, 90, "Bonjour \xC3\xA0 tous", {}}, {120, 180, "Second\nline", {}}};
+            s.captionTracks.push_back(t);
+            return true;
+        }));
+        panel->setCurrentTrack(track);
+        const auto source = state()->sequence()->captionTracks.front().captions;
+        for (const char* ext : {"srt", "vtt", "scc", "ttml", "stl", "ass"}) {
+            const QString file = dir_.path() + "/panel-captions." + ext;
+            QString error;
+            QVERIFY2(panel->exportFile(file, &error), qPrintable(error));
+            const size_t before = state()->sequence()->captionTracks.size();
+            QVERIFY2(panel->importFile(file, &error), qPrintable(QString("%1: %2").arg(ext, error)));
+            const auto& tracks = state()->sequence()->captionTracks;
+            QCOMPARE(tracks.size(), before + 1);
+            const auto& got = tracks.back().captions;
+            QCOMPARE(got.size(), source.size());
+            for (size_t i = 0; i < got.size(); ++i) {
+                QVERIFY2(got[i].text == source[i].text, qPrintable(QString("%1: %2").arg(ext, QString::fromStdString(got[i].text))));
+                // SCC runs at 29.97, so its times may land a frame off at other rates.
+                QVERIFY2(std::abs(got[i].start - source[i].start) <= (std::string(ext) == "scc" ? 1 : 0), ext);
+                QVERIFY2(std::abs(got[i].end - source[i].end) <= (std::string(ext) == "scc" ? 1 : 0), ext);
+            }
+            panel->setCurrentTrack(track);
+        }
+        state()->newProject();
+    }
+
     void dubCaptionTrack() {
         auto* panel = win_->findChild<CaptionsPanel*>();
         QVERIFY(panel);

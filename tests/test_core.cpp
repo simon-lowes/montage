@@ -230,8 +230,8 @@ private slots:
         QVERIFY(scc.rfind("Scenarist_SCC V1.0\n", 0) == 0);
         // "HI" is the only row: preamble 9470 (row 15), tab offset to column 15, then 'H' (c8) 'I' (49).
         QVERIFY2(scc.find("9420 9420 94ae 94ae 9476 9476 9723 9723 c849 942f 942f") != std::string::npos, scc.c_str());
-        // Caption 1 shows at frame 30: 11 pairs loaded from frame 20; cleared at 90.
-        QVERIFY2(scc.find("\n00:00:00;20\t9420") != std::string::npos, scc.c_str());
+        // Caption 1 shows at frame 30 (its first end-of-caption code): 11 pairs loaded from frame 21; cleared at 90.
+        QVERIFY2(scc.find("\n00:00:00;21\t9420") != std::string::npos, scc.c_str());
         QVERIFY2(scc.find("\n00:00:03;00\t942c 942c") != std::string::npos, scc.c_str());
         // Explicit lines go on rows 14 and 15: "Two" at column 14, "lines" at column 13.
         QVERIFY2(scc.find("94d6 94d6 97a2 97a2") != std::string::npos, scc.c_str());
@@ -252,6 +252,140 @@ private slots:
         Project q;
         QVERIFY(projectFromJson(projectToJson(p), q));
         QCOMPARE(q.active()->captionTracks, p.active()->captionTracks);
+    }
+
+    void captionFormats() {
+        const Rational fps{25, 1};
+        const std::vector<Caption> caps = {{25, 75, "Caf\xC3\xA9 & <na\xC3\xAFve>\nsecond line"}, {100, 150, "\xE2\x99\xAA Pi\xC3\xB1" "a colada \xC2\xBD"}};
+        std::vector<Caption> back;
+        std::string err;
+        auto same = [](const std::vector<Caption>& a, const std::vector<Caption>& b) {
+            if (a.size() != b.size()) return false;
+            for (size_t i = 0; i < a.size(); ++i)
+                if (a[i].start != b[i].start || a[i].end != b[i].end || a[i].text != b[i].text) return false;
+            return true;
+        };
+
+        // TTML (IMSC 1.1): escaped text, lines as <br/>, the style's colours; and back.
+        CaptionStyle style;
+        style.textR = 1, style.textG = 1, style.textB = 0;
+        const std::string ttml = captionsToTtml(caps, fps, "fr", style);
+        QVERIFY(ttml.find("ttp:profile=\"http://www.w3.org/ns/ttml/profile/imsc1.1/text\"") != std::string::npos);
+        QVERIFY(ttml.find("xml:lang=\"fr\"") != std::string::npos);
+        QVERIFY(ttml.find("tts:color=\"#ffff00\"") != std::string::npos);
+        QVERIFY2(ttml.find("begin=\"00:00:01.000\" end=\"00:00:03.000\"><span style=\"caption\">Caf\xC3\xA9 &amp; &lt;na\xC3\xAFve&gt;<br/>second line</span>") !=
+                     std::string::npos,
+                 ttml.c_str());
+        QVERIFY(parseSubtitles(ttml, fps, back, &err));
+        QVERIFY(same(back, caps));
+        // Others' TTML: frames at 24 fps, offsets, times nested in a div, a duration, ticks, spans.
+        const std::string theirs =
+            "<?xml version=\"1.0\"?>\n<tt xmlns=\"http://www.w3.org/ns/ttml\" xmlns:ttp=\"http://www.w3.org/ns/ttml#parameter\" "
+            "ttp:frameRate=\"24\" ttp:tickRate=\"10000000\">\n<body><div>\n"
+            "  <p begin=\"00:00:01:12\" end=\"00:00:02:00\">Half\n    a second</p>\n"
+            "  <p begin=\"2.5s\" end=\"3000ms\"><span>One</span><br/><span tts:color=\"red\">two</span></p>\n"
+            "  <p begin=\"40000000t\" dur=\"1s\">Ticks</p>\n"
+            "</div><div begin=\"10s\"><p begin=\"1s\" end=\"2s\">Nested</p><p begin=\"3s\">No end</p></div></body></tt>\n";
+        QVERIFY(parseSubtitles(theirs, fps, back, &err));
+        QCOMPARE(back.size(), size_t(4));
+        QCOMPARE(back[0].start, FrameTime(38));  // 1.5 s
+        QCOMPARE(back[0].end, FrameTime(50));
+        QCOMPARE(back[0].text, std::string("Half a second"));
+        QCOMPARE(back[1].start, FrameTime(63));  // 2.5 s, rounded
+        QCOMPARE(back[1].end, FrameTime(75));
+        QCOMPARE(back[1].text, std::string("One\ntwo"));
+        QCOMPARE(back[2].start, FrameTime(100));
+        QCOMPARE(back[2].end, FrameTime(125));
+        QCOMPARE(back[3].start, FrameTime(275));
+        QCOMPARE(back[3].end, FrameTime(300));
+        QCOMPARE(back[3].text, std::string("Nested"));
+        QVERIFY(!parseTtml("<tt xmlns=\"http://www.w3.org/ns/ttml\"><body><p>oops", fps, back, &err));
+        QVERIFY(!err.empty());
+
+        // EBU STL: the GSI block, one 128-byte block a subtitle, ISO 6937 text; and back.
+        const std::string stl = captionsToStl(caps, fps, "fr", "Film");
+        QCOMPARE(stl.size(), size_t(1024 + 2 * 128));
+        QCOMPARE(stl.substr(0, 16), std::string("850STL25.01100" "0F"));
+        QCOMPARE(stl.substr(16, 4), std::string("Film"));
+        QCOMPARE(stl.substr(238, 10), std::string("0000200002"));
+        const auto* tti = reinterpret_cast<const uint8_t*>(stl.data() + 1024);
+        QCOMPARE(int(tti[3]), 0xFF);  // the last block of its subtitle
+        QVERIFY(tti[5] == 0 && tti[6] == 0 && tti[7] == 1 && tti[8] == 0);    // in at 00:00:01:00
+        QVERIFY(tti[9] == 0 && tti[10] == 0 && tti[11] == 3 && tti[12] == 0);  // out at 00:00:03:00
+        QCOMPARE(int(tti[13]), 20);  // two lines: from row 20
+        QCOMPARE(int(tti[14]), 2);   // centred
+        // é is the acute diacritic (c2) before e; & stays; lines are double height in boxes.
+        const std::string tf(stl.data() + 1024 + 16, 112);
+        QVERIFY(tf.find("\x0D\x0B\x0B" "Caf\xC2" "e & <na\xC8" "ive>\x0A\x0A\x8A\x8A\x0D\x0B\x0B" "second line\x0A\x0A\x8F") == 0);
+        QVERIFY(parseSubtitles(stl, fps, back, &err));
+        QVERIFY2(same(back, caps), back.empty() ? "" : back[0].text.c_str());
+        // A long subtitle runs into an extension block; a 30 fps sequence writes STL30.01.
+        const std::string longText = "Thirty five characters on line one\nthirty five characters on line two\nand a third line of thirty five ch";
+        const std::string two = captionsToStl({{30, 90, longText}}, Rational{30, 1});
+        QCOMPARE(two.substr(3, 8), std::string("STL30.01"));
+        QCOMPARE(two.size(), size_t(1024 + 2 * 128));
+        QCOMPARE(int(uint8_t(two[1024 + 3])), 0);
+        QCOMPARE(int(uint8_t(two[1024 + 128 + 3])), 0xFF);
+        QVERIFY(parseSubtitles(two, Rational{30, 1}, back, &err));
+        QCOMPARE(back.size(), size_t(1));
+        QCOMPARE(back[0].text, longText);
+        QCOMPARE(back[0].start, FrameTime(30));
+        // Times count from the start of programme (here 10:00:00:00).
+        std::string late = stl;
+        late.replace(256, 8, "10000000");
+        for (size_t b = 1024; b < late.size(); b += 128) late[b + 5] = char(late[b + 5] + 10), late[b + 9] = char(late[b + 9] + 10);
+        QVERIFY(parseSubtitles(late, fps, back, &err));
+        QCOMPARE(back.front().start, FrameTime(25));
+
+        // ASS: the track's style at the frame size; and back, override tags and comments ignored.
+        CaptionStyle box;
+        box.font = "Source Sans 3";
+        box.size = 0.05;
+        box.boxOpacity = 0.5;
+        const std::string ass = captionsToAss(caps, fps, box, 1920, 1080);
+        QVERIFY(ass.find("PlayResX: 1920\nPlayResY: 1080") != std::string::npos);
+        QVERIFY2(ass.find("Style: Default,Source Sans 3,54,&H00FFFFFF,&H00FFFFFF,&H7F000000,&H7F000000,0,0,0,0,100,100,0,0,3,8,0,2,96,96,86,1") !=
+                     std::string::npos,
+                 ass.c_str());
+        QVERIFY(ass.find("Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,Caf\xC3\xA9 & <na\xC3\xAFve>\\Nsecond line") != std::string::npos);
+        QVERIFY(parseSubtitles(ass, fps, back, &err));
+        QVERIFY(same(back, caps));
+        const std::string theirAss =
+            "[Script Info]\nTitle: x\n\n[Events]\nFormat: Layer, Start, End, Style, Actor, MarginL, MarginR, MarginV, Effect, Text\n"
+            "Comment: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,not shown\n"
+            "Dialogue: 0,0:00:01.50,0:00:02.00,Default,Bob,0,0,0,,{\\i1}Well,{\\i0} yes\\Nand\\hno\n";
+        QVERIFY(parseSubtitles(theirAss, fps, back, &err));
+        QCOMPARE(back.size(), size_t(1));
+        QCOMPARE(back[0].start, FrameTime(38));
+        QCOMPARE(back[0].text, std::string("Well, yes\nand no"));
+
+        // SCC read back: pop-on captions as written, accents and music notes included, on the same frames.
+        const Rational ntsc{30000, 1001};
+        const std::vector<Caption> pop = {{30, 90, "HI THERE"}, {150, 240, "Two\nlines \xC3\xA9 \xC3\x9C \xE2\x99\xAA"}};
+        QVERIFY(parseSubtitles(captionsToScc(pop, ntsc), ntsc, back, &err));
+        QVERIFY2(same(back, pop), back.size() == 2 ? (back[0].text + "|" + back[1].text + "|" + std::to_string(back[1].start) + "-" + std::to_string(back[1].end)).c_str() : "count");
+        // Roll-up: each line stays until the next one replaces it.
+        const std::string rollUp =
+            "Scenarist_SCC V1.0\n\n00:00:01:00\t9425 9425 94ad 94ad 9470 9470 c845 4c4c 4f80\n\n"
+            "00:00:03:00\t94ad 94ad 9470 9470 574f 524c c480\n\n00:00:05:00\t942c 942c\n";
+        QVERIFY(parseSubtitles(rollUp, ntsc, back, &err));
+        QCOMPARE(back.size(), size_t(2));
+        QCOMPARE(back[0].text, std::string("HELLO"));
+        QCOMPARE(back[0].start, FrameTime(36));
+        QCOMPARE(back[0].end, FrameTime(94));
+        QCOMPARE(back[1].text, std::string("WORLD"));
+        QCOMPARE(back[1].end, FrameTime(150));
+
+        // By extension.
+        QVERIFY(captionFormatKnown(".XML") && captionFormatKnown("dfxp") && captionFormatKnown("ssa") && !captionFormatKnown(".docx"));
+        Sequence seq;
+        seq.fps = fps;
+        CaptionTrack track;
+        track.captions = caps;
+        QCOMPARE(exportCaptions(track, seq, ".srt"), captionsToSrt(caps, fps));
+        QVERIFY(exportCaptions(track, seq, ".dfxp").find("<tt ") != std::string::npos);
+        QVERIFY(exportCaptions(track, seq, ".stl").substr(3, 8) == "STL25.01");
+        QVERIFY(exportCaptions(track, seq, ".docx").empty());
     }
 
     void captionsFromClipTranscripts() {

@@ -99,11 +99,42 @@ std::vector<Caption> captionsFromTranscripts(const Project& p, const Sequence& s
 std::string captionsToSrt(const std::vector<Caption>& captions, Rational fps);
 std::string captionsToVtt(const std::vector<Caption>& captions, Rational fps);
 
-// Reads SubRip or WebVTT (detected from the text). Markup is removed.
+// Reads any of the formats below, told apart by their content: SubRip,
+// WebVTT, Scenarist SCC, TTML / IMSC / DFXP, EBU STL and ASS / SSA. Markup is removed.
 bool parseSubtitles(const std::string& text, Rational fps, std::vector<Caption>& out, std::string* error = nullptr);
 
 // Scenarist SCC: CEA-608 pop-on captions on channel 1 at 29.97 fps drop frame,
 // bottom rows, up to 32 characters per row.
 std::string captionsToScc(const std::vector<Caption>& captions, Rational fps);
+// Reads SCC: CEA-608 channel 1 pop-on, paint-on and roll-up captions (each
+// roll-up line becomes a caption, up until the next one).
+bool parseScc(const std::string& text, Rational fps, std::vector<Caption>& out, std::string* error = nullptr);
+
+// TTML in the IMSC 1.1 Text profile (Netflix, broadcasters; DFXP is the same
+// family): times as media clock time, lines as <br/>, the style's colours.
+std::string captionsToTtml(const std::vector<Caption>& captions, Rational fps, const std::string& language = "en",
+                           const CaptionStyle& style = {});
+// Reads TTML: clock times (with frames at ttp:frameRate) and offsets (h, m, s,
+// ms, f, t), times nested in body and div, spans and <br/>.
+bool parseTtml(const std::string& text, Rational fps, std::vector<Caption>& out, std::string* error = nullptr);
+
+// EBU Tech 3264 STL, the European broadcast subtitle file: binary, a GSI block
+// and a 128-byte TTI block per subtitle, at 25 fps (STL25.01) or 30
+// (STL30.01, for every other rate), Latin text (ISO 6937) as centred
+// double-height teletext lines at the bottom.
+std::string captionsToStl(const std::vector<Caption>& captions, Rational fps, const std::string& language = "en",
+                          const std::string& title = {});
+// Reads STL (times from its start-of-programme timecode on, comments skipped).
+bool parseStl(const std::string& data, Rational fps, std::vector<Caption>& out, std::string* error = nullptr);
+
+// Advanced SubStation Alpha: the track's style (font, size, colours, box or
+// outline, height) at the frame size, so players draw it as the viewer does.
+std::string captionsToAss(const std::vector<Caption>& captions, Rational fps, const CaptionStyle& style, int width, int height);
+bool parseAss(const std::string& text, Rational fps, std::vector<Caption>& out, std::string* error = nullptr);
+
+// A caption track in the format a file extension names: srt, vtt, scc, ttml
+// (also xml, dfxp), stl, ass (also ssa). Empty for an unknown extension.
+bool captionFormatKnown(const std::string& extension);
+std::string exportCaptions(const CaptionTrack& track, const Sequence& seq, const std::string& extension);
 
 }  // namespace montage

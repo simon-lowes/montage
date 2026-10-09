@@ -2002,6 +2002,63 @@ void McpServer::Impl::addTools() {
                       QJsonObject{{"output", QString::fromStdString(out)}, {"width", m.width}, {"height", m.height}});
         });
 
+    add("montage_captions", "Import or export captions",
+        "Write a caption track to a file in the format its extension names: .srt (SubRip), .vtt (WebVTT), .scc "
+        "(Scenarist, CEA-608), .ttml / .xml / .dfxp (TTML, IMSC 1.1 Text profile, with the track's colours), .stl "
+        "(EBU Tech 3264, 25 or 30 fps) or .ass / .ssa (SubStation Alpha, with the track's style); or read any of them "
+        "as a new caption track (`import`). `track` is a caption track index (default: the visible one).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"export":{"type":"string","description":"A file to write"},
+            "import":{"type":"string","description":"A file to read as a new track"},"track":{"type":"integer"},
+            "language":{"type":"string","description":"ISO 639-1 code for an imported track"}},"required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            if (a.contains("import")) {
+                const QString path = need(a, "import");
+                QFile in(path);
+                if (!in.open(QIODevice::ReadOnly)) return fail(QStringLiteral("Cannot read %1").arg(path));
+                const std::string data = in.readAll().toStdString();
+                std::vector<Caption> caps;
+                std::string err;
+                if (!parseSubtitles(data, s.fps, caps, &err)) return fail(QString::fromStdString(err));
+                CaptionTrack t;
+                t.id = l.project.newId();
+                const std::string stem = QFileInfo(path).completeBaseName().toStdString();
+                t.name = stem;
+                // "film.fr.srt" names its language.
+                if (const size_t dot = stem.rfind('.'); dot != std::string::npos && stem.size() - dot == 3) t.language = stem.substr(dot + 1);
+                if (a.contains("language")) t.language = a.value("language").toString().toLower().toStdString();
+                t.captions = std::move(caps);
+                const int n = int(t.captions.size());
+                const QString name = QString::fromStdString(t.name);
+                s.captionTracks.push_back(std::move(t));
+                save(l);
+                return ok(QStringLiteral("Imported %1 captions as \"%2\"").arg(n).arg(name),
+                          QJsonObject{{"track", int(s.captionTracks.size()) - 1}, {"name", name}, {"captions", n}});
+            }
+            const QString path = need(a, "export");
+            const CaptionTrack* t = nullptr;
+            if (a.contains("track")) {
+                const int index = a.value("track").toInt(-1);
+                if (index < 0 || index >= int(s.captionTracks.size())) return fail("No such caption track");
+                t = &s.captionTracks[size_t(index)];
+            } else {
+                t = captionTrackFor(s);
+                if (!t && !s.captionTracks.empty()) t = &s.captionTracks.front();
+            }
+            if (!t) return fail("The sequence has no captions");
+            const std::string ext = "." + QFileInfo(path).suffix().toStdString();
+            if (!captionFormatKnown(ext))
+                throw ArgError{QStringLiteral("Unknown caption format \"%1\": use .srt, .vtt, .scc, .ttml, .stl or .ass")
+                                   .arg(QString::fromStdString(ext))};
+            const std::string data = exportCaptions(*t, s, ext);
+            QFile o(path);
+            if (!o.open(QIODevice::WriteOnly) || o.write(data.data(), qint64(data.size())) != qint64(data.size()))
+                return fail(QStringLiteral("Cannot write %1").arg(path));
+            return ok(QStringLiteral("Wrote %1 captions to %2").arg(t->captions.size()).arg(path),
+                      QJsonObject{{"path", path}, {"captions", int(t->captions.size())}, {"bytes", double(data.size())}});
+        });
+
     add("montage_translate_captions", "Translate captions",
         "Translate a caption track into another language on this computer (Opus-MT), as a new track with the same "
         "timings (hidden until chosen). Languages are ISO 639-1 codes (de, fr, es, ja...); pairs without a direct model go "

@@ -8,6 +8,7 @@ add_library(montage_engine STATIC
   core/AutoTag.h core/AutoTag.cpp
   core/Transcript.h core/Transcript.cpp
   core/Captions.h core/Captions.cpp
+  core/CaptionFormats.cpp
   core/TranscriptEdit.h core/TranscriptEdit.cpp
   core/Slate.h core/Slate.cpp
   core/Chapters.h core/Chapters.cpp

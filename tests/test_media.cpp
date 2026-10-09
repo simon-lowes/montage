@@ -7074,6 +7074,80 @@ private slots:
             if (e.text.contains("HELLO")) QVERIFY2(e.start > 1.4 && e.start < 2.05, qPrintable(QString::number(e.start)));
     }
 
+    void captionFilesReadBack() {
+        // FFmpeg's ASS demuxer and decoder read what we write, on the same times.
+        const Rational fps{25, 1};
+        const std::vector<Caption> caps = {{25, 75, "Hello, world\nsecond line"}, {100, 150, "Caf\xC3\xA9"}};
+        const std::string file = path("captions.ass");
+        {
+            QFile f(QString::fromStdString(file));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(QByteArray::fromStdString(captionsToAss(caps, fps, CaptionStyle{}, 1920, 1080)));
+        }
+        std::string codec;
+        const auto events = readSubtitles(file, "ass", &codec);
+        QVERIFY2(codec == "ass" || codec == "ssa", codec.c_str());
+        QCOMPARE(events.size(), size_t(2));
+        QVERIFY(std::fabs(events[0].start - 1.0) < 0.011 && std::fabs(events[0].end - 3.0) < 0.011);
+        QVERIFY(std::fabs(events[1].start - 4.0) < 0.011 && std::fabs(events[1].end - 6.0) < 0.011);
+        QVERIFY2(events[0].text.contains("Hello, world\\Nsecond line"), qPrintable(events[0].text));
+        QVERIFY2(events[1].text.contains(QString::fromUtf8("Caf\xC3\xA9")), qPrintable(events[1].text));
+
+        // Through MCP: a track written as TTML and EBU STL, and each read back as a new track.
+        Project p = makeDefaultProject();
+        CaptionTrack ct;
+        ct.id = p.newId();
+        ct.name = "English";
+        ct.captions = {{30, 90, "First caption"}, {120, 180, "Second\ncaption"}};
+        p.active()->captionTracks.push_back(ct);
+        const QString project = QString::fromStdString(path("caption-files.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_captions"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        const QString ttml = QString::fromStdString(path("caption-files.ttml")), stl = QString::fromStdString(path("caption-files.stl"));
+        QJsonObject r = call({{"project", project}, {"export", ttml}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("captions").toInt(), 2);
+        r = call({{"project", project}, {"export", stl}, {"track", 0}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        {
+            QFile f(stl);
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            QCOMPARE(f.size(), qint64(1024 + 2 * 128));
+            QCOMPARE(f.read(6).mid(3), QByteArray("STL"));
+        }
+        r = call({{"project", project}, {"import", stl}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        r = call({{"project", project}, {"import", ttml}, {"language", "en"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const auto& tracks = back.active()->captionTracks;
+        QCOMPARE(tracks.size(), size_t(3));
+        QCOMPARE(tracks[1].name, std::string("caption-files"));
+        QCOMPARE(tracks[2].language, std::string("en"));
+        for (size_t i = 1; i < 3; ++i) {
+            QCOMPARE(tracks[i].captions.size(), size_t(2));
+            for (size_t k = 0; k < 2; ++k) {
+                QCOMPARE(tracks[i].captions[k].text, ct.captions[k].text);
+                QCOMPARE(tracks[i].captions[k].start, ct.captions[k].start);
+                QCOMPARE(tracks[i].captions[k].end, ct.captions[k].end);
+            }
+        }
+        // An unknown format and a missing track are refused.
+        r = call({{"project", project}, {"export", QString::fromStdString(path("x.docx"))}});
+        QVERIFY(r.value("isError").toBool());
+        r = call({{"project", project}, {"export", ttml}, {"track", 9}});
+        QVERIFY(r.value("isError").toBool());
+    }
+
     void translation() {
         // Languages and routes: direct models, English as the bridge between two others.
         const auto& langs = translationLanguages();

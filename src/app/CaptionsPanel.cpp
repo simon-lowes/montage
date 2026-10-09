@@ -75,7 +75,7 @@ CaptionsPanel::CaptionsPanel(EditorState* state, QWidget* parent) : QWidget(pare
     more->setPopupMode(QToolButton::InstantPopup);
     auto* menu = new QMenu(more);
     menu->addAction(tr("New Caption Track"), this, &CaptionsPanel::addTrack);
-    menu->addAction(tr("Import SubRip / WebVTT..."), this, &CaptionsPanel::importDialog);
+    menu->addAction(tr("Import Captions..."), this, &CaptionsPanel::importDialog);
     menu->addAction(tr("Export Captions..."), this, &CaptionsPanel::exportDialog);
     menu->addAction(tr("Translate Track..."), this, &CaptionsPanel::translateDialog)->setObjectName(QStringLiteral("translateCaptions"));
     menu->addAction(tr("Dub into English..."), this, &CaptionsPanel::dubDialog)->setObjectName(QStringLiteral("dubCaptions"));
@@ -624,10 +624,8 @@ bool CaptionsPanel::exportFile(const QString& path, QString* error) const {
         if (error) *error = tr("There are no captions to export");
         return false;
     }
-    const QString suffix = QFileInfo(path).suffix().toLower();
-    const std::string text = suffix == "vtt"   ? captionsToVtt(t->captions, s->fps)
-                             : suffix == "scc" ? captionsToScc(t->captions, s->fps)
-                                               : captionsToSrt(t->captions, s->fps);
+    const std::string suffix = QFileInfo(path).suffix().toLower().toStdString();
+    const std::string text = exportCaptions(*t, *s, captionFormatKnown(suffix) ? suffix : "srt");
     QSaveFile f(path);
     if (!f.open(QIODevice::WriteOnly) || f.write(text.data(), qint64(text.size())) != qint64(text.size()) || !f.commit()) {
         if (error) *error = tr("Cannot write %1").arg(path);
@@ -639,7 +637,7 @@ bool CaptionsPanel::exportFile(const QString& path, QString* error) const {
 void CaptionsPanel::importDialog() {
     QSettings settings = appSettings();
     const QString path = QFileDialog::getOpenFileName(this, tr("Import Captions"), settings.value("captions/dir").toString(),
-                                                      tr("Captions (*.srt *.vtt);;All files (*)"));
+                                                      tr("Captions (*.srt *.vtt *.scc *.ttml *.xml *.dfxp *.stl *.ass *.ssa);;All files (*)"));
     if (path.isEmpty()) return;
     settings.setValue("captions/dir", QFileInfo(path).absolutePath());
     QString err;
@@ -650,14 +648,24 @@ void CaptionsPanel::exportDialog() {
     const CaptionTrack* t = track();
     if (!t) return;
     QSettings settings = appSettings();
-    const QString srt = tr("SubRip (*.srt)"), vtt = tr("WebVTT (*.vtt)"), scc = tr("Scenarist SCC, CEA-608 (*.scc)");
-    QString filter = srt;
+    // Each format and its extension.
+    const QList<QPair<QString, QString>> formats = {{tr("SubRip (*.srt)"), ".srt"},
+                                                    {tr("WebVTT (*.vtt)"), ".vtt"},
+                                                    {tr("Scenarist SCC, CEA-608 (*.scc)"), ".scc"},
+                                                    {tr("TTML, IMSC 1.1 (*.ttml *.xml *.dfxp)"), ".ttml"},
+                                                    {tr("EBU STL (*.stl)"), ".stl"},
+                                                    {tr("Advanced SubStation Alpha (*.ass *.ssa)"), ".ass"}};
+    QStringList filters;
+    for (const auto& f : formats) filters << f.first;
+    QString filter = filters.front();
     QString path = QFileDialog::getSaveFileName(this, tr("Export Captions"),
                                                 settings.value("captions/dir").toString() + "/" +
                                                     QString::fromStdString(t->name) + ".srt",
-                                                QStringList{srt, vtt, scc}.join(";;"), &filter);
+                                                filters.join(";;"), &filter);
     if (path.isEmpty()) return;
-    if (QFileInfo(path).suffix().isEmpty()) path += filter == vtt ? ".vtt" : filter == scc ? ".scc" : ".srt";
+    if (QFileInfo(path).suffix().isEmpty())
+        for (const auto& f : formats)
+            if (f.first == filter) path += f.second;
     settings.setValue("captions/dir", QFileInfo(path).absolutePath());
     QString err;
     if (!exportFile(path, &err)) QMessageBox::warning(this, tr("Export Captions"), err);

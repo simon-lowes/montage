@@ -90,8 +90,8 @@ int usage() {
                  "  montage-cli people <project.montage> [--person NAME|ID]   (who is in the footage, and where)\n"
                  "  montage-cli speak \"text\" -o voice.wav [--voice af_heart] [--speed 1]   (a voiceover from text; --phonemes prints them)\n"
                  "  montage-cli mcp                       (Model Context Protocol server on stdio, for AI agents)\n"
-                 "  montage-cli captions <project.montage> [-o out.srt|out.vtt|out.scc] [--transcribe MODEL]\n"
-                 "                     [--generate] [--import file.srt] [--save]\n"
+                 "  montage-cli captions <project.montage> [-o out.srt|.vtt|.scc|.ttml|.stl|.ass] [--transcribe MODEL]\n"
+                 "                     [--generate] [--import file.srt|.vtt|.scc|.ttml|.stl|.ass] [--save]\n"
                  "  montage-cli translate <subtitles.srt|.vtt> --to LANG [--from LANG] [-o out.srt|out.vtt]\n"
                  "                     (on this computer, with Opus-MT; LANG is de, fr, es, ja... see `models`)\n",
                  MONTAGE_VERSION);
@@ -831,9 +831,7 @@ int cmdCaptions(const std::vector<std::string>& args) {
         std::printf("Saved %s\n", args[0].c_str());
     }
     const std::string ext = std::filesystem::path(out).extension().string();
-    const std::string text = ext == ".vtt" ? captionsToVtt(t->captions, s.fps)
-                             : ext == ".scc" ? captionsToScc(t->captions, s.fps)
-                                             : captionsToSrt(t->captions, s.fps);
+    const std::string text = exportCaptions(*t, s, captionFormatKnown(ext) ? ext : ".srt");
     if (out.empty()) {
         if (!save) std::fwrite(text.data(), 1, text.size(), stdout);
         return 0;
