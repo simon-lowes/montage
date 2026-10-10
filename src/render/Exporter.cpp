@@ -893,6 +893,11 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             if (AVStereo3D* s3d = av_stereo3d_alloc()) {
                 s3d->type = stereoView == StereoView::SideBySide || stereoView == StereoView::SideBySideHalf ? AV_STEREO3D_SIDEBYSIDE
                                                                                                             : AV_STEREO3D_TOPBOTTOM;
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(59, 27, 100)
+                // A zeroed view reads as "packed", which newer FFmpeg also writes as Apple's view box (vexu) that its
+                // own reader then lets override st3d's packing: unspecified, st3d alone says how the eyes lie.
+                s3d->view = AV_STEREO3D_VIEW_UNSPEC;
+#endif
 #if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(60, 29, 100)
                 if (!av_packet_side_data_add(&o.vst->codecpar->coded_side_data, &o.vst->codecpar->nb_coded_side_data,
                                              AV_PKT_DATA_STEREO3D, s3d, sizeof(AVStereo3D), 0))
