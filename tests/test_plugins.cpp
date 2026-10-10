@@ -679,13 +679,22 @@ private slots:
         float* ch[2] = {l.data(), r.data()};
         inst->process(ch, 2, 600);
         QVERIFY(std::fabs(l[300] - 0.8f) < 1e-6f);  // unity gain, no key
+        // Until a key is chosen the bus stays off (as DAWs leave it), so a key given anyway is not heard.
         const float* key[2] = {k.data(), k.data()};
+        inst->setSidechain(key, 2);
+        inst->process(ch, 2, 600);
+        QVERIFY(std::fabs(l[300] - 0.8f) < 1e-6f);
+        inst->enableSidechain(true);
         inst->setSidechain(key, 2);
         inst->process(ch, 2, 600);
         QVERIFY2(std::fabs(l[300] - 0.4f) < 1e-6f && std::fabs(r[599] - 0.4f) < 1e-6f, qPrintable(QString::number(l[300])));
         inst->setSidechain(nullptr, 0);
         inst->process(ch, 2, 600);
         QVERIFY(std::fabs(l[300] - 0.4f) < 1e-6f);  // silence on the key: unchanged
+        inst->enableSidechain(false);  // and off again
+        inst->setSidechain(key, 2);
+        inst->process(ch, 2, 600);
+        QVERIFY(std::fabs(l[300] - 0.4f) < 1e-6f);
     }
 
     void probesAndHostsAVst3Plugin() {
@@ -908,6 +917,64 @@ private slots:
         onClip.strings["sidechain"] = std::to_string(s.audioTracks[1].id);
         s.audioTracks[0].clips[0].effects.push_back(onClip);
         QVERIFY(std::fabs(level() - alone * 0.75f) < 1e-3f);
+        // Known to have a key input once loaded, even for an effect saved without the mark.
+        QVERIFY(knownSidechain(d->id) && !knownSidechain(gain->id));
+        // A duplicate of the sequence keys from the copy's own track.
+        {
+            Project dp = p;
+            const Id copy = edit::duplicateSequence(dp, dp.activeSequence);
+            const Sequence* c = dp.findSequence(copy);
+            QVERIFY(c);
+            QCOMPARE(c->audioTracks[0].clips[0].effects.at(0).s("sidechain"), std::to_string(c->audioTracks[1].id));
+            QVERIFY(c->audioTracks[1].id != s.audioTracks[1].id);
+        }
+
+        // In step with the signal through plugin latency: the key's onset (a second in) ducks the sound at that same
+        // sample, whether the keyed plugin comes before a latent one on a clip or after one on a track.
+        isolate(reg, path("cache-sidechain-latency.json"), {clapDir("sidechain"), clapDir("latency")});
+        reg.scan();
+        auto delay = reg.find("clap:org.montage.test.delay64");
+        auto duck = reg.find("clap:org.montage.test.ducker");
+        QVERIFY(delay && duck);
+        Project lp = makeDefaultProject();
+        Sequence& ls = *lp.active();
+        const std::string steady = path("sc-steady.wav").toStdString(), onset = path("sc-onset.wav").toStdString();
+        writeWav(steady, 48000, 3.0, 0.5f);
+        writeWav(onset, 48000, 1.0, 0.5f);
+        for (const std::string& f : {steady, onset}) {
+            MediaItem m;
+            m.id = lp.newId();
+            QVERIFY2(probeMedia(f, m, &err), err.c_str());
+            lp.media.push_back(m);
+        }
+        while (ls.audioTracks.size() < 2) edit::addTrack(lp, ls, TrackKind::Audio);
+        Clip main = makeClip(lp, lp.media[0], TrackKind::Audio, ls);
+        main.duration = FrameTime(std::llround(3 * ls.fpsValue()));
+        QVERIFY(edit::overwrite(lp, ls, {TrackKind::Audio, 0}, main).ok);
+        Clip keyClip = makeClip(lp, lp.media[1], TrackKind::Audio, ls);
+        keyClip.start = FrameTime(std::llround(ls.fpsValue()));  // from 1 s (sample 48000)
+        keyClip.duration = FrameTime(std::llround(ls.fpsValue()));
+        QVERIFY(edit::overwrite(lp, ls, {TrackKind::Audio, 1}, keyClip).ok);
+        ls.audioTracks[1].muted = true;
+        auto keyed = [&](Project& pr) {
+            auto fx = makePluginEffect(pr, *duck, &err);
+            fx->strings["sidechain"] = std::to_string(ls.audioTracks[1].id);
+            return *fx;
+        };
+        auto duckedFrom = [&] {
+            AudioMixer mixer;
+            std::vector<float> out(600 * 2);
+            mixer.mix(lp, ls, 47700, 600, out.data());
+            const float before = out[0];
+            for (int i = 0; i < 600; ++i)
+                if (out[size_t(i) * 2] < before * 0.8f) return int64_t(47700 + i);
+            return int64_t(-1);
+        };
+        ls.audioTracks[0].clips[0].effects = {keyed(lp), *makePluginEffect(lp, *delay, &err)};
+        QCOMPARE(duckedFrom(), int64_t(48000));
+        ls.audioTracks[0].clips[0].effects.clear();
+        ls.audioTracks[0].effects = {*makePluginEffect(lp, *delay, &err), keyed(lp)};
+        QCOMPARE(duckedFrom(), int64_t(48000));
     }
 
     void pluginDelayCompensation() {

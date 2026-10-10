@@ -205,12 +205,20 @@ public:
         gui_ = static_cast<const clap_plugin_gui_t*>(plugin_->get_extension(plugin_, CLAP_EXT_GUI));
         if (auto* ports = static_cast<const clap_plugin_audio_ports_t*>(
                 plugin_->get_extension(plugin_, CLAP_EXT_AUDIO_PORTS))) {
-            clap_audio_port_info_t info{};
-            inChannels_ = ports->count(plugin_, true) > 0 && ports->get(plugin_, 0, true, &info) ? int(info.channel_count) : 0;
-            // A second input port is the key (sidechain), as CLAP's compressors and gates have it.
-            keyChannels_ = ports->count(plugin_, true) > 1 && ports->get(plugin_, 1, true, &info) ? int(info.channel_count) : 0;
-            outChannels_ =
-                ports->count(plugin_, false) > 0 && ports->get(plugin_, 0, false, &info) ? int(info.channel_count) : 0;
+            // Every port gets buffers (CLAP wants as many as it declares): the main ones carry the sound, a second input
+            // port is the key (sidechain), as CLAP's compressors and gates have it, and any others get silence.
+            for (int dir = 0; dir < 2; ++dir) {
+                auto& list = dir == 0 ? inPorts_ : outPorts_;
+                list.clear();
+                const uint32_t n = ports->count(plugin_, dir == 0);
+                for (uint32_t i = 0; i < n; ++i) {
+                    clap_audio_port_info_t info{};
+                    list.push_back(ports->get(plugin_, i, dir == 0, &info) ? int(info.channel_count) : 0);
+                }
+            }
+            inChannels_ = inPorts_.empty() ? 0 : inPorts_[0];
+            keyChannels_ = inPorts_.size() > 1 ? inPorts_[1] : 0;
+            outChannels_ = outPorts_.empty() ? 0 : outPorts_[0];
         }
         if (outChannels_ <= 0) {
             if (error) *error = "the plugin has no audio output";
@@ -231,6 +239,11 @@ public:
         processing_ = plugin_->start_processing(plugin_);
         in_.assign(size_t(std::max(1, inChannels_)) * size_t(maxFrames_), 0.0f);
         keyBuf_.assign(size_t(std::max(0, keyChannels_)) * size_t(maxFrames_), 0.0f);
+        // The other ports' buffers.
+        int extra = 0;
+        for (size_t i = 2; i < inPorts_.size(); ++i) extra += inPorts_[i];
+        for (size_t i = 1; i < outPorts_.size(); ++i) extra += outPorts_[i];
+        spare_.assign(size_t(extra) * size_t(maxFrames_), 0.0f);
         out_.assign(size_t(outChannels_) * size_t(maxFrames_), 0.0f);
         return processing_;
     }
@@ -410,7 +423,7 @@ private:
         }
         for (int c = 0; c < outChannels_; ++c) outPtrs.push_back(&out_[size_t(c) * size_t(maxFrames_)]);
 
-        clap_audio_buffer_t inBufs[2]{};
+        std::vector<clap_audio_buffer_t> inBufs(std::max<size_t>(1, inPorts_.size())), outBufs(std::max<size_t>(1, outPorts_.size()));
         clap_audio_buffer_t& inBuf = inBufs[0];
         inBuf.data32 = inPtrs.data();
         inBuf.channel_count = uint32_t(inPtrs.size());
@@ -424,9 +437,28 @@ private:
             else std::memcpy(dst, key_[std::min(c, keyIn_ - 1)] + offset, size_t(n) * sizeof(float));
             keyPtrs.push_back(dst);
         }
-        inBufs[1].data32 = keyPtrs.data();
-        inBufs[1].channel_count = uint32_t(keyPtrs.size());
-        clap_audio_buffer_t outBuf{};
+        if (inBufs.size() > 1) {
+            inBufs[1].data32 = keyPtrs.data();
+            inBufs[1].channel_count = uint32_t(keyPtrs.size());
+        }
+        // Any further ports: silence in, and somewhere to write out.
+        std::vector<std::vector<float*>> sparePtrs;
+        size_t used = 0;
+        auto spare = [&](clap_audio_buffer_t& b, int channels, bool silence) {
+            sparePtrs.emplace_back();
+            for (int c = 0; c < channels; ++c) {
+                float* p = &spare_[used];
+                used += size_t(maxFrames_);
+                if (silence) std::fill(p, p + n, 0.0f);
+                sparePtrs.back().push_back(p);
+            }
+            b.data32 = sparePtrs.back().data();
+            b.channel_count = uint32_t(channels);
+        };
+        sparePtrs.reserve(inPorts_.size() + outPorts_.size());
+        for (size_t i = 2; i < inPorts_.size(); ++i) spare(inBufs[i], inPorts_[i], true);
+        for (size_t i = 1; i < outPorts_.size(); ++i) spare(outBufs[i], outPorts_[i], false);
+        clap_audio_buffer_t& outBuf = outBufs[0];
         outBuf.data32 = outPtrs.data();
         outBuf.channel_count = uint32_t(outPtrs.size());
 
@@ -434,10 +466,10 @@ private:
         proc.steady_time = steadyTime_;
         proc.frames_count = uint32_t(n);
         proc.transport = nullptr;
-        proc.audio_inputs = inChannels_ > 0 ? inBufs : nullptr;
-        proc.audio_inputs_count = inChannels_ > 0 ? (keyChannels_ > 0 ? 2 : 1) : 0;
-        proc.audio_outputs = &outBuf;
-        proc.audio_outputs_count = 1;
+        proc.audio_inputs = inPorts_.empty() ? nullptr : inBufs.data();
+        proc.audio_inputs_count = uint32_t(inPorts_.size());
+        proc.audio_outputs = outBufs.data();
+        proc.audio_outputs_count = uint32_t(std::max<size_t>(1, outPorts_.size()));
         proc.in_events = &pending_.in;
         proc.out_events = &kDiscardEvents;
         const clap_process_status status = plugin_->process(plugin_, &proc);
@@ -458,6 +490,8 @@ private:
     HostSide side_;
     bool editorOpen_ = false;
     int inChannels_ = 2, outChannels_ = 2;
+    std::vector<int> inPorts_, outPorts_;  // every port's channels
+    std::vector<float> spare_;             // buffers for ports other than the main ones and the key
     int keyChannels_ = 0;           // the key input port's channels (0: none)
     const float* const* key_ = nullptr;  // the key for this process() call
     int keyIn_ = 0;

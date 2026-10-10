@@ -1674,9 +1674,12 @@ void processPlugin(AudioMixer::State& st, const Effect& e, double sr, FrameTime 
         ch[1][i] = buf[size_t(i) * 2 + 1];
     }
     const bool keyed = st.plugin->hasSidechain();
+    const float* k[2] = {nullptr, nullptr};  // (lives until process() is done with it)
+    if (keyed) st.plugin->enableSidechain(key != nullptr);
     if (keyed && key) {
         st.keyPlanar.resize(size_t(frames) * 2);
-        const float* k[2] = {st.keyPlanar.data(), st.keyPlanar.data() + frames};
+        k[0] = st.keyPlanar.data();
+        k[1] = st.keyPlanar.data() + frames;
         for (int i = 0; i < frames; ++i) {
             st.keyPlanar[size_t(i)] = key[size_t(i) * 2];
             st.keyPlanar[size_t(frames + i)] = key[size_t(i) * 2 + 1];
@@ -1702,13 +1705,13 @@ void AudioMixer::reset() {
     resetLocked();
 }
 
-const float* AudioMixer::keySignal(Id trackId, int frames) {
+const float* AudioMixer::keySignal(Id trackId, int frames, int64_t keyAt) {
     if (!key_.seq || !key_.p) return nullptr;
     const Track* t = nullptr;
     for (const Track& tr : key_.seq->audioTracks)
         if (tr.id == trackId) t = &tr;
     if (!t) return nullptr;
-    auto& slot = keyBufs_[trackId];
+    auto& slot = keyBufs_[{trackId, keyAt}];
     if (slot.block == keyBlock_ && slot.samples.size() == size_t(frames) * 2) return slot.samples.data();
     if (!keyMixer_) {
         keyMixer_ = std::make_unique<AudioMixer>();
@@ -1716,7 +1719,7 @@ const float* AudioMixer::keySignal(Id trackId, int frames) {
     }
     slot.block = keyBlock_;
     slot.samples.assign(size_t(frames) * 2, 0.0f);
-    const int64_t at = key_.at + (t->effects.empty() ? 0 : keyMixer_->chainLatency(t->effects, t->id, key_.sr));
+    const int64_t at = keyAt + (t->effects.empty() ? 0 : keyMixer_->chainLatency(t->effects, t->id, key_.sr));
     keyMixer_->mixTrackClips(*key_.p, *key_.seq, *t, at, frames, key_.sr, key_.depth, slot.samples.data());
     if (!t->effects.empty())
         keyMixer_->processChain(t->effects, t->id, FrameTime(double(at) * key_.seq->fpsValue() / key_.sr), key_.sr,
@@ -1748,6 +1751,8 @@ void AudioMixer::resetLocked() {
 }
 
 void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameTime lt, double sr, float* buf, int frames) {
+    // Where the signal reaching the next effect comes from: the chain's input, less the latency of the plugins passed.
+    int64_t keyAt = key_.at;
     // What a compressor or gate listens to: its sidechain track (not its own) or the signal, high-passed when asked.
     auto detector = [&](const Effect& e, State& st) -> const float* {
         const float* src = buf;
@@ -1755,7 +1760,7 @@ void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameT
         if (!key.empty()) {
             const Id id = Id(std::strtoll(key.c_str(), nullptr, 10));
             if (id && id != owner)
-                if (const float* k = keySignal(id, frames)) src = k;
+                if (const float* k = keySignal(id, frames, keyAt)) src = k;
         }
         const double hz = e.p("key_hpf_hz", lt, 0);
         if (hz < 1) return src == buf ? nullptr : src;
@@ -1880,8 +1885,9 @@ void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameT
             // Its key input hears its sidechain track (not its own), as the compressor's detector does.
             const float* key = nullptr;
             if (const std::string k = e.s("sidechain"); !k.empty())
-                if (const Id id = Id(std::strtoll(k.c_str(), nullptr, 10)); id && id != owner) key = keySignal(id, frames);
+                if (const Id id = Id(std::strtoll(k.c_str(), nullptr, 10)); id && id != owner) key = keySignal(id, frames, keyAt);
             processPlugin(*st, e, sr, lt, changed, buf, frames, key);
+            if (st->plugin) keyAt -= std::max(0, st->plugin->latencySamples());
         } else if (e.type == "delay") {
             size_t del = size_t(std::max(1.0, e.p("time_ms", lt, 300) * sr / 1000));
             float fb = float(std::clamp(e.p("feedback", lt, 0.35), 0.0, 0.95));
@@ -2218,8 +2224,11 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
                 }
             }
         }
-        // Clip filters (stateful, processed over the whole block for continuity).
+        // Clip filters (stateful, processed over the whole block for continuity), fed `lat` ahead: keys from there too.
+        const int64_t trackKeyAt = key_.at;
+        key_.at = rs;
         processChain(c.effects, c.id, FrameTime(double(start) * fps / sr) - c.start, sr, clipBuf.data(), frames);
+        key_.at = trackKeyAt;
         // Clip volume / pan (keyframed, evaluated every 64 samples) and fades. The dips under audio description
         // (core/AudioDescription.h) are heard only while the descriptions are.
         const auto duck = c.audio.params.find(kDescriptionDuckParam);
@@ -2326,7 +2335,10 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
         ~KeyScope() { k = saved; }
     } keyScope{key_, key_};
     key_ = {&p, &seq, start, sr, depth};
-    if (depth == 0) ++keyBlock_;
+    if (depth == 0) {
+        ++keyBlock_;
+        keyBufs_.clear();  // keys of earlier blocks are never asked for again
+    }
     bool anySolo = std::any_of(seq.audioTracks.begin(), seq.audioTracks.end(), [](const Track& t) { return t.solo; });
     if (trackLevels && depth == 0) trackLevels->assign(seq.audioTracks.size(), MeterLevels{});
     auto frameAt = [&](int64_t sample) { return FrameTime(double(sample) * fps / sr); };

@@ -1710,9 +1710,12 @@ Id duplicateSequence(Project& p, Id id, const std::string& name, std::map<Id, Id
     auto retarget = [&](Effect& e) {
         const EffectInfo* info = e.type.empty() ? nullptr : findEffectInfo(e.type);
         if (!info) return;
-        for (const StringParamInfo& sp : info->strings) {
-            if (sp.kind != StringKind::Track) continue;
-            auto it = e.strings.find(sp.name);
+        std::vector<std::string> names;
+        for (const StringParamInfo& sp : info->strings)
+            if (sp.kind == StringKind::Track) names.push_back(sp.name);
+        if (e.type == "plugin") names.push_back("sidechain");  // a plugin's key input (audio/PluginEffect.h)
+        for (const std::string& name : names) {
+            auto it = e.strings.find(name);
             if (it == e.strings.end() || it->second.empty()) continue;
             const auto to = tracks.find(it->second);
             it->second = to == tracks.end() ? std::string() : to->second;

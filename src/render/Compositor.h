@@ -140,7 +140,9 @@ private:
     // processed, before its fader and whether or not it is muted, from a mixer of its own (so the state of its clips'
     // effects never runs twice); computed once per track and block (fed ahead by its own inserts' latency), so a
     // consumer fed ahead by plugin latency downstream hears it that much early. Null when there is no such track.
-    const float* keySignal(Id track, int frames);
+    // `at` is the timeline sample the consumer's input is at (the chain's input, less the latency of the plugins before
+    // it in the chain), so a key lines up with what it is keying.
+    const float* keySignal(Id track, int frames, int64_t at);
     struct KeyContext {
         const Project* p = nullptr;
         const Sequence* seq = nullptr;
@@ -154,7 +156,7 @@ private:
         int64_t block = -1;
         std::vector<float> samples;
     };
-    std::map<Id, KeyBuffer> keyBufs_;
+    std::map<std::pair<Id, int64_t>, KeyBuffer> keyBufs_;  // by track and where it is heard from, this block
     int64_t keyBlock_ = 0;  // counts the top-level blocks mixed
     int64_t nextStart_ = -1;  // where the next contiguous block starts
     std::map<std::pair<Id, Id>, std::unique_ptr<State>> states_;
