@@ -5486,9 +5486,13 @@ const auto seq = [this] { return state()->sequence(); };
         // A cell edits its cue; a start that is no time is refused and put back.
         table->item(0, 5)->setText("Traffic noise");
         QCOMPARE(state()->sequence()->adrCues[0].note, std::string("Traffic noise"));
+        QSignalSpy said(state(), &EditorState::statusMessage);
         table->item(0, 2)->setText("not a time");
         QCOMPARE(state()->sequence()->adrCues[0].start, FrameTime(150));
         QTRY_COMPARE(table->item(0, 2)->text(), QString::fromStdString(formatTimecode(150, state()->sequence()->fps)));
+        // The status bar says why, in the panel's own (translatable) words.
+        QVERIFY(!said.isEmpty());
+        QCOMPARE(said.last().at(0).toString(), QString("The start must be a timecode before the end"));
 
         // Rehearse: the cycle (beeps, streamer) goes to the Program monitor and nothing is recorded.
         auto* program = win_->findChild<PlaybackController*>("programPlayback");
