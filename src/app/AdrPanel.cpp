@@ -354,7 +354,7 @@ void AdrPanel::refreshTakes() {
     takes_->blockSignals(true);
     takes_->clear();
     if (c && c->takes.empty()) {
-        takes_->addItem(qs(c->name.empty() ? std::string("Take 1") : c->name));
+        takes_->addItem(c->name.empty() ? tr("Take 1") : qs(c->name));
     } else if (c) {
         for (size_t i = 0; i < c->takes.size(); ++i) {
             const std::string& name = int(i) == c->take ? c->name : c->takes[i].name;
@@ -477,7 +477,7 @@ void AdrPanel::removeCue() {
     const Id id = currentCue();
     if (!id || cycle_) return;
     state_->apply(tr("Remove ADR Cue"), [&](Project&, Sequence& sq) {
-        return removeAdrCue(sq, id) ? edit::Result{} : edit::Result::fail("No such cue");
+        return removeAdrCue(sq, id) ? edit::Result{} : edit::Result::fail(tr("No such cue").toStdString());
     });
     refresh();
 }
@@ -487,7 +487,7 @@ void AdrPanel::setCueStatus(int status) {
     if (!id) return;
     state_->apply(tr("Set ADR Cue Status"), [&](Project&, Sequence& sq) {
         AdrCue* q = findAdrCue(sq, id);
-        if (!q) return edit::Result::fail("No such cue");
+        if (!q) return edit::Result::fail(tr("No such cue").toStdString());
         q->status = std::clamp(status, 0, int(kAdrOmitted));
         return edit::Result{};
     });
@@ -502,28 +502,28 @@ void AdrPanel::cellEdited(int row, int column) {
     const std::string text = it->text().trimmed().toStdString();
     const bool ok = state_->apply(tr("Edit ADR Cue"), [&](Project&, Sequence& sq) {
         AdrCue* q = findAdrCue(sq, id);
-        if (!q) return edit::Result::fail("No such cue");
+        if (!q) return edit::Result::fail(tr("No such cue").toStdString());
         FrameTime t = 0;
         switch (column) {
             case CueName:
-                if (text.empty()) return edit::Result::fail("A cue needs a number");
+                if (text.empty()) return edit::Result::fail(tr("A cue needs a number").toStdString());
                 for (const AdrCue& o : sq.adrCues)
-                    if (o.id != id && o.name == text) return edit::Result::fail("Another cue has that number");
+                    if (o.id != id && o.name == text) return edit::Result::fail(tr("Another cue has that number").toStdString());
                 q->name = text;
                 break;
             case CueCharacter: q->character = text; break;
             case CueLine: q->line = text; break;
             case CueNote: q->note = text; break;
             case CueStart:
-                if (!parseTimecode(text, sq.fps, t) || t < 0 || t >= q->end) return edit::Result::fail("The start must be a timecode before the end");
+                if (!parseTimecode(text, sq.fps, t) || t < 0 || t >= q->end) return edit::Result::fail(tr("The start must be a timecode before the end").toStdString());
                 q->start = t;
                 std::stable_sort(sq.adrCues.begin(), sq.adrCues.end(), [](const AdrCue& a, const AdrCue& b) { return a.start < b.start; });
                 break;
             case CueEnd:
-                if (!parseTimecode(text, sq.fps, t) || t <= q->start) return edit::Result::fail("The end must be a timecode after the start");
+                if (!parseTimecode(text, sq.fps, t) || t <= q->start) return edit::Result::fail(tr("The end must be a timecode after the start").toStdString());
                 q->end = t;
                 break;
-            default: return edit::Result::fail("That column cannot be edited");
+            default: return edit::Result::fail(tr("That column cannot be edited").toStdString());
         }
         return edit::Result{};
     });
