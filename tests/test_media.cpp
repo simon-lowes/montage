@@ -70,6 +70,7 @@
 #include "render/AudioReactive.h"
 #include "render/VfxPull.h"
 #include "render/AafExport.h"
+#include "core/Interpretation.h"
 #include "render/Adm.h"
 #include "core/Adr.h"
 #include "core/AudioDescription.h"
@@ -6136,6 +6137,160 @@ private slots:
         QVERIFY(music[1].toObject().value("inputs").toArray()[0].toObject().value("file").toString().endsWith("tone-stereo%20L.wav"));
         QVERIFY(tr[2].toObject().value("components").toArray()[1].toObject().value("inputs").toArray()[0].toObject()
                     .value("file").toString().endsWith("tone-stereo%20R.wav"));
+    }
+
+    void aafExportWithPicture() {
+        // A movie with picture and sound (6 s at 25 fps) and a still.
+        Project src = makeDefaultProject();
+        Sequence& ss = *src.active();
+        ss.fps = {25, 1};
+        ss.width = 320, ss.height = 240;
+        src.media.push_back(probeOrFail(src, MONTAGE_TEST_DATA_DIR "/jfk.wav"));
+        edit::overwrite(src, ss, {TrackKind::Video, 0}, makeGeneratorClip(src, "color", 150));
+        QVERIFY(edit::placeMedia(src, ss, src.media[0].id, 0, 0, 150, {TrackKind::Video, -1}, {TrackKind::Audio, 0}, false).ok);
+        ExportSettings st = findExportPreset("H.264 - High Quality")->settings;
+        st.path = path("pic-movie.mp4");
+        st.preset = "ultrafast";
+        std::string err;
+        QVERIFY2(exportSequence(src, ss, st, nullptr, nullptr, &err), err.c_str());
+        const std::string still = path("still.png");
+        {
+            QImage img(64, 48, QImage::Format_RGB32);
+            img.fill(QColor(200, 40, 40));
+            QVERIFY(img.save(QString::fromStdString(still)));
+        }
+
+        // V1: two shots of the movie with a dissolve, then a generated clip; V2: a shot at double speed and the still.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = {25, 1};
+        s.width = 320, s.height = 240;
+        s.name = "Picture Cut";
+        const MediaItem movie = probeOrFail(p, st.path);
+        p.media.push_back(movie);
+        const MediaItem pic = probeOrFail(p, still);
+        p.media.push_back(pic);
+        QVERIFY(edit::placeMedia(p, s, movie.id, 0, 20, 60, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(edit::placeMedia(p, s, movie.id, 40, 90, 130, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Id shotB = edit::clipAt(s, {TrackKind::Video, 0}, 50)->id;
+        QVERIFY(edit::addTransition(p, s, shotB, edit::Edge::In, "cross_dissolve", 10).ok);
+        Clip title = makeGeneratorClip(p, "color", 10);
+        title.start = 90;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, title).ok);
+        while (s.videoTracks.size() < 2) edit::addTrack(p, s, TrackKind::Video);
+        QVERIFY(edit::placeMedia(p, s, movie.id, 20, 0, 50, {TrackKind::Video, 1}, {TrackKind::Audio, -1}, false).ok);
+        QVERIFY(edit::clipAt(s, {TrackKind::Video, 1}, 20));
+        Clip* fast = edit::clipById(s, edit::clipAt(s, {TrackKind::Video, 1}, 20)->id);
+        fast->speed = 2;
+        fast->duration = 25;
+        QVERIFY(edit::placeMedia(p, s, pic.id, 60, 0, 20, {TrackKind::Video, 1}, {TrackKind::Audio, -1}, false).ok);
+
+        const std::string aaf = path("Picture Cut.aaf");
+        AafExportResult r;
+        QVERIFY2(exportAaf(p, s, aaf, &r, {}, nullptr, &err), err.c_str());
+        QCOMPARE(r.videoTracks, 2);
+        QCOMPARE(r.videoClips, 4);
+        QCOMPARE(r.videoTransitions, 1);
+        QVERIFY(r.audioTracks >= 1);
+        QVERIFY(std::any_of(r.warnings.begin(), r.warnings.end(), [](const std::string& w) { return w.rfind("1 video clip(s) are not linked", 0) == 0; }));
+
+        // Read back by Montage's import: the same shots, places, source frames, dissolve, speed and files.
+        {
+            Project in = makeDefaultProject();
+            const ImportResult ir = importAaf(in, aaf, [](const std::string& f, MediaItem& m) { return probeMedia(f, m); });
+            QVERIFY2(ir.ok, ir.error.c_str());
+            QVERIFY(ir.offline.empty());
+            const Sequence& rs = *in.findSequence(ir.sequence);
+            QCOMPARE(rs.videoTracks.size(), size_t(2));
+            const auto& v1 = rs.videoTracks[0].clips;
+            QCOMPARE(v1.size(), size_t(2));
+            QVERIFY2(v1[0].start == 0 && v1[0].duration == 40 && std::fabs(v1[0].sourceIn - 20) < 0.01,
+                     qPrintable(QString("%1 %2 %3").arg(v1[0].start).arg(v1[0].duration).arg(v1[0].sourceIn)));
+            QVERIFY2(v1[1].start == 40 && v1[1].duration == 40 && std::fabs(v1[1].sourceIn - 90) < 0.01,
+                     qPrintable(QString("%1 %2 %3").arg(v1[1].start).arg(v1[1].duration).arg(v1[1].sourceIn)));
+            QCOMPARE(rs.videoTracks[0].transitions.size(), size_t(1));
+            QCOMPARE(rs.videoTracks[0].transitions[0].duration, FrameTime(10));
+            QCOMPARE(in.findMedia(v1[0].mediaId)->path, st.path);
+            const auto& v2 = rs.videoTracks[1].clips;
+            QCOMPARE(v2.size(), size_t(2));
+            QVERIFY2(v2[0].start == 20 && v2[0].duration == 25 && std::fabs(v2[0].speed - 2) < 1e-3 && std::fabs(v2[0].sourceIn) < 0.01,
+                     qPrintable(QString("%1 %2 %3 %4").arg(v2[0].start).arg(v2[0].duration).arg(v2[0].speed).arg(v2[0].sourceIn)));
+            QVERIFY(v2[1].start == 60 && v2[1].duration == 20);
+            QCOMPARE(in.findMedia(v2[1].mediaId)->path, still);
+            QVERIFY(!rs.audioTracks.empty() && !rs.audioTracks[0].clips.empty());
+        }
+
+        // A clip of footage conformed from 25 to 50 fps (Interpret Footage) plays its file at twice the speed.
+        {
+            Project c = makeDefaultProject();
+            Sequence& cs = *c.active();
+            cs.fps = {25, 1};
+            cs.audioTracks.clear();
+            Interpretation in;
+            in.fps = {50, 1};
+            in.fileFps = {25, 1};
+            const MediaItem conformed = probeOrFail(c, interpretedPath(st.path, in));
+            c.media.push_back(conformed);
+            QVERIFY(edit::placeMedia(c, cs, conformed.id, 0, 10, 30, {TrackKind::Video, 0}, {TrackKind::Audio, -1}, false).ok);
+            const std::string caaf = path("conformed.aaf");
+            AafExportResult cr;
+            QVERIFY2(exportAaf(c, cs, caaf, &cr, {}, nullptr, &err), err.c_str());
+            QCOMPARE(cr.audioTracks, 0);
+            QVERIFY(!QFileInfo::exists(QString::fromStdString(path("conformed Media"))));  // nothing written there
+            Project back = makeDefaultProject();
+            const ImportResult ir = importAaf(back, caaf, [](const std::string& f, MediaItem& m) { return probeMedia(f, m); });
+            QVERIFY2(ir.ok, ir.error.c_str());
+            const Clip& k = back.findSequence(ir.sequence)->videoTracks[0].clips.at(0);
+            QVERIFY2(k.start == 0 && k.duration == 20 && std::fabs(k.speed - 2) < 1e-3 && std::fabs(k.sourceIn - 20) < 0.01,
+                     qPrintable(QString("%1 %2 %3 %4").arg(k.start).arg(k.duration).arg(k.speed).arg(k.sourceIn)));
+        }
+
+        // Through MCP, sound only when asked.
+        {
+            const QString project = QString::fromStdString(path("picture.montage"));
+            QVERIFY(saveProject(p, project.toStdString()));
+            McpServer server;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_export_timeline"},
+                                                         {"arguments", QJsonObject{{"project", project}, {"format", "aaf"}, {"picture", false},
+                                                                                   {"output", QString::fromStdString(path("sound-only.aaf"))}}},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            const QJsonObject res = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+            QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+            QCOMPARE(res.value("structuredContent").toObject().value("video_tracks").toInt(), 0);
+            QVERIFY(res.value("structuredContent").toObject().value("audio_tracks").toInt() >= 1);
+        }
+
+        // An independent reader (pyaaf2): picture slots, the dissolve, Motion Control and the files' descriptors.
+        const QByteArray python = qgetenv("MONTAGE_TEST_PYAAF2");
+        if (python.isEmpty()) return;
+        QProcess py;
+        py.start(QString::fromLocal8Bit(python), {"-I", QStringLiteral(MONTAGE_TEST_TOOLS_DIR "/aaf_check.py"), QString::fromStdString(aaf)});
+        QVERIFY(py.waitForFinished(60000));
+        QVERIFY2(py.exitCode() == 0, py.readAllStandardError().constData());
+        const QJsonObject j = QJsonDocument::fromJson(py.readAllStandardOutput()).object();
+        const QJsonArray tr = j.value("tracks").toArray();
+        QVERIFY(tr.size() >= 3);
+        QCOMPARE(tr[0].toObject().value("name").toString(), QString("V1"));
+        QCOMPARE(tr[0].toObject().value("rate").toString(), QString("25"));
+        const QJsonArray a = tr[0].toObject().value("components").toArray();
+        QCOMPARE(a.size(), 3);
+        QCOMPARE(a[0].toObject().value("length").toInt(), 45);  // into the dissolve, 5 frames past the edit
+        QCOMPARE(a[0].toObject().value("start").toInt(), 20);
+        QVERIFY(a[0].toObject().value("file").toString().endsWith("pic-movie.mp4"));
+        QCOMPARE(a[0].toObject().value("samples").toInt(), 150);
+        QCOMPARE(a[1].toObject().value("op").toString(), QString("Video Dissolve"));
+        QCOMPARE(a[1].toObject().value("cut").toInt(), 5);
+        QCOMPARE(a[2].toObject().value("start").toInt(), 85);
+        const QJsonArray b = tr[1].toObject().value("components").toArray();
+        QCOMPARE(b.size(), 4);
+        QCOMPARE(b[0].toObject().value("type").toString(), QString("filler"));
+        QCOMPARE(b[1].toObject().value("op").toString(), QString("Motion Control"));
+        QVERIFY(std::fabs(b[1].toObject().value("params").toObject().value("constant").toDouble() - 2) < 1e-6);
+        QCOMPARE(b[1].toObject().value("inputs").toArray()[0].toObject().value("length").toInt(), 50);
+        QVERIFY(b[3].toObject().value("file").toString().endsWith("still.png"));
     }
 
     void superScaleUpscaling() {

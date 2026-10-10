@@ -734,7 +734,7 @@ void MainWindow::buildMenus() {
     add(file, tr("Export &FCPXML (Final Cut Pro)…"), QKeySequence(), [this] { exportInterchange(Interchange::FcpXml); });
     add(file, tr("Export E&DL (CMX 3600)…"), QKeySequence(), [this] { exportInterchange(Interchange::Edl); });
     add(file, tr("Export &OpenTimelineIO…"), QKeySequence(), [this] { exportInterchange(Interchange::Otio); });
-    add(file, tr("Export &AAF for Audio Post (Pro Tools, Fairlight)…"), QKeySequence(), [this] { exportAafDialog(); })
+    add(file, tr("Export &AAF (Pro Tools, Fairlight, Media Composer)…"), QKeySequence(), [this] { exportAafDialog(); })
         ->setObjectName(QStringLiteral("exportAaf"));
     file->addSeparator();
     add(file, tr("&Quit"), QKeySequence::Quit, [this] { close(); });
@@ -5748,6 +5748,11 @@ bool MainWindow::exportAafTo(const QString& path, QString* summary) {
                        .arg(o.result.transitions)
                        .arg(o.result.mediaFiles.size())
                        .arg(QFileInfo(path).completeBaseName() + tr(" Media"));
+    if (o.result.videoTracks)
+        text += tr("; %1 video tracks, %2 clips, %3 dissolves linked to the original files")
+                    .arg(o.result.videoTracks)
+                    .arg(o.result.videoClips)
+                    .arg(o.result.videoTransitions);
     for (const std::string& w : o.result.warnings) text += "\n" + QString::fromStdString(w);
     if (summary) *summary = text;
     return true;
@@ -5758,7 +5763,7 @@ void MainWindow::exportAafDialog() {
     if (!s) return;
     QSettings st = appSettings();
     const QString path = QFileDialog::getSaveFileName(
-        this, tr("Export AAF for Audio Post"), st.value("lastExportDir").toString() + "/" + QString::fromStdString(s->name) + ".aaf",
+        this, tr("Export AAF"), st.value("lastExportDir").toString() + "/" + QString::fromStdString(s->name) + ".aaf",
         tr("AAF (*.aaf)"));
     if (path.isEmpty()) return;
     st.setValue("lastExportDir", QFileInfo(path).absolutePath());

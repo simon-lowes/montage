@@ -6,12 +6,15 @@
 #include <QUrl>
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <map>
+#include <numeric>
 
 #include "core/Aaf.h"
 #include "core/Interpretation.h"
 #include "core/EditOps.h"
 #include "media/Decoder.h"
+#include "media/ImageSequence.h"
 #include "media/MediaPool.h"
 
 namespace montage {
@@ -39,6 +42,7 @@ const char* const kConstantValue = "0d010101-0101-3d00-060e-2b3402060101";
 const char* const kVaryingValue = "0d010101-0101-3e00-060e-2b3402060101";
 const char* const kControlPoint = "0d010101-0101-1900-060e-2b3402060101";
 const char* const kWaveDescriptor = "0d010101-0101-2c00-060e-2b3402060101";
+const char* const kCdciDescriptor = "0d010101-0101-2800-060e-2b3402060101";
 const char* const kNetworkLocator = "0d010101-0101-3200-060e-2b3402060101";
 const char* const kDataDefinition = "0d010101-0101-1b00-060e-2b3402060101";
 const char* const kContainerDefinition = "0d010101-0101-2000-060e-2b3402060101";
@@ -48,8 +52,13 @@ const char* const kInterpolationDefinition = "0d010101-0101-2100-060e-2b34020601
 
 // Definitions.
 const char* const kSound = "01030202-0200-0000-060e-2b3404010101";
+const char* const kPicture = "01030202-0100-0000-060e-2b3404010101";
 const char* const kTimecodeData = "01030201-0100-0000-060e-2b3404010101";
 const char* const kContainerAAF = "4313b571-d8ba-11d2-809b-006008143e6f";
+const char* const kContainerExternal = "4313b572-d8ba-11d2-809b-006008143e6f";
+const char* const kVideoDissolve = "0c3bea40-fc05-11d2-8a29-0050040ef7d2";  // OperationDef_VideoDissolve
+const char* const kSpeedControl = "9d2ea893-0968-11d3-8a38-0050040ef7d2";   // OperationDef_VideoSpeedControl
+const char* const kSpeedRatio = "72559a80-24d7-11d3-8a50-0050040ef7d2";     // ParameterDef_SpeedRatio
 const char* const kAudioGain = "9d2ea894-0968-11d3-8a38-0050040ef7d2";      // OperationDef_MonoAudioGain
 const char* const kAudioDissolve = "0c3bea41-fc05-11d2-8a29-0050040ef7d2";  // OperationDef_MonoAudioDissolve
 const char* const kAmplitude = "e4962321-2267-11d3-8a4c-0050040ef7d2";      // ParameterDef_Amplitude
@@ -68,14 +77,15 @@ Obj definition(const char* cls, const char* id, const std::string& name, const s
     return d;
 }
 
-Obj soundComponent(const char* cls, int64_t length) {
+Obj component(const char* cls, int64_t length, const char* dataDef) {
     Obj c = make(cls);
-    c->weak(0x0201, AafRefTable::DataDefinitions, 0x1b01, aafAuid(kSound)).i64(0x0202, length);
+    c->weak(0x0201, AafRefTable::DataDefinitions, 0x1b01, aafAuid(dataDef)).i64(0x0202, length);
     return c;
 }
+Obj soundComponent(const char* cls, int64_t length) { return component(cls, length, kSound); }
 
-Obj sourceClip(int64_t length, int64_t start, const std::string& mobId, uint32_t slot) {
-    Obj c = soundComponent(kSourceClip, length);
+Obj sourceClip(int64_t length, int64_t start, const std::string& mobId, uint32_t slot, const char* dataDef = kSound) {
+    Obj c = component(kSourceClip, length, dataDef);
     c->i64(0x1201, start).bytes(0x1101, mobId).u32(0x1102, slot);
     return c;
 }
@@ -166,6 +176,25 @@ struct Source {
     double frames = 0;  // length in sequence frames
 };
 
+// A picture file the composition links to: the camera original where it is, not copied.
+struct Picture {
+    std::string file, name, masterMob, fileMob;
+    Rational rate{25, 1};  // its frame rate (the sequence's for a still)
+    double seconds = 0;    // its length; 0 for a still (as long as wanted)
+    double used = 0;       // seconds of it the composition reaches (a still's length)
+    int width = 0, height = 0;
+};
+
+// A video clip as placed: its extent with the handles a dissolve reaches into, and where in the file it starts.
+struct PlacedPicture {
+    const Clip* clip = nullptr;
+    Picture* picture = nullptr;
+    int64_t start = 0, end = 0;  // timeline frames
+    double sourceStart = 0;      // the file's time at `start`, in sequence frames
+    double ratio = 1;            // file frames per timeline frame (speed, and a conformed rate)
+    int64_t dissolveCut = -1;    // with the clip before: the edit point, when they dissolve
+};
+
 // A clip as placed in the AAF sequence: its extent with the handles fades and crossfades reach into.
 struct Placed {
     const Clip* clip = nullptr;
@@ -203,7 +232,7 @@ Obj gainParameter(const Clip& c, int64_t offset, int64_t length) {
 }  // namespace
 
 bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, AafExportResult* result,
-               const ExportProgress& progress, const std::atomic<bool>* cancel, std::string* error) {
+               const ExportProgress& progress, const std::atomic<bool>* cancel, std::string* error, const AafExportOptions& options) {
     AafExportResult res;
     const double fps = seq.fpsValue();
     const QFileInfo out(QString::fromStdString(path));
@@ -245,8 +274,101 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
         }
         if (any) tracks.push_back(&t);
     }
-    if (tracks.empty()) {
-        if (error) *error = "There is no audio on the timeline to export";
+
+    // The picture: each video clip linked to the file it plays, where it is.
+    std::map<std::string, Picture> pictures;  // by file
+    struct PictureTrack {
+        const Track* track = nullptr;
+        std::vector<PlacedPicture> clips;
+    };
+    std::vector<PictureTrack> pictureTracks;
+    if (options.picture) {
+        int skipped = 0, motion = 0, notDissolve = 0, fades = 0, shortened = 0;
+        for (const Track& t : seq.videoTracks) {
+            if (t.muted) continue;
+            PictureTrack pt;
+            pt.track = &t;
+            std::map<Id, size_t> at;  // clip -> its place in pt.clips
+            for (const Clip& c : t.clips) {
+                if (!c.enabled) continue;
+                const MediaItem* m = c.mediaId && !c.isGenerator() ? p.findMedia(c.mediaId) : nullptr;
+                const std::string file = m ? uninterpretedPath(m->path) : std::string();
+                if (!m || (m->kind != MediaKind::Video && m->kind != MediaKind::Image) || file.empty() || isImageSequencePath(file)) {
+                    ++skipped;
+                    continue;
+                }
+                const Interpretation in = interpretationOf(*m);
+                const double ts = in.timeScale();  // seconds of the file per second of media time
+                Picture& pic = pictures[file];
+                if (pic.file.empty()) {
+                    pic.file = file;
+                    pic.name = m->name.empty() ? QFileInfo(QString::fromStdString(file)).completeBaseName().toStdString() : m->name;
+                    const Rational own = in.conformed() ? in.fileFps : m->fps;
+                    const bool still = m->kind == MediaKind::Image || m->duration <= 0;
+                    pic.rate = still || !own.valid() ? (seq.fps.valid() ? seq.fps : Rational{30, 1}) : own;
+                    pic.seconds = still ? 0 : m->duration * ts;
+                    pic.width = m->width > 0 ? m->width : seq.width;
+                    pic.height = m->height > 0 ? m->height : seq.height;
+                    pic.masterMob = aafNewMobId();
+                    pic.fileMob = aafNewMobId();
+                }
+                PlacedPicture pc;
+                pc.clip = &c;
+                pc.picture = &pic;
+                pc.start = c.start;
+                pc.end = c.end();
+                // AAF carries a constant speed; a ramp plays at its average and a reversed clip forwards, from its
+                // first frame in the file.
+                if (c.reverse || c.ramped()) ++motion;
+                const double speed = c.ramped() ? c.sourceExtent() / std::max<double>(1, double(c.duration)) : c.speed;
+                pc.ratio = std::max(1e-6, std::fabs(speed)) * ts;
+                pc.sourceStart = (c.reverse || c.ramped() ? std::min(c.sourceAt(0), c.sourceAt(double(c.duration))) : c.sourceIn) * ts;
+                if (c.reverse && !c.ramped()) pc.sourceStart = std::max(0.0, pc.sourceStart);
+                at[c.id] = pt.clips.size();
+                pt.clips.push_back(pc);
+            }
+            // Dissolves between two carried clips that meet: each reaches into the other's handles as far as the
+            // media allows, around the edit.
+            for (const Transition& tr : t.transitions) {
+                FrameTime a, b;
+                if (!edit::transitionRange(t, tr, a, b)) continue;
+                if (!tr.clipA || !tr.clipB) {
+                    ++fades;
+                    continue;
+                }
+                const auto ia = at.find(tr.clipA), ib = at.find(tr.clipB);
+                if (ia == at.end() || ib == at.end()) continue;
+                PlacedPicture& pa = pt.clips[ia->second];
+                PlacedPicture& pb = pt.clips[ib->second];
+                if (pa.end != pb.start) continue;
+                const FrameTime cut = pb.start;
+                const int64_t preroll = int64_t(std::floor(pb.sourceStart / pb.ratio + 1e-6));
+                int64_t postroll = std::numeric_limits<int64_t>::max();
+                if (pa.picture->seconds > 0) {
+                    const double used = pa.sourceStart + double(pa.end - pa.start) * pa.ratio;
+                    postroll = int64_t(std::floor((pa.picture->seconds * fps - used) / pa.ratio + 1e-6));
+                }
+                const int64_t before = std::max<int64_t>(0, std::min<int64_t>(cut - a, preroll));
+                const int64_t after = std::max<int64_t>(0, std::min<int64_t>(b - cut, postroll));
+                if (before < cut - a || after < b - cut) ++shortened;
+                if (before + after <= 0) continue;
+                if (tr.type != "cross_dissolve") ++notDissolve;
+                pa.end += after;
+                pb.start -= before;
+                pb.sourceStart -= double(before) * pb.ratio;
+                pb.dissolveCut = cut;
+            }
+            std::sort(pt.clips.begin(), pt.clips.end(), [](const PlacedPicture& x, const PlacedPicture& y) { return x.start < y.start; });
+            if (!pt.clips.empty()) pictureTracks.push_back(std::move(pt));
+        }
+        if (skipped) res.warnings.push_back(std::to_string(skipped) + " video clip(s) are not linked: titles, generated clips, nested sequences and image sequences leave gaps in the picture");
+        if (motion) res.warnings.push_back(std::to_string(motion) + " video clip(s) with speed ramps or reversed play at a constant speed forwards in the AAF");
+        if (notDissolve) res.warnings.push_back(std::to_string(notDissolve) + " video transition(s) became dissolves");
+        if (fades) res.warnings.push_back(std::to_string(fades) + " fade(s) to or from black are not carried");
+        if (shortened) res.warnings.push_back(std::to_string(shortened) + " dissolve(s) were shortened or cut: not enough media beyond the edit");
+    }
+    if (tracks.empty() && pictureTracks.empty()) {
+        if (error) *error = "There is nothing on the timeline to export";
         return false;
     }
 
@@ -291,6 +413,21 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
     dict->addToSet(0x2605, "DataDefinitions", 0x1b01, aafAuid(kTimecodeData),
                    definition(kDataDefinition, kTimecodeData, "DataDef_Timecode", "Timecode data"));
     dict->addToSet(0x2608, "ContainerDefinitions", 0x1b01, aafAuid(kContainerAAF), definition(kContainerDefinition, kContainerAAF, "ContainerDef_AAF", ""));
+    if (!pictureTracks.empty()) {
+        dict->addToSet(0x2605, "DataDefinitions", 0x1b01, aafAuid(kPicture), definition(kDataDefinition, kPicture, "DataDef_Picture", "Picture data"));
+        dict->addToSet(0x2608, "ContainerDefinitions", 0x1b01, aafAuid(kContainerExternal),
+                       definition(kContainerDefinition, kContainerExternal, "ContainerDef_External", "Essence in a file of its own"));
+        Obj dissolve = definition(kOperationDefinition, kVideoDissolve, "Video Dissolve", "Video dissolve");
+        dissolve->weak(0x1e01, AafRefTable::DataDefinitions, 0x1b01, aafAuid(kPicture)).u8(0x1e02, 0).u32(0x1e07, 2);
+        dict->addToSet(0x2603, "OperationDefinitions", 0x1b01, aafAuid(kVideoDissolve), std::move(dissolve));
+        Obj speed = definition(kOperationDefinition, kSpeedControl, "Motion Control", "Video speed control");
+        speed->weak(0x1e01, AafRefTable::DataDefinitions, 0x1b01, aafAuid(kPicture)).u8(0x1e02, 1).u32(0x1e07, 1);
+        speed->weakSet(0x1e09, "ParametersDefined", AafRefTable::ParameterDefinitions, 0x1b01, {aafAuid(kSpeedRatio)});
+        dict->addToSet(0x2603, "OperationDefinitions", 0x1b01, aafAuid(kSpeedControl), std::move(speed));
+        Obj ratio = definition(kParameterDefinition, kSpeedRatio, "Speed Ratio", "Speed ratio");
+        ratio->weak(0x1f01, AafRefTable::TypeDefinitions, 0x0005, aafAuid(kRationalType));
+        dict->addToSet(0x2604, "ParameterDefinitions", 0x1b01, aafAuid(kSpeedRatio), std::move(ratio));
+    }
     {
         Obj gain = definition(kOperationDefinition, kAudioGain, "Audio Gain", "Mono audio gain");
         gain->weak(0x1e01, AafRefTable::DataDefinitions, 0x1b01, aafAuid(kSound)).u8(0x1e02, 0).u32(0x1e07, 1);
@@ -347,6 +484,60 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
         comp->add(0x4403, "Slots", timelineSlot(1, "TC1", 1, num, den, std::move(tc)));
     }
     uint32_t slotId = 2, physical = 1;
+    // Picture tracks: V1 up, each clip a source clip into its file's master mob (inside a Motion Control operation
+    // when it plays at another speed), dissolves as transitions at their edit points.
+    {
+        uint32_t picturePhysical = 1;
+        for (const PictureTrack& pt : pictureTracks) {
+            Obj sequence = component(kSequence, 0, kPicture);
+            int64_t cursor = 0;
+            const PlacedPicture* prev = nullptr;
+            for (const PlacedPicture& pc : pt.clips) {
+                int64_t start = pc.start;
+                double sourceStart = pc.sourceStart;
+                const int64_t overlap = prev ? prev->end - start : 0;
+                if (prev && pc.dissolveCut >= 0 && overlap > 0) {
+                    Obj op = component(kOperationGroup, overlap, kPicture);
+                    op->weak(0x0b01, AafRefTable::OperationDefinitions, 0x1b01, aafAuid(kVideoDissolve));
+                    Obj tr = component(kTransition, overlap, kPicture);
+                    tr->i64(0x1802, std::clamp<int64_t>(pc.dissolveCut - start, 0, overlap)).strong(0x1801, "OperationGroup", std::move(op));
+                    sequence->add(0x1001, "Components", std::move(tr));
+                    cursor -= overlap;
+                    ++res.videoTransitions;
+                } else {
+                    if (start < cursor) {  // overlapping the clip before (no dissolve): start where it ends
+                        sourceStart += double(cursor - start) * pc.ratio;
+                        start = cursor;
+                    }
+                    if (start > cursor) sequence->add(0x1001, "Components", component(kFiller, start - cursor, kPicture));
+                }
+                const int64_t length = pc.end - start;
+                if (length <= 0) continue;
+                const int64_t in = std::max<int64_t>(0, std::llround(sourceStart));
+                const double needed = sourceStart + double(length) * pc.ratio;  // sequence frames into the file
+                pc.picture->used = std::max(pc.picture->used, needed / fps);
+                if (std::fabs(pc.ratio - 1) < 1e-9) {
+                    sequence->add(0x1001, "Components", sourceClip(length, in, pc.picture->masterMob, 1, kPicture));
+                } else {
+                    const int64_t used = std::max<int64_t>(1, std::llround(double(length) * pc.ratio));
+                    Obj op = component(kOperationGroup, length, kPicture);
+                    Obj ratio = make(kConstantValue);
+                    ratio->bytes(0x4c01, aafAuid(kSpeedRatio)).indirectRational(0x4d01, int32_t(std::llround(pc.ratio * 100000)), 100000);
+                    op->weak(0x0b01, AafRefTable::OperationDefinitions, 0x1b01, aafAuid(kSpeedControl))
+                        .add(0x0b02, "InputSegments", sourceClip(used, in, pc.picture->masterMob, 1, kPicture))
+                        .addToSet(0x0b03, "Parameters", 0x1b01, aafAuid(kSpeedRatio), std::move(ratio));
+                    sequence->add(0x1001, "Components", std::move(op));
+                }
+                cursor = start + length;
+                prev = &pc;
+                ++res.videoClips;
+            }
+            sequence->i64(0x0202, cursor);
+            const std::string name = pt.track->name.empty() ? "V" + std::to_string(picturePhysical) : pt.track->name;
+            comp->add(0x4403, "Slots", timelineSlot(slotId++, name, picturePhysical++, num, den, std::move(sequence)));
+            ++res.videoTracks;
+        }
+    }
     for (const Track* t : tracks) {
         // The clips, extended into their handles where fades and crossfades reach.
         std::vector<Placed> placed;
@@ -446,6 +637,38 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
     }
     content->addToSet(0x1901, "Mobs", 0x4401, compId, std::move(comp));
 
+    // Each picture file: a master mob, and a file source mob whose descriptor (CDCI) and locator name the file.
+    for (auto& [file, pic] : pictures) {
+        if (pic.masterMob.empty()) continue;
+        const double rate = pic.rate.toDouble();
+        const int64_t frames = std::max<int64_t>(1, std::llround((pic.seconds > 0 ? pic.seconds : pic.used) * rate));
+        Obj fileMob = mob(kSourceMob, QFileInfo(QString::fromStdString(file)).fileName().toStdString(), pic.fileMob);
+        fileMob->add(0x4403, "Slots", timelineSlot(1, "", 1, pic.rate.num, pic.rate.den, sourceClip(frames, 0, std::string(32, '\0'), 0, kPicture)));
+        Obj desc = make(kCdciDescriptor);
+        Obj locator = make(kNetworkLocator);
+        locator->text(0x4001, QUrl::fromLocalFile(QString::fromStdString(file)).toString(QUrl::FullyEncoded).toStdString());
+        int w = std::max(1, pic.width), h = std::max(1, pic.height);
+        int g = std::gcd(w, h);
+        std::string lineMap(8, '\0');
+        desc->rational(0x3001, pic.rate.num, pic.rate.den)
+            .i64(0x3002, frames)
+            .weak(0x3004, AafRefTable::ContainerDefinitions, 0x1b01, aafAuid(kContainerExternal))
+            .u32(0x3202, uint32_t(h))
+            .u32(0x3203, uint32_t(w))
+            .u8(0x320c, 0)  // full frame
+            .bytes(0x320d, lineMap)
+            .rational(0x320e, w / g, h / g)
+            .u32(0x3301, 8)
+            .u32(0x3302, 2)
+            .u32(0x3308, 1)
+            .add(0x2f01, "Locator", std::move(locator));
+        fileMob->strong(0x4701, "EssenceDescription", std::move(desc));
+        content->addToSet(0x1901, "Mobs", 0x4401, pic.fileMob, std::move(fileMob));
+        Obj master = mob(kMasterMob, pic.name, pic.masterMob);
+        master->add(0x4403, "Slots", timelineSlot(1, "", 1, pic.rate.num, pic.rate.den, sourceClip(frames, 0, pic.fileMob, 1, kPicture)));
+        content->addToSet(0x1901, "Mobs", 0x4401, pic.masterMob, std::move(master));
+    }
+
     // Header.
     AafObject header(kHeader);
     header.strong(0x3b04, "Dictionary", std::move(dict)).strong(0x3b03, "Content", std::move(content));
@@ -459,6 +682,7 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
     header.now(0x3b02).u16(0x3b01, 0x4949);
     if (cancelled()) return false;
     if (!writeAafFile(path, header, error)) return false;
+    if (tracks.empty()) QDir().rmdir(mediaDir);  // no sound files: no folder for them
     if (progress) progress(1.0, 0);
     if (result) *result = res;
     return true;

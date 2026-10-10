@@ -5720,10 +5720,12 @@ void McpServer::Impl::addTools() {
 
     add("montage_export_timeline", "Export the timeline",
         "Write the active sequence as an EDL, OpenTimelineIO, Final Cut Pro 7 XML (Premiere, Resolve), FCPXML (Final Cut "
-        "Pro) or AAF for audio post (Pro Tools, Fairlight: the audio tracks, linked to mono WAVs written to a \"<name> "
-        "Media\" folder beside it, with crossfades, fades and clip gain).",
+        "Pro) or AAF (Pro Tools, Fairlight, Media Composer: the audio tracks linked to mono WAVs written to a \"<name> "
+        "Media\" folder beside it, with crossfades, fades and clip gain; the video tracks linked to the original files, "
+        "with dissolves and constant speed, unless picture is false).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"format":{"type":"string","enum":["edl","otio","xml","fcpxml","aaf"]},
-            "output":{"type":"string"}},"required":["project","format","output"]})json",
+            "output":{"type":"string"},"picture":{"type":"boolean","description":"AAF: include the video tracks (default true)"}},
+            "required":["project","format","output"]})json",
         true, [this](const QJsonObject& a) {
             Loaded l = open(a);
             const QString f = need(a, "format");
@@ -5731,15 +5733,19 @@ void McpServer::Impl::addTools() {
                 const QString out = absolute(need(a, "output"));
                 AafExportResult r;
                 std::string err;
-                if (!exportAaf(l.project, l.seq(), out.toStdString(), &r, [this](double x, FrameTime) { progress(x, "AAF"); }, nullptr, &err))
+                AafExportOptions o;
+                o.picture = a.value("picture").toBool(true);
+                if (!exportAaf(l.project, l.seq(), out.toStdString(), &r, [this](double x, FrameTime) { progress(x, "AAF"); }, nullptr, &err, o))
                     return fail(QString::fromStdString(err));
                 QJsonArray files, warnings;
                 for (const std::string& m : r.mediaFiles) files.append(QString::fromStdString(m));
                 for (const std::string& w : r.warnings) warnings.append(QString::fromStdString(w));
-                return ok(QStringLiteral("Wrote %1: %2 audio tracks, %3 clips, %4 crossfades, %5 WAV files")
-                              .arg(out).arg(r.audioTracks).arg(r.clips).arg(r.transitions).arg(files.size()),
+                return ok(QStringLiteral("Wrote %1: %2 audio tracks, %3 clips, %4 crossfades, %5 WAV files; %6 video tracks, %7 clips, %8 dissolves")
+                              .arg(out).arg(r.audioTracks).arg(r.clips).arg(r.transitions).arg(files.size())
+                              .arg(r.videoTracks).arg(r.videoClips).arg(r.videoTransitions),
                           QJsonObject{{"output", out}, {"audio_tracks", r.audioTracks}, {"clips", r.clips},
-                                      {"crossfades", r.transitions}, {"media", files}, {"warnings", warnings}});
+                                      {"crossfades", r.transitions}, {"video_tracks", r.videoTracks}, {"video_clips", r.videoClips},
+                                      {"dissolves", r.videoTransitions}, {"media", files}, {"warnings", warnings}});
             }
             const std::string text = f == "otio" ? exportOtio(l.project, l.seq())
                                      : f == "xml" ? exportFcp7Xml(l.project, l.seq())
