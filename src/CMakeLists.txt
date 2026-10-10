@@ -108,6 +108,7 @@ add_library(montage_engine STATIC
   render/Retime.h render/Retime.cpp
   render/VideoDenoise.h render/VideoDenoise.cpp
   render/Shapes.h render/Shapes.cpp
+  render/Title3D.h render/Title3D.cpp
   render/AafExport.h render/AafExport.cpp
   render/ClipAnalysis.h render/ClipAnalysis.cpp
   render/MusicEdit.h render/MusicEdit.cpp

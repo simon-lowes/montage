@@ -1499,11 +1499,14 @@ void McpServer::Impl::addTools() {
         "Add a text title over the picture at a time, for a duration (default 3 s), on a video track (default: the "
         "track above the top one in use). template picks a ready-made, animated design (a lower third takes two lines: "
         "name, newline, role; credits roll up the frame, a crawl runs along the bottom); the text replaces its sample text. "
-        "motion makes any title roll or crawl, starting and ending off screen.",
+        "motion makes any title roll or crawl, starting and ending off screen. The 3d template is extruded text turned in "
+        "space and lit (Final Cut's 3D titles), `depth` deep, spinning in with `spin_in`.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"text":{"type":"string"},
             "at":{"type":["number","string"]},"duration":{"type":["number","string"],"default":3},
             "track":{"type":"string"},"size":{"type":"number","description":"Font size in pixels"},
-            "template":{"type":"string","enum":["plain","lower_third","lower_third_box","centred","chapter","callout","typewriter","cascade","pop_words","drop","wave","decode","end_card","credits","crawl"],"default":"plain"},
+            "template":{"type":"string","enum":["plain","lower_third","lower_third_box","centred","chapter","callout","typewriter","cascade","pop_words","drop","wave","decode","end_card","credits","crawl","3d"],"default":"plain"},
+            "depth":{"type":"number","description":"3d: how far the letters are extruded (pixels)"},
+            "spin_in":{"type":"boolean","description":"3d: spin in at the start"},
             "text_animation":{"type":"string","enum":["none","rise","fade","pop","drop","wave","scramble"],"description":"The text coming on a letter, word or line at a time"},
             "animate_by":{"type":"string","enum":["letter","word","line"],"default":"letter"},
             "animation_seconds":{"type":"number","default":1,"description":"How long the text animation takes across the whole text"},
@@ -1523,11 +1526,16 @@ void McpServer::Impl::addTools() {
             }
             const FrameTime len = a.contains("duration") ? timeArg(a.value("duration"), s, "duration") : FrameTime(std::llround(3 * s.fpsValue()));
             const QString tpl = str(a, "template", "plain");
-            const std::string type = tpl == "plain" ? std::string("title") : "title_" + tpl.toStdString();
-            if (type != "title" && !findTitleTemplate(type)) throw ArgError{QStringLiteral("Unknown template \"%1\"").arg(tpl)};
+            const std::string type = tpl == "plain" ? std::string("title") : tpl == "3d" ? std::string("title3d") : "title_" + tpl.toStdString();
+            if (type != "title" && type != "title3d" && !findTitleTemplate(type)) throw ArgError{QStringLiteral("Unknown template \"%1\"").arg(tpl)};
+            if (type == "title3d" && (a.contains("text_animation") || a.contains("motion")))
+                throw ArgError{"A 3D title has its own animation (spin_in); text_animation and motion are for flat titles"};
+            if (type != "title3d" && (a.contains("depth") || a.contains("spin_in"))) throw ArgError{"depth and spin_in are for the 3d template"};
             Clip c = makeGeneratorClip(l.project, type, std::max<FrameTime>(1, len));
             c.generator.strings["text"] = need(a, "text").toStdString();
             if (a.value("size").isDouble()) c.generator.params["size"] = Param(a.value("size").toDouble());
+            if (a.value("depth").isDouble()) c.generator.params["depth"] = Param(std::clamp(a.value("depth").toDouble(), 0.0, 1000.0));
+            if (a.value("spin_in").toBool()) c.generator.params["anim_in"] = Param(2.0);
             if (a.contains("text_animation")) {
                 const QStringList kinds{"none", "rise", "fade", "pop", "drop", "wave", "scramble"};
                 const int k = int(kinds.indexOf(str(a, "text_animation")));

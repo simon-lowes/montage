@@ -11912,6 +11912,21 @@ private slots:
                                                   {"motion", "crawl_left"}, {"track", "V4"}});
         QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
         QVERIFY(tool("montage_add_title", QJsonObject{{"project", project}, {"text", "x"}, {"at", 0}, {"motion", "sideways"}}).value("isError").toBool());
+        // Extruded 3D text, spinning in; its own options only on it.
+        r = tool("montage_add_title", QJsonObject{{"project", project}, {"text", "Chapter One"}, {"at", 0}, {"duration", 0.3},
+                                                  {"template", "3d"}, {"depth", 60}, {"spin_in", true}, {"track", "V5"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        {
+            Project p3;
+            QVERIFY(loadProject(project.toStdString(), p3));
+            const Clip* t3 = nullptr;
+            for (const Track& vt : p3.active()->videoTracks)
+                for (const Clip& c : vt.clips)
+                    if (c.generator.type == "title3d") t3 = &c;
+            QVERIFY(t3 && t3->generator.s("text") == "Chapter One" && t3->generator.p("depth", 0) == 60 && t3->generator.p("anim_in", 0) == 2);
+        }
+        QVERIFY(tool("montage_add_title", QJsonObject{{"project", project}, {"text", "x"}, {"at", 0}, {"depth", 10}}).value("isError").toBool());
+        QVERIFY(tool("montage_add_title", QJsonObject{{"project", project}, {"text", "x"}, {"at", 0}, {"template", "3d"}, {"motion", "roll"}}).value("isError").toBool());
         // Words popping on one at a time, and leaving the same way.
         r = tool("montage_add_title", QJsonObject{{"project", project}, {"text", "One two three"}, {"at", 0.5}, {"duration", 0.2},
                                                   {"text_animation", "pop"}, {"animate_by", "word"}, {"animation_seconds", 0.5},

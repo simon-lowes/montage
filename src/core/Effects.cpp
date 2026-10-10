@@ -736,6 +736,38 @@ std::vector<EffectInfo> buildCatalog() {
                          {str("text", "Text", StringKind::MultilineText, "Title"),
                           str("font", "Font", StringKind::Font, "Sans Serif")}};
         c.push_back(title);
+        // Extruded 3D text (render/Title3D.h): turned in space, lit, seen through a perspective camera.
+        EffectInfo title3d{"title3d", "3D Title", EffectCategory::Generator, "Titles",
+                           {
+                               num("size", "Font Size (px)", 4, 1000, 120, 1),
+                               color("color", "Face", 0.95, 0.95, 0.95),
+                               color("side_color", "Sides", 0.45, 0.5, 0.6),
+                               num("depth", "Extrusion (px)", 0, 1000, 40, 0.5),
+                               num("rot_x", "Tilt (X°)", -360, 360, 10, 0.5),
+                               num("rot_y", "Turn (Y°)", -360, 360, -20, 0.5),
+                               num("rot_z", "Roll (Z°)", -360, 360, 0, 0.5),
+                               num("pos_x", "Position X", -4000, 4000, 0, 1),
+                               num("pos_y", "Position Y", -4000, 4000, 0, 1),
+                               pct("scale", "Scale", 1, 2000, 100),
+                               num("fov", "Lens (field of view °)", 5, 120, 35, 0.5),
+                               num("light_angle", "Light Direction (°)", -180, 180, -40, 1),
+                               num("light_height", "Light Height (°)", -90, 90, 40, 1),
+                               pct("ambient", "Ambient Light", 0, 100, 35),
+                               pct("specular", "Shine", 0, 100, 40),
+                               num("tracking", "Tracking", -50, 200, 0, 0.5),
+                               num("line_spacing", "Line Spacing", 0.5, 3, 1.1),
+                               boolean("bold", "Bold", true),
+                               boolean("italic", "Italic"),
+                               choice("align", "Alignment", {"Left", "Center", "Right"}, 1),
+                               pct("opacity", "Opacity", 0, 100, 100),
+                               choice("anim_in", "Animate In", {"None", "Fade", "Spin", "Flip Up", "Swing In", "Zoom From Far"}, 0),
+                               num("anim_in_dur", "In Duration (s)", 0.05, 10, 0.8, 0.05),
+                               choice("anim_out", "Animate Out", {"None", "Fade", "Spin", "Flip Up", "Swing In", "Zoom From Far"}, 0),
+                               num("anim_out_dur", "Out Duration (s)", 0.05, 10, 0.8, 0.05),
+                           },
+                           {str("text", "Text", StringKind::MultilineText, "3D Title"),
+                            str("font", "Font", StringKind::Font, "Sans Serif")}};
+        c.push_back(title3d);
         // Ready-made titles: a Title with its settings filled in (makeEffect gives type "title").
         for (const TitleTemplate& tpl : titleTemplates()) {
             EffectInfo t = title;

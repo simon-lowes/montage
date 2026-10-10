@@ -23,6 +23,7 @@
 #include "Processing.h"
 #include "Retime.h"
 #include "Shapes.h"
+#include "Title3D.h"
 #include "TemporalFx.h"
 #include "VideoDenoise.h"
 #include "audio/PluginEffect.h"
@@ -376,6 +377,8 @@ Image renderGenerator(const Effect& g, FrameTime t, int w, int h, double scale, 
         return renderTitle(g, t, w, h, scale, duration, fps);
     } else if (g.type == "shape") {
         return renderShape(g, t, w, h, scale);
+    } else if (g.type == "title3d") {
+        return renderTitle3D(g, t, w, h, scale, duration, fps);
     }
     return img;
 }

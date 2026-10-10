@@ -4297,6 +4297,130 @@ colorspaces:
         QVERIFY(across == 1 && down == 1);
     }
 
+    void titles3D() {
+        // Extruded text, lit flat (all ambient, no shine) so faces and sides show their own colours.
+        auto title = [](const std::string& text) {
+            Effect g = makeEffect("title3d", 1);
+            g.strings["text"] = text;
+            g.params["size"] = Param(200.0);
+            g.params["rot_x"] = Param(0.0);
+            g.params["rot_y"] = Param(0.0);
+            g.params["ambient"] = Param(100.0);
+            g.params["specular"] = Param(0.0);
+            g.params["color.r"] = Param(1.0), g.params["color.g"] = Param(0.8), g.params["color.b"] = Param(0.2);
+            g.params["side_color.r"] = Param(0.2), g.params["side_color.g"] = Param(0.3), g.params["side_color.b"] = Param(0.9);
+            return g;
+        };
+        const int w = 480, h = 270;
+        auto dump = [&](const Image& img, const char* name) {
+            if (const QByteArray dir = qgetenv("MONTAGE_TEST_DUMP"); !dir.isEmpty()) {
+                QImage q(img.width, img.height, QImage::Format_RGBA8888);
+                toRgba8(img, q.bits(), size_t(q.bytesPerLine()));
+                q.save(QString::fromLocal8Bit(dir) + "/" + name + ".png");
+            }
+        };
+        struct Ink {
+            int x0 = 1 << 30, x1 = -1, y0 = 1 << 30, y1 = -1, faces = 0, sides = 0, covered = 0;
+        };
+        auto ink = [](const Image& img) {
+            Ink k;
+            for (int y = 0; y < img.height; ++y)
+                for (int x = 0; x < img.width; ++x) {
+                    const float* p = img.at(x, y);
+                    if (p[3] < 0.5f) continue;
+                    ++k.covered;
+                    k.x0 = std::min(k.x0, x), k.x1 = std::max(k.x1, x), k.y0 = std::min(k.y0, y), k.y1 = std::max(k.y1, y);
+                    if (p[3] > 0.99f && std::fabs(p[0] - 1) < 0.02f && std::fabs(p[1] - 0.8f) < 0.02f && std::fabs(p[2] - 0.2f) < 0.02f) ++k.faces;
+                    if (p[3] > 0.99f && std::fabs(p[0] - 0.2f) < 0.02f && std::fabs(p[1] - 0.3f) < 0.02f && std::fabs(p[2] - 0.9f) < 0.02f) ++k.sides;
+                }
+            return k;
+        };
+        // Face on: the face's colour where the letters are, nothing round them; the sides hidden behind (only a sliver
+        // shows in perspective away from the middle).
+        const Image flat = renderGenerator(title("H"), 0, w, h, 1.0, 90, 30);
+        dump(flat, "t3d-flat");
+        const Ink f = ink(flat);
+        QVERIFY2(f.covered > 2000 && f.faces > 0.85 * f.covered, qPrintable(QString("%1 %2").arg(f.covered).arg(f.faces)));
+        QVERIFY(flat.at(2, 2)[3] == 0 && flat.at(w - 3, h - 3)[3] == 0);
+        // A letter's hole stays open (nonzero winding): the middle of an O is empty, its ring is not.
+        const Image o = renderGenerator(title("O"), 0, w, h, 1.0, 90, 30);
+        dump(o, "t3d-o");
+        const Ink oi = ink(o);
+        QVERIFY(oi.covered > 1000);
+        QCOMPARE(o.at((oi.x0 + oi.x1) / 2, (oi.y0 + oi.y1) / 2)[3], 0.0f);
+        // Turned 60° about Y, a thin title is about half as wide (in perspective); a deep one shows its side.
+        Effect thin = title("H");
+        thin.params["rot_y"] = Param(60.0);
+        thin.params["depth"] = Param(2.0);
+        const Ink th = ink(renderGenerator(thin, 0, w, h, 1.0, 90, 30));
+        const double ratio = double(th.x1 - th.x0) / double(f.x1 - f.x0);
+        QVERIFY2(ratio > 0.4 && ratio < 0.65, qPrintable(QString::number(ratio)));
+        Effect turned = title("H");
+        turned.params["rot_y"] = Param(60.0);
+        turned.params["depth"] = Param(80.0);
+        const Image tu = renderGenerator(turned, 0, w, h, 1.0, 90, 30);
+        dump(tu, "t3d-turned");
+        const Ink ti = ink(tu);
+        QVERIFY2(ti.sides > 300 && ti.faces > 300, qPrintable(QString("%1 %2").arg(ti.sides).arg(ti.faces)));
+        // Turned the right side back, the left side shows: the sides' pixels lie left of the face's.
+        double faceX = 0, sideX = 0;
+        int nf = 0, ns = 0;
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                const float* p = tu.at(x, y);
+                if (p[3] < 0.99f) continue;
+                if (std::fabs(p[2] - 0.2f) < 0.02f) faceX += x, ++nf;
+                else if (std::fabs(p[2] - 0.9f) < 0.02f) sideX += x, ++ns;
+            }
+        QVERIFY(nf && ns && sideX / ns < faceX / nf);
+        // Seen from behind (180°): the back face, mirrored, the same size.
+        Effect back = title("H");
+        back.params["rot_y"] = Param(180.0);
+        const Ink bi = ink(renderGenerator(back, 0, w, h, 1.0, 90, 30));
+        QVERIFY(std::abs(bi.covered - f.covered) < f.covered / 10 && bi.faces > 0.8 * bi.covered);
+        // Flat (no depth) and edge on: next to nothing.
+        Effect edge = title("H");
+        edge.params["depth"] = Param(0.0);
+        edge.params["rot_y"] = Param(90.0);
+        QVERIFY(ink(renderGenerator(edge, 0, w, h, 1.0, 90, 30)).covered < f.covered / 20);
+        // Lit from where the camera is, the face is fully lit; from straight above, only the ambient light reaches it.
+        Effect lit = title("H");
+        lit.params["ambient"] = Param(20.0);
+        lit.params["light_height"] = Param(90.0);
+        const Image li = renderGenerator(lit, 0, w, h, 1.0, 90, 30);
+        const float* centre = li.at(f.x0 + 12, (f.y0 + f.y1) / 2 + 30);  // on the left stem
+        lit.params["light_height"] = Param(0.0);
+        lit.params["light_angle"] = Param(0.0);
+        const Image dark = renderGenerator(lit, 0, w, h, 1.0, 90, 30);
+        const float* dc = dark.at(f.x0 + 12, (f.y0 + f.y1) / 2 + 30);
+        QVERIFY2(centre[3] > 0.99f && std::fabs(centre[0] - 1.0f) < 0.02f, qPrintable(QString::number(centre[0])));
+        QVERIFY2(dc[3] > 0.99f && std::fabs(dc[0] - 0.2f) < 0.03f, qPrintable(QString::number(dc[0])));
+        // Animation in: flipped up edge on at the start, settled by the end of it; faded out at the clip's end.
+        Effect anim = title("H");
+        anim.params["depth"] = Param(4.0);  // thin, so edge on is next to nothing
+        anim.params["anim_in"] = Param(3.0);
+        anim.params["anim_out"] = Param(1.0);
+        Effect still = anim;
+        still.params["anim_in"] = Param(0.0);
+        const int settledCover = ink(renderGenerator(still, 30, w, h, 1.0, 90, 30)).covered;
+        const Ink a0 = ink(renderGenerator(anim, 0, w, h, 1.0, 90, 30)), a1 = ink(renderGenerator(anim, 30, w, h, 1.0, 90, 30));
+        QVERIFY2(a0.covered < a1.covered / 5 && a1.covered == settledCover, qPrintable(QString("%1 %2").arg(a0.covered).arg(a1.covered)));
+        QCOMPARE(ink(renderGenerator(anim, 89, w, h, 1.0, 90, 30)).covered, 0);
+        // The same at a quarter size (preview), and the same picture each time.
+        const Image small = renderGenerator(title("H"), 0, w / 4, h / 4, 0.25, 90, 30);
+        const Ink si = ink(small);
+        QVERIFY(std::fabs(double(si.x1 - si.x0) * 4 - double(f.x1 - f.x0)) < 12);
+        const Image again = renderGenerator(turned, 0, w, h, 1.0, 90, 30);
+        QVERIFY(std::equal(again.px.begin(), again.px.end(), tu.px.begin()));
+        // The default look (shaded, turned a little), for looking at.
+        Effect plain = makeEffect("title3d", 2);
+        plain.strings["text"] = "Montage\n3D";
+        dump(renderGenerator(plain, 0, w, h, 0.5, 90, 30), "t3d-default");
+        // In the catalog, with its own text.
+        const EffectInfo* info = findEffectInfo("title3d");
+        QVERIFY(info && info->category == EffectCategory::Generator && info->displayName == "3D Title");
+    }
+
     void titlesRender() {
         Project p;
         Effect t = makeEffect(p, "title");
