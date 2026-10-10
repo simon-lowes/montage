@@ -104,6 +104,7 @@
 #include "MixerPanel.h"
 #include "MulticamPanel.h"
 #include "AdrPanel.h"
+#include "AudioDescriptionDialog.h"
 #include "CaptionsPanel.h"
 #include "MaskOverlay.h"
 #include "TransformOverlay.h"
@@ -1195,6 +1196,13 @@ void MainWindow::buildMenus() {
         adrDock_->show();
         adrDock_->raise();
     })->setObjectName(QStringLiteral("showAdr"));
+    add(seqM, tr("Audio &Description…"), QKeySequence(), [this] {
+        if (!state_->sequence()) return;
+        // Kept open beside the work while descriptions are written.
+        if (!audioDescription_) audioDescription_ = new AudioDescriptionDialog(state_, this);
+        audioDescription_->show();
+        audioDescription_->raise();
+    })->setObjectName(QStringLiteral("audioDescription"));
     add(seqM, tr("&Generate Voiceover…"), QKeySequence("Ctrl+Alt+G"), [this] {
         if (!state_->sequence()) return;
         SpeechDialog dlg(state_, this);

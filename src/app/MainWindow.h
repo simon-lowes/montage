@@ -57,6 +57,7 @@ class ShotSearchPanel;
 class PeoplePanel;
 class MulticamPanel;
 class AdrPanel;
+class AudioDescriptionDialog;
 class AudioMeterWidget;
 class LoudnessReadout;
 class VoiceoverDialog;
@@ -421,6 +422,7 @@ private:
     MixerPanel* mixer_ = nullptr;
     MulticamPanel* multicam_ = nullptr;
     AdrPanel* adr_ = nullptr;
+    AudioDescriptionDialog* audioDescription_ = nullptr;
     CaptionsPanel* captions_ = nullptr;
     TranscriptPanel* transcript_ = nullptr;
     ShotSearchPanel* shots_ = nullptr;

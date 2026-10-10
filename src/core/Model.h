@@ -339,6 +339,9 @@ struct Track {
     // Fader automation (core/Automation.h): volume (dB) and pan lanes keyed in timeline frames, and the
     // AutomationMode (0 Off, 1 Read, 2 Write, 3 Latch, 4 Touch).
     Param volumeAuto, panAuto;
+    // Surround position lanes (x, y, z as in SurroundPan), keyed in timeline frames and played in the same mode: a
+    // sound, or an ADM object, moving round the room.
+    Param surroundXAuto, surroundYAuto, surroundZAuto;
     int automation = 1;
     // Track folder (Resolve's Fairlight folders): tracks of a kind with the same folder, next to each other, show under
     // one header that can collapse them and mute, solo or hide them together. "" = none.

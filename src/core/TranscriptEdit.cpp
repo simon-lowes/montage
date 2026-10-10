@@ -1,4 +1,5 @@
 #include "TranscriptEdit.h"
+#include "Adr.h"
 
 #include <cctype>
 
@@ -120,6 +121,7 @@ edit::Result rippleDeleteRanges(Project& p, Sequence& s, std::vector<FrameRange>
         auto r = edit::extractRange(p, s, it->first, it->second, tracks);
         if (!r.ok) return r;
         rippleCaptions(s, it->first, it->second);
+        rippleAdrCues(s, it->first, it->second);
     }
     edit::Result res;
     for (const auto& r : ranges) res.applied += r.second - r.first;

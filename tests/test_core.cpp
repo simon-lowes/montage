@@ -39,6 +39,7 @@
 #include "core/TimelineCompare.h"
 #include "core/Reconform.h"
 #include "core/Adr.h"
+#include "core/AudioDescription.h"
 #include "core/ProjectIO.h"
 #include "core/ScriptCut.h"
 #include "core/Surround.h"
@@ -2733,6 +2734,91 @@ private slots:
         QCOMPARE(uint8_t(head[30]), uint8_t(12));
     }
 
+    void surroundPositionLanes() {
+        Fixture fx;
+        Track& a = fx.a1();
+        a.surround.x = -0.5, a.surround.y = std::sqrt(0.75), a.surround.width = 0.4, a.surround.object = true;
+        QVERIFY(!surroundAnimated(a));
+        QCOMPARE(trackSurroundAt(a, 50).x, -0.5);
+        // Lanes move it: x across from left to right over frames 0-60, rising overhead; y and the rest stay the track's.
+        a.surroundXAuto.addKey(0, -0.5);
+        a.surroundXAuto.addKey(60, 0.5);
+        a.surroundZAuto.addKey(0, 0);
+        a.surroundZAuto.addKey(60, 2);  // held within 0..1
+        QVERIFY(surroundAnimated(a));
+        SurroundPan at = trackSurroundAt(a, 30);
+        QVERIFY(std::fabs(at.x) < 1e-9 && std::fabs(at.y - std::sqrt(0.75)) < 1e-9 && at.width == 0.4 && at.object);
+        QVERIFY(std::fabs(at.z - 1.0) < 1e-9);
+        QCOMPARE(trackSurroundAt(a, 60).z, 1.0);
+        QVERIFY(std::fabs(trackSurroundAt(a, 15.5).x - (-0.5 + 15.5 / 60)) < 1e-9);  // between frames
+        // Off (and Write) do not read them.
+        a.automation = int(AutomationMode::Off);
+        QCOMPARE(trackSurroundAt(a, 30).x, -0.5);
+        a.automation = int(AutomationMode::Touch);
+        QCOMPARE(trackSurroundAt(a, 60).x, 0.5);
+        // Saved with the project; closing a gap moves the keys after it with the clips.
+        const std::string file = (QDir::tempPath() + "/montage-surround-lanes.montage").toStdString();
+        QVERIFY(saveProject(fx.p, file));
+        Project back;
+        QVERIFY(loadProject(file, back));
+        QFile::remove(QString::fromStdString(file));
+        const Track& b = back.active()->audioTracks[0];
+        QCOMPARE(b.surroundXAuto, a.surroundXAuto);
+        QCOMPARE(b.surroundZAuto, a.surroundZAuto);
+        QVERIFY(!b.surroundYAuto.animated());
+        fx.put(V1, 0, 10);
+        fx.put(V1, 40, 30);
+        QVERIFY(edit::deleteGaps(fx.p, fx.s()).ok);
+        QCOMPARE(fx.a1().surroundXAuto.keys.back().t, FrameTime(30));
+        QCOMPARE(fx.a1().surroundXAuto.keys.front().t, FrameTime(0));
+    }
+
+    void audioDescriptionGaps() {
+        // Speech 1-3 s, 6-7 s and 7.5-12 s in 15 s at 30 fps: gaps of two seconds or more, kept 0.3 s clear of the lines
+        // (not of the range's ends).
+        const std::vector<std::pair<double, double>> speech{{1, 3}, {6, 7}, {7.5, 12}};
+        const std::vector<DescriptionGap> gaps = descriptionGaps(speech, 30, 0, 450);
+        QCOMPARE(gaps.size(), size_t(2));
+        QCOMPARE(gaps[0], (DescriptionGap{99, 171}));
+        QCOMPARE(gaps[1], (DescriptionGap{369, 450}));
+        QVERIFY(descriptionGaps(speech, 30, 0, 450, 3.0).empty());
+        QCOMPARE(descriptionGaps({}, 30, 30, 90).size(), size_t(1));
+        QCOMPARE(descriptionGaps({}, 30, 30, 90)[0], (DescriptionGap{30, 90}));
+        QVERIFY(descriptionGaps(speech, 30, 120, 300).empty());  // only 4-10 s looked at: 4 s to 5.7 s is too short
+        // Words, seconds at a describer's pace, and fit.
+        QCOMPARE(descriptionWords("  A man   walks in. "), 4);
+        QCOMPARE(descriptionSeconds("A man walks in."), 1.5);
+        const std::string eight = "She opens the door and steps outside slowly";
+        DescriptionFit f = descriptionFit(eight, 2.5);
+        QVERIFY(f.fits && std::fabs(f.speed - 1.2) < 1e-9 && f.overWords == 2);
+        f = descriptionFit(eight, 2.0);
+        QVERIFY(!f.fits && std::fabs(f.speed - 1.5) < 1e-9 && f.overWords == 3);
+        f = descriptionFit("Night.", 2.0);
+        QVERIFY(f.fits && f.speed == 1.0 && f.overWords == 0);
+        // The description track: hidden, made once; descriptions replace what they overlap, empty text removes.
+        Fixture fx;
+        Sequence& s = fx.s();
+        QCOMPARE(findDescriptionTrack(s), -1);
+        const int t = descriptionTrack(fx.p, s, "fr");
+        QCOMPARE(descriptionTrack(fx.p, s), t);
+        QVERIFY(!s.captionTracks[size_t(t)].visible);
+        QCOMPARE(s.captionTracks[size_t(t)].language, std::string("fr"));
+        QVERIFY(setDescription(fx.p, s, 99, 171, "Rain on the window."));
+        QVERIFY(setDescription(fx.p, s, 369, 450, "She leaves."));
+        QVERIFY(setDescription(fx.p, s, 120, 160, "Rain streaks the glass."));  // replaces the first
+        auto& caps = s.captionTracks[size_t(t)].captions;
+        QCOMPARE(caps.size(), size_t(2));
+        QVERIFY(caps[0].start == 120 && caps[0].text == "Rain streaks the glass.");
+        QVERIFY(!setDescription(fx.p, s, 200, 200, "No room."));
+        QVERIFY(setDescription(fx.p, s, 130, 0, ""));  // the one there goes
+        QCOMPARE(caps.size(), size_t(1));
+        QVERIFY(!setDescription(fx.p, s, 10, 0, ""));
+        QVERIFY(!hasDescriptionClips(s));
+        const Id clip = fx.put(A1, 0, 30);
+        edit::clipById(s, clip)->role = kDescriptionRole;
+        QVERIFY(hasDescriptionClips(s));
+    }
+
     void adrCueList() {
         Fixture fx;
         Sequence& s = fx.s();  // 30 fps
@@ -2962,6 +3048,110 @@ private slots:
         }
         QVERIFY(removeAdrCue(fx.s(), annaId));
         QVERIFY(!removeAdrCue(fx.s(), annaId));
+    }
+
+    void adrReviewFixes() {
+        Fixture fx;
+        Sequence& s = fx.s();  // 30 fps
+        // Sheets (and marker lists) from a 01:00:00:00 timeline at 23.976 come in where their timecodes say.
+        Sequence film = makeSequence(fx.p, "Film", 1920, 1080, Rational{24000, 1001});
+        std::vector<AdrCue> got;
+        QVERIFY(parseAdrCueSheet("Cue,Start,End\nA1,01:00:01:00,01:00:02:00\n", film, got));
+        QVERIFY(got.size() == 1 && got[0].start == 24 && got[0].end == 48);
+        std::vector<Marker> marks;
+        QVERIFY(parseMarkerList("Marker Name,In\nM,01:00:01:00\n", film, marks));
+        QCOMPARE(marks.at(0).t, FrameTime(24));
+        // A quote inside a field is text: the rows after it are still read.
+        QVERIFY(parseAdrCueSheet("Cue\tStart\tLine\nX1\t00:00:01:00\tHe's 6'2\" tall\nX2\t00:00:03:00\tNext\n", s, got));
+        QCOMPARE(got.size(), size_t(2));
+        QCOMPARE(got[0].line, std::string("He's 6'2\" tall"));
+        // A cue numbered in the sheet keeps its number even after a blank one for the same character.
+        AdrCue blank, named;
+        blank.character = named.character = "Anna";
+        blank.start = 10, blank.end = 40;
+        named.name = "A101", named.start = 600, named.end = 640;
+        addAdrCues(fx.p, s, {blank, named});
+        QCOMPARE(s.adrCues.size(), size_t(2));
+        QCOMPARE(s.adrCues[0].name, std::string("A102"));
+        QCOMPARE(s.adrCues[1].name, std::string("A101"));
+        s.adrCues.clear();
+
+        auto audio = [&](const char* name, double seconds, bool picture = false) {
+            MediaItem m;
+            m.id = fx.p.newId();
+            m.kind = picture ? MediaKind::Video : MediaKind::Audio;
+            m.name = name;
+            m.path = std::string("/nonexistent/") + name;
+            m.duration = seconds;
+            m.hasAudio = true;
+            m.hasVideo = picture;
+            m.width = picture ? 1920 : 0, m.height = picture ? 1080 : 0;
+            fx.p.media.push_back(m);
+            return m.id;
+        };
+        AdrCue a, b;
+        a.name = "A1", a.start = 120, a.end = 150;
+        b.name = "B1", b.start = 100, b.end = 200;
+        const std::vector<Id> ids = addAdrCues(fx.p, s, {a, b});
+        const Id cueA = ids[1], cueB = ids[0];  // added in time order: B1 first
+        QCOMPARE(findAdrCue(s, cueA)->name, std::string("A1"));
+        // Overlapping lines: B's first take goes to a second ADR track instead of cutting A's out.
+        QVERIFY(edit::addAdrTake(fx.p, s, cueA, audio("a.wav", 10), 60, -1).ok);
+        QVERIFY(edit::addAdrTake(fx.p, s, cueB, audio("b.wav", 10), 60, -1).ok);
+        const Clip* ca = edit::clipById(s, findAdrCue(s, cueA)->clip);
+        const Clip* cb = edit::clipById(s, findAdrCue(s, cueB)->clip);
+        QVERIFY(ca && cb && ca->start == 120 && ca->duration == 30 && cb->start == 100 && cb->duration == 100);
+        QCOMPARE(s.audioTracks[size_t(edit::locate(s, ca->id)->track.index)].name, std::string("ADR"));
+        QCOMPARE(s.audioTracks[size_t(edit::locate(s, cb->id)->track.index)].name, std::string("ADR 2"));
+        // A track asked for that is taken there falls back to a free ADR track.
+        AdrCue c;
+        c.name = "C1", c.start = 130, c.end = 140;
+        const Id cueC = addAdrCues(fx.p, s, {c}).front();
+        QVERIFY(edit::addAdrTake(fx.p, s, cueC, audio("c.wav", 10), 60, edit::locate(s, ca->id)->track.index).ok);
+        QCOMPARE(s.audioTracks[size_t(edit::locate(s, findAdrCue(s, cueC)->clip)->track.index)].name, std::string("ADR 3"));
+        QVERIFY(edit::clipById(s, findAdrCue(s, cueA)->clip));
+        // A later take that ends before the clip starts is refused (a take stopped in the pre-roll).
+        QVERIFY(!edit::addAdrTake(fx.p, s, cueA, audio("short.wav", 1), 60, -1).ok);
+        QCOMPARE(edit::clipById(s, findAdrCue(s, cueA)->clip)->takes.size(), size_t(0));
+        // A first take stopped mid-line gives a short clip; a later full take grows it to the line.
+        AdrCue d;
+        d.name = "D1", d.start = 300, d.end = 360;
+        const Id cueD = addAdrCues(fx.p, s, {d}).front();
+        QVERIFY(edit::addAdrTake(fx.p, s, cueD, audio("d1.wav", 4.5), 180, -1).ok);  // 135 frames: to 315
+        QCOMPARE(edit::clipById(s, findAdrCue(s, cueD)->clip)->duration, FrameTime(15));
+        QVERIFY(edit::addAdrTake(fx.p, s, cueD, audio("d2.wav", 7), 180, -1).ok);
+        QCOMPARE(edit::clipById(s, findAdrCue(s, cueD)->clip)->duration, FrameTime(60));
+        // A take with picture leaves the video tracks alone.
+        AdrCue e;
+        e.name = "E1", e.start = 500, e.end = 530;
+        const Id cueE = addAdrCues(fx.p, s, {e}).front();
+        QVERIFY(edit::addAdrTake(fx.p, s, cueE, audio("e.mov", 30, true), 480, -1).ok);
+        QVERIFY(s.videoTracks[0].clips.empty());
+        QCOMPARE(edit::locate(s, findAdrCue(s, cueE)->clip)->track.kind, TrackKind::Audio);
+
+        // Cues follow what is taken out of the timeline: after it they move back, across it they keep the rest.
+        Sequence r = s;
+        rippleAdrCues(r, 110, 130);
+        const AdrCue* rb = nullptr;
+        for (const AdrCue& q : r.adrCues)
+            if (q.name == "B1") rb = &q;
+        QVERIFY(rb && rb->start == 100 && rb->end == 180);
+        QCOMPARE(std::find_if(r.adrCues.begin(), r.adrCues.end(), [](const AdrCue& q) { return q.name == "D1"; })->start, FrameTime(280));
+        rippleAdrCues(r, 0, 1000);
+        QVERIFY(r.adrCues.empty());
+        // Closing a gap moves them too.
+        Sequence gaps = makeSequence(fx.p, "Gaps", 1920, 1080, Rational{30, 1});
+        Clip k1 = makeClip(fx.p, *fx.p.findMedia(fx.media), TrackKind::Video, gaps);
+        k1.start = 0, k1.duration = 30;
+        QVERIFY(overwrite(fx.p, gaps, V1, k1).ok);
+        Clip k2 = k1;
+        k2.start = 90;
+        QVERIFY(overwrite(fx.p, gaps, V1, k2).ok);
+        AdrCue g;
+        g.name = "G1", g.start = 95, g.end = 110;
+        addAdrCues(fx.p, gaps, {g});
+        QVERIFY(edit::deleteGaps(fx.p, gaps).ok);
+        QVERIFY(gaps.adrCues[0].start == 35 && gaps.adrCues[0].end == 50);
     }
 
     void immersivePanning() {
@@ -4872,7 +5062,7 @@ private slots:
         QVERIFY(out.adrCues[0].start == 0 && out.adrCues[0].end == 20);
         QCOMPARE(out.adrCues[1].name, std::string("A1"));
         QVERIFY(out.adrCues[1].start == 70 && out.adrCues[1].end == 90);
-        QVERIFY(!out.adrCues[1].clip || edit::clipById(out, out.adrCues[1].clip));
+        QCOMPARE(out.adrCues[1].clip, v2.clips[0].id);  // its takes come along (here, the title's copy)
         QCOMPARE(out.adrCues[2].name, std::string("D1"));
         QVERIFY(out.adrCues[2].start == 130 && out.adrCues[2].end == 140);
         QVERIFY(out.adrCues[0].id != fx.p.findSequence(mix.id)->adrCues[0].id);
@@ -5613,6 +5803,51 @@ private slots:
         QVERIFY(!importXmlTimeline(p, "not xml").ok);
         QVERIFY(!importOtio(p, "{}").ok);
         QVERIFY(!importEdl(p, "nothing here", {25, 1}).ok);
+    }
+
+    void syncOffsetsAndRepair() {
+        Fixture fx;
+        auto r = placeMedia(fx.p, fx.s(), fx.media, 30, 30, 90, V1, A1, false);
+        QVERIFY(r.ok);
+        const Id v = r.created[0], a = r.created[1];
+        QVERIFY(syncOffsets(fx.s()).empty());
+        // Moving the sound alone puts it 5 frames late; the picture is the anchor.
+        QVERIFY(moveClips(fx.p, fx.s(), {a}, 5, 0, 0, false).ok);
+        auto offs = syncOffsets(fx.s());
+        QCOMPARE(offs.size(), size_t(1));
+        QCOMPARE(offs[0].clip, a);
+        QCOMPARE(offs[0].anchor, v);
+        QCOMPARE(offs[0].frames, 5.0);
+        QCOMPARE(syncOffset(fx.s(), v), 0.0);
+        QVERIFY(moveIntoSync(fx.p, fx.s(), a).ok);
+        QCOMPARE(clipById(fx.s(), a)->start, FrameTime(30));
+        QVERIFY(syncOffsets(fx.s()).empty());
+        QVERIFY(!moveIntoSync(fx.p, fx.s(), a).ok);  // already in sync
+        // Slipping the sound 8 frames early: slipping it back puts its source in where the picture's is.
+        clipById(fx.s(), a)->sourceIn = 22;
+        QCOMPARE(syncOffset(fx.s(), a), 8.0);
+        QVERIFY(slipIntoSync(fx.p, fx.s(), a).ok);
+        QCOMPARE(clipById(fx.s(), a)->sourceIn, 30.0);
+        QCOMPARE(clipById(fx.s(), a)->start, FrameTime(30));
+        // Trimming the sound's head in step stays in sync (the source moves with the start).
+        QVERIFY(trim(fx.p, fx.s(), a, Edge::In, 10, TrimMode::Normal, false).ok);
+        QCOMPARE(syncOffset(fx.s(), a), 0.0);
+        // Sound earlier than the picture's media can slip to: refused, moving works.
+        Fixture fx2;
+        auto r2 = placeMedia(fx2.p, fx2.s(), fx2.media, 30, 0, 90, V1, A1, false);
+        const Id a2 = r2.created[1];
+        QVERIFY(moveClips(fx2.p, fx2.s(), {a2}, -10, 0, 0, false).ok);
+        QCOMPARE(syncOffset(fx2.s(), a2), -10.0);
+        QVERIFY(!slipIntoSync(fx2.p, fx2.s(), a2).ok);
+        QVERIFY(moveIntoSync(fx2.p, fx2.s(), a2).ok);
+        QCOMPARE(clipById(fx2.s(), a2)->start, FrameTime(30));
+        // Different speeds, or other media in the group, are not compared.
+        QVERIFY(moveClips(fx2.p, fx2.s(), {a2}, 3, 0, 0, false).ok);
+        clipById(fx2.s(), a2)->speed = 2;
+        QVERIFY(syncOffsets(fx2.s()).empty());
+        clipById(fx2.s(), a2)->speed = 1;
+        clipById(fx2.s(), a2)->mediaId = 9999;
+        QVERIFY(syncOffsets(fx2.s()).empty());
     }
 
     void projectFileRelinksRelativePaths() {

@@ -49,6 +49,12 @@ void SurroundPanner::emitChange(bool final) {
     emit changed(pan_, final);
 }
 
+void SurroundPanner::setAnimated(bool on) {
+    if (animated_ == on) return;
+    animated_ = on;
+    update();
+}
+
 void SurroundPanner::paintEvent(QPaintEvent*) {
     QPainter p(this);
     p.setRenderHint(QPainter::Antialiasing);
@@ -86,6 +92,11 @@ void SurroundPanner::paintEvent(QPaintEvent*) {
         p.drawEllipse(ch, 2.5, 2.5);
     }
     const QPointF at = toWidget(pan_.x, pan_.y);
+    if (animated_) {  // keyed: a ring round it
+        p.setPen(QPen(QColor(255, 210, 80), 1.2));
+        p.setBrush(Qt::NoBrush);
+        p.drawEllipse(at, 7, 7);
+    }
     p.setPen(QPen(Qt::black, 1));
     p.setBrush(pan_.lfeDb > -99 ? QColor(255, 170, 90) : theme::kAccent);
     if (pan_.object && objectsAllowed_) {
@@ -169,6 +180,12 @@ void SurroundPanner::contextMenuEvent(QContextMenuEvent* e) {
         o->setCheckable(true);
         o->setChecked(pan_.object);
         o->setToolTip(tr("Exported as an object of its own, at this position, instead of in the bed"));
+    }
+    if (objectsAllowed_) {
+        QAction* k = menu.addAction(tr("Animate Position"), this, [this](bool on) { emit animateRequested(on); });
+        k->setCheckable(true);
+        k->setChecked(animated_);
+        k->setToolTip(tr("Key the position at the playhead; moving it then keys it there, and Write, Latch or Touch record it as it plays"));
     }
     menu.addSeparator();
     menu.addAction(tr("Front (as in stereo)"), this, [this] {

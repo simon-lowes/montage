@@ -1,4 +1,5 @@
 #include "Exporter.h"
+#include "core/AudioDescription.h"
 
 #include "core/ColorGroups.h"
 #include "core/ClipAnimation.h"
@@ -1061,6 +1062,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             }
             e->mixer.setTrackMask(want.tracks);
             e->seq = seq;
+            for (const std::string& r : want.unmute) std::erase(e->seq.mutedRoles, r);
             if (!want.role.empty())
                 for (Track& t : e->seq.audioTracks)
                     for (Clip& c : t.clips)
@@ -1508,17 +1510,26 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
     // dialog's summary says, rather than failing or turning into stereo. Down to stereo it is the stereo fold-down of the
     // whole mix. Mono tracks carry a channel each, whatever the codec.
     const std::string layout = s.downmixStereo || s.monoAudioTracks > 0 ? seq.audioLayout : exportAudioLayout(seq.audioLayout, s.audioCodec);
+    // A described master: the mix without the descriptions, then the programme with them as a stream of its own.
+    const bool described = s.describedStream && hasDescriptionClips(seq) && !s.audioCodec.empty();
     bool ok;
-    if (layout == seq.audioLayout) {
-        ok = exportImpl(p, seq, s, progress, cancel, error, opened, encoderUsed, smartRendered, light);
-    } else if (layoutChannels(layout) <= 2) {
-        ExportSettings stereo = s;
-        stereo.downmixStereo = true;
-        ok = exportImpl(p, seq, stereo, progress, cancel, error, opened, encoderUsed, smartRendered, light);
+    if (layout != seq.audioLayout || described) {
+        Sequence work = seq;
+        ExportSettings settings = s;
+        if (layoutChannels(layout) <= 2 && layoutChannels(seq.audioLayout) > 2) settings.downmixStereo = true;
+        else work.audioLayout = layout;
+        if (described) {
+            if (!edit::roleMuted(work, kDescriptionRole)) work.mutedRoles.push_back(kDescriptionRole);
+            ExportSettings::AudioStream ad;
+            ad.name = s.describedName.empty() ? std::string("Audio Description") : s.describedName;
+            ad.language = s.audioLanguage;
+            ad.unmute = {kDescriptionRole};
+            settings.extraAudio.push_back(std::move(ad));
+            if (settings.audioName.empty()) settings.audioName = "Programme";
+        }
+        ok = exportImpl(p, work, settings, progress, cancel, error, opened, encoderUsed, smartRendered, light);
     } else {
-        Sequence folded = seq;
-        folded.audioLayout = layout;
-        ok = exportImpl(p, folded, s, progress, cancel, error, opened, encoderUsed, smartRendered, light);
+        ok = exportImpl(p, seq, s, progress, cancel, error, opened, encoderUsed, smartRendered, light);
     }
     // Never leave a truncated file behind (the output is closed by now), but
     // don't touch an existing file if we failed before writing to it.

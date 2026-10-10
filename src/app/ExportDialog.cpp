@@ -28,6 +28,7 @@
 
 #include "EditorState.h"
 #include "RenderQueue.h"
+#include "core/AudioDescription.h"
 #include "core/Surround.h"
 #include "SequenceSettingsDialog.h"
 #include "Theme.h"
@@ -213,6 +214,12 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
                             "each named and tagged with its language"));
     streams_->setCurrentIndex(std::clamp(appSettings().value("export/audioStreams", 0).toInt(), 0, 2));
     form->addRow(tr("Audio streams:"), streams_);
+    described_ = new QCheckBox(tr("Audio description: the programme with its descriptions as a stream after the mix"), form_);
+    described_->setObjectName(QStringLiteral("exportDescribed"));
+    described_->setToolTip(tr("The mix without the descriptions (clips of the role Description), then a stream with them, as "
+                              "broadcasters and streaming services ask for described video"));
+    described_->setChecked(appSettings().value("export/described", true).toBool());
+    form->addRow(QString(), described_);
     chapters_ = new QCheckBox(tr("From chapter markers"), form_);
     chapters_->setObjectName(QStringLiteral("exportChapters"));
     chapters_->setChecked(appSettings().value("export/chapters", true).toBool());
@@ -499,6 +506,8 @@ void ExportDialog::updateControls() {
         const QString e = p ? QString::fromStdString(p->extension).toLower() : QString();
         const bool container = e == QLatin1String("mp4") || e == QLatin1String("mov") || e == QLatin1String("mkv") || e == QLatin1String("mxf");
         streams_->setEnabled(p && hasAudio(p->settings) && container);
+        described_->setEnabled(p && hasAudio(p->settings) && container && state_ && state_->sequence() &&
+                               hasDescriptionClips(*state_->sequence()));
     }
     const QString ext = p ? QString::fromStdString(p->extension).toLower() : QString();
     const bool chapterFile = ext == QLatin1String("mp4") || ext == QLatin1String("mov") || ext == QLatin1String("m4v") ||
@@ -645,7 +654,8 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
     }
     settings.setValue("export/captions", captions_->currentIndex());
     if (allCaptions_->isEnabled() && allCaptions_->isChecked() && state_->sequence())
-        for (const CaptionTrack& t : state_->sequence()->captionTracks) s.extraCaptions.push_back(t.id);
+        for (const CaptionTrack& t : state_->sequence()->captionTracks)
+            if (t.name != kDescriptionTrackName) s.extraCaptions.push_back(t.id);  // descriptions are spoken, not subtitles
     settings.setValue("export/allCaptions", allCaptions_->isChecked());
     s.cea608 = cea608_->isEnabled() && cea608_->isChecked();
     settings.setValue("export/cea608", cea608_->isChecked());
@@ -655,6 +665,8 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
         if (!state_->sequence()->captionTracks.empty()) s.audioLanguage = state_->sequence()->captionTracks.front().language;
     }
     settings.setValue("export/audioStreams", streams_->currentIndex());
+    s.describedStream = described_->isEnabled() && described_->isChecked();
+    settings.setValue("export/described", described_->isChecked());
     s.chapters = chapters_->isChecked();
     settings.setValue("export/chapters", chapters_->isChecked());
     if (startTc_->isEnabled() && !startTc_->text().trimmed().isEmpty() && state_->sequence()) {

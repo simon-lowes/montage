@@ -335,6 +335,9 @@ QJsonObject trackToJson(const Track& t) {
     if (const QJsonValue sp = surroundToJson(t.surround); !sp.isUndefined()) o["surround"] = sp;
     if (t.volumeAuto.animated()) o["volumeAuto"] = paramToJson(t.volumeAuto);
     if (t.panAuto.animated()) o["panAuto"] = paramToJson(t.panAuto);
+    if (t.surroundXAuto.animated()) o["surroundXAuto"] = paramToJson(t.surroundXAuto);
+    if (t.surroundYAuto.animated()) o["surroundYAuto"] = paramToJson(t.surroundYAuto);
+    if (t.surroundZAuto.animated()) o["surroundZAuto"] = paramToJson(t.surroundZAuto);
     if (t.automation != 1) o["automation"] = t.automation;
     if (!t.folder.empty()) o["folder"] = qs(t.folder);
     return o;
@@ -369,6 +372,9 @@ Track trackFromJson(const QJsonObject& o, TrackKind kind) {
     if (o.contains("surround")) t.surround = surroundFromJson(o.value("surround"));
     if (o.contains("volumeAuto")) t.volumeAuto = paramFromJson(o.value("volumeAuto"));
     if (o.contains("panAuto")) t.panAuto = paramFromJson(o.value("panAuto"));
+    if (o.contains("surroundXAuto")) t.surroundXAuto = paramFromJson(o.value("surroundXAuto"));
+    if (o.contains("surroundYAuto")) t.surroundYAuto = paramFromJson(o.value("surroundYAuto"));
+    if (o.contains("surroundZAuto")) t.surroundZAuto = paramFromJson(o.value("surroundZAuto"));
     t.automation = std::clamp(o.value("automation").toInt(1), 0, 4);
     t.folder = ss(o.value("folder"));
     std::sort(t.clips.begin(), t.clips.end(), [](const Clip& a, const Clip& b) { return a.start < b.start; });

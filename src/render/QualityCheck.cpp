@@ -6,6 +6,7 @@
 
 #include "ColorSpace.h"
 #include "Compositor.h"
+#include "core/EditOps.h"
 #include "core/SpellCheck.h"
 #include "media/Loudness.h"
 
@@ -58,6 +59,7 @@ const char* qcKindName(QcKind k) {
         case QcKind::Loudness: return "Loudness";
         case QcKind::TruePeak: return "True peak";
         case QcKind::Spelling: return "Spelling";
+        case QcKind::OutOfSync: return "Out of sync";
     }
     return "";
 }
@@ -345,6 +347,16 @@ std::vector<QcIssue> qualityCheck(const Project& p, const Sequence& s, FrameTime
                                           "Spelling in the title '" + (c.name.empty() ? text->second.substr(0, 40) : c.name) + "': " + listed(bad)});
                 }
     }
+    if (q.sync)
+        for (const edit::SyncOffset& o : edit::syncOffsets(s)) {
+            const Clip* c = edit::clipById(s, o.clip);
+            const Clip* a = edit::clipById(s, o.anchor);
+            if (!c->enabled || c->end() <= in || c->start >= out) continue;
+            const double frames = std::fabs(o.frames);
+            issues.push_back({QcKind::OutOfSync, std::max(c->start, in), std::min(c->end(), out),
+                              "'" + c->name + "' is " + fmt("%g", std::round(frames * 10) / 10) + (frames == 1 ? " frame " : " frames ") +
+                                  (o.frames > 0 ? "late" : "early") + " against '" + a->name + "', the clip it is linked to"});
+        }
     std::stable_sort(issues.begin(), issues.end(), [](const QcIssue& a, const QcIssue& b) { return a.start < b.start; });
     if (progress) progress(1.0);
     return issues;

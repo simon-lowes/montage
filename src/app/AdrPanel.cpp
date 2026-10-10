@@ -230,9 +230,18 @@ AdrPanel::AdrPanel(EditorState* state, PlaybackController* program, ViewerWidget
     refreshTimer_->setInterval(0);
     connect(refreshTimer_, &QTimer::timeout, this, &AdrPanel::refresh);
     connect(state_, &EditorState::projectChanged, refreshTimer_, qOverload<>(&QTimer::start));
+    // Another sequence or project: a take being recorded belongs to neither, so it is dropped.
     connect(state_, &EditorState::sequenceSwitched, this, [this] {
-        if (cycle_) stop();
+        if (recorder_->isRecording()) {
+            recorder_->cancel();
+            state_->message(tr("ADR take dropped: the sequence changed while recording"), 6000);
+        }
+        if (cycle_) endCycle();
         refresh();
+    });
+    // Playback stopping (Space, the sequence's end, a shuttle) ends a cycle as reaching its end does.
+    connect(program_, &PlaybackController::playingChanged, this, [this](bool playing) {
+        if (!playing) playbackEnded();
     });
 
     if (viewer) {
@@ -549,49 +558,68 @@ void AdrPanel::startCycle(bool record) {
     recording_ = record;
     stopRequested_ = false;
     graceArmed_ = false;
+    ++cycleSerial_;
     cycleText_ = q->character.empty() ? qs(q->line) : qs(q->character) + QStringLiteral(": ") + qs(q->line);
     const QString cueName = qs(q->name);
     if (record) {
         recorder_->setPlacing(false);
-        recorder_->setTakeNaming(QStringLiteral("ADR"), cueName + QStringLiteral(" take "));
+        QString stem = cueName;  // a file name: no path separators or characters Windows refuses
+        for (QChar& ch : stem)
+            if (QStringLiteral("/\\:*?\"<>|").contains(ch)) ch = '-';
+        recorder_->setTakeNaming(QStringLiteral("ADR"), stem + QStringLiteral(" take "));
         if (!recorder_->start(c.playFrom, 0, c.playTo, input_->count() ? input_->currentText() : QString(), useDevice_)) {
             statusLabel_->setText(tr("Could not start recording"));
             return;
         }
         program_->setMutedAudioTracks(mutedWhileRecording());
     }
+    // Forward at normal speed (not a shuttle), once through (not looping round In to Out).
+    if (program_->isPlaying()) program_->pause();
+    loopWas_ = program_->loop();
+    program_->setLoop(false);
     cycle_ = c;
+    lastPosition_ = c.playFrom;
     program_->setAdrCycle(c);
     program_->seek(c.playFrom);
-    if (!program_->isPlaying()) program_->play();
+    program_->play();
     statusLabel_->setText(record ? tr("Recording %1, take %2").arg(cueName).arg(adrTakeCount(*s, *q) + 1) : tr("Rehearsing %1").arg(cueName));
     refreshTakes();
     updateButtons();
 }
 
 void AdrPanel::endCycle() {
+    cycle_.reset();  // first: pausing below reports playback stopping, which must find no cycle
+    ++cycleSerial_;
+    recording_ = false;
     program_->setAdrCycle(std::nullopt);
     program_->setMutedAudioTracks({});
     if (program_->isPlaying()) program_->pause();
-    cycle_.reset();
-    recording_ = false;
+    program_->setLoop(loopWas_);
     meter_->setValue(0);
     refresh();
 }
 
 void AdrPanel::onPosition(FrameTime t) {
-    if (!cycle_ || t < cycle_->playTo) return;
-    if (program_->isPlaying()) program_->pause();
+    if (!cycle_) return;
+    // Past the post-roll, or jumped back (playback looping round): the pass is over.
+    const bool back = t + 1 < lastPosition_;
+    lastPosition_ = std::max(lastPosition_, t);
+    if (t >= cycle_->playTo || back) playbackEnded();
+}
+
+void AdrPanel::playbackEnded() {
+    if (!cycle_) return;
     if (!recording_) {
         endCycle();
         return;
     }
+    if (program_->isPlaying()) program_->pause();  // (comes back here, and finds the stop already armed)
     // The recording stops itself at the end of the cycle; should its input lag behind the picture, a moment later.
     if (!graceArmed_) {
         graceArmed_ = true;
-        QTimer::singleShot(1500, this, [this, cue = cycleCue_] {
+        QTimer::singleShot(1500, this, [this, serial = cycleSerial_] {
             graceArmed_ = false;
-            if (cycle_ && cycleCue_ == cue && recorder_->isRecording()) recorder_->stop();
+            if (cycle_ && cycleSerial_ == serial && recorder_->isRecording()) recorder_->stop();
         });
     }
 }
@@ -601,11 +629,14 @@ void AdrPanel::onTaken(Id media, FrameTime at) {
     const Id cue = cycleCue_;
     const int track = track_->currentIndex() - 1;  // -1: the ADR track
     Id clip = 0;
-    state_->apply(tr("Record ADR Take"), [&](Project& p, Sequence& sq) {
+    std::string why;
+    const bool kept = state_->apply(tr("Record ADR Take"), [&](Project& p, Sequence& sq) {
         edit::Result r = edit::addAdrTake(p, sq, cue, media, at, track);
         if (const AdrCue* q = r.ok ? findAdrCue(sq, cue) : nullptr) clip = q->clip;
+        why = r.error;
         return r;
     });
+    if (!kept) state_->message(tr("Take not kept: %1").arg(QString::fromStdString(why)), 6000);
     const bool again = loop_->isChecked() && !stopRequested_;
     endCycle();
     emit takeRecorded(cue, clip);
@@ -632,12 +663,14 @@ void AdrPanel::pickTake(int index) {
 }
 
 void AdrPanel::paintOverlay(QPainter& p, const QRectF& r) {
-    if (!cycle_) return;
+    // The cycle the Program monitor is playing.
+    const std::optional<AdrCycle>& cyc = program_->adrCycle();
+    if (!cyc) return;
     const FrameTime t = program_->position();
-    if (t < cycle_->playFrom || t > cycle_->playTo) return;
+    if (t < cyc->playFrom || t > cyc->playTo) return;
     p.save();
     // The streamer: a white bar crossing the picture with a fading trail, at the right edge on the line.
-    const double pos = adrStreamerPosition(*cycle_, t);
+    const double pos = adrStreamerPosition(*cyc, t);
     if (pos >= 0) {
         const double w = std::max(3.0, r.width() * 0.012), x = r.left() + pos * r.width();
         const double trail = std::min(6 * w, x - r.left());
@@ -650,7 +683,7 @@ void AdrPanel::paintOverlay(QPainter& p, const QRectF& r) {
         p.fillRect(QRectF(std::max(r.left(), x - w), r.top(), w, r.height()), QColor(255, 255, 255, 230));
     }
     // The punch on the line's first frames.
-    if (adrPunch(*cycle_, t)) {
+    if (adrPunch(*cyc, t)) {
         const double rad = r.height() * 0.12;
         p.setPen(Qt::NoPen);
         p.setBrush(QColor(255, 255, 255, 210));
@@ -664,7 +697,7 @@ void AdrPanel::paintOverlay(QPainter& p, const QRectF& r) {
         p.setFont(f);
         const QRectF box(r.left() + r.width() * 0.05, r.bottom() - r.height() * 0.16, r.width() * 0.9, r.height() * 0.11);
         p.fillRect(box, QColor(0, 0, 0, 150));
-        p.setPen(t >= cycle_->lineFrom && t < cycle_->lineTo ? QColor(255, 220, 60) : QColor(240, 240, 240));
+        p.setPen(t >= cyc->lineFrom && t < cyc->lineTo ? QColor(255, 220, 60) : QColor(240, 240, 240));
         p.drawText(box.adjusted(8, 0, -8, 0), Qt::AlignCenter | Qt::TextWordWrap, cycleText_);
     }
     // Recording: a red dot.

@@ -74,6 +74,7 @@ private:
     void startCycle(bool record);
     void endCycle();
     void onPosition(FrameTime t);
+    void playbackEnded();  // the picture stopped or passed the cycle's end
     void onTaken(Id media, FrameTime at);
     void cellEdited(int row, int column);
     void paintOverlay(QPainter& p, const QRectF& r);
@@ -107,6 +108,9 @@ private:
     bool useDevice_ = true;
     bool refreshing_ = false;
     bool graceArmed_ = false;
+    bool loopWas_ = false;           // the Program monitor's loop setting before the cycle
+    int cycleSerial_ = 0;            // which cycle a delayed stop belongs to
+    FrameTime lastPosition_ = 0;
     int loopGap_ = 1000;
     QTimer* refreshTimer_;
 };

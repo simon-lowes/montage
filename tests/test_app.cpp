@@ -113,6 +113,8 @@
 #include "LoudnessReadout.h"
 #include "Voiceover.h"
 #include "AdrPanel.h"
+#include "AudioDescriptionDialog.h"
+#include "core/AudioDescription.h"
 #include "core/Adr.h"
 #include "MaskOverlay.h"
 #include "TransformOverlay.h"
@@ -649,6 +651,83 @@ private slots:
         QVERIFY(!mixer->recordingAutomation());
         mixer->playbackStopped(30);
         QCOMPARE(a1().volumeAuto.keys.size(), keys);
+    }
+
+    void surroundPositionAutomation() {
+        loadDemo();
+        state()->edit("5.1", [](Project&, Sequence& s) {
+            s.audioLayout = "5.1";
+            s.audioTracks[0].output = 0;
+            return true;
+        });
+        auto* mixer = win_->findChild<MixerPanel*>();
+        QVERIFY(mixer);
+        QTRY_VERIFY(mixer->trackSurround(0) && !mixer->trackSurround(0)->isHidden());
+        SurroundPanner* panner = mixer->trackSurround(0);
+        auto a1 = [&]() -> const Track& { return state()->sequence()->audioTracks.at(0); };
+        const SurroundPan still = a1().surround;
+        // Animate Position keys it where it is, at the playhead.
+        state()->setPlayhead(10);
+        emit panner->animateRequested(true);
+        QVERIFY(surroundAnimated(a1()));
+        QVERIFY(a1().surroundXAuto.keyAt(10) && a1().surroundYAuto.keyAt(10) && a1().surroundZAuto.keyAt(10));
+        QVERIFY(panner->isAnimated());
+        // Moved, it is keyed at the playhead; its own position stays.
+        state()->setPlayhead(50);
+        SurroundPan right = panner->pan();
+        right.x = 0.5, right.y = std::sqrt(0.75);
+        panner->setPan(right);
+        emit panner->changed(right, true);
+        QVERIFY(a1().surroundXAuto.keyAt(50));
+        QCOMPARE(a1().surroundXAuto.keyAt(50)->v, 0.5);
+        QCOMPARE(a1().surround.x, still.x);
+        // The panner follows the playhead.
+        state()->setPlayhead(30);
+        QVERIFY(std::fabs(panner->pan().x - (still.x + 0.5) / 2) < 1e-6);
+        state()->setPlayhead(0);
+        QCOMPARE(panner->pan().x, still.x);
+        // A Write pass records the panner: where it was, then hard right from frame 20; Write hands over to Touch.
+        mixer->trackAutomationMode(0)->setCurrentIndex(int(AutomationMode::Write));
+        mixer->playbackStarted(0);
+        QVERIFY(mixer->recordingAutomation());
+        for (FrameTime f = 0; f <= 60; ++f) {
+            if (f == 20) {
+                SurroundPan p = panner->pan();
+                p.x = 1, p.y = 0;
+                panner->setPan(p);
+            }
+            mixer->playbackPosition(f);
+            if (f == 30) QCOMPARE(a1().surround.x, 1.0);  // heard as it is written
+        }
+        mixer->playbackStopped(60);
+        QVERIFY(surroundAnimated(a1()));
+        QVERIFY(std::fabs(a1().surroundXAuto.at(10) - still.x) < 1e-6);
+        QCOMPARE(a1().surroundXAuto.at(40), 1.0);
+        QCOMPARE(a1().surroundYAuto.at(40), 0.0);
+        QCOMPARE(a1().automation, int(AutomationMode::Touch));
+        QCOMPARE(a1().surround.x, still.x);
+        // One undo step back to the keys made by hand.
+        state()->undo();
+        QVERIFY(a1().surroundXAuto.keyAt(50) && a1().surroundXAuto.keyAt(50)->v == 0.5);
+        state()->redo();
+        // A Touch pass writes only while the panner is held.
+        mixer->playbackStarted(0);
+        for (FrameTime f = 0; f <= 60; ++f) {
+            if (f == 5) QTest::mousePress(panner, Qt::LeftButton, {}, panner->toWidget(-1, 0).toPoint());
+            if (f == 15) QTest::mouseRelease(panner, Qt::LeftButton, {}, panner->toWidget(-1, 0).toPoint());
+            mixer->playbackPosition(f);
+        }
+        mixer->playbackStopped(60);
+        QVERIFY2(a1().surroundXAuto.at(10) < -0.9, qPrintable(QString::number(a1().surroundXAuto.at(10))));
+        QVERIFY(std::fabs(a1().surroundXAuto.at(2) - still.x) < 1e-6);                 // before it was held
+        QVERIFY(a1().surroundXAuto.at(50) > a1().surroundXAuto.at(20) + 0.1);           // let go: gliding back
+        // Stopping the animation leaves it where it is at the playhead.
+        state()->setPlayhead(40);
+        const double here = a1().surroundXAuto.at(40);
+        emit panner->animateRequested(false);
+        QVERIFY(!surroundAnimated(a1()));
+        QCOMPARE(a1().surround.x, here);
+        QVERIFY(!panner->isAnimated());
     }
 
     void trackAutomationOnTheTimeline() {
@@ -3345,6 +3424,75 @@ private slots:
         state()->setSelection({}, false);
     }
 
+    void syncIndicators() {
+        state()->newProject();
+        Id v = 0, a = 0;
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            MediaItem m;
+            m.id = p.newId();
+            m.kind = MediaKind::Video;
+            m.name = "sync.mov";
+            m.path = (dir_.path() + "/missing-sync.mov").toStdString();
+            m.duration = 10;
+            m.width = 1920, m.height = 1080;
+            m.fps = {30, 1};
+            m.hasVideo = m.hasAudio = true;
+            p.media.push_back(m);
+            const auto r = edit::placeMedia(p, s, m.id, 30, 30, 90, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+            if (!r.ok) return false;
+            v = r.created[0], a = r.created[1];
+            return true;
+        }));
+        TimelineWidget* tl = win_->timeline();
+        for (int k = 0; k < 4; ++k) tl->zoomIn();  // clips wide enough for the badge
+        QCOMPARE(tl->syncOffsetOf(a), 0.0);
+        const QImage inSync = tl->viewport()->grab().toImage();
+        // The sound alone nudged 6 frames later: a red +6 on it, none on the picture.
+        QVERIFY(state()->apply("Nudge", [a](Project& p, Sequence& s) { return edit::moveClips(p, s, {a}, 6, 0, 0, false); }));
+        QCOMPARE(tl->syncOffsetOf(a), 6.0);
+        QCOMPARE(tl->syncOffsetOf(v), 0.0);
+        QVERIFY(tl->viewport()->grab().toImage() != inSync);
+        // Right-click it: Slip into Sync, then (undone) Move into Sync.
+        auto viaMenu = [&](const char* name) {
+            bool triggered = false;
+            QTimer::singleShot(0, this, [&] {
+                auto* menu = qobject_cast<QMenu*>(QApplication::activePopupWidget());
+                if (!menu) return;
+                if (auto* act = menu->findChild<QAction*>(name)) {
+                    act->trigger();
+                    triggered = true;
+                }
+                menu->close();
+            });
+            const QPoint at = tl->clipBounds(a).center();
+            QContextMenuEvent ev(QContextMenuEvent::Mouse, at, tl->viewport()->mapToGlobal(at));
+            QApplication::sendEvent(tl->viewport(), &ev);
+            return triggered;
+        };
+        QVERIFY(viaMenu("slipIntoSync"));
+        QCOMPARE(tl->syncOffsetOf(a), 0.0);
+        QCOMPARE(edit::clipById(*state()->sequence(), a)->sourceIn, 36.0);
+        QCOMPARE(edit::clipById(*state()->sequence(), a)->start, FrameTime(36));
+        state()->undo();
+        QCOMPARE(tl->syncOffsetOf(a), 6.0);
+        QVERIFY(viaMenu("moveIntoSync"));
+        QCOMPARE(edit::clipById(*state()->sequence(), a)->start, FrameTime(30));
+        QCOMPARE(tl->syncOffsetOf(a), 0.0);
+        QVERIFY(!viaMenu("moveIntoSync"));  // offered only while out of sync
+        // Quality Check reports it.
+        state()->undo();
+        QcSettings q;
+        q.flashing = q.levels = q.clipping = q.spelling = false;
+        q.blackSeconds = q.freezeSeconds = q.silenceSeconds = 0;
+        const auto issues = qualityCheck(state()->project(), *state()->sequence(), 0, -1, q);
+        QCOMPARE(issues.size(), size_t(1));
+        QCOMPARE(issues[0].kind, QcKind::OutOfSync);
+        QCOMPARE(issues[0].start, FrameTime(36));
+        QVERIFY(issues[0].text.find("6 frames late") != std::string::npos);
+        q.sync = false;
+        QVERIFY(qualityCheck(state()->project(), *state()->sequence(), 0, -1, q).empty());
+    }
+
     void auditionsFromTheBin() {
         // Two takes of a shot: the first in the cut, the second added from the bin as a take.
         QStringList files;
@@ -5421,8 +5569,13 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(program->adrCycle()->lineFrom, FrameTime(150));
         QCOMPARE(program->adrCycle()->beeps.size(), size_t(3));
         QVERIFY(program->mutedAudioTracks().empty());
-        // Half way across the picture, the streamer: a white bar down the middle of the frame.
+        // Stopping playback (Space, a shuttle, the sequence's end) ends the pass.
+        const AdrCycle rehearsed = *program->adrCycle();
         program->pause();
+        QVERIFY(!panel->isRunning() && !program->adrCycle());
+        QCOMPARE(panel->findChild<QPushButton*>("adrRehearse")->isEnabled(), true);
+        // Half way across the picture, the streamer: a white bar down the middle of the frame.
+        program->setAdrCycle(rehearsed);
         program->seek(120);
         MonitorPanel* monitor = nullptr;
         for (MonitorPanel* m : win_->findChildren<MonitorPanel*>())
@@ -5432,8 +5585,7 @@ const auto seq = [this] { return state()->sequence(); };
         QTRY_VERIFY(!viewer->image().isNull());
         QTRY_VERIFY2(qGray(viewer->grab().toImage().pixel(viewer->width() / 2 - 1, viewer->height() / 2)) > 200, "no streamer");
         QVERIFY(qGray(viewer->grab().toImage().pixel(viewer->width() / 4, viewer->height() / 2)) < 60);
-        panel->stop();
-        QVERIFY(!panel->isRunning() && !program->adrCycle());
+        program->setAdrCycle(std::nullopt);
 
         // Record: the guide (A1) is muted, and the take (fed as the input would feed it) lands over the line on a new
         // ADR track, in sync.
@@ -5463,24 +5615,45 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(state()->project().findMedia(c->mediaId)->bin, std::string("ADR"));
         QTRY_COMPARE(table->item(0, 7)->text(), QString("1"));
 
+        // The picture stopping before the input had all of the pass arms a delayed stop; it belongs to that pass only and
+        // never cuts the next take short.
+        panel->record();
+        program->pause();
+        feedCycle();
+        QTRY_VERIFY(!panel->isRunning());
+        QTRY_COMPARE(adrTakeCount(*state()->sequence(), state()->sequence()->adrCues[0]), 2);
+        panel->record();
+        QTest::qWait(1700);
+        QVERIFY(panel->isRecording());
+        feedCycle();
+        QTRY_VERIFY(!panel->isRunning());
+        QTRY_COMPARE(adrTakeCount(*state()->sequence(), state()->sequence()->adrCues[0]), 3);
         // Loop: take after take until stopped, the ADR track muted too while recording; Stop keeps what was recorded.
         panel->findChild<QCheckBox*>("adrLoop")->setChecked(true);
         panel->record();
         QCOMPARE(program->mutedAudioTracks(), (std::vector<int>{0, loc->track.index}));
         feedCycle();
-        QTRY_COMPARE(adrTakeCount(*state()->sequence(), state()->sequence()->adrCues[0]), 2);
+        QTRY_COMPARE(adrTakeCount(*state()->sequence(), state()->sequence()->adrCues[0]), 4);
         QTRY_VERIFY(panel->isRecording());  // the next take began by itself
-        panel->recorder()->feed(block.data(), 4800);
+        for (int i = 0; i < 45; ++i) panel->recorder()->feed(block.data(), 4800);  // 4.5 s: into the line
         panel->stop();
         QVERIFY(!panel->isRunning() && !panel->isRecording());
         c = edit::clipById(*state()->sequence(), clip);
-        QCOMPARE(c->takes.size(), size_t(3));
-        QCOMPARE(c->take, 2);
+        QCOMPARE(c->takes.size(), size_t(5));
+        QCOMPARE(c->take, 4);
         QTest::qWait(100);
         QVERIFY(!panel->isRunning());
+        // Stopped in the pre-roll, before the line: not a take.
+        panel->findChild<QCheckBox*>("adrLoop")->setChecked(false);
+        panel->record();
+        panel->recorder()->feed(block.data(), 4800);
+        panel->stop();
+        QVERIFY(!panel->isRunning());
+        QCOMPARE(edit::clipById(*state()->sequence(), clip)->takes.size(), size_t(5));
+        QCOMPARE(edit::clipById(*state()->sequence(), clip)->take, 4);
         // Another take picked from the list.
         auto* takes = panel->findChild<QComboBox*>("adrTakes");
-        QTRY_COMPARE(takes->count(), 3);
+        QTRY_COMPARE(takes->count(), 5);
         panel->pickTake(0);
         QCOMPARE(edit::clipById(*state()->sequence(), clip)->take, 0);
 
@@ -5498,6 +5671,107 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(state()->sequence()->adrCues[0].status, int(kAdrRecorded));
         QCOMPARE(state()->sequence()->adrCues[0].note, std::string("Traffic noise"));
         QVERIFY(!panel->importCueSheet(dir_.path() + "/missing.csv"));
+        // Another project opened mid-take: the take is dropped, not imported into it.
+        panel->selectCue(state()->sequence()->adrCues[0].id);
+        panel->findChild<QCheckBox*>("adrLoop")->setChecked(false);
+        panel->record();
+        QVERIFY(panel->isRecording());
+        panel->recorder()->feed(block.data(), 4800);
+        const QString partial = panel->recorder()->takeFolder();
+        state()->newProject();
+        QVERIFY(!panel->isRecording() && !panel->isRunning() && !program->adrCycle());
+        QVERIFY(state()->project().media.empty());
+        QVERIFY(!QFileInfo::exists(partial + "/M101 take 7.wav"));
+        state()->newProject();
+    }
+
+    void audioDescriptionDialog() {
+        state()->newProject();
+        // Dialogue: a second of tone at 0 s and again at 3 s.
+        const QString wav = dir_.path() + "/ad-line.wav";
+        {
+            WavWriter w;
+            QVERIFY(w.open(wav, 48000, 1));
+            std::vector<float> tone(48000);
+            for (size_t i = 0; i < tone.size(); ++i) tone[i] = float(0.3 * std::sin(2 * M_PI * 440 * double(i) / 48000));
+            w.write(tone.data(), 48000);
+            QVERIFY(w.close());
+        }
+        const auto ids = state()->importFiles({wav});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids.front();
+        QVERIFY(state()->apply("Lines", [&](Project& p, Sequence& s) {
+            edit::Result r = edit::placeMedia(p, s, media, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+            if (!r.ok) return r;
+            return edit::placeMedia(p, s, media, 90, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        }));
+        win_->findChild<QAction*>("audioDescription")->trigger();
+        auto* dlg = win_->findChild<AudioDescriptionDialog*>("audioDescriptionDialog");
+        QVERIFY(dlg && dlg->isVisible());
+        dlg->findChild<QDoubleSpinBox*>("adMinGap")->setValue(1.0);
+        QString err;
+        QVERIFY2(dlg->findGaps(&err) >= 1, qPrintable(err));
+        auto* table = dlg->findChild<QTableWidget*>("adTable");
+        QVERIFY(table->rowCount() >= 1);
+        // A description typed into the gap goes on the hidden description track; its fit is shown.
+        table->item(0, 3)->setText("Rain falls.");
+        QTRY_VERIFY(findDescriptionTrack(*state()->sequence()) >= 0);
+        const CaptionTrack& t = state()->sequence()->captionTracks[size_t(findDescriptionTrack(*state()->sequence()))];
+        QCOMPARE(t.captions.size(), size_t(1));
+        QCOMPARE(t.captions[0].text, std::string("Rain falls."));
+        QVERIFY(!t.visible);
+        QVERIFY(t.captions[0].start >= 39 && t.captions[0].end <= 81);
+        QTRY_COMPARE(table->item(0, 4)->text(), QString("Fits"));
+        // One too long for its gap says how many words to cut.
+        table->item(0, 3)->setText("Rain streams down the tall window while thunder rolls far across the dark valley below.");
+        QTRY_VERIFY(table->item(0, 4)->text().startsWith("Too long"));
+        // Undo puts the first back.
+        state()->undo();
+        QTRY_COMPARE(table->item(0, 3)->text(), QString("Rain falls."));
+        // Muting them while working; nothing to duck before they are voiced.
+        dlg->setHear(false);
+        QVERIFY(edit::roleMuted(*state()->sequence(), kDescriptionRole));
+        QVERIFY(!dlg->findChild<QCheckBox*>("adHear")->isChecked());
+        dlg->setHear(true);
+        QCOMPARE(dlg->duck(), 0);
+        // Voiced (when the speech model is here) onto the AD track as Description clips, and the programme ducked.
+        if (ttsAvailable() && ttsModel().installed()) {
+            QCOMPARE(dlg->voice(&err), 1);
+            const Sequence& s = *state()->sequence();
+            QVERIFY(hasDescriptionClips(s));
+            int ad = -1;
+            for (int i = 0; i < int(s.audioTracks.size()); ++i)
+                if (s.audioTracks[size_t(i)].name == "AD") ad = i;
+            QVERIFY(ad >= 0 && s.audioTracks[size_t(ad)].clips.size() == 1);
+            QVERIFY(dlg->duck() >= 1);
+            QCOMPARE(dlg->voice(&err), 1);  // voiced again: replaced, not added
+            QCOMPARE(state()->sequence()->audioTracks[size_t(ad)].clips.size(), size_t(1));
+        } else {
+            QVERIFY(state()->apply("Description clip", [&](Project& p, Sequence& s) {
+                const TrackRef r = edit::addTrack(p, s, TrackKind::Audio);
+                s.audioTracks[size_t(r.index)].name = "AD";
+                edit::Result res = edit::placeMedia(p, s, media, 40, 0, -1, {TrackKind::Video, -1}, r, false);
+                if (res.ok) edit::clipById(s, res.created.front())->role = kDescriptionRole;
+                return res;
+            }));
+            QVERIFY(dlg->duck() >= 1);
+        }
+        // Export offers the described stream once there are descriptions, for containers with several streams.
+        {
+            ExportDialog ed(state(), win_.get());
+            auto* described = ed.findChild<QCheckBox*>("exportDescribed");
+            auto* preset = ed.findChild<QComboBox*>("exportPreset");
+            QVERIFY(described && preset);
+            preset->setCurrentIndex(preset->findText("Audio - AAC (M4A)"));
+            QVERIFY(!described->isEnabled());  // M4A here: one stream
+            for (int i = 0; i < preset->count(); ++i)
+                if (preset->itemText(i).startsWith("H.264")) {
+                    preset->setCurrentIndex(i);
+                    break;
+                }
+            QVERIFY(described->isEnabled());
+        }
+        dlg->close();
         state()->newProject();
     }
 

@@ -58,6 +58,7 @@
 #include "core/TimelineCompare.h"
 #include "core/Reconform.h"
 #include "core/Adr.h"
+#include "core/AudioDescription.h"
 #include "core/Effects.h"
 #include "core/History.h"
 #include "core/Interchange.h"
@@ -1056,6 +1057,59 @@ void McpServer::Impl::addTools() {
             return ok(QStringLiteral("Swapped; the clip now starts at %1").arg(tc(c ? c->start : 0, s)), c ? clipJson(l.project, s, *c) : QJsonObject{});
         });
 
+    add("montage_sync", "Find and fix clips out of sync",
+        "Linked clips playing the same media as their picture but out of step with it (Premiere's red out-of-sync "
+        "numbers, Avid's sync breaks), each with how many frames late (negative: early). `action` move puts a clip back "
+        "in sync by moving it, slip by slipping its source where it is (refused past the media's ends); with `clip` "
+        "only that clip, else every one listed.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "action":{"type":"string","enum":["check","move","slip"],"default":"check"},"clip":{"type":"number"}},
+            "required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const QString action = str(a, "action", "check");
+            if (action != "check" && action != "move" && action != "slip") throw ArgError{"\"action\" is check, move or slip"};
+            auto listed = [&] {
+                QJsonArray out;
+                for (const edit::SyncOffset& o : edit::syncOffsets(s)) {
+                    const Clip* c = edit::clipById(s, o.clip);
+                    const auto loc = edit::locate(s, o.clip);
+                    out.append(QJsonObject{{"clip", double(o.clip)}, {"name", QString::fromStdString(c->name)},
+                                           {"track", QString::fromStdString(trackAt(s, loc->track)->name)}, {"anchor", double(o.anchor)},
+                                           {"frames", o.frames}, {"seconds", o.frames / s.fps.toDouble()}});
+                }
+                return out;
+            };
+            if (action == "check") {
+                const QJsonArray out = listed();
+                QString text = out.isEmpty() ? QStringLiteral("Every linked clip is in sync.") : QStringLiteral("%1 clip(s) out of sync:").arg(out.size());
+                for (const auto& v : out) {
+                    const QJsonObject o = v.toObject();
+                    text += QStringLiteral("\n  %1 (%2, clip %3): %4 frame(s) %5").arg(o["name"].toString(), o["track"].toString())
+                                .arg(qint64(o["clip"].toDouble())).arg(std::fabs(o["frames"].toDouble())).arg(o["frames"].toDouble() > 0 ? "late" : "early");
+                }
+                return ok(text, QJsonObject{{"clips", out}});
+            }
+            std::vector<Id> ids;
+            if (a.contains("clip")) ids.push_back(clipArg(l, a).id);
+            else
+                for (const edit::SyncOffset& o : edit::syncOffsets(s)) ids.push_back(o.clip);
+            if (ids.empty()) return ok(QStringLiteral("Every linked clip is in sync."), QJsonObject{{"clips", QJsonArray{}}});
+            int fixed = 0;
+            QStringList errors;
+            for (Id id : ids) {
+                const auto r = action == "move" ? edit::moveIntoSync(l.project, s, id) : edit::slipIntoSync(l.project, s, id);
+                if (r.ok) ++fixed;
+                else errors << QStringLiteral("clip %1: %2").arg(qint64(id)).arg(QString::fromStdString(r.error));
+            }
+            if (!fixed) return fail(errors.join("; "));
+            save(l);
+            QString text = QStringLiteral("%1 clip(s) %2 into sync.").arg(fixed).arg(action == "move" ? "moved" : "slipped");
+            if (!errors.isEmpty()) text += QStringLiteral(" Not fixed: ") + errors.join("; ");
+            return ok(text, QJsonObject{{"fixed", fixed}, {"clips", listed()}});
+        });
+
     add("montage_trim_clip", "Trim a clip",
         "Move a clip's in or out point by a number of seconds (positive: later). Ripple moves later clips with it. "
         "With `extend_to` (a timeline time) instead, Extend Edit: the clip's edge nearest it moves there, rolling with "
@@ -1974,8 +2028,8 @@ void McpServer::Impl::addTools() {
         "Check the sequence (or from..to) before delivery, as broadcasters' QC does: flashing that can trigger seizures "
         "(ITU-R BT.1702 / Ofcom / WCAG: more than three flashes a second over a quarter of the screen, or saturated red), "
         "levels outside EBU R103, black or frozen picture, silence, clipping, loudness against a target, and spelling in "
-        "captions (each track's language) and titles (`title_language`, default en-US), the project's vocabulary allowed. "
-        "Lists each problem with its timecodes; with markers, puts a red \"QC:\" marker on each (replacing earlier ones).",
+        "captions (each track's language) and titles (`title_language`, default en-US), the project's vocabulary allowed, "
+        "and linked clips out of sync with their picture (`sync`). Lists each problem with its timecodes; with markers, puts a red \"QC:\" marker on each (replacing earlier ones).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"from":{"type":["number","string"]},
             "to":{"type":["number","string"]},"flashing":{"type":"boolean","default":true},"levels":{"type":"boolean","default":true},
             "black_seconds":{"type":"number","default":1,"description":"0 = not checked"},
@@ -1985,7 +2039,7 @@ void McpServer::Impl::addTools() {
             "loudness_target":{"type":"number","description":"LUFS, e.g. -14 (streaming) or -23 (EBU R128); omitted = not checked"},
             "peak_ceiling":{"type":"number","default":-1,"description":"dBTP, checked with the loudness"},
             "spelling":{"type":"boolean","default":true},"title_language":{"type":"string","default":"en-US"},
-            "markers":{"type":"boolean","default":false}},"required":["project"]})json",
+            "sync":{"type":"boolean","default":true},"markers":{"type":"boolean","default":false}},"required":["project"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
@@ -2002,6 +2056,7 @@ void McpServer::Impl::addTools() {
             q.peakCeiling = a.value("peak_ceiling").toDouble(-1);
             q.spelling = a.value("spelling").toBool(true);
             q.titleLanguage = str(a, "title_language", "en-US").toStdString();
+            q.sync = a.value("sync").toBool(true);
             const std::vector<QcIssue> issues = qualityCheck(l.project, s, from, to, q, [this](double f) { progress(f, "Checking"); });
             QString text;
             for (const QcIssue& i : issues)
@@ -3513,14 +3568,19 @@ void McpServer::Impl::addTools() {
         "position is an angle (0 straight ahead, 90 right, -90 left, 180 behind) and a distance (1 at the speakers, 0 spread "
         "over all of them); height (0 at the ear to 1 overhead) lifts it in immersive layouts; width narrows a stereo track "
         "to a point (0, e.g. dialogue in the centre speaker); lfe_db sends it to the subwoofer (-100 off); object makes the "
-        "track an audio object of its own in ADM masters (montage_export_adm) instead of part of the bed. A track routed to "
-        "a bus is placed by its bus. Export with montage_render (downmix_stereo for a stereo copy).",
+        "track an audio object of its own in ADM masters (montage_export_adm) instead of part of the bed. path moves it: "
+        "points of time, angle, distance and height (the rest from the track's own), keyed on its position lanes and "
+        "played as its automation reads (Read, the default, Latch or Touch); an object's movement goes into the ADM "
+        "master; an empty path stops it moving. A track routed to a bus is placed by its bus. Export with montage_render "
+        "(downmix_stereo for a stereo copy).",
         R"json({"type":"object","properties":{"project":{"type":"string"},
             "layout":{"type":"string","enum":["stereo","5.1","7.1","5.1.2","5.1.4","7.1.2","7.1.4"]},
             "tracks":{"type":"array","items":{"type":"object","properties":{
                 "track":{"type":"string","description":"Audio track, e.g. A1"},"angle":{"type":"number","default":0},
                 "distance":{"type":"number","default":1},"height":{"type":"number","default":0},"width":{"type":"number","default":1},
-                "lfe_db":{"type":"number","default":-100},"object":{"type":"boolean","default":false}},
+                "lfe_db":{"type":"number","default":-100},"object":{"type":"boolean","default":false},
+                "path":{"type":"array","items":{"type":"object","properties":{"at":{"type":["number","string"]},
+                    "angle":{"type":"number"},"distance":{"type":"number"},"height":{"type":"number"}},"required":["at"]}}},
                 "required":["track"]}}},"required":["project"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
@@ -3546,8 +3606,23 @@ void McpServer::Impl::addTools() {
                 p.lfeDb = std::clamp(t.value("lfe_db").toDouble(-100), -100.0, 12.0);
                 p.z = std::clamp(t.value("height").toDouble(0), 0.0, 1.0);
                 p.object = t.value("object").toBool(false);
-                out.append(QJsonObject{{"track", QString::fromStdString(tr->name)}, {"x", p.x}, {"y", p.y}, {"z", p.z}, {"width", p.width},
-                                       {"lfe_db", p.lfeDb}, {"object", p.object}});
+                if (t.contains("path")) {
+                    // Keys on the position lanes; what a point leaves out is the track's own.
+                    tr->surroundXAuto = Param(), tr->surroundYAuto = Param(), tr->surroundZAuto = Param();
+                    for (const QJsonValue& kv : t.value("path").toArray()) {
+                        const QJsonObject k = kv.toObject();
+                        const FrameTime at = timeArg(k.value("at"), s, "at");
+                        const double ka = k.contains("angle") ? k.value("angle").toDouble() * M_PI / 180 : angle;
+                        const double kd = std::clamp(k.contains("distance") ? k.value("distance").toDouble() : dist, 0.0, 1.0);
+                        tr->surroundXAuto.addKey(at, kd * std::sin(ka));
+                        tr->surroundYAuto.addKey(at, kd * std::cos(ka));
+                        tr->surroundZAuto.addKey(at, std::clamp(k.contains("height") ? k.value("height").toDouble() : p.z, 0.0, 1.0));
+                    }
+                }
+                QJsonObject placed{{"track", QString::fromStdString(tr->name)}, {"x", p.x}, {"y", p.y}, {"z", p.z}, {"width", p.width},
+                                   {"lfe_db", p.lfeDb}, {"object", p.object}};
+                if (surroundAnimated(*tr)) placed["path_points"] = int(tr->surroundXAuto.keys.size());
+                out.append(placed);
             }
             save(l);
             return ok(QStringLiteral("%1 mix, %2 track(s) placed").arg(QString::fromStdString(s.audioLayout)).arg(out.size()),
@@ -4130,6 +4205,158 @@ void McpServer::Impl::addTools() {
             save(l);
             return ok(QStringLiteral("Placed %1 voiceover clip(s), %2 s in all").arg(lines.size()).arg(total, 0, 'f', 1),
                       QJsonObject{{"clips", placed}});
+        });
+
+    add("montage_audio_description", "Audio description",
+        "Described video for broadcasters and streaming services: descriptions of what is seen, spoken in the gaps between "
+        "the dialogue. gaps finds them (speech on the audio tracks other than the AD track; at least min_gap seconds, kept "
+        "clear of the lines); write puts descriptions (start, optional end: by default the gap it starts in, or three "
+        "seconds; empty text removes one) on the hidden \"Audio Description\" caption track; list shows them with how they "
+        "fit at pace words a minute; voice speaks them with an AI voice (Kokoro) onto the AD track as clips of the role "
+        "Description, replacing what was voiced before; duck lowers every other clip under them by duck_db; hear sets "
+        "whether they play while working. montage_render's described option (or the export dialog's) writes the mix "
+        "without them and a stream of the programme with them.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "action":{"type":"string","enum":["gaps","write","list","voice","duck","hear"],"default":"list"},
+            "min_gap":{"type":"number","default":2},"pace":{"type":"number","default":160},
+            "descriptions":{"type":"array","items":{"type":"object","properties":{"start":{"type":["number","string"]},
+                "end":{"type":["number","string"]},"text":{"type":"string"}},"required":["start","text"]}},
+            "voice":{"type":"string","default":"bf_emma"},"duck_db":{"type":"number","default":-9},"on":{"type":"boolean"}},
+            "required":["project"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const QString action = a.value("action").toString("list");
+            const double pace = std::clamp(a.value("pace").toDouble(160), 60.0, 300.0);
+            auto adTrack = [&]() {
+                for (int i = 0; i < int(s.audioTracks.size()); ++i)
+                    if (s.audioTracks[size_t(i)].name == "AD") return i;
+                return -1;
+            };
+            auto findGaps = [&](std::vector<DescriptionGap>& out, double minGap) -> QString {
+                std::vector<int> tracks;
+                for (int i = 0; i < int(s.audioTracks.size()); ++i)
+                    if (i != adTrack()) tracks.push_back(i);
+                DuckOptions o;
+                o.minPause = 0.5;
+                std::string err;
+                const Spans speech = dialogueSpans(l.project, s, tracks, o, &err);
+                if (!err.empty()) return QString::fromStdString(err);
+                out = descriptionGaps(speech, s.fpsValue(), 0, std::max<FrameTime>(1, s.duration()), minGap);
+                return {};
+            };
+            auto listing = [&] {
+                QJsonArray list;
+                const int t = findDescriptionTrack(s);
+                if (t >= 0)
+                    for (const Caption& c : s.captionTracks[size_t(t)].captions) {
+                        const DescriptionFit f = descriptionFit(c.text, double(c.end - c.start) / s.fpsValue(), pace);
+                        list.append(QJsonObject{{"start", tc(c.start, s)}, {"end", tc(c.end, s)}, {"text", QString::fromStdString(c.text)},
+                                                {"room", f.room}, {"needed", f.needed}, {"fits", f.fits}, {"speed", f.speed},
+                                                {"over_words", f.overWords}});
+                    }
+                return QJsonObject{{"descriptions", list}, {"heard", !edit::roleMuted(s, kDescriptionRole)},
+                                   {"voiced", hasDescriptionClips(s)}};
+            };
+            if (action == "list") return ok(QStringLiteral("%1 description(s)").arg(listing().value("descriptions").toArray().size()), listing());
+            if (action == "gaps") {
+                std::vector<DescriptionGap> gaps;
+                if (const QString err = findGaps(gaps, std::max(0.5, a.value("min_gap").toDouble(2))); !err.isEmpty()) return fail(err);
+                QJsonArray out;
+                for (const DescriptionGap& g : gaps)
+                    out.append(QJsonObject{{"start", tc(g.start, s)}, {"end", tc(g.end, s)}, {"seconds", double(g.length()) / s.fpsValue()},
+                                           {"words", int(std::floor(double(g.length()) / s.fpsValue() * pace / 60))}});
+                return ok(QStringLiteral("%1 gap(s) between the dialogue").arg(gaps.size()), QJsonObject{{"gaps", out}});
+            }
+            if (action == "write") {
+                const QJsonArray items = a.value("descriptions").toArray();
+                if (items.isEmpty()) throw ArgError{"\"descriptions\" lists what to write"};
+                std::vector<DescriptionGap> gaps;
+                bool haveGaps = false;
+                for (const QJsonValue& v : items) {
+                    const QJsonObject o = v.toObject();
+                    const FrameTime start = timeArg(o.value("start"), s, "start");
+                    FrameTime end = -1;
+                    if (o.contains("end")) {
+                        end = timeArg(o.value("end"), s, "end");
+                    } else {
+                        if (!haveGaps) {
+                            if (const QString err = findGaps(gaps, 0.1); !err.isEmpty()) return fail(err);  // whatever its length
+                            haveGaps = true;
+                        }
+                        for (const DescriptionGap& g : gaps)
+                            if (start >= g.start && start < g.end) end = g.end;
+                        if (end < 0) end = start + FrameTime(std::llround(3 * s.fpsValue()));
+                    }
+                    const std::string text = o.value("text").toString().toStdString();
+                    if (!setDescription(l.project, s, start, end, text) && !text.empty())
+                        throw ArgError{"A description's end must come after its start"};
+                }
+                save(l);
+                return ok("Wrote the descriptions", listing());
+            }
+            if (action == "voice") {
+                const int t = findDescriptionTrack(s);
+                std::vector<SpeechLine> lines;
+                if (t >= 0)
+                    for (const Caption& c : s.captionTracks[size_t(t)].captions) {
+                        std::string text = c.text;
+                        std::replace(text.begin(), text.end(), '\n', ' ');
+                        if (!text.empty()) lines.push_back({text, c.start, c.end - c.start});
+                    }
+                if (lines.empty()) return fail("There are no descriptions to voice");
+                if (!ttsAvailable()) return fail("This build of Montage cannot speak (no ONNX Runtime)");
+                if (!ttsModel().installed())
+                    return fail("The speech model is not downloaded: run `scripts/fetch-models.sh` or generate a voiceover once in the app");
+                const std::string voice = str(a, "voice", "bf_emma").toStdString();
+                if (!findTtsVoice(voice)) throw ArgError{QStringLiteral("Unknown voice \"%1\"").arg(QString::fromStdString(voice))};
+                std::vector<Id> old;
+                for (const Track& tr : s.audioTracks)
+                    for (const Clip& c : tr.clips)
+                        if (c.role == kDescriptionRole) old.push_back(c.id);
+                if (!old.empty()) edit::removeClips(l.project, s, old, false);
+                int ad = adTrack();
+                if (ad < 0) {
+                    ad = edit::addTrack(l.project, s, TrackKind::Audio).index;
+                    s.audioTracks[size_t(ad)].name = "AD";
+                }
+                QJsonArray placed;
+                double total = 0;
+                const QString err = speakLines(l.project, s, lines, voice, 1.0, {TrackKind::Audio, ad},
+                                               QFileInfo(absolute(need(a, "project"))).absolutePath() + QStringLiteral("/Audio Description"),
+                                               placed, total);
+                if (!err.isEmpty()) return fail(err);
+                for (const QJsonValue& v : placed)
+                    if (Clip* c = edit::clipById(s, Id(v.toObject().value("clip").toDouble()))) c->role = kDescriptionRole;
+                save(l);
+                QJsonObject r = listing();
+                r["clips"] = placed;
+                return ok(QStringLiteral("Voiced %1 description(s), %2 s in all").arg(placed.size()).arg(total, 0, 'f', 1), r);
+            }
+            if (action == "duck") {
+                const int ad = adTrack();
+                if (ad < 0 || !hasDescriptionClips(s)) return fail("Voice the descriptions first");
+                DuckOptions o;
+                o.amountDb = std::clamp(a.value("duck_db").toDouble(-9), -40.0, -1.0);
+                o.fadeDown = 0.4;
+                o.fadeUp = 0.6;
+                const Spans spans = clipSpans(s, ad, 1.0);
+                int changed = 0;
+                for (int i = 0; i < int(s.audioTracks.size()); ++i) {
+                    if (i == ad) continue;
+                    for (Clip& c : s.audioTracks[size_t(i)].clips)
+                        if (c.role != kDescriptionRole && duckClip(c, s, spans, o)) ++changed;
+                }
+                save(l);
+                return ok(QStringLiteral("Ducked %1 clip(s) under the descriptions").arg(changed), QJsonObject{{"ducked", changed}});
+            }
+            if (action == "hear") {
+                if (!a.contains("on")) throw ArgError{"\"on\" says whether the descriptions are heard"};
+                edit::setRoleMuted(s, kDescriptionRole, !a.value("on").toBool());
+                save(l);
+                return ok(a.value("on").toBool() ? "Descriptions are heard" : "Descriptions are muted (exports still describe)", listing());
+            }
+            throw ArgError{"Unknown action"};
         });
 
     add("montage_dub", "Dub into English",
@@ -4895,6 +5122,7 @@ void McpServer::Impl::addTools() {
                 "watermark_corner":{"type":"string","enum":["top_left","top_centre","top_right","bottom_left","bottom_centre","bottom_right"],"default":"bottom_right"},
                 "watermark_opacity":{"type":"number","default":0.6}}},
             "downmix_stereo":{"type":"boolean","default":false,"description":"A 5.1/7.1 sequence: fold the mix down to stereo"},
+            "described":{"type":"boolean","default":false,"description":"Audio description: the mix without the descriptions, then a stream of the programme with them (montage_audio_description)"},
             "stems":{"type":"string","enum":["none","tracks","buses","roles"],"default":"none",
                 "description":"Also write 24-bit WAV stems beside the output, one per audio track, per bus (plus Main) or per audio role"},
             "captions":{"type":"string","enum":["none","burn","embed","both"],"default":"none","description":"The visible caption track, burned into the picture and/or embedded as a subtitle stream"},
@@ -4949,6 +5177,7 @@ void McpServer::Impl::addTools() {
                 st.burnIn.watermarkOpacity = std::clamp(b.value("watermark_opacity").toDouble(0.6), 0.0, 1.0);
             }
             st.downmixStereo = a.value("downmix_stereo").toBool();
+            st.describedStream = a.value("described").toBool();
             const QString cap = str(a, "captions", "none");
             if (cap != "none" && cap != "burn" && cap != "embed" && cap != "both") throw ArgError{"\"captions\" must be none, burn, embed or both"};
             st.burnInCaptions = cap == "burn" || cap == "both";

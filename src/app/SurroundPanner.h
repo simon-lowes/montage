@@ -4,7 +4,8 @@
 // wheel narrows or widens it, double-click puts it back, and the context menu
 // sets its width and LFE. In immersive layouts a bar on the right shows its
 // height (Alt+wheel or the menu sets it), and a track can be made an audio
-// object for ADM masters (drawn as a diamond).
+// object for ADM masters (drawn as a diamond). A track's position can be
+// animated (its x, y, z lanes): drawn with a ring, set at the playhead.
 #pragma once
 
 #include <QWidget>
@@ -23,6 +24,10 @@ public:
     void setObjectsAllowed(bool on) { objectsAllowed_ = on; }
     void setPan(const SurroundPan& p);  // does not emit
     const SurroundPan& pan() const { return pan_; }
+    // Whether the position is keyed (drawn with a ring; the menu's "Animate Position" ticked).
+    void setAnimated(bool on);
+    bool isAnimated() const { return animated_; }
+    bool isDragging() const { return dragging_; }
     // Where a position (x, y in -1..1) is drawn, and the reverse.
     QPointF toWidget(double x, double y) const;
     void fromWidget(QPointF p, double& x, double& y) const;
@@ -31,6 +36,8 @@ public:
 
 signals:
     void changed(const montage::SurroundPan& p, bool final);
+    // "Animate Position" chosen (on: key the position at the playhead; off: stop it moving).
+    void animateRequested(bool on);
 
 protected:
     void paintEvent(QPaintEvent*) override;
@@ -48,6 +55,7 @@ private:
     SurroundPan pan_;
     bool dragging_ = false;
     bool objectsAllowed_ = false;
+    bool animated_ = false;
 };
 
 }  // namespace montage

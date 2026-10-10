@@ -1,5 +1,6 @@
 // Montage — track fader automation, written live from the mixer as in Premiere's Audio Track Mixer, Pro Tools and
-// Fairlight. Each audio track has a volume (dB) and a pan lane, keyed in timeline frames, and a mode:
+// Fairlight. Each audio track has a volume (dB) and a pan lane (and, in surround, x, y and z lanes for its position),
+// keyed in timeline frames, and a mode:
 //  - Off: the fader as set; the lanes are kept but not heard.
 //  - Read: the lanes play (when they have keys) and the fader follows them.
 //  - Write: from the moment playback starts until it stops, the fader is recorded.
@@ -19,6 +20,10 @@ AutomationMode trackAutomation(const Track& t);
 // The fader values heard at timeline frame t (fractional frames interpolate between whole ones).
 double trackVolumeAt(const Track& t, double frame);
 double trackPanAt(const Track& t, double frame);
+// Whether a track's surround position moves (any of its x, y, z lanes has keys), and where it is at frame t when the
+// lanes play: SurroundPan with x, y and z from the lanes that have keys (within -1..1, z 0..1).
+bool surroundAnimated(const Track& t);
+SurroundPan trackSurroundAt(const Track& t, double frame);
 
 // Reduces a lane to the keys needed to stay within `tolerance` of it (Ramer–Douglas–Peucker on linear segments).
 void thinKeys(std::vector<Keyframe>& keys, double tolerance);

@@ -126,7 +126,7 @@ TimelineWidget::TimelineWidget(EditorState* state, QWidget* parent) : QAbstractS
     horizontalScrollBar()->setSingleStep(20);
     verticalScrollBar()->setSingleStep(20);
     connect(state_, &EditorState::projectChanged, this, [this] {
-        duplicatesDirty_ = throughDirty_ = true;
+        duplicatesDirty_ = throughDirty_ = syncDirty_ = true;
         clipPeaks_.clear();
         gap_.reset();
         updateScrollBars();
@@ -138,7 +138,7 @@ TimelineWidget::TimelineWidget(EditorState* state, QWidget* parent) : QAbstractS
     });
     connect(state_, &EditorState::playheadChanged, viewport(), qOverload<>(&QWidget::update));
     connect(state_, &EditorState::sequenceSwitched, this, [this] {
-        duplicatesDirty_ = throughDirty_ = true;
+        duplicatesDirty_ = throughDirty_ = syncDirty_ = true;
         horizontalScrollBar()->setValue(0);
         zoomToFit();
     });
@@ -782,6 +782,19 @@ void TimelineWidget::paintClip(QPainter& p, const Row& row, const Clip& c, const
             name = QStringLiteral("[%1] %2").arg(QString::fromStdString(mc->audioTracks[size_t(c.audioAngle)].name), name);
         }
     }
+    if (const double off = syncOffsetOf(c.id); off != 0) {
+        // Out of sync: the frames it is off by in a red box at the head of the name, as Premiere and Avid mark it.
+        const QString text = QStringLiteral("%1%2").arg(off > 0 ? "+" : "-").arg(std::fabs(off), 0, 'g', 4);
+        const int w = p.fontMetrics().horizontalAdvance(text) + 6;
+        if (nameR.width() > w + 10) {
+            const QRect box(nameR.left(), nameR.top() + 1, w, nameR.height() - 1);
+            p.fillRect(box, QColor(0xd0, 0x20, 0x20));
+            p.setPen(Qt::white);
+            p.drawText(box, Qt::AlignCenter, text);
+            p.setPen(theme::kText);
+            nameR.setLeft(box.right() + 4);
+        }
+    }
     if (!badges.isEmpty()) {
         int bw = p.fontMetrics().horizontalAdvance(badges);
         if (nameR.width() > bw + 30) {
@@ -917,6 +930,17 @@ bool TimelineWidget::isThroughEdit(Id clip) const {
         throughDirty_ = false;
     }
     return std::find(through_.begin(), through_.end(), clip) != through_.end();
+}
+
+double TimelineWidget::syncOffsetOf(Id clip) const {
+    if (syncDirty_) {
+        sync_.clear();
+        if (state_->sequence())
+            for (const edit::SyncOffset& o : edit::syncOffsets(*state_->sequence())) sync_[o.clip] = o.frames;
+        syncDirty_ = false;
+    }
+    const auto it = sync_.find(clip);
+    return it == sync_.end() ? 0 : it->second;
 }
 
 void TimelineWidget::setShowTrackAutomation(bool on) {
@@ -2239,6 +2263,17 @@ void TimelineWidget::contextMenuEvent(QContextMenuEvent* e) {
                     state_->apply(tr("Flatten Multicam"), [sel](Project& p, Sequence& s) { return edit::flattenMulticam(p, s, sel); });
                 })->setObjectName(QStringLiteral("flattenMulticam"));
             }
+        // Out of sync: back into step with its picture by moving it, or by slipping its source where it is.
+        if (syncOffsetOf(h.clip) != 0) {
+            const Id id = h.clip;
+            menu.addSeparator();
+            menu.addAction(tr("Move into Sync"), this, [this, id] {
+                state_->apply(tr("Move into Sync"), [id](Project& p, Sequence& s) { return edit::moveIntoSync(p, s, id); });
+            })->setObjectName(QStringLiteral("moveIntoSync"));
+            menu.addAction(tr("Slip into Sync"), this, [this, id] {
+                state_->apply(tr("Slip into Sync"), [id](Project& p, Sequence& s) { return edit::slipIntoSync(p, s, id); });
+            })->setObjectName(QStringLiteral("slipIntoSync"));
+        }
         // Offline rendering of a clip's effects (CPU-heavy plugins, AI effects) and speed changes.
         if (h.track)
             if (const Clip* c = edit::clipById(*state_->sequence(), h.clip)) {

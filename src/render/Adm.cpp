@@ -10,6 +10,7 @@
 #include <memory>
 
 #include "Compositor.h"
+#include "core/Automation.h"
 #include "core/Surround.h"
 
 namespace montage {
@@ -91,6 +92,72 @@ std::array<double, 2> polarToCartesian(double azimuth, double distance) {
         return {distance * (left.x + (right.x - left.x) * t), distance * (left.y + (right.y - left.y) * t)};
     }
     return {0, distance};  // not reached: the sectors cover the circle
+}
+
+// Where an object is in ADM's cartesian coordinates, as the panner places it: its angle and distance round the room
+// into the square by BS.2127's mapping, and its height as Z (0 at the ear, 1 overhead, in layouts with overhead
+// speakers; `overhead`), which renderers crossfade between the layers at constant power as the mix does, whatever the
+// distance.
+struct Position {
+    double x = 0, y = 1, z = 0;
+};
+Position admPosition(const SurroundPan& sp, bool overhead) {
+    const std::array<double, 2> xy = polarToCartesian(-std::atan2(sp.x, sp.y) * 180 / M_PI, std::min(1.0, std::hypot(sp.x, sp.y)));
+    return {xy[0], xy[1], overhead ? std::clamp(sp.z, 0.0, 1.0) : 0.0};
+}
+
+// One audioBlockFormat: from `from` to `to` (samples into the master), moving to `at` over its length.
+struct Block {
+    int64_t from = 0, to = 0;
+    Position at;
+};
+
+// An object's blocks. Still: one. Moving (its position lanes play): a millisecond at where it starts, then the
+// position ten times a second, each block gliding to the next point in a straight line (so crossing behind the
+// listener stays behind); points on a straight line (within 0.005) share a block. Boundaries fall on whole samples
+// that hh:mm:ss.fffff writes exactly (every 12 at 48 kHz).
+std::vector<Block> objectBlocks(const Track& tr, bool overhead, FrameTime first, FrameTime end, double fps, int64_t total) {
+    const bool reads = trackAutomation(tr) == AutomationMode::Read || trackAutomation(tr) == AutomationMode::Latch ||
+                       trackAutomation(tr) == AutomationMode::Touch;
+    if (!reads || !surroundAnimated(tr)) return {{0, total, admPosition(tr.surround, overhead)}};
+    auto sampleAt = [&](FrameTime f) {
+        const int64_t v = int64_t(std::llround(double(f - first) * kRate / fps));
+        return std::min(total, v / 12 * 12);
+    };
+    const FrameTime step = std::max<FrameTime>(1, FrameTime(std::llround(fps / 10)));
+    std::vector<std::pair<int64_t, Position>> points;
+    for (FrameTime f = first; f < end; f += step) points.push_back({sampleAt(f), admPosition(trackSurroundAt(tr, double(f)), overhead)});
+    points.push_back({total, admPosition(trackSurroundAt(tr, double(end)), overhead)});
+    std::vector<Block> out{{0, std::min<int64_t>(total, kRate / 1000), points[0].second}};
+    auto onLine = [](const Position& a, const Position& b, double u, const Position& m) {
+        return std::fabs(a.x + (b.x - a.x) * u - m.x) < 0.005 && std::fabs(a.y + (b.y - a.y) * u - m.y) < 0.005 &&
+               std::fabs(a.z + (b.z - a.z) * u - m.z) < 0.005;
+    };
+    size_t i = 1;
+    while (i < points.size()) {
+        const int64_t from = out.back().to;
+        if (points[i].first <= from) {  // a point the lead-in already covers
+            ++i;
+            continue;
+        }
+        const Position start = out.back().at;
+        // As far along as the points between stay on the straight line (at most 200 points to a block).
+        size_t j = i;
+        while (j + 1 < points.size() && j - i < 200) {
+            const size_t k = j + 1;
+            bool straight = true;
+            for (size_t m = i; m <= j && straight; ++m) {
+                const double u = double(points[m].first - from) / double(points[k].first - from);
+                straight = onLine(start, points[k].second, u, points[m].second);
+            }
+            if (!straight) break;
+            j = k;
+        }
+        out.push_back({from, points[j].first, points[j].second});
+        i = j + 1;
+    }
+    out.back().to = total;
+    return out;
 }
 
 }  // namespace
@@ -343,27 +410,24 @@ bool exportAdmBwf(const Project& p, const Sequence& s, const AdmSettings& settin
             x.writeAttribute("audioChannelFormatName", name);
             x.writeAttribute("typeLabel", "0003");
             x.writeAttribute("typeDefinition", "Objects");
-            x.writeStartElement("audioBlockFormat");
-            x.writeAttribute("audioBlockFormatID", "AB_0003" + hex + "_00000001");
-            x.writeAttribute("rtime", admTime(0));
-            x.writeAttribute("duration", duration);
-            x.writeTextElement("cartesian", "1");
-            // Where the panner puts it: its angle and distance round the room into ADM's cartesian square by BS.2127's
-            // mapping, and its height as Z (0 at the ear, 1 overhead, in layouts with overhead speakers), which renderers
-            // crossfade between the layers at constant power as the mix does, whatever the distance.
-            const SurroundPan& sp = tr.surround;
             const bool overhead = std::any_of(layoutSpeakers(layout).begin(), layoutSpeakers(layout).end(),
                                               [](const Speaker& k) { return k.elevation > 0; });
-            const std::array<double, 2> xy = polarToCartesian(-std::atan2(sp.x, sp.y) * 180 / M_PI, std::min(1.0, std::hypot(sp.x, sp.y)));
-            const double pos[3] = {xy[0], xy[1], overhead ? std::clamp(sp.z, 0.0, 1.0) : 0.0};
-            const char* const coords[3] = {"X", "Y", "Z"};
-            for (int c = 0; c < 3; ++c) {
-                x.writeStartElement("position");
-                x.writeAttribute("coordinate", coords[c]);
-                x.writeCharacters(number(std::abs(pos[c]) < 5e-7 ? 0.0 : std::clamp(pos[c], -1.0, 1.0)));
-                x.writeEndElement();
+            const std::vector<Block> blocks = objectBlocks(tr, overhead, first, end, fps, total);
+            for (size_t b = 0; b < blocks.size(); ++b) {
+                const Block& bl = blocks[b];
+                x.writeStartElement("audioBlockFormat");
+                x.writeAttribute("audioBlockFormatID", "AB_0003" + hex + QString::asprintf("_%08X", unsigned(b + 1)));
+                x.writeAttribute("rtime", admTime(bl.from));
+                x.writeAttribute("duration", blocks.size() == 1 ? duration : admTime(bl.to - bl.from));
+                x.writeTextElement("cartesian", "1");
+                for (auto [coord, v] : {std::pair<const char*, double>{"X", bl.at.x}, {"Y", bl.at.y}, {"Z", bl.at.z}}) {
+                    x.writeStartElement("position");
+                    x.writeAttribute("coordinate", coord);
+                    x.writeCharacters(number(std::abs(v) < 5e-7 ? 0.0 : std::clamp(v, -1.0, 1.0)));
+                    x.writeEndElement();
+                }
+                x.writeEndElement();  // audioBlockFormat
             }
-            x.writeEndElement();  // audioBlockFormat
             x.writeEndElement();  // audioChannelFormat
             x.writeStartElement("audioStreamFormat");
             x.writeAttribute("audioStreamFormatID", "AS_0003" + hex);
