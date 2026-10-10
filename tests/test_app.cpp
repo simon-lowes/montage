@@ -7265,6 +7265,7 @@ const auto seq = [this] { return state()->sequence(); };
             return true;
         }));
         QTRY_VERIFY(!dlg->busy());
+        QTest::qWait(400);  // the picture refreshing after the edit keeps what the attempt said
         QVERIFY2(dlg->status().contains("moved"), qPrintable(dlg->status()));
         QVERIFY(state()->sequence()->audioTracks[0].panAuto == lane);
         state()->undo();

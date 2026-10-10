@@ -72,6 +72,8 @@ private:
     FrameTime clipStart_ = 0;
     TrackRef clipTrack_;
     bool closed_ = false;
+    bool outcome_ = false;       // the hint shows how the last attempt went
+    bool refreshLater_ = false;  // edits came while tracking
     QTimer* refresh_ = nullptr;
     PanFollowPicker* picker_;
     QComboBox* size_;

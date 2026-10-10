@@ -155,7 +155,10 @@ PanFollowDialog::PanFollowDialog(EditorState* state, Id audioClip, QWidget* pare
     refresh_->setSingleShot(true);
     refresh_->setInterval(250);
     connect(refresh_, &QTimer::timeout, this, [this] {
-        if (!running_) refreshFrame(false);
+        if (running_)
+            refreshLater_ = true;  // (once it is done)
+        else
+            refreshFrame(false);
     });
     connect(state_, &EditorState::projectChanged, refresh_, qOverload<>(&QTimer::start));
     refreshFrame(true);
@@ -187,7 +190,8 @@ void PanFollowDialog::refreshFrame(bool first) {
     if (from_ < c->start || from_ >= c->end()) from_ = c->start + c->duration / 2;
     const bool picture = panFollowSource(state_->project(), *s, *c, from_) != nullptr;
     track_->setEnabled(picture);
-    if (keys_ == 0 || !picture)
+    // (Not over what the last attempt said, such as the clips having moved.)
+    if ((keys_ == 0 && !outcome_) || !picture)
         info_->setText(!picture ? tr("There is no video on screen with this sound to follow.")
                        : stereoLane() ? tr("Writes the track's pan.")
                                       : tr("Writes the track's surround position."));
@@ -253,6 +257,7 @@ bool PanFollowDialog::track(bool wait) {
     error_ = std::make_shared<std::string>();
     running_ = true;
     keys_ = 0;
+    outcome_ = false;
     track_->setText(tr("Stop"));
     progress_->setValue(0);
     progress_->setVisible(true);
@@ -284,6 +289,11 @@ void PanFollowDialog::finish() {
     track_->setText(tr("Track and Pan"));
     progress_->setVisible(false);
     if (closed_) return;
+    outcome_ = true;
+    if (refreshLater_) {
+        refreshLater_ = false;
+        refresh_->start();
+    }
     if (!watcher_.future().result()) {
         info_->setText(cancel_->load() ? tr("Stopped.") : tr("Could not follow it: %1").arg(QString::fromStdString(*error_)));
         return;
