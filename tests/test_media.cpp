@@ -21,6 +21,7 @@
 #include <QFile>
 #include <random>
 #include <complex>
+#include <tuple>
 #include <sstream>
 #include <cstdio>
 
@@ -4654,7 +4655,7 @@ private slots:
         a1.automation = int(AutomationMode::Read);
 
         // An object on A2 going round from the left (-90°) through the front to the right (+90°): in the ADM master, a
-        // millisecond at the left, then blocks gliding round, ADM's azimuth from +90 to -90, back to back.
+        // millisecond at the left, then blocks gliding round, X from -1 to 1, back to back.
         QVERIFY(edit::placeMedia(p, s, p.media[1].id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 1}, false).ok);
         Track& a2 = s.audioTracks[1];
         a2.surround.object = true, a2.surround.width = 0;
@@ -4672,7 +4673,7 @@ private slots:
         QVERIFY(readBwfInfo(adm, info, &err));
         struct Blk {
             QString rtime, duration;
-            double az = 0;
+            double x = 0, y = 0, z = 0;
         };
         auto blocksOf = [](const std::string& axml, const QString& channel) {
             std::vector<Blk> out;
@@ -4680,10 +4681,12 @@ private slots:
             QRegularExpression re("<audioBlockFormat audioBlockFormatID=\"AB_" + channel.mid(3) +
                                   "_[0-9A-F]{8}\" rtime=\"([0-9:.]+)\" duration=\"([0-9:.]+)\">(.*?)</audioBlockFormat>",
                                   QRegularExpression::DotMatchesEverythingOption);
-            QRegularExpression az("coordinate=\"azimuth\">([-0-9.]+)<");
+            auto coord = [](const QString& block, const char* c) {
+                return QRegularExpression(QString("coordinate=\"%1\">([-0-9.]+)<").arg(c)).match(block).captured(1).toDouble();
+            };
             for (auto it = re.globalMatch(xml); it.hasNext();) {
                 const auto m = it.next();
-                out.push_back({m.captured(1), m.captured(2), az.match(m.captured(3)).captured(1).toDouble()});
+                out.push_back({m.captured(1), m.captured(2), coord(m.captured(3), "X"), coord(m.captured(3), "Y"), coord(m.captured(3), "Z")});
             }
             return out;
         };
@@ -4695,15 +4698,18 @@ private slots:
         QVERIFY2(blocks.size() > 4, qPrintable(QString::number(blocks.size())));
         QCOMPARE(blocks[0].rtime, QString("00:00:00.00000"));
         QCOMPARE(blocks[0].duration, QString("00:00:00.00100"));
-        QVERIFY(std::fabs(blocks[0].az - 90) < 1e-6);
-        QVERIFY(std::fabs(blocks.back().az + 90) < 1e-6);
+        QVERIFY(std::fabs(blocks[0].x + 1) < 1e-6);
+        QVERIFY(std::fabs(blocks.back().x - 1) < 1e-6);
         for (size_t i = 1; i < blocks.size(); ++i) {
             QVERIFY2(std::fabs(seconds(blocks[i].rtime) - seconds(blocks[i - 1].rtime) - seconds(blocks[i - 1].duration)) < 1e-9,
                      qPrintable(QString::number(i)));
-            QVERIFY(blocks[i].az <= blocks[i - 1].az + 1e-9);  // always turning right
-            QVERIFY(blocks[i - 1].az - blocks[i].az <= 10 + 1e-6);  // short enough that a renderer sweeps, not fades
+            // Always turning right (the path is a chord, so X alone dips as it passes nearer the middle).
+            QVERIFY(std::atan2(blocks[i].x, blocks[i].y) >= std::atan2(blocks[i - 1].x, blocks[i - 1].y) - 1e-9);
         }
         QVERIFY(std::fabs(seconds(blocks.back().rtime) + seconds(blocks.back().duration) - 2.0) < 1e-4);
+        // No block goes more than 10° round, so a renderer sweeps through the speakers rather than fading: 180° takes
+        // at least 18 after the lead-in.
+        QVERIFY2(blocks.size() >= 19, qPrintable(QString::number(blocks.size())));
         QVERIFY(info.axml.find("jumpPosition") == std::string::npos);
         // A straight rise (only its height moving, in 7.1.4) needs one block after the lead-in.
         {
@@ -4718,9 +4724,9 @@ private slots:
             QVERIFY(readBwfInfo(path("rise.wav"), info, &err));
             const std::vector<Blk> two = blocksOf(info.axml, "AC_00031001");
             QCOMPARE(two.size(), size_t(2));
-            QVERIFY(info.axml.find("coordinate=\"elevation\">30.000000<") != std::string::npos);
+            QVERIFY(std::fabs(two.back().z - 1) < 1e-6);
         }
-        // Crossing behind the listener (170° to -170°) jumps there instead of sweeping round the front.
+        // Crossing behind the listener (170° to -170°) glides across the back instead of sweeping round the front.
         {
             Sequence behind = s;
             Track& t = behind.audioTracks[1];
@@ -4730,7 +4736,11 @@ private slots:
             t.surround.y = std::cos(170 * M_PI / 180);
             QVERIFY(exportAdmBwf(p, behind, st, path("behind.wav"), &r, {}, &err));
             QVERIFY(readBwfInfo(path("behind.wav"), info, &err));
-            QVERIFY(info.axml.find("<jumpPosition interpolationLength=\"0\">1</jumpPosition>") != std::string::npos);
+            const std::vector<Blk> back = blocksOf(info.axml, "AC_00031001");
+            // 20° round across the back: two blocks after the lead-in (the 10° limit counts the short way round).
+            QVERIFY2(back.size() >= 3 && back.size() <= 4, qPrintable(QString::number(back.size())));
+            for (const Blk& b : back) QVERIFY2(b.y < -0.9, qPrintable(QString::number(b.y)));
+            QVERIFY(back.front().x > 0 && back.back().x < 0);  // from behind on the right to behind on the left
         }
 
         // EBU's renderer (ear), when there is one, hears the object start on the left and end on the right.
@@ -5160,13 +5170,30 @@ private slots:
                 info.chna[0].pack == "AP_00010017");
         QVERIFY(info.chna[8].trackFormat == "AT_00010022_01");  // Ltf, U+045
         QVERIFY(info.chna[12].trackFormat == "AT_00031001_01" && info.chna[12].pack == "AP_00031001");
-        // The object where the panner puts it, in polar coordinates: 45° right (ADM's azimuth counts to the left), raised to
-        // the overhead speakers.
+        // The object where the panner puts it, in ADM's cartesian space by BS.2127's mapping (the one renderers undo): 45°
+        // to the right is on the right wall, a little in front of its middle; overhead is the top of the room.
         for (const char* want : {"audioProgrammeName=\"Immersive test\"", "audioPackFormatIDRef>AP_00010017<", "typeDefinition=\"Objects\"",
-                                 "audioObjectName=\"A2\"", "coordinate=\"azimuth\">-45.000000<", "coordinate=\"elevation\">30.000000<",
-                                 "coordinate=\"distance\">1.000000<", "duration=\"00:00:02.00000\""})
+                                 "audioObjectName=\"A2\"", "<cartesian>1</cartesian>", "coordinate=\"X\">1.000000<",
+                                 "coordinate=\"Y\">0.645822<", "coordinate=\"Z\">1.000000<", "duration=\"00:00:02.00000\""})
             QVERIFY2(info.axml.find(want) != std::string::npos, want);
-        QVERIFY(info.axml.find("<cartesian>1</cartesian>") == std::string::npos);
+        // A speaker's angle lands on that speaker's corner of the square: 30° right at ear level at the front right
+        // corner, 110° left at the back left one, straight ahead in the middle of the front wall. Height is Z whatever the
+        // distance, as the mix crossfades the layers: in the middle overhead is the middle of the ceiling.
+        for (const auto& [x, y, z, want] : {std::tuple{0.5, std::sqrt(0.75), 0.0, "1.000000 1.000000 0.000000"},
+                                            std::tuple{-std::sin(110 * M_PI / 180), std::cos(110 * M_PI / 180), 0.0, "-1.000000 -1.000000 0.000000"},
+                                            std::tuple{0.0, 1.0, 0.0, "0.000000 1.000000 0.000000"},
+                                            std::tuple{0.0, 0.0, 1.0, "0.000000 0.000000 1.000000"},
+                                            std::tuple{0.0, 0.5, 1.0, "0.000000 0.500000 1.000000"}}) {
+            Sequence at = s;
+            at.audioTracks[1].surround.x = x, at.audioTracks[1].surround.y = y, at.audioTracks[1].surround.z = z;
+            QVERIFY(exportAdmBwf(p, at, st, path("corner.wav"), &r, {}, &err) && readBwfInfo(path("corner.wav"), info));
+            const QStringList xyz = QString(want).split(' ');
+            for (int c = 0; c < 3; ++c) {
+                const std::string pos = QString("coordinate=\"%1\">%2<").arg(QChar("XYZ"[c])).arg(xyz[c]).toStdString();
+                QVERIFY2(info.axml.find(pos) != std::string::npos, pos.c_str());
+            }
+        }
+        QVERIFY(readBwfInfo(adm, info));
         // In the file: the 440 in the bed's L, nothing of the 1 kHz in the bed, the 1 kHz as the object at the level it has
         // at a speaker.
         auto fileRms = [&](const std::string& file, std::vector<double>& out) {
@@ -5253,13 +5280,20 @@ private slots:
             QVERIFY(exportAdmBwf(p, solo, st, path("solo2.wav"), &r, {}, &err) && r.objects == 0);
             QVERIFY(fileRms(path("solo2.wav"), ch) && std::fabs(ch[0] - atSpeaker) < 0.01);
         }
-        // Codecs with fewer channels fold the heights down (AAC carries 7.1 at most); PCM keeps them all.
+        // Codecs that cannot carry the overhead channels fold them down instead of failing or turning into stereo:
+        // AAC and FLAC to the ear-level 7.1 or 5.1, AC-3 to 5.1, MP3 to stereo; PCM keeps them all.
         QCOMPARE(exportAudioLayout("7.1.4", "aac"), std::string("7.1"));
         QCOMPARE(exportAudioLayout("5.1.4", "flac"), std::string("5.1"));
         QCOMPARE(exportAudioLayout("7.1.4", "pcm_s24le"), std::string("7.1.4"));
         QCOMPARE(exportAudioLayout("7.1", "ac3"), std::string("5.1"));
         QCOMPARE(exportAudioLayout("5.1", "libmp3lame"), std::string("stereo"));
         QCOMPARE(exportAudioLayout("5.1.2", ""), std::string("5.1.2"));
+        for (const char* layout : {"5.1.2", "5.1.4", "7.1.2", "7.1.4"})
+            for (const char* codec : {"aac", "flac"}) {
+                // Whatever the layout folds to, the encoder takes it.
+                const std::string carried = exportAudioLayout(layout, codec);
+                QVERIFY2(exportCodecCarries(codec, carried), qPrintable(QString("%1 %2 -> %3").arg(codec, layout).arg(QString::fromStdString(carried))));
+            }
         {
             ExportSettings aac = findExportPreset("Audio - AAC (M4A)")->settings;
             aac.path = path("mix714.m4a");
@@ -5267,6 +5301,70 @@ private slots:
             MediaItem folded;
             QVERIFY(probeMedia(aac.path, folded));
             QCOMPARE(folded.channels, 8);
+            // 5.1.2 has eight channels, but FFmpeg 6.1's AAC refuses its layout (newer FFmpeg takes it): the export
+            // carries what the encoder takes, folding to 5.1 rather than failing.
+            Sequence fiveTwo = s;
+            fiveTwo.audioLayout = "5.1.2";
+            aac.path = path("mix512.m4a");
+            QVERIFY2(exportSequence(p, fiveTwo, aac, nullptr, nullptr, &err), err.c_str());
+            QVERIFY(probeMedia(aac.path, folded));
+            const std::string carried = exportAudioLayout("5.1.2", "aac");
+            QVERIFY2(carried == "5.1.2" || carried == "5.1", carried.c_str());
+            QCOMPARE(folded.channels, layoutChannels(carried));
+        }
+        {
+            ExportSettings flac;
+            flac.path = path("mix514.mkv");
+            flac.videoCodec = "none";
+            flac.audioCodec = "flac";
+            Sequence five = s;
+            five.audioLayout = "5.1.4";
+            QVERIFY2(exportSequence(p, five, flac, nullptr, nullptr, &err), err.c_str());
+            MediaItem folded;
+            QVERIFY(probeMedia(flac.path, folded));
+            QCOMPARE(folded.channels, 6);
+        }
+        // Down to stereo it is the fold-down of the whole mix: MP3's two channels have the front-left tone on the left.
+        {
+            ExportSettings mp3;
+            mp3.path = path("mix714.mp3");
+            mp3.videoCodec = "none";
+            mp3.audioCodec = "libmp3lame";
+            QVERIFY2(exportSequence(p, s, mp3, nullptr, nullptr, &err), err.c_str());
+            const std::vector<float> two = decodeAudioStream(mp3.path, 0);
+            const double left = toneLevel(two, 0, 440, 4800, 48000), right = toneLevel(two, 1, 440, 4800, 48000);
+            QVERIFY2(left > 0.1 && right < 0.1 * left, qPrintable(QString("%1 %2").arg(left).arg(right)));
+        }
+        // Mono tracks carry a channel each, so nothing folds: twelve AAC tracks for 7.1.4, the last two the rear heights.
+        {
+            ExportSettings monos;
+            monos.path = path("monos714.mkv");
+            monos.videoCodec = "none";
+            monos.audioCodec = "aac";
+            monos.audioName = "Mix";
+            monos.monoAudioTracks = 12;
+            QVERIFY2(exportSequence(p, s, monos, nullptr, nullptr, &err), err.c_str());
+            std::string title;
+            QVERIFY(!decodeAudioStream(monos.path, 11, &title).empty());
+            QCOMPARE(title, std::string("Mix Rtr"));
+        }
+        // Mono tracks are named for their speakers in FFmpeg's channel order: 7.1's fifth and sixth are the back pair.
+        {
+            Sequence seven = s;
+            seven.audioLayout = "7.1";
+            ExportSettings monos;
+            monos.path = path("monos71.mkv");
+            monos.videoCodec = "none";
+            monos.audioCodec = "pcm_s24le";
+            monos.audioName = "Mix";
+            monos.monoAudioTracks = 8;
+            QVERIFY2(exportSequence(p, seven, monos, nullptr, nullptr, &err), err.c_str());
+            const char* const names[8] = {"L", "R", "C", "LFE", "Lb", "Rb", "Ls", "Rs"};
+            for (int i = 0; i < 8; ++i) {
+                std::string title;
+                decodeAudioStream(monos.path, i, &title);
+                QCOMPARE(title, std::string("Mix ") + names[i]);
+            }
         }
         // 7.1.2 has a pack of its own (Dolby's bed, its pair overhead at the sides); stereo uses BS.2094's.
         Sequence atmos = s;

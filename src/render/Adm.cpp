@@ -3,6 +3,7 @@
 #include <QFile>
 #include <QXmlStreamWriter>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -62,47 +63,77 @@ struct Channel {
     std::string uid, trackFormat, pack;
 };
 
-// Where an object is, in ADM's polar coordinates, as the panner places it: its angle round the room (ADM counts
-// azimuth positive to the left), up to the overhead speakers' elevation (`top`) as far as it is raised, and its
-// distance.
-struct Polar {
-    double az = 0, el = 0, dist = 1;
-};
-Polar admPolar(const SurroundPan& sp, double top) {
-    Polar p;
-    p.az = -std::atan2(sp.x, sp.y) * 180 / M_PI;
-    p.dist = std::min(1.0, std::hypot(sp.x, sp.y));
-    p.el = std::clamp(sp.z, 0.0, 1.0) * top;
-    return p;
+// ITU-R BS.2127's polar to cartesian mapping (section 10.1) at ear level, the one ADM renderers apply to cartesian
+// objects: the loudspeakers M+000, M-030, M-110, M+110 and M+030 sit on the corners and edges of the square, so a
+// position at a speaker's angle lands where a renderer puts that speaker. `azimuth` in degrees, positive to the left as
+// ADM counts it; X and Y scaled by `distance`.
+std::array<double, 2> polarToCartesian(double azimuth, double distance) {
+    constexpr double kDeg = M_PI / 180;
+    // The sectors between neighbouring loudspeakers, anticlockwise: azimuth and position on the square.
+    struct Corner {
+        double az, x, y;
+    };
+    static const Corner corners[5] = {{0, 0, 1}, {-30, 1, 1}, {-110, 1, -1}, {110, -1, -1}, {30, -1, 1}};
+    // An angle unwrapped to lie at or past `base` (by less than a turn).
+    auto from = [](double base, double a) {
+        while (a - 360 >= base) a -= 360;
+        while (a < base) a += 360;
+        return a;
+    };
+    for (int i = 0; i < 5; ++i) {
+        const Corner& left = corners[i];
+        const Corner& right = corners[(i + 1) % 5];
+        const double rightAz = right.az, leftAz = from(rightAz, left.az), az = from(rightAz, azimuth);
+        if (az > leftAz) continue;
+        // Equal-tangent panning between the two corners, then the constant-power gain's angle as a fraction.
+        const double mid = (leftAz + rightAz) / 2, half = rightAz - mid;
+        const double gainR = 0.5 + 0.5 * std::tan((az - mid) * kDeg) / std::tan(half * kDeg);
+        const double t = std::atan2(gainR, 1 - gainR) * 2 / M_PI;
+        return {distance * (left.x + (right.x - left.x) * t), distance * (left.y + (right.y - left.y) * t)};
+    }
+    return {0, distance};  // not reached: the sectors cover the circle
 }
 
-// One audioBlockFormat: from `from` to `to` (samples into the master), moving to `at` over its length (or jumping
-// there at once).
+// Where an object is in ADM's cartesian coordinates, as the panner places it: its angle and distance round the room
+// into the square by BS.2127's mapping, and its height as Z (0 at the ear, 1 overhead, in layouts with overhead
+// speakers; `overhead`), which renderers crossfade between the layers at constant power as the mix does, whatever the
+// distance.
+struct Position {
+    double x = 0, y = 1, z = 0;
+    double az = 0;  // the panner's angle (degrees, ADM's way round), for how far round a block goes
+};
+Position admPosition(const SurroundPan& sp, bool overhead) {
+    const double az = -std::atan2(sp.x, sp.y) * 180 / M_PI;
+    const std::array<double, 2> xy = polarToCartesian(az, std::min(1.0, std::hypot(sp.x, sp.y)));
+    return {xy[0], xy[1], overhead ? std::clamp(sp.z, 0.0, 1.0) : 0.0, az};
+}
+
+// One audioBlockFormat: from `from` to `to` (samples into the master), moving to `at` over its length.
 struct Block {
     int64_t from = 0, to = 0;
-    Polar at;
-    bool jump = false;
+    Position at;
 };
 
 // An object's blocks. Still: one. Moving (its position lanes play): a millisecond at where it starts, then the
-// position every frame, each block gliding to the next point; points on a straight line (within half a degree
-// and 0.005 of distance, and no more than 10 degrees round) share a block, and a step across the back (azimuth ±180°)
-// jumps instead of sweeping round the front. Boundaries fall on whole samples that hh:mm:ss.fffff writes exactly (every 12 at 48 kHz).
-std::vector<Block> objectBlocks(const Track& tr, double top, FrameTime first, FrameTime end, double fps, int64_t total) {
+// position every frame, each block gliding to the next point; points on a straight line (within 0.005 in X, Y and Z,
+// and no more than 10 degrees round) share a block. Cartesian blocks need no jump behind the listener: the path between
+// two points behind stays behind. Boundaries fall on whole samples that hh:mm:ss.fffff writes exactly (every 12 at
+// 48 kHz).
+std::vector<Block> objectBlocks(const Track& tr, bool overhead, FrameTime first, FrameTime end, double fps, int64_t total) {
     const bool reads = trackAutomation(tr) == AutomationMode::Read || trackAutomation(tr) == AutomationMode::Latch ||
                        trackAutomation(tr) == AutomationMode::Touch;
-    if (!reads || !surroundAnimated(tr)) return {{0, total, admPolar(tr.surround, top), false}};
+    if (!reads || !surroundAnimated(tr)) return {{0, total, admPosition(tr.surround, overhead)}};
     auto sampleAt = [&](FrameTime f) {
         const int64_t v = int64_t(std::llround(double(f - first) * kRate / fps));
         return std::min(total, v / 12 * 12);
     };
-    std::vector<std::pair<int64_t, Polar>> points;  // every frame, merged below
-    for (FrameTime f = first; f < end; ++f) points.push_back({sampleAt(f), admPolar(trackSurroundAt(tr, double(f)), top)});
-    points.push_back({total, admPolar(trackSurroundAt(tr, double(end)), top)});
-    std::vector<Block> out{{0, std::min<int64_t>(total, kRate / 1000), points[0].second, false}};
-    auto onLine = [](const Polar& a, const Polar& b, double u, const Polar& m) {
-        return std::fabs(a.az + (b.az - a.az) * u - m.az) < 0.5 && std::fabs(a.el + (b.el - a.el) * u - m.el) < 0.5 &&
-               std::fabs(a.dist + (b.dist - a.dist) * u - m.dist) < 0.005;
+    std::vector<std::pair<int64_t, Position>> points;  // every frame, merged below
+    for (FrameTime f = first; f < end; ++f) points.push_back({sampleAt(f), admPosition(trackSurroundAt(tr, double(f)), overhead)});
+    points.push_back({total, admPosition(trackSurroundAt(tr, double(end)), overhead)});
+    std::vector<Block> out{{0, std::min<int64_t>(total, kRate / 1000), points[0].second}};
+    auto onLine = [](const Position& a, const Position& b, double u, const Position& m) {
+        return std::fabs(a.x + (b.x - a.x) * u - m.x) < 0.005 && std::fabs(a.y + (b.y - a.y) * u - m.y) < 0.005 &&
+               std::fabs(a.z + (b.z - a.z) * u - m.z) < 0.005;
     };
     size_t i = 1;
     while (i < points.size()) {
@@ -111,20 +142,15 @@ std::vector<Block> objectBlocks(const Track& tr, double top, FrameTime first, Fr
             ++i;
             continue;
         }
-        const Polar start = out.back().at;
-        if (std::fabs(points[i].second.az - start.az) > 180) {
-            out.push_back({from, points[i].first, points[i].second, true});
-            ++i;
-            continue;
-        }
+        const Position start = out.back().at;
         // As far along as the points between stay on the straight line (at most 200 points to a block), and no
-        // further than 10 degrees round: renderers (BS.2127) fade the speaker gains between blocks, so a long block
-        // would play an arc as a crossfade between its ends instead of a sweep through the speakers between (a rise
-        // at one azimuth fades between the same speakers either way).
+        // further than 10 degrees round (either way across the back): renderers (BS.2127) fade the speaker gains
+        // between blocks, so a long block would play an arc as a crossfade between its ends instead of a sweep through
+        // the speakers between (a rise at one angle fades between the same speakers either way).
         size_t j = i;
-        while (j + 1 < points.size() && j - i < 200 && std::fabs(points[j + 1].second.az - points[j].second.az) <= 180) {
+        while (j + 1 < points.size() && j - i < 200) {
             const size_t k = j + 1;
-            if (std::fabs(points[k].second.az - start.az) > 10) break;
+            if (std::fabs(std::remainder(points[k].second.az - start.az, 360.0)) > 10) break;
             bool straight = true;
             for (size_t m = i; m <= j && straight; ++m) {
                 const double u = double(points[m].first - from) / double(points[k].first - from);
@@ -133,7 +159,7 @@ std::vector<Block> objectBlocks(const Track& tr, double top, FrameTime first, Fr
             if (!straight) break;
             j = k;
         }
-        out.push_back({from, points[j].first, points[j].second, false});
+        out.push_back({from, points[j].first, points[j].second});
         i = j + 1;
     }
     out.back().to = total;
@@ -390,25 +416,20 @@ bool exportAdmBwf(const Project& p, const Sequence& s, const AdmSettings& settin
             x.writeAttribute("audioChannelFormatName", name);
             x.writeAttribute("typeLabel", "0003");
             x.writeAttribute("typeDefinition", "Objects");
-            double top = 0;
-            for (const Speaker& k : layoutSpeakers(layout)) top = std::max(top, k.elevation);
-            const std::vector<Block> blocks = objectBlocks(tr, top, first, end, fps, total);
+            const bool overhead = std::any_of(layoutSpeakers(layout).begin(), layoutSpeakers(layout).end(),
+                                              [](const Speaker& k) { return k.elevation > 0; });
+            const std::vector<Block> blocks = objectBlocks(tr, overhead, first, end, fps, total);
             for (size_t b = 0; b < blocks.size(); ++b) {
                 const Block& bl = blocks[b];
                 x.writeStartElement("audioBlockFormat");
                 x.writeAttribute("audioBlockFormatID", "AB_0003" + hex + QString::asprintf("_%08X", unsigned(b + 1)));
                 x.writeAttribute("rtime", admTime(bl.from));
                 x.writeAttribute("duration", blocks.size() == 1 ? duration : admTime(bl.to - bl.from));
-                if (bl.jump) {
-                    x.writeStartElement("jumpPosition");
-                    x.writeAttribute("interpolationLength", "0");
-                    x.writeCharacters("1");
-                    x.writeEndElement();
-                }
-                for (auto [coord, v] : {std::pair<const char*, double>{"azimuth", bl.at.az}, {"elevation", bl.at.el}, {"distance", bl.at.dist}}) {
+                x.writeTextElement("cartesian", "1");
+                for (auto [coord, v] : {std::pair<const char*, double>{"X", bl.at.x}, {"Y", bl.at.y}, {"Z", bl.at.z}}) {
                     x.writeStartElement("position");
                     x.writeAttribute("coordinate", coord);
-                    x.writeCharacters(number(std::abs(v) < 5e-7 ? 0.0 : v));
+                    x.writeCharacters(number(std::abs(v) < 5e-7 ? 0.0 : std::clamp(v, -1.0, 1.0)));
                     x.writeEndElement();
                 }
                 x.writeEndElement();  // audioBlockFormat

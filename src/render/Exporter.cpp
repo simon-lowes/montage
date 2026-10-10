@@ -18,6 +18,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
 
 #include "ColorSpace.h"
 #include "Compositor.h"
@@ -321,6 +322,25 @@ const ExportPreset* findExportPreset(const std::string& name) {
 }
 
 namespace {
+
+// FFmpeg's layout for one of core/Surround.h's, channels in the same order: 5.1.x on the back pair as FFmpeg's own
+// 5.1.2 and 5.1.4, 7.1.2's overhead pair at the sides (Dolby's bed). False for a layout it has no channels for.
+bool ffmpegLayout(const std::string& name, AVChannelLayout& out) {
+    const uint64_t top = AV_CH_TOP_FRONT_LEFT | AV_CH_TOP_FRONT_RIGHT, rear = AV_CH_TOP_BACK_LEFT | AV_CH_TOP_BACK_RIGHT;
+    uint64_t mask = 0;
+    if (name == "stereo") mask = AV_CH_LAYOUT_STEREO;
+    else if (name == "5.1") mask = AV_CH_LAYOUT_5POINT1;
+    else if (name == "7.1") mask = AV_CH_LAYOUT_7POINT1;
+    else if (name == "5.1.2") mask = AV_CH_LAYOUT_5POINT1_BACK | top;
+    else if (name == "5.1.4") mask = AV_CH_LAYOUT_5POINT1_BACK | top | rear;
+    else if (name == "7.1.2") mask = AV_CH_LAYOUT_7POINT1 | AV_CH_TOP_SIDE_LEFT | AV_CH_TOP_SIDE_RIGHT;
+    else if (name == "7.1.4") mask = AV_CH_LAYOUT_7POINT1 | top | rear;
+    else if (layoutChannels(name) == 2) mask = AV_CH_LAYOUT_STEREO;  // what core/Surround.h makes of any other name
+    AVChannelLayout l{};
+    if (!mask || av_channel_layout_from_mask(&l, mask) < 0 || l.nb_channels != layoutChannels(name)) return false;
+    out = l;
+    return true;
+}
 
 // ---- Animated GIF -----------------------------------------------------------------
 
@@ -932,24 +952,12 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         if (!codec) return "Audio encoder not available: " + s.audioCodec;
         ast = avformat_new_stream(o.oc, nullptr);
         actx = avcodec_alloc_context3(codec);
-        // The sequence's layout (the channel order core/Surround.h uses is FFmpeg's), or stereo.
+        // The sequence's layout (the channel order core/Surround.h uses is FFmpeg's), or stereo. exportSequence has
+        // already folded a layout the codec cannot carry; one FFmpeg cannot describe is an error, never a stereo stream
+        // fed every channel.
         AVChannelLayout layout = AV_CHANNEL_LAYOUT_STEREO;
-        if (!s.downmixStereo && seq.audioLayout == "5.1") layout = AV_CHANNEL_LAYOUT_5POINT1;
-        if (!s.downmixStereo && seq.audioLayout == "7.1") layout = AV_CHANNEL_LAYOUT_7POINT1;
-        if (!s.downmixStereo && immersiveLayout(seq.audioLayout)) {
-            // FFmpeg's overhead layouts (5.1.x on the back pair, 7.1.2's pair at the sides), whose native order is the
-            // order core/Surround.h mixes in.
-            const uint64_t top = AV_CH_TOP_FRONT_LEFT | AV_CH_TOP_FRONT_RIGHT, rear = AV_CH_TOP_BACK_LEFT | AV_CH_TOP_BACK_RIGHT;
-            uint64_t mask = 0;
-            if (seq.audioLayout == "5.1.2") mask = AV_CH_LAYOUT_5POINT1_BACK | top;
-            else if (seq.audioLayout == "5.1.4") mask = AV_CH_LAYOUT_5POINT1_BACK | top | rear;
-            else if (seq.audioLayout == "7.1.2") mask = AV_CH_LAYOUT_7POINT1 | AV_CH_TOP_SIDE_LEFT | AV_CH_TOP_SIDE_RIGHT;
-            else if (seq.audioLayout == "7.1.4") mask = AV_CH_LAYOUT_7POINT1 | top | rear;
-            AVChannelLayout immersive{};
-            if (!mask || av_channel_layout_from_mask(&immersive, mask) < 0 || immersive.nb_channels != layoutChannels(seq.audioLayout))
-                return "This FFmpeg cannot describe the " + seq.audioLayout + " layout";
-            layout = immersive;
-        }
+        if (!s.downmixStereo && !ffmpegLayout(seq.audioLayout, layout))
+            return "This FFmpeg cannot describe the " + seq.audioLayout + " channel layout";
         if (mono) layout = AV_CHANNEL_LAYOUT_MONO;
         av_channel_layout_copy(&actx->ch_layout, &layout);
         actx->sample_rate = sr;
@@ -1491,20 +1499,47 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
 
 }  // namespace
 
-int maxAudioChannels(const std::string& codec) {
-    if (codec.rfind("pcm_", 0) == 0) return 64;
-    if (codec == "ac3" || codec == "eac3" || codec == "ac3_fixed") return 6;
-    if (codec == "libmp3lame" || codec == "mp3" || codec == "mp2" || codec == "libtwolame") return 2;
-    return 8;
+bool exportCodecCarries(const std::string& codecName, const std::string& layout) {
+    AVChannelLayout want{};
+    if (!ffmpegLayout(layout, want)) return false;
+    const AVCodec* codec = avcodec_find_encoder_by_name(codecName.c_str());
+    if (!codec) return true;  // the export itself says the encoder is missing
+    // Encoders list some layouts and check others only when they open (FFmpeg's AAC takes 7.1 but not 5.1.2), so the
+    // answer is an encoder opened with the layout, once per codec and layout.
+    static std::mutex mutex;
+    static std::map<std::string, bool> known;
+    const std::string key = codecName + '/' + layout;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (auto it = known.find(key); it != known.end()) return it->second;
+    }
+    AVCodecContext* ctx = avcodec_alloc_context3(codec);
+    if (!ctx) return false;
+    av_channel_layout_copy(&ctx->ch_layout, &want);
+    ctx->sample_rate = 48000;
+    ctx->time_base = AVRational{1, 48000};
+    const AVSampleFormat* fmts = nullptr;
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(61, 13, 100)
+    const void* cfg = nullptr;
+    if (avcodec_get_supported_config(ctx, codec, AV_CODEC_CONFIG_SAMPLE_FORMAT, 0, &cfg, nullptr) >= 0)
+        fmts = static_cast<const AVSampleFormat*>(cfg);
+#else
+    fmts = codec->sample_fmts;
+#endif
+    ctx->sample_fmt = fmts ? fmts[0] : AV_SAMPLE_FMT_FLTP;
+    const bool ok = avcodec_open2(ctx, codec, nullptr) >= 0;
+    avcodec_free_context(&ctx);
+    std::lock_guard<std::mutex> lock(mutex);
+    known[key] = ok;
+    return ok;
 }
 
 std::string exportAudioLayout(const std::string& layout, const std::string& codec) {
-    if (codec.empty()) return layout;
-    const int most = maxAudioChannels(codec);
-    if (layoutChannels(layout) <= most) return layout;
+    if (codec.empty() || codec == "none" || exportCodecCarries(codec, layout)) return layout;
     const std::string ear = earLevelLayout(layout);
-    if (layoutChannels(ear) <= most) return ear;
-    return most >= 6 ? "5.1" : "stereo";
+    if (ear != layout && exportCodecCarries(codec, ear)) return ear;
+    if (layoutChannels(layout) > 6 && exportCodecCarries(codec, "5.1")) return "5.1";
+    return "stereo";
 }
 
 bool containerCarriesStreams(const std::string& path) {
@@ -1521,16 +1556,19 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
     bool opened = false;
     if (smartRendered) *smartRendered = 0;
     if (light) *light = LightLevels{};
-    // Channels a codec cannot carry fold down (an immersive mix to its ear-level layout, for AAC and the like).
-    const std::string layout = s.downmixStereo ? seq.audioLayout : exportAudioLayout(seq.audioLayout, s.audioCodec);
+    // Channels the codec cannot carry fold down (an immersive mix in AAC to its ear-level 7.1 or 5.1), as the export
+    // dialog's summary says, rather than failing or turning into stereo. Down to stereo it is the stereo fold-down of the
+    // whole mix. Mono tracks carry a channel each, whatever the codec.
+    const std::string layout = s.downmixStereo || s.monoAudioTracks > 0 ? seq.audioLayout : exportAudioLayout(seq.audioLayout, s.audioCodec);
     // A described master: the mix without the descriptions, then the programme with them as a stream of its own.
     const bool described = s.describedStream && hasDescriptionClips(seq) && !s.audioCodec.empty() && s.audioCodec != "none" &&
                            containerCarriesStreams(s.path);
     bool ok;
     if (layout != seq.audioLayout || described) {
         Sequence work = seq;
-        work.audioLayout = layout;
         ExportSettings settings = s;
+        if (layoutChannels(layout) <= 2 && layoutChannels(seq.audioLayout) > 2) settings.downmixStereo = true;
+        else work.audioLayout = layout;
         if (described) {
             if (!edit::roleMuted(work, kDescriptionRole)) work.mutedRoles.push_back(kDescriptionRole);
             // Streams that would hear only the descriptions (their role, or tracks holding nothing else) are silent

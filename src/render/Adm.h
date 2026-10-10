@@ -7,8 +7,9 @@
 // which those definitions lack in Dolby's form, has a pack of its own made of their channels). Each audio track marked
 // as an object (SurroundPan::object) and going straight to the speakers (a track sent to a bus is heard through the
 // bus, so it stays in the bed) becomes an object of its own: its sound after its fader, as one channel, at its
-// panner's position in polar coordinates (azimuth, elevation up to the overhead speakers', distance); its LFE send
-// stays in the bed. Solo and mute count as they do when playing. 48 kHz, 24 bits.
+// panner's position in the ADM's cartesian coordinates (its angle and distance by BS.2127's polar to cartesian mapping,
+// its height as Z), so a renderer puts it where the mix does; its LFE send stays in the bed. Solo and mute count as
+// they do when playing. 48 kHz, 24 bits.
 #pragma once
 
 #include <cstdint>
