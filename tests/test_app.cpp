@@ -7225,11 +7225,35 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(dlg->track(true));
         const double half = trackPanAt(state()->sequence()->audioTracks[0], 27);
         QVERIFY2(half > 0.2 && half < 0.45, qPrintable(QString::number(half)));
-        // Another sequence closes it.
+        // The sound moved while it was being followed: the frames tracked no longer fit, so nothing is written.
+        const Param lane = state()->sequence()->audioTracks[0].panAuto;
+        dlg->setWidth(1.0);
+        QVERIFY(dlg->track(false));
+        QVERIFY(state()->edit("Nudge", [](Project&, Sequence& s) {
+            s.audioTracks[0].clips[0].start += 3;
+            return true;
+        }));
+        QTRY_VERIFY(!dlg->busy());
+        QVERIFY2(dlg->status().contains("moved"), qPrintable(dlg->status()));
+        QVERIFY(state()->sequence()->audioTracks[0].panAuto == lane);
+        state()->undo();
+        // In the middle of a drag (or a fader pass), the result waits for it to end rather than breaking it.
+        dlg->setWidth(0.75);
+        state()->beginGesture("Drag");
+        QVERIFY(dlg->track(true));
+        QVERIFY(state()->inGesture());
+        QVERIFY(state()->sequence()->audioTracks[0].panAuto == lane);
+        state()->endGesture(false);
+        QTRY_VERIFY(!(state()->sequence()->audioTracks[0].panAuto == lane));
+        const double wider = trackPanAt(state()->sequence()->audioTracks[0], 27);
+        QVERIFY2(wider > half + 0.1, qPrintable(QString::number(wider)));
+        // Another sequence closes it, and what was being followed is never written into the new one.
         QPointer<PanFollowDialog> guard(dlg);
+        QVERIFY(dlg->track(false));
         state()->newProject();
-        QTest::qWait(10);
+        QTest::qWait(300);
         QVERIFY(!guard || !guard->isVisible());
+        QVERIFY(!state()->canUndo());
     }
 
     void closeUpOnAFace() {

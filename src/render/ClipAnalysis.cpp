@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <numeric>
 
 #include "Compositor.h"
@@ -278,7 +279,20 @@ void applyFollow(Clip& c, const std::vector<FollowKey>& keys, MotionModel model)
 
 // ---- Panning that follows the picture ------------------------------------------------
 
-const Clip* panFollowSource(const Project& p, const Sequence& s, const Clip& a, FrameTime t) {
+const Clip* panFollowSource(const Project& p, const Sequence& s, const Clip& a, FrameTime t, double x, double y) {
+    if (x >= 0 && y >= 0) {
+        // What is seen at the point: the topmost clip from a file whose frame covers it.
+        for (int i = int(s.videoTracks.size()) - 1; i >= 0; --i) {
+            if (s.videoTracks[size_t(i)].muted) continue;
+            const Clip* c = edit::clipAt(s, TrackRef{TrackKind::Video, i}, t);
+            const MediaItem* m = c && c->enabled && c->mediaId ? p.findMedia(c->mediaId) : nullptr;
+            if (!m) continue;  // empty, off, or a generator (a title over the picture)
+            double u, v;
+            if (!sequenceToClipFrame(p, s, *c, t, x * s.width, y * s.height, u, v) || u < 0 || u > 1 || v < 0 || v > 1) continue;
+            return hasPicture(p, *c) ? c : nullptr;
+        }
+        return nullptr;
+    }
     for (Id id : edit::linkedClips(s, a.id)) {
         const auto loc = edit::locate(s, id);
         const Clip* c = edit::clipById(s, id);
@@ -319,18 +333,23 @@ bool panFollowSubject(const Project& p, const Sequence& s, const Clip& a, FrameT
 
 bool trackPanFollow(const Project& p, const Sequence& s, const Clip& a, FrameTime from, double x, double y, double size,
                     std::vector<PanFollowKey>& keys, const TrackProgress& progress, const std::atomic<bool>* cancel,
-                    std::string* error) {
+                    std::string* error, Id* source) {
     keys.clear();
     if (a.duration <= 0) return false;
     from = std::clamp<FrameTime>(from, a.start, a.end() - 1);
-    const Clip* src = panFollowSource(p, s, a, from);
+    x = std::clamp(x, 0.0, 1.0);
+    y = std::clamp(y, 0.0, 1.0);
+    const Clip* src = panFollowSource(p, s, a, from, x, y);
     if (!src) {
-        if (error) *error = "No picture to follow here: the sound needs video on screen with it";
+        if (error)
+            *error = panFollowSource(p, s, a, from) ? "Nothing that moves is seen there: pick a point on the video"
+                                                    : "No picture to follow here: the sound needs video on screen with it";
         return false;
     }
+    if (source) *source = src->id;
     const MediaItem* m = p.findMedia(src->mediaId);
     // The square around the point, in the footage's own frame.
-    const double cx = std::clamp(x, 0.0, 1.0) * s.width, cy = std::clamp(y, 0.0, 1.0) * s.height;
+    const double cx = x * s.width, cy = y * s.height;
     const double half = std::clamp(size, 0.02, 1.0) * s.height / 2;
     double u, v, ux, vx, uy, vy;
     if (!sequenceToClipFrame(p, s, *src, from, cx, cy, u, v) || !sequenceToClipFrame(p, s, *src, from, cx + half, cy, ux, vx) ||
@@ -342,18 +361,20 @@ bool trackPanFollow(const Project& p, const Sequence& s, const Clip& a, FrameTim
     const FrameTime lo = std::max(a.start, src->start), hi = std::min(a.end(), src->end()) - 1;
     const double fps = m->fps.valid() ? m->fps.toDouble() : s.fpsValue();
     const double span = double(std::max<FrameTime>(1, hi - lo));
+    std::string why;  // what the tracker said, if it found nothing
     // One direction from `from` to timeline frame `to`, as keys in tracking order.
     auto run = [&](FrameTime to, double offset, double share, std::vector<PanFollowKey>& out) -> bool {
         if (to == from) return true;
         const double fromSec = sourceSeconds(s, *src, from - src->start), toSec = sourceSeconds(s, *src, to - src->start);
         TrackProgress part;
         if (progress) part = [&](double f) { progress(offset + f * share); };
-        std::string why;
-        const auto regions = trackRegion(m->path, fromSec, toSec, start, MotionModel::Translation, part, cancel, &why);
+        std::string said;
+        const auto regions = trackRegion(m->path, fromSec, toSec, start, MotionModel::Translation, part, cancel, &said);
         if (cancel && cancel->load()) {
-            if (error) *error = why.empty() ? "Stopped" : why;
+            if (error) *error = said.empty() ? "Stopped" : said;
             return false;
         }
+        if (regions.empty() && why.empty()) why = said;
         const double dir = toSec >= fromSec ? 1 : -1;
         for (size_t k = 0; k < regions.size(); ++k) {
             const FrameTime t = src->start + FrameTime(std::llround(localFrame(s, *src, fromSec + dir * double(k) / fps)));
@@ -373,9 +394,13 @@ bool trackPanFollow(const Project& p, const Sequence& s, const Clip& a, FrameTim
     for (auto it = behind.rbegin(); it != behind.rend(); ++it) keys.push_back(*it);
     for (const PanFollowKey& k : ahead)
         if (keys.empty() || k.t > keys.back().t) keys.push_back(k);
-    if (keys.empty()) keys.push_back({from, std::clamp(x, 0.0, 1.0), std::clamp(y, 0.0, 1.0)});
-    if (keys.size() < 2 && error) *error = "Lost straight away: pick something with detail to follow";
+    if (keys.size() < 2 && error) *error = !why.empty() ? why : "Lost straight away: pick something with detail to follow";
     return keys.size() >= 2;
+}
+
+bool panFollowStereo(const Sequence& s, const Track& t) {
+    if (layoutChannels(s.audioLayout) <= 2) return true;
+    return t.output && std::any_of(s.buses.begin(), s.buses.end(), [&](const Bus& b) { return b.id == t.output; });
 }
 
 void panFollowPosition(const Sequence& s, double x, double width, bool stereo, double& panX, double& panY) {
@@ -388,13 +413,22 @@ void panFollowPosition(const Sequence& s, double x, double width, bool stereo, d
         panY = std::cos(azimuth);
         return;
     }
-    panX = (2 * x - 1) * width * (stereo ? 1.0 : std::tan(30 * M_PI / 180));
-    panY = 1;
+    if (stereo) {
+        panX = (2 * x - 1) * width;
+        panY = 1;
+        return;
+    }
+    // A flat picture seen as through a window in front: its edges at ±30° (in perspective across it).
+    const double angle = std::atan((2 * x - 1) * width * std::tan(30 * M_PI / 180));
+    panX = std::sin(angle);
+    panY = std::cos(angle);
 }
 
 bool applyPanFollow(const Sequence& s, Track& t, const std::vector<PanFollowKey>& keys, double width) {
     if (keys.size() < 2 || t.kind != TrackKind::Audio) return false;
-    const bool stereo = layoutChannels(s.audioLayout) <= 2;
+    const bool stereo = panFollowStereo(s, t);
+    const bool reading = trackAutomation(t) != AutomationMode::Off && trackAutomation(t) != AutomationMode::Write;
+    const Track was = t;
     // A pixel or two of tracking jitter would be heard as the sound wobbling: a five-frame moving average.
     std::vector<double> xs(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -404,16 +438,14 @@ bool applyPanFollow(const Sequence& s, Track& t, const std::vector<PanFollowKey>
         xs[i] = sum / n;
     }
     const FrameTime lo = keys.front().t, hi = keys.back().t;
-    auto write = [&](Param& lane, double still, bool wantY) {
+    // value(i): the lane's value at key i.
+    auto write = [&](Param& lane, double still, const std::function<double(size_t)>& value) {
+        if (!reading) lane.keys.clear();  // not heard: what was heard is the fader as set
         const double before = lane.animated() ? lane.at(lo - 1) : still, after = lane.animated() ? lane.at(hi + 1) : still;
         const bool keyBefore = lane.keyAt(lo - 1) != nullptr, keyAfter = lane.keyAt(hi + 1) != nullptr;
         std::erase_if(lane.keys, [&](const Keyframe& k) { return k.t >= lo && k.t <= hi; });
         std::vector<Keyframe> path;
-        for (size_t i = 0; i < keys.size(); ++i) {
-            double px, py;
-            panFollowPosition(s, xs[i], width, stereo, px, py);
-            path.push_back({keys[i].t, wantY ? py : px});
-        }
+        for (size_t i = 0; i < keys.size(); ++i) path.push_back({keys[i].t, value(i)});
         thinKeys(path, 0.005);
         for (const Keyframe& k : path) lane.addKey(k.t, k.v, Interp::Linear);
         // Outside the span the lane stays what it was (a lane with no keys before plays its static value there).
@@ -421,12 +453,27 @@ bool applyPanFollow(const Sequence& s, Track& t, const std::vector<PanFollowKey>
         if (!keyAfter) lane.addKey(hi + 1, after, Interp::Linear);
     };
     if (stereo) {
-        write(t.panAuto, t.pan, false);
+        write(t.panAuto, t.pan, [&](size_t i) {
+            double px, py;
+            panFollowPosition(s, xs[i], width, true, px, py);
+            return px;
+        });
     } else {
-        write(t.surroundXAuto, t.surround.x, false);
-        if (s.spherical) write(t.surroundYAuto, t.surround.y, true);
+        // The direction followed, at the distance the track was heard at (all the way out if it was in the middle).
+        std::vector<double> px(keys.size()), py(keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            const SurroundPan heard = trackSurroundAt(was, double(keys[i].t));
+            double d = std::min(1.0, std::hypot(heard.x, heard.y));
+            if (d < 0.1) d = 1;
+            panFollowPosition(s, xs[i], width, false, px[i], py[i]);
+            px[i] *= d;
+            py[i] *= d;
+        }
+        write(t.surroundXAuto, t.surround.x, [&](size_t i) { return px[i]; });
+        write(t.surroundYAuto, t.surround.y, [&](size_t i) { return py[i]; });
+        if (!reading) t.surroundZAuto.keys.clear();
     }
-    if (t.automation == int(AutomationMode::Off)) t.automation = int(AutomationMode::Read);
+    if (!reading) t.automation = int(AutomationMode::Read);
     return true;
 }
 

@@ -13223,8 +13223,9 @@ private slots:
         QVERIFY2(worst < 1.5, qPrintable(QString::number(worst)));
         // Stereo: the track's pan moves left to right with it, thinned, and stays as it was outside the span.
         Track& tr = *trackAt(s, {TrackKind::Audio, 1});
-        tr.automation = int(AutomationMode::Off);
+        tr.automation = int(AutomationMode::Read);
         tr.panAuto.addKey(60, 0.5);  // a later move, kept
+        const Track untouched = tr;
         QVERIFY(applyPanFollow(s, tr, keys, 1.0));
         QCOMPARE(tr.automation, int(AutomationMode::Read));
         QVERIFY(tr.panAuto.keys.size() < 20);
@@ -13235,25 +13236,70 @@ private slots:
         QVERIFY(trackPanAt(tr, 2) < -0.5 && trackPanAt(tr, 37) > 0.5);
         QVERIFY(std::fabs(trackPanAt(tr, 40) - 0.5) < 1e-9);  // what the lane held there before
         QVERIFY(tr.panAuto.keyAt(60) && std::fabs(tr.panAuto.keyAt(60)->v - 0.5) < 1e-9);
+        // A track not reading its lanes (Off, or Write): those lanes were not heard, so they are replaced, the fader's
+        // pan kept outside the span, and the track set to read.
+        for (AutomationMode mode : {AutomationMode::Off, AutomationMode::Write}) {
+            Track off = untouched;
+            off.automation = int(mode);
+            off.pan = -0.25;
+            QVERIFY(applyPanFollow(s, off, keys, 1.0));
+            QCOMPARE(off.automation, int(AutomationMode::Read));
+            QVERIFY(!off.panAuto.keyAt(60));
+            QVERIFY(std::fabs(trackPanAt(off, 40) + 0.25) < 1e-9 && std::fabs(trackPanAt(off, 80) + 0.25) < 1e-9);
+            QVERIFY(trackPanAt(off, 37) > 0.5);
+        }
+        // A path starting later: the lane before it is held as it was by a key just before.
+        {
+            Track later = untouched;
+            later.panAuto = Param();
+            later.panAuto.addKey(0, -0.5);
+            std::vector<PanFollowKey> shifted;
+            for (int t = 10; t <= 20; ++t) shifted.push_back({FrameTime(t), 0.75, 0.5});
+            QVERIFY(applyPanFollow(s, later, shifted, 1.0));
+            QVERIFY(later.panAuto.keyAt(9) && std::fabs(later.panAuto.keyAt(9)->v + 0.5) < 1e-9);
+            QVERIFY(std::fabs(trackPanAt(later, 5) + 0.5) < 1e-9 && std::fabs(trackPanAt(later, 15) - 0.5) < 1e-9);
+            QVERIFY(std::fabs(trackPanAt(later, 30) + 0.5) < 1e-9);
+        }
         // Half the stage: half the pan.
         Track narrow = tr;
         narrow.panAuto = Param();
         QVERIFY(applyPanFollow(s, narrow, keys, 0.5));
         QVERIFY(std::fabs(trackPanAt(narrow, 37) - 0.5 * expectPan(37)) < 0.03);
-        // Surround: the x of the surround position, the picture's edges at the front left and right speakers.
+        // Surround: the surround position's direction, the picture's edges at the front left and right speakers (in
+        // perspective), at the distance the track was heard at.
         Sequence surround = s;
         surround.audioLayout = "5.1";
-        Track st = tr;
+        Track st = untouched;
         st.panAuto = Param();
         QVERIFY(applyPanFollow(surround, st, keys, 1.0));
-        QVERIFY(!st.panAuto.animated() && st.surroundXAuto.animated() && !st.surroundYAuto.animated());
+        QVERIFY(!st.panAuto.animated() && st.surroundXAuto.animated() && st.surroundYAuto.animated());
         const SurroundPan end = trackSurroundAt(st, 37);
-        QVERIFY(std::fabs(end.x - expectPan(37) * std::tan(30 * M_PI / 180)) < 0.03);
-        QVERIFY(std::fabs(std::atan2(end.x, end.y) * 180 / M_PI - std::atan(expectPan(37) * std::tan(30 * M_PI / 180)) * 180 / M_PI) < 2);
+        const double wantAngle = std::atan(expectPan(37) * std::tan(30 * M_PI / 180)) * 180 / M_PI;
+        QVERIFY2(std::fabs(std::atan2(end.x, end.y) * 180 / M_PI - wantAngle) < 2, qPrintable(QString::number(wantAngle)));
+        QVERIFY(std::fabs(std::hypot(end.x, end.y) - 1) < 0.01);
+        // Kept nearer the middle (y 0.4): the same direction, at that distance.
+        Track nearer = untouched;
+        nearer.panAuto = Param();
+        nearer.surround.y = 0.4;
+        QVERIFY(applyPanFollow(surround, nearer, keys, 1.0));
+        const SurroundPan near37 = trackSurroundAt(nearer, 37);
+        QVERIFY(std::fabs(std::atan2(near37.x, near37.y) * 180 / M_PI - wantAngle) < 2 && std::fabs(std::hypot(near37.x, near37.y) - 0.4) < 0.01);
+        QVERIFY(std::fabs(trackSurroundAt(nearer, 45).y - 0.4) < 1e-9);  // as it was after the span
+        // Going to a bus (stereo inside), a surround sequence's track is panned in stereo.
+        Sequence bused = surround;
+        Bus bus;
+        bus.id = p.newId();
+        bused.buses.push_back(bus);
+        Track routed = untouched;
+        routed.panAuto = Param();
+        routed.output = bus.id;
+        QVERIFY(panFollowStereo(bused, routed) && !panFollowStereo(surround, routed));
+        QVERIFY(applyPanFollow(bused, routed, keys, 1.0));
+        QVERIFY(routed.panAuto.animated() && !routed.surroundXAuto.animated());
         // A 360° sequence: the picture is the whole circle, so the card goes round behind the listener.
         Sequence sphere = surround;
         sphere.spherical = true;
-        Track sp = tr;
+        Track sp = untouched;
         sp.panAuto = Param();
         QVERIFY(applyPanFollow(sphere, sp, keys, 1.0));
         QVERIFY(sp.surroundYAuto.animated());
@@ -13275,6 +13321,27 @@ private slots:
         a2.linkGroup = group;
         low.linkGroup = group;
         QVERIFY(panFollowSource(p2, s2, a2, 10)->id == low.id);
+        // At a point, what is seen there: the shot on top.
+        QVERIFY(panFollowSource(p2, s2, a2, 10, 0.5, 0.5)->id == trackAt(s2, {TrackKind::Video, 1})->clips.at(0).id);
+        // A still over part of the picture: nothing moves there to follow; beside it, the video.
+        {
+            Project p3 = p;
+            Sequence& s3 = *p3.active();
+            MediaItem still = probeOrFail(p3, path("panfollow-grey.png"));
+            p3.media.push_back(still);
+            edit::addTrack(p3, s3, TrackKind::Video);
+            Clip inset = makeClip(p3, still, TrackKind::Video, s3);
+            inset.duration = frames;
+            inset.motion.params["scale"] = Param(40.0);
+            inset.motion.params["pos_x"] = Param(-100.0);  // over the left of the frame
+            QVERIFY(edit::overwrite(p3, s3, {TrackKind::Video, 1}, inset).ok);
+            const Clip& a3 = trackAt(s3, {TrackKind::Audio, 1})->clips.at(0);
+            QVERIFY(!panFollowSource(p3, s3, a3, 20, 60.0 / 320, 0.5));
+            QVERIFY(panFollowSource(p3, s3, a3, 20, 0.75, 0.5));
+            std::vector<PanFollowKey> none;
+            QVERIFY(!trackPanFollow(p3, s3, a3, 20, 60.0 / 320, 0.5, 0.25, none, {}, nullptr, &err));
+            QVERIFY2(QString::fromStdString(err).contains("moves"), err.c_str());
+        }
         // No picture with the sound: an error.
         Sequence bare = s;
         bare.videoTracks[0].clips.clear();
@@ -13301,7 +13368,15 @@ private slots:
         QVERIFY(call("montage_pan_follow", {{"project", project}, {"clip", double(a.id)}, {"at", 99}}).value("isError").toBool());
         QVERIFY(call("montage_pan_follow", {{"project", project}, {"clip", double(a.id)}, {"x", 0.5}}).value("isError").toBool());
         QVERIFY(call("montage_pan_follow", {{"project", project}, {"clip", double(a.id)}, {"width", 2}}).value("isError").toBool());
+        QVERIFY(call("montage_pan_follow", {{"project", project}, {"clip", double(a.id)}, {"x", "0.5"}, {"y", "0.5"}}).value("isError").toBool());
+        QVERIFY(call("montage_pan_follow", {{"project", project}, {"clip", double(a.id)}, {"at", 20.5}}).value("isError").toBool());
+        // By default from the shot's subject (where it lands depends on the platform's decoder, so only roughly).
         QJsonObject res = call("montage_pan_follow", {{"project", project}, {"clip", double(a.id)}, {"at", 20}, {"size", "medium"}});
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        const QJsonObject from = res.value("structuredContent").toObject().value("start").toObject();
+        QVERIFY2(std::fabs(from.value("x").toDouble() * 320 - (160 + pos(20))) < 24, QJsonDocument(from).toJson().constData());
+        // From the card's centre: the pan follows it.
+        res = call("montage_pan_follow", {{"project", project}, {"clip", double(a.id)}, {"at", 20}, {"x", (160 + pos(20)) / 320}, {"y", 0.5}});
         QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
         const QJsonObject out = res.value("structuredContent").toObject();
         QCOMPARE(out.value("lane").toString(), QStringLiteral("pan"));

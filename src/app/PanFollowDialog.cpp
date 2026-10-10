@@ -1,5 +1,6 @@
 #include "PanFollowDialog.h"
 
+#include <QCloseEvent>
 #include <QComboBox>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -143,26 +144,53 @@ PanFollowDialog::PanFollowDialog(EditorState* state, Id audioClip, QWidget* pare
         if (running_) progress_->setValue(int(std::lround(fraction_->load() * 1000)));
     });
     timer->start(100);
-    connect(state_, &EditorState::sequenceSwitched, this, &QDialog::close);
+    // Another sequence or project: whatever is being followed is no longer there to write to.
+    connect(state_, &EditorState::sequenceSwitched, this, [this] {
+        closed_ = true;
+        cancel_->store(true);
+        QDialog::close();
+    });
+    // Edits meanwhile: the picture and the frame tracking starts at are brought up to date (shortly after, once).
+    refresh_ = new QTimer(this);
+    refresh_->setSingleShot(true);
+    refresh_->setInterval(250);
+    connect(refresh_, &QTimer::timeout, this, [this] {
+        if (!running_) refreshFrame(false);
+    });
+    connect(state_, &EditorState::projectChanged, refresh_, qOverload<>(&QTimer::start));
+    refreshFrame(true);
+}
 
+PanFollowDialog::~PanFollowDialog() {
+    cancel_->store(true);
+    watcher_.waitForFinished();
+}
+
+void PanFollowDialog::closeEvent(QCloseEvent* e) {
+    // Closed while following: stopped, and nothing written afterwards.
+    closed_ = true;
+    cancel_->store(true);
+    QDialog::closeEvent(e);
+}
+
+void PanFollowDialog::refreshFrame(bool first) {
     // Tracking starts at the playhead, or the middle of the clip when the playhead is off it.
     const Sequence* s = state_->sequence();
     const Clip* c = s ? edit::clipById(*s, clip_) : nullptr;
     if (!c || c->duration <= 0) {
         info_->setText(tr("The audio clip is no longer in the sequence."));
         track_->setEnabled(false);
-        setPoint(0.5, 0.5);
+        if (first) setPoint(0.5, 0.5);
         return;
     }
-    from_ = state_->playhead();
+    if (first) from_ = state_->playhead();
     if (from_ < c->start || from_ >= c->end()) from_ = c->start + c->duration / 2;
-    if (!panFollowSource(state_->project(), *s, *c, from_)) {
-        info_->setText(tr("There is no video on screen with this sound to follow."));
-        track_->setEnabled(false);
-    } else {
-        info_->setText(layoutChannels(s->audioLayout) > 2 ? tr("Writes the track's surround position.")
-                                                          : tr("Writes the track's pan."));
-    }
+    const bool picture = panFollowSource(state_->project(), *s, *c, from_) != nullptr;
+    track_->setEnabled(picture);
+    if (keys_ == 0 || !picture)
+        info_->setText(!picture ? tr("There is no video on screen with this sound to follow.")
+                       : stereoLane() ? tr("Writes the track's pan.")
+                                      : tr("Writes the track's surround position."));
     RenderOptions o;
     o.scale = std::min(1.0, 960.0 / std::max(1, s->width));
     o.displaySpace = "rec709";
@@ -172,15 +200,18 @@ PanFollowDialog::PanFollowDialog(EditorState* state, Id audioClip, QWidget* pare
         toRgba8(view, img.bits(), size_t(img.bytesPerLine()));
         picker_->setFrame(img);
     }
+    if (!first) return;
     // Starting on the subject of the shot, the likeliest source of the sound.
     double x = 0.5, y = 0.5;
-    if (track_->isEnabled()) panFollowSubject(state_->project(), *s, *c, from_, x, y);
+    if (picture) panFollowSubject(state_->project(), *s, *c, from_, x, y);
     setPoint(x, y);
 }
 
-PanFollowDialog::~PanFollowDialog() {
-    cancel_->store(true);
-    watcher_.waitForFinished();
+bool PanFollowDialog::stereoLane() const {
+    const Sequence* s = state_->sequence();
+    const auto loc = s ? edit::locate(*s, clip_) : std::nullopt;
+    if (!loc || loc->track.kind != TrackKind::Audio) return true;
+    return panFollowStereo(*s, *trackAt(*s, loc->track));
 }
 
 void PanFollowDialog::setPoint(double x, double y) {
@@ -195,21 +226,30 @@ void PanFollowDialog::setWidth(double width) { width_->setValue(int(std::lround(
 
 bool PanFollowDialog::track(bool wait) {
     if (running_ || !track_->isEnabled()) return false;
+    if (state_->readOnly()) {
+        info_->setText(tr("The project is read-only: nothing can be written to it."));
+        return false;
+    }
     const Sequence* s = state_->sequence();
+    const auto loc = s ? edit::locate(*s, clip_) : std::nullopt;
     const Clip* c = s ? edit::clipById(*s, clip_) : nullptr;
-    if (!c) {
+    if (!c || !loc) {
         info_->setText(tr("The audio clip is no longer in the sequence."));
         return false;
     }
-    // Tracked on a copy, so editing can go on meanwhile.
+    if (from_ < c->start || from_ >= c->end()) refreshFrame(false);
+    // Tracked on a copy, so editing can go on meanwhile; where things were is noted, to check before writing.
     auto project = std::make_shared<Project>(state_->project());
-    const Id seqId = s->id;
+    seq_ = s->id;
+    clipStart_ = c->start;
+    clipTrack_ = loc->track;
     const Clip clip = *c;
+    const Id seqId = s->id;
     const FrameTime from = from_;
     const double x = x_, y = y_, size = kSizes[std::clamp(size_->currentIndex(), 0, 2)];
     cancel_ = std::make_shared<std::atomic<bool>>(false);
     fraction_->store(0);
-    pending_ = std::make_shared<std::vector<PanFollowKey>>();
+    pending_ = std::make_shared<Pending>();
     error_ = std::make_shared<std::string>();
     running_ = true;
     keys_ = 0;
@@ -224,8 +264,10 @@ bool PanFollowDialog::track(bool wait) {
     watcher_.setFuture(QtConcurrent::run([project, seqId, clip, from, x, y, size, cancel, fraction, out, error] {
         const Sequence* seq = project->findSequence(seqId);
         if (!seq) return false;
-        return trackPanFollow(*project, *seq, clip, from, x, y, size, *out, [&](double f) { fraction->store(f); },
-                              cancel.get(), error.get());
+        const bool ok = trackPanFollow(*project, *seq, clip, from, x, y, size, out->keys, [&](double f) { fraction->store(f); },
+                                       cancel.get(), error.get(), &out->source);
+        if (const Clip* src = ok ? edit::clipById(*seq, out->source) : nullptr) out->sourceStart = src->start;
+        return ok;
     }));
     if (wait) {
         watcher_.waitForFinished();
@@ -241,23 +283,51 @@ void PanFollowDialog::finish() {
     running_ = false;
     track_->setText(tr("Track and Pan"));
     progress_->setVisible(false);
+    if (closed_) return;
     if (!watcher_.future().result()) {
         info_->setText(cancel_->load() ? tr("Stopped.") : tr("Could not follow it: %1").arg(QString::fromStdString(*error_)));
         return;
     }
-    const auto keys = pending_;
-    const double width = width_->value() / 100.0;
-    const Id clip = clip_;
-    const bool ok = state_->edit(tr("Pan to Follow"), [keys, width, clip](Project&, Sequence& s) {
-        const auto loc = edit::locate(s, clip);
-        if (!loc || loc->track.kind != TrackKind::Audio) return false;
-        return applyPanFollow(s, *trackAt(s, loc->track), *keys, width);
-    });
-    if (!ok) {
+    applyPending();
+}
+
+void PanFollowDialog::applyPending() {
+    if (closed_ || !pending_ || pending_->keys.empty()) return;
+    // Not in the middle of a drag or a fader pass: written once that is over.
+    if (state_->inGesture()) {
+        QTimer::singleShot(150, this, [this] { applyPending(); });
+        return;
+    }
+    const auto pending = std::move(pending_);
+    const Sequence* s = state_->sequence();
+    if (!s || s->id != seq_) return;
+    // The frames tracked belong to where the clips were: if they moved meanwhile, the path would land elsewhere.
+    const auto loc = edit::locate(*s, clip_);
+    const Clip* c = edit::clipById(*s, clip_);
+    const Clip* src = edit::clipById(*s, pending->source);
+    if (!c || !loc) {
         info_->setText(tr("The audio clip is no longer in the sequence."));
         return;
     }
-    keys_ = int(keys->size());
+    if (c->start != clipStart_ || !(loc->track == clipTrack_) || !src || src->start != pending->sourceStart) {
+        info_->setText(tr("The clips moved while it was being followed: track again."));
+        return;
+    }
+    const auto keys = pending->keys;
+    const double width = width_->value() / 100.0;
+    const Id clip = clip_;
+    const bool ok = state_->edit(tr("Pan to Follow"), [keys, width, clip](Project&, Sequence& seq) {
+        const auto at = edit::locate(seq, clip);
+        if (!at || at->track.kind != TrackKind::Audio) return false;
+        return applyPanFollow(seq, *trackAt(seq, at->track), keys, width);
+    });
+    if (!ok) {
+        info_->setText(state_->readOnly() ? tr("The project is read-only: nothing can be written to it.")
+                                          : tr("The audio clip is no longer in the sequence."));
+        return;
+    }
+    keys_ = int(keys.size());
+    span_ = keys.back().t - keys.front().t + 1;
     info_->setText(status());
 }
 
@@ -265,7 +335,7 @@ QString PanFollowDialog::status() const {
     if (running_) return tr("Following…");
     if (keys_ == 0) return info_->text();
     const Sequence* s = state_->sequence();
-    const double seconds = s ? double(keys_) / s->fpsValue() : 0;
+    const double seconds = s ? double(span_) / s->fpsValue() : 0;
     return tr("Followed for %1 s: the track's panning now moves with it (Read automation).").arg(seconds, 0, 'f', 1);
 }
 

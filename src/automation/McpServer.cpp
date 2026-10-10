@@ -5854,13 +5854,13 @@ void McpServer::Impl::addTools() {
     add("montage_pan_follow", "Pan to follow the picture",
         "Panning that follows what makes a sound, as Resolve's IntelliTrack panning: a point of the picture is tracked "
         "through the shot both ways from timeline frame `at` (default: the middle of the clip) and written into the "
-        "audio track's automation over the span tracked: its pan in stereo sequences, its surround x position in "
-        "surround and ambisonic ones (and y in 360° sequences, where the picture is the whole circle round the "
-        "listener). `clip` is the audio clip; the picture is a video clip linked to it, else the topmost on screen. "
+        "audio track's automation over the span tracked: its pan in stereo sequences (and for tracks going to a bus), its "
+        "surround position in surround and ambisonic ones (a 360° sequence's picture is the whole circle round the "
+        "listener). `clip` is the audio clip; the picture is what is seen at the point. "
         "`x`, `y` (fractions of the frame, 0..1) are the point, by default the shot's subject; `size` how much "
         "around it is followed (small, medium, large); `width` (0.1..1, default 1) how much of the stage the picture "
         "spans (1: its edges hard left and right, or at the front left and right speakers). The track is set to read "
-        "its automation.",
+        "its automation (a track whose lanes were off gets them replaced, keeping what was heard outside the span).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},"at":{"type":"integer"},
             "x":{"type":"number"},"y":{"type":"number"},"size":{"type":"string","enum":["small","medium","large"]},
             "width":{"type":"number"}},"required":["project","clip"]})json",
@@ -5869,12 +5869,15 @@ void McpServer::Impl::addTools() {
             const Clip& c = clipArg(l, a);
             const auto loc = edit::locate(l.seq(), c.id);
             if (!loc || loc->track.kind != TrackKind::Audio) throw ArgError{"clip is an audio clip"};
-            const FrameTime at = a.contains("at") ? FrameTime(a.value("at").toInteger()) : c.start + c.duration / 2;
+            if (a.contains("at") && (!a.value("at").isDouble() || std::floor(a.value("at").toDouble()) != a.value("at").toDouble()))
+                throw ArgError{"at is a timeline frame (a whole number)"};
+            const FrameTime at = a.contains("at") ? FrameTime(a.value("at").toDouble()) : c.start + c.duration / 2;
             if (at < c.start || at >= c.end()) throw ArgError{"at is a frame inside the clip"};
             if (a.contains("x") != a.contains("y")) throw ArgError{"Give both x and y, or neither"};
             double x = 0.5, y = 0.5;
             std::string err;
             if (a.contains("x")) {
+                if (!a.value("x").isDouble() || !a.value("y").isDouble()) throw ArgError{"x and y are numbers (fractions of the frame)"};
                 x = a.value("x").toDouble();
                 y = a.value("y").toDouble();
                 if (x < 0 || x > 1 || y < 0 || y > 1) throw ArgError{"x and y are fractions of the frame (0 to 1)"};
@@ -5884,13 +5887,14 @@ void McpServer::Impl::addTools() {
             const QString sizeName = a.contains("size") ? str(a, "size") : QStringLiteral("medium");
             const double size = sizeName == "small" ? 0.1 : sizeName == "large" ? 0.35 : sizeName == "medium" ? 0.2 : -1;
             if (size < 0) throw ArgError{"size is small, medium or large"};
+            if (a.contains("width") && !a.value("width").isDouble()) throw ArgError{"width is a number, 0.1 to 1"};
             const double width = a.contains("width") ? a.value("width").toDouble() : 1.0;
             if (width < 0.1 || width > 1) throw ArgError{"width is 0.1 to 1"};
             std::vector<PanFollowKey> keys;
             if (!trackPanFollow(l.project, l.seq(), c, at, x, y, size, keys, {}, nullptr, &err)) throw ArgError{QString::fromStdString(err)};
             Track& track = *trackAt(l.seq(), loc->track);
+            const bool stereo = panFollowStereo(l.seq(), track);
             applyPanFollow(l.seq(), track, keys, width);
-            const bool stereo = layoutChannels(l.seq().audioLayout) <= 2;
             QJsonArray path;
             const size_t every = std::max<size_t>(1, keys.size() / 8);
             for (size_t i = 0; i < keys.size(); i += every) {
