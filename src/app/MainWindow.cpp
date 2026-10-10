@@ -108,6 +108,8 @@
 #include "RenderQueue.h"
 #include "RenderQueuePanel.h"
 #include "MixerPanel.h"
+#include "ControlSurface.h"
+#include "control/Midi.h"
 #include "MulticamPanel.h"
 #include "AdrPanel.h"
 #include "AudioDescriptionDialog.h"
@@ -378,6 +380,26 @@ void MainWindow::buildPanels() {
         inspectorDock_->show();
         inspectorDock_->raise();
     });
+    // A hardware control surface (Mackie Control) works the mixer and transport.
+    surface_ = new ControlSurface(state_, mixer_, program_, this);
+    connect(program_, &PlaybackController::audioLevels, surface_, &ControlSurface::setLevels);
+    surface_->setCommand(QStringLiteral("marker"), [this] { addMarker(); });
+    surface_->setCommand(QStringLiteral("save"), [this] { save(); });
+    surface_->setCommand(QStringLiteral("record"), [this] {
+        if (QAction* a = findChild<QAction*>(QStringLiteral("recordVoiceover"))) a->trigger();
+    });
+    surface_->setCommand(QStringLiteral("previousEdit"), [this] {
+        if (const Sequence* s = state_->sequence()) program_->seek(edit::prevEdit(*s, state_->playhead()));
+    });
+    surface_->setCommand(QStringLiteral("nextEdit"), [this] {
+        if (const Sequence* s = state_->sequence()) program_->seek(edit::nextEdit(*s, state_->playhead()));
+    });
+    if (appSettings().value(QStringLiteral("controlSurface/connect"), false).toBool()) {
+        // Reconnected at start-up, quietly: the surface may simply be unplugged today.
+        const std::string in = appSettings().value(QStringLiteral("controlSurface/input")).toString().toStdString();
+        const std::string out = appSettings().value(QStringLiteral("controlSurface/output")).toString().toStdString();
+        if (!in.empty() || !out.empty()) surface_->connectPorts(in, out);
+    }
     captions_ = new CaptionsPanel(state_, this);
     transcript_ = new TranscriptPanel(state_, this);
     connect(transcript_, &TranscriptPanel::sourceSeekRequested, this, [this](FrameTime f) {
@@ -871,6 +893,8 @@ void MainWindow::buildMenus() {
             emit state_->projectChanged();
         });
     }
+    editM->addSeparator();
+    add(editM, tr("Control &Surface…"), QKeySequence(), [this] { controlSurfaceDialog(); })->setObjectName(QStringLiteral("controlSurface"));
 
     // ---- Clip
     QMenu* clipM = menuBar()->addMenu(tr("&Clip"));
@@ -5016,6 +5040,78 @@ void MainWindow::exportDcpDialog() {
     appSettings().setValue(QStringLiteral("dcp/studio"), studio->text().trimmed());
     appSettings().setValue(QStringLiteral("dcp/facility"), facility->text().trimmed());
     exportDcpTo(folder->text(), st);
+}
+
+QDialog* MainWindow::controlSurfaceDialog() {
+    // One dialog: the surface's MIDI ports, connected now and (optionally) at every start.
+    if (auto* open = findChild<QDialog*>(QStringLiteral("controlSurfaceDialog"))) {
+        open->raise();
+        open->activateWindow();
+        return open;
+    }
+    auto* dlg = new QDialog(this);
+    dlg->setObjectName(QStringLiteral("controlSurfaceDialog"));
+    dlg->setWindowTitle(tr("Control Surface"));
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    auto* form = new QFormLayout(dlg);
+    auto* intro = new QLabel(tr("A surface in Mackie Control mode (Mackie MCU, Behringer X-Touch, iCON, PreSonus FaderPort, SSL UF8...): "
+                                "faders, pans, mutes and solos for eight audio tracks at a time, the master fader, the transport and "
+                                "the jog wheel, with names, levels and timecode on its displays."),
+                             dlg);
+    intro->setWordWrap(true);
+    form->addRow(intro);
+    auto* input = new QComboBox(dlg);
+    input->setObjectName(QStringLiteral("surfaceInput"));
+    auto* output = new QComboBox(dlg);
+    output->setObjectName(QStringLiteral("surfaceOutput"));
+    const QString savedIn = appSettings().value(QStringLiteral("controlSurface/input")).toString();
+    const QString savedOut = appSettings().value(QStringLiteral("controlSurface/output")).toString();
+    auto fill = [&](QComboBox* box, const std::vector<MidiPortInfo>& ports, const QString& saved) {
+        box->addItem(tr("None"), QString());
+        for (const MidiPortInfo& p : ports) box->addItem(QString::fromStdString(p.name), QString::fromStdString(p.id));
+        const int at = box->findData(saved);
+        box->setCurrentIndex(at >= 0 ? at : std::min(1, box->count() - 1));
+    };
+    fill(input, midiInputs(), savedIn);
+    fill(output, midiOutputs(), savedOut);
+    form->addRow(tr("MIDI input:"), input);
+    form->addRow(tr("MIDI output:"), output);
+    auto* atStart = new QCheckBox(tr("Connect when Montage starts"), dlg);
+    atStart->setObjectName(QStringLiteral("surfaceAtStart"));
+    atStart->setChecked(appSettings().value(QStringLiteral("controlSurface/connect"), false).toBool());
+    form->addRow(QString(), atStart);
+    auto* status = new QLabel(dlg);
+    status->setObjectName(QStringLiteral("surfaceStatus"));
+    status->setWordWrap(true);
+    form->addRow(status);
+    auto showStatus = [this, status] {
+        status->setText(surface_->isConnected() ? tr("Connected to %1.").arg(surface_->surfaceName()) : tr("Not connected."));
+    };
+    showStatus();
+    connect(surface_, &ControlSurface::connectionChanged, status, showStatus);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, dlg);
+    QPushButton* connectButton = buttons->addButton(tr("Connect"), QDialogButtonBox::ActionRole);
+    connectButton->setObjectName(QStringLiteral("surfaceConnect"));
+    QPushButton* disconnectButton = buttons->addButton(tr("Disconnect"), QDialogButtonBox::ActionRole);
+    disconnectButton->setObjectName(QStringLiteral("surfaceDisconnect"));
+    connect(connectButton, &QPushButton::clicked, dlg, [this, input, output, atStart, status] {
+        const QString in = input->currentData().toString(), out = output->currentData().toString();
+        appSettings().setValue(QStringLiteral("controlSurface/input"), in);
+        appSettings().setValue(QStringLiteral("controlSurface/output"), out);
+        appSettings().setValue(QStringLiteral("controlSurface/connect"), atStart->isChecked());
+        if (in.isEmpty() && out.isEmpty()) {
+            status->setText(tr("Choose the surface's MIDI input and output."));
+            return;
+        }
+        std::string err;
+        if (!surface_->connectPorts(in.toStdString(), out.toStdString(), &err)) status->setText(QString::fromStdString(err));
+    });
+    connect(disconnectButton, &QPushButton::clicked, surface_, &ControlSurface::disconnectSurface);
+    connect(atStart, &QCheckBox::toggled, this, [](bool on) { appSettings().setValue(QStringLiteral("controlSurface/connect"), on); });
+    connect(buttons, &QDialogButtonBox::rejected, dlg, &QDialog::close);
+    form->addRow(buttons);
+    dlg->show();
+    return dlg;
 }
 
 bool MainWindow::analyseHdrLightLevels(bool ask) {

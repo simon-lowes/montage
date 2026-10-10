@@ -52,6 +52,7 @@ class EffectsBrowser;
 class InspectorWidget;
 class ScopesWidget;
 class MixerPanel;
+class ControlSurface;
 class CaptionsPanel;
 class TranscriptPanel;
 class ShotSearchPanel;
@@ -161,6 +162,9 @@ public:
     // and saved with it (render/LightLevel.h), one undo step, for exports that state them up front; `ask` shows the
     // result with a way to the brightest frame. False (with a message) for SDR sequences or when cancelled.
     bool analyseHdrLightLevels(bool ask = true);
+    // Edit > Control Surface: the Mackie Control surface's MIDI ports (one dialog, shown and returned).
+    QDialog* controlSurfaceDialog();
+    ControlSurface* controlSurface() const { return surface_; }
     // Clip › Colour Group (core/ColorGroups.h), each one undo step: a new group of the selected video clips (its id, 0
     // with a message when none are selected), the selection joining a group, or leaving its group.
     Id newColorGroup(const QString& name = {});
@@ -434,6 +438,7 @@ private:
     ScopesWidget* scopes_ = nullptr;
     CleanFeedWindow* cleanFeed_ = nullptr;
     MixerPanel* mixer_ = nullptr;
+    ControlSurface* surface_ = nullptr;
     MulticamPanel* multicam_ = nullptr;
     AdrPanel* adr_ = nullptr;
     ProductionPanel* production_ = nullptr;

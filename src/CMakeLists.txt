@@ -117,6 +117,8 @@ add_library(montage_engine STATIC
   render/Letterbox.h render/Letterbox.cpp
   render/LightLevel.h render/LightLevel.cpp
   render/Hdr10Plus.h render/Hdr10Plus.cpp
+  control/Midi.h control/Midi.cpp
+  control/MackieControl.h control/MackieControl.cpp
   render/Versions.h render/Versions.cpp
   render/ReviewExport.h render/ReviewExport.cpp
   render/DcpMxf.h render/DcpMxf.cpp
@@ -180,7 +182,10 @@ target_compile_definitions(montage_engine PUBLIC MONTAGE_VERSION="${PROJECT_VERS
 target_link_libraries(montage_engine PUBLIC Qt6::Core Qt6::Gui Qt6::Xml PkgConfig::FFMPEG Threads::Threads ${CMAKE_DL_LIBS})
 if(APPLE)
   target_sources(montage_engine PRIVATE audio/AuHost.cpp)
-  target_link_libraries(montage_engine PUBLIC "-framework AudioToolbox" "-framework CoreFoundation")
+  target_link_libraries(montage_engine PUBLIC "-framework AudioToolbox" "-framework CoreFoundation" "-framework CoreMIDI")
+endif()
+if(WIN32)
+  target_link_libraries(montage_engine PUBLIC winmm)  # MIDI (control/Midi.cpp)
 endif()
 target_compile_options(montage_engine PRIVATE
   $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wno-unused-parameter>)

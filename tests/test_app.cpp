@@ -110,6 +110,8 @@
 #include "media/Translator.h"
 #include "ModelPacks.h"
 #include "MixerPanel.h"
+#include "ControlSurface.h"
+#include "control/MackieControl.h"
 #include "MulticamPanel.h"
 #include "PluginEditorWindow.h"
 #include "audio/PluginEffect.h"
@@ -584,6 +586,170 @@ private slots:
         QVERIFY(ranged.runCheck());
         QCOMPARE(ranged.issues().size(), size_t(1));
         QVERIFY(ranged.issues()[0].start == 60 && ranged.issues()[0].end == 120);
+    }
+
+    void controlSurfaceMackie() {
+        // A stand-in for the surface's MIDI connection: what Montage sends it is kept.
+        struct Recorder : MidiConnection {
+            std::shared_ptr<std::vector<MidiMessage>> sent = std::make_shared<std::vector<MidiMessage>>();
+            bool send(const MidiMessage& m) override {
+                sent->push_back(m);
+                return true;
+            }
+            std::string inputName() const override { return "X-Touch"; }
+            std::string outputName() const override { return "X-Touch"; }
+        };
+        state()->newProject();
+        QVERIFY(state()->edit("Tracks", [](Project& p, Sequence& s) {
+            while (s.audioTracks.size() < 10) edit::addTrack(p, s, TrackKind::Audio);
+            for (size_t i = 0; i < s.audioTracks.size(); ++i) s.audioTracks[i].name = "Trk " + std::to_string(i + 1);
+            s.audioTracks[0].name = "Dialogue A";
+            return true;
+        }));
+        auto* mixer = win_->findChild<MixerPanel*>();
+        QTRY_COMPARE(mixer->trackStrips(), 10);
+        ControlSurface* surface = win_->controlSurface();
+        QVERIFY(surface && !surface->isConnected());
+        QVERIFY(win_->findChild<QAction*>("controlSurface"));
+        auto rec = std::make_unique<Recorder>();
+        auto sent = rec->sent;
+        QSignalSpy connected(surface, &ControlSurface::connectionChanged);
+        surface->setConnection(std::move(rec));
+        QVERIFY(surface->isConnected() && connected.size() == 1);
+        QCOMPARE(surface->surfaceName(), QString("X-Touch"));
+        auto has = [&](const MidiMessage& m) { return std::find(sent->begin(), sent->end(), m) != sent->end(); };
+        // On connecting: asked if it is there, then shown everything: names, levels, faders, the timecode.
+        QCOMPARE(sent->front(), mcu::deviceQuery());
+        QVERIFY(has(mcu::lcd(0, "Dialog ")));
+        QVERIFY(has(mcu::lcd(7, "Trk 2  ")));
+        QVERIFY(has(mcu::lcd(mcu::kLcdWidth, " 0.0   ")));
+        QVERIFY(has(mcu::fader(0, mcu::faderValue(0))));
+        QVERIFY(has(mcu::led(mcu::Stop, 2)) && has(mcu::meterMode(0, 3)));
+        QVERIFY(has(mcu::timecode("00:00:00:00")[0]));
+        QVERIFY(has(mcu::assignment("1")[1]));
+        auto track = [&](int i) -> const Track& { return state()->sequence()->audioTracks.at(size_t(i)); };
+
+        // A touched fader moving: the track's volume, the position echoed back so the servo holds it, one undo step.
+        sent->clear();
+        surface->handle({0x90, 0x68, 0x7F});
+        QVERIFY(mixer->trackFader(0)->isSliderDown());
+        const int minus6 = mcu::faderValue(-6);
+        surface->handle(mcu::fader(0, mcu::faderValue(-3)));
+        surface->handle(mcu::fader(0, minus6));
+        QCOMPARE(track(0).volumeDb, -6.0);
+        QVERIFY(has(mcu::fader(0, minus6)));
+        surface->handle({0x90, 0x68, 0x00});
+        QVERIFY(!mixer->trackFader(0)->isSliderDown());
+        state()->undo();
+        QCOMPARE(track(0).volumeDb, 0.0);
+        // The motor follows the mixer: the fader goes back up.
+        sent->clear();
+        surface->refresh();
+        QVERIFY(has(mcu::fader(0, mcu::faderValue(0))));
+        // A surface without touch sensing: a move holds the fader until it rests.
+        surface->handle(mcu::fader(1, minus6));
+        QCOMPARE(track(1).volumeDb, -6.0);
+        QVERIFY(mixer->trackFader(1)->isSliderDown());
+        QTRY_VERIFY_WITH_TIMEOUT(!mixer->trackFader(1)->isSliderDown(), 3000);
+        // The master fader.
+        surface->handle(mcu::fader(mcu::kMasterChannel, mcu::faderValue(-10)));
+        QCOMPARE(state()->sequence()->masterVolumeDb, -10.0);
+
+        // Mute and solo light up; the V-Pot pans (shown on the strip for a moment) and its push centres it.
+        sent->clear();
+        surface->handle({0x90, uint8_t(mcu::Mute + 2), 0x7F});
+        surface->handle({0x90, uint8_t(mcu::Mute + 2), 0x00});
+        QVERIFY(track(2).muted);
+        QVERIFY(has(mcu::led(mcu::Mute + 2, 2)));
+        surface->handle({0x90, uint8_t(mcu::Solo + 3), 0x7F});
+        QVERIFY(track(3).solo && has(mcu::led(mcu::Solo + 3, 2)));
+        surface->handle({0xB0, 0x10, 0x05});
+        QCOMPARE(track(0).pan, 0.1);
+        QVERIFY(has(mcu::ring(0, mcu::panRing(0.1))));
+        QVERIFY(has(mcu::lcd(mcu::kLcdWidth, " R10   ")));
+        surface->handle({0xB0, 0x10, 0x43});
+        QVERIFY(std::fabs(track(0).pan - 0.04) < 1e-9);
+        surface->handle({0x90, uint8_t(mcu::VPotPush), 0x7F});
+        QCOMPARE(track(0).pan, 0.0);
+
+        // Banking: the strips move to the last eight tracks, the faders and names with them.
+        sent->clear();
+        surface->handle({0x90, uint8_t(mcu::BankRight), 0x7F});
+        QCOMPARE(surface->bank(), 2);
+        QVERIFY(has(mcu::lcd(0, "Trk 3  ")) && has(mcu::assignment("3")[1]));
+        surface->handle(mcu::fader(0, minus6));
+        QCOMPARE(track(2).volumeDb, -6.0);
+        QTRY_VERIFY_WITH_TIMEOUT(!mixer->trackFader(2)->isSliderDown(), 3000);
+        surface->handle({0x90, uint8_t(mcu::ChannelLeft), 0x7F});
+        QCOMPARE(surface->bank(), 1);
+        surface->handle({0x90, uint8_t(mcu::BankLeft), 0x7F});
+        QCOMPARE(surface->bank(), 0);
+        // A level changed in Montage moves the motor.
+        QVERIFY(state()->edit("Level", [](Project&, Sequence& s) {
+            s.audioTracks[4].volumeDb = -12;
+            return true;
+        }));
+        sent->clear();
+        surface->refresh();
+        QVERIFY(has(mcu::fader(4, mcu::faderValue(-12))));
+
+        // Automation: select a strip, Touch on it, and a pass written while the fader is held.
+        surface->handle({0x90, uint8_t(mcu::Select + 5), 0x7F});
+        QCOMPARE(surface->selectedTrack(), 5);
+        surface->handle({0x90, uint8_t(mcu::Touch), 0x7F});
+        QCOMPARE(track(5).automation, int(AutomationMode::Touch));
+        QVERIFY(has(mcu::led(mcu::Touch, 2)));
+        mixer->playbackStarted(0);
+        for (FrameTime f = 0; f <= 40; ++f) {
+            if (f == 10) surface->handle({0x90, 0x6D, 0x7F});
+            if (f == 10) surface->handle(mcu::fader(5, mcu::faderValue(-20)));
+            if (f == 30) surface->handle({0x90, 0x6D, 0x00});
+            mixer->playbackPosition(f);
+        }
+        mixer->playbackStopped(40);
+        QVERIFY(track(5).volumeAuto.animated());
+        QCOMPARE(track(5).volumeAuto.at(20), -20.0);
+        QCOMPARE(track(5).volumeAuto.at(5), 0.0);
+
+        // Transport, jog and markers.
+        auto* program = win_->findChild<PlaybackController*>("programPlayback");
+        state()->setPlayhead(10);
+        surface->handle({0xB0, 0x3C, 0x03});
+        QTRY_COMPARE(state()->playhead(), FrameTime(13));
+        surface->handle({0xB0, 0x3C, 0x41});
+        QTRY_COMPARE(state()->playhead(), FrameTime(12));
+        const size_t markers = state()->sequence()->markers.size();
+        surface->handle({0x90, uint8_t(mcu::Marker), 0x7F});
+        QCOMPARE(state()->sequence()->markers.size(), markers + 1);
+        surface->handle({0x90, uint8_t(mcu::Undo), 0x7F});
+        QCOMPARE(state()->sequence()->markers.size(), markers);
+        sent->clear();
+        surface->handle({0x90, uint8_t(mcu::Play), 0x7F});
+        QVERIFY(program->isPlaying());
+        QVERIFY(has(mcu::led(mcu::Play, 2)) && has(mcu::led(mcu::Stop, 0)));
+        surface->handle({0x90, uint8_t(mcu::Stop), 0x7F});
+        QVERIFY(!program->isPlaying());
+        // Meters follow playback levels.
+        sent->clear();
+        surface->setLevels(0, 0, QVector<float>{0.5f, 0.25f, 1.0f, 1.0f});
+        QVERIFY(has(mcu::meter(0, 8)) && has(mcu::meter(1, 12)));
+
+        // A surface switched on later says so: everything is sent again.
+        sent->clear();
+        surface->handle({0xF0, 0x00, 0x00, 0x66, 0x14, 0x01, 1, 2, 3, 4, 5, 6, 7, 0, 0, 0, 0, 0xF7});
+        QVERIFY(has(mcu::lcd(0, "Dialog ")));
+        // Disconnecting leaves it clean.
+        sent->clear();
+        surface->disconnectSurface();
+        QVERIFY(!surface->isConnected() && connected.size() == 2);
+        QVERIFY(has(mcu::fader(0, 0)) && has(mcu::led(mcu::Mute + 2, 0)) && has(mcu::lcd(0, std::string(2 * mcu::kLcdWidth, ' '))));
+
+        // The settings dialog lists the ports and opens once.
+        QDialog* dlg = win_->controlSurfaceDialog();
+        QVERIFY(dlg && dlg->findChild<QComboBox*>("surfaceInput") && dlg->findChild<QComboBox*>("surfaceOutput"));
+        QVERIFY(dlg->findChild<QLabel*>("surfaceStatus")->text().contains("Not connected"));
+        QCOMPARE(win_->controlSurfaceDialog(), dlg);
+        dlg->close();
     }
 
     void mixerAutomation() {

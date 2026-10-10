@@ -55,6 +55,8 @@
 #include "core/TranscriptEdit.h"
 #include "core/Zip.h"
 #include "core/G2p.h"
+#include "control/MackieControl.h"
+#include "control/Midi.h"
 
 using namespace montage;
 using namespace montage::edit;
@@ -481,6 +483,85 @@ private slots:
         QCOMPARE(words[1].text, std::string("T00ts s0"));
         QCOMPARE(replaceInCaptions(words, {}, "a.b", "x"), 0);  // literal, not a pattern
         QCOMPARE(replaceInCaptions(words, {}, "$", "\\1"), 0);
+    }
+
+    void midiAndMackieControl() {
+        // ---- Splitting a MIDI stream into messages.
+        std::vector<MidiMessage> got;
+        auto feed = [&](std::vector<uint8_t> bytes) {
+            got.clear();
+            MidiParser parser;
+            parser.feed(bytes.data(), bytes.size(), [&](const MidiMessage& m) { got.push_back(m); });
+        };
+        feed({0x90, 0x10, 0x7F, 0x10, 0x00});  // running status
+        QCOMPARE(got, (std::vector<MidiMessage>{{0x90, 0x10, 0x7F}, {0x90, 0x10, 0x00}}));
+        feed({0x90, 0x10, 0xF8, 0x7F});  // a clock tick inside a message
+        QCOMPARE(got, (std::vector<MidiMessage>{{0xF8}, {0x90, 0x10, 0x7F}}));
+        feed({0xD0, 0x25, 0x2C, 0xE8, 0x00, 0x40});  // one data byte (and running status), then pitch bend
+        QCOMPARE(got, (std::vector<MidiMessage>{{0xD0, 0x25}, {0xD0, 0x2C}, {0xE8, 0x00, 0x40}}));
+        feed({0xF0, 0x00, 0x00, 0x66, 0x14, 0x01, 0x05, 0xF7, 0x12, 0x90, 0x5E, 0x7F});  // exclusive, a stray byte, a note
+        QCOMPARE(got, (std::vector<MidiMessage>{{0xF0, 0x00, 0x00, 0x66, 0x14, 0x01, 0x05, 0xF7}, {0x90, 0x5E, 0x7F}}));
+        feed({0xF0, 0x00, 0x66, 0xB0, 0x3C, 0x01, 0xF6});  // an exclusive cut short by a status; tune request
+        QCOMPARE(got, (std::vector<MidiMessage>{{0xB0, 0x3C, 0x01}, {0xF6}}));
+        QCOMPARE(midiDataBytes(0xC3), 1);
+        QCOMPARE(midiDataBytes(0xF2), 2);
+
+        // ---- Mackie Control: what the surface says.
+        using mcu::Event;
+        auto ev = [](MidiMessage m) { return mcu::decode(m); };
+        Event e = ev({0xE3, 0x00, 0x40});
+        QVERIFY(e.kind == Event::Fader && e.index == 3 && e.value == 0x2000);
+        e = ev({0x90, 0x68, 0x7F});
+        QVERIFY(e.kind == Event::Touch && e.index == 0 && e.down);
+        e = ev({0x90, 0x70, 0x00});
+        QVERIFY(e.kind == Event::Touch && e.index == mcu::kMasterChannel && !e.down);
+        e = ev({0xB0, 0x12, 0x41});
+        QVERIFY(e.kind == Event::VPot && e.index == 2 && e.value == -1);
+        QCOMPARE(ev({0xB0, 0x12, 0x03}).value, 3);
+        QCOMPARE(ev({0xB0, 0x12, 0x40}).value, -1);  // a zero count is still a step
+        e = ev({0xB0, 0x3C, 0x05});
+        QVERIFY(e.kind == Event::Jog && e.value == 5);
+        e = ev({0x90, 0x5E, 0x7F});
+        QVERIFY(e.kind == Event::Button && e.index == mcu::Play && e.down);
+        e = ev({0x80, 0x5E, 0x40});
+        QVERIFY(e.kind == Event::Button && !e.down);
+        QVERIFY(ev({0xF8}).kind == Event::None);
+        int device = 0, command = 0;
+        QVERIFY(mcu::surfaceSysex({0xF0, 0x00, 0x00, 0x66, 0x14, 0x01, 1, 2, 3, 0xF7}, device, command) && device == 0x14 && command == 1);
+        QVERIFY(!mcu::surfaceSysex({0xF0, 0x00, 0x20, 0x32, 0x14, 0x01, 0xF7}, device, command));
+
+        // ---- What it is told.
+        QCOMPARE(mcu::fader(8, 16383), (MidiMessage{0xE8, 0x7F, 0x7F}));
+        QCOMPARE(mcu::led(mcu::Mute + 1, 2), (MidiMessage{0x90, 0x11, 0x7F}));
+        QCOMPARE(mcu::led(mcu::Record, 1), (MidiMessage{0x90, 0x5F, 0x01}));
+        QCOMPARE(mcu::panRing(-1), 1);
+        QCOMPARE(mcu::panRing(0), 6);
+        QCOMPARE(mcu::panRing(1), 11);
+        QCOMPARE(mcu::ring(3, 6), (MidiMessage{0xB0, 0x33, 0x06}));
+        QCOMPARE(mcu::meter(2, 12), (MidiMessage{0xD0, 0x2C}));
+        QCOMPARE(mcu::meterLevel(0), 0);
+        QCOMPARE(mcu::meterLevel(1.0), 12);
+        QCOMPARE(mcu::meterLevel(0.51), 9);  // -5.8 dB
+        QCOMPARE(mcu::meterLevel(0.5), 8);   // -6.02 dB, just under
+        QCOMPARE(mcu::meterLevel(2.0), 13);
+        QCOMPARE(mcu::meterMode(1, 3), (MidiMessage{0xF0, 0x00, 0x00, 0x66, 0x14, 0x20, 0x01, 0x03, 0xF7}));
+        const MidiMessage text = mcu::lcd(7, "Vo\xc3\xa7");
+        QCOMPARE(text, (MidiMessage{0xF0, 0x00, 0x00, 0x66, 0x14, 0x12, 0x07, 'V', 'o', '?', '?', 0xF7}));
+        QCOMPARE(mcu::stripText("Dialogue A"), std::string("Dialog "));
+        QCOMPARE(mcu::stripText("Ça va"), std::string("?a va  "));
+        // The timecode display: 3-2-2-3 digits, dots after the hours, minutes and seconds, 0x40 the rightmost.
+        const std::vector<MidiMessage> tc = mcu::timecode("01:02:03:04");
+        QCOMPARE(tc.size(), size_t(10));
+        const uint8_t want[10] = {0x34, 0x30, 0x20, 0x73, 0x30, 0x72, 0x30, 0x71, 0x30, 0x20};
+        for (int i = 0; i < 10; ++i) QCOMPARE(tc[size_t(i)], (MidiMessage{0xB0, uint8_t(0x40 + i), want[i]}));
+        QCOMPARE(mcu::assignment("3"), (std::vector<MidiMessage>{{0xB0, 0x4B, 0x20}, {0xB0, 0x4A, 0x33}}));
+        // The fader law, both ways; the top of a fader's ten-bit travel reads as the top.
+        QCOMPARE(mcu::faderValue(-100), 0);
+        QCOMPARE(mcu::faderValue(12), 16383);
+        QCOMPARE(mcu::faderValue(0), int(std::lround(0.75 * 16383)));
+        for (double db : {-60.0, -30.0, -12.0, -6.0, 0.0, 6.0, 11.0}) QVERIFY(std::fabs(mcu::faderDb(mcu::faderValue(db)) - db) < 0.01);
+        QCOMPARE(mcu::faderDb(0x3F70), 12.0);
+        QVERIFY(mcu::faderDb(mcu::faderValue(-6) + 100) > -6);
     }
 
     void captionPlacement() {

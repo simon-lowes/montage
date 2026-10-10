@@ -47,6 +47,10 @@ public:
     QComboBox* trackAutomationMode(int index) const {
         return index >= 0 && index < int(strips_.size()) ? strips_[size_t(index)].automation : nullptr;
     }
+    QToolButton* trackMute(int index) const { return index >= 0 && index < int(strips_.size()) ? strips_[size_t(index)].mute : nullptr; }
+    QToolButton* trackSolo(int index) const { return index >= 0 && index < int(strips_.size()) ? strips_[size_t(index)].solo : nullptr; }
+    QSlider* masterFader() const { return masterFader_; }
+    int trackStrips() const { return int(strips_.size()); }
 
 signals:
     // The user asked to see a track's, bus's or the master's effects (now in the Inspector).
