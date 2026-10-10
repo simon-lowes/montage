@@ -10,6 +10,7 @@
 
 #include "Cdl.h"
 #include "History.h"
+#include "Interpretation.h"
 
 namespace montage {
 
@@ -17,8 +18,32 @@ namespace {
 
 std::string lower(const std::string& s) { return QString::fromStdString(s).trimmed().toLower().toStdString(); }
 
-std::string baseName(const std::string& path) { return QFileInfo(QString::fromStdString(path)).fileName().toStdString(); }
-std::string stem(const std::string& name) { return QFileInfo(QString::fromStdString(name)).completeBaseName().toStdString(); }
+// A file's name from its path, whichever separator the path was written with (and without Interpret Footage's suffix).
+std::string baseName(const std::string& path) {
+    QString p = QString::fromStdString(uninterpretedPath(path));
+    p.replace('\\', '/');
+    return p.mid(p.lastIndexOf('/') + 1).toStdString();
+}
+
+// An ALE timecode in frames: drop-frame only when written with ';' at a drop-frame rate; false if it is not one.
+bool aleTimecode(const std::string& text, Rational fps, FrameTime& out) {
+    const QStringList parts = QString::fromStdString(text).trimmed().split(QRegularExpression("[:;.]"));
+    if (parts.size() != 4) return false;
+    long long v[4];
+    for (int i = 0; i < 4; ++i) {
+        bool ok = false;
+        v[i] = parts[i].toLongLong(&ok);
+        if (!ok || parts[i].size() > 3 || v[i] < 0) return false;
+    }
+    const int nominal = std::max(1, int(std::lround(fps.toDouble())));
+    out = ((v[0] * 60 + v[1]) * 60 + v[2]) * nominal + v[3];
+    if (text.find(';') != std::string::npos && isDropFrameRate(fps)) {
+        const int drop = nominal == 60 ? 4 : 2;
+        const long long minutes = v[0] * 60 + v[1];
+        out -= drop * (minutes - minutes / 10);
+    }
+    return true;
+}
 
 // ALE columns and the log fields they fill (the first column present wins for a field).
 struct ColumnField {
@@ -134,16 +159,18 @@ AleImport applyAle(Project& p, const AleTable& t, bool cdlToClips) {
         if (!file.empty()) pick([&](const MediaItem& m) { return !m.path.empty() && lower(baseName(m.path)) == lower(baseName(file)); });
         if (!name.empty()) {
             pick([&](const MediaItem& m) { return lower(m.name) == lower(name); });
+            // Without a media file extension ("A001C003" for "A001C003.mov"; "Sc12.1" stays itself).
+            const std::string plain = lower(withoutMediaExtension(name));
             pick([&](const MediaItem& m) {
-                return lower(stem(m.name)) == lower(stem(name)) || (!m.path.empty() && lower(stem(baseName(m.path))) == lower(stem(name)));
+                return lower(withoutMediaExtension(m.name)) == plain || (!m.path.empty() && lower(withoutMediaExtension(baseName(m.path))) == plain);
             });
         }
         FrameTime start = 0;
-        if (!tape.empty() && parseTimecode(t.value(r, "Start"), fps, start))
+        if (!tape.empty() && aleTimecode(t.value(r, "Start"), fps, start))
             pick([&](const MediaItem& m) {
                 const auto mt = m.metadata.find("tape");
                 return mt != m.metadata.end() && lower(mt->second) == lower(tape) && m.timecode >= 0 &&
-                       std::fabs(m.timecode * fps.toDouble() - double(start)) < 0.5;
+                       std::fabs(m.timecode - double(start) / fps.toDouble()) < 0.5 / fps.toDouble();
             });
         if (!found) {
             res.unmatched.push_back(!name.empty() ? name : !file.empty() ? file : "row " + std::to_string(r + 1));
@@ -173,13 +200,22 @@ AleImport applyAle(Project& p, const AleTable& t, bool cdlToClips) {
             graded.push_back(found->id);
         }
         if (std::find(res.matched.begin(), res.matched.end(), found->id) == res.matched.end()) res.matched.push_back(found->id);
+        // Its subclips carry its log too (made from it, they copied it then).
+        for (MediaItem& sub : p.media)
+            if (sub.subclipOf == found->id) {
+                for (const ColumnField& cf : kColumns)
+                    if (const auto v = found->metadata.find(cf.field); v != found->metadata.end()) sub.metadata[cf.field] = v->second;
+                if (hasCdl) setMediaCdl(sub, cdl);
+            }
     }
     if (cdlToClips && !graded.empty())
         for (Sequence& s : p.sequences)
             for (Track& tr : s.videoTracks)
                 for (Clip& c : tr.clips) {
-                    if (c.isGenerator() || std::find(graded.begin(), graded.end(), c.mediaId) == graded.end()) continue;
+                    if (c.isGenerator()) continue;
                     const MediaItem* m = p.findMedia(c.mediaId);
+                    const Id source = m && m->subclipOf ? m->subclipOf : c.mediaId;  // (a subclip's clips are its parent's picture)
+                    if (std::find(graded.begin(), graded.end(), source) == graded.end()) continue;
                     Cdl cdl;
                     if (!m || !mediaCdl(*m, cdl)) continue;
                     setClipCdl(p, c, cdl);
@@ -194,12 +230,20 @@ AleTable aleFromMedia(const Project& p, const std::vector<Id>& ids, Rational fps
     int height = 0;
     for (Id id : ids)
         if (const MediaItem* m = p.findMedia(id); m && m->hasVideo) height = std::max(height, m->height);
+    // The heading's rate: the media's own (the most common among them), else the one given.
+    std::map<std::pair<int, int>, int> rates;
+    for (Id id : ids)
+        if (const MediaItem* m = p.findMedia(id); m && m->fps.valid() && m->kind != MediaKind::Sequence && m->kind != MediaKind::Image)
+            ++rates[{m->fps.num, m->fps.den}];
+    if (!rates.empty()) {
+        const auto most = std::max_element(rates.begin(), rates.end(), [](const auto& a, const auto& b) { return a.second < b.second; });
+        fps = {most->first.first, most->first.second};
+    }
     const double rate = fps.toDouble();
-    char fpsText[32];
-    std::snprintf(fpsText, sizeof fpsText, "%.3f", rate);
-    std::string fpsValue = fpsText;
-    while (!fpsValue.empty() && fpsValue.back() == '0') fpsValue.pop_back();
-    if (!fpsValue.empty() && fpsValue.back() == '.') fpsValue.pop_back();
+    QString fpsText = QString::number(rate, 'f', 3);  // (locale-independent)
+    while (fpsText.endsWith('0')) fpsText.chop(1);
+    if (fpsText.endsWith('.')) fpsText.chop(1);
+    const std::string fpsValue = fpsText.toStdString();
     t.heading = {{"FIELD_DELIM", "TABS"},
                  {"VIDEO_FORMAT", height >= 1080 ? "1080" : height >= 720 ? "720" : height > 0 ? "NTSC" : "CUSTOM"},
                  {"AUDIO_FORMAT", "48khz"},
@@ -216,16 +260,20 @@ AleTable aleFromMedia(const Project& p, const std::vector<Id>& ids, Rational fps
         };
         std::string tracks = m->hasVideo ? "V" : "";
         for (int c = 1; m->hasAudio && c <= std::clamp(m->channels, 1, 8); ++c) tracks += "A" + std::to_string(c);
-        const FrameTime start = m->timecode > 0 ? FrameTime(std::llround(m->timecode * rate)) : 0;
-        const FrameTime length = std::max<FrameTime>(1, FrameTime(std::llround(m->duration * rate)));
-        const bool drop = isDropFrameRate(fps);
+        // Timecodes at the media's own rate, drop-frame only when its own timecode is.
+        const Rational own = m->fps.valid() ? m->fps : fps;
+        const double ownRate = own.toDouble();
+        const FrameTime start = m->timecode > 0 ? FrameTime(std::llround(m->timecode * ownRate)) : 0;
+        const FrameTime length = std::max<FrameTime>(1, FrameTime(std::llround(m->duration * ownRate)));
+        const auto df = m->metadata.find("timecode_drop");
+        const bool drop = isDropFrameRate(own) && df != m->metadata.end() && df->second == "1";
         std::vector<std::string> row{m->name,
                                      tracks,
-                                     formatTimecode(start, fps, drop),
-                                     formatTimecode(start + length, fps, drop),
-                                     formatTimecode(length, fps, drop),
+                                     formatTimecode(start, own, drop),
+                                     formatTimecode(start + length, own, drop),
+                                     formatTimecode(length, own, drop),
                                      meta("tape"),
-                                     m->path.empty() ? std::string() : baseName(m->path),
+                                     m->path.empty() ? std::string() : baseName(m->path),  // (without Interpret Footage's settings)
                                      meta("scene"),
                                      meta("shot"),
                                      meta("take"),
@@ -238,7 +286,7 @@ AleTable aleFromMedia(const Project& p, const std::vector<Id>& ids, Rational fps
         for (const Sequence& s : p.sequences)
             for (const Track& tr : s.videoTracks)
                 for (const Clip& c : tr.clips)
-                    if (!has && c.mediaId == id && clipCdl(c, c.start, cdl)) has = true;
+                    if (!has && c.mediaId == id && clipCdl(c, 0, cdl)) has = true;
         anyCdl |= has;
         rows.push_back({row, {has, cdl}});
     }

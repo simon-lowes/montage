@@ -6724,7 +6724,7 @@ private slots:
         Cdl fromEdl;
         QVERIFY(clipCdl(trackAt(*q.findSequence(ir.sequence), V1)->clips.at(1), 0, fromEdl) && fromEdl.sameGrade(mc));
         QVERIFY(!clipCdl(trackAt(*q.findSequence(ir.sequence), A1)->clips.at(0), 0, fromEdl));
-        // Setting a CDL replaces the clip's, put first after an input transform.
+        // Setting a CDL replaces the clip's, put first (before a transform out of the camera's log).
         Clip& c0 = trackAt(s, V1)->clips[0];
         c0.effects.clear();
         c0.effects.push_back(makeEffect(p, "color_space_transform"));
@@ -6732,8 +6732,104 @@ private slots:
         setClipCdl(p, c0, g);
         setClipCdl(p, c0, h);
         QCOMPARE(c0.effects.size(), size_t(3));
-        QCOMPARE(c0.effects[1].type, std::string("cdl"));
+        QCOMPARE(c0.effects[0].type, std::string("cdl"));
         QVERIFY(clipCdl(c0, 0, cc0) && cc0.sameGrade(h));
+    }
+
+    void cdlAleReviewFixes() {
+        Project p = makeDefaultProject();
+        auto addMedia = [&](const char* name, std::string path, Rational fps, double tc) {
+            MediaItem m;
+            m.id = p.newId();
+            m.kind = MediaKind::Video;
+            m.name = name;
+            m.path = std::move(path);
+            m.duration = 10;
+            m.width = 1920;
+            m.height = 1080;
+            m.fps = fps;
+            m.hasVideo = true;
+            m.timecode = tc;
+            p.media.push_back(m);
+            return m.id;
+        };
+        // Timecodes at each media item's own rate, drop-frame only when its own timecode was.
+        const Id film = addMedia("A001.mov", "/c/A001.mov", {24000, 1001}, 3603.6);  // 01:00:00:00 at 23.976
+        const Id ndf = addMedia("B001.mov", "/c/B001.mov", {30000, 1001}, 36036.0);  // 10:00:00:00 non-drop at 29.97
+        const Id df = addMedia("C001.mov", "/c/C001.mov", {30000, 1001}, 1078920.0 * 1001 / 30000);  // 10:00:00;00 drop
+        p.findMedia(df)->metadata["timecode_drop"] = "1";
+        AleTable out = aleFromMedia(p, {film}, {24, 1});
+        QCOMPARE(out.headingValue("FPS"), std::string("23.976"));
+        QCOMPARE(out.value(0, "Start"), std::string("01:00:00:00"));
+        out = aleFromMedia(p, {ndf, df}, {25, 1});
+        QCOMPARE(out.headingValue("FPS"), std::string("29.97"));
+        QCOMPARE(out.value(0, "Start"), std::string("10:00:00:00"));
+        QCOMPARE(out.value(1, "Start"), std::string("10:00:00;00"));
+        // Matched by tape and a non-drop timecode at 29.97; a malformed timecode is just no match.
+        p.findMedia(ndf)->metadata["tape"] = "B001";
+        AleTable t;
+        QVERIFY(parseAle("Heading\nFPS\t29.97\n\nColumn\nName\tTape\tStart\tScene\n\nData\n"
+                         "B-cam roll\tB001\t10:00:00:00\t7\n"
+                         "Junk\tB001\t01:00:00:99999999999999999999\t8\n", t));
+        AleImport r = applyAle(p, t, false);
+        QCOMPARE(r.matched, std::vector<Id>{ndf});
+        QCOMPARE(r.unmatched, std::vector<std::string>{"Junk"});
+        QCOMPARE(p.findMedia(ndf)->metadata.at("scene"), std::string("7"));
+        // Names: an extension is only a media file's ("Sc12.1" is not "Sc12.2"); a file name read through Interpret
+        // Footage's settings and from a Windows path.
+        const Id sc1 = addMedia("Sc12.1", "/c/Sc12.1.mov", {25, 1}, 0);
+        Interpretation conform;
+        conform.fps = {24, 1};
+        const Id conformed = addMedia("D001", interpretedPath("/c/D001.mov", conform), {24, 1}, 0);
+        QVERIFY(parseAle("Heading\nFPS\t25\n\nColumn\nName\tSource File\tTake\n\nData\n"
+                         "Sc12.2\t\t9\n"
+                         "Whatever\tC:\\Media\\D001.mov\t3\n", t));
+        r = applyAle(p, t, false);
+        QCOMPARE(r.matched, std::vector<Id>{conformed});
+        QVERIFY(!p.findMedia(sc1)->metadata.count("take"));
+        const AleTable written = aleFromMedia(p, {conformed}, {24, 1});
+        QCOMPARE(written.value(0, "Source File"), std::string("D001.mov"));
+        // A collection: the exact name first ("Sc12.2" gets its own grade, not "Sc12.1"'s), then without the extension.
+        Cdl one, two;
+        one.id = "Sc12.1";
+        one.slope[0] = 1.1;
+        two.id = "Sc12.2";
+        two.slope[0] = 1.2;
+        QCOMPARE(matchCdl({one, two}, {"Sc12.2"})->id, std::string("Sc12.2"));
+        QCOMPARE(matchCdl({one, two}, {"Sc12.2.mov"})->id, std::string("Sc12.2"));
+        QVERIFY(!matchCdl({one, two}, {"Sc12.3"}));
+        // A subclip's clips get their parent's CDL, and the subclip its log.
+        const Id parent = addMedia("E001.mov", "/c/E001.mov", {25, 1}, 0);
+        std::optional<MediaItem> sub = makeSubclip(p, parent, 2, 6);
+        QVERIFY(sub);
+        sub->id = p.newId();
+        p.media.push_back(*sub);
+        Sequence& s = *p.active();
+        QVERIFY(edit::placeMedia(p, s, sub->id, 100, 0, 25, V1, {}, false).ok);
+        QVERIFY(parseAle("Heading\nFPS\t25\n\nColumn\nName\tScene\tASC_SOP\tASC_SAT\n\nData\nE001\t4\t(1.3 1 1)(0 0 0)(1 1 1)\t1\n", t));
+        r = applyAle(p, t, true);
+        QCOMPARE(r.clips, 1);
+        QCOMPARE(p.findMedia(sub->id)->metadata.at("scene"), std::string("4"));
+        Cdl got;
+        QVERIFY(clipCdl(trackAt(s, V1)->clips.at(0), 0, got) && got.slope[0] == 1.3);
+        // A keyframed CDL is read at the clip's own start, not at its place in the sequence.
+        Clip& c = trackAt(s, V1)->clips[0];
+        for (Effect& e : c.effects)
+            if (e.type == "cdl") {
+                e.params["slope.r"] = Param(1.5);
+                e.params["slope.r"].keys = {Keyframe{0, 1.5}, Keyframe{20, 2.0}};
+            }
+        QVERIFY(exportEdl(p, s).find("*ASC_SOP (1.500000") != std::string::npos);
+        // Corrections left out are reported even when others are read.
+        std::string err;
+        const std::vector<Cdl> some = parseCdlXml(
+            "<ColorCorrectionCollection><ColorCorrection id=\"ok\"><SOPNode><Slope>1 1 1</Slope></SOPNode></ColorCorrection>"
+            "<ColorCorrection id=\"bad\"><SatNode><Saturation>lots</Saturation></SatNode></ColorCorrection></ColorCorrectionCollection>",
+            &err);
+        QCOMPARE(some.size(), size_t(1));
+        QVERIFY(err.find("bad") != std::string::npos);
+        QVERIFY(parseCdlXml("<ColorDecisionList><ColorDecision><ColorCorrectionRef ref=\"x\"/></ColorDecision></ColorDecisionList>", &err).empty());
+        QVERIFY(err.find("ColorCorrectionRef") != std::string::npos);
     }
 
     void interchangeCompoundAndMulticam() {

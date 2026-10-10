@@ -683,6 +683,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
     const FrameTime lt = t - c.start;
     const int SW = seq.width, SH = seq.height;
     Image src;
+    const Effect* sourceCdl = nullptr;  // a CDL applied in the media's own space, before the input transform
     double mw = SW, mh = SH;
     Geometry g;
     double sourceSeconds = -1;  // media time of the frame, for effects that follow the footage
@@ -915,6 +916,13 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             if (vr)
                 src = reframeEquirect(src, vr->p("yaw", lt, 0), vr->p("pitch", lt, 0), vr->p("roll", lt, 0), vrFov, vrView, viewW, viewH,
                                       projectionSpan(m->projection));
+            // A CDL made in the media's own space (an on-set grade on camera log) grades the picture as it comes, before the
+            // input transform's display rendering.
+            for (const Effect& e : c.effects)
+                if (!sourceCdl && e.enabled && e.type == "cdl" && e.s("space") == mediaColorSpace(*m).label) {
+                    sourceCdl = &e;
+                    applyCdlValues(e, lt, src);
+                }
             // Input transform: the media's space into the sequence's working space.
             convertColor(src, mediaColorSpace(*m), sequenceColorSpace(seq), seq.hdrPeakNits);
         } else {
@@ -954,7 +962,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
         if (e->type == "redact_faces") applyVideoEffect(*e, lt, src, pixelScale, sourceSeconds);
     for (const Effect* e : chain)
         if (e->type != "video_denoise" && e->type != "super_scale" && e->type != "reframe_360" && e->type != "redact_faces" &&
-            e->type != "stereo_3d")  // those ran already (Stereo 3D is placed below)
+            e->type != "stereo_3d" && e != sourceCdl)  // those ran already (Stereo 3D is placed below)
             applyVideoEffect(*e, lt, src, pixelScale, sourceSeconds);
     // Stereo 3D: in a stereoscopic sequence the eyes are moved apart by the clip's depth (into the screen when
     // positive, out of it when negative); half the separation each way.

@@ -406,8 +406,10 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         if (!tc) tc = av_dict_get(fmt->metadata, "timecode", nullptr, 0);
         for (unsigned i = 0; !tc && i < fmt->nb_streams; ++i) tc = av_dict_get(fmt->streams[i]->metadata, "timecode", nullptr, 0);
         AVTimecode parsed;
-        if (tc && fr.num > 0 && fr.den > 0 && av_timecode_init_from_string(&parsed, fr, tc->value, nullptr) == 0)
+        if (tc && fr.num > 0 && fr.den > 0 && av_timecode_init_from_string(&parsed, fr, tc->value, nullptr) == 0) {
             m.timecode = double(parsed.start) * fr.den / fr.num;
+            if (std::strchr(tc->value, ';')) m.metadata["timecode_drop"] = "1";  // (so logs written of it say drop-frame too)
+        }
         if (dur <= 0 && st->duration > 0) dur = double(st->duration) * av_q2d(st->time_base);
     }
     if (m.hasAudio) {

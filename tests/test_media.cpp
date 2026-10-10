@@ -111,6 +111,7 @@
 #include "media/Inpaint.h"
 #include "media/VisualSearch.h"
 #include "automation/McpServer.h"
+#include "core/Cdl.h"
 #ifdef MONTAGE_WITH_WHISPER
 #include "media/Transcriber.h"
 #endif
@@ -628,12 +629,59 @@ private slots:
         r = call("montage_cdl", {{"project", project}, {"action", "get"}, {"clip", clip0}});
         QVERIFY2(text(r).contains("(1.100000 1.100000 1.100000)(0.010000 0.000000 -0.010000)"), qPrintable(text(r)));
         QVERIFY(call("montage_cdl", {{"project", project}, {"action", "import"}, {"text", "<x/>"}}).value("isError").toBool());
+        {
+            Project withSound;
+            QVERIFY(loadProject(project.toStdString(), withSound));
+            MediaItem wav = *withSound.findMedia(a);
+            wav.id = withSound.newId();
+            wav.kind = MediaKind::Audio;
+            wav.hasVideo = false;
+            wav.hasAudio = true;
+            withSound.media.push_back(wav);
+            QVERIFY(edit::placeMedia(withSound, *withSound.active(), wav.id, 0, 0, 25, {}, {TrackKind::Audio, 0}, false).ok);
+            QVERIFY(saveProject(withSound, project.toStdString()));
+            const double sound = double(withSound.active()->audioTracks[0].clips.at(0).id);
+            QVERIFY(call("montage_cdl", {{"project", project}, {"action", "import"}, {"path", cdlFile}, {"clip", sound}}).value("isError").toBool());
+        }
         // An ALE of the media, with the CDLs.
         r = call("montage_ale", {{"project", project}, {"action", "export"}});
         QVERIFY2(text(r).contains("ASC_SOP") && text(r).contains("A001C002.mov\t4\t\t3") && text(r).contains("10:00:00:00\t10:00:10:00"), qPrintable(text(r)));
         QVERIFY(call("montage_ale", {{"project", project}, {"action", "export"}, {"media", QJsonArray{"Nope"}}}).value("isError").toBool());
         QVERIFY(call("montage_ale", {{"project", project}, {"action", "import"}, {"text", "nothing"}}).value("isError").toBool());
         QVERIFY(call("montage_ale", {{"project", project}, {"action", "rename"}}).value("isError").toBool());
+    }
+
+    void cdlInTheMediasOwnLog() {
+        // LogC3 footage (a flat grey still read as LogC3) in a Rec.709 sequence: a CDL made in LogC3 grades the log
+        // values before the display rendering, as on set; the same CDL in the working space grades after it.
+        QImage grey(64, 48, QImage::Format_RGB32);
+        grey.fill(qRgb(102, 102, 102));
+        QVERIFY(grey.save(QString::fromStdString(path("logc-grey.png"))));
+        Project p = makeDefaultProject();
+        MediaItem m = probeOrFail(p, path("logc-grey.png"));
+        m.colorOverride = "logc3-awg3";
+        p.media.push_back(m);
+        Sequence& s = *p.active();
+        s.width = 64;
+        s.height = 48;
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 25, {TrackKind::Video, 0}, {}, false).ok);
+        Cdl lift;
+        lift.offset[0] = lift.offset[1] = lift.offset[2] = 0.05;
+        setClipCdl(p, s.videoTracks[0].clips[0], lift);
+        const ColorSpace& logc = *findColorSpace("logc3-awg3");
+        s.videoTracks[0].clips[0].effects[0].strings["space"] = logc.label;
+        RenderOptions ro;
+        Image img = renderProgramFrame(p, s, 2, ro);
+        float want[3] = {102 / 255.0f, 102 / 255.0f, 102 / 255.0f};
+        applyCdl(lift, want[0], want[1], want[2]);
+        convertPixel(want, logc, rec709Space(), 1000);
+        QVERIFY2(std::fabs(img.at(32, 24)[1] - want[1]) < 0.01f, qPrintable(QString("%1 vs %2").arg(img.at(32, 24)[1]).arg(want[1])));
+        s.videoTracks[0].clips[0].effects[0].strings["space"] = "Working space";
+        const float after = renderProgramFrame(p, s, 2, ro).at(32, 24)[1];
+        float plain[3] = {102 / 255.0f, 102 / 255.0f, 102 / 255.0f};
+        convertPixel(plain, logc, rec709Space(), 1000);
+        QVERIFY2(std::fabs(after - (plain[1] + 0.05f)) < 0.01f, qPrintable(QString("%1 vs %2").arg(after).arg(plain[1] + 0.05f)));
+        QVERIFY(std::fabs(after - want[1]) > 0.01f);
     }
 
     void probeAndDecodeWav() {

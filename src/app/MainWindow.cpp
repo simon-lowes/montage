@@ -3172,19 +3172,13 @@ int MainWindow::importCdl(const QString& path) {
             const Cdl* use = cdls.size() == 1 ? &cdls.front() : nullptr;
             if (!use) {
                 // A collection: the correction named after this clip, its file or its tape.
-                const MediaItem* m = p.findMedia(c->mediaId);
-                std::vector<QString> names{QString::fromStdString(c->name)};
-                if (m) {
-                    names.push_back(QString::fromStdString(m->name));
-                    if (!m->path.empty()) names.push_back(QFileInfo(QString::fromStdString(m->path)).fileName());
-                    if (auto tape = m->metadata.find("tape"); tape != m->metadata.end()) names.push_back(QString::fromStdString(tape->second));
+                std::vector<std::string> names{c->name};
+                if (const MediaItem* m = p.findMedia(c->mediaId)) {
+                    names.push_back(m->name);
+                    if (!m->path.empty()) names.push_back(QFileInfo(QString::fromStdString(uninterpretedPath(m->path))).fileName().toStdString());
+                    if (auto tape = m->metadata.find("tape"); tape != m->metadata.end()) names.push_back(tape->second);
                 }
-                for (const Cdl& cdl : cdls)
-                    for (const QString& n : names) {
-                        const QString id = QString::fromStdString(cdl.id);
-                        if (!use && !id.isEmpty() && (id.compare(n, Qt::CaseInsensitive) == 0 || QFileInfo(id).completeBaseName().compare(QFileInfo(n).completeBaseName(), Qt::CaseInsensitive) == 0))
-                            use = &cdl;
-                    }
+                use = matchCdl(cdls, names);
             }
             if (!use) continue;
             setClipCdl(p, *c, *use);
@@ -3192,7 +3186,9 @@ int MainWindow::importCdl(const QString& path) {
         }
         return graded > 0;
     });
-    state_->message(graded ? tr("Graded %n clip(s) with the CDL", nullptr, graded) : tr("No correction in the file matched the selected clips"), 6000);
+    QString msg = graded ? tr("Graded %n clip(s) with the CDL", nullptr, graded) : tr("No correction in the file matched the selected clips");
+    if (!err.empty()) msg += tr(" (%1)").arg(QString::fromStdString(err));  // corrections left out
+    state_->message(msg, 8000);
     return graded;
 }
 
@@ -3208,7 +3204,7 @@ bool MainWindow::exportCdl(const QString& path) {
     std::vector<Cdl> cdls;
     for (const Clip* c : clips) {
         Cdl cdl;
-        if (!clipCdl(*c, c->start, cdl)) continue;
+        if (!clipCdl(*c, 0, cdl)) continue;
         if (cdl.id.empty()) cdl.id = c->name;
         cdls.push_back(cdl);
     }

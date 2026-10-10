@@ -59,7 +59,7 @@ struct EdlWriter {
     // The clip's ASC CDL, as Resolve and Baselight write and read it.
     void cdl(const Clip& c) {
         Cdl g;
-        if (!clipCdl(c, c.start, g)) return;
+        if (!clipCdl(c, 0, g)) return;
         out << "*ASC_SOP " << cdlSopText(g) << "\n";
         out << "*ASC_SAT " << cdlNumber(g.saturation) << "\n";
     }

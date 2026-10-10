@@ -2520,7 +2520,7 @@ void McpServer::Impl::addTools() {
             if (action == "get") {
                 const Clip& c = clipArg(l, a);
                 Cdl g;
-                if (!clipCdl(c, c.start, g)) return ok(QStringLiteral("Clip %1 has no CDL").arg(qulonglong(c.id)), QJsonObject{{"clip", double(c.id)}});
+                if (!clipCdl(c, 0, g)) return ok(QStringLiteral("Clip %1 has no CDL").arg(qulonglong(c.id)), QJsonObject{{"clip", double(c.id)}});
                 const QJsonObject o = describe(c, g);
                 return ok(QString::fromUtf8(QJsonDocument(o).toJson(QJsonDocument::Compact)), o);
             }
@@ -2529,7 +2529,7 @@ void McpServer::Impl::addTools() {
                 if (c.isGenerator()) throw ArgError{QStringLiteral("A CDL grades footage, not a generator")};
                 if (auto loc = edit::locate(s, c.id); !loc || loc->track.kind != TrackKind::Video) throw ArgError{QStringLiteral("A CDL goes on a video clip")};
                 Cdl g;
-                clipCdl(c, c.start, g);
+                clipCdl(c, 0, g);
                 auto three = [&](const char* key, double out[3], double lo) {
                     if (!a.contains(key)) return;
                     const QJsonValue v = a.value(key);
@@ -2582,29 +2582,20 @@ void McpServer::Impl::addTools() {
                 std::string err;
                 const std::vector<Cdl> cdls = parseCdlXml(text, &err);
                 if (cdls.empty()) return fail(QString::fromStdString(err));
-                auto namesOf = [&](const Clip& c) {
-                    std::vector<QString> names{QString::fromStdString(c.name)};
-                    if (const MediaItem* m = l.project.findMedia(c.mediaId)) {
-                        names.push_back(QString::fromStdString(m->name));
-                        if (!m->path.empty()) names.push_back(QFileInfo(QString::fromStdString(m->path)).fileName());
-                        if (auto t = m->metadata.find("tape"); t != m->metadata.end()) names.push_back(QString::fromStdString(t->second));
-                    }
-                    return names;
-                };
                 auto matching = [&](const Clip& c) -> const Cdl* {
-                    for (const Cdl& g : cdls)
-                        for (const QString& n : namesOf(c)) {
-                            const QString id = QString::fromStdString(g.id);
-                            if (!id.isEmpty() && (id.compare(n, Qt::CaseInsensitive) == 0 ||
-                                                  QFileInfo(id).completeBaseName().compare(QFileInfo(n).completeBaseName(), Qt::CaseInsensitive) == 0))
-                                return &g;
-                        }
-                    return nullptr;
+                    std::vector<std::string> names{c.name};
+                    if (const MediaItem* m = l.project.findMedia(c.mediaId)) {
+                        names.push_back(m->name);
+                        if (!m->path.empty()) names.push_back(QFileInfo(QString::fromStdString(uninterpretedPath(m->path))).fileName().toStdString());
+                        if (auto t = m->metadata.find("tape"); t != m->metadata.end()) names.push_back(t->second);
+                    }
+                    return matchCdl(cdls, names);
                 };
                 int graded = 0;
                 if (a.contains("clip")) {
                     Clip& c = clipArg(l, a);
                     if (c.isGenerator()) throw ArgError{QStringLiteral("A CDL grades footage, not a generator")};
+                    if (auto loc = edit::locate(s, c.id); !loc || loc->track.kind != TrackKind::Video) throw ArgError{QStringLiteral("A CDL goes on a video clip")};
                     const Cdl* g = matching(c);
                     setClipCdl(l.project, c, g ? *g : cdls.front());
                     graded = 1;
@@ -2619,13 +2610,15 @@ void McpServer::Impl::addTools() {
                                 }
                 }
                 if (graded) save(l);
-                return ok(QStringLiteral("%1 correction(s) read; %2 clip(s) graded").arg(cdls.size()).arg(graded), QJsonObject{{"corrections", int(cdls.size())}, {"clips", graded}});
+                QString msg = QStringLiteral("%1 correction(s) read; %2 clip(s) graded").arg(cdls.size()).arg(graded);
+                if (!err.empty()) msg += QStringLiteral(" (%1)").arg(QString::fromStdString(err));
+                return ok(msg, QJsonObject{{"corrections", int(cdls.size())}, {"clips", graded}});
             }
             if (action != "export") throw ArgError{QStringLiteral("\"action\" must be get, set, import or export")};
             std::vector<Cdl> cdls;
             auto take = [&](const Clip& c) {
                 Cdl g;
-                if (!clipCdl(c, c.start, g)) return;
+                if (!clipCdl(c, 0, g)) return;
                 if (g.id.empty()) g.id = c.name;
                 cdls.push_back(g);
             };

@@ -46,6 +46,11 @@ QDomElement childNamed(const QDomElement& e, std::initializer_list<const char*> 
 
 // Every ColorCorrection at or below `c`.
 void collect(const QDomElement& c, std::vector<Cdl>& out, std::string& problem) {
+    if (nameOf(c) == "ColorCorrectionRef") {
+        problem = "The file refers to corrections kept in another file (ColorCorrectionRef " + c.attribute("ref").toStdString() +
+                  "): import that .ccc instead";
+        return;
+    }
     if (nameOf(c) != "ColorCorrection") {
         for (QDomElement k = c.firstChildElement(); !k.isNull(); k = k.nextSiblingElement()) collect(k, out, problem);
         return;
@@ -66,7 +71,11 @@ void collect(const QDomElement& c, std::vector<Cdl>& out, std::string& problem) 
     if (QDomElement sat = childNamed(c, {"SatNode", "SATNode"}); !sat.isNull()) {
         bool ok = false;
         const double v = childNamed(sat, {"Saturation"}).text().trimmed().toDouble(&ok);
-        if (ok && std::isfinite(v)) cdl.saturation = v;
+        if (!ok || !std::isfinite(v)) {
+            problem = "A ColorCorrection (" + cdl.id + ") has an unreadable saturation";
+            return;
+        }
+        cdl.saturation = v;
     }
     for (double& p : cdl.power) p = std::max(1e-6, p);  // (a power of 0 or less is not a CDL)
     cdl.saturation = std::max(0.0, cdl.saturation);
@@ -135,8 +144,28 @@ std::vector<Cdl> parseCdlXml(const std::string& xml, std::string* error) {
     std::vector<Cdl> out;
     std::string problem;
     collect(doc.documentElement(), out, problem);
-    if (out.empty() && error) *error = problem.empty() ? "The file holds no ColorCorrection" : problem;
+    if (error) *error = out.empty() && problem.empty() ? "The file holds no ColorCorrection" : problem;
     return out;
+}
+
+std::string withoutMediaExtension(const std::string& name) {
+    static const QStringList media{"mov", "mp4", "m4v", "mxf", "avi", "mkv", "mts", "m2ts", "braw", "r3d", "ari", "arx", "crm", "dng",
+                                   "cine", "nev", "rmf", "mpg", "mpeg", "wav", "bwf", "aif", "aiff", "mp3", "dpx", "exr", "tif", "tiff"};
+    const QString n = QString::fromStdString(name);
+    const int dot = n.lastIndexOf('.');
+    if (dot <= 0 || !media.contains(n.mid(dot + 1).toLower())) return name;
+    return n.left(dot).toStdString();
+}
+
+const Cdl* matchCdl(const std::vector<Cdl>& cdls, const std::vector<std::string>& names) {
+    auto same = [](const std::string& a, const std::string& b) { return !a.empty() && QString::fromStdString(a).compare(QString::fromStdString(b), Qt::CaseInsensitive) == 0; };
+    for (const Cdl& c : cdls)
+        for (const std::string& n : names)
+            if (same(c.id, n)) return &c;
+    for (const Cdl& c : cdls)
+        for (const std::string& n : names)
+            if (same(withoutMediaExtension(c.id), withoutMediaExtension(n))) return &c;
+    return nullptr;
 }
 
 CdlFormat cdlFormatFor(const std::string& path) {
@@ -221,11 +250,9 @@ void setClipCdl(Project& p, Clip& c, const Cdl& cdl) {
             break;
         }
     if (!e) {
-        // First in the chain, after any transforms into the space the CDL was made in.
-        size_t at = 0;
-        while (at < c.effects.size() && (c.effects[at].type == "color_space_transform" || c.effects[at].type == "ocio")) ++at;
-        c.effects.insert(c.effects.begin() + long(at), makeEffect(p, "cdl"));
-        e = &c.effects[at];
+        // First in the chain: a CDL is made on the camera's own picture, before any transform out of it.
+        c.effects.insert(c.effects.begin(), makeEffect(p, "cdl"));
+        e = &c.effects.front();
     }
     e->enabled = true;
     for (int i = 0; i < 3; ++i) {
