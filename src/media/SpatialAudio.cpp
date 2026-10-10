@@ -90,12 +90,13 @@ std::vector<Box> topLevel(QFile& f) {
     return out;
 }
 
-// The path from moov down to the first audio track's first sample entry (moov's own box excluded: the buffer is its
-// contents with its header).
+// The path from moov down to an audio track's first sample entry (moov's own box excluded: the buffer is its contents
+// with its header), for every audio track in order.
 struct AudioEntry {
     std::vector<Box> path;  // trak, mdia, minf, stbl, stsd, entry
 };
-bool firstAudioEntry(const std::vector<uint8_t>& moov, AudioEntry& out) {
+std::vector<AudioEntry> audioEntries(const std::vector<uint8_t>& moov) {
+    std::vector<AudioEntry> out;
     const uint8_t* b = moov.data();
     const Box root{0, moov.size(), fourcc("moov"), size_t(be32(b) == 1 ? 16 : 8)};
     for (const Box& trak : inside(b, root)) {
@@ -115,10 +116,19 @@ bool firstAudioEntry(const std::vector<uint8_t>& moov, AudioEntry& out) {
         if (!stsd || stsd->size < stsd->header + 8) continue;
         const auto entries = inside(b, *stsd, 8);  // after version, flags and the entry count
         if (entries.empty()) continue;
-        out.path = {trak, *mdia, *minf, *stbl, *stsd, entries.front()};
-        return true;
+        out.push_back({{trak, *mdia, *minf, *stbl, *stsd, entries.front()}});
     }
-    return false;
+    return out;
+}
+
+// The channels an audio sample entry declares: ISO's (and QuickTime's version 0 and 1) count after the reserved
+// fields, or QuickTime version 2's own 32-bit count further on.
+uint32_t entryChannels(const std::vector<uint8_t>& moov, const Box& entry) {
+    const size_t at = entry.start + entry.header;  // reserved (6), data reference index (2), then version
+    if (entry.size < entry.header + 28) return 0;
+    const uint16_t version = uint16_t(moov[at + 8] << 8 | moov[at + 9]);
+    if (version == 2 && entry.size >= entry.header + 44) return be32(moov.data() + at + 40);
+    return uint32_t(moov[at + 16] << 8 | moov[at + 17]);
 }
 
 // Where an SA3D box sits in a sample entry (its children follow fields whose length depends on the entry's version,
@@ -156,11 +166,10 @@ int readSpatialAudioBox(const std::string& path) {
     if (!f.open(QIODevice::ReadOnly)) return 0;
     Box moov;
     std::vector<uint8_t> buf;
-    AudioEntry e;
-    if (!readMoov(f, moov, buf) || !firstAudioEntry(buf, e)) return 0;
-    const size_t at = findSa3d(buf, e.path.back());
-    // SA3D: version, ambisonic type, then the order.
-    return at ? int(be32(buf.data() + at + 8 + 2)) : 0;
+    if (!readMoov(f, moov, buf)) return 0;
+    for (const AudioEntry& e : audioEntries(buf))
+        if (const size_t at = findSa3d(buf, e.path.back())) return int(be32(buf.data() + at + 8 + 2));  // version, type, order
+    return 0;
 }
 
 bool writeSpatialAudioBox(const std::string& path, int order, std::string* error) {
@@ -170,25 +179,29 @@ bool writeSpatialAudioBox(const std::string& path, int order, std::string* error
     };
     if (order < 1 || order > 7) return fail("Ambisonic orders are 1 to 7");
     QFile f(QString::fromStdString(path));
-    if (!f.open(QIODevice::ReadOnly)) return fail("Cannot open " + path);
+    if (!f.open(QIODevice::ReadWrite)) return fail("Cannot open " + path);
     Box moov;
     std::vector<uint8_t> buf;
     std::vector<Box> top;
-    AudioEntry e;
     if (!readMoov(f, moov, buf, &top)) return fail("Not an MP4 or MOV file: " + path);
-    if (!firstAudioEntry(buf, e)) return fail("The file has no audio track");
-    const Box& entry = e.path.back();
-    if (findSa3d(buf, entry)) return true;  // already says so
-    // The box: version 0, periphonic, the order, ACN order, SN3D, the channels each in its own place.
+    const auto all = audioEntries(buf);
+    if (all.empty()) return fail("The file has no audio track");
+    // Every track carrying the order's channels (a mix, extra streams of one), without a box yet; mono tracks of the
+    // channels one by one are not a field.
     const uint32_t channels = uint32_t((order + 1) * (order + 1));
+    std::vector<AudioEntry> todo;
+    for (const AudioEntry& e : all)
+        if (entryChannels(buf, e.path.back()) == channels && !findSa3d(buf, e.path.back())) todo.push_back(e);
+    if (todo.empty()) return true;
+    // The box: version 0, periphonic, the order, ACN order, SN3D, the channels each in its own place.
     std::vector<uint8_t> sa3d(8 + 12 + 4 * size_t(channels), 0);
     put32(sa3d.data(), uint32_t(sa3d.size()));
     put32(sa3d.data() + 4, fourcc("SA3D"));
     put32(sa3d.data() + 10, uint32_t(order));
     put32(sa3d.data() + 16, channels);
     for (uint32_t c = 0; c < channels; ++c) put32(sa3d.data() + 20 + 4 * c, c);
-    const uint64_t delta = sa3d.size();
-    // A movie header before the media data moves them: every chunk offset beyond it grows by the box.
+    const uint64_t delta = uint64_t(sa3d.size()) * todo.size();
+    // A movie header before the media data moves them: every chunk offset beyond it grows by the boxes.
     bool dataAfter = false;
     for (const Box& x : top) dataAfter |= x.type == fourcc("mdat") && x.start > moov.start;
     if (dataAfter) {
@@ -219,11 +232,32 @@ bool writeSpatialAudioBox(const std::string& path, int order, std::string* error
             }
         }
     }
-    // Every box holding the entry grows by it, and the box goes at the entry's end.
+    // Every box holding an entry grows by its box, which goes at the entry's end; the last entries first, so the
+    // places of those before stay as they were.
     addToSize(buf, Box{0, buf.size(), fourcc("moov"), moov.header}, delta);
-    for (const Box& x : e.path) addToSize(buf, x, delta);
-    buf.insert(buf.begin() + std::ptrdiff_t(entry.start + size_t(entry.size)), sa3d.begin(), sa3d.end());
-    // The file again: what came before the movie header, the new header, and what came after.
+    std::sort(todo.begin(), todo.end(), [](const AudioEntry& a, const AudioEntry& b) { return a.path.back().start > b.path.back().start; });
+    for (const AudioEntry& e : todo) {
+        for (const Box& x : e.path) addToSize(buf, x, sa3d.size());
+        const Box& entry = e.path.back();
+        buf.insert(buf.begin() + std::ptrdiff_t(entry.start + size_t(entry.size)), sa3d.begin(), sa3d.end());
+    }
+    const qint64 size = f.size(), after = qint64(moov.start + size_t(moov.size));
+    if (after == size) {
+        // The movie header last (as exports write it): the new one goes after it, and only once that is all written
+        // does the old one become free space, so a full disk leaves the file as it was. Nothing is copied.
+        if (!f.seek(size) || f.write(reinterpret_cast<const char*>(buf.data()), qint64(buf.size())) != qint64(buf.size()) || !f.flush()) {
+            f.resize(size);
+            return fail("Cannot write " + path);
+        }
+        uint8_t freeType[4];
+        put32(freeType, fourcc("free"));
+        if (!f.seek(qint64(moov.start) + 4) || f.write(reinterpret_cast<const char*>(freeType), 4) != 4 || !f.flush()) {
+            f.resize(size);
+            return fail("Cannot write " + path);
+        }
+        return true;
+    }
+    // Otherwise the file again: what came before the movie header, the new header, and what came after.
     QSaveFile out(QString::fromStdString(path));
     if (!out.open(QIODevice::WriteOnly)) return fail("Cannot write " + path);
     auto copy = [&](qint64 from, qint64 length) {
@@ -236,9 +270,8 @@ bool writeSpatialAudioBox(const std::string& path, int order, std::string* error
         }
         return true;
     };
-    const qint64 after = qint64(moov.start + size_t(moov.size));
     if (!copy(0, qint64(moov.start)) || out.write(reinterpret_cast<const char*>(buf.data()), qint64(buf.size())) != qint64(buf.size()) ||
-        !copy(after, f.size() - after))
+        !copy(after, size - after))
         return fail("Cannot write " + path);
     f.close();
     if (!out.commit()) return fail("Cannot write " + path);

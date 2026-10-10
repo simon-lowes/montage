@@ -367,7 +367,8 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& settings,
     if (end <= first) return fail("The sequence is empty");
     const int64_t frames = (end - first) / step;
     if (frames < fps) return fail("A DCP must last at least a second (cinema servers refuse shorter reels)");
-    const int seqChannels = layoutChannels(earLevelLayout(s.audioLayout));  // immersive mixes fold their heights down
+    // Immersive mixes fold their heights down; an ambisonic field is heard through two virtual cardioids (stereo).
+    const int seqChannels = ambisonicLayout(s.audioLayout) ? 2 : layoutChannels(earLevelLayout(s.audioLayout));
     const int channels = seqChannels == 8 ? 8 : 6;
 
     // The folder.

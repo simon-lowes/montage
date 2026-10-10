@@ -1270,12 +1270,25 @@ void checkStereoMedia(Project& p) {
 }
 
 AudioBufferPtr decodeAmbisonic(const std::string& path, int sampleRate, std::string* error, const std::atomic<bool>* cancel) {
-    // A conformed file plays at its new speed (its pitch with it).
+    // A conformed file plays at its new speed, or stretched to its new length with its pitch kept, as decodeAudio does.
     if (Interpretation in; parseInterpretation(path, in) && in.conformed()) {
-        const int rate = int(std::clamp(std::llround(sampleRate / in.timeScale()), 1000LL, 1LL << 30));
-        AudioBufferPtr played = decodeAmbisonic(uninterpretedPath(path), rate, error, cancel);
-        if (!played) return nullptr;
-        auto out = std::make_shared<AudioBuffer>(*played);
+        const double k = in.timeScale();
+        if (!in.keepPitch) {
+            const int rate = int(std::clamp(std::llround(sampleRate / k), 1000LL, 1LL << 30));
+            AudioBufferPtr played = decodeAmbisonic(uninterpretedPath(path), rate, error, cancel);
+            if (!played) return nullptr;
+            auto out = std::make_shared<AudioBuffer>(*played);
+            out->sampleRate = sampleRate;
+            return out;
+        }
+        AudioBufferPtr src = decodeAmbisonic(uninterpretedPath(path), sampleRate, error, cancel);
+        if (!src) return nullptr;
+        const int hop = stretchHop(sampleRate);
+        const int64_t outFrames = int64_t(std::llround(double(src->frames()) / k));
+        std::vector<double> positions(size_t(outFrames / hop + 2));
+        for (size_t j = 0; j < positions.size(); ++j) positions[j] = double(j) * hop * k;
+        auto out = std::make_shared<AudioBuffer>();
+        wsolaStretch(*src, positions, hop, outFrames, *out);
         out->sampleRate = sampleRate;
         return out;
     }

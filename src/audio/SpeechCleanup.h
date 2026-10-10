@@ -53,7 +53,9 @@ bool enhanceSpeech(const AudioBuffer& in, AudioBuffer& out, double amount, doubl
 
 // The source audio with the clip's source effects applied, in order. With
 // `blocking` the work is done now; otherwise it starts in the background and
-// nullptr is returned until it is ready.
+// nullptr is returned until it is ready. An ambisonic field (four channels)
+// has its W cleaned and the same change, frequency by frequency, made to Y, Z
+// and X, so its directions hold (with Pitch Shift: the channels in pairs).
 AudioBufferPtr cleanedAudio(const std::string& path, const AudioBufferPtr& source, const std::vector<const Effect*>& effects,
                             bool blocking);
 // Number of cleanups still running in the background.

@@ -58,6 +58,9 @@ void takeDetails(MediaItem& m, const MediaItem& n, bool replace) {
     m.audioCodec = n.audioCodec;
     m.colorSpace = n.colorSpace;
     m.stereo = n.stereo;  // its size above is one eye's
+    // A field stays one unless the new file has too few channels to be (or says it is one).
+    if (n.ambisonic > 0) m.ambisonic = n.ambisonic;
+    else if (n.channels < 4) m.ambisonic = 0;
     if (!n.projection.empty()) m.projection = n.projection;
     if (!m.subclipOf) m.duration = n.duration;
     if (replace) {

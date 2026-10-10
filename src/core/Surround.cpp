@@ -143,8 +143,10 @@ SurroundGains surroundGains(const std::string& layout, const SurroundPan& p) {
     const double half = 30 * width;
     out.left = panGains(layout, angle - half, distance, p.z);
     out.right = panGains(layout, angle + half, distance, p.z);
-    // Drawn together, the two channels add up: a sound in both stays as loud as it was on two speakers.
-    const float k = float(std::sqrt(0.5 + 0.5 * width));
+    // Drawn together, the two channels add up: a sound in both stays as loud as it was on two speakers. In an
+    // ambisonic field both always add in W (as in phase as the sound is), so each goes in 3 dB down at any width: a
+    // sound in both is then as loud as on two speakers, and W keeps the headroom a front stereo pair would take.
+    const float k = float(ambisonicLayout(layout) ? std::sqrt(0.5) : std::sqrt(0.5 + 0.5 * width));
     for (float& g : out.left) g *= k;
     for (float& g : out.right) g *= k;
     out.lfe = p.lfeDb <= -99 ? 0.0f : float(std::pow(10.0, p.lfeDb / 20));

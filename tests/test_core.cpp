@@ -4637,6 +4637,13 @@ private slots:
         QVERIFY(pg.size() == 4 && near(pg[0], 1) && near(pg[1], 1) && near(pg[3], 0));
         QVERIFY(near(panGains("ambix", 0, 1, 1)[2], 1));   // overhead
         QVERIFY(near(panGains("ambix", -90, 0, 0)[1], 0));  // in the middle: all round
+        // A stereo track's two channels go into the field 3 dB down at any width (both always add in W), where the
+        // speaker layouts keep them whole when wide.
+        for (double width : {0.0, 1.0}) {
+            const SurroundGains sg = surroundGains("ambix", SurroundPan{0, 1, width, -100, 0, false});
+            QVERIFY(near(sg.left[0], float(std::sqrt(0.5))) && near(sg.right[0], float(std::sqrt(0.5))));
+        }
+        QVERIFY(near(surroundGains("5.1", SurroundPan{0, 1, 1, -100, 0, false}).left[0], 1));
         float field[4] = {1, 1, 0, 0}, st[2];
         downmixToStereo("ambix", field, 1, st);
         QVERIFY(st[0] > 4 * st[1]);

@@ -110,8 +110,8 @@ public:
         nonBlocking_ = on;
         if (keyMixer_) keyMixer_->setNonBlocking(on);
     }
-    // How mix() lets an ambisonic sequence be heard: binaurally for headphones (the default), or through two virtual
-    // cardioids for speakers.
+    // How mix() lets an ambisonic sequence be heard: binaurally for headphones, or through two virtual cardioids for
+    // speakers (the default, as downmixToStereo folds it: exports, stems; playback sets the monitoring choice).
     void setAmbisonicBinaural(bool on) { ambisonicBinaural_ = on; }
 
     struct State;  // per clip/effect DSP state
@@ -120,15 +120,18 @@ public:
 private:
     // `rate` overrides the sequence's sample rate (nested sequences mix at the outer rate);
     // `onlyTrack` mixes that audio track alone (a multicam clip's audio angle).
-    // `channels` is 2, or the sequence layout's count for a surround mix (depth 0 only).
+    // `channels` is 2, or the sequence layout's count for a surround mix (depth 0 only; an ambisonic sequence nested in
+    // an ambisonic mix is mixed as its four-channel field).
     void mixInto(const Project& p, const Sequence& seq, int64_t start, int frames, float* out,
                  std::vector<MeterLevels>* trackLevels, int depth, int rate = 0, int onlyTrack = -1, int channels = 2);
     // Runs an effect chain over an interleaved stereo block; DSP state is kept per (owner, effect).
     void processChain(const std::vector<Effect>& chain, Id owner, FrameTime lt, double sr, float* buf, int frames);
     // Sums a track's clips over [start, start + frames) into trackBuf; false if none plays. With `trackField` (an
-    // ambisonic mix), ambisonic clips add their turned field there (four channels) instead of being heard as stereo.
+    // ambisonic mix), ambisonic clips (and nested ambisonic sequences) add their turned field there (four channels)
+    // over [fieldStart, fieldStart + frames) instead of being heard as stereo: the field passes no stereo inserts, so it
+    // is read where the mix after them is (the master's latency ahead) rather than as far ahead as the track's sound.
     bool mixTrackClips(const Project& p, const Sequence& seq, const Track& track, int64_t start, int frames, double sr,
-                       int depth, float* trackBuf, float* trackField = nullptr);
+                       int depth, float* trackBuf, float* trackField = nullptr, int64_t fieldStart = 0);
     // Latency (samples) of a chain's plugins, loading them if needed; and the largest in a sequence.
     int chainLatency(const std::vector<Effect>& chain, Id owner, double sr);
     int maxLatency(const Sequence& seq, double sr);
@@ -158,7 +161,7 @@ private:
     std::mutex m_;
     bool nonBlocking_ = false;
     std::vector<bool> mask_, lfeOnly_;
-    bool ambisonicBinaural_ = true;
+    bool ambisonicBinaural_ = false;
     std::map<Id, std::unique_ptr<FoaBinaural>> binaural_;  // per ambisonic clip heard binaurally
     std::unique_ptr<FoaBinaural> monitor_;                  // an ambisonic sequence heard binaurally
 };

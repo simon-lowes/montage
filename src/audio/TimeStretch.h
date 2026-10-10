@@ -20,7 +20,8 @@ int stretchHop(int sampleRate);
 
 // Stretches `in` along a time map: output sample k * hop plays around source
 // sample `positions[k]` (fractional; the last position is held past the end).
-// `outFrames` frames are made at the input's rate, pitch kept.
+// `outFrames` frames are made at the input's rate and channels, pitch kept (an ambisonic field's four channels cut
+// together, guided by W).
 void wsolaStretch(const AudioBuffer& in, const std::vector<double>& positions, int hop, int64_t outFrames, AudioBuffer& out);
 
 // The same, cached under `key` (which must name the source and the time map;

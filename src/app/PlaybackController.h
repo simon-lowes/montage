@@ -57,7 +57,8 @@ public:
     // Global Mute (as in Premiere): playback and scrubbing are silent; clips, tracks and exports are untouched.
     void setGlobalMute(bool on);
     bool globalMute() const { return globalMute_; }
-    // How an ambisonic sequence (or ambisonic clip) is heard: binaurally for headphones, or as stereo for speakers.
+    // How an ambisonic sequence is heard (playing and scrubbing): binaurally for headphones, or as stereo for speakers.
+    // An ambisonic clip in a stereo or surround sequence is decoded as its Ambisonics effect says, as it is exported.
     void setAmbisonicBinaural(bool on);
     bool ambisonicBinaural() const { return ambisonicBinaural_; }
     // Audio tracks left out of what is heard (an ADR guide track while recording), the project untouched.

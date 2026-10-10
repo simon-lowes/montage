@@ -4327,16 +4327,35 @@ private slots:
         // SA3D goes in whether the movie header follows the sound (FFmpeg's way) or comes first (fast start), and the
         // sound plays the same afterwards.
         {
-            Project sp = makeDefaultProject();
-            Sequence& ss = *sp.active();
-            MediaItem tm = probeOrFail(sp, toneWav);
-            sp.media.push_back(tm);
-            QVERIFY(edit::placeMedia(sp, ss, tm.id, 0, 0, 25, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+            // A four-channel AAC file without the box: an ambisonic export with its box renamed to free space.
             ExportSettings st = aac->settings;
             st.path = path("plain.m4a");
             std::string err;
-            QVERIFY2(exportSequence(sp, ss, st, nullptr, nullptr, &err), err.c_str());
+            QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+            {
+                QFile f(QString::fromStdString(st.path));
+                QVERIFY(f.open(QIODevice::ReadWrite));
+                QByteArray bytes = f.readAll();
+                const qsizetype at = bytes.indexOf("SA3D");
+                QVERIFY(at > 0);
+                f.seek(at);
+                f.write("free", 4);
+            }
             QCOMPARE(readSpatialAudioBox(st.path), 0);
+            auto topLevel = [](const std::string& file) {
+                QFile f(QString::fromStdString(file));
+                QStringList types;
+                if (!f.open(QIODevice::ReadOnly)) return types;
+                const QByteArray b = f.readAll();
+                for (qsizetype pos = 0; pos + 8 <= b.size();) {
+                    const quint32 size = quint32(uchar(b[pos])) << 24 | quint32(uchar(b[pos + 1])) << 16 | quint32(uchar(b[pos + 2])) << 8 | uchar(b[pos + 3]);
+                    types << QString::fromLatin1(b.mid(pos + 4, 4));
+                    if (size < 8) break;
+                    pos += qsizetype(size);
+                }
+                return types;
+            };
+            QVERIFY(topLevel(st.path).last() == "moov");
             // Remuxed with the movie header first.
             const std::string fast = path("fast.m4a");
             {
@@ -4368,15 +4387,54 @@ private slots:
                 avformat_close_input(&in);
             }
             for (const std::string& f : {st.path, fast}) {
-                AudioBufferPtr before = decodeAudio(f, 48000, &err);
+                AudioBufferPtr before = decodeAmbisonic(f, 48000, &err);
                 QVERIFY2(before, err.c_str());
+                const QStringList was = topLevel(f);
                 QVERIFY2(writeSpatialAudioBox(f, 1, &err), err.c_str());
                 QCOMPARE(readSpatialAudioBox(f), 1);
+                const QStringList now = topLevel(f);
+                QCOMPARE(now.count("moov"), 1);
+                if (was.last() == "moov") {
+                    // Header last: the new one written after it, the old one now free space; nothing else moved.
+                    QCOMPARE(now.size(), was.size() + 1);
+                    QCOMPARE(now.last(), QStringLiteral("moov"));
+                    QCOMPARE(now[now.size() - 2], QStringLiteral("free"));
+                } else {
+                    QCOMPARE(now, was);
+                }
                 QVERIFY(writeSpatialAudioBox(f, 1, &err));  // a second time: already there
-                AudioBufferPtr after = decodeAudio(f, 48000, &err);
+                QCOMPARE(topLevel(f), now);
+                AudioBufferPtr after = decodeAmbisonic(f, 48000, &err);
                 QVERIFY2(after && after->samples == before->samples, f.c_str());
+                MediaItem probed;
+                QVERIFY(probeMedia(f, probed));
+                QCOMPARE(probed.ambisonic, 1);
             }
             QVERIFY(!writeSpatialAudioBox(toneWav, 1, &err));  // not MP4
+            // A stereo track is not a field: nothing to add.
+            Project sp = makeDefaultProject();
+            Sequence& ss = *sp.active();
+            MediaItem tm = probeOrFail(sp, toneWav);
+            sp.media.push_back(tm);
+            QVERIFY(edit::placeMedia(sp, ss, tm.id, 0, 0, 25, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+            ExportSettings ps = aac->settings;
+            ps.path = path("stereo-plain.m4a");
+            QVERIFY2(exportSequence(sp, ss, ps, nullptr, nullptr, &err), err.c_str());
+            const QStringList stereoBoxes = topLevel(ps.path);
+            QVERIFY(writeSpatialAudioBox(ps.path, 1, &err));
+            QCOMPARE(readSpatialAudioBox(ps.path), 0);
+            QCOMPARE(topLevel(ps.path), stereoBoxes);
+            // A file that cannot be written: refused, and left as it was.
+            const std::string locked = path("locked.m4a");
+            QFile::remove(QString::fromStdString(locked));
+            QVERIFY(QFile::copy(QString::fromStdString(fast), QString::fromStdString(locked)));
+            QFile::setPermissions(QString::fromStdString(locked), QFileDevice::ReadOwner);
+            const qint64 lockedSize = QFileInfo(QString::fromStdString(locked)).size();
+            if (!QFile(QString::fromStdString(locked)).open(QIODevice::ReadWrite)) {  // (root can write anything)
+                QVERIFY(!writeSpatialAudioBox(locked, 1, &err));
+                QCOMPARE(QFileInfo(QString::fromStdString(locked)).size(), lockedSize);
+            }
+            QFile::setPermissions(QString::fromStdString(locked), QFileDevice::ReadOwner | QFileDevice::WriteOwner);
         }
 
         // Over MCP: mark media, turn a clip with keys, follow the view or not, decode as stereo; an ambisonic sequence.
@@ -12827,6 +12885,253 @@ private slots:
         // Nothing beneath: an error.
         QVERIFY(!trackClipFollow(p, s, footage, 0, true, MotionModel::Translation, 0.3, keys, {}, nullptr, &err));
         QVERIFY(!err.empty());
+    }
+
+    void ambisonicReviewFixes() {
+        const int rate = 48000;
+        // A four-channel 16-bit WAV of a field.
+        auto writeField = [&](const std::string& file, int frames, const std::function<std::array<float, 4>(int)>& at) {
+            std::string data;
+            for (int i = 0; i < frames; ++i)
+                for (float v : at(i)) {
+                    const int16_t q = int16_t(std::lround(std::clamp(v, -1.0f, 1.0f) * 32767));
+                    data.append(reinterpret_cast<const char*>(&q), 2);
+                }
+            auto u32 = [](uint32_t v) { return std::string(reinterpret_cast<const char*>(&v), 4); };
+            auto u16 = [](uint16_t v) { return std::string(reinterpret_cast<const char*>(&v), 2); };
+            const std::string fmt = u16(1) + u16(4) + u32(uint32_t(rate)) + u32(uint32_t(rate) * 8) + u16(8) + u16(16);
+            const std::string chunks = "fmt " + u32(16) + fmt + "data" + u32(uint32_t(data.size())) + data;
+            FILE* f = std::fopen(file.c_str(), "wb");
+            QVERIFY(f);
+            const std::string head = "RIFF" + u32(uint32_t(4 + chunks.size())) + "WAVE";
+            std::fwrite(head.data(), 1, head.size(), f);
+            std::fwrite(chunks.data(), 1, chunks.size(), f);
+            std::fclose(f);
+        };
+        auto tone = [](int i) { return 0.3f * float(std::sin(2 * M_PI * 3000 * i / 48000.0)); };
+        // A 3 kHz tone from the left: W and Y alike, X and Z silent.
+        const std::string leftWav = path("rf-left.wav");
+        writeField(leftWav, rate * 2, [&](int i) { return std::array<float, 4>{tone(i), tone(i), 0, 0}; });
+        auto rms = [](const std::vector<float>& b, int nch, int ch, int from, int to) {
+            double e = 0;
+            for (int i = from; i < to; ++i) e += double(b[size_t(i) * size_t(nch) + size_t(ch)]) * b[size_t(i) * size_t(nch) + size_t(ch)];
+            return std::sqrt(e / std::max(1, to - from));
+        };
+        // An ambisonic sequence with the field on its first track.
+        auto fieldSequence = [&](Project& p, const std::string& layout) -> Sequence& {
+            p = makeDefaultProject();
+            Sequence& s = *p.active();
+            s.fps = Rational{25, 1};
+            s.audioLayout = layout;
+            MediaItem m = probeOrFail(p, leftWav);
+            m.ambisonic = 1;
+            p.media.push_back(m);
+            Clip c = makeClip(p, m, TrackKind::Audio, s);
+            c.duration = 50;
+            edit::overwrite(p, s, {TrackKind::Audio, 0}, c);
+            return s;
+        };
+        auto mixField = [&](const Project& p, const Sequence& s, int frames) {
+            std::vector<float> out(size_t(frames) * 4);
+            AudioMixer mixer;
+            mixer.mixLayout(p, s, 0, frames, out.data());
+            return out;
+        };
+        Project p;
+        Sequence& s = fieldSequence(p, "ambix");
+        QCOMPARE(p.media.back().channels, 4);
+        const auto plain = mixField(p, s, rate);
+        const double w0 = rms(plain, 4, 0, 4800, 14400);
+        QVERIFY2(w0 > 0.15 && std::fabs(rms(plain, 4, 1, 4800, 14400) - w0) < 0.01 * w0 && rms(plain, 4, 3, 4800, 14400) < 1e-3,
+                 qPrintable(QString::number(w0)));
+
+        // Bleeps cover the field in every direction: silence, or the tone in W alone.
+        {
+            Clip& c = s.audioTracks[0].clips[0];
+            Effect bleep = makeEffect(p, "bleep");
+            setBleepRanges(bleep, {{0.4, 0.6}});
+            bleep.params["mode"] = Param(1.0);  // silence
+            c.effects.push_back(bleep);
+            auto out = mixField(p, s, rate);
+            for (int ch = 0; ch < 4; ++ch) QVERIFY2(rms(out, 4, ch, 20160, 27840) < 1e-4, qPrintable(QString::number(ch)));
+            QVERIFY(std::fabs(rms(out, 4, 0, 4800, 14400) - w0) < 0.01 * w0);
+            c.effects.back().params["mode"] = Param(0.0);  // the tone
+            out = mixField(p, s, rate);
+            const double level = std::pow(10.0, -12 / 20.0) / std::sqrt(2.0);
+            QVERIFY2(std::fabs(rms(out, 4, 0, 20160, 27840) - level) < 0.02, qPrintable(QString::number(rms(out, 4, 0, 20160, 27840))));
+            for (int ch = 1; ch < 4; ++ch) QVERIFY(rms(out, 4, ch, 20160, 27840) < 1e-4);
+            // Heard as stereo too (a stereo sequence decodes the clip): the bleep still silences it.
+            Sequence st = s;
+            st.audioLayout = "stereo";
+            st.audioTracks[0].clips[0].effects.back().params["mode"] = Param(1.0);
+            std::vector<float> stereo(size_t(rate) * 2);
+            AudioMixer mixer;
+            mixer.mix(p, st, 0, rate, stereo.data());
+            QVERIFY(rms(stereo, 2, 0, 20160, 27840) < 1e-4 && rms(stereo, 2, 0, 4800, 14400) > 0.05);
+            c.effects.clear();
+        }
+
+        // Routed to a bus: the field goes through its mute and fader (not round it).
+        {
+            Bus b;
+            b.id = p.newId();
+            s.buses.push_back(b);
+            s.audioTracks[0].output = b.id;
+            auto out = mixField(p, s, rate);
+            QVERIFY(std::fabs(rms(out, 4, 0, 4800, 14400) - w0) < 0.01 * w0);
+            s.buses[0].volumeDb = -6.0206;
+            out = mixField(p, s, rate);
+            QVERIFY2(std::fabs(rms(out, 4, 0, 4800, 14400) - w0 / 2) < 0.01 * w0, qPrintable(QString::number(rms(out, 4, 0, 4800, 14400))));
+            s.buses[0].muted = true;
+            out = mixField(p, s, rate);
+            QVERIFY(rms(out, 4, 0, 4800, 14400) < 1e-6);
+            s.buses.clear();
+            s.audioTracks[0].output = 0;
+        }
+
+        // Nested in an ambisonic sequence, an ambisonic sequence stays a field (left stays left, nothing decoded);
+        // nested in a stereo one, it is heard binaurally, louder on the left.
+        {
+            Project np = p;
+            const Id inner = np.activeSequence;
+            Sequence outer = makeSequence(np, "Outer", 1920, 1080, {25, 1}, 1, 1);
+            outer.audioLayout = "ambix";
+            MediaItem nm;
+            nm.id = np.newId();
+            nm.kind = MediaKind::Sequence;
+            nm.sequenceId = inner;
+            nm.hasAudio = true;
+            nm.duration = 2;
+            np.media.push_back(nm);
+            Clip nc = makeClip(np, nm, TrackKind::Audio, outer);
+            nc.duration = 50;
+            outer.audioTracks[0].clips.push_back(nc);
+            np.sequences.push_back(outer);
+            const Sequence& o = np.sequences.back();
+            auto out = mixField(np, o, rate);
+            const double w = rms(out, 4, 0, 4800, 14400);
+            QVERIFY2(std::fabs(w - w0) < 0.02 * w0, qPrintable(QString("%1 vs %2").arg(w).arg(w0)));
+            QVERIFY(std::fabs(rms(out, 4, 1, 4800, 14400) - w) < 0.02 * w && rms(out, 4, 3, 4800, 14400) < 1e-3);
+            Sequence flat = o;
+            flat.audioLayout = "stereo";
+            std::vector<float> stereo(size_t(rate) * 2);
+            AudioMixer mixer;
+            mixer.mix(np, flat, 0, rate, stereo.data());
+            QVERIFY2(rms(stereo, 2, 0, 4800, 14400) > 1.5 * rms(stereo, 2, 1, 4800, 14400),
+                     qPrintable(QString("%1 %2").arg(rms(stereo, 2, 0, 4800, 14400)).arg(rms(stereo, 2, 1, 4800, 14400))));
+        }
+
+        // A fresh mixer (an export's) folds an ambisonic sequence through the cardioids, as downmixToStereo does.
+        {
+            std::vector<float> stereo(size_t(rate) * 2), fold(size_t(rate) * 2);
+            AudioMixer mixer;
+            mixer.mix(p, s, 0, rate, stereo.data());
+            downmixToStereo("ambix", plain.data(), rate, fold.data());
+            double worst = 0;
+            for (size_t i = 0; i < stereo.size(); ++i) worst = std::max(worst, double(std::fabs(stereo[i] - fold[i])));
+            QVERIFY2(worst < 1e-5, qPrintable(QString::number(worst)));
+        }
+
+        // Kept pitch: a field at double speed stays at 3 kHz with its direction, all four channels cut together.
+        {
+            Clip& c = s.audioTracks[0].clips[0];
+            c.speed = 2;
+            c.duration = 25;
+            c.timing.params["maintain_pitch"] = Param(1.0);
+            const auto out = mixField(p, s, rate / 2);
+            int crossings = 0;
+            for (int i = 2400; i < 21600; ++i) crossings += (out[size_t(i) * 4] < 0) != (out[size_t(i + 1) * 4] < 0);
+            const double hz = crossings / 2.0 / (19200.0 / rate);
+            QVERIFY2(std::fabs(hz - 3000) < 60, qPrintable(QString::number(hz)));
+            QVERIFY(std::fabs(rms(out, 4, 1, 2400, 21600) - rms(out, 4, 0, 2400, 21600)) < 0.03 * rms(out, 4, 0, 2400, 21600));
+            c.timing.params["maintain_pitch"] = Param(0.0);  // resampled: an octave up
+            const auto up = mixField(p, s, rate / 2);
+            crossings = 0;
+            for (int i = 2400; i < 21600; ++i) crossings += (up[size_t(i) * 4] < 0) != (up[size_t(i + 1) * 4] < 0);
+            QVERIFY(std::fabs(crossings / 2.0 / (19200.0 / rate) - 6000) < 120);
+            c.speed = 1;
+            c.duration = 50;
+        }
+        // A conformed file keeping its pitch: stretched to its new length, still 3 kHz.
+        {
+            Interpretation in;
+            in.fps = Rational{25, 1};
+            in.fileFps = Rational{50, 1};
+            in.keepPitch = true;
+            const std::string conformed = interpretedPath(leftWav, in);
+            AudioBufferPtr b = decodeAmbisonic(conformed, rate);
+            QVERIFY(b && b->channels == 4);
+            QVERIFY2(std::llabs(b->frames() - int64_t(rate) * 4) < 64, qPrintable(QString::number(b->frames())));
+            int crossings = 0;
+            for (int64_t i = rate; i < rate * 2; ++i) crossings += (b->samples[size_t(i) * 4] < 0) != (b->samples[size_t(i + 1) * 4] < 0);
+            QVERIFY2(std::fabs(crossings / 2.0 - 3000) < 60, qPrintable(QString::number(crossings / 2.0)));
+        }
+
+        // Noise reduction on a field cleans W and does the same to Y, Z and X: the sound from the left stays on the left.
+        {
+            const std::string noisy = path("rf-noisy.wav");
+            std::mt19937 rng(3);
+            std::normal_distribution<float> noise(0, 0.02f);
+            writeField(noisy, rate * 2, [&](int i) {
+                const float v = (i % 24000) < 12000 ? tone(i) : 0.0f;  // the tone half the time, noise throughout
+                return std::array<float, 4>{v + noise(rng), v + noise(rng), noise(rng), noise(rng)};
+            });
+            auto src = MediaPool::instance().audio(ambisonicAudioKey(noisy), rate);
+            QVERIFY(src && src->channels == 4);
+            Effect dn = makeEffect(p, "denoise");
+            dn.params["reduction_db"] = Param(20.0);
+            const AudioBufferPtr clean = cleanedAudio(ambisonicAudioKey(noisy), src, {&dn}, true);
+            QVERIFY(clean && clean->channels == 4 && clean->frames() == src->frames());
+            std::vector<float> a(src->samples.begin(), src->samples.end()), b(clean->samples.begin(), clean->samples.end());
+            // In the gaps the noise is down in every channel; in the tone W and Y stay alike.
+            for (int ch = 0; ch < 4; ++ch)
+                QVERIFY2(rms(b, 4, ch, 14000, 22000) < 0.5 * rms(a, 4, ch, 14000, 22000), qPrintable(QString::number(ch)));
+            const double cw = rms(b, 4, 0, 2000, 10000), cy = rms(b, 4, 1, 2000, 10000);
+            QVERIFY2(cw > 0.1 && std::fabs(cy - cw) < 0.05 * cw, qPrintable(QString("%1 %2").arg(cw).arg(cy)));
+            QVERIFY(rms(b, 4, 3, 2000, 10000) < 0.3 * cw);
+        }
+
+        // A field relinked to a stereo file is a field no longer, and media marked ambisonic with too few channels
+        // plays as channels rather than going quiet.
+        {
+            const std::string two = path("rf-stereo.wav");
+            writeWav(two, rate, 2.0, 0.3f, 0.3f);
+            Project rp = p;
+            MediaItem& m = rp.media.back();
+            m.ambisonic = 1;
+            const Id mid = m.id;
+            std::string err;
+            QVERIFY2(relinkMedia(rp, mid, two, RelinkCheck::Replace, &err), err.c_str());
+            QCOMPARE(rp.findMedia(mid)->ambisonic, 0);
+            Project lp = p;
+            lp.media.back().path = two;
+            lp.media.back().channels = 2;
+            lp.media.back().ambisonic = 1;
+            Sequence st = *lp.active();
+            st.audioLayout = "stereo";
+            std::vector<float> stereo(size_t(rate) * 2);
+            AudioMixer mixer;
+            mixer.mix(lp, st, 0, rate, stereo.data());
+            QVERIFY(rms(stereo, 2, 0, 4800, 14400) > 0.1);
+        }
+
+        // The clip's turn is set right in the scene before the view turns it: yaw 90° right undone by a view 90° left.
+        {
+            const FoaRotation clip = foaRotation(90, 0, 0), view = foaRotation(-90, 0, 0);
+            float d[4] = {1, 0.3f, 0.2f, 0.5f};
+            foaRotate(foaCompose(clip, view), d);
+            QVERIFY(std::fabs(d[1] - 0.3f) < 1e-5 && std::fabs(d[2] - 0.2f) < 1e-5 && std::fabs(d[3] - 0.5f) < 1e-5);
+            // Composed is the same as one after the other (pitch, then yaw), which summed angles are not.
+            float a[4] = {1, 0.3f, 0.2f, 0.5f}, b2[4] = {1, 0.3f, 0.2f, 0.5f}, c2[4] = {1, 0.3f, 0.2f, 0.5f};
+            foaRotate(foaRotation(0, 30, 0), a);
+            foaRotate(foaRotation(60, 0, 0), a);
+            foaRotate(foaCompose(foaRotation(0, 30, 0), foaRotation(60, 0, 0)), b2);
+            for (int k = 0; k < 4; ++k) QVERIFY(std::fabs(a[k] - b2[k]) < 1e-5);
+            foaRotate(foaRotation(60, 30, 0), c2);
+            double diff = 0;
+            for (int k = 0; k < 4; ++k) diff += std::fabs(a[k] - c2[k]);
+            QVERIFY(diff > 0.05);
+        }
     }
 
     void panFollowsThePicture() {

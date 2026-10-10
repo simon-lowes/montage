@@ -360,6 +360,8 @@ PlaybackController::PlaybackController(QObject* parent) : QObject(parent) {
     connect(worker_, &RenderWorker::scopeRendered, this, &PlaybackController::scopeFrameRendered, Qt::QueuedConnection);
     renderThread_->start();
     device_ = new MixerDevice(this);
+    device_->setAmbisonicBinaural(ambisonicBinaural_);
+    scrubMixer_.setAmbisonicBinaural(ambisonicBinaural_);
     connect(device_, &MixerDevice::levels, this, &PlaybackController::audioLevels);
     connect(device_, &MixerDevice::loudness, this, &PlaybackController::loudness);
     timer_.setTimerType(Qt::PreciseTimer);
@@ -423,6 +425,7 @@ void PlaybackController::setUseProxies(bool on) {
 void PlaybackController::setAmbisonicBinaural(bool on) {
     ambisonicBinaural_ = on;
     device_->setAmbisonicBinaural(on);
+    scrubMixer_.setAmbisonicBinaural(on);  // scrubbing sounds as playback does
 }
 
 void PlaybackController::setShowCaptions(bool on) {

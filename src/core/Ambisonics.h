@@ -26,6 +26,8 @@ struct FoaRotation {
     bool identity = true;
 };
 FoaRotation foaRotation(double yaw, double pitch, double roll);
+// `first` and then `then`, as one turn.
+FoaRotation foaCompose(const FoaRotation& first, const FoaRotation& then);
 void foaRotate(const FoaRotation& r, float* wyzx);
 
 // Two virtual cardioids 60° either side of the front: a stereo picture of the field for speakers.

@@ -49,6 +49,20 @@ FoaRotation foaRotation(double yaw, double pitch, double roll) {
     return r;
 }
 
+FoaRotation foaCompose(const FoaRotation& first, const FoaRotation& then) {
+    if (first.identity) return then;
+    if (then.identity) return first;
+    FoaRotation r;
+    r.identity = false;
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) {
+            double v = 0;
+            for (int k = 0; k < 3; ++k) v += double(then.m[i][k]) * double(first.m[k][j]);
+            r.m[i][j] = float(v);
+        }
+    return r;
+}
+
 void foaRotate(const FoaRotation& r, float* wyzx) {
     if (r.identity) return;
     const float x = wyzx[3], y = wyzx[1], z = wyzx[2];

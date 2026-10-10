@@ -1019,10 +1019,21 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             for (const AVSampleFormat* f = fmts; *f != AV_SAMPLE_FMT_NONE; ++f) ok |= (*f == want);
             if (!ok) actx->sample_fmt = fmts[0];
         }
-        if (s.audioCodec == "aac" || s.audioCodec == "libopus") actx->bit_rate = s.audioBitrate;
+        const bool field = !mono && !s.downmixStereo && ambisonicLayout(seq.audioLayout);
+        if (s.audioCodec == "aac" || s.audioCodec == "libopus") actx->bit_rate = s.audioBitrate * (field ? 2 : 1);  // per pair of channels
         actx->time_base = AVRational{1, actx->sample_rate};
         if (o.oc->oformat->flags & AVFMT_GLOBALHEADER) actx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-        if ((rc = avcodec_open2(actx, codec, nullptr)) < 0) return "Cannot open audio encoder: " + averr(rc);
+        AVDictionary* opts = nullptr;
+        if (field && s.audioCodec == "aac") {
+            // The field's channels are not left and right: joint stereo coding (mid/side, intensity) and noise
+            // substitution would mix or replace their differences, which are the directions.
+            av_dict_set(&opts, "aac_ms", "0", 0);
+            av_dict_set(&opts, "aac_is", "0", 0);
+            av_dict_set(&opts, "aac_pns", "0", 0);
+        }
+        rc = avcodec_open2(actx, codec, &opts);
+        av_dict_free(&opts);
+        if (rc < 0) return "Cannot open audio encoder: " + averr(rc);
         avcodec_parameters_from_context(ast->codecpar, actx);
         ast->time_base = actx->time_base;
         if (actx->frame_size > 0) audioFrameSize = actx->frame_size;
@@ -1629,7 +1640,11 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
     if (ok && ambisonicLayout(layout) && !s.downmixStereo && !s.audioCodec.empty() && s.audioCodec != "none") {
         std::string ext = std::filesystem::path(s.path).extension().string();
         for (char& ch : ext) ch = char(std::tolower(static_cast<unsigned char>(ch)));
-        if ((ext == ".mp4" || ext == ".m4a" || ext == ".mov" || ext == ".m4v") && !writeSpatialAudioBox(s.path, 1, error)) ok = false;
+        // The export is good either way: without the box players hear four channels rather than a field, which is no
+        // reason to throw the file away.
+        std::string why;
+        if ((ext == ".mp4" || ext == ".m4a" || ext == ".mov" || ext == ".m4v") && !writeSpatialAudioBox(s.path, 1, &why))
+            qWarning("Spatial audio metadata not added to %s: %s", s.path.c_str(), why.c_str());
     }
     // Never leave a truncated file behind (the output is closed by now), but
     // don't touch an existing file if we failed before writing to it.
