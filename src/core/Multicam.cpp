@@ -116,6 +116,44 @@ bool timecodeOffsets(const Project& p, const std::vector<Id>& media, std::vector
     return true;
 }
 
+Sequence flattenedMulticam(const Project& p, const Sequence& in) {
+    Sequence s = in;
+    std::vector<Id> clips;
+    for (const auto* list : {&s.videoTracks, &s.audioTracks})
+        for (const Track& t : *list)
+            for (const Clip& c : t.clips)
+                if (multicamSequence(p, c)) clips.push_back(c.id);
+    if (clips.empty()) return s;
+    // The mix of every source becomes the sound of the angle seen with it (else the first source's).
+    for (Track& t : s.audioTracks)
+        for (Clip& a : t.clips) {
+            const Sequence* mc = multicamSequence(p, a);
+            if (!mc || a.audioAngle >= 0) continue;
+            int angle = -1;
+            for (Id other : edit::linkedClips(s, a.id))
+                if (const Clip* v = edit::clipById(s, other); v && v->mediaId == a.mediaId && edit::locate(s, other)->track.kind == TrackKind::Video)
+                    angle = v->angle;
+            const int track = angle >= 0 ? angleAudioTrack(*mc, angle) : -1;
+            a.audioAngle = track >= 0 ? track : mc->audioTracks.empty() ? -1 : 0;
+        }
+    Project scratch = p;  // (new ids only; the media and sequences are the project's)
+    const edit::Result r = edit::flattenMulticam(scratch, s, clips);
+    if (!r.ok) return s;
+    // Picture and sound cut from one source together stay linked.
+    std::vector<Clip*> made;
+    for (auto* list : {&s.videoTracks, &s.audioTracks})
+        for (Track& t : *list)
+            for (Clip& c : t.clips)
+                if (std::find(r.created.begin(), r.created.end(), c.id) != r.created.end()) made.push_back(&c);
+    for (Clip* v : made)
+        for (Clip* a : made)
+            if (v != a && !v->linkGroup && !a->linkGroup && v->mediaId == a->mediaId && v->start == a->start &&
+                v->duration == a->duration && edit::locate(s, v->id)->track.kind == TrackKind::Video &&
+                edit::locate(s, a->id)->track.kind == TrackKind::Audio)
+                v->linkGroup = a->linkGroup = scratch.newId();
+    return s;
+}
+
 namespace edit {
 
 namespace {

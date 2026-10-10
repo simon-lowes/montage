@@ -15,6 +15,9 @@ public:
     TimelineBuilder(Project& p, const std::string& name, Rational fps, const MediaProber& probe);
 
     Sequence& sequence() { return seq_; }
+    Rational sequenceFps() const { return seq_.fps; }
+    int sequenceWidth() const { return seq_.width; }
+    int sequenceHeight() const { return seq_.height; }
     // Track `index` of a kind, adding tracks up to it.
     Track& track(TrackKind kind, int index);
     // The media item for a file: the project's own if it already has the path,

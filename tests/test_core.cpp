@@ -6402,6 +6402,209 @@ private slots:
         QVERIFY(!importEdl(p, "nothing here", {25, 1}).ok);
     }
 
+    void interchangeCompoundAndMulticam() {
+        Project p = makeDefaultProject();
+        auto addMedia = [&](const char* name, bool video, bool audio) {
+            MediaItem m;
+            m.id = p.newId();
+            m.kind = video ? MediaKind::Video : MediaKind::Audio;
+            m.name = name;
+            m.path = std::string("/nonexistent/") + name;
+            m.duration = 20.0;
+            m.width = 1920;
+            m.height = 1080;
+            m.fps = {30, 1};
+            m.hasVideo = video;
+            m.hasAudio = audio;
+            p.media.push_back(m);
+            return m.id;
+        };
+        const Id camA = addMedia("CamA.mov", true, true), camB = addMedia("CamB.mov", true, true);
+        const Id lav = addMedia("Lav.wav", false, true), broll = addMedia("Broll.mov", true, true);
+        // A multicam clip: the lav first, A half a second later, B 1.5 s later.
+        std::string err;
+        const Id mcMedia = makeMulticam(p, {camA, camB, lav}, {0.5, 1.5, 0.0}, "Interview", &err);
+        QVERIFY2(mcMedia, err.c_str());
+        // A compound clip: b-roll with its sound, a title over it.
+        Sequence inner = makeSequence(p, "Inner", 1920, 1080, {30, 1}, 2, 1);
+        {
+            Clip v = makeClip(p, *p.findMedia(broll), TrackKind::Video, inner), a = makeClip(p, *p.findMedia(broll), TrackKind::Audio, inner);
+            v.start = a.start = 0;
+            v.duration = a.duration = 60;
+            v.sourceIn = a.sourceIn = 30;
+            v.linkGroup = a.linkGroup = p.newId();
+            inner.videoTracks[0].clips.push_back(v);
+            inner.audioTracks[0].clips.push_back(a);
+            Clip t = makeGeneratorClip(p, "title", 30);
+            t.start = 15;
+            t.generator.strings["text"] = "Inside";
+            inner.videoTracks[1].clips.push_back(t);
+        }
+        MediaItem cm;
+        cm.id = p.newId();
+        cm.kind = MediaKind::Sequence;
+        cm.name = "Inner";
+        cm.sequenceId = inner.id;
+        cm.hasVideo = cm.hasAudio = true;
+        cm.width = 1920;
+        cm.height = 1080;
+        cm.fps = {30, 1};
+        cm.duration = 2.0;
+        p.sequences.push_back(inner);
+        p.media.push_back(cm);
+        // The cut: the multicam clip from its frame 60, angle A then B from frame 45 (sound following), then the
+        // compound clip from its frame 10.
+        Sequence& s = *p.active();
+        QVERIFY(edit::placeMedia(p, s, mcMedia, 0, 60, 150, V1, A1, false).ok);
+        QVERIFY(edit::switchAngle(p, s, trackAt(s, V1)->clips.at(0).id, 1, 45, true, true).ok);
+        QVERIFY(edit::placeMedia(p, s, cm.id, 90, 10, 50, V1, A1, false).ok);
+        QCOMPARE(trackAt(s, V1)->clips.size(), size_t(3));
+        QCOMPARE(trackAt(s, A1)->clips.at(0).audioAngle, -1);  // the whole mix
+        QCOMPARE(trackAt(s, A1)->clips.at(1).audioAngle, 1);
+
+        // FCPXML: a multicam (an mc-angle per source) and a compound sequence among the resources.
+        const std::string xml = exportFcpXml(p, s);
+        for (const char* want : {"<multicam ", "<mc-angle name=\"CamA.mov\" angleID=\"angle-1\"", "<mc-angle name=\"Lav.wav\" angleID=\"angle-3\"",
+                                 "<mc-clip ", "angleID=\"angle-2\" srcEnable=\"all\"", "<ref-clip ", "Inside"})
+            QVERIFY2(xml.find(want) != std::string::npos, want);
+        // Read back (into a project without the media): the same cut, the same nested sequences.
+        Project q = makeDefaultProject();
+        ImportResult r = importXmlTimeline(q, xml);
+        QVERIFY2(r.ok, r.error.c_str());
+        QVERIFY(r.warnings.empty());
+        const Sequence& back = *q.findSequence(r.sequence);
+        QCOMPARE(q.activeSequence, back.id);
+        const auto& vc = trackAt(back, V1)->clips;
+        const auto& ac = trackAt(back, A1)->clips;
+        QCOMPARE(vc.size(), size_t(3));
+        QCOMPARE(ac.size(), size_t(3));
+        const MediaItem* mcBack = q.findMedia(vc[0].mediaId);
+        QVERIFY(mcBack && mcBack->kind == MediaKind::Sequence);
+        QCOMPARE(vc[1].mediaId, vc[0].mediaId);  // one multicam, used twice
+        const Sequence* mc = q.findSequence(mcBack->sequenceId);
+        QVERIFY(mc && mc->multicam);
+        QCOMPARE(angleNames(*mc), (std::vector<std::string>{"CamA.mov", "CamB.mov"}));
+        QCOMPARE(mc->audioTracks.size(), size_t(3));
+        QCOMPARE(mc->videoTracks[0].clips.at(0).start, FrameTime(15));
+        QCOMPARE(mc->videoTracks[1].clips.at(0).start, FrameTime(45));
+        QCOMPARE(mc->audioTracks[2].clips.at(0).start, FrameTime(0));
+        QCOMPARE(angleAudioTrack(*mc, 1), 1);
+        QCOMPARE(audioTrackAngle(*mc, 2), -1);
+        QCOMPARE(vc[0].start, FrameTime(0));
+        QCOMPARE(vc[0].duration, FrameTime(45));
+        QCOMPARE(vc[0].sourceIn, 60.0);
+        QCOMPARE(vc[0].angle, 0);
+        QCOMPARE(ac[0].audioAngle, 0);  // the mix arrives as the seen angle's own sound
+        QCOMPARE(vc[1].angle, 1);
+        QCOMPARE(vc[1].sourceIn, 105.0);
+        QCOMPARE(ac[1].audioAngle, 1);
+        QVERIFY(vc[1].linkGroup && vc[1].linkGroup == ac[1].linkGroup);
+        // The compound clip and its sequence.
+        const MediaItem* inBack = q.findMedia(vc[2].mediaId);
+        QVERIFY(inBack && inBack->kind == MediaKind::Sequence && inBack->name == "Inner");
+        QCOMPARE(vc[2].start, FrameTime(90));
+        QCOMPARE(vc[2].duration, FrameTime(40));
+        QCOMPARE(vc[2].sourceIn, 10.0);
+        QCOMPARE(ac[2].mediaId, vc[2].mediaId);
+        QVERIFY(vc[2].linkGroup && vc[2].linkGroup == ac[2].linkGroup);
+        const Sequence* nested = q.findSequence(inBack->sequenceId);
+        QVERIFY(nested && !nested->multicam);
+        QCOMPARE(nested->videoTracks.at(0).clips.size(), size_t(1));
+        QCOMPARE(nested->videoTracks[0].clips[0].sourceIn, 30.0);
+        QCOMPARE(nested->videoTracks[0].clips[0].duration, FrameTime(60));
+        QCOMPARE(nested->videoTracks[0].clips[0].linkGroup, nested->audioTracks.at(0).clips.at(0).linkGroup);
+        QCOMPARE(nested->videoTracks.at(1).clips.at(0).generator.s("text"), std::string("Inside"));
+        QCOMPARE(nested->videoTracks[1].clips[0].start, FrameTime(15));
+        // Each file once, though the multicam, the compound clip and the cut all reach them.
+        int files = 0;
+        for (const MediaItem& m : q.media) files += m.kind != MediaKind::Sequence;
+        QCOMPARE(files, 4);
+        // The project's sequence is found even with compound sequences written before it.
+        QCOMPARE(back.duration(), FrameTime(130));
+
+        // As Final Cut writes them: random angle ids, an hour's timecode start, picture from one angle and sound from
+        // another, a compound clip of sound alone.
+        {
+            const std::string fcp = readData("interchange/final-cut-multicam.fcpxml");
+            Project f = makeDefaultProject();
+            ImportResult rf = importXmlTimeline(f, fcp);
+            QVERIFY2(rf.ok, rf.error.c_str());
+            const Sequence& sf = *f.findSequence(rf.sequence);
+            QCOMPARE(sf.name, std::string("Scene 4"));
+            const Clip& mv = trackAt(sf, V1)->clips.at(0);
+            QCOMPARE(mv.angle, 1);  // Cam B's picture
+            QCOMPARE(mv.sourceIn, 250.0);  // 10 s into the multicam
+            QCOMPARE(mv.duration, FrameTime(200));
+            const Clip& ma = trackAt(sf, A1)->clips.at(0);
+            QCOMPARE(ma.audioAngle, 0);  // Cam A's sound
+            QCOMPARE(ma.mediaId, mv.mediaId);
+            const Sequence* fm = f.findSequence(f.findMedia(mv.mediaId)->sequenceId);
+            QVERIFY(fm && fm->multicam);
+            QCOMPARE(angleNames(*fm), (std::vector<std::string>{"Cam A", "Cam B"}));
+            QCOMPARE(fm->videoTracks[1].clips.at(0).start, FrameTime(50));
+            // The connected compound clip of sound alone: on A2, a second into the multicam clip, its picture absent.
+            const Clip& tone = trackAt(sf, TrackRef{TrackKind::Audio, 1})->clips.at(0);
+            QCOMPARE(tone.start, FrameTime(25));
+            QCOMPARE(tone.sourceIn, 25.0);
+            const MediaItem* tm = f.findMedia(tone.mediaId);
+            QVERIFY(tm && tm->kind == MediaKind::Sequence && !tm->hasVideo && tm->hasAudio);
+            QCOMPARE(trackAt(sf, V1)->clips.size(), size_t(1));
+            QCOMPARE(rf.offline.size(), size_t(3));
+        }
+
+        // The other formats have no multicam clips: the angles' own clips, linked, in their place.
+        const Sequence flat = flattenedMulticam(p, s);
+        const auto& fv = trackAt(flat, V1)->clips;
+        const auto& fa = trackAt(flat, A1)->clips;
+        QCOMPARE(fv.size(), size_t(3));
+        QCOMPARE(fv[0].mediaId, camA);
+        QCOMPARE(fv[0].sourceIn, 45.0);  // multicam frame 60, 45 frames into A
+        QCOMPARE(fv[1].mediaId, camB);
+        QCOMPARE(fv[1].sourceIn, 60.0);
+        QCOMPARE(fa.at(0).mediaId, camA);  // the mix: angle A's own sound
+        QCOMPARE(fa.at(1).mediaId, camB);
+        QVERIFY(fv[0].linkGroup && fv[0].linkGroup == fa[0].linkGroup && fv[1].linkGroup == fa[1].linkGroup);
+        QCOMPARE(fv[2].mediaId, cm.id);  // a compound clip stays
+        const std::string otio = exportOtio(p, s), fcp7 = exportFcp7Xml(p, s), edl = exportEdl(p, s);
+        for (const std::string& out : {otio, fcp7, edl}) {
+            QVERIFY(out.find("CamB.mov") != std::string::npos);
+            QVERIFY(out.find("Interview") == std::string::npos);
+        }
+        // OTIO nests the compound clip as Stacks (its picture in V1's, its sound in A1's), FCP 7 XML as a sequence
+        // inside the clip item: both read back as one compound clip with its own sequence.
+        for (int flavour = 0; flavour < 2; ++flavour) {
+            Project q2 = makeDefaultProject();
+            ImportResult r2 = flavour == 0 ? importOtio(q2, otio) : importXmlTimeline(q2, fcp7);
+            QVERIFY2(r2.ok, r2.error.c_str());
+            QVERIFY(r2.warnings.empty());
+            const Sequence& b2 = *q2.findSequence(r2.sequence);
+            QCOMPARE(q2.activeSequence, b2.id);
+            const auto& v2 = trackAt(b2, V1)->clips;
+            const auto& a2 = trackAt(b2, A1)->clips;
+            QCOMPARE(v2.size(), size_t(3));
+            QCOMPARE(q2.findMedia(v2[1].mediaId)->name, std::string("CamB.mov"));
+            QCOMPARE(v2[1].sourceIn, 60.0);
+            const MediaItem* c2 = q2.findMedia(v2[2].mediaId);
+            QVERIFY(c2 && c2->kind == MediaKind::Sequence);
+            QCOMPARE(c2->name, std::string("Inner"));
+            QCOMPARE(v2[2].start, FrameTime(90));
+            QCOMPARE(v2[2].duration, FrameTime(40));
+            QCOMPARE(v2[2].sourceIn, 10.0);
+            QCOMPARE(a2.at(2).mediaId, v2[2].mediaId);  // one sequence for its picture and its sound
+            QVERIFY(v2[2].linkGroup && v2[2].linkGroup == a2[2].linkGroup);
+            const Sequence* n2 = q2.findSequence(c2->sequenceId);
+            QVERIFY(n2);
+            QCOMPARE(n2->name, std::string("Inner"));
+            QCOMPARE(n2->videoTracks.at(0).clips.at(0).sourceIn, 30.0);
+            QCOMPARE(n2->videoTracks[0].clips[0].duration, FrameTime(60));
+            QCOMPARE(n2->audioTracks.at(0).clips.size(), size_t(1));
+            QCOMPARE(n2->videoTracks.at(1).clips.at(0).generator.s("text"), std::string("Inside"));
+            int seqs = 0;
+            for (const Sequence& sq : q2.sequences) seqs += sq.name == "Inner";
+            QCOMPARE(seqs, 1);
+        }
+    }
+
     void syncOffsetsAndRepair() {
         Fixture fx;
         auto r = placeMedia(fx.p, fx.s(), fx.media, 30, 30, 90, V1, A1, false);
