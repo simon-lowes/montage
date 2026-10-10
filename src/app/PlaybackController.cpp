@@ -41,6 +41,7 @@ public:
         int direction = 0;  // playback step (+1, -2 ...), 0 when paused
         bool captions = false;
         double cacheScale = 0;  // the scale rendered previews are kept at (playback's), 0 = scale
+        StereoView stereoView = StereoView::Left;  // how a stereo 3D sequence's eyes are shown
     };
     void request(const Request& r) {
         {
@@ -91,6 +92,7 @@ private:
         o.scale = r.scale;
         o.useProxies = r.proxies;
         o.captions = r.captions;
+        o.stereoView = r.stereoView;
         return signalImage(renderProgramFrame(*r.project, *s, t, o));
     }
 
@@ -111,7 +113,7 @@ private:
 
     bool sameContext(const Request& r) const {
         return r.project == ctx_.project && r.sequence == ctx_.sequence && r.scale == ctx_.scale && r.proxies == ctx_.proxies &&
-               r.captions == ctx_.captions;
+               r.captions == ctx_.captions && r.stereoView == ctx_.stereoView;
     }
 
     Rendered render(const Request& r, FrameTime t) {
@@ -121,6 +123,7 @@ private:
         o.scale = r.scale;
         o.useProxies = r.proxies;
         o.captions = r.captions;
+        o.stereoView = r.stereoView;
         o.displaySpace = "rec709";  // HDR and wide-gamut sequences are previewed tone mapped to SDR
         // A rendered preview of this frame (kept at playback's scale) is used as it is, paused too.
         RenderOptions co = o;
@@ -418,6 +421,12 @@ void PlaybackController::setShowCaptions(bool on) {
     requestFrame();
 }
 
+void PlaybackController::setStereoView(StereoView v) {
+    if (stereoView_ == v) return;
+    stereoView_ = v;
+    requestFrame();
+}
+
 int PlaybackController::playStep() const {
     if (speed_ == 0) return 0;
     int step = int(std::lround(speed_));
@@ -429,7 +438,7 @@ FrameTime PlaybackController::clampToSequence(FrameTime t) const { return std::m
 void PlaybackController::requestFrame() {
     if (!sequence()) return;
     // Paused frames render at full quality; playback uses the preview scale.
-    worker_->request({project_, sequenceId_, position_, isPlaying() ? scale_ : 1.0, useProxies_, playStep(), showCaptions_, scale_});
+    worker_->request({project_, sequenceId_, position_, isPlaying() ? scale_ : 1.0, useProxies_, playStep(), showCaptions_, scale_, stereoView_});
 }
 
 void PlaybackController::seek(FrameTime t) {
@@ -593,7 +602,7 @@ void PlaybackController::tick() {
     }
     if (t != position_) {
         position_ = t;
-        worker_->request({project_, sequenceId_, t, scale_, useProxies_, playStep(), showCaptions_, scale_});
+        worker_->request({project_, sequenceId_, t, scale_, useProxies_, playStep(), showCaptions_, scale_, stereoView_});
         emit positionChanged(t);
     }
 }
@@ -634,6 +643,7 @@ RenderOptions PlaybackController::renderOptions() const {
     o.scale = scale_;
     o.useProxies = useProxies_;
     o.captions = showCaptions_;
+    o.stereoView = stereoView_;
     o.displaySpace = "rec709";
     return o;
 }

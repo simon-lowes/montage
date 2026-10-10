@@ -1250,7 +1250,7 @@ void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos)
             }
         // 360° footage: placed in a flat sequence as a view out of the sphere (Reframe 360°).
         bool all360 = true;
-        for (Id id : pictures) all360 = all360 && state_->project().findMedia(id)->projection == "equirect";
+        for (Id id : pictures) all360 = all360 && !state_->project().findMedia(id)->projection.empty();  // 360° or VR180
         QAction* sphere = menu.addAction(tr("360° Footage"), this, [this, pictures, all360] {
             setMediaProjection(pictures, all360 ? std::string() : std::string("equirect"));
         });

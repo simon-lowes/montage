@@ -35,6 +35,8 @@ private:
     QDoubleSpinBox* par_ = nullptr;
     QComboBox* alpha_ = nullptr;
     QComboBox* fields_ = nullptr;
+    QComboBox* stereo_ = nullptr;
+    QCheckBox* swapEyes_ = nullptr;
     // Camera RAW (stills and CinemaDNG).
     QDoubleSpinBox* exposure_ = nullptr;
     QComboBox* whiteBalance_ = nullptr;

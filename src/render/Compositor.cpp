@@ -45,6 +45,7 @@
 #include "media/Faces.h"
 #include "media/Rife.h"
 #include "media/SuperScale.h"
+#include "core/Interpretation.h"
 
 namespace montage {
 
@@ -721,6 +722,12 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
         } else if (m->kind == MediaKind::Video || m->kind == MediaKind::Image) {
             if (!m->hasVideo && m->kind != MediaKind::Image) return {};
             std::string path = (o.useProxies && !m->proxyPath.empty()) ? m->proxyPath : m->path;
+            // Stereoscopic footage: the eye being rendered (a clip's Stereo 3D effect can swap them).
+            if (!m->stereo.empty() && path == m->path) {
+                int eye = o.eye;
+                if (const Effect* s3d = enabledEffect(c, "stereo_3d"); s3d && s3d->p("swap_eyes", lt, 0) > 0.5) eye = 1 - eye;
+                if (eye) path = eyePath(path, 1);
+            }
             mw = m->width > 0 ? m->width : SW;
             mh = m->height > 0 ? m->height : SH;
             // Reframe 360: the clip is a view, at the sequence's shape, out of the whole sphere.
@@ -733,10 +740,11 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             const double vrFov = vr ? vr->p("fov", lt, 100) : 0;
             const SphereView vrView = vr ? SphereView(std::clamp(int(vr->p("projection", lt, 0)), 0, 2)) : SphereView::Flat;
             if (vr) {
-                // As much of the sphere as the view's pixels need: 360 / fov times its width, up to the footage's own.
+                // As much of the sphere as the view's pixels need: 360 / fov times its width (180 / fov for VR180), up
+                // to the footage's own.
                 const double across = vrView == SphereView::Flat ? std::clamp(vrFov, 20.0, 170.0) : 180.0;
                 const int full = m->width > 0 ? m->width : viewW * 2;
-                w = std::clamp(int(std::ceil(viewW * 360.0 / across)), 2, full);
+                w = std::clamp(int(std::ceil(viewW * projectionSpan(m->projection) / across)), 2, full);
                 h = std::max(1, int(std::lround(double(w) * (m->height > 0 ? m->height : full / 2) / full)));
             }
             // Super Scale: shown larger than it was shot, the frame is decoded at its own size and enlarged by
@@ -897,7 +905,8 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             }
             if (vr) reframed = true;
             if (vr)
-                src = reframeEquirect(src, vr->p("yaw", lt, 0), vr->p("pitch", lt, 0), vr->p("roll", lt, 0), vrFov, vrView, viewW, viewH);
+                src = reframeEquirect(src, vr->p("yaw", lt, 0), vr->p("pitch", lt, 0), vr->p("roll", lt, 0), vrFov, vrView, viewW, viewH,
+                                      projectionSpan(m->projection));
             // Input transform: the media's space into the sequence's working space.
             convertColor(src, mediaColorSpace(*m), sequenceColorSpace(seq), seq.hdrPeakNits);
         } else {
@@ -936,8 +945,16 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
     for (const Effect* e : chain)
         if (e->type == "redact_faces") applyVideoEffect(*e, lt, src, pixelScale, sourceSeconds);
     for (const Effect* e : chain)
-        if (e->type != "video_denoise" && e->type != "super_scale" && e->type != "reframe_360" && e->type != "redact_faces")  // those ran already
+        if (e->type != "video_denoise" && e->type != "super_scale" && e->type != "reframe_360" && e->type != "redact_faces" &&
+            e->type != "stereo_3d")  // those ran already (Stereo 3D is placed below)
             applyVideoEffect(*e, lt, src, pixelScale, sourceSeconds);
+    // Stereo 3D: in a stereoscopic sequence the eyes are moved apart by the clip's depth (into the screen when
+    // positive, out of it when negative); half the separation each way.
+    if (seq.stereo3d && !(c.isGenerator() && c.generator.type == "adjustment"))
+        if (const Effect* s3d = enabledEffect(c, "stereo_3d")) {
+            const double half = s3d->p("depth", lt, 0) / 100.0 * SW / 2;
+            g.px += o.eye ? half : -half;
+        }
     if (identityLayer(src, g, SW, SH, o.scale)) return src;  // a full-frame clip: no copy
     return transformLayer(src, g, SW, SH, o.scale);
 }
@@ -1083,10 +1100,20 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
 }
 
 Image renderProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o) {
-    Image img = renderSequenceFrame(p, seq, t, o);
-    flattenOver(img, 0, 0, 0);
-    if (o.captions && o.depth == 0)
-        if (const CaptionTrack* track = captionTrackFor(seq)) drawCaption(img, *track, t, &sequenceColorSpace(seq));
+    auto eyeFrame = [&](int eye) {
+        RenderOptions e = o;
+        e.eye = eye;
+        Image img = renderSequenceFrame(p, seq, t, e);
+        flattenOver(img, 0, 0, 0);
+        if (o.captions && o.depth == 0)
+            if (const CaptionTrack* track = captionTrackFor(seq)) drawCaption(img, *track, t, &sequenceColorSpace(seq));
+        return img;
+    };
+    Image img;
+    if (seq.stereo3d && o.depth == 0 && o.stereoView != StereoView::Left)
+        img = o.stereoView == StereoView::Right ? eyeFrame(1) : combineStereo(eyeFrame(0), eyeFrame(1), o.stereoView);
+    else
+        img = eyeFrame(seq.stereo3d && o.depth == 0 ? 0 : o.eye);
     if (!o.displaySpace.empty() && o.depth == 0)
         if (const ColorSpace* d = findColorSpace(o.displaySpace)) convertColor(img, sequenceColorSpace(seq), *d, seq.hdrPeakNits);
     return img;

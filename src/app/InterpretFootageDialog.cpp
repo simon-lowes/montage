@@ -154,6 +154,25 @@ InterpretFootageDialog::InterpretFootageDialog(const MediaItem& first, int count
     fields_->setEnabled(video);
     form->addRow(tr("Alpha:"), alpha_);
     form->addRow(tr("Field order:"), fields_);
+    // Stereoscopic 3D: how the two eyes are packed in each frame, for files whose metadata says nothing (or is wrong).
+    stereo_ = new QComboBox(this);
+    stereo_->setObjectName(QStringLiteral("interpretStereo"));
+    const QString detected = first.stereo.empty() || !now.stereo.empty() ? QString() : QStringLiteral(" (%1)").arg(tr("detected"));
+    stereo_->addItem(tr("As the file says") + detected, QString());
+    stereo_->addItem(tr("Not stereo (one picture)"), QStringLiteral("none"));
+    stereo_->addItem(tr("Side by side, full width eyes"), QStringLiteral("sbs"));
+    stereo_->addItem(tr("Side by side, squeezed (half width)"), QStringLiteral("sbs_half"));
+    stereo_->addItem(tr("Top and bottom, full height eyes"), QStringLiteral("tb"));
+    stereo_->addItem(tr("Top and bottom, squeezed (half height)"), QStringLiteral("tb_half"));
+    stereo_->setCurrentIndex(std::max(0, stereo_->findData(QString::fromStdString(now.stereo))));
+    stereo_->setToolTip(tr("In a stereoscopic 3D sequence each eye reads its own half of the frame; elsewhere the left eye is shown"));
+    stereo_->setEnabled(video);
+    swapEyes_ = new QCheckBox(tr("Swap left and right eyes"), this);
+    swapEyes_->setObjectName(QStringLiteral("interpretSwapEyes"));
+    swapEyes_->setChecked(now.swapEyes);
+    swapEyes_->setEnabled(video);
+    form->addRow(tr("Stereo 3D:"), stereo_);
+    form->addRow(QString(), swapEyes_);
     lay->addLayout(form);
 
     // Camera RAW: how the sensor data is developed.
@@ -235,6 +254,8 @@ Interpretation InterpretFootageDialog::interpretation() const {
     if (conformPar_->isChecked()) i.par = par_->value();
     i.alpha = alpha_->currentData().toString().toStdString();
     i.fields = fields_->currentData().toString().toStdString();
+    i.stereo = stereo_->currentData().toString().toStdString();
+    i.swapEyes = swapEyes_->isChecked();
     if (raw_) {
         i.rawExposure = exposure_->value();
         i.rawTemperature = whiteBalance_->currentData().toDouble() == 0 ? 0 : temperature_->value();

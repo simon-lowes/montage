@@ -9,6 +9,7 @@
 
 #include "CameraRaw.h"
 #include "Image.h"
+#include "core/Interpretation.h"
 #include "core/Model.h"
 
 struct AVFormatContext;
@@ -103,6 +104,9 @@ private:
     double timeScale_ = 1;
     double par_ = 0;
     std::string alpha_, fields_;
+    Interpretation interp_;
+    std::string stereo_;  // stereoscopic footage's packing ("sbs", "sbs_half", "tb", "tb_half"), "" = flat
+    int eye_ = 0;         // the eye read (0 left, 1 right), after any swap
     std::shared_ptr<VectorDocument> vector_;  // a Lottie animation or SVG, rendered instead of decoded
     AVFrame* raw_ = nullptr;                  // a camera raw still, developed once (RGB48), or a CinemaDNG run's current frame
     std::unique_ptr<ImageSequence> rawSequence_;  // a run of camera raw frames (media/ImageSequence.h)

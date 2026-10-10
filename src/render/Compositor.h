@@ -6,6 +6,7 @@
 #include <mutex>
 #include <vector>
 
+#include "Stereo.h"
 #include "core/Model.h"
 #include "media/Image.h"
 
@@ -21,6 +22,9 @@ struct RenderOptions {
     bool captions = false;     // draw the visible caption track over the program
     std::string displaySpace;  // program frames converted to this space (ColorSpace.h id) for viewing; "" = as is
     int soloVideoTrack = -1;   // render only this video track (a multicam angle); not passed to nested sequences
+    int eye = 0;               // stereoscopic 3D: the eye rendered (0 left, 1 right)
+    // How renderProgramFrame shows a stereoscopic sequence's two eyes (render/Stereo.h); flat sequences ignore it.
+    StereoView stereoView = StereoView::Left;
 };
 
 // Composites all video tracks of `seq` at timeline frame `t`.

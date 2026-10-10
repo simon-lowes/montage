@@ -217,6 +217,12 @@ std::vector<EffectInfo> buildCatalog() {
                   num("roll", "Roll (°)", -180, 180, 0, 0.1), num("fov", "Field of View (°)", 20, 330, 100, 0.1),
                   choice("projection", "Projection", {"Flat", "Little Planet", "Tunnel"}, 0)},
                  {}});
+    // Stereo 3D (Premiere's and Resolve's stereoscopic convergence): in a stereoscopic sequence, a clip's place in
+    // depth, by moving its eyes apart (positive into the screen, negative out of it, as a % of the width), and its eyes
+    // swapped when stereo footage was shot or packed the other way round (render/Stereo.h).
+    c.push_back({"stereo_3d", "Stereo 3D", EffectCategory::VideoFilter, "Transform",
+                 {num("depth", "Depth (% of width)", -10, 10, 0, 0.05), choice("swap_eyes", "Eyes", {"As Shot", "Swapped"}, 0)},
+                 {}});
     {
         // OpenColorIO transform from a config file, a built-in config or $OCIO (render/Ocio.h).
         EffectInfo ocio{"ocio", "OpenColorIO Transform", EffectCategory::VideoFilter, "Color",

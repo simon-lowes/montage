@@ -32,6 +32,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/spherical.h>
+#include <libavutil/stereo3d.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/mastering_display_metadata.h>
 #include <libavutil/opt.h>
@@ -726,10 +727,20 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     if (imageSequence) av_opt_set_int(o.oc->priv_data, "start_number", s.startNumber, 0);
     o.pkt = av_packet_alloc();
     const AVRational fps{seq.fps.num, seq.fps.den};
-    int W = s.width > 0 ? s.width : seq.width;
-    int H = s.height > 0 ? s.height : seq.height;
+    // A stereoscopic sequence: its eyes packed as asked (two eyes across or down make the frame twice the size).
+    StereoView stereoView = StereoView::Left;
+    if (seq.stereo3d && !stereoViewFromName(s.stereo.empty() ? "sbs" : s.stereo, stereoView))
+        return fail("Unknown stereo output " + s.stereo + " (sbs, sbs_half, tb, tb_half, left, right or anaglyph)");
+    if (stereoView == StereoView::Difference) return fail("The eyes' difference is for checking, not delivering");
+    int across = 1, down = 1;
+    stereoPacking(stereoView, across, down);
+    // A chosen size is each eye's.
+    int W = (s.width > 0 ? s.width : seq.width) * across;
+    int H = (s.height > 0 ? s.height : seq.height) * down;
     W += W & 1;  // most codecs need even dimensions
     H += H & 1;
+    if (across == 2) W += (W / 2) & 1;  // each eye even too
+    if (down == 2) H += (H / 2) & 1;
     const int sr = s.sampleRate > 0 ? s.sampleRate : seq.sampleRate;
 
     const ColorSpace& seqSpace = sequenceColorSpace(seq);
@@ -873,6 +884,23 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         avcodec_parameters_from_context(o.vst->codecpar, o.vctx);
         o.vst->time_base = o.vctx->time_base;
         o.vst->avg_frame_rate = fps;
+        // Packed stereoscopic 3D: stereo metadata, so players and headsets show the eyes apart (MP4/MOV st3d, written
+        // only when asked to go beyond the standard, as sv3d is; Matroska StereoMode).
+        const bool packed = seq.stereo3d && stereoView != StereoView::Left && stereoView != StereoView::Right && stereoView != StereoView::Anaglyph;
+        if (packed) {
+            if (AVStereo3D* s3d = av_stereo3d_alloc()) {
+                s3d->type = stereoView == StereoView::SideBySide || stereoView == StereoView::SideBySideHalf ? AV_STEREO3D_SIDEBYSIDE
+                                                                                                            : AV_STEREO3D_TOPBOTTOM;
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(60, 29, 100)
+                if (!av_packet_side_data_add(&o.vst->codecpar->coded_side_data, &o.vst->codecpar->nb_coded_side_data,
+                                             AV_PKT_DATA_STEREO3D, s3d, sizeof(AVStereo3D), 0))
+                    av_free(s3d);
+#else
+                if (av_stream_add_side_data(o.vst, AV_PKT_DATA_STEREO3D, reinterpret_cast<uint8_t*>(s3d), sizeof(AVStereo3D)) < 0) av_free(s3d);
+#endif
+            }
+            o.oc->strict_std_compliance = FF_COMPLIANCE_UNOFFICIAL;
+        }
         if (seq.spherical) {
             // A 360° sequence: equirectangular spherical metadata, so players and YouTube show it as 360°
             // (MP4/MOV sv3d and st3d boxes, which FFmpeg writes only when asked to go beyond the standard; Matroska
@@ -880,6 +908,11 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             size_t size = 0;
             if (AVSphericalMapping* map = av_spherical_alloc(&size)) {
                 map->projection = AV_SPHERICAL_EQUIRECTANGULAR;
+                if (seq.vr180) {
+                    // VR180: the front half of the sphere, a quarter of the way in from each side (0.32 fixed point).
+                    map->projection = AV_SPHERICAL_EQUIRECTANGULAR_TILE;
+                    map->bound_left = map->bound_right = 0x40000000u;
+                }
 #if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(60, 29, 100)
                 if (!av_packet_side_data_add(&o.vst->codecpar->coded_side_data, &o.vst->codecpar->nb_coded_side_data,
                                              AV_PKT_DATA_SPHERICAL, map, size, 0))
@@ -1301,12 +1334,13 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     const QImage watermark = s.burnIn.watermark.empty() ? QImage() : QImage(QString::fromStdString(s.burnIn.watermark));
     if (!s.burnIn.watermark.empty() && watermark.isNull()) return fail("Cannot read the watermark image " + s.burnIn.watermark);
     RenderOptions ro;
-    ro.scale = double(W) / seq.width;
+    ro.scale = double(W / across) / seq.width;
     ro.highQuality = true;
     ro.useProxies = s.useProxies;
+    ro.stereoView = stereoView;
     // Smart rendering: only where nothing would change the source's pictures for the whole export.
     std::unique_ptr<SmartRenderer> smart;
-    if (wantVideo && s.smartRender && o.vctx && isIntraCodec(o.vctx->codec ? o.vctx->codec->name : "") && W == seq.width && H == seq.height &&
+    if (wantVideo && s.smartRender && o.vctx && isIntraCodec(o.vctx->codec ? o.vctx->codec->name : "") && W == seq.width && H == seq.height && !seq.stereo3d &&
         !s.useProxies && !s.burnInCaptions && !s.cea608 && !s.burnIn.any() && outSpace.id == seqSpace.id)
         smart = std::make_unique<SmartRenderer>(p, seq, seqSpace, o.vctx, o.vst, s.alpha, s.profile);
     // CEA-608 captions in the video: the pairs due in each frame's span of the 29.97 Hz line-21 clock, padding between.
@@ -1351,7 +1385,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         if (wantVideo && smart && smart->copy(f, in, o.oc)) {
             // copied from the source
         } else if (wantVideo) {
-            Image img = s.alpha ? renderSequenceFrame(p, seq, f, ro) : renderProgramFrame(p, seq, f, ro);
+            Image img = s.alpha && !seq.stereo3d ? renderSequenceFrame(p, seq, f, ro) : renderProgramFrame(p, seq, f, ro);
             if (s.burnInCaptions && captions) drawCaption(img, *captions, f, &seqSpace);
             if (s.burnIn.any()) drawBurnIns(img, p, seq, f, s.burnIn, watermark.isNull() ? nullptr : &watermark, &seqSpace);
             convertColor(img, seqSpace, outSpace, peakNits);

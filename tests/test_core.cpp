@@ -4572,6 +4572,63 @@ private slots:
         QFile::remove(file);
     }
 
+    void stereoInterpretation() {
+        // How the eyes are packed, swapped eyes, and the eye read: carried with the path like the rest.
+        Interpretation i;
+        i.stereo = "tb_half";
+        i.swapEyes = true;
+        QVERIFY(!i.empty());
+        const std::string path = interpretedPath("/f/3d.mp4", i);
+        QCOMPARE(path, std::string("/f/3d.mp4\x1dstereo=tb_half;swap=1"));
+        Interpretation back;
+        QVERIFY(parseInterpretation(path, back));
+        QVERIFY(back == i);
+        // The right eye is the same file read another way; the left eye is the media's own path.
+        QCOMPARE(eyePath(path, 0), path);
+        const std::string right = eyePath(path, 1);
+        QVERIFY(parseInterpretation(right, back));
+        QVERIFY(back.eye == 1 && back.stereo == "tb_half" && back.swapEyes);
+        QCOMPARE(eyePath(right, 0), path);
+        QCOMPARE(eyePath("/f/flat.mp4", 1), std::string("/f/flat.mp4\x1d" "eye=1"));
+        QCOMPARE(uninterpretedPath(right), std::string("/f/3d.mp4"));
+        // The file's own packing unless overridden; "none" reads it flat.
+        Interpretation none;
+        none.stereo = "none";
+        QCOMPARE(stereoLayout("sbs", Interpretation{}), std::string("sbs"));
+        QCOMPARE(stereoLayout("sbs", none), std::string());
+        QCOMPARE(stereoLayout("", i), std::string("tb_half"));
+        QVERIFY(validStereoLayout("") && validStereoLayout("none") && validStereoLayout("sbs_half") && !validStereoLayout("diagonal"));
+        QVERIFY(parseInterpretation("/a.mp4\x1dstereo=diagonal;swap=1", back) && back.stereo.empty() && back.swapEyes);
+        // A sequence's stereo flags and a media item's packing through a project file.
+        Project p = makeDefaultProject();
+        p.active()->stereo3d = true;
+        p.active()->spherical = true;
+        p.active()->vr180 = true;
+        MediaItem m;
+        m.id = p.newId();
+        m.kind = MediaKind::Video;
+        m.path = path;
+        m.stereo = "tb_half";
+        p.media.push_back(m);
+        const QString file = QDir::temp().filePath("stereo-test.montage");
+        QVERIFY(saveProject(p, file.toStdString()));
+        Project loaded;
+        QVERIFY(loadProject(file.toStdString(), loaded));
+        QVERIFY(loaded.active()->stereo3d && loaded.active()->vr180);
+        QCOMPARE(loaded.media.back().stereo, std::string("tb_half"));
+        QCOMPARE(interpretationOf(loaded.media.back()).stereo, std::string("tb_half"));
+        p.active()->stereo3d = false;
+        p.active()->vr180 = false;
+        QVERIFY(saveProject(p, file.toStdString()));
+        QVERIFY(loadProject(file.toStdString(), loaded));
+        QVERIFY(!loaded.active()->stereo3d && !loaded.active()->vr180);
+        QFile::remove(file);
+        // The Stereo 3D effect: depth and which way round the eyes are.
+        const Effect e = makeEffect(p, "stereo_3d");
+        QCOMPARE(e.p("depth", 0, 99), 0.0);
+        QCOMPARE(e.p("swap_eyes", 0, 99), 0.0);
+    }
+
     void deleteGaps() {
         Project p = makeDefaultProject();
         Sequence& s = *p.active();

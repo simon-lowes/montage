@@ -1544,6 +1544,35 @@ void MainWindow::buildMenus() {
             a->setChecked(cleanFeed_ && cleanFeed_->isVisible() && cleanFeed_->screen() == screens[i]);
         }
     });
+    // How the Program monitor shows a stereo 3D sequence's two eyes (render/Stereo.h).
+    QMenu* stereoM = play->addMenu(tr("Stereo 3D View"));
+    stereoM->setObjectName(QStringLiteral("stereoViewMenu"));
+    stereoM->setToolTip(tr("For stereoscopic 3D sequences: one eye, red-cyan anaglyph, both eyes, or where they differ"));
+    {
+        auto* group = new QActionGroup(stereoM);
+        const QString saved = appSettings().value("playback/stereoView", "left").toString();
+        StereoView initial = StereoView::Left;
+        stereoViewFromName(saved.toStdString(), initial);
+        program_->setStereoView(initial);
+        const std::pair<StereoView, QString> views[] = {
+            {StereoView::Left, tr("Left Eye")},
+            {StereoView::Right, tr("Right Eye")},
+            {StereoView::Anaglyph, tr("Anaglyph (Red-Cyan)")},
+            {StereoView::SideBySideHalf, tr("Side by Side")},
+            {StereoView::TopBottomHalf, tr("Top and Bottom")},
+            {StereoView::Difference, tr("Difference")},
+        };
+        for (const auto& [view, label] : views) {
+            QAction* a = stereoM->addAction(label, this, [this, view = view] {
+                program_->setStereoView(view);
+                appSettings().setValue("playback/stereoView", QString::fromStdString(stereoViewName(view)));
+            });
+            a->setObjectName(QStringLiteral("stereoView_") + QString::fromStdString(stereoViewName(view)));
+            a->setCheckable(true);
+            a->setChecked(view == initial);
+            group->addAction(a);
+        }
+    }
     play->addSeparator();
     add(play, tr("&Play / Pause"), QKeySequence(Qt::Key_Space), [this] { activeController()->togglePlay(); });
     // In Trim mode J, K and L trim the selected edit as it plays (dynamic trimming).
@@ -6068,6 +6097,8 @@ void MainWindow::newSequence() {
             s.hdrPeakNits = spec.hdrPeakNits;
             s.audioLayout = spec.audioLayout;
             s.spherical = spec.spherical;
+            s.vr180 = spec.vr180;
+            s.stereo3d = spec.stereo3d;
             return true;
         });
 }

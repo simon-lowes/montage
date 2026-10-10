@@ -23,6 +23,7 @@ extern "C" {
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/spherical.h>
+#include <libavutil/stereo3d.h>
 #include <libavutil/timecode.h>
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
@@ -83,7 +84,41 @@ std::string streamProjection(const AVStream* st) {
 #endif
     if (!data) return {};
     const auto* map = reinterpret_cast<const AVSphericalMapping*>(data);
-    return map->projection == AV_SPHERICAL_EQUIRECTANGULAR ? "equirect" : "";
+    if (map->projection == AV_SPHERICAL_EQUIRECTANGULAR) return "equirect";
+    // VR180: a tile of the sphere a quarter of the way in from each side (0.32 fixed point), the whole height.
+    if (map->projection == AV_SPHERICAL_EQUIRECTANGULAR_TILE && map->bound_top == 0 && map->bound_bottom == 0) {
+        const double cut = (double(map->bound_left) + double(map->bound_right)) / 4294967296.0;
+        if (std::fabs(cut - 0.5) < 0.01) return "vr180";
+    }
+    return {};
+}
+
+// Stereoscopic 3D footage: how the stream's stereo metadata (MP4 st3d, Matroska StereoMode, H.264 frame packing)
+// packs the eyes, "sbs" or "tb", and whether the right eye comes first. A frame-compatible file (each eye squeezed to
+// half the frame, as 3D TV and Blu-ray masters are) is told apart by its eyes' shape; 360° stereo is never squeezed.
+std::string streamStereo(const AVStream* st, bool& inverted, bool spherical) {
+    inverted = false;
+    const uint8_t* data = nullptr;
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(60, 29, 100)
+    const AVPacketSideData* sd = av_packet_side_data_get(st->codecpar->coded_side_data,
+                                                         st->codecpar->nb_coded_side_data, AV_PKT_DATA_STEREO3D);
+    if (sd) data = sd->data;
+#else
+    data = av_stream_get_side_data(st, AV_PKT_DATA_STEREO3D, nullptr);
+#endif
+    if (!data) return {};
+    const auto* s3d = reinterpret_cast<const AVStereo3D*>(data);
+    inverted = (s3d->flags & AV_STEREO3D_FLAG_INVERT) != 0;
+    const double w = st->codecpar->width, h = std::max(1, st->codecpar->height);
+    if (s3d->type == AV_STEREO3D_SIDEBYSIDE) return !spherical && w / 2 / h < 1.0 ? "sbs_half" : "sbs";
+    if (s3d->type == AV_STEREO3D_TOPBOTTOM) return !spherical && w / (h / 2) > 2.4 ? "tb_half" : "tb";
+    return {};
+}
+
+// One eye's size as shown, from the frame's.
+void stereoEyeSize(const std::string& layout, int& w, int& h) {
+    if (layout == "sbs") w = std::max(1, w / 2);
+    else if (layout == "tb") h = std::max(1, h / 2);
 }
 
 int streamRotation(const AVStream* st) {
@@ -346,6 +381,9 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         if (const std::string proj = streamProjection(st); !proj.empty()) m.projection = proj;
         if (m.colorSpace == "rec709") m.colorSpace.clear();
         int w = st->codecpar->width, h = st->codecpar->height;
+        bool inverted = false;
+        m.stereo = stereoLayout(streamStereo(st, inverted, !m.projection.empty()), in);
+        stereoEyeSize(m.stereo, w, h);
         AVRational sar = st->sample_aspect_ratio.num ? st->sample_aspect_ratio : st->codecpar->sample_aspect_ratio;
         if (in.par > 0) w = int(std::lround(double(w) * in.par));  // Interpret Footage's pixel aspect
         else if (sar.num > 0 && sar.den > 0 && sar.num != sar.den) w = int(std::lround(double(w) * sar.num / sar.den));
@@ -450,6 +488,7 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
     par_ = in.par;
     alpha_ = in.alpha;
     fields_ = in.fields;
+    interp_ = in;
     if (isVectorPath(uninterpretedPath(path))) {
         VectorInfo vi;
         vector_ = openVector(uninterpretedPath(path), vi, error);
@@ -567,6 +606,12 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
     duration_ = fmt_->duration > 0 ? double(fmt_->duration) / AV_TIME_BASE : 0;
     rotation_ = streamRotation(st);
     int w = st->codecpar->width, h = st->codecpar->height;
+    // Stereoscopic footage: one eye is read, the one asked for (the file's right-first packing and Interpret Footage's
+    // swap each turn them round).
+    bool inverted = false;
+    stereo_ = stereoLayout(streamStereo(st, inverted, !streamProjection(st).empty()), interp_);
+    eye_ = (interp_.eye != 0) != (inverted != interp_.swapEyes) ? 1 : 0;
+    stereoEyeSize(stereo_, w, h);
     AVRational sar = st->sample_aspect_ratio.num ? st->sample_aspect_ratio : st->codecpar->sample_aspect_ratio;
     if (par_ > 0) w = int(std::lround(double(w) * par_));
     else if (sar.num > 0 && sar.den > 0 && sar.num != sar.den) w = int(std::lround(double(w) * sar.num / sar.den));
@@ -769,6 +814,23 @@ Frame16Ptr VideoDecoder::convert(const AVFrame* in, double pts, int w, int h, bo
         deint.reset(av_frame_clone(in));
         if (deint) setFieldDominance(deint.get(), dominance);
         if (deint && deinterlaceFrame(deint.get())) f = deint.get();
+    }
+    // Stereoscopic footage: the eye's half of the frame (squeezed halves are stretched back by the scaling below).
+    std::unique_ptr<AVFrame, void (*)(AVFrame*)> eyeFrame(nullptr, [](AVFrame* fr) { av_frame_free(&fr); });
+    if (!stereo_.empty() && f->width > 1 && f->height > 1) {
+        eyeFrame.reset(av_frame_clone(f));
+        if (AVFrame* e = eyeFrame.get()) {
+            if (stereo_.rfind("sbs", 0) == 0) {
+                const int half = e->width / 2;
+                if (eye_) e->crop_left += size_t(half);
+                else e->crop_right += size_t(e->width - half);
+            } else {
+                const int half = e->height / 2;
+                if (eye_) e->crop_top += size_t(half);
+                else e->crop_bottom += size_t(e->height - half);
+            }
+            if (av_frame_apply_cropping(e, AV_FRAME_CROP_UNALIGNED) == 0) f = e;
+        }
     }
     if (w <= 0) w = dispW_;
     if (h <= 0) h = dispH_;

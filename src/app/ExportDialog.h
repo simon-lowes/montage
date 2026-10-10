@@ -87,6 +87,7 @@ private:
     QCheckBox* smart_ = nullptr;
     QLineEdit* startTc_ = nullptr;   // the file's starting timecode (MXF, MOV)
     QComboBox* color_ = nullptr;
+    QComboBox* stereo_ = nullptr;  // a stereoscopic sequence: how its eyes are delivered
     QComboBox* loudness_ = nullptr;
     QCheckBox* described_ = nullptr;  // an audio description stream after the mix
     QComboBox* audioOut_ = nullptr;  // a surround sequence: all its channels, or folded to stereo

@@ -6191,6 +6191,133 @@ const auto seq = [this] { return state()->sequence(); };
         state()->newProject();
     }
 
+    void stereoscopic3dUi() {
+        // A side-by-side file (left half red, right half blue), 128 x 36.
+        const QString video = dir_.filePath("sbs.mov");
+        {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 128, gs.height = 36, gs.fps = Rational{25, 1};
+            Clip blue = makeGeneratorClip(gen, "color", 10), red = makeGeneratorClip(gen, "color", 10);
+            blue.generator.params["color.r"] = 0.0, blue.generator.params["color.g"] = 0.0, blue.generator.params["color.b"] = 1.0;
+            red.generator.params["color.r"] = 1.0, red.generator.params["color.g"] = 0.0, red.generator.params["color.b"] = 0.0;
+            red.motion.params["crop_right"] = 50.0;
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, blue);
+            edit::overwrite(gen, gs, {TrackKind::Video, 1}, red);
+            ExportSettings st;
+            st.path = video.toStdString();
+            st.videoCodec = "prores_ks";
+            st.audioCodec = "none";
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        state()->newProject();
+        const auto ids = state()->importFiles({video});
+        QCOMPARE(ids.size(), size_t(1));
+        auto* bin = win_->findChild<MediaBinWidget*>();
+        // Interpret Footage: side by side, eyes swapped.
+        bool shown = false;
+        QTimer::singleShot(0, this, [&] {
+            auto* dlg = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+            if (!dlg || dlg->objectName() != "interpretFootageDialog") return;
+            auto* stereo = dlg->findChild<QComboBox*>("interpretStereo");
+            auto* swap = dlg->findChild<QCheckBox*>("interpretSwapEyes");
+            if (!stereo || !swap || !stereo->isEnabled()) return dlg->reject();
+            shown = true;
+            stereo->setCurrentIndex(stereo->findData(QStringLiteral("sbs")));
+            swap->setChecked(true);
+            dlg->accept();
+        });
+        bin->interpretFootageDialog({ids[0]});
+        QVERIFY(shown);
+        const MediaItem* m = state()->project().findMedia(ids[0]);
+        QCOMPARE(m->stereo, std::string("sbs"));
+        QCOMPARE(m->width, 64);
+        QVERIFY(interpretationOf(*m).swapEyes);
+        // Opened again it shows how the file is read.
+        shown = false;
+        QTimer::singleShot(0, this, [&] {
+            auto* dlg = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+            if (!dlg) return;
+            shown = dlg->findChild<QComboBox*>("interpretStereo")->currentData().toString() == "sbs" &&
+                    dlg->findChild<QCheckBox*>("interpretSwapEyes")->isChecked();
+            dlg->reject();
+        });
+        bin->interpretFootageDialog({ids[0]});
+        QVERIFY(shown);
+        // Sequence Settings: a stereoscopic sequence; VR180 only with 360°.
+        {
+            SequenceSettingsDialog dlg(win_.get());
+            NewSequenceSpec spec;
+            spec.width = 64;
+            spec.height = 36;
+            spec.stereo3d = true;
+            dlg.setSpec(spec);
+            auto* stereo = dlg.findChild<QCheckBox*>("stereoSequence");
+            auto* vr180 = dlg.findChild<QCheckBox*>("vr180Sequence");
+            auto* sphere = dlg.findChild<QCheckBox*>("sphericalSequence");
+            QVERIFY(stereo && vr180 && sphere);
+            QVERIFY(stereo->isChecked() && dlg.spec().stereo3d);
+            QVERIFY(!vr180->isEnabled());
+            sphere->setChecked(true);
+            QVERIFY(vr180->isEnabled());
+            vr180->setChecked(true);
+            QVERIFY(dlg.spec().vr180 && dlg.spec().spherical);
+            sphere->setChecked(false);
+            QVERIFY(!vr180->isChecked() && !dlg.spec().vr180);
+        }
+        QVERIFY(state()->edit("3D", [&](Project& p, Sequence& s) {
+            s.width = 64, s.height = 36, s.fps = Rational{25, 1};
+            s.stereo3d = true;
+            return edit::placeMedia(p, s, ids[0], 0, 0, 10, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        // Playback › Stereo 3D View: the Program monitor shows the anaglyph, then both eyes side by side.
+        MonitorPanel* program = nullptr;
+        for (auto* mp : win_->findChildren<MonitorPanel*>())
+            if (mp->mode() == MonitorPanel::Mode::Program) program = mp;
+        QVERIFY(program);
+        auto* left = win_->findChild<QAction*>("stereoView_left");
+        auto* anaglyph = win_->findChild<QAction*>("stereoView_anaglyph");
+        auto* sbs = win_->findChild<QAction*>("stereoView_sbs_half");
+        QVERIFY(left && anaglyph && sbs && win_->findChild<QAction*>("stereoView_difference"));
+        anaglyph->trigger();
+        QCOMPARE(program->controller()->stereoView(), StereoView::Anaglyph);
+        QVERIFY(anaglyph->isChecked() && !left->isChecked());
+        QCOMPARE(appSettings().value("playback/stereoView").toString(), QStringLiteral("anaglyph"));
+        QCOMPARE(program->controller()->renderOptions().stereoView, StereoView::Anaglyph);
+        state()->setPlayhead(5);
+        program->controller()->seek(5);
+        // The eyes are swapped (Interpret Footage): the left eye is blue, the right red; the anaglyph's red channel
+        // carries the left eye's brightness, its blue the right eye's.
+        QTRY_VERIFY(!program->viewer()->image().isNull() && program->viewer()->image().width() == 64);
+        QTRY_VERIFY2(qBlue(program->viewer()->image().pixel(32, 18)) < 60 && qRed(program->viewer()->image().pixel(32, 18)) > 5,
+                     qPrintable(QString::number(program->viewer()->image().pixel(32, 18), 16)));
+        sbs->trigger();
+        QTRY_VERIFY(program->viewer()->image().width() == 64 && qBlue(program->viewer()->image().pixel(16, 18)) > 180 &&
+                    qRed(program->viewer()->image().pixel(48, 18)) > 180);
+        left->trigger();
+        QCOMPARE(program->controller()->stereoView(), StereoView::Left);
+        // Export: the 3D choice is offered for a stereo sequence and sets the export's packing.
+        {
+            ExportDialog ed(state(), win_.get());
+            auto* stereo = ed.findChild<QComboBox*>("exportStereo");
+            QVERIFY(stereo && !stereo->isHidden());
+            stereo->setCurrentIndex(stereo->findData(QStringLiteral("tb")));
+            QVERIFY(stereo->currentText().contains("Top and bottom"));
+        }
+        QVERIFY(state()->edit("2D", [](Project&, Sequence& s) {
+            s.stereo3d = false;
+            return true;
+        }));
+        {
+            ExportDialog ed(state(), win_.get());
+            QVERIFY(ed.findChild<QComboBox*>("exportStereo")->isHidden());
+        }
+        appSettings().remove("playback/stereoView");
+        appSettings().remove("export/stereo");
+        state()->newProject();
+    }
+
     // One request to the agent link over HTTP, as a client sends it; the event loop runs meanwhile (the link lives on
     // this thread). The body; `status` gets the HTTP status.
     QByteArray agentPost(quint16 port, const QByteArray& body, const QByteArray& token, int* status, const QByteArray& extra = {}) {

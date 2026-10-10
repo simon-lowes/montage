@@ -318,6 +318,8 @@ QJsonObject interpretationJson(const MediaItem& m) {
     if (i.rawTint != 0) o["raw_tint"] = i.rawTint;
     if (!i.rawHighlights.empty()) o["raw_highlights"] = QString::fromStdString(i.rawHighlights);
     if (i.rawHalf) o["raw_half"] = true;
+    if (!i.stereo.empty()) o["stereo"] = QString::fromStdString(i.stereo);
+    if (i.swapEyes) o["swap_eyes"] = true;
     return o;
 }
 
@@ -4787,6 +4789,8 @@ void McpServer::Impl::addTools() {
             "raw_tint":{"type":"number","description":"Camera RAW: tint, + magenta, - green (-150 to 150)"},
             "raw_highlights":{"type":"string","enum":["clip","blend","rebuild"]},
             "raw_half":{"type":"boolean","description":"Camera RAW: decode at half size for speed"},
+            "stereo":{"type":"string","enum":["file","none","sbs","sbs_half","tb","tb_half"],"description":"Stereoscopic 3D: how the eyes are packed (side by side or top and bottom, full size or squeezed), none for a flat picture"},
+            "swap_eyes":{"type":"boolean","description":"Stereoscopic 3D: the eyes are the other way round"},
             "reset":{"type":"boolean","description":"Read the files as they are"}},"required":["project","media"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
@@ -4825,12 +4829,15 @@ void McpServer::Impl::addTools() {
                 if (a.contains("raw_tint")) i.rawTint = a.value("raw_tint").toDouble();
                 if (a.contains("raw_highlights")) i.rawHighlights = str(a, "raw_highlights") == "clip" ? "" : str(a, "raw_highlights").toStdString();
                 if (a.contains("raw_half")) i.rawHalf = a.value("raw_half").toBool();
+                if (a.contains("stereo")) i.stereo = str(a, "stereo") == "file" ? "" : str(a, "stereo").toStdString();
+                if (a.contains("swap_eyes")) i.swapEyes = a.value("swap_eyes").toBool();
                 const edit::Result r = edit::interpretFootage(l.project, m->id, i);
                 if (!r.ok && !r.error.empty()) throw ArgError{QStringLiteral("%1: %2").arg(QString::fromStdString(m->name), QString::fromStdString(r.error))};
                 changed += r.ok;
                 m = l.project.findMedia(m->id);
                 QJsonObject o{{"name", QString::fromStdString(m->name)}, {"frame_rate", m->fps.toDouble()}, {"duration_seconds", m->duration},
                               {"width", m->width}, {"height", m->height}};
+                if (!m->stereo.empty()) o["stereo"] = QString::fromStdString(m->stereo);
                 mediaPathJson(*m, o);
                 out.append(o);
             }
@@ -5117,7 +5124,8 @@ void McpServer::Impl::addTools() {
         "Render the program at a timeline time and return it as an image (to check an edit), optionally saving a PNG.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"at":{"type":["number","string"]},
             "width":{"type":"integer","default":640,"description":"Width of the returned image"},
-            "output":{"type":"string","description":"Also save the full-size frame here (PNG)"}},"required":["project","at"]})json", true,
+            "output":{"type":"string","description":"Also save the full-size frame here (PNG)"},
+            "stereo_view":{"type":"string","enum":["left","right","anaglyph","sbs","sbs_half","tb","tb_half","difference"],"default":"left","description":"A stereoscopic 3D sequence: which eye, both, or where they differ"}},"required":["project","at"]})json", true,
         [](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
@@ -5126,6 +5134,8 @@ void McpServer::Impl::addTools() {
             RenderOptions ro;
             ro.scale = std::min(1.0, double(w) / std::max(1, s.width));
             ro.captions = true;
+            if (a.contains("stereo_view") && !stereoViewFromName(str(a, "stereo_view").toStdString(), ro.stereoView))
+                throw ArgError{"Unknown stereo_view"};
             Image img = renderProgramFrame(l.project, s, at, ro);
             flattenOver(img, 0, 0, 0);
             QImage q(img.width, img.height, QImage::Format_RGBA8888);
@@ -5392,7 +5402,8 @@ void McpServer::Impl::addTools() {
                     "name":{"type":"string"},"language":{"type":"string"},"tracks":{"type":"array","items":{"type":"string"}},"role":{"type":"string"}}}}]},
             "audio_name":{"type":"string","description":"The mix stream's title"},"audio_language":{"type":"string","description":"The mix stream's language (ISO 639-1)"},
             "start_timecode":{"type":"string","description":"The file's starting timecode (MXF and MOV), e.g. 10:00:00:00 as broadcasters ask"},
-            "mono_tracks":{"type":"integer","description":"Write the mix (then each audio stream) as mono tracks, padded with silence to this many, as broadcast MXF takes it; the MXF presets set 8, 4 or 2"}},
+            "mono_tracks":{"type":"integer","description":"Write the mix (then each audio stream) as mono tracks, padded with silence to this many, as broadcast MXF takes it; the MXF presets set 8, 4 or 2"},
+            "stereo_view":{"type":"string","enum":["sbs","sbs_half","tb","tb_half","left","right","anaglyph"],"default":"sbs","description":"A stereoscopic 3D sequence: the eyes side by side or top and bottom (full size, or squeezed into one frame), or one picture"}},
             "required":["project","output"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
@@ -5413,6 +5424,12 @@ void McpServer::Impl::addTools() {
             }
             if (a.contains("in")) st.in = timeArg(a.value("in"), s, "in");
             if (a.contains("out")) st.out = timeArg(a.value("out"), s, "out");
+            if (a.contains("stereo_view")) {
+                StereoView v;
+                st.stereo = str(a, "stereo_view").toStdString();
+                if (!stereoViewFromName(st.stereo, v) || v == StereoView::Difference)
+                    throw ArgError{"\"stereo_view\" is sbs, sbs_half, tb, tb_half, left, right or anaglyph"};
+            }
             if (a.value("loudness_lufs").isDouble()) {
                 st.loudnessTarget = a.value("loudness_lufs").toDouble();
                 if (st.loudnessTarget >= 0 || st.loudnessTarget < -70) throw ArgError{"\"loudness_lufs\" must be between -70 and 0"};
@@ -5753,6 +5770,75 @@ void McpServer::Impl::addTools() {
             if (done.isEmpty()) throw ArgError{"Give clip, media or sequence_360"};
             save(l);
             return ok(done.join('\n'), QJsonObject{{"view", view}});
+        });
+
+    add("montage_stereo", "Stereoscopic 3D",
+        "Stereoscopic 3D editing, as Premiere's and Resolve's stereo workflows: with `sequence_3d` make the active "
+        "sequence stereoscopic (each eye rendered, stereo footage giving each its own picture) or flat, and with "
+        "`vr180` mark a 360° sequence as VR180 (the front half of the sphere); with `media` and `layout` say how a "
+        "file packs its eyes (file, none, sbs, sbs_half, tb, tb_half) and `swap_eyes` if they are the other way round; "
+        "with `clip` and `depth` (% of the frame's width, -10 to 10: + further away, - nearer) set the clip's Stereo 3D "
+        "convergence (titles and graphics placed in depth), keyed at `at` when given. Reports the sequence's stereo state.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"sequence_3d":{"type":"boolean"},"vr180":{"type":"boolean"},
+            "media":{"type":"number"},"layout":{"type":"string","enum":["file","none","sbs","sbs_half","tb","tb_half"]},"swap_eyes":{"type":"boolean"},
+            "clip":{"type":"number"},"depth":{"type":"number"},"at":{"type":"integer"}},"required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            QStringList done;
+            Sequence& seq = l.seq();
+            if (a.contains("sequence_3d")) {
+                seq.stereo3d = a.value("sequence_3d").toBool();
+                done << (seq.stereo3d ? QStringLiteral("The sequence is stereoscopic 3D") : QStringLiteral("The sequence is flat (2D)"));
+            }
+            if (a.contains("vr180")) {
+                if (a.value("vr180").toBool() && !seq.spherical) throw ArgError{"VR180 is for 360° sequences (montage_reframe_360 sequence_360)"};
+                seq.vr180 = a.value("vr180").toBool();
+                done << (seq.vr180 ? QStringLiteral("The sequence is VR180") : QStringLiteral("The sequence covers the whole sphere"));
+            }
+            if (a.contains("media")) {
+                MediaItem* m = l.project.findMedia(Id(a.value("media").toDouble()));
+                if (!m) throw ArgError{"No such media"};
+                if (m->subclipOf) m = l.project.findMedia(m->subclipOf);
+                Interpretation i = interpretationOf(*m);
+                if (a.contains("layout")) i.stereo = str(a, "layout") == "file" ? "" : str(a, "layout").toStdString();
+                if (a.contains("swap_eyes")) i.swapEyes = a.value("swap_eyes").toBool();
+                const edit::Result r = edit::interpretFootage(l.project, m->id, i);
+                if (!r.ok && !r.error.empty()) throw ArgError{QString::fromStdString(r.error)};
+                m = l.project.findMedia(m->id);
+                done << QStringLiteral("%1: %2 (%3 x %4 per eye)").arg(QString::fromStdString(m->name), m->stereo.empty() ? QStringLiteral("flat") : QString::fromStdString(m->stereo))
+                            .arg(m->width).arg(m->height);
+            }
+            if (a.contains("clip")) {
+                if (!a.contains("depth")) throw ArgError{"Give depth with clip"};
+                const double depth = a.value("depth").toDouble();
+                if (depth < -10 || depth > 10) throw ArgError{"depth is -10 to 10 (% of the width)"};
+                const Clip& c = clipArg(l, a);
+                FrameTime key = -1;
+                if (a.contains("at")) {
+                    key = FrameTime(a.value("at").toInteger()) - c.start;
+                    if (key < 0 || key >= c.duration) throw ArgError{"at is a frame inside the clip"};
+                }
+                Clip* clip = edit::clipById(seq, c.id);
+                if (!clip) throw ArgError{"No such clip"};
+                auto it = std::find_if(clip->effects.begin(), clip->effects.end(), [](const Effect& e) { return e.type == "stereo_3d"; });
+                if (it == clip->effects.end()) {
+                    clip->effects.push_back(makeEffect(l.project, "stereo_3d"));
+                    it = std::prev(clip->effects.end());
+                }
+                if (key >= 0) it->params["depth"].addKey(key, depth, Interp::Smooth);
+                else it->params["depth"] = Param(depth);
+                done << QStringLiteral("Clip %1 depth %2%%3").arg(clip->id).arg(depth).arg(key >= 0 ? QStringLiteral(" (key at frame %1)").arg(c.start + key) : QString());
+            }
+            if (done.isEmpty() && (a.contains("layout") || a.contains("swap_eyes"))) throw ArgError{"Give media with layout or swap_eyes"};
+            if (!done.isEmpty()) save(l);
+            int stereoClips = 0;
+            for (const Track& t : seq.videoTracks)
+                for (const Clip& c : t.clips)
+                    if (const MediaItem* m = c.mediaId ? l.project.findMedia(c.mediaId) : nullptr; m && !m->stereo.empty()) ++stereoClips;
+            const QJsonObject res{{"sequence_3d", seq.stereo3d}, {"vr180", seq.vr180}, {"spherical", seq.spherical}, {"stereo_clips", stereoClips}};
+            if (done.isEmpty())
+                done << QStringLiteral("%1, %2 stereo clip(s)").arg(seq.stereo3d ? QStringLiteral("Stereoscopic 3D") : QStringLiteral("Flat (2D)")).arg(stereoClips);
+            return ok(done.join('\n'), res);
         });
 
     add("montage_vfx_pull", "VFX pulls",

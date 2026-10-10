@@ -33,8 +33,17 @@ struct Interpretation {
     double rawTint = 0;         // + towards magenta, - towards green
     std::string rawHighlights;  // "" clipped, "blend", "rebuild"
     bool rawHalf = false;       // decoded at half size (faster)
+    // Stereoscopic 3D: how the two eyes are packed in each frame ("" as the file says, "none" not stereo, "sbs" side
+    // by side at full size, "sbs_half" squeezed side by side, "tb" top and bottom, "tb_half" squeezed top and bottom),
+    // whether the eyes are the other way round, and which eye is read (0 left, 1 right; set by the renderer).
+    std::string stereo;
+    bool swapEyes = false;
+    int eye = 0;
     bool hasRaw() const { return rawExposure != 0 || rawTemperature > 0 || rawTint != 0 || !rawHighlights.empty() || rawHalf; }
-    bool empty() const { return !conformed() && par <= 0 && (alpha.empty() || alpha == "straight") && fields.empty() && !hasRaw(); }
+    bool empty() const {
+        return !conformed() && par <= 0 && (alpha.empty() || alpha == "straight") && fields.empty() && !hasRaw() && stereo.empty() && !swapEyes &&
+               eye == 0;
+    }
     bool conformed() const { return fps.valid() && fileFps.valid() && !(fps == fileFps); }
     // Seconds of the file per second of media time (the new rate over the file's); 1 when not conformed.
     double timeScale() const { return conformed() ? fps.toDouble() / fileFps.toDouble() : 1.0; }
@@ -54,5 +63,11 @@ Interpretation interpretationOf(const MediaItem& m);
 bool validAlphaMode(const std::string& alpha);
 bool validFieldOrder(const std::string& fields);
 bool validRawHighlights(const std::string& mode);
+bool validStereoLayout(const std::string& layout);  // "", "none", "sbs", "sbs_half", "tb", "tb_half"
+// The eyes' packing a media file is read with: the file's own (`detected`, from its stereo metadata) unless the
+// interpretation says otherwise; "" for a flat picture.
+std::string stereoLayout(const std::string& detected, const Interpretation& i);
+// `path` with the right (1) or left (0) eye of a stereoscopic file read from it.
+std::string eyePath(const std::string& path, int eye);
 
 }  // namespace montage

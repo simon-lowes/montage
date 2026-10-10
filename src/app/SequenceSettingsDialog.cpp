@@ -180,6 +180,20 @@ SequenceSettingsDialog::SequenceSettingsDialog(QWidget* parent) : QDialog(parent
     spherical_->setToolTip(tr("Exports say they are 360° to players and YouTube; 360° footage comes in whole, not as a view.\n"
                               "Use a 2:1 frame size such as 3840 x 1920 or 5760 x 2880."));
     form->addRow(tr("Projection:"), spherical_);
+    vr180_ = new QCheckBox(tr("VR180 (the front half of the sphere)"), this);
+    vr180_->setObjectName(QStringLiteral("vr180Sequence"));
+    vr180_->setToolTip(tr("For VR180 cameras: each eye covers the half of the sphere in front. Use a 1:1 frame per eye."));
+    vr180_->setEnabled(false);
+    connect(spherical_, &QCheckBox::toggled, vr180_, [this](bool on) {
+        vr180_->setEnabled(on);
+        if (!on) vr180_->setChecked(false);
+    });
+    form->addRow(QString(), vr180_);
+    stereo3d_ = new QCheckBox(tr("Stereoscopic 3D (a picture for each eye)"), this);
+    stereo3d_->setObjectName(QStringLiteral("stereoSequence"));
+    stereo3d_->setToolTip(tr("Stereo footage gives each eye its own picture and the Stereo 3D effect sets a clip's depth.\n"
+                             "View › Stereo 3D chooses what the viewer shows; exports are side by side unless chosen otherwise."));
+    form->addRow(tr("Stereo:"), stereo3d_);
     form->addRow(QString(), summary_);
 
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
@@ -218,6 +232,8 @@ void SequenceSettingsDialog::setSpec(const NewSequenceSpec& spec) {
     const int al = audioLayout_->findData(QString::fromStdString(spec.audioLayout));
     audioLayout_->setCurrentIndex(al >= 0 ? al : 0);
     spherical_->setChecked(spec.spherical);
+    vr180_->setChecked(spec.spherical && spec.vr180);
+    stereo3d_->setChecked(spec.stereo3d);
     updateSummary();
 }
 
@@ -233,6 +249,8 @@ NewSequenceSpec SequenceSettingsDialog::spec() const {
     s.hdrPeakNits = hdrPeak_->value();
     s.audioLayout = audioLayout_->currentData().toString().toStdString();
     s.spherical = spherical_->isChecked();
+    s.vr180 = s.spherical && vr180_->isChecked();
+    s.stereo3d = stereo3d_->isChecked();
     return s;
 }
 
@@ -305,7 +323,7 @@ bool SequenceSettingsDialog::editActive(EditorState* state, QWidget* parent) {
     if (!state || !state->sequence()) return false;
     const Sequence& seq = *state->sequence();
     const NewSequenceSpec before{QString::fromStdString(seq.name), seq.width, seq.height, seq.fps, seq.sampleRate,
-                                 seq.colorSpace, seq.hdrPeakNits, seq.audioLayout, seq.spherical};
+                                 seq.colorSpace, seq.hdrPeakNits, seq.audioLayout, seq.spherical, seq.vr180, seq.stereo3d};
 
     SequenceSettingsDialog dlg(parent);
     dlg.setWindowTitle(tr("Sequence Settings"));
@@ -320,7 +338,8 @@ bool SequenceSettingsDialog::editActive(EditorState* state, QWidget* parent) {
     const NewSequenceSpec after = dlg.spec();
     if (after.name == before.name && after.width == before.width && after.height == before.height &&
         after.fps == before.fps && after.sampleRate == before.sampleRate && after.colorSpace == before.colorSpace &&
-        after.hdrPeakNits == before.hdrPeakNits && after.audioLayout == before.audioLayout && after.spherical == before.spherical)
+        after.hdrPeakNits == before.hdrPeakNits && after.audioLayout == before.audioLayout && after.spherical == before.spherical &&
+        after.vr180 == before.vr180 && after.stereo3d == before.stereo3d)
         return false;
 
     const std::string name = after.name.toStdString();
@@ -334,6 +353,8 @@ bool SequenceSettingsDialog::editActive(EditorState* state, QWidget* parent) {
         s.hdrPeakNits = after.hdrPeakNits;
         s.audioLayout = after.audioLayout;
         s.spherical = after.spherical;
+        s.vr180 = after.vr180;
+        s.stereo3d = after.stereo3d;
         // Keep the media item that represents this sequence (for nesting) in sync.
         for (MediaItem& m : p.media) {
             if (m.kind != MediaKind::Sequence || m.sequenceId != s.id) continue;

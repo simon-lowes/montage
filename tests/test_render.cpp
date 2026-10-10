@@ -4249,6 +4249,54 @@ colorspaces:
         QVERIFY(!measureLightLevels(empty, *empty.active(), 0, 0, l, &err) && err.find("empty") != std::string::npos);
     }
 
+    void stereoViews() {
+        // Two eyes, a red left and a blue right, 8 x 4, shown each way the viewer and exports offer.
+        Image left(8, 4), right(8, 4);
+        for (int y = 0; y < 4; ++y)
+            for (int x = 0; x < 8; ++x) {
+                float* l = left.at(x, y);
+                float* r = right.at(x, y);
+                l[0] = 1, l[1] = 0, l[2] = 0, l[3] = 1;
+                r[0] = 0, r[1] = 0.5f, r[2] = 1, r[3] = 1;
+            }
+        auto same = [](const float* a, float r, float g, float b) {
+            return std::fabs(a[0] - r) < 1e-4f && std::fabs(a[1] - g) < 1e-4f && std::fabs(a[2] - b) < 1e-4f;
+        };
+        QVERIFY(same(combineStereo(left, right, StereoView::Left).at(3, 2), 1, 0, 0));
+        QVERIFY(same(combineStereo(left, right, StereoView::Right).at(3, 2), 0, 0.5f, 1));
+        // Anaglyph: red from the left eye's brightness, green and blue from the right eye.
+        QVERIFY(same(combineStereo(left, right, StereoView::Anaglyph).at(3, 2), 0.299f, 0.5f, 1));
+        // Difference: twice the gap, clipped.
+        QVERIFY(same(combineStereo(left, right, StereoView::Difference).at(0, 0), 1, 1, 1));
+        QVERIFY(same(combineStereo(left, left, StereoView::Difference).at(0, 0), 0, 0, 0));
+        // Packed: full size doubles the frame, squeezed keeps it.
+        Image p = combineStereo(left, right, StereoView::SideBySide);
+        QVERIFY(p.width == 16 && p.height == 4 && same(p.at(7, 1), 1, 0, 0) && same(p.at(8, 1), 0, 0.5f, 1));
+        p = combineStereo(left, right, StereoView::TopBottom);
+        QVERIFY(p.width == 8 && p.height == 8 && same(p.at(2, 3), 1, 0, 0) && same(p.at(2, 4), 0, 0.5f, 1));
+        p = combineStereo(left, right, StereoView::SideBySideHalf);
+        QVERIFY(p.width == 8 && p.height == 4 && same(p.at(1, 1), 1, 0, 0) && same(p.at(6, 1), 0, 0.5f, 1));
+        p = combineStereo(left, right, StereoView::TopBottomHalf);
+        QVERIFY(p.width == 8 && p.height == 4 && same(p.at(4, 0), 1, 0, 0) && same(p.at(4, 3), 0, 0.5f, 1));
+        // Eyes of different sizes cannot be combined: the left is shown.
+        QCOMPARE(combineStereo(left, Image(4, 4), StereoView::SideBySide).width, 8);
+        // Names, as files and MCP use them, and how many eyes go across and down.
+        for (const std::string& n : stereoViewNames()) {
+            StereoView v;
+            QVERIFY(stereoViewFromName(n, v));
+            QCOMPARE(stereoViewName(v), n);
+        }
+        StereoView v;
+        QVERIFY(!stereoViewFromName("checkerboard", v));
+        int across = 0, down = 0;
+        stereoPacking(StereoView::SideBySide, across, down);
+        QVERIFY(across == 2 && down == 1);
+        stereoPacking(StereoView::TopBottom, across, down);
+        QVERIFY(across == 1 && down == 2);
+        stereoPacking(StereoView::SideBySideHalf, across, down);
+        QVERIFY(across == 1 && down == 1);
+    }
+
     void titlesRender() {
         Project p;
         Effect t = makeEffect(p, "title");

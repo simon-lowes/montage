@@ -48,6 +48,10 @@ public:
     // Draw the sequence's visible caption track (program monitor only).
     void setShowCaptions(bool on);
     bool showCaptions() const { return showCaptions_; }
+    // How a stereo 3D sequence is shown: one eye, anaglyph, the eyes packed side by side or top and bottom, or their
+    // difference (render/Stereo.h). Other sequences are not affected.
+    void setStereoView(StereoView v);
+    StereoView stereoView() const { return stereoView_; }
 
     bool isPlaying() const { return speed_ != 0; }
     // Global Mute (as in Premiere): playback and scrubbing are silent; clips, tracks and exports are untouched.
@@ -113,6 +117,7 @@ private:
     double scale_ = 0.5;
     bool useProxies_ = false;
     bool showCaptions_ = false;
+    StereoView stereoView_ = StereoView::Left;
     double speed_ = 0;
     bool loop_ = false;
     FrameTime position_ = 0;

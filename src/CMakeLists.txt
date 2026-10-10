@@ -122,6 +122,7 @@ add_library(montage_engine STATIC
   render/PaperEdit.h render/PaperEdit.cpp
   render/VfxPull.h render/VfxPull.cpp
   render/Spherical.h render/Spherical.cpp
+  render/Stereo.h render/Stereo.cpp
   render/ClipPlacement.h render/ClipPlacement.cpp
   render/AudioReactive.h render/AudioReactive.cpp
   render/QualityCheck.h render/QualityCheck.cpp

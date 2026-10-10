@@ -34,6 +34,7 @@
 #include "Theme.h"
 #include "core/History.h"
 #include "render/ColorSpace.h"
+#include "render/Stereo.h"
 
 namespace montage {
 
@@ -243,6 +244,22 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     color_->setToolTip(tr("Deliver in another colour space: an HDR sequence delivered in Rec.709 is tone mapped.\n"
                           "HDR output is 10-bit and tagged; PQ carries HDR10 metadata."));
     form->addRow(tr("Colour:"), color_);
+    // A stereoscopic 3D sequence: how its eyes are delivered (render/Stereo.h).
+    stereo_ = new QComboBox(form_);
+    stereo_->setObjectName(QStringLiteral("exportStereo"));
+    stereo_->addItem(tr("Side by side, full size (both eyes)"), QStringLiteral("sbs"));
+    stereo_->addItem(tr("Side by side, squeezed into one frame (3D TV)"), QStringLiteral("sbs_half"));
+    stereo_->addItem(tr("Top and bottom, full size (VR players)"), QStringLiteral("tb"));
+    stereo_->addItem(tr("Top and bottom, squeezed into one frame"), QStringLiteral("tb_half"));
+    stereo_->addItem(tr("Left eye only (2D)"), QStringLiteral("left"));
+    stereo_->addItem(tr("Right eye only (2D)"), QStringLiteral("right"));
+    stereo_->addItem(tr("Anaglyph (red-cyan)"), QStringLiteral("anaglyph"));
+    stereo_->setCurrentIndex(std::max(0, stereo_->findData(appSettings().value("export/stereo", "sbs").toString())));
+    stereo_->setToolTip(tr("Packed exports say how their eyes are packed (MP4 and MOV st3d, Matroska StereoMode), so 3D "
+                           "players, headsets and YouTube show them in depth"));
+    if (seq && seq->stereo3d) form->addRow(tr("Stereo 3D:"), stereo_);
+    else stereo_->hide();
+    connect(stereo_, &QComboBox::currentIndexChanged, this, &ExportDialog::updateSummary);
     // Loudness for where it is going: (target LUFS, true peak ceiling dBTP).
     loudness_ = new QComboBox(form_);
     loudness_->setObjectName(QStringLiteral("exportLoudness"));
@@ -546,15 +563,23 @@ void ExportDialog::updateSummary() {
     QStringList lines;
 
     if (hasVideo(s)) {
-        const int w = matchSize_->isChecked() ? seq->width : width_->value();
-        const int h = matchSize_->isChecked() ? seq->height : height_->value();
+        int w = matchSize_->isChecked() ? seq->width : width_->value();
+        int h = matchSize_->isChecked() ? seq->height : height_->value();
+        StereoView view = StereoView::Left;
+        if (seq->stereo3d) {
+            stereoViewFromName(stereo_->currentData().toString().toStdString(), view);
+            int across = 1, down = 1;
+            stereoPacking(view, across, down);
+            w *= across, h *= down;
+        }
         QString line = tr("Video: %1 (%2), %3 × %4, %5 fps")
                            .arg(videoCodecName(s), QString::fromStdString(s.videoCodec))
                            .arg(w)
                            .arg(h)
                            .arg(fpsLabel(seq->fps));
         if (usesCrf(s.videoCodec)) line += tr(", CRF %1").arg(quality_->value());
-        if (s.alpha) line += tr(", with alpha");
+        if (s.alpha && !seq->stereo3d) line += tr(", with alpha");
+        if (seq->stereo3d) line += ", " + stereo_->currentText();
         const ColorSpace* out = findColorSpace(color_->currentData().toString().toStdString());
         const ColorSpace& space = out ? *out : sequenceColorSpace(*seq);
         line += ", " + QString::fromStdString(space.label);
@@ -681,6 +706,10 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
     s.smartRender = smart_->isChecked();
     settings.setValue("export/smartRender", smart_->isChecked());
     if (hasVideo(s)) s.colorSpace = color_->currentData().toString().toStdString();
+    if (hasVideo(s) && state_->sequence() && state_->sequence()->stereo3d) {
+        s.stereo = stereo_->currentData().toString().toStdString();
+        settings.setValue("export/stereo", stereo_->currentData().toString());
+    }
     if (hasAudio(s) && loudness_->currentIndex() > 0) {
         const QPointF target = loudness_->currentData().toPointF();
         s.loudnessTarget = target.x();

@@ -16,6 +16,7 @@
 #include <functional>
 #include <array>
 #include <QImage>
+#include <QVector3D>
 #include <QDir>
 #include <QFileInfo>
 #include <QFile>
@@ -3733,6 +3734,259 @@ private slots:
         QCOMPARE(e.type, std::string("reframe_360"));
         QCOMPARE(e.p("yaw", 30), -90.0);
         QCOMPARE(e.p("projection", 0), 1.0);
+    }
+
+    void stereoscopic3d() {
+        // A side-by-side stereo file without stereo metadata: the left eye red, the right eye blue.
+        Project src = makeDefaultProject();
+        src.sequences.clear();
+        Sequence& ss = src.sequences.emplace_back(makeSequence(src, "SBS", 320, 96, Rational{25, 1}, 2, 1));
+        src.activeSequence = ss.id;
+        auto solid = [&](double r, double g, double b) {
+            Clip c = makeGeneratorClip(src, "color", 10);
+            c.generator.params["color.r"] = r;
+            c.generator.params["color.g"] = g;
+            c.generator.params["color.b"] = b;
+            return c;
+        };
+        QVERIFY(edit::overwrite(src, ss, {TrackKind::Video, 0}, solid(0, 0, 1)).ok);
+        Clip red = solid(1, 0, 0);
+        red.motion.params["crop_right"] = 50.0;
+        QVERIFY(edit::overwrite(src, ss, {TrackKind::Video, 1}, red).ok);
+        const std::string flatFile = path("sbs-flat.mp4");
+        {
+            ExportSettings st;
+            st.path = flatFile;
+            st.preset = "ultrafast";
+            st.crf = 12;
+            std::string err;
+            QVERIFY2(exportSequence(src, ss, st, nullptr, nullptr, &err), err.c_str());
+        }
+        Project p = makeDefaultProject();
+        p.sequences.clear();
+        MediaItem m = probeOrFail(p, flatFile);
+        QVERIFY(m.stereo.empty());
+        QCOMPARE(m.width, 320);
+        p.media.push_back(m);
+        // Interpreted as side by side: each eye is half the frame.
+        Interpretation how;
+        how.stereo = "sbs";
+        QVERIFY(edit::interpretFootage(p, m.id, how).ok);
+        QCOMPARE(p.findMedia(m.id)->stereo, std::string("sbs"));
+        QCOMPARE(p.findMedia(m.id)->width, 160);
+        QCOMPARE(p.findMedia(m.id)->height, 96);
+        how.stereo = "diagonal";
+        QVERIFY(!edit::interpretFootage(p, m.id, how).ok);
+
+        Sequence& s3 = p.sequences.emplace_back(makeSequence(p, "3D", 160, 96, Rational{25, 1}, 2, 1));
+        p.activeSequence = s3.id;
+        s3.stereo3d = true;
+        QVERIFY(edit::placeMedia(p, s3, m.id, 0, 0, 10, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        auto px = [](const Image& img, int x, int y) { return QVector3D(img.at(x, y)[0], img.at(x, y)[1], img.at(x, y)[2]); };
+        auto isRed = [](QVector3D c) { return c.x() > 0.7f && c.y() < 0.2f && c.z() < 0.25f; };
+        auto isBlue = [](QVector3D c) { return c.z() > 0.7f && c.x() < 0.2f && c.y() < 0.2f; };
+        RenderOptions o;
+        o.eye = 0;
+        const Image left = renderSequenceFrame(p, s3, 5, o);
+        o.eye = 1;
+        const Image right = renderSequenceFrame(p, s3, 5, o);
+        QCOMPARE(left.width, 160);
+        QVERIFY2(isRed(px(left, 80, 48)), qPrintable(QString("%1 %2 %3").arg(px(left, 80, 48).x()).arg(px(left, 80, 48).y()).arg(px(left, 80, 48).z())));
+        QVERIFY(isBlue(px(right, 80, 48)));
+        // The program as the viewer shows it: one eye, anaglyph, packed, difference.
+        RenderOptions view;
+        view.stereoView = StereoView::Left;
+        QVERIFY(isRed(px(renderProgramFrame(p, s3, 5, view), 80, 48)));
+        view.stereoView = StereoView::Right;
+        QVERIFY(isBlue(px(renderProgramFrame(p, s3, 5, view), 80, 48)));
+        view.stereoView = StereoView::Anaglyph;
+        const QVector3D ana = px(renderProgramFrame(p, s3, 5, view), 80, 48);
+        QVERIFY2(ana.x() > 0.15f && ana.z() > 0.7f && ana.y() < 0.2f, qPrintable(QString("%1 %2 %3").arg(ana.x()).arg(ana.y()).arg(ana.z())));
+        view.stereoView = StereoView::SideBySide;
+        const Image sbs = renderProgramFrame(p, s3, 5, view);
+        QCOMPARE(sbs.width, 320);
+        QCOMPARE(sbs.height, 96);
+        QVERIFY(isRed(px(sbs, 80, 48)) && isBlue(px(sbs, 240, 48)));
+        view.stereoView = StereoView::TopBottomHalf;
+        const Image tbh = renderProgramFrame(p, s3, 5, view);
+        QVERIFY(tbh.width == 160 && tbh.height == 96);
+        QVERIFY(isRed(px(tbh, 80, 20)) && isBlue(px(tbh, 80, 76)));
+        view.stereoView = StereoView::Difference;
+        QVERIFY(px(renderProgramFrame(p, s3, 5, view), 80, 48).x() > 0.9f);
+        // A flat sequence shows the left eye.
+        Sequence& flat = p.sequences.emplace_back(makeSequence(p, "2D", 160, 96, Rational{25, 1}, 2, 1));
+        const Id flatId = flat.id;
+        QVERIFY(edit::placeMedia(p, flat, m.id, 0, 0, 10, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        view.stereoView = StereoView::Anaglyph;
+        QVERIFY(isRed(px(renderProgramFrame(p, flat, 5, view), 80, 48)));
+        const Id s3id = p.activeSequence;
+        Sequence* s3p = p.findSequence(s3id);
+        // The eyes swapped by the clip's Stereo 3D effect, then a title placed in depth.
+        Clip& clip = s3p->videoTracks[0].clips.at(0);
+        Effect s3d = makeEffect(p, "stereo_3d");
+        s3d.params["swap_eyes"] = 1.0;
+        clip.effects.push_back(s3d);
+        o.eye = 0;
+        QVERIFY(isBlue(px(renderSequenceFrame(p, *s3p, 5, o), 80, 48)));
+        clip.effects.clear();
+        Clip bar = makeGeneratorClip(p, "color", 10);
+        bar.generator.params["color.r"] = 1.0, bar.generator.params["color.g"] = 1.0, bar.generator.params["color.b"] = 1.0;
+        bar.motion.params["crop_left"] = 45.0;
+        bar.motion.params["crop_right"] = 45.0;  // x 72 to 88
+        Effect depth = makeEffect(p, "stereo_3d");
+        depth.params["depth"] = 10.0;  // 16 px apart: 8 each way, into the screen
+        bar.effects.push_back(depth);
+        QVERIFY(edit::overwrite(p, *s3p, {TrackKind::Video, 1}, bar).ok);
+        auto white = [&](const Image& img, int x) { return img.at(x, 48)[1] > 0.9f; };
+        o.eye = 0;
+        const Image l2 = renderSequenceFrame(p, *s3p, 5, o);
+        o.eye = 1;
+        const Image r2 = renderSequenceFrame(p, *s3p, 5, o);
+        QVERIFY(white(l2, 66) && !white(r2, 66));
+        QVERIFY(white(r2, 93) && !white(l2, 93));
+        QVERIFY(white(l2, 78) && white(r2, 82));
+        // Depth means nothing in a flat sequence.
+        {
+            Sequence* f = p.findSequence(flatId);
+            QVERIFY(edit::overwrite(p, *f, {TrackKind::Video, 1}, bar).ok);
+            o.eye = 0;
+            const Image fl = renderSequenceFrame(p, *f, 5, o);
+            QVERIFY(white(fl, 74) && white(fl, 86) && !white(fl, 66));
+        }
+        // A stereo export: packed side by side or top and bottom with stereo metadata, so it comes back in as stereo.
+        struct Out {
+            const char* name;
+            const char* view;
+            int w, h;
+            const char* detected;
+        };
+        for (const Out& out : {Out{"3d-sbs.mp4", "sbs", 160, 96, "sbs"}, Out{"3d-sbs.mkv", "sbs", 160, 96, "sbs"},
+                               Out{"3d-tbh.mp4", "tb_half", 160, 96, "tb_half"}, Out{"3d-tb.mp4", "tb", 160, 96, "tb"},
+                               Out{"3d-anaglyph.mp4", "anaglyph", 160, 96, ""}}) {
+            ExportSettings st;
+            st.path = path(out.name);
+            st.preset = "ultrafast";
+            st.crf = 12;
+            st.stereo = out.view;
+            std::string err;
+            QVERIFY2(exportSequence(p, *s3p, st, nullptr, nullptr, &err), err.c_str());
+            MediaItem back;
+            QVERIFY(probeMedia(st.path, back));
+            QVERIFY2(back.stereo == out.detected, qPrintable(QString("%1: %2").arg(out.name, QString::fromStdString(back.stereo))));
+            QVERIFY2(back.width == out.w && back.height == out.h, qPrintable(QString("%1: %2 x %3").arg(out.name).arg(back.width).arg(back.height)));
+        }
+        {
+            // The side-by-side export read back: each eye its own picture again (away from the title).
+            MediaItem back = probeOrFail(p, path("3d-sbs.mp4"));
+            p.media.push_back(back);
+            Sequence& again = p.sequences.emplace_back(makeSequence(p, "Again", 160, 96, Rational{25, 1}, 1, 1));
+            again.stereo3d = true;
+            QVERIFY(edit::placeMedia(p, again, back.id, 0, 0, 10, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+            o.eye = 0;
+            QVERIFY(isRed(px(renderSequenceFrame(p, again, 5, o), 30, 48)));
+            o.eye = 1;
+            QVERIFY(isBlue(px(renderSequenceFrame(p, again, 5, o), 30, 48)));
+            // Squeezed sizes: each eye stretched back to the full frame.
+            ExportSettings st;
+            st.path = path("3d-sbsh.mp4");
+            st.preset = "ultrafast";
+            st.stereo = "sbs_half";
+            std::string err;
+            QVERIFY2(exportSequence(p, *p.findSequence(s3id), st, nullptr, nullptr, &err), err.c_str());
+            MediaItem half;
+            QVERIFY(probeMedia(st.path, half));
+            QCOMPARE(half.stereo, std::string("sbs_half"));
+            QCOMPARE(half.width, 160);  // the eye shown at the whole frame's size
+            st.stereo = "difference";
+            QVERIFY(!exportSequence(p, *p.findSequence(s3id), st, nullptr, nullptr, &err));
+        }
+        // Saved and loaded: the sequence's stereo and VR180 flags, the media's packing and interpretation.
+        s3p = p.findSequence(s3id);
+        s3p->spherical = true;
+        s3p->vr180 = true;
+        QVERIFY(saveProject(p, path("stereo.montage")));
+        Project loaded;
+        QVERIFY(loadProject(path("stereo.montage"), loaded));
+        QVERIFY(loaded.findSequence(s3id)->stereo3d && loaded.findSequence(s3id)->vr180);
+        QVERIFY(!loaded.findSequence(flatId)->stereo3d);
+        QCOMPARE(loaded.findMedia(m.id)->stereo, std::string("sbs"));
+        QCOMPARE(interpretationOf(*loaded.findMedia(m.id)).stereo, std::string("sbs"));
+        // VR180 export: half-sphere spherical metadata.
+        {
+            ExportSettings st;
+            st.path = path("vr180.mp4");
+            st.preset = "ultrafast";
+            std::string err;
+            QVERIFY2(exportSequence(p, *s3p, st, nullptr, nullptr, &err), err.c_str());
+            MediaItem back;
+            QVERIFY(probeMedia(st.path, back));
+            QCOMPARE(back.stereo, std::string("sbs"));  // 360° stereo is never squeezed
+            QCOMPARE(back.projection, std::string("vr180"));
+        }
+        // VR180 footage reframed: the view covers the half in front, and looking behind shows nothing.
+        {
+            Image half(360, 180);
+            for (int y = 0; y < 180; ++y)
+                for (int x = 0; x < 360; ++x) {
+                    float* q = half.at(x, y);
+                    q[0] = (x + 0.5f) / 360, q[1] = 0, q[2] = 0, q[3] = 1;  // red: 0 at 90° left, 1 at 90° right
+                }
+            Image v = reframeEquirect(half, 45, 0, 0, 60, SphereView::Flat, 64, 36, 180);
+            QVERIFY2(std::fabs(v.at(32, 18)[0] - 0.75f) < 0.02f, qPrintable(QString::number(v.at(32, 18)[0])));
+            v = reframeEquirect(half, 180, 0, 0, 60, SphereView::Flat, 64, 36, 180);
+            QVERIFY(v.at(32, 18)[3] == 0.0f);
+            QCOMPARE(projectionSpan("vr180"), 180.0);
+            QCOMPARE(projectionSpan("equirect"), 360.0);
+        }
+
+        // Over MCP: mark a file's packing, make a sequence 3D, set a clip's depth, look at the anaglyph, render top and bottom.
+        Project mp = makeDefaultProject();
+        mp.sequences.clear();
+        Sequence& ms = mp.sequences.emplace_back(makeSequence(mp, "MCP", 160, 96, Rational{25, 1}, 1, 1));
+        mp.activeSequence = ms.id;
+        MediaItem mm = probeOrFail(mp, flatFile);
+        mp.media.push_back(mm);
+        QVERIFY(edit::placeMedia(mp, ms, mm.id, 0, 0, 10, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Id mclip = ms.videoTracks[0].clips.at(0).id;
+        const QString project = QString::fromStdString(path("stereo-mcp.montage"));
+        QVERIFY(saveProject(mp, project.toStdString()));
+        McpServer server;
+        int rid = 1;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", rid++}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call("montage_stereo", {{"project", project}, {"sequence_3d", true}, {"media", double(mm.id)}, {"layout", "sbs"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(r.value("structuredContent").toObject().value("sequence_3d").toBool());
+        QCOMPARE(r.value("structuredContent").toObject().value("stereo_clips").toInt(), 1);
+        r = call("montage_stereo", {{"project", project}, {"clip", double(mclip)}, {"depth", 4}, {"at", 2}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(call("montage_stereo", {{"project", project}, {"clip", double(mclip)}, {"depth", 40}}).value("isError").toBool());
+        QVERIFY(call("montage_stereo", {{"project", project}, {"vr180", true}}).value("isError").toBool());  // not 360°
+        r = call("montage_render_frame", {{"project", project}, {"at", 5}, {"width", 160}, {"stereo_view", "anaglyph"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        r = call("montage_render", {{"project", project}, {"output", QString::fromStdString(path("mcp-tb.mp4"))}, {"preset", "H.264 - Fast Draft"},
+                                    {"stereo_view", "tb"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        {
+            MediaItem back;
+            QVERIFY(probeMedia(path("mcp-tb.mp4"), back));
+            QCOMPARE(back.stereo, std::string("tb"));
+        }
+        QVERIFY(call("montage_render", {{"project", project}, {"output", QString::fromStdString(path("x.mp4"))}, {"stereo_view", "difference"}})
+                    .value("isError").toBool());
+        Project after;
+        QVERIFY(loadProject(project.toStdString(), after));
+        QVERIFY(after.active()->stereo3d);
+        QCOMPARE(after.findMedia(mm.id)->stereo, std::string("sbs"));
+        const Clip* withDepth = edit::clipById(*after.active(), mclip);
+        QVERIFY(withDepth && !withDepth->effects.empty() && withDepth->effects.back().type == "stereo_3d");
+        QCOMPARE(withDepth->effects.back().params.at("depth").keys.size(), size_t(1));
     }
 
     void vfxPullsWithHandles() {

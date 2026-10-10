@@ -128,6 +128,9 @@ struct MediaItem {
     std::string colorOverride;  // Interpret Colour: the space to read it as, "" = as detected
     // 360° footage: "equirect" (from the file's spherical metadata, or set by hand), "" = a flat picture.
     std::string projection;
+    // Stereoscopic 3D footage: how its two eyes are packed ("sbs", "sbs_half", "tb", "tb_half"; core/Interpretation.h),
+    // from the file's stereo metadata or Interpret Footage; "" = a flat picture. Its size is one eye's, as shown.
+    std::string stereo;
     double timecode = -1;       // start timecode in seconds (for multicam sync), -1 = none
     // Speech-to-text of the media's audio (shared: undo snapshots copy the pointer).
     std::shared_ptr<const Transcript> transcript;
@@ -387,6 +390,10 @@ struct Sequence {
     double hdrPeakNits = 1000;          // mastering peak for HDR spaces
     double hdrMaxCll = 0, hdrMaxFall = 0;  // measured light levels (Analyse HDR Light Levels), nits; 0 = not measured
     bool spherical = false;             // a 360° sequence (equirectangular): exports say so to players and YouTube
+    bool vr180 = false;                 // with spherical: half the sphere in front (VR180), as stereo VR180 cameras shoot
+    // Stereoscopic 3D: the sequence is made for two eyes (its size is one eye's); each is rendered from stereo footage's
+    // own eye, clips' Stereo 3D effect placing them in depth; exports pack the eyes (render/Stereo.h).
+    bool stereo3d = false;
     FrameTime inPoint = -1;   // In / Out marks; both frames are included, -1 = unset
     FrameTime outPoint = -1;
     FrameTime playhead = 0;
