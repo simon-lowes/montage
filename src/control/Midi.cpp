@@ -1,9 +1,13 @@
 #include "Midi.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
+#include <condition_variable>
 #include <cstdio>
+#include <deque>
+#include <mutex>
 #include <thread>
 
 #if defined(__APPLE__)
@@ -116,6 +120,26 @@ std::string endpointId(MIDIEndpointRef e) {
     return std::to_string(uid);
 }
 
+class CoreMidiConnection;
+std::mutex gLiveMutex;
+std::vector<CoreMidiConnection*> gLive;  // open connections, told when the MIDI setup changes
+void setupChanged();
+
+// One client for the whole process, never disposed (disposing an app's last client can stop the MIDI server, after
+// which no new client can be made).
+MIDIClientRef sharedClient() {
+    static MIDIClientRef client = 0;
+    static std::once_flag once;
+    std::call_once(once, [] {
+        MIDIClientCreate(CFSTR("Montage"),
+                         [](const MIDINotification* n, void*) {
+                             if (n && (n->messageID == kMIDIMsgSetupChanged || n->messageID == kMIDIMsgObjectRemoved)) setupChanged();
+                         },
+                         nullptr, &client);
+    });
+    return client;
+}
+
 MIDIEndpointRef findEndpoint(bool source, const std::string& id) {
     const ItemCount n = source ? MIDIGetNumberOfSources() : MIDIGetNumberOfDestinations();
     for (ItemCount i = 0; i < n; ++i) {
@@ -128,12 +152,23 @@ MIDIEndpointRef findEndpoint(bool source, const std::string& id) {
 class CoreMidiConnection : public MidiConnection {
 public:
     ~CoreMidiConnection() override {
+        {
+            std::lock_guard<std::mutex> lock(gLiveMutex);
+            std::erase(gLive, this);
+        }
         if (inPort_) {
             if (src_) MIDIPortDisconnectSource(inPort_, src_);
             MIDIPortDispose(inPort_);
         }
         if (outPort_) MIDIPortDispose(outPort_);
-        if (client_) MIDIClientDispose(client_);
+    }
+    // Still plugged in? Told once when not.
+    void check() {
+        if (lost_) return;
+        if ((!inId_.empty() && !findEndpoint(true, inId_)) || (!outId_.empty() && !findEndpoint(false, outId_))) {
+            lost_ = true;
+            if (onLost_) onLost_();
+        }
     }
     bool send(const MidiMessage& bytes) override {
         if (!outPort_ || !dst_ || bytes.empty()) return false;
@@ -155,13 +190,19 @@ public:
         }
     }
 
-    MIDIClientRef client_ = 0;
     MIDIPortRef inPort_ = 0, outPort_ = 0;
     MIDIEndpointRef src_ = 0, dst_ = 0;
     MidiParser parser_;
     std::function<void(const MidiMessage&)> onMessage_;
-    std::string inName_, outName_;
+    std::function<void()> onLost_;
+    std::string inName_, outName_, inId_, outId_;
+    bool lost_ = false;
 };
+
+void setupChanged() {
+    std::lock_guard<std::mutex> lock(gLiveMutex);
+    for (CoreMidiConnection* c : gLive) c->check();
+}
 
 }  // namespace
 
@@ -180,19 +221,24 @@ std::vector<MidiPortInfo> midiOutputs() {
 }
 
 std::unique_ptr<MidiConnection> openMidi(const std::string& inputId, const std::string& outputId,
-                                         std::function<void(const MidiMessage&)> onMessage, std::string* error) {
+                                         std::function<void(const MidiMessage&)> onMessage, std::string* error,
+                                         std::function<void()> onLost) {
     auto fail = [&](const std::string& e) {
         if (error) *error = e;
         return std::unique_ptr<MidiConnection>();
     };
+    const MIDIClientRef client = sharedClient();
+    if (!client) return fail("CoreMIDI is not available");
     auto c = std::make_unique<CoreMidiConnection>();
     c->onMessage_ = std::move(onMessage);
-    if (MIDIClientCreate(CFSTR("Montage"), nullptr, nullptr, &c->client_) != noErr) return fail("CoreMIDI is not available");
+    c->onLost_ = std::move(onLost);
+    c->inId_ = inputId;
+    c->outId_ = outputId;
     if (!inputId.empty()) {
         c->src_ = findEndpoint(true, inputId);
         if (!c->src_) return fail("That MIDI input is not connected");
         c->inName_ = endpointName(c->src_);
-        if (MIDIInputPortCreate(c->client_, CFSTR("Montage In"), &CoreMidiConnection::readProc, c.get(), &c->inPort_) != noErr ||
+        if (MIDIInputPortCreate(client, CFSTR("Montage In"), &CoreMidiConnection::readProc, c.get(), &c->inPort_) != noErr ||
             MIDIPortConnectSource(c->inPort_, c->src_, nullptr) != noErr)
             return fail("Cannot open the MIDI input " + c->inName_);
     }
@@ -200,8 +246,12 @@ std::unique_ptr<MidiConnection> openMidi(const std::string& inputId, const std::
         c->dst_ = findEndpoint(false, outputId);
         if (!c->dst_) return fail("That MIDI output is not connected");
         c->outName_ = endpointName(c->dst_);
-        if (MIDIOutputPortCreate(c->client_, CFSTR("Montage Out"), &c->outPort_) != noErr)
+        if (MIDIOutputPortCreate(client, CFSTR("Montage Out"), &c->outPort_) != noErr)
             return fail("Cannot open the MIDI output " + c->outName_);
+    }
+    {
+        std::lock_guard<std::mutex> lock(gLiveMutex);
+        gLive.push_back(c.get());
     }
     return c;
 }
@@ -264,9 +314,19 @@ bool findDevice(bool input, const std::string& id, UINT& index, std::string& nam
 class WinMidiConnection : public MidiConnection {
 public:
     ~WinMidiConnection() override {
+        // The sender first (it may be mid-message), then the input with its exclusive buffers handed back.
+        {
+            std::lock_guard<std::mutex> lock(queueMutex_);
+            stop_ = true;
+        }
+        queueReady_.notify_all();
+        if (sender_.joinable()) sender_.join();
         if (in_) {
+            closing_ = true;
             midiInStop(in_);
             midiInReset(in_);
+            for (MIDIHDR& h : headers_)
+                if (h.dwFlags & MHDR_PREPARED) midiInUnprepareHeader(in_, &h, sizeof h);
             midiInClose(in_);
         }
         if (out_) {
@@ -274,8 +334,36 @@ public:
             midiOutClose(out_);
         }
     }
+    // Queued for the sending thread, so a slow driver never holds up the caller.
     bool send(const MidiMessage& bytes) override {
-        if (!out_ || bytes.empty()) return false;
+        if (!out_ || bytes.empty() || lost_) return false;
+        {
+            std::lock_guard<std::mutex> lock(queueMutex_);
+            if (queue_.size() > 4096) return false;  // the port cannot keep up: dropped
+            queue_.push_back(bytes);
+        }
+        queueReady_.notify_one();
+        return true;
+    }
+    std::string inputName() const override { return inName_; }
+    std::string outputName() const override { return outName_; }
+
+    void startSender() {
+        sender_ = std::thread([this] {
+            for (;;) {
+                MidiMessage m;
+                {
+                    std::unique_lock<std::mutex> lock(queueMutex_);
+                    queueReady_.wait(lock, [&] { return stop_ || !queue_.empty(); });
+                    if (stop_) return;
+                    m = std::move(queue_.front());
+                    queue_.pop_front();
+                }
+                if (!write(m)) gone();
+            }
+        });
+    }
+    bool write(const MidiMessage& bytes) {
         if (bytes[0] == 0xF0) {
             // System exclusive: a prepared buffer, waited on until the driver is done with it.
             std::vector<char> data(bytes.begin(), bytes.end());
@@ -283,35 +371,68 @@ public:
             h.lpData = data.data();
             h.dwBufferLength = DWORD(data.size());
             if (midiOutPrepareHeader(out_, &h, sizeof h) != MMSYSERR_NOERROR) return false;
-            const bool ok = midiOutLongMsg(out_, &h, sizeof h) == MMSYSERR_NOERROR;
-            for (int i = 0; ok && !(h.dwFlags & MHDR_DONE) && i < 1000; ++i) Sleep(1);
+            const MMRESULT r = midiOutLongMsg(out_, &h, sizeof h);
+            for (int i = 0; r == MMSYSERR_NOERROR && !(h.dwFlags & MHDR_DONE) && i < 1000; ++i) Sleep(1);
+            if (!(h.dwFlags & MHDR_DONE)) midiOutReset(out_);  // (so the driver hands the buffer back before it goes)
             midiOutUnprepareHeader(out_, &h, sizeof h);
-            return ok;
+            return r == MMSYSERR_NOERROR;
         }
         DWORD msg = bytes[0];
         if (bytes.size() > 1) msg |= DWORD(bytes[1]) << 8;
         if (bytes.size() > 2) msg |= DWORD(bytes[2]) << 16;
         return midiOutShortMsg(out_, msg) == MMSYSERR_NOERROR;
     }
-    std::string inputName() const override { return inName_; }
-    std::string outputName() const override { return outName_; }
+    void gone() {
+        if (lost_.exchange(true)) return;
+        if (onLost_) onLost_();
+    }
 
-    // Channel and system common messages (all a control surface sends the host); system exclusive input is not read.
-    static void CALLBACK inProc(HMIDIIN, UINT msg, DWORD_PTR instance, DWORD_PTR p1, DWORD_PTR) {
-        if (msg != MIM_DATA) return;
+    // Short messages whole, system exclusive through buffers handed back to the driver after each is read.
+    static void CALLBACK inProc(HMIDIIN in, UINT msg, DWORD_PTR instance, DWORD_PTR p1, DWORD_PTR) {
         auto* self = reinterpret_cast<WinMidiConnection*>(instance);
-        const uint8_t status = uint8_t(p1 & 0xff);
-        MidiMessage m{status};
-        const int n = midiDataBytes(status);
-        if (n >= 1) m.push_back(uint8_t((p1 >> 8) & 0x7f));
-        if (n >= 2) m.push_back(uint8_t((p1 >> 16) & 0x7f));
-        if (self->onMessage_) self->onMessage_(m);
+        if (msg == MIM_DATA) {
+            const uint8_t status = uint8_t(p1 & 0xff);
+            MidiMessage m{status};
+            const int n = midiDataBytes(status);
+            if (n >= 1) m.push_back(uint8_t((p1 >> 8) & 0x7f));
+            if (n >= 2) m.push_back(uint8_t((p1 >> 16) & 0x7f));
+            if (self->onMessage_) self->onMessage_(m);
+        } else if (msg == MIM_LONGDATA) {
+            auto* h = reinterpret_cast<MIDIHDR*>(p1);
+            if (h->dwBytesRecorded > 0)
+                self->sysex_.feed(reinterpret_cast<const uint8_t*>(h->lpData), h->dwBytesRecorded, self->onMessage_);
+            if (!self->closing_) midiInAddBuffer(in, h, sizeof *h);
+        } else if (msg == MIM_CLOSE && !self->closing_) {
+            self->gone();
+        }
+    }
+    bool addBuffers() {
+        for (size_t i = 0; i < headers_.size(); ++i) {
+            buffers_[i].assign(1024, 0);
+            headers_[i] = MIDIHDR{};
+            headers_[i].lpData = buffers_[i].data();
+            headers_[i].dwBufferLength = DWORD(buffers_[i].size());
+            if (midiInPrepareHeader(in_, &headers_[i], sizeof headers_[i]) != MMSYSERR_NOERROR ||
+                midiInAddBuffer(in_, &headers_[i], sizeof headers_[i]) != MMSYSERR_NOERROR)
+                return false;
+        }
+        return true;
     }
 
     HMIDIIN in_ = nullptr;
     HMIDIOUT out_ = nullptr;
+    std::array<MIDIHDR, 4> headers_{};
+    std::array<std::vector<char>, 4> buffers_;
+    MidiParser sysex_;
+    std::atomic<bool> closing_{false}, lost_{false};
     std::function<void(const MidiMessage&)> onMessage_;
+    std::function<void()> onLost_;
     std::string inName_, outName_;
+    std::thread sender_;
+    std::mutex queueMutex_;
+    std::condition_variable queueReady_;
+    std::deque<MidiMessage> queue_;
+    bool stop_ = false;
 };
 
 }  // namespace
@@ -339,13 +460,15 @@ std::vector<MidiPortInfo> midiOutputs() {
 }
 
 std::unique_ptr<MidiConnection> openMidi(const std::string& inputId, const std::string& outputId,
-                                         std::function<void(const MidiMessage&)> onMessage, std::string* error) {
+                                         std::function<void(const MidiMessage&)> onMessage, std::string* error,
+                                         std::function<void()> onLost) {
     auto fail = [&](const std::string& e) {
         if (error) *error = e;
         return std::unique_ptr<MidiConnection>();
     };
     auto c = std::make_unique<WinMidiConnection>();
     c->onMessage_ = std::move(onMessage);
+    c->onLost_ = std::move(onLost);
     if (!inputId.empty()) {
         UINT index = 0;
         if (!findDevice(true, inputId, index, c->inName_)) return fail("That MIDI input is not connected");
@@ -353,6 +476,7 @@ std::unique_ptr<MidiConnection> openMidi(const std::string& inputId, const std::
             c->in_ = nullptr;
             return fail("Cannot open the MIDI input " + c->inName_ + " (another program may be using it)");
         }
+        c->addBuffers();  // (without them only short messages come in)
         midiInStart(c->in_);
     }
     if (!outputId.empty()) {
@@ -362,6 +486,7 @@ std::unique_ptr<MidiConnection> openMidi(const std::string& inputId, const std::
             c->out_ = nullptr;
             return fail("Cannot open the MIDI output " + c->outName_ + " (another program may be using it)");
         }
+        c->startSender();
     }
     return c;
 }
@@ -412,15 +537,30 @@ public:
         if (in_ >= 0) close(in_);
         if (out_ >= 0) close(out_);
     }
+    // Non-blocking: a port that is full is waited on briefly, then what does not fit is dropped.
     bool send(const MidiMessage& bytes) override {
-        if (out_ < 0 || bytes.empty()) return false;
+        if (out_ < 0 || bytes.empty() || lost_) return false;
         size_t done = 0;
+        int waits = 0;
         while (done < bytes.size()) {
             const ssize_t n = write(out_, bytes.data() + done, bytes.size() - done);
-            if (n <= 0) return false;
-            done += size_t(n);
+            if (n > 0) {
+                done += size_t(n);
+                continue;
+            }
+            if (n < 0 && (errno == EAGAIN || errno == EINTR) && waits++ < 4) {
+                pollfd p{out_, POLLOUT, 0};
+                poll(&p, 1, 5);
+                continue;
+            }
+            if (n < 0 && errno != EAGAIN && errno != EINTR) gone();  // unplugged
+            return false;
         }
         return true;
+    }
+    void gone() {
+        if (lost_.exchange(true)) return;
+        if (onLost_) onLost_();
     }
     std::string inputName() const override { return inName_; }
     std::string outputName() const override { return outName_; }
@@ -432,17 +572,22 @@ public:
                 pollfd p{in_, POLLIN, 0};
                 if (poll(&p, 1, 100) <= 0) continue;
                 const ssize_t n = read(in_, buf, sizeof buf);
-                if (n > 0) parser_.feed(buf, size_t(n), onMessage_);
-                else if (n == 0 || (errno != EAGAIN && errno != EINTR)) break;  // unplugged
+                if (n > 0) {
+                    parser_.feed(buf, size_t(n), onMessage_);
+                } else if (n == 0 || (errno != EAGAIN && errno != EINTR)) {
+                    gone();  // unplugged
+                    break;
+                }
             }
         });
     }
 
     int in_ = -1, out_ = -1;
-    std::atomic<bool> stop_{false};
+    std::atomic<bool> stop_{false}, lost_{false};
     std::thread reader_;
     MidiParser parser_;
     std::function<void(const MidiMessage&)> onMessage_;
+    std::function<void()> onLost_;
     std::string inName_, outName_;
 };
 
@@ -463,7 +608,8 @@ std::vector<MidiPortInfo> midiOutputs() {
 }
 
 std::unique_ptr<MidiConnection> openMidi(const std::string& inputId, const std::string& outputId,
-                                         std::function<void(const MidiMessage&)> onMessage, std::string* error) {
+                                         std::function<void(const MidiMessage&)> onMessage, std::string* error,
+                                         std::function<void()> onLost) {
     auto fail = [&](const std::string& e) {
         if (error) *error = e;
         return std::unique_ptr<MidiConnection>();
@@ -477,6 +623,7 @@ std::unique_ptr<MidiConnection> openMidi(const std::string& inputId, const std::
     auto ours = [](const std::string& path) { return path.rfind("/dev/snd/midiC", 0) == 0 && path.find("..") == std::string::npos; };
     auto c = std::make_unique<RawMidiConnection>();
     c->onMessage_ = std::move(onMessage);
+    c->onLost_ = std::move(onLost);
     if (!inputId.empty()) {
         if (!ours(inputId)) return fail("Not a MIDI device: " + inputId);
         c->inName_ = nameOf(inputId);
@@ -486,7 +633,7 @@ std::unique_ptr<MidiConnection> openMidi(const std::string& inputId, const std::
     if (!outputId.empty()) {
         if (!ours(outputId)) return fail("Not a MIDI device: " + outputId);
         c->outName_ = nameOf(outputId);
-        c->out_ = open(outputId.c_str(), O_WRONLY);
+        c->out_ = open(outputId.c_str(), O_WRONLY | O_NONBLOCK);  // (a busy port would otherwise block the open)
         if (c->out_ < 0) return fail("Cannot open the MIDI output " + c->outName_ + " (another program may be using it)");
     }
     c->start();
@@ -498,7 +645,7 @@ std::unique_ptr<MidiConnection> openMidi(const std::string& inputId, const std::
 std::vector<MidiPortInfo> midiInputs() { return {}; }
 std::vector<MidiPortInfo> midiOutputs() { return {}; }
 std::unique_ptr<MidiConnection> openMidi(const std::string&, const std::string&, std::function<void(const MidiMessage&)>,
-                                         std::string* error) {
+                                         std::string* error, std::function<void()>) {
     if (error) *error = "MIDI is not available on this system";
     return nullptr;
 }

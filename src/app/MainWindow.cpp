@@ -2162,6 +2162,7 @@ void MainWindow::closeEvent(QCloseEvent* e) {
     if (backgroundCancel_) *backgroundCancel_ = true;  // a background render stops at its next frame
     program_->pause();
     source_->pause();
+    surface_->disconnectSurface();  // faders down, lights off and displays blank, not left showing a closed project
     recovery_->endSession();  // a clean exit: nothing to recover next time
     QSettings s = appSettings();
     s.setValue("window/geometry", saveGeometry());
@@ -5074,6 +5075,11 @@ QDialog* MainWindow::controlSurfaceDialog() {
     };
     fill(input, midiInputs(), savedIn);
     fill(output, midiOutputs(), savedOut);
+    if (savedOut.isEmpty() && input->currentIndex() > 0) {
+        // Nothing chosen before: the output named like the input (a surface's two ports share its name).
+        const int at = output->findText(input->currentText());
+        if (at >= 0) output->setCurrentIndex(at);
+    }
     form->addRow(tr("MIDI input:"), input);
     form->addRow(tr("MIDI output:"), output);
     auto* atStart = new QCheckBox(tr("Connect when Montage starts"), dlg);

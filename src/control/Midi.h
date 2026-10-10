@@ -46,8 +46,11 @@ public:
     virtual std::string outputName() const = 0;
 };
 // Opens the input and output with these ids (from midiInputs and midiOutputs). `onMessage` is called for every whole
-// message received, from another thread, until the connection is destroyed.
+// message received, and `onLost` (at most once) when the device goes away (unplugged, switched off), both from another
+// thread, until the connection is destroyed. Sending never blocks the caller for long: a port that cannot keep up
+// drops what does not fit rather than stalling.
 std::unique_ptr<MidiConnection> openMidi(const std::string& inputId, const std::string& outputId,
-                                         std::function<void(const MidiMessage&)> onMessage, std::string* error = nullptr);
+                                         std::function<void(const MidiMessage&)> onMessage, std::string* error = nullptr,
+                                         std::function<void()> onLost = {});
 
 }  // namespace montage

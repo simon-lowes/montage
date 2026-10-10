@@ -113,9 +113,10 @@ std::vector<MidiMessage> timecode(const std::string& text) {
         std::string s = groups[g];
         if (int(s.size()) > widths[k]) s = s.substr(s.size() - size_t(widths[k]));
         s.insert(0, size_t(widths[k]) - s.size(), ' ');
+        const bool shown = !groups[g].empty();  // a dot only after a group that is there
         for (size_t i = 0; i < s.size(); ++i) {
             digits += s[i];
-            dots.push_back(k < 3 && i + 1 == s.size());
+            dots.push_back(shown && k < 3 && i + 1 == s.size());
         }
     }
     std::vector<MidiMessage> out;

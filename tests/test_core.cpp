@@ -554,6 +554,10 @@ private slots:
         QCOMPARE(tc.size(), size_t(10));
         const uint8_t want[10] = {0x34, 0x30, 0x20, 0x73, 0x30, 0x72, 0x30, 0x71, 0x30, 0x20};
         for (int i = 0; i < 10; ++i) QCOMPARE(tc[size_t(i)], (MidiMessage{0xB0, uint8_t(0x40 + i), want[i]}));
+        // Dots only after groups that are there: none for a blank display, and only after the seconds for "12:34".
+        for (const MidiMessage& m : mcu::timecode("")) QCOMPARE(m[2], uint8_t(0x20));
+        const std::vector<MidiMessage> short_ = mcu::timecode("12:34");
+        for (int i = 0; i < 10; ++i) QCOMPARE(bool(short_[size_t(i)][2] & 0x40), i == 3);
         QCOMPARE(mcu::assignment("3"), (std::vector<MidiMessage>{{0xB0, 0x4B, 0x20}, {0xB0, 0x4A, 0x33}}));
         // The fader law, both ways; the top of a fader's ten-bit travel reads as the top.
         QCOMPARE(mcu::faderValue(-100), 0);

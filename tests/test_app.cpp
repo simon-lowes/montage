@@ -729,10 +729,53 @@ private slots:
         QVERIFY(has(mcu::led(mcu::Play, 2)) && has(mcu::led(mcu::Stop, 0)));
         surface->handle({0x90, uint8_t(mcu::Stop), 0x7F});
         QVERIFY(!program->isPlaying());
+        // Play while shuttling plays at normal speed.
+        program->shuttle(1);
+        program->shuttle(1);
+        QVERIFY(program->speed() > 1);
+        surface->handle({0x90, uint8_t(mcu::Play), 0x7F});
+        QCOMPARE(program->speed(), 1.0);
+        surface->handle({0x90, uint8_t(mcu::Stop), 0x7F});
+        QVERIFY(!program->isPlaying());
         // Meters follow playback levels.
         sent->clear();
         surface->setLevels(0, 0, QVector<float>{0.5f, 0.25f, 1.0f, 1.0f});
         QVERIFY(has(mcu::meter(0, 8)) && has(mcu::meter(1, 12)));
+
+        // Moves from the surface are one undo step together, two faders moving at once included.
+        QVERIFY(state()->edit("Level", [](Project&, Sequence& s) {
+            s.audioTracks[4].volumeDb = 0;
+            return true;
+        }));
+        surface->handle(mcu::fader(6, minus6));
+        surface->handle(mcu::fader(7, minus6));
+        surface->handle(mcu::fader(6, mcu::faderValue(-3)));
+        QCOMPARE(track(6).volumeDb, -3.0);
+        QCOMPARE(track(7).volumeDb, -6.0);
+        state()->undo();
+        QCOMPARE(track(6).volumeDb, 0.0);
+        QCOMPARE(track(7).volumeDb, 0.0);
+        QTRY_VERIFY_WITH_TIMEOUT(!mixer->trackFader(6)->isSliderDown() && !mixer->trackFader(7)->isSliderDown(), 3000);
+        // A fader's moves that queued up together are applied once, at the last position.
+        sent->clear();
+        surface->receive(mcu::fader(6, mcu::faderValue(-20)));
+        surface->receive(mcu::fader(6, mcu::faderValue(-10)));
+        QTRY_COMPARE(track(6).volumeDb, -10.0);
+        QVERIFY(has(mcu::fader(6, mcu::faderValue(-10))) && !has(mcu::fader(6, mcu::faderValue(-20))));
+        QTRY_VERIFY_WITH_TIMEOUT(!mixer->trackFader(6)->isSliderDown(), 3000);
+        // Banking while a fader is touched: the fader holds its new track, and its motor stays still.
+        surface->handle({0x90, 0x68, 0x7F});
+        sent->clear();
+        surface->handle({0x90, uint8_t(mcu::BankRight), 0x7F});
+        QCOMPARE(surface->bank(), 2);
+        QVERIFY(!mixer->trackFader(0)->isSliderDown() && mixer->trackFader(2)->isSliderDown());
+        QVERIFY(std::none_of(sent->begin(), sent->end(), [](const MidiMessage& m) { return m[0] == 0xE0; }));
+        surface->handle(mcu::fader(0, mcu::faderValue(-12)));
+        QCOMPARE(track(2).volumeDb, -12.0);
+        surface->handle({0x90, 0x68, 0x00});
+        QVERIFY(!mixer->trackFader(2)->isSliderDown());
+        surface->handle({0x90, uint8_t(mcu::BankLeft), 0x7F});
+        QCOMPARE(surface->bank(), 0);
 
         // A surface switched on later says so: everything is sent again.
         sent->clear();
@@ -750,6 +793,23 @@ private slots:
         QVERIFY(dlg->findChild<QLabel*>("surfaceStatus")->text().contains("Not connected"));
         QCOMPARE(win_->controlSurfaceDialog(), dlg);
         dlg->close();
+
+        // The device going away (unplugged mid-move): what it held lets go and it is closed.
+        surface->setConnection(std::make_unique<Recorder>());
+        QVERIFY(surface->isConnected() && connected.size() == 3);
+        surface->handle({0x90, 0x69, 0x7F});
+        QVERIFY(mixer->trackFader(1)->isSliderDown());
+        surface->connectionLost();
+        QTRY_VERIFY(!surface->isConnected());
+        QCOMPARE(connected.size(), 4);
+        QVERIFY(!mixer->trackFader(1)->isSliderDown());
+        // A loss reported by a connection since replaced is ignored.
+        surface->setConnection(std::make_unique<Recorder>());
+        surface->connectionLost();
+        surface->setConnection(std::make_unique<Recorder>());
+        QTest::qWait(50);
+        QVERIFY(surface->isConnected());
+        surface->disconnectSurface();
     }
 
     void mixerAutomation() {

@@ -59,6 +59,12 @@ ControlSurface::ControlSurface(EditorState* state, MixerPanel* mixer, PlaybackCo
         holds_[size_t(i)]->setInterval(1000);  // (a fader without touch sensing counts as held until it rests a second)
         connect(holds_[size_t(i)], &QTimer::timeout, this, [this, i] { release(i); });
     }
+    for (int i = 0; i < mcu::kStrips; ++i) {
+        potHolds_[size_t(i)] = new QTimer(this);
+        potHolds_[size_t(i)]->setSingleShot(true);
+        potHolds_[size_t(i)]->setInterval(1000);
+        connect(potHolds_[size_t(i)], &QTimer::timeout, this, [this, i] { releasePot(i); });
+    }
 }
 
 ControlSurface::~ControlSurface() {
@@ -70,8 +76,7 @@ bool ControlSurface::connectPorts(const std::string& input, const std::string& o
     disconnectSurface();
     auto c = openMidi(
         input, output,
-        [this](const MidiMessage& m) { QMetaObject::invokeMethod(this, [this, m] { handle(m); }, Qt::QueuedConnection); },
-        error);
+        [this](const MidiMessage& m) { receive(m); }, error, [this] { connectionLost(); });
     if (!c) return false;
     setConnection(std::move(c));
     return true;
@@ -80,6 +85,7 @@ bool ControlSurface::connectPorts(const std::string& input, const std::string& o
 void ControlSurface::setConnection(std::unique_ptr<MidiConnection> connection) {
     if (connection_) disconnectSurface();
     connection_ = std::move(connection);
+    ++generation_;
     if (!connection_) return;
     // Asked to say it is there (surfaces that wait for a host answer it; the rest are taken as there), meters with
     // their signal and peak lights, then everything it shows.
@@ -98,6 +104,7 @@ void ControlSurface::disconnectSurface() {
             touched_[size_t(i)] = false;
             release(i);
         }
+    for (int i = 0; i < mcu::kStrips; ++i) releasePot(i);
     // Left clean: faders down, every light out, strips and display blank.
     for (int i = 0; i <= kMaster; ++i) send(mcu::fader(i, 0));
     for (int note = 0; note < 0x76; ++note) send(mcu::led(note, 0));
@@ -110,6 +117,66 @@ void ControlSurface::disconnectSurface() {
     for (const MidiMessage& m : mcu::assignment("")) send(m);
     connection_.reset();
     emit connectionChanged(false);
+}
+
+void ControlSurface::receive(const MidiMessage& m) {
+    std::lock_guard<std::mutex> lock(inboxMutex_);
+    inbox_.push_back(m);
+    if (!drainPending_) {
+        drainPending_ = true;
+        QMetaObject::invokeMethod(this, [this] { drain(); }, Qt::QueuedConnection);
+    }
+}
+
+void ControlSurface::connectionLost() {
+    const quint64 generation = generation_.load();
+    QMetaObject::invokeMethod(this, [this, generation] { if (generation == generation_.load()) lost(); }, Qt::QueuedConnection);
+}
+
+void ControlSurface::lost() {
+    if (!connection_) return;
+    timer_->stop();
+    for (int i = 0; i <= kMaster; ++i) {
+        touched_[size_t(i)] = false;
+        release(i);
+    }
+    for (int i = 0; i < mcu::kStrips; ++i) releasePot(i);
+    connection_.reset();
+    emit connectionChanged(false);
+}
+
+void ControlSurface::drain() {
+    std::vector<MidiMessage> batch;
+    {
+        std::lock_guard<std::mutex> lock(inboxMutex_);
+        batch.swap(inbox_);
+        drainPending_ = false;
+    }
+    if (!connection_) return;
+    // A fader's moves that queued up behind each other: only the last needs applying (each is an edit), as long as no
+    // touch of that fader comes between them.
+    for (size_t i = 0; i < batch.size(); ++i) {
+        const MidiMessage& m = batch[i];
+        if (!m.empty() && (m[0] & 0xF0) == 0xE0) {
+            bool later = false;
+            for (size_t j = i + 1; j < batch.size() && !later; ++j) {
+                const MidiMessage& n = batch[j];
+                if (n.empty()) continue;
+                if (n[0] == m[0]) later = true;
+                else if ((n[0] & 0xF0) == 0x90 && n.size() > 1 && n[1] == mcu::FaderTouch + (m[0] & 0x0F)) break;
+            }
+            if (later) continue;
+        }
+        handle(m);
+    }
+}
+
+int ControlSurface::selectedTrack() const {
+    const Sequence* s = state_->sequence();
+    if (!s || !selected_) return -1;
+    for (size_t i = 0; i < s->audioTracks.size(); ++i)
+        if (s->audioTracks[i].id == selected_) return int(i);
+    return -1;
 }
 
 QString ControlSurface::surfaceName() const {
@@ -127,6 +194,7 @@ void ControlSurface::reset() {
     leds_.clear();
     digits_.clear();
     assignment_.clear();
+    bottomAt_ = {};
     levels_ = {};
     meterAt_ = {};
     for (int i = 0; i < mcu::kStrips; ++i) send(mcu::meterMode(i, 0x03, device_));
@@ -141,12 +209,18 @@ void ControlSurface::setBank(int first) {
     const int n = tracks();
     first = std::clamp(first, 0, std::max(0, n - mcu::kStrips));
     if (first == bank_) return;
-    for (int i = 0; i < mcu::kStrips; ++i)
-        if (touched_[size_t(i)] || holds_[size_t(i)]->isActive()) {
-            touched_[size_t(i)] = false;
-            release(i);
-        }
+    // The old tracks let go; a fader still under a hand holds its new track instead (its motor stays still).
+    for (int i = 0; i < mcu::kStrips; ++i) {
+        const bool held = touched_[size_t(i)];
+        touched_[size_t(i)] = false;
+        release(i);
+        releasePot(i);
+        touched_[size_t(i)] = held;
+    }
     bank_ = first;
+    for (int i = 0; i < mcu::kStrips; ++i)
+        if (touched_[size_t(i)])
+            if (QSlider* f = mixer_->trackFader(bank_ + i)) f->setSliderDown(true);
     refresh();
 }
 
@@ -164,6 +238,8 @@ void ControlSurface::handle(const MidiMessage& m) {
         return;
     }
     const mcu::Event e = mcu::decode(m);
+    // Every move from the surface is one undo step together, however many controls move at once.
+    mixer_->setEditMergeKey(QStringLiteral("control-surface"));
     switch (e.kind) {
         case mcu::Event::Fader: moveFader(e.index, e.value); break;
         case mcu::Event::Touch: touch(e.index, e.down); break;
@@ -172,9 +248,10 @@ void ControlSurface::handle(const MidiMessage& m) {
             if (!program_->isPlaying()) program_->step(e.value);
             break;
         case mcu::Event::Button: button(e.index, e.down); break;
-        case mcu::Event::None: return;
+        case mcu::Event::None: break;
     }
-    refresh();  // what it changed shows at once
+    mixer_->setEditMergeKey(QString());
+    if (e.kind != mcu::Event::None) refresh();  // what it changed shows at once
 }
 
 void ControlSurface::moveFader(int strip, int value) {
@@ -213,16 +290,19 @@ void ControlSurface::release(int strip) {
     if (touched_[size_t(strip)]) return;
     QSlider* slider = strip == kMaster ? mixer_->masterFader() : mixer_->trackFader(bank_ + strip);
     if (slider && slider->isSliderDown()) slider->setSliderDown(false);
-    if (strip != kMaster)
-        if (QDial* pan = mixer_->trackPan(bank_ + strip); pan && pan->isSliderDown()) pan->setSliderDown(false);
     shown_[size_t(strip)].fader = -1;  // sent again where it now is
+}
+
+void ControlSurface::releasePot(int strip) {
+    potHolds_[size_t(strip)]->stop();
+    if (QDial* pan = mixer_->trackPan(bank_ + strip); pan && pan->isSliderDown()) pan->setSliderDown(false);
 }
 
 void ControlSurface::turn(int strip, int steps) {
     QDial* pan = mixer_->trackPan(bank_ + strip);
     if (!pan || !pan->isVisibleTo(mixer_) || steps == 0) return;  // (surround tracks pan in two dimensions on screen)
-    pan->setSliderDown(true);
-    holds_[size_t(strip)]->start();
+    pan->setSliderDown(true);  // held while it turns, so a Touch pass records it
+    potHolds_[size_t(strip)]->start();
     pan->setValue(std::clamp(pan->value() + 2 * steps, -100, 100));
     turnedAt_[size_t(strip)] = QDateTime::currentMSecsSinceEpoch();
 }
@@ -241,9 +321,14 @@ void ControlSurface::button(int note, bool down) {
     } else if (const int t = strip(mcu::Solo); t >= 0) {
         if (QToolButton* b = mixer_->trackSolo(t)) b->click();
     } else if (const int t = strip(mcu::Select); t >= 0) {
-        if (t < n) selected_ = selected_ == t ? -1 : t;
+        if (const Sequence* seq = state_->sequence(); seq && t < n) {
+            const Id id = seq->audioTracks[size_t(t)].id;
+            selected_ = selected_ == id ? 0 : id;
+        }
     } else if (const int t = strip(mcu::VPotPush); t >= 0) {
         if (QDial* pan = mixer_->trackPan(t); pan && pan->isVisibleTo(mixer_)) {
+            pan->setSliderDown(true);
+            potHolds_[size_t(t - bank_)]->start();
             pan->setValue(0);
             turnedAt_[size_t(t - bank_)] = QDateTime::currentMSecsSinceEpoch();
         }
@@ -254,6 +339,8 @@ void ControlSurface::button(int note, bool down) {
             case mcu::ChannelLeft: setBank(bank_ - 1); break;
             case mcu::ChannelRight: setBank(bank_ + 1); break;
             case mcu::Play:
+                // Plays at normal speed, from shuttling too.
+                if (program_->isPlaying() && program_->speed() != 1.0) program_->shuttle(0);
                 if (!program_->isPlaying()) program_->togglePlay();
                 break;
             case mcu::Stop:
@@ -267,7 +354,6 @@ void ControlSurface::button(int note, bool down) {
             case mcu::Up: command(QStringLiteral("previousEdit")); break;
             case mcu::Down: command(QStringLiteral("nextEdit")); break;
             case mcu::Marker: command(QStringLiteral("marker")); break;
-            case mcu::Cycle: command(QStringLiteral("loop")); break;
             case mcu::Save: command(QStringLiteral("save")); break;
             case mcu::Undo: state_->undo(); break;
             case mcu::Read:
@@ -275,7 +361,7 @@ void ControlSurface::button(int note, bool down) {
             case mcu::Touch:
             case mcu::Latch: {
                 // The selected track's fader automation; its own mode again turns it off.
-                QComboBox* mode = mixer_->trackAutomationMode(selected_);
+                QComboBox* mode = mixer_->trackAutomationMode(selectedTrack());
                 if (!mode || !mode->isEnabled()) break;
                 const AutomationMode want = note == mcu::Read ? AutomationMode::Read
                                             : note == mcu::Write ? AutomationMode::Write
@@ -312,7 +398,7 @@ void ControlSurface::refresh() {
     const Sequence* seq = state_->sequence();
     const int n = tracks();
     if (bank_ > std::max(0, n - mcu::kStrips)) bank_ = std::max(0, n - mcu::kStrips);
-    if (selected_ >= n) selected_ = -1;
+    const int selected = selectedTrack();
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
     for (int i = 0; i < mcu::kStrips; ++i) {
         Shown& was = shown_[size_t(i)];
@@ -328,7 +414,7 @@ void ControlSurface::refresh() {
             send(mcu::fader(i, fv));
             was.fader = fv;
         }
-        const int mute = tr && tr->muted ? 2 : 0, solo = tr && tr->solo ? 2 : 0, select = has && t == selected_ ? 2 : 0;
+        const int mute = tr && tr->muted ? 2 : 0, solo = tr && tr->solo ? 2 : 0, select = has && t == selected ? 2 : 0;
         if (mute != was.mute) send(mcu::led(mcu::Mute + i, was.mute = mute));
         if (solo != was.solo) send(mcu::led(mcu::Solo + i, was.solo = solo));
         if (select != was.select) send(mcu::led(mcu::Select + i, was.select = select));
@@ -340,7 +426,11 @@ void ControlSurface::refresh() {
         const std::string top = has ? mcu::stripText(tr->name) : std::string(7, ' ');
         const std::string bottom = !has ? std::string(7, ' ') : panning && now - turnedAt_[size_t(i)] < 1000 ? panShort(panValue) : dbShort(db);
         if (top != was.top) send(mcu::lcd(i * 7, was.top = top, device_));
-        if (bottom != was.bottom) send(mcu::lcd(mcu::kLcdWidth + i * 7, was.bottom = bottom, device_));
+        // The level line changes as automation plays: at most ten times a second, so a 5-pin MIDI cable keeps up.
+        if (bottom != was.bottom && now - bottomAt_[size_t(i)] >= 100) {
+            send(mcu::lcd(mcu::kLcdWidth + i * 7, was.bottom = bottom, device_));
+            bottomAt_[size_t(i)] = now;
+        }
     }
     // The master fader.
     if (QSlider* master = mixer_->masterFader()) {
@@ -352,7 +442,7 @@ void ControlSurface::refresh() {
     }
     // Transport and automation lights.
     const bool playing = program_->isPlaying();
-    const QComboBox* mode = mixer_->trackAutomationMode(selected_);
+    const QComboBox* mode = mixer_->trackAutomationMode(selected);
     const int am = mode ? mode->currentIndex() : -1;
     const std::pair<int, bool> lights[] = {{mcu::Play, playing},
                                            {mcu::Stop, !playing},
