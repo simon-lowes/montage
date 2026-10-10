@@ -945,3 +945,23 @@ Ranked by what the market leaders have that Montage lacks, weighed against the w
 - [x] HDR10+ dynamic metadata on HDR10 exports (above). Dolby Vision is not planned: its metadata and RPU tools are licensed.
 - [x] Control surfaces in Mackie Control mode (above). HUI, EuCon and Tangent colour panels are still to come.
 - Runners-up: AI motion deblur.
+
+# Phase 4
+
+The third gap analysis (`docs/research/phase4-roadmap.md`, October 2026) ranks what is still missing against Premiere 26.5, Resolve 21.1, Final Cut Pro 12 and Media Composer 2025.12. Worked through in order:
+
+- [ ] 1. ProRes RAW with RAW controls, and current camera logs (Apple Log 2, D-Log2, GoPro Log, L-Log) (M).
+- [ ] 2. HDR viewer on HDR and EDR displays (M).
+- [ ] 3. Stacked timelines and editing from a sequence (S–M).
+- [ ] 4. Aux sends and full mixer automation (M).
+- [ ] 5. Voice-cloned speech (M).
+- [ ] 6. Stem separation and prompted sound isolation (L).
+- [ ] 7. Editable motion-graphics templates (M).
+- [ ] 8. Audio search by description (S–M).
+- [ ] 9. ALE and ASC CDL interchange (S).
+- [ ] 10. Editing growing files (M).
+- [ ] 11. In-app scripting and extension panels (M–L).
+- [ ] 12. Motion Deblur (M).
+- [ ] 13. Control surfaces beyond Mackie: Tangent, HUI, editor keyboards (M).
+- [ ] 14. Freeform storyboard bin (M).
+- [ ] 15. Spatial video (MV-HEVC) in and out (M).
