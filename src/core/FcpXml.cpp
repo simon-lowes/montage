@@ -79,7 +79,7 @@ struct Fcp7Writer {
     QString out;
     std::map<Id, QString> fileIds;   // media -> file id (written in full once)
     std::map<Id, QString> clipItem;  // clip -> clipitem id (in the sequence being written)
-    std::map<Id, QString> nestedIds;  // nested sequences -> their sequence ids (written in full where first used)
+    std::map<std::string, QString> nestedIds;  // nested sequences (and multicam parts) -> their ids (written in full where first used)
     std::deque<Sequence> copies;       // those sequences as the exports write them
     int nextItem = 0, depth = 0;
 
@@ -233,14 +233,18 @@ struct Fcp7Writer {
         times(c, t);
         const Sequence* nested = m->kind == MediaKind::Sequence ? p.findSequence(m->sequenceId) : nullptr;
         if (nested && depth < 8) {
-            // A nested sequence, as Premiere writes one: in full where first used, by its id afterwards.
-            if (auto it = nestedIds.find(nested->id); it != nestedIds.end()) {
+            // A nested sequence, as Premiere writes one: in full where first used, by its id afterwards. A multicam clip
+            // left as one (at another speed) nests only what it shows.
+            const std::string key = std::to_string(nested->id) +
+                                    (nested->multicam ? (audio ? ":a" + std::to_string(c.audioAngle) : ":v" + std::to_string(c.angle)) : std::string());
+            if (auto it = nestedIds.find(key); it != nestedIds.end()) {
                 w.writeEmptyElement("sequence");
                 w.writeAttribute("id", it->second);
             } else {
                 const QString id = QString("sequence-%1").arg(nestedIds.size() + 2);
-                nestedIds[nested->id] = id;
-                copies.push_back(interchangeSequence(flattenedMulticam(p, *nested)));
+                nestedIds[key] = id;
+                copies.push_back(nested->multicam ? multicamPart(*nested, !audio, c.angle, c.audioAngle)
+                                                  : interchangeSequence(flattenedMulticam(p, *nested)));
                 sequence(copies.back(), id);
             }
         } else {
@@ -827,9 +831,16 @@ struct FcpxWriter {
         w.writeAttribute("start", c.isGenerator() ? "0s" : t(c.sourceIn));
         w.writeAttribute("duration", t(double(c.duration)));
         if (!c.enabled) w.writeAttribute("enabled", "0");
+        if (!c.isGenerator()) timeMap(c);  // (before mc-source, as the DTD orders them)
         if (inner && inner->multicam && nested.count(inner->id)) {
-            // Which angle is seen and which heard (Montage's mix of every source becomes the seen angle's sound).
-            const int video = std::clamp(c.angle, 0, std::max(0, int(inner->videoTracks.size()) - 1));
+            // Which angle is seen and which heard (Montage's mix of every source becomes the seen angle's sound: for
+            // sound on its own, the angle its linked picture shows).
+            int shown = c.angle;
+            if (audioOnly)
+                for (Id other : edit::linkedClips(*cur, c.id))
+                    if (const Clip* v = edit::clipById(*cur, other); v && v->mediaId == c.mediaId && edit::locate(*cur, other)->track.kind == TrackKind::Video)
+                        shown = v->angle;
+            const int video = std::clamp(shown, 0, std::max(0, int(inner->videoTracks.size()) - 1));
             int heard = -1;
             if (audioOnly) heard = audioAngleOf(*inner, c.audioAngle);
             else if (withAudio && audio) heard = audioAngleOf(*inner, audio->audioAngle);
@@ -866,7 +877,6 @@ struct FcpxWriter {
             w.writeAttribute("fontColor", "1 1 1 1");
             w.writeEndElement();
         }
-        if (!c.isGenerator()) timeMap(c);
         for (const Connected& k : connected) clip(*k.clip, k.lane, k.offset, false);
         for (const Marker& m : markersIn(c.start, c.end()))
             marker(m, (c.isGenerator() ? 0 : c.sourceIn) + double(m.t - c.start) * c.speed);
@@ -1095,6 +1105,16 @@ struct FcpxReader {
     std::set<QString> making;
     std::vector<std::string> warnings;
     ImportResult nestedResults;  // what nested builds found (clips, offline files, warnings)
+    // Inside a multicam angle, connected sound (a recorder's track beside the camera) waits until every angle has its
+    // tracks, then gets tracks of its own (a sound-only source); connected pictures cannot be an angle's.
+    struct Deferred {
+        QDomElement e;
+        double at;
+        int lane, angle;
+    };
+    bool inAngle = false;
+    int angleIndex = 0;
+    std::vector<Deferred> deferred;
 
     FcpxReader(Project& pr, TimelineBuilder& bu, double rate, const MediaProber& pb) : p(pr), b(&bu), fps(rate), probe(pb) {}
     FrameTime frames(double seconds) const { return FrameTime(std::llround(seconds * fps)); }
@@ -1178,7 +1198,14 @@ struct FcpxReader {
             // Each angle: its picture a video track (an angle in Montage), its sound an audio track.
             int v = 0, a = 0;
             auto& ids = angles[ref];
-            for (QDomElement angle = body.firstChildElement("mc-angle"); !angle.isNull(); angle = angle.nextSiblingElement("mc-angle")) {
+            const bool wasInAngle = inAngle;
+            std::vector<Deferred> outerDeferred;
+            outerDeferred.swap(deferred);
+            inAngle = true;
+            angleIndex = 0;
+            std::vector<QString> angleNames;
+            for (QDomElement angle = body.firstChildElement("mc-angle"); !angle.isNull(); angle = angle.nextSiblingElement("mc-angle"), ++angleIndex) {
+                angleNames.push_back(angle.attribute("name"));
                 storyline(angle, tcStart, v, a);
                 const auto used = [&](const std::vector<Track>& list, int i) { return int(list.size()) > i && !list[size_t(i)].clips.empty(); };
                 const QString angleName = angle.attribute("name");
@@ -1193,6 +1220,21 @@ struct FcpxReader {
                 }
                 ids[angle.attribute("angleID")] = tracks;
             }
+            inAngle = wasInAngle;
+            // The angles' connected sound, a track for each angle's lane after all the angles' own.
+            std::map<std::pair<int, int>, int> trackFor;
+            for (const Deferred& d : deferred) {
+                auto [it, added] = trackFor.try_emplace({d.angle, d.lane}, a);
+                if (added) {
+                    const QString n = d.angle < int(angleNames.size()) ? angleNames[size_t(d.angle)] : QString();
+                    nb.track(TrackKind::Audio, a).name = (n.isEmpty() ? QStringLiteral("Angle %1").arg(d.angle + 1) : n).toStdString() + " (connected)";
+                    ++a;
+                }
+                Id ignore = 0;
+                double none = 0;
+                element(d.e, d.at, -1, it->second, ignore, none);
+            }
+            deferred.swap(outerDeferred);
         } else {
             storyline(body.firstChildElement("spine"), tcStart, 0, 0);
         }
@@ -1331,19 +1373,21 @@ struct FcpxReader {
                 const QString ref = e.attribute("ref");
                 const double origin = parseFcpTime(medias[ref].firstChildElement("multicam").attribute("tcStart", "0s"));
                 const auto& ids = angles[ref];
-                int seen = -1, heard = -2;  // -2: no sound chosen
-                bool anySource = false;
+                int seen = -1, heard = -2;  // -2: no sound (none chosen, or the angle chosen has none)
+                bool anySource = false, anyKnown = false;
                 for (QDomElement src = e.firstChildElement("mc-source"); !src.isNull(); src = src.nextSiblingElement("mc-source")) {
                     anySource = true;
                     const auto it = ids.find(src.attribute("angleID"));
                     if (it == ids.end()) continue;
+                    anyKnown = true;
                     const QString enable = src.attribute("srcEnable", "all");
                     if (enable != "audio" && it->second.first >= 0) seen = it->second.first;
-                    if (enable != "video") heard = it->second.second;  // (-1, all of them, for an angle with no sound)
+                    if (enable != "video" && it->second.second >= 0) heard = it->second.second;
                 }
-                if (!anySource) {
+                if (anySource && !anyKnown) b->warn("A multicam clip names angles its multicam does not have; the first angle is shown (" + name + ")");
+                if (!anyKnown) {
                     seen = 0;
-                    heard = -1;
+                    heard = -1;  // every source's sound
                 }
                 const MediaItem* m = p.findMedia(mid);
                 Id v = 0, au = 0;
@@ -1366,9 +1410,9 @@ struct FcpxReader {
         }
         if (lane(e) == 0 && placed) {
             if (pendingDissolve > 0 && lastPrimary)
-                b->addTransition(TrackKind::Video, 0, lastPrimary, placed, frames(pendingDissolve), {});
+                b->addTransition(TrackKind::Video, std::max(0, vTrack), lastPrimary, placed, frames(pendingDissolve), {});
             if (pendingDissolve > 0 && lastPrimaryAudio && placedAudio)
-                b->addTransition(TrackKind::Audio, 0, lastPrimaryAudio, placedAudio, frames(pendingDissolve), "crossfade");
+                b->addTransition(TrackKind::Audio, std::max(0, aTrack), lastPrimaryAudio, placedAudio, frames(pendingDissolve), "crossfade");
             pendingDissolve = 0;
             lastPrimary = placed;
             lastPrimaryAudio = placedAudio;
@@ -1378,6 +1422,11 @@ struct FcpxReader {
             const int l = lane(k);
             if (l == 0) continue;
             const double kAt = at + (parseFcpTime(k.attribute("offset", "0s")) - start) / std::max(0.01, speed);
+            if (inAngle) {
+                if (l < 0) deferred.push_back({k, kAt, l, angleIndex});
+                else b->warn("A picture connected inside a multicam angle was left out (" + k.attribute("name").toStdString() + ")");
+                continue;
+            }
             Id ignore = 0;
             double none = 0;
             // Lane n > 0 is V(n + 1); lane -n is A(n + 1) (A1 carries the storyline's own sound).

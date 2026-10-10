@@ -116,6 +116,20 @@ bool timecodeOffsets(const Project& p, const std::vector<Id>& media, std::vector
     return true;
 }
 
+Sequence multicamPart(const Sequence& mc, bool picture, int angle, int audioAngle) {
+    Sequence part = mc;
+    part.multicam = false;
+    if (picture) {
+        part.audioTracks.clear();
+        if (mc.videoTracks.empty()) return part;
+        part.videoTracks = {mc.videoTracks[size_t(std::clamp(angle, 0, int(mc.videoTracks.size()) - 1))]};
+    } else {
+        part.videoTracks.clear();
+        if (audioAngle >= 0 && audioAngle < int(mc.audioTracks.size())) part.audioTracks = {mc.audioTracks[size_t(audioAngle)]};
+    }
+    return part;
+}
+
 Sequence flattenedMulticam(const Project& p, const Sequence& in) {
     Sequence s = in;
     std::vector<Id> clips;
@@ -136,21 +150,61 @@ Sequence flattenedMulticam(const Project& p, const Sequence& in) {
             const int track = angle >= 0 ? angleAudioTrack(*mc, angle) : -1;
             a.audioAngle = track >= 0 ? track : mc->audioTracks.empty() ? -1 : 0;
         }
+    const Sequence unflattened = s;
+    // Transitions touching a multicam clip, to be put back between the pieces that replace it.
+    struct Kept {
+        TrackRef track;
+        Transition tr;
+        FrameTime aEnd = -1, bStart = -1;  // where the multicam clip on either side ended or started
+    };
+    std::vector<Kept> kept;
+    const auto isMulticam = [&](Id id) { return std::find(clips.begin(), clips.end(), id) != clips.end(); };
+    for (const TrackRef ref : allTracks(s)) {
+        const Track& t = *trackAt(s, ref);
+        for (const Transition& tr : t.transitions) {
+            if (!isMulticam(tr.clipA) && !isMulticam(tr.clipB)) continue;
+            Kept k{ref, tr};
+            if (const Clip* a = tr.clipA ? edit::clipById(s, tr.clipA) : nullptr; a && isMulticam(a->id)) k.aEnd = a->end();
+            if (const Clip* b = tr.clipB ? edit::clipById(s, tr.clipB) : nullptr; b && isMulticam(b->id)) k.bStart = b->start;
+            kept.push_back(k);
+        }
+    }
+    // Locks only guard editing by hand: the copy is flattened whatever is locked.
+    for (auto* list : {&s.videoTracks, &s.audioTracks})
+        for (Track& t : *list) t.locked = false;
     Project scratch = p;  // (new ids only; the media and sequences are the project's)
     const edit::Result r = edit::flattenMulticam(scratch, s, clips);
-    if (!r.ok) return s;
-    // Picture and sound cut from one source together stay linked.
+    if (!r.ok) return unflattened;
+    for (auto* list : {&s.videoTracks, &s.audioTracks})
+        for (size_t i = 0; i < list->size(); ++i)
+            (*list)[i].locked = (list == &s.videoTracks ? unflattened.videoTracks : unflattened.audioTracks)[i].locked;
     std::vector<Clip*> made;
     for (auto* list : {&s.videoTracks, &s.audioTracks})
         for (Track& t : *list)
             for (Clip& c : t.clips)
                 if (std::find(r.created.begin(), r.created.end(), c.id) != r.created.end()) made.push_back(&c);
+    // Picture and sound cut from one source together stay linked.
     for (Clip* v : made)
         for (Clip* a : made)
             if (v != a && !v->linkGroup && !a->linkGroup && v->mediaId == a->mediaId && v->start == a->start &&
                 v->duration == a->duration && edit::locate(s, v->id)->track.kind == TrackKind::Video &&
                 edit::locate(s, a->id)->track.kind == TrackKind::Audio)
                 v->linkGroup = a->linkGroup = scratch.newId();
+    // Dissolves and fades back on: the piece ending where the old clip ended, the piece starting where it started.
+    for (Kept& k : kept) {
+        Track* t = trackAt(s, k.track);
+        if (!t) continue;
+        auto pieceAt = [&](FrameTime edge, bool ending) -> Id {
+            for (const Clip& c : t->clips)
+                if ((ending ? c.end() : c.start) == edge) return c.id;
+            return 0;
+        };
+        if (k.aEnd >= 0) k.tr.clipA = pieceAt(k.aEnd, true);
+        if (k.bStart >= 0) k.tr.clipB = pieceAt(k.bStart, false);
+        if ((k.aEnd >= 0 && !k.tr.clipA) || (k.bStart >= 0 && !k.tr.clipB)) continue;  // (an angle with nothing there)
+        if (std::none_of(t->transitions.begin(), t->transitions.end(), [&](const Transition& o) { return o.id == k.tr.id; }))
+            t->transitions.push_back(k.tr);
+    }
     return s;
 }
 

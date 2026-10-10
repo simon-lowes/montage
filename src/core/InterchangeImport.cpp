@@ -244,11 +244,19 @@ struct OtioReader {
         TimelineBuilder nb(p, name, fps, probe);
         nb.sequence().width = own.contains("width") ? std::max(16, own.value("width").toInt()) : parent.sequenceWidth();
         nb.sequence().height = own.contains("height") ? std::max(16, own.value("height").toInt()) : parent.sequenceHeight();
-        // Every Stack's tracks: the picture from one, the sound from the other.
+        // Its picture from the first Stack that has picture, its sound from the first that has sound (a clip cut in two
+        // is two Stacks of the same tracks).
         QJsonArray tracks;
-        bool marked = false;
+        bool marked = false, havePicture = false, haveSound = false;
         for (const QJsonObject& st : list->second) {
-            for (const auto& t : st.value("children").toArray()) tracks.append(t);
+            bool picture = false, sound = false;
+            for (const auto& t : st.value("children").toArray()) (t.toObject().value("kind").toString() == "Audio" ? sound : picture) = true;
+            for (const auto& t : st.value("children").toArray()) {
+                const bool isSound = t.toObject().value("kind").toString() == "Audio";
+                if (isSound ? !haveSound : !havePicture) tracks.append(t);
+            }
+            havePicture |= picture;
+            haveSound |= sound;
             if (!marked && !st.value("markers").toArray().isEmpty()) {
                 for (const auto& mv : st.value("markers").toArray()) nb.sequence().markers.push_back(otioMarker(mv.toObject(), fps.toDouble()));
                 marked = true;
@@ -335,9 +343,13 @@ struct OtioReader {
                 const double sourceIn = scalar < 0 ? srcStart - dur * std::fabs(scalar) : srcStart;
                 Clip* clip = nullptr;
                 if (schema.startsWith("Stack.")) {
-                    // A nested timeline: a compound clip of its sequence.
+                    // A nested timeline: a compound clip of its sequence (all of it when no range is given).
                     if (const Id mid = nestedMedia(keyOf(item), b, depth)) {
-                        clip = b.addClip(kind, index, mid, start, len, sourceIn, name);
+                        FrameTime length = len;
+                        if (length <= 0)
+                            if (const MediaItem* m = p.findMedia(mid)) length = FrameTime(std::llround(m->duration * rate));
+                        clip = b.addClip(kind, index, mid, start, length, sourceIn, name);
+                        if (len <= 0 && clip) cursorAdvance = double(length);
                         if (clip) {
                             clip->speed = std::max(0.01, std::fabs(scalar));
                             clip->reverse = scalar < 0;
@@ -398,10 +410,12 @@ struct OtioReader {
                     prev = 0;
                 }
                 pendingTr.reset();
-                cursor += dur;
+                cursor += dur + cursorAdvance;
+                cursorAdvance = 0;
             }
         }
     }
+    double cursorAdvance = 0;  // a nested timeline without a range: its own length, which the item did not say
 };
 
 }  // namespace

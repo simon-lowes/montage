@@ -6404,6 +6404,169 @@ private slots:
         QVERIFY(!importEdl(p, "nothing here", {25, 1}).ok);
     }
 
+    void interchangeReviewFixes() {
+        Project p = makeDefaultProject();
+        auto addMedia = [&](const char* name, bool video, bool audio) {
+            MediaItem m;
+            m.id = p.newId();
+            m.kind = video ? MediaKind::Video : MediaKind::Audio;
+            m.name = name;
+            m.path = std::string("/nonexistent/") + name;
+            m.duration = 20.0;
+            m.width = 1920;
+            m.height = 1080;
+            m.fps = {30, 1};
+            m.hasVideo = video;
+            m.hasAudio = audio;
+            p.media.push_back(m);
+            return m.id;
+        };
+        const Id camA = addMedia("CamA.mov", true, true), camB = addMedia("CamB.mov", true, true);
+        std::string err;
+        const Id mcMedia = makeMulticam(p, {camA, camB}, {0.0, 0.0}, "Pair", &err);
+        QVERIFY2(mcMedia, err.c_str());
+        Sequence& s = *p.active();
+        QVERIFY(edit::placeMedia(p, s, mcMedia, 0, 0, 120, V1, A1, false).ok);
+        QVERIFY(edit::switchAngle(p, s, trackAt(s, V1)->clips.at(0).id, 1, 60, true, true).ok);
+        // A dissolve at the angle switch, picture and sound.
+        for (TrackRef ref : {V1, A1}) {
+            Track& t = *trackAt(s, ref);
+            Transition tr;
+            tr.id = p.newId();
+            tr.type = ref.kind == TrackKind::Video ? "cross_dissolve" : "crossfade";
+            tr.clipA = t.clips.at(0).id;
+            tr.clipB = t.clips.at(1).id;
+            tr.duration = 10;
+            t.transitions.push_back(tr);
+        }
+        // Flattening keeps the dissolves (between the pieces now) and works on locked tracks too.
+        trackAt(s, V1)->locked = true;
+        Sequence flat = flattenedMulticam(p, s);
+        QCOMPARE(trackAt(flat, V1)->clips.size(), size_t(2));
+        QCOMPARE(trackAt(flat, A1)->clips.size(), size_t(2));
+        QCOMPARE(trackAt(flat, V1)->clips[0].mediaId, camA);
+        QCOMPARE(trackAt(flat, A1)->clips[1].mediaId, camB);
+        QVERIFY(trackAt(flat, V1)->locked);
+        for (TrackRef ref : {V1, A1}) {
+            const Track& t = *trackAt(flat, ref);
+            QCOMPARE(t.transitions.size(), size_t(1));
+            QCOMPARE(t.transitions[0].clipA, t.clips[0].id);
+            QCOMPARE(t.transitions[0].clipB, t.clips[1].id);
+        }
+        QVERIFY(exportEdl(p, s).find("D    010") != std::string::npos);
+        trackAt(s, V1)->locked = false;
+
+        // A multicam clip at twice the speed stays one; FCPXML writes its timeMap before the mc-source, OTIO and FCP 7
+        // XML nest only the angle it shows.
+        Clip& fast = trackAt(s, V1)->clips[0];
+        fast.speed = 2;
+        for (Id other : edit::linkedClips(s, fast.id)) edit::clipById(s, other)->speed = 2;
+        const std::string fcpx = exportFcpXml(p, s);
+        const size_t mc = fcpx.find("<mc-clip ");
+        QVERIFY(mc != std::string::npos);
+        const size_t tm = fcpx.find("<timeMap", mc), src = fcpx.find("<mc-source", mc);
+        QVERIFY(tm != std::string::npos && src != std::string::npos && tm < src);
+        const QJsonObject otio = QJsonDocument::fromJson(QByteArray::fromStdString(exportOtio(p, s))).object();
+        const QJsonObject stack = otio["tracks"].toObject()["children"].toArray()[0].toObject()["children"].toArray()[0].toObject();
+        QCOMPARE(stack["OTIO_SCHEMA"].toString(), QString("Stack.1"));
+        QCOMPARE(stack["children"].toArray().size(), 1);  // angle A alone, not both cameras stacked
+        QCOMPARE(stack["children"].toArray()[0].toObject()["children"].toArray()[0].toObject()["name"].toString(), QString("CamA.mov"));
+        const std::string fcp7 = exportFcp7Xml(p, s);
+        QVERIFY(fcp7.find("CamA.mov") != std::string::npos);
+        fast.speed = 1;
+        for (Id other : edit::linkedClips(s, fast.id)) edit::clipById(s, other)->speed = 1;
+
+        // Sound on its own (a J-cut: not carried with the picture) playing the mix takes the angle its picture shows.
+        Clip& late = trackAt(s, A1)->clips[1];
+        late.audioAngle = -1;
+        late.start += 3;
+        late.duration -= 3;
+        late.sourceIn += 3;
+        std::string again = exportFcpXml(p, s);
+        const size_t lane = again.find("lane=\"-1\"");
+        QVERIFY(lane != std::string::npos);
+        const size_t heard = again.find("<mc-source", lane);
+        QVERIFY(heard != std::string::npos && heard - lane < 400);
+        QVERIFY2(again.substr(heard, 60).find("angleID=\"angle-2\" srcEnable=\"audio\"") != std::string::npos, again.substr(heard, 60).c_str());
+
+        // A compound clip cut in two reads back from OTIO with its tracks once, not twice.
+        Sequence inner = makeSequence(p, "Inner", 1920, 1080, {30, 1}, 1, 1);
+        {
+            Clip v = makeClip(p, *p.findMedia(camA), TrackKind::Video, inner), a = makeClip(p, *p.findMedia(camA), TrackKind::Audio, inner);
+            v.duration = a.duration = 90;
+            inner.videoTracks[0].clips.push_back(v);
+            inner.audioTracks[0].clips.push_back(a);
+        }
+        MediaItem cm;
+        cm.id = p.newId();
+        cm.kind = MediaKind::Sequence;
+        cm.name = "Inner";
+        cm.sequenceId = inner.id;
+        cm.hasVideo = cm.hasAudio = true;
+        cm.fps = {30, 1};
+        cm.duration = 3;
+        p.sequences.push_back(inner);
+        p.media.push_back(cm);
+        Sequence& s2 = *p.active();
+        removeClips(p, s2, expandLinks(s2, {trackAt(s2, V1)->clips[0].id, trackAt(s2, V1)->clips[1].id}), false);
+        QVERIFY(edit::placeMedia(p, s2, cm.id, 0, 0, 90, V1, A1, false).ok);
+        QVERIFY(edit::razorAll(p, s2, 45).ok);
+        QCOMPARE(trackAt(s2, V1)->clips.size(), size_t(2));
+        Project q = makeDefaultProject();
+        ImportResult r = importOtio(q, exportOtio(p, s2));
+        QVERIFY2(r.ok, r.error.c_str());
+        const Sequence& back = *q.findSequence(r.sequence);
+        const MediaItem* nm = q.findMedia(trackAt(back, V1)->clips.at(0).mediaId);
+        QVERIFY(nm && nm->kind == MediaKind::Sequence);
+        const Sequence* ns = q.findSequence(nm->sequenceId);
+        QCOMPARE(ns->videoTracks.size(), size_t(1));
+        QCOMPARE(ns->audioTracks.size(), size_t(1));
+        // An OTIO Stack with no range (OTIO's default) shows all of its timeline.
+        const char* bare =
+            "{\"OTIO_SCHEMA\":\"Timeline.1\",\"name\":\"T\",\"global_start_time\":{\"OTIO_SCHEMA\":\"RationalTime.1\",\"rate\":25,\"value\":0},"
+            "\"tracks\":{\"OTIO_SCHEMA\":\"Stack.1\",\"children\":[{\"OTIO_SCHEMA\":\"Track.1\",\"kind\":\"Video\",\"name\":\"V1\",\"children\":["
+            "{\"OTIO_SCHEMA\":\"Stack.1\",\"name\":\"Nest\",\"source_range\":null,\"children\":[{\"OTIO_SCHEMA\":\"Track.1\",\"kind\":\"Video\",\"children\":["
+            "{\"OTIO_SCHEMA\":\"Clip.2\",\"name\":\"a\",\"source_range\":{\"OTIO_SCHEMA\":\"TimeRange.1\",\"start_time\":{\"OTIO_SCHEMA\":\"RationalTime.1\",\"rate\":25,\"value\":0},"
+            "\"duration\":{\"OTIO_SCHEMA\":\"RationalTime.1\",\"rate\":25,\"value\":50}},\"media_reference\":{\"OTIO_SCHEMA\":\"ExternalReference.1\",\"target_url\":\"file:///x/a.mov\"}}]}]},"
+            "{\"OTIO_SCHEMA\":\"Clip.2\",\"name\":\"b\",\"source_range\":{\"OTIO_SCHEMA\":\"TimeRange.1\",\"start_time\":{\"OTIO_SCHEMA\":\"RationalTime.1\",\"rate\":25,\"value\":0},"
+            "\"duration\":{\"OTIO_SCHEMA\":\"RationalTime.1\",\"rate\":25,\"value\":10}},\"media_reference\":{\"OTIO_SCHEMA\":\"ExternalReference.1\",\"target_url\":\"file:///x/b.mov\"}}"
+            "]}]}}";
+        Project q2 = makeDefaultProject();
+        ImportResult r2 = importOtio(q2, bare);
+        QVERIFY2(r2.ok, r2.error.c_str());
+        const auto& vc = trackAt(*q2.findSequence(r2.sequence), V1)->clips;
+        QCOMPARE(vc.size(), size_t(2));
+        QCOMPARE(vc[0].duration, FrameTime(50));
+        QCOMPARE(vc[1].start, FrameTime(50));
+
+        // Final Cut angles: a recorder connected inside an angle gets a track of its own, a dissolve inside the second
+        // angle stays on its track, a picture-only angle chosen for sound gives no sound, an unknown angle is reported.
+        Project f = makeDefaultProject();
+        ImportResult rf = importXmlTimeline(f, readData("interchange/final-cut-angles.fcpxml"));
+        QVERIFY2(rf.ok, rf.error.c_str());
+        bool warnedAngle = false;
+        for (const std::string& w : rf.warnings) {
+            QVERIFY2(w.find("Overlapping") == std::string::npos, w.c_str());
+            warnedAngle |= w.find("angles its multicam does not have") != std::string::npos;
+        }
+        QVERIFY(warnedAngle);
+        const Sequence& fs = *f.findSequence(rf.sequence);
+        const Sequence* fm = f.findSequence(f.findMedia(trackAt(fs, V1)->clips.at(0).mediaId)->sequenceId);
+        QVERIFY(fm && fm->multicam);
+        QCOMPARE(angleNames(*fm), (std::vector<std::string>{"Cam A", "Cam B", "GoPro"}));
+        QCOMPARE(fm->audioTracks.size(), size_t(3));
+        QCOMPARE(fm->audioTracks[2].name, std::string("Cam A (connected)"));
+        QCOMPARE(f.findMedia(fm->audioTracks[2].clips.at(0).mediaId)->name, std::string("ZOOM_A"));
+        QCOMPARE(fm->audioTracks[0].clips.at(0).duration, FrameTime(1000));
+        QCOMPARE(fm->videoTracks[1].transitions.size(), size_t(1));
+        QCOMPARE(trackAt(fs, V1)->clips[0].angle, 2);
+        QCOMPARE(trackAt(fs, V1)->clips[1].angle, 0);
+        const auto& fa = trackAt(fs, A1)->clips;
+        QCOMPARE(fa.size(), size_t(1));  // the GoPro part is silent
+        QCOMPARE(fa[0].start, FrameTime(100));
+        QCOMPARE(fa[0].audioAngle, -1);
+    }
+
     void ascCdlAndAle() {
         // The CDL maths, v1.2: slope, offset, clamp, power; saturation about Rec. 709 luma, clamped.
         Cdl g;

@@ -176,7 +176,10 @@ QJsonObject trackJson(const Project& p, const Sequence& s, const Track& t, int d
 // video track, sound in an audio track; Montage's metadata names the sequence so both halves come back as one).
 QJsonObject stackJson(const Project& p, const Sequence& s, const Clip& c, const Sequence& nested, TrackKind kind, int depth) {
     const double rate = s.fpsValue();
-    const Sequence inner = interchangeSequence(flattenedMulticam(p, nested));
+    // A multicam clip left as one (at another speed): only what it shows, as a plain nested sequence.
+    const bool part = nested.multicam;
+    const Sequence inner = part ? multicamPart(nested, kind == TrackKind::Video, c.angle, c.audioAngle)
+                                : interchangeSequence(flattenedMulticam(p, nested));
     QJsonObject o = item("Stack.1", QString::fromStdString(c.name));
     o["enabled"] = c.enabled;
     o["source_range"] = range(c.reverse ? c.sourceIn + c.sourceExtent() : c.sourceIn, double(c.duration), rate);
@@ -194,6 +197,10 @@ QJsonObject stackJson(const Project& p, const Sequence& s, const Clip& c, const 
         fx.append(QJsonObject{{"OTIO_SCHEMA", "LinearTimeWarp.1"}, {"name", ""}, {"effect_name", "LinearTimeWarp"},
                               {"time_scalar", (c.reverse ? -1.0 : 1.0) * speed}, {"metadata", QJsonObject()}});
         o["effects"] = fx;
+    }
+    if (part) {
+        o["metadata"] = QJsonObject{{"montage", QJsonObject{{"clip_id", double(c.id)}, {"sequence_name", QString::fromStdString(nested.name)}}}};
+        return o;
     }
     o["metadata"] = QJsonObject{{"montage", QJsonObject{{"clip_id", double(c.id)},
                                                         {"sequence_id", double(nested.id)},
