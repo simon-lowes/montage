@@ -1544,6 +1544,24 @@ void MainWindow::buildMenus() {
             a->setChecked(cleanFeed_ && cleanFeed_->isVisible() && cleanFeed_->screen() == screens[i]);
         }
     });
+    // How ambisonic sound (core/Ambisonics.h) is heard: binaurally on headphones, or as stereo on speakers.
+    {
+        QMenu* ambiM = play->addMenu(tr("Ambisonic Monitoring"));
+        ambiM->setObjectName(QStringLiteral("ambisonicMonitorMenu"));
+        auto* group = new QActionGroup(ambiM);
+        const bool binaural = appSettings().value("playback/ambisonicBinaural", true).toBool();
+        program_->setAmbisonicBinaural(binaural);
+        for (const bool b : {true, false}) {
+            QAction* a = ambiM->addAction(b ? tr("Binaural (Headphones)") : tr("Stereo (Speakers)"), this, [this, b] {
+                program_->setAmbisonicBinaural(b);
+                appSettings().setValue("playback/ambisonicBinaural", b);
+            });
+            a->setObjectName(b ? QStringLiteral("ambisonicBinaural") : QStringLiteral("ambisonicStereo"));
+            a->setCheckable(true);
+            a->setChecked(b == binaural);
+            group->addAction(a);
+        }
+    }
     // How the Program monitor shows a stereo 3D sequence's two eyes (render/Stereo.h).
     QMenu* stereoM = play->addMenu(tr("Stereo 3D View"));
     stereoM->setObjectName(QStringLiteral("stereoViewMenu"));

@@ -22,11 +22,18 @@ std::string audioKey(const std::string& path, const std::vector<int>& channels) 
     return key;
 }
 
+std::string ambisonicAudioKey(const std::string& path) { return path + kChannelMark + "ambix"; }
+
+bool isAmbisonicAudioKey(const std::string& key) {
+    const size_t mark = key.find(kChannelMark);
+    return mark != std::string::npos && key.compare(mark + 1, std::string::npos, "ambix") == 0;
+}
+
 std::string audioKeyFile(const std::string& key, std::vector<int>* channels) {
     const size_t mark = key.find(kChannelMark);
     if (channels) {
         channels->clear();
-        if (mark != std::string::npos) {
+        if (mark != std::string::npos && !isAmbisonicAudioKey(key)) {
             size_t from = mark + 1;
             while (from < key.size()) {
                 size_t comma = key.find(',', from);
@@ -199,7 +206,7 @@ AudioBufferPtr MediaPool::audio(const std::string& path, int sampleRate) {
     }
     std::vector<int> channels;
     const std::string file = audioKeyFile(path, &channels);
-    AudioBufferPtr buf = decodeAudio(file, sampleRate, nullptr, nullptr, channels);
+    AudioBufferPtr buf = isAmbisonicAudioKey(path) ? decodeAmbisonic(file, sampleRate) : decodeAudio(file, sampleRate, nullptr, nullptr, channels);
     if (!buf) buf = std::make_shared<AudioBuffer>();  // remember failures as silence
     PeaksPtr pk = computePeaks(*buf);
     std::function<void(const std::string&)> cb;

@@ -703,6 +703,7 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
         if (!m.colorSpace.empty()) o["colorSpace"] = qs(m.colorSpace);
         if (!m.colorOverride.empty()) o["colorOverride"] = qs(m.colorOverride);
         if (!m.projection.empty()) o["projection"] = qs(m.projection);
+        if (m.ambisonic > 0) o["ambisonic"] = m.ambisonic;
         if (!m.stereo.empty()) o["stereo"] = qs(m.stereo);
         if (m.timecode >= 0) o["timecode"] = m.timecode;
         if (!m.audioChannelMode.empty()) o["audioChannelMode"] = qs(m.audioChannelMode);
@@ -846,6 +847,7 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
         m.colorSpace = ss(o.value("colorSpace"));
         m.colorOverride = ss(o.value("colorOverride"));
         m.projection = ss(o.value("projection"));
+        m.ambisonic = std::clamp(o.value("ambisonic").toInt(0), 0, 7);
         m.stereo = ss(o.value("stereo"));
         m.timecode = o.value("timecode").toDouble(-1);
         for (const auto& v : o.value("audioStreams").toArray()) m.audioStreams.push_back(std::max(1, v.toInt(1)));

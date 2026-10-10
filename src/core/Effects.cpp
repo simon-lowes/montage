@@ -515,6 +515,14 @@ std::vector<EffectInfo> buildCatalog() {
                  {choice("mode", "Channels", {"Stereo", "Mono (Sum)", "Left to Both", "Right to Both", "Swap Left and Right"}, 0),
                   boolean("invert_l", "Invert Left Polarity"), boolean("invert_r", "Invert Right Polarity")},
                  {}});
+    // Ambisonic sound (core/Ambisonics.h): the field turned (as a view of it would turn), following the linked
+    // picture's Reframe 360° view while asked, and heard binaurally (headphones) or as stereo (speakers).
+    c.push_back({"ambisonics", "Ambisonics", EffectCategory::AudioFilter, "Channels",
+                 {num("yaw", "Turn (degrees right)", -180, 180, 0, 0.5), num("pitch", "Tilt (degrees up)", -90, 90, 0, 0.5),
+                  num("roll", "Roll (degrees clockwise)", -180, 180, 0, 0.5),
+                  choice("follow_view", "Follow the 360° View", {"Off", "On"}, 1),
+                  choice("decode", "Heard As", {"Binaural (headphones)", "Stereo (speakers)"}, 0)},
+                 {}});
     c.push_back({"stereo_width", "Stereo Width", EffectCategory::AudioFilter, "Channels",
                  {pct("width", "Width", 0, 200, 100), num("bass_mono_hz", "Mono Bass Below (Hz)", 0, 500, 0, 1)},
                  {}});

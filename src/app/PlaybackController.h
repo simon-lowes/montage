@@ -57,6 +57,9 @@ public:
     // Global Mute (as in Premiere): playback and scrubbing are silent; clips, tracks and exports are untouched.
     void setGlobalMute(bool on);
     bool globalMute() const { return globalMute_; }
+    // How an ambisonic sequence (or ambisonic clip) is heard: binaurally for headphones, or as stereo for speakers.
+    void setAmbisonicBinaural(bool on);
+    bool ambisonicBinaural() const { return ambisonicBinaural_; }
     // Audio tracks left out of what is heard (an ADR guide track while recording), the project untouched.
     void setMutedAudioTracks(const std::vector<int>& tracks);
     const std::vector<int>& mutedAudioTracks() const { return mutedTracks_; }
@@ -135,6 +138,7 @@ private:
     int scrubRate_ = 0;
     AudioMixer scrubMixer_;
     bool globalMute_ = false;
+    bool ambisonicBinaural_ = true;
 };
 
 }  // namespace montage

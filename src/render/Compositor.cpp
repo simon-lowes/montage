@@ -1710,6 +1710,8 @@ const float* AudioMixer::keySignal(Id trackId, int frames) {
 void AudioMixer::resetLocked() {
     nextStart_ = -1;
     keyBufs_.clear();
+    binaural_.clear();
+    if (monitor_) monitor_->reset();
     if (keyMixer_) keyMixer_->reset();
     // Plugins are expensive to load: keep them, clearing only their audio state.
     for (auto it = states_.begin(); it != states_.end();) {
@@ -1912,6 +1914,12 @@ void AudioMixer::mix(const Project& p, const Sequence& seq, int64_t start, int f
         }
         nextStart_ = start + frames;
         mixInto(p, seq, start, frames, full.data(), trackLevels, 0, 0, -1, n);
+        // An ambisonic mix heard binaurally (the decoder keeps its state from block to block).
+        if (ambisonicLayout(seq.audioLayout) && ambisonicBinaural_) {
+            if (!monitor_ || monitor_->sampleRate() != seq.sampleRate) monitor_ = std::make_unique<FoaBinaural>(seq.sampleRate);
+            monitor_->process(full.data(), frames, out);
+            return;
+        }
     }
     downmixToStereo(seq.audioLayout, full.data(), frames, out);
 }
@@ -1931,10 +1939,11 @@ void AudioMixer::mixLayout(const Project& p, const Sequence& seq, int64_t start,
 }
 
 bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Track& track, int64_t start, int frames,
-                               double sr, int depth, float* trackBuf) {
+                               double sr, int depth, float* trackBuf, float* trackField) {
     const double fps = seq.fpsValue();
     const int64_t end = start + frames;
     std::vector<float> clipBuf(size_t(frames) * 2);
+    std::vector<float> field;  // an ambisonic clip's turned field, kept for an ambisonic mix
     bool any = false;
     for (const Clip& c : track.clips) {
         if (!c.enabled || edit::roleMuted(seq, c.role)) continue;
@@ -1967,6 +1976,7 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
         const MediaItem* m = c.mediaId ? p.findMedia(c.mediaId) : nullptr;
         if (!m) continue;
         std::fill(clipBuf.begin(), clipBuf.end(), 0.0f);
+        field.clear();
         const int64_t rs = start + lat;  // the source window fed to the chain
         int64_t s0 = std::max(rs, ps), s1 = std::min(rs + frames, pe);
         const double srcBase = c.sourceIn * sr / fps;
@@ -1995,6 +2005,64 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
                 float* d = &clipBuf[size_t(smp - rs) * 2];
                 d[0] = nb[size_t(i) * 2] + (nb[size_t(i + 1) * 2] - nb[size_t(i) * 2]) * f;
                 d[1] = nb[size_t(i) * 2 + 1] + (nb[size_t(i + 1) * 2 + 1] - nb[size_t(i) * 2 + 1]) * f;
+            }
+        } else if (m->ambisonic > 0 && c.channels.empty()) {
+            // Ambisonic sound: the field read sample for sample and turned (by the clip's Ambisonics effect and, while
+            // it follows, the linked picture's Reframe 360° view), then heard binaurally or as stereo, or kept as a
+            // field for an ambisonic mix.
+            if (!m->hasAudio) continue;
+            const std::string key = ambisonicAudioKey(m->path);
+            AudioBufferPtr fb = nonBlocking_ ? MediaPool::instance().audioIfReady(key, int(sr)) : MediaPool::instance().audio(key, int(sr));
+            if (!fb || fb->channels != kFoaChannels || fb->frames() < 2) continue;
+            const Effect* amb = nullptr;
+            for (const Effect& e : c.effects)
+                if (e.enabled && e.type == "ambisonics") amb = &e;
+            const Clip* picture = nullptr;
+            const Effect* view = nullptr;
+            if ((!amb || amb->p("follow_view", 0, 1) > 0.5) && c.linkGroup)
+                for (const Track& vt : seq.videoTracks)
+                    for (const Clip& vc : vt.clips)
+                        if (vc.linkGroup == c.linkGroup)
+                            for (const Effect& e : vc.effects)
+                                if (e.enabled && e.type == "reframe_360") picture = &vc, view = &e;
+            const bool keep = trackField != nullptr;
+            const int64_t base = keep ? start : rs;  // the field is not run through the clip's (stereo) effects
+            const int64_t f0 = std::max(base, ps), f1 = std::min(base + frames, pe);
+            field.assign(size_t(frames) * kFoaChannels, 0.0f);
+            const int64_t n = fb->frames();
+            const float* src = fb->samples.data();
+            for (int64_t b = f0; b < f1; b += 64) {
+                const int64_t e2 = std::min(f1, b + 64);
+                const FrameTime t = FrameTime(std::floor(double(b) * fps / sr));
+                double yaw = amb ? amb->p("yaw", t - c.start, 0) : 0, pitch = amb ? amb->p("pitch", t - c.start, 0) : 0,
+                       roll = amb ? amb->p("roll", t - c.start, 0) : 0;
+                if (view) {
+                    yaw += view->p("yaw", t - picture->start, 0);
+                    pitch += view->p("pitch", t - picture->start, 0);
+                    roll += view->p("roll", t - picture->start, 0);
+                }
+                const FoaRotation turn = foaRotation(yaw, pitch, roll);
+                for (int64_t s = b; s < e2; ++s) {
+                    const double pos = c.reverse ? srcBase + double(ce - 1 - s) * c.speed
+                                       : ramped  ? (c.sourceIn + c.sourceOffset(double(s - cs) * fps / sr)) * sr / fps
+                                                 : srcBase + double(s - cs) * c.speed;
+                    if (pos < 0 || pos >= double(n - 1)) continue;
+                    const int64_t i = int64_t(pos);
+                    const float f = float(pos - double(i));
+                    float* d = &field[size_t(s - base) * kFoaChannels];
+                    for (int k = 0; k < kFoaChannels; ++k) d[k] = src[i * 4 + k] + (src[i * 4 + 4 + k] - src[i * 4 + k]) * f;
+                    foaRotate(turn, d);
+                }
+            }
+            if (!keep) {
+                if (!amb || amb->p("decode", 0, 0) < 0.5) {
+                    auto& dec = binaural_[c.id];
+                    if (!dec || dec->sampleRate() != sr) dec = std::make_unique<FoaBinaural>(sr);
+                    dec->process(field.data(), frames, clipBuf.data());
+                } else {
+                    for (int i = 0; i < frames; ++i) foaDecodeStereo(&field[size_t(i) * kFoaChannels], clipBuf[size_t(i) * 2], clipBuf[size_t(i) * 2 + 1]);
+                }
+                field.clear();
             }
         } else {
             if (!m->hasAudio) continue;
@@ -2101,6 +2169,9 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
                 float* tb = &trackBuf[size_t(k - start) * 2];
                 tb[0] += d[0] * g * pl * fade;
                 tb[1] += d[1] * g * pr * fade;
+                if (!field.empty())
+                    for (int ch = 0; ch < kFoaChannels; ++ch)
+                        trackField[size_t(k - start) * kFoaChannels + size_t(ch)] += field[size_t(k - start) * kFoaChannels + size_t(ch)] * g * fade;
             }
         }
         any = true;
@@ -2177,6 +2248,9 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
         busLat[b.id] = chainLatency(b.effects, b.id, sr);
     }
     std::vector<float> trackBuf(size_t(frames) * 2);
+    // An ambisonic mix: ambisonic clips add their field straight to it (W, Y, Z, X), beside the tracks' panned sound.
+    const bool fieldMix = surround && ambisonicLayout(seq.audioLayout) && nch == kFoaChannels;
+    std::vector<float> trackField(fieldMix ? size_t(frames) * kFoaChannels : 0);
     for (size_t ti = 0; ti < seq.audioTracks.size(); ++ti) {
         const Track& track = seq.audioTracks[ti];
         if (onlyTrack >= 0 ? int(ti) != onlyTrack : (track.muted || (anySolo && !track.solo))) continue;
@@ -2187,8 +2261,10 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
         const int64_t downstream = masterLat + (bus != busBufs.end() ? busLat[bus->first] : 0);
         const int64_t trackLat = chainLatency(track.effects, track.id, sr);
         std::fill(trackBuf.begin(), trackBuf.end(), 0.0f);
+        std::fill(trackField.begin(), trackField.end(), 0.0f);
         key_ = {&p, &seq, start + downstream + trackLat, sr, depth};
-        const bool any = mixTrackClips(p, seq, track, start + downstream + trackLat, frames, sr, depth, trackBuf.data());
+        const bool any = mixTrackClips(p, seq, track, start + downstream + trackLat, frames, sr, depth, trackBuf.data(),
+                                       fieldMix ? trackField.data() : nullptr);
         // Track inserts keep running without clips, so reverb and delay tails ring out.
         if (!any && track.effects.empty()) continue;
         if (!track.effects.empty())
@@ -2207,12 +2283,22 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
                     const float g = g0 + (g1 - g0) * float(k - i) / float(e - i);
                     trackBuf[size_t(k) * 2] *= g;
                     trackBuf[size_t(k) * 2 + 1] *= g;
+                    if (fieldMix)
+                        for (int ch = 0; ch < kFoaChannels; ++ch) trackField[size_t(k) * kFoaChannels + size_t(ch)] *= g;
                 }
             }
             tg = 1;
         }
         tg *= dbToLin(edit::folderGain(seq, TrackKind::Audio, track.folder));  // its folder's fader (a VCA)
         MeterLevels lv;
+        if (fieldMix && !lfeOnly)
+            for (int i = 0; i < frames; ++i) {
+                const float* f = &trackField[size_t(i) * kFoaChannels];
+                float* d = master.data() + size_t(i) * size_t(nch);
+                for (int ch = 0; ch < kFoaChannels; ++ch) d[ch] += f[ch] * tg;
+                lv.peakL = std::max(lv.peakL, std::fabs(f[0] * tg));
+                lv.peakR = std::max(lv.peakR, std::fabs(f[0] * tg));
+            }
         if (surround && bus == busBufs.end()) {
             // Straight to the speakers through the track's surround panner.
             for (int i = 0; i < frames; ++i) {

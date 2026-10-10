@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include "Ambisonics.h"
+
 namespace montage {
 
 namespace {
@@ -47,15 +49,21 @@ const std::vector<Speaker>& layoutSpeakers(const std::string& layout) {
     if (layout == "5.1.4") return fiveFour;
     if (layout == "7.1.2") return sevenTwo;
     if (layout == "7.1.4") return sevenFour;
+    // Ambisonics: the field's components, measured for loudness by the omnidirectional W alone.
+    static const std::vector<Speaker> ambix = {{"W", 0, false, 1.0, 0, ""}, {"Y", 0, false, 0.0, 0, ""},
+                                               {"Z", 0, false, 0.0, 0, ""}, {"X", 0, false, 0.0, 0, ""}};
+    if (layout == "ambix") return ambix;
     return stereo;
 }
 
 int layoutChannels(const std::string& layout) { return int(layoutSpeakers(layout).size()); }
 
 const std::vector<std::string>& audioLayouts() {
-    static const std::vector<std::string> l = {"stereo", "5.1", "7.1", "5.1.2", "5.1.4", "7.1.2", "7.1.4"};
+    static const std::vector<std::string> l = {"stereo", "5.1", "7.1", "5.1.2", "5.1.4", "7.1.2", "7.1.4", "ambix"};
     return l;
 }
+
+bool ambisonicLayout(const std::string& layout) { return layout == "ambix"; }
 
 bool immersiveLayout(const std::string& layout) {
     for (const Speaker& sp : layoutSpeakers(layout))
@@ -109,6 +117,11 @@ void ringGains(const std::vector<Speaker>& sp, std::vector<size_t> ring, double 
 }  // namespace
 
 std::vector<float> panGains(const std::string& layout, double angle, double distance, double height) {
+    if (ambisonicLayout(layout)) {
+        // From the direction, overhead at height 1; the nearer the middle, the more it is heard all round.
+        const auto g = foaEncode(angle, std::clamp(height, 0.0, 1.0) * 90, std::clamp(distance, 0.0, 1.0));
+        return {g.begin(), g.end()};
+    }
     const auto& sp = layoutSpeakers(layout);
     std::vector<float> g(sp.size(), 0.0f);
     std::vector<size_t> ear, top;
@@ -139,6 +152,10 @@ SurroundGains surroundGains(const std::string& layout, const SurroundPan& p) {
 }
 
 void downmixToStereo(const std::string& layout, const float* in, int frames, float* out) {
+    if (ambisonicLayout(layout)) {
+        for (int i = 0; i < frames; ++i) foaDecodeStereo(in + size_t(i) * 4, out[size_t(i) * 2], out[size_t(i) * 2 + 1]);
+        return;
+    }
     const auto& sp = layoutSpeakers(layout);
     const int n = int(sp.size());
     if (n == 2) {

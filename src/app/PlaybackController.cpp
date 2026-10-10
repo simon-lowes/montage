@@ -247,6 +247,10 @@ public:
     }
     // Global Mute: the meters still move, the speakers get silence.
     void setMuted(bool on) { muted_ = on; }
+    void setAmbisonicBinaural(bool on) {
+        QMutexLocker lock(&m_);
+        mixer_.setAmbisonicBinaural(on);
+    }
     // An ADR cycle's beeps, in what is heard (never in the meters).
     void setCycle(const std::optional<AdrCycle>& c) {
         QMutexLocker lock(&m_);
@@ -414,6 +418,11 @@ void PlaybackController::setPreviewScale(double s) {
 void PlaybackController::setUseProxies(bool on) {
     useProxies_ = on;
     requestFrame();
+}
+
+void PlaybackController::setAmbisonicBinaural(bool on) {
+    ambisonicBinaural_ = on;
+    device_->setAmbisonicBinaural(on);
 }
 
 void PlaybackController::setShowCaptions(bool on) {

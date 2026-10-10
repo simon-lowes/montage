@@ -1,4 +1,5 @@
 #include "Exporter.h"
+#include "media/SpatialAudio.h"
 #include "core/AudioDescription.h"
 
 #include "core/ColorGroups.h"
@@ -984,6 +985,12 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
                 return "This FFmpeg cannot describe the " + seq.audioLayout + " layout";
             layout = immersive;
         }
+        if (!s.downmixStereo && ambisonicLayout(seq.audioLayout)) {
+            // An ambisonic field: named as one for PCM, as four speakers (4.0, in ACN order) for AAC, which knows no
+            // other four-channel layout; the SA3D box written afterwards says what they are.
+            const AVChannelLayout field = AV_CHANNEL_LAYOUT_AMBISONIC_FIRST_ORDER, quad = AV_CHANNEL_LAYOUT_4POINT0;
+            layout = s.audioCodec.rfind("pcm_", 0) == 0 ? field : quad;
+        }
         if (mono) layout = AV_CHANNEL_LAYOUT_MONO;
         av_channel_layout_copy(&actx->ch_layout, &layout);
         actx->sample_rate = sr;
@@ -1553,6 +1560,9 @@ int maxAudioChannels(const std::string& codec) {
 
 std::string exportAudioLayout(const std::string& layout, const std::string& codec) {
     if (codec.empty()) return layout;
+    // An ambisonic field goes into PCM or AAC (as YouTube takes it); anything else hears it as stereo.
+    if (ambisonicLayout(layout) && codec.rfind("pcm_", 0) != 0 && codec != "aac" && codec != "libfdk_aac" && codec != "aac_at")
+        return "stereo";
     const int most = maxAudioChannels(codec);
     if (layoutChannels(layout) <= most) return layout;
     const std::string ear = earLevelLayout(layout);
@@ -1609,6 +1619,12 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
         ok = exportImpl(p, work, settings, progress, cancel, error, opened, encoderUsed, smartRendered, light);
     } else {
         ok = exportImpl(p, seq, s, progress, cancel, error, opened, encoderUsed, smartRendered, light);
+    }
+    // An ambisonic mix in MP4 or MOV: the Spatial Audio box, so YouTube and players hear it as a field.
+    if (ok && ambisonicLayout(layout) && !s.downmixStereo && !s.audioCodec.empty() && s.audioCodec != "none") {
+        std::string ext = std::filesystem::path(s.path).extension().string();
+        for (char& ch : ext) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+        if ((ext == ".mp4" || ext == ".m4a" || ext == ".mov" || ext == ".m4v") && !writeSpatialAudioBox(s.path, 1, error)) ok = false;
     }
     // Never leave a truncated file behind (the output is closed by now), but
     // don't touch an existing file if we failed before writing to it.

@@ -805,6 +805,20 @@ Id MediaBinWidget::mergeClips(Id video, const std::vector<Id>& sounds, int syncB
     return made;
 }
 
+bool MediaBinWidget::setMediaAmbisonic(const std::vector<Id>& media, int order) {
+    return state_->edit(tr("Ambisonic Audio"), [media, order](Project& p, Sequence&) {
+        bool changed = false;
+        for (Id id : media)
+            if (MediaItem* m = p.findMedia(id); m && m->hasAudio && m->channels >= 4 && m->kind != MediaKind::Sequence && m->ambisonic != order) {
+                m->ambisonic = order;
+                changed = true;
+                for (MediaItem& sub : p.media)
+                    if (sub.subclipOf == id) sub.ambisonic = order;
+            }
+        return changed;
+    });
+}
+
 bool MediaBinWidget::setMediaProjection(const std::vector<Id>& media, const std::string& projection) {
     return state_->edit(tr("360° Footage"), [media, projection](Project& p, Sequence&) {
         bool any = false;
@@ -1257,6 +1271,25 @@ void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos)
         sphere->setObjectName(QStringLiteral("mediaSpherical"));
         sphere->setCheckable(true);
         sphere->setChecked(all360);
+    }
+    // Ambisonic sound (four or more channels): heard as a field that turns with the view (core/Ambisonics.h).
+    {
+        std::vector<Id> fields;
+        bool allAmbisonic = true;
+        for (Id id : ids)
+            if (const MediaItem* m = state_->project().findMedia(id); m && m->hasAudio && m->channels >= 4 && m->kind != MediaKind::Sequence) {
+                fields.push_back(id);
+                allAmbisonic = allAmbisonic && m->ambisonic > 0;
+            }
+        if (!fields.empty()) {
+            QAction* field = menu.addAction(tr("Ambisonic Audio"), this, [this, fields, allAmbisonic] {
+                setMediaAmbisonic(fields, allAmbisonic ? 0 : 1);
+            });
+            field->setObjectName(QStringLiteral("mediaAmbisonic"));
+            field->setCheckable(true);
+            field->setChecked(allAmbisonic);
+            field->setToolTip(tr("The file's first four channels are a first-order ambisonic field (AmbiX: W, Y, Z, X)"));
+        }
     }
     // Audio Channels (Premiere's Modify > Audio Channels): how new clips of files with several channels take them.
     std::vector<Id> multichannel;

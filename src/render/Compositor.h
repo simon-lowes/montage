@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "Stereo.h"
+#include "core/Ambisonics.h"
 #include "core/Model.h"
 #include "media/Image.h"
 
@@ -109,6 +110,9 @@ public:
         nonBlocking_ = on;
         if (keyMixer_) keyMixer_->setNonBlocking(on);
     }
+    // How mix() lets an ambisonic sequence be heard: binaurally for headphones (the default), or through two virtual
+    // cardioids for speakers.
+    void setAmbisonicBinaural(bool on) { ambisonicBinaural_ = on; }
 
     struct State;  // per clip/effect DSP state
     static bool ensurePlugin(State& st, const Effect& e, double sr);
@@ -121,9 +125,10 @@ private:
                  std::vector<MeterLevels>* trackLevels, int depth, int rate = 0, int onlyTrack = -1, int channels = 2);
     // Runs an effect chain over an interleaved stereo block; DSP state is kept per (owner, effect).
     void processChain(const std::vector<Effect>& chain, Id owner, FrameTime lt, double sr, float* buf, int frames);
-    // Sums a track's clips over [start, start + frames) into trackBuf; false if none plays.
+    // Sums a track's clips over [start, start + frames) into trackBuf; false if none plays. With `trackField` (an
+    // ambisonic mix), ambisonic clips add their turned field there (four channels) instead of being heard as stereo.
     bool mixTrackClips(const Project& p, const Sequence& seq, const Track& track, int64_t start, int frames, double sr,
-                       int depth, float* trackBuf);
+                       int depth, float* trackBuf, float* trackField = nullptr);
     // Latency (samples) of a chain's plugins, loading them if needed; and the largest in a sequence.
     int chainLatency(const std::vector<Effect>& chain, Id owner, double sr);
     int maxLatency(const Sequence& seq, double sr);
@@ -153,6 +158,9 @@ private:
     std::mutex m_;
     bool nonBlocking_ = false;
     std::vector<bool> mask_, lfeOnly_;
+    bool ambisonicBinaural_ = true;
+    std::map<Id, std::unique_ptr<FoaBinaural>> binaural_;  // per ambisonic clip heard binaurally
+    std::unique_ptr<FoaBinaural> monitor_;                  // an ambisonic sequence heard binaurally
 };
 
 }  // namespace montage

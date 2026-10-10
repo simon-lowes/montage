@@ -30,6 +30,8 @@ add_library(montage_engine STATIC
   core/Aaf.h core/Aaf.cpp core/AafMetaDictionary.inc
   core/AafImport.h core/AafImport.cpp
   core/Surround.h core/Surround.cpp
+  core/Ambisonics.h core/Ambisonics.cpp
+  media/SpatialAudio.h media/SpatialAudio.cpp
   core/Effects.h core/Effects.cpp
   core/EditOps.h core/EditOps.cpp
   core/TimelineCompare.h core/TimelineCompare.cpp

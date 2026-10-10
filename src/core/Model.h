@@ -126,8 +126,12 @@ struct MediaItem {
     std::string bin;         // bin path, "/" between nested bins ("Interviews/Day 1"), "" = the project root
     std::string colorSpace;     // detected from the file's colour tags (ColorSpace.h id), "" = Rec.709
     std::string colorOverride;  // Interpret Colour: the space to read it as, "" = as detected
-    // 360° footage: "equirect" (from the file's spherical metadata, or set by hand), "" = a flat picture.
+    // 360° footage: "equirect" or "vr180" (the half in front; from the file's spherical metadata, or set by hand),
+    // "" = a flat picture.
     std::string projection;
+    // Ambisonic sound (core/Ambisonics.h): its order (1 = first-order AmbiX, four channels W Y Z X), from the file's
+    // spatial audio metadata (MP4 SA3D) or set by hand; 0 = channels for speakers.
+    int ambisonic = 0;
     // Stereoscopic 3D footage: how its two eyes are packed ("sbs", "sbs_half", "tb", "tb_half"; core/Interpretation.h),
     // from the file's stereo metadata or Interpret Footage; "" = a flat picture. Its size is one eye's, as shown.
     std::string stereo;

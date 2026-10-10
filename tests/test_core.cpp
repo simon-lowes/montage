@@ -10,6 +10,7 @@
 #include "core/SpellCheck.h"
 #include "core/ColorGroups.h"
 #include "core/Interpretation.h"
+#include "core/Ambisonics.h"
 #include "core/SpokenSearch.h"
 #include "core/OnScreenText.h"
 #include "core/AutoTag.h"
@@ -4570,6 +4571,95 @@ private slots:
         QVERIFY(loadProject(file.toStdString(), loaded));
         QCOMPARE(loaded.media.back().path, m.path);
         QFile::remove(file);
+    }
+
+    void ambisonicsMaths() {
+        auto near = [](double a, double b, double tol = 1e-4) { return std::fabs(a - b) < tol; };
+        // A sound from the left: W 1, Y 1 (Y points left); from above: Z 1; focus 0 is heard all round.
+        auto g = foaEncode(-90, 0);
+        QVERIFY(near(g[0], 1) && near(g[1], 1) && near(g[2], 0) && near(g[3], 0));
+        g = foaEncode(0, 90);
+        QVERIFY(near(g[2], 1) && near(g[3], 0));
+        g = foaEncode(30, 0, 0);
+        QVERIFY(near(g[0], 1) && near(g[1], 0) && near(g[3], 0));
+        // The view turned right brings a sound on the right to the front; tilted up, one above; rolled clockwise, a
+        // sound on the right is now above.
+        auto turned = [&](double angle, double el, double yaw, double pitch, double roll) {
+            auto v = foaEncode(angle, el);
+            foaRotate(foaRotation(yaw, pitch, roll), v.data());
+            return v;
+        };
+        g = turned(90, 0, 90, 0, 0);
+        QVERIFY2(near(g[3], 1) && near(g[1], 0), qPrintable(QString("%1 %2").arg(g[3]).arg(g[1])));
+        g = turned(0, 90, 0, 90, 0);
+        QVERIFY(near(g[3], 1) && near(g[2], 0));
+        g = turned(90, 0, 0, 0, 90);
+        QVERIFY(near(g[2], 1) && near(g[1], 0));
+        // Yaw then pitch: a sound 90° right and 45° up, looked at directly.
+        g = turned(90, 45, 90, 45, 0);
+        QVERIFY(near(g[3], 1, 1e-3));
+        QVERIFY(foaRotation(0, 0, 0).identity && !foaRotation(1, 0, 0).identity);
+        // Two virtual cardioids: louder on the side the sound comes from, equal from the front.
+        float l, r;
+        g = foaEncode(-90, 0);
+        foaDecodeStereo(g.data(), l, r);
+        QVERIFY(l > 4 * r);
+        g = foaEncode(0, 0);
+        foaDecodeStereo(g.data(), l, r);
+        QVERIFY(near(l, r) && l > 0.5f);
+        // Binaurally, a click from the left reaches the left ear first and louder.
+        FoaBinaural bin(48000);
+        std::vector<float> in(size_t(512) * 4, 0.0f), out(size_t(512) * 2);
+        g = foaEncode(-90, 0);
+        for (int k = 0; k < 4; ++k) in[size_t(10) * 4 + size_t(k)] = g[size_t(k)];
+        bin.process(in.data(), 512, out.data());
+        int peakL = 0, peakR = 0;
+        double eL = 0, eR = 0;
+        for (int i = 0; i < 512; ++i) {
+            if (std::fabs(out[size_t(i) * 2]) > std::fabs(out[size_t(peakL) * 2])) peakL = i;
+            if (std::fabs(out[size_t(i) * 2 + 1]) > std::fabs(out[size_t(peakR) * 2 + 1])) peakR = i;
+            eL += out[size_t(i) * 2] * out[size_t(i) * 2];
+            eR += out[size_t(i) * 2 + 1] * out[size_t(i) * 2 + 1];
+        }
+        QVERIFY2(peakR - peakL >= 15 && peakR - peakL <= 40 && eL > 2 * eR, qPrintable(QString("%1 %2 %3 %4").arg(peakL).arg(peakR).arg(eL).arg(eR)));
+        // From the front, the ears agree.
+        bin.reset();
+        std::fill(in.begin(), in.end(), 0.0f);
+        g = foaEncode(0, 0);
+        for (int k = 0; k < 4; ++k) in[size_t(10) * 4 + size_t(k)] = g[size_t(k)];
+        bin.process(in.data(), 512, out.data());
+        for (int i = 0; i < 512; ++i) QVERIFY(near(out[size_t(i) * 2], out[size_t(i) * 2 + 1], 1e-5));
+        // The ambisonic layout: four channels, sounds placed by direction, heard as stereo when folded.
+        QVERIFY(ambisonicLayout("ambix") && !ambisonicLayout("5.1"));
+        QCOMPARE(layoutChannels("ambix"), 4);
+        QVERIFY(std::find(audioLayouts().begin(), audioLayouts().end(), "ambix") != audioLayouts().end());
+        const auto pg = panGains("ambix", -90, 1, 0);
+        QVERIFY(pg.size() == 4 && near(pg[0], 1) && near(pg[1], 1) && near(pg[3], 0));
+        QVERIFY(near(panGains("ambix", 0, 1, 1)[2], 1));   // overhead
+        QVERIFY(near(panGains("ambix", -90, 0, 0)[1], 0));  // in the middle: all round
+        float field[4] = {1, 1, 0, 0}, st[2];
+        downmixToStereo("ambix", field, 1, st);
+        QVERIFY(st[0] > 4 * st[1]);
+        QVERIFY(!immersiveLayout("ambix"));
+        // Saved and loaded: the sequence's layout and a media item's ambisonic order.
+        Project p = makeDefaultProject();
+        p.active()->audioLayout = "ambix";
+        MediaItem m;
+        m.id = p.newId();
+        m.kind = MediaKind::Audio;
+        m.path = "/f/field.wav";
+        m.ambisonic = 1;
+        p.media.push_back(m);
+        const QString file = QDir::temp().filePath("ambisonic-test.montage");
+        QVERIFY(saveProject(p, file.toStdString()));
+        Project loaded;
+        QVERIFY(loadProject(file.toStdString(), loaded));
+        QCOMPARE(loaded.active()->audioLayout, std::string("ambix"));
+        QCOMPARE(loaded.media.back().ambisonic, 1);
+        QFile::remove(file);
+        // The Ambisonics effect: no turn, follows the view, heard binaurally.
+        const Effect e = makeEffect(p, "ambisonics");
+        QVERIFY(e.p("yaw", 0, 9) == 0 && e.p("follow_view", 0, 0) == 1 && e.p("decode", 0, 9) == 0);
     }
 
     void stereoInterpretation() {

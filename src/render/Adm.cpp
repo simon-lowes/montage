@@ -177,6 +177,8 @@ bool exportAdmBwf(const Project& p, const Sequence& s, const AdmSettings& settin
         if (error) *error = why;
         return false;
     };
+    if (ambisonicLayout(s.audioLayout))
+        return fail("An ADM master is a bed of speakers and objects: an ambisonic mix is delivered as a four-channel file (File > Export)");
     const std::string layout = std::find(audioLayouts().begin(), audioLayouts().end(), s.audioLayout) != audioLayouts().end()
                                    ? s.audioLayout
                                    : std::string("stereo");

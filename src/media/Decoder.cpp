@@ -6,6 +6,8 @@
 #include "ImageSequence.h"
 #include "Psd.h"
 #include "audio/TimeStretch.h"
+#include "core/Ambisonics.h"
+#include "SpatialAudio.h"
 #include "core/Interpretation.h"
 
 #include <algorithm>
@@ -414,6 +416,12 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         m.audioCodec = d ? d->name : "unknown";
         m.sampleRate = st->codecpar->sample_rate;
         m.channels = st->codecpar->ch_layout.nb_channels;
+        // Ambisonic sound: the file's spatial audio metadata (MP4 SA3D) gives its layout as ambisonic components.
+        if (st->codecpar->ch_layout.order == AV_CHANNEL_ORDER_AMBISONIC && m.channels >= kFoaChannels)
+            m.ambisonic = std::max(1, int(std::sqrt(double(m.channels) + 1e-9)) - 1);
+        // (Reading AAC to find its layout replaces that with the decoder's speakers: the box itself is read then.)
+        if (!m.ambisonic && m.channels >= kFoaChannels && std::strstr(fmt->iformat->name, "mov"))
+            m.ambisonic = readSpatialAudioBox(uninterpretedPath(path));
         if (dur <= 0 && st->duration > 0) dur = double(st->duration) * av_q2d(st->time_base);
         m.audioStreams.clear();
         for (unsigned i = 0; i < fmt->nb_streams; ++i)
@@ -1108,7 +1116,7 @@ namespace {
 // One audio stream decoded whole to float at `sampleRate`, aligned so sample 0 is media time 0: the best stream
 // mixed to stereo (ordinal -1), or the ordinal-th audio stream with its own channels. `channels` says how many.
 bool decodeAudioStream(const std::string& path, int sampleRate, int ordinal, std::vector<float>& samples, int& channels,
-                       std::string* error, const std::atomic<bool>* cancel) {
+                       std::string* error, const std::atomic<bool>* cancel, AVChannelLayout* layoutOut = nullptr) {
     AVFormatContext* fmt = nullptr;
     int rc = openMediaInput(&fmt, path);
     if (rc < 0) {
@@ -1158,6 +1166,7 @@ bool decodeAudioStream(const std::string& path, int sampleRate, int ordinal, std
     }
     if (c.ctx->ch_layout.order == AV_CHANNEL_ORDER_UNSPEC)
         av_channel_layout_default(&c.ctx->ch_layout, std::max(1, c.ctx->ch_layout.nb_channels));
+    if (layoutOut) av_channel_layout_copy(layoutOut, &c.ctx->ch_layout);
     AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
     const AVChannelLayout* outLayout = ordinal < 0 ? &stereo : &c.ctx->ch_layout;
     channels = outLayout->nb_channels;
@@ -1260,6 +1269,64 @@ void checkStereoMedia(Project& p) {
     }
 }
 
+AudioBufferPtr decodeAmbisonic(const std::string& path, int sampleRate, std::string* error, const std::atomic<bool>* cancel) {
+    // A conformed file plays at its new speed (its pitch with it).
+    if (Interpretation in; parseInterpretation(path, in) && in.conformed()) {
+        const int rate = int(std::clamp(std::llround(sampleRate / in.timeScale()), 1000LL, 1LL << 30));
+        AudioBufferPtr played = decodeAmbisonic(uninterpretedPath(path), rate, error, cancel);
+        if (!played) return nullptr;
+        auto out = std::make_shared<AudioBuffer>(*played);
+        out->sampleRate = sampleRate;
+        return out;
+    }
+    // The stream the stereo mix comes from, with its own channels.
+    int ordinal = -1;
+    {
+        AVFormatContext* fmt = nullptr;
+        if (int rc = openMediaInput(&fmt, path); rc < 0) {
+            if (error) *error = averr(rc);
+            return nullptr;
+        }
+        if (avformat_find_stream_info(fmt, nullptr) >= 0) {
+            const int best = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+            for (unsigned i = 0, k = 0; best >= 0 && i < fmt->nb_streams; ++i) {
+                if (fmt->streams[i]->codecpar->codec_type != AVMEDIA_TYPE_AUDIO) continue;
+                if (int(i) == best) {
+                    ordinal = int(k);
+                    break;
+                }
+                ++k;
+            }
+        }
+        avformat_close_input(&fmt);
+    }
+    if (ordinal < 0) {
+        if (error) *error = "No audio stream";
+        return nullptr;
+    }
+    std::vector<float> raw;
+    int n = 0;
+    AVChannelLayout layout{};
+    if (!decodeAudioStream(path, sampleRate, ordinal, raw, n, error, cancel, &layout)) return nullptr;
+    if (n < kFoaChannels) {
+        av_channel_layout_uninit(&layout);
+        if (error) *error = "Ambisonic sound needs at least four channels";
+        return nullptr;
+    }
+    // ACN order (W, Y, Z, X) as decoded: a decoder that names four channels as speakers (AAC's 4.0) gives them in its
+    // own channel order, which is the order FFmpeg's encoders took them in (and Montage's exports write).
+    const int map[4] = {0, 1, 2, 3};
+    av_channel_layout_uninit(&layout);
+    auto buf = std::make_shared<AudioBuffer>();
+    buf->sampleRate = sampleRate;
+    buf->channels = kFoaChannels;
+    const size_t frames = raw.size() / size_t(n);
+    buf->samples.resize(frames * 4);
+    for (size_t i = 0; i < frames; ++i)
+        for (int k = 0; k < 4; ++k) buf->samples[i * 4 + size_t(k)] = raw[i * size_t(n) + size_t(map[k])];
+    return buf;
+}
+
 AudioBufferPtr decodeAudio(const std::string& path, int sampleRate, std::string* error, const std::atomic<bool>* cancel,
                            const std::vector<int>& channels) {
     // A conformed video's sound plays with its frames: at the new speed, or stretched to the new length with its pitch
@@ -1354,8 +1421,10 @@ PeaksPtr computePeaks(const AudioBuffer& buf, int samplesPerBucket) {
     for (int64_t b = 0; b < buckets; ++b) {
         float lo = 0, hi = 0;
         int64_t s0 = b * p->samplesPerBucket, s1 = std::min(frames, s0 + p->samplesPerBucket);
+        const size_t nch = size_t(std::max(1, buf.channels));
         for (int64_t s = s0; s < s1; ++s) {
-            float v = 0.5f * (buf.samples[size_t(s) * 2] + buf.samples[size_t(s) * 2 + 1]);
+            // Stereo: the two sides' mean; an ambisonic field: its omnidirectional W.
+            float v = nch == 2 ? 0.5f * (buf.samples[size_t(s) * 2] + buf.samples[size_t(s) * 2 + 1]) : buf.samples[size_t(s) * nch];
             lo = std::min(lo, v);
             hi = std::max(hi, v);
         }

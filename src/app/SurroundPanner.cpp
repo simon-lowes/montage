@@ -65,7 +65,8 @@ void SurroundPanner::paintEvent(QPaintEvent*) {
     p.setBrush(QColor(0, 0, 0, 60));
     p.drawEllipse(c, r, r);
     // The speakers.
-    for (const Speaker& sp : layoutSpeakers(layout_)) {
+    // (An ambisonic field has no speakers: a sound is placed in it from a direction.)
+    for (const Speaker& sp : ambisonicLayout(layout_) ? std::vector<Speaker>{} : layoutSpeakers(layout_)) {
         if (sp.lfe) continue;
         const double a = sp.angle * M_PI / 180, k = sp.elevation > 0 ? 0.6 : 1.0;  // overhead ones further in
         const QPointF at = toWidget(k * std::sin(a), k * std::cos(a));
@@ -73,7 +74,7 @@ void SurroundPanner::paintEvent(QPaintEvent*) {
         p.setBrush(sp.elevation > 0 ? QBrush(Qt::NoBrush) : QBrush(theme::kTextDim));
         p.drawRect(QRectF(at.x() - 2, at.y() - 2, 4, 4));
     }
-    if (immersiveLayout(layout_)) {
+    if (immersiveLayout(layout_) || ambisonicLayout(layout_)) {
         // The height, a bar up the right-hand side.
         const QRectF bar(width() - 4, 4, 3, height() - 8);
         p.setPen(Qt::NoPen);
@@ -137,7 +138,7 @@ void SurroundPanner::mouseDoubleClickEvent(QMouseEvent*) {
 void SurroundPanner::wheelEvent(QWheelEvent* e) {
     const int dy = e->angleDelta().y() != 0 ? e->angleDelta().y() : e->angleDelta().x();  // Alt turns the wheel sideways on some systems
     const double step = dy > 0 ? 0.1 : -0.1;
-    if ((e->modifiers() & Qt::AltModifier) && immersiveLayout(layout_)) pan_.z = std::clamp(pan_.z + step, 0.0, 1.0);
+    if ((e->modifiers() & Qt::AltModifier) && (immersiveLayout(layout_) || ambisonicLayout(layout_))) pan_.z = std::clamp(pan_.z + step, 0.0, 1.0);
     else pan_.width = std::clamp(pan_.width + step, 0.0, 1.0);
     emitChange(true);
 }
@@ -162,7 +163,7 @@ void SurroundPanner::contextMenuEvent(QContextMenuEvent* e) {
         a->setCheckable(true);
         a->setChecked(std::lround(pan_.lfeDb) == db || (db <= -99 && pan_.lfeDb <= -99));
     }
-    if (immersiveLayout(layout_)) {
+    if (immersiveLayout(layout_) || ambisonicLayout(layout_)) {
         QMenu* h = menu.addMenu(tr("Height"));
         for (int pct : {0, 25, 50, 75, 100}) {
             QAction* a = h->addAction(pct == 0 ? tr("At the ear") : pct == 100 ? tr("Overhead") : tr("%1 %").arg(pct), this, [this, pct] {

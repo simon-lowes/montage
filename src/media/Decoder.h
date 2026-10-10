@@ -121,8 +121,9 @@ private:
 
 struct AudioBuffer {
     int sampleRate = 48000;
-    std::vector<float> samples;  // interleaved stereo
-    int64_t frames() const { return int64_t(samples.size() / 2); }
+    int channels = 2;            // 2, or 4 for an ambisonic field (W, Y, Z, X)
+    std::vector<float> samples;  // interleaved stereo (or `channels`)
+    int64_t frames() const { return int64_t(samples.size() / size_t(std::max(1, channels))); }
 };
 using AudioBufferPtr = std::shared_ptr<const AudioBuffer>;
 
@@ -136,6 +137,11 @@ int openMediaInput(struct AVFormatContext** fmt, const std::string& path);
 // alternately left and right.
 AudioBufferPtr decodeAudio(const std::string& path, int sampleRate, std::string* error = nullptr,
                            const std::atomic<bool>* cancel = nullptr, const std::vector<int>& channels = {});
+
+// The first-order ambisonic field (four channels: W, Y, Z, X in ACN order, SN3D) of the audio stream decodeAudio
+// mixes from; a higher-order file gives its first-order part. Aligned like decodeAudio.
+AudioBufferPtr decodeAmbisonic(const std::string& path, int sampleRate, std::string* error = nullptr,
+                               const std::atomic<bool>* cancel = nullptr);
 
 // Min/max envelope for waveform drawing: one (min, max) pair per bucket.
 struct Peaks {

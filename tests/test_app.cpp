@@ -6191,6 +6191,67 @@ const auto seq = [this] { return state()->sequence(); };
         state()->newProject();
     }
 
+    void ambisonicUi() {
+        // A four-channel ambisonic WAV (speech placed to the left of a field), which a WAV does not mark as one.
+        const QString field = dir_.filePath("field.wav");
+        {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.fps = Rational{25, 1};
+            gs.audioLayout = "ambix";
+            MediaItem speech;
+            QVERIFY(probeMedia(MONTAGE_TEST_DATA_DIR "/jfk.wav", speech));
+            speech.id = gen.newId();
+            gen.media.push_back(speech);
+            QVERIFY(edit::placeMedia(gen, gs, speech.id, 0, 0, 50, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+            gs.audioTracks[0].surround = SurroundPan{-1, 0, 0, -100, 0, false};
+            ExportSettings st = findExportPreset("Audio - WAV 24-bit")->settings;
+            st.path = field.toStdString();
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        state()->newProject();
+        const auto ids = state()->importFiles({field});
+        QCOMPARE(ids.size(), size_t(1));
+        QCOMPARE(state()->project().findMedia(ids[0])->channels, 4);
+        QCOMPARE(state()->project().findMedia(ids[0])->ambisonic, 0);
+        // The media bin marks it ambisonic, in one undo step.
+        auto* bin = win_->findChild<MediaBinWidget*>();
+        QVERIFY(bin->setMediaAmbisonic(ids, 1));
+        QVERIFY(!bin->setMediaAmbisonic(ids, 1));
+        QCOMPARE(state()->project().findMedia(ids[0])->ambisonic, 1);
+        state()->undo();
+        QCOMPARE(state()->project().findMedia(ids[0])->ambisonic, 0);
+        state()->redo();
+        // The Ambisonics effect is offered among the audio effects.
+        QVERIFY(findEffectInfo("ambisonics"));
+        // Sequence Settings offers an ambisonic mix.
+        {
+            SequenceSettingsDialog dlg(win_.get());
+            NewSequenceSpec spec;
+            spec.audioLayout = "ambix";
+            dlg.setSpec(spec);
+            auto* layouts = dlg.findChild<QComboBox*>("audioLayout");
+            QVERIFY(layouts && layouts->currentData().toString() == "ambix");
+            QCOMPARE(dlg.spec().audioLayout, std::string("ambix"));
+        }
+        // Playback › Ambisonic Monitoring: binaural or stereo, remembered.
+        MonitorPanel* program = nullptr;
+        for (auto* mp : win_->findChildren<MonitorPanel*>())
+            if (mp->mode() == MonitorPanel::Mode::Program) program = mp;
+        QVERIFY(program);
+        auto* binaural = win_->findChild<QAction*>("ambisonicBinaural");
+        auto* stereo = win_->findChild<QAction*>("ambisonicStereo");
+        QVERIFY(binaural && stereo);
+        stereo->trigger();
+        QVERIFY(!program->controller()->ambisonicBinaural() && stereo->isChecked() && !binaural->isChecked());
+        QCOMPARE(appSettings().value("playback/ambisonicBinaural").toBool(), false);
+        binaural->trigger();
+        QVERIFY(program->controller()->ambisonicBinaural());
+        appSettings().remove("playback/ambisonicBinaural");
+        state()->newProject();
+    }
+
     void stereoscopic3dUi() {
         // A side-by-side file (left half red, right half blue), 128 x 36.
         const QString video = dir_.filePath("sbs.mov");

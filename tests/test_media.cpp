@@ -63,6 +63,7 @@
 #include "media/Vector.h"
 #include "media/Beats.h"
 #include "render/Spherical.h"
+#include "media/SpatialAudio.h"
 #include "render/ExtendClip.h"
 #include "render/ReviewExport.h"
 #include "render/Versions.h"
@@ -4181,6 +4182,246 @@ private slots:
             QCOMPARE(saved.width(), 320);
             QVERIFY2(qRed(saved.pixel(40, 48)) > 180 && qBlue(saved.pixel(200, 48)) > 180, qPrintable(QString::number(saved.pixel(40, 48), 16) + " " + QString::number(saved.pixel(200, 48), 16)));
         }
+    }
+
+    void ambisonicAudio() {
+        // A 3 kHz tone, both sides alike (high enough for the head to shade the far ear).
+        AudioBuffer tone;
+        tone.sampleRate = 48000;
+        for (int i = 0; i < 48000; ++i) {
+            const float v = 0.3f * float(std::sin(2 * M_PI * 3000 * i / 48000.0));
+            tone.samples.push_back(v);
+            tone.samples.push_back(v);
+        }
+        const std::string toneWav = path("ambi-tone.wav");
+        writeBwf(toneWav, tone, 0, "", "");
+        auto rms = [](const AudioBuffer& b, int ch, int64_t from, int64_t to) {
+            double e = 0;
+            for (int64_t i = from; i < to; ++i) e += double(b.samples[size_t(i) * size_t(b.channels) + size_t(ch)]) * b.samples[size_t(i) * size_t(b.channels) + size_t(ch)];
+            return std::sqrt(e / double(std::max<int64_t>(1, to - from)));
+        };
+        auto corr = [](const AudioBuffer& b, int c1, int c2) {
+            double e = 0;
+            for (int64_t i = b.frames() / 4; i < b.frames() * 3 / 4; ++i)
+                e += double(b.samples[size_t(i) * size_t(b.channels) + size_t(c1)]) * b.samples[size_t(i) * size_t(b.channels) + size_t(c2)];
+            return e;
+        };
+        // An ambisonic sequence with the tone placed hard left (a point, at the ear).
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = Rational{25, 1};
+        s.audioLayout = "ambix";
+        QCOMPARE(layoutChannels("ambix"), 4);
+        MediaItem m = probeOrFail(p, toneWav);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 25, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        s.audioTracks[0].surround = SurroundPan{-1, 0, 0, -100, 0, false};
+        const ExportPreset* aac = findExportPreset("Audio - AAC (M4A)");
+        const ExportPreset* wav = findExportPreset("Audio - WAV 24-bit");
+        QVERIFY(aac && wav);
+        const std::string fieldM4a = path("field.m4a"), fieldWav = path("field.wav");
+        for (const auto& [preset, out] : {std::pair{aac, fieldM4a}, std::pair{wav, fieldWav}}) {
+            ExportSettings st = preset->settings;
+            st.path = out;
+            std::string err;
+            QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        }
+        // The AAC file says it is a field (SA3D, which FFmpeg reads as an ambisonic layout); the WAV has four channels.
+        QCOMPARE(readSpatialAudioBox(fieldM4a), 1);
+        QCOMPARE(readSpatialAudioBox(fieldWav), 0);
+        MediaItem back;
+        QVERIFY(probeMedia(fieldM4a, back));
+        QCOMPARE(back.channels, 4);
+        QCOMPARE(back.ambisonic, 1);
+        QVERIFY(probeMedia(fieldWav, back));
+        QCOMPARE(back.channels, 4);
+        // A sound from the left: Y as strong as W and in step with it, X and Z nearly silent.
+        for (const std::string& f : {fieldM4a, fieldWav}) {
+            std::string err;
+            AudioBufferPtr b = decodeAmbisonic(f, 48000, &err);
+            QVERIFY2(b && b->channels == 4, err.c_str());
+            const double w = rms(*b, 0, 8000, 30000), y = rms(*b, 1, 8000, 30000), z = rms(*b, 2, 8000, 30000), x = rms(*b, 3, 8000, 30000);
+            QVERIFY2(w > 0.05 && std::fabs(y / w - 1) < 0.15 && x < 0.1 * w && z < 0.1 * w && corr(*b, 0, 1) > 0,
+                     qPrintable(QString("%1: W %2 Y %3 Z %4 X %5").arg(QString::fromStdString(f)).arg(w).arg(y).arg(z).arg(x)));
+        }
+        // Codecs without ambisonics hear the mix as stereo.
+        QCOMPARE(exportAudioLayout("ambix", "aac"), std::string("ambix"));
+        QCOMPARE(exportAudioLayout("ambix", "pcm_s24le"), std::string("ambix"));
+        QCOMPARE(exportAudioLayout("ambix", "libopus"), std::string("stereo"));
+
+        // The field in a stereo sequence: heard from the left, binaurally or as stereo, turning with the clip's
+        // Ambisonics effect or the linked picture's 360° view.
+        Project q = makeDefaultProject();
+        Sequence& qs = *q.active();
+        qs.fps = Rational{25, 1};
+        MediaItem fm = probeOrFail(q, fieldM4a);
+        QCOMPARE(fm.ambisonic, 1);
+        q.media.push_back(fm);
+        QVERIFY(edit::placeMedia(q, qs, fm.id, 0, 0, 25, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Clip& ac = qs.audioTracks[0].clips.at(0);
+        auto sides = [&](const Sequence& seq, double& l, double& r) {
+            AudioMixer mixer;
+            AudioBuffer out;
+            out.sampleRate = 48000;
+            out.samples.resize(size_t(24000) * 2);
+            mixer.mix(q, seq, 4800, 24000, out.samples.data());
+            l = rms(out, 0, 2000, 24000);
+            r = rms(out, 1, 2000, 24000);
+        };
+        double l = 0, r = 0;
+        sides(qs, l, r);
+        QVERIFY2(l > 1.5 * r && l > 0.02, qPrintable(QString("binaural %1 %2").arg(l).arg(r)));
+        Effect amb = makeEffect(q, "ambisonics");
+        amb.params["decode"] = 1.0;  // stereo
+        ac.effects.push_back(amb);
+        sides(qs, l, r);
+        QVERIFY2(l > 1.5 * r, qPrintable(QString("stereo %1 %2").arg(l).arg(r)));
+        // Turned 90° left, the sound is in front; turned round, on the right.
+        ac.effects.back().params["yaw"] = -90.0;
+        sides(qs, l, r);
+        QVERIFY2(std::fabs(l / r - 1) < 0.15, qPrintable(QString("front %1 %2").arg(l).arg(r)));
+        ac.effects.back().params["yaw"] = 180.0;
+        sides(qs, l, r);
+        QVERIFY2(r > 1.5 * l, qPrintable(QString("behind %1 %2").arg(l).arg(r)));
+        // Following the picture's view: a linked 360° clip looking 90° left brings the sound in front.
+        ac.effects.back().params["yaw"] = 0.0;
+        Clip picture = makeGeneratorClip(q, "color", 25);
+        Effect view = makeEffect(q, "reframe_360");
+        view.params["yaw"] = -90.0;
+        picture.effects.push_back(view);
+        QVERIFY(edit::overwrite(q, qs, {TrackKind::Video, 0}, picture).ok);
+        Clip& audio = qs.audioTracks[0].clips.at(0);
+        qs.videoTracks[0].clips.at(0).linkGroup = audio.linkGroup = q.newId();
+        sides(qs, l, r);
+        QVERIFY2(std::fabs(l / r - 1) < 0.15, qPrintable(QString("follow %1 %2").arg(l).arg(r)));
+        audio.effects.back().params["follow_view"] = 0.0;
+        sides(qs, l, r);
+        QVERIFY2(l > 1.5 * r, qPrintable(QString("not following %1 %2").arg(l).arg(r)));
+        audio.effects.back().params["follow_view"] = 1.0;
+
+        // In an ambisonic sequence the clip's field is kept, turned with the view: the sound now in front.
+        qs.audioLayout = "ambix";
+        {
+            AudioMixer mixer;
+            AudioBuffer out;
+            out.sampleRate = 48000;
+            out.channels = 4;
+            out.samples.resize(size_t(24000) * 4);
+            mixer.mixLayout(q, qs, 4800, 24000, out.samples.data());
+            const double w = rms(out, 0, 2000, 24000), y = rms(out, 1, 2000, 24000), x = rms(out, 3, 2000, 24000);
+            QVERIFY2(w > 0.05 && std::fabs(x / w - 1) < 0.15 && y < 0.15 * w, qPrintable(QString("W %1 Y %2 X %3").arg(w).arg(y).arg(x)));
+            // Heard on headphones or speakers, the mix of a field is a stereo picture of it.
+            AudioMixer listen;
+            AudioBuffer st;
+            st.sampleRate = 48000;
+            st.samples.resize(size_t(24000) * 2);
+            audio.effects.back().params["follow_view"] = 0.0;  // back on the left
+            listen.mix(q, qs, 4800, 24000, st.samples.data());
+            QVERIFY(rms(st, 0, 2000, 24000) > 1.5 * rms(st, 1, 2000, 24000));
+            listen.setAmbisonicBinaural(false);
+            listen.reset();
+            listen.mix(q, qs, 4800, 24000, st.samples.data());
+            QVERIFY(rms(st, 0, 2000, 24000) > 1.5 * rms(st, 1, 2000, 24000));
+        }
+
+        // SA3D goes in whether the movie header follows the sound (FFmpeg's way) or comes first (fast start), and the
+        // sound plays the same afterwards.
+        {
+            Project sp = makeDefaultProject();
+            Sequence& ss = *sp.active();
+            MediaItem tm = probeOrFail(sp, toneWav);
+            sp.media.push_back(tm);
+            QVERIFY(edit::placeMedia(sp, ss, tm.id, 0, 0, 25, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+            ExportSettings st = aac->settings;
+            st.path = path("plain.m4a");
+            std::string err;
+            QVERIFY2(exportSequence(sp, ss, st, nullptr, nullptr, &err), err.c_str());
+            QCOMPARE(readSpatialAudioBox(st.path), 0);
+            // Remuxed with the movie header first.
+            const std::string fast = path("fast.m4a");
+            {
+                AVFormatContext* in = nullptr;
+                QVERIFY(avformat_open_input(&in, st.path.c_str(), nullptr, nullptr) == 0);
+                QVERIFY(avformat_find_stream_info(in, nullptr) >= 0);
+                AVFormatContext* outc = nullptr;
+                QVERIFY(avformat_alloc_output_context2(&outc, nullptr, "mp4", fast.c_str()) >= 0);
+                for (unsigned i = 0; i < in->nb_streams; ++i) {
+                    AVStream* os = avformat_new_stream(outc, nullptr);
+                    avcodec_parameters_copy(os->codecpar, in->streams[i]->codecpar);
+                    os->codecpar->codec_tag = 0;
+                    os->time_base = in->streams[i]->time_base;
+                }
+                QVERIFY(avio_open(&outc->pb, fast.c_str(), AVIO_FLAG_WRITE) >= 0);
+                AVDictionary* opts = nullptr;
+                av_dict_set(&opts, "movflags", "+faststart", 0);
+                QVERIFY(avformat_write_header(outc, &opts) >= 0);
+                av_dict_free(&opts);
+                AVPacket* pkt = av_packet_alloc();
+                while (av_read_frame(in, pkt) >= 0) {
+                    av_packet_rescale_ts(pkt, in->streams[pkt->stream_index]->time_base, outc->streams[pkt->stream_index]->time_base);
+                    av_interleaved_write_frame(outc, pkt);
+                }
+                av_packet_free(&pkt);
+                av_write_trailer(outc);
+                avio_closep(&outc->pb);
+                avformat_free_context(outc);
+                avformat_close_input(&in);
+            }
+            for (const std::string& f : {st.path, fast}) {
+                AudioBufferPtr before = decodeAudio(f, 48000, &err);
+                QVERIFY2(before, err.c_str());
+                QVERIFY2(writeSpatialAudioBox(f, 1, &err), err.c_str());
+                QCOMPARE(readSpatialAudioBox(f), 1);
+                QVERIFY(writeSpatialAudioBox(f, 1, &err));  // a second time: already there
+                AudioBufferPtr after = decodeAudio(f, 48000, &err);
+                QVERIFY2(after && after->samples == before->samples, f.c_str());
+            }
+            QVERIFY(!writeSpatialAudioBox(toneWav, 1, &err));  // not MP4
+        }
+
+        // Over MCP: mark media, turn a clip with keys, follow the view or not, decode as stereo; an ambisonic sequence.
+        Project mp = makeDefaultProject();
+        Sequence& ms = *mp.active();
+        ms.fps = Rational{25, 1};
+        MediaItem wm = probeOrFail(mp, fieldWav);  // four channels, not marked
+        QCOMPARE(wm.ambisonic, 0);
+        mp.media.push_back(wm);
+        MediaItem two = probeOrFail(mp, toneWav);
+        mp.media.push_back(two);
+        QVERIFY(edit::placeMedia(mp, ms, wm.id, 0, 0, 25, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Id mclip = ms.audioTracks[0].clips.at(0).id;
+        const QString project = QString::fromStdString(path("ambi-mcp.montage"));
+        QVERIFY(saveProject(mp, project.toStdString()));
+        McpServer server;
+        int rid = 1;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", rid++}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QVERIFY(call("montage_ambisonics", {{"project", project}, {"clip", double(mclip)}, {"yaw", 10}}).value("isError").toBool());  // not marked yet
+        QVERIFY(call("montage_ambisonics", {{"project", project}, {"media", double(two.id)}, {"ambisonic", true}}).value("isError").toBool());  // two channels
+        QJsonObject res = call("montage_ambisonics", {{"project", project}, {"media", double(wm.id)}, {"ambisonic", true}});
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        res = call("montage_ambisonics", {{"project", project}, {"clip", double(mclip)}, {"yaw", -90}, {"at", 0}, {"follow_view", false}, {"decode", "stereo"}});
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        res = call("montage_ambisonics", {{"project", project}, {"clip", double(mclip)}, {"yaw", 90}, {"at", 20}});
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        QVERIFY(call("montage_ambisonics", {{"project", project}, {"clip", double(mclip)}, {"decode", "quad"}}).value("isError").toBool());
+        res = call("montage_set_surround", {{"project", project}, {"layout", "ambix"}});
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        Project after;
+        QVERIFY(loadProject(project.toStdString(), after));
+        QCOMPARE(after.findMedia(wm.id)->ambisonic, 1);
+        QCOMPARE(after.active()->audioLayout, std::string("ambix"));
+        const Clip* turned = edit::clipById(*after.active(), mclip);
+        QVERIFY(turned && turned->effects.back().type == "ambisonics");
+        QCOMPARE(turned->effects.back().params.at("yaw").keys.size(), size_t(2));
+        QCOMPARE(turned->effects.back().p("follow_view", 0, 1), 0.0);
+        QCOMPARE(turned->effects.back().p("decode", 0), 1.0);
     }
 
     void vfxPullsWithHandles() {

@@ -69,6 +69,7 @@
 #include "core/MediaLog.h"
 #include "core/ProjectIO.h"
 #include "core/ScriptCut.h"
+#include "core/Ambisonics.h"
 #include "core/Surround.h"
 #include "core/TranscriptEdit.h"
 #include "media/DualSystem.h"
@@ -772,7 +773,7 @@ void McpServer::Impl::addTools() {
             "project":{"type":"string","description":"Path of the .montage file to write"},
             "media":{"type":"array","items":{"type":"string"},"description":"Media files, in order"},
             "width":{"type":"integer"},"height":{"type":"integer"},"fps":{"type":"number"},
-            "audio_layout":{"type":"string","enum":["stereo","5.1","7.1","5.1.2","5.1.4","7.1.2","7.1.4"],"default":"stereo"}},
+            "audio_layout":{"type":"string","enum":["stereo","5.1","7.1","5.1.2","5.1.4","7.1.2","7.1.4","ambix"],"default":"stereo"}},
             "required":["project"]})json",
         false, [](const QJsonObject& a) {
             Loaded l;
@@ -800,7 +801,7 @@ void McpServer::Impl::addTools() {
             if (a.contains("audio_layout")) {
                 const std::string layout = a.value("audio_layout").toString().toStdString();
                 if (std::find(audioLayouts().begin(), audioLayouts().end(), layout) == audioLayouts().end())
-                    throw ArgError{"\"audio_layout\" must be stereo, 5.1, 7.1, 5.1.2, 5.1.4, 7.1.2 or 7.1.4"};
+                    throw ArgError{"\"audio_layout\" must be stereo, 5.1, 7.1, 5.1.2, 5.1.4, 7.1.2, 7.1.4 or ambix"};
                 s.audioLayout = layout;
             }
             FrameTime at = 0;
@@ -3846,7 +3847,7 @@ void McpServer::Impl::addTools() {
         "master; an empty path stops it moving. A track routed to a bus is placed by its bus. Export with montage_render "
         "(downmix_stereo for a stereo copy).",
         R"json({"type":"object","properties":{"project":{"type":"string"},
-            "layout":{"type":"string","enum":["stereo","5.1","7.1","5.1.2","5.1.4","7.1.2","7.1.4"]},
+            "layout":{"type":"string","enum":["stereo","5.1","7.1","5.1.2","5.1.4","7.1.2","7.1.4","ambix"]},
             "tracks":{"type":"array","items":{"type":"object","properties":{
                 "track":{"type":"string","description":"Audio track, e.g. A1"},"angle":{"type":"number","default":0},
                 "distance":{"type":"number","default":1},"height":{"type":"number","default":0},"width":{"type":"number","default":1},
@@ -3860,7 +3861,7 @@ void McpServer::Impl::addTools() {
             if (a.contains("layout")) {
                 const std::string layout = a.value("layout").toString().toStdString();
                 if (std::find(audioLayouts().begin(), audioLayouts().end(), layout) == audioLayouts().end())
-                    throw ArgError{"\"layout\" must be stereo, 5.1, 7.1, 5.1.2, 5.1.4, 7.1.2 or 7.1.4"};
+                    throw ArgError{"\"layout\" must be stereo, 5.1, 7.1, 5.1.2, 5.1.4, 7.1.2, 7.1.4 or ambix"};
                 s.audioLayout = layout;
             }
             QJsonArray out;
@@ -5784,6 +5785,70 @@ void McpServer::Impl::addTools() {
             if (done.isEmpty()) throw ArgError{"Give clip, media or sequence_360"};
             save(l);
             return ok(done.join('\n'), QJsonObject{{"view", view}});
+        });
+
+    add("montage_ambisonics", "Ambisonic audio",
+        "Ambisonic (spatial) sound, as Premiere's VR audio and YouTube's spatial audio take it: first-order AmbiX (W, Y, Z, "
+        "X; ACN, SN3D) from 360° cameras and ambisonic microphones, found from a file's spatial audio metadata or marked "
+        "here with `media` and `ambisonic`. With `clip` (an audio clip of ambisonic media): turn its field with `yaw` "
+        "(degrees right), `pitch` (up) and `roll` (clockwise), keyed at `at` when given; `follow_view` (default true) "
+        "turns it with the linked picture's Reframe 360° view so the sound follows the picture; `decode` binaural "
+        "(headphones, the default) or stereo (speakers) in a stereo or surround mix. A sequence whose audio layout is "
+        "\"ambix\" (montage_set_surround layout) mixes to a four-channel field (tracks placed in it by their surround panner, "
+        "ambisonic clips added as they are) and exports as AAC or PCM in MP4 or MOV with the SA3D box YouTube reads.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"media":{"type":"number"},"ambisonic":{"type":"boolean"},
+            "clip":{"type":"number"},"yaw":{"type":"number"},"pitch":{"type":"number"},"roll":{"type":"number"},"at":{"type":"integer"},
+            "follow_view":{"type":"boolean"},"decode":{"type":"string","enum":["binaural","stereo"]}},"required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            QStringList done;
+            if (a.contains("media")) {
+                MediaItem* m = l.project.findMedia(Id(a.value("media").toDouble()));
+                if (!m || !m->hasAudio || m->kind == MediaKind::Sequence) throw ArgError{"No such sound media"};
+                const bool on = a.value("ambisonic").toBool(true);
+                if (on && m->channels < kFoaChannels) throw ArgError{"Ambisonic sound has at least four channels"};
+                m->ambisonic = on ? 1 : 0;
+                for (MediaItem& sub : l.project.media)
+                    if (sub.subclipOf == m->id) sub.ambisonic = m->ambisonic;
+                done << QStringLiteral("%1 is %2").arg(QString::fromStdString(m->name), on ? "an ambisonic field" : "channels for speakers");
+            }
+            QJsonObject field;
+            if (a.contains("clip")) {
+                const Clip& c = clipArg(l, a);
+                const MediaItem* m = c.mediaId ? l.project.findMedia(c.mediaId) : nullptr;
+                if (!m || m->ambisonic <= 0) throw ArgError{"The clip does not play ambisonic sound (mark its media first)"};
+                FrameTime key = -1;
+                if (a.contains("at")) {
+                    key = FrameTime(a.value("at").toInteger()) - c.start;
+                    if (key < 0 || key >= c.duration) throw ArgError{"at is a frame inside the clip"};
+                }
+                Clip* clip = edit::clipById(l.seq(), c.id);
+                auto it = std::find_if(clip->effects.begin(), clip->effects.end(), [](const Effect& e) { return e.type == "ambisonics"; });
+                if (it == clip->effects.end()) {
+                    clip->effects.push_back(makeEffect(l.project, "ambisonics"));
+                    it = std::prev(clip->effects.end());
+                }
+                for (const char* name : {"yaw", "pitch", "roll"}) {
+                    if (!a.contains(name)) continue;
+                    const double v = a.value(name).toDouble();
+                    if (key >= 0) it->params[name].addKey(key, v, Interp::Smooth);
+                    else it->params[name] = Param(v);
+                }
+                if (a.contains("follow_view")) it->params["follow_view"] = Param(a.value("follow_view").toBool() ? 1.0 : 0.0);
+                if (a.contains("decode")) {
+                    const QString d = str(a, "decode");
+                    if (d != "binaural" && d != "stereo") throw ArgError{"decode is binaural or stereo"};
+                    it->params["decode"] = Param(d == "stereo" ? 1.0 : 0.0);
+                }
+                const FrameTime t = std::max<FrameTime>(0, key);
+                field = QJsonObject{{"yaw", it->p("yaw", t)}, {"pitch", it->p("pitch", t)}, {"roll", it->p("roll", t)},
+                                    {"follow_view", it->p("follow_view", t, 1) > 0.5}, {"decode", it->p("decode", t) > 0.5 ? "stereo" : "binaural"}};
+                done << QStringLiteral("Clip %1: turned %2° right, %3° up, %4° roll%5").arg(clip->id).arg(it->p("yaw", t)).arg(it->p("pitch", t))
+                            .arg(it->p("roll", t)).arg(it->p("follow_view", t, 1) > 0.5 ? QStringLiteral(", following the 360° view") : QString());
+            }
+            if (done.isEmpty()) throw ArgError{"Give media or clip"};
+            save(l);
+            return ok(done.join('\n'), QJsonObject{{"field", field}, {"sequence_ambisonic", ambisonicLayout(l.seq().audioLayout)}});
         });
 
     add("montage_stereo", "Stereoscopic 3D",
