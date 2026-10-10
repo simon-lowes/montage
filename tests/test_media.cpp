@@ -3439,6 +3439,7 @@ private slots:
         if (avcodec_find_encoder_by_name("libx265")) {
             r = call("montage_render", {{"output", QString::fromStdString(path("hdr-mcp.mp4"))}, {"preset", "H.265 / HEVC"}, {"hdr10plus", true}});
             QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            QCOMPARE(r.value("structuredContent").toObject().value("hdr10plus").toString(), QString("video"));
             QCOMPARE(r.value("structuredContent").toObject().value("max_cll").toInt(), 203);
             std::vector<Hdr10PlusScene> beside;
             QVERIFY2(readHdr10PlusJson(path("hdr-mcp.hdr10plus.json"), beside, &err), err.c_str());
@@ -14016,6 +14017,11 @@ private slots:
             av_packet_free(&pkt);
         }
         {
+            // The SEI takes its access unit's TemporalId (here a sub-layer 2 slice).
+            AVPacket* sub = packet({0, 0, 0, 1, 0x02, 0x03, 0xD0, 0x11});
+            QVERIFY(addHdr10PlusSei(sub, zeros, 0));
+            QCOMPARE(sub->data[5], uint8_t(0x03));
+            av_packet_free(&sub);
             AVPacket* pkt = packet({0, 0, 0, 4, 0x40, 0x01, 0x0C, 0x01, 0, 0, 0, 3, 0x02, 0x01, 0xD0});  // VPS, TRAIL_R slice
             QVERIFY(addHdr10PlusSei(pkt, zeros, 4));
             const uint8_t* d = pkt->data;
@@ -14098,8 +14104,7 @@ private slots:
         QVERIFY(near(got[0].percentiles[0], 100) && near(got[0].percentiles[2], 100) && near(got[0].percentiles[3], 1000) && near(got[0].percentiles[6], 1000));
         QVERIFY(near(got[1].maxScl[0], 1) && near(got[1].average, 1));
 
-        // ---- A cut exported: three shots, each its own scene in the file, on every frame.
-        if (!avcodec_find_encoder_by_name("libx265")) QSKIP("This FFmpeg has no libx265");
+        // ---- A cut of three shots: each its own scene.
         Project p = makeDefaultProject();
         Sequence& s = *p.active();
         s.width = 160;
@@ -14129,7 +14134,44 @@ private slots:
         // channel its red.
         QVERIFY2(analysed[2].maxScl[0] > 100 && analysed[2].maxScl[1] < analysed[2].maxScl[0] / 4 && near(analysed[2].average, analysed[2].maxScl[0]),
                  qPrintable(QString("%1 %2 %3 %4").arg(analysed[2].maxScl[0]).arg(analysed[2].maxScl[1]).arg(analysed[2].maxScl[2]).arg(analysed[2].average)));
+        // A hidden track's clip or a disabled clip makes no cut.
+        {
+            Sequence hidden = s;
+            edit::addTrack(p, hidden, TrackKind::Video);
+            Clip extra = makeGeneratorClip(p, "color", 4);
+            extra.start = 3;
+            edit::overwrite(p, hidden, {TrackKind::Video, 1}, extra);
+            QCOMPARE(hdr10PlusCuts(hidden, 0, 30), (std::vector<FrameTime>{3, 7, 10, 20}));
+            hidden.videoTracks[1].muted = true;
+            QCOMPARE(hdr10PlusCuts(hidden, 0, 30), (std::vector<FrameTime>{10, 20}));
+            hidden.videoTracks[1].muted = false;
+            hidden.videoTracks[1].clips[0].enabled = false;
+            QCOMPARE(hdr10PlusCuts(hidden, 0, 30), (std::vector<FrameTime>{10, 20}));
+        }
+        // Analysing part again grows to whole stored scenes, and the result replaces only what it covers.
+        {
+            FrameTime a = 15, b = 25;
+            widenHdr10PlusRange(analysed, a, b);
+            QVERIFY(a == 10 && b == 30);
+            std::vector<Hdr10PlusScene> stored = analysed, fresh(analysed.begin() + 1, analysed.end());
+            fresh[0].maxScl[0] = 1;
+            mergeHdr10PlusScenes(stored, fresh);
+            QVERIFY(stored.size() == 3 && stored[0] == analysed[0] && stored[1].maxScl[0] == 1 && stored[2] == analysed[2]);
+        }
+        // The sequence's analysis is checked against the cut scene by scene, and kept with the project.
+        s.hdr10Plus = analysed;
+        QCOMPARE(storedHdr10Plus(p, s, 0, 30, pq, 1000), analysed);
+        std::vector<Hdr10PlusScene> part = storedHdr10Plus(p, s, 5, 25, pq, 1000);
+        QVERIFY(part.size() == 3 && part[0].start == 5 && part[2].end == 25);
+        const QString proj = QString::fromStdString(path("hdr10plus.montage"));
+        QVERIFY(saveProject(p, proj.toStdString()));
+        Project reopened;
+        QVERIFY(loadProject(proj.toStdString(), reopened));
+        QCOMPARE(reopened.active()->hdr10Plus, analysed);
+        s.hdr10Plus.clear();
 
+        // ---- Exported: each scene in the file, on every frame.
+        if (!avcodec_find_encoder_by_name("libx265")) QSKIP("This FFmpeg has no libx265");
         ExportSettings st;
         st.path = path("hdr10plus.mp4");
         st.videoCodec = "libx265";
@@ -14214,23 +14256,50 @@ private slots:
             QCOMPARE(root.value("SceneInfoSummary").toObject().value("SceneFrameNumbers").toArray(), (QJsonArray{10, 10, 10}));
         }
 
-        // The sequence's analysis is used while its scenes still match the cut (each scene checked on its own), and kept
-        // with the project.
+        // Exports use the stored analysis where it still matches: a marked value comes through untouched...
         s.hdr10Plus = analysed;
-        QCOMPARE(storedHdr10Plus(p, s, 0, 30, pq, 1000), analysed);
-        std::vector<Hdr10PlusScene> part = storedHdr10Plus(p, s, 5, 25, pq, 1000);
-        QVERIFY(part.size() == 3 && part[0].start == 5 && part[2].end == 25);
-        const QString proj = QString::fromStdString(path("hdr10plus.montage"));
-        QVERIFY(saveProject(p, proj.toStdString()));
-        Project reopened;
-        QVERIFY(loadProject(proj.toStdString(), reopened));
-        QCOMPARE(reopened.active()->hdr10Plus, analysed);
-        trackAt(s, {TrackKind::Video, 0})->clips[2].generator.params["color.g"] = 1.0;  // the last shot regraded
+        s.hdr10Plus[0].maxScl[0] = 777;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        QVERIFY(readHdr10PlusJson(path("hdr10plus.hdr10plus.json"), fromJson, &err) && fromJson.size() == 3);
+        QVERIFY2(std::fabs(fromJson[0].maxScl[0] - 777) < 0.051, qPrintable(QString::number(fromJson[0].maxScl[0])));
+        // ...and a regraded shot is measured again on its own, the other scenes kept.
+        trackAt(s, {TrackKind::Video, 0})->clips[2].generator.params["color.g"] = 1.0;
         QVERIFY(storedHdr10Plus(p, s, 0, 30, pq, 1000).empty());
         QCOMPARE(storedHdr10Plus(p, s, 0, 20, pq, 1000).size(), size_t(2));
-        // Exported again, it is measured afresh: the last shot now has green in it.
         QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
-        QVERIFY(readHdr10PlusJson(path("hdr10plus.hdr10plus.json"), fromJson, &err) && fromJson.size() == 3 && fromJson[2].maxScl[1] > 150);
+        QVERIFY(readHdr10PlusJson(path("hdr10plus.hdr10plus.json"), fromJson, &err) && fromJson.size() == 3);
+        QVERIFY(std::fabs(fromJson[0].maxScl[0] - 777) < 0.051 && fromJson[2].maxScl[1] > 150);
+        // Burn-ins change the picture from what was analysed: measured on the frames as delivered instead.
+        {
+            ExportSettings burnt = st;
+            burnt.burnIn.timecode = true;
+            QVERIFY2(exportSequence(p, s, burnt, nullptr, nullptr, &err), err.c_str());
+            QVERIFY(readHdr10PlusJson(path("hdr10plus.hdr10plus.json"), fromJson, &err) && fromJson.size() == 3);
+            QVERIFY2(fromJson[0].maxScl[0] < 700, qPrintable(QString::number(fromJson[0].maxScl[0])));
+        }
+        s.hdr10Plus.clear();
+        // A JSON that cannot be written (a folder in its place) is warned about; the video is kept.
+        {
+            QDir().mkpath(QString::fromStdString(path("blocked.hdr10plus.json")));
+            ExportSettings blocked = st;
+            blocked.path = path("blocked.mp4");
+            QVERIFY2(exportSequence(p, s, blocked, nullptr, nullptr, &err), err.c_str());
+            QVERIFY(QFileInfo(QString::fromStdString(blocked.path)).size() > 1000);
+        }
+        // An image sequence's JSON is named without its frame number.
+        {
+            ExportSettings frames = st;
+            frames.path = path("frames_%04d.tif");
+            frames.videoCodec = "tiff";
+            frames.audioCodec = "none";
+            QVERIFY2(exportSequence(p, s, frames, nullptr, nullptr, &err), err.c_str());
+            QVERIFY(QFileInfo::exists(QString::fromStdString(path("frames.hdr10plus.json"))));
+            QCOMPARE(hdr10PlusCarriage(s, frames), std::string("json"));
+            QCOMPARE(hdr10PlusCarriage(s, st), std::string("video"));
+            Sequence sdrSeq = s;
+            sdrSeq.colorSpace = "rec709";
+            QCOMPARE(hdr10PlusCarriage(sdrSeq, st), std::string());
+        }
         // Not for SDR.
         Sequence sdr = s;
         sdr.colorSpace = "rec709";
@@ -14239,7 +14308,9 @@ private slots:
 
         // AV1 carries it in metadata OBUs, which dav1d reads back.
 #if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(60, 31, 100)
-        if (avcodec_find_encoder_by_name("libsvtav1") && avcodec_find_decoder_by_name("libdav1d")) {
+        if (!avcodec_find_encoder_by_name("libsvtav1") || !avcodec_find_decoder_by_name("libdav1d"))
+            qWarning("AV1 HDR10+ not checked: this FFmpeg lacks libsvtav1 or libdav1d");
+        else {
             ExportSettings av1 = st;
             av1.path = path("hdr10plus-av1.mp4");
             av1.videoCodec = "libsvtav1";
@@ -14250,7 +14321,9 @@ private slots:
             QCOMPARE(messages, 30);
             QCOMPARE(maxRed.size(), size_t(30));
             for (int f = 0; f < 30; ++f) QVERIFY2(maxRed[size_t(f)] > 0, qPrintable(QString::number(f)));
-            QVERIFY(std::fabs(maxRed[25] - std::floor(fromJson[2].maxScl[0] * 10 + 0.5) / 10) < 0.051);
+            std::vector<Hdr10PlusScene> av1Json;
+            QVERIFY(readHdr10PlusJson(path("hdr10plus-av1.hdr10plus.json"), av1Json, &err) && av1Json.size() == 3);
+            QVERIFY(std::fabs(maxRed[25] - std::floor(av1Json[2].maxScl[0] * 10 + 0.5) / 10) < 0.051);
         }
 #endif
     }

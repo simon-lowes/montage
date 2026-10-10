@@ -767,22 +767,10 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     LightLevels measured;
     const LightMeter meter(outSpace);
     const bool measure = wantVideo && outSpace.hdr() && meter.valid();
-    // HDR10+: each scene's metadata for the frames exported, from the sequence's analysis while it still matches the
-    // cut, else measured now (the first part of the progress).
+    // HDR10+ (measured once everything is open, just before the frames, so a missing encoder fails first).
+    const bool wantHdr10 = s.hdr10Plus && wantVideo && pq && !floatFrames;
     std::vector<Hdr10PlusScene> hdr10;
     double renderFrom = 0;  // where the render's share of the progress starts
-    if (s.hdr10Plus && wantVideo && pq && !floatFrames) {
-        hdr10 = storedHdr10Plus(p, seq, in, out, outSpace, peakNits);
-        if (hdr10.empty()) {
-            renderFrom = 0.3;
-            std::string e;
-            const auto part = [&](double f) {
-                if (progress) progress(renderFrom * f, in + FrameTime(std::floor(f * double(out - in - 1))));
-            };
-            if (!analyseHdr10Plus(p, seq, in, out, outSpace, peakNits, hdr10, &e, part, cancel))
-                return fail(cancel && cancel->load() ? std::string("Export cancelled") : "HDR10+ analysis failed: " + e);
-        }
-    }
     if (wantVideo) {
         std::string c = s.videoCodec;
         const bool hardware = c == "hw_h264" || c == "hw_hevc";
@@ -903,26 +891,6 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         rc = avcodec_open2(o.vctx, codec, &opts);
         av_dict_free(&opts);
         if (rc < 0) return fail("Cannot open video encoder: " + averr(rc));
-        // HDR10+ in the video itself: an SEI message in each HEVC access unit, a metadata OBU in each AV1 temporal
-        // unit, the scene's values on every frame of it.
-        if (!hdr10.empty() && (o.vctx->codec_id == AV_CODEC_ID_HEVC || o.vctx->codec_id == AV_CODEC_ID_AV1)) {
-            const bool av1 = o.vctx->codec_id == AV_CODEC_ID_AV1;
-            // Packets carry NAL units after start codes, or after lengths when the encoder's header is an hvcC record.
-            const int lengthSize = !av1 && o.vctx->extradata_size > 22 && o.vctx->extradata[0] == 1 ? (o.vctx->extradata[21] & 3) + 1 : 0;
-            auto messages = std::make_shared<std::vector<std::vector<uint8_t>>>();
-            for (const Hdr10PlusScene& sc : hdr10) messages->push_back(hdr10PlusT35(sc));
-            const auto scenes = std::make_shared<std::vector<Hdr10PlusScene>>(hdr10);
-            const FrameTime first = in;
-            o.videoPacket = [scenes, messages, av1, lengthSize, first](AVPacket* pkt) {
-                if (pkt->pts == AV_NOPTS_VALUE) return false;
-                const FrameTime f = first + pkt->pts;
-                const auto it = std::upper_bound(scenes->begin(), scenes->end(), f,
-                                                 [](FrameTime t, const Hdr10PlusScene& sc) { return t < sc.end; });
-                if (it == scenes->end() || f < it->start) return false;
-                const auto& msg = (*messages)[size_t(it - scenes->begin())];
-                return av1 ? addHdr10PlusObu(pkt, msg) : addHdr10PlusSei(pkt, msg, lengthSize);
-            };
-        }
         avcodec_parameters_from_context(o.vst->codecpar, o.vctx);
         o.vst->time_base = o.vctx->time_base;
         o.vst->avg_frame_rate = fps;
@@ -1443,34 +1411,75 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         std::memcpy(sd->data, cc.data(), cc.size());
         return true;
     };
+    const bool burns = (s.burnInCaptions && captions) || s.burnIn.any();
+    const bool packedEyes = seq.stereo3d && stereoView != StereoView::Left && stereoView != StereoView::Right && stereoView != StereoView::Anaglyph;
+    // A frame as delivered: rendered, captions and burn-ins drawn, in the output space.
+    auto deliveredFrame = [&](FrameTime f) {
+        auto burn = [&](Image& img) {
+            if (s.burnInCaptions && captions) drawCaption(img, *captions, f, &seqSpace);
+            if (s.burnIn.any()) drawBurnIns(img, p, seq, f, s.burnIn, watermark.isNull() ? nullptr : &watermark, &seqSpace);
+        };
+        Image img;
+        if (burns && packedEyes) {
+            // Packed eyes: captions and burn-ins on each eye, so they sit on the screen in both rather than across
+            // the join.
+            RenderOptions eye = ro;
+            eye.stereoView = StereoView::Left;
+            Image left = renderProgramFrame(p, seq, f, eye);
+            eye.stereoView = StereoView::Right;
+            Image right = renderProgramFrame(p, seq, f, eye);
+            burn(left);
+            burn(right);
+            img = combineStereo(left, right, stereoView);
+        } else {
+            img = s.alpha && !seq.stereo3d ? renderSequenceFrame(p, seq, f, ro) : renderProgramFrame(p, seq, f, ro);
+            burn(img);
+        }
+        convertColor(img, seqSpace, outSpace, peakNits);
+        return img;
+    };
+    // HDR10+: each scene's metadata for the frames exported. The sequence's analysis is used where it still matches
+    // the cut (not when burn-ins or packed eyes change the picture from what was analysed); the rest is measured now on
+    // the frames as delivered, as the first part of the progress.
+    if (wantHdr10) {
+        const bool reuse = !burns && !packedEyes;
+        FrameTime toMeasure = 0;
+        renderFrom = 0.3;
+        std::string e;
+        const auto part = [&](double f) {
+            if (progress) progress(renderFrom * f, in + FrameTime(std::floor(f * double(out - in - 1))));
+        };
+        if (!hdr10PlusForRange(p, seq, in, out, outSpace, peakNits, reuse, hdr10, &e, part, cancel, deliveredFrame, &toMeasure))
+            return fail(cancel && cancel->load() ? std::string("Export cancelled") : "HDR10+ analysis failed: " + e);
+        if (toMeasure == 0) renderFrom = 0;
+        // In the video itself: an SEI message in each HEVC access unit, a metadata OBU in each AV1 temporal unit, the
+        // scene's values on every frame of it.
+        if (!hdr10.empty() && o.vctx && (o.vctx->codec_id == AV_CODEC_ID_HEVC || o.vctx->codec_id == AV_CODEC_ID_AV1)) {
+            const bool av1 = o.vctx->codec_id == AV_CODEC_ID_AV1;
+            // Packets carry NAL units after start codes, or after lengths when the encoder's header is an hvcC record.
+            const int lengthSize = !av1 && o.vctx->extradata_size > 22 && o.vctx->extradata[0] == 1 ? (o.vctx->extradata[21] & 3) + 1 : 0;
+            auto messages = std::make_shared<std::vector<std::vector<uint8_t>>>();
+            for (const Hdr10PlusScene& sc : hdr10) messages->push_back(hdr10PlusT35(sc));
+            const auto scenes = std::make_shared<std::vector<Hdr10PlusScene>>(hdr10);
+            const FrameTime first = in;
+            o.videoPacket = [scenes, messages, av1, lengthSize, first](AVPacket* pkt) {
+                if (pkt->pts == AV_NOPTS_VALUE) return false;
+                const FrameTime f = first + pkt->pts;
+                const auto it = std::upper_bound(scenes->begin(), scenes->end(), f,
+                                                 [](FrameTime t, const Hdr10PlusScene& sc) { return t < sc.end; });
+                if (it == scenes->end() || f < it->start) return false;
+                const auto& msg = (*messages)[size_t(it - scenes->begin())];
+                return av1 ? addHdr10PlusObu(pkt, msg) : addHdr10PlusSei(pkt, msg, lengthSize);
+            };
+        }
+    }
     for (FrameTime f = in; f < out; ++f) {
         if (cancel && cancel->load()) return fail("Export cancelled");
         if (!writeCaptions(f + 1)) return fail("Writing captions failed");
         if (wantVideo && smart && smart->copy(f, in, o.oc)) {
             // copied from the source
         } else if (wantVideo) {
-            const bool burns = (s.burnInCaptions && captions) || s.burnIn.any();
-            auto burn = [&](Image& img) {
-                if (s.burnInCaptions && captions) drawCaption(img, *captions, f, &seqSpace);
-                if (s.burnIn.any()) drawBurnIns(img, p, seq, f, s.burnIn, watermark.isNull() ? nullptr : &watermark, &seqSpace);
-            };
-            Image img;
-            if (burns && seq.stereo3d && stereoView != StereoView::Left && stereoView != StereoView::Right && stereoView != StereoView::Anaglyph) {
-                // Packed eyes: captions and burn-ins on each eye, so they sit on the screen in both rather than across
-                // the join.
-                RenderOptions eye = ro;
-                eye.stereoView = StereoView::Left;
-                Image left = renderProgramFrame(p, seq, f, eye);
-                eye.stereoView = StereoView::Right;
-                Image right = renderProgramFrame(p, seq, f, eye);
-                burn(left);
-                burn(right);
-                img = combineStereo(left, right, stereoView);
-            } else {
-                img = s.alpha && !seq.stereo3d ? renderSequenceFrame(p, seq, f, ro) : renderProgramFrame(p, seq, f, ro);
-                burn(img);
-            }
-            convertColor(img, seqSpace, outSpace, peakNits);
+            Image img = deliveredFrame(f);
             if (measure) meter.add(img, f, measured);
             if (floatFrames && img.width == W && img.height == H) {
                 // Planar float, green-blue-red(-alpha), unpremultiplied, values above 1 kept.
@@ -1600,12 +1609,18 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         }
     if ((rc = av_write_trailer(o.oc)) < 0) return fail("Cannot finalise file: " + averr(rc));
     if (o.oc->pb && o.oc->pb->error < 0) return fail("Writing the file failed: " + averr(o.oc->pb->error));
-    // The HDR10+ metadata beside the file too.
+    // The HDR10+ metadata beside the file too (named after it, an image sequence's frame number left out). The video
+    // is done by now: a JSON that cannot be written is warned about, never a reason to lose the export.
     if (!hdr10.empty()) {
         const size_t slash = s.path.find_last_of("/\\"), dot = s.path.find_last_of('.');
-        const size_t stem = dot != std::string::npos && (slash == std::string::npos || dot > slash) ? dot : s.path.size();
+        std::string stem = s.path.substr(0, dot != std::string::npos && (slash == std::string::npos || dot > slash) ? dot : s.path.size());
+        if (const size_t pct = stem.find('%'); pct != std::string::npos && (slash == std::string::npos || pct > slash)) {
+            size_t cut = pct;
+            if (cut > 0 && (stem[cut - 1] == '_' || stem[cut - 1] == '.' || stem[cut - 1] == '-')) --cut;
+            stem.erase(cut);
+        }
         std::string e;
-        if (!writeHdr10PlusJson(s.path.substr(0, stem) + ".hdr10plus.json", hdr10, in, out, &e)) return fail(e);
+        if (!writeHdr10PlusJson(stem + ".hdr10plus.json", hdr10, in, out, &e)) qWarning("HDR10+ JSON not written beside %s: %s", s.path.c_str(), e.c_str());
     }
     if (smartRendered) *smartRendered = smart ? smart->copied() : 0;
     if (light) *light = measured;
@@ -1613,6 +1628,17 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
 }
 
 }  // namespace
+
+std::string hdr10PlusCarriage(const Sequence& seq, const ExportSettings& s) {
+    const std::string& c = s.videoCodec;
+    if (c.empty() || c == "none" || c == "gif" || c == "exr") return {};
+    const ColorSpace* chosen = findColorSpace(s.colorSpace);
+    const ColorSpace& out = chosen && !chosen->sceneReferred ? *chosen : sequenceColorSpace(seq);
+    if (out.transfer != Transfer::Pq) return {};
+    const bool video = c == "libx265" || c == "hw_hevc" || c.rfind("hevc_", 0) == 0 || c == "libsvtav1" || c == "libaom-av1" ||
+                       c == "librav1e" || c.rfind("av1_", 0) == 0;
+    return video ? "video" : "json";
+}
 
 int maxAudioChannels(const std::string& codec) {
     if (codec.rfind("pcm_", 0) == 0) return 64;

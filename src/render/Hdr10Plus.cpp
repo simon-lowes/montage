@@ -8,6 +8,7 @@
 #include <QJsonObject>
 #include <algorithm>
 #include <cmath>
+#include <mutex>
 
 #include "render/Compositor.h"
 #include "render/RenderCache.h"
@@ -25,8 +26,6 @@ constexpr int kCoarse = 32;
 // The percentages HDR10+ sends (ST 2094-40 §8.5.4): 99 stands for 99.98 %, and 5 and 10 carry fixed values.
 constexpr int kPercentages[9] = {1, 5, 10, 25, 50, 75, 90, 95, 99};
 constexpr double kMeasured[7] = {1, 25, 50, 75, 90, 95, 99.98};  // what Hdr10PlusScene::percentiles holds
-
-inline int code16(float v) { return int(std::lround(std::clamp(v, 0.0f, 1.0f) * float(kCodes - 1))); }
 
 // Linearised light as ST 2094-40 codes it: 0.00001 of 10000 cd/m² (0.1 cd/m²) steps, 17 bits.
 uint32_t linearCode(double nits) { return uint32_t(std::clamp<long>(std::lround(nits * 10), 0, 100000)); }
@@ -159,24 +158,37 @@ void Hdr10PlusMeter::close() {
 
 void Hdr10PlusMeter::add(const Image& img, FrameTime f, bool cut) {
     if (!valid_ || img.empty()) return;
-    // The frame's spread of brightest channels, coarsely, to see a cut within a clip.
+    // The frame's codes counted in bands of rows at once, each band on its own histogram, merged after. Codes are
+    // monotonic in light, so each pixel's brightest code is its brightest channel's.
     coarse_.assign(kCoarse, 0);
     std::vector<uint64_t>& frameHist = frame_;
     frameHist.assign(kCodes, 0);
-    double frameMax[3] = {0, 0, 0}, frameSum = 0;
-    for (int y = 0; y < img.height; ++y) {
-        const float* p = img.row(y);
-        for (int x = 0; x < img.width; ++x, p += 4) {
-            const int r = code16(p[0]), g = code16(p[1]), b = code16(p[2]);
-            const int m = std::max({r, g, b});
-            frameMax[0] = std::max<double>(frameMax[0], nits_[size_t(r)]);
-            frameMax[1] = std::max<double>(frameMax[1], nits_[size_t(g)]);
-            frameMax[2] = std::max<double>(frameMax[2], nits_[size_t(b)]);
-            frameSum += nits_[size_t(m)];
-            ++frameHist[size_t(m)];
-            coarse_[size_t(m * kCoarse / kCodes)] += 1;
+    int frameMaxCode[3] = {0, 0, 0};
+    std::mutex merge;
+    parallelRows(img.height, [&](int y0, int y1) {
+        std::vector<uint32_t> hist(kCodes, 0);
+        int mx[3] = {0, 0, 0};
+        for (int y = y0; y < y1; ++y) {
+            const float* p = img.row(y);
+            for (int x = 0; x < img.width; ++x, p += 4) {
+                const int r = int(std::clamp(p[0], 0.0f, 1.0f) * float(kCodes - 1) + 0.5f);
+                const int g = int(std::clamp(p[1], 0.0f, 1.0f) * float(kCodes - 1) + 0.5f);
+                const int b = int(std::clamp(p[2], 0.0f, 1.0f) * float(kCodes - 1) + 0.5f);
+                mx[0] = std::max(mx[0], r), mx[1] = std::max(mx[1], g), mx[2] = std::max(mx[2], b);
+                ++hist[size_t(std::max({r, g, b}))];
+            }
         }
-    }
+        std::lock_guard<std::mutex> lock(merge);
+        for (int c = 0; c < 3; ++c) frameMaxCode[c] = std::max(frameMaxCode[c], mx[c]);
+        for (int c = 0; c < kCodes; ++c) frameHist[size_t(c)] += hist[size_t(c)];
+    });
+    double frameMax[3], frameSum = 0;
+    for (int c = 0; c < 3; ++c) frameMax[c] = nits_[size_t(frameMaxCode[c])];
+    for (int c = 0; c < kCodes; ++c)
+        if (const uint64_t k = frameHist[size_t(c)]) {
+            frameSum += double(k) * nits_[size_t(c)];
+            coarse_[size_t(c * kCoarse / kCodes)] += double(k);
+        }
     const double n = double(img.width) * img.height;
     for (double& c : coarse_) c /= n;
     bool change = false;
@@ -207,10 +219,14 @@ std::vector<Hdr10PlusScene> Hdr10PlusMeter::scenes() {
 
 std::vector<FrameTime> hdr10PlusCuts(const Sequence& s, FrameTime from, FrameTime to) {
     std::vector<FrameTime> cuts;
-    for (const Track& t : s.videoTracks)
-        for (const Clip& c : t.clips)
+    for (const Track& t : s.videoTracks) {
+        if (t.muted) continue;  // (hidden tracks show nothing)
+        for (const Clip& c : t.clips) {
+            if (!c.enabled) continue;
             for (FrameTime e : {c.start, c.end()})
                 if (e > from && e < to) cuts.push_back(e);
+        }
+    }
     std::sort(cuts.begin(), cuts.end());
     cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
     return cuts;
@@ -224,7 +240,7 @@ std::string hdr10PlusFramesKey(const Project& p, const Sequence& s, FrameTime fr
 
 bool analyseHdr10Plus(const Project& p, const Sequence& s, FrameTime from, FrameTime to, const ColorSpace& out, double peakNits,
                       std::vector<Hdr10PlusScene>& scenes, std::string* error, const std::function<void(double)>& progress,
-                      const std::atomic<bool>* cancel, LightLevels* light) {
+                      const std::atomic<bool>* cancel, LightLevels* light, const std::function<Image(FrameTime)>& frame) {
     scenes.clear();
     if (light) *light = LightLevels{};
     Hdr10PlusMeter meter(out);
@@ -252,8 +268,13 @@ bool analyseHdr10Plus(const Project& p, const Sequence& s, FrameTime from, Frame
             if (error) *error = "Cancelled";
             return false;
         }
-        Image img = renderProgramFrame(p, s, f, o);
-        convertColor(img, space, out, peakNits);
+        Image img;
+        if (frame) {
+            img = frame(f);
+        } else {
+            img = renderProgramFrame(p, s, f, o);
+            convertColor(img, space, out, peakNits);
+        }
         const bool cut = nextCut < cuts.size() && cuts[nextCut] == f;
         if (cut) ++nextCut;
         meter.add(img, f, cut);
@@ -284,6 +305,65 @@ std::vector<Hdr10PlusScene> storedHdr10Plus(const Project& p, const Sequence& s,
     }
     if (at < to) return {};
     return part;
+}
+
+bool hdr10PlusForRange(const Project& p, const Sequence& s, FrameTime from, FrameTime to, const ColorSpace& out, double peakNits,
+                       bool reuse, std::vector<Hdr10PlusScene>& scenes, std::string* error, const std::function<void(double)>& progress,
+                       const std::atomic<bool>* cancel, const std::function<Image(FrameTime)>& frame, FrameTime* measured) {
+    scenes.clear();
+    if (measured) *measured = 0;
+    if (to <= from) return true;
+    // What still matches, scene by scene.
+    std::vector<Hdr10PlusScene> kept;
+    if (reuse)
+        for (const Hdr10PlusScene& sc : s.hdr10Plus) {
+            if (sc.end <= from || sc.start >= to || sc.end > s.duration()) continue;
+            if (hdr10PlusFramesKey(p, s, sc.start, sc.end, out, peakNits) != sc.key) continue;
+            Hdr10PlusScene c = sc;
+            c.start = std::max(c.start, from);
+            c.end = std::min(c.end, to);
+            kept.push_back(c);
+        }
+    // The stretches between them, measured now.
+    std::vector<std::pair<FrameTime, FrameTime>> gaps;
+    FrameTime at = from;
+    for (const Hdr10PlusScene& c : kept) {
+        if (c.start > at) gaps.push_back({at, c.start});
+        at = std::max(at, c.end);
+    }
+    if (at < to) gaps.push_back({at, to});
+    FrameTime total = 0, done = 0;
+    for (const auto& [a, b] : gaps) total += b - a;
+    for (const auto& [a, b] : gaps) {
+        std::vector<Hdr10PlusScene> part;
+        const FrameTime len = b - a;
+        const auto partProgress = [&](double f) {
+            if (progress && total > 0) progress((double(done) + f * double(len)) / double(total));
+        };
+        if (!analyseHdr10Plus(p, s, a, b, out, peakNits, part, error, partProgress, cancel, nullptr, frame)) return false;
+        kept.insert(kept.end(), part.begin(), part.end());
+        done += len;
+    }
+    std::sort(kept.begin(), kept.end(), [](const Hdr10PlusScene& x, const Hdr10PlusScene& y) { return x.start < y.start; });
+    scenes = std::move(kept);
+    if (measured) *measured = total;
+    return true;
+}
+
+void widenHdr10PlusRange(const std::vector<Hdr10PlusScene>& stored, FrameTime& from, FrameTime& to) {
+    for (const Hdr10PlusScene& sc : stored)
+        if (sc.end > from && sc.start < to) {
+            from = std::min(from, sc.start);
+            to = std::max(to, sc.end);
+        }
+}
+
+void mergeHdr10PlusScenes(std::vector<Hdr10PlusScene>& stored, const std::vector<Hdr10PlusScene>& fresh) {
+    if (fresh.empty()) return;
+    const FrameTime a = fresh.front().start, b = fresh.back().end;
+    std::erase_if(stored, [&](const Hdr10PlusScene& o) { return o.end > a && o.start < b; });
+    stored.insert(stored.end(), fresh.begin(), fresh.end());
+    std::sort(stored.begin(), stored.end(), [](const Hdr10PlusScene& x, const Hdr10PlusScene& y) { return x.start < y.start; });
 }
 
 // ---- Writing --------------------------------------------------------------------------------------------------------
@@ -323,20 +403,18 @@ bool addHdr10PlusSei(AVPacket* pkt, const std::vector<uint8_t>& t35, int lengthS
     rbsp.push_back(uint8_t(size));
     rbsp.insert(rbsp.end(), t35.begin(), t35.end());
     rbsp.push_back(0x80);
-    std::vector<uint8_t> nal{0x4E, 0x01};  // prefix SEI (type 39), layer 0, temporal id 0
-    const std::vector<uint8_t> body = escape(rbsp);
-    nal.insert(nal.end(), body.begin(), body.end());
     const uint8_t* d = pkt->data;
     const size_t n = size_t(pkt->size);
-    // Find the first slice (VCL NAL types 0-31) and where its unit starts.
-    size_t insertAt = n;
+    // Find the first slice (VCL NAL types 0-31), where its unit starts and its header.
+    size_t insertAt = n, sliceHeader = n;
     if (lengthSize == 0) {
         size_t i = 0;
         while (i + 3 <= n) {
             if (d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1) {
                 const size_t start = i > 0 && d[i - 1] == 0 ? i - 1 : i;  // a four-byte start code
-                if (i + 3 < n && ((d[i + 3] >> 1) & 0x3f) < 32) {
+                if (i + 4 < n && ((d[i + 3] >> 1) & 0x3f) < 32) {
                     insertAt = start;
+                    sliceHeader = i + 3;
                     break;
                 }
                 i += 3;
@@ -349,14 +427,19 @@ bool addHdr10PlusSei(AVPacket* pkt, const std::vector<uint8_t>& t35, int lengthS
         while (i + size_t(lengthSize) < n) {
             size_t len = 0;
             for (int k = 0; k < lengthSize; ++k) len = (len << 8) | d[i + size_t(k)];
-            if (((d[i + size_t(lengthSize)] >> 1) & 0x3f) < 32) {
+            if (i + size_t(lengthSize) + 1 < n && ((d[i + size_t(lengthSize)] >> 1) & 0x3f) < 32) {
                 insertAt = i;
+                sliceHeader = i + size_t(lengthSize);
                 break;
             }
             i += size_t(lengthSize) + len;
         }
     }
-    if (insertAt >= n) return false;
+    if (insertAt >= n || sliceHeader + 1 >= n) return false;
+    // Prefix SEI (type 39) in the slice's layer 0 sub-layer: the same TemporalId as its access unit.
+    std::vector<uint8_t> nal{0x4E, uint8_t(std::max(1, d[sliceHeader + 1] & 0x07))};
+    const std::vector<uint8_t> body = escape(rbsp);
+    nal.insert(nal.end(), body.begin(), body.end());
     std::vector<uint8_t> out(d, d + insertAt);
     if (lengthSize == 0) {
         out.insert(out.end(), {0, 0, 0, 1});

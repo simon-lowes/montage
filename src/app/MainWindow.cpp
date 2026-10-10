@@ -5035,22 +5035,30 @@ bool MainWindow::analyseHdrLightLevels(bool ask) {
     std::vector<Hdr10PlusScene> scenes;
     const FrameTime from = marked ? s.inPoint : 0, to = marked ? s.outPoint + 1 : 0;
     if (!runWithProgress(this, state_, tr("Measuring light levels..."), [&](const auto& progress, const auto* cancel, std::string* e) {
-            if (pq)
-                return analyseHdr10Plus(p, s, from, to, sequenceColorSpace(s), std::clamp(s.hdrPeakNits, 100.0, 10000.0), scenes, e,
-                                        [&](double f) { progress(f); }, cancel, &l);
-            return measureLightLevels(p, s, from, to, l, e, 1.0, [&](double f) { progress(f); }, cancel);
+            if (!pq) return measureLightLevels(p, s, from, to, l, e, 1.0, [&](double f) { progress(f); }, cancel);
+            // HDR10+ over whole scenes (a stretch analysed again grows to the stored scenes it cuts into), the light
+            // levels over what was asked.
+            const FrameTime lo = from, hi = to > from ? to : s.duration();
+            FrameTime a = lo, b = hi;
+            widenHdr10PlusRange(s.hdr10Plus, a, b);
+            const LightMeter meter(sequenceColorSpace(s));
+            const auto frame = [&](FrameTime f) {
+                RenderOptions o;
+                o.scale = 1.0;
+                o.highQuality = true;
+                Image img = renderProgramFrame(p, s, f, o);
+                if (f >= lo && f < hi) meter.add(img, f, l);
+                return img;
+            };
+            return analyseHdr10Plus(p, s, a, b, sequenceColorSpace(s), std::clamp(s.hdrPeakNits, 100.0, 10000.0), scenes, e,
+                                    [&](double f) { progress(f); }, cancel, nullptr, frame);
         }))
         return false;
     unsigned cll = 0, fall = 0;
     hdr10LightLevels(l, cll, fall);
     state_->apply(tr("Analyse HDR Light Levels"), [&](Project&, Sequence& sq) {
         sq.hdrMaxCll = cll, sq.hdrMaxFall = fall;
-        if (pq && !scenes.empty()) {
-            // The new scenes replace those they overlap; others (another stretch analysed before) stay.
-            std::erase_if(sq.hdr10Plus, [&](const Hdr10PlusScene& o) { return o.end > scenes.front().start && o.start < scenes.back().end; });
-            sq.hdr10Plus.insert(sq.hdr10Plus.end(), scenes.begin(), scenes.end());
-            std::sort(sq.hdr10Plus.begin(), sq.hdr10Plus.end(), [](const Hdr10PlusScene& x, const Hdr10PlusScene& y) { return x.start < y.start; });
-        }
+        if (pq) mergeHdr10PlusScenes(sq.hdr10Plus, scenes);  // replacing those they overlap; others stay
         return edit::Result{};
     });
     const QLocale loc;

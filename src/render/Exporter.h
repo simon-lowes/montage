@@ -156,6 +156,10 @@ std::string exportAudioLayout(const std::string& layout, const std::string& code
 // WebM, TS.
 bool containerCarriesStreams(const std::string& path);
 
+// Where an export's HDR10+ metadata goes: "video" (HEVC and AV1, with the JSON beside it), "json" (other codecs: the
+// JSON beside the file only), or "" when it has none (not PQ, EXR or GIF, no video).
+std::string hdr10PlusCarriage(const Sequence& seq, const ExportSettings& s);
+
 // HDR exports measure their light levels as they render (`light`, when given); PQ files to MP4 and MOV carry the
 // measured MaxCLL and MaxFALL. Encoders that state them before the first frame (x265) use the sequence's analysed
 // levels, or the mastering peak when it has none.

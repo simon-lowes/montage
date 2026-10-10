@@ -2013,10 +2013,27 @@ void McpServer::Impl::addTools() {
             std::string err;
             const bool pq = sequenceColorSpace(s).transfer == Transfer::Pq;
             std::vector<Hdr10PlusScene> scenes;
-            if (pq ? !analyseHdr10Plus(l.project, s, from, to, sequenceColorSpace(s), std::clamp(s.hdrPeakNits, 100.0, 10000.0), scenes, &err,
-                                       {}, nullptr, &light)
-                   : !measureLightLevels(l.project, s, from, to, light, &err))
-                return fail(QString::fromStdString(err));
+            bool measuredOk = false;
+            if (!pq) {
+                measuredOk = measureLightLevels(l.project, s, from, to, light, &err);
+            } else {
+                // HDR10+ over whole scenes (grown to the stored scenes the stretch cuts into), light levels over the stretch.
+                const FrameTime lo = std::max<FrameTime>(0, from), hi = to > lo ? to : s.duration();
+                FrameTime a = lo, b = hi;
+                widenHdr10PlusRange(s.hdr10Plus, a, b);
+                const LightMeter meter(sequenceColorSpace(s));
+                const auto frame = [&](FrameTime f) {
+                    RenderOptions o;
+                    o.scale = 1.0;
+                    o.highQuality = true;
+                    Image img = renderProgramFrame(l.project, s, f, o);
+                    if (f >= lo && f < hi) meter.add(img, f, light);
+                    return img;
+                };
+                measuredOk = analyseHdr10Plus(l.project, s, a, b, sequenceColorSpace(s), std::clamp(s.hdrPeakNits, 100.0, 10000.0), scenes,
+                                              &err, {}, nullptr, nullptr, frame);
+            }
+            if (!measuredOk) return fail(QString::fromStdString(err));
             unsigned cll = 0, fall = 0;
             hdr10LightLevels(light, cll, fall);
             QJsonObject out{{"max_cll", int(cll)}, {"max_fall", int(fall)}, {"max_cll_at", tc(light.maxCllFrame, s)},
@@ -2038,14 +2055,7 @@ void McpServer::Impl::addTools() {
             }
             if (a.value("save").toBool(true)) {
                 s.hdrMaxCll = cll, s.hdrMaxFall = fall;
-                if (pq) {
-                    // The new scenes replace those they overlap; others (another stretch analysed before) stay.
-                    std::erase_if(s.hdr10Plus, [&](const Hdr10PlusScene& o) {
-                        return !scenes.empty() && o.end > scenes.front().start && o.start < scenes.back().end;
-                    });
-                    s.hdr10Plus.insert(s.hdr10Plus.end(), scenes.begin(), scenes.end());
-                    std::sort(s.hdr10Plus.begin(), s.hdr10Plus.end(), [](const Hdr10PlusScene& x, const Hdr10PlusScene& y) { return x.start < y.start; });
-                }
+                if (pq) mergeHdr10PlusScenes(s.hdr10Plus, scenes);  // replacing those they overlap; others stay
                 save(l);
             }
             return ok(text, out);
@@ -5552,6 +5562,14 @@ void McpServer::Impl::addTools() {
                 return fail(QString::fromStdString(err));
             QJsonObject o{{"output", QString::fromStdString(st.path)}};
             QString text = QStringLiteral("Wrote %1").arg(QString::fromStdString(st.path));
+            if (st.hdr10Plus) {
+                // Where HDR10+ went: in the video and beside it, beside it only, or nowhere (not PQ output).
+                const std::string carriage = hdr10PlusCarriage(s, st);
+                o["hdr10plus"] = carriage.empty() ? QStringLiteral("none") : QString::fromStdString(carriage);
+                text += carriage == "video" ? QStringLiteral("\nHDR10+ metadata in the video, and beside it as .hdr10plus.json")
+                        : carriage == "json" ? QStringLiteral("\nHDR10+ metadata beside it as .hdr10plus.json (this codec cannot carry it)")
+                                             : QStringLiteral("\nNo HDR10+ metadata: it is for PQ (HDR10) video");
+            }
             if (light.frames > 0) {  // HDR: what was rendered, measured
                 unsigned cll = 0, fall = 0;
                 hdr10LightLevels(light, cll, fall);

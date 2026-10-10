@@ -46,17 +46,29 @@ private:
     std::vector<Hdr10PlusScene> done_;
 };
 
-// Where the cut's scenes change in [from, to): the starts and ends of video clips (and transitions' middles) inside it.
+// Where the cut's scenes change in [from, to): the starts and ends of the enabled video clips on tracks that show.
 std::vector<FrameTime> hdr10PlusCuts(const Sequence& s, FrameTime from, FrameTime to);
 // A fingerprint of frames [from, to) of `s` as exports render them to `out` (from the render cache's frame keys).
 std::string hdr10PlusFramesKey(const Project& p, const Sequence& s, FrameTime from, FrameTime to, const ColorSpace& out,
                                double peakNits);
 // Renders [from, to) at full size into `out` (PQ) and measures its scenes, each with its key, and (when given) its
 // HDR10 light levels in the same pass. False with `error` if `out` is not PQ, the range is empty or it was cancelled.
+// `frame`, when given, makes each PQ frame instead (an export's own pictures, with its burn-ins and stereo packing).
 bool analyseHdr10Plus(const Project& p, const Sequence& s, FrameTime from, FrameTime to, const ColorSpace& out, double peakNits,
                       std::vector<Hdr10PlusScene>& scenes, std::string* error = nullptr,
                       const std::function<void(double)>& progress = {}, const std::atomic<bool>* cancel = nullptr,
-                      LightLevels* light = nullptr);
+                      LightLevels* light = nullptr, const std::function<Image(FrameTime)>& frame = {});
+// The scenes for [from, to) as an export needs them: the sequence's stored scenes that still match the cut (when
+// `reuse`), and the rest measured now; `measured` says how many frames had to be. False only on failure or cancel.
+bool hdr10PlusForRange(const Project& p, const Sequence& s, FrameTime from, FrameTime to, const ColorSpace& out, double peakNits,
+                       bool reuse, std::vector<Hdr10PlusScene>& scenes, std::string* error = nullptr,
+                       const std::function<void(double)>& progress = {}, const std::atomic<bool>* cancel = nullptr,
+                       const std::function<Image(FrameTime)>& frame = {}, FrameTime* measured = nullptr);
+// A stretch to analyse grown to the edges of the stored scenes it cuts into, so analysing part of a sequence again
+// leaves no scene half measured.
+void widenHdr10PlusRange(const std::vector<Hdr10PlusScene>& stored, FrameTime& from, FrameTime& to);
+// New scenes into the stored ones, replacing those they overlap.
+void mergeHdr10PlusScenes(std::vector<Hdr10PlusScene>& stored, const std::vector<Hdr10PlusScene>& fresh);
 // The sequence's stored scenes for [from, to) (clipped to it) when every scene there still matches the cut; empty if
 // any part is unanalysed or has changed.
 std::vector<Hdr10PlusScene> storedHdr10Plus(const Project& p, const Sequence& s, FrameTime from, FrameTime to,
