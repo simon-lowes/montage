@@ -121,6 +121,20 @@ private:
     int chainLatency(const std::vector<Effect>& chain, Id owner, double sr);
     int maxLatency(const Sequence& seq, double sr);
     void resetLocked();
+    // Sidechain keys (a compressor or gate listening to another audio track): that track's signal over the block being
+    // processed, before its fader and whether or not it is muted, from a mixer of its own (so the state of its clips'
+    // effects never runs twice); computed once per track and block. Null when there is no such track.
+    const float* keySignal(Id track, int frames);
+    struct KeyContext {
+        const Project* p = nullptr;
+        const Sequence* seq = nullptr;
+        int64_t at = 0;  // the timeline sample the chain being run starts at
+        double sr = 0;
+        int depth = 0;
+    };
+    KeyContext key_;
+    std::unique_ptr<AudioMixer> keyMixer_;
+    std::map<Id, std::pair<int64_t, std::vector<float>>> keyBufs_;
     int64_t nextStart_ = -1;  // where the next contiguous block starts
     std::map<std::pair<Id, Id>, std::unique_ptr<State>> states_;
     std::mutex m_;

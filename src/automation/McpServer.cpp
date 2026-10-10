@@ -36,6 +36,7 @@
 #include "render/LightLevel.h"
 #include "render/Spherical.h"
 #include "render/ClipPlacement.h"
+#include "audio/SpeechCleanup.h"
 #include "media/Offload.h"
 #include "media/SpeechSearch.h"
 #include "media/TextReader.h"
@@ -173,6 +174,16 @@ TrackRef trackArg(const QString& name, const Sequence& s, bool mayCreate, Projec
         if (good && mayCreate && p && ms && i == count) return edit::addTrack(*p, *ms, kind);
     }
     throw ArgError{QStringLiteral("Unknown track \"%1\": use V1, V2... or A1, A2...").arg(name)};
+}
+
+// An audio track by reference ("A2") or name, as its id (a sidechain key); "" or "none" for none.
+std::string audioTrackId(const QString& ref, const Sequence& s) {
+    if (ref.trimmed().isEmpty() || ref.trimmed().compare("none", Qt::CaseInsensitive) == 0) return {};
+    for (const Track& t : s.audioTracks)
+        if (QString::fromStdString(t.name).compare(ref.trimmed(), Qt::CaseInsensitive) == 0) return std::to_string(t.id);
+    const TrackRef r = trackArg(ref, s, false);
+    if (r.kind != TrackKind::Audio) throw ArgError{QStringLiteral("A sidechain is an audio track (A1, A2... or its name)")};
+    return std::to_string(s.audioTracks[size_t(r.index)].id);
 }
 
 QString tc(FrameTime f, const Sequence& s) { return QString::fromStdString(formatTimecode(f, s.fps)); }
@@ -1619,7 +1630,8 @@ void McpServer::Impl::addTools() {
                 const auto si = std::find_if(info->strings.begin(), info->strings.end(), [&](const StringParamInfo& x) { return x.name == name; });
                 if (si == info->strings.end())
                     throw ArgError{QStringLiteral("\"%1\" has no text setting \"%2\"").arg(QString::fromStdString(type), it.key())};
-                const std::string value = it.value().toString().toStdString();
+                std::string value = it.value().toString().toStdString();
+                if (si->kind == StringKind::Track) value = audioTrackId(it.value().toString(), l.seq());
                 if (si->kind == StringKind::ColorWarp) {
                     ColorWarp w;
                     if (!parseColorWarp(value, w)) throw ArgError{QStringLiteral("The mesh is \"spoke,ring,hue,sat,luma\" groups separated by ';'")};
@@ -1695,6 +1707,57 @@ void McpServer::Impl::addTools() {
             c.effects.push_back(e);
             save(l);
             return ok(QStringLiteral("Added %1 to %2").arg(QString::fromStdString(displayName), QString::fromStdString(c.name)),
+                      QJsonObject{{"effect_id", double(e.id)}});
+        });
+
+    add("montage_track_effect", "Add an effect to an audio track",
+        "Add an audio effect to an audio track's inserts (after its clips are mixed, before its fader), or with `remove` "
+        "take one off by its id. A compressor or noise gate can listen to another track instead of its own signal: "
+        "strings {\"sidechain\": \"A1\"} (a track's reference or name) ducks music under dialogue or opens a gate on a "
+        "kick; key_hpf_hz high-passes what it listens to.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"track":{"type":"string","description":"A1, A2..."},
+            "effect":{"type":"string"},"params":{"type":"object","additionalProperties":{"type":"number"}},
+            "strings":{"type":"object","additionalProperties":{"type":"string"}},
+            "remove":{"type":"number","description":"An effect id to take off instead"}},"required":["project","track"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const TrackRef r = trackArg(need(a, "track"), s, false);
+            if (r.kind != TrackKind::Audio) throw ArgError{"Effects go on audio tracks (A1, A2...)"};
+            Track& t = s.audioTracks[size_t(r.index)];
+            if (a.contains("remove")) {
+                const Id id = Id(a.value("remove").toDouble());
+                const auto before = t.effects.size();
+                std::erase_if(t.effects, [&](const Effect& e) { return e.id == id; });
+                if (t.effects.size() == before) return fail(QStringLiteral("No effect %1 on %2").arg(qint64(id)).arg(need(a, "track")));
+                save(l);
+                return ok(QStringLiteral("Removed it"), QJsonObject{{"effects", int(t.effects.size())}});
+            }
+            const std::string type = need(a, "effect").toStdString();
+            const EffectInfo* info = findEffectInfo(type);
+            if (!info || info->hidden || info->category != EffectCategory::AudioFilter)
+                throw ArgError{QStringLiteral("Unknown audio effect \"%1\" (see montage_list_effects)").arg(QString::fromStdString(type))};
+            if (isSourceAudioEffect(type)) throw ArgError{QStringLiteral("%1 works on a clip's own audio: add it to the clip").arg(QString::fromStdString(info->displayName))};
+            Effect e = makeEffect(l.project, type);
+            const QJsonObject params = a.value("params").toObject();
+            for (auto it = params.begin(); it != params.end(); ++it) {
+                const std::string name = it.key().toStdString();
+                if (std::none_of(info->params.begin(), info->params.end(), [&](const ParamInfo& p) { return p.name == name; }))
+                    throw ArgError{QStringLiteral("\"%1\" has no parameter \"%2\"").arg(QString::fromStdString(type), it.key())};
+                e.params[name] = Param(it.value().toDouble());
+            }
+            const QJsonObject strings = a.value("strings").toObject();
+            for (auto it = strings.begin(); it != strings.end(); ++it) {
+                const std::string name = it.key().toStdString();
+                const auto si = std::find_if(info->strings.begin(), info->strings.end(), [&](const StringParamInfo& x) { return x.name == name; });
+                if (si == info->strings.end())
+                    throw ArgError{QStringLiteral("\"%1\" has no text setting \"%2\"").arg(QString::fromStdString(type), it.key())};
+                e.strings[name] = si->kind == StringKind::Track ? audioTrackId(it.value().toString(), s) : it.value().toString().toStdString();
+            }
+            if (e.s("sidechain") == std::to_string(t.id)) throw ArgError{"A track cannot be its own sidechain"};
+            t.effects.push_back(e);
+            save(l);
+            return ok(QStringLiteral("Added %1 to %2").arg(QString::fromStdString(info->displayName), QString::fromStdString(t.name)),
                       QJsonObject{{"effect_id", double(e.id)}});
         });
 

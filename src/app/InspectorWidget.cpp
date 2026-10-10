@@ -1623,6 +1623,26 @@ void InspectorWidget::addStringRow(QFormLayout* form, const StringParamInfo& si,
             });
             break;
         }
+        case StringKind::Track: {
+            // An audio track (a sidechain key): None, then the sequence's audio tracks by name; the track's id is kept.
+            auto* combo = new QComboBox(content_);
+            combo->setObjectName(QString::fromStdString("track_" + name));
+            form->addRow(label, combo);
+            connect(combo, &QComboBox::activated, this, [combo, write](int i) { write(combo->itemData(i).toString()); });
+            refreshers_.push_back([this, combo, read] {
+                QSignalBlocker b(combo);
+                combo->clear();
+                combo->addItem(tr("None"), QString());
+                if (const Sequence* s = state_->sequence())
+                    for (size_t k = 0; k < s->audioTracks.size(); ++k) {
+                        const Track& t = s->audioTracks[k];
+                        combo->addItem(QStringLiteral("A%1  %2").arg(k + 1).arg(QString::fromStdString(t.name)), QString::number(t.id));
+                    }
+                const int at = combo->findData(read());
+                combo->setCurrentIndex(at < 0 ? 0 : at);
+            });
+            break;
+        }
         case StringKind::Choice: {
             auto* combo = new QComboBox(content_);
             for (const auto& c : si.choices) combo->addItem(QString::fromStdString(c));

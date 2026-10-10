@@ -43,7 +43,8 @@ struct ParamInfo {
 // settings (the colour spaces of the chosen OCIO config, for example).
 // Curve: a tone curve (in -> out). HueCurve and LevelCurve: a change against
 // hue (wrapping round) or against luma/saturation, 0.5 meaning none.
-enum class StringKind { Text, MultilineText, File, Font, Choice, Curve, Dynamic, HueCurve, LevelCurve, ColorWarp };
+// Track: an audio track of the sequence by its id (a sidechain key), "" = none.
+enum class StringKind { Text, MultilineText, File, Font, Choice, Curve, Dynamic, HueCurve, LevelCurve, ColorWarp, Track };
 
 struct StringParamInfo {
     std::string name;

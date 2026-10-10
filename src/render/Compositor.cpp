@@ -1563,6 +1563,10 @@ struct AudioMixer::State {
     fx::Saturator saturator;
     fx::StereoWidth width;
     std::vector<double> lastParams;
+    // Dynamics' detector: the sidechain (or the signal) through an optional high-pass.
+    Biquad keyHp;
+    double keyHz = -1;
+    std::vector<float> keyBuf;
     double env = 0;
     double gain = 1;
     std::vector<float> delay;
@@ -1648,8 +1652,31 @@ void AudioMixer::reset() {
     resetLocked();
 }
 
+const float* AudioMixer::keySignal(Id trackId, int frames) {
+    if (!key_.seq || !key_.p) return nullptr;
+    const Track* t = nullptr;
+    for (const Track& tr : key_.seq->audioTracks)
+        if (tr.id == trackId) t = &tr;
+    if (!t) return nullptr;
+    auto& slot = keyBufs_[trackId];
+    if (slot.first == key_.at && slot.second.size() == size_t(frames) * 2) return slot.second.data();
+    if (!keyMixer_) {
+        keyMixer_ = std::make_unique<AudioMixer>();
+        keyMixer_->setNonBlocking(nonBlocking_);
+    }
+    slot.first = key_.at;
+    slot.second.assign(size_t(frames) * 2, 0.0f);
+    keyMixer_->mixTrackClips(*key_.p, *key_.seq, *t, key_.at, frames, key_.sr, key_.depth, slot.second.data());
+    if (!t->effects.empty())
+        keyMixer_->processChain(t->effects, t->id, FrameTime(double(key_.at) * key_.seq->fpsValue() / key_.sr), key_.sr,
+                                slot.second.data(), frames);
+    return slot.second.data();
+}
+
 void AudioMixer::resetLocked() {
     nextStart_ = -1;
+    keyBufs_.clear();
+    if (keyMixer_) keyMixer_->reset();
     // Plugins are expensive to load: keep them, clearing only their audio state.
     for (auto it = states_.begin(); it != states_.end();) {
         if (auto plugin = std::move(it->second->plugin)) {
@@ -1668,6 +1695,26 @@ void AudioMixer::resetLocked() {
 }
 
 void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameTime lt, double sr, float* buf, int frames) {
+    // What a compressor or gate listens to: its sidechain track (not its own) or the signal, high-passed when asked.
+    auto detector = [&](const Effect& e, State& st) -> const float* {
+        const float* src = buf;
+        const std::string key = e.s("sidechain");
+        if (!key.empty()) {
+            const Id id = Id(std::strtoll(key.c_str(), nullptr, 10));
+            if (id && id != owner)
+                if (const float* k = keySignal(id, frames)) src = k;
+        }
+        const double hz = e.p("key_hpf_hz", lt, 0);
+        if (hz < 1) return src == buf ? nullptr : src;
+        if (hz != st.keyHz) {
+            st.keyHp.highPass(sr, hz);
+            st.keyHz = hz;
+        }
+        st.keyBuf.assign(src, src + size_t(frames) * 2);
+        for (int i = 0; i < frames; ++i)
+            for (int ch = 0; ch < 2; ++ch) st.keyBuf[size_t(i) * 2 + ch] = st.keyHp.process(ch, st.keyBuf[size_t(i) * 2 + ch]);
+        return st.keyBuf.data();
+    };
     for (const Effect& e : chain) {
         if (!e.enabled || isSourceAudioEffect(e.type)) continue;
         auto& st = states_[{owner, e.id}];
@@ -1701,9 +1748,11 @@ void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameT
             double att = std::exp(-1.0 / (std::max(0.1, e.p("attack_ms", lt, 10)) * sr / 1000));
             double rel = std::exp(-1.0 / (std::max(1.0, e.p("release_ms", lt, 120)) * sr / 1000));
             double makeup = e.p("makeup_db", lt);
+            const float* key = detector(e, *st);
             for (int i = 0; i < frames; ++i) {
                 float* d = &buf[size_t(i) * 2];
-                double lvl = std::max(std::fabs(d[0]), std::fabs(d[1]));
+                const float* k = key ? key + size_t(i) * 2 : d;
+                double lvl = std::max(std::fabs(k[0]), std::fabs(k[1]));
                 st->env = lvl > st->env ? att * st->env + (1 - att) * lvl : rel * st->env + (1 - rel) * lvl;
                 double envDb = 20 * std::log10(st->env + 1e-9);
                 double over = envDb - thr;
@@ -1737,7 +1786,7 @@ void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameT
             st->deesser.process(buf, frames, sr, e.p("hz", lt, 6000), e.p("threshold_db", lt, -30), e.p("reduction_db", lt, 10));
         } else if (e.type == "gate") {
             st->gate.process(buf, frames, sr, e.p("threshold_db", lt, -45), e.p("range_db", lt, -40), e.p("attack_ms", lt, 1),
-                             e.p("hold_ms", lt, 50), e.p("release_ms", lt, 150));
+                             e.p("hold_ms", lt, 50), e.p("release_ms", lt, 150), detector(e, *st));
         } else if (e.type == "reverb") {
             st->reverb.process(buf, frames, sr, e.p("size", lt, 50) / 100, e.p("damping", lt, 50) / 100, e.p("width", lt, 100) / 100,
                                e.p("mix", lt, 25) / 100);
@@ -2070,6 +2119,13 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
         }
     };
     const double fps = seq.fpsValue();
+    // Sidechains hear this sequence's tracks (a nested sequence's mix sets its own, then puts this back).
+    struct KeyScope {
+        KeyContext& k;
+        KeyContext saved;
+        ~KeyScope() { k = saved; }
+    } keyScope{key_, key_};
+    key_ = {&p, &seq, start, sr, depth};
     bool anySolo = std::any_of(seq.audioTracks.begin(), seq.audioTracks.end(), [](const Track& t) { return t.solo; });
     if (trackLevels && depth == 0) trackLevels->assign(seq.audioTracks.size(), MeterLevels{});
     auto frameAt = [&](int64_t sample) { return FrameTime(double(sample) * fps / sr); };
@@ -2096,6 +2152,7 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
         const int64_t downstream = masterLat + (bus != busBufs.end() ? busLat[bus->first] : 0);
         const int64_t trackLat = chainLatency(track.effects, track.id, sr);
         std::fill(trackBuf.begin(), trackBuf.end(), 0.0f);
+        key_ = {&p, &seq, start + downstream + trackLat, sr, depth};
         const bool any = mixTrackClips(p, seq, track, start + downstream + trackLat, frames, sr, depth, trackBuf.data());
         // Track inserts keep running without clips, so reverb and delay tails ring out.
         if (!any && track.effects.empty()) continue;
@@ -2167,6 +2224,7 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
     }
     for (const Bus& b : seq.buses) {
         std::vector<float>& bb = busBufs[b.id];
+        key_.at = start + masterLat + busLat[b.id];
         if (!b.effects.empty()) processChain(b.effects, b.id, frameAt(start + masterLat + busLat[b.id]), sr, bb.data(), frames);
         if (b.muted) continue;
         float g = dbToLin(b.volumeDb), bl, br;
@@ -2181,6 +2239,7 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
         }
     }
     // Master inserts are stereo: in a surround mix they are left out.
+    key_.at = start + masterLat;
     if (!seq.masterEffects.empty() && !surround) processChain(seq.masterEffects, seq.id, frameAt(start + masterLat), sr, master.data(), frames);
     const float g = dbToLin(seq.masterVolumeDb);
     for (int i = 0; i < frames * nch; ++i) out[i] = master[size_t(i)] * g;

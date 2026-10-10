@@ -4738,6 +4738,99 @@ private slots:
         QVERIFY(std::fabs(trackSurroundAt(moved, 60).z - 0.5) < 1e-9);
     }
 
+    void sidechainKeying() {
+        // Music (220 Hz, all four seconds) on A1; a voice (1 kHz) on A2 from 1 s to 2 s only, its track muted.
+        const int rate = 48000;
+        std::vector<float> music(size_t(rate) * 4), voice(size_t(rate) * 4, 0.0f);
+        for (size_t i = 0; i < music.size(); ++i) music[i] = float(0.3 * std::sin(2 * M_PI * 220 * double(i) / rate));
+        for (size_t i = size_t(rate); i < size_t(2 * rate); ++i) voice[i] = float(0.3 * std::sin(2 * M_PI * 1000 * double(i) / rate));
+        writeMonoWav(path("sc-music.wav"), music, rate);
+        writeMonoWav(path("sc-voice.wav"), voice, rate);
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        p.media.push_back(probeOrFail(p, path("sc-music.wav")));
+        p.media.push_back(probeOrFail(p, path("sc-voice.wav")));
+        while (s.audioTracks.size() < 2) edit::addTrack(p, s, TrackKind::Audio);
+        QVERIFY(edit::placeMedia(p, s, p.media[0].id, 0, 0, -1, {TrackKind::Video, -1}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(edit::placeMedia(p, s, p.media[1].id, 0, 0, -1, {TrackKind::Video, -1}, {TrackKind::Audio, 1}, false).ok);
+        s.audioTracks[1].muted = true;  // heard only as the key
+        const Id voiceTrack = s.audioTracks[1].id;
+        auto render = [&](const Sequence& seq) {
+            AudioMixer mixer;
+            std::vector<float> out(size_t(rate) * 4 * 2);
+            for (int at = 0; at < 4 * rate; at += 1024) mixer.mix(p, seq, at, std::min(1024, 4 * rate - at), out.data() + size_t(at) * 2);
+            return out;
+        };
+        auto level = [&](const std::vector<float>& b, double from, double to) { return toneLevel(b, 0, 220, size_t(from * rate), size_t(to * rate)); };
+        // A compressor on the music keyed by the voice: the music dips while the voice speaks, and only then.
+        Effect comp = makeEffect(p, "compressor");
+        comp.params["threshold_db"] = Param(-30.0);
+        comp.params["ratio"] = Param(10.0);
+        comp.params["attack_ms"] = Param(5.0);
+        comp.params["release_ms"] = Param(50.0);
+        comp.strings["sidechain"] = std::to_string(voiceTrack);
+        Sequence keyed = s;
+        keyed.audioTracks[0].effects = {comp};
+        std::vector<float> out = render(keyed);
+        const double before = level(out, 0.3, 0.9), during = level(out, 1.3, 1.9), after = level(out, 2.5, 3.5);
+        QVERIFY2(during < 0.3 * before, qPrintable(QString("%1 %2").arg(before).arg(during)));
+        QVERIFY2(std::fabs(after - before) < 0.05 * before, qPrintable(QString("%1 %2").arg(before).arg(after)));
+        QVERIFY(toneLevel(out, 0, 1000, size_t(1.3 * rate), size_t(1.9 * rate)) < 0.001);  // the muted key is not heard
+        // Listening to itself instead, the steady music is squashed all along.
+        Sequence self = keyed;
+        self.audioTracks[0].effects[0].strings.erase("sidechain");
+        out = render(self);
+        QVERIFY(level(out, 0.3, 0.9) < 0.5 * before && std::fabs(level(out, 1.3, 1.9) - level(out, 0.3, 0.9)) < 0.1 * level(out, 0.3, 0.9));
+        // A high-pass on what it listens to (2 kHz, far above the music) leaves the music alone.
+        self.audioTracks[0].effects[0].params["key_hpf_hz"] = Param(2000.0);
+        out = render(self);
+        QVERIFY2(std::fabs(level(out, 0.3, 0.9) - before) < 0.1 * before, qPrintable(QString::number(level(out, 0.3, 0.9))));
+        // A gate on the music keyed by the voice opens only while the voice speaks.
+        Effect gate = makeEffect(p, "gate");
+        gate.params["threshold_db"] = Param(-40.0);
+        gate.params["range_db"] = Param(-60.0);
+        gate.strings["sidechain"] = std::to_string(voiceTrack);
+        Sequence gated = s;
+        gated.audioTracks[0].effects = {gate};
+        out = render(gated);
+        QVERIFY2(level(out, 1.3, 1.9) > 0.8 * before && level(out, 0.3, 0.9) < 0.01 * before && level(out, 2.6, 3.5) < 0.01 * before,
+                 qPrintable(QString("%1 %2 %3").arg(level(out, 0.3, 0.9)).arg(level(out, 1.3, 1.9)).arg(level(out, 2.6, 3.5))));
+        // A clip's own compressor can be keyed by a track too, and a key track that is gone is ignored.
+        Sequence clipKeyed = s;
+        clipKeyed.audioTracks[0].clips[0].effects = {comp};
+        out = render(clipKeyed);
+        QVERIFY(level(out, 1.3, 1.9) < 0.3 * before && level(out, 0.3, 0.9) > 0.9 * before);
+        clipKeyed.audioTracks[0].clips[0].effects[0].strings["sidechain"] = "123456789";
+        out = render(clipKeyed);
+        QVERIFY(level(out, 1.3, 1.9) < 0.5 * before && std::fabs(level(out, 1.3, 1.9) - level(out, 0.3, 0.9)) < 0.1 * before);  // its own signal
+
+        // MCP: the compressor on A1's inserts, keyed by A2 by reference; a track cannot key itself.
+        const QString project = QString::fromStdString(path("sidechain.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_track_effect"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call({{"project", project}, {"track", "A1"}, {"effect", "compressor"},
+                              {"params", QJsonObject{{"threshold_db", -30}, {"ratio", 10}}}, {"strings", QJsonObject{{"sidechain", "A2"}}}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(QJsonDocument(r).toJson()));
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.active()->audioTracks[0].effects.size(), size_t(1));
+        QCOMPARE(back.active()->audioTracks[0].effects[0].s("sidechain"), std::to_string(voiceTrack));
+        QVERIFY(call({{"project", project}, {"track", "A2"}, {"effect", "gate"}, {"strings", QJsonObject{{"sidechain", "A2"}}}}).value("isError").toBool());
+        QVERIFY(call({{"project", project}, {"track", "A1"}, {"effect", "blur"}}).value("isError").toBool());  // a picture effect
+        r = call({{"project", project}, {"track", "A1"}, {"remove", r.value("structuredContent").toObject().value("effect_id")}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(QJsonDocument(r).toJson()));
+        QVERIFY(loadProject(project.toStdString(), back));
+        QVERIFY(back.active()->audioTracks[0].effects.empty());
+    }
+
     void describedExportAndMcp() {
         // Dialogue (440 Hz) at 0-1 s and 3-4 s on A1; a description (1 kHz) at 1.3-2.7 s on the AD track.
         const int rate = 48000;

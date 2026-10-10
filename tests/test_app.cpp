@@ -3461,6 +3461,50 @@ private slots:
         state()->setSelection({}, false);
     }
 
+    void sidechainInInspector() {
+        // A compressor on a music clip, keyed from the inspector by another audio track.
+        state()->newProject();
+        const QString wav = dir_.path() + "/sc-bed.wav";
+        {
+            WavWriter w;
+            QVERIFY(w.open(wav, 48000, 1));
+            std::vector<float> tone(48000, 0.1f);
+            w.write(tone.data(), int(tone.size()));
+            QVERIFY(w.close());
+        }
+        const auto ids = state()->importFiles({wav});
+        QCOMPARE(ids.size(), size_t(1));
+        Id clip = 0;
+        QVERIFY(state()->edit("Bed", [&](Project& p, Sequence& s) {
+            while (s.audioTracks.size() < 2) edit::addTrack(p, s, TrackKind::Audio);
+            s.audioTracks[1].name = "Dialogue";
+            const auto r = edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, -1}, {TrackKind::Audio, 0}, false);
+            if (!r.ok) return false;
+            clip = r.created.front();
+            edit::clipById(s, clip)->effects.push_back(makeEffect(p, "compressor"));
+            return true;
+        }));
+        state()->setSelection({clip}, false);
+        QApplication::processEvents();
+        auto* inspector = win_->findChild<InspectorWidget*>();
+        QVERIFY(inspector && inspector->widget());
+        auto* key = inspector->widget()->findChild<QComboBox*>("track_sidechain");
+        QVERIFY(key);
+        QCOMPARE(key->count(), 1 + int(state()->sequence()->audioTracks.size()));
+        QCOMPARE(key->currentIndex(), 0);  // None
+        const int dialogue = key->findText("A2  Dialogue");
+        QVERIFY(dialogue > 0);
+        key->setCurrentIndex(dialogue);
+        emit key->activated(dialogue);
+        const auto keyOf = [&] { return edit::clipById(*state()->sequence(), clip)->effects.at(0).s("sidechain"); };
+        QCOMPARE(keyOf(), std::to_string(state()->sequence()->audioTracks[1].id));
+        state()->undo();
+        QVERIFY(keyOf().empty());
+        QApplication::processEvents();
+        key = inspector->widget()->findChild<QComboBox*>("track_sidechain");
+        QVERIFY(key && key->currentIndex() == 0);
+    }
+
     void offloadCardDialog() {
         state()->newProject();
         // A card: a recording and its sidecar.
