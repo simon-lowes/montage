@@ -5498,8 +5498,13 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(program->adrCycle()->lineFrom, FrameTime(150));
         QCOMPARE(program->adrCycle()->beeps.size(), size_t(3));
         QVERIFY(program->mutedAudioTracks().empty());
-        // Half way across the picture, the streamer: a white bar down the middle of the frame.
+        // Stopping playback (Space, a shuttle, the sequence's end) ends the pass.
+        const AdrCycle rehearsed = *program->adrCycle();
         program->pause();
+        QVERIFY(!panel->isRunning() && !program->adrCycle());
+        QCOMPARE(panel->findChild<QPushButton*>("adrRehearse")->isEnabled(), true);
+        // Half way across the picture, the streamer: a white bar down the middle of the frame.
+        program->setAdrCycle(rehearsed);
         program->seek(120);
         MonitorPanel* monitor = nullptr;
         for (MonitorPanel* m : win_->findChildren<MonitorPanel*>())
@@ -5509,8 +5514,7 @@ const auto seq = [this] { return state()->sequence(); };
         QTRY_VERIFY(!viewer->image().isNull());
         QTRY_VERIFY2(qGray(viewer->grab().toImage().pixel(viewer->width() / 2 - 1, viewer->height() / 2)) > 200, "no streamer");
         QVERIFY(qGray(viewer->grab().toImage().pixel(viewer->width() / 4, viewer->height() / 2)) < 60);
-        panel->stop();
-        QVERIFY(!panel->isRunning() && !program->adrCycle());
+        program->setAdrCycle(std::nullopt);
 
         // Record: the guide (A1) is muted, and the take (fed as the input would feed it) lands over the line on a new
         // ADR track, in sync.
@@ -5540,24 +5544,45 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(state()->project().findMedia(c->mediaId)->bin, std::string("ADR"));
         QTRY_COMPARE(table->item(0, 7)->text(), QString("1"));
 
+        // The picture stopping before the input had all of the pass arms a delayed stop; it belongs to that pass only and
+        // never cuts the next take short.
+        panel->record();
+        program->pause();
+        feedCycle();
+        QTRY_VERIFY(!panel->isRunning());
+        QTRY_COMPARE(adrTakeCount(*state()->sequence(), state()->sequence()->adrCues[0]), 2);
+        panel->record();
+        QTest::qWait(1700);
+        QVERIFY(panel->isRecording());
+        feedCycle();
+        QTRY_VERIFY(!panel->isRunning());
+        QTRY_COMPARE(adrTakeCount(*state()->sequence(), state()->sequence()->adrCues[0]), 3);
         // Loop: take after take until stopped, the ADR track muted too while recording; Stop keeps what was recorded.
         panel->findChild<QCheckBox*>("adrLoop")->setChecked(true);
         panel->record();
         QCOMPARE(program->mutedAudioTracks(), (std::vector<int>{0, loc->track.index}));
         feedCycle();
-        QTRY_COMPARE(adrTakeCount(*state()->sequence(), state()->sequence()->adrCues[0]), 2);
+        QTRY_COMPARE(adrTakeCount(*state()->sequence(), state()->sequence()->adrCues[0]), 4);
         QTRY_VERIFY(panel->isRecording());  // the next take began by itself
-        panel->recorder()->feed(block.data(), 4800);
+        for (int i = 0; i < 45; ++i) panel->recorder()->feed(block.data(), 4800);  // 4.5 s: into the line
         panel->stop();
         QVERIFY(!panel->isRunning() && !panel->isRecording());
         c = edit::clipById(*state()->sequence(), clip);
-        QCOMPARE(c->takes.size(), size_t(3));
-        QCOMPARE(c->take, 2);
+        QCOMPARE(c->takes.size(), size_t(5));
+        QCOMPARE(c->take, 4);
         QTest::qWait(100);
         QVERIFY(!panel->isRunning());
+        // Stopped in the pre-roll, before the line: not a take.
+        panel->findChild<QCheckBox*>("adrLoop")->setChecked(false);
+        panel->record();
+        panel->recorder()->feed(block.data(), 4800);
+        panel->stop();
+        QVERIFY(!panel->isRunning());
+        QCOMPARE(edit::clipById(*state()->sequence(), clip)->takes.size(), size_t(5));
+        QCOMPARE(edit::clipById(*state()->sequence(), clip)->take, 4);
         // Another take picked from the list.
         auto* takes = panel->findChild<QComboBox*>("adrTakes");
-        QTRY_COMPARE(takes->count(), 3);
+        QTRY_COMPARE(takes->count(), 5);
         panel->pickTake(0);
         QCOMPARE(edit::clipById(*state()->sequence(), clip)->take, 0);
 
@@ -5575,6 +5600,17 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(state()->sequence()->adrCues[0].status, int(kAdrRecorded));
         QCOMPARE(state()->sequence()->adrCues[0].note, std::string("Traffic noise"));
         QVERIFY(!panel->importCueSheet(dir_.path() + "/missing.csv"));
+        // Another project opened mid-take: the take is dropped, not imported into it.
+        panel->selectCue(state()->sequence()->adrCues[0].id);
+        panel->findChild<QCheckBox*>("adrLoop")->setChecked(false);
+        panel->record();
+        QVERIFY(panel->isRecording());
+        panel->recorder()->feed(block.data(), 4800);
+        const QString partial = panel->recorder()->takeFolder();
+        state()->newProject();
+        QVERIFY(!panel->isRecording() && !panel->isRunning() && !program->adrCycle());
+        QVERIFY(state()->project().media.empty());
+        QVERIFY(!QFileInfo::exists(partial + "/M101 take 7.wav"));
         state()->newProject();
     }
 

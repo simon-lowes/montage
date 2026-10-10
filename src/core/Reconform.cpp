@@ -536,6 +536,7 @@ ReconformResult reconformSequence(Project& p, Id sourceId, const CutChanges& cha
         if (e.id) e.id = p.newId();
     };
     std::map<std::pair<size_t, Id>, Id> groups;  // (stretch, link group) -> the copies' link group
+    std::map<std::pair<size_t, Id>, Id> copies;  // (stretch, source clip) -> its copy there
     auto copyClip = [&](const Clip& c, FrameTime from, FrameTime to, FrameTime shift, size_t stretch) {
         Clip piece = edit::subClip(c, from, to);
         piece.start += shift;
@@ -567,6 +568,7 @@ ReconformResult reconformSequence(Project& p, Id sourceId, const CutChanges& cha
                 const Clip& c = *it;
                 Clip piece = copyClip(c, std::max(c.start, pc.i0), std::min(c.end(), pc.i1), pc.shift(), k);
                 ids[c.id] = piece.id;
+                copies[{k, c.id}] = piece.id;
                 wholeEnds[c.id] = {c.start >= pc.i0, c.end() <= pc.i1};
                 to.clips.push_back(std::move(piece));
             }
@@ -655,7 +657,10 @@ ReconformResult reconformSequence(Project& p, Id sourceId, const CutChanges& cha
     // cut altogether goes, and a cue whose takes were taken out has none.
     {
         std::vector<AdrCue> cues;
-        for (AdrCue q : out.adrCues) {
+        for (size_t qi = 0; qi < out.adrCues.size(); ++qi) {
+            AdrCue q = out.adrCues[qi];
+            // Its takes: the copy of the source cue's clip in the stretch its line lands in (or any stretch it went to).
+            const Id sourceClip = qi < source.adrCues.size() ? source.adrCues[qi].clip : 0;
             const Piece* at = nullptr;
             for (const Piece& pc : pieces)
                 if (q.start >= pc.i0 && q.start < pc.i1) at = &pc;
@@ -669,7 +674,13 @@ ReconformResult reconformSequence(Project& p, Id sourceId, const CutChanges& cha
             const FrameTime to = std::min(q.end, at->i1);
             q.start = from + at->shift();
             q.end = to + at->shift();
-            if (q.clip && !edit::clipById(out, q.clip)) q.clip = 0;
+            q.clip = 0;
+            if (sourceClip) {
+                const size_t k = size_t(at - pieces.data());
+                if (auto c = copies.find({k, sourceClip}); c != copies.end()) q.clip = c->second;
+                for (size_t j = 0; j < pieces.size() && !q.clip; ++j)
+                    if (auto c = copies.find({j, sourceClip}); c != copies.end()) q.clip = c->second;
+            }
             cues.push_back(std::move(q));
         }
         std::stable_sort(cues.begin(), cues.end(), [](const AdrCue& a, const AdrCue& b) { return a.start < b.start; });

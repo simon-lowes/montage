@@ -177,7 +177,8 @@ bool parseMarkerList(const std::string& text, const Sequence& s, std::vector<Mar
         return false;
     }
     // Lists made on timelines that start at 01:00:00:00.
-    const FrameTime hour = FrameTime(std::llround(3600 * s.fpsValue()));
+    FrameTime hour = FrameTime(std::llround(3600 * s.fpsValue()));
+    parseTimecode("01:00:00:00", s.fps, hour);  // as the list's timecodes count (86400 frames at 23.976)
     if (s.duration() < hour && std::all_of(out.begin(), out.end(), [&](const Marker& m) { return m.t >= hour; }))
         for (Marker& m : out) m.t -= hour;
     std::sort(out.begin(), out.end(), [](const Marker& a, const Marker& b) { return a.t < b.t; });

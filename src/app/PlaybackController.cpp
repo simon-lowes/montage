@@ -287,11 +287,11 @@ protected:
         }
         if (muted_) std::fill(buf_.begin(), buf_.end(), 0.0f);
         std::vector<float> heard;
-        if (cycle) {
+        if (cycle && !muted_) {  // (Global Mute silences the beeps too)
             heard = buf_;
             addAdrBeeps(*cycle, fps, rate, first, heard.data(), frames, 2);
         }
-        const std::vector<float>& out = cycle ? heard : buf_;
+        const std::vector<float>& out = heard.empty() ? buf_ : heard;
         if (int16_) {
             auto* d = reinterpret_cast<int16_t*>(data);
             for (size_t i = 0; i < out.size(); ++i) d[i] = int16_t(std::lround(std::clamp(out[i], -1.0f, 1.0f) * 32767.0f));
@@ -382,8 +382,7 @@ void PlaybackController::updateHeard() {
     Sequence* s = copy->findSequence(sequenceId_);
     for (int i : mutedTracks_)
         if (i >= 0 && i < int(s->audioTracks.size())) {
-            s->audioTracks[size_t(i)].muted = true;
-            s->audioTracks[size_t(i)].solo = false;
+            s->audioTracks[size_t(i)].muted = true;  // (a soloed guide stays soloed, so nothing else comes up)
         }
     heard_ = std::move(copy);
 }
@@ -459,7 +458,7 @@ std::vector<float> PlaybackController::heard(int64_t start, int frames) {
     if (!s || globalMute_ || frames <= 0) return mix;
     scrubMixer_.reset();
     scrubMixer_.setNonBlocking(false);
-    scrubMixer_.mix(*heard_, *s, start, frames, mix.data());
+    scrubMixer_.mix(*heard_, *heard_->findSequence(sequenceId_), start, frames, mix.data());  // its tracks as heard
     return mix;
 }
 
@@ -494,7 +493,7 @@ void PlaybackController::scrubAudio(FrameTime t) {
     int64_t start = int64_t(std::llround(double(t) * s->sampleRate / s->fpsValue()));
     scrubMixer_.reset();
     scrubMixer_.setNonBlocking(true);
-    scrubMixer_.mix(*heard_, *s, start, frames, mix.data());
+    scrubMixer_.mix(*heard_, *heard_->findSequence(sequenceId_), start, frames, mix.data());  // its tracks as heard
     std::vector<int16_t> pcm(mix.size());
     const int fade = std::min(frames / 4, 240);
     for (int i = 0; i < frames; ++i) {

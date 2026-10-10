@@ -1,4 +1,5 @@
 #include "EditOps.h"
+#include "Adr.h"
 
 #include "ProjectIO.h"
 
@@ -1055,6 +1056,7 @@ Result deleteGaps(Project& p, Sequence& s, bool leading, int* closed, FrameTime*
         for (Marker& m : s.markers)
             if (m.t >= b) m.t -= len;
             else if (m.t > a) m.t = a;
+        rippleAdrCues(s, a, b);
         if (s.inPoint >= b) s.inPoint -= len;
         if (s.outPoint >= b) s.outPoint -= len;
         ++count;

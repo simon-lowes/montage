@@ -3003,6 +3003,110 @@ private slots:
         QVERIFY(!removeAdrCue(fx.s(), annaId));
     }
 
+    void adrReviewFixes() {
+        Fixture fx;
+        Sequence& s = fx.s();  // 30 fps
+        // Sheets (and marker lists) from a 01:00:00:00 timeline at 23.976 come in where their timecodes say.
+        Sequence film = makeSequence(fx.p, "Film", 1920, 1080, Rational{24000, 1001});
+        std::vector<AdrCue> got;
+        QVERIFY(parseAdrCueSheet("Cue,Start,End\nA1,01:00:01:00,01:00:02:00\n", film, got));
+        QVERIFY(got.size() == 1 && got[0].start == 24 && got[0].end == 48);
+        std::vector<Marker> marks;
+        QVERIFY(parseMarkerList("Marker Name,In\nM,01:00:01:00\n", film, marks));
+        QCOMPARE(marks.at(0).t, FrameTime(24));
+        // A quote inside a field is text: the rows after it are still read.
+        QVERIFY(parseAdrCueSheet("Cue\tStart\tLine\nX1\t00:00:01:00\tHe's 6'2\" tall\nX2\t00:00:03:00\tNext\n", s, got));
+        QCOMPARE(got.size(), size_t(2));
+        QCOMPARE(got[0].line, std::string("He's 6'2\" tall"));
+        // A cue numbered in the sheet keeps its number even after a blank one for the same character.
+        AdrCue blank, named;
+        blank.character = named.character = "Anna";
+        blank.start = 10, blank.end = 40;
+        named.name = "A101", named.start = 600, named.end = 640;
+        addAdrCues(fx.p, s, {blank, named});
+        QCOMPARE(s.adrCues.size(), size_t(2));
+        QCOMPARE(s.adrCues[0].name, std::string("A102"));
+        QCOMPARE(s.adrCues[1].name, std::string("A101"));
+        s.adrCues.clear();
+
+        auto audio = [&](const char* name, double seconds, bool picture = false) {
+            MediaItem m;
+            m.id = fx.p.newId();
+            m.kind = picture ? MediaKind::Video : MediaKind::Audio;
+            m.name = name;
+            m.path = std::string("/nonexistent/") + name;
+            m.duration = seconds;
+            m.hasAudio = true;
+            m.hasVideo = picture;
+            m.width = picture ? 1920 : 0, m.height = picture ? 1080 : 0;
+            fx.p.media.push_back(m);
+            return m.id;
+        };
+        AdrCue a, b;
+        a.name = "A1", a.start = 120, a.end = 150;
+        b.name = "B1", b.start = 100, b.end = 200;
+        const std::vector<Id> ids = addAdrCues(fx.p, s, {a, b});
+        const Id cueA = ids[1], cueB = ids[0];  // added in time order: B1 first
+        QCOMPARE(findAdrCue(s, cueA)->name, std::string("A1"));
+        // Overlapping lines: B's first take goes to a second ADR track instead of cutting A's out.
+        QVERIFY(edit::addAdrTake(fx.p, s, cueA, audio("a.wav", 10), 60, -1).ok);
+        QVERIFY(edit::addAdrTake(fx.p, s, cueB, audio("b.wav", 10), 60, -1).ok);
+        const Clip* ca = edit::clipById(s, findAdrCue(s, cueA)->clip);
+        const Clip* cb = edit::clipById(s, findAdrCue(s, cueB)->clip);
+        QVERIFY(ca && cb && ca->start == 120 && ca->duration == 30 && cb->start == 100 && cb->duration == 100);
+        QCOMPARE(s.audioTracks[size_t(edit::locate(s, ca->id)->track.index)].name, std::string("ADR"));
+        QCOMPARE(s.audioTracks[size_t(edit::locate(s, cb->id)->track.index)].name, std::string("ADR 2"));
+        // A track asked for that is taken there falls back to a free ADR track.
+        AdrCue c;
+        c.name = "C1", c.start = 130, c.end = 140;
+        const Id cueC = addAdrCues(fx.p, s, {c}).front();
+        QVERIFY(edit::addAdrTake(fx.p, s, cueC, audio("c.wav", 10), 60, edit::locate(s, ca->id)->track.index).ok);
+        QCOMPARE(s.audioTracks[size_t(edit::locate(s, findAdrCue(s, cueC)->clip)->track.index)].name, std::string("ADR 3"));
+        QVERIFY(edit::clipById(s, findAdrCue(s, cueA)->clip));
+        // A later take that ends before the clip starts is refused (a take stopped in the pre-roll).
+        QVERIFY(!edit::addAdrTake(fx.p, s, cueA, audio("short.wav", 1), 60, -1).ok);
+        QCOMPARE(edit::clipById(s, findAdrCue(s, cueA)->clip)->takes.size(), size_t(0));
+        // A first take stopped mid-line gives a short clip; a later full take grows it to the line.
+        AdrCue d;
+        d.name = "D1", d.start = 300, d.end = 360;
+        const Id cueD = addAdrCues(fx.p, s, {d}).front();
+        QVERIFY(edit::addAdrTake(fx.p, s, cueD, audio("d1.wav", 4.5), 180, -1).ok);  // 135 frames: to 315
+        QCOMPARE(edit::clipById(s, findAdrCue(s, cueD)->clip)->duration, FrameTime(15));
+        QVERIFY(edit::addAdrTake(fx.p, s, cueD, audio("d2.wav", 7), 180, -1).ok);
+        QCOMPARE(edit::clipById(s, findAdrCue(s, cueD)->clip)->duration, FrameTime(60));
+        // A take with picture leaves the video tracks alone.
+        AdrCue e;
+        e.name = "E1", e.start = 500, e.end = 530;
+        const Id cueE = addAdrCues(fx.p, s, {e}).front();
+        QVERIFY(edit::addAdrTake(fx.p, s, cueE, audio("e.mov", 30, true), 480, -1).ok);
+        QVERIFY(s.videoTracks[0].clips.empty());
+        QCOMPARE(edit::locate(s, findAdrCue(s, cueE)->clip)->track.kind, TrackKind::Audio);
+
+        // Cues follow what is taken out of the timeline: after it they move back, across it they keep the rest.
+        Sequence r = s;
+        rippleAdrCues(r, 110, 130);
+        const AdrCue* rb = nullptr;
+        for (const AdrCue& q : r.adrCues)
+            if (q.name == "B1") rb = &q;
+        QVERIFY(rb && rb->start == 100 && rb->end == 180);
+        QCOMPARE(std::find_if(r.adrCues.begin(), r.adrCues.end(), [](const AdrCue& q) { return q.name == "D1"; })->start, FrameTime(280));
+        rippleAdrCues(r, 0, 1000);
+        QVERIFY(r.adrCues.empty());
+        // Closing a gap moves them too.
+        Sequence gaps = makeSequence(fx.p, "Gaps", 1920, 1080, Rational{30, 1});
+        Clip k1 = makeClip(fx.p, *fx.p.findMedia(fx.media), TrackKind::Video, gaps);
+        k1.start = 0, k1.duration = 30;
+        QVERIFY(overwrite(fx.p, gaps, V1, k1).ok);
+        Clip k2 = k1;
+        k2.start = 90;
+        QVERIFY(overwrite(fx.p, gaps, V1, k2).ok);
+        AdrCue g;
+        g.name = "G1", g.start = 95, g.end = 110;
+        addAdrCues(fx.p, gaps, {g});
+        QVERIFY(edit::deleteGaps(fx.p, gaps).ok);
+        QVERIFY(gaps.adrCues[0].start == 35 && gaps.adrCues[0].end == 50);
+    }
+
     void immersivePanning() {
         // The layouts: BS.2051's speakers in FFmpeg's channel order.
         QCOMPARE(layoutChannels("5.1.2"), 8);
@@ -4911,7 +5015,7 @@ private slots:
         QVERIFY(out.adrCues[0].start == 0 && out.adrCues[0].end == 20);
         QCOMPARE(out.adrCues[1].name, std::string("A1"));
         QVERIFY(out.adrCues[1].start == 70 && out.adrCues[1].end == 90);
-        QVERIFY(!out.adrCues[1].clip || edit::clipById(out, out.adrCues[1].clip));
+        QCOMPARE(out.adrCues[1].clip, v2.clips[0].id);  // its takes come along (here, the title's copy)
         QCOMPARE(out.adrCues[2].name, std::string("D1"));
         QVERIFY(out.adrCues[2].start == 130 && out.adrCues[2].end == 140);
         QVERIFY(out.adrCues[0].id != fx.p.findSequence(mix.id)->adrCues[0].id);

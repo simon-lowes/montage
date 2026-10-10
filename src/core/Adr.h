@@ -38,6 +38,9 @@ std::vector<AdrCue> adrCuesFromMarkers(const Sequence& s, FrameTime from = 0, Fr
 // left out. Returns the ids of the cues added or updated.
 std::vector<Id> addAdrCues(Project& p, Sequence& s, std::vector<AdrCue> cues);
 bool removeAdrCue(Sequence& s, Id id);
+// Takes frames [a, b) out of the cue list, as a ripple delete or closing a gap does to the timeline: cues after it move
+// back, cues across it keep what is outside it, cues inside it go.
+void rippleAdrCues(Sequence& s, FrameTime a, FrameTime b);
 
 // How many takes a cue has (0 before the first; its clip gone counts as none).
 int adrTakeCount(const Sequence& s, const AdrCue& cue);
@@ -81,8 +84,11 @@ namespace edit {
 // The audio track named "ADR", added at the bottom when there is none; its index.
 int adrTrack(Project& p, Sequence& s);
 // A recorded take of a cue: `media`, whose first sample belongs at timeline frame `recordedFrom`. The first take
-// becomes a clip over the line on audio track `track` (added when missing), in sync; later takes join that clip as
-// takes of its audition, the newest the pick. A cue still To Record becomes Recorded.
+// becomes a clip over the line (as much of it as the take covers), in sync, on audio track `track` when it has room
+// there, else on the first ADR track free over the line ("ADR", "ADR 2"... added as needed); a take's picture, if
+// any, is left out. Later takes join that clip as takes of its audition, the newest the pick, the clip growing to
+// what a take covers when an earlier one was cut short. A take that ends before the line is refused. A cue still
+// To Record becomes Recorded.
 Result addAdrTake(Project& p, Sequence& s, Id cueId, Id mediaId, FrameTime recordedFrom, int track);
 }  // namespace edit
 
