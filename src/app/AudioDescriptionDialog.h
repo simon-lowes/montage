@@ -41,7 +41,6 @@ private:
     void refresh();
     void cellEdited(int row, int column);
     int adTrack() const;  // the audio track named "AD", -1 if none
-    std::vector<int> dialogueTracks() const;
 
     EditorState* state_;
     QTableWidget* table_;

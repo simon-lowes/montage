@@ -86,10 +86,13 @@ struct ExportSettings {
         std::vector<bool> tracks;
         std::string role;
         std::vector<std::string> unmute;  // roles heard in this stream even where the sequence mutes them
+        bool normalise = false;           // brought to the loudness target and limited like the mix (stems are not)
+        bool descriptions = false;        // marked as audio description for the visually impaired
     };
     std::vector<AudioStream> extraAudio;
     // Audio description (core/AudioDescription.h): the mix without the descriptions (clips of the role "Description")
     // and, after it, a stream of the programme with them, named describedName in the mix's language.
+    // Only where the container carries several audio streams (containerCarriesStreams); with stems, never.
     bool describedStream = false;
     std::string describedName = "Audio Description";
     std::string audioName, audioLanguage;  // the mix's title and language
@@ -141,6 +144,9 @@ int maxAudioChannels(const std::string& codec);
 // channels, else its ear-level fold (an immersive mix's heights folded into 5.1 or 7.1), else 5.1, else stereo.
 // Exports mix in that layout; the export summary says when channels fold.
 std::string exportAudioLayout(const std::string& layout, const std::string& codec);
+// Whether the file `path` names (by its extension) can hold several audio streams: MP4 (M4A), MOV, MKV (MKA), MXF,
+// WebM, TS.
+bool containerCarriesStreams(const std::string& path);
 
 // HDR exports measure their light levels as they render (`light`, when given); PQ files to MP4 and MOV carry the
 // measured MaxCLL and MaxFALL. Encoders that state them before the first frame (x265) use the sequence's analysed

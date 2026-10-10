@@ -8,6 +8,7 @@
 // animated (its x, y, z lanes): drawn with a ring, set at the playhead.
 #pragma once
 
+#include <QElapsedTimer>
 #include <QWidget>
 
 #include "core/Model.h"
@@ -27,7 +28,9 @@ public:
     // Whether the position is keyed (drawn with a ring; the menu's "Animate Position" ticked).
     void setAnimated(bool on);
     bool isAnimated() const { return animated_; }
-    bool isDragging() const { return dragging_; }
+    // Held: dragged, or changed by the wheel, a double-click or the menu within the last 0.75 s (so Touch and Latch
+    // automation record those changes too).
+    bool isDragging() const { return dragging_ || (nudged_.isValid() && nudged_.elapsed() < 750); }
     // Where a position (x, y in -1..1) is drawn, and the reverse.
     QPointF toWidget(double x, double y) const;
     void fromWidget(QPointF p, double& x, double& y) const;
@@ -49,11 +52,12 @@ protected:
     void contextMenuEvent(QContextMenuEvent* e) override;
 
 private:
-    void emitChange(bool final);
+    void emitChange(bool final, bool nudge = true);
 
     std::string layout_ = "5.1";
     SurroundPan pan_;
     bool dragging_ = false;
+    QElapsedTimer nudged_;
     bool objectsAllowed_ = false;
     bool animated_ = false;
 };

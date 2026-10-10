@@ -85,9 +85,9 @@ struct Block {
 };
 
 // An object's blocks. Still: one. Moving (its position lanes play): a millisecond at where it starts, then the
-// position ten times a second, each block gliding to the next point; points on a straight line (within half a degree
-// and 0.005 of distance) share a block, and a step across the back (azimuth ±180°) jumps instead of sweeping round
-// the front. Boundaries fall on whole samples that hh:mm:ss.fffff writes exactly (every 12 at 48 kHz).
+// position every frame, each block gliding to the next point; points on a straight line (within half a degree
+// and 0.005 of distance, and no more than 10 degrees round) share a block, and a step across the back (azimuth ±180°)
+// jumps instead of sweeping round the front. Boundaries fall on whole samples that hh:mm:ss.fffff writes exactly (every 12 at 48 kHz).
 std::vector<Block> objectBlocks(const Track& tr, double top, FrameTime first, FrameTime end, double fps, int64_t total) {
     const bool reads = trackAutomation(tr) == AutomationMode::Read || trackAutomation(tr) == AutomationMode::Latch ||
                        trackAutomation(tr) == AutomationMode::Touch;
@@ -96,9 +96,8 @@ std::vector<Block> objectBlocks(const Track& tr, double top, FrameTime first, Fr
         const int64_t v = int64_t(std::llround(double(f - first) * kRate / fps));
         return std::min(total, v / 12 * 12);
     };
-    const FrameTime step = std::max<FrameTime>(1, FrameTime(std::llround(fps / 10)));
-    std::vector<std::pair<int64_t, Polar>> points;
-    for (FrameTime f = first; f < end; f += step) points.push_back({sampleAt(f), admPolar(trackSurroundAt(tr, double(f)), top)});
+    std::vector<std::pair<int64_t, Polar>> points;  // every frame, merged below
+    for (FrameTime f = first; f < end; ++f) points.push_back({sampleAt(f), admPolar(trackSurroundAt(tr, double(f)), top)});
     points.push_back({total, admPolar(trackSurroundAt(tr, double(end)), top)});
     std::vector<Block> out{{0, std::min<int64_t>(total, kRate / 1000), points[0].second, false}};
     auto onLine = [](const Polar& a, const Polar& b, double u, const Polar& m) {
@@ -118,10 +117,14 @@ std::vector<Block> objectBlocks(const Track& tr, double top, FrameTime first, Fr
             ++i;
             continue;
         }
-        // As far along as the points between stay on the straight line (at most 200 points to a block).
+        // As far along as the points between stay on the straight line (at most 200 points to a block), and no
+        // further than 10 degrees round: renderers (BS.2127) fade the speaker gains between blocks, so a long block
+        // would play an arc as a crossfade between its ends instead of a sweep through the speakers between (a rise
+        // at one azimuth fades between the same speakers either way).
         size_t j = i;
         while (j + 1 < points.size() && j - i < 200 && std::fabs(points[j + 1].second.az - points[j].second.az) <= 180) {
             const size_t k = j + 1;
+            if (std::fabs(points[k].second.az - start.az) > 10) break;
             bool straight = true;
             for (size_t m = i; m <= j && straight; ++m) {
                 const double u = double(points[m].first - from) / double(points[k].first - from);

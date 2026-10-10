@@ -139,8 +139,9 @@ private:
         // In surround (a panner among the speakers): its x, y and z, recorded as the pan is.
         bool surround = false;
         AutomationRecorder x, y, z;
-        SurroundPan position;               // the position before
+        SurroundPan position;               // the position before (its width, LFE and object as changed meanwhile)
         Param xLane, yLane, zLane;          // its lanes before
+        bool changedOther = false;          // width, LFE or object changed during the pass
     };
     std::vector<Recording> recording_;
     QString liveState_;  // what the gesture last applied, to skip repeats

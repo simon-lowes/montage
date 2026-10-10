@@ -44,7 +44,8 @@ void SurroundPanner::fromWidget(QPointF p, double& x, double& y) const {
     if (d > 1) x /= d, y /= d;
 }
 
-void SurroundPanner::emitChange(bool final) {
+void SurroundPanner::emitChange(bool final, bool nudge) {
+    if (final && nudge && !dragging_) nudged_.start();
     update();
     emit changed(pan_, final);
 }
@@ -124,7 +125,7 @@ void SurroundPanner::mouseReleaseEvent(QMouseEvent* e) {
     if (!dragging_ || e->button() != Qt::LeftButton) return;
     dragging_ = false;
     fromWidget(e->position(), pan_.x, pan_.y);
-    emitChange(true);
+    emitChange(true, false);
 }
 
 void SurroundPanner::mouseDoubleClickEvent(QMouseEvent*) {

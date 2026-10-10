@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <cmath>
 #include <map>
+#include <set>
 
 #include "Decoder.h"
+#include "core/AudioDescription.h"
 #include "MediaPool.h"
 
 namespace montage {
@@ -37,7 +39,7 @@ Spans dialogueSpans(const Project& p, const Sequence& s, const std::vector<int>&
         const Track& t = s.audioTracks[size_t(ti)];
         if (t.muted) continue;
         for (const Clip& c : t.clips) {
-            if (!c.enabled) continue;
+            if (!c.enabled || std::find(o.skipRoles.begin(), o.skipRoles.end(), c.role) != o.skipRoles.end()) continue;
             const MediaItem* m = p.findMedia(c.mediaId);
             if (!m || !m->hasAudio || m->path.empty()) continue;
             const double cs = double(c.start) / fps, ce = double(c.end()) / fps;
@@ -99,6 +101,24 @@ Spans dialogueSpans(const Project& p, const Sequence& s, const std::vector<int>&
     return merge(speech, std::max(o.minPause, o.fadeDown + o.fadeUp));
 }
 
+Spans descriptionSpeech(const Project& p, const Sequence& s, int skipTrack, std::string* error) {
+    std::vector<int> tracks;
+    for (int i = 0; i < int(s.audioTracks.size()); ++i)
+        if (i != skipTrack) tracks.push_back(i);
+    DuckOptions o;
+    o.minPause = 0.5;
+    std::set<std::string> roles;
+    for (const Track& t : s.audioTracks)
+        for (const Clip& c : t.clips) roles.insert(c.role);
+    if (roles.count("Dialogue")) {
+        for (const std::string& r : roles)
+            if (r != "Dialogue") o.skipRoles.push_back(r);
+    } else {
+        o.skipRoles = {"Music", "Effects", kDescriptionRole};
+    }
+    return dialogueSpans(p, s, tracks, o, error);
+}
+
 Spans clipSpans(const Sequence& s, int track, double minPause) {
     if (track < 0 || track >= int(s.audioTracks.size())) return {};
     const double fps = s.fpsValue();
@@ -108,10 +128,17 @@ Spans clipSpans(const Sequence& s, int track, double minPause) {
     return merge(std::move(spans), minPause);
 }
 
-bool duckClip(Clip& c, const Sequence& s, const Spans& spans, const DuckOptions& o) {
+bool duckClip(Clip& c, const Sequence& s, const Spans& spans, const DuckOptions& o, const std::string& lane) {
     const double fps = s.fpsValue();
-    Param& gain = c.audio.params["gain_db"];
-    const double base = gain.at(0);
+    const bool own = lane != "gain_db", existed = c.audio.params.count(lane) > 0;
+    if (own && !existed) {
+        // Only a clip a span reaches gets the lane.
+        const double cs = double(c.start) / fps, ce = double(c.end()) / fps;
+        if (std::none_of(spans.begin(), spans.end(), [&](const auto& sp) { return sp.first - o.fadeDown < ce && sp.second + o.fadeUp > cs; }))
+            return false;
+    }
+    Param& gain = c.audio.params[lane];
+    const double base = own ? 0.0 : gain.at(0);
     const double cs = double(c.start) / fps, ce = double(c.end()) / fps;
     // How far down the music is (0 to 1): spans are far enough apart that the fades never overlap.
     auto depth = [&](double t) {
@@ -136,7 +163,13 @@ bool duckClip(Clip& c, const Sequence& s, const Spans& spans, const DuckOptions&
         reached |= d > 0;
         out.addKey(local, base + o.amountDb * d);
     }
-    if (!reached) out.keys.clear();
+    if (!reached) {
+        if (own) {
+            c.audio.params.erase(lane);
+            return existed;
+        }
+        out.keys.clear();
+    }
     // Keys between two equal neighbours add nothing.
     for (size_t i = 1; i + 1 < out.keys.size();)
         if (std::fabs(out.keys[i - 1].v - out.keys[i].v) < 1e-9 && std::fabs(out.keys[i + 1].v - out.keys[i].v) < 1e-9)
@@ -146,6 +179,24 @@ bool duckClip(Clip& c, const Sequence& s, const Spans& spans, const DuckOptions&
     if (out == gain) return false;
     gain = out;
     return true;
+}
+
+int duckUnderDescriptions(Sequence& s, double amountDb, double fadeSeconds) {
+    const double fps = s.fpsValue();
+    Spans spans;
+    for (const Track& t : s.audioTracks)
+        for (const Clip& c : t.clips)
+            if (c.enabled && c.role == kDescriptionRole) spans.emplace_back(double(c.start) / fps, double(c.end()) / fps);
+    std::sort(spans.begin(), spans.end());
+    spans = merge(std::move(spans), 2 * fadeSeconds);
+    DuckOptions o;
+    o.amountDb = amountDb;
+    o.fadeDown = o.fadeUp = fadeSeconds;
+    int changed = 0;
+    for (Track& t : s.audioTracks)
+        for (Clip& c : t.clips)
+            if (c.role != kDescriptionRole && duckClip(c, s, spans, o, kDescriptionDuckParam)) ++changed;
+    return changed;
 }
 
 }  // namespace montage

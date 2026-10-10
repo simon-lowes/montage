@@ -29,6 +29,7 @@
 #include "audio/SpeechCleanup.h"
 #include "audio/TimeStretch.h"
 #include "core/ProjectIO.h"
+#include "core/AudioDescription.h"
 #include "core/Bleep.h"
 #include "core/ClipAnimation.h"
 #include "render/Spherical.h"
@@ -1992,12 +1993,15 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
         }
         // Clip filters (stateful, processed over the whole block for continuity).
         processChain(c.effects, c.id, FrameTime(double(start) * fps / sr) - c.start, sr, clipBuf.data(), frames);
-        // Clip volume / pan (keyframed, evaluated every 64 samples) and fades.
+        // Clip volume / pan (keyframed, evaluated every 64 samples) and fades. The dips under audio description
+        // (core/AudioDescription.h) are heard only while the descriptions are.
+        const auto duck = c.audio.params.find(kDescriptionDuckParam);
+        const Param* adDuck = duck != c.audio.params.end() && !edit::roleMuted(seq, kDescriptionRole) ? &duck->second : nullptr;
         const int64_t o0 = std::max(start, ps), o1 = std::min(end, pe);
         for (int64_t s = o0; s < o1; s += 64) {
             int64_t e2 = std::min(o1, s + 64);
             FrameTime lt = FrameTime(std::floor(double(s) * fps / sr)) - c.start;
-            float g = dbToLin(c.audio.p("gain_db", lt, 0));
+            float g = dbToLin(c.audio.p("gain_db", lt, 0) + (adDuck ? adDuck->at(lt) : 0.0));
             float pl, pr;
             panGains(c.audio.p("pan", lt, 0), pl, pr);
             for (int64_t k = s; k < e2; ++k) {

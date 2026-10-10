@@ -721,6 +721,42 @@ private slots:
         QVERIFY2(a1().surroundXAuto.at(10) < -0.9, qPrintable(QString::number(a1().surroundXAuto.at(10))));
         QVERIFY(std::fabs(a1().surroundXAuto.at(2) - still.x) < 1e-6);                 // before it was held
         QVERIFY(a1().surroundXAuto.at(50) > a1().surroundXAuto.at(20) + 0.1);           // let go: gliding back
+        // During a pass another track's panner and Animate Position wait (an edit would end the pass), while a width
+        // change on the track being recorded (the wheel: not a drag) is kept, all as one undo step.
+        state()->edit("A2 out", [](Project&, Sequence& s) {
+            s.audioTracks.at(1).output = 0;
+            return true;
+        });
+        QTRY_VERIFY(mixer->trackSurround(1) && !mixer->trackSurround(1)->isHidden());
+        const SurroundPan a2Was = state()->sequence()->audioTracks.at(1).surround;
+        const double widthWas = a1().surround.width;
+        const int notch = widthWas > 0.5 ? -120 : 120;
+        mixer->playbackStarted(0);
+        for (FrameTime f = 0; f <= 30; ++f) {
+            if (f == 10) {
+                SurroundPan moved = a2Was;
+                moved.x = -0.7;
+                emit mixer->trackSurround(1)->changed(moved, true);
+                emit mixer->trackSurround(1)->animateRequested(true);
+            }
+            if (f == 12) {
+                const QPointF c(panner->width() / 2.0, panner->height() / 2.0);
+                QWheelEvent wheel(c, panner->mapToGlobal(c), QPoint(), QPoint(0, notch), Qt::NoButton, Qt::NoModifier, Qt::NoScrollPhase, false);
+                QApplication::sendEvent(panner, &wheel);
+                QVERIFY(panner->isDragging());  // held a moment, so Touch writes it
+            }
+            mixer->playbackPosition(f);
+            if (f == 11) QVERIFY(mixer->recordingAutomation());
+        }
+        mixer->playbackStopped(30);
+        QVERIFY(state()->sequence()->audioTracks.at(1).surround == a2Was);
+        QVERIFY(!surroundAnimated(state()->sequence()->audioTracks.at(1)));
+        const double widened = std::clamp(widthWas + (notch > 0 ? 0.1 : -0.1), 0.0, 1.0);
+        QVERIFY2(std::fabs(a1().surround.width - widened) < 1e-9, qPrintable(QString::number(a1().surround.width)));
+        QVERIFY2(a1().surroundXAuto.at(10) < -0.9, qPrintable(QString::number(a1().surroundXAuto.at(10))));  // the last pass's lane kept
+        state()->undo();
+        QVERIFY(std::fabs(a1().surround.width - widthWas) < 1e-9);
+        state()->redo();
         // Stopping the animation leaves it where it is at the playhead.
         state()->setPlayhead(40);
         const double here = a1().surroundXAuto.at(40);
@@ -5703,7 +5739,13 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(state()->apply("Lines", [&](Project& p, Sequence& s) {
             edit::Result r = edit::placeMedia(p, s, media, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
             if (!r.ok) return r;
-            return edit::placeMedia(p, s, media, 90, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+            r = edit::placeMedia(p, s, media, 90, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+            if (!r.ok) return r;
+            // Music between the lines (not dialogue: the gap is still found), to be ducked under the description.
+            const TrackRef music = edit::addTrack(p, s, TrackKind::Audio);
+            r = edit::placeMedia(p, s, media, 36, 0, -1, {TrackKind::Video, -1}, music, false);
+            if (r.ok) edit::clipById(s, r.created.front())->role = "Music";
+            return r;
         }));
         win_->findChild<QAction*>("audioDescription")->trigger();
         auto* dlg = win_->findChild<AudioDescriptionDialog*>("audioDescriptionDialog");
@@ -5743,7 +5785,7 @@ const auto seq = [this] { return state()->sequence(); };
             for (int i = 0; i < int(s.audioTracks.size()); ++i)
                 if (s.audioTracks[size_t(i)].name == "AD") ad = i;
             QVERIFY(ad >= 0 && s.audioTracks[size_t(ad)].clips.size() == 1);
-            QVERIFY(dlg->duck() >= 1);
+            QCOMPARE(dlg->duck(), 1);  // the music; the lines are clear of it
             QCOMPARE(dlg->voice(&err), 1);  // voiced again: replaced, not added
             QCOMPARE(state()->sequence()->audioTracks[size_t(ad)].clips.size(), size_t(1));
         } else {
@@ -5754,7 +5796,7 @@ const auto seq = [this] { return state()->sequence(); };
                 if (res.ok) edit::clipById(s, res.created.front())->role = kDescriptionRole;
                 return res;
             }));
-            QVERIFY(dlg->duck() >= 1);
+            QCOMPARE(dlg->duck(), 1);  // the music; the lines are clear of it
         }
         // Export offers the described stream once there are descriptions, for containers with several streams.
         {

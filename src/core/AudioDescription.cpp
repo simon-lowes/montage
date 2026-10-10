@@ -86,6 +86,8 @@ bool setDescription(Project& p, Sequence& s, FrameTime start, FrameTime end, con
     }
     if (end <= start) return false;
     auto& caps = s.captionTracks[size_t(descriptionTrack(p, s))].captions;
+    for (Caption& c : caps)
+        if (c.start < start && c.end > start) c.end = start;  // an earlier line ends where this one begins
     std::erase_if(caps, [&](const Caption& c) { return c.start < end && c.end > start; });
     Caption c;
     c.start = start;

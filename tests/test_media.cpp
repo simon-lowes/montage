@@ -4369,6 +4369,7 @@ private slots:
             QVERIFY2(std::fabs(seconds(blocks[i].rtime) - seconds(blocks[i - 1].rtime) - seconds(blocks[i - 1].duration)) < 1e-9,
                      qPrintable(QString::number(i)));
             QVERIFY(blocks[i].az <= blocks[i - 1].az + 1e-9);  // always turning right
+            QVERIFY(blocks[i - 1].az - blocks[i].az <= 10 + 1e-6);  // short enough that a renderer sweeps, not fades
         }
         QVERIFY(std::fabs(seconds(blocks.back().rtime) + seconds(blocks.back().duration) - 2.0) < 1e-4);
         QVERIFY(info.axml.find("jumpPosition") == std::string::npos);
@@ -4497,6 +4498,13 @@ private slots:
         p.media.push_back(probeOrFail(p, tone(1000, 1.4, "desc.wav")));
         QVERIFY(edit::placeMedia(p, s, p.media[0].id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
         QVERIFY(edit::placeMedia(p, s, p.media[0].id, 90, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        // A music bed (220 Hz) under all of it: music, so not dialogue the gaps are found between.
+        p.media.push_back(probeOrFail(p, tone(220, 4, "bed.wav")));
+        const int bedTrack = edit::addTrack(p, s, TrackKind::Audio).index;
+        const edit::Result bed = edit::placeMedia(p, s, p.media[2].id, 0, 0, -1, {TrackKind::Video, -1}, {TrackKind::Audio, bedTrack}, false);
+        QVERIFY(bed.ok && !bed.created.empty());
+        const Id bedClip = bed.created.front();
+        edit::clipById(s, bedClip)->role = "Music";
         // MCP: the gap between the lines, a description written into it, how it fits.
         const QString project = QString::fromStdString(path("described.montage"));
         QVERIFY(saveProject(p, project.toStdString()));
@@ -4517,17 +4525,20 @@ private slots:
         QVERIFY(parseTimecode(gaps[0].toObject().value("start").toString().toStdString(), s.fps, g0));
         QVERIFY(parseTimecode(gaps[0].toObject().value("end").toString().toStdString(), s.fps, g1));
         QVERIFY2(g0 >= 39 && g0 <= 42 && g1 >= 78 && g1 <= 81, qPrintable(QString("%1 %2").arg(g0).arg(g1)));  // 1.3 s to 2.7 s
+        // Two in the gap: the first runs to the second, the second to the gap's end.
         r = call({{"project", project}, {"action", "write"},
-                  {"descriptions", QJsonArray{QJsonObject{{"start", gaps[0].toObject().value("start")}, {"text", "Rain falls."}}}}});
+                  {"descriptions", QJsonArray{QJsonObject{{"start", gaps[0].toObject().value("start")}, {"text", "Rain falls."}},
+                                              QJsonObject{{"start", double(g0 + 20) / 30.0}, {"text", "Wind."}}}}});
         QVERIFY2(!r.value("isError").toBool(), qPrintable(QJsonDocument(r).toJson()));
         QJsonArray list = r.value("structuredContent").toObject().value("descriptions").toArray();
-        QCOMPARE(list.size(), 1);
-        QCOMPARE(list[0].toObject().value("end").toString(), QString::fromStdString(formatTimecode(g1, s.fps)));  // the gap's end
+        QCOMPARE(list.size(), 2);
+        QCOMPARE(list[0].toObject().value("end").toString(), QString::fromStdString(formatTimecode(g0 + 20, s.fps)));
+        QCOMPARE(list[1].toObject().value("end").toString(), QString::fromStdString(formatTimecode(g1, s.fps)));  // the gap's end
         QVERIFY(list[0].toObject().value("fits").toBool());
         r = call({{"project", project}, {"action", "write"},
                   {"descriptions", QJsonArray{QJsonObject{{"start", 3.4}, {"end", 3.9}, {"text", "A long description that cannot possibly fit."}}}}});
         list = r.value("structuredContent").toObject().value("descriptions").toArray();
-        QVERIFY(list.size() == 2 && !list[1].toObject().value("fits").toBool() && list[1].toObject().value("over_words").toInt() > 0);
+        QVERIFY(list.size() == 3 && !list[2].toObject().value("fits").toBool() && list[2].toObject().value("over_words").toInt() > 0);
         QVERIFY(call({{"project", project}, {"action", "duck"}}).value("isError").toBool());  // nothing voiced yet
         // The voiced description (placed here by hand: the speech model is optional) on the AD track, ducked under.
         QVERIFY(loadProject(project.toStdString(), p));
@@ -4539,7 +4550,18 @@ private slots:
         edit::clipById(d, placed.created.front())->role = kDescriptionRole;
         QVERIFY(saveProject(p, project.toStdString()));
         r = call({{"project", project}, {"action", "duck"}, {"duck_db", -12}});
-        QVERIFY2(r.value("structuredContent").toObject().value("ducked").toInt() >= 1, qPrintable(QJsonDocument(r).toJson()));
+        // Only the bed: the dialogue around the description is clear of the fades.
+        QVERIFY2(r.value("structuredContent").toObject().value("ducked").toInt() == 1, qPrintable(QJsonDocument(r).toJson()));
+        {
+            Project ducked;
+            QVERIFY(loadProject(project.toStdString(), ducked));
+            const Clip* bc = edit::clipById(*ducked.active(), bedClip);
+            QVERIFY(bc->audio.params.count(kDescriptionDuckParam));
+            QVERIFY(!bc->audio.params.count("gain_db") || bc->audio.params.at("gain_db").keys.empty());  // its own volume untouched
+            QVERIFY(std::fabs(bc->audio.params.at(kDescriptionDuckParam).at(60) + 12) < 1e-6);
+            // Ducking again rebuilds the lane rather than dipping further.
+            QVERIFY(call({{"project", project}, {"action", "duck"}, {"duck_db", -12}}).value("structuredContent").toObject().value("ducked").toInt() == 0);
+        }
         r = call({{"project", project}, {"action", "hear"}, {"on", false}});
         QCOMPARE(r.value("structuredContent").toObject().value("heard").toBool(), false);
         QVERIFY(r.value("structuredContent").toObject().value("voiced").toBool());
@@ -4561,9 +4583,55 @@ private slots:
         const size_t a = size_t(1.5 * rate), b = size_t(2.5 * rate);
         QVERIFY2(toneLevel(main, 0, 1000, a, b) < 0.01, qPrintable(QString::number(toneLevel(main, 0, 1000, a, b))));
         QVERIFY2(toneLevel(described, 0, 1000, a, b) > 0.05, qPrintable(QString::number(toneLevel(described, 0, 1000, a, b))));
-        // Both keep the dialogue (ducked around the description, whole elsewhere).
+        // Both keep the dialogue.
         QVERIFY(toneLevel(main, 0, 440, size_t(0.1 * rate), size_t(0.5 * rate)) > 0.05);
         QVERIFY(toneLevel(described, 0, 440, size_t(0.1 * rate), size_t(0.5 * rate)) > 0.05);
+        // The bed dips 12 dB under the description in the described stream only.
+        const size_t c0 = size_t(3.2 * rate), c1 = size_t(3.8 * rate);
+        const double mainDip = toneLevel(main, 0, 220, a, b) / toneLevel(main, 0, 220, c0, c1);
+        const double adDip = toneLevel(described, 0, 220, a, b) / toneLevel(described, 0, 220, c0, c1);
+        QVERIFY2(std::fabs(mainDip - 1) < 0.05, qPrintable(QString::number(mainDip)));
+        QVERIFY2(std::fabs(adDip - 0.25) < 0.04, qPrintable(QString::number(adDip)));
+        // In to Out: the described stream starts where the mix does.
+        ExportSettings ranged = aac;
+        ranged.path = path("described-range.m4a");
+        ranged.in = 30, ranged.out = 105;  // 1 s to 3.5 s
+        QVERIFY2(exportSequence(p, *p.active(), ranged, nullptr, nullptr, &err), err.c_str());
+        const std::vector<float> rMain = decodeAudioStream(ranged.path, 0), rDesc = decodeAudioStream(ranged.path, 1);
+        QVERIFY2(std::llabs((long long)rMain.size() - (long long)rDesc.size()) <= 2 * 2048, qPrintable(QString("%1 %2").arg(rMain.size()).arg(rDesc.size())));
+        QVERIFY(std::llabs((long long)(rMain.size() / 2) - (long long)(2.5 * rate)) < 4096);
+        QVERIFY(toneLevel(rDesc, 0, 1000, size_t(0.6 * rate), size_t(1.4 * rate)) > 0.05);  // 1.3-2.7 s on the timeline
+        QVERIFY(toneLevel(rDesc, 0, 1000, size_t(1.9 * rate), size_t(2.4 * rate)) < 0.01);
+        // Marked as description in containers that say so; a loudness target levels it like the mix.
+        ExportSettings mka = aac;
+        mka.path = path("described.mka");
+        mka.audioCodec = "flac";
+        mka.loudnessTarget = -23;
+        QVERIFY2(exportSequence(p, *p.active(), mka, nullptr, nullptr, &err), err.c_str());
+        {
+            AVFormatContext* fmt = nullptr;
+            QVERIFY(avformat_open_input(&fmt, mka.path.c_str(), nullptr, nullptr) >= 0);
+            avformat_find_stream_info(fmt, nullptr);
+            QCOMPARE(int(fmt->nb_streams), 2);
+            QVERIFY(fmt->streams[1]->disposition & AV_DISPOSITION_VISUAL_IMPAIRED);
+            QVERIFY(!(fmt->streams[0]->disposition & AV_DISPOSITION_VISUAL_IMPAIRED));
+            avformat_close_input(&fmt);
+            for (int k = 0; k < 2; ++k) {
+                const std::vector<float> x = decodeAudioStream(mka.path, k);
+                LoudnessMeter lm(rate);
+                lm.add(x.data(), int64_t(x.size() / 2));
+                const LoudnessResult lr = lm.result();
+                QVERIFY2(lr.valid && std::fabs(lr.integrated + 23) < 1.0, qPrintable(QString("%1: %2").arg(k).arg(lr.integrated)));
+            }
+        }
+        // Stems and single-stream files leave the described stream out (one stream each).
+        ExportSettings stems = aac;
+        stems.path = path("described-stems.wav");
+        stems.audioCodec = "pcm_s24le";
+        std::vector<StemFile> written;
+        QVERIFY2(exportStems(p, *p.active(), stems, StemsByRole, &written, {}, nullptr, &err), err.c_str());
+        QVERIFY(!written.empty());
+        for (const StemFile& f : written) QVERIFY(decodeAudioStream(f.path, 1).empty());
         // Without descriptions, nothing changes: one stream.
         Sequence plain = *p.active();
         for (Track& t : plain.audioTracks) std::erase_if(t.clips, [](const Clip& c) { return c.role == kDescriptionRole; });
@@ -4575,7 +4643,7 @@ private slots:
         if (ttsAvailable() && ttsModel().installed()) {
             r = call({{"project", project}, {"action", "voice"}, {"voice", "bf_emma"}});
             QVERIFY2(!r.value("isError").toBool(), qPrintable(QJsonDocument(r).toJson()));
-            QCOMPARE(r.value("structuredContent").toObject().value("clips").toArray().size(), 2);
+            QCOMPARE(r.value("structuredContent").toObject().value("clips").toArray().size(), 3);
             Project voiced;
             QVERIFY(loadProject(project.toStdString(), voiced));
             int described2 = 0;
@@ -4585,7 +4653,7 @@ private slots:
                         ++described2;
                         QCOMPARE(t.name, std::string("AD"));
                     }
-            QCOMPARE(described2, 2);  // the hand-placed one replaced
+            QCOMPARE(described2, 3);  // the hand-placed one replaced
         }
     }
 

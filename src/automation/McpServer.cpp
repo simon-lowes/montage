@@ -4234,13 +4234,8 @@ void McpServer::Impl::addTools() {
                 return -1;
             };
             auto findGaps = [&](std::vector<DescriptionGap>& out, double minGap) -> QString {
-                std::vector<int> tracks;
-                for (int i = 0; i < int(s.audioTracks.size()); ++i)
-                    if (i != adTrack()) tracks.push_back(i);
-                DuckOptions o;
-                o.minPause = 0.5;
                 std::string err;
-                const Spans speech = dialogueSpans(l.project, s, tracks, o, &err);
+                const Spans speech = descriptionSpeech(l.project, s, adTrack(), &err);
                 if (!err.empty()) return QString::fromStdString(err);
                 out = descriptionGaps(speech, s.fpsValue(), 0, std::max<FrameTime>(1, s.duration()), minGap);
                 return {};
@@ -4287,6 +4282,12 @@ void McpServer::Impl::addTools() {
                         for (const DescriptionGap& g : gaps)
                             if (start >= g.start && start < g.end) end = g.end;
                         if (end < 0) end = start + FrameTime(std::llround(3 * s.fpsValue()));
+                        // Up to the next description, written now or already there, so one never erases another.
+                        for (const QJsonValue& w : items)
+                            if (const FrameTime next = timeArg(w.toObject().value("start"), s, "start"); next > start) end = std::min(end, next);
+                        if (const int t = findDescriptionTrack(s); t >= 0)
+                            for (const Caption& c : s.captionTracks[size_t(t)].captions)
+                                if (c.start > start) end = std::min(end, c.start);
                     }
                     const std::string text = o.value("text").toString().toStdString();
                     if (!setDescription(l.project, s, start, end, text) && !text.empty())
@@ -4334,19 +4335,9 @@ void McpServer::Impl::addTools() {
                 return ok(QStringLiteral("Voiced %1 description(s), %2 s in all").arg(placed.size()).arg(total, 0, 'f', 1), r);
             }
             if (action == "duck") {
-                const int ad = adTrack();
-                if (ad < 0 || !hasDescriptionClips(s)) return fail("Voice the descriptions first");
-                DuckOptions o;
-                o.amountDb = std::clamp(a.value("duck_db").toDouble(-9), -40.0, -1.0);
-                o.fadeDown = 0.4;
-                o.fadeUp = 0.6;
-                const Spans spans = clipSpans(s, ad, 1.0);
-                int changed = 0;
-                for (int i = 0; i < int(s.audioTracks.size()); ++i) {
-                    if (i == ad) continue;
-                    for (Clip& c : s.audioTracks[size_t(i)].clips)
-                        if (c.role != kDescriptionRole && duckClip(c, s, spans, o)) ++changed;
-                }
+                if (!hasDescriptionClips(s)) return fail("Voice the descriptions first");
+                // On a lane of its own, heard only with the descriptions: the mix without them is not dipped.
+                const int changed = duckUnderDescriptions(s, std::clamp(a.value("duck_db").toDouble(-9), -40.0, -1.0));
                 save(l);
                 return ok(QStringLiteral("Ducked %1 clip(s) under the descriptions").arg(changed), QJsonObject{{"ducked", changed}});
             }
@@ -5178,13 +5169,16 @@ void McpServer::Impl::addTools() {
             }
             st.downmixStereo = a.value("downmix_stereo").toBool();
             st.describedStream = a.value("described").toBool();
+            if (st.describedStream && !containerCarriesStreams(st.path))
+                throw ArgError{"A described export needs a container with several audio streams (mp4, mov, mkv, mxf)"};
             const QString cap = str(a, "captions", "none");
             if (cap != "none" && cap != "burn" && cap != "embed" && cap != "both") throw ArgError{"\"captions\" must be none, burn, embed or both"};
             st.burnInCaptions = cap == "burn" || cap == "both";
             st.cea608 = a.value("cea608").toBool();
             st.embedCaptions = cap == "embed" || cap == "both";
             if (st.embedCaptions && a.value("all_captions").toBool())
-                for (const CaptionTrack& t : s.captionTracks) st.extraCaptions.push_back(t.id);
+                for (const CaptionTrack& t : s.captionTracks)
+                    if (t.name != kDescriptionTrackName) st.extraCaptions.push_back(t.id);  // descriptions are spoken, not subtitles
             st.audioName = a.value("audio_name").toString().toStdString();
             st.audioLanguage = a.value("audio_language").toString().toStdString();
             const QJsonValue streams = a.value("audio_streams");

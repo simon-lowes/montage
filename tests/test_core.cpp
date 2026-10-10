@@ -2805,13 +2805,17 @@ private slots:
         QCOMPARE(s.captionTracks[size_t(t)].language, std::string("fr"));
         QVERIFY(setDescription(fx.p, s, 99, 171, "Rain on the window."));
         QVERIFY(setDescription(fx.p, s, 369, 450, "She leaves."));
-        QVERIFY(setDescription(fx.p, s, 120, 160, "Rain streaks the glass."));  // replaces the first
+        QVERIFY(setDescription(fx.p, s, 120, 160, "Rain streaks the glass."));  // the first now ends where it begins
         auto& caps = s.captionTracks[size_t(t)].captions;
-        QCOMPARE(caps.size(), size_t(2));
-        QVERIFY(caps[0].start == 120 && caps[0].text == "Rain streaks the glass.");
+        QCOMPARE(caps.size(), size_t(3));
+        QVERIFY(caps[0].start == 99 && caps[0].end == 120 && caps[0].text == "Rain on the window.");
+        QVERIFY(caps[1].start == 120 && caps[1].end == 160 && caps[1].text == "Rain streaks the glass.");
+        QVERIFY(setDescription(fx.p, s, 110, 125, "Rain."));  // inside the first: it is cut short, the second replaced
+        QCOMPARE(caps.size(), size_t(3));
+        QVERIFY(caps[0].end == 110 && caps[1].start == 110 && caps[1].end == 125 && caps[2].start == 369);
         QVERIFY(!setDescription(fx.p, s, 200, 200, "No room."));
-        QVERIFY(setDescription(fx.p, s, 130, 0, ""));  // the one there goes
-        QCOMPARE(caps.size(), size_t(1));
+        QVERIFY(setDescription(fx.p, s, 115, 0, ""));  // the one there goes
+        QCOMPARE(caps.size(), size_t(2));
         QVERIFY(!setDescription(fx.p, s, 10, 0, ""));
         QVERIFY(!hasDescriptionClips(s));
         const Id clip = fx.put(A1, 0, 30);
