@@ -22,7 +22,8 @@ def walk(seg, out):
         inner = []
         for s in seg.segments:
             walk(s, inner)
-        out.append({"type": "gain", "op": seg.operation.name, "length": seg.length, "params": params, "inputs": inner})
+        out.append({"type": "gain", "op": seg.operation.name, "op_id": str(seg.operation.auid), "length": seg.length, "params": params,
+                    "inputs": inner})
     elif kind == "Transition":
         out.append({"type": "transition", "length": seg.length, "cut": seg["CutPoint"].value, "op": seg["OperationGroup"].value.operation.name})
     elif kind == "Filler":
@@ -38,6 +39,13 @@ def walk(seg, out):
         for k, key in (("fade_in", "FadeInLength"), ("fade_out", "FadeOutLength")):
             if key in seg.keys():
                 entry[k] = seg[key].value
+        if "ImageAspectRatio" in filemob.descriptor.keys():
+            entry["aspect"] = str(filemob.descriptor["ImageAspectRatio"].value)
+        # A file recorded as a source with a timecode ("tape" mob): where the file starts in it.
+        fseg = filemob.slots[0].segment
+        tape = fseg.mob if type(fseg).__name__ == "SourceClip" else None
+        if tape is not None and any(type(ts.segment).__name__ == "Timecode" for ts in tape.slots):
+            entry["tape_tc"] = fseg.start
         out.append(entry)
     else:
         out.append({"type": kind})

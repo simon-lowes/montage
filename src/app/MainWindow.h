@@ -385,11 +385,11 @@ private:
     enum class Interchange { Edl, Otio, Fcp7Xml, FcpXml };
     void exportInterchange(Interchange format);
     // The audio tracks as AAF with mono WAVs beside it (for Pro Tools, Fairlight), in the background with progress.
-    void exportAafDialog();
+    void exportAafDialog(bool picture = true);
     // Find Shots for moments that look like the selected clip (or the one under the playhead) at the playhead.
     void findSimilarShots();
 public:
-    bool exportAafTo(const QString& path, QString* summary = nullptr);
+    bool exportAafTo(const QString& path, QString* summary = nullptr, bool picture = true);
 private:
     // Imports an OTIO, EDL or FCP XML timeline as a new sequence (one undo step).
     void importTimeline();

@@ -786,6 +786,8 @@ void MainWindow::buildMenus() {
     add(file, tr("Export &OpenTimelineIO…"), QKeySequence(), [this] { exportInterchange(Interchange::Otio); });
     add(file, tr("Export &AAF (Pro Tools, Fairlight, Media Composer)…"), QKeySequence(), [this] { exportAafDialog(); })
         ->setObjectName(QStringLiteral("exportAaf"));
+    add(file, tr("Export AAF, Sound Only (Pro Tools, Fairlight)…"), QKeySequence(), [this] { exportAafDialog(false); })
+        ->setObjectName(QStringLiteral("exportAafSound"));
     file->addSeparator();
     add(file, tr("&Quit"), QKeySequence::Quit, [this] { close(); });
 
@@ -5890,7 +5892,7 @@ void MainWindow::findSimilarShots() {
     statusBar()->showMessage(tr("%n moment(s) like this one", "", n), 5000);
 }
 
-bool MainWindow::exportAafTo(const QString& path, QString* summary) {
+bool MainWindow::exportAafTo(const QString& path, QString* summary, bool picture) {
     const Sequence* s = state_->sequence();
     if (!s) return false;
     // In the background on a copy of the project: decoding and writing the WAVs takes a while.
@@ -5913,12 +5915,14 @@ bool MainWindow::exportAafTo(const QString& path, QString* summary) {
     QTimer poll;
     connect(&poll, &QTimer::timeout, this, [&] { dlg.setValue(int(progress->load() * 1000)); });
     poll.start(100);
-    watcher.setFuture(QtConcurrent::run([snap, seqId, path, cancel, progress]() {
+    watcher.setFuture(QtConcurrent::run([snap, seqId, path, cancel, progress, picture]() {
         Outcome o;
         const Sequence* sq = snap->findSequence(seqId);
         if (!sq) return o;
+        AafExportOptions options;
+        options.picture = picture;
         o.ok = exportAaf(*snap, *sq, path.toStdString(), &o.result, [progress](double f, FrameTime) { *progress = f; }, cancel.get(),
-                         &o.error);
+                         &o.error, options);
         return o;
     }));
     loop.exec();
@@ -5929,13 +5933,14 @@ bool MainWindow::exportAafTo(const QString& path, QString* summary) {
         if (!*cancel) QMessageBox::warning(this, tr("Export AAF"), QString::fromStdString(o.error));
         return false;
     }
-    QString text = tr("%1: %2 audio tracks, %3 clips, %4 crossfades; %5 WAV files in \"%6\"")
-                       .arg(QFileInfo(path).fileName())
-                       .arg(o.result.audioTracks)
-                       .arg(o.result.clips)
-                       .arg(o.result.transitions)
-                       .arg(o.result.mediaFiles.size())
-                       .arg(QFileInfo(path).completeBaseName() + tr(" Media"));
+    QString text = o.result.mediaFiles.empty() ? QFileInfo(path).fileName() + tr(": no sound")
+                                               : tr("%1: %2 audio tracks, %3 clips, %4 crossfades; %5 WAV files in \"%6\"")
+                                                     .arg(QFileInfo(path).fileName())
+                                                     .arg(o.result.audioTracks)
+                                                     .arg(o.result.clips)
+                                                     .arg(o.result.transitions)
+                                                     .arg(o.result.mediaFiles.size())
+                                                     .arg(QFileInfo(path).completeBaseName() + tr(" Media"));
     if (o.result.videoTracks)
         text += tr("; %1 video tracks, %2 clips, %3 dissolves linked to the original files")
                     .arg(o.result.videoTracks)
@@ -5946,7 +5951,7 @@ bool MainWindow::exportAafTo(const QString& path, QString* summary) {
     return true;
 }
 
-void MainWindow::exportAafDialog() {
+void MainWindow::exportAafDialog(bool picture) {
     const Sequence* s = state_->sequence();
     if (!s) return;
     QSettings st = appSettings();
@@ -5956,7 +5961,7 @@ void MainWindow::exportAafDialog() {
     if (path.isEmpty()) return;
     st.setValue("lastExportDir", QFileInfo(path).absolutePath());
     QString summary;
-    if (exportAafTo(path, &summary)) statusBar()->showMessage(tr("Exported %1").arg(summary), 10000);
+    if (exportAafTo(path, &summary, picture)) statusBar()->showMessage(tr("Exported %1").arg(summary), 10000);
 }
 
 void MainWindow::importTimeline() {

@@ -5809,7 +5809,8 @@ void McpServer::Impl::addTools() {
                 AafExportResult r;
                 std::string err;
                 AafExportOptions o;
-                o.picture = a.value("picture").toBool(true);
+                const QJsonValue pv = a.value("picture");
+                o.picture = pv.isString() ? pv.toString().compare("false", Qt::CaseInsensitive) != 0 && pv.toString() != "0" : pv.toBool(true);
                 if (!exportAaf(l.project, l.seq(), out.toStdString(), &r, [this](double x, FrameTime) { progress(x, "AAF"); }, nullptr, &err, o))
                     return fail(QString::fromStdString(err));
                 QJsonArray files, warnings;

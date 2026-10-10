@@ -6276,7 +6276,8 @@ private slots:
         s.fps = {25, 1};
         s.width = 320, s.height = 240;
         s.name = "Picture Cut";
-        const MediaItem movie = probeOrFail(p, st.path);
+        MediaItem movie = probeOrFail(p, st.path);
+        movie.timecode = 3600;  // recorded from 01:00:00:00
         p.media.push_back(movie);
         const MediaItem pic = probeOrFail(p, still);
         p.media.push_back(pic);
@@ -6398,6 +6399,7 @@ private slots:
         QCOMPARE(a[0].toObject().value("start").toInt(), 20);
         QVERIFY(a[0].toObject().value("file").toString().endsWith("pic-movie.mp4"));
         QCOMPARE(a[0].toObject().value("samples").toInt(), 150);
+        QCOMPARE(a[0].toObject().value("tape_tc").toInt(), 90000);  // its source's timecode, 01:00:00:00 at 25 fps
         QCOMPARE(a[1].toObject().value("op").toString(), QString("Video Dissolve"));
         QCOMPARE(a[1].toObject().value("cut").toInt(), 5);
         QCOMPARE(a[2].toObject().value("start").toInt(), 85);
@@ -6405,10 +6407,51 @@ private slots:
         QCOMPARE(b.size(), 6);
         QCOMPARE(b[0].toObject().value("type").toString(), QString("filler"));
         QCOMPARE(b[1].toObject().value("op").toString(), QString("Motion Control"));
+        QCOMPARE(b[1].toObject().value("op_id").toString(), QString("9d2ea890-0968-11d3-8a38-0050040ef7d2"));  // VideoSpeedControl
         QVERIFY(std::fabs(b[1].toObject().value("params").toObject().value("constant").toDouble() - 2) < 1e-6);
         QCOMPARE(b[1].toObject().value("inputs").toArray()[0].toObject().value("length").toInt(), 50);
         QVERIFY(b[3].toObject().value("file").toString().endsWith("still.png"));
+        QVERIFY(!b[3].toObject().contains("tape_tc"));  // a still has no timecode
         QCOMPARE(b[5].toObject().value("inputs").toArray()[0].toObject().value("length").toInt(), 10);  // slow motion: 10 frames over 20
+
+        // A 10-frame shot between two 16-frame dissolves: they may not overlap in the AAF, so each reaches only as far
+        // as the other leaves; a shot at 40% speed is fed every frame it shows; anamorphic footage keeps its shape.
+        {
+            Project q = makeDefaultProject();
+            Sequence& qs = *q.active();
+            qs.fps = {25, 1};
+            Interpretation anamorphic;
+            anamorphic.par = 2;
+            const MediaItem wide = probeOrFail(q, interpretedPath(st.path, anamorphic));
+            q.media.push_back(wide);
+            QVERIFY(edit::placeMedia(q, qs, wide.id, 0, 10, 50, {TrackKind::Video, 0}, {TrackKind::Audio, -1}, false).ok);
+            QVERIFY(edit::placeMedia(q, qs, wide.id, 40, 70, 80, {TrackKind::Video, 0}, {TrackKind::Audio, -1}, false).ok);
+            QVERIFY(edit::placeMedia(q, qs, wide.id, 50, 100, 140, {TrackKind::Video, 0}, {TrackKind::Audio, -1}, false).ok);
+            QVERIFY(edit::addTransition(q, qs, edit::clipAt(qs, {TrackKind::Video, 0}, 45)->id, edit::Edge::In, "cross_dissolve", 16).ok);
+            QVERIFY(edit::addTransition(q, qs, edit::clipAt(qs, {TrackKind::Video, 0}, 55)->id, edit::Edge::In, "cross_dissolve", 16).ok);
+            while (qs.videoTracks.size() < 2) edit::addTrack(q, qs, TrackKind::Video);
+            QVERIFY(edit::placeMedia(q, qs, wide.id, 0, 0, 41, {TrackKind::Video, 1}, {TrackKind::Audio, -1}, false).ok);
+            Clip* crawl = edit::clipById(qs, edit::clipAt(qs, {TrackKind::Video, 1}, 0)->id);
+            crawl->speed = 0.4;
+            crawl->duration = 101;
+            const std::string qaaf = path("short-shot.aaf");
+            AafExportResult qr;
+            QVERIFY2(exportAaf(q, qs, qaaf, &qr, {}, nullptr, &err), err.c_str());
+            QCOMPARE(qr.videoTransitions, 2);
+            QProcess qp;
+            qp.start(QString::fromLocal8Bit(python), {"-I", QStringLiteral(MONTAGE_TEST_TOOLS_DIR "/aaf_check.py"), QString::fromStdString(qaaf)});
+            QVERIFY(qp.waitForFinished(60000));
+            QVERIFY2(qp.exitCode() == 0, qp.readAllStandardError().constData());
+            const QJsonArray qt = QJsonDocument::fromJson(qp.readAllStandardOutput()).object().value("tracks").toArray();
+            const QJsonArray v1 = qt[0].toObject().value("components").toArray();
+            QCOMPARE(v1.size(), 5);  // shot, dissolve, short shot, dissolve, shot
+            const int t1 = v1[1].toObject().value("length").toInt(), mid = v1[2].toObject().value("length").toInt(),
+                      t2 = v1[3].toObject().value("length").toInt();
+            QVERIFY2(t1 > 0 && t2 > 0 && mid >= t1 + t2, qPrintable(QString("%1 %2 %3").arg(t1).arg(mid).arg(t2)));
+            QCOMPARE(v1[0].toObject().value("aspect").toString(), QString("8/3"));  // 320 x 240 stored, at a pixel aspect of 2
+            const QJsonArray v2 = qt[1].toObject().value("components").toArray();
+            QCOMPARE(v2[0].toObject().value("inputs").toArray()[0].toObject().value("length").toInt(), 41);  // 40.4 frames, all shown
+        }
     }
 
     void superScaleUpscaling() {

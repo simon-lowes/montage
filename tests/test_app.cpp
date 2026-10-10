@@ -1685,6 +1685,10 @@ private slots:
         QVERIFY2(summary.contains("1 audio tracks") && summary.contains("1 clips"), qPrintable(summary));
         QVERIFY(QFileInfo::exists(dir_.path() + "/turnover.aaf"));
         QVERIFY(QFileInfo::exists(dir_.path() + "/turnover Media/jfk.wav"));
+        // Sound only, from its own menu item.
+        QVERIFY(win_->findChild<QAction*>("exportAafSound"));
+        QVERIFY(win_->exportAafTo(dir_.path() + "/sound.aaf", &summary, false));
+        QVERIFY2(summary.contains("1 audio tracks") && !summary.contains("video"), qPrintable(summary));
         state()->newProject();
     }
 
