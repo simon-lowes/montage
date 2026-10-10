@@ -5852,6 +5852,36 @@ private slots:
         clipById(fx2.s(), a2)->speed = 1;
         clipById(fx2.s(), a2)->mediaId = 9999;
         QVERIFY(syncOffsets(fx2.s()).empty());
+        // Both reversed, the sound's source 5 frames off: slipped back exactly.
+        Fixture fx3;
+        auto r3 = placeMedia(fx3.p, fx3.s(), fx3.media, 30, 30, 100, V1, A1, false);
+        Clip* v3 = clipById(fx3.s(), r3.created[0]);
+        Clip* a3 = clipById(fx3.s(), r3.created[1]);
+        v3->reverse = a3->reverse = true;
+        a3->sourceIn += 5;
+        QVERIFY(std::fabs(syncOffset(fx3.s(), a3->id)) > 0.5);
+        QVERIFY(slipIntoSync(fx3.p, fx3.s(), a3->id).ok);
+        QCOMPARE(syncOffset(fx3.s(), a3->id), 0.0);
+        QCOMPARE(clipById(fx3.s(), a3->id)->sourceIn, v3->sourceIn);
+        // Half a frame (both at 200 %, one frame apart in source) is not flagged: moving cannot fix it.
+        a3->reverse = v3->reverse = false;
+        a3->speed = v3->speed = 2;
+        a3->sourceIn = v3->sourceIn + 1;
+        QCOMPARE(syncOffset(fx3.s(), a3->id), 0.0);
+        // The reference is the group's clip of the same media, not a linked cutaway that happens to come first.
+        MediaItem other = *fx3.p.findMedia(fx3.media);
+        other.id = fx3.p.newId();
+        other.name = "cutaway.mov";
+        fx3.p.media.push_back(other);
+        a3->speed = v3->speed = 1;
+        a3->sourceIn = v3->sourceIn;
+        Clip cut = makeClip(fx3.p, other, TrackKind::Video, fx3.s());
+        cut.start = 0, cut.duration = 20, cut.linkGroup = a3->linkGroup;
+        Track* top = trackAt(fx3.s(), V1);
+        top->clips.insert(top->clips.begin(), cut);  // first in the group
+        a3 = clipById(fx3.s(), r3.created[1]);
+        a3->start += 4;
+        QCOMPARE(syncOffset(fx3.s(), a3->id), 4.0);
     }
 
     void projectFileRelinksRelativePaths() {

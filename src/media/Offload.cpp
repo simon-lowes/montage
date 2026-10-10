@@ -7,6 +7,7 @@
 #include <QFileInfo>
 #include <QRegularExpression>
 #include <QSaveFile>
+#include <QStorageInfo>
 #include <QSysInfo>
 #include <QXmlStreamReader>
 #include <QXmlStreamWriter>
@@ -40,25 +41,36 @@ uint64_t round64(uint64_t acc, uint64_t input) { return rotl(acc + input * kP2, 
 uint64_t merge64(uint64_t acc, uint64_t v) { return (acc ^ round64(0, v)) * kP1 + kP4; }
 
 const char* const kToolVersion = "0.1.0";
-// Left out of offloads and of hash lists (ASC MHL's own folder, and what the operating systems leave on cards).
-const QStringList kIgnore = {".DS_Store", "._*", "Thumbs.db", ".Spotlight-V100", ".Trashes", ".fseventsd", "ascmhl", "ascmhl/"};
+// What the operating systems leave on cards: never copied, never hashed.
+const QStringList kJunk = {".DS_Store", "._*", "Thumbs.db", ".Spotlight-V100", ".Trashes", ".fseventsd"};
+// Left out of hash lists (and written as their ignore patterns): the junk, and ASC MHL's own folders at any depth.
+const QStringList kHashIgnore = kJunk + QStringList{"ascmhl", "ascmhl/"};
 const QStringList kFormats = {"c4", "md5", "sha1", "xxh128", "xxh3", "xxh64"};  // the order ASC MHL's schema wants
+
+#if defined(_WIN32) || defined(__APPLE__)
+constexpr Qt::CaseSensitivity kPathCase = Qt::CaseInsensitive;  // NTFS and APFS as usually formatted
+#else
+constexpr Qt::CaseSensitivity kPathCase = Qt::CaseSensitive;
+#endif
 
 QString now() { return QDateTime::currentDateTimeUtc().toString(QStringLiteral("yyyy-MM-ddTHH:mm:ss+00:00")); }
 QString stamp(const QDateTime& t) { return t.toUTC().toString(QStringLiteral("yyyy-MM-ddTHH:mm:ss+00:00")); }
 
 struct Ignore {
     std::vector<QRegularExpression> patterns;
-    explicit Ignore(const QStringList& extra = {}) {
-        QStringList all = kIgnore;
-        all += extra;
-        for (QString p : all) {
+    explicit Ignore(const QStringList& list) {
+        for (QString p : list) {
             if (p.endsWith('/')) p.chop(1);
             if (!p.isEmpty() && !p.contains('/')) patterns.emplace_back(QRegularExpression::wildcardToRegularExpression(p));
         }
     }
     bool matches(const QString& name) const {
         return std::any_of(patterns.begin(), patterns.end(), [&](const QRegularExpression& r) { return r.match(name).hasMatch(); });
+    }
+    // Whether any folder or file name along a relative path is ignored.
+    bool covers(const QString& path) const {
+        const QStringList parts = path.split('/', Qt::SkipEmptyParts);
+        return std::any_of(parts.begin(), parts.end(), [&](const QString& n) { return matches(n); });
     }
 };
 
@@ -69,21 +81,55 @@ struct Item {
     qint64 size = 0;
     QDateTime modified;
 };
-void walk(const QString& root, const QString& rel, const Ignore& ignore, std::vector<Item>& out) {
-    QDir d(rel.isEmpty() ? root : root + '/' + rel);
+struct Walk {
+    std::vector<Item> items;
+    QStringList unreadable;  // folders that could not be listed
+    QStringList skipped;     // links and special files, never followed or copied
+    int files() const {
+        return int(std::count_if(items.begin(), items.end(), [](const Item& i) { return !i.dir; }));
+    }
+};
+// Names as hash lists write them: NFC on macOS (whose file systems hand back decomposed names), as they are elsewhere.
+QString listName(const QString& n) {
+#if defined(__APPLE__)
+    return n.normalized(QString::NormalizationForm_C);
+#else
+    return n;
+#endif
+}
+// Everything but the junk, and but the ASC MHL folder at the top (a hash list's own history, handled apart).
+void walk(const QString& root, const QString& rel, const Ignore& junk, Walk& out) {
+    const QString here = rel.isEmpty() ? root : root + '/' + rel;
+    QDir d(here);
+    if (!QFileInfo(here).isReadable() || !d.exists()) {
+        out.unreadable << (rel.isEmpty() ? QStringLiteral(".") : rel);
+        return;
+    }
     const QFileInfoList list = d.entryInfoList(QDir::Files | QDir::Dirs | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot, QDir::Name);
     std::vector<QFileInfo> sorted(list.begin(), list.end());
     std::sort(sorted.begin(), sorted.end(), [](const QFileInfo& a, const QFileInfo& b) { return a.fileName().toUtf8() < b.fileName().toUtf8(); });
     for (const QFileInfo& fi : sorted) {
-        if (fi.isSymLink() || ignore.matches(fi.fileName())) continue;
-        const QString path = rel.isEmpty() ? fi.fileName() : rel + '/' + fi.fileName();
-        if (fi.isDir()) {
-            walk(root, path, ignore, out);
-            out.push_back({path, true, 0, fi.lastModified()});
+        if (junk.matches(fi.fileName())) continue;
+        if (rel.isEmpty() && fi.fileName() == QLatin1String("ascmhl") && fi.isDir()) continue;
+        const QString path = (rel.isEmpty() ? QString() : rel + '/') + listName(fi.fileName());
+        if (fi.isSymLink()) {
+            out.skipped << path;
+        } else if (fi.isDir()) {
+            walk(root, path, junk, out);
+            out.items.push_back({path, true, 0, fi.lastModified()});
         } else if (fi.isFile()) {
-            out.push_back({path, false, fi.size(), fi.lastModified()});
+            out.items.push_back({path, false, fi.size(), fi.lastModified()});
+        } else {
+            out.skipped << path;
         }
     }
+}
+// What a hash list of `root` covers: the walk without what its ignore patterns leave out.
+std::vector<Item> hashed(const std::vector<Item>& items, const Ignore& ignore) {
+    std::vector<Item> out;
+    for (const Item& it : items)
+        if (!ignore.covers(it.path)) out.push_back(it);
+    return out;
 }
 
 // Reads a file past the system's cache where it can (a copy is checked on the disk, not in memory).
@@ -91,6 +137,25 @@ void dropCache(QFile& f) {
 #if defined(__linux__)
     posix_fadvise(f.handle(), 0, 0, POSIX_FADV_DONTNEED);
 #elif defined(__APPLE__)
+    fcntl(f.handle(), F_NOCACHE, 1);
+#else
+    (void)f;
+#endif
+}
+
+// Everything written reaches the disk, or the failure is known: Qt's buffer, the system's and, on macOS, the drive's
+// own cache (F_FULLFSYNC). On macOS the writer also bypasses the cache, so reading the copy back reads the disk.
+bool flushToDisk(QFile& f) {
+    if (!f.flush()) return false;
+#if defined(__APPLE__)
+    if (fcntl(f.handle(), F_FULLFSYNC) != 0 && ::fsync(f.handle()) != 0) return false;
+#elif defined(__unix__)
+    if (::fsync(f.handle()) != 0) return false;
+#endif
+    return true;
+}
+void writeUncached(QFile& f) {
+#if defined(__APPLE__)
     fcntl(f.handle(), F_NOCACHE, 1);
 #else
     (void)f;
@@ -142,11 +207,23 @@ bool hashFile(const QString& path, const std::set<QString>& formats, bool uncach
     return true;
 }
 
-// The record a hash list keeps for a path: the latest generation's.
-std::map<QString, MhlEntry> latestRecords(const std::vector<MhlGeneration>& history) {
+// What a hash list holds a file to be, as ascmhl compares: for each hash format the earliest value not marked failed
+// (a later "failed" record holds the damage, not the file), with the latest size.
+std::map<QString, MhlEntry> referenceRecords(const std::vector<MhlGeneration>& history) {
     std::map<QString, MhlEntry> out;
     for (const MhlGeneration& g : history)
-        for (const MhlEntry& e : g.entries) out[e.path] = e;
+        for (const MhlEntry& e : g.entries) {
+            MhlEntry& r = out[e.path];
+            r.path = e.path;
+            if (e.size >= 0) r.size = e.size;
+            if (!e.modified.isEmpty()) r.modified = e.modified;
+            for (const MhlHash& h : e.hashes)
+                if (h.action != QLatin1String("failed") &&
+                    std::none_of(r.hashes.begin(), r.hashes.end(), [&](const MhlHash& x) { return x.format == h.format; }))
+                    r.hashes.push_back(h);
+        }
+    // A file only ever recorded as failed has no reference.
+    for (auto it = out.begin(); it != out.end();) it = it->second.hashes.empty() ? out.erase(it) : std::next(it);
     return out;
 }
 
@@ -320,7 +397,7 @@ QString writeGeneration(const QString& root, const std::vector<Item>& items, con
     contentStructure(rootContent, rootStructure);
     w.writeEndElement();
     w.writeStartElement("ignore");
-    QStringList patterns = kIgnore + historyIgnores(root);
+    QStringList patterns = kHashIgnore + historyIgnores(root);
     patterns.removeDuplicates();
     for (const QString& p : patterns) w.writeTextElement("pattern", p);
     w.writeEndElement();
@@ -521,12 +598,13 @@ std::vector<MhlGeneration> readMhlHistory(const QString& root, QString* error) {
                     const QXmlStreamAttributes a = x.attributes();
                     e.size = a.hasAttribute("size") ? a.value("size").toLongLong() : -1;
                     e.modified = a.value("lastmodificationdate").toString();
-                    e.path = x.readElementText().trimmed();
+                    e.path = x.readElementText();  // names may begin or end with spaces
                 } else if (inHash && kFormats.contains(n)) {
                     MhlHash h;
                     h.format = n;
                     h.action = x.attributes().value("action").toString();
-                    h.value = x.readElementText().trimmed().toLower();
+                    h.value = x.readElementText().trimmed();
+                    if (n != QLatin1String("c4")) h.value = h.value.toLower();  // hex; C4 IDs are base 58, case and all
                     e.hashes.push_back(h);
                 } else if (n == "creationdate") {
                     g.created = x.readElementText().trimmed();
@@ -549,10 +627,100 @@ std::vector<MhlGeneration> readMhlHistory(const QString& root, QString* error) {
     return out;
 }
 
+namespace {
+
+// A destination's path as it will be once made: its nearest existing folder resolved (links and all), the rest as given.
+QString resolvedPath(const QString& path) {
+    QString existing = QDir::cleanPath(QFileInfo(path).absoluteFilePath()), rest;
+    while (!QFileInfo::exists(existing) && existing.contains('/')) {
+        rest.prepend('/' + existing.mid(existing.lastIndexOf('/') + 1));
+        existing = existing.left(existing.lastIndexOf('/'));
+        if (existing.endsWith(':')) existing += '/';  // a Windows drive
+    }
+    QString out = QFileInfo(existing).canonicalFilePath() + rest;
+    while (out.contains(QLatin1String("//"))) out.replace(QLatin1String("//"), QLatin1String("/"));
+    return out;
+}
+bool samePath(const QString& a, const QString& b) { return QString::compare(a, b, kPathCase) == 0; }
+bool within(const QString& path, const QString& folder) {
+    const QString prefix = folder.endsWith('/') ? folder : folder + '/';
+    return samePath(path, folder) || path.startsWith(prefix, kPathCase);
+}
+
+// Whether `folder` is empty or an earlier (perhaps interrupted) copy of this card: some of the card's files there at
+// their sizes (or half written), none at another size.
+bool copyOfThisCard(const QString& folder, const std::vector<Item>& card) {
+    if (!QFileInfo(folder).isDir()) return true;
+    Walk there;
+    walk(folder, {}, Ignore(kJunk), there);
+    if (there.items.empty() && there.skipped.isEmpty()) return true;
+    int matches = 0;
+    for (const Item& it : card) {
+        if (it.dir) continue;
+        const QFileInfo f(folder + '/' + it.path);
+        if (f.isFile()) {
+            if (f.size() != it.size) return false;
+            ++matches;
+        } else if (QFileInfo::exists(folder + '/' + it.path + ".montage-part")) {
+            ++matches;
+        }
+    }
+    return matches > 0;
+}
+
+// Copies `from` to `part` (written uncached, flushed to the disk, its time carried), hashing it; false with `why`.
+// `bytes` is what was read; `stop` may cancel.
+bool copyOne(const QString& from, const QString& part, const QDateTime& modified, std::map<QString, QString>& hashes,
+             const std::set<QString>& formats, qint64& bytes, QString& why, const std::function<bool(qint64)>& tick) {
+    QFile in(from), out(part);
+    if (!in.open(QIODevice::ReadOnly)) {
+        why = QStringLiteral("cannot be read from the card");
+        return false;
+    }
+    if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Unbuffered)) {
+        why = QStringLiteral("cannot be written");
+        return false;
+    }
+    writeUncached(out);
+    Hasher h(formats);
+    QByteArray buf(int(kChunk), Qt::Uninitialized);
+    bytes = 0;
+    for (;;) {
+        const qint64 got = in.read(buf.data(), kChunk);
+        if (got < 0) {
+            why = QStringLiteral("cannot be read from the card");
+            return false;
+        }
+        if (got == 0) break;
+        h.add(buf.constData(), got);
+        if (out.write(buf.constData(), got) != got) {
+            why = QStringLiteral("writing failed (is the drive full?)");
+            return false;
+        }
+        bytes += got;
+        if (tick && !tick(got)) {
+            why = QStringLiteral("cancelled");
+            return false;
+        }
+    }
+    const bool flushed = flushToDisk(out);
+    out.setFileTime(modified, QFileDevice::FileModificationTime);
+    out.close();
+    if (!flushed || out.error() != QFileDevice::NoError || QFileInfo(part).size() != bytes) {
+        why = QStringLiteral("writing failed (is the drive full?)");
+        return false;
+    }
+    hashes = h.result();
+    return true;
+}
+
+}  // namespace
+
 OffloadResult offloadCard(const QString& source, const QStringList& destinations, const OffloadSettings& settings,
                           const std::function<bool(double, const QString&)>& progress) {
     OffloadResult res;
-    const QFileInfo card(source);
+    const QString src = QDir::cleanPath(QFileInfo(source).absoluteFilePath());
+    const QFileInfo card(src);
     if (!card.isDir()) {
         res.error = QStringLiteral("%1 is not a folder").arg(source);
         return res;
@@ -561,54 +729,99 @@ OffloadResult offloadCard(const QString& source, const QStringList& destinations
         res.error = QStringLiteral("Choose where to copy the card");
         return res;
     }
-    const QString name = card.fileName().isEmpty() ? QStringLiteral("Card") : card.fileName();
+    // The copy's name: the card's folder, or for a drive's root its volume label.
+    QString name = card.fileName();
+    if (name.isEmpty()) {
+        const QStorageInfo volume(src);
+        name = volume.displayName();
+        if (name.isEmpty() || name.contains('/') || name.contains('\\') || name.contains(':')) name = volume.name();
+        if (name.isEmpty() || name.contains('/') || name.contains('\\') || name.contains(':')) name = QStringLiteral("Card");
+    }
     const QString cardPath = card.canonicalFilePath();
-    // Every destination checked before anything is made (nothing is ever written to the card).
+    // Every destination checked before anything is made: never on the card, never the card itself, never twice.
+    QStringList resolved;
     for (const QString& d : destinations) {
-        // The destination's nearest existing folder, resolved, with the rest of its path after it.
-        QString existing = QDir::cleanPath(QFileInfo(d).absoluteFilePath()), rest;
-        while (!QFileInfo::exists(existing) && existing.contains('/')) {
-            rest.prepend('/' + existing.mid(existing.lastIndexOf('/') + 1));
-            existing = existing.left(existing.lastIndexOf('/'));
-        }
-        const QString resolved = QFileInfo(existing).canonicalFilePath() + rest;
-        if (resolved == cardPath || resolved.startsWith(cardPath + '/')) {
+        const QString r = resolvedPath(d), copy = r + '/' + name;
+        if (within(r, cardPath)) {
             res.error = QStringLiteral("%1 is on the card itself").arg(d);
             return res;
         }
-        const QString copy = QDir(d).absoluteFilePath(name);
-        if (res.copies.contains(copy)) {
-            res.error = QStringLiteral("%1 is named twice").arg(d);
+        if (within(cardPath, copy)) {
+            res.error = QStringLiteral("Copying into %1 would write onto the card itself").arg(d);
             return res;
         }
-        res.copies << copy;
+        for (const QString& other : resolved)
+            if (samePath(other, r)) {
+                res.error = QStringLiteral("%1 is named twice").arg(d);
+                return res;
+            }
+        resolved << r;
     }
-    for (const QString& d : destinations)
-        if (!QDir().mkpath(d)) {
-            res.error = QStringLiteral("Cannot use %1").arg(d);
-            return res;
-        }
 
     // What the card holds, and what its hash list says it should.
+    Walk cw;
+    walk(src, {}, Ignore(kJunk), cw);
+    for (const QString& f : cw.unreadable) res.issues.push_back({f, QStringLiteral("This folder cannot be read (check its permissions); nothing in it was copied")});
+    for (const QString& f : cw.skipped) res.issues.push_back({f, QStringLiteral("A link or special file: not copied")});
+    res.files = cw.files();
+    if (res.files == 0) {
+        res.error = cw.unreadable.isEmpty() ? QStringLiteral("%1 holds no files").arg(source) : QStringLiteral("%1 cannot be read").arg(source);
+        return res;
+    }
     QString historyError;
-    const std::vector<MhlGeneration> cardHistory = readMhlHistory(source, &historyError);
+    const std::vector<MhlGeneration> cardHistory = readMhlHistory(src, &historyError);
     if (!historyError.isEmpty()) {
         res.error = historyError;
         return res;
     }
-    const std::map<QString, MhlEntry> cardRecords = latestRecords(cardHistory);
-    std::vector<Item> items;
-    walk(source, {}, Ignore(historyIgnores(source)), items);
+    const std::map<QString, MhlEntry> cardRecords = referenceRecords(cardHistory);
+    const Ignore cardIgnore(kHashIgnore + historyIgnores(src));
     qint64 total = 0;
     std::set<QString> onCard;
-    for (const Item& it : items)
+    for (const Item& it : cw.items)
         if (!it.dir) {
             total += it.size;
-            ++res.files;
             onCard.insert(it.path);
         }
     res.bytes = total;
+    for (const auto& [path, rec] : cardRecords)
+        if (!onCard.count(path) && !cardIgnore.covers(path))
+            res.issues.push_back({path, QStringLiteral("In the card's hash list but not on the card")});
+
+    // Where each copy goes: <destination>/<name>, or "<name> 2"... when that folder holds another card.
+    for (const QString& d : destinations) {
+        if (!QDir().mkpath(d)) {
+            res.error = QStringLiteral("Cannot use %1").arg(d);
+            return res;
+        }
+        const QString base = QDir(d).absoluteFilePath(name);
+        QString copy = base;
+        for (int n = 2; !copyOfThisCard(copy, cw.items); ++n) copy = base + QStringLiteral(" %1").arg(n);
+        if (!QDir().mkpath(copy)) {
+            res.error = QStringLiteral("Cannot make %1").arg(copy);
+            return res;
+        }
+        res.copies << copy;
+    }
     const int n = int(res.copies.size());
+    // Each copy's history: its own when it has one (an offload resumed), else the card's (carried over at the end, so a
+    // stopped offload leaves none). A history that cannot be read is left alone, and no generation is added to it.
+    std::vector<std::map<QString, MhlEntry>> known(static_cast<size_t>(n));
+    std::vector<char> carry(static_cast<size_t>(n), 0), noList(static_cast<size_t>(n), 0);
+    for (int k = 0; k < n; ++k) {
+        QString err;
+        const std::vector<MhlGeneration> own = readMhlHistory(res.copies[k], &err);
+        if (!err.isEmpty()) {
+            res.issues.push_back({QString(), QStringLiteral("%1: %2; no hash list was added to it").arg(res.copies[k], err)});
+            noList[size_t(k)] = 1;
+        } else if (!own.empty()) {
+            known[size_t(k)] = referenceRecords(own);
+        } else if (!cardHistory.empty()) {
+            known[size_t(k)] = cardRecords;
+            carry[size_t(k)] = 1;
+        }
+    }
+
     const double work = double(std::max<qint64>(1, total)) * (1 + (settings.verify ? n : 0));
     double done = 0;
     QString current;
@@ -616,31 +829,9 @@ OffloadResult offloadCard(const QString& source, const QStringList& destinations
         done += double(bytes);
         return !progress || progress(std::min(1.0, done / work), current);
     };
-    for (const auto& [path, rec] : cardRecords)
-        if (!onCard.count(path)) res.issues.push_back({path, QStringLiteral("In the card's hash list but not on the card")});
-
-    // Each copy's history: its own when it has one (an offload resumed), else the card's (carried over at the end, so
-    // a stopped offload leaves none).
-    std::vector<std::map<QString, MhlEntry>> known(static_cast<size_t>(n));
-    std::vector<char> carry(static_cast<size_t>(n), 0);
-    for (int k = 0; k < n; ++k) {
-        const QString copy = res.copies[k];
-        if (!QDir().mkpath(copy)) {
-            res.error = QStringLiteral("Cannot make %1").arg(copy);
-            return res;
-        }
-        const std::vector<MhlGeneration> own = readMhlHistory(copy);
-        if (!own.empty()) {
-            known[size_t(k)] = latestRecords(own);
-        } else if (!cardHistory.empty()) {
-            known[size_t(k)] = cardRecords;
-            carry[size_t(k)] = 1;
-        }
-    }
-
     std::vector<std::map<QString, Record>> records(static_cast<size_t>(n));
     QByteArray buf(int(kChunk), Qt::Uninitialized);
-    for (const Item& it : items) {
+    for (const Item& it : cw.items) {
         if (it.dir) {
             for (const QString& copy : res.copies) QDir().mkpath(copy + '/' + it.path);
             continue;
@@ -663,17 +854,19 @@ OffloadResult offloadCard(const QString& source, const QStringList& destinations
         for (int k = 0; k < n; ++k) {
             Target& t = targets[size_t(k)];
             t.path = res.copies[k] + '/' + it.path;
+            t.part = t.path + ".montage-part";
             if (QFileInfo::exists(t.path)) {
                 t.existing = true;
                 continue;
             }
             QDir().mkpath(QFileInfo(t.path).absolutePath());
-            t.part = t.path + ".montage-part";
             t.file = std::make_unique<QFile>(t.part);
-            if (!t.file->open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            if (!t.file->open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Unbuffered)) {
                 res.issues.push_back({it.path, QStringLiteral("Cannot write to %1").arg(res.copies[k])});
                 t.failed = true;
                 t.file.reset();
+            } else {
+                writeUncached(*t.file);
             }
         }
         auto abandon = [&] {
@@ -681,9 +874,15 @@ OffloadResult offloadCard(const QString& source, const QStringList& destinations
                 if (t.file) {
                     t.file->close();
                     QFile::remove(t.part);
+                    t.file.reset();
                 }
         };
-        QFile in(source + '/' + it.path);
+        auto cancelled = [&] {
+            abandon();
+            res.error = QStringLiteral("Cancelled");
+            return res;
+        };
+        QFile in(src + '/' + it.path);
         if (!in.open(QIODevice::ReadOnly)) {
             res.issues.push_back({it.path, QStringLiteral("Cannot be read from the card")});
             abandon();
@@ -691,6 +890,7 @@ OffloadResult offloadCard(const QString& source, const QStringList& destinations
         }
         Hasher h(formats);
         bool readOk = true;
+        qint64 read = 0;
         for (;;) {
             const qint64 got = in.read(buf.data(), kChunk);
             if (got < 0) {
@@ -699,6 +899,7 @@ OffloadResult offloadCard(const QString& source, const QStringList& destinations
             }
             if (got == 0) break;
             h.add(buf.constData(), got);
+            read += got;
             for (int k = 0; k < n; ++k) {
                 Target& t = targets[size_t(k)];
                 if (t.file && t.file->write(buf.constData(), got) != got) {
@@ -709,11 +910,7 @@ OffloadResult offloadCard(const QString& source, const QStringList& destinations
                     t.failed = true;
                 }
             }
-            if (!tick(got)) {
-                abandon();
-                res.error = QStringLiteral("Cancelled");
-                return res;
-            }
+            if (!tick(got)) return cancelled();
         }
         if (!readOk) {
             res.issues.push_back({it.path, QStringLiteral("Cannot be read from the card")});
@@ -722,53 +919,81 @@ OffloadResult offloadCard(const QString& source, const QStringList& destinations
         }
         const std::map<QString, QString> hashes = h.result();
         const QString xxh = hashes.at("xxh64");
+        if (read != it.size)
+            res.issues.push_back({it.path, QStringLiteral("Changed size while it was copied (%1 bytes, then %2)").arg(it.size).arg(read)});
         // Changed on the card since its hash list was made?
         bool cardChanged = false;
-        if (cardRecord)
+        if (cardRecord) {
             if (const MhlHash* rec = checkable(*cardRecord); rec && hashes.count(rec->format) && hashes.at(rec->format) != rec->value) {
                 cardChanged = true;
                 res.issues.push_back({it.path, QStringLiteral("Differs from the card's hash list (changed since it was hashed)")});
+            } else if (!rec) {
+                res.notes << QStringLiteral("%1: the card's hash list records it only in a hash Montage does not compute (xxh3, xxh128)").arg(it.path);
             }
+        }
         for (int k = 0; k < n; ++k) {
             Target& t = targets[size_t(k)];
             if (t.failed) continue;
+            bool wrote = false;
             if (t.file) {
-                t.file->flush();
-#if defined(__unix__) || defined(__APPLE__)
-                if (settings.verify) ::fsync(t.file->handle());
-#endif
+                const bool flushed = flushToDisk(*t.file);
                 t.file->setFileTime(it.modified, QFileDevice::FileModificationTime);
                 t.file->close();
-                QFile::remove(t.path);
-                if (!QFile::rename(t.part, t.path)) {
-                    res.issues.push_back({it.path, QStringLiteral("Cannot finish the copy in %1").arg(res.copies[k])});
+                const bool good = flushed && t.file->error() == QFileDevice::NoError && QFileInfo(t.part).size() == read;
+                t.file.reset();
+                if (!good || !QFile::rename(t.part, t.path)) {
+                    res.issues.push_back({it.path, QStringLiteral("Writing to %1 failed (is it full?)").arg(res.copies[k])});
                     QFile::remove(t.part);
                     continue;
                 }
+                wrote = true;
             }
             // Read back (what was already there always is).
             if (t.existing || settings.verify) {
                 std::map<QString, QString> back;
                 if (!hashFile(t.path, {"xxh64"}, true, back, [&](qint64 b) { return t.existing || tick(b); })) {
-                    if (progress && !progress(std::min(1.0, done / work), current)) {
-                        res.error = QStringLiteral("Cancelled");
-                        return res;
-                    }
+                    if (progress && !progress(std::min(1.0, done / work), current)) return cancelled();
                     res.issues.push_back({it.path, QStringLiteral("Cannot read the copy in %1 back").arg(res.copies[k])});
+                    if (wrote) QFile::remove(t.path);  // never leave a copy that may be bad under its name
                     continue;
                 }
-                if (back.at("xxh64") != xxh) {
-                    res.issues.push_back({it.path, t.existing ? QStringLiteral("A different file is already in %1; left as it was").arg(res.copies[k])
-                                                              : QStringLiteral("The copy in %1 does not match the card").arg(res.copies[k])});
+                if (back.at("xxh64") != xxh && t.existing) {
+                    // Already there but different: a damaged earlier copy of this file (its own hash list says the
+                    // card's content belongs here) is copied again; anything else is left alone.
+                    const auto rec = known[size_t(k)].find(it.path);
+                    const MhlHash* mine = rec == known[size_t(k)].end() ? nullptr : checkable(rec->second);
+                    if (!mine || mine->format != QLatin1String("xxh64") || mine->value != xxh) {
+                        res.issues.push_back({it.path, QStringLiteral("A different file is already in %1; left as it was").arg(res.copies[k])});
+                        continue;
+                    }
+                    std::map<QString, QString> again;
+                    qint64 bytes = 0;
+                    QString why;
+                    if (!copyOne(src + '/' + it.path, t.part, it.modified, again, {"xxh64"}, bytes, why, {}) || again.at("xxh64") != xxh ||
+                        !QFile::remove(t.path) || !QFile::rename(t.part, t.path)) {
+                        QFile::remove(t.part);
+                        res.issues.push_back({it.path, QStringLiteral("A damaged copy in %1 could not be replaced (%2)").arg(res.copies[k], why.isEmpty() ? QStringLiteral("it changed") : why)});
+                        continue;
+                    }
+                    std::map<QString, QString> check;
+                    if (!hashFile(t.path, {"xxh64"}, true, check, {}) || check.at("xxh64") != xxh) {
+                        QFile::remove(t.path);
+                        res.issues.push_back({it.path, QStringLiteral("The copy in %1 does not match the card; it was removed").arg(res.copies[k])});
+                        continue;
+                    }
+                    res.notes << QStringLiteral("%1: a damaged copy in %2 was replaced").arg(it.path, res.copies[k]);
+                } else if (back.at("xxh64") != xxh) {
+                    QFile::remove(t.path);
+                    res.issues.push_back({it.path, QStringLiteral("The copy in %1 does not match the card; it was removed").arg(res.copies[k])});
                     continue;
-                }
-                if (t.existing) {
+                } else if (t.existing) {
                     ++res.alreadyThere;
                     if (settings.verify) tick(it.size);  // counted as if read back
                 }
             }
+            if (cardIgnore.covers(it.path)) continue;  // copied, but left out of hash lists
             // How this copy's hash list records it: against what the list knew, XXH64 always.
-            Record r{it.path, it.size, QFileInfo(t.path).lastModified(), {}};
+            Record r{it.path, read, QFileInfo(t.path).lastModified(), {}};
             const auto e = known[size_t(k)].find(it.path);
             const MhlHash* prior = e == known[size_t(k)].end() ? nullptr : checkable(e->second);
             if (prior && prior->format != "xxh64")
@@ -780,27 +1005,31 @@ OffloadResult offloadCard(const QString& source, const QStringList& destinations
             records[size_t(k)][it.path] = r;
         }
     }
-    if (settings.mhl)
-        for (int k = 0; k < n; ++k) {
-            const QString copy = res.copies[k];
-            if (carry[size_t(k)]) {
-                QDir().mkpath(copy + "/ascmhl");
-                bool copied = true;
-                for (const QString& f : QDir(source + "/ascmhl").entryList(QDir::Files)) {
-                    QFile::remove(copy + "/ascmhl/" + f);
-                    copied = QFile::copy(source + "/ascmhl/" + f, copy + "/ascmhl/" + f) && copied;
-                }
-                if (!copied) {
-                    res.issues.push_back({QString(), QStringLiteral("Cannot copy the card's hash list to %1").arg(copy)});
-                    continue;
-                }
+    for (int k = 0; k < n; ++k) {
+        const QString copy = res.copies[k];
+        if (noList[size_t(k)]) continue;
+        // The card's history goes with the copy (whether or not a generation is added).
+        if (carry[size_t(k)]) {
+            QDir().mkpath(copy + "/ascmhl");
+            bool copied = true;
+            for (const QString& f : QDir(src + "/ascmhl").entryList(QDir::Files)) {
+                QFile::remove(copy + "/ascmhl/" + f);
+                copied = QFile::copy(src + "/ascmhl/" + f, copy + "/ascmhl/" + f) && copied;
             }
-            std::vector<Item> copyItems;
-            walk(res.copies[k], {}, Ignore(historyIgnores(res.copies[k])), copyItems);
-            QString err;
-            if (writeGeneration(res.copies[k], copyItems, records[size_t(k)], QStringLiteral("transfer"), settings, &err).isEmpty())
-                res.issues.push_back({QString(), err});
+            if (!copied) {
+                res.issues.push_back({QString(), QStringLiteral("Cannot copy the card's hash list to %1").arg(copy)});
+                continue;
+            }
         }
+        if (!settings.mhl) continue;
+        Walk there;
+        walk(copy, {}, Ignore(kJunk), there);
+        QString err;
+        if (writeGeneration(copy, hashed(there.items, Ignore(kHashIgnore + historyIgnores(copy))), records[size_t(k)], QStringLiteral("transfer"),
+                            settings, &err)
+                .isEmpty())
+            res.issues.push_back({QString(), err});
+    }
     if (progress) progress(1.0, QString());
     res.ok = res.issues.empty();
     return res;
@@ -819,9 +1048,12 @@ MhlVerifyResult verifyMhl(const QString& root, bool writeGeneration_, const Offl
         res.error = QStringLiteral("%1 has no ASC MHL history (an ascmhl folder)").arg(root);
         return res;
     }
-    const std::map<QString, MhlEntry> recorded = latestRecords(history);
-    std::vector<Item> items;
-    walk(root, {}, Ignore(historyIgnores(root)), items);
+    const std::map<QString, MhlEntry> recorded = referenceRecords(history);
+    const Ignore ignore(kHashIgnore + historyIgnores(root));
+    Walk w;
+    walk(root, {}, Ignore(kJunk), w);
+    for (const QString& f : w.unreadable) res.missing << f + QStringLiteral(" (cannot be read)");
+    const std::vector<Item> items = hashed(w.items, ignore);
     std::set<QString> present;
     qint64 total = 0;
     for (const Item& it : items)
@@ -830,7 +1062,7 @@ MhlVerifyResult verifyMhl(const QString& root, bool writeGeneration_, const Offl
             total += it.size;
         }
     for (const auto& [path, e] : recorded)
-        if (!present.count(path)) res.missing << path;
+        if (!present.count(path) && !ignore.covers(path)) res.missing << path;
     double done = 0;
     std::map<QString, Record> records;
     for (const Item& it : items) {
@@ -850,13 +1082,15 @@ MhlVerifyResult verifyMhl(const QString& root, bool writeGeneration_, const Offl
             res.changed << it.path;  // unreadable counts as not matching
             continue;
         }
-        Record r{it.path, it.size, it.modified, {}};
         const MhlHash* check = rec ? checkable(*rec) : nullptr;
+        if (rec && !check) {
+            res.unchecked << it.path;  // and not recorded: an unchecked hash must never become the reference
+            continue;
+        }
+        Record r{it.path, it.size, it.modified, {}};
         QString xxhAction = QStringLiteral("original");
         if (!rec) {
             res.added << it.path;
-        } else if (!check) {
-            res.unchecked << it.path;
         } else {
             const bool same = hashes.at(check->format) == check->value;
             if (same) ++res.verified;
@@ -867,7 +1101,8 @@ MhlVerifyResult verifyMhl(const QString& root, bool writeGeneration_, const Offl
         r.hashes.push_back({"xxh64", hashes.at("xxh64"), xxhAction});
         records[it.path] = r;
     }
-    res.ok = res.missing.isEmpty() && res.changed.isEmpty();
+    // Nothing checkable is not a pass.
+    res.ok = res.missing.isEmpty() && res.changed.isEmpty() && (res.verified > 0 || res.unchecked.isEmpty());
     if (writeGeneration_) {
         res.generation = writeGeneration(root, items, records, QStringLiteral("in-place"), settings, &res.error);
         if (res.generation.isEmpty()) res.ok = false;

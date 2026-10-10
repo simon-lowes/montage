@@ -76,17 +76,24 @@ struct OffloadResult {
     qint64 bytes = 0;
     int alreadyThere = 0;  // files a destination already had, identical (counted once per destination)
     std::vector<OffloadIssue> issues;
+    QStringList notes;  // worth knowing, not failures (a damaged earlier copy replaced, a hash Montage cannot check)
 };
 
-// Copies the folder `source` (a camera card, or any folder) into each of `destinations` as <destination>/<its name>,
-// reading each file once and writing it to every destination while hashing it (XXH64), carrying modification times.
-// A file a destination already has is hashed: identical, it is kept (an interrupted offload resumes); different, it
-// is reported and left alone. With `verify`, each copy is read back (past the system's cache where it can) and
-// compared. A card with an ASC MHL history is checked against it (a file changed since it was hashed, or gone, is
-// reported) and the history goes with each copy. With `mhl`, each copy gets a generation (process "transfer")
-// recording every file that arrived intact: verified when the history knew it, else original. Junk the operating
-// systems leave (.DS_Store, ._ files, Thumbs.db, .Spotlight-V100, .Trashes, .fseventsd) is not copied. `progress`
-// hears the fraction done and the file at hand, and may return false to stop.
+// Copies the folder `source` (a camera card, or any folder) into each of `destinations` as <destination>/<its name>
+// (a drive's root by its volume label; "<name> 2"... when that folder holds another card), reading each file once and
+// writing it to every destination while hashing it (XXH64), carrying modification times. Nothing is ever written to
+// the card; a destination on it, one that would make the copy the card, or one named twice is refused before anything
+// is made. Every write is checked down to the disk (sizes, flushes, fsync; F_FULLFSYNC on macOS). A file a destination
+// already has is hashed: identical, it is kept (an interrupted offload resumes); a damaged earlier copy (its own hash
+// list says the card's file belongs there) is copied again; anything else is reported and left alone. With `verify`,
+// each copy is read back (past the system's cache on Linux and macOS) and compared; a copy that does not match is
+// removed. A card with an ASC MHL history is checked against it (against each file's earliest good record, as ascmhl
+// does: a file changed since it was hashed, or gone, is reported) and the history goes with each copy. With `mhl`, each
+// copy gets a generation (process "transfer") recording every file that arrived intact: verified when the history knew
+// it, else original. Folders that cannot be read, links and special files are reported, never passed over silently,
+// and a card with no files is an error. Junk the operating systems leave (.DS_Store, ._ files, Thumbs.db,
+// .Spotlight-V100, .Trashes, .fseventsd) is not copied. `progress` hears the fraction done and the file at hand, and
+// may return false to stop (the file in hand is removed; no hash list is written).
 OffloadResult offloadCard(const QString& source, const QStringList& destinations, const OffloadSettings& settings = {},
                           const std::function<bool(double, const QString&)>& progress = {});
 
@@ -95,11 +102,12 @@ struct MhlVerifyResult {
     QString error;
     int verified = 0;
     QStringList missing, changed, added;
-    QStringList unchecked;  // recorded only in a hash Montage does not compute (xxh3, xxh128)
+    QStringList unchecked;  // recorded only in a hash Montage does not compute (xxh3, xxh128); never recorded anew
     QString generation;     // the generation written, if one was
 };
-// Checks `root` against its ASC MHL history: the latest record of each file is compared with the file as it is now
-// (missing, changed), and files the history does not know are listed as added. With `writeGeneration`, a generation
+// Checks `root` against its ASC MHL history: each file is compared, in the best hash Montage computes, with its earliest
+// record not marked failed (as ascmhl does, so a damaged file recorded as failed never becomes the reference), and
+// files the history does not know are listed as added. A history whose files Montage can check none of is not a pass. With `writeGeneration`, a generation
 // (process "in-place") records every file as verified, failed or original; a folder without a history gets its
 // first generation that way (with no history and no generation it is an error).
 MhlVerifyResult verifyMhl(const QString& root, bool writeGeneration, const OffloadSettings& settings = {},

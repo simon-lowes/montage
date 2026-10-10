@@ -288,8 +288,9 @@ Result finalizeAudition(Project& p, Sequence& s, Id clipId);     // keeps the pi
 
 // Sync (Premiere's out-of-sync indicators, Avid's sync-break numbers): a linked clip playing the same media as its
 // link group's picture (its first video clip; with none, its first clip) is out of sync when it starts somewhere other
-// than where the picture shows the same moment: `frames` later (negative: earlier), at least half a frame either way.
-// Clips of other media in the group (merged dual-system sound) are not compared.
+// than where the picture shows the same moment: `frames` later (negative: earlier), more than half a frame either way.
+// The reference is the group's first video clip of the same media (else its first such sound clip); clips of other
+// media in the group (merged dual-system sound, a linked cutaway) are not compared.
 struct SyncOffset {
     Id clip = 0, anchor = 0;
     double frames = 0;

@@ -861,17 +861,15 @@ Result slip(Project& p, Sequence& s, Id clipId, FrameTime delta) {
 }
 
 namespace {
-// The clip a linked clip is kept in sync with: its group's first video clip, else its first clip.
+// The clip a linked clip is kept in sync with: the first video clip of its group playing the same media, else the
+// first such sound clip (a linked cutaway or a merged clip's other camera is never the reference).
 const Clip* syncAnchor(const Sequence& s, const Clip& c) {
-    if (!c.linkGroup) return nullptr;
-    const Clip* first = nullptr;
-    for (const Track& t : s.videoTracks)
-        for (const Clip& o : t.clips)
-            if (o.linkGroup == c.linkGroup) return &o;
-    for (const Track& t : s.audioTracks)
-        for (const Clip& o : t.clips)
-            if (o.linkGroup == c.linkGroup && !first) first = &o;
-    return first;
+    if (!c.linkGroup || !c.mediaId || c.isGenerator()) return nullptr;
+    for (const auto* tracks : {&s.videoTracks, &s.audioTracks})
+        for (const Track& t : *tracks)
+            for (const Clip& o : t.clips)
+                if (o.linkGroup == c.linkGroup && o.mediaId == c.mediaId && !o.isGenerator()) return &o;
+    return nullptr;
 }
 
 // How far `c` starts from where `anchor` shows the moment `c` begins with (timeline frames; positive: later).
@@ -890,7 +888,7 @@ std::vector<SyncOffset> syncOffsets(const Sequence& s) {
         for (const Clip& c : trackAt(s, r)->clips) {
             const Clip* a = syncAnchor(s, c);
             if (!a) continue;
-            if (const auto off = offsetFrom(*a, c); off && std::fabs(*off) >= 0.5) out.push_back({c.id, a->id, *off});
+            if (const auto off = offsetFrom(*a, c); off && std::fabs(*off) > 0.5 + 1e-9) out.push_back({c.id, a->id, *off});
         }
     return out;
 }
@@ -900,7 +898,7 @@ double syncOffset(const Sequence& s, Id clipId) {
     const Clip* a = c ? syncAnchor(s, *c) : nullptr;
     if (!a) return 0;
     const auto off = offsetFrom(*a, *c);
-    return off && std::fabs(*off) >= 0.5 ? *off : 0;
+    return off && std::fabs(*off) > 0.5 + 1e-9 ? *off : 0;
 }
 
 Result moveIntoSync(Project& p, Sequence& s, Id clipId) {
@@ -918,12 +916,14 @@ Result slipIntoSync(Project& p, Sequence& s, Id clipId) {
     Clip* c = clipById(s, clipId);
     const Clip* a = syncAnchor(s, *c);
     if (trackAt(s, locate(s, clipId)->track)->locked) return Result::fail("Track is locked");
-    // What the picture shows where this clip starts is what it should start with.
-    const double in = a->sourceAt(double(c->start - a->start));
+    // What the picture shows where this clip starts is what it should start with (for a reversed clip its head is the
+    // top of its source span, so the span moves by the difference).
+    const double want = a->sourceAt(double(c->start - a->start));
+    const double in = c->sourceIn + (want - c->sourceAt(0));
     const FrameTime limit = sourceLimit(p, s, *c);
-    if (in < 0 || (limit < kInfiniteFrames && in + c->sourceExtent() > double(limit) + 1e-6))
+    if (in < -1e-6 || (limit < kInfiniteFrames && in + c->sourceExtent() > double(limit) + 1e-6))
         return Result::fail("There is not enough media to slip it into sync: move it instead");
-    c->sourceIn = in;
+    c->sourceIn = std::max(0.0, in);
     return {};
 }
 

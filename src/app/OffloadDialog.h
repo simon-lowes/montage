@@ -12,6 +12,7 @@ class QLabel;
 class QLineEdit;
 class QListWidget;
 class QPlainTextEdit;
+class QPushButton;
 
 namespace montage {
 
@@ -38,7 +39,9 @@ private:
     QCheckBox* import_;
     QLineEdit* author_;
     QPlainTextEdit* report_;
+    QPushButton* start_ = nullptr;
     QString reportText_;
+    bool running_ = false;
 };
 
 // Checks `folder` against its ASC MHL history (optionally adding a generation) with a progress dialog; the report is a

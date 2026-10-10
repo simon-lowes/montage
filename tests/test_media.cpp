@@ -4247,6 +4247,9 @@ private slots:
             for (const MhlEntry& e : h[1].entries)
                 QCOMPARE(e.hashes.back().action, QString(e.path == "CLIPS/C002.mov" ? "failed" : "verified"));
         }
+        // The damage recorded as failed never becomes the reference: checked again, it is still changed.
+        v = verifyMhl(root + "/raid/A001", false);
+        QVERIFY(!v.ok && v.changed == QStringList{"CLIPS/C002.mov"});
         // A file gone and one added are both reported.
         QVERIFY(QFile::remove(root + "/shuttle/A001/card.xml"));
         put(root + "/shuttle/A001/notes.txt", "notes");
@@ -4265,12 +4268,28 @@ private slots:
             QCOMPARE(h[1].entries.size(), size_t(4));
             for (const MhlEntry& e : h[1].entries) QCOMPARE(e.hashes.back().action, QString("verified"));
         }
-        // A different file already at the destination is reported and left alone.
+        // A damaged earlier copy (its hash list says the card's file belongs there) is copied again.
+        {
+            QByteArray b = read(root + "/shuttle/A001/CLIPS/C002.mov");
+            b[7] = 'q';
+            put(root + "/shuttle/A001/CLIPS/C002.mov", b);
+        }
+        r = offloadCard(card, {root + "/shuttle"}, os);
+        QVERIFY2(r.ok && r.notes.size() == 1 && r.notes[0].contains("replaced"), qPrintable(issues(r) + r.notes.join(";")));
+        QCOMPARE(read(root + "/shuttle/A001/CLIPS/C002.mov"), QByteArray(1000, 'x'));
+        // A different file of the same size, which no hash list vouches for, is reported and left alone.
         QVERIFY(QDir().mkpath(root + "/clash/A001"));
-        put(root + "/clash/A001/card.xml", "other");
+        put(root + "/clash/A001/card.xml", "<card id=\"B999\"/>\n");
         r = offloadCard(card, {root + "/clash"}, os);
-        QVERIFY(!r.ok && r.issues.size() == 1 && r.issues[0].path == "card.xml");
-        QCOMPARE(read(root + "/clash/A001/card.xml"), QByteArray("other"));
+        QVERIFY2(!r.ok && r.issues.size() == 1 && r.issues[0].path == "card.xml", qPrintable(issues(r)));
+        QCOMPARE(read(root + "/clash/A001/card.xml"), QByteArray("<card id=\"B999\"/>\n"));
+        // Another card of the same name goes beside the first copy, not into it.
+        QVERIFY(QDir().mkpath(root + "/other/A001"));
+        put(root + "/other/A001/card.xml", "<card id=\"A001\" reel=\"2\"/>\n");
+        r = offloadCard(root + "/other/A001", {root + "/shuttle"}, os);
+        QVERIFY2(r.ok, qPrintable(issues(r)));
+        QCOMPARE(r.copies, QStringList{root + "/shuttle/A001 2"});
+        QCOMPARE(read(root + "/shuttle/A001/card.xml"), QByteArray("<card id=\"A001\"/>\n"));
 
         // A card with its own hash list: checked against it, the list carried to the copy, changes on the card caught.
         v = verifyMhl(card, true, os);
@@ -4290,10 +4309,34 @@ private slots:
         }
         r = offloadCard(card, {root + "/archive2"}, os);
         QVERIFY(!r.ok && r.issues.size() == 1 && r.issues[0].path == "CLIPS/C002.mov");
-        // Refused onto the card itself; stopping leaves no half-written file or hash list.
+        // Refused onto the card itself, into its parent (the copy would be the card), or to one folder twice; nothing is made.
         r = offloadCard(card, {card + "/backup/day1"}, os);
         QVERIFY(!r.ok && !r.error.isEmpty());
         QVERIFY(!QFileInfo::exists(card + "/backup"));  // nothing made on the card
+        r = offloadCard(card, {root}, os);
+        QVERIFY(!r.ok && r.error.contains("onto the card"));
+        r = offloadCard(card, {root + "/twice", root + "/twice/../twice/"}, os);
+        QVERIFY(!r.ok && r.error.contains("twice") && !QFileInfo::exists(root + "/twice"));
+        // A link is reported, never followed; a card with no files is an error, not a success.
+        QVERIFY(QDir().mkpath(root + "/linked/L001"));
+        put(root + "/linked/L001/real.wav", "data");
+        QVERIFY(QFile::link(root + "/linked/L001/real.wav", root + "/linked/L001/alias.wav"));
+        r = offloadCard(root + "/linked/L001", {root + "/linkcopy"}, os);
+        QVERIFY(!r.ok && r.issues.size() == 1 && r.issues[0].path == "alias.wav");
+        QVERIFY(QFileInfo::exists(root + "/linkcopy/L001/real.wav") && !QFileInfo::exists(root + "/linkcopy/L001/alias.wav"));
+        QVERIFY(QDir().mkpath(root + "/blank/E001/DCIM"));
+        r = offloadCard(root + "/blank/E001", {root + "/blankcopy"}, os);
+        QVERIFY(!r.ok && r.error.contains("no files"));
+        // Without a new hash list the card's own still goes with the copy; earlier offloads' hash lists inside the card
+        // are copied as files, not hashed.
+        QVERIFY(QDir().mkpath(card + "/OLD/ascmhl"));
+        put(card + "/OLD/ascmhl/0001_OLD.mhl", "<hashlist/>");
+        OffloadSettings plain = os;
+        plain.mhl = false;
+        r = offloadCard(card, {root + "/plain"}, plain);
+        QVERIFY(QFileInfo::exists(root + "/plain/A001/OLD/ascmhl/0001_OLD.mhl"));
+        QCOMPARE(readMhlHistory(root + "/plain/A001").size(), readMhlHistory(card).size());
+        QVERIFY(QFile::remove(card + "/OLD/ascmhl/0001_OLD.mhl") && QDir(card + "/OLD").removeRecursively());
         r = offloadCard(card, {root + "/stopped"}, os, [](double, const QString&) { return false; });
         QCOMPARE(r.error, QString("Cancelled"));
         QVERIFY(readMhlHistory(root + "/stopped/A001").empty());
@@ -4376,6 +4419,17 @@ private slots:
             const auto [code, out] = run("ascmhl", {"diff", fresh});
             QVERIFY2(code == 0, qPrintable(out));
         }
+        // A hash list made in C4 (case-sensitive base 58) verifies.
+        {
+            const QString c4dir = root + "/c4card";
+            QVERIFY(QDir().mkpath(c4dir));
+            put(c4dir + "/a.wav", "first");
+            put(c4dir + "/b.wav", "second");
+            const auto [code, out] = run("ascmhl", {"create", "-h", "c4", c4dir});
+            QVERIFY2(code == 0, qPrintable(out));
+            const MhlVerifyResult cv = verifyMhl(c4dir, false);
+            QVERIFY2(cv.ok && cv.verified == 2, qPrintable(cv.changed.join(",") + cv.error));
+        }
         // ascmhl adds its own generation, verifying every file against Montage's; Montage reads it and verifies again.
         {
             const auto [code, out] = run("ascmhl", {"create", "-h", "xxh64", fresh});
@@ -4443,6 +4497,26 @@ private slots:
         QCOMPARE(edit::clipById(*back.active(), sound)->sourceIn, 34.0);
         r = call("montage_sync", {{"project", project}, {"action", "move"}});
         QVERIFY(r.value("content").toArray()[0].toObject().value("text").toString().contains("in sync"));
+        // A whole sound track slid 5 frames early: moving every clip back keeps each one whole (none lands on the next).
+        Project q = makeDefaultProject();
+        Sequence& qs = *q.active();
+        q.media.push_back(m);
+        const auto p1 = edit::placeMedia(q, qs, m.id, 30, 0, 90, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        const auto p2 = edit::placeMedia(q, qs, m.id, 120, 100, 190, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        QVERIFY(p1.ok && p2.ok);
+        QVERIFY(edit::moveClips(q, qs, {p1.created[1], p2.created[1]}, -5, 0, 0, false).ok);
+        QCOMPARE(edit::syncOffsets(qs).size(), size_t(2));
+        QVERIFY(saveProject(q, project.toStdString()));
+        r = call("montage_sync", {{"project", project}, {"action", "move"}});
+        QCOMPARE(r.value("structuredContent").toObject().value("fixed").toInt(), 2);
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Track& soundTrack = back.active()->audioTracks[0];
+        QCOMPARE(soundTrack.clips.size(), size_t(2));
+        QVERIFY2(soundTrack.clips[0].start == 30 && soundTrack.clips[0].duration == 90 && soundTrack.clips[1].start == 120 &&
+                     soundTrack.clips[1].duration == 90,
+                 qPrintable(QString("%1+%2 %3+%4").arg(soundTrack.clips[0].start).arg(soundTrack.clips[0].duration)
+                                .arg(soundTrack.clips[1].start).arg(soundTrack.clips[1].duration)));
+        QVERIFY(edit::syncOffsets(*back.active()).empty());
     }
 
     void mcpAdrCues() {

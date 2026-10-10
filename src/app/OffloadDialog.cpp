@@ -21,6 +21,7 @@
 #include <QVBoxLayout>
 #include <QtConcurrent>
 #include <atomic>
+#include <set>
 #include <memory>
 
 #include "Settings.h"
@@ -147,9 +148,9 @@ OffloadDialog::OffloadDialog(EditorState* state, QWidget* parent) : QDialog(pare
     layout->addWidget(report_, 1);
 
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, this);
-    auto* start = buttons->addButton(tr("Offload"), QDialogButtonBox::AcceptRole);
-    start->setObjectName(QStringLiteral("offloadStart"));
-    connect(start, &QPushButton::clicked, this, [this] { run(); });
+    start_ = buttons->addButton(tr("Offload"), QDialogButtonBox::AcceptRole);
+    start_->setObjectName(QStringLiteral("offloadStart"));
+    connect(start_, &QPushButton::clicked, this, [this] { run(); });
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
     layout->addWidget(buttons);
 }
@@ -162,6 +163,16 @@ void OffloadDialog::addDestination(const QString& folder) {
 }
 
 OffloadResult OffloadDialog::run() {
+    if (running_) return {};  // one at a time: a second click while one runs does nothing
+    running_ = true;
+    start_->setEnabled(false);
+    struct Done {
+        OffloadDialog* d;
+        ~Done() {
+            d->running_ = false;
+            d->start_->setEnabled(true);
+        }
+    } done{this};
     const QString source = QDir::fromNativeSeparators(source_->text().trimmed());
     QStringList dests;
     for (int i = 0; i < destinations_->count(); ++i) dests << QDir::fromNativeSeparators(destinations_->item(i)->text());
@@ -190,20 +201,25 @@ OffloadResult OffloadDialog::run() {
                          .arg(r.copies.size());
         if (r.alreadyThere) lines << tr("%n file(s) were already there, identical, and were kept.", nullptr, r.alreadyThere);
         for (const OffloadIssue& i : r.issues) lines << QStringLiteral("  %1: %2").arg(i.path.isEmpty() ? tr("Hash list") : i.path, i.problem);
+        for (const QString& n : r.notes) lines << QStringLiteral("  ") + n;
         if (os.mhl) lines << tr("ASC MHL hash lists are in each copy's ascmhl folder.");
     }
     // The first copy's media in a bin named after the card.
     if (r.error.isEmpty() && import_->isChecked() && !r.copies.isEmpty()) {
         QStringList files;
         QDirIterator it(r.copies.front(), QDir::Files, QDirIterator::Subdirectories);
+        // Not the hash lists, half-written parts, or what the project already has (an offload resumed).
+        std::set<std::string> have;
+        for (const MediaItem& m : state_->project().media) have.insert(m.path);
         while (it.hasNext()) {
             const QString f = it.next();
-            if (!f.contains(QStringLiteral("/ascmhl/"))) files << f;
+            if (!f.contains(QStringLiteral("/ascmhl/")) && !f.endsWith(QStringLiteral(".montage-part")) && !have.count(f.toStdString())) files << f;
         }
         files.sort();
         QStringList errors;
-        const auto ids = state_->importFiles(files, &errors, QFileInfo(source).fileName());
-        lines << tr("Imported %n clip(s) into the bin \"%1\".", nullptr, int(ids.size())).arg(QFileInfo(source).fileName());
+        const QString bin = QFileInfo(r.copies.front()).fileName();
+        const auto ids = state_->importFiles(files, &errors, bin);
+        lines << tr("Imported %n clip(s) into the bin \"%1\".", nullptr, int(ids.size())).arg(bin);
     }
     reportText_ = lines.join('\n');
     report_->setPlainText(reportText_);

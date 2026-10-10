@@ -784,7 +784,8 @@ void TimelineWidget::paintClip(QPainter& p, const Row& row, const Clip& c, const
     }
     if (const double off = syncOffsetOf(c.id); off != 0) {
         // Out of sync: the frames it is off by in a red box at the head of the name, as Premiere and Avid mark it.
-        const QString text = QStringLiteral("%1%2").arg(off > 0 ? "+" : "-").arg(std::fabs(off), 0, 'g', 4);
+        const double a = std::fabs(off);
+        const QString text = QStringLiteral("%1%2").arg(off > 0 ? "+" : "-").arg(a, 0, 'f', std::fabs(a - std::round(a)) < 0.05 ? 0 : 1);
         const int w = p.fontMetrics().horizontalAdvance(text) + 6;
         if (nameR.width() > w + 10) {
             const QRect box(nameR.left(), nameR.top() + 1, w, nameR.height() - 1);

@@ -591,6 +591,8 @@ void McpServer::Impl::addTools() {
             os.location = str(a, "location");
             os.comment = str(a, "comment");
             const QString source = absolute(need(a, "source"));
+            std::optional<Loaded> l;
+            if (a.contains("project")) l = open(a);  // checked before a long offload, not after
             const OffloadResult r = offloadCard(source, dests, os, [this](double f, const QString&) {
                 progress(f, "Offloading");
                 return true;
@@ -607,26 +609,47 @@ void McpServer::Impl::addTools() {
                                .arg(r.copies.size())
                                .arg(r.alreadyThere ? QStringLiteral(", %1 already there").arg(r.alreadyThere) : QString());
             for (const OffloadIssue& i : r.issues) text += QStringLiteral("\n  %1: %2").arg(i.path, i.problem);
-            if (a.contains("project") && !r.copies.isEmpty()) {
-                Loaded l = open(a);
-                const std::string bin = QFileInfo(source).fileName().toStdString();
+            for (const QString& note : r.notes) text += QStringLiteral("\n  ") + note;
+            if (!r.notes.isEmpty()) out["notes"] = QJsonArray::fromStringList(r.notes);
+            if (l && !r.copies.isEmpty()) {
+                const std::string bin = QFileInfo(r.copies.front()).fileName().toStdString();
                 int imported = 0;
+                // Not the hash lists, half-written parts, or what the project already has (an offload resumed); runs
+                // of numbered frames (CinemaDNG, EXR...) as one image sequence each.
+                std::set<std::string> have;
+                for (const MediaItem& m : l->project.media) have.insert(m.path);
                 QDirIterator it(r.copies.front(), QDir::Files, QDirIterator::Subdirectories);
                 QStringList files;
                 while (it.hasNext()) {
                     const QString f = it.next();
-                    if (!f.contains("/ascmhl/")) files << f;
+                    if (!f.contains("/ascmhl/") && !f.endsWith(".montage-part")) files << f;
                 }
                 files.sort();
+                std::map<std::string, std::pair<ImageSequence, int>> runs;
+                for (const QString& f : files)
+                    if (ImageSequence seq; isFrameFormat(f.toStdString()) && detectImageSequence(f.toStdString(), seq)) {
+                        runs[seq.pattern].first = seq;
+                        ++runs[seq.pattern].second;
+                    }
+                std::set<std::string> made;
                 for (const QString& f : files) {
+                    std::string path = f.toStdString();
+                    if (ImageSequence seq; isFrameFormat(path) && detectImageSequence(path, seq) && runs[seq.pattern].second >= 2) {
+                        if (!made.insert(seq.pattern).second) continue;
+                        double rate = 0;
+                        seq.fps = cinemaDng(path, &rate) && rate > 0 ? rateFor(rate) : l->seq().fps;
+                        path = imageSequencePath(seq);
+                    }
+                    if (have.count(path)) continue;
                     MediaItem m;
-                    if (!probeMedia(f.toStdString(), m)) continue;
-                    m.id = l.project.newId();
+                    if (!probeMedia(path, m)) continue;
+                    m.id = l->project.newId();
                     m.bin = bin;
-                    l.project.media.push_back(m);
+                    l->project.media.push_back(m);
+                    have.insert(path);
                     ++imported;
                 }
-                save(l);
+                save(*l);
                 out["imported"] = imported;
                 text += QStringLiteral("\nImported %1 clip(s) into the bin \"%2\".").arg(imported).arg(QString::fromStdString(bin));
             }
@@ -1198,9 +1221,20 @@ void McpServer::Impl::addTools() {
                 return ok(text, QJsonObject{{"clips", out}});
             }
             std::vector<Id> ids;
-            if (a.contains("clip")) ids.push_back(clipArg(l, a).id);
-            else
-                for (const edit::SyncOffset& o : edit::syncOffsets(s)) ids.push_back(o.clip);
+            if (a.contains("clip")) {
+                ids.push_back(clipArg(l, a).id);
+            } else {
+                // Moved one at a time, a clip going later must never land on the head of the next one still to move:
+                // those going later go last first, those going earlier first first.
+                std::vector<edit::SyncOffset> all = edit::syncOffsets(s);
+                std::stable_sort(all.begin(), all.end(), [&](const edit::SyncOffset& x, const edit::SyncOffset& y) {
+                    const FrameTime xs = edit::clipById(s, x.clip)->start, ys = edit::clipById(s, y.clip)->start;
+                    const bool xl = x.frames < 0, yl = y.frames < 0;  // going later
+                    if (xl != yl) return xl;
+                    return xl ? xs > ys : xs < ys;
+                });
+                for (const edit::SyncOffset& o : all) ids.push_back(o.clip);
+            }
             if (ids.empty()) return ok(QStringLiteral("Every linked clip is in sync."), QJsonObject{{"clips", QJsonArray{}}});
             int fixed = 0;
             QStringList errors;
