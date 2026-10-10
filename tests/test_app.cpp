@@ -3575,12 +3575,38 @@ private slots:
             return true;
         }));
         QVERIFY2(state()->save(path, &err), qPrintable(err));
+        // Marks on a read-only project are not changes to keep (tested below, once read-only again).
+        // A network blip: the lock file gone for a moment is written again, and the project stays this editor's.
+        QFile::remove(QString::fromStdString(lockPathFor(path.toStdString())));
+        state()->checkSharedState(true);
+        QVERIFY(state()->holdsLock() && !state()->readOnly());
+        QCOMPARE(projectLockStatus(path.toStdString()).state, LockState::Mine);
+        // Taken over while this machine slept, with changes not yet saved: read-only, and their saves never replace
+        // those changes; Edit Project will not discard them unless asked.
+        QVERIFY(state()->edit("Rename", [](Project&, Sequence& s) {
+            s.name = "Unsaved";
+            return true;
+        }));
+        foreignLock(path);
+        state()->checkSharedState(true);
+        QVERIFY(state()->readOnly() && !state()->holdsLock() && state()->isModified());
+        theirSave(path, "Their Cut", 8);
+        state()->checkSharedState();
+        QCOMPARE(state()->sequence()->name, std::string("Unsaved"));
+        QFile::remove(QString::fromStdString(lockPathFor(path.toStdString())));
+        QVERIFY(!state()->takeEdit(&err) && err.contains("not saved"));
+        QCOMPARE(state()->sequence()->name, std::string("Unsaved"));
+        QVERIFY2(state()->takeEdit(&err, true), qPrintable(err));
+        QCOMPARE(state()->sequence()->name, std::string("Their Cut"));
+        QVERIFY(!state()->isModified() && state()->holdsLock());
         // Closing it lets it go.
         state()->newProject();
         QCOMPARE(projectLockStatus(path.toStdString()).state, LockState::Free);
         // Saving a read-only project as a copy makes the copy this editor's.
         foreignLock(path);
         QVERIFY(win_->openProjectAs(path, MainWindow::OpenMode::ReadOnly));
+        state()->setInPoint(10);
+        QVERIFY(!state()->isModified());  // marks on a read-only project are not changes
         const QString copy = dir_.path() + "/shared/Reel 1 (mine).montage";
         QVERIFY2(state()->save(copy, &err), qPrintable(err));
         QVERIFY(!state()->readOnly() && state()->holdsLock());

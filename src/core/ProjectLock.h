@@ -15,6 +15,7 @@ namespace montage {
 struct LockOwner {
     std::string user, host, app;
     qint64 pid = 0;
+    std::string token;  // random for each running Montage: tells its own lock apart whatever the machine is called
     QDateTime since, heartbeat;  // UTC
     // "Sam on edit-bay-2", for messages.
     std::string describe() const;
@@ -49,8 +50,12 @@ enum class LockResult {
 };
 // Takes the lock (a stale one is taken over). Writing it is atomic, so of two editors opening at once one wins.
 LockResult acquireProjectLock(const std::string& project, LockOwner* holder = nullptr);
-// Renews this process's heartbeat; false when the lock is no longer ours (taken over after this machine slept).
-bool refreshProjectLock(const std::string& project);
+// Renews this process's heartbeat. Lost only when the lock file can be read and names someone else (taken over
+// after this machine slept); a lock file gone missing is written again, and one that cannot be read just now (the
+// drive briefly away) is Unknown, the lock kept.
+enum class RefreshResult { Held, Lost, Unknown };
+RefreshResult refreshProjectLockState(const std::string& project);
+bool refreshProjectLock(const std::string& project);  // false only when Lost
 // Lets go of the lock if this process holds it.
 void releaseProjectLock(const std::string& project);
 

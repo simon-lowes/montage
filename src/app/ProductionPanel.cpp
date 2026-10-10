@@ -62,12 +62,16 @@ ProductionPanel::ProductionPanel(EditorState* state, QWidget* parent) : QWidget(
         if (isVisible()) refresh();
     });
     timer_->start();
-    connect(state_, &EditorState::lockStateChanged, this, &ProductionPanel::refresh);
+    connect(state_, &EditorState::lockStateChanged, this, [this] {
+        if (isVisible()) refresh();
+    });
+    // Every edit says the file's state changed: only another project (perhaps of another production) is news here.
     connect(state_, &EditorState::fileStateChanged, this, [this] {
-        // A project of another production opened: follow it.
-        const QString of = QString::fromStdString(productionOf(state_->filePath().toStdString()));
+        if (state_->filePath() == shownFor_) return;
+        shownFor_ = state_->filePath();
+        const QString of = QString::fromStdString(productionOf(shownFor_.toStdString()));
         if (!of.isEmpty() && of != folder_) setFolder(of);
-        else refresh();
+        else if (isVisible()) refresh();
     });
     updateButtons();
 }

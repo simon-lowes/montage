@@ -8,6 +8,7 @@
 #include <QJsonObject>
 #include <QSaveFile>
 #include <QSysInfo>
+#include <QUuid>
 #include <mutex>
 
 #ifdef Q_OS_WIN
@@ -28,6 +29,11 @@ namespace {
 std::mutex nameMutex;
 std::string userName;
 
+const std::string& processToken() {
+    static const std::string token = QUuid::createUuid().toString(QUuid::WithoutBraces).toStdString();
+    return token;
+}
+
 bool processAlive(qint64 pid) {
     if (pid <= 0) return false;
 #ifdef Q_OS_WIN
@@ -47,6 +53,7 @@ QByteArray encode(const LockOwner& o) {
                         {"host", QString::fromStdString(o.host)},
                         {"app", QString::fromStdString(o.app)},
                         {"pid", double(o.pid)},
+                        {"token", QString::fromStdString(o.token)},
                         {"since", o.since.toString(Qt::ISODateWithMs)},
                         {"heartbeat", o.heartbeat.toString(Qt::ISODateWithMs)}};
     return QJsonDocument(j).toJson(QJsonDocument::Indented);
@@ -59,12 +66,16 @@ bool decode(const QByteArray& bytes, LockOwner& o) {
     o.host = j.value("host").toString().toStdString();
     o.app = j.value("app").toString().toStdString();
     o.pid = qint64(j.value("pid").toDouble());
+    o.token = j.value("token").toString().toStdString();
     o.since = QDateTime::fromString(j.value("since").toString(), Qt::ISODateWithMs);
     o.heartbeat = QDateTime::fromString(j.value("heartbeat").toString(), Qt::ISODateWithMs);
     return true;
 }
 
 bool sameHost(const LockOwner& a, const LockOwner& b) { return QString::fromStdString(a.host).compare(QString::fromStdString(b.host), Qt::CaseInsensitive) == 0; }
+
+// This process's lock: by its token (older locks without one: by machine and process).
+bool isMine(const LockOwner& o, const LockOwner& me) { return o.token.empty() ? sameHost(o, me) && o.pid == me.pid : o.token == me.token; }
 
 }  // namespace
 
@@ -97,6 +108,7 @@ LockOwner currentLockOwner() {
     o.host = QSysInfo::machineHostName().toStdString();
     o.app = "Montage";
     o.pid = QCoreApplication::applicationPid();
+    o.token = processToken();
     o.since = o.heartbeat = QDateTime::currentDateTimeUtc();
     return o;
 }
@@ -118,7 +130,7 @@ LockStatus projectLockStatus(const std::string& project) {
         return st;
     }
     const LockOwner me = currentLockOwner();
-    if (sameHost(st.owner, me) && st.owner.pid == me.pid) {
+    if (isMine(st.owner, me)) {
         st.state = LockState::Mine;
         return st;
     }
@@ -126,8 +138,11 @@ LockStatus projectLockStatus(const std::string& project) {
         st.state = LockState::Stale;
         return st;
     }
-    // Heard from lately (by its own clock, or the file's time on the shared drive, whichever is later)?
+    // Heard from lately (by its own clock, or the file's time on the shared drive, whichever is later)? A heartbeat
+    // from the future (a clock running ahead) is not believed.
+    const QDateTime now = QDateTime::currentDateTimeUtc();
     QDateTime last = st.owner.heartbeat;
+    if (last.isValid() && last.secsTo(now) < -60) last = QDateTime();
     const QDateTime touched = QFileInfo(f).lastModified().toUTC();
     if (!last.isValid() || (touched.isValid() && touched > last)) last = touched;
     st.state = last.isValid() && last.secsTo(QDateTime::currentDateTimeUtc()) > kLockStaleSeconds ? LockState::Stale : LockState::Theirs;
@@ -136,7 +151,7 @@ LockStatus projectLockStatus(const std::string& project) {
 
 LockResult acquireProjectLock(const std::string& project, LockOwner* holder) {
     const QString path = QString::fromStdString(lockPathFor(project));
-    for (int attempt = 0; attempt < 2; ++attempt) {
+    for (int attempt = 0; attempt < 3; ++attempt) {
         const LockStatus st = projectLockStatus(project);
         if (st.state == LockState::Mine) {
             refreshProjectLock(project);
@@ -146,7 +161,27 @@ LockResult acquireProjectLock(const std::string& project, LockOwner* holder) {
             if (holder) *holder = st.owner;
             return LockResult::HeldByOther;
         }
-        if (st.state == LockState::Stale) QFile::remove(path);
+        if (st.state == LockState::Stale) {
+            // Taken over by moving it aside under a name of this process's own: of two editors taking it over at
+            // once only one move succeeds. What was moved must be the stale lock that was read, not a fresh one
+            // someone wrote meanwhile (that one is put back).
+            const QString aside = path + "." + QString::fromStdString(processToken()) + ".stale";
+            QFile::remove(aside);
+            if (!QFile::rename(path, aside)) continue;  // someone else got there first: look again
+            QByteArray bytes;
+            if (QFile moved(aside); moved.open(QIODevice::ReadOnly)) bytes = moved.readAll();
+            LockOwner was;
+            const bool parsed = decode(bytes, was);
+            const bool damaged = st.owner.host.empty() && st.owner.token.empty() && st.owner.pid == 0;  // judged stale unreadable
+            const bool same = damaged ? !parsed
+                                      : parsed && was.token == st.owner.token && was.pid == st.owner.pid && was.host == st.owner.host &&
+                                            was.heartbeat == st.owner.heartbeat;
+            if (!same) {
+                QFile::rename(aside, path);
+                continue;
+            }
+            QFile::remove(aside);
+        }
         // Created only if it is not there, so of two editors opening at once one gets it.
         QFile f(path);
         if (f.open(QIODevice::WriteOnly | QIODevice::NewOnly)) {
@@ -166,16 +201,36 @@ LockResult acquireProjectLock(const std::string& project, LockOwner* holder) {
     return st.state == LockState::Mine ? LockResult::Acquired : LockResult::HeldByOther;
 }
 
-bool refreshProjectLock(const std::string& project) {
-    LockStatus st = projectLockStatus(project);
-    if (st.state != LockState::Mine) return false;
-    st.owner.heartbeat = QDateTime::currentDateTimeUtc();
-    QSaveFile f(QString::fromStdString(lockPathFor(project)));
-    if (!f.open(QIODevice::WriteOnly)) return true;  // still ours; the time just could not be renewed
-    f.write(encode(st.owner));
-    f.commit();
-    return true;
+RefreshResult refreshProjectLockState(const std::string& project) {
+    const QString path = QString::fromStdString(lockPathFor(project));
+    QFile in(path);
+    if (!in.exists()) {
+        // Gone (removed by hand, or the drive came back without it): written again unless someone has meanwhile.
+        if (!QFileInfo(path).absoluteDir().exists()) return RefreshResult::Unknown;
+        QFile f(path);
+        if (f.open(QIODevice::WriteOnly | QIODevice::NewOnly)) {
+            f.write(encode(currentLockOwner()));
+            f.close();
+            return RefreshResult::Held;
+        }
+        return projectLockStatus(project).state == LockState::Mine ? RefreshResult::Held : RefreshResult::Unknown;
+    }
+    if (!in.open(QIODevice::ReadOnly)) return RefreshResult::Unknown;
+    LockOwner owner;
+    const bool read = decode(in.readAll(), owner);
+    in.close();
+    if (!read) return RefreshResult::Unknown;
+    if (!isMine(owner, currentLockOwner())) return RefreshResult::Lost;
+    owner.heartbeat = QDateTime::currentDateTimeUtc();
+    QSaveFile f(path);
+    if (f.open(QIODevice::WriteOnly)) {
+        f.write(encode(owner));
+        f.commit();
+    }
+    return RefreshResult::Held;
 }
+
+bool refreshProjectLock(const std::string& project) { return refreshProjectLockState(project) != RefreshResult::Lost; }
 
 void releaseProjectLock(const std::string& project) {
     if (projectLockStatus(project).state == LockState::Mine) QFile::remove(QString::fromStdString(lockPathFor(project)));

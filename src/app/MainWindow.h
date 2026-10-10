@@ -438,6 +438,7 @@ private:
     QDockWidget* productionDock_ = nullptr;
     QAction* takeEdit_ = nullptr;
     void importFromProjectDialog(QString project = QString());
+    bool takeEditInteractive();  // File › Edit Project: asks before discarding changes not saved
     void newProjectInProduction(const QString& folder);
     AudioDescriptionDialog* audioDescription_ = nullptr;
     CaptionsPanel* captions_ = nullptr;

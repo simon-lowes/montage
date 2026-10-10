@@ -32,6 +32,7 @@ signals:
 private:
     EditorState* state_;
     QString folder_;
+    QString shownFor_;  // the open project when the list was last brought up to date
     QLabel* title_;
     QTreeWidget* list_;
     QPushButton* open_;

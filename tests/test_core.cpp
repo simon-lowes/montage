@@ -46,6 +46,7 @@
 #include "core/ProjectIO.h"
 #include "core/ProjectLock.h"
 #include "core/Production.h"
+#include "core/FaceIndex.h"
 #include "core/ScriptCut.h"
 #include "core/Surround.h"
 #include "core/Transcript.h"
@@ -2876,6 +2877,51 @@ private slots:
         }
         QCOMPARE(projectLockStatus(proj).state, LockState::Stale);
         QFile::remove(lockFile);
+        // A heartbeat from the future (a clock running ahead) is not believed: the file's own age decides.
+        {
+            const QString future = QDateTime::currentDateTimeUtc().addDays(1).toString(Qt::ISODateWithMs);
+            QFile f(lockFile);
+            QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            f.write(QJsonDocument(QJsonObject{{"user", "sam"}, {"host", "edit-bay-2"}, {"pid", 4242.0}, {"since", future}, {"heartbeat", future}}).toJson());
+            f.close();
+            QVERIFY(f.open(QIODevice::ReadWrite));
+            f.setFileTime(QDateTime::currentDateTime().addSecs(-(kLockStaleSeconds + 60)), QFileDevice::FileModificationTime);
+        }
+        QCOMPARE(projectLockStatus(proj).state, LockState::Stale);
+        QFile::remove(lockFile);
+        // Renewing: a lock file gone missing (the drive briefly away) is written again; one that cannot be read just
+        // now leaves the lock held; only one naming someone else means it was taken over.
+        QCOMPARE(acquireProjectLock(proj), LockResult::Acquired);
+        QFile::remove(lockFile);
+        QCOMPARE(refreshProjectLockState(proj), RefreshResult::Held);
+        QCOMPARE(projectLockStatus(proj).state, LockState::Mine);
+        {
+            QFile f(lockFile);
+            QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            f.write("{\"us");
+        }
+        QCOMPARE(refreshProjectLockState(proj), RefreshResult::Unknown);
+        QVERIFY(refreshProjectLock(proj));
+        writeLock("edit-bay-2", 4242, 5);
+        QCOMPARE(refreshProjectLockState(proj), RefreshResult::Lost);
+        QVERIFY(!refreshProjectLock(proj));
+        QFile::remove(lockFile);
+        // This process's own lock is known by its token, whatever the machine is called now.
+        QCOMPARE(acquireProjectLock(proj), LockResult::Acquired);
+        {
+            QFile f(lockFile);
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            QJsonObject j = QJsonDocument::fromJson(f.readAll()).object();
+            f.close();
+            QVERIFY(!j.value("token").toString().isEmpty());
+            j["host"] = "renamed-laptop";
+            j["pid"] = 1;
+            QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            f.write(QJsonDocument(j).toJson());
+        }
+        QCOMPARE(projectLockStatus(proj).state, LockState::Mine);
+        releaseProjectLock(proj);
+        QVERIFY(!QFileInfo::exists(lockFile));
 
         // A production: projects in its folder and below, who is editing each, found from a project inside it.
         const std::string prod = (dir.path() + "/Feature").toStdString();
@@ -2958,6 +3004,30 @@ private slots:
         nested.start = 120;
         nested.duration = 40;
         a.findSequence(a.activeSequence)->videoTracks[1].clips.push_back(nested);
+        // An audition take of the camera file, and a colour group with a grade.
+        {
+            Sequence& m = *a.findSequence(a.activeSequence);
+            Take alt;
+            alt.mediaId = sub.id;
+            alt.name = "take 2";
+            m.videoTracks[0].clips[0].takes.push_back(alt);
+            ColorGroup g;
+            g.id = a.newId();
+            g.postId = a.newId();
+            g.name = "Day";
+            g.pre.push_back(makeEffect(a, "color_correct"));
+            m.colorGroups.push_back(g);
+            m.videoTracks[0].clips[0].colorGroup = g.id;
+        }
+        // Faces found in the camera file, named in this project.
+        {
+            auto faces = std::make_shared<FaceIndex>();
+            FaceIndex::Face face;
+            face.person = 3;
+            faces->faces.push_back(face);
+            for (MediaItem& m : a.media)
+                if (m.id == sub.id) m.faces = faces;
+        }
         const Id mainId = a.activeSequence;
 
         // The target already has the camera file.
@@ -2997,6 +3067,15 @@ private slots:
         QVERIFY(*ids.rbegin() < b.nextId);
         QVERIFY(im->videoTracks[0].clips[0].linkGroup != 0 && im->videoTracks[0].clips[0].linkGroup == im->audioTracks[0].clips[0].linkGroup);
         QCOMPARE(im->audioTracks[0].effects[0].s("sidechain"), std::to_string(im->audioTracks[1].id));
+        // The take plays the copied subclip; the colour group is the copy's own, the clip graded with it; faces are
+        // still to be named here.
+        QCOMPARE(im->videoTracks[0].clips[0].takes.size(), size_t(1));
+        QCOMPARE(im->videoTracks[0].clips[0].takes[0].mediaId, takeMedia->id);
+        QCOMPARE(im->colorGroups.size(), size_t(1));
+        const Id gid = im->colorGroups[0].id;
+        QVERIFY(gid != a.findSequence(mainId)->colorGroups[0].id && ids.count(gid) == 0 && gid < b.nextId);
+        QCOMPARE(im->videoTracks[0].clips[0].colorGroup, gid);
+        QVERIFY(takeMedia->faces && takeMedia->faces->faces[0].person == 0);
         // A sequence it does not have: nothing.
         QVERIFY(importFromProject(b, a, {987654}).empty());
     }

@@ -1664,6 +1664,16 @@ Id duplicateSequence(Project& p, Id id, const std::string& name, std::map<Id, Id
     }
     for (Effect& e : s.masterEffects) renew(e);
     for (CaptionTrack& ct : s.captionTracks) ct.id = p.newId();
+    // Colour groups: their ids own their grades' effect chains, so the copy's are its own (clips follow below).
+    std::map<Id, Id> colorGroups;
+    for (ColorGroup& g : s.colorGroups) {
+        const Id fresh = p.newId();
+        colorGroups[g.id] = fresh;
+        g.id = fresh;
+        g.postId = p.newId();
+        for (Effect& e : g.pre) renew(e);
+        for (Effect& e : g.post) renew(e);
+    }
     for (auto* tracks : {&s.videoTracks, &s.audioTracks})
         for (Track& t : *tracks) {
             t.id = p.newId();
@@ -1680,6 +1690,7 @@ Id duplicateSequence(Project& p, Id id, const std::string& name, std::map<Id, Id
                 }
                 for (Effect* e : {&c.generator, &c.motion, &c.audio, &c.timing}) renew(*e);
                 for (Effect& e : c.effects) renew(e);
+                if (c.colorGroup) c.colorGroup = colorGroups.count(c.colorGroup) ? colorGroups[c.colorGroup] : 0;
             }
             for (Transition& tr : t.transitions) {
                 tr.id = p.newId();

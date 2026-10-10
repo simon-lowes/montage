@@ -13,6 +13,7 @@
 #include <set>
 
 #include "EditOps.h"
+#include "FaceIndex.h"
 
 namespace montage {
 
@@ -117,6 +118,12 @@ std::vector<Id> importFromProject(Project& into, const Project& from, const std:
         copy.id = into.newId();
         media[id] = copy.id;
         if (m->subclipOf) copy.subclipOf = bring(m->subclipOf);
+        // Its faces were named after the other project's people: here they are still to be grouped.
+        if (copy.faces) {
+            auto faces = std::make_shared<FaceIndex>(*copy.faces);
+            for (auto& f : faces->faces) f.person = 0;
+            copy.faces = faces;
+        }
         if (!copy.bin.empty() && std::find(into.bins.begin(), into.bins.end(), copy.bin) == into.bins.end()) into.bins.push_back(copy.bin);
         into.media.push_back(std::move(copy));
         return media[id];
@@ -129,14 +136,19 @@ std::vector<Id> importFromProject(Project& into, const Project& from, const std:
         for (auto* list : {&s.videoTracks, &s.audioTracks})
             for (Track& t : *list)
                 for (Clip& c : t.clips) {
-                    if (!c.mediaId) continue;
-                    const MediaItem* m = from.findMedia(c.mediaId);
-                    if (m && m->kind == MediaKind::Sequence) {
-                        const auto it = sequenceMedia.find(m->sequenceId);
-                        c.mediaId = it == sequenceMedia.end() ? 0 : it->second;
-                    } else {
-                        c.mediaId = bring(c.mediaId);
-                    }
+                    // The clip's media and its other takes (auditions).
+                    auto remap = [&](Id& mediaId) {
+                        if (!mediaId) return;
+                        const MediaItem* m = from.findMedia(mediaId);
+                        if (m && m->kind == MediaKind::Sequence) {
+                            const auto it = sequenceMedia.find(m->sequenceId);
+                            mediaId = it == sequenceMedia.end() ? 0 : it->second;
+                        } else {
+                            mediaId = bring(mediaId);
+                        }
+                    };
+                    remap(c.mediaId);
+                    for (Take& tk : c.takes) remap(tk.mediaId);
                 }
         // In under a temporary id, then copied with new ids for everything in it (tracks, clips, links, effects).
         s.id = into.newId();

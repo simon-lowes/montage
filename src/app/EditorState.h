@@ -159,11 +159,12 @@ public:
     QString lockHolder() const { return lockHolder_; }  // who is editing a read-only project ("" once it is free)
     bool holdsLock() const { return holdsLock_; }
     bool canTakeEdit() const;
-    // Takes the lock of a read-only project whose editor has let it go, reloading it from disk first.
-    bool takeEdit(QString* error = nullptr);
-    // Renews this editor's lock (every half minute); for a read-only project, reloads it when it was saved and
-    // notices when its lock is let go. Runs every few seconds by itself.
-    void checkSharedState();
+    // Takes the lock of a read-only project whose editor has let it go, reloading it from disk first. Changes made
+    // here before it became read-only (taken over while this machine slept) are not thrown away unless asked.
+    bool takeEdit(QString* error = nullptr, bool discardChanges = false);
+    // Renews this editor's lock (every half minute); for a read-only project, reloads it when it was saved (unless
+    // it holds changes of this editor's not yet saved) and notices when its lock is let go. Runs every few seconds.
+    void checkSharedState(bool renewNow = false);  // renewNow: the lock renewed now, not on the half minute
     // Opens a recovered copy as if it were `originalPath` (empty = untitled),
     // marked modified so the user decides whether to save it.
     bool recover(const QString& copy, const QString& originalPath, QString* error = nullptr);

@@ -6250,6 +6250,10 @@ private slots:
         QVERIFY(r.value("content").toArray().at(0).toObject().value("text").toString().contains("sam on edit-bay-2"));
         QVERIFY(loadProject(ep2.toStdString(), back));
         QCOMPARE(back.sequences.size(), size_t(1));
+        // Nor is it undone behind their back.
+        QVERIFY(QFile::copy(ep2, ep2 + ".bak"));
+        r = call("montage_undo", {{"project", ep2}});
+        QVERIFY(r.value("isError").toBool() && r.value("content").toArray().at(0).toObject().value("text").toString().contains("editing"));
     }
 
     void aafExportWithPicture() {

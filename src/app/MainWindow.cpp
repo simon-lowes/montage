@@ -432,8 +432,7 @@ void MainWindow::buildPanels() {
     connect(production_, &ProductionPanel::openRequested, this, [this](const QString& path, bool readOnly) {
         const bool here = !state_->filePath().isEmpty() && QFileInfo(path).absoluteFilePath() == QFileInfo(state_->filePath()).absoluteFilePath();
         if (here && !readOnly && state_->readOnly()) {
-            QString err;
-            if (!state_->takeEdit(&err)) QMessageBox::information(this, tr("Edit Project"), err);
+            takeEditInteractive();
             return;
         }
         if (here && readOnly == state_->readOnly()) return;
@@ -748,10 +747,7 @@ void MainWindow::buildMenus() {
             openProduction(folder, true);
         })->setObjectName(QStringLiteral("openProduction"));
         add(prod, tr("&Import from Project…"), QKeySequence(), [this] { importFromProjectDialog(); })->setObjectName(QStringLiteral("importFromProject"));
-        takeEdit_ = add(file, tr("&Edit Project (Take the Lock)"), QKeySequence(), [this] {
-            QString err;
-            if (!state_->takeEdit(&err) && !err.isEmpty()) QMessageBox::information(this, tr("Edit Project"), err);
-        });
+        takeEdit_ = add(file, tr("&Edit Project (Take the Lock)"), QKeySequence(), [this] { takeEditInteractive(); });
         takeEdit_->setObjectName(QStringLiteral("takeEdit"));
         takeEdit_->setEnabled(false);
         connect(state_, &EditorState::lockStateChanged, this, [this] {
@@ -1781,7 +1777,18 @@ Id MainWindow::makeSubclip() {
 // File commands
 
 bool MainWindow::maybeSave() {
-    if (!state_->isModified() || state_->readOnly()) return true;
+    if (!state_->isModified()) return true;
+    if (state_->readOnly()) {
+        // Changes made before someone else took the project over: only a copy can keep them.
+        const auto r = QMessageBox::warning(
+            this, tr("Montage"),
+            tr("Your changes to this project are not saved, and %1 is editing it now. Save them as a copy?")
+                .arg(state_->lockHolder().isEmpty() ? tr("someone else") : state_->lockHolder()),
+            QMessageBox::Save | QMessageBox::Discard | QMessageBox::Cancel);
+        if (r == QMessageBox::Cancel) return false;
+        if (r == QMessageBox::Save) return saveAs();
+        return true;
+    }
     auto r = QMessageBox::warning(this, tr("Montage"), tr("The project has unsaved changes. Save them?"),
                                   QMessageBox::Save | QMessageBox::Discard | QMessageBox::Cancel);
     if (r == QMessageBox::Cancel) return false;
@@ -1891,6 +1898,23 @@ bool MainWindow::saveAs() {
     }
     addRecent(path);
     s.setValue("lastProjectDir", QFileInfo(path).absolutePath());
+    return true;
+}
+
+bool MainWindow::takeEditInteractive() {
+    bool discard = false;
+    if (state_->isModified()) {
+        if (QMessageBox::question(this, tr("Edit Project"),
+                                  tr("Your changes here are not saved. Discard them and edit the project as it was last saved? (Save As keeps "
+                                     "them as a copy instead.)")) != QMessageBox::Yes)
+            return false;
+        discard = true;
+    }
+    QString err;
+    if (!state_->takeEdit(&err, discard)) {
+        if (!err.isEmpty()) QMessageBox::information(this, tr("Edit Project"), err);
+        return false;
+    }
     return true;
 }
 

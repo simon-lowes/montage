@@ -5873,6 +5873,9 @@ void McpServer::Impl::addTools() {
         R"json({"type":"object","properties":{"project":{"type":"string"}},"required":["project"]})json", false,
         [](const QJsonObject& a) {
             const QString path = absolute(need(a, "project")), bak = path + ".bak";
+            if (const LockStatus st = projectLockStatus(path.toStdString()); st.state == LockState::Theirs)
+                return fail(QStringLiteral("%1 is editing %2 in Montage: nothing is undone behind their back")
+                                .arg(QString::fromStdString(st.owner.describe()), QFileInfo(path).fileName()));
             if (!QFileInfo::exists(bak)) return fail("Nothing to undo");
             QFile::remove(path);
             if (!QFile::rename(bak, path)) return fail(QStringLiteral("Cannot restore %1").arg(path));
