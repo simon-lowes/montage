@@ -185,6 +185,25 @@ std::vector<EffectInfo> buildCatalog() {
                  {str("path", "LUT File", StringKind::File)}});
     c.back().strings[0].fileFilter = "LUT files (*.cube)";
     {
+        // ASC CDL (core/Cdl.h): slope, offset and power per channel and saturation, as dailies carry it, applied in
+        // the working space or in the space it was made in (a camera log, ACEScct).
+        EffectInfo cdl{"cdl", "ASC CDL", EffectCategory::VideoFilter, "Color", {}, {}};
+        for (const char* part : {"slope", "offset", "power"})
+            for (const char* ch : {"r", "g", "b"}) {
+                const std::string P = part, C = ch;
+                const std::string label = std::string(1, char(std::toupper(P[0]))) + P.substr(1) + " " + char(std::toupper(C[0]));
+                if (P == "offset") cdl.params.push_back(num(P + "." + C, label, -1, 1, 0, 0.001));
+                else cdl.params.push_back(num(P + "." + C, label, P == "power" ? 0.1 : 0, 4, 1, 0.001));
+            }
+        cdl.params.push_back(num("saturation", "Saturation", 0, 4, 1, 0.001));
+        std::vector<std::string> spaces{"Working space"};
+        for (const auto& cs : colorSpaces()) spaces.push_back(cs.label);
+        cdl.strings = {str("space", "Apply In", StringKind::Choice, "Working space"), str("id", "CDL ID", StringKind::Text),
+                       str("description", "Description", StringKind::Text)};
+        cdl.strings[0].choices = spaces;
+        c.push_back(cdl);
+    }
+    {
         // Colour Space Transform: one clip from any space into another (render/ColorSpace.h).
         std::vector<std::string> spaces;
         for (const auto& cs : colorSpaces()) spaces.push_back(cs.label);

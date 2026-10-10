@@ -111,6 +111,7 @@
 #include "ModelPacks.h"
 #include "MixerPanel.h"
 #include "ControlSurface.h"
+#include "core/Cdl.h"
 #include "control/MackieControl.h"
 #include "MulticamPanel.h"
 #include "PluginEditorWindow.h"
@@ -586,6 +587,72 @@ private slots:
         QVERIFY(ranged.runCheck());
         QCOMPARE(ranged.issues().size(), size_t(1));
         QVERIFY(ranged.issues()[0].start == 60 && ranged.issues()[0].end == 120);
+    }
+
+    void aleAndCdlFromTheMenus() {
+        state()->newProject();
+        Id media = 0;
+        QVERIFY(state()->edit("Media", [&](Project& p, Sequence& s) {
+            MediaItem m;
+            m.id = media = p.newId();
+            m.kind = MediaKind::Video;
+            m.name = "A001C005.mov";
+            m.path = "/cards/A001C005.mov";
+            m.duration = 8;
+            m.width = 1920;
+            m.height = 1080;
+            m.fps = s.fps;
+            m.hasVideo = true;
+            m.timecode = 3600;
+            p.media.push_back(m);
+            return edit::placeMedia(p, s, m.id, 0, 0, 60, {TrackKind::Video, 0}, {}, false).ok;
+        }));
+        for (const char* name : {"importAle", "exportAle", "importCdl", "exportCdl"}) QVERIFY(win_->findChild<QAction*>(name));
+        const Id clip = state()->sequence()->videoTracks[0].clips.at(0).id;
+        auto clipGrade = [&](Cdl& out) { return clipCdl(*edit::clipById(*state()->sequence(), clip), 0, out); };
+        // An ALE: its log on the media and its CDL on the clip, as one undo step.
+        const QString ale = dir_.path() + "/dailies.ale";
+        {
+            QFile f(ale);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write("Heading\nFIELD_DELIM\tTABS\nFPS\t25\n\nColumn\nName\tScene\tTake\tASC_SOP\tASC_SAT\n\nData\n"
+                    "A001C005\t7B\t1\t(0.9 1.0 1.1)(0.02 0.0 -0.02)(1.0 1.0 1.0)\t1.1\n");
+        }
+        QCOMPARE(win_->importAle(ale), 1);
+        QCOMPARE(state()->project().findMedia(media)->metadata.at("scene"), std::string("7B"));
+        Cdl g;
+        QVERIFY(clipGrade(g) && g.slope[0] == 0.9 && g.saturation == 1.1);
+        state()->undo();
+        QVERIFY(!state()->project().findMedia(media)->metadata.count("scene"));
+        QVERIFY(!clipGrade(g));
+        QCOMPARE(win_->importAle(dir_.path() + "/missing.ale"), -1);
+        // A .cc onto the selected clip; out again as a collection; the bin's media as an ALE.
+        const QString cc = dir_.path() + "/look.cc";
+        {
+            Cdl look;
+            look.id = "look";
+            look.slope[1] = 1.3;
+            QFile f(cc);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(QByteArray::fromStdString(writeCdlXml({look}, CdlFormat::Cc)));
+        }
+        QCOMPARE(win_->importCdl(cc), 0);  // nothing selected
+        state()->setSelection({clip});
+        QCOMPARE(win_->importCdl(cc), 1);
+        QVERIFY(clipGrade(g) && g.slope[1] == 1.3);
+        const QString ccc = dir_.path() + "/out.ccc";
+        QVERIFY(win_->exportCdl(ccc));
+        QFile out(ccc);
+        QVERIFY(out.open(QIODevice::ReadOnly));
+        const std::vector<Cdl> again = parseCdlXml(out.readAll().toStdString());
+        QVERIFY(again.size() == 1 && again[0].sameGrade(g));
+        state()->setSelection({});
+        const QString aleOut = dir_.path() + "/out.ale";
+        QVERIFY(win_->exportAle(aleOut));
+        QFile af(aleOut);
+        QVERIFY(af.open(QIODevice::ReadOnly));
+        const QString aleText = QString::fromUtf8(af.readAll());
+        QVERIFY2(aleText.contains("A001C005.mov") && aleText.contains("ASC_SOP") && aleText.contains("01:00:00:00"), qPrintable(aleText));
     }
 
     void controlSurfaceMackie() {

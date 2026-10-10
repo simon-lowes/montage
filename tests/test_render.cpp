@@ -84,6 +84,52 @@ Clip colorClip(Project& p, float r, float g, float b, FrameTime start, FrameTime
 class TestRender : public QObject {
     Q_OBJECT
 private slots:
+    void ascCdlEffect() {
+        // The cdl effect grades like the ASC's maths, in the working space or in the space the CDL was made in.
+        Project p = makeDefaultProject();
+        Effect e = makeEffect(p, "cdl");
+        e.params["slope.r"] = Param(2.0);
+        e.params["offset.g"] = Param(0.1);
+        e.params["power.b"] = Param(2.0);
+        float c[4];
+        Image img = solid(2, 2, 0.3f, 0.3f, 0.6f);
+        applyVideoEffect(e, 0, img, 1.0);
+        rgb(img, 0, 0, c);
+        QVERIFY(std::fabs(c[0] - 0.6f) < 1e-5f && std::fabs(c[1] - 0.4f) < 1e-5f && std::fabs(c[2] - 0.36f) < 1e-5f);
+        // Half-transparent pixels grade as their colour.
+        Image half = solid(1, 1, 0.3f, 0.3f, 0.6f, 0.5f);
+        applyVideoEffect(e, 0, half, 1.0);
+        rgb(half, 0, 0, c);
+        QVERIFY(std::fabs(c[0] - 0.6f) < 1e-5f && std::fabs(c[3] - 0.5f) < 1e-6f);
+        // In ACEScct: into it and back exactly, so an identity CDL leaves the picture alone and an offset there lifts
+        // the picture by what it is in log, not the same as in Rec.709.
+        Effect plain = makeEffect(p, "cdl");
+        plain.strings["space"] = findColorSpace("acescct")->label;
+        plain.params["offset.g"] = Param(1e-6);  // (not quite an identity, so the conversions run)
+        Image same = solid(1, 1, 0.2f, 0.5f, 0.8f);
+        applyVideoEffect(plain, 0, same, 1.0);
+        rgb(same, 0, 0, c);
+        QVERIFY(std::fabs(c[0] - 0.2f) < 1e-3f && std::fabs(c[1] - 0.5f) < 1e-3f && std::fabs(c[2] - 0.8f) < 1e-3f);
+        Effect lifted = plain;
+        lifted.params.erase("offset.g");
+        lifted.params["offset.r"] = lifted.params["offset.g"] = lifted.params["offset.b"] = Param(0.05);
+        Image inLog = solid(1, 1, 0.2f, 0.2f, 0.2f), inVideo = inLog;
+        applyVideoEffect(lifted, 0, inLog, 1.0);
+        lifted.strings["space"] = "Working space";
+        applyVideoEffect(lifted, 0, inVideo, 1.0);
+        QVERIFY(std::fabs(inVideo.at(0, 0)[1] - 0.25f) < 1e-5f);
+        // Rec.709 0.2 is 0.0213 in linear light, 0.2367 in ACEScct; 0.2867 there is 2^(0.2867 x 17.52 - 9.72) = 0.0385,
+        // which is 0.2570 in Rec.709 (BT.1886).
+        const double lin = std::pow(2.0, ((std::log2(std::pow(0.2, 2.4)) + 9.72) / 17.52 + 0.05) * 17.52 - 9.72);
+        QVERIFY2(std::fabs(inLog.at(0, 0)[1] - std::pow(lin, 1 / 2.4)) < 2e-3, qPrintable(QString::number(inLog.at(0, 0)[1])));
+        QVERIFY(std::fabs(inLog.at(0, 0)[1] - inVideo.at(0, 0)[1]) > 0.005f);
+        // Off: nothing.
+        e.enabled = false;
+        Image off = solid(1, 1, 0.3f, 0.3f, 0.3f);
+        applyVideoEffect(e, 0, off, 1.0);
+        QCOMPARE(off.at(0, 0)[0], 0.3f);
+    }
+
     void redactFacesCoversTheFaces() {
         // A busy picture (fine checks) and a face's box in the middle (40 x 36 px at 80, 42).
         const int W = 200, H = 120;

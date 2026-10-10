@@ -59,6 +59,8 @@
 #include "core/Bleep.h"
 #include "audio/SpectralRepair.h"
 #include "core/Checkerboard.h"
+#include "core/Ale.h"
+#include "core/Cdl.h"
 #include "core/EditOps.h"
 #include "core/TimelineCompare.h"
 #include "core/Reconform.h"
@@ -2429,6 +2431,220 @@ void McpServer::Impl::addTools() {
             for (const Marker& m : markers) edit::addMarker(s, m);
             save(l);
             return ok(QStringLiteral("Added %1 marker(s)").arg(markers.size()));
+        });
+
+    add("montage_ale", "Avid Log Exchange (ALE) in and out",
+        "import: read an ALE (as dailies arrive from Media Composer, Resolve, Silverstack or the lab) and fill in each "
+        "matching media item's scene, shot, take, tape, camera, description and comment, and its ASC CDL; rows find their "
+        "media by source file, by name (with or without extension) or by tape and start timecode. With cdl_to_clips "
+        "(default) every clip of a media item that got a CDL is graded with it (its cdl effect). export: the media (all, "
+        "or those named in `media`) as an ALE, timecodes at the sequence's rate, with CDL columns when any has one. Give a "
+        "`path`, or `text` to import from.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"action":{"type":"string","enum":["import","export"]},
+            "path":{"type":"string"},"text":{"type":"string"},"cdl_to_clips":{"type":"boolean","default":true},
+            "media":{"type":"array","items":{"type":"string"},"description":"export: media names (default all)"}},
+            "required":["project","action"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            const QString action = need(a, "action");
+            if (action == "import") {
+                std::string text = str(a, "text").toStdString();
+                if (a.contains("path")) {
+                    QFile f(absolute(need(a, "path")));
+                    if (!f.open(QIODevice::ReadOnly)) return fail(QStringLiteral("Cannot read %1").arg(f.fileName()));
+                    text = f.readAll().toStdString();
+                }
+                AleTable table;
+                std::string err;
+                if (!parseAle(text, table, &err)) return fail(QString::fromStdString(err));
+                const AleImport r = applyAle(l.project, table, a.value("cdl_to_clips").toBool(true));
+                if (!r.matched.empty()) save(l);
+                QJsonArray unmatched;
+                for (const std::string& u : r.unmatched) unmatched.append(QString::fromStdString(u));
+                return ok(QStringLiteral("%1 of %2 row(s) matched media; %3 CDL(s); %4 clip(s) graded")
+                              .arg(r.matched.size()).arg(r.rows).arg(r.cdls).arg(r.clips),
+                          QJsonObject{{"rows", r.rows}, {"matched", int(r.matched.size())}, {"cdls", r.cdls}, {"clips", r.clips}, {"unmatched", unmatched}});
+            }
+            if (action != "export") throw ArgError{QStringLiteral("\"action\" must be import or export")};
+            std::vector<Id> ids;
+            if (a.contains("media")) {
+                for (const QJsonValue& v : a.value("media").toArray()) {
+                    const MediaItem* found = nullptr;
+                    for (const MediaItem& m : l.project.media)
+                        if (!found && QString::fromStdString(m.name).compare(v.toString(), Qt::CaseInsensitive) == 0) found = &m;
+                    if (!found) throw ArgError{QStringLiteral("No media named %1").arg(v.toString())};
+                    ids.push_back(found->id);
+                }
+            } else {
+                for (const MediaItem& m : l.project.media) ids.push_back(m.id);
+            }
+            const AleTable table = aleFromMedia(l.project, ids, l.seq().fps);
+            if (table.rows.empty()) return fail(QStringLiteral("No media to log (stills and sequences are left out)"));
+            const std::string text = writeAle(table);
+            if (a.contains("path")) {
+                QFile f(absolute(need(a, "path")));
+                if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate) || f.write(text.data(), qint64(text.size())) != qint64(text.size()))
+                    return fail(QStringLiteral("Cannot write %1").arg(f.fileName()));
+                return ok(QStringLiteral("Wrote %1 media item(s) to %2").arg(table.rows.size()).arg(f.fileName()));
+            }
+            return ok(QString::fromStdString(text));
+        });
+
+    add("montage_cdl", "ASC CDL on clips",
+        "get: a clip's ASC CDL (slope, offset, power per channel, saturation, the space it is applied in). set: give a "
+        "clip slope, offset and power (three numbers each, or one for all) and saturation, as its cdl effect; `space` is "
+        "\"Working space\" or a colour space it was made in (a camera log, ACEScct). import: a .cc, .ccc or .cdl (path or "
+        "text): onto `clip` (the correction whose id matches it, else the first), or without a clip onto every video clip "
+        "whose name, file or tape matches a correction's id. export: the clip's CDL (or every clip's that has one) as cdl, "
+        "cc or ccc XML, to `path` or returned.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"action":{"type":"string","enum":["get","set","import","export"]},
+            "clip":{"type":"integer"},"slope":{"type":["array","number"]},"offset":{"type":["array","number"]},"power":{"type":["array","number"]},
+            "saturation":{"type":"number"},"space":{"type":"string"},"id":{"type":"string"},"path":{"type":"string"},"text":{"type":"string"},
+            "format":{"type":"string","enum":["cdl","cc","ccc"]}},"required":["project","action"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const QString action = need(a, "action");
+            auto describe = [&](const Clip& c, const Cdl& g) {
+                auto arr = [](const double v[3]) { return QJsonArray{v[0], v[1], v[2]}; };
+                QString space = "Working space";
+                for (const Effect& e : c.effects)
+                    if (e.type == "cdl" && e.enabled) {
+                        space = QString::fromStdString(e.s("space", "Working space"));
+                        break;
+                    }
+                return QJsonObject{{"clip", double(c.id)}, {"id", QString::fromStdString(g.id)}, {"slope", arr(g.slope)}, {"offset", arr(g.offset)},
+                                   {"power", arr(g.power)}, {"saturation", g.saturation}, {"space", space},
+                                   {"asc_sop", QString::fromStdString(cdlSopText(g))}};
+            };
+            if (action == "get") {
+                const Clip& c = clipArg(l, a);
+                Cdl g;
+                if (!clipCdl(c, c.start, g)) return ok(QStringLiteral("Clip %1 has no CDL").arg(qulonglong(c.id)), QJsonObject{{"clip", double(c.id)}});
+                const QJsonObject o = describe(c, g);
+                return ok(QString::fromUtf8(QJsonDocument(o).toJson(QJsonDocument::Compact)), o);
+            }
+            if (action == "set") {
+                Clip& c = clipArg(l, a);
+                if (c.isGenerator()) throw ArgError{QStringLiteral("A CDL grades footage, not a generator")};
+                if (auto loc = edit::locate(s, c.id); !loc || loc->track.kind != TrackKind::Video) throw ArgError{QStringLiteral("A CDL goes on a video clip")};
+                Cdl g;
+                clipCdl(c, c.start, g);
+                auto three = [&](const char* key, double out[3], double lo) {
+                    if (!a.contains(key)) return;
+                    const QJsonValue v = a.value(key);
+                    if (v.isDouble()) {
+                        out[0] = out[1] = out[2] = v.toDouble();
+                    } else {
+                        const QJsonArray arr = v.toArray();
+                        if (arr.size() != 3) throw ArgError{QStringLiteral("\"%1\" must be one number or three").arg(key)};
+                        for (int i = 0; i < 3; ++i) {
+                            if (!arr[i].isDouble()) throw ArgError{QStringLiteral("\"%1\" must be numbers").arg(key)};
+                            out[i] = arr[i].toDouble();
+                        }
+                    }
+                    for (int i = 0; i < 3; ++i)
+                        if (!std::isfinite(out[i]) || out[i] < lo) throw ArgError{QStringLiteral("\"%1\" is out of range").arg(key)};
+                };
+                three("slope", g.slope, 0);
+                three("offset", g.offset, -1e9);
+                three("power", g.power, 1e-6);
+                if (a.contains("saturation")) {
+                    if (!a.value("saturation").isDouble() || a.value("saturation").toDouble() < 0) throw ArgError{QStringLiteral("\"saturation\" must be a number of 0 or more")};
+                    g.saturation = a.value("saturation").toDouble();
+                }
+                if (a.contains("id")) g.id = str(a, "id").toStdString();
+                QString space;
+                if (a.contains("space")) {
+                    space = str(a, "space");
+                    bool known = space == "Working space";
+                    for (const auto& cs : colorSpaces()) known |= QString::fromStdString(cs.label) == space;
+                    if (!known) throw ArgError{QStringLiteral("Unknown colour space \"%1\" (see montage_list_effects for cdl's choices)").arg(space)};
+                }
+                setClipCdl(l.project, c, g);
+                if (!space.isEmpty())
+                    for (Effect& e : c.effects)
+                        if (e.type == "cdl") {
+                            e.strings["space"] = space.toStdString();
+                            break;
+                        }
+                save(l);
+                const QJsonObject o = describe(c, g);
+                return ok(QStringLiteral("Clip %1 graded: %2, saturation %3").arg(qulonglong(c.id)).arg(QString::fromStdString(cdlSopText(g))).arg(g.saturation), o);
+            }
+            if (action == "import") {
+                std::string text = str(a, "text").toStdString();
+                if (a.contains("path")) {
+                    QFile f(absolute(need(a, "path")));
+                    if (!f.open(QIODevice::ReadOnly)) return fail(QStringLiteral("Cannot read %1").arg(f.fileName()));
+                    text = f.readAll().toStdString();
+                }
+                std::string err;
+                const std::vector<Cdl> cdls = parseCdlXml(text, &err);
+                if (cdls.empty()) return fail(QString::fromStdString(err));
+                auto namesOf = [&](const Clip& c) {
+                    std::vector<QString> names{QString::fromStdString(c.name)};
+                    if (const MediaItem* m = l.project.findMedia(c.mediaId)) {
+                        names.push_back(QString::fromStdString(m->name));
+                        if (!m->path.empty()) names.push_back(QFileInfo(QString::fromStdString(m->path)).fileName());
+                        if (auto t = m->metadata.find("tape"); t != m->metadata.end()) names.push_back(QString::fromStdString(t->second));
+                    }
+                    return names;
+                };
+                auto matching = [&](const Clip& c) -> const Cdl* {
+                    for (const Cdl& g : cdls)
+                        for (const QString& n : namesOf(c)) {
+                            const QString id = QString::fromStdString(g.id);
+                            if (!id.isEmpty() && (id.compare(n, Qt::CaseInsensitive) == 0 ||
+                                                  QFileInfo(id).completeBaseName().compare(QFileInfo(n).completeBaseName(), Qt::CaseInsensitive) == 0))
+                                return &g;
+                        }
+                    return nullptr;
+                };
+                int graded = 0;
+                if (a.contains("clip")) {
+                    Clip& c = clipArg(l, a);
+                    if (c.isGenerator()) throw ArgError{QStringLiteral("A CDL grades footage, not a generator")};
+                    const Cdl* g = matching(c);
+                    setClipCdl(l.project, c, g ? *g : cdls.front());
+                    graded = 1;
+                } else {
+                    if (cdls.size() == 1 && cdls.front().id.empty()) throw ArgError{QStringLiteral("The correction has no id to match: give \"clip\"")};
+                    for (Track& t : s.videoTracks)
+                        for (Clip& c : t.clips)
+                            if (!c.isGenerator())
+                                if (const Cdl* g = matching(c)) {
+                                    setClipCdl(l.project, c, *g);
+                                    ++graded;
+                                }
+                }
+                if (graded) save(l);
+                return ok(QStringLiteral("%1 correction(s) read; %2 clip(s) graded").arg(cdls.size()).arg(graded), QJsonObject{{"corrections", int(cdls.size())}, {"clips", graded}});
+            }
+            if (action != "export") throw ArgError{QStringLiteral("\"action\" must be get, set, import or export")};
+            std::vector<Cdl> cdls;
+            auto take = [&](const Clip& c) {
+                Cdl g;
+                if (!clipCdl(c, c.start, g)) return;
+                if (g.id.empty()) g.id = c.name;
+                cdls.push_back(g);
+            };
+            if (a.contains("clip")) take(clipArg(l, a));
+            else
+                for (const Track& t : s.videoTracks)
+                    for (const Clip& c : t.clips) take(c);
+            if (cdls.empty()) return fail(QStringLiteral("No CDL to export"));
+            const QString fmt = str(a, "format", a.contains("path") ? QString::fromStdString(std::string(cdlFormatFor(need(a, "path").toStdString()) == CdlFormat::Cc ? "cc" : cdlFormatFor(need(a, "path").toStdString()) == CdlFormat::Ccc ? "ccc" : "cdl")) : QStringLiteral("cdl"));
+            const CdlFormat format = fmt == "cc" ? CdlFormat::Cc : fmt == "ccc" ? CdlFormat::Ccc : CdlFormat::Cdl;
+            if (format == CdlFormat::Cc && cdls.size() > 1) return fail(QStringLiteral("A .cc holds one correction; %1 clips have CDLs (give \"clip\", or use ccc or cdl)").arg(cdls.size()));
+            const std::string xml = writeCdlXml(cdls, format);
+            if (a.contains("path")) {
+                QFile f(absolute(need(a, "path")));
+                if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate) || f.write(xml.data(), qint64(xml.size())) != qint64(xml.size()))
+                    return fail(QStringLiteral("Cannot write %1").arg(f.fileName()));
+                return ok(QStringLiteral("Wrote %1 correction(s) to %2").arg(cdls.size()).arg(f.fileName()));
+            }
+            return ok(QString::fromStdString(xml));
         });
 
     add("montage_consolidate", "Copy the project and its media",

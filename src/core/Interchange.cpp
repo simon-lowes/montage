@@ -10,6 +10,7 @@
 #include <iomanip>
 #include <sstream>
 
+#include "Cdl.h"
 #include "EditOps.h"
 #include "Effects.h"
 #include "Interpretation.h"
@@ -53,6 +54,14 @@ struct EdlWriter {
         if (speed != 1.0 || c.reverse)
             out << "M2   " << reelFor(c) << "       " << std::fixed << std::setprecision(1)
                 << (c.reverse ? -1 : 1) * speed * s.fpsValue() << "    " << tc(src(c, c.start)) << "\n";
+        cdl(c);
+    }
+    // The clip's ASC CDL, as Resolve and Baselight write and read it.
+    void cdl(const Clip& c) {
+        Cdl g;
+        if (!clipCdl(c, c.start, g)) return;
+        out << "*ASC_SOP " << cdlSopText(g) << "\n";
+        out << "*ASC_SAT " << cdlNumber(g.saturation) << "\n";
     }
 
     void line(const std::string& reel, const std::string& channel, const std::string& type, FrameTime srcIn,
@@ -87,6 +96,7 @@ struct EdlWriter {
                 line(reelFor(c), channel, type, src(c, from), src(c, recOut), from, recOut);
                 if (a) out << "* FROM CLIP NAME: " << a->name << "\n";
                 out << "* TO CLIP NAME: " << c.name << "\n";
+                cdl(c);
                 continue;
             }
             ++event;

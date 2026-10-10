@@ -4,6 +4,7 @@
 #include "ColorSpace.h"
 #include "Ocio.h"
 #include "VideoFx.h"
+#include "core/Cdl.h"
 #include "core/Effects.h"
 #include "core/ColorWarp.h"
 #include "core/MaskPath.h"
@@ -330,6 +331,41 @@ void applyLut(const Effect& e, FrameTime t, Image& img) {
         r += (nr - r) * strength;
         g += (ng - g) * strength;
         b += (nb - b) * strength;
+    });
+}
+
+// ASC CDL, in the working space or converted into the space it was made in and back.
+void applyCdlEffect(const Effect& e, FrameTime t, Image& img) {
+    Clip holder;
+    holder.effects.push_back(e);
+    holder.effects.back().enabled = true;
+    Cdl cdl;
+    if (!clipCdl(holder, t, cdl) || cdl.identity()) return;
+    const ColorSpace* space = nullptr;
+    for (const auto& cs : colorSpaces())
+        if (cs.label == e.s("space")) space = &cs;
+    const ColorSpace& working = currentWorkingSpace();
+    if (!space || space->id == working.id) {
+        perPixel(img, [&](float& r, float& g, float& b, float&) { applyCdl(cdl, r, g, b); });
+        return;
+    }
+    // Into that space and back exactly (linear light through its primaries and curve, no display rendering), so only
+    // the CDL changes the picture.
+    double to[9], from[9];
+    primariesMatrix(working.primaries, space->primaries, to);
+    primariesMatrix(space->primaries, working.primaries, from);
+    auto through = [](const double m[9], Transfer a, Transfer b, float v[3]) {
+        double l[3], o[3];
+        for (int i = 0; i < 3; ++i) l[i] = toLinear(a, v[i]);
+        for (int i = 0; i < 3; ++i) o[i] = m[i * 3] * l[0] + m[i * 3 + 1] * l[1] + m[i * 3 + 2] * l[2];
+        for (int i = 0; i < 3; ++i) v[i] = float(fromLinear(b, o[i]));
+    };
+    perPixel(img, [&](float& r, float& g, float& b, float&) {
+        float v[3] = {r, g, b};
+        through(to, working.transfer, space->transfer, v);
+        applyCdl(cdl, v[0], v[1], v[2]);
+        through(from, space->transfer, working.transfer, v);
+        r = v[0], g = v[1], b = v[2];
     });
 }
 
@@ -1567,6 +1603,7 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
     else if (ty == "hdr_palette") hdrPalette(e, t, img);
     else if (ty == "hue_sat") hueSat(e, t, img);
     else if (ty == "lut") applyLut(e, t, img);
+    else if (ty == "cdl") applyCdlEffect(e, t, img);
     else if (ty == "color_space_transform") {
         const ColorSpace* from = nullptr;
         const ColorSpace* to = nullptr;

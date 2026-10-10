@@ -15,6 +15,7 @@
 #include <optional>
 #include <set>
 
+#include "Cdl.h"
 #include "EditOps.h"
 #include "Effects.h"
 #include "History.h"
@@ -474,6 +475,8 @@ ImportResult importEdl(Project& p, const std::string& text, Rational fps, const 
         FrameTime srcIn = 0, srcOut = 0, recIn = 0, recOut = 0;
         std::string name, file;
         double speed = 1;
+        bool hasCdl = false;  // an ASC CDL in the event's comments
+        Cdl cdl;
     };
     std::vector<Event> events;
     auto tc = [&](const QString& s) {
@@ -501,6 +504,17 @@ ImportResult importEdl(Project& p, const std::string& text, Rational fps, const 
         if (l.startsWith("* FROM CLIP NAME:")) events.back().name = l.mid(17).trimmed().toStdString();
         else if (l.startsWith("* TO CLIP NAME:")) events.back().name = l.mid(15).trimmed().toStdString();
         else if (l.startsWith("* SOURCE FILE:")) events.back().file = l.mid(14).trimmed().toStdString();
+        else if (QString compact = QString(l).remove(' '); compact.startsWith("*ASC_SOP", Qt::CaseInsensitive)) {
+            const int at = l.indexOf("ASC_SOP", 0, Qt::CaseInsensitive) + 7;
+            events.back().hasCdl |= parseCdlSop(l.mid(at).toStdString(), events.back().cdl);
+        } else if (compact.startsWith("*ASC_SAT", Qt::CaseInsensitive)) {
+            bool ok = false;
+            const double v = l.mid(l.indexOf("ASC_SAT", 0, Qt::CaseInsensitive) + 7).trimmed().toDouble(&ok);
+            if (ok && std::isfinite(v)) {
+                events.back().cdl.saturation = std::max(0.0, v);
+                events.back().hasCdl = true;
+            }
+        }
         else if (auto m = m2Re.match(l); m.hasMatch() && fps.toDouble() > 0) events.back().speed = m.captured(2).toDouble() / fps.toDouble();
     }
     if (events.empty()) {
@@ -567,6 +581,7 @@ ImportResult importEdl(Project& p, const std::string& text, Rational fps, const 
             if (!c) continue;
             c->speed = std::max(0.01, std::fabs(e.speed));
             c->reverse = e.speed < 0;
+            if (e.hasCdl && kind == TrackKind::Video && !black) setClipCdl(p, *c, e.cdl);
             if (dissolve > 0 && lastClip.count(chKey)) {
                 // The outgoing clip runs to the middle of the dissolve.
                 if (Clip* prev = edit::clipById(b.sequence(), lastClip[chKey]); prev && prev->end() <= recIn) {

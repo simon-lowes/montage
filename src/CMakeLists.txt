@@ -1,6 +1,8 @@
 add_library(montage_engine STATIC
   core/Model.h core/Model.cpp
   core/MediaLog.h core/MediaLog.cpp
+  core/Cdl.h core/Cdl.cpp
+  core/Ale.h core/Ale.cpp
   core/KeyframeEdit.h core/KeyframeEdit.cpp
   core/MaskPath.h core/MaskPath.cpp
   core/ColorWarp.h core/ColorWarp.cpp

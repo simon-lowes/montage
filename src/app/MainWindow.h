@@ -217,6 +217,16 @@ public:
     int importMarkers(const QString& path);
     // Bakes the colour effects of the clip a command acts on, at the playhead, into a .cube file.
     bool exportClipLut(const QString& path, int size = 33);
+    // Avid Log Exchange (core/Ale.h): an ALE's log fields and CDLs onto the matching media (and, with `cdlToClips`,
+    // the CDLs onto their clips), as one undo step, returning how many media items matched (-1 if it cannot be read);
+    // the selected media (else all) as an ALE.
+    int importAle(const QString& path, bool cdlToClips = true);
+    bool exportAle(const QString& path);
+    // ASC CDL files (core/Cdl.h): a .cc, .ccc or .cdl onto the selected video clips (one correction onto all of them,
+    // a collection matched by id to each clip's name, file or tape), returning how many clips were graded; the selected
+    // clips' CDLs (else every clip with one) as a .cc (one) or a .ccc or .cdl.
+    int importCdl(const QString& path);
+    bool exportCdl(const QString& path);
     // File › Link Media: the dialog for the offline media (shown by itself when a project opens with some), or a
     // message and nullptr when nothing is offline.
     LinkMediaDialog* showLinkMedia();

@@ -555,6 +555,87 @@ class TestMedia : public QObject {
     std::string path(const char* name) { return (dir_.path() + "/" + name).toStdString(); }
 
 private slots:
+    void ascCdlAndAleOverMcp() {
+        // A project with two (offline) camera files, one cut in twice.
+        Project q = makeDefaultProject();
+        auto add = [&](const char* name, double tc) {
+            MediaItem m;
+            m.id = q.newId();
+            m.kind = MediaKind::Video;
+            m.name = name;
+            m.path = std::string("/cards/") + name;
+            m.duration = 10;
+            m.width = 1920;
+            m.height = 1080;
+            m.fps = {25, 1};
+            m.hasVideo = true;
+            m.timecode = tc;
+            q.media.push_back(m);
+            return m.id;
+        };
+        const Id a = add("A001C001.mov", 36000), b = add("A001C002.mov", 36010);
+        QVERIFY(edit::placeMedia(q, *q.active(), a, 0, 0, 50, {TrackKind::Video, 0}, {}, false).ok);
+        QVERIFY(edit::placeMedia(q, *q.active(), a, 50, 100, 150, {TrackKind::Video, 0}, {}, false).ok);
+        QVERIFY(edit::placeMedia(q, *q.active(), b, 150, 0, 50, {TrackKind::Video, 0}, {}, false).ok);
+        const QString project = QString::fromStdString(path("cdl.montage"));
+        QVERIFY(saveProject(q, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) { return r.value("content").toArray().at(0).toObject().value("text").toString(); };
+        // An ALE from the lab: scene, take and a CDL for A; B by name without its extension; one row for nothing.
+        const QString ale = "Heading\nFIELD_DELIM\tTABS\nFPS\t25\n\nColumn\nName\tSource File\tScene\tTake\tASC_SOP\tASC_SAT\n\nData\n"
+                            "A001C001\tA001C001.mov\t4\t2\t(1.2 1.0 0.8)(0 0 0)(1 1 1)\t0.5\n"
+                            "A001C002\t\t4\t3\t\t\n"
+                            "Z009C001\tZ009C001.mov\t9\t1\t\t\n";
+        QJsonObject r = call("montage_ale", {{"project", project}, {"action", "import"}, {"text", ale}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY2(text(r).contains("2 of 3 row(s) matched") && text(r).contains("1 CDL") && text(r).contains("2 clip(s) graded"), qPrintable(text(r)));
+        QCOMPARE(r.value("structuredContent").toObject().value("unmatched").toArray().at(0).toString(), QString("Z009C001"));
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.findMedia(b)->metadata.at("take"), std::string("3"));
+        const double clip0 = double(back.active()->videoTracks[0].clips.at(0).id), clipB = double(back.active()->videoTracks[0].clips.at(2).id);
+        r = call("montage_cdl", {{"project", project}, {"action", "get"}, {"clip", clip0}});
+        QVERIFY2(text(r).contains("(1.200000 1.000000 0.800000)"), qPrintable(text(r)));
+        QCOMPARE(r.value("structuredContent").toObject().value("saturation").toDouble(), 0.5);
+        QVERIFY(text(call("montage_cdl", {{"project", project}, {"action", "get"}, {"clip", clipB}})).contains("no CDL"));
+        // Set by hand, in a camera log, then out as a collection and back by id.
+        r = call("montage_cdl", {{"project", project}, {"action", "set"}, {"clip", clipB}, {"slope", 1.1}, {"offset", QJsonArray{0.01, 0, -0.01}},
+                                 {"saturation", 1.2}, {"space", "ACEScct"}, {"id", "A001C002"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QCOMPARE(r.value("structuredContent").toObject().value("space").toString(), QString("ACEScct"));
+        QVERIFY(call("montage_cdl", {{"project", project}, {"action", "set"}, {"clip", clipB}, {"space", "Mars Log"}}).value("isError").toBool());
+        QVERIFY(call("montage_cdl", {{"project", project}, {"action", "set"}, {"clip", clipB}, {"power", QJsonArray{1, 0}}}).value("isError").toBool());
+        QVERIFY(call("montage_cdl", {{"project", project}, {"action", "set"}, {"clip", clipB}, {"saturation", -1}}).value("isError").toBool());
+        r = call("montage_cdl", {{"project", project}, {"action", "export"}, {"format", "ccc"}});
+        QVERIFY2(text(r).contains("<ColorCorrectionCollection") && text(r).count("<ColorCorrection ") == 3, qPrintable(text(r)));
+        QVERIFY(call("montage_cdl", {{"project", project}, {"action", "export"}, {"format", "cc"}}).value("isError").toBool());
+        const QString cdlFile = QString::fromStdString(path("look.cc"));
+        r = call("montage_cdl", {{"project", project}, {"action", "export"}, {"clip", clipB}, {"path", cdlFile}});
+        QVERIFY2(!r.value("isError").toBool() && QFileInfo::exists(cdlFile), qPrintable(text(r)));
+        // Onto every clip whose file matches: the .cc's id is A001C002, so only B's clip.
+        r = call("montage_cdl", {{"project", project}, {"action", "import"}, {"path", cdlFile}});
+        QVERIFY2(text(r).contains("1 clip(s) graded"), qPrintable(text(r)));
+        r = call("montage_cdl", {{"project", project}, {"action", "import"}, {"path", cdlFile}, {"clip", clip0}});
+        QVERIFY2(text(r).contains("1 clip(s) graded"), qPrintable(text(r)));
+        r = call("montage_cdl", {{"project", project}, {"action", "get"}, {"clip", clip0}});
+        QVERIFY2(text(r).contains("(1.100000 1.100000 1.100000)(0.010000 0.000000 -0.010000)"), qPrintable(text(r)));
+        QVERIFY(call("montage_cdl", {{"project", project}, {"action", "import"}, {"text", "<x/>"}}).value("isError").toBool());
+        // An ALE of the media, with the CDLs.
+        r = call("montage_ale", {{"project", project}, {"action", "export"}});
+        QVERIFY2(text(r).contains("ASC_SOP") && text(r).contains("A001C002.mov\t4\t\t3") && text(r).contains("10:00:00:00\t10:00:10:00"), qPrintable(text(r)));
+        QVERIFY(call("montage_ale", {{"project", project}, {"action", "export"}, {"media", QJsonArray{"Nope"}}}).value("isError").toBool());
+        QVERIFY(call("montage_ale", {{"project", project}, {"action", "import"}, {"text", "nothing"}}).value("isError").toBool());
+        QVERIFY(call("montage_ale", {{"project", project}, {"action", "rename"}}).value("isError").toBool());
+    }
+
     void probeAndDecodeWav() {
         std::string wav = path("tone.wav");
         writeWav(wav, 48000, 1.0, 0.5f, -0.25f);

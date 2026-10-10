@@ -6,6 +6,8 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 
+#include "core/Ale.h"
+#include "core/Cdl.h"
 #include "core/TranscriptCorrect.h"
 #include "core/SpellCheck.h"
 #include "core/ColorGroups.h"
@@ -6400,6 +6402,175 @@ private slots:
         QVERIFY(!importXmlTimeline(p, "not xml").ok);
         QVERIFY(!importOtio(p, "{}").ok);
         QVERIFY(!importEdl(p, "nothing here", {25, 1}).ok);
+    }
+
+    void ascCdlAndAle() {
+        // The CDL maths, v1.2: slope, offset, clamp, power; saturation about Rec. 709 luma, clamped.
+        Cdl g;
+        g.slope[0] = 1.2;
+        g.offset[1] = -0.05;
+        g.power[2] = 1.5;
+        g.saturation = 0.8;
+        float r = 0.5f, gr = 0.4f, b = 0.3f;
+        applyCdl(g, r, gr, b);
+        const double R = 0.6, G = 0.35, B = std::pow(0.3, 1.5);
+        const double Y = 0.2126 * R + 0.7152 * G + 0.0722 * B;
+        QVERIFY(std::fabs(r - (Y + 0.8 * (R - Y))) < 1e-5 && std::fabs(gr - (Y + 0.8 * (G - Y))) < 1e-5 && std::fabs(b - (Y + 0.8 * (B - Y))) < 1e-5);
+        Cdl hot;
+        hot.slope[0] = 3;
+        hot.offset[1] = -0.5;
+        hot.power[1] = 0.5;  // a negative base would be NaN without the clamp
+        r = 0.5f, gr = 0.2f, b = 0.25f;
+        applyCdl(hot, r, gr, b);
+        QCOMPARE(r, 1.0f);
+        QCOMPARE(gr, 0.0f);
+        QCOMPARE(b, 0.25f);
+        QVERIFY(Cdl{}.identity() && !g.identity());
+        // As EDLs and ALEs carry it.
+        QCOMPARE(cdlSopText(g), std::string("(1.200000 1.000000 1.000000)(0.000000 -0.050000 0.000000)(1.000000 1.000000 1.500000)"));
+        Cdl back;
+        QVERIFY(parseCdlSop(cdlSopText(g), back));
+        back.saturation = 0.8;
+        QVERIFY(back.sameGrade(g));
+        QVERIFY(parseCdlSop(" ( 0.9 1 1.1 ) (0 0 0)(1 1 1) ", back) && back.slope[0] == 0.9 && back.slope[2] == 1.1);
+        QVERIFY(!parseCdlSop("(1 1)(0 0 0)(1 1 1)", back) && !parseCdlSop("hello", back));
+        // .cc, .ccc and .cdl files; CDL 1.0's SATNode; a description; one value for three.
+        const std::string cc = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+            "<ColorCorrection id=\"A001C003\" xmlns=\"urn:ASC:CDL:v1.01\"><Description>day ext</Description>\n"
+            "<SOPNode><Slope>1.1 1.0 0.9</Slope><Offset>0.01 0 -0.01</Offset><Power>1 1 1</Power></SOPNode>\n"
+            "<SatNode><Saturation>1.2</Saturation></SatNode></ColorCorrection>";
+        std::vector<Cdl> got = parseCdlXml(cc);
+        QCOMPARE(got.size(), size_t(1));
+        QCOMPARE(got[0].id, std::string("A001C003"));
+        QCOMPARE(got[0].description, std::string("day ext"));
+        QCOMPARE(got[0].slope[2], 0.9);
+        QCOMPARE(got[0].offset[0], 0.01);
+        QCOMPARE(got[0].saturation, 1.2);
+        const std::string ccc = "<ColorCorrectionCollection xmlns=\"urn:ASC:CDL:v1.01\">\n"
+            "<ColorCorrection id=\"one\"><SOPNode><Slope>2</Slope><Offset>0 0 0</Offset><Power>1 1 1</Power></SOPNode></ColorCorrection>\n"
+            "<ColorCorrection id=\"two\"><SOPNode><Slope>1 1 1</Slope><Offset>0 0 0</Offset><Power>1 1 1</Power></SOPNode><SATNode><Saturation>0</Saturation></SATNode></ColorCorrection>\n"
+            "</ColorCorrectionCollection>";
+        got = parseCdlXml(ccc);
+        QCOMPARE(got.size(), size_t(2));
+        QCOMPARE(got[0].slope[1], 2.0);
+        QCOMPARE(got[1].id, std::string("two"));
+        QCOMPARE(got[1].saturation, 0.0);
+        std::string err;
+        QVERIFY(parseCdlXml("<ColorDecisionList/>", &err).empty() && !err.empty());
+        QVERIFY(parseCdlXml("not xml", &err).empty());
+        QVERIFY(parseCdlXml("<ColorCorrection><SOPNode><Slope>a b c</Slope></SOPNode></ColorCorrection>", &err).empty());
+        // Written and read back, in each form.
+        g.id = "A001C001";
+        Cdl h = got[0];
+        for (CdlFormat f : {CdlFormat::Cc, CdlFormat::Ccc, CdlFormat::Cdl}) {
+            const std::string xml = writeCdlXml(f == CdlFormat::Cc ? std::vector<Cdl>{g} : std::vector<Cdl>{g, h}, f);
+            QVERIFY(xml.find("urn:ASC:CDL:v1.01") != std::string::npos);
+            const std::vector<Cdl> again = parseCdlXml(xml);
+            QCOMPARE(again.size(), f == CdlFormat::Cc ? size_t(1) : size_t(2));
+            QVERIFY(again[0].sameGrade(g) && again[0].id == "A001C001");
+        }
+        QVERIFY(writeCdlXml({g}, CdlFormat::Cdl).find("<ColorDecision>") != std::string::npos);
+        QCOMPARE(cdlFormatFor("/x/look.CC"), CdlFormat::Cc);
+        QCOMPARE(cdlFormatFor("/x/all.ccc"), CdlFormat::Ccc);
+
+        // An ALE as the lab sends it: CRLF, trailing tabs, a column left off one row.
+        const std::string ale =
+            "Heading\r\nFIELD_DELIM\tTABS\r\nVIDEO_FORMAT\t1080\r\nAUDIO_FORMAT\t48khz\r\nFPS\t23.976\r\n\r\n"
+            "Column\r\nName\tTracks\tStart\tEnd\tTape\tSource File\tScene\tTake\tComments\tASC_SOP\tASC_SAT\t\r\n\r\n"
+            "Data\r\n"
+            "A001C001_250101_R1AB\tVA1A2\t10:00:00:00\t10:00:10:00\t\tA001C001_250101_R1AB.mov\t12A\t3\tcircled\t(1.1 1.0 0.9)(0.0 0.0 0.01)(1.0 1.0 1.0)\t0.9\t\r\n"
+            "B-cam\tV\t01:00:00:00\t01:00:05:00\tB001\t\t12A\t4\r\n"
+            "Mystery\tV\t02:00:00:00\t02:00:01:00\tX\tnothing.mov\t1\t1\t\t\t\r\n";
+        AleTable t;
+        QVERIFY(parseAle(ale, t, &err));
+        QCOMPARE(t.fps(), (Rational{24000, 1001}));
+        QCOMPARE(t.rows.size(), size_t(3));
+        QCOMPARE(t.value(0, "source file"), std::string("A001C001_250101_R1AB.mov"));
+        QCOMPARE(t.value(1, "ASC_SOP"), std::string());
+        QVERIFY(!parseAle("Name\tTracks\nfoo\tV\n", t, &err));
+        QVERIFY(parseAle(ale, t));
+        // Onto a project: by file, by tape and start timecode; a row with no media reported.
+        Project p = makeDefaultProject();
+        auto addMedia = [&](const char* name, const char* path, double tc) {
+            MediaItem m;
+            m.id = p.newId();
+            m.kind = MediaKind::Video;
+            m.name = name;
+            m.path = path;
+            m.duration = 10;
+            m.width = 1920;
+            m.height = 1080;
+            m.fps = {24000, 1001};
+            m.hasVideo = m.hasAudio = true;
+            m.channels = 2;
+            m.timecode = tc;
+            p.media.push_back(m);
+            return m.id;
+        };
+        const Id a = addMedia("A001C001_250101_R1AB.mov", "/cards/A001/A001C001_250101_R1AB.mov", 36036.0);
+        const Id bc = addMedia("Interview B", "/cards/B001/B001C007.mov", 3603.6);
+        p.findMedia(bc)->metadata["tape"] = "B001";
+        Sequence& s = *p.active();
+        QVERIFY(edit::placeMedia(p, s, a, 0, 0, 48, V1, A1, false).ok);
+        QVERIFY(edit::placeMedia(p, s, a, 48, 100, 148, V1, A1, false).ok);
+        const AleImport ar = applyAle(p, t, true);
+        QCOMPARE(ar.rows, 3);
+        QCOMPARE(ar.matched.size(), size_t(2));
+        QCOMPARE(ar.unmatched, std::vector<std::string>{"Mystery"});
+        QCOMPARE(ar.cdls, 1);
+        QCOMPARE(ar.clips, 2);  // both clips of A, picture only
+        const MediaItem& ma = *p.findMedia(a);
+        QCOMPARE(ma.metadata.at("scene"), std::string("12A"));
+        QCOMPARE(ma.metadata.at("take"), std::string("3"));
+        QCOMPARE(ma.metadata.at("comment"), std::string("circled"));
+        QVERIFY(!ma.metadata.count("tape"));  // empty cells change nothing
+        QCOMPARE(p.findMedia(bc)->metadata.at("take"), std::string("4"));
+        Cdl mc, cc0;
+        QVERIFY(mediaCdl(ma, mc) && mc.slope[0] == 1.1 && mc.offset[2] == 0.01 && mc.saturation == 0.9);
+        QVERIFY(!mediaCdl(*p.findMedia(bc), mc));
+        QVERIFY(clipCdl(trackAt(s, V1)->clips.at(1), 50, cc0) && cc0.sameGrade(mc));
+        QVERIFY(!clipCdl(trackAt(s, A1)->clips.at(0), 0, cc0));
+        // An ALE of the media, read back into a fresh copy: the same log and CDL.
+        const AleTable out = aleFromMedia(p, {a, bc}, {24000, 1001});
+        const std::string text = writeAle(out);
+        QVERIFY(text.find("FPS\t23.976") != std::string::npos);
+        AleTable in;
+        QVERIFY(parseAle(text, in));
+        QCOMPARE(in.value(0, "Start"), std::string("10:00:00:00"));
+        QCOMPARE(in.value(0, "End"), std::string("10:00:10:00"));  // 10 s, the frame after the last
+        QCOMPARE(in.value(0, "Tracks"), std::string("VA1A2"));
+        QCOMPARE(in.value(1, "Tape"), std::string("B001"));
+        QCOMPARE(in.value(1, "Start"), std::string("01:00:00:00"));
+        QCOMPARE(in.value(0, "ASC_SOP"), cdlSopText(mc));
+        QCOMPARE(in.value(1, "ASC_SOP"), std::string());
+        Project fresh = p;
+        for (MediaItem& m : fresh.media) m.metadata.clear();
+        fresh.findMedia(bc)->metadata["tape"] = "B001";
+        const AleImport r2 = applyAle(fresh, in, false);
+        QCOMPARE(r2.matched.size(), size_t(2));
+        QCOMPARE(r2.clips, 0);
+        QCOMPARE(fresh.findMedia(a)->metadata.at("scene"), std::string("12A"));
+        QVERIFY(mediaCdl(*fresh.findMedia(a), cc0) && cc0.sameGrade(mc));
+
+        // EDLs carry a clip's CDL as *ASC_SOP and *ASC_SAT and read it back.
+        const std::string edl = exportEdl(p, s);
+        QVERIFY(edl.find("*ASC_SOP (1.100000 1.000000 0.900000)(0.000000 0.000000 0.010000)(1.000000 1.000000 1.000000)\n*ASC_SAT 0.900000") != std::string::npos);
+        Project q = makeDefaultProject();
+        ImportResult ir = importEdl(q, edl, s.fps);
+        QVERIFY2(ir.ok, ir.error.c_str());
+        Cdl fromEdl;
+        QVERIFY(clipCdl(trackAt(*q.findSequence(ir.sequence), V1)->clips.at(1), 0, fromEdl) && fromEdl.sameGrade(mc));
+        QVERIFY(!clipCdl(trackAt(*q.findSequence(ir.sequence), A1)->clips.at(0), 0, fromEdl));
+        // Setting a CDL replaces the clip's, put first after an input transform.
+        Clip& c0 = trackAt(s, V1)->clips[0];
+        c0.effects.clear();
+        c0.effects.push_back(makeEffect(p, "color_space_transform"));
+        c0.effects.push_back(makeEffect(p, "lut"));
+        setClipCdl(p, c0, g);
+        setClipCdl(p, c0, h);
+        QCOMPARE(c0.effects.size(), size_t(3));
+        QCOMPARE(c0.effects[1].type, std::string("cdl"));
+        QVERIFY(clipCdl(c0, 0, cc0) && cc0.sameGrade(h));
     }
 
     void interchangeCompoundAndMulticam() {

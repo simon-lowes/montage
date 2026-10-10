@@ -52,6 +52,7 @@
 #include <QSpinBox>
 #include <QStandardPaths>
 #include <QTimer>
+#include <QSaveFile>
 #include <QSettings>
 #include <QShortcut>
 #include <QStatusBar>
@@ -74,6 +75,8 @@
 #include "core/AudioChannels.h"
 #include "render/ClipPlacement.h"
 #include "core/Chapters.h"
+#include "core/Ale.h"
+#include "core/Cdl.h"
 #include "core/ChapterSuggest.h"
 #include "core/MarkerList.h"
 #include "render/AudioReactive.h"
@@ -800,6 +803,14 @@ void MainWindow::buildMenus() {
     add(file, tr("Export &Frame…"), QKeySequence("Ctrl+Shift+E"), [this] { exportFrame(); });
     add(file, tr("Export &VFX Pulls…"), QKeySequence(), [this] { vfxPullDialog(); })->setObjectName(QStringLiteral("vfxPulls"));
     add(file, tr("&Import Timeline (FCP XML, FCPXML, OTIO, EDL, AAF)…"), QKeySequence(), [this] { importTimeline(); });
+    add(file, tr("Import A&LE (Avid Log Exchange)…"), QKeySequence(), [this] {
+        const QString path = QFileDialog::getOpenFileName(this, tr("Import ALE"), QString(), tr("Avid Log Exchange (*.ale *.ALE);;All files (*)"));
+        if (!path.isEmpty()) importAle(path);
+    })->setObjectName(QStringLiteral("importAle"));
+    add(file, tr("Export ALE…"), QKeySequence(), [this] {
+        const QString path = QFileDialog::getSaveFileName(this, tr("Export ALE"), QString(), tr("Avid Log Exchange (*.ale)"));
+        if (!path.isEmpty()) exportAle(path.endsWith(QLatin1String(".ale"), Qt::CaseInsensitive) ? path : path + QStringLiteral(".ale"));
+    })->setObjectName(QStringLiteral("exportAle"));
     add(file, tr("Export Final Cut Pro &7 XML (Premiere, Resolve)…"), QKeySequence(), [this] { exportInterchange(Interchange::Fcp7Xml); });
     add(file, tr("Export &FCPXML (Final Cut Pro)…"), QKeySequence(), [this] { exportInterchange(Interchange::FcpXml); });
     add(file, tr("Export E&DL (CMX 3600)…"), QKeySequence(), [this] { exportInterchange(Interchange::Edl); });
@@ -922,6 +933,19 @@ void MainWindow::buildMenus() {
         const QString path = QFileDialog::getSaveFileName(this, tr("Export LUT"), QString(), tr("LUT files (*.cube)"));
         if (!path.isEmpty()) exportClipLut(path.endsWith(QLatin1String(".cube"), Qt::CaseInsensitive) ? path : path + QStringLiteral(".cube"));
     })->setObjectName(QStringLiteral("exportLut"));
+    add(clipM, tr("Import CDL…"), QKeySequence(), [this] {
+        const QString path = QFileDialog::getOpenFileName(this, tr("Import CDL"), QString(), tr("ASC CDL (*.cdl *.cc *.ccc);;All files (*)"));
+        if (!path.isEmpty()) importCdl(path);
+    })->setObjectName(QStringLiteral("importCdl"));
+    add(clipM, tr("Export CDL…"), QKeySequence(), [this] {
+        QString filter;
+        const QString path = QFileDialog::getSaveFileName(this, tr("Export CDL"), QString(),
+                                                          tr("Color Decision List (*.cdl);;Color Correction (*.cc);;Color Correction Collection (*.ccc)"), &filter);
+        if (path.isEmpty()) return;
+        const QString ext = QFileInfo(path).suffix().toLower();
+        const QString want = filter.contains("*.ccc") ? "ccc" : filter.contains("*.cc") ? "cc" : "cdl";
+        exportCdl(ext == "cdl" || ext == "cc" || ext == "ccc" ? path : path + "." + want);
+    })->setObjectName(QStringLiteral("exportCdl"));
     add(clipM, tr("Find Similar S&hots"), QKeySequence(), [this] { findSimilarShots(); })->setObjectName(QStringLiteral("findSimilarShots"));
     add(clipM, tr("Checkerboard Dialogue by Speaker"), QKeySequence(), withSeq([this] {
             // The selected audio clips, each split where the speaker changes, a track per person.
@@ -3073,6 +3097,138 @@ int MainWindow::importMarkers(const QString& path) {
     });
     statusBar()->showMessage(tr("Imported %n marker(s)", nullptr, int(markers.size())), 6000);
     return int(markers.size());
+}
+
+int MainWindow::importAle(const QString& path, bool cdlToClips) {
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly)) {
+        state_->message(tr("Cannot read %1").arg(path), 6000);
+        return -1;
+    }
+    AleTable table;
+    std::string err;
+    if (!parseAle(f.readAll().toStdString(), table, &err)) {
+        state_->message(QString::fromStdString(err), 6000);
+        return -1;
+    }
+    AleImport result;
+    state_->edit(tr("Import ALE"), [&](Project& p, Sequence&) {
+        result = applyAle(p, table, cdlToClips);
+        return !result.matched.empty();
+    });
+    QString msg = tr("ALE: %1 of %2 rows matched media").arg(result.matched.size()).arg(result.rows);
+    if (result.cdls) msg += tr(", %n CDL(s)", nullptr, result.cdls);
+    if (result.clips) msg += tr(", %n clip(s) graded", nullptr, result.clips);
+    if (!result.unmatched.empty()) msg += tr("; not found: %1").arg(QString::fromStdString(result.unmatched.front())) + (result.unmatched.size() > 1 ? tr(" and %n more", nullptr, int(result.unmatched.size() - 1)) : QString());
+    state_->message(msg, 8000);
+    return int(result.matched.size());
+}
+
+bool MainWindow::exportAle(const QString& path) {
+    std::vector<Id> ids = bin_->selectedMedia();
+    if (ids.empty())
+        for (const MediaItem& m : state_->project().media) ids.push_back(m.id);
+    const Sequence* s = state_->sequence();
+    const AleTable table = aleFromMedia(state_->project(), ids, s ? s->fps : Rational{24, 1});
+    if (table.rows.empty()) {
+        state_->message(tr("No media to log: stills and sequences are left out of an ALE"), 6000);
+        return false;
+    }
+    QSaveFile f(path);
+    const std::string text = writeAle(table);
+    if (!f.open(QIODevice::WriteOnly) || f.write(text.data(), qint64(text.size())) != qint64(text.size()) || !f.commit()) {
+        state_->message(tr("Cannot write %1").arg(path), 6000);
+        return false;
+    }
+    state_->message(tr("Wrote %n media item(s) to %1", nullptr, int(table.rows.size())).arg(QFileInfo(path).fileName()), 6000);
+    return true;
+}
+
+int MainWindow::importCdl(const QString& path) {
+    const Sequence* s = state_->sequence();
+    QFile f(path);
+    if (!s || !f.open(QIODevice::ReadOnly)) {
+        state_->message(tr("Cannot read %1").arg(path), 6000);
+        return 0;
+    }
+    std::string err;
+    const std::vector<Cdl> cdls = parseCdlXml(f.readAll().toStdString(), &err);
+    if (cdls.empty()) {
+        state_->message(QString::fromStdString(err), 6000);
+        return 0;
+    }
+    std::vector<Id> clips;
+    for (Id id : state_->selectedClips())
+        if (auto loc = edit::locate(*s, id); loc && loc->track.kind == TrackKind::Video) clips.push_back(id);
+    if (clips.empty()) {
+        state_->message(tr("Select the video clips to grade with the CDL"), 6000);
+        return 0;
+    }
+    int graded = 0;
+    state_->edit(tr("Import CDL"), [&](Project& p, Sequence& sq) {
+        for (Id id : clips) {
+            Clip* c = edit::clipById(sq, id);
+            if (!c || c->isGenerator()) continue;
+            const Cdl* use = cdls.size() == 1 ? &cdls.front() : nullptr;
+            if (!use) {
+                // A collection: the correction named after this clip, its file or its tape.
+                const MediaItem* m = p.findMedia(c->mediaId);
+                std::vector<QString> names{QString::fromStdString(c->name)};
+                if (m) {
+                    names.push_back(QString::fromStdString(m->name));
+                    if (!m->path.empty()) names.push_back(QFileInfo(QString::fromStdString(m->path)).fileName());
+                    if (auto tape = m->metadata.find("tape"); tape != m->metadata.end()) names.push_back(QString::fromStdString(tape->second));
+                }
+                for (const Cdl& cdl : cdls)
+                    for (const QString& n : names) {
+                        const QString id = QString::fromStdString(cdl.id);
+                        if (!use && !id.isEmpty() && (id.compare(n, Qt::CaseInsensitive) == 0 || QFileInfo(id).completeBaseName().compare(QFileInfo(n).completeBaseName(), Qt::CaseInsensitive) == 0))
+                            use = &cdl;
+                    }
+            }
+            if (!use) continue;
+            setClipCdl(p, *c, *use);
+            ++graded;
+        }
+        return graded > 0;
+    });
+    state_->message(graded ? tr("Graded %n clip(s) with the CDL", nullptr, graded) : tr("No correction in the file matched the selected clips"), 6000);
+    return graded;
+}
+
+bool MainWindow::exportCdl(const QString& path) {
+    const Sequence* s = state_->sequence();
+    if (!s) return false;
+    std::vector<const Clip*> clips;
+    for (Id id : state_->selectedClips())
+        if (const Clip* c = edit::clipById(*s, id)) clips.push_back(c);
+    if (clips.empty())
+        for (const Track& t : s->videoTracks)
+            for (const Clip& c : t.clips) clips.push_back(&c);
+    std::vector<Cdl> cdls;
+    for (const Clip* c : clips) {
+        Cdl cdl;
+        if (!clipCdl(*c, c->start, cdl)) continue;
+        if (cdl.id.empty()) cdl.id = c->name;
+        cdls.push_back(cdl);
+    }
+    if (cdls.empty()) {
+        state_->message(tr("No clip here has an ASC CDL"), 6000);
+        return false;
+    }
+    const CdlFormat format = cdlFormatFor(path.toStdString());
+    if (format == CdlFormat::Cc && cdls.size() > 1) {
+        state_->message(tr("A .cc file holds one correction: select one clip, or export a .ccc or .cdl"), 6000);
+        return false;
+    }
+    QSaveFile f(path);
+    const std::string xml = writeCdlXml(cdls, format);
+    if (!f.open(QIODevice::WriteOnly) || f.write(xml.data(), qint64(xml.size())) != qint64(xml.size()) || !f.commit()) {
+        state_->message(tr("Cannot write %1").arg(path), 6000);
+        return false;
+    }
+    state_->message(tr("Wrote %n CDL(s) to %1", nullptr, int(cdls.size())).arg(QFileInfo(path).fileName()), 6000);
+    return true;
 }
 
 int MainWindow::suggestChapterMarkers(double minSeconds, bool ask) {
