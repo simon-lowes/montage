@@ -244,6 +244,13 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     color_->setToolTip(tr("Deliver in another colour space: an HDR sequence delivered in Rec.709 is tone mapped.\n"
                           "HDR output is 10-bit and tagged; PQ carries HDR10 metadata."));
     form->addRow(tr("Colour:"), color_);
+    hdr10Plus_ = new QCheckBox(tr("HDR10+ metadata (scene by scene)"), form_);
+    hdr10Plus_->setObjectName(QStringLiteral("exportHdr10Plus"));
+    hdr10Plus_->setToolTip(tr("Each scene's light measured (SMPTE ST 2094-40) so HDR10+ televisions tone map it scene by scene: "
+                              "carried in HEVC and AV1 video, and written beside the file as .hdr10plus.json for other formats. "
+                              "Uses Analyse HDR Light Levels' measurements while the cut still matches them, else measures first."));
+    hdr10Plus_->setChecked(appSettings().value("export/hdr10Plus", false).toBool());
+    form->addRow(QString(), hdr10Plus_);
     // A stereoscopic 3D sequence: how its eyes are delivered (render/Stereo.h).
     stereo_ = new QComboBox(form_);
     stereo_->setObjectName(QStringLiteral("exportStereo"));
@@ -397,7 +404,10 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     connect(width_, &QSpinBox::valueChanged, this, [this](int w) { widthChanged(w); });
     connect(height_, &QSpinBox::valueChanged, this, [this](int h) { heightChanged(h); });
     connect(quality_, &QSpinBox::valueChanged, this, [this] { updateSummary(); });
-    connect(color_, &QComboBox::currentIndexChanged, this, [this] { updateSummary(); });
+    connect(color_, &QComboBox::currentIndexChanged, this, [this] {
+        updateSummary();
+        updateControls();
+    });
     connect(&watcher_, &QFutureWatcher<Result>::finished, this, [this] { exportFinished(); });
 
     presetChanged();
@@ -506,6 +516,14 @@ void ExportDialog::updateControls() {
     width_->setEnabled(video && !matchSize_->isChecked());
     height_->setEnabled(video && !matchSize_->isChecked());
     color_->setEnabled(video);
+    {
+        // HDR10+ is HDR10's: PQ output only.
+        const Sequence* sq = state_ ? state_->sequence() : nullptr;
+        const ColorSpace* chosen = findColorSpace(color_->currentData().toString().toStdString());
+        const ColorSpace* out = chosen ? chosen : sq ? &sequenceColorSpace(*sq) : nullptr;
+        const std::string vc = p ? p->settings.videoCodec : std::string();
+        hdr10Plus_->setEnabled(video && out && out->transfer == Transfer::Pq && vc != "exr" && vc != "gif");
+    }
     loudness_->setEnabled(p && hasAudio(p->settings));
     quality_->setEnabled(p && usesCrf(p->settings.videoCodec));
     const Sequence* seq = state_ ? state_->sequence() : nullptr;
@@ -687,6 +705,8 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
     settings.setValue("export/allCaptions", allCaptions_->isChecked());
     s.cea608 = cea608_->isEnabled() && cea608_->isChecked();
     settings.setValue("export/cea608", cea608_->isChecked());
+    s.hdr10Plus = hdr10Plus_->isEnabled() && hdr10Plus_->isChecked();
+    settings.setValue("export/hdr10Plus", hdr10Plus_->isChecked());
     if (streams_->isEnabled() && streams_->currentIndex() > 0 && state_->sequence()) {
         s.extraAudio = stemStreams(*state_->sequence(), streams_->currentIndex() == 1 ? StemsByRole : StemsByTrack);
         s.audioName = "Mix";

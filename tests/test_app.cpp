@@ -9359,8 +9359,23 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(win_->analyseHdrLightLevels(false));
         QCOMPARE(state()->sequence()->hdrMaxCll, 203.0);
         QCOMPARE(state()->sequence()->hdrMaxFall, 203.0);
+        // PQ: HDR10+'s scenes measured in the same pass and kept too (one shot, one scene at reference white).
+        QCOMPARE(state()->sequence()->hdr10Plus.size(), size_t(1));
+        QVERIFY(std::fabs(state()->sequence()->hdr10Plus[0].maxScl[1] - 203) < 1 && state()->sequence()->hdr10Plus[0].end == 10);
+        {
+            // The export dialog offers HDR10+ for PQ output only.
+            ExportDialog ed(state(), win_.get());
+            auto* hdr10 = ed.findChild<QCheckBox*>("exportHdr10Plus");
+            auto* color = ed.findChild<QComboBox*>("exportColor");
+            QVERIFY(hdr10 && color && hdr10->isEnabled());
+            color->setCurrentIndex(color->findData(QStringLiteral("rec709")));
+            QVERIFY(!hdr10->isEnabled());
+            color->setCurrentIndex(color->findData(QStringLiteral("rec2100pq")));
+            QVERIFY(hdr10->isEnabled());
+        }
         state()->undo();
         QCOMPARE(state()->sequence()->hdrMaxCll, 0.0);
+        QVERIFY(state()->sequence()->hdr10Plus.empty());
         // Not for SDR.
         state()->newProject();
         QVERIFY(!win_->analyseHdrLightLevels(false));

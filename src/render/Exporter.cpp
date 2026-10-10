@@ -22,6 +22,7 @@
 
 #include "ColorSpace.h"
 #include "Compositor.h"
+#include "Hdr10Plus.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
 #include "Processing.h"
@@ -184,6 +185,8 @@ struct Output {
     AVFrame* vframe = nullptr;
     AVFrame* aframe = nullptr;
     AVPacket* pkt = nullptr;
+    // Called with each video packet before it is written (pts in the encoder's time base); false fails the export.
+    std::function<bool(AVPacket*)> videoPacket;
     bool headerWritten = false;
     ~Output() {
         sws_freeContext(sws);
@@ -205,6 +208,7 @@ int drain(Output& o, AVCodecContext* ctx, AVStream* st) {
         int rc = avcodec_receive_packet(ctx, o.pkt);
         if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) return 0;
         if (rc < 0) return rc;
+        if (st == o.vst && o.videoPacket && !o.videoPacket(o.pkt)) return AVERROR(EINVAL);
         av_packet_rescale_ts(o.pkt, ctx->time_base, st->time_base);
         o.pkt->stream_index = st->index;
         rc = av_interleaved_write_frame(o.oc, o.pkt);
@@ -763,6 +767,22 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     LightLevels measured;
     const LightMeter meter(outSpace);
     const bool measure = wantVideo && outSpace.hdr() && meter.valid();
+    // HDR10+: each scene's metadata for the frames exported, from the sequence's analysis while it still matches the
+    // cut, else measured now (the first part of the progress).
+    std::vector<Hdr10PlusScene> hdr10;
+    double renderFrom = 0;  // where the render's share of the progress starts
+    if (s.hdr10Plus && wantVideo && pq && !floatFrames) {
+        hdr10 = storedHdr10Plus(p, seq, in, out, outSpace, peakNits);
+        if (hdr10.empty()) {
+            renderFrom = 0.3;
+            std::string e;
+            const auto part = [&](double f) {
+                if (progress) progress(renderFrom * f, in + FrameTime(std::floor(f * double(out - in - 1))));
+            };
+            if (!analyseHdr10Plus(p, seq, in, out, outSpace, peakNits, hdr10, &e, part, cancel))
+                return fail(cancel && cancel->load() ? std::string("Export cancelled") : "HDR10+ analysis failed: " + e);
+        }
+    }
     if (wantVideo) {
         std::string c = s.videoCodec;
         const bool hardware = c == "hw_h264" || c == "hw_hevc";
@@ -883,6 +903,26 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         rc = avcodec_open2(o.vctx, codec, &opts);
         av_dict_free(&opts);
         if (rc < 0) return fail("Cannot open video encoder: " + averr(rc));
+        // HDR10+ in the video itself: an SEI message in each HEVC access unit, a metadata OBU in each AV1 temporal
+        // unit, the scene's values on every frame of it.
+        if (!hdr10.empty() && (o.vctx->codec_id == AV_CODEC_ID_HEVC || o.vctx->codec_id == AV_CODEC_ID_AV1)) {
+            const bool av1 = o.vctx->codec_id == AV_CODEC_ID_AV1;
+            // Packets carry NAL units after start codes, or after lengths when the encoder's header is an hvcC record.
+            const int lengthSize = !av1 && o.vctx->extradata_size > 22 && o.vctx->extradata[0] == 1 ? (o.vctx->extradata[21] & 3) + 1 : 0;
+            auto messages = std::make_shared<std::vector<std::vector<uint8_t>>>();
+            for (const Hdr10PlusScene& sc : hdr10) messages->push_back(hdr10PlusT35(sc));
+            const auto scenes = std::make_shared<std::vector<Hdr10PlusScene>>(hdr10);
+            const FrameTime first = in;
+            o.videoPacket = [scenes, messages, av1, lengthSize, first](AVPacket* pkt) {
+                if (pkt->pts == AV_NOPTS_VALUE) return false;
+                const FrameTime f = first + pkt->pts;
+                const auto it = std::upper_bound(scenes->begin(), scenes->end(), f,
+                                                 [](FrameTime t, const Hdr10PlusScene& sc) { return t < sc.end; });
+                if (it == scenes->end() || f < it->start) return false;
+                const auto& msg = (*messages)[size_t(it - scenes->begin())];
+                return av1 ? addHdr10PlusObu(pkt, msg) : addHdr10PlusSei(pkt, msg, lengthSize);
+            };
+        }
         avcodec_parameters_from_context(o.vst->codecpar, o.vctx);
         o.vst->time_base = o.vctx->time_base;
         o.vst->avg_frame_rate = fps;
@@ -1526,7 +1566,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             for (auto& mo : monos)
                 if (!encodeFifo(mo->ctx, mo->st, mo->frame, mo->fifo, mo->pts, false)) return fail("Audio encoding failed");
         }
-        if (progress && ((f - in) % 5 == 0 || f + 1 == out)) progress(double(f - in + 1) / double(total), f);
+        if (progress && ((f - in) % 5 == 0 || f + 1 == out)) progress(renderFrom + (1 - renderFrom) * double(f - in + 1) / double(total), f);
     }
     // Flush the encoders; errors here (e.g. a full disk) must fail the export.
     if (wantAudio) {
@@ -1560,6 +1600,13 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         }
     if ((rc = av_write_trailer(o.oc)) < 0) return fail("Cannot finalise file: " + averr(rc));
     if (o.oc->pb && o.oc->pb->error < 0) return fail("Writing the file failed: " + averr(o.oc->pb->error));
+    // The HDR10+ metadata beside the file too.
+    if (!hdr10.empty()) {
+        const size_t slash = s.path.find_last_of("/\\"), dot = s.path.find_last_of('.');
+        const size_t stem = dot != std::string::npos && (slash == std::string::npos || dot > slash) ? dot : s.path.size();
+        std::string e;
+        if (!writeHdr10PlusJson(s.path.substr(0, stem) + ".hdr10plus.json", hdr10, in, out, &e)) return fail(e);
+    }
     if (smartRendered) *smartRendered = smart ? smart->copied() : 0;
     if (light) *light = measured;
     return true;

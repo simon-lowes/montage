@@ -34,6 +34,7 @@
 #include "render/Adm.h"
 #include "render/Imf.h"
 #include "render/LightLevel.h"
+#include "render/Hdr10Plus.h"
 #include "render/Spherical.h"
 #include "render/ClipPlacement.h"
 #include "audio/SpeechCleanup.h"
@@ -1996,7 +1997,9 @@ void McpServer::Impl::addTools() {
         "brightest pixel in any frame, and MaxFALL, the highest frame-average light, in nits (CTA-861.3), each with where "
         "it happens, over `from` to `to` (default the whole sequence). With `save` (the default) they are kept with the "
         "sequence so exports that state them before the first frame (x265, Matroska) use them; MP4 and MOV exports "
-        "measure what they render anyway. Warns when MaxCLL is above the sequence's mastering peak.",
+        "measure what they render anyway. Warns when MaxCLL is above the sequence's mastering peak. A PQ sequence's "
+        "HDR10+ scenes are measured in the same pass (each scene's brightest red, green and blue, average and spread, "
+        "as ST 2094-40 sends them) and kept too, for exports with `hdr10plus`.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"from":{"type":["number","string"]},
             "to":{"type":["number","string"]},"save":{"type":"boolean","default":true}},"required":["project"]})json",
         false, [](const QJsonObject& a) {
@@ -2008,7 +2011,12 @@ void McpServer::Impl::addTools() {
             const FrameTime to = a.contains("to") ? timeArg(a.value("to"), s, "to") : 0;
             LightLevels light;
             std::string err;
-            if (!measureLightLevels(l.project, s, from, to, light, &err)) return fail(QString::fromStdString(err));
+            const bool pq = sequenceColorSpace(s).transfer == Transfer::Pq;
+            std::vector<Hdr10PlusScene> scenes;
+            if (pq ? !analyseHdr10Plus(l.project, s, from, to, sequenceColorSpace(s), std::clamp(s.hdrPeakNits, 100.0, 10000.0), scenes, &err,
+                                       {}, nullptr, &light)
+                   : !measureLightLevels(l.project, s, from, to, light, &err))
+                return fail(QString::fromStdString(err));
             unsigned cll = 0, fall = 0;
             hdr10LightLevels(light, cll, fall);
             QJsonObject out{{"max_cll", int(cll)}, {"max_fall", int(fall)}, {"max_cll_at", tc(light.maxCllFrame, s)},
@@ -2019,8 +2027,25 @@ void McpServer::Impl::addTools() {
                 out["warning"] = QStringLiteral("Brighter than the %1-nit mastering peak").arg(s.hdrPeakNits);
                 text += QStringLiteral("; brighter than the %1-nit mastering peak").arg(s.hdrPeakNits);
             }
+            if (pq) {
+                QJsonArray list;
+                for (const Hdr10PlusScene& sc : scenes)
+                    list.append(QJsonObject{{"start", tc(sc.start, s)}, {"end", tc(sc.end, s)},
+                                            {"max_rgb", QJsonArray{sc.maxScl[0], sc.maxScl[1], sc.maxScl[2]}},
+                                            {"average", sc.average}, {"percentile_99_98", sc.percentiles[6]}});
+                out["hdr10plus_scenes"] = list;
+                text += QStringLiteral("; HDR10+: %1 scene(s)").arg(scenes.size());
+            }
             if (a.value("save").toBool(true)) {
                 s.hdrMaxCll = cll, s.hdrMaxFall = fall;
+                if (pq) {
+                    // The new scenes replace those they overlap; others (another stretch analysed before) stay.
+                    std::erase_if(s.hdr10Plus, [&](const Hdr10PlusScene& o) {
+                        return !scenes.empty() && o.end > scenes.front().start && o.start < scenes.back().end;
+                    });
+                    s.hdr10Plus.insert(s.hdr10Plus.end(), scenes.begin(), scenes.end());
+                    std::sort(s.hdr10Plus.begin(), s.hdr10Plus.end(), [](const Hdr10PlusScene& x, const Hdr10PlusScene& y) { return x.start < y.start; });
+                }
                 save(l);
             }
             return ok(text, out);
@@ -5421,6 +5446,7 @@ void McpServer::Impl::addTools() {
             "stems":{"type":"string","enum":["none","tracks","buses","roles"],"default":"none",
                 "description":"Also write 24-bit WAV stems beside the output, one per audio track, per bus (plus Main) or per audio role"},
             "captions":{"type":"string","enum":["none","burn","embed","both"],"default":"none","description":"The visible caption track, burned into the picture and/or embedded as a subtitle stream"},
+            "hdr10plus":{"type":"boolean","default":false,"description":"PQ exports: HDR10+ dynamic metadata, scene by scene, in HEVC and AV1 video and as name.hdr10plus.json beside the file (measured first unless montage_measure_hdr's analysis still matches the cut)"},
             "cea608":{"type":"boolean","default":false,"description":"Also carry the caption track as CEA-608 closed captions inside H.264/HEVC video (A/53, as US broadcast and streaming deliveries ask)"},
             "all_captions":{"type":"boolean","default":false,"description":"With embed: every caption track as its own subtitle stream, language tagged"},
             "audio_streams":{"description":"More audio streams after the mix (a master's M&E, dialogue, dubs): \"roles\" (one per role), \"tracks\" (one per track), or a list of {name, language, tracks:[\"A2\",...], role}",
@@ -5486,6 +5512,7 @@ void McpServer::Impl::addTools() {
             if (cap != "none" && cap != "burn" && cap != "embed" && cap != "both") throw ArgError{"\"captions\" must be none, burn, embed or both"};
             st.burnInCaptions = cap == "burn" || cap == "both";
             st.cea608 = a.value("cea608").toBool();
+            st.hdr10Plus = a.value("hdr10plus").toBool();
             st.embedCaptions = cap == "embed" || cap == "both";
             if (st.embedCaptions && a.value("all_captions").toBool())
                 for (const CaptionTrack& t : s.captionTracks)

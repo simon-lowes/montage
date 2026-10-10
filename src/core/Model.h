@@ -292,6 +292,17 @@ struct Clip {
 // A colour group (Resolve's groups, core/ColorGroups.h): clips graded together. Its pre-clip grade runs on each member
 // before the clip's own effects (to match the shots), its post-clip grade after them (the group's look). Keyframes in
 // either are timed from each clip's start.
+// One scene of HDR10+ dynamic metadata (SMPTE ST 2094-40): what an HDR10+ display needs to tone map it, measured on
+// the PQ picture in linear light (render/Hdr10Plus.h).
+struct Hdr10PlusScene {
+    FrameTime start = 0, end = 0;   // sequence frames [start, end)
+    double maxScl[3] = {0, 0, 0};   // cd/m²: the brightest red, green and blue anywhere in the scene
+    double average = 0;             // cd/m²: the mean over the scene of each pixel's brightest channel (maxRGB)
+    double percentiles[7] = {};     // cd/m²: maxRGB at 1, 25, 50, 75, 90, 95 and 99.98 % of the scene's pixels
+    std::string key;                // a fingerprint of the frames measured, to tell when the cut has changed under it
+    bool operator==(const Hdr10PlusScene&) const = default;
+};
+
 struct ColorGroup {
     Id id = 0;      // also the owner of its pre-clip effects (edit::effectChain)
     Id postId = 0;  // the owner of its post-clip effects
@@ -393,6 +404,7 @@ struct Sequence {
     std::string colorSpace = "rec709";  // working and delivery space (ColorSpace.h id)
     double hdrPeakNits = 1000;          // mastering peak for HDR spaces
     double hdrMaxCll = 0, hdrMaxFall = 0;  // measured light levels (Analyse HDR Light Levels), nits; 0 = not measured
+    std::vector<Hdr10PlusScene> hdr10Plus;  // HDR10+ metadata from the same analysis (PQ only), in time order
     bool spherical = false;             // a 360° sequence (equirectangular): exports say so to players and YouTube
     bool vr180 = false;                 // with spherical: half the sphere in front (VR180), as stereo VR180 cameras shoot
     // Stereoscopic 3D: the sequence is made for two eyes (its size is one eye's); each is rendered from stereo footage's

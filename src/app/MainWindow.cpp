@@ -147,6 +147,7 @@
 #include "render/Shorts.h"
 #include "render/Letterbox.h"
 #include "render/LightLevel.h"
+#include "render/Hdr10Plus.h"
 #include "render/Versions.h"
 #include "media/MicBleed.h"
 #include "render/MusicEdit.h"
@@ -5029,19 +5030,33 @@ bool MainWindow::analyseHdrLightLevels(bool ask) {
     const Sequence s = *cur;
     const bool marked = s.inPoint >= 0 && s.outPoint >= s.inPoint;
     LightLevels l;
+    // PQ: HDR10+'s scenes measured in the same pass.
+    const bool pq = sequenceColorSpace(s).transfer == Transfer::Pq;
+    std::vector<Hdr10PlusScene> scenes;
+    const FrameTime from = marked ? s.inPoint : 0, to = marked ? s.outPoint + 1 : 0;
     if (!runWithProgress(this, state_, tr("Measuring light levels..."), [&](const auto& progress, const auto* cancel, std::string* e) {
-            return measureLightLevels(p, s, marked ? s.inPoint : 0, marked ? s.outPoint + 1 : 0, l, e, 1.0,
-                                      [&](double f) { progress(f); }, cancel);
+            if (pq)
+                return analyseHdr10Plus(p, s, from, to, sequenceColorSpace(s), std::clamp(s.hdrPeakNits, 100.0, 10000.0), scenes, e,
+                                        [&](double f) { progress(f); }, cancel, &l);
+            return measureLightLevels(p, s, from, to, l, e, 1.0, [&](double f) { progress(f); }, cancel);
         }))
         return false;
     unsigned cll = 0, fall = 0;
     hdr10LightLevels(l, cll, fall);
     state_->apply(tr("Analyse HDR Light Levels"), [&](Project&, Sequence& sq) {
         sq.hdrMaxCll = cll, sq.hdrMaxFall = fall;
+        if (pq && !scenes.empty()) {
+            // The new scenes replace those they overlap; others (another stretch analysed before) stay.
+            std::erase_if(sq.hdr10Plus, [&](const Hdr10PlusScene& o) { return o.end > scenes.front().start && o.start < scenes.back().end; });
+            sq.hdr10Plus.insert(sq.hdr10Plus.end(), scenes.begin(), scenes.end());
+            std::sort(sq.hdr10Plus.begin(), sq.hdr10Plus.end(), [](const Hdr10PlusScene& x, const Hdr10PlusScene& y) { return x.start < y.start; });
+        }
         return edit::Result{};
     });
     const QLocale loc;
-    state_->message(tr("MaxCLL %1 nits, MaxFALL %2 nits").arg(loc.toString(cll), loc.toString(fall)), 8000);
+    state_->message(pq ? tr("MaxCLL %1 nits, MaxFALL %2 nits, %3 HDR10+ scenes").arg(loc.toString(cll), loc.toString(fall)).arg(scenes.size())
+                       : tr("MaxCLL %1 nits, MaxFALL %2 nits").arg(loc.toString(cll), loc.toString(fall)),
+                    8000);
     if (!ask) return true;
     QMessageBox box(QMessageBox::Information, tr("HDR Light Levels"),
                     tr("MaxCLL %1 nits, the brightest pixel (at %2)\nMaxFALL %3 nits, the brightest frame on average (at %4)")
@@ -5050,6 +5065,8 @@ bool MainWindow::analyseHdrLightLevels(bool ask) {
                     QMessageBox::Close, this);
     box.setObjectName(QStringLiteral("hdrLightLevelsDialog"));
     QString more = tr("Saved with the sequence: HDR10 exports state them (MP4 and MOV also measure what they render).");
+    if (pq)
+        more += tr("\n\nHDR10+: %n scene(s) measured, used by exports with HDR10+ metadata while the cut still matches them.", "", int(scenes.size()));
     if (sequenceColorSpace(s).transfer == Transfer::Pq && cll > s.hdrPeakNits + 0.5)
         more = tr("Brighter than the %1-nit mastering peak: highlights above it will be clipped or tone mapped by displays.\n\n")
                    .arg(loc.toString(qRound(s.hdrPeakNits))) + more;

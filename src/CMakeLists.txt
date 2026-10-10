@@ -116,6 +116,7 @@ add_library(montage_engine STATIC
   render/Shorts.h render/Shorts.cpp
   render/Letterbox.h render/Letterbox.cpp
   render/LightLevel.h render/LightLevel.cpp
+  render/Hdr10Plus.h render/Hdr10Plus.cpp
   render/Versions.h render/Versions.cpp
   render/ReviewExport.h render/ReviewExport.cpp
   render/DcpMxf.h render/DcpMxf.cpp

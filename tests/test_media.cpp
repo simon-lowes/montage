@@ -101,6 +101,7 @@
 #include "media/SuperScale.h"
 #include "media/Reframe.h"
 #include "media/Diarizer.h"
+#include "render/Hdr10Plus.h"
 #include "media/Faces.h"
 #include "media/FaceTracks.h"
 #include "media/DepthMap.h"
@@ -135,6 +136,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libswresample/swresample.h>
 #include <libavutil/mastering_display_metadata.h>
+#include <libavutil/hdr_dynamic_metadata.h>
 #include <libavutil/pixdesc.h>
 }
 
@@ -3382,11 +3384,15 @@ private slots:
         QCOMPARE(out.value("max_fall").toInt(), 203);
         QCOMPARE(out.value("max_cll_at").toString(), QString("00:00:00:00"));
         QVERIFY(!out.contains("warning"));
+        // A PQ sequence's HDR10+ scenes come with it: one shot, one scene.
+        QCOMPARE(out.value("hdr10plus_scenes").toArray().size(), 1);
+        QCOMPARE(out.value("hdr10plus_scenes").toArray().at(0).toObject().value("end").toString(), QString("00:00:00:10"));
         {
             Project q;
             QVERIFY(loadProject(project.toStdString(), q));
             QCOMPARE(q.active()->hdrMaxCll, 203.0);
             QCOMPARE(q.active()->hdrMaxFall, 203.0);
+            QCOMPARE(q.active()->hdr10Plus.size(), size_t(1));
         }
         // Over a part only, not saved: graphics are held to a lower mastering peak.
         Project dim = p;
@@ -3431,9 +3437,12 @@ private slots:
         QVERIFY(saveProject(p, project.toStdString()));
         // Exports report what they measured.
         if (avcodec_find_encoder_by_name("libx265")) {
-            r = call("montage_render", {{"output", QString::fromStdString(path("hdr-mcp.mp4"))}, {"preset", "H.265 / HEVC"}});
+            r = call("montage_render", {{"output", QString::fromStdString(path("hdr-mcp.mp4"))}, {"preset", "H.265 / HEVC"}, {"hdr10plus", true}});
             QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
             QCOMPARE(r.value("structuredContent").toObject().value("max_cll").toInt(), 203);
+            std::vector<Hdr10PlusScene> beside;
+            QVERIFY2(readHdr10PlusJson(path("hdr-mcp.hdr10plus.json"), beside, &err), err.c_str());
+            QVERIFY(beside.size() == 1 && beside[0].end == 10 && std::fabs(beside[0].maxScl[0] - 203) < 1);
         }
         // SDR sequences have none.
         Project sdr = p;
@@ -13909,6 +13918,341 @@ private slots:
         QVERIFY(rms(0, 1.0) > 0.15);   // lav A
         QVERIFY(rms(1, 1.0) < 0.03);   // lav B hears A faintly
         QVERIFY(rms(1, 4.0) > 0.15);
+    }
+
+    void hdr10PlusMetadata() {
+        // ---- The message: ST 2094-40 as FFmpeg's own parser reads it.
+        Hdr10PlusScene sc;
+        sc.maxScl[0] = 1000, sc.maxScl[1] = 500, sc.maxScl[2] = 250;
+        sc.average = 123.4;
+        const double pct[7] = {0.5, 10, 50, 120, 400, 700, 999.9};
+        std::copy(pct, pct + 7, sc.percentiles);
+        const std::vector<uint8_t> t35 = hdr10PlusT35(sc);
+        QCOMPARE(t35.size(), size_t(49));  // profile A: 6 header bytes and 339 bits
+        QCOMPARE(std::vector<uint8_t>(t35.begin(), t35.begin() + 6), (std::vector<uint8_t>{0xB5, 0x00, 0x3C, 0x00, 0x01, 0x04}));
+        {
+            size_t sz = 0;
+            AVDynamicHDRPlus* m = av_dynamic_hdr_plus_alloc(&sz);
+            QVERIFY(m);
+            QCOMPARE(av_dynamic_hdr_plus_from_t35(m, t35.data() + 6, t35.size() - 6), 0);
+            const AVHDRPlusColorTransformParams& w = m->params[0];
+            const int version = m->application_version, windows = m->num_windows, percentiles = w.num_distribution_maxrgb_percentiles;
+            const double target = av_q2d(m->targeted_system_display_maximum_luminance);
+            const double r = av_q2d(w.maxscl[0]) * 10000, g = av_q2d(w.maxscl[1]) * 10000, b = av_q2d(w.maxscl[2]) * 10000;
+            const double avg = av_q2d(w.average_maxrgb) * 10000;
+            std::vector<int> percentages;
+            std::vector<double> values;
+            for (int i = 0; i < percentiles; ++i)
+                percentages.push_back(w.distribution_maxrgb[i].percentage), values.push_back(av_q2d(w.distribution_maxrgb[i].percentile) * 10000);
+            const double bright = av_q2d(w.fraction_bright_pixels);
+            const int toneMapping = w.tone_mapping_flag;
+            av_free(m);
+            QCOMPARE(version, 1);
+            QCOMPARE(windows, 1);
+            QCOMPARE(target, 0.0);
+            QVERIFY(std::fabs(r - 1000) < 1e-6 && std::fabs(g - 500) < 1e-6 && std::fabs(b - 250) < 1e-6);
+            QVERIFY(std::fabs(avg - 123.4) < 1e-6);
+            QCOMPARE(percentages, (std::vector<int>{1, 5, 10, 25, 50, 75, 90, 95, 99}));
+            // The measured values where they go; 5 and 10 % hold the standard's fixed 0 and 0.00255.
+            const std::vector<double> want{0.5, 0, 25.5, 10, 50, 120, 400, 700, 999.9};
+            for (size_t i = 0; i < want.size(); ++i) QVERIFY2(std::fabs(values[i] - want[i]) < 1e-6, qPrintable(QString("%1 %2").arg(i).arg(values[i])));
+            QCOMPARE(bright, 0.0);
+            QCOMPARE(toneMapping, 0);
+        }
+
+        // ---- Into packets: an HEVC prefix SEI before the first slice (start codes and lengths), escaped; an AV1
+        // metadata OBU before the shown frame.
+        auto packet = [](const std::vector<uint8_t>& bytes) {
+            AVPacket* pkt = av_packet_alloc();
+            av_new_packet(pkt, int(bytes.size()));
+            std::copy(bytes.begin(), bytes.end(), pkt->data);
+            pkt->pts = 7;
+            return pkt;
+        };
+        Hdr10PlusScene black;  // all zero: the message is full of zero bytes to escape
+        const std::vector<uint8_t> zeros = hdr10PlusT35(black);
+        auto unescape = [](const uint8_t* d, size_t n, bool& clean) {
+            std::vector<uint8_t> out;
+            clean = true;
+            int z = 0;
+            for (size_t i = 0; i < n; ++i) {
+                if (z >= 2 && d[i] <= 3) {
+                    if (d[i] != 3) clean = false;  // 00 00 0x must not appear
+                    z = 0;
+                    if (d[i] == 3) continue;
+                }
+                out.push_back(d[i]);
+                z = d[i] == 0 ? z + 1 : 0;
+            }
+            return out;
+        };
+        std::vector<uint8_t> wantRbsp{4, uint8_t(zeros.size())};
+        wantRbsp.insert(wantRbsp.end(), zeros.begin(), zeros.end());
+        wantRbsp.push_back(0x80);
+        {
+            AVPacket* pkt = packet({0, 0, 0, 1, 0x40, 0x01, 0x0C, 0x01, 0, 0, 1, 0x26, 0x01, 0xAF, 0x09});  // VPS, IDR slice
+            QVERIFY(addHdr10PlusSei(pkt, zeros, 0));
+            QCOMPARE(pkt->pts, int64_t(7));
+            // Split at start codes: VPS, SEI, slice.
+            std::vector<std::pair<size_t, size_t>> units;
+            const uint8_t* d = pkt->data;
+            const size_t n = size_t(pkt->size);
+            for (size_t i = 0; i + 3 <= n; ++i)
+                if (d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1) {
+                    if (!units.empty()) units.back().second = (i > 0 && d[i - 1] == 0 ? i - 1 : i);
+                    units.push_back({i + 3, n});
+                    i += 2;
+                }
+            QCOMPARE(units.size(), size_t(3));
+            QCOMPARE(int((d[units[0].first] >> 1) & 0x3f), 32);
+            QCOMPARE(int((d[units[1].first] >> 1) & 0x3f), 39);
+            QCOMPARE(int((d[units[2].first] >> 1) & 0x3f), 19);
+            QCOMPARE(d[units[1].first + 1], uint8_t(0x01));
+            bool clean = false;
+            const auto rbsp = unescape(d + units[1].first + 2, units[1].second - units[1].first - 2, clean);
+            QVERIFY(clean);
+            QCOMPARE(rbsp, wantRbsp);
+            QCOMPARE(std::vector<uint8_t>(d + units[2].first, d + n), (std::vector<uint8_t>{0x26, 0x01, 0xAF, 0x09}));
+            av_packet_free(&pkt);
+        }
+        {
+            AVPacket* pkt = packet({0, 0, 0, 4, 0x40, 0x01, 0x0C, 0x01, 0, 0, 0, 3, 0x02, 0x01, 0xD0});  // VPS, TRAIL_R slice
+            QVERIFY(addHdr10PlusSei(pkt, zeros, 4));
+            const uint8_t* d = pkt->data;
+            size_t i = 0;
+            std::vector<int> types;
+            std::vector<uint8_t> sei;
+            while (i + 4 <= size_t(pkt->size)) {
+                const size_t len = (size_t(d[i]) << 24) | (size_t(d[i + 1]) << 16) | (size_t(d[i + 2]) << 8) | d[i + 3];
+                QVERIFY(i + 4 + len <= size_t(pkt->size));
+                types.push_back((d[i + 4] >> 1) & 0x3f);
+                if (types.back() == 39) sei.assign(d + i + 6, d + i + 4 + len);
+                i += 4 + len;
+            }
+            QCOMPARE(i, size_t(pkt->size));
+            QCOMPARE(types, (std::vector<int>{32, 39, 1}));
+            bool clean = false;
+            QCOMPARE(unescape(sei.data(), sei.size(), clean), wantRbsp);
+            av_packet_free(&pkt);
+            pkt = packet({0, 0, 0, 2, 0x40, 0x01});  // no slice: nothing to attach it to
+            QVERIFY(!addHdr10PlusSei(pkt, zeros, 4));
+            av_packet_free(&pkt);
+        }
+        {
+            // Temporal delimiter, sequence header, a hidden frame, the shown frame.
+            AVPacket* pkt = packet({0x12, 0x00, 0x0A, 0x02, 0xAA, 0xBB, 0x32, 0x01, 0xCC, 0x32, 0x02, 0xDD, 0xEE});
+            QVERIFY(addHdr10PlusObu(pkt, t35));
+            const uint8_t* d = pkt->data;
+            size_t i = 0;
+            std::vector<int> types;
+            std::vector<uint8_t> meta;
+            while (i < size_t(pkt->size)) {
+                const int type = (d[i] >> 3) & 0xf;
+                size_t size = 0, shift = 0, j = i + 1;
+                while (true) {
+                    size |= size_t(d[j] & 0x7f) << shift;
+                    shift += 7;
+                    if (!(d[j++] & 0x80)) break;
+                }
+                types.push_back(type);
+                if (type == 5) meta.assign(d + j, d + j + size);
+                i = j + size;
+            }
+            QCOMPARE(i, size_t(pkt->size));
+            QCOMPARE(types, (std::vector<int>{2, 1, 6, 5, 6}));  // just before the last (shown) frame
+            std::vector<uint8_t> want{4};
+            want.insert(want.end(), t35.begin(), t35.end());
+            want.push_back(0x80);
+            QCOMPARE(meta, want);
+            av_packet_free(&pkt);
+        }
+
+        // ---- Measuring: linear light from PQ codes, per channel and of each pixel's brightest channel.
+        const ColorSpace& pq = *findColorSpace("rec2100pq");
+        QVERIFY(!Hdr10PlusMeter(*findColorSpace("rec709")).valid());
+        Hdr10PlusMeter meter(pq);
+        QVERIFY(meter.valid());
+        meter.minSceneFrames = 2;
+        auto frame = [&](double leftNits, double rightRed) {
+            Image img(100, 10);
+            const float l = float(nitsToCode(pq, leftNits)), red = float(nitsToCode(pq, rightRed)), low = float(nitsToCode(pq, 1));
+            for (int y = 0; y < 10; ++y)
+                for (int x = 0; x < 100; ++x) {
+                    float* px = img.at(x, y);
+                    if (x < 50) px[0] = px[1] = px[2] = l;
+                    else px[0] = red, px[1] = px[2] = low;
+                    px[3] = 1;
+                }
+            return img;
+        };
+        for (FrameTime f = 0; f < 3; ++f) meter.add(frame(100, 1000), f, f == 0);
+        meter.add(frame(1, 1), 3, false);  // most of the picture changes brightness at once: a cut within the clip
+        meter.add(frame(1, 1), 4, true);   // an edit
+        std::vector<Hdr10PlusScene> got = meter.scenes();
+        QCOMPARE(got.size(), size_t(3));
+        QVERIFY(got[0].start == 0 && got[0].end == 3 && got[1].start == 3 && got[1].end == 4 && got[2].start == 4 && got[2].end == 5);
+        auto near = [](double a, double b) { return std::fabs(a - b) <= 0.002 * std::max(1.0, b); };
+        QVERIFY2(near(got[0].maxScl[0], 1000) && near(got[0].maxScl[1], 100) && near(got[0].maxScl[2], 100), qPrintable(QString::number(got[0].maxScl[0])));
+        QVERIFY2(near(got[0].average, 550), qPrintable(QString::number(got[0].average)));
+        // Half the pixels at 100 nits, half at 1000: up to the 50th percentile 100, above it 1000.
+        QVERIFY(near(got[0].percentiles[0], 100) && near(got[0].percentiles[2], 100) && near(got[0].percentiles[3], 1000) && near(got[0].percentiles[6], 1000));
+        QVERIFY(near(got[1].maxScl[0], 1) && near(got[1].average, 1));
+
+        // ---- A cut exported: three shots, each its own scene in the file, on every frame.
+        if (!avcodec_find_encoder_by_name("libx265")) QSKIP("This FFmpeg has no libx265");
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 160;
+        s.height = 90;
+        s.fps = {25, 1};
+        s.colorSpace = "rec2100pq";
+        s.hdrPeakNits = 1000;
+        auto shot = [&](double r, double g, double b, FrameTime at) {
+            Clip c = makeGeneratorClip(p, "color", 10);
+            c.generator.params["color.r"] = r;
+            c.generator.params["color.g"] = g;
+            c.generator.params["color.b"] = b;
+            c.start = at;
+            edit::overwrite(p, s, {TrackKind::Video, 0}, c);
+        };
+        shot(0.25, 0.25, 0.25, 0);
+        shot(1, 1, 1, 10);
+        shot(1, 0, 0, 20);
+        std::vector<Hdr10PlusScene> analysed;
+        std::string err;
+        QVERIFY2(analyseHdr10Plus(p, s, 0, 30, pq, 1000, analysed, &err), err.c_str());
+        QCOMPARE(analysed.size(), size_t(3));
+        QVERIFY(analysed[1].start == 10 && analysed[2].start == 20 && analysed[2].end == 30);
+        QVERIFY2(analysed[0].maxScl[0] < 100 && near(analysed[1].maxScl[0], 203) && near(analysed[1].maxScl[2], 203),
+                 qPrintable(QString("%1 %2").arg(analysed[0].maxScl[0]).arg(analysed[1].maxScl[0])));
+        // Red graphics in BT.2020: mostly red (Rec.709's red primary sits inside BT.2020's), every pixel's brightest
+        // channel its red.
+        QVERIFY2(analysed[2].maxScl[0] > 100 && analysed[2].maxScl[1] < analysed[2].maxScl[0] / 4 && near(analysed[2].average, analysed[2].maxScl[0]),
+                 qPrintable(QString("%1 %2 %3 %4").arg(analysed[2].maxScl[0]).arg(analysed[2].maxScl[1]).arg(analysed[2].maxScl[2]).arg(analysed[2].average)));
+
+        ExportSettings st;
+        st.path = path("hdr10plus.mp4");
+        st.videoCodec = "libx265";
+        st.audioCodec = "none";
+        st.preset = "ultrafast";
+        st.hdr10Plus = true;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        // Every access unit carries one HDR10+ message.
+        auto readBack = [&](const std::string& file, std::vector<double>& maxRed, int& messages) {
+            maxRed.clear();
+            messages = 0;
+            AVFormatContext* fmt = nullptr;
+            if (avformat_open_input(&fmt, file.c_str(), nullptr, nullptr) < 0) return false;
+            avformat_find_stream_info(fmt, nullptr);
+            const AVCodecParameters* cp = fmt->streams[0]->codecpar;
+            const AVCodec* dec = cp->codec_id == AV_CODEC_ID_AV1 ? avcodec_find_decoder_by_name("libdav1d") : avcodec_find_decoder(cp->codec_id);
+            AVCodecContext* ctx = dec ? avcodec_alloc_context3(dec) : nullptr;
+            if (!ctx || avcodec_parameters_to_context(ctx, cp) < 0 || avcodec_open2(ctx, dec, nullptr) < 0) {
+                avcodec_free_context(&ctx);
+                avformat_close_input(&fmt);
+                return false;
+            }
+            const bool hevc = cp->codec_id == AV_CODEC_ID_HEVC;
+            const int lengthSize = hevc && cp->extradata_size > 22 && cp->extradata[0] == 1 ? (cp->extradata[21] & 3) + 1 : 4;
+            const uint8_t sig[6] = {0xB5, 0x00, 0x3C, 0x00, 0x01, 0x04};
+            AVPacket* pkt = av_packet_alloc();
+            AVFrame* fr = av_frame_alloc();
+            auto take = [&] {
+                while (avcodec_receive_frame(ctx, fr) == 0) {
+                    const AVFrameSideData* sd = av_frame_get_side_data(fr, AV_FRAME_DATA_DYNAMIC_HDR_PLUS);
+                    maxRed.push_back(sd ? av_q2d(reinterpret_cast<const AVDynamicHDRPlus*>(sd->data)->params[0].maxscl[0]) * 10000 : -1);
+                    av_frame_unref(fr);
+                }
+            };
+            while (av_read_frame(fmt, pkt) >= 0) {
+                if (hevc) {
+                    for (size_t i = 0; i + size_t(lengthSize) < size_t(pkt->size);) {
+                        size_t len = 0;
+                        for (int k = 0; k < lengthSize; ++k) len = (len << 8) | pkt->data[i + size_t(k)];
+                        const uint8_t* nal = pkt->data + i + lengthSize;
+                        if (((nal[0] >> 1) & 0x3f) == 39 && len > 9 && nal[2] == 4 && std::equal(sig, sig + 6, nal + 4)) ++messages;
+                        i += size_t(lengthSize) + len;
+                    }
+                } else {
+                    const uint8_t* d = pkt->data;
+                    for (int i = 0; i + 8 < pkt->size; ++i)
+                        if (d[i] == 0x2A && std::equal(sig, sig + 6, d + i + 3)) ++messages;
+                }
+                avcodec_send_packet(ctx, pkt);
+                av_packet_unref(pkt);
+                take();
+            }
+            avcodec_send_packet(ctx, nullptr);
+            take();
+            av_frame_free(&fr);
+            av_packet_free(&pkt);
+            avcodec_free_context(&ctx);
+            avformat_close_input(&fmt);
+            return true;
+        };
+        std::vector<double> maxRed;
+        int messages = 0;
+        QVERIFY(readBack(st.path, maxRed, messages));
+        QCOMPARE(messages, 30);
+        QCOMPARE(maxRed.size(), size_t(30));
+        for (int f = 0; f < 30; ++f) {
+            const double want = std::floor(analysed[size_t(f / 10)].maxScl[0] * 10 + 0.5) / 10;
+            QVERIFY2(std::fabs(maxRed[size_t(f)] - want) < 1e-6, qPrintable(QString("%1: %2 %3").arg(f).arg(maxRed[size_t(f)]).arg(want)));
+        }
+        // The same beside it as JSON, scene by scene.
+        std::vector<Hdr10PlusScene> fromJson;
+        QVERIFY2(readHdr10PlusJson(path("hdr10plus.hdr10plus.json"), fromJson, &err), err.c_str());
+        QCOMPARE(fromJson.size(), size_t(3));
+        QVERIFY(fromJson[0].start == 0 && fromJson[1].start == 10 && fromJson[2].start == 20 && fromJson[2].end == 30);
+        QVERIFY(std::fabs(fromJson[1].maxScl[1] - analysed[1].maxScl[1]) < 0.051 && std::fabs(fromJson[2].percentiles[6] - analysed[2].percentiles[6]) < 0.051);
+        {
+            QFile jf(QString::fromStdString(path("hdr10plus.hdr10plus.json")));
+            QVERIFY(jf.open(QIODevice::ReadOnly));
+            const QJsonObject root = QJsonDocument::fromJson(jf.readAll()).object();
+            for (const char* key : {"JSONInfo", "SceneInfo", "SceneInfoSummary", "ToolInfo"}) QVERIFY(root.contains(key));
+            QCOMPARE(root.value("SceneInfo").toArray().size(), 30);
+            QCOMPARE(root.value("SceneInfoSummary").toObject().value("SceneFrameNumbers").toArray(), (QJsonArray{10, 10, 10}));
+        }
+
+        // The sequence's analysis is used while its scenes still match the cut (each scene checked on its own), and kept
+        // with the project.
+        s.hdr10Plus = analysed;
+        QCOMPARE(storedHdr10Plus(p, s, 0, 30, pq, 1000), analysed);
+        std::vector<Hdr10PlusScene> part = storedHdr10Plus(p, s, 5, 25, pq, 1000);
+        QVERIFY(part.size() == 3 && part[0].start == 5 && part[2].end == 25);
+        const QString proj = QString::fromStdString(path("hdr10plus.montage"));
+        QVERIFY(saveProject(p, proj.toStdString()));
+        Project reopened;
+        QVERIFY(loadProject(proj.toStdString(), reopened));
+        QCOMPARE(reopened.active()->hdr10Plus, analysed);
+        trackAt(s, {TrackKind::Video, 0})->clips[2].generator.params["color.g"] = 1.0;  // the last shot regraded
+        QVERIFY(storedHdr10Plus(p, s, 0, 30, pq, 1000).empty());
+        QCOMPARE(storedHdr10Plus(p, s, 0, 20, pq, 1000).size(), size_t(2));
+        // Exported again, it is measured afresh: the last shot now has green in it.
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        QVERIFY(readHdr10PlusJson(path("hdr10plus.hdr10plus.json"), fromJson, &err) && fromJson.size() == 3 && fromJson[2].maxScl[1] > 150);
+        // Not for SDR.
+        Sequence sdr = s;
+        sdr.colorSpace = "rec709";
+        std::vector<Hdr10PlusScene> none;
+        QVERIFY(!analyseHdr10Plus(p, sdr, 0, 30, *findColorSpace("rec709"), 1000, none, &err) && !err.empty());
+
+        // AV1 carries it in metadata OBUs, which dav1d reads back.
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(60, 31, 100)
+        if (avcodec_find_encoder_by_name("libsvtav1") && avcodec_find_decoder_by_name("libdav1d")) {
+            ExportSettings av1 = st;
+            av1.path = path("hdr10plus-av1.mp4");
+            av1.videoCodec = "libsvtav1";
+            av1.preset = "12";
+            av1.crf = 40;
+            QVERIFY2(exportSequence(p, s, av1, nullptr, nullptr, &err), err.c_str());
+            QVERIFY(readBack(av1.path, maxRed, messages));
+            QCOMPARE(messages, 30);
+            QCOMPARE(maxRed.size(), size_t(30));
+            for (int f = 0; f < 30; ++f) QVERIFY2(maxRed[size_t(f)] > 0, qPrintable(QString::number(f)));
+            QVERIFY(std::fabs(maxRed[25] - std::floor(fromJson[2].maxScl[0] * 10 + 0.5) / 10) < 0.051);
+        }
+#endif
     }
 
     void hdrExportRoundTrip() {

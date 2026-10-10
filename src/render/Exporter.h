@@ -65,6 +65,10 @@ struct ExportSettings {
     // An HDR sequence delivered in SDR is tone mapped. HDR output is 10-bit,
     // tagged, and PQ carries HDR10 mastering and light-level metadata.
     std::string colorSpace;
+    // HDR10+ dynamic metadata (PQ exports, render/Hdr10Plus.h): each scene measured (with the sequence's analysis
+    // while it still matches the cut, else before the render) and carried in HEVC and AV1 video on every frame; the
+    // same goes beside the file as name.hdr10plus.json, for other codecs and for encoders and checks that read it.
+    bool hdr10Plus = false;
     // Loudness normalisation: the mix is measured first (ITU-R BS.1770) and
     // brought to this integrated loudness, with a limiter holding peaks under
     // the ceiling. 0 = off; e.g. -14 LUFS for streaming, -23 for EBU R128.
