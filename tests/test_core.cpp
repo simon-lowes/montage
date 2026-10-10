@@ -2732,6 +2732,76 @@ private slots:
         const QByteArray head = f.read(32);
         QCOMPARE(uint8_t(head[26]), uint8_t(4));
         QCOMPARE(uint8_t(head[30]), uint8_t(12));
+        f.close();
+
+        // Damaged or hostile files are refused or read as far as they make sense, never read past or looped over.
+        QFile src(QString::fromStdString(path));
+        QVERIFY(src.open(QIODevice::ReadOnly));
+        const QByteArray good = src.readAll();
+        src.close();
+        auto attempt = [&](QByteArray bytes) {
+            const std::string bad = (dir.path() + "/bad.cfb").toStdString();
+            QFile o(QString::fromStdString(bad));
+            if (!o.open(QIODevice::WriteOnly | QIODevice::Truncate)) return false;
+            o.write(bytes);
+            o.close();
+            CfbEntry r;
+            std::string e;
+            return readCompoundFile(bad, r, &e);
+        };
+        auto put32 = [](QByteArray& b, int at, uint32_t v) {
+            for (int i = 0; i < 4; ++i) b[at + i] = char((v >> (8 * i)) & 0xff);
+        };
+        QByteArray hostile = good.left(512);
+        put32(hostile, 68, 0x7FFFFF);  // a DIFAT sector far past the end
+        put32(hostile, 72, 1);
+        QVERIFY(!attempt(hostile));
+        hostile = good;
+        hostile[30] = char(40);  // an impossible sector size
+        QVERIFY(!attempt(hostile));
+        // A directory whose first entry under the root points back at itself on every side: read once, not forever.
+        CfbEntry loop;
+        loop.name = "Root Entry";
+        loop.storage = true;
+        CfbEntry one;
+        one.name = "one";
+        one.data = "x";
+        loop.children.push_back(one);
+        const std::string loopPath = (dir.path() + "/loop.cfb").toStdString();
+        QVERIFY(writeCompoundFile(loopPath, loop, &err));
+        QFile lf(QString::fromStdString(loopPath));
+        QVERIFY(lf.open(QIODevice::ReadOnly));
+        QByteArray looped = lf.readAll();
+        lf.close();
+        const int sectorSize = 1 << (uint8_t(looped[30]) | uint8_t(looped[31]) << 8);
+        const uint32_t dirSector = uint32_t(uint8_t(looped[48]) | uint8_t(looped[49]) << 8 | uint8_t(looped[50]) << 16 | uint8_t(looped[51]) << 24);
+        const int entry1 = (int(dirSector) + 1) * sectorSize + 128;
+        put32(looped, entry1 + 68, 1);
+        put32(looped, entry1 + 72, 1);
+        put32(looped, entry1 + 76, 1);
+        CfbEntry lr;
+        std::string le;
+        QFile lo(QString::fromStdString(loopPath));
+        QVERIFY(lo.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        lo.write(looped);
+        lo.close();
+        QVERIFY(readCompoundFile(loopPath, lr, &le));
+        QCOMPARE(lr.children.size(), size_t(1));
+        // A long run of siblings (a writer's unbalanced tree) is read whole.
+        CfbEntry many;
+        many.name = "Root Entry";
+        many.storage = true;
+        for (int i = 0; i < 300; ++i) {
+            CfbEntry c;
+            c.name = "child" + std::to_string(i);
+            c.data = std::string(8, char(i));
+            many.children.push_back(c);
+        }
+        const std::string manyPath = (dir.path() + "/many.cfb").toStdString();
+        QVERIFY(writeCompoundFile(manyPath, many, &err));
+        CfbEntry mr;
+        QVERIFY(readCompoundFile(manyPath, mr, &err));
+        QCOMPARE(mr.children.size(), size_t(300));
     }
 
     void surroundPositionLanes() {

@@ -1659,18 +1659,19 @@ const float* AudioMixer::keySignal(Id trackId, int frames) {
         if (tr.id == trackId) t = &tr;
     if (!t) return nullptr;
     auto& slot = keyBufs_[trackId];
-    if (slot.first == key_.at && slot.second.size() == size_t(frames) * 2) return slot.second.data();
+    if (slot.block == keyBlock_ && slot.samples.size() == size_t(frames) * 2) return slot.samples.data();
     if (!keyMixer_) {
         keyMixer_ = std::make_unique<AudioMixer>();
         keyMixer_->setNonBlocking(nonBlocking_);
     }
-    slot.first = key_.at;
-    slot.second.assign(size_t(frames) * 2, 0.0f);
-    keyMixer_->mixTrackClips(*key_.p, *key_.seq, *t, key_.at, frames, key_.sr, key_.depth, slot.second.data());
+    slot.block = keyBlock_;
+    slot.samples.assign(size_t(frames) * 2, 0.0f);
+    const int64_t at = key_.at + (t->effects.empty() ? 0 : keyMixer_->chainLatency(t->effects, t->id, key_.sr));
+    keyMixer_->mixTrackClips(*key_.p, *key_.seq, *t, at, frames, key_.sr, key_.depth, slot.samples.data());
     if (!t->effects.empty())
-        keyMixer_->processChain(t->effects, t->id, FrameTime(double(key_.at) * key_.seq->fpsValue() / key_.sr), key_.sr,
-                                slot.second.data(), frames);
-    return slot.second.data();
+        keyMixer_->processChain(t->effects, t->id, FrameTime(double(at) * key_.seq->fpsValue() / key_.sr), key_.sr,
+                                slot.samples.data(), frames);
+    return slot.samples.data();
 }
 
 void AudioMixer::resetLocked() {
@@ -2126,6 +2127,7 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
         ~KeyScope() { k = saved; }
     } keyScope{key_, key_};
     key_ = {&p, &seq, start, sr, depth};
+    if (depth == 0) ++keyBlock_;
     bool anySolo = std::any_of(seq.audioTracks.begin(), seq.audioTracks.end(), [](const Track& t) { return t.solo; });
     if (trackLevels && depth == 0) trackLevels->assign(seq.audioTracks.size(), MeterLevels{});
     auto frameAt = [&](int64_t sample) { return FrameTime(double(sample) * fps / sr); };

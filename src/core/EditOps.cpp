@@ -1692,6 +1692,32 @@ Id duplicateSequence(Project& p, Id id, const std::string& name, std::map<Id, Id
         q.id = p.newId();
         q.clip = clips.count(q.clip) ? clips[q.clip] : 0;
     }
+    // Settings naming a track (a compressor's or gate's sidechain) follow it to its copy.
+    std::map<std::string, std::string> tracks;
+    for (size_t k = 0; k < s.audioTracks.size() && k < src->audioTracks.size(); ++k)
+        tracks[std::to_string(src->audioTracks[k].id)] = std::to_string(s.audioTracks[k].id);
+    auto retarget = [&](Effect& e) {
+        const EffectInfo* info = e.type.empty() ? nullptr : findEffectInfo(e.type);
+        if (!info) return;
+        for (const StringParamInfo& sp : info->strings) {
+            if (sp.kind != StringKind::Track) continue;
+            auto it = e.strings.find(sp.name);
+            if (it == e.strings.end() || it->second.empty()) continue;
+            const auto to = tracks.find(it->second);
+            it->second = to == tracks.end() ? std::string() : to->second;
+        }
+    };
+    for (Bus& b : s.buses)
+        for (Effect& e : b.effects) retarget(e);
+    for (Effect& e : s.masterEffects) retarget(e);
+    for (auto* list : {&s.videoTracks, &s.audioTracks})
+        for (Track& t : *list) {
+            for (Effect& e : t.effects) retarget(e);
+            for (Clip& c : t.clips) {
+                retarget(c.audio);
+                for (Effect& e : c.effects) retarget(e);
+            }
+        }
     const Id out = s.id;
     // Its own item in the media bin, beside the original's.
     MediaItem m;

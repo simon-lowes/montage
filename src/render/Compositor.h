@@ -101,7 +101,10 @@ public:
     void reset();
     // Real-time mode: media whose audio is not decoded yet plays as silence
     // instead of blocking until decoding finishes.
-    void setNonBlocking(bool on) { nonBlocking_ = on; }
+    void setNonBlocking(bool on) {
+        nonBlocking_ = on;
+        if (keyMixer_) keyMixer_->setNonBlocking(on);
+    }
 
     struct State;  // per clip/effect DSP state
     static bool ensurePlugin(State& st, const Effect& e, double sr);
@@ -123,7 +126,8 @@ private:
     void resetLocked();
     // Sidechain keys (a compressor or gate listening to another audio track): that track's signal over the block being
     // processed, before its fader and whether or not it is muted, from a mixer of its own (so the state of its clips'
-    // effects never runs twice); computed once per track and block. Null when there is no such track.
+    // effects never runs twice); computed once per track and block (fed ahead by its own inserts' latency), so a
+    // consumer fed ahead by plugin latency downstream hears it that much early. Null when there is no such track.
     const float* keySignal(Id track, int frames);
     struct KeyContext {
         const Project* p = nullptr;
@@ -134,7 +138,12 @@ private:
     };
     KeyContext key_;
     std::unique_ptr<AudioMixer> keyMixer_;
-    std::map<Id, std::pair<int64_t, std::vector<float>>> keyBufs_;
+    struct KeyBuffer {
+        int64_t block = -1;
+        std::vector<float> samples;
+    };
+    std::map<Id, KeyBuffer> keyBufs_;
+    int64_t keyBlock_ = 0;  // counts the top-level blocks mixed
     int64_t nextStart_ = -1;  // where the next contiguous block starts
     std::map<std::pair<Id, Id>, std::unique_ptr<State>> states_;
     std::mutex m_;

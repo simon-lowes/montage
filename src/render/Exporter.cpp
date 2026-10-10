@@ -1720,27 +1720,38 @@ bool renderClipAudio(const Project& p, const Sequence& seq, Id clip, const std::
         if (error) *error = "No such clip";
         return false;
     }
-    // The clip alone, at the start of an otherwise empty copy of the sequence.
+    // The clip alone where it is, on a plain track of its own; the other audio tracks stay (muted, with their
+    // inserts) so a compressor or gate on the clip still hears the track it is keyed by.
     Sequence alone = seq;
     alone.videoTracks.assign(1, Track{});
     alone.videoTracks[0].kind = TrackKind::Video;
-    alone.audioTracks.assign(1, Track{});
-    alone.audioTracks[0].kind = TrackKind::Audio;
+    const auto loc = edit::locate(seq, clip);
+    Track own;
+    own.kind = TrackKind::Audio;
+    own.id = loc && loc->track.kind == TrackKind::Audio ? seq.audioTracks[size_t(loc->track.index)].id : 0;
+    for (Track& t : alone.audioTracks) {
+        t.muted = true;
+        t.solo = false;
+        t.output = 0;
+    }
+    Clip copy = *c;
+    copy.linkGroup = 0;
+    copy.audio.params.clear();  // volume and pan stay live on the clip
+    own.clips.push_back(copy);
+    bool placed = false;
+    for (Track& t : alone.audioTracks)
+        if (own.id && t.id == own.id) t = own, placed = true;
+    if (!placed) alone.audioTracks.push_back(own);
     alone.buses.clear();
     alone.masterEffects.clear();
     alone.masterVolumeDb = 0;
     alone.captionTracks.clear();
-    Clip copy = *c;
-    copy.start = 0;
-    copy.linkGroup = 0;
-    copy.audio.params.clear();  // volume and pan stay live on the clip
-    alone.audioTracks[0].clips.push_back(copy);
     ExportSettings st;
     st.path = path;
     st.videoCodec = "none";
     st.audioCodec = "pcm_s24le";
-    st.in = 0;
-    st.out = copy.duration;
+    st.in = copy.start;
+    st.out = copy.start + copy.duration;
     return exportSequence(p, alone, st, progress, cancel, error);
 }
 

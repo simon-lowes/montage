@@ -3490,7 +3490,9 @@ private slots:
         QVERIFY(inspector && inspector->widget());
         auto* key = inspector->widget()->findChild<QComboBox*>("track_sidechain");
         QVERIFY(key);
-        QCOMPARE(key->count(), 1 + int(state()->sequence()->audioTracks.size()));
+        // None, then every audio track but the clip's own (a key cannot be its own signal).
+        QCOMPARE(key->count(), int(state()->sequence()->audioTracks.size()));
+        for (int i = 0; i < key->count(); ++i) QVERIFY(!key->itemText(i).startsWith("A1 "));
         QCOMPARE(key->currentIndex(), 0);  // None
         const int dialogue = key->findText("A2  Dialogue");
         QVERIFY(dialogue > 0);

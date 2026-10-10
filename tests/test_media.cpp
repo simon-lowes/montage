@@ -4879,6 +4879,25 @@ private slots:
         clipKeyed.audioTracks[0].clips[0].effects[0].strings["sidechain"] = "123456789";
         out = render(clipKeyed);
         QVERIFY(level(out, 1.3, 1.9) < 0.5 * before && std::fabs(level(out, 1.3, 1.9) - level(out, 0.3, 0.9)) < 0.1 * before);  // its own signal
+        // In a copy of the sequence the compressor listens to the copy's voice track; the clip rendered alone (as AAF
+        // export renders clips) still hears its key.
+        {
+            Project dp = p;
+            dp.active()->audioTracks[0].clips[0].effects = {comp};
+            const Id copy = edit::duplicateSequence(dp, dp.activeSequence, "Copy");
+            const Sequence* cs = dp.findSequence(copy);
+            QVERIFY(cs && cs->audioTracks[1].id != voiceTrack);
+            QCOMPARE(cs->audioTracks[0].clips[0].effects[0].s("sidechain"), std::to_string(cs->audioTracks[1].id));
+            const std::string alone = path("sc-alone.wav");
+            std::string err;
+            QVERIFY2(renderClipAudio(dp, *cs, cs->audioTracks[0].clips[0].id, alone, &err), err.c_str());
+            AudioBufferPtr buf = decodeAudio(alone, rate, &err);
+            QVERIFY2(buf, err.c_str());
+            const std::vector<float> rendered(buf->samples.begin(), buf->samples.end());
+            QVERIFY2(level(rendered, 1.3, 1.9) < 0.3 * level(rendered, 0.3, 0.9) && level(rendered, 0.3, 0.9) > 0.8 * before,
+                     qPrintable(QString("%1 %2").arg(level(rendered, 0.3, 0.9)).arg(level(rendered, 1.3, 1.9))));
+            QVERIFY(toneLevel(rendered, 0, 1000, size_t(1.3 * rate), size_t(1.9 * rate)) < 0.001);  // the key is not in it
+        }
 
         // MCP: the compressor on A1's inserts, keyed by A2 by reference; a track cannot key itself.
         const QString project = QString::fromStdString(path("sidechain.montage"));
@@ -5829,9 +5848,13 @@ private slots:
                  qPrintable(QString("%1 %2 %3").arg(v[0].start).arg(v[0].duration).arg(v[0].sourceIn)));
         QVERIFY2(v[1].start == 45 && v[1].duration == 25 && std::fabs(v[1].sourceIn - 65) < 0.01,
                  qPrintable(QString("%1 %2 %3").arg(v[1].start).arg(v[1].duration).arg(v[1].sourceIn)));
-        QCOMPARE(s.videoTracks[0].transitions.size(), size_t(1));
+        // The dissolve, and the fade out of the second clip (a dissolve into the filler after it).
+        QCOMPARE(s.videoTracks[0].transitions.size(), size_t(2));
         QCOMPARE(s.videoTracks[0].transitions[0].duration, FrameTime(10));
         QCOMPARE(s.videoTracks[0].transitions[0].type, std::string("cross_dissolve"));
+        QVERIFY(s.videoTracks[0].transitions[0].clipA == v[0].id && s.videoTracks[0].transitions[0].clipB == v[1].id);
+        QVERIFY(s.videoTracks[0].transitions[1].clipA == v[1].id && s.videoTracks[0].transitions[1].clipB == 0 &&
+                s.videoTracks[0].transitions[1].duration == 10);
         // The movie, found through the master mob and its file mob's locator; each sound track one of its channels.
         const MediaItem* movie = p.findMedia(v[0].mediaId);
         QVERIFY(movie && movie->path == st.path && movie->hasVideo && movie->hasAudio);
@@ -5849,6 +5872,34 @@ private slots:
         QCOMPARE(s.markers.size(), size_t(1));
         QCOMPARE(s.markers[0].t, FrameTime(20));
         QCOMPARE(s.markers[0].name, std::string("Check focus"));
+        // A nested sequence: made once, and played whole by one clip on the picture track and one on the sound.
+        {
+            const QString nestAaf = QString::fromStdString(path("nested.aaf"));
+            QProcess np;
+            np.start(QString::fromLocal8Bit(python), {"-I", QStringLiteral(MONTAGE_TEST_TOOLS_DIR "/make_aaf.py"), nestAaf,
+                                                      QString::fromStdString(st.path), "--nested"});
+            QVERIFY(np.waitForFinished(120000));
+            QVERIFY2(np.exitCode() == 0, np.readAllStandardError().constData());
+            Project n = makeDefaultProject();
+            const size_t before = n.sequences.size();
+            const ImportResult nr = importAaf(n, nestAaf.toStdString(), [](const std::string& f, MediaItem& m) { return probeMedia(f, m); });
+            QVERIFY2(nr.ok, nr.error.c_str());
+            QCOMPARE(n.sequences.size(), before + 2);
+            const Sequence& main = *n.findSequence(nr.sequence);
+            QCOMPARE(main.name, std::string("Main"));
+            QCOMPARE(main.videoTracks[0].clips.size(), size_t(1));
+            const Clip& nc = main.videoTracks[0].clips[0];
+            QVERIFY(nc.start == 10 && nc.duration == 40 && std::fabs(nc.sourceIn) < 0.01);
+            const MediaItem* nm = n.findMedia(nc.mediaId);
+            QVERIFY(nm && nm->kind == MediaKind::Sequence);
+            const Sequence* nest = n.findSequence(nm->sequenceId);
+            QVERIFY(nest && nest->name == "Nest");
+            QVERIFY(nest->videoTracks[0].clips.size() == 1 && std::fabs(nest->videoTracks[0].clips[0].sourceIn - 5) < 0.01);
+            size_t sounds = 0;
+            for (const Track& t : main.audioTracks)
+                for (const Clip& c : t.clips) sounds += c.mediaId == nm->id ? 1 : 0;
+            QCOMPARE(sounds, size_t(1));  // its mix, once
+        }
         // Its media moved beside the AAF: found there.
         const QString moved = QString::fromStdString(path("moved"));
         QVERIFY(QDir().mkpath(moved + "/Media"));
@@ -6063,9 +6114,19 @@ private slots:
                      qPrintable(QString("%1 %2 %3").arg(dl[0].start).arg(dl[0].duration).arg(dl[0].sourceIn)));
             QVERIFY2(dl[1].start == 50 && dl[1].duration == 60 && std::fabs(dl[1].sourceIn - 150) < 0.01,
                      qPrintable(QString("%1 %2 %3").arg(dl[1].start).arg(dl[1].duration).arg(dl[1].sourceIn)));
-            QCOMPARE(rs.audioTracks[0].transitions.size(), size_t(1));
-            QCOMPARE(rs.audioTracks[0].transitions[0].duration, FrameTime(10));
-            QVERIFY(dl[1].audio.params.count("gain_db"));  // its gain (the keyframes' first value)
+            // The crossfade, and the second clip's fade out (its fade length).
+            QCOMPARE(rs.audioTracks[0].transitions.size(), size_t(2));
+            const Transition* cross = nullptr;
+            const Transition* fade = nullptr;
+            for (const Transition& t : rs.audioTracks[0].transitions) (t.clipA && t.clipB ? cross : fade) = &t;
+            QVERIFY(cross && fade);
+            QCOMPARE(cross->duration, FrameTime(10));
+            QVERIFY(fade->clipA == dl[1].id && fade->clipB == 0 && fade->duration == 12 && fade->type == "crossfade_linear");
+            // Its gain keyframes where they were: 0 dB at its start, -12 dB 30 frames in.
+            QVERIFY(dl[1].audio.params.count("gain_db"));
+            const Param& g = dl[1].audio.params.at("gain_db");
+            QVERIFY2(g.keys.size() == 2 && g.keys[0].t == 0 && std::fabs(g.keys[0].v) < 0.05 && g.keys[1].t == 30 && std::fabs(g.keys[1].v + 12) < 0.05,
+                     qPrintable(QString("%1 keys, %2 %3").arg(g.keys.size()).arg(g.keys.empty() ? -1 : g.keys[0].t).arg(g.keys.size() < 2 ? -1 : g.keys[1].t)));
             QVERIFY(QString::fromStdString(in.findMedia(dl[0].mediaId)->path).endsWith("jfk.wav"));
             const auto& music = rs.audioTracks[1].clips;
             QVERIFY(music.size() == 2 && music[0].start == 20 && music[1].start == 100);
@@ -6184,12 +6245,16 @@ private slots:
         fast->speed = 2;
         fast->duration = 25;
         QVERIFY(edit::placeMedia(p, s, pic.id, 60, 0, 20, {TrackKind::Video, 1}, {TrackKind::Audio, -1}, false).ok);
+        QVERIFY(edit::placeMedia(p, s, movie.id, 85, 100, 110, {TrackKind::Video, 1}, {TrackKind::Audio, -1}, false).ok);
+        Clip* slow = edit::clipById(s, edit::clipAt(s, {TrackKind::Video, 1}, 85)->id);
+        slow->speed = 0.5;
+        slow->duration = 20;  // 10 frames of the movie over 20
 
         const std::string aaf = path("Picture Cut.aaf");
         AafExportResult r;
         QVERIFY2(exportAaf(p, s, aaf, &r, {}, nullptr, &err), err.c_str());
         QCOMPARE(r.videoTracks, 2);
-        QCOMPARE(r.videoClips, 4);
+        QCOMPARE(r.videoClips, 5);
         QCOMPARE(r.videoTransitions, 1);
         QVERIFY(r.audioTracks >= 1);
         QVERIFY(std::any_of(r.warnings.begin(), r.warnings.end(), [](const std::string& w) { return w.rfind("1 video clip(s) are not linked", 0) == 0; }));
@@ -6212,11 +6277,14 @@ private slots:
             QCOMPARE(rs.videoTracks[0].transitions[0].duration, FrameTime(10));
             QCOMPARE(in.findMedia(v1[0].mediaId)->path, st.path);
             const auto& v2 = rs.videoTracks[1].clips;
-            QCOMPARE(v2.size(), size_t(2));
+            QCOMPARE(v2.size(), size_t(3));
             QVERIFY2(v2[0].start == 20 && v2[0].duration == 25 && std::fabs(v2[0].speed - 2) < 1e-3 && std::fabs(v2[0].sourceIn) < 0.01,
                      qPrintable(QString("%1 %2 %3 %4").arg(v2[0].start).arg(v2[0].duration).arg(v2[0].speed).arg(v2[0].sourceIn)));
             QVERIFY(v2[1].start == 60 && v2[1].duration == 20);
             QCOMPARE(in.findMedia(v2[1].mediaId)->path, still);
+            QVERIFY2(v2.size() == 3 && v2[2].start == 85 && v2[2].duration == 20 && std::fabs(v2[2].speed - 0.5) < 1e-3 &&
+                         std::fabs(v2[2].sourceIn - 100) < 0.01,
+                     qPrintable(QString("%1 %2 %3 %4").arg(v2.back().start).arg(v2.back().duration).arg(v2.back().speed).arg(v2.back().sourceIn)));
             QVERIFY(!rs.audioTracks.empty() && !rs.audioTracks[0].clips.empty());
         }
 
@@ -6285,12 +6353,13 @@ private slots:
         QCOMPARE(a[1].toObject().value("cut").toInt(), 5);
         QCOMPARE(a[2].toObject().value("start").toInt(), 85);
         const QJsonArray b = tr[1].toObject().value("components").toArray();
-        QCOMPARE(b.size(), 4);
+        QCOMPARE(b.size(), 6);
         QCOMPARE(b[0].toObject().value("type").toString(), QString("filler"));
         QCOMPARE(b[1].toObject().value("op").toString(), QString("Motion Control"));
         QVERIFY(std::fabs(b[1].toObject().value("params").toObject().value("constant").toDouble() - 2) < 1e-6);
         QCOMPARE(b[1].toObject().value("inputs").toArray()[0].toObject().value("length").toInt(), 50);
         QVERIFY(b[3].toObject().value("file").toString().endsWith("still.png"));
+        QCOMPARE(b[5].toObject().value("inputs").toArray()[0].toObject().value("length").toInt(), 10);  // slow motion: 10 frames over 20
     }
 
     void superScaleUpscaling() {

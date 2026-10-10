@@ -64,7 +64,7 @@ struct Obj {
     std::string text(uint16_t pid) const { return utf16z(raw(pid)); }
     Rational rational(uint16_t pid, Rational def = {0, 1}) const {
         if (raw(pid).size() < 8) return def;
-        return {int64_t(int32_t(rd32(raw(pid), 0))), int64_t(int32_t(rd32(raw(pid), 4)))};
+        return {int(int32_t(rd32(raw(pid), 0))), int(int32_t(rd32(raw(pid), 4)))};
     }
     // A weak reference's key (the referenced object's identification, e.g. a definition's AUID).
     std::string weakKey(uint16_t pid) const {
@@ -160,25 +160,45 @@ const char* const kUsageTopLevel = "0d010102-0101-0700-060e-2b3404010101";
 const char* const kAmplitude = "e4962321-2267-11d3-8a4c-0050040ef7d2";
 const char* const kSpeedRatio = "72559a80-24d7-11d3-8a50-0050040ef7d2";
 
-// A parameter's value as a number: a constant (or a varying value's first point) holding a Rational or an integer.
-std::optional<double> parameterValue(const Obj& group, const char* parameterDef) {
+// An Indirect value (byte order, the type's AUID, then the value) holding a Rational or an integer, as a number.
+std::optional<double> indirectNumber(const std::string& v) {
+    if (v.size() < 17) return std::nullopt;
+    const std::string value = v.substr(17);
+    if (value.size() >= 8) {
+        const int32_t num = int32_t(rd32(value, 0)), den = int32_t(rd32(value, 4));
+        if (den) return double(num) / double(den);
+    }
+    if (value.size() == 4) return double(int32_t(rd32(value, 0)));
+    return std::nullopt;
+}
+
+// A parameter's value as a number: a constant (or, with `firstPoint`, a varying value's first point).
+std::optional<double> parameterValue(const Obj& group, const char* parameterDef, bool firstPoint = true) {
     for (const Obj& prm : strongList(group, 0x0b03)) {
         if (prm.raw(0x4c01) != aafAuid(parameterDef)) continue;
-        std::string v;
-        if (prm.is(kConstantValue)) v = prm.raw(0x4d01);
-        else if (prm.is(kVaryingValue))
-            if (const std::vector<Obj> pts = strongList(prm, 0x4e02); !pts.empty()) v = pts.front().raw(0x1a02);
-        // An Indirect value: byte order, the type's AUID, then the value.
-        if (v.size() < 17) continue;
-        const std::string value = v.substr(17);
-        if (value.size() >= 8) {
-            const int32_t num = int32_t(rd32(value, 0)), den = int32_t(rd32(value, 4));
-            if (den) return double(num) / double(den);
-        }
-        if (value.size() == 4) return double(int32_t(rd32(value, 0)));
+        if (prm.is(kConstantValue)) return indirectNumber(prm.raw(0x4d01));
+        if (firstPoint && prm.is(kVaryingValue))
+            if (const std::vector<Obj> pts = strongList(prm, 0x4e02); !pts.empty()) return indirectNumber(pts.front().raw(0x1a02));
     }
     return std::nullopt;
 }
+
+// A varying parameter's points: (time as a fraction of the operation's length, value).
+std::vector<std::pair<double, double>> parameterPoints(const Obj& group, const char* parameterDef) {
+    std::vector<std::pair<double, double>> out;
+    for (const Obj& prm : strongList(group, 0x0b03)) {
+        if (prm.raw(0x4c01) != aafAuid(parameterDef) || !prm.is(kVaryingValue)) continue;
+        for (const Obj& pt : strongList(prm, 0x4e02)) {
+            const Rational t = pt.rational(0x1a03);
+            const auto v = indirectNumber(pt.raw(0x1a02));
+            if (t.den && v) out.emplace_back(std::clamp(double(t.num) / double(t.den), 0.0, 1.0), *v);
+        }
+    }
+    return out;
+}
+
+// Amplitude as gain in dB, silence as the gain control's floor.
+double amplitudeDb(double amplitude) { return amplitude > 0.001 ? std::max(-60.0, 20 * std::log10(amplitude)) : -60.0; }
 
 // ---- Mobs ------------------------------------------------------------------------
 
@@ -233,14 +253,17 @@ public:
                 mob.mobSlots.push_back(std::move(slot));
             }
             mob.obj = std::move(m);
+            if (!mobs_.count(mob.id)) order_.push_back(mob.id);
             mobs_[mob.id] = std::move(mob);
         }
     }
 
+    // The compositions to import, in the file's order: those marked top level, else those no other uses.
     std::vector<const Mob*> compositions() const {
         std::vector<const Mob*> all, top;
         std::set<std::string> referenced;
-        for (const auto& [id, m] : mobs_) {
+        for (const std::string& id : order_) {
+            const Mob& m = mobs_.at(id);
             if (!m.obj.is(kCompositionMob)) continue;
             all.push_back(&m);
             if (m.obj.raw(0x4408) == aafAuid(kUsageTopLevel)) top.push_back(&m);
@@ -310,6 +333,11 @@ public:
     }
 
     const std::map<std::string, Mob>& mobs() const { return mobs_; }
+    // The composition (a nested sequence) a source clip names, if it names one.
+    const Mob* composition(const std::string& mobId) const {
+        const auto it = mobs_.find(mobId);
+        return it != mobs_.end() && it->second.obj.is(kCompositionMob) ? &it->second : nullptr;
+    }
     void warn(const std::string& w) {
         if (std::find(warnings_.begin(), warnings_.end(), w) == warnings_.end()) warnings_.push_back(w);
     }
@@ -330,6 +358,7 @@ private:
     }
 
     std::map<std::string, Mob> mobs_;
+    std::vector<std::string> order_;  // mob ids as the file lists them
     std::vector<std::string>& warnings_;
 };
 
@@ -341,29 +370,40 @@ struct Piece {
     uint32_t slot = 0;
     double start = 0;     // into the referenced mob slot, in this slot's units
     double gainDb = 0;
+    std::vector<std::pair<double, double>> gainKeys;  // keyframed gain: (slot units on the timeline, dB)
     double speed = 1;
+    double fadeIn = 0, fadeOut = 0;  // fade lengths (a sound clip's own), in slot units
+    bool linearIn = false, linearOut = false;
     double cutPoint = 0;  // transitions: where the cut falls, from its start
 };
 
+// What the operations around a segment do to it.
+struct Effects {
+    double gainDb = 0;
+    std::vector<std::pair<double, double>> gainKeys;
+    double speed = 1;
+};
+
 // The pieces of a segment placed from `pos`; returns the length it takes.
-double place(Reader& r, const Obj& seg, double pos, std::vector<Piece>& out, double gainDb = 0, double speed = 1) {
-    if (!seg) return 0;
-    const double len = double(seg.i64(0x0202));
+double place(Reader& r, const Obj& seg, double pos, std::vector<Piece>& out, const Effects& fx = {}, int depth = 0) {
+    if (!seg || depth > 64) return 0;
+    const double len = double(std::max<int64_t>(0, seg.i64(0x0202)));
     if (seg.is(kSequence)) {
         double cursor = pos;
         for (const Obj& c : strongList(seg, 0x1001)) {
             if (c.is(kTransition)) {
-                const double l = double(c.i64(0x0202));
-                cursor -= l;  // a transition overlaps the pieces on either side
+                // A transition overlaps the pieces on either side (never reaching back before the sequence).
+                const double l = std::min(double(std::max<int64_t>(0, c.i64(0x0202))), cursor - pos);
+                cursor -= l;
                 Piece t;
                 t.kind = Piece::Transition;
                 t.pos = cursor;
                 t.len = l;
-                t.cutPoint = double(c.i64(0x1802, int64_t(l / 2)));
+                t.cutPoint = std::clamp(double(c.i64(0x1802, int64_t(l / 2))), 0.0, l);
                 out.push_back(t);
                 continue;
             }
-            cursor += place(r, c, cursor, out, gainDb, speed);
+            cursor += place(r, c, cursor, out, fx, depth + 1);
         }
         return cursor - pos;
     }
@@ -375,8 +415,13 @@ double place(Reader& r, const Obj& seg, double pos, std::vector<Piece>& out, dou
             p.mob = seg.raw(0x1101);
             p.slot = seg.u32(0x1102);
             p.start = double(seg.i64(0x1201));
-            p.gainDb = gainDb;
-            p.speed = speed;
+            p.gainDb = fx.gainDb;
+            p.gainKeys = fx.gainKeys;
+            p.speed = fx.speed;
+            p.fadeIn = std::clamp(double(seg.i64(0x1202)), 0.0, len);
+            p.fadeOut = std::clamp(double(seg.i64(0x1204)), 0.0, len);
+            p.linearIn = seg.has(0x1203) && uint8_t(seg.raw(0x1203)[0]) == 1;  // LinearAmp, not LinearPower
+            p.linearOut = seg.has(0x1205) && uint8_t(seg.raw(0x1205)[0]) == 1;
             out.push_back(p);
         }
         return len;
@@ -384,29 +429,46 @@ double place(Reader& r, const Obj& seg, double pos, std::vector<Piece>& out, dou
     if (seg.is(kFiller) || seg.is(kTimecode)) return len;
     if (seg.is(kOperationGroup)) {
         const std::vector<Obj> inputs = strongList(seg, 0x0b02);
-        double g = gainDb, sp = speed;
-        if (const auto amp = parameterValue(seg, kAmplitude); amp && *amp > 0) g += 20 * std::log10(*amp);
-        else if (const auto ratio = parameterValue(seg, kSpeedRatio); ratio && *ratio > 0) sp *= *ratio;
-        else if (!inputs.empty()) r.warn("Some effects in the AAF could not be carried over; their clips came in without them");
+        Effects inner = fx;
+        double warp = 1;  // a speed change: input units per output unit
+        if (const auto points = parameterPoints(seg, kAmplitude); !points.empty()) {
+            if (inner.gainKeys.empty())
+                for (const auto& [t, v] : points) inner.gainKeys.emplace_back(pos + t * len, amplitudeDb(v));
+        } else if (const auto amp = parameterValue(seg, kAmplitude, false)) {
+            inner.gainDb += amplitudeDb(*amp);
+        } else if (const auto ratio = parameterValue(seg, kSpeedRatio); ratio && *ratio > 0) {
+            warp = *ratio;
+            inner.speed *= warp;
+        } else if (!inputs.empty()) {
+            r.warn("Some effects in the AAF could not be carried over; their clips came in without them");
+        }
         if (!inputs.empty()) {
-            std::vector<Piece> inner;
-            place(r, inputs.front(), pos, inner, g, sp);
-            for (Piece& p : inner)
-                if (p.kind == Piece::Clip) p.len = std::min(p.len, len);  // the effect's length is what plays
-            out.insert(out.end(), inner.begin(), inner.end());
+            std::vector<Piece> pieces;
+            place(r, inputs.front(), pos, pieces, inner, depth + 1);
+            for (Piece& p : pieces) {
+                if (warp != 1) {  // the input is in its own (source) time: on the timeline it takes 1/warp as long
+                    p.pos = pos + (p.pos - pos) / warp;
+                    p.len /= warp;
+                    p.cutPoint /= warp;
+                    p.fadeIn /= warp;
+                    p.fadeOut /= warp;
+                }
+                if (p.kind == Piece::Clip) p.len = std::max(0.0, std::min(p.len, pos + len - p.pos));  // what plays is the operation's length
+            }
+            out.insert(out.end(), pieces.begin(), pieces.end());
         }
         return len;
     }
     if (seg.is(kSelector)) {
-        place(r, strong(seg, 0x0f01), pos, out, gainDb, speed);
+        place(r, strong(seg, 0x0f01), pos, out, fx, depth + 1);
         return len;
     }
     if (seg.is(kEssenceGroup)) {
-        if (const std::vector<Obj> choices = strongList(seg, 0x0501); !choices.empty()) place(r, choices.front(), pos, out, gainDb, speed);
+        if (const std::vector<Obj> choices = strongList(seg, 0x0501); !choices.empty()) place(r, choices.front(), pos, out, fx, depth + 1);
         return len;
     }
     if (seg.is(kNestedScope)) {
-        if (const std::vector<Obj> scopes = strongList(seg, 0x0c01); !scopes.empty()) place(r, scopes.back(), pos, out, gainDb, speed);
+        if (const std::vector<Obj> scopes = strongList(seg, 0x0c01); !scopes.empty()) place(r, scopes.back(), pos, out, fx, depth + 1);
         return len;
     }
     r.warn("Parts of the AAF Montage does not read came in as gaps");
@@ -450,14 +512,22 @@ ImportResult importAaf(Project& p, const std::string& path, const MediaProber& p
         return res;
     }
     const std::string aafDir = QFileInfo(QString::fromStdString(path)).absolutePath().toStdString();
-    for (const Mob* comp : comps) {
+    // Each composition becomes a sequence; one that another plays (a nested sequence) is made once, when first met,
+    // and played there as a nested sequence clip.
+    std::map<std::string, Id> built;    // composition mob -> sequence
+    std::map<Id, Id> nestedMedia;       // sequence -> its media item
+    std::set<std::string> building;
+    std::function<Id(const Mob*)> build = [&](const Mob* comp) -> Id {
+        if (const auto it = built.find(comp->id); it != built.end()) return it->second;
+        if (building.count(comp->id) || building.size() > 32) return 0;  // a loop, or nesting too deep
+        building.insert(comp->id);
         // The sequence's rate: its first picture slot's (else its first slot's, when it is a video rate).
         Rational fps{0, 1};
         for (const Slot& s : comp->mobSlots)
             if (!fps.num && s.segment && picture(s.segment.weakKey(0x0201))) fps = s.rate;
         for (const Slot& s : comp->mobSlots)
             if (!fps.num && !s.event && rateOf(s.rate) > 0 && rateOf(s.rate) <= 120) fps = s.rate;
-        if (!fps.num) fps = {25, 1};
+        if (!fps.valid()) fps = {25, 1};
         TimelineBuilder b(p, comp->name, fps, probe);
         const double f = rateOf(fps);
         int videoTrack = 0, audioTrack = 0;
@@ -488,37 +558,100 @@ ImportResult importAaf(Project& p, const std::string& path, const MediaProber& p
             std::vector<Piece> pieces;
             place(reader, s.segment, 0, pieces);
             const double toFrames = f / rateOf(s.rate);
-            // Clips first, then transitions between the clips either side of each.
+            // Clips first, then transitions between the clips either side of each (or fades, beside a gap).
             struct Placed {
                 Id id;
                 double pos, len;  // slot units
             };
             std::vector<Placed> placed;
             for (const Piece& pc : pieces) {
-                if (pc.kind != Piece::Clip) continue;
-                const Source src = reader.resolve(pc.mob, pc.slot, pc.start, s.rate);
-                const std::string file = src.url.empty() ? std::string() : findFile(src.url, aafDir);
-                const double seconds = std::max(src.length, src.seconds + pc.len * pc.speed / rateOf(s.rate));
-                const Id media = b.media(file, src.name, pic, snd, seconds);
+                if (pc.kind != Piece::Clip || pc.len <= 0) continue;
                 const FrameTime start = FrameTime(std::llround(pc.pos * toFrames));
                 const FrameTime end = FrameTime(std::llround((pc.pos + pc.len) * toFrames));
-                Clip* c = b.addClip(kind, index, media, start, end - start, src.seconds * f, src.name);
+                if (end <= start) continue;
+                Id media = 0;
+                double sourceIn = 0;
+                std::string name;
+                int channel = -1;
+                if (const Mob* nested = reader.composition(pc.mob)) {
+                    // A nested sequence: played whole (picture composited, sound mixed), once per stretch of time.
+                    const Id seq = build(nested);
+                    if (!seq) {
+                        reader.warn("A nested sequence that contains itself was left out");
+                        continue;
+                    }
+                    auto [it, added] = nestedMedia.try_emplace(seq, 0);
+                    if (added) {
+                        const Sequence* ns = p.findSequence(seq);
+                        MediaItem m;
+                        m.id = p.newId();
+                        m.kind = MediaKind::Sequence;
+                        m.name = nested->name;
+                        m.sequenceId = seq;
+                        m.hasVideo = m.hasAudio = true;
+                        if (ns) {
+                            m.width = ns->width;
+                            m.height = ns->height;
+                            m.fps = ns->fps;
+                            m.duration = double(ns->duration()) / std::max(1e-9, ns->fpsValue());
+                        }
+                        p.media.push_back(m);
+                        it->second = m.id;
+                    }
+                    media = it->second;
+                    sourceIn = pc.start * toFrames;
+                    name = nested->name;
+                    const auto same = [&](const Clip& c) { return c.mediaId == media && c.start == start && std::fabs(c.sourceIn - sourceIn) < 0.5; };
+                    bool already = false;
+                    for (const Track& t : snd ? b.sequence().audioTracks : b.sequence().videoTracks)
+                        already = already || std::any_of(t.clips.begin(), t.clips.end(), same);
+                    if (already) continue;  // its other sound (or picture) slots: the nested mix already plays them
+                } else {
+                    const Source src = reader.resolve(pc.mob, pc.slot, pc.start, s.rate);
+                    const std::string file = src.url.empty() ? std::string() : findFile(src.url, aafDir);
+                    const double seconds = std::max(src.length, src.seconds + pc.len * pc.speed / rateOf(s.rate));
+                    media = b.media(file, src.name, pic, snd, seconds);
+                    sourceIn = src.seconds * f;
+                    name = src.name;
+                    channel = src.channel;
+                }
+                Clip* c = b.addClip(kind, index, media, start, end - start, sourceIn, name);
                 if (!c) continue;
                 if (pc.speed != 1) c->speed = pc.speed;
-                if (snd && std::fabs(pc.gainDb) > 1e-6) c->audio.params["gain_db"] = Param(pc.gainDb);
-                if (snd && src.channel >= 0)
-                    if (const MediaItem* mi = p.findMedia(media); mi && mi->channels > 1 && src.channel < mi->channels)
-                        c->channels = {src.channel};
-                placed.push_back({c->id, pc.pos, pc.len});
+                if (snd && !pc.gainKeys.empty()) {
+                    Param gain;
+                    for (const auto& [t, db] : pc.gainKeys)
+                        gain.addKey(FrameTime(std::llround(t * toFrames)) - start, std::max(-60.0, db + pc.gainDb));
+                    c->audio.params["gain_db"] = gain;
+                } else if (snd && std::fabs(pc.gainDb) > 1e-6) {
+                    c->audio.params["gain_db"] = Param(pc.gainDb);
+                }
+                if (snd && channel >= 0)
+                    if (const MediaItem* mi = p.findMedia(media); mi && mi->channels > 1 && channel < mi->channels) c->channels = {channel};
+                const Id id = c->id;
+                const FrameTime fadeIn = FrameTime(std::llround(pc.fadeIn * toFrames)), fadeOut = FrameTime(std::llround(pc.fadeOut * toFrames));
+                if (fadeIn > 0) b.addTransition(kind, index, 0, id, fadeIn, pc.linearIn ? "crossfade_linear" : "crossfade");
+                if (fadeOut > 0) b.addTransition(kind, index, id, 0, fadeOut, pc.linearOut ? "crossfade_linear" : "crossfade");
+                placed.push_back({id, pc.pos, pc.len});
             }
             for (const Piece& pc : pieces) {
-                if (pc.kind != Piece::Transition) continue;
+                if (pc.kind != Piece::Transition || pc.len <= 0) continue;
                 // The clips that end and begin across it.
                 const Placed* a = nullptr;
                 const Placed* bb = nullptr;
                 for (const Placed& x : placed) {
                     if (std::fabs(x.pos + x.len - (pc.pos + pc.len)) < 0.5) a = &x;
                     if (std::fabs(x.pos - pc.pos) < 0.5) bb = &x;
+                }
+                const FrameTime length = FrameTime(std::llround(pc.len * toFrames));
+                // Beside a gap (filler): a fade in from nothing or out to nothing, inside the clip.
+                if (!a && bb) {
+                    b.addTransition(kind, index, 0, bb->id, length, {});
+                    continue;
+                }
+                if (a && !bb) {
+                    b.addTransition(kind, index, a->id, 0, length, {});
+                    continue;
                 }
                 if (!a || !bb) continue;
                 // Montage's clips meet at the cut: the outgoing one ends there, the incoming one starts there.
@@ -532,19 +665,29 @@ ImportResult importAaf(Project& p, const std::string& path, const MediaProber& p
                 cb->sourceIn += double(trimB) * cb->speed;
                 cb->start = cut;
                 cb->duration -= trimB;
-                b.addTransition(kind, index, ca->id, cb->id, FrameTime(std::llround(pc.len * toFrames)), {});
+                if (auto g = cb->audio.params.find("gain_db"); g != cb->audio.params.end())
+                    for (Keyframe& k : g->second.keys) k.t -= trimB;  // keyframes stay where they were on the timeline
+                b.addTransition(kind, index, ca->id, cb->id, length, {});
             }
         }
         ImportResult one = b.finish();
-        if (!res.ok) {
-            res = one;
-        } else {
-            res.clips += one.clips;
-            res.offline.insert(res.offline.end(), one.offline.begin(), one.offline.end());
-        }
+        building.erase(comp->id);
+        built[comp->id] = one.sequence;
+        res.clips += one.clips;
+        res.offline.insert(res.offline.end(), one.offline.begin(), one.offline.end());
+        res.warnings.insert(res.warnings.end(), one.warnings.begin(), one.warnings.end());
+        return one.sequence;
+    };
+    for (const Mob* comp : comps) {
+        const Id seq = build(comp);
+        if (!res.sequence) res.sequence = seq;
     }
+    res.ok = res.sequence != 0;
+    if (!res.ok) res.error = "The AAF's sequences could not be read";
     p.activeSequence = res.sequence;  // the first composition
     res.warnings.insert(res.warnings.end(), warnings.begin(), warnings.end());
+    std::sort(res.warnings.begin(), res.warnings.end());
+    res.warnings.erase(std::unique(res.warnings.begin(), res.warnings.end()), res.warnings.end());
     std::sort(res.offline.begin(), res.offline.end());
     res.offline.erase(std::unique(res.offline.begin(), res.offline.end()), res.offline.end());
     return res;
