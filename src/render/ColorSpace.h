@@ -30,11 +30,14 @@ enum class Transfer {
     Log3G10,              // RED Log3G10
     BmdFilmGen5,          // Blackmagic Film Generation 5
     DavinciIntermediate,  // DaVinci Intermediate
+    GoProLog,             // GoPro GP-Log (HERO12 and HERO13 Black)
+    GoProLog2,            // GoPro GP-Log2 (MISSION 1)
+    LLog,                 // Leica L-Log
 };
 
 enum class Primaries {
     Bt709, Bt2020, P3D65, SGamut3Cine, AlexaWideGamut3, AlexaWideGamut4, VGamut, CinemaGamut, Ap1, Ap0,
-    SGamut3, DGamut, RedWideGamut, BmdWideGamut, DavinciWideGamut
+    SGamut3, DGamut, RedWideGamut, BmdWideGamut, DavinciWideGamut, AppleWideGamut
 };
 
 struct ColorSpace {

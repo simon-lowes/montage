@@ -951,6 +951,8 @@ Ranked by what the market leaders have that Montage lacks, weighed against the w
 The third gap analysis (`docs/research/phase4-roadmap.md`, October 2026) ranks what is still missing against Premiere 26.5, Resolve 21.1, Final Cut Pro 12 and Media Composer 2025.12. Worked through in order:
 
 - [ ] 1. ProRes RAW with RAW controls, and current camera logs (Apple Log 2, D-Log2, GoPro Log, L-Log) (M).
+  - [x] The logs (facts in `docs/research/notes-camera-logs-prores-raw.md`): Apple Log 2 is Apple Log's curve over Apple Gamut (Apple Wide Gamut, xy from ACES' `CSC.Apple.AppleLog2_to_ACES`, Bradford to AP0 matching OCIO's matrix); GoPro GP-Log (base 400, Rec.709) and GP-Log2 (base 600, Rec.2020) by GoPro's own formula, with sensor linear 0.0517 as 18 % grey (GP-Log2's white paper; assumed for GP-Log); Leica L-Log over Rec.2020, with the manual's two cut points. DJI's D-Log M and D-Log2 have no published formula and are not guessed. **Tests:** render `cameraLogSpaces` (code values at six exposures against colour-science and GoPro's formula, round trips, the Apple Gamut matrix against ACES', GoPro and Leica grey reading as grey).
+  - [ ] ProRes RAW (FFmpeg 9's decoder: linear Bayer with white balance, camera matrix and gain as frame side data).
 - [ ] 2. HDR viewer on HDR and EDR displays (M).
 - [ ] 3. Stacked timelines and editing from a sequence (S–M).
 - [ ] 4. Aux sends and full mixer automation (M).

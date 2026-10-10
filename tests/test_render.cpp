@@ -1757,6 +1757,10 @@ colorspaces:
             {Transfer::Log3G10, {0.091551488, 0.117456111, 0.137898710, 0.333332912, 0.483360528, 0.627292998}},
             {Transfer::BmdFilmGen5, {0.092465753, 0.133883783, 0.167755310, 0.383561644, 0.521383526, 0.650641506}},
             {Transfer::DavinciIntermediate, {0.0, 0.049697572, 0.085275708, 0.336043272, 0.502784181, 0.659830394}},
+            {Transfer::LLog, {0.090000000, 0.130000000, 0.165074843, 0.435313904, 0.619557106, 0.793579940}},  // also colour-science
+            // GoPro's formula from its Labs docs (base 400) and GP-Log2 white paper (base 600), grey at L = 0.0517.
+            {Transfer::GoProLog, {0.0, 0.075595792, 0.127435427, 0.513037243, 0.775367400, 1.023083798}},
+            {Transfer::GoProLog2, {0.0, 0.097019004, 0.156433877, 0.541601097, 0.789234046, 1.021637515}},
         };
         for (const Curve& c : curves)
             for (int i = 0; i < 6; ++i) {
@@ -1775,6 +1779,7 @@ colorspaces:
             {Primaries::BmdWideGamut, {0.622830, 0.334441, 0.029346}},
             {Primaries::SGamut3, {0.692332, 0.299477, 0.059835}},
             {Primaries::DavinciWideGamut, {0.701011, 0.330216, -0.011751}},
+            {Primaries::AppleWideGamut, {0.679108, 0.312928, 0.044307}},
         };
         for (const Gamut& g : gamuts) {
             double m[9];
@@ -1786,7 +1791,8 @@ colorspaces:
             }
         }
         // Each is offered by name, scene-referred, and an Apple Log grey reads as Rec.709 grey.
-        for (const char* id : {"applelog-rec2020", "dlog-dgamut", "flog2-fgamut", "nlog-ngamut", "log3g10-rwg", "bmdfilm5-bmdwg", "di-dwg", "slog3-sgamut3"}) {
+        for (const char* id : {"applelog-rec2020", "applelog2-applewg", "dlog-dgamut", "flog2-fgamut", "nlog-ngamut", "log3g10-rwg", "bmdfilm5-bmdwg",
+                               "di-dwg", "slog3-sgamut3", "gplog-rec709", "gplog2-rec2020", "llog-rec2020"}) {
             const ColorSpace* cs = findColorSpace(id);
             QVERIFY2(cs && cs->sceneReferred, id);
         }
@@ -1797,6 +1803,21 @@ colorspaces:
         rgb(grey, 0, 0, c);
         QVERIFY2(std::fabs(c[0] - 0.18f) < 1e-3f && std::fabs(c[1] - 0.18f) < 1e-3f && std::fabs(c[2] - 0.18f) < 1e-3f,
                  qPrintable(QString("%1 %2 %3").arg(c[0]).arg(c[1]).arg(c[2])));
+        // Apple Log 2 is Apple Log's curve over Apple Gamut (ACES' CSC.Apple.AppleLog2_to_ACES matrix, through Bradford).
+        double toAp0[9];
+        primariesMatrix(Primaries::AppleWideGamut, Primaries::Ap0, toAp0);
+        const double aces[9] = {0.694961049318, 0.241405268785, 0.063633681897, 0.047362746415, 1.004295925054,
+                                -0.051658671469, -0.021989789360, -0.028989104971, 1.050978894331};
+        for (int i = 0; i < 9; ++i) QVERIFY2(std::fabs(toAp0[i] - aces[i]) < 2e-4, qPrintable(QString("%1: %2").arg(i).arg(toAp0[i], 0, 'f', 6)));
+        // A GoPro or Leica grey reads as grey.
+        for (const char* id : {"gplog2-rec2020", "llog-rec2020"}) {
+            const ColorSpace& cs = *findColorSpace(id);
+            const float code = float(fromLinear(cs.transfer, 0.18));
+            Image g = solid(1, 1, code, code, code);
+            convertColor(g, cs, *findColorSpace("linear-rec709"), 1000);
+            rgb(g, 0, 0, c);
+            QVERIFY2(std::fabs(c[1] - 0.18f) < 2e-3f, qPrintable(QString("%1: %2").arg(id).arg(c[1])));
+        }
     }
 
     void curvesAndLuts() {
