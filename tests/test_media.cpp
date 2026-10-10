@@ -54,6 +54,7 @@
 #include "media/Loudness.h"
 #include "media/Offload.h"
 #include "core/AafImport.h"
+#include "core/ProjectLock.h"
 #include "media/MediaPool.h"
 #include "media/Relink.h"
 #include "media/SpeakerSwitch.h"
@@ -6198,6 +6199,54 @@ private slots:
         QVERIFY(music[1].toObject().value("inputs").toArray()[0].toObject().value("file").toString().endsWith("tone-stereo%20L.wav"));
         QVERIFY(tr[2].toObject().value("components").toArray()[1].toObject().value("inputs").toArray()[0].toObject()
                     .value("file").toString().endsWith("tone-stereo%20R.wav"));
+    }
+
+    void sharedProjectsOverMcp() {
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        const QString prod = QString::fromStdString(path("mcp-production"));
+        QVERIFY(call("montage_production", {{"folder", prod}}).value("isError").toBool());  // not one yet
+        QJsonObject r = call("montage_production", {{"folder", prod}, {"create", true}, {"name", "Series 2"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("production").toString(), QString("Series 2"));
+        const QString ep1 = prod + "/Episode 1.montage", ep2 = prod + "/Episode 2.montage";
+        {
+            Project p = makeDefaultProject();
+            p.active()->name = "Ep 1 Cut";
+            QVERIFY(saveProject(p, ep1.toStdString()));
+            p.active()->name = "Ep 2 Cut";
+            QVERIFY(saveProject(p, ep2.toStdString()));
+            const QString t = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
+            QFile f(QString::fromStdString(lockPathFor(ep2.toStdString())));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(QJsonDocument(QJsonObject{{"user", "sam"}, {"host", "edit-bay-2"}, {"pid", 4242.0}, {"since", t}, {"heartbeat", t}}).toJson());
+        }
+        r = call("montage_production", {{"folder", prod}});
+        const QJsonArray projects = r.value("structuredContent").toObject().value("projects").toArray();
+        QCOMPARE(projects.size(), 2);
+        QCOMPARE(projects[0].toObject().value("status").toString(), QString("free"));
+        QCOMPARE(projects[1].toObject().value("editor").toString(), QString("sam on edit-bay-2"));
+        // A sequence from the episode being edited, brought into the free one: reading it is fine.
+        r = call("montage_import_from_project", {{"project", ep1}, {"from", ep2}, {"sequences", QJsonArray{"Ep 2 Cut"}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        Project back;
+        QVERIFY(loadProject(ep1.toStdString(), back));
+        QCOMPARE(back.active()->name, std::string("Ep 2 Cut"));
+        QCOMPARE(back.sequences.size(), size_t(2));
+        QVERIFY(call("montage_import_from_project", {{"project", ep1}, {"from", ep2}, {"sequences", QJsonArray{"Nope"}}}).value("isError").toBool());
+        // Changing the episode someone has open is refused, and it is left as it was.
+        r = call("montage_import_from_project", {{"project", ep2}, {"from", ep1}});
+        QVERIFY(r.value("isError").toBool());
+        QVERIFY(r.value("content").toArray().at(0).toObject().value("text").toString().contains("sam on edit-bay-2"));
+        QVERIFY(loadProject(ep2.toStdString(), back));
+        QCOMPARE(back.sequences.size(), size_t(1));
     }
 
     void aafExportWithPicture() {

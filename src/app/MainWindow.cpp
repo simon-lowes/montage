@@ -94,7 +94,11 @@
 #include "ScriptCutDialog.h"
 #include "QualityCheckDialog.h"
 #include "OffloadDialog.h"
+#include "ProductionPanel.h"
 #include "core/AafImport.h"
+#include "core/Production.h"
+#include "core/ProjectLock.h"
+#include "core/ProjectIO.h"
 #include "ProjectManagerDialog.h"
 #include "LinkMediaDialog.h"
 #include "EffectPresetStore.h"
@@ -423,6 +427,21 @@ void MainWindow::buildPanels() {
     keyframesDock_ = makeDock(tr("Keyframes"), "keyframes", new KeyframePanel(state_, this));
     queue_ = new RenderQueue(this);
     queueDock_ = makeDock(tr("Render Queue"), "renderqueue", new RenderQueuePanel(queue_, this));
+    production_ = new ProductionPanel(state_, this);
+    productionDock_ = makeDock(tr("Production"), "production", production_);
+    connect(production_, &ProductionPanel::openRequested, this, [this](const QString& path, bool readOnly) {
+        const bool here = !state_->filePath().isEmpty() && QFileInfo(path).absoluteFilePath() == QFileInfo(state_->filePath()).absoluteFilePath();
+        if (here && !readOnly && state_->readOnly()) {
+            QString err;
+            if (!state_->takeEdit(&err)) QMessageBox::information(this, tr("Edit Project"), err);
+            return;
+        }
+        if (here && readOnly == state_->readOnly()) return;
+        if (!maybeSave()) return;
+        openProjectAs(path, readOnly ? OpenMode::ReadOnly : OpenMode::Ask);
+    });
+    connect(production_, &ProductionPanel::newProjectRequested, this, &MainWindow::newProjectInProduction);
+    connect(production_, &ProductionPanel::importRequested, this, [this](const QString& path) { importFromProjectDialog(path); });
     connect(queue_, &RenderQueue::jobFinished, this, [this](int id, bool ok) {
         const RenderQueue::Job* j = queue_->job(id);
         if (!j) return;
@@ -709,6 +728,37 @@ void MainWindow::buildMenus() {
         ProjectManagerDialog dlg(state_, this);
         if (dlg.exec() == QDialog::Accepted) runProjectManager(dlg.options());
     })->setObjectName(QStringLiteral("projectManager"));
+    {
+        QMenu* prod = file->addMenu(tr("Productio&n"));
+        add(prod, tr("&New Production…"), QKeySequence(), [this] {
+            const QString folder = QFileDialog::getExistingDirectory(this, tr("New Production: Choose or Make Its Folder (on the Shared Drive)"),
+                                                                     appSettings().value("lastProjectDir").toString());
+            if (folder.isEmpty()) return;
+            bool ok = false;
+            const QString name = QInputDialog::getText(this, tr("New Production"), tr("Name:"), QLineEdit::Normal, QDir(folder).dirName(), &ok);
+            if (ok) openProduction(folder, true, name);
+        })->setObjectName(QStringLiteral("newProduction"));
+        add(prod, tr("&Open Production…"), QKeySequence(), [this] {
+            const QString folder = QFileDialog::getExistingDirectory(this, tr("Open Production"), appSettings().value("lastProjectDir").toString());
+            if (folder.isEmpty()) return;
+            if (!isProduction(folder.toStdString()) &&
+                QMessageBox::question(this, tr("Open Production"), tr("%1 is not a production yet. Make it one?").arg(QDir::toNativeSeparators(folder))) !=
+                    QMessageBox::Yes)
+                return;
+            openProduction(folder, true);
+        })->setObjectName(QStringLiteral("openProduction"));
+        add(prod, tr("&Import from Project…"), QKeySequence(), [this] { importFromProjectDialog(); })->setObjectName(QStringLiteral("importFromProject"));
+        takeEdit_ = add(file, tr("&Edit Project (Take the Lock)"), QKeySequence(), [this] {
+            QString err;
+            if (!state_->takeEdit(&err) && !err.isEmpty()) QMessageBox::information(this, tr("Edit Project"), err);
+        });
+        takeEdit_->setObjectName(QStringLiteral("takeEdit"));
+        takeEdit_->setEnabled(false);
+        connect(state_, &EditorState::lockStateChanged, this, [this] {
+            updateTitle();
+            takeEdit_->setEnabled(state_->canTakeEdit());
+        });
+    }
     add(file, tr("&Offload Card…"), QKeySequence(), [this] {
         OffloadDialog dlg(state_, this);
         dlg.exec();
@@ -1653,6 +1703,8 @@ void MainWindow::updateActions() {
 
 void MainWindow::updateTitle() {
     QString name = state_->filePath().isEmpty() ? tr("Untitled") : QFileInfo(state_->filePath()).completeBaseName();
+    if (state_->readOnly())
+        name += state_->lockHolder().isEmpty() ? tr(" (Read-Only)") : tr(" (Read-Only: %1 is editing)").arg(state_->lockHolder());
     setWindowTitle(QString("%1[*] — Montage").arg(name));
     setWindowModified(state_->isModified());
 }
@@ -1727,7 +1779,7 @@ Id MainWindow::makeSubclip() {
 // File commands
 
 bool MainWindow::maybeSave() {
-    if (!state_->isModified()) return true;
+    if (!state_->isModified() || state_->readOnly()) return true;
     auto r = QMessageBox::warning(this, tr("Montage"), tr("The project has unsaved changes. Save them?"),
                                   QMessageBox::Save | QMessageBox::Discard | QMessageBox::Cancel);
     if (r == QMessageBox::Cancel) return false;
@@ -1749,10 +1801,43 @@ void MainWindow::openDialog() {
     if (!path.isEmpty()) openProject(path);
 }
 
-bool MainWindow::openProject(const QString& path) {
+bool MainWindow::openProject(const QString& path) { return openProjectAs(path, OpenMode::Ask); }
+
+bool MainWindow::openProjectAs(const QString& path, OpenMode mode) {
     QString err;
     program_->pause();
-    if (!state_->open(path, &err)) {
+    EditorState::Access access = mode == OpenMode::ReadOnly ? EditorState::Access::ReadOnly
+                                 : mode == OpenMode::Edit   ? EditorState::Access::Edit
+                                                            : EditorState::Access::Auto;
+    if (mode == OpenMode::Ask) {
+        const LockStatus st = projectLockStatus(path.toStdString());
+        const QString who = QString::fromStdString(st.owner.describe()), file = QFileInfo(path).completeBaseName();
+        const QString since = st.owner.since.isValid() ? QLocale().toString(st.owner.since.toLocalTime(), QLocale::ShortFormat) : tr("a while");
+        if (st.state == LockState::Theirs) {
+            QMessageBox box(QMessageBox::Information, tr("Project in Use"),
+                            tr("%1 is editing “%2” (since %3).\n\nOpen it read-only? You can watch, play and export it; it follows their saves, "
+                               "and once they close it File › Edit Project lets you edit it.")
+                                .arg(who, file, since),
+                            QMessageBox::Cancel, this);
+            QPushButton* ro = box.addButton(tr("Open Read-Only"), QMessageBox::AcceptRole);
+            box.exec();
+            if (box.clickedButton() != ro) return false;
+            access = EditorState::Access::ReadOnly;
+        } else if (st.state == LockState::Stale) {
+            QMessageBox box(QMessageBox::Question, tr("Project Left Open"),
+                            tr("“%2” was left open by %1, who has not been heard from since %3 (Montage closed unexpectedly, or the "
+                               "computer went to sleep).\n\nTake it over and edit it?")
+                                .arg(who, file, st.owner.heartbeat.isValid() ? QLocale().toString(st.owner.heartbeat.toLocalTime(), QLocale::ShortFormat) : since),
+                            QMessageBox::Cancel, this);
+            QPushButton* take = box.addButton(tr("Take Over"), QMessageBox::AcceptRole);
+            QPushButton* ro = box.addButton(tr("Open Read-Only"), QMessageBox::ActionRole);
+            box.exec();
+            if (box.clickedButton() == take) access = EditorState::Access::Edit;
+            else if (box.clickedButton() == ro) access = EditorState::Access::ReadOnly;
+            else return false;
+        }
+    }
+    if (!state_->open(path, &err, access)) {
         QMessageBox::warning(this, tr("Open Project"), err);
         return false;
     }
@@ -1805,6 +1890,109 @@ bool MainWindow::saveAs() {
     addRecent(path);
     s.setValue("lastProjectDir", QFileInfo(path).absolutePath());
     return true;
+}
+
+bool MainWindow::openProduction(const QString& folder, bool create, const QString& name) {
+    if (!isProduction(folder.toStdString())) {
+        std::string err;
+        if (!create || !createProduction(folder.toStdString(), name.toStdString(), &err)) {
+            if (!err.empty()) QMessageBox::warning(this, tr("Production"), QString::fromStdString(err));
+            return false;
+        }
+    }
+    appSettings().setValue("lastProductionDir", QDir(folder).absolutePath());
+    production_->setFolder(folder);
+    productionDock_->show();
+    productionDock_->raise();
+    return true;
+}
+
+void MainWindow::newProjectInProduction(const QString& folder) {
+    bool ok = false;
+    const QString name = QInputDialog::getText(this, tr("New Project in Production"), tr("Name:"), QLineEdit::Normal, tr("Reel 1"), &ok).trimmed();
+    if (!ok || name.isEmpty()) return;
+    const QString path = QDir(folder).filePath(name + ".montage");
+    if (QFileInfo::exists(path)) {
+        QMessageBox::warning(this, tr("New Project"), tr("%1 already exists").arg(QDir::toNativeSeparators(path)));
+        return;
+    }
+    if (!maybeSave()) return;
+    program_->pause();
+    state_->newProject();
+    QString err;
+    if (!state_->save(path, &err)) {
+        QMessageBox::warning(this, tr("New Project"), err);
+        return;
+    }
+    addRecent(path);
+    production_->refresh();
+}
+
+std::vector<Id> MainWindow::importSequencesFrom(const QString& project, const QStringList& names, QString* error) {
+    Project from;
+    std::string err;
+    if (!loadProject(project.toStdString(), from, &err)) {
+        if (error) *error = QString::fromStdString(err);
+        return {};
+    }
+    std::vector<Id> wanted;
+    for (const Sequence& s : from.sequences)
+        if (names.isEmpty() || names.contains(QString::fromStdString(s.name))) wanted.push_back(s.id);
+    if (wanted.empty()) {
+        if (error) *error = tr("No such sequence in %1").arg(QFileInfo(project).fileName());
+        return {};
+    }
+    std::vector<Id> made;
+    state_->edit(tr("Import from Project"), [&](Project& p, Sequence&) {
+        made = importFromProject(p, from, wanted);
+        return !made.empty();
+    });
+    if (made.empty()) {
+        if (error && error->isEmpty()) *error = state_->readOnly() ? tr("This project is read-only") : tr("Nothing was imported");
+        return {};
+    }
+    state_->setActiveSequence(made.front());
+    statusBar()->showMessage(tr("Imported %n sequence(s) from %1", "", int(made.size())).arg(QFileInfo(project).completeBaseName()), 5000);
+    return made;
+}
+
+void MainWindow::importFromProjectDialog(QString project) {
+    if (project.isEmpty())
+        project = QFileDialog::getOpenFileName(this, tr("Import from Project"), appSettings().value("lastProjectDir").toString(),
+                                               tr("Montage projects (*.montage)"));
+    if (project.isEmpty()) return;
+    Project from;
+    std::string err;
+    if (!loadProject(project.toStdString(), from, &err)) {
+        QMessageBox::warning(this, tr("Import from Project"), QString::fromStdString(err));
+        return;
+    }
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Import from %1").arg(QFileInfo(project).completeBaseName()));
+    auto* v = new QVBoxLayout(&dlg);
+    v->addWidget(new QLabel(tr("Sequences to bring in (with the sequences they nest and their media, linked where it is):"), &dlg));
+    auto* list = new QListWidget(&dlg);
+    list->setObjectName(QStringLiteral("importSequences"));
+    for (const Sequence& s : from.sequences) {
+        auto* item = new QListWidgetItem(QStringLiteral("%1  (%2)").arg(QString::fromStdString(s.name),
+                                                                         QString::fromStdString(formatTimecode(s.duration(), s.fps))),
+                                         list);
+        item->setData(Qt::UserRole, QString::fromStdString(s.name));
+        item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
+        item->setCheckState(Qt::Unchecked);
+    }
+    v->addWidget(list);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    v->addWidget(buttons);
+    if (dlg.exec() != QDialog::Accepted) return;
+    QStringList names;
+    for (int i = 0; i < list->count(); ++i)
+        if (list->item(i)->checkState() == Qt::Checked) names << list->item(i)->data(Qt::UserRole).toString();
+    if (names.isEmpty()) return;
+    QString error;
+    if (importSequencesFrom(project, names, &error).empty()) QMessageBox::warning(this, tr("Import from Project"), error);
 }
 
 void MainWindow::addRecent(const QString& path) {

@@ -108,6 +108,8 @@
 #include "render/Shorts.h"
 #include "render/Letterbox.h"
 #include "render/Processing.h"
+#include "core/Production.h"
+#include "core/ProjectLock.h"
 
 namespace montage {
 
@@ -210,8 +212,13 @@ Loaded open(const QJsonObject& a) {
     return l;
 }
 
-// Saves, keeping the previous version as <project>.bak for montage_undo.
+// Saves, keeping the previous version as <project>.bak for montage_undo. A project someone has open to edit in
+// Montage (its lock held by another process: core/ProjectLock.h) is not written behind their back.
 void save(Loaded& l) {
+    if (const LockStatus st = projectLockStatus(l.path.toStdString()); st.state == LockState::Theirs)
+        throw ArgError{QStringLiteral("%1 is editing %2 in Montage: make the change through Montage's live agent link, or once they have "
+                                      "closed it")
+                           .arg(QString::fromStdString(st.owner.describe()), QFileInfo(l.path).fileName())};
     const QString bak = l.path + ".bak";
     if (QFileInfo::exists(l.path)) {
         QFile::remove(bak);
@@ -684,6 +691,74 @@ void McpServer::Impl::addTools() {
             if (!v.added.isEmpty()) text += QStringLiteral(" %1 not in the hash list.").arg(v.added.size());
             if (!v.generation.isEmpty()) text += QStringLiteral(" Recorded as %1.").arg(v.generation);
             return ok(text, out);
+        });
+
+    add("montage_production", "List or make a production",
+        "A production is a folder of a team's projects on a shared drive (Premiere's Productions, Avid's shared projects): "
+        "lists its projects with who is editing each (a project being edited cannot be changed by these tools), or makes "
+        "the folder a production with `create`.",
+        R"json({"type":"object","properties":{"folder":{"type":"string"},"create":{"type":"boolean","default":false},
+            "name":{"type":"string","description":"The production's name when making one"}},"required":["folder"]})json",
+        true, [](const QJsonObject& a) {
+            const QString folder = absolute(need(a, "folder"));
+            if (!isProduction(folder.toStdString())) {
+                if (!a.value("create").toBool()) return fail(QStringLiteral("%1 is not a production (pass create to make it one)").arg(folder));
+                std::string err;
+                if (!createProduction(folder.toStdString(), str(a, "name").toStdString(), &err)) return fail(QString::fromStdString(err));
+            }
+            QJsonArray projects;
+            QStringList lines;
+            for (const ProductionProject& pp : listProduction(folder.toStdString())) {
+                QString status = QStringLiteral("free");
+                if (pp.lock.state == LockState::Theirs || pp.lock.state == LockState::Mine)
+                    status = QStringLiteral("editing: ") + QString::fromStdString(pp.lock.owner.describe());
+                else if (pp.lock.state == LockState::Stale)
+                    status = QStringLiteral("free (left open by %1)").arg(QString::fromStdString(pp.lock.owner.describe()));
+                projects.append(QJsonObject{{"project", QString::fromStdString(pp.path)},
+                                            {"name", QString::fromStdString(pp.relative)},
+                                            {"status", status},
+                                            {"editor", pp.lock.state == LockState::Theirs || pp.lock.state == LockState::Mine
+                                                           ? QString::fromStdString(pp.lock.owner.describe())
+                                                           : QString()},
+                                            {"saved", pp.modified.toUTC().toString(Qt::ISODate)}});
+                lines << QStringLiteral("%1 — %2").arg(QString::fromStdString(pp.relative), status);
+            }
+            const QString name = QString::fromStdString(productionName(folder.toStdString()));
+            return ok(QStringLiteral("Production \"%1\": %2 project(s)%3").arg(name).arg(projects.size()).arg(lines.isEmpty() ? QString() : "\n" + lines.join('\n')),
+                      QJsonObject{{"production", name}, {"folder", folder}, {"projects", projects}});
+        });
+
+    add("montage_import_from_project", "Bring sequences from another project",
+        "Copy sequences (by name; all when none are named) from another .montage project into this one, with the "
+        "sequences they nest and the media their clips play (linked where it is; files the project has are not added "
+        "twice), each as a sequence of its own. The first becomes active.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"from":{"type":"string","description":"The .montage project to copy from"},
+            "sequences":{"type":"array","items":{"type":"string"}}},"required":["project","from"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Project from;
+            std::string err;
+            const QString src = absolute(need(a, "from"));
+            if (!loadProject(src.toStdString(), from, &err)) return fail(QStringLiteral("Cannot open %1: %2").arg(src, QString::fromStdString(err)));
+            QStringList names;
+            for (const QJsonValue& v : a.value("sequences").toArray()) names << v.toString();
+            std::vector<Id> wanted;
+            for (const Sequence& s : from.sequences)
+                if (names.isEmpty() || names.contains(QString::fromStdString(s.name))) wanted.push_back(s.id);
+            for (const QString& n : names)
+                if (std::none_of(from.sequences.begin(), from.sequences.end(), [&](const Sequence& s) { return QString::fromStdString(s.name) == n; }))
+                    return fail(QStringLiteral("%1 has no sequence \"%2\"").arg(QFileInfo(src).fileName(), n));
+            const std::vector<Id> made = importFromProject(l.project, from, wanted);
+            if (made.empty()) return fail("Nothing to import");
+            l.project.activeSequence = made.front();
+            save(l);
+            QJsonArray seqs;
+            for (Id id : made) {
+                const Sequence* s = l.project.findSequence(id);
+                seqs.append(QJsonObject{{"id", double(id)}, {"name", s ? QString::fromStdString(s->name) : QString()}});
+            }
+            return ok(QStringLiteral("Imported %1 sequence(s) from %2").arg(made.size()).arg(QFileInfo(src).fileName()),
+                      QJsonObject{{"sequences", seqs}, {"project", l.path}});
         });
 
     add("montage_create_project", "Create a project",

@@ -41,6 +41,10 @@
 #include <QToolButton>
 #include <QTreeView>
 #include <QTreeWidget>
+#include <QJsonObject>
+#include <QJsonDocument>
+#include "core/ProjectLock.h"
+#include "ProductionPanel.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -3505,6 +3509,122 @@ private slots:
         QApplication::processEvents();
         key = inspector->widget()->findChild<QComboBox*>("track_sidechain");
         QVERIFY(key && key->currentIndex() == 0);
+    }
+
+    void sharedProjectLocking() {
+        state()->newProject();
+        QVERIFY(QDir().mkpath(dir_.path() + "/shared"));
+        const QString path = dir_.path() + "/shared/Reel 1.montage";
+        // Someone else on another machine is editing it.
+        auto foreignLock = [](const QString& project) {
+            const QString t = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
+            QFile f(QString::fromStdString(lockPathFor(project.toStdString())));
+            QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            f.write(QJsonDocument(QJsonObject{{"user", "sam"}, {"host", "edit-bay-2"}, {"app", "Montage"}, {"pid", 4242.0}, {"since", t}, {"heartbeat", t}}).toJson());
+        };
+        auto theirSave = [](const QString& project, const std::string& name, int ahead) {
+            Project p;
+            QVERIFY(loadProject(project.toStdString(), p) || (p = makeDefaultProject(), true));
+            p.active()->name = name;
+            QVERIFY(saveProject(p, project.toStdString()));
+            QFile f(project);
+            QVERIFY(f.open(QIODevice::ReadWrite));
+            f.setFileTime(QDateTime::currentDateTime().addSecs(ahead), QFileDevice::FileModificationTime);  // a later save
+        };
+        {
+            Project p = makeDefaultProject();
+            p.active()->name = "Cut 1";
+            QVERIFY(saveProject(p, path.toStdString()));
+        }
+        foreignLock(path);
+        QVERIFY(win_->openProjectAs(path, MainWindow::OpenMode::ReadOnly));
+        QVERIFY(state()->readOnly() && !state()->holdsLock());
+        QCOMPARE(state()->lockHolder(), QString("sam on edit-bay-2"));
+        QVERIFY2(win_->windowTitle().contains("Read-Only: sam on edit-bay-2"), qPrintable(win_->windowTitle()));
+        // Nothing changes it, and it cannot be saved over theirs.
+        QVERIFY(!state()->edit("Rename", [](Project&, Sequence& s) {
+            s.name = "Mine";
+            return true;
+        }));
+        QVERIFY(state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")}).empty());
+        QString err;
+        QVERIFY(!state()->save(path, &err) && err.contains("sam"));
+        QVERIFY(!win_->findChild<QAction*>("takeEdit")->isEnabled());
+        QVERIFY(!state()->open(path, &err, EditorState::Access::Edit) && err.contains("sam"));
+        // Their save is shown here.
+        theirSave(path, "Cut 2", 2);
+        state()->checkSharedState();
+        QCOMPARE(state()->sequence()->name, std::string("Cut 2"));
+        // They close it after one more save: it can be edited here, from what they saved last.
+        theirSave(path, "Cut 3", 4);
+        QFile::remove(QString::fromStdString(lockPathFor(path.toStdString())));
+        QVERIFY(state()->canTakeEdit());
+        state()->checkSharedState();
+        QVERIFY(win_->findChild<QAction*>("takeEdit")->isEnabled());
+        QVERIFY2(state()->takeEdit(&err), qPrintable(err));
+        QCOMPARE(state()->sequence()->name, std::string("Cut 3"));
+        QVERIFY(!state()->readOnly() && state()->holdsLock());
+        QCOMPARE(projectLockStatus(path.toStdString()).state, LockState::Mine);
+        QVERIFY(!win_->windowTitle().contains("Read-Only"));
+        QVERIFY(state()->edit("Rename", [](Project&, Sequence& s) {
+            s.name = "Mine";
+            return true;
+        }));
+        QVERIFY2(state()->save(path, &err), qPrintable(err));
+        // Closing it lets it go.
+        state()->newProject();
+        QCOMPARE(projectLockStatus(path.toStdString()).state, LockState::Free);
+        // Saving a read-only project as a copy makes the copy this editor's.
+        foreignLock(path);
+        QVERIFY(win_->openProjectAs(path, MainWindow::OpenMode::ReadOnly));
+        const QString copy = dir_.path() + "/shared/Reel 1 (mine).montage";
+        QVERIFY2(state()->save(copy, &err), qPrintable(err));
+        QVERIFY(!state()->readOnly() && state()->holdsLock());
+        QCOMPARE(projectLockStatus(copy.toStdString()).state, LockState::Mine);
+        QCOMPARE(projectLockStatus(path.toStdString()).state, LockState::Theirs);
+        state()->newProject();
+        QCOMPARE(projectLockStatus(copy.toStdString()).state, LockState::Free);
+
+        // A production: its projects in the Production panel with who is editing each.
+        const QString prod = dir_.path() + "/Feature";
+        QVERIFY(win_->openProduction(prod, true, "The Feature"));
+        const QString reel1 = prod + "/Reel 1.montage", reel2 = prod + "/Reel 2.montage";
+        {
+            Project p = makeDefaultProject();
+            p.active()->name = "Reel 1 Cut";
+            QVERIFY(saveProject(p, reel1.toStdString()));
+            p.active()->name = "Reel 2 Cut";
+            QVERIFY(saveProject(p, reel2.toStdString()));
+        }
+        foreignLock(reel2);
+        ProductionPanel* panel = win_->productionPanel();
+        QVERIFY(panel && panel->folder() == QDir(prod).absolutePath());
+        panel->refresh();
+        auto* tree = panel->findChild<QTreeWidget*>("productionProjects");
+        QVERIFY(tree);
+        QCOMPARE(tree->topLevelItemCount(), 2);
+        QVERIFY(panel->findChild<QLabel*>("productionTitle")->text().contains("The Feature"));
+        QCOMPARE(tree->topLevelItem(0)->text(1), QString("Free"));
+        QVERIFY(tree->topLevelItem(1)->text(1).contains("sam on edit-bay-2"));
+        // Opened from the panel: editing it.
+        emit panel->openRequested(reel1, false);
+        QVERIFY(state()->holdsLock() && !state()->readOnly());
+        QCOMPARE(state()->filePath(), reel1);
+        panel->refresh();
+        QCOMPARE(tree->topLevelItem(0)->text(1), QString("Editing (you)"));
+        // A sequence brought in from the reel someone else is editing (read, not changed), one undo step.
+        const std::vector<Id> made = win_->importSequencesFrom(reel2, {"Reel 2 Cut"}, &err);
+        QVERIFY2(made.size() == 1, qPrintable(err));
+        QCOMPARE(state()->sequence()->name, std::string("Reel 2 Cut"));
+        QVERIFY(state()->project().findSequence(made[0]));
+        state()->undo();
+        QVERIFY(!state()->project().findSequence(made[0]));
+        QVERIFY(win_->importSequencesFrom(reel2, {"No Such Cut"}, &err).empty() && !err.isEmpty());
+        QVERIFY(win_->findChild<QAction*>("newProduction") && win_->findChild<QAction*>("openProduction") &&
+                win_->findChild<QAction*>("importFromProject"));
+        state()->newProject();
+        QFile::remove(QString::fromStdString(lockPathFor(reel2.toStdString())));
+        QFile::remove(QString::fromStdString(lockPathFor(path.toStdString())));
     }
 
     void offloadCardDialog() {

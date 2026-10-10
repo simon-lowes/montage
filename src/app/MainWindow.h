@@ -57,6 +57,7 @@ class ShotSearchPanel;
 class PeoplePanel;
 class MulticamPanel;
 class AdrPanel;
+class ProductionPanel;
 class AudioDescriptionDialog;
 class AudioMeterWidget;
 class LoudnessReadout;
@@ -75,6 +76,17 @@ public:
     TimelineWidget* timeline() const { return timeline_; }
     RenderQueue* renderQueue() const { return queue_; }
     bool openProject(const QString& path);
+    // Opening a shared project (core/ProjectLock.h): Ask asks whether to open it read-only when someone else is
+    // editing it (or to take it over when they left it locked); Edit and ReadOnly say up front.
+    enum class OpenMode { Ask, Edit, ReadOnly };
+    bool openProjectAs(const QString& path, OpenMode mode);
+    // Productions (core/Production.h): a folder of a team's projects, shown in the Production panel; `create` makes
+    // the folder a production if it is not one.
+    bool openProduction(const QString& folder, bool create = false, const QString& name = QString());
+    ProductionPanel* productionPanel() const { return production_; }
+    // Brings sequences (by name; all when none are named) from another project into this one, with their media; one
+    // undo step. Returns the new sequences' ids.
+    std::vector<Id> importSequencesFrom(const QString& project, const QStringList& names = {}, QString* error = nullptr);
     // Waits for pending renders and saves a screenshot of the window (testing aid).
     void scheduleScreenshot(const QString& path, int delayMs);
     // Brings a panel to the front by its object name ("inspector", "scopes", "mixer", "effects"...).
@@ -422,6 +434,11 @@ private:
     MixerPanel* mixer_ = nullptr;
     MulticamPanel* multicam_ = nullptr;
     AdrPanel* adr_ = nullptr;
+    ProductionPanel* production_ = nullptr;
+    QDockWidget* productionDock_ = nullptr;
+    QAction* takeEdit_ = nullptr;
+    void importFromProjectDialog(QString project = QString());
+    void newProjectInProduction(const QString& folder);
     AudioDescriptionDialog* audioDescription_ = nullptr;
     CaptionsPanel* captions_ = nullptr;
     TranscriptPanel* transcript_ = nullptr;

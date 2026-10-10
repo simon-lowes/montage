@@ -40,7 +40,12 @@
 #include "core/Reconform.h"
 #include "core/Adr.h"
 #include "core/AudioDescription.h"
+#include <QProcess>
+#include <QSysInfo>
+#include <QCoreApplication>
 #include "core/ProjectIO.h"
+#include "core/ProjectLock.h"
+#include "core/Production.h"
 #include "core/ScriptCut.h"
 #include "core/Surround.h"
 #include "core/Transcript.h"
@@ -2802,6 +2807,198 @@ private slots:
         CfbEntry mr;
         QVERIFY(readCompoundFile(manyPath, mr, &err));
         QCOMPARE(mr.children.size(), size_t(300));
+    }
+
+    void projectLocksAndProductions() {
+        QTemporaryDir dir;
+        const std::string proj = (dir.path() + "/Reel 1.montage").toStdString();
+        Project p = makeDefaultProject();
+        QVERIFY(saveProject(p, proj));
+        // Free, then this process's: a hidden file beside the project.
+        QCOMPARE(projectLockStatus(proj).state, LockState::Free);
+        QCOMPARE(acquireProjectLock(proj), LockResult::Acquired);
+        const QString lockFile = QString::fromStdString(lockPathFor(proj));
+        QVERIFY(QFileInfo::exists(lockFile) && QFileInfo(lockFile).fileName().startsWith('.'));
+        LockStatus st = projectLockStatus(proj);
+        QCOMPARE(st.state, LockState::Mine);
+        QCOMPARE(st.owner.pid, qint64(QCoreApplication::applicationPid()));
+        QCOMPARE(acquireProjectLock(proj), LockResult::Acquired);  // again: still ours
+        QVERIFY(refreshProjectLock(proj));
+        releaseProjectLock(proj);
+        QCOMPARE(projectLockStatus(proj).state, LockState::Free);
+        // Someone on another machine, heard from just now: theirs, never taken or let go from here.
+        auto writeLock = [&](const QString& host, qint64 pid, int secondsAgo) {
+            const QString t = QDateTime::currentDateTimeUtc().addSecs(-secondsAgo).toString(Qt::ISODateWithMs);
+            QFile f(lockFile);
+            QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            f.write(QJsonDocument(QJsonObject{{"user", "sam"}, {"host", host}, {"app", "Montage"}, {"pid", double(pid)}, {"since", t}, {"heartbeat", t}}).toJson());
+            f.close();
+            QVERIFY(f.open(QIODevice::ReadWrite));
+            f.setFileTime(QDateTime::currentDateTime().addSecs(-secondsAgo), QFileDevice::FileModificationTime);
+            f.close();
+        };
+        writeLock("edit-bay-2", 4242, 5);
+        st = projectLockStatus(proj);
+        QCOMPARE(st.state, LockState::Theirs);
+        QCOMPARE(st.owner.describe(), std::string("sam on edit-bay-2"));
+        LockOwner holder;
+        QCOMPARE(acquireProjectLock(proj, &holder), LockResult::HeldByOther);
+        QCOMPARE(holder.user, std::string("sam"));
+        QVERIFY(!refreshProjectLock(proj));
+        releaseProjectLock(proj);
+        QCOMPARE(projectLockStatus(proj).state, LockState::Theirs);
+        // Not heard from for longer than the stale time: taken over.
+        writeLock("edit-bay-2", 4242, kLockStaleSeconds + 60);
+        QCOMPARE(projectLockStatus(proj).state, LockState::Stale);
+        QCOMPARE(acquireProjectLock(proj), LockResult::Acquired);
+        QCOMPARE(projectLockStatus(proj).state, LockState::Mine);
+        releaseProjectLock(proj);
+        // On this machine with its process gone: stale at once.
+        QProcess gone;
+        gone.start(QCoreApplication::applicationFilePath(), {"-functions"});
+        QVERIFY(gone.waitForStarted());
+        const qint64 deadPid = gone.processId();
+        QVERIFY(gone.waitForFinished());
+        writeLock(QSysInfo::machineHostName(), deadPid, 1);
+        QCOMPARE(projectLockStatus(proj).state, LockState::Stale);
+        // A lock file being written just now (not yet readable) is someone's; an old damaged one is stale.
+        {
+            QFile f(lockFile);
+            QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            f.write("{\"us");
+            f.close();
+        }
+        QCOMPARE(projectLockStatus(proj).state, LockState::Theirs);
+        {
+            QFile f(lockFile);
+            QVERIFY(f.open(QIODevice::ReadWrite));
+            f.setFileTime(QDateTime::currentDateTime().addSecs(-(kLockStaleSeconds + 60)), QFileDevice::FileModificationTime);
+        }
+        QCOMPARE(projectLockStatus(proj).state, LockState::Stale);
+        QFile::remove(lockFile);
+
+        // A production: projects in its folder and below, who is editing each, found from a project inside it.
+        const std::string prod = (dir.path() + "/Feature").toStdString();
+        QVERIFY(createProduction(prod, "The Feature"));
+        QVERIFY(isProduction(prod) && !isProduction(dir.path().toStdString()));
+        QCOMPARE(productionName(prod), std::string("The Feature"));
+        QVERIFY(QDir().mkpath(QString::fromStdString(prod) + "/Reels"));
+        const std::string assembly = prod + "/Assembly.montage", reel1 = prod + "/Reels/Reel 1.montage", reel2 = prod + "/Reels/Reel 2.montage";
+        for (const std::string& f : {assembly, reel1, reel2}) QVERIFY(saveProject(p, f));
+        QCOMPARE(acquireProjectLock(reel1), LockResult::Acquired);
+        {
+            const QString t = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
+            QFile f(QString::fromStdString(lockPathFor(reel2)));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(QJsonDocument(QJsonObject{{"user", "alex"}, {"host", "bay-3"}, {"pid", 7}, {"since", t}, {"heartbeat", t}}).toJson());
+        }
+        const auto list = listProduction(prod);
+        QCOMPARE(list.size(), size_t(3));  // the lock files are not projects
+        QCOMPARE(list[0].relative, std::string("Assembly.montage"));
+        QCOMPARE(list[1].relative, std::string("Reels/Reel 1.montage"));
+        QCOMPARE(list[2].relative, std::string("Reels/Reel 2.montage"));
+        QCOMPARE(list[0].lock.state, LockState::Free);
+        QCOMPARE(list[1].lock.state, LockState::Mine);
+        QCOMPARE(list[2].lock.state, LockState::Theirs);
+        QCOMPARE(list[2].lock.owner.describe(), std::string("alex on bay-3"));
+        QCOMPARE(QString::fromStdString(productionOf(reel1)), QDir(QString::fromStdString(prod)).absolutePath());
+        QVERIFY(productionOf(proj).empty());
+        releaseProjectLock(reel1);
+    }
+
+    void importSequencesFromAnotherProject() {
+        // The source: "Main" (a picture clip and its linked sound, a subclip, a compressor keyed by A2) nesting "Nest".
+        Project a = makeDefaultProject();
+        MediaItem cam;
+        cam.id = a.newId();
+        cam.kind = MediaKind::Video;
+        cam.name = "A001";
+        cam.path = "/media/A001.mov";
+        cam.duration = 10;
+        cam.hasVideo = cam.hasAudio = true;
+        cam.fps = {25, 1};
+        cam.bin = "Day 1";
+        a.media.push_back(cam);
+        MediaItem sub = cam;
+        sub.id = a.newId();
+        sub.name = "A001 take 2";
+        sub.subclipOf = cam.id;
+        sub.subclipIn = 2, sub.subclipOut = 4;
+        a.media.push_back(sub);
+        Sequence& main = *a.active();
+        main.name = "Main";
+        edit::addTrack(a, main, TrackKind::Audio);
+        edit::addTrack(a, main, TrackKind::Video);
+        Clip v;
+        v.id = a.newId();
+        v.mediaId = cam.id;
+        v.duration = 50;
+        v.linkGroup = a.newId();
+        Clip snd = v;
+        snd.id = a.newId();
+        main.videoTracks[0].clips.push_back(v);
+        main.audioTracks[0].clips.push_back(snd);
+        Clip take = v;
+        take.id = a.newId();
+        take.mediaId = sub.id;
+        take.start = 60;
+        take.linkGroup = 0;
+        main.videoTracks[0].clips.push_back(take);
+        Effect comp = makeEffect(a, "compressor");
+        comp.strings["sidechain"] = std::to_string(main.audioTracks[1].id);
+        main.audioTracks[0].effects = {comp};
+        const Id nestId = edit::duplicateSequence(a, main.id, "Nest");
+        Id nestMedia = 0;
+        for (const MediaItem& m : a.media)
+            if (m.kind == MediaKind::Sequence && m.sequenceId == nestId) nestMedia = m.id;
+        QVERIFY(nestMedia);
+        Clip nested;
+        nested.id = a.newId();
+        nested.mediaId = nestMedia;
+        nested.start = 120;
+        nested.duration = 40;
+        a.findSequence(a.activeSequence)->videoTracks[1].clips.push_back(nested);
+        const Id mainId = a.activeSequence;
+
+        // The target already has the camera file.
+        Project b = makeDefaultProject();
+        MediaItem own = cam;
+        own.id = b.newId();
+        own.bin.clear();
+        b.media.push_back(own);
+        const size_t sequencesBefore = b.sequences.size();
+        const std::vector<Id> made = importFromProject(b, a, {mainId});
+        QCOMPARE(made.size(), size_t(1));
+        QCOMPARE(b.sequences.size(), sequencesBefore + 2);  // Main and the Nest it plays
+        const Sequence* im = b.findSequence(made[0]);
+        QVERIFY(im && im->name == "Main");
+        // The camera file is not added twice; the subclip comes, pointing at it; the nested clip plays the new Nest.
+        QCOMPARE(im->videoTracks[0].clips[0].mediaId, own.id);
+        const MediaItem* takeMedia = b.findMedia(im->videoTracks[0].clips[1].mediaId);
+        QVERIFY(takeMedia && takeMedia->subclipOf == own.id && takeMedia->name == "A001 take 2");
+        QVERIFY(std::find(b.bins.begin(), b.bins.end(), "Day 1") != b.bins.end());
+        const MediaItem* nm = b.findMedia(im->videoTracks[1].clips[0].mediaId);
+        QVERIFY(nm && nm->kind == MediaKind::Sequence && nm->sequenceId != nestId);
+        const Sequence* nest = b.findSequence(nm->sequenceId);
+        QVERIFY(nest && nest->name == "Nest" && nest->videoTracks[0].clips[0].mediaId == own.id);
+        // New ids throughout, links kept, the compressor keyed by the copy's A2.
+        std::set<Id> ids;
+        size_t count = 0;
+        for (const Sequence& s : b.sequences) {
+            ids.insert(s.id), ++count;
+            for (const auto* list : {&s.videoTracks, &s.audioTracks})
+                for (const Track& t : *list) {
+                    ids.insert(t.id), ++count;
+                    for (const Clip& c : t.clips) ids.insert(c.id), ++count;
+                }
+        }
+        for (const MediaItem& m : b.media) ids.insert(m.id), ++count;
+        QCOMPARE(ids.size(), count);
+        QVERIFY(*ids.rbegin() < b.nextId);
+        QVERIFY(im->videoTracks[0].clips[0].linkGroup != 0 && im->videoTracks[0].clips[0].linkGroup == im->audioTracks[0].clips[0].linkGroup);
+        QCOMPARE(im->audioTracks[0].effects[0].s("sidechain"), std::to_string(im->audioTracks[1].id));
+        // A sequence it does not have: nothing.
+        QVERIFY(importFromProject(b, a, {987654}).empty());
     }
 
     void surroundPositionLanes() {

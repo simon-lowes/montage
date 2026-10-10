@@ -17,6 +17,7 @@
 
 #include "core/MediaLog.h"
 #include "core/ProjectIO.h"
+#include "core/ProjectLock.h"
 #include "media/Decoder.h"
 #include "media/MediaPool.h"
 #include "media/ImageSequence.h"
@@ -55,6 +56,11 @@ EditorState::EditorState(QObject* parent) : QObject(parent), project_(makeDefaul
         reloadChangedMedia(paths);
     });
     connect(this, &EditorState::projectChanged, this, &EditorState::watchMediaFiles);
+    // Shared projects: the lock renewed, and a read-only project followed, every few seconds.
+    lockTimer_ = new QTimer(this);
+    lockTimer_->setInterval(3000);
+    connect(lockTimer_, &QTimer::timeout, this, &EditorState::checkSharedState);
+    lockTimer_->start();
     // Watch folders: a scan a moment after anything in them changes.
     folderWatcher_ = new QFileSystemWatcher(this);
     folderTimer_ = new QTimer(this);
@@ -65,7 +71,10 @@ EditorState::EditorState(QObject* parent) : QObject(parent), project_(makeDefaul
     connect(this, &EditorState::projectChanged, this, &EditorState::watchFoldersChanged);
 }
 
-EditorState::~EditorState() { MediaPool::instance().setReadyCallback(nullptr); }
+EditorState::~EditorState() {
+    MediaPool::instance().setReadyCallback(nullptr);
+    releaseLock();
+}
 
 QString timecodeString(const Sequence* s, FrameTime t) {
     return QString::fromStdString(formatTimecode(t, s ? s->fps : Rational{30, 1}));
@@ -74,8 +83,17 @@ QString timecodeString(const Sequence* s, FrameTime t) {
 // ---------------------------------------------------------------------------
 // Editing
 
+bool EditorState::refuseReadOnly() {
+    if (!readOnly_) return false;
+    message(lockHolder_.isEmpty() ? tr("This project is open read-only (File › Edit Project to make changes)")
+                                  : tr("Read-only: %1 is editing this project").arg(lockHolder_),
+            5000);
+    return true;
+}
+
 bool EditorState::edit(const QString& label, const std::function<bool(Project&, Sequence&)>& fn,
                        const QString& mergeKey) {
+    if (refuseReadOnly()) return false;
     if (gesture_) endGesture(true);
     Sequence* s = project_.active();
     if (!s) return false;
@@ -100,6 +118,7 @@ bool EditorState::edit(const QString& label, const std::function<bool(Project&, 
 }
 
 bool EditorState::amend(const std::function<bool(Project&, Sequence&)>& fn) {
+    if (readOnly_) return false;
     if (gesture_) endGesture(true);
     Sequence* s = project_.active();
     if (!s) return false;
@@ -127,6 +146,7 @@ bool EditorState::apply(const QString& label, const std::function<edit::Result(P
 }
 
 void EditorState::beginGesture(const QString& label) {
+    if (refuseReadOnly()) return;  // no gesture: its updates change nothing
     if (gesture_) endGesture(true);
     gesture_ = Gesture{label, project_, false};
     lastMergeKey_.clear();
@@ -156,6 +176,7 @@ void EditorState::endGesture(bool commit) {
 }
 
 void EditorState::undo() {
+    if (refuseReadOnly()) return;
     if (gesture_) endGesture(false);
     FrameTime ph = playhead();
     if (!history_.undo(project_)) return;
@@ -169,6 +190,7 @@ void EditorState::undo() {
 }
 
 void EditorState::redo() {
+    if (refuseReadOnly()) return;
     if (gesture_) endGesture(false);
     FrameTime ph = playhead();
     if (!history_.redo(project_)) return;
@@ -542,6 +564,7 @@ std::vector<Id> EditorState::importPsd(const QString& path, PsdImport mode, QStr
 }
 
 std::vector<Id> EditorState::importFiles(const QStringList& paths, QStringList* errors, const QString& bin) {
+    if (refuseReadOnly()) return {};
     std::vector<MediaItem> items;
     // Numbered frames in render formats, two or more of a run chosen: one image sequence each.
     std::map<std::string, std::pair<ImageSequence, int>> runs;
@@ -785,28 +808,92 @@ Id EditorState::newSequence(const QString& name, int w, int h, Rational fps) {
 
 bool EditorState::save(const QString& path, QString* error) {
     if (gesture_) endGesture(true);
+    const bool sameFile = !path_.isEmpty() && QFileInfo(path).absoluteFilePath() == QFileInfo(path_).absoluteFilePath();
+    if (sameFile && readOnly_) {
+        if (error)
+            *error = lockHolder_.isEmpty() ? tr("The project is open read-only: use Edit Project, or Save As to keep a copy of your own")
+                                           : tr("%1 is editing this project: Save As to keep a copy of your own").arg(lockHolder_);
+        return false;
+    }
+    if (sameFile && holdsLock_ && !refreshProjectLock(path.toStdString())) {
+        // Taken over while this machine slept or lost the drive: the other editor's work is not overwritten.
+        holdsLock_ = false;
+        readOnly_ = true;
+        lockHolder_ = QString::fromStdString(projectLockStatus(path.toStdString()).owner.describe());
+        emit lockStateChanged();
+        if (error) *error = tr("%1 took over this project: Save As to keep your changes").arg(lockHolder_);
+        return false;
+    }
+    bool newLock = false;
+    if (!sameFile) {
+        LockOwner holder;
+        const LockResult r = acquireProjectLock(path.toStdString(), &holder);
+        if (r == LockResult::HeldByOther) {
+            if (error) *error = tr("%1 is editing %2").arg(QString::fromStdString(holder.describe()), QFileInfo(path).fileName());
+            return false;
+        }
+        newLock = r == LockResult::Acquired;
+    }
     Project p = project_;
     if (p.name.empty() || p.name == "Untitled") p.name = QFileInfo(path).completeBaseName().toStdString();
     std::string err;
     if (!saveProject(p, path.toStdString(), &err)) {
+        if (newLock) releaseProjectLock(path.toStdString());
         if (error) *error = QString::fromStdString(err);
         return false;
+    }
+    if (!sameFile) {
+        releaseLock();
+        holdsLock_ = newLock;
+        if (readOnly_ || !lockHolder_.isEmpty()) {
+            readOnly_ = false;
+            lockHolder_.clear();
+            emit lockStateChanged();
+        }
     }
     project_.name = p.name;
     path_ = path;
     savedRevision_ = history_.revision();
+    diskTime_ = QFileInfo(path).lastModified();
+    lastRefresh_ = QDateTime::currentDateTimeUtc();
     QFile::remove(path + ".autosave");
     emit fileStateChanged();
     return true;
 }
 
-bool EditorState::open(const QString& path, QString* error) {
+void EditorState::releaseLock() {
+    if (holdsLock_ && !path_.isEmpty()) releaseProjectLock(path_.toStdString());
+    holdsLock_ = false;
+}
+
+bool EditorState::open(const QString& path, QString* error, Access access) {
     Project p;
     std::string err;
     if (!loadProject(path.toStdString(), p, &err)) {
         if (error) *error = QString::fromStdString(err);
         return false;
     }
+    const bool sameFile = !path_.isEmpty() && QFileInfo(path).absoluteFilePath() == QFileInfo(path_).absoluteFilePath();
+    LockResult lock = LockResult::Unavailable;
+    LockOwner holder;
+    if (access != Access::ReadOnly) {
+        lock = acquireProjectLock(path.toStdString(), &holder);
+        if (lock == LockResult::HeldByOther && access == Access::Edit) {
+            if (error) *error = tr("%1 is editing this project").arg(QString::fromStdString(holder.describe()));
+            return false;
+        }
+    } else {
+        const LockStatus st = projectLockStatus(path.toStdString());
+        if (st.state == LockState::Theirs) holder = st.owner;
+        if (sameFile && st.state == LockState::Mine) releaseProjectLock(path.toStdString());
+    }
+    if (!sameFile) releaseLock();
+    holdsLock_ = lock == LockResult::Acquired;
+    readOnly_ = access == Access::ReadOnly || lock == LockResult::HeldByOther;
+    lockHolder_ = readOnly_ && !holder.host.empty() ? QString::fromStdString(holder.describe()) : QString();
+    lockFree_ = readOnly_ && lockHolder_.isEmpty();
+    diskTime_ = QFileInfo(path).lastModified();
+    lastRefresh_ = QDateTime::currentDateTimeUtc();
     if (gesture_) gesture_.reset();
     project_ = std::move(p);
     // The last project's files are let go (idle decoders keep them open, which on Windows stops their folder being
@@ -829,10 +916,114 @@ bool EditorState::open(const QString& path, QString* error) {
     emit projectChanged();
     emit historyChanged();
     emit fileStateChanged();
+    emit lockStateChanged();
     return true;
 }
 
+bool EditorState::canTakeEdit() const {
+    if (!readOnly_ || path_.isEmpty()) return false;
+    const LockState s = projectLockStatus(path_.toStdString()).state;
+    return s == LockState::Free || s == LockState::Stale || s == LockState::Mine;
+}
+
+bool EditorState::takeEdit(QString* error) {
+    if (!readOnly_) return true;
+    if (path_.isEmpty()) return false;
+    LockOwner holder;
+    const LockResult r = acquireProjectLock(path_.toStdString(), &holder);
+    if (r == LockResult::HeldByOther) {
+        lockHolder_ = QString::fromStdString(holder.describe());
+        if (error) *error = tr("%1 is editing this project").arg(lockHolder_);
+        emit lockStateChanged();
+        return false;
+    }
+    if (r == LockResult::Unavailable) {
+        if (error) *error = tr("The project's folder cannot be written to");
+        return false;
+    }
+    holdsLock_ = true;
+    if (!reloadFromDisk()) {  // the latest saved version, not what was on screen when its editor last saved
+        releaseLock();
+        if (error) *error = tr("The project could not be read again");
+        return false;
+    }
+    readOnly_ = false;
+    lockHolder_.clear();
+    lockFree_ = false;
+    lastRefresh_ = QDateTime::currentDateTimeUtc();
+    emit lockStateChanged();
+    emit fileStateChanged();
+    message(tr("You are editing %1").arg(QFileInfo(path_).fileName()), 4000);
+    return true;
+}
+
+bool EditorState::reloadFromDisk() {
+    Project p;
+    if (!loadProject(path_.toStdString(), p)) return false;  // being written just now: tried again later
+    std::map<Id, FrameTime> heads;
+    for (const Sequence& s : project_.sequences) heads[s.id] = s.playhead;
+    for (Sequence& s : p.sequences)
+        if (const auto it = heads.find(s.id); it != heads.end()) s.playhead = it->second;
+    if (p.findSequence(project_.activeSequence)) p.activeSequence = project_.activeSequence;
+    const bool switched = p.activeSequence != project_.activeSequence;
+    if (gesture_) gesture_.reset();
+    std::set<std::string> known;
+    for (const MediaItem& m : project_.media) known.insert(m.path);
+    project_ = std::move(p);
+    history_.clear();
+    savedRevision_ = history_.revision();
+    diskTime_ = QFileInfo(path_).lastModified();
+    offlineChecked_.clear();
+    for (const MediaItem& m : project_.media)
+        if (!known.count(m.path)) startAudioDecode(m);
+    pruneSelection();
+    if (switched) emit sequenceSwitched();
+    emit projectChanged();
+    emit historyChanged();
+    emit fileStateChanged();
+    return true;
+}
+
+void EditorState::checkSharedState() {
+    if (path_.isEmpty()) return;
+    const std::string path = path_.toStdString();
+    if (holdsLock_) {
+        if (lastRefresh_.isValid() && lastRefresh_.secsTo(QDateTime::currentDateTimeUtc()) < 30) return;
+        lastRefresh_ = QDateTime::currentDateTimeUtc();
+        if (!refreshProjectLock(path)) {
+            holdsLock_ = false;
+            readOnly_ = true;
+            lockHolder_ = QString::fromStdString(projectLockStatus(path).owner.describe());
+            message(tr("%1 took over this project: it is read-only now (Save As keeps your changes)").arg(lockHolder_), 8000);
+            emit lockStateChanged();
+        }
+        return;
+    }
+    if (!readOnly_) return;  // opened without a lock (its folder cannot be written to)
+    // Saved by its editor: read again.
+    const QFileInfo fi(path_);
+    if (fi.exists() && fi.lastModified() != diskTime_ && reloadFromDisk())
+        message(tr("%1 was saved by %2: showing the latest").arg(fi.fileName(), lockHolder_.isEmpty() ? tr("its editor") : lockHolder_), 4000);
+    // Let go, or taken by someone else?
+    const LockStatus st = projectLockStatus(path);
+    const bool free = st.state != LockState::Theirs;
+    const QString who = st.state == LockState::Theirs ? QString::fromStdString(st.owner.describe()) : QString();
+    if (free != lockFree_ || who != lockHolder_) {
+        lockFree_ = free;
+        lockHolder_ = who;
+        if (free) message(tr("%1 is free to edit: File › Edit Project").arg(fi.fileName()), 8000);
+        emit lockStateChanged();
+    }
+}
+
 void EditorState::newProject() {
+    releaseLock();
+    if (readOnly_ || !lockHolder_.isEmpty()) {
+        readOnly_ = false;
+        lockHolder_.clear();
+        lockFree_ = false;
+        emit lockStateChanged();
+    }
     if (gesture_) gesture_.reset();
     project_ = makeDefaultProject();
     MediaPool::instance().clear();  // let the last project's files go
@@ -853,10 +1044,24 @@ void EditorState::newProject() {
 }
 
 bool EditorState::recover(const QString& copy, const QString& originalPath, QString* error) {
-    if (!open(copy, error)) return false;
+    if (!open(copy, error, Access::ReadOnly)) return false;  // the recovery copy is never locked
+    readOnly_ = false;
+    lockHolder_.clear();
+    lockFree_ = false;
     path_ = originalPath;
+    if (!path_.isEmpty()) {
+        LockOwner holder;
+        const LockResult r = acquireProjectLock(path_.toStdString(), &holder);
+        holdsLock_ = r == LockResult::Acquired;
+        if (r == LockResult::HeldByOther) {
+            readOnly_ = true;  // someone else is editing the project meanwhile: Save As keeps what was recovered
+            lockHolder_ = QString::fromStdString(holder.describe());
+        }
+        diskTime_ = QFileInfo(path_).lastModified();
+    }
     savedRevision_ = ~uint64_t(0);  // never equal to a real revision: unsaved until saved
     emit fileStateChanged();
+    emit lockStateChanged();
     return true;
 }
 
