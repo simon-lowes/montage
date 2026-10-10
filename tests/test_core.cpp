@@ -2733,6 +2733,45 @@ private slots:
         QCOMPARE(uint8_t(head[30]), uint8_t(12));
     }
 
+    void surroundPositionLanes() {
+        Fixture fx;
+        Track& a = fx.a1();
+        a.surround.x = -0.5, a.surround.y = std::sqrt(0.75), a.surround.width = 0.4, a.surround.object = true;
+        QVERIFY(!surroundAnimated(a));
+        QCOMPARE(trackSurroundAt(a, 50).x, -0.5);
+        // Lanes move it: x across from left to right over frames 0-60, rising overhead; y and the rest stay the track's.
+        a.surroundXAuto.addKey(0, -0.5);
+        a.surroundXAuto.addKey(60, 0.5);
+        a.surroundZAuto.addKey(0, 0);
+        a.surroundZAuto.addKey(60, 2);  // held within 0..1
+        QVERIFY(surroundAnimated(a));
+        SurroundPan at = trackSurroundAt(a, 30);
+        QVERIFY(std::fabs(at.x) < 1e-9 && std::fabs(at.y - std::sqrt(0.75)) < 1e-9 && at.width == 0.4 && at.object);
+        QVERIFY(std::fabs(at.z - 1.0) < 1e-9);
+        QCOMPARE(trackSurroundAt(a, 60).z, 1.0);
+        QVERIFY(std::fabs(trackSurroundAt(a, 15.5).x - (-0.5 + 15.5 / 60)) < 1e-9);  // between frames
+        // Off (and Write) do not read them.
+        a.automation = int(AutomationMode::Off);
+        QCOMPARE(trackSurroundAt(a, 30).x, -0.5);
+        a.automation = int(AutomationMode::Touch);
+        QCOMPARE(trackSurroundAt(a, 60).x, 0.5);
+        // Saved with the project; closing a gap moves the keys after it with the clips.
+        const std::string file = (QDir::tempPath() + "/montage-surround-lanes.montage").toStdString();
+        QVERIFY(saveProject(fx.p, file));
+        Project back;
+        QVERIFY(loadProject(file, back));
+        QFile::remove(QString::fromStdString(file));
+        const Track& b = back.active()->audioTracks[0];
+        QCOMPARE(b.surroundXAuto, a.surroundXAuto);
+        QCOMPARE(b.surroundZAuto, a.surroundZAuto);
+        QVERIFY(!b.surroundYAuto.animated());
+        fx.put(V1, 0, 10);
+        fx.put(V1, 40, 30);
+        QVERIFY(edit::deleteGaps(fx.p, fx.s()).ok);
+        QCOMPARE(fx.a1().surroundXAuto.keys.back().t, FrameTime(30));
+        QCOMPARE(fx.a1().surroundXAuto.keys.front().t, FrameTime(0));
+    }
+
     void adrCueList() {
         Fixture fx;
         Sequence& s = fx.s();  // 30 fps

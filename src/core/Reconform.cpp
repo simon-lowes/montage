@@ -591,6 +591,9 @@ ReconformResult reconformSequence(Project& p, Id sourceId, const CutChanges& cha
         }
         to.volumeAuto = remapParam(from.volumeAuto, pieces);
         to.panAuto = remapParam(from.panAuto, pieces);
+        to.surroundXAuto = remapParam(from.surroundXAuto, pieces);
+        to.surroundYAuto = remapParam(from.surroundYAuto, pieces);
+        to.surroundZAuto = remapParam(from.surroundZAuto, pieces);
         remapEffects(to.effects, pieces);
     };
     for (size_t i = 0; i < out.videoTracks.size() && i < source.videoTracks.size(); ++i) rebuild(source.videoTracks[i], out.videoTracks[i]);

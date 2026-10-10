@@ -3513,14 +3513,19 @@ void McpServer::Impl::addTools() {
         "position is an angle (0 straight ahead, 90 right, -90 left, 180 behind) and a distance (1 at the speakers, 0 spread "
         "over all of them); height (0 at the ear to 1 overhead) lifts it in immersive layouts; width narrows a stereo track "
         "to a point (0, e.g. dialogue in the centre speaker); lfe_db sends it to the subwoofer (-100 off); object makes the "
-        "track an audio object of its own in ADM masters (montage_export_adm) instead of part of the bed. A track routed to "
-        "a bus is placed by its bus. Export with montage_render (downmix_stereo for a stereo copy).",
+        "track an audio object of its own in ADM masters (montage_export_adm) instead of part of the bed. path moves it: "
+        "points of time, angle, distance and height (the rest from the track's own), keyed on its position lanes and "
+        "played as its automation reads (Read, the default, Latch or Touch); an object's movement goes into the ADM "
+        "master; an empty path stops it moving. A track routed to a bus is placed by its bus. Export with montage_render "
+        "(downmix_stereo for a stereo copy).",
         R"json({"type":"object","properties":{"project":{"type":"string"},
             "layout":{"type":"string","enum":["stereo","5.1","7.1","5.1.2","5.1.4","7.1.2","7.1.4"]},
             "tracks":{"type":"array","items":{"type":"object","properties":{
                 "track":{"type":"string","description":"Audio track, e.g. A1"},"angle":{"type":"number","default":0},
                 "distance":{"type":"number","default":1},"height":{"type":"number","default":0},"width":{"type":"number","default":1},
-                "lfe_db":{"type":"number","default":-100},"object":{"type":"boolean","default":false}},
+                "lfe_db":{"type":"number","default":-100},"object":{"type":"boolean","default":false},
+                "path":{"type":"array","items":{"type":"object","properties":{"at":{"type":["number","string"]},
+                    "angle":{"type":"number"},"distance":{"type":"number"},"height":{"type":"number"}},"required":["at"]}}},
                 "required":["track"]}}},"required":["project"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
@@ -3546,8 +3551,23 @@ void McpServer::Impl::addTools() {
                 p.lfeDb = std::clamp(t.value("lfe_db").toDouble(-100), -100.0, 12.0);
                 p.z = std::clamp(t.value("height").toDouble(0), 0.0, 1.0);
                 p.object = t.value("object").toBool(false);
-                out.append(QJsonObject{{"track", QString::fromStdString(tr->name)}, {"x", p.x}, {"y", p.y}, {"z", p.z}, {"width", p.width},
-                                       {"lfe_db", p.lfeDb}, {"object", p.object}});
+                if (t.contains("path")) {
+                    // Keys on the position lanes; what a point leaves out is the track's own.
+                    tr->surroundXAuto = Param(), tr->surroundYAuto = Param(), tr->surroundZAuto = Param();
+                    for (const QJsonValue& kv : t.value("path").toArray()) {
+                        const QJsonObject k = kv.toObject();
+                        const FrameTime at = timeArg(k.value("at"), s, "at");
+                        const double ka = k.contains("angle") ? k.value("angle").toDouble() * M_PI / 180 : angle;
+                        const double kd = std::clamp(k.contains("distance") ? k.value("distance").toDouble() : dist, 0.0, 1.0);
+                        tr->surroundXAuto.addKey(at, kd * std::sin(ka));
+                        tr->surroundYAuto.addKey(at, kd * std::cos(ka));
+                        tr->surroundZAuto.addKey(at, std::clamp(k.contains("height") ? k.value("height").toDouble() : p.z, 0.0, 1.0));
+                    }
+                }
+                QJsonObject placed{{"track", QString::fromStdString(tr->name)}, {"x", p.x}, {"y", p.y}, {"z", p.z}, {"width", p.width},
+                                   {"lfe_db", p.lfeDb}, {"object", p.object}};
+                if (surroundAnimated(*tr)) placed["path_points"] = int(tr->surroundXAuto.keys.size());
+                out.append(placed);
             }
             save(l);
             return ok(QStringLiteral("%1 mix, %2 track(s) placed").arg(QString::fromStdString(s.audioLayout)).arg(out.size()),

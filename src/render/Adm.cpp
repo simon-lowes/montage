@@ -9,6 +9,7 @@
 #include <memory>
 
 #include "Compositor.h"
+#include "core/Automation.h"
 #include "core/Surround.h"
 
 namespace montage {
@@ -60,6 +61,81 @@ uint64_t get64(const uint8_t* p) { return uint64_t(get32(p)) | (uint64_t(get32(p
 struct Channel {
     std::string uid, trackFormat, pack;
 };
+
+// Where an object is, in ADM's polar coordinates, as the panner places it: its angle round the room (ADM counts
+// azimuth positive to the left), up to the overhead speakers' elevation (`top`) as far as it is raised, and its
+// distance.
+struct Polar {
+    double az = 0, el = 0, dist = 1;
+};
+Polar admPolar(const SurroundPan& sp, double top) {
+    Polar p;
+    p.az = -std::atan2(sp.x, sp.y) * 180 / M_PI;
+    p.dist = std::min(1.0, std::hypot(sp.x, sp.y));
+    p.el = std::clamp(sp.z, 0.0, 1.0) * top;
+    return p;
+}
+
+// One audioBlockFormat: from `from` to `to` (samples into the master), moving to `at` over its length (or jumping
+// there at once).
+struct Block {
+    int64_t from = 0, to = 0;
+    Polar at;
+    bool jump = false;
+};
+
+// An object's blocks. Still: one. Moving (its position lanes play): a millisecond at where it starts, then the
+// position ten times a second, each block gliding to the next point; points on a straight line (within half a degree
+// and 0.005 of distance) share a block, and a step across the back (azimuth ±180°) jumps instead of sweeping round
+// the front. Boundaries fall on whole samples that hh:mm:ss.fffff writes exactly (every 12 at 48 kHz).
+std::vector<Block> objectBlocks(const Track& tr, double top, FrameTime first, FrameTime end, double fps, int64_t total) {
+    const bool reads = trackAutomation(tr) == AutomationMode::Read || trackAutomation(tr) == AutomationMode::Latch ||
+                       trackAutomation(tr) == AutomationMode::Touch;
+    if (!reads || !surroundAnimated(tr)) return {{0, total, admPolar(tr.surround, top), false}};
+    auto sampleAt = [&](FrameTime f) {
+        const int64_t v = int64_t(std::llround(double(f - first) * kRate / fps));
+        return std::min(total, v / 12 * 12);
+    };
+    const FrameTime step = std::max<FrameTime>(1, FrameTime(std::llround(fps / 10)));
+    std::vector<std::pair<int64_t, Polar>> points;
+    for (FrameTime f = first; f < end; f += step) points.push_back({sampleAt(f), admPolar(trackSurroundAt(tr, double(f)), top)});
+    points.push_back({total, admPolar(trackSurroundAt(tr, double(end)), top)});
+    std::vector<Block> out{{0, std::min<int64_t>(total, kRate / 1000), points[0].second, false}};
+    auto onLine = [](const Polar& a, const Polar& b, double u, const Polar& m) {
+        return std::fabs(a.az + (b.az - a.az) * u - m.az) < 0.5 && std::fabs(a.el + (b.el - a.el) * u - m.el) < 0.5 &&
+               std::fabs(a.dist + (b.dist - a.dist) * u - m.dist) < 0.005;
+    };
+    size_t i = 1;
+    while (i < points.size()) {
+        const int64_t from = out.back().to;
+        if (points[i].first <= from) {  // a point the lead-in already covers
+            ++i;
+            continue;
+        }
+        const Polar start = out.back().at;
+        if (std::fabs(points[i].second.az - start.az) > 180) {
+            out.push_back({from, points[i].first, points[i].second, true});
+            ++i;
+            continue;
+        }
+        // As far along as the points between stay on the straight line (at most 200 points to a block).
+        size_t j = i;
+        while (j + 1 < points.size() && j - i < 200 && std::fabs(points[j + 1].second.az - points[j].second.az) <= 180) {
+            const size_t k = j + 1;
+            bool straight = true;
+            for (size_t m = i; m <= j && straight; ++m) {
+                const double u = double(points[m].first - from) / double(points[k].first - from);
+                straight = onLine(start, points[k].second, u, points[m].second);
+            }
+            if (!straight) break;
+            j = k;
+        }
+        out.push_back({from, points[j].first, points[j].second, false});
+        i = j + 1;
+    }
+    out.back().to = total;
+    return out;
+}
 
 }  // namespace
 
@@ -311,25 +387,29 @@ bool exportAdmBwf(const Project& p, const Sequence& s, const AdmSettings& settin
             x.writeAttribute("audioChannelFormatName", name);
             x.writeAttribute("typeLabel", "0003");
             x.writeAttribute("typeDefinition", "Objects");
-            x.writeStartElement("audioBlockFormat");
-            x.writeAttribute("audioBlockFormatID", "AB_0003" + hex + "_00000001");
-            x.writeAttribute("rtime", admTime(0));
-            x.writeAttribute("duration", duration);
-            // Polar, as the panner places it: its angle round the room (ADM counts azimuth positive to the left), up to
-            // the overhead speakers' elevation as far as it is raised (in layouts that have them), and its distance.
-            const SurroundPan& sp = tr.surround;
-            const double azimuth = -std::atan2(sp.x, sp.y) * 180 / M_PI;
-            const double distance = std::min(1.0, std::hypot(sp.x, sp.y));
             double top = 0;
             for (const Speaker& k : layoutSpeakers(layout)) top = std::max(top, k.elevation);
-            const double elevation = std::clamp(sp.z, 0.0, 1.0) * top;
-            for (auto [coord, v] : {std::pair<const char*, double>{"azimuth", azimuth}, {"elevation", elevation}, {"distance", distance}}) {
-                x.writeStartElement("position");
-                x.writeAttribute("coordinate", coord);
-                x.writeCharacters(number(std::abs(v) < 5e-7 ? 0.0 : v));
-                x.writeEndElement();
+            const std::vector<Block> blocks = objectBlocks(tr, top, first, end, fps, total);
+            for (size_t b = 0; b < blocks.size(); ++b) {
+                const Block& bl = blocks[b];
+                x.writeStartElement("audioBlockFormat");
+                x.writeAttribute("audioBlockFormatID", "AB_0003" + hex + QString::asprintf("_%08X", unsigned(b + 1)));
+                x.writeAttribute("rtime", admTime(bl.from));
+                x.writeAttribute("duration", blocks.size() == 1 ? duration : admTime(bl.to - bl.from));
+                if (bl.jump) {
+                    x.writeStartElement("jumpPosition");
+                    x.writeAttribute("interpolationLength", "0");
+                    x.writeCharacters("1");
+                    x.writeEndElement();
+                }
+                for (auto [coord, v] : {std::pair<const char*, double>{"azimuth", bl.at.az}, {"elevation", bl.at.el}, {"distance", bl.at.dist}}) {
+                    x.writeStartElement("position");
+                    x.writeAttribute("coordinate", coord);
+                    x.writeCharacters(number(std::abs(v) < 5e-7 ? 0.0 : v));
+                    x.writeEndElement();
+                }
+                x.writeEndElement();  // audioBlockFormat
             }
-            x.writeEndElement();  // audioBlockFormat
             x.writeEndElement();  // audioChannelFormat
             x.writeStartElement("audioStreamFormat");
             x.writeAttribute("audioStreamFormatID", "AS_0003" + hex);

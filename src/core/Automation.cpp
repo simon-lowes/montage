@@ -40,6 +40,17 @@ double trackPanAt(const Track& t, double frame) {
     return reads(t) && t.panAuto.animated() ? std::clamp(laneAt(t.panAuto, frame), -1.0, 1.0) : t.pan;
 }
 
+bool surroundAnimated(const Track& t) { return t.surroundXAuto.animated() || t.surroundYAuto.animated() || t.surroundZAuto.animated(); }
+
+SurroundPan trackSurroundAt(const Track& t, double frame) {
+    SurroundPan p = t.surround;
+    if (!reads(t)) return p;
+    if (t.surroundXAuto.animated()) p.x = std::clamp(laneAt(t.surroundXAuto, frame), -1.0, 1.0);
+    if (t.surroundYAuto.animated()) p.y = std::clamp(laneAt(t.surroundYAuto, frame), -1.0, 1.0);
+    if (t.surroundZAuto.animated()) p.z = std::clamp(laneAt(t.surroundZAuto, frame), 0.0, 1.0);
+    return p;
+}
+
 void thinKeys(std::vector<Keyframe>& keys, double tolerance) {
     if (keys.size() < 3) return;
     std::vector<char> keep(keys.size(), 0);

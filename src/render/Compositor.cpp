@@ -2127,6 +2127,23 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
                 const float lfe = float(std::pow(10.0, track.surround.lfeDb / 20));
                 for (int i = 0; i < frames; ++i)
                     master[size_t(i) * size_t(nch) + size_t(lfeCh)] += 0.70710678f * (trackBuf[size_t(i) * 2] + trackBuf[size_t(i) * 2 + 1]) * tg * lfe;
+            } else if (readsLanes && surroundAnimated(track)) {
+                // A moving position (its x, y, z lanes): the speakers' gains glide from one 64-sample step to the next.
+                SurroundGains g0 = surroundGains(seq.audioLayout, trackSurroundAt(track, double(heard) * fps / sr));
+                for (int i = 0; i < frames; i += 64) {
+                    const int e = std::min(frames, i + 64);
+                    const SurroundGains g1 = surroundGains(seq.audioLayout, trackSurroundAt(track, double(heard + e) * fps / sr));
+                    for (int k = i; k < e; ++k) {
+                        const float w = float(k - i) / float(e - i);
+                        const float l = trackBuf[size_t(k) * 2] * tg, r = trackBuf[size_t(k) * 2 + 1] * tg;
+                        float* d = master.data() + size_t(k) * size_t(nch);
+                        for (int c = 0; c < nch; ++c)
+                            d[c] += l * (g0.left[size_t(c)] + (g1.left[size_t(c)] - g0.left[size_t(c)]) * w) +
+                                    r * (g0.right[size_t(c)] + (g1.right[size_t(c)] - g0.right[size_t(c)]) * w);
+                        if (lfeCh >= 0 && g0.lfe > 0) d[lfeCh] += 0.70710678f * (l + r) * g0.lfe;
+                    }
+                    g0 = g1;
+                }
             } else {
                 panInto(trackBuf.data(), track.surround, tg, master.data());
             }

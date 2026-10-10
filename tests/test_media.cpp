@@ -3,6 +3,7 @@
 #include <QtTest>
 #include <QPainter>
 #include <QProcess>
+#include <QRegularExpression>
 #include <QStandardPaths>
 #include <QJsonObject>
 #include <QJsonDocument>
@@ -4209,6 +4210,220 @@ private slots:
         QVERIFY(call({{"project", project}, {"action", "from_markers"}}).value("isError").toBool());  // no range markers
         r = call({{"project", project}});
         QCOMPARE(cues(r).size(), 3);
+    }
+
+    void movingSurroundAndAdmObjects() {
+        const int rate = 48000;
+        auto tone = [&](double hz, const char* name) {
+            std::vector<float> x(size_t(rate) * 2);
+            for (size_t i = 0; i < x.size(); ++i) x[i] = float(0.3 * std::sin(2 * M_PI * hz * double(i) / rate));
+            const std::string f = path(name);
+            writeMonoWav(f, x, rate);
+            return f;
+        };
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();  // 30 fps: two seconds are 60 frames
+        for (const std::string& f : {tone(1000, "m1k.wav"), tone(440, "m440.wav")}) p.media.push_back(probeOrFail(p, f));
+        QVERIFY(edit::placeMedia(p, s, p.media[0].id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        s.audioLayout = "5.1";  // L R C LFE Ls Rs
+        // A1 sweeps from L (-30°) to R (+30°) across the front over the two seconds.
+        Track& a1 = s.audioTracks[0];
+        a1.surround.x = -0.5, a1.surround.y = std::sqrt(0.75), a1.surround.width = 0;  // where it is when the lanes are off
+        a1.surroundXAuto.addKey(0, -0.5);
+        a1.surroundXAuto.addKey(60, 0.5);
+        auto rms = [&](const std::vector<float>& buf, int ch, int channels) {
+            double acc = 0;
+            const size_t frames = buf.size() / size_t(channels);
+            for (size_t i = 0; i < frames; ++i) acc += double(buf[i * size_t(channels) + size_t(ch)]) * buf[i * size_t(channels) + size_t(ch)];
+            return std::sqrt(acc / double(frames));
+        };
+        AudioMixer mixer;
+        const int n = rate / 5;
+        std::vector<float> six(size_t(n) * 6);
+        mixer.mixLayout(p, s, 0, n, six.data());  // the first fifth of a second: still left
+        QVERIFY2(rms(six, 0, 6) > 4 * rms(six, 1, 6), qPrintable(QString("%1 %2").arg(rms(six, 0, 6)).arg(rms(six, 1, 6))));
+        mixer.reset();
+        mixer.mixLayout(p, s, 2 * rate - n, n, six.data());  // the last: right
+        QVERIFY2(rms(six, 1, 6) > 4 * rms(six, 0, 6), qPrintable(QString("%1 %2").arg(rms(six, 1, 6)).arg(rms(six, 0, 6))));
+        // No clicks: the gains glide, so the sweep's sharpest bend (second difference) is no sharper than the still tone's.
+        auto bend = [&](const Sequence& q) {
+            AudioMixer m;
+            std::vector<float> all(size_t(rate) * 2 * 6);
+            m.mixLayout(p, q, 0, rate * 2, all.data());
+            float most = 0;
+            for (size_t i = 2; i < size_t(rate) * 2; ++i)
+                for (int c : {0, 1, 2})
+                    most = std::max(most, std::fabs(all[i * 6 + size_t(c)] - 2 * all[(i - 1) * 6 + size_t(c)] + all[(i - 2) * 6 + size_t(c)]));
+            return most;
+        };
+        const float moving = bend(s);
+        // Off: the lanes are not heard and it stays at the left.
+        a1.automation = int(AutomationMode::Off);
+        const float still = bend(s);
+        QVERIFY2(moving < 1.2f * still, qPrintable(QString("%1 %2").arg(moving).arg(still)));
+        mixer.reset();
+        mixer.mixLayout(p, s, 2 * rate - n, n, six.data());
+        QVERIFY(rms(six, 0, 6) > 4 * rms(six, 1, 6));
+        a1.automation = int(AutomationMode::Read);
+
+        // An object on A2 going round from the left (-90°) through the front to the right (+90°): in the ADM master, a
+        // millisecond at the left, then blocks gliding round, ADM's azimuth from +90 to -90, back to back.
+        QVERIFY(edit::placeMedia(p, s, p.media[1].id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 1}, false).ok);
+        Track& a2 = s.audioTracks[1];
+        a2.surround.object = true, a2.surround.width = 0;
+        for (auto [f, x, y] : {std::tuple<FrameTime, double, double>{0, -1, 0}, {30, 0, 1}, {60, 1, 0}}) {
+            a2.surroundXAuto.addKey(f, x);
+            a2.surroundYAuto.addKey(f, y);
+        }
+        const std::string adm = path("moving.wav");
+        AdmSettings st;
+        AdmResult r;
+        std::string err;
+        QVERIFY2(exportAdmBwf(p, s, st, adm, &r, {}, &err), err.c_str());
+        QCOMPARE(r.objects, 1);
+        BwfInfo info;
+        QVERIFY(readBwfInfo(adm, info, &err));
+        struct Blk {
+            QString rtime, duration;
+            double az = 0;
+        };
+        auto blocksOf = [](const std::string& axml, const QString& channel) {
+            std::vector<Blk> out;
+            const QString xml = QString::fromStdString(axml);
+            QRegularExpression re("<audioBlockFormat audioBlockFormatID=\"AB_" + channel.mid(3) +
+                                  "_[0-9A-F]{8}\" rtime=\"([0-9:.]+)\" duration=\"([0-9:.]+)\">(.*?)</audioBlockFormat>",
+                                  QRegularExpression::DotMatchesEverythingOption);
+            QRegularExpression az("coordinate=\"azimuth\">([-0-9.]+)<");
+            for (auto it = re.globalMatch(xml); it.hasNext();) {
+                const auto m = it.next();
+                out.push_back({m.captured(1), m.captured(2), az.match(m.captured(3)).captured(1).toDouble()});
+            }
+            return out;
+        };
+        auto seconds = [](const QString& t) {
+            const QStringList p = t.split(':');
+            return p[0].toDouble() * 3600 + p[1].toDouble() * 60 + p[2].toDouble();
+        };
+        std::vector<Blk> blocks = blocksOf(info.axml, "AC_00031001");
+        QVERIFY2(blocks.size() > 4, qPrintable(QString::number(blocks.size())));
+        QCOMPARE(blocks[0].rtime, QString("00:00:00.00000"));
+        QCOMPARE(blocks[0].duration, QString("00:00:00.00100"));
+        QVERIFY(std::fabs(blocks[0].az - 90) < 1e-6);
+        QVERIFY(std::fabs(blocks.back().az + 90) < 1e-6);
+        for (size_t i = 1; i < blocks.size(); ++i) {
+            QVERIFY2(std::fabs(seconds(blocks[i].rtime) - seconds(blocks[i - 1].rtime) - seconds(blocks[i - 1].duration)) < 1e-9,
+                     qPrintable(QString::number(i)));
+            QVERIFY(blocks[i].az <= blocks[i - 1].az + 1e-9);  // always turning right
+        }
+        QVERIFY(std::fabs(seconds(blocks.back().rtime) + seconds(blocks.back().duration) - 2.0) < 1e-4);
+        QVERIFY(info.axml.find("jumpPosition") == std::string::npos);
+        // A straight rise (only its height moving, in 7.1.4) needs one block after the lead-in.
+        {
+            Sequence rise = s;
+            rise.audioLayout = "7.1.4";
+            Track& t = rise.audioTracks[1];
+            t.surroundXAuto = Param(), t.surroundYAuto = Param();
+            t.surround.x = 0, t.surround.y = 1;
+            t.surroundZAuto.addKey(0, 0);
+            t.surroundZAuto.addKey(60, 1);
+            QVERIFY(exportAdmBwf(p, rise, st, path("rise.wav"), &r, {}, &err));
+            QVERIFY(readBwfInfo(path("rise.wav"), info, &err));
+            const std::vector<Blk> two = blocksOf(info.axml, "AC_00031001");
+            QCOMPARE(two.size(), size_t(2));
+            QVERIFY(info.axml.find("coordinate=\"elevation\">30.000000<") != std::string::npos);
+        }
+        // Crossing behind the listener (170° to -170°) jumps there instead of sweeping round the front.
+        {
+            Sequence behind = s;
+            Track& t = behind.audioTracks[1];
+            t.surroundXAuto = Param(), t.surroundYAuto = Param();
+            t.surroundXAuto.addKey(0, std::sin(170 * M_PI / 180));
+            t.surroundXAuto.addKey(60, std::sin(-170 * M_PI / 180));
+            t.surround.y = std::cos(170 * M_PI / 180);
+            QVERIFY(exportAdmBwf(p, behind, st, path("behind.wav"), &r, {}, &err));
+            QVERIFY(readBwfInfo(path("behind.wav"), info, &err));
+            QVERIFY(info.axml.find("<jumpPosition interpolationLength=\"0\">1</jumpPosition>") != std::string::npos);
+        }
+
+        // EBU's renderer (ear), when there is one, hears the object start on the left and end on the right.
+        const QByteArray ear = qgetenv("MONTAGE_TEST_EAR");
+        if (!ear.isEmpty()) {
+            QProcess run;
+            const QString rendered = QString::fromStdString(path("moving-ear.wav"));
+            run.start(QString::fromLocal8Bit(ear), {"--strict", "-s", "0+5+0", QString::fromStdString(adm), rendered});
+            QVERIFY(run.waitForFinished(120000));
+            QVERIFY2(run.exitCode() == 0, run.readAllStandardError().constData());
+            // M+030 M-030 M+000 LFE1 M+110 M-110, windowed.
+            auto windowRms = [&](const std::string& file, double from, double to, std::vector<double>& out) {
+                QFile f(QString::fromStdString(file));
+                if (!f.open(QIODevice::ReadOnly)) return false;
+                const QByteArray all = f.readAll();
+                const auto* d = reinterpret_cast<const uint8_t*>(all.constData());
+                auto u16 = [&](size_t at) { return int(d[at] | (d[at + 1] << 8)); };
+                auto u32 = [&](size_t at) { return uint32_t(d[at]) | (uint32_t(d[at + 1]) << 8) | (uint32_t(d[at + 2]) << 16) | (uint32_t(d[at + 3]) << 24); };
+                int channels = 0, bits = 0, tag = 0, srate = 0;
+                size_t dataAt = 0, dataLen = 0;
+                for (size_t at = 12; at + 8 <= size_t(all.size());) {
+                    const std::string id(all.constData() + at, 4);
+                    const size_t len = u32(at + 4);
+                    if (id == "fmt ") {
+                        tag = u16(at + 8), channels = u16(at + 10), srate = int(u32(at + 12)), bits = u16(at + 22);
+                        if (tag == 0xFFFE) tag = u16(at + 8 + 24);
+                    }
+                    if (id == "data") dataAt = at + 8, dataLen = std::min(len, size_t(all.size()) - at - 8);
+                    at += 8 + len + (len & 1);
+                }
+                if (!channels || !dataAt || !srate) return false;
+                const size_t bytes = size_t(bits / 8), frames = dataLen / (bytes * size_t(channels));
+                const size_t a = size_t(from * srate), b = std::min(frames, size_t(to * srate));
+                out.assign(size_t(channels), 0.0);
+                for (size_t i = a; i < b; ++i)
+                    for (int c = 0; c < channels; ++c) {
+                        const uint8_t* q = d + dataAt + (i * size_t(channels) + size_t(c)) * bytes;
+                        double v = 0;
+                        if (bits == 24) v = double(int32_t(uint32_t(q[0]) << 8 | uint32_t(q[1]) << 16 | uint32_t(q[2]) << 24) >> 8) / 8388608.0;
+                        else if (bits == 16) v = double(int16_t(q[0] | (q[1] << 8))) / 32768.0;
+                        else if (bits == 32 && tag == 3) {
+                            float fv;
+                            std::memcpy(&fv, q, 4);
+                            v = fv;
+                        }
+                        out[size_t(c)] += v * v;
+                    }
+                for (double& v : out) v = std::sqrt(v / double(std::max<size_t>(1, b - a)));
+                return true;
+            };
+            std::vector<double> head, tail;
+            QVERIFY(windowRms(rendered.toStdString(), 0.0, 0.25, head) && head.size() == 6);
+            QVERIFY(windowRms(rendered.toStdString(), 1.75, 2.0, tail));
+            // The 440 Hz object (A1's sweep is in the bed too, but it is in front, between M+030 and M-030).
+            QVERIFY2(head[4] > 3 * head[5], qPrintable(QString("%1 %2").arg(head[4]).arg(head[5])));
+            QVERIFY2(tail[5] > 3 * tail[4], qPrintable(QString("%1 %2").arg(tail[5]).arg(tail[4])));
+        }
+
+        // Over MCP: a path for A2 keys its lanes.
+        const QString project = QString::fromStdString(path("moving.montage"));
+        a2.surroundXAuto = Param(), a2.surroundYAuto = Param();
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_set_surround"},
+                                                     {"arguments", QJsonObject{{"project", project},
+                                                                               {"tracks", QJsonArray{QJsonObject{{"track", "A2"}, {"object", true}, {"width", 0},
+                                                                                   {"path", QJsonArray{QJsonObject{{"at", 0}, {"angle", -90}},
+                                                                                                       QJsonObject{{"at", 2}, {"angle", 90}, {"height", 0.5}}}}}}}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject res = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!res.value("isError").toBool(), qPrintable(QJsonDocument(res).toJson()));
+        QCOMPARE(res.value("structuredContent").toObject().value("tracks").toArray()[0].toObject().value("path_points").toInt(), 2);
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Track& moved = back.active()->audioTracks[1];
+        QVERIFY(surroundAnimated(moved));
+        QVERIFY(std::fabs(trackSurroundAt(moved, 0).x + 1) < 1e-9 && std::fabs(trackSurroundAt(moved, 60).x - 1) < 1e-9);
+        QVERIFY(std::fabs(trackSurroundAt(moved, 60).z - 0.5) < 1e-9);
     }
 
     void immersiveMixAndAdmMaster() {

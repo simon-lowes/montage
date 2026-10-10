@@ -1039,6 +1039,7 @@ Result deleteGaps(Project& p, Sequence& s, bool leading, int* closed, FrameTime*
                 if (c.start >= b) c.start -= len;
             shiftParam(t->volumeAuto, b, len);
             shiftParam(t->panAuto, b, len);
+            for (Param* lane : {&t->surroundXAuto, &t->surroundYAuto, &t->surroundZAuto}) shiftParam(*lane, b, len);
             for (Effect& e : t->effects)
                 for (auto& [name, q] : e.params) shiftParam(q, b, len);
         }

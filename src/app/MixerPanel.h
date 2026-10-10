@@ -36,6 +36,7 @@ public:
     void playbackStopped(FrameTime t);
     bool recordingAutomation() const { return !recording_.empty(); }
     QSlider* trackFader(int index) const { return index >= 0 && index < int(strips_.size()) ? strips_[size_t(index)].fader : nullptr; }
+    SurroundPanner* trackSurround(int index) const { return index >= 0 && index < int(strips_.size()) ? strips_[size_t(index)].surround : nullptr; }
     // A track folder's fader (a VCA over its tracks), shown after the track strips; nullptr if no such folder.
     QSlider* folderFader(const QString& folder) const {
         for (const FolderStrip& f : folderStrips_)
@@ -109,6 +110,7 @@ private:
     void setVolume(int index, double db);
     void setPan(int index, double pan);
     void setSurround(int index, const SurroundPan& pan, bool final);
+    void animateSurround(int index, bool on);  // key the position at the playhead, or stop it moving
     void setMute(int index, bool on);
     void setSolo(int index, bool on);
     void setAutomationMode(int index, int mode);
@@ -134,6 +136,11 @@ private:
         AutomationRecorder volume, pan;
         double volumeDb = 0, panValue = 0;  // the fader and pan before
         Param volumeLane, panLane;          // the lanes before
+        // In surround (a panner among the speakers): its x, y and z, recorded as the pan is.
+        bool surround = false;
+        AutomationRecorder x, y, z;
+        SurroundPan position;               // the position before
+        Param xLane, yLane, zLane;          // its lanes before
     };
     std::vector<Recording> recording_;
     QString liveState_;  // what the gesture last applied, to skip repeats

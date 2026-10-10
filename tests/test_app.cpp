@@ -651,6 +651,83 @@ private slots:
         QCOMPARE(a1().volumeAuto.keys.size(), keys);
     }
 
+    void surroundPositionAutomation() {
+        loadDemo();
+        state()->edit("5.1", [](Project&, Sequence& s) {
+            s.audioLayout = "5.1";
+            s.audioTracks[0].output = 0;
+            return true;
+        });
+        auto* mixer = win_->findChild<MixerPanel*>();
+        QVERIFY(mixer);
+        QTRY_VERIFY(mixer->trackSurround(0) && !mixer->trackSurround(0)->isHidden());
+        SurroundPanner* panner = mixer->trackSurround(0);
+        auto a1 = [&]() -> const Track& { return state()->sequence()->audioTracks.at(0); };
+        const SurroundPan still = a1().surround;
+        // Animate Position keys it where it is, at the playhead.
+        state()->setPlayhead(10);
+        emit panner->animateRequested(true);
+        QVERIFY(surroundAnimated(a1()));
+        QVERIFY(a1().surroundXAuto.keyAt(10) && a1().surroundYAuto.keyAt(10) && a1().surroundZAuto.keyAt(10));
+        QVERIFY(panner->isAnimated());
+        // Moved, it is keyed at the playhead; its own position stays.
+        state()->setPlayhead(50);
+        SurroundPan right = panner->pan();
+        right.x = 0.5, right.y = std::sqrt(0.75);
+        panner->setPan(right);
+        emit panner->changed(right, true);
+        QVERIFY(a1().surroundXAuto.keyAt(50));
+        QCOMPARE(a1().surroundXAuto.keyAt(50)->v, 0.5);
+        QCOMPARE(a1().surround.x, still.x);
+        // The panner follows the playhead.
+        state()->setPlayhead(30);
+        QVERIFY(std::fabs(panner->pan().x - (still.x + 0.5) / 2) < 1e-6);
+        state()->setPlayhead(0);
+        QCOMPARE(panner->pan().x, still.x);
+        // A Write pass records the panner: where it was, then hard right from frame 20; Write hands over to Touch.
+        mixer->trackAutomationMode(0)->setCurrentIndex(int(AutomationMode::Write));
+        mixer->playbackStarted(0);
+        QVERIFY(mixer->recordingAutomation());
+        for (FrameTime f = 0; f <= 60; ++f) {
+            if (f == 20) {
+                SurroundPan p = panner->pan();
+                p.x = 1, p.y = 0;
+                panner->setPan(p);
+            }
+            mixer->playbackPosition(f);
+            if (f == 30) QCOMPARE(a1().surround.x, 1.0);  // heard as it is written
+        }
+        mixer->playbackStopped(60);
+        QVERIFY(surroundAnimated(a1()));
+        QVERIFY(std::fabs(a1().surroundXAuto.at(10) - still.x) < 1e-6);
+        QCOMPARE(a1().surroundXAuto.at(40), 1.0);
+        QCOMPARE(a1().surroundYAuto.at(40), 0.0);
+        QCOMPARE(a1().automation, int(AutomationMode::Touch));
+        QCOMPARE(a1().surround.x, still.x);
+        // One undo step back to the keys made by hand.
+        state()->undo();
+        QVERIFY(a1().surroundXAuto.keyAt(50) && a1().surroundXAuto.keyAt(50)->v == 0.5);
+        state()->redo();
+        // A Touch pass writes only while the panner is held.
+        mixer->playbackStarted(0);
+        for (FrameTime f = 0; f <= 60; ++f) {
+            if (f == 5) QTest::mousePress(panner, Qt::LeftButton, {}, panner->toWidget(-1, 0).toPoint());
+            if (f == 15) QTest::mouseRelease(panner, Qt::LeftButton, {}, panner->toWidget(-1, 0).toPoint());
+            mixer->playbackPosition(f);
+        }
+        mixer->playbackStopped(60);
+        QVERIFY2(a1().surroundXAuto.at(10) < -0.9, qPrintable(QString::number(a1().surroundXAuto.at(10))));
+        QVERIFY(std::fabs(a1().surroundXAuto.at(2) - still.x) < 1e-6);                 // before it was held
+        QVERIFY(a1().surroundXAuto.at(50) > a1().surroundXAuto.at(20) + 0.1);           // let go: gliding back
+        // Stopping the animation leaves it where it is at the playhead.
+        state()->setPlayhead(40);
+        const double here = a1().surroundXAuto.at(40);
+        emit panner->animateRequested(false);
+        QVERIFY(!surroundAnimated(a1()));
+        QCOMPARE(a1().surround.x, here);
+        QVERIFY(!panner->isAnimated());
+    }
+
     void trackAutomationOnTheTimeline() {
         loadDemo();
         auto* toggle = win_->findChild<QAction*>("showTrackAutomation");
