@@ -13,7 +13,9 @@
 #include <QMouseEvent>
 #include <QPainter>
 #include <QStyle>
+#include <QResizeEvent>
 #include <QSettings>
+#include <QTimer>
 #include <QToolButton>
 #include <QVBoxLayout>
 #include <algorithm>
@@ -24,6 +26,7 @@
 #include <QtConcurrent>
 
 #include "EditorState.h"
+#include "HdrSurface.h"
 #include "PlaybackController.h"
 #include "media/Image.h"
 #include "media/MediaPool.h"
@@ -43,8 +46,10 @@ ViewerWidget::ViewerWidget(QWidget* parent) : QWidget(parent) {
 }
 
 void ViewerWidget::setImage(const QImage& img) {
+    const bool reshaped = img.isNull() != image_.isNull() || img.size() != image_.size();
     image_ = img;
     update();
+    if (surface_ && reshaped) updateHdr();  // (the picture's place moved)
 }
 
 void ViewerWidget::setPlaceholder(const QString& text) {
@@ -87,16 +92,22 @@ void ViewerWidget::setTwoUp(const QImage& left, const QImage& right, const QStri
     twoUpImages_[0] = left, twoUpImages_[1] = right;
     twoUpLabels_[0] = leftLabel, twoUpLabels_[1] = rightLabel;
     update();
+    if (surface_) updateHdr();
 }
 
 void ViewerWidget::clearTwoUp() {
     twoUp_ = false;
     twoUpImages_[0] = twoUpImages_[1] = QImage();
     update();
+    if (surface_) updateHdr();
 }
 
 void ViewerWidget::paintEvent(QPaintEvent*) {
     QPainter p(this);
+    paintContent(p, true);
+}
+
+void ViewerWidget::paintContent(QPainter& p, bool picture) {
     p.fillRect(rect(), QColor(0x0e, 0x0f, 0x11));
     if (twoUp_) {
         p.setRenderHint(QPainter::SmoothPixmapTransform);
@@ -118,7 +129,15 @@ void ViewerWidget::paintEvent(QPaintEvent*) {
     }
     const QRectF r = imageRect();
     p.setRenderHint(QPainter::SmoothPixmapTransform);
-    p.drawImage(r, exposure_ ? shownImage() : image_);
+    if (picture || exposure_) {
+        p.drawImage(r, exposure_ ? shownImage() : image_);  // (the exposure check is an SDR picture, drawn over HDR too)
+    } else {
+        // Where the HDR surface's picture shows through.
+        p.save();
+        p.setCompositionMode(QPainter::CompositionMode_Clear);
+        p.fillRect(r, Qt::transparent);
+        p.restore();
+    }
     if (safe_) {
         p.setPen(QPen(QColor(255, 255, 255, 90), 1, Qt::DashLine));
         p.drawRect(r.adjusted(r.width() * 0.05, r.height() * 0.05, -r.width() * 0.05, -r.height() * 0.05));
@@ -190,6 +209,125 @@ void ViewerWidget::setLookAround(bool on) {
     lookAround_ = on;
     if (on) setCursor(Qt::OpenHandCursor);
     else unsetCursor();
+}
+
+void ViewerWidget::resizeEvent(QResizeEvent* e) {
+    QWidget::resizeEvent(e);
+    if (container_) container_->setGeometry(rect());
+#ifdef MONTAGE_HDR_VIEWER
+    if (surface_ && hdrPicture_) surface_->setPicture(hdrPicture_, imageRect());
+#endif
+}
+
+void ViewerWidget::setHdrViewer(bool on) {
+    if (hdrWanted_ == on) return;
+    hdrWanted_ = on;
+    hdrStatus_.clear();  // asked again: try the display again
+    if (!on) dropHdrSurface();
+    updateHdr();
+}
+
+void ViewerWidget::setHdrPicture(HdrPicturePtr picture) {
+    hdrPicture_ = std::move(picture);
+    updateHdr();
+}
+
+HdrSurface* ViewerWidget::hdrSurface() const { return surface_; }
+
+bool ViewerWidget::hdrShowing() const {
+#ifdef MONTAGE_HDR_VIEWER
+    return surface_ && container_ && container_->isVisible() && surface_->hdrActive();
+#else
+    return false;
+#endif
+}
+
+double ViewerWidget::hdrHeadroom() const {
+#ifdef MONTAGE_HDR_VIEWER
+    if (hdrShowing()) return surface_->headroom();
+#endif
+    return 1;
+}
+
+QImage ViewerWidget::overlayImage() {
+    const qreal dpr = devicePixelRatioF();
+    QImage img(QSize(std::max(1, qRound(width() * dpr)), std::max(1, qRound(height() * dpr))), QImage::Format_ARGB32_Premultiplied);
+    img.setDevicePixelRatio(dpr);
+    img.fill(Qt::transparent);
+    QPainter p(&img);
+    paintContent(p, false);
+    return img;
+}
+
+void ViewerWidget::refreshOverlay() {
+#ifdef MONTAGE_HDR_VIEWER
+    if (!hdrShowing()) return;
+    QImage img = overlayImage();
+    if (img == lastOverlay_) return;  // (unchanged: nothing to upload)
+    lastOverlay_ = img;
+    surface_->setOverlay(img);
+#endif
+}
+
+void ViewerWidget::dropHdrSurface() {
+#ifdef MONTAGE_HDR_VIEWER
+    if (overlayTimer_) overlayTimer_->stop();
+    surface_ = nullptr;
+    if (container_) container_->deleteLater();  // (the surface with it)
+    container_ = nullptr;
+    lastOverlay_ = QImage();
+#endif
+}
+
+void ViewerWidget::updateHdr() {
+#ifdef MONTAGE_HDR_VIEWER
+    const bool want = hdrWanted_ && hdrPicture_ && !twoUp_ && !image_.isNull();
+    if (want && !surface_ && hdrStatus_.isEmpty()) {
+        auto* s = new HdrSurface(this);
+        QString why;
+        if (!s->probe(&why)) {
+            delete s;
+            hdrStatus_ = why;
+            lastStatus_ = hdrStatus_, lastShowing_ = false, lastHeadroom_ = 1, lastWanted_ = hdrWanted_;
+            emit hdrChanged();
+            return;
+        }
+        surface_ = s;
+        container_ = QWidget::createWindowContainer(s, this);
+        container_->setObjectName(QStringLiteral("hdrSurface"));
+        container_->setGeometry(rect());
+        container_->setFocusPolicy(Qt::NoFocus);
+        connect(s, &HdrSurface::displayChanged, this, [this] {
+            if (surface_ && !surface_->hdrActive()) {
+                hdrStatus_ = tr("This display does not show HDR");
+                dropHdrSurface();
+            }
+            updateHdr();
+        });
+        if (!overlayTimer_) {
+            // The viewer's drawing changes with no signal (overlays repaint on their own), so it is looked at 30 times
+            // a second and uploaded when it changed.
+            overlayTimer_ = new QTimer(this);
+            overlayTimer_->setInterval(33);
+            connect(overlayTimer_, &QTimer::timeout, this, &ViewerWidget::refreshOverlay);
+        }
+    }
+    if (container_) container_->setVisible(want && surface_ && surface_->hdrActive());
+    if (hdrShowing()) {
+        surface_->setPicture(hdrPicture_, imageRect());
+        refreshOverlay();
+        if (overlayTimer_ && !overlayTimer_->isActive()) overlayTimer_->start();
+    } else if (overlayTimer_) {
+        overlayTimer_->stop();
+    }
+#endif
+    // Said when what shows changed (not for every picture).
+    const bool showing = hdrShowing();
+    const double headroom = hdrHeadroom();
+    if (showing != lastShowing_ || headroom != lastHeadroom_ || hdrStatus_ != lastStatus_ || hdrWanted_ != lastWanted_) {
+        lastShowing_ = showing, lastHeadroom_ = headroom, lastStatus_ = hdrStatus_, lastWanted_ = hdrWanted_;
+        emit hdrChanged();
+    }
 }
 
 void ViewerWidget::mousePressEvent(QMouseEvent* e) {
@@ -470,12 +608,27 @@ MonitorPanel::MonitorPanel(Mode mode, EditorState* state, PlaybackController* co
     durationLabel_->setFont(theme::monoFont(9));
     durationLabel_->setStyleSheet(QString("color: %1;").arg(theme::kTextDim.name()));
     bar->addWidget(durationLabel_);
+    hdrBadge_ = new QLabel(QStringLiteral("HDR"), this);
+    hdrBadge_->setObjectName(QStringLiteral("hdrBadge"));
+    hdrBadge_->setStyleSheet(QStringLiteral("color: #111; background: #f0c040; border-radius: 3px; padding: 0 4px; font-weight: 600;"));
+    hdrBadge_->hide();
+    bar->addWidget(hdrBadge_);
     lay->addLayout(bar);
 
     connect(scrub_, &ScrubBar::seekRequested, controller_, &PlaybackController::seek);
     connect(controller_, &PlaybackController::frameRendered, viewer_, [this](const QImage& img, FrameTime) {
         if (mode_ == Mode::Source && !state_->sourceMedia()) return;
         viewer_->setImage(img);
+    });
+    connect(controller_, &PlaybackController::hdrFrameRendered, viewer_, [this](HdrPicturePtr picture, FrameTime) {
+        if (mode_ == Mode::Source && !state_->sourceMedia()) return;
+        viewer_->setHdrPicture(std::move(picture));
+    });
+    connect(viewer_, &ViewerWidget::hdrChanged, this, [this] {
+        // HDR light is only rendered while it can be shown.
+        controller_->setHdrOutput(viewer_->hdrViewer() && viewer_->hdrStatus().isEmpty());
+        hdrBadge_->setVisible(viewer_->hdrShowing());
+        hdrBadge_->setToolTip(tr("Showing HDR: this display goes to %1 times SDR white").arg(viewer_->hdrHeadroom(), 0, 'f', 1));
     });
     connect(controller_, &PlaybackController::positionChanged, this, [this] { refresh(); });
     connect(controller_, &PlaybackController::playingChanged, this, [this](bool playing) {
@@ -620,6 +773,12 @@ void MonitorPanel::renderTrimView() {
         };
         return std::pair<QImage, QImage>{one(frames[0]), one(frames[1])};
     }));
+}
+
+void MonitorPanel::setHdrViewer(bool on) {
+    on = on && hdrViewerBuilt();
+    viewer_->setHdrViewer(on);
+    controller_->setHdrOutput(on && viewer_->hdrStatus().isEmpty());
 }
 
 void MonitorPanel::refresh() {

@@ -15,6 +15,7 @@
 #include "core/Adr.h"
 #include "core/Model.h"
 #include "render/Compositor.h"
+#include "render/HdrView.h"
 
 class QAudioSink;
 class QIODevice;
@@ -52,6 +53,9 @@ public:
     // difference (render/Stereo.h). Other sequences are not affected.
     void setStereoView(StereoView v);
     StereoView stereoView() const { return stereoView_; }
+    // Also render HDR sequences as light for the HDR viewer (hdrFrameRendered), beside their SDR pictures.
+    void setHdrOutput(bool on);
+    bool hdrOutput() const { return hdrOutput_; }
 
     bool isPlaying() const { return speed_ != 0; }
     // Global Mute (as in Premiere): playback and scrubbing are silent; clips, tracks and exports are untouched.
@@ -95,6 +99,8 @@ signals:
     // The same frame for the scopes: as delivered (code values in `space`, 16-bit for sequences outside Rec.709,
     // whose frameRendered pictures are their SDR previews), with the sequence's mastering peak.
     void scopeFrameRendered(const QImage& image, montage::FrameTime t, const QString& space, double peakNits);
+    // The same frame for the HDR viewer (with setHdrOutput): null when the sequence is not HDR.
+    void hdrFrameRendered(montage::HdrPicturePtr picture, montage::FrameTime t);
     // Peak levels of the last audio block: master L/R and per-track
     // interleaved L,R pairs (linear, 0..1+).
     void audioLevels(float masterL, float masterR, const QVector<float>& trackPeaks);
@@ -122,6 +128,7 @@ private:
     bool useProxies_ = false;
     bool showCaptions_ = false;
     StereoView stereoView_ = StereoView::Left;
+    bool hdrOutput_ = false;
     double speed_ = 0;
     bool loop_ = false;
     FrameTime position_ = 0;

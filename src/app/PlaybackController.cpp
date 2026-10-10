@@ -21,6 +21,7 @@
 
 #include "render/ColorSpace.h"
 #include "render/Compositor.h"
+#include "render/HdrView.h"
 
 namespace montage {
 
@@ -42,6 +43,7 @@ public:
         bool captions = false;
         double cacheScale = 0;  // the scale rendered previews are kept at (playback's), 0 = scale
         StereoView stereoView = StereoView::Left;  // how a stereo 3D sequence's eyes are shown
+        bool hdr = false;  // HDR sequences also as light for the HDR viewer
     };
     void request(const Request& r) {
         {
@@ -55,12 +57,14 @@ public:
 signals:
     void rendered(const QImage& image, montage::FrameTime t);
     void scopeRendered(const QImage& image, montage::FrameTime t, const QString& space, double peakNits);
+    void hdrRendered(montage::HdrPicturePtr picture, montage::FrameTime t);
 
 private:
     // A frame for the viewer (Rec.709) and, for sequences in another space, a small copy as delivered (16-bit code
     // values in the sequence's space) so the scopes measure what is exported, not its SDR preview.
     struct Rendered {
         QImage view, signal;
+        HdrPicturePtr hdr;  // for the HDR viewer (HDR sequences, when it is on)
     };
     static constexpr int kSignalWidth = 480, kSignalHeight = 320;
 
@@ -98,6 +102,7 @@ private:
 
     void emitFrame(Rendered& img, const Request& r, FrameTime t) {
         emit rendered(img.view, t);
+        if (r.hdr) emit hdrRendered(img.hdr, t);  // (none for SDR sequences: the viewer shows the SDR picture)
         const Sequence* s = r.project->findSequence(r.sequence);
         if (!s) return;
         if (!ownSpace(*s)) {
@@ -113,7 +118,7 @@ private:
 
     bool sameContext(const Request& r) const {
         return r.project == ctx_.project && r.sequence == ctx_.sequence && r.scale == ctx_.scale && r.proxies == ctx_.proxies &&
-               r.captions == ctx_.captions && r.stereoView == ctx_.stereoView;
+               r.captions == ctx_.captions && r.stereoView == ctx_.stereoView && r.hdr == ctx_.hdr;
     }
 
     Rendered render(const Request& r, FrameTime t) {
@@ -129,7 +134,8 @@ private:
         RenderOptions co = o;
         if (r.cacheScale > 0) co.scale = r.cacheScale;
         const QByteArray key = frameKey(*r.project, *s, t, co);
-        if (RenderCache::instance().has(key)) {
+        const bool hdr = r.hdr && sequenceColorSpace(*s).hdr();  // (a rendered preview has only its SDR picture)
+        if (!hdr && RenderCache::instance().has(key)) {
             QImage cached = RenderCache::instance().load(key);
             if (!cached.isNull()) return {cached, {}};
         }
@@ -141,6 +147,14 @@ private:
         Image img = renderProgramFrame(*r.project, *s, t, own);
         if (other) {
             out.signal = signalImage(img);
+            if (hdr) {
+                auto pic = std::make_shared<HdrPicture>();
+                pic->width = img.width;
+                pic->height = img.height;
+                pic->contentPeak = hdrContentPeak(sequenceColorSpace(*s), s->hdrPeakNits);
+                hdrViewImage(img, sequenceColorSpace(*s), s->hdrPeakNits, pic->contentPeak, pic->rgba);  // (rolled off as drawn)
+                out.hdr = std::move(pic);
+            }
             convertColor(img, sequenceColorSpace(*s), rec709Space(), s->hdrPeakNits);
         }
         out.view = QImage(img.width, img.height, QImage::Format_RGBA8888);
@@ -198,7 +212,8 @@ private:
 
     // Drops cached frames furthest from the playhead.
     void trim() {
-        while (cache_.size() > kMaxCached) {
+        const size_t limit = ctx_.hdr ? kMaxCached / 2 : kMaxCached;  // HDR frames are twice the size
+        while (cache_.size() > limit) {
             auto first = cache_.begin(), last = std::prev(cache_.end());
             if (std::llabs(first->first - ctx_.frame) > std::llabs(last->first - ctx_.frame)) cache_.erase(first);
             else cache_.erase(last);
@@ -358,6 +373,8 @@ PlaybackController::PlaybackController(QObject* parent) : QObject(parent) {
     connect(renderThread_, &QThread::finished, worker_, &QObject::deleteLater);
     connect(worker_, &RenderWorker::rendered, this, &PlaybackController::frameRendered, Qt::QueuedConnection);
     connect(worker_, &RenderWorker::scopeRendered, this, &PlaybackController::scopeFrameRendered, Qt::QueuedConnection);
+    qRegisterMetaType<HdrPicturePtr>("montage::HdrPicturePtr");
+    connect(worker_, &RenderWorker::hdrRendered, this, &PlaybackController::hdrFrameRendered, Qt::QueuedConnection);
     renderThread_->start();
     device_ = new MixerDevice(this);
     device_->setAmbisonicBinaural(ambisonicBinaural_);
@@ -433,6 +450,12 @@ void PlaybackController::setShowCaptions(bool on) {
     requestFrame();
 }
 
+void PlaybackController::setHdrOutput(bool on) {
+    if (hdrOutput_ == on) return;
+    hdrOutput_ = on;
+    requestFrame();
+}
+
 void PlaybackController::setStereoView(StereoView v) {
     if (stereoView_ == v) return;
     stereoView_ = v;
@@ -450,7 +473,8 @@ FrameTime PlaybackController::clampToSequence(FrameTime t) const { return std::m
 void PlaybackController::requestFrame() {
     if (!sequence()) return;
     // Paused frames render at full quality; playback uses the preview scale.
-    worker_->request({project_, sequenceId_, position_, isPlaying() ? scale_ : 1.0, useProxies_, playStep(), showCaptions_, scale_, stereoView_});
+    worker_->request(
+        {project_, sequenceId_, position_, isPlaying() ? scale_ : 1.0, useProxies_, playStep(), showCaptions_, scale_, stereoView_, hdrOutput_});
 }
 
 void PlaybackController::seek(FrameTime t) {
@@ -614,7 +638,7 @@ void PlaybackController::tick() {
     }
     if (t != position_) {
         position_ = t;
-        worker_->request({project_, sequenceId_, t, scale_, useProxies_, playStep(), showCaptions_, scale_, stereoView_});
+        worker_->request({project_, sequenceId_, t, scale_, useProxies_, playStep(), showCaptions_, scale_, stereoView_, hdrOutput_});
         emit positionChanged(t);
     }
 }

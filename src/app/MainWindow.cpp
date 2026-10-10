@@ -129,6 +129,7 @@
 #include "PeoplePanel.h"
 #include "SpeechDialog.h"
 #include "TranscriptPanel.h"
+#include "HdrSurface.h"
 #include "MonitorPanel.h"
 #include "PlaybackController.h"
 #include "PluginManagerDialog.h"
@@ -175,6 +176,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     buildPanels();
     buildActions();
     buildMenus();
+    applyHdrViewer();
     keymap::load(this);
 
     // Crash safety: find sessions that did not exit cleanly before starting ours.
@@ -708,6 +710,22 @@ void MainWindow::restoreLayout() {
 // Actions & menus
 
 void MainWindow::buildActions() {}
+
+void MainWindow::applyHdrViewer() {
+    const bool on = hdrViewer_ && hdrViewer_->isChecked();
+    for (MonitorPanel* m : {sourcePanel_, programPanel_}) {
+        if (!m) continue;
+        m->setHdrViewer(on);
+        if (hdrWired_) continue;
+        // Asked for and not possible here (an SDR display, no GPU device): said once, in the status bar.
+        connect(m->viewer(), &ViewerWidget::hdrChanged, this, [this, m] {
+            if (hdrMessageShown_ || !m->viewer()->hdrViewer() || m->viewer()->hdrStatus().isEmpty()) return;
+            hdrMessageShown_ = true;
+            state_->message(tr("HDR Viewer: %1; HDR is shown tone mapped to SDR").arg(m->viewer()->hdrStatus()), 6000);
+        });
+    }
+    hdrWired_ = true;
+}
 
 void MainWindow::buildMenus() {
     auto add = [this](QMenu* menu, const QString& text, const QKeySequence& key, auto fn) {
@@ -1572,6 +1590,19 @@ void MainWindow::buildMenus() {
     trimView_->setCheckable(true);
     trimView_->setChecked(appSettings().value("playback/twoUpTrim", true).toBool());
     trimView_->setToolTip(tr("While trimming, rolling, slipping or sliding, show the frames either side of the edit side by side"));
+    // HDR sequences as HDR on an HDR or EDR display (app/HdrSurface.h); elsewhere, and in builds without it, tone mapped.
+    hdrViewer_ = add(play, tr("HDR Viewer"), QKeySequence(), [this](bool on) {
+        appSettings().setValue("playback/hdrViewer", on);
+        hdrMessageShown_ = false;
+        applyHdrViewer();
+    });
+    hdrViewer_->setObjectName(QStringLiteral("hdrViewer"));
+    hdrViewer_->setCheckable(true);
+    hdrViewer_->setEnabled(hdrViewerBuilt());
+    hdrViewer_->setChecked(hdrViewerBuilt() && appSettings().value("playback/hdrViewer", true).toBool());
+    hdrViewer_->setToolTip(hdrViewerBuilt() ? tr("Show HDR sequences as HDR on an HDR display (macOS EDR, Windows with HDR switched on) "
+                                                 "instead of tone mapped to SDR")
+                                            : tr("This build has no HDR viewer (it needs Qt 6.7 or later)"));
     // Video output: the Program picture alone, full screen here or on another display.
     QAction* fullScreen = add(play, tr("Full Screen Program"), QKeySequence("Ctrl+Shift+F"), [this] {
         if (cleanFeed_ && cleanFeed_->isVisible()) hideCleanFeed();

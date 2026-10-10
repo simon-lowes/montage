@@ -501,6 +501,10 @@ private:
     QString voiceRefName_;
     QAction* compareRef_ = nullptr;
     QAction* trimView_ = nullptr;  // Playback › Two-Up Trim View
+    QAction* hdrViewer_ = nullptr;  // Playback › HDR Viewer
+    bool hdrMessageShown_ = false;  // why HDR is not showing, said once a toggle
+    bool hdrWired_ = false;
+    void applyHdrViewer();
     QMenu* recentMenu_ = nullptr;
     QMenu* windowMenu_ = nullptr;
     QString workspace_ = QStringLiteral("Editing");

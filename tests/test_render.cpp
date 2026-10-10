@@ -22,6 +22,7 @@
 #include "core/Effects.h"
 #include "core/MaskPath.h"
 #include "render/ColorSpace.h"
+#include "render/HdrView.h"
 #include "render/Compositor.h"
 #include "render/Dcp.h"
 #include "render/Imf.h"
@@ -1740,6 +1741,67 @@ colorspaces:
         QCOMPARE(red(4), red(7));
         QVERIFY(red(4) > red(3) + 0.05f);
         QCOMPARE(red(9), red(8));
+    }
+
+    void hdrViewForHdrDisplays() {
+        const ColorSpace& pq = *findColorSpace("rec2100pq");
+        const ColorSpace& hlg = *findColorSpace("rec2100hlg");
+        auto view = [](const ColorSpace& s, float r, float g, float b, double headroom, double peak = 1000) {
+            float c[3] = {r, g, b};
+            hdrViewPixel(c, s, peak, headroom);
+            return std::array<float, 3>{c[0], c[1], c[2]};
+        };
+        auto show = [](std::array<float, 3> c) { return QString("%1 %2 %3").arg(c[0]).arg(c[1]).arg(c[2]); };
+        // PQ's 203 nits is SDR white; 1000 nits five times it, shown as such where the display has the headroom.
+        const float w203 = float(nitsToCode(pq, 203)), w1000 = float(nitsToCode(pq, 1000)), w4000 = float(nitsToCode(pq, 4000));
+        auto white = view(pq, w203, w203, w203, 8);
+        QVERIFY2(std::fabs(white[0] - 1) < 0.01 && std::fabs(white[1] - 1) < 0.01 && std::fabs(white[2] - 1) < 0.01, qPrintable(show(white)));
+        auto spec = view(pq, w1000, w1000, w1000, 8);
+        QVERIFY2(std::fabs(spec[1] - 1000.0 / 203) < 0.05, qPrintable(show(spec)));
+        // A display with less headroom than the master: highlights roll off below its peak, SDR white untouched,
+        // hue kept; one with enough shows the master as it is.
+        auto rolled = view(pq, w1000, w1000, w1000, 2);
+        QVERIFY2(rolled[1] > 1.6 && rolled[1] < 2.0, qPrintable(show(rolled)));
+        QVERIFY2(std::fabs(view(pq, w203, w203, w203, 2)[1] - 1) < 0.01, qPrintable(show(view(pq, w203, w203, w203, 2))));
+        const float o1 = float(nitsToCode(pq, 1000)), o2 = float(nitsToCode(pq, 250));
+        auto orange = view(pq, o1, o2, 0, 2), orangeFull = view(pq, o1, o2, 0, 8);
+        QVERIFY2(orange[0] < 2.0 && std::fabs(orange[1] / orange[0] - orangeFull[1] / orangeFull[0]) < 0.01, qPrintable(show(orange) + " / " + show(orangeFull)));
+        QVERIFY2(view(pq, w4000, w4000, w4000, 8, 4000)[1] < 8.0 && view(pq, w4000, w4000, w4000, 8, 4000)[1] > 6.0,
+                 qPrintable(show(view(pq, w4000, w4000, w4000, 8, 4000))));
+        QCOMPARE(hdrContentPeak(pq, 1000), 1000.0 / 203);
+        QCOMPARE(hdrContentPeak(rec709Space(), 1000), 1.0);
+        // On an SDR display (headroom 1) the HDR picture stays within white.
+        QVERIFY(view(pq, w1000, w1000, w1000, 1)[1] <= 1.0f);
+        // Wide gamut kept: Rec. 2020's green is outside Rec. 709, so red and blue go negative.
+        const float g100 = float(nitsToCode(pq, 100));
+        auto green = view(pq, 0, g100, 0, 8);
+        QVERIFY2(green[0] < -0.05f && green[2] < -0.01f && green[1] > 0.5f, qPrintable(show(green)));
+        // HLG's 75 % is SDR white on its 1000-nit reference display (BT.2408).
+        auto hw = view(hlg, 0.75f, 0.75f, 0.75f, 8);
+        QVERIFY2(std::fabs(hw[1] - 1) < 0.04, qPrintable(show(hw)));
+        // SDR is its own display light, within white.
+        auto sdr = view(rec709Space(), 1, 0.5f, 0, 8);
+        QVERIFY2(std::fabs(sdr[0] - 1) < 1e-4 && std::fabs(sdr[1] - std::pow(0.5f, 2.4f)) < 1e-4 && std::fabs(sdr[2]) < 1e-6, qPrintable(show(sdr)));
+        // A frame as half floats, the table matching the pixel function, alpha 1, scaled for scRGB.
+        Image img(3, 2);
+        const float codes[3] = {w203, w1000, g100};
+        for (int x = 0; x < 3; ++x)
+            for (int y = 0; y < 2; ++y) {
+                float* p = img.at(x, y);
+                p[0] = p[1] = p[2] = codes[x];
+                p[3] = 1;
+            }
+        std::vector<uint16_t> half;
+        hdrViewImage(img, pq, 1000, 8, half, 2.5f);
+        QCOMPARE(half.size(), size_t(3 * 2 * 4));
+        std::vector<float> back(half.size());
+        qFloatFromFloat16(back.data(), reinterpret_cast<const qfloat16*>(half.data()), qsizetype(half.size()));
+        for (int x = 0; x < 3; ++x) {
+            auto expect = view(pq, codes[x], codes[x], codes[x], 8);
+            QVERIFY2(std::fabs(back[size_t(x) * 4 + 1] / 2.5f - expect[1]) < 0.01f * std::max(1.0f, expect[1]),
+                     qPrintable(QString("%1: %2 vs %3").arg(x).arg(back[size_t(x) * 4 + 1] / 2.5f).arg(expect[1])));
+            QCOMPARE(back[size_t(x) * 4 + 3], 1.0f);
+        }
     }
 
     void cameraLogSpaces() {

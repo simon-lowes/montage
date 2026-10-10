@@ -145,6 +145,7 @@
 #include "core/History.h"
 #include "render/Processing.h"
 #include "media/Segmenter.h"
+#include "HdrSurface.h"
 #include "MonitorPanel.h"
 #include "PlaybackController.h"
 #include "Recovery.h"
@@ -9672,6 +9673,131 @@ const auto seq = [this] { return state()->sequence(); };
         // Not for SDR.
         state()->newProject();
         QVERIFY(!win_->analyseHdrLightLevels(false));
+    }
+
+    void hdrViewerOnHdrSequences() {
+        auto* action = win_->findChild<QAction*>("hdrViewer");
+        QVERIFY(action);
+        QCOMPARE(action->isEnabled(), hdrViewerBuilt());
+        auto* program = win_->findChild<PlaybackController*>("programPlayback");
+        MonitorPanel* panel = nullptr;
+        for (MonitorPanel* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Program) panel = m;
+        QVERIFY(program && panel);
+        ViewerWidget* viewer = panel->viewer();
+        auto* badge = panel->findChild<QLabel*>("hdrBadge");
+        QVERIFY(badge);
+        auto makeHdr = [&](const char* space) {
+            state()->newProject();
+            return state()->edit("HDR", [space](Project& p, Sequence& s) {
+                s.colorSpace = space;
+                s.hdrPeakNits = 1000;
+                Clip c = makeGeneratorClip(p, "color", 10);
+                for (const char* k : {"color.r", "color.g", "color.b"}) c.generator.params[k] = 1.0;
+                return edit::overwrite(p, s, {TrackKind::Video, 0}, c).ok;
+            });
+        };
+        auto centre = [](const HdrPicture& pic) {
+            float px[4];
+            qFloatFromFloat16(px, reinterpret_cast<const qfloat16*>(&pic.rgba[(size_t(pic.height / 2) * size_t(pic.width) + size_t(pic.width / 2)) * 4]), 4);
+            return std::array<float, 4>{px[0], px[1], px[2], px[3]};
+        };
+        // The controller renders an HDR sequence's light when asked: graphics white (203 nits) is SDR white, 1.0. (The
+        // viewer, off, leaves the controller alone; on, it renders HDR light only while it can show it.)
+        viewer->setHdrViewer(false);
+        QVERIFY(makeHdr("rec2100pq"));
+        const bool wasOn = program->hdrOutput();
+        program->setHdrOutput(true);
+        QSignalSpy hdrSpy(program, &PlaybackController::hdrFrameRendered);
+        auto latest = [&] { return hdrSpy.isEmpty() ? HdrPicturePtr() : hdrSpy.last().at(0).value<HdrPicturePtr>(); };
+        program->requestFrame();
+        QTRY_VERIFY(latest() != nullptr);
+        const HdrPicturePtr pic = latest();
+        QVERIFY(pic->width > 0 && pic->rgba.size() == size_t(pic->width) * size_t(pic->height) * 4);
+        const auto c = centre(*pic);
+        QVERIFY2(std::fabs(c[0] - 1) < 0.01 && std::fabs(c[1] - 1) < 0.01 && std::fabs(c[2] - 1) < 0.01 && c[3] == 1,
+                 qPrintable(QString("%1 %2 %3 %4").arg(c[0]).arg(c[1]).arg(c[2]).arg(c[3])));
+        QVERIFY(std::fabs(pic->contentPeak - 1000.0 / 203) < 1e-6);
+        // Playing too, frame after frame.
+        hdrSpy.clear();
+        program->seek(0);
+        program->play();
+        QTRY_VERIFY(hdrSpy.size() >= 3);
+        program->pause();
+        for (const QList<QVariant>& args : hdrSpy) QVERIFY(args.at(0).value<HdrPicturePtr>() != nullptr);
+        // An SDR sequence has none (the viewer shows its SDR picture).
+        QVERIFY(makeHdr("rec709"));
+        hdrSpy.clear();
+        program->requestFrame();
+        QTRY_VERIFY(!hdrSpy.isEmpty());
+        QTRY_VERIFY(latest() == nullptr);
+        program->setHdrOutput(wasOn);
+
+        // Without a display that shows HDR the viewer stays SDR, with the reason.
+        viewer->setHdrViewer(false);
+        viewer->setHdrViewer(true);
+        viewer->setHdrPicture(pic);
+        QVERIFY(!viewer->hdrShowing());
+        QVERIFY(!badge->isVisible());
+        QCOMPARE(viewer->hdrHeadroom(), 1.0);
+#ifdef MONTAGE_HDR_VIEWER
+        QVERIFY(!viewer->hdrStatus().isEmpty());  // (this machine's display is not HDR, or there is no GPU device)
+        // On a stand-in HDR display (Qt's Null RHI, four times SDR white): the picture on the HDR surface, the viewer's
+        // own drawing over it with the picture's area clear, the badge up, input passed on to the viewer.
+        HdrSurface::setTestDisplay(4);
+        viewer->setHdrViewer(false);
+        viewer->setHdrViewer(true);
+        QVERIFY(makeHdr("rec2100pq"));
+        program->requestFrame();
+        QTRY_VERIFY(viewer->hdrShowing());
+        QCOMPARE(viewer->hdrHeadroom(), 4.0);
+        QTRY_VERIFY(badge->isVisible());
+        QVERIFY(program->hdrOutput());
+        HdrSurface* surface = viewer->hdrSurface();
+        QVERIFY(surface && surface->hdrActive());
+        QTRY_VERIFY(!surface->overlay().isNull());
+        const QImage overlay = surface->overlay();
+        const QRectF r = viewer->imageRect();
+        const qreal dpr = overlay.devicePixelRatio();
+        QVERIFY(!r.isEmpty());
+        QCOMPARE(qAlpha(overlay.pixel(int(r.center().x() * dpr), int(r.center().y() * dpr))), 0);
+        if (r.left() > 4) QCOMPARE(qAlpha(overlay.pixel(int(2 * dpr), int(r.center().y() * dpr))), 255);  // the background
+        // Guides drawn by the viewer reach the surface.
+        viewer->setSafeMargins(true);
+        QTRY_VERIFY(surface->overlay() != overlay);
+        viewer->setSafeMargins(false);
+        struct Presses : QObject {
+            int n = 0;
+            bool eventFilter(QObject*, QEvent* e) override {
+                if (e->type() == QEvent::MouseButtonPress) ++n;
+                return false;
+            }
+        } presses;
+        viewer->installEventFilter(&presses);
+        QMouseEvent press(QEvent::MouseButtonPress, r.center(), r.center(), viewer->mapToGlobal(r.center().toPoint()), Qt::LeftButton, Qt::LeftButton,
+                          Qt::NoModifier);
+        QCoreApplication::sendEvent(surface, &press);
+        QMouseEvent release(QEvent::MouseButtonRelease, r.center(), r.center(), viewer->mapToGlobal(r.center().toPoint()), Qt::LeftButton,
+                            Qt::NoButton, Qt::NoModifier);
+        QCoreApplication::sendEvent(surface, &release);
+        viewer->removeEventFilter(&presses);
+        QCOMPARE(presses.n, 1);
+        // Two-up trimming draws over it in SDR; an SDR sequence and the viewer switched off take it away.
+        viewer->setTwoUp(QImage(), QImage(), "A", "B");
+        QVERIFY(!viewer->hdrShowing());
+        viewer->clearTwoUp();
+        QTRY_VERIFY(viewer->hdrShowing());
+        QVERIFY(makeHdr("rec709"));
+        program->requestFrame();
+        QTRY_VERIFY(!viewer->hdrShowing());
+        QTRY_VERIFY(!badge->isVisible());
+        HdrSurface::setTestDisplay(0);
+#endif
+        // The menu's setting decides again.
+        viewer->setHdrViewer(false);
+        panel->setHdrViewer(action->isChecked());
+        QVERIFY(!viewer->hdrShowing());
+        state()->newProject();
     }
 
     void workspaces() {
