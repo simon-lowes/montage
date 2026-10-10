@@ -4,6 +4,7 @@
 
 #include "FieldRecorder.h"
 #include "ImageSequence.h"
+#include "ProResRaw.h"
 #include "Psd.h"
 #include "audio/TimeStretch.h"
 #include "core/Ambisonics.h"
@@ -385,6 +386,13 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         if (const std::string proj = streamProjection(st); !proj.empty()) m.projection = proj;
         if (m.colorSpace == "rec709") m.colorSpace.clear();
         int w = st->codecpar->width, h = st->codecpar->height;
+#ifdef MONTAGE_PRORES_RAW
+        // ProRes RAW is developed to ACEScct (the scene's whole range), at its size less the recommended crop.
+        if (st->codecpar->codec_id == AV_CODEC_ID_PRORES_RAW) {
+            m.colorSpace = "acescct";
+            if (ProResRawInfo info; probeProResRaw(file, info)) w = info.width, h = info.height;
+        }
+#endif
         bool inverted = false;
         m.stereo = stereoLayout(streamStereo(st, inverted, !m.projection.empty()), in);
         stereoEyeSize(m.stereo, w, h);
@@ -489,6 +497,7 @@ void VideoDecoder::close() {
     if (raw_) av_frame_free(&raw_);
     rawSequence_.reset();
     rawFrame_ = -1;
+    proResRaw_ = false;
 }
 
 bool VideoDecoder::open(const std::string& path, std::string* error) {
@@ -601,7 +610,11 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
     }
     AVStream* st = fmt_->streams[stream_];
     still_ = isStillFormat(fmt_);
-    if (!openCodec(hwDecodeMode() == HwDecodeMode::Auto && !still_, error)) {
+#ifdef MONTAGE_PRORES_RAW
+    // ProRes RAW: a Bayer mosaic and its colour, developed here (media/ProResRaw.h), in software.
+    proResRaw_ = st->codecpar->codec_id == AV_CODEC_ID_PRORES_RAW;
+#endif
+    if (!openCodec(hwDecodeMode() == HwDecodeMode::Auto && !still_ && !proResRaw_, error)) {
         close();
         return false;
     }
@@ -618,6 +631,8 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
     duration_ = fmt_->duration > 0 ? double(fmt_->duration) / AV_TIME_BASE : 0;
     rotation_ = streamRotation(st);
     int w = st->codecpar->width, h = st->codecpar->height;
+    // (less its recommended crop, which the first frame says)
+    if (ProResRawInfo info; proResRaw_ && probeProResRaw(uninterpretedPath(path), info)) w = info.width, h = info.height;
     // Stereoscopic footage: one eye is read, the one asked for (the file's right-first packing and Interpret Footage's
     // swap each turn them round).
     bool inverted = false;
@@ -645,6 +660,8 @@ bool VideoDecoder::openCodec(bool tryHardware, std::string* error) {
     ctx_ = avcodec_alloc_context3(codec);
     avcodec_parameters_to_context(ctx_, st->codecpar);
     ctx_->pkt_timebase = st->time_base;
+    // The mosaic whole: its crop is cut after it is developed, on whole 2x2 cells (FFmpeg's would shift the pattern).
+    if (proResRaw_) ctx_->apply_cropping = 0;
     // Hardware: the first device of this platform's list that the codec supports.
     for (const std::string& name : tryHardware ? hwDeviceCandidates() : std::vector<std::string>{}) {
         const AVHWDeviceType type = av_hwdevice_find_type_by_name(name.c_str());
@@ -817,6 +834,13 @@ bool deinterlaceFrame(AVFrame* f) {
 }
 
 Frame16Ptr VideoDecoder::convert(const AVFrame* in, double pts, int w, int h, bool hq) {
+    // ProRes RAW is developed first (RGB48, ACEScct), at half size when it is shown that small.
+    std::unique_ptr<AVFrame, void (*)(AVFrame*)> developed(nullptr, [](AVFrame* fr) { av_frame_free(&fr); });
+    if (proResRaw_) {
+        const int tw = w > 0 ? w : dispW_, th = h > 0 ? h : dispH_;
+        developed.reset(developProResRawFrame(in, rawSettings_, rotation_ % 180 ? th : tw, rotation_ % 180 ? tw : th));
+        if (developed) in = developed.get();
+    }
     // Interlaced pictures are deinterlaced on a copy first, in their own format.
     std::unique_ptr<AVFrame, void (*)(AVFrame*)> deint(nullptr, [](AVFrame* fr) { av_frame_free(&fr); });
     const AVFrame* f = in;

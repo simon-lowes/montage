@@ -76,7 +76,8 @@ I read FFmpeg master at ba987fe (2026-10-10) and the release tags n8.0, n8.1 and
   - The only free one I found is https://samples.ffmpeg.org/ffmpeg-bugs/trac/ticket7887/Filmplusgear-ProRes-RAW-testfiles-6.mov, which is 1,041,311,744 bytes.
   - I checked it with byte-range requests: `aprh`, 4112×2176, 25 fps, 178 frames of about 5.87 MB each, crop 8/8/8/8 (giving 4096×2160), vendor `appl`, version 0, white level 61568.
   - Its header values: wb_red 1.82421875, wb_blue 2.08203125, gain 11.7412, no curve. The matrix rows sum to about (0.95, 1.00, 1.09), which is the D65 white, consistent with an XYZ D65 matrix.
-  - The moov box is at the end of the file. `ffmpeg -i <url> -map 0:v -c copy -frames:v 2 prr.mov` should make a fixture of about 12 MB.
+  - The moov box is at the end of the file. `ffmpeg -i <url> -map 0:v:0 -c copy -frames:v 1 prr.mov` makes a one-frame fixture of 5,876,065 bytes in about 6 seconds; the macOS packaging job does this (cached) for the `proResRawDecode` test rather than keeping a sample of unclear licence in the repository.
+  - Developed with FFmpeg master (October 2026) and media/ProResRaw: FFmpeg reports wb_cct 0 for this file, so temperature changes adapt from D65; the frame's mean scene-linear AP1 is about (0.55, 0.58, 0.64), a bright trade-show stand, and skin and the grey walls come out natural.
 
 ## Implementation implications
 1. **Apple Log 2:** add an Apple Wide Gamut entry (D65 white, xy above) and reuse the existing Apple Log curve. Nothing else is needed.

@@ -52,6 +52,19 @@ jobs:
           scripts/fetch-models.sh ~/montage-models \
             && { echo "MONTAGE_OBJECT_MODEL=$HOME/montage-models/edgetam-video"; echo "MONTAGE_SPEAKER_MODEL=$HOME/montage-models/speakers"; echo "MONTAGE_VISUAL_MODEL=$HOME/montage-models/clip-vit-b32"; echo "MONTAGE_SPEECH_MODEL=$HOME/montage-models/speech-enhance"; echo "MONTAGE_UPSCALE_MODEL=$HOME/montage-models/upscale"; echo "MONTAGE_FACE_MODEL=$HOME/montage-models/faces"; echo "MONTAGE_DEPTH_MODEL=$HOME/montage-models/depth"; echo "MONTAGE_RIFE_MODEL=$HOME/montage-models/rife"; echo "MONTAGE_MATTE_MODEL=$HOME/montage-models/matte"; echo "MONTAGE_TTS_MODEL=$HOME/montage-models/tts"; echo "MONTAGE_INPAINT_MODEL=$HOME/montage-models/inpaint"; echo "MONTAGE_SENTENCE_MODEL=$HOME/montage-models/minilm-qa"; echo "MONTAGE_OCR_MODEL=$HOME/montage-models/ocr"; } >> "$GITHUB_ENV" \
             || echo "::warning::Could not download the AI models; AI model tests will be skipped"
+      - name: Cache the ProRes RAW sample
+        uses: actions/cache@v4
+        with:
+          path: ~/montage-samples
+          key: samples-prores-raw-ticket7887-1
+      - name: ProRes RAW sample for the decode test
+        # The first frame of the ProRes RAW test file on FFmpeg's sample server (its index is at the end of the 1 GB
+        # file, which FFmpeg reads over HTTP without fetching the rest).
+        run: |
+          f="$HOME/montage-samples/prores-raw.mov"
+          { test -s "$f" || { mkdir -p "$HOME/montage-samples" && ffmpeg -nostdin -v error -i https://samples.ffmpeg.org/ffmpeg-bugs/trac/ticket7887/Filmplusgear-ProRes-RAW-testfiles-6.mov -map 0:v:0 -c copy -frames:v 1 -y "$f.part.mov" && mv "$f.part.mov" "$f"; }; } \
+            && echo "MONTAGE_TEST_PRORES_RAW=$f" >> "$GITHUB_ENV" \
+            || echo "::warning::Could not fetch the ProRes RAW sample; its decode test will be skipped"
       - name: Test
         run: ctest --test-dir build --output-on-failure
       - name: Package

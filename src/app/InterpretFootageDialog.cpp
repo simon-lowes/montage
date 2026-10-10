@@ -235,6 +235,11 @@ InterpretFootageDialog::InterpretFootageDialog(const MediaItem& first, int count
     rawForm->addRow(QString(), half_);
     raw_ = isRawMedia(first);
     rawBox->setVisible(raw_);
+    // ProRes RAW clips its highlights at the sensor's white itself (LibRaw's recovery modes are for stills and DNGs).
+    if (first.videoCodec == "prores_raw") {
+        highlights_->setCurrentIndex(0);
+        rawForm->setRowVisible(highlights_, false);
+    }
     lay->addWidget(rawBox);
 
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);

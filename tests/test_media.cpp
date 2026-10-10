@@ -126,6 +126,7 @@
 #include "core/OnScreenText.h"
 #include "render/Processing.h"
 #include "media/CameraRaw.h"
+#include "media/ProResRaw.h"
 #include "core/Slate.h"
 #include "render/PaperEdit.h"
 #include "render/QualityCheck.h"
@@ -1978,6 +1979,184 @@ private slots:
         QCOMPARE(interpretationOf(back.media.at(0)).par, 1.5);  // left as it was
         r = call({{"project", project}, {"media", "hfr.mov"}, {"alpha", "sideways"}});
         QVERIFY(r.value("isError").toBool());
+    }
+
+    void proResRawDevelop() {
+        // A test camera that sees linear Rec. 709 (so its matrix is Rec. 709's to XYZ), its sensor from 256 to 61568.
+        ProResRawColor color;
+        primariesToXyz(Primaries::Bt709, color.camToXyz);
+        const double black = color.black * 65535, white = color.white * 65535;
+        auto code = [&](double v) { return uint16_t(std::lround(black + v * (white - black))); };
+        const int w = 16, h = 12;
+        // Each site's sensor value from the scene's red, green and blue there (RGGB), divided by the white balance.
+        auto mosaic = [&](std::array<double, 3> rgb, double wbRed = 1, double wbBlue = 1) {
+            std::vector<uint16_t> m(size_t(w) * size_t(h));
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x) {
+                    const int c = (y & 1) ? ((x & 1) ? 2 : 1) : ((x & 1) ? 1 : 0);
+                    const double v = c == 0 ? rgb[0] / wbRed : c == 2 ? rgb[2] / wbBlue : rgb[1];
+                    m[size_t(y) * size_t(w) + size_t(x)] = v >= 1 ? 65535 : code(v);
+                }
+            return m;
+        };
+        const int noCrop[4] = {0, 0, 0, 0};
+        auto develop = [&](const std::vector<uint16_t>& m, const ProResRawColor& c, const RawSettings& st, const int crop[4] = nullptr) {
+            DevelopedRaw out;
+            developProResRaw(m.data(), w, h, w, c, st, crop ? crop : noCrop, out);
+            return out;
+        };
+        // A pixel back to linear AP1.
+        auto at = [&](const DevelopedRaw& d, int x, int y) {
+            std::array<double, 3> v{};
+            for (int i = 0; i < 3; ++i) v[size_t(i)] = toLinear(Transfer::AcesCct, d.rgb[(size_t(y) * size_t(d.width) + size_t(x)) * 3 + size_t(i)] / 65535.0);
+            return v;
+        };
+        auto show = [](std::array<double, 3> c) { return QString("%1 %2 %3").arg(c[0]).arg(c[1]).arg(c[2]); };
+        auto near = [](std::array<double, 3> a, std::array<double, 3> b, double tol) {
+            for (int i = 0; i < 3; ++i)
+                if (std::fabs(a[size_t(i)] - b[size_t(i)]) > tol * std::max(1.0, std::fabs(b[size_t(i)]))) return false;
+            return true;
+        };
+        // Grey is grey in ACES (Rec. 709's D65 white adapted to ACES's), at full size and at half.
+        const auto grey = mosaic({0.18, 0.18, 0.18});
+        DevelopedRaw full = develop(grey, color, {});
+        QCOMPARE(full.width, w);
+        QCOMPARE(full.height, h);
+        QVERIFY2(near(at(full, 7, 5), {0.18, 0.18, 0.18}, 0.004), qPrintable(show(at(full, 7, 5))));
+        RawSettings half;
+        half.half = true;
+        DevelopedRaw small = develop(grey, color, half);
+        QCOMPARE(small.width, w / 2);
+        QVERIFY2(near(at(small, 3, 2), {0.18, 0.18, 0.18}, 0.004), qPrintable(show(at(small, 3, 2))));
+        // A colour comes through as AP1 sees it.
+        double toXyz709[9], toXyzAp1[9], fromXyzAp1[9];
+        primariesToXyz(Primaries::Bt709, toXyz709);
+        primariesToXyz(Primaries::Ap1, toXyzAp1);
+        {
+            const double* a = toXyzAp1;
+            const double det = a[0] * (a[4] * a[8] - a[5] * a[7]) - a[1] * (a[3] * a[8] - a[5] * a[6]) + a[2] * (a[3] * a[7] - a[4] * a[6]);
+            const double inv[9] = {a[4] * a[8] - a[5] * a[7], a[2] * a[7] - a[1] * a[8], a[1] * a[5] - a[2] * a[4],
+                                   a[5] * a[6] - a[3] * a[8], a[0] * a[8] - a[2] * a[6], a[2] * a[3] - a[0] * a[5],
+                                   a[3] * a[7] - a[4] * a[6], a[1] * a[6] - a[0] * a[7], a[0] * a[4] - a[1] * a[3]};
+            for (int i = 0; i < 9; ++i) fromXyzAp1[i] = inv[i] / det;
+        }
+        const std::array<double, 3> orange{0.4, 0.2, 0.05};
+        std::array<double, 3> xyz{}, ap1{};
+        for (int r = 0; r < 3; ++r) xyz[size_t(r)] = toXyz709[r * 3] * orange[0] + toXyz709[r * 3 + 1] * orange[1] + toXyz709[r * 3 + 2] * orange[2];
+        for (int r = 0; r < 3; ++r) ap1[size_t(r)] = fromXyzAp1[r * 3] * xyz[0] + fromXyzAp1[r * 3 + 1] * xyz[1] + fromXyzAp1[r * 3 + 2] * xyz[2];
+        QVERIFY2(near(at(develop(mosaic(orange), color, {}), 8, 6), ap1, 0.006), qPrintable(show(at(develop(mosaic(orange), color, {}), 8, 6)) + " / " + show(ap1)));
+        // The white balance as shot: a sensor that saw red and blue weaker is balanced back to grey.
+        ProResRawColor balanced = color;
+        balanced.wbRed = 2, balanced.wbBlue = 1.5;
+        QVERIFY2(near(at(develop(mosaic({0.18, 0.18, 0.18}, 2, 1.5), balanced, {}), 7, 5), {0.18, 0.18, 0.18}, 0.004),
+                 qPrintable(show(at(develop(mosaic({0.18, 0.18, 0.18}, 2, 1.5), balanced, {}), 7, 5))));
+        // Clipped sites go white, not magenta: red past the sensor's white after its balance is held at the white.
+        const auto blown = develop(mosaic({1.0, 1.0, 1.0}, 0.5, 0.5), balanced, {});
+        const auto b = at(blown, 7, 5);
+        QVERIFY2(std::fabs(b[0] - b[1]) < 0.01 * b[1] && std::fabs(b[2] - b[1]) < 0.01 * b[1], qPrintable(show(b)));
+        // Exposure in stops and the camera's gain multiply the light.
+        RawSettings up;
+        up.exposure = 1;
+        QVERIFY2(near(at(develop(grey, color, up), 7, 5), {0.36, 0.36, 0.36}, 0.004), qPrintable(show(at(develop(grey, color, up), 7, 5))));
+        ProResRawColor gained = color;
+        gained.gain = 4;
+        QVERIFY2(near(at(develop(grey, gained, {}), 7, 5), {0.72, 0.72, 0.72}, 0.004), qPrintable(show(at(develop(grey, gained, {}), 7, 5))));
+        // Highlights far above white keep their stops (ACEScct's headroom), and below black is black.
+        gained.gain = 200;
+        QVERIFY2(near(at(develop(grey, gained, {}), 7, 5), {36, 36, 36}, 0.01), qPrintable(show(at(develop(grey, gained, {}), 7, 5))));
+        QVERIFY(at(develop(mosaic({0, 0, 0}), color, {}), 7, 5)[1] < 1e-4);
+        // White balance by the light's temperature: shot at 5600 K and corrected for tungsten goes blue; for shade, warm.
+        ProResRawColor daylight = color;
+        daylight.cct = 5600;
+        RawSettings tungsten, shade, asShot;
+        tungsten.temperature = 3200;
+        shade.temperature = 9000;
+        asShot.temperature = 5600;
+        const auto t = at(develop(grey, daylight, tungsten), 7, 5), sh = at(develop(grey, daylight, shade), 7, 5);
+        const auto same = at(develop(grey, daylight, asShot), 7, 5);
+        QVERIFY2(t[2] > t[0] * 1.3, qPrintable(show(t)));
+        QVERIFY2(sh[0] > sh[2] * 1.05, qPrintable(show(sh)));
+        QVERIFY2(near(same, {0.18, 0.18, 0.18}, 0.004), qPrintable(show(same)));
+        // Tint: plus is magenta (less green).
+        RawSettings magenta;
+        magenta.tint = 60;
+        const auto mg = at(develop(grey, color, magenta), 7, 5);
+        QVERIFY2(mg[1] < mg[0] * 0.9 && mg[1] < mg[2] * 0.9, qPrintable(show(mg)));
+        // The recommended crop is cut on whole 2x2 cells (an odd margin rounds out), at full size and at half.
+        const int crop[4] = {2, 2, 3, 1};
+        int cw = 0, ch = 0;
+        proResRawSize(w, h, crop, false, cw, ch);
+        QCOMPARE(cw, 10);
+        QCOMPARE(ch, 8);
+        proResRawSize(w, h, crop, true, cw, ch);
+        QCOMPARE(cw, 5);
+        QCOMPARE(ch, 4);
+        // (a mosaic whose left two columns and top two rows are a different grey, cut away)
+        auto edged = grey;
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x)
+                if (x < 2 || y < 2) edged[size_t(y) * size_t(w) + size_t(x)] = code(0.9);
+        const DevelopedRaw cropped = develop(edged, color, half, crop);
+        QCOMPARE(cropped.width, 5);
+        QVERIFY2(near(at(cropped, 0, 0), {0.18, 0.18, 0.18}, 0.004), qPrintable(show(at(cropped, 0, 0))));
+        // ProRes RAW media get the RAW controls (when this FFmpeg can develop them).
+        MediaItem m;
+        m.path = "clip.mov";
+        m.videoCodec = "prores_raw";
+        QCOMPARE(isRawMedia(m), proResRawAvailable());
+    }
+
+    void proResRawDecode() {
+        // A real ProRes RAW file (the CI's macOS job fetches one; FFmpeg 9 or later is needed for its colour).
+        const QString file = qEnvironmentVariable("MONTAGE_TEST_PRORES_RAW");
+        if (!proResRawAvailable()) QSKIP("Built with an FFmpeg without ProRes RAW's colour parameters (FFmpeg 9 or later)");
+        if (file.isEmpty() || !QFileInfo::exists(file)) QSKIP("Set MONTAGE_TEST_PRORES_RAW to a ProRes RAW .mov to run this test");
+        const std::string clip = file.toStdString();
+        Project p;
+        MediaItem m = probeOrFail(p, clip);
+        p.media.push_back(m);
+        QCOMPARE(m.videoCodec, std::string("prores_raw"));
+        QCOMPARE(m.colorSpace, std::string("acescct"));
+        QVERIFY(isRawMedia(m));
+        ProResRawInfo info;
+        std::string err;
+        QVERIFY2(probeProResRaw(clip, info, &err), err.c_str());
+        QCOMPARE(m.width, info.width);
+        QCOMPARE(m.height, info.height);
+        QVERIFY(info.color.gain > 0 && info.color.white > info.color.black);
+        // Decoded, developed and cropped: the picture's own size, its colours not the mosaic's green.
+        auto mean = [](const Frame16& f) {
+            std::array<double, 3> s{};
+            for (size_t i = 0; i < f.px.size(); i += 4)
+                for (int c = 0; c < 3; ++c) s[size_t(c)] += f.px[i + size_t(c)] / 65535.0;
+            const double n = double(f.px.size() / 4);
+            return std::array<double, 3>{s[0] / n, s[1] / n, s[2] / n};
+        };
+        auto show = [](std::array<double, 3> c) { return QString("%1 %2 %3").arg(c[0]).arg(c[1]).arg(c[2]); };
+        VideoDecoder dec;
+        QVERIFY2(dec.open(clip, &err), err.c_str());
+        QVERIFY(dec.hardware().empty());
+        QCOMPARE(dec.displayWidth(), info.width);
+        Frame16Ptr f = dec.frameAt(0, 0, 0, true);
+        QVERIFY(f && f->width == info.width && f->height == info.height);
+        const auto base = mean(*f);
+        QVERIFY2(base[1] > 0.2 && base[1] < 0.8, qPrintable(show(base)));
+        QVERIFY2(std::fabs(base[1] - base[0]) < 0.1 && std::fabs(base[1] - base[2]) < 0.1, qPrintable(show(base)));
+        // Shown small: developed at half size, looking the same.
+        Frame16Ptr small = dec.frameAt(0, info.width / 4, info.height / 4, false);
+        QVERIFY(small && small->width == info.width / 4);
+        const auto smallMean = mean(*small);
+        QVERIFY2(std::fabs(smallMean[1] - base[1]) < 0.02, qPrintable(show(smallMean)));
+        // Interpret Footage's RAW controls: a stop up is 1/17.52 higher in ACEScct.
+        Interpretation up;
+        up.rawExposure = 1;
+        VideoDecoder brighter;
+        QVERIFY2(brighter.open(interpretedPath(clip, up), &err), err.c_str());
+        Frame16Ptr bf = brighter.frameAt(0, info.width / 4, info.height / 4, false);
+        QVERIFY(bf);
+        const auto upMean = mean(*bf);
+        QVERIFY2(upMean[1] > smallMean[1] + 0.03, qPrintable(show(smallMean) + " / " + show(upMean)));
+        QVERIFY(edit::interpretFootage(p, m.id, up).ok);
     }
 
     void cameraRawSettingsAndCinemaDng() {

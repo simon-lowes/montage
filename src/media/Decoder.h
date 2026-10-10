@@ -116,6 +116,7 @@ private:
     std::unique_ptr<ImageSequence> rawSequence_;  // a run of camera raw frames (media/ImageSequence.h)
     int rawFrame_ = -1;                       // the run's frame in raw_
     RawSettings rawSettings_;                 // how raw pictures are developed (Interpret Footage)
+    bool proResRaw_ = false;                  // ProRes RAW: each frame's mosaic developed (media/ProResRaw.h)
     bool loadRaw(const RawImage& img, std::string* error);
 };
 
