@@ -4371,7 +4371,8 @@ private slots:
         for (size_t i = 1; i < blocks.size(); ++i) {
             QVERIFY2(std::fabs(seconds(blocks[i].rtime) - seconds(blocks[i - 1].rtime) - seconds(blocks[i - 1].duration)) < 1e-9,
                      qPrintable(QString::number(i)));
-            QVERIFY(blocks[i].x >= blocks[i - 1].x - 1e-9);  // always turning right
+            // Always turning right (the path is a chord, so X alone dips as it passes nearer the middle).
+            QVERIFY(std::atan2(blocks[i].x, blocks[i].y) >= std::atan2(blocks[i - 1].x, blocks[i - 1].y) - 1e-9);
         }
         QVERIFY(std::fabs(seconds(blocks.back().rtime) + seconds(blocks.back().duration) - 2.0) < 1e-4);
         QVERIFY(info.axml.find("jumpPosition") == std::string::npos);
@@ -4403,7 +4404,7 @@ private slots:
             const std::vector<Blk> back = blocksOf(info.axml, "AC_00031001");
             QVERIFY(back.size() >= 2);
             for (const Blk& b : back) QVERIFY2(b.y < -0.9, qPrintable(QString::number(b.y)));
-            QVERIFY(back.front().x < 0 && back.back().x > 0);
+            QVERIFY(back.front().x > 0 && back.back().x < 0);  // from behind on the right to behind on the left
         }
 
         // EBU's renderer (ear), when there is one, hears the object start on the left and end on the right.
