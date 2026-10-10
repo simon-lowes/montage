@@ -129,12 +129,12 @@ bool exportStems(const Project& p, const Sequence& seq, const ExportSettings& s,
 // in use (StemsByTrack or StemsByRole), each named for it and in the language of the sequence's first caption track.
 std::vector<ExportSettings::AudioStream> stemStreams(const Sequence& seq, int groups);
 
-// The most channels audio encoder `codec` takes (FFmpeg's): PCM 64, AAC, FLAC, ALAC, Opus and Vorbis 8, AC-3 and E-AC-3
-// 6, MP3 and MP2 2.
-int maxAudioChannels(const std::string& codec);
-// The layout an export in `codec` carries for a sequence mixed in `layout`: the layout when the codec holds its
-// channels, else its ear-level fold (an immersive mix's heights folded into 5.1 or 7.1), else 5.1, else stereo.
-// Exports mix in that layout; the export summary says when channels fold.
+// Whether audio encoder `codec` opens with a sequence layout's channels (FFmpeg's layout for it).
+bool exportCodecCarries(const std::string& codec, const std::string& layout);
+// The layout an export in `codec` carries for a sequence mixed in `layout`: the layout when the codec takes it, else
+// its ear-level fold (an immersive mix's heights folded into 5.1 or 7.1), else 5.1, else stereo (the mix's stereo
+// fold-down, as ExportSettings::downmixStereo gives). exportSequence mixes in that layout unless the export has mono
+// tracks; the export dialog's summary says when channels fold.
 std::string exportAudioLayout(const std::string& layout, const std::string& codec);
 
 // HDR exports measure their light levels as they render (`light`, when given); PQ files to MP4 and MOV carry the

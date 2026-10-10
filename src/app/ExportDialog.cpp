@@ -558,16 +558,17 @@ void ExportDialog::updateSummary() {
     if (hasAudio(s)) {
         int rate = s.sampleRate > 0 ? s.sampleRate : seq->sampleRate;
         if (s.audioCodec == "libopus") rate = 48000;  // Opus always encodes at 48 kHz
-        // The mix's layout, folded where the codec has fewer channels than the sequence (an immersive mix in AAC).
+        // The mix's layout: stereo when folded, else the sequence's, or what the codec can carry of it (an immersive mix
+        // in AAC folds its heights into 7.1).
         const bool fold = audioOut_ && !audioOut_->isHidden() && audioOut_->currentIndex() == 1;
-        const std::string layout = fold ? std::string("stereo") : exportAudioLayout(seq->audioLayout, s.audioCodec);
+        const std::string layout = fold                      ? std::string("stereo")
+                                   : s.monoAudioTracks > 0 ? seq->audioLayout
+                                                           : exportAudioLayout(seq->audioLayout, s.audioCodec);
         QString line = tr("Audio: %1, %2 kHz %3").arg(audioCodecName(s), QString::number(rate / 1000.0, 'g', 4), QString::fromStdString(layout));
         if (!fold && layout != seq->audioLayout)
-            line += tr(" (%1 carries %2 channels at most: the %3 mix folds down; WAV or MOV PCM, or File › Export ADM Master, keep "
+            line += tr(" (%1 cannot carry %2: the mix folds down; WAV, MOV with PCM, or File › Export Immersive Master keep "
                        "every channel)")
-                        .arg(audioCodecName(s))
-                        .arg(maxAudioChannels(s.audioCodec))
-                        .arg(QString::fromStdString(seq->audioLayout));
+                        .arg(audioCodecName(s), QString::fromStdString(seq->audioLayout));
         lines << line;
     } else {
         lines << tr("Audio: none");

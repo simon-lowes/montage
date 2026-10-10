@@ -20,6 +20,7 @@
 #include <QFile>
 #include <random>
 #include <complex>
+#include <tuple>
 #include <sstream>
 #include <cstdio>
 
@@ -4270,13 +4271,30 @@ private slots:
                 info.chna[0].pack == "AP_00010017");
         QVERIFY(info.chna[8].trackFormat == "AT_00010022_01");  // Ltf, U+045
         QVERIFY(info.chna[12].trackFormat == "AT_00031001_01" && info.chna[12].pack == "AP_00031001");
-        // The object where the panner puts it, in polar coordinates: 45° right (ADM's azimuth counts to the left), raised to
-        // the overhead speakers.
+        // The object where the panner puts it, in ADM's cartesian space by BS.2127's mapping (the one renderers undo): 45°
+        // to the right is on the right wall, a little in front of its middle; overhead is the top of the room.
         for (const char* want : {"audioProgrammeName=\"Immersive test\"", "audioPackFormatIDRef>AP_00010017<", "typeDefinition=\"Objects\"",
-                                 "audioObjectName=\"A2\"", "coordinate=\"azimuth\">-45.000000<", "coordinate=\"elevation\">30.000000<",
-                                 "coordinate=\"distance\">1.000000<", "duration=\"00:00:02.00000\""})
+                                 "audioObjectName=\"A2\"", "<cartesian>1</cartesian>", "coordinate=\"X\">1.000000<",
+                                 "coordinate=\"Y\">0.645822<", "coordinate=\"Z\">1.000000<", "duration=\"00:00:02.00000\""})
             QVERIFY2(info.axml.find(want) != std::string::npos, want);
-        QVERIFY(info.axml.find("<cartesian>1</cartesian>") == std::string::npos);
+        // A speaker's angle lands on that speaker's corner of the square: 30° right at ear level at the front right
+        // corner, 110° left at the back left one, straight ahead in the middle of the front wall. Height is Z whatever the
+        // distance, as the mix crossfades the layers: in the middle overhead is the middle of the ceiling.
+        for (const auto& [x, y, z, want] : {std::tuple{0.5, std::sqrt(0.75), 0.0, "1.000000 1.000000 0.000000"},
+                                            std::tuple{-std::sin(110 * M_PI / 180), std::cos(110 * M_PI / 180), 0.0, "-1.000000 -1.000000 0.000000"},
+                                            std::tuple{0.0, 1.0, 0.0, "0.000000 1.000000 0.000000"},
+                                            std::tuple{0.0, 0.0, 1.0, "0.000000 0.000000 1.000000"},
+                                            std::tuple{0.0, 0.5, 1.0, "0.000000 0.500000 1.000000"}}) {
+            Sequence at = s;
+            at.audioTracks[1].surround.x = x, at.audioTracks[1].surround.y = y, at.audioTracks[1].surround.z = z;
+            QVERIFY(exportAdmBwf(p, at, st, path("corner.wav"), &r, {}, &err) && readBwfInfo(path("corner.wav"), info));
+            const QStringList xyz = QString(want).split(' ');
+            for (int c = 0; c < 3; ++c) {
+                const std::string pos = QString("coordinate=\"%1\">%2<").arg(QChar("XYZ"[c])).arg(xyz[c]).toStdString();
+                QVERIFY2(info.axml.find(pos) != std::string::npos, pos.c_str());
+            }
+        }
+        QVERIFY(readBwfInfo(adm, info));
         // In the file: the 440 in the bed's L, nothing of the 1 kHz in the bed, the 1 kHz as the object at the level it has
         // at a speaker.
         auto fileRms = [&](const std::string& file, std::vector<double>& out) {
@@ -4363,13 +4381,20 @@ private slots:
             QVERIFY(exportAdmBwf(p, solo, st, path("solo2.wav"), &r, {}, &err) && r.objects == 0);
             QVERIFY(fileRms(path("solo2.wav"), ch) && std::fabs(ch[0] - atSpeaker) < 0.01);
         }
-        // Codecs with fewer channels fold the heights down (AAC carries 7.1 at most); PCM keeps them all.
+        // Codecs that cannot carry the overhead channels fold them down instead of failing or turning into stereo:
+        // AAC and FLAC to the ear-level 7.1 or 5.1, AC-3 to 5.1, MP3 to stereo; PCM keeps them all.
         QCOMPARE(exportAudioLayout("7.1.4", "aac"), std::string("7.1"));
         QCOMPARE(exportAudioLayout("5.1.4", "flac"), std::string("5.1"));
         QCOMPARE(exportAudioLayout("7.1.4", "pcm_s24le"), std::string("7.1.4"));
         QCOMPARE(exportAudioLayout("7.1", "ac3"), std::string("5.1"));
         QCOMPARE(exportAudioLayout("5.1", "libmp3lame"), std::string("stereo"));
         QCOMPARE(exportAudioLayout("5.1.2", ""), std::string("5.1.2"));
+        for (const char* layout : {"5.1.2", "5.1.4", "7.1.2", "7.1.4"})
+            for (const char* codec : {"aac", "flac"}) {
+                // Whatever the layout folds to, the encoder takes it.
+                const std::string carried = exportAudioLayout(layout, codec);
+                QVERIFY2(exportCodecCarries(codec, carried), qPrintable(QString("%1 %2 -> %3").arg(codec, layout).arg(QString::fromStdString(carried))));
+            }
         {
             ExportSettings aac = findExportPreset("Audio - AAC (M4A)")->settings;
             aac.path = path("mix714.m4a");
@@ -4377,6 +4402,67 @@ private slots:
             MediaItem folded;
             QVERIFY(probeMedia(aac.path, folded));
             QCOMPARE(folded.channels, 8);
+            // 5.1.2 has eight channels, but FFmpeg's AAC refuses its layout: it folds to 5.1 rather than failing.
+            Sequence fiveTwo = s;
+            fiveTwo.audioLayout = "5.1.2";
+            aac.path = path("mix512.m4a");
+            QVERIFY2(exportSequence(p, fiveTwo, aac, nullptr, nullptr, &err), err.c_str());
+            QVERIFY(probeMedia(aac.path, folded));
+            QCOMPARE(folded.channels, 6);
+        }
+        {
+            ExportSettings flac;
+            flac.path = path("mix514.mkv");
+            flac.videoCodec = "none";
+            flac.audioCodec = "flac";
+            Sequence five = s;
+            five.audioLayout = "5.1.4";
+            QVERIFY2(exportSequence(p, five, flac, nullptr, nullptr, &err), err.c_str());
+            MediaItem folded;
+            QVERIFY(probeMedia(flac.path, folded));
+            QCOMPARE(folded.channels, 6);
+        }
+        // Down to stereo it is the fold-down of the whole mix: MP3's two channels have the front-left tone on the left.
+        {
+            ExportSettings mp3;
+            mp3.path = path("mix714.mp3");
+            mp3.videoCodec = "none";
+            mp3.audioCodec = "libmp3lame";
+            QVERIFY2(exportSequence(p, s, mp3, nullptr, nullptr, &err), err.c_str());
+            const std::vector<float> two = decodeAudioStream(mp3.path, 0);
+            const double left = toneLevel(two, 0, 440, 4800, 48000), right = toneLevel(two, 1, 440, 4800, 48000);
+            QVERIFY2(left > 0.1 && right < 0.1 * left, qPrintable(QString("%1 %2").arg(left).arg(right)));
+        }
+        // Mono tracks carry a channel each, so nothing folds: twelve AAC tracks for 7.1.4, the last two the rear heights.
+        {
+            ExportSettings monos;
+            monos.path = path("monos714.mkv");
+            monos.videoCodec = "none";
+            monos.audioCodec = "aac";
+            monos.audioName = "Mix";
+            monos.monoAudioTracks = 12;
+            QVERIFY2(exportSequence(p, s, monos, nullptr, nullptr, &err), err.c_str());
+            std::string title;
+            QVERIFY(!decodeAudioStream(monos.path, 11, &title).empty());
+            QCOMPARE(title, std::string("Mix Rtr"));
+        }
+        // Mono tracks are named for their speakers in FFmpeg's channel order: 7.1's fifth and sixth are the back pair.
+        {
+            Sequence seven = s;
+            seven.audioLayout = "7.1";
+            ExportSettings monos;
+            monos.path = path("monos71.mkv");
+            monos.videoCodec = "none";
+            monos.audioCodec = "pcm_s24le";
+            monos.audioName = "Mix";
+            monos.monoAudioTracks = 8;
+            QVERIFY2(exportSequence(p, seven, monos, nullptr, nullptr, &err), err.c_str());
+            const char* const names[8] = {"L", "R", "C", "LFE", "Lb", "Rb", "Ls", "Rs"};
+            for (int i = 0; i < 8; ++i) {
+                std::string title;
+                decodeAudioStream(monos.path, i, &title);
+                QCOMPARE(title, std::string("Mix ") + names[i]);
+            }
         }
         // 7.1.2 has a pack of its own (Dolby's bed, its pair overhead at the sides); stereo uses BS.2094's.
         Sequence atmos = s;

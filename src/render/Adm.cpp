@@ -3,6 +3,7 @@
 #include <QFile>
 #include <QXmlStreamWriter>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -60,6 +61,37 @@ uint64_t get64(const uint8_t* p) { return uint64_t(get32(p)) | (uint64_t(get32(p
 struct Channel {
     std::string uid, trackFormat, pack;
 };
+
+// ITU-R BS.2127's polar to cartesian mapping (section 10.1) at ear level, the one ADM renderers apply to cartesian
+// objects: the loudspeakers M+000, M-030, M-110, M+110 and M+030 sit on the corners and edges of the square, so a
+// position at a speaker's angle lands where a renderer puts that speaker. `azimuth` in degrees, positive to the left as
+// ADM counts it; X and Y scaled by `distance`.
+std::array<double, 2> polarToCartesian(double azimuth, double distance) {
+    constexpr double kDeg = M_PI / 180;
+    // The sectors between neighbouring loudspeakers, anticlockwise: azimuth and position on the square.
+    struct Corner {
+        double az, x, y;
+    };
+    static const Corner corners[5] = {{0, 0, 1}, {-30, 1, 1}, {-110, 1, -1}, {110, -1, -1}, {30, -1, 1}};
+    // An angle unwrapped to lie at or past `base` (by less than a turn).
+    auto from = [](double base, double a) {
+        while (a - 360 >= base) a -= 360;
+        while (a < base) a += 360;
+        return a;
+    };
+    for (int i = 0; i < 5; ++i) {
+        const Corner& left = corners[i];
+        const Corner& right = corners[(i + 1) % 5];
+        const double rightAz = right.az, leftAz = from(rightAz, left.az), az = from(rightAz, azimuth);
+        if (az > leftAz) continue;
+        // Equal-tangent panning between the two corners, then the constant-power gain's angle as a fraction.
+        const double mid = (leftAz + rightAz) / 2, half = rightAz - mid;
+        const double gainR = 0.5 + 0.5 * std::tan((az - mid) * kDeg) / std::tan(half * kDeg);
+        const double t = std::atan2(gainR, 1 - gainR) * 2 / M_PI;
+        return {distance * (left.x + (right.x - left.x) * t), distance * (left.y + (right.y - left.y) * t)};
+    }
+    return {0, distance};  // not reached: the sectors cover the circle
+}
 
 }  // namespace
 
@@ -315,18 +347,20 @@ bool exportAdmBwf(const Project& p, const Sequence& s, const AdmSettings& settin
             x.writeAttribute("audioBlockFormatID", "AB_0003" + hex + "_00000001");
             x.writeAttribute("rtime", admTime(0));
             x.writeAttribute("duration", duration);
-            // Polar, as the panner places it: its angle round the room (ADM counts azimuth positive to the left), up to
-            // the overhead speakers' elevation as far as it is raised (in layouts that have them), and its distance.
+            x.writeTextElement("cartesian", "1");
+            // Where the panner puts it: its angle and distance round the room into ADM's cartesian square by BS.2127's
+            // mapping, and its height as Z (0 at the ear, 1 overhead, in layouts with overhead speakers), which renderers
+            // crossfade between the layers at constant power as the mix does, whatever the distance.
             const SurroundPan& sp = tr.surround;
-            const double azimuth = -std::atan2(sp.x, sp.y) * 180 / M_PI;
-            const double distance = std::min(1.0, std::hypot(sp.x, sp.y));
-            double top = 0;
-            for (const Speaker& k : layoutSpeakers(layout)) top = std::max(top, k.elevation);
-            const double elevation = std::clamp(sp.z, 0.0, 1.0) * top;
-            for (auto [coord, v] : {std::pair<const char*, double>{"azimuth", azimuth}, {"elevation", elevation}, {"distance", distance}}) {
+            const bool overhead = std::any_of(layoutSpeakers(layout).begin(), layoutSpeakers(layout).end(),
+                                              [](const Speaker& k) { return k.elevation > 0; });
+            const std::array<double, 2> xy = polarToCartesian(-std::atan2(sp.x, sp.y) * 180 / M_PI, std::min(1.0, std::hypot(sp.x, sp.y)));
+            const double pos[3] = {xy[0], xy[1], overhead ? std::clamp(sp.z, 0.0, 1.0) : 0.0};
+            const char* const coords[3] = {"X", "Y", "Z"};
+            for (int c = 0; c < 3; ++c) {
                 x.writeStartElement("position");
-                x.writeAttribute("coordinate", coord);
-                x.writeCharacters(number(std::abs(v) < 5e-7 ? 0.0 : v));
+                x.writeAttribute("coordinate", coords[c]);
+                x.writeCharacters(number(std::abs(pos[c]) < 5e-7 ? 0.0 : std::clamp(pos[c], -1.0, 1.0)));
                 x.writeEndElement();
             }
             x.writeEndElement();  // audioBlockFormat
