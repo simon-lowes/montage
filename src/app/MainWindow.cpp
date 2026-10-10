@@ -94,6 +94,7 @@
 #include "ScriptCutDialog.h"
 #include "QualityCheckDialog.h"
 #include "OffloadDialog.h"
+#include "core/AafImport.h"
 #include "ProjectManagerDialog.h"
 #include "LinkMediaDialog.h"
 #include "EffectPresetStore.h"
@@ -728,7 +729,7 @@ void MainWindow::buildMenus() {
     add(file, tr("&Link Media…"), QKeySequence(), [this] { showLinkMedia(); })->setObjectName(QStringLiteral("linkMediaAction"));
     add(file, tr("Export &Frame…"), QKeySequence("Ctrl+Shift+E"), [this] { exportFrame(); });
     add(file, tr("Export &VFX Pulls…"), QKeySequence(), [this] { vfxPullDialog(); })->setObjectName(QStringLiteral("vfxPulls"));
-    add(file, tr("&Import Timeline (FCP XML, FCPXML, OTIO, EDL)…"), QKeySequence(), [this] { importTimeline(); });
+    add(file, tr("&Import Timeline (FCP XML, FCPXML, OTIO, EDL, AAF)…"), QKeySequence(), [this] { importTimeline(); });
     add(file, tr("Export Final Cut Pro &7 XML (Premiere, Resolve)…"), QKeySequence(), [this] { exportInterchange(Interchange::Fcp7Xml); });
     add(file, tr("Export &FCPXML (Final Cut Pro)…"), QKeySequence(), [this] { exportInterchange(Interchange::FcpXml); });
     add(file, tr("Export E&DL (CMX 3600)…"), QKeySequence(), [this] { exportInterchange(Interchange::Edl); });
@@ -5768,8 +5769,9 @@ void MainWindow::exportAafDialog() {
 void MainWindow::importTimeline() {
     QSettings st = appSettings();
     QString path = QFileDialog::getOpenFileName(this, tr("Import Timeline"), st.value("lastImportTimelineDir").toString(),
-                                                tr("Timelines (*.xml *.fcpxml *.otio *.edl);;Final Cut Pro 7 XML (*.xml);;"
-                                                   "FCPXML (*.fcpxml);;OpenTimelineIO (*.otio);;CMX 3600 EDL (*.edl)"));
+                                                tr("Timelines (*.xml *.fcpxml *.otio *.edl *.aaf);;Final Cut Pro 7 XML (*.xml);;"
+                                                   "FCPXML (*.fcpxml);;OpenTimelineIO (*.otio);;CMX 3600 EDL (*.edl);;"
+                                                   "AAF (Media Composer, Pro Tools) (*.aaf)"));
     if (path.isEmpty()) return;
     if (QFileInfo(path).isDir()) path += "/Info.fcpxml";  // an .fcpxmld bundle
     QFile f(path);
@@ -5778,7 +5780,8 @@ void MainWindow::importTimeline() {
         return;
     }
     st.setValue("lastImportTimelineDir", QFileInfo(path).absolutePath());
-    const std::string text = f.readAll().toStdString();
+    const QString suffix = QFileInfo(path).suffix().toLower();
+    const std::string text = suffix == QLatin1String("aaf") ? std::string() : f.readAll().toStdString();
     const MediaProber prober = [](const std::string& file, MediaItem& m) { return probeMedia(file, m, nullptr); };
     const QString ext = QFileInfo(path).suffix().toLower();
     // EDLs do not say their rate: take the open sequence's.
@@ -5787,7 +5790,8 @@ void MainWindow::importTimeline() {
     ImportResult r;
     QApplication::setOverrideCursor(Qt::WaitCursor);
     state_->edit(tr("Import Timeline"), [&](Project& p, Sequence&) {
-        r = ext == "edl"                      ? importEdl(p, text, fps, prober, dir)
+        r = ext == "aaf"                      ? importAaf(p, path.toStdString(), prober)
+            : ext == "edl"                    ? importEdl(p, text, fps, prober, dir)
             : ext == "xml" || ext == "fcpxml" ? importXmlTimeline(p, text, prober)
                                               : importOtio(p, text, prober);
         return r.ok;

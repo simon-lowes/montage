@@ -53,6 +53,7 @@
 #include "media/HwAccel.h"
 #include "media/Loudness.h"
 #include "media/Offload.h"
+#include "core/AafImport.h"
 #include "media/MediaPool.h"
 #include "media/Relink.h"
 #include "media/SpeakerSwitch.h"
@@ -5765,6 +5766,122 @@ private slots:
         QCOMPARE(back.active()->audioTracks[0].clips[0].effects.at(0).type, std::string("bleep"));
     }
 
+    void aafImportFromMediaComposer() {
+        // An AAF laid out as Media Composer writes one (pyaaf2, AMA-linked to a movie with picture and stereo sound).
+        const QByteArray python = qgetenv("MONTAGE_TEST_PYAAF2");
+        if (python.isEmpty() || QStandardPaths::findExecutable("ffprobe").isEmpty()) QSKIP("needs pyaaf2 (MONTAGE_TEST_PYAAF2) and ffprobe");
+        const int rate = 48000;
+        const std::string tone = path("mc-stereo.wav");
+        {
+            std::vector<float> l(size_t(rate) * 6), r(size_t(rate) * 6);
+            for (size_t i = 0; i < l.size(); ++i) {
+                l[i] = float(0.3 * std::sin(2 * M_PI * 440 * double(i) / rate));
+                r[i] = float(0.3 * std::sin(2 * M_PI * 660 * double(i) / rate));
+            }
+            QFile f(QString::fromStdString(tone));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            QByteArray data;
+            QDataStream out(&data, QIODevice::WriteOnly);
+            out.setByteOrder(QDataStream::LittleEndian);
+            const quint32 frames = quint32(l.size());
+            out.writeRawData("RIFF", 4);
+            out << quint32(36 + frames * 4);
+            out.writeRawData("WAVEfmt ", 8);
+            out << quint32(16) << quint16(1) << quint16(2) << quint32(rate) << quint32(rate * 4) << quint16(4) << quint16(16);
+            out.writeRawData("data", 4);
+            out << quint32(frames * 4);
+            for (size_t i = 0; i < l.size(); ++i) out << qint16(std::lround(l[i] * 32767)) << qint16(std::lround(r[i] * 32767));
+            f.write(data);
+        }
+        Project src = makeDefaultProject();
+        Sequence& ss = *src.active();
+        ss.fps = {25, 1};
+        ss.width = 320, ss.height = 240;
+        src.media.push_back(probeOrFail(src, tone));
+        Clip color = makeGeneratorClip(src, "color", 150);
+        edit::overwrite(src, ss, {TrackKind::Video, 0}, color);
+        QVERIFY(edit::placeMedia(src, ss, src.media[0].id, 0, 0, -1, {TrackKind::Video, -1}, {TrackKind::Audio, 0}, false).ok);
+        ExportSettings st = findExportPreset("H.264 - High Quality")->settings;
+        st.path = path("mc-movie.mp4");
+        st.preset = "ultrafast";
+        std::string err;
+        QVERIFY2(exportSequence(src, ss, st, nullptr, nullptr, &err), err.c_str());
+        const QString aaf = QString::fromStdString(path("scene4.aaf"));
+        QProcess py;
+        py.start(QString::fromLocal8Bit(python), {"-I", QStringLiteral(MONTAGE_TEST_TOOLS_DIR "/make_aaf.py"), aaf, QString::fromStdString(st.path)});
+        QVERIFY(py.waitForFinished(120000));
+        QVERIFY2(py.exitCode() == 0, py.readAllStandardError().constData());
+
+        Project p = makeDefaultProject();
+        const ImportResult r = importAaf(p, aaf.toStdString(), [](const std::string& f, MediaItem& m) { return probeMedia(f, m); });
+        QVERIFY2(r.ok, r.error.c_str());
+        QVERIFY2(r.offline.empty(), r.offline.empty() ? "" : r.offline[0].c_str());
+        const Sequence& s = *p.findSequence(r.sequence);
+        QCOMPARE(s.name, std::string("Scene 4 Cut"));
+        QCOMPARE(s.fps, Rational(25, 1));
+        QCOMPARE(p.activeSequence, r.sequence);
+        // The picture: the filler as a gap, then the two clips meeting at the dissolve's cut (halfway through it).
+        QCOMPARE(s.videoTracks.size(), size_t(1));
+        const auto& v = s.videoTracks[0].clips;
+        QCOMPARE(v.size(), size_t(2));
+        QVERIFY2(v[0].start == 10 && v[0].duration == 35 && std::fabs(v[0].sourceIn - 5) < 0.01,
+                 qPrintable(QString("%1 %2 %3").arg(v[0].start).arg(v[0].duration).arg(v[0].sourceIn)));
+        QVERIFY2(v[1].start == 45 && v[1].duration == 25 && std::fabs(v[1].sourceIn - 65) < 0.01,
+                 qPrintable(QString("%1 %2 %3").arg(v[1].start).arg(v[1].duration).arg(v[1].sourceIn)));
+        QCOMPARE(s.videoTracks[0].transitions.size(), size_t(1));
+        QCOMPARE(s.videoTracks[0].transitions[0].duration, FrameTime(10));
+        QCOMPARE(s.videoTracks[0].transitions[0].type, std::string("cross_dissolve"));
+        // The movie, found through the master mob and its file mob's locator; each sound track one of its channels.
+        const MediaItem* movie = p.findMedia(v[0].mediaId);
+        QVERIFY(movie && movie->path == st.path && movie->hasVideo && movie->hasAudio);
+        QCOMPARE(s.audioTracks.size(), size_t(2));
+        for (int k = 0; k < 2; ++k) {
+            const auto& a = s.audioTracks[size_t(k)].clips;
+            QCOMPARE(a.size(), size_t(1));
+            QVERIFY(a[0].start == 10 && a[0].duration == 40 && std::fabs(a[0].sourceIn - 5) < 0.01);
+            QCOMPARE(a[0].mediaId, movie->id);
+            QCOMPARE(a[0].channels, std::vector<int>{k});
+        }
+        // The second channel's Audio Gain (0.5) as clip gain; the marker.
+        QVERIFY(std::fabs(s.audioTracks[1].clips[0].audio.p("gain_db", 0) - 20 * std::log10(0.5)) < 0.01);
+        QVERIFY(!s.audioTracks[0].clips[0].audio.params.count("gain_db") || std::fabs(s.audioTracks[0].clips[0].audio.p("gain_db", 0)) < 1e-6);
+        QCOMPARE(s.markers.size(), size_t(1));
+        QCOMPARE(s.markers[0].t, FrameTime(20));
+        QCOMPARE(s.markers[0].name, std::string("Check focus"));
+        // Its media moved beside the AAF: found there.
+        const QString moved = QString::fromStdString(path("moved"));
+        QVERIFY(QDir().mkpath(moved + "/Media"));
+        QVERIFY(QFile::copy(aaf, moved + "/scene4.aaf"));
+        QVERIFY(QFile::rename(QString::fromStdString(st.path), moved + "/Media/mc-movie.mp4"));
+        Project p2 = makeDefaultProject();
+        const ImportResult r2 = importAaf(p2, (moved + "/scene4.aaf").toStdString(), [](const std::string& f, MediaItem& m) { return probeMedia(f, m); });
+        QVERIFY(r2.ok && r2.offline.empty());
+        QVERIFY(QString::fromStdString(p2.findMedia(p2.findSequence(r2.sequence)->videoTracks[0].clips[0].mediaId)->path).endsWith("moved/Media/mc-movie.mp4"));
+        // Missing altogether: offline, with its name and length kept.
+        QVERIFY(QFile::remove(moved + "/Media/mc-movie.mp4"));
+        Project p3 = makeDefaultProject();
+        const ImportResult r3 = importAaf(p3, (moved + "/scene4.aaf").toStdString(), [](const std::string& f, MediaItem& m) { return probeMedia(f, m); });
+        QVERIFY(r3.ok && r3.offline.size() == 1);
+        QCOMPARE(p3.findSequence(r3.sequence)->videoTracks[0].clips.size(), size_t(2));
+        // Through MCP's import.
+        {
+            McpServer server;
+            const QString project = QString::fromStdString(path("from-aaf.montage"));
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_import_timeline"},
+                                                         {"arguments", QJsonObject{{"input", aaf}, {"project", project}}},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            const QJsonObject res = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+            QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+            Project back;
+            QVERIFY(loadProject(project.toStdString(), back));
+            QCOMPARE(back.active()->name, std::string("Scene 4 Cut"));
+        }
+        QVERIFY(!importAaf(p3, path("not-an.aaf")).ok);
+    }
+
     void aafExportForAudioPost() {
         // Mono speech (JFK) and a stereo tone, at 25 fps.
         const int rate = 48000;
@@ -5926,6 +6043,32 @@ private slots:
             QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
             QCOMPARE(res.value("structuredContent").toObject().value("crossfades").toInt(), 1);
             QVERIFY(QFileInfo::exists(QString::fromStdString(path("mcp Media/jfk.wav"))));
+        }
+
+        // Read back by Montage's AAF import: the same clips, places, source offsets, crossfade and gain.
+        {
+            Project in = makeDefaultProject();
+            const ImportResult r = importAaf(in, aaf, [](const std::string& f, MediaItem& m) { return probeMedia(f, m); });
+            QVERIFY2(r.ok, r.error.c_str());
+            QVERIFY2(r.offline.empty(), r.offline.empty() ? "" : r.offline[0].c_str());
+            const Sequence& rs = *in.findSequence(r.sequence);
+            QCOMPARE(rs.name, std::string("Reel 1"));
+            QCOMPARE(rs.fps, Rational(25, 1));
+            QCOMPARE(rs.audioTracks.size(), size_t(3));  // Dialogue, Music L, Music R
+            QCOMPARE(rs.audioTracks[0].name, std::string("Dialogue"));
+            const auto& dl = rs.audioTracks[0].clips;
+            QCOMPARE(dl.size(), size_t(2));
+            QVERIFY2(dl[0].start == 0 && dl[0].duration == 50 && std::fabs(dl[0].sourceIn - 25) < 0.01,
+                     qPrintable(QString("%1 %2 %3").arg(dl[0].start).arg(dl[0].duration).arg(dl[0].sourceIn)));
+            QVERIFY2(dl[1].start == 50 && dl[1].duration == 60 && std::fabs(dl[1].sourceIn - 150) < 0.01,
+                     qPrintable(QString("%1 %2 %3").arg(dl[1].start).arg(dl[1].duration).arg(dl[1].sourceIn)));
+            QCOMPARE(rs.audioTracks[0].transitions.size(), size_t(1));
+            QCOMPARE(rs.audioTracks[0].transitions[0].duration, FrameTime(10));
+            QVERIFY(dl[1].audio.params.count("gain_db"));  // its gain (the keyframes' first value)
+            QVERIFY(QString::fromStdString(in.findMedia(dl[0].mediaId)->path).endsWith("jfk.wav"));
+            const auto& music = rs.audioTracks[1].clips;
+            QVERIFY(music.size() == 2 && music[0].start == 20 && music[1].start == 100);
+            QVERIFY(std::fabs(music[0].audio.p("gain_db", 0) + 6) < 0.05);
         }
 
         // Checkerboarding through MCP: the speech labelled with two speakers, split onto two tracks.

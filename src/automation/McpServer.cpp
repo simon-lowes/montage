@@ -37,6 +37,7 @@
 #include "render/Spherical.h"
 #include "render/ClipPlacement.h"
 #include "audio/SpeechCleanup.h"
+#include "core/AafImport.h"
 #include "media/Offload.h"
 #include "media/SpeechSearch.h"
 #include "media/TextReader.h"
@@ -5753,7 +5754,9 @@ void McpServer::Impl::addTools() {
         });
 
     add("montage_import_timeline", "Import a timeline",
-        "Make a project from an EDL, OpenTimelineIO, Final Cut Pro 7 XML or FCPXML file (media found by path).",
+        "Make a project from an EDL, OpenTimelineIO, Final Cut Pro 7 XML, FCPXML or AAF file (Media Composer and Pro "
+        "Tools sequences: picture and sound tracks, clips followed to their files, dissolves, audio gain, markers; media "
+        "found by path, else beside the file).",
         R"json({"type":"object","properties":{"input":{"type":"string"},"project":{"type":"string","description":"The .montage file to write"},
             "fps":{"type":"number","description":"Frame rate for an EDL (default 30)"}},"required":["input","project"]})json",
         false, [](const QJsonObject& a) {
@@ -5761,15 +5764,18 @@ void McpServer::Impl::addTools() {
             if (std::filesystem::is_directory(in)) in += "/Info.fcpxml";
             std::ifstream f(in, std::ios::binary);
             if (!f) return fail(QStringLiteral("Cannot read %1").arg(QString::fromStdString(in)));
-            const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            std::string ext = std::filesystem::path(in).extension().string();
+            for (char& ch : ext) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+            // An AAF is a binary compound file, read by its own importer.
+            const std::string text = ext == ".aaf" ? std::string() : std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
             Loaded l;
             l.path = absolute(need(a, "project"));
             l.project.name = std::filesystem::path(in).stem().string();
             const MediaProber prober = [](const std::string& file, MediaItem& m) { return probeMedia(file, m, nullptr); };
-            const std::string ext = std::filesystem::path(in).extension().string();
             const double fps = a.value("fps").toDouble(30);
             const Rational rate = std::fabs(fps - std::round(fps)) < 1e-6 ? Rational{int(std::lround(fps)), 1} : Rational{int(std::lround(fps * 1001)), 1001};
-            const ImportResult r = ext == ".edl" ? importEdl(l.project, text, rate, prober, std::filesystem::path(in).parent_path().string())
+            const ImportResult r = ext == ".aaf" ? importAaf(l.project, in, prober)
+                                   : ext == ".edl" ? importEdl(l.project, text, rate, prober, std::filesystem::path(in).parent_path().string())
                                    : ext == ".xml" || ext == ".fcpxml" ? importXmlTimeline(l.project, text, prober)
                                                                        : importOtio(l.project, text, prober);
             if (!r.ok) return fail(QString::fromStdString(r.error));

@@ -303,6 +303,7 @@ Final Cut Pro is the exception: it is written in Objective-C/Swift on Apple-only
 - Interchange both ways with Premiere Pro, DaVinci Resolve, Final Cut Pro, Avid and Nuke:
   - Final Cut Pro 7 XML, FCPXML, OpenTimelineIO and CMX 3600 EDL.
   - Imported timelines find their media (missing files come in offline) and keep links, dissolves, speed changes, titles and markers.
+  - **AAF import** (File › Import Timeline, or MCP `montage_import_timeline`): Media Composer sequences and Pro Tools, Fairlight, Premiere or Resolve AAFs come in as sequences. Picture and sound tracks keep their clips, gaps, source offsets and names; each clip is followed through the AAF's master clip to its file (where the AAF says, else beside it or in a folder below it; missing files come in offline with their names and lengths). A sound track plays its file's channel, dissolves and crossfades keep their cut points, Audio Gain becomes clip gain, constant speed changes are kept, and locators become markers.
 - Project files are readable JSON (`.montage`) and relink moved media through relative paths
 - Crash safety:
   - Unsaved work is saved to a recovery copy about a second after each edit. After a crash or forced quit, the next launch offers to recover it.
@@ -432,7 +433,7 @@ Its tools work on `.montage` files by path. Each edit is saved at once, and the 
 - make a first mix (roles, levels, dialogue rides, ducking), set up a 5.1 or 7.1 mix and place tracks in it, match voices to a reference, mark a music clip's bars or beats and fit music to a length, duck music under dialogue, match clips' colour to a shot, add adjustment layers, and make a reframed copy of the cut at another aspect ratio;
 - return a rendered frame as an image so the agent can check its work;
 - render with any preset, with progress, optionally folding surround down to stereo and writing stems;
-- export and import EDL, OTIO, FCP 7 XML and FCPXML, and export AAF for audio post.
+- export and import EDL, OTIO, FCP 7 XML and FCPXML, import AAF, and export AAF for audio post.
 
 ```bash
 claude mcp add montage -- montage-cli mcp      # Claude Code

@@ -28,6 +28,7 @@ add_library(montage_engine STATIC
   core/Bleep.h core/Bleep.cpp
   core/FaceIndex.h core/FaceIndex.cpp
   core/Aaf.h core/Aaf.cpp core/AafMetaDictionary.inc
+  core/AafImport.h core/AafImport.cpp
   core/Surround.h core/Surround.cpp
   core/Effects.h core/Effects.cpp
   core/EditOps.h core/EditOps.cpp
