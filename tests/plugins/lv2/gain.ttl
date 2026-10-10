@@ -42,4 +42,16 @@
         lv2:index 5 ;
         lv2:symbol "out_r" ;
         lv2:name "Out R"
+    ] , [
+        a lv2:AudioPort , lv2:InputPort ;
+        lv2:index 6 ;
+        lv2:symbol "key_l" ;
+        lv2:name "Key L" ;
+        lv2:portProperty lv2:isSideChain , lv2:connectionOptional
+    ] , [
+        a lv2:AudioPort , lv2:InputPort ;
+        lv2:index 7 ;
+        lv2:symbol "key_r" ;
+        lv2:name "Key R" ;
+        lv2:portProperty lv2:isSideChain , lv2:connectionOptional
     ] .

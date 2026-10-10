@@ -3514,6 +3514,37 @@ private slots:
         QApplication::processEvents();
         key = inspector->widget()->findChild<QComboBox*>("track_sidechain");
         QVERIFY(key && key->currentIndex() == 0);
+
+        // A plugin with a key input offers the same choice (one without does not).
+        plugins::Registry& reg = plugins::Registry::instance();
+        reg.setCachePath((dir_.path() + "/plugin-cache-sc.json").toStdString());
+        reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
+        for (plugins::Format f : plugins::kAllFormats) reg.setSearchPaths(f, {"/nonexistent-montage-test-dir"});
+        reg.setSearchPaths(plugins::Format::Clap, {QStringLiteral(MONTAGE_TEST_CLAP_DIR "/sidechain").toStdString(),
+                                                   QStringLiteral(MONTAGE_TEST_CLAP_DIR "/good").toStdString()});
+        reg.scan();
+        auto ducker = reg.find("clap:org.montage.test.ducker"), gain = reg.find("clap:org.montage.test.gain");
+        QVERIFY(ducker && gain);
+        QVERIFY(state()->edit("Plugins", [&](Project& p, Sequence& s) {
+            Clip* c = edit::clipById(s, clip);
+            c->effects.clear();
+            auto e = plugins::makePluginEffect(p, *gain);
+            auto d = plugins::makePluginEffect(p, *ducker);
+            if (!e || !d) return false;
+            c->effects.push_back(*e);
+            c->effects.push_back(*d);
+            return true;
+        }));
+        state()->setSelection({}, false);
+        state()->setSelection({clip}, false);
+        QApplication::processEvents();
+        const auto keys = inspector->widget()->findChildren<QComboBox*>("track_sidechain");
+        QCOMPARE(keys.size(), 1);  // the ducker's, not the gain's
+        key = keys.front();
+        key->setCurrentIndex(key->findText("A2  Dialogue"));
+        emit key->activated(key->currentIndex());
+        QCOMPARE(edit::clipById(*state()->sequence(), clip)->effects.at(1).s("sidechain"), std::to_string(state()->sequence()->audioTracks[1].id));
+        QVERIFY(edit::clipById(*state()->sequence(), clip)->effects.at(0).s("sidechain").empty());
     }
 
     void sharedProjectLocking() {

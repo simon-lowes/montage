@@ -1,5 +1,6 @@
 /* A test LV2 plugin for Montage: stereo gain (dB) delayed by 16 samples,
-   reporting that latency on a lv2:reportsLatency output. */
+   reporting that latency on a lv2:reportsLatency output, and turned down by
+   what arrives on its key (side chain) inputs: (1 - min(1, |key|)). */
 #include <lv2/core/lv2.h>
 #include <math.h>
 #include <stdlib.h>
@@ -12,6 +13,7 @@ typedef struct {
     float* latency;
     const float* in[2];
     float* out[2];
+    const float* key[2];
     float line[2][DELAY];
     int pos;
 } Gain;
@@ -33,6 +35,8 @@ static void connect_port(LV2_Handle h, uint32_t port, void* data) {
         case 3: g->in[1] = (const float*)data; break;
         case 4: g->out[0] = (float*)data; break;
         case 5: g->out[1] = (float*)data; break;
+        case 6: g->key[0] = (const float*)data; break;
+        case 7: g->key[1] = (const float*)data; break;
     }
 }
 
@@ -49,7 +53,8 @@ static void run(LV2_Handle h, uint32_t n) {
     for (uint32_t i = 0; i < n; ++i) {
         for (int c = 0; c < 2; ++c) {
             const float x = g->in[c][i];
-            g->out[c][i] = g->line[c][g->pos] * k;
+            const float duck = g->key[c] ? 1.0f - fminf(1.0f, fabsf(g->key[c][i])) : 1.0f;
+            g->out[c][i] = g->line[c][g->pos] * k * duck;
             g->line[c][g->pos] = x;
         }
         g->pos = (g->pos + 1) % DELAY;

@@ -650,6 +650,14 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
         EffectInfo shown = *catalog;
         shown.displayName = plugins::effectName(e);
         shown.params = effectParams(e);
+        // A plugin with a key input: which track it hears there (as the Compressor's sidechain).
+        if (e.type == "plugin" && e.s("key_input") == "1") {
+            StringParamInfo key;
+            key.name = "sidechain";
+            key.label = tr("Sidechain").toStdString();
+            key.kind = StringKind::Track;
+            shown.strings.push_back(key);
+        }
         const EffectInfo* info = &shown;
         Id eid = e.id;
         auto* tools = new QWidget;

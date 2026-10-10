@@ -21,7 +21,7 @@ if(MONTAGE_BUILD_APP)
   montage_copy_runtime(test_app)
   add_test(NAME test_app COMMAND test_app)
   set_tests_properties(test_app PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;MONTAGE_NO_PLUGIN_SCAN=1;MONTAGE_NO_RECOVERY_PROMPT=1;MONTAGE_RECOVERY_DIR=${CMAKE_CURRENT_BINARY_DIR}/recovery-test" TIMEOUT 300)
-  add_dependencies(test_app montage_test_plugins montage_test_ofx montage-plugin-probe)
+  add_dependencies(test_app montage_test_plugins montage_test_sidechain montage_test_ofx montage-plugin-probe)
   target_compile_definitions(test_app PRIVATE
     MONTAGE_TEST_CLAP_DIR="${CMAKE_CURRENT_BINARY_DIR}/clap"
     MONTAGE_TEST_OFX_DIR="${CMAKE_CURRENT_BINARY_DIR}/ofx"
@@ -44,6 +44,10 @@ target_compile_definitions(montage_test_hang PRIVATE MONTAGE_TEST_HANG)
 montage_test_clap(montage_test_crash MontageTestCrash crash plugins/test_clap_misbehaving.c)
 target_compile_definitions(montage_test_crash PRIVATE MONTAGE_TEST_CRASH)
 montage_test_clap(montage_test_latency MontageTestLatency latency plugins/test_clap_latency.c)
+montage_test_clap(montage_test_sidechain MontageTestSidechain sidechain plugins/test_clap_sidechain.c)
+if(NOT WIN32 AND NOT APPLE)
+  target_link_libraries(montage_test_sidechain PRIVATE m)
+endif()
 
 # ---- Video plugins: test OpenFX plugins built as *.ofx.bundle folders ----
 if(WIN32)
@@ -67,7 +71,7 @@ montage_test_ofx(montage_test_ofx_crash MontageTestOfxCrash crash)
 target_compile_definitions(montage_test_ofx_crash PRIVATE MONTAGE_TEST_OFX_CRASH)
 
 montage_test(test_plugins)
-add_dependencies(test_plugins montage_test_plugins montage_test_hang montage_test_crash montage_test_latency montage-plugin-probe
+add_dependencies(test_plugins montage_test_plugins montage_test_hang montage_test_crash montage_test_latency montage_test_sidechain montage-plugin-probe
   montage_test_ofx montage_test_ofx_crash)
 target_compile_definitions(test_plugins PRIVATE
   MONTAGE_TEST_CLAP_DIR="${CMAKE_CURRENT_BINARY_DIR}/clap"

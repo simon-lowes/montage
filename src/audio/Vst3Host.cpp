@@ -494,6 +494,11 @@ public:
     }
 
     int latencySamples() override { return processor_ ? int(processor_->getLatencySamples()) : 0; }
+    bool hasSidechain() override { return keyBus_ >= 0; }
+    void setSidechain(const float* const* channels, int numChannels) override {
+        key_ = channels;
+        keyIn_ = channels ? numChannels : 0;
+    }
 
     void reset() override {
         if (!active_) return;
@@ -528,9 +533,16 @@ private:
         outBusChannels_.clear();
         for (int32 i = 0; i < numIn; ++i) inBusChannels_.push_back(SpeakerArr::getChannelCount(ins[size_t(i)]));
         for (int32 i = 0; i < numOut; ++i) outBusChannels_.push_back(SpeakerArr::getChannelCount(outs[size_t(i)]));
-        // Only the main buses carry audio; side chains stay inactive (silent).
+        // The main buses carry audio, and the first auxiliary input is the key (sidechain); other buses stay inactive.
         if (numIn > 0) component_->activateBus(kAudio, kInput, 0, true);
         if (numOut > 0) component_->activateBus(kAudio, kOutput, 0, true);
+        keyBus_ = -1;
+        for (int32 i = 1; i < numIn && keyBus_ < 0; ++i) {
+            BusInfo info{};
+            if (component_->getBusInfo(kAudio, kInput, i, info) == kResultOk && info.busType == kAux && inBusChannels_[size_t(i)] > 0 &&
+                component_->activateBus(kAudio, kInput, i, true) == kResultOk)
+                keyBus_ = i;
+        }
         inChannels_ = numIn > 0 ? inBusChannels_[0] : 0;
         outChannels_ = numOut > 0 ? outBusChannels_[0] : 0;
     }
@@ -560,6 +572,17 @@ private:
     }
 
     void processBlock(float* const* channels, int numChannels, int offset, int n) {
+        if (keyBus_ >= 0) {
+            // The key: what the host gave (mono to both sides), or silence.
+            float* const* dst = inBuses_[size_t(keyBus_)].channelBuffers32;
+            const int kc = inBusChannels_[size_t(keyBus_)];
+            for (int c = 0; c < kc; ++c) {
+                if (keyIn_ <= 0) std::fill(dst[c], dst[c] + n, 0.0f);
+                else if (kc == 1 && keyIn_ >= 2)
+                    for (int i = 0; i < n; ++i) dst[0][i] = 0.5f * (key_[0][offset + i] + key_[1][offset + i]);
+                else std::memcpy(dst[c], key_[std::min(c, keyIn_ - 1)] + offset, size_t(n) * sizeof(float));
+            }
+        }
         if (inChannels_ > 0) {
             float* const* dst = inBuses_[0].channelBuffers32;
             for (int c = 0; c < inChannels_; ++c) {
@@ -619,6 +642,9 @@ private:
     int maxFrames_ = 1024;
     int inChannels_ = 0, outChannels_ = 0;
     std::vector<int32> inBusChannels_, outBusChannels_;
+    int32 keyBus_ = -1;                  // the active auxiliary input (the key), or -1
+    const float* const* key_ = nullptr;  // the key for this process() call
+    int keyIn_ = 0;
     std::vector<std::vector<float>> inStorage_, outStorage_;
     std::vector<std::vector<float*>> inPtrs_, outPtrs_;
     std::vector<AudioBusBuffers> inBuses_, outBuses_;

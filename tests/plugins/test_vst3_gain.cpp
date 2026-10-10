@@ -3,8 +3,11 @@
 // commercial plugins use). Parameter 3 "Gain" is normalised 0..1 = gain 0..2,
 // default 0.5 (unity). Its editor has no real window: attached() asks the
 // host frame for 360x240 and turns the gain to 0.125 through the component
-// handler, as a user dragging its knob would. Built as MontageTestVst3.vst3.
+// handler, as a user dragging its knob would. An auxiliary input bus is the key:
+// once active, the gain is turned down by (1 - min(1, |key|)). Built as MontageTestVst3.vst3.
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstring>
 
 #include "pluginterfaces/base/funknown.h"
@@ -75,19 +78,23 @@ public:
         return kResultOk;
     }
     tresult PLUGIN_API setIoMode(IoMode) override { return kResultOk; }
-    int32 PLUGIN_API getBusCount(MediaType type, BusDirection) override { return type == kAudio ? 1 : 0; }
+    // A main stereo input and output, and a stereo auxiliary input (the key, inactive until the host turns it on).
+    int32 PLUGIN_API getBusCount(MediaType type, BusDirection dir) override { return type == kAudio ? (dir == kInput ? 2 : 1) : 0; }
     tresult PLUGIN_API getBusInfo(MediaType type, BusDirection dir, int32 index, BusInfo& bus) override {
-        if (type != kAudio || index != 0) return kInvalidArgument;
+        if (type != kAudio || index < 0 || index > (dir == kInput ? 1 : 0)) return kInvalidArgument;
         bus.mediaType = kAudio;
         bus.direction = dir;
         bus.channelCount = 2;
-        copyTitle(bus.name, u"Main");
-        bus.busType = kMain;
-        bus.flags = BusInfo::kDefaultActive;
+        copyTitle(bus.name, index == 0 ? u"Main" : u"Sidechain");
+        bus.busType = index == 0 ? kMain : kAux;
+        bus.flags = index == 0 ? BusInfo::kDefaultActive : 0;
         return kResultOk;
     }
     tresult PLUGIN_API getRoutingInfo(RoutingInfo&, RoutingInfo&) override { return kNotImplemented; }
-    tresult PLUGIN_API activateBus(MediaType, BusDirection, int32, TBool) override { return kResultOk; }
+    tresult PLUGIN_API activateBus(MediaType type, BusDirection dir, int32 index, TBool state) override {
+        if (type == kAudio && dir == kInput && index == 1) keyActive_ = state;
+        return kResultOk;
+    }
     tresult PLUGIN_API setActive(TBool) override { return kResultOk; }
     tresult PLUGIN_API setState(IBStream* s) override { return readDouble(s, norm_) ? kResultOk : kResultFalse; }
     tresult PLUGIN_API getState(IBStream* s) override {
@@ -97,8 +104,9 @@ public:
 
     // IAudioProcessor
     tresult PLUGIN_API setBusArrangements(SpeakerArrangement* in, int32 numIns, SpeakerArrangement* out, int32 numOuts) override {
-        return numIns == 1 && numOuts == 1 && in[0] == SpeakerArr::kStereo && out[0] == SpeakerArr::kStereo ? kResultOk
-                                                                                                      : kResultFalse;
+        bool ok = numIns >= 1 && numIns <= 2 && numOuts == 1 && out[0] == SpeakerArr::kStereo;
+        for (int32 i = 0; ok && i < numIns; ++i) ok = in[i] == SpeakerArr::kStereo;
+        return ok ? kResultOk : kResultFalse;
     }
     tresult PLUGIN_API getBusArrangement(BusDirection, int32, SpeakerArrangement& arr) override {
         arr = SpeakerArr::kStereo;
@@ -120,10 +128,12 @@ public:
         }
         if (data.numInputs < 1 || data.numOutputs < 1) return kResultOk;
         const float g = float(norm_ * 2.0);
+        const bool keyed = keyActive_ && data.numInputs >= 2 && data.inputs[1].numChannels >= 2 && data.inputs[1].channelBuffers32;
         for (int32 c = 0; c < 2; ++c) {
             const float* in = data.inputs[0].channelBuffers32[c];
+            const float* key = keyed ? data.inputs[1].channelBuffers32[c] : nullptr;
             float* out = data.outputs[0].channelBuffers32[c];
-            for (int32 i = 0; i < data.numSamples; ++i) out[i] = in[i] * g;
+            for (int32 i = 0; i < data.numSamples; ++i) out[i] = in[i] * g * (key ? 1.0f - std::min(1.0f, std::fabs(key[i])) : 1.0f);
         }
         return kResultOk;
     }
@@ -133,6 +143,7 @@ private:
     virtual ~GainComponent() = default;
     std::atomic<uint32> refs_{1};
     double norm_ = 0.5;
+    bool keyActive_ = false;
 };
 
 // The editor: the protocol only.

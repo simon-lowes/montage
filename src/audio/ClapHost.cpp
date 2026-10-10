@@ -207,6 +207,8 @@ public:
                 plugin_->get_extension(plugin_, CLAP_EXT_AUDIO_PORTS))) {
             clap_audio_port_info_t info{};
             inChannels_ = ports->count(plugin_, true) > 0 && ports->get(plugin_, 0, true, &info) ? int(info.channel_count) : 0;
+            // A second input port is the key (sidechain), as CLAP's compressors and gates have it.
+            keyChannels_ = ports->count(plugin_, true) > 1 && ports->get(plugin_, 1, true, &info) ? int(info.channel_count) : 0;
             outChannels_ =
                 ports->count(plugin_, false) > 0 && ports->get(plugin_, 0, false, &info) ? int(info.channel_count) : 0;
         }
@@ -228,8 +230,15 @@ public:
         active_ = true;
         processing_ = plugin_->start_processing(plugin_);
         in_.assign(size_t(std::max(1, inChannels_)) * size_t(maxFrames_), 0.0f);
+        keyBuf_.assign(size_t(std::max(0, keyChannels_)) * size_t(maxFrames_), 0.0f);
         out_.assign(size_t(outChannels_) * size_t(maxFrames_), 0.0f);
         return processing_;
+    }
+
+    bool hasSidechain() override { return keyChannels_ > 0; }
+    void setSidechain(const float* const* channels, int numChannels) override {
+        key_ = channels;
+        keyIn_ = channels ? numChannels : 0;
     }
 
     void process(float* const* channels, int numChannels, int frames) override {
@@ -401,9 +410,22 @@ private:
         }
         for (int c = 0; c < outChannels_; ++c) outPtrs.push_back(&out_[size_t(c) * size_t(maxFrames_)]);
 
-        clap_audio_buffer_t inBuf{};
+        clap_audio_buffer_t inBufs[2]{};
+        clap_audio_buffer_t& inBuf = inBufs[0];
         inBuf.data32 = inPtrs.data();
         inBuf.channel_count = uint32_t(inPtrs.size());
+        // The key: what the host gave (mono to both sides, stereo to a mono port as its mid), or silence.
+        std::vector<float*> keyPtrs;
+        for (int c = 0; c < keyChannels_; ++c) {
+            float* dst = &keyBuf_[size_t(c) * size_t(maxFrames_)];
+            if (keyIn_ <= 0) std::fill(dst, dst + n, 0.0f);
+            else if (keyChannels_ == 1 && keyIn_ >= 2)
+                for (int i = 0; i < n; ++i) dst[i] = 0.5f * (key_[0][offset + i] + key_[1][offset + i]);
+            else std::memcpy(dst, key_[std::min(c, keyIn_ - 1)] + offset, size_t(n) * sizeof(float));
+            keyPtrs.push_back(dst);
+        }
+        inBufs[1].data32 = keyPtrs.data();
+        inBufs[1].channel_count = uint32_t(keyPtrs.size());
         clap_audio_buffer_t outBuf{};
         outBuf.data32 = outPtrs.data();
         outBuf.channel_count = uint32_t(outPtrs.size());
@@ -412,8 +434,8 @@ private:
         proc.steady_time = steadyTime_;
         proc.frames_count = uint32_t(n);
         proc.transport = nullptr;
-        proc.audio_inputs = inChannels_ > 0 ? &inBuf : nullptr;
-        proc.audio_inputs_count = inChannels_ > 0 ? 1 : 0;
+        proc.audio_inputs = inChannels_ > 0 ? inBufs : nullptr;
+        proc.audio_inputs_count = inChannels_ > 0 ? (keyChannels_ > 0 ? 2 : 1) : 0;
         proc.audio_outputs = &outBuf;
         proc.audio_outputs_count = 1;
         proc.in_events = &pending_.in;
@@ -436,6 +458,10 @@ private:
     HostSide side_;
     bool editorOpen_ = false;
     int inChannels_ = 2, outChannels_ = 2;
+    int keyChannels_ = 0;           // the key input port's channels (0: none)
+    const float* const* key_ = nullptr;  // the key for this process() call
+    int keyIn_ = 0;
+    std::vector<float> keyBuf_;
     int maxFrames_ = 1024;
     bool active_ = false, processing_ = false;
     int64_t steadyTime_ = 0;

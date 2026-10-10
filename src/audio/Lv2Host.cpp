@@ -35,7 +35,7 @@ struct World {
     LV2_URID_Map map{this, &World::mapUri};
     LV2_URID_Unmap unmap{this, &World::unmapUri};
     LilvNode *audioPort, *controlPort, *cvPort, *atomPort, *inputPort, *outputPort, *optional, *integer, *toggled,
-        *enumeration;
+        *enumeration, *sideChain;
 
     World() {
         audioPort = lilv_new_uri(world, LV2_CORE__AudioPort);
@@ -48,6 +48,7 @@ struct World {
         integer = lilv_new_uri(world, LV2_CORE__integer);
         toggled = lilv_new_uri(world, LV2_CORE__toggled);
         enumeration = lilv_new_uri(world, LV2_CORE__enumeration);
+        sideChain = lilv_new_uri(world, LV2_CORE_PREFIX "isSideChain");
     }
     static LV2_URID mapUri(LV2_URID_Map_Handle h, const char* uri) {
         auto* w = static_cast<World*>(h);
@@ -123,7 +124,9 @@ public:
             p.latency = p.kind == Port::ControlOut && i == latencyPort;
             p.stepped = lilv_port_has_property(plugin_, port, w.integer) || lilv_port_has_property(plugin_, port, w.toggled) ||
                         lilv_port_has_property(plugin_, port, w.enumeration);
-            if (p.kind == Port::AudioIn) audioIn_.push_back(int(ports_.size()));
+            // Audio inputs marked as a side chain are the key, not the signal.
+            if (p.kind == Port::AudioIn && lilv_port_has_property(plugin_, port, w.sideChain)) keyIn_.push_back(int(ports_.size()));
+            else if (p.kind == Port::AudioIn) audioIn_.push_back(int(ports_.size()));
             if (p.kind == Port::AudioOut) audioOut_.push_back(int(ports_.size()));
             ports_.push_back(p);
         }
@@ -155,6 +158,15 @@ public:
                 else if (k < numChannels) std::memcpy(dst, channels[k] + offset, size_t(n) * sizeof(float));
                 else std::fill(dst, dst + n, 0.0f);
             }
+            // The key: what the host gave (stereo to a mono key as its mid), or silence.
+            const int kins = int(keyIn_.size());
+            for (int k = 0; k < kins; ++k) {
+                float* dst = buffers_[size_t(keyIn_[size_t(k)])].data();
+                if (keyChannels_ <= 0) std::fill(dst, dst + n, 0.0f);
+                else if (kins == 1 && keyChannels_ >= 2)
+                    for (int i = 0; i < n; ++i) dst[i] = 0.5f * (key_[0][offset + i] + key_[1][offset + i]);
+                else std::memcpy(dst, key_[std::min(k, keyChannels_ - 1)] + offset, size_t(n) * sizeof(float));
+            }
             resetAtoms();
             lilv_instance_run(inst_, uint32_t(n));
             for (int c = 0; c < numChannels; ++c) {
@@ -162,6 +174,12 @@ public:
                 std::memcpy(channels[c] + offset, src, size_t(n) * sizeof(float));
             }
         }
+    }
+
+    bool hasSidechain() override { return !keyIn_.empty(); }
+    void setSidechain(const float* const* channels, int numChannels) override {
+        key_ = channels;
+        keyChannels_ = channels ? numChannels : 0;
     }
 
     std::vector<ParamInfo> parameters() override {
@@ -352,7 +370,9 @@ private:
     LilvInstance* inst_ = nullptr;
     bool active_ = false;
     std::vector<Port> ports_;
-    std::vector<int> audioIn_, audioOut_;
+    std::vector<int> audioIn_, audioOut_, keyIn_;
+    const float* const* key_ = nullptr;  // the key for this process() call
+    int keyChannels_ = 0;
     std::vector<std::vector<float>> buffers_;
     double sampleRate_ = 48000;
     int32_t maxFrames_ = 1024, minFrames_ = 1, nominal_ = 1024;
