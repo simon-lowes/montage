@@ -12829,6 +12829,187 @@ private slots:
         QVERIFY(!err.empty());
     }
 
+    void panFollowsThePicture() {
+        // A textured card crossing a flat grey frame left to right: its centre at x = 160 + pos(t) of 320.
+        const std::string video = path("panfollow.mp4");
+        const int frames = 40;
+        auto pos = [&](double t) { return -110 + 220 * t / (frames - 1); };
+        {
+            QImage grey(320, 180, QImage::Format_RGB32);
+            grey.fill(QColor(110, 110, 110));
+            const QString greyPng = QString::fromStdString(path("panfollow-grey.png"));
+            grey.save(greyPng);
+            QImage card(64, 64, QImage::Format_RGB32);
+            card.fill(QColor(40, 40, 40));
+            {
+                QPainter pa(&card);
+                std::mt19937 rng(11);
+                std::uniform_int_distribution<int> xy(0, 56), sz(3, 12), c(0, 255);
+                for (int i = 0; i < 60; ++i) pa.fillRect(xy(rng), xy(rng), sz(rng), sz(rng), QColor(c(rng), c(rng), c(rng)));
+            }
+            const QString cardPng = QString::fromStdString(path("panfollow-card.png"));
+            card.save(cardPng);
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            s.width = 320;
+            s.height = 180;
+            s.fps = {25, 1};
+            MediaItem g = probeOrFail(p, greyPng.toStdString());
+            p.media.push_back(g);
+            MediaItem k = probeOrFail(p, cardPng.toStdString());
+            p.media.push_back(k);
+            Clip bg = makeClip(p, g, TrackKind::Video, s);
+            bg.duration = frames;
+            QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, bg).ok);
+            edit::addTrack(p, s, TrackKind::Video);
+            Clip fg = makeClip(p, k, TrackKind::Video, s);
+            fg.duration = frames;
+            fg.motion.params["scale"] = Param(100.0);
+            fg.motion.params["pos_x"].addKey(0, pos(0), Interp::Linear);
+            fg.motion.params["pos_x"].addKey(frames - 1, pos(frames - 1), Interp::Linear);
+            QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 1}, fg).ok);
+            ExportSettings st;
+            st.path = video;
+            st.audioCodec = "none";
+            st.crf = 12;
+            st.preset = "ultrafast";
+            std::string err;
+            QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        }
+        const std::string wav = path("panfollow.wav");
+        writeWav(wav, 48000, 2.0, 0.3f, 0.3f);
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320;
+        s.height = 180;
+        s.fps = {25, 1};
+        MediaItem mv = probeOrFail(p, video);
+        p.media.push_back(mv);
+        MediaItem ma = probeOrFail(p, wav);
+        p.media.push_back(ma);
+        QVERIFY(edit::placeMedia(p, s, mv.id, 0, 0, frames, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        // The sound on its own track, not linked to the picture.
+        while (s.audioTracks.size() < 2) edit::addTrack(p, s, TrackKind::Audio);
+        Clip snd = makeClip(p, ma, TrackKind::Audio, s);
+        snd.duration = frames;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Audio, 1}, snd).ok);
+        const Clip& a = trackAt(s, {TrackKind::Audio, 1})->clips.at(0);
+        const Clip& pic = trackAt(s, {TrackKind::Video, 0})->clips.at(0);
+        QVERIFY(panFollowSource(p, s, a, 20) == &pic);
+        // The subject of the shot is the card.
+        double sx = 0, sy = 0;
+        std::string err;
+        QVERIFY2(panFollowSubject(p, s, a, 20, sx, sy, &err), err.c_str());
+        QVERIFY2(std::fabs(sx * 320 - (160 + pos(20))) < 24 && std::fabs(sy - 0.5) < 0.15, qPrintable(QString("%1 %2").arg(sx).arg(sy)));
+        // Followed from the middle both ways: every frame, on the card's centre.
+        std::vector<PanFollowKey> keys;
+        double last = -1;
+        QVERIFY2(trackPanFollow(p, s, a, 20, (160 + pos(20)) / 320, 0.5, 0.25, keys, [&](double f) {
+            QVERIFY(f >= -1e-9 && f <= 1 + 1e-9);
+            last = f;
+        }, nullptr, &err), err.c_str());
+        QVERIFY(last > 0.9);
+        QCOMPARE(int(keys.size()), frames);
+        double worst = 0;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            QCOMPARE(keys[i].t, FrameTime(i));
+            worst = std::max({worst, std::fabs(keys[i].x * 320 - (160 + pos(double(i)))), std::fabs(keys[i].y * 180 - 90)});
+        }
+        QVERIFY2(worst < 1.5, qPrintable(QString::number(worst)));
+        // Stereo: the track's pan moves left to right with it, thinned, and stays as it was outside the span.
+        Track& tr = *trackAt(s, {TrackKind::Audio, 1});
+        tr.automation = int(AutomationMode::Off);
+        tr.panAuto.addKey(60, 0.5);  // a later move, kept
+        QVERIFY(applyPanFollow(s, tr, keys, 1.0));
+        QCOMPARE(tr.automation, int(AutomationMode::Read));
+        QVERIFY(tr.panAuto.keys.size() < 20);
+        auto expectPan = [&](double t) { return (2 * (160 + pos(t)) / 320 - 1); };
+        QVERIFY2(std::fabs(trackPanAt(tr, 2) - expectPan(2)) < 0.03, qPrintable(QString::number(trackPanAt(tr, 2))));
+        QVERIFY(std::fabs(trackPanAt(tr, 20) - expectPan(20)) < 0.03);
+        QVERIFY(std::fabs(trackPanAt(tr, 37) - expectPan(37)) < 0.03);
+        QVERIFY(trackPanAt(tr, 2) < -0.5 && trackPanAt(tr, 37) > 0.5);
+        QVERIFY(std::fabs(trackPanAt(tr, 40) - 0.5) < 1e-9);  // what the lane held there before
+        QVERIFY(tr.panAuto.keyAt(60) && std::fabs(tr.panAuto.keyAt(60)->v - 0.5) < 1e-9);
+        // Half the stage: half the pan.
+        Track narrow = tr;
+        narrow.panAuto = Param();
+        QVERIFY(applyPanFollow(s, narrow, keys, 0.5));
+        QVERIFY(std::fabs(trackPanAt(narrow, 37) - 0.5 * expectPan(37)) < 0.03);
+        // Surround: the x of the surround position, the picture's edges at the front left and right speakers.
+        Sequence surround = s;
+        surround.audioLayout = "5.1";
+        Track st = tr;
+        st.panAuto = Param();
+        QVERIFY(applyPanFollow(surround, st, keys, 1.0));
+        QVERIFY(!st.panAuto.animated() && st.surroundXAuto.animated() && !st.surroundYAuto.animated());
+        const SurroundPan end = trackSurroundAt(st, 37);
+        QVERIFY(std::fabs(end.x - expectPan(37) * std::tan(30 * M_PI / 180)) < 0.03);
+        QVERIFY(std::fabs(std::atan2(end.x, end.y) * 180 / M_PI - std::atan(expectPan(37) * std::tan(30 * M_PI / 180)) * 180 / M_PI) < 2);
+        // A 360° sequence: the picture is the whole circle, so the card goes round behind the listener.
+        Sequence sphere = surround;
+        sphere.spherical = true;
+        Track sp = tr;
+        sp.panAuto = Param();
+        QVERIFY(applyPanFollow(sphere, sp, keys, 1.0));
+        QVERIFY(sp.surroundYAuto.animated());
+        const SurroundPan behind = trackSurroundAt(sp, 37);
+        const double azimuth = std::atan2(behind.x, behind.y) * 180 / M_PI, want = (keys[37].x - 0.5) * 360;
+        QVERIFY2(std::fabs(azimuth - want) < 4 && behind.y < 0, qPrintable(QString("%1 vs %2").arg(azimuth).arg(want)));
+        // Linked picture first: the same shot on a track above, the sound linked to the lower one.
+        Project p2 = p;
+        Sequence& s2 = *p2.active();
+        edit::addTrack(p2, s2, TrackKind::Video);
+        Clip top = pic;
+        top.id = p2.newId();
+        top.linkGroup = 0;
+        QVERIFY(edit::overwrite(p2, s2, {TrackKind::Video, 1}, top).ok);
+        Clip& low = trackAt(s2, {TrackKind::Video, 0})->clips.at(0);
+        Clip& a2 = trackAt(s2, {TrackKind::Audio, 1})->clips.at(0);
+        QVERIFY(panFollowSource(p2, s2, a2, 10)->id == trackAt(s2, {TrackKind::Video, 1})->clips.at(0).id);
+        const Id group = p2.newId();
+        a2.linkGroup = group;
+        low.linkGroup = group;
+        QVERIFY(panFollowSource(p2, s2, a2, 10)->id == low.id);
+        // No picture with the sound: an error.
+        Sequence bare = s;
+        bare.videoTracks[0].clips.clear();
+        QVERIFY(!trackPanFollow(p, bare, a, 20, 0.5, 0.5, 0.25, keys, {}, nullptr, &err));
+        QVERIFY(!err.empty());
+        QVERIFY(!panFollowSource(p, bare, a, 20));
+        // The agent's tool: from the shot's subject by default, writing the pan and reporting the path.
+        Project mp = p;
+        Track& fresh = *trackAt(*mp.active(), {TrackKind::Audio, 1});
+        fresh.panAuto = Param();
+        const QString project = QString::fromStdString(path("panfollow.montage"));
+        QVERIFY(saveProject(mp, project.toStdString()));
+        McpServer server;
+        int rid = 1;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", rid++}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QVERIFY(call("montage_pan_follow", {{"project", project}, {"clip", double(pic.id)}}).value("isError").toBool());  // not audio
+        QVERIFY(call("montage_pan_follow", {{"project", project}, {"clip", double(a.id)}, {"at", 99}}).value("isError").toBool());
+        QVERIFY(call("montage_pan_follow", {{"project", project}, {"clip", double(a.id)}, {"x", 0.5}}).value("isError").toBool());
+        QVERIFY(call("montage_pan_follow", {{"project", project}, {"clip", double(a.id)}, {"width", 2}}).value("isError").toBool());
+        QJsonObject res = call("montage_pan_follow", {{"project", project}, {"clip", double(a.id)}, {"at", 20}, {"size", "medium"}});
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        const QJsonObject out = res.value("structuredContent").toObject();
+        QCOMPARE(out.value("lane").toString(), QStringLiteral("pan"));
+        QCOMPARE(out.value("from").toInteger(), qint64(0));
+        QCOMPARE(out.value("to").toInteger(), qint64(frames - 1));
+        QVERIFY(out.value("path").toArray().size() >= 4);
+        Project after;
+        QVERIFY(loadProject(project.toStdString(), after));
+        const Track& written = *trackAt(*after.active(), {TrackKind::Audio, 1});
+        QVERIFY(written.panAuto.animated());
+        QVERIFY2(std::fabs(trackPanAt(written, 37) - expectPan(37)) < 0.06, qPrintable(QString::number(trackPanAt(written, 37))));
+    }
+
     void autoReframe() {
         // A red ball crossing textured ground left to right (x 180 -> 516 of 640), bobbing up and down.
         const std::string video = path("reframe-ball.mp4");

@@ -115,6 +115,7 @@
 #include "MaskOverlay.h"
 #include "TransformOverlay.h"
 #include "SequenceIndexPanel.h"
+#include "PanFollowDialog.h"
 #include "RedactFacesDialog.h"
 #include "SpectralRepairDialog.h"
 #include "ShotSearchPanel.h"
@@ -940,6 +941,7 @@ void MainWindow::buildMenus() {
         }))->setObjectName(QStringLiteral("autoDuck"));
     add(clipM, tr("Remove Mic &Bleed…"), QKeySequence(), withSeq([this] { micBleedDialog(); }))->setObjectName(QStringLiteral("removeMicBleed"));
     add(clipM, tr("S&pectral Repair…"), QKeySequence(), withSeq([this] { spectralRepairDialog(); }))->setObjectName(QStringLiteral("spectralRepair"));
+    add(clipM, tr("Pan to &Follow…"), QKeySequence(), withSeq([this] { panFollowDialog(); }))->setObjectName(QStringLiteral("panFollow"));
     add(clipM, tr("Redact &Faces…"), QKeySequence(), withSeq([this] { redactFacesDialog(); }))->setObjectName(QStringLiteral("redactFaces"));
     add(clipM, tr("Remove Letterbo&x"), QKeySequence(), withSeq([this] { removeLetterbox(); }))->setObjectName(QStringLiteral("removeLetterbox"));
     // Colour groups: grade shots together, before and after each clip's own grade (core/ColorGroups.h).
@@ -4195,6 +4197,18 @@ RedactFacesDialog* MainWindow::redactFacesDialog() {
         return nullptr;
     }
     auto* dlg = new RedactFacesDialog(state_, c->id, this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    dlg->show();
+    return dlg;
+}
+
+PanFollowDialog* MainWindow::panFollowDialog() {
+    const Clip* c = musicClip();
+    if (!c || !c->mediaId) {
+        state_->message(tr("Select the audio clip whose panning should follow the picture"));
+        return nullptr;
+    }
+    auto* dlg = new PanFollowDialog(state_, c->id, this);
     dlg->setAttribute(Qt::WA_DeleteOnClose);
     dlg->show();
     return dlg;

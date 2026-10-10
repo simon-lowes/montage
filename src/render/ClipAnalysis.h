@@ -71,6 +71,34 @@ bool trackClipFollow(const Project& p, const Sequence& s, const Clip& c, FrameTi
 // models), replacing the keyframes in the tracked range.
 void applyFollow(Clip& c, const std::vector<FollowKey>& keys, MotionModel model);
 
+// ---- Panning that follows the picture (Resolve's IntelliTrack panning) ------------------
+// The picture audio clip `a` plays with at timeline frame t: a video clip linked to it on screen then (the shot it was
+// recorded with), else the topmost video clip on screen. Null if none.
+const Clip* panFollowSource(const Project& p, const Sequence& s, const Clip& a, FrameTime t);
+// Where the subject of that picture is at timeline frame t (what stands out or moves against the camera), in
+// fractions of the sequence frame: a point to start following from.
+bool panFollowSubject(const Project& p, const Sequence& s, const Clip& a, FrameTime t, double& x, double& y,
+                      std::string* error = nullptr);
+struct PanFollowKey {
+    FrameTime t = 0;          // timeline frame
+    double x = 0.5, y = 0.5;  // the point followed, in fractions of the sequence frame
+};
+// Follows the point (x, y) of the sequence frame (fractions) at timeline frame `from` (within clip `a`): a square
+// `size` (a fraction of the frame height) wide around it is tracked through that picture both ways, to wherever the
+// audio clip or the shot ends first. One key per frame tracked, in timeline order.
+bool trackPanFollow(const Project& p, const Sequence& s, const Clip& a, FrameTime from, double x, double y, double size,
+                    std::vector<PanFollowKey>& keys, const TrackProgress& progress = {},
+                    const std::atomic<bool>* cancel = nullptr, std::string* error = nullptr);
+// Where something seen at `x` across the sequence frame (a fraction) sounds, as the x and y of SurroundPan: in a flat
+// picture somewhere across the front, its edges `width` of the way to the front left and right speakers (±30°); in a
+// 360° sequence, the direction round the listener the picture shows there (behind them, y goes negative). Stereo pan
+// is the x of a flat picture with its edges hard left and right.
+void panFollowPosition(const Sequence& s, double x, double width, bool stereo, double& panX, double& panY);
+// Writes the path into audio track `t`'s automation over its span, which is replaced: its pan lane in stereo, else its
+// surround x lane (and y in 360° sequences). Lightly smoothed and thinned; just outside the span each lane is left as
+// it was. The track reads its lanes (Off becomes Read). False with fewer than two keys.
+bool applyPanFollow(const Sequence& s, Track& t, const std::vector<PanFollowKey>& keys, double width);
+
 // ---- Auto Reframe (media/Reframe.h) ------------------------------------------------
 // The subject of a picture clip at clip-local frame t, in fractions of its frame.
 struct ReframeKey {

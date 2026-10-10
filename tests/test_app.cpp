@@ -73,6 +73,7 @@
 #include "render/Ofx.h"
 #include "Assistant.h"
 #include "AssistantPanel.h"
+#include "PanFollowDialog.h"
 #include "RedactFacesDialog.h"
 #include "SpectralRepairDialog.h"
 #include "automation/McpServer.h"
@@ -7126,6 +7127,106 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(dlg->status().contains("0 covered"));
         // Another sequence closes it.
         QPointer<RedactFacesDialog> guard(dlg);
+        state()->newProject();
+        QTest::qWait(10);
+        QVERIFY(!guard || !guard->isVisible());
+    }
+
+    void panToFollowFromTheClipMenu() {
+        // A textured card crossing a flat frame left to right (x = 80 + pos(t) of 160), with sound.
+        const QString video = dir_.path() + "/crossing.mp4";
+        const int frames = 30;
+        auto pos = [&](double t) { return -55 + 110 * t / (frames - 1); };
+        {
+            QImage card(32, 32, QImage::Format_RGB32);
+            card.fill(QColor(30, 30, 30));
+            {
+                QPainter pa(&card);
+                std::mt19937 rng(5);
+                std::uniform_int_distribution<int> xy(0, 28), sz(2, 7), c(0, 255);
+                for (int i = 0; i < 40; ++i) pa.fillRect(xy(rng), xy(rng), sz(rng), sz(rng), QColor(c(rng), c(rng), c(rng)));
+            }
+            const QString cardPng = dir_.path() + "/crossing-card.png";
+            QVERIFY(card.save(cardPng));
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 160;
+            gs.height = 90;
+            gs.fps = {25, 1};
+            Clip bg = makeGeneratorClip(gen, "color", frames);
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, bg);
+            edit::addTrack(gen, gs, TrackKind::Video);
+            MediaItem cm;
+            cm.id = gen.newId();
+            std::string err;
+            QVERIFY(probeMedia(cardPng.toStdString(), cm, &err));
+            gen.media.push_back(cm);
+            Clip fg = makeClip(gen, cm, TrackKind::Video, gs);
+            fg.duration = frames;
+            fg.motion.params["scale"] = Param(100.0);
+            fg.motion.params["pos_x"].addKey(0, pos(0), Interp::Linear);
+            fg.motion.params["pos_x"].addKey(frames - 1, pos(frames - 1), Interp::Linear);
+            edit::overwrite(gen, gs, {TrackKind::Video, 1}, fg);
+            MediaItem src;
+            src.id = gen.newId();
+            QVERIFY(probeMedia(MONTAGE_TEST_DATA_DIR "/jfk.wav", src, &err));
+            gen.media.push_back(src);
+            Clip snd = makeClip(gen, src, TrackKind::Audio, gs);
+            snd.duration = frames;
+            edit::overwrite(gen, gs, {TrackKind::Audio, 0}, snd);
+            ExportSettings st;
+            st.path = video.toStdString();
+            st.preset = "ultrafast";
+            st.crf = 12;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        state()->newProject();
+        QVERIFY(win_->findChild<QAction*>("panFollow"));
+        QVERIFY(!win_->panFollowDialog());  // no clip
+        const auto ids = state()->importFiles({video});
+        QCOMPARE(ids.size(), size_t(1));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            s.width = 160;
+            s.height = 90;
+            s.fps = {25, 1};
+            return edit::placeMedia(p, s, ids[0], 0, 0, frames, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        const Id sound = state()->sequence()->audioTracks[0].clips.at(0).id;
+        state()->setSelection({sound}, false);
+        state()->setPlayhead(15);
+        PanFollowDialog* dlg = win_->panFollowDialog();
+        QVERIFY(dlg && dlg->isVisible());
+        QCOMPARE(dlg->frame(), FrameTime(15));
+        QVERIFY(dlg->findChild<QWidget*>("panFollowPicker"));
+        QVERIFY2(dlg->status().contains("pan"), qPrintable(dlg->status()));
+        // It starts on the subject: the card.
+        QVERIFY2(std::fabs(dlg->pointX() * 160 - (80 + pos(15))) < 16, qPrintable(QString::number(dlg->pointX())));
+        // A click on the picture moves the point.
+        auto* picker = dlg->findChild<QWidget*>("panFollowPicker");
+        QTest::mouseClick(picker, Qt::LeftButton, {}, QPoint(picker->width() / 4, picker->height() / 2));
+        QVERIFY(dlg->pointX() < 0.4);
+        dlg->setPoint((80 + pos(15)) / 160, 0.5);
+        dlg->setSize(2);
+        QVERIFY(dlg->track(true));
+        QVERIFY(!dlg->busy());
+        QCOMPARE(dlg->keyCount(), frames);
+        QVERIFY2(dlg->status().contains("Followed"), qPrintable(dlg->status()));
+        // One undoable step on the track's pan lane, read back as the card crosses.
+        const Track& tr = state()->sequence()->audioTracks[0];
+        QVERIFY(tr.panAuto.animated());
+        QCOMPARE(tr.automation, int(AutomationMode::Read));
+        QVERIFY2(trackPanAt(tr, 2) < -0.4 && trackPanAt(tr, 27) > 0.4, qPrintable(QString("%1 %2").arg(trackPanAt(tr, 2)).arg(trackPanAt(tr, 27))));
+        state()->undo();
+        QVERIFY(!state()->sequence()->audioTracks[0].panAuto.animated());
+        state()->redo();
+        QVERIFY(state()->sequence()->audioTracks[0].panAuto.animated());
+        // Half the stage: half the pan, writing over the span again.
+        dlg->setWidth(0.5);
+        QVERIFY(dlg->track(true));
+        const double half = trackPanAt(state()->sequence()->audioTracks[0], 27);
+        QVERIFY2(half > 0.2 && half < 0.45, qPrintable(QString::number(half)));
+        // Another sequence closes it.
+        QPointer<PanFollowDialog> guard(dlg);
         state()->newProject();
         QTest::qWait(10);
         QVERIFY(!guard || !guard->isVisible());
