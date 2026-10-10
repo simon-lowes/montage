@@ -258,6 +258,7 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
         audioOut_->addItem(tr("Stereo (folded down)"));
         if (layoutChannels(layout) > 2) form->addRow(tr("Audio channels:"), audioOut_);
         else audioOut_->hide();
+        connect(audioOut_, &QComboBox::currentIndexChanged, this, &ExportDialog::updateSummary);
     }
     stems_ = new QComboBox(form_);
     stems_->setObjectName(QStringLiteral("exportStems"));
@@ -557,7 +558,17 @@ void ExportDialog::updateSummary() {
     if (hasAudio(s)) {
         int rate = s.sampleRate > 0 ? s.sampleRate : seq->sampleRate;
         if (s.audioCodec == "libopus") rate = 48000;  // Opus always encodes at 48 kHz
-        lines << tr("Audio: %1, %2 kHz stereo").arg(audioCodecName(s), QString::number(rate / 1000.0, 'g', 4));
+        // The mix's layout, folded where the codec has fewer channels than the sequence (an immersive mix in AAC).
+        const bool fold = audioOut_ && !audioOut_->isHidden() && audioOut_->currentIndex() == 1;
+        const std::string layout = fold ? std::string("stereo") : exportAudioLayout(seq->audioLayout, s.audioCodec);
+        QString line = tr("Audio: %1, %2 kHz %3").arg(audioCodecName(s), QString::number(rate / 1000.0, 'g', 4), QString::fromStdString(layout));
+        if (!fold && layout != seq->audioLayout)
+            line += tr(" (%1 carries %2 channels at most: the %3 mix folds down; WAV or MOV PCM, or File › Export ADM Master, keep "
+                       "every channel)")
+                        .arg(audioCodecName(s))
+                        .arg(maxAudioChannels(s.audioCodec))
+                        .arg(QString::fromStdString(seq->audioLayout));
+        lines << line;
     } else {
         lines << tr("Audio: none");
     }

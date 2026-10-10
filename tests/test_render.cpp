@@ -1334,6 +1334,37 @@ colorspaces:
             rgb(graded(solid(2, 2, white, white, white), tame), 0, 0, c);
             QVERIFY(std::fabs(codeToNits(pq, c[1]) / 203 - 1) < 0.01);
         }
+        // Half-transparent pixels (feathered edges, keys, titles) grade like opaque ones: untouched they stay as they are
+        // (in PQ too, where a doubled code would clip), graded they get the opaque colour at their alpha.
+        auto halfAlpha = [](float v) {
+            Image img = solid(2, 2, v * 0.5f, v * 0.5f, v * 0.5f);
+            for (int y = 0; y < 2; ++y)
+                for (int x = 0; x < 2; ++x) img.at(x, y)[3] = 0.5f;
+            return img;
+        };
+        {
+            const WorkingSpaceScope working(&pq);
+            const Image edge = graded(halfAlpha(0.6f), {});
+            QVERIFY2(near(edge.at(0, 0)[1], 0.3f, 1e-3f), qPrintable(QString::number(edge.at(0, 0)[1])));
+        }
+        const Image half = graded(halfAlpha(0.2f), {{"shadow_exposure", 1.0}});
+        rgb(graded(solid(2, 2, 0.2f, 0.2f, 0.2f), {{"shadow_exposure", 1.0}}), 0, 0, c);
+        QVERIFY2(near(half.at(0, 0)[1], c[1] * 0.5f, 1e-3f), qPrintable(QString("%1 %2").arg(half.at(0, 0)[1]).arg(c[1])));
+        // HLG's zones sit where SDR's and PQ's do: its mid grey (18% of reference white, 75% code) is in no shadow zone,
+        // and a stop up doubles its light.
+        {
+            const ColorSpace& hlg = *findColorSpace("rec2100hlg");
+            const WorkingSpaceScope working(&hlg);
+            const double white = toLinear(Transfer::Hlg, 0.75);
+            const float grey = float(fromLinear(Transfer::Hlg, 0.18 * white));
+            rgb(graded(solid(2, 2, grey, grey, grey), {{"shadow_exposure", 1.0}}), 0, 0, c);
+            QVERIFY2(near(c[1], grey, 2e-3f), qPrintable(QString("%1 %2").arg(c[1]).arg(grey)));
+            rgb(graded(solid(2, 2, grey, grey, grey), {{"exposure", 1.0}}), 0, 0, c);
+            QVERIFY2(std::fabs(toLinear(Transfer::Hlg, c[1]) / (0.18 * white) - 2) < 0.03, qPrintable(QString::number(c[1])));
+        }
+        // A channel balance that changes quickly with brightness never turns that channel's tones over.
+        const Image blue = graded(ramp, {{"highlight_b", -1.0}, {"highlight_falloff", 0.25}});
+        for (int x = 1; x <= 100; ++x) QVERIFY2(blue.at(x, 0)[2] >= blue.at(x - 1, 0)[2] - 1e-5f, qPrintable(QString::number(x)));
         // The compositor says which space the sequence is in: a grey matte in a PQ sequence, a stop up, has twice the light.
         Sequence seq = makeSequence(p, "HDR", 64, 36, Rational{25, 1});
         seq.colorSpace = "rec2100pq";

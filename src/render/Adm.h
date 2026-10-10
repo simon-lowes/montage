@@ -5,8 +5,10 @@
 // The bed is the mix of every track that is not an object, in the sequence's layout (stereo, 5.1, 7.1 or an immersive
 // one with overhead speakers), named by the common definitions of BS.2094 so any ADM tool knows the speakers (7.1.2,
 // which those definitions lack in Dolby's form, has a pack of its own made of their channels). Each audio track marked
-// as an object (SurroundPan::object) becomes an object of its own: its sound after its fader, as one channel, with its
-// position (x left to right, y back to front, z up) in the ADM's cartesian coordinates. 48 kHz, 24 bits.
+// as an object (SurroundPan::object) and going straight to the speakers (a track sent to a bus is heard through the
+// bus, so it stays in the bed) becomes an object of its own: its sound after its fader, as one channel, at its
+// panner's position in polar coordinates (azimuth, elevation up to the overhead speakers', distance); its LFE send
+// stays in the bed. Solo and mute count as they do when playing. 48 kHz, 24 bits.
 #pragma once
 
 #include <cstdint>
@@ -31,7 +33,8 @@ struct AdmResult {
     std::string bedPack;  // the bed's audioPackFormat ID
 };
 
-// The audio tracks a master would write as objects, in order: those marked as objects that are not muted.
+// The audio tracks a master would write as objects, in order: those marked as objects, not sent to a bus, and heard
+// (not muted, and soloed when any track is).
 std::vector<int> admObjectTracks(const Sequence& s);
 
 // The bed's pack for a layout (BS.2094 common definitions, or Montage's own for 7.1.2) and each speaker's channel

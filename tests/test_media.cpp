@@ -4191,9 +4191,13 @@ private slots:
                 info.chna[0].pack == "AP_00010017");
         QVERIFY(info.chna[8].trackFormat == "AT_00010022_01");  // Ltf, U+045
         QVERIFY(info.chna[12].trackFormat == "AT_00031001_01" && info.chna[12].pack == "AP_00031001");
+        // The object where the panner puts it, in polar coordinates: 45° right (ADM's azimuth counts to the left), raised to
+        // the overhead speakers.
         for (const char* want : {"audioProgrammeName=\"Immersive test\"", "audioPackFormatIDRef>AP_00010017<", "typeDefinition=\"Objects\"",
-                                 "audioObjectName=\"A2\"", "<cartesian>1</cartesian>", "coordinate=\"Z\">1.000000<", "duration=\"00:00:02.00000\""})
+                                 "audioObjectName=\"A2\"", "coordinate=\"azimuth\">-45.000000<", "coordinate=\"elevation\">30.000000<",
+                                 "coordinate=\"distance\">1.000000<", "duration=\"00:00:02.00000\""})
             QVERIFY2(info.axml.find(want) != std::string::npos, want);
+        QVERIFY(info.axml.find("<cartesian>1</cartesian>") == std::string::npos);
         // In the file: the 440 in the bed's L, nothing of the 1 kHz in the bed, the 1 kHz as the object at the level it has
         // at a speaker.
         auto fileRms = [&](const std::string& file, std::vector<double>& out) {
@@ -4243,6 +4247,58 @@ private slots:
         QVERIFY(std::fabs(ch[0] - atSpeaker) < 0.01);
         QVERIFY2(ch[9] < 1e-4, qPrintable(QString::number(ch[9])));
         QVERIFY2(std::fabs(ch[12] - atSpeaker) < 0.01, qPrintable(QString("%1 vs %2").arg(ch[12]).arg(atSpeaker)));
+        // An object's LFE send stays in the bed, as loud as in the mix.
+        {
+            Sequence lfe = s;
+            lfe.audioTracks[1].surround.lfeDb = 0;
+            AudioMixer heard;
+            heard.mixLayout(p, lfe, rate / 2, n, twelve.data());
+            const double sub = rms(twelve, 3, 12);
+            QVERIFY(sub > 0.1);
+            QVERIFY(exportAdmBwf(p, lfe, st, path("lfe.wav"), &r, {}, &err) && r.objects == 1);
+            QVERIFY(fileRms(path("lfe.wav"), ch));
+            QVERIFY2(std::fabs(ch[3] - sub) < 0.01, qPrintable(QString("%1 vs %2").arg(ch[3]).arg(sub)));
+            QVERIFY(std::fabs(ch[12] - atSpeaker) < 0.01 && ch[9] < 1e-4);
+        }
+        // A track sent to a bus is heard through the bus, so it stays in the bed.
+        {
+            Sequence routed = s;
+            Bus b;
+            b.id = p.newId();
+            b.name = "Dialogue";
+            routed.buses.push_back(b);
+            routed.audioTracks[1].output = b.id;
+            QVERIFY(admObjectTracks(routed).empty());
+            QVERIFY(exportAdmBwf(p, routed, st, path("routed.wav"), &r, {}, &err) && r.objects == 0 && r.bedChannels == 12);
+        }
+        // Solo counts as it does when playing: the object soloed, the bed is silent; a bed track soloed, no object.
+        {
+            Sequence solo = s;
+            solo.audioTracks[1].solo = true;
+            QVERIFY(exportAdmBwf(p, solo, st, path("solo.wav"), &r, {}, &err) && r.objects == 1);
+            QVERIFY(fileRms(path("solo.wav"), ch));
+            QVERIFY(ch[0] < 1e-4 && std::fabs(ch[12] - atSpeaker) < 0.01);
+            solo.audioTracks[1].solo = false;
+            solo.audioTracks[0].solo = true;
+            QVERIFY(admObjectTracks(solo).empty());
+            QVERIFY(exportAdmBwf(p, solo, st, path("solo2.wav"), &r, {}, &err) && r.objects == 0);
+            QVERIFY(fileRms(path("solo2.wav"), ch) && std::fabs(ch[0] - atSpeaker) < 0.01);
+        }
+        // Codecs with fewer channels fold the heights down (AAC carries 7.1 at most); PCM keeps them all.
+        QCOMPARE(exportAudioLayout("7.1.4", "aac"), std::string("7.1"));
+        QCOMPARE(exportAudioLayout("5.1.4", "flac"), std::string("5.1"));
+        QCOMPARE(exportAudioLayout("7.1.4", "pcm_s24le"), std::string("7.1.4"));
+        QCOMPARE(exportAudioLayout("7.1", "ac3"), std::string("5.1"));
+        QCOMPARE(exportAudioLayout("5.1", "libmp3lame"), std::string("stereo"));
+        QCOMPARE(exportAudioLayout("5.1.2", ""), std::string("5.1.2"));
+        {
+            ExportSettings aac = findExportPreset("Audio - AAC (M4A)")->settings;
+            aac.path = path("mix714.m4a");
+            QVERIFY2(exportSequence(p, s, aac, nullptr, nullptr, &err), err.c_str());
+            MediaItem folded;
+            QVERIFY(probeMedia(aac.path, folded));
+            QCOMPARE(folded.channels, 8);
+        }
         // 7.1.2 has a pack of its own (Dolby's bed, its pair overhead at the sides); stereo uses BS.2094's.
         Sequence atmos = s;
         atmos.audioLayout = "7.1.2";

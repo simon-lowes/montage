@@ -64,9 +64,12 @@ struct Channel {
 }  // namespace
 
 std::vector<int> admObjectTracks(const Sequence& s) {
+    const bool anySolo = std::any_of(s.audioTracks.begin(), s.audioTracks.end(), [](const Track& t) { return t.solo; });
     std::vector<int> out;
-    for (size_t i = 0; i < s.audioTracks.size(); ++i)
-        if (s.audioTracks[i].surround.object && !s.audioTracks[i].muted) out.push_back(int(i));
+    for (size_t i = 0; i < s.audioTracks.size(); ++i) {
+        const Track& t = s.audioTracks[i];
+        if (t.surround.object && !t.output && !t.muted && (!anySolo || t.solo)) out.push_back(int(i));
+    }
     return out;
 }
 
@@ -174,10 +177,11 @@ bool exportAdmBwf(const Project& p, const Sequence& s, const AdmSettings& settin
     Sequence mixSeq = s;
     mixSeq.sampleRate = kRate;
     mixSeq.audioLayout = layout;
-    std::vector<bool> bedMask(s.audioTracks.size(), true);
-    for (int t : objects) bedMask[size_t(t)] = false;
+    // Objects keep their LFE send in the bed.
+    std::vector<bool> lfeOnly(s.audioTracks.size(), false);
+    for (int t : objects) lfeOnly[size_t(t)] = true;
     AudioMixer bed;
-    bed.setTrackMask(bedMask);
+    bed.setLfeOnly(lfeOnly);
     std::vector<Sequence> objectSeqs;
     std::vector<std::unique_ptr<AudioMixer>> objectMixers;
     for (int t : objects) {
@@ -311,12 +315,18 @@ bool exportAdmBwf(const Project& p, const Sequence& s, const AdmSettings& settin
             x.writeAttribute("audioBlockFormatID", "AB_0003" + hex + "_00000001");
             x.writeAttribute("rtime", admTime(0));
             x.writeAttribute("duration", duration);
-            x.writeTextElement("cartesian", "1");
+            // Polar, as the panner places it: its angle round the room (ADM counts azimuth positive to the left), up to
+            // the overhead speakers' elevation as far as it is raised (in layouts that have them), and its distance.
             const SurroundPan& sp = tr.surround;
-            for (auto [coord, v] : {std::pair<const char*, double>{"X", sp.x}, {"Y", sp.y}, {"Z", sp.z}}) {
+            const double azimuth = -std::atan2(sp.x, sp.y) * 180 / M_PI;
+            const double distance = std::min(1.0, std::hypot(sp.x, sp.y));
+            double top = 0;
+            for (const Speaker& k : layoutSpeakers(layout)) top = std::max(top, k.elevation);
+            const double elevation = std::clamp(sp.z, 0.0, 1.0) * top;
+            for (auto [coord, v] : {std::pair<const char*, double>{"azimuth", azimuth}, {"elevation", elevation}, {"distance", distance}}) {
                 x.writeStartElement("position");
                 x.writeAttribute("coordinate", coord);
-                x.writeCharacters(number(std::clamp(v, -1.0, 1.0)));
+                x.writeCharacters(number(std::abs(v) < 5e-7 ? 0.0 : v));
                 x.writeEndElement();
             }
             x.writeEndElement();  // audioBlockFormat

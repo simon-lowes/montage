@@ -2086,6 +2086,8 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
         const Track& track = seq.audioTracks[ti];
         if (onlyTrack >= 0 ? int(ti) != onlyTrack : (track.muted || (anySolo && !track.solo))) continue;
         if (depth == 0 && !mask_.empty() && (ti >= mask_.size() || !mask_[ti])) continue;
+        const bool lfeOnly = depth == 0 && ti < lfeOnly_.size() && lfeOnly_[ti];
+        if (lfeOnly && (!surround || lfeCh < 0 || track.output || track.surround.lfeDb <= -99)) continue;
         auto bus = track.output ? busBufs.find(track.output) : busBufs.end();
         const int64_t downstream = masterLat + (bus != busBufs.end() ? busLat[bus->first] : 0);
         const int64_t trackLat = chainLatency(track.effects, track.id, sr);
@@ -2121,7 +2123,13 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
                 lv.peakL = std::max(lv.peakL, std::fabs(trackBuf[size_t(i) * 2] * tg));
                 lv.peakR = std::max(lv.peakR, std::fabs(trackBuf[size_t(i) * 2 + 1] * tg));
             }
-            panInto(trackBuf.data(), track.surround, tg, master.data());
+            if (lfeOnly) {
+                const float lfe = float(std::pow(10.0, track.surround.lfeDb / 20));
+                for (int i = 0; i < frames; ++i)
+                    master[size_t(i) * size_t(nch) + size_t(lfeCh)] += 0.70710678f * (trackBuf[size_t(i) * 2] + trackBuf[size_t(i) * 2 + 1]) * tg * lfe;
+            } else {
+                panInto(trackBuf.data(), track.surround, tg, master.data());
+            }
         } else {
             panGains(track.pan, tl, tr);
             float* dest = bus != busBufs.end() ? bus->second.data() : master.data();

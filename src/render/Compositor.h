@@ -94,6 +94,9 @@ public:
     void mixLayout(const Project& p, const Sequence& seq, int64_t start, int frames, float* out);
     // Mixes only the audio tracks whose entry is true (stems); empty = all.
     void setTrackMask(std::vector<bool> mask) { mask_ = std::move(mask); }
+    // Audio tracks heard only through their LFE send (ADM objects: their position is the object's, their LFE send
+    // stays in the bed); empty = none. Only in surround mixes.
+    void setLfeOnly(std::vector<bool> tracks) { lfeOnly_ = std::move(tracks); }
     // Drop filter state (call after seeking).
     void reset();
     // Real-time mode: media whose audio is not decoded yet plays as silence
@@ -122,7 +125,7 @@ private:
     std::map<std::pair<Id, Id>, std::unique_ptr<State>> states_;
     std::mutex m_;
     bool nonBlocking_ = false;
-    std::vector<bool> mask_;
+    std::vector<bool> mask_, lfeOnly_;
 };
 
 }  // namespace montage

@@ -935,10 +935,18 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         if (!s.downmixStereo && seq.audioLayout == "5.1") layout = AV_CHANNEL_LAYOUT_5POINT1;
         if (!s.downmixStereo && seq.audioLayout == "7.1") layout = AV_CHANNEL_LAYOUT_7POINT1;
         if (!s.downmixStereo && immersiveLayout(seq.audioLayout)) {
-            // FFmpeg's names for the overhead layouts; 7.1.2's pair is at the sides (top side, not top front).
-            const char* name = seq.audioLayout == "7.1.2" ? "FL+FR+FC+LFE+BL+BR+SL+SR+TSL+TSR" : seq.audioLayout.c_str();
+            // FFmpeg's overhead layouts (5.1.x on the back pair, 7.1.2's pair at the sides), whose native order is the
+            // order core/Surround.h mixes in.
+            const uint64_t top = AV_CH_TOP_FRONT_LEFT | AV_CH_TOP_FRONT_RIGHT, rear = AV_CH_TOP_BACK_LEFT | AV_CH_TOP_BACK_RIGHT;
+            uint64_t mask = 0;
+            if (seq.audioLayout == "5.1.2") mask = AV_CH_LAYOUT_5POINT1_BACK | top;
+            else if (seq.audioLayout == "5.1.4") mask = AV_CH_LAYOUT_5POINT1_BACK | top | rear;
+            else if (seq.audioLayout == "7.1.2") mask = AV_CH_LAYOUT_7POINT1 | AV_CH_TOP_SIDE_LEFT | AV_CH_TOP_SIDE_RIGHT;
+            else if (seq.audioLayout == "7.1.4") mask = AV_CH_LAYOUT_7POINT1 | top | rear;
             AVChannelLayout immersive{};
-            if (av_channel_layout_from_string(&immersive, name) == 0 && immersive.nb_channels == layoutChannels(seq.audioLayout)) layout = immersive;
+            if (!mask || av_channel_layout_from_mask(&immersive, mask) < 0 || immersive.nb_channels != layoutChannels(seq.audioLayout))
+                return "This FFmpeg cannot describe the " + seq.audioLayout + " layout";
+            layout = immersive;
         }
         if (mono) layout = AV_CHANNEL_LAYOUT_MONO;
         av_channel_layout_copy(&actx->ch_layout, &layout);
@@ -1012,14 +1020,10 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     std::vector<std::unique_ptr<MonoOut>> monos;
     const bool monoTracks = wantAudio && s.monoAudioTracks > 0;
     if (monoTracks) {
-        static const char* const names[3][8] = {{"L", "R"}, {"L", "R", "C", "LFE", "Ls", "Rs"}, {"L", "R", "C", "LFE", "Lss", "Rss", "Lrs", "Rrs"}};
-        // Immersive layouts name their channels as core/Surround.h does.
-        const auto& speakers = layoutSpeakers(seq.audioLayout);
-        auto channelName = [&](int c) -> std::string {
-            if (layoutChannels == 2 || layoutChannels == 6 || layoutChannels == 8)
-                return names[layoutChannels == 6 ? 1 : layoutChannels == 8 ? 2 : 0][c];
-            return c < int(speakers.size()) ? speakers[size_t(c)].name : std::to_string(c + 1);
-        };
+        // Each channel named for its speaker, as core/Surround.h names them (7.1's fifth and sixth are the back pair,
+        // Lb Rb, then the sides, Ls Rs, in FFmpeg's order).
+        const auto& speakers = layoutSpeakers(s.downmixStereo ? std::string("stereo") : seq.audioLayout);
+        auto channelName = [&](int c) -> std::string { return c < int(speakers.size()) ? speakers[size_t(c)].name : std::to_string(c + 1); };
         const int used = layoutChannels * int(1 + s.extraAudio.size());
         const int count = std::max(s.monoAudioTracks, used);
         for (int i = 0; i < count; ++i) {
@@ -1443,13 +1447,38 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
 
 }  // namespace
 
+int maxAudioChannels(const std::string& codec) {
+    if (codec.rfind("pcm_", 0) == 0) return 64;
+    if (codec == "ac3" || codec == "eac3" || codec == "ac3_fixed") return 6;
+    if (codec == "libmp3lame" || codec == "mp3" || codec == "mp2" || codec == "libtwolame") return 2;
+    return 8;
+}
+
+std::string exportAudioLayout(const std::string& layout, const std::string& codec) {
+    if (codec.empty()) return layout;
+    const int most = maxAudioChannels(codec);
+    if (layoutChannels(layout) <= most) return layout;
+    const std::string ear = earLevelLayout(layout);
+    if (layoutChannels(ear) <= most) return ear;
+    return most >= 6 ? "5.1" : "stereo";
+}
+
 bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
                     const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed, int* smartRendered,
                     LightLevels* light) {
     bool opened = false;
     if (smartRendered) *smartRendered = 0;
     if (light) *light = LightLevels{};
-    bool ok = exportImpl(p, seq, s, progress, cancel, error, opened, encoderUsed, smartRendered, light);
+    // Channels a codec cannot carry fold down (an immersive mix to its ear-level layout, for AAC and the like).
+    const std::string layout = s.downmixStereo ? seq.audioLayout : exportAudioLayout(seq.audioLayout, s.audioCodec);
+    bool ok;
+    if (layout != seq.audioLayout) {
+        Sequence folded = seq;
+        folded.audioLayout = layout;
+        ok = exportImpl(p, folded, s, progress, cancel, error, opened, encoderUsed, smartRendered, light);
+    } else {
+        ok = exportImpl(p, seq, s, progress, cancel, error, opened, encoderUsed, smartRendered, light);
+    }
     // Never leave a truncated file behind (the output is closed by now), but
     // don't touch an existing file if we failed before writing to it.
     if (!ok && opened) std::remove(s.path.c_str());

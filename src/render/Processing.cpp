@@ -254,17 +254,23 @@ void hdrPalette(const Effect& e, FrameTime t, Image& img) {
         sat[size_t(i)] = std::max(0.0f, s);
         for (int k = 0; k < 3; ++k) bal[k][size_t(i)] = c[k];
     }
+    // Each channel keeps rising too: a balance that falls faster than the brightness climbs is held level.
+    for (int k = 0; k < 3; ++k)
+        for (int i = 1; i <= kSteps; ++i)
+            bal[k][size_t(i)] = std::max(bal[k][size_t(i)], evOut[size_t(i - 1)] + bal[k][size_t(i - 1)] - evOut[size_t(i)]);
     auto lookup = [&](const std::vector<float>& table, float x) {
         const int i = std::min(kSteps - 1, int(x));
         return table[size_t(i)] + (table[size_t(i + 1)] - table[size_t(i)]) * (x - float(i));
     };
     constexpr float kGrey = 0.18f;
-    perPixel(img, [&](float& r, float& g, float& b, float& a) {
-        if (a <= 0) return;
-        const float un = a < 1 ? 1 / a : 1;
-        const float code[3] = {r * un, g * un, b * un};
+    // HLG decodes to scene light with its peak at 1; its reference white (75%) is brought to 1 like SDR white and PQ's
+    // 203 nits.
+    const float toWhite = space.transfer == Transfer::Hlg ? float(1 / toLinear(Transfer::Hlg, 0.75)) : 1.0f;
+    // perPixel hands over straight (unpremultiplied) colour and premultiplies after.
+    perPixel(img, [&](float& r, float& g, float& b, float&) {
+        const float code[3] = {r, g, b};
         float lin[3];
-        for (int k = 0; k < 3; ++k) lin[k] = tables.decode(code[k]);
+        for (int k = 0; k < 3; ++k) lin[k] = tables.decode(code[k]) * toWhite;
         const float y = kr * lin[0] + kg * lin[1] + kb * lin[2];
         const float ev = y > 1e-9f ? std::log2(y / kGrey) : kEvMin;
         const float x = (std::clamp(ev, kEvMin, kEvMax) - kEvMin) / (kEvMax - kEvMin) * kSteps;
@@ -279,8 +285,8 @@ void hdrPalette(const Effect& e, FrameTime t, Image& img) {
             for (float& v : out) v = y2 + (v - y2) * s;
         }
         for (int k = 0; k < 3; ++k) {
-            const float coded = tables.encode(out[k] + blackOffset);
-            out[k] = (code[k] + (coded - code[k]) * mix) * a;
+            const float coded = tables.encode((out[k] + blackOffset) / toWhite);
+            out[k] = code[k] + (coded - code[k]) * mix;
         }
         r = out[0], g = out[1], b = out[2];
     });
