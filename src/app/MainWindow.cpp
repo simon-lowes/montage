@@ -103,6 +103,7 @@
 #include "RenderQueuePanel.h"
 #include "MixerPanel.h"
 #include "MulticamPanel.h"
+#include "AdrPanel.h"
 #include "CaptionsPanel.h"
 #include "MaskOverlay.h"
 #include "TransformOverlay.h"
@@ -414,6 +415,8 @@ void MainWindow::buildPanels() {
     assistantDock_ = makeDock(tr("Assistant"), "assistant", assistant_);
     indexDock_ = makeDock(tr("Sequence Index"), "index", new SequenceIndexPanel(state_, this));
     multicamDock_ = makeDock(tr("Multicam"), "multicam", multicam_);
+    adr_ = new AdrPanel(state_, program_, programPanel_->viewer(), this);
+    adrDock_ = makeDock(tr("ADR"), "adr", adr_);
     keyframesDock_ = makeDock(tr("Keyframes"), "keyframes", new KeyframePanel(state_, this));
     queue_ = new RenderQueue(this);
     queueDock_ = makeDock(tr("Render Queue"), "renderqueue", new RenderQueuePanel(queue_, this));
@@ -526,7 +529,7 @@ void MainWindow::layOutBuiltIn(const QString& name) {
         resizeDocks({scopesDock_}, {h * 3 / 5}, Qt::Vertical);
     } else if (name == "Audio") {
         // The mixer where the Source monitor was, wide meters (Premiere's Audio workspace, Resolve's Fairlight page).
-        arrangeDocks({{mixerDock_, sourceDock_}, {programDock_}}, {{binDock_, effectsDock_}}, {{meterDock_}});
+        arrangeDocks({{mixerDock_, adrDock_, sourceDock_}, {programDock_}}, {{binDock_, effectsDock_}}, {{meterDock_}});
         resizeDocks({mixerDock_, programDock_}, {900, 640}, Qt::Horizontal);
         resizeDocks({mixerDock_}, {h / 2 + 40}, Qt::Vertical);
         resizeDocks({meterDock_}, {110}, Qt::Horizontal);
@@ -1187,6 +1190,11 @@ void MainWindow::buildMenus() {
         voiceover_->show();
         voiceover_->raise();
     })->setObjectName(QStringLiteral("recordVoiceover"));
+    add(seqM, tr("A&DR (Dialogue Replacement)…"), QKeySequence(), [this] {
+        // The cue list and recording to picture, in its panel beside the Program monitor.
+        adrDock_->show();
+        adrDock_->raise();
+    })->setObjectName(QStringLiteral("showAdr"));
     add(seqM, tr("&Generate Voiceover…"), QKeySequence("Ctrl+Alt+G"), [this] {
         if (!state_->sequence()) return;
         SpeechDialog dlg(state_, this);

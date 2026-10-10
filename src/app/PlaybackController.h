@@ -9,7 +9,10 @@
 #include <QTimer>
 #include <QVector>
 #include <memory>
+#include <optional>
+#include <vector>
 
+#include "core/Adr.h"
 #include "core/Model.h"
 #include "render/Compositor.h"
 
@@ -50,6 +53,12 @@ public:
     // Global Mute (as in Premiere): playback and scrubbing are silent; clips, tracks and exports are untouched.
     void setGlobalMute(bool on);
     bool globalMute() const { return globalMute_; }
+    // Audio tracks left out of what is heard (an ADR guide track while recording), the project untouched.
+    void setMutedAudioTracks(const std::vector<int>& tracks);
+    const std::vector<int>& mutedAudioTracks() const { return mutedTracks_; }
+    // An ADR cycle (core/Adr.h): its beeps are heard while it is set; the Program monitor draws its streamer.
+    void setAdrCycle(const std::optional<AdrCycle>& cycle);
+    const std::optional<AdrCycle>& adrCycle() const { return cycle_; }
     // What the speakers get for `frames` samples of the sequence from sample `start` (silence under Global Mute).
     std::vector<float> heard(int64_t start, int frames);
     double speed() const { return speed_; }
@@ -94,8 +103,12 @@ private:
     FrameTime clampToSequence(FrameTime t) const;
     int playStep() const;
     void scrubAudio(FrameTime t);  // frames per tick direction for render-ahead (0 = paused)
+    void updateHeard();
 
     std::shared_ptr<const Project> project_;
+    std::shared_ptr<const Project> heard_;  // project_, or a copy with mutedTracks_ muted
+    std::vector<int> mutedTracks_;
+    std::optional<AdrCycle> cycle_;
     Id sequenceId_ = 0;
     double scale_ = 0.5;
     bool useProxies_ = false;

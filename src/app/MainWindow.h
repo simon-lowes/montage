@@ -56,6 +56,7 @@ class TranscriptPanel;
 class ShotSearchPanel;
 class PeoplePanel;
 class MulticamPanel;
+class AdrPanel;
 class AudioMeterWidget;
 class LoudnessReadout;
 class VoiceoverDialog;
@@ -419,6 +420,7 @@ private:
     CleanFeedWindow* cleanFeed_ = nullptr;
     MixerPanel* mixer_ = nullptr;
     MulticamPanel* multicam_ = nullptr;
+    AdrPanel* adr_ = nullptr;
     CaptionsPanel* captions_ = nullptr;
     TranscriptPanel* transcript_ = nullptr;
     ShotSearchPanel* shots_ = nullptr;
@@ -450,6 +452,7 @@ private:
     AssistantPanel* assistant_ = nullptr;
     QDockWidget* indexDock_ = nullptr;
     QDockWidget* multicamDock_ = nullptr;
+    QDockWidget* adrDock_ = nullptr;
     QDockWidget* queueDock_ = nullptr;
     QDockWidget* keyframesDock_ = nullptr;
     QDockWidget* meterDock_ = nullptr;

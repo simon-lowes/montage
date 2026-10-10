@@ -38,6 +38,7 @@
 #include "core/Multicam.h"
 #include "core/TimelineCompare.h"
 #include "core/Reconform.h"
+#include "core/Adr.h"
 #include "core/ProjectIO.h"
 #include "core/ScriptCut.h"
 #include "core/Surround.h"
@@ -2732,6 +2733,237 @@ private slots:
         QCOMPARE(uint8_t(head[30]), uint8_t(12));
     }
 
+    void adrCueList() {
+        Fixture fx;
+        Sequence& s = fx.s();  // 30 fps
+        // Cues from captions: a speaker label before the text is the character; a time is not a name.
+        CaptionTrack ct;
+        ct.id = fx.p.newId();
+        auto cap = [](FrameTime a, FrameTime b, const char* t) {
+            Caption c;
+            c.start = a, c.end = b, c.text = t;
+            return c;
+        };
+        ct.captions = {cap(30, 90, "ANNA: Where were you?"), cap(100, 160, "[Ben] Out.\nJust out."), cap(170, 200, "10:30 already?"),
+                       cap(300, 360, "- Dr. Hale: Sit down.")};
+        s.captionTracks.push_back(ct);
+        std::vector<AdrCue> fromCaps = adrCuesFromCaptions(s, -1, 0, 250);
+        QCOMPARE(fromCaps.size(), size_t(3));
+        QCOMPARE(fromCaps[0].character, std::string("ANNA"));
+        QCOMPARE(fromCaps[0].line, std::string("Where were you?"));
+        QCOMPARE(fromCaps[1].character, std::string("Ben"));
+        QCOMPARE(fromCaps[1].line, std::string("Out. Just out."));
+        QVERIFY(fromCaps[2].character.empty());
+        QCOMPARE(fromCaps[2].line, std::string("10:30 already?"));
+        QCOMPARE(fromCaps[1].start, FrameTime(100));
+        QCOMPARE(fromCaps[1].end, FrameTime(160));
+        // Added in time order with cue numbers from the characters' initials.
+        std::vector<Id> ids = addAdrCues(fx.p, s, fromCaps);
+        QCOMPARE(ids.size(), size_t(3));
+        const std::vector<AdrCue> late = adrCuesFromCaptions(s, 0, 250);
+        QCOMPARE(late.size(), size_t(1));
+        QCOMPARE(late[0].character, std::string("Dr. Hale"));
+        addAdrCues(fx.p, s, late);
+        QStringList names;
+        for (const AdrCue& q : s.adrCues) names << QString::fromStdString(q.name);
+        QCOMPARE(names.join(","), QString("A101,B101,ADR101,DH101"));
+        QCOMPARE(nextAdrCueName(s, "Anna"), std::string("A102"));
+        QCOMPARE(nextAdrCueName(s, ""), std::string("ADR102"));
+        QVERIFY(findAdrCue(s, ids[1]) && findAdrCue(s, ids[1])->name == "B101");
+        // Range markers make cues (the name is why, the comment the line); point markers do not.
+        s.markers = {Marker{400, 45, "Plane overhead", "I said no.", 3, false}, Marker{500, 0, "Note", "", 0, false}};
+        const std::vector<AdrCue> fromMarkers = adrCuesFromMarkers(s);
+        QCOMPARE(fromMarkers.size(), size_t(1));
+        QCOMPARE(fromMarkers[0].note, std::string("Plane overhead"));
+        QCOMPARE(fromMarkers[0].line, std::string("I said no."));
+        QCOMPARE(fromMarkers[0].end, FrameTime(445));
+        QVERIFY(adrCuesFromMarkers(s, 0, -1, 5).empty());  // another label
+        addAdrCues(fx.p, s, fromMarkers);
+        QCOMPARE(s.adrCues.back().name, std::string("ADR102"));
+        // No length, no cue.
+        AdrCue empty;
+        empty.start = empty.end = 10;
+        QVERIFY(addAdrCues(fx.p, s, {empty}).empty());
+        QCOMPARE(s.adrCues.size(), size_t(5));
+
+        // The cue sheet, and back.
+        const std::string csv = adrCueSheetCsv(s);
+        QVERIFY(csv.rfind("Cue,Character,Start,End,Duration,Line,Note,Status,Takes\n", 0) == 0);
+        QVERIFY(csv.find("B101,Ben,00:00:03:10,00:00:05:10,00:00:02:00,Out. Just out.,,To Record,0\n") != std::string::npos);
+        std::vector<AdrCue> back;
+        std::string err;
+        QVERIFY2(parseAdrCueSheet(csv, s, back, &err), err.c_str());
+        QCOMPARE(back.size(), s.adrCues.size());
+        for (size_t i = 0; i < back.size(); ++i) {
+            QCOMPARE(back[i].name, s.adrCues[i].name);
+            QCOMPARE(back[i].start, s.adrCues[i].start);
+            QCOMPARE(back[i].end, s.adrCues[i].end);
+            QCOMPARE(back[i].character, s.adrCues[i].character);
+            QCOMPARE(back[i].line, s.adrCues[i].line);
+            QCOMPARE(back[i].note, s.adrCues[i].note);
+        }
+        // A stage's sheet: tab separated, its own column names, on a timeline from 01:00:00:00; a quoted line may run
+        // over two lines. A cue named like one already there updates it.
+        const std::string stage =
+            "Cue #\tRole\tTC In\tTC Out\tDialogue\tReason\tStatus\n"
+            "A101\tAnna\t01:00:01:15\t01:00:03:15\tWhere were you?\tperformance\tApproved\n"
+            "X1\t\t01:00:20:00\t\t\"Two\nlines\"\t\tomit\n"
+            "bad\t\tnot a time\t\t\t\t\n";
+        QVERIFY2(parseAdrCueSheet(stage, s, back, &err), err.c_str());
+        QCOMPARE(back.size(), size_t(2));
+        QCOMPARE(back[0].start, FrameTime(45));
+        QCOMPARE(back[0].end, FrameTime(105));
+        QCOMPARE(back[0].status, int(kAdrApproved));
+        QCOMPARE(back[0].note, std::string("performance"));
+        QCOMPARE(back[1].start, FrameTime(600));
+        QCOMPARE(back[1].end, FrameTime(660));  // no end: two seconds
+        QCOMPARE(back[1].line, std::string("Two lines"));
+        QCOMPARE(back[1].status, int(kAdrOmitted));
+        const Id annaId = s.adrCues[0].id;
+        const std::vector<Id> merged = addAdrCues(fx.p, s, back);
+        QCOMPARE(merged.size(), size_t(2));
+        QCOMPARE(merged[0], annaId);
+        QCOMPARE(s.adrCues.size(), size_t(6));
+        const AdrCue* anna = findAdrCue(s, annaId);
+        QVERIFY(anna->start == 45 && anna->end == 105 && anna->status == kAdrApproved && anna->character == "Anna");
+        QVERIFY(!parseAdrCueSheet("Cue,Line\nA1,Hello\n", s, back, &err));
+        QVERIFY(!parseAdrCueSheet("", s, back, &err));
+        QCOMPARE(adrStatusFromName("RECORDED"), int(kAdrRecorded));
+        QCOMPARE(adrStatusName(kAdrOmitted), std::string("Omitted"));
+
+        // A cycle: four seconds of pre-roll, beeps a second apart with the line where the fourth would be, the streamer
+        // crossing in the two seconds before it, the punch on its first two frames.
+        AdrCue hale = *std::find_if(s.adrCues.begin(), s.adrCues.end(), [](const AdrCue& q) { return q.name == "DH101"; });
+        AdrCycle cy = adrCycle(s, hale);
+        QVERIFY(cy.valid());
+        QCOMPARE(cy.playFrom, FrameTime(180));
+        QCOMPARE(cy.playTo, FrameTime(390));
+        QCOMPARE(cy.beeps, (std::vector<FrameTime>{210, 240, 270}));
+        QCOMPARE(cy.streamerFrom, FrameTime(240));
+        QCOMPARE(cy.streamerTo, FrameTime(300));
+        QCOMPARE(adrStreamerPosition(cy, 239), -1.0);
+        QCOMPARE(adrStreamerPosition(cy, 270), 0.5);
+        QCOMPARE(adrStreamerPosition(cy, 300), 1.0);
+        QCOMPARE(adrStreamerPosition(cy, 301), -1.0);
+        QVERIFY(adrPunch(cy, 300) && adrPunch(cy, 301) && !adrPunch(cy, 302) && !adrPunch(cy, 299));
+        // Too little pre-roll asked for the beeps: they still fit. Near the start, the beeps before frame 0 are left out.
+        AdrSettings shortPre;
+        shortPre.preRoll = 1;
+        shortPre.streamer = 0;
+        cy = adrCycle(s, hale, shortPre);
+        QCOMPARE(cy.playFrom, FrameTime(300 - 105));
+        QVERIFY(cy.streamerFrom < 0 && adrStreamerPosition(cy, 290) < 0);
+        AdrCue early;
+        early.start = 40, early.end = 60;
+        cy = adrCycle(s, early);
+        QCOMPARE(cy.playFrom, FrameTime(0));
+        QCOMPARE(cy.beeps, std::vector<FrameTime>{10});
+        QCOMPARE(cy.streamerFrom, FrameTime(0));
+        AdrSettings two;
+        two.beeps = 2;
+        QCOMPARE(adrCycle(s, hale, two).beeps, (std::vector<FrameTime>{240, 270}));
+
+        // The beeps: 1 kHz at a quarter, 40 ms (longer than a frame at 30 fps), the same however the sound is cut up.
+        cy = adrCycle(s, hale);
+        const int64_t beep = 210 * 48000 / 30;  // 336000
+        std::vector<float> whole(size_t(4000) * 2, 0.0f);
+        addAdrBeeps(cy, 30, 48000, beep - 1000, whole.data(), 4000, 2);
+        float before = 0, during = 0, after = 0;
+        for (int i = 0; i < 4000; ++i) {
+            const float v = std::fabs(whole[size_t(i) * 2]);
+            QCOMPARE(whole[size_t(i) * 2], whole[size_t(i) * 2 + 1]);
+            if (i < 1000) before = std::max(before, v);
+            else if (i < 1000 + 1920) during = std::max(during, v);
+            else after = std::max(after, v);
+        }
+        QCOMPARE(before, 0.0f);
+        QVERIFY(during > 0.24f && during <= 0.25f);
+        QCOMPARE(after, 0.0f);
+        std::vector<float> parts(size_t(4000) * 2, 0.0f);
+        addAdrBeeps(cy, 30, 48000, beep - 1000, parts.data(), 1500, 2);
+        addAdrBeeps(cy, 30, 48000, beep + 500, parts.data() + 3000, 2500, 2);
+        QCOMPARE(parts, whole);
+
+        // Takes: the first lands over the line on the ADR track, in sync; the next joins it as the pick.
+        auto audio = [&](const char* name, double seconds) {
+            MediaItem m;
+            m.id = fx.p.newId();
+            m.kind = MediaKind::Audio;
+            m.name = name;
+            m.path = std::string("/nonexistent/") + name;
+            m.duration = seconds;
+            m.hasAudio = true;
+            fx.p.media.push_back(m);
+            return m.id;
+        };
+        const Id take1 = audio("DH101 1.wav", 7), take2 = audio("DH101 2.wav", 7), stub = audio("short.wav", 1);
+        const Id haleId = hale.id;
+        QVERIFY(edit::addAdrTake(fx.p, s, haleId, take1, 180, -1).ok);
+        const int adr = edit::adrTrack(fx.p, s);
+        QCOMPARE(s.audioTracks[size_t(adr)].name, std::string("ADR"));
+        QCOMPARE(edit::adrTrack(fx.p, s), adr);  // the same track, not another
+        const AdrCue* q = findAdrCue(s, haleId);
+        QVERIFY(q->clip);
+        QCOMPARE(q->status, int(kAdrRecorded));
+        const Clip* c = edit::clipById(s, q->clip);
+        QVERIFY(c && c->start == 300 && c->duration == 60 && c->mediaId == take1 && c->role == "Dialogue");
+        QCOMPARE(c->sourceIn, 120.0);
+        QCOMPARE(edit::locate(s, q->clip)->track, (TrackRef{TrackKind::Audio, adr}));
+        QCOMPARE(adrTakeCount(s, *q), 1);
+        QVERIFY(edit::addAdrTake(fx.p, s, haleId, take2, 190, -1).ok);
+        c = edit::clipById(s, q->clip);
+        QCOMPARE(c->takes.size(), size_t(2));
+        QCOMPARE(c->take, 1);
+        QCOMPARE(c->mediaId, take2);
+        QCOMPARE(c->sourceIn, 110.0);
+        QCOMPARE(c->start, FrameTime(300));
+        QCOMPARE(adrTakeCount(s, *q), 2);
+        QVERIFY(edit::cycleTake(fx.p, s, q->clip, 1).ok);
+        c = edit::clipById(s, q->clip);
+        QVERIFY(c->mediaId == take1 && c->sourceIn == 120.0);
+        QVERIFY(adrCueSheetCsv(s).find(",Sit down.,,Recorded,2\n") != std::string::npos);
+        // An approved cue stays approved; a take that ended before the line is refused.
+        AdrCue* ben = findAdrCue(s, ids[1]);
+        ben->status = kAdrApproved;
+        QVERIFY(!edit::addAdrTake(fx.p, s, ids[1], stub, 0, -1).ok);  // one second from 0: over before 100
+        QVERIFY(edit::addAdrTake(fx.p, s, ids[1], take1, 0, -1).ok);
+        QCOMPARE(findAdrCue(s, ids[1])->status, int(kAdrApproved));
+        // Recording that began after the line started: the clip begins with the take.
+        const Id lateCue = s.adrCues.back().id;  // X1, 600..660
+        QVERIFY(edit::addAdrTake(fx.p, s, lateCue, take1, 610, -1).ok);
+        c = edit::clipById(s, findAdrCue(s, lateCue)->clip);
+        QVERIFY(c->start == 610 && c->duration == 50 && c->sourceIn == 0);
+        QVERIFY(!edit::addAdrTake(fx.p, s, 999999, take1, 0, -1).ok);
+        QVERIFY(!edit::addAdrTake(fx.p, s, haleId, fx.p.newId(), 0, -1).ok);
+        // A cue whose clip was deleted starts again with a new clip.
+        const Id old = findAdrCue(s, lateCue)->clip;
+        QVERIFY(edit::removeClips(fx.p, s, {old}, false).ok);
+        QCOMPARE(adrTakeCount(s, *findAdrCue(s, lateCue)), 0);
+        QVERIFY(edit::addAdrTake(fx.p, s, lateCue, take2, 600, -1).ok);
+        QVERIFY(findAdrCue(s, lateCue)->clip && findAdrCue(s, lateCue)->clip != old);
+
+        // Saved with the project (ids counted), copied with fresh ids and the copies' clips.
+        const std::string file = (QDir::tempPath() + "/montage-adr.montage").toStdString();
+        QVERIFY(saveProject(fx.p, file));
+        Project loaded;
+        QVERIFY(loadProject(file, loaded));
+        QFile::remove(QString::fromStdString(file));
+        QCOMPARE(loaded.active()->adrCues, s.adrCues);
+        for (const AdrCue& k : s.adrCues) QVERIFY(loaded.nextId > k.id);
+        std::map<Id, Id> clipIds;
+        const Id copy = edit::duplicateSequence(fx.p, s.id, "Copy", &clipIds);
+        const Sequence& dup = *fx.p.findSequence(copy);
+        const Sequence& orig = *fx.p.active();
+        QCOMPARE(dup.adrCues.size(), orig.adrCues.size());
+        for (size_t i = 0; i < dup.adrCues.size(); ++i) {
+            QVERIFY(dup.adrCues[i].id != orig.adrCues[i].id);
+            QCOMPARE(dup.adrCues[i].name, orig.adrCues[i].name);
+            QCOMPARE(dup.adrCues[i].clip, orig.adrCues[i].clip ? clipIds[orig.adrCues[i].clip] : Id(0));
+        }
+        QVERIFY(removeAdrCue(fx.s(), annaId));
+        QVERIFY(!removeAdrCue(fx.s(), annaId));
+    }
+
     void immersivePanning() {
         // The layouts: BS.2051's speakers in FFmpeg's channel order.
         QCOMPARE(layoutChannels("5.1.2"), 8);
@@ -4583,6 +4815,14 @@ private slots:
         subs.id = fx.p.newId();
         subs.captions.push_back(Caption{20, 40, "Hello", {}});
         mix.captionTracks.push_back(subs);
+        // ADR cues: one in the third shot (its take the title, for the sake of it), one starting in the trimmed head, one
+        // in the deleted shot, one running past the end of the second shot.
+        auto adr = [&](const char* name, FrameTime a0, FrameTime a1, Id clip) {
+            AdrCue q;
+            q.id = fx.p.newId(), q.name = name, q.start = a0, q.end = a1, q.clip = clip;
+            return q;
+        };
+        mix.adrCues = {adr("B1", 5, 30, 0), adr("D1", 90, 110, 0), adr("A1", 120, 140, title.id), adr("C1", 160, 175, 0)};
         fx.p.sequences.push_back(mix);
         QVERIFY(!reconformSequence(fx.p, mix.id, CutChanges{}, cut.id).sequence);  // nothing to conform to
         CutChanges at25 = ch;
@@ -4626,6 +4866,16 @@ private slots:
         QCOMPARE(out.captionTracks[0].captions.size(), size_t(1));
         QCOMPARE(out.captionTracks[0].captions[0].start, FrameTime(10));
         QCOMPARE(out.captionTracks[0].captions[0].end, FrameTime(30));
+        // The cues go with their lines: the one in the trimmed head starts where its stretch now does, the deleted one goes.
+        QCOMPARE(out.adrCues.size(), size_t(3));
+        QCOMPARE(out.adrCues[0].name, std::string("B1"));
+        QVERIFY(out.adrCues[0].start == 0 && out.adrCues[0].end == 20);
+        QCOMPARE(out.adrCues[1].name, std::string("A1"));
+        QVERIFY(out.adrCues[1].start == 70 && out.adrCues[1].end == 90);
+        QVERIFY(!out.adrCues[1].clip || edit::clipById(out, out.adrCues[1].clip));
+        QCOMPARE(out.adrCues[2].name, std::string("D1"));
+        QVERIFY(out.adrCues[2].start == 130 && out.adrCues[2].end == 140);
+        QVERIFY(out.adrCues[0].id != fx.p.findSequence(mix.id)->adrCues[0].id);
         // The source is untouched; without filling, the new material is a gap.
         QCOMPARE(fx.p.findSequence(mix.id)->videoTracks[0].clips.size(), size_t(4));
         ReconformOptions bare;

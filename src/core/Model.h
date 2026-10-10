@@ -180,6 +180,20 @@ struct Marker {
     bool operator==(const Marker&) const = default;
 };
 
+// An ADR cue (core/Adr.h): a line to re-record to picture, from `start` to `end` (timeline frames, end exclusive).
+struct AdrCue {
+    Id id = 0;
+    std::string name;       // the cue number ("JD101")
+    std::string character;  // who says it
+    std::string line;       // what is said
+    std::string note;       // why it is replaced (noise, performance, a new line)
+    FrameTime start = 0;
+    FrameTime end = 0;
+    int status = 0;  // AdrStatus
+    Id clip = 0;     // the clip holding its takes (an audition), 0 before the first take
+    bool operator==(const AdrCue&) const = default;
+};
+
 // One take of an audition (Final Cut's auditions, Resolve's take selector): a piece of media, starting `offset`
 // sequence frames from the clip's own in-point, so trims and splits of the clip carry its takes along.
 struct Take {
@@ -365,6 +379,7 @@ struct Sequence {
     std::map<std::string, double> folderGains;  // audio track folders' faders (a VCA over their tracks), dB, by "A/name"
     std::vector<std::string> mutedRoles;  // audio roles not heard (clip roles, see Clip::role)
     std::vector<ColorGroup> colorGroups;   // clips graded together (core/ColorGroups.h)
+    std::vector<AdrCue> adrCues;           // lines to re-record, in time order (core/Adr.h)
     std::string colorSpace = "rec709";  // working and delivery space (ColorSpace.h id)
     double hdrPeakNits = 1000;          // mastering peak for HDR spaces
     double hdrMaxCll = 0, hdrMaxFall = 0;  // measured light levels (Analyse HDR Light Levels), nits; 0 = not measured

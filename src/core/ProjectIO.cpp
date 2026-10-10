@@ -472,6 +472,19 @@ QJsonObject sequenceToJson(const Sequence& s) {
         for (const auto& t : s.captionTracks) c.append(captionTrackToJson(t));
         o["captions"] = c;
     }
+    if (!s.adrCues.empty()) {
+        QJsonArray cues;
+        for (const AdrCue& q : s.adrCues) {
+            QJsonObject qo{{"id", double(q.id)}, {"name", qs(q.name)}, {"start", double(q.start)}, {"end", double(q.end)}};
+            if (!q.character.empty()) qo["character"] = qs(q.character);
+            if (!q.line.empty()) qo["line"] = qs(q.line);
+            if (!q.note.empty()) qo["note"] = qs(q.note);
+            if (q.status) qo["status"] = q.status;
+            if (q.clip) qo["clip"] = double(q.clip);
+            cues.append(qo);
+        }
+        o["adrCues"] = cues;
+    }
     if (!s.buses.empty()) {
         QJsonArray buses;
         for (const auto& b : s.buses) {
@@ -564,6 +577,20 @@ Sequence sequenceFromJson(const QJsonObject& o) {
         s.markers.push_back(mk);
     }
     for (const auto& c : o.value("captions").toArray()) s.captionTracks.push_back(captionTrackFromJson(c.toObject()));
+    for (const auto& v : o.value("adrCues").toArray()) {
+        const QJsonObject qo = v.toObject();
+        AdrCue q;
+        q.id = Id(i64(qo.value("id")));
+        q.name = ss(qo.value("name"));
+        q.character = ss(qo.value("character"));
+        q.line = ss(qo.value("line"));
+        q.note = ss(qo.value("note"));
+        q.start = i64(qo.value("start"));
+        q.end = i64(qo.value("end"));
+        q.status = std::clamp(qo.value("status").toInt(0), 0, 3);
+        q.clip = Id(i64(qo.value("clip")));
+        if (q.id && q.end > q.start) s.adrCues.push_back(std::move(q));
+    }
     for (const auto& v : o.value("buses").toArray()) {
         const QJsonObject bo = v.toObject();
         Bus b;
@@ -877,6 +904,7 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
         }
         for (const auto& e : s.masterEffects) bump(e.id);
         for (const auto& ct : s.captionTracks) bump(ct.id);
+        for (const auto& q : s.adrCues) bump(q.id);
         for (const auto& g : s.colorGroups) {
             bump(g.id);
             bump(g.postId);

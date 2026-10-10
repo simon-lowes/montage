@@ -68,6 +68,7 @@
 #include "render/VfxPull.h"
 #include "render/AafExport.h"
 #include "render/Adm.h"
+#include "core/Adr.h"
 #include "render/Retime.h"
 #include "render/FaceRefine.h"
 #include "render/AudioFx.h"
@@ -4130,6 +4131,84 @@ private slots:
         // The gain recovers over the release after the burst: well down soon after, nearly back 5 releases later.
         QVERIFY(std::fabs(out[size_t(25000 + delay) * 2]) < 0.9f * std::fabs(in[size_t(25000) * 2]) + 1e-6f || std::fabs(in[size_t(25000) * 2]) < 0.01f);
         for (int i = 45000; i < 45100; ++i) QVERIFY(std::fabs(out[size_t(i + delay) * 2] - in[size_t(i) * 2]) < 0.002f);
+    }
+
+    void mcpAdrCues() {
+        // A sequence with two captions, and two recordings of the second line.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        CaptionTrack ct;
+        ct.id = p.newId();
+        for (auto [a, b, t] : {std::tuple<FrameTime, FrameTime, const char*>{30, 90, "LEO: Not now."}, {120, 180, "NIA: Then when?"}}) {
+            Caption c;
+            c.start = a, c.end = b, c.text = t;
+            ct.captions.push_back(c);
+        }
+        s.captionTracks.push_back(ct);
+        const QString project = QString::fromStdString(path("adr.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        std::vector<float> take(48000 * 5, 0.1f);
+        writeMonoWav(path("nia1.wav"), take, 48000);
+        writeMonoWav(path("nia2.wav"), take, 48000);
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_adr"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto cues = [](const QJsonObject& r) { return r.value("structuredContent").toObject().value("cues").toArray(); };
+        QJsonObject r = call({{"project", project}, {"action", "from_captions"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(QJsonDocument(r).toJson()));
+        QCOMPARE(cues(r).size(), 2);
+        QCOMPARE(cues(r)[1].toObject().value("name").toString(), QString("N101"));
+        QCOMPARE(cues(r)[1].toObject().value("character").toString(), QString("NIA"));
+        QCOMPARE(cues(r)[1].toObject().value("status").toString(), QString("to_record"));
+        // A cue added by hand, then changed.
+        r = call({{"project", project}, {"action", "add"},
+                  {"cues", QJsonArray{QJsonObject{{"start", 7}, {"end", 9}, {"character", "Leo"}, {"line", "Fine."}}}}});
+        QCOMPARE(cues(r).size(), 3);
+        QCOMPARE(cues(r)[2].toObject().value("name").toString(), QString("L102"));
+        r = call({{"project", project}, {"action", "update"}, {"cue", "L102"}, {"note", "added line"}, {"status", "omitted"}, {"rename", "L200"}});
+        QCOMPARE(cues(r)[2].toObject().value("name").toString(), QString("L200"));
+        QCOMPARE(cues(r)[2].toObject().value("note").toString(), QString("added line"));
+        QCOMPARE(cues(r)[2].toObject().value("status").toString(), QString("omitted"));
+        QVERIFY(call({{"project", project}, {"action", "update"}, {"cue", "L200"}, {"rename", "L101"}}).value("isError").toBool());
+        QVERIFY(call({{"project", project}, {"action", "update"}, {"cue", "nope"}}).value("isError").toBool());
+        QVERIFY(call({{"project", project}, {"action", "update"}, {"cue", "L200"}, {"status", "maybe"}}).value("isError").toBool());
+        // Two takes of N101 (recorded from a second in, frame 30): the first a clip over the line on the ADR track, the second its pick.
+        r = call({{"project", project}, {"action", "add_take"}, {"cue", "N101"}, {"media", QString::fromStdString(path("nia1.wav"))}, {"recorded_from", 1}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(QJsonDocument(r).toJson()));
+        QCOMPARE(cues(r)[1].toObject().value("takes").toInt(), 1);
+        QCOMPARE(cues(r)[1].toObject().value("status").toString(), QString("recorded"));
+        r = call({{"project", project}, {"action", "add_take"}, {"cue", "N101"}, {"media", QString::fromStdString(path("nia2.wav"))}, {"recorded_from", "00:00:01:00"}});
+        QCOMPARE(cues(r)[1].toObject().value("takes").toInt(), 2);
+        QCOMPARE(cues(r)[1].toObject().value("take").toInt(), 2);
+        r = call({{"project", project}, {"action", "pick_take"}, {"cue", "N101"}, {"take", 1}});
+        QCOMPARE(cues(r)[1].toObject().value("take").toInt(), 1);
+        QVERIFY(call({{"project", project}, {"action", "pick_take"}, {"cue", "N101"}, {"take", 5}}).value("isError").toBool());
+        QVERIFY(call({{"project", project}, {"action", "pick_take"}, {"cue", "L101"}, {"take", 1}}).value("isError").toBool());
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Sequence& b = *back.active();
+        const AdrCue& nia = b.adrCues[1];
+        const Clip* clip = edit::clipById(b, nia.clip);
+        QVERIFY(clip && clip->start == 120 && clip->duration == 60 && clip->sourceIn == 90.0 && clip->takes.size() == 2);
+        QCOMPARE(b.audioTracks[size_t(edit::locate(b, nia.clip)->track.index)].name, std::string("ADR"));
+        // The cue sheet, out and in again.
+        const QString sheet = QString::fromStdString(path("adr.csv"));
+        r = call({{"project", project}, {"action", "export_sheet"}, {"path", sheet}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(QJsonDocument(r).toJson()));
+        r = call({{"project", project}, {"action", "remove"}, {"cue", "L200"}});
+        QCOMPARE(cues(r).size(), 2);
+        r = call({{"project", project}, {"action", "import_sheet"}, {"path", sheet}});
+        QCOMPARE(cues(r).size(), 3);
+        QCOMPARE(cues(r)[2].toObject().value("status").toString(), QString("omitted"));
+        QVERIFY(call({{"project", project}, {"action", "from_markers"}}).value("isError").toBool());  // no range markers
+        r = call({{"project", project}});
+        QCOMPARE(cues(r).size(), 3);
     }
 
     void immersiveMixAndAdmMaster() {

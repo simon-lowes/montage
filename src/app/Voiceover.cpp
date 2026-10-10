@@ -106,7 +106,12 @@ QString VoiceoverRecorder::takeFolder() const {
     const QString project = state_->filePath();
     const QString base = project.isEmpty() ? QStandardPaths::writableLocation(QStandardPaths::MusicLocation) + QStringLiteral("/Montage")
                                            : QFileInfo(project).absolutePath();
-    return base + QStringLiteral("/Voiceover");
+    return base + '/' + folder_;
+}
+
+void VoiceoverRecorder::setTakeNaming(const QString& folder, const QString& stem) {
+    folder_ = folder.isEmpty() ? QStringLiteral("Voiceover") : folder;
+    stem_ = stem;
 }
 
 bool VoiceoverRecorder::start(FrameTime at, int track, FrameTime stopAt, const QString& input, bool openDevice, int sampleRate,
@@ -142,7 +147,7 @@ bool VoiceoverRecorder::start(FrameTime at, int track, FrameTime stopAt, const Q
     }
     // A new numbered file for the take.
     QDir().mkpath(takeFolder());
-    const QString stem = QString::fromStdString(s->name) + QStringLiteral(" VO ");
+    const QString stem = stem_.isEmpty() ? QString::fromStdString(s->name) + QStringLiteral(" VO ") : stem_;
     int n = 1;
     do path_ = takeFolder() + '/' + stem + QString::number(n++) + QStringLiteral(".wav");
     while (QFileInfo::exists(path_));
@@ -218,11 +223,16 @@ Id VoiceoverRecorder::stop() {
     }
     lastTake_ = path_;
     // Into the bin's Voiceover folder, then onto the track where recording began.
-    const auto ids = state_->importFiles({path_}, nullptr, QStringLiteral("Voiceover"));
+    const auto ids = state_->importFiles({path_}, nullptr, folder_);
     if (ids.empty()) return 0;
     const Id media = ids.front();
     const FrameTime at = at_;
     const int track = track_;
+    emit taken(media, at);
+    if (!placing_) {
+        emit stopped(0);
+        return 0;
+    }
     std::vector<Id> created;
     state_->apply(tr("Record Voiceover"), [&](Project& p, Sequence& sq) {
         const TrackRef a{TrackKind::Audio, std::min(track, int(sq.audioTracks.size()) - 1)};

@@ -57,6 +57,7 @@
 #include "core/EditOps.h"
 #include "core/TimelineCompare.h"
 #include "core/Reconform.h"
+#include "core/Adr.h"
 #include "core/Effects.h"
 #include "core/History.h"
 #include "core/Interchange.h"
@@ -2927,6 +2928,168 @@ void McpServer::Impl::addTools() {
                 message += QStringLiteral("; made %1").arg(QString::fromStdString(made->name));
             }
             return ok(message, result);
+        });
+
+    add("montage_adr", "ADR cue list and takes",
+        "The lines to re-record to picture (ADR, looping): the sequence's cue list (cue number, character, the line, a "
+        "note on why, start and end, status: to_record, recorded, approved or omitted) and each cue's takes. list shows "
+        "it; add adds cues (numbered from the characters' initials when no name is given; a name already there updates "
+        "that cue); from_captions makes a cue of each caption between from and to (a speaker label before the text is "
+        "the character), from_markers one of each range marker; update changes a cue; remove takes it off; "
+        "import_sheet and export_sheet read and write a cue sheet (CSV); add_take adds a recorded file as the cue's "
+        "next take (its first sample at recorded_from, by default the line's start): the first becomes a clip over the "
+        "line on the ADR track (or `track`), later ones join it as takes of its audition, the newest the pick; "
+        "pick_take plays another take.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "action":{"type":"string","enum":["list","add","from_captions","from_markers","update","remove","import_sheet","export_sheet","add_take","pick_take"],"default":"list"},
+            "cues":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"character":{"type":"string"},
+                "line":{"type":"string"},"note":{"type":"string"},"start":{"type":["number","string"]},"end":{"type":["number","string"]},
+                "status":{"type":"string"}},"required":["start","end"]}},
+            "cue":{"type":"string","description":"A cue number (update, remove, add_take, pick_take)"},
+            "rename":{"type":"string"},"character":{"type":"string"},"line":{"type":"string"},"note":{"type":"string"},
+            "start":{"type":["number","string"]},"end":{"type":["number","string"]},
+            "status":{"type":"string","enum":["to_record","recorded","approved","omitted"]},
+            "from":{"type":["number","string"]},"to":{"type":["number","string"]},
+            "path":{"type":"string","description":"The cue sheet (import_sheet, export_sheet)"},
+            "media":{"type":"string","description":"The recorded take's file (add_take)"},
+            "recorded_from":{"type":["number","string"],"description":"Where the take's first sample belongs (add_take)"},
+            "track":{"type":"integer","minimum":1,"description":"Audio track for a cue's first take (default: the ADR track)"},
+            "take":{"type":"integer","minimum":1,"description":"pick_take: which take"}},
+            "required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const QString action = a.value("action").toString("list");
+            auto statusArg = [](const QString& v) {
+                const QString n = v.trimmed().toLower().replace('_', ' ');
+                if (n != "to record" && n != "recorded" && n != "approved" && n != "omitted")
+                    throw ArgError{"\"status\" must be to_record, recorded, approved or omitted"};
+                return adrStatusFromName(n.toStdString());
+            };
+            auto cueNamed = [&](const QString& name) -> AdrCue& {
+                for (AdrCue& q : s.adrCues)
+                    if (QString::fromStdString(q.name) == name) return q;
+                throw ArgError{QStringLiteral("No ADR cue \"%1\"").arg(name)};
+            };
+            auto listing = [&] {
+                QJsonArray cues;
+                for (const AdrCue& q : s.adrCues) {
+                    QJsonObject o{{"name", QString::fromStdString(q.name)}, {"start", tc(q.start, s)}, {"end", tc(q.end, s)},
+                                  {"status", QString::fromStdString(adrStatusName(q.status)).toLower().replace(' ', '_')},
+                                  {"takes", adrTakeCount(s, q)}};
+                    if (!q.character.empty()) o["character"] = QString::fromStdString(q.character);
+                    if (!q.line.empty()) o["line"] = QString::fromStdString(q.line);
+                    if (!q.note.empty()) o["note"] = QString::fromStdString(q.note);
+                    if (const Clip* c = q.clip ? edit::clipById(s, q.clip) : nullptr) {
+                        o["clip"] = double(c->id);
+                        if (!c->takes.empty()) o["take"] = c->take + 1;
+                    }
+                    cues.append(o);
+                }
+                return QJsonObject{{"cues", cues}};
+            };
+            auto added = [&](std::vector<AdrCue> cues, const QString& what) {
+                const std::vector<Id> ids = addAdrCues(l.project, s, std::move(cues));
+                save(l);
+                return ok(QStringLiteral("%1 %2 ADR cue(s)").arg(what).arg(ids.size()), listing());
+            };
+            const FrameTime from = a.contains("from") ? timeArg(a.value("from"), s, "from") : 0;
+            const FrameTime to = a.contains("to") ? timeArg(a.value("to"), s, "to") : -1;
+            if (action == "list") return ok(QStringLiteral("%1 ADR cue(s)").arg(s.adrCues.size()), listing());
+            if (action == "add") {
+                std::vector<AdrCue> cues;
+                for (const QJsonValue& v : a.value("cues").toArray()) {
+                    const QJsonObject o = v.toObject();
+                    AdrCue q;
+                    q.name = o.value("name").toString().toStdString();
+                    q.character = o.value("character").toString().toStdString();
+                    q.line = o.value("line").toString().toStdString();
+                    q.note = o.value("note").toString().toStdString();
+                    q.start = timeArg(o.value("start"), s, "start");
+                    q.end = timeArg(o.value("end"), s, "end");
+                    if (q.end <= q.start) throw ArgError{"A cue's end must come after its start"};
+                    if (o.contains("status")) q.status = statusArg(o.value("status").toString());
+                    cues.push_back(std::move(q));
+                }
+                if (cues.empty()) throw ArgError{"\"cues\" lists the cues to add"};
+                return added(std::move(cues), "Added or updated");
+            }
+            if (action == "from_captions") {
+                std::vector<AdrCue> cues = adrCuesFromCaptions(s, -1, from, to);
+                if (cues.empty()) return fail("No captions there");
+                return added(std::move(cues), "Made");
+            }
+            if (action == "from_markers") {
+                std::vector<AdrCue> cues = adrCuesFromMarkers(s, from, to);
+                if (cues.empty()) return fail("No range markers (markers with a duration) there");
+                return added(std::move(cues), "Made");
+            }
+            if (action == "update") {
+                AdrCue& q = cueNamed(need(a, "cue"));
+                if (a.contains("rename")) {
+                    const std::string n = str(a, "rename").trimmed().toStdString();
+                    for (const AdrCue& o : s.adrCues)
+                        if (&o != &q && o.name == n) throw ArgError{"Another cue has that number"};
+                    if (n.empty()) throw ArgError{"A cue needs a number"};
+                    q.name = n;
+                }
+                if (a.contains("character")) q.character = str(a, "character").toStdString();
+                if (a.contains("line")) q.line = str(a, "line").toStdString();
+                if (a.contains("note")) q.note = str(a, "note").toStdString();
+                if (a.contains("status")) q.status = statusArg(str(a, "status"));
+                const FrameTime start = a.contains("start") ? timeArg(a.value("start"), s, "start") : q.start;
+                const FrameTime end = a.contains("end") ? timeArg(a.value("end"), s, "end") : q.end;
+                if (end <= start) throw ArgError{"A cue's end must come after its start"};
+                q.start = start, q.end = end;
+                std::stable_sort(s.adrCues.begin(), s.adrCues.end(), [](const AdrCue& x, const AdrCue& y) { return x.start < y.start; });
+                save(l);
+                return ok("Updated the cue", listing());
+            }
+            if (action == "remove") {
+                removeAdrCue(s, cueNamed(need(a, "cue")).id);
+                save(l);
+                return ok("Removed the cue", listing());
+            }
+            if (action == "import_sheet") {
+                QFile f(absolute(need(a, "path")));
+                if (!f.open(QIODevice::ReadOnly)) return fail(QStringLiteral("Cannot read %1").arg(f.fileName()));
+                std::vector<AdrCue> cues;
+                std::string err;
+                if (!parseAdrCueSheet(f.readAll().toStdString(), s, cues, &err)) return fail(QString::fromStdString(err));
+                return added(std::move(cues), "Read");
+            }
+            if (action == "export_sheet") {
+                QFile f(absolute(need(a, "path")));
+                const std::string csv = adrCueSheetCsv(s);
+                if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate) || f.write(csv.data(), qint64(csv.size())) != qint64(csv.size()))
+                    return fail(QStringLiteral("Cannot write %1").arg(f.fileName()));
+                QJsonObject r = listing();
+                r["path"] = f.fileName();
+                return ok(QStringLiteral("Wrote %1 cue(s)").arg(s.adrCues.size()), r);
+            }
+            if (action == "add_take") {
+                const AdrCue& q = cueNamed(need(a, "cue"));
+                const Id cue = q.id;
+                const FrameTime at = a.contains("recorded_from") ? timeArg(a.value("recorded_from"), s, "recorded_from") : q.start;
+                const Id media = mediaFor(l.project, need(a, "media"));
+                const int track = a.contains("track") ? a.value("track").toInt() - 1 : -1;
+                if (a.contains("track") && (track < 0 || track > int(s.audioTracks.size())))
+                    throw ArgError{QStringLiteral("\"track\" must be 1 to %1").arg(s.audioTracks.size() + 1)};
+                const edit::Result r = edit::addAdrTake(l.project, s, cue, media, at, track);
+                if (!r.ok) return fail(QString::fromStdString(r.error));
+                save(l);
+                return ok(QStringLiteral("Take %1 of %2").arg(adrTakeCount(s, *findAdrCue(s, cue))).arg(QString::fromStdString(findAdrCue(s, cue)->name)),
+                          listing());
+            }
+            if (action == "pick_take") {
+                const AdrCue& q = cueNamed(need(a, "cue"));
+                if (!q.clip || !edit::clipById(s, q.clip)) return fail("That cue has no takes");
+                const edit::Result r = edit::pickTake(l.project, s, q.clip, a.value("take").toInt(0) - 1);
+                if (!r.ok) return fail(QString::fromStdString(r.error));
+                save(l);
+                return ok("Picked the take", listing());
+            }
+            throw ArgError{"Unknown action"};
         });
 
     add("montage_layout", "Arrange clips in a layout",

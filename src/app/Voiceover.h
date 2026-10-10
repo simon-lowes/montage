@@ -53,6 +53,12 @@ public:
     static QStringList inputs();
     // Where takes go: a "Voiceover" folder beside the project (or in Music when it is unsaved).
     QString takeFolder() const;
+    // Takes named otherwise: into folder `folder` (on disk beside the project, and in the bin), files `stem` 1, 2...
+    // ("" = "<sequence> VO "). ADR takes go to "ADR", named by their cue.
+    void setTakeNaming(const QString& folder, const QString& stem = {});
+    // With `place` false a take is imported but left off the timeline: taken() says where it began, and stop()
+    // returns 0.
+    void setPlacing(bool place) { placing_ = place; }
 
     // Starts a take at timeline frame `at` for audio track `track` (index), from
     // input `input` ("" = default). With `stopAt` > at, it ends by itself there
@@ -67,12 +73,15 @@ public:
     void cancel();
 
     bool isRecording() const { return writer_.isOpen(); }
+    FrameTime startedAt() const { return at_; }
     double seconds() const { return rate_ > 0 ? double(writer_.frames()) / rate_ : 0; }
     QString lastTake() const { return lastTake_; }
 
 signals:
     void level(float peak);              // linear, per block
     void stopped(montage::Id clip);      // after a take is placed (also when Out ended it)
+    // After a take is imported (placed or not): its media, and the timeline frame its first sample belongs at.
+    void taken(montage::Id media, montage::FrameTime at);
 
 private:
     void readDevice();
@@ -86,7 +95,9 @@ private:
     FrameTime at_ = 0, stopAt_ = -1;
     int track_ = 0;
     QString path_, lastTake_;
+    QString folder_ = QStringLiteral("Voiceover"), stem_;
     bool stopping_ = false;
+    bool placing_ = true;
 };
 
 // Sequence › Record Voiceover: input, level, countdown and punch-in.

@@ -1618,6 +1618,10 @@ Id duplicateSequence(Project& p, Id id, const std::string& name, std::map<Id, Id
                 if (tr.clipB) tr.clipB = clips.count(tr.clipB) ? clips[tr.clipB] : 0;
             }
         }
+    for (AdrCue& q : s.adrCues) {
+        q.id = p.newId();
+        q.clip = clips.count(q.clip) ? clips[q.clip] : 0;
+    }
     const Id out = s.id;
     // Its own item in the media bin, beside the original's.
     MediaItem m;

@@ -2,6 +2,7 @@
 
 #include <atomic>
 
+#include "core/Adr.h"
 #include "media/Loudness.h"
 #include "render/RenderCache.h"
 
@@ -243,6 +244,11 @@ public:
     }
     // Global Mute: the meters still move, the speakers get silence.
     void setMuted(bool on) { muted_ = on; }
+    // An ADR cycle's beeps, in what is heard (never in the meters).
+    void setCycle(const std::optional<AdrCycle>& c) {
+        QMutexLocker lock(&m_);
+        cycle_ = c;
+    }
     bool isSequential() const override { return true; }
     qint64 bytesAvailable() const override { return (1 << 16) + QIODevice::bytesAvailable(); }
 
@@ -257,11 +263,21 @@ protected:
         if (frames <= 0) return 0;
         buf_.resize(size_t(frames) * 2);
         std::vector<MeterLevels> tl;
+        std::optional<AdrCycle> cycle;
+        int64_t first = 0;
+        double fps = 30;
+        int rate = 48000;
         {
             QMutexLocker lock(&m_);
             const Sequence* s = project_ ? project_->findSequence(seq_) : nullptr;
             if (s) mixer_.mix(*project_, *s, sample_, frames, buf_.data(), &tl);
             else std::fill(buf_.begin(), buf_.end(), 0.0f);
+            if (s && cycle_) {
+                cycle = cycle_;
+                fps = s->fpsValue();
+                rate = s->sampleRate;
+            }
+            first = sample_;
             sample_ += frames;
         }
         float pl = 0, pr = 0;
@@ -270,11 +286,17 @@ protected:
             pr = std::max(pr, std::fabs(buf_[size_t(i) * 2 + 1]));
         }
         if (muted_) std::fill(buf_.begin(), buf_.end(), 0.0f);
+        std::vector<float> heard;
+        if (cycle) {
+            heard = buf_;
+            addAdrBeeps(*cycle, fps, rate, first, heard.data(), frames, 2);
+        }
+        const std::vector<float>& out = cycle ? heard : buf_;
         if (int16_) {
             auto* d = reinterpret_cast<int16_t*>(data);
-            for (size_t i = 0; i < buf_.size(); ++i) d[i] = int16_t(std::lround(std::clamp(buf_[i], -1.0f, 1.0f) * 32767.0f));
+            for (size_t i = 0; i < out.size(); ++i) d[i] = int16_t(std::lround(std::clamp(out[i], -1.0f, 1.0f) * 32767.0f));
         } else {
-            std::memcpy(data, buf_.data(), size_t(frames) * 8);
+            std::memcpy(data, out.data(), size_t(frames) * 8);
         }
         QVector<float> tracks;
         tracks.reserve(int(tl.size()) * 2);
@@ -307,6 +329,7 @@ private:
     int64_t sample_ = 0;
     bool int16_ = false;
     std::atomic<bool> muted_{false};
+    std::optional<AdrCycle> cycle_;
     AudioMixer mixer_;
     std::vector<float> buf_;
     QMutex meterM_;
@@ -320,6 +343,7 @@ private:
 
 PlaybackController::PlaybackController(QObject* parent) : QObject(parent) {
     project_ = std::make_shared<Project>(makeDefaultProject());
+    heard_ = project_;
     renderThread_ = new QThread(this);
     renderThread_->setObjectName("montage-render");
     worker_ = new RenderWorker;
@@ -345,7 +369,35 @@ PlaybackController::~PlaybackController() {
 void PlaybackController::setProject(const Project& p, Id sequenceId) {
     project_ = std::make_shared<const Project>(p);
     sequenceId_ = sequenceId;
-    device_->setProject(project_);
+    updateHeard();
+    device_->setProject(heard_);
+}
+
+void PlaybackController::updateHeard() {
+    if (mutedTracks_.empty() || !project_ || !project_->findSequence(sequenceId_)) {
+        heard_ = project_;
+        return;
+    }
+    auto copy = std::make_shared<Project>(*project_);
+    Sequence* s = copy->findSequence(sequenceId_);
+    for (int i : mutedTracks_)
+        if (i >= 0 && i < int(s->audioTracks.size())) {
+            s->audioTracks[size_t(i)].muted = true;
+            s->audioTracks[size_t(i)].solo = false;
+        }
+    heard_ = std::move(copy);
+}
+
+void PlaybackController::setMutedAudioTracks(const std::vector<int>& tracks) {
+    if (tracks == mutedTracks_) return;
+    mutedTracks_ = tracks;
+    updateHeard();
+    device_->setProject(heard_);
+}
+
+void PlaybackController::setAdrCycle(const std::optional<AdrCycle>& cycle) {
+    cycle_ = cycle;
+    device_->setCycle(cycle);
 }
 
 const Sequence* PlaybackController::sequence() const {
@@ -407,7 +459,7 @@ std::vector<float> PlaybackController::heard(int64_t start, int frames) {
     if (!s || globalMute_ || frames <= 0) return mix;
     scrubMixer_.reset();
     scrubMixer_.setNonBlocking(false);
-    scrubMixer_.mix(*project_, *s, start, frames, mix.data());
+    scrubMixer_.mix(*heard_, *s, start, frames, mix.data());
     return mix;
 }
 
@@ -442,7 +494,7 @@ void PlaybackController::scrubAudio(FrameTime t) {
     int64_t start = int64_t(std::llround(double(t) * s->sampleRate / s->fpsValue()));
     scrubMixer_.reset();
     scrubMixer_.setNonBlocking(true);
-    scrubMixer_.mix(*project_, *s, start, frames, mix.data());
+    scrubMixer_.mix(*heard_, *s, start, frames, mix.data());
     std::vector<int16_t> pcm(mix.size());
     const int fade = std::min(frames / 4, 240);
     for (int i = 0; i < frames; ++i) {
@@ -564,7 +616,7 @@ void PlaybackController::startAudio(FrameTime from) {
         if (!dev.isFormatSupported(fmt)) return;
     }
     int64_t startSample = int64_t(std::llround(double(from) * s->sampleRate / s->fpsValue()));
-    device_->configure(project_, sequenceId_, startSample, int16);
+    device_->configure(heard_, sequenceId_, startSample, int16);
     if (!device_->isOpen()) device_->open(QIODevice::ReadOnly);
     sink_ = new QAudioSink(dev, fmt, this);
     sink_->setBufferSize(fmt.bytesForDuration(80000));  // ~80 ms

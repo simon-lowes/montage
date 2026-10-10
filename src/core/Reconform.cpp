@@ -648,6 +648,30 @@ ReconformResult reconformSequence(Project& p, Id sourceId, const CutChanges& cha
         std::stable_sort(caps.begin(), caps.end(), [](const Caption& a, const Caption& b) { return a.start < b.start; });
         out.captionTracks[ct].captions = std::move(caps);
     }
+    // ADR cues the same way: with the stretch their line starts in, or (taken out) the first one it runs into; a line
+    // cut altogether goes, and a cue whose takes were taken out has none.
+    {
+        std::vector<AdrCue> cues;
+        for (AdrCue q : out.adrCues) {
+            const Piece* at = nullptr;
+            for (const Piece& pc : pieces)
+                if (q.start >= pc.i0 && q.start < pc.i1) at = &pc;
+            FrameTime from = q.start;
+            if (!at) {
+                auto next = std::find_if(byOld.begin(), byOld.end(), [&](size_t i) { return pieces[i].i0 > q.start; });
+                if (next == byOld.end() || pieces[*next].i0 >= q.end) continue;
+                at = &pieces[*next];
+                from = at->i0;
+            }
+            const FrameTime to = std::min(q.end, at->i1);
+            q.start = from + at->shift();
+            q.end = to + at->shift();
+            if (q.clip && !edit::clipById(out, q.clip)) q.clip = 0;
+            cues.push_back(std::move(q));
+        }
+        std::stable_sort(cues.begin(), cues.end(), [](const AdrCue& a, const AdrCue& b) { return a.start < b.start; });
+        out.adrCues = std::move(cues);
+    }
 
     // New material from the new cut, on the same tracks (more where it has more), labelled to stand out.
     const int newLabel = std::max(0, labelFromName("Forest"));
