@@ -628,6 +628,14 @@ private slots:
         QCOMPARE(captionKeypad(under[3]), 2);
         QCOMPARE(captionKeypad(under[4]), 2);
         QCOMPARE(raiseCaptionsOverTitles(under, seq), 0);
+        // A 3D title placed low counts as well.
+        Clip low3d = makeGeneratorClip(p, "title3d", 50);
+        low3d.start = 500;
+        low3d.generator.params["pos_y"] = Param(0.3 * seq.height);
+        edit::overwrite(p, seq, {TrackKind::Video, 0}, low3d);
+        under.push_back(placed(510, 540, "under the 3D title", 2));
+        QCOMPARE(raiseCaptionsOverTitles(under, seq), 1);
+        QCOMPARE(captionKeypad(under.back()), 8);
     }
 
     void mergedClipsFromSeparateSound() {

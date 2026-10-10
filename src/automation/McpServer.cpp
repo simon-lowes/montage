@@ -252,7 +252,7 @@ QJsonObject clipJson(const Project& p, const Sequence& s, const Clip& c) {
                   {"duration_seconds", secs(c.duration, s)}};
     if (c.isGenerator()) {
         o["generator"] = QString::fromStdString(c.generator.type);
-        if (c.generator.type == "title") o["text"] = QString::fromStdString(c.generator.s("text"));
+        if (c.generator.type.rfind("title", 0) == 0) o["text"] = QString::fromStdString(c.generator.s("text"));
     } else if (const MediaItem* m = p.findMedia(c.mediaId)) {
         o["media"] = QString::fromStdString(m->path.empty() ? m->name : m->path);
         o["source_in_seconds"] = c.sourceIn / s.fpsValue();
@@ -1533,8 +1533,11 @@ void McpServer::Impl::addTools() {
             if (type != "title3d" && (a.contains("depth") || a.contains("spin_in"))) throw ArgError{"depth and spin_in are for the 3d template"};
             Clip c = makeGeneratorClip(l.project, type, std::max<FrameTime>(1, len));
             c.generator.strings["text"] = need(a, "text").toStdString();
-            if (a.value("size").isDouble()) c.generator.params["size"] = Param(a.value("size").toDouble());
-            if (a.value("depth").isDouble()) c.generator.params["depth"] = Param(std::clamp(a.value("depth").toDouble(), 0.0, 1000.0));
+            for (const char* key : {"size", "depth"})
+                if (a.contains(key) && !a.value(key).isDouble()) throw ArgError{QStringLiteral("\"%1\" is a number").arg(key)};
+            if (a.contains("spin_in") && !a.value("spin_in").isBool()) throw ArgError{"\"spin_in\" is true or false"};
+            if (a.contains("size")) c.generator.params["size"] = Param(std::clamp(a.value("size").toDouble(), 4.0, 1000.0));
+            if (a.contains("depth")) c.generator.params["depth"] = Param(std::clamp(a.value("depth").toDouble(), 0.0, 1000.0));
             if (a.value("spin_in").toBool()) c.generator.params["anim_in"] = Param(2.0);
             if (a.contains("text_animation")) {
                 const QStringList kinds{"none", "rise", "fade", "pop", "drop", "wave", "scramble"};

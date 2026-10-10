@@ -11916,6 +11916,13 @@ private slots:
         r = tool("montage_add_title", QJsonObject{{"project", project}, {"text", "Chapter One"}, {"at", 0}, {"duration", 0.3},
                                                   {"template", "3d"}, {"depth", 60}, {"spin_in", true}, {"track", "V5"}});
         QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QCOMPARE(r.value("structuredContent").toObject().value("text").toString(), QString("Chapter One"));  // the reply says what it reads
+        // Wrong types are refused rather than ignored.
+        for (const QJsonObject& bad : {QJsonObject{{"depth", "60"}}, QJsonObject{{"spin_in", "true"}}, QJsonObject{{"size", "big"}}}) {
+            QJsonObject args{{"project", project}, {"text", "x"}, {"at", 0}, {"template", "3d"}};
+            for (auto it = bad.begin(); it != bad.end(); ++it) args[it.key()] = it.value();
+            QVERIFY(tool("montage_add_title", args).value("isError").toBool());
+        }
         {
             Project p3;
             QVERIFY(loadProject(project.toStdString(), p3));

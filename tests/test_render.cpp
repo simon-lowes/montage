@@ -4378,6 +4378,39 @@ colorspaces:
         back.params["rot_y"] = Param(180.0);
         const Ink bi = ink(renderGenerator(back, 0, w, h, 1.0, 90, 30));
         QVERIFY(std::abs(bi.covered - f.covered) < f.covered / 10 && bi.faces > 0.8 * bi.covered);
+        // Depth goes back from the face, which stays at its set size: as wide deep as flat (perspective draws the
+        // extrusion inside its outline).
+        Effect deep = title("H");
+        deep.params["depth"] = Param(600.0);
+        const Ink di = ink(renderGenerator(deep, 0, w, h, 1.0, 90, 30));
+        QVERIFY2(std::abs((di.x1 - di.x0) - (f.x1 - f.x0)) <= 3, qPrintable(QString("%1 %2").arg(di.x1 - di.x0).arg(f.x1 - f.x0)));
+        // A wide lens and a deep title (which used to put the face behind the camera) still draws it.
+        deep.params["fov"] = Param(120.0);
+        deep.params["depth"] = Param(700.0);
+        const Ink wide = ink(renderGenerator(deep, 0, w, h, 1.0, 90, 30));
+        QVERIFY2(wide.faces > 0.5 * wide.covered && wide.covered > 300, qPrintable(QString("%1 %2").arg(wide.covered).arg(wide.faces)));
+        // Turned so its near end comes past the camera, the rest of the face is still drawn (cut at the near plane).
+        Effect past = title("WIDE TITLE");
+        past.params["size"] = Param(160.0);
+        past.params["rot_y"] = Param(-80.0);
+        past.params["fov"] = Param(100.0);
+        past.params["pos_x"] = Param(-120.0);
+        const Image pi = renderGenerator(past, 0, w, h, 1.0, 90, 30);
+        dump(pi, "t3d-near");
+        const Ink pk = ink(pi);
+        QVERIFY2(pk.faces > 2000, qPrintable(QString("%1 %2").arg(pk.covered).arg(pk.faces)));
+        // Letters run into each other (tight tracking pulls the dash across the I): merged first, so their sides still
+        // face out and show. (Before, the dash's sides were judged from a point that fell inside the I, and turned
+        // inside out: about half the sides went missing.)
+        Effect apart = title("I\u2014");
+        apart.params["rot_y"] = Param(50.0);
+        apart.params["depth"] = Param(120.0);
+        Effect together = apart;
+        together.params["tracking"] = Param(-140.0);
+        const Image ti2 = renderGenerator(together, 0, w, h, 1.0, 90, 30);
+        dump(ti2, "t3d-overlap");
+        const Ink ap = ink(renderGenerator(apart, 0, w, h, 1.0, 90, 30)), tg = ink(ti2);
+        QVERIFY2(tg.sides > 0.65 * ap.sides && tg.covered < ap.covered, qPrintable(QString("%1 %2 %3 %4").arg(tg.sides).arg(ap.sides).arg(tg.covered).arg(ap.covered)));
         // Flat (no depth) and edge on: next to nothing.
         Effect edge = title("H");
         edge.params["depth"] = Param(0.0);
