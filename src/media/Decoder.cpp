@@ -93,7 +93,7 @@ std::string streamProjection(const AVStream* st) {
     return {};
 }
 
-// Stereoscopic 3D footage: how the stream's stereo metadata (MP4 st3d, Matroska StereoMode, H.264 frame packing)
+// Stereoscopic 3D footage: how the stream's stereo metadata (MP4 st3d, Matroska StereoMode)
 // packs the eyes, "sbs" or "tb", and whether the right eye comes first. A frame-compatible file (each eye squeezed to
 // half the frame, as 3D TV and Blu-ray masters are) is told apart by its eyes' shape; 360° stereo is never squeezed.
 std::string streamStereo(const AVStream* st, bool& inverted, bool spherical) {
@@ -109,7 +109,9 @@ std::string streamStereo(const AVStream* st, bool& inverted, bool spherical) {
     if (!data) return {};
     const auto* s3d = reinterpret_cast<const AVStereo3D*>(data);
     inverted = (s3d->flags & AV_STEREO3D_FLAG_INVERT) != 0;
-    const double w = st->codecpar->width, h = std::max(1, st->codecpar->height);
+    // The shape as shown (a stored width with non-square pixels is widened by them).
+    const AVRational sar = st->sample_aspect_ratio.num > 0 ? st->sample_aspect_ratio : st->codecpar->sample_aspect_ratio;
+    const double w = st->codecpar->width * (sar.num > 0 && sar.den > 0 ? av_q2d(sar) : 1.0), h = std::max(1, st->codecpar->height);
     if (s3d->type == AV_STEREO3D_SIDEBYSIDE) return !spherical && w / 2 / h < 1.0 ? "sbs_half" : "sbs";
     if (s3d->type == AV_STEREO3D_TOPBOTTOM) return !spherical && w / (h / 2) > 2.4 ? "tb_half" : "tb";
     return {};
@@ -820,12 +822,16 @@ Frame16Ptr VideoDecoder::convert(const AVFrame* in, double pts, int w, int h, bo
     if (!stereo_.empty() && f->width > 1 && f->height > 1) {
         eyeFrame.reset(av_frame_clone(f));
         if (AVFrame* e = eyeFrame.get()) {
+            // Where the eyes meet, on a whole chroma sample (an odd offset would split packed 4:2:2 pairs).
+            const AVPixFmtDescriptor* pd = av_pix_fmt_desc_get(AVPixelFormat(e->format));
             if (stereo_.rfind("sbs", 0) == 0) {
-                const int half = e->width / 2;
+                int half = e->width / 2;
+                if (pd && pd->log2_chroma_w > 0) half &= ~1;
                 if (eye_) e->crop_left += size_t(half);
                 else e->crop_right += size_t(e->width - half);
             } else {
-                const int half = e->height / 2;
+                int half = e->height / 2;
+                if (pd && pd->log2_chroma_h > 0) half &= ~1;
                 if (eye_) e->crop_top += size_t(half);
                 else e->crop_bottom += size_t(e->height - half);
             }
@@ -1225,6 +1231,34 @@ bool decodeAudioStream(const std::string& path, int sampleRate, int ordinal, std
 }
 
 }  // namespace
+
+void checkStereoMedia(Project& p) {
+    if (p.stereoChecked) return;
+    p.stereoChecked = true;
+    for (MediaItem& m : p.media) {
+        if (m.kind != MediaKind::Video || m.path.empty() || m.subclipOf || !m.stereo.empty()) continue;
+        // The header alone says (no stream analysis), so a project of many files opens quickly.
+        AVFormatContext* fmt = nullptr;
+        if (openMediaInput(&fmt, m.path) < 0) continue;
+        std::string layout;
+        for (unsigned i = 0; i < fmt->nb_streams && layout.empty(); ++i) {
+            const AVStream* st = fmt->streams[i];
+            if (st->codecpar->codec_type != AVMEDIA_TYPE_VIDEO || (st->disposition & AV_DISPOSITION_ATTACHED_PIC)) continue;
+            bool inverted = false;
+            Interpretation in;
+            parseInterpretation(m.path, in);
+            layout = stereoLayout(streamStereo(st, inverted, !streamProjection(st).empty()), in);
+        }
+        avformat_close_input(&fmt);
+        MediaItem fresh;
+        if (layout.empty() || !probeMedia(m.path, fresh)) continue;
+        m.stereo = fresh.stereo;
+        m.width = fresh.width;
+        m.height = fresh.height;
+        for (MediaItem& sub : p.media)
+            if (sub.subclipOf == m.id) sub.stereo = m.stereo, sub.width = m.width, sub.height = m.height;
+    }
+}
 
 AudioBufferPtr decodeAudio(const std::string& path, int sampleRate, std::string* error, const std::atomic<bool>* cancel,
                            const std::vector<int>& channels) {

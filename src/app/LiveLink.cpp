@@ -21,6 +21,7 @@
 #include "core/EditOps.h"
 #include "core/History.h"
 #include "core/ProjectIO.h"
+#include "media/Decoder.h"
 
 namespace montage {
 
@@ -458,6 +459,7 @@ void LiveLink::finish(const Job& job, const QString& tool, const Project& before
             Project loaded;
             std::string err;
             if (loadProject(path.toStdString(), loaded, &err)) {
+                checkStereoMedia(loaded);
                 // The editor's playhead and marks stay where they are.
                 for (Sequence& s : loaded.sequences)
                     if (const Sequence* now = state_->project().findSequence(s.id)) s.playhead = now->playhead, s.inPoint = now->inPoint, s.outPoint = now->outPoint;

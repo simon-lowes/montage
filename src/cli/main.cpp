@@ -232,6 +232,7 @@ bool load(const std::string& path, Project& p) {
         std::fprintf(stderr, "error: %s\n", err.c_str());
         return false;
     }
+    checkStereoMedia(p);
     return true;
 }
 

@@ -1990,6 +1990,7 @@ std::vector<Id> MainWindow::importSequencesFrom(const QString& project, const QS
         if (error) *error = QString::fromStdString(err);
         return {};
     }
+    checkStereoMedia(from);
     std::vector<Id> wanted;
     for (const Sequence& s : from.sequences)
         if (names.isEmpty() || names.contains(QString::fromStdString(s.name))) wanted.push_back(s.id);
@@ -2022,6 +2023,7 @@ void MainWindow::importFromProjectDialog(QString project) {
         QMessageBox::warning(this, tr("Import from Project"), QString::fromStdString(err));
         return;
     }
+    checkStereoMedia(from);
     QDialog dlg(this);
     dlg.setWindowTitle(tr("Import from %1").arg(QFileInfo(project).completeBaseName()));
     auto* v = new QVBoxLayout(&dlg);

@@ -384,6 +384,7 @@ void EditorState::reloadChangedMedia(const QStringList& paths) {
                 m.hasVideo = fresh.hasVideo, m.hasAudio = fresh.hasAudio;
                 m.sampleRate = fresh.sampleRate, m.channels = fresh.channels, m.audioStreams = fresh.audioStreams;
                 m.videoCodec = fresh.videoCodec, m.audioCodec = fresh.audioCodec;
+                m.stereo = fresh.stereo;
                 if (!m.subclipOf) {
                     m.duration = fresh.duration;
                     names << QString::fromStdString(m.name);
@@ -885,6 +886,7 @@ bool EditorState::open(const QString& path, QString* error, Access access) {
         if (error) *error = QString::fromStdString(err);
         return false;
     }
+    checkStereoMedia(p);
     const bool sameFile = samePath(path, path_);
     LockResult lock = LockResult::Unavailable;
     LockOwner holder;
@@ -976,6 +978,7 @@ bool EditorState::takeEdit(QString* error, bool discardChanges) {
 bool EditorState::reloadFromDisk() {
     Project p;
     if (!loadProject(path_.toStdString(), p)) return false;  // being written just now: tried again later
+    checkStereoMedia(p);
     std::map<Id, FrameTime> heads;
     for (const Sequence& s : project_.sequences) heads[s.id] = s.playhead;
     for (Sequence& s : p.sequences)

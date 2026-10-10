@@ -3968,7 +3968,7 @@ private slots:
         QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
         QVERIFY(call("montage_stereo", {{"project", project}, {"clip", double(mclip)}, {"depth", 40}}).value("isError").toBool());
         QVERIFY(call("montage_stereo", {{"project", project}, {"vr180", true}}).value("isError").toBool());  // not 360°
-        r = call("montage_render_frame", {{"project", project}, {"at", 5}, {"width", 160}, {"stereo_view", "anaglyph"}});
+        r = call("montage_render_frame", {{"project", project}, {"at", 0.2}, {"width", 160}, {"stereo_view", "anaglyph"}});
         QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
         r = call("montage_render", {{"project", project}, {"output", QString::fromStdString(path("mcp-tb.mp4"))}, {"preset", "H.264 - Fast Draft"},
                                     {"stereo_view", "tb"}});
@@ -3987,6 +3987,200 @@ private slots:
         const Clip* withDepth = edit::clipById(*after.active(), mclip);
         QVERIFY(withDepth && !withDepth->effects.empty() && withDepth->effects.back().type == "stereo_3d");
         QCOMPARE(withDepth->effects.back().params.at("depth").keys.size(), size_t(1));
+    }
+
+    void stereoscopicEdgeCases() {
+        // A side-by-side file with stereo metadata: the left eye red, the right blue, 160 x 96 an eye.
+        auto solid = [](Project& pr, double r, double g, double b, FrameTime len) {
+            Clip c = makeGeneratorClip(pr, "color", len);
+            c.generator.params["color.r"] = r;
+            c.generator.params["color.g"] = g;
+            c.generator.params["color.b"] = b;
+            return c;
+        };
+        const std::string sbsFile = path("edge-sbs.mp4");
+        {
+            Project src = makeDefaultProject();
+            src.sequences.clear();
+            Sequence& ss = src.sequences.emplace_back(makeSequence(src, "SBS", 320, 96, Rational{25, 1}, 2, 1));
+            src.activeSequence = ss.id;
+            QVERIFY(edit::overwrite(src, ss, {TrackKind::Video, 0}, solid(src, 0, 0, 1, 10)).ok);
+            Clip red = solid(src, 1, 0, 0, 10);
+            red.motion.params["crop_right"] = 50.0;
+            QVERIFY(edit::overwrite(src, ss, {TrackKind::Video, 1}, red).ok);
+            ExportSettings st;
+            st.path = path("edge-flat.mp4");
+            st.preset = "ultrafast";
+            st.crf = 12;
+            std::string err;
+            QVERIFY2(exportSequence(src, ss, st, nullptr, nullptr, &err), err.c_str());
+            Project q = makeDefaultProject();
+            q.sequences.clear();
+            MediaItem flat = probeOrFail(q, st.path);
+            q.media.push_back(flat);
+            Interpretation how;
+            how.stereo = "sbs";
+            QVERIFY(edit::interpretFootage(q, flat.id, how).ok);
+            Sequence& s3 = q.sequences.emplace_back(makeSequence(q, "3D", 160, 96, Rational{25, 1}, 1, 1));
+            q.activeSequence = s3.id;
+            s3.stereo3d = true;
+            QVERIFY(edit::placeMedia(q, s3, flat.id, 0, 0, 10, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+            ExportSettings sb;
+            sb.path = sbsFile;
+            sb.preset = "ultrafast";
+            sb.crf = 12;
+            QVERIFY2(exportSequence(q, s3, sb, nullptr, nullptr, &err), err.c_str());
+        }
+        auto isRed = [](const Image& img, int x, int y) { return img.at(x, y)[0] > 0.7f && img.at(x, y)[2] < 0.25f; };
+        auto isBlue = [](const Image& img, int x, int y) { return img.at(x, y)[2] > 0.7f && img.at(x, y)[0] < 0.2f; };
+        // A project saved before stereo was read: the item has the whole frame's size and no packing. Opened, its
+        // stereo files are found and read as stereo.
+        {
+            Project old = makeDefaultProject();
+            MediaItem m = probeOrFail(old, sbsFile);
+            QCOMPARE(m.stereo, std::string("sbs"));
+            m.stereo.clear();
+            m.width = 320;
+            old.media.push_back(m);
+            const QString file = QString::fromStdString(path("old.montage"));
+            QVERIFY(saveProject(old, file.toStdString()));
+            QFile f(file);
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            QJsonObject root = QJsonDocument::fromJson(f.readAll()).object();
+            f.close();
+            root.remove("mediaStereo");
+            QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            f.write(QJsonDocument(root).toJson());
+            f.close();
+            Project loaded;
+            QVERIFY(loadProject(file.toStdString(), loaded));
+            QVERIFY(!loaded.stereoChecked);
+            QVERIFY(loaded.findMedia(m.id)->stereo.empty());
+            checkStereoMedia(loaded);
+            QVERIFY(loaded.stereoChecked);
+            QCOMPARE(loaded.findMedia(m.id)->stereo, std::string("sbs"));
+            QCOMPARE(loaded.findMedia(m.id)->width, 160);
+            // Saved now, it is not looked at again.
+            QVERIFY(saveProject(loaded, file.toStdString()));
+            Project again;
+            QVERIFY(loadProject(file.toStdString(), again));
+            QVERIFY(again.stereoChecked);
+        }
+        Project p = makeDefaultProject();
+        p.sequences.clear();
+        MediaItem m = probeOrFail(p, sbsFile);
+        QCOMPARE(m.stereo, std::string("sbs"));
+        p.media.push_back(m);
+        Sequence& s3 = p.sequences.emplace_back(makeSequence(p, "3D", 160, 96, Rational{25, 1}, 2, 1));
+        const Id s3id = s3.id;
+        p.activeSequence = s3id;
+        s3.stereo3d = true;
+        QVERIFY(edit::placeMedia(p, s3, m.id, 0, 0, 10, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        // With proxies on, the right eye still comes from the file (a proxy holds the left eye alone).
+        p.findMedia(m.id)->proxyPath = path("edge-flat.mp4");
+        RenderOptions o;
+        o.useProxies = true;
+        o.eye = 1;
+        QVERIFY(isBlue(renderSequenceFrame(p, *p.findSequence(s3id), 5, o), 40, 48));
+        p.findMedia(m.id)->proxyPath.clear();
+        // Burn-ins sit on each eye: a timecode at the top left is in both halves of a side-by-side export.
+        {
+            ExportSettings st;
+            st.path = path("edge-burn.mp4");
+            st.preset = "ultrafast";
+            st.crf = 12;
+            st.burnIn.text = "MONTAGE";
+            st.burnIn.size = 0.2;
+            std::string err;
+            QVERIFY2(exportSequence(p, *p.findSequence(s3id), st, nullptr, nullptr, &err), err.c_str());
+            Project b = makeDefaultProject();
+            b.sequences.clear();
+            MediaItem bm = probeOrFail(b, st.path);
+            QCOMPARE(bm.stereo, std::string("sbs"));
+            b.media.push_back(bm);
+            Sequence& bs = b.sequences.emplace_back(makeSequence(b, "B", 160, 96, Rational{25, 1}, 1, 1));
+            bs.stereo3d = true;
+            QVERIFY(edit::placeMedia(b, bs, bm.id, 0, 0, 10, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+            // The text's light pixels in the top left of each eye (the eyes are red and blue there otherwise).
+            auto lightIn = [&](int eye) {
+                RenderOptions ro;
+                ro.eye = eye;
+                const Image img = renderSequenceFrame(b, bs, 5, ro);
+                int n = 0;
+                for (int y = 0; y < 40; ++y)
+                    for (int x = 0; x < 80; ++x) n += img.at(x, y)[1] > 0.6f;
+                return n;
+            };
+            const int left = lightIn(0), right = lightIn(1);
+            QVERIFY2(left > 20 && right > 20 && std::abs(left - right) < std::max(left, right) / 2,
+                     qPrintable(QString("%1 %2").arg(left).arg(right)));
+        }
+        // A chosen eye size is kept even in each half: 327 wide an eye becomes 328.
+        {
+            ExportSettings st;
+            st.path = path("edge-odd.mp4");
+            st.preset = "ultrafast";
+            st.width = 327;
+            st.height = 96;
+            std::string err;
+            QVERIFY2(exportSequence(p, *p.findSequence(s3id), st, nullptr, nullptr, &err), err.c_str());
+            MediaItem back;
+            QVERIFY(probeMedia(st.path, back));
+            QCOMPARE(back.width, 328);
+            QCOMPARE(back.stereo, std::string("sbs"));
+        }
+        // Nesting keeps the clips in depth.
+        {
+            Sequence* s = p.findSequence(s3id);
+            const Id clip = s->videoTracks[0].clips.at(0).id;
+            QVERIFY(edit::makeCompound(p, *s, {clip}, "Nest").ok);
+            const Sequence* nested = nullptr;
+            for (const Sequence& q : p.sequences)
+                if (q.name == "Nest") nested = &q;
+            QVERIFY(nested && nested->stereo3d);
+            o = RenderOptions{};
+            o.eye = 1;
+            QVERIFY(isBlue(renderSequenceFrame(p, *p.findSequence(s3id), 5, o), 40, 48));
+            o.eye = 0;
+            QVERIFY(isRed(renderSequenceFrame(p, *p.findSequence(s3id), 5, o), 40, 48));
+        }
+        // Over MCP: a still has no stereo layout; the anaglyph saved at full size.
+        {
+            Project mp = makeDefaultProject();
+            mp.sequences.clear();
+            Sequence& ms = mp.sequences.emplace_back(makeSequence(mp, "M", 160, 96, Rational{25, 1}, 1, 1));
+            mp.activeSequence = ms.id;
+            ms.stereo3d = true;
+            MediaItem vm = probeOrFail(mp, sbsFile);
+            mp.media.push_back(vm);
+            QVERIFY(edit::placeMedia(mp, ms, vm.id, 0, 0, 10, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+            const std::string still = path("edge-still.png");
+            {
+                QImage q(64, 32, QImage::Format_RGB32);
+                q.fill(Qt::gray);
+                QVERIFY(q.save(QString::fromStdString(still)));
+            }
+            MediaItem sm = probeOrFail(mp, still);
+            mp.media.push_back(sm);
+            const QString project = QString::fromStdString(path("edge-mcp.montage"));
+            QVERIFY(saveProject(mp, project.toStdString()));
+            McpServer server;
+            auto call = [&](const char* tool, const QJsonObject& args) {
+                const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                      {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                             {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                                   {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+                const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+                return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+            };
+            QVERIFY(call("montage_stereo", {{"project", project}, {"media", double(sm.id)}, {"layout", "sbs"}}).value("isError").toBool());
+            const QString png = QString::fromStdString(path("edge-sbs.png"));
+            const QJsonObject r = call("montage_render_frame", {{"project", project}, {"at", 0.2}, {"stereo_view", "sbs"}, {"output", png}});
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            const QImage saved(png);
+            QCOMPARE(saved.width(), 320);
+            QVERIFY2(qRed(saved.pixel(40, 48)) > 180 && qBlue(saved.pixel(200, 48)) > 180, qPrintable(QString::number(saved.pixel(40, 48), 16) + " " + QString::number(saved.pixel(200, 48), 16)));
+        }
     }
 
     void vfxPullsWithHandles() {

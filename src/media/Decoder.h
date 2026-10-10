@@ -22,6 +22,10 @@ namespace montage {
 
 // Fills `out` (kind, duration, dimensions, codecs...) from the file at `path`.
 bool probeMedia(const std::string& path, MediaItem& out, std::string* error = nullptr);
+// A project saved before Montage read stereo packing: its stereo video files (side-by-side or top-and-bottom metadata)
+// are found from their headers and read again, so their items say so and give one eye's size, as they would imported
+// now. Nothing happens once a project has been checked (Project::stereoChecked).
+void checkStereoMedia(Project& p);
 
 // Captions carried inside a video as CEA-608 (the A/53 caption data of H.264, HEVC and MPEG-2 frames, as broadcast
 // and camera files carry them): caption channel 1, timed in frames at `fps` of the media's own time. The whole video

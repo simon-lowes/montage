@@ -208,6 +208,7 @@ Loaded open(const QJsonObject& a) {
     std::string err;
     if (!loadProject(l.path.toStdString(), l.project, &err))
         throw ArgError{QStringLiteral("Cannot open %1: %2").arg(l.path, QString::fromStdString(err))};
+    checkStereoMedia(l.project);
     if (!l.project.active()) throw ArgError{QStringLiteral("%1 has no sequence").arg(l.path)};
     return l;
 }
@@ -742,6 +743,7 @@ void McpServer::Impl::addTools() {
             std::string err;
             const QString src = absolute(need(a, "from"));
             if (!loadProject(src.toStdString(), from, &err)) return fail(QStringLiteral("Cannot open %1: %2").arg(src, QString::fromStdString(err)));
+            checkStereoMedia(from);
             QStringList names;
             for (const QJsonValue& v : a.value("sequences").toArray()) names << v.toString();
             std::vector<Id> wanted;
@@ -5146,7 +5148,19 @@ void McpServer::Impl::addTools() {
             q.save(&buf, "PNG");
             if (a.contains("output")) {
                 std::string err;
-                if (!exportStill(l.project, s, at, absolute(str(a, "output")).toStdString(), &err)) return fail(QString::fromStdString(err));
+                if (s.stereo3d && ro.stereoView != StereoView::Left) {
+                    // The view asked for, at full size.
+                    RenderOptions full;
+                    full.captions = true;
+                    full.stereoView = ro.stereoView;
+                    Image big = renderProgramFrame(l.project, s, at, full);
+                    flattenOver(big, 0, 0, 0);
+                    QImage q8(big.width, big.height, QImage::Format_RGBA8888);
+                    toRgba8(big, q8.bits(), size_t(q8.bytesPerLine()));
+                    if (!q8.save(absolute(str(a, "output")), "PNG")) return fail(QStringLiteral("Cannot write %1").arg(str(a, "output")));
+                } else if (!exportStill(l.project, s, at, absolute(str(a, "output")).toStdString(), &err)) {
+                    return fail(QString::fromStdString(err));
+                }
             }
             ToolResult r = ok(QStringLiteral("Frame at %1 (%2x%3)").arg(tc(at, s)).arg(img.width).arg(img.height));
             r.png = png;
@@ -5799,6 +5813,7 @@ void McpServer::Impl::addTools() {
                 MediaItem* m = l.project.findMedia(Id(a.value("media").toDouble()));
                 if (!m) throw ArgError{"No such media"};
                 if (m->subclipOf) m = l.project.findMedia(m->subclipOf);
+                if (m->kind != MediaKind::Video || !m->hasVideo) throw ArgError{"Stereo layouts are for video files"};
                 Interpretation i = interpretationOf(*m);
                 if (a.contains("layout")) i.stereo = str(a, "layout") == "file" ? "" : str(a, "layout").toStdString();
                 if (a.contains("swap_eyes")) i.swapEyes = a.value("swap_eyes").toBool();

@@ -683,7 +683,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
     double mw = SW, mh = SH;
     Geometry g;
     double sourceSeconds = -1;  // media time of the frame, for effects that follow the footage
-    uint64_t sourceMedia = 0;   // and its media, and whether it was reframed from 360°, for analyses made from it
+    uint64_t sourceMedia = 0;   // and its media, and whether it was reframed from 360° (or is a right eye), for analyses made from it
     bool reframed = false;
     ofx::FrameFetch ofxFetch;   // the clip's source at other clip frames, for OpenFX plugins that ask (render/Ofx.h)
     if (c.isGenerator() && c.generator.type == "adjustment") {
@@ -722,12 +722,17 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
         } else if (m->kind == MediaKind::Video || m->kind == MediaKind::Image) {
             if (!m->hasVideo && m->kind != MediaKind::Image) return {};
             std::string path = (o.useProxies && !m->proxyPath.empty()) ? m->proxyPath : m->path;
-            // Stereoscopic footage: the eye being rendered (a clip's Stereo 3D effect can swap them).
-            if (!m->stereo.empty() && path == m->path) {
+            // Stereoscopic footage: the eye being rendered (a clip's Stereo 3D effect can swap them). A proxy holds
+            // the left eye alone (it is made through a flat sequence), so the right eye is always read from the file.
+            if (!m->stereo.empty()) {
                 int eye = o.eye;
                 if (const Effect* s3d = enabledEffect(c, "stereo_3d"); s3d && s3d->p("swap_eyes", lt, 0) > 0.5) eye = 1 - eye;
-                if (eye) path = eyePath(path, 1);
+                if (eye) path = eyePath(m->path, 1);
+                // Faces analysed in the left eye sit elsewhere in the right (the eyes' disparity): there they are found
+                // in the picture itself, so Redact Faces never leaves one uncovered.
+                if (eye) reframed = true;
             }
+            const bool original = m->proxyPath.empty() || path != m->proxyPath;  // the file itself, not its proxy
             mw = m->width > 0 ? m->width : SW;
             mh = m->height > 0 ? m->height : SH;
             // Reframe 360: the clip is a view, at the sequence's shape, out of the whole sphere.
@@ -753,7 +758,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             // The size it is shown at (decoding stops at the media's own size), up to four times that.
             const int outW = int(std::ceil(std::clamp(g.mw * std::fabs(g.sx) * o.scale, 1.0, 4.0 * mw)));
             const int outH = int(std::ceil(std::clamp(g.mh * std::fabs(g.sy) * o.scale, 1.0, 4.0 * mh)));
-            const bool upscale = ss && !vr && path == m->path && (outW > int(mw) + 1 || outH > int(mh) + 1) &&
+            const bool upscale = ss && !vr && original && (outW > int(mw) + 1 || outH > int(mh) + 1) &&
                                  ss->p("strength", lt, 100) > 0 && upscalerAvailable() && upscaleModel().installed();
             if (upscale) {
                 w = int(mw);
@@ -766,7 +771,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                 sec = std::clamp(sec, 0.0, std::max(0.0, m->duration - fd * 0.5));
             }
             Frame16Ptr f = MediaPool::instance().videoFrame(path, sec, w, h, o.highQuality);
-            if (!f && path == m->path && isOffline(*m)) f = offlineSlate(w, h);
+            if (!f && original && isOffline(*m)) f = offlineSlate(w, h);
             if (!f) return {};
             if (m->kind == MediaKind::Video) sourceSeconds = sec;
             sourceMedia = m->id;
@@ -1058,7 +1063,8 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
                 if (la.width == W && la.height == H && lb.width == W && lb.height == H)
                     mixed = interpolateFrames(la, lb, u,
                                               "smooth#" + std::to_string(active->id) + '@' + std::to_string(from) + '-' +
-                                                  std::to_string(to) + '#' + std::to_string(W) + 'x' + std::to_string(H));
+                                                  std::to_string(to) + '#' + std::to_string(W) + 'x' + std::to_string(H) +
+                                                  (o.eye ? "#R" : ""));
                 else
                     mixed = transitionMix("cross_dissolve", active->params, la, lb, u, W, H);
             } else {

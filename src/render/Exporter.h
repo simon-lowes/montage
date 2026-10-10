@@ -52,7 +52,7 @@ struct ExportSettings {
     bool alpha = false;                  // keep transparency (ProRes 4444 etc.)
     // A stereoscopic sequence's eyes as delivered (render/Stereo.h names): "sbs" side by side at full size (the
     // default), "sbs_half", "tb", "tb_half", or one picture ("left", "right", "anaglyph"). Packed exports carry stereo
-    // metadata (MP4/MOV st3d, Matroska StereoMode). The width and height asked for are each eye's.
+    // metadata (MP4 st3d, Matroska StereoMode; FFmpeg writes none into MOV). The width and height asked for are each eye's.
     std::string stereo;
     // Captions from the sequence's visible caption track (or captionTrack):
     bool burnInCaptions = false;         // drawn into the picture

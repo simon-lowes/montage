@@ -2005,6 +2005,10 @@ Result makeCompound(Project& p, Sequence& s, const std::vector<Id>& ids, const s
     nested.sampleRate = s.sampleRate;
     nested.colorSpace = s.colorSpace;  // same working space: the clips are not converted twice
     nested.hdrPeakNits = s.hdrPeakNits;
+    // The same kind of picture: stereo clips keep their depth, 360° footage stays whole.
+    nested.stereo3d = s.stereo3d;
+    nested.spherical = s.spherical;
+    nested.vr180 = s.vr180;
     bool hasAudio = false;
     for (Id id : all) {
         auto loc = locate(s, id);

@@ -7,6 +7,8 @@
 #include <iterator>
 #include <utility>
 
+#include "core/Interpretation.h"
+
 namespace montage {
 
 namespace {
@@ -251,10 +253,13 @@ void MediaPool::clear() {
 }
 
 void MediaPool::forget(const std::string& path) {
+    // The file however it is read (each eye of a stereo file, every interpretation of it).
+    const std::string file = uninterpretedPath(path);
+    auto same = [&](const std::string& key) { return key == path || uninterpretedPath(key) == file; };
     {
         std::lock_guard lock(m_);
         for (auto it = lru_.begin(); it != lru_.end();) {
-            if (it->first.path == path) {
+            if (same(it->first.path)) {
                 cacheBytes_ -= it->second->bytes();
                 index_.erase(it->first);
                 it = lru_.erase(it);
@@ -262,15 +267,19 @@ void MediaPool::forget(const std::string& path) {
                 ++it;
             }
         }
-        if (auto d = decoders_.find(path); d != decoders_.end()) {
+        for (auto d = decoders_.begin(); d != decoders_.end();) {
+            if (!same(d->first)) {
+                ++d;
+                continue;
+            }
             auto& slots = d->second;
             slots.erase(std::remove_if(slots.begin(), slots.end(), [](const Slot& s) { return !s.busy; }), slots.end());
-            if (slots.empty()) decoders_.erase(d);
+            d = slots.empty() ? decoders_.erase(d) : std::next(d);
         }
     }
     std::lock_guard lock(audioM_);
-    for (auto it = audio_.begin(); it != audio_.end();) it = audioKeyFile(it->first.first) == path ? audio_.erase(it) : std::next(it);
-    for (auto it = peaks_.begin(); it != peaks_.end();) it = audioKeyFile(it->first) == path ? peaks_.erase(it) : std::next(it);
+    for (auto it = audio_.begin(); it != audio_.end();) it = same(audioKeyFile(it->first.first)) ? audio_.erase(it) : std::next(it);
+    for (auto it = peaks_.begin(); it != peaks_.end();) it = same(audioKeyFile(it->first)) ? peaks_.erase(it) : std::next(it);
 }
 
 void MediaPool::setReadyCallback(std::function<void(const std::string&)> cb) {

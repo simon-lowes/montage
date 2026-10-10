@@ -57,6 +57,7 @@ void takeDetails(MediaItem& m, const MediaItem& n, bool replace) {
     m.videoCodec = n.videoCodec;
     m.audioCodec = n.audioCodec;
     m.colorSpace = n.colorSpace;
+    m.stereo = n.stereo;  // its size above is one eye's
     if (!n.projection.empty()) m.projection = n.projection;
     if (!m.subclipOf) m.duration = n.duration;
     if (replace) {

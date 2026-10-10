@@ -255,7 +255,7 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     stereo_->addItem(tr("Right eye only (2D)"), QStringLiteral("right"));
     stereo_->addItem(tr("Anaglyph (red-cyan)"), QStringLiteral("anaglyph"));
     stereo_->setCurrentIndex(std::max(0, stereo_->findData(appSettings().value("export/stereo", "sbs").toString())));
-    stereo_->setToolTip(tr("Packed exports say how their eyes are packed (MP4 and MOV st3d, Matroska StereoMode), so 3D "
+    stereo_->setToolTip(tr("Packed exports say how their eyes are packed (MP4 st3d, Matroska StereoMode; MOV keeps none), so 3D "
                            "players, headsets and YouTube show them in depth"));
     if (seq && seq->stereo3d) form->addRow(tr("Stereo 3D:"), stereo_);
     else stereo_->hide();
@@ -585,6 +585,10 @@ void ExportDialog::updateSummary() {
         line += ", " + QString::fromStdString(space.label);
         if (&space != &sequenceColorSpace(*seq) && sequenceColorSpace(*seq).hdr() && !space.hdr()) line += tr(" (tone mapped)");
         lines << line;
+        // FFmpeg writes stereo and spherical metadata into MP4 and Matroska only.
+        const bool packed = seq->stereo3d && view != StereoView::Left && view != StereoView::Right && view != StereoView::Anaglyph;
+        if ((packed || seq->spherical) && p->extension == "mov")
+            lines << tr("MOV keeps no 3D or 360° metadata: choose MP4 or MKV for players and YouTube to recognise it");
     } else {
         lines << tr("Video: none");
     }

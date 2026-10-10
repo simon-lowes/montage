@@ -415,6 +415,9 @@ struct Project {
     std::vector<std::string> watchFolders;  // folders whose arriving media files are imported (app/EditorState)
     Id activeSequence = 0;
     Id nextId = 1;
+    // Whether its media's stereo packing (MediaItem::stereo) has been read: false for a project saved before Montage
+    // read it, until media/Decoder.h checkStereoMedia looks (not saved).
+    bool stereoChecked = true;
 
     Id newId() { return nextId++; }
     MediaItem* findMedia(Id id);

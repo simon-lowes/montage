@@ -631,6 +631,7 @@ private:
         if (!m || m->kind != MediaKind::Video || m->path.empty()) return nullptr;
         if (mediaColorSpace(*m).id != seqSpace_.id) return nullptr;  // would be converted
         if (!interpretationOf(*m).empty()) return nullptr;            // read differently from its packets
+        if (!m->stereo.empty()) return nullptr;                       // one eye of each picture is shown
         if (openMediaInput(&src.fmt, m->path) < 0) return nullptr;
         if (avformat_find_stream_info(src.fmt, nullptr) < 0) return nullptr;
         src.stream = av_find_best_stream(src.fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
@@ -739,8 +740,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     int H = (s.height > 0 ? s.height : seq.height) * down;
     W += W & 1;  // most codecs need even dimensions
     H += H & 1;
-    if (across == 2) W += (W / 2) & 1;  // each eye even too
-    if (down == 2) H += (H / 2) & 1;
+    if (across == 2) W += 2 * ((W / 2) & 1);  // each eye even too
+    if (down == 2) H += 2 * ((H / 2) & 1);
     const int sr = s.sampleRate > 0 ? s.sampleRate : seq.sampleRate;
 
     const ColorSpace& seqSpace = sequenceColorSpace(seq);
@@ -884,7 +885,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         avcodec_parameters_from_context(o.vst->codecpar, o.vctx);
         o.vst->time_base = o.vctx->time_base;
         o.vst->avg_frame_rate = fps;
-        // Packed stereoscopic 3D: stereo metadata, so players and headsets show the eyes apart (MP4/MOV st3d, written
+        // Packed stereoscopic 3D: stereo metadata, so players and headsets show the eyes apart (MP4 st3d, written
         // only when asked to go beyond the standard, as sv3d is; Matroska StereoMode).
         const bool packed = seq.stereo3d && stereoView != StereoView::Left && stereoView != StereoView::Right && stereoView != StereoView::Anaglyph;
         if (packed) {
@@ -903,8 +904,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         }
         if (seq.spherical) {
             // A 360° sequence: equirectangular spherical metadata, so players and YouTube show it as 360°
-            // (MP4/MOV sv3d and st3d boxes, which FFmpeg writes only when asked to go beyond the standard; Matroska
-            // Projection).
+            // (MP4 sv3d and st3d boxes, which FFmpeg writes only when asked to go beyond the standard and never into MOV;
+            // Matroska Projection).
             size_t size = 0;
             if (AVSphericalMapping* map = av_spherical_alloc(&size)) {
                 map->projection = AV_SPHERICAL_EQUIRECTANGULAR;
@@ -1385,9 +1386,27 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         if (wantVideo && smart && smart->copy(f, in, o.oc)) {
             // copied from the source
         } else if (wantVideo) {
-            Image img = s.alpha && !seq.stereo3d ? renderSequenceFrame(p, seq, f, ro) : renderProgramFrame(p, seq, f, ro);
-            if (s.burnInCaptions && captions) drawCaption(img, *captions, f, &seqSpace);
-            if (s.burnIn.any()) drawBurnIns(img, p, seq, f, s.burnIn, watermark.isNull() ? nullptr : &watermark, &seqSpace);
+            const bool burns = (s.burnInCaptions && captions) || s.burnIn.any();
+            auto burn = [&](Image& img) {
+                if (s.burnInCaptions && captions) drawCaption(img, *captions, f, &seqSpace);
+                if (s.burnIn.any()) drawBurnIns(img, p, seq, f, s.burnIn, watermark.isNull() ? nullptr : &watermark, &seqSpace);
+            };
+            Image img;
+            if (burns && seq.stereo3d && stereoView != StereoView::Left && stereoView != StereoView::Right && stereoView != StereoView::Anaglyph) {
+                // Packed eyes: captions and burn-ins on each eye, so they sit on the screen in both rather than across
+                // the join.
+                RenderOptions eye = ro;
+                eye.stereoView = StereoView::Left;
+                Image left = renderProgramFrame(p, seq, f, eye);
+                eye.stereoView = StereoView::Right;
+                Image right = renderProgramFrame(p, seq, f, eye);
+                burn(left);
+                burn(right);
+                img = combineStereo(left, right, stereoView);
+            } else {
+                img = s.alpha && !seq.stereo3d ? renderSequenceFrame(p, seq, f, ro) : renderProgramFrame(p, seq, f, ro);
+                burn(img);
+            }
             convertColor(img, seqSpace, outSpace, peakNits);
             if (measure) meter.add(img, f, measured);
             if (floatFrames && img.width == W && img.height == H) {

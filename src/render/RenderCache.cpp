@@ -104,6 +104,7 @@ void addClipAt(QCryptographicHash& h, const Project& p, const Sequence& seq, con
 bool addFrame(QCryptographicHash& h, const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o, int depth) {
     h.addData(QByteArray::number(seq.width) + 'x' + QByteArray::number(seq.height) + '@' + QByteArray::number(seq.fpsValue(), 'g', 10));
     h.addData(QByteArray::fromStdString(seq.colorSpace) + QByteArray::number(seq.hdrPeakNits));
+    if (seq.stereo3d) h.addData("|stereo");  // clips placed in depth (a nested sequence's too)
     bool any = false;
     for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti) {
         const Track& track = seq.videoTracks[ti];
