@@ -452,8 +452,8 @@ bool MediaBinWidget::setImageSequenceRate(Id media, double fps) {
     return state_->apply(tr("Interpret Frame Rate"), [media, rate](Project& p, Sequence&) { return edit::setImageSequenceRate(p, media, rate); });
 }
 
-bool MediaBinWidget::interpretFootage(const std::vector<Id>& media, const Interpretation& how) {
-    return state_->apply(tr("Interpret Footage"), [media, how](Project& p, Sequence&) {
+bool MediaBinWidget::interpretFootage(const std::vector<Id>& media, const Interpretation& how, bool keepHighlights) {
+    return state_->apply(tr("Interpret Footage"), [media, how, keepHighlights](Project& p, Sequence&) {
         edit::Result out = edit::Result::fail("");
         for (Id id : media) {
             const MediaItem* m = p.findMedia(id);
@@ -461,6 +461,7 @@ bool MediaBinWidget::interpretFootage(const std::vector<Id>& media, const Interp
             Interpretation i = how;
             if (m->kind == MediaKind::Image) i.fps = Rational{0, 1};
             if (!isRawMedia(*m)) i.rawExposure = 0, i.rawTemperature = 0, i.rawTint = 0, i.rawHighlights.clear(), i.rawHalf = false;
+            else if (keepHighlights) i.rawHighlights = interpretationOf(*m).rawHighlights;
             const edit::Result r = edit::interpretFootage(p, id, i);
             if (!r.ok && !r.error.empty()) return edit::Result::fail(m->name + ": " + r.error);
             if (r.ok) out = {};
@@ -473,7 +474,7 @@ void MediaBinWidget::interpretFootageDialog(const std::vector<Id>& media) {
     const MediaItem* first = media.empty() ? nullptr : state_->project().findMedia(media.front());
     if (!first) return;
     InterpretFootageDialog dlg(*first, int(media.size()), this);
-    if (dlg.exec() == QDialog::Accepted) interpretFootage(media, dlg.interpretation());
+    if (dlg.exec() == QDialog::Accepted) interpretFootage(media, dlg.interpretation(), !dlg.highlightsShown());
 }
 
 void MediaBinWidget::importInto(const QStringList& files, const QString& bin) {

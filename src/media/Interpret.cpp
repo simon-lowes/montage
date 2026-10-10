@@ -56,6 +56,7 @@ Result interpretFootage(Project& p, Id media, Interpretation i) {
     if (!validRawHighlights(i.rawHighlights)) return Result::fail("Highlights are clip, blend or rebuild");
     if (i.rawHighlights == "clip") i.rawHighlights.clear();
     if (i.hasRaw() && !isRawMedia(*m)) return Result::fail("Camera RAW settings are for camera RAW stills, CinemaDNG and ProRes RAW");
+    if (m->videoCodec == "prores_raw") i.rawHighlights.clear();  // (ProRes RAW clips at the sensor's white itself)
     if (i.rawExposure < -5 || i.rawExposure > 5) return Result::fail("Exposure must be -5 to +5 stops");
     if (i.rawTemperature != 0 && (i.rawTemperature < 2000 || i.rawTemperature > 25000)) return Result::fail("The temperature must be 2000 to 25000 K");
     if (i.rawTint < -150 || i.rawTint > 150) return Result::fail("The tint must be -150 to 150");

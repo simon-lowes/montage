@@ -237,7 +237,7 @@ InterpretFootageDialog::InterpretFootageDialog(const MediaItem& first, int count
     rawBox->setVisible(raw_);
     // ProRes RAW clips its highlights at the sensor's white itself (LibRaw's recovery modes are for stills and DNGs).
     if (first.videoCodec == "prores_raw") {
-        highlights_->setCurrentIndex(0);
+        highlightsShown_ = false;
         rawForm->setRowVisible(highlights_, false);
     }
     lay->addWidget(rawBox);

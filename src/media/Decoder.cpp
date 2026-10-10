@@ -686,6 +686,9 @@ bool VideoDecoder::openCodec(bool tryHardware, std::string* error) {
         // Many decoders can be open at once; bound each one's thread pool.
         ctx_->thread_count = int(std::clamp(std::thread::hardware_concurrency(), 1u, 8u));
         ctx_->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+        // ProRes RAW (every frame a key frame) decodes its tiles in parallel; FFmpeg 9.0's frame threading would run
+        // them one after another, and hold each seek's first frame back until eight were decoded.
+        if (proResRaw_) ctx_->thread_type = FF_THREAD_SLICE;
     }
     int rc = avcodec_open2(ctx_, codec, nullptr);
     if (rc < 0 && hwPixFmt_ >= 0) {
@@ -1268,6 +1271,19 @@ bool decodeAudioStream(const std::string& path, int sampleRate, int ordinal, std
 }  // namespace
 
 void checkStereoMedia(Project& p) {
+    // ProRes RAW media read by another build: developed to ACEScct where this FFmpeg gives its colour, left to FFmpeg
+    // (and not ACEScct) where it does not; their size and colour space come from probing again.
+    for (MediaItem& m : p.media) {
+        if (m.videoCodec != "prores_raw" || m.path.empty() || m.subclipOf || (m.colorSpace == "acescct") == proResRawAvailable()) continue;
+        MediaItem fresh = m;
+        fresh.colorSpace.clear();
+        if (!probeMedia(m.path, fresh)) continue;
+        m.colorSpace = fresh.colorSpace;
+        m.width = fresh.width;
+        m.height = fresh.height;
+        for (MediaItem& sub : p.media)
+            if (sub.subclipOf == m.id) sub.colorSpace = m.colorSpace, sub.width = m.width, sub.height = m.height;
+    }
     if (p.stereoChecked) return;
     p.stereoChecked = true;
     for (MediaItem& m : p.media) {

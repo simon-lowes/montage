@@ -121,7 +121,7 @@ public:
     // Interpret Footage on an image sequence (media/ImageSequence.h): its frames at `fps`; one undo step.
     bool setImageSequenceRate(Id media, double fps);
     // Interpret Footage (core/Interpretation.h) on each of `media`; one undo step. False (with a message) if none changed.
-    bool interpretFootage(const std::vector<Id>& media, const Interpretation& how);
+    bool interpretFootage(const std::vector<Id>& media, const Interpretation& how, bool keepHighlights = false);
     // The Interpret Footage dialog for `media`, applied when accepted.
     void interpretFootageDialog(const std::vector<Id>& media);
 

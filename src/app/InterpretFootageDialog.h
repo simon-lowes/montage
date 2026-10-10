@@ -23,6 +23,9 @@ public:
     InterpretFootageDialog(const MediaItem& first, int count, QWidget* parent = nullptr);
     // The choices (fps 0 = the file's own rate).
     Interpretation interpretation() const;
+    // Whether the RAW highlight mode was offered (not for ProRes RAW, which clips at the sensor's white): when not,
+    // each item keeps its own.
+    bool highlightsShown() const { return highlightsShown_; }
 
 private:
     QRadioButton* fileRate_ = nullptr;
@@ -45,6 +48,7 @@ private:
     QComboBox* highlights_ = nullptr;
     QCheckBox* half_ = nullptr;
     bool raw_ = false;  // the settings apply (camera RAW media)
+    bool highlightsShown_ = true;
 };
 
 }  // namespace montage

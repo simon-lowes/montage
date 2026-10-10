@@ -32,16 +32,20 @@ struct ProResRawColor {
     double gain = 1;                                         // to scene-linear light
 };
 
-// The developed picture's size: the mosaic less its recommended crop (left, top, right, bottom), on whole 2x2 cells
-// so the colour pattern stays RGGB; halved with `half`.
+// The developed picture's size: the mosaic less its recommended crop (left, top, right, bottom) exactly; with `half`,
+// whole 2x2 cells of it, halved.
 void proResRawSize(int width, int height, const int crop[4], bool half, int& outWidth, int& outHeight);
 
+// The white balance multipliers on the mosaic (red, green, blue): as shot, or for `settings`' light (its white as the
+// camera sees it once balanced as shot, made white) and tint (on green).
+void proResRawBalance(const ProResRawColor& color, const RawSettings& settings, double mul[3]);
+
 // Develops an RGGB mosaic (16-bit samples, `stride` samples a row) into 16-bit RGB encoded as ACEScct (AP1
-// primaries), so the scene's whole range fits: sensor range to 0-1, white balance (as shot, or `settings`' temperature
-// and tint by chromatic adaptation from the as-shot light), sites past the sensor's white clipped (so clipped
-// highlights go white, not magenta), bilinear demosaic (or, with settings.half, each 2x2 cell one pixel), the camera
-// matrix, the gain and `settings.exposure`. `crop` is cut away; `rgb` holds proResRawSize()'s picture, `rgbStride`
-// samples a row.
+// primaries), so highlights far above white keep their stops: sensor range to 0-1, the white balance on the mosaic
+// (proResRawBalance), each channel clipped where it saturates (so blown areas are white, not magenta, whatever the
+// balance; bright saturated colours lose what lies past the first channel's saturation, as LibRaw's Clip does), a
+// bilinear demosaic (or, with settings.half, each 2x2 cell one pixel), the camera matrix, the gain and
+// `settings.exposure`. `crop` is cut away; `rgb` holds proResRawSize()'s picture, `rgbStride` samples a row.
 void developProResRaw(const uint16_t* mosaic, int width, int height, ptrdiff_t stride, const ProResRawColor& color,
                       const RawSettings& settings, const int crop[4], uint16_t* rgb, ptrdiff_t rgbStride);
 
@@ -67,5 +71,7 @@ struct ProResRawInfo {
     ProResRawColor color;
 };
 bool probeProResRaw(const std::string& path, ProResRawInfo& out, std::string* error = nullptr);
+// The same from a ProRes RAW frame's own header (a packet as the file holds it); false if it is not one.
+bool parseProResRawFrame(const uint8_t* data, size_t size, ProResRawInfo& out);
 
 }  // namespace montage

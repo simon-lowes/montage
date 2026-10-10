@@ -2082,15 +2082,72 @@ private slots:
         magenta.tint = 60;
         const auto mg = at(develop(grey, color, magenta), 7, 5);
         QVERIFY2(mg[1] < mg[0] * 0.9 && mg[1] < mg[2] * 0.9, qPrintable(show(mg)));
-        // The recommended crop is cut on whole 2x2 cells (an odd margin rounds out), at full size and at half.
+        // The recommended crop is cut exactly at full size, on whole 2x2 cells at half.
         const int crop[4] = {2, 2, 3, 1};
         int cw = 0, ch = 0;
         proResRawSize(w, h, crop, false, cw, ch);
-        QCOMPARE(cw, 10);
-        QCOMPARE(ch, 8);
+        QCOMPARE(cw, 11);
+        QCOMPARE(ch, 9);
         proResRawSize(w, h, crop, true, cw, ch);
         QCOMPARE(cw, 5);
         QCOMPARE(ch, 4);
+        {
+            const DevelopedRaw odd = develop(grey, color, {}, crop);
+            QCOMPARE(odd.width, 11);
+            QVERIFY2(near(at(odd, 0, 0), {0.18, 0.18, 0.18}, 0.004) && near(at(odd, 10, 8), {0.18, 0.18, 0.18}, 0.004),
+                     qPrintable(show(at(odd, 0, 0)) + " / " + show(at(odd, 10, 8))));
+        }
+        // The frame's edges keep their colour (neighbours past the crop are real sites; past the mosaic, mirrored ones).
+        {
+            const DevelopedRaw o = develop(mosaic(orange), color, {});
+            const auto mid = at(o, 8, 6);
+            for (auto [x, y] : {std::pair{0, 0}, std::pair{15, 0}, std::pair{0, 11}, std::pair{15, 11}, std::pair{1, 0}, std::pair{0, 1}})
+                QVERIFY2(near(at(o, x, y), mid, 0.006), qPrintable(QString("(%1, %2) ").arg(x).arg(y) + show(at(o, x, y)) + " / " + show(mid)));
+            const int margin[4] = {2, 2, 2, 2};
+            const DevelopedRaw c = develop(mosaic(orange), color, {}, margin);
+            QVERIFY2(near(at(c, 0, 0), mid, 0.006), qPrintable(show(at(c, 0, 0))));
+        }
+        // Blown highlights stay white whatever white balance or tint is chosen (the balance is on the mosaic, before
+        // the clip).
+        for (RawSettings chosen : {tungsten, shade, magenta}) {
+            const auto bw = at(develop(mosaic({1.0, 1.0, 1.0}, 0.5, 0.5), [&] { auto c = daylight; c.wbRed = 2, c.wbBlue = 1.5; return c; }(), chosen), 7, 5);
+            QVERIFY2(std::fabs(bw[0] - bw[1]) < 0.01 * bw[1] && std::fabs(bw[2] - bw[1]) < 0.01 * bw[1], qPrintable(show(bw)));
+        }
+        // A frame's own header gives its size, crop and colour without decoding it.
+        {
+            std::vector<uint8_t> pkt(10 + 70, 0);
+            auto put16 = [&](size_t o, uint32_t v) { pkt[o] = uint8_t(v >> 8), pkt[o + 1] = uint8_t(v); };
+            auto put32 = [&](size_t o, uint32_t v) { pkt[o] = uint8_t(v >> 24), pkt[o + 1] = uint8_t(v >> 16), pkt[o + 2] = uint8_t(v >> 8), pkt[o + 3] = uint8_t(v); };
+            auto putF = [&](size_t o, float f) {
+                uint32_t b;
+                std::memcpy(&b, &f, 4);
+                put32(o, b);
+            };
+            put32(0, uint32_t(pkt.size()));
+            std::memcpy(pkt.data() + 4, "prrf", 4);
+            put16(8, 72);  // the header's length, with these two bytes
+            const size_t hd = 10;
+            put16(hd + 6, 4112), put16(hd + 8, 2176);
+            pkt[hd + 10] = 8, pkt[hd + 11] = 6, pkt[hd + 12] = 4, pkt[hd + 13] = 2;  // left, right, top, bottom
+            put16(hd + 16, 61312);
+            putF(hd + 18, 1.82421875f), putF(hd + 22, 2.08203125f);
+            const float mx[9] = {0.494f, 0.354f, 0.101f, 0.075f, 0.968f, -0.043f, -0.133f, -0.345f, 1.567f};
+            for (int i = 0; i < 9; ++i) putF(hd + 26 + size_t(i) * 4, mx[i]);
+            putF(hd + 62, 11.7412f);
+            put16(hd + 66, 5600);
+            ProResRawInfo hi;
+            QVERIFY(parseProResRawFrame(pkt.data(), pkt.size(), hi));
+            QCOMPARE(hi.width, 4112 - 8 - 6);
+            QCOMPARE(hi.height, 2176 - 4 - 2);
+            QVERIFY(hi.crop[0] == 8 && hi.crop[1] == 4 && hi.crop[2] == 6 && hi.crop[3] == 2);
+            QVERIFY(std::fabs(hi.color.white - 61568.0 / 65535) < 1e-9 && std::fabs(hi.color.black - 256.0 / 65535) < 1e-9);
+            QVERIFY(std::fabs(hi.color.wbRed - 1.82421875) < 1e-6 && std::fabs(hi.color.wbBlue - 2.08203125) < 1e-6);
+            QVERIFY(std::fabs(hi.color.gain - 11.7412) < 1e-4 && std::fabs(hi.color.camToXyz[8] - 1.567) < 1e-5);
+            QCOMPARE(hi.color.cct, 5600u);
+            pkt[5] = 'X';
+            QVERIFY(!parseProResRawFrame(pkt.data(), pkt.size(), hi));
+            QVERIFY(!parseProResRawFrame(pkt.data(), 20, hi));
+        }
         // (a mosaic whose left two columns and top two rows are a different grey, cut away)
         auto edged = grey;
         for (int y = 0; y < h; ++y)
@@ -2104,6 +2161,24 @@ private slots:
         m.path = "clip.mov";
         m.videoCodec = "prores_raw";
         QCOMPARE(isRawMedia(m), proResRawAvailable());
+        // A project saved by a build that developed ProRes RAW, opened by one that cannot: its media is probed again and
+        // no longer read as ACEScct.
+        if (!proResRawAvailable()) {
+            const std::string still = path("prores-raw-stand-in.png");
+            QImage(32, 16, QImage::Format_RGB32).save(QString::fromStdString(still));
+            Project saved = makeDefaultProject();
+            MediaItem item;
+            item.id = saved.newId();
+            item.kind = MediaKind::Video;
+            item.path = still;
+            item.videoCodec = "prores_raw";
+            item.colorSpace = "acescct";
+            item.width = 4096, item.height = 2160;
+            saved.media.push_back(item);
+            checkStereoMedia(saved);
+            QVERIFY(saved.media.back().colorSpace != "acescct");
+            QCOMPARE(saved.media.back().width, 32);
+        }
     }
 
     void proResRawDecode() {
@@ -2157,6 +2232,21 @@ private slots:
         const auto upMean = mean(*bf);
         QVERIFY2(upMean[1] > smallMean[1] + 0.03, qPrintable(show(smallMean) + " / " + show(upMean)));
         QVERIFY(edit::interpretFootage(p, m.id, up).ok);
+        // LibRaw's highlight modes do not apply: asked for, they are left out (the picture and its proxy kept).
+        Interpretation rebuild = up;
+        rebuild.rawExposure = 0.5;
+        rebuild.rawHighlights = "rebuild";
+        QVERIFY(edit::interpretFootage(p, m.id, rebuild).ok);
+        QVERIFY(interpretationOf(*p.findMedia(m.id)).rawHighlights.empty());
+        // Saved by a build that could not develop it: probed again on opening, as ACEScct at the cropped size.
+        Project saved = makeDefaultProject();
+        MediaItem old = m;
+        old.colorSpace.clear();
+        old.width = 4112, old.height = 2176;
+        saved.media.push_back(old);
+        checkStereoMedia(saved);
+        QCOMPARE(saved.media.back().colorSpace, std::string("acescct"));
+        QCOMPARE(saved.media.back().width, info.width);
     }
 
     void cameraRawSettingsAndCinemaDng() {

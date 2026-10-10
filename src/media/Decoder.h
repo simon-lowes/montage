@@ -24,7 +24,8 @@ namespace montage {
 bool probeMedia(const std::string& path, MediaItem& out, std::string* error = nullptr);
 // A project saved before Montage read stereo packing: its stereo video files (side-by-side or top-and-bottom metadata)
 // are found from their headers and read again, so their items say so and give one eye's size, as they would imported
-// now. Nothing happens once a project has been checked (Project::stereoChecked).
+// now. Nothing happens once a project has been checked (Project::stereoChecked). ProRes RAW media saved by a build
+// that read them differently (with or without FFmpeg 9's colour) are probed again every time.
 void checkStereoMedia(Project& p);
 
 // Captions carried inside a video as CEA-608 (the A/53 caption data of H.264, HEVC and MPEG-2 frames, as broadcast

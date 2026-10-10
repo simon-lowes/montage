@@ -4,7 +4,6 @@
 #include <cmath>
 #include <cstring>
 #include <memory>
-#include <thread>
 
 #include "Image.h"
 #include "render/ColorSpace.h"
@@ -116,48 +115,70 @@ bool proResRawAvailable() {
 }
 
 void proResRawSize(int width, int height, const int crop[4], bool half, int& outWidth, int& outHeight) {
-    const int x0 = std::clamp(crop[0], 0, width) & ~1, y0 = std::clamp(crop[1], 0, height) & ~1;
-    const int x1 = std::max(x0, (width - std::clamp(crop[2], 0, width)) & ~1), y1 = std::max(y0, (height - std::clamp(crop[3], 0, height)) & ~1);
-    outWidth = half ? (x1 - x0) / 2 : x1 - x0;
-    outHeight = half ? (y1 - y0) / 2 : y1 - y0;
+    const int left = std::clamp(crop[0], 0, width), top = std::clamp(crop[1], 0, height);
+    const int right = std::max(left, width - std::clamp(crop[2], 0, width)), bottom = std::max(top, height - std::clamp(crop[3], 0, height));
+    if (!half) {
+        outWidth = right - left;
+        outHeight = bottom - top;
+        return;
+    }
+    // Half size: whole 2x2 cells (an odd margin keeps one more column or row on the left and top, one less on the right
+    // and bottom).
+    outWidth = std::max(0, (right & ~1) - (left & ~1)) / 2;
+    outHeight = std::max(0, (bottom & ~1) - (top & ~1)) / 2;
+}
+
+void proResRawBalance(const ProResRawColor& color, const RawSettings& settings, double mul[3]) {
+    mul[0] = std::max(1e-6, color.wbRed), mul[1] = 1, mul[2] = std::max(1e-6, color.wbBlue);
+    if (settings.temperature > 0) {
+        // The chosen light's white as the camera sees it once balanced as shot (the camera's matrix takes the as-shot
+        // light to D65), made the new white: c = camToXyz^-1 · Bradford(as shot → D65) · XYZ(light).
+        double ax = 0.3127, ay = 0.3290, kx, ky;
+        if (color.cct > 0) planckian(color.cct, ax, ay);
+        planckian(settings.temperature, kx, ky);
+        double adapt[9], inv[9];
+        bradford(ax, ay, 0.3127, 0.3290, adapt);
+        if (invert3(color.camToXyz, inv)) {
+            const double xyz[3] = {kx / ky, 1, (1 - kx - ky) / ky};
+            double a[3], c[3];
+            for (int r = 0; r < 3; ++r) a[r] = adapt[r * 3] * xyz[0] + adapt[r * 3 + 1] * xyz[1] + adapt[r * 3 + 2] * xyz[2];
+            for (int r = 0; r < 3; ++r) c[r] = inv[r * 3] * a[0] + inv[r * 3 + 1] * a[1] + inv[r * 3 + 2] * a[2];
+            if (c[0] > 1e-6 && c[1] > 1e-6 && c[2] > 1e-6)
+                for (int i = 0; i < 3; ++i) mul[i] *= c[1] / c[i];  // (green kept)
+        }
+    }
+    mul[1] *= std::pow(2.0, -settings.tint / 150.0);  // plus is magenta: less green
 }
 
 void developProResRaw(const uint16_t* mosaic, int width, int height, ptrdiff_t stride, const ProResRawColor& color,
                       const RawSettings& settings, const int crop[4], uint16_t* rgb, ptrdiff_t rgbStride) {
-    // The picture's area in mosaic pixels, on whole 2x2 cells so the colour pattern stays RGGB.
     const bool half = settings.half;
-    const int x0 = std::clamp(crop[0], 0, width) & ~1, y0 = std::clamp(crop[1], 0, height) & ~1;
     int outW = 0, outH = 0;
     proResRawSize(width, height, crop, half, outW, outH);
     if (outW <= 0 || outH <= 0 || !mosaic || !rgb) return;
+    const int left = std::clamp(crop[0], 0, width), top = std::clamp(crop[1], 0, height);
 
-    // One matrix from white-balanced camera RGB to AP1: the camera's to XYZ, adapted from the as-shot light to the one
-    // asked for (when asked), the tint on green, then the gain and exposure.
-    double m[9];
+    // The white balance on the mosaic (as shot, or the chosen light and tint), scaled so the smallest multiplier is 1:
+    // every channel then clips where it saturates at no more than 1, so blown areas are white whatever the balance
+    // (bright saturated colours lose what lies past the first channel's saturation, as LibRaw's Clip does). The
+    // matrix takes the scaling back out.
+    double mul[3];
+    proResRawBalance(color, settings, mul);
+    const double lift = 1 / std::min({mul[0], mul[1], mul[2]});
+    for (double& m : mul) m *= lift;
+    // One matrix from balanced camera RGB to AP1: the camera's to XYZ, then XYZ to AP1, with the gain and exposure.
+    double m[9], ap1ToXyz[9], xyzToAp1[9];
     std::copy(color.camToXyz, color.camToXyz + 9, m);
-    if (settings.temperature > 0) {
-        double ax = 0.3127, ay = 0.3290, kx, ky;
-        if (color.cct > 0) planckian(color.cct, ax, ay);
-        planckian(settings.temperature, kx, ky);
-        double toShot[9], fromK[9];
-        bradford(0.3127, 0.3290, ax, ay, toShot);  // back to what the scene's light was
-        bradford(kx, ky, 0.3127, 0.3290, fromK);   // and the chosen light made white
-        mul3(toShot, m, m);
-        mul3(fromK, m, m);
-    }
-    const double tint[9] = {1, 0, 0, 0, std::pow(2.0, -settings.tint / 150.0), 0, 0, 0, 1};
-    mul3(m, tint, m);
-    double ap1ToXyz[9], xyzToAp1[9];
     primariesToXyz(Primaries::Ap1, ap1ToXyz);
     invert3(ap1ToXyz, xyzToAp1);
     mul3(xyzToAp1, m, m);
-    const double scale = std::max(0.0, color.gain) * std::pow(2.0, settings.exposure);
+    const double scale = std::max(0.0, color.gain) * std::pow(2.0, settings.exposure) / lift;
     float k[9];
     for (int i = 0; i < 9; ++i) k[i] = float(m[i] * scale);
 
-    // Sites: the sensor's range to 0-1, white balanced, clipped at the sensor's white (so clipped highlights go white).
+    // Sites: the sensor's range to 0-1, balanced, clipped at 1.
     const float black = float(color.black) * 65535.0f, scaleSite = 1.0f / (float(std::max(1e-6, color.white - color.black)) * 65535.0f);
-    const float mulR = float(color.wbRed) * scaleSite, mulG = scaleSite, mulB = float(color.wbBlue) * scaleSite;
+    const float mulR = float(mul[0]) * scaleSite, mulG = float(mul[1]) * scaleSite, mulB = float(mul[2]) * scaleSite;
     auto norm = [black](uint16_t v, float mul) { return std::clamp((float(v) - black) * mul, 0.0f, 1.0f); };
     const AcesCctTable& cct = acesCctTable();
     auto encode = [&](const float c[3], uint16_t* o) {
@@ -165,6 +186,7 @@ void developProResRaw(const uint16_t* mosaic, int width, int height, ptrdiff_t s
     };
     if (half) {
         // Each 2x2 cell one pixel, straight from the mosaic: its red, its two greens averaged, its blue.
+        const int x0 = left & ~1, y0 = top & ~1;
         parallelRows(outH, [&](int r0, int r1) {
             for (int oy = r0; oy < r1; ++oy) {
                 const uint16_t* a = mosaic + ptrdiff_t(y0 + oy * 2) * stride + x0;
@@ -178,24 +200,33 @@ void developProResRaw(const uint16_t* mosaic, int width, int height, ptrdiff_t s
         });
         return;
     }
-    // Full size: the sites into a plane of floats once, then a bilinear demosaic.
-    const int pw = outW, ph = outH;
+    // Full size: the picture's sites and two around it (the recommended crop's margin is real sensor data) into a
+    // plane of floats once, then a bilinear demosaic; past the mosaic's own edge, sites mirror on whole cells.
+    const int px0 = std::max(0, left - 2), py0 = std::max(0, top - 2);
+    const int px1 = std::min(width, left + outW + 2), py1 = std::min(height, top + outH + 2);
+    const int pw = px1 - px0, ph = py1 - py0;
     std::vector<float> plane(size_t(pw) * size_t(ph));
     parallelRows(ph, [&](int r0, int r1) {
         for (int y = r0; y < r1; ++y) {
-            const uint16_t* in = mosaic + ptrdiff_t(y0 + y) * stride + x0;
+            const int ay = py0 + y;
+            const uint16_t* in = mosaic + ptrdiff_t(ay) * stride + px0;
             float* o = &plane[size_t(y) * size_t(pw)];
-            const float m0 = (y & 1) ? mulG : mulR, m1 = (y & 1) ? mulB : mulG;  // RGGB: R G on even rows, G B on odd
-            for (int x = 0; x < pw; ++x) o[x] = norm(in[x], (x & 1) ? m1 : m0);
+            const float m0 = (ay & 1) ? mulG : mulR, m1 = (ay & 1) ? mulB : mulG;  // RGGB: R G on even rows, G B on odd
+            for (int x = 0; x < pw; ++x) o[x] = norm(in[x], ((px0 + x) & 1) ? m1 : m0);
         }
     });
-    auto site = [&](int x, int y) { return plane[size_t(std::clamp(y, 0, ph - 1)) * size_t(pw) + size_t(std::clamp(x, 0, pw - 1))]; };
+    auto mirror = [](int v, int n) { return v < 0 ? -v : v >= n ? 2 * n - 2 - v : v; };
+    auto site = [&](int ax, int ay) {
+        ax = std::clamp(mirror(ax, width), px0, px1 - 1), ay = std::clamp(mirror(ay, height), py0, py1 - 1);
+        return plane[size_t(ay - py0) * size_t(pw) + size_t(ax - px0)];
+    };
     parallelRows(outH, [&](int r0, int r1) {
         for (int oy = r0; oy < r1; ++oy) {
             uint16_t* row = rgb + ptrdiff_t(oy) * rgbStride;
+            const int y = top + oy;
             for (int ox = 0; ox < outW; ++ox) {
                 // Bilinear: the site's own colour, the others averaged from the nearest sites of theirs.
-                const int x = ox, y = oy;  // (x0 and y0 are even: the pattern is the same from the plane's corner)
+                const int x = left + ox;
                 const int ch = (y & 1) ? ((x & 1) ? 2 : 1) : ((x & 1) ? 1 : 0);
                 const float self = site(x, y);
                 float c[3];
@@ -226,6 +257,41 @@ void developProResRaw(const uint16_t* mosaic, int width, int height, ptrdiff_t s
     out.width = std::max(0, out.width), out.height = std::max(0, out.height);
     out.rgb.assign(size_t(out.width) * size_t(out.height) * 3, 0);
     developProResRaw(mosaic, width, height, stride, color, settings, crop, out.rgb.data(), ptrdiff_t(out.width) * 3);
+}
+
+bool parseProResRawFrame(const uint8_t* data, size_t size, ProResRawInfo& out) {
+    // The frame header as FFmpeg's decoder reads it: the frame's size, "prrf", the header's length, then (from the
+    // header's start) a reserved byte, the version, the vendor, width and height, the recommended crop (left, right,
+    // top, bottom), the Bayer pattern, the sensel range, the white balance (red, blue), the colour matrix, the gain and
+    // the white balance in kelvin. Black is 0x100.
+    auto be16 = [&](size_t o) { return (uint32_t(data[o]) << 8) | data[o + 1]; };
+    auto be32 = [&](size_t o) { return (uint32_t(data[o]) << 24) | (uint32_t(data[o + 1]) << 16) | (uint32_t(data[o + 2]) << 8) | data[o + 3]; };
+    if (!data || size < 10 || std::memcmp(data + 4, "prrf", 4) != 0) return false;
+    const size_t headerLength = be16(8);
+    if (headerLength < 62 || 8 + headerLength > size) return false;
+    const size_t h = 10, end = 8 + headerLength;  // (the length counts its own two bytes)
+    auto f32 = [&](size_t o, double fallback) {
+        if (h + o + 4 > end) return fallback;
+        const uint32_t b = be32(h + o);
+        float v;
+        std::memcpy(&v, &b, sizeof v);
+        return std::isfinite(v) ? double(v) : fallback;
+    };
+    const int w = int(be16(h + 6)), ht = int(be16(h + 8));
+    if (w <= 0 || ht <= 0 || (w & 1) || (ht & 1) || (be16(h + 14) & 3) != 0) return false;  // RGGB only, as FFmpeg
+    out.crop[0] = data[h + 10], out.crop[2] = data[h + 11], out.crop[1] = data[h + 12], out.crop[3] = data[h + 13];
+    out.color.black = 256.0 / 65535;
+    out.color.white = (double(be16(h + 16)) + 256.0) / 65535;
+    out.color.wbRed = f32(18, 1);
+    out.color.wbBlue = f32(22, 1);
+    for (int i = 0; i < 9; ++i) out.color.camToXyz[i] = f32(26 + size_t(i) * 4, (i % 4 == 0) ? 1 : 0);
+    out.color.gain = f32(62, 1);
+    out.color.cct = h + 68 <= end ? be16(h + 66) : 0;
+    if (!(out.color.wbRed > 0)) out.color.wbRed = 1;
+    if (!(out.color.wbBlue > 0)) out.color.wbBlue = 1;
+    if (!(out.color.gain > 0)) out.color.gain = 1;
+    proResRawSize(w, ht, out.crop, false, out.width, out.height);
+    return true;
 }
 
 bool proResRawColorOf(const AVFrame* frame, ProResRawColor& color, int crop[4]) {
@@ -297,41 +363,21 @@ bool probeProResRaw(const std::string& path, ProResRawInfo& out, std::string* er
         return false;
     };
 #ifdef MONTAGE_PRORES_RAW
+    // The first frame's header says it all: no decoding.
     AVFormatContext* fmt = nullptr;
     if (avformat_open_input(&fmt, path.c_str(), nullptr, nullptr) < 0) return fail("Cannot open " + path);
     std::unique_ptr<AVFormatContext, void (*)(AVFormatContext*)> fmtGuard(fmt, [](AVFormatContext* f) { avformat_close_input(&f); });
     if (avformat_find_stream_info(fmt, nullptr) < 0) return fail("Cannot read " + path);
     const int stream = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
     if (stream < 0 || fmt->streams[stream]->codecpar->codec_id != AV_CODEC_ID_PRORES_RAW) return fail("Not ProRes RAW");
-    const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_PRORES_RAW);
-    if (!codec) return fail("This FFmpeg has no ProRes RAW decoder");
-    std::unique_ptr<AVCodecContext, void (*)(AVCodecContext*)> ctx(avcodec_alloc_context3(codec), [](AVCodecContext* c) { avcodec_free_context(&c); });
-    avcodec_parameters_to_context(ctx.get(), fmt->streams[stream]->codecpar);
-    ctx->apply_cropping = 0;
-    ctx->thread_count = std::clamp(int(std::thread::hardware_concurrency()), 1, 8);
-    if (avcodec_open2(ctx.get(), codec, nullptr) < 0) return fail("Cannot open the ProRes RAW decoder");
     std::unique_ptr<AVPacket, void (*)(AVPacket*)> pkt(av_packet_alloc(), [](AVPacket* p) { av_packet_free(&p); });
-    std::unique_ptr<AVFrame, void (*)(AVFrame*)> frame(av_frame_alloc(), [](AVFrame* f) { av_frame_free(&f); });
-    bool got = false, flushed = false;
-    while (!got) {
-        int rc = avcodec_receive_frame(ctx.get(), frame.get());
-        if (rc >= 0) {
-            got = true;
-            break;
-        }
-        if (rc != AVERROR(EAGAIN) || flushed) break;
-        if (av_read_frame(fmt, pkt.get()) < 0) {
-            avcodec_send_packet(ctx.get(), nullptr);
-            flushed = true;
-            continue;
-        }
-        if (pkt->stream_index == stream) avcodec_send_packet(ctx.get(), pkt.get());
+    for (int packets = 0; packets < 64 && av_read_frame(fmt, pkt.get()) >= 0; ++packets) {
+        const bool ours = pkt->stream_index == stream;
+        const bool ok = ours && parseProResRawFrame(pkt->data, size_t(pkt->size), out);
         av_packet_unref(pkt.get());
+        if (ours) return ok ? true : fail("The first ProRes RAW frame's header could not be read");
     }
-    if (!got) return fail("No ProRes RAW frame could be decoded");
-    if (!proResRawColorOf(frame.get(), out.color, out.crop)) return fail("The frame carries no ProRes RAW colour");
-    proResRawSize(frame->width, frame->height, out.crop, false, out.width, out.height);
-    return true;
+    return fail("No ProRes RAW frame");
 #else
     (void)path, (void)out;
     return fail("This FFmpeg cannot read ProRes RAW's colour (FFmpeg 9 is needed)");
