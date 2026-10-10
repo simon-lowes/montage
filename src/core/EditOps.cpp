@@ -860,6 +860,73 @@ Result slip(Project& p, Sequence& s, Id clipId, FrameTime delta) {
     return res;
 }
 
+namespace {
+// The clip a linked clip is kept in sync with: its group's first video clip, else its first clip.
+const Clip* syncAnchor(const Sequence& s, const Clip& c) {
+    if (!c.linkGroup) return nullptr;
+    const Clip* first = nullptr;
+    for (const Track& t : s.videoTracks)
+        for (const Clip& o : t.clips)
+            if (o.linkGroup == c.linkGroup) return &o;
+    for (const Track& t : s.audioTracks)
+        for (const Clip& o : t.clips)
+            if (o.linkGroup == c.linkGroup && !first) first = &o;
+    return first;
+}
+
+// How far `c` starts from where `anchor` shows the moment `c` begins with (timeline frames; positive: later).
+std::optional<double> offsetFrom(const Clip& anchor, const Clip& c) {
+    if (&anchor == &c || c.mediaId != anchor.mediaId || !c.mediaId || c.isGenerator() || anchor.isGenerator()) return std::nullopt;
+    // Only clips playing at the same constant speed stay in step all the way along.
+    if (c.ramped() || anchor.ramped() || c.reverse != anchor.reverse || std::fabs(c.speed - anchor.speed) > 1e-9) return std::nullopt;
+    const double source = c.sourceAt(0);
+    return double(c.start) - (double(anchor.start) + anchor.localForSource(source));
+}
+}  // namespace
+
+std::vector<SyncOffset> syncOffsets(const Sequence& s) {
+    std::vector<SyncOffset> out;
+    for (TrackRef r : allTracks(s))
+        for (const Clip& c : trackAt(s, r)->clips) {
+            const Clip* a = syncAnchor(s, c);
+            if (!a) continue;
+            if (const auto off = offsetFrom(*a, c); off && std::fabs(*off) >= 0.5) out.push_back({c.id, a->id, *off});
+        }
+    return out;
+}
+
+double syncOffset(const Sequence& s, Id clipId) {
+    const Clip* c = clipById(s, clipId);
+    const Clip* a = c ? syncAnchor(s, *c) : nullptr;
+    if (!a) return 0;
+    const auto off = offsetFrom(*a, *c);
+    return off && std::fabs(*off) >= 0.5 ? *off : 0;
+}
+
+Result moveIntoSync(Project& p, Sequence& s, Id clipId) {
+    const double off = syncOffset(s, clipId);
+    if (off == 0) return Result::fail("That clip is in sync");
+    const FrameTime delta = -FrameTime(std::llround(off));
+    const Clip* c = clipById(s, clipId);
+    if (c->start + delta < 0) return Result::fail("In sync it would start before the sequence does");
+    return moveClips(p, s, {clipId}, delta, 0, 0, false);
+}
+
+Result slipIntoSync(Project& p, Sequence& s, Id clipId) {
+    const double off = syncOffset(s, clipId);
+    if (off == 0) return Result::fail("That clip is in sync");
+    Clip* c = clipById(s, clipId);
+    const Clip* a = syncAnchor(s, *c);
+    if (trackAt(s, locate(s, clipId)->track)->locked) return Result::fail("Track is locked");
+    // What the picture shows where this clip starts is what it should start with.
+    const double in = a->sourceAt(double(c->start - a->start));
+    const FrameTime limit = sourceLimit(p, s, *c);
+    if (in < 0 || (limit < kInfiniteFrames && in + c->sourceExtent() > double(limit) + 1e-6))
+        return Result::fail("There is not enough media to slip it into sync: move it instead");
+    c->sourceIn = in;
+    return {};
+}
+
 Result slide(Project& p, Sequence& s, Id clipId, FrameTime delta) {
     auto loc = locate(s, clipId);
     if (!loc) return Result::fail("Unknown clip");

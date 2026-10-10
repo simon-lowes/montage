@@ -93,6 +93,8 @@ public:
     }
     // Whether a through edit follows this clip (edit::throughEdits), as marked on the timeline.
     bool isThroughEdit(Id clip) const;
+    // How many frames a linked clip is out of sync with its picture (edit::syncOffset), as its red badge shows; 0 in sync.
+    double syncOffsetOf(Id clip) const;
     void setShowTrackAutomation(bool on);
     bool showTrackAutomation() const { return showTrackAuto_; }
     // Where audio track `index`'s automation line is at frame f, in viewport pixels (testing aid); (-1, -1) if hidden.
@@ -287,6 +289,8 @@ private:
     mutable bool duplicatesDirty_ = true;
     mutable bool throughDirty_ = true;
     mutable std::vector<Id> through_;
+    mutable bool syncDirty_ = true;
+    mutable std::map<Id, double> sync_;
     mutable std::map<Id, std::vector<edit::DuplicateSpan>> duplicates_;
     Id trimOut_ = 0, trimIn_ = 0;
     int trimSide_ = -1;

@@ -94,6 +94,10 @@ QualityCheckDialog::QualityCheckDialog(EditorState* state, QWidget* parent) : QD
     spelling_->setObjectName(QStringLiteral("qcSpelling"));
     spelling_->setChecked(true);
     form->addRow(tr("Text:"), spelling_);
+    sync_ = new QCheckBox(tr("Linked clips out of sync"), this);
+    sync_->setObjectName(QStringLiteral("qcSync"));
+    sync_->setChecked(true);
+    form->addRow(tr("Sync:"), sync_);
     layout->addLayout(form);
 
     auto* check = new QPushButton(tr("Check"), this);
@@ -138,6 +142,7 @@ QcSettings QualityCheckDialog::settings() const {
     q.loudnessTarget = target.x();
     q.peakCeiling = target.y();
     q.spelling = spelling_->isChecked();
+    q.sync = sync_->isChecked();
     q.titleLanguage = titleSpellingLanguage().toStdString();
     return q;
 }

@@ -3424,6 +3424,75 @@ private slots:
         state()->setSelection({}, false);
     }
 
+    void syncIndicators() {
+        state()->newProject();
+        Id v = 0, a = 0;
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            MediaItem m;
+            m.id = p.newId();
+            m.kind = MediaKind::Video;
+            m.name = "sync.mov";
+            m.path = (dir_.path() + "/missing-sync.mov").toStdString();
+            m.duration = 10;
+            m.width = 1920, m.height = 1080;
+            m.fps = {30, 1};
+            m.hasVideo = m.hasAudio = true;
+            p.media.push_back(m);
+            const auto r = edit::placeMedia(p, s, m.id, 30, 30, 90, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+            if (!r.ok) return false;
+            v = r.created[0], a = r.created[1];
+            return true;
+        }));
+        TimelineWidget* tl = win_->timeline();
+        for (int k = 0; k < 4; ++k) tl->zoomIn();  // clips wide enough for the badge
+        QCOMPARE(tl->syncOffsetOf(a), 0.0);
+        const QImage inSync = tl->viewport()->grab().toImage();
+        // The sound alone nudged 6 frames later: a red +6 on it, none on the picture.
+        QVERIFY(state()->apply("Nudge", [a](Project& p, Sequence& s) { return edit::moveClips(p, s, {a}, 6, 0, 0, false); }));
+        QCOMPARE(tl->syncOffsetOf(a), 6.0);
+        QCOMPARE(tl->syncOffsetOf(v), 0.0);
+        QVERIFY(tl->viewport()->grab().toImage() != inSync);
+        // Right-click it: Slip into Sync, then (undone) Move into Sync.
+        auto viaMenu = [&](const char* name) {
+            bool triggered = false;
+            QTimer::singleShot(0, this, [&] {
+                auto* menu = qobject_cast<QMenu*>(QApplication::activePopupWidget());
+                if (!menu) return;
+                if (auto* act = menu->findChild<QAction*>(name)) {
+                    act->trigger();
+                    triggered = true;
+                }
+                menu->close();
+            });
+            const QPoint at = tl->clipBounds(a).center();
+            QContextMenuEvent ev(QContextMenuEvent::Mouse, at, tl->viewport()->mapToGlobal(at));
+            QApplication::sendEvent(tl->viewport(), &ev);
+            return triggered;
+        };
+        QVERIFY(viaMenu("slipIntoSync"));
+        QCOMPARE(tl->syncOffsetOf(a), 0.0);
+        QCOMPARE(edit::clipById(*state()->sequence(), a)->sourceIn, 36.0);
+        QCOMPARE(edit::clipById(*state()->sequence(), a)->start, FrameTime(36));
+        state()->undo();
+        QCOMPARE(tl->syncOffsetOf(a), 6.0);
+        QVERIFY(viaMenu("moveIntoSync"));
+        QCOMPARE(edit::clipById(*state()->sequence(), a)->start, FrameTime(30));
+        QCOMPARE(tl->syncOffsetOf(a), 0.0);
+        QVERIFY(!viaMenu("moveIntoSync"));  // offered only while out of sync
+        // Quality Check reports it.
+        state()->undo();
+        QcSettings q;
+        q.flashing = q.levels = q.clipping = q.spelling = false;
+        q.blackSeconds = q.freezeSeconds = q.silenceSeconds = 0;
+        const auto issues = qualityCheck(state()->project(), *state()->sequence(), 0, -1, q);
+        QCOMPARE(issues.size(), size_t(1));
+        QCOMPARE(issues[0].kind, QcKind::OutOfSync);
+        QCOMPARE(issues[0].start, FrameTime(36));
+        QVERIFY(issues[0].text.find("6 frames late") != std::string::npos);
+        q.sync = false;
+        QVERIFY(qualityCheck(state()->project(), *state()->sequence(), 0, -1, q).empty());
+    }
+
     void auditionsFromTheBin() {
         // Two takes of a shot: the first in the cut, the second added from the bin as a take.
         QStringList files;

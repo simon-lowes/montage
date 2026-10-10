@@ -1057,6 +1057,59 @@ void McpServer::Impl::addTools() {
             return ok(QStringLiteral("Swapped; the clip now starts at %1").arg(tc(c ? c->start : 0, s)), c ? clipJson(l.project, s, *c) : QJsonObject{});
         });
 
+    add("montage_sync", "Find and fix clips out of sync",
+        "Linked clips playing the same media as their picture but out of step with it (Premiere's red out-of-sync "
+        "numbers, Avid's sync breaks), each with how many frames late (negative: early). `action` move puts a clip back "
+        "in sync by moving it, slip by slipping its source where it is (refused past the media's ends); with `clip` "
+        "only that clip, else every one listed.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "action":{"type":"string","enum":["check","move","slip"],"default":"check"},"clip":{"type":"number"}},
+            "required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const QString action = str(a, "action", "check");
+            if (action != "check" && action != "move" && action != "slip") throw ArgError{"\"action\" is check, move or slip"};
+            auto listed = [&] {
+                QJsonArray out;
+                for (const edit::SyncOffset& o : edit::syncOffsets(s)) {
+                    const Clip* c = edit::clipById(s, o.clip);
+                    const auto loc = edit::locate(s, o.clip);
+                    out.append(QJsonObject{{"clip", double(o.clip)}, {"name", QString::fromStdString(c->name)},
+                                           {"track", QString::fromStdString(trackAt(s, loc->track)->name)}, {"anchor", double(o.anchor)},
+                                           {"frames", o.frames}, {"seconds", o.frames / s.fps.toDouble()}});
+                }
+                return out;
+            };
+            if (action == "check") {
+                const QJsonArray out = listed();
+                QString text = out.isEmpty() ? QStringLiteral("Every linked clip is in sync.") : QStringLiteral("%1 clip(s) out of sync:").arg(out.size());
+                for (const auto& v : out) {
+                    const QJsonObject o = v.toObject();
+                    text += QStringLiteral("\n  %1 (%2, clip %3): %4 frame(s) %5").arg(o["name"].toString(), o["track"].toString())
+                                .arg(qint64(o["clip"].toDouble())).arg(std::fabs(o["frames"].toDouble())).arg(o["frames"].toDouble() > 0 ? "late" : "early");
+                }
+                return ok(text, QJsonObject{{"clips", out}});
+            }
+            std::vector<Id> ids;
+            if (a.contains("clip")) ids.push_back(clipArg(l, a).id);
+            else
+                for (const edit::SyncOffset& o : edit::syncOffsets(s)) ids.push_back(o.clip);
+            if (ids.empty()) return ok(QStringLiteral("Every linked clip is in sync."), QJsonObject{{"clips", QJsonArray{}}});
+            int fixed = 0;
+            QStringList errors;
+            for (Id id : ids) {
+                const auto r = action == "move" ? edit::moveIntoSync(l.project, s, id) : edit::slipIntoSync(l.project, s, id);
+                if (r.ok) ++fixed;
+                else errors << QStringLiteral("clip %1: %2").arg(qint64(id)).arg(QString::fromStdString(r.error));
+            }
+            if (!fixed) return fail(errors.join("; "));
+            save(l);
+            QString text = QStringLiteral("%1 clip(s) %2 into sync.").arg(fixed).arg(action == "move" ? "moved" : "slipped");
+            if (!errors.isEmpty()) text += QStringLiteral(" Not fixed: ") + errors.join("; ");
+            return ok(text, QJsonObject{{"fixed", fixed}, {"clips", listed()}});
+        });
+
     add("montage_trim_clip", "Trim a clip",
         "Move a clip's in or out point by a number of seconds (positive: later). Ripple moves later clips with it. "
         "With `extend_to` (a timeline time) instead, Extend Edit: the clip's edge nearest it moves there, rolling with "
@@ -1975,8 +2028,8 @@ void McpServer::Impl::addTools() {
         "Check the sequence (or from..to) before delivery, as broadcasters' QC does: flashing that can trigger seizures "
         "(ITU-R BT.1702 / Ofcom / WCAG: more than three flashes a second over a quarter of the screen, or saturated red), "
         "levels outside EBU R103, black or frozen picture, silence, clipping, loudness against a target, and spelling in "
-        "captions (each track's language) and titles (`title_language`, default en-US), the project's vocabulary allowed. "
-        "Lists each problem with its timecodes; with markers, puts a red \"QC:\" marker on each (replacing earlier ones).",
+        "captions (each track's language) and titles (`title_language`, default en-US), the project's vocabulary allowed, "
+        "and linked clips out of sync with their picture (`sync`). Lists each problem with its timecodes; with markers, puts a red \"QC:\" marker on each (replacing earlier ones).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"from":{"type":["number","string"]},
             "to":{"type":["number","string"]},"flashing":{"type":"boolean","default":true},"levels":{"type":"boolean","default":true},
             "black_seconds":{"type":"number","default":1,"description":"0 = not checked"},
@@ -1986,7 +2039,7 @@ void McpServer::Impl::addTools() {
             "loudness_target":{"type":"number","description":"LUFS, e.g. -14 (streaming) or -23 (EBU R128); omitted = not checked"},
             "peak_ceiling":{"type":"number","default":-1,"description":"dBTP, checked with the loudness"},
             "spelling":{"type":"boolean","default":true},"title_language":{"type":"string","default":"en-US"},
-            "markers":{"type":"boolean","default":false}},"required":["project"]})json",
+            "sync":{"type":"boolean","default":true},"markers":{"type":"boolean","default":false}},"required":["project"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
@@ -2003,6 +2056,7 @@ void McpServer::Impl::addTools() {
             q.peakCeiling = a.value("peak_ceiling").toDouble(-1);
             q.spelling = a.value("spelling").toBool(true);
             q.titleLanguage = str(a, "title_language", "en-US").toStdString();
+            q.sync = a.value("sync").toBool(true);
             const std::vector<QcIssue> issues = qualityCheck(l.project, s, from, to, q, [this](double f) { progress(f, "Checking"); });
             QString text;
             for (const QcIssue& i : issues)

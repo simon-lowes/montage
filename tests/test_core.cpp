@@ -5805,6 +5805,51 @@ private slots:
         QVERIFY(!importEdl(p, "nothing here", {25, 1}).ok);
     }
 
+    void syncOffsetsAndRepair() {
+        Fixture fx;
+        auto r = placeMedia(fx.p, fx.s(), fx.media, 30, 30, 90, V1, A1, false);
+        QVERIFY(r.ok);
+        const Id v = r.created[0], a = r.created[1];
+        QVERIFY(syncOffsets(fx.s()).empty());
+        // Moving the sound alone puts it 5 frames late; the picture is the anchor.
+        QVERIFY(moveClips(fx.p, fx.s(), {a}, 5, 0, 0, false).ok);
+        auto offs = syncOffsets(fx.s());
+        QCOMPARE(offs.size(), size_t(1));
+        QCOMPARE(offs[0].clip, a);
+        QCOMPARE(offs[0].anchor, v);
+        QCOMPARE(offs[0].frames, 5.0);
+        QCOMPARE(syncOffset(fx.s(), v), 0.0);
+        QVERIFY(moveIntoSync(fx.p, fx.s(), a).ok);
+        QCOMPARE(clipById(fx.s(), a)->start, FrameTime(30));
+        QVERIFY(syncOffsets(fx.s()).empty());
+        QVERIFY(!moveIntoSync(fx.p, fx.s(), a).ok);  // already in sync
+        // Slipping the sound 8 frames early: slipping it back puts its source in where the picture's is.
+        clipById(fx.s(), a)->sourceIn = 22;
+        QCOMPARE(syncOffset(fx.s(), a), 8.0);
+        QVERIFY(slipIntoSync(fx.p, fx.s(), a).ok);
+        QCOMPARE(clipById(fx.s(), a)->sourceIn, 30.0);
+        QCOMPARE(clipById(fx.s(), a)->start, FrameTime(30));
+        // Trimming the sound's head in step stays in sync (the source moves with the start).
+        QVERIFY(trim(fx.p, fx.s(), a, Edge::In, 10, TrimMode::Normal, false).ok);
+        QCOMPARE(syncOffset(fx.s(), a), 0.0);
+        // Sound earlier than the picture's media can slip to: refused, moving works.
+        Fixture fx2;
+        auto r2 = placeMedia(fx2.p, fx2.s(), fx2.media, 30, 0, 90, V1, A1, false);
+        const Id a2 = r2.created[1];
+        QVERIFY(moveClips(fx2.p, fx2.s(), {a2}, -10, 0, 0, false).ok);
+        QCOMPARE(syncOffset(fx2.s(), a2), -10.0);
+        QVERIFY(!slipIntoSync(fx2.p, fx2.s(), a2).ok);
+        QVERIFY(moveIntoSync(fx2.p, fx2.s(), a2).ok);
+        QCOMPARE(clipById(fx2.s(), a2)->start, FrameTime(30));
+        // Different speeds, or other media in the group, are not compared.
+        QVERIFY(moveClips(fx2.p, fx2.s(), {a2}, 3, 0, 0, false).ok);
+        clipById(fx2.s(), a2)->speed = 2;
+        QVERIFY(syncOffsets(fx2.s()).empty());
+        clipById(fx2.s(), a2)->speed = 1;
+        clipById(fx2.s(), a2)->mediaId = 9999;
+        QVERIFY(syncOffsets(fx2.s()).empty());
+    }
+
     void projectFileRelinksRelativePaths() {
         QTemporaryDir dir;
         QVERIFY(dir.isValid());

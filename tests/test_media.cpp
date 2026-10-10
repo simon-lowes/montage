@@ -4136,6 +4136,59 @@ private slots:
         for (int i = 45000; i < 45100; ++i) QVERIFY(std::fabs(out[size_t(i + delay) * 2] - in[size_t(i) * 2]) < 0.002f);
     }
 
+    void mcpSyncCheck() {
+        // A clip with its sound knocked 4 frames late.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        MediaItem m;
+        m.id = p.newId();
+        m.kind = MediaKind::Video;
+        m.name = "shot.mov";
+        m.path = path("missing-shot.mov");
+        m.duration = 10;
+        m.width = 1920, m.height = 1080;
+        m.fps = {30, 1};
+        m.hasVideo = m.hasAudio = true;
+        p.media.push_back(m);
+        const auto placed = edit::placeMedia(p, s, m.id, 30, 30, 90, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        QVERIFY(placed.ok);
+        const Id sound = placed.created[1];
+        QVERIFY(edit::moveClips(p, s, {sound}, 4, 0, 0, false).ok);
+        const QString project = QString::fromStdString(path("sync.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QString& tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call("montage_sync", {{"project", project}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(QJsonDocument(r).toJson()));
+        QJsonArray clips = r.value("structuredContent").toObject().value("clips").toArray();
+        QCOMPARE(clips.size(), 1);
+        QCOMPARE(Id(clips[0].toObject().value("clip").toDouble()), sound);
+        QCOMPARE(clips[0].toObject().value("frames").toDouble(), 4.0);
+        // Quality Check lists it (nothing else checked).
+        r = call("montage_quality_check", {{"project", project}, {"flashing", false}, {"levels", false}, {"black_seconds", 0},
+                                           {"freeze_seconds", 0}, {"silence_seconds", 0}, {"clipping", false}, {"spelling", false}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(QJsonDocument(r).toJson()));
+        const QString report = r.value("content").toArray()[0].toObject().value("text").toString();
+        QVERIFY2(report.contains("Out of sync") && report.contains("4 frames late"), qPrintable(report));
+        // Slipped back into sync, saved.
+        r = call("montage_sync", {{"project", project}, {"action", "slip"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(QJsonDocument(r).toJson()));
+        QCOMPARE(r.value("structuredContent").toObject().value("fixed").toInt(), 1);
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QVERIFY(edit::syncOffsets(*back.active()).empty());
+        QCOMPARE(edit::clipById(*back.active(), sound)->sourceIn, 34.0);
+        r = call("montage_sync", {{"project", project}, {"action", "move"}});
+        QVERIFY(r.value("content").toArray()[0].toObject().value("text").toString().contains("in sync"));
+    }
+
     void mcpAdrCues() {
         // A sequence with two captions, and two recordings of the second line.
         Project p = makeDefaultProject();

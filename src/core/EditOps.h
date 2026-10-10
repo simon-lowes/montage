@@ -286,6 +286,21 @@ Result pickTake(Project& p, Sequence& s, Id clipId, int index);
 Result cycleTake(Project& p, Sequence& s, Id clipId, int step);  // the next (+1) or previous (-1) take, round
 Result finalizeAudition(Project& p, Sequence& s, Id clipId);     // keeps the pick, forgets the other takes
 
+// Sync (Premiere's out-of-sync indicators, Avid's sync-break numbers): a linked clip playing the same media as its
+// link group's picture (its first video clip; with none, its first clip) is out of sync when it starts somewhere other
+// than where the picture shows the same moment: `frames` later (negative: earlier), at least half a frame either way.
+// Clips of other media in the group (merged dual-system sound) are not compared.
+struct SyncOffset {
+    Id clip = 0, anchor = 0;
+    double frames = 0;
+};
+std::vector<SyncOffset> syncOffsets(const Sequence& s);
+double syncOffset(const Sequence& s, Id clipId);  // 0 when in sync or not comparable
+// Back into sync: the clip moved by its offset (overwriting what is there, like any move), or its source slipped so
+// it plays in sync where it is (refused past the media's ends).
+Result moveIntoSync(Project& p, Sequence& s, Id clipId);
+Result slipIntoSync(Project& p, Sequence& s, Id clipId);
+
 // Clips that start at or after `frame` (Track Select Forward), on every track
 // or only `track`.
 std::vector<Id> clipsFrom(const Sequence& s, FrameTime frame, std::optional<TrackRef> track = {});

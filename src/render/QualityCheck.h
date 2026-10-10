@@ -6,7 +6,8 @@
 //  - picture levels outside EBU R103 (RGB -5 % to 105 %, luma -1 % to 103 %) on more than 1 % of the picture;
 //  - black and frozen picture, silence and clipped sound held too long;
 //  - integrated loudness away from the target and true peaks over the ceiling;
-//  - spelling in captions (in each track's language) and titles (core/SpellCheck.h), the project's vocabulary allowed.
+//  - spelling in captions (in each track's language) and titles (core/SpellCheck.h), the project's vocabulary allowed;
+//  - linked clips out of sync with their picture (core/EditOps.h syncOffsets).
 #pragma once
 
 #include <atomic>
@@ -31,9 +32,10 @@ struct QcSettings {
     int analysisWidth = 160;        // the picture is checked at this width
     bool spelling = true;           // captions and titles
     std::string titleLanguage = "en-US";  // the dictionary titles are checked with
+    bool sync = true;               // linked sound or picture out of sync
 };
 
-enum class QcKind { Flashing, RedFlashing, Levels, Black, Freeze, Silence, Clipping, Loudness, TruePeak, Spelling };
+enum class QcKind { Flashing, RedFlashing, Levels, Black, Freeze, Silence, Clipping, Loudness, TruePeak, Spelling, OutOfSync };
 
 struct QcIssue {
     QcKind kind = QcKind::Flashing;
