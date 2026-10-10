@@ -4786,13 +4786,16 @@ private slots:
             MediaItem folded;
             QVERIFY(probeMedia(aac.path, folded));
             QCOMPARE(folded.channels, 8);
-            // 5.1.2 has eight channels, but FFmpeg's AAC refuses its layout: it folds to 5.1 rather than failing.
+            // 5.1.2 has eight channels, but FFmpeg 6.1's AAC refuses its layout (newer FFmpeg takes it): the export
+            // carries what the encoder takes, folding to 5.1 rather than failing.
             Sequence fiveTwo = s;
             fiveTwo.audioLayout = "5.1.2";
             aac.path = path("mix512.m4a");
             QVERIFY2(exportSequence(p, fiveTwo, aac, nullptr, nullptr, &err), err.c_str());
             QVERIFY(probeMedia(aac.path, folded));
-            QCOMPARE(folded.channels, 6);
+            const std::string carried = exportAudioLayout("5.1.2", "aac");
+            QVERIFY2(carried == "5.1.2" || carried == "5.1", carried.c_str());
+            QCOMPARE(folded.channels, layoutChannels(carried));
         }
         {
             ExportSettings flac;
