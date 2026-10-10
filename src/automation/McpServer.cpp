@@ -58,6 +58,7 @@
 #include "core/TimelineCompare.h"
 #include "core/Reconform.h"
 #include "core/Adr.h"
+#include "core/AudioDescription.h"
 #include "core/Effects.h"
 #include "core/History.h"
 #include "core/Interchange.h"
@@ -4152,6 +4153,158 @@ void McpServer::Impl::addTools() {
                       QJsonObject{{"clips", placed}});
         });
 
+    add("montage_audio_description", "Audio description",
+        "Described video for broadcasters and streaming services: descriptions of what is seen, spoken in the gaps between "
+        "the dialogue. gaps finds them (speech on the audio tracks other than the AD track; at least min_gap seconds, kept "
+        "clear of the lines); write puts descriptions (start, optional end: by default the gap it starts in, or three "
+        "seconds; empty text removes one) on the hidden \"Audio Description\" caption track; list shows them with how they "
+        "fit at pace words a minute; voice speaks them with an AI voice (Kokoro) onto the AD track as clips of the role "
+        "Description, replacing what was voiced before; duck lowers every other clip under them by duck_db; hear sets "
+        "whether they play while working. montage_render's described option (or the export dialog's) writes the mix "
+        "without them and a stream of the programme with them.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "action":{"type":"string","enum":["gaps","write","list","voice","duck","hear"],"default":"list"},
+            "min_gap":{"type":"number","default":2},"pace":{"type":"number","default":160},
+            "descriptions":{"type":"array","items":{"type":"object","properties":{"start":{"type":["number","string"]},
+                "end":{"type":["number","string"]},"text":{"type":"string"}},"required":["start","text"]}},
+            "voice":{"type":"string","default":"bf_emma"},"duck_db":{"type":"number","default":-9},"on":{"type":"boolean"}},
+            "required":["project"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const QString action = a.value("action").toString("list");
+            const double pace = std::clamp(a.value("pace").toDouble(160), 60.0, 300.0);
+            auto adTrack = [&]() {
+                for (int i = 0; i < int(s.audioTracks.size()); ++i)
+                    if (s.audioTracks[size_t(i)].name == "AD") return i;
+                return -1;
+            };
+            auto findGaps = [&](std::vector<DescriptionGap>& out, double minGap) -> QString {
+                std::vector<int> tracks;
+                for (int i = 0; i < int(s.audioTracks.size()); ++i)
+                    if (i != adTrack()) tracks.push_back(i);
+                DuckOptions o;
+                o.minPause = 0.5;
+                std::string err;
+                const Spans speech = dialogueSpans(l.project, s, tracks, o, &err);
+                if (!err.empty()) return QString::fromStdString(err);
+                out = descriptionGaps(speech, s.fpsValue(), 0, std::max<FrameTime>(1, s.duration()), minGap);
+                return {};
+            };
+            auto listing = [&] {
+                QJsonArray list;
+                const int t = findDescriptionTrack(s);
+                if (t >= 0)
+                    for (const Caption& c : s.captionTracks[size_t(t)].captions) {
+                        const DescriptionFit f = descriptionFit(c.text, double(c.end - c.start) / s.fpsValue(), pace);
+                        list.append(QJsonObject{{"start", tc(c.start, s)}, {"end", tc(c.end, s)}, {"text", QString::fromStdString(c.text)},
+                                                {"room", f.room}, {"needed", f.needed}, {"fits", f.fits}, {"speed", f.speed},
+                                                {"over_words", f.overWords}});
+                    }
+                return QJsonObject{{"descriptions", list}, {"heard", !edit::roleMuted(s, kDescriptionRole)},
+                                   {"voiced", hasDescriptionClips(s)}};
+            };
+            if (action == "list") return ok(QStringLiteral("%1 description(s)").arg(listing().value("descriptions").toArray().size()), listing());
+            if (action == "gaps") {
+                std::vector<DescriptionGap> gaps;
+                if (const QString err = findGaps(gaps, std::max(0.5, a.value("min_gap").toDouble(2))); !err.isEmpty()) return fail(err);
+                QJsonArray out;
+                for (const DescriptionGap& g : gaps)
+                    out.append(QJsonObject{{"start", tc(g.start, s)}, {"end", tc(g.end, s)}, {"seconds", double(g.length()) / s.fpsValue()},
+                                           {"words", int(std::floor(double(g.length()) / s.fpsValue() * pace / 60))}});
+                return ok(QStringLiteral("%1 gap(s) between the dialogue").arg(gaps.size()), QJsonObject{{"gaps", out}});
+            }
+            if (action == "write") {
+                const QJsonArray items = a.value("descriptions").toArray();
+                if (items.isEmpty()) throw ArgError{"\"descriptions\" lists what to write"};
+                std::vector<DescriptionGap> gaps;
+                bool haveGaps = false;
+                for (const QJsonValue& v : items) {
+                    const QJsonObject o = v.toObject();
+                    const FrameTime start = timeArg(o.value("start"), s, "start");
+                    FrameTime end = -1;
+                    if (o.contains("end")) {
+                        end = timeArg(o.value("end"), s, "end");
+                    } else {
+                        if (!haveGaps) {
+                            if (const QString err = findGaps(gaps, 0.1); !err.isEmpty()) return fail(err);  // whatever its length
+                            haveGaps = true;
+                        }
+                        for (const DescriptionGap& g : gaps)
+                            if (start >= g.start && start < g.end) end = g.end;
+                        if (end < 0) end = start + FrameTime(std::llround(3 * s.fpsValue()));
+                    }
+                    const std::string text = o.value("text").toString().toStdString();
+                    if (!setDescription(l.project, s, start, end, text) && !text.empty())
+                        throw ArgError{"A description's end must come after its start"};
+                }
+                save(l);
+                return ok("Wrote the descriptions", listing());
+            }
+            if (action == "voice") {
+                const int t = findDescriptionTrack(s);
+                std::vector<SpeechLine> lines;
+                if (t >= 0)
+                    for (const Caption& c : s.captionTracks[size_t(t)].captions) {
+                        std::string text = c.text;
+                        std::replace(text.begin(), text.end(), '\n', ' ');
+                        if (!text.empty()) lines.push_back({text, c.start, c.end - c.start});
+                    }
+                if (lines.empty()) return fail("There are no descriptions to voice");
+                if (!ttsAvailable()) return fail("This build of Montage cannot speak (no ONNX Runtime)");
+                if (!ttsModel().installed())
+                    return fail("The speech model is not downloaded: run `scripts/fetch-models.sh` or generate a voiceover once in the app");
+                const std::string voice = str(a, "voice", "bf_emma").toStdString();
+                if (!findTtsVoice(voice)) throw ArgError{QStringLiteral("Unknown voice \"%1\"").arg(QString::fromStdString(voice))};
+                std::vector<Id> old;
+                for (const Track& tr : s.audioTracks)
+                    for (const Clip& c : tr.clips)
+                        if (c.role == kDescriptionRole) old.push_back(c.id);
+                if (!old.empty()) edit::removeClips(l.project, s, old, false);
+                int ad = adTrack();
+                if (ad < 0) {
+                    ad = edit::addTrack(l.project, s, TrackKind::Audio).index;
+                    s.audioTracks[size_t(ad)].name = "AD";
+                }
+                QJsonArray placed;
+                double total = 0;
+                const QString err = speakLines(l.project, s, lines, voice, 1.0, {TrackKind::Audio, ad},
+                                               QFileInfo(absolute(need(a, "project"))).absolutePath() + QStringLiteral("/Audio Description"),
+                                               placed, total);
+                if (!err.isEmpty()) return fail(err);
+                for (const QJsonValue& v : placed)
+                    if (Clip* c = edit::clipById(s, Id(v.toObject().value("clip").toDouble()))) c->role = kDescriptionRole;
+                save(l);
+                QJsonObject r = listing();
+                r["clips"] = placed;
+                return ok(QStringLiteral("Voiced %1 description(s), %2 s in all").arg(placed.size()).arg(total, 0, 'f', 1), r);
+            }
+            if (action == "duck") {
+                const int ad = adTrack();
+                if (ad < 0 || !hasDescriptionClips(s)) return fail("Voice the descriptions first");
+                DuckOptions o;
+                o.amountDb = std::clamp(a.value("duck_db").toDouble(-9), -40.0, -1.0);
+                o.fadeDown = 0.4;
+                o.fadeUp = 0.6;
+                const Spans spans = clipSpans(s, ad, 1.0);
+                int changed = 0;
+                for (int i = 0; i < int(s.audioTracks.size()); ++i) {
+                    if (i == ad) continue;
+                    for (Clip& c : s.audioTracks[size_t(i)].clips)
+                        if (c.role != kDescriptionRole && duckClip(c, s, spans, o)) ++changed;
+                }
+                save(l);
+                return ok(QStringLiteral("Ducked %1 clip(s) under the descriptions").arg(changed), QJsonObject{{"ducked", changed}});
+            }
+            if (action == "hear") {
+                if (!a.contains("on")) throw ArgError{"\"on\" says whether the descriptions are heard"};
+                edit::setRoleMuted(s, kDescriptionRole, !a.value("on").toBool());
+                save(l);
+                return ok(a.value("on").toBool() ? "Descriptions are heard" : "Descriptions are muted (exports still describe)", listing());
+            }
+            throw ArgError{"Unknown action"};
+        });
+
     add("montage_dub", "Dub into English",
         "Dub a caption track into English on this computer: translated from its language (Opus-MT; skipped if it is English), "
         "each cue spoken at its time with an AI voice (Kokoro; a little faster where a cue is short) on a new audio track "
@@ -4915,6 +5068,7 @@ void McpServer::Impl::addTools() {
                 "watermark_corner":{"type":"string","enum":["top_left","top_centre","top_right","bottom_left","bottom_centre","bottom_right"],"default":"bottom_right"},
                 "watermark_opacity":{"type":"number","default":0.6}}},
             "downmix_stereo":{"type":"boolean","default":false,"description":"A 5.1/7.1 sequence: fold the mix down to stereo"},
+            "described":{"type":"boolean","default":false,"description":"Audio description: the mix without the descriptions, then a stream of the programme with them (montage_audio_description)"},
             "stems":{"type":"string","enum":["none","tracks","buses","roles"],"default":"none",
                 "description":"Also write 24-bit WAV stems beside the output, one per audio track, per bus (plus Main) or per audio role"},
             "captions":{"type":"string","enum":["none","burn","embed","both"],"default":"none","description":"The visible caption track, burned into the picture and/or embedded as a subtitle stream"},
@@ -4969,6 +5123,7 @@ void McpServer::Impl::addTools() {
                 st.burnIn.watermarkOpacity = std::clamp(b.value("watermark_opacity").toDouble(0.6), 0.0, 1.0);
             }
             st.downmixStereo = a.value("downmix_stereo").toBool();
+            st.describedStream = a.value("described").toBool();
             const QString cap = str(a, "captions", "none");
             if (cap != "none" && cap != "burn" && cap != "embed" && cap != "both") throw ArgError{"\"captions\" must be none, burn, embed or both"};
             st.burnInCaptions = cap == "burn" || cap == "both";

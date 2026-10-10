@@ -70,6 +70,8 @@
 #include "render/AafExport.h"
 #include "render/Adm.h"
 #include "core/Adr.h"
+#include "core/AudioDescription.h"
+#include "core/History.h"
 #include "render/Retime.h"
 #include "render/FaceRefine.h"
 #include "render/AudioFx.h"
@@ -4424,6 +4426,114 @@ private slots:
         QVERIFY(surroundAnimated(moved));
         QVERIFY(std::fabs(trackSurroundAt(moved, 0).x + 1) < 1e-9 && std::fabs(trackSurroundAt(moved, 60).x - 1) < 1e-9);
         QVERIFY(std::fabs(trackSurroundAt(moved, 60).z - 0.5) < 1e-9);
+    }
+
+    void describedExportAndMcp() {
+        // Dialogue (440 Hz) at 0-1 s and 3-4 s on A1; a description (1 kHz) at 1.3-2.7 s on the AD track.
+        const int rate = 48000;
+        auto tone = [&](double hz, double seconds, const char* name) {
+            std::vector<float> x(size_t(rate * seconds));
+            for (size_t i = 0; i < x.size(); ++i) x[i] = float(0.3 * std::sin(2 * M_PI * hz * double(i) / rate));
+            const std::string f = path(name);
+            writeMonoWav(f, x, rate);
+            return f;
+        };
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();  // 30 fps
+        p.media.push_back(probeOrFail(p, tone(440, 1, "line.wav")));
+        p.media.push_back(probeOrFail(p, tone(1000, 1.4, "desc.wav")));
+        QVERIFY(edit::placeMedia(p, s, p.media[0].id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(edit::placeMedia(p, s, p.media[0].id, 90, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        // MCP: the gap between the lines, a description written into it, how it fits.
+        const QString project = QString::fromStdString(path("described.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_audio_description"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call({{"project", project}, {"action", "gaps"}, {"min_gap", 1}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(QJsonDocument(r).toJson()));
+        const QJsonArray gaps = r.value("structuredContent").toObject().value("gaps").toArray();
+        QVERIFY2(gaps.size() >= 1, qPrintable(QJsonDocument(r).toJson()));
+        FrameTime g0 = 0, g1 = 0;
+        QVERIFY(parseTimecode(gaps[0].toObject().value("start").toString().toStdString(), s.fps, g0));
+        QVERIFY(parseTimecode(gaps[0].toObject().value("end").toString().toStdString(), s.fps, g1));
+        QVERIFY2(g0 >= 39 && g0 <= 42 && g1 >= 78 && g1 <= 81, qPrintable(QString("%1 %2").arg(g0).arg(g1)));  // 1.3 s to 2.7 s
+        r = call({{"project", project}, {"action", "write"},
+                  {"descriptions", QJsonArray{QJsonObject{{"start", gaps[0].toObject().value("start")}, {"text", "Rain falls."}}}}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(QJsonDocument(r).toJson()));
+        QJsonArray list = r.value("structuredContent").toObject().value("descriptions").toArray();
+        QCOMPARE(list.size(), 1);
+        QCOMPARE(list[0].toObject().value("end").toString(), QString::fromStdString(formatTimecode(g1, s.fps)));  // the gap's end
+        QVERIFY(list[0].toObject().value("fits").toBool());
+        r = call({{"project", project}, {"action", "write"},
+                  {"descriptions", QJsonArray{QJsonObject{{"start", 3.4}, {"end", 3.9}, {"text", "A long description that cannot possibly fit."}}}}});
+        list = r.value("structuredContent").toObject().value("descriptions").toArray();
+        QVERIFY(list.size() == 2 && !list[1].toObject().value("fits").toBool() && list[1].toObject().value("over_words").toInt() > 0);
+        QVERIFY(call({{"project", project}, {"action", "duck"}}).value("isError").toBool());  // nothing voiced yet
+        // The voiced description (placed here by hand: the speech model is optional) on the AD track, ducked under.
+        QVERIFY(loadProject(project.toStdString(), p));
+        Sequence& d = *p.active();
+        const int ad = edit::addTrack(p, d, TrackKind::Audio).index;
+        d.audioTracks[size_t(ad)].name = "AD";
+        const edit::Result placed = edit::placeMedia(p, d, p.media[1].id, 39, 0, -1, {TrackKind::Video, -1}, {TrackKind::Audio, ad}, false);
+        QVERIFY(placed.ok && !placed.created.empty());
+        edit::clipById(d, placed.created.front())->role = kDescriptionRole;
+        QVERIFY(saveProject(p, project.toStdString()));
+        r = call({{"project", project}, {"action", "duck"}, {"duck_db", -12}});
+        QVERIFY2(r.value("structuredContent").toObject().value("ducked").toInt() >= 1, qPrintable(QJsonDocument(r).toJson()));
+        r = call({{"project", project}, {"action", "hear"}, {"on", false}});
+        QCOMPARE(r.value("structuredContent").toObject().value("heard").toBool(), false);
+        QVERIFY(r.value("structuredContent").toObject().value("voiced").toBool());
+
+        // The described master: the mix without the description (even muted, it goes to the AD stream), then the
+        // programme with it.
+        QVERIFY(loadProject(project.toStdString(), p));
+        ExportSettings aac = findExportPreset("Audio - AAC (M4A)")->settings;
+        aac.path = path("described.m4a");
+        aac.describedStream = true;
+        std::string err;
+        QVERIFY2(exportSequence(p, *p.active(), aac, nullptr, nullptr, &err), err.c_str());
+        std::string title;
+        const std::vector<float> main = decodeAudioStream(aac.path, 0, &title);
+        QCOMPARE(QString::fromStdString(title), QString("Programme"));
+        const std::vector<float> described = decodeAudioStream(aac.path, 1, &title);
+        QCOMPARE(QString::fromStdString(title), QString("Audio Description"));
+        QVERIFY(!main.empty() && !described.empty());
+        const size_t a = size_t(1.5 * rate), b = size_t(2.5 * rate);
+        QVERIFY2(toneLevel(main, 0, 1000, a, b) < 0.01, qPrintable(QString::number(toneLevel(main, 0, 1000, a, b))));
+        QVERIFY2(toneLevel(described, 0, 1000, a, b) > 0.05, qPrintable(QString::number(toneLevel(described, 0, 1000, a, b))));
+        // Both keep the dialogue (ducked around the description, whole elsewhere).
+        QVERIFY(toneLevel(main, 0, 440, size_t(0.1 * rate), size_t(0.5 * rate)) > 0.05);
+        QVERIFY(toneLevel(described, 0, 440, size_t(0.1 * rate), size_t(0.5 * rate)) > 0.05);
+        // Without descriptions, nothing changes: one stream.
+        Sequence plain = *p.active();
+        for (Track& t : plain.audioTracks) std::erase_if(t.clips, [](const Clip& c) { return c.role == kDescriptionRole; });
+        aac.path = path("plain.m4a");
+        QVERIFY(exportSequence(p, plain, aac, nullptr, nullptr, &err));
+        QVERIFY(decodeAudioStream(aac.path, 1).empty());
+
+        // Voicing them, when the speech model is here.
+        if (ttsAvailable() && ttsModel().installed()) {
+            r = call({{"project", project}, {"action", "voice"}, {"voice", "bf_emma"}});
+            QVERIFY2(!r.value("isError").toBool(), qPrintable(QJsonDocument(r).toJson()));
+            QCOMPARE(r.value("structuredContent").toObject().value("clips").toArray().size(), 2);
+            Project voiced;
+            QVERIFY(loadProject(project.toStdString(), voiced));
+            int described2 = 0;
+            for (const Track& t : voiced.active()->audioTracks)
+                for (const Clip& c : t.clips)
+                    if (c.role == kDescriptionRole) {
+                        ++described2;
+                        QCOMPARE(t.name, std::string("AD"));
+                    }
+            QCOMPARE(described2, 2);  // the hand-placed one replaced
+        }
     }
 
     void immersiveMixAndAdmMaster() {

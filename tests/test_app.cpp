@@ -113,6 +113,8 @@
 #include "LoudnessReadout.h"
 #include "Voiceover.h"
 #include "AdrPanel.h"
+#include "AudioDescriptionDialog.h"
+#include "core/AudioDescription.h"
 #include "core/Adr.h"
 #include "MaskOverlay.h"
 #include "TransformOverlay.h"
@@ -5611,6 +5613,96 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(!panel->isRecording() && !panel->isRunning() && !program->adrCycle());
         QVERIFY(state()->project().media.empty());
         QVERIFY(!QFileInfo::exists(partial + "/M101 take 7.wav"));
+        state()->newProject();
+    }
+
+    void audioDescriptionDialog() {
+        state()->newProject();
+        // Dialogue: a second of tone at 0 s and again at 3 s.
+        const QString wav = dir_.path() + "/ad-line.wav";
+        {
+            WavWriter w;
+            QVERIFY(w.open(wav, 48000, 1));
+            std::vector<float> tone(48000);
+            for (size_t i = 0; i < tone.size(); ++i) tone[i] = float(0.3 * std::sin(2 * M_PI * 440 * double(i) / 48000));
+            w.write(tone.data(), 48000);
+            QVERIFY(w.close());
+        }
+        const auto ids = state()->importFiles({wav});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids.front();
+        QVERIFY(state()->apply("Lines", [&](Project& p, Sequence& s) {
+            edit::Result r = edit::placeMedia(p, s, media, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+            if (!r.ok) return r;
+            return edit::placeMedia(p, s, media, 90, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        }));
+        win_->findChild<QAction*>("audioDescription")->trigger();
+        auto* dlg = win_->findChild<AudioDescriptionDialog*>("audioDescriptionDialog");
+        QVERIFY(dlg && dlg->isVisible());
+        dlg->findChild<QDoubleSpinBox*>("adMinGap")->setValue(1.0);
+        QString err;
+        QVERIFY2(dlg->findGaps(&err) >= 1, qPrintable(err));
+        auto* table = dlg->findChild<QTableWidget*>("adTable");
+        QVERIFY(table->rowCount() >= 1);
+        // A description typed into the gap goes on the hidden description track; its fit is shown.
+        table->item(0, 3)->setText("Rain falls.");
+        QTRY_VERIFY(findDescriptionTrack(*state()->sequence()) >= 0);
+        const CaptionTrack& t = state()->sequence()->captionTracks[size_t(findDescriptionTrack(*state()->sequence()))];
+        QCOMPARE(t.captions.size(), size_t(1));
+        QCOMPARE(t.captions[0].text, std::string("Rain falls."));
+        QVERIFY(!t.visible);
+        QVERIFY(t.captions[0].start >= 39 && t.captions[0].end <= 81);
+        QTRY_COMPARE(table->item(0, 4)->text(), QString("Fits"));
+        // One too long for its gap says how many words to cut.
+        table->item(0, 3)->setText("Rain streams down the tall window while thunder rolls far across the dark valley below.");
+        QTRY_VERIFY(table->item(0, 4)->text().startsWith("Too long"));
+        // Undo puts the first back.
+        state()->undo();
+        QTRY_COMPARE(table->item(0, 3)->text(), QString("Rain falls."));
+        // Muting them while working; nothing to duck before they are voiced.
+        dlg->setHear(false);
+        QVERIFY(edit::roleMuted(*state()->sequence(), kDescriptionRole));
+        QVERIFY(!dlg->findChild<QCheckBox*>("adHear")->isChecked());
+        dlg->setHear(true);
+        QCOMPARE(dlg->duck(), 0);
+        // Voiced (when the speech model is here) onto the AD track as Description clips, and the programme ducked.
+        if (ttsAvailable() && ttsModel().installed()) {
+            QCOMPARE(dlg->voice(&err), 1);
+            const Sequence& s = *state()->sequence();
+            QVERIFY(hasDescriptionClips(s));
+            int ad = -1;
+            for (int i = 0; i < int(s.audioTracks.size()); ++i)
+                if (s.audioTracks[size_t(i)].name == "AD") ad = i;
+            QVERIFY(ad >= 0 && s.audioTracks[size_t(ad)].clips.size() == 1);
+            QVERIFY(dlg->duck() >= 1);
+            QCOMPARE(dlg->voice(&err), 1);  // voiced again: replaced, not added
+            QCOMPARE(state()->sequence()->audioTracks[size_t(ad)].clips.size(), size_t(1));
+        } else {
+            QVERIFY(state()->apply("Description clip", [&](Project& p, Sequence& s) {
+                const TrackRef r = edit::addTrack(p, s, TrackKind::Audio);
+                s.audioTracks[size_t(r.index)].name = "AD";
+                edit::Result res = edit::placeMedia(p, s, media, 40, 0, -1, {TrackKind::Video, -1}, r, false);
+                if (res.ok) edit::clipById(s, res.created.front())->role = kDescriptionRole;
+                return res;
+            }));
+            QVERIFY(dlg->duck() >= 1);
+        }
+        // Export offers the described stream once there are descriptions, for containers with several streams.
+        {
+            ExportDialog ed(state(), win_.get());
+            auto* described = ed.findChild<QCheckBox*>("exportDescribed");
+            auto* preset = ed.findChild<QComboBox*>("exportPreset");
+            QVERIFY(described && preset);
+            preset->setCurrentIndex(preset->findText("Audio - AAC (M4A)"));
+            QVERIFY(!described->isEnabled());  // M4A here: one stream
+            for (int i = 0; i < preset->count(); ++i)
+                if (preset->itemText(i).startsWith("H.264")) {
+                    preset->setCurrentIndex(i);
+                    break;
+                }
+            QVERIFY(described->isEnabled());
+        }
+        dlg->close();
         state()->newProject();
     }
 

@@ -85,8 +85,13 @@ struct ExportSettings {
         std::string language;  // ISO 639-1
         std::vector<bool> tracks;
         std::string role;
+        std::vector<std::string> unmute;  // roles heard in this stream even where the sequence mutes them
     };
     std::vector<AudioStream> extraAudio;
+    // Audio description (core/AudioDescription.h): the mix without the descriptions (clips of the role "Description")
+    // and, after it, a stream of the programme with them, named describedName in the mix's language.
+    bool describedStream = false;
+    std::string describedName = "Audio Description";
     std::string audioName, audioLanguage;  // the mix's title and language
     // Broadcast MXF (XDCAM HD422, AVC-Intra, DNxHR OP1a) carries each channel as its own mono track: the mix's channels,
     // then each extra stream's, then silence up to this many (0 = the mix as one stream, as everywhere else).

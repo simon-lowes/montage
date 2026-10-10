@@ -88,6 +88,7 @@ private:
     QLineEdit* startTc_ = nullptr;   // the file's starting timecode (MXF, MOV)
     QComboBox* color_ = nullptr;
     QComboBox* loudness_ = nullptr;
+    QCheckBox* described_ = nullptr;  // an audio description stream after the mix
     QComboBox* audioOut_ = nullptr;  // a surround sequence: all its channels, or folded to stereo
     QComboBox* stems_ = nullptr;     // also write stems: none, per track, per bus
     int stemsMode_ = 0;

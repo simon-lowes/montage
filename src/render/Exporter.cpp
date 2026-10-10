@@ -1,4 +1,5 @@
 #include "Exporter.h"
+#include "core/AudioDescription.h"
 
 #include "core/ColorGroups.h"
 #include "core/ClipAnimation.h"
@@ -1053,6 +1054,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             }
             e->mixer.setTrackMask(want.tracks);
             e->seq = seq;
+            for (const std::string& r : want.unmute) std::erase(e->seq.mutedRoles, r);
             if (!want.role.empty())
                 for (Track& t : e->seq.audioTracks)
                     for (Clip& c : t.clips)
@@ -1471,11 +1473,23 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
     if (light) *light = LightLevels{};
     // Channels a codec cannot carry fold down (an immersive mix to its ear-level layout, for AAC and the like).
     const std::string layout = s.downmixStereo ? seq.audioLayout : exportAudioLayout(seq.audioLayout, s.audioCodec);
+    // A described master: the mix without the descriptions, then the programme with them as a stream of its own.
+    const bool described = s.describedStream && hasDescriptionClips(seq) && !s.audioCodec.empty();
     bool ok;
-    if (layout != seq.audioLayout) {
-        Sequence folded = seq;
-        folded.audioLayout = layout;
-        ok = exportImpl(p, folded, s, progress, cancel, error, opened, encoderUsed, smartRendered, light);
+    if (layout != seq.audioLayout || described) {
+        Sequence work = seq;
+        work.audioLayout = layout;
+        ExportSettings settings = s;
+        if (described) {
+            if (!edit::roleMuted(work, kDescriptionRole)) work.mutedRoles.push_back(kDescriptionRole);
+            ExportSettings::AudioStream ad;
+            ad.name = s.describedName.empty() ? std::string("Audio Description") : s.describedName;
+            ad.language = s.audioLanguage;
+            ad.unmute = {kDescriptionRole};
+            settings.extraAudio.push_back(std::move(ad));
+            if (settings.audioName.empty()) settings.audioName = "Programme";
+        }
+        ok = exportImpl(p, work, settings, progress, cancel, error, opened, encoderUsed, smartRendered, light);
     } else {
         ok = exportImpl(p, seq, s, progress, cancel, error, opened, encoderUsed, smartRendered, light);
     }

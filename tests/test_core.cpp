@@ -39,6 +39,7 @@
 #include "core/TimelineCompare.h"
 #include "core/Reconform.h"
 #include "core/Adr.h"
+#include "core/AudioDescription.h"
 #include "core/ProjectIO.h"
 #include "core/ScriptCut.h"
 #include "core/Surround.h"
@@ -2770,6 +2771,52 @@ private slots:
         QVERIFY(edit::deleteGaps(fx.p, fx.s()).ok);
         QCOMPARE(fx.a1().surroundXAuto.keys.back().t, FrameTime(30));
         QCOMPARE(fx.a1().surroundXAuto.keys.front().t, FrameTime(0));
+    }
+
+    void audioDescriptionGaps() {
+        // Speech 1-3 s, 6-7 s and 7.5-12 s in 15 s at 30 fps: gaps of two seconds or more, kept 0.3 s clear of the lines
+        // (not of the range's ends).
+        const std::vector<std::pair<double, double>> speech{{1, 3}, {6, 7}, {7.5, 12}};
+        const std::vector<DescriptionGap> gaps = descriptionGaps(speech, 30, 0, 450);
+        QCOMPARE(gaps.size(), size_t(2));
+        QCOMPARE(gaps[0], (DescriptionGap{99, 171}));
+        QCOMPARE(gaps[1], (DescriptionGap{369, 450}));
+        QVERIFY(descriptionGaps(speech, 30, 0, 450, 3.0).empty());
+        QCOMPARE(descriptionGaps({}, 30, 30, 90).size(), size_t(1));
+        QCOMPARE(descriptionGaps({}, 30, 30, 90)[0], (DescriptionGap{30, 90}));
+        QVERIFY(descriptionGaps(speech, 30, 120, 300).empty());  // only 4-10 s looked at: 4 s to 5.7 s is too short
+        // Words, seconds at a describer's pace, and fit.
+        QCOMPARE(descriptionWords("  A man   walks in. "), 4);
+        QCOMPARE(descriptionSeconds("A man walks in."), 1.5);
+        const std::string eight = "She opens the door and steps outside slowly";
+        DescriptionFit f = descriptionFit(eight, 2.5);
+        QVERIFY(f.fits && std::fabs(f.speed - 1.2) < 1e-9 && f.overWords == 2);
+        f = descriptionFit(eight, 2.0);
+        QVERIFY(!f.fits && std::fabs(f.speed - 1.5) < 1e-9 && f.overWords == 3);
+        f = descriptionFit("Night.", 2.0);
+        QVERIFY(f.fits && f.speed == 1.0 && f.overWords == 0);
+        // The description track: hidden, made once; descriptions replace what they overlap, empty text removes.
+        Fixture fx;
+        Sequence& s = fx.s();
+        QCOMPARE(findDescriptionTrack(s), -1);
+        const int t = descriptionTrack(fx.p, s, "fr");
+        QCOMPARE(descriptionTrack(fx.p, s), t);
+        QVERIFY(!s.captionTracks[size_t(t)].visible);
+        QCOMPARE(s.captionTracks[size_t(t)].language, std::string("fr"));
+        QVERIFY(setDescription(fx.p, s, 99, 171, "Rain on the window."));
+        QVERIFY(setDescription(fx.p, s, 369, 450, "She leaves."));
+        QVERIFY(setDescription(fx.p, s, 120, 160, "Rain streaks the glass."));  // replaces the first
+        auto& caps = s.captionTracks[size_t(t)].captions;
+        QCOMPARE(caps.size(), size_t(2));
+        QVERIFY(caps[0].start == 120 && caps[0].text == "Rain streaks the glass.");
+        QVERIFY(!setDescription(fx.p, s, 200, 200, "No room."));
+        QVERIFY(setDescription(fx.p, s, 130, 0, ""));  // the one there goes
+        QCOMPARE(caps.size(), size_t(1));
+        QVERIFY(!setDescription(fx.p, s, 10, 0, ""));
+        QVERIFY(!hasDescriptionClips(s));
+        const Id clip = fx.put(A1, 0, 30);
+        edit::clipById(s, clip)->role = kDescriptionRole;
+        QVERIFY(hasDescriptionClips(s));
     }
 
     void adrCueList() {
