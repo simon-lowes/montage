@@ -2,6 +2,8 @@
 #pragma once
 
 #include <QAbstractScrollArea>
+#include <map>
+#include <QMenu>
 #include <QList>
 #include <optional>
 #include <vector>
@@ -42,9 +44,79 @@ public:
 
     QSize sizeHint() const override { return {900, 320}; }
 
+    // Bakes an audio clip's effects into a new audio file and points the clip at it (undoable).
+    bool renderAndReplace(montage::Id clip, QString* error = nullptr);
+
+    // Lines over clips for their volume (audio clips) and opacity (video clips),
+    // with their keyframes: drag the line to change it, Ctrl/Cmd-click it to add
+    // a keyframe, drag keyframes, Alt-click one to delete it.
+    void setShowVolumeLines(bool on);
+    bool showVolumeLines() const { return showVolume_; }
+    // Audio rows show their track's volume automation (core/Automation.h) across the row instead of clip lines:
+    // drag a key or the line, Ctrl/Cmd-click to add a key, Alt-click a key to delete it.
+    // Trim mode's selected edit, drawn as brackets on the sides being trimmed (side 0 both, 1 outgoing, 2 incoming).
+    void setTrimEdit(Id outgoing, Id incoming, int side);
+    void clearTrimEdit();
+    bool trimEditShown() const { return trimSide_ >= 0; }
+    // Each clip's duration in its name strip (Resolve 21.1's view option).
+    void setShowClipDurations(bool on);
+    bool showClipDurations() const { return showDurations_; }
+    // Resolve 21.1's independent waveform scaling: each audio clip's waveform drawn to the full height of the clip
+    // from its own loudest point, so quiet sound is readable (the clip's level no longer scales it).
+    void setNormalizeWaveforms(bool on);
+    bool normalizeWaveforms() const { return normalizeWaves_; }
+    // The factor a clip's samples are drawn at: its gain, or with normalising 1 / its peak (0 until peaks are read).
+    double waveformScale(const Clip& c) const;
+    // Duplicate frame markers (Premiere's): a coloured stripe under video frames that another clip also shows.
+    void setShowDuplicateFrames(bool on);
+    bool showDuplicateFrames() const { return showDuplicates_; }
+    const std::vector<edit::DuplicateSpan>& duplicateSpans(Id clip) const;  // as drawn
+    // Track folders: where a folder's header is drawn (empty when not shown), and opening or closing it as its
+    // arrow does.
+    QRect folderHeaderRect(TrackKind kind, const QString& folder) const;
+    void toggleFolder(TrackKind kind, const QString& folder);
+    // Gaps (Premiere's and Resolve's): a click on the empty stretch between two clips selects it, and Delete closes
+    // it, rippling what follows. The selected gap's track and frames [from, to), if any.
+    struct Gap {
+        TrackRef track;
+        FrameTime from = 0, to = 0;
+    };
+    const std::optional<Gap>& selectedGap() const { return gap_; }
+    bool selectGapAt(TrackRef track, FrameTime frame);  // false if there is no gap there
+    void clearGap();
+    // Whether a track's row is shown (not inside a collapsed folder).
+    bool trackShown(TrackRef ref) const;
+    // Where a clip is drawn, in viewport pixels (empty when its row is not shown).
+    QRect clipBounds(Id clip) const {
+        QRect r;
+        return clipRect(clip, r) ? r : QRect();
+    }
+    // Whether a through edit follows this clip (edit::throughEdits), as marked on the timeline.
+    bool isThroughEdit(Id clip) const;
+    // How many frames a linked clip is out of sync with its picture (edit::syncOffset), as its red badge shows; 0 in sync.
+    double syncOffsetOf(Id clip) const;
+    void setShowTrackAutomation(bool on);
+    bool showTrackAutomation() const { return showTrackAuto_; }
+    // Where audio track `index`'s automation line is at frame f, in viewport pixels (testing aid); (-1, -1) if hidden.
+    QPoint trackLanePoint(int index, FrameTime f) const;
+    void setShowOpacityLines(bool on);
+    bool showOpacityLines() const { return showOpacity_; }
+    // The render bar under the ruler: the frame ranges ([first, end)) whose
+    // rendered previews are cached show green.
+    void setRenderedRanges(std::vector<std::pair<FrameTime, FrameTime>> ranges);
+    const std::vector<std::pair<FrameTime, FrameTime>>& renderedRanges() const { return rendered_; }
+    // Where a clip's line is drawn (widget coordinates), for tests; empty if it is not shown.
+    QRect lineBand(montage::Id clip) const;
+    int lineY(montage::Id clip, montage::FrameTime local) const;
+
 signals:
     void toolChanged(montage::TimelineWidget::Tool tool);
     void clipActivated(montage::Id clip);  // double-click
+    void captionActivated(montage::Id track, int index);  // double-click on a caption
+    // While an edit is trimmed, rolled, slipped or slid: the frames either side of it
+    // (timeline frames, -1 for none) and their labels, for a two-up view; then the end.
+    void trimViewChanged(montage::FrameTime left, montage::FrameTime right, const QString& leftLabel, const QString& rightLabel);
+    void trimViewEnded();
 
 protected:
     void paintEvent(QPaintEvent* e) override;
@@ -63,22 +135,42 @@ protected:
     void leaveEvent(QEvent* e) override;
 
 private:
+    void emitTrimView();
     struct Row {
         TrackRef ref;
         int y = 0;
         int h = 0;
     };
-    enum class HitKind { None, Ruler, Header, Body, ClipBody, ClipIn, ClipOut, Transition };
-    enum class HeaderButton { None, Target, Visible, Lock, Mute, Solo, Name };
+    // A track folder's header row (its tracks' rows follow unless it is collapsed).
+    struct FolderRow {
+        TrackKind kind = TrackKind::Audio;
+        std::string name;
+        int y = 0, h = 0;
+        bool collapsed = false;
+        std::vector<int> tracks;  // by index, in display order
+    };
+    // Lays out the track and folder rows top to bottom; where the video/audio divider and the last row end.
+    void layoutRows(std::vector<Row>* rows, std::vector<FolderRow>* folders, int* divider, int* bottom) const;
+    std::vector<FolderRow> folderRows() const;
+    std::optional<FolderRow> folderRowAt(int y) const;
+    void paintFolderRow(QPainter& p, const FolderRow& f, bool header);
+    void folderMenu(QMenu& menu, TrackKind kind, const std::string& folder);
+    enum class HitKind { None, Ruler, Header, Body, ClipBody, ClipIn, ClipOut, Transition, TransitionEdge, CaptionLane, Caption, CaptionIn, CaptionOut };
+    enum class HeaderButton { None, Target, Visible, Lock, Mute, Solo, Name, Folder };
     struct Hit {
         HitKind kind = HitKind::None;
         std::optional<TrackRef> track;
         Id clip = 0;
         Id transition = 0;
+        bool rightEdge = false;  // TransitionEdge: the transition's end rather than its start
         HeaderButton button = HeaderButton::None;
         FrameTime frame = 0;
+        Id captionTrack = 0;
+        int caption = -1;
+        std::string folder;  // a track folder's header (with folderKind)
+        TrackKind folderKind = TrackKind::Audio;
     };
-    enum class DragKind { None, Scrub, Move, Trim, Roll, Slip, Slide, Rubber, Pan };
+    enum class DragKind { None, Scrub, Move, Trim, Roll, Slip, Slide, Rubber, Pan, CaptionMove, CaptionIn, CaptionOut, Line, LineKey, TrackLine, TrackKey, TransitionEdge };
     struct DragState {
         DragKind kind = DragKind::None;
         QPoint pressPos;
@@ -96,6 +188,32 @@ private:
         int vOffsetAtPress = 0;
         QRect band;
         QString label;  // live readout (e.g. "+00:00:00:12")
+        Id captionTrack = 0;
+        int caption = -1;
+        FrameTime key = -1;     // the keyframe dragged (clip-local frame)
+        double lineAtPress = 0;  // the line's value under the press
+        int track = -1;          // the audio track whose automation is dragged
+        Id transition = 0;       // TransitionEdge: the transition resized (edge: In its start, Out its end)
+    };
+    struct TrackLaneHit {
+        int track = -1;       // audio track index
+        FrameTime frame = 0;  // timeline frame under the pointer
+        FrameTime key = -1;   // a key under the pointer
+        bool onLine = false;
+    };
+    // A clip's line: which fixed parameter it shows and its range.
+    struct Lane {
+        Effect Clip::*fixed;
+        const char* param;
+        double def, lo, hi;
+        bool gain;  // drawn on the volume scale (core/KeyframeEdit.h)
+    };
+    struct LaneHit {
+        Id clip = 0;
+        Lane lane{};
+        FrameTime local = 0;  // clip-local frame under the pointer
+        FrameTime key = -1;   // a keyframe under the pointer
+        bool onLine = false;
     };
     struct Ghost {
         TrackRef track;
@@ -103,6 +221,8 @@ private:
         FrameTime duration = 0;
     };
 
+    int captionLanesHeight() const;
+    void paintCaptionLanes(QPainter& p);
     std::vector<Row> rows() const;
     int contentHeight() const;
     int dividerY() const;
@@ -123,6 +243,21 @@ private:
     void paintClip(QPainter& p, const Row& row, const Clip& c, const QRect& r);
     void paintWaveform(QPainter& p, const Clip& c, const QRect& r, const QColor& col);
     void paintThumbnails(QPainter& p, const Clip& c, const QRect& r);
+    std::optional<Lane> laneFor(const Clip& c, TrackKind kind) const;
+    static QRect laneBand(const QRect& clipRect);
+    static int laneY(const Lane& lane, const QRect& band, double v);
+    static double laneValue(const Lane& lane, const QRect& band, int y);
+    std::optional<LaneHit> laneHit(const QPoint& pos) const;
+    static const Lane& trackVolumeLane();
+    QRect trackLaneBand(const Row& row) const;
+    std::optional<TrackLaneHit> trackLaneHit(const QPoint& pos) const;
+    void paintTrackLane(QPainter& p, const Row& row, const Track& t);
+    bool beginTrackLaneDrag(QMouseEvent* e, const TrackLaneHit& h);
+    bool clipRect(Id clip, QRect& r, TrackKind* kind = nullptr) const;
+    bool laneOf(Id clip, Lane& lane, QRect& band) const;
+    void paintLane(QPainter& p, const Clip& c, TrackKind kind, const QRect& r);
+    bool beginLaneDrag(QMouseEvent* e, const LaneHit& h);
+    void laneMenu(QMenu& menu, const LaneHit& h);
 
     void beginDrag(QMouseEvent* e, const Hit& hit);
     void updateDrag(QMouseEvent* e);
@@ -135,6 +270,8 @@ private:
     Tool tool_ = Tool::Select;
     double ppf_ = 3.0;  // pixels per frame
     DragState drag_;
+    Id selectedCaptionTrack_ = 0;  // the caption last clicked
+    int selectedCaption_ = -1;
     FrameTime snapIndicator_ = -1;
     std::vector<Ghost> ghosts_;
     QList<QAction*> clipActions_;
@@ -142,6 +279,23 @@ private:
     FrameTime contextFrame_ = 0;
     std::optional<TrackRef> contextTrack_;
     QPoint hoverPos_;
+    bool showVolume_ = true;
+    bool showTrackAuto_ = false;
+    std::optional<Gap> gap_;
+    bool showDuplicates_ = false;
+    bool showDurations_ = false;
+    bool normalizeWaves_ = false;
+    mutable std::map<Id, double> clipPeaks_;  // normalising: each audio clip's loudest sample, until the project changes
+    mutable bool duplicatesDirty_ = true;
+    mutable bool throughDirty_ = true;
+    mutable std::vector<Id> through_;
+    mutable bool syncDirty_ = true;
+    mutable std::map<Id, double> sync_;
+    mutable std::map<Id, std::vector<edit::DuplicateSpan>> duplicates_;
+    Id trimOut_ = 0, trimIn_ = 0;
+    int trimSide_ = -1;
+    bool showOpacity_ = false;
+    std::vector<std::pair<FrameTime, FrameTime>> rendered_;
 };
 
 }  // namespace montage

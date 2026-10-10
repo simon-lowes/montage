@@ -10,8 +10,34 @@ namespace montage {
 // ---------------------------------------------------------------------------
 // Param
 
-double Param::at(FrameTime t) const {
-    if (keys.empty()) return value;
+void keyHandles(const std::vector<Keyframe>& keys, size_t i, double& inDt, double& inDv, double& outDt, double& outDv) {
+    inDt = inDv = outDt = outDv = 0;
+    if (i >= keys.size()) return;
+    const Keyframe& k = keys[i];
+    // Automatic: the slope through the neighbours, flat where the curve turns and at the ends.
+    double slope = 0;
+    if (i > 0 && i + 1 < keys.size()) {
+        const Keyframe& a = keys[i - 1];
+        const Keyframe& b = keys[i + 1];
+        if ((k.v - a.v) * (b.v - k.v) > 0 && b.t > a.t) slope = (b.v - a.v) / double(b.t - a.t);
+    }
+    if (k.inDt != 0 || k.inDv != 0) {
+        inDt = k.inDt, inDv = k.inDv;
+    } else if (i > 0) {
+        inDt = -double(k.t - keys[i - 1].t) / 3;
+        inDv = slope * inDt;
+    }
+    if (k.outDt != 0 || k.outDv != 0) {
+        outDt = k.outDt, outDv = k.outDv;
+    } else if (i + 1 < keys.size()) {
+        outDt = double(keys[i + 1].t - k.t) / 3;
+        outDv = slope * outDt;
+    }
+}
+
+namespace {
+// The value of keys at t, holding the first and last values outside them.
+double evalKeys(const std::vector<Keyframe>& keys, FrameTime t) {
     if (t <= keys.front().t) return keys.front().v;
     if (t >= keys.back().t) return keys.back().v;
     auto it = std::upper_bound(keys.begin(), keys.end(), t,
@@ -20,8 +46,46 @@ double Param::at(FrameTime t) const {
     const Keyframe& a = *(it - 1);
     if (a.interp == Interp::Hold || b.t == a.t) return a.v;
     double u = double(t - a.t) / double(b.t - a.t);
+    if (a.interp == Interp::Bezier) {
+        // A cubic from a to b through a's out handle and b's in handle, their times kept
+        // inside the segment so the curve is a function of time; solved for t by bisection.
+        const size_t ia = size_t(it - keys.begin()) - 1;
+        double ai, av, aOutDt, aOutDv, bInDt, bInDv, bo1, bo2;
+        keyHandles(keys, ia, ai, av, aOutDt, aOutDv);
+        keyHandles(keys, ia + 1, bInDt, bInDv, bo1, bo2);
+        const double seg = double(b.t - a.t);
+        const double x1 = std::clamp(aOutDt, 0.0, seg) / seg, x2 = 1 + std::clamp(bInDt, -seg, 0.0) / seg;
+        const double y0 = a.v, y1 = a.v + aOutDv, y2 = b.v + bInDv, y3 = b.v;
+        auto bez = [](double p0, double p1, double p2, double p3, double s) {
+            const double r = 1 - s;
+            return r * r * r * p0 + 3 * r * r * s * p1 + 3 * r * s * s * p2 + s * s * s * p3;
+        };
+        double lo = 0, hi = 1;
+        for (int k = 0; k < 50; ++k) {
+            const double mid = 0.5 * (lo + hi);
+            (bez(0, x1, x2, 1, mid) < u ? lo : hi) = mid;
+        }
+        return bez(y0, y1, y2, y3, 0.5 * (lo + hi));
+    }
     if (a.interp == Interp::Smooth) u = u * u * (3.0 - 2.0 * u);
     return a.v + (b.v - a.v) * u;
+}
+
+}  // namespace
+
+double Param::at(FrameTime t) const {
+    if (keys.empty()) return value;
+    if (repeat != Repeat::Hold && keys.size() >= 2 && t > keys.back().t && keys.back().t > keys.front().t) {
+        const FrameTime first = keys.front().t, span = keys.back().t - first;
+        const FrameTime cycle = (t - first) / span, into = (t - first) % span;
+        switch (repeat) {
+            case Repeat::Loop: return evalKeys(keys, first + into);
+            case Repeat::PingPong: return evalKeys(keys, cycle % 2 ? keys.back().t - into : first + into);
+            case Repeat::Offset: return evalKeys(keys, first + into) + double(cycle) * (keys.back().v - keys.front().v);
+            default: break;
+        }
+    }
+    return evalKeys(keys, t);
 }
 
 void Param::addKey(FrameTime t, double v, Interp interp) {
@@ -62,6 +126,12 @@ const Keyframe* Param::keyAt(FrameTime t) const {
 // ---------------------------------------------------------------------------
 // Effect
 
+bool Effect::operator==(const Effect& o) const {
+    if (id != o.id || type != o.type || enabled != o.enabled || params != o.params || strings != o.strings) return false;
+    if (object == o.object) return true;
+    return object && o.object && *object == *o.object;
+}
+
 double Effect::p(const std::string& name, FrameTime t, double def) const {
     auto it = params.find(name);
     if (it == params.end()) return def;
@@ -76,10 +146,82 @@ std::string Effect::s(const std::string& name, const std::string& def) const {
 // ---------------------------------------------------------------------------
 // Clip / Sequence / Project
 
-double Clip::sourceFrameAt(FrameTime t) const {
-    double local = double(t - start);
-    if (reverse) local = double(duration - 1) - local;
-    return double(sourceIn) + local * speed;
+namespace {
+// The integral of a parameter's curve from x0 to x1 (continuous form of Param::at).
+double integrate(const Param& p, double x0, double x1) {
+    const auto& k = p.keys;
+    if (k.empty()) return p.value * (x1 - x0);
+    // Antiderivative with G(first key) = 0.
+    auto G = [&](double x) {
+        if (x <= double(k.front().t)) return k.front().v * (x - double(k.front().t));
+        double cum = 0;
+        for (size_t i = 0; i + 1 < k.size(); ++i) {
+            const Keyframe& a = k[i];
+            const Keyframe& b = k[i + 1];
+            const double dt = double(b.t - a.t);
+            if (dt <= 0) continue;
+            const double u = std::min(1.0, (x - double(a.t)) / dt);
+            double part;
+            if (a.interp == Interp::Hold) part = a.v * u;
+            else if (a.interp == Interp::Smooth) part = a.v * u + (b.v - a.v) * (u * u * u - u * u * u * u / 2);
+            else part = a.v * u + (b.v - a.v) * u * u / 2;
+            if (x <= double(b.t)) return cum + part * dt;
+            cum += part * dt;
+        }
+        return cum + k.back().v * (x - double(k.back().t));
+    };
+    return G(x1) - G(x0);
+}
+}  // namespace
+
+bool Clip::ramped() const {
+    if (reverse || timing.empty()) return false;
+    auto it = timing.params.find("speed");
+    return it != timing.params.end() && (it->second.animated() || it->second.value != 100);
+}
+
+double Clip::speedAt(double local) const {
+    if (!ramped()) return speed;
+    const Param& p = timing.params.at("speed");
+    if (!p.animated()) return speed * p.value / 100;
+    return speed * std::max(0.0, integrate(p, local, local + 1e-6) / 1e-6) / 100;
+}
+
+double Clip::sourceOffset(double local) const {
+    if (!ramped()) return local * speed;
+    return speed * integrate(timing.params.at("speed"), 0, local) / 100;
+}
+
+double Clip::sourceAt(double local) const {
+    if (reverse) return double(sourceIn) + (double(duration - 1) - local) * speed;
+    return double(sourceIn) + sourceOffset(local);
+}
+
+double Clip::sourceFrameAt(FrameTime t) const { return sourceAt(double(t - start)); }
+
+FrameTime Clip::markerFrame(const Marker& m) const {
+    const double local = localForSource(double(m.t));
+    const FrameTime f = FrameTime(std::llround(local));
+    return f >= 0 && f < duration ? start + f : -1;
+}
+
+double Clip::localForSource(double source) const {
+    if (reverse) return double(duration - 1) - (source - sourceIn) / speed;
+    const double want = source - sourceIn;
+    if (!ramped()) return want / speed;
+    // The offset grows with time (speeds are positive): bisect.
+    double lo = 0, hi = 1;
+    if (want < 0) {
+        lo = want / std::max(1e-6, speedAt(0));
+        hi = 0;
+    } else {
+        while (sourceOffset(hi) < want && hi < 1e9) hi *= 2;
+    }
+    for (int i = 0; i < 60; ++i) {
+        const double mid = (lo + hi) / 2;
+        (sourceOffset(mid) < want ? lo : hi) = mid;
+    }
+    return (lo + hi) / 2;
 }
 
 FrameTime Sequence::duration() const {
@@ -161,6 +303,7 @@ Clip makeClip(Project& p, const MediaItem& media, TrackKind kind, const Sequence
     c.duration = len;
     c.motion = makeEffect(p, "transform");
     c.audio = makeEffect(p, "volume");
+    c.timing = makeEffect(p, "time");
     (void)kind;
     return c;
 }
@@ -173,6 +316,7 @@ Clip makeGeneratorClip(Project& p, const std::string& generatorType, FrameTime d
     c.duration = std::max<FrameTime>(1, duration);
     c.motion = makeEffect(p, "transform");
     c.audio = makeEffect(p, "volume");
+    c.timing = makeEffect(p, "time");
     return c;
 }
 

@@ -1,6 +1,8 @@
 // Montage — sequence settings dialog.
 #include "SequenceSettingsDialog.h"
+#include "Settings.h"
 
+#include <QCheckBox>
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QFormLayout>
@@ -18,6 +20,7 @@
 #include "EditorState.h"
 #include "Theme.h"
 #include "core/History.h"
+#include "render/ColorSpace.h"
 
 namespace montage {
 
@@ -132,6 +135,32 @@ SequenceSettingsDialog::SequenceSettingsDialog(QWidget* parent) : QDialog(parent
     sampleRate_ = new QComboBox(this);
     for (int sr : kSampleRates) sampleRate_->addItem(tr("%1 Hz").arg(sr), sr);
 
+    colorSpace_ = new QComboBox(this);
+    colorSpace_->setObjectName(QStringLiteral("colorSpace"));
+    for (const ColorSpace* cs : displayColorSpaces())
+        colorSpace_->addItem(QString::fromStdString(cs->label), QString::fromStdString(cs->id));
+    colorSpace_->setToolTip(tr("The space clips are converted into, effects work in and exports deliver.\n"
+                               "HDR sequences are previewed tone mapped to SDR."));
+    hdrPeak_ = new QSpinBox(this);
+    hdrPeak_->setObjectName(QStringLiteral("hdrPeak"));
+    hdrPeak_->setRange(100, 10000);
+    hdrPeak_->setSingleStep(100);
+    hdrPeak_->setSuffix(tr(" nits"));
+    hdrPeak_->setToolTip(tr("Mastering display peak: the brightest level exported, written into HDR10 metadata"));
+
+    audioLayout_ = new QComboBox(this);
+    audioLayout_->setObjectName(QStringLiteral("audioLayout"));
+    audioLayout_->addItem(tr("Stereo"), QStringLiteral("stereo"));
+    audioLayout_->addItem(tr("5.1 surround (L R C LFE Ls Rs)"), QStringLiteral("5.1"));
+    audioLayout_->addItem(tr("7.1 surround (L R C LFE Lb Rb Ls Rs)"), QStringLiteral("7.1"));
+    audioLayout_->addItem(tr("5.1.2 immersive (5.1 and two overhead)"), QStringLiteral("5.1.2"));
+    audioLayout_->addItem(tr("5.1.4 immersive (5.1 and four overhead)"), QStringLiteral("5.1.4"));
+    audioLayout_->addItem(tr("7.1.2 immersive (7.1 and two overhead, the Atmos bed)"), QStringLiteral("7.1.2"));
+    audioLayout_->addItem(tr("7.1.4 immersive (7.1 and four overhead)"), QStringLiteral("7.1.4"));
+    audioLayout_->addItem(tr("Ambisonics (first order AmbiX, for 360° video)"), QStringLiteral("ambix"));
+    audioLayout_->setToolTip(tr("The speakers the sequence mixes to. Surround mixes are heard folded down to stereo,\n"
+                                "and each track and bus gets a surround panner in the mixer."));
+
     summary_ = new QLabel(this);
     QPalette dim = summary_->palette();
     dim.setColor(QPalette::WindowText, theme::kTextDim);
@@ -144,6 +173,28 @@ SequenceSettingsDialog::SequenceSettingsDialog(QWidget* parent) : QDialog(parent
     form->addRow(QString(), sizeRow);
     form->addRow(tr("Frame rate:"), frameRate_);
     form->addRow(tr("Sample rate:"), sampleRate_);
+    form->addRow(tr("Audio channels:"), audioLayout_);
+    form->addRow(tr("Colour space:"), colorSpace_);
+    form->addRow(tr("HDR peak:"), hdrPeak_);
+    spherical_ = new QCheckBox(tr("360° video (equirectangular)"), this);
+    spherical_->setObjectName(QStringLiteral("sphericalSequence"));
+    spherical_->setToolTip(tr("Exports say they are 360° to players and YouTube; 360° footage comes in whole, not as a view.\n"
+                              "Use a 2:1 frame size such as 3840 x 1920 or 5760 x 2880."));
+    form->addRow(tr("Projection:"), spherical_);
+    vr180_ = new QCheckBox(tr("VR180 (the front half of the sphere)"), this);
+    vr180_->setObjectName(QStringLiteral("vr180Sequence"));
+    vr180_->setToolTip(tr("For VR180 cameras: each eye covers the half of the sphere in front. Use a 1:1 frame per eye."));
+    vr180_->setEnabled(false);
+    connect(spherical_, &QCheckBox::toggled, vr180_, [this](bool on) {
+        vr180_->setEnabled(on);
+        if (!on) vr180_->setChecked(false);
+    });
+    form->addRow(QString(), vr180_);
+    stereo3d_ = new QCheckBox(tr("Stereoscopic 3D (a picture for each eye)"), this);
+    stereo3d_->setObjectName(QStringLiteral("stereoSequence"));
+    stereo3d_->setToolTip(tr("Stereo footage gives each eye its own picture and the Stereo 3D effect sets a clip's depth.\n"
+                             "View › Stereo 3D chooses what the viewer shows; exports are side by side unless chosen otherwise."));
+    form->addRow(tr("Stereo:"), stereo3d_);
     form->addRow(QString(), summary_);
 
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
@@ -162,6 +213,7 @@ SequenceSettingsDialog::SequenceSettingsDialog(QWidget* parent) : QDialog(parent
     connect(height_, &QSpinBox::valueChanged, this, [this] { selectPresetForSize(); });
     connect(frameRate_, &QComboBox::currentIndexChanged, this, [this] { updateSummary(); });
     connect(sampleRate_, &QComboBox::currentIndexChanged, this, [this] { updateSummary(); });
+    connect(colorSpace_, &QComboBox::currentIndexChanged, this, [this] { updateSummary(); });
 
     setSpec(NewSequenceSpec{tr("Sequence 1")});
 }
@@ -175,6 +227,14 @@ void SequenceSettingsDialog::setSpec(const NewSequenceSpec& spec) {
     selectPresetForSize();
     selectFrameRate(spec.fps.valid() ? spec.fps : Rational{30, 1});
     selectSampleRate(spec.sampleRate > 0 ? spec.sampleRate : 48000);
+    const int cs = colorSpace_->findData(QString::fromStdString(spec.colorSpace));
+    colorSpace_->setCurrentIndex(cs >= 0 ? cs : 0);
+    hdrPeak_->setValue(int(std::lround(spec.hdrPeakNits)));
+    const int al = audioLayout_->findData(QString::fromStdString(spec.audioLayout));
+    audioLayout_->setCurrentIndex(al >= 0 ? al : 0);
+    spherical_->setChecked(spec.spherical);
+    vr180_->setChecked(spec.spherical && spec.vr180);
+    stereo3d_->setChecked(spec.stereo3d);
     updateSummary();
 }
 
@@ -186,6 +246,12 @@ NewSequenceSpec SequenceSettingsDialog::spec() const {
     const QPoint r = frameRate_->currentData().toPoint();
     s.fps = Rational{r.x(), r.y()};
     s.sampleRate = sampleRate_->currentData().toInt();
+    s.colorSpace = colorSpace_->currentData().toString().toStdString();
+    s.hdrPeakNits = hdrPeak_->value();
+    s.audioLayout = audioLayout_->currentData().toString().toStdString();
+    s.spherical = spherical_->isChecked();
+    s.vr180 = s.spherical && vr180_->isChecked();
+    s.stereo3d = stereo3d_->isChecked();
     return s;
 }
 
@@ -247,6 +313,9 @@ void SequenceSettingsDialog::updateSummary() {
     parts << tr("Aspect %1").arg(aspectLabel(s.width, s.height));
     parts << (isDropFrameRate(s.fps) ? tr("drop-frame timecode") : tr("non-drop-frame timecode"));
     parts << tr("%1 kHz stereo").arg(QString::number(s.sampleRate / 1000.0, 'g', 4));
+    const ColorSpace* cs = findColorSpace(s.colorSpace);
+    hdrPeak_->setEnabled(cs && cs->transfer == Transfer::Pq);
+    if (cs && cs->hdr()) parts << tr("HDR");
     summary_->setText(parts.join(QStringLiteral("  ·  ")));
     if (okButton_) okButton_->setEnabled(!s.name.isEmpty());
 }
@@ -254,7 +323,8 @@ void SequenceSettingsDialog::updateSummary() {
 bool SequenceSettingsDialog::editActive(EditorState* state, QWidget* parent) {
     if (!state || !state->sequence()) return false;
     const Sequence& seq = *state->sequence();
-    const NewSequenceSpec before{QString::fromStdString(seq.name), seq.width, seq.height, seq.fps, seq.sampleRate};
+    const NewSequenceSpec before{QString::fromStdString(seq.name), seq.width, seq.height, seq.fps, seq.sampleRate,
+                                 seq.colorSpace, seq.hdrPeakNits, seq.audioLayout, seq.spherical, seq.vr180, seq.stereo3d};
 
     SequenceSettingsDialog dlg(parent);
     dlg.setWindowTitle(tr("Sequence Settings"));
@@ -268,7 +338,9 @@ bool SequenceSettingsDialog::editActive(EditorState* state, QWidget* parent) {
 
     const NewSequenceSpec after = dlg.spec();
     if (after.name == before.name && after.width == before.width && after.height == before.height &&
-        after.fps == before.fps && after.sampleRate == before.sampleRate)
+        after.fps == before.fps && after.sampleRate == before.sampleRate && after.colorSpace == before.colorSpace &&
+        after.hdrPeakNits == before.hdrPeakNits && after.audioLayout == before.audioLayout && after.spherical == before.spherical &&
+        after.vr180 == before.vr180 && after.stereo3d == before.stereo3d)
         return false;
 
     const std::string name = after.name.toStdString();
@@ -278,6 +350,12 @@ bool SequenceSettingsDialog::editActive(EditorState* state, QWidget* parent) {
         s.height = after.height;
         s.fps = after.fps;
         s.sampleRate = after.sampleRate;
+        s.colorSpace = after.colorSpace;
+        s.hdrPeakNits = after.hdrPeakNits;
+        s.audioLayout = after.audioLayout;
+        s.spherical = after.spherical;
+        s.vr180 = after.vr180;
+        s.stereo3d = after.stereo3d;
         // Keep the media item that represents this sequence (for nesting) in sync.
         for (MediaItem& m : p.media) {
             if (m.kind != MediaKind::Sequence || m.sequenceId != s.id) continue;
@@ -291,7 +369,7 @@ bool SequenceSettingsDialog::editActive(EditorState* state, QWidget* parent) {
 }
 
 std::optional<NewSequenceSpec> SequenceSettingsDialog::askNew(QWidget* parent, const QString& defaultName) {
-    QSettings settings(QStringLiteral("Montage"), QStringLiteral("Montage"));
+    QSettings settings = appSettings();
     NewSequenceSpec spec;
     spec.name = defaultName.isEmpty() ? tr("Sequence") : defaultName;
     spec.width = settings.value(QStringLiteral("newSequence/width"), spec.width).toInt();
@@ -299,6 +377,9 @@ std::optional<NewSequenceSpec> SequenceSettingsDialog::askNew(QWidget* parent, c
     spec.fps.num = settings.value(QStringLiteral("newSequence/fpsNum"), spec.fps.num).toInt();
     spec.fps.den = settings.value(QStringLiteral("newSequence/fpsDen"), spec.fps.den).toInt();
     spec.sampleRate = settings.value(QStringLiteral("newSequence/sampleRate"), spec.sampleRate).toInt();
+    spec.colorSpace = settings.value(QStringLiteral("newSequence/colorSpace"), QStringLiteral("rec709")).toString().toStdString();
+    spec.hdrPeakNits = settings.value(QStringLiteral("newSequence/hdrPeakNits"), spec.hdrPeakNits).toDouble();
+    spec.audioLayout = settings.value(QStringLiteral("newSequence/audioLayout"), QStringLiteral("stereo")).toString().toStdString();
 
     SequenceSettingsDialog dlg(parent);
     dlg.setWindowTitle(tr("New Sequence"));
@@ -312,6 +393,9 @@ std::optional<NewSequenceSpec> SequenceSettingsDialog::askNew(QWidget* parent, c
     settings.setValue(QStringLiteral("newSequence/fpsNum"), spec.fps.num);
     settings.setValue(QStringLiteral("newSequence/fpsDen"), spec.fps.den);
     settings.setValue(QStringLiteral("newSequence/sampleRate"), spec.sampleRate);
+    settings.setValue(QStringLiteral("newSequence/colorSpace"), QString::fromStdString(spec.colorSpace));
+    settings.setValue(QStringLiteral("newSequence/hdrPeakNits"), spec.hdrPeakNits);
+    settings.setValue(QStringLiteral("newSequence/audioLayout"), QString::fromStdString(spec.audioLayout));
     return spec;
 }
 

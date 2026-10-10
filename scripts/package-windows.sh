@@ -14,7 +14,13 @@ ZIP="Montage-$VERSION-windows-x64.zip"
 
 rm -rf "$OUT" "dist/$ZIP"
 mkdir -p "$OUT"
-cp "$BUILD/src/app/montage.exe" "$BUILD/src/montage-cli.exe" "$OUT/"
+cp "$BUILD/src/app/montage.exe" "$BUILD/src/app/montage-plugin-probe.exe" "$BUILD/src/montage-cli.exe" "$OUT/"
+# ONNX Runtime goes beside the programs explicitly: Windows has an older
+# onnxruntime.dll of its own in System32, which ldd (and the loader) would
+# otherwise pick. Its own dependencies are collected below.
+for dll in "$BUILD"/src/app/onnxruntime.dll "$BUILD"/src/app/libonnxruntime.dll; do
+  if [ -e "$dll" ]; then cp "$dll" "$OUT/"; fi
+done
 
 WINDEPLOYQT=$(command -v windeployqt6 || command -v windeployqt || ls /ucrt64/share/qt6/bin/windeployqt*.exe | head -1)
 "$WINDEPLOYQT" --release --no-translations --no-system-d3d-compiler --no-opengl-sw "$OUT/montage.exe"

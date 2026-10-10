@@ -1,11 +1,15 @@
 #include "Analysis.h"
 
+#include <QImage>
+#include <QString>
 #include <algorithm>
 #include <cmath>
 #include <deque>
 #include <numeric>
 
 #include "Decoder.h"
+#include "SuperScale.h"
+#include "core/Effects.h"
 #include "core/EditOps.h"
 #include "render/Exporter.h"
 
@@ -108,6 +112,9 @@ bool createProxy(const std::string& source, const std::string& proxyPath, int ma
     s.width = m.width;
     s.height = m.height;
     s.fps = m.fps.valid() ? m.fps : Rational{30, 1};
+    // 360° footage whole, not as a view. (A stereo file's proxy holds its left eye: the right is read from the file.)
+    s.spherical = !m.projection.empty();
+    s.vr180 = m.projection == "vr180";
     m.id = p.newId();
     p.media.push_back(m);
     edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
@@ -121,6 +128,66 @@ bool createProxy(const std::string& source, const std::string& proxyPath, int ma
     double scale = std::min(1.0, double(maxWidth) / std::max(1, m.width));
     st.width = std::max(2, int(std::lround(m.width * scale)) & ~1);
     st.height = std::max(2, int(std::lround(m.height * scale)) & ~1);
+    return exportSequence(p, s, st, [&](double f, FrameTime) { if (progress) progress(f); }, cancel, error);
+}
+
+bool createSuperScaled(const std::string& source, const std::string& dest, int factor, double strength,
+                       const AnalysisProgress& progress, const std::atomic<bool>* cancel, std::string* error) {
+    if (!upscalerAvailable() || !upscaleModel().installed()) {
+        if (error) *error = upscalerAvailable() ? "The Super Scale model is not downloaded" : "This build has no ONNX Runtime";
+        return false;
+    }
+    MediaItem m;
+    if (!probeMedia(source, m, error)) return false;
+    if (!m.hasVideo || m.width <= 0 || m.height <= 0) {
+        if (error) *error = "Super Scale needs a video or a still";
+        return false;
+    }
+    factor = std::clamp(factor, 2, 4);
+    if (m.kind == MediaKind::Image) {
+        VideoDecoder dec;
+        if (!dec.open(source, error)) return false;
+        Frame16Ptr f = dec.frameAt(0);
+        if (!f) {
+            if (error) *error = "Cannot read " + source;
+            return false;
+        }
+        Image big;
+        if (!superScale(toImage(*f), f->width * factor, f->height * factor, big, strength, error, cancel)) return false;
+        if (progress) progress(1.0);
+        QImage out(toRgba8(big).data(), big.width, big.height, big.width * 4, QImage::Format_RGBA8888);
+        if (!out.save(QString::fromStdString(dest))) {
+            if (error) *error = "Cannot write " + dest;
+            return false;
+        }
+        return true;
+    }
+    // A video: rendered through a sequence of the new size, the clip with Super Scale on it.
+    Project p = makeDefaultProject();
+    Sequence& s = *p.active();
+    s.width = (m.width * factor) & ~1;
+    s.height = (m.height * factor) & ~1;
+    s.fps = m.fps.valid() ? m.fps : Rational{30, 1};
+    // 360° footage whole, not as a view. (A stereo file's proxy holds its left eye: the right is read from the file.)
+    s.spherical = !m.projection.empty();
+    s.vr180 = m.projection == "vr180";
+    m.id = p.newId();
+    p.media.push_back(m);
+    edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+    if (s.videoTracks.empty() || s.videoTracks[0].clips.empty()) {
+        if (error) *error = "Nothing to scale in " + source;
+        return false;
+    }
+    Effect e = makeEffect(p, "super_scale");
+    e.params["strength"] = Param(std::clamp(strength, 0.0, 1.0) * 100);
+    s.videoTracks[0].clips[0].effects.push_back(e);
+    const std::string ext = dest.substr(dest.find_last_of('.') + 1);
+    const ExportPreset* pr = findExportPreset(ext == "mov" ? "Apple ProRes 422 HQ" : "H.264 - High Quality");
+    ExportSettings st = pr ? pr->settings : ExportSettings{};
+    st.path = dest;
+    st.width = s.width;
+    st.height = s.height;
+    if (!m.hasAudio) st.audioCodec = "none";
     return exportSequence(p, s, st, [&](double f, FrameTime) { if (progress) progress(f); }, cancel, error);
 }
 

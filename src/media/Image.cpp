@@ -35,7 +35,7 @@ void Image::fill(float r, float g, float b, float a) {
 }
 
 Image toImage(const Frame16& f) {
-    Image img(f.width, f.height);
+    Image img(f.width, f.height, Image::Uninitialized{});
     const float k = 1.0f / 65535.0f;
     parallelRows(f.height, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y) {
@@ -53,20 +53,29 @@ Image toImage(const Frame16& f) {
     return img;
 }
 
-std::vector<uint8_t> toRgba8(const Image& img) {
-    std::vector<uint8_t> out(size_t(img.width) * size_t(img.height) * 4);
+void toRgba8(const Image& img, uint8_t* dst, size_t stride) {
     parallelRows(img.height, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y) {
             const float* s = img.row(y);
-            uint8_t* d = out.data() + size_t(y) * size_t(img.width) * 4;
+            uint8_t* d = dst + size_t(y) * stride;
             for (int x = 0; x < img.width; ++x, s += 4, d += 4) {
-                float a = std::clamp(s[3], 0.0f, 1.0f);
+                if (s[3] >= 1.0f) {  // opaque (every program frame): nothing to unpremultiply
+                    for (int c = 0; c < 3; ++c) d[c] = uint8_t(std::clamp(s[c], 0.0f, 1.0f) * 255.0f + 0.5f);
+                    d[3] = 255;
+                    continue;
+                }
+                float a = std::max(s[3], 0.0f);
                 float inv = a > 1e-6f ? 1.0f / a : 0.0f;
                 for (int c = 0; c < 3; ++c) d[c] = uint8_t(std::clamp(s[c] * inv, 0.0f, 1.0f) * 255.0f + 0.5f);
                 d[3] = uint8_t(a * 255.0f + 0.5f);
             }
         }
     });
+}
+
+std::vector<uint8_t> toRgba8(const Image& img) {
+    std::vector<uint8_t> out(size_t(img.width) * size_t(img.height) * 4);
+    toRgba8(img, out.data(), size_t(img.width) * 4);
     return out;
 }
 

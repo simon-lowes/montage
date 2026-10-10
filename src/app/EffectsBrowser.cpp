@@ -1,7 +1,15 @@
 // Montage — effects browser.
 #include "EffectsBrowser.h"
+#include "render/Ofx.h"
 
+#include "EffectPresetStore.h"
+
+#include <QDesktopServices>
 #include <QDrag>
+#include <QFileDialog>
+#include <QMenu>
+#include <QMessageBox>
+#include <QUrl>
 #include <QFontMetrics>
 #include <QHash>
 #include <QKeyEvent>
@@ -16,6 +24,7 @@
 #include <functional>
 
 #include "Theme.h"
+#include "audio/PluginEffect.h"
 
 namespace montage {
 
@@ -196,6 +205,31 @@ EffectsBrowser::EffectsBrowser(QWidget* parent) : QWidget(parent) {
 
     connect(search_, &QLineEdit::textChanged, this, [this](const QString& text) { applyFilter(text); });
     connect(search_, &QLineEdit::returnPressed, this, [this] { focusFirstMatch(); });
+    // Presets: delete one, import a preset file, or show the folder they are kept in.
+    tree_->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(tree_, &QWidget::customContextMenuRequested, this, [this](const QPoint& pos) {
+        QTreeWidgetItem* item = tree_->itemAt(pos);
+        const QString type = item ? item->data(0, kTypeRole).toString() : QString();
+        QMenu menu(this);
+        if (type.startsWith(QStringLiteral("preset:"))) {
+            const QString file = type.mid(7);
+            menu.addAction(tr("Delete Preset"), this, [this, file] {
+                presets::remove(file);
+                populate();
+            });
+        }
+        menu.addAction(tr("Import Preset..."), this, [this] {
+            const QString file = QFileDialog::getOpenFileName(this, tr("Import Preset"), QString(), tr("Montage presets (*.montagepreset)"));
+            EffectPreset p;
+            QString error;
+            if (file.isEmpty()) return;
+            if (!presets::load(file, p, &error) || presets::save(p, &error).isEmpty())
+                QMessageBox::warning(this, tr("Import Preset"), error);
+            populate();
+        });
+        menu.addAction(tr("Show Presets Folder"), this, [] { QDesktopServices::openUrl(QUrl::fromLocalFile(presets::folder())); });
+        menu.exec(tree_->viewport()->mapToGlobal(pos));
+    });
     connect(tree_, &QTreeWidget::itemDoubleClicked, this, [this](QTreeWidgetItem* item) {
         if (isLeaf(item)) requestApply(item);
     });
@@ -252,6 +286,91 @@ void EffectsBrowser::populate() {
             leaf->setData(0, kTypeRole, type);
             leaf->setData(0, kCategoryRole, int(info->category));
             leaf->setData(0, kSearchRole, QStringList{name, group, type}.join(' '));
+        }
+        top->setExpanded(true);
+    }
+    // Installed audio plugins this build can run, by vendor, after "Audio Effects".
+    QTreeWidgetItem* pluginsTop = nullptr;
+    QHash<QString, QTreeWidgetItem*> vendors;
+    const QIcon pluginIcon = categoryIcon(EffectCategory::AudioFilter);
+    for (const plugins::Descriptor& d : plugins::Registry::instance().plugins()) {
+        if (!plugins::canHost(d.format) || d.instrument || plugins::Registry::instance().isPluginDisabled(d.id)) continue;
+        if (!pluginsTop) {
+            pluginsTop = new QTreeWidgetItem(QStringList{tr("Audio Plugins")});
+            pluginsTop->setIcon(0, folderIcon);
+            pluginsTop->setFlags(folderFlags);
+            tree_->insertTopLevelItem(2, pluginsTop);
+        }
+        const QString vendor = d.vendor.empty() ? tr("Other") : QString::fromStdString(d.vendor);
+        QTreeWidgetItem*& folder = vendors[vendor];
+        if (!folder) {
+            folder = new QTreeWidgetItem(pluginsTop, QStringList{vendor});
+            folder->setIcon(0, folderIcon);
+            folder->setFlags(folderFlags);
+        }
+        const QString name = QString::fromStdString(d.name);
+        auto* leaf = new QTreeWidgetItem(folder, QStringList{name});
+        leaf->setFlags(leafFlags);
+        leaf->setIcon(0, pluginIcon);
+        QStringList details{QString::fromLatin1(plugins::formatName(d.format)), vendor};
+        if (!d.category.empty()) details << QString::fromStdString(d.category);
+        if (!d.version.empty()) details << tr("version %1").arg(QString::fromStdString(d.version));
+        leaf->setToolTip(0, QStringLiteral("<b>%1</b><br>%2").arg(name.toHtmlEscaped(), details.join(QStringLiteral(" · ")).toHtmlEscaped()));
+        leaf->setData(0, kTypeRole, QString::fromStdString(plugins::pluginType(d)));
+        leaf->setData(0, kCategoryRole, int(EffectCategory::AudioFilter));
+        leaf->setData(0, kSearchRole, QStringList{name, vendor, QString::fromStdString(d.category), tr("plugin")}.join(' '));
+    }
+    if (pluginsTop) pluginsTop->setExpanded(true);
+    // Installed OpenFX video plugins, by the plugin's own grouping, after the video effects.
+    QTreeWidgetItem* ofxTop = nullptr;
+    QHash<QString, QTreeWidgetItem*> ofxGroups;
+    for (const ofx::PluginDesc& d : ofx::Registry::instance().plugins()) {
+        if (!ofxTop) {
+            ofxTop = new QTreeWidgetItem(QStringList{tr("Video Plugins")});
+            ofxTop->setIcon(0, folderIcon);
+            ofxTop->setFlags(folderFlags);
+            tree_->insertTopLevelItem(1, ofxTop);
+        }
+        const QString group = d.group.empty() ? tr("Other") : QString::fromStdString(d.group).replace('/', QStringLiteral(" › "));
+        QTreeWidgetItem*& folder = ofxGroups[group];
+        if (!folder) {
+            folder = new QTreeWidgetItem(ofxTop, QStringList{group});
+            folder->setIcon(0, folderIcon);
+            folder->setFlags(folderFlags);
+        }
+        const QString name = QString::fromStdString(d.label);
+        auto* leaf = new QTreeWidgetItem(folder, QStringList{name});
+        leaf->setFlags(leafFlags);
+        leaf->setIcon(0, categoryIcon(EffectCategory::VideoFilter));
+        QStringList details{QStringLiteral("OpenFX"), group, tr("version %1.%2").arg(d.versionMajor).arg(d.versionMinor)};
+        if (d.temporal) details << tr("uses neighbouring frames");
+        leaf->setToolTip(0, QStringLiteral("<b>%1</b><br>%2%3")
+                                .arg(name.toHtmlEscaped(), details.join(QStringLiteral(" · ")).toHtmlEscaped(),
+                                     d.description.empty() ? QString() : "<br>" + QString::fromStdString(d.description).toHtmlEscaped()));
+        leaf->setData(0, kTypeRole, QString::fromStdString(ofx::kTypePrefix + d.id));
+        leaf->setData(0, kCategoryRole, int(EffectCategory::VideoFilter));
+        leaf->setData(0, kSearchRole, QStringList{name, group, QStringLiteral("openfx ofx plugin")}.join(' '));
+    }
+    if (ofxTop) ofxTop->setExpanded(true);
+    // Effect presets saved on this computer, first.
+    const auto saved = presets::all();
+    if (!saved.empty()) {
+        auto* top = new QTreeWidgetItem(QStringList{tr("Presets")});
+        top->setIcon(0, folderIcon);
+        top->setFlags(folderFlags);
+        tree_->insertTopLevelItem(0, top);
+        for (const auto& [file, preset] : saved) {
+            const QString name = QString::fromStdString(preset.name);
+            auto* leaf = new QTreeWidgetItem(top, QStringList{name});
+            leaf->setFlags(leafFlags);
+            leaf->setIcon(0, categoryIcon(preset.video ? EffectCategory::VideoFilter : EffectCategory::AudioFilter));
+            QStringList inside;
+            for (const Effect& e : preset.effects)
+                if (const EffectInfo* info = findEffectInfo(e.type)) inside << QString::fromStdString(info->displayName);
+            leaf->setToolTip(0, QStringLiteral("<b>%1</b><br>%2").arg(name.toHtmlEscaped(), inside.join(QStringLiteral(", ")).toHtmlEscaped()));
+            leaf->setData(0, kTypeRole, QStringLiteral("preset:") + file);
+            leaf->setData(0, kCategoryRole, int(preset.video ? EffectCategory::VideoFilter : EffectCategory::AudioFilter));
+            leaf->setData(0, kSearchRole, QStringList{name, tr("preset"), inside.join(' ')}.join(' '));
         }
         top->setExpanded(true);
     }

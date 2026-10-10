@@ -1,6 +1,7 @@
 #include "Loudness.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <vector>
 
@@ -12,7 +13,7 @@ namespace {
 // with coefficients derived for any sample rate (as in libebur128).
 struct KFilter {
     double b[2][3], a[2][3];
-    double z[2][2][2] = {};  // [stage][channel][state]
+    double z[2][8][2] = {};  // [stage][channel][state]
     explicit KFilter(double fs) {
         double f0 = 1681.974450955533, G = 3.999843853973347, Q = 0.7071752369554196;
         double K = std::tan(M_PI * f0 / fs), Vh = std::pow(10.0, G / 20.0), Vb = std::pow(Vh, 0.4996667741545416);
@@ -43,33 +44,99 @@ struct KFilter {
     }
 };
 
+// 4× oversampling for true peak (BS.1770-4 Annex 2): a 48-tap windowed-sinc
+// interpolator, 12 taps per phase.
+constexpr int kPhases = 4, kTaps = 12;
+const std::array<std::array<double, kTaps>, kPhases>& truePeakFilter() {
+    static const auto f = [] {
+        std::array<std::array<double, kTaps>, kPhases> h{};
+        for (int ph = 0; ph < kPhases; ++ph)
+            for (int k = 0; k < kTaps; ++k) {
+                // Tap k of phase ph sits at time (k - kTaps/2 + 1) - ph/4 samples from the output point.
+                const double t = double(k - kTaps / 2 + 1) - double(ph) / kPhases;
+                const double sinc = std::fabs(t) < 1e-9 ? 1.0 : std::sin(M_PI * t) / (M_PI * t);
+                const double w = 0.5 + 0.5 * std::cos(M_PI * t / (kTaps / 2.0));  // Hann over the span
+                h[size_t(ph)][size_t(k)] = sinc * std::max(0.0, w);
+            }
+        return h;
+    }();
+    return f;
+}
+
 }  // namespace
 
-LoudnessResult measureLoudness(const AudioBuffer& buf, int64_t first, int64_t count) {
-    LoudnessResult r;
-    const int64_t total = buf.frames();
-    first = std::clamp<int64_t>(first, 0, total);
-    int64_t last = count < 0 ? total : std::min(total, first + count);
-    if (last <= first || buf.sampleRate <= 0) return r;
-    const double fs = buf.sampleRate;
-    KFilter k(fs);
-    // Mean square per 100 ms step; blocks are 400 ms with 75 % overlap.
-    const int64_t step = std::max<int64_t>(1, int64_t(fs * 0.1));
-    std::vector<double> steps;
-    double acc = 0, peak = 0;
+struct LoudnessMeter::Impl {
+    explicit Impl(int rate) : fs(std::max(1, rate)), k(fs), step(std::max<int64_t>(1, int64_t(fs * 0.1))) {}
+    double fs;
+    KFilter k;
+    int64_t step;
+    std::vector<double> steps;  // mean square per 100 ms
+    double acc = 0;
     int64_t n = 0;
-    for (int64_t i = first; i < last; ++i) {
-        double l = buf.samples[size_t(i) * 2], rr = buf.samples[size_t(i) * 2 + 1];
-        peak = std::max({peak, std::fabs(l), std::fabs(rr)});
-        double kl = k.process(0, l), kr = k.process(1, rr);
-        acc += kl * kl + kr * kr;  // channel weights are 1.0 for L/R
-        if (++n == step) {
-            steps.push_back(acc / double(step));
-            acc = 0;
-            n = 0;
+    double peak = 0;
+    std::array<std::array<double, kTaps>, 8> history{};  // recent samples per channel, for oversampling
+    size_t hpos = 0;
+    double maxM = -200, maxS = -200;
+    // The mean square of the last `count` steps (fewer at the start).
+    double window(size_t count) const {
+        if (steps.empty()) return 0;
+        const size_t from = steps.size() > count ? steps.size() - count : 0;
+        double sum = 0;
+        for (size_t i = from; i < steps.size(); ++i) sum += steps[i];
+        return sum / double(steps.size() - from);
+    }
+};
+
+namespace {
+double toLufs(double ms) { return ms > 0 ? -0.691 + 10.0 * std::log10(ms) : -200.0; }
+}  // namespace
+
+LoudnessMeter::LoudnessMeter(int sampleRate) : d_(std::make_unique<Impl>(sampleRate)) {}
+LoudnessMeter::~LoudnessMeter() = default;
+
+void LoudnessMeter::add(const float* stereo, int64_t frames) {
+    static const double weights[2] = {1.0, 1.0};
+    addChannels(stereo, frames, 2, weights);
+}
+
+void LoudnessMeter::addChannels(const float* data, int64_t frames, int channels, const double* weights) {
+    Impl& d = *d_;
+    channels = std::clamp(channels, 1, 8);
+    const auto& h = truePeakFilter();
+    for (int64_t i = 0; i < frames; ++i) {
+        double sum = 0;
+        for (int ch = 0; ch < channels; ++ch) {
+            const double x = data[i * channels + ch];
+            d.history[size_t(ch)][d.hpos] = x;
+            d.peak = std::max(d.peak, std::fabs(x));
+            const double k = d.k.process(ch, x);
+            sum += weights[ch] * k * k;
+        }
+        d.hpos = (d.hpos + 1) % kTaps;
+        // True peak: the samples between this one and the last, interpolated.
+        for (int ch = 0; ch < channels; ++ch)
+            for (int ph = 0; ph < kPhases; ++ph) {
+                double v = 0;
+                for (int k = 0; k < kTaps; ++k) v += h[size_t(ph)][size_t(k)] * d.history[size_t(ch)][(d.hpos + size_t(k)) % kTaps];
+                d.peak = std::max(d.peak, std::fabs(v));
+            }
+        d.acc += sum;
+        if (++d.n == d.step) {
+            d.steps.push_back(d.acc / double(d.step));
+            d.acc = 0;
+            d.n = 0;
+            if (d.steps.size() >= 4) d.maxM = std::max(d.maxM, toLufs(d.window(4)));
+            if (d.steps.size() >= 30) d.maxS = std::max(d.maxS, toLufs(d.window(30)));
         }
     }
-    r.truePeakDb = peak > 0 ? 20.0 * std::log10(peak) : -96.0;
+}
+
+LoudnessResult LoudnessMeter::result() const {
+    const Impl& d = *d_;
+    LoudnessResult r;
+    r.truePeakDb = d.peak > 0 ? 20.0 * std::log10(d.peak) : -96.0;
+    // Blocks are 400 ms with 75 % overlap.
+    const std::vector<double>& steps = d.steps;
     std::vector<double> blocks;
     for (size_t i = 3; i < steps.size(); ++i) blocks.push_back((steps[i] + steps[i - 1] + steps[i - 2] + steps[i - 3]) / 4.0);
     if (blocks.empty() && !steps.empty()) {  // shorter than 400 ms: use what we have
@@ -87,7 +154,7 @@ LoudnessResult measureLoudness(const AudioBuffer& buf, int64_t first, int64_t co
             ++cnt;
         }
     if (cnt == 0) return r;
-    double relGate = lufs(sum / cnt) - 10.0;
+    const double relGate = lufs(sum / cnt) - 10.0;
     double sum2 = 0;
     int cnt2 = 0;
     for (double b : blocks)
@@ -99,6 +166,98 @@ LoudnessResult measureLoudness(const AudioBuffer& buf, int64_t first, int64_t co
     r.integrated = lufs(sum2 / cnt2);
     r.valid = true;
     return r;
+}
+
+double LoudnessMeter::momentary() const { return std::max(-200.0, toLufs(d_->window(4))); }
+double LoudnessMeter::shortTerm() const { return std::max(-200.0, toLufs(d_->window(30))); }
+double LoudnessMeter::maxMomentary() const { return d_->maxM; }
+double LoudnessMeter::maxShortTerm() const { return d_->maxS; }
+double LoudnessMeter::seconds() const { return double(d_->steps.size()) * 0.1 + double(d_->n) / d_->fs; }
+
+double LoudnessMeter::loudnessRange() const {
+    // Short-term (3 s) blocks at every 100 ms step (Tech 3342 asks for at least ten a second).
+    const auto& st = d_->steps;
+    if (st.size() < 30) return 0;
+    std::vector<double> blocks;
+    for (size_t i = 29; i < st.size(); ++i) {
+        double sum = 0;
+        for (size_t j = i - 29; j <= i; ++j) sum += st[j];
+        const double l = toLufs(sum / 30);
+        if (l > -70) blocks.push_back(l);
+    }
+    if (blocks.size() < 2) return 0;
+    // Relative gate 20 LU below the (energy) mean of what passed the absolute gate.
+    double e = 0;
+    for (double l : blocks) e += std::pow(10.0, (l + 0.691) / 10);
+    const double gate = toLufs(e / double(blocks.size())) - 20;
+    std::vector<double> kept;
+    for (double l : blocks)
+        if (l > gate) kept.push_back(l);
+    if (kept.size() < 2) return 0;
+    std::sort(kept.begin(), kept.end());
+    auto pct = [&](double q) { return kept[size_t(std::lround(q * double(kept.size() - 1)))]; };
+    return pct(0.95) - pct(0.10);
+}
+
+void LoudnessMeter::reset() { d_ = std::make_unique<Impl>(int(d_->fs)); }
+
+LoudnessResult measureLoudness(const AudioBuffer& buf, int64_t first, int64_t count) {
+    const int64_t total = buf.frames();
+    first = std::clamp<int64_t>(first, 0, total);
+    const int64_t last = count < 0 ? total : std::min(total, first + count);
+    if (last <= first || buf.sampleRate <= 0) return {};
+    LoudnessMeter m(buf.sampleRate);
+    m.add(buf.samples.data() + first * 2, last - first);
+    return m.result();
+}
+
+LoudnessResult measureLoudness(const float* data, int64_t frames, int channels, const double* weights, int sampleRate) {
+    if (frames <= 0 || sampleRate <= 0 || channels <= 0) return {};
+    LoudnessMeter m(sampleRate);
+    m.addChannels(data, frames, channels, weights);
+    return m.result();
+}
+
+// ---------------------------------------------------------------------------
+// PeakLimiter
+
+PeakLimiter::PeakLimiter(int sampleRate, double ceilingDb, double lookaheadMs, double releaseMs, int channels)
+    : ceiling_(float(std::pow(10.0, ceilingDb / 20.0))),
+      channels_(std::max(1, channels)),
+      lookahead_(std::max(1, int(std::lround(sampleRate * lookaheadMs / 1000.0)))),
+      release_(std::exp(-1.0 / std::max(1.0, sampleRate * releaseMs / 1000.0))),
+      delay_(size_t(lookahead_) * size_t(channels_), 0.f),
+      box_(size_t(lookahead_), 1.f),
+      boxSum_(double(lookahead_)) {}
+
+void PeakLimiter::process(const float* in, float* out, int frames) {
+    const size_t nc = size_t(channels_);
+    for (int i = 0; i < frames; ++i, ++n_) {
+        const float* x = in + size_t(i) * nc;
+        // The gain this sample needs, and the smallest over the look-ahead window.
+        float peak = 0;
+        for (size_t c = 0; c < nc; ++c) peak = std::max(peak, std::fabs(x[c]));
+        const float need = peak > ceiling_ ? ceiling_ / peak : 1.f;
+        while (!minQueue_.empty() && minQueue_.back().second >= need) minQueue_.pop_back();
+        minQueue_.emplace_back(n_, need);
+        while (minQueue_.front().first < n_ - lookahead_) minQueue_.pop_front();
+        const float lowest = minQueue_.front().second;
+        // Averaged over the look-ahead, the gain ramps down before a peak and never exceeds what it needs.
+        boxSum_ += double(lowest) - double(box_[boxPos_]);
+        box_[boxPos_] = lowest;
+        boxPos_ = (boxPos_ + 1) % box_.size();
+        const double ramp = boxSum_ / double(lookahead_);
+        gain_ = std::min(ramp, 1.0 - (1.0 - gain_) * release_);
+        // Out goes the sample from `lookahead_` frames ago (read before `out` may overwrite `in`).
+        float* slot = delay_.data() + delayPos_ * nc;
+        for (size_t c = 0; c < nc; ++c) {
+            const float v = x[c];
+            const float d = slot[c];
+            slot[c] = v;
+            out[size_t(i) * nc + c] = float(d * gain_);
+        }
+        delayPos_ = (delayPos_ + 1) % size_t(lookahead_);
+    }
 }
 
 }  // namespace montage

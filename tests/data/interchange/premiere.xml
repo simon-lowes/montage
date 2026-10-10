@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE xmeml>
+<xmeml version="4"><sequence id="seq"><name>Premiere Cut</name><duration>200</duration>
+<rate><timebase>25</timebase><ntsc>FALSE</ntsc></rate>
+<media><video><format><samplecharacteristics><width>1280</width><height>720</height></samplecharacteristics></format>
+<track>
+  <clipitem id="clipitem-1"><name>A</name><duration>500</duration><rate><timebase>25</timebase></rate>
+    <start>0</start><end>-1</end><in>10</in><out>120</out>
+    <file id="file-1"><name>a.mov</name><pathurl>file://localhost/media/a.mov</pathurl><duration>500</duration>
+      <media><video/><audio/></media></file>
+    <link><linkclipref>clipitem-1</linkclipref></link><link><linkclipref>clipitem-3</linkclipref></link></clipitem>
+  <transitionitem><start>100</start><end>120</end><alignment>center</alignment>
+    <effect><name>Cross Dissolve</name><effectid>Cross Dissolve</effectid></effect></transitionitem>
+  <clipitem id="clipitem-2"><name>B</name><duration>500</duration><rate><timebase>25</timebase></rate>
+    <start>-1</start><end>200</end><in>50</in><out>150</out><file id="file-1"/></clipitem>
+</track></video>
+<audio><track>
+  <clipitem id="clipitem-3"><name>A</name><start>0</start><end>110</end><in>10</in><out>120</out><file id="file-1"/>
+    <link><linkclipref>clipitem-1</linkclipref></link></clipitem>
+</track></audio></media></sequence></xmeml>

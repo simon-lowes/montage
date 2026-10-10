@@ -1,7 +1,10 @@
 // Montage — audio mixer panel.
 #include "MixerPanel.h"
 
+#include <QComboBox>
 #include <QDial>
+#include <QInputDialog>
+#include <QMenu>
 #include <QEvent>
 #include <QFrame>
 #include <QHBoxLayout>
@@ -16,11 +19,20 @@
 
 #include "AudioMeterWidget.h"
 #include "EditorState.h"
+#include "SurroundPanner.h"
+#include "core/Automation.h"
+#include "core/Surround.h"
 #include "Theme.h"
 
 namespace montage {
 
 namespace {
+
+// Whether a track plays its automation lanes (and its fader edits them).
+bool readsLanes(const Track& t) {
+    const AutomationMode m = trackAutomation(t);
+    return m == AutomationMode::Read || m == AutomationMode::Latch || m == AutomationMode::Touch;
+}
 
 constexpr int kStripWidth = 80;
 constexpr int kMasterWidth = 68;
@@ -88,6 +100,7 @@ MixerPanel::MixerPanel(EditorState* state, QWidget* parent) : QWidget(parent), s
 
     connect(state_, &EditorState::projectChanged, this, &MixerPanel::syncToProject);
     connect(state_, &EditorState::sequenceSwitched, this, &MixerPanel::syncToProject);
+    connect(state_, &EditorState::playheadChanged, this, [this] { followAutomation(); });
     rebuild();
 }
 
@@ -104,10 +117,156 @@ QWidget* MixerPanel::makeMasterStrip() {
     name->setFont(f);
     name->setText(tr("Master"));
     v->addWidget(name);
+    masterFx_ = new QToolButton(box);
+    masterFx_->setObjectName(QStringLiteral("masterFx"));
+    masterFx_->setText(tr("FX"));
+    masterFx_->setToolTip(tr("Effects on the whole mix (shown in the Inspector)"));
+    connect(masterFx_, &QToolButton::clicked, this, [this] {
+        if (const Sequence* s = state_->sequence()) inspect(s->id);
+    });
+    v->addWidget(masterFx_, 0, Qt::AlignHCenter);
+    auto* mid = new QHBoxLayout;
+    mid->setContentsMargins(0, 0, 0, 0);
+    mid->setSpacing(2);
+    masterFader_ = new QSlider(Qt::Vertical, box);
+    masterFader_->setObjectName(QStringLiteral("masterFader"));
+    masterFader_->setRange(kFaderMin, kFaderMax);
+    masterFader_->setPageStep(30);
+    masterFader_->setToolTip(tr("Master volume (double-click for 0 dB)"));
+    masterFader_->installEventFilter(this);
     masterMeter_ = new AudioMeterWidget(box);
     masterMeter_->setShowScale(true);
-    v->addWidget(masterMeter_, 1, Qt::AlignHCenter);
+    mid->addWidget(masterFader_);
+    mid->addWidget(masterMeter_);
+    v->addLayout(mid, 1);
+    masterDb_ = smallLabel(box);
+    v->addWidget(masterDb_);
+    connect(masterFader_, &QSlider::valueChanged, this, [this](int value) {
+        const double db = value / 10.0;
+        masterDb_->setText(dbText(db));
+        state_->edit(tr("Master Volume"), [db](Project&, Sequence& s) {
+            if (s.masterVolumeDb == db) return false;
+            s.masterVolumeDb = db;
+            return true;
+        }, mergeKey_.isEmpty() ? QStringLiteral("master-volume") : mergeKey_);
+    });
     return box;
+}
+
+void MixerPanel::inspect(Id owner) {
+    state_->inspectChain(owner);
+    emit effectsRequested();
+}
+
+void MixerPanel::addBus() {
+    Id created = 0;
+    state_->edit(tr("Add Bus"), [&created, this](Project& p, Sequence& s) {
+        Bus b;
+        b.id = created = p.newId();
+        b.name = tr("Bus %1").arg(s.buses.size() + 1).toStdString();
+        s.buses.push_back(b);
+        return true;
+    });
+}
+
+MixerPanel::BusStrip MixerPanel::makeBusStrip(Id bus) {
+    BusStrip b;
+    auto* box = new QFrame(stripHost_);
+    box->setObjectName(QStringLiteral("mixerStrip"));
+    box->setFixedWidth(kStripWidth);
+    box->setContextMenuPolicy(Qt::CustomContextMenu);
+    b.box = box;
+    auto* v = new QVBoxLayout(box);
+    v->setContentsMargins(4, 4, 4, 4);
+    v->setSpacing(3);
+    b.name = smallLabel(box, 11);
+    QFont nf = b.name->font();
+    nf.setBold(true);
+    nf.setItalic(true);
+    b.name->setFont(nf);
+    v->addWidget(b.name);
+    b.fx = new QToolButton(box);
+    b.fx->setObjectName(QStringLiteral("fxButton"));
+    b.fx->setToolTip(tr("This bus's effects (shown in the Inspector)"));
+    v->addWidget(b.fx, 0, Qt::AlignHCenter);
+    auto* mid = new QHBoxLayout;
+    b.fader = new QSlider(Qt::Vertical, box);
+    b.fader->setRange(kFaderMin, kFaderMax);
+    b.fader->setPageStep(30);
+    b.fader->setMinimumHeight(80);
+    b.fader->setToolTip(tr("Bus volume (double-click for 0 dB)"));
+    b.fader->installEventFilter(this);
+    mid->addWidget(b.fader, 0, Qt::AlignHCenter);
+    v->addLayout(mid, 1);
+    b.dbLabel = smallLabel(box);
+    v->addWidget(b.dbLabel);
+    b.mute = new QToolButton(box);
+    b.mute->setObjectName(QStringLiteral("muteButton"));
+    b.mute->setText(tr("M"));
+    b.mute->setCheckable(true);
+    v->addWidget(b.mute, 0, Qt::AlignHCenter);
+    b.surround = new SurroundPanner(box);
+    b.surround->setObjectName(QStringLiteral("surroundPanner"));
+    b.surround->hide();
+    v->insertWidget(2, b.surround, 0, Qt::AlignHCenter);
+    auto editBus = [this, bus](const QString& label, std::function<bool(Bus&)> fn, const QString& merge = {}) {
+        state_->edit(label, [bus, fn](Project&, Sequence& s) {
+            for (Bus& x : s.buses)
+                if (x.id == bus) return fn(x);
+            return false;
+        }, merge);
+    };
+    connect(b.fx, &QToolButton::clicked, this, [this, bus] { inspect(bus); });
+    connect(b.surround, &SurroundPanner::changed, this, [editBus, bus](const SurroundPan& pan, bool) {
+        editBus(tr("Bus Surround Pan"), [pan](Bus& x) {
+            if (x.surround == pan) return false;
+            x.surround = pan;
+            return true;
+        }, QStringLiteral("bus-surround-%1").arg(bus));
+    });
+    connect(b.fader, &QSlider::valueChanged, this, [editBus, bus](int value) {
+        const double db = value / 10.0;
+        editBus(tr("Bus Volume"), [db](Bus& x) {
+            if (x.volumeDb == db) return false;
+            x.volumeDb = db;
+            return true;
+        }, QStringLiteral("bus-volume-%1").arg(bus));
+    });
+    connect(b.mute, &QToolButton::toggled, this, [editBus](bool on) {
+        editBus(on ? tr("Mute Bus") : tr("Unmute Bus"), [on](Bus& x) {
+            if (x.muted == on) return false;
+            x.muted = on;
+            return true;
+        });
+    });
+    connect(box, &QWidget::customContextMenuRequested, this, [this, box, bus, editBus](const QPoint& pos) {
+        QMenu menu;
+        menu.addAction(tr("Rename..."), this, [this, bus, editBus] {
+            const Sequence* s = state_->sequence();
+            QString current;
+            for (const Bus& x : s->buses)
+                if (x.id == bus) current = QString::fromStdString(x.name);
+            bool ok = false;
+            const QString name = QInputDialog::getText(this, tr("Rename Bus"), tr("Name:"), QLineEdit::Normal, current, &ok);
+            if (ok && !name.trimmed().isEmpty())
+                editBus(tr("Rename Bus"), [name](Bus& x) {
+                    x.name = name.trimmed().toStdString();
+                    return true;
+                });
+        });
+        menu.addAction(tr("Delete Bus"), this, [this, bus] {
+            state_->edit(tr("Delete Bus"), [bus](Project&, Sequence& s) {
+                auto it = std::find_if(s.buses.begin(), s.buses.end(), [bus](const Bus& x) { return x.id == bus; });
+                if (it == s.buses.end()) return false;
+                s.buses.erase(it);
+                for (Track& t : s.audioTracks)
+                    if (t.output == bus) t.output = 0;  // back to the master
+                return true;
+            });
+        });
+        menu.exec(box->mapToGlobal(pos));
+    });
+    return b;
 }
 
 MixerPanel::Strip MixerPanel::makeStrip(int index) {
@@ -126,6 +285,25 @@ MixerPanel::Strip MixerPanel::makeStrip(int index) {
     s.name->setFont(nf);
     v->addWidget(s.name);
 
+    s.fx = new QToolButton(box);
+    s.fx->setObjectName(QStringLiteral("fxButton"));
+    s.fx->setToolTip(tr("This track's insert effects (shown in the Inspector)"));
+    v->addWidget(s.fx, 0, Qt::AlignHCenter);
+    s.output = new QComboBox(box);
+    s.output->setObjectName(QStringLiteral("outputCombo"));
+    s.output->setToolTip(tr("Where this track goes: the master or a bus"));
+    QFont of = s.output->font();
+    of.setPixelSize(10);
+    s.output->setFont(of);
+    v->addWidget(s.output);
+    s.automation = new QComboBox(box);
+    s.automation->setObjectName(QStringLiteral("automationMode"));
+    for (int m = 0; m <= 4; ++m) s.automation->addItem(tr(automationModeName(AutomationMode(m))));
+    s.automation->setToolTip(tr("Fader automation: Off ignores it; Read plays it; Write records the fader and pan from play to stop; "
+                                "Latch from the first move to stop; Touch while you hold them"));
+    s.automation->setFont(of);
+    v->addWidget(s.automation);
+
     s.pan = new QDial(box);
     s.pan->setRange(-100, 100);
     s.pan->setSingleStep(1);
@@ -140,6 +318,13 @@ MixerPanel::Strip MixerPanel::makeStrip(int index) {
     s.panLabel = smallLabel(box);
     s.panLabel->setStyleSheet(QStringLiteral("color: %1;").arg(theme::kTextDim.name()));
     v->addWidget(s.panLabel);
+    s.surround = new SurroundPanner(box);
+    s.surround->setObjectName(QStringLiteral("surroundPanner"));
+    s.surround->setObjectsAllowed(true);
+    s.surround->hide();
+    v->addWidget(s.surround, 0, Qt::AlignHCenter);
+    connect(s.surround, &SurroundPanner::changed, this, [this, index](const SurroundPan& pan, bool final) { setSurround(index, pan, final); });
+    connect(s.surround, &SurroundPanner::animateRequested, this, [this, index](bool on) { animateSurround(index, on); });
 
     auto* mid = new QHBoxLayout;
     mid->setContentsMargins(0, 0, 0, 0);
@@ -185,13 +370,80 @@ MixerPanel::Strip MixerPanel::makeStrip(int index) {
     connect(s.pan, &QDial::valueChanged, this, [this, index](int value) { setPan(index, value / 100.0); });
     connect(s.mute, &QToolButton::toggled, this, [this, index](bool on) { setMute(index, on); });
     connect(s.solo, &QToolButton::toggled, this, [this, index](bool on) { setSolo(index, on); });
+    connect(s.automation, &QComboBox::currentIndexChanged, this, [this, index](int m) { setAutomationMode(index, m); });
+    connect(s.fx, &QToolButton::clicked, this, [this, index] {
+        const Sequence* seq = state_->sequence();
+        if (seq && index < int(seq->audioTracks.size())) inspect(seq->audioTracks[size_t(index)].id);
+    });
+    connect(s.output, &QComboBox::activated, this, [this, index, combo = s.output](int i) {
+        const Id bus = combo->itemData(i).toULongLong();
+        state_->edit(tr("Track Output"), [index, bus](Project&, Sequence& sq) {
+            if (index >= int(sq.audioTracks.size()) || sq.audioTracks[size_t(index)].output == bus) return false;
+            sq.audioTracks[size_t(index)].output = bus;
+            return true;
+        });
+    });
     return s;
+}
+
+std::vector<std::string> MixerPanel::audioFolders() const {
+    std::vector<std::string> out;
+    if (const Sequence* seq = state_->sequence())
+        for (const Track& t : seq->audioTracks)
+            if (!t.folder.empty() && std::find(out.begin(), out.end(), t.folder) == out.end()) out.push_back(t.folder);
+    return out;
+}
+
+// A folder's fader: a VCA adding its level to every track in the folder, as Fairlight's and Pro Tools' VCAs do.
+MixerPanel::FolderStrip MixerPanel::makeFolderStrip(const std::string& folder) {
+    FolderStrip f;
+    f.folder = folder;
+    auto* box = new QFrame(stripHost_);
+    box->setObjectName(QStringLiteral("mixerFolderStrip"));
+    box->setFixedWidth(kStripWidth);
+    box->setStyleSheet(QStringLiteral("#mixerFolderStrip { border-top: 3px solid #d8a85a; }"));
+    f.box = box;
+    auto* v = new QVBoxLayout(box);
+    v->setContentsMargins(4, 4, 4, 4);
+    v->setSpacing(3);
+    f.name = smallLabel(box, 11);
+    QFont nf = f.name->font();
+    nf.setBold(true);
+    f.name->setFont(nf);
+    f.name->setText(f.name->fontMetrics().elidedText(QString::fromStdString(folder), Qt::ElideRight, kStripWidth - 12));
+    f.name->setToolTip(tr("Folder %1: its fader raises or lowers all of its tracks").arg(QString::fromStdString(folder)));
+    v->addWidget(f.name);
+    auto* tag = smallLabel(box);
+    tag->setText(tr("VCA"));
+    v->addWidget(tag);
+    f.fader = new QSlider(Qt::Vertical, box);
+    f.fader->setObjectName(QStringLiteral("folderFader"));
+    f.fader->setRange(kFaderMin, kFaderMax);
+    f.fader->setPageStep(30);
+    f.fader->setMinimumHeight(80);
+    f.fader->setToolTip(tr("Folder level, added to each of its tracks (double-click for 0 dB)"));
+    f.fader->installEventFilter(this);
+    v->addWidget(f.fader, 1, Qt::AlignHCenter);
+    f.dbLabel = smallLabel(box);
+    v->addWidget(f.dbLabel);
+    connect(f.fader, &QSlider::valueChanged, this, [this, folder](int value) {
+        const double db = value / 10.0;
+        state_->edit(tr("Folder Level"), [folder, db](Project&, Sequence& s) {
+            if (edit::folderGain(s, TrackKind::Audio, folder) == db) return false;
+            edit::setFolderGain(s, TrackKind::Audio, folder, db);
+            return true;
+        }, QStringLiteral("folder-volume-") + QString::fromStdString(folder));
+    });
+    return f;
 }
 
 void MixerPanel::syncToProject() {
     const Sequence* seq = state_->sequence();
     const size_t count = seq ? seq->audioTracks.size() : 0;
-    if (count != strips_.size())
+    const size_t buses = seq ? seq->buses.size() : 0;
+    std::vector<std::string> shown;
+    for (const FolderStrip& f : folderStrips_) shown.push_back(f.folder);
+    if (count != strips_.size() || buses != busStrips_.size() || shown != audioFolders())
         rebuild();
     else
         refresh();
@@ -204,6 +456,27 @@ void MixerPanel::rebuild() {
         s.box->deleteLater();  // may be called from one of the strip's own signals
     }
     strips_.clear();
+    for (BusStrip& b : busStrips_) {
+        stripLayout_->removeWidget(b.box);
+        b.box->hide();
+        b.box->deleteLater();
+    }
+    busStrips_.clear();
+    for (FolderStrip& f : folderStrips_) {
+        stripLayout_->removeWidget(f.box);
+        f.box->hide();
+        f.box->deleteLater();
+    }
+    folderStrips_.clear();
+    if (!addBus_) {
+        addBus_ = new QToolButton(stripHost_);
+        addBus_->setObjectName(QStringLiteral("addBus"));
+        addBus_->setText(tr("+ Bus"));
+        addBus_->setToolTip(tr("Add a bus: route tracks to it to process them together"));
+        connect(addBus_, &QToolButton::clicked, this, &MixerPanel::addBus);
+        stripLayout_->insertWidget(stripLayout_->count() - 1, addBus_);
+    }
+    stripLayout_->removeWidget(addBus_);
 
     const Sequence* seq = state_->sequence();
     const int count = seq ? int(seq->audioTracks.size()) : 0;
@@ -211,6 +484,16 @@ void MixerPanel::rebuild() {
         strips_.push_back(makeStrip(i));
         stripLayout_->insertWidget(stripLayout_->count() - 1, strips_.back().box);  // before the stretch
     }
+    for (const std::string& folder : audioFolders()) {
+        folderStrips_.push_back(makeFolderStrip(folder));
+        stripLayout_->insertWidget(stripLayout_->count() - 1, folderStrips_.back().box);
+    }
+    if (seq)
+        for (const Bus& b : seq->buses) {
+            busStrips_.push_back(makeBusStrip(b.id));
+            stripLayout_->insertWidget(stripLayout_->count() - 1, busStrips_.back().box);
+        }
+    stripLayout_->insertWidget(stripLayout_->count() - 1, addBus_, 0, Qt::AlignTop);
     emptyLabel_->setVisible(count == 0);
     refresh();
 }
@@ -219,22 +502,46 @@ void MixerPanel::refresh() {
     const Sequence* seq = state_->sequence();
     if (!seq)
         return;
+    for (FolderStrip& f : folderStrips_) {
+        const double db = edit::folderGain(*seq, TrackKind::Audio, f.folder);
+        if (!f.fader->isSliderDown()) {
+            const QSignalBlocker block(f.fader);
+            f.fader->setValue(int(std::lround(std::clamp(db, -60.0, 12.0) * 10.0)));
+        }
+        f.dbLabel->setText(dbText(db));
+    }
     for (size_t i = 0; i < strips_.size() && i < seq->audioTracks.size(); ++i) {
         const Track& t = seq->audioTracks[i];
         Strip& s = strips_[i];
         const QString name = t.name.empty() ? tr("A%1").arg(i + 1) : QString::fromStdString(t.name);
         s.name->setText(s.name->fontMetrics().elidedText(name, Qt::ElideRight, kStripWidth - 12));
         s.name->setToolTip(name);
-        {
+        // The automation at the playhead on tracks that read it; a fader being held stays where the hand is.
+        const double db = trackVolumeAt(t, double(state_->playhead())), pan = trackPanAt(t, double(state_->playhead()));
+        if (!s.fader->isSliderDown()) {
             const QSignalBlocker block(s.fader);
-            s.fader->setValue(int(std::lround(std::clamp(t.volumeDb, -60.0, 12.0) * 10.0)));
+            s.fader->setValue(int(std::lround(std::clamp(db, -60.0, 12.0) * 10.0)));
+            s.dbLabel->setText(dbText(db));
         }
-        s.dbLabel->setText(dbText(t.volumeDb));
-        {
+        if (!s.pan->isSliderDown()) {
             const QSignalBlocker block(s.pan);
-            s.pan->setValue(int(std::lround(std::clamp(t.pan, -1.0, 1.0) * 100.0)));
+            s.pan->setValue(int(std::lround(std::clamp(pan, -1.0, 1.0) * 100.0)));
         }
         s.panLabel->setText(panText(s.pan->value()));
+        {
+            const QSignalBlocker block(s.automation);
+            s.automation->setCurrentIndex(int(trackAutomation(t)));
+        }
+        s.automation->setEnabled(recording_.empty());
+        // In surround, a track going straight to the master is placed among the speakers;
+        // one going to a bus is panned in stereo into it.
+        const bool surround = layoutChannels(seq->audioLayout) > 2 && !t.output;
+        s.pan->setVisible(!surround);
+        s.panLabel->setVisible(!surround);
+        s.surround->setVisible(surround);
+        s.surround->setSpeakerLayout(seq->audioLayout);
+        if (!s.surround->isDragging()) s.surround->setPan(trackSurroundAt(t, double(state_->playhead())));
+        s.surround->setAnimated(surroundAnimated(t));
         {
             const QSignalBlocker block(s.mute);
             s.mute->setChecked(t.muted);
@@ -243,21 +550,72 @@ void MixerPanel::refresh() {
             const QSignalBlocker block(s.solo);
             s.solo->setChecked(t.solo);
         }
+        s.fx->setText(t.effects.empty() ? tr("FX") : tr("FX %1").arg(t.effects.size()));
+        {
+            const QSignalBlocker block(s.output);
+            s.output->clear();
+            s.output->addItem(tr("Master"), QVariant::fromValue<qulonglong>(0));
+            for (const Bus& b : seq->buses) {
+                s.output->addItem(QString::fromStdString(b.name), QVariant::fromValue<qulonglong>(b.id));
+                if (b.id == t.output) s.output->setCurrentIndex(s.output->count() - 1);
+            }
+        }
     }
+    for (size_t i = 0; i < busStrips_.size() && i < seq->buses.size(); ++i) {
+        const Bus& b = seq->buses[i];
+        BusStrip& st = busStrips_[i];
+        const QString name = QString::fromStdString(b.name);
+        st.name->setText(st.name->fontMetrics().elidedText(name, Qt::ElideRight, kStripWidth - 12));
+        st.name->setToolTip(tr("%1 (bus; right-click to rename or delete)").arg(name));
+        st.fx->setText(b.effects.empty() ? tr("FX") : tr("FX %1").arg(b.effects.size()));
+        {
+            const QSignalBlocker block(st.fader);
+            st.fader->setValue(int(std::lround(std::clamp(b.volumeDb, -60.0, 12.0) * 10.0)));
+        }
+        st.dbLabel->setText(dbText(b.volumeDb));
+        {
+            const QSignalBlocker block(st.mute);
+            st.mute->setChecked(b.muted);
+        }
+        st.surround->setVisible(layoutChannels(seq->audioLayout) > 2);
+        st.surround->setSpeakerLayout(seq->audioLayout);
+        st.surround->setPan(b.surround);
+    }
+    masterFx_->setText(seq->masterEffects.empty() ? tr("FX") : tr("FX %1").arg(seq->masterEffects.size()));
+    {
+        const QSignalBlocker block(masterFader_);
+        masterFader_->setValue(int(std::lround(std::clamp(seq->masterVolumeDb, -60.0, 12.0) * 10.0)));
+    }
+    masterDb_->setText(dbText(seq->masterVolumeDb));
 }
 
 void MixerPanel::setVolume(int index, double db) {
     if (index < int(strips_.size()))
         strips_[index].dbLabel->setText(dbText(db));
+    // While automation is written the recorder samples the faders; nothing else is edited meanwhile.
+    if (!recording_.empty()) {
+        if (std::none_of(recording_.begin(), recording_.end(), [&](const Recording& r) { return r.track == index; })) refresh();
+        return;
+    }
+    // On a track playing its volume lane, the fader sets the lane at the playhead.
+    const FrameTime at = state_->playhead();
     const bool ok = state_->edit(
         tr("Track Volume"),
-        [index, db](Project&, Sequence& s) {
-            if (index >= int(s.audioTracks.size()) || s.audioTracks[index].volumeDb == db)
+        [index, db, at](Project&, Sequence& s) {
+            if (index >= int(s.audioTracks.size()))
                 return false;
-            s.audioTracks[index].volumeDb = db;
+            Track& t = s.audioTracks[size_t(index)];
+            if (t.volumeAuto.animated() && readsLanes(t)) {
+                if (t.volumeAuto.at(at) == db && t.volumeAuto.keyAt(at)) return false;
+                t.volumeAuto.set(at, db);
+                return true;
+            }
+            if (t.volumeDb == db)
+                return false;
+            t.volumeDb = db;
             return true;
         },
-        QStringLiteral("track-volume-%1").arg(index));
+        mergeKey_.isEmpty() ? QStringLiteral("track-volume-%1").arg(index) : mergeKey_);
     if (!ok)
         refresh();
 }
@@ -265,17 +623,270 @@ void MixerPanel::setVolume(int index, double db) {
 void MixerPanel::setPan(int index, double pan) {
     if (index < int(strips_.size()))
         strips_[index].panLabel->setText(panText(int(std::lround(pan * 100.0))));
+    if (!recording_.empty()) {
+        if (std::none_of(recording_.begin(), recording_.end(), [&](const Recording& r) { return r.track == index; })) refresh();
+        return;
+    }
+    const FrameTime at = state_->playhead();
     const bool ok = state_->edit(
         tr("Track Pan"),
-        [index, pan](Project&, Sequence& s) {
-            if (index >= int(s.audioTracks.size()) || s.audioTracks[index].pan == pan)
+        [index, pan, at](Project&, Sequence& s) {
+            if (index >= int(s.audioTracks.size()))
                 return false;
-            s.audioTracks[index].pan = pan;
+            Track& t = s.audioTracks[size_t(index)];
+            if (t.panAuto.animated() && readsLanes(t)) {
+                if (t.panAuto.at(at) == pan && t.panAuto.keyAt(at)) return false;
+                t.panAuto.set(at, pan);
+                return true;
+            }
+            if (t.pan == pan)
+                return false;
+            t.pan = pan;
             return true;
         },
-        QStringLiteral("track-pan-%1").arg(index));
+        mergeKey_.isEmpty() ? QStringLiteral("track-pan-%1").arg(index) : mergeKey_);
     if (!ok)
         refresh();
+}
+
+void MixerPanel::setAutomationMode(int index, int mode) {
+    state_->edit(tr("Automation Mode"), [index, mode](Project&, Sequence& s) {
+        if (index >= int(s.audioTracks.size()) || s.audioTracks[size_t(index)].automation == mode) return false;
+        s.audioTracks[size_t(index)].automation = mode;
+        return true;
+    });
+}
+
+void MixerPanel::followAutomation() {
+    if (!recording_.empty()) return;
+    const Sequence* seq = state_->sequence();
+    if (!seq) return;
+    const double at = double(state_->playhead());
+    for (size_t i = 0; i < strips_.size() && i < seq->audioTracks.size(); ++i) {
+        const Track& t = seq->audioTracks[i];
+        if (!readsLanes(t)) continue;
+        Strip& s = strips_[i];
+        if (surroundAnimated(t) && !s.surround->isDragging()) s.surround->setPan(trackSurroundAt(t, at));
+        if (!t.volumeAuto.animated() && !t.panAuto.animated()) continue;
+        if (!s.fader->isSliderDown()) {
+            const double db = trackVolumeAt(t, at);
+            const QSignalBlocker block(s.fader);
+            s.fader->setValue(int(std::lround(std::clamp(db, -60.0, 12.0) * 10.0)));
+            s.dbLabel->setText(dbText(db));
+        }
+        if (!s.pan->isSliderDown()) {
+            const QSignalBlocker block(s.pan);
+            s.pan->setValue(int(std::lround(std::clamp(trackPanAt(t, at), -1.0, 1.0) * 100.0)));
+            s.panLabel->setText(panText(s.pan->value()));
+        }
+    }
+}
+
+void MixerPanel::playbackStarted(FrameTime t) {
+    const Sequence* seq = state_->sequence();
+    if (!recording_.empty() || !seq || state_->inGesture()) return;
+    for (size_t i = 0; i < seq->audioTracks.size() && i < strips_.size(); ++i) {
+        const Track& tr = seq->audioTracks[i];
+        const AutomationMode m = trackAutomation(tr);
+        if (m != AutomationMode::Write && m != AutomationMode::Latch && m != AutomationMode::Touch) continue;
+        const FrameTime glide = FrameTime(std::lround(seq->fpsValue()));  // a second back to what was there
+        const bool surround = layoutChannels(seq->audioLayout) > 2 && !tr.output;
+        recording_.push_back({int(i), m, AutomationRecorder(m, tr.volumeAuto, tr.volumeDb, t, glide),
+                              AutomationRecorder(m, tr.panAuto, tr.pan, t, glide), tr.volumeDb, tr.pan, tr.volumeAuto, tr.panAuto, surround,
+                              AutomationRecorder(m, tr.surroundXAuto, tr.surround.x, t, glide),
+                              AutomationRecorder(m, tr.surroundYAuto, tr.surround.y, t, glide),
+                              AutomationRecorder(m, tr.surroundZAuto, tr.surround.z, t, glide), tr.surround, tr.surroundXAuto,
+                              tr.surroundYAuto, tr.surroundZAuto});
+    }
+    if (recording_.empty()) return;
+    state_->beginGesture(tr("Write Automation"));
+    liveState_.clear();
+    for (Strip& s : strips_) s.automation->setEnabled(false);
+    playbackPosition(t);
+}
+
+void MixerPanel::playbackPosition(FrameTime t) {
+    if (recording_.empty()) {
+        followAutomation();
+        return;
+    }
+    struct Live {
+        int track;
+        bool volume, pan;
+        double db, panValue;
+        bool x = false, y = false, z = false, surround = false;
+        SurroundPan position;
+    };
+    std::vector<Live> live;
+    QString key;
+    for (Recording& r : recording_) {
+        Strip& st = strips_[size_t(r.track)];
+        const double db = st.fader->value() / 10.0, pan = st.pan->value() / 100.0;
+        const double showDb = r.volume.tick(t, db, st.fader->isSliderDown());
+        const double showPan = r.pan.tick(t, pan, st.pan->isSliderDown());
+        // Not writing: the fader shows (and the mix plays) the automation that was there.
+        if (!r.volume.writing() && !st.fader->isSliderDown()) {
+            const QSignalBlocker block(st.fader);
+            st.fader->setValue(int(std::lround(std::clamp(showDb, -60.0, 12.0) * 10.0)));
+            st.dbLabel->setText(dbText(showDb));
+        }
+        if (!r.pan.writing() && !st.pan->isSliderDown()) {
+            const QSignalBlocker block(st.pan);
+            st.pan->setValue(int(std::lround(std::clamp(showPan, -1.0, 1.0) * 100.0)));
+            st.panLabel->setText(panText(st.pan->value()));
+        }
+        Live lv{r.track, r.volume.writing(), r.pan.writing(), db, pan};
+        if (r.surround) {
+            // The panner: written while dragged (or all along in Write), showing what was there otherwise.
+            const SurroundPan now = st.surround->pan();
+            const bool held = st.surround->isDragging();
+            SurroundPan shown = now;
+            shown.x = r.x.tick(t, now.x, held);
+            shown.y = r.y.tick(t, now.y, held);
+            shown.z = r.z.tick(t, now.z, held);
+            lv.x = r.x.writing(), lv.y = r.y.writing(), lv.z = r.z.writing();
+            lv.surround = true;
+            lv.position = now;
+            lv.position.width = r.position.width, lv.position.lfeDb = r.position.lfeDb, lv.position.object = r.position.object;
+            if (!held && !(lv.x && lv.y && lv.z)) st.surround->setPan(shown);
+            key += QStringLiteral("s%1%2%3,%4,%5,%6;").arg(int(lv.x)).arg(int(lv.y)).arg(int(lv.z)).arg(now.x).arg(now.y).arg(now.z);
+        }
+        live.push_back(lv);
+        key += QStringLiteral("%1:%2%3%4,%5;").arg(r.track).arg(int(r.volume.writing())).arg(int(r.pan.writing())).arg(db).arg(pan);
+    }
+    if (key == liveState_) return;
+    liveState_ = key;
+    // What plays meanwhile: the fader on a lane being written, the lanes as they were otherwise.
+    state_->updateGesture([live](Project&, Sequence& s) {
+        for (const Live& l : live) {
+            if (l.track >= int(s.audioTracks.size())) continue;
+            Track& tr = s.audioTracks[size_t(l.track)];
+            if (l.volume) tr.volumeAuto = Param(), tr.volumeDb = l.db;
+            if (l.pan) tr.panAuto = Param(), tr.pan = l.panValue;
+            if (l.x) tr.surroundXAuto = Param(), tr.surround.x = l.position.x;
+            if (l.y) tr.surroundYAuto = Param(), tr.surround.y = l.position.y;
+            if (l.z) tr.surroundZAuto = Param(), tr.surround.z = l.position.z;
+            if (l.surround) tr.surround.width = l.position.width, tr.surround.lfeDb = l.position.lfeDb, tr.surround.object = l.position.object;
+        }
+    });
+}
+
+void MixerPanel::playbackStopped(FrameTime t) {
+    if (recording_.empty()) return;
+    struct Done {
+        int track;
+        Param volume, pan;
+        double db, panValue;
+        bool fromWrite;
+        Param x, y, z;
+        SurroundPan position;
+    };
+    std::vector<Done> done;
+    bool wrote = false;
+    for (Recording& r : recording_) {
+        const bool v = r.volume.wrote(), p = r.pan.wrote();
+        const bool px = r.surround && r.x.wrote(), py = r.surround && r.y.wrote(), pz = r.surround && r.z.wrote();
+        wrote = wrote || v || p || px || py || pz || r.changedOther;
+        done.push_back({r.track, v ? r.volume.finish(t, 0.1) : r.volumeLane, p ? r.pan.finish(t, 0.005) : r.panLane, r.volumeDb, r.panValue,
+                        r.mode == AutomationMode::Write, px ? r.x.finish(t, 0.005) : r.xLane, py ? r.y.finish(t, 0.005) : r.yLane,
+                        pz ? r.z.finish(t, 0.005) : r.zLane, r.position});
+    }
+    recording_.clear();
+    liveState_.clear();
+    if (!wrote) {
+        state_->endGesture(false);
+        refresh();
+        return;
+    }
+    // Write hands over to Touch, so the next pass does not write over this one unless a fader is moved.
+    state_->updateGesture([done](Project&, Sequence& s) {
+        for (const Done& d : done) {
+            if (d.track >= int(s.audioTracks.size())) continue;
+            Track& tr = s.audioTracks[size_t(d.track)];
+            tr.volumeAuto = d.volume;
+            tr.panAuto = d.pan;
+            tr.volumeDb = d.db;
+            tr.pan = d.panValue;
+            tr.surroundXAuto = d.x;
+            tr.surroundYAuto = d.y;
+            tr.surroundZAuto = d.z;
+            tr.surround.x = d.position.x, tr.surround.y = d.position.y, tr.surround.z = d.position.z;
+            tr.surround.width = d.position.width, tr.surround.lfeDb = d.position.lfeDb, tr.surround.object = d.position.object;
+            if (d.fromWrite) tr.automation = int(AutomationMode::Touch);
+        }
+    });
+    state_->endGesture(true);
+    refresh();
+}
+
+void MixerPanel::setSurround(int index, const SurroundPan& pan, bool) {
+    // While automation is written the recorder samples the panner's position; its width, LFE and object flag are
+    // kept for the end of the pass. Nothing else is edited meanwhile (an edit would end the pass).
+    if (!recording_.empty()) {
+        bool recorded = false;
+        for (Recording& r : recording_)
+            if (r.track == index && r.surround) {
+                recorded = true;
+                if (r.position.width != pan.width || r.position.lfeDb != pan.lfeDb || r.position.object != pan.object) {
+                    r.position.width = pan.width, r.position.lfeDb = pan.lfeDb, r.position.object = pan.object;
+                    r.changedOther = true;
+                    liveState_.clear();
+                }
+            }
+        if (!recorded) refresh();
+        return;
+    }
+    // A moving position is keyed at the playhead; its width, LFE and object flag stay the track's own.
+    const FrameTime at = state_->playhead();
+    state_->edit(
+        tr("Track Surround Pan"),
+        [index, pan, at](Project&, Sequence& s) {
+            if (index >= int(s.audioTracks.size())) return false;
+            Track& t = s.audioTracks[size_t(index)];
+            if (surroundAnimated(t) && readsLanes(t)) {
+                const SurroundPan was = t.surround;
+                t.surround.width = pan.width, t.surround.lfeDb = pan.lfeDb, t.surround.object = pan.object;
+                bool changed = !(t.surround == was);
+                for (auto [lane, v] : {std::pair<Param*, double>{&t.surroundXAuto, pan.x}, {&t.surroundYAuto, pan.y}, {&t.surroundZAuto, pan.z}})
+                    if (lane->keys.empty() || lane->at(at) != v || !lane->keyAt(at)) {
+                        if (lane->keys.empty()) lane->addKey(at, v);  // (set() on an empty lane changes only its still value)
+                        else lane->set(at, v);
+                        changed = true;
+                    }
+                return changed;
+            }
+            if (t.surround == pan) return false;
+            t.surround = pan;
+            return true;
+        },
+        QStringLiteral("track-surround-%1").arg(index));
+}
+
+void MixerPanel::animateSurround(int index, bool on) {
+    if (!recording_.empty()) {  // not while a pass is written: the edit would end it
+        refresh();
+        return;
+    }
+    const FrameTime at = state_->playhead();
+    state_->edit(on ? tr("Animate Surround Position") : tr("Stop Surround Animation"), [index, on, at](Project&, Sequence& s) {
+        if (index >= int(s.audioTracks.size())) return false;
+        Track& t = s.audioTracks[size_t(index)];
+        const SurroundPan here = trackSurroundAt(t, double(at));
+        if (on) {
+            if (surroundAnimated(t)) return false;
+            t.surroundXAuto.addKey(at, here.x);
+            t.surroundYAuto.addKey(at, here.y);
+            t.surroundZAuto.addKey(at, here.z);
+            if (!readsLanes(t)) t.automation = int(AutomationMode::Read);
+            return true;
+        }
+        if (!surroundAnimated(t)) return false;
+        // It stays where it is at the playhead.
+        t.surround.x = here.x, t.surround.y = here.y, t.surround.z = here.z;
+        t.surroundXAuto = Param(), t.surroundYAuto = Param(), t.surroundZAuto = Param();
+        return true;
+    });
+    refresh();
 }
 
 void MixerPanel::setMute(int index, bool on) {

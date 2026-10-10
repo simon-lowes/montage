@@ -1,7 +1,11 @@
-// Montage — loudness measurement (ITU-R BS.1770-4 / EBU R128).
+// Montage — loudness measurement (ITU-R BS.1770-4 / EBU R128), and the
+// limiter loudness-normalised exports use to stay under a peak ceiling.
 #pragma once
 
 #include <cstdint>
+#include <deque>
+#include <memory>
+#include <vector>
 
 #include "Decoder.h"
 
@@ -9,12 +13,68 @@ namespace montage {
 
 struct LoudnessResult {
     double integrated = -70.0;  // LUFS (gated)
-    double truePeakDb = -96.0;  // sample peak, dBFS
+    double truePeakDb = -96.0;  // true peak (4× oversampled), dBTP
     bool valid = false;         // false if everything was below the absolute gate
 };
 
 // Measures interleaved-stereo samples [first, first + count) of `buf`
 // (count < 0 = to the end).
 LoudnessResult measureLoudness(const AudioBuffer& buf, int64_t first = 0, int64_t count = -1);
+// The same for interleaved audio of any channel count, with BS.1770 weights.
+LoudnessResult measureLoudness(const float* data, int64_t frames, int channels, const double* weights, int sampleRate);
+
+// The same measurement fed in pieces, for sound too long to hold at once.
+class LoudnessMeter {
+public:
+    explicit LoudnessMeter(int sampleRate);
+    ~LoudnessMeter();
+    void add(const float* stereo, int64_t frames);
+    // Interleaved audio of `channels` (up to 8), each weighted as BS.1770 says
+    // (1 front, 1.41 surround, 0 for the LFE).
+    void addChannels(const float* data, int64_t frames, int channels, const double* weights);
+    LoudnessResult result() const;
+    // Live readings (EBU R128): the last 400 ms and the last 3 s, in LUFS
+    // (-70 or below for silence or before any sound), and their highest so far.
+    double momentary() const;
+    double shortTerm() const;
+    double maxMomentary() const;
+    double maxShortTerm() const;
+    // Loudness range (EBU Tech 3342), in LU: the spread of the short-term
+    // loudness, 10th to 95th percentile after gating; 0 until there is enough.
+    double loudnessRange() const;
+    // Seconds measured so far.
+    double seconds() const;
+    void reset();
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> d_;
+};
+
+// A look-ahead peak limiter: no sample leaves louder than the ceiling. The
+// gain ramps down over the look-ahead before a peak and recovers smoothly
+// after it. Output is delayed by latency() frames.
+class PeakLimiter {
+public:
+    // `channels` interleaved (all limited by one gain, so the image holds).
+    PeakLimiter(int sampleRate, double ceilingDb, double lookaheadMs = 5, double releaseMs = 80, int channels = 2);
+    // Limits `frames` frames from `in` into `out` (which may be `in`).
+    void process(const float* in, float* out, int frames);
+    int latency() const { return lookahead_; }
+
+private:
+    float ceiling_;
+    int channels_;
+    int lookahead_;
+    double release_;
+    double gain_ = 1;
+    std::vector<float> delay_;        // the last `lookahead_` frames
+    size_t delayPos_ = 0;
+    std::deque<std::pair<int64_t, float>> minQueue_;  // sliding minimum of the gains peaks need
+    std::vector<float> box_;          // the last `lookahead_` minima, averaged
+    size_t boxPos_ = 0;
+    double boxSum_ = 0;
+    int64_t n_ = 0;
+};
 
 }  // namespace montage

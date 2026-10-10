@@ -3,10 +3,48 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <iterator>
 #include <utility>
 
+#include "core/Interpretation.h"
+
 namespace montage {
+
+namespace {
+constexpr char kChannelMark = '\x1f';  // never in a file name
+}  // namespace
+
+std::string audioKey(const std::string& path, const std::vector<int>& channels) {
+    if (channels.empty()) return path;
+    std::string key = path + kChannelMark;
+    for (size_t i = 0; i < channels.size(); ++i) key += (i ? "," : "") + std::to_string(channels[i]);
+    return key;
+}
+
+std::string ambisonicAudioKey(const std::string& path) { return path + kChannelMark + "ambix"; }
+
+bool isAmbisonicAudioKey(const std::string& key) {
+    const size_t mark = key.find(kChannelMark);
+    return mark != std::string::npos && key.compare(mark + 1, std::string::npos, "ambix") == 0;
+}
+
+std::string audioKeyFile(const std::string& key, std::vector<int>* channels) {
+    const size_t mark = key.find(kChannelMark);
+    if (channels) {
+        channels->clear();
+        if (mark != std::string::npos && !isAmbisonicAudioKey(key)) {
+            size_t from = mark + 1;
+            while (from < key.size()) {
+                size_t comma = key.find(',', from);
+                if (comma == std::string::npos) comma = key.size();
+                channels->push_back(std::atoi(key.substr(from, comma - from).c_str()));
+                from = comma + 1;
+            }
+        }
+    }
+    return mark == std::string::npos ? key : key.substr(0, mark);
+}
 
 MediaPool& MediaPool::instance() {
     static MediaPool pool;
@@ -73,11 +111,34 @@ void MediaPool::release(VideoDecoder* d) {
     std::lock_guard lock(m_);
     auto it = decoders_.find(d->path());
     if (it == decoders_.end()) return;
+    if (openFiles_ && !openFiles_->count(it->first)) {
+        // Not one of the open project's files: closed rather than kept.
+        std::erase_if(it->second, [d](const Slot& s) { return s.dec.get() == d; });
+        if (it->second.empty()) decoders_.erase(it);
+        return;
+    }
     for (auto& s : it->second)
         if (s.dec.get() == d) {
             s.busy = false;
             s.lastUsed = ++useClock_;
         }
+}
+
+size_t MediaPool::openDecoders() const {
+    std::lock_guard lock(m_);
+    size_t n = 0;
+    for (const auto& [path, slots] : decoders_) n += slots.size();
+    return n;
+}
+
+void MediaPool::setOpenFiles(std::optional<std::set<std::string>> paths) {
+    std::lock_guard lock(m_);
+    openFiles_ = std::move(paths);
+    if (!openFiles_) return;
+    for (auto it = decoders_.begin(); it != decoders_.end();) {
+        if (!openFiles_->count(it->first)) std::erase_if(it->second, [](const Slot& s) { return !s.busy; });
+        it = it->second.empty() ? decoders_.erase(it) : std::next(it);
+    }
 }
 
 Frame16Ptr MediaPool::videoFrame(const std::string& path, double t, int w, int h, bool highQuality) {
@@ -143,7 +204,9 @@ AudioBufferPtr MediaPool::audio(const std::string& path, int sampleRate) {
         auto it = audio_.find({path, sampleRate});
         if (it != audio_.end()) return it->second;
     }
-    AudioBufferPtr buf = decodeAudio(path, sampleRate);
+    std::vector<int> channels;
+    const std::string file = audioKeyFile(path, &channels);
+    AudioBufferPtr buf = isAmbisonicAudioKey(path) ? decodeAmbisonic(file, sampleRate) : decodeAudio(file, sampleRate, nullptr, nullptr, channels);
     if (!buf) buf = std::make_shared<AudioBuffer>();  // remember failures as silence
     PeaksPtr pk = computePeaks(*buf);
     std::function<void(const std::string&)> cb;
@@ -194,6 +257,36 @@ void MediaPool::clear() {
     std::lock_guard lock(audioM_);
     audio_.clear();
     peaks_.clear();
+}
+
+void MediaPool::forget(const std::string& path) {
+    // The file however it is read (each eye of a stereo file, every interpretation of it).
+    const std::string file = uninterpretedPath(path);
+    auto same = [&](const std::string& key) { return key == path || uninterpretedPath(key) == file; };
+    {
+        std::lock_guard lock(m_);
+        for (auto it = lru_.begin(); it != lru_.end();) {
+            if (same(it->first.path)) {
+                cacheBytes_ -= it->second->bytes();
+                index_.erase(it->first);
+                it = lru_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (auto d = decoders_.begin(); d != decoders_.end();) {
+            if (!same(d->first)) {
+                ++d;
+                continue;
+            }
+            auto& slots = d->second;
+            slots.erase(std::remove_if(slots.begin(), slots.end(), [](const Slot& s) { return !s.busy; }), slots.end());
+            d = slots.empty() ? decoders_.erase(d) : std::next(d);
+        }
+    }
+    std::lock_guard lock(audioM_);
+    for (auto it = audio_.begin(); it != audio_.end();) it = same(audioKeyFile(it->first.first)) ? audio_.erase(it) : std::next(it);
+    for (auto it = peaks_.begin(); it != peaks_.end();) it = same(audioKeyFile(it->first)) ? peaks_.erase(it) : std::next(it);
 }
 
 void MediaPool::setReadyCallback(std::function<void(const std::string&)> cb) {

@@ -5,11 +5,28 @@ file(GLOB MONTAGE_UI_SOURCES CONFIGURE_DEPENDS
 list(FILTER MONTAGE_UI_SOURCES EXCLUDE REGEX ".*/main\\.cpp$")
 
 add_library(montage_ui STATIC ${MONTAGE_UI_SOURCES})
-target_link_libraries(montage_ui PUBLIC montage_engine Qt6::Widgets Qt6::Multimedia Qt6::Concurrent)
+target_link_libraries(montage_ui PUBLIC montage_engine Qt6::Widgets Qt6::Multimedia Qt6::Concurrent Qt6::Network)
 target_include_directories(montage_ui PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR})
 set_target_properties(montage_ui PROPERTIES AUTOMOC ON)
 target_compile_options(montage_ui PRIVATE
   $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wno-unused-parameter>)
+# The HDR viewer (HdrSurface.h): Qt's RHI and its HDR swap chain information, from Qt 6.7 (a private module, which
+# Qt 6.9 and later only load when asked for by name). Older Qt builds show HDR tone mapped to SDR, as before.
+if(Qt6_VERSION VERSION_GREATER_EQUAL 6.7)
+  if(NOT TARGET Qt6::GuiPrivate)
+    set(QT_NO_PRIVATE_MODULE_WARNING ON)
+    find_package(Qt6 QUIET COMPONENTS GuiPrivate)
+  endif()
+  if(TARGET Qt6::GuiPrivate)
+    target_link_libraries(montage_ui PRIVATE Qt6::GuiPrivate)
+    target_compile_definitions(montage_ui PUBLIC MONTAGE_HDR_VIEWER)
+    message(STATUS "HDR viewer: on (Qt ${Qt6_VERSION})")
+  else()
+    message(STATUS "HDR viewer: off (Qt's private GUI module was not found)")
+  endif()
+else()
+  message(STATUS "HDR viewer: off (Qt ${Qt6_VERSION}; it needs 6.7 or later)")
+endif()
 
 set(MONTAGE_PACKAGING_DIR ${PROJECT_SOURCE_DIR}/packaging)
 set(MONTAGE_APP_SOURCES main.cpp ${MONTAGE_PACKAGING_DIR}/montage.qrc)
@@ -24,6 +41,7 @@ endif()
 
 add_executable(montage ${MONTAGE_APP_SOURCES})
 target_link_libraries(montage PRIVATE montage_ui)
+montage_copy_runtime(montage)
 set_target_properties(montage PROPERTIES
   AUTOMOC ON
   AUTORCC ON

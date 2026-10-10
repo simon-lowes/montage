@@ -1,5 +1,11 @@
 #include "PlaybackController.h"
 
+#include <atomic>
+
+#include "core/Adr.h"
+#include "media/Loudness.h"
+#include "render/RenderCache.h"
+
 #include <QAudioDevice>
 #include <QAudioFormat>
 #include <QAudioSink>
@@ -13,7 +19,9 @@
 #include <iterator>
 #include <map>
 
+#include "render/ColorSpace.h"
 #include "render/Compositor.h"
+#include "render/HdrView.h"
 
 namespace montage {
 
@@ -32,6 +40,10 @@ public:
         double scale = 1;
         bool proxies = false;
         int direction = 0;  // playback step (+1, -2 ...), 0 when paused
+        bool captions = false;
+        double cacheScale = 0;  // the scale rendered previews are kept at (playback's), 0 = scale
+        StereoView stereoView = StereoView::Left;  // how a stereo 3D sequence's eyes are shown
+        bool hdr = false;  // HDR sequences also as light for the HDR viewer
     };
     void request(const Request& r) {
         {
@@ -44,24 +56,110 @@ public:
 
 signals:
     void rendered(const QImage& image, montage::FrameTime t);
+    void scopeRendered(const QImage& image, montage::FrameTime t, const QString& space, double peakNits);
+    void hdrRendered(montage::HdrPicturePtr picture, montage::FrameTime t);
 
 private:
+    // A frame for the viewer (Rec.709) and, for sequences in another space, a small copy as delivered (16-bit code
+    // values in the sequence's space) so the scopes measure what is exported, not its SDR preview.
+    struct Rendered {
+        QImage view, signal;
+        HdrPicturePtr hdr;  // for the HDR viewer (HDR sequences, when it is on)
+    };
+    static constexpr int kSignalWidth = 480, kSignalHeight = 320;
+
+    static QImage signalImage(const Image& img) {
+        int w = img.width, h = img.height;
+        if (w > kSignalWidth || h > kSignalHeight) {
+            const double k = std::min(double(kSignalWidth) / w, double(kSignalHeight) / h);
+            w = std::max(1, int(w * k)), h = std::max(1, int(h * k));
+        }
+        QImage out(w, h, QImage::Format_RGBA64);
+        for (int y = 0; y < h; ++y) {
+            const float* row = img.row(std::min(img.height - 1, int((y + 0.5) * img.height / h)));
+            auto* o = reinterpret_cast<quint16*>(out.scanLine(y));
+            for (int x = 0; x < w; ++x) {
+                const float* px = row + 4 * size_t(std::min(img.width - 1, int((x + 0.5) * img.width / w)));
+                for (int c = 0; c < 4; ++c) o[4 * x + c] = quint16(std::lround(std::clamp(px[c], 0.0f, 1.0f) * 65535));
+            }
+        }
+        return out;
+    }
+
+    static bool ownSpace(const Sequence& s) { return sequenceColorSpace(s).id != "rec709"; }
+
+    // The frame as delivered alone (a preview from the render cache has only its SDR picture).
+    QImage renderSignal(const Request& r, FrameTime t) {
+        const Sequence* s = r.project->findSequence(r.sequence);
+        if (!s || !ownSpace(*s)) return {};
+        RenderOptions o;
+        o.scale = r.scale;
+        o.useProxies = r.proxies;
+        o.captions = r.captions;
+        o.stereoView = r.stereoView;
+        return signalImage(renderProgramFrame(*r.project, *s, t, o));
+    }
+
+    void emitFrame(Rendered& img, const Request& r, FrameTime t) {
+        emit rendered(img.view, t);
+        if (r.hdr) emit hdrRendered(img.hdr, t);  // (none for SDR sequences: the viewer shows the SDR picture)
+        const Sequence* s = r.project->findSequence(r.sequence);
+        if (!s) return;
+        if (!ownSpace(*s)) {
+            emit scopeRendered(img.view, t, QStringLiteral("rec709"), s->hdrPeakNits);
+            return;
+        }
+        if (img.signal.isNull() && r.direction == 0) img.signal = renderSignal(r, t);  // paused: worth the render
+        if (!img.signal.isNull()) emit scopeRendered(img.signal, t, QString::fromStdString(sequenceColorSpace(*s).id), s->hdrPeakNits);
+    }
+
     static constexpr int kAhead = 24;
     static constexpr size_t kMaxCached = 48;
 
     bool sameContext(const Request& r) const {
-        return r.project == ctx_.project && r.sequence == ctx_.sequence && r.scale == ctx_.scale && r.proxies == ctx_.proxies;
+        return r.project == ctx_.project && r.sequence == ctx_.sequence && r.scale == ctx_.scale && r.proxies == ctx_.proxies &&
+               r.captions == ctx_.captions && r.stereoView == ctx_.stereoView && r.hdr == ctx_.hdr;
     }
 
-    QImage render(const Request& r, FrameTime t) {
+    Rendered render(const Request& r, FrameTime t) {
         const Sequence* s = r.project->findSequence(r.sequence);
         if (!s) return {};
         RenderOptions o;
         o.scale = r.scale;
         o.useProxies = r.proxies;
-        Image img = renderProgramFrame(*r.project, *s, t, o);
-        std::vector<uint8_t> rgba = toRgba8(img);
-        return QImage(rgba.data(), img.width, img.height, img.width * 4, QImage::Format_RGBA8888).copy();
+        o.captions = r.captions;
+        o.stereoView = r.stereoView;
+        o.displaySpace = "rec709";  // HDR and wide-gamut sequences are previewed tone mapped to SDR
+        // A rendered preview of this frame (kept at playback's scale) is used as it is, paused too.
+        RenderOptions co = o;
+        if (r.cacheScale > 0) co.scale = r.cacheScale;
+        const QByteArray key = frameKey(*r.project, *s, t, co);
+        const bool hdr = r.hdr && sequenceColorSpace(*s).hdr();  // (a rendered preview has only its SDR picture)
+        if (!hdr && RenderCache::instance().has(key)) {
+            QImage cached = RenderCache::instance().load(key);
+            if (!cached.isNull()) return {cached, {}};
+        }
+        // Rendered in the sequence's own space, kept for the scopes, then shown as Rec.709 (as displaySpace does).
+        Rendered out;
+        RenderOptions own = o;
+        const bool other = ownSpace(*s);
+        if (other) own.displaySpace.clear();
+        Image img = renderProgramFrame(*r.project, *s, t, own);
+        if (other) {
+            out.signal = signalImage(img);
+            if (hdr) {
+                auto pic = std::make_shared<HdrPicture>();
+                pic->width = img.width;
+                pic->height = img.height;
+                pic->contentPeak = hdrContentPeak(sequenceColorSpace(*s), s->hdrPeakNits);
+                hdrViewImage(img, sequenceColorSpace(*s), s->hdrPeakNits, pic->contentPeak, pic->rgba);  // (rolled off as drawn)
+                out.hdr = std::move(pic);
+            }
+            convertColor(img, sequenceColorSpace(*s), rec709Space(), s->hdrPeakNits);
+        }
+        out.view = QImage(img.width, img.height, QImage::Format_RGBA8888);
+        toRgba8(img, out.view.bits(), size_t(out.view.bytesPerLine()));
+        return out;
     }
 
     void process() {
@@ -80,10 +178,10 @@ private:
         ctx_.direction = r.direction;
         ctx_.frame = r.frame;
         auto it = cache_.find(r.frame);
-        QImage img = it != cache_.end() ? it->second : render(r, r.frame);
-        if (img.isNull()) return;
+        Rendered img = it != cache_.end() ? it->second : render(r, r.frame);
+        if (img.view.isNull()) return;
+        emitFrame(img, r, r.frame);
         cache_[r.frame] = img;
-        emit rendered(img, r.frame);
         trim();
         if (r.direction != 0) QMetaObject::invokeMethod(this, &RenderWorker::prefetch, Qt::QueuedConnection);
     }
@@ -103,8 +201,8 @@ private:
             FrameTime t = ctx_.frame + FrameTime(k) * ctx_.direction;
             if (t < 0 || t >= end) return;
             if (cache_.count(t)) continue;
-            QImage img = render(ctx_, t);
-            if (img.isNull()) return;
+            Rendered img = render(ctx_, t);
+            if (img.view.isNull()) return;
             cache_[t] = img;
             trim();
             QMetaObject::invokeMethod(this, &RenderWorker::prefetch, Qt::QueuedConnection);
@@ -114,7 +212,8 @@ private:
 
     // Drops cached frames furthest from the playhead.
     void trim() {
-        while (cache_.size() > kMaxCached) {
+        const size_t limit = ctx_.hdr ? kMaxCached / 2 : kMaxCached;  // HDR frames are twice the size
+        while (cache_.size() > limit) {
             auto first = cache_.begin(), last = std::prev(cache_.end());
             if (std::llabs(first->first - ctx_.frame) > std::llabs(last->first - ctx_.frame)) cache_.erase(first);
             else cache_.erase(last);
@@ -125,7 +224,7 @@ private:
     Request pending_;
     bool has_ = false;
     Request ctx_;  // context of the cached frames (render-thread only)
-    std::map<FrameTime, QImage> cache_;
+    std::map<FrameTime, Rendered> cache_;
 };
 
 // ---------------------------------------------------------------------------
@@ -138,21 +237,46 @@ public:
 
     void configure(std::shared_ptr<const Project> p, Id seq, int64_t startSample, bool int16) {
         QMutexLocker lock(&m_);
+        const Sequence* s = p ? p->findSequence(seq) : nullptr;
         project_ = std::move(p);
         seq_ = seq;
         sample_ = startSample;
         int16_ = int16;
         mixer_.reset();
+        // Loudness keeps integrating across plays of the same sequence until reset.
+        QMutexLocker meterLock(&meterM_);
+        const int rate = s ? s->sampleRate : 48000;
+        if (!meter_ || seq != meterSeq_ || rate != meterRate_) {
+            meter_ = std::make_unique<LoudnessMeter>(rate);
+            meterSeq_ = seq;
+            meterRate_ = rate;
+        }
+    }
+    void resetLoudness() {
+        QMutexLocker lock(&meterM_);
+        if (meter_) meter_->reset();
     }
     void setProject(std::shared_ptr<const Project> p) {
         QMutexLocker lock(&m_);
         project_ = std::move(p);
+    }
+    // Global Mute: the meters still move, the speakers get silence.
+    void setMuted(bool on) { muted_ = on; }
+    void setAmbisonicBinaural(bool on) {
+        QMutexLocker lock(&m_);
+        mixer_.setAmbisonicBinaural(on);
+    }
+    // An ADR cycle's beeps, in what is heard (never in the meters).
+    void setCycle(const std::optional<AdrCycle>& c) {
+        QMutexLocker lock(&m_);
+        cycle_ = c;
     }
     bool isSequential() const override { return true; }
     qint64 bytesAvailable() const override { return (1 << 16) + QIODevice::bytesAvailable(); }
 
 signals:
     void levels(float l, float r, const QVector<float>& tracks);
+    void loudness(double momentary, double shortTerm, double integrated, double range, double truePeak);
 
 protected:
     qint64 readData(char* data, qint64 maxlen) override {
@@ -161,11 +285,21 @@ protected:
         if (frames <= 0) return 0;
         buf_.resize(size_t(frames) * 2);
         std::vector<MeterLevels> tl;
+        std::optional<AdrCycle> cycle;
+        int64_t first = 0;
+        double fps = 30;
+        int rate = 48000;
         {
             QMutexLocker lock(&m_);
             const Sequence* s = project_ ? project_->findSequence(seq_) : nullptr;
             if (s) mixer_.mix(*project_, *s, sample_, frames, buf_.data(), &tl);
             else std::fill(buf_.begin(), buf_.end(), 0.0f);
+            if (s && cycle_) {
+                cycle = cycle_;
+                fps = s->fpsValue();
+                rate = s->sampleRate;
+            }
+            first = sample_;
             sample_ += frames;
         }
         float pl = 0, pr = 0;
@@ -173,11 +307,18 @@ protected:
             pl = std::max(pl, std::fabs(buf_[size_t(i) * 2]));
             pr = std::max(pr, std::fabs(buf_[size_t(i) * 2 + 1]));
         }
+        if (muted_) std::fill(buf_.begin(), buf_.end(), 0.0f);
+        std::vector<float> heard;
+        if (cycle && !muted_) {  // (Global Mute silences the beeps too)
+            heard = buf_;
+            addAdrBeeps(*cycle, fps, rate, first, heard.data(), frames, 2);
+        }
+        const std::vector<float>& out = heard.empty() ? buf_ : heard;
         if (int16_) {
             auto* d = reinterpret_cast<int16_t*>(data);
-            for (size_t i = 0; i < buf_.size(); ++i) d[i] = int16_t(std::lround(std::clamp(buf_[i], -1.0f, 1.0f) * 32767.0f));
+            for (size_t i = 0; i < out.size(); ++i) d[i] = int16_t(std::lround(std::clamp(out[i], -1.0f, 1.0f) * 32767.0f));
         } else {
-            std::memcpy(data, buf_.data(), size_t(frames) * 8);
+            std::memcpy(data, out.data(), size_t(frames) * 8);
         }
         QVector<float> tracks;
         tracks.reserve(int(tl.size()) * 2);
@@ -185,6 +326,20 @@ protected:
             tracks << lv.peakL << lv.peakR;
         }
         emit levels(pl, pr, tracks);
+        // Loudness of what is heard, reported ten times a second.
+        {
+            QMutexLocker lock(&meterM_);
+            if (meter_) {
+                meter_->add(buf_.data(), frames);
+                sinceReport_ += frames;
+                if (sinceReport_ >= meterRate_ / 10) {
+                    sinceReport_ = 0;
+                    const LoudnessResult r = meter_->result();
+                    emit loudness(meter_->momentary(), meter_->shortTerm(), r.valid ? r.integrated : -200.0, meter_->loudnessRange(),
+                                  r.truePeakDb);
+                }
+            }
+        }
         return qint64(frames) * bytesPerFrame;
     }
     qint64 writeData(const char*, qint64) override { return -1; }
@@ -195,23 +350,37 @@ private:
     Id seq_ = 0;
     int64_t sample_ = 0;
     bool int16_ = false;
+    std::atomic<bool> muted_{false};
+    std::optional<AdrCycle> cycle_;
     AudioMixer mixer_;
     std::vector<float> buf_;
+    QMutex meterM_;
+    std::unique_ptr<LoudnessMeter> meter_;
+    Id meterSeq_ = 0;
+    int meterRate_ = 48000;
+    int64_t sinceReport_ = 0;
 };
 
 // ---------------------------------------------------------------------------
 
 PlaybackController::PlaybackController(QObject* parent) : QObject(parent) {
     project_ = std::make_shared<Project>(makeDefaultProject());
+    heard_ = project_;
     renderThread_ = new QThread(this);
     renderThread_->setObjectName("montage-render");
     worker_ = new RenderWorker;
     worker_->moveToThread(renderThread_);
     connect(renderThread_, &QThread::finished, worker_, &QObject::deleteLater);
     connect(worker_, &RenderWorker::rendered, this, &PlaybackController::frameRendered, Qt::QueuedConnection);
+    connect(worker_, &RenderWorker::scopeRendered, this, &PlaybackController::scopeFrameRendered, Qt::QueuedConnection);
+    qRegisterMetaType<HdrPicturePtr>("montage::HdrPicturePtr");
+    connect(worker_, &RenderWorker::hdrRendered, this, &PlaybackController::hdrFrameRendered, Qt::QueuedConnection);
     renderThread_->start();
     device_ = new MixerDevice(this);
+    device_->setAmbisonicBinaural(ambisonicBinaural_);
+    scrubMixer_.setAmbisonicBinaural(ambisonicBinaural_);
     connect(device_, &MixerDevice::levels, this, &PlaybackController::audioLevels);
+    connect(device_, &MixerDevice::loudness, this, &PlaybackController::loudness);
     timer_.setTimerType(Qt::PreciseTimer);
     timer_.setInterval(8);
     connect(&timer_, &QTimer::timeout, this, &PlaybackController::tick);
@@ -226,7 +395,34 @@ PlaybackController::~PlaybackController() {
 void PlaybackController::setProject(const Project& p, Id sequenceId) {
     project_ = std::make_shared<const Project>(p);
     sequenceId_ = sequenceId;
-    device_->setProject(project_);
+    updateHeard();
+    device_->setProject(heard_);
+}
+
+void PlaybackController::updateHeard() {
+    if (mutedTracks_.empty() || !project_ || !project_->findSequence(sequenceId_)) {
+        heard_ = project_;
+        return;
+    }
+    auto copy = std::make_shared<Project>(*project_);
+    Sequence* s = copy->findSequence(sequenceId_);
+    for (int i : mutedTracks_)
+        if (i >= 0 && i < int(s->audioTracks.size())) {
+            s->audioTracks[size_t(i)].muted = true;  // (a soloed guide stays soloed, so nothing else comes up)
+        }
+    heard_ = std::move(copy);
+}
+
+void PlaybackController::setMutedAudioTracks(const std::vector<int>& tracks) {
+    if (tracks == mutedTracks_) return;
+    mutedTracks_ = tracks;
+    updateHeard();
+    device_->setProject(heard_);
+}
+
+void PlaybackController::setAdrCycle(const std::optional<AdrCycle>& cycle) {
+    cycle_ = cycle;
+    device_->setCycle(cycle);
 }
 
 const Sequence* PlaybackController::sequence() const {
@@ -243,6 +439,29 @@ void PlaybackController::setUseProxies(bool on) {
     requestFrame();
 }
 
+void PlaybackController::setAmbisonicBinaural(bool on) {
+    ambisonicBinaural_ = on;
+    device_->setAmbisonicBinaural(on);
+    scrubMixer_.setAmbisonicBinaural(on);  // scrubbing sounds as playback does
+}
+
+void PlaybackController::setShowCaptions(bool on) {
+    showCaptions_ = on;
+    requestFrame();
+}
+
+void PlaybackController::setHdrOutput(bool on) {
+    if (hdrOutput_ == on) return;
+    hdrOutput_ = on;
+    requestFrame();
+}
+
+void PlaybackController::setStereoView(StereoView v) {
+    if (stereoView_ == v) return;
+    stereoView_ = v;
+    requestFrame();
+}
+
 int PlaybackController::playStep() const {
     if (speed_ == 0) return 0;
     int step = int(std::lround(speed_));
@@ -254,7 +473,8 @@ FrameTime PlaybackController::clampToSequence(FrameTime t) const { return std::m
 void PlaybackController::requestFrame() {
     if (!sequence()) return;
     // Paused frames render at full quality; playback uses the preview scale.
-    worker_->request({project_, sequenceId_, position_, isPlaying() ? scale_ : 1.0, useProxies_, playStep()});
+    worker_->request(
+        {project_, sequenceId_, position_, isPlaying() ? scale_ : 1.0, useProxies_, playStep(), showCaptions_, scale_, stereoView_, hdrOutput_});
 }
 
 void PlaybackController::seek(FrameTime t) {
@@ -272,9 +492,24 @@ void PlaybackController::seek(FrameTime t) {
     emit positionChanged(position_);
 }
 
+void PlaybackController::setGlobalMute(bool on) {
+    globalMute_ = on;
+    device_->setMuted(on);
+}
+
+std::vector<float> PlaybackController::heard(int64_t start, int frames) {
+    std::vector<float> mix(size_t(std::max(0, frames)) * 2, 0.0f);
+    const Sequence* s = sequence();
+    if (!s || globalMute_ || frames <= 0) return mix;
+    scrubMixer_.reset();
+    scrubMixer_.setNonBlocking(false);
+    scrubMixer_.mix(*heard_, *heard_->findSequence(sequenceId_), start, frames, mix.data());  // its tracks as heard
+    return mix;
+}
+
 void PlaybackController::scrubAudio(FrameTime t) {
     const Sequence* s = sequence();
-    if (!scrubbing_ || !s || s->audioTracks.empty()) return;
+    if (!scrubbing_ || !s || s->audioTracks.empty() || globalMute_) return;
     if (!scrubSink_) {
         QAudioDevice dev = QMediaDevices::defaultAudioOutput();
         if (dev.isNull()) {
@@ -303,7 +538,7 @@ void PlaybackController::scrubAudio(FrameTime t) {
     int64_t start = int64_t(std::llround(double(t) * s->sampleRate / s->fpsValue()));
     scrubMixer_.reset();
     scrubMixer_.setNonBlocking(true);
-    scrubMixer_.mix(*project_, *s, start, frames, mix.data());
+    scrubMixer_.mix(*heard_, *heard_->findSequence(sequenceId_), start, frames, mix.data());  // its tracks as heard
     std::vector<int16_t> pcm(mix.size());
     const int fade = std::min(frames / 4, 240);
     for (int i = 0; i < frames; ++i) {
@@ -403,7 +638,7 @@ void PlaybackController::tick() {
     }
     if (t != position_) {
         position_ = t;
-        worker_->request({project_, sequenceId_, t, scale_, useProxies_, playStep()});
+        worker_->request({project_, sequenceId_, t, scale_, useProxies_, playStep(), showCaptions_, scale_, stereoView_, hdrOutput_});
         emit positionChanged(t);
     }
 }
@@ -425,7 +660,7 @@ void PlaybackController::startAudio(FrameTime from) {
         if (!dev.isFormatSupported(fmt)) return;
     }
     int64_t startSample = int64_t(std::llround(double(from) * s->sampleRate / s->fpsValue()));
-    device_->configure(project_, sequenceId_, startSample, int16);
+    device_->configure(heard_, sequenceId_, startSample, int16);
     if (!device_->isOpen()) device_->open(QIODevice::ReadOnly);
     sink_ = new QAudioSink(dev, fmt, this);
     sink_->setBufferSize(fmt.bytesForDuration(80000));  // ~80 ms
@@ -438,6 +673,18 @@ void PlaybackController::stopAudio() {
     sink_->deleteLater();
     sink_ = nullptr;
 }
+
+RenderOptions PlaybackController::renderOptions() const {
+    RenderOptions o;
+    o.scale = scale_;
+    o.useProxies = useProxies_;
+    o.captions = showCaptions_;
+    o.stereoView = stereoView_;
+    o.displaySpace = "rec709";
+    return o;
+}
+
+void PlaybackController::resetLoudness() { device_->resetLoudness(); }
 
 }  // namespace montage
 

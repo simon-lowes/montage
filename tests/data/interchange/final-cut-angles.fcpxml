@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE fcpxml>
+<fcpxml version="1.11">
+  <resources>
+    <format id="r1" frameDuration="1/25s" width="1920" height="1080"/>
+    <asset id="a1" name="A001" start="0s" duration="40s" hasVideo="1" hasAudio="1" format="r1"><media-rep kind="original-media" src="file:///Cards/A001.mov"/></asset>
+    <asset id="b1" name="B001" start="0s" duration="40s" hasVideo="1" hasAudio="1" format="r1"><media-rep kind="original-media" src="file:///Cards/B001.mov"/></asset>
+    <asset id="z1" name="ZOOM_A" start="0s" duration="40s" hasVideo="0" hasAudio="1"><media-rep kind="original-media" src="file:///Cards/ZOOM_A.wav"/></asset>
+    <asset id="g1" name="GoPro" start="0s" duration="40s" hasVideo="1" hasAudio="0" format="r1"><media-rep kind="original-media" src="file:///Cards/GOPR0001.mp4"/></asset>
+    <effect id="x1" name="Cross Dissolve" uid="FxPlug:4731E73A-8DAC-4113-9A30-AE85B1761265"/>
+    <media id="m1" name="Three Cams">
+      <multicam format="r1" tcStart="0s" tcFormat="NDF">
+        <mc-angle name="Cam A" angleID="A">
+          <sync-clip offset="0s" name="A sync" start="0s" duration="40s">
+            <asset-clip ref="a1" offset="0s" name="A001" duration="40s"/>
+            <asset-clip ref="z1" lane="-1" offset="0s" name="ZOOM_A" duration="40s"/>
+          </sync-clip>
+        </mc-angle>
+        <mc-angle name="Cam B" angleID="B">
+          <asset-clip ref="b1" offset="0s" name="B001" start="0s" duration="20s"/>
+          <transition name="Cross Dissolve" offset="19s" duration="2s"><filter-video ref="x1" name="Cross Dissolve"/></transition>
+          <asset-clip ref="b1" offset="20s" name="B001" start="25s" duration="15s"/>
+        </mc-angle>
+        <mc-angle name="GoPro" angleID="G">
+          <video ref="g1" offset="0s" name="GoPro" duration="40s"/>
+        </mc-angle>
+      </multicam>
+    </media>
+  </resources>
+  <library><event name="Day 2"><project name="Angles">
+    <sequence format="r1" duration="8s" tcStart="0s" tcFormat="NDF" audioLayout="stereo" audioRate="48k">
+      <spine>
+        <mc-clip ref="m1" offset="0s" name="Three Cams" start="0s" duration="4s">
+          <mc-source angleID="G" srcEnable="all"/>
+        </mc-clip>
+        <mc-clip ref="m1" offset="4s" name="Three Cams" start="4s" duration="4s">
+          <mc-source angleID="NOPE" srcEnable="all"/>
+        </mc-clip>
+      </spine>
+    </sequence>
+  </project></event></library>
+</fcpxml>

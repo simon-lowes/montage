@@ -1,14 +1,24 @@
 name: Package
 
 # Builds the macOS DMG and the Windows installer + portable zip. Every run
-# uploads them as workflow artifacts; pushing a tag like v0.1.0 also
-# publishes them as a GitHub Release.
+# uploads them as workflow artifacts. Pushing a tag like v0.1.0, or running
+# the workflow by hand with a release tag, also publishes them as a GitHub
+# Release (an existing release with that tag gets its files replaced).
 on:
   push:
     branches: [main]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Publish a release with this tag (e.g. v0.1.0); empty = build only"
+        required: false
+        default: ""
+      target:
+        description: "Commit the new tag points at (default: the commit being built)"
+        required: false
+        default: ""
 
 # A newer push waits for the running packaging run instead of cancelling it,
 # so each run reports both platforms.
@@ -27,11 +37,36 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install dependencies
         # Only the Qt modules Montage uses; the "qt" formula installs all of Qt.
-        run: brew install qtbase qtmultimedia ffmpeg ninja pkgconf
+        run: brew install qtbase qtmultimedia ffmpeg opencolorio lilv libraw openjpeg onnxruntime ninja pkgconf
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(brew --prefix)"
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(brew --prefix)" -DMONTAGE_REQUIRE_ONNXRUNTIME=ON
       - name: Build
         run: cmake --build build
+      - name: Cache the AI models
+        uses: actions/cache@v4
+        with:
+          path: ~/montage-models
+          key: models-edgetam-8ca3d3e-speakers-9403a69-0743f30-clipq4-d15189d-dfn3-888f33c-esrgan-899dc1e-faces-3cc26e7-3d70824-depth-4472b73-rife-01fdc7e-modnet-fa2fa54-kokoro-1939ad2-lama-c3c0c9e-minilm-3c96c1d-ocr-1cfba2e-7b02d0a
+      - name: AI models for the object mask, speaker and visual search tests
+        run: |
+          scripts/fetch-models.sh ~/montage-models \
+            && { echo "MONTAGE_OBJECT_MODEL=$HOME/montage-models/edgetam-video"; echo "MONTAGE_SPEAKER_MODEL=$HOME/montage-models/speakers"; echo "MONTAGE_VISUAL_MODEL=$HOME/montage-models/clip-vit-b32"; echo "MONTAGE_SPEECH_MODEL=$HOME/montage-models/speech-enhance"; echo "MONTAGE_UPSCALE_MODEL=$HOME/montage-models/upscale"; echo "MONTAGE_FACE_MODEL=$HOME/montage-models/faces"; echo "MONTAGE_DEPTH_MODEL=$HOME/montage-models/depth"; echo "MONTAGE_RIFE_MODEL=$HOME/montage-models/rife"; echo "MONTAGE_MATTE_MODEL=$HOME/montage-models/matte"; echo "MONTAGE_TTS_MODEL=$HOME/montage-models/tts"; echo "MONTAGE_INPAINT_MODEL=$HOME/montage-models/inpaint"; echo "MONTAGE_SENTENCE_MODEL=$HOME/montage-models/minilm-qa"; echo "MONTAGE_OCR_MODEL=$HOME/montage-models/ocr"; } >> "$GITHUB_ENV" \
+            || echo "::warning::Could not download the AI models; AI model tests will be skipped"
+      - name: Cache the ProRes RAW sample
+        uses: actions/cache@v4
+        with:
+          path: ~/montage-samples
+          key: samples-prores-raw-ticket7887-2
+      - name: ProRes RAW sample for the decode test
+        # The first frame of the ProRes RAW test file on FFmpeg's sample server (its index is at the end of the 1 GB
+        # file, which FFmpeg reads over HTTP without fetching the rest). It is fetched outside the cached folder, which
+        # only exists once the file is whole, so a failed fetch is never cached.
+        run: |
+          f="$HOME/montage-samples/prores-raw.mov"
+          part="$RUNNER_TEMP/prores-raw-part.mov"
+          { test -s "$f" || { ffmpeg -nostdin -v error -i https://samples.ffmpeg.org/ffmpeg-bugs/trac/ticket7887/Filmplusgear-ProRes-RAW-testfiles-6.mov -map 0:v:0 -c copy -frames:v 1 -y "$part" && test -s "$part" && mkdir -p "$HOME/montage-samples" && mv "$part" "$f"; }; } \
+            && echo "MONTAGE_TEST_PRORES_RAW=$f" >> "$GITHUB_ENV" \
+            || echo "::warning::Could not fetch the ProRes RAW sample; its decode test will be skipped"
       - name: Test
         run: ctest --test-dir build --output-on-failure
       - name: Package
@@ -65,16 +100,49 @@ jobs:
         with:
           msystem: UCRT64
           update: true
-          install: zip
+          install: zip curl
           pacboy: >-
             gcc:p cmake:p ninja:p pkgconf:p
-            qt6-base:p qt6-multimedia:p qt6-tools:p ffmpeg:p
+            qt6-base:p qt6-multimedia:p qt6-tools:p ffmpeg:p opencolorio:p lilv:p libraw:p openjpeg2:p onnxruntime:p
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DMONTAGE_REQUIRE_ONNXRUNTIME=ON
       - name: Build
         run: cmake --build build
+      - name: Cache the AI models
+        uses: actions/cache@v4
+        with:
+          path: ~/montage-models
+          key: models-edgetam-8ca3d3e-speakers-9403a69-0743f30-clipq4-d15189d-dfn3-888f33c-esrgan-899dc1e-faces-3cc26e7-3d70824-depth-4472b73-rife-01fdc7e-modnet-fa2fa54-kokoro-1939ad2-lama-c3c0c9e-minilm-3c96c1d-ocr-1cfba2e-7b02d0a
+      - name: AI models for the object mask, speaker and visual search tests
+        run: |
+          dir="$(cygpath -u "$USERPROFILE")/montage-models"  # where actions/cache's ~ points
+          scripts/fetch-models.sh "$dir" \
+            && { echo "MONTAGE_OBJECT_MODEL=$(cygpath -m "$dir/edgetam-video")"; echo "MONTAGE_SPEAKER_MODEL=$(cygpath -m "$dir/speakers")"; echo "MONTAGE_VISUAL_MODEL=$(cygpath -m "$dir/clip-vit-b32")"; echo "MONTAGE_SPEECH_MODEL=$(cygpath -m "$dir/speech-enhance")"; echo "MONTAGE_UPSCALE_MODEL=$(cygpath -m "$dir/upscale")"; echo "MONTAGE_FACE_MODEL=$(cygpath -m "$dir/faces")"; echo "MONTAGE_DEPTH_MODEL=$(cygpath -m "$dir/depth")"; echo "MONTAGE_RIFE_MODEL=$(cygpath -m "$dir/rife")"; echo "MONTAGE_MATTE_MODEL=$(cygpath -m "$dir/matte")"; echo "MONTAGE_TTS_MODEL=$(cygpath -m "$dir/tts")"; echo "MONTAGE_INPAINT_MODEL=$(cygpath -m "$dir/inpaint")"; echo "MONTAGE_SENTENCE_MODEL=$(cygpath -m "$dir/minilm-qa")"; echo "MONTAGE_OCR_MODEL=$(cygpath -m "$dir/ocr")"; } >> "$GITHUB_ENV" \
+            || echo "::warning::Could not download the AI models; AI model tests will be skipped"
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        # Qt Test's console output does not reach this log on Windows, so a failing binary is run again writing its
+        # results to a file; every failure is printed (and annotated) with where and why, and the log in full is kept.
+        run: |
+          ctest --test-dir build --output-on-failure || {
+            for t in $(ctest --test-dir build --rerun-failed --show-only=json-v1 | sed -n 's/.*"name" *: *"\(test_[a-z]*\)".*/\1/p' | sort -u); do
+              log="build/tests/$t-results.txt"
+              code=0
+              (cd build/tests && QT_QPA_PLATFORM=offscreen "./$t.exe" -maxwarnings 0 -o "$t-results.txt,txt") || code=$?
+              echo "::group::$t (exit code $code)"; cat "$log" 2>/dev/null || echo "no results were written"; echo "::endgroup::"
+              { grep -A3 '^FAIL!' "$log" | tr -d '\r' | awk '/^FAIL!/ { if (m) print m; m = $0; next } /^[ \t]/ { m = m " " $0 } END { if (m) print m }' |
+                  while read -r line; do echo "::error title=$t::$line"; done; } 2>/dev/null || true
+              if ! grep -q '^Totals' "$log" 2>/dev/null; then
+                echo "::error title=$t::stopped before the end (crashed?); last lines: $(tail -n 3 "$log" 2>/dev/null | tr -d '\r' | tr '\n' ' ')"
+              fi
+            done
+            exit 1
+          }
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: test-results-windows
+          path: build/tests/*-results.txt
+          if-no-files-found: ignore
       - name: Package (portable zip)
         run: scripts/package-windows.sh build
       - name: Package (installer)
@@ -106,7 +174,7 @@ jobs:
 
   release:
     name: Publish release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
     needs: [macos, windows]
     runs-on: ubuntu-24.04
     permissions:
@@ -117,7 +185,15 @@ jobs:
           pattern: montage-*
           merge-multiple: true
           path: dist
-      - name: Create release
+      - name: Create or update the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "Montage ${GITHUB_REF_NAME#v}" --generate-notes
+          TAG: ${{ inputs.release_tag || github.ref_name }}
+          TARGET: ${{ inputs.target || github.sha }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --target "$TARGET" \
+              --title "Montage ${TAG#v}" --generate-notes
+          fi

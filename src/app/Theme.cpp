@@ -5,34 +5,33 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QPalette>
+#include <QProxyStyle>
 #include <QStyleFactory>
+#include <algorithm>
+#include <iterator>
+
+#include "core/MediaLog.h"
 
 namespace montage::theme {
 
 namespace {
-struct Label {
-    const char* name;
-    QColor color;
+// Colours for core/MediaLog.h's label names, in the same order.
+const QColor kLabelColors[] = {
+    QColor(),                  QColor(0x8a, 0x5c, 0xc9), QColor(0x5b, 0x6e, 0xd8), QColor(0x2a, 0x9d, 0x8f),
+    QColor(0xb2, 0x8d, 0xd8), QColor(0x2f, 0x8f, 0xc9), QColor(0x3d, 0x8a, 0x48), QColor(0xd1, 0x5f, 0x8c),
+    QColor(0xe0, 0x93, 0x3c), QColor(0xd8, 0xc2, 0x3a), QColor(0xa8, 0x8a, 0x64), QColor(0xc8, 0x46, 0x46),
 };
-const Label kLabels[] = {
-    {"Default", QColor()},           {"Violet", QColor(0x8a, 0x5c, 0xc9)}, {"Iris", QColor(0x5b, 0x6e, 0xd8)},
-    {"Caribbean", QColor(0x2a, 0x9d, 0x8f)}, {"Lavender", QColor(0xb2, 0x8d, 0xd8)}, {"Cerulean", QColor(0x2f, 0x8f, 0xc9)},
-    {"Forest", QColor(0x3d, 0x8a, 0x48)}, {"Rose", QColor(0xd1, 0x5f, 0x8c)},     {"Mango", QColor(0xe0, 0x93, 0x3c)},
-    {"Yellow", QColor(0xd8, 0xc2, 0x3a)}, {"Tan", QColor(0xa8, 0x8a, 0x64)},      {"Red", QColor(0xc8, 0x46, 0x46)},
-};
+static_assert(std::size(kLabelColors) == 12);
 }  // namespace
 
 QColor labelColor(int index) {
     if (index <= 0 || index >= labelCount()) return QColor();
-    return kLabels[index].color;
+    return kLabelColors[index];
 }
 
-int labelCount() { return int(sizeof(kLabels) / sizeof(kLabels[0])); }
+int labelCount() { return std::min(montage::labelCount(), int(std::size(kLabelColors))); }
 
-const char* labelName(int index) {
-    if (index < 0 || index >= labelCount()) return kLabels[0].name;
-    return kLabels[index].name;
-}
+const char* labelName(int index) { return index <= 0 || index >= labelCount() ? "Default" : montage::labelName(index); }
 
 QFont monoFont(int pointSize) {
     QFont f = QFontDatabase::systemFont(QFontDatabase::FixedFont);
@@ -106,8 +105,20 @@ QIcon icon(const char* nameC) {
     return result;
 }
 
+namespace {
+// Fusion, with tab names never shortened to "Tra…": a crowded dock shows scroll arrows instead.
+class Style : public QProxyStyle {
+public:
+    Style() : QProxyStyle(QStyleFactory::create("Fusion")) {}
+    int styleHint(StyleHint hint, const QStyleOption* option, const QWidget* widget, QStyleHintReturn* ret) const override {
+        if (hint == SH_TabBar_ElideMode) return Qt::ElideNone;
+        return QProxyStyle::styleHint(hint, option, widget, ret);
+    }
+};
+}  // namespace
+
 void apply(QApplication& app) {
-    app.setStyle(QStyleFactory::create("Fusion"));
+    app.setStyle(new Style);
     QPalette p;
     p.setColor(QPalette::Window, kWindow);
     p.setColor(QPalette::WindowText, kText);

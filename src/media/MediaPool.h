@@ -4,6 +4,8 @@
 #include <functional>
 #include <list>
 #include <map>
+#include <optional>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -12,6 +14,15 @@
 #include "Decoder.h"
 
 namespace montage {
+
+// The pool's name for some of a file's audio channels (Clip::channels): audio(), audioIfReady() and the peaks take it
+// in place of the path, decoding just those channels. With none it is the path itself.
+std::string audioKey(const std::string& path, const std::vector<int>& channels);
+// The file an audio key names, and (if asked) its channels.
+std::string audioKeyFile(const std::string& key, std::vector<int>* channels = nullptr);
+// The pool's name for a file's ambisonic field: audio() gives its four channels (media/Decoder.h decodeAmbisonic).
+std::string ambisonicAudioKey(const std::string& path);
+bool isAmbisonicAudioKey(const std::string& key);
 
 class MediaPool {
 public:
@@ -22,7 +33,7 @@ public:
     // Native display size of the video (0,0 if it cannot be opened).
     bool videoSize(const std::string& path, int& w, int& h);
 
-    // Fully decoded stereo audio at `sampleRate` (blocking on first use).
+    // Fully decoded stereo audio at `sampleRate` (blocking on first use), of a file or an audioKey.
     AudioBufferPtr audio(const std::string& path, int sampleRate);
     // Returns cached audio or nullptr without decoding.
     AudioBufferPtr audioIfReady(const std::string& path, int sampleRate);
@@ -32,6 +43,13 @@ public:
     void setFrameCacheBudget(size_t bytes);
     size_t frameCacheBytes() const;
     void clear();
+    // Drops everything cached for one file (decoded frames, idle decoders, audio and peaks), after it changed on disk.
+    void forget(const std::string& path);
+    // The files idle decoders may stay open on (the open project's media). Any other file's decoders are closed now
+    // if idle, or as soon as they are released, so a closed project's files are let go even while background jobs
+    // finish (on Windows an open file stops its folder being moved or renamed). nullopt (the start) lifts the limit.
+    void setOpenFiles(std::optional<std::set<std::string>> paths);
+    size_t openDecoders() const;  // decoders open now, busy or idle
     // Called (from any thread) when audio/peaks for a path become available.
     void setReadyCallback(std::function<void(const std::string&)> cb);
 
@@ -69,6 +87,7 @@ private:
 
     mutable std::mutex m_;
     std::map<std::string, std::vector<Slot>> decoders_;
+    std::optional<std::set<std::string>> openFiles_;  // setOpenFiles; nullopt = no limit
     std::list<std::pair<FrameKey, Frame16Ptr>> lru_;
     std::unordered_map<FrameKey, decltype(lru_)::iterator, FrameKeyHash> index_;
     size_t cacheBytes_ = 0;

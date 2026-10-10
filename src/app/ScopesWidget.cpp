@@ -3,6 +3,8 @@
 
 #include <QComboBox>
 #include <QHBoxLayout>
+#include <QLabel>
+#include <QLocale>
 #include <QPainter>
 #include <QPainterPath>
 #include <QVBoxLayout>
@@ -11,6 +13,7 @@
 #include <vector>
 
 #include "Theme.h"
+#include "render/ColorSpace.h"
 
 namespace montage {
 
@@ -23,9 +26,6 @@ constexpr int kVectorBins = 256;
 constexpr float kVectorRange = 0.6f;  // Cb/Cr magnitude at the edge of the vectorscope circle
 constexpr double kPi = 3.14159265358979323846;
 
-// Rec.709 luma on 8-bit values (weights sum to 65536).
-inline int luma709(int r, int g, int b) { return (13933 * r + 46871 * g + 4732 * b + 32768) >> 16; }
-
 struct CbCr {
     float cb, cr;  // -0.5..0.5
 };
@@ -35,15 +35,30 @@ inline CbCr cbcr709(float r, float g, float b) {
     return {(b - y) / 1.8556f, (r - y) / 1.5748f};
 }
 
-QImage downsample(const QImage& src) {
+// The frame at analysis size, in its own format (16-bit frames keep their precision).
+QImage pointSample(const QImage& src) {
     QSize size = src.size();
     if (size.width() > kMaxAnalysisWidth || size.height() > kMaxAnalysisHeight)
         size = size.scaled(kMaxAnalysisWidth, kMaxAnalysisHeight, Qt::KeepAspectRatio);
     size = size.expandedTo(QSize(1, 1));
     // Point sampling keeps real pixel values (smoothing would hide outliers).
-    const QImage img = size == src.size() ? src : src.scaled(size, Qt::IgnoreAspectRatio, Qt::FastTransformation);
-    return img.convertToFormat(QImage::Format_RGB32);
+    return size == src.size() ? src : src.scaled(size, Qt::IgnoreAspectRatio, Qt::FastTransformation);
 }
+
+// Code values 0..1 of a frame (any format) for the light meter.
+Image toCodeValues(const QImage& src) {
+    const QImage img = src.convertToFormat(QImage::Format_RGBA64);
+    Image out(img.width(), img.height());
+    for (int y = 0; y < img.height(); ++y) {
+        const auto* in = reinterpret_cast<const quint16*>(img.constScanLine(y));
+        float* o = out.row(y);
+        for (int x = 0; x < img.width() * 4; ++x) o[x] = in[x] / 65535.0f;
+    }
+    return out;
+}
+
+// The scale's labels: whole nits, thousands as K.
+QString nitsLabel(double n) { return n >= 1000 ? QStringLiteral("%1K").arg(n / 1000) : QString::number(n); }
 
 // Phosphor-like shade: tint scales with density, the densest areas bloom towards white.
 // Returns a premultiplied ARGB value.
@@ -103,10 +118,24 @@ ScopesWidget::ScopesWidget(QWidget* parent) : QWidget(parent) {
     modeBox_->addItem(tr("RGB Parade"));
     modeBox_->addItem(tr("Vectorscope"));
     modeBox_->addItem(tr("Histogram"));
+    modeBox_->addItem(tr("All Four"));
     modeBox_->setSizeAdjustPolicy(QComboBox::AdjustToContents);
     modeBox_->setToolTip(tr("Scope type"));
     row->addWidget(modeBox_);
+    // HDR: the waveform's top in nits, and the frame's light.
+    rangeBox_ = new QComboBox(this);
+    rangeBox_->setObjectName(QStringLiteral("scopeRange"));
+    for (int n : {10000, 4000, 2000, 1000}) rangeBox_->addItem(tr("%1 nits").arg(QLocale().toString(n)), n);
+    rangeBox_->setSizeAdjustPolicy(QComboBox::AdjustToContents);
+    rangeBox_->setToolTip(tr("The top of the waveform and parade"));
+    rangeBox_->hide();
+    row->addWidget(rangeBox_);
+    connect(rangeBox_, &QComboBox::currentIndexChanged, this, [this](int i) { setNitsRange(rangeBox_->itemData(i).toDouble()); });
     row->addStretch(1);
+    nitsLabel_ = new QLabel(this);
+    nitsLabel_->setObjectName(QStringLiteral("scopeNits"));
+    nitsLabel_->hide();
+    row->addWidget(nitsLabel_);
     layout->addLayout(row);
     layout->addStretch(1);
     connect(modeBox_, &QComboBox::currentIndexChanged, this, [this](int i) { setMode(Mode(i)); });
@@ -131,15 +160,49 @@ void ScopesWidget::setMode(Mode m) {
     update();
 }
 
-void ScopesWidget::setFrame(const QImage& image, FrameTime t) {
+void ScopesWidget::setFrame(const QImage& image, FrameTime t) { setSignal(image, t, QStringLiteral("rec709"), 1000); }
+
+void ScopesWidget::setSignal(const QImage& image, FrameTime t, const QString& space, double masteringPeakNits) {
     if (image.isNull()) {
         clear();
         return;
     }
     frameTime_ = t;
     pending_ = image;  // implicitly shared, no copy
+    pendingSpace_ = space;
+    pendingPeak_ = masteringPeakNits;
     dirty_ = true;
     scheduleAnalysis();
+}
+
+bool ScopesWidget::hdr() const {
+    const ColorSpace* cs = findColorSpace(space_.toStdString());
+    return cs && cs->hdr();
+}
+
+void ScopesWidget::setNitsRange(double nits) {
+    nitsTop_ = std::clamp(nits, 100.0, 10000.0);
+    const int i = rangeBox_->findData(int(std::lround(nitsTop_)));
+    if (i >= 0 && i != rangeBox_->currentIndex()) {
+        QSignalBlocker block(rangeBox_);
+        rangeBox_->setCurrentIndex(i);
+    }
+    computeTrace();
+    update();
+}
+
+void ScopesWidget::updateHdrControls() {
+    const ColorSpace* cs = findColorSpace(space_.toStdString());
+    const bool h = cs && cs->hdr();
+    rangeBox_->setVisible(h && cs->transfer == Transfer::Pq);
+    nitsLabel_->setVisible(h && haveData_);
+    if (!h || !haveData_) return;
+    const QLocale loc;
+    nitsLabel_->setText(tr("Peak %1 · Avg %2 nits").arg(loc.toString(qRound(peakNits_)), loc.toString(qRound(averageNits_))));
+    const bool over = cs->transfer == Transfer::Pq && peakNits_ > masterPeak_ + 0.5;
+    nitsLabel_->setStyleSheet(over ? QStringLiteral("color: #ff6b5e;") : QString());
+    nitsLabel_->setToolTip(over ? tr("Brighter than the %1-nit mastering peak").arg(loc.toString(qRound(masterPeak_)))
+                                : tr("The frame's brightest pixel and its average light (MaxCLL and MaxFALL measures)"));
 }
 
 void ScopesWidget::clear() {
@@ -151,6 +214,8 @@ void ScopesWidget::clear() {
     dirty_ = false;
     haveData_ = false;
     frameTime_ = -1;
+    peakNits_ = averageNits_ = -1;
+    updateHdrControls();
     update();
 }
 
@@ -171,11 +236,26 @@ void ScopesWidget::scheduleAnalysis() {
 void ScopesWidget::analyze() {
     if (!dirty_ || !isVisible())
         return;  // a hidden scope catches up in showEvent()
-    small_ = downsample(pending_);
+    const QImage sampled = pointSample(pending_);
+    if (!meter_ || pendingSpace_ != space_) {
+        space_ = pendingSpace_;
+        const ColorSpace* cs = findColorSpace(space_.toStdString());
+        if (!cs) cs = &rec709Space();
+        meter_ = cs->hdr() ? std::make_unique<LightMeter>(*cs) : nullptr;
+        // Luma as the space weighs its primaries (Rec.709 and BT.2020 differ).
+        double m[9];
+        primariesToXyz(cs->primaries, m);
+        lumaR_ = int(std::lround(m[3] * 65536)), lumaG_ = int(std::lround(m[4] * 65536)), lumaB_ = 65536 - lumaR_ - lumaG_;
+    }
+    masterPeak_ = pendingPeak_;
+    peakNits_ = averageNits_ = -1;
+    if (meter_) meter_->measure(toCodeValues(sampled), peakNits_, averageNits_);
+    small_ = sampled.convertToFormat(QImage::Format_RGB32);
     pending_ = QImage();
     dirty_ = false;
     sinceAnalysis_.restart();
     computeTrace();
+    updateHdrControls();
     update();
 }
 
@@ -189,6 +269,15 @@ void ScopesWidget::computeTrace() {
     case Mode::Parade: analyzeWaveform(true); break;
     case Mode::Vectorscope: analyzeVectorscope(); break;
     case Mode::Histogram: analyzeHistogram(); break;
+    case Mode::Quad:
+        analyzeWaveform(false);
+        quad_[0] = trace_;
+        analyzeWaveform(true);
+        quad_[1] = trace_;
+        analyzeVectorscope();
+        quad_[2] = trace_;
+        analyzeHistogram();
+        break;
     }
 }
 
@@ -208,7 +297,7 @@ void ScopesWidget::analyzeWaveform(bool parade) {
                 ++counts[size_t(255 - g) * stride + w + x];
                 ++counts[size_t(255 - b) * stride + 2 * w + x];
             } else {
-                ++counts[size_t(255 - luma709(r, g, b)) * stride + x];
+                ++counts[size_t(255 - luma(r, g, b)) * stride + x];
             }
         }
     }
@@ -234,6 +323,12 @@ void ScopesWidget::analyzeWaveform(bool parade) {
             for (int x = 0; x < w; ++x)
                 out[p * w + x] = l[in[p * w + x]];
         }
+    }
+    // PQ shown to a lower top: only the levels up to it (brighter ones are off the scale).
+    const ColorSpace* cs = findColorSpace(space_.toStdString());
+    if (cs && cs->transfer == Transfer::Pq && nitsTop_ < 10000) {
+        const int top = std::clamp(int(std::lround(nitsToCode(*cs, nitsTop_) * 255)), 1, 255);
+        trace_ = trace_.copy(0, 255 - top, stride, top + 1);
     }
 }
 
@@ -285,7 +380,7 @@ void ScopesWidget::analyzeHistogram() {
             ++hist_[0][r];
             ++hist_[1][g];
             ++hist_[2][b];
-            ++hist_[3][luma709(r, g, b)];
+            ++hist_[3][luma(r, g, b)];
         }
     }
 }
@@ -320,6 +415,22 @@ void ScopesWidget::paintEvent(QPaintEvent*) {
     case Mode::Parade: paintWaveform(p, area, true); break;
     case Mode::Vectorscope: paintVectorscope(p, area); break;
     case Mode::Histogram: paintHistogram(p, area); break;
+    case Mode::Quad: {
+        // Waveform and parade above, vectorscope and histogram below.
+        const int w2 = area.width() / 2, h2 = area.height() / 2;
+        const QRect cells[4] = {QRect(area.left(), area.top(), w2 - 3, h2 - 3), QRect(area.left() + w2 + 3, area.top(), area.width() - w2 - 3, h2 - 3),
+                                QRect(area.left(), area.top() + h2 + 3, w2 - 3, area.height() - h2 - 3),
+                                QRect(area.left() + w2 + 3, area.top() + h2 + 3, area.width() - w2 - 3, area.height() - h2 - 3)};
+        const QImage single = trace_;
+        for (int i = 0; i < 3; ++i) {
+            trace_ = quad_[size_t(i)];
+            if (i == 2) paintVectorscope(p, cells[2]);
+            else paintWaveform(p, cells[i], i == 1);
+        }
+        trace_ = single;
+        paintHistogram(p, cells[3]);
+        break;
+    }
     }
     if (!haveData_) {
         p.setPen(theme::kTextDim);
@@ -327,10 +438,48 @@ void ScopesWidget::paintEvent(QPaintEvent*) {
     }
 }
 
+std::vector<std::pair<double, double>> ScopesWidget::nitsMarks(bool fullRange, double& peakAt) const {
+    std::vector<std::pair<double, double>> marks;
+    peakAt = -1;
+    const ColorSpace* cs = findColorSpace(space_.toStdString());
+    if (!cs || !cs->hdr()) return marks;
+    const bool pq = cs->transfer == Transfer::Pq;
+    const double top = pq && !fullRange ? nitsToCode(*cs, nitsTop_) : 1.0;
+    for (double n : {0.0, 10.0, 100.0, 203.0, 1000.0, 4000.0, 10000.0}) {
+        const double at = nitsToCode(*cs, n) / top;
+        if (at <= 1 + 1e-6 && (pq || n <= 1000)) marks.push_back({n, std::min(at, 1.0)});
+    }
+    if (pq && masterPeak_ < (fullRange ? 10000 : nitsTop_) - 0.5) peakAt = nitsToCode(*cs, masterPeak_) / top;
+    return marks;
+}
+
 void ScopesWidget::paintLevelGraticule(QPainter& p, const QRectF& plot, bool labels) {
     p.save();
     p.setRenderHint(QPainter::Antialiasing, false);
     const QFontMetrics fm(p.font());
+    double peakAt = -1;
+    const auto marks = nitsMarks(false, peakAt);
+    if (!marks.empty()) {
+        // HDR: the levels in nits where they fall on the signal, reference white (203) and the mastering peak marked.
+        for (const auto& [nits, at] : marks) {
+            const double y = std::round(plot.bottom() - plot.height() * at) + 0.5;
+            QPen pen(graticuleColor(nits == 203 ? 110 : 70));
+            if (nits != 0 && nits != 203 && nits != 1000 && nits != 10000) pen.setStyle(Qt::DotLine);
+            p.setPen(pen);
+            p.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y));
+            if (labels) {
+                p.setPen(theme::kTextDim);
+                p.drawText(QRectF(plot.left() - 40, y - fm.height() / 2.0, 36, fm.height()), Qt::AlignRight | Qt::AlignVCenter, nitsLabel(nits));
+            }
+        }
+        if (peakAt > 0) {
+            const double y = std::round(plot.bottom() - plot.height() * peakAt) + 0.5;
+            p.setPen(QPen(QColor(255, 150, 60, 170), 1, Qt::DashLine));
+            p.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y));
+        }
+        p.restore();
+        return;
+    }
     for (int pct = 0; pct <= 100; pct += 25) {
         const double y = std::round(plot.bottom() - plot.height() * pct / 100.0) + 0.5;
         QPen pen(graticuleColor(pct % 50 == 0 ? 95 : 60));
@@ -358,10 +507,11 @@ void ScopesWidget::paintWaveform(QPainter& p, const QRect& area, bool parade) {
     const int panels = parade ? 3 : 1;
     const int gap = parade ? 6 : 0;
     const int panelW = (int(plot.width()) - gap * (panels - 1)) / panels;
-    // Each level is a bin centred on its graticule position.
-    const double binH = plot.height() / 255.0;
+    // Each level is a bin centred on its graticule position (an HDR range shows fewer than all 256).
+    const int rows = trace_.isNull() ? 256 : std::max(2, trace_.height());
+    const double binH = plot.height() / double(rows - 1);
     // Pre-scaled with area averaging: drawImage() would point-sample a shrinking trace into dotted lines.
-    const QImage scaled = haveData_ ? scaledTrace(QSize(panelW * panels, int(std::lround(binH * 256)))) : QImage();
+    const QImage scaled = haveData_ ? scaledTrace(QSize(panelW * panels, int(std::lround(binH * rows)))) : QImage();
 
     static const QColor kPanelTint[3] = {{255, 90, 80}, {90, 230, 120}, {100, 150, 255}};
     for (int i = 0; i < panels; ++i) {
@@ -472,9 +622,17 @@ void ScopesWidget::paintHistogram(QPainter& p, const QRect& area) {
         return;
     p.fillRect(plot, theme::kWindow);
 
-    // Vertical graticule at 0/25/50/75/100%.
+    // Vertical graticule at 0/25/50/75/100% (HDR: at the nits marks over the whole signal).
     p.save();
-    for (int pct = 0; pct <= 100; pct += 25) {
+    double peakAt = -1;
+    for (const auto& [nits, at] : nitsMarks(true, peakAt)) {
+        const double x = std::round(plot.left() + plot.width() * at) + 0.5;
+        p.setPen(QPen(graticuleColor(nits == 203 ? 110 : 70), 1, nits == 0 || nits == 203 || nits == 1000 || nits == 10000 ? Qt::SolidLine : Qt::DotLine));
+        p.drawLine(QPointF(x, plot.top()), QPointF(x, plot.bottom()));
+        p.setPen(theme::kTextDim);
+        p.drawText(QRectF(x - 20, plot.bottom() + 2, 40, fm.height()), Qt::AlignHCenter | Qt::AlignTop, nitsLabel(nits));
+    }
+    for (int pct = 0; pct <= 100 && !hdr(); pct += 25) {
         const double x = std::round(plot.left() + plot.width() * pct / 100.0) + 0.5;
         QPen pen(graticuleColor(pct % 50 == 0 ? 95 : 60));
         if (pct % 50 != 0)

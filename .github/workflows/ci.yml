@@ -5,16 +5,47 @@ on:
     branches: [main]
   pull_request:
 
+# A newer push supersedes the running check of the same branch.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-and-test:
     runs-on: ubuntu-24.04
+    timeout-minutes: 45  # a run takes about 8; a stuck apt mirror should not hold the runner for hours
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
+        timeout-minutes: 15
         run: ./scripts/setup-deps.sh
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DMONTAGE_BUILD_APP=ON
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DMONTAGE_BUILD_APP=ON -DMONTAGE_REQUIRE_ONNXRUNTIME=ON
       - name: Build
         run: cmake --build build
+      - name: Cache the speech model
+        uses: actions/cache@v4
+        with:
+          path: ~/whisper-models
+          key: whisper-ggml-tiny.en-v1
+      - name: Speech model for the transcription tests
+        run: |
+          mkdir -p ~/whisper-models
+          f="$HOME/whisper-models/ggml-tiny.en.bin"
+          if [ ! -s "$f" ]; then
+            curl -fL --retry 3 -o "$f" https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin \
+              || { rm -f "$f"; echo "::warning::Could not download the speech model; transcription tests will be skipped"; }
+          fi
+          [ -s "$f" ] && echo "MONTAGE_TEST_WHISPER_MODEL=$f" >> "$GITHUB_ENV" || true
+      - name: Cache the AI models
+        uses: actions/cache@v4
+        with:
+          path: ~/montage-models
+          key: models-edgetam-8ca3d3e-speakers-9403a69-0743f30-clipq4-d15189d-dfn3-888f33c-esrgan-899dc1e-faces-3cc26e7-3d70824-depth-4472b73-rife-01fdc7e-modnet-fa2fa54-kokoro-1939ad2-lama-c3c0c9e-minilm-3c96c1d-ocr-1cfba2e-7b02d0a
+      - name: AI models for the object mask, speaker and visual search tests
+        run: |
+          scripts/fetch-models.sh ~/montage-models \
+            && { echo "MONTAGE_OBJECT_MODEL=$HOME/montage-models/edgetam-video"; echo "MONTAGE_SPEAKER_MODEL=$HOME/montage-models/speakers"; echo "MONTAGE_VISUAL_MODEL=$HOME/montage-models/clip-vit-b32"; echo "MONTAGE_SPEECH_MODEL=$HOME/montage-models/speech-enhance"; echo "MONTAGE_UPSCALE_MODEL=$HOME/montage-models/upscale"; echo "MONTAGE_FACE_MODEL=$HOME/montage-models/faces"; echo "MONTAGE_DEPTH_MODEL=$HOME/montage-models/depth"; echo "MONTAGE_RIFE_MODEL=$HOME/montage-models/rife"; echo "MONTAGE_MATTE_MODEL=$HOME/montage-models/matte"; echo "MONTAGE_TTS_MODEL=$HOME/montage-models/tts"; echo "MONTAGE_INPAINT_MODEL=$HOME/montage-models/inpaint"; echo "MONTAGE_SENTENCE_MODEL=$HOME/montage-models/minilm-qa"; echo "MONTAGE_OCR_MODEL=$HOME/montage-models/ocr"; } >> "$GITHUB_ENV" \
+            || echo "::warning::Could not download the AI models; AI model tests will be skipped"
       - name: Test
         run: ctest --test-dir build --output-on-failure

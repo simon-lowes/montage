@@ -1,6 +1,12 @@
 #include "TimelineWidget.h"
 
+#include "EffectPresetStore.h"
+
 #include <QApplication>
+#include <QDir>
+#include <QRegularExpression>
+#include <QStandardPaths>
+#include <QDateTime>
 #include <QContextMenuEvent>
 #include <QFileInfo>
 #include <QInputDialog>
@@ -12,14 +18,22 @@
 #include <QToolTip>
 #include <QUrl>
 #include <algorithm>
+#include <limits>
 #include <cmath>
 #include <set>
 #include <utility>
 
 #include "EditorState.h"
+#include "ModelPacks.h"
+#include "render/Exporter.h"
 #include "Theme.h"
 #include "ThumbnailCache.h"
+#include "audio/PluginEffect.h"
 #include "core/Effects.h"
+#include "core/AudioChannels.h"
+#include "core/Automation.h"
+#include "core/KeyframeEdit.h"
+#include "core/Multicam.h"
 #include "media/MediaPool.h"
 
 namespace montage {
@@ -31,10 +45,38 @@ constexpr int kRulerH = 30;
 constexpr int kDividerH = 8;
 constexpr int kVideoH = 62;
 constexpr int kAudioH = 52;
+constexpr int kCaptionH = 24;
 constexpr int kEdgeGrab = 6;
 constexpr int kSnapPx = 9;
 constexpr int kNameStrip = 16;
 constexpr int kBtn = 20;
+constexpr int kFolderH = 24;  // a track folder's header row
+
+// A clip's line parameter (generic over the timeline's private Lane type).
+template <class L>
+const Param* laneParam(const Clip& c, const L& lane) {
+    const Effect& fx = c.*(lane.fixed);
+    const auto it = fx.params.find(lane.param);
+    return it == fx.params.end() ? nullptr : &it->second;
+}
+template <class L>
+Param& laneParamRef(Clip& c, const L& lane) {
+    Effect& fx = c.*(lane.fixed);
+    auto it = fx.params.find(lane.param);
+    if (it == fx.params.end()) it = fx.params.emplace(lane.param, Param(lane.def)).first;
+    return it->second;
+}
+template <class L>
+double laneAt(const Clip& c, const L& lane, FrameTime t) {
+    const Param* p = laneParam(c, lane);
+    return p ? p->at(t) : lane.def;
+}
+template <class L>
+QString laneText(const L& lane, double v) {
+    if (!lane.gain) return QObject::tr("Opacity %1 %").arg(v, 0, 'f', 0);
+    if (v <= kGainLineMinDb) return QObject::tr("Volume -inf dB");
+    return QObject::tr("Volume %1%2 dB").arg(v > 0.05 ? "+" : "").arg(v, 0, 'f', 1);
+}
 
 int trackHeight(const Track& t) { return t.height > 0 ? t.height : (t.kind == TrackKind::Video ? kVideoH : kAudioH); }
 
@@ -52,6 +94,7 @@ QColor clipColor(const Project& p, const Clip& c, TrackKind kind) {
 struct MediaRef {
     Id id = 0;
     FrameTime in = -1, out = -1;
+    Id subclip = 0;  // the bin's subclip this range came from (its name names the clips)
 };
 std::vector<MediaRef> parseMediaMime(const QMimeData* mime) {
     std::vector<MediaRef> out;
@@ -64,6 +107,7 @@ std::vector<MediaRef> parseMediaMime(const QMimeData* mime) {
             r.in = f[1].toLongLong();
             r.out = f[2].toLongLong();
         }
+        if (f.size() >= 4) r.subclip = f[3].toULongLong();
         if (r.id) out.push_back(r);
     }
     return out;
@@ -82,12 +126,19 @@ TimelineWidget::TimelineWidget(EditorState* state, QWidget* parent) : QAbstractS
     horizontalScrollBar()->setSingleStep(20);
     verticalScrollBar()->setSingleStep(20);
     connect(state_, &EditorState::projectChanged, this, [this] {
+        duplicatesDirty_ = throughDirty_ = syncDirty_ = true;
+        clipPeaks_.clear();
+        gap_.reset();
         updateScrollBars();
         viewport()->update();
     });
-    connect(state_, &EditorState::selectionChanged, viewport(), qOverload<>(&QWidget::update));
+    connect(state_, &EditorState::selectionChanged, this, [this] {
+        if (!state_->selectedClips().empty()) gap_.reset();
+        viewport()->update();
+    });
     connect(state_, &EditorState::playheadChanged, viewport(), qOverload<>(&QWidget::update));
     connect(state_, &EditorState::sequenceSwitched, this, [this] {
+        duplicatesDirty_ = throughDirty_ = syncDirty_ = true;
         horizontalScrollBar()->setValue(0);
         zoomToFit();
     });
@@ -112,40 +163,128 @@ void TimelineWidget::setTool(Tool t) {
 // ---------------------------------------------------------------------------
 // Geometry
 
+int TimelineWidget::captionLanesHeight() const {
+    const Sequence* s = state_->sequence();
+    return s ? int(s->captionTracks.size()) * kCaptionH : 0;
+}
+
+void TimelineWidget::layoutRows(std::vector<Row>* rowsOut, std::vector<FolderRow>* foldersOut, int* divider, int* bottom) const {
+    const Sequence* s = state_->sequence();
+    int y = kRulerH - verticalScrollBar()->value() + captionLanesHeight();
+    if (!s) {
+        if (divider) *divider = y;
+        if (bottom) *bottom = y + kDividerH;
+        return;
+    }
+    // Video tracks top-down (V1 nearest the divider), audio tracks downwards; a run of tracks in one folder goes
+    // under its header, hidden while the folder is collapsed.
+    auto lay = [&](TrackKind kind, const std::vector<Track>& tracks, bool topDown) {
+        const int n = int(tracks.size());
+        auto at = [&](int k) { return topDown ? n - 1 - k : k; };
+        for (int k = 0; k < n;) {
+            const Track& t = tracks[size_t(at(k))];
+            if (t.folder.empty()) {
+                if (rowsOut) rowsOut->push_back({{kind, at(k)}, y, trackHeight(t)});
+                y += trackHeight(t);
+                ++k;
+                continue;
+            }
+            FolderRow f{kind, t.folder, y, kFolderH, edit::folderCollapsed(*s, kind, t.folder), {}};
+            for (; k < n && tracks[size_t(at(k))].folder == t.folder; ++k) f.tracks.push_back(at(k));
+            y += kFolderH;
+            if (!f.collapsed)
+                for (int i : f.tracks) {
+                    if (rowsOut) rowsOut->push_back({{kind, i}, y, trackHeight(tracks[size_t(i)])});
+                    y += trackHeight(tracks[size_t(i)]);
+                }
+            if (foldersOut) foldersOut->push_back(std::move(f));
+        }
+    };
+    lay(TrackKind::Video, s->videoTracks, true);
+    if (divider) *divider = y;
+    y += kDividerH;
+    lay(TrackKind::Audio, s->audioTracks, false);
+    if (bottom) *bottom = y;
+}
+
 std::vector<TimelineWidget::Row> TimelineWidget::rows() const {
     std::vector<Row> out;
-    const Sequence* s = state_->sequence();
-    if (!s) return out;
-    int y = kRulerH - verticalScrollBar()->value();
-    for (int i = int(s->videoTracks.size()) - 1; i >= 0; --i) {
-        int h = trackHeight(s->videoTracks[size_t(i)]);
-        out.push_back({{TrackKind::Video, i}, y, h});
-        y += h;
-    }
-    y += kDividerH;
-    for (int i = 0; i < int(s->audioTracks.size()); ++i) {
-        int h = trackHeight(s->audioTracks[size_t(i)]);
-        out.push_back({{TrackKind::Audio, i}, y, h});
-        y += h;
-    }
+    layoutRows(&out, nullptr, nullptr, nullptr);
     return out;
 }
 
+std::vector<TimelineWidget::FolderRow> TimelineWidget::folderRows() const {
+    std::vector<FolderRow> out;
+    layoutRows(nullptr, &out, nullptr, nullptr);
+    return out;
+}
+
+std::optional<TimelineWidget::FolderRow> TimelineWidget::folderRowAt(int y) const {
+    for (const FolderRow& f : folderRows())
+        if (y >= f.y && y < f.y + f.h) return f;
+    return std::nullopt;
+}
+
 int TimelineWidget::contentHeight() const {
-    const Sequence* s = state_->sequence();
-    if (!s) return 0;
-    int h = kDividerH + 40;
-    for (const auto& t : s->videoTracks) h += trackHeight(t);
-    for (const auto& t : s->audioTracks) h += trackHeight(t);
-    return h;
+    if (!state_->sequence()) return 0;
+    int bottom = 0;
+    layoutRows(nullptr, nullptr, nullptr, &bottom);
+    return bottom - (kRulerH - verticalScrollBar()->value()) + 40;
 }
 
 int TimelineWidget::dividerY() const {
-    const Sequence* s = state_->sequence();
-    int y = kRulerH - verticalScrollBar()->value();
-    if (s)
-        for (const auto& t : s->videoTracks) y += trackHeight(t);
+    int y = 0;
+    layoutRows(nullptr, nullptr, &y, nullptr);
     return y;
+}
+
+QRect TimelineWidget::folderHeaderRect(TrackKind kind, const QString& folder) const {
+    for (const FolderRow& f : folderRows())
+        if (f.kind == kind && f.name == folder.toStdString()) return QRect(0, f.y, kHeaderW, f.h);
+    return {};
+}
+
+void TimelineWidget::toggleFolder(TrackKind kind, const QString& folder) {
+    const std::string name = folder.toStdString();
+    const Sequence* s = state_->sequence();
+    if (!s || edit::folderTracks(*s, kind, name).empty()) return;
+    const bool collapse = !edit::folderCollapsed(*s, kind, name);
+    state_->edit(collapse ? tr("Collapse Folder") : tr("Expand Folder"), [kind, name, collapse](Project&, Sequence& sq) {
+        edit::setFolderCollapsed(sq, kind, name, collapse);
+        return true;
+    });
+}
+
+bool TimelineWidget::selectGapAt(TrackRef track, FrameTime frame) {
+    const Sequence* s = state_->sequence();
+    const Track* t = s ? trackAt(*s, track) : nullptr;
+    gap_.reset();
+    if (!t || frame < 0) {
+        viewport()->update();
+        return false;
+    }
+    FrameTime from = 0;
+    for (const Clip& c : t->clips) {
+        if (c.contains(frame)) break;  // on a clip, not a gap
+        if (c.start > frame) {
+            if (c.start > from) gap_ = Gap{track, from, c.start};
+            break;
+        }
+        from = c.end();
+    }
+    viewport()->update();
+    return gap_.has_value();
+}
+
+void TimelineWidget::clearGap() {
+    gap_.reset();
+    viewport()->update();
+}
+
+bool TimelineWidget::trackShown(TrackRef ref) const {
+    for (const Row& r : rows())
+        if (r.ref == ref) return true;
+    return false;
 }
 
 std::optional<TimelineWidget::Row> TimelineWidget::rowAt(int y) const {
@@ -245,6 +384,41 @@ TimelineWidget::Hit TimelineWidget::hitTest(const QPoint& pos) const {
         h.kind = pos.x() >= kHeaderW ? HitKind::Ruler : HitKind::None;
         return h;
     }
+    // Caption lanes, above the video tracks.
+    const int lanesTop = kRulerH - verticalScrollBar()->value();
+    if (pos.y() >= lanesTop && pos.y() < lanesTop + captionLanesHeight()) {
+        const CaptionTrack& ct = s->captionTracks[size_t((pos.y() - lanesTop) / kCaptionH)];
+        h.captionTrack = ct.id;
+        if (pos.x() < kHeaderW) return h;
+        h.kind = HitKind::CaptionLane;
+        for (size_t i = 0; i < ct.captions.size(); ++i) {
+            const int xs = xForFrame(ct.captions[i].start), xe = xForFrame(ct.captions[i].end);
+            if (pos.x() < xs - 4 || pos.x() > xe + 4) continue;
+            h.caption = int(i);
+            h.kind = std::abs(pos.x() - xs) <= 4 && xe - xs > 12   ? HitKind::CaptionIn
+                     : std::abs(pos.x() - xe) <= 4 && xe - xs > 12 ? HitKind::CaptionOut
+                     : pos.x() >= xs && pos.x() <= xe              ? HitKind::Caption
+                                                                   : HitKind::CaptionLane;
+            if (h.kind != HitKind::CaptionLane) break;
+            h.caption = -1;
+        }
+        return h;
+    }
+    if (const auto f = folderRowAt(pos.y())) {
+        // A track folder's header: its arrow opens or closes it, its buttons act on all its tracks.
+        h.folder = f->name;
+        h.folderKind = f->kind;
+        if (pos.x() >= kHeaderW) return h;
+        h.kind = HitKind::Header;
+        const Row fake{{f->kind, 0}, f->y, f->h};
+        const bool video = f->kind == TrackKind::Video;
+        if (pos.x() < 26) h.button = HeaderButton::Folder;
+        else if (video && headerButtonRect(fake, HeaderButton::Visible).contains(pos)) h.button = HeaderButton::Visible;
+        else if (!video && headerButtonRect(fake, HeaderButton::Solo).contains(pos)) h.button = HeaderButton::Solo;
+        else if (!video && headerButtonRect(fake, HeaderButton::Mute).contains(pos)) h.button = HeaderButton::Mute;
+        else h.button = HeaderButton::Folder;  // the name opens or closes it too
+        return h;
+    }
     auto row = rowAt(pos.y());
     if (!row) {
         h.kind = pos.x() >= kHeaderW ? HitKind::Body : HitKind::None;
@@ -283,6 +457,21 @@ TimelineWidget::Hit TimelineWidget::hitTest(const QPoint& pos) const {
         FrameTime a, b;
         if (!edit::transitionRange(*t, tr, a, b)) continue;
         int xa = xForFrame(a), xb = xForFrame(b);
+        // Its edges drag its length (Premiere 26): a dissolve's either side, a fade's side away from the cut.
+        if (pos.y() >= row->y + row->h / 2 && xb - xa >= 8) {
+            const bool left = tr.clipA != 0, right = tr.clipB != 0;  // a fade-out's cut is its end, a fade-in's its start
+            if (left && std::abs(pos.x() - xa) <= 3) {
+                h.kind = HitKind::TransitionEdge;
+                h.transition = tr.id;
+                return h;
+            }
+            if (right && std::abs(pos.x() - xb) <= 3) {
+                h.kind = HitKind::TransitionEdge;
+                h.transition = tr.id;
+                h.rightEdge = true;
+                return h;
+            }
+        }
         if (pos.x() >= xa && pos.x() <= xb && pos.y() >= row->y + row->h / 2) {
             h.kind = HitKind::Transition;
             h.transition = tr.id;
@@ -371,6 +560,7 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
             QRect cr(xs, r.y + 1, std::max(2, xe - xs), r.h - 3);
             paintClip(p, r, c, cr);
         }
+        if (showTrackAuto_ && r.ref.kind == TrackKind::Audio) paintTrackLane(p, r, *t);
         for (const auto& tr : t->transitions) {
             FrameTime a, b;
             if (!edit::transitionRange(*t, tr, a, b)) continue;
@@ -400,6 +590,31 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
             }
         }
     }
+    for (const FolderRow& f : folderRows()) paintFolderRow(p, f, false);
+    if (gap_)
+        for (const Row& r : rs)
+            if (r.ref == gap_->track) {
+                const QRect gr(xForFrame(gap_->from), r.y + 2, std::max(2, xForFrame(gap_->to) - xForFrame(gap_->from)), r.h - 5);
+                p.fillRect(gr, QColor(61, 139, 255, 70));
+                p.setPen(QPen(theme::kAccent, 1, Qt::DashLine));
+                p.setBrush(Qt::NoBrush);
+                p.drawRect(gr.adjusted(0, 0, -1, -1));
+            }
+    // Trim mode: a bracket on each side being trimmed, ']' on the outgoing clip's end, '[' on the incoming clip's start.
+    if (trimSide_ >= 0) {
+        p.setPen(QPen(QColor(255, 70, 70), 3));
+        auto bracket = [&](Id id, bool outgoing) {
+            QRect r;
+            if (!id || !clipRect(id, r)) return;
+            const int x = outgoing ? r.right() - 1 : r.left() + 1, arm = outgoing ? -7 : 7;
+            p.drawLine(x, r.top() + 1, x, r.bottom() - 1);
+            p.drawLine(x, r.top() + 1, x + arm, r.top() + 1);
+            p.drawLine(x, r.bottom() - 1, x + arm, r.bottom() - 1);
+        };
+        if (trimSide_ != 2) bracket(trimOut_, true);
+        if (trimSide_ != 1) bracket(trimIn_, false);
+    }
+    paintCaptionLanes(p);
     // Divider between video and audio.
     int dy = dividerY();
     p.fillRect(QRect(kHeaderW, dy, W - kHeaderW, kDividerH), QColor(0x14, 0x15, 0x18));
@@ -446,9 +661,43 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
     }
 }
 
+void TimelineWidget::paintCaptionLanes(QPainter& p) {
+    const Sequence* s = state_->sequence();
+    const int W = viewport()->width();
+    int y = kRulerH - verticalScrollBar()->value();
+    QFont f = p.font();
+    f.setPointSize(8);
+    p.setFont(f);
+    for (const CaptionTrack& ct : s->captionTracks) {
+        p.fillRect(QRect(kHeaderW, y, W - kHeaderW, kCaptionH), theme::kPanel.darker(118));
+        p.setPen(QColor(0, 0, 0, 90));
+        p.drawLine(kHeaderW, y + kCaptionH - 1, W, y + kCaptionH - 1);
+        const QColor fill = ct.visible ? QColor(0xc9, 0xa2, 0x27) : QColor(0x6b, 0x62, 0x48);
+        for (size_t i = 0; i < ct.captions.size(); ++i) {
+            const Caption& c = ct.captions[i];
+            const int xs = xForFrame(c.start), xe = xForFrame(c.end);
+            if (xe < kHeaderW || xs > W) continue;
+            const QRect r(xs, y + 2, std::max(2, xe - xs), kCaptionH - 5);
+            const bool sel = ct.id == selectedCaptionTrack_ && int(i) == selectedCaption_;
+            p.setPen(sel ? QPen(Qt::white, 1.5) : QPen(fill.darker(150), 1));
+            p.setBrush(fill.darker(sel ? 100 : 115));
+            p.drawRoundedRect(r, 3, 3);
+            if (r.width() > 16) {
+                p.setPen(QColor(20, 18, 10));
+                QString text = QString::fromStdString(c.text);
+                text.replace('\n', ' ');
+                p.drawText(r.adjusted(4, 0, -3, 0), Qt::AlignVCenter | Qt::AlignLeft,
+                           p.fontMetrics().elidedText(text, Qt::ElideRight, r.width() - 7));
+            }
+        }
+        y += kCaptionH;
+    }
+}
+
 void TimelineWidget::paintClip(QPainter& p, const Row& row, const Clip& c, const QRect& r) {
     const Project& proj = state_->project();
-    QColor base = clipColor(proj, c, row.ref.kind);
+    // Offline media in red, as the other editors show it.
+    QColor base = state_->isMediaOffline(c.mediaId) ? QColor(0x9a, 0x1c, 0x1c) : clipColor(proj, c, row.ref.kind);
     bool sel = state_->isSelected(c.id);
     p.setPen(Qt::NoPen);
     p.setBrush(sel ? base.lighter(125) : base);
@@ -463,7 +712,7 @@ void TimelineWidget::paintClip(QPainter& p, const Row& row, const Clip& c, const
                                               float(std::clamp(c.generator.p("color.g", 0), 0.0, 1.0)),
                                               float(std::clamp(c.generator.p("color.b", 0), 0.0, 1.0)));
                 p.fillRect(body.adjusted(2, 0, -2, -2), col);
-            } else if (c.generator.type == "title" && body.height() > 10) {
+            } else if (c.generator.type.rfind("title", 0) == 0 && body.height() > 10) {
                 p.setPen(QColor(255, 255, 255, 200));
                 QFont f = p.font();
                 f.setPointSize(8);
@@ -483,18 +732,70 @@ void TimelineWidget::paintClip(QPainter& p, const Row& row, const Clip& c, const
         p.setPen(QPen(QColor(0, 0, 0, 60), 1));
         for (int x = r.left() - r.height(); x < r.right(); x += 8) p.drawLine(x, r.bottom(), x + r.height(), r.top());
     }
+    paintLane(p, c, row.ref.kind, r);
+    if (isThroughEdit(c.id)) {
+        // A through edit (the picture or sound runs straight on): a small arrowhead into the cut, as Premiere marks it.
+        const int x = r.right() - 1, y = r.top() + kNameStrip + 2;
+        p.setPen(Qt::NoPen);
+        p.setBrush(QColor(255, 255, 255, 210));
+        p.drawPolygon(QPolygon({QPoint(x - 5, y), QPoint(x, y + 4), QPoint(x - 5, y + 8)}));
+    }
+    if (showDuplicates_ && row.ref.kind == TrackKind::Video) {
+        // Duplicate frame markers: a stripe in one colour per file under the frames used again elsewhere.
+        static const QColor kDup[] = {QColor(0xff, 0x5c, 0x8a), QColor(0x4c, 0xd9, 0xff), QColor(0xff, 0xc8, 0x3c),
+                                      QColor(0x9c, 0xff, 0x5c), QColor(0xc0, 0x7c, 0xff), QColor(0xff, 0x8c, 0x3c)};
+        for (const edit::DuplicateSpan& d : duplicateSpans(c.id)) {
+            const int x0 = std::max(r.left(), xForFrame(d.from)), x1 = std::min(r.right(), xForFrame(d.to));
+            if (x1 > x0) p.fillRect(QRect(x0, r.bottom() - 4, x1 - x0, 4), kDup[size_t(d.group) % std::size(kDup)]);
+        }
+    }
     // Name strip with badges.
     p.fillRect(QRect(r.left(), r.top(), r.width(), kNameStrip), QColor(0, 0, 0, 70));
     QString badges;
     if (c.speed != 1.0 || c.reverse) badges += QString(" %1%2%").arg(c.reverse ? "-" : "").arg(c.speed * 100, 0, 'f', 0);
+    if (c.ramped()) badges += tr(" ramp");
     if (!c.effects.empty()) badges += " fx";
+    if (!c.takes.empty()) badges += tr(" take %1/%2").arg(c.take + 1).arg(c.takes.size());  // an audition
+    if (!c.channels.empty() && row.ref.kind == TrackKind::Audio)  // the source channels it plays, unless its name says
+        if (const MediaItem* m = proj.findMedia(c.mediaId)) {
+            const std::string label = channelsLabel(*m, c.channels);
+            if (c.name.find(label) == std::string::npos) badges += QStringLiteral(" ") + QString::fromStdString(label);
+        }
+    if (!c.role.empty() && row.ref.kind == TrackKind::Audio && state_->sequence())  // its audio role, and if it is muted
+        badges.prepend(QStringLiteral(" ") + QString::fromStdString(c.role) +
+                       (edit::roleMuted(*state_->sequence(), c.role) ? tr(" (muted)") : QString()));
+    if (showDurations_ && state_->sequence())  // Resolve 21.1's clip durations view option
+        badges += QStringLiteral("  ") + QString::fromStdString(formatTimecode(c.duration, state_->sequence()->fps));
     QFont f = p.font();
     f.setPointSize(8);
     p.setFont(f);
     p.setPen(theme::kText);
     QRect nameR = r.adjusted(5, 1, -4, 0);
     nameR.setHeight(kNameStrip - 2);
-    QString name = QString::fromStdString(c.name);
+    QString name = QString::fromStdString(c.name).replace('\n', ' ');  // a title's lines on one
+    if (const Sequence* mc = multicamSequence(proj, c)) {
+        // Multicam: the angle (or audio source) this part plays.
+        if (row.ref.kind == TrackKind::Video) {
+            const int a = std::clamp(c.angle, 0, std::max(0, int(mc->videoTracks.size()) - 1));
+            name = QStringLiteral("[%1] %2").arg(a + 1).arg(mc->videoTracks.empty() ? QString() : QString::fromStdString(mc->videoTracks[size_t(a)].name));
+        } else if (c.audioAngle >= 0 && c.audioAngle < int(mc->audioTracks.size())) {
+            name = QStringLiteral("[%1] %2").arg(QString::fromStdString(mc->audioTracks[size_t(c.audioAngle)].name), name);
+        }
+    }
+    if (const double off = syncOffsetOf(c.id); off != 0) {
+        // Out of sync: the frames it is off by in a red box at the head of the name, as Premiere and Avid mark it.
+        const double a = std::fabs(off);
+        const QString text = QStringLiteral("%1%2").arg(off > 0 ? "+" : "-").arg(a, 0, 'f', std::fabs(a - std::round(a)) < 0.05 ? 0 : 1);
+        const int w = p.fontMetrics().horizontalAdvance(text) + 6;
+        if (nameR.width() > w + 10) {
+            const QRect box(nameR.left(), nameR.top() + 1, w, nameR.height() - 1);
+            p.fillRect(box, QColor(0xd0, 0x20, 0x20));
+            p.setPen(Qt::white);
+            p.drawText(box, Qt::AlignCenter, text);
+            p.setPen(theme::kText);
+            nameR.setLeft(box.right() + 4);
+        }
+    }
     if (!badges.isEmpty()) {
         int bw = p.fontMetrics().horizontalAdvance(badges);
         if (nameR.width() > bw + 30) {
@@ -533,6 +834,21 @@ void TimelineWidget::paintClip(QPainter& p, const Row& row, const Clip& c, const
             p.drawPolygon(d);
         }
     }
+    // Clip markers: small flags hanging from the top edge, where the clip shows their moment.
+    for (const Marker& m : c.markers) {
+        const FrameTime f = c.markerFrame(m);
+        if (f < 0) continue;
+        const int x = xForFrame(f);
+        QColor col = theme::labelColor(m.color);
+        if (!col.isValid()) col = m.chapter ? QColor(255, 149, 0) : QColor(126, 211, 33);
+        QPolygon flag;
+        flag << QPoint(x - 4, r.top() + 1) << QPoint(x + 4, r.top() + 1) << QPoint(x + 4, r.top() + 5) << QPoint(x, r.top() + 9)
+             << QPoint(x - 4, r.top() + 5);
+        p.setPen(QPen(QColor(0, 0, 0, 150), 1));
+        p.setBrush(col);
+        p.drawPolygon(flag);
+        if (m.duration > 0) p.fillRect(QRect(x, r.top() + 1, std::max(1, xForFrame(f + m.duration) - x), 2), col);
+    }
     p.restore();
     if (sel) {
         p.setPen(QPen(theme::kSelection, 2));
@@ -542,6 +858,441 @@ void TimelineWidget::paintClip(QPainter& p, const Row& row, const Clip& c, const
         p.setPen(QPen(base.darker(150), 1));
         p.setBrush(Qt::NoBrush);
         p.drawRoundedRect(r, 3, 3);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lines over clips: volume on audio clips, opacity on video clips
+
+void TimelineWidget::setShowVolumeLines(bool on) {
+    showVolume_ = on;
+    viewport()->update();
+}
+
+void TimelineWidget::setTrimEdit(Id outgoing, Id incoming, int side) {
+    trimOut_ = outgoing, trimIn_ = incoming, trimSide_ = side;
+    viewport()->update();
+}
+
+void TimelineWidget::clearTrimEdit() {
+    trimSide_ = -1;
+    viewport()->update();
+}
+
+void TimelineWidget::setShowClipDurations(bool on) {
+    showDurations_ = on;
+    viewport()->update();
+}
+
+void TimelineWidget::setNormalizeWaveforms(bool on) {
+    normalizeWaves_ = on;
+    clipPeaks_.clear();
+    viewport()->update();
+}
+
+double TimelineWidget::waveformScale(const Clip& c) const {
+    if (!normalizeWaves_) return std::pow(10.0, c.audio.p("gain_db", 0, 0) / 20.0);
+    const Sequence* s = state_->sequence();
+    const MediaItem* m = state_->project().findMedia(c.mediaId);
+    if (!s || !m) return 0;
+    if (auto it = clipPeaks_.find(c.id); it != clipPeaks_.end()) return it->second > 0 ? 1.0 / it->second : 0;
+    const PeaksPtr pk = MediaPool::instance().peaksIfReady(audioKey(m->path, c.channels));
+    if (!pk || pk->minmax.empty()) return 0;  // not cached: tried again once the peaks are read
+    // The loudest sample over the stretch of source the clip plays.
+    const double fps = s->fpsValue(), perBucket = pk->samplesPerBucket;
+    double a = c.sourceFrameAt(c.start) / fps * pk->sampleRate / perBucket, b = c.sourceFrameAt(c.end() - 1) / fps * pk->sampleRate / perBucket;
+    if (a > b) std::swap(a, b);
+    const size_t buckets = pk->minmax.size() / 2, first = size_t(std::max(0.0, a)), last = std::min(buckets, size_t(std::max(0.0, b)) + 2);
+    float peak = 0;
+    for (size_t i = first; i < last; ++i) peak = std::max({peak, std::fabs(pk->minmax[i * 2]), std::fabs(pk->minmax[i * 2 + 1])});
+    clipPeaks_[c.id] = peak;
+    return peak > 0 ? 1.0 / peak : 0;
+}
+
+void TimelineWidget::setShowDuplicateFrames(bool on) {
+    showDuplicates_ = on;
+    duplicatesDirty_ = true;
+    viewport()->update();
+}
+
+const std::vector<edit::DuplicateSpan>& TimelineWidget::duplicateSpans(Id clip) const {
+    static const std::vector<edit::DuplicateSpan> none;
+    if (duplicatesDirty_) {
+        duplicates_ = state_->sequence() ? edit::duplicateFrames(*state_->sequence()) : decltype(duplicates_){};
+        duplicatesDirty_ = false;
+    }
+    const auto it = duplicates_.find(clip);
+    return it == duplicates_.end() ? none : it->second;
+}
+
+bool TimelineWidget::isThroughEdit(Id clip) const {
+    if (throughDirty_) {
+        through_ = state_->sequence() ? edit::throughEdits(*state_->sequence()) : std::vector<Id>{};
+        throughDirty_ = false;
+    }
+    return std::find(through_.begin(), through_.end(), clip) != through_.end();
+}
+
+double TimelineWidget::syncOffsetOf(Id clip) const {
+    if (syncDirty_) {
+        sync_.clear();
+        if (state_->sequence())
+            for (const edit::SyncOffset& o : edit::syncOffsets(*state_->sequence())) sync_[o.clip] = o.frames;
+        syncDirty_ = false;
+    }
+    const auto it = sync_.find(clip);
+    return it == sync_.end() ? 0 : it->second;
+}
+
+void TimelineWidget::setShowTrackAutomation(bool on) {
+    showTrackAuto_ = on;
+    viewport()->update();
+}
+
+// A track's volume lane, on the same scale as clip volume lines.
+const TimelineWidget::Lane& TimelineWidget::trackVolumeLane() {
+    static const Lane lane{nullptr, "volume", 0.0, kGainLineMinDb, kGainLineMaxDb, true};
+    return lane;
+}
+
+namespace {
+double trackLaneValue(const Track& t, FrameTime f) { return t.volumeAuto.animated() ? t.volumeAuto.at(f) : t.volumeDb; }
+}  // namespace
+
+QRect TimelineWidget::trackLaneBand(const Row& row) const {
+    const QRect band(kHeaderW + 1, row.y + 5, viewport()->width() - kHeaderW - 2, row.h - 11);
+    return band.height() >= 8 ? band : QRect();
+}
+
+QPoint TimelineWidget::trackLanePoint(int index, FrameTime f) const {
+    const Sequence* s = state_->sequence();
+    if (!showTrackAuto_ || !s || index < 0 || index >= int(s->audioTracks.size())) return {-1, -1};
+    for (const Row& row : rows())
+        if (row.ref == TrackRef{TrackKind::Audio, index}) {
+            const QRect band = trackLaneBand(row);
+            if (band.isNull()) return {-1, -1};
+            return {xForFrame(f), laneY(trackVolumeLane(), band, trackLaneValue(s->audioTracks[size_t(index)], f))};
+        }
+    return {-1, -1};
+}
+
+std::optional<TimelineWidget::TrackLaneHit> TimelineWidget::trackLaneHit(const QPoint& pos) const {
+    const Sequence* s = state_->sequence();
+    if (!showTrackAuto_ || !s || pos.x() < kHeaderW) return std::nullopt;
+    const auto row = rowAt(pos.y());
+    if (!row || row->ref.kind != TrackKind::Audio) return std::nullopt;
+    const QRect band = trackLaneBand(*row);
+    if (band.isNull()) return std::nullopt;
+    const Track& t = s->audioTracks.at(size_t(row->ref.index));
+    TrackLaneHit h;
+    h.track = row->ref.index;
+    for (const Keyframe& k : t.volumeAuto.keys)
+        if (std::abs(pos.x() - xForFrame(k.t)) <= 4 && std::abs(pos.y() - laneY(trackVolumeLane(), band, k.v)) <= 4) {
+            h.key = h.frame = k.t;
+            return h;
+        }
+    h.frame = std::max<FrameTime>(0, FrameTime(std::floor(frameAtX(pos.x()))));
+    h.onLine = std::abs(pos.y() - laneY(trackVolumeLane(), band, trackLaneValue(t, h.frame))) <= 3;
+    return h;
+}
+
+void TimelineWidget::paintTrackLane(QPainter& p, const Row& row, const Track& t) {
+    const QRect band = trackLaneBand(row);
+    if (band.isNull()) return;
+    const Lane& lane = trackVolumeLane();
+    const int x0 = band.left(), x1 = band.right();
+    std::vector<int> xs;
+    for (int x = x0; x <= x1; x += 2) xs.push_back(x);
+    for (const Keyframe& k : t.volumeAuto.keys)
+        if (const int kx = xForFrame(k.t); kx > x0 && kx < x1) xs.push_back(kx);
+    std::sort(xs.begin(), xs.end());
+    QPolygonF line;
+    for (int x : xs) line << QPointF(x, laneY(lane, band, trackLaneValue(t, std::max<FrameTime>(0, FrameTime(std::floor(frameAtX(x)))))));
+    // Heard in Read, Latch and Touch; dimmed when the mode ignores it, dashed while it is only the fader's level.
+    const AutomationMode m = trackAutomation(t);
+    const bool heard = m == AutomationMode::Read || m == AutomationMode::Latch || m == AutomationMode::Touch;
+    QColor col(84, 200, 255, heard ? 230 : 110);
+    p.save();
+    p.setRenderHint(QPainter::Antialiasing);
+    QPen pen(col, 1.5);
+    if (!t.volumeAuto.animated()) pen.setStyle(Qt::DashLine);
+    p.setPen(pen);
+    p.setBrush(Qt::NoBrush);
+    p.drawPolyline(line);
+    p.setPen(QPen(QColor(0, 0, 0, 160), 1));
+    p.setBrush(col);
+    for (const Keyframe& k : t.volumeAuto.keys) {
+        const QPointF at(xForFrame(k.t), laneY(lane, band, k.v));
+        if (at.x() < x0 - 4 || at.x() > x1 + 4) continue;
+        QPolygonF d;
+        d << at + QPointF(0, -4) << at + QPointF(4, 0) << at + QPointF(0, 4) << at + QPointF(-4, 0);
+        p.drawPolygon(d);
+    }
+    p.setPen(col);
+    QFont f = p.font();
+    f.setPointSize(7);
+    p.setFont(f);
+    p.drawText(QRect(band.left() + 4, row.y + 1, 120, 12), Qt::AlignLeft | Qt::AlignTop,
+               tr("Volume · %1").arg(tr(automationModeName(m))));
+    p.restore();
+}
+
+bool TimelineWidget::beginTrackLaneDrag(QMouseEvent* e, const TrackLaneHit& h) {
+    const bool add = e->modifiers() & (Qt::ControlModifier | Qt::MetaModifier);
+    const bool alt = e->modifiers() & Qt::AltModifier;
+    const int ti = h.track;
+    drag_.track = ti;
+    if (h.key >= 0) {
+        const FrameTime key = h.key;
+        if (alt) {
+            state_->edit(tr("Delete Automation Point"), [ti, key](Project&, Sequence& s) {
+                return ti < int(s.audioTracks.size()) && s.audioTracks[size_t(ti)].volumeAuto.removeKey(key);
+            });
+            drag_ = DragState{};
+            return true;
+        }
+        drag_.kind = DragKind::TrackKey;
+        drag_.key = key;
+        return true;
+    }
+    if (add) {
+        const FrameTime f = h.frame;
+        state_->edit(tr("Add Automation Point"), [ti, f](Project&, Sequence& s) {
+            if (ti >= int(s.audioTracks.size())) return false;
+            Track& t = s.audioTracks[size_t(ti)];
+            if (t.volumeAuto.keyAt(f)) return false;
+            t.volumeAuto.addKey(f, trackLaneValue(t, f));
+            return true;
+        });
+        drag_.kind = DragKind::TrackKey;
+        drag_.key = f;
+        return true;
+    }
+    drag_.kind = DragKind::TrackLine;
+    drag_.key = h.frame;
+    return true;
+}
+
+void TimelineWidget::setShowOpacityLines(bool on) {
+    showOpacity_ = on;
+    viewport()->update();
+}
+
+std::optional<TimelineWidget::Lane> TimelineWidget::laneFor(const Clip&, TrackKind kind) const {
+    if (kind == TrackKind::Audio) {
+        if (!showVolume_ || showTrackAuto_) return std::nullopt;
+        return Lane{&Clip::audio, "gain_db", 0.0, kGainLineMinDb, kGainLineMaxDb, true};
+    }
+    if (!showOpacity_) return std::nullopt;
+    return Lane{&Clip::motion, "opacity", 100.0, 0.0, 100.0, false};
+}
+
+QRect TimelineWidget::laneBand(const QRect& clipRect) {
+    const QRect band = clipRect.adjusted(2, kNameStrip + 3, -2, -4);
+    return band.height() >= 10 && band.width() >= 4 ? band : QRect();
+}
+
+int TimelineWidget::laneY(const Lane& lane, const QRect& band, double v) {
+    const double level = lane.gain ? gainToLevel(v) : std::clamp((v - lane.lo) / (lane.hi - lane.lo), 0.0, 1.0);
+    return band.top() + int(std::lround((1.0 - level) * (band.height() - 1)));
+}
+
+double TimelineWidget::laneValue(const Lane& lane, const QRect& band, int y) {
+    const double level = std::clamp(double(band.bottom() - y) / std::max(1, band.height() - 1), 0.0, 1.0);
+    return lane.gain ? levelToGain(level) : lane.lo + level * (lane.hi - lane.lo);
+}
+
+bool TimelineWidget::clipRect(Id clip, QRect& r, TrackKind* kind) const {
+    const Sequence* s = state_->sequence();
+    if (!s) return false;
+    for (const Row& row : rows()) {
+        const Track* t = trackAt(*s, row.ref);
+        for (const Clip& c : t->clips)
+            if (c.id == clip) {
+                const int xs = xForFrame(c.start), xe = xForFrame(c.end());
+                r = QRect(xs, row.y + 1, std::max(2, xe - xs), row.h - 3);
+                if (kind) *kind = row.ref.kind;
+                return true;
+            }
+    }
+    return false;
+}
+
+bool TimelineWidget::laneOf(Id clip, Lane& lane, QRect& band) const {
+    QRect r;
+    TrackKind kind;
+    const Clip* c = state_->sequence() ? edit::clipById(*state_->sequence(), clip) : nullptr;
+    if (!c || !clipRect(clip, r, &kind)) return false;
+    const auto l = laneFor(*c, kind);
+    if (!l) return false;
+    lane = *l;
+    band = laneBand(r);
+    return !band.isNull();
+}
+
+QRect TimelineWidget::lineBand(Id clip) const {
+    Lane lane{};
+    QRect band;
+    return laneOf(clip, lane, band) ? band : QRect();
+}
+
+int TimelineWidget::lineY(Id clip, FrameTime local) const {
+    Lane lane{};
+    QRect band;
+    const Clip* c = state_->sequence() ? edit::clipById(*state_->sequence(), clip) : nullptr;
+    if (!c || !laneOf(clip, lane, band)) return -1;
+    return laneY(lane, band, laneAt(*c, lane, local));
+}
+
+std::optional<TimelineWidget::LaneHit> TimelineWidget::laneHit(const QPoint& pos) const {
+    const Sequence* s = state_->sequence();
+    const auto row = rowAt(pos.y());
+    if (!s || !row || pos.x() < kHeaderW) return std::nullopt;
+    const Track* t = trackAt(*s, row->ref);
+    for (const Clip& c : t->clips) {
+        const int xs = xForFrame(c.start), xe = xForFrame(c.end());
+        if (pos.x() < xs - 4 || pos.x() > xe + 4) continue;
+        const auto lane = laneFor(c, row->ref.kind);
+        if (!lane) continue;
+        const QRect band = laneBand(QRect(xs, row->y + 1, std::max(2, xe - xs), row->h - 3));
+        if (band.isNull() || pos.y() < band.top() - 5 || pos.y() > band.bottom() + 5) continue;
+        LaneHit h;
+        h.clip = c.id;
+        h.lane = *lane;
+        if (const Param* prm = laneParam(c, *lane))
+            for (const Keyframe& k : prm->keys) {
+                if (k.t < 0 || k.t >= c.duration) continue;
+                if (std::abs(pos.x() - xForFrame(c.start + k.t)) <= 4 && std::abs(pos.y() - laneY(*lane, band, k.v)) <= 4) {
+                    h.key = h.local = k.t;
+                    return h;
+                }
+            }
+        if (pos.x() < xs || pos.x() >= xe) continue;
+        h.local = std::clamp<FrameTime>(FrameTime(std::floor(frameAtX(pos.x()))) - c.start, 0, c.duration - 1);
+        h.onLine = std::abs(pos.y() - laneY(*lane, band, laneAt(c, *lane, h.local))) <= 3;
+        if (h.onLine) return h;
+    }
+    return std::nullopt;
+}
+
+void TimelineWidget::paintLane(QPainter& p, const Clip& c, TrackKind kind, const QRect& r) {
+    const auto lane = laneFor(c, kind);
+    if (!lane) return;
+    const QRect band = laneBand(r);
+    if (band.isNull()) return;
+    const Param* found = laneParam(c, *lane);
+    const Param prm = found ? *found : Param(lane->def);
+    const int x0 = std::max(r.left(), kHeaderW), x1 = std::min(r.right(), viewport()->width());
+    if (x1 <= x0) return;
+    // Sample the curve every two pixels and at each key.
+    std::vector<int> xs;
+    for (int x = x0; x <= x1; x += 2) xs.push_back(x);
+    for (const Keyframe& k : prm.keys)
+        if (const int kx = xForFrame(c.start + k.t); kx > x0 && kx < x1) xs.push_back(kx);
+    std::sort(xs.begin(), xs.end());
+    QPolygonF line;
+    for (int x : xs) {
+        const FrameTime t = std::clamp<FrameTime>(FrameTime(std::floor(frameAtX(x))) - c.start, 0, c.duration - 1);
+        line << QPointF(x, laneY(*lane, band, prm.at(t)));
+    }
+    const bool sel = state_->isSelected(c.id);
+    const QColor col = sel ? QColor(255, 222, 96) : QColor(236, 200, 92, 210);
+    p.save();
+    p.setRenderHint(QPainter::Antialiasing);
+    p.setPen(QPen(col, 1.5));
+    p.setBrush(Qt::NoBrush);
+    p.drawPolyline(line);
+    p.setPen(QPen(QColor(0, 0, 0, 160), 1));
+    p.setBrush(col);
+    for (const Keyframe& k : prm.keys) {
+        if (k.t < 0 || k.t >= c.duration) continue;
+        const QPointF at(xForFrame(c.start + k.t), laneY(*lane, band, k.v));
+        QPolygonF d;
+        d << at + QPointF(0, -4) << at + QPointF(4, 0) << at + QPointF(0, 4) << at + QPointF(-4, 0);
+        p.drawPolygon(d);
+    }
+    p.restore();
+}
+
+bool TimelineWidget::beginLaneDrag(QMouseEvent* e, const LaneHit& h) {
+    const bool add = e->modifiers() & (Qt::ControlModifier | Qt::MetaModifier);
+    const bool alt = e->modifiers() & Qt::AltModifier;
+    const Id id = h.clip;
+    const Lane lane = h.lane;
+    if (!state_->isSelected(id)) state_->setSelection({id}, false);
+    drag_.clip = id;
+    if (h.key >= 0) {
+        const FrameTime key = h.key;
+        if (alt) {
+            state_->edit(tr("Delete Keyframe"), [id, lane, key](Project&, Sequence& s) {
+                Clip* c = edit::clipById(s, id);
+                return c && laneParamRef(*c, lane).removeKey(key);
+            });
+            drag_ = DragState{};
+            return true;
+        }
+        drag_.kind = DragKind::LineKey;
+        drag_.key = key;
+        return true;
+    }
+    if (add) {
+        // Ctrl/Cmd-click adds a key on the line; dragging on moves it.
+        const FrameTime t = h.local;
+        state_->edit(tr("Add Keyframe"), [id, lane, t](Project&, Sequence& s) {
+            Clip* c = edit::clipById(s, id);
+            if (!c) return false;
+            Param& prm = laneParamRef(*c, lane);
+            if (prm.keyAt(t)) return false;
+            Interp interp = Interp::Linear;
+            for (const Keyframe& k : prm.keys)
+                if (k.t < t) interp = k.interp;
+            prm.addKey(t, prm.at(t), interp);
+            return true;
+        });
+        drag_.kind = DragKind::LineKey;
+        drag_.key = t;
+        return true;
+    }
+    drag_.kind = DragKind::Line;
+    drag_.key = h.local;
+    return true;
+}
+
+void TimelineWidget::laneMenu(QMenu& menu, const LaneHit& h) {
+    const Id id = h.clip;
+    const Lane lane = h.lane;
+    const FrameTime key = h.key;
+    const Clip* c = edit::clipById(*state_->sequence(), id);
+    const Param* prm = c ? laneParam(*c, lane) : nullptr;
+    const Keyframe* k = prm ? prm->keyAt(key) : nullptr;
+    if (!k) return;
+    menu.addAction(tr("Delete Keyframe"), this, [this, id, lane, key] {
+        state_->edit(tr("Delete Keyframe"), [id, lane, key](Project&, Sequence& s) {
+            Clip* c = edit::clipById(s, id);
+            return c && laneParamRef(*c, lane).removeKey(key);
+        });
+    })->setObjectName(QStringLiteral("deleteKeyframe"));
+    menu.addSeparator();
+    const std::pair<Interp, QString> kinds[] = {{Interp::Linear, tr("Linear")},
+                                                {Interp::Hold, tr("Hold")},
+                                                {Interp::Smooth, tr("Smooth (Ease In and Out)")},
+                                                {Interp::Bezier, tr("Bezier")}};
+    for (const auto& [interp, name] : kinds) {
+        QAction* a = menu.addAction(name, this, [this, id, lane, key, interp = interp] {
+            state_->edit(tr("Keyframe Interpolation"), [id, lane, key, interp](Project&, Sequence& s) {
+                Clip* c = edit::clipById(s, id);
+                if (!c) return false;
+                for (Keyframe& k : laneParamRef(*c, lane).keys)
+                    if (k.t == key && k.interp != interp) {
+                        k.interp = interp;
+                        return true;
+                    }
+                return false;
+            });
+        });
+        a->setCheckable(true);
+        a->setChecked(k->interp == interp);
+        a->setData(int(interp));
     }
 }
 
@@ -577,7 +1328,7 @@ void TimelineWidget::paintWaveform(QPainter& p, const Clip& c, const QRect& r, c
     const Sequence* s = state_->sequence();
     const MediaItem* m = proj.findMedia(c.mediaId);
     if (!m || !s || r.height() < 6 || !m->hasAudio || m->kind == MediaKind::Sequence) return;
-    PeaksPtr pk = MediaPool::instance().peaksIfReady(m->path);
+    PeaksPtr pk = MediaPool::instance().peaksIfReady(audioKey(m->path, c.channels));
     if (!pk || pk->minmax.empty()) {
         p.setPen(QColor(255, 255, 255, 60));
         p.drawLine(r.left(), r.center().y(), r.right(), r.center().y());
@@ -587,7 +1338,7 @@ void TimelineWidget::paintWaveform(QPainter& p, const Clip& c, const QRect& r, c
     const double rate = pk->sampleRate;
     const size_t buckets = pk->minmax.size() / 2;
     int x0 = std::max(r.left(), kHeaderW), x1 = std::min(r.right(), viewport()->width());
-    double gain = std::pow(10.0, c.audio.p("gain_db", 0, 0) / 20.0);
+    const double gain = waveformScale(c);
     double mid = r.center().y(), half = r.height() / 2.0;
     p.setPen(col);
     for (int x = x0; x <= x1; ++x) {
@@ -608,6 +1359,11 @@ void TimelineWidget::paintWaveform(QPainter& p, const Clip& c, const QRect& r, c
         int y1 = int(mid - std::min(1.0, hi * gain) * half), y2 = int(mid - std::max(-1.0, lo * gain) * half);
         p.drawLine(x, y1, x, std::max(y1, y2));
     }
+}
+
+void TimelineWidget::setRenderedRanges(std::vector<std::pair<FrameTime, FrameTime>> ranges) {
+    rendered_ = std::move(ranges);
+    viewport()->update();
 }
 
 void TimelineWidget::paintRuler(QPainter& p) {
@@ -648,6 +1404,12 @@ void TimelineWidget::paintRuler(QPainter& p) {
             p.drawText(x + 3, 12, timecodeString(s, ft));
         }
     }
+    // Render bar: rendered previews in green along the foot of the ruler.
+    for (const auto& [a, b] : rendered_) {
+        const int xa = xForFrame(a), xb = xForFrame(b);
+        if (xb < kHeaderW || xa > W) continue;
+        p.fillRect(QRect(xa, kRulerH - 3, std::max(1, xb - xa), 2), QColor(63, 185, 80));
+    }
     // In/out band.
     if (s->inPoint >= 0 || s->outPoint >= 0) {
         int a = xForFrame(std::max<FrameTime>(0, s->inPoint));
@@ -658,9 +1420,13 @@ void TimelineWidget::paintRuler(QPainter& p) {
     for (const auto& m : s->markers) {
         int x = xForFrame(m.t);
         QColor col = theme::labelColor(m.color);
-        if (!col.isValid()) col = theme::kSnap;
+        if (!col.isValid()) col = m.chapter ? QColor(255, 149, 0) : theme::kSnap;
         QPolygon poly;
-        poly << QPoint(x - 5, 14) << QPoint(x + 5, 14) << QPoint(x + 5, 20) << QPoint(x, 25) << QPoint(x - 5, 20);
+        if (m.chapter)  // a flag: chapter markers stand apart from ordinary ones
+            poly << QPoint(x - 1, 12) << QPoint(x + 7, 12) << QPoint(x + 4, 16) << QPoint(x + 7, 20) << QPoint(x + 1, 20) << QPoint(x + 1, 25)
+                 << QPoint(x - 1, 25);
+        else
+            poly << QPoint(x - 5, 14) << QPoint(x + 5, 14) << QPoint(x + 5, 20) << QPoint(x, 25) << QPoint(x - 5, 20);
         p.setPen(Qt::NoPen);
         p.setBrush(col);
         p.drawPolygon(poly);
@@ -692,10 +1458,25 @@ void TimelineWidget::paintHeaders(QPainter& p, const std::vector<Row>& rs) {
         p.setPen(on ? Qt::white : theme::kTextDim);
         p.drawText(r, Qt::AlignCenter, text);
     };
+    {
+        int y = kRulerH - verticalScrollBar()->value();
+        for (const CaptionTrack& ct : s->captionTracks) {
+            QRect hr(0, y, kHeaderW, kCaptionH);
+            p.fillRect(hr, theme::kPanelAlt.darker(112));
+            p.setPen(QColor(0, 0, 0, 120));
+            p.drawLine(0, y + kCaptionH - 1, kHeaderW, y + kCaptionH - 1);
+            button(QRect(6, y + 4, 26, kCaptionH - 8), QStringLiteral("CC"), ct.visible, QColor(0xc9, 0xa2, 0x27));
+            p.setPen(ct.visible ? theme::kText : theme::kTextDim);
+            p.drawText(QRect(38, y, kHeaderW - 44, kCaptionH), Qt::AlignVCenter | Qt::AlignLeft,
+                       p.fontMetrics().elidedText(QString::fromStdString(ct.name), Qt::ElideRight, kHeaderW - 44));
+            y += kCaptionH;
+        }
+    }
     for (const Row& r : rs) {
         const Track* t = trackAt(*s, r.ref);
         QRect hr(0, r.y, kHeaderW, r.h);
         p.fillRect(hr, (r.ref.index % 2) ? theme::kPanelAlt : theme::kPanelAlt.darker(106));
+        if (!t->folder.empty()) p.fillRect(QRect(0, r.y, 3, r.h), QColor(0xd8, 0xa8, 0x5a));  // in a folder
         p.setPen(QColor(0, 0, 0, 120));
         p.drawLine(0, r.y + r.h - 1, kHeaderW, r.y + r.h - 1);
         bool video = r.ref.kind == TrackKind::Video;
@@ -716,6 +1497,23 @@ void TimelineWidget::paintHeaders(QPainter& p, const std::vector<Row>& rs) {
             p.drawText(info, Qt::AlignLeft | Qt::AlignVCenter, detail);
         }
     }
+    for (const FolderRow& f : folderRows()) {
+        paintFolderRow(p, f, true);
+        // Its buttons show the state of all its tracks (on when all are).
+        bool muted = !f.tracks.empty(), solo = !f.tracks.empty();
+        for (int i : f.tracks) {
+            const Track* t = trackAt(*s, {f.kind, i});
+            muted &= t->muted;
+            solo &= t->solo;
+        }
+        const Row fake{{f.kind, 0}, f.y, f.h};
+        if (f.kind == TrackKind::Video) {
+            button(headerButtonRect(fake, HeaderButton::Visible), muted ? QStringLiteral("—") : QStringLiteral("◉"), !muted, QColor(0x4a, 0x80, 0xc8));
+        } else {
+            button(headerButtonRect(fake, HeaderButton::Mute), QStringLiteral("M"), muted, QColor(0xc8, 0x46, 0x46));
+            button(headerButtonRect(fake, HeaderButton::Solo), QStringLiteral("S"), solo, QColor(0xd8, 0xc2, 0x3a));
+        }
+    }
     int dy = dividerY();
     p.fillRect(QRect(0, dy, kHeaderW, kDividerH), QColor(0x14, 0x15, 0x18));
     p.setPen(theme::kBorder);
@@ -723,10 +1521,83 @@ void TimelineWidget::paintHeaders(QPainter& p, const std::vector<Row>& rs) {
     p.restore();
 }
 
+void TimelineWidget::folderMenu(QMenu& menu, TrackKind kind, const std::string& folder) {
+    const Sequence* s = state_->sequence();
+    if (!s) return;
+    const QString name = QString::fromStdString(folder);
+    menu.addAction(edit::folderCollapsed(*s, kind, folder) ? tr("Expand Folder") : tr("Collapse Folder"), this,
+                   [this, kind, name] { toggleFolder(kind, name); });
+    menu.addAction(tr("Rename Folder..."), this, [this, kind, folder, name] {
+        bool ok = false;
+        const QString to = QInputDialog::getText(this, tr("Rename Folder"), tr("Folder name:"), QLineEdit::Normal, name, &ok);
+        if (!ok || to.trimmed().isEmpty()) return;
+        state_->apply(tr("Rename Folder"), [kind, folder, to](Project&, Sequence& sq) {
+            return edit::renameFolder(sq, kind, folder, to.trimmed().toStdString());
+        });
+    });
+    menu.addAction(tr("Remove Folder (Keep Tracks)"), this, [this, kind, folder] {
+        state_->apply(tr("Remove Folder"), [kind, folder](Project&, Sequence& sq) {
+            std::vector<TrackRef> refs;
+            for (int i : edit::folderTracks(sq, kind, folder)) refs.push_back({kind, i});
+            return edit::setTrackFolder(sq, refs, {});
+        });
+    });
+}
+
+// A folder's row: in the header, its arrow and name; across the timeline, a band (with its tracks' clips in outline
+// while it is collapsed).
+void TimelineWidget::paintFolderRow(QPainter& p, const FolderRow& f, bool header) {
+    const Sequence* s = state_->sequence();
+    const QColor band(0x33, 0x2c, 0x22);
+    if (header) {
+        const QRect hr(0, f.y, kHeaderW, f.h);
+        p.fillRect(hr, band.lighter(115));
+        p.setPen(QColor(0xd8, 0xa8, 0x5a));
+        p.drawText(QRect(6, f.y, 18, f.h), Qt::AlignCenter, f.collapsed ? QStringLiteral("▸") : QStringLiteral("▾"));
+        p.setPen(theme::kText);
+        const QString label = tr("%1 (%2)").arg(QString::fromStdString(f.name)).arg(f.tracks.size());
+        p.drawText(QRect(26, f.y, kHeaderW - 30 - 3 * kBtn, f.h), Qt::AlignVCenter | Qt::AlignLeft,
+                   p.fontMetrics().elidedText(label, Qt::ElideRight, kHeaderW - 30 - 3 * kBtn));
+        p.setPen(QColor(0, 0, 0, 120));
+        p.drawLine(0, f.y + f.h - 1, kHeaderW, f.y + f.h - 1);
+        return;
+    }
+    const int W = viewport()->width();
+    p.fillRect(QRect(kHeaderW, f.y, W - kHeaderW, f.h), band);
+    if (f.collapsed && s)
+        for (int i : f.tracks)
+            for (const Clip& c : trackAt(*s, {f.kind, i})->clips) {
+                const int xs = std::max(kHeaderW, xForFrame(c.start)), xe = std::min(W, xForFrame(c.end()));
+                if (xe > xs) p.fillRect(QRect(xs, f.y + 5, xe - xs, f.h - 10), QColor(0xd8, 0xa8, 0x5a, 90));
+            }
+    p.setPen(QColor(0, 0, 0, 90));
+    p.drawLine(kHeaderW, f.y + f.h - 1, W, f.y + f.h - 1);
+}
+
 // ---------------------------------------------------------------------------
 // Mouse
 
 void TimelineWidget::handleHeaderClick(const Hit& hit) {
+    if (!hit.folder.empty()) {
+        const TrackKind kind = hit.folderKind;
+        const std::string name = hit.folder;
+        if (hit.button == HeaderButton::Folder) {
+            toggleFolder(kind, QString::fromStdString(name));
+            return;
+        }
+        if (hit.button == HeaderButton::None) return;
+        // Mute (or hide) and solo the folder's tracks together: on for all unless all are on already.
+        const bool solo = hit.button == HeaderButton::Solo;
+        state_->edit(solo ? tr("Solo Folder") : kind == TrackKind::Video ? tr("Toggle Folder Output") : tr("Mute Folder"),
+                     [kind, name, solo](Project&, Sequence& s) {
+                         const std::vector<int> members = edit::folderTracks(s, kind, name);
+                         bool all = true;
+                         for (int i : members) all &= solo ? trackAt(s, {kind, i})->solo : trackAt(s, {kind, i})->muted;
+                         for (int i : members) (solo ? trackAt(s, {kind, i})->solo : trackAt(s, {kind, i})->muted) = !all;
+                         return !members.empty();
+                     });
+        return;
+    }
     if (!hit.track) return;
     TrackRef ref = *hit.track;
     switch (hit.button) {
@@ -783,6 +1654,30 @@ void TimelineWidget::mousePressEvent(QMouseEvent* e) {
         handleHeaderClick(hit);
         return;
     }
+    if (hit.captionTrack) {
+        const Id track = hit.captionTrack;
+        if (e->pos().x() < kHeaderW) {
+            // The CC button shows or hides the track.
+            if (e->pos().x() < 34)
+                state_->edit(tr("Show Captions"), [track](Project&, Sequence& sq) {
+                    for (auto& t : sq.captionTracks)
+                        if (t.id == track) t.visible = !t.visible;
+                    return true;
+                });
+            return;
+        }
+        selectedCaptionTrack_ = track;
+        selectedCaption_ = hit.caption;
+        drag_.captionTrack = track;
+        drag_.caption = hit.caption;
+        drag_.kind = hit.kind == HitKind::Caption     ? DragKind::CaptionMove
+                     : hit.kind == HitKind::CaptionIn  ? DragKind::CaptionIn
+                     : hit.kind == HitKind::CaptionOut ? DragKind::CaptionOut
+                                                       : DragKind::None;
+        if (hit.caption < 0) state_->setPlayhead(hit.frame);
+        viewport()->update();
+        return;
+    }
     if (hit.kind == HitKind::Ruler) {
         drag_.kind = DragKind::Scrub;
         drag_.started = true;
@@ -791,6 +1686,14 @@ void TimelineWidget::mousePressEvent(QMouseEvent* e) {
         state_->setPlayhead(f);
         return;
     }
+    // A track's automation line or one of its points.
+    if (tool_ == Tool::Select)
+        if (const auto th = trackLaneHit(e->pos()); th && (th->key >= 0 || th->onLine))
+            if (beginTrackLaneDrag(e, *th)) return;
+    // A clip's volume or opacity line, or one of its keyframes (clip edges keep trimming).
+    if (tool_ == Tool::Select)
+        if (const auto lh = laneHit(e->pos()); lh && (lh->key >= 0 || (lh->onLine && hit.kind == HitKind::ClipBody)))
+            if (beginLaneDrag(e, *lh)) return;
     beginDrag(e, hit);
 }
 
@@ -834,6 +1737,13 @@ void TimelineWidget::beginDrag(QMouseEvent* e, const Hit& hit) {
     }
     if (hit.kind == HitKind::Transition) {
         state_->selectTransition(hit.transition);
+        return;
+    }
+    if (hit.kind == HitKind::TransitionEdge) {
+        state_->selectTransition(hit.transition);
+        drag_.kind = DragKind::TransitionEdge;
+        drag_.transition = hit.transition;
+        drag_.edge = hit.rightEdge ? edit::Edge::Out : edit::Edge::In;
         return;
     }
     if (hit.kind == HitKind::ClipBody || hit.kind == HitKind::ClipIn || hit.kind == HitKind::ClipOut) {
@@ -892,7 +1802,9 @@ void TimelineWidget::updateDrag(QMouseEvent* e) {
     if (!state_->sequence()) return;
     QPoint pos = e->pos();
     if (!drag_.started) {
-        if ((pos - drag_.pressPos).manhattanLength() < QApplication::startDragDistance()) return;
+        // Lines respond to small moves: a few pixels can be a few dB.
+        const bool line = drag_.kind == DragKind::Line || drag_.kind == DragKind::LineKey;
+        if ((pos - drag_.pressPos).manhattanLength() < (line ? 2 : QApplication::startDragDistance())) return;
         drag_.started = true;
         switch (drag_.kind) {
             case DragKind::Move: state_->beginGesture(drag_.insertMode ? tr("Insert Move") : tr("Move")); break;
@@ -900,6 +1812,19 @@ void TimelineWidget::updateDrag(QMouseEvent* e) {
             case DragKind::Roll: state_->beginGesture(tr("Roll Edit")); break;
             case DragKind::Slip: state_->beginGesture(tr("Slip")); break;
             case DragKind::Slide: state_->beginGesture(tr("Slide")); break;
+            case DragKind::CaptionMove: state_->beginGesture(tr("Move Caption")); break;
+            case DragKind::CaptionIn:
+            case DragKind::CaptionOut: state_->beginGesture(tr("Trim Caption")); break;
+            case DragKind::Line: {
+                Lane lane{};
+                QRect band;
+                state_->beginGesture(laneOf(drag_.clip, lane, band) && !lane.gain ? tr("Opacity") : tr("Volume"));
+                break;
+            }
+            case DragKind::LineKey: state_->beginGesture(tr("Move Keyframe")); break;
+            case DragKind::TrackLine: state_->beginGesture(tr("Track Volume")); break;
+            case DragKind::TrackKey: state_->beginGesture(tr("Move Automation Point")); break;
+            case DragKind::TransitionEdge: state_->beginGesture(tr("Transition Duration")); break;
             default: break;
         }
     }
@@ -966,6 +1891,31 @@ void TimelineWidget::updateDrag(QMouseEvent* e) {
             drag_.label = signedTc(applied);
             break;
         }
+        case DragKind::TransitionEdge: {
+            // The length follows the pointer: twice its distance from the cut for a dissolve (centred), the
+            // distance itself for a fade.
+            const Sequence* live = state_->sequence();
+            const Transition* t = nullptr;
+            const Track* onTrack = nullptr;
+            for (TrackRef r : allTracks(*live))
+                for (const Transition& x : trackAt(*live, r)->transitions)
+                    if (x.id == drag_.transition) t = &x, onTrack = trackAt(*live, r);
+            if (!t) break;
+            FrameTime cut = -1;
+            for (const Clip& c : onTrack->clips) {
+                if (t->clipA && c.id == t->clipA) cut = c.end();
+                if (!t->clipA && c.id == t->clipB) cut = c.start;
+            }
+            if (cut < 0) break;
+            const FrameTime f = frameAtX(pos.x());
+            const FrameTime reach = drag_.edge == edit::Edge::Out ? f - cut : cut - f;
+            const FrameTime want = t->clipA && t->clipB ? 2 * reach : reach;
+            const Id id = drag_.transition;
+            FrameTime applied = 0;
+            state_->updateGesture([&](Project&, Sequence& sq) { applied = edit::setTransitionDuration(sq, id, want).applied; });
+            drag_.label = tr("Transition %1").arg(QString::fromStdString(formatTimecode(applied, live->fps)));
+            break;
+        }
         case DragKind::Slip: {
             Id id = drag_.clip;
             FrameTime applied = 0;
@@ -979,6 +1929,38 @@ void TimelineWidget::updateDrag(QMouseEvent* e) {
             FrameTime applied = 0;
             state_->updateGesture([&](Project& p, Sequence& sq) { applied = edit::slide(p, sq, id, delta).applied; });
             drag_.label = tr("Slide %1").arg(signedTc(applied));
+            break;
+        }
+        case DragKind::CaptionMove:
+        case DragKind::CaptionIn:
+        case DragKind::CaptionOut: {
+            const Id track = drag_.captionTrack;
+            const int i = drag_.caption;
+            const DragKind kind = drag_.kind;
+            FrameTime applied = 0;
+            state_->updateGesture([&](Project&, Sequence& sq) {
+                for (auto& t : sq.captionTracks) {
+                    if (t.id != track || i < 0 || size_t(i) >= t.captions.size()) continue;
+                    Caption& c = t.captions[size_t(i)];
+                    const FrameTime lo = i > 0 ? t.captions[size_t(i) - 1].end : 0;
+                    const FrameTime hi = size_t(i) + 1 < t.captions.size() ? t.captions[size_t(i) + 1].start
+                                                                           : std::numeric_limits<FrameTime>::max() / 4;
+                    if (kind == DragKind::CaptionMove) {
+                        applied = std::clamp(raw, lo - c.start, hi - c.end);
+                        c.start += applied;
+                        c.end += applied;
+                    } else if (kind == DragKind::CaptionIn) {
+                        const FrameTime v = std::clamp(c.start + raw, lo, c.end - 1);
+                        applied = v - c.start;
+                        c.start = v;
+                    } else {
+                        const FrameTime v = std::clamp(c.end + raw, c.start + 1, hi);
+                        applied = v - c.end;
+                        c.end = v;
+                    }
+                }
+            });
+            drag_.label = signedTc(applied);
             break;
         }
         case DragKind::Rubber: {
@@ -996,9 +1978,114 @@ void TimelineWidget::updateDrag(QMouseEvent* e) {
             state_->setSelection(sel, true);
             break;
         }
+        case DragKind::Line: {
+            Lane lane{};
+            QRect band;
+            if (!laneOf(drag_.clip, lane, band)) break;
+            // Past the top or bottom of the clip pins the line there.
+            const double delta = pos.y() <= band.top()      ? lane.hi - lane.lo
+                                 : pos.y() >= band.bottom() ? lane.lo - lane.hi
+                                                            : laneValue(lane, band, pos.y()) - laneValue(lane, band, drag_.pressPos.y());
+            const Id id = drag_.clip;
+            const FrameTime t = drag_.key;
+            state_->updateGesture([=](Project&, Sequence& sq) {
+                if (Clip* c = edit::clipById(sq, id)) offsetLine(laneParamRef(*c, lane), t, delta, lane.lo, lane.hi);
+            });
+            if (const Clip* c = edit::clipById(*state_->sequence(), id)) drag_.label = laneText(lane, laneAt(*c, lane, t));
+            break;
+        }
+        case DragKind::LineKey: {
+            Lane lane{};
+            QRect band;
+            const Clip* base = edit::clipById(*s, drag_.clip);
+            if (!base || !laneOf(drag_.clip, lane, band)) break;
+            // Shift keeps the key's time and changes only its value.
+            const FrameTime to = (e->modifiers() & Qt::ShiftModifier) ? drag_.key : frameRound(pos.x()) - base->start;
+            const double v = laneValue(lane, band, pos.y());
+            const Id id = drag_.clip;
+            const FrameTime from = drag_.key;
+            FrameTime placed = from;
+            state_->updateGesture([&](Project&, Sequence& sq) {
+                if (Clip* c = edit::clipById(sq, id)) placed = moveKey(laneParamRef(*c, lane), from, to, v, c->duration - 1);
+            });
+            drag_.label = laneText(lane, v) + QStringLiteral("  ") + signedTc(placed - from);
+            break;
+        }
+        case DragKind::TrackLine:
+        case DragKind::TrackKey: {
+            const int ti = drag_.track;
+            QRect band;
+            for (const Row& row : rows())
+                if (row.ref == TrackRef{TrackKind::Audio, ti}) band = trackLaneBand(row);
+            if (band.isNull() || ti < 0 || ti >= int(s->audioTracks.size())) break;
+            const Lane& lane = trackVolumeLane();
+            if (drag_.kind == DragKind::TrackLine) {
+                const double delta = pos.y() <= band.top()      ? lane.hi - lane.lo
+                                     : pos.y() >= band.bottom() ? lane.lo - lane.hi
+                                                                : laneValue(lane, band, pos.y()) - laneValue(lane, band, drag_.pressPos.y());
+                const FrameTime t = drag_.key;
+                state_->updateGesture([=](Project&, Sequence& sq) {
+                    Track& tr = sq.audioTracks[size_t(ti)];
+                    if (tr.volumeAuto.animated()) offsetLine(tr.volumeAuto, t, delta, lane.lo, lane.hi);
+                    else tr.volumeDb = std::clamp(tr.volumeDb + delta, lane.lo, lane.hi);
+                });
+                drag_.label = laneText(lane, trackLaneValue(state_->sequence()->audioTracks[size_t(ti)], t));
+            } else {
+                const FrameTime to = (e->modifiers() & Qt::ShiftModifier) ? drag_.key : std::max<FrameTime>(0, frameRound(pos.x()));
+                const double v = laneValue(lane, band, pos.y());
+                const FrameTime from = drag_.key;
+                FrameTime placed = from;
+                state_->updateGesture([&](Project&, Sequence& sq) {
+                    placed = moveKey(sq.audioTracks[size_t(ti)].volumeAuto, from, to, v, std::numeric_limits<FrameTime>::max() / 4);
+                });
+                drag_.label = laneText(lane, v) + QStringLiteral("  ") + signedTc(placed - from);
+            }
+            break;
+        }
         default: break;
     }
+    if (drag_.kind == DragKind::Trim || drag_.kind == DragKind::Roll || drag_.kind == DragKind::Slip || drag_.kind == DragKind::Slide)
+        emitTrimView();
     viewport()->update();
+}
+
+void TimelineWidget::emitTrimView() {
+    const Sequence* s = state_->sequence();
+    const auto at = s ? edit::locate(*s, drag_.clip) : std::nullopt;
+    if (!at) return;
+    const Track& track = *trackAt(*s, at->track);
+    const Clip& c = track.clips[size_t(at->index)];
+    // The clip on the same track covering a frame, for the labels.
+    auto nameAt = [&](FrameTime f) -> QString {
+        for (const Clip& k : track.clips)
+            if (f >= k.start && f < k.end()) return QString::fromStdString(k.name);
+        return QString();
+    };
+    auto label = [&](FrameTime f) {
+        if (f < 0) return QString();
+        const QString name = nameAt(f), tc = timecodeString(s, f);
+        return name.isEmpty() ? tc : name + QStringLiteral("  ") + tc;
+    };
+    // Outgoing frame on the left, incoming on the right; a slip shows the clip's own first and last frames.
+    FrameTime left = -1, right = -1;
+    switch (drag_.kind) {
+        case DragKind::Trim:
+            left = drag_.edge == edit::Edge::Out ? c.end() - 1 : c.start - 1;
+            right = drag_.edge == edit::Edge::Out ? c.end() : c.start;
+            break;
+        case DragKind::Roll: {
+            // The edit between the two clips, wherever it is now.
+            const Clip* a = edit::clipById(*s, drag_.clip);
+            const Clip* b = edit::clipById(*s, drag_.neighbor);
+            const FrameTime cut = a && b ? (a->start < b->start ? a->end() : b->end()) : c.end();
+            left = cut - 1, right = cut;
+            break;
+        }
+        case DragKind::Slip: left = c.start, right = c.end() - 1; break;
+        case DragKind::Slide: left = c.start - 1, right = c.end(); break;
+        default: return;
+    }
+    emit trimViewChanged(left, right, label(left), label(right));
 }
 
 void TimelineWidget::mouseMoveEvent(QMouseEvent* e) {
@@ -1010,7 +2097,14 @@ void TimelineWidget::mouseMoveEvent(QMouseEvent* e) {
     // Hover cursor feedback.
     if (tool_ == Tool::Select || tool_ == Tool::Ripple || tool_ == Tool::Roll) {
         Hit h = hitTest(e->pos());
-        if (h.kind == HitKind::ClipIn || h.kind == HitKind::ClipOut) viewport()->setCursor(Qt::SizeHorCursor);
+        if (tool_ == Tool::Select)
+            if (const auto lh = laneHit(e->pos()); lh && (lh->key >= 0 || (lh->onLine && h.kind == HitKind::ClipBody))) {
+                viewport()->setCursor(lh->key >= 0 ? Qt::SizeAllCursor : Qt::SizeVerCursor);
+                return;
+            }
+        if (h.kind == HitKind::ClipIn || h.kind == HitKind::ClipOut || h.kind == HitKind::CaptionIn ||
+            h.kind == HitKind::CaptionOut || h.kind == HitKind::TransitionEdge)
+            viewport()->setCursor(Qt::SizeHorCursor);
         else if (tool_ == Tool::Select) viewport()->unsetCursor();
     }
 }
@@ -1021,8 +2115,19 @@ void TimelineWidget::mouseReleaseEvent(QMouseEvent* e) {
         if (tool_ == Tool::Hand) viewport()->setCursor(Qt::OpenHandCursor);
     }
     bool gesture = drag_.started && (drag_.kind == DragKind::Move || drag_.kind == DragKind::Trim || drag_.kind == DragKind::Roll ||
-                                     drag_.kind == DragKind::Slip || drag_.kind == DragKind::Slide);
+                                     drag_.kind == DragKind::Slip || drag_.kind == DragKind::Slide ||
+                                     drag_.kind == DragKind::CaptionMove || drag_.kind == DragKind::CaptionIn ||
+                                     drag_.kind == DragKind::CaptionOut || drag_.kind == DragKind::Line ||
+                                     drag_.kind == DragKind::LineKey || drag_.kind == DragKind::TrackLine ||
+                                     drag_.kind == DragKind::TrackKey || drag_.kind == DragKind::TransitionEdge);
     if (gesture) state_->endGesture(true);
+    if (drag_.started && (drag_.kind == DragKind::Trim || drag_.kind == DragKind::Roll || drag_.kind == DragKind::Slip || drag_.kind == DragKind::Slide))
+        emit trimViewEnded();
+    // A click (not a drag) on empty track space selects the gap there.
+    if (drag_.kind == DragKind::Rubber && !drag_.started && drag_.pressTrack && e->button() == Qt::LeftButton && tool_ == Tool::Select)
+        selectGapAt(*drag_.pressTrack, drag_.pressFrame);
+    else if (drag_.kind != DragKind::None && drag_.kind != DragKind::Pan)
+        gap_.reset();
     drag_ = DragState{};
     snapIndicator_ = -1;
     viewport()->update();
@@ -1033,6 +2138,8 @@ void TimelineWidget::mouseDoubleClickEvent(QMouseEvent* e) {
     Hit h = hitTest(e->pos());
     if (h.kind == HitKind::ClipBody) {
         emit clipActivated(h.clip);
+    } else if (h.kind == HitKind::Caption) {
+        emit captionActivated(h.captionTrack, h.caption);
     } else if (h.kind == HitKind::Header && h.button == HeaderButton::Name && h.track) {
         const Track* t = trackAt(*state_->sequence(), *h.track);
         bool ok = false;
@@ -1069,7 +2176,52 @@ void TimelineWidget::leaveEvent(QEvent* e) {
     QAbstractScrollArea::leaveEvent(e);
 }
 
+bool TimelineWidget::renderAndReplace(Id clip, QString* error) {
+    const Sequence* s = state_->sequence();
+    const Clip* c = s ? edit::clipById(*s, clip) : nullptr;
+    if (!c) return false;
+    const auto loc = edit::locate(*s, clip);
+    const bool video = loc && loc->track.kind == TrackKind::Video;
+    const QString kind = video ? tr("Rendered Video") : tr("Rendered Audio");
+    // Next to the project when it has been saved, else in the app's data folder.
+    QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/" + kind;
+    if (!state_->filePath().isEmpty()) {
+        const QFileInfo fi(state_->filePath());
+        dir = fi.absolutePath() + "/" + fi.completeBaseName() + " " + kind;
+    }
+    QDir().mkpath(dir);
+    const QString base = QString::fromStdString(c->name).replace(QRegularExpression(QStringLiteral("[^\\w\\- ]")), "_");
+    const QString path = QStringLiteral("%1/%2 %3.%4").arg(dir, base.isEmpty() ? tr("Clip") : base,
+                                                           QDateTime::currentDateTime().toString("yyyyMMdd-hhmmss-zzz"), video ? "mov" : "wav");
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    std::string err;
+    const bool ok = video ? renderClipVideo(state_->project(), *s, clip, path.toStdString(), &err)
+                          : renderClipAudio(state_->project(), *s, clip, path.toStdString(), &err);
+    QApplication::restoreOverrideCursor();
+    if (!ok) {
+        if (error) *error = QString::fromStdString(err);
+        state_->message(tr("Render failed: %1").arg(QString::fromStdString(err)), 6000);
+        return false;
+    }
+    QStringList errors;
+    const auto ids = state_->importFiles({path}, &errors, kind);
+    if (ids.empty()) {
+        if (error) *error = errors.join('\n');
+        return false;
+    }
+    const Id media = ids.front();
+    return state_->apply(tr("Render and Replace"), [clip, media](Project&, Sequence& sq) { return edit::replaceWithRender(sq, clip, media); });
+}
+
 void TimelineWidget::contextMenuEvent(QContextMenuEvent* e) {
+    // A keyframe on a clip's line: delete it or change how it eases.
+    if (const auto lh = laneHit(e->pos()); lh && lh->key >= 0) {
+        QMenu menu(this);
+        menu.setObjectName(QStringLiteral("keyframeMenu"));
+        laneMenu(menu, *lh);
+        if (!menu.isEmpty()) menu.exec(e->globalPos());
+        return;
+    }
     Hit h = hitTest(e->pos());
     contextFrame_ = h.frame;
     contextTrack_ = h.track;
@@ -1077,15 +2229,100 @@ void TimelineWidget::contextMenuEvent(QContextMenuEvent* e) {
     if (h.kind == HitKind::ClipBody || h.kind == HitKind::ClipIn || h.kind == HitKind::ClipOut) {
         if (!state_->isSelected(h.clip)) state_->setSelection({h.clip});
         menu.addActions(clipActions_);
+        // Multicam: choose the angle or the sound, or replace with the angles' own clips.
+        if (const Clip* c = edit::clipById(*state_->sequence(), h.clip))
+            if (const Sequence* mc = multicamSequence(state_->project(), *c)) {
+                const Id id = h.clip;
+                menu.addSeparator();
+                if (h.track && h.track->kind == TrackKind::Video) {
+                    QMenu* angles = menu.addMenu(tr("Multicam Angle"));
+                    angles->setObjectName(QStringLiteral("multicamAngle"));
+                    for (int a = 0; a < int(mc->videoTracks.size()); ++a) {
+                        QAction* act = angles->addAction(QStringLiteral("%1  %2").arg(a + 1).arg(QString::fromStdString(mc->videoTracks[size_t(a)].name)),
+                                                         this, [this, id, a] {
+                                                             state_->apply(tr("Switch to Angle %1").arg(a + 1), [id, a](Project& p, Sequence& s) {
+                                                                 return edit::switchAngle(p, s, id, a, 0, false, false);
+                                                             });
+                                                         });
+                        act->setCheckable(true);
+                        act->setChecked(c->angle == a);
+                    }
+                } else {
+                    QMenu* sound = menu.addMenu(tr("Multicam Audio"));
+                    sound->setObjectName(QStringLiteral("multicamAudio"));
+                    for (int a = -1; a < int(mc->audioTracks.size()); ++a) {
+                        const QString label = a < 0 ? tr("All Sources Mixed") : QString::fromStdString(mc->audioTracks[size_t(a)].name);
+                        QAction* act = sound->addAction(label, this, [this, id, a] {
+                            state_->apply(tr("Multicam Audio"), [id, a](Project& p, Sequence& s) { return edit::setAudioAngle(p, s, id, a); });
+                        });
+                        act->setCheckable(true);
+                        act->setChecked(c->audioAngle == a);
+                    }
+                }
+                menu.addAction(tr("Flatten Multicam"), this, [this] {
+                    const std::vector<Id> sel = state_->selectedClips();
+                    state_->apply(tr("Flatten Multicam"), [sel](Project& p, Sequence& s) { return edit::flattenMulticam(p, s, sel); });
+                })->setObjectName(QStringLiteral("flattenMulticam"));
+            }
+        // Out of sync: back into step with its picture by moving it, or by slipping its source where it is.
+        if (syncOffsetOf(h.clip) != 0) {
+            const Id id = h.clip;
+            menu.addSeparator();
+            menu.addAction(tr("Move into Sync"), this, [this, id] {
+                state_->apply(tr("Move into Sync"), [id](Project& p, Sequence& s) { return edit::moveIntoSync(p, s, id); });
+            })->setObjectName(QStringLiteral("moveIntoSync"));
+            menu.addAction(tr("Slip into Sync"), this, [this, id] {
+                state_->apply(tr("Slip into Sync"), [id](Project& p, Sequence& s) { return edit::slipIntoSync(p, s, id); });
+            })->setObjectName(QStringLiteral("slipIntoSync"));
+        }
+        // Offline rendering of a clip's effects (CPU-heavy plugins, AI effects) and speed changes.
+        if (h.track)
+            if (const Clip* c = edit::clipById(*state_->sequence(), h.clip)) {
+                const Id id = h.clip;
+                if (!c->effects.empty() || (h.track->kind == TrackKind::Video && (c->speed != 1 || c->reverse || c->ramped()))) {
+                    menu.addSeparator();
+                    menu.addAction(tr("Render and Replace"), this, [this, id] { renderAndReplace(id); });
+                }
+                if (!c->unrendered.empty())
+                    menu.addAction(tr("Restore Unrendered"), this, [this, id] {
+                        state_->apply(tr("Restore Unrendered"), [id](Project&, Sequence& s) { return edit::restoreUnrendered(s, id); });
+                    });
+            }
     } else if (h.kind == HitKind::Transition) {
         state_->selectTransition(h.transition);
         Id id = h.transition;
         menu.addAction(tr("Delete Transition"), this, [this, id] {
             state_->apply(tr("Delete Transition"), [id](Project&, Sequence& s) { return edit::removeTransition(s, id); });
         });
+    } else if (h.kind == HitKind::Header && !h.folder.empty()) {
+        folderMenu(menu, h.folderKind, h.folder);
     } else if (h.kind == HitKind::Header && h.track) {
         TrackRef ref = *h.track;
         bool video = ref.kind == TrackKind::Video;
+        // Track folders: into a new or existing folder, or out of one.
+        {
+            QMenu* folders = menu.addMenu(tr("Folder"));
+            folders->setObjectName(QStringLiteral("trackFolderMenu"));
+            const Sequence* s = state_->sequence();
+            const std::string current = trackAt(*s, ref)->folder;
+            auto moveTo = [this, ref](const std::string& name) {
+                state_->apply(name.empty() ? tr("Remove from Folder") : tr("Move to Folder"),
+                              [ref, name](Project&, Sequence& sq) { return edit::setTrackFolder(sq, {ref}, name); });
+            };
+            folders->addAction(tr("New Folder..."), this, [this, moveTo] {
+                bool ok = false;
+                const QString name = QInputDialog::getText(this, tr("New Folder"), tr("Folder name:"), QLineEdit::Normal, tr("Folder"), &ok);
+                if (ok && !name.trimmed().isEmpty()) moveTo(name.trimmed().toStdString());
+            });
+            std::vector<std::string> names;
+            for (const Track& t : video ? s->videoTracks : s->audioTracks)
+                if (!t.folder.empty() && t.folder != current && std::find(names.begin(), names.end(), t.folder) == names.end())
+                    names.push_back(t.folder);
+            for (const std::string& n : names)
+                folders->addAction(tr("Move to %1").arg(QString::fromStdString(n)), this, [moveTo, n] { moveTo(n); });
+            if (!current.empty()) folders->addAction(tr("Remove from Folder"), this, [moveTo] { moveTo({}); });
+            menu.addSeparator();
+        }
         menu.addAction(video ? tr("Add Video Track") : tr("Add Audio Track"), this, [this, ref] {
             state_->edit(tr("Add Track"), [ref](Project& p, Sequence& s) {
                 edit::addTrack(p, s, ref.kind);
@@ -1215,8 +2452,12 @@ void TimelineWidget::dropMedia(const QMimeData* mime, const QPoint& pos, bool in
             }
             last = res;
             created.insert(created.end(), res.created.begin(), res.created.end());
+            const MediaItem* sub = r.subclip ? p.findMedia(r.subclip) : nullptr;
             for (Id id : res.created)
-                if (const Clip* c = edit::clipById(sq, id)) f = std::max(f, c->end());
+                if (Clip* c = edit::clipById(sq, id)) {
+                    if (sub) c->name = sub->name;
+                    f = std::max(f, c->end());
+                }
         }
         if (!created.empty()) last.ok = true;
         return last;
@@ -1228,28 +2469,55 @@ void TimelineWidget::dropMedia(const QMimeData* mime, const QPoint& pos, bool in
 
 void TimelineWidget::dropEffect(const QString& typeQ, const QPoint& pos) {
     const Sequence* s = state_->sequence();
+    if (s && typeQ.startsWith(QStringLiteral("preset:"))) {
+        // An effect preset dropped on a clip of its kind: its effects added to that clip.
+        EffectPreset preset;
+        const Hit hit = hitTest(pos);
+        const auto loc = hit.clip ? edit::locate(*s, hit.clip) : std::nullopt;
+        if (!presets::load(typeQ.mid(7), preset) || !loc || (loc->track.kind == TrackKind::Video) != preset.video) return;
+        const Id clip = hit.clip;
+        state_->edit(tr("Apply Preset %1").arg(QString::fromStdString(preset.name)), [clip, preset](Project& p, Sequence& sq) {
+            Clip* c = edit::clipById(sq, clip);
+            return c && applyPreset(p, *c, preset) > 0;
+        });
+        return;
+    }
     std::string type = typeQ.toStdString();
     const EffectInfo* info = findEffectInfo(type);
-    if (!info || !s) return;
+    const bool plugin = plugins::isPluginType(type);
+    if ((!info && !plugin) || !s) return;
+    if (!ensureEffectModel(window(), type)) return;
+    s = state_->sequence();  // the download waited in an event loop
+    if (!s) return;
+    const EffectCategory category = plugin ? EffectCategory::AudioFilter : info->category;
+    const QString name = QString::fromStdString(plugins::effectTypeName(type));
     Hit h = hitTest(pos);
     auto row = rowAt(pos.y());
-    switch (info->category) {
+    switch (category) {
         case EffectCategory::VideoFilter:
         case EffectCategory::AudioFilter: {
             if (!h.clip) return;
             auto loc = edit::locate(*s, h.clip);
-            bool wantVideo = info->category == EffectCategory::VideoFilter;
+            bool wantVideo = category == EffectCategory::VideoFilter;
             if (!loc || (loc->track.kind == TrackKind::Video) != wantVideo) {
                 state_->message(wantVideo ? tr("Drop video effects onto video clips") : tr("Drop audio effects onto audio clips"));
                 return;
             }
             Id id = h.clip;
-            state_->edit(tr("Add %1").arg(QString::fromStdString(info->displayName)), [id, type](Project& p, Sequence& sq) {
+            QString error;
+            state_->edit(tr("Add %1").arg(name), [id, type, &error](Project& p, Sequence& sq) {
                 Clip* c = edit::clipById(sq, id);
                 if (!c) return false;
-                c->effects.push_back(makeEffect(p, type));
+                std::string err;
+                auto e = plugins::makeEffectOfType(p, type, &err);
+                if (!e) {
+                    error = QString::fromStdString(err);
+                    return false;
+                }
+                c->effects.push_back(*e);
                 return true;
             });
+            if (!error.isEmpty()) state_->message(tr("Could not load %1: %2").arg(name, error));
             state_->setSelection({id}, false);
             break;
         }

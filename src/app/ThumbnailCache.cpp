@@ -15,6 +15,13 @@ ThumbnailCache& ThumbnailCache::instance() {
 
 ThumbnailCache::ThumbnailCache() { pool_.setMaxThreadCount(2); }
 
+void ThumbnailCache::forget(const QString& path) {
+    const QString prefix = path + '|';
+    QMutexLocker lock(&m_);
+    for (auto it = cache_.begin(); it != cache_.end();) it = it.key().startsWith(prefix) ? cache_.erase(it) : std::next(it);
+    order_.removeIf([&](const QString& k) { return k.startsWith(prefix); });
+}
+
 QImage ThumbnailCache::get(const QString& path, double seconds, int width, int height, double quantum) {
     if (path.isEmpty() || width <= 0 || height <= 0) return {};
     if (quantum > 0) seconds = std::floor(seconds / quantum) * quantum;

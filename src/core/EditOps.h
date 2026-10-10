@@ -7,6 +7,7 @@
 // consistent state; they never need to be reversible themselves.
 #pragma once
 
+#include <map>
 #include <optional>
 #include <string>
 #include <utility>
@@ -65,6 +66,41 @@ Result insert(Project& p, Sequence& s, TrackRef t, Clip clip);
 // srcIn / srcOut are in sequence frames; srcOut < 0 means "to the end".
 Result placeMedia(Project& p, Sequence& s, Id mediaId, FrameTime at, double srcIn, double srcOut,
                   TrackRef videoTrack, TrackRef audioTrack, bool insertMode);
+// Place on Top: the media on the first tracks above the video target (the audio target or after it) with nothing
+// over its length, new tracks when none have room. Nothing already in the sequence moves.
+Result placeOnTop(Project& p, Sequence& s, Id mediaId, FrameTime at, double srcIn, double srcOut, TrackRef videoTrack,
+                  TrackRef audioTrack);
+// Ripple Overwrite: the clip and the clips linked to it give way to the media range at its start, and everything
+// after moves by the difference in length.
+Result rippleOverwrite(Project& p, Sequence& s, Id clipId, Id mediaId, double srcIn, double srcOut, TrackRef videoTrack,
+                       TrackRef audioTrack);
+// Audio roles (Clip::role). The standard ones, then any others the sequence's clips use, in that order.
+extern const std::vector<std::string> kStandardRoles;  // Dialogue, Music, Effects
+std::vector<std::string> sequenceRoles(const Sequence& s);
+// Gives the audio clips among `clips`, and the audio clips linked to video ones among them, the role ("" clears it).
+// Returns how many changed.
+int setClipRole(Sequence& s, const std::vector<Id>& clips, const std::string& role);
+bool roleMuted(const Sequence& s, const std::string& role);
+void setRoleMuted(Sequence& s, const std::string& role, bool muted);
+// Reverse Match Frame (Premiere's): where the timeline shows a source frame (in sequence frames of the media) of a
+// media item: per enabled clip playing it, on any track, the timeline frame nearest it; by time, then track.
+struct FrameUse {
+    Id clip = 0;
+    TrackRef track;
+    FrameTime at = 0;
+};
+std::vector<FrameUse> sourceFrameUses(const Sequence& s, Id mediaId, double srcFrame);
+// Match Frame through nested sequences and multicam clips (Resolve 21): the file shown at frame t of the sequence
+// and its frame (in `s`'s frames, as the Source monitor takes them), from the topmost visible video clip that is
+// not a generator, descending into a nested sequence's own topmost clip there (a multicam into its angle).
+struct SourceMatch {
+    Id media = 0;
+    double frame = 0;
+    Id clip = 0;  // the clip in `s` it was found under
+};
+std::optional<SourceMatch> matchSource(const Project& p, const Sequence& s, FrameTime t);
+// Smart Insert's point: the clip start or end on the track nearest the frame (the frame itself on an empty track).
+FrameTime nearestEdit(const Sequence& s, TrackRef t, FrameTime frame);
 Result razor(Project& p, Sequence& s, TrackRef t, FrameTime frame);
 Result razorAll(Project& p, Sequence& s, FrameTime frame);
 Result removeClips(Project& p, Sequence& s, const std::vector<Id>& ids, bool ripple);
@@ -72,11 +108,29 @@ Result moveClips(Project& p, Sequence& s, const std::vector<Id>& ids, FrameTime 
                  int audioTrackDelta, bool insertMode = false);
 Result trim(Project& p, Sequence& s, Id clipId, Edge edge, FrameTime delta, TrimMode mode, bool includeLinked = true);
 Result roll(Project& p, Sequence& s, Id leftClip, Id rightClip, FrameTime delta);
+// Extend Edit (Premiere's and Resolve's E, Final Cut's Extend Edit, Avid's Extend): the clip's edge nearest `target`
+// (the one on that side when `target` is beyond it) moved to `target`: rolled with the clip that meets it there,
+// else trimmed into the gap or back. Linked clips follow; `applied` says how far it went (media can end sooner).
+Result extendEdit(Project& p, Sequence& s, Id clip, FrameTime target);
 Result slip(Project& p, Sequence& s, Id clipId, FrameTime delta);
 Result slide(Project& p, Sequence& s, Id clipId, FrameTime delta);
 Result setSpeed(Project& p, Sequence& s, Id clipId, double speed, bool ripple, bool reverse = false,
                 bool includeLinked = true);
+// Maintain Audio Pitch on a clip and the clips linked to it (its sound): sped-up or slowed sound keeps its pitch.
+// False if nothing changed (or no such clip).
+bool setMaintainPitch(Project& p, Sequence& s, Id clipId, bool on);
 Result closeGap(Project& p, Sequence& s, TrackRef t, FrameTime frame);
+// Pasting a copied gap (Resolve 21.1): `length` frames of empty space opened at `at` on the track, splitting a
+// clip there and pushing what follows (and the same on sync-locked tracks), as an insert edit does.
+Result insertGap(Project& p, Sequence& s, TrackRef t, FrameTime at, FrameTime length);
+// Delete Gaps (Resolve's Edit > Delete Gaps, Premiere's Close Gap on a whole sequence): every stretch where no track
+// has anything is closed, so nothing slips out of sync; what follows moves up, with the captions, sequence markers and
+// track automation after it. The empty start of the cut too when `leading`. A gap is left when a locked track has
+// clips after it (they could not move with the rest). `closed` receives how many gaps went and `frames` their total.
+Result deleteGaps(Project& p, Sequence& s, bool leading = false, int* closed = nullptr, FrameTime* frames = nullptr);
+// Clear Solo (Resolve 21.1): the soloed tracks (as track ids), and all of them soloed again.
+std::vector<Id> soloedTracks(const Sequence& s);
+Result setSoloedTracks(Sequence& s, const std::vector<Id>& tracks);
 Result liftRange(Project& p, Sequence& s, FrameTime a, FrameTime b, const std::vector<TrackRef>& tracks);
 Result extractRange(Project& p, Sequence& s, FrameTime a, FrameTime b, const std::vector<TrackRef>& tracks);
 Result linkClips(Project& p, Sequence& s, const std::vector<Id>& ids);
@@ -92,16 +146,184 @@ Result pasteClips(Project& p, Sequence& s, const std::vector<ClipboardItem>& ite
 
 // ---- Transitions -----------------------------------------------------------------
 Result addTransition(Project& p, Sequence& s, Id clipId, Edge edge, const std::string& type, FrameTime duration);
+// Premiere's Apply Default Transitions to Selection, Final Cut's Add Transition on several clips: a transition at both
+// ends of each clip (one per edit point where two meet, a fade where a clip meets a gap), `videoType` on picture
+// clips and `audioType` on sound. Clips on locked tracks are left. The transitions are in `created`.
+Result addTransitionsToClips(Project& p, Sequence& s, const std::vector<Id>& clips, const std::string& videoType,
+                             const std::string& audioType, FrameTime duration);
 Result removeTransition(Sequence& s, Id transitionId);
 Transition* transitionById(Sequence& s, Id id, TrackRef* where = nullptr);
 // Timeline range covered by a transition on a track.
 bool transitionRange(const Track& t, const Transition& tr, FrameTime& from, FrameTime& to);
+// A transition's length (Premiere 26's transition handles on the timeline): at least 2 frames; a dissolve between
+// two clips stays centred on the edit and inside both, a fade inside its clip. Result::applied is the length set.
+Result setTransitionDuration(Sequence& s, Id transitionId, FrameTime duration);
+
+// ---- Editing staples -----------------------------------------------------------------
+// The nearest clip edge (a clip's start or end on any track) before / after
+// `frame`; -1 when there is none.
+FrameTime previousClipEdge(const Sequence& s, FrameTime frame);
+FrameTime nextClipEdge(const Sequence& s, FrameTime frame);
+// Premiere's Q and W: ripple-deletes from the previous edit to `frame`
+// (previous) or from `frame` to the next edit, on every unlocked track.
+Result rippleTrimToPlayhead(Project& p, Sequence& s, FrameTime frame, bool previous);
+
+// Clip attributes for Paste Attributes and Remove Attributes.
+enum Attribute : unsigned {
+    AttrMotion = 1,      // position, scale, rotation, anchor, crop, flip (the transform but opacity)
+    AttrOpacity = 2,     // opacity and blend mode
+    AttrTimeRemap = 4,   // the Time Remapping curve and frame sampling
+    AttrVolume = 8,      // clip gain and pan
+    AttrEffects = 16,    // the effect stack (pasted ones are added after the clip's own)
+    AttrAll = 31
+};
+// Copies the chosen attributes of `from` (a clip on a `fromKind` track,
+// keyframes included) onto the clips: picture ones onto video clips, volume
+// onto audio clips, effects onto clips of the same kind.
+Result pasteAttributes(Project& p, Sequence& s, const Clip& from, TrackKind fromKind, const std::vector<Id>& to,
+                       unsigned what);
+// Puts the chosen attributes back to their defaults (effects: removed).
+Result removeAttributes(Project& p, Sequence& s, const std::vector<Id>& ids, unsigned what);
+
+// Freezes video clip `clipId` from `frame` on: it is split there and the rest
+// holds that frame (0 % Time Remapping). Returns the held part's id.
+Result addFrameHold(Project& p, Sequence& s, Id clipId, FrameTime frame);
+// Speed ramp presets (CapCut's speed curves, Final Cut's ramps): the clip's Time Remapping curve given a shape,
+// eased between its points and scaled so the clip still plays the same stretch of footage in the same length
+// (and so never runs past it); its linked clips of the same length follow. "none" takes the ramp away.
+struct SpeedRampPreset {
+    std::string id, name, description;
+    std::vector<std::pair<double, double>> shape;  // (place in the clip 0..1, relative speed)
+};
+const std::vector<SpeedRampPreset>& speedRampPresets();
+Result applySpeedRamp(Project& p, Sequence& s, Id clipId, const std::string& preset);
+
+// Replace Edit: clip `clipId` shows media `mediaId` instead, in the same place
+// and length with its effects and transform, the media's frame `srcAlign`
+// (sequence frames) landing on timeline frame `at`. Linked clips follow.
+Result replaceClip(Project& p, Sequence& s, Id clipId, Id mediaId, double srcAlign, FrameTime at);
+// Fit to Fill: overwrites timeline frames [tlIn, tlOut] with source frames
+// [srcIn, srcOut] (both inclusive, sequence frames), the speed changed to fit.
+Result fitToFill(Project& p, Sequence& s, Id mediaId, double srcIn, double srcOut, FrameTime tlIn, FrameTime tlOut,
+                 TrackRef videoTrack, TrackRef audioTrack);
+
+// Swap with Previous / Next Clip (Resolve's swap, Final Cut's reorder): the clip
+// and its neighbour on the track change places within the span they share
+// (any gap between them stays between them); clips linked to each move with
+// it. A transition between the two moves to their new edit; others on their
+// edges are removed.
+Result swapClip(Project& p, Sequence& s, Id clipId, bool withNext);
+
+// ---- Duplicate frames (Premiere's duplicate frame markers) ---------------------
+// Where a video clip shows source frames that another video clip in the sequence also shows: timeline frames
+// [from, to) of the clip, and a group number per media (the same group for every repeat of one file's frames).
+struct DuplicateSpan {
+    FrameTime from = 0, to = 0;
+    int group = 0;
+    bool operator==(const DuplicateSpan&) const = default;
+};
+std::map<Id, std::vector<DuplicateSpan>> duplicateFrames(const Sequence& s);
+
+// ---- Close Up (Resolve's Cut page) -------------------------------------------------
+// A punched-in copy of a video clip over [from, to) on the track above it (added if needed), scaled `zoom` times
+// its own size and moved so the point (u, v) of the media (fractions, e.g. a face) sits near the middle of the
+// frame, a little above it, without uncovering the frame's edges. Video only; its effects come with it.
+Result closeUp(Project& p, Sequence& s, Id clipId, FrameTime from, FrameTime to, double zoom, double u, double v);
+
+// ---- Video layouts (CapCut's layouts, Resolve's Video Collage, split-screen templates) -------------------------
+// Sets the video clips' size, position and crop so they share the frame. The clips are taken from the lowest track
+// up (and by start on a track). Side by side, top and bottom, three across and the 2 x 2 grid fill their cells,
+// cropping what spills over (centred); picture in picture leaves the lowest clip full frame and puts each other one,
+// whole, in a corner (`corner`: 0 top left, 1 top right, 2 bottom left, 3 bottom right; further clips go round
+// bottom right, bottom left, top right, top left from there), `pipSize` of
+// the frame's width; full frame puts them all back. `gap` is the space between and around cells, in pixels.
+// Keys on those parameters are replaced; rotation, opacity and effects stay.
+enum class Layout { FullFrame, PictureInPicture, SideBySide, TopAndBottom, ThreeAcross, Grid };
+struct LayoutOptions {
+    double gap = 0;
+    int corner = 3;
+    double pipSize = 0.3;
+};
+struct Cell {
+    double x = 0, y = 0, w = 0, h = 0;  // sequence pixels, from the top left
+};
+// The cells of a layout for `n` clips (picture in picture: the full frame then the corners, with each corner's
+// height to be set from its clip's shape).
+std::vector<Cell> layoutCells(Layout layout, int n, int width, int height, const LayoutOptions& o);
+Result arrangeLayout(const Project& p, Sequence& s, const std::vector<Id>& clips, Layout layout, const LayoutOptions& o = {});
+
+// ---- Track folders (Resolve's Fairlight folders) -----------------------------------
+// Puts tracks in a folder ("" takes them out). Fails for no tracks or a folder name with a slash.
+Result setTrackFolder(Sequence& s, const std::vector<TrackRef>& tracks, const std::string& folder);
+// The tracks of a kind in the folder, by index.
+std::vector<int> folderTracks(const Sequence& s, TrackKind kind, const std::string& folder);
+bool folderCollapsed(const Sequence& s, TrackKind kind, const std::string& folder);
+void setFolderCollapsed(Sequence& s, TrackKind kind, const std::string& folder, bool collapsed);
+// A folder's fader (a VCA: added to each of its tracks' faders in the mix), dB; 0 when unset.
+double folderGain(const Sequence& s, TrackKind kind, const std::string& folder);
+void setFolderGain(Sequence& s, TrackKind kind, const std::string& folder, double db);
+// Renames a folder (its tracks follow); fails if the new name is taken or empty.
+Result renameFolder(Sequence& s, TrackKind kind, const std::string& from, const std::string& to);
+
+// ---- Through edits (Premiere's through edit indicators and Join Through Edits) ----
+// An edit the picture or sound runs straight through: the next clip starts where this one ends and plays the same
+// media at the same speed from exactly where this one leaves off, with the same kind of effects and no transition
+// between them (what a razor cut leaves). The outgoing clips' ids, on every track.
+std::vector<Id> throughEdits(const Sequence& s);
+// Joins a clip with the one after it across a through edit, and its linked clips across theirs: one clip each, with
+// the outgoing clip's id, settings and keyframes. Fails when there is no through edit after it.
+Result joinThroughEdit(Project& p, Sequence& s, Id clipId);
+// Joins every through edit touching these clips (all of them when empty); how many were joined.
+int joinThroughEdits(Project& p, Sequence& s, const std::vector<Id>& ids = {});
+
+// ---- Auditions (Final Cut's auditions, Resolve's take selector) ----------------
+// Adds media as alternative takes of a clip, each from a source in-point (sequence frames), the clip staying the
+// pick. Takes must have what the track plays (pictures on a video track, sound on an audio track).
+Result addTakes(Project& p, Sequence& s, Id clipId, const std::vector<std::pair<Id, double>>& media);
+// Makes take `index` the pick: the clip plays it in the same place, keeping its length, effects and keyframes; clips
+// linked to it that play the same media (its sound) follow.
+Result pickTake(Project& p, Sequence& s, Id clipId, int index);
+Result cycleTake(Project& p, Sequence& s, Id clipId, int step);  // the next (+1) or previous (-1) take, round
+Result finalizeAudition(Project& p, Sequence& s, Id clipId);     // keeps the pick, forgets the other takes
+
+// Sync (Premiere's out-of-sync indicators, Avid's sync-break numbers): a linked clip playing the same media as its
+// link group's picture (its first video clip; with none, its first clip) is out of sync when it starts somewhere other
+// than where the picture shows the same moment: `frames` later (negative: earlier), more than half a frame either way.
+// The reference is the group's first video clip of the same media (else its first such sound clip); clips of other
+// media in the group (merged dual-system sound, a linked cutaway) are not compared.
+struct SyncOffset {
+    Id clip = 0, anchor = 0;
+    double frames = 0;
+};
+std::vector<SyncOffset> syncOffsets(const Sequence& s);
+double syncOffset(const Sequence& s, Id clipId);  // 0 when in sync or not comparable
+// Back into sync: the clip moved by its offset (overwriting what is there, like any move), or its source slipped so
+// it plays in sync where it is (refused past the media's ends).
+Result moveIntoSync(Project& p, Sequence& s, Id clipId);
+Result slipIntoSync(Project& p, Sequence& s, Id clipId);
+
+// Clips that start at or after `frame` (Track Select Forward), on every track
+// or only `track`.
+std::vector<Id> clipsFrom(const Sequence& s, FrameTime frame, std::optional<TrackRef> track = {});
+
+// ---- Sequences -------------------------------------------------------------------------
+// A copy of sequence `id` with fresh ids throughout (clips, tracks, effects,
+// transitions, link groups, buses, caption tracks), named `name` or
+// "<name> Copy", added to the project with its own media bin item. Returns
+// its id (0 if `id` is unknown).
+// `clipIds`, if given, receives old clip id -> new clip id.
+Id duplicateSequence(Project& p, Id id, const std::string& name = {}, std::map<Id, Id>* clipIds = nullptr);
 
 // ---- Tracks & markers ---------------------------------------------------------------
 TrackRef addTrack(Project& p, Sequence& s, TrackKind kind);
 Result removeTrack(Sequence& s, TrackRef t);
 void addMarker(Sequence& s, Marker m);
 bool removeMarkerAt(Sequence& s, FrameTime frame);
+// A clip marker on clip `id` at timeline frame `at`, on the moment of the clip's source shown there (replacing one
+// already on that moment). False if the clip does not cover `at`.
+bool addClipMarker(Sequence& s, Id id, FrameTime at, Marker m);
+// Removes the clip's markers shown at timeline frame `at`.
+bool removeClipMarkerAt(Sequence& s, Id id, FrameTime at);
 
 // ---- Snapping & navigation -------------------------------------------------------------
 std::vector<FrameTime> snapPoints(const Sequence& s, const std::vector<Id>& exclude, bool includePlayhead = true);
@@ -115,6 +337,19 @@ bool matchSequenceToMedia(Sequence& s, const MediaItem& m);
 
 // ---- Nesting --------------------------------------------------------------------------
 // Moves the clips into a new sequence and replaces them with a compound clip.
+// The effect chain owned by `owner`: a clip's effects, an audio track's
+// inserts, a bus's effects, or (the sequence's own id) the master effects.
+// `origin` receives the timeline frame its keyframes count from.
+std::vector<Effect>* effectChain(Sequence& s, Id owner, FrameTime* origin = nullptr);
+Effect* ownedEffect(Sequence& s, Id owner, Id effect, FrameTime* origin = nullptr);
+
+// Render and Replace: points an audio clip at `media` (its sound with its
+// effects baked in, from the clip's first frame), dropping the effects and
+// remembering the clip as it was. Restore puts the original back, keeping
+// trims made since.
+Result replaceWithRender(Sequence& s, Id clip, Id media);
+Result restoreUnrendered(Sequence& s, Id clip);
+
 Result makeCompound(Project& p, Sequence& s, const std::vector<Id>& ids, const std::string& name);
 
 }  // namespace montage::edit

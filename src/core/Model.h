@@ -9,9 +9,16 @@
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
+
+#include "Captions.h"
+#include "ObjectMask.h"
+#include "Transcript.h"
+#include "FaceIndex.h"
+#include "VisualIndex.h"
 
 namespace montage {
 
@@ -29,18 +36,32 @@ struct Rational {
 // ---------------------------------------------------------------------------
 // Keyframed parameters
 
-enum class Interp { Linear, Hold, Smooth };
+enum class Interp { Linear, Hold, Smooth, Bezier };
 
 struct Keyframe {
     FrameTime t = 0;          // relative to the start of the owning clip
     double v = 0;
     Interp interp = Interp::Linear;  // interpolation towards the next key
+    // Bezier handles, relative to the key in frames and value: the one coming in
+    // (dt <= 0, used when the key before is Bezier) and the one going out (dt >= 0,
+    // used when this key is). Both zero means automatic: smooth through the key,
+    // flat where it turns and at the ends.
+    double inDt = 0, inDv = 0, outDt = 0, outDv = 0;
     bool operator==(const Keyframe&) const = default;
 };
+
+// The handles key i actually uses (its own, or the automatic ones).
+void keyHandles(const std::vector<Keyframe>& keys, size_t i, double& inDt, double& inDv, double& outDt, double& outDv);
+
+// What an animation does after its last keyframe (After Effects' loopOut, Resolve 21's keyframe loop and ping pong).
+enum class Repeat { Hold, Loop, PingPong, Offset };
 
 struct Param {
     double value = 0;              // used when there are no keyframes
     std::vector<Keyframe> keys;    // sorted by t
+    // After the last key: hold its value, play the keys again (Loop), back and forth (PingPong), or again carrying
+    // on from where the last cycle ended (Offset: a value climbing by the same step each cycle). Needs two keys.
+    Repeat repeat = Repeat::Hold;
 
     Param() = default;
     Param(double v) : value(v) {}  // NOLINT(google-explicit-constructor)
@@ -65,11 +86,13 @@ struct Effect {
     bool enabled = true;
     std::map<std::string, Param> params;
     std::map<std::string, std::string> strings;
+    // The object picked for an "Object" mask (shared: undo snapshots copy the pointer).
+    std::shared_ptr<const ObjectMask> object;
 
     double p(const std::string& name, FrameTime t, double def = 0) const;
     std::string s(const std::string& name, const std::string& def = {}) const;
     bool empty() const { return type.empty(); }
-    bool operator==(const Effect&) const = default;
+    bool operator==(const Effect&) const;  // compares the object mask by value
 };
 
 // ---------------------------------------------------------------------------
@@ -91,17 +114,116 @@ struct MediaItem {
     bool hasAudio = false;
     int sampleRate = 0;
     int channels = 0;
+    // Channels in each audio stream, in file order (cameras writing MXF often carry a mono stream per channel).
+    // Clip::channels counts across them. Empty: one stream of `channels`.
+    std::vector<int> audioStreams;
+    // How new clips take its channels (core/AudioChannels.h): "" the main stream mixed to stereo, "mono" a clip per
+    // channel, "pairs" a stereo clip per pair (Premiere's Modify > Audio Channels on a project item).
+    std::string audioChannelMode;
     std::string videoCodec;
     std::string audioCodec;
     Id sequenceId = 0;       // for MediaKind::Sequence (compound clip)
-    std::string bin;         // bin (folder) name, "" = root
+    std::string bin;         // bin path, "/" between nested bins ("Interviews/Day 1"), "" = the project root
+    std::string colorSpace;     // detected from the file's colour tags (ColorSpace.h id), "" = Rec.709
+    std::string colorOverride;  // Interpret Colour: the space to read it as, "" = as detected
+    // 360° footage: "equirect" or "vr180" (the half in front; from the file's spherical metadata, or set by hand),
+    // "" = a flat picture.
+    std::string projection;
+    // Ambisonic sound (core/Ambisonics.h): its order (1 = first-order AmbiX, four channels W Y Z X), from the file's
+    // spatial audio metadata (MP4 SA3D) or set by hand; 0 = channels for speakers.
+    int ambisonic = 0;
+    // Stereoscopic 3D footage: how its two eyes are packed ("sbs", "sbs_half", "tb", "tb_half"; core/Interpretation.h),
+    // from the file's stereo metadata or Interpret Footage; "" = a flat picture. Its size is one eye's, as shown.
+    std::string stereo;
+    double timecode = -1;       // start timecode in seconds (for multicam sync), -1 = none
+    // Speech-to-text of the media's audio (shared: undo snapshots copy the pointer).
+    std::shared_ptr<const Transcript> transcript;
+    // What the footage shows, for search by description (shared like the transcript).
+    std::shared_ptr<const VisualIndex> visual;
+    // The faces in it, for finding people (shared like the visual index).
+    std::shared_ptr<const FaceIndex> faces;
+    // Logging (core/MediaLog.h): what the editor notes about the media to find it again.
+    int rating = 0;                                // -1 rejected, 0 unrated, 1-5 stars
+    int label = 0;                                 // colour label (core/MediaLog.h labelName), 0 = none
+    std::vector<std::string> keywords;
+    std::map<std::string, std::string> metadata;  // scene, shot, take, camera, description, comment, ...
+    std::string created;                           // when it was recorded (ISO 8601, from the file), "" = unknown
+    // A subclip: a saved range of another media item. Clips made from it use
+    // that item (with this range), so only bins, logging and search see it.
+    Id subclipOf = 0;
+    double subclipIn = 0, subclipOut = 0;  // seconds of the parent media
     bool operator==(const MediaItem&) const = default;
+};
+
+// A saved search: the media matching its rules (core/MediaLog.h).
+struct SmartRule {
+    std::string field;  // a mediaFields() key, or "any" for any text
+    std::string op;     // contains, !contains, is, !is, starts, empty, !empty, >, >=, <, <=, includes, !includes
+    std::string value;
+    bool operator==(const SmartRule&) const = default;
+};
+
+struct SmartBin {
+    Id id = 0;
+    std::string name;
+    bool matchAll = true;  // all rules must match, or any of them
+    std::vector<SmartRule> rules;
+    bool operator==(const SmartBin&) const = default;
 };
 
 // ---------------------------------------------------------------------------
 // Timeline
 
 enum class TrackKind { Video, Audio };
+
+// A sequence marker (t in timeline frames) or a clip marker (Clip::markers: t in the clip's source frames).
+struct Marker {
+    FrameTime t = 0;
+    FrameTime duration = 0;
+    std::string name;
+    std::string comment;
+    int color = 0;
+    bool chapter = false;  // a chapter marker: a chapter in exported MP4 / MOV / MKV files and YouTube's list
+    bool operator==(const Marker&) const = default;
+};
+
+// An ADR cue (core/Adr.h): a line to re-record to picture, from `start` to `end` (timeline frames, end exclusive).
+struct AdrCue {
+    Id id = 0;
+    std::string name;       // the cue number ("JD101")
+    std::string character;  // who says it
+    std::string line;       // what is said
+    std::string note;       // why it is replaced (noise, performance, a new line)
+    FrameTime start = 0;
+    FrameTime end = 0;
+    int status = 0;  // AdrStatus
+    Id clip = 0;     // the clip holding its takes (an audition), 0 before the first take
+    bool operator==(const AdrCue&) const = default;
+};
+
+// One take of an audition (Final Cut's auditions, Resolve's take selector): a piece of media, starting `offset`
+// sequence frames from the clip's own in-point, so trims and splits of the clip carry its takes along.
+struct Take {
+    Id mediaId = 0;
+    double offset = 0;
+    std::string name;
+    bool operator==(const Take&) const = default;
+};
+
+// A grade version (core/GradeVersions.h): its name and, while it is not the one shown, its colour effects.
+struct GradeVersion {
+    std::string name;
+    std::vector<Effect> effects;
+    std::vector<int> anchors;  // where each went in the stack: how many other effects came before it
+    bool operator==(const GradeVersion&) const = default;
+};
+
+// A clip animation preset (core/ClipAnimation.h): its kind ("" = none) and how long it lasts, in seconds.
+struct ClipAnimation {
+    std::string type;
+    double seconds = 0.5;
+    bool operator==(const ClipAnimation&) const = default;
+};
 
 struct Clip {
     Id id = 0;
@@ -115,20 +237,78 @@ struct Clip {
     bool enabled = true;
     Id linkGroup = 0;            // clips sharing a non-zero link group act as one
     int colorLabel = 0;
+    // Audio role (Final Cut's roles, Premiere's clip types): "Dialogue", "Music", "Effects" or the editor's own; ""
+    // = none. A sequence can mute a role, and stems can be split by role.
+    std::string role;
     std::string blendMode = "normal";
     Effect generator;            // non-empty type => clip is generated, not decoded
     Effect motion;               // fixed "transform" attributes (video clips)
     Effect audio;                // fixed "volume" attributes (audio clips)
+    Effect timing;               // fixed "time" attributes: Time Remapping speed (%) and frame sampling
     std::vector<Effect> effects; // filter stack, applied in order
+    std::string unrendered;      // after Render and Replace: the clip as it was (JSON), for Restore
+    int angle = 0;               // multicam video clip: the angle shown (video track of the multicam sequence)
+    int audioAngle = -1;         // multicam audio clip: the audio track played, -1 = all of them
+    // Source channels played (Premiere's Modify > Audio Channels): indexes into every channel of the file's audio
+    // streams, in order (MediaItem::audioStreams). Empty = the main audio stream mixed to stereo. One channel plays
+    // in the centre, two as left and right; with more, the first, third... go left and the others right.
+    std::vector<int> channels;
 
     FrameTime end() const { return start + duration; }
     bool contains(FrameTime t) const { return t >= start && t < end(); }
     bool isGenerator() const { return !generator.empty(); }
     // Source position, in sequence frames, displayed at timeline frame t.
     double sourceFrameAt(FrameTime t) const;
+    // The same at a fractional clip-local time (audio is sampled between frames).
+    double sourceAt(double local) const;
     // Number of source frames consumed by the clip.
-    double sourceExtent() const { return double(duration) * speed; }
+    double sourceExtent() const { return sourceOffset(double(duration)); }
+    // Time Remapping: the speed curve (timing "speed", % of `speed`) is keyframed.
+    // Reversed clips play at their constant speed.
+    bool ramped() const;
+    // Source frames per timeline frame at clip-local time `local`.
+    double speedAt(double local) const;
+    // Source frames consumed over clip-local [0, local) (the speed integrated; negative before 0).
+    double sourceOffset(double local) const;
+    // The clip-local time showing source position `source` (sequence frames).
+    double localForSource(double source) const;
+    // Clip markers (Premiere's and Final Cut's): on the clip's source, in source frames like sourceIn, so they stay
+    // on the same moment of the media through moves, trims and splits. Shown where that moment is in the clip.
+    std::vector<Marker> markers;
+    // Where marker m falls on the timeline, or -1 when the clip does not show that moment.
+    FrameTime markerFrame(const Marker& m) const;
+    // An audition (core/EditOps.h pickTake): every take, the clip's own included as takes[take]; empty for a plain clip.
+    std::vector<Take> takes;
+    int take = 0;
+    // Animation presets (core/ClipAnimation.h): an entrance, an exit and a repeating motion on top of the transform.
+    ClipAnimation animIn, animOut, animLoop;
+    // Grade versions (core/GradeVersions.h): empty for a clip with one grade; the shown one's effects are in `effects`.
+    std::vector<GradeVersion> gradeVersions;
+    int gradeVersion = 0;
+    Id colorGroup = 0;  // the colour group it is graded with (Sequence::colorGroups), 0 = none
     bool operator==(const Clip&) const = default;
+};
+
+// A colour group (Resolve's groups, core/ColorGroups.h): clips graded together. Its pre-clip grade runs on each member
+// before the clip's own effects (to match the shots), its post-clip grade after them (the group's look). Keyframes in
+// either are timed from each clip's start.
+// One scene of HDR10+ dynamic metadata (SMPTE ST 2094-40): what an HDR10+ display needs to tone map it, measured on
+// the PQ picture in linear light (render/Hdr10Plus.h).
+struct Hdr10PlusScene {
+    FrameTime start = 0, end = 0;   // sequence frames [start, end)
+    double maxScl[3] = {0, 0, 0};   // cd/m²: the brightest red, green and blue anywhere in the scene
+    double average = 0;             // cd/m²: the mean over the scene of each pixel's brightest channel (maxRGB)
+    double percentiles[7] = {};     // cd/m²: maxRGB at 1, 25, 50, 75, 90, 95 and 99.98 % of the scene's pixels
+    std::string key;                // a fingerprint of the frames measured, to tell when the cut has changed under it
+    bool operator==(const Hdr10PlusScene&) const = default;
+};
+
+struct ColorGroup {
+    Id id = 0;      // also the owner of its pre-clip effects (edit::effectChain)
+    Id postId = 0;  // the owner of its post-clip effects
+    std::string name;
+    std::vector<Effect> pre, post;
+    bool operator==(const ColorGroup&) const = default;
 };
 
 struct Transition {
@@ -139,6 +319,23 @@ struct Transition {
     FrameTime duration = 15;    // centred on the edit point
     Effect params;              // type-specific parameters (e.g. wipe softness)
     bool operator==(const Transition&) const = default;
+};
+
+// Where a track or bus sits in a surround mix (core/Surround.h): its position
+// (x left to right, y back to front, both -1..1; the edge of the circle is at
+// the speakers, nearer the middle spreads it over all of them; z its height in
+// immersive layouts), how far apart
+// its left and right channels are (1: as wide as the front pair, 0: one
+// point), and how much goes to the LFE. The default puts a stereo track on
+// the front left and right speakers, as in stereo.
+struct SurroundPan {
+    double x = 0;
+    double y = 1;
+    double width = 1;
+    double lfeDb = -100;  // -100 = none
+    double z = 0;         // height in immersive layouts: 0 at the ear, 1 overhead
+    bool object = false;  // an audio object in immersive masters (render/Adm.h), not part of the bed
+    bool operator==(const SurroundPan&) const = default;
 };
 
 struct Track {
@@ -154,16 +351,33 @@ struct Track {
     double volumeDb = 0;  // audio track fader
     double pan = 0;       // audio track pan -1..1
     int height = 0;       // UI hint, 0 = default
+    std::vector<Effect> effects;  // audio track inserts, before the fader (keyframes in timeline frames)
+    Id output = 0;                // audio: the bus the track feeds, 0 = master
+    SurroundPan surround;         // audio, in 5.1 and 7.1 sequences
+    // Fader automation (core/Automation.h): volume (dB) and pan lanes keyed in timeline frames, and the
+    // AutomationMode (0 Off, 1 Read, 2 Write, 3 Latch, 4 Touch).
+    Param volumeAuto, panAuto;
+    // Surround position lanes (x, y, z as in SurroundPan), keyed in timeline frames and played in the same mode: a
+    // sound, or an ADM object, moving round the room.
+    Param surroundXAuto, surroundYAuto, surroundZAuto;
+    int automation = 1;
+    // Track folder (Resolve's Fairlight folders): tracks of a kind with the same folder, next to each other, show under
+    // one header that can collapse them and mute, solo or hide them together. "" = none.
+    std::string folder;
     bool operator==(const Track&) const = default;
 };
 
-struct Marker {
-    FrameTime t = 0;
-    FrameTime duration = 0;
-    std::string name;
-    std::string comment;
-    int color = 0;
-    bool operator==(const Marker&) const = default;
+// An audio bus (submix): tracks routed to it are summed, run through its
+// effects, fader and pan, and go to the master.
+struct Bus {
+    Id id = 0;
+    std::string name = "Bus";
+    std::vector<Effect> effects;
+    double volumeDb = 0;
+    double pan = 0;
+    bool muted = false;
+    SurroundPan surround;
+    bool operator==(const Bus&) const = default;
 };
 
 struct Sequence {
@@ -173,9 +387,29 @@ struct Sequence {
     int height = 1080;
     Rational fps{30, 1};
     int sampleRate = 48000;
+    std::string audioLayout = "stereo";  // "stereo", "5.1" or "7.1" (core/Surround.h)
     std::vector<Track> videoTracks;   // [0] = V1 (bottom-most)
     std::vector<Track> audioTracks;   // [0] = A1
     std::vector<Marker> markers;
+    std::vector<CaptionTrack> captionTracks;  // subtitles, drawn above the video tracks
+    std::vector<Bus> buses;                   // audio submixes
+    std::vector<Effect> masterEffects;        // on the final mix, before the master fader
+    double masterVolumeDb = 0;
+    bool multicam = false;              // a multicam clip's sequence: video tracks are angles (Multicam.h)
+    std::vector<std::string> collapsedFolders;  // track folders shown collapsed: "V/name" or "A/name"
+    std::map<std::string, double> folderGains;  // audio track folders' faders (a VCA over their tracks), dB, by "A/name"
+    std::vector<std::string> mutedRoles;  // audio roles not heard (clip roles, see Clip::role)
+    std::vector<ColorGroup> colorGroups;   // clips graded together (core/ColorGroups.h)
+    std::vector<AdrCue> adrCues;           // lines to re-record, in time order (core/Adr.h)
+    std::string colorSpace = "rec709";  // working and delivery space (ColorSpace.h id)
+    double hdrPeakNits = 1000;          // mastering peak for HDR spaces
+    double hdrMaxCll = 0, hdrMaxFall = 0;  // measured light levels (Analyse HDR Light Levels), nits; 0 = not measured
+    std::vector<Hdr10PlusScene> hdr10Plus;  // HDR10+ metadata from the same analysis (PQ only), in time order
+    bool spherical = false;             // a 360° sequence (equirectangular): exports say so to players and YouTube
+    bool vr180 = false;                 // with spherical: half the sphere in front (VR180), as stereo VR180 cameras shoot
+    // Stereoscopic 3D: the sequence is made for two eyes (its size is one eye's); each is rendered from stereo footage's
+    // own eye, clips' Stereo 3D effect placing them in depth; exports pack the eyes (render/Stereo.h).
+    bool stereo3d = false;
     FrameTime inPoint = -1;   // In / Out marks; both frames are included, -1 = unset
     FrameTime outPoint = -1;
     FrameTime playhead = 0;
@@ -189,8 +423,17 @@ struct Project {
     std::string name = "Untitled";
     std::vector<MediaItem> media;
     std::vector<Sequence> sequences;
+    std::vector<std::string> bins;  // bin paths ("Interviews/Day 1"), including empty ones
+    std::vector<SmartBin> smartBins;
+    std::vector<Person> people;  // the people found in the footage (FaceIndex.h), with their names
+    std::vector<std::string> fillerWords;  // the editor's own filler words or phrases (core/TranscriptEdit.h)
+    std::vector<std::string> vocabulary;   // names and terms speech-to-text should expect (core/TranscriptCorrect.h)
+    std::vector<std::string> watchFolders;  // folders whose arriving media files are imported (app/EditorState)
     Id activeSequence = 0;
     Id nextId = 1;
+    // Whether its media's stereo packing (MediaItem::stereo) has been read: false for a project saved before Montage
+    // read it, until media/Decoder.h checkStereoMedia looks (not saved).
+    bool stereoChecked = true;
 
     Id newId() { return nextId++; }
     MediaItem* findMedia(Id id);

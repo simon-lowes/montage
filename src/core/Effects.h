@@ -7,6 +7,7 @@
 #pragma once
 
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "Model.h"
@@ -38,7 +39,12 @@ struct ParamInfo {
     bool keyframeable = true;
 };
 
-enum class StringKind { Text, MultilineText, File, Font, Choice, Curve };
+// Dynamic: an editable list whose entries depend on the effect's other
+// settings (the colour spaces of the chosen OCIO config, for example).
+// Curve: a tone curve (in -> out). HueCurve and LevelCurve: a change against
+// hue (wrapping round) or against luma/saturation, 0.5 meaning none.
+// Track: an audio track of the sequence by its id (a sidechain key), "" = none.
+enum class StringKind { Text, MultilineText, File, Font, Choice, Curve, Dynamic, HueCurve, LevelCurve, ColorWarp, Track };
 
 struct StringParamInfo {
     std::string name;
@@ -46,6 +52,7 @@ struct StringParamInfo {
     StringKind kind = StringKind::Text;
     std::string def;
     std::vector<std::string> choices;
+    std::string fileFilter;  // File: the open dialog's filter, e.g. "LUT files (*.cube)"
 };
 
 struct EffectInfo {
@@ -55,11 +62,57 @@ struct EffectInfo {
     std::string group;  // UI grouping, e.g. "Color", "Blur & Sharpen", "Keying"
     std::vector<ParamInfo> params;
     std::vector<StringParamInfo> strings;
+    // Not offered in effect lists (e.g. "plugin", added per installed plugin).
+    bool hidden = false;
 };
 
 const std::vector<EffectInfo>& effectCatalog();
+
+// The HDR Palette's zones, darkest first: the dark three reach every tone below their range, the bright three every
+// tone above it (stops from mid grey), each fading out over its falloff.
+struct HdrZone {
+    const char* name;   // parameter prefix: "black", "dark", "shadow", "light", "highlight", "specular"
+    const char* label;
+    double range, falloff;
+    bool dark;
+};
+const std::vector<HdrZone>& hdrZones();
 const EffectInfo* findEffectInfo(const std::string& type);
+
+// Ready-made titles (lower thirds, call-outs...): listed as generators of
+// their own, they make a "title" generator with these settings.
+struct TitleTemplate {
+    const char* id;
+    const char* name;
+    std::vector<std::pair<const char*, double>> params;
+    std::vector<std::pair<const char*, const char*>> strings;
+};
+const std::vector<TitleTemplate>& titleTemplates();
+const TitleTemplate* findTitleTemplate(const std::string& id);
 std::vector<const EffectInfo*> effectsInCategory(EffectCategory c);
+
+// The parameters the inspector shows for an effect: the catalogue entry's,
+// or for "plugin" effects those recorded when the plugin was added
+// (keys "param.<id>", described by strings "meta.<id>").
+std::vector<ParamInfo> effectParams(const Effect& e);
+std::string pluginParamMeta(const ParamInfo& p);
+
+// The mask every video filter can have (params "mask.*", absent = no mask):
+// an ellipse or rectangle in the clip's source frame (centre and size as
+// fractions of the frame, feather and expansion in sequence pixels), a drawn
+// Bézier path in that box (shape 5, core/MaskPath.h), a gradient across it
+// (shape 6), the people in the picture (shape 4, media/Matting.h), an HSL
+// qualifier that selects colours, and/or a depth qualifier that selects a
+// range of distances. The filter is applied through it.
+const EffectInfo& maskInfo();
+bool supportsMask(const std::string& effectType);
+bool hasMask(const Effect& e, FrameTime t);
+// The effect works from the picture's depth (a depth effect, or a depth qualifier).
+bool needsDepth(const Effect& e, FrameTime t);
+// The effect works from the faces in the picture (Face Refinement, Blemish Remover, Redact Faces).
+bool needsFaces(const Effect& e);
+// The effect works from the people in the picture (Remove Background, or a People mask).
+bool needsPersonMatte(const Effect& e, FrameTime t);
 
 // Builds an Effect of the given type populated with default values.
 Effect makeEffect(Project& p, const std::string& type);
