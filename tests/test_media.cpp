@@ -4320,13 +4320,16 @@ private slots:
         QVERIFY(!r.ok && r.error.contains("onto the card"));
         r = offloadCard(card, {root + "/twice", root + "/twice/../twice/"}, os);
         QVERIFY(!r.ok && r.error.contains("twice") && !QFileInfo::exists(root + "/twice"));
-        // A link is reported, never followed; a card with no files is an error, not a success.
+        // A link is reported, never followed (QFile::link makes a symbolic link except on Windows, where it makes a
+        // shortcut file, which is a file like any other); a card with no files is an error, not a success.
+#ifndef Q_OS_WIN
         QVERIFY(QDir().mkpath(root + "/linked/L001"));
         put(root + "/linked/L001/real.wav", "data");
         QVERIFY(QFile::link(root + "/linked/L001/real.wav", root + "/linked/L001/alias.wav"));
         r = offloadCard(root + "/linked/L001", {root + "/linkcopy"}, os);
         QVERIFY(!r.ok && r.issues.size() == 1 && r.issues[0].path == "alias.wav");
         QVERIFY(QFileInfo::exists(root + "/linkcopy/L001/real.wav") && !QFileInfo::exists(root + "/linkcopy/L001/alias.wav"));
+#endif
         QVERIFY(QDir().mkpath(root + "/blank/E001/DCIM"));
         r = offloadCard(root + "/blank/E001", {root + "/blankcopy"}, os);
         QVERIFY(!r.ok && r.error.contains("no files"));
