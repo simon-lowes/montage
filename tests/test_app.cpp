@@ -60,6 +60,7 @@
 #include "ExportDialog.h"
 #include "ExposureView.h"
 #include "QualityCheckDialog.h"
+#include "OffloadDialog.h"
 #include "SpellUi.h"
 #include "core/ColorGroups.h"
 #include "core/Interpretation.h"
@@ -3458,6 +3459,46 @@ private slots:
         state()->undo();
         QCOMPARE(edit::soloedTracks(*state()->sequence()), soloed);
         state()->setSelection({}, false);
+    }
+
+    void offloadCardDialog() {
+        state()->newProject();
+        // A card: a recording and its sidecar.
+        const QString card = dir_.path() + "/cards/A007";
+        QVERIFY(QDir().mkpath(card + "/CLIPS"));
+        {
+            WavWriter w;
+            QVERIFY(w.open(card + "/CLIPS/A007C001.wav", 48000, 1));
+            std::vector<float> tone(4800, 0.1f);
+            w.write(tone.data(), int(tone.size()));
+            QVERIFY(w.close());
+            QFile f(card + "/A007.xml");
+            QVERIFY(f.open(QIODevice::WriteOnly) && f.write("<clip/>") > 0);
+        }
+        QVERIFY(win_->findChild<QAction*>("offloadCard") && win_->findChild<QAction*>("verifyMhl"));
+        OffloadDialog dlg(state(), win_.get());
+        dlg.findChild<QListWidget*>("offloadDestinations")->clear();  // whatever an earlier run remembered
+        dlg.setSource(card);
+        dlg.addDestination(dir_.path() + "/drive1");
+        dlg.addDestination(dir_.path() + "/drive2");
+        dlg.findChild<QCheckBox*>("offloadImport")->setChecked(true);
+        dlg.findChild<QCheckBox*>("offloadVerify")->setChecked(true);
+        dlg.findChild<QCheckBox*>("offloadMhl")->setChecked(true);
+        const OffloadResult r = dlg.run();
+        QVERIFY2(r.ok, qPrintable(dlg.report()));
+        QVERIFY2(dlg.report().contains("every copy matches"), qPrintable(dlg.report()));
+        QVERIFY(QFileInfo::exists(dir_.path() + "/drive2/A007/CLIPS/A007C001.wav"));
+        QCOMPARE(QDir(dir_.path() + "/drive1/A007/ascmhl").entryList({"*.mhl"}).size(), qsizetype(1));
+        // The copied recording, in a bin named after the card (the sidecar is not media).
+        const auto& media = state()->project().media;
+        QCOMPARE(media.size(), size_t(1));
+        QCOMPARE(media[0].bin, std::string("A007"));
+        QVERIFY(QString::fromStdString(media[0].path).startsWith(dir_.path() + "/drive1/A007/"));
+        // Verified later, with a generation recorded.
+        QString report;
+        const MhlVerifyResult v = verifyMhlWithProgress(win_.get(), dir_.path() + "/drive2/A007", true, &report);
+        QVERIFY2(v.ok && v.verified == 2 && !v.generation.isEmpty(), qPrintable(report));
+        QVERIFY2(report.contains("match"), qPrintable(report));
     }
 
     void syncIndicators() {

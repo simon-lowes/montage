@@ -52,6 +52,7 @@
 #include "media/Decoder.h"
 #include "media/HwAccel.h"
 #include "media/Loudness.h"
+#include "media/Offload.h"
 #include "media/MediaPool.h"
 #include "media/Relink.h"
 #include "media/SpeakerSwitch.h"
@@ -4134,6 +4135,261 @@ private slots:
         // The gain recovers over the release after the burst: well down soon after, nearly back 5 releases later.
         QVERIFY(std::fabs(out[size_t(25000 + delay) * 2]) < 0.9f * std::fabs(in[size_t(25000) * 2]) + 1e-6f || std::fabs(in[size_t(25000) * 2]) < 0.01f);
         for (int i = 45000; i < 45100; ++i) QVERIFY(std::fabs(out[size_t(i + delay) * 2] - in[size_t(i) * 2]) < 0.002f);
+    }
+
+    void cardOffloadWithMhl() {
+        // The hashes, against xxHash's and the C4 reference implementations.
+        QCOMPARE(xxh64Hex(Xxh64::of("", 0)), std::string("ef46db3751d8e999"));
+        QCOMPARE(xxh64Hex(Xxh64::of("abc", 3)), std::string("44bc2cf5ad770999"));
+        QCOMPARE(xxh64Hex(Xxh64::of("hello world\n", 12)), std::string("5215e13b207d6d8c"));
+        QCOMPARE(xxh64Hex(Xxh64::of("0123456789abcdef0123456789abcdef!", 33)), std::string("8afff4daac4e677e"));
+        std::vector<unsigned char> big(100000);
+        for (size_t i = 0; i < big.size(); ++i) big[i] = static_cast<unsigned char>((i * 7 + 3) % 256);
+        QCOMPARE(xxh64Hex(Xxh64::of(big.data(), big.size())), std::string("953e8a6a68df79c4"));
+        {
+            Xxh64 x;  // fed in odd pieces
+            size_t at = 0;
+            for (size_t n : {1, 31, 32, 33, 1000, 7, 64}) {
+                x.update(big.data() + at, n);
+                at += n;
+            }
+            x.update(big.data() + at, big.size() - at);
+            QCOMPARE(xxh64Hex(x.digest()), std::string("953e8a6a68df79c4"));
+        }
+        QCOMPARE(c4Id(QByteArray()), std::string("c459dsjfscH38cYeXXYogktxf4Cd9ibshE3BHUo6a58hBXmRQdZrAkZzsWcbWtDg5oQstpDuni4Hirj75GEmTc1sFT"));
+        QCOMPARE(c4Id("abc"), std::string("c45S4rnaTNWonxss1u8LzsaJdEph1AJhWUF4sh2waXKMsutyfAxg4ybUeuXVWS9HdNcEypmeXn8FZGonD4w1rj9DZp"));
+
+        // A card: two clips (one larger than a read), a sidecar, an empty file, an empty folder and macOS's leavings.
+        const QString root = QString::fromStdString(path("offload"));
+        const QString card = root + "/A001";
+        QVERIFY(QDir().mkpath(card + "/CLIPS") && QDir().mkpath(card + "/EMPTY"));
+        auto put = [](const QString& f, const QByteArray& b) {
+            QFile out(f);
+            QVERIFY(out.open(QIODevice::WriteOnly) && out.write(b) == b.size());
+        };
+        auto read = [](const QString& f) {
+            QFile in(f);
+            return in.open(QIODevice::ReadOnly) ? in.readAll() : QByteArray();
+        };
+        QByteArray clip1(9 << 20, 0);
+        for (int i = 0; i < clip1.size(); ++i) clip1[i] = char((i * 31 + (i >> 12)) & 0xff);
+        put(card + "/CLIPS/C001.mov", clip1);
+        put(card + "/CLIPS/C002.mov", QByteArray(1000, 'x'));
+        put(card + "/card.xml", "<card id=\"A001\"/>\n");
+        put(card + "/empty.txt", QByteArray());
+        put(card + "/.DS_Store", "junk");
+        put(card + "/CLIPS/._C001.mov", "junk");
+        const QDateTime shot = QDateTime::fromString("2026-09-01T10:00:00Z", Qt::ISODate);
+        {
+            QFile f(card + "/CLIPS/C002.mov");
+            QVERIFY(f.open(QIODevice::ReadWrite) && f.setFileTime(shot, QFileDevice::FileModificationTime));
+        }
+
+        // Offloaded to two drives at once.
+        OffloadSettings os;
+        os.author = "DIT";
+        os.location = "Stage 4";
+        std::vector<double> seen;
+        OffloadResult r = offloadCard(card, {root + "/shuttle", root + "/raid"}, os, [&](double f, const QString&) {
+            seen.push_back(f);
+            return true;
+        });
+        auto issues = [](const OffloadResult& o) {
+            QStringList l{o.error};
+            for (const OffloadIssue& i : o.issues) l << i.path + ": " + i.problem;
+            return l.join("; ");
+        };
+        QVERIFY2(r.ok, qPrintable(issues(r)));
+        QCOMPARE(r.files, 4);
+        QCOMPARE(r.bytes, qint64(clip1.size() + 1000 + 18));
+        QCOMPARE(r.copies, QStringList({root + "/shuttle/A001", root + "/raid/A001"}));
+        QVERIFY(!seen.empty() && std::is_sorted(seen.begin(), seen.end()) && seen.back() == 1.0);
+        for (const QString& copy : r.copies) {
+            QCOMPARE(read(copy + "/CLIPS/C001.mov"), clip1);
+            QCOMPARE(read(copy + "/CLIPS/C002.mov"), QByteArray(1000, 'x'));
+            QVERIFY(QFileInfo::exists(copy + "/empty.txt") && QFileInfo(copy + "/EMPTY").isDir());
+            QVERIFY(!QFileInfo::exists(copy + "/.DS_Store") && !QFileInfo::exists(copy + "/CLIPS/._C001.mov"));
+            QCOMPARE(QFileInfo(copy + "/CLIPS/C002.mov").lastModified().toUTC(), shot);
+            QVERIFY(QDir(copy + "/CLIPS").entryList({"*.montage-part"}, QDir::Files).isEmpty());
+            const std::vector<MhlGeneration> h = readMhlHistory(copy);
+            QCOMPARE(h.size(), size_t(1));
+            QCOMPARE(h[0].process, QString("transfer"));
+            QCOMPARE(h[0].tool, QString("Montage"));
+            QCOMPARE(h[0].entries.size(), size_t(4));
+            for (const MhlEntry& e : h[0].entries) {
+                QCOMPARE(e.hashes.size(), size_t(1));
+                QCOMPARE(e.hashes[0].format, QString("xxh64"));
+                QCOMPARE(e.hashes[0].action, QString("original"));
+                if (e.path == "CLIPS/C001.mov") {
+                    QCOMPARE(e.hashes[0].value.toStdString(), xxh64Hex(Xxh64::of(clip1.constData(), size_t(clip1.size()))));
+                    QCOMPARE(e.size, qint64(clip1.size()));
+                }
+            }
+            const MhlVerifyResult v = verifyMhl(copy, false);
+            QVERIFY2(v.ok && v.verified == 4 && v.added.isEmpty(), qPrintable(v.error + v.changed.join(",") + v.added.join(",")));
+        }
+
+        // A flipped byte in one copy is found, and a new generation records it as failed.
+        {
+            QByteArray b = read(root + "/raid/A001/CLIPS/C002.mov");
+            b[500] = 'y';
+            put(root + "/raid/A001/CLIPS/C002.mov", b);
+        }
+        MhlVerifyResult v = verifyMhl(root + "/raid/A001", true, os);
+        QVERIFY(!v.ok);
+        QCOMPARE(v.changed, QStringList{"CLIPS/C002.mov"});
+        QCOMPARE(v.verified, 3);
+        QVERIFY(v.generation.startsWith("0002_A001_"));
+        {
+            const std::vector<MhlGeneration> h = readMhlHistory(root + "/raid/A001");
+            QCOMPARE(h.size(), size_t(2));
+            QCOMPARE(h[1].process, QString("in-place"));
+            for (const MhlEntry& e : h[1].entries)
+                QCOMPARE(e.hashes.back().action, QString(e.path == "CLIPS/C002.mov" ? "failed" : "verified"));
+        }
+        // A file gone and one added are both reported.
+        QVERIFY(QFile::remove(root + "/shuttle/A001/card.xml"));
+        put(root + "/shuttle/A001/notes.txt", "notes");
+        v = verifyMhl(root + "/shuttle/A001", false);
+        QVERIFY(!v.ok);
+        QCOMPARE(v.missing, QStringList{"card.xml"});
+        QCOMPARE(v.added, QStringList{"notes.txt"});
+        // Offloading again resumes: what is there is checked and kept, the missing file copied, a second generation.
+        r = offloadCard(card, {root + "/shuttle"}, os);
+        QVERIFY2(r.ok, qPrintable(issues(r)));
+        QCOMPARE(r.alreadyThere, 3);
+        QCOMPARE(read(root + "/shuttle/A001/card.xml"), QByteArray("<card id=\"A001\"/>\n"));
+        {
+            const std::vector<MhlGeneration> h = readMhlHistory(root + "/shuttle/A001");
+            QCOMPARE(h.size(), size_t(2));
+            QCOMPARE(h[1].entries.size(), size_t(4));
+            for (const MhlEntry& e : h[1].entries) QCOMPARE(e.hashes.back().action, QString("verified"));
+        }
+        // A different file already at the destination is reported and left alone.
+        QVERIFY(QDir().mkpath(root + "/clash/A001"));
+        put(root + "/clash/A001/card.xml", "other");
+        r = offloadCard(card, {root + "/clash"}, os);
+        QVERIFY(!r.ok && r.issues.size() == 1 && r.issues[0].path == "card.xml");
+        QCOMPARE(read(root + "/clash/A001/card.xml"), QByteArray("other"));
+
+        // A card with its own hash list: checked against it, the list carried to the copy, changes on the card caught.
+        v = verifyMhl(card, true, os);
+        QVERIFY2(v.ok && v.added.size() == 4, qPrintable(v.error));
+        r = offloadCard(card, {root + "/archive"}, os);
+        QVERIFY2(r.ok, qPrintable(issues(r)));
+        {
+            const std::vector<MhlGeneration> h = readMhlHistory(root + "/archive/A001");
+            QCOMPARE(h.size(), size_t(2));
+            QCOMPARE(h[0].process, QString("in-place"));
+            for (const MhlEntry& e : h[1].entries) QCOMPARE(e.hashes.back().action, QString("verified"));
+        }
+        {
+            QByteArray b = read(card + "/CLIPS/C002.mov");
+            b[10] = 'z';
+            put(card + "/CLIPS/C002.mov", b);
+        }
+        r = offloadCard(card, {root + "/archive2"}, os);
+        QVERIFY(!r.ok && r.issues.size() == 1 && r.issues[0].path == "CLIPS/C002.mov");
+        // Refused onto the card itself; stopping leaves no half-written file or hash list.
+        r = offloadCard(card, {card + "/backup/day1"}, os);
+        QVERIFY(!r.ok && !r.error.isEmpty());
+        QVERIFY(!QFileInfo::exists(card + "/backup"));  // nothing made on the card
+        r = offloadCard(card, {root + "/stopped"}, os, [](double, const QString&) { return false; });
+        QCOMPARE(r.error, QString("Cancelled"));
+        QVERIFY(readMhlHistory(root + "/stopped/A001").empty());
+        QVERIFY(QDir(root + "/stopped/A001/CLIPS").entryList({"*.montage-part"}, QDir::Files).isEmpty());
+
+        // MCP: a card with a recording offloaded into a project's bin, then verified and recorded.
+        {
+            const QString b = root + "/B002";
+            QVERIFY(QDir().mkpath(b));
+            writeMonoWav((b + "/take1.wav").toStdString(), std::vector<float>(4800, 0.1f), 48000);
+            put(b + "/notes.txt", "scene 4");
+            const QString project = root + "/offload.montage";
+            QVERIFY(saveProject(makeDefaultProject(), project.toStdString()));
+            McpServer server;
+            auto call = [&](const QString& tool, const QJsonObject& args) {
+                const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                      {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                             {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                                   {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+                const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+                return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+            };
+            QJsonObject res = call("montage_offload", {{"source", b}, {"destinations", QJsonArray{root + "/mcp1", root + "/mcp2"}},
+                                                       {"project", project}, {"author", "DIT"}});
+            QVERIFY2(!res.value("isError").toBool(), qPrintable(QJsonDocument(res).toJson()));
+            QJsonObject sc = res.value("structuredContent").toObject();
+            QVERIFY(sc.value("ok").toBool());
+            QCOMPARE(sc.value("files").toInt(), 2);
+            QCOMPARE(sc.value("imported").toInt(), 1);
+            Project back;
+            QVERIFY(loadProject(project.toStdString(), back));
+            QCOMPARE(back.media.size(), size_t(1));
+            QCOMPARE(back.media[0].bin, std::string("B002"));
+            QVERIFY(QString::fromStdString(back.media[0].path).startsWith(root + "/mcp1/B002/"));
+            res = call("montage_verify_mhl", {{"folder", root + "/mcp2/B002"}});
+            sc = res.value("structuredContent").toObject();
+            QVERIFY2(sc.value("ok").toBool() && sc.value("verified").toInt() == 2, qPrintable(QJsonDocument(res).toJson()));
+            res = call("montage_verify_mhl", {{"folder", root + "/mcp2/B002"}, {"record", true}});
+            QVERIFY(res.value("structuredContent").toObject().value("generation").toString().startsWith("0002_B002_"));
+            QVERIFY(call("montage_offload", {{"source", root + "/nothing"}, {"destinations", QJsonArray{root + "/mcp1"}}}).value("isError").toBool());
+        }
+
+        // The ASC's own tool reads what Montage writes, and Montage reads what it writes.
+        const QString tools = QString::fromLocal8Bit(qgetenv("MONTAGE_TEST_ASCMHL"));
+        if (tools.isEmpty()) return;
+        auto run = [&](const QString& program, const QStringList& args) {
+            QProcess pr;
+            pr.start(tools + '/' + program, args);
+            pr.waitForFinished(120000);
+            const QString out = QString::fromLocal8Bit(pr.readAllStandardOutput() + pr.readAllStandardError());
+            return std::make_pair(pr.exitStatus() == QProcess::NormalExit ? pr.exitCode() : -1, out);
+        };
+        const QString clean = root + "/clean/A001";
+        r = offloadCard(card, {root + "/clean"}, os);  // the card's list says C002 changed; the copy records it as failed
+        const std::vector<MhlGeneration> ch = readMhlHistory(clean);
+        QCOMPARE(ch.size(), size_t(2));
+        const QString xsd = QString::fromLocal8Bit(qgetenv("MONTAGE_TEST_ASCMHL_XSD"));
+        if (!xsd.isEmpty()) {
+            for (const MhlGeneration& g : ch) {
+                const auto [code, out] = run("ascmhl-debug", {"xsd-schema-check", "-xsd", xsd + "/ASCMHL.xsd", clean + "/ascmhl/" + g.file});
+                QVERIFY2(code == 0, qPrintable(out));
+            }
+            const auto [code, out] = run("ascmhl-debug", {"xsd-schema-check", "-df", "-xsd", xsd + "/ASCMHLDirectory__combined.xsd", clean + "/ascmhl/ascmhl_chain.xml"});
+            QVERIFY2(code == 0, qPrintable(out));
+        }
+        // The card put back as its hash list has it, a fresh copy that ascmhl verifies file by file and by folder hashes.
+        {
+            QByteArray b = read(card + "/CLIPS/C002.mov");
+            b[10] = 'x';
+            put(card + "/CLIPS/C002.mov", b);
+        }
+        const QString fresh = root + "/fresh/A001";
+        r = offloadCard(card, {root + "/fresh"}, os);
+        QVERIFY2(r.ok, qPrintable(issues(r)));
+        for (const QStringList& args : {QStringList{"verify", fresh}, QStringList{"verify", "-dh", "-h", "xxh64", fresh}}) {
+            const auto [code, out] = run("ascmhl-debug", args);
+            QVERIFY2(code == 0 && !out.contains("ERROR", Qt::CaseInsensitive), qPrintable(args.join(' ') + ": " + out));
+        }
+        {
+            const auto [code, out] = run("ascmhl", {"diff", fresh});
+            QVERIFY2(code == 0, qPrintable(out));
+        }
+        // ascmhl adds its own generation, verifying every file against Montage's; Montage reads it and verifies again.
+        {
+            const auto [code, out] = run("ascmhl", {"create", "-h", "xxh64", fresh});
+            QVERIFY2(code == 0 && !out.contains("ERROR", Qt::CaseInsensitive), qPrintable(out));
+        }
+        const std::vector<MhlGeneration> fh = readMhlHistory(fresh);
+        QCOMPARE(fh.size(), size_t(3));
+        QCOMPARE(fh[2].tool, QString("ascmhl"));
+        QCOMPARE(fh[2].entries.size(), size_t(4));
+        for (const MhlEntry& e : fh[2].entries) QCOMPARE(e.hashes.back().action, QString("verified"));
+        v = verifyMhl(fresh, true, os);
+        QVERIFY2(v.ok && v.verified == 4, qPrintable(v.error));
+        const auto [code, out] = run("ascmhl-debug", {"verify", fresh});
+        QVERIFY2(code == 0 && !out.contains("ERROR", Qt::CaseInsensitive), qPrintable(out));
     }
 
     void mcpSyncCheck() {

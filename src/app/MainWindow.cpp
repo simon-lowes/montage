@@ -93,6 +93,7 @@
 #include "AutoMixDialog.h"
 #include "ScriptCutDialog.h"
 #include "QualityCheckDialog.h"
+#include "OffloadDialog.h"
 #include "ProjectManagerDialog.h"
 #include "LinkMediaDialog.h"
 #include "EffectPresetStore.h"
@@ -707,6 +708,23 @@ void MainWindow::buildMenus() {
         ProjectManagerDialog dlg(state_, this);
         if (dlg.exec() == QDialog::Accepted) runProjectManager(dlg.options());
     })->setObjectName(QStringLiteral("projectManager"));
+    add(file, tr("&Offload Card…"), QKeySequence(), [this] {
+        OffloadDialog dlg(state_, this);
+        dlg.exec();
+    })->setObjectName(QStringLiteral("offloadCard"));
+    add(file, tr("Verify Media &Hash List…"), QKeySequence(), [this] {
+        const QString folder = QFileDialog::getExistingDirectory(this, tr("Verify a Folder Against Its ASC MHL Hash List"));
+        if (folder.isEmpty()) return;
+        QString report;
+        const MhlVerifyResult v = verifyMhlWithProgress(this, folder, false, &report);
+        QMessageBox box(v.ok ? QMessageBox::Information : QMessageBox::Warning, tr("Verify Media Hash List"), report, QMessageBox::Close, this);
+        QPushButton* record = v.error.isEmpty() ? box.addButton(tr("Record a Generation"), QMessageBox::ActionRole) : nullptr;
+        box.exec();
+        if (record && box.clickedButton() == record) {
+            verifyMhlWithProgress(this, folder, true, &report);
+            QMessageBox::information(this, tr("Verify Media Hash List"), report);
+        }
+    })->setObjectName(QStringLiteral("verifyMhl"));
     add(file, tr("&Link Media…"), QKeySequence(), [this] { showLinkMedia(); })->setObjectName(QStringLiteral("linkMediaAction"));
     add(file, tr("Export &Frame…"), QKeySequence("Ctrl+Shift+E"), [this] { exportFrame(); });
     add(file, tr("Export &VFX Pulls…"), QKeySequence(), [this] { vfxPullDialog(); })->setObjectName(QStringLiteral("vfxPulls"));

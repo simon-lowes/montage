@@ -4,6 +4,7 @@
 #include <QColor>
 #include <QFile>
 #include <QDir>
+#include <QDirIterator>
 #include <QFileInfo>
 #include <QImage>
 #include <QJsonArray>
@@ -35,6 +36,7 @@
 #include "render/LightLevel.h"
 #include "render/Spherical.h"
 #include "render/ClipPlacement.h"
+#include "media/Offload.h"
 #include "media/SpeechSearch.h"
 #include "media/TextReader.h"
 #include "media/ImageSequence.h"
@@ -554,6 +556,99 @@ void McpServer::Impl::addTools() {
             if (!probeMedia(absolute(need(a, "path")).toStdString(), m, &err)) return fail(QString::fromStdString(err));
             const QJsonObject o = mediaJson(m);
             return ok(json(o), o);
+        });
+
+    add("montage_offload", "Offload a camera card",
+        "Copy a camera card (or any folder) to one or more destinations as <destination>/<card name>, as Resolve's Clone "
+        "tool and Silverstack do: each file read once and written to all of them while hashed (XXH64), each copy read back "
+        "and compared (`verify`), and an ASC MHL generation written into each copy (`mhl`). A file already at a destination "
+        "is kept when identical (an interrupted offload resumes), reported when not. A card with an ASC MHL history is "
+        "checked against it and the history carried over. With `project`, the first copy's media is imported into a bin "
+        "named after the card. Lists every problem.",
+        R"json({"type":"object","properties":{"source":{"type":"string"},"destinations":{"type":"array","items":{"type":"string"}},
+            "verify":{"type":"boolean","default":true},"mhl":{"type":"boolean","default":true},
+            "author":{"type":"string"},"location":{"type":"string"},"comment":{"type":"string"},
+            "project":{"type":"string","description":"Import the copied media into this project"}},"required":["source","destinations"]})json",
+        false, [this](const QJsonObject& a) {
+            QStringList dests;
+            for (const QJsonValue& v : a.value("destinations").toArray()) dests << absolute(v.toString());
+            if (dests.isEmpty()) throw ArgError{"\"destinations\" lists where to copy the card"};
+            OffloadSettings os;
+            os.verify = a.value("verify").toBool(true);
+            os.mhl = a.value("mhl").toBool(true);
+            os.author = str(a, "author");
+            os.location = str(a, "location");
+            os.comment = str(a, "comment");
+            const QString source = absolute(need(a, "source"));
+            const OffloadResult r = offloadCard(source, dests, os, [this](double f, const QString&) {
+                progress(f, "Offloading");
+                return true;
+            });
+            if (!r.error.isEmpty()) return fail(r.error);
+            QJsonArray issues;
+            for (const OffloadIssue& i : r.issues) issues.append(QJsonObject{{"path", i.path}, {"problem", i.problem}});
+            QJsonObject out{{"ok", r.ok}, {"files", r.files}, {"bytes", double(r.bytes)}, {"already_there", r.alreadyThere},
+                            {"copies", QJsonArray::fromStringList(r.copies)}, {"issues", issues}};
+            QString text = QStringLiteral("%1 %2 file(s) (%3 bytes) to %4 destination(s)%5.")
+                               .arg(r.ok ? "Offloaded and verified" : "Offloaded with problems:")
+                               .arg(r.files)
+                               .arg(r.bytes)
+                               .arg(r.copies.size())
+                               .arg(r.alreadyThere ? QStringLiteral(", %1 already there").arg(r.alreadyThere) : QString());
+            for (const OffloadIssue& i : r.issues) text += QStringLiteral("\n  %1: %2").arg(i.path, i.problem);
+            if (a.contains("project") && !r.copies.isEmpty()) {
+                Loaded l = open(a);
+                const std::string bin = QFileInfo(source).fileName().toStdString();
+                int imported = 0;
+                QDirIterator it(r.copies.front(), QDir::Files, QDirIterator::Subdirectories);
+                QStringList files;
+                while (it.hasNext()) {
+                    const QString f = it.next();
+                    if (!f.contains("/ascmhl/")) files << f;
+                }
+                files.sort();
+                for (const QString& f : files) {
+                    MediaItem m;
+                    if (!probeMedia(f.toStdString(), m)) continue;
+                    m.id = l.project.newId();
+                    m.bin = bin;
+                    l.project.media.push_back(m);
+                    ++imported;
+                }
+                save(l);
+                out["imported"] = imported;
+                text += QStringLiteral("\nImported %1 clip(s) into the bin \"%2\".").arg(imported).arg(QString::fromStdString(bin));
+            }
+            return ok(text, out);
+        });
+
+    add("montage_verify_mhl", "Verify a folder against its ASC MHL hash list",
+        "Check a folder (a card or an offloaded copy) against its ASC MHL history, whichever tool wrote it: each file's "
+        "latest record compared with the file now (missing, changed) and files the history lacks listed (added). With "
+        "`record`, a new generation records each file as verified, failed or original (a folder without a history gets its "
+        "first that way).",
+        R"json({"type":"object","properties":{"folder":{"type":"string"},"record":{"type":"boolean","default":false},
+            "author":{"type":"string"}},"required":["folder"]})json",
+        false, [this](const QJsonObject& a) {
+            OffloadSettings os;
+            os.author = str(a, "author");
+            const MhlVerifyResult v = verifyMhl(absolute(need(a, "folder")), a.value("record").toBool(), os, [this](double f, const QString&) {
+                progress(f, "Verifying");
+                return true;
+            });
+            if (!v.error.isEmpty()) return fail(v.error);
+            const QJsonObject out{{"ok", v.ok},
+                                  {"verified", v.verified},
+                                  {"missing", QJsonArray::fromStringList(v.missing)},
+                                  {"changed", QJsonArray::fromStringList(v.changed)},
+                                  {"added", QJsonArray::fromStringList(v.added)},
+                                  {"unchecked", QJsonArray::fromStringList(v.unchecked)},
+                                  {"generation", v.generation}};
+            QString text = v.ok ? QStringLiteral("All %1 recorded file(s) match.").arg(v.verified)
+                                : QStringLiteral("%1 match; %2 missing, %3 changed.").arg(v.verified).arg(v.missing.size()).arg(v.changed.size());
+            if (!v.added.isEmpty()) text += QStringLiteral(" %1 not in the hash list.").arg(v.added.size());
+            if (!v.generation.isEmpty()) text += QStringLiteral(" Recorded as %1.").arg(v.generation);
+            return ok(text, out);
         });
 
     add("montage_create_project", "Create a project",
