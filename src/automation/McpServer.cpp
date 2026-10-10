@@ -4,6 +4,7 @@
 #include <QColor>
 #include <QFile>
 #include <QDir>
+#include <QDirIterator>
 #include <QFileInfo>
 #include <QImage>
 #include <QJsonArray>
@@ -35,6 +36,9 @@
 #include "render/LightLevel.h"
 #include "render/Spherical.h"
 #include "render/ClipPlacement.h"
+#include "audio/SpeechCleanup.h"
+#include "core/AafImport.h"
+#include "media/Offload.h"
 #include "media/SpeechSearch.h"
 #include "media/TextReader.h"
 #include "media/ImageSequence.h"
@@ -171,6 +175,16 @@ TrackRef trackArg(const QString& name, const Sequence& s, bool mayCreate, Projec
         if (good && mayCreate && p && ms && i == count) return edit::addTrack(*p, *ms, kind);
     }
     throw ArgError{QStringLiteral("Unknown track \"%1\": use V1, V2... or A1, A2...").arg(name)};
+}
+
+// An audio track by reference ("A2") or name, as its id (a sidechain key); "" or "none" for none.
+std::string audioTrackId(const QString& ref, const Sequence& s) {
+    if (ref.trimmed().isEmpty() || ref.trimmed().compare("none", Qt::CaseInsensitive) == 0) return {};
+    for (const Track& t : s.audioTracks)
+        if (QString::fromStdString(t.name).compare(ref.trimmed(), Qt::CaseInsensitive) == 0) return std::to_string(t.id);
+    const TrackRef r = trackArg(ref, s, false);
+    if (r.kind != TrackKind::Audio) throw ArgError{QStringLiteral("A sidechain is an audio track (A1, A2... or its name)")};
+    return std::to_string(s.audioTracks[size_t(r.index)].id);
 }
 
 QString tc(FrameTime f, const Sequence& s) { return QString::fromStdString(formatTimecode(f, s.fps)); }
@@ -554,6 +568,122 @@ void McpServer::Impl::addTools() {
             if (!probeMedia(absolute(need(a, "path")).toStdString(), m, &err)) return fail(QString::fromStdString(err));
             const QJsonObject o = mediaJson(m);
             return ok(json(o), o);
+        });
+
+    add("montage_offload", "Offload a camera card",
+        "Copy a camera card (or any folder) to one or more destinations as <destination>/<card name>, as Resolve's Clone "
+        "tool and Silverstack do: each file read once and written to all of them while hashed (XXH64), each copy read back "
+        "and compared (`verify`), and an ASC MHL generation written into each copy (`mhl`). A file already at a destination "
+        "is kept when identical (an interrupted offload resumes), reported when not. A card with an ASC MHL history is "
+        "checked against it and the history carried over. With `project`, the first copy's media is imported into a bin "
+        "named after the card. Lists every problem.",
+        R"json({"type":"object","properties":{"source":{"type":"string"},"destinations":{"type":"array","items":{"type":"string"}},
+            "verify":{"type":"boolean","default":true},"mhl":{"type":"boolean","default":true},
+            "author":{"type":"string"},"location":{"type":"string"},"comment":{"type":"string"},
+            "project":{"type":"string","description":"Import the copied media into this project"}},"required":["source","destinations"]})json",
+        false, [this](const QJsonObject& a) {
+            QStringList dests;
+            for (const QJsonValue& v : a.value("destinations").toArray()) dests << absolute(v.toString());
+            if (dests.isEmpty()) throw ArgError{"\"destinations\" lists where to copy the card"};
+            OffloadSettings os;
+            os.verify = a.value("verify").toBool(true);
+            os.mhl = a.value("mhl").toBool(true);
+            os.author = str(a, "author");
+            os.location = str(a, "location");
+            os.comment = str(a, "comment");
+            const QString source = absolute(need(a, "source"));
+            std::optional<Loaded> l;
+            if (a.contains("project")) l = open(a);  // checked before a long offload, not after
+            const OffloadResult r = offloadCard(source, dests, os, [this](double f, const QString&) {
+                progress(f, "Offloading");
+                return true;
+            });
+            if (!r.error.isEmpty()) return fail(r.error);
+            QJsonArray issues;
+            for (const OffloadIssue& i : r.issues) issues.append(QJsonObject{{"path", i.path}, {"problem", i.problem}});
+            QJsonObject out{{"ok", r.ok}, {"files", r.files}, {"bytes", double(r.bytes)}, {"already_there", r.alreadyThere},
+                            {"copies", QJsonArray::fromStringList(r.copies)}, {"issues", issues}};
+            QString text = QStringLiteral("%1 %2 file(s) (%3 bytes) to %4 destination(s)%5.")
+                               .arg(r.ok ? "Offloaded and verified" : "Offloaded with problems:")
+                               .arg(r.files)
+                               .arg(r.bytes)
+                               .arg(r.copies.size())
+                               .arg(r.alreadyThere ? QStringLiteral(", %1 already there").arg(r.alreadyThere) : QString());
+            for (const OffloadIssue& i : r.issues) text += QStringLiteral("\n  %1: %2").arg(i.path, i.problem);
+            for (const QString& note : r.notes) text += QStringLiteral("\n  ") + note;
+            if (!r.notes.isEmpty()) out["notes"] = QJsonArray::fromStringList(r.notes);
+            if (l && !r.copies.isEmpty()) {
+                const std::string bin = QFileInfo(r.copies.front()).fileName().toStdString();
+                int imported = 0;
+                // Not the hash lists, half-written parts, or what the project already has (an offload resumed); runs
+                // of numbered frames (CinemaDNG, EXR...) as one image sequence each.
+                std::set<std::string> have;
+                for (const MediaItem& m : l->project.media) have.insert(m.path);
+                QDirIterator it(r.copies.front(), QDir::Files, QDirIterator::Subdirectories);
+                QStringList files;
+                while (it.hasNext()) {
+                    const QString f = it.next();
+                    if (!f.contains("/ascmhl/") && !f.endsWith(".montage-part")) files << f;
+                }
+                files.sort();
+                std::map<std::string, std::pair<ImageSequence, int>> runs;
+                for (const QString& f : files)
+                    if (ImageSequence seq; isFrameFormat(f.toStdString()) && detectImageSequence(f.toStdString(), seq)) {
+                        runs[seq.pattern].first = seq;
+                        ++runs[seq.pattern].second;
+                    }
+                std::set<std::string> made;
+                for (const QString& f : files) {
+                    std::string path = f.toStdString();
+                    if (ImageSequence seq; isFrameFormat(path) && detectImageSequence(path, seq) && runs[seq.pattern].second >= 2) {
+                        if (!made.insert(seq.pattern).second) continue;
+                        double rate = 0;
+                        seq.fps = cinemaDng(path, &rate) && rate > 0 ? rateFor(rate) : l->seq().fps;
+                        path = imageSequencePath(seq);
+                    }
+                    if (have.count(path)) continue;
+                    MediaItem m;
+                    if (!probeMedia(path, m)) continue;
+                    m.id = l->project.newId();
+                    m.bin = bin;
+                    l->project.media.push_back(m);
+                    have.insert(path);
+                    ++imported;
+                }
+                save(*l);
+                out["imported"] = imported;
+                text += QStringLiteral("\nImported %1 clip(s) into the bin \"%2\".").arg(imported).arg(QString::fromStdString(bin));
+            }
+            return ok(text, out);
+        });
+
+    add("montage_verify_mhl", "Verify a folder against its ASC MHL hash list",
+        "Check a folder (a card or an offloaded copy) against its ASC MHL history, whichever tool wrote it: each file's "
+        "latest record compared with the file now (missing, changed) and files the history lacks listed (added). With "
+        "`record`, a new generation records each file as verified, failed or original (a folder without a history gets its "
+        "first that way).",
+        R"json({"type":"object","properties":{"folder":{"type":"string"},"record":{"type":"boolean","default":false},
+            "author":{"type":"string"}},"required":["folder"]})json",
+        false, [this](const QJsonObject& a) {
+            OffloadSettings os;
+            os.author = str(a, "author");
+            const MhlVerifyResult v = verifyMhl(absolute(need(a, "folder")), a.value("record").toBool(), os, [this](double f, const QString&) {
+                progress(f, "Verifying");
+                return true;
+            });
+            if (!v.error.isEmpty()) return fail(v.error);
+            const QJsonObject out{{"ok", v.ok},
+                                  {"verified", v.verified},
+                                  {"missing", QJsonArray::fromStringList(v.missing)},
+                                  {"changed", QJsonArray::fromStringList(v.changed)},
+                                  {"added", QJsonArray::fromStringList(v.added)},
+                                  {"unchecked", QJsonArray::fromStringList(v.unchecked)},
+                                  {"generation", v.generation}};
+            QString text = v.ok ? QStringLiteral("All %1 recorded file(s) match.").arg(v.verified)
+                                : QStringLiteral("%1 match; %2 missing, %3 changed.").arg(v.verified).arg(v.missing.size()).arg(v.changed.size());
+            if (!v.added.isEmpty()) text += QStringLiteral(" %1 not in the hash list.").arg(v.added.size());
+            if (!v.generation.isEmpty()) text += QStringLiteral(" Recorded as %1.").arg(v.generation);
+            return ok(text, out);
         });
 
     add("montage_create_project", "Create a project",
@@ -1092,9 +1222,20 @@ void McpServer::Impl::addTools() {
                 return ok(text, QJsonObject{{"clips", out}});
             }
             std::vector<Id> ids;
-            if (a.contains("clip")) ids.push_back(clipArg(l, a).id);
-            else
-                for (const edit::SyncOffset& o : edit::syncOffsets(s)) ids.push_back(o.clip);
+            if (a.contains("clip")) {
+                ids.push_back(clipArg(l, a).id);
+            } else {
+                // Moved one at a time, a clip going later must never land on the head of the next one still to move:
+                // those going later go last first, those going earlier first first.
+                std::vector<edit::SyncOffset> all = edit::syncOffsets(s);
+                std::stable_sort(all.begin(), all.end(), [&](const edit::SyncOffset& x, const edit::SyncOffset& y) {
+                    const FrameTime xs = edit::clipById(s, x.clip)->start, ys = edit::clipById(s, y.clip)->start;
+                    const bool xl = x.frames < 0, yl = y.frames < 0;  // going later
+                    if (xl != yl) return xl;
+                    return xl ? xs > ys : xs < ys;
+                });
+                for (const edit::SyncOffset& o : all) ids.push_back(o.clip);
+            }
             if (ids.empty()) return ok(QStringLiteral("Every linked clip is in sync."), QJsonObject{{"clips", QJsonArray{}}});
             int fixed = 0;
             QStringList errors;
@@ -1524,7 +1665,8 @@ void McpServer::Impl::addTools() {
                 const auto si = std::find_if(info->strings.begin(), info->strings.end(), [&](const StringParamInfo& x) { return x.name == name; });
                 if (si == info->strings.end())
                     throw ArgError{QStringLiteral("\"%1\" has no text setting \"%2\"").arg(QString::fromStdString(type), it.key())};
-                const std::string value = it.value().toString().toStdString();
+                std::string value = it.value().toString().toStdString();
+                if (si->kind == StringKind::Track) value = audioTrackId(it.value().toString(), l.seq());
                 if (si->kind == StringKind::ColorWarp) {
                     ColorWarp w;
                     if (!parseColorWarp(value, w)) throw ArgError{QStringLiteral("The mesh is \"spoke,ring,hue,sat,luma\" groups separated by ';'")};
@@ -1600,6 +1742,57 @@ void McpServer::Impl::addTools() {
             c.effects.push_back(e);
             save(l);
             return ok(QStringLiteral("Added %1 to %2").arg(QString::fromStdString(displayName), QString::fromStdString(c.name)),
+                      QJsonObject{{"effect_id", double(e.id)}});
+        });
+
+    add("montage_track_effect", "Add an effect to an audio track",
+        "Add an audio effect to an audio track's inserts (after its clips are mixed, before its fader), or with `remove` "
+        "take one off by its id. A compressor or noise gate can listen to another track instead of its own signal: "
+        "strings {\"sidechain\": \"A1\"} (a track's reference or name) ducks music under dialogue or opens a gate on a "
+        "kick; key_hpf_hz high-passes what it listens to.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"track":{"type":"string","description":"A1, A2..."},
+            "effect":{"type":"string"},"params":{"type":"object","additionalProperties":{"type":"number"}},
+            "strings":{"type":"object","additionalProperties":{"type":"string"}},
+            "remove":{"type":"number","description":"An effect id to take off instead"}},"required":["project","track"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const TrackRef r = trackArg(need(a, "track"), s, false);
+            if (r.kind != TrackKind::Audio) throw ArgError{"Effects go on audio tracks (A1, A2...)"};
+            Track& t = s.audioTracks[size_t(r.index)];
+            if (a.contains("remove")) {
+                const Id id = Id(a.value("remove").toDouble());
+                const auto before = t.effects.size();
+                std::erase_if(t.effects, [&](const Effect& e) { return e.id == id; });
+                if (t.effects.size() == before) return fail(QStringLiteral("No effect %1 on %2").arg(qint64(id)).arg(need(a, "track")));
+                save(l);
+                return ok(QStringLiteral("Removed it"), QJsonObject{{"effects", int(t.effects.size())}});
+            }
+            const std::string type = need(a, "effect").toStdString();
+            const EffectInfo* info = findEffectInfo(type);
+            if (!info || info->hidden || info->category != EffectCategory::AudioFilter)
+                throw ArgError{QStringLiteral("Unknown audio effect \"%1\" (see montage_list_effects)").arg(QString::fromStdString(type))};
+            if (isSourceAudioEffect(type)) throw ArgError{QStringLiteral("%1 works on a clip's own audio: add it to the clip").arg(QString::fromStdString(info->displayName))};
+            Effect e = makeEffect(l.project, type);
+            const QJsonObject params = a.value("params").toObject();
+            for (auto it = params.begin(); it != params.end(); ++it) {
+                const std::string name = it.key().toStdString();
+                if (std::none_of(info->params.begin(), info->params.end(), [&](const ParamInfo& p) { return p.name == name; }))
+                    throw ArgError{QStringLiteral("\"%1\" has no parameter \"%2\"").arg(QString::fromStdString(type), it.key())};
+                e.params[name] = Param(it.value().toDouble());
+            }
+            const QJsonObject strings = a.value("strings").toObject();
+            for (auto it = strings.begin(); it != strings.end(); ++it) {
+                const std::string name = it.key().toStdString();
+                const auto si = std::find_if(info->strings.begin(), info->strings.end(), [&](const StringParamInfo& x) { return x.name == name; });
+                if (si == info->strings.end())
+                    throw ArgError{QStringLiteral("\"%1\" has no text setting \"%2\"").arg(QString::fromStdString(type), it.key())};
+                e.strings[name] = si->kind == StringKind::Track ? audioTrackId(it.value().toString(), s) : it.value().toString().toStdString();
+            }
+            if (e.s("sidechain") == std::to_string(t.id)) throw ArgError{"A track cannot be its own sidechain"};
+            t.effects.push_back(e);
+            save(l);
+            return ok(QStringLiteral("Added %1 to %2").arg(QString::fromStdString(info->displayName), QString::fromStdString(t.name)),
                       QJsonObject{{"effect_id", double(e.id)}});
         });
 
@@ -4234,13 +4427,8 @@ void McpServer::Impl::addTools() {
                 return -1;
             };
             auto findGaps = [&](std::vector<DescriptionGap>& out, double minGap) -> QString {
-                std::vector<int> tracks;
-                for (int i = 0; i < int(s.audioTracks.size()); ++i)
-                    if (i != adTrack()) tracks.push_back(i);
-                DuckOptions o;
-                o.minPause = 0.5;
                 std::string err;
-                const Spans speech = dialogueSpans(l.project, s, tracks, o, &err);
+                const Spans speech = descriptionSpeech(l.project, s, adTrack(), &err);
                 if (!err.empty()) return QString::fromStdString(err);
                 out = descriptionGaps(speech, s.fpsValue(), 0, std::max<FrameTime>(1, s.duration()), minGap);
                 return {};
@@ -4287,6 +4475,12 @@ void McpServer::Impl::addTools() {
                         for (const DescriptionGap& g : gaps)
                             if (start >= g.start && start < g.end) end = g.end;
                         if (end < 0) end = start + FrameTime(std::llround(3 * s.fpsValue()));
+                        // Up to the next description, written now or already there, so one never erases another.
+                        for (const QJsonValue& w : items)
+                            if (const FrameTime next = timeArg(w.toObject().value("start"), s, "start"); next > start) end = std::min(end, next);
+                        if (const int t = findDescriptionTrack(s); t >= 0)
+                            for (const Caption& c : s.captionTracks[size_t(t)].captions)
+                                if (c.start > start) end = std::min(end, c.start);
                     }
                     const std::string text = o.value("text").toString().toStdString();
                     if (!setDescription(l.project, s, start, end, text) && !text.empty())
@@ -4334,19 +4528,9 @@ void McpServer::Impl::addTools() {
                 return ok(QStringLiteral("Voiced %1 description(s), %2 s in all").arg(placed.size()).arg(total, 0, 'f', 1), r);
             }
             if (action == "duck") {
-                const int ad = adTrack();
-                if (ad < 0 || !hasDescriptionClips(s)) return fail("Voice the descriptions first");
-                DuckOptions o;
-                o.amountDb = std::clamp(a.value("duck_db").toDouble(-9), -40.0, -1.0);
-                o.fadeDown = 0.4;
-                o.fadeUp = 0.6;
-                const Spans spans = clipSpans(s, ad, 1.0);
-                int changed = 0;
-                for (int i = 0; i < int(s.audioTracks.size()); ++i) {
-                    if (i == ad) continue;
-                    for (Clip& c : s.audioTracks[size_t(i)].clips)
-                        if (c.role != kDescriptionRole && duckClip(c, s, spans, o)) ++changed;
-                }
+                if (!hasDescriptionClips(s)) return fail("Voice the descriptions first");
+                // On a lane of its own, heard only with the descriptions: the mix without them is not dipped.
+                const int changed = duckUnderDescriptions(s, std::clamp(a.value("duck_db").toDouble(-9), -40.0, -1.0));
                 save(l);
                 return ok(QStringLiteral("Ducked %1 clip(s) under the descriptions").arg(changed), QJsonObject{{"ducked", changed}});
             }
@@ -5178,13 +5362,16 @@ void McpServer::Impl::addTools() {
             }
             st.downmixStereo = a.value("downmix_stereo").toBool();
             st.describedStream = a.value("described").toBool();
+            if (st.describedStream && !containerCarriesStreams(st.path))
+                throw ArgError{"A described export needs a container with several audio streams (mp4, mov, mkv, mxf)"};
             const QString cap = str(a, "captions", "none");
             if (cap != "none" && cap != "burn" && cap != "embed" && cap != "both") throw ArgError{"\"captions\" must be none, burn, embed or both"};
             st.burnInCaptions = cap == "burn" || cap == "both";
             st.cea608 = a.value("cea608").toBool();
             st.embedCaptions = cap == "embed" || cap == "both";
             if (st.embedCaptions && a.value("all_captions").toBool())
-                for (const CaptionTrack& t : s.captionTracks) st.extraCaptions.push_back(t.id);
+                for (const CaptionTrack& t : s.captionTracks)
+                    if (t.name != kDescriptionTrackName) st.extraCaptions.push_back(t.id);  // descriptions are spoken, not subtitles
             st.audioName = a.value("audio_name").toString().toStdString();
             st.audioLanguage = a.value("audio_language").toString().toStdString();
             const QJsonValue streams = a.value("audio_streams");
@@ -5533,10 +5720,12 @@ void McpServer::Impl::addTools() {
 
     add("montage_export_timeline", "Export the timeline",
         "Write the active sequence as an EDL, OpenTimelineIO, Final Cut Pro 7 XML (Premiere, Resolve), FCPXML (Final Cut "
-        "Pro) or AAF for audio post (Pro Tools, Fairlight: the audio tracks, linked to mono WAVs written to a \"<name> "
-        "Media\" folder beside it, with crossfades, fades and clip gain).",
+        "Pro) or AAF (Pro Tools, Fairlight, Media Composer: the audio tracks linked to mono WAVs written to a \"<name> "
+        "Media\" folder beside it, with crossfades, fades and clip gain; the video tracks linked to the original files, "
+        "with dissolves and constant speed, unless picture is false).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"format":{"type":"string","enum":["edl","otio","xml","fcpxml","aaf"]},
-            "output":{"type":"string"}},"required":["project","format","output"]})json",
+            "output":{"type":"string"},"picture":{"type":"boolean","description":"AAF: include the video tracks (default true)"}},
+            "required":["project","format","output"]})json",
         true, [this](const QJsonObject& a) {
             Loaded l = open(a);
             const QString f = need(a, "format");
@@ -5544,15 +5733,19 @@ void McpServer::Impl::addTools() {
                 const QString out = absolute(need(a, "output"));
                 AafExportResult r;
                 std::string err;
-                if (!exportAaf(l.project, l.seq(), out.toStdString(), &r, [this](double x, FrameTime) { progress(x, "AAF"); }, nullptr, &err))
+                AafExportOptions o;
+                o.picture = a.value("picture").toBool(true);
+                if (!exportAaf(l.project, l.seq(), out.toStdString(), &r, [this](double x, FrameTime) { progress(x, "AAF"); }, nullptr, &err, o))
                     return fail(QString::fromStdString(err));
                 QJsonArray files, warnings;
                 for (const std::string& m : r.mediaFiles) files.append(QString::fromStdString(m));
                 for (const std::string& w : r.warnings) warnings.append(QString::fromStdString(w));
-                return ok(QStringLiteral("Wrote %1: %2 audio tracks, %3 clips, %4 crossfades, %5 WAV files")
-                              .arg(out).arg(r.audioTracks).arg(r.clips).arg(r.transitions).arg(files.size()),
+                return ok(QStringLiteral("Wrote %1: %2 audio tracks, %3 clips, %4 crossfades, %5 WAV files; %6 video tracks, %7 clips, %8 dissolves")
+                              .arg(out).arg(r.audioTracks).arg(r.clips).arg(r.transitions).arg(files.size())
+                              .arg(r.videoTracks).arg(r.videoClips).arg(r.videoTransitions),
                           QJsonObject{{"output", out}, {"audio_tracks", r.audioTracks}, {"clips", r.clips},
-                                      {"crossfades", r.transitions}, {"media", files}, {"warnings", warnings}});
+                                      {"crossfades", r.transitions}, {"video_tracks", r.videoTracks}, {"video_clips", r.videoClips},
+                                      {"dissolves", r.videoTransitions}, {"media", files}, {"warnings", warnings}});
             }
             const std::string text = f == "otio" ? exportOtio(l.project, l.seq())
                                      : f == "xml" ? exportFcp7Xml(l.project, l.seq())
@@ -5567,7 +5760,9 @@ void McpServer::Impl::addTools() {
         });
 
     add("montage_import_timeline", "Import a timeline",
-        "Make a project from an EDL, OpenTimelineIO, Final Cut Pro 7 XML or FCPXML file (media found by path).",
+        "Make a project from an EDL, OpenTimelineIO, Final Cut Pro 7 XML, FCPXML or AAF file (Media Composer and Pro "
+        "Tools sequences: picture and sound tracks, clips followed to their files, dissolves, audio gain, markers; media "
+        "found by path, else beside the file).",
         R"json({"type":"object","properties":{"input":{"type":"string"},"project":{"type":"string","description":"The .montage file to write"},
             "fps":{"type":"number","description":"Frame rate for an EDL (default 30)"}},"required":["input","project"]})json",
         false, [](const QJsonObject& a) {
@@ -5575,15 +5770,18 @@ void McpServer::Impl::addTools() {
             if (std::filesystem::is_directory(in)) in += "/Info.fcpxml";
             std::ifstream f(in, std::ios::binary);
             if (!f) return fail(QStringLiteral("Cannot read %1").arg(QString::fromStdString(in)));
-            const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            std::string ext = std::filesystem::path(in).extension().string();
+            for (char& ch : ext) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+            // An AAF is a binary compound file, read by its own importer.
+            const std::string text = ext == ".aaf" ? std::string() : std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
             Loaded l;
             l.path = absolute(need(a, "project"));
             l.project.name = std::filesystem::path(in).stem().string();
             const MediaProber prober = [](const std::string& file, MediaItem& m) { return probeMedia(file, m, nullptr); };
-            const std::string ext = std::filesystem::path(in).extension().string();
             const double fps = a.value("fps").toDouble(30);
             const Rational rate = std::fabs(fps - std::round(fps)) < 1e-6 ? Rational{int(std::lround(fps)), 1} : Rational{int(std::lround(fps * 1001)), 1001};
-            const ImportResult r = ext == ".edl" ? importEdl(l.project, text, rate, prober, std::filesystem::path(in).parent_path().string())
+            const ImportResult r = ext == ".aaf" ? importAaf(l.project, in, prober)
+                                   : ext == ".edl" ? importEdl(l.project, text, rate, prober, std::filesystem::path(in).parent_path().string())
                                    : ext == ".xml" || ext == ".fcpxml" ? importXmlTimeline(l.project, text, prober)
                                                                        : importOtio(l.project, text, prober);
             if (!r.ok) return fail(QString::fromStdString(r.error));

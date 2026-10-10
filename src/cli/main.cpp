@@ -83,7 +83,8 @@ int usage() {
                  "  montage-cli loudness <media>\n"
                  "  montage-cli edl <project.montage> [-o out.edl]\n"
                  "  montage-cli otio <project.montage> [-o out.otio]\n"
-                 "  montage-cli aaf <project.montage> -o <out.aaf>   (audio for Pro Tools, Fairlight; WAVs in \"<out> Media\")\n"
+                 "  montage-cli aaf <project.montage> -o <out.aaf> [--no-picture]   (Pro Tools, Fairlight, Media Composer: audio as\n"
+                 "      WAVs in \"<out> Media\", video tracks linked to the original files)\n"
                  "  montage-cli xml <project.montage> [-o out.xml]       (Final Cut Pro 7 XML)\n"
                  "  montage-cli fcpxml <project.montage> [-o out.fcpxml]\n"
                  "  montage-cli import <timeline.xml|.fcpxml|.otio|.edl> -o <project.montage> [--fps N]\n"
@@ -536,8 +537,10 @@ int cmdInterchange(const std::vector<std::string>& args, const std::string& form
 int cmdAaf(const std::vector<std::string>& args) {
     if (args.empty()) return usage();
     std::string out;
+    AafExportOptions options;
     for (size_t i = 1; i < args.size(); ++i) {
         if (args[i] == "-o" && i + 1 < args.size()) out = args[++i];
+        else if (args[i] == "--no-picture") options.picture = false;
         else return usage();
     }
     if (out.empty()) return usage();
@@ -552,15 +555,15 @@ int cmdAaf(const std::vector<std::string>& args) {
             std::fprintf(stderr, "\rAAF... %5.1f%%", f * 100.0);
             std::fflush(stderr);
         },
-        &gCancel, &err);
+        &gCancel, &err, options);
     std::fprintf(stderr, "\n");
     if (!ok) {
         std::fprintf(stderr, "error: %s\n", err.c_str());
         return 1;
     }
     for (const std::string& w : r.warnings) std::fprintf(stderr, "warning: %s\n", w.c_str());
-    std::printf("Wrote %s: %d audio tracks, %d clips, %d crossfades, %zu media files\n", out.c_str(), r.audioTracks, r.clips,
-                r.transitions, r.mediaFiles.size());
+    std::printf("Wrote %s: %d audio tracks, %d clips, %d crossfades, %zu media files; %d video tracks, %d clips, %d dissolves\n",
+                out.c_str(), r.audioTracks, r.clips, r.transitions, r.mediaFiles.size(), r.videoTracks, r.videoClips, r.videoTransitions);
     return 0;
 }
 

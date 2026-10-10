@@ -35,6 +35,7 @@ private:
         std::function<void(Sequence&)> afterWrite;  // runs in the same edit (e.g. to keep linked clips in step)
         Id clip = 0;  // a clip's own effect: value changes reach the same effect on the other selected clips
         Id effect = 0;
+        Id owner = 0;  // the clip, track, bus or sequence whose chain holds the effect
     };
     // The other selected clips a change to `target` also goes to (Resolve's multi-clip Inspector), and applying
     // `fn` to their matching effects at their own times, inside an edit.

@@ -93,6 +93,8 @@
 #include "AutoMixDialog.h"
 #include "ScriptCutDialog.h"
 #include "QualityCheckDialog.h"
+#include "OffloadDialog.h"
+#include "core/AafImport.h"
 #include "ProjectManagerDialog.h"
 #include "LinkMediaDialog.h"
 #include "EffectPresetStore.h"
@@ -707,15 +709,32 @@ void MainWindow::buildMenus() {
         ProjectManagerDialog dlg(state_, this);
         if (dlg.exec() == QDialog::Accepted) runProjectManager(dlg.options());
     })->setObjectName(QStringLiteral("projectManager"));
+    add(file, tr("&Offload Card…"), QKeySequence(), [this] {
+        OffloadDialog dlg(state_, this);
+        dlg.exec();
+    })->setObjectName(QStringLiteral("offloadCard"));
+    add(file, tr("Verify Media &Hash List…"), QKeySequence(), [this] {
+        const QString folder = QFileDialog::getExistingDirectory(this, tr("Verify a Folder Against Its ASC MHL Hash List"));
+        if (folder.isEmpty()) return;
+        QString report;
+        const MhlVerifyResult v = verifyMhlWithProgress(this, folder, false, &report);
+        QMessageBox box(v.ok ? QMessageBox::Information : QMessageBox::Warning, tr("Verify Media Hash List"), report, QMessageBox::Close, this);
+        QPushButton* record = v.error.isEmpty() ? box.addButton(tr("Record a Generation"), QMessageBox::ActionRole) : nullptr;
+        box.exec();
+        if (record && box.clickedButton() == record) {
+            verifyMhlWithProgress(this, folder, true, &report);
+            QMessageBox::information(this, tr("Verify Media Hash List"), report);
+        }
+    })->setObjectName(QStringLiteral("verifyMhl"));
     add(file, tr("&Link Media…"), QKeySequence(), [this] { showLinkMedia(); })->setObjectName(QStringLiteral("linkMediaAction"));
     add(file, tr("Export &Frame…"), QKeySequence("Ctrl+Shift+E"), [this] { exportFrame(); });
     add(file, tr("Export &VFX Pulls…"), QKeySequence(), [this] { vfxPullDialog(); })->setObjectName(QStringLiteral("vfxPulls"));
-    add(file, tr("&Import Timeline (FCP XML, FCPXML, OTIO, EDL)…"), QKeySequence(), [this] { importTimeline(); });
+    add(file, tr("&Import Timeline (FCP XML, FCPXML, OTIO, EDL, AAF)…"), QKeySequence(), [this] { importTimeline(); });
     add(file, tr("Export Final Cut Pro &7 XML (Premiere, Resolve)…"), QKeySequence(), [this] { exportInterchange(Interchange::Fcp7Xml); });
     add(file, tr("Export &FCPXML (Final Cut Pro)…"), QKeySequence(), [this] { exportInterchange(Interchange::FcpXml); });
     add(file, tr("Export E&DL (CMX 3600)…"), QKeySequence(), [this] { exportInterchange(Interchange::Edl); });
     add(file, tr("Export &OpenTimelineIO…"), QKeySequence(), [this] { exportInterchange(Interchange::Otio); });
-    add(file, tr("Export &AAF for Audio Post (Pro Tools, Fairlight)…"), QKeySequence(), [this] { exportAafDialog(); })
+    add(file, tr("Export &AAF (Pro Tools, Fairlight, Media Composer)…"), QKeySequence(), [this] { exportAafDialog(); })
         ->setObjectName(QStringLiteral("exportAaf"));
     file->addSeparator();
     add(file, tr("&Quit"), QKeySequence::Quit, [this] { close(); });
@@ -5729,6 +5748,11 @@ bool MainWindow::exportAafTo(const QString& path, QString* summary) {
                        .arg(o.result.transitions)
                        .arg(o.result.mediaFiles.size())
                        .arg(QFileInfo(path).completeBaseName() + tr(" Media"));
+    if (o.result.videoTracks)
+        text += tr("; %1 video tracks, %2 clips, %3 dissolves linked to the original files")
+                    .arg(o.result.videoTracks)
+                    .arg(o.result.videoClips)
+                    .arg(o.result.videoTransitions);
     for (const std::string& w : o.result.warnings) text += "\n" + QString::fromStdString(w);
     if (summary) *summary = text;
     return true;
@@ -5739,7 +5763,7 @@ void MainWindow::exportAafDialog() {
     if (!s) return;
     QSettings st = appSettings();
     const QString path = QFileDialog::getSaveFileName(
-        this, tr("Export AAF for Audio Post"), st.value("lastExportDir").toString() + "/" + QString::fromStdString(s->name) + ".aaf",
+        this, tr("Export AAF"), st.value("lastExportDir").toString() + "/" + QString::fromStdString(s->name) + ".aaf",
         tr("AAF (*.aaf)"));
     if (path.isEmpty()) return;
     st.setValue("lastExportDir", QFileInfo(path).absolutePath());
@@ -5750,8 +5774,9 @@ void MainWindow::exportAafDialog() {
 void MainWindow::importTimeline() {
     QSettings st = appSettings();
     QString path = QFileDialog::getOpenFileName(this, tr("Import Timeline"), st.value("lastImportTimelineDir").toString(),
-                                                tr("Timelines (*.xml *.fcpxml *.otio *.edl);;Final Cut Pro 7 XML (*.xml);;"
-                                                   "FCPXML (*.fcpxml);;OpenTimelineIO (*.otio);;CMX 3600 EDL (*.edl)"));
+                                                tr("Timelines (*.xml *.fcpxml *.otio *.edl *.aaf);;Final Cut Pro 7 XML (*.xml);;"
+                                                   "FCPXML (*.fcpxml);;OpenTimelineIO (*.otio);;CMX 3600 EDL (*.edl);;"
+                                                   "AAF (Media Composer, Pro Tools) (*.aaf)"));
     if (path.isEmpty()) return;
     if (QFileInfo(path).isDir()) path += "/Info.fcpxml";  // an .fcpxmld bundle
     QFile f(path);
@@ -5760,7 +5785,8 @@ void MainWindow::importTimeline() {
         return;
     }
     st.setValue("lastImportTimelineDir", QFileInfo(path).absolutePath());
-    const std::string text = f.readAll().toStdString();
+    const QString suffix = QFileInfo(path).suffix().toLower();
+    const std::string text = suffix == QLatin1String("aaf") ? std::string() : f.readAll().toStdString();
     const MediaProber prober = [](const std::string& file, MediaItem& m) { return probeMedia(file, m, nullptr); };
     const QString ext = QFileInfo(path).suffix().toLower();
     // EDLs do not say their rate: take the open sequence's.
@@ -5769,7 +5795,8 @@ void MainWindow::importTimeline() {
     ImportResult r;
     QApplication::setOverrideCursor(Qt::WaitCursor);
     state_->edit(tr("Import Timeline"), [&](Project& p, Sequence&) {
-        r = ext == "edl"                      ? importEdl(p, text, fps, prober, dir)
+        r = ext == "aaf"                      ? importAaf(p, path.toStdString(), prober)
+            : ext == "edl"                    ? importEdl(p, text, fps, prober, dir)
             : ext == "xml" || ext == "fcpxml" ? importXmlTimeline(p, text, prober)
                                               : importOtio(p, text, prober);
         return r.ok;

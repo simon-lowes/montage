@@ -115,7 +115,7 @@ void DeEsser::process(float* buf, int frames, double sr, double hz, double thres
 // ---- Noise gate --------------------------------------------------------------
 
 void NoiseGate::process(float* buf, int frames, double sr, double thresholdDb, double rangeDb, double attackMs, double holdMs,
-                        double releaseMs) {
+                        double releaseMs, const float* key) {
     const double det = std::exp(-1.0 / (0.002 * sr));  // the level detector's own smoothing
     const double att = std::exp(-1.0 / (std::max(0.05, attackMs) / 1000 * sr));
     const double rel = std::exp(-1.0 / (std::max(1.0, releaseMs) / 1000 * sr));
@@ -124,7 +124,8 @@ void NoiseGate::process(float* buf, int frames, double sr, double thresholdDb, d
     const int hold = int(std::max(0.0, holdMs) / 1000 * sr);
     for (int i = 0; i < frames; ++i) {
         float* d = buf + i * 2;
-        const double lvl = std::max(std::fabs(d[0]), std::fabs(d[1]));
+        const float* k = key ? key + i * 2 : d;
+        const double lvl = std::max(std::fabs(k[0]), std::fabs(k[1]));
         env_ = lvl > env_ ? lvl : det * env_ + (1 - det) * lvl;
         double target = floor;
         if (env_ >= thr) {

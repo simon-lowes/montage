@@ -2732,6 +2732,76 @@ private slots:
         const QByteArray head = f.read(32);
         QCOMPARE(uint8_t(head[26]), uint8_t(4));
         QCOMPARE(uint8_t(head[30]), uint8_t(12));
+        f.close();
+
+        // Damaged or hostile files are refused or read as far as they make sense, never read past or looped over.
+        QFile src(QString::fromStdString(path));
+        QVERIFY(src.open(QIODevice::ReadOnly));
+        const QByteArray good = src.readAll();
+        src.close();
+        auto attempt = [&](QByteArray bytes) {
+            const std::string bad = (dir.path() + "/bad.cfb").toStdString();
+            QFile o(QString::fromStdString(bad));
+            if (!o.open(QIODevice::WriteOnly | QIODevice::Truncate)) return false;
+            o.write(bytes);
+            o.close();
+            CfbEntry r;
+            std::string e;
+            return readCompoundFile(bad, r, &e);
+        };
+        auto put32 = [](QByteArray& b, int at, uint32_t v) {
+            for (int i = 0; i < 4; ++i) b[at + i] = char((v >> (8 * i)) & 0xff);
+        };
+        QByteArray hostile = good.left(512);
+        put32(hostile, 68, 0x7FFFFF);  // a DIFAT sector far past the end
+        put32(hostile, 72, 1);
+        QVERIFY(!attempt(hostile));
+        hostile = good;
+        hostile[30] = char(40);  // an impossible sector size
+        QVERIFY(!attempt(hostile));
+        // A directory whose first entry under the root points back at itself on every side: read once, not forever.
+        CfbEntry loop;
+        loop.name = "Root Entry";
+        loop.storage = true;
+        CfbEntry one;
+        one.name = "one";
+        one.data = "x";
+        loop.children.push_back(one);
+        const std::string loopPath = (dir.path() + "/loop.cfb").toStdString();
+        QVERIFY(writeCompoundFile(loopPath, loop, &err));
+        QFile lf(QString::fromStdString(loopPath));
+        QVERIFY(lf.open(QIODevice::ReadOnly));
+        QByteArray looped = lf.readAll();
+        lf.close();
+        const int sectorSize = 1 << (uint8_t(looped[30]) | uint8_t(looped[31]) << 8);
+        const uint32_t dirSector = uint32_t(uint8_t(looped[48]) | uint8_t(looped[49]) << 8 | uint8_t(looped[50]) << 16 | uint8_t(looped[51]) << 24);
+        const int entry1 = (int(dirSector) + 1) * sectorSize + 128;
+        put32(looped, entry1 + 68, 1);
+        put32(looped, entry1 + 72, 1);
+        put32(looped, entry1 + 76, 1);
+        CfbEntry lr;
+        std::string le;
+        QFile lo(QString::fromStdString(loopPath));
+        QVERIFY(lo.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        lo.write(looped);
+        lo.close();
+        QVERIFY(readCompoundFile(loopPath, lr, &le));
+        QCOMPARE(lr.children.size(), size_t(1));
+        // A long run of siblings (a writer's unbalanced tree) is read whole.
+        CfbEntry many;
+        many.name = "Root Entry";
+        many.storage = true;
+        for (int i = 0; i < 300; ++i) {
+            CfbEntry c;
+            c.name = "child" + std::to_string(i);
+            c.data = std::string(8, char(i));
+            many.children.push_back(c);
+        }
+        const std::string manyPath = (dir.path() + "/many.cfb").toStdString();
+        QVERIFY(writeCompoundFile(manyPath, many, &err));
+        CfbEntry mr;
+        QVERIFY(readCompoundFile(manyPath, mr, &err));
+        QCOMPARE(mr.children.size(), size_t(300));
     }
 
     void surroundPositionLanes() {
@@ -2805,13 +2875,17 @@ private slots:
         QCOMPARE(s.captionTracks[size_t(t)].language, std::string("fr"));
         QVERIFY(setDescription(fx.p, s, 99, 171, "Rain on the window."));
         QVERIFY(setDescription(fx.p, s, 369, 450, "She leaves."));
-        QVERIFY(setDescription(fx.p, s, 120, 160, "Rain streaks the glass."));  // replaces the first
+        QVERIFY(setDescription(fx.p, s, 120, 160, "Rain streaks the glass."));  // the first now ends where it begins
         auto& caps = s.captionTracks[size_t(t)].captions;
-        QCOMPARE(caps.size(), size_t(2));
-        QVERIFY(caps[0].start == 120 && caps[0].text == "Rain streaks the glass.");
+        QCOMPARE(caps.size(), size_t(3));
+        QVERIFY(caps[0].start == 99 && caps[0].end == 120 && caps[0].text == "Rain on the window.");
+        QVERIFY(caps[1].start == 120 && caps[1].end == 160 && caps[1].text == "Rain streaks the glass.");
+        QVERIFY(setDescription(fx.p, s, 110, 125, "Rain."));  // inside the first: it is cut short, the second replaced
+        QCOMPARE(caps.size(), size_t(3));
+        QVERIFY(caps[0].end == 110 && caps[1].start == 110 && caps[1].end == 125 && caps[2].start == 369);
         QVERIFY(!setDescription(fx.p, s, 200, 200, "No room."));
-        QVERIFY(setDescription(fx.p, s, 130, 0, ""));  // the one there goes
-        QCOMPARE(caps.size(), size_t(1));
+        QVERIFY(setDescription(fx.p, s, 115, 0, ""));  // the one there goes
+        QCOMPARE(caps.size(), size_t(2));
         QVERIFY(!setDescription(fx.p, s, 10, 0, ""));
         QVERIFY(!hasDescriptionClips(s));
         const Id clip = fx.put(A1, 0, 30);
@@ -5848,6 +5922,36 @@ private slots:
         clipById(fx2.s(), a2)->speed = 1;
         clipById(fx2.s(), a2)->mediaId = 9999;
         QVERIFY(syncOffsets(fx2.s()).empty());
+        // Both reversed, the sound's source 5 frames off: slipped back exactly.
+        Fixture fx3;
+        auto r3 = placeMedia(fx3.p, fx3.s(), fx3.media, 30, 30, 100, V1, A1, false);
+        Clip* v3 = clipById(fx3.s(), r3.created[0]);
+        Clip* a3 = clipById(fx3.s(), r3.created[1]);
+        v3->reverse = a3->reverse = true;
+        a3->sourceIn += 5;
+        QVERIFY(std::fabs(syncOffset(fx3.s(), a3->id)) > 0.5);
+        QVERIFY(slipIntoSync(fx3.p, fx3.s(), a3->id).ok);
+        QCOMPARE(syncOffset(fx3.s(), a3->id), 0.0);
+        QCOMPARE(clipById(fx3.s(), a3->id)->sourceIn, v3->sourceIn);
+        // Half a frame (both at 200 %, one frame apart in source) is not flagged: moving cannot fix it.
+        a3->reverse = v3->reverse = false;
+        a3->speed = v3->speed = 2;
+        a3->sourceIn = v3->sourceIn + 1;
+        QCOMPARE(syncOffset(fx3.s(), a3->id), 0.0);
+        // The reference is the group's clip of the same media, not a linked cutaway that happens to come first.
+        MediaItem other = *fx3.p.findMedia(fx3.media);
+        other.id = fx3.p.newId();
+        other.name = "cutaway.mov";
+        fx3.p.media.push_back(other);
+        a3->speed = v3->speed = 1;
+        a3->sourceIn = v3->sourceIn;
+        Clip cut = makeClip(fx3.p, other, TrackKind::Video, fx3.s());
+        cut.start = 0, cut.duration = 20, cut.linkGroup = a3->linkGroup;
+        Track* top = trackAt(fx3.s(), V1);
+        top->clips.insert(top->clips.begin(), cut);  // first in the group
+        a3 = clipById(fx3.s(), r3.created[1]);
+        a3->start += 4;
+        QCOMPARE(syncOffset(fx3.s(), a3->id), 4.0);
     }
 
     void projectFileRelinksRelativePaths() {

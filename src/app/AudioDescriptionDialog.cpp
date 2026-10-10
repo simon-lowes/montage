@@ -147,26 +147,14 @@ int AudioDescriptionDialog::adTrack() const {
     return -1;
 }
 
-std::vector<int> AudioDescriptionDialog::dialogueTracks() const {
-    std::vector<int> out;
-    const Sequence* s = state_->sequence();
-    const int ad = adTrack();
-    if (s)
-        for (int i = 0; i < int(s->audioTracks.size()); ++i)
-            if (i != ad) out.push_back(i);
-    return out;
-}
-
 int AudioDescriptionDialog::rows() const { return table_->rowCount(); }
 
 int AudioDescriptionDialog::findGaps(QString* error) {
     const Sequence* s = state_->sequence();
     if (!s) return -1;
     QApplication::setOverrideCursor(Qt::WaitCursor);
-    DuckOptions o;
-    o.minPause = 0.5;
     std::string err;
-    const Spans speech = dialogueSpans(state_->project(), *s, dialogueTracks(), o, &err);
+    const Spans speech = descriptionSpeech(state_->project(), *s, adTrack(), &err);
     QApplication::restoreOverrideCursor();
     if (!err.empty()) {
         if (error) *error = qs(err);
@@ -314,18 +302,10 @@ int AudioDescriptionDialog::duck() {
         status_->setText(tr("Voice the descriptions first"));
         return 0;
     }
-    DuckOptions o;
-    o.amountDb = duckDb_->value();
-    o.fadeDown = 0.4;
-    o.fadeUp = 0.6;
+    // On a lane of its own, heard only with the descriptions: the mix without them is not dipped.
     int changed = 0;
     state_->edit(tr("Duck Under Descriptions"), [&](Project&, Sequence& sq) {
-        const Spans spans = clipSpans(sq, ad, 1.0);
-        for (int i = 0; i < int(sq.audioTracks.size()); ++i) {
-            if (i == ad) continue;
-            for (Clip& c : sq.audioTracks[size_t(i)].clips)
-                if (c.role != kDescriptionRole && duckClip(c, sq, spans, o)) ++changed;
-        }
+        changed = duckUnderDescriptions(sq, duckDb_->value(), 0.25);
         return changed > 0;
     });
     status_->setText(tr("Ducked %n clip(s) under the descriptions", "", changed));

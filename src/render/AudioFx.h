@@ -65,8 +65,9 @@ private:
 // Opens above the threshold; closed, it turns the sound down by `rangeDb`.
 class NoiseGate {
 public:
+    // `key` (interleaved stereo, `frames` long) opens and closes it in place of the signal itself (a sidechain).
     void process(float* buf, int frames, double sr, double thresholdDb, double rangeDb, double attackMs, double holdMs,
-                 double releaseMs);
+                 double releaseMs, const float* key = nullptr);
 
 private:
     double env_ = 0, gain_ = 0;

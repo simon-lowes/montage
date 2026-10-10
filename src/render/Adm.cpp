@@ -100,10 +100,12 @@ std::array<double, 2> polarToCartesian(double azimuth, double distance) {
 // distance.
 struct Position {
     double x = 0, y = 1, z = 0;
+    double az = 0;  // the panner's angle (degrees, ADM's way round), for how far round a block goes
 };
 Position admPosition(const SurroundPan& sp, bool overhead) {
-    const std::array<double, 2> xy = polarToCartesian(-std::atan2(sp.x, sp.y) * 180 / M_PI, std::min(1.0, std::hypot(sp.x, sp.y)));
-    return {xy[0], xy[1], overhead ? std::clamp(sp.z, 0.0, 1.0) : 0.0};
+    const double az = -std::atan2(sp.x, sp.y) * 180 / M_PI;
+    const std::array<double, 2> xy = polarToCartesian(az, std::min(1.0, std::hypot(sp.x, sp.y)));
+    return {xy[0], xy[1], overhead ? std::clamp(sp.z, 0.0, 1.0) : 0.0, az};
 }
 
 // One audioBlockFormat: from `from` to `to` (samples into the master), moving to `at` over its length.
@@ -113,9 +115,10 @@ struct Block {
 };
 
 // An object's blocks. Still: one. Moving (its position lanes play): a millisecond at where it starts, then the
-// position ten times a second, each block gliding to the next point in a straight line (so crossing behind the
-// listener stays behind); points on a straight line (within 0.005) share a block. Boundaries fall on whole samples
-// that hh:mm:ss.fffff writes exactly (every 12 at 48 kHz).
+// position every frame, each block gliding to the next point; points on a straight line (within 0.005 in X, Y and Z,
+// and no more than 10 degrees round) share a block. Cartesian blocks need no jump behind the listener: the path between
+// two points behind stays behind. Boundaries fall on whole samples that hh:mm:ss.fffff writes exactly (every 12 at
+// 48 kHz).
 std::vector<Block> objectBlocks(const Track& tr, bool overhead, FrameTime first, FrameTime end, double fps, int64_t total) {
     const bool reads = trackAutomation(tr) == AutomationMode::Read || trackAutomation(tr) == AutomationMode::Latch ||
                        trackAutomation(tr) == AutomationMode::Touch;
@@ -124,9 +127,8 @@ std::vector<Block> objectBlocks(const Track& tr, bool overhead, FrameTime first,
         const int64_t v = int64_t(std::llround(double(f - first) * kRate / fps));
         return std::min(total, v / 12 * 12);
     };
-    const FrameTime step = std::max<FrameTime>(1, FrameTime(std::llround(fps / 10)));
-    std::vector<std::pair<int64_t, Position>> points;
-    for (FrameTime f = first; f < end; f += step) points.push_back({sampleAt(f), admPosition(trackSurroundAt(tr, double(f)), overhead)});
+    std::vector<std::pair<int64_t, Position>> points;  // every frame, merged below
+    for (FrameTime f = first; f < end; ++f) points.push_back({sampleAt(f), admPosition(trackSurroundAt(tr, double(f)), overhead)});
     points.push_back({total, admPosition(trackSurroundAt(tr, double(end)), overhead)});
     std::vector<Block> out{{0, std::min<int64_t>(total, kRate / 1000), points[0].second}};
     auto onLine = [](const Position& a, const Position& b, double u, const Position& m) {
@@ -141,10 +143,14 @@ std::vector<Block> objectBlocks(const Track& tr, bool overhead, FrameTime first,
             continue;
         }
         const Position start = out.back().at;
-        // As far along as the points between stay on the straight line (at most 200 points to a block).
+        // As far along as the points between stay on the straight line (at most 200 points to a block), and no
+        // further than 10 degrees round (either way across the back): renderers (BS.2127) fade the speaker gains
+        // between blocks, so a long block would play an arc as a crossfade between its ends instead of a sweep through
+        // the speakers between (a rise at one angle fades between the same speakers either way).
         size_t j = i;
         while (j + 1 < points.size() && j - i < 200) {
             const size_t k = j + 1;
+            if (std::fabs(std::remainder(points[k].second.az - start.az, 360.0)) > 10) break;
             bool straight = true;
             for (size_t m = i; m <= j && straight; ++m) {
                 const double u = double(points[m].first - from) / double(points[k].first - from);

@@ -60,6 +60,7 @@
 #include "ExportDialog.h"
 #include "ExposureView.h"
 #include "QualityCheckDialog.h"
+#include "OffloadDialog.h"
 #include "SpellUi.h"
 #include "core/ColorGroups.h"
 #include "core/Interpretation.h"
@@ -721,6 +722,42 @@ private slots:
         QVERIFY2(a1().surroundXAuto.at(10) < -0.9, qPrintable(QString::number(a1().surroundXAuto.at(10))));
         QVERIFY(std::fabs(a1().surroundXAuto.at(2) - still.x) < 1e-6);                 // before it was held
         QVERIFY(a1().surroundXAuto.at(50) > a1().surroundXAuto.at(20) + 0.1);           // let go: gliding back
+        // During a pass another track's panner and Animate Position wait (an edit would end the pass), while a width
+        // change on the track being recorded (the wheel: not a drag) is kept, all as one undo step.
+        state()->edit("A2 out", [](Project&, Sequence& s) {
+            s.audioTracks.at(1).output = 0;
+            return true;
+        });
+        QTRY_VERIFY(mixer->trackSurround(1) && !mixer->trackSurround(1)->isHidden());
+        const SurroundPan a2Was = state()->sequence()->audioTracks.at(1).surround;
+        const double widthWas = a1().surround.width;
+        const int notch = widthWas > 0.5 ? -120 : 120;
+        mixer->playbackStarted(0);
+        for (FrameTime f = 0; f <= 30; ++f) {
+            if (f == 10) {
+                SurroundPan moved = a2Was;
+                moved.x = -0.7;
+                emit mixer->trackSurround(1)->changed(moved, true);
+                emit mixer->trackSurround(1)->animateRequested(true);
+            }
+            if (f == 12) {
+                const QPointF c(panner->width() / 2.0, panner->height() / 2.0);
+                QWheelEvent wheel(c, panner->mapToGlobal(c), QPoint(), QPoint(0, notch), Qt::NoButton, Qt::NoModifier, Qt::NoScrollPhase, false);
+                QApplication::sendEvent(panner, &wheel);
+                QVERIFY(panner->isDragging());  // held a moment, so Touch writes it
+            }
+            mixer->playbackPosition(f);
+            if (f == 11) QVERIFY(mixer->recordingAutomation());
+        }
+        mixer->playbackStopped(30);
+        QVERIFY(state()->sequence()->audioTracks.at(1).surround == a2Was);
+        QVERIFY(!surroundAnimated(state()->sequence()->audioTracks.at(1)));
+        const double widened = std::clamp(widthWas + (notch > 0 ? 0.1 : -0.1), 0.0, 1.0);
+        QVERIFY2(std::fabs(a1().surround.width - widened) < 1e-9, qPrintable(QString::number(a1().surround.width)));
+        QVERIFY2(a1().surroundXAuto.at(10) < -0.9, qPrintable(QString::number(a1().surroundXAuto.at(10))));  // the last pass's lane kept
+        state()->undo();
+        QVERIFY(std::fabs(a1().surround.width - widthWas) < 1e-9);
+        state()->redo();
         // Stopping the animation leaves it where it is at the playhead.
         state()->setPlayhead(40);
         const double here = a1().surroundXAuto.at(40);
@@ -3424,6 +3461,92 @@ private slots:
         state()->setSelection({}, false);
     }
 
+    void sidechainInInspector() {
+        // A compressor on a music clip, keyed from the inspector by another audio track.
+        state()->newProject();
+        const QString wav = dir_.path() + "/sc-bed.wav";
+        {
+            WavWriter w;
+            QVERIFY(w.open(wav, 48000, 1));
+            std::vector<float> tone(48000, 0.1f);
+            w.write(tone.data(), int(tone.size()));
+            QVERIFY(w.close());
+        }
+        const auto ids = state()->importFiles({wav});
+        QCOMPARE(ids.size(), size_t(1));
+        Id clip = 0;
+        QVERIFY(state()->edit("Bed", [&](Project& p, Sequence& s) {
+            while (s.audioTracks.size() < 2) edit::addTrack(p, s, TrackKind::Audio);
+            s.audioTracks[1].name = "Dialogue";
+            const auto r = edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, -1}, {TrackKind::Audio, 0}, false);
+            if (!r.ok) return false;
+            clip = r.created.front();
+            edit::clipById(s, clip)->effects.push_back(makeEffect(p, "compressor"));
+            return true;
+        }));
+        state()->setSelection({clip}, false);
+        QApplication::processEvents();
+        auto* inspector = win_->findChild<InspectorWidget*>();
+        QVERIFY(inspector && inspector->widget());
+        auto* key = inspector->widget()->findChild<QComboBox*>("track_sidechain");
+        QVERIFY(key);
+        // None, then every audio track but the clip's own (a key cannot be its own signal).
+        QCOMPARE(key->count(), int(state()->sequence()->audioTracks.size()));
+        for (int i = 0; i < key->count(); ++i) QVERIFY(!key->itemText(i).startsWith("A1 "));
+        QCOMPARE(key->currentIndex(), 0);  // None
+        const int dialogue = key->findText("A2  Dialogue");
+        QVERIFY(dialogue > 0);
+        key->setCurrentIndex(dialogue);
+        emit key->activated(dialogue);
+        const auto keyOf = [&] { return edit::clipById(*state()->sequence(), clip)->effects.at(0).s("sidechain"); };
+        QCOMPARE(keyOf(), std::to_string(state()->sequence()->audioTracks[1].id));
+        state()->undo();
+        QVERIFY(keyOf().empty());
+        QApplication::processEvents();
+        key = inspector->widget()->findChild<QComboBox*>("track_sidechain");
+        QVERIFY(key && key->currentIndex() == 0);
+    }
+
+    void offloadCardDialog() {
+        state()->newProject();
+        // A card: a recording and its sidecar.
+        const QString card = dir_.path() + "/cards/A007";
+        QVERIFY(QDir().mkpath(card + "/CLIPS"));
+        {
+            WavWriter w;
+            QVERIFY(w.open(card + "/CLIPS/A007C001.wav", 48000, 1));
+            std::vector<float> tone(4800, 0.1f);
+            w.write(tone.data(), int(tone.size()));
+            QVERIFY(w.close());
+            QFile f(card + "/A007.xml");
+            QVERIFY(f.open(QIODevice::WriteOnly) && f.write("<clip/>") > 0);
+        }
+        QVERIFY(win_->findChild<QAction*>("offloadCard") && win_->findChild<QAction*>("verifyMhl"));
+        OffloadDialog dlg(state(), win_.get());
+        dlg.findChild<QListWidget*>("offloadDestinations")->clear();  // whatever an earlier run remembered
+        dlg.setSource(card);
+        dlg.addDestination(dir_.path() + "/drive1");
+        dlg.addDestination(dir_.path() + "/drive2");
+        dlg.findChild<QCheckBox*>("offloadImport")->setChecked(true);
+        dlg.findChild<QCheckBox*>("offloadVerify")->setChecked(true);
+        dlg.findChild<QCheckBox*>("offloadMhl")->setChecked(true);
+        const OffloadResult r = dlg.run();
+        QVERIFY2(r.ok, qPrintable(dlg.report()));
+        QVERIFY2(dlg.report().contains("every copy matches"), qPrintable(dlg.report()));
+        QVERIFY(QFileInfo::exists(dir_.path() + "/drive2/A007/CLIPS/A007C001.wav"));
+        QCOMPARE(QDir(dir_.path() + "/drive1/A007/ascmhl").entryList({"*.mhl"}).size(), qsizetype(1));
+        // The copied recording, in a bin named after the card (the sidecar is not media).
+        const auto& media = state()->project().media;
+        QCOMPARE(media.size(), size_t(1));
+        QCOMPARE(media[0].bin, std::string("A007"));
+        QVERIFY(QString::fromStdString(media[0].path).startsWith(dir_.path() + "/drive1/A007/"));
+        // Verified later, with a generation recorded.
+        QString report;
+        const MhlVerifyResult v = verifyMhlWithProgress(win_.get(), dir_.path() + "/drive2/A007", true, &report);
+        QVERIFY2(v.ok && v.verified == 2 && !v.generation.isEmpty(), qPrintable(report));
+        QVERIFY2(report.contains("match"), qPrintable(report));
+    }
+
     void syncIndicators() {
         state()->newProject();
         Id v = 0, a = 0;
@@ -5707,7 +5830,13 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(state()->apply("Lines", [&](Project& p, Sequence& s) {
             edit::Result r = edit::placeMedia(p, s, media, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
             if (!r.ok) return r;
-            return edit::placeMedia(p, s, media, 90, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+            r = edit::placeMedia(p, s, media, 90, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+            if (!r.ok) return r;
+            // Music between the lines (not dialogue: the gap is still found), to be ducked under the description.
+            const TrackRef music = edit::addTrack(p, s, TrackKind::Audio);
+            r = edit::placeMedia(p, s, media, 36, 0, -1, {TrackKind::Video, -1}, music, false);
+            if (r.ok) edit::clipById(s, r.created.front())->role = "Music";
+            return r;
         }));
         win_->findChild<QAction*>("audioDescription")->trigger();
         auto* dlg = win_->findChild<AudioDescriptionDialog*>("audioDescriptionDialog");
@@ -5747,7 +5876,7 @@ const auto seq = [this] { return state()->sequence(); };
             for (int i = 0; i < int(s.audioTracks.size()); ++i)
                 if (s.audioTracks[size_t(i)].name == "AD") ad = i;
             QVERIFY(ad >= 0 && s.audioTracks[size_t(ad)].clips.size() == 1);
-            QVERIFY(dlg->duck() >= 1);
+            QCOMPARE(dlg->duck(), 1);  // the music; the lines are clear of it
             QCOMPARE(dlg->voice(&err), 1);  // voiced again: replaced, not added
             QCOMPARE(state()->sequence()->audioTracks[size_t(ad)].clips.size(), size_t(1));
         } else {
@@ -5758,7 +5887,7 @@ const auto seq = [this] { return state()->sequence(); };
                 if (res.ok) edit::clipById(s, res.created.front())->role = kDescriptionRole;
                 return res;
             }));
-            QVERIFY(dlg->duck() >= 1);
+            QCOMPARE(dlg->duck(), 1);  // the music; the lines are clear of it
         }
         // Export offers the described stream once there are descriptions, for containers with several streams.
         {

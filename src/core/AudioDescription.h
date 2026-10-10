@@ -16,6 +16,9 @@ namespace montage {
 
 constexpr const char* kDescriptionRole = "Description";
 constexpr const char* kDescriptionTrackName = "Audio Description";
+// The clip volume lane (dB, clip frames) that dips the programme under the descriptions: separate from the clip's
+// own volume, and heard only while the role Description is (so not in the mix without descriptions).
+constexpr const char* kDescriptionDuckParam = "ad_duck_db";
 
 struct DescriptionGap {
     FrameTime start = 0, end = 0;  // end exclusive
@@ -46,8 +49,9 @@ DescriptionFit descriptionFit(const std::string& text, double room, double words
 int findDescriptionTrack(const Sequence& s);
 int descriptionTrack(Project& p, Sequence& s, const std::string& language = "en");
 
-// Puts a description on the description track from `start` to `end` (frames), replacing what is there; empty text
-// removes the description at `start`. Returns false when there is no room (end <= start).
+// Puts a description on the description track from `start` to `end` (frames): one that began earlier is cut short
+// at `start`, others it overlaps are replaced; empty text removes the description at `start`. Returns false when
+// there is no room (end <= start).
 bool setDescription(Project& p, Sequence& s, FrameTime start, FrameTime end, const std::string& text);
 
 // Whether the sequence has described clips (clips of the role "Description").

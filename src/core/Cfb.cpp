@@ -278,6 +278,8 @@ bool readCompoundFile(const std::string& path, CfbEntry& root, std::string* erro
         return false;
     };
     if (b.size() < 512 || uint8_t(b[0]) != 0xD0 || uint8_t(b[1]) != 0xCF) return fail("Not a compound file");
+    // Every value below comes from the file: nothing is read or allocated past what it holds.
+    if ((get16(b, 30) != 9 && get16(b, 30) != 12) || get16(b, 32) != 6) return fail("Not a compound file");
     const uint32_t sector = 1u << get16(b, 30), miniSector = 1u << get16(b, 32);
     const uint32_t cutoff = get32(b, 56);
     auto offset = [&](uint32_t s) { return (uint64_t(s) + 1) * sector; };
@@ -285,6 +287,7 @@ bool readCompoundFile(const std::string& path, CfbEntry& root, std::string* erro
     std::vector<uint32_t> fatSectors;
     for (uint32_t k = 0; k < 109 && k < get32(b, 44); ++k) fatSectors.push_back(get32(b, 76 + size_t(k) * 4));
     for (uint32_t s = get32(b, 68), n = 0; s < kDifSect && n < get32(b, 72); ++n) {
+        if (offset(s) + sector > b.size()) return fail("Truncated DIFAT");
         for (uint32_t k = 0; k + 1 < sector / 4 && fatSectors.size() < get32(b, 44); ++k)
             fatSectors.push_back(get32(b, size_t(offset(s)) + size_t(k) * 4));
         s = get32(b, size_t(offset(s)) + sector - 4);
@@ -300,7 +303,7 @@ bool readCompoundFile(const std::string& path, CfbEntry& root, std::string* erro
             if (offset(s) + sector > b.size()) break;
             out.append(b, size_t(offset(s)), sector);
         }
-        if (sized) out.resize(size_t(size), '\0');
+        if (sized) out.resize(size_t(std::min<uint64_t>(size, out.size())));  // a short chain is truncated, not padded
         return out;
     };
     const std::string dir = readChain(get32(b, 48), 0, false);
@@ -321,11 +324,12 @@ bool readCompoundFile(const std::string& path, CfbEntry& root, std::string* erro
         }
         return QString::fromStdU16String(n).toStdString();
     };
+    // Each storage's children are a tree of siblings (left, right), walked in order without recursion so a long chain
+    // of siblings is read whole; an entry is visited once, so a damaged file's loops end.
+    std::vector<char> visited(count, 0);
     std::function<void(uint32_t, CfbEntry&, int)> fill;
-    std::function<void(uint32_t, CfbEntry&, int)> siblings = [&](uint32_t i, CfbEntry& parent, int depth) {
-        if (i >= count || depth > 64) return;
+    auto entry = [&](uint32_t i, CfbEntry& parent, int depth) {
         const size_t at = size_t(i) * 128;
-        siblings(get32(dir, at + 68), parent, depth + 1);
         CfbEntry e;
         e.name = entryName(i);
         e.storage = dir[at + 66] == 1;
@@ -336,21 +340,36 @@ bool readCompoundFile(const std::string& path, CfbEntry& root, std::string* erro
             if (size < cutoff) {
                 for (uint32_t s = start, guard = 0; s < kDifSect && s < miniFat.size() && guard < miniFat.size(); s = miniFat[s], ++guard)
                     if (size_t(s) * miniSector + miniSector <= miniStream.size()) e.data.append(miniStream, size_t(s) * miniSector, miniSector);
-                e.data.resize(size_t(size), '\0');
+                e.data.resize(size_t(std::min<uint64_t>(size, e.data.size())));
             } else {
                 e.data = readChain(start, size, true);
             }
-        } else if (dir[at + 66] == 1) {
-            fill(i, e, depth);
+        } else if (dir[at + 66] == 1 && depth < 64) {
+            fill(i, e, depth + 1);
         }
         parent.children.push_back(std::move(e));
-        siblings(get32(dir, at + 72), parent, depth + 1);
     };
-    fill = [&](uint32_t i, CfbEntry& e, int depth) { siblings(get32(dir, size_t(i) * 128 + 76), e, depth + 1); };
+    fill = [&](uint32_t i, CfbEntry& e, int depth) {
+        std::vector<uint32_t> stack;
+        uint32_t cur = get32(dir, size_t(i) * 128 + 76);
+        for (;;) {
+            while (cur < count && !visited[cur]) {
+                visited[cur] = 1;
+                stack.push_back(cur);
+                cur = get32(dir, size_t(cur) * 128 + 68);
+            }
+            if (stack.empty()) break;
+            const uint32_t n = stack.back();
+            stack.pop_back();
+            entry(n, e, depth);
+            cur = get32(dir, size_t(n) * 128 + 72);
+        }
+    };
     root = CfbEntry{};
     root.name = "Root Entry";
     root.storage = true;
     std::memcpy(root.clsid.data(), &dir[80], 16);
+    visited[0] = 1;
     fill(0, root, 0);
     return true;
 }

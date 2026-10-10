@@ -11,6 +11,7 @@
 #include <QString>
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <filesystem>
 #include <cmath>
 #include <cstdio>
@@ -1004,6 +1005,11 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         AVFrame* frame = nullptr;
         AudioMixer mixer;
         Sequence seq;
+        std::vector<bool> tracks;
+        bool normalise = false;
+        double gain = 1;
+        std::unique_ptr<PeakLimiter> limiter;
+        int64_t delay = 0;
         std::vector<float> fifo;
         int64_t pts = 0, cursor = 0;
         ~ExtraAudio() {
@@ -1059,8 +1065,11 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
                 if (const std::string why = openAudio(e->ctx, e->st); !why.empty()) return fail(why);
                 e->frame = av_frame_alloc();
                 tagStream(e->st, want.name, want.language);
+                if (want.descriptions) e->st->disposition |= AV_DISPOSITION_VISUAL_IMPAIRED | AV_DISPOSITION_DESCRIPTIONS;
             }
             e->mixer.setTrackMask(want.tracks);
+            e->tracks = want.tracks;
+            e->normalise = want.normalise;
             e->seq = seq;
             for (const std::string& r : want.unmute) std::erase(e->seq.mutedRoles, r);
             if (!want.role.empty())
@@ -1148,6 +1157,10 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     std::vector<float> mixBuf;
     int64_t audioPts = 0;
     int64_t audioCursor = int64_t(std::llround(double(in) * mixRate / seq.fpsValue()));
+    for (auto& e : extras) {  // every stream starts where the mix does
+        e->cursor = audioCursor;
+        e->seq.sampleRate = mixRate;
+    }
     std::vector<uint16_t> rgba16;
     // Loudness normalisation: measure the whole mix first, then play it through a gain and a limiter.
     double normGain = 1;
@@ -1177,6 +1190,31 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         for (float& v : prime) v = float(v * normGain);
         limiter->process(prime.data(), prime.data(), int(limiterDelay));
         audioCursor += limiterDelay;
+        // Streams of the whole programme (the described one) likewise, each measured on its own.
+        for (auto& e : extras) {
+            if (!e->normalise) continue;
+            AudioMixer m;
+            m.setTrackMask(e->tracks);
+            LoudnessMeter em(mixRate);
+            for (int64_t pos = e->cursor; pos < end;) {
+                if (cancel && cancel->load()) return fail("Cancelled");
+                const int n = int(std::min<int64_t>(8192, end - pos));
+                if (nch > 2) m.mixLayout(p, e->seq, pos, n, chunk.data());
+                else m.mix(p, e->seq, pos, n, chunk.data());
+                em.addChannels(chunk.data(), n, nch, weights.data());
+                pos += n;
+            }
+            const LoudnessResult r = em.result();
+            if (r.valid) e->gain = std::pow(10.0, (s.loudnessTarget - r.integrated) / 20.0);
+            e->limiter = std::make_unique<PeakLimiter>(mixRate, s.peakCeiling - 0.5, 5, 80, nch);
+            e->delay = e->limiter->latency();
+            std::vector<float> ep(size_t(e->delay) * size_t(nch));
+            if (nch > 2) e->mixer.mixLayout(p, e->seq, e->cursor, int(e->delay), ep.data());
+            else e->mixer.mix(p, e->seq, e->cursor, int(e->delay), ep.data());
+            for (float& v : ep) v = float(v * e->gain);
+            e->limiter->process(ep.data(), ep.data(), int(e->delay));
+            e->cursor += e->delay;
+        }
     }
 
     auto encodeFifo = [&](AVCodecContext* actx, AVStream* ast, AVFrame* aframe, std::vector<float>& fifo, int64_t& audioPts,
@@ -1394,15 +1432,19 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
                     }
                 }
             }
-            // The other streams, sample for sample with the mix (not normalised: stems keep their levels).
+            // The other streams, sample for sample with the mix (stems keep their levels; the described stream is
+            // normalised and limited as the mix is).
             for (auto& e : extras) {
-                const int64_t until = int64_t(std::llround(double(f + 1) * mixRate / seq.fpsValue()));
+                const int64_t until = int64_t(std::llround(double(f + 1) * mixRate / seq.fpsValue())) + e->delay;
                 const int m = int(until - e->cursor);
                 if (m <= 0) continue;
                 mixBuf.resize(size_t(m) * size_t(nch));
-                e->seq.sampleRate = mixRate;
                 if (nch > 2) e->mixer.mixLayout(p, e->seq, e->cursor, m, mixBuf.data());
                 else e->mixer.mix(p, e->seq, e->cursor, m, mixBuf.data());
+                if (e->limiter) {
+                    for (float& v : mixBuf) v = float(v * e->gain);
+                    e->limiter->process(mixBuf.data(), mixBuf.data(), m);
+                }
                 e->cursor = until;
                 if (!e->ctx) {
                     const size_t first = size_t(nch) * size_t(1 + (&e - extras.data()));
@@ -1500,6 +1542,14 @@ std::string exportAudioLayout(const std::string& layout, const std::string& code
     return "stereo";
 }
 
+bool containerCarriesStreams(const std::string& path) {
+    std::string ext = std::filesystem::path(path).extension().string();
+    for (char& ch : ext) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+    for (const char* e : {".mp4", ".m4v", ".m4a", ".mov", ".mkv", ".mka", ".mxf", ".webm", ".ts", ".m2ts"})
+        if (ext == e) return true;
+    return false;
+}
+
 bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
                     const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed, int* smartRendered,
                     LightLevels* light) {
@@ -1511,7 +1561,8 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
     // whole mix. Mono tracks carry a channel each, whatever the codec.
     const std::string layout = s.downmixStereo || s.monoAudioTracks > 0 ? seq.audioLayout : exportAudioLayout(seq.audioLayout, s.audioCodec);
     // A described master: the mix without the descriptions, then the programme with them as a stream of its own.
-    const bool described = s.describedStream && hasDescriptionClips(seq) && !s.audioCodec.empty();
+    const bool described = s.describedStream && hasDescriptionClips(seq) && !s.audioCodec.empty() && s.audioCodec != "none" &&
+                           containerCarriesStreams(s.path);
     bool ok;
     if (layout != seq.audioLayout || described) {
         Sequence work = seq;
@@ -1520,10 +1571,23 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
         else work.audioLayout = layout;
         if (described) {
             if (!edit::roleMuted(work, kDescriptionRole)) work.mutedRoles.push_back(kDescriptionRole);
+            // Streams that would hear only the descriptions (their role, or tracks holding nothing else) are silent
+            // in a mix without them: left out.
+            std::erase_if(settings.extraAudio, [&](const ExportSettings::AudioStream& a) {
+                if (a.role == kDescriptionRole) return true;
+                if (!a.role.empty()) return false;
+                bool other = false;
+                for (size_t t = 0; t < work.audioTracks.size(); ++t)
+                    if (a.tracks.empty() || (t < a.tracks.size() && a.tracks[t]))
+                        for (const Clip& c : work.audioTracks[t].clips) other |= c.role != kDescriptionRole;
+                return !other;
+            });
             ExportSettings::AudioStream ad;
             ad.name = s.describedName.empty() ? std::string("Audio Description") : s.describedName;
             ad.language = s.audioLanguage;
             ad.unmute = {kDescriptionRole};
+            ad.normalise = true;
+            ad.descriptions = true;
             settings.extraAudio.push_back(std::move(ad));
             if (settings.audioName.empty()) settings.audioName = "Programme";
         }
@@ -1634,6 +1698,8 @@ bool exportStems(const Project& p, const Sequence& seq, const ExportSettings& s,
         one.videoCodec = "none";
         one.audioCodec = "pcm_s24le";
         one.loudnessTarget = 0;  // stems keep their levels, so they add back up to the mix
+        one.describedStream = false;  // one stream each
+        one.extraAudio.clear();
         one.burnInCaptions = one.embedCaptions = false;
         one.burnIn = {};
         one.audioTracks = groups[g].second;
@@ -1692,27 +1758,38 @@ bool renderClipAudio(const Project& p, const Sequence& seq, Id clip, const std::
         if (error) *error = "No such clip";
         return false;
     }
-    // The clip alone, at the start of an otherwise empty copy of the sequence.
+    // The clip alone where it is, on a plain track of its own; the other audio tracks stay (muted, with their
+    // inserts) so a compressor or gate on the clip still hears the track it is keyed by.
     Sequence alone = seq;
     alone.videoTracks.assign(1, Track{});
     alone.videoTracks[0].kind = TrackKind::Video;
-    alone.audioTracks.assign(1, Track{});
-    alone.audioTracks[0].kind = TrackKind::Audio;
+    const auto loc = edit::locate(seq, clip);
+    Track own;
+    own.kind = TrackKind::Audio;
+    own.id = loc && loc->track.kind == TrackKind::Audio ? seq.audioTracks[size_t(loc->track.index)].id : 0;
+    for (Track& t : alone.audioTracks) {
+        t.muted = true;
+        t.solo = false;
+        t.output = 0;
+    }
+    Clip copy = *c;
+    copy.linkGroup = 0;
+    copy.audio.params.clear();  // volume and pan stay live on the clip
+    own.clips.push_back(copy);
+    bool placed = false;
+    for (Track& t : alone.audioTracks)
+        if (own.id && t.id == own.id) t = own, placed = true;
+    if (!placed) alone.audioTracks.push_back(own);
     alone.buses.clear();
     alone.masterEffects.clear();
     alone.masterVolumeDb = 0;
     alone.captionTracks.clear();
-    Clip copy = *c;
-    copy.start = 0;
-    copy.linkGroup = 0;
-    copy.audio.params.clear();  // volume and pan stay live on the clip
-    alone.audioTracks[0].clips.push_back(copy);
     ExportSettings st;
     st.path = path;
     st.videoCodec = "none";
     st.audioCodec = "pcm_s24le";
-    st.in = 0;
-    st.out = copy.duration;
+    st.in = copy.start;
+    st.out = copy.start + copy.duration;
     return exportSequence(p, alone, st, progress, cancel, error);
 }
 

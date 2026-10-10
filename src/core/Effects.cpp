@@ -427,8 +427,8 @@ std::vector<EffectInfo> buildCatalog() {
     c.push_back({"compressor", "Compressor", EffectCategory::AudioFilter, "Dynamics",
                  {num("threshold_db", "Threshold (dB)", -60, 0, -18, 0.1), num("ratio", "Ratio", 1, 20, 4, 0.1),
                   num("attack_ms", "Attack (ms)", 0.1, 200, 10, 0.1), num("release_ms", "Release (ms)", 5, 2000, 120, 1),
-                  num("makeup_db", "Makeup (dB)", 0, 30, 0, 0.1)},
-                 {}});
+                  num("makeup_db", "Makeup (dB)", 0, 30, 0, 0.1), num("key_hpf_hz", "Key High-Pass (Hz)", 0, 500, 0, 1)},
+                 {str("sidechain", "Sidechain", StringKind::Track)}});
     c.push_back({"limiter", "Limiter", EffectCategory::AudioFilter, "Dynamics",
                  {num("ceiling_db", "Ceiling (dB)", -20, 0, -1, 0.1), num("release_ms", "Release (ms)", 5, 1000, 60, 1)},
                  {}});
@@ -499,8 +499,8 @@ std::vector<EffectInfo> buildCatalog() {
     c.push_back({"gate", "Noise Gate", EffectCategory::AudioFilter, "Dynamics",
                  {num("threshold_db", "Threshold (dB)", -80, 0, -45, 0.1), num("range_db", "Range (dB)", -80, 0, -40, 0.1),
                   num("attack_ms", "Attack (ms)", 0.1, 50, 1, 0.1), num("hold_ms", "Hold (ms)", 0, 500, 50, 1),
-                  num("release_ms", "Release (ms)", 5, 2000, 150, 1)},
-                 {}});
+                  num("release_ms", "Release (ms)", 5, 2000, 150, 1), num("key_hpf_hz", "Key High-Pass (Hz)", 0, 500, 0, 1)},
+                 {str("sidechain", "Sidechain", StringKind::Track)}});
     c.push_back({"reverb", "Reverb", EffectCategory::AudioFilter, "Time",
                  {pct("size", "Room Size", 0, 100, 50), pct("damping", "Damping", 0, 100, 50), pct("width", "Width", 0, 100, 100),
                   pct("mix", "Mix", 0, 100, 25)},

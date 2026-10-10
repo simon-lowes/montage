@@ -714,7 +714,7 @@ void MixerPanel::playbackPosition(FrameTime t) {
         int track;
         bool volume, pan;
         double db, panValue;
-        bool x = false, y = false, z = false;
+        bool x = false, y = false, z = false, surround = false;
         SurroundPan position;
     };
     std::vector<Live> live;
@@ -745,7 +745,9 @@ void MixerPanel::playbackPosition(FrameTime t) {
             shown.y = r.y.tick(t, now.y, held);
             shown.z = r.z.tick(t, now.z, held);
             lv.x = r.x.writing(), lv.y = r.y.writing(), lv.z = r.z.writing();
+            lv.surround = true;
             lv.position = now;
+            lv.position.width = r.position.width, lv.position.lfeDb = r.position.lfeDb, lv.position.object = r.position.object;
             if (!held && !(lv.x && lv.y && lv.z)) st.surround->setPan(shown);
             key += QStringLiteral("s%1%2%3,%4,%5,%6;").arg(int(lv.x)).arg(int(lv.y)).arg(int(lv.z)).arg(now.x).arg(now.y).arg(now.z);
         }
@@ -764,6 +766,7 @@ void MixerPanel::playbackPosition(FrameTime t) {
             if (l.x) tr.surroundXAuto = Param(), tr.surround.x = l.position.x;
             if (l.y) tr.surroundYAuto = Param(), tr.surround.y = l.position.y;
             if (l.z) tr.surroundZAuto = Param(), tr.surround.z = l.position.z;
+            if (l.surround) tr.surround.width = l.position.width, tr.surround.lfeDb = l.position.lfeDb, tr.surround.object = l.position.object;
         }
     });
 }
@@ -783,7 +786,7 @@ void MixerPanel::playbackStopped(FrameTime t) {
     for (Recording& r : recording_) {
         const bool v = r.volume.wrote(), p = r.pan.wrote();
         const bool px = r.surround && r.x.wrote(), py = r.surround && r.y.wrote(), pz = r.surround && r.z.wrote();
-        wrote = wrote || v || p || px || py || pz;
+        wrote = wrote || v || p || px || py || pz || r.changedOther;
         done.push_back({r.track, v ? r.volume.finish(t, 0.1) : r.volumeLane, p ? r.pan.finish(t, 0.005) : r.panLane, r.volumeDb, r.panValue,
                         r.mode == AutomationMode::Write, px ? r.x.finish(t, 0.005) : r.xLane, py ? r.y.finish(t, 0.005) : r.yLane,
                         pz ? r.z.finish(t, 0.005) : r.zLane, r.position});
@@ -808,6 +811,7 @@ void MixerPanel::playbackStopped(FrameTime t) {
             tr.surroundYAuto = d.y;
             tr.surroundZAuto = d.z;
             tr.surround.x = d.position.x, tr.surround.y = d.position.y, tr.surround.z = d.position.z;
+            tr.surround.width = d.position.width, tr.surround.lfeDb = d.position.lfeDb, tr.surround.object = d.position.object;
             if (d.fromWrite) tr.automation = int(AutomationMode::Touch);
         }
     });
@@ -816,8 +820,22 @@ void MixerPanel::playbackStopped(FrameTime t) {
 }
 
 void MixerPanel::setSurround(int index, const SurroundPan& pan, bool) {
-    // While automation is written the recorder samples the panner.
-    if (std::any_of(recording_.begin(), recording_.end(), [&](const Recording& r) { return r.track == index && r.surround; })) return;
+    // While automation is written the recorder samples the panner's position; its width, LFE and object flag are
+    // kept for the end of the pass. Nothing else is edited meanwhile (an edit would end the pass).
+    if (!recording_.empty()) {
+        bool recorded = false;
+        for (Recording& r : recording_)
+            if (r.track == index && r.surround) {
+                recorded = true;
+                if (r.position.width != pan.width || r.position.lfeDb != pan.lfeDb || r.position.object != pan.object) {
+                    r.position.width = pan.width, r.position.lfeDb = pan.lfeDb, r.position.object = pan.object;
+                    r.changedOther = true;
+                    liveState_.clear();
+                }
+            }
+        if (!recorded) refresh();
+        return;
+    }
     // A moving position is keyed at the playhead; its width, LFE and object flag stay the track's own.
     const FrameTime at = state_->playhead();
     state_->edit(
@@ -845,6 +863,10 @@ void MixerPanel::setSurround(int index, const SurroundPan& pan, bool) {
 }
 
 void MixerPanel::animateSurround(int index, bool on) {
+    if (!recording_.empty()) {  // not while a pass is written: the edit would end it
+        refresh();
+        return;
+    }
     const FrameTime at = state_->playhead();
     state_->edit(on ? tr("Animate Surround Position") : tr("Stop Surround Animation"), [index, on, at](Project&, Sequence& s) {
         if (index >= int(s.audioTracks.size())) return false;
