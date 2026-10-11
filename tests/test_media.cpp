@@ -119,6 +119,7 @@
 #include "media/VisualSearch.h"
 #include "automation/McpServer.h"
 #include "automation/ScriptHost.h"
+#include "automation/ScriptPanel.h"
 #include "core/Cdl.h"
 #ifdef MONTAGE_WITH_WHISPER
 #include "media/Transcriber.h"
@@ -9146,6 +9147,128 @@ private slots:
         QVERIFY(call({{"action", "assemble"}, {"video_track", "A1"}}).value("isError").toBool());
         QVERIFY(call({{"action", "board"}, {"bin", "No Such Bin"}}).value("isError").toBool());
         QVERIFY(call({{"action", "nonsense"}}).value("isError").toBool());
+    }
+
+    void luaPanels() {
+        // ---- A panel's description checked, every default filled in.
+        auto parse = [](const char* json, QString* err = nullptr) { return parsePanel(QJsonDocument::fromJson(json).object(), err); };
+        std::optional<PanelSpec> spec = parse(R"({"title": "Rename", "controls": [
+            {"type": "text", "id": "prefix", "label": "Prefix", "value": "Shot_"},
+            {"type": "number", "id": "start", "min": 0, "max": 100, "step": 0.5},
+            {"type": "check", "id": "selected", "label": "Selected only"},
+            {"type": "choice", "id": "track", "choices": ["V1", "V2"]},
+            {"type": "slider", "id": "amount", "value": 140},
+            {"type": "label", "id": "status", "text": "Ready"},
+            {"type": "label", "text": "No id"},
+            {"type": "separator"},
+            {"type": "button", "id": "go"}]})");
+        QVERIFY(spec);
+        QCOMPARE(spec->title, QString("Rename"));
+        QCOMPARE(spec->controls.size(), size_t(9));
+        const QJsonObject defaults = panelValues(*spec);
+        QCOMPARE(defaults.value("prefix").toString(), QString("Shot_"));
+        QCOMPARE(defaults.value("start").toDouble(), 0.0);
+        QCOMPARE(defaults.value("selected").toBool(), false);
+        QCOMPARE(defaults.value("track").toString(), QString("V1"));
+        QCOMPARE(defaults.value("amount").toInt(), 100);  // (clamped to the slider's 0-100)
+        QCOMPARE(defaults.value("status").toString(), QString("Ready"));
+        QVERIFY(!defaults.contains("go"));
+        QCOMPARE(spec->find("go")->label, QString("go"));  // a button's caption defaults to its id
+        QCOMPARE(describePanel(*spec).value("controls").toArray().size(), 9);
+        QString err;
+        QVERIFY(!parse(R"({"title": "x"})", &err) && err.contains("controls"));
+        QVERIFY(!parse(R"({"controls": [{"type": "knob", "id": "a"}]})", &err) && err.contains("type"));
+        QVERIFY(!parse(R"({"controls": [{"type": "text"}]})", &err) && err.contains("needs an id"));
+        QVERIFY(!parse(R"({"controls": [{"type": "text", "id": "a"}, {"type": "check", "id": "a"}]})", &err) && err.contains("twice"));
+        QVERIFY(!parse(R"({"controls": [{"type": "choice", "id": "a", "choices": ["x"], "value": "y"}]})", &err) && err.contains("not one of"));
+        QVERIFY(!parse(R"({"controls": [{"type": "number", "id": "a", "min": 5, "max": 1}]})", &err) && err.contains("min"));
+        QVERIFY(!parse(R"({"controls": [{"type": "button", "id": "pressed"}]})", &err) && err.contains("pressed"));
+        QVERIFY(!parse(R"({"controls": [{"type": "text", "id": "1st"}]})", &err) && err.contains("letters"));
+        QVERIFY(!parse(R"({"controls": [{"type": "text", "id": "a"}], "colour": "red"})", &err) && err.contains("colour"));
+        QVERIFY(!parse(R"({"controls": [{"type": "button", "id": "a", "value": 1}]})", &err) && err.contains("no value"));
+        // Values set as the script or the command line gives them, made each control's kind.
+        QVERIFY(setPanelValue(*spec, "start", "12.5"));
+        QCOMPARE(panelValues(*spec).value("start").toDouble(), 12.5);
+        QVERIFY(setPanelValue(*spec, "start", 1000));
+        QCOMPARE(panelValues(*spec).value("start").toDouble(), 100.0);
+        QVERIFY(setPanelValue(*spec, "selected", "true") && panelValues(*spec).value("selected").toBool());
+        QVERIFY(setPanelValue(*spec, "status", 3) && panelValues(*spec).value("status").toString() == "3");
+        QVERIFY(!setPanelValue(*spec, "track", "V9", &err) && err.contains("V1"));
+        QVERIFY(!setPanelValue(*spec, "go", "x", &err) && err.contains("button"));
+        QVERIFY(!setPanelValue(*spec, "nothing", "x", &err) && err.contains("no control"));
+        QVERIFY(!setPanelValue(*spec, "start", "lots", &err) && err.contains("number"));
+        QVERIFY(!setPanelValue(*spec, "prefix", 4, &err));
+
+        if (!scriptingAvailable()) QSKIP("built without Lua");
+        // ---- In a script: described (the script ends there, successfully, nothing after it run), then run again with
+        // what the panel holds when its button is pressed.
+        QTemporaryDir dir;
+        const QString project = dir.path() + "/p.montage";
+        McpServer server;
+        ScriptOptions o = toolScriptOptions(server, project);
+        QStringList printed;
+        o.print = [&](const QString& line) { printed << line; };
+        const QString code = R"lua(
+            print("before")
+            local ui = montage.panel{title = "Titles", controls = {
+              {type = "text", id = "words", label = "Words", value = "Hello"},
+              {type = "number", id = "at", label = "At", value = 1, min = 0, max = 60},
+              {type = "label", id = "status", text = ""},
+              {type = "button", id = "add", label = "Add Title"},
+            }}
+            print("pressed", ui.pressed, ui.words, math.type(ui.at), ui.at)
+            if ui.pressed == "add" then
+              montage.create_project{width = 640, height = 360, fps = 25}
+              local t = montage.add_title{text = ui.words, at = ui.at}
+              montage.set_panel{status = "Added " .. ui.words}
+            end
+        )lua";
+        std::optional<PanelSpec> described;
+        std::optional<QJsonObject> answer;
+        o.panel = [&](const QJsonObject& d, QString* error) -> std::optional<QJsonObject> {
+            described = parsePanel(d, error);
+            if (!described) return std::nullopt;
+            return answer;
+        };
+        QJsonObject shown;
+        o.setPanel = [&](const QJsonObject& v, QString*) {
+            for (auto it = v.begin(); it != v.end(); ++it) shown[it.key()] = it.value();
+            return true;
+        };
+        QString error;
+        QVERIFY2(runScript(code, "titles.lua", o, &error), qPrintable(error));
+        QVERIFY(described && described->title == "Titles" && described->controls.size() == 4);
+        QCOMPARE(printed, QStringList{"before"});
+        QVERIFY(!QFileInfo::exists(project));
+        // Inside pcall, described still ends the script.
+        printed.clear();
+        QVERIFY2(runScript("local ok = pcall(montage.panel, {controls = {{type = 'button', id = 'b'}}})\nprint('after', ok)", "p.lua", o, &error), qPrintable(error));
+        QVERIFY(printed.isEmpty());
+        // A button pressed: the script goes on with the panel's values, its tools run and set_panel shows a result.
+        printed.clear();
+        QJsonObject values = panelValues(*parse(R"({"controls": [{"type": "text", "id": "words"}, {"type": "number", "id": "at"}, {"type": "label", "id": "status"}]})"));
+        values["words"] = "Panel title";
+        values["at"] = 2;
+        values["pressed"] = "add";
+        answer = values;
+        QVERIFY2(runScript(code, "titles.lua", o, &error), qPrintable(error));
+        QCOMPARE(printed.value(1), QString("pressed\tadd\tPanel title\tinteger\t2"));
+        QCOMPARE(shown.value("status").toString(), QString("Added Panel title"));
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        bool found = false;
+        for (const Track& t : back.active()->videoTracks)
+            for (const Clip& c : t.clips) found |= c.generator.type == "title" && c.start == 2 * 25;
+        QVERIFY(found);
+        // A description that does not check out, and a host without panels, are errors naming the problem.
+        QVERIFY(!runScript("montage.panel{controls = {{type = 'dial', id = 'x'}}}", "bad.lua", o, &error));
+        QVERIFY2(error.contains("montage.panel") && error.contains("type"), qPrintable(error));
+        o.panel = nullptr;
+        o.setPanel = nullptr;
+        QVERIFY(!runScript("montage.panel{controls = {{type = 'button', id = 'b'}}}", "none.lua", o, &error));
+        QVERIFY2(error.contains("Montage app"), qPrintable(error));
+        QVERIFY(!runScript("montage.set_panel{a = 1}", "none.lua", o, &error));
+        QVERIFY(error.contains("no panel"));
     }
 
     void luaScripts() {

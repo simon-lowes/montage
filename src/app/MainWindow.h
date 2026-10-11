@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "Recovery.h"
+#include "automation/ScriptPanel.h"
 #include "TimelineWidget.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
@@ -69,6 +70,7 @@ class LinkMediaDialog;
 class LiveLink;
 class AssistantPanel;
 class ScriptConsole;
+class ScriptPanelWidget;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -195,6 +197,10 @@ public:
     // dialog with how to connect.
     LiveLink* liveLink() const { return liveLink_; }
     ScriptConsole* scriptConsole() const { return scripts_; }
+    // Scripts' own panels (montage.panel), by key (their script's file, or "console"), and those open when Montage
+    // last closed opened again (their scripts run as far as montage.panel, with no tools).
+    ScriptPanelWidget* scriptPanel(const QString& key) const;
+    void restoreScriptPanels();
     AssistantPanel* assistant() const { return assistant_; }
     bool setAgentLink(bool on);
     void agentLinkDialog();
@@ -493,6 +499,14 @@ private:
     // Tools › Scripts: Lua scripts on the open project (app/ScriptConsole.h).
     QDockWidget* scriptsDock_ = nullptr;
     ScriptConsole* scripts_ = nullptr;
+    struct ScriptPanelDock {
+        QDockWidget* dock = nullptr;
+        ScriptPanelWidget* widget = nullptr;
+        QString name, code;  // its script's name, and its text when it is the console's (a file is read afresh)
+    };
+    std::map<QString, ScriptPanelDock> scriptPanels_;
+    void openScriptPanel(const QString& key, const QString& name, const QString& code, const PanelSpec& spec);
+    void pressScriptPanel(const QString& key, const QString& button);
     QDockWidget* indexDock_ = nullptr;
     QDockWidget* stackedDock_ = nullptr;
     StackedTimelineWidget* stacked_ = nullptr;

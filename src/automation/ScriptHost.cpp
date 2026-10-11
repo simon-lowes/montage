@@ -62,6 +62,8 @@ namespace {
 
 const char* kHostKey = "montage.host";
 const char* kStopKey = "montage.stop";  // the error a stopped script is ended with (no pcall keeps it)
+const char* kDoneKey = "montage.done";  // and a script that has described its panel (it ends there, successfully)
+const char* kEndingKey = "montage.ending";  // which of the two is ending the script (the hook raises it again)
 const char* kStopped = "Stopped";
 
 const ScriptOptions& host(lua_State* L) {
@@ -73,14 +75,19 @@ const ScriptOptions& host(lua_State* L) {
 
 void hook(lua_State* L, lua_Debug*);
 
-// Ends the script: its stop value, which pcall, xpcall and coroutine.resume pass on (see kPrelude), and the hook
-// from now on at every instruction, so a script that catches it anyway cannot go on for long.
-[[noreturn]] void stopScript(lua_State* L) {
+// Ends the script with the value under `key` (stopped, or done), which pcall, xpcall and coroutine.resume pass on (see
+// kPrelude), and the hook from now on at every instruction raising it again, so a script that catches it anyway
+// cannot go on for long.
+[[noreturn]] void endScript(lua_State* L, const char* key) {
+    lua_getfield(L, LUA_REGISTRYINDEX, key);
+    lua_setfield(L, LUA_REGISTRYINDEX, kEndingKey);
     lua_sethook(L, hook, LUA_MASKCOUNT, 1);
-    lua_getfield(L, LUA_REGISTRYINDEX, kStopKey);
+    lua_getfield(L, LUA_REGISTRYINDEX, key);
     lua_error(L);
     std::abort();  // (lua_error does not return)
 }
+
+[[noreturn]] void stopScript(lua_State* L) { endScript(L, kStopKey); }
 
 // JSON null in a result's arrays and as montage.null (a NULL light userdata, as lua-cjson's).
 bool isNull(lua_State* L, int index) { return lua_islightuserdata(L, index) && !lua_touserdata(L, index); }
@@ -277,7 +284,35 @@ int montageJson(lua_State* L) {
     return 1;
 }
 
+// montage.panel{...}: the script's panel described to the host, which answers with what it holds (or ends the script).
+int montagePanel(lua_State* L) {
+    const ScriptOptions& o = host(L);
+    luaL_checktype(L, 1, LUA_TTABLE);
+    const QJsonValue description = toJson(L, 1);
+    if (!o.panel) return luaL_error(L, "montage.panel: panels open in the Montage app (montage-cli script --press <button> answers one)");
+    if (o.stopped && o.stopped()) stopScript(L);
+    QString error;
+    const std::optional<QJsonObject> values = o.panel(description.toObject(), &error);
+    if (!error.isEmpty()) return luaL_error(L, "montage.panel: %s", error.toUtf8().constData());
+    if (!values) endScript(L, kDoneKey);  // described: it runs again when a button is pressed
+    pushObject(L, *values);
+    return 1;
+}
+
+int montageSetPanel(lua_State* L) {
+    const ScriptOptions& o = host(L);
+    luaL_checktype(L, 1, LUA_TTABLE);
+    const QJsonValue values = toJson(L, 1);
+    if (!o.setPanel) return luaL_error(L, "montage.set_panel: this script has no panel open");
+    QString error;
+    if (!o.setPanel(values.toObject(), &error)) return luaL_error(L, "montage.set_panel: %s", error.toUtf8().constData());
+    return 0;
+}
+
 void hook(lua_State* L, lua_Debug*) {
+    lua_getfield(L, LUA_REGISTRYINDEX, kEndingKey);
+    if (!lua_isnil(L, -1)) lua_error(L);  // (ending: caught somewhere, raised again)
+    lua_pop(L, 1);
     const ScriptOptions& o = host(L);
     if (o.tick) o.tick();
     if (o.stopped && o.stopped()) stopScript(L);
@@ -286,15 +321,15 @@ void hook(lua_State* L, lua_Debug*) {
 // Run before a script, with the stop value as its argument: the catching functions pass it on, so Stop (and Ctrl+C)
 // end a script that catches errors too.
 const char* kPrelude = R"lua(
-local STOP = ...
+local STOP, DONE = ...
 local pcall0, xpcall0, error0 = pcall, xpcall, error
 local function pass(ok, ...)
-  if not ok and (...) == STOP then error0(STOP, 0) end
+  if not ok and ((...) == STOP or (...) == DONE) then error0((...), 0) end
   return ok, ...
 end
 pcall = function(f, ...) return pass(pcall0(f, ...)) end
 xpcall = function(f, handler, ...)
-  return pass(xpcall0(f, function(e) if e == STOP then return STOP end return handler(e) end, ...))
+  return pass(xpcall0(f, function(e) if e == STOP or e == DONE then return e end return handler(e) end, ...))
 end
 local resume0 = coroutine.resume
 coroutine.resume = function(co, ...) return pass(resume0(co, ...)) end
@@ -313,6 +348,8 @@ bool runScript(const QString& code, const QString& name, const ScriptOptions& op
     lua_setfield(L, LUA_REGISTRYINDEX, kHostKey);
     lua_newtable(L);  // the stop value: a table only the host and the prelude hold
     lua_setfield(L, LUA_REGISTRYINDEX, kStopKey);
+    lua_newtable(L);  // the panel described: another
+    lua_setfield(L, LUA_REGISTRYINDEX, kDoneKey);
     // Nothing that takes the stop hook away, and no C modules (Lua is built into Montage, not a library to load).
     lua_getglobal(L, "debug");
     lua_pushnil(L);
@@ -348,6 +385,10 @@ bool runScript(const QString& code, const QString& name, const ScriptOptions& op
     lua_setfield(L, -2, "tools");
     lua_pushcfunction(L, montageJson);
     lua_setfield(L, -2, "json");
+    lua_pushcfunction(L, montagePanel);
+    lua_setfield(L, -2, "panel");
+    lua_pushcfunction(L, montageSetPanel);
+    lua_setfield(L, -2, "set_panel");
     lua_createtable(L, int(options.args.size()), 0);
     for (qsizetype i = 0; i < options.args.size(); ++i) {
         lua_pushstring(L, options.args[i].toUtf8().constData());
@@ -370,7 +411,8 @@ bool runScript(const QString& code, const QString& name, const ScriptOptions& op
         return false;
     }
     lua_getfield(L, LUA_REGISTRYINDEX, kStopKey);
-    lua_call(L, 1, 0);
+    lua_getfield(L, LUA_REGISTRYINDEX, kDoneKey);
+    lua_call(L, 2, 0);
     lua_sethook(L, hook, LUA_MASKCOUNT, 20000);
     // As lua.c reads a file: a UTF-8 byte order mark and a first "#!" line skipped (the line kept, for line numbers).
     QByteArray src = code.toUtf8();
@@ -378,6 +420,12 @@ bool runScript(const QString& code, const QString& name, const ScriptOptions& op
     if (src.startsWith('#')) src.remove(0, src.indexOf('\n') < 0 ? src.size() : src.indexOf('\n'));
     const QByteArray chunk = ("=" + name).toUtf8();
     bool ok = luaL_loadbuffer(L, src.constData(), size_t(src.size()), chunk.constData()) == LUA_OK && lua_pcall(L, 0, 0, 0) == LUA_OK;
+    if (!ok) {
+        // Ended at montage.panel, its panel described: a success.
+        lua_getfield(L, LUA_REGISTRYINDEX, kDoneKey);
+        ok = lua_rawequal(L, -1, -2);
+        lua_pop(L, 1);
+    }
     if (!ok && error) {
         lua_getfield(L, LUA_REGISTRYINDEX, kStopKey);
         const bool stopped = lua_rawequal(L, -1, -2);

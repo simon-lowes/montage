@@ -91,7 +91,8 @@ ScriptConsole::ScriptConsole(EditorState* state, LiveLink* link, QWidget* parent
     if (!scriptingAvailable()) print(tr("This build of Montage has no Lua, so scripts cannot run."), true);
 
     connect(run_, &QPushButton::clicked, this, [this] {
-        run(editor_->toPlainText(), path_.isEmpty() ? tr("Console") : QFileInfo(path_).fileName());
+        runScriptAs(editor_->toPlainText(), path_.isEmpty() ? tr("Console") : QFileInfo(path_).fileName(), {},
+                    path_.isEmpty() ? QStringLiteral("console") : path_, std::nullopt, false);
     });
     connect(stop_, &QPushButton::clicked, this, &ScriptConsole::stop);
     connect(openBtn, &QPushButton::clicked, this, [this] {
@@ -149,7 +150,20 @@ bool ScriptConsole::runFile(const QString& path, const QStringList& args) {
         print(tr("Cannot read %1").arg(QDir::toNativeSeparators(path)), true);
         return false;
     }
-    return run(QString::fromUtf8(f.readAll()), QFileInfo(path).fileName(), args);
+    return runScriptAs(QString::fromUtf8(f.readAll()), QFileInfo(path).fileName(), args, QFileInfo(path).absoluteFilePath(), std::nullopt, false);
+}
+
+bool ScriptConsole::runPanel(const QString& key, const QString& code, const QString& name, const QJsonObject& values) {
+    return runScriptAs(code, name, {}, key, values, false);
+}
+
+bool ScriptConsole::setUpPanel(const QString& path) {
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly)) {
+        print(tr("Cannot read %1").arg(QDir::toNativeSeparators(path)), true);
+        return false;
+    }
+    return runScriptAs(QString::fromUtf8(f.readAll()), QFileInfo(path).fileName(), {}, QFileInfo(path).absoluteFilePath(), std::nullopt, true);
 }
 
 void ScriptConsole::stop() {
@@ -161,6 +175,11 @@ void ScriptConsole::stop() {
 }
 
 bool ScriptConsole::run(const QString& code, const QString& name, const QStringList& args) {
+    return runScriptAs(code, name, args, QStringLiteral("console"), std::nullopt, false);
+}
+
+bool ScriptConsole::runScriptAs(const QString& code, const QString& name, const QStringList& args, const QString& key,
+                                const std::optional<QJsonObject>& values, bool setUp) {
     if (running_) return false;
     if (!scriptingAvailable()) {
         print(tr("This build of Montage has no Lua, so scripts cannot run."), true);
@@ -184,7 +203,31 @@ bool ScriptConsole::run(const QString& code, const QString& name, const QStringL
     o.project = state_->filePath();
     o.args = args;
     o.noStdin = true;
-    o.print = [this](const QString& line) { print(line); };
+    QString lastLine;  // (a panel shows its run's last line)
+    o.print = [this, &lastLine](const QString& line) {
+        print(line);
+        lastLine = line.section(QLatin1Char('\n'), -1);
+    };
+    // Its panel: described (the script ends there and the panel opens), or answered with what it holds.
+    std::optional<PanelSpec> described;
+    o.panel = [&](const QJsonObject& d, QString* error) -> std::optional<QJsonObject> {
+        std::optional<PanelSpec> spec = parsePanel(d, error);
+        if (!spec) return std::nullopt;
+        if (values) return *values;
+        if (!panels_.described) {
+            *error = tr("panels open in the main window");
+            return std::nullopt;
+        }
+        described = std::move(spec);
+        return std::nullopt;
+    };
+    o.setPanel = [&](const QJsonObject& v, QString* error) {
+        if (!values || !panels_.set) {
+            *error = tr("call it after montage.panel, from a press of the panel's button");
+            return false;
+        }
+        return panels_.set(key, v, error);
+    };
     o.stopped = [this] { return stopping_; };
     QElapsedTimer sinceEvents;
     sinceEvents.start();
@@ -193,7 +236,12 @@ bool ScriptConsole::run(const QString& code, const QString& name, const QStringL
         QCoreApplication::processEvents();
         sinceEvents.restart();
     };
-    o.call = [this, label, group, generation](const QString& tool, const QJsonObject& a, QString* error) -> QJsonObject {
+    o.call = [this, label, group, generation, setUp](const QString& tool, const QJsonObject& a, QString* error) -> QJsonObject {
+        // A panel being opened again: the script runs only as far as montage.panel, so nothing changes.
+        if (setUp) {
+            if (error) *error = tr("a panel opening again runs no tools: call montage.panel before any");
+            return {};
+        }
         // Another project opened since it started: its calls would edit that one, so none runs.
         if (state_->projectGeneration() != generation) {
             if (error) *error = tr("the project the script was running on was closed");
@@ -232,8 +280,11 @@ bool ScriptConsole::run(const QString& code, const QString& name, const QStringL
     const bool ok = runScript(code, name, o, &err);
     state_->setUndoGroup({});
     group_.clear();
-    if (ok) print(tr("Done."));
+    if (ok && described) print(tr("Panel \"%1\" open.").arg(described->title));
+    else if (ok) print(tr("Done."));
     else print(err, true);
+    if (ok && described) panels_.described(key, name, code, *described);
+    if (values && panels_.finished) panels_.finished(key, ok ? lastLine : err, !ok);
     running_ = stopping_ = false;
     updateButtons();
     emit finished(ok);

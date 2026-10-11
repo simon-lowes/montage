@@ -80,6 +80,7 @@
 #include "automation/McpServer.h"
 #include "automation/ScriptHost.h"
 #include "ScriptConsole.h"
+#include "ScriptPanelWidget.h"
 #include "media/SpeechSearch.h"
 #include "media/TextReader.h"
 #include "core/OnScreenText.h"
@@ -10725,6 +10726,96 @@ const auto seq = [this] { return state()->sequence(); };
             for (const Clip& c : t.clips) QVERIFY(state()->project().findMedia(c.mediaId)->kind != MediaKind::Sequence);
         bin->setView(MediaBinWidget::View::Icons);
         state()->newProject();
+    }
+
+    void scriptPanelsInTheApp() {
+        if (!scriptingAvailable()) QSKIP("built without Lua");
+        state()->newProject();
+        appSettings().remove("scripts/panels");
+        // A script with its own panel: run once, it opens the panel; its button runs it again with what the panel holds.
+        const QString path = QFileInfo(dir_.filePath("marker-maker.lua")).absoluteFilePath();
+        auto write = [&](const QByteArray& code) {
+            QFile f(path);
+            QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            f.write(code);
+        };
+        const QByteArray code = R"lua(
+local ui = montage.panel{title = "Marker Maker", controls = {
+  {type = "text", id = "name", label = "Name", value = "Cue"},
+  {type = "number", id = "at", label = "At (s)", value = 1, min = 0, max = 600},
+  {type = "check", id = "chapter", label = "Chapter"},
+  {type = "label", id = "status", text = ""},
+  {type = "button", id = "add", label = "Add Marker"},
+  {type = "button", id = "fail", label = "Fail"},
+}}
+if ui.pressed == "fail" then error("on purpose") end
+montage.add_marker{at = ui.at, name = ui.name, chapter = ui.chapter}
+montage.add_marker{at = ui.at + 1, name = ui.name .. " end"}
+montage.set_panel{status = "Added " .. ui.name, at = ui.at + 2}
+print("added " .. ui.name)
+)lua";
+        write(code);
+        ScriptConsole* console = win_->scriptConsole();
+        const int steps = int(state()->history().undoCount());
+        QVERIFY(console->runFile(path));
+        ScriptPanelWidget* panel = win_->scriptPanel(path);
+        QVERIFY(panel);
+        auto* dock = qobject_cast<QDockWidget*>(panel->parentWidget());
+        QVERIFY(dock && dock->windowTitle() == "Marker Maker" && dock->isVisible());
+        QCOMPARE(int(state()->history().undoCount()), steps);  // (nothing ran past montage.panel)
+        QVERIFY(state()->sequence()->markers.empty());
+        QVERIFY(appSettings().value("scripts/panels").toStringList().contains(path));
+        QVERIFY(console->output().contains("Panel \"Marker Maker\" open"));
+        // Filled in and pressed: two markers as one undo step, the panel showing what the script set and printed.
+        qobject_cast<QLineEdit*>(panel->control("name"))->setText("Intro");
+        qobject_cast<QDoubleSpinBox*>(panel->control("at"))->setValue(2);
+        qobject_cast<QCheckBox*>(panel->control("chapter"))->setChecked(true);
+        qobject_cast<QPushButton*>(panel->control("add"))->click();
+        const Sequence* s = state()->sequence();
+        QCOMPARE(s->markers.size(), size_t(2));
+        QCOMPARE(QString::fromStdString(s->markers[0].name), QString("Intro"));
+        QCOMPARE(s->markers[0].t, FrameTime(2 * s->fps.num / s->fps.den));
+        QVERIFY(s->markers[0].chapter);
+        QCOMPARE(int(state()->history().undoCount()), steps + 1);
+        QCOMPARE(QString::fromStdString(state()->history().undoLabel()), QString("Script: marker-maker.lua"));
+        QCOMPARE(qobject_cast<QLabel*>(panel->control("status"))->text(), QString("Added Intro"));
+        QCOMPARE(qobject_cast<QDoubleSpinBox*>(panel->control("at"))->value(), 4.0);
+        QCOMPARE(panel->findChild<QLabel*>("panelMessage")->text(), QString("added Intro"));
+        QVERIFY(panel->control("add")->isEnabled());
+        state()->undo();
+        QVERIFY(state()->sequence()->markers.empty());
+        // An error shows on the panel, and nothing is changed.
+        qobject_cast<QPushButton*>(panel->control("fail"))->click();
+        QVERIFY(panel->findChild<QLabel*>("panelMessage")->text().contains("on purpose"));
+        QVERIFY(state()->sequence()->markers.empty());
+        // The script edited on disk runs as edited (its panel described again when it is run again).
+        write(QByteArray(code).replace("Marker Maker", "Marker Maker 2"));
+        QVERIFY(console->runFile(path));
+        QCOMPARE(win_->scriptPanel(path), qobject_cast<ScriptPanelWidget*>(dock->widget()));
+        QCOMPARE(dock->windowTitle(), QString("Marker Maker 2"));
+        // Closed by its button: gone and not opened again; opened again at start-up while listed, running no tools
+        // before its panel (a script that calls one first is refused).
+        dock->close();
+        QTRY_VERIFY(!win_->scriptPanel(path));
+        QVERIFY(!appSettings().value("scripts/panels").toStringList().contains(path));
+        appSettings().setValue("scripts/panels", QStringList{path});
+        win_->restoreScriptPanels();
+        QVERIFY(win_->scriptPanel(path));
+        QVERIFY(state()->sequence()->markers.empty());
+        write("montage.add_marker{at = 1, name = 'too soon'}\n" + code);
+        QPointer<QDockWidget> old = qobject_cast<QDockWidget*>(win_->scriptPanel(path)->parentWidget());
+        old->close();
+        QTRY_VERIFY(old.isNull());
+        appSettings().setValue("scripts/panels", QStringList{path});
+        win_->restoreScriptPanels();
+        QVERIFY(!win_->scriptPanel(path));
+        QVERIFY(state()->sequence()->markers.empty());
+        QVERIFY(console->output().contains("runs no tools"));
+        // The console's own script can have a panel too.
+        QVERIFY(console->run("local ui = montage.panel{title = 'Here', controls = {{type = 'button', id = 'b'}}}\nprint('pressed ' .. ui.pressed)", "Console"));
+        QVERIFY(win_->scriptPanel("console"));
+        appSettings().remove("scripts/panels");
+        qobject_cast<QDockWidget*>(win_->scriptPanel("console")->parentWidget())->close();
     }
 
     void scriptsInTheApp() {

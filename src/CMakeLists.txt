@@ -60,6 +60,7 @@ add_library(montage_engine STATIC
   core/GraphicsTemplate.h core/GraphicsTemplate.cpp
   core/Storyboard.h core/Storyboard.cpp
   automation/ScriptHost.h automation/ScriptHost.cpp
+  automation/ScriptPanel.h automation/ScriptPanel.cpp
   core/Interchange.h core/Interchange.cpp
   automation/McpServer.h automation/McpServer.cpp
   media/Image.h media/Image.cpp

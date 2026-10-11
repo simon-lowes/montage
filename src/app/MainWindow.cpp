@@ -4,6 +4,7 @@
 #include "render/Ofx.h"
 #include "AssistantPanel.h"
 #include "ScriptConsole.h"
+#include "ScriptPanelWidget.h"
 #include "CleanFeed.h"
 #include "Settings.h"
 
@@ -195,6 +196,9 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     } else {
         scanPluginsInBackground();
     }
+
+    // Scripts' panels open when Montage last closed, opened again once the window is up.
+    QTimer::singleShot(0, this, [this] { restoreScriptPanels(); });
 
     // The agent link comes back on if it was on when Montage last closed.
     connect(liveLink_, &LiveLink::applied, this, [this](const QString& label) { statusBar()->showMessage(label, 5000); });
@@ -467,6 +471,22 @@ void MainWindow::buildPanels() {
     assistantDock_ = makeDock(tr("Assistant"), "assistant", assistant_);
     scripts_ = new ScriptConsole(state_, liveLink_, this);
     scriptsDock_ = makeDock(tr("Script Console"), "scripts", scripts_);
+    scripts_->setPanelHost(PanelHost{
+        [this](const QString& key, const QString& name, const QString& code, const PanelSpec& spec) { openScriptPanel(key, name, code, spec); },
+        [this](const QString& key, const QJsonObject& values, QString* error) {
+            const auto it = scriptPanels_.find(key);
+            if (it == scriptPanels_.end()) {
+                *error = tr("its panel was closed");
+                return false;
+            }
+            return it->second.widget->set(values, error);
+        },
+        [this](const QString& key, const QString& message, bool error) {
+            const auto it = scriptPanels_.find(key);
+            if (it == scriptPanels_.end()) return;
+            it->second.widget->setBusy(false);
+            it->second.widget->showMessage(message, error);
+        }});
     indexDock_ = makeDock(tr("Sequence Index"), "index", new SequenceIndexPanel(state_, this));
     stacked_ = new StackedTimelineWidget(state_, this);
     stackedDock_ = makeDock(tr("Stacked Timeline"), "stacked", stacked_);
@@ -5352,6 +5372,89 @@ void MainWindow::exportDcpDialog() {
     appSettings().setValue(QStringLiteral("dcp/studio"), studio->text().trimmed());
     appSettings().setValue(QStringLiteral("dcp/facility"), facility->text().trimmed());
     exportDcpTo(folder->text(), st);
+}
+
+namespace {
+
+// Tells when a dock is closed by its own button (closing the window closes no docks).
+class ScriptPanelCloseFilter : public QObject {
+public:
+    ScriptPanelCloseFilter(QObject* parent, std::function<void()> closed) : QObject(parent), closed_(std::move(closed)) {}
+
+protected:
+    bool eventFilter(QObject*, QEvent* e) override {
+        if (e->type() == QEvent::Close && closed_) closed_();
+        return false;
+    }
+
+private:
+    std::function<void()> closed_;
+};
+
+}  // namespace
+
+ScriptPanelWidget* MainWindow::scriptPanel(const QString& key) const {
+    const auto it = scriptPanels_.find(key);
+    return it == scriptPanels_.end() ? nullptr : it->second.widget;
+}
+
+void MainWindow::openScriptPanel(const QString& key, const QString& name, const QString& code, const PanelSpec& spec) {
+    // A script's panel, docked beside the Script Console; described again, it is built afresh in the same dock.
+    ScriptPanelDock& p = scriptPanels_[key];
+    if (!p.dock) {
+        p.dock = new QDockWidget(this);
+        p.dock->setObjectName(QStringLiteral("scriptPanel_%1").arg(qHash(key), 0, 16));
+        p.dock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable | QDockWidget::DockWidgetClosable);
+        addDockWidget(Qt::RightDockWidgetArea, p.dock);
+        if (scriptsDock_->isVisible() && !scriptsDock_->isFloating()) tabifyDockWidget(scriptsDock_, p.dock);
+        // Closed by its own button: gone, and not opened again at the next start.
+        auto* filter = new ScriptPanelCloseFilter(p.dock, [this, key] {
+            const auto it = scriptPanels_.find(key);
+            if (it == scriptPanels_.end()) return;
+            QDockWidget* dock = it->second.dock;
+            scriptPanels_.erase(it);
+            QStringList open = appSettings().value(QStringLiteral("scripts/panels")).toStringList();
+            open.removeAll(key);
+            appSettings().setValue(QStringLiteral("scripts/panels"), open);
+            dock->deleteLater();
+        });
+        p.dock->installEventFilter(filter);
+    }
+    p.name = name;
+    p.code = code;
+    p.widget = new ScriptPanelWidget(spec, p.dock);
+    p.dock->setWindowTitle(spec.title);
+    p.dock->setWidget(p.widget);  // (the old panel, if any, is deleted with its dock's last widget)
+    connect(p.widget, &ScriptPanelWidget::pressed, this, [this, key](const QString& id) { pressScriptPanel(key, id); });
+    p.dock->show();
+    p.dock->raise();
+    if (key != QLatin1String("console")) {
+        QStringList open = appSettings().value(QStringLiteral("scripts/panels")).toStringList();
+        if (!open.contains(key)) appSettings().setValue(QStringLiteral("scripts/panels"), open << key);
+    }
+}
+
+void MainWindow::pressScriptPanel(const QString& key, const QString& button) {
+    const auto it = scriptPanels_.find(key);
+    if (it == scriptPanels_.end()) return;
+    ScriptPanelDock& p = it->second;
+    if (scripts_->running()) return state_->message(tr("A script is running"), 4000);
+    QString code = p.code;
+    if (key != QLatin1String("console")) {
+        // The script as it is now on disk (edited since, it runs as edited).
+        QFile f(key);
+        if (!f.open(QIODevice::ReadOnly)) return p.widget->showMessage(tr("Cannot read %1").arg(QDir::toNativeSeparators(key)), true);
+        code = QString::fromUtf8(f.readAll());
+    }
+    p.widget->setBusy(true);
+    p.widget->showMessage(tr("Running…"));
+    const QJsonObject values = p.widget->values(button);
+    scripts_->runPanel(key, code, p.name, values);
+}
+
+void MainWindow::restoreScriptPanels() {
+    for (const QString& path : appSettings().value(QStringLiteral("scripts/panels")).toStringList())
+        if (QFileInfo::exists(path) && !scriptPanels_.count(path) && !scripts_->running()) scripts_->setUpPanel(path);
 }
 
 QDialog* MainWindow::controlSurfaceDialog() {

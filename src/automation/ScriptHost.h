@@ -4,13 +4,16 @@
 // args)); arguments are tables, results come back as tables (a tool's structured result, else {text = ...}; JSON null in
 // an array as montage.null), and a tool's error stops the script with its message. `montage.tools()` lists them, `montage.args` holds the script's
 // arguments, and print() writes to the script's output. The host decides what a call works on: montage-cli runs
-// scripts on project files, the app on the project open in it (each change one undo step).
+// scripts on project files, the app on the project open in it (each change one undo step). A script can have its own
+// panel (montage.panel, automation/ScriptPanel.h): described when it first runs, and run again with what the panel
+// holds whenever one of its buttons is pressed.
 #pragma once
 
 #include <QJsonObject>
 #include <QString>
 #include <QStringList>
 #include <functional>
+#include <optional>
 
 namespace montage {
 
@@ -24,6 +27,13 @@ struct ScriptOptions {
     QStringList args;
     QString project;  // montage.project: the project the script works on ("" if none)
     bool noStdin = false;  // no io.read or io.lines() from standard input (the app has none: they would wait for ever)
+    // montage.panel{title = ..., controls = {...}}: given what it describes (as JSON), the host answers with what the
+    // panel's controls hold (by id) and the button pressed ("pressed"), which montage.panel returns for the script to
+    // go on with; or with nothing, which ends the script there, successfully, its panel described (it runs again from
+    // the top when a button is pressed); or with an error, which stops it. Unset: montage.panel is an error.
+    std::function<std::optional<QJsonObject>(const QJsonObject& description, QString* error)> panel;
+    // montage.set_panel{id = value, ...}: shown on the panel (a label's value is its text); false with the error.
+    std::function<bool(const QJsonObject& values, QString* error)> setPanel;
 };
 
 class McpServer;

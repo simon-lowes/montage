@@ -1,5 +1,7 @@
 // montage-cli — headless rendering, probing and project assembly.
 #include <QFileInfo>
+#include <QJsonArray>
+#include <QJsonDocument>
 #include <QGuiApplication>
 #include <algorithm>
 #include <atomic>
@@ -32,6 +34,7 @@
 #ifdef MONTAGE_WITH_WHISPER
 #include "automation/McpServer.h"
 #include "automation/ScriptHost.h"
+#include "automation/ScriptPanel.h"
 #ifdef MONTAGE_LIVE_BRIDGE
 #include "app/LiveBridge.h"
 #endif
@@ -104,8 +107,10 @@ int usage() {
                  "  montage-cli speak \"text\" -o voice.wav [--voice af_heart] [--speed 1]   (a voiceover from text; --phonemes prints them)\n"
                  "  montage-cli clone-speech \"text\" --voice sample.wav -o out.wav --consent [--language en] [--from S] [--to S]\n"
                  "              [--speed 1] [--exaggeration 0.5]   (in the voice of the sample, with its owner's consent; 23 languages)\n"
-                 "  montage-cli script [--project <project.montage>] <file.lua> [arg...]   (a Lua script driving Montage's tools;\n"
-                 "                                        montage.add_title{text = \"Hi\"} calls montage_add_title)\n"
+                 "  montage-cli script [--project <project.montage>] [--press <button> [--set id=value]...] <file.lua> [arg...]\n"
+                 "                                       (a Lua script driving Montage's tools; montage.add_title{text = \"Hi\"}\n"
+                 "                                        calls montage_add_title. A script with a panel prints it, or with\n"
+                 "                                        --press runs as if that button were pressed, --set filling its controls)\n"
                  "  montage-cli mcp [--live]              (Model Context Protocol server on stdio, for AI agents;\n"
                  "                                        --live: on the project open in Montage, with Tools > Agent Link on)\n"
                  "  montage-cli captions <project.montage> [-o out.srt|.vtt|.scc|.ttml|.stl|.ass] [--transcribe MODEL]\n"
@@ -1224,14 +1229,29 @@ int cmdCloneSpeech(const std::vector<std::string>& args) {
 int cmdScript(const std::vector<std::string>& args) {
     // Options before the script; everything after it is the script's ("-p 3" there is an argument).
     std::string file, project;
+    QString press;
+    std::vector<std::pair<QString, QString>> sets;
     QStringList rest;
     for (size_t i = 0; i < args.size(); ++i) {
         if (!file.empty()) rest << QString::fromStdString(args[i]);
         else if ((args[i] == "--project" || args[i] == "-p") && i + 1 < args.size()) project = args[++i];
-        else if (args[i] == "--" && i + 1 < args.size()) file = args[++i];
+        else if (args[i] == "--press" && i + 1 < args.size()) press = QString::fromStdString(args[++i]);
+        else if (args[i] == "--set" && i + 1 < args.size()) {
+            const QString kv = QString::fromStdString(args[++i]);
+            const qsizetype eq = kv.indexOf(QLatin1Char('='));
+            if (eq <= 0) {
+                std::fprintf(stderr, "error: --set takes id=value\n");
+                return 2;
+            }
+            sets.push_back({kv.left(eq), kv.mid(eq + 1)});
+        } else if (args[i] == "--" && i + 1 < args.size()) file = args[++i];
         else file = args[i];
     }
     if (file.empty()) return usage();
+    if (press.isEmpty() && !sets.empty()) {
+        std::fprintf(stderr, "error: --set fills a panel for --press\n");
+        return 2;
+    }
     if (!scriptingAvailable()) {
         std::fprintf(stderr, "error: this build of Montage has no Lua\n");
         return 1;
@@ -1255,10 +1275,53 @@ int cmdScript(const std::vector<std::string>& args) {
         gCancel = true;
     });
     o.stopped = [] { return gCancel.load(); };
+    // A panel: printed (and the script ends there), or answered as if --press's button were pressed.
+    std::optional<PanelSpec> panel;
+    bool pressed = false;
+    o.panel = [&](const QJsonObject& description, QString* error) -> std::optional<QJsonObject> {
+        std::optional<PanelSpec> spec = parsePanel(description, error);
+        if (!spec) return std::nullopt;
+        if (press.isEmpty()) {
+            std::printf("%s", QJsonDocument(describePanel(*spec)).toJson(QJsonDocument::Indented).constData());
+            std::fflush(stdout);
+            return std::nullopt;
+        }
+        const PanelControl* button = spec->find(press);
+        if (!button || button->type != QLatin1String("button")) {
+            *error = QStringLiteral("the panel has no button \"%1\"").arg(press);
+            return std::nullopt;
+        }
+        for (const auto& [id, value] : sets)
+            if (!setPanelValue(*spec, id, value, error)) return std::nullopt;
+        QJsonObject values = panelValues(*spec);
+        values["pressed"] = press;
+        panel = spec;
+        pressed = true;
+        return values;
+    };
+    o.setPanel = [&](const QJsonObject& values, QString* error) {
+        if (!panel) {
+            *error = QStringLiteral("call montage.panel first");
+            return false;
+        }
+        for (auto it = values.begin(); it != values.end(); ++it) {
+            if (!setPanelValue(*panel, it.key(), it.value(), error)) return false;
+            const QJsonValue shown = panelValues(*panel).value(it.key());
+            std::printf("panel: %s = %s\n", it.key().toUtf8().constData(),
+                        shown.isString() ? shown.toString().toUtf8().constData()
+                                         : QJsonDocument(QJsonArray{shown}).toJson(QJsonDocument::Compact).mid(1).chopped(1).constData());
+        }
+        std::fflush(stdout);
+        return true;
+    };
     QString err;
     if (!runScript(QString::fromUtf8(code.data(), qsizetype(code.size())), QString::fromStdString(std::filesystem::path(file).filename().string()), o, &err)) {
         std::fprintf(stderr, "error: %s\n", err.toUtf8().constData());
         return gCancel ? 130 : 1;
+    }
+    if (!press.isEmpty() && !pressed) {
+        std::fprintf(stderr, "error: --press: the script has no panel\n");
+        return 1;
     }
     return 0;
 }
