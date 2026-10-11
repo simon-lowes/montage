@@ -12658,8 +12658,9 @@ private slots:
                              {"sends", QJsonArray{QJsonObject{{"bus", "Reverb"}, {"level_db", -8}, {"pre_fader", true},
                                                               {"level", QJsonArray{QJsonArray{0, -20}, QJsonArray{1, -8}}}}}}});
         QVERIFY2(!r.value("isError").toBool() && text(r).contains("Reverb -8.0 dB pre-fader") && text(r).contains("Mute: "), qPrintable(text(r)));
+        // (A one-point list is wrapped in QJsonValue: QJsonArray{QJsonArray{t, v}} would copy the inner array.)
         r = tool("montage_automate_track", QJsonObject{{"project", project}, {"bus", "reverb"}, {"mode", "touch"},
-                                                       {"volume", QJsonArray{QJsonArray{0, -6}}}, {"mute", QJsonArray{QJsonArray{2, 1}}}});
+                                                       {"volume", QJsonArray{QJsonValue(QJsonArray{0, -6})}}, {"mute", QJsonArray{QJsonValue(QJsonArray{2, 1})}}});
         QVERIFY2(!r.value("isError").toBool() && text(r).contains("Bus Reverb: Touch automation"), qPrintable(text(r)));
         {
             Project mixed;
@@ -12690,7 +12691,7 @@ private slots:
                              {"inserts", QJsonArray{QJsonObject{{"effect", eqId}, {"param", "mid_db"},
                                                                 {"points", QJsonArray{QJsonArray{0, 0}, QJsonArray{1, 40}}}},
                                                     QJsonObject{{"effect", chId}, {"param", "mode"},
-                                                                {"points", QJsonArray{QJsonArray{0.5, 1.4}}}}}}});
+                                                                {"points", QJsonArray{QJsonValue(QJsonArray{0.5, 1.4})}}}}}});
         QVERIFY2(!r.value("isError").toBool() && text(r).contains("eq3 (") && text(r).contains("mid_db:"), qPrintable(text(r)));
         {
             Project mixed;
