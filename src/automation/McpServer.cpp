@@ -2184,8 +2184,10 @@ void McpServer::Impl::addTools() {
         "Set an audio track's mix automation, as written from the mixer: its mode (off, read, write, latch, touch) and "
         "volume (dB), pan (-1 left to 1 right) and mute (1 muted, 0 not; a switch held to the next point) points at times; "
         "points replace the lane's points between the first and last given. sends sets aux sends to buses by name (a bus "
-        "not there yet is made, as an effects return): level_db, pre_fader, muted, level points, or remove. With bus, the "
-        "named bus's mode, volume, pan and mute are set instead. clear removes the lanes. Lists the automation afterwards.",
+        "not there yet is made, as an effects return): level_db, pre_fader, muted, level points, or remove. inserts sets "
+        "points on the track's insert effects' parameters (an effect's id, a parameter's name as montage_describe lists it, "
+        "or param.<id> for a plugin's; on/off and choice parameters hold to the next point). With bus, the named bus's "
+        "mode, volume, pan, mute and inserts are set instead. clear removes the lanes. Lists the automation afterwards.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"track":{"type":"string","default":"A1"},
             "bus":{"type":"string","description":"Automate this bus (by name) instead of a track"},
             "mode":{"type":"string","enum":["off","read","write","latch","touch"]},
@@ -2200,6 +2202,11 @@ void McpServer::Impl::addTools() {
                 "remove":{"type":"boolean"},
                 "level":{"type":"array","items":{"type":"array","items":{"type":["number","string"]},"minItems":2,"maxItems":2},
                          "description":"[[time, dB], ...]"}},"required":["bus"]}},
+            "inserts":{"type":"array","items":{"type":"object","properties":{
+                "effect":{"type":"number","description":"The insert's effect id"},"param":{"type":"string"},
+                "points":{"type":"array","items":{"type":"array","items":{"type":["number","string"]},"minItems":2,"maxItems":2},
+                          "description":"[[time, value], ...]"},
+                "clear":{"type":"boolean","description":"Remove this parameter's points first"}},"required":["effect","param"]}},
             "clear":{"type":"boolean","default":false}},"required":["project"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
@@ -2217,7 +2224,7 @@ void McpServer::Impl::addTools() {
                     const QJsonArray pt = v.toArray();
                     if (pt.size() != 2) throw ArgError{QStringLiteral("\"%1\" points are [time, value]").arg(key)};
                     Keyframe k{timeArg(pt.at(0), s, key.toLatin1().constData()), std::clamp(pt.at(1).toDouble(), lo, hi)};
-                    if (hold) k.interp = Interp::Hold, k.v = k.v >= 0.5 ? 1 : 0;
+                    if (hold) k.interp = Interp::Hold, k.v = std::round(k.v);  // a switch (0 or 1) or a choice
                     keys.push_back(k);
                 }
                 std::sort(keys.begin(), keys.end(), [](const Keyframe& x, const Keyframe& y) { return x.t < y.t; });
@@ -2235,6 +2242,40 @@ void McpServer::Impl::addTools() {
                     if (QString::fromStdString(b.name).compare(name, Qt::CaseInsensitive) == 0) return &b;
                 return nullptr;
             };
+            // Points on a chain's insert parameters, and the animated ones listed.
+            auto insertPoints = [&](std::vector<Effect>& chain) {
+                for (const auto& v : a.value("inserts").toArray()) {
+                    const QJsonObject io = v.toObject();
+                    const Id id = Id(io.value("effect").toDouble());
+                    const auto e = std::find_if(chain.begin(), chain.end(), [id](const Effect& x) { return x.id == id; });
+                    if (e == chain.end()) throw ArgError{QStringLiteral("No insert effect %1 here").arg(id)};
+                    const std::string param = io.value("param").toString().trimmed().toStdString();
+                    double lo = -1e12, hi = 1e12, def = 0;
+                    bool hold = false, known = e->type == "plugin" && param.rfind("param.", 0) == 0;
+                    if (const EffectInfo* info = findEffectInfo(e->type))
+                        for (const ParamInfo& pi : info->params)
+                            if (pi.name == param && pi.kind != ParamKind::Color) {
+                                lo = pi.min, hi = pi.max, def = pi.def, known = true;
+                                hold = pi.kind == ParamKind::Bool || pi.kind == ParamKind::Choice;
+                            }
+                    if (!known) throw ArgError{QStringLiteral("%1 has no parameter %2").arg(QString::fromStdString(e->type), QString::fromStdString(param))};
+                    const QJsonArray pts = io.value("points").toArray();
+                    if (!e->params.count(param))  // not set yet: its default (a plugin's first point) outside the points
+                        e->params[param] = Param(e->type == "plugin" && !pts.isEmpty() ? pts.at(0).toArray().at(1).toDouble() : def);
+                    Param& lane = e->params[param];
+                    if (io.value("clear").toBool()) lane.keys.clear();
+                    points(pts, QStringLiteral("points"), lane, lo, hi, hold);
+                }
+            };
+            auto describeInserts = [&](const std::vector<Effect>& chain) {
+                QStringList parts;
+                for (const Effect& e : chain)
+                    for (const auto& [name, lane] : e.params)
+                        if (lane.animated())
+                            parts << QStringLiteral("%1 (%2) %3: %4").arg(QString::fromStdString(e.type)).arg(e.id)
+                                         .arg(QString::fromStdString(name), describe(lane, ""));
+                return parts.isEmpty() ? QStringLiteral("none") : parts.join(QStringLiteral("; "));
+            };
             if (a.contains("bus")) {
                 Bus* b = findBus(str(a, "bus"));
                 if (!b) throw ArgError{QStringLiteral("No bus called %1").arg(str(a, "bus"))};
@@ -2243,10 +2284,12 @@ void McpServer::Impl::addTools() {
                 points(a.value("volume").toArray(), QStringLiteral("volume"), b->volumeAuto, -96, 12, false);
                 points(a.value("pan").toArray(), QStringLiteral("pan"), b->panAuto, -1, 1, false);
                 points(a.value("mute").toArray(), QStringLiteral("mute"), b->muteAuto, 0, 1, true);
+                insertPoints(b->effects);
                 save(l);
-                return ok(QStringLiteral("Bus %1: %2 automation\nVolume: %3\nPan: %4\nMute: %5")
+                return ok(QStringLiteral("Bus %1: %2 automation\nVolume: %3\nPan: %4\nMute: %5\nInserts: %6")
                               .arg(QString::fromStdString(b->name), QString::fromLatin1(automationModeName(busAutomation(*b))),
-                                   describe(b->volumeAuto, " dB"), describe(b->panAuto, ""), describe(b->muteAuto, "")));
+                                   describe(b->volumeAuto, " dB"), describe(b->panAuto, ""), describe(b->muteAuto, ""),
+                                   describeInserts(b->effects)));
             }
             const TrackRef ref = trackArg(str(a, "track", "A1"), s, false);
             if (ref.kind != TrackKind::Audio) throw ArgError{QStringLiteral("Automation is for audio tracks (A1, A2...)")};
@@ -2290,6 +2333,7 @@ void McpServer::Impl::addTools() {
             points(a.value("volume").toArray(), QStringLiteral("volume"), t.volumeAuto, -60, 12, false);
             points(a.value("pan").toArray(), QStringLiteral("pan"), t.panAuto, -1, 1, false);
             points(a.value("mute").toArray(), QStringLiteral("mute"), t.muteAuto, 0, 1, true);
+            insertPoints(t.effects);
             save(l);
             QStringList sendText;
             for (const Send& sd : t.sends) {
@@ -2300,10 +2344,10 @@ void McpServer::Impl::addTools() {
                                 .arg(sd.preFader ? QStringLiteral(" pre-fader") : QString(), sd.muted ? QStringLiteral(" (muted)") : QString(),
                                      sd.levelAuto.animated() ? QStringLiteral(", level: ") + describe(sd.levelAuto, " dB") : QString());
             }
-            return ok(QStringLiteral("%1: %2 automation\nVolume: %3\nPan: %4\nMute: %5\nSends: %6")
+            return ok(QStringLiteral("%1: %2 automation\nVolume: %3\nPan: %4\nMute: %5\nSends: %6\nInserts: %7")
                           .arg(str(a, "track", "A1"), QString::fromLatin1(automationModeName(trackAutomation(t))), describe(t.volumeAuto, " dB"),
                                describe(t.panAuto, ""), describe(t.muteAuto, ""),
-                               sendText.isEmpty() ? QStringLiteral("none") : sendText.join(QStringLiteral("; "))));
+                               sendText.isEmpty() ? QStringLiteral("none") : sendText.join(QStringLiteral("; ")), describeInserts(t.effects)));
         });
 
     add("montage_export_lut", "Export a clip's grade as a LUT",

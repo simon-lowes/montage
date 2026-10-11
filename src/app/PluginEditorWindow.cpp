@@ -1,6 +1,7 @@
 #include "PluginEditorWindow.h"
 
 #include <QCloseEvent>
+#include <QPointer>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <algorithm>
@@ -90,6 +91,7 @@ bool PluginEditorWindow::start(QString* error) {
     if (!inst_) return fail(tr("The plugin could not be loaded: %1").arg(QString::fromStdString(err)));
     const std::string saved = plugins::decodeState(e->s("state"));
     if (!saved.empty()) inst_->loadState(saved);
+    for (const plugins::ParamInfo& p : inst_->parameters()) params_[p.id] = p;
     syncFromProject();
     if (!inst_->hasEditor()) return fail(tr("%1 has no editor of its own; use its controls in the Inspector")
                                              .arg(QString::fromStdString(d->name)));
@@ -113,7 +115,9 @@ bool PluginEditorWindow::start(QString* error) {
     idle_->start(30);
     // Settings are saved into the project every few seconds and on close.
     auto* saver = new QTimer(this);
-    connect(saver, &QTimer::timeout, this, &PluginEditorWindow::saveSettings);
+    connect(saver, &QTimer::timeout, this, [this] {
+        if (!state_->inGesture()) saveSettings();  // not in the middle of a drag or an automation pass
+    });
     saver->start(3000);
     connect(state_, &EditorState::projectChanged, this, [this] {
         if (!effect()) {
@@ -144,6 +148,19 @@ void PluginEditorWindow::editorParameter(uint32_t id, double value) {
     const FrameTime lt = localTime();
     const Id clip = clip_, eff = effect_;
     const std::string key = kParamPrefix + std::to_string(id);
+    // On a track or bus whose automation the mixer is writing, the move goes to that pass.
+    if (const Effect* e = effect()) {
+        const auto info = params_.find(id);
+        const bool known = info != params_.end();
+        const double range = known ? info->second.max - info->second.min : 1;
+        const auto stored = e->params.find(key);
+        const double before = stored != e->params.end() ? stored->second.at(lt) : known ? info->second.def : value;
+        // Held while the plugin reports the knob grabbed; a plugin that reports no grab counts as held briefly.
+        std::function<bool()> held;
+        if (gesture_.count(id)) held = [self = QPointer<PluginEditorWindow>(this), id] { return self && self->gesture_.count(id) > 0; };
+        if (state_->captureParameter({clip, eff, key, value, before, std::max(1e-9, std::fabs(range) * 0.001), known && info->second.stepped, held}))
+            return;
+    }
     const auto g = gesture_.find(id);
     const QString merge = QStringLiteral("plugin-%1-%2-%3").arg(eff).arg(id).arg(g != gesture_.end() ? g->second : 0);
     state_->edit(tr("Change Plugin Parameter"), [clip, eff, key, value, lt](Project&, Sequence& s) {

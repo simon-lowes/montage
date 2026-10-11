@@ -1048,6 +1048,135 @@ private slots:
         QTRY_VERIFY(!mixer->sendLevel(0, 0));
     }
 
+    void insertAutomationAndInterruptedPasses() {
+        loadDemo();
+        auto* mixer = win_->findChild<MixerPanel*>();
+        QVERIFY(mixer);
+        QTRY_VERIFY(mixer->trackFader(0));
+        auto a1 = [&]() -> const Track& { return state()->sequence()->audioTracks.at(0); };
+        const Id track = a1().id;
+        const std::string name = a1().name;
+        Id eq = 0, ch = 0;
+        QVERIFY(state()->edit("Inserts", [&](Project& p, Sequence& s) {
+            Effect e;
+            e.id = eq = p.newId();
+            e.type = "eq3";
+            s.audioTracks[0].effects.push_back(e);
+            Effect c;
+            c.id = ch = p.newId();
+            c.type = "channels";
+            s.audioTracks[0].effects.push_back(c);
+            return true;
+        }));
+        auto value = [&](Id fx, const char* param, FrameTime t) {
+            for (const Effect& e : a1().effects)
+                if (e.id == fx) return e.p(param, t, 0);
+            return -100.0;
+        };
+        auto lane = [&](Id fx, const char* param) {
+            for (const Effect& e : a1().effects)
+                if (e.id == fx && e.params.count(param)) return e.params.at(param);
+            return Param();
+        };
+        // Nothing is taken outside a pass.
+        QVERIFY(!state()->captureParameter({track, eq, "mid_db", 6, 0, 0.048, false, {}}));
+        // Touch on A1: the EQ's mid held at +6 dB over frames 10-19, then let go (back to what was there); Channel Tools'
+        // mode (a choice) changed at frame 30, latching to the stop; an edit at frame 40 goes under the pass.
+        mixer->trackAutomationMode(0)->setCurrentIndex(int(AutomationMode::Touch));
+        bool held = false;
+        mixer->playbackStarted(0);
+        QVERIFY(mixer->recordingAutomation());
+        for (FrameTime f = 0; f <= 80; ++f) {
+            if (f == 10) {
+                held = true;
+                QVERIFY(state()->captureParameter({track, eq, "mid_db", 6, 0, 0.048, false, [&held] { return held; }}));
+                QCOMPARE(value(eq, "mid_db", f), 6.0);  // heard at once
+            }
+            if (f == 20) held = false;
+            if (f == 30) QVERIFY(state()->captureParameter({track, ch, "mode", 1, 0, 0.004, true, {}}));
+            if (f == 40) {
+                QVERIFY(state()->edit("Rename", [](Project&, Sequence& s) {
+                    s.audioTracks[0].name = "Dialogue";
+                    return true;
+                }));
+                QCOMPARE(a1().name, std::string("Dialogue"));
+                QVERIFY(mixer->recordingAutomation());
+            }
+            mixer->playbackPosition(f);
+            if (f == 15) QCOMPARE(value(eq, "mid_db", f), 6.0);
+            if (f == 25) QCOMPARE(value(eq, "mid_db", f), 0.0);
+            if (f == 50) QCOMPARE(value(ch, "mode", f), 1.0);  // still latched after the edit
+        }
+        mixer->playbackStopped(80);
+        QVERIFY(!mixer->recordingAutomation());
+        QCOMPARE(a1().name, std::string("Dialogue"));
+        const Param mid = lane(eq, "mid_db");
+        QVERIFY(mid.animated());
+        QCOMPARE(mid.at(5), 0.0);
+        QCOMPARE(mid.at(15), 6.0);
+        QVERIFY(std::fabs(mid.at(70)) < 1e-9);  // a second's glide back from frame 19
+        const Param mode = lane(ch, "mode");
+        QVERIFY(mode.animated());
+        QCOMPARE(mode.at(20), 0.0);
+        QCOMPARE(mode.at(35), 1.0);
+        QCOMPARE(mode.at(80), 1.0);
+        for (const Keyframe& k : mode.keys) QCOMPARE(int(k.interp), int(Interp::Hold));
+        // The pass is one undo step, after the rename's.
+        state()->undo();
+        QVERIFY(!lane(eq, "mid_db").animated() && !lane(ch, "mode").animated());
+        QCOMPARE(a1().name, std::string("Dialogue"));
+        state()->undo();
+        QCOMPARE(a1().name, name);
+        state()->redo();
+        state()->redo();
+        QVERIFY(lane(eq, "mid_db").animated() && lane(ch, "mode").animated());
+        // Undo during a pass undoes the step before it and starts the pass over. Here the EQ's low band is typed into
+        // the Inspector at frame 15 (counted as held for half a second).
+        state()->inspectChain(track);
+        QApplication::processEvents();
+        auto* inspector = win_->findChild<InspectorWidget*>();
+        QVERIFY(inspector);
+        auto lowRow = [&]() -> QDoubleSpinBox* {  // the EQ's first row, Low (dB) (looked up each time: rows are rebuilt)
+            for (QDoubleSpinBox* sp : inspector->findChildren<QDoubleSpinBox*>())
+                if (sp->minimum() == -24 && sp->maximum() == 24) return sp;
+            return nullptr;
+        };
+        QVERIFY(lowRow());
+        mixer->playbackStarted(0);
+        for (FrameTime f = 0; f <= 80; ++f) {
+            if (f == 5) {
+                held = true;
+                QVERIFY(state()->captureParameter({track, eq, "high_db", -6, 0, 0.048, false, [&held] { return held; }}));
+            }
+            if (f == 10) {
+                state()->undo();
+                QVERIFY(!mixer->recordingAutomation());
+                QVERIFY(!lane(eq, "mid_db").animated());  // the last pass undone
+            }
+            if (f == 15) {
+                QApplication::processEvents();
+                QDoubleSpinBox* low = lowRow();
+                QVERIFY(low);
+                low->setValue(-3);
+            }
+            mixer->playbackPosition(f);
+            if (f == 12) QVERIFY(mixer->recordingAutomation());  // started over
+        }
+        held = false;
+        mixer->playbackStopped(80);
+        QVERIFY(!lane(eq, "high_db").animated());  // written before the undo: gone
+        const Param lowLane = lane(eq, "low_db");
+        QVERIFY(lowLane.animated());
+        QCOMPARE(lowLane.at(10), 0.0);
+        QCOMPARE(lowLane.at(17), -3.0);
+        QVERIFY(std::fabs(lowLane.at(80)) < 1e-9);
+        // A track in Read takes nothing.
+        mixer->trackAutomationMode(0)->setCurrentIndex(int(AutomationMode::Read));
+        mixer->playbackStarted(0);
+        QVERIFY(!state()->captureParameter({track, eq, "mid_db", 3, 0, 0.048, false, {}}));
+        mixer->playbackStopped(5);
+    }
+
     void surroundPositionAutomation() {
         loadDemo();
         state()->edit("5.1", [](Project&, Sequence& s) {

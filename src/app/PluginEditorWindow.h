@@ -54,6 +54,7 @@ private:
     QWidget* host_ = nullptr;
     QTimer* idle_ = nullptr;
     std::map<uint32_t, int> gesture_;  // parameter -> serial of the drag in progress
+    std::map<uint32_t, plugins::ParamInfo> params_;  // the plugin's parameters, by id
     int gestureSerial_ = 0;
     bool resizing_ = false;
     int requestedW_ = 0, requestedH_ = 0;  // a size asked for while the editor was opening

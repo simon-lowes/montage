@@ -54,6 +54,27 @@ public:
     void updateGesture(const std::function<void(Project&, Sequence&)>& fn);
     void endGesture(bool commit = true);
     bool inGesture() const { return gesture_.has_value(); }
+    // Automation passes (MixerPanel): while the mixer records one, a move of an insert parameter on a track or bus it
+    // writes (from the Inspector or a plugin's editor) is offered to it first. True if it took the move: the move then
+    // plays, and is written into the parameter's keys when the pass ends, instead of changing the project now.
+    struct ParameterMove {
+        Id owner = 0, effect = 0;
+        std::string param;
+        double value = 0, before = 0;  // the new value, and the one shown before it
+        double tolerance = 0.001;      // how far thinning may move the written keys
+        bool toggle = false;           // a switch or a choice: its keys hold
+        std::function<bool()> held;    // the control still held (a slider or a plugin's knob being dragged); may be empty
+    };
+    void setParameterCapture(std::function<bool(const ParameterMove&)> fn) { parameterCapture_ = std::move(fn); }
+    bool captureParameter(const ParameterMove& move) const { return parameterCapture_ && parameterCapture_(move); }
+    // Why a gesture is being ended by something else (gestureInterrupted).
+    enum class Interruption {
+        Edit,     // an edit, another gesture or a save, of the project as it was before the gesture
+        Undo,     // undo or redo
+        Switch,   // another sequence made active
+        Replace,  // the project replaced (opened, reloaded or new)
+    };
+    Q_ENUM(Interruption)
     // The active sequence as it was when the current gesture began (or the
     // live one outside gestures): drag maths must be relative to this.
     const Sequence* gestureBase() const { return gesture_ ? gesture_->origin.active() : sequence(); }
@@ -201,8 +222,14 @@ signals:
     void statusMessage(const QString& text, int timeoutMs);
     void fileStateChanged();          // path or modified flag changed
     void lockStateChanged();          // read-only, who holds the lock, or whether it is free changed
+    // A gesture is about to be ended by something else: its owner can end it first, as it sees fit. The mixer's
+    // automation pass steps aside for an edit and carries on after it.
+    void gestureInterrupted(montage::EditorState::Interruption why);
 
 private:
+    void interruptGesture(bool commit, Interruption why);  // gestureInterrupted(), then ends what the owner left
+    void dropGesture();  // the same, the gesture forgotten (the project is being replaced)
+    std::function<bool(const ParameterMove&)> parameterCapture_;
     void pruneSelection();
     bool refuseReadOnly();     // true, with a message, when the project cannot be changed
     void releaseLock();        // lets go of the current project's lock, if held

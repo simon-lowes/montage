@@ -15,6 +15,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QMenu>
+#include <QPointer>
 #include <QPainter>
 #include <QPlainTextEdit>
 #include <QProgressDialog>
@@ -640,6 +641,7 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
         };
         t.key = QString("p%1:%2").arg(owner).arg(effectId);
         t.owner = owner;
+        t.effect = effectId;
         return t;
     };
     for (size_t i = 0; i < effects.size(); ++i) {
@@ -1242,7 +1244,18 @@ void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const 
         auto it = e->params.find(n);
         return it == e->params.end() ? nullptr : &it->second;
     };
-    auto write = [this, target, label, mergeKey](std::vector<std::pair<std::string, double>> values) {
+    // A track's or bus's insert moved while the mixer writes its automation goes to that pass (held: whether the
+    // control is still being dragged, if it can tell).
+    const bool toggle = pi.kind == ParamKind::Bool || pi.kind == ParamKind::Choice;
+    const double tolerance = std::max(1e-6, (pi.max - pi.min) * 0.001);
+    auto write = [this, target, label, mergeKey, read, toggle, tolerance](std::vector<std::pair<std::string, double>> values,
+                                                                           std::function<bool()> held = {}) {
+        if (!target.clip && target.owner) {
+            bool taken = false;
+            for (const auto& [n, v] : values)
+                taken = state_->captureParameter({target.owner, target.effect, n, v, read(n), tolerance, toggle, held}) || taken;
+            if (taken) return;
+        }
         FrameTime t = target.time();
         const std::vector<Id> others = otherSelected(target);
         const FrameTime playhead = state_->playhead();
@@ -1329,7 +1342,12 @@ void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const 
                 connect(slider, &QSlider::sliderReleased, this, [this] { state_->notifyChanged(); });
             }
             h->addWidget(spin, slider ? 0 : 1);
-            connect(spin, &QDoubleSpinBox::valueChanged, this, [write, name](double v) { write({{name, v}}); });
+            // A slider being dragged is held until let go; other changes (typed, stepped, wheeled) count as held briefly.
+            connect(spin, &QDoubleSpinBox::valueChanged, this, [write, name, slider = QPointer<QSlider>(slider)](double v) {
+                std::function<bool()> held;
+                if (slider && slider->isSliderDown()) held = [slider] { return slider && slider->isSliderDown(); };
+                write({{name, v}}, held);
+            });
             // Double-click the label area resets to default: provided via context menu below.
             spin->setContextMenuPolicy(Qt::CustomContextMenu);
             double def = pi.def;

@@ -12650,6 +12650,43 @@ private slots:
             QVERIFY(ms.buses[0].volumeAuto.keys.size() == 1 && ms.buses[0].muteAuto.keys.size() == 1);
         }
         QVERIFY(tool("montage_automate_track", QJsonObject{{"project", project}, {"bus", "Nowhere"}, {"mode", "read"}}).value("isError").toBool());
+        // Insert parameter points: an EQ's mid band ridden, Channel Tools' mode (a choice) switched and held.
+        r = tool("montage_track_effect", QJsonObject{{"project", project}, {"track", "A1"}, {"effect", "eq3"}});
+        const double eqId = r.value("structuredContent").toObject().value("effect_id").toDouble();
+        r = tool("montage_track_effect", QJsonObject{{"project", project}, {"track", "A1"}, {"effect", "channels"}});
+        const double chId = r.value("structuredContent").toObject().value("effect_id").toDouble();
+        QVERIFY(eqId > 0 && chId > 0);
+        r = tool("montage_automate_track",
+                 QJsonObject{{"project", project}, {"track", "A1"},
+                             {"inserts", QJsonArray{QJsonObject{{"effect", eqId}, {"param", "mid_db"},
+                                                                {"points", QJsonArray{QJsonArray{0, 0}, QJsonArray{1, 40}}}},
+                                                    QJsonObject{{"effect", chId}, {"param", "mode"},
+                                                                {"points", QJsonArray{QJsonArray{0.5, 1.4}}}}}}});
+        QVERIFY2(!r.value("isError").toBool() && text(r).contains("eq3 (") && text(r).contains("mid_db:"), qPrintable(text(r)));
+        {
+            Project mixed;
+            QVERIFY(loadProject(project.toStdString(), mixed));
+            const Sequence& ms = *mixed.active();
+            const Track& t = ms.audioTracks.at(0);
+            const Effect* eqFx = nullptr;
+            const Effect* chFx = nullptr;
+            for (const Effect& e : t.effects) {
+                if (e.id == Id(eqId)) eqFx = &e;
+                if (e.id == Id(chId)) chFx = &e;
+            }
+            QVERIFY(eqFx && chFx);
+            const Param& midLane = eqFx->params.at("mid_db");
+            QCOMPARE(midLane.keys.size(), size_t(2));
+            QCOMPARE(midLane.keys.back().v, 24.0);  // clamped to the parameter's range
+            const FrameTime end = midLane.keys.back().t, half = end / 2;  // a ramp between the points
+            QCOMPARE(eqFx->p("mid_db", half), 24.0 * double(half) / double(end));
+            const Param& modeLane = chFx->params.at("mode");
+            QVERIFY(modeLane.keys.size() == 1 && modeLane.keys[0].interp == Interp::Hold && modeLane.keys[0].v == 1);
+        }
+        QVERIFY(tool("montage_automate_track", QJsonObject{{"project", project}, {"inserts", QJsonArray{QJsonObject{{"effect", eqId}, {"param", "nope"}}}}})
+                    .value("isError").toBool());
+        QVERIFY(tool("montage_automate_track", QJsonObject{{"project", project}, {"inserts", QJsonArray{QJsonObject{{"effect", 999999}, {"param", "mid_db"}}}}})
+                    .value("isError").toBool());
         r = tool("montage_automate_track", QJsonObject{{"project", project}, {"sends", QJsonArray{QJsonObject{{"bus", "Reverb"}, {"remove", true}}}}});
         QVERIFY2(!r.value("isError").toBool() && text(r).contains("Sends: none"), qPrintable(text(r)));
         QVERIFY(QFile::remove(project) && QFile::rename(beforeSends, project));

@@ -6,9 +6,11 @@
 #include <QVector>
 #include <QWidget>
 #include <functional>
+#include <map>
 #include <set>
 #include <vector>
 
+#include "EditorState.h"
 #include "core/Automation.h"
 #include "core/Model.h"
 
@@ -24,7 +26,6 @@ class QVBoxLayout;
 namespace montage {
 
 class AudioMeterWidget;
-class EditorState;
 class SurroundPanner;
 
 class MixerPanel : public QWidget {
@@ -34,7 +35,9 @@ public:
 
     // Mix automation (core/Automation.h). Playback starting and stopping, and each frame it plays: tracks in Write,
     // Latch or Touch record their fader, pan, mute and send levels, and buses in those modes their fader, pan and mute,
-    // kept as one undo step when playback stops.
+    // kept as one undo step when playback stops. Insert parameters on those tracks and buses moved during the pass (in
+    // the Inspector or a plugin's editor) are written too: Touch while moved, Latch and Write from the first move to the
+    // stop. Another edit made meanwhile keeps what the pass has written so far, and the pass carries on after it.
     void playbackStarted(FrameTime t);
     void playbackPosition(FrameTime t);
     void playbackStopped(FrameTime t);
@@ -155,6 +158,15 @@ private:
     void setBusPan(Id bus, double pan);
     void setBusMute(Id bus, bool on);
     bool recordingLane(const QString& id) const;
+    // Ends the automation pass at `t`, its lanes written as one undo step; `final` (playback stopped) also hands Write
+    // over to Touch.
+    void finishPass(FrameTime t, bool final);
+    void finishWhenFree();  // finishPass at stopAt_ once no other gesture is under way
+    void resumePass();      // the pass's gesture again, after an edit
+    void clearPass();
+    void discardPass();     // ends the pass, writing nothing
+    // An insert parameter moved during a pass (EditorState::captureParameter): true if this pass writes it.
+    bool captureInsert(const EditorState::ParameterMove& move);
     // Faders and pans show the automation at the playhead on tracks that read it.
     void followAutomation();
 
@@ -184,6 +196,7 @@ private:
         SurroundPan position;               // the position before (its width, LFE and object as changed meanwhile)
         Param xLane, yLane, zLane;          // its lanes before
         bool changedOther = false;          // width, LFE or object changed during the pass
+        Id trackId = 0;                     // (an edit that moves the track leaves its lanes as they were)
     };
     std::vector<Recording> recording_;
     // The other lanes written in a pass (track mutes and send levels, bus faders, pans and mutes), each read from its
@@ -198,11 +211,26 @@ private:
         std::function<void(double)> show;                       // the lane shown on it while not written
         std::function<void(Sequence&, double)> live;            // what plays while written
         std::function<void(Sequence&, const Param&)> done;      // the new lane, the static value as it was
+        std::function<bool(const Sequence&)> valid;             // still the same control after an edit (empty: always)
     };
     std::vector<LaneRecording> lanes_;
     std::set<QString> touched_;       // switches the user changed during the pass (a mute's "move")
     std::vector<Id> busesFromWrite_;  // handed over to Touch when the pass wrote
     QString liveState_;  // what the gesture last applied, to skip repeats
+    std::function<void(Project&, Sequence&)> lastLive_;  // what plays (the last frame's lanes being written)
+    FrameTime lastTick_ = 0;  // the frame the pass last played
+    bool resume_ = false;     // the pass was ended (undo, another sequence): start again at the next frame
+    bool suspended_ = false;  // an edit took the pass's gesture: taken back at the next frame
+    FrameTime stopAt_ = -1;   // playback stopped there, the pass waiting for another gesture to end
+    // Insert parameters moved in this pass: the last value, the frame it came at, and whether its control is held.
+    struct InsertMove {
+        double value = 0;
+        FrameTime at = 0;
+        std::function<bool()> held;
+    };
+    std::map<QString, InsertMove> insertMoves_;
+    // Moves since the last frame, played at once rather than at the next frame.
+    std::map<QString, std::pair<std::function<void(Sequence&, double)>, double>> pendingLive_;
 };
 
 }  // namespace montage
