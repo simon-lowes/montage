@@ -1,6 +1,7 @@
 // Media tests: probing, frame-accurate decoding, audio mixing, export round trips.
 #include <clocale>
 #include <QtTest>
+#include <QElapsedTimer>
 #include <QPainter>
 #include <QProcess>
 #include <QRegularExpression>
@@ -109,6 +110,7 @@
 #include "media/Rife.h"
 #include "media/Matting.h"
 #include "media/TextToSpeech.h"
+#include "media/VoiceClone.h"
 #include "media/Inpaint.h"
 #include "media/VisualSearch.h"
 #include "automation/McpServer.h"
@@ -15515,6 +15517,175 @@ private slots:
 
         // A pair whose model is not here says so.
         QVERIFY(!translateTexts({"Hallo"}, "de", "en", out, {}, nullptr, &err) || translationModel("de", "en")->installed());
+    }
+
+    void voiceCloning() {
+        // Text as the model was trained on.
+        QCOMPARE(normalizeCloneText("  hello   world "), std::string("Hello world."));
+        QCOMPARE(normalizeCloneText("Is it “done”?"), std::string("Is it \"done\"?"));
+        QCOMPARE(normalizeCloneText("one; two — three"), std::string("One, two - three."));
+        QVERIFY(normalizeCloneText("   ").empty());
+        const std::vector<std::string> pieces = splitCloneText(std::string(120, 'a') + ". " + std::string(120, 'b') + ". " + std::string(60, 'c') + ".", 200);
+        QCOMPARE(pieces.size(), size_t(2));
+        QCOMPARE(pieces[0], std::string(120, 'a') + ".");
+        QVERIFY(findCloneLanguage("fr") && std::string(findCloneLanguage("fr")->name) == "French");
+        QVERIFY(findCloneLanguage("pt-BR") && std::string(findCloneLanguage("pt-BR")->code) == "pt");
+        QVERIFY(findCloneLanguage("german") && !findCloneLanguage("klingon"));
+        QCOMPARE(voiceCloneLanguages().size(), size_t(23));
+        // A reference: resampled to 24 kHz, quiet edges trimmed, at most ten seconds (the loudest).
+        {
+            std::vector<float> tone(48000 * 2, 0.0f);
+            for (int i = 24000; i < 72000; ++i) tone[size_t(i)] = float(0.5 * std::sin(2 * M_PI * 440.0 * i / 48000));
+            const std::vector<float> ref = cloneReference(tone, 48000);
+            QVERIFY2(std::abs(int(ref.size()) - kCloneSampleRate) < 1000, qPrintable(QString::number(ref.size())));
+            int crossings = 0;
+            for (size_t i = 1; i < ref.size(); ++i) crossings += (ref[i - 1] < 0) != (ref[i] < 0);
+            QVERIFY2(std::abs(crossings - 880) < 20, qPrintable(QString::number(crossings)));  // still 440 Hz
+            std::vector<float> longer(size_t(kCloneSampleRate) * 20, 0.1f);
+            for (size_t i = size_t(kCloneSampleRate) * 12; i < size_t(kCloneSampleRate) * 15; ++i) longer[i] = 0.4f;
+            const std::vector<float> ten = cloneReference(longer, kCloneSampleRate);
+            QCOMPARE(ten.size(), size_t(kCloneSampleRate) * 10);
+            QCOMPARE(std::count(ten.begin(), ten.end(), 0.4f), std::ptrdiff_t(kCloneSampleRate) * 3);  // the loud stretch in it
+        }
+        // Fitting: quiet edges trimmed, the length changed with the pitch kept, the provenance note in the file.
+        {
+            std::vector<float> tone(size_t(kCloneSampleRate) * 2, 0.0f);
+            for (size_t i = size_t(kCloneSampleRate) / 2; i < size_t(kCloneSampleRate) * 3 / 2; ++i)
+                tone[i] = float(0.5 * std::sin(2 * M_PI * 220.0 * double(i) / kCloneSampleRate));
+            std::vector<float> trimmed = tone;
+            trimSpeech(trimmed, kCloneSampleRate);
+            QVERIFY2(std::abs(int(trimmed.size()) - kCloneSampleRate) < kCloneSampleRate / 20, qPrintable(QString::number(trimmed.size())));
+            const std::vector<float> longer = stretchSpeech(trimmed, kCloneSampleRate, 1.5);
+            QVERIFY(std::abs(double(longer.size()) - trimmed.size() * 1.5) < 2);
+            int crossings = 0;
+            for (size_t i = size_t(kCloneSampleRate) / 10; i < longer.size() - size_t(kCloneSampleRate) / 10; ++i)
+                crossings += (longer[i - 1] < 0) != (longer[i] < 0);
+            const double hz = crossings / 2.0 / (double(longer.size()) / kCloneSampleRate - 0.2);
+            QVERIFY2(std::abs(hz - 220) < 15, qPrintable(QString::number(hz)));  // the pitch kept
+            QVERIFY(writeClonedSpeechWav(path("note.wav"), trimmed, "Generated speech in a voice cloned from a test"));
+            MediaItem m;
+            QVERIFY(probeMedia(path("note.wav"), m));
+            QVERIFY(std::abs(m.duration - 1.0) < 0.06);
+            QFile f(QString::fromStdString(path("note.wav")));
+            QVERIFY(f.open(QIODevice::ReadOnly) && f.readAll().contains("cloned from a test"));
+        }
+        // Korean as jamo, before any model.
+        CloneTokenizer bare;
+        QCOMPARE(QString::fromStdString(bare.prepare("한국", "ko")), QString::fromUtf8("[ko]한국"));
+        QCOMPARE(bare.prepare("Hola", "es"), std::string("[es]Hola"));
+
+        const ModelPack& pack = voiceCloneModel();
+        if (!voiceCloneAvailable() || !pack.installed()) QSKIP("Set MONTAGE_VOICE_CLONE_MODEL to the Chatterbox Multilingual ONNX files to run the rest");
+        // The tokenizer gives what Hugging Face's does with the model's tokenizer.json.
+        CloneTokenizer tok;
+        QVERIFY(tok.load(pack.directory() + "/tokenizer.json", pack.directory() + "/Cangjie5_TC.json"));
+        QCOMPARE(tok.encode("Hello world, this is a test.", "en"),
+                 (std::vector<int64_t>{6563, 255, 708, 284, 18, 84, 28, 2, 179, 79, 7, 2, 147, 2, 54, 2, 14, 2, 33, 218, 9, 0, 6561, 6561}));
+        QCOMPARE(tok.encode("Bonjour, ça va? Très bien!", "fr"),
+                 (std::vector<int64_t>{6563, 255, 634, 278, 47, 23, 160, 7, 2, 400, 14, 2, 35, 14, 13, 2, 296, 31, 401, 32, 2, 15, 22, 50, 3, 0, 6561, 6561}));
+        QCOMPARE(tok.encode("Größe über Straße.", "de"),
+                 (std::vector<int64_t>{6563, 255, 636, 283, 31, 415, 392, 18, 2, 421, 15, 44, 2, 295, 144, 14, 392, 18, 9, 0, 6561, 6561}));
+        QCOMPARE(tok.encode("It's 10,5 km — honestly.", "en"),
+                 (std::vector<int64_t>{6563, 255, 708, 285, 33, 4, 32, 2, 264, 263, 7, 268, 2, 24, 26, 2, 317, 2, 21, 47, 218, 70, 9, 0, 6561, 6561}));
+        QCOMPARE(tok.encode("한국", "ko"), (std::vector<int64_t>{6563, 255, 724, 1801, 1880, 1954, 1783, 1893, 1951, 0, 6561, 6561}));
+        // Chinese as Cangjie codes ("你" is ONF).
+        QVERIFY2(tok.prepare("你", "zh").rfind("[zh][cj_o][cj_n][cj_f][cj_.]", 0) == 0, tok.prepare("你", "zh").c_str());
+        // Speech in the sample voice that comes with the model.
+        const std::string sample = pack.directory() + "/default_voice.wav";
+        if (!QFileInfo::exists(QString::fromStdString(sample))) QSKIP("No default_voice.wav beside the voice cloning model");
+        AudioBufferPtr voice = decodeAudio(sample, kCloneSampleRate);
+        QVERIFY(voice && voice->frames() > kCloneSampleRate);
+        std::vector<float> ref(size_t(voice->frames()));
+        const size_t ch = size_t(std::max(1, voice->channels));
+        for (size_t i = 0; i < ref.size(); ++i) {
+            for (size_t c = 0; c < ch; ++c) ref[i] += voice->samples[i * ch + c];
+            ref[i] /= float(ch);
+        }
+        QElapsedTimer timer;
+        timer.start();
+        std::vector<float> shortSpeech, longSpeech, french;
+        std::string err;
+        double progressed = 0;
+        QVERIFY2(cloneSpeech("Hello, this is a test.", ref, kCloneSampleRate, {}, shortSpeech, &err, [&](double p) { progressed = p; }), err.c_str());
+        qInfo("cloned %.2f s of speech in %.1f s", double(shortSpeech.size()) / kCloneSampleRate, timer.elapsed() / 1000.0);
+        QCOMPARE(progressed, 1.0);
+        const double shortLength = double(shortSpeech.size()) / kCloneSampleRate;
+        QVERIFY2(shortLength > 0.8 && shortLength < 6, qPrintable(QString::number(shortLength)));
+        double energy = 0, peak = 0;
+        for (const float v : shortSpeech) energy += double(v) * v, peak = std::max(peak, double(std::fabs(v)));
+        QVERIFY2(std::sqrt(energy / double(shortSpeech.size())) > 0.01 && peak < 1.5, qPrintable(QString::number(peak)));
+        QVERIFY2(cloneSpeech("Hello, this is a test. And this second sentence is quite a lot longer than the first one was.", ref,
+                             kCloneSampleRate, {}, longSpeech, &err),
+                 err.c_str());
+        QVERIFY(double(longSpeech.size()) > double(shortSpeech.size()) * 1.8);
+        CloneOptions fr;
+        fr.language = "fr";
+        QVERIFY2(cloneSpeech("Bonjour, comment allez-vous?", ref, kCloneSampleRate, fr, french, &err), err.c_str());
+        QVERIFY(french.size() > size_t(kCloneSampleRate) / 2);
+        // Refused: an unknown language, a reference too short to hear a voice in, nothing to say; cancelled.
+        CloneOptions xx;
+        xx.language = "xx";
+        std::vector<float> none;
+        QVERIFY(!cloneSpeech("Hi.", ref, kCloneSampleRate, xx, none, &err));
+        QVERIFY(!cloneSpeech("Hi.", std::vector<float>(ref.begin(), ref.begin() + kCloneSampleRate / 4), kCloneSampleRate, {}, none, &err));
+        QVERIFY(!cloneSpeech("   ", ref, kCloneSampleRate, {}, none, &err));
+        std::atomic<bool> stop{true};
+        QVERIFY(!cloneSpeech("Hello again.", ref, kCloneSampleRate, {}, none, &err, {}, &stop) && err == "Cancelled");
+        writeSpeechWav(path("cloned.wav"), longSpeech);
+        // Made to fit: `exact` fills the room (within 0.7 to 1.4 times its own length), otherwise only sped up.
+        std::vector<float> fitted;
+        QVERIFY(cloneSpeechToFit("Hello, this is a test.", ref, kCloneSampleRate, {}, 1, 1.0, false, fitted, &err));
+        const double sped = double(fitted.size()) / kCloneSampleRate;  // into a second, or 1.6 times as fast if that is not enough
+        QVERIFY2(sped >= 0.97 && sped <= std::max(1.0, shortLength / 1.6) + 0.05, qPrintable(QString::number(sped)));
+        QVERIFY(cloneSpeechToFit("Hello, this is a test.", ref, kCloneSampleRate, {}, 1, 2.0, true, fitted, &err));
+        const double exact = double(fitted.size()) / kCloneSampleRate;
+        QVERIFY2(exact > 1.0 && exact < 2.05, qPrintable(QString::number(exact)));
+
+        // Through MCP: refused without consent; in place of what is said (the voice heard there), and from a file.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        MediaItem jfk;
+        QVERIFY(probeMedia(MONTAGE_TEST_DATA_DIR "/jfk.wav", jfk));
+        jfk.id = p.newId();
+        p.media.push_back(jfk);
+        QVERIFY(edit::placeMedia(p, s, jfk.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const QString project = QString::fromStdString(path("clone.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_clone_speech"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call({{"project", project}, {"text", "Hello there."}, {"consent", false}});
+        QVERIFY(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("consent"));
+        QVERIFY(call({{"project", project}, {"text", "Hi."}, {"consent", true}, {"language", "xx"}}).value("isError").toBool());
+        r = call({{"project", project}, {"text", "And so, my fellow Americans."}, {"consent", true},
+                  {"replace", QJsonObject{{"start", 2}, {"end", 4}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(r.value("structuredContent").toObject().value("voice_from").toString().contains("jfk.wav"));
+        r = call({{"project", project}, {"text", "Guten Tag."}, {"consent", true}, {"voice_media", MONTAGE_TEST_DATA_DIR "/jfk.wav"},
+                  {"voice_to", 6}, {"language", "de"}, {"at", 20}, {"track", "A2"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back, &err));
+        const Sequence& bs = *back.active();
+        const double fps = bs.fpsValue();
+        const auto& a1 = bs.audioTracks[0].clips;
+        QCOMPARE(int(a1.size()), 3);  // jfk before, the new words, jfk after
+        QCOMPARE(a1[0].end(), FrameTime(std::llround(2 * fps)));
+        QCOMPARE(a1[1].start, FrameTime(std::llround(2 * fps)));
+        QVERIFY(a1[1].end() <= FrameTime(std::llround(4 * fps)));
+        QCOMPARE(a1[2].start, FrameTime(std::llround(4 * fps)));
+        const MediaItem* said = back.findMedia(a1[1].mediaId);
+        QVERIFY(said && QString::fromStdString(said->name).contains("Cloned Speech"));
+        QVERIFY(QString::fromStdString(said->metadata.at("comment")).contains("cloned from jfk"));
+        QVERIFY(std::find(said->keywords.begin(), said->keywords.end(), "AI voice") != said->keywords.end());
+        QCOMPARE(int(bs.audioTracks.at(1).clips.size()), 1);
+        QCOMPARE(bs.audioTracks[1].clips[0].start, FrameTime(std::llround(20 * fps)));
     }
 
     void dubIntoEnglish() {

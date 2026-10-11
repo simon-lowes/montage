@@ -20,6 +20,7 @@
 #include "media/Faces.h"
 #include "media/Rife.h"
 #include "media/TextToSpeech.h"
+#include "media/VoiceClone.h"
 #include "media/SuperScale.h"
 #include "media/SpeechEnhance.h"
 
@@ -164,6 +165,18 @@ bool ensureObjectModel(QWidget* parent) {
     }
     return ensureModelPack(parent, objectModel(), QObject::tr("Object Mask"),
                            QObject::tr("Picking objects uses EdgeTAM, a segmentation model from Meta (Apache-2.0) that runs on this computer."));
+}
+
+bool ensureVoiceCloneModel(QWidget* parent) {
+    if (!voiceCloneAvailable()) {
+        QMessageBox::information(parent, QObject::tr("Cloned Voice"),
+                                 QObject::tr("This build of Montage cannot clone voices: it was built without ONNX Runtime."));
+        return false;
+    }
+    return ensureModelPack(parent, voiceCloneModel(), QObject::tr("Cloned Voice"),
+                           QObject::tr("Speaking in a cloned voice uses Chatterbox Multilingual (Resemble AI, MIT), which runs on this "
+                                       "computer. Only clone a voice with its owner's consent: every file it makes notes that it is "
+                                       "generated, and from whose voice."));
 }
 
 bool ensureEffectModel(QWidget* parent, const std::string& type) {

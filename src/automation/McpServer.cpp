@@ -3,6 +3,7 @@
 #include <QBuffer>
 #include <QColor>
 #include <QFile>
+#include <QDateTime>
 #include <QDir>
 #include <QDirIterator>
 #include <QFileInfo>
@@ -104,6 +105,7 @@
 #include "media/Inpaint.h"
 #include "media/Rife.h"
 #include "media/TextToSpeech.h"
+#include "media/VoiceClone.h"
 #include "media/Transcriber.h"
 #include "media/VisualSearch.h"
 #include "render/ClipAnalysis.h"
@@ -511,8 +513,19 @@ struct McpServer::Impl {
     }
     // Speaks each line (Kokoro) into a WAV in `folder`, a little faster where it has too little room, and places it at its time
     // on audio track `track`, adding `placed` entries; an error message or "".
+    // With `clone`, in a voice cloned from a recording (Chatterbox), time-stretched to fit, each file and its media noting
+    // that it is generated and from whose voice; `exact` makes each line fill its room.
+    struct CloneVoice {
+        std::vector<float> sample;  // mono at kCloneSampleRate
+        CloneOptions options;
+        std::string from, note;
+        bool exact = false;
+    };
     QString speakLines(Project& p, Sequence& s, const std::vector<SpeechLine>& lines, const std::string& voice, double speed, TrackRef track,
-                       const QString& folder, QJsonArray& placed, double& seconds);
+                       const QString& folder, QJsonArray& placed, double& seconds, const CloneVoice* clone = nullptr);
+    // The voice for montage_clone_speech and montage_dub: from voice_clip, voice_media (a file or the project's media, from
+    // voice_from to voice_to seconds), or else the clip heard at `fallback`; consent must be given.
+    CloneVoice cloneVoiceArg(const QJsonObject& a, const Project& p, const Sequence& s, FrameTime fallback);
     // Indexes the videos (all, or these and subclips' media) that have no visual index; an error message or "".
     QString indexMissing(Project& p, const std::vector<Id>& only, bool& changed);
 };
@@ -546,24 +559,42 @@ QString McpServer::Impl::indexMissing(Project& p, const std::vector<Id>& only, b
 }
 
 QString McpServer::Impl::speakLines(Project& p, Sequence& s, const std::vector<SpeechLine>& lines, const std::string& voice, double speed,
-                                    TrackRef track, const QString& folder, QJsonArray& placed, double& seconds) {
+                                    TrackRef track, const QString& folder, QJsonArray& placed, double& seconds, const CloneVoice* clone) {
+    static_assert(kCloneSampleRate == kTtsSampleRate);
     QDir().mkpath(folder);
     int n = 1;
     for (size_t i = 0; i < lines.size(); ++i) {
         std::vector<float> audio;
         std::string err;
         progress(double(i) / lines.size(), QStringLiteral("Speaking"));
-        if (!synthesizeSpeech(lines[i].text, voice, speed, audio, &err)) return QString::fromStdString(err);
-        const double room = lines[i].fit > 0 ? lines[i].fit / s.fpsValue() : 0, said = double(audio.size()) / kTtsSampleRate;
-        if (room > 0 && said > room * 1.02) {
-            const double faster = std::min(1.6, speed * said / room);
-            if (faster > speed * 1.02 && !synthesizeSpeech(lines[i].text, voice, faster, audio, &err)) return QString::fromStdString(err);
+        const double room = lines[i].fit > 0 ? lines[i].fit / s.fpsValue() : 0;
+        if (clone) {
+            if (!cloneSpeechToFit(lines[i].text, clone->sample, kCloneSampleRate, clone->options, speed, room, clone->exact, audio, &err))
+                return QString::fromStdString(err);
+        } else {
+            if (!synthesizeSpeech(lines[i].text, voice, speed, audio, &err)) return QString::fromStdString(err);
+            const double said = double(audio.size()) / kTtsSampleRate;
+            if (room > 0 && said > room * 1.02) {
+                const double faster = std::min(1.6, speed * said / room);
+                if (faster > speed * 1.02 && !synthesizeSpeech(lines[i].text, voice, faster, audio, &err)) return QString::fromStdString(err);
+            }
         }
         QString path;
-        do path = folder + '/' + QString::fromStdString(s.name) + QStringLiteral(" Speech ") + QString::number(n++) + QStringLiteral(".wav");
+        do path = folder + '/' + QString::fromStdString(s.name) + (clone ? QStringLiteral(" Cloned Speech ") : QStringLiteral(" Speech ")) +
+                  QString::number(n++) + QStringLiteral(".wav");
         while (QFileInfo::exists(path));
-        if (!writeSpeechWav(path.toStdString(), audio, &err)) return QString::fromStdString(err);
+        if (!(clone ? writeClonedSpeechWav(path.toStdString(), audio, clone->note, &err) : writeSpeechWav(path.toStdString(), audio, &err)))
+            return QString::fromStdString(err);
         const Id media = mediaFor(p, path);
+        if (MediaItem* m = clone ? p.findMedia(media) : nullptr) {
+            m->metadata["comment"] = clone->note;
+            if (std::find(m->keywords.begin(), m->keywords.end(), "AI voice") == m->keywords.end()) m->keywords.push_back("AI voice");
+        }
+        if (clone && clone->exact && lines[i].fit > 0) {
+            // In place of what was there.
+            const edit::Result lifted = edit::liftRange(p, s, lines[i].at, lines[i].at + lines[i].fit, {track});
+            if (!lifted.ok && !lifted.error.empty()) return QString::fromStdString(lifted.error);
+        }
         const edit::Result r = edit::placeMedia(p, s, media, lines[i].at, 0, -1, {TrackKind::Video, 0}, track, false);
         if (!r.ok) return QString::fromStdString(r.error);
         seconds += double(audio.size()) / kTtsSampleRate;
@@ -571,6 +602,68 @@ QString McpServer::Impl::speakLines(Project& p, Sequence& s, const std::vector<S
                                   {"clip", r.created.empty() ? 0.0 : double(r.created.front())}});
     }
     return {};
+}
+
+McpServer::Impl::CloneVoice McpServer::Impl::cloneVoiceArg(const QJsonObject& a, const Project& p, const Sequence& s, FrameTime fallback) {
+    if (!a.value("consent").toBool())
+        throw ArgError{"Cloning a voice needs its owner's consent: pass consent: true to confirm you have it (or that it is your own)"};
+    if (!voiceCloneAvailable()) throw ArgError{"This build of Montage cannot clone voices (no ONNX Runtime)"};
+    if (!voiceCloneModel().installed())
+        throw ArgError{QStringLiteral("The voice cloning model is not downloaded (%1 MB): clone a voice once in the app, or fetch it into %2")
+                           .arg(voiceCloneModel().bytes() / 1000000)
+                           .arg(QString::fromStdString(voiceCloneModel().directory()))};
+    CloneVoice v;
+    const CloneLanguage* lang = findCloneLanguage(str(a, "language", "en").toStdString());
+    if (!lang) throw ArgError{QStringLiteral("Voice cloning does not speak \"%1\"").arg(str(a, "language"))};
+    v.options.language = lang->code;
+    v.options.exaggeration = std::clamp(a.value("exaggeration").toDouble(0.5), 0.25, 2.0);
+    const double fps = s.fpsValue();
+    std::string path, err;
+    std::vector<int> channels;
+    double from = 0, to = 0;
+    const Clip* c = nullptr;
+    if (a.contains("voice_clip")) {
+        c = edit::clipById(const_cast<Sequence&>(s), Id(a.value("voice_clip").toDouble()));
+        if (!c) throw ArgError{"No such voice_clip"};
+    } else if (a.contains("voice_media")) {
+        const QString name = a.value("voice_media").toString();
+        for (const MediaItem& m : p.media)
+            if (QString::fromStdString(m.name) == name || QString::fromStdString(m.path) == absolute(name)) path = m.path;
+        if (path.empty()) path = absolute(name).toStdString();
+        if (!QFileInfo::exists(QString::fromStdString(path))) throw ArgError{QStringLiteral("No voice_media \"%1\"").arg(name)};
+        from = std::max(0.0, a.value("voice_from").toDouble(0));
+        to = a.contains("voice_to") ? a.value("voice_to").toDouble() : from + 30;
+        v.from = QFileInfo(QString::fromStdString(path)).fileName().toStdString();
+    } else {
+        // The voice heard where it speaks.
+        for (const Track& t : s.audioTracks) {
+            if (t.muted) continue;
+            for (const Clip& k : t.clips)
+                if (k.contains(fallback) && k.mediaId && k.enabled)
+                    if (const MediaItem* m = p.findMedia(k.mediaId); m && m->hasAudio) {
+                        c = &k;
+                        break;
+                    }
+            if (c) break;
+        }
+        if (!c) throw ArgError{"Give voice_clip or voice_media: no clip with sound is heard there to take a voice from"};
+    }
+    if (c) {
+        const MediaItem* m = c->mediaId ? p.findMedia(c->mediaId) : nullptr;
+        if (!m || !m->hasAudio) throw ArgError{"That clip has no sound to take a voice from"};
+        path = m->path;
+        channels = c->channels;
+        const double x = c->sourceFrameAt(c->start) / fps, y = c->sourceFrameAt(c->end() - 1) / fps;
+        from = std::min(x, y);
+        to = std::min(std::max(x, y) + 1 / fps, from + 30);
+        v.from = (c->name.empty() ? m->name : c->name) + " (" + QFileInfo(QString::fromStdString(m->path)).fileName().toStdString() + ")";
+    }
+    if (!voiceSampleFrom(path, from, to, v.sample, &err, channels, s.sampleRate > 0 ? s.sampleRate : 48000)) throw ArgError{QString::fromStdString(err)};
+    v.note = QStringLiteral("Generated speech (%1) in a voice cloned from %2 with Chatterbox Multilingual in Montage, %3; the speaker's consent "
+                            "was confirmed by the caller.")
+                 .arg(QString::fromUtf8(lang->name), QString::fromStdString(v.from), QDateTime::currentDateTime().toString(Qt::ISODate))
+                 .toStdString();
+    return v;
 }
 
 void McpServer::Impl::addTools() {
@@ -4869,6 +4962,61 @@ void McpServer::Impl::addTools() {
             save(l);
             return ok(QStringLiteral("Placed %1 voiceover clip(s), %2 s in all").arg(lines.size()).arg(total, 0, 'f', 1),
                       QJsonObject{{"clips", placed}});
+        });
+
+    add("montage_clone_speech", "Speak in a cloned voice",
+        "Speak text in a voice cloned from a few seconds of someone speaking (Chatterbox Multilingual, on this computer; "
+        "5 to 10 clean seconds is best), in any of 23 languages (ar da de el en es fi fr he hi it ja ko ms nl no pl pt ru "
+        "sv sw tr zh), and place it on an audio track: text at a time, a caption track spoken cue by cue, or text in place "
+        "of what is said from replace.start to replace.end (fitted to that time and put over it on the track, as Descript's "
+        "Overdub does; the voice heard there is cloned unless one is given). The voice is voice_clip (a clip id, what it "
+        "plays), voice_media (a file or the project's media, voice_from to voice_to seconds), or the clip heard at the "
+        "time. Needs consent: true, confirming you have the speaker's consent (or it is your own voice). Each WAV (in the "
+        "Voiceover folder) and its media note that it is generated, and from whose voice; its media gets the keyword AI voice.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"text":{"type":"string"},
+            "captions":{"type":"integer","description":"Caption track index to speak instead of text"},
+            "consent":{"type":"boolean","description":"You have the speaker's consent to clone their voice"},
+            "voice_clip":{"type":"integer"},"voice_media":{"type":"string"},"voice_from":{"type":"number"},"voice_to":{"type":"number"},
+            "language":{"type":"string","default":"en"},"exaggeration":{"type":"number","default":0.5,"description":"0.25 flat to 2 very expressive"},
+            "speed":{"type":"number","default":1},"at":{"type":["number","string"]},
+            "replace":{"type":"object","properties":{"start":{"type":["number","string"]},"end":{"type":["number","string"]}},"required":["start","end"]},
+            "track":{"type":"string","description":"Audio track, default A1"}},"required":["project","consent"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            std::vector<SpeechLine> lines;
+            FrameTime where = a.contains("at") ? timeArg(a.value("at"), s, "at") : 0;
+            const bool replace = a.contains("replace");
+            if (replace) {
+                const QJsonObject r = a.value("replace").toObject();
+                const FrameTime start = timeArg(r.value("start"), s, "replace.start"), end = timeArg(r.value("end"), s, "replace.end");
+                if (end <= start) throw ArgError{"replace.end must be after replace.start"};
+                lines.push_back({need(a, "text").toStdString(), start, end - start});
+                where = start;
+            } else if (a.contains("captions")) {
+                const int index = a.value("captions").toInt();
+                if (index < 0 || index >= int(s.captionTracks.size())) throw ArgError{"No such caption track"};
+                lines = captionSpeech(s.captionTracks[size_t(index)]);
+                if (!lines.empty()) where = lines.front().at;
+            } else {
+                lines.push_back({need(a, "text").toStdString(), where, -1});
+            }
+            if (lines.empty()) return fail("Nothing to say");
+            CloneVoice voice = cloneVoiceArg(a, l.project, s, where);
+            voice.exact = replace;
+            const TrackRef au = trackArg(str(a, "track", "A1"), s, true, &l.project, &s);
+            QJsonArray placed;
+            double total = 0;
+            const QString err = speakLines(l.project, s, lines, {}, std::clamp(a.value("speed").toDouble(1), 0.5, 2.0), au,
+                                           QFileInfo(absolute(need(a, "project"))).absolutePath() + QStringLiteral("/Voiceover"), placed, total,
+                                           &voice);
+            if (!err.isEmpty()) return fail(err);
+            save(l);
+            return ok(QStringLiteral("Placed %1 clip(s) in the voice from %2, %3 s in all")
+                          .arg(lines.size())
+                          .arg(QString::fromStdString(voice.from))
+                          .arg(total, 0, 'f', 1),
+                      QJsonObject{{"clips", placed}, {"voice_from", QString::fromStdString(voice.from)}, {"language", QString::fromStdString(voice.options.language)}});
         });
 
     add("montage_audio_description", "Audio description",

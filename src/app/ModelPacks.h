@@ -48,6 +48,8 @@ private:
 bool ensureModelPack(QWidget* parent, const ModelPack& pack, const QString& title, const QString& why);
 // The object model, after checking that this build can run it.
 bool ensureObjectModel(QWidget* parent);
+// The voice cloning model (media/VoiceClone.h), after checking that this build can run it.
+bool ensureVoiceCloneModel(QWidget* parent);
 // True when effects of `type` can run: no model needed, or theirs is ready
 // (asking and downloading if needed, e.g. Enhance Speech).
 bool ensureEffectModel(QWidget* parent, const std::string& type);

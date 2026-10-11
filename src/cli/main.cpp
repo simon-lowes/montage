@@ -44,6 +44,7 @@
 #include "media/Rife.h"
 #include "media/Matting.h"
 #include "media/TextToSpeech.h"
+#include "media/VoiceClone.h"
 #include "media/Inpaint.h"
 #include "media/Transcriber.h"
 #endif
@@ -95,6 +96,8 @@ int usage() {
                  "  montage-cli shots <project.montage> \"a red car at night\" [--max N]   (find shots by description)\n"
                  "  montage-cli people <project.montage> [--person NAME|ID]   (who is in the footage, and where)\n"
                  "  montage-cli speak \"text\" -o voice.wav [--voice af_heart] [--speed 1]   (a voiceover from text; --phonemes prints them)\n"
+                 "  montage-cli clone-speech \"text\" --voice sample.wav -o out.wav --consent [--language en] [--from S] [--to S]\n"
+                 "              [--speed 1] [--exaggeration 0.5]   (in the voice of the sample, with its owner's consent; 23 languages)\n"
                  "  montage-cli mcp [--live]              (Model Context Protocol server on stdio, for AI agents;\n"
                  "                                        --live: on the project open in Montage, with Tools > Agent Link on)\n"
                  "  montage-cli captions <project.montage> [-o out.srt|.vtt|.scc|.ttml|.stl|.ass] [--transcribe MODEL]\n"
@@ -659,6 +662,11 @@ int cmdModels() {
     if (!ttsAvailable()) std::printf("  unavailable: this build has no ONNX Runtime\n");
     else
         std::printf("  %-22s %6.1f MB  %s\n", ttsModel().id.c_str(), double(ttsModel().bytes()) / 1e6, ttsModel().installed() ? "downloaded" : "");
+    std::printf("\nVoice cloning model (Chatterbox Multilingual, for speech in a cloned voice; folder: %s)\n", voiceCloneModel().directory().c_str());
+    if (!voiceCloneAvailable()) std::printf("  unavailable: this build has no ONNX Runtime\n");
+    else
+        std::printf("  %-22s %6.0f MB  %s\n", voiceCloneModel().id.c_str(), double(voiceCloneModel().bytes()) / 1e6,
+                    voiceCloneModel().installed() ? "downloaded" : "");
     std::printf("\nSpeech search model (multi-qa-MiniLM, for finding what is said by meaning; folder: %s)\n", sentenceModel().directory().c_str());
     if (!speechSearchAvailable()) std::printf("  unavailable: this build has no ONNX Runtime\n");
     else
@@ -1052,6 +1060,53 @@ int cmdSpeak(const std::vector<std::string>& args) {
     return 0;
 }
 
+// Speaks text into a WAV file in a voice cloned from a recording (Chatterbox Multilingual), with its owner's consent.
+int cmdCloneSpeech(const std::vector<std::string>& args) {
+    if (args.empty()) return usage();
+    std::string out, sample;
+    double from = 0, to = 30, speed = 1;
+    CloneOptions o;
+    bool consent = false;
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (args[i] == "-o" && i + 1 < args.size()) out = args[++i];
+        else if (args[i] == "--voice" && i + 1 < args.size()) sample = args[++i];
+        else if (args[i] == "--language" && i + 1 < args.size()) o.language = args[++i];
+        else if (args[i] == "--from" && i + 1 < args.size()) from = std::atof(args[++i].c_str());
+        else if (args[i] == "--to" && i + 1 < args.size()) to = std::atof(args[++i].c_str());
+        else if (args[i] == "--speed" && i + 1 < args.size()) speed = std::atof(args[++i].c_str());
+        else if (args[i] == "--exaggeration" && i + 1 < args.size()) o.exaggeration = std::clamp(std::atof(args[++i].c_str()), 0.25, 2.0);
+        else if (args[i] == "--consent") consent = true;
+        else return usage();
+    }
+    if (out.empty() || sample.empty()) return usage();
+    if (!consent) {
+        std::fprintf(stderr, "error: cloning a voice needs its owner's consent: pass --consent to confirm you have it\n");
+        return 1;
+    }
+    const CloneLanguage* lang = findCloneLanguage(o.language);
+    if (!lang) {
+        std::fprintf(stderr, "error: voice cloning does not speak \"%s\"; it speaks:", o.language.c_str());
+        for (const CloneLanguage& l : voiceCloneLanguages()) std::fprintf(stderr, " %s", l.code);
+        std::fprintf(stderr, "\n");
+        return 1;
+    }
+    o.language = lang->code;
+    std::vector<float> voice, samples;
+    std::string err;
+    if (!voiceSampleFrom(sample, from, to, voice, &err) ||
+        !cloneSpeechToFit(args[0], voice, kCloneSampleRate, o, speed, 0, false, samples, &err) ||
+        !writeClonedSpeechWav(out, samples,
+                              "Generated speech (" + std::string(lang->name) + ") in a voice cloned from " +
+                                  std::filesystem::path(sample).filename().string() +
+                                  " with Chatterbox Multilingual in Montage; the speaker's consent was confirmed.",
+                              &err)) {
+        std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
+    }
+    std::printf("Wrote %s (%.1f s)\n", out.c_str(), double(samples.size()) / kCloneSampleRate);
+    return 0;
+}
+
 int cmdPresets() {
     for (const auto& p : exportPresets())
         std::printf("%-28s .%-5s %s\n", p.name.c_str(), p.extension.c_str(), p.description.c_str());
@@ -1100,6 +1155,7 @@ int main(int argc, char** argv) {
     if (cmd == "shots") return cmdShots(args);
     if (cmd == "people") return cmdPeople(args);
     if (cmd == "speak") return cmdSpeak(args);
+    if (cmd == "clone-speech") return cmdCloneSpeech(args);
     if (cmd == "mcp") {
 #ifdef MONTAGE_LIVE_BRIDGE
         // --live: the tools work on the project open in the running app (Tools > Agent Link), relayed to it.

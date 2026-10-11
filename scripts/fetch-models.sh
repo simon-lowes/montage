@@ -14,10 +14,16 @@
 #   <dir>/inpaint        Object Removal     (MONTAGE_INPAINT_MODEL)
 #   <dir>/minilm-qa      Find What's Said   (MONTAGE_SENTENCE_MODEL)
 #   <dir>/ocr            Reading text       (MONTAGE_OCR_MODEL)
+#   <dir>/voice-clone    Cloned voices      (MONTAGE_VOICE_CLONE_MODEL; 1.6 GB, only with --voice-clone)
 #
-#   scripts/fetch-models.sh [dir]      (default: ./models)
+#   scripts/fetch-models.sh [dir] [--voice-clone]      (default: ./models)
 set -euo pipefail
-DIR=${1:-models}
+VOICE_CLONE=0
+ARGS=()
+for a in "$@"; do
+  if [ "$a" = "--voice-clone" ]; then VOICE_CLONE=1; else ARGS+=("$a"); fi
+done
+DIR=${ARGS[0]:-models}
 sha256() { if command -v sha256sum > /dev/null; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
 fetch() {  # folder, file name, URL, SHA-256
   mkdir -p "$DIR/$1"
@@ -99,4 +105,18 @@ fetch ocr en_rec.onnx "$OCRREC/english/rec.onnx" 4e16deb22c4da6468bdca539b2cd3c8
 fetch ocr en_dict.txt "$OCRREC/english/dict.txt" e025a66d31f327ba0c232e03f407ae8d105e1e709e7ccb3f408aa778c24e70d6
 fetch ocr latin_rec.onnx "$OCRREC/latin/rec.onnx" 614ffc2d6d3902d360fad7f1b0dd455ee45e877069d14c4e51a99dc4ef144409
 fetch ocr latin_dict.txt "$OCRREC/latin/dict.txt" 3c0a8a79b612653c25f765271714f71281e4e955962c153e272b7b8c1d2b13ff
+if [ "$VOICE_CLONE" = 1 ]; then
+  CHATTERBOX=https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/452d3f434aa592098f1eedac9099f33642ab2da5
+  fetch voice-clone speech_encoder.onnx "$CHATTERBOX/onnx/speech_encoder.onnx" 8f1c8a0f89b77bf9cd5dd8f2e034eb2c79dc00fe70d41196b28c257643b00ccb
+  fetch voice-clone speech_encoder.onnx_data "$CHATTERBOX/onnx/speech_encoder.onnx_data" 92f8f290fc9720e169bc2412c507209e20b03f6564bc3243739e25c56f7dfb8f
+  fetch voice-clone embed_tokens.onnx "$CHATTERBOX/onnx/embed_tokens.onnx" f785819ca4f6271262d5bb8971d62796c3a909e3b031982c113dbe83a4c3b854
+  fetch voice-clone embed_tokens.onnx_data "$CHATTERBOX/onnx/embed_tokens.onnx_data" 2a15f7dd73b2ee47f6edf87740324011594b5a528ed6471ae55e327ed6cad68c
+  fetch voice-clone language_model_q4.onnx "$CHATTERBOX/onnx/language_model_q4.onnx" 7f8cdca83b2493536cbf3acf421199808a3d68736f55f4eabd20ef8a99da4313
+  fetch voice-clone language_model_q4.onnx_data "$CHATTERBOX/onnx/language_model_q4.onnx_data" e79ab8784122a501718868b9631ff46e151c552d9b24e50f25d721f375e3526c
+  fetch voice-clone conditional_decoder.onnx "$CHATTERBOX/onnx/conditional_decoder.onnx" 1656d0d31332bae1854839959a3139300ebb67c178651dfa3f8c5fbfa5351351
+  fetch voice-clone conditional_decoder.onnx_data "$CHATTERBOX/onnx/conditional_decoder.onnx_data" 51d58345a272747665ec9d5bb61e01835258a940e321a288582ac4c18cf01b5a
+  fetch voice-clone tokenizer.json "$CHATTERBOX/tokenizer.json" 29d48c4a178f6af3ad5130097c34744639e9294847b38a7b912c8c68027cb819
+  fetch voice-clone Cangjie5_TC.json "$CHATTERBOX/Cangjie5_TC.json" 7073fd9de919443ae88e0bd2449917a65fe54898a4413ed1edcc4b67f28bce8c
+  echo "Voice cloning model: MONTAGE_VOICE_CLONE_MODEL=$DIR/voice-clone"
+fi
 echo "Models in $DIR: MONTAGE_OBJECT_MODEL=$DIR/edgetam-video MONTAGE_SPEAKER_MODEL=$DIR/speakers MONTAGE_VISUAL_MODEL=$DIR/clip-vit-b32 MONTAGE_SPEECH_MODEL=$DIR/speech-enhance MONTAGE_UPSCALE_MODEL=$DIR/upscale MONTAGE_FACE_MODEL=$DIR/faces MONTAGE_DEPTH_MODEL=$DIR/depth MONTAGE_RIFE_MODEL=$DIR/rife MONTAGE_MATTE_MODEL=$DIR/matte MONTAGE_TTS_MODEL=$DIR/tts MONTAGE_INPAINT_MODEL=$DIR/inpaint MONTAGE_SENTENCE_MODEL=$DIR/minilm-qa MONTAGE_OCR_MODEL=$DIR/ocr"

@@ -137,6 +137,7 @@
 #include "media/Rife.h"
 #include "media/Matting.h"
 #include "media/TextToSpeech.h"
+#include "media/VoiceClone.h"
 #include "media/Inpaint.h"
 #include "SpeechDialog.h"
 #include "ShotSearchPanel.h"
@@ -5517,6 +5518,61 @@ private slots:
         const MediaItem* m = state()->project().findMedia(c->mediaId);
         QVERIFY(m && m->bin == "Voiceover" && QFileInfo::exists(QString::fromStdString(m->path)));
         // One undo step takes it away.
+        state()->undo();
+        QVERIFY(!edit::clipById(*state()->sequence(), clips[0]));
+    }
+
+    void clonedVoiceover() {
+        state()->newProject();
+        auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        QVERIFY(state()->apply("Place", [media](Project& p, Sequence& s) { return edit::placeMedia(p, s, media, 0, 0, -1, V1, A1, false); }));
+        const Id clip = trackAt(*state()->sequence(), A1)->clips.at(0).id;
+        // The voice in a clip: up to ten seconds of what it plays; the voice heard at a frame; none where nothing plays.
+        ClonedVoice v;
+        QString err;
+        QVERIFY2(clipVoice(state()->project(), *state()->sequence(), clip, v, &err), qPrintable(err));
+        QVERIFY2(v.sample.size() > size_t(kCloneSampleRate) * 5 && v.sample.size() <= size_t(kCloneSampleRate) * 10, qPrintable(QString::number(v.sample.size())));
+        QVERIFY(QString::fromStdString(v.from).contains("jfk.wav"));
+        ClonedVoice at;
+        QVERIFY(voiceAt(state()->project(), *state()->sequence(), 50, at, &err));
+        QCOMPARE(at.sample.size(), v.sample.size());
+        QVERIFY(!voiceAt(state()->project(), *state()->sequence(), 100000, at, &err) && !err.isEmpty());
+        QVERIFY(QString::fromStdString(clonedVoiceNote(v)).contains("cloned from jfk"));
+        // The dialog: the clone choices ask for a selected clip with sound and the speaker's consent before generating.
+        state()->setSelection({});
+        SpeechDialog dlg(state(), win_.get());
+        auto* voice = dlg.findChild<QComboBox*>("speechVoice");
+        auto* consent = dlg.findChild<QCheckBox*>("speechConsent");
+        auto* go = dlg.findChild<QPushButton*>("speechGenerate");
+        QVERIFY(voice && consent && go && dlg.findChild<QComboBox*>("speechLanguage"));
+        QVERIFY(consent->isHidden());
+        voice->setCurrentIndex(voice->findData("clone:clip"));
+        emit voice->activated(voice->currentIndex());
+        QVERIFY(!consent->isHidden() && !go->isEnabled());
+        state()->setSelection({clip}, false);
+        consent->setChecked(true);
+        QCOMPARE(go->isEnabled(), voiceCloneAvailable());
+        QVERIFY(dlg.findChild<QLabel*>("speechSample")->text().contains("jfk"));
+        consent->setChecked(false);
+        QVERIFY(!go->isEnabled());
+        dlg.findChild<QPlainTextEdit*>("speechText")->setPlainText("Testing a cloned voice.");
+        QVERIFY(dlg.generate().empty());  // no consent
+        if (!voiceCloneAvailable() || !voiceCloneModel().installed()) QSKIP("Set MONTAGE_VOICE_CLONE_MODEL to the Chatterbox Multilingual pack");
+        consent->setChecked(true);
+        state()->setPlayhead(300);
+        const auto clips = dlg.generate();
+        QCOMPARE(int(clips.size()), 1);
+        const Clip* c = edit::clipById(*state()->sequence(), clips[0]);
+        QVERIFY(c && c->start == 300);
+        const MediaItem* m = state()->project().findMedia(c->mediaId);
+        QVERIFY(m && m->bin == "Voiceover" && QString::fromStdString(m->name).contains("Cloned Speech"));
+        QVERIFY(QString::fromStdString(m->metadata.at("comment")).contains("cloned from jfk"));
+        QVERIFY(std::find(m->keywords.begin(), m->keywords.end(), "AI voice") != m->keywords.end());
+        QFile wav(QString::fromStdString(m->path));
+        QVERIFY(wav.open(QIODevice::ReadOnly));
+        QVERIFY(wav.readAll().contains("Generated speech"));  // the note in the file itself
         state()->undo();
         QVERIFY(!edit::clipById(*state()->sequence(), clips[0]));
     }
