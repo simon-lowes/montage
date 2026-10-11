@@ -30,6 +30,7 @@
 #include "RenderQueue.h"
 #include "core/AudioDescription.h"
 #include "core/Surround.h"
+#include "media/ContentCredentials.h"
 #include "SequenceSettingsDialog.h"
 #include "Theme.h"
 #include "core/History.h"
@@ -347,6 +348,29 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
             if (!f.isEmpty()) watermark_->setText(f);
         });
     }
+    {
+        // Content Credentials (media/ContentCredentials.h): a signed record of how the file was made, AI included.
+        auto* crow = new QWidget(form_);
+        auto* cl = new QHBoxLayout(crow);
+        cl->setContentsMargins(0, 0, 0, 0);
+        credentials_ = new QCheckBox(tr("Sign with Content Credentials"), crow);
+        credentials_->setObjectName(QStringLiteral("exportCredentials"));
+        credentials_->setChecked(appSettings().value("export/credentials", false).toBool());
+        credentialIdentity_ = new QPushButton(crow);
+        credentialIdentity_->setObjectName(QStringLiteral("exportCredentialIdentity"));
+        cl->addWidget(credentials_);
+        cl->addWidget(credentialIdentity_);
+        cl->addStretch(1);
+        form->addRow(tr("Credentials:"), crow);
+        aiTraining_ = new QCheckBox(tr("Allow AI models to train on it"), form_);
+        aiTraining_->setObjectName(QStringLiteral("exportAllowAiTraining"));
+        aiTraining_->setToolTip(tr("Unticked, its credentials ask that it not be used to train AI models (CAWG training and mining)"));
+        aiTraining_->setChecked(appSettings().value("export/allowAiTraining", false).toBool());
+        form->addRow(QString(), aiTraining_);
+        connect(credentials_, &QCheckBox::toggled, this, [this] { updateControls(); });
+        connect(credentialIdentity_, &QPushButton::clicked, this, [this] { chooseSigningIdentity(); });
+        showSigningIdentity();
+    }
     form->addRow(tr("Summary:"), summary_);
 
     progress_ = new QProgressBar(this);
@@ -475,6 +499,38 @@ void ExportDialog::browse() {
     appSettings().setValue(kSettingsDir, QFileInfo(chosen).absolutePath());
 }
 
+void ExportDialog::chooseSigningIdentity() {
+    QSettings st = appSettings();
+    const QString cert = QFileDialog::getOpenFileName(
+        this, tr("Signing Certificate (the certificate chain, yours first)"), st.value("credentials/certificate").toString(),
+        tr("Certificates (*.pem *.crt *.cer);;All Files (*)"));
+    if (cert.isEmpty()) return;
+    const QString key = QFileDialog::getOpenFileName(this, tr("Its Private Key"), QFileInfo(cert).absolutePath(),
+                                                     tr("Private Keys (*.pem *.key);;All Files (*)"));
+    if (key.isEmpty()) return;
+    std::string why;
+    if (!checkCredentialSigner({cert.toStdString(), key.toStdString(), {}}, &why)) {
+        QMessageBox::warning(this, tr("Signing Certificate"),
+                             tr("This certificate and key cannot sign Content Credentials: %1\n\nThe certificate must be issued "
+                                "by a certificate authority (not signed by itself), for digital signatures with e-mail "
+                                "protection or document signing use.")
+                                 .arg(QString::fromStdString(why)));
+        return;
+    }
+    st.setValue("credentials/certificate", cert);
+    st.setValue("credentials/key", key);
+    credentials_->setChecked(true);
+    showSigningIdentity();
+}
+
+void ExportDialog::showSigningIdentity() {
+    const QString cert = appSettings().value("credentials/certificate").toString();
+    credentialIdentity_->setText(cert.isEmpty() ? tr("Choose Certificate…") : QFileInfo(cert).fileName());
+    credentialIdentity_->setToolTip(cert.isEmpty() ? tr("The certificate and private key you sign with")
+                                                   : tr("Signs with %1 (click to choose another)").arg(QDir::toNativeSeparators(cert)));
+    if (exportButton_) updateControls();  // (built: the constructor's own call comes once every control is)
+}
+
 void ExportDialog::widthChanged(int w) {
     const Sequence* seq = state_ ? state_->sequence() : nullptr;
     if (!updatingSize_ && seq && seq->width > 0) {
@@ -550,6 +606,17 @@ void ExportDialog::updateControls() {
     const bool anyChapters = seq && std::any_of(seq->markers.begin(), seq->markers.end(), [](const Marker& m) { return m.chapter; });
     chapters_->setEnabled(chapterFile && anyChapters);
     startTc_->setEnabled(ext == QLatin1String("mxf") || ext == QLatin1String("mov"));
+    if (credentials_) {
+        const bool can = contentCredentialsAvailable() && contentCredentialsFormat(("x." + ext).toStdString());
+        credentials_->setEnabled(can);
+        credentials_->setToolTip(!contentCredentialsAvailable() ? tr("This build of Montage cannot sign (no C2PA library)")
+                                 : !can ? tr("Content Credentials cannot go in %1 files: MP4, MOV, WAV, MP3, JPEG, PNG and TIFF can hold them").arg(ext.toUpper())
+                                        : tr("A signed record in the file of who made it, with what, and each AI model that "
+                                             "generated or changed it, with the credentials its sources carried; checked at "
+                                             "contentcredentials.org/verify. Like Premiere's Content Credentials."));
+        credentialIdentity_->setEnabled(can);
+        aiTraining_->setEnabled(can && credentials_->isChecked());
+    }
     const bool intra = p && (p->settings.videoCodec == "prores_ks" || p->settings.videoCodec == "dnxhd");
     smart_->setEnabled(intra);
     smart_->setToolTip(intra ? tr("Frames that are one untouched clip already in this ProRes or DNxHR flavour, size and rate are copied from "
@@ -761,6 +828,24 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
     settings.setValue("export/burnCorner", burnCorner_->currentIndex());
     settings.setValue("export/watermark", watermark_->text());
     settings.setValue("export/watermarkCorner", watermarkCorner_->currentIndex());
+    if (credentials_->isEnabled() && credentials_->isChecked()) {
+        const CredentialSigner signer{settings.value("credentials/certificate").toString().toStdString(),
+                                      settings.value("credentials/key").toString().toStdString(), {}};
+        std::string why;
+        if (signer.certificatePath.empty() || signer.keyPath.empty())
+            why = tr("Choose your signing certificate and key first.").toStdString();
+        else if (!checkCredentialSigner(signer, &why))
+            why = tr("Your signing certificate cannot sign: %1").arg(QString::fromStdString(why)).toStdString();
+        if (!why.empty()) {
+            QMessageBox::warning(this, tr("Export"), QString::fromStdString(why));
+            return false;
+        }
+        s.credentialCertificate = signer.certificatePath;
+        s.credentialKey = signer.keyPath;
+        s.credentialAllowAiTraining = aiTraining_->isChecked();
+    }
+    settings.setValue("export/credentials", credentials_->isChecked());
+    settings.setValue("export/allowAiTraining", aiTraining_->isChecked());
     if (rangeIsInOut()) {
         s.in = in;
         s.out = out;

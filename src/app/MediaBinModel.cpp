@@ -296,6 +296,8 @@ QString MediaBinModel::toolTip(const MediaItem& m) const {
         }
     if (m.rating < 0) tip += "<br>" + tr("Rejected");
     else if (m.rating > 0) tip += "<br>" + QString(m.rating, QChar(0x2605));
+    if (const auto c2pa = m.metadata.find("c2pa"); c2pa != m.metadata.end() && !c2pa->second.empty())
+        tip += "<br>" + tr("Content Credentials: %1").arg(QString::fromStdString(c2pa->second).toHtmlEscaped());
     if (!m.keywords.empty()) tip += "<br>" + tr("Keywords: %1").arg(QString::fromStdString(joinKeywords(m.keywords)).toHtmlEscaped());
     if (m.transcript)
         tip += "<br>" + tr("Transcript: %n word(s)", "", int(m.transcript->wordCount())) +

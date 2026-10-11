@@ -20,6 +20,7 @@
 #include "core/MediaLog.h"
 #include "core/ProjectIO.h"
 #include "core/ProjectLock.h"
+#include "media/ContentCredentials.h"
 #include "media/Decoder.h"
 #include "media/MediaPool.h"
 #include "media/Proxy.h"
@@ -414,7 +415,7 @@ void EditorState::reloadChangedMedia(const QStringList& paths) {
                 reloaded.push_back(m.id);
             }
             for (const MediaItem& m : project_.media)
-                if (m.path == p && !m.subclipOf) startAudioDecode(m);
+                if (m.path == p && !m.subclipOf) startAudioDecode(m), startCredentialRead(m);
             for (auto it = clipAudioRequested_.begin(); it != clipAudioRequested_.end();)
                 it = audioKeyFile(it->first) == p ? clipAudioRequested_.erase(it) : std::next(it);
         }
@@ -624,6 +625,44 @@ void EditorState::startAudioDecode(const MediaItem& m) {
     (void)QtConcurrent::run([path, rate] { MediaPool::instance().audio(path, rate); });
 }
 
+void EditorState::startCredentialRead(const MediaItem& m) {
+    if (m.path.empty() || m.subclipOf || m.kind == MediaKind::Sequence || !contentCredentialsAvailable()) return;
+    const std::string path = m.path;
+    const std::string file = mediaFileOnDisk(path);
+    if (!contentCredentialsFormat(file)) return;
+    QPointer<EditorState> self(this);
+    const uint64_t generation = projectGeneration_;
+    (void)QtConcurrent::run([self, path, file, generation] {
+        CredentialSummary c;
+        if (!readContentCredentials(file, c)) return;  // (unreadable: what it said before stays)
+        const std::string label = c.present ? credentialsLabel(c) : std::string();
+        QCoreApplication* app = QCoreApplication::instance();
+        if (!app) return;
+        QMetaObject::invokeMethod(app, [self, path, label, generation] {
+            if (!self || generation != self->projectGeneration_) return;
+            // As probed facts: in the project and every state undo, redo or a gesture's start can bring back.
+            auto apply = [&](Project& p) {
+                bool changed = false;
+                for (MediaItem& m : p.media) {
+                    if (m.path != path) continue;
+                    const auto it = m.metadata.find("c2pa");
+                    if (label.empty() ? it == m.metadata.end() : it != m.metadata.end() && it->second == label) continue;
+                    if (label.empty()) m.metadata.erase(it);
+                    else m.metadata["c2pa"] = label;
+                    changed = true;
+                }
+                return changed;
+            };
+            const bool changed = apply(self->project_);
+            self->history_.forEachState(apply);
+            if (self->gesture_) apply(self->gesture_->origin);
+            if (!changed) return;
+            self->history_.touch();
+            emit self->projectChanged();
+        }, Qt::QueuedConnection);
+    });
+}
+
 Id EditorState::importImageSequence(const QString& frame, Rational fps, QString* error) {
     ImageSequence seq;
     if (!detectImageSequence(frame.toStdString(), seq)) {
@@ -830,7 +869,7 @@ std::vector<Id> EditorState::importFiles(const QStringList& paths, QStringList* 
              }
              return true;
          });
-    for (const auto& m : items) startAudioDecode(m);
+    for (const auto& m : items) startAudioDecode(m), startCredentialRead(m);
     return ids;
 }
 

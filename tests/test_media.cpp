@@ -47,6 +47,8 @@
 #include "core/ClipAnimation.h"
 #include "core/GradeVersions.h"
 #include "core/MergeClips.h"
+#include "media/ContentCredentials.h"
+#include "core/Provenance.h"
 #include "media/DualSystem.h"
 #include "media/FieldRecorder.h"
 #include "media/Analysis.h"
@@ -17055,6 +17057,154 @@ private slots:
         QVERIFY(std::find(said->keywords.begin(), said->keywords.end(), "AI voice") != said->keywords.end());
         QCOMPARE(int(bs.audioTracks.at(1).clips.size()), 1);
         QCOMPARE(bs.audioTracks[1].clips[0].start, FrameTime(std::llround(20 * fps)));
+    }
+
+    void contentCredentials() {
+        // What an export's credentials say, as c2pa-rs is given it: made by Montage from other media, then each AI model's
+        // part, and that it may not train AI.
+        Provenance made;
+        made.ai = {{"Object Removal", "LaMa", AiRole::Generated}, {"Super Scale", "Real-ESRGAN", AiRole::Enhanced}};
+        QJsonObject def = QJsonDocument::fromJson(QByteArray::fromStdString(credentialManifestJson("/x/cut.mp4", made, {}))).object();
+        QCOMPARE(def.value("title").toString(), QStringLiteral("cut.mp4"));
+        QCOMPARE(def.value("format").toString(), QStringLiteral("video/mp4"));
+        QCOMPARE(def.value("claim_generator_info").toArray()[0].toObject().value("name").toString(), QStringLiteral("Montage"));
+        QJsonArray assertions = def.value("assertions").toArray();
+        QCOMPARE(assertions.size(), 2);
+        QJsonArray actions = assertions[0].toObject().value("data").toObject().value("actions").toArray();
+        QCOMPARE(actions.size(), 3);
+        QCOMPARE(actions[0].toObject().value("action").toString(), QStringLiteral("c2pa.created"));
+        QVERIFY(actions[0].toObject().value("digitalSourceType").toString().endsWith("compositeWithTrainedAlgorithmicMedia"));
+        QCOMPARE(actions[1].toObject().value("action").toString(), QStringLiteral("c2pa.edited"));
+        QVERIFY(actions[1].toObject().value("description").toString().contains("Object Removal (LaMa)"));
+        QVERIFY(actions[2].toObject().value("digitalSourceType").toString().endsWith("algorithmicallyEnhanced"));
+        QCOMPARE(assertions[1].toObject().value("label").toString(), QStringLiteral("cawg.training-mining"));
+        // No AI, a title, and training allowed: a composite, and nothing said about training.
+        CredentialOptions allow;
+        allow.title = "Trailer";
+        allow.allowAiTraining = true;
+        def = QJsonDocument::fromJson(QByteArray::fromStdString(credentialManifestJson("/x/cut.wav", {}, allow))).object();
+        QCOMPARE(def.value("title").toString(), QStringLiteral("Trailer"));
+        assertions = def.value("assertions").toArray();
+        QCOMPARE(assertions.size(), 1);
+        QVERIFY(assertions[0].toObject().value("data").toObject().value("actions").toArray()[0].toObject().value("digitalSourceType").toString().endsWith("/composite"));
+        // Which files can hold them, and how a file's read.
+        QVERIFY(contentCredentialsFormat("a.MOV") && contentCredentialsFormat("b.wav") && contentCredentialsFormat("c.jpg"));
+        QVERIFY(!contentCredentialsFormat("a.mkv") && !contentCredentialsFormat("a.mxf") && !contentCredentialsFormat("a.webm"));
+        CredentialSummary said;
+        said.present = true, said.state = "Trusted", said.issuer = "Sony Corporation", said.signedAt = "2026-10-01T09:30:00Z";
+        said.generator = "ILCE-1", said.aiGenerated = true;
+        QCOMPARE(credentialsLabel(said), std::string("Signed by Sony Corporation, 2026-10-01, made with ILCE-1 (trusted); made with AI"));
+        QCOMPARE(credentialsLabel({}), std::string());
+
+        std::string err;
+        const std::string certs = MONTAGE_TEST_DATA_DIR "/c2pa/chain.pem", key = MONTAGE_TEST_DATA_DIR "/c2pa/signer.key";
+        if (!contentCredentialsAvailable()) {
+            QVERIFY(!checkCredentialSigner({certs, key, {}}, &err) && err.find("C2PA") != std::string::npos);
+            QSKIP("Built without the C2PA library (scripts/build-c2pa.sh) for the rest");
+        }
+        // The test signer can sign; a certificate authority's own certificate, or a missing key, cannot.
+        QVERIFY2(checkCredentialSigner({certs, key, {}}, &err), err.c_str());
+        QVERIFY(!checkCredentialSigner({MONTAGE_TEST_DATA_DIR "/c2pa/ca.pem", key, {}}, &err) && !err.empty());
+        QVERIFY(!checkCredentialSigner({certs, path("missing.key"), {}}, &err) && err.find("private key") != std::string::npos);
+
+        // A file without credentials has none; a "camera original" signed, then read back.
+        CredentialSummary c;
+        QVERIFY2(readContentCredentials(MONTAGE_TEST_DATA_DIR "/jfk.wav", c, &err), err.c_str());
+        QVERIFY(!c.present);
+        const std::string camera = path("camera.wav");
+        QVERIFY(QFile::copy(MONTAGE_TEST_DATA_DIR "/jfk.wav", QString::fromStdString(camera)));
+        QFile::setPermissions(QString::fromStdString(camera), QFile::permissions(QString::fromStdString(camera)) | QFileDevice::WriteOwner | QFileDevice::ReadGroup);
+        const auto permissions = QFile::permissions(QString::fromStdString(camera));
+        CredentialOptions original;
+        original.title = "Camera original";
+        QVERIFY2(signContentCredentials(camera, {}, {certs, key, {}}, original, &err), err.c_str());
+        QCOMPARE(QFile::permissions(QString::fromStdString(camera)), permissions);  // (not a temporary file's)
+        QVERIFY2(readContentCredentials(camera, c, &err), err.c_str());
+        QVERIFY(c.present);
+        QCOMPARE(c.state, std::string("Valid"));  // intact; the test authority is on no trust list
+        QCOMPARE(c.issuer, std::string("Montage tests"));
+        QCOMPARE(c.title, std::string("Camera original"));
+        QVERIFY(QString::fromStdString(c.generator).startsWith("Montage"));
+        QVERIFY(!c.aiGenerated);
+        QVERIFY(std::find(c.actions.begin(), c.actions.end(), "c2pa.created") != c.actions.end());
+        QVERIFY(c.json.find("cawg.training-mining") != std::string::npos);
+        // Still plays as it did.
+        MediaItem m;
+        QVERIFY(probeMedia(camera, m));
+        QVERIFY(std::abs(m.duration - 11.0) < 0.1);
+
+        // A format that cannot hold them: refused, the file untouched.
+        const std::string mkv = path("cut.mkv");
+        QVERIFY(QFile::copy(MONTAGE_TEST_DATA_DIR "/jfk.wav", QString::fromStdString(mkv)));
+        QVERIFY(!signContentCredentials(mkv, {}, {certs, key, {}}, {}, &err) && err.find(".mkv") != std::string::npos);
+        // Changed after signing: invalid.
+        const std::string changed = path("changed.wav");
+        QVERIFY(QFile::copy(QString::fromStdString(camera), QString::fromStdString(changed)));
+        {
+            QFile f(QString::fromStdString(changed));
+            QVERIFY(f.open(QIODevice::ReadWrite));
+            f.seek(f.size() / 2);
+            const QByteArray b = f.read(64);
+            QByteArray flipped = b;
+            for (char& x : flipped) x = char(~x);
+            f.seek(f.size() / 2);
+            f.write(flipped);
+        }
+        QVERIFY2(readContentCredentials(changed, c, &err), err.c_str());
+        QVERIFY(c.present && c.state == "Invalid" && !c.problems.empty());
+
+        // An export through MCP: signed, the camera's credentials kept as an ingredient; then read through MCP. With
+        // AI in it (speech made by a model), it says so.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        QVERIFY(probeMedia(camera, m));
+        m.id = p.newId();
+        p.media.push_back(m);
+        MediaItem voice;
+        QVERIFY(probeMedia(MONTAGE_TEST_DATA_DIR "/jfk.wav", voice));
+        voice.id = p.newId();
+        voice.keywords = {"AI voice"};
+        voice.metadata["comment"] = "Spoken by Kokoro voice af_heart";
+        p.media.push_back(voice);
+        const double fps = s.fpsValue();
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 2 * fps, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(edit::placeMedia(p, s, voice.id, FrameTime(2 * fps), 0, 2 * fps, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const QString project = QString::fromStdString(path("credentials.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        const QJsonObject signer{{"certificate", QString::fromStdString(certs)}, {"key", QString::fromStdString(key)}};
+        const QString out = QString::fromStdString(path("signed.wav"));
+        // A refused certificate fails before rendering; MKV cannot hold them.
+        QJsonObject r = call("montage_render", {{"project", project}, {"output", out}, {"preset", "Audio - WAV 24-bit"},
+                                                {"credentials", QJsonObject{{"certificate", MONTAGE_TEST_DATA_DIR "/c2pa/ca.pem"}, {"key", QString::fromStdString(key)}}}});
+        QVERIFY2(r.value("isError").toBool() && !QFileInfo::exists(out), QJsonDocument(r).toJson().constData());
+        r = call("montage_render", {{"project", project}, {"output", QString::fromStdString(path("signed.mkv"))}, {"credentials", signer}});
+        QVERIFY(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("cannot go in"));
+        r = call("montage_render", {{"project", project}, {"output", out}, {"preset", "Audio - WAV 24-bit"}, {"credentials", signer}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject written = r.value("structuredContent").toObject().value("credentials").toObject();
+        QVERIFY(written.value("signed").toBool());
+        QCOMPARE(written.value("ai").toArray().size(), 1);
+        QCOMPARE(written.value("ai").toArray()[0].toObject().value("role").toString(), QStringLiteral("generated"));
+        r = call("montage_read_credentials", {{"path", out}, {"full", true}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject read = r.value("structuredContent").toObject();
+        QVERIFY(read.value("present").toBool());
+        QCOMPARE(read.value("state").toString(), QStringLiteral("Valid"));
+        QVERIFY(read.value("ai_generated").toBool());
+        QVERIFY(read.value("label").toString().endsWith("made with AI"));
+        // The camera original's credentials inside, as an ingredient.
+        const QByteArray store = QJsonDocument(read.value("manifest_store").toObject()).toJson();
+        QVERIFY2(store.contains("Camera original") && store.contains("componentOf"), store.left(4000).constData());
+        QVERIFY(!call("montage_read_credentials", {{"path", MONTAGE_TEST_DATA_DIR "/jfk.wav"}}).value("structuredContent").toObject().value("present").toBool());
     }
 
     void voiceConversion() {

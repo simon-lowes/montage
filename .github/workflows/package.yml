@@ -38,8 +38,15 @@ jobs:
       - name: Install dependencies
         # Only the Qt modules Montage uses; the "qt" formula installs all of Qt.
         run: brew install qtbase qtmultimedia ffmpeg opencolorio lilv libraw openjpeg onnxruntime ninja pkgconf
+      - name: Cache the C2PA library
+        uses: actions/cache@v4
+        with:
+          path: ~/c2pa
+          key: c2pa-${{ runner.os }}-${{ hashFiles('scripts/build-c2pa.sh') }}
+      - name: C2PA library (Content Credentials)
+        run: scripts/build-c2pa.sh ~/c2pa
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(brew --prefix)" -DMONTAGE_REQUIRE_ONNXRUNTIME=ON
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(brew --prefix)" -DMONTAGE_REQUIRE_ONNXRUNTIME=ON -DC2PA_ROOT="$HOME/c2pa" -DMONTAGE_REQUIRE_C2PA=ON
       - name: Build
         run: cmake --build build
       - name: Cache the AI models
@@ -103,9 +110,16 @@ jobs:
           install: zip curl
           pacboy: >-
             gcc:p cmake:p ninja:p pkgconf:p
-            qt6-base:p qt6-multimedia:p qt6-tools:p ffmpeg:p opencolorio:p lilv:p libraw:p openjpeg2:p onnxruntime:p
+            qt6-base:p qt6-multimedia:p qt6-tools:p ffmpeg:p opencolorio:p lilv:p libraw:p openjpeg2:p onnxruntime:p rust:p
+      - name: Cache the C2PA library
+        uses: actions/cache@v4
+        with:
+          path: ~/c2pa
+          key: c2pa-${{ runner.os }}-ucrt64-${{ hashFiles('scripts/build-c2pa.sh') }}
+      - name: C2PA library (Content Credentials)
+        run: scripts/build-c2pa.sh "$(cygpath -u "$USERPROFILE")/c2pa"  # where actions/cache's ~ points
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DMONTAGE_REQUIRE_ONNXRUNTIME=ON
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DMONTAGE_REQUIRE_ONNXRUNTIME=ON -DC2PA_ROOT="$(cygpath -m "$USERPROFILE")/c2pa" -DMONTAGE_REQUIRE_C2PA=ON
       - name: Build
         run: cmake --build build
       - name: Cache the AI models

@@ -64,6 +64,8 @@
 #include "EditorState.h"
 #include "EffectsBrowser.h"
 #include "ExportDialog.h"
+#include <QMessageBox>
+#include "media/ContentCredentials.h"
 #include "ExposureView.h"
 #include "QualityCheckDialog.h"
 #include "OffloadDialog.h"
@@ -6365,6 +6367,81 @@ private slots:
         // One undo step takes it away.
         state()->undo();
         QVERIFY(!edit::clipById(*state()->sequence(), clips[0]));
+    }
+
+    void contentCredentialsInTheApp() {
+        // The Export dialog offers signing for files that can hold credentials, and not for MKV.
+        state()->newProject();
+        const QString certs = MONTAGE_TEST_DATA_DIR "/c2pa/chain.pem", key = MONTAGE_TEST_DATA_DIR "/c2pa/signer.key";
+        appSettings().remove("credentials/certificate");
+        appSettings().remove("credentials/key");
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        QVERIFY(state()->apply("Place", [&](Project& p, Sequence& s) { return edit::placeMedia(p, s, ids[0], 0, 0, 60, V1, A1, false); }));
+        const QString out = dir_.path() + "/signed-in-app.wav";
+        {
+            ExportDialog ed(state(), win_.get());
+            auto* sign = ed.findChild<QCheckBox*>("exportCredentials");
+            auto* identity = ed.findChild<QPushButton*>("exportCredentialIdentity");
+            auto* training = ed.findChild<QCheckBox*>("exportAllowAiTraining");
+            auto* preset = ed.findChild<QComboBox*>("exportPreset");
+            auto* path = ed.findChild<QLineEdit*>("exportPath");
+            QVERIFY(sign && identity && training && preset && path);
+            QVERIFY(identity->text().contains("Choose"));
+            preset->setCurrentIndex(preset->findText("Audio - WAV 24-bit"));
+            QCOMPARE(sign->isEnabled(), contentCredentialsAvailable());
+            for (int i = 0; i < preset->count(); ++i)
+                if (preset->itemText(i).contains("MKV")) {
+                    preset->setCurrentIndex(i);
+                    QVERIFY(!sign->isEnabled());
+                    break;
+                }
+            if (!contentCredentialsAvailable()) QSKIP("Built without the C2PA library (scripts/build-c2pa.sh) for the rest");
+            preset->setCurrentIndex(preset->findText("Audio - WAV 24-bit"));
+            path->setText(out);
+            // Asked to sign without a certificate: nothing is exported.
+            sign->setChecked(true);
+            QVERIFY(training->isEnabled() && !training->isChecked());
+            QTimer::singleShot(0, [] {
+                if (auto* box = qobject_cast<QMessageBox*>(QApplication::activeModalWidget())) box->accept();
+            });
+            ed.findChild<QPushButton*>("exportButton")->click();
+            QVERIFY(!ed.isExporting() && !QFileInfo::exists(out));
+        }
+        appSettings().setValue("credentials/certificate", certs);
+        appSettings().setValue("credentials/key", key);
+        {
+            ExportDialog ed(state(), win_.get());
+            QCOMPARE(ed.findChild<QPushButton*>("exportCredentialIdentity")->text(), QStringLiteral("chain.pem"));
+            ed.findChild<QComboBox*>("exportPreset")->setCurrentIndex(ed.findChild<QComboBox*>("exportPreset")->findText("Audio - WAV 24-bit"));
+            ed.findChild<QLineEdit*>("exportPath")->setText(out);
+            ed.findChild<QCheckBox*>("exportCredentials")->setChecked(true);
+            ed.findChild<QPushButton*>("exportButton")->click();
+            QTRY_COMPARE_WITH_TIMEOUT(ed.result(), int(QDialog::Accepted), 60000);
+        }
+        appSettings().setValue("export/credentials", false);
+        CredentialSummary c;
+        QVERIFY(readContentCredentials(out.toStdString(), c) && c.present && c.state == "Valid");
+
+        // Imported, the bin shows who signed it (read in the background), in its column and tooltip; not an undo step.
+        const int undoBefore = int(state()->history().undoCount());
+        const auto signedIds = state()->importFiles({out});
+        QCOMPARE(signedIds.size(), size_t(1));
+        auto label = [&] {
+            const MediaItem* m = state()->project().findMedia(signedIds[0]);
+            const auto it = m ? m->metadata.find("c2pa") : decltype(m->metadata.end()){};
+            return m && it != m->metadata.end() ? QString::fromStdString(it->second) : QString();
+        };
+        QTRY_VERIFY_WITH_TIMEOUT(!label().isEmpty(), 20000);
+        QVERIFY2(label().startsWith("Signed by Montage tests") && label().contains("(valid)"), qPrintable(label()));
+        QCOMPARE(int(state()->history().undoCount()), undoBefore + 1);  // the import alone
+        state()->undo();
+        QVERIFY(!state()->project().findMedia(signedIds[0]));
+        state()->redo();
+        QVERIFY2(label().startsWith("Signed by"), "redo brings back what was read");
+        // A file without credentials gets none.
+        const MediaItem* plain = state()->project().findMedia(ids[0]);
+        QVERIFY(plain && !plain->metadata.count("c2pa"));
     }
 
     void convertVoice() {

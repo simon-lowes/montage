@@ -29,6 +29,8 @@ option(MONTAGE_WITH_OPENJPEG "IMF masters in the JPEG 2000 IMF profiles, when Op
 option(MONTAGE_WITH_OCIO "OpenColorIO configs and ACES transforms, when OpenColorIO 2.1+ is installed" ON)
 option(MONTAGE_WITH_ONNXRUNTIME "AI object masks (EdgeTAM), when ONNX Runtime 1.16+ is installed (ONNXRUNTIME_ROOT or the usual prefixes)" ON)
 option(MONTAGE_REQUIRE_ONNXRUNTIME "Fail to configure without ONNX Runtime (release builds)" OFF)
+option(MONTAGE_WITH_C2PA "Content Credentials (C2PA), when scripts/build-c2pa.sh has built c2pa-rs (C2PA_ROOT or /opt/c2pa)" ON)
+option(MONTAGE_REQUIRE_C2PA "Fail to configure without the C2PA library (release builds)" OFF)
 
 # Windows ships an older onnxruntime.dll of its own in System32, which the
 # loader finds before PATH: programs get a copy of ours beside them

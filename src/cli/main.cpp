@@ -24,6 +24,7 @@
 #include "core/History.h"
 #include "core/Interchange.h"
 #include "core/ProjectIO.h"
+#include "core/Provenance.h"
 #include "core/Transcript.h"
 #include "media/SpeechSearch.h"
 #include "media/TextReader.h"
@@ -53,6 +54,7 @@
 #include "media/Rife.h"
 #include "media/Matting.h"
 #include "media/TextToSpeech.h"
+#include "media/ContentCredentials.h"
 #include "media/VoiceClone.h"
 #include "media/Inpaint.h"
 #include "media/Transcriber.h"
@@ -111,6 +113,9 @@ int usage() {
                  "  montage-cli speak \"text\" -o voice.wav [--voice af_heart] [--speed 1]   (a voiceover from text; --phonemes prints them)\n"
                  "  montage-cli clone-speech \"text\" --voice sample.wav -o out.wav --consent [--language en] [--from S] [--to S]\n"
                  "              [--speed 1] [--exaggeration 0.5]   (in the voice of the sample, with its owner's consent; 23 languages)\n"
+                 "  montage-cli credentials <file> [--json]   (its Content Credentials: who signed it, intact or not, AI use)\n"
+                 "  montage-cli sign <file> --cert chain.pem --key key.pem [--project <project.montage>] [--allow-ai-training]\n"
+                 "              (Content Credentials: made in Montage, with the project's AI use and its sources' credentials)\n"
                  "  montage-cli convert-voice <speech> --voice sample.wav -o out.wav --consent [--from S] [--to S]\n"
                  "              [--voice-from S] [--voice-to S]   (the speech said again in the sample's voice, as long as it was)\n"
                  "  montage-cli script [--project <project.montage>] [--press <button> [--set id=value]...] <file.lua> [arg...]\n"
@@ -1238,6 +1243,61 @@ int cmdCloneSpeech(const std::vector<std::string>& args) {
     return 0;
 }
 
+// A file's Content Credentials.
+int cmdCredentials(const std::vector<std::string>& args) {
+    if (args.empty()) return usage();
+    const bool json = std::find(args.begin(), args.end(), "--json") != args.end();
+    CredentialSummary c;
+    std::string err;
+    if (!readContentCredentials(args[0], c, &err)) {
+        std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
+    }
+    if (json) {
+        std::printf("%s\n", c.json.c_str());
+        return 0;
+    }
+    if (!c.present) {
+        std::printf("No Content Credentials\n");
+        return 0;
+    }
+    std::printf("%s\n", credentialsLabel(c).c_str());
+    for (const std::string& a : c.actions) std::printf("  %s\n", a.c_str());
+    for (const std::string& p : c.problems) std::printf("  problem: %s\n", p.c_str());
+    return c.state == "Invalid" ? 2 : 0;
+}
+
+// Signs a file with Content Credentials, with a project's AI use and its sources' credentials.
+int cmdSign(const std::vector<std::string>& args) {
+    if (args.empty()) return usage();
+    CredentialSigner signer;
+    CredentialOptions o;
+    std::string project;
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (args[i] == "--cert" && i + 1 < args.size()) signer.certificatePath = args[++i];
+        else if (args[i] == "--key" && i + 1 < args.size()) signer.keyPath = args[++i];
+        else if (args[i] == "--algorithm" && i + 1 < args.size()) signer.algorithm = args[++i];
+        else if (args[i] == "--project" && i + 1 < args.size()) project = args[++i];
+        else if (args[i] == "--allow-ai-training") o.allowAiTraining = true;
+        else return usage();
+    }
+    if (signer.certificatePath.empty() || signer.keyPath.empty()) return usage();
+    Provenance made;
+    if (!project.empty()) {
+        Project p;
+        if (!load(project, p)) return 1;
+        if (const Sequence* s = p.active()) made = sequenceProvenance(p, *s);
+        o.sources = made.sources;
+    }
+    std::string err;
+    if (!signContentCredentials(args[0], made, signer, o, &err)) {
+        std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
+    }
+    std::printf("Signed %s (%zu AI uses noted)\n", args[0].c_str(), made.ai.size());
+    return 0;
+}
+
 // Says speech again in a voice cloned from a recording (Chatterbox's decoder), its words and timing kept, with the
 // voice's owner's consent.
 int cmdConvertVoice(const std::vector<std::string>& args) {
@@ -1456,6 +1516,8 @@ int main(int argc, char** argv) {
     if (cmd == "speak") return cmdSpeak(args);
     if (cmd == "clone-speech") return cmdCloneSpeech(args);
     if (cmd == "convert-voice") return cmdConvertVoice(args);
+    if (cmd == "credentials") return cmdCredentials(args);
+    if (cmd == "sign") return cmdSign(args);
     if (cmd == "script") return cmdScript(args);
     if (cmd == "mcp") {
 #ifdef MONTAGE_LIVE_BRIDGE

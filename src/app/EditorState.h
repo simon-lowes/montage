@@ -210,6 +210,9 @@ public:
     void message(const QString& text, int timeoutMs = 4000) { emit statusMessage(text, timeoutMs); }
     // Decodes the media's audio (and its waveform peaks) in the background; mediaReady follows.
     void startAudioDecode(const MediaItem& m);
+    // Reads and checks the Content Credentials in the media's file (media/ContentCredentials.h) in the background,
+    // setting its "c2pa" metadata to what they say ("" when it has none); projectChanged follows a change.
+    void startCredentialRead(const MediaItem& m);
     // The same for the channels clips have chosen (Clip::channels), each once.
     void startClipAudioDecodes();
     // Whether the media's file is missing (media/Relink.h), each file checked at most every two seconds, since

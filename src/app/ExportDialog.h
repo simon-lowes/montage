@@ -101,6 +101,12 @@ private:
     QComboBox* burnCorner_ = nullptr;
     QLineEdit* watermark_ = nullptr;
     QComboBox* watermarkCorner_ = nullptr;
+    // Content Credentials: signed with the editor's certificate (Settings "credentials/certificate" and "/key").
+    QCheckBox* credentials_ = nullptr;
+    QPushButton* credentialIdentity_ = nullptr;
+    QCheckBox* aiTraining_ = nullptr;
+    void chooseSigningIdentity();
+    void showSigningIdentity();
     QPushButton* queueButton_ = nullptr;
     RenderQueue* queue_ = nullptr;
     QLabel* summary_ = nullptr;

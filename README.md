@@ -368,7 +368,7 @@ ctest --test-dir build --output-on-failure
 ./build/src/montage-cli --help          # the command-line tool
 ```
 
-Optional libraries are used when found: OpenColorIO (OCIO transforms), lilv (LV2 plugins) and ONNX Runtime (object masks). `setup-deps.sh` installs all three; ONNX Runtime goes to `/opt/onnxruntime` from Microsoft's release archive (point `ONNXRUNTIME_ROOT` at another copy).
+Optional libraries are used when found: OpenColorIO (OCIO transforms), lilv (LV2 plugins) and ONNX Runtime (object masks). `setup-deps.sh` installs all three; ONNX Runtime goes to `/opt/onnxruntime` from Microsoft's release archive (point `ONNXRUNTIME_ROOT` at another copy). Content Credentials (C2PA signing and reading) need c2pa-rs: `scripts/build-c2pa.sh` (needs Rust's cargo) builds it into `/opt/c2pa` (or a prefix given, then `-DC2PA_ROOT=`).
 
 On macOS: `brew install qtbase qtmultimedia ffmpeg opencolorio lilv libraw openjpeg onnxruntime ninja pkgconf`, configure with `-DCMAKE_PREFIX_PATH="$(brew --prefix)"`, then `scripts/package-macos.sh build` makes the DMG. On Windows, build in an MSYS2 UCRT64 shell with the `qt6-base`, `qt6-multimedia`, `qt6-tools`, `ffmpeg`, `opencolorio`, `lilv`, `libraw`, `openjpeg2` and `onnxruntime` packages; `scripts/package-windows.sh build` makes the portable folder and zip, and `packaging/windows/montage.iss` (Inno Setup) the installer.
 

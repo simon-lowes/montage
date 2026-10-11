@@ -43,6 +43,8 @@
 #include "render/ClipPlacement.h"
 #include "audio/SpeechCleanup.h"
 #include "core/AafImport.h"
+#include "core/Provenance.h"
+#include "media/ContentCredentials.h"
 #include "media/Offload.h"
 #include "media/Proxy.h"
 #include "media/SpeechSearch.h"
@@ -693,6 +695,40 @@ void McpServer::Impl::addTools() {
             if (!probeMedia(absolute(need(a, "path")).toStdString(), m, &err)) return fail(QString::fromStdString(err));
             const QJsonObject o = mediaJson(m);
             return ok(json(o), o);
+        });
+
+    add("montage_read_credentials", "Read Content Credentials",
+        "Read and check a file's Content Credentials (C2PA): whether it has any, whether they are intact and who signed "
+        "them (state Trusted, Valid or Invalid, with the problems), the app or camera that made it, its actions, and whether "
+        "it says AI generated or changed it. `full` adds the whole manifest store as JSON.",
+        R"json({"type":"object","properties":{"path":{"type":"string","description":"Media file"},
+            "full":{"type":"boolean","default":false,"description":"Add the whole manifest store (manifest_store)"}},"required":["path"]})json", true,
+        [](const QJsonObject& a) {
+            const std::string path = absolute(need(a, "path")).toStdString();
+            if (!contentCredentialsAvailable()) return fail("This build of Montage cannot read Content Credentials (no C2PA library)");
+            if (!contentCredentialsFormat(path)) return fail("Content Credentials cannot be in this kind of file");
+            CredentialSummary c;
+            std::string err;
+            if (!readContentCredentials(path, c, &err)) return fail(QString::fromStdString(err));
+            auto list = [](const std::vector<std::string>& v) {
+                QJsonArray out;
+                for (const std::string& x : v) out.append(QString::fromStdString(x));
+                return out;
+            };
+            QJsonObject o{{"present", c.present}};
+            if (c.present) {
+                o["state"] = QString::fromStdString(c.state);
+                o["issuer"] = QString::fromStdString(c.issuer);
+                o["signed_at"] = QString::fromStdString(c.signedAt);
+                o["generator"] = QString::fromStdString(c.generator);
+                o["title"] = QString::fromStdString(c.title);
+                o["actions"] = list(c.actions);
+                o["ai_generated"] = c.aiGenerated;
+                o["problems"] = list(c.problems);
+                o["label"] = QString::fromStdString(credentialsLabel(c));
+                if (a.value("full").toBool()) o["manifest_store"] = QJsonDocument::fromJson(QByteArray::fromStdString(c.json)).object();
+            }
+            return ok(c.present ? QString::fromStdString(credentialsLabel(c)) : QStringLiteral("No Content Credentials"), o);
         });
 
     add("montage_offload", "Offload a camera card",
@@ -6694,6 +6730,10 @@ void McpServer::Impl::addTools() {
             "audio_name":{"type":"string","description":"The mix stream's title"},"audio_language":{"type":"string","description":"The mix stream's language (ISO 639-1)"},
             "start_timecode":{"type":"string","description":"The file's starting timecode (MXF and MOV), e.g. 10:00:00:00 as broadcasters ask"},
             "mono_tracks":{"type":"integer","description":"Write the mix (then each audio stream) as mono tracks, padded with silence to this many, as broadcast MXF takes it; the MXF presets set 8, 4 or 2"},
+            "credentials":{"type":"object","description":"Sign it with Content Credentials (C2PA, as Premiere does): a signed record in the file that Montage made it, each AI model that generated or changed what is in the range, and the credentials its sources carried. MP4, MOV, WAV, MP3, JPEG, PNG and TIFF",
+                "properties":{"certificate":{"type":"string","description":"The signing certificate chain (PEM, the signing certificate first; issued by a certificate authority, for digital signatures with e-mail protection or document signing use)"},
+                    "key":{"type":"string","description":"Its private key (PEM)"},
+                    "allow_ai_training":{"type":"boolean","default":false,"description":"false: the credentials ask that it not be used to train AI models"}},"required":["certificate","key"]},
             "stereo_view":{"type":"string","enum":["sbs","sbs_half","tb","tb_half","left","right","anaglyph"],"default":"sbs","description":"A stereoscopic 3D sequence: the eyes side by side or top and bottom (full size, or squeezed into one frame), or one picture"}},
             "required":["project","output"]})json",
         false, [this](const QJsonObject& a) {
@@ -6785,6 +6825,16 @@ void McpServer::Impl::addTools() {
             const QString stems = str(a, "stems", "none");
             if (stems != "none" && stems != "tracks" && stems != "buses" && stems != "roles")
                 throw ArgError{"\"stems\" must be none, tracks, buses or roles"};
+            if (a.value("credentials").isObject()) {
+                const QJsonObject c = a.value("credentials").toObject();
+                st.credentialCertificate = absolute(need(c, "certificate")).toStdString();
+                st.credentialKey = absolute(need(c, "key")).toStdString();
+                st.credentialAllowAiTraining = c.value("allow_ai_training").toBool();
+                if (!contentCredentialsAvailable()) throw ArgError{"This build of Montage cannot sign with Content Credentials (no C2PA library)"};
+                if (!contentCredentialsFormat(st.path)) throw ArgError{"Content Credentials cannot go in this kind of file (mp4, mov, wav, mp3, jpg, png, tif can hold them)"};
+                std::string why;
+                if (!checkCredentialSigner({st.credentialCertificate, st.credentialKey, {}}, &why)) return fail(QString::fromStdString(why));
+            }
             std::string err;
             LightLevels light;
             if (!exportSequence(l.project, s, st, [this](double f, FrameTime) { progress(f, "Rendering"); }, nullptr, &err, nullptr, nullptr, &light))
@@ -6798,6 +6848,17 @@ void McpServer::Impl::addTools() {
                 text += carriage == "video" ? QStringLiteral("\nHDR10+ metadata in the video, and beside it as .hdr10plus.json")
                         : carriage == "json" ? QStringLiteral("\nHDR10+ metadata beside it as .hdr10plus.json (this codec cannot carry it)")
                                              : QStringLiteral("\nNo HDR10+ metadata: it is for PQ (HDR10) video");
+            }
+            if (!st.credentialCertificate.empty()) {
+                // What the credentials say it was made with (core/Provenance.h).
+                const Provenance made = sequenceProvenance(l.project, s, st.in, st.out);
+                QJsonArray ai;
+                for (const AiUse& u : made.ai)
+                    ai.append(QJsonObject{{"feature", QString::fromStdString(u.feature)}, {"model", QString::fromStdString(u.model)},
+                                          {"role", u.role == AiRole::Generated ? "generated" : u.role == AiRole::Enhanced ? "enhanced" : "assisted"}});
+                o["credentials"] = QJsonObject{{"signed", true}, {"ai", ai}};
+                text += made.ai.empty() ? QStringLiteral("\nSigned with Content Credentials (no AI recorded)")
+                                        : QStringLiteral("\nSigned with Content Credentials, recording %1 AI use%2").arg(made.ai.size()).arg(made.ai.size() == 1 ? "" : "s");
             }
             if (light.frames > 0) {  // HDR: what was rendered, measured
                 unsigned cll = 0, fall = 0;

@@ -46,6 +46,7 @@
 #include "core/TimelineCompare.h"
 #include "core/Reconform.h"
 #include "core/Adr.h"
+#include "core/Provenance.h"
 #include "core/AudioDescription.h"
 #include <QProcess>
 #include <QSysInfo>
@@ -6981,6 +6982,91 @@ private slots:
         QVERIFY(clipById(fx.s(), clip)->takes.empty());
         QCOMPARE(clipById(fx.s(), clip)->mediaId, b);
         QVERIFY(!cycleTake(fx.p, fx.s(), clip, 1).ok);
+    }
+
+    void provenanceForCredentials() {
+        // A plain cut: its file, no AI.
+        Fixture fx;
+        const Id a = fx.put(V1, 0, 30), b = fx.put(V1, 30, 30);
+        Provenance made = sequenceProvenance(fx.p, fx.s());
+        QCOMPARE(made.sources, std::vector<std::string>{"/nonexistent/clip.mov"});
+        QVERIFY(made.ai.empty() && !made.generated());
+
+        // Object removal generates; Super Scale enhances; a people mask only assists. Each once.
+        clipById(fx.s(), a)->effects.push_back(makeEffect(fx.p, "object_removal"));
+        clipById(fx.s(), a)->effects.push_back(makeEffect(fx.p, "object_removal"));
+        clipById(fx.s(), b)->effects.push_back(makeEffect(fx.p, "super_scale"));
+        Effect masked = makeEffect(fx.p, "gaussian_blur");
+        masked.params["mask.shape"] = Param(4);
+        clipById(fx.s(), b)->effects.push_back(masked);
+        made = sequenceProvenance(fx.p, fx.s());
+        QCOMPARE(made.ai.size(), size_t(3));
+        QCOMPARE(made.ai[0], (AiUse{"Object Removal", "LaMa", AiRole::Generated}));
+        QCOMPARE(made.ai[1], (AiUse{"Super Scale", "Real-ESRGAN", AiRole::Enhanced}));
+        QCOMPARE(made.ai[2], (AiUse{"People Matte", "MODNet", AiRole::Assisted}));
+        QVERIFY(made.generated());
+        QVERIFY(QString::fromStdString(iptcSourceType(AiRole::Generated)).endsWith("compositeWithTrainedAlgorithmicMedia"));
+        QVERIFY(QString::fromStdString(iptcSourceType(AiRole::Enhanced)).endsWith("algorithmicallyEnhanced"));
+        QVERIFY(iptcSourceType(AiRole::Assisted).empty());
+
+        // Only what the range exports counts, and a turned-off effect or clip does not.
+        made = sequenceProvenance(fx.p, fx.s(), 30, 59);
+        QCOMPARE(made.ai.size(), size_t(2));
+        QCOMPARE(made.ai[0].feature, std::string("Super Scale"));
+        clipById(fx.s(), b)->effects[0].enabled = false;
+        clipById(fx.s(), a)->enabled = false;
+        made = sequenceProvenance(fx.p, fx.s());
+        QCOMPARE(made.ai.size(), size_t(1));
+        QCOMPARE(made.ai[0].feature, std::string("People Matte"));
+
+        // AI frames for slow motion generate pictures.
+        clipById(fx.s(), b)->timing = makeEffect(fx.p, "time");
+        clipById(fx.s(), b)->timing.params["sampling"] = Param(3);
+        made = sequenceProvenance(fx.p, fx.s());
+        QVERIFY(std::find(made.ai.begin(), made.ai.end(), AiUse{"AI Frames", "RIFE", AiRole::Generated}) != made.ai.end());
+
+        // Speech made by a model, through a nested sequence: generated, converted or cloned, from the media's note.
+        Fixture n;
+        Sequence inner = n.s();
+        inner.id = n.p.newId();
+        inner.videoTracks.assign(1, Track{}), inner.audioTracks.assign(1, Track{});
+        const char* notes[] = {"Spoken by Kokoro voice af_heart", "Speech converted to a voice cloned from narrator.wav",
+                               "Spoken in a voice cloned from narrator.wav"};
+        for (const char* note : notes) {
+            MediaItem m;
+            m.id = n.p.newId();
+            m.kind = MediaKind::Audio;
+            m.path = std::string("/nonexistent/") + std::to_string(m.id) + ".wav";
+            m.duration = 2;
+            m.hasAudio = true;
+            m.keywords = {"AI voice"};
+            m.metadata["comment"] = note;
+            n.p.media.push_back(m);
+            Clip c = makeClip(n.p, m, TrackKind::Audio, inner);
+            c.start = inner.audioTracks[0].clips.empty() ? 0 : inner.audioTracks[0].clips.back().end();
+            inner.audioTracks[0].clips.push_back(c);
+        }
+        n.p.sequences.push_back(inner);
+        MediaItem nest;
+        nest.id = n.p.newId();
+        nest.kind = MediaKind::Sequence;
+        nest.sequenceId = inner.id;
+        nest.hasAudio = true;
+        n.p.media.push_back(nest);
+        Clip c = makeClip(n.p, nest, TrackKind::Audio, n.s());
+        n.a1().clips.push_back(c);
+        made = sequenceProvenance(n.p, n.s());
+        QCOMPARE(made.ai.size(), size_t(3));
+        QCOMPARE(made.ai[0].feature, std::string("Generated Speech"));
+        QCOMPARE(made.ai[1].feature, std::string("Voice Conversion"));
+        QCOMPARE(made.ai[2].feature, std::string("Cloned Voice"));
+        QCOMPARE(made.sources.size(), size_t(3));
+
+        // The bin shows what a file's credentials said, read on import.
+        MediaItem signedFile;
+        signedFile.metadata["c2pa"] = "Signed by Sony Corporation (valid)";
+        QVERIFY(mediaField("c2pa") && !mediaField("c2pa")->editable);
+        QCOMPARE(mediaFieldText(signedFile, "c2pa"), std::string("Signed by Sony Corporation (valid)"));
     }
 
     void convertedVoiceTakes() {

@@ -111,6 +111,12 @@ struct ExportSettings {
     std::string startTimecode;
     // With embedCaptions, these caption tracks too, each as its own subtitle stream (every language at once).
     std::vector<Id> extraCaptions;
+    // Content Credentials (media/ContentCredentials.h): the file signed with this certificate chain and key (PEM),
+    // saying Montage made it, how AI was used in the range exported, and carrying its sources' own credentials. Empty =
+    // not signed. An export that cannot be signed (a format that cannot hold them, a refused certificate) fails, leaving
+    // no file.
+    std::string credentialCertificate, credentialKey;
+    bool credentialAllowAiTraining = false;
 };
 
 struct ExportPreset {
