@@ -928,6 +928,12 @@ private slots:
                 if (it->address == address) return static_cast<const osc::Message*>(&*it);
             return static_cast<const osc::Message*>(nullptr);
         };
+        // Everything waiting read and forgotten (so a check sees only what comes after).
+        auto drain = [&] {
+            QTest::qWait(30);
+            received("");
+            heard.clear();
+        };
         auto* program = win_->findChild<PlaybackController*>("programPlayback");
         const Rational fps = state()->sequence()->fps;
         // Over the network socket: go to a timecode, play (a button's release, 0, does nothing), stop; feedback back.
@@ -942,8 +948,42 @@ private slots:
         QTRY_VERIFY(received("/montage/state/playing") && received("/montage/state/playing")->args.at(0).i == 1);
         sendOsc({"/montage/stop", {}});
         QTRY_VERIFY(!program->isPlaying());
+        // TouchOSC's buttons send 1.0 then 0.0: one toggle, not two.
+        QVERIFY(osc->handle({"/montage/playpause", {osc::float32(1.0f)}}) && program->isPlaying());
+        QVERIFY(osc->handle({"/montage/playpause", {osc::float32(0.0f)}}) && program->isPlaying());
+        QVERIFY(osc->handle({"/montage/stop", {}}) && !program->isPlaying());
+        drain();
         sendOsc({"/montage/nowhere", {}});
         QTRY_VERIFY(received("/montage/error"));
+        // Its own feedback addresses are never answered (another Montage's, or its own sent back).
+        drain();
+        QVERIFY(osc->handle({"/montage/state/playing", {osc::int32(1)}}) && osc->handle({"/montage/error", {osc::string("x")}}));
+        QTest::qWait(50);
+        QVERIFY(!received("/montage/error"));
+        // A new feedback port gets the whole state at once, without waiting for it to change.
+        QUdpSocket other;
+        QVERIFY(other.bind(QHostAddress::LocalHost, 0));
+        osc->setFeedbackPort(other.localPort());
+        QTRY_VERIFY(other.hasPendingDatagrams());
+        std::vector<osc::Message> got;
+        QTRY_VERIFY_WITH_TIMEOUT([&] {
+            while (other.hasPendingDatagrams()) {
+                QByteArray d(int(other.pendingDatagramSize()), '\0');
+                other.readDatagram(d.data(), d.size());
+                osc::parse(std::string(d.constData(), size_t(d.size())), got);
+            }
+            int states = 0;
+            for (const osc::Message& m : got) states += m.address.rfind("/montage/state/", 0) == 0;
+            return states >= 3;
+        }(), 2000);
+        osc->setFeedbackPort(sender.localPort());
+        // A feedback port pointed back at the port it listens on: nothing answers itself (the window stays free).
+        QSignalSpy handled(osc, &OscControl::handled);
+        osc->setFeedbackPort(osc->port());
+        sendOsc({"/montage/nowhere", {}});
+        QTest::qWait(300);
+        QVERIFY(handled.size() < 5);
+        osc->setFeedbackPort(sender.localPort());
         // Seconds, steps, start and end, In and Out, loop on and off.
         QVERIFY(osc->handle({"/montage/goto", {osc::float32(1.0f)}}));
         QCOMPARE(state()->playhead(), FrameTime(fps.num / fps.den));
@@ -981,6 +1021,9 @@ private slots:
         QVERIFY(osc->handle({"/montage/track/2/volume", {osc::float32(-6)}}));
         QCOMPARE(track(1).volumeDb, -6.0);
         QCOMPARE(int(state()->history().undoCount()), steps + 1);
+        // Held a moment as a hand holds it (so Touch and Latch passes write the move), then let go.
+        QVERIFY(mixer->trackFader(1)->isSliderDown());
+        QTRY_VERIFY_WITH_TIMEOUT(!mixer->trackFader(1)->isSliderDown(), 3000);
         QVERIFY(osc->handle({"/montage/track/1/mute", {osc::int32(1)}}) && track(0).muted);
         QVERIFY(osc->handle({"/montage/track/1/mute", {osc::int32(1)}}) && track(0).muted);  // (set, not toggled)
         QVERIFY(osc->handle({"/montage/track/1/mute", {}}) && !track(0).muted);            // (no value: toggled)
@@ -989,24 +1032,33 @@ private slots:
         QCOMPARE(state()->sequence()->masterVolumeDb, -3.0);
         QVERIFY(!osc->handle({"/montage/track/9/volume", {osc::int32(0)}}, QHostAddress::LocalHost, &err) && err.contains("track"));
         QVERIFY(!osc->handle({"/montage/track/1/volume", {osc::string("loud")}}, QHostAddress::LocalHost, &err));
-        // An agent tool on the open project: one undo step named after it, its answer sent back.
-        heard.clear();
+        // Agent tools: off until allowed; then on the open project only, one undo step named after each, the answer sent back.
+        QVERIFY(!osc->handle({"/montage/tool/add_marker", {osc::string(R"({"at": 4})")}}, QHostAddress::LocalHost, &err) && err.contains("off"));
+        osc->setToolsAllowed(true);
+        QVERIFY(!osc->handle({"/montage/tool/add_marker", {osc::string(R"({"at": 4, "project": "/elsewhere.montage"})")}}, QHostAddress::LocalHost, &err) &&
+                err.contains("open project"));
+        QVERIFY(!osc->handle({"/montage/tool/undo", {}}, QHostAddress::LocalHost, &err) && err.contains("/montage/undo"));
+        drain();
         sendOsc({"/montage/tool/add_marker", {osc::string(R"({"at": 4, "name": "From OSC"})")}});
         QTRY_VERIFY(std::any_of(state()->sequence()->markers.begin(), state()->sequence()->markers.end(),
                                 [](const Marker& m) { return m.name == "From OSC"; }));
         QCOMPARE(QString::fromStdString(state()->history().undoLabel()), QString("OSC: add_marker"));
         QTRY_VERIFY(received("/montage/reply/add_marker"));
         QVERIFY(!osc->handle({"/montage/tool/add_marker", {osc::string("not json")}}, QHostAddress::LocalHost, &err) && err.contains("JSON"));
-        heard.clear();
+        drain();
         sendOsc({"/montage/tool/add_marker", {osc::string(R"({"at": "never"})")}});
         QTRY_VERIFY(received("/montage/error"));
+        QVERIFY2(QString::fromStdString(received("/montage/error")->args.at(0).s).contains("at"), received("/montage/error")->args.at(0).s.c_str());
+        osc->setToolsAllowed(false);
         // A malformed packet is answered with an error and nothing done.
-        heard.clear();
+        drain();
         sender.writeDatagram("bad!", 4, QHostAddress::LocalHost, osc->port());
         QTRY_VERIFY(received("/montage/error"));
+        QVERIFY(QString::fromStdString(received("/montage/error")->args.at(0).s).contains("address"));  // ("bad!" is a word, but no address)
         // The settings: in the Control Surface dialog, with every address listed.
         QDialog* dlg = win_->controlSurfaceDialog();
         QVERIFY(dlg->findChild<QCheckBox*>("oscEnabled")->isChecked());
+        QVERIFY(dlg->findChild<QCheckBox*>("oscTools") && !dlg->findChild<QCheckBox*>("oscTools")->isChecked());
         QVERIFY(dlg->findChild<QLabel*>("oscStatus")->text().contains(QString::number(osc->port())));
         dlg->findChild<QPushButton*>("oscAddresses")->click();
         auto* list = dlg->findChild<QDialog*>("oscAddressList");

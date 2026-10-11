@@ -432,8 +432,12 @@ void MainWindow::buildPanels() {
         osc_->setCommand(QString::fromLatin1(name), fn);
     }
     osc_->setFeedbackPort(quint16(appSettings().value(QStringLiteral("osc/feedbackPort"), 0).toInt()));
-    if (appSettings().value(QStringLiteral("osc/enabled"), false).toBool())
-        osc_->start(quint16(appSettings().value(QStringLiteral("osc/port"), 9100).toInt()), appSettings().value(QStringLiteral("osc/network"), false).toBool());
+    osc_->setToolsAllowed(appSettings().value(QStringLiteral("osc/tools"), false).toBool());
+    if (appSettings().value(QStringLiteral("osc/enabled"), false).toBool()) {
+        QString err;
+        if (!osc_->start(quint16(appSettings().value(QStringLiteral("osc/port"), 9100).toInt()), appSettings().value(QStringLiteral("osc/network"), false).toBool(), &err))
+            QTimer::singleShot(0, this, [this, err] { state_->message(tr("OSC: %1").arg(err), 8000); });  // (once the window is up)
+    }
     surface_->setProtocol(appSettings().value(QStringLiteral("controlSurface/protocol")).toString() == QLatin1String("hui")
                               ? SurfaceProtocol::Hui
                               : SurfaceProtocol::MackieControl);
@@ -5591,7 +5595,6 @@ QDialog* MainWindow::controlSurfaceDialog() {
     connect(disconnectButton, &QPushButton::clicked, surface_, &ControlSurface::disconnectSurface);
     connect(atStart, &QCheckBox::toggled, this, [](bool on) { appSettings().setValue(QStringLiteral("controlSurface/connect"), on); });
     connect(buttons, &QDialogButtonBox::rejected, dlg, &QDialog::close);
-    form->addRow(buttons);
     // OSC: Stream Deck, Loupedeck and X-keys through Bitfocus Companion's generic OSC connection, TouchOSC, QLab...
     auto* oscBox = new QGroupBox(tr("OSC (Stream Deck, Loupedeck, X-keys through Bitfocus Companion; TouchOSC; QLab)"), dlg);
     auto* oscForm = new QFormLayout(oscBox);
@@ -5611,7 +5614,13 @@ QDialog* MainWindow::controlSurfaceDialog() {
     auto* oscNetwork = new QCheckBox(tr("Accept messages from other computers"), oscBox);
     oscNetwork->setObjectName(QStringLiteral("oscNetwork"));
     oscNetwork->setChecked(appSettings().value(QStringLiteral("osc/network"), false).toBool());
-    oscNetwork->setToolTip(tr("Otherwise only this computer can send (anyone on the network could edit the open project)"));
+    oscNetwork->setToolTip(tr("Otherwise only this computer can send. Anyone on the network could then play, edit with menu "
+                              "commands and, if allowed, run agent tools"));
+    auto* oscTools = new QCheckBox(tr("Allow agent tools (/montage/tool/...)"), oscBox);
+    oscTools->setObjectName(QStringLiteral("oscTools"));
+    oscTools->setChecked(osc_->toolsAllowed());
+    oscTools->setToolTip(tr("Any program that can send to the port could then run Montage's agent tools on the open project, "
+                            "including ones that write files (renders, exports)"));
     auto* oscStatus = new QLabel(oscBox);
     oscStatus->setObjectName(QStringLiteral("oscStatus"));
     oscStatus->setWordWrap(true);
@@ -5621,6 +5630,7 @@ QDialog* MainWindow::controlSurfaceDialog() {
     oscForm->addRow(tr("Port:"), oscPort);
     oscForm->addRow(tr("Feedback port:"), oscFeedback);
     oscForm->addRow(oscNetwork);
+    oscForm->addRow(oscTools);
     oscForm->addRow(oscStatus);
     oscForm->addRow(oscAddresses);
     form->addRow(oscBox);
@@ -5628,14 +5638,22 @@ QDialog* MainWindow::controlSurfaceDialog() {
         oscStatus->setText(osc_->isRunning() ? tr("Listening on port %1.").arg(osc_->port()) : tr("Not listening."));
     };
     showOsc();
-    auto applyOsc = [this, oscOn, oscPort, oscNetwork, oscStatus, showOsc] {
-        appSettings().setValue(QStringLiteral("osc/enabled"), oscOn->isChecked());
+    auto applyOsc = [this, oscOn, oscPort, oscNetwork, oscStatus, oscFeedback, showOsc] {
         appSettings().setValue(QStringLiteral("osc/port"), oscPort->value());
         appSettings().setValue(QStringLiteral("osc/network"), oscNetwork->isChecked());
         QString err;
+        if (oscOn->isChecked() && oscFeedback->value() == oscPort->value()) err = tr("The feedback port must differ from the port listened on.");
         if (!oscOn->isChecked()) osc_->stop();
-        else if (!osc_->start(quint16(oscPort->value()), oscNetwork->isChecked(), &err)) return oscStatus->setText(err);
+        else if (err.isEmpty()) osc_->start(quint16(oscPort->value()), oscNetwork->isChecked(), &err);
+        if (!err.isEmpty()) {
+            // Not listening: said, and not tried again at the next start.
+            const QSignalBlocker block(oscOn);
+            oscOn->setChecked(false);
+            osc_->stop();
+        }
+        appSettings().setValue(QStringLiteral("osc/enabled"), oscOn->isChecked());
         showOsc();
+        if (!err.isEmpty()) oscStatus->setText(err);
     };
     connect(oscOn, &QCheckBox::toggled, dlg, applyOsc);
     connect(oscNetwork, &QCheckBox::toggled, dlg, [oscOn, applyOsc] {
@@ -5644,9 +5662,15 @@ QDialog* MainWindow::controlSurfaceDialog() {
     connect(oscPort, &QSpinBox::editingFinished, dlg, [oscOn, applyOsc] {
         if (oscOn->isChecked()) applyOsc();
     });
-    connect(oscFeedback, &QSpinBox::valueChanged, dlg, [this](int port) {
+    connect(oscFeedback, &QSpinBox::valueChanged, dlg, [this, oscPort, oscStatus, showOsc](int port) {
+        if (port != 0 && port == oscPort->value()) return oscStatus->setText(tr("The feedback port must differ from the port listened on."));
         osc_->setFeedbackPort(quint16(port));
         appSettings().setValue(QStringLiteral("osc/feedbackPort"), port);
+        showOsc();
+    });
+    connect(oscTools, &QCheckBox::toggled, dlg, [this](bool on) {
+        osc_->setToolsAllowed(on);
+        appSettings().setValue(QStringLiteral("osc/tools"), on);
     });
     connect(oscAddresses, &QPushButton::clicked, dlg, [this, dlg] {
         // Every address, to copy into Companion's buttons.
@@ -5677,6 +5701,7 @@ QDialog* MainWindow::controlSurfaceDialog() {
         list->resize(760, 520);
         list->show();
     });
+    form->addRow(buttons);
     dlg->show();
     return dlg;
 }

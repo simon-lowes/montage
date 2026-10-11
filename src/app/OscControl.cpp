@@ -1,7 +1,9 @@
 #include "OscControl.h"
 
 #include <QAction>
+#include <QDateTime>
 #include <QDial>
+#include <QPointer>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -69,24 +71,48 @@ bool OscControl::isRunning() const { return socket_ != nullptr; }
 quint16 OscControl::port() const { return socket_ ? socket_->localPort() : 0; }
 
 void OscControl::readPending() {
-    while (socket_ && socket_->hasPendingDatagrams()) {
+    // A few hundred at a time, then back to the event loop (a flood cannot hold the window).
+    for (int n = 0; n < 256 && socket_ && socket_->hasPendingDatagrams(); ++n) {
         const QNetworkDatagram d = socket_->receiveDatagram();
+        // (Its own datagrams, should a feedback port point back at it, are not read as messages.)
+        if (d.senderPort() == socket_->localPort() && (d.senderAddress().isLoopback() || d.senderAddress() == socket_->localAddress())) continue;
         std::vector<osc::Message> messages;
         std::string err;
         const QByteArray data = d.data();
         if (!osc::parse(std::string(data.constData(), size_t(data.size())), messages, &err)) {
-            peer_ = d.senderAddress();
-            send({"/montage/error", {osc::string(err)}});
+            send({"/montage/error", {osc::string(err)}}, d.senderAddress());  // (answered, not taken as the feedback peer)
             continue;
         }
         for (const osc::Message& m : messages) handle(m, d.senderAddress());
     }
+    if (socket_ && socket_->hasPendingDatagrams()) QTimer::singleShot(0, this, &OscControl::readPending);
 }
 
-void OscControl::send(const osc::Message& m) {
-    if (!socket_ || !feedbackPort_ || peer_.isNull()) return;
+void OscControl::setFeedbackPort(quint16 port) {
+    if (port != feedbackPort_) playingSent_ = loopSent_ = -1, timecodeSent_.clear();  // (everything again to the new port)
+    feedbackPort_ = port;
+}
+
+void OscControl::send(const osc::Message& m) { send(m, peer_); }
+
+void OscControl::send(const osc::Message& m, const QHostAddress& to) {
+    if (!socket_ || !feedbackPort_ || to.isNull()) return;
+    if (feedbackPort_ == socket_->localPort() && (to.isLoopback() || to == socket_->localAddress())) return;  // (not to itself)
     const std::string bytes = osc::encode(m);
-    socket_->writeDatagram(bytes.data(), qint64(bytes.size()), peer_, feedbackPort_);
+    socket_->writeDatagram(bytes.data(), qint64(bytes.size()), to, feedbackPort_);
+}
+
+void OscControl::hold(QAbstractSlider* control) {
+    if (!control) return;
+    control->setSliderDown(true);
+    heldUntil_[control] = QDateTime::currentMSecsSinceEpoch() + 1000;
+    QPointer<QAbstractSlider> guard(control);
+    QTimer::singleShot(1050, this, [this, guard, control] {
+        const auto it = heldUntil_.find(control);
+        if (it == heldUntil_.end() || QDateTime::currentMSecsSinceEpoch() < it->second) return;  // (moved again since)
+        heldUntil_.erase(it);
+        if (guard && guard->isSliderDown()) guard->setSliderDown(false);
+    });
 }
 
 void OscControl::sendFeedback() {
@@ -131,6 +157,15 @@ bool OscControl::command(const QString& name, QString* error) {
 }
 
 bool OscControl::runTool(const QString& name, const osc::Message& m, QString* error) {
+    // Off unless allowed: any program that can send to the port could otherwise run them.
+    if (!toolsAllowed_) {
+        if (error) *error = tr("agent tools over OSC are off (Edit › Control Surface… › OSC › Allow agent tools)");
+        return false;
+    }
+    if (name == QLatin1String("undo") || name == QLatin1String("montage_undo")) {
+        if (error) *error = tr("use /montage/undo");
+        return false;
+    }
     QJsonObject args;
     if (!m.args.empty()) {
         const QByteArray json = QByteArray::fromStdString(m.args.front().text());
@@ -141,29 +176,42 @@ bool OscControl::runTool(const QString& name, const osc::Message& m, QString* er
             return false;
         }
         args = doc.object();
+        // On the open project only (a "project" argument would edit another file, outside undo).
+        if (args.contains("project")) {
+            if (error) *error = tr("over OSC, tools work on the open project: leave out \"project\"");
+            return false;
+        }
     }
     const QString tool = name.startsWith(QLatin1String("montage_")) ? name : QStringLiteral("montage_") + name;
     const QJsonObject msg{{"jsonrpc", "2.0"}, {"id", ++calls_}, {"method", "tools/call"}, {"params", QJsonObject{{"name", tool}, {"arguments", args}}}};
-    // One undo step for the call, its answer sent back when it comes (the window stays free meanwhile).
+    // One undo step for the call, its answer sent back to whoever asked when it comes (the window stays free meanwhile).
     const QString reply = QStringLiteral("/montage/reply/") + name;
-    link_->handleScript(compact(msg), [this, reply](QByteArray answer) {
+    const QHostAddress asker = peer_;
+    QPointer<OscControl> self(this);
+    link_->handleScript(compact(msg), [self, reply, asker](QByteArray answer) {
+        if (!self) return;
         const QJsonObject r = QJsonDocument::fromJson(answer).object();
         QString text;
         if (r.contains("error")) {
             text = r.value("error").toObject().value("message").toString();
-            send({"/montage/error", {osc::string(text.toStdString())}});
+            self->send({"/montage/error", {osc::string(text.toStdString())}}, asker);
             return;
         }
         const QJsonObject result = r.value("result").toObject();
         for (const QJsonValue& c : result.value("content").toArray()) text += c.toObject().value("text").toString();
-        send({result.value("isError").toBool() ? std::string("/montage/error") : reply.toStdString(), {osc::string(text.toStdString())}});
+        self->send({result.value("isError").toBool() ? std::string("/montage/error") : reply.toStdString(), {osc::string(text.toStdString())}}, asker);
     }, tr("OSC: %1").arg(name), QStringLiteral("osc-%1").arg(calls_));
     return true;
 }
 
 bool OscControl::handle(const osc::Message& m, const QHostAddress& from, QString* error) {
-    peer_ = from;
     const QString address = QString::fromStdString(m.address);
+    // Montage's own feedback (another Montage's, or its own sent back): never answered.
+    if (address.startsWith(QLatin1String("/montage/state/")) || address.startsWith(QLatin1String("/montage/reply/")) ||
+        address == QLatin1String("/montage/error"))
+        return true;
+    if (from != peer_) playingSent_ = loopSent_ = -1, timecodeSent_.clear();  // (a new receiver gets everything)
+    peer_ = from;
     QString err;
     auto fail = [&](const QString& e) {
         err = e;
@@ -171,7 +219,8 @@ bool OscControl::handle(const osc::Message& m, const QHostAddress& from, QString
     };
     auto arg = [&](size_t i) -> const osc::Value* { return i < m.args.size() ? &m.args[i] : nullptr; };
     // A button press sends 1 and its release 0 (Companion, TouchOSC): a release does nothing.
-    const bool released = !m.args.empty() && (m.args.front().type == 'F' || (m.args.front().type == 'i' && m.args.front().i == 0)) &&
+    const bool zeroArg = !m.args.empty() && std::string("ihfdTF").find(m.args.front().type) != std::string::npos && m.args.front().number() == 0;
+    const bool released = zeroArg &&
                           !address.contains(QLatin1String("/track/")) && !address.startsWith(QLatin1String("/montage/master/")) &&
                           !address.startsWith(QLatin1String("/montage/command/")) &&
                           address != QLatin1String("/montage/loop") && address != QLatin1String("/montage/shuttle") &&
@@ -259,7 +308,7 @@ bool OscControl::handle(const osc::Message& m, const QHostAddress& from, QString
                 if (a->isEnabled()) break;
             }
         }
-        const bool zero = arg(0) && (arg(0)->type == 'F' || ((arg(0)->type == 'i' || arg(0)->type == 'f') && arg(0)->number() == 0));
+        const bool zero = zeroArg;
         if (!found) ok = fail(tr("No menu command at %1").arg(address));
         else if (!found->isEnabled()) ok = fail(tr("%1 is not available now").arg(keymap::idOf(found)));
         else if (found->isCheckable() && arg(0) && arg(0)->type != 'N') {
@@ -288,7 +337,7 @@ bool OscControl::handle(const osc::Message& m, const QHostAddress& from, QString
             const double v = arg(0) ? arg(0)->number(&n) : 0;
             if (what == QLatin1String("volume")) {
                 if (!n) ok = fail(tr("%1 takes decibels").arg(address));
-                else fader->setValue(int(std::lround(std::clamp(v, -60.0, 12.0) * 10)));
+                else hold(fader), fader->setValue(int(std::lround(std::clamp(v, -60.0, 12.0) * 10)));
             } else if (!master && (what == QLatin1String("mute") || what == QLatin1String("solo"))) {
                 QToolButton* b = what == QLatin1String("mute") ? mixer_->trackMute(track) : mixer_->trackSolo(track);
                 if (!b) {
@@ -301,7 +350,7 @@ bool OscControl::handle(const osc::Message& m, const QHostAddress& from, QString
                 QDial* pan = mixer_->trackPan(track);
                 if (!n) ok = fail(tr("%1 takes -1 (left) to 1 (right)").arg(address));
                 else if (!pan || !pan->isVisibleTo(mixer_)) ok = fail(tr("Track %1 pans in two dimensions").arg(track + 1));
-                else pan->setValue(int(std::lround(std::clamp(v, -1.0, 1.0) * 100)));
+                else hold(pan), pan->setValue(int(std::lround(std::clamp(v, -1.0, 1.0) * 100)));
             } else {
                 ok = fail(tr("No mixer control at %1").arg(address));
             }
