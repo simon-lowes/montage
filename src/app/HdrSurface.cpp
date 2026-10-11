@@ -1,11 +1,12 @@
 #include "HdrSurface.h"
 
+#include <QGuiApplication>
+
 #ifdef MONTAGE_HDR_VIEWER
 #include <QContextMenuEvent>
 #include <QCoreApplication>
 #include <QDropEvent>
 #include <QExposeEvent>
-#include <QGuiApplication>
 #include <QMouseEvent>
 #include <QPlatformSurfaceEvent>
 #include <QWheelEvent>
@@ -159,11 +160,10 @@ bool HdrSurface::probe(QString* why) {
         g.rhi.reset(QRhi::create(QRhi::Null, &params));
     } else {
 #if defined(Q_OS_MACOS) || defined(Q_OS_WIN)
-        // The swap chain draws into the window's own layer (an NSView's, an HWND's), which only the system's windows
-        // have: Qt's offscreen platform (the tests') hands out stand-in ids, and Metal crashes on one.
+        // A native window is needed: headless platforms (offscreen, minimal, VNC) have no swap chain to show HDR.
         const QString platform = QGuiApplication::platformName();
-        if (platform != QLatin1String("cocoa") && platform != QLatin1String("windows"))
-            return fail(tr("HDR viewing needs the system's own windows, not Qt's %1 platform").arg(platform));
+        if (platform != QLatin1String("cocoa") && platform != QLatin1String("windows") && platform != QLatin1String("direct2d"))
+            return fail(tr("HDR viewing needs a desktop display (this one is \"%1\")").arg(platform));
 #endif
 #if defined(Q_OS_MACOS)
         setSurfaceType(QSurface::MetalSurface);
