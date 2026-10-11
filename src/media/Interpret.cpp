@@ -114,6 +114,12 @@ Result interpretFootage(Project& p, Id media, Interpretation i) {
             for (VisualIndex::Sample& smp : v->samples) smp.time *= ratio;
             m->visual = v;
         }
+        if (m->sounds) {
+            auto v = std::make_shared<VisualIndex>(*m->sounds);
+            v->step *= ratio;
+            for (VisualIndex::Sample& smp : v->samples) smp.time *= ratio;
+            m->sounds = v;
+        }
         if (m->faces) {
             auto f = std::make_shared<FaceIndex>(*m->faces);
             f->step *= ratio;

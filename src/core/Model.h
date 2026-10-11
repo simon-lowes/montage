@@ -140,6 +140,8 @@ struct MediaItem {
     std::shared_ptr<const Transcript> transcript;
     // What the footage shows, for search by description (shared like the transcript).
     std::shared_ptr<const VisualIndex> visual;
+    // What its sound is, for search by description (CLAP embeddings of 10-second windows; shared like the visual index).
+    std::shared_ptr<const VisualIndex> sounds;
     // The faces in it, for finding people (shared like the visual index).
     std::shared_ptr<const FaceIndex> faces;
     // Logging (core/MediaLog.h): what the editor notes about the media to find it again.

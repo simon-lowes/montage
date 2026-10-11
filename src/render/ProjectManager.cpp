@@ -163,7 +163,7 @@ bool consolidateProject(const Project& p, const ConsolidateOptions& o, Consolida
             ts.vr180 = m.projection == "vr180";
             MediaItem copy = m;
             copy.id = t.newId();
-            copy.transcript.reset(), copy.visual.reset(), copy.faces.reset();
+            copy.transcript.reset(), copy.visual.reset(), copy.sounds.reset(), copy.faces.reset();
             t.media.push_back(copy);
             const double fps = ts.fpsValue();
             if (!edit::placeMedia(t, ts, copy.id, 0, from * fps, to * fps, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok)
@@ -188,6 +188,7 @@ bool consolidateProject(const Project& p, const ConsolidateOptions& o, Consolida
             m.audioCodec = fresh.audioCodec;
             m.proxyPath.clear();
             m.visual.reset();
+            m.sounds.reset();
             m.faces.reset();
             if (m.timecode >= 0) m.timecode += from;
             // What was said, moved to the new file's time.

@@ -792,6 +792,8 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
             o["visual"] = QJsonDocument::fromJson(QByteArray::fromStdString(visualIndexToJson(*m.visual))).object();
         if (m.faces && !m.faces->model.empty())
             o["faces"] = QJsonDocument::fromJson(QByteArray::fromStdString(faceIndexToJson(*m.faces))).object();
+        if (m.sounds && !m.sounds->samples.empty())
+            o["sounds"] = QJsonDocument::fromJson(QByteArray::fromStdString(visualIndexToJson(*m.sounds))).object();
         media.append(o);
     }
     root["media"] = media;
@@ -881,6 +883,11 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
             VisualIndex v;
             if (visualIndexFromJson(QJsonDocument(o.value("visual").toObject()).toJson(QJsonDocument::Compact).toStdString(), v))
                 m.visual = std::make_shared<const VisualIndex>(std::move(v));
+        }
+        if (o.contains("sounds")) {
+            VisualIndex v;
+            if (visualIndexFromJson(QJsonDocument(o.value("sounds").toObject()).toJson(QJsonDocument::Compact).toStdString(), v))
+                m.sounds = std::make_shared<const VisualIndex>(std::move(v));
         }
         if (o.contains("faces")) {
             FaceIndex f;

@@ -71,11 +71,13 @@ bool visualIndexFromJson(const std::string& json, VisualIndex& out) {
     return true;
 }
 
-std::vector<ShotMatch> findShots(const Project& p, const std::vector<float>& query, size_t max, float tolerance) {
+namespace {
+std::vector<ShotMatch> findMoments(const Project& p, std::shared_ptr<const VisualIndex> MediaItem::*index, const std::vector<float>& query,
+                                   size_t max, float tolerance) {
     std::vector<ShotMatch> all;
     for (const MediaItem& m : p.media) {
-        if (!m.visual || m.visual->samples.empty()) continue;
-        const VisualIndex& v = *m.visual;
+        if (!(m.*index) || (m.*index)->samples.empty()) continue;
+        const VisualIndex& v = *(m.*index);
         std::vector<float> score(v.samples.size());
         for (size_t i = 0; i < score.size(); ++i) score[i] = v.similarity(i, query);
         // Moments: local runs within a little of their peak (CLIP scores sit in a narrow band).
@@ -103,6 +105,15 @@ std::vector<ShotMatch> findShots(const Project& p, const std::vector<float>& que
     std::sort(all.begin(), all.end(), [](const ShotMatch& a, const ShotMatch& b) { return a.score > b.score; });
     if (all.size() > max) all.resize(max);
     return all;
+}
+}  // namespace
+
+std::vector<ShotMatch> findShots(const Project& p, const std::vector<float>& query, size_t max, float tolerance) {
+    return findMoments(p, &MediaItem::visual, query, max, tolerance);
+}
+
+std::vector<ShotMatch> findSounds(const Project& p, const std::vector<float>& query, size_t max, float tolerance) {
+    return findMoments(p, &MediaItem::sounds, query, max, tolerance);
 }
 
 std::vector<ShotMatch> findSimilarShots(const Project& p, const std::vector<float>& image, uint64_t fromMedia, double fromSeconds,

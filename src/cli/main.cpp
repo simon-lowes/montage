@@ -39,6 +39,7 @@
 #include "media/SuperScale.h"
 #include "media/Translator.h"
 #include "media/VisualSearch.h"
+#include "media/SoundSearch.h"
 #include "media/Faces.h"
 #include "media/DepthMap.h"
 #include "media/Rife.h"
@@ -94,6 +95,7 @@ int usage() {
                  "                     [--srt out.srt] [--vtt out.vtt] [--json out.json] [--txt out.txt]\n"
                  "  montage-cli models\n"
                  "  montage-cli shots <project.montage> \"a red car at night\" [--max N]   (find shots by description)\n"
+                 "  montage-cli sounds <project.montage> \"applause\" [--max N]   (find sounds by description)\n"
                  "  montage-cli people <project.montage> [--person NAME|ID]   (who is in the footage, and where)\n"
                  "  montage-cli speak \"text\" -o voice.wav [--voice af_heart] [--speed 1]   (a voiceover from text; --phonemes prints them)\n"
                  "  montage-cli clone-speech \"text\" --voice sample.wav -o out.wav --consent [--language en] [--from S] [--to S]\n"
@@ -606,6 +608,10 @@ int cmdModels() {
     else
         std::printf("  %-22s %6.0f MB  %-10s ONNX Runtime %s\n", objectModel().id.c_str(), double(objectModel().bytes()) / 1e6,
                     objectModel().installed() ? "downloaded" : "", segmenterRuntimeVersion().c_str());
+    std::printf("\nSound search model (CLAP, for What's Heard; folder: %s)\n", soundModel().directory().c_str());
+    if (!soundSearchAvailable()) std::printf("  unavailable: this build has no ONNX Runtime\n");
+    else
+        std::printf("  %-22s %6.0f MB  %s\n", soundModel().id.c_str(), double(soundModel().bytes()) / 1e6, soundModel().installed() ? "downloaded" : "");
     std::printf("\nVisual search model (CLIP ViT-B/32, for Find Shots; folder: %s)\n", visualModel().directory().c_str());
     std::printf("  %-22s %6.0f MB  %s\n", visualModel().id.c_str(), double(visualModel().bytes()) / 1e6,
                 visualModel().installed() ? "downloaded" : "");
@@ -967,6 +973,51 @@ int cmdShots(const std::vector<std::string>& args) {
     return 0;
 }
 
+// Finds sounds by description, indexing the project's recordings first (and saving the index).
+int cmdSounds(const std::vector<std::string>& args) {
+    if (args.size() < 2) return usage();
+    size_t max = 10;
+    for (size_t i = 2; i < args.size(); ++i)
+        if (args[i] == "--max" && i + 1 < args.size()) max = size_t(std::max(1, std::atoi(args[++i].c_str())));
+        else return usage();
+    Project p;
+    if (!load(args[0], p)) return 1;
+    std::string err;
+    bool changed = false;
+    for (MediaItem& m : p.media) {
+        if (!m.hasAudio || m.path.empty() || m.subclipOf || (m.sounds && !m.sounds->samples.empty())) continue;
+        VisualIndex v;
+        const bool ok = indexSound(
+            m.path, m.duration, v, 0,
+            [&](double f) {
+                std::fprintf(stderr, "\rListening to %s... %5.1f%%", m.name.c_str(), f * 100);
+                std::fflush(stderr);
+            },
+            nullptr, &err);
+        std::fprintf(stderr, "\n");
+        if (!ok) {
+            std::fprintf(stderr, "error: %s: %s\n", m.name.c_str(), err.c_str());
+            return 1;
+        }
+        m.sounds = std::make_shared<const VisualIndex>(std::move(v));
+        changed = true;
+    }
+    if (changed && !saveProject(p, args[0], &err)) {
+        std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
+    }
+    auto model = SoundModel::load(&err);
+    const std::vector<float> q = model ? model->text(args[1], &err) : std::vector<float>{};
+    if (q.empty()) {
+        std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
+    }
+    for (const ShotMatch& h : findSounds(p, q, max))
+        if (const MediaItem* m = p.findMedia(h.media))
+            std::printf("%.3f  %-30s %8.2f - %8.2f s\n", double(h.score), m->name.c_str(), h.start, h.end);
+    return 0;
+}
+
 // Lists the people in the footage, finding faces in media not looked through yet (and saving them).
 int cmdPeople(const std::vector<std::string>& args) {
     if (args.empty()) return usage();
@@ -1153,6 +1204,7 @@ int main(int argc, char** argv) {
     }
 #endif
     if (cmd == "shots") return cmdShots(args);
+    if (cmd == "sounds") return cmdSounds(args);
     if (cmd == "people") return cmdPeople(args);
     if (cmd == "speak") return cmdSpeak(args);
     if (cmd == "clone-speech") return cmdCloneSpeech(args);

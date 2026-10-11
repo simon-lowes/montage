@@ -106,6 +106,7 @@
 #include "media/Rife.h"
 #include "media/TextToSpeech.h"
 #include "media/VoiceClone.h"
+#include "media/SoundSearch.h"
 #include "media/Transcriber.h"
 #include "media/VisualSearch.h"
 #include "render/ClipAnalysis.h"
@@ -4839,6 +4840,51 @@ void McpServer::Impl::addTools() {
                             .arg(double(h.score), 0, 'f', 3);
             }
             return ok(text.isEmpty() ? QStringLiteral("No indexed video") : text, QJsonObject{{"moments", list}});
+        });
+
+    add("montage_find_sounds", "Find sounds by description",
+        "Search the project's recordings by what is heard (\"applause\", \"a door slamming\", \"rain on a window\", \"a crowd "
+        "cheering\", \"a car passing\"), with CLAP running on this computer. Recordings not indexed yet are indexed first "
+        "(10-second windows every 5 s, once; the index is saved in the project). Returns the best moments: media file and media "
+        "times, best first.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"query":{"type":"string"},
+            "max":{"type":"integer","default":10}},"required":["project","query"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            if (!soundSearchAvailable()) return fail("This build of Montage cannot search sound (no ONNX Runtime)");
+            if (!soundModel().installed())
+                return fail("The sound search model is not downloaded: run `scripts/fetch-models.sh` or search What's Heard in the app once");
+            const std::string query = need(a, "query").toStdString();
+            std::string err;
+            bool changed = false;
+            for (MediaItem& m : l.project.media) {
+                if (!m.hasAudio || m.path.empty() || m.subclipOf || (m.sounds && !m.sounds->samples.empty())) continue;
+                VisualIndex v;
+                if (!indexSound(m.path, m.duration, v, 0,
+                                [&](double f) { progress(f, QStringLiteral("Listening to %1").arg(QString::fromStdString(m.name))); }, nullptr, &err))
+                    return fail(QString::fromStdString(m.name + ": " + err));
+                m.sounds = std::make_shared<const VisualIndex>(std::move(v));
+                changed = true;
+            }
+            if (changed) save(l);
+            auto model = SoundModel::load(&err);
+            const std::vector<float> q = model ? model->text(query, &err) : std::vector<float>{};
+            if (q.empty()) return fail(QString::fromStdString(err));
+            const std::vector<ShotMatch> hits = findSounds(l.project, q, size_t(std::clamp(a.value("max").toInt(10), 1, 100)));
+            QJsonArray list;
+            QString text;
+            for (const ShotMatch& h : hits) {
+                const MediaItem* m = l.project.findMedia(h.media);
+                if (!m) continue;
+                list.append(QJsonObject{{"media", QString::fromStdString(m->path)}, {"start_seconds", h.start}, {"end_seconds", h.end},
+                                        {"best_seconds", h.best}, {"score", double(h.score)}});
+                text += QStringLiteral("%1  %2-%3 s (score %4)\n")
+                            .arg(QString::fromStdString(m->name))
+                            .arg(h.start, 0, 'f', 1)
+                            .arg(h.end, 0, 'f', 1)
+                            .arg(double(h.score), 0, 'f', 3);
+            }
+            return ok(text.isEmpty() ? QStringLiteral("No recording with sound") : text, QJsonObject{{"moments", list}});
         });
 
     add("montage_find_people", "Find people",

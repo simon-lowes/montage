@@ -4,7 +4,9 @@
 // Source monitor with In and Out around it. Videos are indexed once (CLIP,
 // media/VisualSearch.h) and the index is saved with the project. Switched to
 // What's Said, it finds moments of the transcripts by meaning instead
-// (media/SpeechSearch.h): "where they talk about money" finds "the budget was too tight".
+// (media/SpeechSearch.h): "where they talk about money" finds "the budget was too tight". Switched to What's
+// Heard, it finds sounds by what they are ("applause", "a door slamming", "rain"): each recording's sound is
+// indexed once by CLAP (media/SoundSearch.h).
 #pragma once
 
 #include <QWidget>
@@ -27,6 +29,8 @@ class ThumbnailCache;
 // visual index yet, offering the model download first and showing progress.
 // False if cancelled or failed.
 bool indexVideos(EditorState* state, const std::vector<Id>& media, QWidget* parent);
+// The same for the sound of the given media (anything with sound), for What's Heard.
+bool indexSounds(EditorState* state, const std::vector<Id>& media, QWidget* parent);
 
 class ShotSearchPanel : public QWidget {
     Q_OBJECT
@@ -35,12 +39,14 @@ public:
 
     // Searches (indexing unindexed videos first, after asking). Returns the number of moments found.
     int search(const QString& query);
-    // What is searched: 0 what is shown (CLIP), 1 what is said (transcripts, by meaning).
-    enum Mode { Shown = 0, Said = 1 };
+    // What is searched: 0 what is shown (CLIP), 1 what is said (transcripts, by meaning), 2 what is heard (CLAP).
+    enum Mode { Shown = 0, Said = 1, Heard = 2 };
     Mode mode() const;
     void setMode(Mode m);
     // Searches the transcripts by meaning (offering the model download first). Returns the number of moments found.
     int searchSaid(const QString& query);
+    // Searches the media's sound by description (indexing unindexed recordings first, after asking).
+    int searchHeard(const QString& query);
     // A result's words, for What's Said results ("" for shots).
     QString resultText(int i) const;
     // Searches for moments that look like `media` at `seconds` (CLIP image to image), leaving that moment out.

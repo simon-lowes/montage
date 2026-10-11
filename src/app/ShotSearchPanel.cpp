@@ -23,6 +23,7 @@
 #include "ModelPacks.h"
 #include "ThumbnailCache.h"
 #include "core/History.h"
+#include "media/SoundSearch.h"
 #include "media/SpeechSearch.h"
 #include "media/VisualSearch.h"
 
@@ -30,6 +31,7 @@ namespace montage {
 
 namespace {
 bool searchable(const MediaItem& m) { return m.kind == MediaKind::Video && m.hasVideo && !m.path.empty() && !m.subclipOf; }
+bool audible(const MediaItem& m) { return m.hasAudio && !m.path.empty() && !m.subclipOf; }
 }  // namespace
 
 ShotSearchPanel::ShotSearchPanel(EditorState* state, QWidget* parent)
@@ -41,7 +43,9 @@ ShotSearchPanel::ShotSearchPanel(EditorState* state, QWidget* parent)
     mode_->setObjectName(QStringLiteral("findMode"));
     mode_->addItem(tr("What's Shown"));
     mode_->addItem(tr("What's Said"));
-    mode_->setToolTip(tr("Search the footage by what it shows, or the transcripts by what is said (by meaning, not only the words)"));
+    mode_->addItem(tr("What's Heard"));
+    mode_->setToolTip(tr("Search the footage by what it shows, the transcripts by what is said (by meaning, not only the words), or the "
+                         "sound by what it is"));
     row->addWidget(mode_);
     query_ = new QLineEdit(this);
     query_->setObjectName(QStringLiteral("shotQuery"));
@@ -92,8 +96,9 @@ void ShotSearchPanel::setMode(Mode m) {
         QSignalBlocker block(mode_);
         mode_->setCurrentIndex(int(m));
     }
-    query_->setPlaceholderText(m == Said ? tr("What is talked about: \"where they discuss the budget\"")
-                                         : tr("Describe a shot: \"a dog running on a beach\""));
+    query_->setPlaceholderText(m == Said    ? tr("What is talked about: \"where they discuss the budget\"")
+                               : m == Heard ? tr("Describe a sound: \"applause\", \"a door slamming\", \"rain on a window\"")
+                                            : tr("Describe a shot: \"a dog running on a beach\""));
     results_.clear();
     texts_.clear();
     showResults();
@@ -172,6 +177,22 @@ void ShotSearchPanel::refreshStatus() {
                                                   : tr("%1 of %n recording(s) transcribed.", "", sounds).arg(transcribed));
         return;
     }
+    if (mode() == Heard) {
+        int recordings = 0, indexed = 0;
+        for (const MediaItem& m : state_->project().media)
+            if (audible(m)) {
+                ++recordings;
+                indexed += m.sounds && !m.sounds->samples.empty();
+            }
+        indexBtn_->setVisible(true);
+        indexBtn_->setEnabled(soundSearchAvailable() && indexed < recordings);
+        searchBtn_->setEnabled(soundSearchAvailable());
+        status_->setText(!soundSearchAvailable() ? tr("This build of Montage cannot search sound by description (no ONNX Runtime).")
+                         : recordings == 0       ? tr("Import recordings to search their sound.")
+                                                 : tr("%1 of %n recording(s) indexed for their sound.", "", recordings).arg(indexed));
+        return;
+    }
+    searchBtn_->setEnabled(true);
     indexBtn_->setVisible(true);
     int videos = 0, indexed = 0;
     for (const MediaItem& m : state_->project().media)
@@ -193,8 +214,8 @@ void ShotSearchPanel::refreshStatus() {
 bool ShotSearchPanel::indexMissing() {
     std::vector<Id> ids;
     for (const MediaItem& m : state_->project().media)
-        if (searchable(m)) ids.push_back(m.id);
-    const bool ok = indexVideos(state_, ids, window());
+        if (mode() == Heard ? audible(m) : searchable(m)) ids.push_back(m.id);
+    const bool ok = mode() == Heard ? indexSounds(state_, ids, window()) : indexVideos(state_, ids, window());
     refreshStatus();
     return ok;
 }
@@ -261,8 +282,92 @@ bool indexVideos(EditorState* state, const std::vector<Id>& media, QWidget* pare
     return !*cancel && r.second.empty();
 }
 
+bool indexSounds(EditorState* state, const std::vector<Id>& media, QWidget* parent) {
+    if (!soundSearchAvailable()) return false;
+    struct Job {
+        Id id;
+        std::string path;
+        double duration;
+    };
+    std::vector<Job> jobs;
+    for (Id id : media) {
+        const MediaItem* m = state->project().findMedia(id);
+        if (m && m->subclipOf) m = state->project().findMedia(m->subclipOf);
+        if (!m || !audible(*m) || (m->sounds && !m->sounds->samples.empty())) continue;
+        if (std::none_of(jobs.begin(), jobs.end(), [&](const Job& j) { return j.id == m->id; })) jobs.push_back({m->id, m->path, m->duration});
+    }
+    if (jobs.empty()) return true;
+    if (!ensureModelPack(parent, soundModel(), QObject::tr("Find Sounds"),
+                         QObject::tr("Searching sound by what it is uses CLAP (LAION, Apache-2.0), which runs on this computer.")))
+        return false;
+    QProgressDialog progress(QObject::tr("Listening to the recordings…"), QObject::tr("Cancel"), 0, 1000, parent);
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(300);
+    auto done = std::make_shared<std::atomic<double>>(0.0);
+    auto cancel = std::make_shared<std::atomic<bool>>(false);
+    QObject::connect(&progress, &QProgressDialog::canceled, &progress, [cancel] { *cancel = true; });
+    QTimer tick;
+    QObject::connect(&tick, &QTimer::timeout, &progress, [&progress, done] { progress.setValue(int(*done * 1000)); });
+    tick.start(100);
+    using Out = std::pair<std::vector<std::pair<Id, std::shared_ptr<const VisualIndex>>>, std::string>;
+    QFutureWatcher<Out> watcher;
+    QEventLoop wait;
+    QObject::connect(&watcher, &QFutureWatcher<Out>::finished, &wait, &QEventLoop::quit);
+    watcher.setFuture(QtConcurrent::run([jobs, done, cancel] {
+        Out out;
+        for (size_t i = 0; i < jobs.size() && !*cancel; ++i) {
+            VisualIndex v;
+            std::string err;
+            const double n = double(jobs.size());
+            if (indexSound(jobs[i].path, jobs[i].duration, v, 0, [&](double f) { *done = (double(i) + f) / n; }, cancel.get(), &err))
+                out.first.emplace_back(jobs[i].id, std::make_shared<const VisualIndex>(std::move(v)));
+            else if (!*cancel && out.second.empty())
+                out.second = err;
+        }
+        return out;
+    }));
+    if (!watcher.isFinished()) wait.exec();
+    tick.stop();
+    QObject::disconnect(&progress, &QProgressDialog::canceled, nullptr, nullptr);
+    progress.close();
+    const Out r = watcher.result();
+    if (!r.first.empty()) {
+        const auto indexes = r.first;
+        state->amend([indexes](Project& p, Sequence&) {
+            for (const auto& [id, v] : indexes)
+                if (MediaItem* m = p.findMedia(id)) m->sounds = v;
+            return true;
+        });
+    }
+    if (!r.second.empty()) state->message(QString::fromStdString(r.second), 6000);
+    return !*cancel && r.second.empty();
+}
+
+int ShotSearchPanel::searchHeard(const QString& queryText) {
+    const QString query = queryText.trimmed();
+    results_.clear();
+    texts_.clear();
+    if (query.isEmpty() || !soundSearchAvailable()) {
+        showResults();
+        return 0;
+    }
+    if (!indexMissing() && !soundModel().installed()) return 0;
+    std::string err;
+    auto model = SoundModel::load(&err);
+    const std::vector<float> q = model ? model->text(query.toStdString(), &err) : std::vector<float>{};
+    if (q.empty()) {
+        state_->message(QString::fromStdString(err), 6000);
+        return 0;
+    }
+    results_ = findSounds(state_->project(), q, 30);
+    lastQuery_ = query;
+    showResults();
+    return int(results_.size());
+}
+
 int ShotSearchPanel::search(const QString& queryText) {
     if (mode() == Said) return searchSaid(queryText);
+    if (mode() == Heard) return searchHeard(queryText);
     const QString query = queryText.trimmed();
     results_.clear();
     texts_.clear();

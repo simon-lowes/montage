@@ -140,6 +140,12 @@ int openMediaInput(struct AVFormatContext** fmt, const std::string& path);
 AudioBufferPtr decodeAudio(const std::string& path, int sampleRate, std::string* error = nullptr,
                            const std::atomic<bool>* cancel = nullptr, const std::vector<int>& channels = {});
 
+// The main audio stream as mono (the stereo mix's two sides averaged) at `sampleRate`, aligned like decodeAudio, handed
+// to `sink` `block` frames at a time (the last block may be shorter): for long files, without holding all of it. False
+// from `sink` stops early (still a success).
+bool decodeAudioBlocks(const std::string& path, int sampleRate, size_t block, const std::function<bool(const std::vector<float>& mono)>& sink,
+                       std::string* error = nullptr, const std::atomic<bool>* cancel = nullptr);
+
 // The first-order ambisonic field (four channels: W, Y, Z, X in ACN order, SN3D) of the audio stream decodeAudio
 // mixes from; a higher-order file gives its first-order part. Aligned like decodeAudio.
 AudioBufferPtr decodeAmbisonic(const std::string& path, int sampleRate, std::string* error = nullptr,

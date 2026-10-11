@@ -71,6 +71,7 @@ add_library(montage_engine STATIC
   media/Matting.h media/Matting.cpp
   media/TextToSpeech.h media/TextToSpeech.cpp
   media/VoiceClone.h media/VoiceClone.cpp
+  media/SoundSearch.h media/SoundSearch.cpp
   media/Inpaint.h media/Inpaint.cpp
   media/ValueMap.h
   media/Rife.h media/Rife.cpp

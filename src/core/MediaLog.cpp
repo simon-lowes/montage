@@ -354,6 +354,7 @@ std::optional<MediaItem> makeSubclip(const Project& p, Id media, double in, doub
     m.id = 0;
     m.transcript.reset();
     m.visual.reset();
+    m.sounds.reset();
     m.subclipOf = base->id;
     m.subclipIn = in;
     m.subclipOut = out;

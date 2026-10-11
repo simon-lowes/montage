@@ -1147,8 +1147,11 @@ namespace {
 
 // One audio stream decoded whole to float at `sampleRate`, aligned so sample 0 is media time 0: the best stream
 // mixed to stereo (ordinal -1), or the ordinal-th audio stream with its own channels. `channels` says how many.
+// With `drain`, it is handed `samples` after each decoded frame (it may take some off the front; false stops the decode)
+// and once more at the end with `last` set, instead of all of them being kept.
 bool decodeAudioStream(const std::string& path, int sampleRate, int ordinal, std::vector<float>& samples, int& channels,
-                       std::string* error, const std::atomic<bool>* cancel, AVChannelLayout* layoutOut = nullptr) {
+                       std::string* error, const std::atomic<bool>* cancel, AVChannelLayout* layoutOut = nullptr,
+                       const std::function<bool(std::vector<float>& samples, bool last)>* drain = nullptr) {
     AVFormatContext* fmt = nullptr;
     int rc = openMediaInput(&fmt, path);
     if (rc < 0) {
@@ -1212,7 +1215,7 @@ bool decodeAudioStream(const std::string& path, int sampleRate, int ordinal, std
     c.frame = av_frame_alloc();
     const size_t nch = size_t(channels);
     samples.clear();
-    if (st->duration > 0) samples.reserve(size_t(double(st->duration) * av_q2d(st->time_base) * sampleRate * double(nch) + 4096));
+    if (st->duration > 0 && !drain) samples.reserve(size_t(double(st->duration) * av_q2d(st->time_base) * sampleRate * double(nch) + 4096));
     const double origin = fileOrigin(fmt);
     const double tb = av_q2d(st->time_base);
     bool first = true;
@@ -1252,6 +1255,7 @@ bool decodeAudioStream(const std::string& path, int sampleRate, int ordinal, std
         rc = avcodec_receive_frame(c.ctx, c.frame);
         if (rc == 0) {
             handleFrame();
+            if (drain && !(*drain)(samples, false)) return true;
             continue;
         }
         if (rc == AVERROR_EOF) break;
@@ -1267,11 +1271,48 @@ bool decodeAudioStream(const std::string& path, int sampleRate, int ordinal, std
         av_packet_unref(c.pkt);
     }
     append(nullptr, 0);  // flush the resampler
+    if (drain) (*drain)(samples, true);
     samples.shrink_to_fit();
     return true;
 }
 
 }  // namespace
+
+bool decodeAudioBlocks(const std::string& path, int sampleRate, size_t block, const std::function<bool(const std::vector<float>& mono)>& sink,
+                       std::string* error, const std::atomic<bool>* cancel) {
+    block = std::max<size_t>(1, block);
+    std::vector<float> mono;
+    mono.reserve(block);
+    bool stopped = false;
+    auto give = [&](const float* stereo, size_t frames) {
+        for (size_t i = 0; i < frames && !stopped; ++i) {
+            mono.push_back(0.5f * (stereo[i * 2] + stereo[i * 2 + 1]));
+            if (mono.size() == block) {
+                stopped = !sink(mono);
+                mono.clear();
+            }
+        }
+    };
+    // A conformed video's sound (Interpret Footage) is made whole, as decodeAudio makes it, and handed out in blocks.
+    if (Interpretation in; parseInterpretation(path, in) && in.conformed()) {
+        AudioBufferPtr whole = decodeAudio(path, sampleRate, error, cancel);
+        if (!whole) return false;
+        give(whole->samples.data(), size_t(whole->frames()));
+        if (!stopped && !mono.empty()) sink(mono);
+        return true;
+    }
+    int channels = 2;
+    std::vector<float> stereo;
+    const std::function<bool(std::vector<float>&, bool)> drain = [&](std::vector<float>& s, bool last) {
+        const size_t frames = s.size() / 2;
+        give(s.data(), frames);
+        s.erase(s.begin(), s.begin() + std::ptrdiff_t(frames * 2));
+        if (last && !stopped && !mono.empty()) sink(mono);
+        return !stopped;
+    };
+    if (!decodeAudioStream(path, sampleRate, -1, stereo, channels, error, cancel, nullptr, &drain)) return false;
+    return !(cancel && cancel->load());
+}
 
 void checkStereoMedia(Project& p) {
     // ProRes RAW media read by another build: developed to ACEScct where this FFmpeg gives its colour, left to FFmpeg

@@ -14,6 +14,7 @@
 #   <dir>/inpaint        Object Removal     (MONTAGE_INPAINT_MODEL)
 #   <dir>/minilm-qa      Find What's Said   (MONTAGE_SENTENCE_MODEL)
 #   <dir>/ocr            Reading text       (MONTAGE_OCR_MODEL)
+#   <dir>/sound          What's Heard       (MONTAGE_SOUND_MODEL)
 #   <dir>/voice-clone    Cloned voices      (MONTAGE_VOICE_CLONE_MODEL; 1.6 GB, only with --voice-clone)
 #
 #   scripts/fetch-models.sh [dir] [--voice-clone]      (default: ./models)
@@ -105,6 +106,11 @@ fetch ocr en_rec.onnx "$OCRREC/english/rec.onnx" 4e16deb22c4da6468bdca539b2cd3c8
 fetch ocr en_dict.txt "$OCRREC/english/dict.txt" e025a66d31f327ba0c232e03f407ae8d105e1e709e7ccb3f408aa778c24e70d6
 fetch ocr latin_rec.onnx "$OCRREC/latin/rec.onnx" 614ffc2d6d3902d360fad7f1b0dd455ee45e877069d14c4e51a99dc4ef144409
 fetch ocr latin_dict.txt "$OCRREC/latin/dict.txt" 3c0a8a79b612653c25f765271714f71281e4e955962c153e272b7b8c1d2b13ff
+CLAP=https://huggingface.co/Xenova/clap-htsat-unfused/resolve/c28f2883575e590e04d3146ff0713c2448d691ba
+fetch sound audio_model.onnx "$CLAP/onnx/audio_model.onnx" a1c2b43c44f71e0fa841a4b86700886c199bf87699ea45632c4d831bc6c88957
+fetch sound text_model_fp16.onnx "$CLAP/onnx/text_model_fp16.onnx" c1fd1e4cdd02acbcacaafe7a8e608dcfc8f84a00bfea3e2ca7df710957b4c3a5
+fetch sound vocab.json "$CLAP/vocab.json" ed19656ea1707df69134c4af35c8ceda2cc9860bf2c3495026153a133670ab5e
+fetch sound merges.txt "$CLAP/merges.txt" 1ce1664773c50f3e0cc8842619a93edc4624525b728b188a9e0be33b7726adc5
 if [ "$VOICE_CLONE" = 1 ]; then
   CHATTERBOX=https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/452d3f434aa592098f1eedac9099f33642ab2da5
   fetch voice-clone speech_encoder.onnx "$CHATTERBOX/onnx/speech_encoder.onnx" 8f1c8a0f89b77bf9cd5dd8f2e034eb2c79dc00fe70d41196b28c257643b00ccb
@@ -119,4 +125,4 @@ if [ "$VOICE_CLONE" = 1 ]; then
   fetch voice-clone Cangjie5_TC.json "$CHATTERBOX/Cangjie5_TC.json" 7073fd9de919443ae88e0bd2449917a65fe54898a4413ed1edcc4b67f28bce8c
   echo "Voice cloning model: MONTAGE_VOICE_CLONE_MODEL=$DIR/voice-clone"
 fi
-echo "Models in $DIR: MONTAGE_OBJECT_MODEL=$DIR/edgetam-video MONTAGE_SPEAKER_MODEL=$DIR/speakers MONTAGE_VISUAL_MODEL=$DIR/clip-vit-b32 MONTAGE_SPEECH_MODEL=$DIR/speech-enhance MONTAGE_UPSCALE_MODEL=$DIR/upscale MONTAGE_FACE_MODEL=$DIR/faces MONTAGE_DEPTH_MODEL=$DIR/depth MONTAGE_RIFE_MODEL=$DIR/rife MONTAGE_MATTE_MODEL=$DIR/matte MONTAGE_TTS_MODEL=$DIR/tts MONTAGE_INPAINT_MODEL=$DIR/inpaint MONTAGE_SENTENCE_MODEL=$DIR/minilm-qa MONTAGE_OCR_MODEL=$DIR/ocr"
+echo "Models in $DIR: MONTAGE_OBJECT_MODEL=$DIR/edgetam-video MONTAGE_SPEAKER_MODEL=$DIR/speakers MONTAGE_VISUAL_MODEL=$DIR/clip-vit-b32 MONTAGE_SPEECH_MODEL=$DIR/speech-enhance MONTAGE_UPSCALE_MODEL=$DIR/upscale MONTAGE_FACE_MODEL=$DIR/faces MONTAGE_DEPTH_MODEL=$DIR/depth MONTAGE_RIFE_MODEL=$DIR/rife MONTAGE_MATTE_MODEL=$DIR/matte MONTAGE_TTS_MODEL=$DIR/tts MONTAGE_INPAINT_MODEL=$DIR/inpaint MONTAGE_SENTENCE_MODEL=$DIR/minilm-qa MONTAGE_OCR_MODEL=$DIR/ocr MONTAGE_SOUND_MODEL=$DIR/sound"

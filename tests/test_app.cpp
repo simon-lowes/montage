@@ -138,6 +138,7 @@
 #include "media/Matting.h"
 #include "media/TextToSpeech.h"
 #include "media/VoiceClone.h"
+#include "media/SoundSearch.h"
 #include "media/Inpaint.h"
 #include "SpeechDialog.h"
 #include "ShotSearchPanel.h"
@@ -9993,6 +9994,41 @@ const auto seq = [this] { return state()->sequence(); };
         mode->setCurrentIndex(0);
         QCOMPARE(list->count(), 0);
         QVERIFY(panel->resultText(0).isEmpty());
+        state()->newProject();
+    }
+
+    void findWhatIsHeard() {
+        state()->newProject();
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        auto* panel = win_->findChild<ShotSearchPanel*>();
+        QVERIFY(panel);
+        auto* mode = panel->findChild<QComboBox*>("findMode");
+        QVERIFY(mode && mode->count() == 3);
+        mode->setCurrentIndex(2);
+        QCOMPARE(panel->mode(), ShotSearchPanel::Heard);
+        QVERIFY(panel->findChild<QLineEdit*>("shotQuery")->placeholderText().contains("applause"));
+        auto* status = panel->findChild<QLabel*>("shotStatus");
+        if (!soundSearchAvailable()) {
+            QVERIFY(status->text().contains("cannot"));
+            return;
+        }
+        QVERIFY2(status->text().contains("0 of 1"), qPrintable(status->text()));
+        QVERIFY(!panel->findChild<QPushButton*>("indexShots")->isHidden());
+        if (!soundModel().installed()) QSKIP("Set MONTAGE_SOUND_MODEL to the CLAP model");
+        // Searching indexes the recording first (saved with the project, not an undo step), then finds the speech.
+        const int undoBefore = int(state()->history().undoCount());
+        QVERIFY(panel->search("a man giving a speech") >= 1);
+        const MediaItem* m = state()->project().findMedia(ids[0]);
+        QVERIFY(m && m->sounds && m->sounds->samples.size() == 1);
+        QCOMPARE(int(state()->history().undoCount()), undoBefore);
+        QVERIFY(status->text().contains("1 of 1"));
+        QCOMPARE(panel->results()[0].media, ids[0]);
+        auto* list = panel->findChild<QListWidget*>("shotResults");
+        QVERIFY(list->count() >= 1 && list->item(0)->text().contains("jfk.wav"));
+        QSignalSpy opened(panel, &ShotSearchPanel::openRequested);
+        panel->open(0);
+        QCOMPARE(opened.count(), 1);
         state()->newProject();
     }
 

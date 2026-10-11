@@ -44,6 +44,9 @@ struct ShotMatch {
 // samples close to their media's best score are joined into one moment.
 // `tolerance`: how far below a peak a neighbouring sample may score and still be part of its moment.
 std::vector<ShotMatch> findShots(const Project& p, const std::vector<float>& query, size_t max = 20, float tolerance = 0.015f);
+// The same over the media's sound indexes (media/SoundSearch.h): where the sound a query describes is heard.
+// CLAP's scores spread wider than CLIP's, so moments join samples within a wider margin of their peak.
+std::vector<ShotMatch> findSounds(const Project& p, const std::vector<float>& query, size_t max = 20, float tolerance = 0.03f);
 // The moments most like a frame (its image embedding), best first, leaving out the moment it comes from
 // (`fromMedia` at `fromSeconds`). Frames of one shot score alike, so moments are wider than for words.
 std::vector<ShotMatch> findSimilarShots(const Project& p, const std::vector<float>& image, uint64_t fromMedia, double fromSeconds,

@@ -111,6 +111,7 @@
 #include "media/Matting.h"
 #include "media/TextToSpeech.h"
 #include "media/VoiceClone.h"
+#include "media/SoundSearch.h"
 #include "media/Inpaint.h"
 #include "media/VisualSearch.h"
 #include "automation/McpServer.h"
@@ -15517,6 +15518,120 @@ private slots:
 
         // A pair whose model is not here says so.
         QVERIFY(!translateTexts({"Hallo"}, "de", "en", out, {}, nullptr, &err) || translationModel("de", "en")->installed());
+    }
+
+    void soundSearch() {
+        // Long sound read a block at a time: the same samples as decoding it whole (the two sides averaged).
+        {
+            AudioBufferPtr whole = decodeAudio(MONTAGE_TEST_DATA_DIR "/jfk.wav", kClapRate);
+            QVERIFY(whole && whole->channels == 2);
+            std::vector<float> blocks;
+            int count = 0;
+            size_t biggest = 0;
+            QVERIFY(decodeAudioBlocks(MONTAGE_TEST_DATA_DIR "/jfk.wav", kClapRate, size_t(kClapRate), [&](const std::vector<float>& b) {
+                ++count;
+                biggest = std::max(biggest, b.size());
+                blocks.insert(blocks.end(), b.begin(), b.end());
+                return true;
+            }));
+            QCOMPARE(biggest, size_t(kClapRate));
+            QCOMPARE(blocks.size(), size_t(whole->frames()));
+            QCOMPARE(count, int((blocks.size() + kClapRate - 1) / kClapRate));
+            float worst = 0;
+            for (size_t i = 0; i < blocks.size(); ++i)
+                worst = std::max(worst, std::fabs(blocks[i] - 0.5f * (whole->samples[i * 2] + whole->samples[i * 2 + 1])));
+            QVERIFY(worst < 1e-6f);
+            // Stopping early.
+            int seen = 0;
+            QVERIFY(decodeAudioBlocks(MONTAGE_TEST_DATA_DIR "/jfk.wav", kClapRate, size_t(kClapRate), [&](const std::vector<float>&) { return ++seen < 3; }));
+            QCOMPARE(seen, 3);
+        }
+        // CLAP's features: silence at the floor; a 3 s tone repeated three times to fill the window, then silence.
+        {
+            const std::vector<float> quiet = clapFeatures(std::vector<float>(size_t(kClapRate), 0.0f));
+            QCOMPARE(quiet.size(), size_t(kClapFrames) * kClapMels);
+            QVERIFY(*std::max_element(quiet.begin(), quiet.end()) <= -99.99f);
+            std::vector<float> tone(size_t(kClapRate) * 3);
+            for (size_t i = 0; i < tone.size(); ++i) tone[i] = float(0.5 * std::sin(2 * M_PI * 1000.0 * double(i) / kClapRate));
+            const std::vector<float> f = clapFeatures(tone);
+            auto frameMax = [&](int t, int* band = nullptr) {
+                const auto row = f.begin() + std::ptrdiff_t(t) * kClapMels;
+                const auto it = std::max_element(row, row + kClapMels);
+                if (band) *band = int(it - row);
+                return *it;
+            };
+            int b1 = 0, b2 = 0;
+            QVERIFY(frameMax(150, &b1) > 0 && frameMax(750, &b2) > 0);  // in the first and third repeat
+            QCOMPARE(b1, b2);
+            QVERIFY2(b1 > 15 && b1 < 30, qPrintable(QString::number(b1)));  // 1 kHz, a quarter of the way up a 50 Hz-14 kHz mel scale
+            QVERIFY(frameMax(960) < -90);  // the last second, silent
+        }
+        if (!soundSearchAvailable() || !soundModel().installed()) QSKIP("Set MONTAGE_SOUND_MODEL to the CLAP model to run the rest");
+        std::string err;
+        std::shared_ptr<SoundModel> model = SoundModel::load(&err);
+        QVERIFY2(model, err.c_str());
+        // RoBERTa's tokens, as transformers gives them.
+        QCOMPARE(model->tokenizer().encode("a man giving a speech"), (std::vector<int64_t>{0, 102, 313, 1311, 10, 1901, 2}));
+        QCOMPARE(model->tokenizer().encode("a dog barking"), (std::vector<int64_t>{0, 102, 2335, 35828, 2}));
+        QCOMPARE(model->tokenizer().encode("applause"), (std::vector<int64_t>{0, 3340, 462, 17498, 2}));
+        // JFK speaking (11 s: one window) and a synthetic song: each found by its description.
+        Project p = makeDefaultProject();
+        MediaItem jfk = probeOrFail(p, MONTAGE_TEST_DATA_DIR "/jfk.wav");
+        VisualIndex said;
+        QVERIFY2(indexSound(jfk.path, jfk.duration, said, 0, {}, nullptr, &err), err.c_str());
+        QCOMPARE(said.samples.size(), size_t(1));
+        QCOMPARE(said.samples[0].time, 5.0);
+        QCOMPARE(said.model, soundModel().id);
+        jfk.sounds = std::make_shared<const VisualIndex>(said);
+        p.media.push_back(jfk);
+        const std::vector<int> chords = {0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3};
+        const std::vector<float> songSamples = testSong(48000, 0.5, chords);  // 39 s
+        QVERIFY(writeMonoWav(path("song.wav"), songSamples, 48000));
+        MediaItem song = probeOrFail(p, path("song.wav"));
+        VisualIndex heard;
+        double progressed = 0;
+        QVERIFY2(indexSound(song.path, song.duration, heard, 0, [&](double f) { progressed = f; }, nullptr, &err), err.c_str());
+        QCOMPARE(progressed, 1.0);
+        // Every 5 s through the song's 39 s, and its last window to the end.
+        QCOMPARE(heard.step, 5.0);
+        QVERIFY2(heard.samples.size() == 7, qPrintable(QString::number(heard.samples.size())));
+        QCOMPARE(heard.samples.front().time, 5.0);
+        QVERIFY(std::abs(heard.samples.back().time - (song.duration - 5)) < 0.05);
+        song.sounds = std::make_shared<const VisualIndex>(heard);
+        p.media.push_back(song);
+        const std::vector<float> speech = model->text("a man giving a speech"), music = model->text("music with piano chords");
+        QCOMPARE(speech.size(), size_t(512));
+        QVERIFY2(said.similarity(0, speech) > 0.2f, qPrintable(QString::number(said.similarity(0, speech))));
+        auto hits = findSounds(p, speech);
+        QVERIFY(!hits.empty() && hits[0].media == jfk.id);
+        hits = findSounds(p, music);
+        QVERIFY(!hits.empty() && hits[0].media == song.id);
+        // Saved with the project.
+        QVERIFY(saveProject(p, path("sounds.montage")));
+        Project back;
+        QVERIFY(loadProject(path("sounds.montage"), back, &err));
+        QVERIFY(back.findMedia(song.id)->sounds && back.findMedia(song.id)->sounds->samples.size() == 7);
+        QVERIFY(std::abs(back.findMedia(jfk.id)->sounds->similarity(0, speech) - said.similarity(0, speech)) < 0.01f);
+
+        // Through MCP: the recordings indexed on first search (and saved), the speech found.
+        Project fresh = makeDefaultProject();
+        fresh.media.push_back(probeOrFail(fresh, MONTAGE_TEST_DATA_DIR "/jfk.wav"));
+        fresh.media.push_back(probeOrFail(fresh, path("song.wav")));
+        const QString project = QString::fromStdString(path("find-sounds.montage"));
+        QVERIFY(saveProject(fresh, project.toStdString()));
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_find_sounds"},
+                                                     {"arguments", QJsonObject{{"project", project}, {"query", "a man giving a speech"}, {"max", 3}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonArray moments = r.value("structuredContent").toObject().value("moments").toArray();
+        QVERIFY(!moments.isEmpty() && moments[0].toObject().value("media").toString().endsWith("jfk.wav"));
+        QVERIFY(loadProject(project.toStdString(), back, &err));
+        for (const MediaItem& m : back.media) QVERIFY(m.sounds && !m.sounds->samples.empty());
     }
 
     void voiceCloning() {

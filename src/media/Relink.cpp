@@ -69,6 +69,7 @@ void takeDetails(MediaItem& m, const MediaItem& n, bool replace) {
         m.proxyPath.clear();
         m.transcript.reset();
         m.visual.reset();
+        m.sounds.reset();
         m.faces.reset();
         if (!m.subclipOf) m.name = n.name;
     }
