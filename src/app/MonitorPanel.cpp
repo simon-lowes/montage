@@ -51,6 +51,9 @@ void ViewerWidget::setImage(const QImage& img) {
     // Under the HDR surface the SDR picture is not seen: repainted (and the drawing over it sent again) only when its
     // place moved, or when the exposure check, drawn from it, is on.
     if (!hdrShowing() || reshaped || exposure_ != 0) update();
+    // Overlays that move with playback (ADR streamers, handles on animated clips) repaint with each picture: theirs are
+    // sent along with it, when they changed.
+    else if (!overlays_.empty()) refreshOverlay(false);
     if (surface_ && reshaped) updateHdr();  // (the picture's place moved)
 }
 

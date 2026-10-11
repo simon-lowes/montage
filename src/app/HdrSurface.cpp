@@ -58,7 +58,7 @@ constexpr quint32 kUniformBytes = 96;
 // The display a window is on, as Windows reports it. (Qt asks about the display at the window's position, which for
 // the surface, a window inside the main one, is the main display's.)
 struct WinDisplay {
-    bool known = false, hdr = false;
+    bool known = false, hdr = false, whiteKnown = false;
     double maxNits = 0, sdrWhiteNits = 80;
 };
 
@@ -90,12 +90,18 @@ WinDisplay windowsDisplay(HWND hwnd) {
     // SDR white (Settings' "SDR content brightness"), from the display configuration of this monitor's source.
     MONITORINFOEXW info{};
     info.cbSize = sizeof info;
+    if (!out.known || !GetMonitorInfoW(monitor, &info)) return out;
+    std::vector<DISPLAYCONFIG_PATH_INFO> pathInfo;
+    std::vector<DISPLAYCONFIG_MODE_INFO> modeInfo;
     UINT32 paths = 0, modes = 0;
-    if (!out.known || !GetMonitorInfoW(monitor, &info) || GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &paths, &modes) != ERROR_SUCCESS)
-        return out;
-    std::vector<DISPLAYCONFIG_PATH_INFO> pathInfo(paths);
-    std::vector<DISPLAYCONFIG_MODE_INFO> modeInfo(modes);
-    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &paths, pathInfo.data(), &modes, modeInfo.data(), nullptr) != ERROR_SUCCESS) return out;
+    LONG status = ERROR_INSUFFICIENT_BUFFER;
+    for (int attempt = 0; attempt < 4 && status == ERROR_INSUFFICIENT_BUFFER; ++attempt) {  // (the displays may change between the calls)
+        if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &paths, &modes) != ERROR_SUCCESS) return out;
+        pathInfo.resize(paths);
+        modeInfo.resize(modes);
+        status = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &paths, pathInfo.data(), &modes, modeInfo.data(), nullptr);
+    }
+    if (status != ERROR_SUCCESS) return out;
     for (UINT32 i = 0; i < paths; ++i) {
         DISPLAYCONFIG_SOURCE_DEVICE_NAME source{};
         source.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
@@ -108,8 +114,10 @@ WinDisplay windowsDisplay(HWND hwnd) {
         white.header.size = sizeof white;
         white.header.adapterId = pathInfo[i].targetInfo.adapterId;
         white.header.id = pathInfo[i].targetInfo.id;
-        if (DisplayConfigGetDeviceInfo(&white.header) == ERROR_SUCCESS && white.SDRWhiteLevel > 0)
+        if (DisplayConfigGetDeviceInfo(&white.header) == ERROR_SUCCESS && white.SDRWhiteLevel > 0) {
             out.sdrWhiteNits = white.SDRWhiteLevel / 1000.0 * 80.0;  // (in thousandths of 80 nits)
+            out.whiteKnown = true;
+        }
         break;
     }
     return out;
@@ -294,8 +302,8 @@ bool HdrSurface::displayShowsHdr() {
     const bool qt = gpu_->sc->isFormatSupported(QRhiSwapChain::HDRExtendedSrgbLinear);
 #if defined(Q_OS_WIN)
     // Both must agree: Windows about the viewer's own display, and Qt (which makes the swap chain) about the main one.
-    QWidget* top = target_ ? target_->window() : nullptr;
-    const WinDisplay d = windowsDisplay(top ? reinterpret_cast<HWND>(top->winId()) : reinterpret_cast<HWND>(winId()));
+    // (the surface's own window: the monitor the viewer is on, not the one most of the main window is on)
+    const WinDisplay d = windowsDisplay(reinterpret_cast<HWND>(winId()));
     if ((d.known && !d.hdr) || (!d.known && !qt)) {
         problem_ = tr("This display does not show HDR");
         return false;
@@ -331,11 +339,16 @@ void HdrSurface::readDisplay() {
     } else if (gpu_ && gpu_->sc && gpu_->hasSwapChain) {
 #if defined(Q_OS_WIN)
         // The viewer's own display (Qt's answer is about the main one).
-        QWidget* top = target_ ? target_->window() : nullptr;
-        const WinDisplay d = windowsDisplay(top ? reinterpret_cast<HWND>(top->winId()) : reinterpret_cast<HWND>(winId()));
+        const WinDisplay d = windowsDisplay(reinterpret_cast<HWND>(winId()));
         if (d.known && d.maxNits > 0) {
-            h = d.maxNits / d.sdrWhiteNits;
-            sc = float(d.sdrWhiteNits / 80);
+            // SDR white from the display configuration, else as Qt reads it, else Windows' default.
+            double white = d.sdrWhiteNits;
+            if (!d.whiteKnown) {
+                const QRhiSwapChainHdrInfo info = gpu_->sc->hdrInfo();
+                white = info.sdrWhiteLevel > 0 ? info.sdrWhiteLevel : 80;
+            }
+            h = d.maxNits / white;
+            sc = float(white / 80);
             h = std::max(1.0, std::isfinite(h) ? h : 1.0);
             if (std::fabs(h - headroom_) > 0.01 || sc != scale_) {
                 headroom_ = h;
@@ -383,6 +396,10 @@ void HdrSurface::exposeEvent(QExposeEvent*) {
     HdrSurfaceGpu& g = *gpu_;
     if (isExposed() && !g.hasSwapChain) {
         g.hasSwapChain = g.sc->createOrResize();
+        if (!g.hasSwapChain && g.rhi->isDeviceLost()) {
+            stopHdr(tr("The graphics device was reset"));
+            return;
+        }
         // Now inside the viewer: asked again (on Windows Qt makes an SDR swap chain where it sees an SDR display).
         if (g.hasSwapChain && gTestHeadroom <= 0 && !displayShowsHdr()) {
             stopHdr(problem_);
@@ -500,16 +517,20 @@ bool HdrSurface::forward(QEvent* e) {
 void HdrSurface::render() {
     if (!gpu_ || !gpu_->rhi || !gpu_->hasSwapChain || gpu_->notExposed) return;
     HdrSurfaceGpu& g = *gpu_;
-    if (g.sc->currentPixelSize() != g.sc->surfacePixelSize() || g.newlyExposed) {
+    // A swap chain that cannot be made again because the device is gone: back to SDR, as below.
+    auto remade = [&] {
         g.hasSwapChain = g.sc->createOrResize();
-        if (!g.hasSwapChain) return;
+        if (!g.hasSwapChain && g.rhi->isDeviceLost()) stopHdr(tr("The graphics device was reset"));
+        return g.hasSwapChain;
+    };
+    if (g.sc->currentPixelSize() != g.sc->surfacePixelSize() || g.newlyExposed) {
+        if (!remade()) return;
         g.newlyExposed = false;
     }
     readDisplay();
     QRhi::FrameOpResult r = g.rhi->beginFrame(g.sc.get());
     if (r == QRhi::FrameOpSwapChainOutOfDate) {
-        g.hasSwapChain = g.sc->createOrResize();
-        if (!g.hasSwapChain) return;
+        if (!remade()) return;
         r = g.rhi->beginFrame(g.sc.get());
     }
     if (r == QRhi::FrameOpDeviceLost || r == QRhi::FrameOpError) {
@@ -587,7 +608,10 @@ void HdrSurface::render() {
         cb->draw(4);
     }
     cb->endPass();
-    g.rhi->endFrame(g.sc.get());
+    if (g.rhi->endFrame(g.sc.get()) == QRhi::FrameOpDeviceLost) {
+        stopHdr(tr("The graphics device was reset"));
+        return;
+    }
     if (++frames_ == 1) {
         // macOS reports the headroom once a frame is up: asked again straight after the first.
         QTimer::singleShot(100, this, [this] {
