@@ -132,7 +132,13 @@ QString InspectorWidget::signature() const {
         for (const auto& e : *chain) sig += QString(":%1%2").arg(e.id).arg(e.enabled ? "+" : "-");
         return sig;
     }
-    QString sig = QString("C%1:%2").arg(c->id).arg(QString::fromStdString(c->generator.type));
+    QString sig = QString("C%1:%2:%3").arg(c->id).arg(QString::fromStdString(c->generator.type)).arg(c->mediaId);
+    // A graphic's fields: rebuild when one is published, removed or renamed.
+    if (const Sequence* g = graphicOf(state_->project(), *c)) {
+        sig += QString("|F%1").arg(g->id);
+        for (const TemplateField& f : liveFields(*g))
+            sig += QString(":%1/%2/%3").arg(QString::fromStdString(f.id), QString::fromStdString(f.kind), QString::fromStdString(f.label));
+    }
     // Object and Bézier masks have their own controls: rebuild when one is chosen.
     for (const auto& e : c->effects) {
         const long shape = std::lround(e.p("mask.shape", 0));
@@ -253,10 +259,12 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
         t.key = QString("p%1:%2").arg(clipId).arg(effectId);
         t.clip = clipId;
         t.effect = effectId;
+        // (A clip's sound is mixed as it is inside a graphic: only what it shows is published.)
+        t.publishClip = kind == TrackKind::Video && effectId != clip.audio.id ? clipId : 0;
         return t;
     };
 
-    addGraphicSection(clip);
+    if (kind == TrackKind::Video) addGraphicSection(clip);
 
     // ---- Clip ---------------------------------------------------------------
     QFormLayout* form = addSection(clip.isGenerator() ? tr("Clip (Generated)") : tr("Clip"));
@@ -645,6 +653,8 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
         t.key = QString("p%1:%2").arg(owner).arg(effectId);
         t.owner = owner;
         t.effect = effectId;
+        // A picture clip's effects can be published (not a track's, bus's or colour group's).
+        if (const Sequence* s = state_->sequence(); kind == TrackKind::Video && s && edit::clipById(*s, owner)) t.publishClip = owner;
         return t;
     };
     for (size_t i = 0; i < effects.size(); ++i) {
@@ -1242,7 +1252,7 @@ void InspectorWidget::publishParameter(const Target& target, const std::string& 
                                                tr("Every clip that plays this sequence can set this as a field. Its label:"),
                                                QLineEdit::Normal, label, &ok).trimmed();
     if (!ok || name.isEmpty()) return;
-    if (const QString why = publishField(target.clip, target.effect, param, name); !why.isEmpty()) state_->message(why, 5000);
+    if (const QString why = publishField(target.publishClip, target.effect, param, name); !why.isEmpty()) state_->message(why, 5000);
 }
 
 void InspectorWidget::addGraphicSection(const Clip& clip) {
@@ -1299,13 +1309,22 @@ void InspectorWidget::addGraphicSection(const Clip& clip) {
             btn->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
             btn->setIconSize(QSize(28, 14));
             h->addWidget(btn, 1);
-            connect(btn, &QToolButton::clicked, this, [this, valueOf, setValue, f, label] {
+            connect(btn, &QToolButton::clicked, this, [this, valueOf, clipId, tplId, f, label] {
                 const QColor start(valueOf(f));
                 QColorDialog dlg(start, this);
                 dlg.setWindowTitle(label);
                 dlg.setOption(QColorDialog::DontUseNativeDialog);
-                connect(&dlg, &QColorDialog::currentColorChanged, this, [setValue, f](const QColor& c) { setValue(f, c.name()); });
-                if (dlg.exec() != QDialog::Accepted) setValue(f, start.name());
+                // Seen as it is picked; one undo step on OK, and Cancel leaves the clip as it was (its own value or none).
+                state_->beginGesture(tr("Change %1").arg(label));
+                connect(&dlg, &QColorDialog::currentColorChanged, this, [this, clipId, tplId, f](const QColor& c) {
+                    state_->updateGesture([&](Project& p, Sequence& s) {
+                        Clip* clip = edit::clipById(s, clipId);
+                        const Sequence* t = p.findSequence(tplId);
+                        std::string out;
+                        if (clip && t && normalizeFieldValue(p, *t, f, c.name().toStdString(), out)) clip->fields[f.id] = out;
+                    });
+                });
+                state_->endGesture(dlg.exec() == QDialog::Accepted);
             });
             refreshers_.push_back([btn, valueOf, f] {
                 const QColor c(valueOf(f));
@@ -1468,6 +1487,7 @@ void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const 
         }
         default: {
             auto* spin = new QDoubleSpinBox(row);
+            spin->setObjectName(QStringLiteral("param_%1_%2").arg(target.effect).arg(QString::fromStdString(name)));
             int decimals = pi.step >= 1 ? 0 : (pi.step >= 0.1 ? 1 : (pi.step >= 0.01 ? 2 : 3));
             spin->setDecimals(decimals);
             spin->setRange(pi.min, pi.max);
@@ -1500,7 +1520,7 @@ void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const 
             connect(spin, &QWidget::customContextMenuRequested, this, [spin, write, name, def, target, label, this](const QPoint& p) {
                 QMenu m;
                 m.addAction(tr("Reset to Default"), this, [write, name, def] { write({{name, def}}); });
-                if (target.clip) m.addAction(tr("Publish to Graphic…"), this, [this, target, name, label] { publishParameter(target, name, label); });
+                if (target.publishClip) m.addAction(tr("Publish to Graphic…"), this, [this, target, name, label] { publishParameter(target, name, label); });
                 m.exec(spin->mapToGlobal(p));
             });
             refreshWidget = [spin, slider, read, name, pi] {
@@ -1586,7 +1606,7 @@ void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const 
         };
     }
     // A clip's setting can be published as a field of the graphic its sequence is (core/GraphicsTemplate.h).
-    if (target.clip) {
+    if (target.publishClip) {
         row->setContextMenuPolicy(Qt::CustomContextMenu);
         connect(row, &QWidget::customContextMenuRequested, this, [this, row, target, name, label](const QPoint& p) {
             QMenu m;
@@ -1622,7 +1642,7 @@ void InspectorWidget::addStringRow(QFormLayout* form, const StringParamInfo& si,
             auto* edit = new QPlainTextEdit(content_);
             edit->setFixedHeight(64);
             std::function<void(QMenu*)> more;
-            if (target.clip)
+            if (target.publishClip)
                 more = [this, target, name, label](QMenu* m) {
                     m->addAction(tr("Publish to Graphic…"), this, [this, target, name, label] { publishParameter(target, name, label); });
                 };

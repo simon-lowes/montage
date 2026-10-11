@@ -30,10 +30,12 @@ QString saveSequenceAsGraphicsTemplate(EditorState* state, QWidget* parent, cons
                                   QString::fromStdString(s->name), &ok)
                 .trimmed();
         if (!ok || n.isEmpty()) return {};
+        // The name it is kept under decides what it replaces ("A: B" and "A_ B" are one template).
+        const QString folder = QString::fromStdString(graphicsTemplateFolderName(n.toStdString()));
         for (const GraphicsTemplateInfo& t : listGraphicsTemplates(graphicsTemplatesDirectory()))
-            if (QString::fromStdString(t.name).compare(n, Qt::CaseInsensitive) == 0 &&
+            if (QString::fromStdString(t.name).compare(folder, Qt::CaseInsensitive) == 0 &&
                 QMessageBox::question(parent, QObject::tr("Save as Graphics Template"),
-                                      QObject::tr("Replace the template \"%1\"?").arg(n)) != QMessageBox::Yes)
+                                      QObject::tr("Replace the template \"%1\"?").arg(QString::fromStdString(t.name))) != QMessageBox::Yes)
                 return {};
     }
     std::string path, err;
@@ -129,9 +131,14 @@ GraphicsTemplatesDialog::GraphicsTemplatesDialog(EditorState* state, QWidget* pa
         const int row = list_->currentRow();
         if (row < 0 || row >= int(templates_.size())) return;
         const QString name = QString::fromStdString(templates_[size_t(row)].name);
-        if (QMessageBox::question(this, tr("Delete Template"), tr("Delete the template \"%1\" and its files?").arg(name)) != QMessageBox::Yes)
+        if (QMessageBox::question(this, tr("Delete Template"),
+                                  tr("Move the template \"%1\" and its files to the Trash?\n\nProjects it was inserted into play its "
+                                     "pictures from there, so they would need relinking.")
+                                      .arg(name)) != QMessageBox::Yes)
             return;
-        QDir(QFileInfo(QString::fromStdString(templates_[size_t(row)].path)).absolutePath()).removeRecursively();
+        const QString dir = QFileInfo(QString::fromStdString(templates_[size_t(row)].path)).absolutePath();
+        if (!QFile::moveToTrash(dir) && !QDir(dir).removeRecursively())
+            QMessageBox::warning(this, tr("Delete Template"), tr("Cannot delete %1").arg(QDir::toNativeSeparators(dir)));
         reload();
     });
     connect(folderBtn, &QPushButton::clicked, this, [] {

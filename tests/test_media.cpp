@@ -91,6 +91,7 @@
 #include "render/Letterbox.h"
 #include "media/Psd.h"
 #include "media/MicBleed.h"
+#include "core/GraphicsTemplate.h"
 #include "render/ProjectManager.h"
 #include "PsdWriter.h"
 #include "render/AutoBroll.h"
@@ -9024,6 +9025,49 @@ private slots:
         QCOMPARE(replaced.active()->videoTracks[0].clips.size(), size_t(1));
     }
 
+    void consolidateKeepsGraphicPictures() {
+        // A picture only a graphic's picture field shows is used: collected with the project, and copied whole.
+        QTemporaryDir dir;
+        auto still = [&](const QString& name, QRgb c) {
+            QImage img(32, 18, QImage::Format_RGB32);
+            img.fill(c);
+            const QString f = dir.path() + '/' + name;
+            img.save(f);
+            return f.toStdString();
+        };
+        Project p = makeDefaultProject();
+        MediaItem logo = probeOrFail(p, still("logo.png", qRgb(200, 0, 0))), other = probeOrFail(p, still("other.png", qRgb(0, 0, 200)));
+        p.media.push_back(logo), p.media.push_back(other);
+        Sequence g = makeSequence(p, "Graphic", 1920, 1080, p.active()->fps);
+        QVERIFY(edit::placeMedia(p, g, logo.id, 0, 0, 50, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(publishField(g, *mediaFieldFor(p, g, g.videoTracks[0].clips[0].id, "Logo")).ok);
+        p.sequences.push_back(g);
+        MediaItem gm;
+        gm.id = p.newId();
+        gm.kind = MediaKind::Sequence;
+        gm.sequenceId = g.id;
+        gm.hasVideo = true;
+        p.media.push_back(gm);
+        Sequence& s = *p.active();
+        const edit::Result put = edit::placeMedia(p, s, gm.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        QVERIFY(put.ok);
+        edit::clipById(s, put.created[0])->fields["logo"] = std::to_string(other.id);
+        const std::vector<Id> used = usedMedia(p, {s.id});
+        QVERIFY(std::find(used.begin(), used.end(), other.id) != used.end());
+        ConsolidateOptions o;
+        o.folder = (dir.path() + "/collected").toStdString();
+        o.sequences = {s.id};
+        o.trim = true;
+        ConsolidateResult res;
+        std::string err;
+        QVERIFY2(consolidateProject(p, o, &res, {}, nullptr, &err), err.c_str());
+        Project back;
+        QVERIFY(loadProject(res.projectPath, back));
+        const MediaItem* kept = back.findMedia(other.id);
+        QVERIFY(kept && QFile::exists(QString::fromStdString(kept->path)));
+        QVERIFY(QString::fromStdString(kept->path).contains("/collected/Media/"));
+    }
+
     void projectManager() {
         // A: four seconds of a changing ramp (ProRes, 96 x 54 at 25 fps); B: a sound nothing uses; C: a still.
         Project gen = makeDefaultProject();
@@ -16061,6 +16105,17 @@ private slots:
         // Rendered with its own values: the template's white title comes out green for Ada.
         const Clip* ada = edit::clipById(*back.active(), Id(clip));
         QCOMPARE(ada->fields.at("colour"), std::string("#00ff00"));
+        RenderOptions ro;
+        ro.scale = 0.25;
+        const Image shown = renderProgramFrame(back, *back.active(), ada->start + ada->duration / 2, ro);
+        int green = 0, white = 0;
+        for (int y = 0; y < shown.height; ++y)
+            for (int x = 0; x < shown.width; ++x) {
+                const float* q = shown.at(x, y);
+                green += q[1] > 0.7f && q[0] < 0.3f && q[2] < 0.3f;
+                white += q[0] > 0.9f && q[1] > 0.9f && q[2] > 0.9f;
+            }
+        QVERIFY2(green > 20 && white < green / 4, qPrintable(QString("green %1, white %2").arg(green).arg(white)));
     }
 
     void voiceCloning() {

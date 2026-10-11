@@ -31,6 +31,7 @@
 #include <QScrollBar>
 #include <QSlider>
 #include <QPushButton>
+#include <QColorDialog>
 #include <QMenu>
 #include <QPainter>
 #include <QTabBar>
@@ -10125,6 +10126,57 @@ const auto seq = [this] { return state()->sequence(); };
         state()->undo();
         QVERIFY(!edit::clipById(*state()->sequence(), made[2]));
         QCOMPARE(edit::clipById(*state()->sequence(), clip)->fields.at("name"), std::string("Jane Smith"));
+        // The colour picker: Cancel leaves the graphic as it was (no value of its own, no undo step); OK is one step.
+        state()->setSelection({clip});
+        QApplication::processEvents();
+        auto pickColour = [&](bool accept) {
+            QTimer::singleShot(0, [accept] {
+                auto* dlg = qobject_cast<QColorDialog*>(QApplication::activeModalWidget());
+                QVERIFY(dlg);
+                dlg->setCurrentColor(Qt::green);
+                accept ? dlg->accept() : dlg->reject();
+            });
+            inspector->findChild<QToolButton*>("field_colour")->click();
+        };
+        int steps = int(state()->history().undoCount());
+        pickColour(false);
+        QVERIFY(!edit::clipById(*state()->sequence(), clip)->fields.count("colour"));
+        QCOMPARE(int(state()->history().undoCount()), steps);
+        pickColour(true);
+        QCOMPARE(edit::clipById(*state()->sequence(), clip)->fields.at("colour"), std::string("#00ff00"));
+        QCOMPARE(int(state()->history().undoCount()), steps + 1);
+        // A field published while an instance is selected shows up in its Graphic section.
+        const Id inserted = graphicOf(state()->project(), *edit::clipById(*state()->sequence(), clip))->id;  // (the library's copy)
+        QVERIFY(state()->edit("Publish", [&](Project& p, Sequence&) {
+            Sequence* g = p.findSequence(inserted);
+            const Id title = g->videoTracks[0].clips[0].id;
+            return publishField(*g, *fieldFor(*g, title, 0, "size", "Size")).ok;
+        }));
+        QApplication::processEvents();
+        QVERIFY(inspector->findChild<QWidget*>("field_size"));
+        // In the graphic itself, a clip's own effect can be published from its settings' menus.
+        Id gradeId = 0;
+        QVERIFY(state()->edit("Grade", [&](Project& p, Sequence&) {
+            Clip* t = edit::clipById(*p.findSequence(gid), titleId);
+            t->effects.push_back(makeEffect(p, "color_correct"));
+            gradeId = t->effects.back().id;
+            return true;
+        }));
+        state()->setActiveSequence(gid);
+        state()->setSelection({titleId});
+        QApplication::processEvents();
+        auto* sat = inspector->findChild<QDoubleSpinBox*>(QStringLiteral("param_%1_saturation").arg(gradeId));
+        QVERIFY(sat);
+        QStringList offered;
+        QTimer::singleShot(0, [&offered] {
+            if (auto* m = qobject_cast<QMenu*>(QApplication::activePopupWidget())) {
+                for (QAction* a : m->actions()) offered << a->text();
+                m->close();
+            }
+        });
+        emit sat->customContextMenuRequested(QPoint(2, 2));
+        QVERIFY2(offered.contains(QStringLiteral("Publish to Graphic…")), qPrintable(offered.join(", ")));
+        state()->setActiveSequence(main);
         qunsetenv("MONTAGE_TEMPLATES_DIR");
         state()->newProject();
     }

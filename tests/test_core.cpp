@@ -360,6 +360,148 @@ private slots:
         }
     }
 
+    void graphicsTemplateEdges() {
+        // Names a template can be kept under: never ".", "..", hidden, or cut short by Windows.
+        QCOMPARE(graphicsTemplateFolderName("."), std::string("Graphic"));
+        QCOMPARE(graphicsTemplateFolderName(".."), std::string("Graphic"));
+        QCOMPARE(graphicsTemplateFolderName("..x."), std::string("x"));
+        QCOMPARE(graphicsTemplateFolderName(" Lower Third. "), std::string("Lower Third"));
+        QCOMPARE(graphicsTemplateFolderName("A: B"), std::string("A_ B"));
+
+        // A 30 fps graphic: a title (its name published), a graded logo whose grade is shared with the clip after it
+        // (the halves of a split clip share effect ids) and published on the first, and a whoosh under it.
+        QTemporaryDir lib;
+        const QString image = lib.path() + "/logo.png";
+        QImage(8, 8, QImage::Format_RGBA8888).save(image);
+        Project q = makeDefaultProject();
+        Sequence g;
+        g.id = q.newId();
+        g.name = "Logo";
+        g.width = 1920, g.height = 1080, g.fps = {30, 1};
+        g.videoTracks.resize(2);
+        g.audioTracks.resize(1);
+        for (auto* tracks : {&g.videoTracks, &g.audioTracks})
+            for (Track& t : *tracks) t.id = q.newId();
+        Clip title;
+        title.id = q.newId();
+        title.duration = 90;
+        title.generator = makeEffect(q, "title");
+        g.videoTracks[0].clips.push_back(title);
+        MediaItem logo, whoosh;
+        logo.id = q.newId(), whoosh.id = q.newId();
+        logo.kind = MediaKind::Image, logo.path = image.toStdString(), logo.name = "logo.png";
+        whoosh.kind = MediaKind::Audio, whoosh.path = "/nowhere/whoosh.wav", whoosh.hasAudio = true, whoosh.duration = 3;
+        q.media.push_back(logo), q.media.push_back(whoosh);
+        const Effect grade = makeEffect(q, "color_correct");
+        Clip left, right;
+        left.id = q.newId(), right.id = q.newId();
+        left.mediaId = right.mediaId = logo.id;
+        left.duration = 45, right.start = 45, right.duration = 45;
+        left.effects = right.effects = {grade};  // the same id on both
+        g.videoTracks[1].clips = {left, right};
+        Clip sound;
+        sound.id = q.newId();
+        sound.mediaId = whoosh.id;
+        sound.duration = 30;
+        g.audioTracks[0].clips.push_back(sound);
+        QVERIFY(publishField(g, *fieldFor(g, title.id, 0, "text", "Name")).ok);
+        QVERIFY(publishField(g, *fieldFor(g, left.id, grade.id, "saturation", "Saturation")).ok);
+        // Not publishable: an animated setting (a field would flatten it), or a setting of the graphic's sound.
+        Sequence animated = g;
+        animated.videoTracks[0].clips[0].generator.params["size"].addKey(0, 10);
+        animated.videoTracks[0].clips[0].generator.params["size"].addKey(30, 90);
+        QVERIFY(!publishField(animated, *fieldFor(animated, title.id, 0, "size")).ok);
+        Effect vol = makeEffect(q, "volume");
+        g.audioTracks[0].clips[0].audio = vol;
+        QVERIFY(!publishField(g, *fieldFor(g, sound.id, vol.id, "gain_db")).ok);
+        MediaItem gm;
+        gm.id = q.newId();
+        gm.kind = MediaKind::Sequence;
+        gm.sequenceId = g.id;
+        gm.hasVideo = true;
+        q.media.push_back(gm);
+        q.sequences.push_back(g);
+
+        // Copies keep both fields, the shared grade's on the first clip's copy.
+        const Id copy = edit::duplicateSequence(q, g.id, "Copy");
+        QCOMPARE(liveFields(*q.findSequence(copy)).size(), size_t(2));
+        QCOMPARE(withFieldValues(q, *q.findSequence(copy), {{"saturation", "0.25"}}).videoTracks[1].clips[0].effects[0].p("saturation", 0), 0.25);
+        QCOMPARE(withFieldValues(q, *q.findSequence(copy), {{"saturation", "0.25"}}).videoTracks[1].clips[1].effects[0].p("saturation", 0), 1.0);
+
+        // The library: a name made of dots stays inside it, and a folder that is not a template is left alone.
+        const std::string folder = lib.path().toStdString() + "/templates";
+        QFile sentinel(lib.path() + "/keep.txt");
+        QVERIFY(sentinel.open(QIODevice::WriteOnly));
+        sentinel.close();
+        std::string saved, why;
+        QVERIFY2(saveGraphicsTemplate(q, g.id, "..", folder, &saved, &why), why.c_str());
+        QVERIFY(QString::fromStdString(saved).endsWith("/templates/Graphic/Graphic.montage"));
+        QVERIFY(QFile::exists(lib.path() + "/keep.txt"));
+        QVERIFY(QDir().mkpath(lib.path() + "/templates/Notes"));
+        QFile notes(lib.path() + "/templates/Notes/mine.txt");
+        QVERIFY(notes.open(QIODevice::WriteOnly));
+        notes.close();
+        QVERIFY(!saveGraphicsTemplate(q, g.id, "Notes", folder, &saved, &why));
+        QVERIFY(QFile::exists(lib.path() + "/templates/Notes/mine.txt"));
+        QVERIFY2(saveGraphicsTemplate(q, g.id, "Logo", folder, &saved, &why), why.c_str());
+        QCOMPARE(QDir(lib.path() + "/templates").entryList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::Hidden).size(), 3);  // nothing left over
+
+        // Inserted: its length in the sequence's frames, its whoosh on a new audio track (A1's music untouched).
+        Project into = makeDefaultProject();
+        Sequence& is = *into.active();
+        is.fps = {60, 1};
+        MediaItem song;
+        song.id = into.newId();
+        song.kind = MediaKind::Audio, song.path = "/nowhere/song.wav", song.hasAudio = true, song.duration = 60;
+        into.media.push_back(song);
+        Clip music;
+        music.id = into.newId();
+        music.mediaId = song.id;
+        music.duration = 600;
+        is.audioTracks[0].clips.push_back(music);
+        const size_t audioTracks = is.audioTracks.size();
+        const edit::Result r = insertGraphicsTemplate(into, is, saved, 30);
+        QVERIFY2(r.ok, r.error.c_str());
+        Sequence& is2 = *into.active();
+        const Clip* gc = edit::clipById(is2, r.created[0]);
+        QCOMPARE(gc->duration, FrameTime(180));  // 3 s at 60 fps
+        QCOMPARE(is2.audioTracks.size(), audioTracks + 1);
+        QCOMPARE(is2.audioTracks[0].clips.size(), size_t(1));
+        QCOMPARE(is2.audioTracks[0].clips[0].duration, FrameTime(600));
+        QCOMPARE(is2.audioTracks.back().clips.size(), size_t(1));
+        // Saved again under its own name (it plays the template's own files): they are still there afterwards.
+        const MediaItem* used = into.findMedia(graphicOf(into, *gc)->videoTracks[1].clips[0].mediaId);
+        const QString usedPath = QString::fromStdString(used->path);
+        QVERIFY(usedPath.endsWith("/templates/Logo/logo.png"));
+        std::string again;
+        QVERIFY2(saveGraphicsTemplate(into, graphicOf(into, *gc)->id, "Logo", folder, &again, &why), why.c_str());
+        QCOMPARE(again, saved);
+        QVERIFY(QFile::exists(usedPath));
+        QCOMPARE(listGraphicsTemplates(folder).size(), size_t(2));  // Graphic and Logo
+
+        // Filled from a table: a blank row skipped, a blank number kept, blank text emptied, a quote after a space
+        // read as quoting; each copy brings its whoosh.
+        std::vector<Id> made;
+        const edit::Result filled =
+            fillGraphicsFromTable(into, is2, r.created[0], "Name,Saturation\nJane,\n,0.5\n,,\nKim, \"0.25\"\n", &made);
+        QVERIFY2(filled.ok, filled.error.c_str());
+        QCOMPARE(made.size(), size_t(3));
+        const Clip* c1 = edit::clipById(is2, made[0]);
+        const Clip* c2 = edit::clipById(is2, made[1]);
+        const Clip* c3 = edit::clipById(is2, made[2]);
+        QCOMPARE(c1->fields.at("name"), std::string("Jane"));
+        QVERIFY(!c1->fields.count("saturation"));
+        QCOMPARE(c2->fields.at("name"), std::string());
+        QCOMPARE(c2->fields.at("saturation"), std::string("0.5"));
+        QCOMPARE(c3->fields.at("saturation"), std::string("0.25"));
+        for (Id m : {made[1], made[2]}) {
+            int sounds = 0;
+            for (Id l : edit::linkedClips(is2, m))
+                if (edit::locate(is2, l)->track.kind == TrackKind::Audio) ++sounds;
+            QCOMPARE(sounds, 1);
+        }
+    }
+
     void gzipAndTar() {
         // A gzipped GNU tar (as Python's tarfile writes it): a file, a folder, and a file under it with a name past
         // 100 characters.

@@ -36,6 +36,7 @@ private:
         Id clip = 0;  // a clip's own effect: value changes reach the same effect on the other selected clips
         Id effect = 0;
         Id owner = 0;  // the clip, track, bus or sequence whose chain holds the effect
+        Id publishClip = 0;  // a picture clip of the open sequence: its settings can be published to the graphic it is part of
     };
     // The other selected clips a change to `target` also goes to (Resolve's multi-clip Inspector), and applying
     // `fn` to their matching effects at their own times, inside an edit.

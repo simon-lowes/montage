@@ -86,7 +86,9 @@ FrameTime sourceLimit(const Project& p, const Sequence& s, const Clip& c) {
     if (!m) return kInfiniteFrames;
     if (m->kind == MediaKind::Sequence) {
         const Sequence* nested = p.findSequence(m->sequenceId);
-        return nested ? std::max<FrameTime>(1, nested->duration()) : kInfiniteFrames;
+        if (!nested) return kInfiniteFrames;
+        // In this sequence's frames, as it plays (a 3 s graphic at 30 fps lasts 180 frames of a 60 fps sequence).
+        return std::max<FrameTime>(1, FrameTime(std::ceil(double(nested->duration()) * s.fpsValue() / nested->fpsValue() - 1e-6)));
     }
     return mediaFrames(*m, s);
 }
@@ -1803,11 +1805,14 @@ Id duplicateSequence(Project& p, Id id, const std::string& name, std::map<Id, Id
     Sequence s = *src;
     s.id = p.newId();
     s.name = name.empty() ? src->name + " Copy" : name;
-    std::map<Id, Id> clips, groups, buses, effects;
+    std::map<Id, Id> clips, groups, buses;
+    // Effect ids are not unique within a sequence (a split clip's halves share them), so a clip's are found by both.
+    std::map<std::pair<Id, Id>, Id> effects;
+    Id owner = 0;  // the clip (its old id) whose effects are being renewed, 0 for others
     auto renew = [&](Effect& e) {
         if (e.id) {
             const Id fresh = p.newId();
-            effects[e.id] = fresh;
+            effects[{owner, e.id}] = fresh;
             e.id = fresh;
         }
     };
@@ -1840,6 +1845,7 @@ Id duplicateSequence(Project& p, Id id, const std::string& name, std::map<Id, Id
             for (Clip& c : t.clips) {
                 const Id fresh = p.newId();
                 clips[c.id] = fresh;
+                owner = c.id;
                 c.id = fresh;
                 if (c.linkGroup) {
                     auto [it, added] = groups.try_emplace(c.linkGroup, 0);
@@ -1848,6 +1854,7 @@ Id duplicateSequence(Project& p, Id id, const std::string& name, std::map<Id, Id
                 }
                 for (Effect* e : {&c.generator, &c.motion, &c.audio, &c.timing}) renew(*e);
                 for (Effect& e : c.effects) renew(e);
+                owner = 0;
                 if (c.colorGroup) c.colorGroup = colorGroups.count(c.colorGroup) ? colorGroups[c.colorGroup] : 0;
             }
             for (Transition& tr : t.transitions) {
@@ -1863,9 +1870,10 @@ Id duplicateSequence(Project& p, Id id, const std::string& name, std::map<Id, Id
     }
     // A graphic's published fields follow their clips and effects to the copies.
     for (TemplateField& f : s.fields) {
-        if (f.effect && !effects.count(f.effect)) f.clip = 0;
+        const auto effect = effects.find({f.clip, f.effect});
+        if (f.effect && effect == effects.end()) f.clip = 0;
+        if (f.effect) f.effect = effect != effects.end() ? effect->second : 0;
         f.clip = clips.count(f.clip) ? clips[f.clip] : 0;
-        if (f.effect) f.effect = effects[f.effect];
     }
     // Settings naming a track (a compressor's or gate's sidechain) follow it to its copy.
     std::map<std::string, std::string> tracks;

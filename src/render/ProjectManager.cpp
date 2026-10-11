@@ -2,11 +2,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <map>
 #include <set>
 
 #include "Exporter.h"
+#include "core/GraphicsTemplate.h"
 #include "core/Interpretation.h"
 #include "core/EditOps.h"
 #include "core/ProjectIO.h"
@@ -57,6 +59,22 @@ fs::path uniqueIn(const fs::path& dir, const std::string& stem, const std::strin
     }
 }
 
+// The pictures graphics show through their published picture fields (core/GraphicsTemplate.h).
+std::set<Id> fieldMedia(const Project& p, const Sequence& s) {
+    std::set<Id> out;
+    for (TrackRef r : allTracks(s))
+        for (const Clip& c : trackAt(s, r)->clips) {
+            if (c.fields.empty()) continue;
+            const Sequence* g = graphicOf(p, c);
+            if (!g) continue;
+            for (const TemplateField& f : g->fields)
+                if (f.kind == "media")
+                    if (const auto it = c.fields.find(f.id); it != c.fields.end())
+                        if (const Id id = Id(std::strtoull(it->second.c_str(), nullptr, 10)); p.findMedia(id)) out.insert(id);
+        }
+    return out;
+}
+
 }  // namespace
 
 std::vector<Id> usedMedia(const Project& p, const std::vector<Id>& sequences) {
@@ -69,6 +87,7 @@ std::vector<Id> usedMedia(const Project& p, const std::vector<Id>& sequences) {
                 for (const Take& t : c.takes)  // an audition's other takes
                     if (p.findMedia(t.mediaId)) used.insert(t.mediaId);
             }
+        for (Id m : fieldMedia(p, *s)) used.insert(m);
     }
     return {used.begin(), used.end()};
 }
@@ -147,6 +166,8 @@ bool consolidateProject(const Project& p, const ConsolidateOptions& o, Consolida
             for (TrackRef r : allTracks(s))
                 for (const Clip& c : trackAt(s, r)->clips)
                     for (size_t k = 0; k < c.takes.size(); ++k) aTake |= int(k) != c.take && c.takes[k].mediaId == m.id;
+        // So is a graphic's picture: it plays over the span of the template's clip, not one of its own.
+        for (const Sequence& s : q.sequences) aTake |= fieldMedia(q, s).count(m.id) > 0;
         // Stereo footage is copied whole too: rendered, it would keep one eye.
         const bool trimHere = o.trim && m.kind == MediaKind::Video && m.hasVideo && last > first && !aTake && m.stereo.empty();
         if (trimHere) {

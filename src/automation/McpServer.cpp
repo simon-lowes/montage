@@ -5157,10 +5157,10 @@ void McpServer::Impl::addTools() {
             }
             if (action == "insert") {
                 QString path = need(a, "template");
-                if (!QFileInfo::exists(absolute(path)))
+                if (!QFileInfo(absolute(path)).isFile())
                     for (const GraphicsTemplateInfo& t : listGraphicsTemplates(folder))
                         if (QString::fromStdString(t.name).compare(path, Qt::CaseInsensitive) == 0) path = QString::fromStdString(t.path);
-                if (!QFileInfo::exists(absolute(path))) throw ArgError{QStringLiteral("No template \"%1\" (see action templates)").arg(path)};
+                if (!QFileInfo(absolute(path)).isFile()) throw ArgError{QStringLiteral("No template \"%1\" (see action templates)").arg(path)};
                 Sequence& s = l.seq();
                 const FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : 0;
                 const edit::Result r = insertGraphicsTemplate(l.project, s, absolute(path).toStdString(), at, -1);

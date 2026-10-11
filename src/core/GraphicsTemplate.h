@@ -66,9 +66,14 @@ struct GraphicsTemplateInfo {
 // Where templates are kept: $MONTAGE_TEMPLATES_DIR, else "Graphics Templates" in the app's data folder.
 std::string graphicsTemplatesDirectory();
 // Saves sequence `sequence` of `p` (with the sequences it nests, and the files its clips play copied beside it) as
-// template `name` in `folder`: <folder>/<name>/<name>.montage, replacing one of that name. `path` gets the file.
+// template `name` in `folder`: <folder>/<name>/<name>.montage, replacing one of that name (only a template: another
+// folder of that name is refused). It is written beside it and swapped in, so a failure leaves the old one. `path` gets
+// the file.
 bool saveGraphicsTemplate(const Project& p, Id sequence, const std::string& name, const std::string& folder, std::string* path = nullptr,
                           std::string* error = nullptr);
+// The folder (and file) name template `name` is kept under: characters files cannot have become "_", leading dots
+// and trailing dots and spaces go ("Graphic" if nothing is left).
+std::string graphicsTemplateFolderName(const std::string& name);
 // The templates in `folder`, by name.
 std::vector<GraphicsTemplateInfo> listGraphicsTemplates(const std::string& folder);
 // Brings the template at `path` into `p` (its sequences and media, with new ids) and places a clip of it at `at` on

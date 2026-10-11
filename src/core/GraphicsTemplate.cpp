@@ -4,6 +4,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QStandardPaths>
+#include <QTemporaryDir>
 #include <QString>
 #include <algorithm>
 #include <cctype>
@@ -122,7 +123,8 @@ std::vector<std::vector<std::string>> csvRows(const std::string& text, char sep)
             if (c == '"' && i + 1 < text.size() && text[i + 1] == '"') cur += '"', ++i;
             else if (c == '"') quoted = false;
             else cur += c;
-        } else if (c == '"' && cur.empty()) {
+        } else if (c == '"' && trim(cur).empty()) {
+            cur.clear();  // ("a, "b, c"": the space before a quote is not the cell's)
             quoted = any = true;
         } else if (c == sep) {
             row.push_back(cur);
@@ -202,7 +204,16 @@ std::optional<TemplateField> mediaFieldFor(const Project& p, const Sequence& s, 
 }
 
 edit::Result publishField(Sequence& s, TemplateField f, std::string* id) {
-    if (!edit::clipById(s, f.clip)) return edit::Result::fail("No such clip in the sequence");
+    Clip* c = edit::clipById(s, f.clip);
+    if (!c) return edit::Result::fail("No such clip in the sequence");
+    // What a graphic shows: its sound is mixed as it is, so a field there would change nothing.
+    if (const auto at = edit::locate(s, f.clip); at && at->track.kind == TrackKind::Audio)
+        return edit::Result::fail("Only what a graphic shows can be published, not its sound");
+    // A field sets one value, which would flatten the setting's animation.
+    if (const Effect* e = f.kind == "media" || f.kind == "text" ? nullptr : effectOf(*c, f.effect))
+        for (const std::string& k : {f.param, f.param + ".r", f.param + ".g", f.param + ".b"})
+            if (const auto it = e->params.find(k); it != e->params.end() && it->second.animated())
+                return edit::Result::fail("\"" + f.label + "\" is animated: a field sets one value, so remove its keyframes first");
     for (const TemplateField& o : s.fields)
         if (o.clip == f.clip && o.effect == f.effect && o.param == f.param && o.kind == f.kind)
             return edit::Result::fail("\"" + o.label + "\" already publishes that");
@@ -366,23 +377,34 @@ edit::Result fillGraphicsFromTable(Project& p, Sequence& s, Id clip, const std::
     if (std::none_of(columns.begin(), columns.end(), [](const TemplateField* f) { return f; }))
         return edit::Result::fail("No column of the table names a field of the graphic");
     // Every value checked before anything changes.
+    // A blank row (a spreadsheet's trailing ",,,") is skipped; a blank cell keeps the graphic's value, except text,
+    // which it empties (a lower third with no second line).
     std::vector<std::map<std::string, std::string>> values;
     for (size_t r = 1; r < rows.size(); ++r) {
+        if (std::all_of(rows[r].begin(), rows[r].end(), [](const std::string& cell) { return trim(cell).empty(); })) continue;
         std::map<std::string, std::string> v = first->fields;
         for (size_t k = 0; k < columns.size() && k < rows[r].size(); ++k) {
             if (!columns[k]) continue;
+            const bool text = columns[k]->kind == "text";
+            if (!text && trim(rows[r][k]).empty()) continue;
             std::string out, err;
-            if (!normalizeFieldValue(p, *tpl, *columns[k], rows[r][k], out, &err))
+            if (!normalizeFieldValue(p, *tpl, *columns[k], text ? rows[r][k] : trim(rows[r][k]), out, &err))
                 return edit::Result::fail("Row " + std::to_string(r + 1) + ": " + err);
             v[columns[k]->id] = out;
         }
         values.push_back(std::move(v));
     }
+    if (values.empty()) return edit::Result::fail("The table has no rows of values");
     const Clip base = *first;
+    // The graphic's own sound (a whoosh) goes with each copy, on its track or the first free one below.
+    std::vector<std::pair<int, Clip>> sounds;
+    for (Id l : edit::linkedClips(s, clip))
+        if (const auto at = edit::locate(s, l); at && at->track.kind == TrackKind::Audio) sounds.push_back({at->track.index, *edit::clipById(s, l)});
     edit::Result all;
     all.ok = true;
     edit::clipById(s, clip)->fields = values[0];
     all.created.push_back(clip);
+    std::vector<Id> graphics{clip};  // (all.created has their sound too)
     FrameTime at = base.end();
     for (size_t r = 1; r < values.size(); ++r) {
         // On the graphic's track if the stretch is free, else the first track above where it is.
@@ -398,14 +420,32 @@ edit::Result fillGraphicsFromTable(Project& p, Sequence& s, Id clip, const std::
         Clip c = base;
         c.id = p.newId();
         c.start = at;
-        c.linkGroup = 0;
+        c.linkGroup = sounds.empty() ? 0 : p.newId();
         c.fields = values[r];
         const edit::Result put = edit::overwrite(p, s, {TrackKind::Video, t}, c);
         if (!put.ok) return put;
         all.created.insert(all.created.end(), put.created.begin(), put.created.end());
+        graphics.push_back(c.id);
+        for (const auto& [track, sound] : sounds) {
+            Clip a = sound;
+            a.id = p.newId();
+            a.start = at + (sound.start - base.start);
+            a.linkGroup = c.linkGroup;
+            auto freeOn = [&](int k) {
+                if (k >= int(s.audioTracks.size())) return true;
+                const Track& tr = s.audioTracks[size_t(k)];
+                return !tr.locked && std::none_of(tr.clips.begin(), tr.clips.end(), [&](const Clip& o) { return o.start < a.end() && a.start < o.end(); });
+            };
+            int k = track;
+            while (!freeOn(k)) ++k;
+            while (k >= int(s.audioTracks.size())) edit::addTrack(p, s, TrackKind::Audio);
+            const edit::Result heard = edit::overwrite(p, s, {TrackKind::Audio, k}, a);
+            if (!heard.ok) return heard;
+            all.created.insert(all.created.end(), heard.created.begin(), heard.created.end());
+        }
         at += base.duration;
     }
-    if (made) *made = all.created;
+    if (made) *made = graphics;
     return all;
 }
 
@@ -416,15 +456,14 @@ std::string graphicsTemplatesDirectory() {
     return (QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/Graphics Templates")).toStdString();
 }
 
-namespace {
-
-std::string safeName(const std::string& name) {
+std::string graphicsTemplateFolderName(const std::string& name) {
     std::string out;
-    for (char c : trim(name)) out += std::string("/\\:*?\"<>|").find(c) == std::string::npos ? c : '_';
+    for (char c : trim(name)) out += std::string("/\\:*?\"<>|").find(c) == std::string::npos && (unsigned char)c >= 32 ? c : '_';
+    // Not ".", "..", hidden, or a name Windows would cut short.
+    while (!out.empty() && out.front() == '.') out.erase(out.begin());
+    while (!out.empty() && (out.back() == '.' || out.back() == ' ')) out.pop_back();
     return out.empty() ? std::string("Graphic") : out;
 }
-
-}  // namespace
 
 bool saveGraphicsTemplate(const Project& p, Id sequence, const std::string& name, const std::string& folder, std::string* path,
                           std::string* error) {
@@ -433,13 +472,26 @@ bool saveGraphicsTemplate(const Project& p, Id sequence, const std::string& name
         if (error) *error = "No such sequence";
         return false;
     }
-    const std::string base = safeName(name);
-    const QString dir = QString::fromStdString(folder) + '/' + QString::fromStdString(base);
-    QDir(dir).removeRecursively();
-    if (!QDir().mkpath(dir)) {
-        if (error) *error = "Cannot make " + dir.toStdString();
+    const std::string base = graphicsTemplateFolderName(name);
+    const QString root = QString::fromStdString(folder), final = root + '/' + QString::fromStdString(base),
+                  finalFile = final + '/' + QString::fromStdString(base) + QStringLiteral(".montage");
+    // Only a template is replaced: another folder of that name is not ours to remove.
+    if (QFileInfo::exists(final) && !QFileInfo(finalFile).isFile() && !QDir(final).isEmpty()) {
+        if (error) *error = final.toStdString() + " is not a template, so it is left alone";
         return false;
     }
+    // Written beside it first, then swapped in: a failure leaves the old one, and its files can be the ones copied
+    // (a template saved again after it was inserted plays them).
+    if (!QDir().mkpath(root)) {
+        if (error) *error = "Cannot make " + folder;
+        return false;
+    }
+    QTemporaryDir temp(root + QStringLiteral("/.saving-XXXXXX"));
+    if (!temp.isValid()) {
+        if (error) *error = "Cannot write in " + folder;
+        return false;
+    }
+    const QString dir = temp.path();
     Project t;
     t.name = base;
     const std::vector<Id> ids = importFromProject(t, p, {sequence});
@@ -457,27 +509,43 @@ bool saveGraphicsTemplate(const Project& p, Id sequence, const std::string& name
     std::set<QString> names;
     for (MediaItem& m : t.media) {
         if (m.kind == MediaKind::Sequence || m.path.empty()) continue;
-        const std::string file = uninterpretedPath(m.path);
+        // The file itself: without how it is read (Interpret Footage) or which layer of a Photoshop file it shows.
+        std::string file = uninterpretedPath(m.path);
+        if (const size_t layer = file.rfind("#layer="); layer != std::string::npos) file.resize(layer);
         if (!QFileInfo(QString::fromStdString(file)).isFile()) continue;  // (an image sequence or missing file stays where it is)
         std::string& to = copied[file];
         if (to.empty()) {
             const QFileInfo fi(QString::fromStdString(file));
-            QString target = dir + '/' + fi.fileName();
-            for (int n = 2; names.count(target) || QFileInfo::exists(target); ++n)
-                target = dir + '/' + fi.completeBaseName() + ' ' + QString::number(n) + '.' + fi.suffix();
-            names.insert(target);
-            if (!QFile::copy(fi.absoluteFilePath(), target)) {
+            QString target = fi.fileName();
+            for (int n = 2; names.count(target.toLower()) || target.compare(QString::fromStdString(base) + QStringLiteral(".montage"), Qt::CaseInsensitive) == 0; ++n)
+                target = fi.completeBaseName() + ' ' + QString::number(n) + '.' + fi.suffix();
+            names.insert(target.toLower());
+            if (!QFile::copy(fi.absoluteFilePath(), dir + '/' + target)) {
                 if (error) *error = "Cannot copy " + file;
                 return false;
             }
-            to = target.toStdString();
+            to = (final + '/' + target).toStdString();  // where it will be once swapped in
         }
-        m.path = to + m.path.substr(file.size());  // keeping how it is read (Interpret Footage)
+        m.path = to + m.path.substr(file.size());  // keeping how it is read (Interpret Footage, a PSD layer)
         m.proxyPath.clear();
     }
-    const std::string file = (dir + '/' + QString::fromStdString(base) + QStringLiteral(".montage")).toStdString();
-    if (!saveProject(t, file, error)) return false;
-    if (path) *path = file;
+    if (!saveProject(t, (dir + '/' + QString::fromStdString(base) + QStringLiteral(".montage")).toStdString(), error)) return false;
+    QFile::remove(dir + '/' + QString::fromStdString(base) + QStringLiteral(".montage.bak"));
+    // The swap: the old one aside, the new one in, the old one gone (or back if the new one would not go in).
+    const QString old = root + QStringLiteral("/.replaced-") + QFileInfo(dir).fileName().mid(8);
+    const bool had = QFileInfo::exists(final);
+    if (had && !QDir().rename(final, old)) {
+        if (error) *error = "Cannot replace " + final.toStdString() + " (is a file in it open?)";
+        return false;
+    }
+    if (!QDir().rename(dir, final)) {
+        if (had) QDir().rename(old, final);
+        if (error) *error = "Cannot write " + final.toStdString();
+        return false;
+    }
+    temp.setAutoRemove(false);
+    if (had) QDir(old).removeRecursively();
+    if (path) *path = finalFile.toStdString();
     return true;
 }
 
@@ -524,7 +592,10 @@ edit::Result insertGraphicsTemplate(Project& p, Sequence& s, const std::string& 
         if (std::find(p.bins.begin(), p.bins.end(), m->bin) == p.bins.end()) p.bins.push_back(m->bin);
     }
     const int v = track < 0 ? edit::addTrack(p, *sq, TrackKind::Video).index : track;
-    TrackRef audio{TrackKind::Audio, 0};
+    // Its sound (a whoosh) on a new audio track too, never over the sequence's dialogue or music.
+    const Sequence* g = p.findSequence(ids[0]);
+    const bool sound = g && std::any_of(g->audioTracks.begin(), g->audioTracks.end(), [](const Track& t) { return !t.clips.empty(); });
+    const TrackRef audio{TrackKind::Audio, sound ? edit::addTrack(p, *sq, TrackKind::Audio).index : 0};
     return edit::placeMedia(p, *sq, media, at, 0, -1, {TrackKind::Video, v}, audio, false);
 }
 
