@@ -1360,6 +1360,7 @@ int cmdPresets() {
 int main(int argc, char** argv) {
     if (qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM")) qputenv("QT_QPA_PLATFORM", "offscreen");
     QGuiApplication app(argc, argv);  // fonts for title rendering
+    initInference();  // (the provider libraries and Tools › AI Models Run On, as the app has them)
     std::vector<std::string> args(argv + 1, argv + argc);
     if (args.empty()) return usage();
     std::string cmd = args[0];
@@ -1373,10 +1374,15 @@ int main(int argc, char** argv) {
     if (cmd == "devices") {  // where the AI models can run (media/Inference.h)
         for (const InferenceDevice& d : inferenceDevices())
             std::printf("%-4s %s%s\n", d.kind.c_str(), d.provider.c_str(), d.vendor.empty() ? "" : (" (" + d.vendor + ")").c_str());
-        std::printf("Models run: %s (MONTAGE_INFERENCE=auto|efficient|cpu)\n", inferenceModeName(inferenceMode()));
+        std::printf("Models run: %s%s\n", inferenceModeName(inferenceMode()),
+                    inferenceModeOverridden() ? " (from MONTAGE_INFERENCE)" : " (Tools > AI Models Run On; MONTAGE_INFERENCE=auto|efficient|cpu overrides it)");
+        if (const std::string e = lastInferenceLibraryError(); !e.empty()) std::printf("A provider library was not taken: %s\n", e.c_str());
         std::string why;
+        const int before = inferenceFallbacks();
         const bool ok = inferenceCheck(&why);
-        std::printf("A test model: %s\n", ok ? "ran" : why.c_str());
+        if (!ok) std::printf("A test model: %s\n", why.c_str());
+        else if (inferenceFallbacks() > before) std::printf("A test model: ran on the processor (the device would not take it: %s)\n", lastInferenceFallback().c_str());
+        else std::printf("A test model: ran\n");
         return ok ? 0 : 1;
     }
     if (cmd == "colorspaces") {

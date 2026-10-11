@@ -249,7 +249,7 @@ bool soundSearchAvailable() { return true; }
 
 struct SoundModel::Impl {
     Ort::Env env{ORT_LOGGING_LEVEL_ERROR, "montage-sound"};
-    std::unique_ptr<Ort::Session> text, audio;
+    std::unique_ptr<OrtModel> text, audio;
     ClapTokenizer tokenizer;
 };
 

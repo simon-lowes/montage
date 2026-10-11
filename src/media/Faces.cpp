@@ -118,7 +118,7 @@ bool faceSearchAvailable() { return true; }
 
 struct FaceModel::Impl {
     Ort::Env env{ORT_LOGGING_LEVEL_ERROR, "montage-faces"};
-    std::unique_ptr<Ort::Session> detector, recogniser;
+    std::unique_ptr<OrtModel> detector, recogniser;
 };
 
 FaceModel::FaceModel() : d_(std::make_unique<Impl>()) {}

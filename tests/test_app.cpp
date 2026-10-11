@@ -4569,13 +4569,26 @@ private slots:
     }
 
     void aiRunsOn() {
-        // Tools > AI Models Run On: one choice checked at a time, remembered in the settings.
-        QVERIFY(win_->findChild<QMenu*>("aiRunOn"));
+        // Tools > AI Models Run On: one choice checked at a time, remembered in the settings; fixed while
+        // MONTAGE_INFERENCE says where models run (as it does in these tests).
+        auto* menu = win_->findChild<QMenu*>("aiRunOn");
+        QVERIFY(menu);
         QVERIFY(win_->findChild<QAction*>("aiDevices"));
         auto* efficient = win_->findChild<QAction*>("aiRunOn_efficient");
         auto* cpu = win_->findChild<QAction*>("aiRunOn_cpu");
         auto* automatic = win_->findChild<QAction*>("aiRunOn_auto");
         QVERIFY(efficient && cpu && automatic);
+        const QByteArray was = qgetenv("MONTAGE_INFERENCE");
+        qputenv("MONTAGE_INFERENCE", "cpu");
+        emit menu->aboutToShow();
+        QVERIFY(!efficient->isEnabled() && efficient->toolTip().contains("MONTAGE_INFERENCE"));
+        qunsetenv("MONTAGE_INFERENCE");
+        auto restore = qScopeGuard([&] {
+            qputenv("MONTAGE_INFERENCE", was);
+            emit menu->aboutToShow();
+        });
+        emit menu->aboutToShow();
+        QVERIFY(efficient->isEnabled());
         efficient->trigger();
         QVERIFY(efficient->isChecked() && !automatic->isChecked() && !cpu->isChecked());
         QCOMPARE(appSettings().value("ai/inference").toString(), QString("efficient"));

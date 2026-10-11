@@ -121,7 +121,7 @@ namespace {
 
 struct Model {
     Ort::Env env{ORT_LOGGING_LEVEL_ERROR, "montage-rife"};
-    std::unique_ptr<Ort::Session> session;
+    std::unique_ptr<OrtModel> session;
 };
 
 std::shared_ptr<Model> loadModel(std::string* error) {

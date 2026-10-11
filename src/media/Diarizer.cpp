@@ -289,7 +289,7 @@ constexpr int kPowerset[7][kLocal] = {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}
 
 struct Models {
     Ort::Env env{ORT_LOGGING_LEVEL_ERROR, "montage-speakers"};
-    std::unique_ptr<Ort::Session> segmentation, embedding;
+    std::unique_ptr<OrtModel> segmentation, embedding;
 };
 
 std::shared_ptr<Models> loadModels(std::string* error) {

@@ -195,7 +195,7 @@ namespace {
 
 struct Model {
     Ort::Env env{ORT_LOGGING_LEVEL_ERROR, "montage-stems"};
-    std::unique_ptr<Ort::Session> session;
+    std::unique_ptr<OrtModel> session;
     int stems = 0;
 };
 

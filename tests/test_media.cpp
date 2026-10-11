@@ -17489,11 +17489,17 @@ private slots:
         // The processor is always among the devices; a model runs in every mode (falling back to the processor when the
         // device chosen cannot take it), and the environment variable wins over the setting.
         const auto devices = montage::inferenceDevices();
-        QVERIFY(!devices.empty());
+        if (devices.empty()) QSKIP("Built without ONNX Runtime");
+        const QByteArray was = qgetenv("MONTAGE_INFERENCE");
+        auto restore = qScopeGuard([&] {
+            qputenv("MONTAGE_INFERENCE", was);
+            setInferenceMode(InferenceMode::Auto);
+        });
         QVERIFY(std::any_of(devices.begin(), devices.end(), [](const InferenceDevice& d) { return d.kind == "CPU"; }));
         InferenceMode parsed;
         QVERIFY(parseInferenceMode("efficient", parsed) && parsed == InferenceMode::Efficient);
         QVERIFY(!parseInferenceMode("gpu", parsed));
+        QVERIFY(parseInferenceMode("CPU", parsed) && parsed == InferenceMode::Cpu);  // (any case)
         qunsetenv("MONTAGE_INFERENCE");
         for (InferenceMode m : {InferenceMode::Auto, InferenceMode::Efficient, InferenceMode::Cpu}) {
             setInferenceMode(m);
@@ -17501,11 +17507,36 @@ private slots:
             std::string why;
             QVERIFY2(inferenceCheck(&why), why.c_str());
         }
-        qputenv("MONTAGE_INFERENCE", "cpu");  // (as the tests run)
+        QVERIFY(!inferenceModeOverridden());
+        // A mode changed after a model opened: it opens again for the new one and still runs.
+        setInferenceMode(InferenceMode::Cpu);
+        QVERIFY(inferenceCheck());
+        qputenv("MONTAGE_INFERENCE", "Cpu");  // (as the tests run)
         setInferenceMode(InferenceMode::Auto);
         QCOMPARE(inferenceMode(), InferenceMode::Cpu);
-        // A folder of things that are not provider libraries registers none.
+        QVERIFY(inferenceModeOverridden());
+        // No folder, and a folder of things that are not provider libraries (a text file named as one, and a link to it):
+        // none registered, and why the file was refused kept.
         QCOMPARE(registerInferenceLibraries(path("no-providers-here")), 0);
+        const QString folder = QString::fromStdString(path("providers"));
+        QVERIFY(QDir().mkpath(folder));
+#if defined(Q_OS_WIN)
+        const QString fake = folder + "/notaprovider.dll";
+#elif defined(Q_OS_MACOS)
+        const QString fake = folder + "/libnotaprovider.dylib";
+#else
+        const QString fake = folder + "/libnotaprovider.so";
+#endif
+        {
+            QFile f(fake);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write("not a library");
+        }
+#ifndef Q_OS_WIN
+        QVERIFY(QFile::link(fake, folder + "/libnotaprovider.so.1"));
+#endif
+        QCOMPARE(registerInferenceLibraries(folder.toStdString()), 0);
+        QVERIFY2(QString::fromStdString(lastInferenceLibraryError()).contains("notaprovider"), lastInferenceLibraryError().c_str());
     }
 
     void proxyFormatsAndOfflineEditing() {

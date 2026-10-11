@@ -195,7 +195,7 @@ bool visualSearchAvailable() { return true; }
 
 struct ClipModel::Impl {
     Ort::Env env{ORT_LOGGING_LEVEL_ERROR, "montage-visual"};
-    std::unique_ptr<Ort::Session> text, vision;
+    std::unique_ptr<OrtModel> text, vision;
     Bpe bpe;
 };
 

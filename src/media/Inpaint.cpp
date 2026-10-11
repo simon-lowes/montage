@@ -56,7 +56,7 @@ constexpr int kSize = 512;  // the model's fixed input
 
 struct Model {
     Ort::Env env{ORT_LOGGING_LEVEL_ERROR, "montage-inpaint"};
-    std::unique_ptr<Ort::Session> session;
+    std::unique_ptr<OrtModel> session;
 };
 
 std::shared_ptr<Model> loadModel(std::string* error) {

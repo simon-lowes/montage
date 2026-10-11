@@ -1929,12 +1929,9 @@ void MainWindow::buildMenus() {
     {
         // Where the AI models run (media/Inference.h): the GPU or NPU when there is one, or the processor only.
         // Provider libraries beside the program or in Montage's data folder are registered first.
-        const QString exeDir = QCoreApplication::applicationDirPath() + QStringLiteral("/execution-providers");
-        const QString dataDir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/execution-providers");
-        for (const QString& d : {exeDir, dataDir}) registerInferenceLibraries(d.toStdString());
+        initInference();  // (the provider libraries, and the choice saved here, as the command line takes them too)
         InferenceMode saved = InferenceMode::Auto;
         parseInferenceMode(appSettings().value(QStringLiteral("ai/inference"), "auto").toString().toStdString(), saved);
-        setInferenceMode(saved);
         QMenu* runOn = toolsM->addMenu(tr("AI Models Run On"));
         runOn->setObjectName(QStringLiteral("aiRunOn"));
         auto* modes = new QActionGroup(this);
@@ -1958,6 +1955,18 @@ void MainWindow::buildMenus() {
             a->setChecked(m == saved);
             modes->addAction(a);
         }
+        // While MONTAGE_INFERENCE says where models run, the choices are fixed (and say why).
+        auto fixChoices = [this, modes] {
+            const bool fixed = inferenceModeOverridden();
+            for (QAction* a : modes->actions()) {
+                a->setEnabled(!fixed);
+                a->setToolTip(fixed ? tr("MONTAGE_INFERENCE=%1 is set: models run as it says").arg(QString::fromLatin1(inferenceModeName(inferenceMode())))
+                                    : QString());
+            }
+        };
+        fixChoices();
+        connect(runOn, &QMenu::aboutToShow, this, fixChoices);
+        runOn->setToolTipsVisible(true);
         runOn->addSeparator();
         runOn->addAction(tr("Devices…"), this, [this] {
             QStringList lines;
@@ -1965,9 +1974,14 @@ void MainWindow::buildMenus() {
                 lines << QStringLiteral("%1 — %2%3").arg(QString::fromStdString(d.kind), QString::fromStdString(d.provider),
                                                          d.vendor.empty() ? QString() : QStringLiteral(" (%1)").arg(QString::fromStdString(d.vendor)));
             if (lines.isEmpty()) lines << tr("No AI runtime is loaded.");
+            if (inferenceModeOverridden())
+                lines << QString() << tr("MONTAGE_INFERENCE=%1 is set: models run as it says, whatever is chosen here.")
+                                          .arg(QString::fromLatin1(inferenceModeName(inferenceMode())));
             if (inferenceFallbacks())
-                lines << QString() << tr("%n model(s) ran on the processor because the device would not take them: %1", "", inferenceFallbacks())
+                lines << QString() << tr("%n model(s) went to the processor because the device would not take or run them: %1", "", inferenceFallbacks())
                                           .arg(QString::fromStdString(lastInferenceFallback()));
+            if (const std::string e = lastInferenceLibraryError(); !e.empty())
+                lines << QString() << tr("A provider library was not taken: %1").arg(QString::fromStdString(e));
             QMessageBox::information(this, tr("AI Devices"), tr("AI models can run on:") + "\n\n" + lines.join("\n"));
         })->setObjectName(QStringLiteral("aiDevices"));
     }

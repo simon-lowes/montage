@@ -142,7 +142,7 @@ namespace {
 
 struct Model {
     Ort::Env env{ORT_LOGGING_LEVEL_ERROR, "montage-tts"};
-    std::unique_ptr<Ort::Session> session;
+    std::unique_ptr<OrtModel> session;
     std::map<QChar, int64_t> vocab;
 };
 

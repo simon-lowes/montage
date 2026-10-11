@@ -53,7 +53,7 @@ constexpr int kStateSize = 45304;  // the export's flattened recurrent and buffe
 
 struct Model {
     Ort::Env env{ORT_LOGGING_LEVEL_ERROR, "montage-speech"};
-    std::unique_ptr<Ort::Session> session;
+    std::unique_ptr<OrtModel> session;
 };
 
 std::shared_ptr<Model> loadModel(std::string* error) {
@@ -80,7 +80,7 @@ std::shared_ptr<Model> loadModel(std::string* error) {
 #else
         const std::string path = pack.path(pack.files[0]);
 #endif
-        model->session = openModel(model->env, path.c_str(), so);
+        model->session = openModel(model->env, path.c_str(), so, ModelRuns::OnProcessor);  // (frame by frame)
         *cached = model;
         return model;
     } catch (const Ort::Exception& e) {

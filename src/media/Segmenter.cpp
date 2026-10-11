@@ -85,7 +85,7 @@ constexpr float kNoObject = -1024.f;  // SAM 2's logit for "no object here"
 
 struct Models {
     Ort::Env env{ORT_LOGGING_LEVEL_ERROR, "montage"};
-    std::unique_ptr<Ort::Session> encoder, decoder, attention, memory;
+    std::unique_ptr<OrtModel> encoder, decoder, attention, memory;
 };
 
 std::basic_string<ORTCHAR_T> ortPath(const QString& path) {

@@ -524,7 +524,7 @@ namespace {
 
 struct CloneModel {
     Ort::Env env{ORT_LOGGING_LEVEL_ERROR, "montage-voice-clone"};
-    std::unique_ptr<Ort::Session> encoder, embed, lm, decoder;
+    std::unique_ptr<OrtModel> encoder, embed, lm, decoder;
     std::vector<std::string> lmInputs, lmOutputs;
     CloneTokenizer tokenizer;
 };
@@ -561,7 +561,7 @@ std::shared_ptr<CloneModel> loadCloneModel(std::string* error) {
 #else
             const std::string path = dir + "/" + name;
 #endif
-            return openModel(model->env, path.c_str(), options);
+            return openModel(model->env, path.c_str(), options, ModelRuns::OnProcessor);  // (a token at a time)
         };
         model->encoder = open("speech_encoder.onnx", so);
         model->embed = open("embed_tokens.onnx", so);

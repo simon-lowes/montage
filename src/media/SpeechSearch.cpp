@@ -166,7 +166,7 @@ std::string cacheKey(const std::string& text) {
 bool speechSearchAvailable() { return true; }
 struct SentenceModel::Impl {
     Ort::Env env{ORT_LOGGING_LEVEL_ERROR, "montage-sentences"};
-    std::unique_ptr<Ort::Session> session;
+    std::unique_ptr<OrtModel> session;
     WordPiece wordPiece;
 };
 #else

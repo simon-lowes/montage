@@ -71,7 +71,7 @@ QImage frameImage(const Frame16& f) {
 bool ocrAvailable() { return true; }
 struct TextReader::Impl {
     Ort::Env env{ORT_LOGGING_LEVEL_ERROR, "montage-ocr"};
-    std::unique_ptr<Ort::Session> det, rec;
+    std::unique_ptr<OrtModel> det, rec;
     std::vector<std::string> chars;  // the recogniser's characters: index 1 on (0 is CTC's blank), a space last
 };
 #else
