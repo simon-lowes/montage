@@ -401,7 +401,8 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
     if (std::all_of(std::begin(coding), std::end(coding), [](uint8_t b) { return b == 0; }))
         return fail("No JPEG 2000 IMF profile takes that picture at that bit rate");
     const size_t maxBytes = settings.lossless ? 0 : size_t(settings.megabitsPerSecond * 1e6 / 8 / fps);
-    const int seqChannels = layoutChannels(earLevelLayout(s.audioLayout));  // immersive mixes fold their heights down
+    // Immersive mixes fold their heights down; an ambisonic field is heard through two virtual cardioids (stereo).
+    const int seqChannels = ambisonicLayout(s.audioLayout) ? 2 : layoutChannels(earLevelLayout(s.audioLayout));
     const int channels = seqChannels == 8 ? 8 : seqChannels == 6 ? 6 : 2;
 
     // The folder.

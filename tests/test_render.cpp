@@ -22,6 +22,7 @@
 #include "core/Effects.h"
 #include "core/MaskPath.h"
 #include "render/ColorSpace.h"
+#include "render/HdrView.h"
 #include "render/Compositor.h"
 #include "render/Dcp.h"
 #include "render/Imf.h"
@@ -84,6 +85,52 @@ Clip colorClip(Project& p, float r, float g, float b, FrameTime start, FrameTime
 class TestRender : public QObject {
     Q_OBJECT
 private slots:
+    void ascCdlEffect() {
+        // The cdl effect grades like the ASC's maths, in the working space or in the space the CDL was made in.
+        Project p = makeDefaultProject();
+        Effect e = makeEffect(p, "cdl");
+        e.params["slope.r"] = Param(2.0);
+        e.params["offset.g"] = Param(0.1);
+        e.params["power.b"] = Param(2.0);
+        float c[4];
+        Image img = solid(2, 2, 0.3f, 0.3f, 0.6f);
+        applyVideoEffect(e, 0, img, 1.0);
+        rgb(img, 0, 0, c);
+        QVERIFY(std::fabs(c[0] - 0.6f) < 1e-5f && std::fabs(c[1] - 0.4f) < 1e-5f && std::fabs(c[2] - 0.36f) < 1e-5f);
+        // Half-transparent pixels grade as their colour.
+        Image half = solid(1, 1, 0.3f, 0.3f, 0.6f, 0.5f);
+        applyVideoEffect(e, 0, half, 1.0);
+        rgb(half, 0, 0, c);
+        QVERIFY(std::fabs(c[0] - 0.6f) < 1e-5f && std::fabs(c[3] - 0.5f) < 1e-6f);
+        // In ACEScct: into it and back exactly, so an identity CDL leaves the picture alone and an offset there lifts
+        // the picture by what it is in log, not the same as in Rec.709.
+        Effect plain = makeEffect(p, "cdl");
+        plain.strings["space"] = findColorSpace("acescct")->label;
+        plain.params["offset.g"] = Param(1e-6);  // (not quite an identity, so the conversions run)
+        Image same = solid(1, 1, 0.2f, 0.5f, 0.8f);
+        applyVideoEffect(plain, 0, same, 1.0);
+        rgb(same, 0, 0, c);
+        QVERIFY(std::fabs(c[0] - 0.2f) < 1e-3f && std::fabs(c[1] - 0.5f) < 1e-3f && std::fabs(c[2] - 0.8f) < 1e-3f);
+        Effect lifted = plain;
+        lifted.params.erase("offset.g");
+        lifted.params["offset.r"] = lifted.params["offset.g"] = lifted.params["offset.b"] = Param(0.05);
+        Image inLog = solid(1, 1, 0.2f, 0.2f, 0.2f), inVideo = inLog;
+        applyVideoEffect(lifted, 0, inLog, 1.0);
+        lifted.strings["space"] = "Working space";
+        applyVideoEffect(lifted, 0, inVideo, 1.0);
+        QVERIFY(std::fabs(inVideo.at(0, 0)[1] - 0.25f) < 1e-5f);
+        // Rec.709 0.2 is 0.0213 in linear light, 0.2367 in ACEScct; 0.2867 there is 2^(0.2867 x 17.52 - 9.72) = 0.0385,
+        // which is 0.2570 in Rec.709 (BT.1886).
+        const double lin = std::pow(2.0, ((std::log2(std::pow(0.2, 2.4)) + 9.72) / 17.52 + 0.05) * 17.52 - 9.72);
+        QVERIFY2(std::fabs(inLog.at(0, 0)[1] - std::pow(lin, 1 / 2.4)) < 2e-3, qPrintable(QString::number(inLog.at(0, 0)[1])));
+        QVERIFY(std::fabs(inLog.at(0, 0)[1] - inVideo.at(0, 0)[1]) > 0.005f);
+        // Off: nothing.
+        e.enabled = false;
+        Image off = solid(1, 1, 0.3f, 0.3f, 0.3f);
+        applyVideoEffect(e, 0, off, 1.0);
+        QCOMPARE(off.at(0, 0)[0], 0.3f);
+    }
+
     void redactFacesCoversTheFaces() {
         // A busy picture (fine checks) and a face's box in the middle (40 x 36 px at 80, 42).
         const int W = 200, H = 120;
@@ -1696,6 +1743,67 @@ colorspaces:
         QCOMPARE(red(9), red(8));
     }
 
+    void hdrViewForHdrDisplays() {
+        const ColorSpace& pq = *findColorSpace("rec2100pq");
+        const ColorSpace& hlg = *findColorSpace("rec2100hlg");
+        auto view = [](const ColorSpace& s, float r, float g, float b, double headroom, double peak = 1000) {
+            float c[3] = {r, g, b};
+            hdrViewPixel(c, s, peak, headroom);
+            return std::array<float, 3>{c[0], c[1], c[2]};
+        };
+        auto show = [](std::array<float, 3> c) { return QString("%1 %2 %3").arg(c[0]).arg(c[1]).arg(c[2]); };
+        // PQ's 203 nits is SDR white; 1000 nits five times it, shown as such where the display has the headroom.
+        const float w203 = float(nitsToCode(pq, 203)), w1000 = float(nitsToCode(pq, 1000)), w4000 = float(nitsToCode(pq, 4000));
+        auto white = view(pq, w203, w203, w203, 8);
+        QVERIFY2(std::fabs(white[0] - 1) < 0.01 && std::fabs(white[1] - 1) < 0.01 && std::fabs(white[2] - 1) < 0.01, qPrintable(show(white)));
+        auto spec = view(pq, w1000, w1000, w1000, 8);
+        QVERIFY2(std::fabs(spec[1] - 1000.0 / 203) < 0.05, qPrintable(show(spec)));
+        // A display with less headroom than the master: highlights roll off below its peak, SDR white untouched,
+        // hue kept; one with enough shows the master as it is.
+        auto rolled = view(pq, w1000, w1000, w1000, 2);
+        QVERIFY2(rolled[1] > 1.6 && rolled[1] < 2.0, qPrintable(show(rolled)));
+        QVERIFY2(std::fabs(view(pq, w203, w203, w203, 2)[1] - 1) < 0.01, qPrintable(show(view(pq, w203, w203, w203, 2))));
+        const float o1 = float(nitsToCode(pq, 1000)), o2 = float(nitsToCode(pq, 250));
+        auto orange = view(pq, o1, o2, 0, 2), orangeFull = view(pq, o1, o2, 0, 8);
+        QVERIFY2(orange[0] < 2.0 && std::fabs(orange[1] / orange[0] - orangeFull[1] / orangeFull[0]) < 0.01, qPrintable(show(orange) + " / " + show(orangeFull)));
+        QVERIFY2(view(pq, w4000, w4000, w4000, 8, 4000)[1] < 8.0 && view(pq, w4000, w4000, w4000, 8, 4000)[1] > 6.0,
+                 qPrintable(show(view(pq, w4000, w4000, w4000, 8, 4000))));
+        QCOMPARE(hdrContentPeak(pq, 1000), 1000.0 / 203);
+        QCOMPARE(hdrContentPeak(rec709Space(), 1000), 1.0);
+        // On an SDR display (headroom 1) the HDR picture stays within white.
+        QVERIFY(view(pq, w1000, w1000, w1000, 1)[1] <= 1.0f);
+        // Wide gamut kept: Rec. 2020's green is outside Rec. 709, so red and blue go negative.
+        const float g100 = float(nitsToCode(pq, 100));
+        auto green = view(pq, 0, g100, 0, 8);
+        QVERIFY2(green[0] < -0.05f && green[2] < -0.01f && green[1] > 0.5f, qPrintable(show(green)));
+        // HLG's 75 % is SDR white on its 1000-nit reference display (BT.2408).
+        auto hw = view(hlg, 0.75f, 0.75f, 0.75f, 8);
+        QVERIFY2(std::fabs(hw[1] - 1) < 0.04, qPrintable(show(hw)));
+        // SDR is its own display light, within white.
+        auto sdr = view(rec709Space(), 1, 0.5f, 0, 8);
+        QVERIFY2(std::fabs(sdr[0] - 1) < 1e-4 && std::fabs(sdr[1] - std::pow(0.5f, 2.4f)) < 1e-4 && std::fabs(sdr[2]) < 1e-6, qPrintable(show(sdr)));
+        // A frame as half floats, the table matching the pixel function, alpha 1, scaled for scRGB.
+        Image img(3, 2);
+        const float codes[3] = {w203, w1000, g100};
+        for (int x = 0; x < 3; ++x)
+            for (int y = 0; y < 2; ++y) {
+                float* p = img.at(x, y);
+                p[0] = p[1] = p[2] = codes[x];
+                p[3] = 1;
+            }
+        std::vector<uint16_t> half;
+        hdrViewImage(img, pq, 1000, 8, half, 2.5f);
+        QCOMPARE(half.size(), size_t(3 * 2 * 4));
+        std::vector<float> back(half.size());
+        qFloatFromFloat16(back.data(), reinterpret_cast<const qfloat16*>(half.data()), qsizetype(half.size()));
+        for (int x = 0; x < 3; ++x) {
+            auto expect = view(pq, codes[x], codes[x], codes[x], 8);
+            QVERIFY2(std::fabs(back[size_t(x) * 4 + 1] / 2.5f - expect[1]) < 0.01f * std::max(1.0f, expect[1]),
+                     qPrintable(QString("%1: %2 vs %3").arg(x).arg(back[size_t(x) * 4 + 1] / 2.5f).arg(expect[1])));
+            QCOMPARE(back[size_t(x) * 4 + 3], 1.0f);
+        }
+    }
+
     void cameraLogSpaces() {
         // Code values for scene-linear 0, 0.005, 0.01, 0.18 (grey), 0.9 and 4, from colour-science 0.4.7.
         struct Curve {
@@ -1711,6 +1819,10 @@ colorspaces:
             {Transfer::Log3G10, {0.091551488, 0.117456111, 0.137898710, 0.333332912, 0.483360528, 0.627292998}},
             {Transfer::BmdFilmGen5, {0.092465753, 0.133883783, 0.167755310, 0.383561644, 0.521383526, 0.650641506}},
             {Transfer::DavinciIntermediate, {0.0, 0.049697572, 0.085275708, 0.336043272, 0.502784181, 0.659830394}},
+            {Transfer::LLog, {0.090000000, 0.130000000, 0.165074843, 0.435313904, 0.619557106, 0.793579940}},  // also colour-science
+            // GoPro's formula from its Labs docs (base 400) and GP-Log2 white paper (base 600), grey at L = 0.0517.
+            {Transfer::GoProLog, {0.0, 0.075595792, 0.127435427, 0.513037243, 0.775367400, 1.023083798}},
+            {Transfer::GoProLog2, {0.0, 0.097019004, 0.156433877, 0.541601097, 0.789234046, 1.021637515}},
         };
         for (const Curve& c : curves)
             for (int i = 0; i < 6; ++i) {
@@ -1729,6 +1841,7 @@ colorspaces:
             {Primaries::BmdWideGamut, {0.622830, 0.334441, 0.029346}},
             {Primaries::SGamut3, {0.692332, 0.299477, 0.059835}},
             {Primaries::DavinciWideGamut, {0.701011, 0.330216, -0.011751}},
+            {Primaries::AppleWideGamut, {0.679108, 0.312928, 0.044307}},
         };
         for (const Gamut& g : gamuts) {
             double m[9];
@@ -1740,7 +1853,8 @@ colorspaces:
             }
         }
         // Each is offered by name, scene-referred, and an Apple Log grey reads as Rec.709 grey.
-        for (const char* id : {"applelog-rec2020", "dlog-dgamut", "flog2-fgamut", "nlog-ngamut", "log3g10-rwg", "bmdfilm5-bmdwg", "di-dwg", "slog3-sgamut3"}) {
+        for (const char* id : {"applelog-rec2020", "applelog2-applewg", "dlog-dgamut", "flog2-fgamut", "nlog-ngamut", "log3g10-rwg", "bmdfilm5-bmdwg",
+                               "di-dwg", "slog3-sgamut3", "gplog-rec709", "gplog2-rec2020", "llog-rec2020"}) {
             const ColorSpace* cs = findColorSpace(id);
             QVERIFY2(cs && cs->sceneReferred, id);
         }
@@ -1751,6 +1865,21 @@ colorspaces:
         rgb(grey, 0, 0, c);
         QVERIFY2(std::fabs(c[0] - 0.18f) < 1e-3f && std::fabs(c[1] - 0.18f) < 1e-3f && std::fabs(c[2] - 0.18f) < 1e-3f,
                  qPrintable(QString("%1 %2 %3").arg(c[0]).arg(c[1]).arg(c[2])));
+        // Apple Log 2 is Apple Log's curve over Apple Gamut (ACES' CSC.Apple.AppleLog2_to_ACES matrix, through Bradford).
+        double toAp0[9];
+        primariesMatrix(Primaries::AppleWideGamut, Primaries::Ap0, toAp0);
+        const double aces[9] = {0.694961049318, 0.241405268785, 0.063633681897, 0.047362746415, 1.004295925054,
+                                -0.051658671469, -0.021989789360, -0.028989104971, 1.050978894331};
+        for (int i = 0; i < 9; ++i) QVERIFY2(std::fabs(toAp0[i] - aces[i]) < 2e-4, qPrintable(QString("%1: %2").arg(i).arg(toAp0[i], 0, 'f', 6)));
+        // A GoPro or Leica grey reads as grey.
+        for (const char* id : {"gplog2-rec2020", "llog-rec2020"}) {
+            const ColorSpace& cs = *findColorSpace(id);
+            const float code = float(fromLinear(cs.transfer, 0.18));
+            Image g = solid(1, 1, code, code, code);
+            convertColor(g, cs, *findColorSpace("linear-rec709"), 1000);
+            rgb(g, 0, 0, c);
+            QVERIFY2(std::fabs(c[1] - 0.18f) < 2e-3f, qPrintable(QString("%1: %2").arg(id).arg(c[1])));
+        }
     }
 
     void curvesAndLuts() {
@@ -4247,6 +4376,211 @@ colorspaces:
         Project empty = makeDefaultProject();
         empty.active()->colorSpace = "rec2100pq";
         QVERIFY(!measureLightLevels(empty, *empty.active(), 0, 0, l, &err) && err.find("empty") != std::string::npos);
+    }
+
+    void stereoViews() {
+        // Two eyes, a red left and a blue right, 8 x 4, shown each way the viewer and exports offer.
+        Image left(8, 4), right(8, 4);
+        for (int y = 0; y < 4; ++y)
+            for (int x = 0; x < 8; ++x) {
+                float* l = left.at(x, y);
+                float* r = right.at(x, y);
+                l[0] = 1, l[1] = 0, l[2] = 0, l[3] = 1;
+                r[0] = 0, r[1] = 0.5f, r[2] = 1, r[3] = 1;
+            }
+        auto same = [](const float* a, float r, float g, float b) {
+            return std::fabs(a[0] - r) < 1e-4f && std::fabs(a[1] - g) < 1e-4f && std::fabs(a[2] - b) < 1e-4f;
+        };
+        QVERIFY(same(combineStereo(left, right, StereoView::Left).at(3, 2), 1, 0, 0));
+        QVERIFY(same(combineStereo(left, right, StereoView::Right).at(3, 2), 0, 0.5f, 1));
+        // Anaglyph: red from the left eye's brightness, green and blue from the right eye.
+        QVERIFY(same(combineStereo(left, right, StereoView::Anaglyph).at(3, 2), 0.299f, 0.5f, 1));
+        // Difference: twice the gap, clipped.
+        QVERIFY(same(combineStereo(left, right, StereoView::Difference).at(0, 0), 1, 1, 1));
+        QVERIFY(same(combineStereo(left, left, StereoView::Difference).at(0, 0), 0, 0, 0));
+        // Packed: full size doubles the frame, squeezed keeps it.
+        Image p = combineStereo(left, right, StereoView::SideBySide);
+        QVERIFY(p.width == 16 && p.height == 4 && same(p.at(7, 1), 1, 0, 0) && same(p.at(8, 1), 0, 0.5f, 1));
+        p = combineStereo(left, right, StereoView::TopBottom);
+        QVERIFY(p.width == 8 && p.height == 8 && same(p.at(2, 3), 1, 0, 0) && same(p.at(2, 4), 0, 0.5f, 1));
+        p = combineStereo(left, right, StereoView::SideBySideHalf);
+        QVERIFY(p.width == 8 && p.height == 4 && same(p.at(1, 1), 1, 0, 0) && same(p.at(6, 1), 0, 0.5f, 1));
+        p = combineStereo(left, right, StereoView::TopBottomHalf);
+        QVERIFY(p.width == 8 && p.height == 4 && same(p.at(4, 0), 1, 0, 0) && same(p.at(4, 3), 0, 0.5f, 1));
+        // Eyes of different sizes cannot be combined: the left is shown.
+        QCOMPARE(combineStereo(left, Image(4, 4), StereoView::SideBySide).width, 8);
+        // Names, as files and MCP use them, and how many eyes go across and down.
+        for (const std::string& n : stereoViewNames()) {
+            StereoView v;
+            QVERIFY(stereoViewFromName(n, v));
+            QCOMPARE(stereoViewName(v), n);
+        }
+        StereoView v;
+        QVERIFY(!stereoViewFromName("checkerboard", v));
+        int across = 0, down = 0;
+        stereoPacking(StereoView::SideBySide, across, down);
+        QVERIFY(across == 2 && down == 1);
+        stereoPacking(StereoView::TopBottom, across, down);
+        QVERIFY(across == 1 && down == 2);
+        stereoPacking(StereoView::SideBySideHalf, across, down);
+        QVERIFY(across == 1 && down == 1);
+    }
+
+    void titles3D() {
+        // Extruded text, lit flat (all ambient, no shine) so faces and sides show their own colours.
+        auto title = [](const std::string& text) {
+            Effect g = makeEffect("title3d", 1);
+            g.strings["text"] = text;
+            g.params["size"] = Param(200.0);
+            g.params["rot_x"] = Param(0.0);
+            g.params["rot_y"] = Param(0.0);
+            g.params["ambient"] = Param(100.0);
+            g.params["specular"] = Param(0.0);
+            g.params["color.r"] = Param(1.0), g.params["color.g"] = Param(0.8), g.params["color.b"] = Param(0.2);
+            g.params["side_color.r"] = Param(0.2), g.params["side_color.g"] = Param(0.3), g.params["side_color.b"] = Param(0.9);
+            return g;
+        };
+        const int w = 480, h = 270;
+        auto dump = [&](const Image& img, const char* name) {
+            if (const QByteArray dir = qgetenv("MONTAGE_TEST_DUMP"); !dir.isEmpty()) {
+                QImage q(img.width, img.height, QImage::Format_RGBA8888);
+                toRgba8(img, q.bits(), size_t(q.bytesPerLine()));
+                q.save(QString::fromLocal8Bit(dir) + "/" + name + ".png");
+            }
+        };
+        struct Ink {
+            int x0 = 1 << 30, x1 = -1, y0 = 1 << 30, y1 = -1, faces = 0, sides = 0, covered = 0;
+        };
+        auto ink = [](const Image& img) {
+            Ink k;
+            for (int y = 0; y < img.height; ++y)
+                for (int x = 0; x < img.width; ++x) {
+                    const float* p = img.at(x, y);
+                    if (p[3] < 0.5f) continue;
+                    ++k.covered;
+                    k.x0 = std::min(k.x0, x), k.x1 = std::max(k.x1, x), k.y0 = std::min(k.y0, y), k.y1 = std::max(k.y1, y);
+                    if (p[3] > 0.99f && std::fabs(p[0] - 1) < 0.02f && std::fabs(p[1] - 0.8f) < 0.02f && std::fabs(p[2] - 0.2f) < 0.02f) ++k.faces;
+                    if (p[3] > 0.99f && std::fabs(p[0] - 0.2f) < 0.02f && std::fabs(p[1] - 0.3f) < 0.02f && std::fabs(p[2] - 0.9f) < 0.02f) ++k.sides;
+                }
+            return k;
+        };
+        // Face on: the face's colour where the letters are, nothing round them; the sides hidden behind (only a sliver
+        // shows in perspective away from the middle).
+        const Image flat = renderGenerator(title("H"), 0, w, h, 1.0, 90, 30);
+        dump(flat, "t3d-flat");
+        const Ink f = ink(flat);
+        QVERIFY2(f.covered > 2000 && f.faces > 0.85 * f.covered, qPrintable(QString("%1 %2").arg(f.covered).arg(f.faces)));
+        QVERIFY(flat.at(2, 2)[3] == 0 && flat.at(w - 3, h - 3)[3] == 0);
+        // A letter's hole stays open (nonzero winding): the middle of an O is empty, its ring is not.
+        const Image o = renderGenerator(title("O"), 0, w, h, 1.0, 90, 30);
+        dump(o, "t3d-o");
+        const Ink oi = ink(o);
+        QVERIFY(oi.covered > 1000);
+        QCOMPARE(o.at((oi.x0 + oi.x1) / 2, (oi.y0 + oi.y1) / 2)[3], 0.0f);
+        // Turned 60° about Y, a thin title is about half as wide (in perspective); a deep one shows its side.
+        Effect thin = title("H");
+        thin.params["rot_y"] = Param(60.0);
+        thin.params["depth"] = Param(2.0);
+        const Ink th = ink(renderGenerator(thin, 0, w, h, 1.0, 90, 30));
+        const double ratio = double(th.x1 - th.x0) / double(f.x1 - f.x0);
+        QVERIFY2(ratio > 0.4 && ratio < 0.65, qPrintable(QString::number(ratio)));
+        Effect turned = title("H");
+        turned.params["rot_y"] = Param(60.0);
+        turned.params["depth"] = Param(80.0);
+        const Image tu = renderGenerator(turned, 0, w, h, 1.0, 90, 30);
+        dump(tu, "t3d-turned");
+        const Ink ti = ink(tu);
+        QVERIFY2(ti.sides > 300 && ti.faces > 300, qPrintable(QString("%1 %2").arg(ti.sides).arg(ti.faces)));
+        // Turned the right side back, the left side shows: the sides' pixels lie left of the face's.
+        double faceX = 0, sideX = 0;
+        int nf = 0, ns = 0;
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                const float* p = tu.at(x, y);
+                if (p[3] < 0.99f) continue;
+                if (std::fabs(p[2] - 0.2f) < 0.02f) faceX += x, ++nf;
+                else if (std::fabs(p[2] - 0.9f) < 0.02f) sideX += x, ++ns;
+            }
+        QVERIFY(nf && ns && sideX / ns < faceX / nf);
+        // Seen from behind (180°): the back face, mirrored, the same size.
+        Effect back = title("H");
+        back.params["rot_y"] = Param(180.0);
+        const Ink bi = ink(renderGenerator(back, 0, w, h, 1.0, 90, 30));
+        QVERIFY(std::abs(bi.covered - f.covered) < f.covered / 10 && bi.faces > 0.8 * bi.covered);
+        // Depth goes back from the face, which stays at its set size: as wide deep as flat (perspective draws the
+        // extrusion inside its outline).
+        Effect deep = title("H");
+        deep.params["depth"] = Param(600.0);
+        const Ink di = ink(renderGenerator(deep, 0, w, h, 1.0, 90, 30));
+        QVERIFY2(std::abs((di.x1 - di.x0) - (f.x1 - f.x0)) <= 3, qPrintable(QString("%1 %2").arg(di.x1 - di.x0).arg(f.x1 - f.x0)));
+        // A wide lens and a deep title (which used to put the face behind the camera) still draws it.
+        deep.params["fov"] = Param(120.0);
+        deep.params["depth"] = Param(700.0);
+        const Ink wide = ink(renderGenerator(deep, 0, w, h, 1.0, 90, 30));
+        QVERIFY2(wide.faces > 0.5 * wide.covered && wide.covered > 300, qPrintable(QString("%1 %2").arg(wide.covered).arg(wide.faces)));
+        // Turned so its near end comes past the camera, the rest of the face is still drawn (cut at the near plane).
+        Effect past = title("WIDE TITLE");
+        past.params["size"] = Param(160.0);
+        past.params["rot_y"] = Param(-80.0);
+        past.params["fov"] = Param(100.0);
+        past.params["pos_x"] = Param(-120.0);
+        const Image pi = renderGenerator(past, 0, w, h, 1.0, 90, 30);
+        dump(pi, "t3d-near");
+        const Ink pk = ink(pi);
+        QVERIFY2(pk.faces > 2000, qPrintable(QString("%1 %2").arg(pk.covered).arg(pk.faces)));
+        // Letters run into each other (tight tracking pulls the dash across the I): merged first, so their sides still
+        // face out and show. (Before, the dash's sides were judged from a point that fell inside the I, and turned
+        // inside out: about half the sides went missing.)
+        Effect apart = title("I\u2014");
+        apart.params["rot_y"] = Param(50.0);
+        apart.params["depth"] = Param(120.0);
+        Effect together = apart;
+        together.params["tracking"] = Param(-140.0);
+        const Image ti2 = renderGenerator(together, 0, w, h, 1.0, 90, 30);
+        dump(ti2, "t3d-overlap");
+        const Ink ap = ink(renderGenerator(apart, 0, w, h, 1.0, 90, 30)), tg = ink(ti2);
+        QVERIFY2(tg.sides > 0.65 * ap.sides && tg.covered < ap.covered, qPrintable(QString("%1 %2 %3 %4").arg(tg.sides).arg(ap.sides).arg(tg.covered).arg(ap.covered)));
+        // Flat (no depth) and edge on: next to nothing.
+        Effect edge = title("H");
+        edge.params["depth"] = Param(0.0);
+        edge.params["rot_y"] = Param(90.0);
+        QVERIFY(ink(renderGenerator(edge, 0, w, h, 1.0, 90, 30)).covered < f.covered / 20);
+        // Lit from where the camera is, the face is fully lit; from straight above, only the ambient light reaches it.
+        Effect lit = title("H");
+        lit.params["ambient"] = Param(20.0);
+        lit.params["light_height"] = Param(90.0);
+        const Image li = renderGenerator(lit, 0, w, h, 1.0, 90, 30);
+        const float* centre = li.at(f.x0 + 12, (f.y0 + f.y1) / 2 + 30);  // on the left stem
+        lit.params["light_height"] = Param(0.0);
+        lit.params["light_angle"] = Param(0.0);
+        const Image dark = renderGenerator(lit, 0, w, h, 1.0, 90, 30);
+        const float* dc = dark.at(f.x0 + 12, (f.y0 + f.y1) / 2 + 30);
+        QVERIFY2(centre[3] > 0.99f && std::fabs(centre[0] - 1.0f) < 0.02f, qPrintable(QString::number(centre[0])));
+        QVERIFY2(dc[3] > 0.99f && std::fabs(dc[0] - 0.2f) < 0.03f, qPrintable(QString::number(dc[0])));
+        // Animation in: flipped up edge on at the start, settled by the end of it; faded out at the clip's end.
+        Effect anim = title("H");
+        anim.params["depth"] = Param(4.0);  // thin, so edge on is next to nothing
+        anim.params["anim_in"] = Param(3.0);
+        anim.params["anim_out"] = Param(1.0);
+        Effect still = anim;
+        still.params["anim_in"] = Param(0.0);
+        const int settledCover = ink(renderGenerator(still, 30, w, h, 1.0, 90, 30)).covered;
+        const Ink a0 = ink(renderGenerator(anim, 0, w, h, 1.0, 90, 30)), a1 = ink(renderGenerator(anim, 30, w, h, 1.0, 90, 30));
+        QVERIFY2(a0.covered < a1.covered / 5 && a1.covered == settledCover, qPrintable(QString("%1 %2").arg(a0.covered).arg(a1.covered)));
+        QCOMPARE(ink(renderGenerator(anim, 89, w, h, 1.0, 90, 30)).covered, 0);
+        // The same at a quarter size (preview), and the same picture each time.
+        const Image small = renderGenerator(title("H"), 0, w / 4, h / 4, 0.25, 90, 30);
+        const Ink si = ink(small);
+        QVERIFY(std::fabs(double(si.x1 - si.x0) * 4 - double(f.x1 - f.x0)) < 12);
+        const Image again = renderGenerator(turned, 0, w, h, 1.0, 90, 30);
+        QVERIFY(std::equal(again.px.begin(), again.px.end(), tu.px.begin()));
+        // The default look (shaded, turned a little), for looking at.
+        Effect plain = makeEffect("title3d", 2);
+        plain.strings["text"] = "Montage\n3D";
+        dump(renderGenerator(plain, 0, w, h, 0.5, 90, 30), "t3d-default");
+        // In the catalog, with its own text.
+        const EffectInfo* info = findEffectInfo("title3d");
+        QVERIFY(info && info->category == EffectCategory::Generator && info->displayName == "3D Title");
     }
 
     void titlesRender() {

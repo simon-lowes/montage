@@ -1,6 +1,8 @@
 add_library(montage_engine STATIC
   core/Model.h core/Model.cpp
   core/MediaLog.h core/MediaLog.cpp
+  core/Cdl.h core/Cdl.cpp
+  core/Ale.h core/Ale.cpp
   core/KeyframeEdit.h core/KeyframeEdit.cpp
   core/MaskPath.h core/MaskPath.cpp
   core/ColorWarp.h core/ColorWarp.cpp
@@ -30,6 +32,8 @@ add_library(montage_engine STATIC
   core/Aaf.h core/Aaf.cpp core/AafMetaDictionary.inc
   core/AafImport.h core/AafImport.cpp
   core/Surround.h core/Surround.cpp
+  core/Ambisonics.h core/Ambisonics.cpp
+  media/SpatialAudio.h media/SpatialAudio.cpp
   core/Effects.h core/Effects.cpp
   core/EditOps.h core/EditOps.cpp
   core/TimelineCompare.h core/TimelineCompare.cpp
@@ -51,12 +55,15 @@ add_library(montage_engine STATIC
   core/Multicam.h core/Multicam.cpp
   core/History.h core/History.cpp
   core/ProjectIO.h core/ProjectIO.cpp
+  core/ProjectLock.h core/ProjectLock.cpp
+  core/Production.h core/Production.cpp
   core/Interchange.h core/Interchange.cpp
   automation/McpServer.h automation/McpServer.cpp
   media/Image.h media/Image.cpp
   media/Decoder.h media/Decoder.cpp
   media/Vector.h media/Vector.cpp
   media/CameraRaw.h media/CameraRaw.cpp
+  media/ProResRaw.h media/ProResRaw.cpp
   media/SuperScale.h media/SuperScale.cpp
   media/Faces.h media/Faces.cpp
   media/FaceTracks.h media/FaceTracks.cpp
@@ -104,6 +111,7 @@ add_library(montage_engine STATIC
   render/Retime.h render/Retime.cpp
   render/VideoDenoise.h render/VideoDenoise.cpp
   render/Shapes.h render/Shapes.cpp
+  render/Title3D.h render/Title3D.cpp
   render/AafExport.h render/AafExport.cpp
   render/ClipAnalysis.h render/ClipAnalysis.cpp
   render/MusicEdit.h render/MusicEdit.cpp
@@ -111,6 +119,9 @@ add_library(montage_engine STATIC
   render/Shorts.h render/Shorts.cpp
   render/Letterbox.h render/Letterbox.cpp
   render/LightLevel.h render/LightLevel.cpp
+  render/Hdr10Plus.h render/Hdr10Plus.cpp
+  control/Midi.h control/Midi.cpp
+  control/MackieControl.h control/MackieControl.cpp
   render/Versions.h render/Versions.cpp
   render/ReviewExport.h render/ReviewExport.cpp
   render/DcpMxf.h render/DcpMxf.cpp
@@ -120,6 +131,7 @@ add_library(montage_engine STATIC
   render/PaperEdit.h render/PaperEdit.cpp
   render/VfxPull.h render/VfxPull.cpp
   render/Spherical.h render/Spherical.cpp
+  render/Stereo.h render/Stereo.cpp
   render/ClipPlacement.h render/ClipPlacement.cpp
   render/AudioReactive.h render/AudioReactive.cpp
   render/QualityCheck.h render/QualityCheck.cpp
@@ -129,6 +141,7 @@ add_library(montage_engine STATIC
   render/AutoMix.h render/AutoMix.cpp
   render/VoiceMatch.h render/VoiceMatch.cpp
   render/ColorSpace.h render/ColorSpace.cpp
+  render/HdrView.h render/HdrView.cpp
   render/Ocio.h render/Ocio.cpp
   render/Compositor.h render/Compositor.cpp
   render/RenderCache.h render/RenderCache.cpp
@@ -173,7 +186,10 @@ target_compile_definitions(montage_engine PUBLIC MONTAGE_VERSION="${PROJECT_VERS
 target_link_libraries(montage_engine PUBLIC Qt6::Core Qt6::Gui Qt6::Xml PkgConfig::FFMPEG Threads::Threads ${CMAKE_DL_LIBS})
 if(APPLE)
   target_sources(montage_engine PRIVATE audio/AuHost.cpp)
-  target_link_libraries(montage_engine PUBLIC "-framework AudioToolbox" "-framework CoreFoundation")
+  target_link_libraries(montage_engine PUBLIC "-framework AudioToolbox" "-framework CoreFoundation" "-framework CoreMIDI")
+endif()
+if(WIN32)
+  target_link_libraries(montage_engine PUBLIC winmm)  # MIDI (control/Midi.cpp)
 endif()
 target_compile_options(montage_engine PRIVATE
   $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wno-unused-parameter>)

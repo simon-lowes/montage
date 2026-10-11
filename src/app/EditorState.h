@@ -145,9 +145,26 @@ public:
     // ---- File -----------------------------------------------------------------
     QString filePath() const { return path_; }
     bool isModified() const { return history_.revision() != savedRevision_; }
+    // Saving to the project's own path needs it not to be read-only (and the lock still to be this editor's); saving
+    // to another path (Save As) takes that file's lock, so the copy is this editor's to edit.
     bool save(const QString& path, QString* error = nullptr);
-    bool open(const QString& path, QString* error = nullptr);
+    // Shared projects (core/ProjectLock.h): Auto takes the project's lock, or opens it read-only when someone else is
+    // editing it; Edit refuses then (a stale lock is taken over either way); ReadOnly opens it without the lock.
+    enum class Access { Auto, Edit, ReadOnly };
+    bool open(const QString& path, QString* error = nullptr, Access access = Access::Auto);
     void newProject();
+    // A project opened read-only: nothing can change it (edits are refused with a message saying who is editing it),
+    // it reloads by itself when its editor saves, and once they let it go it can be taken to edit.
+    bool readOnly() const { return readOnly_; }
+    QString lockHolder() const { return lockHolder_; }  // who is editing a read-only project ("" once it is free)
+    bool holdsLock() const { return holdsLock_; }
+    bool canTakeEdit() const;
+    // Takes the lock of a read-only project whose editor has let it go, reloading it from disk first. Changes made
+    // here before it became read-only (taken over while this machine slept) are not thrown away unless asked.
+    bool takeEdit(QString* error = nullptr, bool discardChanges = false);
+    // Renews this editor's lock (every half minute); for a read-only project, reloads it when it was saved (unless
+    // it holds changes of this editor's not yet saved) and notices when its lock is let go. Runs every few seconds.
+    void checkSharedState(bool renewNow = false);  // renewNow: the lock renewed now, not on the half minute
     // Opens a recovered copy as if it were `originalPath` (empty = untitled),
     // marked modified so the user decides whether to save it.
     bool recover(const QString& copy, const QString& originalPath, QString* error = nullptr);
@@ -178,9 +195,20 @@ signals:
     void mediaFileChanged(montage::Id media);  // its file changed on disk and was reloaded
     void statusMessage(const QString& text, int timeoutMs);
     void fileStateChanged();          // path or modified flag changed
+    void lockStateChanged();          // read-only, who holds the lock, or whether it is free changed
 
 private:
     void pruneSelection();
+    bool refuseReadOnly();     // true, with a message, when the project cannot be changed
+    void releaseLock();        // lets go of the current project's lock, if held
+    bool reloadFromDisk();     // a read-only project, read again (keeping what is shown)
+    bool readOnly_ = false;
+    bool holdsLock_ = false;
+    bool lockFree_ = false;     // a read-only project's lock has been let go
+    QString lockHolder_;
+    QDateTime diskTime_;        // the project file's time when last read or written
+    QDateTime lastRefresh_;     // when the lock was last renewed
+    QTimer* lockTimer_ = nullptr;
     void watchMediaFiles();  // keeps the watcher on the project's media files
     QFileSystemWatcher* watcher_ = nullptr;
     QFileSystemWatcher* folderWatcher_ = nullptr;  // the watch folders

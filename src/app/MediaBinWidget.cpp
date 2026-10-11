@@ -452,8 +452,8 @@ bool MediaBinWidget::setImageSequenceRate(Id media, double fps) {
     return state_->apply(tr("Interpret Frame Rate"), [media, rate](Project& p, Sequence&) { return edit::setImageSequenceRate(p, media, rate); });
 }
 
-bool MediaBinWidget::interpretFootage(const std::vector<Id>& media, const Interpretation& how) {
-    return state_->apply(tr("Interpret Footage"), [media, how](Project& p, Sequence&) {
+bool MediaBinWidget::interpretFootage(const std::vector<Id>& media, const Interpretation& how, bool keepHighlights) {
+    return state_->apply(tr("Interpret Footage"), [media, how, keepHighlights](Project& p, Sequence&) {
         edit::Result out = edit::Result::fail("");
         for (Id id : media) {
             const MediaItem* m = p.findMedia(id);
@@ -461,6 +461,7 @@ bool MediaBinWidget::interpretFootage(const std::vector<Id>& media, const Interp
             Interpretation i = how;
             if (m->kind == MediaKind::Image) i.fps = Rational{0, 1};
             if (!isRawMedia(*m)) i.rawExposure = 0, i.rawTemperature = 0, i.rawTint = 0, i.rawHighlights.clear(), i.rawHalf = false;
+            else if (keepHighlights) i.rawHighlights = interpretationOf(*m).rawHighlights;
             const edit::Result r = edit::interpretFootage(p, id, i);
             if (!r.ok && !r.error.empty()) return edit::Result::fail(m->name + ": " + r.error);
             if (r.ok) out = {};
@@ -473,7 +474,7 @@ void MediaBinWidget::interpretFootageDialog(const std::vector<Id>& media) {
     const MediaItem* first = media.empty() ? nullptr : state_->project().findMedia(media.front());
     if (!first) return;
     InterpretFootageDialog dlg(*first, int(media.size()), this);
-    if (dlg.exec() == QDialog::Accepted) interpretFootage(media, dlg.interpretation());
+    if (dlg.exec() == QDialog::Accepted) interpretFootage(media, dlg.interpretation(), !dlg.highlightsShown());
 }
 
 void MediaBinWidget::importInto(const QStringList& files, const QString& bin) {
@@ -803,6 +804,20 @@ Id MediaBinWidget::mergeClips(Id video, const std::vector<Id>& sounds, int syncB
     state_->edit(tr("Merge Clips"), [&](Project& p, Sequence&) { return (made = montage::mergeClips(p, video, sounds, offsets, o, &err)) != 0; });
     if (!made && why) *why = QString::fromStdString(err);
     return made;
+}
+
+bool MediaBinWidget::setMediaAmbisonic(const std::vector<Id>& media, int order) {
+    return state_->edit(tr("Ambisonic Audio"), [media, order](Project& p, Sequence&) {
+        bool changed = false;
+        for (Id id : media)
+            if (MediaItem* m = p.findMedia(id); m && m->hasAudio && m->channels >= 4 && m->kind != MediaKind::Sequence && m->ambisonic != order) {
+                m->ambisonic = order;
+                changed = true;
+                for (MediaItem& sub : p.media)
+                    if (sub.subclipOf == id) sub.ambisonic = order;
+            }
+        return changed;
+    });
 }
 
 bool MediaBinWidget::setMediaProjection(const std::vector<Id>& media, const std::string& projection) {
@@ -1250,13 +1265,32 @@ void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos)
             }
         // 360° footage: placed in a flat sequence as a view out of the sphere (Reframe 360°).
         bool all360 = true;
-        for (Id id : pictures) all360 = all360 && state_->project().findMedia(id)->projection == "equirect";
+        for (Id id : pictures) all360 = all360 && !state_->project().findMedia(id)->projection.empty();  // 360° or VR180
         QAction* sphere = menu.addAction(tr("360° Footage"), this, [this, pictures, all360] {
             setMediaProjection(pictures, all360 ? std::string() : std::string("equirect"));
         });
         sphere->setObjectName(QStringLiteral("mediaSpherical"));
         sphere->setCheckable(true);
         sphere->setChecked(all360);
+    }
+    // Ambisonic sound (four or more channels): heard as a field that turns with the view (core/Ambisonics.h).
+    {
+        std::vector<Id> fields;
+        bool allAmbisonic = true;
+        for (Id id : ids)
+            if (const MediaItem* m = state_->project().findMedia(id); m && m->hasAudio && m->channels >= 4 && m->kind != MediaKind::Sequence) {
+                fields.push_back(id);
+                allAmbisonic = allAmbisonic && m->ambisonic > 0;
+            }
+        if (!fields.empty()) {
+            QAction* field = menu.addAction(tr("Ambisonic Audio"), this, [this, fields, allAmbisonic] {
+                setMediaAmbisonic(fields, allAmbisonic ? 0 : 1);
+            });
+            field->setObjectName(QStringLiteral("mediaAmbisonic"));
+            field->setCheckable(true);
+            field->setChecked(allAmbisonic);
+            field->setToolTip(tr("The file's first four channels are a first-order ambisonic field (AmbiX: W, Y, Z, X)"));
+        }
     }
     // Audio Channels (Premiere's Modify > Audio Channels): how new clips of files with several channels take them.
     std::vector<Id> multichannel;

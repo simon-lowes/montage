@@ -37,6 +37,7 @@ class QTabBar;
 namespace montage {
 
 class SpectralRepairDialog;
+class PanFollowDialog;
 class RedactFacesDialog;
 
 class EditorState;
@@ -51,12 +52,14 @@ class EffectsBrowser;
 class InspectorWidget;
 class ScopesWidget;
 class MixerPanel;
+class ControlSurface;
 class CaptionsPanel;
 class TranscriptPanel;
 class ShotSearchPanel;
 class PeoplePanel;
 class MulticamPanel;
 class AdrPanel;
+class ProductionPanel;
 class AudioDescriptionDialog;
 class AudioMeterWidget;
 class LoudnessReadout;
@@ -75,6 +78,17 @@ public:
     TimelineWidget* timeline() const { return timeline_; }
     RenderQueue* renderQueue() const { return queue_; }
     bool openProject(const QString& path);
+    // Opening a shared project (core/ProjectLock.h): Ask asks whether to open it read-only when someone else is
+    // editing it (or to take it over when they left it locked); Edit and ReadOnly say up front.
+    enum class OpenMode { Ask, Edit, ReadOnly };
+    bool openProjectAs(const QString& path, OpenMode mode);
+    // Productions (core/Production.h): a folder of a team's projects, shown in the Production panel; `create` makes
+    // the folder a production if it is not one.
+    bool openProduction(const QString& folder, bool create = false, const QString& name = QString());
+    ProductionPanel* productionPanel() const { return production_; }
+    // Brings sequences (by name; all when none are named) from another project into this one, with their media; one
+    // undo step. Returns the new sequences' ids.
+    std::vector<Id> importSequencesFrom(const QString& project, const QStringList& names = {}, QString* error = nullptr);
     // Waits for pending renders and saves a screenshot of the window (testing aid).
     void scheduleScreenshot(const QString& path, int delayMs);
     // Brings a panel to the front by its object name ("inspector", "scopes", "mixer", "effects"...).
@@ -139,6 +153,7 @@ public:
     // Clip › Spectral Repair…: the editor for the selected audio clip (or the one under the playhead), shown modeless.
     SpectralRepairDialog* spectralRepairDialog();
     RedactFacesDialog* redactFacesDialog();
+    PanFollowDialog* panFollowDialog();
     // Clip › Remove Letterbox: black bars baked into the selected video clips' pictures found, cropped off and the rest
     // scaled to fill the frame (render/Letterbox.h), one undo step. How many clips changed.
     int removeLetterbox();
@@ -147,6 +162,9 @@ public:
     // and saved with it (render/LightLevel.h), one undo step, for exports that state them up front; `ask` shows the
     // result with a way to the brightest frame. False (with a message) for SDR sequences or when cancelled.
     bool analyseHdrLightLevels(bool ask = true);
+    // Edit > Control Surface: the Mackie Control surface's MIDI ports (one dialog, shown and returned).
+    QDialog* controlSurfaceDialog();
+    ControlSurface* controlSurface() const { return surface_; }
     // Clip › Colour Group (core/ColorGroups.h), each one undo step: a new group of the selected video clips (its id, 0
     // with a message when none are selected), the selection joining a group, or leaving its group.
     Id newColorGroup(const QString& name = {});
@@ -199,6 +217,16 @@ public:
     int importMarkers(const QString& path);
     // Bakes the colour effects of the clip a command acts on, at the playhead, into a .cube file.
     bool exportClipLut(const QString& path, int size = 33);
+    // Avid Log Exchange (core/Ale.h): an ALE's log fields and CDLs onto the matching media (and, with `cdlToClips`,
+    // the CDLs onto their clips), as one undo step, returning how many media items matched (-1 if it cannot be read);
+    // the selected media (else all) as an ALE.
+    int importAle(const QString& path, bool cdlToClips = true);
+    bool exportAle(const QString& path);
+    // ASC CDL files (core/Cdl.h): a .cc, .ccc or .cdl onto the selected video clips (one correction onto all of them,
+    // a collection matched by id to each clip's name, file or tape), returning how many clips were graded; the selected
+    // clips' CDLs (else every clip with one) as a .cc (one) or a .ccc or .cdl.
+    int importCdl(const QString& path);
+    bool exportCdl(const QString& path);
     // File › Link Media: the dialog for the offline media (shown by itself when a project opens with some), or a
     // message and nullptr when nothing is offline.
     LinkMediaDialog* showLinkMedia();
@@ -373,11 +401,11 @@ private:
     enum class Interchange { Edl, Otio, Fcp7Xml, FcpXml };
     void exportInterchange(Interchange format);
     // The audio tracks as AAF with mono WAVs beside it (for Pro Tools, Fairlight), in the background with progress.
-    void exportAafDialog();
+    void exportAafDialog(bool picture = true);
     // Find Shots for moments that look like the selected clip (or the one under the playhead) at the playhead.
     void findSimilarShots();
 public:
-    bool exportAafTo(const QString& path, QString* summary = nullptr);
+    bool exportAafTo(const QString& path, QString* summary = nullptr, bool picture = true);
 private:
     // Imports an OTIO, EDL or FCP XML timeline as a new sequence (one undo step).
     void importTimeline();
@@ -420,8 +448,15 @@ private:
     ScopesWidget* scopes_ = nullptr;
     CleanFeedWindow* cleanFeed_ = nullptr;
     MixerPanel* mixer_ = nullptr;
+    ControlSurface* surface_ = nullptr;
     MulticamPanel* multicam_ = nullptr;
     AdrPanel* adr_ = nullptr;
+    ProductionPanel* production_ = nullptr;
+    QDockWidget* productionDock_ = nullptr;
+    QAction* takeEdit_ = nullptr;
+    void importFromProjectDialog(QString project = QString());
+    bool takeEditInteractive();  // File › Edit Project: asks before discarding changes not saved
+    void newProjectInProduction(const QString& folder);
     AudioDescriptionDialog* audioDescription_ = nullptr;
     CaptionsPanel* captions_ = nullptr;
     TranscriptPanel* transcript_ = nullptr;
@@ -466,6 +501,10 @@ private:
     QString voiceRefName_;
     QAction* compareRef_ = nullptr;
     QAction* trimView_ = nullptr;  // Playback › Two-Up Trim View
+    QAction* hdrViewer_ = nullptr;  // Playback › HDR Viewer
+    bool hdrMessageShown_ = false;  // why HDR is not showing, said once a toggle
+    bool hdrWired_ = false;
+    void applyHdrViewer();
     QMenu* recentMenu_ = nullptr;
     QMenu* windowMenu_ = nullptr;
     QString workspace_ = QStringLiteral("Editing");

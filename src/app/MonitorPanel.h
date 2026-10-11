@@ -2,13 +2,16 @@
 #pragma once
 
 #include <QImage>
+#include <QPointer>
 #include <QWidget>
 #include <functional>
 #include <memory>
 
 #include "core/Model.h"
+#include "render/HdrView.h"
 
 class QLabel;
+class QTimer;
 class QToolButton;
 class QComboBox;
 class QLineEdit;
@@ -18,6 +21,7 @@ namespace montage {
 class EditorState;
 class PlaybackController;
 struct Peaks;
+class HdrSurface;
 
 // Letterboxed frame display with optional safe-area guides.
 class ViewerWidget : public QWidget {
@@ -61,8 +65,21 @@ public:
     // height, instead of starting a drag.
     void setLookAround(bool on);
     bool lookAround() const { return lookAround_; }
+    // HDR viewing (app/HdrSurface.h): HDR pictures (render/HdrView.h) shown as the light they ask for on an HDR or EDR
+    // display, the viewer's own drawing over them. On when asked for, built in and the display shows HDR (else the SDR
+    // picture, as always); in compare, exposure check and two-up those are drawn over it in SDR.
+    void setHdrViewer(bool on);
+    bool hdrViewer() const { return hdrWanted_; }
+    void setHdrPicture(montage::HdrPicturePtr picture);  // null: none (an SDR sequence)
+    bool hdrShowing() const;
+    double hdrHeadroom() const;  // the display's peak over its SDR white, 1 when not showing HDR
+    QString hdrStatus() const { return hdrStatus_; }  // why HDR is not showing, when asked for
+    // The viewer's drawing without the picture (its area transparent), as the HDR surface draws it over the picture.
+    QImage overlayImage();
+    HdrSurface* hdrSurface() const;
 
 signals:
+    void hdrChanged();
     void dragRequested();
     void lookStarted();
     void lookMoved(double dx, double dy);  // since the press
@@ -70,11 +87,17 @@ signals:
 
 protected:
     void paintEvent(QPaintEvent*) override;
+    void resizeEvent(QResizeEvent* e) override;
     void mousePressEvent(QMouseEvent* e) override;
     void mouseMoveEvent(QMouseEvent* e) override;
     void mouseReleaseEvent(QMouseEvent* e) override;
 
 private:
+    void paintContent(QPainter& p, bool picture);
+    void updateHdr();
+    void dropHdrSurface();
+    void refreshOverlay();
+
     QImage image_;
     QImage compare_;
     QString compareLabel_;
@@ -93,6 +116,16 @@ private:
     bool lookAround_ = false, looking_ = false;
     std::vector<std::function<void(QPainter&, const QRectF&)>> overlays_;
     QPoint pressPos_;
+    bool hdrWanted_ = false;
+    montage::HdrPicturePtr hdrPicture_;
+    QString hdrStatus_;
+    HdrSurface* surface_ = nullptr;   // (owned by its container)
+    QPointer<QWidget> container_;
+    QTimer* overlayTimer_ = nullptr;
+    QImage lastOverlay_;
+    bool lastShowing_ = false, lastWanted_ = false;  // what hdrChanged last said
+    double lastHeadroom_ = 1;
+    QString lastStatus_;
 };
 
 // Thin timeline under a monitor: playhead, in/out range and markers.
@@ -149,6 +182,9 @@ public:
     bool trimViewShown() const { return trimView_; }
     // Program: the selected clip whose Reframe 360° view a drag on the picture aims (0 = none).
     Id lookClip() const { return lookClip_; }
+    // HDR viewing (ViewerWidget::setHdrViewer): HDR sequences shown as HDR where the build and display can; the
+    // controller renders their light only while that is so. An "HDR" badge says when it is.
+    void setHdrViewer(bool on);
 
 signals:
     void activated();  // the user interacted with this monitor
@@ -174,6 +210,7 @@ private:
     ScrubBar* scrub_;
     QLineEdit* timecode_;
     QLabel* durationLabel_;
+    QLabel* hdrBadge_ = nullptr;
     QToolButton* playButton_;
     QComboBox* resolution_ = nullptr;
     QComboBox* exposure_ = nullptr;  // exposure check (ExposureView.h)

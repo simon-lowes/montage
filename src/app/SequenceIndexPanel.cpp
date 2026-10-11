@@ -95,7 +95,7 @@ void SequenceIndexPanel::rebuild() {
                 QString name = QString::fromStdString(c.name);
                 const QString media = m ? QFileInfo(QString::fromStdString(mediaFileOnDisk(m->path))).fileName() : QString();
                 if (name.isEmpty()) name = media;
-                QString kind = c.isGenerator() ? (c.generator.type == "title" ? tr("Title") : tr("Generator")) : video ? tr("Video") : tr("Audio");
+                QString kind = c.isGenerator() ? (c.generator.type.rfind("title", 0) == 0 ? tr("Title") : tr("Generator")) : video ? tr("Video") : tr("Audio");
                 if (!c.enabled) kind += tr(" (off)");
                 QStringList fx;
                 for (const Effect& e : c.effects)

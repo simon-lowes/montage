@@ -148,7 +148,7 @@ QWidget* MixerPanel::makeMasterStrip() {
             if (s.masterVolumeDb == db) return false;
             s.masterVolumeDb = db;
             return true;
-        }, QStringLiteral("master-volume"));
+        }, mergeKey_.isEmpty() ? QStringLiteral("master-volume") : mergeKey_);
     });
     return box;
 }
@@ -615,7 +615,7 @@ void MixerPanel::setVolume(int index, double db) {
             t.volumeDb = db;
             return true;
         },
-        QStringLiteral("track-volume-%1").arg(index));
+        mergeKey_.isEmpty() ? QStringLiteral("track-volume-%1").arg(index) : mergeKey_);
     if (!ok)
         refresh();
 }
@@ -644,7 +644,7 @@ void MixerPanel::setPan(int index, double pan) {
             t.pan = pan;
             return true;
         },
-        QStringLiteral("track-pan-%1").arg(index));
+        mergeKey_.isEmpty() ? QStringLiteral("track-pan-%1").arg(index) : mergeKey_);
     if (!ok)
         refresh();
 }

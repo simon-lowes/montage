@@ -6,10 +6,13 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 
+#include "core/Ale.h"
+#include "core/Cdl.h"
 #include "core/TranscriptCorrect.h"
 #include "core/SpellCheck.h"
 #include "core/ColorGroups.h"
 #include "core/Interpretation.h"
+#include "core/Ambisonics.h"
 #include "core/SpokenSearch.h"
 #include "core/OnScreenText.h"
 #include "core/AutoTag.h"
@@ -40,7 +43,13 @@
 #include "core/Reconform.h"
 #include "core/Adr.h"
 #include "core/AudioDescription.h"
+#include <QProcess>
+#include <QSysInfo>
+#include <QCoreApplication>
 #include "core/ProjectIO.h"
+#include "core/ProjectLock.h"
+#include "core/Production.h"
+#include "core/FaceIndex.h"
 #include "core/ScriptCut.h"
 #include "core/Surround.h"
 #include "core/Transcript.h"
@@ -48,6 +57,8 @@
 #include "core/TranscriptEdit.h"
 #include "core/Zip.h"
 #include "core/G2p.h"
+#include "control/MackieControl.h"
+#include "control/Midi.h"
 
 using namespace montage;
 using namespace montage::edit;
@@ -476,6 +487,89 @@ private slots:
         QCOMPARE(replaceInCaptions(words, {}, "$", "\\1"), 0);
     }
 
+    void midiAndMackieControl() {
+        // ---- Splitting a MIDI stream into messages.
+        std::vector<MidiMessage> got;
+        auto feed = [&](std::vector<uint8_t> bytes) {
+            got.clear();
+            MidiParser parser;
+            parser.feed(bytes.data(), bytes.size(), [&](const MidiMessage& m) { got.push_back(m); });
+        };
+        feed({0x90, 0x10, 0x7F, 0x10, 0x00});  // running status
+        QCOMPARE(got, (std::vector<MidiMessage>{{0x90, 0x10, 0x7F}, {0x90, 0x10, 0x00}}));
+        feed({0x90, 0x10, 0xF8, 0x7F});  // a clock tick inside a message
+        QCOMPARE(got, (std::vector<MidiMessage>{{0xF8}, {0x90, 0x10, 0x7F}}));
+        feed({0xD0, 0x25, 0x2C, 0xE8, 0x00, 0x40});  // one data byte (and running status), then pitch bend
+        QCOMPARE(got, (std::vector<MidiMessage>{{0xD0, 0x25}, {0xD0, 0x2C}, {0xE8, 0x00, 0x40}}));
+        feed({0xF0, 0x00, 0x00, 0x66, 0x14, 0x01, 0x05, 0xF7, 0x12, 0x90, 0x5E, 0x7F});  // exclusive, a stray byte, a note
+        QCOMPARE(got, (std::vector<MidiMessage>{{0xF0, 0x00, 0x00, 0x66, 0x14, 0x01, 0x05, 0xF7}, {0x90, 0x5E, 0x7F}}));
+        feed({0xF0, 0x00, 0x66, 0xB0, 0x3C, 0x01, 0xF6});  // an exclusive cut short by a status; tune request
+        QCOMPARE(got, (std::vector<MidiMessage>{{0xB0, 0x3C, 0x01}, {0xF6}}));
+        QCOMPARE(midiDataBytes(0xC3), 1);
+        QCOMPARE(midiDataBytes(0xF2), 2);
+
+        // ---- Mackie Control: what the surface says.
+        using mcu::Event;
+        auto ev = [](MidiMessage m) { return mcu::decode(m); };
+        Event e = ev({0xE3, 0x00, 0x40});
+        QVERIFY(e.kind == Event::Fader && e.index == 3 && e.value == 0x2000);
+        e = ev({0x90, 0x68, 0x7F});
+        QVERIFY(e.kind == Event::Touch && e.index == 0 && e.down);
+        e = ev({0x90, 0x70, 0x00});
+        QVERIFY(e.kind == Event::Touch && e.index == mcu::kMasterChannel && !e.down);
+        e = ev({0xB0, 0x12, 0x41});
+        QVERIFY(e.kind == Event::VPot && e.index == 2 && e.value == -1);
+        QCOMPARE(ev({0xB0, 0x12, 0x03}).value, 3);
+        QCOMPARE(ev({0xB0, 0x12, 0x40}).value, -1);  // a zero count is still a step
+        e = ev({0xB0, 0x3C, 0x05});
+        QVERIFY(e.kind == Event::Jog && e.value == 5);
+        e = ev({0x90, 0x5E, 0x7F});
+        QVERIFY(e.kind == Event::Button && e.index == mcu::Play && e.down);
+        e = ev({0x80, 0x5E, 0x40});
+        QVERIFY(e.kind == Event::Button && !e.down);
+        QVERIFY(ev({0xF8}).kind == Event::None);
+        int device = 0, command = 0;
+        QVERIFY(mcu::surfaceSysex({0xF0, 0x00, 0x00, 0x66, 0x14, 0x01, 1, 2, 3, 0xF7}, device, command) && device == 0x14 && command == 1);
+        QVERIFY(!mcu::surfaceSysex({0xF0, 0x00, 0x20, 0x32, 0x14, 0x01, 0xF7}, device, command));
+
+        // ---- What it is told.
+        QCOMPARE(mcu::fader(8, 16383), (MidiMessage{0xE8, 0x7F, 0x7F}));
+        QCOMPARE(mcu::led(mcu::Mute + 1, 2), (MidiMessage{0x90, 0x11, 0x7F}));
+        QCOMPARE(mcu::led(mcu::Record, 1), (MidiMessage{0x90, 0x5F, 0x01}));
+        QCOMPARE(mcu::panRing(-1), 1);
+        QCOMPARE(mcu::panRing(0), 6);
+        QCOMPARE(mcu::panRing(1), 11);
+        QCOMPARE(mcu::ring(3, 6), (MidiMessage{0xB0, 0x33, 0x06}));
+        QCOMPARE(mcu::meter(2, 12), (MidiMessage{0xD0, 0x2C}));
+        QCOMPARE(mcu::meterLevel(0), 0);
+        QCOMPARE(mcu::meterLevel(1.0), 12);
+        QCOMPARE(mcu::meterLevel(0.51), 9);  // -5.8 dB
+        QCOMPARE(mcu::meterLevel(0.5), 8);   // -6.02 dB, just under
+        QCOMPARE(mcu::meterLevel(2.0), 13);
+        QCOMPARE(mcu::meterMode(1, 3), (MidiMessage{0xF0, 0x00, 0x00, 0x66, 0x14, 0x20, 0x01, 0x03, 0xF7}));
+        const MidiMessage text = mcu::lcd(7, "Vo\xc3\xa7");
+        QCOMPARE(text, (MidiMessage{0xF0, 0x00, 0x00, 0x66, 0x14, 0x12, 0x07, 'V', 'o', '?', '?', 0xF7}));
+        QCOMPARE(mcu::stripText("Dialogue A"), std::string("Dialog "));
+        QCOMPARE(mcu::stripText("Ça va"), std::string("?a va  "));
+        // The timecode display: 3-2-2-3 digits, dots after the hours, minutes and seconds, 0x40 the rightmost.
+        const std::vector<MidiMessage> tc = mcu::timecode("01:02:03:04");
+        QCOMPARE(tc.size(), size_t(10));
+        const uint8_t want[10] = {0x34, 0x30, 0x20, 0x73, 0x30, 0x72, 0x30, 0x71, 0x30, 0x20};
+        for (int i = 0; i < 10; ++i) QCOMPARE(tc[size_t(i)], (MidiMessage{0xB0, uint8_t(0x40 + i), want[i]}));
+        // Dots only after groups that are there: none for a blank display, and only after the seconds for "12:34".
+        for (const MidiMessage& m : mcu::timecode("")) QCOMPARE(m[2], uint8_t(0x20));
+        const std::vector<MidiMessage> short_ = mcu::timecode("12:34");
+        for (int i = 0; i < 10; ++i) QCOMPARE(bool(short_[size_t(i)][2] & 0x40), i == 3);
+        QCOMPARE(mcu::assignment("3"), (std::vector<MidiMessage>{{0xB0, 0x4B, 0x20}, {0xB0, 0x4A, 0x33}}));
+        // The fader law, both ways; the top of a fader's ten-bit travel reads as the top.
+        QCOMPARE(mcu::faderValue(-100), 0);
+        QCOMPARE(mcu::faderValue(12), 16383);
+        QCOMPARE(mcu::faderValue(0), int(std::lround(0.75 * 16383)));
+        for (double db : {-60.0, -30.0, -12.0, -6.0, 0.0, 6.0, 11.0}) QVERIFY(std::fabs(mcu::faderDb(mcu::faderValue(db)) - db) < 0.01);
+        QCOMPARE(mcu::faderDb(0x3F70), 12.0);
+        QVERIFY(mcu::faderDb(mcu::faderValue(-6) + 100) > -6);
+    }
+
     void captionPlacement() {
         const Rational fps{25, 1};
         // Keypad digits, words and back.
@@ -621,6 +715,14 @@ private slots:
         QCOMPARE(captionKeypad(under[3]), 2);
         QCOMPARE(captionKeypad(under[4]), 2);
         QCOMPARE(raiseCaptionsOverTitles(under, seq), 0);
+        // A 3D title placed low counts as well.
+        Clip low3d = makeGeneratorClip(p, "title3d", 50);
+        low3d.start = 500;
+        low3d.generator.params["pos_y"] = Param(0.3 * seq.height);
+        edit::overwrite(p, seq, {TrackKind::Video, 0}, low3d);
+        under.push_back(placed(510, 540, "under the 3D title", 2));
+        QCOMPARE(raiseCaptionsOverTitles(under, seq), 1);
+        QCOMPARE(captionKeypad(under.back()), 8);
     }
 
     void mergedClipsFromSeparateSound() {
@@ -2804,6 +2906,276 @@ private slots:
         QCOMPARE(mr.children.size(), size_t(300));
     }
 
+    void projectLocksAndProductions() {
+        QTemporaryDir dir;
+        const std::string proj = (dir.path() + "/Reel 1.montage").toStdString();
+        Project p = makeDefaultProject();
+        QVERIFY(saveProject(p, proj));
+        // Free, then this process's: a hidden file beside the project.
+        QCOMPARE(projectLockStatus(proj).state, LockState::Free);
+        QCOMPARE(acquireProjectLock(proj), LockResult::Acquired);
+        const QString lockFile = QString::fromStdString(lockPathFor(proj));
+        QVERIFY(QFileInfo::exists(lockFile) && QFileInfo(lockFile).fileName().startsWith('.'));
+        LockStatus st = projectLockStatus(proj);
+        QCOMPARE(st.state, LockState::Mine);
+        QCOMPARE(st.owner.pid, qint64(QCoreApplication::applicationPid()));
+        QCOMPARE(acquireProjectLock(proj), LockResult::Acquired);  // again: still ours
+        QVERIFY(refreshProjectLock(proj));
+        releaseProjectLock(proj);
+        QCOMPARE(projectLockStatus(proj).state, LockState::Free);
+        // Someone on another machine, heard from just now: theirs, never taken or let go from here.
+        auto writeLock = [&](const QString& host, qint64 pid, int secondsAgo) {
+            const QString t = QDateTime::currentDateTimeUtc().addSecs(-secondsAgo).toString(Qt::ISODateWithMs);
+            QFile f(lockFile);
+            QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            f.write(QJsonDocument(QJsonObject{{"user", "sam"}, {"host", host}, {"app", "Montage"}, {"pid", double(pid)}, {"since", t}, {"heartbeat", t}}).toJson());
+            f.close();
+            QVERIFY(f.open(QIODevice::ReadWrite));
+            f.setFileTime(QDateTime::currentDateTime().addSecs(-secondsAgo), QFileDevice::FileModificationTime);
+            f.close();
+        };
+        writeLock("edit-bay-2", 4242, 5);
+        st = projectLockStatus(proj);
+        QCOMPARE(st.state, LockState::Theirs);
+        QCOMPARE(st.owner.describe(), std::string("sam on edit-bay-2"));
+        LockOwner holder;
+        QCOMPARE(acquireProjectLock(proj, &holder), LockResult::HeldByOther);
+        QCOMPARE(holder.user, std::string("sam"));
+        QVERIFY(!refreshProjectLock(proj));
+        releaseProjectLock(proj);
+        QCOMPARE(projectLockStatus(proj).state, LockState::Theirs);
+        // Not heard from for longer than the stale time: taken over.
+        writeLock("edit-bay-2", 4242, kLockStaleSeconds + 60);
+        QCOMPARE(projectLockStatus(proj).state, LockState::Stale);
+        QCOMPARE(acquireProjectLock(proj), LockResult::Acquired);
+        QCOMPARE(projectLockStatus(proj).state, LockState::Mine);
+        releaseProjectLock(proj);
+        // On this machine with its process gone: stale at once.
+        QProcess gone;
+        gone.start(QCoreApplication::applicationFilePath(), {"-functions"});
+        QVERIFY(gone.waitForStarted());
+        const qint64 deadPid = gone.processId();
+        QVERIFY(gone.waitForFinished());
+        writeLock(QSysInfo::machineHostName(), deadPid, 1);
+        QCOMPARE(projectLockStatus(proj).state, LockState::Stale);
+        // A lock file being written just now (not yet readable) is someone's; an old damaged one is stale.
+        {
+            QFile f(lockFile);
+            QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            f.write("{\"us");
+            f.close();
+        }
+        QCOMPARE(projectLockStatus(proj).state, LockState::Theirs);
+        {
+            QFile f(lockFile);
+            QVERIFY(f.open(QIODevice::ReadWrite));
+            f.setFileTime(QDateTime::currentDateTime().addSecs(-(kLockStaleSeconds + 60)), QFileDevice::FileModificationTime);
+        }
+        QCOMPARE(projectLockStatus(proj).state, LockState::Stale);
+        QFile::remove(lockFile);
+        // A heartbeat from the future (a clock running ahead) is not believed: the file's own age decides.
+        {
+            const QString future = QDateTime::currentDateTimeUtc().addDays(1).toString(Qt::ISODateWithMs);
+            QFile f(lockFile);
+            QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            f.write(QJsonDocument(QJsonObject{{"user", "sam"}, {"host", "edit-bay-2"}, {"pid", 4242.0}, {"since", future}, {"heartbeat", future}}).toJson());
+            f.close();
+            QVERIFY(f.open(QIODevice::ReadWrite));
+            f.setFileTime(QDateTime::currentDateTime().addSecs(-(kLockStaleSeconds + 60)), QFileDevice::FileModificationTime);
+        }
+        QCOMPARE(projectLockStatus(proj).state, LockState::Stale);
+        QFile::remove(lockFile);
+        // Renewing: a lock file gone missing (the drive briefly away) is written again; one that cannot be read just
+        // now leaves the lock held; only one naming someone else means it was taken over.
+        QCOMPARE(acquireProjectLock(proj), LockResult::Acquired);
+        QFile::remove(lockFile);
+        QCOMPARE(refreshProjectLockState(proj), RefreshResult::Held);
+        QCOMPARE(projectLockStatus(proj).state, LockState::Mine);
+        {
+            QFile f(lockFile);
+            QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            f.write("{\"us");
+        }
+        QCOMPARE(refreshProjectLockState(proj), RefreshResult::Unknown);
+        QVERIFY(refreshProjectLock(proj));
+        writeLock("edit-bay-2", 4242, 5);
+        QCOMPARE(refreshProjectLockState(proj), RefreshResult::Lost);
+        QVERIFY(!refreshProjectLock(proj));
+        QFile::remove(lockFile);
+        // This process's own lock is known by its token, whatever the machine is called now.
+        QCOMPARE(acquireProjectLock(proj), LockResult::Acquired);
+        {
+            QFile f(lockFile);
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            QJsonObject j = QJsonDocument::fromJson(f.readAll()).object();
+            f.close();
+            QVERIFY(!j.value("token").toString().isEmpty());
+            j["host"] = "renamed-laptop";
+            j["pid"] = 1;
+            QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            f.write(QJsonDocument(j).toJson());
+        }
+        QCOMPARE(projectLockStatus(proj).state, LockState::Mine);
+        releaseProjectLock(proj);
+        QVERIFY(!QFileInfo::exists(lockFile));
+
+        // A production: projects in its folder and below, who is editing each, found from a project inside it.
+        const std::string prod = (dir.path() + "/Feature").toStdString();
+        QVERIFY(createProduction(prod, "The Feature"));
+        QVERIFY(isProduction(prod) && !isProduction(dir.path().toStdString()));
+        QCOMPARE(productionName(prod), std::string("The Feature"));
+        QVERIFY(QDir().mkpath(QString::fromStdString(prod) + "/Reels"));
+        const std::string assembly = prod + "/Assembly.montage", reel1 = prod + "/Reels/Reel 1.montage", reel2 = prod + "/Reels/Reel 2.montage";
+        for (const std::string& f : {assembly, reel1, reel2}) QVERIFY(saveProject(p, f));
+        QCOMPARE(acquireProjectLock(reel1), LockResult::Acquired);
+        {
+            const QString t = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
+            QFile f(QString::fromStdString(lockPathFor(reel2)));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(QJsonDocument(QJsonObject{{"user", "alex"}, {"host", "bay-3"}, {"pid", 7}, {"since", t}, {"heartbeat", t}}).toJson());
+        }
+        const auto list = listProduction(prod);
+        QCOMPARE(list.size(), size_t(3));  // the lock files are not projects
+        QCOMPARE(list[0].relative, std::string("Assembly.montage"));
+        QCOMPARE(list[1].relative, std::string("Reels/Reel 1.montage"));
+        QCOMPARE(list[2].relative, std::string("Reels/Reel 2.montage"));
+        QCOMPARE(list[0].lock.state, LockState::Free);
+        QCOMPARE(list[1].lock.state, LockState::Mine);
+        QCOMPARE(list[2].lock.state, LockState::Theirs);
+        QCOMPARE(list[2].lock.owner.describe(), std::string("alex on bay-3"));
+        QCOMPARE(QString::fromStdString(productionOf(reel1)), QDir(QString::fromStdString(prod)).absolutePath());
+        QVERIFY(productionOf(proj).empty());
+        releaseProjectLock(reel1);
+    }
+
+    void importSequencesFromAnotherProject() {
+        // The source: "Main" (a picture clip and its linked sound, a subclip, a compressor keyed by A2) nesting "Nest".
+        Project a = makeDefaultProject();
+        MediaItem cam;
+        cam.id = a.newId();
+        cam.kind = MediaKind::Video;
+        cam.name = "A001";
+        cam.path = "/media/A001.mov";
+        cam.duration = 10;
+        cam.hasVideo = cam.hasAudio = true;
+        cam.fps = {25, 1};
+        cam.bin = "Day 1";
+        a.media.push_back(cam);
+        MediaItem sub = cam;
+        sub.id = a.newId();
+        sub.name = "A001 take 2";
+        sub.subclipOf = cam.id;
+        sub.subclipIn = 2, sub.subclipOut = 4;
+        a.media.push_back(sub);
+        Sequence& main = *a.active();
+        main.name = "Main";
+        edit::addTrack(a, main, TrackKind::Audio);
+        edit::addTrack(a, main, TrackKind::Video);
+        Clip v;
+        v.id = a.newId();
+        v.mediaId = cam.id;
+        v.duration = 50;
+        v.linkGroup = a.newId();
+        Clip snd = v;
+        snd.id = a.newId();
+        main.videoTracks[0].clips.push_back(v);
+        main.audioTracks[0].clips.push_back(snd);
+        Clip take = v;
+        take.id = a.newId();
+        take.mediaId = sub.id;
+        take.start = 60;
+        take.linkGroup = 0;
+        main.videoTracks[0].clips.push_back(take);
+        Effect comp = makeEffect(a, "compressor");
+        comp.strings["sidechain"] = std::to_string(main.audioTracks[1].id);
+        main.audioTracks[0].effects = {comp};
+        const Id nestId = edit::duplicateSequence(a, main.id, "Nest");
+        Id nestMedia = 0;
+        for (const MediaItem& m : a.media)
+            if (m.kind == MediaKind::Sequence && m.sequenceId == nestId) nestMedia = m.id;
+        QVERIFY(nestMedia);
+        Clip nested;
+        nested.id = a.newId();
+        nested.mediaId = nestMedia;
+        nested.start = 120;
+        nested.duration = 40;
+        a.findSequence(a.activeSequence)->videoTracks[1].clips.push_back(nested);
+        // An audition take of the camera file, and a colour group with a grade.
+        {
+            Sequence& m = *a.findSequence(a.activeSequence);
+            Take alt;
+            alt.mediaId = sub.id;
+            alt.name = "take 2";
+            m.videoTracks[0].clips[0].takes.push_back(alt);
+            ColorGroup g;
+            g.id = a.newId();
+            g.postId = a.newId();
+            g.name = "Day";
+            g.pre.push_back(makeEffect(a, "color_correct"));
+            m.colorGroups.push_back(g);
+            m.videoTracks[0].clips[0].colorGroup = g.id;
+        }
+        // Faces found in the camera file, named in this project.
+        {
+            auto faces = std::make_shared<FaceIndex>();
+            FaceIndex::Face face;
+            face.person = 3;
+            faces->faces.push_back(face);
+            for (MediaItem& m : a.media)
+                if (m.id == sub.id) m.faces = faces;
+        }
+        const Id mainId = a.activeSequence;
+
+        // The target already has the camera file.
+        Project b = makeDefaultProject();
+        MediaItem own = cam;
+        own.id = b.newId();
+        own.bin.clear();
+        b.media.push_back(own);
+        const size_t sequencesBefore = b.sequences.size();
+        const std::vector<Id> made = importFromProject(b, a, {mainId});
+        QCOMPARE(made.size(), size_t(1));
+        QCOMPARE(b.sequences.size(), sequencesBefore + 2);  // Main and the Nest it plays
+        const Sequence* im = b.findSequence(made[0]);
+        QVERIFY(im && im->name == "Main");
+        // The camera file is not added twice; the subclip comes, pointing at it; the nested clip plays the new Nest.
+        QCOMPARE(im->videoTracks[0].clips[0].mediaId, own.id);
+        const MediaItem* takeMedia = b.findMedia(im->videoTracks[0].clips[1].mediaId);
+        QVERIFY(takeMedia && takeMedia->subclipOf == own.id && takeMedia->name == "A001 take 2");
+        QVERIFY(std::find(b.bins.begin(), b.bins.end(), "Day 1") != b.bins.end());
+        const MediaItem* nm = b.findMedia(im->videoTracks[1].clips[0].mediaId);
+        QVERIFY(nm && nm->kind == MediaKind::Sequence && nm->sequenceId != nestId);
+        const Sequence* nest = b.findSequence(nm->sequenceId);
+        QVERIFY(nest && nest->name == "Nest" && nest->videoTracks[0].clips[0].mediaId == own.id);
+        // New ids throughout, links kept, the compressor keyed by the copy's A2.
+        std::set<Id> ids;
+        size_t count = 0;
+        for (const Sequence& s : b.sequences) {
+            ids.insert(s.id), ++count;
+            for (const auto* list : {&s.videoTracks, &s.audioTracks})
+                for (const Track& t : *list) {
+                    ids.insert(t.id), ++count;
+                    for (const Clip& c : t.clips) ids.insert(c.id), ++count;
+                }
+        }
+        for (const MediaItem& m : b.media) ids.insert(m.id), ++count;
+        QCOMPARE(ids.size(), count);
+        QVERIFY(*ids.rbegin() < b.nextId);
+        QVERIFY(im->videoTracks[0].clips[0].linkGroup != 0 && im->videoTracks[0].clips[0].linkGroup == im->audioTracks[0].clips[0].linkGroup);
+        QCOMPARE(im->audioTracks[0].effects[0].s("sidechain"), std::to_string(im->audioTracks[1].id));
+        // The take plays the copied subclip; the colour group is the copy's own, the clip graded with it; faces are
+        // still to be named here.
+        QCOMPARE(im->videoTracks[0].clips[0].takes.size(), size_t(1));
+        QCOMPARE(im->videoTracks[0].clips[0].takes[0].mediaId, takeMedia->id);
+        QCOMPARE(im->colorGroups.size(), size_t(1));
+        const Id gid = im->colorGroups[0].id;
+        QVERIFY(gid != a.findSequence(mainId)->colorGroups[0].id && ids.count(gid) == 0 && gid < b.nextId);
+        QCOMPARE(im->videoTracks[0].clips[0].colorGroup, gid);
+        QVERIFY(takeMedia->faces && takeMedia->faces->faces[0].person == 0);
+        // A sequence it does not have: nothing.
+        QVERIFY(importFromProject(b, a, {987654}).empty());
+    }
+
     void surroundPositionLanes() {
         Fixture fx;
         Track& a = fx.a1();
@@ -4294,6 +4666,159 @@ private slots:
         QVERIFY(loadProject(file.toStdString(), loaded));
         QCOMPARE(loaded.media.back().path, m.path);
         QFile::remove(file);
+    }
+
+    void ambisonicsMaths() {
+        auto near = [](double a, double b, double tol = 1e-4) { return std::fabs(a - b) < tol; };
+        // A sound from the left: W 1, Y 1 (Y points left); from above: Z 1; focus 0 is heard all round.
+        auto g = foaEncode(-90, 0);
+        QVERIFY(near(g[0], 1) && near(g[1], 1) && near(g[2], 0) && near(g[3], 0));
+        g = foaEncode(0, 90);
+        QVERIFY(near(g[2], 1) && near(g[3], 0));
+        g = foaEncode(30, 0, 0);
+        QVERIFY(near(g[0], 1) && near(g[1], 0) && near(g[3], 0));
+        // The view turned right brings a sound on the right to the front; tilted up, one above; rolled clockwise, a
+        // sound on the right is now above.
+        auto turned = [&](double angle, double el, double yaw, double pitch, double roll) {
+            auto v = foaEncode(angle, el);
+            foaRotate(foaRotation(yaw, pitch, roll), v.data());
+            return v;
+        };
+        g = turned(90, 0, 90, 0, 0);
+        QVERIFY2(near(g[3], 1) && near(g[1], 0), qPrintable(QString("%1 %2").arg(g[3]).arg(g[1])));
+        g = turned(0, 90, 0, 90, 0);
+        QVERIFY(near(g[3], 1) && near(g[2], 0));
+        g = turned(90, 0, 0, 0, 90);
+        QVERIFY(near(g[2], 1) && near(g[1], 0));
+        // Yaw then pitch: a sound 90° right and 45° up, looked at directly.
+        g = turned(90, 45, 90, 45, 0);
+        QVERIFY(near(g[3], 1, 1e-3));
+        QVERIFY(foaRotation(0, 0, 0).identity && !foaRotation(1, 0, 0).identity);
+        // Two virtual cardioids: louder on the side the sound comes from, equal from the front.
+        float l, r;
+        g = foaEncode(-90, 0);
+        foaDecodeStereo(g.data(), l, r);
+        QVERIFY(l > 4 * r);
+        g = foaEncode(0, 0);
+        foaDecodeStereo(g.data(), l, r);
+        QVERIFY(near(l, r) && l > 0.5f);
+        // Binaurally, a click from the left reaches the left ear first and louder.
+        FoaBinaural bin(48000);
+        std::vector<float> in(size_t(512) * 4, 0.0f), out(size_t(512) * 2);
+        g = foaEncode(-90, 0);
+        for (int k = 0; k < 4; ++k) in[size_t(10) * 4 + size_t(k)] = g[size_t(k)];
+        bin.process(in.data(), 512, out.data());
+        int peakL = 0, peakR = 0;
+        double eL = 0, eR = 0;
+        for (int i = 0; i < 512; ++i) {
+            if (std::fabs(out[size_t(i) * 2]) > std::fabs(out[size_t(peakL) * 2])) peakL = i;
+            if (std::fabs(out[size_t(i) * 2 + 1]) > std::fabs(out[size_t(peakR) * 2 + 1])) peakR = i;
+            eL += out[size_t(i) * 2] * out[size_t(i) * 2];
+            eR += out[size_t(i) * 2 + 1] * out[size_t(i) * 2 + 1];
+        }
+        QVERIFY2(peakR - peakL >= 15 && peakR - peakL <= 40 && eL > 2 * eR, qPrintable(QString("%1 %2 %3 %4").arg(peakL).arg(peakR).arg(eL).arg(eR)));
+        // From the front, the ears agree.
+        bin.reset();
+        std::fill(in.begin(), in.end(), 0.0f);
+        g = foaEncode(0, 0);
+        for (int k = 0; k < 4; ++k) in[size_t(10) * 4 + size_t(k)] = g[size_t(k)];
+        bin.process(in.data(), 512, out.data());
+        for (int i = 0; i < 512; ++i) QVERIFY(near(out[size_t(i) * 2], out[size_t(i) * 2 + 1], 1e-5));
+        // The ambisonic layout: four channels, sounds placed by direction, heard as stereo when folded.
+        QVERIFY(ambisonicLayout("ambix") && !ambisonicLayout("5.1"));
+        QCOMPARE(layoutChannels("ambix"), 4);
+        QVERIFY(std::find(audioLayouts().begin(), audioLayouts().end(), "ambix") != audioLayouts().end());
+        const auto pg = panGains("ambix", -90, 1, 0);
+        QVERIFY(pg.size() == 4 && near(pg[0], 1) && near(pg[1], 1) && near(pg[3], 0));
+        QVERIFY(near(panGains("ambix", 0, 1, 1)[2], 1));   // overhead
+        QVERIFY(near(panGains("ambix", -90, 0, 0)[1], 0));  // in the middle: all round
+        // A stereo track's two channels go into the field 3 dB down at any width (both always add in W), where the
+        // speaker layouts keep them whole when wide.
+        for (double width : {0.0, 1.0}) {
+            const SurroundGains sg = surroundGains("ambix", SurroundPan{0, 1, width, -100, 0, false});
+            QVERIFY(near(sg.left[0], float(std::sqrt(0.5))) && near(sg.right[0], float(std::sqrt(0.5))));
+        }
+        QVERIFY(near(surroundGains("5.1", SurroundPan{0, 1, 1, -100, 0, false}).left[0], 1));
+        float field[4] = {1, 1, 0, 0}, st[2];
+        downmixToStereo("ambix", field, 1, st);
+        QVERIFY(st[0] > 4 * st[1]);
+        QVERIFY(!immersiveLayout("ambix"));
+        // Saved and loaded: the sequence's layout and a media item's ambisonic order.
+        Project p = makeDefaultProject();
+        p.active()->audioLayout = "ambix";
+        MediaItem m;
+        m.id = p.newId();
+        m.kind = MediaKind::Audio;
+        m.path = "/f/field.wav";
+        m.ambisonic = 1;
+        p.media.push_back(m);
+        const QString file = QDir::temp().filePath("ambisonic-test.montage");
+        QVERIFY(saveProject(p, file.toStdString()));
+        Project loaded;
+        QVERIFY(loadProject(file.toStdString(), loaded));
+        QCOMPARE(loaded.active()->audioLayout, std::string("ambix"));
+        QCOMPARE(loaded.media.back().ambisonic, 1);
+        QFile::remove(file);
+        // The Ambisonics effect: no turn, follows the view, heard binaurally.
+        const Effect e = makeEffect(p, "ambisonics");
+        QVERIFY(e.p("yaw", 0, 9) == 0 && e.p("follow_view", 0, 0) == 1 && e.p("decode", 0, 9) == 0);
+    }
+
+    void stereoInterpretation() {
+        // How the eyes are packed, swapped eyes, and the eye read: carried with the path like the rest.
+        Interpretation i;
+        i.stereo = "tb_half";
+        i.swapEyes = true;
+        QVERIFY(!i.empty());
+        const std::string path = interpretedPath("/f/3d.mp4", i);
+        QCOMPARE(path, std::string("/f/3d.mp4\x1dstereo=tb_half;swap=1"));
+        Interpretation back;
+        QVERIFY(parseInterpretation(path, back));
+        QVERIFY(back == i);
+        // The right eye is the same file read another way; the left eye is the media's own path.
+        QCOMPARE(eyePath(path, 0), path);
+        const std::string right = eyePath(path, 1);
+        QVERIFY(parseInterpretation(right, back));
+        QVERIFY(back.eye == 1 && back.stereo == "tb_half" && back.swapEyes);
+        QCOMPARE(eyePath(right, 0), path);
+        QCOMPARE(eyePath("/f/flat.mp4", 1), std::string("/f/flat.mp4\x1d" "eye=1"));
+        QCOMPARE(uninterpretedPath(right), std::string("/f/3d.mp4"));
+        // The file's own packing unless overridden; "none" reads it flat.
+        Interpretation none;
+        none.stereo = "none";
+        QCOMPARE(stereoLayout("sbs", Interpretation{}), std::string("sbs"));
+        QCOMPARE(stereoLayout("sbs", none), std::string());
+        QCOMPARE(stereoLayout("", i), std::string("tb_half"));
+        QVERIFY(validStereoLayout("") && validStereoLayout("none") && validStereoLayout("sbs_half") && !validStereoLayout("diagonal"));
+        QVERIFY(parseInterpretation("/a.mp4\x1dstereo=diagonal;swap=1", back) && back.stereo.empty() && back.swapEyes);
+        // A sequence's stereo flags and a media item's packing through a project file.
+        Project p = makeDefaultProject();
+        p.active()->stereo3d = true;
+        p.active()->spherical = true;
+        p.active()->vr180 = true;
+        MediaItem m;
+        m.id = p.newId();
+        m.kind = MediaKind::Video;
+        m.path = path;
+        m.stereo = "tb_half";
+        p.media.push_back(m);
+        const QString file = QDir::temp().filePath("stereo-test.montage");
+        QVERIFY(saveProject(p, file.toStdString()));
+        Project loaded;
+        QVERIFY(loadProject(file.toStdString(), loaded));
+        QVERIFY(loaded.active()->stereo3d && loaded.active()->vr180);
+        QCOMPARE(loaded.media.back().stereo, std::string("tb_half"));
+        QCOMPARE(interpretationOf(loaded.media.back()).stereo, std::string("tb_half"));
+        p.active()->stereo3d = false;
+        p.active()->vr180 = false;
+        QVERIFY(saveProject(p, file.toStdString()));
+        QVERIFY(loadProject(file.toStdString(), loaded));
+        QVERIFY(!loaded.active()->stereo3d && !loaded.active()->vr180);
+        QFile::remove(file);
+        // The Stereo 3D effect: depth and which way round the eyes are.
+        const Effect e = makeEffect(p, "stereo_3d");
+        QCOMPARE(e.p("depth", 0, 99), 0.0);
+        QCOMPARE(e.p("swap_eyes", 0, 99), 0.0);
     }
 
     void deleteGaps() {
@@ -5877,6 +6402,637 @@ private slots:
         QVERIFY(!importXmlTimeline(p, "not xml").ok);
         QVERIFY(!importOtio(p, "{}").ok);
         QVERIFY(!importEdl(p, "nothing here", {25, 1}).ok);
+    }
+
+    void interchangeReviewFixes() {
+        Project p = makeDefaultProject();
+        auto addMedia = [&](const char* name, bool video, bool audio) {
+            MediaItem m;
+            m.id = p.newId();
+            m.kind = video ? MediaKind::Video : MediaKind::Audio;
+            m.name = name;
+            m.path = std::string("/nonexistent/") + name;
+            m.duration = 20.0;
+            m.width = 1920;
+            m.height = 1080;
+            m.fps = {30, 1};
+            m.hasVideo = video;
+            m.hasAudio = audio;
+            p.media.push_back(m);
+            return m.id;
+        };
+        const Id camA = addMedia("CamA.mov", true, true), camB = addMedia("CamB.mov", true, true);
+        std::string err;
+        const Id mcMedia = makeMulticam(p, {camA, camB}, {0.0, 0.0}, "Pair", &err);
+        QVERIFY2(mcMedia, err.c_str());
+        Sequence& s = *p.active();
+        QVERIFY(edit::placeMedia(p, s, mcMedia, 0, 0, 120, V1, A1, false).ok);
+        QVERIFY(edit::switchAngle(p, s, trackAt(s, V1)->clips.at(0).id, 1, 60, true, true).ok);
+        // A dissolve at the angle switch, picture and sound.
+        for (TrackRef ref : {V1, A1}) {
+            Track& t = *trackAt(s, ref);
+            Transition tr;
+            tr.id = p.newId();
+            tr.type = ref.kind == TrackKind::Video ? "cross_dissolve" : "crossfade";
+            tr.clipA = t.clips.at(0).id;
+            tr.clipB = t.clips.at(1).id;
+            tr.duration = 10;
+            t.transitions.push_back(tr);
+        }
+        // Flattening keeps the dissolves (between the pieces now) and works on locked tracks too.
+        trackAt(s, V1)->locked = true;
+        Sequence flat = flattenedMulticam(p, s);
+        QCOMPARE(trackAt(flat, V1)->clips.size(), size_t(2));
+        QCOMPARE(trackAt(flat, A1)->clips.size(), size_t(2));
+        QCOMPARE(trackAt(flat, V1)->clips[0].mediaId, camA);
+        QCOMPARE(trackAt(flat, A1)->clips[1].mediaId, camB);
+        QVERIFY(trackAt(flat, V1)->locked);
+        for (TrackRef ref : {V1, A1}) {
+            const Track& t = *trackAt(flat, ref);
+            QCOMPARE(t.transitions.size(), size_t(1));
+            QCOMPARE(t.transitions[0].clipA, t.clips[0].id);
+            QCOMPARE(t.transitions[0].clipB, t.clips[1].id);
+        }
+        QVERIFY(exportEdl(p, s).find("D    010") != std::string::npos);
+        trackAt(s, V1)->locked = false;
+
+        // A multicam clip at twice the speed stays one; FCPXML writes its timeMap before the mc-source, OTIO and FCP 7
+        // XML nest only the angle it shows.
+        Clip& fast = trackAt(s, V1)->clips[0];
+        fast.speed = 2;
+        for (Id other : edit::linkedClips(s, fast.id)) edit::clipById(s, other)->speed = 2;
+        const std::string fcpx = exportFcpXml(p, s);
+        const size_t mc = fcpx.find("<mc-clip ");
+        QVERIFY(mc != std::string::npos);
+        const size_t tm = fcpx.find("<timeMap", mc), src = fcpx.find("<mc-source", mc);
+        QVERIFY(tm != std::string::npos && src != std::string::npos && tm < src);
+        const QJsonObject otio = QJsonDocument::fromJson(QByteArray::fromStdString(exportOtio(p, s))).object();
+        const QJsonObject stack = otio["tracks"].toObject()["children"].toArray()[0].toObject()["children"].toArray()[0].toObject();
+        QCOMPARE(stack["OTIO_SCHEMA"].toString(), QString("Stack.1"));
+        QCOMPARE(stack["children"].toArray().size(), 1);  // angle A alone, not both cameras stacked
+        QCOMPARE(stack["children"].toArray()[0].toObject()["children"].toArray()[0].toObject()["name"].toString(), QString("CamA.mov"));
+        const std::string fcp7 = exportFcp7Xml(p, s);
+        QVERIFY(fcp7.find("CamA.mov") != std::string::npos);
+        fast.speed = 1;
+        for (Id other : edit::linkedClips(s, fast.id)) edit::clipById(s, other)->speed = 1;
+
+        // Sound on its own (a J-cut: not carried with the picture) playing the mix takes the angle its picture shows.
+        Clip& late = trackAt(s, A1)->clips[1];
+        late.audioAngle = -1;
+        late.start += 3;
+        late.duration -= 3;
+        late.sourceIn += 3;
+        std::string again = exportFcpXml(p, s);
+        const size_t lane = again.find("lane=\"-1\"");
+        QVERIFY(lane != std::string::npos);
+        const size_t heard = again.find("<mc-source", lane);
+        QVERIFY(heard != std::string::npos && heard - lane < 400);
+        QVERIFY2(again.substr(heard, 60).find("angleID=\"angle-2\" srcEnable=\"audio\"") != std::string::npos, again.substr(heard, 60).c_str());
+
+        // A compound clip cut in two reads back from OTIO with its tracks once, not twice.
+        Sequence inner = makeSequence(p, "Inner", 1920, 1080, {30, 1}, 1, 1);
+        {
+            Clip v = makeClip(p, *p.findMedia(camA), TrackKind::Video, inner), a = makeClip(p, *p.findMedia(camA), TrackKind::Audio, inner);
+            v.duration = a.duration = 90;
+            inner.videoTracks[0].clips.push_back(v);
+            inner.audioTracks[0].clips.push_back(a);
+        }
+        MediaItem cm;
+        cm.id = p.newId();
+        cm.kind = MediaKind::Sequence;
+        cm.name = "Inner";
+        cm.sequenceId = inner.id;
+        cm.hasVideo = cm.hasAudio = true;
+        cm.fps = {30, 1};
+        cm.duration = 3;
+        p.sequences.push_back(inner);
+        p.media.push_back(cm);
+        Sequence& s2 = *p.active();
+        removeClips(p, s2, expandLinks(s2, {trackAt(s2, V1)->clips[0].id, trackAt(s2, V1)->clips[1].id}), false);
+        QVERIFY(edit::placeMedia(p, s2, cm.id, 0, 0, 90, V1, A1, false).ok);
+        QVERIFY(edit::razorAll(p, s2, 45).ok);
+        QCOMPARE(trackAt(s2, V1)->clips.size(), size_t(2));
+        Project q = makeDefaultProject();
+        ImportResult r = importOtio(q, exportOtio(p, s2));
+        QVERIFY2(r.ok, r.error.c_str());
+        const Sequence& back = *q.findSequence(r.sequence);
+        const MediaItem* nm = q.findMedia(trackAt(back, V1)->clips.at(0).mediaId);
+        QVERIFY(nm && nm->kind == MediaKind::Sequence);
+        const Sequence* ns = q.findSequence(nm->sequenceId);
+        QCOMPARE(ns->videoTracks.size(), size_t(1));
+        QCOMPARE(ns->audioTracks.size(), size_t(1));
+        // An OTIO Stack with no range (OTIO's default) shows all of its timeline.
+        const char* bare =
+            "{\"OTIO_SCHEMA\":\"Timeline.1\",\"name\":\"T\",\"global_start_time\":{\"OTIO_SCHEMA\":\"RationalTime.1\",\"rate\":25,\"value\":0},"
+            "\"tracks\":{\"OTIO_SCHEMA\":\"Stack.1\",\"children\":[{\"OTIO_SCHEMA\":\"Track.1\",\"kind\":\"Video\",\"name\":\"V1\",\"children\":["
+            "{\"OTIO_SCHEMA\":\"Stack.1\",\"name\":\"Nest\",\"source_range\":null,\"children\":[{\"OTIO_SCHEMA\":\"Track.1\",\"kind\":\"Video\",\"children\":["
+            "{\"OTIO_SCHEMA\":\"Clip.2\",\"name\":\"a\",\"source_range\":{\"OTIO_SCHEMA\":\"TimeRange.1\",\"start_time\":{\"OTIO_SCHEMA\":\"RationalTime.1\",\"rate\":25,\"value\":0},"
+            "\"duration\":{\"OTIO_SCHEMA\":\"RationalTime.1\",\"rate\":25,\"value\":50}},\"media_reference\":{\"OTIO_SCHEMA\":\"ExternalReference.1\",\"target_url\":\"file:///x/a.mov\"}}]}]},"
+            "{\"OTIO_SCHEMA\":\"Clip.2\",\"name\":\"b\",\"source_range\":{\"OTIO_SCHEMA\":\"TimeRange.1\",\"start_time\":{\"OTIO_SCHEMA\":\"RationalTime.1\",\"rate\":25,\"value\":0},"
+            "\"duration\":{\"OTIO_SCHEMA\":\"RationalTime.1\",\"rate\":25,\"value\":10}},\"media_reference\":{\"OTIO_SCHEMA\":\"ExternalReference.1\",\"target_url\":\"file:///x/b.mov\"}}"
+            "]}]}}";
+        Project q2 = makeDefaultProject();
+        ImportResult r2 = importOtio(q2, bare);
+        QVERIFY2(r2.ok, r2.error.c_str());
+        const auto& vc = trackAt(*q2.findSequence(r2.sequence), V1)->clips;
+        QCOMPARE(vc.size(), size_t(2));
+        QCOMPARE(vc[0].duration, FrameTime(50));
+        QCOMPARE(vc[1].start, FrameTime(50));
+
+        // Final Cut angles: a recorder connected inside an angle gets a track of its own, a dissolve inside the second
+        // angle stays on its track, a picture-only angle chosen for sound gives no sound, an unknown angle is reported.
+        Project f = makeDefaultProject();
+        ImportResult rf = importXmlTimeline(f, readData("interchange/final-cut-angles.fcpxml"));
+        QVERIFY2(rf.ok, rf.error.c_str());
+        bool warnedAngle = false;
+        for (const std::string& w : rf.warnings) {
+            QVERIFY2(w.find("Overlapping") == std::string::npos, w.c_str());
+            warnedAngle |= w.find("angles its multicam does not have") != std::string::npos;
+        }
+        QVERIFY(warnedAngle);
+        const Sequence& fs = *f.findSequence(rf.sequence);
+        const Sequence* fm = f.findSequence(f.findMedia(trackAt(fs, V1)->clips.at(0).mediaId)->sequenceId);
+        QVERIFY(fm && fm->multicam);
+        QCOMPARE(angleNames(*fm), (std::vector<std::string>{"Cam A", "Cam B", "GoPro"}));
+        QCOMPARE(fm->audioTracks.size(), size_t(3));
+        QCOMPARE(fm->audioTracks[2].name, std::string("Cam A (connected)"));
+        QCOMPARE(f.findMedia(fm->audioTracks[2].clips.at(0).mediaId)->name, std::string("ZOOM_A"));
+        QCOMPARE(fm->audioTracks[0].clips.at(0).duration, FrameTime(1000));
+        QCOMPARE(fm->videoTracks[1].transitions.size(), size_t(1));
+        QCOMPARE(trackAt(fs, V1)->clips[0].angle, 2);
+        QCOMPARE(trackAt(fs, V1)->clips[1].angle, 0);
+        const auto& fa = trackAt(fs, A1)->clips;
+        QCOMPARE(fa.size(), size_t(1));  // the GoPro part is silent
+        QCOMPARE(fa[0].start, FrameTime(100));
+        QCOMPARE(fa[0].audioAngle, -1);
+    }
+
+    void ascCdlAndAle() {
+        // The CDL maths, v1.2: slope, offset, clamp, power; saturation about Rec. 709 luma, clamped.
+        Cdl g;
+        g.slope[0] = 1.2;
+        g.offset[1] = -0.05;
+        g.power[2] = 1.5;
+        g.saturation = 0.8;
+        float r = 0.5f, gr = 0.4f, b = 0.3f;
+        applyCdl(g, r, gr, b);
+        const double R = 0.6, G = 0.35, B = std::pow(0.3, 1.5);
+        const double Y = 0.2126 * R + 0.7152 * G + 0.0722 * B;
+        QVERIFY(std::fabs(r - (Y + 0.8 * (R - Y))) < 1e-5 && std::fabs(gr - (Y + 0.8 * (G - Y))) < 1e-5 && std::fabs(b - (Y + 0.8 * (B - Y))) < 1e-5);
+        Cdl hot;
+        hot.slope[0] = 3;
+        hot.offset[1] = -0.5;
+        hot.power[1] = 0.5;  // a negative base would be NaN without the clamp
+        r = 0.5f, gr = 0.2f, b = 0.25f;
+        applyCdl(hot, r, gr, b);
+        QCOMPARE(r, 1.0f);
+        QCOMPARE(gr, 0.0f);
+        QCOMPARE(b, 0.25f);
+        QVERIFY(Cdl{}.identity() && !g.identity());
+        // As EDLs and ALEs carry it.
+        QCOMPARE(cdlSopText(g), std::string("(1.200000 1.000000 1.000000)(0.000000 -0.050000 0.000000)(1.000000 1.000000 1.500000)"));
+        Cdl back;
+        QVERIFY(parseCdlSop(cdlSopText(g), back));
+        back.saturation = 0.8;
+        QVERIFY(back.sameGrade(g));
+        QVERIFY(parseCdlSop(" ( 0.9 1 1.1 ) (0 0 0)(1 1 1) ", back) && back.slope[0] == 0.9 && back.slope[2] == 1.1);
+        QVERIFY(!parseCdlSop("(1 1)(0 0 0)(1 1 1)", back) && !parseCdlSop("hello", back));
+        // .cc, .ccc and .cdl files; CDL 1.0's SATNode; a description; one value for three.
+        const std::string cc = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+            "<ColorCorrection id=\"A001C003\" xmlns=\"urn:ASC:CDL:v1.01\"><Description>day ext</Description>\n"
+            "<SOPNode><Slope>1.1 1.0 0.9</Slope><Offset>0.01 0 -0.01</Offset><Power>1 1 1</Power></SOPNode>\n"
+            "<SatNode><Saturation>1.2</Saturation></SatNode></ColorCorrection>";
+        std::vector<Cdl> got = parseCdlXml(cc);
+        QCOMPARE(got.size(), size_t(1));
+        QCOMPARE(got[0].id, std::string("A001C003"));
+        QCOMPARE(got[0].description, std::string("day ext"));
+        QCOMPARE(got[0].slope[2], 0.9);
+        QCOMPARE(got[0].offset[0], 0.01);
+        QCOMPARE(got[0].saturation, 1.2);
+        const std::string ccc = "<ColorCorrectionCollection xmlns=\"urn:ASC:CDL:v1.01\">\n"
+            "<ColorCorrection id=\"one\"><SOPNode><Slope>2</Slope><Offset>0 0 0</Offset><Power>1 1 1</Power></SOPNode></ColorCorrection>\n"
+            "<ColorCorrection id=\"two\"><SOPNode><Slope>1 1 1</Slope><Offset>0 0 0</Offset><Power>1 1 1</Power></SOPNode><SATNode><Saturation>0</Saturation></SATNode></ColorCorrection>\n"
+            "</ColorCorrectionCollection>";
+        got = parseCdlXml(ccc);
+        QCOMPARE(got.size(), size_t(2));
+        QCOMPARE(got[0].slope[1], 2.0);
+        QCOMPARE(got[1].id, std::string("two"));
+        QCOMPARE(got[1].saturation, 0.0);
+        std::string err;
+        QVERIFY(parseCdlXml("<ColorDecisionList/>", &err).empty() && !err.empty());
+        QVERIFY(parseCdlXml("not xml", &err).empty());
+        QVERIFY(parseCdlXml("<ColorCorrection><SOPNode><Slope>a b c</Slope></SOPNode></ColorCorrection>", &err).empty());
+        // Written and read back, in each form.
+        g.id = "A001C001";
+        Cdl h = got[0];
+        for (CdlFormat f : {CdlFormat::Cc, CdlFormat::Ccc, CdlFormat::Cdl}) {
+            const std::string xml = writeCdlXml(f == CdlFormat::Cc ? std::vector<Cdl>{g} : std::vector<Cdl>{g, h}, f);
+            QVERIFY(xml.find("urn:ASC:CDL:v1.01") != std::string::npos);
+            const std::vector<Cdl> again = parseCdlXml(xml);
+            QCOMPARE(again.size(), f == CdlFormat::Cc ? size_t(1) : size_t(2));
+            QVERIFY(again[0].sameGrade(g) && again[0].id == "A001C001");
+        }
+        QVERIFY(writeCdlXml({g}, CdlFormat::Cdl).find("<ColorDecision>") != std::string::npos);
+        QCOMPARE(cdlFormatFor("/x/look.CC"), CdlFormat::Cc);
+        QCOMPARE(cdlFormatFor("/x/all.ccc"), CdlFormat::Ccc);
+
+        // An ALE as the lab sends it: CRLF, trailing tabs, a column left off one row.
+        const std::string ale =
+            "Heading\r\nFIELD_DELIM\tTABS\r\nVIDEO_FORMAT\t1080\r\nAUDIO_FORMAT\t48khz\r\nFPS\t23.976\r\n\r\n"
+            "Column\r\nName\tTracks\tStart\tEnd\tTape\tSource File\tScene\tTake\tComments\tASC_SOP\tASC_SAT\t\r\n\r\n"
+            "Data\r\n"
+            "A001C001_250101_R1AB\tVA1A2\t10:00:00:00\t10:00:10:00\t\tA001C001_250101_R1AB.mov\t12A\t3\tcircled\t(1.1 1.0 0.9)(0.0 0.0 0.01)(1.0 1.0 1.0)\t0.9\t\r\n"
+            "B-cam\tV\t01:00:00:00\t01:00:05:00\tB001\t\t12A\t4\r\n"
+            "Mystery\tV\t02:00:00:00\t02:00:01:00\tX\tnothing.mov\t1\t1\t\t\t\r\n";
+        AleTable t;
+        QVERIFY(parseAle(ale, t, &err));
+        QCOMPARE(t.fps(), (Rational{24000, 1001}));
+        QCOMPARE(t.rows.size(), size_t(3));
+        QCOMPARE(t.value(0, "source file"), std::string("A001C001_250101_R1AB.mov"));
+        QCOMPARE(t.value(1, "ASC_SOP"), std::string());
+        QVERIFY(!parseAle("Name\tTracks\nfoo\tV\n", t, &err));
+        QVERIFY(parseAle(ale, t));
+        // Onto a project: by file, by tape and start timecode; a row with no media reported.
+        Project p = makeDefaultProject();
+        auto addMedia = [&](const char* name, const char* path, double tc) {
+            MediaItem m;
+            m.id = p.newId();
+            m.kind = MediaKind::Video;
+            m.name = name;
+            m.path = path;
+            m.duration = 10;
+            m.width = 1920;
+            m.height = 1080;
+            m.fps = {24000, 1001};
+            m.hasVideo = m.hasAudio = true;
+            m.channels = 2;
+            m.timecode = tc;
+            p.media.push_back(m);
+            return m.id;
+        };
+        const Id a = addMedia("A001C001_250101_R1AB.mov", "/cards/A001/A001C001_250101_R1AB.mov", 36036.0);
+        const Id bc = addMedia("Interview B", "/cards/B001/B001C007.mov", 3603.6);
+        p.findMedia(bc)->metadata["tape"] = "B001";
+        Sequence& s = *p.active();
+        QVERIFY(edit::placeMedia(p, s, a, 0, 0, 48, V1, A1, false).ok);
+        QVERIFY(edit::placeMedia(p, s, a, 48, 100, 148, V1, A1, false).ok);
+        const AleImport ar = applyAle(p, t, true);
+        QCOMPARE(ar.rows, 3);
+        QCOMPARE(ar.matched.size(), size_t(2));
+        QCOMPARE(ar.unmatched, std::vector<std::string>{"Mystery"});
+        QCOMPARE(ar.cdls, 1);
+        QCOMPARE(ar.clips, 2);  // both clips of A, picture only
+        const MediaItem& ma = *p.findMedia(a);
+        QCOMPARE(ma.metadata.at("scene"), std::string("12A"));
+        QCOMPARE(ma.metadata.at("take"), std::string("3"));
+        QCOMPARE(ma.metadata.at("comment"), std::string("circled"));
+        QVERIFY(!ma.metadata.count("tape"));  // empty cells change nothing
+        QCOMPARE(p.findMedia(bc)->metadata.at("take"), std::string("4"));
+        Cdl mc, cc0;
+        QVERIFY(mediaCdl(ma, mc) && mc.slope[0] == 1.1 && mc.offset[2] == 0.01 && mc.saturation == 0.9);
+        QVERIFY(!mediaCdl(*p.findMedia(bc), mc));
+        QVERIFY(clipCdl(trackAt(s, V1)->clips.at(1), 50, cc0) && cc0.sameGrade(mc));
+        QVERIFY(!clipCdl(trackAt(s, A1)->clips.at(0), 0, cc0));
+        // An ALE of the media, read back into a fresh copy: the same log and CDL.
+        const AleTable out = aleFromMedia(p, {a, bc}, {24000, 1001});
+        const std::string text = writeAle(out);
+        QVERIFY(text.find("FPS\t23.976") != std::string::npos);
+        AleTable in;
+        QVERIFY(parseAle(text, in));
+        QCOMPARE(in.value(0, "Start"), std::string("10:00:00:00"));
+        QCOMPARE(in.value(0, "End"), std::string("10:00:10:00"));  // 10 s, the frame after the last
+        QCOMPARE(in.value(0, "Tracks"), std::string("VA1A2"));
+        QCOMPARE(in.value(1, "Tape"), std::string("B001"));
+        QCOMPARE(in.value(1, "Start"), std::string("01:00:00:00"));
+        QCOMPARE(in.value(0, "ASC_SOP"), cdlSopText(mc));
+        QCOMPARE(in.value(1, "ASC_SOP"), std::string());
+        Project fresh = p;
+        for (MediaItem& m : fresh.media) m.metadata.clear();
+        fresh.findMedia(bc)->metadata["tape"] = "B001";
+        const AleImport r2 = applyAle(fresh, in, false);
+        QCOMPARE(r2.matched.size(), size_t(2));
+        QCOMPARE(r2.clips, 0);
+        QCOMPARE(fresh.findMedia(a)->metadata.at("scene"), std::string("12A"));
+        QVERIFY(mediaCdl(*fresh.findMedia(a), cc0) && cc0.sameGrade(mc));
+
+        // EDLs carry a clip's CDL as *ASC_SOP and *ASC_SAT and read it back.
+        const std::string edl = exportEdl(p, s);
+        QVERIFY(edl.find("*ASC_SOP (1.100000 1.000000 0.900000)(0.000000 0.000000 0.010000)(1.000000 1.000000 1.000000)\n*ASC_SAT 0.900000") != std::string::npos);
+        Project q = makeDefaultProject();
+        ImportResult ir = importEdl(q, edl, s.fps);
+        QVERIFY2(ir.ok, ir.error.c_str());
+        Cdl fromEdl;
+        QVERIFY(clipCdl(trackAt(*q.findSequence(ir.sequence), V1)->clips.at(1), 0, fromEdl) && fromEdl.sameGrade(mc));
+        QVERIFY(!clipCdl(trackAt(*q.findSequence(ir.sequence), A1)->clips.at(0), 0, fromEdl));
+        // Setting a CDL replaces the clip's, put first (before a transform out of the camera's log).
+        Clip& c0 = trackAt(s, V1)->clips[0];
+        c0.effects.clear();
+        c0.effects.push_back(makeEffect(p, "color_space_transform"));
+        c0.effects.push_back(makeEffect(p, "lut"));
+        setClipCdl(p, c0, g);
+        setClipCdl(p, c0, h);
+        QCOMPARE(c0.effects.size(), size_t(3));
+        QCOMPARE(c0.effects[0].type, std::string("cdl"));
+        QVERIFY(clipCdl(c0, 0, cc0) && cc0.sameGrade(h));
+    }
+
+    void cdlAleReviewFixes() {
+        Project p = makeDefaultProject();
+        auto addMedia = [&](const char* name, std::string path, Rational fps, double tc) {
+            MediaItem m;
+            m.id = p.newId();
+            m.kind = MediaKind::Video;
+            m.name = name;
+            m.path = std::move(path);
+            m.duration = 10;
+            m.width = 1920;
+            m.height = 1080;
+            m.fps = fps;
+            m.hasVideo = true;
+            m.timecode = tc;
+            p.media.push_back(m);
+            return m.id;
+        };
+        // Timecodes at each media item's own rate, drop-frame only when its own timecode was.
+        const Id film = addMedia("A001.mov", "/c/A001.mov", {24000, 1001}, 3603.6);  // 01:00:00:00 at 23.976
+        const Id ndf = addMedia("B001.mov", "/c/B001.mov", {30000, 1001}, 36036.0);  // 10:00:00:00 non-drop at 29.97
+        const Id df = addMedia("C001.mov", "/c/C001.mov", {30000, 1001}, 1078920.0 * 1001 / 30000);  // 10:00:00;00 drop
+        p.findMedia(df)->metadata["timecode_drop"] = "1";
+        AleTable out = aleFromMedia(p, {film}, {24, 1});
+        QCOMPARE(out.headingValue("FPS"), std::string("23.976"));
+        QCOMPARE(out.value(0, "Start"), std::string("01:00:00:00"));
+        out = aleFromMedia(p, {ndf, df}, {25, 1});
+        QCOMPARE(out.headingValue("FPS"), std::string("29.97"));
+        QCOMPARE(out.value(0, "Start"), std::string("10:00:00:00"));
+        QCOMPARE(out.value(1, "Start"), std::string("10:00:00;00"));
+        // Matched by tape and a non-drop timecode at 29.97; a malformed timecode is just no match.
+        p.findMedia(ndf)->metadata["tape"] = "B001";
+        AleTable t;
+        QVERIFY(parseAle("Heading\nFPS\t29.97\n\nColumn\nName\tTape\tStart\tScene\n\nData\n"
+                         "B-cam roll\tB001\t10:00:00:00\t7\n"
+                         "Junk\tB001\t01:00:00:99999999999999999999\t8\n", t));
+        AleImport r = applyAle(p, t, false);
+        QCOMPARE(r.matched, std::vector<Id>{ndf});
+        QCOMPARE(r.unmatched, std::vector<std::string>{"Junk"});
+        QCOMPARE(p.findMedia(ndf)->metadata.at("scene"), std::string("7"));
+        // Names: an extension is only a media file's ("Sc12.1" is not "Sc12.2"); a file name read through Interpret
+        // Footage's settings and from a Windows path.
+        const Id sc1 = addMedia("Sc12.1", "/c/Sc12.1.mov", {25, 1}, 0);
+        Interpretation conform;
+        conform.fps = {24, 1};
+        const Id conformed = addMedia("D001", interpretedPath("/c/D001.mov", conform), {24, 1}, 0);
+        QVERIFY(parseAle("Heading\nFPS\t25\n\nColumn\nName\tSource File\tTake\n\nData\n"
+                         "Sc12.2\t\t9\n"
+                         "Whatever\tC:\\Media\\D001.mov\t3\n", t));
+        r = applyAle(p, t, false);
+        QCOMPARE(r.matched, std::vector<Id>{conformed});
+        QVERIFY(!p.findMedia(sc1)->metadata.count("take"));
+        const AleTable written = aleFromMedia(p, {conformed}, {24, 1});
+        QCOMPARE(written.value(0, "Source File"), std::string("D001.mov"));
+        // A collection: the exact name first ("Sc12.2" gets its own grade, not "Sc12.1"'s), then without the extension.
+        Cdl one, two;
+        one.id = "Sc12.1";
+        one.slope[0] = 1.1;
+        two.id = "Sc12.2";
+        two.slope[0] = 1.2;
+        QCOMPARE(matchCdl({one, two}, {"Sc12.2"})->id, std::string("Sc12.2"));
+        QCOMPARE(matchCdl({one, two}, {"Sc12.2.mov"})->id, std::string("Sc12.2"));
+        QVERIFY(!matchCdl({one, two}, {"Sc12.3"}));
+        // A subclip's clips get their parent's CDL, and the subclip its log.
+        const Id parent = addMedia("E001.mov", "/c/E001.mov", {25, 1}, 0);
+        std::optional<MediaItem> sub = makeSubclip(p, parent, 2, 6);
+        QVERIFY(sub);
+        sub->id = p.newId();
+        p.media.push_back(*sub);
+        Sequence& s = *p.active();
+        QVERIFY(edit::placeMedia(p, s, sub->id, 100, 0, 25, V1, {}, false).ok);
+        QVERIFY(parseAle("Heading\nFPS\t25\n\nColumn\nName\tScene\tASC_SOP\tASC_SAT\n\nData\nE001\t4\t(1.3 1 1)(0 0 0)(1 1 1)\t1\n", t));
+        r = applyAle(p, t, true);
+        QCOMPARE(r.clips, 1);
+        QCOMPARE(p.findMedia(sub->id)->metadata.at("scene"), std::string("4"));
+        Cdl got;
+        QVERIFY(clipCdl(trackAt(s, V1)->clips.at(0), 0, got) && got.slope[0] == 1.3);
+        // A keyframed CDL is read at the clip's own start, not at its place in the sequence.
+        Clip& c = trackAt(s, V1)->clips[0];
+        for (Effect& e : c.effects)
+            if (e.type == "cdl") {
+                e.params["slope.r"] = Param(1.5);
+                e.params["slope.r"].keys = {Keyframe{0, 1.5}, Keyframe{20, 2.0}};
+            }
+        QVERIFY(exportEdl(p, s).find("*ASC_SOP (1.500000") != std::string::npos);
+        // Corrections left out are reported even when others are read.
+        std::string err;
+        const std::vector<Cdl> some = parseCdlXml(
+            "<ColorCorrectionCollection><ColorCorrection id=\"ok\"><SOPNode><Slope>1 1 1</Slope></SOPNode></ColorCorrection>"
+            "<ColorCorrection id=\"bad\"><SatNode><Saturation>lots</Saturation></SatNode></ColorCorrection></ColorCorrectionCollection>",
+            &err);
+        QCOMPARE(some.size(), size_t(1));
+        QVERIFY(err.find("bad") != std::string::npos);
+        QVERIFY(parseCdlXml("<ColorDecisionList><ColorDecision><ColorCorrectionRef ref=\"x\"/></ColorDecision></ColorDecisionList>", &err).empty());
+        QVERIFY(err.find("ColorCorrectionRef") != std::string::npos);
+    }
+
+    void interchangeCompoundAndMulticam() {
+        Project p = makeDefaultProject();
+        auto addMedia = [&](const char* name, bool video, bool audio) {
+            MediaItem m;
+            m.id = p.newId();
+            m.kind = video ? MediaKind::Video : MediaKind::Audio;
+            m.name = name;
+            m.path = std::string("/nonexistent/") + name;
+            m.duration = 20.0;
+            m.width = 1920;
+            m.height = 1080;
+            m.fps = {30, 1};
+            m.hasVideo = video;
+            m.hasAudio = audio;
+            p.media.push_back(m);
+            return m.id;
+        };
+        const Id camA = addMedia("CamA.mov", true, true), camB = addMedia("CamB.mov", true, true);
+        const Id lav = addMedia("Lav.wav", false, true), broll = addMedia("Broll.mov", true, true);
+        // A multicam clip: the lav first, A half a second later, B 1.5 s later.
+        std::string err;
+        const Id mcMedia = makeMulticam(p, {camA, camB, lav}, {0.5, 1.5, 0.0}, "Interview", &err);
+        QVERIFY2(mcMedia, err.c_str());
+        // A compound clip: b-roll with its sound, a title over it.
+        Sequence inner = makeSequence(p, "Inner", 1920, 1080, {30, 1}, 2, 1);
+        {
+            Clip v = makeClip(p, *p.findMedia(broll), TrackKind::Video, inner), a = makeClip(p, *p.findMedia(broll), TrackKind::Audio, inner);
+            v.start = a.start = 0;
+            v.duration = a.duration = 60;
+            v.sourceIn = a.sourceIn = 30;
+            v.linkGroup = a.linkGroup = p.newId();
+            inner.videoTracks[0].clips.push_back(v);
+            inner.audioTracks[0].clips.push_back(a);
+            Clip t = makeGeneratorClip(p, "title", 30);
+            t.start = 15;
+            t.generator.strings["text"] = "Inside";
+            inner.videoTracks[1].clips.push_back(t);
+        }
+        MediaItem cm;
+        cm.id = p.newId();
+        cm.kind = MediaKind::Sequence;
+        cm.name = "Inner";
+        cm.sequenceId = inner.id;
+        cm.hasVideo = cm.hasAudio = true;
+        cm.width = 1920;
+        cm.height = 1080;
+        cm.fps = {30, 1};
+        cm.duration = 2.0;
+        p.sequences.push_back(inner);
+        p.media.push_back(cm);
+        // The cut: the multicam clip from its frame 60, angle A then B from frame 45 (sound following), then the
+        // compound clip from its frame 10.
+        Sequence& s = *p.active();
+        QVERIFY(edit::placeMedia(p, s, mcMedia, 0, 60, 150, V1, A1, false).ok);
+        QVERIFY(edit::switchAngle(p, s, trackAt(s, V1)->clips.at(0).id, 1, 45, true, true).ok);
+        QVERIFY(edit::placeMedia(p, s, cm.id, 90, 10, 50, V1, A1, false).ok);
+        QCOMPARE(trackAt(s, V1)->clips.size(), size_t(3));
+        QCOMPARE(trackAt(s, A1)->clips.at(0).audioAngle, -1);  // the whole mix
+        QCOMPARE(trackAt(s, A1)->clips.at(1).audioAngle, 1);
+
+        // FCPXML: a multicam (an mc-angle per source) and a compound sequence among the resources.
+        const std::string xml = exportFcpXml(p, s);
+        for (const char* want : {"<multicam ", "<mc-angle name=\"CamA.mov\" angleID=\"angle-1\"", "<mc-angle name=\"Lav.wav\" angleID=\"angle-3\"",
+                                 "<mc-clip ", "angleID=\"angle-2\" srcEnable=\"all\"", "<ref-clip ", "Inside"})
+            QVERIFY2(xml.find(want) != std::string::npos, want);
+        // Read back (into a project without the media): the same cut, the same nested sequences.
+        Project q = makeDefaultProject();
+        ImportResult r = importXmlTimeline(q, xml);
+        QVERIFY2(r.ok, r.error.c_str());
+        QVERIFY(r.warnings.empty());
+        const Sequence& back = *q.findSequence(r.sequence);
+        QCOMPARE(q.activeSequence, back.id);
+        const auto& vc = trackAt(back, V1)->clips;
+        const auto& ac = trackAt(back, A1)->clips;
+        QCOMPARE(vc.size(), size_t(3));
+        QCOMPARE(ac.size(), size_t(3));
+        const MediaItem* mcBack = q.findMedia(vc[0].mediaId);
+        QVERIFY(mcBack && mcBack->kind == MediaKind::Sequence);
+        QCOMPARE(vc[1].mediaId, vc[0].mediaId);  // one multicam, used twice
+        const Sequence* mc = q.findSequence(mcBack->sequenceId);
+        QVERIFY(mc && mc->multicam);
+        QCOMPARE(angleNames(*mc), (std::vector<std::string>{"CamA.mov", "CamB.mov"}));
+        QCOMPARE(mc->audioTracks.size(), size_t(3));
+        QCOMPARE(mc->videoTracks[0].clips.at(0).start, FrameTime(15));
+        QCOMPARE(mc->videoTracks[1].clips.at(0).start, FrameTime(45));
+        QCOMPARE(mc->audioTracks[2].clips.at(0).start, FrameTime(0));
+        QCOMPARE(angleAudioTrack(*mc, 1), 1);
+        QCOMPARE(audioTrackAngle(*mc, 2), -1);
+        QCOMPARE(vc[0].start, FrameTime(0));
+        QCOMPARE(vc[0].duration, FrameTime(45));
+        QCOMPARE(vc[0].sourceIn, 60.0);
+        QCOMPARE(vc[0].angle, 0);
+        QCOMPARE(ac[0].audioAngle, 0);  // the mix arrives as the seen angle's own sound
+        QCOMPARE(vc[1].angle, 1);
+        QCOMPARE(vc[1].sourceIn, 105.0);
+        QCOMPARE(ac[1].audioAngle, 1);
+        QVERIFY(vc[1].linkGroup && vc[1].linkGroup == ac[1].linkGroup);
+        // The compound clip and its sequence.
+        const MediaItem* inBack = q.findMedia(vc[2].mediaId);
+        QVERIFY(inBack && inBack->kind == MediaKind::Sequence && inBack->name == "Inner");
+        QCOMPARE(vc[2].start, FrameTime(90));
+        QCOMPARE(vc[2].duration, FrameTime(40));
+        QCOMPARE(vc[2].sourceIn, 10.0);
+        QCOMPARE(ac[2].mediaId, vc[2].mediaId);
+        QVERIFY(vc[2].linkGroup && vc[2].linkGroup == ac[2].linkGroup);
+        const Sequence* nested = q.findSequence(inBack->sequenceId);
+        QVERIFY(nested && !nested->multicam);
+        QCOMPARE(nested->videoTracks.at(0).clips.size(), size_t(1));
+        QCOMPARE(nested->videoTracks[0].clips[0].sourceIn, 30.0);
+        QCOMPARE(nested->videoTracks[0].clips[0].duration, FrameTime(60));
+        QCOMPARE(nested->videoTracks[0].clips[0].linkGroup, nested->audioTracks.at(0).clips.at(0).linkGroup);
+        QCOMPARE(nested->videoTracks.at(1).clips.at(0).generator.s("text"), std::string("Inside"));
+        QCOMPARE(nested->videoTracks[1].clips[0].start, FrameTime(15));
+        // Each file once, though the multicam, the compound clip and the cut all reach them.
+        int files = 0;
+        for (const MediaItem& m : q.media) files += m.kind != MediaKind::Sequence;
+        QCOMPARE(files, 4);
+        // The project's sequence is found even with compound sequences written before it.
+        QCOMPARE(back.duration(), FrameTime(130));
+
+        // As Final Cut writes them: random angle ids, an hour's timecode start, picture from one angle and sound from
+        // another, a compound clip of sound alone.
+        {
+            const std::string fcp = readData("interchange/final-cut-multicam.fcpxml");
+            Project f = makeDefaultProject();
+            ImportResult rf = importXmlTimeline(f, fcp);
+            QVERIFY2(rf.ok, rf.error.c_str());
+            const Sequence& sf = *f.findSequence(rf.sequence);
+            QCOMPARE(sf.name, std::string("Scene 4"));
+            const Clip& mv = trackAt(sf, V1)->clips.at(0);
+            QCOMPARE(mv.angle, 1);  // Cam B's picture
+            QCOMPARE(mv.sourceIn, 250.0);  // 10 s into the multicam
+            QCOMPARE(mv.duration, FrameTime(200));
+            const Clip& ma = trackAt(sf, A1)->clips.at(0);
+            QCOMPARE(ma.audioAngle, 0);  // Cam A's sound
+            QCOMPARE(ma.mediaId, mv.mediaId);
+            const Sequence* fm = f.findSequence(f.findMedia(mv.mediaId)->sequenceId);
+            QVERIFY(fm && fm->multicam);
+            QCOMPARE(angleNames(*fm), (std::vector<std::string>{"Cam A", "Cam B"}));
+            QCOMPARE(fm->videoTracks[1].clips.at(0).start, FrameTime(50));
+            // The connected compound clip of sound alone: on A2, a second into the multicam clip, its picture absent.
+            const Clip& tone = trackAt(sf, TrackRef{TrackKind::Audio, 1})->clips.at(0);
+            QCOMPARE(tone.start, FrameTime(25));
+            QCOMPARE(tone.sourceIn, 25.0);
+            const MediaItem* tm = f.findMedia(tone.mediaId);
+            QVERIFY(tm && tm->kind == MediaKind::Sequence && !tm->hasVideo && tm->hasAudio);
+            QCOMPARE(trackAt(sf, V1)->clips.size(), size_t(1));
+            QCOMPARE(rf.offline.size(), size_t(3));
+        }
+
+        // The other formats have no multicam clips: the angles' own clips, linked, in their place.
+        const Sequence flat = flattenedMulticam(p, s);
+        const auto& fv = trackAt(flat, V1)->clips;
+        const auto& fa = trackAt(flat, A1)->clips;
+        QCOMPARE(fv.size(), size_t(3));
+        QCOMPARE(fv[0].mediaId, camA);
+        QCOMPARE(fv[0].sourceIn, 45.0);  // multicam frame 60, 45 frames into A
+        QCOMPARE(fv[1].mediaId, camB);
+        QCOMPARE(fv[1].sourceIn, 60.0);
+        QCOMPARE(fa.at(0).mediaId, camA);  // the mix: angle A's own sound
+        QCOMPARE(fa.at(1).mediaId, camB);
+        QVERIFY(fv[0].linkGroup && fv[0].linkGroup == fa[0].linkGroup && fv[1].linkGroup == fa[1].linkGroup);
+        QCOMPARE(fv[2].mediaId, cm.id);  // a compound clip stays
+        const std::string otio = exportOtio(p, s), fcp7 = exportFcp7Xml(p, s), edl = exportEdl(p, s);
+        for (const std::string& out : {otio, fcp7, edl}) {
+            QVERIFY(out.find("CamB.mov") != std::string::npos);
+            QVERIFY(out.find("Interview") == std::string::npos);
+        }
+        // OTIO nests the compound clip as Stacks (its picture in V1's, its sound in A1's), FCP 7 XML as a sequence
+        // inside the clip item: both read back as one compound clip with its own sequence.
+        for (int flavour = 0; flavour < 2; ++flavour) {
+            Project q2 = makeDefaultProject();
+            ImportResult r2 = flavour == 0 ? importOtio(q2, otio) : importXmlTimeline(q2, fcp7);
+            QVERIFY2(r2.ok, r2.error.c_str());
+            QVERIFY(r2.warnings.empty());
+            const Sequence& b2 = *q2.findSequence(r2.sequence);
+            QCOMPARE(q2.activeSequence, b2.id);
+            const auto& v2 = trackAt(b2, V1)->clips;
+            const auto& a2 = trackAt(b2, A1)->clips;
+            QCOMPARE(v2.size(), size_t(3));
+            QCOMPARE(q2.findMedia(v2[1].mediaId)->name, std::string("CamB.mov"));
+            QCOMPARE(v2[1].sourceIn, 60.0);
+            const MediaItem* c2 = q2.findMedia(v2[2].mediaId);
+            QVERIFY(c2 && c2->kind == MediaKind::Sequence);
+            QCOMPARE(c2->name, std::string("Inner"));
+            QCOMPARE(v2[2].start, FrameTime(90));
+            QCOMPARE(v2[2].duration, FrameTime(40));
+            QCOMPARE(v2[2].sourceIn, 10.0);
+            QCOMPARE(a2.at(2).mediaId, v2[2].mediaId);  // one sequence for its picture and its sound
+            QVERIFY(v2[2].linkGroup && v2[2].linkGroup == a2[2].linkGroup);
+            const Sequence* n2 = q2.findSequence(c2->sequenceId);
+            QVERIFY(n2);
+            QCOMPARE(n2->name, std::string("Inner"));
+            QCOMPARE(n2->videoTracks.at(0).clips.at(0).sourceIn, 30.0);
+            QCOMPARE(n2->videoTracks[0].clips[0].duration, FrameTime(60));
+            QCOMPARE(n2->audioTracks.at(0).clips.size(), size_t(1));
+            QCOMPARE(n2->videoTracks.at(1).clips.at(0).generator.s("text"), std::string("Inside"));
+            int seqs = 0;
+            for (const Sequence& sq : q2.sequences) seqs += sq.name == "Inner";
+            QCOMPARE(seqs, 1);
+        }
     }
 
     void syncOffsetsAndRepair() {

@@ -6,6 +6,8 @@
 #include <mutex>
 #include <vector>
 
+#include "Stereo.h"
+#include "core/Ambisonics.h"
 #include "core/Model.h"
 #include "media/Image.h"
 
@@ -21,6 +23,9 @@ struct RenderOptions {
     bool captions = false;     // draw the visible caption track over the program
     std::string displaySpace;  // program frames converted to this space (ColorSpace.h id) for viewing; "" = as is
     int soloVideoTrack = -1;   // render only this video track (a multicam angle); not passed to nested sequences
+    int eye = 0;               // stereoscopic 3D: the eye rendered (0 left, 1 right)
+    // How renderProgramFrame shows a stereoscopic sequence's two eyes (render/Stereo.h); flat sequences ignore it.
+    StereoView stereoView = StereoView::Left;
 };
 
 // Composites all video tracks of `seq` at timeline frame `t`.
@@ -105,6 +110,9 @@ public:
         nonBlocking_ = on;
         if (keyMixer_) keyMixer_->setNonBlocking(on);
     }
+    // How mix() lets an ambisonic sequence be heard: binaurally for headphones, or through two virtual cardioids for
+    // speakers (the default, as downmixToStereo folds it: exports, stems; playback sets the monitoring choice).
+    void setAmbisonicBinaural(bool on) { ambisonicBinaural_ = on; }
 
     struct State;  // per clip/effect DSP state
     static bool ensurePlugin(State& st, const Effect& e, double sr);
@@ -112,14 +120,18 @@ public:
 private:
     // `rate` overrides the sequence's sample rate (nested sequences mix at the outer rate);
     // `onlyTrack` mixes that audio track alone (a multicam clip's audio angle).
-    // `channels` is 2, or the sequence layout's count for a surround mix (depth 0 only).
+    // `channels` is 2, or the sequence layout's count for a surround mix (depth 0 only; an ambisonic sequence nested in
+    // an ambisonic mix is mixed as its four-channel field).
     void mixInto(const Project& p, const Sequence& seq, int64_t start, int frames, float* out,
                  std::vector<MeterLevels>* trackLevels, int depth, int rate = 0, int onlyTrack = -1, int channels = 2);
     // Runs an effect chain over an interleaved stereo block; DSP state is kept per (owner, effect).
     void processChain(const std::vector<Effect>& chain, Id owner, FrameTime lt, double sr, float* buf, int frames);
-    // Sums a track's clips over [start, start + frames) into trackBuf; false if none plays.
+    // Sums a track's clips over [start, start + frames) into trackBuf; false if none plays. With `trackField` (an
+    // ambisonic mix), ambisonic clips (and nested ambisonic sequences) add their turned field there (four channels)
+    // over [fieldStart, fieldStart + frames) instead of being heard as stereo: the field passes no stereo inserts, so it
+    // is read where the mix after them is (the master's latency ahead) rather than as far ahead as the track's sound.
     bool mixTrackClips(const Project& p, const Sequence& seq, const Track& track, int64_t start, int frames, double sr,
-                       int depth, float* trackBuf);
+                       int depth, float* trackBuf, float* trackField = nullptr, int64_t fieldStart = 0);
     // Latency (samples) of a chain's plugins, loading them if needed; and the largest in a sequence.
     int chainLatency(const std::vector<Effect>& chain, Id owner, double sr);
     int maxLatency(const Sequence& seq, double sr);
@@ -128,7 +140,9 @@ private:
     // processed, before its fader and whether or not it is muted, from a mixer of its own (so the state of its clips'
     // effects never runs twice); computed once per track and block (fed ahead by its own inserts' latency), so a
     // consumer fed ahead by plugin latency downstream hears it that much early. Null when there is no such track.
-    const float* keySignal(Id track, int frames);
+    // `at` is the timeline sample the consumer's input is at (the chain's input, less the latency of the plugins before
+    // it in the chain), so a key lines up with what it is keying.
+    const float* keySignal(Id track, int frames, int64_t at);
     struct KeyContext {
         const Project* p = nullptr;
         const Sequence* seq = nullptr;
@@ -142,13 +156,16 @@ private:
         int64_t block = -1;
         std::vector<float> samples;
     };
-    std::map<Id, KeyBuffer> keyBufs_;
+    std::map<std::pair<Id, int64_t>, KeyBuffer> keyBufs_;  // by track and where it is heard from, this block
     int64_t keyBlock_ = 0;  // counts the top-level blocks mixed
     int64_t nextStart_ = -1;  // where the next contiguous block starts
     std::map<std::pair<Id, Id>, std::unique_ptr<State>> states_;
     std::mutex m_;
     bool nonBlocking_ = false;
     std::vector<bool> mask_, lfeOnly_;
+    bool ambisonicBinaural_ = false;
+    std::map<Id, std::unique_ptr<FoaBinaural>> binaural_;  // per ambisonic clip heard binaurally
+    std::unique_ptr<FoaBinaural> monitor_;                  // an ambisonic sequence heard binaurally
 };
 
 }  // namespace montage

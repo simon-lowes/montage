@@ -712,7 +712,7 @@ void TimelineWidget::paintClip(QPainter& p, const Row& row, const Clip& c, const
                                               float(std::clamp(c.generator.p("color.g", 0), 0.0, 1.0)),
                                               float(std::clamp(c.generator.p("color.b", 0), 0.0, 1.0)));
                 p.fillRect(body.adjusted(2, 0, -2, -2), col);
-            } else if (c.generator.type == "title" && body.height() > 10) {
+            } else if (c.generator.type.rfind("title", 0) == 0 && body.height() > 10) {
                 p.setPen(QColor(255, 255, 255, 200));
                 QFont f = p.font();
                 f.setPointSize(8);

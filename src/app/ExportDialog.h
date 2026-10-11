@@ -84,9 +84,11 @@ private:
     QComboBox* streams_ = nullptr;      // more audio streams after the mix: none, per role, per track
     QCheckBox* allCaptions_ = nullptr;  // every caption track as its own subtitle stream
     QCheckBox* cea608_ = nullptr;       // the caption track as CEA-608 inside H.264/HEVC
+    QCheckBox* hdr10Plus_ = nullptr;    // HDR10+ dynamic metadata (PQ)
     QCheckBox* smart_ = nullptr;
     QLineEdit* startTc_ = nullptr;   // the file's starting timecode (MXF, MOV)
     QComboBox* color_ = nullptr;
+    QComboBox* stereo_ = nullptr;  // a stereoscopic sequence: how its eyes are delivered
     QComboBox* loudness_ = nullptr;
     QCheckBox* described_ = nullptr;  // an audio description stream after the mix
     QComboBox* audioOut_ = nullptr;  // a surround sequence: all its channels, or folded to stereo

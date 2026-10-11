@@ -16,6 +16,7 @@
 #include <functional>
 #include <array>
 #include <QImage>
+#include <QVector3D>
 #include <QDir>
 #include <QFileInfo>
 #include <QFile>
@@ -55,6 +56,7 @@
 #include "media/Loudness.h"
 #include "media/Offload.h"
 #include "core/AafImport.h"
+#include "core/ProjectLock.h"
 #include "media/MediaPool.h"
 #include "media/Relink.h"
 #include "media/SpeakerSwitch.h"
@@ -62,6 +64,7 @@
 #include "media/Vector.h"
 #include "media/Beats.h"
 #include "render/Spherical.h"
+#include "media/SpatialAudio.h"
 #include "render/ExtendClip.h"
 #include "render/ReviewExport.h"
 #include "render/Versions.h"
@@ -99,6 +102,7 @@
 #include "media/SuperScale.h"
 #include "media/Reframe.h"
 #include "media/Diarizer.h"
+#include "render/Hdr10Plus.h"
 #include "media/Faces.h"
 #include "media/FaceTracks.h"
 #include "media/DepthMap.h"
@@ -108,6 +112,7 @@
 #include "media/Inpaint.h"
 #include "media/VisualSearch.h"
 #include "automation/McpServer.h"
+#include "core/Cdl.h"
 #ifdef MONTAGE_WITH_WHISPER
 #include "media/Transcriber.h"
 #endif
@@ -122,6 +127,7 @@
 #include "core/OnScreenText.h"
 #include "render/Processing.h"
 #include "media/CameraRaw.h"
+#include "media/ProResRaw.h"
 #include "core/Slate.h"
 #include "render/PaperEdit.h"
 #include "render/QualityCheck.h"
@@ -133,6 +139,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libswresample/swresample.h>
 #include <libavutil/mastering_display_metadata.h>
+#include <libavutil/hdr_dynamic_metadata.h>
 #include <libavutil/pixdesc.h>
 }
 
@@ -551,6 +558,134 @@ class TestMedia : public QObject {
     std::string path(const char* name) { return (dir_.path() + "/" + name).toStdString(); }
 
 private slots:
+    void ascCdlAndAleOverMcp() {
+        // A project with two (offline) camera files, one cut in twice.
+        Project q = makeDefaultProject();
+        auto add = [&](const char* name, double tc) {
+            MediaItem m;
+            m.id = q.newId();
+            m.kind = MediaKind::Video;
+            m.name = name;
+            m.path = std::string("/cards/") + name;
+            m.duration = 10;
+            m.width = 1920;
+            m.height = 1080;
+            m.fps = {25, 1};
+            m.hasVideo = true;
+            m.timecode = tc;
+            q.media.push_back(m);
+            return m.id;
+        };
+        const Id a = add("A001C001.mov", 36000), b = add("A001C002.mov", 36010);
+        QVERIFY(edit::placeMedia(q, *q.active(), a, 0, 0, 50, {TrackKind::Video, 0}, {}, false).ok);
+        QVERIFY(edit::placeMedia(q, *q.active(), a, 50, 100, 150, {TrackKind::Video, 0}, {}, false).ok);
+        QVERIFY(edit::placeMedia(q, *q.active(), b, 150, 0, 50, {TrackKind::Video, 0}, {}, false).ok);
+        const QString project = QString::fromStdString(path("cdl.montage"));
+        QVERIFY(saveProject(q, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) { return r.value("content").toArray().at(0).toObject().value("text").toString(); };
+        // An ALE from the lab: scene, take and a CDL for A; B by name without its extension; one row for nothing.
+        const QString ale = "Heading\nFIELD_DELIM\tTABS\nFPS\t25\n\nColumn\nName\tSource File\tScene\tTake\tASC_SOP\tASC_SAT\n\nData\n"
+                            "A001C001\tA001C001.mov\t4\t2\t(1.2 1.0 0.8)(0 0 0)(1 1 1)\t0.5\n"
+                            "A001C002\t\t4\t3\t\t\n"
+                            "Z009C001\tZ009C001.mov\t9\t1\t\t\n";
+        QJsonObject r = call("montage_ale", {{"project", project}, {"action", "import"}, {"text", ale}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY2(text(r).contains("2 of 3 row(s) matched") && text(r).contains("1 CDL") && text(r).contains("2 clip(s) graded"), qPrintable(text(r)));
+        QCOMPARE(r.value("structuredContent").toObject().value("unmatched").toArray().at(0).toString(), QString("Z009C001"));
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.findMedia(b)->metadata.at("take"), std::string("3"));
+        const double clip0 = double(back.active()->videoTracks[0].clips.at(0).id), clipB = double(back.active()->videoTracks[0].clips.at(2).id);
+        r = call("montage_cdl", {{"project", project}, {"action", "get"}, {"clip", clip0}});
+        QVERIFY2(text(r).contains("(1.200000 1.000000 0.800000)"), qPrintable(text(r)));
+        QCOMPARE(r.value("structuredContent").toObject().value("saturation").toDouble(), 0.5);
+        QVERIFY(text(call("montage_cdl", {{"project", project}, {"action", "get"}, {"clip", clipB}})).contains("no CDL"));
+        // Set by hand, in a camera log, then out as a collection and back by id.
+        r = call("montage_cdl", {{"project", project}, {"action", "set"}, {"clip", clipB}, {"slope", 1.1}, {"offset", QJsonArray{0.01, 0, -0.01}},
+                                 {"saturation", 1.2}, {"space", "ACEScct"}, {"id", "A001C002"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QCOMPARE(r.value("structuredContent").toObject().value("space").toString(), QString("ACEScct"));
+        QVERIFY(call("montage_cdl", {{"project", project}, {"action", "set"}, {"clip", clipB}, {"space", "Mars Log"}}).value("isError").toBool());
+        QVERIFY(call("montage_cdl", {{"project", project}, {"action", "set"}, {"clip", clipB}, {"power", QJsonArray{1, 0}}}).value("isError").toBool());
+        QVERIFY(call("montage_cdl", {{"project", project}, {"action", "set"}, {"clip", clipB}, {"saturation", -1}}).value("isError").toBool());
+        r = call("montage_cdl", {{"project", project}, {"action", "export"}, {"format", "ccc"}});
+        QVERIFY2(text(r).contains("<ColorCorrectionCollection") && text(r).count("<ColorCorrection ") == 3, qPrintable(text(r)));
+        QVERIFY(call("montage_cdl", {{"project", project}, {"action", "export"}, {"format", "cc"}}).value("isError").toBool());
+        const QString cdlFile = QString::fromStdString(path("look.cc"));
+        r = call("montage_cdl", {{"project", project}, {"action", "export"}, {"clip", clipB}, {"path", cdlFile}});
+        QVERIFY2(!r.value("isError").toBool() && QFileInfo::exists(cdlFile), qPrintable(text(r)));
+        // Onto every clip whose file matches: the .cc's id is A001C002, so only B's clip.
+        r = call("montage_cdl", {{"project", project}, {"action", "import"}, {"path", cdlFile}});
+        QVERIFY2(text(r).contains("1 clip(s) graded"), qPrintable(text(r)));
+        r = call("montage_cdl", {{"project", project}, {"action", "import"}, {"path", cdlFile}, {"clip", clip0}});
+        QVERIFY2(text(r).contains("1 clip(s) graded"), qPrintable(text(r)));
+        r = call("montage_cdl", {{"project", project}, {"action", "get"}, {"clip", clip0}});
+        QVERIFY2(text(r).contains("(1.100000 1.100000 1.100000)(0.010000 0.000000 -0.010000)"), qPrintable(text(r)));
+        QVERIFY(call("montage_cdl", {{"project", project}, {"action", "import"}, {"text", "<x/>"}}).value("isError").toBool());
+        {
+            Project withSound;
+            QVERIFY(loadProject(project.toStdString(), withSound));
+            MediaItem wav = *withSound.findMedia(a);
+            wav.id = withSound.newId();
+            wav.kind = MediaKind::Audio;
+            wav.hasVideo = false;
+            wav.hasAudio = true;
+            withSound.media.push_back(wav);
+            QVERIFY(edit::placeMedia(withSound, *withSound.active(), wav.id, 0, 0, 25, {}, {TrackKind::Audio, 0}, false).ok);
+            QVERIFY(saveProject(withSound, project.toStdString()));
+            const double sound = double(withSound.active()->audioTracks[0].clips.at(0).id);
+            QVERIFY(call("montage_cdl", {{"project", project}, {"action", "import"}, {"path", cdlFile}, {"clip", sound}}).value("isError").toBool());
+        }
+        // An ALE of the media, with the CDLs.
+        r = call("montage_ale", {{"project", project}, {"action", "export"}});
+        QVERIFY2(text(r).contains("ASC_SOP") && text(r).contains("A001C002.mov\t4\t\t3") && text(r).contains("10:00:00:00\t10:00:10:00"), qPrintable(text(r)));
+        QVERIFY(call("montage_ale", {{"project", project}, {"action", "export"}, {"media", QJsonArray{"Nope"}}}).value("isError").toBool());
+        QVERIFY(call("montage_ale", {{"project", project}, {"action", "import"}, {"text", "nothing"}}).value("isError").toBool());
+        QVERIFY(call("montage_ale", {{"project", project}, {"action", "rename"}}).value("isError").toBool());
+    }
+
+    void cdlInTheMediasOwnLog() {
+        // LogC3 footage (a flat grey still read as LogC3) in a Rec.709 sequence: a CDL made in LogC3 grades the log
+        // values before the display rendering, as on set; the same CDL in the working space grades after it.
+        QImage grey(64, 48, QImage::Format_RGB32);
+        grey.fill(qRgb(102, 102, 102));
+        QVERIFY(grey.save(QString::fromStdString(path("logc-grey.png"))));
+        Project p = makeDefaultProject();
+        MediaItem m = probeOrFail(p, path("logc-grey.png"));
+        m.colorOverride = "logc3-awg3";
+        p.media.push_back(m);
+        Sequence& s = *p.active();
+        s.width = 64;
+        s.height = 48;
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 25, {TrackKind::Video, 0}, {}, false).ok);
+        Cdl lift;
+        lift.offset[0] = lift.offset[1] = lift.offset[2] = 0.05;
+        setClipCdl(p, s.videoTracks[0].clips[0], lift);
+        const ColorSpace& logc = *findColorSpace("logc3-awg3");
+        s.videoTracks[0].clips[0].effects[0].strings["space"] = logc.label;
+        RenderOptions ro;
+        Image img = renderProgramFrame(p, s, 2, ro);
+        float want[3] = {102 / 255.0f, 102 / 255.0f, 102 / 255.0f};
+        applyCdl(lift, want[0], want[1], want[2]);
+        convertPixel(want, logc, rec709Space(), 1000);
+        QVERIFY2(std::fabs(img.at(32, 24)[1] - want[1]) < 0.01f, qPrintable(QString("%1 vs %2").arg(img.at(32, 24)[1]).arg(want[1])));
+        s.videoTracks[0].clips[0].effects[0].strings["space"] = "Working space";
+        const float after = renderProgramFrame(p, s, 2, ro).at(32, 24)[1];
+        float plain[3] = {102 / 255.0f, 102 / 255.0f, 102 / 255.0f};
+        convertPixel(plain, logc, rec709Space(), 1000);
+        QVERIFY2(std::fabs(after - (plain[1] + 0.05f)) < 0.01f, qPrintable(QString("%1 vs %2").arg(after).arg(plain[1] + 0.05f)));
+        QVERIFY(std::fabs(after - want[1]) > 0.01f);
+    }
+
     void probeAndDecodeWav() {
         std::string wav = path("tone.wav");
         writeWav(wav, 48000, 1.0, 0.5f, -0.25f);
@@ -1845,6 +1980,274 @@ private slots:
         QCOMPARE(interpretationOf(back.media.at(0)).par, 1.5);  // left as it was
         r = call({{"project", project}, {"media", "hfr.mov"}, {"alpha", "sideways"}});
         QVERIFY(r.value("isError").toBool());
+    }
+
+    void proResRawDevelop() {
+        // A test camera that sees linear Rec. 709 (so its matrix is Rec. 709's to XYZ), its sensor from 256 to 61568.
+        ProResRawColor color;
+        primariesToXyz(Primaries::Bt709, color.camToXyz);
+        const double black = color.black * 65535, white = color.white * 65535;
+        auto code = [&](double v) { return uint16_t(std::lround(black + v * (white - black))); };
+        const int w = 16, h = 12;
+        // Each site's sensor value from the scene's red, green and blue there (RGGB), divided by the white balance.
+        auto mosaic = [&](std::array<double, 3> rgb, double wbRed = 1, double wbBlue = 1) {
+            std::vector<uint16_t> m(size_t(w) * size_t(h));
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x) {
+                    const int c = (y & 1) ? ((x & 1) ? 2 : 1) : ((x & 1) ? 1 : 0);
+                    const double v = c == 0 ? rgb[0] / wbRed : c == 2 ? rgb[2] / wbBlue : rgb[1];
+                    m[size_t(y) * size_t(w) + size_t(x)] = v >= 1 ? 65535 : code(v);
+                }
+            return m;
+        };
+        const int noCrop[4] = {0, 0, 0, 0};
+        auto develop = [&](const std::vector<uint16_t>& m, const ProResRawColor& c, const RawSettings& st, const int crop[4] = nullptr) {
+            DevelopedRaw out;
+            developProResRaw(m.data(), w, h, w, c, st, crop ? crop : noCrop, out);
+            return out;
+        };
+        // A pixel back to linear AP1.
+        auto at = [&](const DevelopedRaw& d, int x, int y) {
+            std::array<double, 3> v{};
+            for (int i = 0; i < 3; ++i) v[size_t(i)] = toLinear(Transfer::AcesCct, d.rgb[(size_t(y) * size_t(d.width) + size_t(x)) * 3 + size_t(i)] / 65535.0);
+            return v;
+        };
+        auto show = [](std::array<double, 3> c) { return QString("%1 %2 %3").arg(c[0]).arg(c[1]).arg(c[2]); };
+        auto near = [](std::array<double, 3> a, std::array<double, 3> b, double tol) {
+            for (int i = 0; i < 3; ++i)
+                if (std::fabs(a[size_t(i)] - b[size_t(i)]) > tol * std::max(1.0, std::fabs(b[size_t(i)]))) return false;
+            return true;
+        };
+        // Grey is grey in ACES (Rec. 709's D65 white adapted to ACES's), at full size and at half.
+        const auto grey = mosaic({0.18, 0.18, 0.18});
+        DevelopedRaw full = develop(grey, color, {});
+        QCOMPARE(full.width, w);
+        QCOMPARE(full.height, h);
+        QVERIFY2(near(at(full, 7, 5), {0.18, 0.18, 0.18}, 0.004), qPrintable(show(at(full, 7, 5))));
+        RawSettings half;
+        half.half = true;
+        DevelopedRaw small = develop(grey, color, half);
+        QCOMPARE(small.width, w / 2);
+        QVERIFY2(near(at(small, 3, 2), {0.18, 0.18, 0.18}, 0.004), qPrintable(show(at(small, 3, 2))));
+        // A colour comes through as AP1 sees it.
+        double toXyz709[9], toXyzAp1[9], fromXyzAp1[9];
+        primariesToXyz(Primaries::Bt709, toXyz709);
+        primariesToXyz(Primaries::Ap1, toXyzAp1);
+        {
+            const double* a = toXyzAp1;
+            const double det = a[0] * (a[4] * a[8] - a[5] * a[7]) - a[1] * (a[3] * a[8] - a[5] * a[6]) + a[2] * (a[3] * a[7] - a[4] * a[6]);
+            const double inv[9] = {a[4] * a[8] - a[5] * a[7], a[2] * a[7] - a[1] * a[8], a[1] * a[5] - a[2] * a[4],
+                                   a[5] * a[6] - a[3] * a[8], a[0] * a[8] - a[2] * a[6], a[2] * a[3] - a[0] * a[5],
+                                   a[3] * a[7] - a[4] * a[6], a[1] * a[6] - a[0] * a[7], a[0] * a[4] - a[1] * a[3]};
+            for (int i = 0; i < 9; ++i) fromXyzAp1[i] = inv[i] / det;
+        }
+        const std::array<double, 3> orange{0.4, 0.2, 0.05};
+        std::array<double, 3> xyz{}, ap1{};
+        for (int r = 0; r < 3; ++r) xyz[size_t(r)] = toXyz709[r * 3] * orange[0] + toXyz709[r * 3 + 1] * orange[1] + toXyz709[r * 3 + 2] * orange[2];
+        for (int r = 0; r < 3; ++r) ap1[size_t(r)] = fromXyzAp1[r * 3] * xyz[0] + fromXyzAp1[r * 3 + 1] * xyz[1] + fromXyzAp1[r * 3 + 2] * xyz[2];
+        QVERIFY2(near(at(develop(mosaic(orange), color, {}), 8, 6), ap1, 0.006), qPrintable(show(at(develop(mosaic(orange), color, {}), 8, 6)) + " / " + show(ap1)));
+        // The white balance as shot: a sensor that saw red and blue weaker is balanced back to grey.
+        ProResRawColor balanced = color;
+        balanced.wbRed = 2, balanced.wbBlue = 1.5;
+        QVERIFY2(near(at(develop(mosaic({0.18, 0.18, 0.18}, 2, 1.5), balanced, {}), 7, 5), {0.18, 0.18, 0.18}, 0.004),
+                 qPrintable(show(at(develop(mosaic({0.18, 0.18, 0.18}, 2, 1.5), balanced, {}), 7, 5))));
+        // Clipped sites go white, not magenta: red past the sensor's white after its balance is held at the white.
+        const auto blown = develop(mosaic({1.0, 1.0, 1.0}, 0.5, 0.5), balanced, {});
+        const auto b = at(blown, 7, 5);
+        QVERIFY2(std::fabs(b[0] - b[1]) < 0.01 * b[1] && std::fabs(b[2] - b[1]) < 0.01 * b[1], qPrintable(show(b)));
+        // Exposure in stops and the camera's gain multiply the light.
+        RawSettings up;
+        up.exposure = 1;
+        QVERIFY2(near(at(develop(grey, color, up), 7, 5), {0.36, 0.36, 0.36}, 0.004), qPrintable(show(at(develop(grey, color, up), 7, 5))));
+        ProResRawColor gained = color;
+        gained.gain = 4;
+        QVERIFY2(near(at(develop(grey, gained, {}), 7, 5), {0.72, 0.72, 0.72}, 0.004), qPrintable(show(at(develop(grey, gained, {}), 7, 5))));
+        // Highlights far above white keep their stops (ACEScct's headroom), and below black is black.
+        gained.gain = 200;
+        QVERIFY2(near(at(develop(grey, gained, {}), 7, 5), {36, 36, 36}, 0.01), qPrintable(show(at(develop(grey, gained, {}), 7, 5))));
+        QVERIFY(at(develop(mosaic({0, 0, 0}), color, {}), 7, 5)[1] < 1e-4);
+        // White balance by the light's temperature: shot at 5600 K and corrected for tungsten goes blue; for shade, warm.
+        ProResRawColor daylight = color;
+        daylight.cct = 5600;
+        RawSettings tungsten, shade, asShot;
+        tungsten.temperature = 3200;
+        shade.temperature = 9000;
+        asShot.temperature = 5600;
+        const auto t = at(develop(grey, daylight, tungsten), 7, 5), sh = at(develop(grey, daylight, shade), 7, 5);
+        const auto same = at(develop(grey, daylight, asShot), 7, 5);
+        QVERIFY2(t[2] > t[0] * 1.3, qPrintable(show(t)));
+        QVERIFY2(sh[0] > sh[2] * 1.05, qPrintable(show(sh)));
+        QVERIFY2(near(same, {0.18, 0.18, 0.18}, 0.004), qPrintable(show(same)));
+        // Tint: plus is magenta (less green).
+        RawSettings magenta;
+        magenta.tint = 60;
+        const auto mg = at(develop(grey, color, magenta), 7, 5);
+        QVERIFY2(mg[1] < mg[0] * 0.9 && mg[1] < mg[2] * 0.9, qPrintable(show(mg)));
+        // The recommended crop is cut exactly at full size, on whole 2x2 cells at half.
+        const int crop[4] = {2, 2, 3, 1};
+        int cw = 0, ch = 0;
+        proResRawSize(w, h, crop, false, cw, ch);
+        QCOMPARE(cw, 11);
+        QCOMPARE(ch, 9);
+        proResRawSize(w, h, crop, true, cw, ch);
+        QCOMPARE(cw, 5);
+        QCOMPARE(ch, 4);
+        {
+            const DevelopedRaw odd = develop(grey, color, {}, crop);
+            QCOMPARE(odd.width, 11);
+            QVERIFY2(near(at(odd, 0, 0), {0.18, 0.18, 0.18}, 0.004) && near(at(odd, 10, 8), {0.18, 0.18, 0.18}, 0.004),
+                     qPrintable(show(at(odd, 0, 0)) + " / " + show(at(odd, 10, 8))));
+        }
+        // The frame's edges keep their colour (neighbours past the crop are real sites; past the mosaic, mirrored ones).
+        {
+            const DevelopedRaw o = develop(mosaic(orange), color, {});
+            const auto mid = at(o, 8, 6);
+            for (auto [x, y] : {std::pair{0, 0}, std::pair{15, 0}, std::pair{0, 11}, std::pair{15, 11}, std::pair{1, 0}, std::pair{0, 1}})
+                QVERIFY2(near(at(o, x, y), mid, 0.006), qPrintable(QString("(%1, %2) ").arg(x).arg(y) + show(at(o, x, y)) + " / " + show(mid)));
+            const int margin[4] = {2, 2, 2, 2};
+            const DevelopedRaw c = develop(mosaic(orange), color, {}, margin);
+            QVERIFY2(near(at(c, 0, 0), mid, 0.006), qPrintable(show(at(c, 0, 0))));
+        }
+        // Blown highlights stay white whatever white balance or tint is chosen (the balance is on the mosaic, before
+        // the clip).
+        for (RawSettings chosen : {tungsten, shade, magenta}) {
+            const auto bw = at(develop(mosaic({1.0, 1.0, 1.0}, 0.5, 0.5), [&] { auto c = daylight; c.wbRed = 2, c.wbBlue = 1.5; return c; }(), chosen), 7, 5);
+            QVERIFY2(std::fabs(bw[0] - bw[1]) < 0.01 * bw[1] && std::fabs(bw[2] - bw[1]) < 0.01 * bw[1], qPrintable(show(bw)));
+        }
+        // A frame's own header gives its size, crop and colour without decoding it.
+        {
+            std::vector<uint8_t> pkt(10 + 70, 0);
+            auto put16 = [&](size_t o, uint32_t v) { pkt[o] = uint8_t(v >> 8), pkt[o + 1] = uint8_t(v); };
+            auto put32 = [&](size_t o, uint32_t v) { pkt[o] = uint8_t(v >> 24), pkt[o + 1] = uint8_t(v >> 16), pkt[o + 2] = uint8_t(v >> 8), pkt[o + 3] = uint8_t(v); };
+            auto putF = [&](size_t o, float f) {
+                uint32_t b;
+                std::memcpy(&b, &f, 4);
+                put32(o, b);
+            };
+            put32(0, uint32_t(pkt.size()));
+            std::memcpy(pkt.data() + 4, "prrf", 4);
+            put16(8, 72);  // the header's length, with these two bytes
+            const size_t hd = 10;
+            put16(hd + 6, 4112), put16(hd + 8, 2176);
+            pkt[hd + 10] = 8, pkt[hd + 11] = 6, pkt[hd + 12] = 4, pkt[hd + 13] = 2;  // left, right, top, bottom
+            put16(hd + 16, 61312);
+            putF(hd + 18, 1.82421875f), putF(hd + 22, 2.08203125f);
+            const float mx[9] = {0.494f, 0.354f, 0.101f, 0.075f, 0.968f, -0.043f, -0.133f, -0.345f, 1.567f};
+            for (int i = 0; i < 9; ++i) putF(hd + 26 + size_t(i) * 4, mx[i]);
+            putF(hd + 62, 11.7412f);
+            put16(hd + 66, 5600);
+            ProResRawInfo hi;
+            QVERIFY(parseProResRawFrame(pkt.data(), pkt.size(), hi));
+            QCOMPARE(hi.width, 4112 - 8 - 6);
+            QCOMPARE(hi.height, 2176 - 4 - 2);
+            QVERIFY(hi.crop[0] == 8 && hi.crop[1] == 4 && hi.crop[2] == 6 && hi.crop[3] == 2);
+            QVERIFY(std::fabs(hi.color.white - 61568.0 / 65535) < 1e-9 && std::fabs(hi.color.black - 256.0 / 65535) < 1e-9);
+            QVERIFY(std::fabs(hi.color.wbRed - 1.82421875) < 1e-6 && std::fabs(hi.color.wbBlue - 2.08203125) < 1e-6);
+            QVERIFY(std::fabs(hi.color.gain - 11.7412) < 1e-4 && std::fabs(hi.color.camToXyz[8] - 1.567) < 1e-5);
+            QCOMPARE(hi.color.cct, 5600u);
+            pkt[5] = 'X';
+            QVERIFY(!parseProResRawFrame(pkt.data(), pkt.size(), hi));
+            QVERIFY(!parseProResRawFrame(pkt.data(), 20, hi));
+        }
+        // (a mosaic whose left two columns and top two rows are a different grey, cut away)
+        auto edged = grey;
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x)
+                if (x < 2 || y < 2) edged[size_t(y) * size_t(w) + size_t(x)] = code(0.9);
+        const DevelopedRaw cropped = develop(edged, color, half, crop);
+        QCOMPARE(cropped.width, 5);
+        QVERIFY2(near(at(cropped, 0, 0), {0.18, 0.18, 0.18}, 0.004), qPrintable(show(at(cropped, 0, 0))));
+        // ProRes RAW media get the RAW controls (when this FFmpeg can develop them).
+        MediaItem m;
+        m.path = "clip.mov";
+        m.videoCodec = "prores_raw";
+        QCOMPARE(isRawMedia(m), proResRawAvailable());
+        // A project saved by a build that developed ProRes RAW, opened by one that cannot: its media is probed again and
+        // no longer read as ACEScct.
+        if (!proResRawAvailable()) {
+            const std::string still = path("prores-raw-stand-in.png");
+            QImage(32, 16, QImage::Format_RGB32).save(QString::fromStdString(still));
+            Project saved = makeDefaultProject();
+            MediaItem item;
+            item.id = saved.newId();
+            item.kind = MediaKind::Video;
+            item.path = still;
+            item.videoCodec = "prores_raw";
+            item.colorSpace = "acescct";
+            item.width = 4096, item.height = 2160;
+            saved.media.push_back(item);
+            checkStereoMedia(saved);
+            QVERIFY(saved.media.back().colorSpace != "acescct");
+            QCOMPARE(saved.media.back().width, 32);
+        }
+    }
+
+    void proResRawDecode() {
+        // A real ProRes RAW file (the CI's macOS job fetches one; FFmpeg 9 or later is needed for its colour).
+        const QString file = qEnvironmentVariable("MONTAGE_TEST_PRORES_RAW");
+        if (!proResRawAvailable()) QSKIP("Built with an FFmpeg without ProRes RAW's colour parameters (FFmpeg 9 or later)");
+        if (file.isEmpty() || !QFileInfo::exists(file)) QSKIP("Set MONTAGE_TEST_PRORES_RAW to a ProRes RAW .mov to run this test");
+        const std::string clip = file.toStdString();
+        Project p;
+        MediaItem m = probeOrFail(p, clip);
+        p.media.push_back(m);
+        QCOMPARE(m.videoCodec, std::string("prores_raw"));
+        QCOMPARE(m.colorSpace, std::string("acescct"));
+        QVERIFY(isRawMedia(m));
+        ProResRawInfo info;
+        std::string err;
+        QVERIFY2(probeProResRaw(clip, info, &err), err.c_str());
+        QCOMPARE(m.width, info.width);
+        QCOMPARE(m.height, info.height);
+        QVERIFY(info.color.gain > 0 && info.color.white > info.color.black);
+        // Decoded, developed and cropped: the picture's own size, its colours not the mosaic's green.
+        auto mean = [](const Frame16& f) {
+            std::array<double, 3> s{};
+            for (size_t i = 0; i < f.px.size(); i += 4)
+                for (int c = 0; c < 3; ++c) s[size_t(c)] += f.px[i + size_t(c)] / 65535.0;
+            const double n = double(f.px.size() / 4);
+            return std::array<double, 3>{s[0] / n, s[1] / n, s[2] / n};
+        };
+        auto show = [](std::array<double, 3> c) { return QString("%1 %2 %3").arg(c[0]).arg(c[1]).arg(c[2]); };
+        VideoDecoder dec;
+        QVERIFY2(dec.open(clip, &err), err.c_str());
+        QVERIFY(dec.hardware().empty());
+        QCOMPARE(dec.displayWidth(), info.width);
+        Frame16Ptr f = dec.frameAt(0, 0, 0, true);
+        QVERIFY(f && f->width == info.width && f->height == info.height);
+        const auto base = mean(*f);
+        QVERIFY2(base[1] > 0.2 && base[1] < 0.8, qPrintable(show(base)));
+        QVERIFY2(std::fabs(base[1] - base[0]) < 0.1 && std::fabs(base[1] - base[2]) < 0.1, qPrintable(show(base)));
+        // Shown small: developed at half size, looking the same.
+        Frame16Ptr small = dec.frameAt(0, info.width / 4, info.height / 4, false);
+        QVERIFY(small && small->width == info.width / 4);
+        const auto smallMean = mean(*small);
+        QVERIFY2(std::fabs(smallMean[1] - base[1]) < 0.02, qPrintable(show(smallMean)));
+        // Interpret Footage's RAW controls: a stop up is 1/17.52 higher in ACEScct.
+        Interpretation up;
+        up.rawExposure = 1;
+        VideoDecoder brighter;
+        QVERIFY2(brighter.open(interpretedPath(clip, up), &err), err.c_str());
+        Frame16Ptr bf = brighter.frameAt(0, info.width / 4, info.height / 4, false);
+        QVERIFY(bf);
+        const auto upMean = mean(*bf);
+        QVERIFY2(upMean[1] > smallMean[1] + 0.03, qPrintable(show(smallMean) + " / " + show(upMean)));
+        QVERIFY(edit::interpretFootage(p, m.id, up).ok);
+        // LibRaw's highlight modes do not apply: asked for, they are left out (the picture and its proxy kept).
+        Interpretation rebuild = up;
+        rebuild.rawExposure = 0.5;
+        rebuild.rawHighlights = "rebuild";
+        QVERIFY(edit::interpretFootage(p, m.id, rebuild).ok);
+        QVERIFY(interpretationOf(*p.findMedia(m.id)).rawHighlights.empty());
+        // Saved by a build that could not develop it: probed again on opening, as ACEScct at the cropped size.
+        Project saved = makeDefaultProject();
+        MediaItem old = m;
+        old.colorSpace.clear();
+        old.width = 4112, old.height = 2176;
+        saved.media.push_back(old);
+        checkStereoMedia(saved);
+        QCOMPARE(saved.media.back().colorSpace, std::string("acescct"));
+        QCOMPARE(saved.media.back().width, info.width);
     }
 
     void cameraRawSettingsAndCinemaDng() {
@@ -3380,11 +3783,15 @@ private slots:
         QCOMPARE(out.value("max_fall").toInt(), 203);
         QCOMPARE(out.value("max_cll_at").toString(), QString("00:00:00:00"));
         QVERIFY(!out.contains("warning"));
+        // A PQ sequence's HDR10+ scenes come with it: one shot, one scene.
+        QCOMPARE(out.value("hdr10plus_scenes").toArray().size(), 1);
+        QCOMPARE(out.value("hdr10plus_scenes").toArray().at(0).toObject().value("end").toString(), QString("00:00:00:10"));
         {
             Project q;
             QVERIFY(loadProject(project.toStdString(), q));
             QCOMPARE(q.active()->hdrMaxCll, 203.0);
             QCOMPARE(q.active()->hdrMaxFall, 203.0);
+            QCOMPARE(q.active()->hdr10Plus.size(), size_t(1));
         }
         // Over a part only, not saved: graphics are held to a lower mastering peak.
         Project dim = p;
@@ -3429,9 +3836,13 @@ private slots:
         QVERIFY(saveProject(p, project.toStdString()));
         // Exports report what they measured.
         if (avcodec_find_encoder_by_name("libx265")) {
-            r = call("montage_render", {{"output", QString::fromStdString(path("hdr-mcp.mp4"))}, {"preset", "H.265 / HEVC"}});
+            r = call("montage_render", {{"output", QString::fromStdString(path("hdr-mcp.mp4"))}, {"preset", "H.265 / HEVC"}, {"hdr10plus", true}});
             QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            QCOMPARE(r.value("structuredContent").toObject().value("hdr10plus").toString(), QString("video"));
             QCOMPARE(r.value("structuredContent").toObject().value("max_cll").toInt(), 203);
+            std::vector<Hdr10PlusScene> beside;
+            QVERIFY2(readHdr10PlusJson(path("hdr-mcp.hdr10plus.json"), beside, &err), err.c_str());
+            QVERIFY(beside.size() == 1 && beside[0].end == 10 && std::fabs(beside[0].maxScl[0] - 203) < 1);
         }
         // SDR sequences have none.
         Project sdr = p;
@@ -3733,6 +4144,751 @@ private slots:
         QCOMPARE(e.type, std::string("reframe_360"));
         QCOMPARE(e.p("yaw", 30), -90.0);
         QCOMPARE(e.p("projection", 0), 1.0);
+    }
+
+    void stereoscopic3d() {
+        // A side-by-side stereo file without stereo metadata: the left eye red, the right eye blue.
+        Project src = makeDefaultProject();
+        src.sequences.clear();
+        Sequence& ss = src.sequences.emplace_back(makeSequence(src, "SBS", 320, 96, Rational{25, 1}, 2, 1));
+        src.activeSequence = ss.id;
+        auto solid = [&](double r, double g, double b) {
+            Clip c = makeGeneratorClip(src, "color", 10);
+            c.generator.params["color.r"] = r;
+            c.generator.params["color.g"] = g;
+            c.generator.params["color.b"] = b;
+            return c;
+        };
+        QVERIFY(edit::overwrite(src, ss, {TrackKind::Video, 0}, solid(0, 0, 1)).ok);
+        Clip red = solid(1, 0, 0);
+        red.motion.params["crop_right"] = 50.0;
+        QVERIFY(edit::overwrite(src, ss, {TrackKind::Video, 1}, red).ok);
+        const std::string flatFile = path("sbs-flat.mp4");
+        {
+            ExportSettings st;
+            st.path = flatFile;
+            st.preset = "ultrafast";
+            st.crf = 12;
+            std::string err;
+            QVERIFY2(exportSequence(src, ss, st, nullptr, nullptr, &err), err.c_str());
+        }
+        Project p = makeDefaultProject();
+        p.sequences.clear();
+        MediaItem m = probeOrFail(p, flatFile);
+        QVERIFY(m.stereo.empty());
+        QCOMPARE(m.width, 320);
+        p.media.push_back(m);
+        // Interpreted as side by side: each eye is half the frame.
+        Interpretation how;
+        how.stereo = "sbs";
+        QVERIFY(edit::interpretFootage(p, m.id, how).ok);
+        QCOMPARE(p.findMedia(m.id)->stereo, std::string("sbs"));
+        QCOMPARE(p.findMedia(m.id)->width, 160);
+        QCOMPARE(p.findMedia(m.id)->height, 96);
+        how.stereo = "diagonal";
+        QVERIFY(!edit::interpretFootage(p, m.id, how).ok);
+
+        Sequence& s3 = p.sequences.emplace_back(makeSequence(p, "3D", 160, 96, Rational{25, 1}, 2, 1));
+        p.activeSequence = s3.id;
+        s3.stereo3d = true;
+        QVERIFY(edit::placeMedia(p, s3, m.id, 0, 0, 10, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        auto px = [](const Image& img, int x, int y) { return QVector3D(img.at(x, y)[0], img.at(x, y)[1], img.at(x, y)[2]); };
+        auto isRed = [](QVector3D c) { return c.x() > 0.7f && c.y() < 0.2f && c.z() < 0.25f; };
+        auto isBlue = [](QVector3D c) { return c.z() > 0.7f && c.x() < 0.2f && c.y() < 0.2f; };
+        RenderOptions o;
+        o.eye = 0;
+        const Image left = renderSequenceFrame(p, s3, 5, o);
+        o.eye = 1;
+        const Image right = renderSequenceFrame(p, s3, 5, o);
+        QCOMPARE(left.width, 160);
+        QVERIFY2(isRed(px(left, 80, 48)), qPrintable(QString("%1 %2 %3").arg(px(left, 80, 48).x()).arg(px(left, 80, 48).y()).arg(px(left, 80, 48).z())));
+        QVERIFY(isBlue(px(right, 80, 48)));
+        // The program as the viewer shows it: one eye, anaglyph, packed, difference.
+        RenderOptions view;
+        view.stereoView = StereoView::Left;
+        QVERIFY(isRed(px(renderProgramFrame(p, s3, 5, view), 80, 48)));
+        view.stereoView = StereoView::Right;
+        QVERIFY(isBlue(px(renderProgramFrame(p, s3, 5, view), 80, 48)));
+        view.stereoView = StereoView::Anaglyph;
+        const QVector3D ana = px(renderProgramFrame(p, s3, 5, view), 80, 48);
+        QVERIFY2(ana.x() > 0.15f && ana.z() > 0.7f && ana.y() < 0.2f, qPrintable(QString("%1 %2 %3").arg(ana.x()).arg(ana.y()).arg(ana.z())));
+        view.stereoView = StereoView::SideBySide;
+        const Image sbs = renderProgramFrame(p, s3, 5, view);
+        QCOMPARE(sbs.width, 320);
+        QCOMPARE(sbs.height, 96);
+        QVERIFY(isRed(px(sbs, 80, 48)) && isBlue(px(sbs, 240, 48)));
+        view.stereoView = StereoView::TopBottomHalf;
+        const Image tbh = renderProgramFrame(p, s3, 5, view);
+        QVERIFY(tbh.width == 160 && tbh.height == 96);
+        QVERIFY(isRed(px(tbh, 80, 20)) && isBlue(px(tbh, 80, 76)));
+        view.stereoView = StereoView::Difference;
+        QVERIFY(px(renderProgramFrame(p, s3, 5, view), 80, 48).x() > 0.9f);
+        // A flat sequence shows the left eye.
+        Sequence& flat = p.sequences.emplace_back(makeSequence(p, "2D", 160, 96, Rational{25, 1}, 2, 1));
+        const Id flatId = flat.id;
+        QVERIFY(edit::placeMedia(p, flat, m.id, 0, 0, 10, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        view.stereoView = StereoView::Anaglyph;
+        QVERIFY(isRed(px(renderProgramFrame(p, flat, 5, view), 80, 48)));
+        const Id s3id = p.activeSequence;
+        Sequence* s3p = p.findSequence(s3id);
+        // The eyes swapped by the clip's Stereo 3D effect, then a title placed in depth.
+        Clip& clip = s3p->videoTracks[0].clips.at(0);
+        Effect s3d = makeEffect(p, "stereo_3d");
+        s3d.params["swap_eyes"] = 1.0;
+        clip.effects.push_back(s3d);
+        o.eye = 0;
+        QVERIFY(isBlue(px(renderSequenceFrame(p, *s3p, 5, o), 80, 48)));
+        clip.effects.clear();
+        Clip bar = makeGeneratorClip(p, "color", 10);
+        bar.generator.params["color.r"] = 1.0, bar.generator.params["color.g"] = 1.0, bar.generator.params["color.b"] = 1.0;
+        bar.motion.params["crop_left"] = 45.0;
+        bar.motion.params["crop_right"] = 45.0;  // x 72 to 88
+        Effect depth = makeEffect(p, "stereo_3d");
+        depth.params["depth"] = 10.0;  // 16 px apart: 8 each way, into the screen
+        bar.effects.push_back(depth);
+        QVERIFY(edit::overwrite(p, *s3p, {TrackKind::Video, 1}, bar).ok);
+        auto white = [&](const Image& img, int x) { return img.at(x, 48)[1] > 0.9f; };
+        o.eye = 0;
+        const Image l2 = renderSequenceFrame(p, *s3p, 5, o);
+        o.eye = 1;
+        const Image r2 = renderSequenceFrame(p, *s3p, 5, o);
+        QVERIFY(white(l2, 66) && !white(r2, 66));
+        QVERIFY(white(r2, 93) && !white(l2, 93));
+        QVERIFY(white(l2, 78) && white(r2, 82));
+        // Depth means nothing in a flat sequence.
+        {
+            Sequence* f = p.findSequence(flatId);
+            QVERIFY(edit::overwrite(p, *f, {TrackKind::Video, 1}, bar).ok);
+            o.eye = 0;
+            const Image fl = renderSequenceFrame(p, *f, 5, o);
+            QVERIFY(white(fl, 74) && white(fl, 86) && !white(fl, 66));
+        }
+        // A stereo export: packed side by side or top and bottom with stereo metadata, so it comes back in as stereo.
+        struct Out {
+            const char* name;
+            const char* view;
+            int w, h;
+            const char* detected;
+        };
+        for (const Out& out : {Out{"3d-sbs.mp4", "sbs", 160, 96, "sbs"}, Out{"3d-sbs.mkv", "sbs", 160, 96, "sbs"},
+                               Out{"3d-tbh.mp4", "tb_half", 160, 96, "tb_half"}, Out{"3d-tb.mp4", "tb", 160, 96, "tb"},
+                               Out{"3d-anaglyph.mp4", "anaglyph", 160, 96, ""}}) {
+            ExportSettings st;
+            st.path = path(out.name);
+            st.preset = "ultrafast";
+            st.crf = 12;
+            st.stereo = out.view;
+            std::string err;
+            QVERIFY2(exportSequence(p, *s3p, st, nullptr, nullptr, &err), err.c_str());
+            MediaItem back;
+            QVERIFY(probeMedia(st.path, back));
+            QVERIFY2(back.stereo == out.detected, qPrintable(QString("%1: %2").arg(out.name, QString::fromStdString(back.stereo))));
+            QVERIFY2(back.width == out.w && back.height == out.h, qPrintable(QString("%1: %2 x %3").arg(out.name).arg(back.width).arg(back.height)));
+        }
+        {
+            // The side-by-side export read back: each eye its own picture again (away from the title).
+            MediaItem back = probeOrFail(p, path("3d-sbs.mp4"));
+            p.media.push_back(back);
+            Sequence& again = p.sequences.emplace_back(makeSequence(p, "Again", 160, 96, Rational{25, 1}, 1, 1));
+            again.stereo3d = true;
+            QVERIFY(edit::placeMedia(p, again, back.id, 0, 0, 10, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+            o.eye = 0;
+            QVERIFY(isRed(px(renderSequenceFrame(p, again, 5, o), 30, 48)));
+            o.eye = 1;
+            QVERIFY(isBlue(px(renderSequenceFrame(p, again, 5, o), 30, 48)));
+            // Squeezed sizes: each eye stretched back to the full frame.
+            ExportSettings st;
+            st.path = path("3d-sbsh.mp4");
+            st.preset = "ultrafast";
+            st.stereo = "sbs_half";
+            std::string err;
+            QVERIFY2(exportSequence(p, *p.findSequence(s3id), st, nullptr, nullptr, &err), err.c_str());
+            MediaItem half;
+            QVERIFY(probeMedia(st.path, half));
+            QCOMPARE(half.stereo, std::string("sbs_half"));
+            QCOMPARE(half.width, 160);  // the eye shown at the whole frame's size
+            st.stereo = "difference";
+            QVERIFY(!exportSequence(p, *p.findSequence(s3id), st, nullptr, nullptr, &err));
+        }
+        // Saved and loaded: the sequence's stereo and VR180 flags, the media's packing and interpretation.
+        s3p = p.findSequence(s3id);
+        s3p->spherical = true;
+        s3p->vr180 = true;
+        QVERIFY(saveProject(p, path("stereo.montage")));
+        Project loaded;
+        QVERIFY(loadProject(path("stereo.montage"), loaded));
+        QVERIFY(loaded.findSequence(s3id)->stereo3d && loaded.findSequence(s3id)->vr180);
+        QVERIFY(!loaded.findSequence(flatId)->stereo3d);
+        QCOMPARE(loaded.findMedia(m.id)->stereo, std::string("sbs"));
+        QCOMPARE(interpretationOf(*loaded.findMedia(m.id)).stereo, std::string("sbs"));
+        // VR180 export: half-sphere spherical metadata.
+        {
+            ExportSettings st;
+            st.path = path("vr180.mp4");
+            st.preset = "ultrafast";
+            std::string err;
+            QVERIFY2(exportSequence(p, *s3p, st, nullptr, nullptr, &err), err.c_str());
+            MediaItem back;
+            QVERIFY(probeMedia(st.path, back));
+            QCOMPARE(back.stereo, std::string("sbs"));  // 360° stereo is never squeezed
+            QCOMPARE(back.projection, std::string("vr180"));
+        }
+        // VR180 footage reframed: the view covers the half in front, and looking behind shows nothing.
+        {
+            Image half(360, 180);
+            for (int y = 0; y < 180; ++y)
+                for (int x = 0; x < 360; ++x) {
+                    float* q = half.at(x, y);
+                    q[0] = (x + 0.5f) / 360, q[1] = 0, q[2] = 0, q[3] = 1;  // red: 0 at 90° left, 1 at 90° right
+                }
+            Image v = reframeEquirect(half, 45, 0, 0, 60, SphereView::Flat, 64, 36, 180);
+            QVERIFY2(std::fabs(v.at(32, 18)[0] - 0.75f) < 0.02f, qPrintable(QString::number(v.at(32, 18)[0])));
+            v = reframeEquirect(half, 180, 0, 0, 60, SphereView::Flat, 64, 36, 180);
+            QVERIFY(v.at(32, 18)[3] == 0.0f);
+            QCOMPARE(projectionSpan("vr180"), 180.0);
+            QCOMPARE(projectionSpan("equirect"), 360.0);
+        }
+
+        // Over MCP: mark a file's packing, make a sequence 3D, set a clip's depth, look at the anaglyph, render top and bottom.
+        Project mp = makeDefaultProject();
+        mp.sequences.clear();
+        Sequence& ms = mp.sequences.emplace_back(makeSequence(mp, "MCP", 160, 96, Rational{25, 1}, 1, 1));
+        mp.activeSequence = ms.id;
+        MediaItem mm = probeOrFail(mp, flatFile);
+        mp.media.push_back(mm);
+        QVERIFY(edit::placeMedia(mp, ms, mm.id, 0, 0, 10, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Id mclip = ms.videoTracks[0].clips.at(0).id;
+        const QString project = QString::fromStdString(path("stereo-mcp.montage"));
+        QVERIFY(saveProject(mp, project.toStdString()));
+        McpServer server;
+        int rid = 1;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", rid++}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call("montage_stereo", {{"project", project}, {"sequence_3d", true}, {"media", double(mm.id)}, {"layout", "sbs"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(r.value("structuredContent").toObject().value("sequence_3d").toBool());
+        QCOMPARE(r.value("structuredContent").toObject().value("stereo_clips").toInt(), 1);
+        r = call("montage_stereo", {{"project", project}, {"clip", double(mclip)}, {"depth", 4}, {"at", 2}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(call("montage_stereo", {{"project", project}, {"clip", double(mclip)}, {"depth", 40}}).value("isError").toBool());
+        QVERIFY(call("montage_stereo", {{"project", project}, {"vr180", true}}).value("isError").toBool());  // not 360°
+        r = call("montage_render_frame", {{"project", project}, {"at", 0.2}, {"width", 160}, {"stereo_view", "anaglyph"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        r = call("montage_render", {{"project", project}, {"output", QString::fromStdString(path("mcp-tb.mp4"))}, {"preset", "H.264 - Fast Draft"},
+                                    {"stereo_view", "tb"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        {
+            MediaItem back;
+            QVERIFY(probeMedia(path("mcp-tb.mp4"), back));
+            QCOMPARE(back.stereo, std::string("tb"));
+        }
+        QVERIFY(call("montage_render", {{"project", project}, {"output", QString::fromStdString(path("x.mp4"))}, {"stereo_view", "difference"}})
+                    .value("isError").toBool());
+        Project after;
+        QVERIFY(loadProject(project.toStdString(), after));
+        QVERIFY(after.active()->stereo3d);
+        QCOMPARE(after.findMedia(mm.id)->stereo, std::string("sbs"));
+        const Clip* withDepth = edit::clipById(*after.active(), mclip);
+        QVERIFY(withDepth && !withDepth->effects.empty() && withDepth->effects.back().type == "stereo_3d");
+        QCOMPARE(withDepth->effects.back().params.at("depth").keys.size(), size_t(1));
+    }
+
+    void stereoscopicEdgeCases() {
+        // A side-by-side file with stereo metadata: the left eye red, the right blue, 160 x 96 an eye.
+        auto solid = [](Project& pr, double r, double g, double b, FrameTime len) {
+            Clip c = makeGeneratorClip(pr, "color", len);
+            c.generator.params["color.r"] = r;
+            c.generator.params["color.g"] = g;
+            c.generator.params["color.b"] = b;
+            return c;
+        };
+        const std::string sbsFile = path("edge-sbs.mp4");
+        {
+            Project src = makeDefaultProject();
+            src.sequences.clear();
+            Sequence& ss = src.sequences.emplace_back(makeSequence(src, "SBS", 320, 96, Rational{25, 1}, 2, 1));
+            src.activeSequence = ss.id;
+            QVERIFY(edit::overwrite(src, ss, {TrackKind::Video, 0}, solid(src, 0, 0, 1, 10)).ok);
+            Clip red = solid(src, 1, 0, 0, 10);
+            red.motion.params["crop_right"] = 50.0;
+            QVERIFY(edit::overwrite(src, ss, {TrackKind::Video, 1}, red).ok);
+            ExportSettings st;
+            st.path = path("edge-flat.mp4");
+            st.preset = "ultrafast";
+            st.crf = 12;
+            std::string err;
+            QVERIFY2(exportSequence(src, ss, st, nullptr, nullptr, &err), err.c_str());
+            Project q = makeDefaultProject();
+            q.sequences.clear();
+            MediaItem flat = probeOrFail(q, st.path);
+            q.media.push_back(flat);
+            Interpretation how;
+            how.stereo = "sbs";
+            QVERIFY(edit::interpretFootage(q, flat.id, how).ok);
+            Sequence& s3 = q.sequences.emplace_back(makeSequence(q, "3D", 160, 96, Rational{25, 1}, 1, 1));
+            q.activeSequence = s3.id;
+            s3.stereo3d = true;
+            QVERIFY(edit::placeMedia(q, s3, flat.id, 0, 0, 10, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+            ExportSettings sb;
+            sb.path = sbsFile;
+            sb.preset = "ultrafast";
+            sb.crf = 12;
+            QVERIFY2(exportSequence(q, s3, sb, nullptr, nullptr, &err), err.c_str());
+        }
+        auto isRed = [](const Image& img, int x, int y) { return img.at(x, y)[0] > 0.7f && img.at(x, y)[2] < 0.25f; };
+        auto isBlue = [](const Image& img, int x, int y) { return img.at(x, y)[2] > 0.7f && img.at(x, y)[0] < 0.2f; };
+        // A project saved before stereo was read: the item has the whole frame's size and no packing. Opened, its
+        // stereo files are found and read as stereo.
+        {
+            Project old = makeDefaultProject();
+            MediaItem m = probeOrFail(old, sbsFile);
+            QCOMPARE(m.stereo, std::string("sbs"));
+            m.stereo.clear();
+            m.width = 320;
+            old.media.push_back(m);
+            const QString file = QString::fromStdString(path("old.montage"));
+            QVERIFY(saveProject(old, file.toStdString()));
+            QFile f(file);
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            QJsonObject root = QJsonDocument::fromJson(f.readAll()).object();
+            f.close();
+            root.remove("mediaStereo");
+            QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            f.write(QJsonDocument(root).toJson());
+            f.close();
+            Project loaded;
+            QVERIFY(loadProject(file.toStdString(), loaded));
+            QVERIFY(!loaded.stereoChecked);
+            QVERIFY(loaded.findMedia(m.id)->stereo.empty());
+            checkStereoMedia(loaded);
+            QVERIFY(loaded.stereoChecked);
+            QCOMPARE(loaded.findMedia(m.id)->stereo, std::string("sbs"));
+            QCOMPARE(loaded.findMedia(m.id)->width, 160);
+            // Saved now, it is not looked at again.
+            QVERIFY(saveProject(loaded, file.toStdString()));
+            Project again;
+            QVERIFY(loadProject(file.toStdString(), again));
+            QVERIFY(again.stereoChecked);
+        }
+        Project p = makeDefaultProject();
+        p.sequences.clear();
+        MediaItem m = probeOrFail(p, sbsFile);
+        QCOMPARE(m.stereo, std::string("sbs"));
+        p.media.push_back(m);
+        Sequence& s3 = p.sequences.emplace_back(makeSequence(p, "3D", 160, 96, Rational{25, 1}, 2, 1));
+        const Id s3id = s3.id;
+        p.activeSequence = s3id;
+        s3.stereo3d = true;
+        QVERIFY(edit::placeMedia(p, s3, m.id, 0, 0, 10, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        // With proxies on, the right eye still comes from the file (a proxy holds the left eye alone).
+        p.findMedia(m.id)->proxyPath = path("edge-flat.mp4");
+        RenderOptions o;
+        o.useProxies = true;
+        o.eye = 1;
+        QVERIFY(isBlue(renderSequenceFrame(p, *p.findSequence(s3id), 5, o), 40, 48));
+        p.findMedia(m.id)->proxyPath.clear();
+        // Burn-ins sit on each eye: a timecode at the top left is in both halves of a side-by-side export.
+        {
+            ExportSettings st;
+            st.path = path("edge-burn.mp4");
+            st.preset = "ultrafast";
+            st.crf = 12;
+            st.burnIn.text = "MONTAGE";
+            st.burnIn.size = 0.2;
+            std::string err;
+            QVERIFY2(exportSequence(p, *p.findSequence(s3id), st, nullptr, nullptr, &err), err.c_str());
+            Project b = makeDefaultProject();
+            b.sequences.clear();
+            MediaItem bm = probeOrFail(b, st.path);
+            QCOMPARE(bm.stereo, std::string("sbs"));
+            b.media.push_back(bm);
+            Sequence& bs = b.sequences.emplace_back(makeSequence(b, "B", 160, 96, Rational{25, 1}, 1, 1));
+            bs.stereo3d = true;
+            QVERIFY(edit::placeMedia(b, bs, bm.id, 0, 0, 10, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+            // The text's light pixels in the top left of each eye (the eyes are red and blue there otherwise).
+            auto lightIn = [&](int eye) {
+                RenderOptions ro;
+                ro.eye = eye;
+                const Image img = renderSequenceFrame(b, bs, 5, ro);
+                int n = 0;
+                for (int y = 0; y < 40; ++y)
+                    for (int x = 0; x < 80; ++x) n += img.at(x, y)[1] > 0.6f;
+                return n;
+            };
+            const int left = lightIn(0), right = lightIn(1);
+            QVERIFY2(left > 20 && right > 20 && std::abs(left - right) < std::max(left, right) / 2,
+                     qPrintable(QString("%1 %2").arg(left).arg(right)));
+        }
+        // A chosen eye size is kept even in each half: 327 wide an eye becomes 328.
+        {
+            ExportSettings st;
+            st.path = path("edge-odd.mp4");
+            st.preset = "ultrafast";
+            st.width = 327;
+            st.height = 96;
+            std::string err;
+            QVERIFY2(exportSequence(p, *p.findSequence(s3id), st, nullptr, nullptr, &err), err.c_str());
+            MediaItem back;
+            QVERIFY(probeMedia(st.path, back));
+            QCOMPARE(back.width, 328);
+            QCOMPARE(back.stereo, std::string("sbs"));
+        }
+        // Nesting keeps the clips in depth.
+        {
+            Sequence* s = p.findSequence(s3id);
+            const Id clip = s->videoTracks[0].clips.at(0).id;
+            QVERIFY(edit::makeCompound(p, *s, {clip}, "Nest").ok);
+            const Sequence* nested = nullptr;
+            for (const Sequence& q : p.sequences)
+                if (q.name == "Nest") nested = &q;
+            QVERIFY(nested && nested->stereo3d);
+            o = RenderOptions{};
+            o.eye = 1;
+            QVERIFY(isBlue(renderSequenceFrame(p, *p.findSequence(s3id), 5, o), 40, 48));
+            o.eye = 0;
+            QVERIFY(isRed(renderSequenceFrame(p, *p.findSequence(s3id), 5, o), 40, 48));
+        }
+        // Over MCP: a still has no stereo layout; the anaglyph saved at full size.
+        {
+            Project mp = makeDefaultProject();
+            mp.sequences.clear();
+            Sequence& ms = mp.sequences.emplace_back(makeSequence(mp, "M", 160, 96, Rational{25, 1}, 1, 1));
+            mp.activeSequence = ms.id;
+            ms.stereo3d = true;
+            MediaItem vm = probeOrFail(mp, sbsFile);
+            mp.media.push_back(vm);
+            QVERIFY(edit::placeMedia(mp, ms, vm.id, 0, 0, 10, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+            const std::string still = path("edge-still.png");
+            {
+                QImage q(64, 32, QImage::Format_RGB32);
+                q.fill(Qt::gray);
+                QVERIFY(q.save(QString::fromStdString(still)));
+            }
+            MediaItem sm = probeOrFail(mp, still);
+            mp.media.push_back(sm);
+            const QString project = QString::fromStdString(path("edge-mcp.montage"));
+            QVERIFY(saveProject(mp, project.toStdString()));
+            McpServer server;
+            auto call = [&](const char* tool, const QJsonObject& args) {
+                const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                      {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                             {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                                   {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+                const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+                return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+            };
+            QVERIFY(call("montage_stereo", {{"project", project}, {"media", double(sm.id)}, {"layout", "sbs"}}).value("isError").toBool());
+            const QString png = QString::fromStdString(path("edge-sbs.png"));
+            const QJsonObject r = call("montage_render_frame", {{"project", project}, {"at", 0.2}, {"stereo_view", "sbs"}, {"output", png}});
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            const QImage saved(png);
+            QCOMPARE(saved.width(), 320);
+            QVERIFY2(qRed(saved.pixel(40, 48)) > 180 && qBlue(saved.pixel(200, 48)) > 180, qPrintable(QString::number(saved.pixel(40, 48), 16) + " " + QString::number(saved.pixel(200, 48), 16)));
+        }
+    }
+
+    void ambisonicAudio() {
+        // A 3 kHz tone, both sides alike (high enough for the head to shade the far ear).
+        AudioBuffer tone;
+        tone.sampleRate = 48000;
+        for (int i = 0; i < 48000; ++i) {
+            const float v = 0.3f * float(std::sin(2 * M_PI * 3000 * i / 48000.0));
+            tone.samples.push_back(v);
+            tone.samples.push_back(v);
+        }
+        const std::string toneWav = path("ambi-tone.wav");
+        writeBwf(toneWav, tone, 0, "", "");
+        auto rms = [](const AudioBuffer& b, int ch, int64_t from, int64_t to) {
+            double e = 0;
+            for (int64_t i = from; i < to; ++i) e += double(b.samples[size_t(i) * size_t(b.channels) + size_t(ch)]) * b.samples[size_t(i) * size_t(b.channels) + size_t(ch)];
+            return std::sqrt(e / double(std::max<int64_t>(1, to - from)));
+        };
+        auto corr = [](const AudioBuffer& b, int c1, int c2) {
+            double e = 0;
+            for (int64_t i = b.frames() / 4; i < b.frames() * 3 / 4; ++i)
+                e += double(b.samples[size_t(i) * size_t(b.channels) + size_t(c1)]) * b.samples[size_t(i) * size_t(b.channels) + size_t(c2)];
+            return e;
+        };
+        // An ambisonic sequence with the tone placed hard left (a point, at the ear).
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = Rational{25, 1};
+        s.audioLayout = "ambix";
+        QCOMPARE(layoutChannels("ambix"), 4);
+        MediaItem m = probeOrFail(p, toneWav);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 25, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        s.audioTracks[0].surround = SurroundPan{-1, 0, 0, -100, 0, false};
+        const ExportPreset* aac = findExportPreset("Audio - AAC (M4A)");
+        const ExportPreset* wav = findExportPreset("Audio - WAV 24-bit");
+        QVERIFY(aac && wav);
+        const std::string fieldM4a = path("field.m4a"), fieldWav = path("field.wav");
+        for (const auto& [preset, out] : {std::pair{aac, fieldM4a}, std::pair{wav, fieldWav}}) {
+            ExportSettings st = preset->settings;
+            st.path = out;
+            std::string err;
+            QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        }
+        // The AAC file says it is a field (SA3D, which FFmpeg reads as an ambisonic layout); the WAV has four channels.
+        QCOMPARE(readSpatialAudioBox(fieldM4a), 1);
+        QCOMPARE(readSpatialAudioBox(fieldWav), 0);
+        MediaItem back;
+        QVERIFY(probeMedia(fieldM4a, back));
+        QCOMPARE(back.channels, 4);
+        QCOMPARE(back.ambisonic, 1);
+        QVERIFY(probeMedia(fieldWav, back));
+        QCOMPARE(back.channels, 4);
+        // A sound from the left: Y as strong as W and in step with it, X and Z nearly silent.
+        for (const std::string& f : {fieldM4a, fieldWav}) {
+            std::string err;
+            AudioBufferPtr b = decodeAmbisonic(f, 48000, &err);
+            QVERIFY2(b && b->channels == 4, err.c_str());
+            const double w = rms(*b, 0, 8000, 30000), y = rms(*b, 1, 8000, 30000), z = rms(*b, 2, 8000, 30000), x = rms(*b, 3, 8000, 30000);
+            QVERIFY2(w > 0.05 && std::fabs(y / w - 1) < 0.15 && x < 0.1 * w && z < 0.1 * w && corr(*b, 0, 1) > 0,
+                     qPrintable(QString("%1: W %2 Y %3 Z %4 X %5").arg(QString::fromStdString(f)).arg(w).arg(y).arg(z).arg(x)));
+        }
+        // Codecs without ambisonics hear the mix as stereo.
+        QCOMPARE(exportAudioLayout("ambix", "aac"), std::string("ambix"));
+        QCOMPARE(exportAudioLayout("ambix", "pcm_s24le"), std::string("ambix"));
+        QCOMPARE(exportAudioLayout("ambix", "libopus"), std::string("stereo"));
+
+        // The field in a stereo sequence: heard from the left, binaurally or as stereo, turning with the clip's
+        // Ambisonics effect or the linked picture's 360° view.
+        Project q = makeDefaultProject();
+        Sequence& qs = *q.active();
+        qs.fps = Rational{25, 1};
+        MediaItem fm = probeOrFail(q, fieldM4a);
+        QCOMPARE(fm.ambisonic, 1);
+        q.media.push_back(fm);
+        QVERIFY(edit::placeMedia(q, qs, fm.id, 0, 0, 25, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Clip& ac = qs.audioTracks[0].clips.at(0);
+        auto sides = [&](const Sequence& seq, double& l, double& r) {
+            AudioMixer mixer;
+            AudioBuffer out;
+            out.sampleRate = 48000;
+            out.samples.resize(size_t(24000) * 2);
+            mixer.mix(q, seq, 4800, 24000, out.samples.data());
+            l = rms(out, 0, 2000, 24000);
+            r = rms(out, 1, 2000, 24000);
+        };
+        double l = 0, r = 0;
+        sides(qs, l, r);
+        QVERIFY2(l > 1.5 * r && l > 0.02, qPrintable(QString("binaural %1 %2").arg(l).arg(r)));
+        Effect amb = makeEffect(q, "ambisonics");
+        amb.params["decode"] = 1.0;  // stereo
+        ac.effects.push_back(amb);
+        sides(qs, l, r);
+        QVERIFY2(l > 1.5 * r, qPrintable(QString("stereo %1 %2").arg(l).arg(r)));
+        // Turned 90° left, the sound is in front; turned round, on the right.
+        ac.effects.back().params["yaw"] = -90.0;
+        sides(qs, l, r);
+        QVERIFY2(std::fabs(l / r - 1) < 0.15, qPrintable(QString("front %1 %2").arg(l).arg(r)));
+        ac.effects.back().params["yaw"] = 180.0;
+        sides(qs, l, r);
+        QVERIFY2(r > 1.5 * l, qPrintable(QString("behind %1 %2").arg(l).arg(r)));
+        // Following the picture's view: a linked 360° clip looking 90° left brings the sound in front.
+        ac.effects.back().params["yaw"] = 0.0;
+        Clip picture = makeGeneratorClip(q, "color", 25);
+        Effect view = makeEffect(q, "reframe_360");
+        view.params["yaw"] = -90.0;
+        picture.effects.push_back(view);
+        QVERIFY(edit::overwrite(q, qs, {TrackKind::Video, 0}, picture).ok);
+        Clip& audio = qs.audioTracks[0].clips.at(0);
+        qs.videoTracks[0].clips.at(0).linkGroup = audio.linkGroup = q.newId();
+        sides(qs, l, r);
+        QVERIFY2(std::fabs(l / r - 1) < 0.15, qPrintable(QString("follow %1 %2").arg(l).arg(r)));
+        audio.effects.back().params["follow_view"] = 0.0;
+        sides(qs, l, r);
+        QVERIFY2(l > 1.5 * r, qPrintable(QString("not following %1 %2").arg(l).arg(r)));
+        audio.effects.back().params["follow_view"] = 1.0;
+
+        // In an ambisonic sequence the clip's field is kept, turned with the view: the sound now in front.
+        qs.audioLayout = "ambix";
+        {
+            AudioMixer mixer;
+            AudioBuffer out;
+            out.sampleRate = 48000;
+            out.channels = 4;
+            out.samples.resize(size_t(24000) * 4);
+            mixer.mixLayout(q, qs, 4800, 24000, out.samples.data());
+            const double w = rms(out, 0, 2000, 24000), y = rms(out, 1, 2000, 24000), x = rms(out, 3, 2000, 24000);
+            QVERIFY2(w > 0.05 && std::fabs(x / w - 1) < 0.15 && y < 0.15 * w, qPrintable(QString("W %1 Y %2 X %3").arg(w).arg(y).arg(x)));
+            // Heard on headphones or speakers, the mix of a field is a stereo picture of it.
+            AudioMixer listen;
+            AudioBuffer st;
+            st.sampleRate = 48000;
+            st.samples.resize(size_t(24000) * 2);
+            audio.effects.back().params["follow_view"] = 0.0;  // back on the left
+            listen.mix(q, qs, 4800, 24000, st.samples.data());
+            QVERIFY(rms(st, 0, 2000, 24000) > 1.5 * rms(st, 1, 2000, 24000));
+            listen.setAmbisonicBinaural(false);
+            listen.reset();
+            listen.mix(q, qs, 4800, 24000, st.samples.data());
+            QVERIFY(rms(st, 0, 2000, 24000) > 1.5 * rms(st, 1, 2000, 24000));
+        }
+
+        // SA3D goes in whether the movie header follows the sound (FFmpeg's way) or comes first (fast start), and the
+        // sound plays the same afterwards.
+        {
+            // A four-channel AAC file without the box: an ambisonic export with its box renamed to free space.
+            ExportSettings st = aac->settings;
+            st.path = path("plain.m4a");
+            std::string err;
+            QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+            {
+                QFile f(QString::fromStdString(st.path));
+                QVERIFY(f.open(QIODevice::ReadWrite));
+                QByteArray bytes = f.readAll();
+                const qsizetype at = bytes.indexOf("SA3D");
+                QVERIFY(at > 0);
+                f.seek(at);
+                f.write("free", 4);
+            }
+            QCOMPARE(readSpatialAudioBox(st.path), 0);
+            auto topLevel = [](const std::string& file) {
+                QFile f(QString::fromStdString(file));
+                QStringList types;
+                if (!f.open(QIODevice::ReadOnly)) return types;
+                const QByteArray b = f.readAll();
+                for (qsizetype pos = 0; pos + 8 <= b.size();) {
+                    const quint32 size = quint32(uchar(b[pos])) << 24 | quint32(uchar(b[pos + 1])) << 16 | quint32(uchar(b[pos + 2])) << 8 | uchar(b[pos + 3]);
+                    types << QString::fromLatin1(b.mid(pos + 4, 4));
+                    if (size < 8) break;
+                    pos += qsizetype(size);
+                }
+                return types;
+            };
+            QVERIFY(topLevel(st.path).last() == "moov");
+            // Remuxed with the movie header first.
+            const std::string fast = path("fast.m4a");
+            {
+                AVFormatContext* in = nullptr;
+                QVERIFY(avformat_open_input(&in, st.path.c_str(), nullptr, nullptr) == 0);
+                QVERIFY(avformat_find_stream_info(in, nullptr) >= 0);
+                AVFormatContext* outc = nullptr;
+                QVERIFY(avformat_alloc_output_context2(&outc, nullptr, "mp4", fast.c_str()) >= 0);
+                for (unsigned i = 0; i < in->nb_streams; ++i) {
+                    AVStream* os = avformat_new_stream(outc, nullptr);
+                    avcodec_parameters_copy(os->codecpar, in->streams[i]->codecpar);
+                    os->codecpar->codec_tag = 0;
+                    os->time_base = in->streams[i]->time_base;
+                }
+                QVERIFY(avio_open(&outc->pb, fast.c_str(), AVIO_FLAG_WRITE) >= 0);
+                AVDictionary* opts = nullptr;
+                av_dict_set(&opts, "movflags", "+faststart", 0);
+                QVERIFY(avformat_write_header(outc, &opts) >= 0);
+                av_dict_free(&opts);
+                AVPacket* pkt = av_packet_alloc();
+                while (av_read_frame(in, pkt) >= 0) {
+                    av_packet_rescale_ts(pkt, in->streams[pkt->stream_index]->time_base, outc->streams[pkt->stream_index]->time_base);
+                    av_interleaved_write_frame(outc, pkt);
+                }
+                av_packet_free(&pkt);
+                av_write_trailer(outc);
+                avio_closep(&outc->pb);
+                avformat_free_context(outc);
+                avformat_close_input(&in);
+            }
+            for (const std::string& f : {st.path, fast}) {
+                AudioBufferPtr before = decodeAmbisonic(f, 48000, &err);
+                QVERIFY2(before, err.c_str());
+                const QStringList was = topLevel(f);
+                QVERIFY2(writeSpatialAudioBox(f, 1, &err), err.c_str());
+                QCOMPARE(readSpatialAudioBox(f), 1);
+                const QStringList now = topLevel(f);
+                QCOMPARE(now.count("moov"), 1);
+                if (was.last() == "moov") {
+                    // Header last: the new one written after it, the old one now free space; nothing else moved.
+                    QCOMPARE(now.size(), was.size() + 1);
+                    QCOMPARE(now.last(), QStringLiteral("moov"));
+                    QCOMPARE(now[now.size() - 2], QStringLiteral("free"));
+                } else {
+                    QCOMPARE(now, was);
+                }
+                QVERIFY(writeSpatialAudioBox(f, 1, &err));  // a second time: already there
+                QCOMPARE(topLevel(f), now);
+                AudioBufferPtr after = decodeAmbisonic(f, 48000, &err);
+                QVERIFY2(after && after->samples == before->samples, f.c_str());
+                MediaItem probed;
+                QVERIFY(probeMedia(f, probed));
+                QCOMPARE(probed.ambisonic, 1);
+            }
+            QVERIFY(!writeSpatialAudioBox(toneWav, 1, &err));  // not MP4
+            // A stereo track is not a field: nothing to add.
+            Project sp = makeDefaultProject();
+            Sequence& ss = *sp.active();
+            MediaItem tm = probeOrFail(sp, toneWav);
+            sp.media.push_back(tm);
+            QVERIFY(edit::placeMedia(sp, ss, tm.id, 0, 0, 25, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+            ExportSettings ps = aac->settings;
+            ps.path = path("stereo-plain.m4a");
+            QVERIFY2(exportSequence(sp, ss, ps, nullptr, nullptr, &err), err.c_str());
+            const QStringList stereoBoxes = topLevel(ps.path);
+            QVERIFY(writeSpatialAudioBox(ps.path, 1, &err));
+            QCOMPARE(readSpatialAudioBox(ps.path), 0);
+            QCOMPARE(topLevel(ps.path), stereoBoxes);
+            // A file that cannot be written: refused, and left as it was.
+            const std::string locked = path("locked.m4a");
+            QFile::remove(QString::fromStdString(locked));
+            QVERIFY(QFile::copy(QString::fromStdString(fast), QString::fromStdString(locked)));
+            QFile::setPermissions(QString::fromStdString(locked), QFileDevice::ReadOwner);
+            const qint64 lockedSize = QFileInfo(QString::fromStdString(locked)).size();
+            if (!QFile(QString::fromStdString(locked)).open(QIODevice::ReadWrite)) {  // (root can write anything)
+                QVERIFY(!writeSpatialAudioBox(locked, 1, &err));
+                QCOMPARE(QFileInfo(QString::fromStdString(locked)).size(), lockedSize);
+            }
+            QFile::setPermissions(QString::fromStdString(locked), QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+        }
+
+        // Over MCP: mark media, turn a clip with keys, follow the view or not, decode as stereo; an ambisonic sequence.
+        Project mp = makeDefaultProject();
+        Sequence& ms = *mp.active();
+        ms.fps = Rational{25, 1};
+        MediaItem wm = probeOrFail(mp, fieldWav);  // four channels, not marked
+        QCOMPARE(wm.ambisonic, 0);
+        mp.media.push_back(wm);
+        MediaItem two = probeOrFail(mp, toneWav);
+        mp.media.push_back(two);
+        QVERIFY(edit::placeMedia(mp, ms, wm.id, 0, 0, 25, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Id mclip = ms.audioTracks[0].clips.at(0).id;
+        const QString project = QString::fromStdString(path("ambi-mcp.montage"));
+        QVERIFY(saveProject(mp, project.toStdString()));
+        McpServer server;
+        int rid = 1;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", rid++}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QVERIFY(call("montage_ambisonics", {{"project", project}, {"clip", double(mclip)}, {"yaw", 10}}).value("isError").toBool());  // not marked yet
+        QVERIFY(call("montage_ambisonics", {{"project", project}, {"media", double(two.id)}, {"ambisonic", true}}).value("isError").toBool());  // two channels
+        QJsonObject res = call("montage_ambisonics", {{"project", project}, {"media", double(wm.id)}, {"ambisonic", true}});
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        res = call("montage_ambisonics", {{"project", project}, {"clip", double(mclip)}, {"yaw", -90}, {"at", 0}, {"follow_view", false}, {"decode", "stereo"}});
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        res = call("montage_ambisonics", {{"project", project}, {"clip", double(mclip)}, {"yaw", 90}, {"at", 20}});
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        QVERIFY(call("montage_ambisonics", {{"project", project}, {"clip", double(mclip)}, {"decode", "quad"}}).value("isError").toBool());
+        res = call("montage_set_surround", {{"project", project}, {"layout", "ambix"}});
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        Project after;
+        QVERIFY(loadProject(project.toStdString(), after));
+        QCOMPARE(after.findMedia(wm.id)->ambisonic, 1);
+        QCOMPARE(after.active()->audioLayout, std::string("ambix"));
+        const Clip* turned = edit::clipById(*after.active(), mclip);
+        QVERIFY(turned && turned->effects.back().type == "ambisonics");
+        QCOMPARE(turned->effects.back().params.at("yaw").keys.size(), size_t(2));
+        QCOMPARE(turned->effects.back().p("follow_view", 0, 1), 0.0);
+        QCOMPARE(turned->effects.back().p("decode", 0), 1.0);
     }
 
     void vfxPullsWithHandles() {
@@ -4320,13 +5476,16 @@ private slots:
         QVERIFY(!r.ok && r.error.contains("onto the card"));
         r = offloadCard(card, {root + "/twice", root + "/twice/../twice/"}, os);
         QVERIFY(!r.ok && r.error.contains("twice") && !QFileInfo::exists(root + "/twice"));
-        // A link is reported, never followed; a card with no files is an error, not a success.
+        // A link is reported, never followed (QFile::link makes a symbolic link except on Windows, where it makes a
+        // shortcut file, which is a file like any other); a card with no files is an error, not a success.
+#ifndef Q_OS_WIN
         QVERIFY(QDir().mkpath(root + "/linked/L001"));
         put(root + "/linked/L001/real.wav", "data");
         QVERIFY(QFile::link(root + "/linked/L001/real.wav", root + "/linked/L001/alias.wav"));
         r = offloadCard(root + "/linked/L001", {root + "/linkcopy"}, os);
         QVERIFY(!r.ok && r.issues.size() == 1 && r.issues[0].path == "alias.wav");
         QVERIFY(QFileInfo::exists(root + "/linkcopy/L001/real.wav") && !QFileInfo::exists(root + "/linkcopy/L001/alias.wav"));
+#endif
         QVERIFY(QDir().mkpath(root + "/blank/E001/DCIM"));
         r = offloadCard(root + "/blank/E001", {root + "/blankcopy"}, os);
         QVERIFY(!r.ok && r.error.contains("no files"));
@@ -6298,6 +7457,58 @@ private slots:
                     .value("file").toString().endsWith("tone-stereo%20R.wav"));
     }
 
+    void sharedProjectsOverMcp() {
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        const QString prod = QString::fromStdString(path("mcp-production"));
+        QVERIFY(call("montage_production", {{"folder", prod}}).value("isError").toBool());  // not one yet
+        QJsonObject r = call("montage_production", {{"folder", prod}, {"create", true}, {"name", "Series 2"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("production").toString(), QString("Series 2"));
+        const QString ep1 = prod + "/Episode 1.montage", ep2 = prod + "/Episode 2.montage";
+        {
+            Project p = makeDefaultProject();
+            p.active()->name = "Ep 1 Cut";
+            QVERIFY(saveProject(p, ep1.toStdString()));
+            p.active()->name = "Ep 2 Cut";
+            QVERIFY(saveProject(p, ep2.toStdString()));
+            const QString t = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
+            QFile f(QString::fromStdString(lockPathFor(ep2.toStdString())));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(QJsonDocument(QJsonObject{{"user", "sam"}, {"host", "edit-bay-2"}, {"pid", 4242.0}, {"since", t}, {"heartbeat", t}}).toJson());
+        }
+        r = call("montage_production", {{"folder", prod}});
+        const QJsonArray projects = r.value("structuredContent").toObject().value("projects").toArray();
+        QCOMPARE(projects.size(), 2);
+        QCOMPARE(projects[0].toObject().value("status").toString(), QString("free"));
+        QCOMPARE(projects[1].toObject().value("editor").toString(), QString("sam on edit-bay-2"));
+        // A sequence from the episode being edited, brought into the free one: reading it is fine.
+        r = call("montage_import_from_project", {{"project", ep1}, {"from", ep2}, {"sequences", QJsonArray{"Ep 2 Cut"}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        Project back;
+        QVERIFY(loadProject(ep1.toStdString(), back));
+        QCOMPARE(back.active()->name, std::string("Ep 2 Cut"));
+        QCOMPARE(back.sequences.size(), size_t(2));
+        QVERIFY(call("montage_import_from_project", {{"project", ep1}, {"from", ep2}, {"sequences", QJsonArray{"Nope"}}}).value("isError").toBool());
+        // Changing the episode someone has open is refused, and it is left as it was.
+        r = call("montage_import_from_project", {{"project", ep2}, {"from", ep1}});
+        QVERIFY(r.value("isError").toBool());
+        QVERIFY(r.value("content").toArray().at(0).toObject().value("text").toString().contains("sam on edit-bay-2"));
+        QVERIFY(loadProject(ep2.toStdString(), back));
+        QCOMPARE(back.sequences.size(), size_t(1));
+        // Nor is it undone behind their back.
+        QVERIFY(QFile::copy(ep2, ep2 + ".bak"));
+        r = call("montage_undo", {{"project", ep2}});
+        QVERIFY(r.value("isError").toBool() && r.value("content").toArray().at(0).toObject().value("text").toString().contains("editing"));
+    }
+
     void aafExportWithPicture() {
         // A movie with picture and sound (6 s at 25 fps) and a still.
         Project src = makeDefaultProject();
@@ -6325,7 +7536,8 @@ private slots:
         s.fps = {25, 1};
         s.width = 320, s.height = 240;
         s.name = "Picture Cut";
-        const MediaItem movie = probeOrFail(p, st.path);
+        MediaItem movie = probeOrFail(p, st.path);
+        movie.timecode = 3600;  // recorded from 01:00:00:00
         p.media.push_back(movie);
         const MediaItem pic = probeOrFail(p, still);
         p.media.push_back(pic);
@@ -6447,6 +7659,7 @@ private slots:
         QCOMPARE(a[0].toObject().value("start").toInt(), 20);
         QVERIFY(a[0].toObject().value("file").toString().endsWith("pic-movie.mp4"));
         QCOMPARE(a[0].toObject().value("samples").toInt(), 150);
+        QCOMPARE(a[0].toObject().value("tape_tc").toInt(), 90000);  // its source's timecode, 01:00:00:00 at 25 fps
         QCOMPARE(a[1].toObject().value("op").toString(), QString("Video Dissolve"));
         QCOMPARE(a[1].toObject().value("cut").toInt(), 5);
         QCOMPARE(a[2].toObject().value("start").toInt(), 85);
@@ -6454,10 +7667,51 @@ private slots:
         QCOMPARE(b.size(), 6);
         QCOMPARE(b[0].toObject().value("type").toString(), QString("filler"));
         QCOMPARE(b[1].toObject().value("op").toString(), QString("Motion Control"));
+        QCOMPARE(b[1].toObject().value("op_id").toString(), QString("9d2ea890-0968-11d3-8a38-0050040ef7d2"));  // VideoSpeedControl
         QVERIFY(std::fabs(b[1].toObject().value("params").toObject().value("constant").toDouble() - 2) < 1e-6);
         QCOMPARE(b[1].toObject().value("inputs").toArray()[0].toObject().value("length").toInt(), 50);
         QVERIFY(b[3].toObject().value("file").toString().endsWith("still.png"));
+        QVERIFY(!b[3].toObject().contains("tape_tc"));  // a still has no timecode
         QCOMPARE(b[5].toObject().value("inputs").toArray()[0].toObject().value("length").toInt(), 10);  // slow motion: 10 frames over 20
+
+        // A 10-frame shot between two 16-frame dissolves: they may not overlap in the AAF, so each reaches only as far
+        // as the other leaves; a shot at 40% speed is fed every frame it shows; anamorphic footage keeps its shape.
+        {
+            Project q = makeDefaultProject();
+            Sequence& qs = *q.active();
+            qs.fps = {25, 1};
+            Interpretation anamorphic;
+            anamorphic.par = 2;
+            const MediaItem wide = probeOrFail(q, interpretedPath(st.path, anamorphic));
+            q.media.push_back(wide);
+            QVERIFY(edit::placeMedia(q, qs, wide.id, 0, 10, 50, {TrackKind::Video, 0}, {TrackKind::Audio, -1}, false).ok);
+            QVERIFY(edit::placeMedia(q, qs, wide.id, 40, 70, 80, {TrackKind::Video, 0}, {TrackKind::Audio, -1}, false).ok);
+            QVERIFY(edit::placeMedia(q, qs, wide.id, 50, 100, 140, {TrackKind::Video, 0}, {TrackKind::Audio, -1}, false).ok);
+            QVERIFY(edit::addTransition(q, qs, edit::clipAt(qs, {TrackKind::Video, 0}, 45)->id, edit::Edge::In, "cross_dissolve", 16).ok);
+            QVERIFY(edit::addTransition(q, qs, edit::clipAt(qs, {TrackKind::Video, 0}, 55)->id, edit::Edge::In, "cross_dissolve", 16).ok);
+            while (qs.videoTracks.size() < 2) edit::addTrack(q, qs, TrackKind::Video);
+            QVERIFY(edit::placeMedia(q, qs, wide.id, 0, 0, 41, {TrackKind::Video, 1}, {TrackKind::Audio, -1}, false).ok);
+            Clip* crawl = edit::clipById(qs, edit::clipAt(qs, {TrackKind::Video, 1}, 0)->id);
+            crawl->speed = 0.4;
+            crawl->duration = 101;
+            const std::string qaaf = path("short-shot.aaf");
+            AafExportResult qr;
+            QVERIFY2(exportAaf(q, qs, qaaf, &qr, {}, nullptr, &err), err.c_str());
+            QCOMPARE(qr.videoTransitions, 2);
+            QProcess qp;
+            qp.start(QString::fromLocal8Bit(python), {"-I", QStringLiteral(MONTAGE_TEST_TOOLS_DIR "/aaf_check.py"), QString::fromStdString(qaaf)});
+            QVERIFY(qp.waitForFinished(60000));
+            QVERIFY2(qp.exitCode() == 0, qp.readAllStandardError().constData());
+            const QJsonArray qt = QJsonDocument::fromJson(qp.readAllStandardOutput()).object().value("tracks").toArray();
+            const QJsonArray v1 = qt[0].toObject().value("components").toArray();
+            QCOMPARE(v1.size(), 5);  // shot, dissolve, short shot, dissolve, shot
+            const int t1 = v1[1].toObject().value("length").toInt(), mid = v1[2].toObject().value("length").toInt(),
+                      t2 = v1[3].toObject().value("length").toInt();
+            QVERIFY2(t1 > 0 && t2 > 0 && mid >= t1 + t2, qPrintable(QString("%1 %2 %3").arg(t1).arg(mid).arg(t2)));
+            QCOMPARE(v1[0].toObject().value("aspect").toString(), QString("8/3"));  // 320 x 240 stored, at a pixel aspect of 2
+            const QJsonArray v2 = qt[1].toObject().value("components").toArray();
+            QCOMPARE(v2[0].toObject().value("inputs").toArray()[0].toObject().value("length").toInt(), 41);  // 40.4 frames, all shown
+        }
     }
 
     void superScaleUpscaling() {
@@ -11164,6 +12418,28 @@ private slots:
                                                   {"motion", "crawl_left"}, {"track", "V4"}});
         QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
         QVERIFY(tool("montage_add_title", QJsonObject{{"project", project}, {"text", "x"}, {"at", 0}, {"motion", "sideways"}}).value("isError").toBool());
+        // Extruded 3D text, spinning in; its own options only on it.
+        r = tool("montage_add_title", QJsonObject{{"project", project}, {"text", "Chapter One"}, {"at", 0}, {"duration", 0.3},
+                                                  {"template", "3d"}, {"depth", 60}, {"spin_in", true}, {"track", "V5"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QCOMPARE(r.value("structuredContent").toObject().value("text").toString(), QString("Chapter One"));  // the reply says what it reads
+        // Wrong types are refused rather than ignored.
+        for (const QJsonObject& bad : {QJsonObject{{"depth", "60"}}, QJsonObject{{"spin_in", "true"}}, QJsonObject{{"size", "big"}}}) {
+            QJsonObject args{{"project", project}, {"text", "x"}, {"at", 0}, {"template", "3d"}};
+            for (auto it = bad.begin(); it != bad.end(); ++it) args[it.key()] = it.value();
+            QVERIFY(tool("montage_add_title", args).value("isError").toBool());
+        }
+        {
+            Project p3;
+            QVERIFY(loadProject(project.toStdString(), p3));
+            const Clip* t3 = nullptr;
+            for (const Track& vt : p3.active()->videoTracks)
+                for (const Clip& c : vt.clips)
+                    if (c.generator.type == "title3d") t3 = &c;
+            QVERIFY(t3 && t3->generator.s("text") == "Chapter One" && t3->generator.p("depth", 0) == 60 && t3->generator.p("anim_in", 0) == 2);
+        }
+        QVERIFY(tool("montage_add_title", QJsonObject{{"project", project}, {"text", "x"}, {"at", 0}, {"depth", 10}}).value("isError").toBool());
+        QVERIFY(tool("montage_add_title", QJsonObject{{"project", project}, {"text", "x"}, {"at", 0}, {"template", "3d"}, {"motion", "roll"}}).value("isError").toBool());
         // Words popping on one at a time, and leaving the same way.
         r = tool("montage_add_title", QJsonObject{{"project", project}, {"text", "One two three"}, {"at", 0.5}, {"duration", 0.2},
                                                   {"text_animation", "pop"}, {"animate_by", "word"}, {"animation_seconds", 0.5},
@@ -12139,6 +13415,509 @@ private slots:
         QVERIFY(!err.empty());
     }
 
+    void ambisonicReviewFixes() {
+        const int rate = 48000;
+        // A four-channel 16-bit WAV of a field.
+        auto writeField = [&](const std::string& file, int frames, const std::function<std::array<float, 4>(int)>& at) {
+            std::string data;
+            for (int i = 0; i < frames; ++i)
+                for (float v : at(i)) {
+                    const int16_t q = int16_t(std::lround(std::clamp(v, -1.0f, 1.0f) * 32767));
+                    data.append(reinterpret_cast<const char*>(&q), 2);
+                }
+            auto u32 = [](uint32_t v) { return std::string(reinterpret_cast<const char*>(&v), 4); };
+            auto u16 = [](uint16_t v) { return std::string(reinterpret_cast<const char*>(&v), 2); };
+            const std::string fmt = u16(1) + u16(4) + u32(uint32_t(rate)) + u32(uint32_t(rate) * 8) + u16(8) + u16(16);
+            const std::string chunks = "fmt " + u32(16) + fmt + "data" + u32(uint32_t(data.size())) + data;
+            FILE* f = std::fopen(file.c_str(), "wb");
+            QVERIFY(f);
+            const std::string head = "RIFF" + u32(uint32_t(4 + chunks.size())) + "WAVE";
+            std::fwrite(head.data(), 1, head.size(), f);
+            std::fwrite(chunks.data(), 1, chunks.size(), f);
+            std::fclose(f);
+        };
+        auto tone = [](int i) { return 0.3f * float(std::sin(2 * M_PI * 3000 * i / 48000.0)); };
+        // A 3 kHz tone from the left: W and Y alike, X and Z silent.
+        const std::string leftWav = path("rf-left.wav");
+        writeField(leftWav, rate * 2, [&](int i) { return std::array<float, 4>{tone(i), tone(i), 0, 0}; });
+        auto rms = [](const std::vector<float>& b, int nch, int ch, int from, int to) {
+            double e = 0;
+            for (int i = from; i < to; ++i) e += double(b[size_t(i) * size_t(nch) + size_t(ch)]) * b[size_t(i) * size_t(nch) + size_t(ch)];
+            return std::sqrt(e / std::max(1, to - from));
+        };
+        // An ambisonic sequence with the field on its first track.
+        auto fieldSequence = [&](Project& p, const std::string& layout) -> Sequence& {
+            p = makeDefaultProject();
+            Sequence& s = *p.active();
+            s.fps = Rational{25, 1};
+            s.audioLayout = layout;
+            MediaItem m = probeOrFail(p, leftWav);
+            m.ambisonic = 1;
+            p.media.push_back(m);
+            Clip c = makeClip(p, m, TrackKind::Audio, s);
+            c.duration = 50;
+            edit::overwrite(p, s, {TrackKind::Audio, 0}, c);
+            return s;
+        };
+        auto mixField = [&](const Project& p, const Sequence& s, int frames) {
+            std::vector<float> out(size_t(frames) * 4);
+            AudioMixer mixer;
+            mixer.mixLayout(p, s, 0, frames, out.data());
+            return out;
+        };
+        Project p;
+        Sequence& s = fieldSequence(p, "ambix");
+        QCOMPARE(p.media.back().channels, 4);
+        const auto plain = mixField(p, s, rate);
+        const double w0 = rms(plain, 4, 0, 4800, 14400);
+        QVERIFY2(w0 > 0.15 && std::fabs(rms(plain, 4, 1, 4800, 14400) - w0) < 0.01 * w0 && rms(plain, 4, 3, 4800, 14400) < 1e-3,
+                 qPrintable(QString::number(w0)));
+
+        // Bleeps cover the field in every direction: silence, or the tone in W alone.
+        {
+            Clip& c = s.audioTracks[0].clips[0];
+            Effect bleep = makeEffect(p, "bleep");
+            setBleepRanges(bleep, {{0.4, 0.6}});
+            bleep.params["mode"] = Param(1.0);  // silence
+            c.effects.push_back(bleep);
+            auto out = mixField(p, s, rate);
+            for (int ch = 0; ch < 4; ++ch) QVERIFY2(rms(out, 4, ch, 20160, 27840) < 1e-4, qPrintable(QString::number(ch)));
+            QVERIFY(std::fabs(rms(out, 4, 0, 4800, 14400) - w0) < 0.01 * w0);
+            c.effects.back().params["mode"] = Param(0.0);  // the tone
+            out = mixField(p, s, rate);
+            const double level = std::pow(10.0, -12 / 20.0) / std::sqrt(2.0);
+            QVERIFY2(std::fabs(rms(out, 4, 0, 20160, 27840) - level) < 0.02, qPrintable(QString::number(rms(out, 4, 0, 20160, 27840))));
+            for (int ch = 1; ch < 4; ++ch) QVERIFY(rms(out, 4, ch, 20160, 27840) < 1e-4);
+            // Heard as stereo too (a stereo sequence decodes the clip): the bleep still silences it.
+            Sequence st = s;
+            st.audioLayout = "stereo";
+            st.audioTracks[0].clips[0].effects.back().params["mode"] = Param(1.0);
+            std::vector<float> stereo(size_t(rate) * 2);
+            AudioMixer mixer;
+            mixer.mix(p, st, 0, rate, stereo.data());
+            QVERIFY(rms(stereo, 2, 0, 20160, 27840) < 1e-4 && rms(stereo, 2, 0, 4800, 14400) > 0.05);
+            c.effects.clear();
+        }
+
+        // Routed to a bus: the field goes through its mute and fader (not round it).
+        {
+            Bus b;
+            b.id = p.newId();
+            s.buses.push_back(b);
+            s.audioTracks[0].output = b.id;
+            auto out = mixField(p, s, rate);
+            QVERIFY(std::fabs(rms(out, 4, 0, 4800, 14400) - w0) < 0.01 * w0);
+            s.buses[0].volumeDb = -6.0206;
+            out = mixField(p, s, rate);
+            QVERIFY2(std::fabs(rms(out, 4, 0, 4800, 14400) - w0 / 2) < 0.01 * w0, qPrintable(QString::number(rms(out, 4, 0, 4800, 14400))));
+            s.buses[0].muted = true;
+            out = mixField(p, s, rate);
+            QVERIFY(rms(out, 4, 0, 4800, 14400) < 1e-6);
+            s.buses.clear();
+            s.audioTracks[0].output = 0;
+        }
+
+        // Nested in an ambisonic sequence, an ambisonic sequence stays a field (left stays left, nothing decoded);
+        // nested in a stereo one, it is heard binaurally, louder on the left.
+        {
+            Project np = p;
+            const Id inner = np.activeSequence;
+            Sequence outer = makeSequence(np, "Outer", 1920, 1080, {25, 1}, 1, 1);
+            outer.audioLayout = "ambix";
+            MediaItem nm;
+            nm.id = np.newId();
+            nm.kind = MediaKind::Sequence;
+            nm.sequenceId = inner;
+            nm.hasAudio = true;
+            nm.duration = 2;
+            np.media.push_back(nm);
+            Clip nc = makeClip(np, nm, TrackKind::Audio, outer);
+            nc.duration = 50;
+            outer.audioTracks[0].clips.push_back(nc);
+            np.sequences.push_back(outer);
+            const Sequence& o = np.sequences.back();
+            auto out = mixField(np, o, rate);
+            const double w = rms(out, 4, 0, 4800, 14400);
+            QVERIFY2(std::fabs(w - w0) < 0.02 * w0, qPrintable(QString("%1 vs %2").arg(w).arg(w0)));
+            QVERIFY(std::fabs(rms(out, 4, 1, 4800, 14400) - w) < 0.02 * w && rms(out, 4, 3, 4800, 14400) < 1e-3);
+            Sequence flat = o;
+            flat.audioLayout = "stereo";
+            std::vector<float> stereo(size_t(rate) * 2);
+            AudioMixer mixer;
+            mixer.mix(np, flat, 0, rate, stereo.data());
+            QVERIFY2(rms(stereo, 2, 0, 4800, 14400) > 1.5 * rms(stereo, 2, 1, 4800, 14400),
+                     qPrintable(QString("%1 %2").arg(rms(stereo, 2, 0, 4800, 14400)).arg(rms(stereo, 2, 1, 4800, 14400))));
+        }
+
+        // A fresh mixer (an export's) folds an ambisonic sequence through the cardioids, as downmixToStereo does.
+        {
+            std::vector<float> stereo(size_t(rate) * 2), fold(size_t(rate) * 2);
+            AudioMixer mixer;
+            mixer.mix(p, s, 0, rate, stereo.data());
+            downmixToStereo("ambix", plain.data(), rate, fold.data());
+            double worst = 0;
+            for (size_t i = 0; i < stereo.size(); ++i) worst = std::max(worst, double(std::fabs(stereo[i] - fold[i])));
+            QVERIFY2(worst < 1e-5, qPrintable(QString::number(worst)));
+        }
+
+        // Kept pitch: a field at double speed stays at 3 kHz with its direction, all four channels cut together.
+        {
+            Clip& c = s.audioTracks[0].clips[0];
+            c.speed = 2;
+            c.duration = 25;
+            c.timing.params["maintain_pitch"] = Param(1.0);
+            const auto out = mixField(p, s, rate / 2);
+            int crossings = 0;
+            for (int i = 2400; i < 21600; ++i) crossings += (out[size_t(i) * 4] < 0) != (out[size_t(i + 1) * 4] < 0);
+            const double hz = crossings / 2.0 / (19200.0 / rate);
+            QVERIFY2(std::fabs(hz - 3000) < 60, qPrintable(QString::number(hz)));
+            QVERIFY(std::fabs(rms(out, 4, 1, 2400, 21600) - rms(out, 4, 0, 2400, 21600)) < 0.03 * rms(out, 4, 0, 2400, 21600));
+            c.timing.params["maintain_pitch"] = Param(0.0);  // resampled: an octave up
+            const auto up = mixField(p, s, rate / 2);
+            crossings = 0;
+            for (int i = 2400; i < 21600; ++i) crossings += (up[size_t(i) * 4] < 0) != (up[size_t(i + 1) * 4] < 0);
+            QVERIFY(std::fabs(crossings / 2.0 / (19200.0 / rate) - 6000) < 120);
+            c.speed = 1;
+            c.duration = 50;
+        }
+        // A conformed file keeping its pitch: stretched to its new length, still 3 kHz.
+        {
+            Interpretation in;
+            in.fps = Rational{25, 1};
+            in.fileFps = Rational{50, 1};
+            in.keepPitch = true;
+            const std::string conformed = interpretedPath(leftWav, in);
+            AudioBufferPtr b = decodeAmbisonic(conformed, rate);
+            QVERIFY(b && b->channels == 4);
+            QVERIFY2(std::llabs(b->frames() - int64_t(rate) * 4) < 64, qPrintable(QString::number(b->frames())));
+            int crossings = 0;
+            for (int64_t i = rate; i < rate * 2; ++i) crossings += (b->samples[size_t(i) * 4] < 0) != (b->samples[size_t(i + 1) * 4] < 0);
+            QVERIFY2(std::fabs(crossings / 2.0 - 3000) < 60, qPrintable(QString::number(crossings / 2.0)));
+        }
+
+        // Noise reduction on a field cleans W and does the same to Y, Z and X: the sound from the left stays on the left.
+        {
+            const std::string noisy = path("rf-noisy.wav");
+            std::mt19937 rng(3);
+            std::normal_distribution<float> noise(0, 0.02f);
+            writeField(noisy, rate * 2, [&](int i) {
+                const float v = (i % 24000) < 12000 ? tone(i) : 0.0f;  // the tone half the time, noise throughout
+                return std::array<float, 4>{v + noise(rng), v + noise(rng), noise(rng), noise(rng)};
+            });
+            auto src = MediaPool::instance().audio(ambisonicAudioKey(noisy), rate);
+            QVERIFY(src && src->channels == 4);
+            Effect dn = makeEffect(p, "denoise");
+            dn.params["reduction_db"] = Param(20.0);
+            const AudioBufferPtr clean = cleanedAudio(ambisonicAudioKey(noisy), src, {&dn}, true);
+            QVERIFY(clean && clean->channels == 4 && clean->frames() == src->frames());
+            std::vector<float> a(src->samples.begin(), src->samples.end()), b(clean->samples.begin(), clean->samples.end());
+            // In the gaps the noise is down in every channel; in the tone W and Y stay alike.
+            for (int ch = 0; ch < 4; ++ch)
+                QVERIFY2(rms(b, 4, ch, 14000, 22000) < 0.5 * rms(a, 4, ch, 14000, 22000), qPrintable(QString::number(ch)));
+            const double cw = rms(b, 4, 0, 2000, 10000), cy = rms(b, 4, 1, 2000, 10000);
+            QVERIFY2(cw > 0.1 && std::fabs(cy - cw) < 0.05 * cw, qPrintable(QString("%1 %2").arg(cw).arg(cy)));
+            QVERIFY(rms(b, 4, 3, 2000, 10000) < 0.3 * cw);
+        }
+
+        // A field relinked to a stereo file is a field no longer, and media marked ambisonic with too few channels
+        // plays as channels rather than going quiet.
+        {
+            const std::string two = path("rf-stereo.wav");
+            writeWav(two, rate, 2.0, 0.3f, 0.3f);
+            Project rp = p;
+            MediaItem& m = rp.media.back();
+            m.ambisonic = 1;
+            const Id mid = m.id;
+            std::string err;
+            QVERIFY2(relinkMedia(rp, mid, two, RelinkCheck::Replace, &err), err.c_str());
+            QCOMPARE(rp.findMedia(mid)->ambisonic, 0);
+            Project lp = p;
+            lp.media.back().path = two;
+            lp.media.back().channels = 2;
+            lp.media.back().ambisonic = 1;
+            Sequence st = *lp.active();
+            st.audioLayout = "stereo";
+            std::vector<float> stereo(size_t(rate) * 2);
+            AudioMixer mixer;
+            mixer.mix(lp, st, 0, rate, stereo.data());
+            QVERIFY(rms(stereo, 2, 0, 4800, 14400) > 0.1);
+        }
+
+        // The clip's turn is set right in the scene before the view turns it: yaw 90° right undone by a view 90° left.
+        {
+            const FoaRotation clip = foaRotation(90, 0, 0), view = foaRotation(-90, 0, 0);
+            float d[4] = {1, 0.3f, 0.2f, 0.5f};
+            foaRotate(foaCompose(clip, view), d);
+            QVERIFY(std::fabs(d[1] - 0.3f) < 1e-5 && std::fabs(d[2] - 0.2f) < 1e-5 && std::fabs(d[3] - 0.5f) < 1e-5);
+            // Composed is the same as one after the other (pitch, then yaw), which summed angles are not.
+            float a[4] = {1, 0.3f, 0.2f, 0.5f}, b2[4] = {1, 0.3f, 0.2f, 0.5f}, c2[4] = {1, 0.3f, 0.2f, 0.5f};
+            foaRotate(foaRotation(0, 30, 0), a);
+            foaRotate(foaRotation(60, 0, 0), a);
+            foaRotate(foaCompose(foaRotation(0, 30, 0), foaRotation(60, 0, 0)), b2);
+            for (int k = 0; k < 4; ++k) QVERIFY(std::fabs(a[k] - b2[k]) < 1e-5);
+            foaRotate(foaRotation(60, 30, 0), c2);
+            double diff = 0;
+            for (int k = 0; k < 4; ++k) diff += std::fabs(a[k] - c2[k]);
+            QVERIFY(diff > 0.05);
+        }
+    }
+
+    void panFollowsThePicture() {
+        // A textured card crossing a flat grey frame left to right: its centre at x = 160 + pos(t) of 320.
+        const std::string video = path("panfollow.mp4");
+        const int frames = 40;
+        auto pos = [&](double t) { return -110 + 220 * t / (frames - 1); };
+        {
+            QImage grey(320, 180, QImage::Format_RGB32);
+            grey.fill(QColor(110, 110, 110));
+            const QString greyPng = QString::fromStdString(path("panfollow-grey.png"));
+            grey.save(greyPng);
+            QImage card(64, 64, QImage::Format_RGB32);
+            card.fill(QColor(40, 40, 40));
+            {
+                QPainter pa(&card);
+                std::mt19937 rng(11);
+                std::uniform_int_distribution<int> xy(0, 56), sz(3, 12), c(0, 255);
+                for (int i = 0; i < 60; ++i) pa.fillRect(xy(rng), xy(rng), sz(rng), sz(rng), QColor(c(rng), c(rng), c(rng)));
+            }
+            const QString cardPng = QString::fromStdString(path("panfollow-card.png"));
+            card.save(cardPng);
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            s.width = 320;
+            s.height = 180;
+            s.fps = {25, 1};
+            MediaItem g = probeOrFail(p, greyPng.toStdString());
+            p.media.push_back(g);
+            MediaItem k = probeOrFail(p, cardPng.toStdString());
+            p.media.push_back(k);
+            Clip bg = makeClip(p, g, TrackKind::Video, s);
+            bg.duration = frames;
+            QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, bg).ok);
+            edit::addTrack(p, s, TrackKind::Video);
+            Clip fg = makeClip(p, k, TrackKind::Video, s);
+            fg.duration = frames;
+            fg.motion.params["scale"] = Param(100.0);
+            fg.motion.params["pos_x"].addKey(0, pos(0), Interp::Linear);
+            fg.motion.params["pos_x"].addKey(frames - 1, pos(frames - 1), Interp::Linear);
+            QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 1}, fg).ok);
+            ExportSettings st;
+            st.path = video;
+            st.audioCodec = "none";
+            st.crf = 12;
+            st.preset = "ultrafast";
+            std::string err;
+            QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        }
+        const std::string wav = path("panfollow.wav");
+        writeWav(wav, 48000, 2.0, 0.3f, 0.3f);
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320;
+        s.height = 180;
+        s.fps = {25, 1};
+        MediaItem mv = probeOrFail(p, video);
+        p.media.push_back(mv);
+        MediaItem ma = probeOrFail(p, wav);
+        p.media.push_back(ma);
+        QVERIFY(edit::placeMedia(p, s, mv.id, 0, 0, frames, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        // The sound on its own track, not linked to the picture.
+        while (s.audioTracks.size() < 2) edit::addTrack(p, s, TrackKind::Audio);
+        Clip snd = makeClip(p, ma, TrackKind::Audio, s);
+        snd.duration = frames;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Audio, 1}, snd).ok);
+        const Clip& a = trackAt(s, {TrackKind::Audio, 1})->clips.at(0);
+        const Clip& pic = trackAt(s, {TrackKind::Video, 0})->clips.at(0);
+        QVERIFY(panFollowSource(p, s, a, 20) == &pic);
+        // The subject of the shot is the card.
+        double sx = 0, sy = 0;
+        std::string err;
+        QVERIFY2(panFollowSubject(p, s, a, 20, sx, sy, &err), err.c_str());
+        QVERIFY2(std::fabs(sx * 320 - (160 + pos(20))) < 24 && std::fabs(sy - 0.5) < 0.15, qPrintable(QString("%1 %2").arg(sx).arg(sy)));
+        // Followed from the middle both ways: every frame, on the card's centre.
+        std::vector<PanFollowKey> keys;
+        double last = -1;
+        QVERIFY2(trackPanFollow(p, s, a, 20, (160 + pos(20)) / 320, 0.5, 0.25, keys, [&](double f) {
+            QVERIFY(f >= -1e-9 && f <= 1 + 1e-9);
+            last = f;
+        }, nullptr, &err), err.c_str());
+        QVERIFY(last > 0.9);
+        QCOMPARE(int(keys.size()), frames);
+        double worst = 0;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            QCOMPARE(keys[i].t, FrameTime(i));
+            worst = std::max({worst, std::fabs(keys[i].x * 320 - (160 + pos(double(i)))), std::fabs(keys[i].y * 180 - 90)});
+        }
+        QVERIFY2(worst < 1.5, qPrintable(QString::number(worst)));
+        // Stereo: the track's pan moves left to right with it, thinned, and stays as it was outside the span.
+        Track& tr = *trackAt(s, {TrackKind::Audio, 1});
+        tr.automation = int(AutomationMode::Read);
+        tr.panAuto.addKey(60, 0.5);  // a later move, kept
+        const Track untouched = tr;
+        QVERIFY(applyPanFollow(s, tr, keys, 1.0));
+        QCOMPARE(tr.automation, int(AutomationMode::Read));
+        QVERIFY(tr.panAuto.keys.size() < 20);
+        auto expectPan = [&](double t) { return (2 * (160 + pos(t)) / 320 - 1); };
+        QVERIFY2(std::fabs(trackPanAt(tr, 2) - expectPan(2)) < 0.03, qPrintable(QString::number(trackPanAt(tr, 2))));
+        QVERIFY(std::fabs(trackPanAt(tr, 20) - expectPan(20)) < 0.03);
+        QVERIFY(std::fabs(trackPanAt(tr, 37) - expectPan(37)) < 0.03);
+        QVERIFY(trackPanAt(tr, 2) < -0.5 && trackPanAt(tr, 37) > 0.5);
+        QVERIFY(std::fabs(trackPanAt(tr, 40) - 0.5) < 1e-9);  // what the lane held there before
+        QVERIFY(tr.panAuto.keyAt(60) && std::fabs(tr.panAuto.keyAt(60)->v - 0.5) < 1e-9);
+        // A track not reading its lanes (Off, or Write): those lanes were not heard, so they are replaced, the fader's
+        // pan kept outside the span, and the track set to read.
+        for (AutomationMode mode : {AutomationMode::Off, AutomationMode::Write}) {
+            Track off = untouched;
+            off.automation = int(mode);
+            off.pan = -0.25;
+            QVERIFY(applyPanFollow(s, off, keys, 1.0));
+            QCOMPARE(off.automation, int(AutomationMode::Read));
+            QVERIFY(!off.panAuto.keyAt(60));
+            QVERIFY(std::fabs(trackPanAt(off, 40) + 0.25) < 1e-9 && std::fabs(trackPanAt(off, 80) + 0.25) < 1e-9);
+            QVERIFY(trackPanAt(off, 37) > 0.5);
+        }
+        // A path starting later: the lane before it is held as it was by a key just before.
+        {
+            Track later = untouched;
+            later.panAuto = Param();
+            later.panAuto.addKey(0, -0.5);
+            std::vector<PanFollowKey> shifted;
+            for (int t = 10; t <= 20; ++t) shifted.push_back({FrameTime(t), 0.75, 0.5});
+            QVERIFY(applyPanFollow(s, later, shifted, 1.0));
+            QVERIFY(later.panAuto.keyAt(9) && std::fabs(later.panAuto.keyAt(9)->v + 0.5) < 1e-9);
+            QVERIFY(std::fabs(trackPanAt(later, 5) + 0.5) < 1e-9 && std::fabs(trackPanAt(later, 15) - 0.5) < 1e-9);
+            QVERIFY(std::fabs(trackPanAt(later, 30) + 0.5) < 1e-9);
+        }
+        // Half the stage: half the pan.
+        Track narrow = tr;
+        narrow.panAuto = Param();
+        QVERIFY(applyPanFollow(s, narrow, keys, 0.5));
+        QVERIFY(std::fabs(trackPanAt(narrow, 37) - 0.5 * expectPan(37)) < 0.03);
+        // Surround: the surround position's direction, the picture's edges at the front left and right speakers (in
+        // perspective), at the distance the track was heard at.
+        Sequence surround = s;
+        surround.audioLayout = "5.1";
+        Track st = untouched;
+        st.panAuto = Param();
+        QVERIFY(applyPanFollow(surround, st, keys, 1.0));
+        QVERIFY(!st.panAuto.animated() && st.surroundXAuto.animated() && st.surroundYAuto.animated());
+        const SurroundPan end = trackSurroundAt(st, 37);
+        const double wantAngle = std::atan(expectPan(37) * std::tan(30 * M_PI / 180)) * 180 / M_PI;
+        QVERIFY2(std::fabs(std::atan2(end.x, end.y) * 180 / M_PI - wantAngle) < 2, qPrintable(QString::number(wantAngle)));
+        QVERIFY(std::fabs(std::hypot(end.x, end.y) - 1) < 0.01);
+        // Kept nearer the middle (y 0.4): the same direction, at that distance.
+        Track nearer = untouched;
+        nearer.panAuto = Param();
+        nearer.surround.y = 0.4;
+        QVERIFY(applyPanFollow(surround, nearer, keys, 1.0));
+        const SurroundPan near37 = trackSurroundAt(nearer, 37);
+        QVERIFY(std::fabs(std::atan2(near37.x, near37.y) * 180 / M_PI - wantAngle) < 2 && std::fabs(std::hypot(near37.x, near37.y) - 0.4) < 0.01);
+        QVERIFY(std::fabs(trackSurroundAt(nearer, 45).y - 0.4) < 1e-9);  // as it was after the span
+        // Going to a bus (stereo inside), a surround sequence's track is panned in stereo.
+        Sequence bused = surround;
+        Bus bus;
+        bus.id = p.newId();
+        bused.buses.push_back(bus);
+        Track routed = untouched;
+        routed.panAuto = Param();
+        routed.output = bus.id;
+        QVERIFY(panFollowStereo(bused, routed) && !panFollowStereo(surround, routed));
+        QVERIFY(applyPanFollow(bused, routed, keys, 1.0));
+        QVERIFY(routed.panAuto.animated() && !routed.surroundXAuto.animated());
+        // A 360° sequence: the picture is the whole circle, so the card goes round behind the listener.
+        Sequence sphere = surround;
+        sphere.spherical = true;
+        Track sp = untouched;
+        sp.panAuto = Param();
+        QVERIFY(applyPanFollow(sphere, sp, keys, 1.0));
+        QVERIFY(sp.surroundYAuto.animated());
+        const SurroundPan behind = trackSurroundAt(sp, 37);
+        const double azimuth = std::atan2(behind.x, behind.y) * 180 / M_PI, want = (keys[37].x - 0.5) * 360;
+        QVERIFY2(std::fabs(azimuth - want) < 4 && behind.y < 0, qPrintable(QString("%1 vs %2").arg(azimuth).arg(want)));
+        // Linked picture first: the same shot on a track above, the sound linked to the lower one.
+        Project p2 = p;
+        Sequence& s2 = *p2.active();
+        edit::addTrack(p2, s2, TrackKind::Video);
+        Clip top = pic;
+        top.id = p2.newId();
+        top.linkGroup = 0;
+        QVERIFY(edit::overwrite(p2, s2, {TrackKind::Video, 1}, top).ok);
+        Clip& low = trackAt(s2, {TrackKind::Video, 0})->clips.at(0);
+        Clip& a2 = trackAt(s2, {TrackKind::Audio, 1})->clips.at(0);
+        QVERIFY(panFollowSource(p2, s2, a2, 10)->id == trackAt(s2, {TrackKind::Video, 1})->clips.at(0).id);
+        const Id group = p2.newId();
+        a2.linkGroup = group;
+        low.linkGroup = group;
+        QVERIFY(panFollowSource(p2, s2, a2, 10)->id == low.id);
+        // At a point, what is seen there: the shot on top.
+        QVERIFY(panFollowSource(p2, s2, a2, 10, 0.5, 0.5)->id == trackAt(s2, {TrackKind::Video, 1})->clips.at(0).id);
+        // A still over part of the picture: nothing moves there to follow; beside it, the video.
+        {
+            Project p3 = p;
+            Sequence& s3 = *p3.active();
+            MediaItem still = probeOrFail(p3, path("panfollow-grey.png"));
+            p3.media.push_back(still);
+            edit::addTrack(p3, s3, TrackKind::Video);
+            Clip inset = makeClip(p3, still, TrackKind::Video, s3);
+            inset.duration = frames;
+            inset.motion.params["scale"] = Param(40.0);
+            inset.motion.params["pos_x"] = Param(-100.0);  // over the left of the frame
+            QVERIFY(edit::overwrite(p3, s3, {TrackKind::Video, 1}, inset).ok);
+            const Clip& a3 = trackAt(s3, {TrackKind::Audio, 1})->clips.at(0);
+            QVERIFY(!panFollowSource(p3, s3, a3, 20, 60.0 / 320, 0.5));
+            QVERIFY(panFollowSource(p3, s3, a3, 20, 0.75, 0.5));
+            std::vector<PanFollowKey> none;
+            QVERIFY(!trackPanFollow(p3, s3, a3, 20, 60.0 / 320, 0.5, 0.25, none, {}, nullptr, &err));
+            QVERIFY2(QString::fromStdString(err).contains("moves"), err.c_str());
+        }
+        // No picture with the sound: an error.
+        Sequence bare = s;
+        bare.videoTracks[0].clips.clear();
+        QVERIFY(!trackPanFollow(p, bare, a, 20, 0.5, 0.5, 0.25, keys, {}, nullptr, &err));
+        QVERIFY(!err.empty());
+        QVERIFY(!panFollowSource(p, bare, a, 20));
+        // The agent's tool: from the shot's subject by default, writing the pan and reporting the path.
+        Project mp = p;
+        Track& fresh = *trackAt(*mp.active(), {TrackKind::Audio, 1});
+        fresh.panAuto = Param();
+        const QString project = QString::fromStdString(path("panfollow.montage"));
+        QVERIFY(saveProject(mp, project.toStdString()));
+        McpServer server;
+        int rid = 1;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", rid++}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QVERIFY(call("montage_pan_follow", {{"project", project}, {"clip", double(pic.id)}}).value("isError").toBool());  // not audio
+        QVERIFY(call("montage_pan_follow", {{"project", project}, {"clip", double(a.id)}, {"at", 99}}).value("isError").toBool());
+        QVERIFY(call("montage_pan_follow", {{"project", project}, {"clip", double(a.id)}, {"x", 0.5}}).value("isError").toBool());
+        QVERIFY(call("montage_pan_follow", {{"project", project}, {"clip", double(a.id)}, {"width", 2}}).value("isError").toBool());
+        QVERIFY(call("montage_pan_follow", {{"project", project}, {"clip", double(a.id)}, {"x", "0.5"}, {"y", "0.5"}}).value("isError").toBool());
+        QVERIFY(call("montage_pan_follow", {{"project", project}, {"clip", double(a.id)}, {"at", 20.5}}).value("isError").toBool());
+        // By default from the shot's subject (where it lands depends on the platform's decoder, so only roughly).
+        QJsonObject res = call("montage_pan_follow", {{"project", project}, {"clip", double(a.id)}, {"at", 20}, {"size", "medium"}});
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        const QJsonObject from = res.value("structuredContent").toObject().value("start").toObject();
+        QVERIFY2(std::fabs(from.value("x").toDouble() * 320 - (160 + pos(20))) < 24, QJsonDocument(from).toJson().constData());
+        // From the card's centre: the pan follows it.
+        res = call("montage_pan_follow", {{"project", project}, {"clip", double(a.id)}, {"at", 20}, {"x", (160 + pos(20)) / 320}, {"y", 0.5}});
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        const QJsonObject out = res.value("structuredContent").toObject();
+        QCOMPARE(out.value("lane").toString(), QStringLiteral("pan"));
+        QCOMPARE(out.value("from").toInteger(), qint64(0));
+        QCOMPARE(out.value("to").toInteger(), qint64(frames - 1));
+        QVERIFY(out.value("path").toArray().size() >= 4);
+        Project after;
+        QVERIFY(loadProject(project.toStdString(), after));
+        const Track& written = *trackAt(*after.active(), {TrackKind::Audio, 1});
+        QVERIFY(written.panAuto.animated());
+        QVERIFY2(std::fabs(trackPanAt(written, 37) - expectPan(37)) < 0.06, qPrintable(QString::number(trackPanAt(written, 37))));
+    }
+
     void autoReframe() {
         // A red ball crossing textured ground left to right (x 180 -> 516 of 640), bobbing up and down.
         const std::string video = path("reframe-ball.mp4");
@@ -12636,6 +14415,413 @@ private slots:
         QVERIFY(rms(0, 1.0) > 0.15);   // lav A
         QVERIFY(rms(1, 1.0) < 0.03);   // lav B hears A faintly
         QVERIFY(rms(1, 4.0) > 0.15);
+    }
+
+    void hdr10PlusMetadata() {
+        // ---- The message: ST 2094-40 as FFmpeg's own parser reads it.
+        Hdr10PlusScene sc;
+        sc.maxScl[0] = 1000, sc.maxScl[1] = 500, sc.maxScl[2] = 250;
+        sc.average = 123.4;
+        const double pct[7] = {0.5, 10, 50, 120, 400, 700, 999.9};
+        std::copy(pct, pct + 7, sc.percentiles);
+        const std::vector<uint8_t> t35 = hdr10PlusT35(sc);
+        QCOMPARE(t35.size(), size_t(49));  // profile A: 6 header bytes and 339 bits
+        QCOMPARE(std::vector<uint8_t>(t35.begin(), t35.begin() + 6), (std::vector<uint8_t>{0xB5, 0x00, 0x3C, 0x00, 0x01, 0x04}));
+        {
+            size_t sz = 0;
+            AVDynamicHDRPlus* m = av_dynamic_hdr_plus_alloc(&sz);
+            QVERIFY(m);
+            QCOMPARE(av_dynamic_hdr_plus_from_t35(m, t35.data() + 6, t35.size() - 6), 0);
+            const AVHDRPlusColorTransformParams& w = m->params[0];
+            const int version = m->application_version, windows = m->num_windows, percentiles = w.num_distribution_maxrgb_percentiles;
+            const double target = av_q2d(m->targeted_system_display_maximum_luminance);
+            const double r = av_q2d(w.maxscl[0]) * 10000, g = av_q2d(w.maxscl[1]) * 10000, b = av_q2d(w.maxscl[2]) * 10000;
+            const double avg = av_q2d(w.average_maxrgb) * 10000;
+            std::vector<int> percentages;
+            std::vector<double> values;
+            for (int i = 0; i < percentiles; ++i)
+                percentages.push_back(w.distribution_maxrgb[i].percentage), values.push_back(av_q2d(w.distribution_maxrgb[i].percentile) * 10000);
+            const double bright = av_q2d(w.fraction_bright_pixels);
+            const int toneMapping = w.tone_mapping_flag;
+            av_free(m);
+            QCOMPARE(version, 1);
+            QCOMPARE(windows, 1);
+            QCOMPARE(target, 0.0);
+            QVERIFY(std::fabs(r - 1000) < 1e-6 && std::fabs(g - 500) < 1e-6 && std::fabs(b - 250) < 1e-6);
+            QVERIFY(std::fabs(avg - 123.4) < 1e-6);
+            QCOMPARE(percentages, (std::vector<int>{1, 5, 10, 25, 50, 75, 90, 95, 99}));
+            // The measured values where they go; 5 and 10 % hold the standard's fixed 0 and 0.00255.
+            const std::vector<double> want{0.5, 0, 25.5, 10, 50, 120, 400, 700, 999.9};
+            for (size_t i = 0; i < want.size(); ++i) QVERIFY2(std::fabs(values[i] - want[i]) < 1e-6, qPrintable(QString("%1 %2").arg(i).arg(values[i])));
+            QCOMPARE(bright, 0.0);
+            QCOMPARE(toneMapping, 0);
+        }
+
+        // ---- Into packets: an HEVC prefix SEI before the first slice (start codes and lengths), escaped; an AV1
+        // metadata OBU before the shown frame.
+        auto packet = [](const std::vector<uint8_t>& bytes) {
+            AVPacket* pkt = av_packet_alloc();
+            av_new_packet(pkt, int(bytes.size()));
+            std::copy(bytes.begin(), bytes.end(), pkt->data);
+            pkt->pts = 7;
+            return pkt;
+        };
+        Hdr10PlusScene black;  // all zero: the message is full of zero bytes to escape
+        const std::vector<uint8_t> zeros = hdr10PlusT35(black);
+        auto unescape = [](const uint8_t* d, size_t n, bool& clean) {
+            std::vector<uint8_t> out;
+            clean = true;
+            int z = 0;
+            for (size_t i = 0; i < n; ++i) {
+                if (z >= 2 && d[i] <= 3) {
+                    if (d[i] != 3) clean = false;  // 00 00 0x must not appear
+                    z = 0;
+                    if (d[i] == 3) continue;
+                }
+                out.push_back(d[i]);
+                z = d[i] == 0 ? z + 1 : 0;
+            }
+            return out;
+        };
+        std::vector<uint8_t> wantRbsp{4, uint8_t(zeros.size())};
+        wantRbsp.insert(wantRbsp.end(), zeros.begin(), zeros.end());
+        wantRbsp.push_back(0x80);
+        {
+            AVPacket* pkt = packet({0, 0, 0, 1, 0x40, 0x01, 0x0C, 0x01, 0, 0, 1, 0x26, 0x01, 0xAF, 0x09});  // VPS, IDR slice
+            QVERIFY(addHdr10PlusSei(pkt, zeros, 0));
+            QCOMPARE(pkt->pts, int64_t(7));
+            // Split at start codes: VPS, SEI, slice.
+            std::vector<std::pair<size_t, size_t>> units;
+            const uint8_t* d = pkt->data;
+            const size_t n = size_t(pkt->size);
+            for (size_t i = 0; i + 3 <= n; ++i)
+                if (d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1) {
+                    if (!units.empty()) units.back().second = (i > 0 && d[i - 1] == 0 ? i - 1 : i);
+                    units.push_back({i + 3, n});
+                    i += 2;
+                }
+            QCOMPARE(units.size(), size_t(3));
+            QCOMPARE(int((d[units[0].first] >> 1) & 0x3f), 32);
+            QCOMPARE(int((d[units[1].first] >> 1) & 0x3f), 39);
+            QCOMPARE(int((d[units[2].first] >> 1) & 0x3f), 19);
+            QCOMPARE(d[units[1].first + 1], uint8_t(0x01));
+            bool clean = false;
+            const auto rbsp = unescape(d + units[1].first + 2, units[1].second - units[1].first - 2, clean);
+            QVERIFY(clean);
+            QCOMPARE(rbsp, wantRbsp);
+            QCOMPARE(std::vector<uint8_t>(d + units[2].first, d + n), (std::vector<uint8_t>{0x26, 0x01, 0xAF, 0x09}));
+            av_packet_free(&pkt);
+        }
+        {
+            // The SEI takes its access unit's TemporalId (here a sub-layer 2 slice).
+            AVPacket* sub = packet({0, 0, 0, 1, 0x02, 0x03, 0xD0, 0x11});
+            QVERIFY(addHdr10PlusSei(sub, zeros, 0));
+            QCOMPARE(sub->data[5], uint8_t(0x03));
+            av_packet_free(&sub);
+            AVPacket* pkt = packet({0, 0, 0, 4, 0x40, 0x01, 0x0C, 0x01, 0, 0, 0, 3, 0x02, 0x01, 0xD0});  // VPS, TRAIL_R slice
+            QVERIFY(addHdr10PlusSei(pkt, zeros, 4));
+            const uint8_t* d = pkt->data;
+            size_t i = 0;
+            std::vector<int> types;
+            std::vector<uint8_t> sei;
+            while (i + 4 <= size_t(pkt->size)) {
+                const size_t len = (size_t(d[i]) << 24) | (size_t(d[i + 1]) << 16) | (size_t(d[i + 2]) << 8) | d[i + 3];
+                QVERIFY(i + 4 + len <= size_t(pkt->size));
+                types.push_back((d[i + 4] >> 1) & 0x3f);
+                if (types.back() == 39) sei.assign(d + i + 6, d + i + 4 + len);
+                i += 4 + len;
+            }
+            QCOMPARE(i, size_t(pkt->size));
+            QCOMPARE(types, (std::vector<int>{32, 39, 1}));
+            bool clean = false;
+            QCOMPARE(unescape(sei.data(), sei.size(), clean), wantRbsp);
+            av_packet_free(&pkt);
+            pkt = packet({0, 0, 0, 2, 0x40, 0x01});  // no slice: nothing to attach it to
+            QVERIFY(!addHdr10PlusSei(pkt, zeros, 4));
+            av_packet_free(&pkt);
+        }
+        {
+            // Temporal delimiter, sequence header, a hidden frame, the shown frame.
+            AVPacket* pkt = packet({0x12, 0x00, 0x0A, 0x02, 0xAA, 0xBB, 0x32, 0x01, 0xCC, 0x32, 0x02, 0xDD, 0xEE});
+            QVERIFY(addHdr10PlusObu(pkt, t35));
+            const uint8_t* d = pkt->data;
+            size_t i = 0;
+            std::vector<int> types;
+            std::vector<uint8_t> meta;
+            while (i < size_t(pkt->size)) {
+                const int type = (d[i] >> 3) & 0xf;
+                size_t size = 0, shift = 0, j = i + 1;
+                while (true) {
+                    size |= size_t(d[j] & 0x7f) << shift;
+                    shift += 7;
+                    if (!(d[j++] & 0x80)) break;
+                }
+                types.push_back(type);
+                if (type == 5) meta.assign(d + j, d + j + size);
+                i = j + size;
+            }
+            QCOMPARE(i, size_t(pkt->size));
+            QCOMPARE(types, (std::vector<int>{2, 1, 6, 5, 6}));  // just before the last (shown) frame
+            std::vector<uint8_t> want{4};
+            want.insert(want.end(), t35.begin(), t35.end());
+            want.push_back(0x80);
+            QCOMPARE(meta, want);
+            av_packet_free(&pkt);
+        }
+
+        // ---- Measuring: linear light from PQ codes, per channel and of each pixel's brightest channel.
+        const ColorSpace& pq = *findColorSpace("rec2100pq");
+        QVERIFY(!Hdr10PlusMeter(*findColorSpace("rec709")).valid());
+        Hdr10PlusMeter meter(pq);
+        QVERIFY(meter.valid());
+        meter.minSceneFrames = 2;
+        auto frame = [&](double leftNits, double rightRed) {
+            Image img(100, 10);
+            const float l = float(nitsToCode(pq, leftNits)), red = float(nitsToCode(pq, rightRed)), low = float(nitsToCode(pq, 1));
+            for (int y = 0; y < 10; ++y)
+                for (int x = 0; x < 100; ++x) {
+                    float* px = img.at(x, y);
+                    if (x < 50) px[0] = px[1] = px[2] = l;
+                    else px[0] = red, px[1] = px[2] = low;
+                    px[3] = 1;
+                }
+            return img;
+        };
+        for (FrameTime f = 0; f < 3; ++f) meter.add(frame(100, 1000), f, f == 0);
+        meter.add(frame(1, 1), 3, false);  // most of the picture changes brightness at once: a cut within the clip
+        meter.add(frame(1, 1), 4, true);   // an edit
+        std::vector<Hdr10PlusScene> got = meter.scenes();
+        QCOMPARE(got.size(), size_t(3));
+        QVERIFY(got[0].start == 0 && got[0].end == 3 && got[1].start == 3 && got[1].end == 4 && got[2].start == 4 && got[2].end == 5);
+        auto near = [](double a, double b) { return std::fabs(a - b) <= 0.002 * std::max(1.0, b); };
+        QVERIFY2(near(got[0].maxScl[0], 1000) && near(got[0].maxScl[1], 100) && near(got[0].maxScl[2], 100), qPrintable(QString::number(got[0].maxScl[0])));
+        QVERIFY2(near(got[0].average, 550), qPrintable(QString::number(got[0].average)));
+        // Half the pixels at 100 nits, half at 1000: up to the 50th percentile 100, above it 1000.
+        QVERIFY(near(got[0].percentiles[0], 100) && near(got[0].percentiles[2], 100) && near(got[0].percentiles[3], 1000) && near(got[0].percentiles[6], 1000));
+        QVERIFY(near(got[1].maxScl[0], 1) && near(got[1].average, 1));
+
+        // ---- A cut of three shots: each its own scene.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 160;
+        s.height = 90;
+        s.fps = {25, 1};
+        s.colorSpace = "rec2100pq";
+        s.hdrPeakNits = 1000;
+        auto shot = [&](double r, double g, double b, FrameTime at) {
+            Clip c = makeGeneratorClip(p, "color", 10);
+            c.generator.params["color.r"] = r;
+            c.generator.params["color.g"] = g;
+            c.generator.params["color.b"] = b;
+            c.start = at;
+            edit::overwrite(p, s, {TrackKind::Video, 0}, c);
+        };
+        shot(0.25, 0.25, 0.25, 0);
+        shot(1, 1, 1, 10);
+        shot(1, 0, 0, 20);
+        std::vector<Hdr10PlusScene> analysed;
+        std::string err;
+        QVERIFY2(analyseHdr10Plus(p, s, 0, 30, pq, 1000, analysed, &err), err.c_str());
+        QCOMPARE(analysed.size(), size_t(3));
+        QVERIFY(analysed[1].start == 10 && analysed[2].start == 20 && analysed[2].end == 30);
+        QVERIFY2(analysed[0].maxScl[0] < 100 && near(analysed[1].maxScl[0], 203) && near(analysed[1].maxScl[2], 203),
+                 qPrintable(QString("%1 %2").arg(analysed[0].maxScl[0]).arg(analysed[1].maxScl[0])));
+        // Red graphics in BT.2020: mostly red (Rec.709's red primary sits inside BT.2020's), every pixel's brightest
+        // channel its red.
+        QVERIFY2(analysed[2].maxScl[0] > 100 && analysed[2].maxScl[1] < analysed[2].maxScl[0] / 4 && near(analysed[2].average, analysed[2].maxScl[0]),
+                 qPrintable(QString("%1 %2 %3 %4").arg(analysed[2].maxScl[0]).arg(analysed[2].maxScl[1]).arg(analysed[2].maxScl[2]).arg(analysed[2].average)));
+        // A hidden track's clip or a disabled clip makes no cut.
+        {
+            Sequence hidden = s;
+            edit::addTrack(p, hidden, TrackKind::Video);
+            Clip extra = makeGeneratorClip(p, "color", 4);
+            extra.start = 3;
+            edit::overwrite(p, hidden, {TrackKind::Video, 1}, extra);
+            QCOMPARE(hdr10PlusCuts(hidden, 0, 30), (std::vector<FrameTime>{3, 7, 10, 20}));
+            hidden.videoTracks[1].muted = true;
+            QCOMPARE(hdr10PlusCuts(hidden, 0, 30), (std::vector<FrameTime>{10, 20}));
+            hidden.videoTracks[1].muted = false;
+            hidden.videoTracks[1].clips[0].enabled = false;
+            QCOMPARE(hdr10PlusCuts(hidden, 0, 30), (std::vector<FrameTime>{10, 20}));
+        }
+        // Analysing part again grows to whole stored scenes, and the result replaces only what it covers.
+        {
+            FrameTime a = 15, b = 25;
+            widenHdr10PlusRange(analysed, a, b);
+            QVERIFY(a == 10 && b == 30);
+            std::vector<Hdr10PlusScene> stored = analysed, fresh(analysed.begin() + 1, analysed.end());
+            fresh[0].maxScl[0] = 1;
+            mergeHdr10PlusScenes(stored, fresh);
+            QVERIFY(stored.size() == 3 && stored[0] == analysed[0] && stored[1].maxScl[0] == 1 && stored[2] == analysed[2]);
+        }
+        // The sequence's analysis is checked against the cut scene by scene, and kept with the project.
+        s.hdr10Plus = analysed;
+        QCOMPARE(storedHdr10Plus(p, s, 0, 30, pq, 1000), analysed);
+        std::vector<Hdr10PlusScene> part = storedHdr10Plus(p, s, 5, 25, pq, 1000);
+        QVERIFY(part.size() == 3 && part[0].start == 5 && part[2].end == 25);
+        const QString proj = QString::fromStdString(path("hdr10plus.montage"));
+        QVERIFY(saveProject(p, proj.toStdString()));
+        Project reopened;
+        QVERIFY(loadProject(proj.toStdString(), reopened));
+        QCOMPARE(reopened.active()->hdr10Plus, analysed);
+        s.hdr10Plus.clear();
+
+        // ---- Exported: each scene in the file, on every frame.
+        if (!avcodec_find_encoder_by_name("libx265")) QSKIP("This FFmpeg has no libx265");
+        ExportSettings st;
+        st.path = path("hdr10plus.mp4");
+        st.videoCodec = "libx265";
+        st.audioCodec = "none";
+        st.preset = "ultrafast";
+        st.hdr10Plus = true;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        // Every access unit carries one HDR10+ message.
+        auto readBack = [&](const std::string& file, std::vector<double>& maxRed, int& messages) {
+            maxRed.clear();
+            messages = 0;
+            AVFormatContext* fmt = nullptr;
+            if (avformat_open_input(&fmt, file.c_str(), nullptr, nullptr) < 0) return false;
+            avformat_find_stream_info(fmt, nullptr);
+            const AVCodecParameters* cp = fmt->streams[0]->codecpar;
+            const AVCodec* dec = cp->codec_id == AV_CODEC_ID_AV1 ? avcodec_find_decoder_by_name("libdav1d") : avcodec_find_decoder(cp->codec_id);
+            AVCodecContext* ctx = dec ? avcodec_alloc_context3(dec) : nullptr;
+            if (!ctx || avcodec_parameters_to_context(ctx, cp) < 0 || avcodec_open2(ctx, dec, nullptr) < 0) {
+                avcodec_free_context(&ctx);
+                avformat_close_input(&fmt);
+                return false;
+            }
+            const bool hevc = cp->codec_id == AV_CODEC_ID_HEVC;
+            const int lengthSize = hevc && cp->extradata_size > 22 && cp->extradata[0] == 1 ? (cp->extradata[21] & 3) + 1 : 4;
+            const uint8_t sig[6] = {0xB5, 0x00, 0x3C, 0x00, 0x01, 0x04};
+            AVPacket* pkt = av_packet_alloc();
+            AVFrame* fr = av_frame_alloc();
+            auto take = [&] {
+                while (avcodec_receive_frame(ctx, fr) == 0) {
+                    const AVFrameSideData* sd = av_frame_get_side_data(fr, AV_FRAME_DATA_DYNAMIC_HDR_PLUS);
+                    maxRed.push_back(sd ? av_q2d(reinterpret_cast<const AVDynamicHDRPlus*>(sd->data)->params[0].maxscl[0]) * 10000 : -1);
+                    av_frame_unref(fr);
+                }
+            };
+            while (av_read_frame(fmt, pkt) >= 0) {
+                if (hevc) {
+                    for (size_t i = 0; i + size_t(lengthSize) < size_t(pkt->size);) {
+                        size_t len = 0;
+                        for (int k = 0; k < lengthSize; ++k) len = (len << 8) | pkt->data[i + size_t(k)];
+                        const uint8_t* nal = pkt->data + i + lengthSize;
+                        if (((nal[0] >> 1) & 0x3f) == 39 && len > 9 && nal[2] == 4 && std::equal(sig, sig + 6, nal + 4)) ++messages;
+                        i += size_t(lengthSize) + len;
+                    }
+                } else {
+                    const uint8_t* d = pkt->data;
+                    for (int i = 0; i + 8 < pkt->size; ++i)
+                        if (d[i] == 0x2A && std::equal(sig, sig + 6, d + i + 3)) ++messages;
+                }
+                avcodec_send_packet(ctx, pkt);
+                av_packet_unref(pkt);
+                take();
+            }
+            avcodec_send_packet(ctx, nullptr);
+            take();
+            av_frame_free(&fr);
+            av_packet_free(&pkt);
+            avcodec_free_context(&ctx);
+            avformat_close_input(&fmt);
+            return true;
+        };
+        std::vector<double> maxRed;
+        int messages = 0;
+        QVERIFY(readBack(st.path, maxRed, messages));
+        QCOMPARE(messages, 30);
+        QCOMPARE(maxRed.size(), size_t(30));
+        for (int f = 0; f < 30; ++f) {
+            const double want = std::floor(analysed[size_t(f / 10)].maxScl[0] * 10 + 0.5) / 10;
+            QVERIFY2(std::fabs(maxRed[size_t(f)] - want) < 1e-6, qPrintable(QString("%1: %2 %3").arg(f).arg(maxRed[size_t(f)]).arg(want)));
+        }
+        // The same beside it as JSON, scene by scene.
+        std::vector<Hdr10PlusScene> fromJson;
+        QVERIFY2(readHdr10PlusJson(path("hdr10plus.hdr10plus.json"), fromJson, &err), err.c_str());
+        QCOMPARE(fromJson.size(), size_t(3));
+        QVERIFY(fromJson[0].start == 0 && fromJson[1].start == 10 && fromJson[2].start == 20 && fromJson[2].end == 30);
+        QVERIFY(std::fabs(fromJson[1].maxScl[1] - analysed[1].maxScl[1]) < 0.051 && std::fabs(fromJson[2].percentiles[6] - analysed[2].percentiles[6]) < 0.051);
+        {
+            QFile jf(QString::fromStdString(path("hdr10plus.hdr10plus.json")));
+            QVERIFY(jf.open(QIODevice::ReadOnly));
+            const QJsonObject root = QJsonDocument::fromJson(jf.readAll()).object();
+            for (const char* key : {"JSONInfo", "SceneInfo", "SceneInfoSummary", "ToolInfo"}) QVERIFY(root.contains(key));
+            QCOMPARE(root.value("SceneInfo").toArray().size(), 30);
+            QCOMPARE(root.value("SceneInfoSummary").toObject().value("SceneFrameNumbers").toArray(), (QJsonArray{10, 10, 10}));
+        }
+
+        // Exports use the stored analysis where it still matches: a marked value comes through untouched...
+        s.hdr10Plus = analysed;
+        s.hdr10Plus[0].maxScl[0] = 777;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        QVERIFY(readHdr10PlusJson(path("hdr10plus.hdr10plus.json"), fromJson, &err) && fromJson.size() == 3);
+        QVERIFY2(std::fabs(fromJson[0].maxScl[0] - 777) < 0.051, qPrintable(QString::number(fromJson[0].maxScl[0])));
+        // ...and a regraded shot is measured again on its own, the other scenes kept.
+        trackAt(s, {TrackKind::Video, 0})->clips[2].generator.params["color.g"] = 1.0;
+        QVERIFY(storedHdr10Plus(p, s, 0, 30, pq, 1000).empty());
+        QCOMPARE(storedHdr10Plus(p, s, 0, 20, pq, 1000).size(), size_t(2));
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        QVERIFY(readHdr10PlusJson(path("hdr10plus.hdr10plus.json"), fromJson, &err) && fromJson.size() == 3);
+        QVERIFY(std::fabs(fromJson[0].maxScl[0] - 777) < 0.051 && fromJson[2].maxScl[1] > 150);
+        // Burn-ins change the picture from what was analysed: measured on the frames as delivered instead.
+        {
+            ExportSettings burnt = st;
+            burnt.burnIn.timecode = true;
+            QVERIFY2(exportSequence(p, s, burnt, nullptr, nullptr, &err), err.c_str());
+            QVERIFY(readHdr10PlusJson(path("hdr10plus.hdr10plus.json"), fromJson, &err) && fromJson.size() == 3);
+            QVERIFY2(fromJson[0].maxScl[0] < 700, qPrintable(QString::number(fromJson[0].maxScl[0])));
+        }
+        s.hdr10Plus.clear();
+        // A JSON that cannot be written (a folder in its place) is warned about; the video is kept.
+        {
+            QDir().mkpath(QString::fromStdString(path("blocked.hdr10plus.json")));
+            ExportSettings blocked = st;
+            blocked.path = path("blocked.mp4");
+            QVERIFY2(exportSequence(p, s, blocked, nullptr, nullptr, &err), err.c_str());
+            QVERIFY(QFileInfo(QString::fromStdString(blocked.path)).size() > 1000);
+        }
+        // An image sequence's JSON is named without its frame number.
+        {
+            ExportSettings frames = st;
+            frames.path = path("frames_%04d.tif");
+            frames.videoCodec = "tiff";
+            frames.audioCodec = "none";
+            QVERIFY2(exportSequence(p, s, frames, nullptr, nullptr, &err), err.c_str());
+            QVERIFY(QFileInfo::exists(QString::fromStdString(path("frames.hdr10plus.json"))));
+            QCOMPARE(hdr10PlusCarriage(s, frames), std::string("json"));
+            QCOMPARE(hdr10PlusCarriage(s, st), std::string("video"));
+            Sequence sdrSeq = s;
+            sdrSeq.colorSpace = "rec709";
+            QCOMPARE(hdr10PlusCarriage(sdrSeq, st), std::string());
+        }
+        // Not for SDR.
+        Sequence sdr = s;
+        sdr.colorSpace = "rec709";
+        std::vector<Hdr10PlusScene> none;
+        QVERIFY(!analyseHdr10Plus(p, sdr, 0, 30, *findColorSpace("rec709"), 1000, none, &err) && !err.empty());
+
+        // AV1 carries it in metadata OBUs, which dav1d reads back.
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(60, 31, 100)
+        if (!avcodec_find_encoder_by_name("libsvtav1") || !avcodec_find_decoder_by_name("libdav1d"))
+            qWarning("AV1 HDR10+ not checked: this FFmpeg lacks libsvtav1 or libdav1d");
+        else {
+            ExportSettings av1 = st;
+            av1.path = path("hdr10plus-av1.mp4");
+            av1.videoCodec = "libsvtav1";
+            av1.preset = "12";
+            av1.crf = 40;
+            QVERIFY2(exportSequence(p, s, av1, nullptr, nullptr, &err), err.c_str());
+            QVERIFY(readBack(av1.path, maxRed, messages));
+            QCOMPARE(messages, 30);
+            QCOMPARE(maxRed.size(), size_t(30));
+            for (int f = 0; f < 30; ++f) QVERIFY2(maxRed[size_t(f)] > 0, qPrintable(QString::number(f)));
+            std::vector<Hdr10PlusScene> av1Json;
+            QVERIFY(readHdr10PlusJson(path("hdr10plus-av1.hdr10plus.json"), av1Json, &err) && av1Json.size() == 3);
+            QVERIFY(std::fabs(maxRed[25] - std::floor(av1Json[2].maxScl[0] * 10 + 0.5) / 10) < 0.051);
+        }
+#endif
     }
 
     void hdrExportRoundTrip() {

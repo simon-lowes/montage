@@ -11,7 +11,8 @@ namespace montage::plugins {
 
 // Builds a "plugin" clip effect for `d`: the plugin's identity, its initial
 // state, and one keyframeable parameter per automatable plugin parameter.
-// Loads the plugin briefly to read its parameters.
+// Loads the plugin briefly to read its parameters. A plugin with a key input
+// is marked ("key_input"); its "sidechain" string names the key track's id.
 std::optional<Effect> makePluginEffect(Project& p, const Descriptor& d, std::string* error = nullptr);
 
 // Effect type strings used by browsers and drag and drop: catalogue types

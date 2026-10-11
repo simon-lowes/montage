@@ -115,11 +115,13 @@ public:
     // a single channel keep the mix. One undo step; false if nothing changed.
     bool setAudioChannelMode(const std::vector<Id>& media, const std::string& mode);
     // Marks pictures as 360° footage ("equirect") or flat (""), as Premiere's Modify > VR Properties; one undo step.
+    // Marks media as ambisonic sound (order 1) or channels for speakers (0); false if nothing changed.
+    bool setMediaAmbisonic(const std::vector<Id>& media, int order);
     bool setMediaProjection(const std::vector<Id>& media, const std::string& projection);
     // Interpret Footage on an image sequence (media/ImageSequence.h): its frames at `fps`; one undo step.
     bool setImageSequenceRate(Id media, double fps);
     // Interpret Footage (core/Interpretation.h) on each of `media`; one undo step. False (with a message) if none changed.
-    bool interpretFootage(const std::vector<Id>& media, const Interpretation& how);
+    bool interpretFootage(const std::vector<Id>& media, const Interpretation& how, bool keepHighlights = false);
     // The Interpret Footage dialog for `media`, applied when accepted.
     void interpretFootageDialog(const std::vector<Id>& media);
 

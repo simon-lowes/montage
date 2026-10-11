@@ -35,6 +35,15 @@ int audioTrackAngle(const Sequence& mc, int track);
 // if any item has none.
 bool timecodeOffsets(const Project& p, const std::vector<Id>& media, std::vector<double>& offsets);
 
+// The sequence with its multicam clips replaced by the angles' own clips, for interchange formats that have no
+// multicam clips (EDL, OpenTimelineIO, FCP 7 XML): a clip playing every source's sound plays the sound of the angle
+// shown with it, and picture and sound of one source stay linked. Clips at other speeds are left as they are.
+Sequence flattenedMulticam(const Project& p, const Sequence& s);
+// The part of a multicam sequence one clip of it shows, as a plain sequence (for a nested sequence in OTIO or FCP 7
+// XML, where a clip at another speed stays a multicam clip): the picture of `angle`, or the sound of `audioAngle` (-1
+// all of it).
+Sequence multicamPart(const Sequence& mc, bool picture, int angle, int audioAngle);
+
 namespace edit {
 
 // Shows `angle` on multicam clip `clipId` (a video clip). With `cut`, the clip

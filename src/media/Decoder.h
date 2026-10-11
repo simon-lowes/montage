@@ -9,6 +9,7 @@
 
 #include "CameraRaw.h"
 #include "Image.h"
+#include "core/Interpretation.h"
 #include "core/Model.h"
 
 struct AVFormatContext;
@@ -21,6 +22,11 @@ namespace montage {
 
 // Fills `out` (kind, duration, dimensions, codecs...) from the file at `path`.
 bool probeMedia(const std::string& path, MediaItem& out, std::string* error = nullptr);
+// A project saved before Montage read stereo packing: its stereo video files (side-by-side or top-and-bottom metadata)
+// are found from their headers and read again, so their items say so and give one eye's size, as they would imported
+// now. Nothing happens once a project has been checked (Project::stereoChecked). ProRes RAW media saved by a build
+// that read them differently (with or without FFmpeg 9's colour) are probed again every time.
+void checkStereoMedia(Project& p);
 
 // Captions carried inside a video as CEA-608 (the A/53 caption data of H.264, HEVC and MPEG-2 frames, as broadcast
 // and camera files carry them): caption channel 1, timed in frames at `fps` of the media's own time. The whole video
@@ -103,18 +109,23 @@ private:
     double timeScale_ = 1;
     double par_ = 0;
     std::string alpha_, fields_;
+    Interpretation interp_;
+    std::string stereo_;  // stereoscopic footage's packing ("sbs", "sbs_half", "tb", "tb_half"), "" = flat
+    int eye_ = 0;         // the eye read (0 left, 1 right), after any swap
     std::shared_ptr<VectorDocument> vector_;  // a Lottie animation or SVG, rendered instead of decoded
     AVFrame* raw_ = nullptr;                  // a camera raw still, developed once (RGB48), or a CinemaDNG run's current frame
     std::unique_ptr<ImageSequence> rawSequence_;  // a run of camera raw frames (media/ImageSequence.h)
     int rawFrame_ = -1;                       // the run's frame in raw_
     RawSettings rawSettings_;                 // how raw pictures are developed (Interpret Footage)
+    bool proResRaw_ = false;                  // ProRes RAW: each frame's mosaic developed (media/ProResRaw.h)
     bool loadRaw(const RawImage& img, std::string* error);
 };
 
 struct AudioBuffer {
     int sampleRate = 48000;
-    std::vector<float> samples;  // interleaved stereo
-    int64_t frames() const { return int64_t(samples.size() / 2); }
+    int channels = 2;            // 2, or 4 for an ambisonic field (W, Y, Z, X)
+    std::vector<float> samples;  // interleaved stereo (or `channels`)
+    int64_t frames() const { return int64_t(samples.size() / size_t(std::max(1, channels))); }
 };
 using AudioBufferPtr = std::shared_ptr<const AudioBuffer>;
 
@@ -128,6 +139,11 @@ int openMediaInput(struct AVFormatContext** fmt, const std::string& path);
 // alternately left and right.
 AudioBufferPtr decodeAudio(const std::string& path, int sampleRate, std::string* error = nullptr,
                            const std::atomic<bool>* cancel = nullptr, const std::vector<int>& channels = {});
+
+// The first-order ambisonic field (four channels: W, Y, Z, X in ACN order, SN3D) of the audio stream decodeAudio
+// mixes from; a higher-order file gives its first-order part. Aligned like decodeAudio.
+AudioBufferPtr decodeAmbisonic(const std::string& path, int sampleRate, std::string* error = nullptr,
+                               const std::atomic<bool>* cancel = nullptr);
 
 // Min/max envelope for waveform drawing: one (min, max) pair per bucket.
 struct Peaks {

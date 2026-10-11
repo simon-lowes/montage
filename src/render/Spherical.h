@@ -15,9 +15,12 @@ enum class SphereView { Flat = 0, LittlePlanet = 1, Tunnel = 2 };
 // A view of `equirect` (the whole sphere, premultiplied RGBA, longitude across, latitude down) at w x h: looking
 // `yaw` degrees right of the picture's centre and `pitch` degrees up, turned `roll` degrees clockwise, `fov`
 // degrees across the width. Flat is a rectilinear camera (up to 170°); the little planet looks down at the ground
-// with the sky around it, the tunnel up at the sky (stereographic, up to 330°).
+// with the sky around it, the tunnel up at the sky (stereographic, up to 330°). `span` is the longitude the picture
+// covers: 360 for the whole sphere, 180 for VR180 footage (the half in front; outside it the view is transparent).
 Image reframeEquirect(const Image& equirect, double yaw, double pitch, double roll, double fov, SphereView view, int w,
-                      int h);
+                      int h, double span = 360);
+// The longitude a 360° media item's picture covers ("vr180": 180, else 360).
+double projectionSpan(const std::string& projection);
 
 // Where a direction (degrees right of centre, degrees up) falls in an equirectangular picture of w x h.
 void equirectPoint(double yaw, double pitch, int w, int h, double& x, double& y);

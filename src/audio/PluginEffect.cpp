@@ -22,6 +22,8 @@ std::optional<Effect> makePluginEffect(Project& p, const Descriptor& d, std::str
     e.strings["plugin_vendor"] = d.vendor;
     e.strings["plugin_format"] = formatName(d.format);
     e.strings["state"] = encodeState(inst->saveState());
+    // A key input: the effect then offers a Sidechain track ("sidechain", as the Compressor's).
+    if (inst->hasSidechain()) e.strings["key_input"] = "1";
     for (const plugins::ParamInfo& pi : inst->parameters()) {
         if (!pi.automatable) continue;
         const std::string id = std::to_string(pi.id);

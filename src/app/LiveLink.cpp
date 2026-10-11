@@ -21,6 +21,7 @@
 #include "core/EditOps.h"
 #include "core/History.h"
 #include "core/ProjectIO.h"
+#include "media/Decoder.h"
 
 namespace montage {
 
@@ -352,6 +353,10 @@ void LiveLink::handle(const QByteArray& message, std::function<void(QByteArray)>
         bool isError = false;
         return answer(contextResult(args, isError));
     }
+    if (name == "montage_undo" && targetsOpenProject(args) && state_->readOnly())
+        return answer(toolResult(QStringLiteral("The project is open read-only (%1 is editing it): nothing to undo here")
+                                     .arg(state_->lockHolder().isEmpty() ? QStringLiteral("someone else") : state_->lockHolder()),
+                                 {}, true));
     if (name == "montage_undo" && targetsOpenProject(args)) {
         // Only an agent's own change: the editor's are theirs to undo.
         const QString last = state_->undoText();
@@ -440,7 +445,13 @@ void LiveLink::finish(const Job& job, const QString& tool, const Project& before
     QJsonObject reply = QJsonDocument::fromJson(QByteArray::fromStdString(answer)).object();
     const QString shown = state_->filePath().isEmpty() ? QStringLiteral("the open project") : state_->filePath();
     if (!after.isEmpty() && after != snapshot) {
-        if (!(withoutMarks(state_->project()) == withoutMarks(before))) {
+        if (state_->readOnly()) {
+            // Someone else is editing it: the change is not made here, and the agent is told so.
+            QJsonObject r = toolResult(QStringLiteral("The project is open read-only (%1 is editing it), so %2's change was not applied")
+                                           .arg(state_->lockHolder().isEmpty() ? QStringLiteral("someone else") : state_->lockHolder(), tool),
+                                       {}, true);
+            reply = QJsonObject{{"jsonrpc", "2.0"}, {"id", job.message.value("id")}, {"result", r}};
+        } else if (!(withoutMarks(state_->project()) == withoutMarks(before))) {
             // The editor changed the project while the tool ran: theirs stands.
             QJsonObject r = toolResult(QStringLiteral("The project was changed in Montage while %1 ran, so its result was not applied. Call it again.").arg(tool), {}, true);
             reply = QJsonObject{{"jsonrpc", "2.0"}, {"id", job.message.value("id")}, {"result", r}};
@@ -448,6 +459,7 @@ void LiveLink::finish(const Job& job, const QString& tool, const Project& before
             Project loaded;
             std::string err;
             if (loadProject(path.toStdString(), loaded, &err)) {
+                checkStereoMedia(loaded);
                 // The editor's playhead and marks stay where they are.
                 for (Sequence& s : loaded.sequences)
                     if (const Sequence* now = state_->project().findSequence(s.id)) s.playhead = now->playhead, s.inPoint = now->inPoint, s.outPoint = now->outPoint;

@@ -52,6 +52,7 @@
 #include <QSpinBox>
 #include <QStandardPaths>
 #include <QTimer>
+#include <QSaveFile>
 #include <QSettings>
 #include <QShortcut>
 #include <QStatusBar>
@@ -74,6 +75,8 @@
 #include "core/AudioChannels.h"
 #include "render/ClipPlacement.h"
 #include "core/Chapters.h"
+#include "core/Ale.h"
+#include "core/Cdl.h"
 #include "core/ChapterSuggest.h"
 #include "core/MarkerList.h"
 #include "render/AudioReactive.h"
@@ -94,7 +97,11 @@
 #include "ScriptCutDialog.h"
 #include "QualityCheckDialog.h"
 #include "OffloadDialog.h"
+#include "ProductionPanel.h"
 #include "core/AafImport.h"
+#include "core/Production.h"
+#include "core/ProjectLock.h"
+#include "core/ProjectIO.h"
 #include "ProjectManagerDialog.h"
 #include "LinkMediaDialog.h"
 #include "EffectPresetStore.h"
@@ -104,6 +111,8 @@
 #include "RenderQueue.h"
 #include "RenderQueuePanel.h"
 #include "MixerPanel.h"
+#include "ControlSurface.h"
+#include "control/Midi.h"
 #include "MulticamPanel.h"
 #include "AdrPanel.h"
 #include "AudioDescriptionDialog.h"
@@ -111,6 +120,7 @@
 #include "MaskOverlay.h"
 #include "TransformOverlay.h"
 #include "SequenceIndexPanel.h"
+#include "PanFollowDialog.h"
 #include "RedactFacesDialog.h"
 #include "SpectralRepairDialog.h"
 #include "ShotSearchPanel.h"
@@ -119,6 +129,7 @@
 #include "PeoplePanel.h"
 #include "SpeechDialog.h"
 #include "TranscriptPanel.h"
+#include "HdrSurface.h"
 #include "MonitorPanel.h"
 #include "PlaybackController.h"
 #include "PluginManagerDialog.h"
@@ -142,6 +153,7 @@
 #include "render/Shorts.h"
 #include "render/Letterbox.h"
 #include "render/LightLevel.h"
+#include "render/Hdr10Plus.h"
 #include "render/Versions.h"
 #include "media/MicBleed.h"
 #include "render/MusicEdit.h"
@@ -164,6 +176,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     buildPanels();
     buildActions();
     buildMenus();
+    applyHdrViewer();
     keymap::load(this);
 
     // Crash safety: find sessions that did not exit cleanly before starting ours.
@@ -372,6 +385,26 @@ void MainWindow::buildPanels() {
         inspectorDock_->show();
         inspectorDock_->raise();
     });
+    // A hardware control surface (Mackie Control) works the mixer and transport.
+    surface_ = new ControlSurface(state_, mixer_, program_, this);
+    connect(program_, &PlaybackController::audioLevels, surface_, &ControlSurface::setLevels);
+    surface_->setCommand(QStringLiteral("marker"), [this] { addMarker(); });
+    surface_->setCommand(QStringLiteral("save"), [this] { save(); });
+    surface_->setCommand(QStringLiteral("record"), [this] {
+        if (QAction* a = findChild<QAction*>(QStringLiteral("recordVoiceover"))) a->trigger();
+    });
+    surface_->setCommand(QStringLiteral("previousEdit"), [this] {
+        if (const Sequence* s = state_->sequence()) program_->seek(edit::prevEdit(*s, state_->playhead()));
+    });
+    surface_->setCommand(QStringLiteral("nextEdit"), [this] {
+        if (const Sequence* s = state_->sequence()) program_->seek(edit::nextEdit(*s, state_->playhead()));
+    });
+    if (appSettings().value(QStringLiteral("controlSurface/connect"), false).toBool()) {
+        // Reconnected at start-up, quietly: the surface may simply be unplugged today.
+        const std::string in = appSettings().value(QStringLiteral("controlSurface/input")).toString().toStdString();
+        const std::string out = appSettings().value(QStringLiteral("controlSurface/output")).toString().toStdString();
+        if (!in.empty() || !out.empty()) surface_->connectPorts(in, out);
+    }
     captions_ = new CaptionsPanel(state_, this);
     transcript_ = new TranscriptPanel(state_, this);
     connect(transcript_, &TranscriptPanel::sourceSeekRequested, this, [this](FrameTime f) {
@@ -423,6 +456,20 @@ void MainWindow::buildPanels() {
     keyframesDock_ = makeDock(tr("Keyframes"), "keyframes", new KeyframePanel(state_, this));
     queue_ = new RenderQueue(this);
     queueDock_ = makeDock(tr("Render Queue"), "renderqueue", new RenderQueuePanel(queue_, this));
+    production_ = new ProductionPanel(state_, this);
+    productionDock_ = makeDock(tr("Production"), "production", production_);
+    connect(production_, &ProductionPanel::openRequested, this, [this](const QString& path, bool readOnly) {
+        const bool here = !state_->filePath().isEmpty() && QFileInfo(path).absoluteFilePath() == QFileInfo(state_->filePath()).absoluteFilePath();
+        if (here && !readOnly && state_->readOnly()) {
+            takeEditInteractive();
+            return;
+        }
+        if (here && readOnly == state_->readOnly()) return;
+        if (!maybeSave()) return;
+        openProjectAs(path, readOnly ? OpenMode::ReadOnly : OpenMode::Ask);
+    });
+    connect(production_, &ProductionPanel::newProjectRequested, this, &MainWindow::newProjectInProduction);
+    connect(production_, &ProductionPanel::importRequested, this, [this](const QString& path) { importFromProjectDialog(path); });
     connect(queue_, &RenderQueue::jobFinished, this, [this](int id, bool ok) {
         const RenderQueue::Job* j = queue_->job(id);
         if (!j) return;
@@ -664,6 +711,22 @@ void MainWindow::restoreLayout() {
 
 void MainWindow::buildActions() {}
 
+void MainWindow::applyHdrViewer() {
+    const bool on = hdrViewer_ && hdrViewer_->isChecked();
+    for (MonitorPanel* m : {sourcePanel_, programPanel_}) {
+        if (!m) continue;
+        m->setHdrViewer(on);
+        if (hdrWired_) continue;
+        // Asked for and not possible here (an SDR display, no GPU device): said once, in the status bar.
+        connect(m->viewer(), &ViewerWidget::hdrChanged, this, [this, m] {
+            if (hdrMessageShown_ || !m->viewer()->hdrViewer() || m->viewer()->hdrStatus().isEmpty()) return;
+            hdrMessageShown_ = true;
+            state_->message(tr("HDR Viewer: %1; HDR is shown tone mapped to SDR").arg(m->viewer()->hdrStatus()), 6000);
+        });
+    }
+    hdrWired_ = true;
+}
+
 void MainWindow::buildMenus() {
     auto add = [this](QMenu* menu, const QString& text, const QKeySequence& key, auto fn) {
         QAction* a = menu->addAction(text);
@@ -709,6 +772,34 @@ void MainWindow::buildMenus() {
         ProjectManagerDialog dlg(state_, this);
         if (dlg.exec() == QDialog::Accepted) runProjectManager(dlg.options());
     })->setObjectName(QStringLiteral("projectManager"));
+    {
+        QMenu* prod = file->addMenu(tr("Productio&n"));
+        add(prod, tr("&New Production…"), QKeySequence(), [this] {
+            const QString folder = QFileDialog::getExistingDirectory(this, tr("New Production: Choose or Make Its Folder (on the Shared Drive)"),
+                                                                     appSettings().value("lastProjectDir").toString());
+            if (folder.isEmpty()) return;
+            bool ok = false;
+            const QString name = QInputDialog::getText(this, tr("New Production"), tr("Name:"), QLineEdit::Normal, QDir(folder).dirName(), &ok);
+            if (ok) openProduction(folder, true, name);
+        })->setObjectName(QStringLiteral("newProduction"));
+        add(prod, tr("&Open Production…"), QKeySequence(), [this] {
+            const QString folder = QFileDialog::getExistingDirectory(this, tr("Open Production"), appSettings().value("lastProjectDir").toString());
+            if (folder.isEmpty()) return;
+            if (!isProduction(folder.toStdString()) &&
+                QMessageBox::question(this, tr("Open Production"), tr("%1 is not a production yet. Make it one?").arg(QDir::toNativeSeparators(folder))) !=
+                    QMessageBox::Yes)
+                return;
+            openProduction(folder, true);
+        })->setObjectName(QStringLiteral("openProduction"));
+        add(prod, tr("&Import from Project…"), QKeySequence(), [this] { importFromProjectDialog(); })->setObjectName(QStringLiteral("importFromProject"));
+        takeEdit_ = add(file, tr("&Edit Project (Take the Lock)"), QKeySequence(), [this] { takeEditInteractive(); });
+        takeEdit_->setObjectName(QStringLiteral("takeEdit"));
+        takeEdit_->setEnabled(false);
+        connect(state_, &EditorState::lockStateChanged, this, [this] {
+            updateTitle();
+            takeEdit_->setEnabled(state_->canTakeEdit());
+        });
+    }
     add(file, tr("&Offload Card…"), QKeySequence(), [this] {
         OffloadDialog dlg(state_, this);
         dlg.exec();
@@ -730,12 +821,22 @@ void MainWindow::buildMenus() {
     add(file, tr("Export &Frame…"), QKeySequence("Ctrl+Shift+E"), [this] { exportFrame(); });
     add(file, tr("Export &VFX Pulls…"), QKeySequence(), [this] { vfxPullDialog(); })->setObjectName(QStringLiteral("vfxPulls"));
     add(file, tr("&Import Timeline (FCP XML, FCPXML, OTIO, EDL, AAF)…"), QKeySequence(), [this] { importTimeline(); });
+    add(file, tr("Import A&LE (Avid Log Exchange)…"), QKeySequence(), [this] {
+        const QString path = QFileDialog::getOpenFileName(this, tr("Import ALE"), QString(), tr("Avid Log Exchange (*.ale *.ALE);;All files (*)"));
+        if (!path.isEmpty()) importAle(path);
+    })->setObjectName(QStringLiteral("importAle"));
+    add(file, tr("Export ALE…"), QKeySequence(), [this] {
+        const QString path = QFileDialog::getSaveFileName(this, tr("Export ALE"), QString(), tr("Avid Log Exchange (*.ale)"));
+        if (!path.isEmpty()) exportAle(path.endsWith(QLatin1String(".ale"), Qt::CaseInsensitive) ? path : path + QStringLiteral(".ale"));
+    })->setObjectName(QStringLiteral("exportAle"));
     add(file, tr("Export Final Cut Pro &7 XML (Premiere, Resolve)…"), QKeySequence(), [this] { exportInterchange(Interchange::Fcp7Xml); });
     add(file, tr("Export &FCPXML (Final Cut Pro)…"), QKeySequence(), [this] { exportInterchange(Interchange::FcpXml); });
     add(file, tr("Export E&DL (CMX 3600)…"), QKeySequence(), [this] { exportInterchange(Interchange::Edl); });
     add(file, tr("Export &OpenTimelineIO…"), QKeySequence(), [this] { exportInterchange(Interchange::Otio); });
     add(file, tr("Export &AAF (Pro Tools, Fairlight, Media Composer)…"), QKeySequence(), [this] { exportAafDialog(); })
         ->setObjectName(QStringLiteral("exportAaf"));
+    add(file, tr("Export AAF, Sound Only (Pro Tools, Fairlight)…"), QKeySequence(), [this] { exportAafDialog(false); })
+        ->setObjectName(QStringLiteral("exportAafSound"));
     file->addSeparator();
     add(file, tr("&Quit"), QKeySequence::Quit, [this] { close(); });
 
@@ -821,6 +922,8 @@ void MainWindow::buildMenus() {
             emit state_->projectChanged();
         });
     }
+    editM->addSeparator();
+    add(editM, tr("Control &Surface…"), QKeySequence(), [this] { controlSurfaceDialog(); })->setObjectName(QStringLiteral("controlSurface"));
 
     // ---- Clip
     QMenu* clipM = menuBar()->addMenu(tr("&Clip"));
@@ -848,6 +951,19 @@ void MainWindow::buildMenus() {
         const QString path = QFileDialog::getSaveFileName(this, tr("Export LUT"), QString(), tr("LUT files (*.cube)"));
         if (!path.isEmpty()) exportClipLut(path.endsWith(QLatin1String(".cube"), Qt::CaseInsensitive) ? path : path + QStringLiteral(".cube"));
     })->setObjectName(QStringLiteral("exportLut"));
+    add(clipM, tr("Import CDL…"), QKeySequence(), [this] {
+        const QString path = QFileDialog::getOpenFileName(this, tr("Import CDL"), QString(), tr("ASC CDL (*.cdl *.cc *.ccc);;All files (*)"));
+        if (!path.isEmpty()) importCdl(path);
+    })->setObjectName(QStringLiteral("importCdl"));
+    add(clipM, tr("Export CDL…"), QKeySequence(), [this] {
+        QString filter;
+        const QString path = QFileDialog::getSaveFileName(this, tr("Export CDL"), QString(),
+                                                          tr("Color Decision List (*.cdl);;Color Correction (*.cc);;Color Correction Collection (*.ccc)"), &filter);
+        if (path.isEmpty()) return;
+        const QString ext = QFileInfo(path).suffix().toLower();
+        const QString want = filter.contains("*.ccc") ? "ccc" : filter.contains("*.cc") ? "cc" : "cdl";
+        exportCdl(ext == "cdl" || ext == "cc" || ext == "ccc" ? path : path + "." + want);
+    })->setObjectName(QStringLiteral("exportCdl"));
     add(clipM, tr("Find Similar S&hots"), QKeySequence(), [this] { findSimilarShots(); })->setObjectName(QStringLiteral("findSimilarShots"));
     add(clipM, tr("Checkerboard Dialogue by Speaker"), QKeySequence(), withSeq([this] {
             // The selected audio clips, each split where the speaker changes, a track per person.
@@ -892,6 +1008,7 @@ void MainWindow::buildMenus() {
         }))->setObjectName(QStringLiteral("autoDuck"));
     add(clipM, tr("Remove Mic &Bleed…"), QKeySequence(), withSeq([this] { micBleedDialog(); }))->setObjectName(QStringLiteral("removeMicBleed"));
     add(clipM, tr("S&pectral Repair…"), QKeySequence(), withSeq([this] { spectralRepairDialog(); }))->setObjectName(QStringLiteral("spectralRepair"));
+    add(clipM, tr("Pan to &Follow…"), QKeySequence(), withSeq([this] { panFollowDialog(); }))->setObjectName(QStringLiteral("panFollow"));
     add(clipM, tr("Redact &Faces…"), QKeySequence(), withSeq([this] { redactFacesDialog(); }))->setObjectName(QStringLiteral("redactFaces"));
     add(clipM, tr("Remove Letterbo&x"), QKeySequence(), withSeq([this] { removeLetterbox(); }))->setObjectName(QStringLiteral("removeLetterbox"));
     // Colour groups: grade shots together, before and after each clip's own grade (core/ColorGroups.h).
@@ -1473,6 +1590,19 @@ void MainWindow::buildMenus() {
     trimView_->setCheckable(true);
     trimView_->setChecked(appSettings().value("playback/twoUpTrim", true).toBool());
     trimView_->setToolTip(tr("While trimming, rolling, slipping or sliding, show the frames either side of the edit side by side"));
+    // HDR sequences as HDR on an HDR or EDR display (app/HdrSurface.h); elsewhere, and in builds without it, tone mapped.
+    hdrViewer_ = add(play, tr("HDR Viewer"), QKeySequence(), [this](bool on) {
+        appSettings().setValue("playback/hdrViewer", on);
+        hdrMessageShown_ = false;
+        applyHdrViewer();
+    });
+    hdrViewer_->setObjectName(QStringLiteral("hdrViewer"));
+    hdrViewer_->setCheckable(true);
+    hdrViewer_->setEnabled(hdrViewerBuilt());
+    hdrViewer_->setChecked(hdrViewerBuilt() && appSettings().value("playback/hdrViewer", true).toBool());
+    hdrViewer_->setToolTip(hdrViewerBuilt() ? tr("Show HDR sequences as HDR on an HDR display (macOS EDR, Windows with HDR switched on) "
+                                                 "instead of tone mapped to SDR")
+                                            : tr("This build has no HDR viewer (it needs Qt 6.7 or later)"));
     // Video output: the Program picture alone, full screen here or on another display.
     QAction* fullScreen = add(play, tr("Full Screen Program"), QKeySequence("Ctrl+Shift+F"), [this] {
         if (cleanFeed_ && cleanFeed_->isVisible()) hideCleanFeed();
@@ -1496,6 +1626,53 @@ void MainWindow::buildMenus() {
             a->setChecked(cleanFeed_ && cleanFeed_->isVisible() && cleanFeed_->screen() == screens[i]);
         }
     });
+    // How ambisonic sound (core/Ambisonics.h) is heard: binaurally on headphones, or as stereo on speakers.
+    {
+        QMenu* ambiM = play->addMenu(tr("Ambisonic Monitoring"));
+        ambiM->setObjectName(QStringLiteral("ambisonicMonitorMenu"));
+        auto* group = new QActionGroup(ambiM);
+        const bool binaural = appSettings().value("playback/ambisonicBinaural", true).toBool();
+        program_->setAmbisonicBinaural(binaural);
+        for (const bool b : {true, false}) {
+            QAction* a = ambiM->addAction(b ? tr("Binaural (Headphones)") : tr("Stereo (Speakers)"), this, [this, b] {
+                program_->setAmbisonicBinaural(b);
+                appSettings().setValue("playback/ambisonicBinaural", b);
+            });
+            a->setObjectName(b ? QStringLiteral("ambisonicBinaural") : QStringLiteral("ambisonicStereo"));
+            a->setCheckable(true);
+            a->setChecked(b == binaural);
+            group->addAction(a);
+        }
+    }
+    // How the Program monitor shows a stereo 3D sequence's two eyes (render/Stereo.h).
+    QMenu* stereoM = play->addMenu(tr("Stereo 3D View"));
+    stereoM->setObjectName(QStringLiteral("stereoViewMenu"));
+    stereoM->setToolTip(tr("For stereoscopic 3D sequences: one eye, red-cyan anaglyph, both eyes, or where they differ"));
+    {
+        auto* group = new QActionGroup(stereoM);
+        const QString saved = appSettings().value("playback/stereoView", "left").toString();
+        StereoView initial = StereoView::Left;
+        stereoViewFromName(saved.toStdString(), initial);
+        program_->setStereoView(initial);
+        const std::pair<StereoView, QString> views[] = {
+            {StereoView::Left, tr("Left Eye")},
+            {StereoView::Right, tr("Right Eye")},
+            {StereoView::Anaglyph, tr("Anaglyph (Red-Cyan)")},
+            {StereoView::SideBySideHalf, tr("Side by Side")},
+            {StereoView::TopBottomHalf, tr("Top and Bottom")},
+            {StereoView::Difference, tr("Difference")},
+        };
+        for (const auto& [view, label] : views) {
+            QAction* a = stereoM->addAction(label, this, [this, view = view] {
+                program_->setStereoView(view);
+                appSettings().setValue("playback/stereoView", QString::fromStdString(stereoViewName(view)));
+            });
+            a->setObjectName(QStringLiteral("stereoView_") + QString::fromStdString(stereoViewName(view)));
+            a->setCheckable(true);
+            a->setChecked(view == initial);
+            group->addAction(a);
+        }
+    }
     play->addSeparator();
     add(play, tr("&Play / Pause"), QKeySequence(Qt::Key_Space), [this] { activeController()->togglePlay(); });
     // In Trim mode J, K and L trim the selected edit as it plays (dynamic trimming).
@@ -1653,6 +1830,8 @@ void MainWindow::updateActions() {
 
 void MainWindow::updateTitle() {
     QString name = state_->filePath().isEmpty() ? tr("Untitled") : QFileInfo(state_->filePath()).completeBaseName();
+    if (state_->readOnly())
+        name += state_->lockHolder().isEmpty() ? tr(" (Read-Only)") : tr(" (Read-Only: %1 is editing)").arg(state_->lockHolder());
     setWindowTitle(QString("%1[*] — Montage").arg(name));
     setWindowModified(state_->isModified());
 }
@@ -1728,6 +1907,17 @@ Id MainWindow::makeSubclip() {
 
 bool MainWindow::maybeSave() {
     if (!state_->isModified()) return true;
+    if (state_->readOnly()) {
+        // Changes made before someone else took the project over: only a copy can keep them.
+        const auto r = QMessageBox::warning(
+            this, tr("Montage"),
+            tr("Your changes to this project are not saved, and %1 is editing it now. Save them as a copy?")
+                .arg(state_->lockHolder().isEmpty() ? tr("someone else") : state_->lockHolder()),
+            QMessageBox::Save | QMessageBox::Discard | QMessageBox::Cancel);
+        if (r == QMessageBox::Cancel) return false;
+        if (r == QMessageBox::Save) return saveAs();
+        return true;
+    }
     auto r = QMessageBox::warning(this, tr("Montage"), tr("The project has unsaved changes. Save them?"),
                                   QMessageBox::Save | QMessageBox::Discard | QMessageBox::Cancel);
     if (r == QMessageBox::Cancel) return false;
@@ -1749,10 +1939,43 @@ void MainWindow::openDialog() {
     if (!path.isEmpty()) openProject(path);
 }
 
-bool MainWindow::openProject(const QString& path) {
+bool MainWindow::openProject(const QString& path) { return openProjectAs(path, OpenMode::Ask); }
+
+bool MainWindow::openProjectAs(const QString& path, OpenMode mode) {
     QString err;
     program_->pause();
-    if (!state_->open(path, &err)) {
+    EditorState::Access access = mode == OpenMode::ReadOnly ? EditorState::Access::ReadOnly
+                                 : mode == OpenMode::Edit   ? EditorState::Access::Edit
+                                                            : EditorState::Access::Auto;
+    if (mode == OpenMode::Ask) {
+        const LockStatus st = projectLockStatus(path.toStdString());
+        const QString who = QString::fromStdString(st.owner.describe()), file = QFileInfo(path).completeBaseName();
+        const QString since = st.owner.since.isValid() ? QLocale().toString(st.owner.since.toLocalTime(), QLocale::ShortFormat) : tr("a while");
+        if (st.state == LockState::Theirs) {
+            QMessageBox box(QMessageBox::Information, tr("Project in Use"),
+                            tr("%1 is editing “%2” (since %3).\n\nOpen it read-only? You can watch, play and export it; it follows their saves, "
+                               "and once they close it File › Edit Project lets you edit it.")
+                                .arg(who, file, since),
+                            QMessageBox::Cancel, this);
+            QPushButton* ro = box.addButton(tr("Open Read-Only"), QMessageBox::AcceptRole);
+            box.exec();
+            if (box.clickedButton() != ro) return false;
+            access = EditorState::Access::ReadOnly;
+        } else if (st.state == LockState::Stale) {
+            QMessageBox box(QMessageBox::Question, tr("Project Left Open"),
+                            tr("“%2” was left open by %1, who has not been heard from since %3 (Montage closed unexpectedly, or the "
+                               "computer went to sleep).\n\nTake it over and edit it?")
+                                .arg(who, file, st.owner.heartbeat.isValid() ? QLocale().toString(st.owner.heartbeat.toLocalTime(), QLocale::ShortFormat) : since),
+                            QMessageBox::Cancel, this);
+            QPushButton* take = box.addButton(tr("Take Over"), QMessageBox::AcceptRole);
+            QPushButton* ro = box.addButton(tr("Open Read-Only"), QMessageBox::ActionRole);
+            box.exec();
+            if (box.clickedButton() == take) access = EditorState::Access::Edit;
+            else if (box.clickedButton() == ro) access = EditorState::Access::ReadOnly;
+            else return false;
+        }
+    }
+    if (!state_->open(path, &err, access)) {
         QMessageBox::warning(this, tr("Open Project"), err);
         return false;
     }
@@ -1805,6 +2028,128 @@ bool MainWindow::saveAs() {
     addRecent(path);
     s.setValue("lastProjectDir", QFileInfo(path).absolutePath());
     return true;
+}
+
+bool MainWindow::takeEditInteractive() {
+    bool discard = false;
+    if (state_->isModified()) {
+        if (QMessageBox::question(this, tr("Edit Project"),
+                                  tr("Your changes here are not saved. Discard them and edit the project as it was last saved? (Save As keeps "
+                                     "them as a copy instead.)")) != QMessageBox::Yes)
+            return false;
+        discard = true;
+    }
+    QString err;
+    if (!state_->takeEdit(&err, discard)) {
+        if (!err.isEmpty()) QMessageBox::information(this, tr("Edit Project"), err);
+        return false;
+    }
+    return true;
+}
+
+bool MainWindow::openProduction(const QString& folder, bool create, const QString& name) {
+    if (!isProduction(folder.toStdString())) {
+        std::string err;
+        if (!create || !createProduction(folder.toStdString(), name.toStdString(), &err)) {
+            if (!err.empty()) QMessageBox::warning(this, tr("Production"), QString::fromStdString(err));
+            return false;
+        }
+    }
+    appSettings().setValue("lastProductionDir", QDir(folder).absolutePath());
+    production_->setFolder(folder);
+    productionDock_->show();
+    productionDock_->raise();
+    return true;
+}
+
+void MainWindow::newProjectInProduction(const QString& folder) {
+    bool ok = false;
+    const QString name = QInputDialog::getText(this, tr("New Project in Production"), tr("Name:"), QLineEdit::Normal, tr("Reel 1"), &ok).trimmed();
+    if (!ok || name.isEmpty()) return;
+    const QString path = QDir(folder).filePath(name + ".montage");
+    if (QFileInfo::exists(path)) {
+        QMessageBox::warning(this, tr("New Project"), tr("%1 already exists").arg(QDir::toNativeSeparators(path)));
+        return;
+    }
+    if (!maybeSave()) return;
+    program_->pause();
+    state_->newProject();
+    QString err;
+    if (!state_->save(path, &err)) {
+        QMessageBox::warning(this, tr("New Project"), err);
+        return;
+    }
+    addRecent(path);
+    production_->refresh();
+}
+
+std::vector<Id> MainWindow::importSequencesFrom(const QString& project, const QStringList& names, QString* error) {
+    Project from;
+    std::string err;
+    if (!loadProject(project.toStdString(), from, &err)) {
+        if (error) *error = QString::fromStdString(err);
+        return {};
+    }
+    checkStereoMedia(from);
+    std::vector<Id> wanted;
+    for (const Sequence& s : from.sequences)
+        if (names.isEmpty() || names.contains(QString::fromStdString(s.name))) wanted.push_back(s.id);
+    if (wanted.empty()) {
+        if (error) *error = tr("No such sequence in %1").arg(QFileInfo(project).fileName());
+        return {};
+    }
+    std::vector<Id> made;
+    state_->edit(tr("Import from Project"), [&](Project& p, Sequence&) {
+        made = importFromProject(p, from, wanted);
+        return !made.empty();
+    });
+    if (made.empty()) {
+        if (error && error->isEmpty()) *error = state_->readOnly() ? tr("This project is read-only") : tr("Nothing was imported");
+        return {};
+    }
+    state_->setActiveSequence(made.front());
+    statusBar()->showMessage(tr("Imported %n sequence(s) from %1", "", int(made.size())).arg(QFileInfo(project).completeBaseName()), 5000);
+    return made;
+}
+
+void MainWindow::importFromProjectDialog(QString project) {
+    if (project.isEmpty())
+        project = QFileDialog::getOpenFileName(this, tr("Import from Project"), appSettings().value("lastProjectDir").toString(),
+                                               tr("Montage projects (*.montage)"));
+    if (project.isEmpty()) return;
+    Project from;
+    std::string err;
+    if (!loadProject(project.toStdString(), from, &err)) {
+        QMessageBox::warning(this, tr("Import from Project"), QString::fromStdString(err));
+        return;
+    }
+    checkStereoMedia(from);
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Import from %1").arg(QFileInfo(project).completeBaseName()));
+    auto* v = new QVBoxLayout(&dlg);
+    v->addWidget(new QLabel(tr("Sequences to bring in (with the sequences they nest and their media, linked where it is):"), &dlg));
+    auto* list = new QListWidget(&dlg);
+    list->setObjectName(QStringLiteral("importSequences"));
+    for (const Sequence& s : from.sequences) {
+        auto* item = new QListWidgetItem(QStringLiteral("%1  (%2)").arg(QString::fromStdString(s.name),
+                                                                         QString::fromStdString(formatTimecode(s.duration(), s.fps))),
+                                         list);
+        item->setData(Qt::UserRole, QString::fromStdString(s.name));
+        item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
+        item->setCheckState(Qt::Unchecked);
+    }
+    v->addWidget(list);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    v->addWidget(buttons);
+    if (dlg.exec() != QDialog::Accepted) return;
+    QStringList names;
+    for (int i = 0; i < list->count(); ++i)
+        if (list->item(i)->checkState() == Qt::Checked) names << list->item(i)->data(Qt::UserRole).toString();
+    if (names.isEmpty()) return;
+    QString error;
+    if (importSequencesFrom(project, names, &error).empty()) QMessageBox::warning(this, tr("Import from Project"), error);
 }
 
 void MainWindow::addRecent(const QString& path) {
@@ -1872,6 +2217,7 @@ void MainWindow::closeEvent(QCloseEvent* e) {
     if (backgroundCancel_) *backgroundCancel_ = true;  // a background render stops at its next frame
     program_->pause();
     source_->pause();
+    surface_->disconnectSurface();  // faders down, lights off and displays blank, not left showing a closed project
     recovery_->endSession();  // a clean exit: nothing to recover next time
     QSettings s = appSettings();
     s.setValue("window/geometry", saveGeometry());
@@ -2782,6 +3128,134 @@ int MainWindow::importMarkers(const QString& path) {
     });
     statusBar()->showMessage(tr("Imported %n marker(s)", nullptr, int(markers.size())), 6000);
     return int(markers.size());
+}
+
+int MainWindow::importAle(const QString& path, bool cdlToClips) {
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly)) {
+        state_->message(tr("Cannot read %1").arg(path), 6000);
+        return -1;
+    }
+    AleTable table;
+    std::string err;
+    if (!parseAle(f.readAll().toStdString(), table, &err)) {
+        state_->message(QString::fromStdString(err), 6000);
+        return -1;
+    }
+    AleImport result;
+    state_->edit(tr("Import ALE"), [&](Project& p, Sequence&) {
+        result = applyAle(p, table, cdlToClips);
+        return !result.matched.empty();
+    });
+    QString msg = tr("ALE: %1 of %2 rows matched media").arg(result.matched.size()).arg(result.rows);
+    if (result.cdls) msg += tr(", %n CDL(s)", nullptr, result.cdls);
+    if (result.clips) msg += tr(", %n clip(s) graded", nullptr, result.clips);
+    if (!result.unmatched.empty()) msg += tr("; not found: %1").arg(QString::fromStdString(result.unmatched.front())) + (result.unmatched.size() > 1 ? tr(" and %n more", nullptr, int(result.unmatched.size() - 1)) : QString());
+    state_->message(msg, 8000);
+    return int(result.matched.size());
+}
+
+bool MainWindow::exportAle(const QString& path) {
+    std::vector<Id> ids = bin_->selectedMedia();
+    if (ids.empty())
+        for (const MediaItem& m : state_->project().media) ids.push_back(m.id);
+    const Sequence* s = state_->sequence();
+    const AleTable table = aleFromMedia(state_->project(), ids, s ? s->fps : Rational{24, 1});
+    if (table.rows.empty()) {
+        state_->message(tr("No media to log: stills and sequences are left out of an ALE"), 6000);
+        return false;
+    }
+    QSaveFile f(path);
+    const std::string text = writeAle(table);
+    if (!f.open(QIODevice::WriteOnly) || f.write(text.data(), qint64(text.size())) != qint64(text.size()) || !f.commit()) {
+        state_->message(tr("Cannot write %1").arg(path), 6000);
+        return false;
+    }
+    state_->message(tr("Wrote %n media item(s) to %1", nullptr, int(table.rows.size())).arg(QFileInfo(path).fileName()), 6000);
+    return true;
+}
+
+int MainWindow::importCdl(const QString& path) {
+    const Sequence* s = state_->sequence();
+    QFile f(path);
+    if (!s || !f.open(QIODevice::ReadOnly)) {
+        state_->message(tr("Cannot read %1").arg(path), 6000);
+        return 0;
+    }
+    std::string err;
+    const std::vector<Cdl> cdls = parseCdlXml(f.readAll().toStdString(), &err);
+    if (cdls.empty()) {
+        state_->message(QString::fromStdString(err), 6000);
+        return 0;
+    }
+    std::vector<Id> clips;
+    for (Id id : state_->selectedClips())
+        if (auto loc = edit::locate(*s, id); loc && loc->track.kind == TrackKind::Video) clips.push_back(id);
+    if (clips.empty()) {
+        state_->message(tr("Select the video clips to grade with the CDL"), 6000);
+        return 0;
+    }
+    int graded = 0;
+    state_->edit(tr("Import CDL"), [&](Project& p, Sequence& sq) {
+        for (Id id : clips) {
+            Clip* c = edit::clipById(sq, id);
+            if (!c || c->isGenerator()) continue;
+            const Cdl* use = cdls.size() == 1 ? &cdls.front() : nullptr;
+            if (!use) {
+                // A collection: the correction named after this clip, its file or its tape.
+                std::vector<std::string> names{c->name};
+                if (const MediaItem* m = p.findMedia(c->mediaId)) {
+                    names.push_back(m->name);
+                    if (!m->path.empty()) names.push_back(QFileInfo(QString::fromStdString(uninterpretedPath(m->path))).fileName().toStdString());
+                    if (auto tape = m->metadata.find("tape"); tape != m->metadata.end()) names.push_back(tape->second);
+                }
+                use = matchCdl(cdls, names);
+            }
+            if (!use) continue;
+            setClipCdl(p, *c, *use);
+            ++graded;
+        }
+        return graded > 0;
+    });
+    QString msg = graded ? tr("Graded %n clip(s) with the CDL", nullptr, graded) : tr("No correction in the file matched the selected clips");
+    if (!err.empty()) msg += tr(" (%1)").arg(QString::fromStdString(err));  // corrections left out
+    state_->message(msg, 8000);
+    return graded;
+}
+
+bool MainWindow::exportCdl(const QString& path) {
+    const Sequence* s = state_->sequence();
+    if (!s) return false;
+    std::vector<const Clip*> clips;
+    for (Id id : state_->selectedClips())
+        if (const Clip* c = edit::clipById(*s, id)) clips.push_back(c);
+    if (clips.empty())
+        for (const Track& t : s->videoTracks)
+            for (const Clip& c : t.clips) clips.push_back(&c);
+    std::vector<Cdl> cdls;
+    for (const Clip* c : clips) {
+        Cdl cdl;
+        if (!clipCdl(*c, 0, cdl)) continue;
+        if (cdl.id.empty()) cdl.id = c->name;
+        cdls.push_back(cdl);
+    }
+    if (cdls.empty()) {
+        state_->message(tr("No clip here has an ASC CDL"), 6000);
+        return false;
+    }
+    const CdlFormat format = cdlFormatFor(path.toStdString());
+    if (format == CdlFormat::Cc && cdls.size() > 1) {
+        state_->message(tr("A .cc file holds one correction: select one clip, or export a .ccc or .cdl"), 6000);
+        return false;
+    }
+    QSaveFile f(path);
+    const std::string xml = writeCdlXml(cdls, format);
+    if (!f.open(QIODevice::WriteOnly) || f.write(xml.data(), qint64(xml.size())) != qint64(xml.size()) || !f.commit()) {
+        state_->message(tr("Cannot write %1").arg(path), 6000);
+        return false;
+    }
+    state_->message(tr("Wrote %n CDL(s) to %1", nullptr, int(cdls.size())).arg(QFileInfo(path).fileName()), 6000);
+    return true;
 }
 
 int MainWindow::suggestChapterMarkers(double minSeconds, bool ask) {
@@ -3937,6 +4411,18 @@ RedactFacesDialog* MainWindow::redactFacesDialog() {
     return dlg;
 }
 
+PanFollowDialog* MainWindow::panFollowDialog() {
+    const Clip* c = musicClip();
+    if (!c || !c->mediaId) {
+        state_->message(tr("Select the audio clip whose panning should follow the picture"));
+        return nullptr;
+    }
+    auto* dlg = new PanFollowDialog(state_, c->id, this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    dlg->show();
+    return dlg;
+}
+
 SpectralRepairDialog* MainWindow::spectralRepairDialog() {
     const Clip* c = musicClip();
     if (!c || !c->mediaId) {
@@ -4740,6 +5226,83 @@ void MainWindow::exportDcpDialog() {
     exportDcpTo(folder->text(), st);
 }
 
+QDialog* MainWindow::controlSurfaceDialog() {
+    // One dialog: the surface's MIDI ports, connected now and (optionally) at every start.
+    if (auto* open = findChild<QDialog*>(QStringLiteral("controlSurfaceDialog"))) {
+        open->raise();
+        open->activateWindow();
+        return open;
+    }
+    auto* dlg = new QDialog(this);
+    dlg->setObjectName(QStringLiteral("controlSurfaceDialog"));
+    dlg->setWindowTitle(tr("Control Surface"));
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    auto* form = new QFormLayout(dlg);
+    auto* intro = new QLabel(tr("A surface in Mackie Control mode (Mackie MCU, Behringer X-Touch, iCON, PreSonus FaderPort, SSL UF8...): "
+                                "faders, pans, mutes and solos for eight audio tracks at a time, the master fader, the transport and "
+                                "the jog wheel, with names, levels and timecode on its displays."),
+                             dlg);
+    intro->setWordWrap(true);
+    form->addRow(intro);
+    auto* input = new QComboBox(dlg);
+    input->setObjectName(QStringLiteral("surfaceInput"));
+    auto* output = new QComboBox(dlg);
+    output->setObjectName(QStringLiteral("surfaceOutput"));
+    const QString savedIn = appSettings().value(QStringLiteral("controlSurface/input")).toString();
+    const QString savedOut = appSettings().value(QStringLiteral("controlSurface/output")).toString();
+    auto fill = [&](QComboBox* box, const std::vector<MidiPortInfo>& ports, const QString& saved) {
+        box->addItem(tr("None"), QString());
+        for (const MidiPortInfo& p : ports) box->addItem(QString::fromStdString(p.name), QString::fromStdString(p.id));
+        const int at = box->findData(saved);
+        box->setCurrentIndex(at >= 0 ? at : std::min(1, box->count() - 1));
+    };
+    fill(input, midiInputs(), savedIn);
+    fill(output, midiOutputs(), savedOut);
+    if (savedOut.isEmpty() && input->currentIndex() > 0) {
+        // Nothing chosen before: the output named like the input (a surface's two ports share its name).
+        const int at = output->findText(input->currentText());
+        if (at >= 0) output->setCurrentIndex(at);
+    }
+    form->addRow(tr("MIDI input:"), input);
+    form->addRow(tr("MIDI output:"), output);
+    auto* atStart = new QCheckBox(tr("Connect when Montage starts"), dlg);
+    atStart->setObjectName(QStringLiteral("surfaceAtStart"));
+    atStart->setChecked(appSettings().value(QStringLiteral("controlSurface/connect"), false).toBool());
+    form->addRow(QString(), atStart);
+    auto* status = new QLabel(dlg);
+    status->setObjectName(QStringLiteral("surfaceStatus"));
+    status->setWordWrap(true);
+    form->addRow(status);
+    auto showStatus = [this, status] {
+        status->setText(surface_->isConnected() ? tr("Connected to %1.").arg(surface_->surfaceName()) : tr("Not connected."));
+    };
+    showStatus();
+    connect(surface_, &ControlSurface::connectionChanged, status, showStatus);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, dlg);
+    QPushButton* connectButton = buttons->addButton(tr("Connect"), QDialogButtonBox::ActionRole);
+    connectButton->setObjectName(QStringLiteral("surfaceConnect"));
+    QPushButton* disconnectButton = buttons->addButton(tr("Disconnect"), QDialogButtonBox::ActionRole);
+    disconnectButton->setObjectName(QStringLiteral("surfaceDisconnect"));
+    connect(connectButton, &QPushButton::clicked, dlg, [this, input, output, atStart, status] {
+        const QString in = input->currentData().toString(), out = output->currentData().toString();
+        appSettings().setValue(QStringLiteral("controlSurface/input"), in);
+        appSettings().setValue(QStringLiteral("controlSurface/output"), out);
+        appSettings().setValue(QStringLiteral("controlSurface/connect"), atStart->isChecked());
+        if (in.isEmpty() && out.isEmpty()) {
+            status->setText(tr("Choose the surface's MIDI input and output."));
+            return;
+        }
+        std::string err;
+        if (!surface_->connectPorts(in.toStdString(), out.toStdString(), &err)) status->setText(QString::fromStdString(err));
+    });
+    connect(disconnectButton, &QPushButton::clicked, surface_, &ControlSurface::disconnectSurface);
+    connect(atStart, &QCheckBox::toggled, this, [](bool on) { appSettings().setValue(QStringLiteral("controlSurface/connect"), on); });
+    connect(buttons, &QDialogButtonBox::rejected, dlg, &QDialog::close);
+    form->addRow(buttons);
+    dlg->show();
+    return dlg;
+}
+
 bool MainWindow::analyseHdrLightLevels(bool ask) {
     const Sequence* cur = state_->sequence();
     if (!cur) return false;
@@ -4752,19 +5315,41 @@ bool MainWindow::analyseHdrLightLevels(bool ask) {
     const Sequence s = *cur;
     const bool marked = s.inPoint >= 0 && s.outPoint >= s.inPoint;
     LightLevels l;
+    // PQ: HDR10+'s scenes measured in the same pass.
+    const bool pq = sequenceColorSpace(s).transfer == Transfer::Pq;
+    std::vector<Hdr10PlusScene> scenes;
+    const FrameTime from = marked ? s.inPoint : 0, to = marked ? s.outPoint + 1 : 0;
     if (!runWithProgress(this, state_, tr("Measuring light levels..."), [&](const auto& progress, const auto* cancel, std::string* e) {
-            return measureLightLevels(p, s, marked ? s.inPoint : 0, marked ? s.outPoint + 1 : 0, l, e, 1.0,
-                                      [&](double f) { progress(f); }, cancel);
+            if (!pq) return measureLightLevels(p, s, from, to, l, e, 1.0, [&](double f) { progress(f); }, cancel);
+            // HDR10+ over whole scenes (a stretch analysed again grows to the stored scenes it cuts into), the light
+            // levels over what was asked.
+            const FrameTime lo = from, hi = to > from ? to : s.duration();
+            FrameTime a = lo, b = hi;
+            widenHdr10PlusRange(s.hdr10Plus, a, b);
+            const LightMeter meter(sequenceColorSpace(s));
+            const auto frame = [&](FrameTime f) {
+                RenderOptions o;
+                o.scale = 1.0;
+                o.highQuality = true;
+                Image img = renderProgramFrame(p, s, f, o);
+                if (f >= lo && f < hi) meter.add(img, f, l);
+                return img;
+            };
+            return analyseHdr10Plus(p, s, a, b, sequenceColorSpace(s), std::clamp(s.hdrPeakNits, 100.0, 10000.0), scenes, e,
+                                    [&](double f) { progress(f); }, cancel, nullptr, frame);
         }))
         return false;
     unsigned cll = 0, fall = 0;
     hdr10LightLevels(l, cll, fall);
     state_->apply(tr("Analyse HDR Light Levels"), [&](Project&, Sequence& sq) {
         sq.hdrMaxCll = cll, sq.hdrMaxFall = fall;
+        if (pq) mergeHdr10PlusScenes(sq.hdr10Plus, scenes);  // replacing those they overlap; others stay
         return edit::Result{};
     });
     const QLocale loc;
-    state_->message(tr("MaxCLL %1 nits, MaxFALL %2 nits").arg(loc.toString(cll), loc.toString(fall)), 8000);
+    state_->message(pq ? tr("MaxCLL %1 nits, MaxFALL %2 nits, %3 HDR10+ scenes").arg(loc.toString(cll), loc.toString(fall)).arg(scenes.size())
+                       : tr("MaxCLL %1 nits, MaxFALL %2 nits").arg(loc.toString(cll), loc.toString(fall)),
+                    8000);
     if (!ask) return true;
     QMessageBox box(QMessageBox::Information, tr("HDR Light Levels"),
                     tr("MaxCLL %1 nits, the brightest pixel (at %2)\nMaxFALL %3 nits, the brightest frame on average (at %4)")
@@ -4773,6 +5358,8 @@ bool MainWindow::analyseHdrLightLevels(bool ask) {
                     QMessageBox::Close, this);
     box.setObjectName(QStringLiteral("hdrLightLevelsDialog"));
     QString more = tr("Saved with the sequence: HDR10 exports state them (MP4 and MOV also measure what they render).");
+    if (pq)
+        more += tr("\n\nHDR10+: %n scene(s) measured, used by exports with HDR10+ metadata while the cut still matches them.", "", int(scenes.size()));
     if (sequenceColorSpace(s).transfer == Transfer::Pq && cll > s.hdrPeakNits + 0.5)
         more = tr("Brighter than the %1-nit mastering peak: highlights above it will be clipped or tone mapped by displays.\n\n")
                    .arg(loc.toString(qRound(s.hdrPeakNits))) + more;
@@ -5702,7 +6289,7 @@ void MainWindow::findSimilarShots() {
     statusBar()->showMessage(tr("%n moment(s) like this one", "", n), 5000);
 }
 
-bool MainWindow::exportAafTo(const QString& path, QString* summary) {
+bool MainWindow::exportAafTo(const QString& path, QString* summary, bool picture) {
     const Sequence* s = state_->sequence();
     if (!s) return false;
     // In the background on a copy of the project: decoding and writing the WAVs takes a while.
@@ -5725,12 +6312,14 @@ bool MainWindow::exportAafTo(const QString& path, QString* summary) {
     QTimer poll;
     connect(&poll, &QTimer::timeout, this, [&] { dlg.setValue(int(progress->load() * 1000)); });
     poll.start(100);
-    watcher.setFuture(QtConcurrent::run([snap, seqId, path, cancel, progress]() {
+    watcher.setFuture(QtConcurrent::run([snap, seqId, path, cancel, progress, picture]() {
         Outcome o;
         const Sequence* sq = snap->findSequence(seqId);
         if (!sq) return o;
+        AafExportOptions options;
+        options.picture = picture;
         o.ok = exportAaf(*snap, *sq, path.toStdString(), &o.result, [progress](double f, FrameTime) { *progress = f; }, cancel.get(),
-                         &o.error);
+                         &o.error, options);
         return o;
     }));
     loop.exec();
@@ -5741,13 +6330,14 @@ bool MainWindow::exportAafTo(const QString& path, QString* summary) {
         if (!*cancel) QMessageBox::warning(this, tr("Export AAF"), QString::fromStdString(o.error));
         return false;
     }
-    QString text = tr("%1: %2 audio tracks, %3 clips, %4 crossfades; %5 WAV files in \"%6\"")
-                       .arg(QFileInfo(path).fileName())
-                       .arg(o.result.audioTracks)
-                       .arg(o.result.clips)
-                       .arg(o.result.transitions)
-                       .arg(o.result.mediaFiles.size())
-                       .arg(QFileInfo(path).completeBaseName() + tr(" Media"));
+    QString text = o.result.mediaFiles.empty() ? QFileInfo(path).fileName() + tr(": no sound")
+                                               : tr("%1: %2 audio tracks, %3 clips, %4 crossfades; %5 WAV files in \"%6\"")
+                                                     .arg(QFileInfo(path).fileName())
+                                                     .arg(o.result.audioTracks)
+                                                     .arg(o.result.clips)
+                                                     .arg(o.result.transitions)
+                                                     .arg(o.result.mediaFiles.size())
+                                                     .arg(QFileInfo(path).completeBaseName() + tr(" Media"));
     if (o.result.videoTracks)
         text += tr("; %1 video tracks, %2 clips, %3 dissolves linked to the original files")
                     .arg(o.result.videoTracks)
@@ -5758,7 +6348,7 @@ bool MainWindow::exportAafTo(const QString& path, QString* summary) {
     return true;
 }
 
-void MainWindow::exportAafDialog() {
+void MainWindow::exportAafDialog(bool picture) {
     const Sequence* s = state_->sequence();
     if (!s) return;
     QSettings st = appSettings();
@@ -5768,7 +6358,7 @@ void MainWindow::exportAafDialog() {
     if (path.isEmpty()) return;
     st.setValue("lastExportDir", QFileInfo(path).absolutePath());
     QString summary;
-    if (exportAafTo(path, &summary)) statusBar()->showMessage(tr("Exported %1").arg(summary), 10000);
+    if (exportAafTo(path, &summary, picture)) statusBar()->showMessage(tr("Exported %1").arg(summary), 10000);
 }
 
 void MainWindow::importTimeline() {
@@ -5851,6 +6441,8 @@ void MainWindow::newSequence() {
             s.hdrPeakNits = spec.hdrPeakNits;
             s.audioLayout = spec.audioLayout;
             s.spherical = spec.spherical;
+            s.vr180 = spec.vr180;
+            s.stereo3d = spec.stereo3d;
             return true;
         });
 }

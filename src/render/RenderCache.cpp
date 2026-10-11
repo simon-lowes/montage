@@ -104,6 +104,7 @@ void addClipAt(QCryptographicHash& h, const Project& p, const Sequence& seq, con
 bool addFrame(QCryptographicHash& h, const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o, int depth) {
     h.addData(QByteArray::number(seq.width) + 'x' + QByteArray::number(seq.height) + '@' + QByteArray::number(seq.fpsValue(), 'g', 10));
     h.addData(QByteArray::fromStdString(seq.colorSpace) + QByteArray::number(seq.hdrPeakNits));
+    if (seq.stereo3d) h.addData("|stereo");  // clips placed in depth (a nested sequence's too)
     bool any = false;
     for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti) {
         const Track& track = seq.videoTracks[ti];
@@ -142,7 +143,8 @@ QByteArray frameKey(const Project& p, const Sequence& seq, FrameTime t, const Re
     QCryptographicHash h(QCryptographicHash::Sha1);
     h.addData(QByteArray("montage-frame-") + QByteArray::number(kCacheVersion));
     h.addData(QByteArray::number(o.scale, 'g', 10) + (o.useProxies ? "P" : "") + (o.highQuality ? "H" : "") + '#' +
-              QByteArray::fromStdString(o.displaySpace) + '#' + QByteArray::number(o.soloVideoTrack));
+              QByteArray::fromStdString(o.displaySpace) + '#' + QByteArray::number(o.soloVideoTrack) +
+              (seq.stereo3d ? QByteArray("#3D") + QByteArray::number(int(o.stereoView)) : QByteArray()));
     bool any = addFrame(h, p, seq, t, o, 0);
     if (o.captions)
         if (const CaptionTrack* track = captionTrackFor(seq)) {

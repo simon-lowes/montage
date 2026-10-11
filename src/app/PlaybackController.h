@@ -15,6 +15,7 @@
 #include "core/Adr.h"
 #include "core/Model.h"
 #include "render/Compositor.h"
+#include "render/HdrView.h"
 
 class QAudioSink;
 class QIODevice;
@@ -48,11 +49,22 @@ public:
     // Draw the sequence's visible caption track (program monitor only).
     void setShowCaptions(bool on);
     bool showCaptions() const { return showCaptions_; }
+    // How a stereo 3D sequence is shown: one eye, anaglyph, the eyes packed side by side or top and bottom, or their
+    // difference (render/Stereo.h). Other sequences are not affected.
+    void setStereoView(StereoView v);
+    StereoView stereoView() const { return stereoView_; }
+    // Also render HDR sequences as light for the HDR viewer (hdrFrameRendered), beside their SDR pictures.
+    void setHdrOutput(bool on);
+    bool hdrOutput() const { return hdrOutput_; }
 
     bool isPlaying() const { return speed_ != 0; }
     // Global Mute (as in Premiere): playback and scrubbing are silent; clips, tracks and exports are untouched.
     void setGlobalMute(bool on);
     bool globalMute() const { return globalMute_; }
+    // How an ambisonic sequence is heard (playing and scrubbing): binaurally for headphones, or as stereo for speakers.
+    // An ambisonic clip in a stereo or surround sequence is decoded as its Ambisonics effect says, as it is exported.
+    void setAmbisonicBinaural(bool on);
+    bool ambisonicBinaural() const { return ambisonicBinaural_; }
     // Audio tracks left out of what is heard (an ADR guide track while recording), the project untouched.
     void setMutedAudioTracks(const std::vector<int>& tracks);
     const std::vector<int>& mutedAudioTracks() const { return mutedTracks_; }
@@ -87,6 +99,8 @@ signals:
     // The same frame for the scopes: as delivered (code values in `space`, 16-bit for sequences outside Rec.709,
     // whose frameRendered pictures are their SDR previews), with the sequence's mastering peak.
     void scopeFrameRendered(const QImage& image, montage::FrameTime t, const QString& space, double peakNits);
+    // The same frame for the HDR viewer (with setHdrOutput): null when the sequence is not HDR.
+    void hdrFrameRendered(montage::HdrPicturePtr picture, montage::FrameTime t);
     // Peak levels of the last audio block: master L/R and per-track
     // interleaved L,R pairs (linear, 0..1+).
     void audioLevels(float masterL, float masterR, const QVector<float>& trackPeaks);
@@ -113,6 +127,8 @@ private:
     double scale_ = 0.5;
     bool useProxies_ = false;
     bool showCaptions_ = false;
+    StereoView stereoView_ = StereoView::Left;
+    bool hdrOutput_ = false;
     double speed_ = 0;
     bool loop_ = false;
     FrameTime position_ = 0;
@@ -130,6 +146,7 @@ private:
     int scrubRate_ = 0;
     AudioMixer scrubMixer_;
     bool globalMute_ = false;
+    bool ambisonicBinaural_ = true;
 };
 
 }  // namespace montage

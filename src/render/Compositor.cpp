@@ -23,6 +23,7 @@
 #include "Processing.h"
 #include "Retime.h"
 #include "Shapes.h"
+#include "Title3D.h"
 #include "TemporalFx.h"
 #include "VideoDenoise.h"
 #include "audio/PluginEffect.h"
@@ -45,6 +46,7 @@
 #include "media/Faces.h"
 #include "media/Rife.h"
 #include "media/SuperScale.h"
+#include "core/Interpretation.h"
 
 namespace montage {
 
@@ -375,6 +377,8 @@ Image renderGenerator(const Effect& g, FrameTime t, int w, int h, double scale, 
         return renderTitle(g, t, w, h, scale, duration, fps);
     } else if (g.type == "shape") {
         return renderShape(g, t, w, h, scale);
+    } else if (g.type == "title3d") {
+        return renderTitle3D(g, t, w, h, scale, duration, fps);
     }
     return img;
 }
@@ -679,10 +683,11 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
     const FrameTime lt = t - c.start;
     const int SW = seq.width, SH = seq.height;
     Image src;
+    const Effect* sourceCdl = nullptr;  // a CDL applied in the media's own space, before the input transform
     double mw = SW, mh = SH;
     Geometry g;
     double sourceSeconds = -1;  // media time of the frame, for effects that follow the footage
-    uint64_t sourceMedia = 0;   // and its media, and whether it was reframed from 360°, for analyses made from it
+    uint64_t sourceMedia = 0;   // and its media, and whether it was reframed from 360° (or is a right eye), for analyses made from it
     bool reframed = false;
     ofx::FrameFetch ofxFetch;   // the clip's source at other clip frames, for OpenFX plugins that ask (render/Ofx.h)
     if (c.isGenerator() && c.generator.type == "adjustment") {
@@ -721,6 +726,17 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
         } else if (m->kind == MediaKind::Video || m->kind == MediaKind::Image) {
             if (!m->hasVideo && m->kind != MediaKind::Image) return {};
             std::string path = (o.useProxies && !m->proxyPath.empty()) ? m->proxyPath : m->path;
+            // Stereoscopic footage: the eye being rendered (a clip's Stereo 3D effect can swap them). A proxy holds
+            // the left eye alone (it is made through a flat sequence), so the right eye is always read from the file.
+            if (!m->stereo.empty()) {
+                int eye = o.eye;
+                if (const Effect* s3d = enabledEffect(c, "stereo_3d"); s3d && s3d->p("swap_eyes", lt, 0) > 0.5) eye = 1 - eye;
+                if (eye) path = eyePath(m->path, 1);
+                // Faces analysed in the left eye sit elsewhere in the right (the eyes' disparity): there they are found
+                // in the picture itself, so Redact Faces never leaves one uncovered.
+                if (eye) reframed = true;
+            }
+            const bool original = m->proxyPath.empty() || path != m->proxyPath;  // the file itself, not its proxy
             mw = m->width > 0 ? m->width : SW;
             mh = m->height > 0 ? m->height : SH;
             // Reframe 360: the clip is a view, at the sequence's shape, out of the whole sphere.
@@ -733,10 +749,11 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             const double vrFov = vr ? vr->p("fov", lt, 100) : 0;
             const SphereView vrView = vr ? SphereView(std::clamp(int(vr->p("projection", lt, 0)), 0, 2)) : SphereView::Flat;
             if (vr) {
-                // As much of the sphere as the view's pixels need: 360 / fov times its width, up to the footage's own.
+                // As much of the sphere as the view's pixels need: 360 / fov times its width (180 / fov for VR180), up
+                // to the footage's own.
                 const double across = vrView == SphereView::Flat ? std::clamp(vrFov, 20.0, 170.0) : 180.0;
                 const int full = m->width > 0 ? m->width : viewW * 2;
-                w = std::clamp(int(std::ceil(viewW * 360.0 / across)), 2, full);
+                w = std::clamp(int(std::ceil(viewW * projectionSpan(m->projection) / across)), 2, full);
                 h = std::max(1, int(std::lround(double(w) * (m->height > 0 ? m->height : full / 2) / full)));
             }
             // Super Scale: shown larger than it was shot, the frame is decoded at its own size and enlarged by
@@ -745,7 +762,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             // The size it is shown at (decoding stops at the media's own size), up to four times that.
             const int outW = int(std::ceil(std::clamp(g.mw * std::fabs(g.sx) * o.scale, 1.0, 4.0 * mw)));
             const int outH = int(std::ceil(std::clamp(g.mh * std::fabs(g.sy) * o.scale, 1.0, 4.0 * mh)));
-            const bool upscale = ss && !vr && path == m->path && (outW > int(mw) + 1 || outH > int(mh) + 1) &&
+            const bool upscale = ss && !vr && original && (outW > int(mw) + 1 || outH > int(mh) + 1) &&
                                  ss->p("strength", lt, 100) > 0 && upscalerAvailable() && upscaleModel().installed();
             if (upscale) {
                 w = int(mw);
@@ -758,7 +775,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                 sec = std::clamp(sec, 0.0, std::max(0.0, m->duration - fd * 0.5));
             }
             Frame16Ptr f = MediaPool::instance().videoFrame(path, sec, w, h, o.highQuality);
-            if (!f && path == m->path && isOffline(*m)) f = offlineSlate(w, h);
+            if (!f && original && isOffline(*m)) f = offlineSlate(w, h);
             if (!f) return {};
             if (m->kind == MediaKind::Video) sourceSeconds = sec;
             sourceMedia = m->id;
@@ -897,7 +914,15 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             }
             if (vr) reframed = true;
             if (vr)
-                src = reframeEquirect(src, vr->p("yaw", lt, 0), vr->p("pitch", lt, 0), vr->p("roll", lt, 0), vrFov, vrView, viewW, viewH);
+                src = reframeEquirect(src, vr->p("yaw", lt, 0), vr->p("pitch", lt, 0), vr->p("roll", lt, 0), vrFov, vrView, viewW, viewH,
+                                      projectionSpan(m->projection));
+            // A CDL made in the media's own space (an on-set grade on camera log) grades the picture as it comes, before the
+            // input transform's display rendering.
+            for (const Effect& e : c.effects)
+                if (!sourceCdl && e.enabled && e.type == "cdl" && e.s("space") == mediaColorSpace(*m).label) {
+                    sourceCdl = &e;
+                    applyCdlValues(e, lt, src);
+                }
             // Input transform: the media's space into the sequence's working space.
             convertColor(src, mediaColorSpace(*m), sequenceColorSpace(seq), seq.hdrPeakNits);
         } else {
@@ -936,8 +961,16 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
     for (const Effect* e : chain)
         if (e->type == "redact_faces") applyVideoEffect(*e, lt, src, pixelScale, sourceSeconds);
     for (const Effect* e : chain)
-        if (e->type != "video_denoise" && e->type != "super_scale" && e->type != "reframe_360" && e->type != "redact_faces")  // those ran already
+        if (e->type != "video_denoise" && e->type != "super_scale" && e->type != "reframe_360" && e->type != "redact_faces" &&
+            e->type != "stereo_3d" && e != sourceCdl)  // those ran already (Stereo 3D is placed below)
             applyVideoEffect(*e, lt, src, pixelScale, sourceSeconds);
+    // Stereo 3D: in a stereoscopic sequence the eyes are moved apart by the clip's depth (into the screen when
+    // positive, out of it when negative); half the separation each way.
+    if (seq.stereo3d && !(c.isGenerator() && c.generator.type == "adjustment"))
+        if (const Effect* s3d = enabledEffect(c, "stereo_3d")) {
+            const double half = s3d->p("depth", lt, 0) / 100.0 * SW / 2;
+            g.px += o.eye ? half : -half;
+        }
     if (identityLayer(src, g, SW, SH, o.scale)) return src;  // a full-frame clip: no copy
     return transformLayer(src, g, SW, SH, o.scale);
 }
@@ -1041,7 +1074,8 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
                 if (la.width == W && la.height == H && lb.width == W && lb.height == H)
                     mixed = interpolateFrames(la, lb, u,
                                               "smooth#" + std::to_string(active->id) + '@' + std::to_string(from) + '-' +
-                                                  std::to_string(to) + '#' + std::to_string(W) + 'x' + std::to_string(H));
+                                                  std::to_string(to) + '#' + std::to_string(W) + 'x' + std::to_string(H) +
+                                                  (o.eye ? "#R" : ""));
                 else
                     mixed = transitionMix("cross_dissolve", active->params, la, lb, u, W, H);
             } else {
@@ -1083,10 +1117,20 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
 }
 
 Image renderProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o) {
-    Image img = renderSequenceFrame(p, seq, t, o);
-    flattenOver(img, 0, 0, 0);
-    if (o.captions && o.depth == 0)
-        if (const CaptionTrack* track = captionTrackFor(seq)) drawCaption(img, *track, t, &sequenceColorSpace(seq));
+    auto eyeFrame = [&](int eye) {
+        RenderOptions e = o;
+        e.eye = eye;
+        Image img = renderSequenceFrame(p, seq, t, e);
+        flattenOver(img, 0, 0, 0);
+        if (o.captions && o.depth == 0)
+            if (const CaptionTrack* track = captionTrackFor(seq)) drawCaption(img, *track, t, &sequenceColorSpace(seq));
+        return img;
+    };
+    Image img;
+    if (seq.stereo3d && o.depth == 0 && o.stereoView != StereoView::Left)
+        img = o.stereoView == StereoView::Right ? eyeFrame(1) : combineStereo(eyeFrame(0), eyeFrame(1), o.stereoView);
+    else
+        img = eyeFrame(seq.stereo3d && o.depth == 0 ? 0 : o.eye);
     if (!o.displaySpace.empty() && o.depth == 0)
         if (const ColorSpace* d = findColorSpace(o.displaySpace)) convertColor(img, sequenceColorSpace(seq), *d, seq.hdrPeakNits);
     return img;
@@ -1576,7 +1620,7 @@ struct AudioMixer::State {
     double pluginRate = 0;
     bool pluginFailed = false;
     std::string pluginState;  // the effect's saved state the plugin last loaded
-    std::vector<float> planar;
+    std::vector<float> planar, keyPlanar;
 };
 
 namespace {
@@ -1611,8 +1655,9 @@ bool AudioMixer::ensurePlugin(State& st, const Effect& e, double sr) {
 }
 
 namespace {
+// `key` (interleaved stereo, or null) goes to the plugin's key input, if it has one.
 void processPlugin(AudioMixer::State& st, const Effect& e, double sr, FrameTime lt, bool paramsChanged, float* buf,
-                   int frames) {
+                   int frames, const float* key) {
     if (st.plugin && st.pluginRate != sr) {
         st.pluginRate = sr;
         if (!st.plugin->activate(sr, kPluginBlock)) st.plugin.reset();
@@ -1636,7 +1681,23 @@ void processPlugin(AudioMixer::State& st, const Effect& e, double sr, FrameTime 
         ch[0][i] = buf[size_t(i) * 2];
         ch[1][i] = buf[size_t(i) * 2 + 1];
     }
+    const bool keyed = st.plugin->hasSidechain();
+    const float* k[2] = {nullptr, nullptr};  // (lives until process() is done with it)
+    if (keyed) st.plugin->enableSidechain(key != nullptr);
+    if (keyed && key) {
+        st.keyPlanar.resize(size_t(frames) * 2);
+        k[0] = st.keyPlanar.data();
+        k[1] = st.keyPlanar.data() + frames;
+        for (int i = 0; i < frames; ++i) {
+            st.keyPlanar[size_t(i)] = key[size_t(i) * 2];
+            st.keyPlanar[size_t(frames + i)] = key[size_t(i) * 2 + 1];
+        }
+        st.plugin->setSidechain(k, 2);
+    } else if (keyed) {
+        st.plugin->setSidechain(nullptr, 0);  // no key chosen: it hears silence there
+    }
     st.plugin->process(ch, 2, frames);
+    if (keyed) st.plugin->setSidechain(nullptr, 0);
     for (int i = 0; i < frames; ++i) {
         buf[size_t(i) * 2] = ch[0][i];
         buf[size_t(i) * 2 + 1] = ch[1][i];
@@ -1652,13 +1713,13 @@ void AudioMixer::reset() {
     resetLocked();
 }
 
-const float* AudioMixer::keySignal(Id trackId, int frames) {
+const float* AudioMixer::keySignal(Id trackId, int frames, int64_t keyAt) {
     if (!key_.seq || !key_.p) return nullptr;
     const Track* t = nullptr;
     for (const Track& tr : key_.seq->audioTracks)
         if (tr.id == trackId) t = &tr;
     if (!t) return nullptr;
-    auto& slot = keyBufs_[trackId];
+    auto& slot = keyBufs_[{trackId, keyAt}];
     if (slot.block == keyBlock_ && slot.samples.size() == size_t(frames) * 2) return slot.samples.data();
     if (!keyMixer_) {
         keyMixer_ = std::make_unique<AudioMixer>();
@@ -1666,7 +1727,7 @@ const float* AudioMixer::keySignal(Id trackId, int frames) {
     }
     slot.block = keyBlock_;
     slot.samples.assign(size_t(frames) * 2, 0.0f);
-    const int64_t at = key_.at + (t->effects.empty() ? 0 : keyMixer_->chainLatency(t->effects, t->id, key_.sr));
+    const int64_t at = keyAt + (t->effects.empty() ? 0 : keyMixer_->chainLatency(t->effects, t->id, key_.sr));
     keyMixer_->mixTrackClips(*key_.p, *key_.seq, *t, at, frames, key_.sr, key_.depth, slot.samples.data());
     if (!t->effects.empty())
         keyMixer_->processChain(t->effects, t->id, FrameTime(double(at) * key_.seq->fpsValue() / key_.sr), key_.sr,
@@ -1677,6 +1738,8 @@ const float* AudioMixer::keySignal(Id trackId, int frames) {
 void AudioMixer::resetLocked() {
     nextStart_ = -1;
     keyBufs_.clear();
+    binaural_.clear();
+    if (monitor_) monitor_->reset();
     if (keyMixer_) keyMixer_->reset();
     // Plugins are expensive to load: keep them, clearing only their audio state.
     for (auto it = states_.begin(); it != states_.end();) {
@@ -1696,6 +1759,8 @@ void AudioMixer::resetLocked() {
 }
 
 void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameTime lt, double sr, float* buf, int frames) {
+    // Where the signal reaching the next effect comes from: the chain's input, less the latency of the plugins passed.
+    int64_t keyAt = key_.at;
     // What a compressor or gate listens to: its sidechain track (not its own) or the signal, high-passed when asked.
     auto detector = [&](const Effect& e, State& st) -> const float* {
         const float* src = buf;
@@ -1703,7 +1768,7 @@ void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameT
         if (!key.empty()) {
             const Id id = Id(std::strtoll(key.c_str(), nullptr, 10));
             if (id && id != owner)
-                if (const float* k = keySignal(id, frames)) src = k;
+                if (const float* k = keySignal(id, frames, keyAt)) src = k;
         }
         const double hz = e.p("key_hpf_hz", lt, 0);
         if (hz < 1) return src == buf ? nullptr : src;
@@ -1825,7 +1890,12 @@ void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameT
         } else if (e.type == "channels") {
             fx::channelTools(buf, frames, int(e.p("mode", lt, 0)), e.p("invert_l", lt) > 0.5, e.p("invert_r", lt) > 0.5);
         } else if (e.type == "plugin") {
-            processPlugin(*st, e, sr, lt, changed, buf, frames);
+            // Its key input hears its sidechain track (not its own), as the compressor's detector does.
+            const float* key = nullptr;
+            if (const std::string k = e.s("sidechain"); !k.empty())
+                if (const Id id = Id(std::strtoll(k.c_str(), nullptr, 10)); id && id != owner) key = keySignal(id, frames, keyAt);
+            processPlugin(*st, e, sr, lt, changed, buf, frames, key);
+            if (st->plugin) keyAt -= std::max(0, st->plugin->latencySamples());
         } else if (e.type == "delay") {
             size_t del = size_t(std::max(1.0, e.p("time_ms", lt, 300) * sr / 1000));
             float fb = float(std::clamp(e.p("feedback", lt, 0.35), 0.0, 0.95));
@@ -1879,6 +1949,12 @@ void AudioMixer::mix(const Project& p, const Sequence& seq, int64_t start, int f
         }
         nextStart_ = start + frames;
         mixInto(p, seq, start, frames, full.data(), trackLevels, 0, 0, -1, n);
+        // An ambisonic mix heard binaurally (the decoder keeps its state from block to block).
+        if (ambisonicLayout(seq.audioLayout) && ambisonicBinaural_) {
+            if (!monitor_ || monitor_->sampleRate() != seq.sampleRate) monitor_ = std::make_unique<FoaBinaural>(seq.sampleRate);
+            monitor_->process(full.data(), frames, out);
+            return;
+        }
     }
     downmixToStereo(seq.audioLayout, full.data(), frames, out);
 }
@@ -1898,10 +1974,11 @@ void AudioMixer::mixLayout(const Project& p, const Sequence& seq, int64_t start,
 }
 
 bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Track& track, int64_t start, int frames,
-                               double sr, int depth, float* trackBuf) {
+                               double sr, int depth, float* trackBuf, float* trackField, int64_t fieldStart) {
     const double fps = seq.fpsValue();
     const int64_t end = start + frames;
     std::vector<float> clipBuf(size_t(frames) * 2);
+    std::vector<float> field;  // an ambisonic clip's turned field, kept for an ambisonic mix
     bool any = false;
     for (const Clip& c : track.clips) {
         if (!c.enabled || edit::roleMuted(seq, c.role)) continue;
@@ -1934,20 +2011,154 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
         const MediaItem* m = c.mediaId ? p.findMedia(c.mediaId) : nullptr;
         if (!m) continue;
         std::fill(clipBuf.begin(), clipBuf.end(), 0.0f);
+        field.clear();
         const int64_t rs = start + lat;  // the source window fed to the chain
         int64_t s0 = std::max(rs, ps), s1 = std::min(rs + frames, pe);
         const double srcBase = c.sourceIn * sr / fps;
         const bool ramped = c.ramped();  // Time Remapping: the source position follows the speed curve
-        if (m->kind == MediaKind::Sequence) {
-            const Sequence* nested = p.findSequence(m->sequenceId);
-            if (!nested || depth >= kMaxDepth || nested->id == seq.id) continue;
+        // Where the clip's sound comes from at a timeline sample (in the source's samples), for its speed and direction.
+        auto srcPos = [&](int64_t smp) {
+            if (c.reverse) return srcBase + double(ce - 1 - smp) * c.speed;
+            if (ramped) return (c.sourceIn + c.sourceOffset(double(smp - cs) * fps / sr)) * sr / fps;  // speed ramp
+            return srcBase + double(smp - cs) * c.speed;
+        };
+        // Bleeps: stretches of source (as samples) covered by a tone or silence, with 5 ms ramps.
+        std::vector<std::pair<double, double>> bleeps;
+        bool bleepTone = true;
+        double bleepFreq = 1000;
+        float bleepLevel = 0.25f;
+        for (const Effect& e : c.effects)
+            if (e.enabled && e.type == "bleep") {
+                for (const auto& [a, b] : bleepRanges(e)) bleeps.push_back({a * sr, b * sr});
+                bleepTone = e.p("mode", 0, 0) < 0.5;
+                bleepFreq = e.p("frequency", 0, 1000);
+                bleepLevel = dbToLin(e.p("level", 0, -12));
+            }
+        const double ramp = 0.005 * sr;
+        // How far a bleep covers source position `pos` (0..1), and its tone there.
+        auto bleepAt = [&](double pos, float& tone) {
+            double g = 0;
+            for (const auto& [a, b] : bleeps)
+                if (pos > a - ramp && pos < b + ramp) g = std::max(g, std::min({1.0, (pos - (a - ramp)) / ramp, ((b + ramp) - pos) / ramp}));
+            tone = g > 0 && bleepTone ? bleepLevel * float(std::sin(2 * M_PI * bleepFreq * pos / sr)) : 0.0f;
+            return float(g);
+        };
+        // Ambisonic sound: an ambisonic file (all its channels played), or a nested ambisonic sequence's mix.
+        const Sequence* nested = m->kind == MediaKind::Sequence ? p.findSequence(m->sequenceId) : nullptr;
+        if (m->kind == MediaKind::Sequence && (!nested || depth >= kMaxDepth || nested->id == seq.id)) continue;
+        const bool fieldSource = nested ? ambisonicLayout(nested->audioLayout)
+                                        : m->ambisonic > 0 && c.channels.empty() && m->channels >= kFoaChannels;
+        if (fieldSource) {
+            // The field read sample for sample and turned (by the clip's Ambisonics effect and, while it follows, the
+            // linked picture's Reframe 360° view), then heard binaurally or as stereo, or kept as a field for an
+            // ambisonic mix.
+            if (!nested && !m->hasAudio) continue;
+            const bool keep = trackField != nullptr;
+            const int64_t base = keep ? fieldStart : rs;  // a kept field passes no clip or track (stereo) inserts
+            const int64_t f0 = std::max(base, ps), f1 = std::min(base + frames, pe);
+            AudioBufferPtr fb, stretched;
+            std::vector<float> nf;
+            const float* src = nullptr;
+            int64_t n = 0, origin = 0;  // frames of `src`, and the source sample its first frame is
+            if (nested) {
+                // The nested sequence mixed as a field over the span this block reads.
+                if (f1 > f0) {
+                    const double lo = std::min(srcPos(f0), srcPos(f1 - 1)), hi = std::max(srcPos(f0), srcPos(f1 - 1));
+                    origin = int64_t(std::floor(lo));
+                    n = int64_t(std::floor(hi)) - origin + 2;
+                    nf.assign(size_t(n) * kFoaChannels, 0.0f);
+                    mixInto(p, *nested, origin, int(n), nf.data(), nullptr, depth + 1, int(sr), nested->multicam ? c.audioAngle : -1,
+                            kFoaChannels);
+                    src = nf.data();
+                }
+            } else {
+                const std::string key = ambisonicAudioKey(m->path);
+                fb = nonBlocking_ ? MediaPool::instance().audioIfReady(key, int(sr)) : MediaPool::instance().audio(key, int(sr));
+                if (!fb || fb->channels != kFoaChannels || fb->frames() < 2) continue;
+                // Noise reduction and the like: W cleaned, and what that did done to Y, Z and X (audio/SpeechCleanup.h).
+                std::vector<const Effect*> sourceFx;
+                for (const Effect& e : c.effects)
+                    if (e.enabled && isSourceAudioEffect(e.type)) sourceFx.push_back(&e);
+                if (!sourceFx.empty())
+                    if (AudioBufferPtr clean = cleanedAudio(key, fb, sourceFx, !nonBlocking_)) fb = clean;
+                // Maintain Audio Pitch: the four channels stretched together along the time map.
+                if (!c.reverse && c.timing.p("maintain_pitch", 0) > 0.5 && (ramped || std::fabs(c.speed - 1) > 1e-9)) {
+                    const int hop = stretchHop(int(sr));
+                    char head[160];
+                    std::snprintf(head, sizeof head, "|ambix|%g|%p|%lld|%.9g|%.9g|", double(sr), static_cast<const void*>(fb.get()),
+                                  (long long)fb->frames(), double(c.sourceIn), c.speed);
+                    stretched = stretchedAudio(m->path + head + (ramped ? effectToJsonString(c.timing) : std::string()), fb, [&] {
+                        std::vector<double> positions;
+                        for (int64_t j = 0; j <= (ce - cs) / hop + 2; ++j) {
+                            const double local = double(j * hop);
+                            positions.push_back(ramped ? (c.sourceIn + c.sourceOffset(local * fps / sr)) * sr / fps : srcBase + local * c.speed);
+                        }
+                        return positions;
+                    }, hop, ce - cs, !nonBlocking_);
+                    if (stretched && stretched->channels != kFoaChannels) stretched.reset();
+                }
+                src = fb->samples.data();
+                n = fb->frames();
+            }
+            const Effect* amb = nullptr;
+            for (const Effect& e : c.effects)
+                if (e.enabled && e.type == "ambisonics") amb = &e;
+            const Clip* picture = nullptr;
+            const Effect* view = nullptr;
+            if ((!amb || amb->p("follow_view", 0, 1) > 0.5) && c.linkGroup)
+                for (const Track& vt : seq.videoTracks)
+                    for (const Clip& vc : vt.clips)
+                        if (vc.linkGroup == c.linkGroup)
+                            for (const Effect& e : vc.effects)
+                                if (e.enabled && e.type == "reframe_360") picture = &vc, view = &e;
+            field.assign(size_t(frames) * kFoaChannels, 0.0f);
+            for (int64_t b = f0; b < f1 && src; b += 64) {
+                const int64_t e2 = std::min(f1, b + 64);
+                const FrameTime t = FrameTime(std::floor(double(b) * fps / sr));
+                // The clip's own turn (in the scene, as the recording is set right), then the view's.
+                FoaRotation turn = amb ? foaRotation(amb->p("yaw", t - c.start, 0), amb->p("pitch", t - c.start, 0), amb->p("roll", t - c.start, 0))
+                                       : foaRotation(0, 0, 0);
+                if (view)
+                    turn = foaCompose(turn, foaRotation(view->p("yaw", t - picture->start, 0), view->p("pitch", t - picture->start, 0),
+                                                        view->p("roll", t - picture->start, 0)));
+                for (int64_t s = b; s < e2; ++s) {
+                    const double pos = srcPos(s);
+                    float* d = &field[size_t(s - base) * kFoaChannels];
+                    if (stretched) {
+                        const int64_t j = s - cs;
+                        if (j < 0 || j >= stretched->frames()) continue;
+                        for (int k = 0; k < kFoaChannels; ++k) d[k] = stretched->samples[size_t(j) * kFoaChannels + size_t(k)];
+                    } else {
+                        const double rel = pos - double(origin);
+                        if (rel < 0 || rel >= double(n - 1)) continue;
+                        const int64_t i = int64_t(rel);
+                        const float f = float(rel - double(i));
+                        for (int k = 0; k < kFoaChannels; ++k) d[k] = src[i * 4 + k] + (src[i * 4 + 4 + k] - src[i * 4 + k]) * f;
+                    }
+                    foaRotate(turn, d);
+                    if (!bleeps.empty()) {
+                        // Covered in every direction; the tone in W, all round.
+                        float tone = 0;
+                        if (const float g = bleepAt(pos, tone); g > 0) {
+                            for (int k = 0; k < kFoaChannels; ++k) d[k] *= 1 - g;
+                            d[0] += tone * g;
+                        }
+                    }
+                }
+            }
+            if (!keep) {
+                if (!amb || amb->p("decode", 0, 0) < 0.5) {
+                    auto& dec = binaural_[c.id];
+                    if (!dec || dec->sampleRate() != sr) dec = std::make_unique<FoaBinaural>(sr);
+                    dec->process(field.data(), frames, clipBuf.data());
+                } else {
+                    for (int i = 0; i < frames; ++i) foaDecodeStereo(&field[size_t(i) * kFoaChannels], clipBuf[size_t(i) * 2], clipBuf[size_t(i) * 2 + 1]);
+                }
+                field.clear();
+            }
+        } else if (nested) {
             // Mix the span of the nested sequence this block covers (at our
             // rate), then resample it for the clip's speed and direction.
-            auto srcPos = [&](int64_t smp) {
-                if (c.reverse) return srcBase + double(ce - 1 - smp) * c.speed;
-                if (ramped) return (c.sourceIn + c.sourceOffset(double(smp - cs) * fps / sr)) * sr / fps;  // speed ramp
-                return srcBase + double(smp - cs) * c.speed;
-            };
             const double lo = s1 > s0 ? std::min(srcPos(s0), srcPos(s1 - 1)) : 0;
             const double hi = s1 > s0 ? std::max(srcPos(s0), srcPos(s1 - 1)) : 0;
             int64_t nStart = int64_t(std::floor(lo));
@@ -1997,23 +2208,8 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
                     return positions;
                 }, hop, ce - cs, !nonBlocking_);
             }
-            // Bleeps: stretches of source (as samples) covered by a tone or silence, with 5 ms ramps.
-            std::vector<std::pair<double, double>> bleeps;
-            bool bleepTone = true;
-            double bleepFreq = 1000;
-            float bleepLevel = 0.25f;
-            for (const Effect& e : c.effects)
-                if (e.enabled && e.type == "bleep") {
-                    for (const auto& [a, b] : bleepRanges(e)) bleeps.push_back({a * sr, b * sr});
-                    bleepTone = e.p("mode", 0, 0) < 0.5;
-                    bleepFreq = e.p("frequency", 0, 1000);
-                    bleepLevel = dbToLin(e.p("level", 0, -12));
-                }
-            const double ramp = 0.005 * sr;
             for (int64_t s = s0; s < s1; ++s) {
-                double pos = c.reverse ? srcBase + double(ce - 1 - s) * c.speed
-                             : ramped  ? (c.sourceIn + c.sourceOffset(double(s - cs) * fps / sr)) * sr / fps
-                                       : srcBase + double(s - cs) * c.speed;
+                const double pos = srcPos(s);
                 if (pos < 0 || pos >= double(n - 1)) continue;
                 float* d = &clipBuf[size_t(s - rs) * 2];
                 if (stretched) {
@@ -2028,46 +2224,65 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
                     d[1] = src[i * 2 + 1] + (src[i * 2 + 3] - src[i * 2 + 1]) * f;
                 }
                 if (!bleeps.empty()) {
-                    double g = 0;
-                    for (const auto& [a, b] : bleeps)
-                        if (pos > a - ramp && pos < b + ramp)
-                            g = std::max(g, std::min({1.0, (pos - (a - ramp)) / ramp, ((b + ramp) - pos) / ramp}));
-                    if (g > 0) {
-                        const float tone = bleepTone ? bleepLevel * float(std::sin(2 * M_PI * bleepFreq * pos / sr)) : 0.0f;
-                        const float k = float(g);
+                    float tone = 0;
+                    if (const float k = bleepAt(pos, tone); k > 0) {
                         d[0] = d[0] * (1 - k) + tone * k;
                         d[1] = d[1] * (1 - k) + tone * k;
                     }
                 }
             }
         }
-        // Clip filters (stateful, processed over the whole block for continuity).
+        // Clip filters (stateful, processed over the whole block for continuity), fed `lat` ahead: keys from there too.
+        const int64_t trackKeyAt = key_.at;
+        key_.at = rs;
         processChain(c.effects, c.id, FrameTime(double(start) * fps / sr) - c.start, sr, clipBuf.data(), frames);
+        key_.at = trackKeyAt;
         // Clip volume / pan (keyframed, evaluated every 64 samples) and fades. The dips under audio description
         // (core/AudioDescription.h) are heard only while the descriptions are.
         const auto duck = c.audio.params.find(kDescriptionDuckParam);
         const Param* adDuck = duck != c.audio.params.end() && !edit::roleMuted(seq, kDescriptionRole) ? &duck->second : nullptr;
+        auto fadeAt = [&](int64_t k) {
+            float fade = 1;
+            if (fiE > fiS && k < fiE) {
+                double u = std::clamp(double(k - fiS) / double(fiE - fiS), 0.0, 1.0);
+                fade *= equalPowerIn ? float(std::sin(u * M_PI / 2)) : float(u);
+            }
+            if (foE > foS && k >= foS) {
+                double u = std::clamp(double(k - foS) / double(foE - foS), 0.0, 1.0);
+                fade *= equalPowerOut ? float(std::cos(u * M_PI / 2)) : float(1 - u);
+            }
+            return fade;
+        };
+        auto gainAt = [&](int64_t s) {
+            const FrameTime lt = FrameTime(std::floor(double(s) * fps / sr)) - c.start;
+            return dbToLin(c.audio.p("gain_db", lt, 0) + (adDuck ? adDuck->at(lt) : 0.0));
+        };
         const int64_t o0 = std::max(start, ps), o1 = std::min(end, pe);
         for (int64_t s = o0; s < o1; s += 64) {
             int64_t e2 = std::min(o1, s + 64);
             FrameTime lt = FrameTime(std::floor(double(s) * fps / sr)) - c.start;
-            float g = dbToLin(c.audio.p("gain_db", lt, 0) + (adDuck ? adDuck->at(lt) : 0.0));
+            const float g = gainAt(s);
             float pl, pr;
             panGains(c.audio.p("pan", lt, 0), pl, pr);
             for (int64_t k = s; k < e2; ++k) {
-                float fade = 1;
-                if (fiE > fiS && k < fiE) {
-                    double u = std::clamp(double(k - fiS) / double(fiE - fiS), 0.0, 1.0);
-                    fade *= equalPowerIn ? float(std::sin(u * M_PI / 2)) : float(u);
-                }
-                if (foE > foS && k >= foS) {
-                    double u = std::clamp(double(k - foS) / double(foE - foS), 0.0, 1.0);
-                    fade *= equalPowerOut ? float(std::cos(u * M_PI / 2)) : float(1 - u);
-                }
+                const float fade = fadeAt(k);
                 float* d = &clipBuf[size_t(k - start) * 2];
                 float* tb = &trackBuf[size_t(k - start) * 2];
                 tb[0] += d[0] * g * pl * fade;
                 tb[1] += d[1] * g * pr * fade;
+            }
+        }
+        // A kept field: the clip's gain and fades where it is heard (no pan: it is placed by its turn).
+        if (!field.empty()) {
+            const int64_t q0 = std::max(fieldStart, ps), q1 = std::min(fieldStart + frames, pe);
+            for (int64_t s = q0; s < q1; s += 64) {
+                const int64_t e2 = std::min(q1, s + 64);
+                const float g = gainAt(s);
+                for (int64_t k = s; k < e2; ++k) {
+                    const float gf = g * fadeAt(k);
+                    for (int ch = 0; ch < kFoaChannels; ++ch)
+                        trackField[size_t(k - fieldStart) * kFoaChannels + size_t(ch)] += field[size_t(k - fieldStart) * kFoaChannels + size_t(ch)] * gf;
+                }
             }
         }
         any = true;
@@ -2101,8 +2316,9 @@ int AudioMixer::maxLatency(const Sequence& seq, double sr) {
 void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, int frames, float* out,
                          std::vector<MeterLevels>* trackLevels, int depth, int rate, int onlyTrack, int channels) {
     const double sr = rate > 0 ? rate : seq.sampleRate;
-    // Surround: tracks and buses stay stereo inside and are panned onto the layout's speakers at their faders.
-    const int nch = depth == 0 && channels > 2 ? channels : 2;
+    // Surround: tracks and buses stay stereo inside and are panned onto the layout's speakers at their faders. Nested
+    // sequences mix as stereo, except an ambisonic one wanted as its field.
+    const int nch = channels > 2 && (depth == 0 || (channels == kFoaChannels && ambisonicLayout(seq.audioLayout))) ? channels : 2;
     const bool surround = nch > 2;
     const int lfeCh = [&] {
         const auto& sp = layoutSpeakers(seq.audioLayout);
@@ -2127,7 +2343,10 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
         ~KeyScope() { k = saved; }
     } keyScope{key_, key_};
     key_ = {&p, &seq, start, sr, depth};
-    if (depth == 0) ++keyBlock_;
+    if (depth == 0) {
+        ++keyBlock_;
+        keyBufs_.clear();  // keys of earlier blocks are never asked for again
+    }
     bool anySolo = std::any_of(seq.audioTracks.begin(), seq.audioTracks.end(), [](const Track& t) { return t.solo; });
     if (trackLevels && depth == 0) trackLevels->assign(seq.audioTracks.size(), MeterLevels{});
     auto frameAt = [&](int64_t sample) { return FrameTime(double(sample) * fps / sr); };
@@ -2144,6 +2363,13 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
         busLat[b.id] = chainLatency(b.effects, b.id, sr);
     }
     std::vector<float> trackBuf(size_t(frames) * 2);
+    // An ambisonic mix: ambisonic clips add their field straight to it (W, Y, Z, X), beside the tracks' panned sound.
+    // The field passes no stereo inserts (clip, track or bus), so it is read where the master is fed from; a track
+    // routed to a bus sends it through the bus's mute and fader.
+    const bool fieldMix = surround && ambisonicLayout(seq.audioLayout) && nch == kFoaChannels;
+    std::vector<float> trackField(fieldMix ? size_t(frames) * kFoaChannels : 0);
+    const int64_t fieldStart = start + masterLat;
+    std::map<Id, std::vector<float>> busFields;
     for (size_t ti = 0; ti < seq.audioTracks.size(); ++ti) {
         const Track& track = seq.audioTracks[ti];
         if (onlyTrack >= 0 ? int(ti) != onlyTrack : (track.muted || (anySolo && !track.solo))) continue;
@@ -2154,8 +2380,10 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
         const int64_t downstream = masterLat + (bus != busBufs.end() ? busLat[bus->first] : 0);
         const int64_t trackLat = chainLatency(track.effects, track.id, sr);
         std::fill(trackBuf.begin(), trackBuf.end(), 0.0f);
+        std::fill(trackField.begin(), trackField.end(), 0.0f);
         key_ = {&p, &seq, start + downstream + trackLat, sr, depth};
-        const bool any = mixTrackClips(p, seq, track, start + downstream + trackLat, frames, sr, depth, trackBuf.data());
+        const bool any = mixTrackClips(p, seq, track, start + downstream + trackLat, frames, sr, depth, trackBuf.data(),
+                                       fieldMix ? trackField.data() : nullptr, fieldStart);
         // Track inserts keep running without clips, so reverb and delay tails ring out.
         if (!any && track.effects.empty()) continue;
         if (!track.effects.empty())
@@ -2175,11 +2403,35 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
                     trackBuf[size_t(k) * 2] *= g;
                     trackBuf[size_t(k) * 2 + 1] *= g;
                 }
+                // The field is heard at the master's position, so the fader there moves it.
+                if (fieldMix) {
+                    const float f0 = dbToLin(trackVolumeAt(track, double(fieldStart + i) * fps / sr));
+                    const float f1 = dbToLin(trackVolumeAt(track, double(fieldStart + e) * fps / sr));
+                    for (int k = i; k < e; ++k) {
+                        const float g = f0 + (f1 - f0) * float(k - i) / float(e - i);
+                        for (int ch = 0; ch < kFoaChannels; ++ch) trackField[size_t(k) * kFoaChannels + size_t(ch)] *= g;
+                    }
+                }
             }
             tg = 1;
         }
         tg *= dbToLin(edit::folderGain(seq, TrackKind::Audio, track.folder));  // its folder's fader (a VCA)
         MeterLevels lv;
+        if (fieldMix && !lfeOnly) {
+            float* to = master.data();
+            if (bus != busBufs.end()) {
+                auto& bf = busFields[bus->first];
+                if (bf.empty()) bf.assign(size_t(frames) * kFoaChannels, 0.0f);
+                to = bf.data();
+            }
+            for (int i = 0; i < frames; ++i) {
+                const float* f = &trackField[size_t(i) * kFoaChannels];
+                float* d = to + size_t(i) * kFoaChannels;
+                for (int ch = 0; ch < kFoaChannels; ++ch) d[ch] += f[ch] * tg;
+                lv.peakL = std::max(lv.peakL, std::fabs(f[0] * tg));
+                lv.peakR = std::max(lv.peakR, std::fabs(f[0] * tg));
+            }
+        }
         if (surround && bus == busBufs.end()) {
             // Straight to the speakers through the track's surround panner.
             for (int i = 0; i < frames; ++i) {
@@ -2230,6 +2482,8 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
         if (!b.effects.empty()) processChain(b.effects, b.id, frameAt(start + masterLat + busLat[b.id]), sr, bb.data(), frames);
         if (b.muted) continue;
         float g = dbToLin(b.volumeDb), bl, br;
+        if (auto bf = busFields.find(b.id); bf != busFields.end())
+            for (size_t i = 0; i < bf->second.size(); ++i) master[i] += bf->second[i] * g;  // fieldMix: master is W, Y, Z, X
         if (surround) {
             panInto(bb.data(), b.surround, g, master.data());
             continue;

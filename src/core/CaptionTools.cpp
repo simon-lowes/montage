@@ -194,7 +194,7 @@ int raiseCaptionsOverTitles(std::vector<Caption>& captions, const Sequence& seq)
     for (const Track& track : seq.videoTracks) {
         if (track.muted) continue;
         for (const Clip& c : track.clips) {
-            if (!c.enabled || c.generator.type != "title") continue;
+            if (!c.enabled || (c.generator.type != "title" && c.generator.type != "title3d")) continue;
             // Lower Left, Centre or Right, or placed (with the clip's own position) below the middle fifth.
             const int anchor = int(std::lround(c.generator.p("anchor", 0)));
             const double y = c.generator.p("pos_y", 0) + c.motion.p("pos_y", 0);

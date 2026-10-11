@@ -112,6 +112,9 @@ bool createProxy(const std::string& source, const std::string& proxyPath, int ma
     s.width = m.width;
     s.height = m.height;
     s.fps = m.fps.valid() ? m.fps : Rational{30, 1};
+    // 360° footage whole, not as a view. (A stereo file's proxy holds its left eye: the right is read from the file.)
+    s.spherical = !m.projection.empty();
+    s.vr180 = m.projection == "vr180";
     m.id = p.newId();
     p.media.push_back(m);
     edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
@@ -165,6 +168,9 @@ bool createSuperScaled(const std::string& source, const std::string& dest, int f
     s.width = (m.width * factor) & ~1;
     s.height = (m.height * factor) & ~1;
     s.fps = m.fps.valid() ? m.fps : Rational{30, 1};
+    // 360° footage whole, not as a view. (A stereo file's proxy holds its left eye: the right is read from the file.)
+    s.spherical = !m.projection.empty();
+    s.vr180 = m.projection == "vr180";
     m.id = p.newId();
     p.media.push_back(m);
     edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);

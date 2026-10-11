@@ -185,6 +185,25 @@ std::vector<EffectInfo> buildCatalog() {
                  {str("path", "LUT File", StringKind::File)}});
     c.back().strings[0].fileFilter = "LUT files (*.cube)";
     {
+        // ASC CDL (core/Cdl.h): slope, offset and power per channel and saturation, as dailies carry it, applied in
+        // the working space or in the space it was made in (a camera log, ACEScct).
+        EffectInfo cdl{"cdl", "ASC CDL", EffectCategory::VideoFilter, "Color", {}, {}};
+        for (const char* part : {"slope", "offset", "power"})
+            for (const char* ch : {"r", "g", "b"}) {
+                const std::string P = part, C = ch;
+                const std::string label = std::string(1, char(std::toupper(P[0]))) + P.substr(1) + " " + char(std::toupper(C[0]));
+                if (P == "offset") cdl.params.push_back(num(P + "." + C, label, -1, 1, 0, 0.001));
+                else cdl.params.push_back(num(P + "." + C, label, P == "power" ? 0.1 : 0, 4, 1, 0.001));
+            }
+        cdl.params.push_back(num("saturation", "Saturation", 0, 4, 1, 0.001));
+        std::vector<std::string> spaces{"Working space"};
+        for (const auto& cs : colorSpaces()) spaces.push_back(cs.label);
+        cdl.strings = {str("space", "Apply In", StringKind::Choice, "Working space"), str("id", "CDL ID", StringKind::Text),
+                       str("description", "Description", StringKind::Text)};
+        cdl.strings[0].choices = spaces;
+        c.push_back(cdl);
+    }
+    {
         // Colour Space Transform: one clip from any space into another (render/ColorSpace.h).
         std::vector<std::string> spaces;
         for (const auto& cs : colorSpaces()) spaces.push_back(cs.label);
@@ -216,6 +235,12 @@ std::vector<EffectInfo> buildCatalog() {
                  {num("yaw", "Pan (°)", -360, 360, 0, 0.1), num("pitch", "Tilt (°)", -90, 90, 0, 0.1),
                   num("roll", "Roll (°)", -180, 180, 0, 0.1), num("fov", "Field of View (°)", 20, 330, 100, 0.1),
                   choice("projection", "Projection", {"Flat", "Little Planet", "Tunnel"}, 0)},
+                 {}});
+    // Stereo 3D (Premiere's and Resolve's stereoscopic convergence): in a stereoscopic sequence, a clip's place in
+    // depth, by moving its eyes apart (positive into the screen, negative out of it, as a % of the width), and its eyes
+    // swapped when stereo footage was shot or packed the other way round (render/Stereo.h).
+    c.push_back({"stereo_3d", "Stereo 3D", EffectCategory::VideoFilter, "Transform",
+                 {num("depth", "Depth (% of width)", -10, 10, 0, 0.05), choice("swap_eyes", "Eyes", {"As Shot", "Swapped"}, 0)},
                  {}});
     {
         // OpenColorIO transform from a config file, a built-in config or $OCIO (render/Ocio.h).
@@ -509,6 +534,14 @@ std::vector<EffectInfo> buildCatalog() {
                  {choice("mode", "Channels", {"Stereo", "Mono (Sum)", "Left to Both", "Right to Both", "Swap Left and Right"}, 0),
                   boolean("invert_l", "Invert Left Polarity"), boolean("invert_r", "Invert Right Polarity")},
                  {}});
+    // Ambisonic sound (core/Ambisonics.h): the field turned (as a view of it would turn), following the linked
+    // picture's Reframe 360° view while asked, and heard binaurally (headphones) or as stereo (speakers).
+    c.push_back({"ambisonics", "Ambisonics", EffectCategory::AudioFilter, "Channels",
+                 {num("yaw", "Turn (degrees right)", -180, 180, 0, 0.5), num("pitch", "Tilt (degrees up)", -90, 90, 0, 0.5),
+                  num("roll", "Roll (degrees clockwise)", -180, 180, 0, 0.5),
+                  choice("follow_view", "Follow the 360° View", {"Off", "On"}, 1),
+                  choice("decode", "Heard As", {"Binaural (headphones)", "Stereo (speakers)"}, 0)},
+                 {}});
     c.push_back({"stereo_width", "Stereo Width", EffectCategory::AudioFilter, "Channels",
                  {pct("width", "Width", 0, 200, 100), num("bass_mono_hz", "Mono Bass Below (Hz)", 0, 500, 0, 1)},
                  {}});
@@ -722,6 +755,38 @@ std::vector<EffectInfo> buildCatalog() {
                          {str("text", "Text", StringKind::MultilineText, "Title"),
                           str("font", "Font", StringKind::Font, "Sans Serif")}};
         c.push_back(title);
+        // Extruded 3D text (render/Title3D.h): turned in space, lit, seen through a perspective camera.
+        EffectInfo title3d{"title3d", "3D Title", EffectCategory::Generator, "Titles",
+                           {
+                               num("size", "Font Size (px)", 4, 1000, 120, 1),
+                               color("color", "Face", 0.95, 0.95, 0.95),
+                               color("side_color", "Sides", 0.45, 0.5, 0.6),
+                               num("depth", "Extrusion (px)", 0, 1000, 40, 0.5),
+                               num("rot_x", "Tilt (X°)", -360, 360, 10, 0.5),
+                               num("rot_y", "Turn (Y°)", -360, 360, -20, 0.5),
+                               num("rot_z", "Roll (Z°)", -360, 360, 0, 0.5),
+                               num("pos_x", "Position X", -4000, 4000, 0, 1),
+                               num("pos_y", "Position Y", -4000, 4000, 0, 1),
+                               pct("scale", "Scale", 1, 2000, 100),
+                               num("fov", "Lens (field of view °)", 5, 120, 35, 0.5),
+                               num("light_angle", "Light Direction (°)", -180, 180, -40, 1),
+                               num("light_height", "Light Height (°)", -90, 90, 40, 1),
+                               pct("ambient", "Ambient Light", 0, 100, 35),
+                               pct("specular", "Shine", 0, 100, 40),
+                               num("tracking", "Tracking", -50, 200, 0, 0.5),
+                               num("line_spacing", "Line Spacing", 0.5, 3, 1.1),
+                               boolean("bold", "Bold", true),
+                               boolean("italic", "Italic"),
+                               choice("align", "Alignment", {"Left", "Center", "Right"}, 1),
+                               pct("opacity", "Opacity", 0, 100, 100),
+                               choice("anim_in", "Animate In", {"None", "Fade", "Spin", "Flip Up", "Swing In", "Zoom From Far"}, 0),
+                               num("anim_in_dur", "In Duration (s)", 0.05, 10, 0.8, 0.05),
+                               choice("anim_out", "Animate Out", {"None", "Fade", "Spin", "Flip Up", "Swing In", "Zoom From Far"}, 0),
+                               num("anim_out_dur", "Out Duration (s)", 0.05, 10, 0.8, 0.05),
+                           },
+                           {str("text", "Text", StringKind::MultilineText, "3D Title"),
+                            str("font", "Font", StringKind::Font, "Sans Serif")}};
+        c.push_back(title3d);
         // Ready-made titles: a Title with its settings filled in (makeEffect gives type "title").
         for (const TitleTemplate& tpl : titleTemplates()) {
             EffectInfo t = title;

@@ -22,9 +22,13 @@ struct Speaker {
 // The speakers of "stereo", "5.1" (L R C LFE Ls Rs), "7.1" (L R C LFE Lb Rb Ls Rs) and the immersive layouts with
 // overhead speakers: "5.1.2" and "5.1.4" (5.1 and two or four above, ITU-R BS.2051 2+5+0 and 4+5+0), "7.1.2" (7.1
 // and two above at the sides, as Dolby's bed) and "7.1.4" (4+7+0), in channel order (FFmpeg's). Anything else is stereo.
+// "ambix" is first-order ambisonics (core/Ambisonics.h): its four channels W, Y, Z, X are not speakers but the
+// sound field, and panning places a sound in it from a direction.
 const std::vector<Speaker>& layoutSpeakers(const std::string& layout);
 int layoutChannels(const std::string& layout);
-const std::vector<std::string>& audioLayouts();  // "stereo", "5.1", "7.1", "5.1.2", "5.1.4", "7.1.2", "7.1.4"
+// "stereo", "5.1", "7.1", "5.1.2", "5.1.4", "7.1.2", "7.1.4", "ambix"
+const std::vector<std::string>& audioLayouts();
+bool ambisonicLayout(const std::string& layout);
 // Whether a layout has overhead speakers, and the same layout without them ("7.1.4" -> "7.1").
 bool immersiveLayout(const std::string& layout);
 std::string earLevelLayout(const std::string& layout);
@@ -47,8 +51,9 @@ struct SurroundGains {
 SurroundGains surroundGains(const std::string& layout, const SurroundPan& p);
 
 // ITU-R BS.775 fold-down to stereo: the centre and the surrounds at -3 dB
-// into their side, the LFE left out. `in` has the layout's channels; `out`
-// is stereo. In place is not allowed.
+// into their side, the LFE left out (an ambisonic mix is heard through two
+// virtual cardioids). `in` has the layout's channels; `out` is stereo. In
+// place is not allowed.
 void downmixToStereo(const std::string& layout, const float* in, int frames, float* out);
 
 }  // namespace montage

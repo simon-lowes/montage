@@ -13,7 +13,9 @@
 #include <cmath>
 #include <map>
 #include <optional>
+#include <set>
 
+#include "Cdl.h"
 #include "EditOps.h"
 #include "Effects.h"
 #include "History.h"
@@ -41,6 +43,9 @@ Track& TimelineBuilder::track(TrackKind kind, int index) {
 
 Id TimelineBuilder::media(const std::string& path, const std::string& name, bool video, bool audio, double seconds) {
     const std::string key = path.empty() ? "offline:" + name : path;
+    if (!path.empty() && !byPath_.count(key))
+        for (const MediaItem& m : p_.media)  // added since (by the builder of a nested sequence)
+            if (m.path == path) byPath_[key] = m.id;
     if (auto it = byPath_.find(key); it != byPath_.end()) {
         if (MediaItem* m = p_.findMedia(it->second); m && m->path.empty()) {
             m->hasVideo |= video;  // an offline item learns what it was used for
@@ -191,6 +196,230 @@ QString pathFromUrl(const QString& url) {
 
 }  // namespace
 
+namespace {
+
+// Reads OTIO tracks into sequences; a Stack inside a track (a nested timeline) becomes a nested sequence, built once
+// however many Stacks show it (Montage writes a compound clip's picture and sound as two, named alike).
+struct OtioReader {
+    Project& p;
+    const MediaProber& probe;
+    std::map<QString, std::vector<QJsonObject>> stacks;  // key -> the Stacks showing that sequence
+    std::map<QString, Id> made;                          // key -> its media item
+    std::set<QString> making;
+    ImportResult nested;  // what nested builds found
+
+    static QString keyOf(const QJsonObject& stack) {
+        const QJsonObject own = stack.value("metadata").toObject().value("montage").toObject();
+        if (own.contains("sequence_id")) return "montage:" + QString::number(own.value("sequence_id").toDouble(), 'f', 0);
+        QJsonObject bare = stack;
+        bare.remove("source_range");  // (the same timeline shown from another point is the same timeline)
+        bare.remove("enabled");
+        bare.remove("effects");
+        return QString::fromUtf8(QJsonDocument(bare).toJson(QJsonDocument::Compact));
+    }
+    void gather(const QJsonArray& tracks, int depth) {
+        if (depth > 8) return;
+        for (const auto& tv : tracks)
+            for (const auto& cv : tv.toObject().value("children").toArray()) {
+                const QJsonObject item = cv.toObject();
+                if (!item.value("OTIO_SCHEMA").toString().startsWith("Stack.")) continue;
+                stacks[keyOf(item)].push_back(item);
+                gather(item.value("children").toArray(), depth + 1);
+            }
+    }
+
+    Id nestedMedia(const QString& key, const TimelineBuilder& parent, int depth) {
+        if (auto it = made.find(key); it != made.end()) return it->second;
+        const auto list = stacks.find(key);
+        if (list == stacks.end() || list->second.empty() || making.count(key) || depth > 8) return 0;
+        making.insert(key);
+        QJsonObject own;
+        for (const QJsonObject& st : list->second)
+            if (own.isEmpty()) own = st.value("metadata").toObject().value("montage").toObject();
+        const QJsonObject& first = list->second.front();
+        std::string name = own.value("sequence_name").toString().toStdString();
+        if (name.empty()) name = first.value("name").toString().toStdString();
+        Rational fps = parent.sequenceFps();
+        if (own.value("fps_num").toInt() > 0 && own.value("fps_den").toInt() > 0) fps = {own.value("fps_num").toInt(), own.value("fps_den").toInt()};
+        TimelineBuilder nb(p, name, fps, probe);
+        nb.sequence().width = own.contains("width") ? std::max(16, own.value("width").toInt()) : parent.sequenceWidth();
+        nb.sequence().height = own.contains("height") ? std::max(16, own.value("height").toInt()) : parent.sequenceHeight();
+        // Its picture from the first Stack that has picture, its sound from the first that has sound (a clip cut in two
+        // is two Stacks of the same tracks).
+        QJsonArray tracks;
+        bool marked = false, havePicture = false, haveSound = false;
+        for (const QJsonObject& st : list->second) {
+            bool picture = false, sound = false;
+            for (const auto& t : st.value("children").toArray()) (t.toObject().value("kind").toString() == "Audio" ? sound : picture) = true;
+            for (const auto& t : st.value("children").toArray()) {
+                const bool isSound = t.toObject().value("kind").toString() == "Audio";
+                if (isSound ? !haveSound : !havePicture) tracks.append(t);
+            }
+            havePicture |= picture;
+            haveSound |= sound;
+            if (!marked && !st.value("markers").toArray().isEmpty()) {
+                for (const auto& mv : st.value("markers").toArray()) nb.sequence().markers.push_back(otioMarker(mv.toObject(), fps.toDouble()));
+                marked = true;
+            }
+        }
+        readTracks(nb, tracks, fps.toDouble(), depth + 1);
+        bool video = false, audio = false;
+        for (const Track& t : nb.sequence().videoTracks) video |= !t.clips.empty();
+        for (const Track& t : nb.sequence().audioTracks) audio |= !t.clips.empty();
+        nb.sequence().multicam = own.value("multicam").toBool();
+        const Id active = p.activeSequence;
+        ImportResult one = nb.finish();
+        p.activeSequence = active;
+        making.erase(key);
+        nested.clips += one.clips;
+        nested.offline.insert(nested.offline.end(), one.offline.begin(), one.offline.end());
+        nested.warnings.insert(nested.warnings.end(), one.warnings.begin(), one.warnings.end());
+        const Sequence* ns = p.findSequence(one.sequence);
+        if (!ns) return 0;
+        MediaItem item;
+        item.id = p.newId();
+        item.kind = MediaKind::Sequence;
+        item.name = name;
+        item.sequenceId = ns->id;
+        item.hasVideo = video;
+        item.hasAudio = audio;
+        item.width = ns->width;
+        item.height = ns->height;
+        item.fps = ns->fps;
+        item.duration = double(ns->duration()) / std::max(1e-9, ns->fpsValue());
+        p.media.push_back(item);
+        made[key] = item.id;
+        return item.id;
+    }
+
+    void readTracks(TimelineBuilder& b, const QJsonArray& tracks, double rate, int depth) {
+        int vIndex = 0, aIndex = 0;
+        for (const auto& tv : tracks) {
+            const QJsonObject t = tv.toObject();
+            const bool video = t.value("kind").toString() != "Audio";
+            const int index = video ? vIndex++ : aIndex++;
+            const TrackKind kind = video ? TrackKind::Video : TrackKind::Audio;
+            Track& track = b.track(kind, index);
+            if (!t.value("name").toString().isEmpty()) track.name = t.value("name").toString().toStdString();
+            track.muted = !t.value("enabled").toBool(true);
+            double cursor = 0;
+            Id prev = 0;
+            struct Pending {
+                double in = 0, out = 0;
+                std::string type;
+            };
+            std::optional<Pending> pendingTr;
+            for (const auto& cv : t.value("children").toArray()) {
+                const QJsonObject item = cv.toObject();
+                const QString schema = item.value("OTIO_SCHEMA").toString();
+                const QJsonObject sr = item.value("source_range").toObject();
+                const double dur = rtValue(sr.value("duration"), rate), srcStart = rtValue(sr.value("start_time"), rate);
+                if (schema.startsWith("Gap.")) {
+                    cursor += dur;
+                    prev = 0;
+                    continue;
+                }
+                if (schema.startsWith("Transition.")) {
+                    // A custom transition named after one of ours (as Montage writes them) comes back as itself.
+                    std::string type;
+                    if (item.value("transition_type").toString() != "SMPTE_Dissolve") type = item.value("name").toString().toStdString();
+                    pendingTr = Pending{rtValue(item.value("in_offset"), rate), rtValue(item.value("out_offset"), rate), type};
+                    continue;
+                }
+                if (!schema.startsWith("Clip.") && !schema.startsWith("Stack.")) {
+                    if (schema.startsWith("Track.")) b.warn("Nested tracks are not imported (" + item.value("name").toString().toStdString() + ")");
+                    cursor += dur;
+                    prev = 0;
+                    continue;
+                }
+                const std::string name = item.value("name").toString().toStdString();
+                // Speed: a LinearTimeWarp (negative = reversed).
+                double scalar = 1;
+                for (const auto& ev : item.value("effects").toArray())
+                    if (ev.toObject().value("OTIO_SCHEMA").toString().startsWith("LinearTimeWarp"))
+                        scalar = ev.toObject().value("time_scalar").toDouble(1);
+                const FrameTime start = FrameTime(std::llround(cursor)), len = FrameTime(std::llround(dur));
+                // OTIO's source start is where the clip begins in the media; reversed clips start at the far end.
+                const double sourceIn = scalar < 0 ? srcStart - dur * std::fabs(scalar) : srcStart;
+                Clip* clip = nullptr;
+                if (schema.startsWith("Stack.")) {
+                    // A nested timeline: a compound clip of its sequence (all of it when no range is given).
+                    if (const Id mid = nestedMedia(keyOf(item), b, depth)) {
+                        FrameTime length = len;
+                        if (length <= 0)
+                            if (const MediaItem* m = p.findMedia(mid)) length = FrameTime(std::llround(m->duration * rate));
+                        clip = b.addClip(kind, index, mid, start, length, sourceIn, name);
+                        if (len <= 0 && clip) cursorAdvance = double(length);
+                        if (clip) {
+                            clip->speed = std::max(0.01, std::fabs(scalar));
+                            clip->reverse = scalar < 0;
+                            const QJsonObject own = item.value("metadata").toObject().value("montage").toObject();
+                            if (own.value("multicam").toBool()) {
+                                clip->angle = std::max(0, own.value("angle").toInt(0));
+                                clip->audioAngle = own.value("audio_angle").toInt(-1);
+                            }
+                        }
+                    } else {
+                        b.warn("A nested timeline could not be read (" + name + ")");
+                    }
+                } else {
+                    // Media reference (OTIO 0.15+: media_references[active key]; older: media_reference).
+                    QJsonObject ref = item.value("media_reference").toObject();
+                    if (item.contains("media_references")) {
+                        const QString key = item.value("active_media_reference_key").toString("DEFAULT_MEDIA");
+                        ref = item.value("media_references").toObject().value(key).toObject();
+                    }
+                    const QString refSchema = ref.value("OTIO_SCHEMA").toString();
+                    if (refSchema.startsWith("GeneratorReference.") && video) {
+                        const QString kindName = ref.value("generator_kind").toString();
+                        const std::string type = kindName == "SolidColor" ? "color" : kindName == "Title" ? "title" : kindName.toLower().toStdString();
+                        clip = b.addGenerator(index, type, start, len, name);
+                        if (clip) {
+                            const QJsonObject params = ref.value("parameters").toObject();
+                            for (auto it = params.begin(); it != params.end(); ++it) {
+                                if (it.value().isDouble()) clip->generator.params[it.key().toStdString()] = Param(it.value().toDouble());
+                                else if (it.value().isString()) clip->generator.strings[it.key().toStdString()] = it.value().toString().toStdString();
+                            }
+                        } else {
+                            b.warn("Generator \"" + kindName.toStdString() + "\" is not available");
+                        }
+                    } else {
+                        const QString path = pathFromUrl(ref.value("target_url").toString());
+                        const double avail = rtValue(ref.value("available_range").toObject().value("duration"), rate);
+                        const Id mid = b.media(path.toStdString(), ref.value("name").toString().toStdString(), video, !video,
+                                               avail > 0 ? avail / rate : (srcStart + dur * std::fabs(scalar)) / rate);
+                        clip = b.addClip(kind, index, mid, start, len, sourceIn, name);
+                        if (clip) {
+                            clip->speed = std::max(0.01, std::fabs(scalar));
+                            clip->reverse = scalar < 0;
+                            // Our sequence rate may differ from the media's rate in source_range units: both are `rate` here.
+                        }
+                    }
+                }
+                if (clip) {
+                    clip->enabled = item.value("enabled").toBool(true);
+                    if (!schema.startsWith("Stack."))
+                        for (const auto& mv : item.value("markers").toArray()) clip->markers.push_back(otioMarker(mv.toObject(), rate));
+                    const QJsonObject mm = item.value("metadata").toObject().value("montage").toObject();
+                    if (mm.contains("blend_mode")) clip->blendMode = mm.value("blend_mode").toString().toStdString();
+                    if (pendingTr && prev) {
+                        b.addTransition(kind, index, prev, clip->id, FrameTime(std::llround(pendingTr->in + pendingTr->out)), pendingTr->type);
+                    }
+                    prev = clip->id;
+                } else {
+                    prev = 0;
+                }
+                pendingTr.reset();
+                cursor += dur + cursorAdvance;
+                cursorAdvance = 0;
+            }
+        }
+    }
+    double cursorAdvance = 0;  // a nested timeline without a range: its own length, which the item did not say
+};
+
+}  // namespace
+
 ImportResult importOtio(Project& p, const std::string& json, const MediaProber& probe) {
     QJsonParseError perr;
     const QJsonDocument doc = QJsonDocument::fromJson(QByteArray::fromStdString(json), &perr);
@@ -228,109 +457,15 @@ ImportResult importOtio(Project& p, const std::string& json, const MediaProber& 
         b.sequence().height = std::max(16, meta.value("height").toInt(1080));
         b.sequence().sampleRate = meta.value("sample_rate").toInt(48000);
     }
-    int vIndex = 0, aIndex = 0;
-    for (const auto& tv : tracks) {
-        const QJsonObject t = tv.toObject();
-        const bool video = t.value("kind").toString() != "Audio";
-        const int index = video ? vIndex++ : aIndex++;
-        const TrackKind kind = video ? TrackKind::Video : TrackKind::Audio;
-        Track& track = b.track(kind, index);
-        if (!t.value("name").toString().isEmpty()) track.name = t.value("name").toString().toStdString();
-        track.muted = !t.value("enabled").toBool(true);
-        double cursor = 0;
-        Id prev = 0;
-        struct Pending {
-            double in = 0, out = 0;
-            std::string type;
-        };
-        std::optional<Pending> pendingTr;
-        for (const auto& cv : t.value("children").toArray()) {
-            const QJsonObject item = cv.toObject();
-            const QString schema = item.value("OTIO_SCHEMA").toString();
-            const QJsonObject sr = item.value("source_range").toObject();
-            const double dur = rtValue(sr.value("duration"), rate), srcStart = rtValue(sr.value("start_time"), rate);
-            if (schema.startsWith("Gap.")) {
-                cursor += dur;
-                prev = 0;
-                continue;
-            }
-            if (schema.startsWith("Transition.")) {
-                // A custom transition named after one of ours (as Montage writes them) comes back as itself.
-                std::string type;
-                if (item.value("transition_type").toString() != "SMPTE_Dissolve") type = item.value("name").toString().toStdString();
-                pendingTr = Pending{rtValue(item.value("in_offset"), rate), rtValue(item.value("out_offset"), rate), type};
-                continue;
-            }
-            if (schema.startsWith("Stack.") || schema.startsWith("Track.")) {
-                b.warn("Nested stacks are not imported (" + item.value("name").toString().toStdString() + ")");
-                cursor += dur;
-                prev = 0;
-                continue;
-            }
-            if (!schema.startsWith("Clip.")) {
-                cursor += dur;
-                continue;
-            }
-            // Media reference (OTIO 0.15+: media_references[active key]; older: media_reference).
-            QJsonObject ref = item.value("media_reference").toObject();
-            if (item.contains("media_references")) {
-                const QString key = item.value("active_media_reference_key").toString("DEFAULT_MEDIA");
-                ref = item.value("media_references").toObject().value(key).toObject();
-            }
-            const QString refSchema = ref.value("OTIO_SCHEMA").toString();
-            const std::string name = item.value("name").toString().toStdString();
-            // Speed: a LinearTimeWarp (negative = reversed).
-            double scalar = 1;
-            for (const auto& ev : item.value("effects").toArray())
-                if (ev.toObject().value("OTIO_SCHEMA").toString().startsWith("LinearTimeWarp"))
-                    scalar = ev.toObject().value("time_scalar").toDouble(1);
-            const FrameTime start = FrameTime(std::llround(cursor)), len = FrameTime(std::llround(dur));
-            Clip* clip = nullptr;
-            if (refSchema.startsWith("GeneratorReference.") && video) {
-                const QString kindName = ref.value("generator_kind").toString();
-                const std::string type = kindName == "SolidColor" ? "color" : kindName == "Title" ? "title" : kindName.toLower().toStdString();
-                clip = b.addGenerator(index, type, start, len, name);
-                if (clip) {
-                    const QJsonObject params = ref.value("parameters").toObject();
-                    for (auto it = params.begin(); it != params.end(); ++it) {
-                        if (it.value().isDouble()) clip->generator.params[it.key().toStdString()] = Param(it.value().toDouble());
-                        else if (it.value().isString()) clip->generator.strings[it.key().toStdString()] = it.value().toString().toStdString();
-                    }
-                } else {
-                    b.warn("Generator \"" + kindName.toStdString() + "\" is not available");
-                }
-            } else {
-                const QString path = pathFromUrl(ref.value("target_url").toString());
-                const double avail = rtValue(ref.value("available_range").toObject().value("duration"), rate);
-                const Id mid = b.media(path.toStdString(), ref.value("name").toString().toStdString(), video, !video,
-                                       avail > 0 ? avail / rate : (srcStart + dur * std::fabs(scalar)) / rate);
-                // OTIO's source start is where the clip begins in the media; reversed clips start at the far end.
-                const double sourceIn = scalar < 0 ? srcStart - dur * std::fabs(scalar) : srcStart;
-                clip = b.addClip(kind, index, mid, start, len, sourceIn, name);
-                if (clip) {
-                    clip->speed = std::max(0.01, std::fabs(scalar));
-                    clip->reverse = scalar < 0;
-                    // Our sequence rate may differ from the media's rate in source_range units: both are `rate` here.
-                }
-            }
-            if (clip) {
-                clip->enabled = item.value("enabled").toBool(true);
-                for (const auto& mv : item.value("markers").toArray()) clip->markers.push_back(otioMarker(mv.toObject(), rate));
-                const QJsonObject mm = item.value("metadata").toObject().value("montage").toObject();
-                if (mm.contains("blend_mode")) clip->blendMode = mm.value("blend_mode").toString().toStdString();
-                if (pendingTr && prev) {
-                    b.addTransition(kind, index, prev, clip->id, FrameTime(std::llround(pendingTr->in + pendingTr->out)), pendingTr->type);
-                }
-                prev = clip->id;
-            } else {
-                prev = 0;
-            }
-            pendingTr.reset();
-            cursor += dur;
-        }
-    }
+    OtioReader r{p, probe, {}, {}, {}, {}};
+    r.gather(tracks, 0);
+    r.readTracks(b, tracks, rate, 0);
     for (const auto& mv : stack.value("markers").toArray()) b.sequence().markers.push_back(otioMarker(mv.toObject(), rate));
-    return b.finish();
+    for (const std::string& w : r.nested.warnings) b.warn(w);
+    ImportResult result = b.finish();
+    result.clips += r.nested.clips;
+    result.offline.insert(result.offline.end(), r.nested.offline.begin(), r.nested.offline.end());
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -354,6 +489,8 @@ ImportResult importEdl(Project& p, const std::string& text, Rational fps, const 
         FrameTime srcIn = 0, srcOut = 0, recIn = 0, recOut = 0;
         std::string name, file;
         double speed = 1;
+        bool hasCdl = false;  // an ASC CDL in the event's comments
+        Cdl cdl;
     };
     std::vector<Event> events;
     auto tc = [&](const QString& s) {
@@ -381,6 +518,17 @@ ImportResult importEdl(Project& p, const std::string& text, Rational fps, const 
         if (l.startsWith("* FROM CLIP NAME:")) events.back().name = l.mid(17).trimmed().toStdString();
         else if (l.startsWith("* TO CLIP NAME:")) events.back().name = l.mid(15).trimmed().toStdString();
         else if (l.startsWith("* SOURCE FILE:")) events.back().file = l.mid(14).trimmed().toStdString();
+        else if (QString compact = QString(l).remove(' '); compact.startsWith("*ASC_SOP", Qt::CaseInsensitive)) {
+            const int at = l.indexOf("ASC_SOP", 0, Qt::CaseInsensitive) + 7;
+            events.back().hasCdl |= parseCdlSop(l.mid(at).toStdString(), events.back().cdl);
+        } else if (compact.startsWith("*ASC_SAT", Qt::CaseInsensitive)) {
+            bool ok = false;
+            const double v = l.mid(l.indexOf("ASC_SAT", 0, Qt::CaseInsensitive) + 7).trimmed().toDouble(&ok);
+            if (ok && std::isfinite(v)) {
+                events.back().cdl.saturation = std::max(0.0, v);
+                events.back().hasCdl = true;
+            }
+        }
         else if (auto m = m2Re.match(l); m.hasMatch() && fps.toDouble() > 0) events.back().speed = m.captured(2).toDouble() / fps.toDouble();
     }
     if (events.empty()) {
@@ -447,6 +595,7 @@ ImportResult importEdl(Project& p, const std::string& text, Rational fps, const 
             if (!c) continue;
             c->speed = std::max(0.01, std::fabs(e.speed));
             c->reverse = e.speed < 0;
+            if (e.hasCdl && kind == TrackKind::Video && !black) setClipCdl(p, *c, e.cdl);
             if (dissolve > 0 && lastClip.count(chKey)) {
                 // The outgoing clip runs to the middle of the dissolve.
                 if (Clip* prev = edit::clipById(b.sequence(), lastClip[chKey]); prev && prev->end() <= recIn) {

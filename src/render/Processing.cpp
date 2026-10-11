@@ -4,6 +4,7 @@
 #include "ColorSpace.h"
 #include "Ocio.h"
 #include "VideoFx.h"
+#include "core/Cdl.h"
 #include "core/Effects.h"
 #include "core/ColorWarp.h"
 #include "core/MaskPath.h"
@@ -330,6 +331,74 @@ void applyLut(const Effect& e, FrameTime t, Image& img) {
         r += (nr - r) * strength;
         g += (ng - g) * strength;
         b += (nb - b) * strength;
+    });
+}
+
+// ASC CDL, in the working space or converted into the space it was made in and back.
+Cdl effectCdl(const Effect& e, FrameTime t) {
+    Clip holder;
+    holder.effects.push_back(e);
+    holder.effects.back().enabled = true;
+    Cdl cdl;
+    clipCdl(holder, t, cdl);
+    return cdl;
+}
+
+void applyCdlEffect(const Effect& e, FrameTime t, Image& img) {
+    const Cdl cdl = effectCdl(e, t);
+    if (cdl.identity()) return;
+    const ColorSpace* space = nullptr;
+    for (const auto& cs : colorSpaces())
+        if (cs.label == e.s("space")) space = &cs;
+    const ColorSpace& working = currentWorkingSpace();
+    if (!space || space->id == working.id) {
+        perPixel(img, [&](float& r, float& g, float& b, float&) { applyCdl(cdl, r, g, b); });
+        return;
+    }
+    // Into that space and back exactly (linear light through its primaries and curve, no display rendering), so only
+    // the CDL changes the picture: the whole round trip baked into a 65^3 LUT, kept for these values.
+    static std::mutex m;
+    static std::map<std::string, std::shared_ptr<const Lut3D>> cache;
+    std::string key = working.id + "|" + space->id + "|" + cdlSopText(cdl) + cdlNumber(cdl.saturation);
+    std::shared_ptr<const Lut3D> lut;
+    {
+        std::lock_guard lock(m);
+        if (auto it = cache.find(key); it != cache.end()) lut = it->second;
+    }
+    if (!lut) {
+        double to[9], from[9];
+        primariesMatrix(working.primaries, space->primaries, to);
+        primariesMatrix(space->primaries, working.primaries, from);
+        auto through = [](const double mat[9], Transfer a, Transfer b, float v[3]) {
+            double l[3], o[3];
+            for (int i = 0; i < 3; ++i) l[i] = toLinear(a, v[i]);
+            for (int i = 0; i < 3; ++i) o[i] = mat[i * 3] * l[0] + mat[i * 3 + 1] * l[1] + mat[i * 3 + 2] * l[2];
+            for (int i = 0; i < 3; ++i) v[i] = float(fromLinear(b, o[i]));
+        };
+        auto made = std::make_shared<Lut3D>();
+        const int n = 65;
+        made->size = n;
+        made->data.resize(size_t(n) * n * n * 3);
+        parallelRows(n, [&](int b0, int b1) {
+            for (int bi = b0; bi < b1; ++bi)
+                for (int gi = 0; gi < n; ++gi)
+                    for (int ri = 0; ri < n; ++ri) {
+                        float v[3] = {float(ri) / (n - 1), float(gi) / (n - 1), float(bi) / (n - 1)};
+                        through(to, working.transfer, space->transfer, v);
+                        applyCdl(cdl, v[0], v[1], v[2]);
+                        through(from, space->transfer, working.transfer, v);
+                        float* d = &made->data[(size_t(bi) * n * n + size_t(gi) * n + size_t(ri)) * 3];
+                        d[0] = v[0], d[1] = v[1], d[2] = v[2];
+                    }
+        });
+        lut = made;
+        std::lock_guard lock(m);
+        if (cache.size() > 64) cache.clear();  // (a keyframed CDL makes a new one each frame)
+        cache[key] = lut;
+    }
+    perPixel(img, [&](float& r, float& g, float& b, float&) {
+        r = std::clamp(r, 0.0f, 1.0f), g = std::clamp(g, 0.0f, 1.0f), b = std::clamp(b, 0.0f, 1.0f);
+        lut->apply(r, g, b);
     });
 }
 
@@ -1423,6 +1492,11 @@ thread_local const ColorSpace* tWorkingSpace = nullptr;
 }  // namespace
 
 const ColorSpace& currentWorkingSpace() { return tWorkingSpace ? *tWorkingSpace : rec709Space(); }
+
+void applyCdlValues(const Effect& e, FrameTime t, Image& img) {
+    const Cdl cdl = effectCdl(e, t);
+    if (!cdl.identity()) perPixel(img, [&](float& r, float& g, float& b, float&) { applyCdl(cdl, r, g, b); });
+}
 WorkingSpaceScope::WorkingSpaceScope(const ColorSpace* space) : previous_(tWorkingSpace) { tWorkingSpace = space; }
 WorkingSpaceScope::~WorkingSpaceScope() { tWorkingSpace = previous_; }
 
@@ -1567,6 +1641,7 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
     else if (ty == "hdr_palette") hdrPalette(e, t, img);
     else if (ty == "hue_sat") hueSat(e, t, img);
     else if (ty == "lut") applyLut(e, t, img);
+    else if (ty == "cdl") applyCdlEffect(e, t, img);
     else if (ty == "color_space_transform") {
         const ColorSpace* from = nullptr;
         const ColorSpace* to = nullptr;

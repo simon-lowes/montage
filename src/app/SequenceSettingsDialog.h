@@ -29,6 +29,8 @@ struct NewSequenceSpec {
     double hdrPeakNits = 1000;
     std::string audioLayout = "stereo";  // "stereo", "5.1" or "7.1"
     bool spherical = false;              // a 360° sequence (Sequence::spherical)
+    bool vr180 = false;                  // with spherical: the front half of the sphere (Sequence::vr180)
+    bool stereo3d = false;               // a stereoscopic 3D sequence (Sequence::stereo3d)
 };
 
 // Spin box that only accepts even values (most encoders need even frame sizes).
@@ -75,6 +77,8 @@ private:
     QSpinBox* hdrPeak_ = nullptr;
     QComboBox* audioLayout_ = nullptr;
     QCheckBox* spherical_ = nullptr;
+    QCheckBox* vr180_ = nullptr;
+    QCheckBox* stereo3d_ = nullptr;
     QLabel* summary_ = nullptr;
     QPushButton* okButton_ = nullptr;
     bool updating_ = false;

@@ -50,6 +50,10 @@ struct ExportSettings {
     FrameTime out = -1;
     bool useProxies = false;
     bool alpha = false;                  // keep transparency (ProRes 4444 etc.)
+    // A stereoscopic sequence's eyes as delivered (render/Stereo.h names): "sbs" side by side at full size (the
+    // default), "sbs_half", "tb", "tb_half", or one picture ("left", "right", "anaglyph"). Packed exports carry stereo
+    // metadata (MP4 st3d, Matroska StereoMode; FFmpeg writes none into MOV). The width and height asked for are each eye's.
+    std::string stereo;
     // Captions from the sequence's visible caption track (or captionTrack):
     bool burnInCaptions = false;         // drawn into the picture
     bool embedCaptions = false;          // as a subtitle stream (MP4/MOV mov_text, MKV SubRip, WebM WebVTT)
@@ -61,6 +65,10 @@ struct ExportSettings {
     // An HDR sequence delivered in SDR is tone mapped. HDR output is 10-bit,
     // tagged, and PQ carries HDR10 mastering and light-level metadata.
     std::string colorSpace;
+    // HDR10+ dynamic metadata (PQ exports, render/Hdr10Plus.h): each scene measured (with the sequence's analysis
+    // while it still matches the cut, else before the render) and carried in HEVC and AV1 video on every frame; the
+    // same goes beside the file as name.hdr10plus.json, for other codecs and for encoders and checks that read it.
+    bool hdr10Plus = false;
     // Loudness normalisation: the mix is measured first (ITU-R BS.1770) and
     // brought to this integrated loudness, with a limiter holding peaks under
     // the ceiling. 0 = off; e.g. -14 LUFS for streaming, -23 for EBU R128.
@@ -147,6 +155,10 @@ std::string exportAudioLayout(const std::string& layout, const std::string& code
 // Whether the file `path` names (by its extension) can hold several audio streams: MP4 (M4A), MOV, MKV (MKA), MXF,
 // WebM, TS.
 bool containerCarriesStreams(const std::string& path);
+
+// Where an export's HDR10+ metadata goes: "video" (HEVC and AV1, with the JSON beside it), "json" (other codecs: the
+// JSON beside the file only), or "" when it has none (not PQ, EXR or GIF, no video).
+std::string hdr10PlusCarriage(const Sequence& seq, const ExportSettings& s);
 
 // HDR exports measure their light levels as they render (`light`, when given); PQ files to MP4 and MOV carry the
 // measured MaxCLL and MaxFALL. Encoders that state them before the first frame (x265) use the sequence's analysed

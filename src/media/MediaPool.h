@@ -20,6 +20,9 @@ namespace montage {
 std::string audioKey(const std::string& path, const std::vector<int>& channels);
 // The file an audio key names, and (if asked) its channels.
 std::string audioKeyFile(const std::string& key, std::vector<int>* channels = nullptr);
+// The pool's name for a file's ambisonic field: audio() gives its four channels (media/Decoder.h decodeAmbisonic).
+std::string ambisonicAudioKey(const std::string& path);
+bool isAmbisonicAudioKey(const std::string& key);
 
 class MediaPool {
 public:

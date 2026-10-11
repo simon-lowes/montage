@@ -375,6 +375,11 @@ std::atomic<int> gInstancesCreated{0};
 
 int instancesCreated() { return gInstancesCreated.load(); }
 
+namespace {
+std::mutex gSidechainsM;
+std::map<std::string, bool> gSidechains;  // descriptor id -> has a key input
+}  // namespace
+
 std::unique_ptr<Instance> instantiate(const Descriptor& d, std::string* error) {
     std::unique_ptr<Instance> inst;
     switch (d.format) {
@@ -392,8 +397,18 @@ std::unique_ptr<Instance> instantiate(const Descriptor& d, std::string* error) {
             if (error) *error = std::string(formatName(d.format)) + " plugins cannot be run by this version yet";
             break;
     }
-    if (inst) ++gInstancesCreated;
+    if (inst) {
+        ++gInstancesCreated;
+        std::lock_guard lock(gSidechainsM);
+        gSidechains[d.id] = inst->hasSidechain();
+    }
     return inst;
+}
+
+bool knownSidechain(const std::string& id) {
+    std::lock_guard lock(gSidechainsM);
+    const auto it = gSidechains.find(id);
+    return it != gSidechains.end() && it->second;
 }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE fcpxml>
+<fcpxml version="1.11">
+  <resources>
+    <format id="r1" frameDuration="1/25s" width="1920" height="1080"/>
+    <asset id="r2" name="A001" start="0s" duration="40s" hasVideo="1" hasAudio="1" format="r1"><media-rep kind="original-media" src="file:///Volumes/Cards/A001.mov"/></asset>
+    <asset id="r3" name="B001" start="0s" duration="40s" hasVideo="1" hasAudio="1" format="r1"><media-rep kind="original-media" src="file:///Volumes/Cards/B001.mov"/></asset>
+    <asset id="r6" name="Room Tone" start="0s" duration="40s" hasVideo="0" hasAudio="1"><media-rep kind="original-media" src="file:///Volumes/Cards/tone.wav"/></asset>
+    <media id="r4" name="Multicam 1">
+      <multicam format="r1" tcStart="3600s" tcFormat="NDF">
+        <mc-angle name="Cam A" angleID="q8TzDdJmRbO7gXXyVb8A3w">
+          <asset-clip ref="r2" offset="3600s" name="A001" duration="40s" format="r1"/>
+        </mc-angle>
+        <mc-angle name="Cam B" angleID="Zk2kq0ZQS1qQe7GQz4WZsA">
+          <gap name="Gap" offset="3600s" duration="2s"/>
+          <asset-clip ref="r3" offset="3602s" name="B001" duration="38s" format="r1"/>
+        </mc-angle>
+      </multicam>
+    </media>
+    <media id="r5" name="Tone Compound">
+      <sequence format="r1" duration="10s" tcStart="0s" tcFormat="NDF" audioLayout="stereo" audioRate="48k">
+        <spine><audio ref="r6" offset="0s" name="Room Tone" duration="10s"/></spine>
+      </sequence>
+    </media>
+  </resources>
+  <library><event name="Day 1"><project name="Scene 4">
+    <sequence format="r1" duration="12s" tcStart="0s" tcFormat="NDF" audioLayout="stereo" audioRate="48k">
+      <spine>
+        <mc-clip ref="r4" offset="0s" name="Multicam 1" start="3610s" duration="8s">
+          <mc-source angleID="Zk2kq0ZQS1qQe7GQz4WZsA" srcEnable="video"/>
+          <mc-source angleID="q8TzDdJmRbO7gXXyVb8A3w" srcEnable="audio"/>
+          <ref-clip ref="r5" lane="-1" offset="3611s" name="Tone Compound" start="1s" duration="4s" srcEnable="audio"/>
+        </mc-clip>
+      </spine>
+    </sequence>
+  </project></event></library>
+</fcpxml>

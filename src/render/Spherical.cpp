@@ -38,13 +38,15 @@ Mat3 cameraTurn(double yaw, double pitch, double roll) {
     return mul(Y, mul(P, R));
 }
 
-// Bilinear, wrapping round in longitude and clamped at the poles.
-void sample(const Image& src, double x, double y, float* out) {
+// Bilinear, wrapping round in longitude (clamped at the edges of a picture of less than the whole sphere) and
+// clamped at the poles.
+void sample(const Image& src, double x, double y, float* out, bool wrap) {
     const int W = src.width, H = src.height;
     x -= 0.5, y = std::clamp(y - 0.5, 0.0, double(H - 1));
+    if (!wrap) x = std::clamp(x, 0.0, double(W - 1));
     const double fx = std::floor(x), fy = std::floor(y);
     const float tx = float(x - fx), ty = float(y - fy);
-    const int x0 = ((int(fx) % W) + W) % W, x1 = (x0 + 1) % W;
+    const int x0 = ((int(fx) % W) + W) % W, x1 = wrap ? (x0 + 1) % W : std::min(W - 1, x0 + 1);
     const int y0 = int(fy), y1 = std::min(H - 1, y0 + 1);
     const float* a = src.at(x0, y0);
     const float* b = src.at(x1, y0);
@@ -55,18 +57,22 @@ void sample(const Image& src, double x, double y, float* out) {
 
 }  // namespace
 
+double projectionSpan(const std::string& projection) { return projection == "vr180" ? 180.0 : 360.0; }
+
 void equirectPoint(double yaw, double pitch, int w, int h, double& x, double& y) {
     x = (yaw / 360 + 0.5) * w;
     y = (0.5 - pitch / 180) * h;
 }
 
 Image reframeEquirect(const Image& equirect, double yaw, double pitch, double roll, double fov, SphereView view, int w,
-                      int h) {
+                      int h, double span) {
     if (equirect.empty() || w <= 0 || h <= 0) return {};
     Image out(w, h, Image::Uninitialized{});
     const Mat3 turn = cameraTurn(yaw, pitch, roll);
     const double W = equirect.width, H = equirect.height;
     const bool flat = view == SphereView::Flat;
+    const double across = std::clamp(span, 1.0, 360.0) * kDeg;
+    const bool whole = across >= 2 * M_PI - 1e-9;
     const double half = flat ? std::tan(std::clamp(fov, 1.0, 170.0) * kDeg / 2)          // the image plane at z = 1
                              : 2 * std::tan(std::clamp(fov, 1.0, 330.0) * kDeg / 4);  // stereographic radius at the edge
     parallelRows(h, [&](int y0, int y1) {
@@ -87,7 +93,13 @@ Image reframeEquirect(const Image& equirect, double yaw, double pitch, double ro
                 }
                 turn.apply(x, y, z);
                 const double lon = std::atan2(x, z), lat = std::atan2(y, std::hypot(x, z));
-                sample(equirect, (lon / (2 * M_PI) + 0.5) * W, (0.5 - lat / M_PI) * H, row + size_t(px) * 4);
+                const double fx = lon / across + 0.5;
+                float* o = row + size_t(px) * 4;
+                if (!whole && (fx < 0 || fx > 1)) {
+                    o[0] = o[1] = o[2] = o[3] = 0;  // behind a VR180 camera: nothing was shot
+                    continue;
+                }
+                sample(equirect, fx * W, (0.5 - lat / M_PI) * H, o, whole);
             }
         }
     });

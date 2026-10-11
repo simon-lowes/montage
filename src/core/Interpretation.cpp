@@ -32,6 +32,22 @@ bool validFieldOrder(const std::string& fields) {
 
 bool validRawHighlights(const std::string& mode) { return mode.empty() || mode == "clip" || mode == "blend" || mode == "rebuild"; }
 
+bool validStereoLayout(const std::string& layout) {
+    return layout.empty() || layout == "none" || layout == "sbs" || layout == "sbs_half" || layout == "tb" || layout == "tb_half";
+}
+
+std::string stereoLayout(const std::string& detected, const Interpretation& i) {
+    if (i.stereo == "none") return {};
+    return i.stereo.empty() ? detected : i.stereo;
+}
+
+std::string eyePath(const std::string& path, int eye) {
+    Interpretation i;
+    parseInterpretation(path, i);
+    i.eye = eye ? 1 : 0;
+    return interpretedPath(path, i);
+}
+
 bool parseInterpretation(const std::string& path, Interpretation& out) {
     out = {};
     const size_t mark = path.find(kMark);
@@ -53,6 +69,9 @@ bool parseInterpretation(const std::string& path, Interpretation& out) {
         else if (key == "rawtint") out.rawTint = parseNumber(value);
         else if (key == "rawhl" && validRawHighlights(value)) out.rawHighlights = value == "clip" ? "" : value;
         else if (key == "rawhalf") out.rawHalf = value == "1";
+        else if (key == "stereo" && validStereoLayout(value)) out.stereo = value;
+        else if (key == "swap") out.swapEyes = value == "1";
+        else if (key == "eye") out.eye = value == "1" ? 1 : 0;
     }
     if (!out.conformed()) out.fps = out.fileFps = Rational{0, 1};
     return !out.empty();
@@ -82,6 +101,9 @@ std::string interpretedPath(const std::string& path, const Interpretation& i) {
     if (i.rawTint != 0) add("rawtint=" + number(i.rawTint));
     if (!i.rawHighlights.empty() && i.rawHighlights != "clip") add("rawhl=" + i.rawHighlights);
     if (i.rawHalf) add("rawhalf=1");
+    if (!i.stereo.empty()) add("stereo=" + i.stereo);
+    if (i.swapEyes) add("swap=1");
+    if (i.eye) add("eye=1");
     return items.empty() ? out : out + kMark + items;
 }
 

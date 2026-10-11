@@ -316,7 +316,7 @@ Result placeMedia(Project& p, Sequence& s, Id mediaId, FrameTime at, double srcI
         v.id = p.newId();
         v.linkGroup = group;
         // 360° footage in a flat sequence comes in as a view out of the sphere (Reframe 360°), not a stretched panorama.
-        if (m->projection == "equirect" && !s.spherical) v.effects.push_back(makeEffect(p, "reframe_360"));
+        if ((m->projection == "equirect" || m->projection == "vr180") && !s.spherical) v.effects.push_back(makeEffect(p, "reframe_360"));
         Result r = overwrite(p, s, videoTrack, v);
         res.created.insert(res.created.end(), r.created.begin(), r.created.end());
     }
@@ -1664,6 +1664,16 @@ Id duplicateSequence(Project& p, Id id, const std::string& name, std::map<Id, Id
     }
     for (Effect& e : s.masterEffects) renew(e);
     for (CaptionTrack& ct : s.captionTracks) ct.id = p.newId();
+    // Colour groups: their ids own their grades' effect chains, so the copy's are its own (clips follow below).
+    std::map<Id, Id> colorGroups;
+    for (ColorGroup& g : s.colorGroups) {
+        const Id fresh = p.newId();
+        colorGroups[g.id] = fresh;
+        g.id = fresh;
+        g.postId = p.newId();
+        for (Effect& e : g.pre) renew(e);
+        for (Effect& e : g.post) renew(e);
+    }
     for (auto* tracks : {&s.videoTracks, &s.audioTracks})
         for (Track& t : *tracks) {
             t.id = p.newId();
@@ -1680,6 +1690,7 @@ Id duplicateSequence(Project& p, Id id, const std::string& name, std::map<Id, Id
                 }
                 for (Effect* e : {&c.generator, &c.motion, &c.audio, &c.timing}) renew(*e);
                 for (Effect& e : c.effects) renew(e);
+                if (c.colorGroup) c.colorGroup = colorGroups.count(c.colorGroup) ? colorGroups[c.colorGroup] : 0;
             }
             for (Transition& tr : t.transitions) {
                 tr.id = p.newId();
@@ -1699,9 +1710,12 @@ Id duplicateSequence(Project& p, Id id, const std::string& name, std::map<Id, Id
     auto retarget = [&](Effect& e) {
         const EffectInfo* info = e.type.empty() ? nullptr : findEffectInfo(e.type);
         if (!info) return;
-        for (const StringParamInfo& sp : info->strings) {
-            if (sp.kind != StringKind::Track) continue;
-            auto it = e.strings.find(sp.name);
+        std::vector<std::string> names;
+        for (const StringParamInfo& sp : info->strings)
+            if (sp.kind == StringKind::Track) names.push_back(sp.name);
+        if (e.type == "plugin") names.push_back("sidechain");  // a plugin's key input (audio/PluginEffect.h)
+        for (const std::string& name : names) {
+            auto it = e.strings.find(name);
             if (it == e.strings.end() || it->second.empty()) continue;
             const auto to = tracks.find(it->second);
             it->second = to == tracks.end() ? std::string() : to->second;
@@ -1994,6 +2008,10 @@ Result makeCompound(Project& p, Sequence& s, const std::vector<Id>& ids, const s
     nested.sampleRate = s.sampleRate;
     nested.colorSpace = s.colorSpace;  // same working space: the clips are not converted twice
     nested.hdrPeakNits = s.hdrPeakNits;
+    // The same kind of picture: stereo clips keep their depth, 360° footage stays whole.
+    nested.stereo3d = s.stereo3d;
+    nested.spherical = s.spherical;
+    nested.vr180 = s.vr180;
     bool hasAudio = false;
     for (Id id : all) {
         auto loc = locate(s, id);

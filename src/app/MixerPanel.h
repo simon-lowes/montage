@@ -47,6 +47,13 @@ public:
     QComboBox* trackAutomationMode(int index) const {
         return index >= 0 && index < int(strips_.size()) ? strips_[size_t(index)].automation : nullptr;
     }
+    QToolButton* trackMute(int index) const { return index >= 0 && index < int(strips_.size()) ? strips_[size_t(index)].mute : nullptr; }
+    QToolButton* trackSolo(int index) const { return index >= 0 && index < int(strips_.size()) ? strips_[size_t(index)].solo : nullptr; }
+    QSlider* masterFader() const { return masterFader_; }
+    // While set, every fader and pan edit shares this undo step key (a control surface moving several at once makes one
+    // step, not one per message); empty, each track's control merges its own moves.
+    void setEditMergeKey(const QString& key) { mergeKey_ = key; }
+    int trackStrips() const { return int(strips_.size()); }
 
 signals:
     // The user asked to see a track's, bus's or the master's effects (now in the Inspector).
@@ -128,6 +135,7 @@ private:
     AudioMeterWidget* masterMeter_ = nullptr;
     QToolButton* masterFx_ = nullptr;
     QSlider* masterFader_ = nullptr;
+    QString mergeKey_;
     QLabel* masterDb_ = nullptr;
     QLabel* emptyLabel_ = nullptr;
     struct Recording {

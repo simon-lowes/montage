@@ -1,4 +1,5 @@
 #include "Exporter.h"
+#include "media/SpatialAudio.h"
 #include "core/AudioDescription.h"
 
 #include "core/ColorGroups.h"
@@ -22,6 +23,7 @@
 
 #include "ColorSpace.h"
 #include "Compositor.h"
+#include "Hdr10Plus.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
 #include "Processing.h"
@@ -33,6 +35,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/spherical.h>
+#include <libavutil/stereo3d.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/mastering_display_metadata.h>
 #include <libavutil/opt.h>
@@ -183,6 +186,8 @@ struct Output {
     AVFrame* vframe = nullptr;
     AVFrame* aframe = nullptr;
     AVPacket* pkt = nullptr;
+    // Called with each video packet before it is written (pts in the encoder's time base); false fails the export.
+    std::function<bool(AVPacket*)> videoPacket;
     bool headerWritten = false;
     ~Output() {
         sws_freeContext(sws);
@@ -204,6 +209,7 @@ int drain(Output& o, AVCodecContext* ctx, AVStream* st) {
         int rc = avcodec_receive_packet(ctx, o.pkt);
         if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) return 0;
         if (rc < 0) return rc;
+        if (st == o.vst && o.videoPacket && !o.videoPacket(o.pkt)) return AVERROR(EINVAL);
         av_packet_rescale_ts(o.pkt, ctx->time_base, st->time_base);
         o.pkt->stream_index = st->index;
         rc = av_interleaved_write_frame(o.oc, o.pkt);
@@ -650,6 +656,7 @@ private:
         if (!m || m->kind != MediaKind::Video || m->path.empty()) return nullptr;
         if (mediaColorSpace(*m).id != seqSpace_.id) return nullptr;  // would be converted
         if (!interpretationOf(*m).empty()) return nullptr;            // read differently from its packets
+        if (!m->stereo.empty()) return nullptr;                       // one eye of each picture is shown
         if (openMediaInput(&src.fmt, m->path) < 0) return nullptr;
         if (avformat_find_stream_info(src.fmt, nullptr) < 0) return nullptr;
         src.stream = av_find_best_stream(src.fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
@@ -746,10 +753,20 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     if (imageSequence) av_opt_set_int(o.oc->priv_data, "start_number", s.startNumber, 0);
     o.pkt = av_packet_alloc();
     const AVRational fps{seq.fps.num, seq.fps.den};
-    int W = s.width > 0 ? s.width : seq.width;
-    int H = s.height > 0 ? s.height : seq.height;
+    // A stereoscopic sequence: its eyes packed as asked (two eyes across or down make the frame twice the size).
+    StereoView stereoView = StereoView::Left;
+    if (seq.stereo3d && !stereoViewFromName(s.stereo.empty() ? "sbs" : s.stereo, stereoView))
+        return fail("Unknown stereo output " + s.stereo + " (sbs, sbs_half, tb, tb_half, left, right or anaglyph)");
+    if (stereoView == StereoView::Difference) return fail("The eyes' difference is for checking, not delivering");
+    int across = 1, down = 1;
+    stereoPacking(stereoView, across, down);
+    // A chosen size is each eye's.
+    int W = (s.width > 0 ? s.width : seq.width) * across;
+    int H = (s.height > 0 ? s.height : seq.height) * down;
     W += W & 1;  // most codecs need even dimensions
     H += H & 1;
+    if (across == 2) W += 2 * ((W / 2) & 1);  // each eye even too
+    if (down == 2) H += 2 * ((H / 2) & 1);
     const int sr = s.sampleRate > 0 ? s.sampleRate : seq.sampleRate;
 
     const ColorSpace& seqSpace = sequenceColorSpace(seq);
@@ -770,6 +787,10 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     LightLevels measured;
     const LightMeter meter(outSpace);
     const bool measure = wantVideo && outSpace.hdr() && meter.valid();
+    // HDR10+ (measured once everything is open, just before the frames, so a missing encoder fails first).
+    const bool wantHdr10 = s.hdr10Plus && wantVideo && pq && !floatFrames;
+    std::vector<Hdr10PlusScene> hdr10;
+    double renderFrom = 0;  // where the render's share of the progress starts
     if (wantVideo) {
         std::string c = s.videoCodec;
         const bool hardware = c == "hw_h264" || c == "hw_hevc";
@@ -893,13 +914,40 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         avcodec_parameters_from_context(o.vst->codecpar, o.vctx);
         o.vst->time_base = o.vctx->time_base;
         o.vst->avg_frame_rate = fps;
+        // Packed stereoscopic 3D: stereo metadata, so players and headsets show the eyes apart (MP4 st3d, written
+        // only when asked to go beyond the standard, as sv3d is; Matroska StereoMode).
+        const bool packed = seq.stereo3d && stereoView != StereoView::Left && stereoView != StereoView::Right && stereoView != StereoView::Anaglyph;
+        if (packed) {
+            if (AVStereo3D* s3d = av_stereo3d_alloc()) {
+                s3d->type = stereoView == StereoView::SideBySide || stereoView == StereoView::SideBySideHalf ? AV_STEREO3D_SIDEBYSIDE
+                                                                                                            : AV_STEREO3D_TOPBOTTOM;
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(59, 27, 100)
+                // A zeroed view reads as "packed", which newer FFmpeg also writes as Apple's view box (vexu) that its
+                // own reader then lets override st3d's packing: unspecified, st3d alone says how the eyes lie.
+                s3d->view = AV_STEREO3D_VIEW_UNSPEC;
+#endif
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(60, 29, 100)
+                if (!av_packet_side_data_add(&o.vst->codecpar->coded_side_data, &o.vst->codecpar->nb_coded_side_data,
+                                             AV_PKT_DATA_STEREO3D, s3d, sizeof(AVStereo3D), 0))
+                    av_free(s3d);
+#else
+                if (av_stream_add_side_data(o.vst, AV_PKT_DATA_STEREO3D, reinterpret_cast<uint8_t*>(s3d), sizeof(AVStereo3D)) < 0) av_free(s3d);
+#endif
+            }
+            o.oc->strict_std_compliance = FF_COMPLIANCE_UNOFFICIAL;
+        }
         if (seq.spherical) {
             // A 360° sequence: equirectangular spherical metadata, so players and YouTube show it as 360°
-            // (MP4/MOV sv3d and st3d boxes, which FFmpeg writes only when asked to go beyond the standard; Matroska
-            // Projection).
+            // (MP4 sv3d and st3d boxes, which FFmpeg writes only when asked to go beyond the standard and never into MOV;
+            // Matroska Projection).
             size_t size = 0;
             if (AVSphericalMapping* map = av_spherical_alloc(&size)) {
                 map->projection = AV_SPHERICAL_EQUIRECTANGULAR;
+                if (seq.vr180) {
+                    // VR180: the front half of the sphere, a quarter of the way in from each side (0.32 fixed point).
+                    map->projection = AV_SPHERICAL_EQUIRECTANGULAR_TILE;
+                    map->bound_left = map->bound_right = 0x40000000u;
+                }
 #if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(60, 29, 100)
                 if (!av_packet_side_data_add(&o.vst->codecpar->coded_side_data, &o.vst->codecpar->nb_coded_side_data,
                                              AV_PKT_DATA_SPHERICAL, map, size, 0))
@@ -956,8 +1004,14 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         // already folded a layout the codec cannot carry; one FFmpeg cannot describe is an error, never a stereo stream
         // fed every channel.
         AVChannelLayout layout = AV_CHANNEL_LAYOUT_STEREO;
-        if (!s.downmixStereo && !ffmpegLayout(seq.audioLayout, layout))
+        if (!s.downmixStereo && ambisonicLayout(seq.audioLayout)) {
+            // An ambisonic field: named as one for PCM, as four speakers (4.0, in ACN order) for AAC, which knows no
+            // other four-channel layout; the SA3D box written afterwards says what they are.
+            const AVChannelLayout field = AV_CHANNEL_LAYOUT_AMBISONIC_FIRST_ORDER, quad = AV_CHANNEL_LAYOUT_4POINT0;
+            layout = s.audioCodec.rfind("pcm_", 0) == 0 ? field : quad;
+        } else if (!s.downmixStereo && !ffmpegLayout(seq.audioLayout, layout)) {
             return "This FFmpeg cannot describe the " + seq.audioLayout + " channel layout";
+        }
         if (mono) layout = AV_CHANNEL_LAYOUT_MONO;
         av_channel_layout_copy(&actx->ch_layout, &layout);
         actx->sample_rate = sr;
@@ -981,10 +1035,21 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             for (const AVSampleFormat* f = fmts; *f != AV_SAMPLE_FMT_NONE; ++f) ok |= (*f == want);
             if (!ok) actx->sample_fmt = fmts[0];
         }
-        if (s.audioCodec == "aac" || s.audioCodec == "libopus") actx->bit_rate = s.audioBitrate;
+        const bool field = !mono && !s.downmixStereo && ambisonicLayout(seq.audioLayout);
+        if (s.audioCodec == "aac" || s.audioCodec == "libopus") actx->bit_rate = s.audioBitrate * (field ? 2 : 1);  // per pair of channels
         actx->time_base = AVRational{1, actx->sample_rate};
         if (o.oc->oformat->flags & AVFMT_GLOBALHEADER) actx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-        if ((rc = avcodec_open2(actx, codec, nullptr)) < 0) return "Cannot open audio encoder: " + averr(rc);
+        AVDictionary* opts = nullptr;
+        if (field && s.audioCodec == "aac") {
+            // The field's channels are not left and right: joint stereo coding (mid/side, intensity) and noise
+            // substitution would mix or replace their differences, which are the directions.
+            av_dict_set(&opts, "aac_ms", "0", 0);
+            av_dict_set(&opts, "aac_is", "0", 0);
+            av_dict_set(&opts, "aac_pns", "0", 0);
+        }
+        rc = avcodec_open2(actx, codec, &opts);
+        av_dict_free(&opts);
+        if (rc < 0) return "Cannot open audio encoder: " + averr(rc);
         avcodec_parameters_from_context(ast->codecpar, actx);
         ast->time_base = actx->time_base;
         if (actx->frame_size > 0) audioFrameSize = actx->frame_size;
@@ -1309,12 +1374,13 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     const QImage watermark = s.burnIn.watermark.empty() ? QImage() : QImage(QString::fromStdString(s.burnIn.watermark));
     if (!s.burnIn.watermark.empty() && watermark.isNull()) return fail("Cannot read the watermark image " + s.burnIn.watermark);
     RenderOptions ro;
-    ro.scale = double(W) / seq.width;
+    ro.scale = double(W / across) / seq.width;
     ro.highQuality = true;
     ro.useProxies = s.useProxies;
+    ro.stereoView = stereoView;
     // Smart rendering: only where nothing would change the source's pictures for the whole export.
     std::unique_ptr<SmartRenderer> smart;
-    if (wantVideo && s.smartRender && o.vctx && isIntraCodec(o.vctx->codec ? o.vctx->codec->name : "") && W == seq.width && H == seq.height &&
+    if (wantVideo && s.smartRender && o.vctx && isIntraCodec(o.vctx->codec ? o.vctx->codec->name : "") && W == seq.width && H == seq.height && !seq.stereo3d &&
         !s.useProxies && !s.burnInCaptions && !s.cea608 && !s.burnIn.any() && outSpace.id == seqSpace.id)
         smart = std::make_unique<SmartRenderer>(p, seq, seqSpace, o.vctx, o.vst, s.alpha, s.profile);
     // CEA-608 captions in the video: the pairs due in each frame's span of the 29.97 Hz line-21 clock, padding between.
@@ -1353,16 +1419,75 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         std::memcpy(sd->data, cc.data(), cc.size());
         return true;
     };
+    const bool burns = (s.burnInCaptions && captions) || s.burnIn.any();
+    const bool packedEyes = seq.stereo3d && stereoView != StereoView::Left && stereoView != StereoView::Right && stereoView != StereoView::Anaglyph;
+    // A frame as delivered: rendered, captions and burn-ins drawn, in the output space.
+    auto deliveredFrame = [&](FrameTime f) {
+        auto burn = [&](Image& img) {
+            if (s.burnInCaptions && captions) drawCaption(img, *captions, f, &seqSpace);
+            if (s.burnIn.any()) drawBurnIns(img, p, seq, f, s.burnIn, watermark.isNull() ? nullptr : &watermark, &seqSpace);
+        };
+        Image img;
+        if (burns && packedEyes) {
+            // Packed eyes: captions and burn-ins on each eye, so they sit on the screen in both rather than across
+            // the join.
+            RenderOptions eye = ro;
+            eye.stereoView = StereoView::Left;
+            Image left = renderProgramFrame(p, seq, f, eye);
+            eye.stereoView = StereoView::Right;
+            Image right = renderProgramFrame(p, seq, f, eye);
+            burn(left);
+            burn(right);
+            img = combineStereo(left, right, stereoView);
+        } else {
+            img = s.alpha && !seq.stereo3d ? renderSequenceFrame(p, seq, f, ro) : renderProgramFrame(p, seq, f, ro);
+            burn(img);
+        }
+        convertColor(img, seqSpace, outSpace, peakNits);
+        return img;
+    };
+    // HDR10+: each scene's metadata for the frames exported. The sequence's analysis is used where it still matches
+    // the cut (not when burn-ins or packed eyes change the picture from what was analysed); the rest is measured now on
+    // the frames as delivered, as the first part of the progress.
+    if (wantHdr10) {
+        const bool reuse = !burns && !packedEyes;
+        FrameTime toMeasure = 0;
+        renderFrom = 0.3;
+        std::string e;
+        const auto part = [&](double f) {
+            if (progress) progress(renderFrom * f, in + FrameTime(std::floor(f * double(out - in - 1))));
+        };
+        if (!hdr10PlusForRange(p, seq, in, out, outSpace, peakNits, reuse, hdr10, &e, part, cancel, deliveredFrame, &toMeasure))
+            return fail(cancel && cancel->load() ? std::string("Export cancelled") : "HDR10+ analysis failed: " + e);
+        if (toMeasure == 0) renderFrom = 0;
+        // In the video itself: an SEI message in each HEVC access unit, a metadata OBU in each AV1 temporal unit, the
+        // scene's values on every frame of it.
+        if (!hdr10.empty() && o.vctx && (o.vctx->codec_id == AV_CODEC_ID_HEVC || o.vctx->codec_id == AV_CODEC_ID_AV1)) {
+            const bool av1 = o.vctx->codec_id == AV_CODEC_ID_AV1;
+            // Packets carry NAL units after start codes, or after lengths when the encoder's header is an hvcC record.
+            const int lengthSize = !av1 && o.vctx->extradata_size > 22 && o.vctx->extradata[0] == 1 ? (o.vctx->extradata[21] & 3) + 1 : 0;
+            auto messages = std::make_shared<std::vector<std::vector<uint8_t>>>();
+            for (const Hdr10PlusScene& sc : hdr10) messages->push_back(hdr10PlusT35(sc));
+            const auto scenes = std::make_shared<std::vector<Hdr10PlusScene>>(hdr10);
+            const FrameTime first = in;
+            o.videoPacket = [scenes, messages, av1, lengthSize, first](AVPacket* pkt) {
+                if (pkt->pts == AV_NOPTS_VALUE) return false;
+                const FrameTime f = first + pkt->pts;
+                const auto it = std::upper_bound(scenes->begin(), scenes->end(), f,
+                                                 [](FrameTime t, const Hdr10PlusScene& sc) { return t < sc.end; });
+                if (it == scenes->end() || f < it->start) return false;
+                const auto& msg = (*messages)[size_t(it - scenes->begin())];
+                return av1 ? addHdr10PlusObu(pkt, msg) : addHdr10PlusSei(pkt, msg, lengthSize);
+            };
+        }
+    }
     for (FrameTime f = in; f < out; ++f) {
         if (cancel && cancel->load()) return fail("Export cancelled");
         if (!writeCaptions(f + 1)) return fail("Writing captions failed");
         if (wantVideo && smart && smart->copy(f, in, o.oc)) {
             // copied from the source
         } else if (wantVideo) {
-            Image img = s.alpha ? renderSequenceFrame(p, seq, f, ro) : renderProgramFrame(p, seq, f, ro);
-            if (s.burnInCaptions && captions) drawCaption(img, *captions, f, &seqSpace);
-            if (s.burnIn.any()) drawBurnIns(img, p, seq, f, s.burnIn, watermark.isNull() ? nullptr : &watermark, &seqSpace);
-            convertColor(img, seqSpace, outSpace, peakNits);
+            Image img = deliveredFrame(f);
             if (measure) meter.add(img, f, measured);
             if (floatFrames && img.width == W && img.height == H) {
                 // Planar float, green-blue-red(-alpha), unpremultiplied, values above 1 kept.
@@ -1458,7 +1583,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             for (auto& mo : monos)
                 if (!encodeFifo(mo->ctx, mo->st, mo->frame, mo->fifo, mo->pts, false)) return fail("Audio encoding failed");
         }
-        if (progress && ((f - in) % 5 == 0 || f + 1 == out)) progress(double(f - in + 1) / double(total), f);
+        if (progress && ((f - in) % 5 == 0 || f + 1 == out)) progress(renderFrom + (1 - renderFrom) * double(f - in + 1) / double(total), f);
     }
     // Flush the encoders; errors here (e.g. a full disk) must fail the export.
     if (wantAudio) {
@@ -1492,12 +1617,36 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         }
     if ((rc = av_write_trailer(o.oc)) < 0) return fail("Cannot finalise file: " + averr(rc));
     if (o.oc->pb && o.oc->pb->error < 0) return fail("Writing the file failed: " + averr(o.oc->pb->error));
+    // The HDR10+ metadata beside the file too (named after it, an image sequence's frame number left out). The video
+    // is done by now: a JSON that cannot be written is warned about, never a reason to lose the export.
+    if (!hdr10.empty()) {
+        const size_t slash = s.path.find_last_of("/\\"), dot = s.path.find_last_of('.');
+        std::string stem = s.path.substr(0, dot != std::string::npos && (slash == std::string::npos || dot > slash) ? dot : s.path.size());
+        if (const size_t pct = stem.find('%'); pct != std::string::npos && (slash == std::string::npos || pct > slash)) {
+            size_t cut = pct;
+            if (cut > 0 && (stem[cut - 1] == '_' || stem[cut - 1] == '.' || stem[cut - 1] == '-')) --cut;
+            stem.erase(cut);
+        }
+        std::string e;
+        if (!writeHdr10PlusJson(stem + ".hdr10plus.json", hdr10, in, out, &e)) qWarning("HDR10+ JSON not written beside %s: %s", s.path.c_str(), e.c_str());
+    }
     if (smartRendered) *smartRendered = smart ? smart->copied() : 0;
     if (light) *light = measured;
     return true;
 }
 
 }  // namespace
+
+std::string hdr10PlusCarriage(const Sequence& seq, const ExportSettings& s) {
+    const std::string& c = s.videoCodec;
+    if (c.empty() || c == "none" || c == "gif" || c == "exr") return {};
+    const ColorSpace* chosen = findColorSpace(s.colorSpace);
+    const ColorSpace& out = chosen && !chosen->sceneReferred ? *chosen : sequenceColorSpace(seq);
+    if (out.transfer != Transfer::Pq) return {};
+    const bool video = c == "libx265" || c == "hw_hevc" || c.rfind("hevc_", 0) == 0 || c == "libsvtav1" || c == "libaom-av1" ||
+                       c == "librav1e" || c.rfind("av1_", 0) == 0;
+    return video ? "video" : "json";
+}
 
 bool exportCodecCarries(const std::string& codecName, const std::string& layout) {
     AVChannelLayout want{};
@@ -1535,7 +1684,11 @@ bool exportCodecCarries(const std::string& codecName, const std::string& layout)
 }
 
 std::string exportAudioLayout(const std::string& layout, const std::string& codec) {
-    if (codec.empty() || codec == "none" || exportCodecCarries(codec, layout)) return layout;
+    if (codec.empty() || codec == "none") return layout;
+    // An ambisonic field goes into PCM or AAC (as YouTube takes it); anything else hears it as stereo.
+    if (ambisonicLayout(layout))
+        return codec.rfind("pcm_", 0) == 0 || codec == "aac" || codec == "libfdk_aac" || codec == "aac_at" ? layout : "stereo";
+    if (exportCodecCarries(codec, layout)) return layout;
     const std::string ear = earLevelLayout(layout);
     if (ear != layout && exportCodecCarries(codec, ear)) return ear;
     if (layoutChannels(layout) > 6 && exportCodecCarries(codec, "5.1")) return "5.1";
@@ -1594,6 +1747,16 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
         ok = exportImpl(p, work, settings, progress, cancel, error, opened, encoderUsed, smartRendered, light);
     } else {
         ok = exportImpl(p, seq, s, progress, cancel, error, opened, encoderUsed, smartRendered, light);
+    }
+    // An ambisonic mix in MP4 or MOV: the Spatial Audio box, so YouTube and players hear it as a field.
+    if (ok && ambisonicLayout(layout) && !s.downmixStereo && !s.audioCodec.empty() && s.audioCodec != "none") {
+        std::string ext = std::filesystem::path(s.path).extension().string();
+        for (char& ch : ext) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+        // The export is good either way: without the box players hear four channels rather than a field, which is no
+        // reason to throw the file away.
+        std::string why;
+        if ((ext == ".mp4" || ext == ".m4a" || ext == ".mov" || ext == ".m4v") && !writeSpatialAudioBox(s.path, 1, &why))
+            qWarning("Spatial audio metadata not added to %s: %s", s.path.c_str(), why.c_str());
     }
     // Never leave a truncated file behind (the output is closed by now), but
     // don't touch an existing file if we failed before writing to it.

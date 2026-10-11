@@ -539,7 +539,20 @@ QJsonObject sequenceToJson(const Sequence& s) {
     if (s.hdrPeakNits != 1000) o["hdrPeakNits"] = s.hdrPeakNits;
     if (s.hdrMaxCll > 0) o["hdrMaxCll"] = s.hdrMaxCll;
     if (s.hdrMaxFall > 0) o["hdrMaxFall"] = s.hdrMaxFall;
+    if (!s.hdr10Plus.empty()) {
+        // Each scene as [start, end, maxR, maxG, maxB, average, seven percentiles, key].
+        QJsonArray scenes;
+        for (const Hdr10PlusScene& sc : s.hdr10Plus) {
+            QJsonArray a{double(sc.start), double(sc.end), sc.maxScl[0], sc.maxScl[1], sc.maxScl[2], sc.average};
+            for (double v : sc.percentiles) a.append(v);
+            a.append(qs(sc.key));
+            scenes.append(a);
+        }
+        o["hdr10Plus"] = scenes;
+    }
     if (s.spherical) o["spherical"] = true;
+    if (s.vr180) o["vr180"] = true;
+    if (s.stereo3d) o["stereo3d"] = true;
     if (s.audioLayout != "stereo") o["audioLayout"] = qs(s.audioLayout);
     return o;
 }
@@ -566,7 +579,23 @@ Sequence sequenceFromJson(const QJsonObject& o) {
     s.hdrPeakNits = std::clamp(o.value("hdrPeakNits").toDouble(1000), 100.0, 10000.0);
     s.hdrMaxCll = std::clamp(o.value("hdrMaxCll").toDouble(0), 0.0, 10000.0);
     s.hdrMaxFall = std::clamp(o.value("hdrMaxFall").toDouble(0), 0.0, s.hdrMaxCll);
+    for (const auto& v : o.value("hdr10Plus").toArray()) {
+        const QJsonArray a = v.toArray();
+        if (a.size() != 14) continue;
+        Hdr10PlusScene sc;
+        sc.start = FrameTime(a.at(0).toDouble());
+        sc.end = FrameTime(a.at(1).toDouble());
+        if (sc.end <= sc.start || (!s.hdr10Plus.empty() && sc.start < s.hdr10Plus.back().end)) continue;
+        auto nits = [&](int i) { return std::clamp(a.at(i).toDouble(), 0.0, 10000.0); };
+        for (int c = 0; c < 3; ++c) sc.maxScl[c] = nits(2 + c);
+        sc.average = nits(5);
+        for (int i = 0; i < 7; ++i) sc.percentiles[i] = nits(6 + i);
+        sc.key = ss(a.at(13));
+        s.hdr10Plus.push_back(sc);
+    }
     s.spherical = o.value("spherical").toBool(false);
+    s.vr180 = o.value("vr180").toBool(false);
+    s.stereo3d = o.value("stereo3d").toBool(false);
     s.audioLayout = o.contains("audioLayout") ? ss(o.value("audioLayout")) : "stereo";
     if (std::find(audioLayouts().begin(), audioLayouts().end(), s.audioLayout) == audioLayouts().end()) s.audioLayout = "stereo";
     for (const auto& t : o.value("video").toArray()) s.videoTracks.push_back(trackFromJson(t.toObject(), TrackKind::Video));
@@ -674,7 +703,8 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
                      {"version", kProjectFormatVersion},
                      {"name", qs(p.name)},
                      {"activeSequence", double(p.activeSequence)},
-                     {"nextId", double(p.nextId)}};
+                     {"nextId", double(p.nextId)},
+                     {"mediaStereo", 1}};  // the media's stereo packing is recorded
     QJsonArray media;
     for (const auto& m : p.media) {
         QJsonObject o{{"id", double(m.id)},
@@ -698,6 +728,8 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
         if (!m.colorSpace.empty()) o["colorSpace"] = qs(m.colorSpace);
         if (!m.colorOverride.empty()) o["colorOverride"] = qs(m.colorOverride);
         if (!m.projection.empty()) o["projection"] = qs(m.projection);
+        if (m.ambisonic > 0) o["ambisonic"] = m.ambisonic;
+        if (!m.stereo.empty()) o["stereo"] = qs(m.stereo);
         if (m.timecode >= 0) o["timecode"] = m.timecode;
         if (!m.audioChannelMode.empty()) o["audioChannelMode"] = qs(m.audioChannelMode);
         if (m.audioStreams.size() > 1) {
@@ -793,6 +825,7 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
     p.name = ss(root.value("name"));
     p.activeSequence = Id(i64(root.value("activeSequence")));
     p.nextId = Id(i64(root.value("nextId"), 1));
+    p.stereoChecked = root.value("mediaStereo").toInt() >= 1;
     for (const auto& mv : root.value("media").toArray()) {
         QJsonObject o = mv.toObject();
         MediaItem m;
@@ -839,6 +872,8 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
         m.colorSpace = ss(o.value("colorSpace"));
         m.colorOverride = ss(o.value("colorOverride"));
         m.projection = ss(o.value("projection"));
+        m.ambisonic = std::clamp(o.value("ambisonic").toInt(0), 0, 7);
+        m.stereo = ss(o.value("stereo"));
         m.timecode = o.value("timecode").toDouble(-1);
         for (const auto& v : o.value("audioStreams").toArray()) m.audioStreams.push_back(std::max(1, v.toInt(1)));
         m.audioChannelMode = ss(o.value("audioChannelMode"));

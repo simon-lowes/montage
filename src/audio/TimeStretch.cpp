@@ -15,13 +15,16 @@ namespace montage {
 
 namespace {
 
-// Mono, and the same averaged over four samples, for finding where grains line up.
+// Mono (an ambisonic field's W, its omnidirectional part), and the same averaged over four samples, for finding where
+// grains line up.
 struct Guide {
     std::vector<float> mono, coarse;
     explicit Guide(const AudioBuffer& in) {
         const int64_t n = in.frames();
+        const size_t nch = size_t(std::max(1, in.channels));
         mono.resize(size_t(n));
-        for (int64_t i = 0; i < n; ++i) mono[size_t(i)] = 0.5f * (in.samples[size_t(i) * 2] + in.samples[size_t(i) * 2 + 1]);
+        for (int64_t i = 0; i < n; ++i)
+            mono[size_t(i)] = nch == 2 ? 0.5f * (in.samples[size_t(i) * 2] + in.samples[size_t(i) * 2 + 1]) : in.samples[size_t(i) * nch];
         coarse.resize(size_t(n / 4));
         for (size_t i = 0; i < coarse.size(); ++i) coarse[i] = 0.25f * (mono[i * 4] + mono[i * 4 + 1] + mono[i * 4 + 2] + mono[i * 4 + 3]);
     }
@@ -55,7 +58,9 @@ int stretchHop(int sampleRate) { return std::max(64, int(std::lround(sampleRate 
 
 void wsolaStretch(const AudioBuffer& in, const std::vector<double>& positions, int hop, int64_t outFrames, AudioBuffer& out) {
     out.sampleRate = in.sampleRate;
-    out.samples.assign(size_t(std::max<int64_t>(0, outFrames)) * 2, 0.0f);
+    out.channels = std::max(1, in.channels);
+    const size_t nch = size_t(out.channels);  // every channel cut at the same places, so a field keeps its directions
+    out.samples.assign(size_t(std::max<int64_t>(0, outFrames)) * nch, 0.0f);
     if (outFrames <= 0 || positions.empty() || in.frames() == 0) return;
     const int64_t N = int64_t(hop) * 2, half = hop;  // grains twice the hop: Hann windows that add up to one
     const int64_t tolerance = hop / 2;               // how far a grain may move to line up
@@ -98,15 +103,12 @@ void wsolaStretch(const AudioBuffer& in, const std::vector<double>& positions, i
             const float w = window[size_t(i)];
             weight[size_t(o)] += w;
             if (s < 0 || s >= n) continue;
-            out.samples[size_t(o) * 2] += w * src[size_t(s) * 2];
-            out.samples[size_t(o) * 2 + 1] += w * src[size_t(s) * 2 + 1];
+            for (size_t c = 0; c < nch; ++c) out.samples[size_t(o) * nch + c] += w * src[size_t(s) * nch + c];
         }
     }
     for (int64_t o = 0; o < outFrames; ++o)
-        if (weight[size_t(o)] > 1e-6f) {
-            out.samples[size_t(o) * 2] /= weight[size_t(o)];
-            out.samples[size_t(o) * 2 + 1] /= weight[size_t(o)];
-        }
+        if (weight[size_t(o)] > 1e-6f)
+            for (size_t c = 0; c < nch; ++c) out.samples[size_t(o) * nch + c] /= weight[size_t(o)];
 }
 
 int stretchesRunning() { return gRunning.load(); }

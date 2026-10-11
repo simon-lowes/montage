@@ -7,7 +7,8 @@
 // modification time; plugins that fail to load go on a blocklist until the
 // file changes or the user retries them.
 //
-// Hosting runs a plugin on stereo audio as a clip effect (type "plugin").
+// Hosting runs a plugin on stereo audio as a clip effect (type "plugin"), with another track as its key input when
+// it has one (a sidechain).
 #pragma once
 
 #include <cstdint>
@@ -77,6 +78,15 @@ public:
     virtual std::string saveState() = 0;
     virtual bool loadState(const std::string& state) = 0;
     virtual int latencySamples() { return 0; }
+    // A key input (sidechain), as compressors, gates and duckers have: CLAP's second audio input port, a VST3
+    // auxiliary input bus, LV2 audio inputs marked lv2:isSideChain. setSidechain() gives the key for the next
+    // process() call (`channels` buffers of at least its frames, valid until it returns); null is silence, which a
+    // plugin with a key input hears when none is chosen.
+    virtual bool hasSidechain() { return false; }
+    virtual void setSidechain(const float* const* channels, int numChannels) {}
+    // Whether a key is chosen at all. A VST3 plugin's auxiliary bus is switched on only then (DAWs leave it off until
+    // a key is chosen, and plugins that follow it would otherwise listen to silence); the others ignore it.
+    virtual void enableSidechain(bool on) {}
     // Clears internal audio state (delay lines, envelopes) after a seek.
     virtual void reset() {}
 
@@ -92,6 +102,8 @@ public:
 };
 
 std::unique_ptr<Instance> instantiate(const Descriptor& d, std::string* error = nullptr);
+// Whether a plugin (by descriptor id) has turned out to have a key input, once any instance of it was made here.
+bool knownSidechain(const std::string& id);
 // Plugins loaded by this process so far (crash reports note whether plugins were in use).
 int instancesCreated();
 

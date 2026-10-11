@@ -110,6 +110,15 @@ constexpr double kDiA = 0.0075, kDiB = 7.0, kDiC = 0.07329248, kDiM = 10.4442685
 double linearToDavinciIntermediate(double x) { return x <= kDiLinCut ? x * kDiM : (std::log2(x + kDiA) + kDiB) * kDiC; }
 double davinciIntermediateToLinear(double y) { return y <= kDiLogCut ? y / kDiM : std::pow(2.0, y / kDiC - kDiB) - kDiA; }
 
+// GoPro's log curves: V = ln(L (b - 1) + 1) / ln b over sensor linear L (1 = clip), with 18 % grey at L = 0.0517
+// (0.18 x 2^-1.8: GP-Log2's white paper), so scene reflectance is L x 2^1.8 (assumed alike for GP-Log).
+constexpr double kGoProGrey = 3.4822022531844965;  // 2^1.8
+double linearToGoPro(double x, double b) { return std::log(std::max(x / kGoProGrey * (b - 1) + 1, 1e-9)) / std::log(b); }
+double goProToLinear(double v, double b) { return (std::pow(b, v) - 1) / (b - 1) * kGoProGrey; }
+// Leica L-Log (L-Log Reference Manual 1.6; the two pieces meet at 0.006 encoding and 0.138 decoding, as published).
+double linearToLlog(double x) { return x <= 0.006 ? 8 * x + 0.09 : 0.27 * std::log10(1.3 * x + 0.0115) + 0.6; }
+double llogToLinear(double v) { return v <= 0.138 ? (v - 0.09) / 8 : (std::pow(10.0, (v - 0.6) / 0.27) - 0.0115) / 1.3; }
+
 double acescctToLinear(double v) {
     if (v <= 0.155251141552511) return (v - 0.0729055341958355) / 10.5402377416545;
     return std::min(65504.0, std::pow(2.0, v * 17.52 - 9.72));
@@ -138,6 +147,7 @@ Chroma chroma(Primaries p) {
         case Primaries::RedWideGamut: return {0.780308, 0.304253, 0.121595, 1.493994, 0.095612, -0.084589, wx, wy};
         case Primaries::BmdWideGamut: return {0.7177215, 0.3171181, 0.2280410, 0.8615690, 0.1005841, -0.0820452, 0.3127170, 0.3290312};
         case Primaries::DavinciWideGamut: return {0.8000, 0.3130, 0.1682, 0.9877, 0.0790, -0.1155, wx, wy};
+        case Primaries::AppleWideGamut: return {0.725, 0.301, 0.221, 0.814, 0.068, -0.076, wx, wy};  // Apple Gamut (Apple Log 2)
     }
     return chroma(Primaries::Bt709);
 }
@@ -208,11 +218,15 @@ const std::vector<ColorSpace>& colorSpaces() {
         {"clog3-cinemagamut", "Canon Log 3 / Cinema Gamut", Primaries::CinemaGamut, Transfer::CLog3, true},
         {"slog3-sgamut3", "Sony S-Log3 / S-Gamut3", Primaries::SGamut3, Transfer::SLog3, true},
         {"applelog-rec2020", "Apple Log (iPhone) / Rec.2020", Primaries::Bt2020, Transfer::AppleLog, true},
+        {"applelog2-applewg", "Apple Log 2 (iPhone 17 Pro) / Apple Gamut", Primaries::AppleWideGamut, Transfer::AppleLog, true},
         {"dlog-dgamut", "DJI D-Log / D-Gamut", Primaries::DGamut, Transfer::DLog, true},
         {"flog2-fgamut", "Fujifilm F-Log2 / F-Gamut", Primaries::Bt2020, Transfer::FLog2, true},
         {"nlog-ngamut", "Nikon N-Log / N-Gamut", Primaries::Bt2020, Transfer::NLog, true},
         {"log3g10-rwg", "RED Log3G10 / REDWideGamutRGB", Primaries::RedWideGamut, Transfer::Log3G10, true},
         {"bmdfilm5-bmdwg", "Blackmagic Film Gen 5 / Wide Gamut", Primaries::BmdWideGamut, Transfer::BmdFilmGen5, true},
+        {"gplog-rec709", "GoPro GP-Log / Rec.709", Primaries::Bt709, Transfer::GoProLog, true},
+        {"gplog2-rec2020", "GoPro GP-Log2 / Rec.2020", Primaries::Bt2020, Transfer::GoProLog2, true},
+        {"llog-rec2020", "Leica L-Log / Rec.2020", Primaries::Bt2020, Transfer::LLog, true},
         {"di-dwg", "DaVinci Intermediate / Wide Gamut", Primaries::DavinciWideGamut, Transfer::DavinciIntermediate, true},
         {"acescct", "ACEScct", Primaries::Ap1, Transfer::AcesCct, true},
         {"aces2065-1", "ACES2065-1 (linear AP0)", Primaries::Ap0, Transfer::Linear, true},
@@ -276,6 +290,9 @@ double toLinear(Transfer t, double v) {
         case Transfer::Log3G10: return log3g10ToLinear(v);
         case Transfer::BmdFilmGen5: return bmdGen5ToLinear(v);
         case Transfer::DavinciIntermediate: return davinciIntermediateToLinear(v);
+        case Transfer::GoProLog: return goProToLinear(v, 400);
+        case Transfer::GoProLog2: return goProToLinear(v, 600);
+        case Transfer::LLog: return llogToLinear(v);
     }
     return v;
 }
@@ -300,6 +317,9 @@ double fromLinear(Transfer t, double l) {
         case Transfer::Log3G10: return linearToLog3g10(l);
         case Transfer::BmdFilmGen5: return linearToBmdGen5(l);
         case Transfer::DavinciIntermediate: return linearToDavinciIntermediate(l);
+        case Transfer::GoProLog: return linearToGoPro(l, 400);
+        case Transfer::GoProLog2: return linearToGoPro(l, 600);
+        case Transfer::LLog: return linearToLlog(l);
     }
     return l;
 }

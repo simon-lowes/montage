@@ -126,8 +126,15 @@ struct MediaItem {
     std::string bin;         // bin path, "/" between nested bins ("Interviews/Day 1"), "" = the project root
     std::string colorSpace;     // detected from the file's colour tags (ColorSpace.h id), "" = Rec.709
     std::string colorOverride;  // Interpret Colour: the space to read it as, "" = as detected
-    // 360° footage: "equirect" (from the file's spherical metadata, or set by hand), "" = a flat picture.
+    // 360° footage: "equirect" or "vr180" (the half in front; from the file's spherical metadata, or set by hand),
+    // "" = a flat picture.
     std::string projection;
+    // Ambisonic sound (core/Ambisonics.h): its order (1 = first-order AmbiX, four channels W Y Z X), from the file's
+    // spatial audio metadata (MP4 SA3D) or set by hand; 0 = channels for speakers.
+    int ambisonic = 0;
+    // Stereoscopic 3D footage: how its two eyes are packed ("sbs", "sbs_half", "tb", "tb_half"; core/Interpretation.h),
+    // from the file's stereo metadata or Interpret Footage; "" = a flat picture. Its size is one eye's, as shown.
+    std::string stereo;
     double timecode = -1;       // start timecode in seconds (for multicam sync), -1 = none
     // Speech-to-text of the media's audio (shared: undo snapshots copy the pointer).
     std::shared_ptr<const Transcript> transcript;
@@ -285,6 +292,17 @@ struct Clip {
 // A colour group (Resolve's groups, core/ColorGroups.h): clips graded together. Its pre-clip grade runs on each member
 // before the clip's own effects (to match the shots), its post-clip grade after them (the group's look). Keyframes in
 // either are timed from each clip's start.
+// One scene of HDR10+ dynamic metadata (SMPTE ST 2094-40): what an HDR10+ display needs to tone map it, measured on
+// the PQ picture in linear light (render/Hdr10Plus.h).
+struct Hdr10PlusScene {
+    FrameTime start = 0, end = 0;   // sequence frames [start, end)
+    double maxScl[3] = {0, 0, 0};   // cd/m²: the brightest red, green and blue anywhere in the scene
+    double average = 0;             // cd/m²: the mean over the scene of each pixel's brightest channel (maxRGB)
+    double percentiles[7] = {};     // cd/m²: maxRGB at 1, 25, 50, 75, 90, 95 and 99.98 % of the scene's pixels
+    std::string key;                // a fingerprint of the frames measured, to tell when the cut has changed under it
+    bool operator==(const Hdr10PlusScene&) const = default;
+};
+
 struct ColorGroup {
     Id id = 0;      // also the owner of its pre-clip effects (edit::effectChain)
     Id postId = 0;  // the owner of its post-clip effects
@@ -386,7 +404,12 @@ struct Sequence {
     std::string colorSpace = "rec709";  // working and delivery space (ColorSpace.h id)
     double hdrPeakNits = 1000;          // mastering peak for HDR spaces
     double hdrMaxCll = 0, hdrMaxFall = 0;  // measured light levels (Analyse HDR Light Levels), nits; 0 = not measured
+    std::vector<Hdr10PlusScene> hdr10Plus;  // HDR10+ metadata from the same analysis (PQ only), in time order
     bool spherical = false;             // a 360° sequence (equirectangular): exports say so to players and YouTube
+    bool vr180 = false;                 // with spherical: half the sphere in front (VR180), as stereo VR180 cameras shoot
+    // Stereoscopic 3D: the sequence is made for two eyes (its size is one eye's); each is rendered from stereo footage's
+    // own eye, clips' Stereo 3D effect placing them in depth; exports pack the eyes (render/Stereo.h).
+    bool stereo3d = false;
     FrameTime inPoint = -1;   // In / Out marks; both frames are included, -1 = unset
     FrameTime outPoint = -1;
     FrameTime playhead = 0;
@@ -408,6 +431,9 @@ struct Project {
     std::vector<std::string> watchFolders;  // folders whose arriving media files are imported (app/EditorState)
     Id activeSequence = 0;
     Id nextId = 1;
+    // Whether its media's stereo packing (MediaItem::stereo) has been read: false for a project saved before Montage
+    // read it, until media/Decoder.h checkStereoMedia looks (not saved).
+    bool stereoChecked = true;
 
     Id newId() { return nextId++; }
     MediaItem* findMedia(Id id);

@@ -7,6 +7,7 @@
 #include "CameraRaw.h"
 #include "Decoder.h"
 #include "ImageSequence.h"
+#include "ProResRaw.h"
 
 namespace montage {
 
@@ -17,6 +18,7 @@ Rational fileFrameRate(const MediaItem& m) {
 }
 
 bool isRawMedia(const MediaItem& m) {
+    if (m.videoCodec == "prores_raw") return proResRawAvailable();
     const std::string file = uninterpretedPath(m.path);
     if (ImageSequence seq; parseImageSequencePath(file, seq)) return isRawPath(seq.pattern);
     return isRawPath(file);
@@ -53,12 +55,15 @@ Result interpretFootage(Project& p, Id media, Interpretation i) {
     if (i.alpha == "straight") i.alpha.clear();
     if (!validRawHighlights(i.rawHighlights)) return Result::fail("Highlights are clip, blend or rebuild");
     if (i.rawHighlights == "clip") i.rawHighlights.clear();
-    if (i.hasRaw() && !isRawMedia(*m)) return Result::fail("Camera RAW settings are for camera RAW stills and CinemaDNG");
+    if (i.hasRaw() && !isRawMedia(*m)) return Result::fail("Camera RAW settings are for camera RAW stills, CinemaDNG and ProRes RAW");
+    if (m->videoCodec == "prores_raw") i.rawHighlights.clear();  // (ProRes RAW clips at the sensor's white itself)
     if (i.rawExposure < -5 || i.rawExposure > 5) return Result::fail("Exposure must be -5 to +5 stops");
     if (i.rawTemperature != 0 && (i.rawTemperature < 2000 || i.rawTemperature > 25000)) return Result::fail("The temperature must be 2000 to 25000 K");
     if (i.rawTint < -150 || i.rawTint > 150) return Result::fail("The tint must be -150 to 150");
+    if (!validStereoLayout(i.stereo)) return Result::fail("Stereo 3D is none, sbs, sbs_half, tb or tb_half");
+    i.eye = 0;  // which eye is read is the renderer's choice, never the media's
     const bool still = m->kind == MediaKind::Image;
-    if (still) i.fps = Rational{0, 1}, i.fields.clear(), i.keepPitch = false;
+    if (still) i.fps = Rational{0, 1}, i.fields.clear(), i.keepPitch = false, i.stereo.clear(), i.swapEyes = false;
     // An image sequence's rate is part of its own path.
     bool changed = false;
     if (ImageSequence seq; parseImageSequencePath(m->path, seq)) {
@@ -83,6 +88,7 @@ Result interpretFootage(Project& p, Id media, Interpretation i) {
     m->proxyPath.clear();
     m->width = probe.width;
     m->height = probe.height;
+    m->stereo = probe.stereo;
     if (!still) {
         m->fps = probe.fps;
         m->duration = probe.duration;
@@ -123,6 +129,7 @@ Result interpretFootage(Project& p, Id media, Interpretation i) {
         sub.proxyPath.clear();
         sub.width = m->width;
         sub.height = m->height;
+        sub.stereo = m->stereo;
         if (!still) {
             sub.fps = m->fps;
             sub.duration = sub.subclipOut - sub.subclipIn;

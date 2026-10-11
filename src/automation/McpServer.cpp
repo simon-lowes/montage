@@ -34,6 +34,7 @@
 #include "render/Adm.h"
 #include "render/Imf.h"
 #include "render/LightLevel.h"
+#include "render/Hdr10Plus.h"
 #include "render/Spherical.h"
 #include "render/ClipPlacement.h"
 #include "audio/SpeechCleanup.h"
@@ -58,6 +59,8 @@
 #include "core/Bleep.h"
 #include "audio/SpectralRepair.h"
 #include "core/Checkerboard.h"
+#include "core/Ale.h"
+#include "core/Cdl.h"
 #include "core/EditOps.h"
 #include "core/TimelineCompare.h"
 #include "core/Reconform.h"
@@ -69,6 +72,7 @@
 #include "core/MediaLog.h"
 #include "core/ProjectIO.h"
 #include "core/ScriptCut.h"
+#include "core/Ambisonics.h"
 #include "core/Surround.h"
 #include "core/TranscriptEdit.h"
 #include "media/DualSystem.h"
@@ -108,6 +112,8 @@
 #include "render/Shorts.h"
 #include "render/Letterbox.h"
 #include "render/Processing.h"
+#include "core/Production.h"
+#include "core/ProjectLock.h"
 
 namespace montage {
 
@@ -206,12 +212,18 @@ Loaded open(const QJsonObject& a) {
     std::string err;
     if (!loadProject(l.path.toStdString(), l.project, &err))
         throw ArgError{QStringLiteral("Cannot open %1: %2").arg(l.path, QString::fromStdString(err))};
+    checkStereoMedia(l.project);
     if (!l.project.active()) throw ArgError{QStringLiteral("%1 has no sequence").arg(l.path)};
     return l;
 }
 
-// Saves, keeping the previous version as <project>.bak for montage_undo.
+// Saves, keeping the previous version as <project>.bak for montage_undo. A project someone has open to edit in
+// Montage (its lock held by another process: core/ProjectLock.h) is not written behind their back.
 void save(Loaded& l) {
+    if (const LockStatus st = projectLockStatus(l.path.toStdString()); st.state == LockState::Theirs)
+        throw ArgError{QStringLiteral("%1 is editing %2 in Montage: make the change through Montage's live agent link, or once they have "
+                                      "closed it")
+                           .arg(QString::fromStdString(st.owner.describe()), QFileInfo(l.path).fileName())};
     const QString bak = l.path + ".bak";
     if (QFileInfo::exists(l.path)) {
         QFile::remove(bak);
@@ -243,7 +255,7 @@ QJsonObject clipJson(const Project& p, const Sequence& s, const Clip& c) {
                   {"duration_seconds", secs(c.duration, s)}};
     if (c.isGenerator()) {
         o["generator"] = QString::fromStdString(c.generator.type);
-        if (c.generator.type == "title") o["text"] = QString::fromStdString(c.generator.s("text"));
+        if (c.generator.type.rfind("title", 0) == 0) o["text"] = QString::fromStdString(c.generator.s("text"));
     } else if (const MediaItem* m = p.findMedia(c.mediaId)) {
         o["media"] = QString::fromStdString(m->path.empty() ? m->name : m->path);
         o["source_in_seconds"] = c.sourceIn / s.fpsValue();
@@ -311,6 +323,8 @@ QJsonObject interpretationJson(const MediaItem& m) {
     if (i.rawTint != 0) o["raw_tint"] = i.rawTint;
     if (!i.rawHighlights.empty()) o["raw_highlights"] = QString::fromStdString(i.rawHighlights);
     if (i.rawHalf) o["raw_half"] = true;
+    if (!i.stereo.empty()) o["stereo"] = QString::fromStdString(i.stereo);
+    if (i.swapEyes) o["swap_eyes"] = true;
     return o;
 }
 
@@ -686,6 +700,75 @@ void McpServer::Impl::addTools() {
             return ok(text, out);
         });
 
+    add("montage_production", "List or make a production",
+        "A production is a folder of a team's projects on a shared drive (Premiere's Productions, Avid's shared projects): "
+        "lists its projects with who is editing each (a project being edited cannot be changed by these tools), or makes "
+        "the folder a production with `create`.",
+        R"json({"type":"object","properties":{"folder":{"type":"string"},"create":{"type":"boolean","default":false},
+            "name":{"type":"string","description":"The production's name when making one"}},"required":["folder"]})json",
+        true, [](const QJsonObject& a) {
+            const QString folder = absolute(need(a, "folder"));
+            if (!isProduction(folder.toStdString())) {
+                if (!a.value("create").toBool()) return fail(QStringLiteral("%1 is not a production (pass create to make it one)").arg(folder));
+                std::string err;
+                if (!createProduction(folder.toStdString(), str(a, "name").toStdString(), &err)) return fail(QString::fromStdString(err));
+            }
+            QJsonArray projects;
+            QStringList lines;
+            for (const ProductionProject& pp : listProduction(folder.toStdString())) {
+                QString status = QStringLiteral("free");
+                if (pp.lock.state == LockState::Theirs || pp.lock.state == LockState::Mine)
+                    status = QStringLiteral("editing: ") + QString::fromStdString(pp.lock.owner.describe());
+                else if (pp.lock.state == LockState::Stale)
+                    status = QStringLiteral("free (left open by %1)").arg(QString::fromStdString(pp.lock.owner.describe()));
+                projects.append(QJsonObject{{"project", QString::fromStdString(pp.path)},
+                                            {"name", QString::fromStdString(pp.relative)},
+                                            {"status", status},
+                                            {"editor", pp.lock.state == LockState::Theirs || pp.lock.state == LockState::Mine
+                                                           ? QString::fromStdString(pp.lock.owner.describe())
+                                                           : QString()},
+                                            {"saved", pp.modified.toUTC().toString(Qt::ISODate)}});
+                lines << QStringLiteral("%1 — %2").arg(QString::fromStdString(pp.relative), status);
+            }
+            const QString name = QString::fromStdString(productionName(folder.toStdString()));
+            return ok(QStringLiteral("Production \"%1\": %2 project(s)%3").arg(name).arg(projects.size()).arg(lines.isEmpty() ? QString() : "\n" + lines.join('\n')),
+                      QJsonObject{{"production", name}, {"folder", folder}, {"projects", projects}});
+        });
+
+    add("montage_import_from_project", "Bring sequences from another project",
+        "Copy sequences (by name; all when none are named) from another .montage project into this one, with the "
+        "sequences they nest and the media their clips play (linked where it is; files the project has are not added "
+        "twice), each as a sequence of its own. The first becomes active.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"from":{"type":"string","description":"The .montage project to copy from"},
+            "sequences":{"type":"array","items":{"type":"string"}}},"required":["project","from"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Project from;
+            std::string err;
+            const QString src = absolute(need(a, "from"));
+            if (!loadProject(src.toStdString(), from, &err)) return fail(QStringLiteral("Cannot open %1: %2").arg(src, QString::fromStdString(err)));
+            checkStereoMedia(from);
+            QStringList names;
+            for (const QJsonValue& v : a.value("sequences").toArray()) names << v.toString();
+            std::vector<Id> wanted;
+            for (const Sequence& s : from.sequences)
+                if (names.isEmpty() || names.contains(QString::fromStdString(s.name))) wanted.push_back(s.id);
+            for (const QString& n : names)
+                if (std::none_of(from.sequences.begin(), from.sequences.end(), [&](const Sequence& s) { return QString::fromStdString(s.name) == n; }))
+                    return fail(QStringLiteral("%1 has no sequence \"%2\"").arg(QFileInfo(src).fileName(), n));
+            const std::vector<Id> made = importFromProject(l.project, from, wanted);
+            if (made.empty()) return fail("Nothing to import");
+            l.project.activeSequence = made.front();
+            save(l);
+            QJsonArray seqs;
+            for (Id id : made) {
+                const Sequence* s = l.project.findSequence(id);
+                seqs.append(QJsonObject{{"id", double(id)}, {"name", s ? QString::fromStdString(s->name) : QString()}});
+            }
+            return ok(QStringLiteral("Imported %1 sequence(s) from %2").arg(made.size()).arg(QFileInfo(src).fileName()),
+                      QJsonObject{{"sequences", seqs}, {"project", l.path}});
+        });
+
     add("montage_create_project", "Create a project",
         "Create a .montage project with the given media laid end to end on V1/A1. The sequence takes the first video's "
         "size and frame rate unless width, height or fps are given.",
@@ -693,7 +776,7 @@ void McpServer::Impl::addTools() {
             "project":{"type":"string","description":"Path of the .montage file to write"},
             "media":{"type":"array","items":{"type":"string"},"description":"Media files, in order"},
             "width":{"type":"integer"},"height":{"type":"integer"},"fps":{"type":"number"},
-            "audio_layout":{"type":"string","enum":["stereo","5.1","7.1","5.1.2","5.1.4","7.1.2","7.1.4"],"default":"stereo"}},
+            "audio_layout":{"type":"string","enum":["stereo","5.1","7.1","5.1.2","5.1.4","7.1.2","7.1.4","ambix"],"default":"stereo"}},
             "required":["project"]})json",
         false, [](const QJsonObject& a) {
             Loaded l;
@@ -721,7 +804,7 @@ void McpServer::Impl::addTools() {
             if (a.contains("audio_layout")) {
                 const std::string layout = a.value("audio_layout").toString().toStdString();
                 if (std::find(audioLayouts().begin(), audioLayouts().end(), layout) == audioLayouts().end())
-                    throw ArgError{"\"audio_layout\" must be stereo, 5.1, 7.1, 5.1.2, 5.1.4, 7.1.2 or 7.1.4"};
+                    throw ArgError{"\"audio_layout\" must be stereo, 5.1, 7.1, 5.1.2, 5.1.4, 7.1.2, 7.1.4 or ambix"};
                 s.audioLayout = layout;
             }
             FrameTime at = 0;
@@ -1419,11 +1502,14 @@ void McpServer::Impl::addTools() {
         "Add a text title over the picture at a time, for a duration (default 3 s), on a video track (default: the "
         "track above the top one in use). template picks a ready-made, animated design (a lower third takes two lines: "
         "name, newline, role; credits roll up the frame, a crawl runs along the bottom); the text replaces its sample text. "
-        "motion makes any title roll or crawl, starting and ending off screen.",
+        "motion makes any title roll or crawl, starting and ending off screen. The 3d template is extruded text turned in "
+        "space and lit (Final Cut's 3D titles), `depth` deep, spinning in with `spin_in`.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"text":{"type":"string"},
             "at":{"type":["number","string"]},"duration":{"type":["number","string"],"default":3},
             "track":{"type":"string"},"size":{"type":"number","description":"Font size in pixels"},
-            "template":{"type":"string","enum":["plain","lower_third","lower_third_box","centred","chapter","callout","typewriter","cascade","pop_words","drop","wave","decode","end_card","credits","crawl"],"default":"plain"},
+            "template":{"type":"string","enum":["plain","lower_third","lower_third_box","centred","chapter","callout","typewriter","cascade","pop_words","drop","wave","decode","end_card","credits","crawl","3d"],"default":"plain"},
+            "depth":{"type":"number","description":"3d: how far the letters are extruded (pixels)"},
+            "spin_in":{"type":"boolean","description":"3d: spin in at the start"},
             "text_animation":{"type":"string","enum":["none","rise","fade","pop","drop","wave","scramble"],"description":"The text coming on a letter, word or line at a time"},
             "animate_by":{"type":"string","enum":["letter","word","line"],"default":"letter"},
             "animation_seconds":{"type":"number","default":1,"description":"How long the text animation takes across the whole text"},
@@ -1443,11 +1529,19 @@ void McpServer::Impl::addTools() {
             }
             const FrameTime len = a.contains("duration") ? timeArg(a.value("duration"), s, "duration") : FrameTime(std::llround(3 * s.fpsValue()));
             const QString tpl = str(a, "template", "plain");
-            const std::string type = tpl == "plain" ? std::string("title") : "title_" + tpl.toStdString();
-            if (type != "title" && !findTitleTemplate(type)) throw ArgError{QStringLiteral("Unknown template \"%1\"").arg(tpl)};
+            const std::string type = tpl == "plain" ? std::string("title") : tpl == "3d" ? std::string("title3d") : "title_" + tpl.toStdString();
+            if (type != "title" && type != "title3d" && !findTitleTemplate(type)) throw ArgError{QStringLiteral("Unknown template \"%1\"").arg(tpl)};
+            if (type == "title3d" && (a.contains("text_animation") || a.contains("motion")))
+                throw ArgError{"A 3D title has its own animation (spin_in); text_animation and motion are for flat titles"};
+            if (type != "title3d" && (a.contains("depth") || a.contains("spin_in"))) throw ArgError{"depth and spin_in are for the 3d template"};
             Clip c = makeGeneratorClip(l.project, type, std::max<FrameTime>(1, len));
             c.generator.strings["text"] = need(a, "text").toStdString();
-            if (a.value("size").isDouble()) c.generator.params["size"] = Param(a.value("size").toDouble());
+            for (const char* key : {"size", "depth"})
+                if (a.contains(key) && !a.value(key).isDouble()) throw ArgError{QStringLiteral("\"%1\" is a number").arg(key)};
+            if (a.contains("spin_in") && !a.value("spin_in").isBool()) throw ArgError{"\"spin_in\" is true or false"};
+            if (a.contains("size")) c.generator.params["size"] = Param(std::clamp(a.value("size").toDouble(), 4.0, 1000.0));
+            if (a.contains("depth")) c.generator.params["depth"] = Param(std::clamp(a.value("depth").toDouble(), 0.0, 1000.0));
+            if (a.value("spin_in").toBool()) c.generator.params["anim_in"] = Param(2.0);
             if (a.contains("text_animation")) {
                 const QStringList kinds{"none", "rise", "fade", "pop", "drop", "wave", "scramble"};
                 const int k = int(kinds.indexOf(str(a, "text_animation")));
@@ -1905,7 +1999,9 @@ void McpServer::Impl::addTools() {
         "brightest pixel in any frame, and MaxFALL, the highest frame-average light, in nits (CTA-861.3), each with where "
         "it happens, over `from` to `to` (default the whole sequence). With `save` (the default) they are kept with the "
         "sequence so exports that state them before the first frame (x265, Matroska) use them; MP4 and MOV exports "
-        "measure what they render anyway. Warns when MaxCLL is above the sequence's mastering peak.",
+        "measure what they render anyway. Warns when MaxCLL is above the sequence's mastering peak. A PQ sequence's "
+        "HDR10+ scenes are measured in the same pass (each scene's brightest red, green and blue, average and spread, "
+        "as ST 2094-40 sends them) and kept too, for exports with `hdr10plus`.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"from":{"type":["number","string"]},
             "to":{"type":["number","string"]},"save":{"type":"boolean","default":true}},"required":["project"]})json",
         false, [](const QJsonObject& a) {
@@ -1917,7 +2013,29 @@ void McpServer::Impl::addTools() {
             const FrameTime to = a.contains("to") ? timeArg(a.value("to"), s, "to") : 0;
             LightLevels light;
             std::string err;
-            if (!measureLightLevels(l.project, s, from, to, light, &err)) return fail(QString::fromStdString(err));
+            const bool pq = sequenceColorSpace(s).transfer == Transfer::Pq;
+            std::vector<Hdr10PlusScene> scenes;
+            bool measuredOk = false;
+            if (!pq) {
+                measuredOk = measureLightLevels(l.project, s, from, to, light, &err);
+            } else {
+                // HDR10+ over whole scenes (grown to the stored scenes the stretch cuts into), light levels over the stretch.
+                const FrameTime lo = std::max<FrameTime>(0, from), hi = to > lo ? to : s.duration();
+                FrameTime a = lo, b = hi;
+                widenHdr10PlusRange(s.hdr10Plus, a, b);
+                const LightMeter meter(sequenceColorSpace(s));
+                const auto frame = [&](FrameTime f) {
+                    RenderOptions o;
+                    o.scale = 1.0;
+                    o.highQuality = true;
+                    Image img = renderProgramFrame(l.project, s, f, o);
+                    if (f >= lo && f < hi) meter.add(img, f, light);
+                    return img;
+                };
+                measuredOk = analyseHdr10Plus(l.project, s, a, b, sequenceColorSpace(s), std::clamp(s.hdrPeakNits, 100.0, 10000.0), scenes,
+                                              &err, {}, nullptr, nullptr, frame);
+            }
+            if (!measuredOk) return fail(QString::fromStdString(err));
             unsigned cll = 0, fall = 0;
             hdr10LightLevels(light, cll, fall);
             QJsonObject out{{"max_cll", int(cll)}, {"max_fall", int(fall)}, {"max_cll_at", tc(light.maxCllFrame, s)},
@@ -1928,8 +2046,18 @@ void McpServer::Impl::addTools() {
                 out["warning"] = QStringLiteral("Brighter than the %1-nit mastering peak").arg(s.hdrPeakNits);
                 text += QStringLiteral("; brighter than the %1-nit mastering peak").arg(s.hdrPeakNits);
             }
+            if (pq) {
+                QJsonArray list;
+                for (const Hdr10PlusScene& sc : scenes)
+                    list.append(QJsonObject{{"start", tc(sc.start, s)}, {"end", tc(sc.end, s)},
+                                            {"max_rgb", QJsonArray{sc.maxScl[0], sc.maxScl[1], sc.maxScl[2]}},
+                                            {"average", sc.average}, {"percentile_99_98", sc.percentiles[6]}});
+                out["hdr10plus_scenes"] = list;
+                text += QStringLiteral("; HDR10+: %1 scene(s)").arg(scenes.size());
+            }
             if (a.value("save").toBool(true)) {
                 s.hdrMaxCll = cll, s.hdrMaxFall = fall;
+                if (pq) mergeHdr10PlusScenes(s.hdr10Plus, scenes);  // replacing those they overlap; others stay
                 save(l);
             }
             return ok(text, out);
@@ -2303,6 +2431,213 @@ void McpServer::Impl::addTools() {
             for (const Marker& m : markers) edit::addMarker(s, m);
             save(l);
             return ok(QStringLiteral("Added %1 marker(s)").arg(markers.size()));
+        });
+
+    add("montage_ale", "Avid Log Exchange (ALE) in and out",
+        "import: read an ALE (as dailies arrive from Media Composer, Resolve, Silverstack or the lab) and fill in each "
+        "matching media item's scene, shot, take, tape, camera, description and comment, and its ASC CDL; rows find their "
+        "media by source file, by name (with or without extension) or by tape and start timecode. With cdl_to_clips "
+        "(default) every clip of a media item that got a CDL is graded with it (its cdl effect). export: the media (all, "
+        "or those named in `media`) as an ALE, timecodes at the sequence's rate, with CDL columns when any has one. Give a "
+        "`path`, or `text` to import from.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"action":{"type":"string","enum":["import","export"]},
+            "path":{"type":"string"},"text":{"type":"string"},"cdl_to_clips":{"type":"boolean","default":true},
+            "media":{"type":"array","items":{"type":"string"},"description":"export: media names (default all)"}},
+            "required":["project","action"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            const QString action = need(a, "action");
+            if (action == "import") {
+                std::string text = str(a, "text").toStdString();
+                if (a.contains("path")) {
+                    QFile f(absolute(need(a, "path")));
+                    if (!f.open(QIODevice::ReadOnly)) return fail(QStringLiteral("Cannot read %1").arg(f.fileName()));
+                    text = f.readAll().toStdString();
+                }
+                AleTable table;
+                std::string err;
+                if (!parseAle(text, table, &err)) return fail(QString::fromStdString(err));
+                const AleImport r = applyAle(l.project, table, a.value("cdl_to_clips").toBool(true));
+                if (!r.matched.empty()) save(l);
+                QJsonArray unmatched;
+                for (const std::string& u : r.unmatched) unmatched.append(QString::fromStdString(u));
+                return ok(QStringLiteral("%1 of %2 row(s) matched media; %3 CDL(s); %4 clip(s) graded")
+                              .arg(r.matched.size()).arg(r.rows).arg(r.cdls).arg(r.clips),
+                          QJsonObject{{"rows", r.rows}, {"matched", int(r.matched.size())}, {"cdls", r.cdls}, {"clips", r.clips}, {"unmatched", unmatched}});
+            }
+            if (action != "export") throw ArgError{QStringLiteral("\"action\" must be import or export")};
+            std::vector<Id> ids;
+            if (a.contains("media")) {
+                for (const QJsonValue& v : a.value("media").toArray()) {
+                    const MediaItem* found = nullptr;
+                    for (const MediaItem& m : l.project.media)
+                        if (!found && QString::fromStdString(m.name).compare(v.toString(), Qt::CaseInsensitive) == 0) found = &m;
+                    if (!found) throw ArgError{QStringLiteral("No media named %1").arg(v.toString())};
+                    ids.push_back(found->id);
+                }
+            } else {
+                for (const MediaItem& m : l.project.media) ids.push_back(m.id);
+            }
+            const AleTable table = aleFromMedia(l.project, ids, l.seq().fps);
+            if (table.rows.empty()) return fail(QStringLiteral("No media to log (stills and sequences are left out)"));
+            const std::string text = writeAle(table);
+            if (a.contains("path")) {
+                QFile f(absolute(need(a, "path")));
+                if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate) || f.write(text.data(), qint64(text.size())) != qint64(text.size()))
+                    return fail(QStringLiteral("Cannot write %1").arg(f.fileName()));
+                return ok(QStringLiteral("Wrote %1 media item(s) to %2").arg(table.rows.size()).arg(f.fileName()));
+            }
+            return ok(QString::fromStdString(text));
+        });
+
+    add("montage_cdl", "ASC CDL on clips",
+        "get: a clip's ASC CDL (slope, offset, power per channel, saturation, the space it is applied in). set: give a "
+        "clip slope, offset and power (three numbers each, or one for all) and saturation, as its cdl effect; `space` is "
+        "\"Working space\" or a colour space it was made in (a camera log, ACEScct). import: a .cc, .ccc or .cdl (path or "
+        "text): onto `clip` (the correction whose id matches it, else the first), or without a clip onto every video clip "
+        "whose name, file or tape matches a correction's id. export: the clip's CDL (or every clip's that has one) as cdl, "
+        "cc or ccc XML, to `path` or returned.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"action":{"type":"string","enum":["get","set","import","export"]},
+            "clip":{"type":"integer"},"slope":{"type":["array","number"]},"offset":{"type":["array","number"]},"power":{"type":["array","number"]},
+            "saturation":{"type":"number"},"space":{"type":"string"},"id":{"type":"string"},"path":{"type":"string"},"text":{"type":"string"},
+            "format":{"type":"string","enum":["cdl","cc","ccc"]}},"required":["project","action"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const QString action = need(a, "action");
+            auto describe = [&](const Clip& c, const Cdl& g) {
+                auto arr = [](const double v[3]) { return QJsonArray{v[0], v[1], v[2]}; };
+                QString space = "Working space";
+                for (const Effect& e : c.effects)
+                    if (e.type == "cdl" && e.enabled) {
+                        space = QString::fromStdString(e.s("space", "Working space"));
+                        break;
+                    }
+                return QJsonObject{{"clip", double(c.id)}, {"id", QString::fromStdString(g.id)}, {"slope", arr(g.slope)}, {"offset", arr(g.offset)},
+                                   {"power", arr(g.power)}, {"saturation", g.saturation}, {"space", space},
+                                   {"asc_sop", QString::fromStdString(cdlSopText(g))}};
+            };
+            if (action == "get") {
+                const Clip& c = clipArg(l, a);
+                Cdl g;
+                if (!clipCdl(c, 0, g)) return ok(QStringLiteral("Clip %1 has no CDL").arg(qulonglong(c.id)), QJsonObject{{"clip", double(c.id)}});
+                const QJsonObject o = describe(c, g);
+                return ok(QString::fromUtf8(QJsonDocument(o).toJson(QJsonDocument::Compact)), o);
+            }
+            if (action == "set") {
+                Clip& c = clipArg(l, a);
+                if (c.isGenerator()) throw ArgError{QStringLiteral("A CDL grades footage, not a generator")};
+                if (auto loc = edit::locate(s, c.id); !loc || loc->track.kind != TrackKind::Video) throw ArgError{QStringLiteral("A CDL goes on a video clip")};
+                Cdl g;
+                clipCdl(c, 0, g);
+                auto three = [&](const char* key, double out[3], double lo) {
+                    if (!a.contains(key)) return;
+                    const QJsonValue v = a.value(key);
+                    if (v.isDouble()) {
+                        out[0] = out[1] = out[2] = v.toDouble();
+                    } else {
+                        const QJsonArray arr = v.toArray();
+                        if (arr.size() != 3) throw ArgError{QStringLiteral("\"%1\" must be one number or three").arg(key)};
+                        for (int i = 0; i < 3; ++i) {
+                            if (!arr[i].isDouble()) throw ArgError{QStringLiteral("\"%1\" must be numbers").arg(key)};
+                            out[i] = arr[i].toDouble();
+                        }
+                    }
+                    for (int i = 0; i < 3; ++i)
+                        if (!std::isfinite(out[i]) || out[i] < lo) throw ArgError{QStringLiteral("\"%1\" is out of range").arg(key)};
+                };
+                three("slope", g.slope, 0);
+                three("offset", g.offset, -1e9);
+                three("power", g.power, 1e-6);
+                if (a.contains("saturation")) {
+                    if (!a.value("saturation").isDouble() || a.value("saturation").toDouble() < 0) throw ArgError{QStringLiteral("\"saturation\" must be a number of 0 or more")};
+                    g.saturation = a.value("saturation").toDouble();
+                }
+                if (a.contains("id")) g.id = str(a, "id").toStdString();
+                QString space;
+                if (a.contains("space")) {
+                    space = str(a, "space");
+                    bool known = space == "Working space";
+                    for (const auto& cs : colorSpaces()) known |= QString::fromStdString(cs.label) == space;
+                    if (!known) throw ArgError{QStringLiteral("Unknown colour space \"%1\" (see montage_list_effects for cdl's choices)").arg(space)};
+                }
+                setClipCdl(l.project, c, g);
+                if (!space.isEmpty())
+                    for (Effect& e : c.effects)
+                        if (e.type == "cdl") {
+                            e.strings["space"] = space.toStdString();
+                            break;
+                        }
+                save(l);
+                const QJsonObject o = describe(c, g);
+                return ok(QStringLiteral("Clip %1 graded: %2, saturation %3").arg(qulonglong(c.id)).arg(QString::fromStdString(cdlSopText(g))).arg(g.saturation), o);
+            }
+            if (action == "import") {
+                std::string text = str(a, "text").toStdString();
+                if (a.contains("path")) {
+                    QFile f(absolute(need(a, "path")));
+                    if (!f.open(QIODevice::ReadOnly)) return fail(QStringLiteral("Cannot read %1").arg(f.fileName()));
+                    text = f.readAll().toStdString();
+                }
+                std::string err;
+                const std::vector<Cdl> cdls = parseCdlXml(text, &err);
+                if (cdls.empty()) return fail(QString::fromStdString(err));
+                auto matching = [&](const Clip& c) -> const Cdl* {
+                    std::vector<std::string> names{c.name};
+                    if (const MediaItem* m = l.project.findMedia(c.mediaId)) {
+                        names.push_back(m->name);
+                        if (!m->path.empty()) names.push_back(QFileInfo(QString::fromStdString(uninterpretedPath(m->path))).fileName().toStdString());
+                        if (auto t = m->metadata.find("tape"); t != m->metadata.end()) names.push_back(t->second);
+                    }
+                    return matchCdl(cdls, names);
+                };
+                int graded = 0;
+                if (a.contains("clip")) {
+                    Clip& c = clipArg(l, a);
+                    if (c.isGenerator()) throw ArgError{QStringLiteral("A CDL grades footage, not a generator")};
+                    if (auto loc = edit::locate(s, c.id); !loc || loc->track.kind != TrackKind::Video) throw ArgError{QStringLiteral("A CDL goes on a video clip")};
+                    const Cdl* g = matching(c);
+                    setClipCdl(l.project, c, g ? *g : cdls.front());
+                    graded = 1;
+                } else {
+                    if (cdls.size() == 1 && cdls.front().id.empty()) throw ArgError{QStringLiteral("The correction has no id to match: give \"clip\"")};
+                    for (Track& t : s.videoTracks)
+                        for (Clip& c : t.clips)
+                            if (!c.isGenerator())
+                                if (const Cdl* g = matching(c)) {
+                                    setClipCdl(l.project, c, *g);
+                                    ++graded;
+                                }
+                }
+                if (graded) save(l);
+                QString msg = QStringLiteral("%1 correction(s) read; %2 clip(s) graded").arg(cdls.size()).arg(graded);
+                if (!err.empty()) msg += QStringLiteral(" (%1)").arg(QString::fromStdString(err));
+                return ok(msg, QJsonObject{{"corrections", int(cdls.size())}, {"clips", graded}});
+            }
+            if (action != "export") throw ArgError{QStringLiteral("\"action\" must be get, set, import or export")};
+            std::vector<Cdl> cdls;
+            auto take = [&](const Clip& c) {
+                Cdl g;
+                if (!clipCdl(c, 0, g)) return;
+                if (g.id.empty()) g.id = c.name;
+                cdls.push_back(g);
+            };
+            if (a.contains("clip")) take(clipArg(l, a));
+            else
+                for (const Track& t : s.videoTracks)
+                    for (const Clip& c : t.clips) take(c);
+            if (cdls.empty()) return fail(QStringLiteral("No CDL to export"));
+            const QString fmt = str(a, "format", a.contains("path") ? QString::fromStdString(std::string(cdlFormatFor(need(a, "path").toStdString()) == CdlFormat::Cc ? "cc" : cdlFormatFor(need(a, "path").toStdString()) == CdlFormat::Ccc ? "ccc" : "cdl")) : QStringLiteral("cdl"));
+            const CdlFormat format = fmt == "cc" ? CdlFormat::Cc : fmt == "ccc" ? CdlFormat::Ccc : CdlFormat::Cdl;
+            if (format == CdlFormat::Cc && cdls.size() > 1) return fail(QStringLiteral("A .cc holds one correction; %1 clips have CDLs (give \"clip\", or use ccc or cdl)").arg(cdls.size()));
+            const std::string xml = writeCdlXml(cdls, format);
+            if (a.contains("path")) {
+                QFile f(absolute(need(a, "path")));
+                if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate) || f.write(xml.data(), qint64(xml.size())) != qint64(xml.size()))
+                    return fail(QStringLiteral("Cannot write %1").arg(f.fileName()));
+                return ok(QStringLiteral("Wrote %1 correction(s) to %2").arg(cdls.size()).arg(f.fileName()));
+            }
+            return ok(QString::fromStdString(xml));
         });
 
     add("montage_consolidate", "Copy the project and its media",
@@ -3767,7 +4102,7 @@ void McpServer::Impl::addTools() {
         "master; an empty path stops it moving. A track routed to a bus is placed by its bus. Export with montage_render "
         "(downmix_stereo for a stereo copy).",
         R"json({"type":"object","properties":{"project":{"type":"string"},
-            "layout":{"type":"string","enum":["stereo","5.1","7.1","5.1.2","5.1.4","7.1.2","7.1.4"]},
+            "layout":{"type":"string","enum":["stereo","5.1","7.1","5.1.2","5.1.4","7.1.2","7.1.4","ambix"]},
             "tracks":{"type":"array","items":{"type":"object","properties":{
                 "track":{"type":"string","description":"Audio track, e.g. A1"},"angle":{"type":"number","default":0},
                 "distance":{"type":"number","default":1},"height":{"type":"number","default":0},"width":{"type":"number","default":1},
@@ -3781,7 +4116,7 @@ void McpServer::Impl::addTools() {
             if (a.contains("layout")) {
                 const std::string layout = a.value("layout").toString().toStdString();
                 if (std::find(audioLayouts().begin(), audioLayouts().end(), layout) == audioLayouts().end())
-                    throw ArgError{"\"layout\" must be stereo, 5.1, 7.1, 5.1.2, 5.1.4, 7.1.2 or 7.1.4"};
+                    throw ArgError{"\"layout\" must be stereo, 5.1, 7.1, 5.1.2, 5.1.4, 7.1.2, 7.1.4 or ambix"};
                 s.audioLayout = layout;
             }
             QJsonArray out;
@@ -4707,11 +5042,13 @@ void McpServer::Impl::addTools() {
             "alpha":{"type":"string","enum":["file","straight","premultiplied","ignore","invert"]},
             "field_order":{"type":"string","enum":["file","progressive","upper","lower"]},
             "keep_pitch":{"type":"boolean","description":"A conformed sound keeps its pitch"},
-            "raw_exposure":{"type":"number","description":"Camera RAW and CinemaDNG: exposure in stops (-5 to 5)"},
+            "raw_exposure":{"type":"number","description":"Camera RAW, CinemaDNG and ProRes RAW: exposure in stops (-5 to 5)"},
             "raw_temperature":{"type":["number","string"],"description":"Camera RAW: the light's colour temperature in kelvin (2000 to 25000), or \"as_shot\""},
             "raw_tint":{"type":"number","description":"Camera RAW: tint, + magenta, - green (-150 to 150)"},
-            "raw_highlights":{"type":"string","enum":["clip","blend","rebuild"]},
+            "raw_highlights":{"type":"string","enum":["clip","blend","rebuild"],"description":"Camera RAW stills and CinemaDNG (ProRes RAW clips at the sensor's white)"},
             "raw_half":{"type":"boolean","description":"Camera RAW: decode at half size for speed"},
+            "stereo":{"type":"string","enum":["file","none","sbs","sbs_half","tb","tb_half"],"description":"Stereoscopic 3D: how the eyes are packed (side by side or top and bottom, full size or squeezed), none for a flat picture"},
+            "swap_eyes":{"type":"boolean","description":"Stereoscopic 3D: the eyes are the other way round"},
             "reset":{"type":"boolean","description":"Read the files as they are"}},"required":["project","media"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
@@ -4750,12 +5087,15 @@ void McpServer::Impl::addTools() {
                 if (a.contains("raw_tint")) i.rawTint = a.value("raw_tint").toDouble();
                 if (a.contains("raw_highlights")) i.rawHighlights = str(a, "raw_highlights") == "clip" ? "" : str(a, "raw_highlights").toStdString();
                 if (a.contains("raw_half")) i.rawHalf = a.value("raw_half").toBool();
+                if (a.contains("stereo")) i.stereo = str(a, "stereo") == "file" ? "" : str(a, "stereo").toStdString();
+                if (a.contains("swap_eyes")) i.swapEyes = a.value("swap_eyes").toBool();
                 const edit::Result r = edit::interpretFootage(l.project, m->id, i);
                 if (!r.ok && !r.error.empty()) throw ArgError{QStringLiteral("%1: %2").arg(QString::fromStdString(m->name), QString::fromStdString(r.error))};
                 changed += r.ok;
                 m = l.project.findMedia(m->id);
                 QJsonObject o{{"name", QString::fromStdString(m->name)}, {"frame_rate", m->fps.toDouble()}, {"duration_seconds", m->duration},
                               {"width", m->width}, {"height", m->height}};
+                if (!m->stereo.empty()) o["stereo"] = QString::fromStdString(m->stereo);
                 mediaPathJson(*m, o);
                 out.append(o);
             }
@@ -5042,7 +5382,8 @@ void McpServer::Impl::addTools() {
         "Render the program at a timeline time and return it as an image (to check an edit), optionally saving a PNG.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"at":{"type":["number","string"]},
             "width":{"type":"integer","default":640,"description":"Width of the returned image"},
-            "output":{"type":"string","description":"Also save the full-size frame here (PNG)"}},"required":["project","at"]})json", true,
+            "output":{"type":"string","description":"Also save the full-size frame here (PNG)"},
+            "stereo_view":{"type":"string","enum":["left","right","anaglyph","sbs","sbs_half","tb","tb_half","difference"],"default":"left","description":"A stereoscopic 3D sequence: which eye, both, or where they differ"}},"required":["project","at"]})json", true,
         [](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
@@ -5051,6 +5392,8 @@ void McpServer::Impl::addTools() {
             RenderOptions ro;
             ro.scale = std::min(1.0, double(w) / std::max(1, s.width));
             ro.captions = true;
+            if (a.contains("stereo_view") && !stereoViewFromName(str(a, "stereo_view").toStdString(), ro.stereoView))
+                throw ArgError{"Unknown stereo_view"};
             Image img = renderProgramFrame(l.project, s, at, ro);
             flattenOver(img, 0, 0, 0);
             QImage q(img.width, img.height, QImage::Format_RGBA8888);
@@ -5061,7 +5404,19 @@ void McpServer::Impl::addTools() {
             q.save(&buf, "PNG");
             if (a.contains("output")) {
                 std::string err;
-                if (!exportStill(l.project, s, at, absolute(str(a, "output")).toStdString(), &err)) return fail(QString::fromStdString(err));
+                if (s.stereo3d && ro.stereoView != StereoView::Left) {
+                    // The view asked for, at full size.
+                    RenderOptions full;
+                    full.captions = true;
+                    full.stereoView = ro.stereoView;
+                    Image big = renderProgramFrame(l.project, s, at, full);
+                    flattenOver(big, 0, 0, 0);
+                    QImage q8(big.width, big.height, QImage::Format_RGBA8888);
+                    toRgba8(big, q8.bits(), size_t(q8.bytesPerLine()));
+                    if (!q8.save(absolute(str(a, "output")), "PNG")) return fail(QStringLiteral("Cannot write %1").arg(str(a, "output")));
+                } else if (!exportStill(l.project, s, at, absolute(str(a, "output")).toStdString(), &err)) {
+                    return fail(QString::fromStdString(err));
+                }
             }
             ToolResult r = ok(QStringLiteral("Frame at %1 (%2x%3)").arg(tc(at, s)).arg(img.width).arg(img.height));
             r.png = png;
@@ -5310,6 +5665,7 @@ void McpServer::Impl::addTools() {
             "stems":{"type":"string","enum":["none","tracks","buses","roles"],"default":"none",
                 "description":"Also write 24-bit WAV stems beside the output, one per audio track, per bus (plus Main) or per audio role"},
             "captions":{"type":"string","enum":["none","burn","embed","both"],"default":"none","description":"The visible caption track, burned into the picture and/or embedded as a subtitle stream"},
+            "hdr10plus":{"type":"boolean","default":false,"description":"PQ exports: HDR10+ dynamic metadata, scene by scene, in HEVC and AV1 video and as name.hdr10plus.json beside the file (measured first unless montage_measure_hdr's analysis still matches the cut)"},
             "cea608":{"type":"boolean","default":false,"description":"Also carry the caption track as CEA-608 closed captions inside H.264/HEVC video (A/53, as US broadcast and streaming deliveries ask)"},
             "all_captions":{"type":"boolean","default":false,"description":"With embed: every caption track as its own subtitle stream, language tagged"},
             "audio_streams":{"description":"More audio streams after the mix (a master's M&E, dialogue, dubs): \"roles\" (one per role), \"tracks\" (one per track), or a list of {name, language, tracks:[\"A2\",...], role}",
@@ -5317,7 +5673,8 @@ void McpServer::Impl::addTools() {
                     "name":{"type":"string"},"language":{"type":"string"},"tracks":{"type":"array","items":{"type":"string"}},"role":{"type":"string"}}}}]},
             "audio_name":{"type":"string","description":"The mix stream's title"},"audio_language":{"type":"string","description":"The mix stream's language (ISO 639-1)"},
             "start_timecode":{"type":"string","description":"The file's starting timecode (MXF and MOV), e.g. 10:00:00:00 as broadcasters ask"},
-            "mono_tracks":{"type":"integer","description":"Write the mix (then each audio stream) as mono tracks, padded with silence to this many, as broadcast MXF takes it; the MXF presets set 8, 4 or 2"}},
+            "mono_tracks":{"type":"integer","description":"Write the mix (then each audio stream) as mono tracks, padded with silence to this many, as broadcast MXF takes it; the MXF presets set 8, 4 or 2"},
+            "stereo_view":{"type":"string","enum":["sbs","sbs_half","tb","tb_half","left","right","anaglyph"],"default":"sbs","description":"A stereoscopic 3D sequence: the eyes side by side or top and bottom (full size, or squeezed into one frame), or one picture"}},
             "required":["project","output"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
@@ -5338,6 +5695,12 @@ void McpServer::Impl::addTools() {
             }
             if (a.contains("in")) st.in = timeArg(a.value("in"), s, "in");
             if (a.contains("out")) st.out = timeArg(a.value("out"), s, "out");
+            if (a.contains("stereo_view")) {
+                StereoView v;
+                st.stereo = str(a, "stereo_view").toStdString();
+                if (!stereoViewFromName(st.stereo, v) || v == StereoView::Difference)
+                    throw ArgError{"\"stereo_view\" is sbs, sbs_half, tb, tb_half, left, right or anaglyph"};
+            }
             if (a.value("loudness_lufs").isDouble()) {
                 st.loudnessTarget = a.value("loudness_lufs").toDouble();
                 if (st.loudnessTarget >= 0 || st.loudnessTarget < -70) throw ArgError{"\"loudness_lufs\" must be between -70 and 0"};
@@ -5368,6 +5731,7 @@ void McpServer::Impl::addTools() {
             if (cap != "none" && cap != "burn" && cap != "embed" && cap != "both") throw ArgError{"\"captions\" must be none, burn, embed or both"};
             st.burnInCaptions = cap == "burn" || cap == "both";
             st.cea608 = a.value("cea608").toBool();
+            st.hdr10Plus = a.value("hdr10plus").toBool();
             st.embedCaptions = cap == "embed" || cap == "both";
             if (st.embedCaptions && a.value("all_captions").toBool())
                 for (const CaptionTrack& t : s.captionTracks)
@@ -5407,6 +5771,14 @@ void McpServer::Impl::addTools() {
                 return fail(QString::fromStdString(err));
             QJsonObject o{{"output", QString::fromStdString(st.path)}};
             QString text = QStringLiteral("Wrote %1").arg(QString::fromStdString(st.path));
+            if (st.hdr10Plus) {
+                // Where HDR10+ went: in the video and beside it, beside it only, or nowhere (not PQ output).
+                const std::string carriage = hdr10PlusCarriage(s, st);
+                o["hdr10plus"] = carriage.empty() ? QStringLiteral("none") : QString::fromStdString(carriage);
+                text += carriage == "video" ? QStringLiteral("\nHDR10+ metadata in the video, and beside it as .hdr10plus.json")
+                        : carriage == "json" ? QStringLiteral("\nHDR10+ metadata beside it as .hdr10plus.json (this codec cannot carry it)")
+                                             : QStringLiteral("\nNo HDR10+ metadata: it is for PQ (HDR10) video");
+            }
             if (light.frames > 0) {  // HDR: what was rendered, measured
                 unsigned cll = 0, fall = 0;
                 hdr10LightLevels(light, cll, fall);
@@ -5680,6 +6052,204 @@ void McpServer::Impl::addTools() {
             return ok(done.join('\n'), QJsonObject{{"view", view}});
         });
 
+    add("montage_ambisonics", "Ambisonic audio",
+        "Ambisonic (spatial) sound, as Premiere's VR audio and YouTube's spatial audio take it: first-order AmbiX (W, Y, Z, "
+        "X; ACN, SN3D) from 360° cameras and ambisonic microphones, found from a file's spatial audio metadata or marked "
+        "here with `media` and `ambisonic`. With `clip` (an audio clip of ambisonic media): turn its field with `yaw` "
+        "(degrees right), `pitch` (up) and `roll` (clockwise), keyed at `at` when given; `follow_view` (default true) "
+        "turns it with the linked picture's Reframe 360° view so the sound follows the picture; `decode` binaural "
+        "(headphones, the default) or stereo (speakers) in a stereo or surround mix. A sequence whose audio layout is "
+        "\"ambix\" (montage_set_surround layout) mixes to a four-channel field (tracks placed in it by their surround panner, "
+        "ambisonic clips added as they are) and exports as AAC or PCM in MP4 or MOV with the SA3D box YouTube reads.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"media":{"type":"number"},"ambisonic":{"type":"boolean"},
+            "clip":{"type":"number"},"yaw":{"type":"number"},"pitch":{"type":"number"},"roll":{"type":"number"},"at":{"type":"integer"},
+            "follow_view":{"type":"boolean"},"decode":{"type":"string","enum":["binaural","stereo"]}},"required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            QStringList done;
+            if (a.contains("media")) {
+                MediaItem* m = l.project.findMedia(Id(a.value("media").toDouble()));
+                if (!m || !m->hasAudio || m->kind == MediaKind::Sequence) throw ArgError{"No such sound media"};
+                const bool on = a.value("ambisonic").toBool(true);
+                if (on && m->channels < kFoaChannels) throw ArgError{"Ambisonic sound has at least four channels"};
+                m->ambisonic = on ? 1 : 0;
+                for (MediaItem& sub : l.project.media)
+                    if (sub.subclipOf == m->id) sub.ambisonic = m->ambisonic;
+                done << QStringLiteral("%1 is %2").arg(QString::fromStdString(m->name), on ? "an ambisonic field" : "channels for speakers");
+            }
+            QJsonObject field;
+            if (a.contains("clip")) {
+                const Clip& c = clipArg(l, a);
+                const MediaItem* m = c.mediaId ? l.project.findMedia(c.mediaId) : nullptr;
+                if (!m || m->ambisonic <= 0) throw ArgError{"The clip does not play ambisonic sound (mark its media first)"};
+                FrameTime key = -1;
+                if (a.contains("at")) {
+                    key = FrameTime(a.value("at").toInteger()) - c.start;
+                    if (key < 0 || key >= c.duration) throw ArgError{"at is a frame inside the clip"};
+                }
+                Clip* clip = edit::clipById(l.seq(), c.id);
+                auto it = std::find_if(clip->effects.begin(), clip->effects.end(), [](const Effect& e) { return e.type == "ambisonics"; });
+                if (it == clip->effects.end()) {
+                    clip->effects.push_back(makeEffect(l.project, "ambisonics"));
+                    it = std::prev(clip->effects.end());
+                }
+                for (const char* name : {"yaw", "pitch", "roll"}) {
+                    if (!a.contains(name)) continue;
+                    const double v = a.value(name).toDouble();
+                    if (key >= 0) it->params[name].addKey(key, v, Interp::Smooth);
+                    else it->params[name] = Param(v);
+                }
+                if (a.contains("follow_view")) it->params["follow_view"] = Param(a.value("follow_view").toBool() ? 1.0 : 0.0);
+                if (a.contains("decode")) {
+                    const QString d = str(a, "decode");
+                    if (d != "binaural" && d != "stereo") throw ArgError{"decode is binaural or stereo"};
+                    it->params["decode"] = Param(d == "stereo" ? 1.0 : 0.0);
+                }
+                const FrameTime t = std::max<FrameTime>(0, key);
+                field = QJsonObject{{"yaw", it->p("yaw", t)}, {"pitch", it->p("pitch", t)}, {"roll", it->p("roll", t)},
+                                    {"follow_view", it->p("follow_view", t, 1) > 0.5}, {"decode", it->p("decode", t) > 0.5 ? "stereo" : "binaural"}};
+                done << QStringLiteral("Clip %1: turned %2° right, %3° up, %4° roll%5").arg(clip->id).arg(it->p("yaw", t)).arg(it->p("pitch", t))
+                            .arg(it->p("roll", t)).arg(it->p("follow_view", t, 1) > 0.5 ? QStringLiteral(", following the 360° view") : QString());
+            }
+            if (done.isEmpty()) throw ArgError{"Give media or clip"};
+            save(l);
+            return ok(done.join('\n'), QJsonObject{{"field", field}, {"sequence_ambisonic", ambisonicLayout(l.seq().audioLayout)}});
+        });
+
+    add("montage_pan_follow", "Pan to follow the picture",
+        "Panning that follows what makes a sound, as Resolve's IntelliTrack panning: a point of the picture is tracked "
+        "through the shot both ways from timeline frame `at` (default: the middle of the clip) and written into the "
+        "audio track's automation over the span tracked: its pan in stereo sequences (and for tracks going to a bus), its "
+        "surround position in surround and ambisonic ones (a 360° sequence's picture is the whole circle round the "
+        "listener). `clip` is the audio clip; the picture is what is seen at the point. "
+        "`x`, `y` (fractions of the frame, 0..1) are the point, by default the shot's subject; `size` how much "
+        "around it is followed (small, medium, large); `width` (0.1..1, default 1) how much of the stage the picture "
+        "spans (1: its edges hard left and right, or at the front left and right speakers). The track is set to read "
+        "its automation (a track whose lanes were off gets them replaced, keeping what was heard outside the span).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},"at":{"type":"integer"},
+            "x":{"type":"number"},"y":{"type":"number"},"size":{"type":"string","enum":["small","medium","large"]},
+            "width":{"type":"number"}},"required":["project","clip"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            const Clip& c = clipArg(l, a);
+            const auto loc = edit::locate(l.seq(), c.id);
+            if (!loc || loc->track.kind != TrackKind::Audio) throw ArgError{"clip is an audio clip"};
+            if (a.contains("at") && (!a.value("at").isDouble() || std::floor(a.value("at").toDouble()) != a.value("at").toDouble()))
+                throw ArgError{"at is a timeline frame (a whole number)"};
+            const FrameTime at = a.contains("at") ? FrameTime(a.value("at").toDouble()) : c.start + c.duration / 2;
+            if (at < c.start || at >= c.end()) throw ArgError{"at is a frame inside the clip"};
+            if (a.contains("x") != a.contains("y")) throw ArgError{"Give both x and y, or neither"};
+            double x = 0.5, y = 0.5;
+            std::string err;
+            if (a.contains("x")) {
+                if (!a.value("x").isDouble() || !a.value("y").isDouble()) throw ArgError{"x and y are numbers (fractions of the frame)"};
+                x = a.value("x").toDouble();
+                y = a.value("y").toDouble();
+                if (x < 0 || x > 1 || y < 0 || y > 1) throw ArgError{"x and y are fractions of the frame (0 to 1)"};
+            } else if (!panFollowSubject(l.project, l.seq(), c, at, x, y, &err)) {
+                throw ArgError{QString::fromStdString(err)};
+            }
+            const QString sizeName = a.contains("size") ? str(a, "size") : QStringLiteral("medium");
+            const double size = sizeName == "small" ? 0.1 : sizeName == "large" ? 0.35 : sizeName == "medium" ? 0.2 : -1;
+            if (size < 0) throw ArgError{"size is small, medium or large"};
+            if (a.contains("width") && !a.value("width").isDouble()) throw ArgError{"width is a number, 0.1 to 1"};
+            const double width = a.contains("width") ? a.value("width").toDouble() : 1.0;
+            if (width < 0.1 || width > 1) throw ArgError{"width is 0.1 to 1"};
+            std::vector<PanFollowKey> keys;
+            if (!trackPanFollow(l.project, l.seq(), c, at, x, y, size, keys, {}, nullptr, &err)) throw ArgError{QString::fromStdString(err)};
+            Track& track = *trackAt(l.seq(), loc->track);
+            const bool stereo = panFollowStereo(l.seq(), track);
+            applyPanFollow(l.seq(), track, keys, width);
+            QJsonArray path;
+            const size_t every = std::max<size_t>(1, keys.size() / 8);
+            for (size_t i = 0; i < keys.size(); i += every) {
+                QJsonObject k{{"frame", qint64(keys[i].t)}, {"x", keys[i].x}, {"y", keys[i].y}};
+                if (stereo) {
+                    k["pan"] = trackPanAt(track, double(keys[i].t));
+                } else {
+                    const SurroundPan sp = trackSurroundAt(track, double(keys[i].t));
+                    k["surround_x"] = sp.x;
+                    k["surround_y"] = sp.y;
+                }
+                path.append(k);
+            }
+            save(l);
+            return ok(QStringLiteral("Followed from frame %1 to %2: track %3's %4 now moves with it")
+                          .arg(keys.front().t).arg(keys.back().t).arg(QString::fromStdString(track.name), stereo ? QStringLiteral("pan") : QStringLiteral("surround position")),
+                      QJsonObject{{"from", qint64(keys.front().t)}, {"to", qint64(keys.back().t)}, {"start", QJsonObject{{"x", x}, {"y", y}}},
+                                  {"lane", stereo ? "pan" : "surround"}, {"path", path}});
+        });
+
+    add("montage_stereo", "Stereoscopic 3D",
+        "Stereoscopic 3D editing, as Premiere's and Resolve's stereo workflows: with `sequence_3d` make the active "
+        "sequence stereoscopic (each eye rendered, stereo footage giving each its own picture) or flat, and with "
+        "`vr180` mark a 360° sequence as VR180 (the front half of the sphere); with `media` and `layout` say how a "
+        "file packs its eyes (file, none, sbs, sbs_half, tb, tb_half) and `swap_eyes` if they are the other way round; "
+        "with `clip` and `depth` (% of the frame's width, -10 to 10: + further away, - nearer) set the clip's Stereo 3D "
+        "convergence (titles and graphics placed in depth), keyed at `at` when given. Reports the sequence's stereo state.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"sequence_3d":{"type":"boolean"},"vr180":{"type":"boolean"},
+            "media":{"type":"number"},"layout":{"type":"string","enum":["file","none","sbs","sbs_half","tb","tb_half"]},"swap_eyes":{"type":"boolean"},
+            "clip":{"type":"number"},"depth":{"type":"number"},"at":{"type":"integer"}},"required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            QStringList done;
+            Sequence& seq = l.seq();
+            if (a.contains("sequence_3d")) {
+                seq.stereo3d = a.value("sequence_3d").toBool();
+                done << (seq.stereo3d ? QStringLiteral("The sequence is stereoscopic 3D") : QStringLiteral("The sequence is flat (2D)"));
+            }
+            if (a.contains("vr180")) {
+                if (a.value("vr180").toBool() && !seq.spherical) throw ArgError{"VR180 is for 360° sequences (montage_reframe_360 sequence_360)"};
+                seq.vr180 = a.value("vr180").toBool();
+                done << (seq.vr180 ? QStringLiteral("The sequence is VR180") : QStringLiteral("The sequence covers the whole sphere"));
+            }
+            if (a.contains("media")) {
+                MediaItem* m = l.project.findMedia(Id(a.value("media").toDouble()));
+                if (!m) throw ArgError{"No such media"};
+                if (m->subclipOf) m = l.project.findMedia(m->subclipOf);
+                if (m->kind != MediaKind::Video || !m->hasVideo) throw ArgError{"Stereo layouts are for video files"};
+                Interpretation i = interpretationOf(*m);
+                if (a.contains("layout")) i.stereo = str(a, "layout") == "file" ? "" : str(a, "layout").toStdString();
+                if (a.contains("swap_eyes")) i.swapEyes = a.value("swap_eyes").toBool();
+                const edit::Result r = edit::interpretFootage(l.project, m->id, i);
+                if (!r.ok && !r.error.empty()) throw ArgError{QString::fromStdString(r.error)};
+                m = l.project.findMedia(m->id);
+                done << QStringLiteral("%1: %2 (%3 x %4 per eye)").arg(QString::fromStdString(m->name), m->stereo.empty() ? QStringLiteral("flat") : QString::fromStdString(m->stereo))
+                            .arg(m->width).arg(m->height);
+            }
+            if (a.contains("clip")) {
+                if (!a.contains("depth")) throw ArgError{"Give depth with clip"};
+                const double depth = a.value("depth").toDouble();
+                if (depth < -10 || depth > 10) throw ArgError{"depth is -10 to 10 (% of the width)"};
+                const Clip& c = clipArg(l, a);
+                FrameTime key = -1;
+                if (a.contains("at")) {
+                    key = FrameTime(a.value("at").toInteger()) - c.start;
+                    if (key < 0 || key >= c.duration) throw ArgError{"at is a frame inside the clip"};
+                }
+                Clip* clip = edit::clipById(seq, c.id);
+                if (!clip) throw ArgError{"No such clip"};
+                auto it = std::find_if(clip->effects.begin(), clip->effects.end(), [](const Effect& e) { return e.type == "stereo_3d"; });
+                if (it == clip->effects.end()) {
+                    clip->effects.push_back(makeEffect(l.project, "stereo_3d"));
+                    it = std::prev(clip->effects.end());
+                }
+                if (key >= 0) it->params["depth"].addKey(key, depth, Interp::Smooth);
+                else it->params["depth"] = Param(depth);
+                done << QStringLiteral("Clip %1 depth %2%%3").arg(clip->id).arg(depth).arg(key >= 0 ? QStringLiteral(" (key at frame %1)").arg(c.start + key) : QString());
+            }
+            if (done.isEmpty() && (a.contains("layout") || a.contains("swap_eyes"))) throw ArgError{"Give media with layout or swap_eyes"};
+            if (!done.isEmpty()) save(l);
+            int stereoClips = 0;
+            for (const Track& t : seq.videoTracks)
+                for (const Clip& c : t.clips)
+                    if (const MediaItem* m = c.mediaId ? l.project.findMedia(c.mediaId) : nullptr; m && !m->stereo.empty()) ++stereoClips;
+            const QJsonObject res{{"sequence_3d", seq.stereo3d}, {"vr180", seq.vr180}, {"spherical", seq.spherical}, {"stereo_clips", stereoClips}};
+            if (done.isEmpty())
+                done << QStringLiteral("%1, %2 stereo clip(s)").arg(seq.stereo3d ? QStringLiteral("Stereoscopic 3D") : QStringLiteral("Flat (2D)")).arg(stereoClips);
+            return ok(done.join('\n'), res);
+        });
+
     add("montage_vfx_pull", "VFX pulls",
         "Pull shots for visual effects: each clip's source frames, untouched, at the footage's own size and rate, with "
         "`handles` frames either side (default 8, as far as the footage goes), as an image sequence in a folder per shot "
@@ -5734,7 +6304,8 @@ void McpServer::Impl::addTools() {
                 AafExportResult r;
                 std::string err;
                 AafExportOptions o;
-                o.picture = a.value("picture").toBool(true);
+                const QJsonValue pv = a.value("picture");
+                o.picture = pv.isString() ? pv.toString().compare("false", Qt::CaseInsensitive) != 0 && pv.toString() != "0" : pv.toBool(true);
                 if (!exportAaf(l.project, l.seq(), out.toStdString(), &r, [this](double x, FrameTime) { progress(x, "AAF"); }, nullptr, &err, o))
                     return fail(QString::fromStdString(err));
                 QJsonArray files, warnings;
@@ -5797,6 +6368,9 @@ void McpServer::Impl::addTools() {
         R"json({"type":"object","properties":{"project":{"type":"string"}},"required":["project"]})json", false,
         [](const QJsonObject& a) {
             const QString path = absolute(need(a, "project")), bak = path + ".bak";
+            if (const LockStatus st = projectLockStatus(path.toStdString()); st.state == LockState::Theirs)
+                return fail(QStringLiteral("%1 is editing %2 in Montage: nothing is undone behind their back")
+                                .arg(QString::fromStdString(st.owner.describe()), QFileInfo(path).fileName()));
             if (!QFileInfo::exists(bak)) return fail("Nothing to undo");
             QFile::remove(path);
             if (!QFile::rename(bak, path)) return fail(QStringLiteral("Cannot restore %1").arg(path));

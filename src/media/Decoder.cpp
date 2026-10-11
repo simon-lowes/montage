@@ -4,8 +4,11 @@
 
 #include "FieldRecorder.h"
 #include "ImageSequence.h"
+#include "ProResRaw.h"
 #include "Psd.h"
 #include "audio/TimeStretch.h"
+#include "core/Ambisonics.h"
+#include "SpatialAudio.h"
 #include "core/Interpretation.h"
 
 #include <algorithm>
@@ -23,6 +26,7 @@ extern "C" {
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/spherical.h>
+#include <libavutil/stereo3d.h>
 #include <libavutil/timecode.h>
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
@@ -83,7 +87,43 @@ std::string streamProjection(const AVStream* st) {
 #endif
     if (!data) return {};
     const auto* map = reinterpret_cast<const AVSphericalMapping*>(data);
-    return map->projection == AV_SPHERICAL_EQUIRECTANGULAR ? "equirect" : "";
+    if (map->projection == AV_SPHERICAL_EQUIRECTANGULAR) return "equirect";
+    // VR180: a tile of the sphere a quarter of the way in from each side (0.32 fixed point), the whole height.
+    if (map->projection == AV_SPHERICAL_EQUIRECTANGULAR_TILE && map->bound_top == 0 && map->bound_bottom == 0) {
+        const double cut = (double(map->bound_left) + double(map->bound_right)) / 4294967296.0;
+        if (std::fabs(cut - 0.5) < 0.01) return "vr180";
+    }
+    return {};
+}
+
+// Stereoscopic 3D footage: how the stream's stereo metadata (MP4 st3d, Matroska StereoMode)
+// packs the eyes, "sbs" or "tb", and whether the right eye comes first. A frame-compatible file (each eye squeezed to
+// half the frame, as 3D TV and Blu-ray masters are) is told apart by its eyes' shape; 360° stereo is never squeezed.
+std::string streamStereo(const AVStream* st, bool& inverted, bool spherical) {
+    inverted = false;
+    const uint8_t* data = nullptr;
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(60, 29, 100)
+    const AVPacketSideData* sd = av_packet_side_data_get(st->codecpar->coded_side_data,
+                                                         st->codecpar->nb_coded_side_data, AV_PKT_DATA_STEREO3D);
+    if (sd) data = sd->data;
+#else
+    data = av_stream_get_side_data(st, AV_PKT_DATA_STEREO3D, nullptr);
+#endif
+    if (!data) return {};
+    const auto* s3d = reinterpret_cast<const AVStereo3D*>(data);
+    inverted = (s3d->flags & AV_STEREO3D_FLAG_INVERT) != 0;
+    // The shape as shown (a stored width with non-square pixels is widened by them).
+    const AVRational sar = st->sample_aspect_ratio.num > 0 ? st->sample_aspect_ratio : st->codecpar->sample_aspect_ratio;
+    const double w = st->codecpar->width * (sar.num > 0 && sar.den > 0 ? av_q2d(sar) : 1.0), h = std::max(1, st->codecpar->height);
+    if (s3d->type == AV_STEREO3D_SIDEBYSIDE) return !spherical && w / 2 / h < 1.0 ? "sbs_half" : "sbs";
+    if (s3d->type == AV_STEREO3D_TOPBOTTOM) return !spherical && w / (h / 2) > 2.4 ? "tb_half" : "tb";
+    return {};
+}
+
+// One eye's size as shown, from the frame's.
+void stereoEyeSize(const std::string& layout, int& w, int& h) {
+    if (layout == "sbs") w = std::max(1, w / 2);
+    else if (layout == "tb") h = std::max(1, h / 2);
 }
 
 int streamRotation(const AVStream* st) {
@@ -346,6 +386,16 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         if (const std::string proj = streamProjection(st); !proj.empty()) m.projection = proj;
         if (m.colorSpace == "rec709") m.colorSpace.clear();
         int w = st->codecpar->width, h = st->codecpar->height;
+#ifdef MONTAGE_PRORES_RAW
+        // ProRes RAW is developed to ACEScct (the scene's whole range), at its size less the recommended crop.
+        if (st->codecpar->codec_id == AV_CODEC_ID_PRORES_RAW) {
+            m.colorSpace = "acescct";
+            if (ProResRawInfo info; probeProResRaw(file, info)) w = info.width, h = info.height;
+        }
+#endif
+        bool inverted = false;
+        m.stereo = stereoLayout(streamStereo(st, inverted, !m.projection.empty()), in);
+        stereoEyeSize(m.stereo, w, h);
         AVRational sar = st->sample_aspect_ratio.num ? st->sample_aspect_ratio : st->codecpar->sample_aspect_ratio;
         if (in.par > 0) w = int(std::lround(double(w) * in.par));  // Interpret Footage's pixel aspect
         else if (sar.num > 0 && sar.den > 0 && sar.num != sar.den) w = int(std::lround(double(w) * sar.num / sar.den));
@@ -364,8 +414,10 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         if (!tc) tc = av_dict_get(fmt->metadata, "timecode", nullptr, 0);
         for (unsigned i = 0; !tc && i < fmt->nb_streams; ++i) tc = av_dict_get(fmt->streams[i]->metadata, "timecode", nullptr, 0);
         AVTimecode parsed;
-        if (tc && fr.num > 0 && fr.den > 0 && av_timecode_init_from_string(&parsed, fr, tc->value, nullptr) == 0)
+        if (tc && fr.num > 0 && fr.den > 0 && av_timecode_init_from_string(&parsed, fr, tc->value, nullptr) == 0) {
             m.timecode = double(parsed.start) * fr.den / fr.num;
+            if (std::strchr(tc->value, ';')) m.metadata["timecode_drop"] = "1";  // (so logs written of it say drop-frame too)
+        }
         if (dur <= 0 && st->duration > 0) dur = double(st->duration) * av_q2d(st->time_base);
     }
     if (m.hasAudio) {
@@ -374,6 +426,12 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         m.audioCodec = d ? d->name : "unknown";
         m.sampleRate = st->codecpar->sample_rate;
         m.channels = st->codecpar->ch_layout.nb_channels;
+        // Ambisonic sound: the file's spatial audio metadata (MP4 SA3D) gives its layout as ambisonic components.
+        if (st->codecpar->ch_layout.order == AV_CHANNEL_ORDER_AMBISONIC && m.channels >= kFoaChannels)
+            m.ambisonic = std::max(1, int(std::sqrt(double(m.channels) + 1e-9)) - 1);
+        // (Reading AAC to find its layout replaces that with the decoder's speakers: the box itself is read then.)
+        if (!m.ambisonic && m.channels >= kFoaChannels && std::strstr(fmt->iformat->name, "mov"))
+            m.ambisonic = readSpatialAudioBox(uninterpretedPath(path));
         if (dur <= 0 && st->duration > 0) dur = double(st->duration) * av_q2d(st->time_base);
         m.audioStreams.clear();
         for (unsigned i = 0; i < fmt->nb_streams; ++i)
@@ -439,6 +497,7 @@ void VideoDecoder::close() {
     if (raw_) av_frame_free(&raw_);
     rawSequence_.reset();
     rawFrame_ = -1;
+    proResRaw_ = false;
 }
 
 bool VideoDecoder::open(const std::string& path, std::string* error) {
@@ -450,6 +509,7 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
     par_ = in.par;
     alpha_ = in.alpha;
     fields_ = in.fields;
+    interp_ = in;
     if (isVectorPath(uninterpretedPath(path))) {
         VectorInfo vi;
         vector_ = openVector(uninterpretedPath(path), vi, error);
@@ -550,7 +610,11 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
     }
     AVStream* st = fmt_->streams[stream_];
     still_ = isStillFormat(fmt_);
-    if (!openCodec(hwDecodeMode() == HwDecodeMode::Auto && !still_, error)) {
+#ifdef MONTAGE_PRORES_RAW
+    // ProRes RAW: a Bayer mosaic and its colour, developed here (media/ProResRaw.h), in software.
+    proResRaw_ = st->codecpar->codec_id == AV_CODEC_ID_PRORES_RAW;
+#endif
+    if (!openCodec(hwDecodeMode() == HwDecodeMode::Auto && !still_ && !proResRaw_, error)) {
         close();
         return false;
     }
@@ -567,6 +631,14 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
     duration_ = fmt_->duration > 0 ? double(fmt_->duration) / AV_TIME_BASE : 0;
     rotation_ = streamRotation(st);
     int w = st->codecpar->width, h = st->codecpar->height;
+    // (less its recommended crop, which the first frame says)
+    if (ProResRawInfo info; proResRaw_ && probeProResRaw(uninterpretedPath(path), info)) w = info.width, h = info.height;
+    // Stereoscopic footage: one eye is read, the one asked for (the file's right-first packing and Interpret Footage's
+    // swap each turn them round).
+    bool inverted = false;
+    stereo_ = stereoLayout(streamStereo(st, inverted, !streamProjection(st).empty()), interp_);
+    eye_ = (interp_.eye != 0) != (inverted != interp_.swapEyes) ? 1 : 0;
+    stereoEyeSize(stereo_, w, h);
     AVRational sar = st->sample_aspect_ratio.num ? st->sample_aspect_ratio : st->codecpar->sample_aspect_ratio;
     if (par_ > 0) w = int(std::lround(double(w) * par_));
     else if (sar.num > 0 && sar.den > 0 && sar.num != sar.den) w = int(std::lround(double(w) * sar.num / sar.den));
@@ -588,6 +660,8 @@ bool VideoDecoder::openCodec(bool tryHardware, std::string* error) {
     ctx_ = avcodec_alloc_context3(codec);
     avcodec_parameters_to_context(ctx_, st->codecpar);
     ctx_->pkt_timebase = st->time_base;
+    // The mosaic whole: its crop is cut after it is developed, on whole 2x2 cells (FFmpeg's would shift the pattern).
+    if (proResRaw_) ctx_->apply_cropping = 0;
     // Hardware: the first device of this platform's list that the codec supports.
     for (const std::string& name : tryHardware ? hwDeviceCandidates() : std::vector<std::string>{}) {
         const AVHWDeviceType type = av_hwdevice_find_type_by_name(name.c_str());
@@ -612,6 +686,9 @@ bool VideoDecoder::openCodec(bool tryHardware, std::string* error) {
         // Many decoders can be open at once; bound each one's thread pool.
         ctx_->thread_count = int(std::clamp(std::thread::hardware_concurrency(), 1u, 8u));
         ctx_->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+        // ProRes RAW (every frame a key frame) decodes its tiles in parallel; FFmpeg 9.0's frame threading would run
+        // them one after another, and hold each seek's first frame back until eight were decoded.
+        if (proResRaw_) ctx_->thread_type = FF_THREAD_SLICE;
     }
     int rc = avcodec_open2(ctx_, codec, nullptr);
     if (rc < 0 && hwPixFmt_ >= 0) {
@@ -760,6 +837,13 @@ bool deinterlaceFrame(AVFrame* f) {
 }
 
 Frame16Ptr VideoDecoder::convert(const AVFrame* in, double pts, int w, int h, bool hq) {
+    // ProRes RAW is developed first (RGB48, ACEScct), at half size when it is shown that small.
+    std::unique_ptr<AVFrame, void (*)(AVFrame*)> developed(nullptr, [](AVFrame* fr) { av_frame_free(&fr); });
+    if (proResRaw_) {
+        const int tw = w > 0 ? w : dispW_, th = h > 0 ? h : dispH_;
+        developed.reset(developProResRawFrame(in, rawSettings_, rotation_ % 180 ? th : tw, rotation_ % 180 ? tw : th));
+        if (developed) in = developed.get();
+    }
     // Interlaced pictures are deinterlaced on a copy first, in their own format.
     std::unique_ptr<AVFrame, void (*)(AVFrame*)> deint(nullptr, [](AVFrame* fr) { av_frame_free(&fr); });
     const AVFrame* f = in;
@@ -769,6 +853,27 @@ Frame16Ptr VideoDecoder::convert(const AVFrame* in, double pts, int w, int h, bo
         deint.reset(av_frame_clone(in));
         if (deint) setFieldDominance(deint.get(), dominance);
         if (deint && deinterlaceFrame(deint.get())) f = deint.get();
+    }
+    // Stereoscopic footage: the eye's half of the frame (squeezed halves are stretched back by the scaling below).
+    std::unique_ptr<AVFrame, void (*)(AVFrame*)> eyeFrame(nullptr, [](AVFrame* fr) { av_frame_free(&fr); });
+    if (!stereo_.empty() && f->width > 1 && f->height > 1) {
+        eyeFrame.reset(av_frame_clone(f));
+        if (AVFrame* e = eyeFrame.get()) {
+            // Where the eyes meet, on a whole chroma sample (an odd offset would split packed 4:2:2 pairs).
+            const AVPixFmtDescriptor* pd = av_pix_fmt_desc_get(AVPixelFormat(e->format));
+            if (stereo_.rfind("sbs", 0) == 0) {
+                int half = e->width / 2;
+                if (pd && pd->log2_chroma_w > 0) half &= ~1;
+                if (eye_) e->crop_left += size_t(half);
+                else e->crop_right += size_t(e->width - half);
+            } else {
+                int half = e->height / 2;
+                if (pd && pd->log2_chroma_h > 0) half &= ~1;
+                if (eye_) e->crop_top += size_t(half);
+                else e->crop_bottom += size_t(e->height - half);
+            }
+            if (av_frame_apply_cropping(e, AV_FRAME_CROP_UNALIGNED) == 0) f = e;
+        }
     }
     if (w <= 0) w = dispW_;
     if (h <= 0) h = dispH_;
@@ -1040,7 +1145,7 @@ namespace {
 // One audio stream decoded whole to float at `sampleRate`, aligned so sample 0 is media time 0: the best stream
 // mixed to stereo (ordinal -1), or the ordinal-th audio stream with its own channels. `channels` says how many.
 bool decodeAudioStream(const std::string& path, int sampleRate, int ordinal, std::vector<float>& samples, int& channels,
-                       std::string* error, const std::atomic<bool>* cancel) {
+                       std::string* error, const std::atomic<bool>* cancel, AVChannelLayout* layoutOut = nullptr) {
     AVFormatContext* fmt = nullptr;
     int rc = openMediaInput(&fmt, path);
     if (rc < 0) {
@@ -1090,6 +1195,7 @@ bool decodeAudioStream(const std::string& path, int sampleRate, int ordinal, std
     }
     if (c.ctx->ch_layout.order == AV_CHANNEL_ORDER_UNSPEC)
         av_channel_layout_default(&c.ctx->ch_layout, std::max(1, c.ctx->ch_layout.nb_channels));
+    if (layoutOut) av_channel_layout_copy(layoutOut, &c.ctx->ch_layout);
     AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
     const AVChannelLayout* outLayout = ordinal < 0 ? &stereo : &c.ctx->ch_layout;
     channels = outLayout->nb_channels;
@@ -1163,6 +1269,118 @@ bool decodeAudioStream(const std::string& path, int sampleRate, int ordinal, std
 }
 
 }  // namespace
+
+void checkStereoMedia(Project& p) {
+    // ProRes RAW media read by another build: developed to ACEScct where this FFmpeg gives its colour, left to FFmpeg
+    // (and not ACEScct) where it does not; their size and colour space come from probing again.
+    for (MediaItem& m : p.media) {
+        if (m.videoCodec != "prores_raw" || m.path.empty() || m.subclipOf || (m.colorSpace == "acescct") == proResRawAvailable()) continue;
+        MediaItem fresh = m;
+        fresh.colorSpace.clear();
+        if (!probeMedia(m.path, fresh)) continue;
+        m.colorSpace = fresh.colorSpace;
+        m.width = fresh.width;
+        m.height = fresh.height;
+        for (MediaItem& sub : p.media)
+            if (sub.subclipOf == m.id) sub.colorSpace = m.colorSpace, sub.width = m.width, sub.height = m.height;
+    }
+    if (p.stereoChecked) return;
+    p.stereoChecked = true;
+    for (MediaItem& m : p.media) {
+        if (m.kind != MediaKind::Video || m.path.empty() || m.subclipOf || !m.stereo.empty()) continue;
+        // The header alone says (no stream analysis), so a project of many files opens quickly.
+        AVFormatContext* fmt = nullptr;
+        if (openMediaInput(&fmt, m.path) < 0) continue;
+        std::string layout;
+        for (unsigned i = 0; i < fmt->nb_streams && layout.empty(); ++i) {
+            const AVStream* st = fmt->streams[i];
+            if (st->codecpar->codec_type != AVMEDIA_TYPE_VIDEO || (st->disposition & AV_DISPOSITION_ATTACHED_PIC)) continue;
+            bool inverted = false;
+            Interpretation in;
+            parseInterpretation(m.path, in);
+            layout = stereoLayout(streamStereo(st, inverted, !streamProjection(st).empty()), in);
+        }
+        avformat_close_input(&fmt);
+        MediaItem fresh;
+        if (layout.empty() || !probeMedia(m.path, fresh)) continue;
+        m.stereo = fresh.stereo;
+        m.width = fresh.width;
+        m.height = fresh.height;
+        for (MediaItem& sub : p.media)
+            if (sub.subclipOf == m.id) sub.stereo = m.stereo, sub.width = m.width, sub.height = m.height;
+    }
+}
+
+AudioBufferPtr decodeAmbisonic(const std::string& path, int sampleRate, std::string* error, const std::atomic<bool>* cancel) {
+    // A conformed file plays at its new speed, or stretched to its new length with its pitch kept, as decodeAudio does.
+    if (Interpretation in; parseInterpretation(path, in) && in.conformed()) {
+        const double k = in.timeScale();
+        if (!in.keepPitch) {
+            const int rate = int(std::clamp(std::llround(sampleRate / k), 1000LL, 1LL << 30));
+            AudioBufferPtr played = decodeAmbisonic(uninterpretedPath(path), rate, error, cancel);
+            if (!played) return nullptr;
+            auto out = std::make_shared<AudioBuffer>(*played);
+            out->sampleRate = sampleRate;
+            return out;
+        }
+        AudioBufferPtr src = decodeAmbisonic(uninterpretedPath(path), sampleRate, error, cancel);
+        if (!src) return nullptr;
+        const int hop = stretchHop(sampleRate);
+        const int64_t outFrames = int64_t(std::llround(double(src->frames()) / k));
+        std::vector<double> positions(size_t(outFrames / hop + 2));
+        for (size_t j = 0; j < positions.size(); ++j) positions[j] = double(j) * hop * k;
+        auto out = std::make_shared<AudioBuffer>();
+        wsolaStretch(*src, positions, hop, outFrames, *out);
+        out->sampleRate = sampleRate;
+        return out;
+    }
+    // The stream the stereo mix comes from, with its own channels.
+    int ordinal = -1;
+    {
+        AVFormatContext* fmt = nullptr;
+        if (int rc = openMediaInput(&fmt, path); rc < 0) {
+            if (error) *error = averr(rc);
+            return nullptr;
+        }
+        if (avformat_find_stream_info(fmt, nullptr) >= 0) {
+            const int best = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+            for (unsigned i = 0, k = 0; best >= 0 && i < fmt->nb_streams; ++i) {
+                if (fmt->streams[i]->codecpar->codec_type != AVMEDIA_TYPE_AUDIO) continue;
+                if (int(i) == best) {
+                    ordinal = int(k);
+                    break;
+                }
+                ++k;
+            }
+        }
+        avformat_close_input(&fmt);
+    }
+    if (ordinal < 0) {
+        if (error) *error = "No audio stream";
+        return nullptr;
+    }
+    std::vector<float> raw;
+    int n = 0;
+    AVChannelLayout layout{};
+    if (!decodeAudioStream(path, sampleRate, ordinal, raw, n, error, cancel, &layout)) return nullptr;
+    if (n < kFoaChannels) {
+        av_channel_layout_uninit(&layout);
+        if (error) *error = "Ambisonic sound needs at least four channels";
+        return nullptr;
+    }
+    // ACN order (W, Y, Z, X) as decoded: a decoder that names four channels as speakers (AAC's 4.0) gives them in its
+    // own channel order, which is the order FFmpeg's encoders took them in (and Montage's exports write).
+    const int map[4] = {0, 1, 2, 3};
+    av_channel_layout_uninit(&layout);
+    auto buf = std::make_shared<AudioBuffer>();
+    buf->sampleRate = sampleRate;
+    buf->channels = kFoaChannels;
+    const size_t frames = raw.size() / size_t(n);
+    buf->samples.resize(frames * 4);
+    for (size_t i = 0; i < frames; ++i)
+        for (int k = 0; k < 4; ++k) buf->samples[i * 4 + size_t(k)] = raw[i * size_t(n) + size_t(map[k])];
+    return buf;
+}
 
 AudioBufferPtr decodeAudio(const std::string& path, int sampleRate, std::string* error, const std::atomic<bool>* cancel,
                            const std::vector<int>& channels) {
@@ -1258,8 +1476,10 @@ PeaksPtr computePeaks(const AudioBuffer& buf, int samplesPerBucket) {
     for (int64_t b = 0; b < buckets; ++b) {
         float lo = 0, hi = 0;
         int64_t s0 = b * p->samplesPerBucket, s1 = std::min(frames, s0 + p->samplesPerBucket);
+        const size_t nch = size_t(std::max(1, buf.channels));
         for (int64_t s = s0; s < s1; ++s) {
-            float v = 0.5f * (buf.samples[size_t(s) * 2] + buf.samples[size_t(s) * 2 + 1]);
+            // Stereo: the two sides' mean; an ambisonic field: its omnidirectional W.
+            float v = nch == 2 ? 0.5f * (buf.samples[size_t(s) * 2] + buf.samples[size_t(s) * 2 + 1]) : buf.samples[size_t(s) * nch];
             lo = std::min(lo, v);
             hi = std::max(hi, v);
         }

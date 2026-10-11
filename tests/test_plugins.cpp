@@ -96,7 +96,7 @@ private slots:
 
     void findsPluginFiles() {
         auto files = findPluginFiles(Format::Clap, {kClapDir.toStdString()});
-        QCOMPARE(files.size(), size_t(4));  // good, hang, crash, latency
+        QCOMPARE(files.size(), size_t(5));  // good, hang, crash, latency, sidechain
         auto good = findPluginFiles(Format::Clap, {clapDir("good")});
         QCOMPARE(good.size(), size_t(1));
         QVERIFY(QString::fromStdString(good[0]).endsWith("MontageTestPlugins.clap"));
@@ -666,6 +666,37 @@ private slots:
         QVERIFY(inst->hasEditor());
     }
 
+    void vst3Sidechain() {
+        // The auxiliary input bus is the key: turned on, it hears what it is given, else silence.
+        auto files = findPluginFiles(Format::Vst3, {MONTAGE_TEST_VST3_DIR});
+        QCOMPARE(files.size(), size_t(1));
+        auto ds = probeInProcess(Format::Vst3, files[0]);
+        QCOMPARE(ds.size(), size_t(1));
+        auto inst = instantiate(ds[0]);
+        QVERIFY(inst && inst->activate(48000, 256));
+        QVERIFY(inst->hasSidechain());
+        std::vector<float> l(600, 0.8f), r(600, 0.8f), k(600, 0.5f);
+        float* ch[2] = {l.data(), r.data()};
+        inst->process(ch, 2, 600);
+        QVERIFY(std::fabs(l[300] - 0.8f) < 1e-6f);  // unity gain, no key
+        // Until a key is chosen the bus stays off (as DAWs leave it), so a key given anyway is not heard.
+        const float* key[2] = {k.data(), k.data()};
+        inst->setSidechain(key, 2);
+        inst->process(ch, 2, 600);
+        QVERIFY(std::fabs(l[300] - 0.8f) < 1e-6f);
+        inst->enableSidechain(true);
+        inst->setSidechain(key, 2);
+        inst->process(ch, 2, 600);
+        QVERIFY2(std::fabs(l[300] - 0.4f) < 1e-6f && std::fabs(r[599] - 0.4f) < 1e-6f, qPrintable(QString::number(l[300])));
+        inst->setSidechain(nullptr, 0);
+        inst->process(ch, 2, 600);
+        QVERIFY(std::fabs(l[300] - 0.4f) < 1e-6f);  // silence on the key: unchanged
+        inst->enableSidechain(false);  // and off again
+        inst->setSidechain(key, 2);
+        inst->process(ch, 2, 600);
+        QVERIFY(std::fabs(l[300] - 0.4f) < 1e-6f);
+    }
+
     void probesAndHostsAVst3Plugin() {
         const std::string dir = MONTAGE_TEST_VST3_DIR;
         auto files = findPluginFiles(Format::Vst3, {dir});
@@ -769,6 +800,18 @@ private slots:
         float* zc[2] = {z.data(), z2.data()};
         inst->process(zc, 2, 64);
         QCOMPARE(z[0], 0.0f);
+        // Its side chain inputs are the key, not more signal: 0.5 there halves what comes out.
+        QVERIFY(inst->hasSidechain());
+        inst->setParameter(params[0].id, 0.0);
+        std::vector<float> a(600, 0.8f), b(600, 0.8f), k(600, 0.5f);
+        float* ab[2] = {a.data(), b.data()};
+        const float* key[2] = {k.data(), k.data()};
+        inst->setSidechain(key, 2);
+        inst->process(ab, 2, 600);
+        QVERIFY2(std::fabs(a[300] - 0.4f) < 1e-4f && std::fabs(b[599] - 0.4f) < 1e-4f, qPrintable(QString::number(a[300])));
+        inst->setSidechain(nullptr, 0);
+        inst->process(ab, 2, 600);
+        QVERIFY(std::fabs(a[300] - 0.4f) < 1e-4f);  // 0.4 in, unity, no key
 
         // As a clip effect in the mixer, with its latency compensated.
         const std::string wav = path("lv2-step.wav").toStdString();
@@ -793,6 +836,146 @@ private slots:
         QCOMPARE(step, int64_t(48000));
     }
 #endif
+
+    void pluginSidechain() {
+        // A plugin's key input hears what it is given, or silence; plugins without one say so.
+        Registry& reg = Registry::instance();
+        isolate(reg, path("cache-sidechain.json"), {clapDir("sidechain"), clapDir("good")});
+        reg.scan();
+        auto d = reg.find("clap:org.montage.test.ducker");
+        QVERIFY(d.has_value());
+        auto inst = instantiate(*d);
+        QVERIFY(inst && inst->activate(48000, 256));
+        QVERIFY(inst->hasSidechain());
+        std::vector<float> l(600, 0.8f), r(600, 0.8f), kl(600, 0.5f), kr(600, -0.25f);
+        float* ch[2] = {l.data(), r.data()};
+        const float* key[2] = {kl.data(), kr.data()};
+        inst->setSidechain(key, 2);
+        inst->process(ch, 2, 600);  // more than one block
+        QVERIFY(std::fabs(l[0] - 0.4f) < 1e-6f && std::fabs(l[599] - 0.4f) < 1e-6f && std::fabs(r[599] - 0.6f) < 1e-6f);
+        // A mono key goes to both sides.
+        std::fill(l.begin(), l.end(), 0.8f);
+        std::fill(r.begin(), r.end(), 0.8f);
+        const float* mono[1] = {kl.data()};
+        inst->setSidechain(mono, 1);
+        inst->process(ch, 2, 600);
+        QVERIFY(std::fabs(r[300] - 0.4f) < 1e-6f);
+        // No key: silence there, so nothing is turned down.
+        std::fill(l.begin(), l.end(), 0.8f);
+        inst->setSidechain(nullptr, 0);
+        inst->process(ch, 2, 600);
+        QVERIFY(std::fabs(l[300] - 0.8f) < 1e-6f);
+        auto gain = reg.find("clap:org.montage.test.gain");
+        QVERIFY(gain.has_value());
+        auto plain = instantiate(*gain);
+        QVERIFY(plain && !plain->hasSidechain());
+
+        // As an effect: marked as having a key input (the gain is not), and in the mixer hearing its sidechain
+        // track, muted or not, while that track stays out of the mix.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        std::string err;
+        auto e = makePluginEffect(p, *d, &err);
+        QVERIFY2(e, err.c_str());
+        QCOMPARE(e->s("key_input"), std::string("1"));
+        auto g = makePluginEffect(p, *gain, &err);
+        QVERIFY(g && g->s("key_input").empty());
+        const std::string music = path("sc-music.wav").toStdString(), voice = path("sc-voice.wav").toStdString();
+        writeWav(music, 48000, 2.0, 0.5f);
+        writeWav(voice, 48000, 2.0, 0.25f);
+        for (const std::string& f : {music, voice}) {
+            MediaItem m;
+            m.id = p.newId();
+            QVERIFY2(probeMedia(f, m, &err), err.c_str());
+            p.media.push_back(m);
+        }
+        while (s.audioTracks.size() < 2) edit::addTrack(p, s, TrackKind::Audio);
+        for (int t = 0; t < 2; ++t) {
+            Clip c = makeClip(p, p.media[p.media.size() - 2 + size_t(t)], TrackKind::Audio, s);
+            c.duration = 25;
+            QVERIFY(edit::overwrite(p, s, {TrackKind::Audio, t}, c).ok);
+        }
+        s.audioTracks[1].muted = true;
+        auto level = [&] {
+            AudioMixer mixer;
+            std::vector<float> out(512 * 2);
+            mixer.mix(p, s, 4800, 512, out.data());
+            return out[600];
+        };
+        const float alone = level();
+        QVERIFY(alone > 0.1f);
+        s.audioTracks[0].effects.push_back(*e);
+        QVERIFY(std::fabs(level() - alone) < 1e-5f);  // no key chosen
+        s.audioTracks[0].effects[0].strings["sidechain"] = std::to_string(s.audioTracks[1].id);
+        QVERIFY2(std::fabs(level() - alone * 0.75f) < 1e-3f, qPrintable(QString("%1 vs %2").arg(level()).arg(alone)));
+        // Its own track as the key is ignored (a key cannot be its own signal).
+        s.audioTracks[0].effects[0].strings["sidechain"] = std::to_string(s.audioTracks[0].id);
+        QVERIFY(std::fabs(level() - alone) < 1e-5f);
+        // On a clip too.
+        s.audioTracks[0].effects.clear();
+        Effect onClip = *e;
+        onClip.strings["sidechain"] = std::to_string(s.audioTracks[1].id);
+        s.audioTracks[0].clips[0].effects.push_back(onClip);
+        QVERIFY(std::fabs(level() - alone * 0.75f) < 1e-3f);
+        // Known to have a key input once loaded, even for an effect saved without the mark.
+        QVERIFY(knownSidechain(d->id) && !knownSidechain(gain->id));
+        // A duplicate of the sequence keys from the copy's own track.
+        {
+            Project dp = p;
+            const Id copy = edit::duplicateSequence(dp, dp.activeSequence);
+            const Sequence* c = dp.findSequence(copy);
+            QVERIFY(c);
+            QCOMPARE(c->audioTracks[0].clips[0].effects.at(0).s("sidechain"), std::to_string(c->audioTracks[1].id));
+            QVERIFY(c->audioTracks[1].id != s.audioTracks[1].id);
+        }
+
+        // In step with the signal through plugin latency: the key's onset (a second in) ducks the sound at that same
+        // sample, whether the keyed plugin comes before a latent one on a clip or after one on a track.
+        isolate(reg, path("cache-sidechain-latency.json"), {clapDir("sidechain"), clapDir("latency")});
+        reg.scan();
+        auto delay = reg.find("clap:org.montage.test.delay64");
+        auto duck = reg.find("clap:org.montage.test.ducker");
+        QVERIFY(delay && duck);
+        Project lp = makeDefaultProject();
+        Sequence& ls = *lp.active();
+        const std::string steady = path("sc-steady.wav").toStdString(), onset = path("sc-onset.wav").toStdString();
+        writeWav(steady, 48000, 3.0, 0.5f);
+        writeWav(onset, 48000, 1.0, 0.5f);
+        for (const std::string& f : {steady, onset}) {
+            MediaItem m;
+            m.id = lp.newId();
+            QVERIFY2(probeMedia(f, m, &err), err.c_str());
+            lp.media.push_back(m);
+        }
+        while (ls.audioTracks.size() < 2) edit::addTrack(lp, ls, TrackKind::Audio);
+        Clip main = makeClip(lp, lp.media[0], TrackKind::Audio, ls);
+        main.duration = FrameTime(std::llround(3 * ls.fpsValue()));
+        QVERIFY(edit::overwrite(lp, ls, {TrackKind::Audio, 0}, main).ok);
+        Clip keyClip = makeClip(lp, lp.media[1], TrackKind::Audio, ls);
+        keyClip.start = FrameTime(std::llround(ls.fpsValue()));  // from 1 s (sample 48000)
+        keyClip.duration = FrameTime(std::llround(ls.fpsValue()));
+        QVERIFY(edit::overwrite(lp, ls, {TrackKind::Audio, 1}, keyClip).ok);
+        ls.audioTracks[1].muted = true;
+        auto keyed = [&](Project& pr) {
+            auto fx = makePluginEffect(pr, *duck, &err);
+            fx->strings["sidechain"] = std::to_string(ls.audioTracks[1].id);
+            return *fx;
+        };
+        auto duckedFrom = [&] {
+            AudioMixer mixer;
+            std::vector<float> out(600 * 2);
+            mixer.mix(lp, ls, 47700, 600, out.data());
+            const float before = out[0];
+            for (int i = 0; i < 600; ++i)
+                if (out[size_t(i) * 2] < before * 0.8f) return int64_t(47700 + i);
+            return int64_t(-1);
+        };
+        ls.audioTracks[0].clips[0].effects = {keyed(lp), *makePluginEffect(lp, *delay, &err)};
+        QCOMPARE(duckedFrom(), int64_t(48000));
+        ls.audioTracks[0].clips[0].effects.clear();
+        ls.audioTracks[0].effects = {*makePluginEffect(lp, *delay, &err), keyed(lp)};
+        QCOMPARE(duckedFrom(), int64_t(48000));
+    }
 
     void pluginDelayCompensation() {
         Registry& reg = Registry::instance();

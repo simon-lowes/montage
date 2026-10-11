@@ -147,7 +147,8 @@ bool consolidateProject(const Project& p, const ConsolidateOptions& o, Consolida
             for (TrackRef r : allTracks(s))
                 for (const Clip& c : trackAt(s, r)->clips)
                     for (size_t k = 0; k < c.takes.size(); ++k) aTake |= int(k) != c.take && c.takes[k].mediaId == m.id;
-        const bool trimHere = o.trim && m.kind == MediaKind::Video && m.hasVideo && last > first && !aTake;
+        // Stereo footage is copied whole too: rendered, it would keep one eye.
+        const bool trimHere = o.trim && m.kind == MediaKind::Video && m.hasVideo && last > first && !aTake && m.stereo.empty();
         if (trimHere) {
             const double from = std::max(0.0, first - o.handles), to = m.duration > 0 ? std::min(m.duration, last + o.handles) : last + o.handles;
             const bool prores = o.codec != "libx264";
@@ -158,6 +159,8 @@ bool consolidateProject(const Project& p, const ConsolidateOptions& o, Consolida
             ts.width = m.width, ts.height = m.height;
             ts.fps = m.fps.valid() ? m.fps : Rational{30, 1};
             if (const std::string cs = m.colorOverride.empty() ? m.colorSpace : m.colorOverride; !cs.empty()) ts.colorSpace = cs;
+            ts.spherical = !m.projection.empty();  // 360° footage whole, not as a view
+            ts.vr180 = m.projection == "vr180";
             MediaItem copy = m;
             copy.id = t.newId();
             copy.transcript.reset(), copy.visual.reset(), copy.faces.reset();

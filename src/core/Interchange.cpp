@@ -10,9 +10,11 @@
 #include <iomanip>
 #include <sstream>
 
+#include "Cdl.h"
 #include "EditOps.h"
 #include "Effects.h"
 #include "Interpretation.h"
+#include "Multicam.h"
 #include "History.h"
 
 namespace montage {
@@ -52,6 +54,14 @@ struct EdlWriter {
         if (speed != 1.0 || c.reverse)
             out << "M2   " << reelFor(c) << "       " << std::fixed << std::setprecision(1)
                 << (c.reverse ? -1 : 1) * speed * s.fpsValue() << "    " << tc(src(c, c.start)) << "\n";
+        cdl(c);
+    }
+    // The clip's ASC CDL, as Resolve and Baselight write and read it.
+    void cdl(const Clip& c) {
+        Cdl g;
+        if (!clipCdl(c, 0, g)) return;
+        out << "*ASC_SOP " << cdlSopText(g) << "\n";
+        out << "*ASC_SAT " << cdlNumber(g.saturation) << "\n";
     }
 
     void line(const std::string& reel, const std::string& channel, const std::string& type, FrameTime srcIn,
@@ -86,6 +96,7 @@ struct EdlWriter {
                 line(reelFor(c), channel, type, src(c, from), src(c, recOut), from, recOut);
                 if (a) out << "* FROM CLIP NAME: " << a->name << "\n";
                 out << "* TO CLIP NAME: " << c.name << "\n";
+                cdl(c);
                 continue;
             }
             ++event;
@@ -112,7 +123,7 @@ Sequence interchangeSequence(const Sequence& in) {
 }
 
 std::string exportEdl(const Project& p, const Sequence& sequence, int videoTrack) {
-    const Sequence s = interchangeSequence(sequence);
+    const Sequence s = interchangeSequence(flattenedMulticam(p, sequence));
     EdlWriter w{p, s, {}, 0};
     w.out << "TITLE: " << s.name << "\n";
     w.out << "FCM: " << (isDropFrameRate(s.fps) ? "DROP FRAME" : "NON-DROP FRAME") << "\n\n";
@@ -159,8 +170,56 @@ QJsonObject otioMarker(const Marker& m, double rate) {
                        {"marked_range", range(double(m.t), double(m.duration), rate)}, {"metadata", meta}};
 }
 
-QJsonObject clipJson(const Project& p, const Sequence& s, const Clip& c) {
+QJsonObject trackJson(const Project& p, const Sequence& s, const Track& t, int depth);
+
+// A compound clip (a nested sequence) as OTIO nests one: a Stack of the sequence's tracks of this kind (picture in a
+// video track, sound in an audio track; Montage's metadata names the sequence so both halves come back as one).
+QJsonObject stackJson(const Project& p, const Sequence& s, const Clip& c, const Sequence& nested, TrackKind kind, int depth) {
     const double rate = s.fpsValue();
+    // A multicam clip left as one (at another speed): only what it shows, as a plain nested sequence.
+    const bool part = nested.multicam;
+    const Sequence inner = part ? multicamPart(nested, kind == TrackKind::Video, c.angle, c.audioAngle)
+                                : interchangeSequence(flattenedMulticam(p, nested));
+    QJsonObject o = item("Stack.1", QString::fromStdString(c.name));
+    o["enabled"] = c.enabled;
+    o["source_range"] = range(c.reverse ? c.sourceIn + c.sourceExtent() : c.sourceIn, double(c.duration), rate);
+    QJsonArray tracks;
+    for (const Track& t : kind == TrackKind::Video ? inner.videoTracks : inner.audioTracks) tracks.append(trackJson(p, inner, t, depth + 1));
+    o["children"] = tracks;
+    if (kind == TrackKind::Video) {
+        QJsonArray markers;
+        for (const Marker& m : inner.markers) markers.append(otioMarker(m, inner.fpsValue()));
+        o["markers"] = markers;
+    }
+    const double speed = c.ramped() ? c.sourceExtent() / double(c.duration) : c.speed;
+    if (speed != 1.0 || c.reverse) {
+        QJsonArray fx;
+        fx.append(QJsonObject{{"OTIO_SCHEMA", "LinearTimeWarp.1"}, {"name", ""}, {"effect_name", "LinearTimeWarp"},
+                              {"time_scalar", (c.reverse ? -1.0 : 1.0) * speed}, {"metadata", QJsonObject()}});
+        o["effects"] = fx;
+    }
+    if (part) {
+        o["metadata"] = QJsonObject{{"montage", QJsonObject{{"clip_id", double(c.id)}, {"sequence_name", QString::fromStdString(nested.name)}}}};
+        return o;
+    }
+    o["metadata"] = QJsonObject{{"montage", QJsonObject{{"clip_id", double(c.id)},
+                                                        {"sequence_id", double(nested.id)},
+                                                        {"sequence_name", QString::fromStdString(nested.name)},
+                                                        {"width", nested.width},
+                                                        {"height", nested.height},
+                                                        {"fps_num", nested.fps.num},
+                                                        {"fps_den", nested.fps.den},
+                                                        {"multicam", nested.multicam},
+                                                        {"angle", c.angle},
+                                                        {"audio_angle", c.audioAngle}}}};
+    return o;
+}
+
+QJsonObject clipJson(const Project& p, const Sequence& s, const Clip& c, TrackKind kind, int depth) {
+    const double rate = s.fpsValue();
+    if (!c.isGenerator() && depth < 8)
+        if (const MediaItem* m = p.findMedia(c.mediaId); m && m->kind == MediaKind::Sequence)
+            if (const Sequence* nested = p.findSequence(m->sequenceId)) return stackJson(p, s, c, *nested, kind, depth);
     QJsonObject o = item("Clip.2", QString::fromStdString(c.name));
     o["enabled"] = c.enabled;
     double srcStart = c.reverse ? c.sourceIn + c.sourceExtent() : c.sourceIn;
@@ -205,7 +264,7 @@ QJsonObject clipJson(const Project& p, const Sequence& s, const Clip& c) {
     return o;
 }
 
-QJsonObject trackJson(const Project& p, const Sequence& s, const Track& t) {
+QJsonObject trackJson(const Project& p, const Sequence& s, const Track& t, int depth) {
     const double rate = s.fpsValue();
     QJsonObject o = item("Track.1", QString::fromStdString(t.name));
     o.remove("enabled");
@@ -230,7 +289,7 @@ QJsonObject trackJson(const Project& p, const Sequence& s, const Track& t) {
                                         {"transition_type", type}, {"in_offset", rt(double(c.start - from), rate)},
                                         {"out_offset", rt(double(to - c.start), rate)}, {"metadata", QJsonObject()}});
         }
-        children.append(clipJson(p, s, c));
+        children.append(clipJson(p, s, c, t.kind, depth));
         cursor = c.end();
     }
     o["children"] = children;
@@ -240,11 +299,11 @@ QJsonObject trackJson(const Project& p, const Sequence& s, const Track& t) {
 }  // namespace
 
 std::string exportOtio(const Project& p, const Sequence& sequence) {
-    const Sequence s = interchangeSequence(sequence);
+    const Sequence s = interchangeSequence(flattenedMulticam(p, sequence));
     const double rate = s.fpsValue();
     QJsonArray tracks;
-    for (const auto& t : s.videoTracks) tracks.append(trackJson(p, s, t));
-    for (const auto& t : s.audioTracks) tracks.append(trackJson(p, s, t));
+    for (const auto& t : s.videoTracks) tracks.append(trackJson(p, s, t, 0));
+    for (const auto& t : s.audioTracks) tracks.append(trackJson(p, s, t, 0));
     QJsonArray markers;
     for (const auto& m : s.markers) markers.append(otioMarker(m, rate));
     QJsonObject stack = item("Stack.1", "tracks");

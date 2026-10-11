@@ -41,6 +41,10 @@
 #include <QToolButton>
 #include <QTreeView>
 #include <QTreeWidget>
+#include <QJsonObject>
+#include <QJsonDocument>
+#include "core/ProjectLock.h"
+#include "ProductionPanel.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -69,6 +73,7 @@
 #include "render/Ofx.h"
 #include "Assistant.h"
 #include "AssistantPanel.h"
+#include "PanFollowDialog.h"
 #include "RedactFacesDialog.h"
 #include "SpectralRepairDialog.h"
 #include "automation/McpServer.h"
@@ -105,6 +110,9 @@
 #include "media/Translator.h"
 #include "ModelPacks.h"
 #include "MixerPanel.h"
+#include "ControlSurface.h"
+#include "core/Cdl.h"
+#include "control/MackieControl.h"
 #include "MulticamPanel.h"
 #include "PluginEditorWindow.h"
 #include "audio/PluginEffect.h"
@@ -137,6 +145,7 @@
 #include "core/History.h"
 #include "render/Processing.h"
 #include "media/Segmenter.h"
+#include "HdrSurface.h"
 #include "MonitorPanel.h"
 #include "PlaybackController.h"
 #include "Recovery.h"
@@ -579,6 +588,296 @@ private slots:
         QVERIFY(ranged.runCheck());
         QCOMPARE(ranged.issues().size(), size_t(1));
         QVERIFY(ranged.issues()[0].start == 60 && ranged.issues()[0].end == 120);
+    }
+
+    void aleAndCdlFromTheMenus() {
+        state()->newProject();
+        Id media = 0;
+        QVERIFY(state()->edit("Media", [&](Project& p, Sequence& s) {
+            MediaItem m;
+            m.id = media = p.newId();
+            m.kind = MediaKind::Video;
+            m.name = "A001C005.mov";
+            m.path = "/cards/A001C005.mov";
+            m.duration = 8;
+            m.width = 1920;
+            m.height = 1080;
+            m.fps = s.fps;
+            m.hasVideo = true;
+            m.timecode = 3600;
+            p.media.push_back(m);
+            return edit::placeMedia(p, s, m.id, 0, 0, 60, {TrackKind::Video, 0}, {}, false).ok;
+        }));
+        for (const char* name : {"importAle", "exportAle", "importCdl", "exportCdl"}) QVERIFY(win_->findChild<QAction*>(name));
+        const Id clip = state()->sequence()->videoTracks[0].clips.at(0).id;
+        auto clipGrade = [&](Cdl& out) { return clipCdl(*edit::clipById(*state()->sequence(), clip), 0, out); };
+        // An ALE: its log on the media and its CDL on the clip, as one undo step.
+        const QString ale = dir_.path() + "/dailies.ale";
+        {
+            QFile f(ale);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write("Heading\nFIELD_DELIM\tTABS\nFPS\t25\n\nColumn\nName\tScene\tTake\tASC_SOP\tASC_SAT\n\nData\n"
+                    "A001C005\t7B\t1\t(0.9 1.0 1.1)(0.02 0.0 -0.02)(1.0 1.0 1.0)\t1.1\n");
+        }
+        QCOMPARE(win_->importAle(ale), 1);
+        QCOMPARE(state()->project().findMedia(media)->metadata.at("scene"), std::string("7B"));
+        Cdl g;
+        QVERIFY(clipGrade(g) && g.slope[0] == 0.9 && g.saturation == 1.1);
+        state()->undo();
+        QVERIFY(!state()->project().findMedia(media)->metadata.count("scene"));
+        QVERIFY(!clipGrade(g));
+        QCOMPARE(win_->importAle(dir_.path() + "/missing.ale"), -1);
+        // A .cc onto the selected clip; out again as a collection; the bin's media as an ALE.
+        const QString cc = dir_.path() + "/look.cc";
+        {
+            Cdl look;
+            look.id = "look";
+            look.slope[1] = 1.3;
+            QFile f(cc);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(QByteArray::fromStdString(writeCdlXml({look}, CdlFormat::Cc)));
+        }
+        QCOMPARE(win_->importCdl(cc), 0);  // nothing selected
+        state()->setSelection({clip});
+        QCOMPARE(win_->importCdl(cc), 1);
+        QVERIFY(clipGrade(g) && g.slope[1] == 1.3);
+        const QString ccc = dir_.path() + "/out.ccc";
+        QVERIFY(win_->exportCdl(ccc));
+        QFile out(ccc);
+        QVERIFY(out.open(QIODevice::ReadOnly));
+        const std::vector<Cdl> again = parseCdlXml(out.readAll().toStdString());
+        QVERIFY(again.size() == 1 && again[0].sameGrade(g));
+        state()->setSelection({});
+        const QString aleOut = dir_.path() + "/out.ale";
+        QVERIFY(win_->exportAle(aleOut));
+        QFile af(aleOut);
+        QVERIFY(af.open(QIODevice::ReadOnly));
+        const QString aleText = QString::fromUtf8(af.readAll());
+        QVERIFY2(aleText.contains("A001C005.mov") && aleText.contains("ASC_SOP") && aleText.contains("01:00:00:00"), qPrintable(aleText));
+    }
+
+    void controlSurfaceMackie() {
+        // A stand-in for the surface's MIDI connection: what Montage sends it is kept.
+        struct Recorder : MidiConnection {
+            std::shared_ptr<std::vector<MidiMessage>> sent = std::make_shared<std::vector<MidiMessage>>();
+            bool send(const MidiMessage& m) override {
+                sent->push_back(m);
+                return true;
+            }
+            std::string inputName() const override { return "X-Touch"; }
+            std::string outputName() const override { return "X-Touch"; }
+        };
+        state()->newProject();
+        QVERIFY(state()->edit("Tracks", [](Project& p, Sequence& s) {
+            while (s.audioTracks.size() < 10) edit::addTrack(p, s, TrackKind::Audio);
+            for (size_t i = 0; i < s.audioTracks.size(); ++i) s.audioTracks[i].name = "Trk " + std::to_string(i + 1);
+            s.audioTracks[0].name = "Dialogue A";
+            return true;
+        }));
+        auto* mixer = win_->findChild<MixerPanel*>();
+        QTRY_COMPARE(mixer->trackStrips(), 10);
+        ControlSurface* surface = win_->controlSurface();
+        QVERIFY(surface && !surface->isConnected());
+        QVERIFY(win_->findChild<QAction*>("controlSurface"));
+        auto rec = std::make_unique<Recorder>();
+        auto sent = rec->sent;
+        QSignalSpy connected(surface, &ControlSurface::connectionChanged);
+        surface->setConnection(std::move(rec));
+        QVERIFY(surface->isConnected() && connected.size() == 1);
+        QCOMPARE(surface->surfaceName(), QString("X-Touch"));
+        auto has = [&](const MidiMessage& m) { return std::find(sent->begin(), sent->end(), m) != sent->end(); };
+        // On connecting: asked if it is there, then shown everything: names, levels, faders, the timecode.
+        QCOMPARE(sent->front(), mcu::deviceQuery());
+        QVERIFY(has(mcu::lcd(0, "Dialog ")));
+        QVERIFY(has(mcu::lcd(7, "Trk 2  ")));
+        QVERIFY(has(mcu::lcd(mcu::kLcdWidth, " 0.0   ")));
+        QVERIFY(has(mcu::fader(0, mcu::faderValue(0))));
+        QVERIFY(has(mcu::led(mcu::Stop, 2)) && has(mcu::meterMode(0, 3)));
+        QVERIFY(has(mcu::timecode("00:00:00:00")[0]));
+        QVERIFY(has(mcu::assignment("1")[1]));
+        auto track = [&](int i) -> const Track& { return state()->sequence()->audioTracks.at(size_t(i)); };
+
+        // A touched fader moving: the track's volume, the position echoed back so the servo holds it, one undo step.
+        sent->clear();
+        surface->handle({0x90, 0x68, 0x7F});
+        QVERIFY(mixer->trackFader(0)->isSliderDown());
+        const int minus6 = mcu::faderValue(-6);
+        surface->handle(mcu::fader(0, mcu::faderValue(-3)));
+        surface->handle(mcu::fader(0, minus6));
+        QCOMPARE(track(0).volumeDb, -6.0);
+        QVERIFY(has(mcu::fader(0, minus6)));
+        surface->handle({0x90, 0x68, 0x00});
+        QVERIFY(!mixer->trackFader(0)->isSliderDown());
+        state()->undo();
+        QCOMPARE(track(0).volumeDb, 0.0);
+        // The motor follows the mixer: the fader goes back up.
+        sent->clear();
+        surface->refresh();
+        QVERIFY(has(mcu::fader(0, mcu::faderValue(0))));
+        // A surface without touch sensing: a move holds the fader until it rests.
+        surface->handle(mcu::fader(1, minus6));
+        QCOMPARE(track(1).volumeDb, -6.0);
+        QVERIFY(mixer->trackFader(1)->isSliderDown());
+        QTRY_VERIFY_WITH_TIMEOUT(!mixer->trackFader(1)->isSliderDown(), 3000);
+        // The master fader.
+        surface->handle(mcu::fader(mcu::kMasterChannel, mcu::faderValue(-10)));
+        QCOMPARE(state()->sequence()->masterVolumeDb, -10.0);
+
+        // Mute and solo light up; the V-Pot pans (shown on the strip for a moment) and its push centres it.
+        sent->clear();
+        surface->handle({0x90, uint8_t(mcu::Mute + 2), 0x7F});
+        surface->handle({0x90, uint8_t(mcu::Mute + 2), 0x00});
+        QVERIFY(track(2).muted);
+        QVERIFY(has(mcu::led(mcu::Mute + 2, 2)));
+        surface->handle({0x90, uint8_t(mcu::Solo + 3), 0x7F});
+        QVERIFY(track(3).solo && has(mcu::led(mcu::Solo + 3, 2)));
+        surface->handle({0xB0, 0x10, 0x05});
+        QCOMPARE(track(0).pan, 0.1);
+        QVERIFY(has(mcu::ring(0, mcu::panRing(0.1))));
+        QVERIFY(has(mcu::lcd(mcu::kLcdWidth, " R10   ")));
+        surface->handle({0xB0, 0x10, 0x43});
+        QVERIFY(std::fabs(track(0).pan - 0.04) < 1e-9);
+        surface->handle({0x90, uint8_t(mcu::VPotPush), 0x7F});
+        QCOMPARE(track(0).pan, 0.0);
+
+        // Banking: the strips move to the last eight tracks, the faders and names with them.
+        sent->clear();
+        surface->handle({0x90, uint8_t(mcu::BankRight), 0x7F});
+        QCOMPARE(surface->bank(), 2);
+        QVERIFY(has(mcu::lcd(0, "Trk 3  ")) && has(mcu::assignment("3")[1]));
+        surface->handle(mcu::fader(0, minus6));
+        QCOMPARE(track(2).volumeDb, -6.0);
+        QTRY_VERIFY_WITH_TIMEOUT(!mixer->trackFader(2)->isSliderDown(), 3000);
+        surface->handle({0x90, uint8_t(mcu::ChannelLeft), 0x7F});
+        QCOMPARE(surface->bank(), 1);
+        surface->handle({0x90, uint8_t(mcu::BankLeft), 0x7F});
+        QCOMPARE(surface->bank(), 0);
+        // A level changed in Montage moves the motor.
+        QVERIFY(state()->edit("Level", [](Project&, Sequence& s) {
+            s.audioTracks[4].volumeDb = -12;
+            return true;
+        }));
+        sent->clear();
+        surface->refresh();
+        QVERIFY(has(mcu::fader(4, mcu::faderValue(-12))));
+
+        // Automation: select a strip, Touch on it, and a pass written while the fader is held.
+        surface->handle({0x90, uint8_t(mcu::Select + 5), 0x7F});
+        QCOMPARE(surface->selectedTrack(), 5);
+        surface->handle({0x90, uint8_t(mcu::Touch), 0x7F});
+        QCOMPARE(track(5).automation, int(AutomationMode::Touch));
+        QVERIFY(has(mcu::led(mcu::Touch, 2)));
+        mixer->playbackStarted(0);
+        for (FrameTime f = 0; f <= 40; ++f) {
+            if (f == 10) surface->handle({0x90, 0x6D, 0x7F});
+            if (f == 10) surface->handle(mcu::fader(5, mcu::faderValue(-20)));
+            if (f == 30) surface->handle({0x90, 0x6D, 0x00});
+            mixer->playbackPosition(f);
+        }
+        mixer->playbackStopped(40);
+        QVERIFY(track(5).volumeAuto.animated());
+        QCOMPARE(track(5).volumeAuto.at(20), -20.0);
+        QCOMPARE(track(5).volumeAuto.at(5), 0.0);
+
+        // Transport, jog and markers.
+        auto* program = win_->findChild<PlaybackController*>("programPlayback");
+        state()->setPlayhead(10);
+        surface->handle({0xB0, 0x3C, 0x03});
+        QTRY_COMPARE(state()->playhead(), FrameTime(13));
+        surface->handle({0xB0, 0x3C, 0x41});
+        QTRY_COMPARE(state()->playhead(), FrameTime(12));
+        const size_t markers = state()->sequence()->markers.size();
+        surface->handle({0x90, uint8_t(mcu::Marker), 0x7F});
+        QCOMPARE(state()->sequence()->markers.size(), markers + 1);
+        surface->handle({0x90, uint8_t(mcu::Undo), 0x7F});
+        QCOMPARE(state()->sequence()->markers.size(), markers);
+        sent->clear();
+        surface->handle({0x90, uint8_t(mcu::Play), 0x7F});
+        QVERIFY(program->isPlaying());
+        QVERIFY(has(mcu::led(mcu::Play, 2)) && has(mcu::led(mcu::Stop, 0)));
+        surface->handle({0x90, uint8_t(mcu::Stop), 0x7F});
+        QVERIFY(!program->isPlaying());
+        // Play while shuttling plays at normal speed.
+        program->shuttle(1);
+        program->shuttle(1);
+        QVERIFY(program->speed() > 1);
+        surface->handle({0x90, uint8_t(mcu::Play), 0x7F});
+        QCOMPARE(program->speed(), 1.0);
+        surface->handle({0x90, uint8_t(mcu::Stop), 0x7F});
+        QVERIFY(!program->isPlaying());
+        // Meters follow playback levels.
+        sent->clear();
+        surface->setLevels(0, 0, QVector<float>{0.5f, 0.25f, 1.0f, 1.0f});
+        QVERIFY(has(mcu::meter(0, 8)) && has(mcu::meter(1, 12)));
+
+        // Moves from the surface are one undo step together, two faders moving at once included.
+        QVERIFY(state()->edit("Level", [](Project&, Sequence& s) {
+            s.audioTracks[4].volumeDb = 0;
+            return true;
+        }));
+        surface->handle(mcu::fader(6, minus6));
+        surface->handle(mcu::fader(7, minus6));
+        surface->handle(mcu::fader(6, mcu::faderValue(-3)));
+        QCOMPARE(track(6).volumeDb, -3.0);
+        QCOMPARE(track(7).volumeDb, -6.0);
+        state()->undo();
+        QCOMPARE(track(6).volumeDb, 0.0);
+        QCOMPARE(track(7).volumeDb, 0.0);
+        QTRY_VERIFY_WITH_TIMEOUT(!mixer->trackFader(6)->isSliderDown() && !mixer->trackFader(7)->isSliderDown(), 3000);
+        // A fader's moves that queued up together are applied once, at the last position.
+        sent->clear();
+        surface->receive(mcu::fader(6, mcu::faderValue(-20)));
+        surface->receive(mcu::fader(6, mcu::faderValue(-10)));
+        QTRY_COMPARE(track(6).volumeDb, -10.0);
+        QVERIFY(has(mcu::fader(6, mcu::faderValue(-10))) && !has(mcu::fader(6, mcu::faderValue(-20))));
+        QTRY_VERIFY_WITH_TIMEOUT(!mixer->trackFader(6)->isSliderDown(), 3000);
+        // Banking while a fader is touched: the fader holds its new track, and its motor stays still.
+        surface->handle({0x90, 0x68, 0x7F});
+        sent->clear();
+        surface->handle({0x90, uint8_t(mcu::BankRight), 0x7F});
+        QCOMPARE(surface->bank(), 2);
+        QVERIFY(!mixer->trackFader(0)->isSliderDown() && mixer->trackFader(2)->isSliderDown());
+        QVERIFY(std::none_of(sent->begin(), sent->end(), [](const MidiMessage& m) { return m[0] == 0xE0; }));
+        surface->handle(mcu::fader(0, mcu::faderValue(-12)));
+        QCOMPARE(track(2).volumeDb, -12.0);
+        surface->handle({0x90, 0x68, 0x00});
+        QVERIFY(!mixer->trackFader(2)->isSliderDown());
+        surface->handle({0x90, uint8_t(mcu::BankLeft), 0x7F});
+        QCOMPARE(surface->bank(), 0);
+
+        // A surface switched on later says so: everything is sent again.
+        sent->clear();
+        surface->handle({0xF0, 0x00, 0x00, 0x66, 0x14, 0x01, 1, 2, 3, 4, 5, 6, 7, 0, 0, 0, 0, 0xF7});
+        QVERIFY(has(mcu::lcd(0, "Dialog ")));
+        // Disconnecting leaves it clean.
+        sent->clear();
+        surface->disconnectSurface();
+        QVERIFY(!surface->isConnected() && connected.size() == 2);
+        QVERIFY(has(mcu::fader(0, 0)) && has(mcu::led(mcu::Mute + 2, 0)) && has(mcu::lcd(0, std::string(2 * mcu::kLcdWidth, ' '))));
+
+        // The settings dialog lists the ports and opens once.
+        QDialog* dlg = win_->controlSurfaceDialog();
+        QVERIFY(dlg && dlg->findChild<QComboBox*>("surfaceInput") && dlg->findChild<QComboBox*>("surfaceOutput"));
+        QVERIFY(dlg->findChild<QLabel*>("surfaceStatus")->text().contains("Not connected"));
+        QCOMPARE(win_->controlSurfaceDialog(), dlg);
+        dlg->close();
+
+        // The device going away (unplugged mid-move): what it held lets go and it is closed.
+        surface->setConnection(std::make_unique<Recorder>());
+        QVERIFY(surface->isConnected() && connected.size() == 3);
+        surface->handle({0x90, 0x69, 0x7F});
+        QVERIFY(mixer->trackFader(1)->isSliderDown());
+        surface->connectionLost();
+        QTRY_VERIFY(!surface->isConnected());
+        QCOMPARE(connected.size(), 4);
+        QVERIFY(!mixer->trackFader(1)->isSliderDown());
+        // A loss reported by a connection since replaced is ignored.
+        surface->setConnection(std::make_unique<Recorder>());
+        surface->connectionLost();
+        surface->setConnection(std::make_unique<Recorder>());
+        QTest::qWait(50);
+        QVERIFY(surface->isConnected());
+        surface->disconnectSurface();
     }
 
     void mixerAutomation() {
@@ -1681,6 +1980,10 @@ private slots:
         QVERIFY2(summary.contains("1 audio tracks") && summary.contains("1 clips"), qPrintable(summary));
         QVERIFY(QFileInfo::exists(dir_.path() + "/turnover.aaf"));
         QVERIFY(QFileInfo::exists(dir_.path() + "/turnover Media/jfk.wav"));
+        // Sound only, from its own menu item.
+        QVERIFY(win_->findChild<QAction*>("exportAafSound"));
+        QVERIFY(win_->exportAafTo(dir_.path() + "/sound.aaf", &summary, false));
+        QVERIFY2(summary.contains("1 audio tracks") && !summary.contains("video"), qPrintable(summary));
         state()->newProject();
     }
 
@@ -3505,6 +3808,179 @@ private slots:
         QApplication::processEvents();
         key = inspector->widget()->findChild<QComboBox*>("track_sidechain");
         QVERIFY(key && key->currentIndex() == 0);
+
+        // A plugin with a key input offers the same choice (one without does not).
+        plugins::Registry& reg = plugins::Registry::instance();
+        reg.setCachePath((dir_.path() + "/plugin-cache-sc.json").toStdString());
+        reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
+        for (plugins::Format f : plugins::kAllFormats) reg.setSearchPaths(f, {"/nonexistent-montage-test-dir"});
+        reg.setSearchPaths(plugins::Format::Clap, {QStringLiteral(MONTAGE_TEST_CLAP_DIR "/sidechain").toStdString(),
+                                                   QStringLiteral(MONTAGE_TEST_CLAP_DIR "/good").toStdString()});
+        reg.scan();
+        auto ducker = reg.find("clap:org.montage.test.ducker"), gain = reg.find("clap:org.montage.test.gain");
+        QVERIFY(ducker && gain);
+        QVERIFY(state()->edit("Plugins", [&](Project& p, Sequence& s) {
+            Clip* c = edit::clipById(s, clip);
+            c->effects.clear();
+            auto e = plugins::makePluginEffect(p, *gain);
+            auto d = plugins::makePluginEffect(p, *ducker);
+            if (!e || !d) return false;
+            c->effects.push_back(*e);
+            c->effects.push_back(*d);
+            return true;
+        }));
+        state()->setSelection({}, false);
+        state()->setSelection({clip}, false);
+        QApplication::processEvents();
+        const auto keys = inspector->widget()->findChildren<QComboBox*>("track_sidechain");
+        QCOMPARE(keys.size(), 1);  // the ducker's, not the gain's
+        key = keys.front();
+        key->setCurrentIndex(key->findText("A2  Dialogue"));
+        emit key->activated(key->currentIndex());
+        QCOMPARE(edit::clipById(*state()->sequence(), clip)->effects.at(1).s("sidechain"), std::to_string(state()->sequence()->audioTracks[1].id));
+        QVERIFY(edit::clipById(*state()->sequence(), clip)->effects.at(0).s("sidechain").empty());
+    }
+
+    void sharedProjectLocking() {
+        state()->newProject();
+        QVERIFY(QDir().mkpath(dir_.path() + "/shared"));
+        const QString path = dir_.path() + "/shared/Reel 1.montage";
+        // Someone else on another machine is editing it.
+        auto foreignLock = [](const QString& project) {
+            const QString t = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
+            QFile f(QString::fromStdString(lockPathFor(project.toStdString())));
+            QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            f.write(QJsonDocument(QJsonObject{{"user", "sam"}, {"host", "edit-bay-2"}, {"app", "Montage"}, {"pid", 4242.0}, {"since", t}, {"heartbeat", t}}).toJson());
+        };
+        auto theirSave = [](const QString& project, const std::string& name, int ahead) {
+            Project p;
+            QVERIFY(loadProject(project.toStdString(), p) || (p = makeDefaultProject(), true));
+            p.active()->name = name;
+            QVERIFY(saveProject(p, project.toStdString()));
+            QFile f(project);
+            QVERIFY(f.open(QIODevice::ReadWrite));
+            f.setFileTime(QDateTime::currentDateTime().addSecs(ahead), QFileDevice::FileModificationTime);  // a later save
+        };
+        {
+            Project p = makeDefaultProject();
+            p.active()->name = "Cut 1";
+            QVERIFY(saveProject(p, path.toStdString()));
+        }
+        foreignLock(path);
+        QVERIFY(win_->openProjectAs(path, MainWindow::OpenMode::ReadOnly));
+        QVERIFY(state()->readOnly() && !state()->holdsLock());
+        QCOMPARE(state()->lockHolder(), QString("sam on edit-bay-2"));
+        QVERIFY2(win_->windowTitle().contains("Read-Only: sam on edit-bay-2"), qPrintable(win_->windowTitle()));
+        // Nothing changes it, and it cannot be saved over theirs.
+        QVERIFY(!state()->edit("Rename", [](Project&, Sequence& s) {
+            s.name = "Mine";
+            return true;
+        }));
+        QVERIFY(state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")}).empty());
+        QString err;
+        QVERIFY(!state()->save(path, &err) && err.contains("sam"));
+        QVERIFY(!win_->findChild<QAction*>("takeEdit")->isEnabled());
+        QVERIFY(!state()->open(path, &err, EditorState::Access::Edit) && err.contains("sam"));
+        // Their save is shown here.
+        theirSave(path, "Cut 2", 2);
+        state()->checkSharedState();
+        QCOMPARE(state()->sequence()->name, std::string("Cut 2"));
+        // They close it after one more save: it can be edited here, from what they saved last.
+        theirSave(path, "Cut 3", 4);
+        QFile::remove(QString::fromStdString(lockPathFor(path.toStdString())));
+        QVERIFY(state()->canTakeEdit());
+        state()->checkSharedState();
+        QVERIFY(win_->findChild<QAction*>("takeEdit")->isEnabled());
+        QVERIFY2(state()->takeEdit(&err), qPrintable(err));
+        QCOMPARE(state()->sequence()->name, std::string("Cut 3"));
+        QVERIFY(!state()->readOnly() && state()->holdsLock());
+        QCOMPARE(projectLockStatus(path.toStdString()).state, LockState::Mine);
+        QVERIFY(!win_->windowTitle().contains("Read-Only"));
+        QVERIFY(state()->edit("Rename", [](Project&, Sequence& s) {
+            s.name = "Mine";
+            return true;
+        }));
+        QVERIFY2(state()->save(path, &err), qPrintable(err));
+        // Marks on a read-only project are not changes to keep (tested below, once read-only again).
+        // A network blip: the lock file gone for a moment is written again, and the project stays this editor's.
+        QFile::remove(QString::fromStdString(lockPathFor(path.toStdString())));
+        state()->checkSharedState(true);
+        QVERIFY(state()->holdsLock() && !state()->readOnly());
+        QCOMPARE(projectLockStatus(path.toStdString()).state, LockState::Mine);
+        // Taken over while this machine slept, with changes not yet saved: read-only, and their saves never replace
+        // those changes; Edit Project will not discard them unless asked.
+        QVERIFY(state()->edit("Rename", [](Project&, Sequence& s) {
+            s.name = "Unsaved";
+            return true;
+        }));
+        foreignLock(path);
+        state()->checkSharedState(true);
+        QVERIFY(state()->readOnly() && !state()->holdsLock() && state()->isModified());
+        theirSave(path, "Their Cut", 8);
+        state()->checkSharedState();
+        QCOMPARE(state()->sequence()->name, std::string("Unsaved"));
+        QFile::remove(QString::fromStdString(lockPathFor(path.toStdString())));
+        QVERIFY(!state()->takeEdit(&err) && err.contains("not saved"));
+        QCOMPARE(state()->sequence()->name, std::string("Unsaved"));
+        QVERIFY2(state()->takeEdit(&err, true), qPrintable(err));
+        QCOMPARE(state()->sequence()->name, std::string("Their Cut"));
+        QVERIFY(!state()->isModified() && state()->holdsLock());
+        // Closing it lets it go.
+        state()->newProject();
+        QCOMPARE(projectLockStatus(path.toStdString()).state, LockState::Free);
+        // Saving a read-only project as a copy makes the copy this editor's.
+        foreignLock(path);
+        QVERIFY(win_->openProjectAs(path, MainWindow::OpenMode::ReadOnly));
+        state()->setInPoint(10);
+        QVERIFY(!state()->isModified());  // marks on a read-only project are not changes
+        const QString copy = dir_.path() + "/shared/Reel 1 (mine).montage";
+        QVERIFY2(state()->save(copy, &err), qPrintable(err));
+        QVERIFY(!state()->readOnly() && state()->holdsLock());
+        QCOMPARE(projectLockStatus(copy.toStdString()).state, LockState::Mine);
+        QCOMPARE(projectLockStatus(path.toStdString()).state, LockState::Theirs);
+        state()->newProject();
+        QCOMPARE(projectLockStatus(copy.toStdString()).state, LockState::Free);
+
+        // A production: its projects in the Production panel with who is editing each.
+        const QString prod = dir_.path() + "/Feature";
+        QVERIFY(win_->openProduction(prod, true, "The Feature"));
+        const QString reel1 = prod + "/Reel 1.montage", reel2 = prod + "/Reel 2.montage";
+        {
+            Project p = makeDefaultProject();
+            p.active()->name = "Reel 1 Cut";
+            QVERIFY(saveProject(p, reel1.toStdString()));
+            p.active()->name = "Reel 2 Cut";
+            QVERIFY(saveProject(p, reel2.toStdString()));
+        }
+        foreignLock(reel2);
+        ProductionPanel* panel = win_->productionPanel();
+        QVERIFY(panel && panel->folder() == QDir(prod).absolutePath());
+        panel->refresh();
+        auto* tree = panel->findChild<QTreeWidget*>("productionProjects");
+        QVERIFY(tree);
+        QCOMPARE(tree->topLevelItemCount(), 2);
+        QVERIFY(panel->findChild<QLabel*>("productionTitle")->text().contains("The Feature"));
+        QCOMPARE(tree->topLevelItem(0)->text(1), QString("Free"));
+        QVERIFY(tree->topLevelItem(1)->text(1).contains("sam on edit-bay-2"));
+        // Opened from the panel: editing it.
+        emit panel->openRequested(reel1, false);
+        QVERIFY(state()->holdsLock() && !state()->readOnly());
+        QCOMPARE(state()->filePath(), reel1);
+        panel->refresh();
+        QCOMPARE(tree->topLevelItem(0)->text(1), QString("Editing (you)"));
+        // A sequence brought in from the reel someone else is editing (read, not changed), one undo step.
+        const std::vector<Id> made = win_->importSequencesFrom(reel2, {"Reel 2 Cut"}, &err);
+        QVERIFY2(made.size() == 1, qPrintable(err));
+        QCOMPARE(state()->sequence()->name, std::string("Reel 2 Cut"));
+        QVERIFY(state()->project().findSequence(made[0]));
+        state()->undo();
+        QVERIFY(!state()->project().findSequence(made[0]));
+        QVERIFY(win_->importSequencesFrom(reel2, {"No Such Cut"}, &err).empty() && !err.isEmpty());
+        QVERIFY(win_->findChild<QAction*>("newProduction") && win_->findChild<QAction*>("openProduction") &&
+                win_->findChild<QAction*>("importFromProject"));
+        state()->newProject();
+        QFile::remove(QString::fromStdString(lockPathFor(reel2.toStdString())));
+        QFile::remove(QString::fromStdString(lockPathFor(path.toStdString())));
     }
 
     void offloadCardDialog() {
@@ -6041,6 +6517,194 @@ const auto seq = [this] { return state()->sequence(); };
         state()->newProject();
     }
 
+    void ambisonicUi() {
+        // A four-channel ambisonic WAV (speech placed to the left of a field), which a WAV does not mark as one.
+        const QString field = dir_.filePath("field.wav");
+        {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.fps = Rational{25, 1};
+            gs.audioLayout = "ambix";
+            MediaItem speech;
+            QVERIFY(probeMedia(MONTAGE_TEST_DATA_DIR "/jfk.wav", speech));
+            speech.id = gen.newId();
+            gen.media.push_back(speech);
+            QVERIFY(edit::placeMedia(gen, gs, speech.id, 0, 0, 50, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+            gs.audioTracks[0].surround = SurroundPan{-1, 0, 0, -100, 0, false};
+            ExportSettings st = findExportPreset("Audio - WAV 24-bit")->settings;
+            st.path = field.toStdString();
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        state()->newProject();
+        const auto ids = state()->importFiles({field});
+        QCOMPARE(ids.size(), size_t(1));
+        QCOMPARE(state()->project().findMedia(ids[0])->channels, 4);
+        QCOMPARE(state()->project().findMedia(ids[0])->ambisonic, 0);
+        // The media bin marks it ambisonic, in one undo step.
+        auto* bin = win_->findChild<MediaBinWidget*>();
+        QVERIFY(bin->setMediaAmbisonic(ids, 1));
+        QVERIFY(!bin->setMediaAmbisonic(ids, 1));
+        QCOMPARE(state()->project().findMedia(ids[0])->ambisonic, 1);
+        state()->undo();
+        QCOMPARE(state()->project().findMedia(ids[0])->ambisonic, 0);
+        state()->redo();
+        // The Ambisonics effect is offered among the audio effects.
+        QVERIFY(findEffectInfo("ambisonics"));
+        // Sequence Settings offers an ambisonic mix.
+        {
+            SequenceSettingsDialog dlg(win_.get());
+            NewSequenceSpec spec;
+            spec.audioLayout = "ambix";
+            dlg.setSpec(spec);
+            auto* layouts = dlg.findChild<QComboBox*>("audioLayout");
+            QVERIFY(layouts && layouts->currentData().toString() == "ambix");
+            QCOMPARE(dlg.spec().audioLayout, std::string("ambix"));
+        }
+        // Playback › Ambisonic Monitoring: binaural or stereo, remembered.
+        MonitorPanel* program = nullptr;
+        for (auto* mp : win_->findChildren<MonitorPanel*>())
+            if (mp->mode() == MonitorPanel::Mode::Program) program = mp;
+        QVERIFY(program);
+        auto* binaural = win_->findChild<QAction*>("ambisonicBinaural");
+        auto* stereo = win_->findChild<QAction*>("ambisonicStereo");
+        QVERIFY(binaural && stereo);
+        stereo->trigger();
+        QVERIFY(!program->controller()->ambisonicBinaural() && stereo->isChecked() && !binaural->isChecked());
+        QCOMPARE(appSettings().value("playback/ambisonicBinaural").toBool(), false);
+        binaural->trigger();
+        QVERIFY(program->controller()->ambisonicBinaural());
+        appSettings().remove("playback/ambisonicBinaural");
+        state()->newProject();
+    }
+
+    void stereoscopic3dUi() {
+        // A side-by-side file (left half red, right half blue), 128 x 36.
+        const QString video = dir_.filePath("sbs.mov");
+        {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 128, gs.height = 36, gs.fps = Rational{25, 1};
+            Clip blue = makeGeneratorClip(gen, "color", 10), red = makeGeneratorClip(gen, "color", 10);
+            blue.generator.params["color.r"] = 0.0, blue.generator.params["color.g"] = 0.0, blue.generator.params["color.b"] = 1.0;
+            red.generator.params["color.r"] = 1.0, red.generator.params["color.g"] = 0.0, red.generator.params["color.b"] = 0.0;
+            red.motion.params["crop_right"] = 50.0;
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, blue);
+            edit::overwrite(gen, gs, {TrackKind::Video, 1}, red);
+            ExportSettings st;
+            st.path = video.toStdString();
+            st.videoCodec = "prores_ks";
+            st.audioCodec = "none";
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        state()->newProject();
+        const auto ids = state()->importFiles({video});
+        QCOMPARE(ids.size(), size_t(1));
+        auto* bin = win_->findChild<MediaBinWidget*>();
+        // Interpret Footage: side by side, eyes swapped.
+        bool shown = false;
+        QTimer::singleShot(0, this, [&] {
+            auto* dlg = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+            if (!dlg || dlg->objectName() != "interpretFootageDialog") return;
+            auto* stereo = dlg->findChild<QComboBox*>("interpretStereo");
+            auto* swap = dlg->findChild<QCheckBox*>("interpretSwapEyes");
+            if (!stereo || !swap || !stereo->isEnabled()) return dlg->reject();
+            shown = true;
+            stereo->setCurrentIndex(stereo->findData(QStringLiteral("sbs")));
+            swap->setChecked(true);
+            dlg->accept();
+        });
+        bin->interpretFootageDialog({ids[0]});
+        QVERIFY(shown);
+        const MediaItem* m = state()->project().findMedia(ids[0]);
+        QCOMPARE(m->stereo, std::string("sbs"));
+        QCOMPARE(m->width, 64);
+        QVERIFY(interpretationOf(*m).swapEyes);
+        // Opened again it shows how the file is read.
+        shown = false;
+        QTimer::singleShot(0, this, [&] {
+            auto* dlg = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+            if (!dlg) return;
+            shown = dlg->findChild<QComboBox*>("interpretStereo")->currentData().toString() == "sbs" &&
+                    dlg->findChild<QCheckBox*>("interpretSwapEyes")->isChecked();
+            dlg->reject();
+        });
+        bin->interpretFootageDialog({ids[0]});
+        QVERIFY(shown);
+        // Sequence Settings: a stereoscopic sequence; VR180 only with 360°.
+        {
+            SequenceSettingsDialog dlg(win_.get());
+            NewSequenceSpec spec;
+            spec.width = 64;
+            spec.height = 36;
+            spec.stereo3d = true;
+            dlg.setSpec(spec);
+            auto* stereo = dlg.findChild<QCheckBox*>("stereoSequence");
+            auto* vr180 = dlg.findChild<QCheckBox*>("vr180Sequence");
+            auto* sphere = dlg.findChild<QCheckBox*>("sphericalSequence");
+            QVERIFY(stereo && vr180 && sphere);
+            QVERIFY(stereo->isChecked() && dlg.spec().stereo3d);
+            QVERIFY(!vr180->isEnabled());
+            sphere->setChecked(true);
+            QVERIFY(vr180->isEnabled());
+            vr180->setChecked(true);
+            QVERIFY(dlg.spec().vr180 && dlg.spec().spherical);
+            sphere->setChecked(false);
+            QVERIFY(!vr180->isChecked() && !dlg.spec().vr180);
+        }
+        QVERIFY(state()->edit("3D", [&](Project& p, Sequence& s) {
+            s.width = 64, s.height = 36, s.fps = Rational{25, 1};
+            s.stereo3d = true;
+            return edit::placeMedia(p, s, ids[0], 0, 0, 10, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        // Playback › Stereo 3D View: the Program monitor shows the anaglyph, then both eyes side by side.
+        MonitorPanel* program = nullptr;
+        for (auto* mp : win_->findChildren<MonitorPanel*>())
+            if (mp->mode() == MonitorPanel::Mode::Program) program = mp;
+        QVERIFY(program);
+        auto* left = win_->findChild<QAction*>("stereoView_left");
+        auto* anaglyph = win_->findChild<QAction*>("stereoView_anaglyph");
+        auto* sbs = win_->findChild<QAction*>("stereoView_sbs_half");
+        QVERIFY(left && anaglyph && sbs && win_->findChild<QAction*>("stereoView_difference"));
+        anaglyph->trigger();
+        QCOMPARE(program->controller()->stereoView(), StereoView::Anaglyph);
+        QVERIFY(anaglyph->isChecked() && !left->isChecked());
+        QCOMPARE(appSettings().value("playback/stereoView").toString(), QStringLiteral("anaglyph"));
+        QCOMPARE(program->controller()->renderOptions().stereoView, StereoView::Anaglyph);
+        state()->setPlayhead(5);
+        program->controller()->seek(5);
+        // The eyes are swapped (Interpret Footage): the left eye is blue, the right red; the anaglyph's red channel
+        // carries the left eye's brightness, its blue the right eye's.
+        QTRY_VERIFY(!program->viewer()->image().isNull() && program->viewer()->image().width() == 64);
+        QTRY_VERIFY2(qBlue(program->viewer()->image().pixel(32, 18)) < 60 && qRed(program->viewer()->image().pixel(32, 18)) > 5,
+                     qPrintable(QString::number(program->viewer()->image().pixel(32, 18), 16)));
+        sbs->trigger();
+        QTRY_VERIFY(program->viewer()->image().width() == 64 && qBlue(program->viewer()->image().pixel(16, 18)) > 180 &&
+                    qRed(program->viewer()->image().pixel(48, 18)) > 180);
+        left->trigger();
+        QCOMPARE(program->controller()->stereoView(), StereoView::Left);
+        // Export: the 3D choice is offered for a stereo sequence and sets the export's packing.
+        {
+            ExportDialog ed(state(), win_.get());
+            auto* stereo = ed.findChild<QComboBox*>("exportStereo");
+            QVERIFY(stereo && !stereo->isHidden());
+            stereo->setCurrentIndex(stereo->findData(QStringLiteral("tb")));
+            QVERIFY(stereo->currentText().contains("Top and bottom"));
+        }
+        QVERIFY(state()->edit("2D", [](Project&, Sequence& s) {
+            s.stereo3d = false;
+            return true;
+        }));
+        {
+            ExportDialog ed(state(), win_.get());
+            QVERIFY(ed.findChild<QComboBox*>("exportStereo")->isHidden());
+        }
+        appSettings().remove("playback/stereoView");
+        appSettings().remove("export/stereo");
+        state()->newProject();
+    }
+
     // One request to the agent link over HTTP, as a client sends it; the event loop runs meanwhile (the link lives on
     // this thread). The body; `status` gets the HTTP status.
     QByteArray agentPost(quint16 port, const QByteArray& body, const QByteArray& token, int* status, const QByteArray& extra = {}) {
@@ -6791,6 +7455,131 @@ const auto seq = [this] { return state()->sequence(); };
         state()->newProject();
         QTest::qWait(10);
         QVERIFY(!guard || !guard->isVisible());
+    }
+
+    void panToFollowFromTheClipMenu() {
+        // A textured card crossing a flat frame left to right (x = 80 + pos(t) of 160), with sound.
+        const QString video = dir_.path() + "/crossing.mp4";
+        const int frames = 30;
+        auto pos = [&](double t) { return -55 + 110 * t / (frames - 1); };
+        {
+            QImage card(32, 32, QImage::Format_RGB32);
+            card.fill(QColor(30, 30, 30));
+            {
+                QPainter pa(&card);
+                std::mt19937 rng(5);
+                std::uniform_int_distribution<int> xy(0, 28), sz(2, 7), c(0, 255);
+                for (int i = 0; i < 40; ++i) pa.fillRect(xy(rng), xy(rng), sz(rng), sz(rng), QColor(c(rng), c(rng), c(rng)));
+            }
+            const QString cardPng = dir_.path() + "/crossing-card.png";
+            QVERIFY(card.save(cardPng));
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 160;
+            gs.height = 90;
+            gs.fps = {25, 1};
+            Clip bg = makeGeneratorClip(gen, "color", frames);
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, bg);
+            edit::addTrack(gen, gs, TrackKind::Video);
+            MediaItem cm;
+            cm.id = gen.newId();
+            std::string err;
+            QVERIFY(probeMedia(cardPng.toStdString(), cm, &err));
+            gen.media.push_back(cm);
+            Clip fg = makeClip(gen, cm, TrackKind::Video, gs);
+            fg.duration = frames;
+            fg.motion.params["scale"] = Param(100.0);
+            fg.motion.params["pos_x"].addKey(0, pos(0), Interp::Linear);
+            fg.motion.params["pos_x"].addKey(frames - 1, pos(frames - 1), Interp::Linear);
+            edit::overwrite(gen, gs, {TrackKind::Video, 1}, fg);
+            MediaItem src;
+            src.id = gen.newId();
+            QVERIFY(probeMedia(MONTAGE_TEST_DATA_DIR "/jfk.wav", src, &err));
+            gen.media.push_back(src);
+            Clip snd = makeClip(gen, src, TrackKind::Audio, gs);
+            snd.duration = frames;
+            edit::overwrite(gen, gs, {TrackKind::Audio, 0}, snd);
+            ExportSettings st;
+            st.path = video.toStdString();
+            st.preset = "ultrafast";
+            st.crf = 12;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        state()->newProject();
+        QVERIFY(win_->findChild<QAction*>("panFollow"));
+        QVERIFY(!win_->panFollowDialog());  // no clip
+        const auto ids = state()->importFiles({video});
+        QCOMPARE(ids.size(), size_t(1));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            s.width = 160;
+            s.height = 90;
+            s.fps = {25, 1};
+            return edit::placeMedia(p, s, ids[0], 0, 0, frames, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        const Id sound = state()->sequence()->audioTracks[0].clips.at(0).id;
+        state()->setSelection({sound}, false);
+        state()->setPlayhead(15);
+        PanFollowDialog* dlg = win_->panFollowDialog();
+        QVERIFY(dlg && dlg->isVisible());
+        QCOMPARE(dlg->frame(), FrameTime(15));
+        QVERIFY(dlg->findChild<QWidget*>("panFollowPicker"));
+        QVERIFY2(dlg->status().contains("pan"), qPrintable(dlg->status()));
+        // It starts on the subject: the card.
+        QVERIFY2(std::fabs(dlg->pointX() * 160 - (80 + pos(15))) < 16, qPrintable(QString::number(dlg->pointX())));
+        // A click on the picture moves the point.
+        auto* picker = dlg->findChild<QWidget*>("panFollowPicker");
+        QTest::mouseClick(picker, Qt::LeftButton, {}, QPoint(picker->width() / 4, picker->height() / 2));
+        QVERIFY(dlg->pointX() < 0.4);
+        dlg->setPoint((80 + pos(15)) / 160, 0.5);
+        dlg->setSize(2);
+        QVERIFY(dlg->track(true));
+        QVERIFY(!dlg->busy());
+        QCOMPARE(dlg->keyCount(), frames);
+        QVERIFY2(dlg->status().contains("Followed"), qPrintable(dlg->status()));
+        // One undoable step on the track's pan lane, read back as the card crosses.
+        const Track& tr = state()->sequence()->audioTracks[0];
+        QVERIFY(tr.panAuto.animated());
+        QCOMPARE(tr.automation, int(AutomationMode::Read));
+        QVERIFY2(trackPanAt(tr, 2) < -0.4 && trackPanAt(tr, 27) > 0.4, qPrintable(QString("%1 %2").arg(trackPanAt(tr, 2)).arg(trackPanAt(tr, 27))));
+        state()->undo();
+        QVERIFY(!state()->sequence()->audioTracks[0].panAuto.animated());
+        state()->redo();
+        QVERIFY(state()->sequence()->audioTracks[0].panAuto.animated());
+        // Half the stage: half the pan, writing over the span again.
+        dlg->setWidth(0.5);
+        QVERIFY(dlg->track(true));
+        const double half = trackPanAt(state()->sequence()->audioTracks[0], 27);
+        QVERIFY2(half > 0.2 && half < 0.45, qPrintable(QString::number(half)));
+        // The sound moved while it was being followed: the frames tracked no longer fit, so nothing is written.
+        const Param lane = state()->sequence()->audioTracks[0].panAuto;
+        dlg->setWidth(1.0);
+        QVERIFY(dlg->track(false));
+        QVERIFY(state()->edit("Nudge", [](Project&, Sequence& s) {
+            s.audioTracks[0].clips[0].start += 3;
+            return true;
+        }));
+        QTRY_VERIFY(!dlg->busy());
+        QTest::qWait(400);  // the picture refreshing after the edit keeps what the attempt said
+        QVERIFY2(dlg->status().contains("moved"), qPrintable(dlg->status()));
+        QVERIFY(state()->sequence()->audioTracks[0].panAuto == lane);
+        state()->undo();
+        // In the middle of a drag (or a fader pass), the result waits for it to end rather than breaking it.
+        dlg->setWidth(0.75);
+        state()->beginGesture("Drag");
+        QVERIFY(dlg->track(true));
+        QVERIFY(state()->inGesture());
+        QVERIFY(state()->sequence()->audioTracks[0].panAuto == lane);
+        state()->endGesture(false);
+        QTRY_VERIFY(!(state()->sequence()->audioTracks[0].panAuto == lane));
+        const double wider = trackPanAt(state()->sequence()->audioTracks[0], 27);
+        QVERIFY2(wider > half + 0.1, qPrintable(QString::number(wider)));
+        // Another sequence closes it, and what was being followed is never written into the new one.
+        QPointer<PanFollowDialog> guard(dlg);
+        QVERIFY(dlg->track(false));
+        state()->newProject();
+        QTest::qWait(300);
+        QVERIFY(!guard || !guard->isVisible());
+        QVERIFY(!state()->canUndo());
     }
 
     void closeUpOnAFace() {
@@ -8864,11 +9653,151 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(win_->analyseHdrLightLevels(false));
         QCOMPARE(state()->sequence()->hdrMaxCll, 203.0);
         QCOMPARE(state()->sequence()->hdrMaxFall, 203.0);
+        // PQ: HDR10+'s scenes measured in the same pass and kept too (one shot, one scene at reference white).
+        QCOMPARE(state()->sequence()->hdr10Plus.size(), size_t(1));
+        QVERIFY(std::fabs(state()->sequence()->hdr10Plus[0].maxScl[1] - 203) < 1 && state()->sequence()->hdr10Plus[0].end == 10);
+        {
+            // The export dialog offers HDR10+ for PQ output only.
+            ExportDialog ed(state(), win_.get());
+            auto* hdr10 = ed.findChild<QCheckBox*>("exportHdr10Plus");
+            auto* color = ed.findChild<QComboBox*>("exportColor");
+            QVERIFY(hdr10 && color && hdr10->isEnabled());
+            color->setCurrentIndex(color->findData(QStringLiteral("rec709")));
+            QVERIFY(!hdr10->isEnabled());
+            color->setCurrentIndex(color->findData(QStringLiteral("rec2100pq")));
+            QVERIFY(hdr10->isEnabled());
+        }
         state()->undo();
         QCOMPARE(state()->sequence()->hdrMaxCll, 0.0);
+        QVERIFY(state()->sequence()->hdr10Plus.empty());
         // Not for SDR.
         state()->newProject();
         QVERIFY(!win_->analyseHdrLightLevels(false));
+    }
+
+    void hdrViewerOnHdrSequences() {
+        auto* action = win_->findChild<QAction*>("hdrViewer");
+        QVERIFY(action);
+        QCOMPARE(action->isEnabled(), hdrViewerBuilt());
+        auto* program = win_->findChild<PlaybackController*>("programPlayback");
+        MonitorPanel* panel = nullptr;
+        for (MonitorPanel* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Program) panel = m;
+        QVERIFY(program && panel);
+        ViewerWidget* viewer = panel->viewer();
+        auto* badge = panel->findChild<QLabel*>("hdrBadge");
+        QVERIFY(badge);
+        auto makeHdr = [&](const char* space) {
+            state()->newProject();
+            return state()->edit("HDR", [space](Project& p, Sequence& s) {
+                s.colorSpace = space;
+                s.hdrPeakNits = 1000;
+                Clip c = makeGeneratorClip(p, "color", 10);
+                for (const char* k : {"color.r", "color.g", "color.b"}) c.generator.params[k] = 1.0;
+                return edit::overwrite(p, s, {TrackKind::Video, 0}, c).ok;
+            });
+        };
+        auto centre = [](const HdrPicture& pic) {
+            float px[4];
+            qFloatFromFloat16(px, reinterpret_cast<const qfloat16*>(&pic.rgba[(size_t(pic.height / 2) * size_t(pic.width) + size_t(pic.width / 2)) * 4]), 4);
+            return std::array<float, 4>{px[0], px[1], px[2], px[3]};
+        };
+        // The controller renders an HDR sequence's light when asked: graphics white (203 nits) is SDR white, 1.0. (The
+        // viewer, off, leaves the controller alone; on, it renders HDR light only while it can show it.)
+        viewer->setHdrViewer(false);
+        QVERIFY(makeHdr("rec2100pq"));
+        const bool wasOn = program->hdrOutput();
+        program->setHdrOutput(true);
+        QSignalSpy hdrSpy(program, &PlaybackController::hdrFrameRendered);
+        auto latest = [&] { return hdrSpy.isEmpty() ? HdrPicturePtr() : hdrSpy.last().at(0).value<HdrPicturePtr>(); };
+        program->requestFrame();
+        QTRY_VERIFY(latest() != nullptr);
+        const HdrPicturePtr pic = latest();
+        QVERIFY(pic->width > 0 && pic->rgba.size() == size_t(pic->width) * size_t(pic->height) * 4);
+        const auto c = centre(*pic);
+        QVERIFY2(std::fabs(c[0] - 1) < 0.01 && std::fabs(c[1] - 1) < 0.01 && std::fabs(c[2] - 1) < 0.01 && c[3] == 1,
+                 qPrintable(QString("%1 %2 %3 %4").arg(c[0]).arg(c[1]).arg(c[2]).arg(c[3])));
+        QVERIFY(std::fabs(pic->contentPeak - 1000.0 / 203) < 1e-6);
+        // Playing too, frame after frame.
+        hdrSpy.clear();
+        program->seek(0);
+        program->play();
+        QTRY_VERIFY(hdrSpy.size() >= 3);
+        program->pause();
+        for (const QList<QVariant>& args : hdrSpy) QVERIFY(args.at(0).value<HdrPicturePtr>() != nullptr);
+        // An SDR sequence has none (the viewer shows its SDR picture).
+        QVERIFY(makeHdr("rec709"));
+        hdrSpy.clear();
+        program->requestFrame();
+        QTRY_VERIFY(!hdrSpy.isEmpty());
+        QTRY_VERIFY(latest() == nullptr);
+        program->setHdrOutput(wasOn);
+
+        // Without a display that shows HDR the viewer stays SDR, with the reason.
+        viewer->setHdrViewer(false);
+        viewer->setHdrViewer(true);
+        viewer->setHdrPicture(pic);
+        QVERIFY(!viewer->hdrShowing());
+        QVERIFY(!badge->isVisible());
+        QCOMPARE(viewer->hdrHeadroom(), 1.0);
+#ifdef MONTAGE_HDR_VIEWER
+        QVERIFY(!viewer->hdrStatus().isEmpty());  // (this machine's display is not HDR, or there is no GPU device)
+        // On a stand-in HDR display (Qt's Null RHI, four times SDR white): the picture on the HDR surface, the viewer's
+        // own drawing over it with the picture's area clear, the badge up, input passed on to the viewer.
+        HdrSurface::setTestDisplay(4);
+        viewer->setHdrViewer(false);
+        viewer->setHdrViewer(true);
+        QVERIFY(makeHdr("rec2100pq"));
+        program->requestFrame();
+        QTRY_VERIFY(viewer->hdrShowing());
+        QCOMPARE(viewer->hdrHeadroom(), 4.0);
+        QTRY_VERIFY(badge->isVisible());
+        QVERIFY(program->hdrOutput());
+        HdrSurface* surface = viewer->hdrSurface();
+        QVERIFY(surface && surface->hdrActive());
+        QTRY_VERIFY(!surface->overlay().isNull());
+        const QImage overlay = surface->overlay();
+        const QRectF r = viewer->imageRect();
+        const qreal dpr = overlay.devicePixelRatio();
+        QVERIFY(!r.isEmpty());
+        QCOMPARE(qAlpha(overlay.pixel(int(r.center().x() * dpr), int(r.center().y() * dpr))), 0);
+        if (r.left() > 4) QCOMPARE(qAlpha(overlay.pixel(int(2 * dpr), int(r.center().y() * dpr))), 255);  // the background
+        // Guides drawn by the viewer reach the surface.
+        viewer->setSafeMargins(true);
+        QTRY_VERIFY(surface->overlay() != overlay);
+        viewer->setSafeMargins(false);
+        struct Presses : QObject {
+            int n = 0;
+            bool eventFilter(QObject*, QEvent* e) override {
+                if (e->type() == QEvent::MouseButtonPress) ++n;
+                return false;
+            }
+        } presses;
+        viewer->installEventFilter(&presses);
+        QMouseEvent press(QEvent::MouseButtonPress, r.center(), r.center(), viewer->mapToGlobal(r.center().toPoint()), Qt::LeftButton, Qt::LeftButton,
+                          Qt::NoModifier);
+        QCoreApplication::sendEvent(surface, &press);
+        QMouseEvent release(QEvent::MouseButtonRelease, r.center(), r.center(), viewer->mapToGlobal(r.center().toPoint()), Qt::LeftButton,
+                            Qt::NoButton, Qt::NoModifier);
+        QCoreApplication::sendEvent(surface, &release);
+        viewer->removeEventFilter(&presses);
+        QCOMPARE(presses.n, 1);
+        // Two-up trimming draws over it in SDR; an SDR sequence and the viewer switched off take it away.
+        viewer->setTwoUp(QImage(), QImage(), "A", "B");
+        QVERIFY(!viewer->hdrShowing());
+        viewer->clearTwoUp();
+        QTRY_VERIFY(viewer->hdrShowing());
+        QVERIFY(makeHdr("rec709"));
+        program->requestFrame();
+        QTRY_VERIFY(!viewer->hdrShowing());
+        QTRY_VERIFY(!badge->isVisible());
+        HdrSurface::setTestDisplay(0);
+#endif
+        // The menu's setting decides again.
+        viewer->setHdrViewer(false);
+        panel->setHdrViewer(action->isChecked());
+        QVERIFY(!viewer->hdrShowing());
+        state()->newProject();
     }
 
     void workspaces() {
