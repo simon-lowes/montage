@@ -5565,6 +5565,46 @@ void McpServer::Impl::addTools() {
                                   {"ducked", ducked}, {"first", sample}});
         });
 
+    add("montage_refresh_media", "Refresh media from disk",
+        "Re-read media files whose length or streams changed on disk: a file still being recorded (a growing file from a "
+        "recorder or capture card; the app follows those by itself), a render that finished, a file replaced. Each named "
+        "media, or all; lists what changed with its old and new length. Clips keep their edits.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "media":{"type":"array","items":{"type":["string","number"]},"description":"Media names, files or ids (default: all)"}},
+            "required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            std::vector<MediaItem*> items;
+            for (const QJsonValue& v : a.value("media").toArray()) {
+                MediaItem* m = v.isDouble() ? l.project.findMedia(Id(v.toDouble())) : &projectMedia(l.project, v.toString());
+                if (!m) throw ArgError{QStringLiteral("No media with id %1").arg(v.toDouble(), 0, 'f', 0)};
+                items.push_back(m);
+            }
+            if (!a.contains("media"))
+                for (MediaItem& m : l.project.media) items.push_back(&m);
+            QJsonArray changed, unreadable;
+            for (MediaItem* m : items) {
+                if (m->path.empty() || m->kind == MediaKind::Sequence || m->subclipOf) continue;
+                MediaItem fresh;
+                if (!probeMedia(m->path, fresh)) {
+                    unreadable.append(QString::fromStdString(m->name));
+                    continue;
+                }
+                if (std::fabs(fresh.duration - m->duration) < 1e-6 && fresh.hasVideo == m->hasVideo && fresh.hasAudio == m->hasAudio) continue;
+                changed.append(QJsonObject{{"media", double(m->id)}, {"name", QString::fromStdString(m->name)},
+                                           {"was", m->duration}, {"now", fresh.duration}});
+                m->duration = fresh.duration;
+                m->hasVideo = fresh.hasVideo, m->hasAudio = fresh.hasAudio;
+                if (fresh.width > 0) m->width = fresh.width, m->height = fresh.height;
+                if (fresh.fps.valid()) m->fps = fresh.fps;
+                m->sampleRate = fresh.sampleRate, m->channels = fresh.channels;
+            }
+            if (!changed.isEmpty()) save(l);
+            QString text = changed.isEmpty() ? QStringLiteral("Nothing changed") : QStringLiteral("%1 changed").arg(changed.size());
+            if (!unreadable.isEmpty()) text += QStringLiteral("; could not read %1").arg(unreadable.size());
+            return ok(text, QJsonObject{{"changed", changed}, {"unreadable", unreadable}});
+        });
+
     add("montage_storyboard", "Storyboard a bin",
         "The storyboard (Premiere's Freeform view, Avid's Frame view): a bin's media as thumbnails placed freely on a board, "
         "positions in thumbnail cells (x across, y down), read in rows top to bottom and left to right. board lists a bin's "

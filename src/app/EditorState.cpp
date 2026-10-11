@@ -7,6 +7,7 @@
 #include <QFileSystemWatcher>
 #include <QDirIterator>
 #include <QDateTime>
+#include <cmath>
 #include <QTimer>
 #include <QStandardPaths>
 #include <QtConcurrent>
@@ -50,11 +51,20 @@ EditorState::EditorState(QObject* parent) : QObject(parent), project_(makeDefaul
     connect(watcher_, &QFileSystemWatcher::fileChanged, this, [this](const QString& path) {
         if (!changedFiles_.contains(path)) changedFiles_ << path;
         reloadTimer_->start();
+        noteMediaFileWritten(path);
     });
     connect(reloadTimer_, &QTimer::timeout, this, [this] {
-        const QStringList paths = std::exchange(changedFiles_, {});
+        // (A file still growing is followed by checkGrowingMedia, and reloaded once it stops.)
+        QStringList paths = std::exchange(changedFiles_, {});
+        paths.removeIf([this](const QString& p) { return growth_.count(p) && growth_.at(p).growing; });
         reloadChangedMedia(paths);
     });
+    // Growing media: files being written looked at every second.
+    clock_ = [] { return QDateTime::currentMSecsSinceEpoch(); };
+    growingRefreshMs_ = appSettings().value(QStringLiteral("media/growingRefreshMs"), 15000).toInt();
+    growthTimer_ = new QTimer(this);
+    growthTimer_->setInterval(1000);
+    connect(growthTimer_, &QTimer::timeout, this, &EditorState::checkGrowingMedia);
     connect(this, &EditorState::projectChanged, this, &EditorState::watchMediaFiles);
     // Shared projects: the lock renewed, and a read-only project followed, every few seconds.
     lockTimer_ = new QTimer(this);
@@ -402,6 +412,97 @@ void EditorState::reloadChangedMedia(const QStringList& paths) {
     for (Id id : reloaded) emit mediaFileChanged(id);
     emit projectChanged();
     message(tr("Reloaded %1, changed on disk").arg(names.join(QStringLiteral(", "))), 4000);
+}
+
+namespace {
+constexpr qint64 kGrowingAfterMs = 2000;  // written for this long...
+constexpr qint64 kPauseMs = 1500;         // ...without a pause this long: growing
+constexpr qint64 kStoppedMs = 3000;       // and once not written for this long, it has stopped
+}  // namespace
+
+void EditorState::noteMediaFileWritten(const QString& path) {
+    const qint64 now = clock_();
+    Growth& g = growth_[path];
+    if (!g.first || now - g.last > kPauseMs) g.first = now;  // (a fresh run of writes)
+    g.last = now;
+    if (!growthTimer_->isActive()) growthTimer_->start();
+}
+
+void EditorState::checkGrowingMedia() {
+    const qint64 now = clock_();
+    QStringList refresh, finished, started;
+    for (auto it = growth_.begin(); it != growth_.end();) {
+        Growth& g = it->second;
+        if (g.growing) {
+            if (now - g.last >= kStoppedMs) {
+                finished << it->first;
+                it = growth_.erase(it);
+                continue;
+            }
+            if (growingRefreshMs_ > 0 && now - g.refreshed >= growingRefreshMs_) refresh << it->first, g.refreshed = now;
+        } else if (now - g.last >= kPauseMs) {
+            it = growth_.erase(it);  // a save in a few writes, reloaded once quiet as any change
+            continue;
+        } else if (now - g.first >= kGrowingAfterMs) {
+            g.growing = true;
+            g.refreshed = now;
+            refresh << it->first;
+            started << it->first;
+        }
+        ++it;
+    }
+    if (growth_.empty()) growthTimer_->stop();
+    if ((!refresh.isEmpty() && refreshLengths(refresh)) || !started.isEmpty()) emit projectChanged();  // (the bin shows them as growing)
+    if (!started.isEmpty()) {
+        QStringList names;
+        for (const QString& p : started) names << QFileInfo(p).fileName();
+        message(growingRefreshMs_ > 0 ? tr("%1 is still being written: followed as it grows").arg(names.join(QStringLiteral(", ")))
+                                      : tr("%1 is still being written: reloaded once it stops").arg(names.join(QStringLiteral(", "))),
+                5000);
+    }
+    if (!finished.isEmpty()) reloadChangedMedia(finished);  // in full now: thumbnails, sound
+}
+
+bool EditorState::refreshLengths(const QStringList& paths) {
+    bool changed = false;
+    for (const QString& path : paths) {
+        std::set<std::string> mediaPaths;
+        for (const MediaItem& m : project_.media)
+            if (!m.path.empty() && m.kind != MediaKind::Sequence && mediaFileOnDisk(m.path) == path.toStdString()) mediaPaths.insert(m.path);
+        for (const std::string& p : mediaPaths) {
+            MediaItem fresh;
+            if (!probeMedia(p, fresh)) continue;  // (unreadable mid-write: tried again next time)
+            MediaPool::instance().forget(p);  // decoders open again to see the new end
+            for (MediaItem& m : project_.media)
+                if (m.path == p && !m.subclipOf && (std::fabs(m.duration - fresh.duration) > 1e-6 || m.hasVideo != fresh.hasVideo || m.hasAudio != fresh.hasAudio)) {
+                    m.duration = fresh.duration;
+                    m.hasVideo = fresh.hasVideo, m.hasAudio = fresh.hasAudio;
+                    if (fresh.width > 0) m.width = fresh.width, m.height = fresh.height;
+                    if (fresh.fps.valid()) m.fps = fresh.fps;
+                    changed = true;
+                }
+        }
+    }
+    return changed;
+}
+
+bool EditorState::isMediaGrowing(Id media) const {
+    const MediaItem* m = media ? project_.findMedia(media) : nullptr;
+    if (!m || m->path.empty() || m->kind == MediaKind::Sequence) return false;
+    const auto it = growth_.find(QString::fromStdString(mediaFileOnDisk(m->path)));
+    return it != growth_.end() && it->second.growing;
+}
+
+void EditorState::setGrowingRefreshMs(int ms) {
+    growingRefreshMs_ = std::max(0, ms);
+    appSettings().setValue(QStringLiteral("media/growingRefreshMs"), growingRefreshMs_);
+}
+
+void EditorState::refreshGrowingMedia() {
+    QStringList paths;
+    for (auto& [path, g] : growth_)
+        if (g.growing) paths << path, g.refreshed = clock_();
+    if (!paths.isEmpty() && refreshLengths(paths)) emit projectChanged();
 }
 
 bool EditorState::isMediaOffline(Id media) const {

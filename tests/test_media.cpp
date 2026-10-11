@@ -9027,6 +9027,55 @@ private slots:
         QCOMPARE(replaced.active()->videoTracks[0].clips.size(), size_t(1));
     }
 
+    void refreshMediaOverMcp() {
+        // A recording still being written: a WAV whose header does not yet say how long it is, as recorders write them.
+        QDir().mkpath(QString::fromStdString(path("mcp-grow")));
+        const QString wav = QString::fromStdString(path("mcp-grow/take.wav"));
+        auto samples = [](double seconds) { return QByteArray(int(48000 * seconds) * 2, '\0'); };
+        {
+            QFile f(wav);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            QDataStream d(&f);
+            d.setByteOrder(QDataStream::LittleEndian);
+            f.write("RIFF");
+            d << quint32(0xFFFFFFFF);
+            f.write("WAVEfmt ");
+            d << quint32(16) << quint16(1) << quint16(1) << quint32(48000) << quint32(96000) << quint16(2) << quint16(16);
+            f.write("data");
+            d << quint32(0xFFFFFFFF);
+            f.write(samples(1.0));
+        }
+        const QString project = QString::fromStdString(path("mcp-grow/g.montage"));
+        McpServer server;
+        auto call = [&](const QString& tool, QJsonObject args) {
+            args["project"] = project;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"}, {"params", QJsonObject{{"name", tool}, {"arguments", args}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call("montage_create_project", {{"media", QJsonArray{wav}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        r = call("montage_refresh_media", {});
+        QVERIFY(!r.value("isError").toBool());
+        QVERIFY(r.value("structuredContent").toObject().value("changed").toArray().isEmpty());
+        // Recorded on: refreshed, the media is as long as the file now is.
+        {
+            QFile f(wav);
+            QVERIFY(f.open(QIODevice::Append));
+            f.write(samples(1.5));
+        }
+        r = call("montage_refresh_media", {{"media", QJsonArray{"take.wav"}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonArray changed = r.value("structuredContent").toObject().value("changed").toArray();
+        QCOMPARE(changed.size(), 1);
+        QVERIFY(std::fabs(changed[0].toObject().value("was").toDouble() - 1.0) < 0.01);
+        QVERIFY(std::fabs(changed[0].toObject().value("now").toDouble() - 2.5) < 0.01);
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QVERIFY(std::fabs(back.media.front().duration - 2.5) < 0.01);
+        QVERIFY(call("montage_refresh_media", {{"media", QJsonArray{"nothing.wav"}}}).value("isError").toBool());
+    }
+
     void storyboardOverMcp() {
         // Three stills in a project's top bin.
         QDir().mkpath(QString::fromStdString(path("mcp-board")));

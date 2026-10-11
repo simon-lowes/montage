@@ -205,12 +205,30 @@ QPixmap MediaBinModel::thumbnail(const MediaItem& m) const {
 
 // The thumbnail with the label as a bar along the bottom and the rating in the corner.
 QPixmap MediaBinModel::decorated(const MediaItem& m) const {
-    const bool offline = state_->isMediaOffline(m.id);
+    const bool offline = state_->isMediaOffline(m.id), growing = state_->isMediaGrowing(m.id);
     const qint64 thumb = thumbs_.count(m.id) ? thumbs_.at(m.id).cacheKey() : 0;
     if (const auto it = decorated_.find(m.id); it != decorated_.end() && it->second.rating == m.rating &&
-                                               it->second.label == m.label && it->second.thumb == thumb && it->second.offline == offline)
+                                               it->second.label == m.label && it->second.thumb == thumb && it->second.offline == offline &&
+                                               it->second.growing == growing)
         return it->second.pixmap;
     QPixmap pm = thumbnail(m);
+    if (growing) {
+        // Still being written: a red dot, as a recording light.
+        QPainter p(&pm);
+        p.setRenderHint(QPainter::Antialiasing);
+        QFont f = p.font();
+        f.setPixelSize(10);
+        f.setBold(true);
+        p.setFont(f);
+        const QString text = tr("GROWING");
+        const QRect r(kThumbW - p.fontMetrics().horizontalAdvance(text) - 20, 4, p.fontMetrics().horizontalAdvance(text) + 16, p.fontMetrics().height() + 2);
+        p.fillRect(r, QColor(0, 0, 0, 160));
+        p.setPen(Qt::NoPen);
+        p.setBrush(QColor(0xe8, 0x30, 0x30));
+        p.drawEllipse(QPointF(r.left() + 7, r.center().y() + 0.5), 3.5, 3.5);
+        p.setPen(QColor(0xf0, 0xf0, 0xf0));
+        p.drawText(r.adjusted(13, 0, 0, 0), Qt::AlignVCenter | Qt::AlignLeft, text);
+    }
     if (m.rating != 0 || m.label > 0) {
         QPainter p(&pm);
         p.setRenderHint(QPainter::Antialiasing);
@@ -232,7 +250,7 @@ QPixmap MediaBinModel::decorated(const MediaItem& m) const {
             p.drawText(r, Qt::AlignCenter, stars);
         }
     }
-    decorated_[m.id] = {m.rating, m.label, thumb, offline, pm};
+    decorated_[m.id] = {m.rating, m.label, thumb, offline, growing, pm};
     return pm;
 }
 
@@ -241,6 +259,10 @@ QString MediaBinModel::toolTip(const MediaItem& m) const {
     QString tip = QString("<b>%1</b><br>%2").arg(name.toHtmlEscaped(), kindLabel(m));
     if (state_->isMediaOffline(m.id))
         tip += QString("<br><span style='color:#ff6060'>%1</span> %2").arg(tr("Media offline:"), QString::fromStdString(mediaFileOnDisk(m.path)).toHtmlEscaped());
+    if (state_->isMediaGrowing(m.id))
+        tip += QString("<br><span style='color:#ff6060'>%1</span>")
+                   .arg(state_->growingRefreshMs() > 0 ? tr("Growing: still being written, its length re-read every %n s", "", state_->growingRefreshMs() / 1000)
+                                                       : tr("Growing: still being written, reloaded once it stops"));
     if (m.hasVideo && m.width > 0)
         tip += QString("<br>%1×%2 @ %3 fps, %4")
                    .arg(m.width)

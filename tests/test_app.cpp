@@ -10184,6 +10184,84 @@ const auto seq = [this] { return state()->sequence(); };
         state()->newProject();
     }
 
+    void growingMedia() {
+        state()->newProject();
+        // A recording still being written (a WAV whose header does not yet give its length, as recorders write them).
+        const QString wav = dir_.filePath("growing.wav");
+        auto append = [&](double seconds) {
+            QFile f(wav);
+            QVERIFY(f.open(QIODevice::Append));
+            f.write(QByteArray(int(48000 * seconds) * 2, '\0'));
+        };
+        {
+            QFile f(wav);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            QDataStream d(&f);
+            d.setByteOrder(QDataStream::LittleEndian);
+            f.write("RIFF");
+            d << quint32(0xFFFFFFFF);
+            f.write("WAVEfmt ");
+            d << quint32(16) << quint16(1) << quint16(1) << quint32(48000) << quint32(96000) << quint16(2) << quint16(16);
+            f.write("data");
+            d << quint32(0xFFFFFFFF);
+        }
+        append(1.0);
+        MediaItem m;
+        QVERIFY(probeMedia(wav.toStdString(), m));
+        Id id = 0;
+        QVERIFY(state()->edit("Import", [&](Project& p, Sequence&) {
+            m.id = id = p.newId();
+            p.media.push_back(m);
+            return true;
+        }));
+        auto length = [&] { return state()->project().findMedia(id)->duration; };
+        QVERIFY(std::fabs(length() - 1.0) < 0.01);
+        // Time is the test's: written every 0.8 s for over two seconds, it counts as growing and its length is read.
+        qint64 now = 1000000;
+        state()->setClock([&now] { return now; });
+        state()->setGrowingRefreshMs(5000);
+        const int steps = int(state()->history().undoCount());
+        for (int i = 0; i < 4; ++i) {
+            append(0.5);
+            state()->noteMediaFileWritten(wav);
+            now += 800;
+            state()->checkGrowingMedia();
+        }
+        QVERIFY(state()->isMediaGrowing(id));
+        QVERIFY2(std::fabs(length() - 2.5) < 0.01, qPrintable(QString::number(length())));  // (read when it began to count)
+        auto* bin = win_->findChild<MediaBinWidget*>();
+        bin->showBin(QString());
+        QApplication::processEvents();
+        const QModelIndex row = bin->model()->index(bin->model()->rowOf(id), 0);
+        QVERIFY(row.data(Qt::ToolTipRole).toString().contains("Growing"));
+        // Still growing: read again every five seconds, not only once it is quiet; none of it an undo step.
+        for (int i = 0; i < 7; ++i) {
+            append(0.25);
+            state()->noteMediaFileWritten(wav);
+            now += 800;
+            state()->checkGrowingMedia();
+        }
+        QVERIFY(state()->isMediaGrowing(id));
+        QVERIFY2(length() > 3.0, qPrintable(QString::number(length())));
+        QCOMPARE(int(state()->history().undoCount()), steps);
+        // Stopped: reloaded in full, no longer growing.
+        now += 3500;
+        state()->checkGrowingMedia();
+        QVERIFY(!state()->isMediaGrowing(id));
+        QVERIFY2(std::fabs(length() - (3.0 + 7 * 0.25)) < 0.01, qPrintable(QString::number(length())));
+        // A save in a few quick writes is not growing (it is reloaded once quiet, as before).
+        append(0.1);
+        state()->noteMediaFileWritten(wav);
+        now += 300;
+        state()->noteMediaFileWritten(wav);
+        now += 1600;
+        state()->checkGrowingMedia();
+        QVERIFY(!state()->isMediaGrowing(id));
+        state()->setClock([] { return QDateTime::currentMSecsSinceEpoch(); });
+        state()->setGrowingRefreshMs(15000);
+        state()->newProject();
+    }
+
     void storyboardBin() {
         state()->newProject();
         auto* bin = win_->findChild<MediaBinWidget*>();

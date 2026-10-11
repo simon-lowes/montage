@@ -215,6 +215,20 @@ public:
     // Media files changed on disk (a still re-saved, a graphic re-rendered) are reloaded by themselves, as Premiere
     // and Resolve do: their cached frames, thumbnails and sound are dropped and their details re-read.
     void reloadChangedMedia(const QStringList& paths);
+    // Growing media (Avid's and Premiere's growing files, Resolve's editing while recording): a file that is still
+    // being written (a recorder, a capture card, a render still going) is followed while it grows: its length is
+    // re-read every growingRefreshMs (0: only once it stops), without waiting for it to go quiet, and it is reloaded
+    // in full (thumbnails, sound) once it has stopped growing. A file counts as growing once written for over two
+    // seconds without a pause of a second and a half.
+    bool isMediaGrowing(Id media) const;
+    int growingRefreshMs() const { return growingRefreshMs_; }
+    void setGrowingRefreshMs(int ms);
+    void refreshGrowingMedia();  // their lengths re-read now
+    // A media file written to (the watcher's notice; public for tests) and the growing files looked at (every second
+    // while any file is being written), by the clock (setClock for tests; milliseconds).
+    void noteMediaFileWritten(const QString& path);
+    void checkGrowingMedia();
+    void setClock(std::function<qint64()> clock) { clock_ = std::move(clock); }
 
 signals:
     void projectChanged();            // anything in the project changed
@@ -253,6 +267,16 @@ private:
     void watchFoldersChanged();
     QTimer* reloadTimer_ = nullptr;
     QStringList changedFiles_;
+    // Files being written (growing media): when writing began and was last seen, and whether it counts as growing.
+    struct Growth {
+        qint64 first = 0, last = 0, refreshed = 0;
+        bool growing = false;
+    };
+    std::map<QString, Growth> growth_;
+    QTimer* growthTimer_ = nullptr;
+    int growingRefreshMs_ = 15000;
+    std::function<qint64()> clock_;
+    bool refreshLengths(const QStringList& paths);  // re-reads their media's length and streams (no reload); any changed
     mutable std::map<std::string, std::pair<bool, qint64>> offlineChecked_;  // path -> offline, when checked (ms)
     std::set<std::pair<std::string, int>> clipAudioRequested_;  // audio keys and rates already decoding
 

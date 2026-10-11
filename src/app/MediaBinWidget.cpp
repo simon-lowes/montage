@@ -1,4 +1,6 @@
 #include "MediaBinWidget.h"
+
+#include <QActionGroup>
 #include "InterpretFootageDialog.h"
 #include "media/Interpret.h"
 #include <QCoreApplication>
@@ -1446,6 +1448,21 @@ void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos)
     QAction* scrub = menu.addAction(tr("Hover Scrub"), this, [this](bool on) { setHoverScrub(on); });
     scrub->setCheckable(true);
     scrub->setChecked(hoverScrub_);
+    // Growing files (still being written): how often their length is re-read, and now.
+    QMenu* growing = menu.addMenu(tr("Growing Files"));
+    growing->setObjectName(QStringLiteral("growingFiles"));
+    bool anyGrowing = false;
+    for (const MediaItem& m : state_->project().media) anyGrowing |= state_->isMediaGrowing(m.id);
+    growing->addAction(tr("Refresh Now"), this, [this] { state_->refreshGrowingMedia(); })->setEnabled(anyGrowing);
+    growing->addSeparator();
+    auto* every = new QActionGroup(growing);
+    for (const auto& [label, ms] : {std::pair{tr("Every 5 Seconds"), 5000}, {tr("Every 15 Seconds"), 15000}, {tr("Every 30 Seconds"), 30000},
+                                    {tr("Every Minute"), 60000}, {tr("Only When They Stop"), 0}}) {
+        QAction* a = growing->addAction(label, this, [this, ms = ms] { state_->setGrowingRefreshMs(ms); });
+        a->setCheckable(true);
+        a->setChecked(state_->growingRefreshMs() == ms);
+        every->addAction(a);
+    }
     menu.exec(view->viewport()->mapToGlobal(pos));
 }
 
