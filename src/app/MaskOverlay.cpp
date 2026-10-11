@@ -379,7 +379,7 @@ std::vector<MaskOverlay::ObjectTarget> MaskOverlay::objectTargets() const {
         const FrameTime lt = t - c.start;
         for (const Effect& e : c.effects)
             if (e.enabled && std::lround(e.p("mask.shape", lt)) == 3)
-                out.push_back({c.id, e.id, lt, e.object, clipObjectFrame(state_->project(), *s, c, lt)});
+                out.push_back({c.id, e.id, lt, e.object, clipObjectFrame(state_->project(), *s, c, lt), currentObject(e, lt)});
     }
     return out;
 }
@@ -397,7 +397,7 @@ void MaskOverlay::paintObjects(QPainter& p) const {
             !toWidget(t.clip, 0, 1, c01))
             continue;
         std::vector<float> logits;
-        if (t.object && t.object->logits(t.frame, logits)) {
+        if (t.object && t.object->maskLogits(t.frame, logits)) {  // (the whole mask: its objects added, less those cut out)
             const QString key = QStringLiteral("%1:%2").arg(quintptr(t.object.get())).arg(t.frame);
             if (key != tintKey_) {
                 tint_ = QImage(kObjectGrid, kObjectGrid, QImage::Format_ARGB32_Premultiplied);
@@ -418,9 +418,9 @@ void MaskOverlay::paintObjects(QPainter& p) const {
                 p.restore();
             }
         }
-        // The clicks on this frame: + the object, - not the object, and the box.
+        // The clicks on this frame for the object being picked: + the object, - not the object, and the box.
         if (t.object)
-            if (auto it = t.object->prompts.find(t.frame); it != t.object->prompts.end()) {
+            if (auto it = t.object->object(t.which).prompts.find(t.frame); it != t.object->object(t.which).prompts.end()) {
                 QPointF box[2];
                 int corners = 0;
                 for (const ObjectPoint& pt : it->second) {
@@ -481,8 +481,8 @@ void MaskOverlay::objectRelease(const QPointF& pos, Qt::KeyboardModifiers mods) 
     if (!fromWidget(t.clip, pressPos_, u0, v0) || !fromWidget(t.clip, pos, u1, v1)) return;
     auto clamp01 = [](double x) { return std::clamp(x, 0.0, 1.0); };
     std::vector<ObjectPoint> pts;
-    if (t.object)
-        if (auto it = t.object->prompts.find(t.frame); it != t.object->prompts.end()) pts = it->second;
+    if (t.object && t.which < t.object->count())
+        if (auto it = t.object->object(t.which).prompts.find(t.frame); it != t.object->object(t.which).prompts.end()) pts = it->second;
     if (QLineF(pressPos_, pos).length() >= 6) {
         // A box around the object (one per frame).
         pts.erase(std::remove_if(pts.begin(), pts.end(), [](const ObjectPoint& p) { return p.label >= 2; }), pts.end());
@@ -516,7 +516,7 @@ void MaskOverlay::pickObject(const ObjectTarget& t, const std::vector<ObjectPoin
         Clip* c = edit::clipById(s, t.clip);
         Effect* e = c ? edit::ownedEffect(s, t.clip, t.effect) : nullptr;
         if (!c || !e) return false;
-        e->object = withObjectPrompts(p, s, *c, *e, t.local, points);
+        e->object = withObjectPrompts(p, s, *c, *e, t.local, points, t.which);
         return e->object != nullptr;
     });
     if (!changed || points.empty()) return;
@@ -541,13 +541,14 @@ void MaskOverlay::pickObject(const ObjectTarget& t, const std::vector<ObjectPoin
         // Kept only while the clicks it answers are still the ones on that frame.
         st->amend([t, points, r](Project&, Sequence& s) {
             Effect* e = edit::ownedEffect(s, t.clip, t.effect);
-            if (!e || !e->object) return false;
+            if (!e || !e->object || t.which >= e->object->count() || t.which >= r.first->count()) return false;
             const int64_t n = t.frame;
-            auto have = e->object->prompts.find(n);
-            auto seg = r.first->frames.find(n);
-            if (have == e->object->prompts.end() || have->second != points || seg == r.first->frames.end()) return false;
+            const ObjectMask& now = e->object->object(t.which);
+            auto have = now.prompts.find(n);
+            auto seg = r.first->object(t.which).frames.find(n);
+            if (have == now.prompts.end() || have->second != points || seg == r.first->object(t.which).frames.end()) return false;
             auto o = std::make_shared<ObjectMask>(*e->object);
-            o->frames[n] = seg->second;
+            o->object(t.which).frames[n] = seg->second;
             e->object = o;
             return true;
         });
@@ -558,7 +559,7 @@ void MaskOverlay::pickObject(const ObjectTarget& t, const std::vector<ObjectPoin
         const Effect* e = s ? edit::ownedEffect(const_cast<Sequence&>(*s), t.clip, t.effect) : nullptr;
         if (!c || !e || !e->object) return {};
         std::string err;
-        auto o = segmentClipObjectFrame(*project, *s, *c, *e->object, t.local, &err);
+        auto o = segmentClipObjectFrame(*project, *s, *c, *e->object, t.local, &err, t.which);
         return {o, err};
     }));
 }

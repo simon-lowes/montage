@@ -78,6 +78,7 @@ public:
         FrameTime local = 0;  // clip-local frame of the playhead
         std::shared_ptr<const ObjectMask> object;
         int64_t frame = 0;  // the media frame on screen
+        int which = 0;      // the mask's object being clicked (render/ClipAnalysis.h currentObject)
     };
     std::vector<ObjectTarget> objectTargets() const;
     // Replaces the clicks on the playhead's frame and segments it (asking to

@@ -120,7 +120,15 @@ QJsonObject objectMaskToJson(const ObjectMask& m) {
     }
     for (const auto& [f, data] : m.frames)
         frames[QString::number(f)] = QString::fromLatin1(QByteArray::fromRawData(data.data(), qsizetype(data.size())).toBase64());
-    return QJsonObject{{"fps", m.fps}, {"prompts", prompts}, {"frames", frames}};
+    QJsonObject o{{"fps", m.fps}, {"prompts", prompts}, {"frames", frames}};
+    if (!m.name.empty()) o["name"] = QString::fromStdString(m.name);
+    if (m.subtract) o["subtract"] = true;
+    if (!m.more.empty()) {  // (the mask's further objects)
+        QJsonArray more;
+        for (const ObjectMask& x : m.more) more.append(objectMaskToJson(x));
+        o["more"] = more;
+    }
+    return o;
 }
 
 std::shared_ptr<const ObjectMask> objectMaskFromJson(const QJsonObject& o) {
@@ -137,6 +145,14 @@ std::shared_ptr<const ObjectMask> objectMaskFromJson(const QJsonObject& o) {
     }
     for (auto it = frames.begin(); it != frames.end(); ++it)
         m->frames[it.key().toLongLong()] = QByteArray::fromBase64(it.value().toString().toLatin1()).toStdString();
+    m->name = o.value("name").toString().toStdString();
+    m->subtract = o.value("subtract").toBool();
+    for (const QJsonValue& v : o.value("more").toArray()) {
+        ObjectMask x = *objectMaskFromJson(v.toObject());
+        x.fps = m->fps;
+        x.more.clear();  // (one level: the mask's objects)
+        m->more.push_back(std::move(x));
+    }
     return m;
 }
 

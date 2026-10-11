@@ -3135,6 +3135,17 @@ private slots:
                     logits[size_t(y) * kObjectGrid + size_t(x)] = float(40 - std::hypot(x - 100.0, y - 120.0)) * 0.37f;
             obj->frames[12] = packObjectLogits(logits.data());
             obj->frames[13] = packObjectLogits(logits.data());
+            // A second object, named and cut out of the mask.
+            ObjectMask cut;
+            cut.fps = obj->fps;
+            cut.name = "Mic";
+            cut.subtract = true;
+            cut.prompts[12] = {{0.5, 0.5, 1}};
+            cut.frames[12] = packObjectLogits(logits.data());
+            obj->more.push_back(cut);
+            QCOMPARE(obj->count(), 2);
+            QCOMPARE(obj->object(1).name, std::string("Mic"));
+            QCOMPARE(&obj->object(7), &obj->more.back());  // (out of range: the last)
             v->effects.back().params["mask.shape"] = Param(3.0);
             v->effects.back().object = obj;
             // Packed to 1/8 of a logit, clamped where the sigmoid is flat; a few kB a frame.

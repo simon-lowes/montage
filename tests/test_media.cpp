@@ -13661,8 +13661,9 @@ private slots:
     }
 
     // A shaded red ball (70 x 50 px radii) crossing textured ground, 640 x 360 at
-    // 25 fps; returns its centre in each frame.
-    std::vector<Point2> writeBallVideo(const std::string& file, int frames) {
+    // 25 fps; returns its centre in each frame. With `second`, a blue ball too, low on the right drifting left (its
+    // centres there).
+    std::vector<Point2> writeBallVideo(const std::string& file, int frames, std::vector<Point2>* second = nullptr) {
         QImage bg(640, 360, QImage::Format_RGB32);
         std::mt19937 rng(3);
         std::normal_distribution<double> noise(0, 10);
@@ -13705,6 +13706,29 @@ private slots:
         edit::overwrite(p, s, {TrackKind::Video, 0}, cb);
         while (s.videoTracks.size() < 2) s.videoTracks.push_back(makeTrack(p, TrackKind::Video, "V2"));
         edit::overwrite(p, s, {TrackKind::Video, 1}, co);
+        if (second) {
+            QImage blue = ball;
+            for (int y = 0; y < 360; ++y)
+                for (int x = 0; x < 640; ++x) {
+                    const QColor c = blue.pixelColor(x, y);
+                    if (c.alpha()) blue.setPixelColor(x, y, QColor(c.blue(), c.green() + 60, c.red(), c.alpha()));
+                }
+            const QString bluePng = QString::fromStdString(path("blueball.png"));
+            blue.save(bluePng);
+            MediaItem m2 = probeOrFail(p, bluePng.toStdString());
+            p.media.push_back(m2);
+            Clip c2 = makeClip(p, m2, TrackKind::Video, s);
+            c2.duration = frames;
+            second->clear();
+            for (int i = 0; i < frames; ++i) {
+                const Point2 c{480.0 - 6 * i, 300};
+                second->push_back(c);
+                c2.motion.params["pos_x"].addKey(i, c.x - 320, Interp::Hold);
+                c2.motion.params["pos_y"].addKey(i, c.y - 180, Interp::Hold);
+            }
+            while (s.videoTracks.size() < 3) s.videoTracks.push_back(makeTrack(p, TrackKind::Video, "V3"));
+            edit::overwrite(p, s, {TrackKind::Video, 2}, c2);
+        }
         ExportSettings st;
         st.path = file;
         st.audioCodec = "none";
@@ -13800,6 +13824,131 @@ private slots:
         err = "x";
         QVERIFY(!trackClipObject(p, s, c, *first, 0, true, {}, &cancel, &err));
         QVERIFY(err.empty());
+    }
+
+    void objectMasksSeveralObjects() {
+        if (!segmenterAvailable()) QSKIP("Built without ONNX Runtime");
+        if (!objectModel().installed())
+            QSKIP("Set MONTAGE_OBJECT_MODEL to a folder with the EdgeTAM model files to run this test");
+        const int frames = 10;
+        const std::string video = path("balls.mp4");
+        std::vector<Point2> blue;
+        const auto red = writeBallVideo(video, frames, &blue);
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 640;
+        s.height = 360;
+        s.fps = {25, 1};
+        MediaItem m = probeOrFail(p, video);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, frames, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Clip& c = s.videoTracks[0].clips[0];
+        Effect e = makeEffect(p, "invert");
+        e.params["mask.shape"] = Param(3.0);
+        // How much of a ball the mask covers, and how much of the frame outside both balls.
+        auto inside = [](const std::vector<float>& matte, Point2 centre) {
+            double in = 0, n = 0;
+            for (int y = 0; y < 360; ++y)
+                for (int x = 0; x < 640; ++x) {
+                    const double u = (x + 0.5 - centre.x) / 70, v = (y + 0.5 - centre.y) / 50;
+                    if (u * u + v * v > 0.8) continue;
+                    in += matte[size_t(y) * 640 + size_t(x)];
+                    ++n;
+                }
+            return in / n;
+        };
+        auto matteAt = [&](int n) {
+            Image frame(640, 360);
+            frame.fill(1, 1, 1, 1);
+            return effectMatte(e, n, frame, 1.0, (n + 0.5) / 25);
+        };
+        std::string err;
+        // The red ball clicked and segmented; then a second object, the blue ball.
+        e.object = withObjectPoint(p, s, c, e, 0, {red[0].x / 640, red[0].y / 360, 1});
+        e.object = segmentClipObjectFrame(p, s, c, *e.object, 0, &err);
+        QVERIFY2(e.object, err.c_str());
+        int which = -1;
+        e.object = withNewObject(p, s, c, e, false, &which);
+        QCOMPARE(which, 1);
+        QCOMPARE(e.object->count(), 2);
+        e.params["mask.object"] = Param(1.0);
+        QCOMPARE(currentObject(e), 1);
+        e.object = withObjectPoint(p, s, c, e, 0, {blue[0].x / 640, blue[0].y / 360, 1}, which);
+        QCOMPARE(int(e.object->object(1).prompts.size()), 1);
+        QCOMPARE(int(e.object->prompts.size()), 1);  // (the first object's clicks untouched)
+        e.object = segmentClipObjectFrame(p, s, c, *e.object, 0, &err, which);
+        QVERIFY2(e.object, err.c_str());
+        std::vector<float> m0 = matteAt(0);
+        QVERIFY2(inside(m0, red[0]) > 0.95 && inside(m0, blue[0]) > 0.95,
+                 qPrintable(QString("%1 %2").arg(inside(m0, red[0])).arg(inside(m0, blue[0]))));
+        // Each tracked on its own.
+        e.object = trackClipObject(p, s, c, *e.object, 0, true, {}, nullptr, &err, 1);
+        QVERIFY2(e.object, err.c_str());
+        QCOMPARE(int(e.object->object(1).frames.size()), frames);
+        QCOMPARE(int(e.object->frames.size()), 1);
+        e.object = trackClipObject(p, s, c, *e.object, 0, true, {}, nullptr, &err, 0);
+        QVERIFY2(e.object, err.c_str());
+        QCOMPARE(int(e.object->frames.size()), frames);
+        std::vector<float> m8 = matteAt(8);
+        QVERIFY2(inside(m8, red[8]) > 0.95 && inside(m8, blue[8]) > 0.95,
+                 qPrintable(QString("%1 %2").arg(inside(m8, red[8])).arg(inside(m8, blue[8]))));
+        QVERIFY(!trackClipObject(p, s, c, *e.object, 0, true, {}, nullptr, &err, 5));  // no such object
+        // Cut out: the blue ball leaves the mask.
+        e.object = withObjectSubtracted(e, 1, true);
+        m8 = matteAt(8);
+        QVERIFY(inside(m8, red[8]) > 0.95 && inside(m8, blue[8]) < 0.05);
+        QVERIFY(!withObjectSubtracted(e, 0, true)->object(0).subtract);  // the first always adds
+        // Removed: the first gone, the blue ball takes its place and adds again.
+        auto rest = withoutObject(e, 0);
+        QVERIFY(rest && rest->count() == 1 && !rest->subtract && rest->frames.size() == size_t(frames));
+        QVERIFY(!withoutObject(Effect{}, 0));
+        Effect single = e;
+        single.object = rest;
+        QVERIFY(!withoutObject(single, 0));  // the last one
+
+        // Over MCP: a new object to cut out, clicked and tracked both ways from the middle; listed with the rest.
+        auto firstOnly = std::make_shared<ObjectMask>(*e.object);
+        firstOnly->more.clear();
+        e.object = firstOnly;
+        c.effects.push_back(e);
+        const QString project = QString::fromStdString(path("objects.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            QJsonObject full = args;
+            full["project"] = project;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_object_mask"}, {"arguments", full},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto refused = [](const QJsonObject& r) { return r.value("isError").toBool() || r.isEmpty(); };
+        const double clipId = double(c.id), effectId = double(e.id);
+        QJsonObject r = call({{"clip", clipId}, {"effect", effectId}, {"object", "new_cut"}, {"name", "Blue"}, {"at", 4.0 / 25},
+                              {"points", QJsonArray{QJsonArray{blue[4].x / 640, blue[4].y / 360, 1}}}, {"track", "both"}});
+        QVERIFY2(!refused(r), QJsonDocument(r).toJson().constData());
+        const QJsonArray objs = r.value("structuredContent").toObject().value("objects").toArray();
+        QCOMPARE(objs.size(), 2);
+        QCOMPARE(objs[1].toObject().value("name").toString(), QString("Blue"));
+        QVERIFY(objs[1].toObject().value("subtract").toBool());
+        QCOMPARE(objs[1].toObject().value("segmented_frames").toInt(), frames);
+        QCOMPARE(r.value("structuredContent").toObject().value("object").toInt(), 1);
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Effect& saved = back.active()->videoTracks[0].clips[0].effects.back();
+        QVERIFY(saved.object && saved.object->count() == 2 && saved.object->object(1).subtract);
+        QCOMPARE(currentObject(saved), 1);
+        // Added back, then removed; bad input refused.
+        r = call({{"clip", clipId}, {"effect", effectId}, {"object", 1}, {"subtract", false}});
+        QVERIFY(!refused(r) && !r.value("structuredContent").toObject().value("objects").toArray()[1].toObject().value("subtract").toBool());
+        QVERIFY(refused(call({{"clip", clipId}, {"effect", effectId}, {"object", 0}, {"subtract", true}})));
+        QVERIFY(refused(call({{"clip", clipId}, {"effect", effectId}, {"object", 9}})));
+        QVERIFY(refused(call({{"clip", clipId}, {"effect", effectId}, {"points", QJsonArray{QJsonArray{1.5, 0.2, 1}}}})));
+        QVERIFY(refused(call({{"clip", clipId}, {"effect", effectId + 1000}})));
+        r = call({{"clip", clipId}, {"effect", effectId}, {"object", 1}, {"remove", true}});
+        QCOMPARE(r.value("structuredContent").toObject().value("objects").toArray().size(), 1);
     }
 
     void slowMotionFrameSampling() {

@@ -924,6 +924,121 @@ colorspaces:
         e.params["mask.invert"] = Param(0.0);
         applyVideoEffect(e, 0, img, 1.0, 10.2 / 25);
         QVERIFY(std::fabs(img.at(320, 180)[0] - 0.8f) < 1e-4 && std::fabs(img.at(20, 20)[0] - 0.2f) < 1e-4);
+
+        // Several objects in one mask: added ones joined, cut-out ones taken away, each on the frames it was segmented.
+        {
+            auto field = [](double cx, double cy, double r) {
+                std::vector<float> l(size_t(kObjectGrid) * kObjectGrid);
+                for (int y = 0; y < kObjectGrid; ++y)
+                    for (int x = 0; x < kObjectGrid; ++x) l[size_t(y) * kObjectGrid + size_t(x)] = float(r - std::hypot(x - cx, y - cy)) * 0.5f;
+                return l;
+            };
+            ObjectMask mask;
+            mask.fps = 25;
+            mask.frames[10] = packObjectLogits(field(64, 128, 30).data());  // left disc
+            ObjectMask right;
+            right.fps = 25;
+            right.frames[10] = packObjectLogits(field(192, 128, 30).data());
+            right.frames[11] = right.frames[10];  // (only this object on frame 11)
+            ObjectMask hole;
+            hole.fps = 25;
+            hole.subtract = true;
+            hole.frames[10] = packObjectLogits(field(64, 128, 12).data());  // cut out of the left disc
+            mask.more = {right, hole};
+            std::vector<float> l;
+            QVERIFY(mask.maskLogits(10, l));
+            auto in = [&](int x, int y) { return l[size_t(y) * kObjectGrid + size_t(x)] > 0; };
+            QVERIFY(in(64 + 20, 128) && in(192, 128) && !in(64, 128) && !in(128, 128));
+            QVERIFY(mask.maskLogits(11, l) && in(192, 128) && !in(64 + 20, 128));
+            // A frame with only a cut-out object is no mask; none at all, none.
+            ObjectMask onlyCut = mask;
+            onlyCut.frames.clear();
+            onlyCut.more[0].frames.clear();
+            QVERIFY(!onlyCut.maskLogits(10, l));
+            QVERIFY(!mask.maskLogits(12, l));
+            // Rendered through an effect.
+            Effect two = makeEffect(p, "invert");
+            two.params["mask.shape"] = Param(3.0);
+            two.params["mask.feather"] = Param(1.0);
+            two.object = std::make_shared<ObjectMask>(mask);
+            Image flat(256, 256);
+            flat.fill(0.5f, 0.5f, 0.5f, 1);
+            const std::vector<float> m2 = effectMatte(two, 0, flat, 1.0, 10.2 / 25);
+            QVERIFY(m2[size_t(128) * 256 + 64 + 20] > 0.9f && m2[size_t(128) * 256 + 192] > 0.9f && m2[size_t(128) * 256 + 64] < 0.1f);
+        }
+    }
+
+    void maskEdgeRefinement() {
+        // A white disc (radius 50) on a textured dark ground; the coarse mask a model gives, blocky on an 8 px grid.
+        const int W = 240, H = 200;
+        Image img(W, H);
+        std::vector<float> truth(size_t(W) * H), coarse(size_t(W) * H);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                // Coverage of the disc at each pixel (4 x 4 samples), and the ground's texture.
+                double cov = 0;
+                for (int j = 0; j < 4; ++j)
+                    for (int i = 0; i < 4; ++i) cov += std::hypot(x + (i + 0.5) / 4 - 120, y + (j + 0.5) / 4 - 100) < 50;
+                cov /= 16;
+                truth[size_t(y) * W + size_t(x)] = float(cov);
+                const float g = 0.15f + 0.05f * float(std::sin(x * 0.7) * std::cos(y * 0.9));
+                float* p = img.at(x, y);
+                for (int k = 0; k < 3; ++k) p[k] = float(cov * 0.9 + (1 - cov) * g);
+                p[3] = 1;
+                const int bx = x / 8 * 8 + 4, by = y / 8 * 8 + 4;
+                coarse[size_t(y) * W + size_t(x)] = std::hypot(bx - 120.0, by - 100.0) < 50 ? 1.f : 0.f;
+            }
+        auto error = [&](const std::vector<float>& m) {
+            double e = 0;
+            for (size_t i = 0; i < m.size(); ++i) e += std::fabs(m[i] - truth[i]);
+            return e;
+        };
+        // Refine Edges: the blocky edge settled on the disc's.
+        std::vector<float> refined = coarse;
+        refineMatteEdges(refined, img, 8, 1.0);
+        QVERIFY2(error(refined) < 0.15 * error(coarse), qPrintable(QString("%1 -> %2").arg(error(coarse)).arg(error(refined))));
+        for (float v : refined) QVERIFY(v >= 0 && v <= 1);
+        // Half of it: in between.
+        std::vector<float> half = coarse;
+        refineMatteEdges(half, img, 8, 0.5);
+        QVERIFY(error(half) < error(coarse) && error(half) > error(refined));
+        // A flat picture gives the filter nothing to follow: the mask stays close to itself, softened.
+        Image grey(W, H);
+        grey.fill(0.4f, 0.4f, 0.4f, 1);
+        std::vector<float> same = truth;
+        refineMatteEdges(same, grey, 8, 1.0);
+        QVERIFY(same[size_t(100) * W + 120] > 0.95f && same[size_t(10) * W + 10] < 0.05f);
+
+        // Consolidate: a hole and a narrow gap closed, the outline otherwise kept.
+        std::vector<float> holey = truth;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                if (std::hypot(x - 120.0, y - 100.0) < 6) holey[size_t(y) * W + size_t(x)] = 0;  // a hole
+                if (x >= 150 && x < 154 && y > 80 && y < 120) holey[size_t(y) * W + size_t(x)] = 0;  // a slit
+            }
+        std::vector<float> closed = holey;
+        consolidateMatte(closed, W, H, 8);
+        QVERIFY(closed[size_t(100) * W + 120] > 0.99f && closed[size_t(100) * W + 152] > 0.99f);
+        QVERIFY(closed[size_t(100) * W + 200] < 0.01f && closed[size_t(20) * W + 120] < 0.01f);  // still nothing outside
+        QVERIFY(std::fabs(closed[size_t(100) * W + 170] - truth[size_t(100) * W + 170]) < 0.05f);  // the edge where it was
+        std::vector<float> none = holey;
+        consolidateMatte(none, W, H, 0);
+        QVERIFY(none == holey);
+
+        // Through an effect's mask: an ellipse drawn loosely round the disc, refined onto it.
+        Project p = makeDefaultProject();
+        Effect e = makeEffect(p, "invert");
+        e.params["mask.shape"] = Param(1.0);
+        e.params["mask.x"] = Param(0.5);
+        e.params["mask.y"] = Param(0.5);
+        e.params["mask.w"] = Param(0.45);  // radii of 54 px, the disc's 50
+        e.params["mask.h"] = Param(0.54);
+        e.params["mask.feather"] = Param(1.0);
+        const std::vector<float> loose = effectMatte(e, 0, img, 1.0);
+        e.params["mask.refine"] = Param(100.0);
+        e.params["mask.refine_radius"] = Param(12.0);
+        const std::vector<float> snapped = effectMatte(e, 0, img, 1.0);
+        QVERIFY2(error(snapped) < 0.15 * error(loose), qPrintable(QString("%1 -> %2").arg(error(loose)).arg(error(snapped))));
     }
 
     void multicamShowsOneAngle() {

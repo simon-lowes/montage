@@ -115,6 +115,7 @@
 #include "media/Transcriber.h"
 #include "media/VisualSearch.h"
 #include "render/ClipAnalysis.h"
+#include "media/Segmenter.h"
 #include "render/Compositor.h"
 #include "render/Exporter.h"
 #include "render/Shorts.h"
@@ -6164,6 +6165,112 @@ void McpServer::Impl::addTools() {
             save(l);
             out["clips"] = n;
             return ok(QStringLiteral("Matched the chart on %1 clip(s): delta E %2 before, %3 after").arg(n).arg(fit.deltaEBefore, 0, 'f', 1).arg(fit.deltaEAfter, 0, 'f', 1), out);
+        });
+
+    add("montage_object_mask", "Pick objects for a mask",
+        "AI object masks (Premiere's Object Mask, Resolve's Magic Mask, Final Cut's Magnetic Mask), with several objects in "
+        "one mask: limits a clip's video effect (`effect`, its id) to objects picked by clicks. `object` is the object's "
+        "index, \"new\" for another object joining the mask or \"new_cut\" for one cut out of it. `points` are clicks on "
+        "the frame at `at` (fractions of the clip's frame, [x, y, label]: label 1 the object, 0 not the object, 2 and 3 a "
+        "box's top left and bottom right); that frame is segmented at once. `track` follows the object forward, backward "
+        "or both from there to the clip's ends. `subtract` cuts an object (not the first) out of the mask or adds it back; "
+        "`name` names it; `remove` drops it. Edges: mask.refine (0-100) snaps the mask's edge to the picture's, "
+        "mask.consolidate (px) closes holes and gaps (montage_add_effect params). Returns each object's clicked and "
+        "segmented frames.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
+            "effect":{"type":"number","description":"The effect's id on the clip"},
+            "object":{"type":["integer","string"],"description":"An index (0 the first), \"new\" or \"new_cut\""},
+            "at":{"type":["number","string"],"description":"Timeline time of the frame clicked (the clip's start by default)"},
+            "points":{"type":"array","items":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3}},
+            "track":{"type":"string","enum":["forward","backward","both"]},
+            "subtract":{"type":"boolean"},"name":{"type":"string"},"remove":{"type":"boolean","default":false}},
+            "required":["project","clip","effect"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const Id clipId = clipArg(l, a).id;
+            const auto loc = edit::locate(s, clipId);
+            if (!loc || loc->track.kind != TrackKind::Video) throw ArgError{"\"clip\" must be a video clip"};
+            const Id effectId = Id(a.value("effect").toDouble());
+            Effect* e = edit::ownedEffect(s, clipId, effectId);
+            if (!e || !supportsMask(e->type)) throw ArgError{QStringLiteral("No video effect %1 on that clip (see montage_project_info)").arg(qint64(effectId))};
+            Clip& c = *edit::clipById(s, clipId);
+            const MediaItem* m = c.mediaId ? l.project.findMedia(c.mediaId) : nullptr;
+            if (!m || m->kind != MediaKind::Video) throw ArgError{"Object masks follow objects in video clips"};
+            e->params["mask.shape"] = Param(3.0);
+            // Which object.
+            int which = currentObject(*e);
+            const QJsonValue ov = a.value("object");
+            if (ov.isString()) {
+                const QString kind = ov.toString();
+                if (kind != "new" && kind != "new_cut") throw ArgError{"\"object\" is an index, \"new\" or \"new_cut\""};
+                e->object = withNewObject(l.project, s, c, *e, kind == "new_cut", &which);
+            } else if (ov.isDouble()) {
+                which = int(ov.toDouble());
+                const int n = e->object ? e->object->count() : 1;
+                if (which < 0 || which >= n) throw ArgError{QStringLiteral("The mask has %1 object(s): \"object\" is 0 to %2").arg(n).arg(n - 1)};
+            }
+            if (a.value("remove").toBool()) {
+                if (!e->object) throw ArgError{"The mask has no objects yet"};
+                e->object = withoutObject(*e, which);
+                which = std::max(0, which - 1);
+            } else {
+                if (a.contains("subtract")) {
+                    const bool cut = a.value("subtract").toBool();
+                    if (cut && which == 0) throw ArgError{"The first object always adds: cut out another (\"object\": \"new_cut\")"};
+                    if (e->object) e->object = withObjectSubtracted(*e, which, cut);
+                }
+                if (a.contains("name")) {
+                    auto o = std::make_shared<ObjectMask>(e->object ? *e->object : ObjectMask{});
+                    o->object(which).name = a.value("name").toString().toStdString();
+                    e->object = o;
+                }
+                const FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : c.start;
+                if (!c.contains(at)) throw ArgError{"\"at\" must be inside the clip"};
+                const FrameTime local = at - c.start;
+                const bool needModel = a.contains("points") || a.contains("track");
+                if (needModel && (!segmenterAvailable() || !objectModel().installed()))
+                    return fail("Object masks need their model: run `scripts/fetch-models.sh` or pick an object once in the app");
+                std::string err;
+                if (a.contains("points")) {
+                    std::vector<ObjectPoint> pts;
+                    for (const QJsonValue& v : a.value("points").toArray()) {
+                        const QJsonArray pt = v.toArray();
+                        const double x = pt.at(0).toDouble(-1), y = pt.at(1).toDouble(-1);
+                        const int label = pt.at(2).toInt(-1);
+                        if (pt.size() != 3 || !(x >= 0 && x <= 1 && y >= 0 && y <= 1) || label < 0 || label > 3)
+                            throw ArgError{"Each point is [x, y, label]: x and y fractions of the frame, label 0 to 3"};
+                        pts.push_back({x, y, label});
+                    }
+                    e->object = withObjectPrompts(l.project, s, c, *e, local, pts, which);
+                    if (!e->object) return fail("The clip has no media to pick from");
+                    auto seg = segmentClipObjectFrame(l.project, s, c, *e->object, local, &err, which);
+                    if (!seg) return fail(QString::fromStdString(err));
+                    e->object = seg;
+                }
+                const QString dir = str(a, "track");
+                if (!dir.isEmpty()) {
+                    if (!e->object || e->object->object(which).prompts.empty()) throw ArgError{"Click the object first (\"points\")"};
+                    for (bool forward : {true, false}) {
+                        if ((forward && dir == "backward") || (!forward && dir == "forward")) continue;
+                        auto tracked = trackClipObject(l.project, s, c, *e->object, local, forward,
+                                                       [this, forward](double f) { progress(f, forward ? QStringLiteral("Tracking forward") : QStringLiteral("Tracking backward")); },
+                                                       nullptr, &err, which);
+                        if (!tracked) return fail(QString::fromStdString(err));
+                        e->object = tracked;
+                    }
+                }
+            }
+            e->params["mask.object"] = Param(double(which));
+            save(l);
+            QJsonArray objects;
+            if (e->object)
+                for (int i = 0; i < e->object->count(); ++i) {
+                    const ObjectMask& o = e->object->object(i);
+                    objects.append(QJsonObject{{"index", i}, {"name", QString::fromStdString(o.name)}, {"subtract", i > 0 && o.subtract},
+                                               {"clicked_frames", int(o.prompts.size())}, {"segmented_frames", int(o.frames.size())}});
+                }
+            return ok(QStringLiteral("The mask has %1 object(s)").arg(objects.size()), QJsonObject{{"objects", objects}, {"object", which}});
         });
 
     add("montage_auto_reframe", "Auto reframe for another shape",

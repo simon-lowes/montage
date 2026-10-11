@@ -19,6 +19,30 @@ bool ObjectMask::logitsAt(double seconds, std::vector<float>& out) const {
     return logits(frameAt(seconds), out);
 }
 
+bool ObjectMask::maskLogits(int64_t frame, std::vector<float>& out) const {
+    bool any = false;
+    std::vector<float> l, cut;
+    for (int i = 0; i < count(); ++i) {
+        const ObjectMask& o = object(i);
+        if (!o.logits(frame, l)) continue;
+        std::vector<float>& into = i > 0 && o.subtract ? cut : out;
+        const bool first = i > 0 && o.subtract ? cut.empty() : !any;
+        if (first) {
+            into = l;
+        } else {
+            for (size_t k = 0; k < l.size(); ++k) into[k] = std::max(into[k], l[k]);
+        }
+        if (!(i > 0 && o.subtract)) any = true;
+    }
+    if (any && !cut.empty())
+        for (size_t k = 0; k < out.size(); ++k) out[k] = std::min(out[k], -cut[k]);
+    return any;
+}
+
+bool ObjectMask::maskLogitsAt(double seconds, std::vector<float>& out) const {
+    return fps > 0 && maskLogits(frameAt(seconds), out);
+}
+
 std::string packObjectLogits(const float* logits) {
     constexpr int n = kObjectGrid * kObjectGrid;
     QByteArray raw(n, Qt::Uninitialized);

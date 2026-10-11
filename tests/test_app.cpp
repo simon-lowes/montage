@@ -183,6 +183,7 @@
 #include "core/ProjectIO.h"
 #include "media/Decoder.h"
 #include "render/ColorSpace.h"
+#include "render/ClipAnalysis.h"
 #include "render/Compositor.h"
 #include "render/RenderCache.h"
 #include "render/Exporter.h"
@@ -12395,6 +12396,41 @@ print("added " .. ui.name)
         static_cast<QToolButton*>(visible("trackObjectForward"))->click();
         QTest::qWait(50);
         QVERIFY(!edit::clipById(*state()->sequence(), clip)->effects.back().object);
+        // Several objects: + adds one (the first, when there is none), − one to cut out (chosen at once), Cut Out
+        // flips it, Remove drops the chosen one; each one undo step.
+        {
+            auto fx = [&]() -> const Effect& { return edit::clipById(*state()->sequence(), clip)->effects.back(); };
+            auto* list = static_cast<QComboBox*>(visible("objectList"));
+            QVERIFY(list && visible("objectAdd") && visible("objectSubtract") && visible("objectRemove") && visible("objectCutOut"));
+            QCOMPARE(list->count(), 1);
+            static_cast<QToolButton*>(visible("objectAdd"))->click();
+            QTRY_VERIFY(fx().object && fx().object->count() == 1);
+            static_cast<QToolButton*>(visible("objectSubtract"))->click();
+            QTRY_VERIFY(fx().object->count() == 2);
+            QTRY_COMPARE(static_cast<QComboBox*>(visible("objectList"))->count(), 2);
+            list = static_cast<QComboBox*>(visible("objectList"));
+            QCOMPARE(list->currentIndex(), 1);
+            QVERIFY(list->itemText(1).contains("cut out"));
+            QCOMPARE(currentObject(fx()), 1);
+            QVERIFY(fx().object->object(1).subtract);
+            auto* cut = static_cast<QCheckBox*>(visible("objectCutOut"));
+            QVERIFY(cut->isEnabled() && cut->isChecked());
+            cut->click();
+            QTRY_VERIFY(!fx().object->object(1).subtract);
+            // Choosing the first: Cut Out is off for it.
+            list = static_cast<QComboBox*>(visible("objectList"));
+            list->setCurrentIndex(0);
+            emit list->activated(0);
+            QTRY_COMPARE(currentObject(fx()), 0);
+            QTRY_VERIFY(!static_cast<QCheckBox*>(visible("objectCutOut"))->isEnabled());
+            state()->undo();
+            QTRY_COMPARE(currentObject(fx()), 1);
+            static_cast<QToolButton*>(visible("objectRemove"))->click();
+            QTRY_VERIFY(fx().object && fx().object->count() == 1);
+            QCOMPARE(currentObject(fx()), 0);
+            static_cast<QToolButton*>(visible("objectRemove"))->click();
+            QTRY_VERIFY(!fx().object);
+        }
 
         if (!segmenterAvailable() || !objectModel().installed())
             QSKIP("Picking objects needs ONNX Runtime and the model (MONTAGE_OBJECT_MODEL)");

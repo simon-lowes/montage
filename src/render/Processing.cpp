@@ -480,11 +480,11 @@ void minMaxFilter(std::vector<float>& v, int w, int h, int r, bool maximum) {
     });
 }
 
-// Three box blurs of radius r: close to a Gaussian.
-void boxBlurPlane(std::vector<float>& v, int w, int h, int r) {
+// Three box blurs of radius r: close to a Gaussian (or `passes` of them; one is the box's own mean).
+void boxBlurPlane(std::vector<float>& v, int w, int h, int r, int passes = 3) {
     if (r <= 0) return;
     std::vector<float> tmp(v.size());
-    for (int pass = 0; pass < 3; ++pass) {
+    for (int pass = 0; pass < passes; ++pass) {
         parallelRows(h, [&](int y0, int y1) {
             for (int y = y0; y < y1; ++y) {
                 const float* row = &v[size_t(y) * size_t(w)];
@@ -1151,6 +1151,96 @@ std::vector<float> polygonCoverage(const std::vector<std::pair<double, double>>&
     return cov;
 }
 
+void consolidateMatte(std::vector<float>& matte, int W, int H, double px) {
+    if (matte.size() != size_t(W) * size_t(H) || px < 0.5) return;
+    // A closing: the shape grown by `px` and shrunk back, so holes and gaps narrower than twice that fill in. Pixels it
+    // adds are full, with an edge a pixel soft; the shape's own edge stays as it was.
+    std::vector<uint8_t> inside(matte.size()), grownOut(matte.size());
+    for (size_t i = 0; i < matte.size(); ++i) inside[i] = matte[i] > 0.5f;
+    const std::vector<float> toInside = distanceTransform(inside, W, H);
+    for (size_t i = 0; i < matte.size(); ++i) grownOut[i] = toInside[i] > px;
+    const std::vector<float> toOutside = distanceTransform(grownOut, W, H);
+    // (Distances run between pixel centres, so the ramp starts a pixel in: the shape's own edge does not creep out.)
+    for (size_t i = 0; i < matte.size(); ++i) matte[i] = std::max(matte[i], std::clamp(float(toOutside[i] - px - 0.5), 0.f, 1.f));
+}
+
+void refineMatteEdges(std::vector<float>& matte, const Image& guide, double radius, double amount) {
+    const int W = guide.width, H = guide.height;
+    const size_t n = size_t(W) * size_t(H);
+    if (matte.size() != n || W <= 0 || H <= 0 || !(amount > 0)) return;
+    // A band of `radius` either side of the mask's edge is unknown; beyond it the mask is sure (inside or outside). Each
+    // pixel in the band takes the place of its colour between the sure object's colours and the sure background's
+    // near it (a colour-line matte, as matting tools estimate alpha), so the edge lands on the picture's own and
+    // fine detail (hair, fur, leaves) comes through partly.
+    const double r = std::max(1.0, radius);
+    std::vector<uint8_t> in(n), out(n);
+    for (size_t i = 0; i < n; ++i) {
+        in[i] = matte[i] >= 0.5f;
+        out[i] = !in[i];
+    }
+    const std::vector<float> toOut = distanceTransform(out, W, H), toIn = distanceTransform(in, W, H);
+    auto colour = [&](size_t i, int k) {
+        const float* px = &guide.px[i * 4];
+        return px[3] > 1e-6f ? std::clamp(px[k] / px[3], 0.f, 1.f) : 0.f;
+    };
+    // The sure colours' local means, on a smaller copy (they change slowly), over twice the band.
+    const int sub = std::max(1, int(r / 3));
+    const int w = (W + sub - 1) / sub, h = (H + sub - 1) / sub;
+    const size_t m = size_t(w) * size_t(h);
+    std::vector<float> fg[4], bg[4];  // colour sums and counts
+    for (int k = 0; k < 4; ++k) fg[k].assign(m, 0.f), bg[k].assign(m, 0.f);
+    bool band = false;
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            const size_t i = size_t(y) * size_t(W) + size_t(x), j = size_t(y / sub) * size_t(w) + size_t(x / sub);
+            const bool sureIn = in[i] && toOut[i] > r, sureOut = out[i] && toIn[i] > r;
+            band = band || (!sureIn && !sureOut);
+            std::vector<float>* into = sureIn ? fg : sureOut ? bg : nullptr;
+            if (!into) continue;
+            for (int k = 0; k < 3; ++k) into[k][j] += colour(i, k);
+            into[3][j] += 1;
+        }
+    if (!band) return;
+    const int reach = std::max(1, int(std::ceil(2 * r / sub)));
+    for (int k = 0; k < 4; ++k) {
+        boxBlurPlane(fg[k], w, h, reach, 1);
+        boxBlurPlane(bg[k], w, h, reach, 1);
+    }
+    const float a = float(std::min(1.0, amount));
+    parallelRows(H, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y) {
+            const float gy = std::clamp((y + 0.5f) / float(sub) - 0.5f, 0.f, float(h - 1));
+            const int ya = int(gy), yb = std::min(ya + 1, h - 1);
+            const float fy = gy - float(ya);
+            for (int x = 0; x < W; ++x) {
+                const size_t i = size_t(y) * size_t(W) + size_t(x);
+                if ((in[i] && toOut[i] > r) || (out[i] && toIn[i] > r)) continue;
+                const float gx = std::clamp((x + 0.5f) / float(sub) - 0.5f, 0.f, float(w - 1));
+                const int xa = int(gx), xb = std::min(xa + 1, w - 1);
+                const float fx = gx - float(xa);
+                auto at = [&](const std::vector<float>& v) {
+                    const float top = v[size_t(ya) * size_t(w) + size_t(xa)] + (v[size_t(ya) * size_t(w) + size_t(xb)] - v[size_t(ya) * size_t(w) + size_t(xa)]) * fx;
+                    const float bot = v[size_t(yb) * size_t(w) + size_t(xa)] + (v[size_t(yb) * size_t(w) + size_t(xb)] - v[size_t(yb) * size_t(w) + size_t(xa)]) * fx;
+                    return top + (bot - top) * fy;
+                };
+                const float nf = at(fg[3]), nb = at(bg[3]);
+                if (nf < 1e-4f || nb < 1e-4f) continue;  // (no sure object or background near enough to compare with)
+                float d[3], v[3], dd = 0, proj = 0;
+                for (int k = 0; k < 3; ++k) {
+                    const float F = at(fg[k]) / nf, B = at(bg[k]) / nb;
+                    d[k] = F - B;
+                    v[k] = colour(i, k) - B;
+                    dd += d[k] * d[k];
+                    proj += v[k] * d[k];
+                }
+                if (dd < 1e-3f) continue;  // (object and background alike here: the mask stays)
+                const float alpha = std::clamp(proj / dd, 0.f, 1.f);
+                matte[i] += (alpha - matte[i]) * a;
+            }
+        }
+    });
+}
+
 std::vector<float> effectMatte(const Effect& e, FrameTime t, const Image& img, double pixelScale, double sourceSeconds) {
     std::vector<float> matte;
     if (img.empty() || !hasMask(e, t)) return matte;
@@ -1158,9 +1248,9 @@ std::vector<float> effectMatte(const Effect& e, FrameTime t, const Image& img, d
     matte.assign(size_t(W) * size_t(H), 1.0f);
     const int shape = int(std::lround(e.p("mask.shape", t)));
     if (shape == 3) {
-        // An object picked by the model: nothing where it was not segmented.
+        // The objects picked by the model (those added, less those subtracted): nothing where none was segmented.
         std::vector<float> logits;
-        if (e.object && sourceSeconds >= 0 && e.object->logitsAt(sourceSeconds, logits))
+        if (e.object && sourceSeconds >= 0 && e.object->maskLogitsAt(sourceSeconds, logits))
             matte = objectMatte(logits, W, H, e.p("mask.feather", t, 20) * pixelScale, e.p("mask.expansion", t) * pixelScale);
         else
             std::fill(matte.begin(), matte.end(), 0.f);
@@ -1238,6 +1328,13 @@ std::vector<float> effectMatte(const Effect& e, FrameTime t, const Image& img, d
                     matte[size_t(y) * size_t(W) + size_t(x)] = float(k * k * (3 - 2 * k));  // smoothstep
                 }
         });
+    }
+    if (shape > 0) {
+        // The shape's holes and gaps closed (Consolidate), then its edge settled on the picture's own (Refine Edges,
+        // as Photoshop's Refine Edge and Resolve's Smart Refine).
+        consolidateMatte(matte, W, H, e.p("mask.consolidate", t) * pixelScale);
+        const double refine = std::clamp(e.p("mask.refine", t) / 100.0, 0.0, 1.0);
+        if (refine > 0) refineMatteEdges(matte, img, std::max(1.0, e.p("mask.refine_radius", t, 8) * pixelScale), refine);
     }
     if (e.p("mask.qualify", t) > 0.5) {
         const double hc = e.p("mask.hue", t), hw = e.p("mask.hue_width", t, 60) / 2;
