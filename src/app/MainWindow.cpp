@@ -62,6 +62,7 @@
 #include <QChildEvent>
 #include <QTabBar>
 #include <QToolBar>
+#include <QToolButton>
 #include <QVBoxLayout>
 #include <algorithm>
 #include <cmath>
@@ -405,6 +406,12 @@ void MainWindow::buildPanels() {
     surface_->setCommand(QStringLiteral("nextEdit"), [this] {
         if (const Sequence* s = state_->sequence()) program_->seek(edit::nextEdit(*s, state_->playhead()));
     });
+    surface_->setCommand(QStringLiteral("loop"), [this] {
+        if (auto* loop = findChild<QToolButton*>(QStringLiteral("programLoop"))) loop->click();
+    });
+    surface_->setProtocol(appSettings().value(QStringLiteral("controlSurface/protocol")).toString() == QLatin1String("hui")
+                              ? SurfaceProtocol::Hui
+                              : SurfaceProtocol::MackieControl);
     if (appSettings().value(QStringLiteral("controlSurface/connect"), false).toBool()) {
         // Reconnected at start-up, quietly: the surface may simply be unplugged today.
         const std::string in = appSettings().value(QStringLiteral("controlSurface/input")).toString().toStdString();
@@ -5356,12 +5363,19 @@ QDialog* MainWindow::controlSurfaceDialog() {
     dlg->setWindowTitle(tr("Control Surface"));
     dlg->setAttribute(Qt::WA_DeleteOnClose);
     auto* form = new QFormLayout(dlg);
-    auto* intro = new QLabel(tr("A surface in Mackie Control mode (Mackie MCU, Behringer X-Touch, iCON, PreSonus FaderPort, SSL UF8...): "
-                                "faders, pans, mutes and solos for eight audio tracks at a time, the master fader, the transport and "
-                                "the jog wheel, with names, levels and timecode on its displays."),
+    auto* intro = new QLabel(tr("A surface in Mackie Control or HUI mode (Mackie MCU and HUI, Behringer X-Touch, iCON, PreSonus "
+                                "FaderPort, SSL UF8...): faders, pans, mutes and solos for eight audio tracks at a time, the master "
+                                "fader, the transport and the jog wheel, with names, levels and timecode on its displays."),
                              dlg);
     intro->setWordWrap(true);
     form->addRow(intro);
+    auto* protocol = new QComboBox(dlg);
+    protocol->setObjectName(QStringLiteral("surfaceProtocol"));
+    protocol->addItem(tr("Mackie Control"), QStringLiteral("mackie"));
+    protocol->addItem(tr("HUI"), QStringLiteral("hui"));
+    protocol->setCurrentIndex(surface_->protocol() == SurfaceProtocol::Hui ? 1 : 0);
+    protocol->setToolTip(tr("The protocol the surface is set to (most offer both; HUI is Pro Tools' mode)"));
+    form->addRow(tr("Protocol:"), protocol);
     auto* input = new QComboBox(dlg);
     input->setObjectName(QStringLiteral("surfaceInput"));
     auto* output = new QComboBox(dlg);
@@ -5392,7 +5406,10 @@ QDialog* MainWindow::controlSurfaceDialog() {
     status->setWordWrap(true);
     form->addRow(status);
     auto showStatus = [this, status] {
-        status->setText(surface_->isConnected() ? tr("Connected to %1.").arg(surface_->surfaceName()) : tr("Not connected."));
+        status->setText(surface_->isConnected()
+                            ? tr("Connected to %1 (%2).")
+                                  .arg(surface_->surfaceName(), surface_->protocol() == SurfaceProtocol::Hui ? tr("HUI") : tr("Mackie Control"))
+                            : tr("Not connected."));
     };
     showStatus();
     connect(surface_, &ControlSurface::connectionChanged, status, showStatus);
@@ -5412,6 +5429,13 @@ QDialog* MainWindow::controlSurfaceDialog() {
         }
         std::string err;
         if (!surface_->connectPorts(in.toStdString(), out.toStdString(), &err)) status->setText(QString::fromStdString(err));
+    });
+    // Another protocol chosen: kept, and a connected surface taken over in it (it was switched on the surface).
+    connect(protocol, &QComboBox::currentIndexChanged, dlg, [this, protocol, showStatus] {
+        const bool isHui = protocol->currentData().toString() == QLatin1String("hui");
+        appSettings().setValue(QStringLiteral("controlSurface/protocol"), protocol->currentData().toString());
+        surface_->setProtocol(isHui ? SurfaceProtocol::Hui : SurfaceProtocol::MackieControl);
+        showStatus();
     });
     connect(disconnectButton, &QPushButton::clicked, surface_, &ControlSurface::disconnectSurface);
     connect(atStart, &QCheckBox::toggled, this, [](bool on) { appSettings().setValue(QStringLiteral("controlSurface/connect"), on); });

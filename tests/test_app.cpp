@@ -117,6 +117,7 @@
 #include "MixerPanel.h"
 #include "ControlSurface.h"
 #include "core/Cdl.h"
+#include "control/Hui.h"
 #include "control/MackieControl.h"
 #include "MulticamPanel.h"
 #include "PluginEditorWindow.h"
@@ -888,6 +889,193 @@ private slots:
         QTest::qWait(50);
         QVERIFY(surface->isConnected());
         surface->disconnectSurface();
+    }
+
+    void controlSurfaceHui() {
+        // A surface in HUI mode (Pro Tools' protocol): the same strips, transport and displays, in zones and ports.
+        struct Recorder : MidiConnection {
+            std::shared_ptr<std::vector<MidiMessage>> sent = std::make_shared<std::vector<MidiMessage>>();
+            bool send(const MidiMessage& m) override {
+                sent->push_back(m);
+                return true;
+            }
+            std::string inputName() const override { return "HUI"; }
+            std::string outputName() const override { return "HUI"; }
+        };
+        state()->newProject();
+        QVERIFY(state()->edit("Tracks", [](Project& p, Sequence& s) {
+            while (s.audioTracks.size() < 10) edit::addTrack(p, s, TrackKind::Audio);
+            for (size_t i = 0; i < s.audioTracks.size(); ++i) s.audioTracks[i].name = "Trk " + std::to_string(i + 1);
+            s.audioTracks[0].name = "Dialogue A";
+            edit::overwrite(p, s, V1, makeGeneratorClip(p, "color", 100));
+            return true;
+        }));
+        auto* mixer = win_->findChild<MixerPanel*>();
+        QTRY_COMPARE(mixer->trackStrips(), 10);
+        ControlSurface* surface = win_->controlSurface();
+        QVERIFY(surface && !surface->isConnected());
+        surface->setProtocol(SurfaceProtocol::Hui);
+        auto rec = std::make_unique<Recorder>();
+        auto sent = rec->sent;
+        surface->setConnection(std::move(rec));
+        QVERIFY(surface->isConnected());
+        auto has = [&](const MidiMessage& m) { return std::find(sent->begin(), sent->end(), m) != sent->end(); };
+        // A light or fader is two messages in a row.
+        auto hasPair = [&](const std::vector<MidiMessage>& ms) {
+            return std::search(sent->begin(), sent->end(), ms.begin(), ms.end()) != sent->end();
+        };
+        auto press = [&](int zone, int port, bool down = true) {
+            surface->handle({0xB0, 0x0F, uint8_t(zone)});
+            surface->handle({0xB0, 0x2F, uint8_t((down ? 0x40 : 0) | port)});
+        };
+        auto track = [&](int i) -> const Track& { return state()->sequence()->audioTracks.at(size_t(i)); };
+        // On connecting: pinged, then shown everything: the strips' names, the main display, faders, lights, timecode.
+        QCOMPARE(sent->front(), hui::ping());
+        QVERIFY(has(hui::stripText(0, "Dial")) && has(hui::stripText(1, "Trk ")));
+        QVERIFY(has(hui::display(0, "Dial Trk  ")));
+        QVERIFY(has(hui::display(4, "0.0  0.0  ")));
+        QVERIFY(hasPair(hui::fader(0, mcu::faderValue(0))));
+        QVERIFY(hasPair(hui::led(0x0E, 3, true)));  // Stop
+        QVERIFY(hasPair(hui::led(0x16, 0, true)));  // the timecode light
+        QVERIFY(has(hui::timecode("00:00:00:00")[0]));
+        QVERIFY(has(hui::stripText(8, "   1")));  // Select-Assign: the first track on the strips
+        // Nothing of Mackie Control's.
+        QVERIFY(std::none_of(sent->begin(), sent->end(), [](const MidiMessage& m) { return (m[0] & 0xF0) == 0xE0 || (m[0] & 0xF0) == 0xD0; }));
+        QVERIFY(!has(mcu::deviceQuery()));
+
+        // A touched fader moving: the track's volume, the position echoed back.
+        sent->clear();
+        press(0, 0);
+        QVERIFY(mixer->trackFader(0)->isSliderDown());
+        const int minus6 = mcu::faderValue(-6);
+        for (const MidiMessage& m : hui::fader(0, mcu::faderValue(-3))) surface->handle(m);
+        for (const MidiMessage& m : hui::fader(0, minus6)) surface->handle(m);
+        QCOMPARE(track(0).volumeDb, -6.0);
+        QVERIFY(hasPair(hui::fader(0, minus6)));
+        press(0, 0, false);
+        QVERIFY(!mixer->trackFader(0)->isSliderDown());
+        state()->undo();
+        QCOMPARE(track(0).volumeDb, 0.0);
+        // A fader's moves queued up together (four messages) are applied once, at the last position.
+        sent->clear();
+        for (const MidiMessage& m : hui::fader(6, mcu::faderValue(-20))) surface->receive(m);
+        for (const MidiMessage& m : hui::fader(6, mcu::faderValue(-10))) surface->receive(m);
+        QTRY_COMPARE(track(6).volumeDb, -10.0);
+        QVERIFY(hasPair(hui::fader(6, mcu::faderValue(-10))) && !hasPair(hui::fader(6, mcu::faderValue(-20))));
+        QTRY_VERIFY_WITH_TIMEOUT(!mixer->trackFader(6)->isSliderDown(), 3000);
+
+        // Mute lights up; the V-Pot pans (the main display shows it for a moment) and V-Select centres it.
+        sent->clear();
+        press(2, 2);
+        press(2, 2, false);
+        QVERIFY(track(2).muted);
+        QVERIFY(hasPair(hui::led(2, 2, true)));
+        press(3, 3);
+        QVERIFY(track(3).solo && hasPair(hui::led(3, 3, true)));
+        surface->handle({0xB0, 0x40, 0x45});
+        QCOMPARE(track(0).pan, 0.1);
+        QVERIFY(has(hui::ring(0, mcu::panRing(0.1))));
+        QTRY_VERIFY_WITH_TIMEOUT(has(hui::display(4, "R10  0.0  ")), 900);
+        surface->handle({0xB0, 0x40, 0x02});
+        QVERIFY(std::fabs(track(0).pan - 0.06) < 1e-9);
+        press(0, 5);
+        QCOMPARE(track(0).pan, 0.0);
+
+        // Banking.
+        sent->clear();
+        press(0x0A, 3);
+        QCOMPARE(surface->bank(), 2);
+        QVERIFY(has(hui::stripText(0, "Trk ")) && has(hui::stripText(8, "   3")));
+        press(0x0A, 0);
+        QCOMPARE(surface->bank(), 1);
+        press(0x0A, 1);
+        QCOMPARE(surface->bank(), 0);
+
+        // Automation: select a strip, Touch on it, then Off.
+        sent->clear();
+        press(5, 1);
+        QCOMPARE(surface->selectedTrack(), 5);
+        QVERIFY(hasPair(hui::led(5, 1, true)));
+        press(0x18, 5);
+        QCOMPARE(track(5).automation, int(AutomationMode::Touch));
+        QVERIFY(hasPair(hui::led(0x18, 5, true)));
+        press(0x18, 3);
+        QCOMPARE(track(5).automation, int(AutomationMode::Off));
+        QVERIFY(hasPair(hui::led(0x18, 3, true)) && hasPair(hui::led(0x18, 5, false)));
+
+        // Transport: RTZ and End, the jog wheel, Loop, markers from the keypad's Enter, Play and Stop.
+        auto* program = win_->findChild<PlaybackController*>("programPlayback");
+        state()->setPlayhead(50);
+        press(0x0F, 0);
+        QTRY_COMPARE(state()->playhead(), FrameTime(0));
+        press(0x0F, 1);
+        QTRY_COMPARE(state()->playhead(), state()->sequence()->duration());
+        state()->setPlayhead(10);
+        surface->handle({0xB0, 0x0D, 0x43});
+        QTRY_COMPARE(state()->playhead(), FrameTime(13));
+        surface->handle({0xB0, 0x0D, 0x01});
+        QTRY_COMPARE(state()->playhead(), FrameTime(12));
+        sent->clear();
+        press(0x0F, 3);
+        auto* loop = win_->findChild<QToolButton*>("programLoop");
+        QVERIFY(loop && loop->isChecked() && program->loop());
+        QVERIFY(hasPair(hui::led(0x0F, 3, true)));
+        press(0x0F, 3);
+        QVERIFY(!loop->isChecked() && !program->loop());
+        const size_t markers = state()->sequence()->markers.size();
+        press(0x14, 0);
+        QCOMPARE(state()->sequence()->markers.size(), markers + 1);
+        press(0x08, 3);  // Undo
+        QCOMPARE(state()->sequence()->markers.size(), markers);
+        sent->clear();
+        press(0x0E, 4);
+        QVERIFY(program->isPlaying());
+        QVERIFY(hasPair(hui::led(0x0E, 4, true)) && hasPair(hui::led(0x0E, 3, false)));
+        press(0x0E, 3);
+        QVERIFY(!program->isPlaying());
+
+        // Meters: both sides, and let fall once levels stop coming.
+        sent->clear();
+        surface->setLevels(0, 0, QVector<float>{0.5f, 0.25f, 1.0f, 1.0f});
+        QVERIFY(has(hui::meter(0, 0, 8)) && has(hui::meter(0, 1, 8)) && has(hui::meter(1, 0, 12)));
+        QTRY_VERIFY_WITH_TIMEOUT(has(hui::meter(0, 0, 0)) && has(hui::meter(1, 1, 0)), 2000);
+        // Pinged once a second; a ping answered is not news, a surface switched on is shown everything again.
+        sent->clear();
+        QTRY_VERIFY_WITH_TIMEOUT(has(hui::ping()), 2500);
+        sent->clear();
+        surface->handle({0x90, 0x00, 0x7F});
+        QVERIFY(!has(hui::stripText(0, "Dial")));
+        surface->handle({0xFF});
+        QVERIFY(has(hui::stripText(0, "Dial")) && has(hui::display(0, "Dial Trk  ")));
+
+        // Disconnecting leaves it clean.
+        sent->clear();
+        surface->disconnectSurface();
+        QVERIFY(!surface->isConnected());
+        QVERIFY(hasPair(hui::fader(0, 0)) && has(hui::stripText(0, "")) && has(hui::display(4, "")));
+        QVERIFY(hasPair(hui::zoneOff(2)) && hasPair(hui::zoneOff(0x18)));
+
+        // Switched to Mackie Control while connected: taken over in it on the same ports.
+        auto rec2 = std::make_unique<Recorder>();
+        auto sent2 = rec2->sent;
+        surface->setConnection(std::move(rec2));
+        sent2->clear();
+        surface->setProtocol(SurfaceProtocol::MackieControl);
+        QVERIFY(surface->isConnected() && surface->protocol() == SurfaceProtocol::MackieControl);
+        QCOMPARE(sent2->front(), mcu::deviceQuery());
+        QVERIFY(std::find(sent2->begin(), sent2->end(), mcu::lcd(0, "Dialog ")) != sent2->end());
+        surface->disconnectSurface();
+
+        // The dialog offers both protocols and keeps the choice.
+        QDialog* dlg = win_->controlSurfaceDialog();
+        auto* protocol = dlg->findChild<QComboBox*>("surfaceProtocol");
+        QVERIFY(protocol && protocol->count() == 2 && protocol->currentIndex() == 0);
+        protocol->setCurrentIndex(1);
+        QCOMPARE(surface->protocol(), SurfaceProtocol::Hui);
+        QCOMPARE(appSettings().value("controlSurface/protocol").toString(), QString("hui"));
+        protocol->setCurrentIndex(0);
+        QCOMPARE(surface->protocol(), SurfaceProtocol::MackieControl);
+        dlg->close();
     }
 
     void mixerAutomation() {

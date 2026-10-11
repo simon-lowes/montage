@@ -23,28 +23,32 @@ namespace {
 
 constexpr int kMaster = mcu::kMasterChannel;
 
-std::string centred(const std::string& s) {
-    std::string t = s.substr(0, 6);
-    const size_t left = (6 - t.size()) / 2;
+// Text centred in a display cell of `cell` characters, the last one a space between cells.
+std::string centred(const std::string& s, int cell) {
+    std::string t = s.substr(0, size_t(cell - 1));
+    const size_t left = (size_t(cell - 1) - t.size()) / 2;
     t.insert(0, left, ' ');
-    t.resize(7, ' ');
+    t.resize(size_t(cell), ' ');
     return t;
 }
 
-std::string dbShort(double db) {
-    if (db <= -59.95) return centred("-inf");
+std::string dbShort(double db, int cell) {
+    if (db <= -59.95) return centred("-inf", cell);
     char buf[16];
-    std::snprintf(buf, sizeof buf, "%+.1f", db);
-    return centred(std::fabs(db) < 0.05 ? std::string("0.0") : std::string(buf));
+    // (Four characters have no room for a tenth from -10 dB down.)
+    std::snprintf(buf, sizeof buf, cell <= 5 && std::fabs(db) >= 9.95 ? "%+.0f" : "%+.1f", db);
+    return centred(std::fabs(db) < 0.05 ? std::string("0.0") : std::string(buf), cell);
 }
 
-std::string panShort(double pan) {
+std::string panShort(double pan, int cell) {
     const int p = int(std::lround(pan * 100));
-    if (p == 0) return centred("<C>");
+    if (p == 0) return centred("<C>", cell);
     char buf[16];
     std::snprintf(buf, sizeof buf, "%c%d", p < 0 ? 'L' : 'R', std::abs(p));
-    return centred(buf);
+    return centred(buf, cell);
 }
+
+constexpr int kMackieCell = 7, kHuiCell = 5;  // a strip's share of a display row
 
 }  // namespace
 
@@ -87,9 +91,11 @@ void ControlSurface::setConnection(std::unique_ptr<MidiConnection> connection) {
     connection_ = std::move(connection);
     ++generation_;
     if (!connection_) return;
-    // Asked to say it is there (surfaces that wait for a host answer it; the rest are taken as there), meters with
-    // their signal and peak lights, then everything it shows.
-    send(mcu::deviceQuery(device_));
+    // Asked to say it is there (Mackie Control surfaces that wait for a host answer it, the rest are taken as there;
+    // a HUI is pinged), meters with their signal and peak lights, then everything it shows.
+    decoder_.reset();
+    pingReplyAt_ = QDateTime::currentMSecsSinceEpoch();
+    hello();
     reset();
     refresh();
     timer_->start();
@@ -99,24 +105,55 @@ void ControlSurface::setConnection(std::unique_ptr<MidiConnection> connection) {
 void ControlSurface::disconnectSurface() {
     if (!connection_) return;
     timer_->stop();
+    releaseAll();
+    // Left clean: faders down, every light out, strips and display blank.
+    if (isHui()) {
+        // (Its timecode display goes back to OFF-LINE by itself once the pings stop.)
+        for (int i = 0; i < hui::kStrips; ++i) {
+            send(hui::fader(i, 0));
+            send(hui::ring(i, 0));
+            send(hui::meter(i, 0, 0));
+            send(hui::meter(i, 1, 0));
+        }
+        for (int zone = 0; zone < 0x1D; ++zone) send(hui::zoneOff(zone));  // (0x1D: relays and the beeper, left alone)
+        for (int i = 0; i <= hui::kStrips; ++i) send(hui::stripText(i, ""));
+        for (int zone = 0; zone < 8; ++zone) send(hui::display(zone, ""));
+    } else {
+        for (int i = 0; i <= kMaster; ++i) send(mcu::fader(i, 0));
+        for (int note = 0; note < 0x76; ++note) send(mcu::led(note, 0));
+        for (int i = 0; i < mcu::kStrips; ++i) {
+            send(mcu::ring(i, 0));
+            send(mcu::meter(i, 0));
+        }
+        send(mcu::lcd(0, std::string(2 * mcu::kLcdWidth, ' '), device_));
+        send(mcu::timecode(""));
+        send(mcu::assignment(""));
+    }
+    connection_.reset();
+    emit connectionChanged(false);
+}
+
+void ControlSurface::setProtocol(SurfaceProtocol protocol) {
+    if (protocol == protocol_) return;
+    if (!connection_) {
+        protocol_ = protocol;
+        return;
+    }
+    // The surface was switched to its other mode: the same ports, taken over in the new protocol.
+    timer_->stop();
+    releaseAll();
+    std::unique_ptr<MidiConnection> c = std::move(connection_);
+    protocol_ = protocol;
+    setConnection(std::move(c));
+}
+
+void ControlSurface::releaseAll() {
     for (int i = 0; i <= kMaster; ++i)
         if (touched_[size_t(i)] || holds_[size_t(i)]->isActive()) {
             touched_[size_t(i)] = false;
             release(i);
         }
     for (int i = 0; i < mcu::kStrips; ++i) releasePot(i);
-    // Left clean: faders down, every light out, strips and display blank.
-    for (int i = 0; i <= kMaster; ++i) send(mcu::fader(i, 0));
-    for (int note = 0; note < 0x76; ++note) send(mcu::led(note, 0));
-    for (int i = 0; i < mcu::kStrips; ++i) {
-        send(mcu::ring(i, 0));
-        send(mcu::meter(i, 0));
-    }
-    send(mcu::lcd(0, std::string(2 * mcu::kLcdWidth, ' '), device_));
-    for (const MidiMessage& m : mcu::timecode("")) send(m);
-    for (const MidiMessage& m : mcu::assignment("")) send(m);
-    connection_.reset();
-    emit connectionChanged(false);
 }
 
 void ControlSurface::receive(const MidiMessage& m) {
@@ -136,11 +173,7 @@ void ControlSurface::connectionLost() {
 void ControlSurface::lost() {
     if (!connection_) return;
     timer_->stop();
-    for (int i = 0; i <= kMaster; ++i) {
-        touched_[size_t(i)] = false;
-        release(i);
-    }
-    for (int i = 0; i < mcu::kStrips; ++i) releasePot(i);
+    releaseAll();
     connection_.reset();
     emit connectionChanged(false);
 }
@@ -153,27 +186,33 @@ void ControlSurface::drain() {
         drainPending_ = false;
     }
     if (!connection_) return;
-    // A fader's moves that queued up behind each other: only the last needs applying (each is an edit), as long as no
-    // touch of that fader comes between them.
-    for (size_t i = 0; i < batch.size(); ++i) {
-        const MidiMessage& m = batch[i];
-        if (!m.empty() && (m[0] & 0xF0) == 0xE0) {
+    // Decoded in order (a HUI's switches and faders take two messages each), then a fader's moves that queued up
+    // behind each other: only the last needs applying (each is an edit), as long as no touch of that fader comes
+    // between them.
+    std::vector<mcu::Event> events;
+    for (const MidiMessage& m : batch) {
+        const mcu::Event e = decode(m);
+        if (!connection_) return;
+        if (e.kind != mcu::Event::None) events.push_back(e);
+    }
+    for (size_t i = 0; i < events.size() && connection_; ++i) {
+        const mcu::Event& e = events[i];
+        if (e.kind == mcu::Event::Fader) {
             bool later = false;
-            for (size_t j = i + 1; j < batch.size() && !later; ++j) {
-                const MidiMessage& n = batch[j];
-                if (n.empty()) continue;
-                if (n[0] == m[0]) later = true;
-                else if ((n[0] & 0xF0) == 0x90 && n.size() > 1 && n[1] == mcu::FaderTouch + (m[0] & 0x0F)) break;
+            for (size_t j = i + 1; j < events.size() && !later; ++j) {
+                const mcu::Event& n = events[j];
+                if (n.kind == mcu::Event::Fader && n.index == e.index) later = true;
+                else if (n.kind == mcu::Event::Touch && n.index == e.index) break;
             }
             if (later) continue;
         }
-        handle(m);
+        apply(e);
     }
 }
 
 int ControlSurface::selectedTrack() const {
     const Sequence* s = state_->sequence();
-    if (!s || !selected_) return -1;
+    if (!s || !selected_ || state_->projectGeneration() != project_) return -1;
     for (size_t i = 0; i < s->audioTracks.size(); ++i)
         if (s->audioTracks[i].id == selected_) return int(i);
     return -1;
@@ -189,6 +228,19 @@ void ControlSurface::send(const MidiMessage& m) {
     if (connection_) connection_->send(m);
 }
 
+void ControlSurface::send(const std::vector<MidiMessage>& ms) {
+    for (const MidiMessage& m : ms) send(m);
+}
+
+void ControlSurface::hello() {
+    if (isHui()) {
+        send(hui::ping());
+        pingAt_ = QDateTime::currentMSecsSinceEpoch();
+    } else {
+        send(mcu::deviceQuery(device_));
+    }
+}
+
 void ControlSurface::reset() {
     shown_ = {};
     leds_.clear();
@@ -197,7 +249,35 @@ void ControlSurface::reset() {
     bottomAt_ = {};
     levels_ = {};
     meterAt_ = {};
-    for (int i = 0; i < mcu::kStrips; ++i) send(mcu::meterMode(i, 0x03, device_));
+    zones_ = {};
+    zoneAt_ = {};
+    if (!isHui())
+        for (int i = 0; i < mcu::kStrips; ++i) send(mcu::meterMode(i, 0x03, device_));
+}
+
+void ControlSurface::sendFader(int strip, int value) {
+    if (!isHui()) send(mcu::fader(strip, value));
+    else if (strip < hui::kStrips) send(hui::fader(strip, value));  // (a HUI has no master fader)
+}
+
+void ControlSurface::sendLed(int note, int state) {
+    if (!isHui()) {
+        if (note >= 0 && note < 0x80) send(mcu::led(note, state));
+    } else if (const hui::Port p = hui::portOf(note); p.zone >= 0) {
+        send(hui::led(p.zone, p.port, state != 0));
+    }
+}
+
+void ControlSurface::sendRing(int strip, int value) { send(isHui() ? hui::ring(strip, value) : mcu::ring(strip, value)); }
+
+void ControlSurface::sendMeter(int strip, int level) {
+    if (!isHui()) {
+        send(mcu::meter(strip, level));
+        return;
+    }
+    // Both sides the same (sources disagree on which bit is the left).
+    send(hui::meter(strip, 0, std::min(level, 12)));
+    send(hui::meter(strip, 1, std::min(level, 12)));
 }
 
 int ControlSurface::tracks() const {
@@ -226,7 +306,24 @@ void ControlSurface::setBank(int first) {
 
 // ---- From the surface ------------------------------------------------------------------------------------------------
 
-void ControlSurface::handle(const MidiMessage& m) {
+void ControlSurface::handle(const MidiMessage& m) { apply(decode(m)); }
+
+mcu::Event ControlSurface::decode(const MidiMessage& m) {
+    if (isHui()) {
+        if (hui::isPingReply(m) || hui::isSystemReset(m)) {
+            // A surface switched on, or answering again after a silence (it was off line): shown everything again.
+            const qint64 now = QDateTime::currentMSecsSinceEpoch();
+            const bool back = hui::isSystemReset(m) || now - pingReplyAt_ > 3000;
+            if (hui::isPingReply(m)) pingReplyAt_ = now;
+            if (back) {
+                decoder_.reset();
+                reset();
+                refresh();
+            }
+            return {};
+        }
+        return decoder_.decode(m);
+    }
     int device = 0, cmd = 0;
     if (mcu::surfaceSysex(m, device, cmd)) {
         // A surface switched on or answering the query: shown everything again, addressed as it calls itself.
@@ -235,9 +332,21 @@ void ControlSurface::handle(const MidiMessage& m) {
             reset();
             refresh();
         }
-        return;
+        return {};
     }
-    const mcu::Event e = mcu::decode(m);
+    return mcu::decode(m);
+}
+
+void ControlSurface::followProject() {
+    if (state_->projectGeneration() == project_) return;
+    project_ = state_->projectGeneration();
+    selected_ = 0;  // (ids start again in another project, so the old one could name another track)
+    bank_ = 0;
+}
+
+void ControlSurface::apply(const mcu::Event& e) {
+    if (e.kind == mcu::Event::None || !connection_) return;
+    followProject();
     // Every move from the surface is one undo step together, however many controls move at once.
     mixer_->setEditMergeKey(QStringLiteral("control-surface"));
     switch (e.kind) {
@@ -251,7 +360,7 @@ void ControlSurface::handle(const MidiMessage& m) {
         case mcu::Event::None: break;
     }
     mixer_->setEditMergeKey(QString());
-    if (e.kind != mcu::Event::None) refresh();  // what it changed shows at once
+    refresh();  // what it changed shows at once
 }
 
 void ControlSurface::moveFader(int strip, int value) {
@@ -259,7 +368,7 @@ void ControlSurface::moveFader(int strip, int value) {
     if (!slider) return;
     if (!touched_[size_t(strip)]) hold(strip);  // surfaces without touch sensing
     // Faders hold their place by the host echoing it (else the servo pulls them back to the last position sent).
-    send(mcu::fader(strip, value));
+    sendFader(strip, value);
     shown_[size_t(strip)].fader = value;
     slider->setValue(int(std::lround(std::clamp(mcu::faderDb(value), -60.0, 12.0) * 10)));
 }
@@ -349,6 +458,11 @@ void ControlSurface::button(int note, bool down) {
             case mcu::Rewind: program_->shuttle(-1); break;
             case mcu::FastForward: program_->shuttle(1); break;
             case mcu::Record: command(QStringLiteral("record")); break;
+            case mcu::Cycle: command(QStringLiteral("loop")); break;
+            case hui::ReturnToZero: program_->seek(0); break;
+            case hui::GoToEnd:
+                if (const Sequence* s = state_->sequence()) program_->seek(s->duration());
+                break;
             case mcu::Left: program_->step(-1); break;
             case mcu::Right: program_->step(1); break;
             case mcu::Up: command(QStringLiteral("previousEdit")); break;
@@ -359,14 +473,16 @@ void ControlSurface::button(int note, bool down) {
             case mcu::Read:
             case mcu::Write:
             case mcu::Touch:
-            case mcu::Latch: {
+            case mcu::Latch:
+            case hui::AutomationOff: {
                 // The selected track's fader automation; its own mode again turns it off.
                 QComboBox* mode = mixer_->trackAutomationMode(selectedTrack());
                 if (!mode || !mode->isEnabled()) break;
-                const AutomationMode want = note == mcu::Read ? AutomationMode::Read
+                const AutomationMode want = note == mcu::Read    ? AutomationMode::Read
                                             : note == mcu::Write ? AutomationMode::Write
                                             : note == mcu::Touch ? AutomationMode::Touch
-                                                                 : AutomationMode::Latch;
+                                            : note == mcu::Latch ? AutomationMode::Latch
+                                                                 : AutomationMode::Off;
                 mode->setCurrentIndex(mode->currentIndex() == int(want) ? int(AutomationMode::Off) : int(want));
                 break;
             }
@@ -380,26 +496,51 @@ void ControlSurface::button(int note, bool down) {
 void ControlSurface::setLevels(float, float, const QVector<float>& trackPeaks) {
     if (!connection_) return;
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    levelsAt_ = now;
     for (int i = 0; i < mcu::kStrips; ++i) {
         const int t = bank_ + i;
         const float l = 2 * t < trackPeaks.size() ? trackPeaks[2 * t] : 0.f, r = 2 * t + 1 < trackPeaks.size() ? trackPeaks[2 * t + 1] : 0.f;
         const int level = mcu::meterLevel(std::max(l, r));
-        // Meters fall by themselves on the surface: a level is sent when it rises, and again every 300 ms it holds.
-        if (level > 0 && (level > levels_[size_t(i)] || now - meterAt_[size_t(i)] >= 300)) {
-            send(mcu::meter(i, level));
-            meterAt_[size_t(i)] = now;
+        int& was = levels_[size_t(i)];
+        qint64& at = meterAt_[size_t(i)];
+        if (!isHui()) {
+            // Meters fall by themselves on a Mackie Control surface: a level is sent when it rises, and again every
+            // 300 ms it holds.
+            if (level > 0 && (level > was || now - at >= 300)) {
+                sendMeter(i, level);
+                at = now;
+            }
+        } else if (level > was || (level < was && now - at >= 100) || (level > 0 && now - at >= 300)) {
+            // A HUI's are sent falling too (at most ten times a second, for a 5-pin MIDI cable).
+            sendMeter(i, level);
+            at = now;
+        } else {
+            continue;  // (what it shows stays what was sent)
         }
-        levels_[size_t(i)] = level;
+        was = level;
     }
 }
 
 void ControlSurface::refresh() {
     if (!connection_) return;
+    followProject();
     const Sequence* seq = state_->sequence();
     const int n = tracks();
     if (bank_ > std::max(0, n - mcu::kStrips)) bank_ = std::max(0, n - mcu::kStrips);
     const int selected = selectedTrack();
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (isHui()) {
+        // Pinged once a second (without, its faders stop), and its meters let fall once playback levels stop coming.
+        if (now - pingAt_ >= 1000) hello();
+        if (now - levelsAt_ >= 300)
+            for (int i = 0; i < hui::kStrips; ++i)
+                if (levels_[size_t(i)] > 0) {
+                    sendMeter(i, 0);
+                    levels_[size_t(i)] = 0;
+                }
+    }
+    const int cell = isHui() ? kHuiCell : kMackieCell;
+    std::string names, values;  // HUI: the main display's two rows, a cell per strip
     for (int i = 0; i < mcu::kStrips; ++i) {
         Shown& was = shown_[size_t(i)];
         const int t = bank_ + i;
@@ -411,20 +552,30 @@ void ControlSurface::refresh() {
         const double db = fader ? fader->value() / 10.0 : -60;
         const int fv = has ? mcu::faderValue(db) : 0;
         if (!touched_[size_t(i)] && !holds_[size_t(i)]->isActive() && fv != was.fader) {
-            send(mcu::fader(i, fv));
+            sendFader(i, fv);
             was.fader = fv;
         }
         const int mute = tr && tr->muted ? 2 : 0, solo = tr && tr->solo ? 2 : 0, select = has && t == selected ? 2 : 0;
-        if (mute != was.mute) send(mcu::led(mcu::Mute + i, was.mute = mute));
-        if (solo != was.solo) send(mcu::led(mcu::Solo + i, was.solo = solo));
-        if (select != was.select) send(mcu::led(mcu::Select + i, was.select = select));
+        if (mute != was.mute) sendLed(mcu::Mute + i, was.mute = mute);
+        if (solo != was.solo) sendLed(mcu::Solo + i, was.solo = solo);
+        if (select != was.select) sendLed(mcu::Select + i, was.select = select);
         const bool panning = pan && pan->isVisibleTo(mixer_);
         const double panValue = panning ? pan->value() / 100.0 : 0;
-        const int ringValue = panning ? mcu::panRing(panValue) : 0;
-        if (ringValue != was.ring) send(mcu::ring(i, was.ring = ringValue));
-        // Scribble strip: the name above, the level below (the pan for a second after it turns).
+        const int ringValue = panning ? mcu::panRing(panValue) : 0;  // (single-dot positions, the same in both)
+        if (ringValue != was.ring) sendRing(i, was.ring = ringValue);
+        // The name, and below it the level (the pan for a second after it turns).
+        const std::string bottom = !has ? std::string(size_t(cell), ' ')
+                                   : panning && now - turnedAt_[size_t(i)] < 1000 ? panShort(panValue, cell)
+                                                                                    : dbShort(db, cell);
+        if (isHui()) {
+            // The strip's own four characters, and both on the main display (five characters a strip).
+            const std::string top = hui::fit(has ? tr->name : std::string(), hui::kStripChars);
+            if (top != was.top) send(hui::stripText(i, was.top = top));
+            names += top + ' ';
+            values += bottom;
+            continue;
+        }
         const std::string top = has ? mcu::stripText(tr->name) : std::string(7, ' ');
-        const std::string bottom = !has ? std::string(7, ' ') : panning && now - turnedAt_[size_t(i)] < 1000 ? panShort(panValue) : dbShort(db);
         if (top != was.top) send(mcu::lcd(i * 7, was.top = top, device_));
         // The level line changes as automation plays: at most ten times a second, so a 5-pin MIDI cable keeps up.
         if (bottom != was.bottom && now - bottomAt_[size_t(i)] >= 100) {
@@ -432,44 +583,58 @@ void ControlSurface::refresh() {
             bottomAt_[size_t(i)] = now;
         }
     }
-    // The master fader.
-    if (QSlider* master = mixer_->masterFader()) {
+    if (isHui()) {
+        // The main display by its ten-character zones, as they change (the levels at most ten times a second).
+        for (int zone = 0; zone < 8; ++zone) {
+            const std::string& row = zone < 4 ? names : values;
+            const std::string text = row.substr(size_t(zone % 4) * hui::kZoneChars, hui::kZoneChars);
+            if (text != zones_[size_t(zone)] && (zone < 4 || now - zoneAt_[size_t(zone)] >= 100)) {
+                send(hui::display(zone, text));
+                zones_[size_t(zone)] = text;
+                zoneAt_[size_t(zone)] = now;
+            }
+        }
+    } else if (QSlider* master = mixer_->masterFader()) {
+        // The master fader.
         const int fv = mcu::faderValue(master->value() / 10.0);
         if (!touched_[size_t(kMaster)] && !holds_[size_t(kMaster)]->isActive() && fv != shown_[size_t(kMaster)].fader) {
-            send(mcu::fader(kMaster, fv));
+            sendFader(kMaster, fv);
             shown_[size_t(kMaster)].fader = fv;
         }
     }
-    // Transport and automation lights.
+    // Transport, loop and automation lights.
     const bool playing = program_->isPlaying();
     const QComboBox* mode = mixer_->trackAutomationMode(selected);
     const int am = mode ? mode->currentIndex() : -1;
     const std::pair<int, bool> lights[] = {{mcu::Play, playing},
                                            {mcu::Stop, !playing},
+                                           {mcu::Cycle, program_->loop()},
                                            {mcu::Read, am == int(AutomationMode::Read)},
                                            {mcu::Write, am == int(AutomationMode::Write)},
                                            {mcu::Touch, am == int(AutomationMode::Touch)},
                                            {mcu::Latch, am == int(AutomationMode::Latch)},
+                                           {hui::AutomationOff, am == int(AutomationMode::Off)},
                                            {mcu::SmpteLed, true}};
     for (const auto& [note, on] : lights) {
         const int v = on ? 2 : 0;
         const auto it = leds_.find(note);
         if (it == leds_.end() || it->second != v) {
-            send(mcu::led(note, v));
+            sendLed(note, v);
             leds_[note] = v;
         }
     }
-    // The assignment display: the first track on the strips.
+    // The assignment display (a HUI's Select-Assign): the first track on the strips.
     {
-        const std::string a = n > 0 ? std::to_string(std::min(99, bank_ + 1)) : std::string();
+        const std::string a = n > 0 ? std::to_string(std::min(isHui() ? 9999 : 99, bank_ + 1)) : std::string();
         if (a != assignment_) {
-            for (const MidiMessage& m : mcu::assignment(a)) send(m);
+            if (isHui()) send(hui::stripText(hui::kStrips, std::string(size_t(std::max(0, 4 - int(a.size()))), ' ') + a));
+            else send(mcu::assignment(a));
             assignment_ = a;
         }
     }
-    // The timecode display, digit by digit as they change.
+    // The timecode display, digit by digit as they change (a HUI's all at once).
     const std::string tc = seq ? formatTimecode(state_->playhead(), seq->fps) : std::string();
-    const std::vector<MidiMessage> digits = mcu::timecode(tc);
+    const std::vector<MidiMessage> digits = isHui() ? hui::timecode(tc) : mcu::timecode(tc);
     if (digits_.size() != digits.size()) digits_.assign(digits.size(), std::string());
     for (size_t i = 0; i < digits.size(); ++i) {
         const std::string key(digits[i].begin(), digits[i].end());

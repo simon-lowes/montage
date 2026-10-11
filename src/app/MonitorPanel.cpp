@@ -583,6 +583,7 @@ MonitorPanel::MonitorPanel(Mode mode, EditorState* state, PlaybackController* co
         auto* safe = tool(this, tr("Safe"), tr("Show title / action safe guides"));
         safe->setCheckable(true);
         auto* loop = tool(this, tr("Loop"), tr("Loop playback between In and Out"));
+        loop->setObjectName(QStringLiteral("programLoop"));
         loop->setCheckable(true);
         auto* still = tool(this, QString(), tr("Export Frame..."), "save");
         auto* proxy = tool(this, tr("Proxy"), tr("Play back with proxy media where available (exports always use originals)"));

@@ -1,11 +1,12 @@
-// Montage — hardware control surfaces (Premiere's and Resolve's Mackie Control support, Pro Tools' and Logic's MCU
-// mode): a surface speaking the Mackie Control protocol (control/MackieControl.h) works the mixer and transport.
-// Its eight strips are eight audio tracks (banked across the rest): the motor faders set and follow each track's
-// volume, automation included (a touched fader writes in Touch and Latch as the mixer's own fader does), the V-Pots
-// pan, the buttons mute, solo and select, and Read, Write, Touch and Latch set the selected track's automation. The
-// master fader is the mix's. Play, Stop, Rewind, Fast Forward, the jog wheel and the cursor keys move through the
-// cut; Marker, Undo and Save do what they say. The scribble strips show track names and levels, the meters follow
-// playback and the display shows the timecode.
+// Montage — hardware control surfaces (Premiere's and Resolve's Mackie Control support, Pro Tools' HUI and Logic's MCU
+// modes): a surface speaking the Mackie Control protocol (control/MackieControl.h) or HUI (control/Hui.h) works the
+// mixer and transport. Its eight strips are eight audio tracks (banked across the rest): the motor faders set and
+// follow each track's volume, automation included (a touched fader writes in Touch and Latch as the mixer's own fader
+// does), the V-Pots pan, the buttons mute, solo and select, and Read, Write, Touch, Latch (and a HUI's Off) set the
+// selected track's automation. A Mackie Control master fader is the mix's. Play, Stop, Rewind, Fast Forward, the jog
+// wheel and the cursor keys move through the cut, Cycle (a HUI's Loop) loops playback and a HUI's RTZ and End go to
+// either end; Marker (a HUI's keypad Enter), Undo and Save do what they say. The displays show track names and
+// levels, the meters follow playback and the timecode display the playhead.
 #pragma once
 
 #include <QObject>
@@ -20,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include "control/Hui.h"
 #include "control/Midi.h"
 #include "core/Model.h"
 
@@ -30,6 +32,9 @@ namespace montage {
 class EditorState;
 class MixerPanel;
 class PlaybackController;
+
+// The protocols a surface can speak (most offer both, chosen on the surface).
+enum class SurfaceProtocol { MackieControl, Hui };
 
 class ControlSurface : public QObject {
     Q_OBJECT
@@ -44,9 +49,12 @@ public:
     // Clears the surface (faders down, lights off, strips blank) and closes it.
     void disconnectSurface();
     bool isConnected() const { return connection_ != nullptr; }
+    // Which protocol the surface speaks; changed while connected, the surface is taken over in the new one.
+    void setProtocol(SurfaceProtocol protocol);
+    SurfaceProtocol protocol() const { return protocol_; }
     QString surfaceName() const;
     // What the transport keys do that lives in the main window: "record", "marker", "save", "previousEdit",
-    // "nextEdit".
+    // "nextEdit", "loop".
     void setCommand(const QString& name, std::function<void()> fn) { commands_[name] = std::move(fn); }
 
     // A message from the surface (on the GUI thread; the connection's are queued here).
@@ -74,7 +82,18 @@ private:
         std::string top, bottom;
     };
     void send(const MidiMessage& m);
+    void send(const std::vector<MidiMessage>& ms);
+    void hello();  // what a surface is first sent: Mackie Control's device query, HUI's ping
     void reset();
+    mcu::Event decode(const MidiMessage& m);  // (a surface announcing itself is shown everything again)
+    void apply(const mcu::Event& e);
+    void releaseAll();
+    bool isHui() const { return protocol_ == SurfaceProtocol::Hui; }
+    // To the surface, in its protocol.
+    void sendFader(int strip, int value);
+    void sendLed(int note, int state);  // 0 off, 2 on
+    void sendRing(int strip, int value);
+    void sendMeter(int strip, int level);
     void drain();  // messages queued from the MIDI thread, a fader's run of moves coalesced
     void lost();   // the device went away: holds released, nothing more sent
     int tracks() const;
@@ -96,6 +115,8 @@ private:
     QTimer* timer_ = nullptr;
     int bank_ = 0;
     Id selected_ = 0;  // the selected track (by id, so it stays itself when tracks move)
+    uint64_t project_ = 0;  // the project the selection and bank are in (EditorState::projectGeneration)
+    void followProject();   // another project open: the selection cleared, the first tracks on the strips
     // Per strip (and the master, index 8): held by touch, held by movement (faders and pots apart), when a pot last
     // turned, and when the level below the name was last sent.
     std::array<bool, 9> touched_{};
@@ -113,6 +134,12 @@ private:
     std::vector<std::string> digits_;  // the timecode display as last sent
     std::string assignment_;           // the assignment display as last sent
     int device_ = 0x14;                // how the surface addresses itself (0x14 Mackie Control, 0x10 Logic Control)
+    SurfaceProtocol protocol_ = SurfaceProtocol::MackieControl;
+    hui::Decoder decoder_;
+    qint64 pingAt_ = 0, pingReplyAt_ = 0;  // HUI: when a ping was last sent and last answered
+    qint64 levelsAt_ = 0;                  // when playback levels last came
+    std::array<std::string, 8> zones_;     // HUI: the main display's zones as last sent
+    std::array<qint64, 8> zoneAt_{};
     std::array<int, 8> levels_{};
     std::array<qint64, 8> meterAt_{};
 };

@@ -128,6 +128,7 @@ add_library(montage_engine STATIC
   render/Hdr10Plus.h render/Hdr10Plus.cpp
   control/Midi.h control/Midi.cpp
   control/MackieControl.h control/MackieControl.cpp
+  control/Hui.h control/Hui.cpp
   render/Versions.h render/Versions.cpp
   render/ReviewExport.h render/ReviewExport.cpp
   render/DcpMxf.h render/DcpMxf.cpp

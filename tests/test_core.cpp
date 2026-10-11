@@ -61,6 +61,7 @@
 #include "core/TranscriptEdit.h"
 #include "core/Zip.h"
 #include "core/G2p.h"
+#include "control/Hui.h"
 #include "control/MackieControl.h"
 #include "control/Midi.h"
 
@@ -1077,6 +1078,83 @@ private slots:
         for (double db : {-60.0, -30.0, -12.0, -6.0, 0.0, 6.0, 11.0}) QVERIFY(std::fabs(mcu::faderDb(mcu::faderValue(db)) - db) < 0.01);
         QCOMPARE(mcu::faderDb(0x3F70), 12.0);
         QVERIFY(mcu::faderDb(mcu::faderValue(-6) + 100) > -6);
+    }
+
+    void huiProtocol() {
+        using mcu::Event;
+        // ---- What a HUI says: a switch as its zone then its port, a fader as its high then its low seven bits.
+        hui::Decoder d;
+        QCOMPARE(d.decode({0xB0, 0x2F, 0x43}).kind, Event::None);  // a port before any zone
+        QCOMPARE(d.decode({0xB0, 0x0F, 0x04}).kind, Event::None);
+        Event e = d.decode({0xB0, 0x2F, 0x43});
+        QVERIFY(e.kind == Event::Button && e.index == mcu::Solo + 4 && e.down);
+        e = d.decode({0xB0, 0x2F, 0x03});
+        QVERIFY(e.kind == Event::Button && e.index == mcu::Solo + 4 && !e.down);
+        d.decode({0xB0, 0x0F, 0x02});
+        e = d.decode({0xB0, 0x2F, 0x40});
+        QVERIFY(e.kind == Event::Touch && e.index == 2 && e.down);
+        e = d.decode({0xB0, 0x2F, 0x45});
+        QVERIFY(e.kind == Event::Button && e.index == mcu::VPotPush + 2);
+        QCOMPARE(d.decode({0xB0, 0x03, 0x40}).kind, Event::None);
+        e = d.decode({0xB0, 0x23, 0x20});
+        QVERIFY(e.kind == Event::Fader && e.index == 3 && e.value == (0x40 << 7 | 0x20));
+        e = d.decode({0xB0, 0x41, 0x45});
+        QVERIFY(e.kind == Event::VPot && e.index == 1 && e.value == 5);
+        QCOMPARE(d.decode({0xB0, 0x41, 0x03}).value, -3);
+        e = d.decode({0xB0, 0x0D, 0x42});
+        QVERIFY(e.kind == Event::Jog && e.value == 2);
+        e = d.decode({0xB0, 0x4C, 0x01});  // the scroll V-Pot
+        QVERIFY(e.kind == Event::Jog && e.value == -1);
+        auto press = [&](int zone, int port) {
+            d.decode({0xB0, 0x0F, uint8_t(zone)});
+            return d.decode({0xB0, 0x2F, uint8_t(0x40 | port)});
+        };
+        QCOMPARE(press(0x0E, 4).index, int(mcu::Play));
+        QCOMPARE(press(0x0E, 3).index, int(mcu::Stop));
+        QCOMPARE(press(0x0A, 3).index, int(mcu::BankRight));
+        QCOMPARE(press(0x0F, 0).index, int(hui::ReturnToZero));
+        QCOMPARE(press(0x0F, 1).index, int(hui::GoToEnd));
+        QCOMPARE(press(0x0F, 3).index, int(mcu::Cycle));
+        QCOMPARE(press(0x18, 3).index, int(hui::AutomationOff));
+        QCOMPARE(press(0x18, 5).index, int(mcu::Touch));
+        QCOMPARE(press(0x14, 0).index, int(mcu::Marker));  // the keypad's Enter
+        QCOMPARE(press(0x08, 3).index, int(mcu::Undo));
+        QCOMPARE(press(0x0B, 0).kind, Event::None);  // nothing of Montage's
+        QVERIFY(hui::isPingReply({0x90, 0x00, 0x7F}) && !hui::isPingReply({0x90, 0x00, 0x00}));
+        QVERIFY(hui::isSystemReset({0xFF}));
+        // Lights: the same zone and port as the button.
+        QCOMPARE(hui::portOf(mcu::Mute + 5).zone, 5);
+        QCOMPARE(hui::portOf(mcu::Mute + 5).port, 2);
+        QCOMPARE(hui::portOf(mcu::Stop).zone, 0x0E);
+        QCOMPARE(hui::portOf(mcu::SmpteLed).zone, 0x16);
+        QCOMPARE(hui::portOf(mcu::Flip).zone, -1);
+        QCOMPARE(hui::noteOf(0, 0), -1);  // (the fader's touch)
+
+        // ---- What it is told.
+        QCOMPARE(hui::ping(), (MidiMessage{0x90, 0x00, 0x00}));
+        QCOMPARE(hui::fader(2, 0x40 << 7 | 0x20), (std::vector<MidiMessage>{{0xB0, 0x02, 0x40}, {0xB0, 0x22, 0x20}}));
+        QCOMPARE(hui::led(0x0E, 4, true), (std::vector<MidiMessage>{{0xB0, 0x0C, 0x0E}, {0xB0, 0x2C, 0x44}}));
+        QCOMPARE(hui::led(3, 2, false)[1], (MidiMessage{0xB0, 0x2C, 0x02}));
+        QCOMPARE(hui::zoneOff(0x18).size(), size_t(9));
+        QCOMPARE(hui::ring(3, 6), (MidiMessage{0xB0, 0x13, 0x06}));
+        QCOMPARE(hui::meter(1, 1, 12), (MidiMessage{0xA0, 0x01, 0x1C}));
+        QCOMPARE(hui::meter(1, 0, 13), (MidiMessage{0xA0, 0x01, 0x0C}));
+        QCOMPARE(hui::stripText(0, "Dialogue A"), (MidiMessage{0xF0, 0x00, 0x00, 0x66, 0x05, 0x00, 0x10, 0x00, 'D', 'i', 'a', 'l', 0xF7}));
+        QCOMPARE(hui::stripText(8, "1"), (MidiMessage{0xF0, 0x00, 0x00, 0x66, 0x05, 0x00, 0x10, 0x08, '1', ' ', ' ', ' ', 0xF7}));
+        const MidiMessage zone = hui::display(5, "a\\b~");
+        QCOMPARE(zone.size(), size_t(6 + 2 + 10 + 1));
+        QCOMPARE(std::string(zone.begin() + 8, zone.end() - 1), std::string("a/b-      "));
+        QCOMPARE(hui::fit("Ça va", 4), std::string("?a v"));
+        QCOMPARE(hui::fit("ab", 4), std::string("ab  "));
+        // Timecode: the rightmost digit first, a point after the hours, minutes and seconds.
+        QCOMPARE(hui::timecode("01:02:03:04"),
+                 (std::vector<MidiMessage>{{0xF0, 0x00, 0x00, 0x66, 0x05, 0x00, 0x11, 0x04, 0x00, 0x13, 0x00, 0x12, 0x00, 0x11, 0x00, 0xF7}}));
+        QCOMPARE(hui::timecode("00:00:00;12")[0][7], uint8_t(0x02));
+        QCOMPARE(hui::timecode("00:00:00;12")[0][9], uint8_t(0x10));
+        QVERIFY(hui::timecode("").empty());
+        const MidiMessage shortTc = hui::timecode("12:34")[0];
+        QCOMPARE(MidiMessage(shortTc.begin() + 7, shortTc.end() - 1), (MidiMessage{0x04, 0x03, 0x12, 0x01}));
+        QCOMPARE(hui::timecode("100:00:00:00")[0].size(), size_t(6 + 1 + 8 + 1));  // the last eight digits
     }
 
     void captionPlacement() {
