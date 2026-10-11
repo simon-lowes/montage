@@ -8,11 +8,13 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
-#include <QTemporaryFile>
+#include <QRandomGenerator>
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <map>
 #include <set>
+#include <thread>
 
 #ifdef MONTAGE_WITH_C2PA
 #include <c2pa.h>
@@ -362,21 +364,38 @@ bool signContentCredentials(const std::string& path, const Provenance& provenanc
     }
     // Signed into a new copy beside it, which then takes the file's place (the file is untouched on failure).
     QFile source(QString::fromStdString(path));
-    QTemporaryFile dest(QString::fromStdString(path) + QStringLiteral(".signing-XXXXXX"));
-    bool ok = source.open(QIODevice::ReadOnly) && dest.open();
+    // A plain file rather than a QTemporaryFile, whose handle Windows may still hold when it is renamed.
+    QFile dest;
+    for (int i = 0; i < 100 && !dest.isOpen(); ++i) {
+        dest.setFileName(QString::fromStdString(path) + QStringLiteral(".signing-%1").arg(QRandomGenerator::global()->generate(), 0, 36));
+        dest.open(QIODevice::ReadWrite | QIODevice::NewOnly);
+    }
+    bool ok = source.open(QIODevice::ReadOnly) && dest.isOpen();
     why = ok ? std::string() : "Cannot write beside " + path;
     if (ok) why = signStream(builder, format.c_str(), &source, &dest, sign), ok = why.empty();
     c2pa_free(builder);
     c2pa_free(sign);
     const QFileDevice::Permissions permissions = source.permissions();
     source.close();
-    if (!ok) return fail(why);
     dest.close();
-    dest.setPermissions(permissions);  // (a temporary file is the owner's alone)
+    if (!ok) {
+        if (dest.exists()) dest.remove();
+        return fail(why);
+    }
+    dest.setPermissions(permissions);  // (as the file was)
+    // Windows refuses to replace a file something has open for a moment (a virus scanner looking at the new copy):
+    // tried again for a second or so.
     std::error_code ec;
-    std::filesystem::rename(std::filesystem::path(dest.fileName().toStdU16String()), std::filesystem::path(QString::fromStdString(path).toStdU16String()), ec);
-    if (ec) return fail("Cannot replace " + path + " with its signed copy: " + ec.message());
-    dest.setAutoRemove(false);
+    const std::filesystem::path from(dest.fileName().toStdU16String()), to(QString::fromStdString(path).toStdU16String());
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        std::filesystem::rename(from, to, ec);
+        if (!ec) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    if (ec) {
+        dest.remove();
+        return fail("Cannot replace " + path + " with its signed copy: " + ec.message());
+    }
     return true;
 }
 
