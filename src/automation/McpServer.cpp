@@ -2217,21 +2217,24 @@ void McpServer::Impl::addTools() {
                 if (!names.contains(m)) throw ArgError{QStringLiteral("\"mode\" must be off, read, write, latch or touch")};
                 return int(names.indexOf(m));
             };
-            auto points = [&](const QJsonArray& pts, const QString& key, Param& lane, double lo, double hi, bool hold) {
+            // (hold: a switch's keys hold to the next; whole: its values are whole numbers, a mute's 0 or 1, a choice's index)
+            auto points = [&](const QJsonArray& pts, const QString& key, Param& lane, double lo, double hi, bool hold, bool whole = true) {
                 if (pts.isEmpty()) return;
                 std::vector<Keyframe> keys;
                 for (const auto& v : pts) {
                     const QJsonArray pt = v.toArray();
                     if (pt.size() != 2) throw ArgError{QStringLiteral("\"%1\" points are [time, value]").arg(key)};
                     Keyframe k{timeArg(pt.at(0), s, key.toLatin1().constData()), std::clamp(pt.at(1).toDouble(), lo, hi)};
-                    if (hold) k.interp = Interp::Hold, k.v = std::round(k.v);  // a switch (0 or 1) or a choice
+                    if (hold) k.interp = Interp::Hold;
+                    if (hold && whole) k.v = std::round(k.v);
                     keys.push_back(k);
                 }
                 std::sort(keys.begin(), keys.end(), [](const Keyframe& x, const Keyframe& y) { return x.t < y.t; });
                 // A switch stays as it was before its first point (a lane's first key otherwise reaches back to the start).
                 const FrameTime first = keys.front().t;
                 if (hold && first > 0 && std::none_of(lane.keys.begin(), lane.keys.end(), [&](const Keyframe& k) { return k.t < first; })) {
-                    Keyframe before{first - 1, std::round(lane.animated() ? lane.at(first - 1) : lane.value)};
+                    const double was = lane.animated() ? lane.at(first - 1) : lane.value;
+                    Keyframe before{first - 1, whole ? std::round(was) : was};
                     before.interp = Interp::Hold;
                     keys.insert(keys.begin(), before);
                 }
@@ -2257,21 +2260,22 @@ void McpServer::Impl::addTools() {
                     const auto e = std::find_if(chain.begin(), chain.end(), [id](const Effect& x) { return x.id == id; });
                     if (e == chain.end()) throw ArgError{QStringLiteral("No insert effect %1 here").arg(id)};
                     const std::string param = io.value("param").toString().trimmed().toStdString();
-                    double lo = -1e12, hi = 1e12, def = 0;
-                    bool hold = false, known = e->type == "plugin" && param.rfind("param.", 0) == 0;
-                    if (const EffectInfo* info = findEffectInfo(e->type))
-                        for (const ParamInfo& pi : info->params)
-                            if (pi.name == param && pi.kind != ParamKind::Color) {
-                                lo = pi.min, hi = pi.max, def = pi.def, known = true;
-                                hold = pi.kind == ParamKind::Bool || pi.kind == ParamKind::Choice;
-                            }
+                    // The parameter as the Inspector lists it (a plugin's as recorded when it was added): its range, and
+                    // whether it is a switch (on/off, a choice, a plugin's stepped parameter at its own values).
+                    double lo = 0, hi = 0, def = 0;
+                    bool hold = false, whole = false, known = false;
+                    for (const ParamInfo& pi : effectParams(*e))
+                        if (pi.name == param && pi.kind != ParamKind::Color) {
+                            lo = pi.min, hi = pi.max, def = pi.def, known = true;
+                            whole = pi.kind == ParamKind::Bool || pi.kind == ParamKind::Choice;
+                            hold = whole || (e->type == "plugin" && pi.step >= 1);
+                        }
                     if (!known) throw ArgError{QStringLiteral("%1 has no parameter %2").arg(QString::fromStdString(e->type), QString::fromStdString(param))};
                     const QJsonArray pts = io.value("points").toArray();
-                    if (!e->params.count(param))  // not set yet: its default (a plugin's first point) outside the points
-                        e->params[param] = Param(e->type == "plugin" && !pts.isEmpty() ? pts.at(0).toArray().at(1).toDouble() : def);
+                    if (!e->params.count(param)) e->params[param] = Param(def);  // not set yet: its default outside the points
                     Param& lane = e->params[param];
                     if (io.value("clear").toBool()) lane.keys.clear();
-                    points(pts, QStringLiteral("points"), lane, lo, hi, hold);
+                    points(pts, QStringLiteral("points"), lane, lo, hi, hold, whole);
                 }
             };
             auto describeInserts = [&](const std::vector<Effect>& chain) {

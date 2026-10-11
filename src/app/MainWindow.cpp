@@ -382,6 +382,7 @@ void MainWindow::buildPanels() {
     inspector_ = new InspectorWidget(state_, this);
     scopes_ = new ScopesWidget(this);
     mixer_ = new MixerPanel(state_, this);
+    connect(mixer_, &MixerPanel::liveMix, program_, &PlaybackController::setLiveMix);  // an automation pass heard
     connect(mixer_, &MixerPanel::effectsRequested, this, [this] {
         inspectorDock_->show();
         inspectorDock_->raise();

@@ -408,17 +408,25 @@ void PlaybackController::setProject(const Project& p, Id sequenceId) {
 }
 
 void PlaybackController::updateHeard() {
-    if (mutedTracks_.empty() || !project_ || !project_->findSequence(sequenceId_)) {
+    if ((mutedTracks_.empty() && !liveMix_) || !project_ || !project_->findSequence(sequenceId_)) {
         heard_ = project_;
         return;
     }
     auto copy = std::make_shared<Project>(*project_);
     Sequence* s = copy->findSequence(sequenceId_);
+    if (liveMix_) liveMix_(*s);
     for (int i : mutedTracks_)
         if (i >= 0 && i < int(s->audioTracks.size())) {
             s->audioTracks[size_t(i)].muted = true;  // (a soloed guide stays soloed, so nothing else comes up)
         }
     heard_ = std::move(copy);
+}
+
+void PlaybackController::setLiveMix(const std::function<void(Sequence&)>& apply) {
+    if (!apply && !liveMix_) return;
+    liveMix_ = apply;
+    updateHeard();
+    device_->setProject(heard_);
 }
 
 void PlaybackController::setMutedAudioTracks(const std::vector<int>& tracks) {

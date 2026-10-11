@@ -115,9 +115,7 @@ bool PluginEditorWindow::start(QString* error) {
     idle_->start(30);
     // Settings are saved into the project every few seconds and on close.
     auto* saver = new QTimer(this);
-    connect(saver, &QTimer::timeout, this, [this] {
-        if (!state_->inGesture()) saveSettings();  // not in the middle of a drag or an automation pass
-    });
+    connect(saver, &QTimer::timeout, this, &PluginEditorWindow::saveSettings);
     saver->start(3000);
     connect(state_, &EditorState::projectChanged, this, [this] {
         if (!effect()) {
@@ -155,7 +153,8 @@ void PluginEditorWindow::editorParameter(uint32_t id, double value) {
         const double range = known ? info->second.max - info->second.min : 1;
         const auto stored = e->params.find(key);
         const double before = stored != e->params.end() ? stored->second.at(lt) : known ? info->second.def : value;
-        // Held while the plugin reports the knob grabbed; a plugin that reports no grab counts as held briefly.
+        // Held while the plugin reports the knob grabbed; a plugin that reports no grab counts as held briefly. A
+        // stepped parameter's keys hold, at its own (often 0 to 1) values.
         std::function<bool()> held;
         if (gesture_.count(id)) held = [self = QPointer<PluginEditorWindow>(this), id] { return self && self->gesture_.count(id) > 0; };
         if (state_->captureParameter({clip, eff, key, value, before, std::max(1e-9, std::fabs(range) * 0.001), known && info->second.stepped, held}))

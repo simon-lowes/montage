@@ -12714,6 +12714,39 @@ private slots:
         }
         QVERIFY(tool("montage_automate_track", QJsonObject{{"project", project}, {"inserts", QJsonArray{QJsonObject{{"effect", eqId}, {"param", "nope"}}}}})
                     .value("isError").toBool());
+        // A plugin's parameters as recorded when it was added: a stepped one (0 to 1 here) holds its keys at its own
+        // values, kept within its range; one it does not have is refused.
+        Id pluginId = 0;
+        {
+            Project withPlugin;
+            QVERIFY(loadProject(project.toStdString(), withPlugin));
+            Effect fx = makeEffect(withPlugin, "plugin");
+            ParamInfo stepped;
+            stepped.label = "Mode";
+            stepped.min = 0, stepped.max = 1, stepped.def = 0, stepped.step = 1;
+            fx.params["param.7"] = Param(0);
+            fx.strings["meta.7"] = pluginParamMeta(stepped);
+            pluginId = fx.id;
+            withPlugin.active()->audioTracks.at(0).effects.push_back(fx);
+            QVERIFY(saveProject(withPlugin, project.toStdString()));
+        }
+        r = tool("montage_automate_track",
+                 QJsonObject{{"project", project}, {"inserts", QJsonArray{QJsonObject{{"effect", double(pluginId)}, {"param", "param.7"},
+                                                                                     {"points", QJsonArray{QJsonArray{0.5, 0.333}, QJsonArray{1, 5}}}}}}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        {
+            Project mixed;
+            QVERIFY(loadProject(project.toStdString(), mixed));
+            for (const Effect& e : mixed.active()->audioTracks.at(0).effects)
+                if (e.id == pluginId) {
+                    const Param& lane = e.params.at("param.7");
+                    QCOMPARE(lane.keys.size(), size_t(3));  // a key just before the first point holding what was there
+                    QVERIFY(lane.keys[1].interp == Interp::Hold && std::fabs(lane.keys[1].v - 0.333) < 1e-9 && lane.keys[2].v == 1);
+                }
+        }
+        QVERIFY(tool("montage_automate_track", QJsonObject{{"project", project}, {"inserts", QJsonArray{QJsonObject{{"effect", double(pluginId)},
+                                                                                                                {"param", "param.9"}}}}})
+                    .value("isError").toBool());
         QVERIFY(tool("montage_automate_track", QJsonObject{{"project", project}, {"inserts", QJsonArray{QJsonObject{{"effect", 999999}, {"param", "mid_db"}}}}})
                     .value("isError").toBool());
         r = tool("montage_automate_track", QJsonObject{{"project", project}, {"sends", QJsonArray{QJsonObject{{"bus", "Reverb"}, {"remove", true}}}}});

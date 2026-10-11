@@ -8,6 +8,7 @@
 #include <QPointer>
 #include <QTimer>
 #include <QVector>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -68,6 +69,9 @@ public:
     // Audio tracks left out of what is heard (an ADR guide track while recording), the project untouched.
     void setMutedAudioTracks(const std::vector<int>& tracks);
     const std::vector<int>& mutedAudioTracks() const { return mutedTracks_; }
+    // What an automation pass plays while it records (the mixer's controls being written), laid over the sequence
+    // played's sound without changing the project; empty = none.
+    void setLiveMix(const std::function<void(Sequence&)>& apply);
     // An ADR cycle (core/Adr.h): its beeps are heard while it is set; the Program monitor draws its streamer.
     void setAdrCycle(const std::optional<AdrCycle>& cycle);
     const std::optional<AdrCycle>& adrCycle() const { return cycle_; }
@@ -120,8 +124,9 @@ private:
     void updateHeard();
 
     std::shared_ptr<const Project> project_;
-    std::shared_ptr<const Project> heard_;  // project_, or a copy with mutedTracks_ muted
+    std::shared_ptr<const Project> heard_;  // project_, or a copy with mutedTracks_ muted and liveMix_ laid over
     std::vector<int> mutedTracks_;
+    std::function<void(Sequence&)> liveMix_;
     std::optional<AdrCycle> cycle_;
     Id sequenceId_ = 0;
     double scale_ = 0.5;

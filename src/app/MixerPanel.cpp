@@ -40,10 +40,13 @@ bool readsLanes(const Bus& b) {
     return m == AutomationMode::Read || m == AutomationMode::Latch || m == AutomationMode::Touch;
 }
 bool writes(AutomationMode m) { return m == AutomationMode::Write || m == AutomationMode::Latch || m == AutomationMode::Touch; }
-// A switch's lane as written (a mute, an insert's on/off or choice): each key holds to the next, at a whole value (a
-// mute's 0 or 1).
-Param switchLane(Param lane) {
-    for (Keyframe& k : lane.keys) k.interp = Interp::Hold, k.v = std::round(k.v);
+// A switch's lane as written (a mute, an insert's on/off, choice or stepped parameter): each key holds to the next, at
+// a whole value where the values are whole (a mute's 0 or 1, a choice's index).
+Param switchLane(Param lane, bool whole = true) {
+    for (Keyframe& k : lane.keys) {
+        k.interp = Interp::Hold;
+        if (whole) k.v = std::round(k.v);
+    }
     return lane;
 }
 
@@ -129,29 +132,16 @@ MixerPanel::MixerPanel(EditorState* state, QWidget* parent) : QWidget(parent), s
     connect(state_, &EditorState::projectChanged, this, &MixerPanel::syncToProject);
     connect(state_, &EditorState::sequenceSwitched, this, &MixerPanel::syncToProject);
     connect(state_, &EditorState::playheadChanged, this, [this] { followAutomation(); });
-    // Something else ends the automation pass's gesture. An edit (or another gesture, or a save) goes under the pass:
-    // the project as it was plays while it is made and the pass, recording all along, takes the gesture back at the
-    // next frame. Undo starts the pass over; another sequence made active ends it there.
-    connect(state_, &EditorState::gestureInterrupted, this, [this](EditorState::Interruption why) {
+    // Another sequence made active during an automation pass: what the pass wrote is kept on its own sequence and
+    // recording starts again on the new one. Another project opened takes the pass with it.
+    connect(state_, &EditorState::sequenceSwitched, this, [this] {
         if (!recordingAutomation()) return;
-        switch (why) {
-            case EditorState::Interruption::Edit:
-                if (!suspended_) {
-                    suspended_ = true;
-                    state_->endGesture(false);
-                }
-                break;
-            case EditorState::Interruption::Switch:
-                if (suspended_) discardPass();
-                else finishPass(lastTick_, false);
-                resume_ = true;
-                break;
-            case EditorState::Interruption::Undo:
-                discardPass();
-                resume_ = true;
-                break;
-            case EditorState::Interruption::Replace: discardPass(); break;
+        if (state_->projectGeneration() != passGeneration_) {
+            discardPass();
+            return;
         }
+        finishPass(lastTick_, false);
+        resume_ = true;
     });
     state_->setParameterCapture([self = QPointer<MixerPanel>(this)](const EditorState::ParameterMove& m) {
         return self && self->captureInsert(m);
@@ -558,7 +548,7 @@ bool MixerPanel::recordingLane(const QString& id) const {
 
 bool MixerPanel::captureInsert(const EditorState::ParameterMove& m) {
     const Sequence* seq = state_->sequence();
-    if (!recordingAutomation() || stopAt_ >= 0 || !seq || !m.owner || m.owner == seq->id) return false;  // the master has no mode
+    if (!recordingAutomation() || !seq || !m.owner || m.owner == seq->id) return false;  // the master has no mode
     // A track or bus writing its automation.
     AutomationMode mode = AutomationMode::Off;
     for (const Track& tr : seq->audioTracks)
@@ -569,9 +559,8 @@ bool MixerPanel::captureInsert(const EditorState::ParameterMove& m) {
     const QString id = QStringLiteral("insert-%1-%2-%3").arg(m.owner).arg(m.effect).arg(QString::fromStdString(m.param));
     auto lane = std::find_if(lanes_.begin(), lanes_.end(), [&](const LaneRecording& l) { return l.id == id; });
     if (lane == lanes_.end()) {
-        // Its lane as it was before the pass (the project plays the pass meanwhile).
-        const Sequence* base = state_->gestureBase();
-        const Effect* e = base ? edit::ownedEffect(const_cast<Sequence&>(*base), m.owner, m.effect) : nullptr;
+        // Its lane as it is (the pass plays over the project without changing it).
+        const Effect* e = edit::ownedEffect(const_cast<Sequence&>(*seq), m.owner, m.effect);
         if (!e) return false;
         Param before(m.before);
         if (const auto p = e->params.find(m.param); p != e->params.end()) before = p->second;
@@ -581,7 +570,8 @@ bool MixerPanel::captureInsert(const EditorState::ParameterMove& m) {
         const FrameTime window = std::max<FrameTime>(1, second / 2);  // a control without a held state counts as held this long
         const Id owner = m.owner, effect = m.effect;
         const std::string param = m.param;
-        lanes_.push_back({id, AutomationRecorder(rec, before, before.value, lastTick_, second), m.toggle ? 0.25 : std::max(1e-9, m.tolerance),
+        lanes_.push_back({id, AutomationRecorder(rec, before, before.value, lastTick_, second),
+                          m.toggle && m.whole ? 0.25 : std::max(1e-9, m.tolerance),
                           m.toggle,
                           [this, id] {
                               const auto it = insertMoves_.find(id);
@@ -596,20 +586,18 @@ bool MixerPanel::captureInsert(const EditorState::ParameterMove& m) {
                           [owner, effect, param](Sequence& s, double v) {
                               if (Effect* fx = edit::ownedEffect(s, owner, effect)) fx->params[param] = Param(v);
                           },
-                          [owner, effect, param](Sequence& s, const Param& written) {
-                              if (Effect* fx = edit::ownedEffect(s, owner, effect)) fx->params[param] = written;
+                          [owner, effect, param](Sequence& s) -> Param* {
+                              Effect* fx = edit::ownedEffect(s, owner, effect);
+                              return fx ? &fx->params[param] : nullptr;
                           }});
+        lanes_.back().whole = m.toggle && m.whole;
         lane = lanes_.end() - 1;
     }
     insertMoves_[id] = {m.value, lastTick_, m.held};
     // Heard at once, not at the next frame.
     pendingLive_[id] = {lane->live, m.value};
     liveState_.clear();
-    if (!suspended_)
-        state_->updateGesture([base = lastLive_, pending = pendingLive_](Project& p, Sequence& s) {
-            if (base) base(p, s);
-            for (const auto& [key, move] : pending) move.first(s, move.second);
-        });
+    emit liveMix(liveOverlay());
     return true;
 }
 
@@ -949,6 +937,7 @@ void MixerPanel::refresh() {
         masterFader_->setValue(int(std::lround(std::clamp(seq->masterVolumeDb, -60.0, 12.0) * 10.0)));
     }
     masterDb_->setText(dbText(seq->masterVolumeDb));
+    if (recordingAutomation()) restoreControls();  // (the project does not hold what a pass plays)
 }
 
 void MixerPanel::setVolume(int index, double db) {
@@ -1079,7 +1068,7 @@ void MixerPanel::followAutomation() {
 
 void MixerPanel::playbackStarted(FrameTime t) {
     const Sequence* seq = state_->sequence();
-    if (recordingAutomation() || !seq || state_->inGesture()) return;
+    if (recordingAutomation() || !seq) return;
     for (size_t i = 0; i < seq->audioTracks.size() && i < strips_.size(); ++i) {
         const Track& tr = seq->audioTracks[i];
         const AutomationMode m = trackAutomation(tr);
@@ -1099,9 +1088,10 @@ void MixerPanel::playbackStarted(FrameTime t) {
     const FrameTime second = FrameTime(std::lround(seq->fpsValue()));
     auto addLane = [&](const QString& id, AutomationMode m, const Param& lane, double still, FrameTime glide, double tolerance, bool hold,
                        std::function<double()> value, std::function<bool()> held, std::function<void(double)> show,
-                       std::function<void(Sequence&, double)> live, std::function<void(Sequence&, const Param&)> done) {
+                       std::function<void(Sequence&, double)> live, std::function<Param*(Sequence&)> laneIn) {
         lanes_.push_back({id, AutomationRecorder(m, lane, still, t, glide), tolerance, hold, std::move(value), std::move(held), std::move(show),
-                          std::move(live), std::move(done)});
+                          std::move(live), std::move(laneIn)});
+        lanes_.back().whole = hold;  // (mutes: 0 or 1)
     };
     auto switchMode = [](AutomationMode m) { return m == AutomationMode::Touch ? AutomationMode::Latch : m; };
     auto setSlider = [](QAbstractSlider* sl, double v, double scale, double lo, double hi) {
@@ -1129,11 +1119,7 @@ void MixerPanel::playbackStarted(FrameTime t) {
                     s.audioTracks[size_t(index)].muteAuto = Param();
                     s.audioTracks[size_t(index)].muted = v >= 0.5;
                 },
-                [index](Sequence& s, const Param& lane) {
-                    if (index >= int(s.audioTracks.size())) return;
-                    s.audioTracks[size_t(index)].muteAuto = lane.animated() ? lane : Param();
-                    s.audioTracks[size_t(index)].muted = false;
-                });
+                [index](Sequence& s) { return index < int(s.audioTracks.size()) ? &s.audioTracks[size_t(index)].muteAuto : nullptr; });
             lanes_.back().valid = [index, id = tr.id](const Sequence& s) {
                 return index < int(s.audioTracks.size()) && s.audioTracks[size_t(index)].id == id;
             };
@@ -1163,8 +1149,9 @@ void MixerPanel::playbackStarted(FrameTime t) {
                 [sendIn](Sequence& s, double v) {
                     if (Send* sd = sendIn(s)) sd->levelAuto = Param(), sd->levelDb = v;
                 },
-                [sendIn, still = tr.sends[k].levelDb](Sequence& s, const Param& lane) {
-                    if (Send* sd = sendIn(s)) sd->levelAuto = lane.animated() ? lane : Param(), sd->levelDb = still;
+                [sendIn](Sequence& s) {
+                    Send* sd = sendIn(s);
+                    return sd ? &sd->levelAuto : nullptr;
                 });
             lanes_.back().valid = [index, send, id = tr.id, bus = tr.sends[k].bus](const Sequence& s) {
                 if (index >= int(s.audioTracks.size()) || s.audioTracks[size_t(index)].id != id) return false;
@@ -1206,8 +1193,9 @@ void MixerPanel::playbackStarted(FrameTime t) {
             [busIn](Sequence& s, double v) {
                 if (Bus* x = busIn(s)) x->volumeAuto = Param(), x->volumeDb = v;
             },
-            [busIn, still = b.volumeDb](Sequence& s, const Param& lane) {
-                if (Bus* x = busIn(s)) x->volumeAuto = lane.animated() ? lane : Param(), x->volumeDb = still;
+            [busIn](Sequence& s) {
+                Bus* x = busIn(s);
+                return x ? &x->volumeAuto : nullptr;
             });
         if (!surroundMix)
             addLane(
@@ -1220,8 +1208,9 @@ void MixerPanel::playbackStarted(FrameTime t) {
                 [busIn](Sequence& s, double v) {
                     if (Bus* x = busIn(s)) x->panAuto = Param(), x->pan = v;
                 },
-                [busIn, still = b.pan](Sequence& s, const Param& lane) {
-                    if (Bus* x = busIn(s)) x->panAuto = lane.animated() ? lane : Param(), x->pan = still;
+                [busIn](Sequence& s) {
+                    Bus* x = busIn(s);
+                    return x ? &x->panAuto : nullptr;
                 });
         if (!b.muted) {
             const QString id = QStringLiteral("bus-mute-%1").arg(bus);
@@ -1237,14 +1226,16 @@ void MixerPanel::playbackStarted(FrameTime t) {
                 [busIn](Sequence& s, double v) {
                     if (Bus* x = busIn(s)) x->muteAuto = Param(), x->muted = v >= 0.5;
                 },
-                [busIn](Sequence& s, const Param& lane) {
-                    if (Bus* x = busIn(s)) x->muteAuto = lane.animated() ? lane : Param(), x->muted = false;
+                [busIn](Sequence& s) {
+                    Bus* x = busIn(s);
+                    return x ? &x->muteAuto : nullptr;
                 });
         }
         if (m == AutomationMode::Write) busesFromWrite_.push_back(bus);
     }
     if (!recordingAutomation()) return;
-    state_->beginGesture(tr("Write Automation"));
+    passSeq_ = seq->id;
+    passGeneration_ = state_->projectGeneration();
     liveState_.clear();
     touched_.clear();
     for (Strip& s : strips_) s.automation->setEnabled(false);
@@ -1253,8 +1244,7 @@ void MixerPanel::playbackStarted(FrameTime t) {
 }
 
 void MixerPanel::playbackPosition(FrameTime t) {
-    if (stopAt_ >= 0) return;  // stopped, waiting to write the pass
-    if (resume_ && !recordingAutomation() && !state_->inGesture()) {
+    if (resume_ && !recordingAutomation()) {
         resume_ = false;
         playbackStarted(t);
         return;
@@ -1276,7 +1266,6 @@ void MixerPanel::playbackPosition(FrameTime t) {
         discardPass();
         return;
     }
-    if (suspended_ && !state_->inGesture()) resumePass();
     struct Live {
         int track;
         bool volume, pan;
@@ -1303,6 +1292,8 @@ void MixerPanel::playbackPosition(FrameTime t) {
             st.pan->setValue(int(std::lround(std::clamp(showPan, -1.0, 1.0) * 100.0)));
             st.panLabel->setText(panText(st.pan->value()));
         }
+        r.shownDb = r.volume.writing() || st.fader->isSliderDown() ? db : showDb;
+        r.shownPan = r.pan.writing() || st.pan->isSliderDown() ? pan : showPan;
         Live lv{r.track, r.volume.writing(), r.pan.writing(), db, pan};
         if (r.surround) {
             // The panner: written while dragged (or all along in Write), showing what was there otherwise.
@@ -1317,6 +1308,7 @@ void MixerPanel::playbackPosition(FrameTime t) {
             lv.position = now;
             lv.position.width = r.position.width, lv.position.lfeDb = r.position.lfeDb, lv.position.object = r.position.object;
             if (!held && !(lv.x && lv.y && lv.z)) st.surround->setPan(shown);
+            r.shownPosition = held ? now : shown;
             key += QStringLiteral("s%1%2%3,%4,%5,%6;").arg(int(lv.x)).arg(int(lv.y)).arg(int(lv.z)).arg(now.x).arg(now.y).arg(now.z);
         }
         live.push_back(lv);
@@ -1329,13 +1321,14 @@ void MixerPanel::playbackPosition(FrameTime t) {
         const bool held = lr.held();
         const double shown = lr.rec.tick(t, v, held);
         if (!lr.rec.writing() && !held) lr.show(shown);
+        lr.shown = lr.rec.writing() || held ? v : shown;
         if (lr.rec.writing()) laneLive.emplace_back(lr.live, v);
         key += QStringLiteral("%1:%2,%3;").arg(lr.id).arg(int(lr.rec.writing())).arg(v);
     }
     if (key == liveState_) return;
     liveState_ = key;
     // What plays meanwhile: the fader on a lane being written, the lanes as they were otherwise.
-    lastLive_ = [live, laneLive](Project&, Sequence& s) {
+    lastLive_ = [live, laneLive](Sequence& s) {
         for (const auto& [apply, v] : laneLive) apply(s, v);
         for (const Live& l : live) {
             if (l.track >= int(s.audioTracks.size())) continue;
@@ -1348,35 +1341,47 @@ void MixerPanel::playbackPosition(FrameTime t) {
             if (l.surround) tr.surround.width = l.position.width, tr.surround.lfeDb = l.position.lfeDb, tr.surround.object = l.position.object;
         }
     };
-    if (!suspended_) state_->updateGesture(lastLive_);  // (suspended under another gesture: heard once it ends)
+    emit liveMix(liveOverlay());
+}
+
+std::function<void(Sequence&)> MixerPanel::liveOverlay() const {
+    if (pendingLive_.empty()) return lastLive_;
+    return [base = lastLive_, pending = pendingLive_](Sequence& s) {
+        if (base) base(s);
+        for (const auto& [key, move] : pending) move.first(s, move.second);
+    };
+}
+
+Sequence MixerPanel::heard() const {
+    Sequence s = state_->sequence() ? *state_->sequence() : Sequence();
+    if (const auto apply = liveOverlay()) apply(s);
+    return s;
+}
+
+void MixerPanel::restoreControls() {
+    // What the pass shows on its controls, put back after the strips were refreshed or rebuilt meanwhile.
+    for (const Recording& r : recording_) {
+        if (r.track >= int(strips_.size())) continue;
+        Strip& st = strips_[size_t(r.track)];
+        if (!st.fader->isSliderDown()) {
+            const QSignalBlocker block(st.fader);
+            st.fader->setValue(int(std::lround(std::clamp(r.shownDb, -60.0, 12.0) * 10.0)));
+            st.dbLabel->setText(dbText(r.shownDb));
+        }
+        if (!st.pan->isSliderDown()) {
+            const QSignalBlocker block(st.pan);
+            st.pan->setValue(int(std::lround(std::clamp(r.shownPan, -1.0, 1.0) * 100.0)));
+            st.panLabel->setText(panText(st.pan->value()));
+        }
+        if (r.surround && st.surround && !st.surround->isDragging()) st.surround->setPan(r.shownPosition);
+    }
+    for (const LaneRecording& lr : lanes_)
+        if (!lr.held()) lr.show(lr.shown);
 }
 
 void MixerPanel::playbackStopped(FrameTime t) {
     resume_ = false;
-    if (!recordingAutomation()) return;
-    stopAt_ = t;
-    finishWhenFree();
-}
-
-void MixerPanel::finishWhenFree() {
-    if (!recordingAutomation() || stopAt_ < 0) return;
-    if (suspended_) {
-        // Another gesture (a drag) is under way: the pass is written once it ends.
-        if (state_->inGesture()) {
-            QTimer::singleShot(50, this, [this] { finishWhenFree(); });
-            return;
-        }
-        resumePass();
-    }
-    const FrameTime t = stopAt_;
-    stopAt_ = -1;
-    finishPass(t, true);
-}
-
-void MixerPanel::resumePass() {
-    state_->beginGesture(tr("Write Automation"));
-    suspended_ = false;
-    liveState_.clear();
+    if (recordingAutomation()) finishPass(t, true);
 }
 
 void MixerPanel::clearPass() {
@@ -1388,76 +1393,68 @@ void MixerPanel::clearPass() {
     lastLive_ = nullptr;
     insertMoves_.clear();
     pendingLive_.clear();
-    suspended_ = false;
-    stopAt_ = -1;
 }
 
 void MixerPanel::discardPass() {
-    if (!suspended_ && state_->inGesture()) state_->endGesture(false);
     clearPass();
+    emit liveMix({});
     refresh();
 }
 
 void MixerPanel::finishPass(FrameTime t, bool final) {
-    struct Done {
-        int track;
-        Param volume, pan;
-        double db, panValue;
-        bool fromWrite;
-        Param x, y, z;
-        SurroundPan position;
-    };
-    std::vector<Done> done;
-    bool wrote = false;
-    for (Recording& r : recording_) {
-        const bool v = r.volume.wrote(), p = r.pan.wrote();
-        const bool px = r.surround && r.x.wrote(), py = r.surround && r.y.wrote(), pz = r.surround && r.z.wrote();
-        wrote = wrote || v || p || px || py || pz || r.changedOther;
-        done.push_back({r.track, v ? r.volume.finish(t, 0.1) : r.volumeLane, p ? r.pan.finish(t, 0.005) : r.panLane, r.volumeDb, r.panValue,
-                        final && r.mode == AutomationMode::Write, px ? r.x.finish(t, 0.005) : r.xLane, py ? r.y.finish(t, 0.005) : r.yLane,
-                        pz ? r.z.finish(t, 0.005) : r.zLane, r.position});
+    // One edit of the project as it is now (edits made during the pass included): the lanes the pass wrote, laid over
+    // what those lanes hold now, on the sequence it was recorded on. Lanes nothing was written to are left alone.
+    emit liveMix({});
+    if (state_->projectGeneration() == passGeneration_) {
+        state_->edit(tr("Write Automation"), [this, t, final](Project& p, Sequence&) {
+            Sequence* s = p.findSequence(passSeq_);
+            if (!s) return false;
+            bool wrote = false;
+            auto write = [&](AutomationRecorder& rec, Param& lane, double tolerance, bool hold, bool whole) {
+                if (!rec.wrote()) return;
+                wrote = true;
+                rec.rebase(lane);
+                Param out = rec.finish(t, tolerance);
+                if (hold) out = switchLane(out, whole);
+                if (out.animated() || lane.animated()) lane = out;
+            };
+            for (Recording& r : recording_) {
+                if (r.track >= int(s->audioTracks.size()) || s->audioTracks[size_t(r.track)].id != r.trackId) continue;
+                Track& tr = s->audioTracks[size_t(r.track)];
+                write(r.volume, tr.volumeAuto, 0.1, false, false);
+                write(r.pan, tr.panAuto, 0.005, false, false);
+                if (r.surround) {
+                    write(r.x, tr.surroundXAuto, 0.005, false, false);
+                    write(r.y, tr.surroundYAuto, 0.005, false, false);
+                    write(r.z, tr.surroundZAuto, 0.005, false, false);
+                }
+                if (r.changedOther) {
+                    tr.surround.width = r.position.width, tr.surround.lfeDb = r.position.lfeDb, tr.surround.object = r.position.object;
+                    wrote = true;
+                }
+            }
+            for (LaneRecording& lr : lanes_) {
+                if (lr.valid && !lr.valid(*s)) continue;
+                if (Param* lane = lr.laneIn(*s)) write(lr.rec, *lane, lr.tolerance, lr.hold, lr.whole);
+            }
+            // Write hands over to Touch, so the next pass does not write over this one unless a control is moved.
+            if (wrote && final) {
+                for (const Recording& r : recording_)
+                    if (r.mode == AutomationMode::Write && r.track < int(s->audioTracks.size()) && s->audioTracks[size_t(r.track)].id == r.trackId)
+                        s->audioTracks[size_t(r.track)].automation = int(AutomationMode::Touch);
+                for (Bus& b : s->buses)
+                    if (std::find(busesFromWrite_.begin(), busesFromWrite_.end(), b.id) != busesFromWrite_.end()) b.automation = int(AutomationMode::Touch);
+            }
+            return wrote;
+        });
     }
-    std::vector<std::pair<std::function<void(Sequence&, const Param&)>, Param>> laneDone;
-    for (LaneRecording& lr : lanes_) {
-        if (!lr.rec.wrote()) continue;
-        Param lane = lr.rec.finish(t, lr.tolerance);
-        laneDone.emplace_back(lr.done, lr.hold ? switchLane(lane) : lane);
-    }
-    wrote = wrote || !laneDone.empty();
-    const std::vector<Id> toTouch = final ? busesFromWrite_ : std::vector<Id>();
     clearPass();
-    if (!wrote) {
-        state_->endGesture(false);
-        refresh();
-        return;
-    }
-    // Write hands over to Touch, so the next pass does not write over this one unless a fader is moved.
-    state_->updateGesture([done, laneDone, toTouch](Project&, Sequence& s) {
-        for (const auto& [apply, lane] : laneDone) apply(s, lane);
-        for (Bus& b : s.buses)
-            if (std::find(toTouch.begin(), toTouch.end(), b.id) != toTouch.end()) b.automation = int(AutomationMode::Touch);
-        for (const Done& d : done) {
-            if (d.track >= int(s.audioTracks.size())) continue;
-            Track& tr = s.audioTracks[size_t(d.track)];
-            tr.volumeAuto = d.volume;
-            tr.panAuto = d.pan;
-            tr.volumeDb = d.db;
-            tr.pan = d.panValue;
-            tr.surroundXAuto = d.x;
-            tr.surroundYAuto = d.y;
-            tr.surroundZAuto = d.z;
-            tr.surround.x = d.position.x, tr.surround.y = d.position.y, tr.surround.z = d.position.z;
-            tr.surround.width = d.position.width, tr.surround.lfeDb = d.position.lfeDb, tr.surround.object = d.position.object;
-            if (d.fromWrite) tr.automation = int(AutomationMode::Touch);
-        }
-    });
-    state_->endGesture(true);
     refresh();
 }
 
 void MixerPanel::setSurround(int index, const SurroundPan& pan, bool) {
     // While automation is written the recorder samples the panner's position; its width, LFE and object flag are
-    // kept for the end of the pass. Nothing else is edited meanwhile (an edit would end the pass).
+    // kept for the end of the pass. Other tracks' panners wait for the stop.
     if (recordingAutomation()) {
         bool recorded = false;
         for (Recording& r : recording_)

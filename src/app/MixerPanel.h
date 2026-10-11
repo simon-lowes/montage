@@ -37,11 +37,14 @@ public:
     // Latch or Touch record their fader, pan, mute and send levels, and buses in those modes their fader, pan and mute,
     // kept as one undo step when playback stops. Insert parameters on those tracks and buses moved during the pass (in
     // the Inspector or a plugin's editor) are written too: Touch while moved, Latch and Write from the first move to the
-    // stop. Another edit made meanwhile keeps what the pass has written so far, and the pass carries on after it.
+    // stop. While the pass records, what it plays goes out as liveMix() (laid over the sound, the project unchanged), so
+    // other edits made meanwhile are kept; at the stop the lanes written are laid over the project as it is then.
     void playbackStarted(FrameTime t);
     void playbackPosition(FrameTime t);
     void playbackStopped(FrameTime t);
     bool recordingAutomation() const { return !recording_.empty() || !lanes_.empty(); }
+    // The active sequence as the pass plays it (its live values laid over); the sequence itself outside a pass.
+    Sequence heard() const;
     // Aux sends, as a track strip's "+ Send" menu: to an existing bus, or to a new effects return (its id).
     void addSend(int track, Id bus);
     Id newReturn(int track);
@@ -77,6 +80,9 @@ public:
 signals:
     // The user asked to see a track's, bus's or the master's effects (now in the Inspector).
     void effectsRequested();
+    // What an automation pass plays over the sequence while it records (PlaybackController::setLiveMix); empty when
+    // it ends.
+    void liveMix(const std::function<void(montage::Sequence&)>& apply);
 
 public slots:
     // Master L/R and per-audio-track interleaved L,R linear peaks
@@ -161,10 +167,10 @@ private:
     // Ends the automation pass at `t`, its lanes written as one undo step; `final` (playback stopped) also hands Write
     // over to Touch.
     void finishPass(FrameTime t, bool final);
-    void finishWhenFree();  // finishPass at stopAt_ once no other gesture is under way
-    void resumePass();      // the pass's gesture again, after an edit
     void clearPass();
-    void discardPass();     // ends the pass, writing nothing
+    void discardPass();  // ends the pass, writing nothing
+    std::function<void(Sequence&)> liveOverlay() const;  // what the pass plays now
+    void restoreControls();  // the pass's values back on its controls after a refresh
     // An insert parameter moved during a pass (EditorState::captureParameter): true if this pass writes it.
     bool captureInsert(const EditorState::ParameterMove& move);
     // Faders and pans show the automation at the playhead on tracks that read it.
@@ -197,6 +203,8 @@ private:
         Param xLane, yLane, zLane;          // its lanes before
         bool changedOther = false;          // width, LFE or object changed during the pass
         Id trackId = 0;                     // (an edit that moves the track leaves its lanes as they were)
+        double shownDb = 0, shownPan = 0;   // what the fader and pan show
+        SurroundPan shownPosition;
     };
     std::vector<Recording> recording_;
     // The other lanes written in a pass (track mutes and send levels, bus faders, pans and mutes), each read from its
@@ -210,18 +218,20 @@ private:
         std::function<bool()> held;                             // held (Touch), or first moved (Latch)
         std::function<void(double)> show;                       // the lane shown on it while not written
         std::function<void(Sequence&, double)> live;            // what plays while written
-        std::function<void(Sequence&, const Param&)> done;      // the new lane, the static value as it was
+        std::function<Param*(Sequence&)> laneIn;                // its lane in a sequence (to write at the stop)
         std::function<bool(const Sequence&)> valid;             // still the same control after an edit (empty: always)
+        bool whole = false;                                     // a switch's values are whole numbers
+        double shown = 0;                                       // what its control shows
     };
     std::vector<LaneRecording> lanes_;
     std::set<QString> touched_;       // switches the user changed during the pass (a mute's "move")
     std::vector<Id> busesFromWrite_;  // handed over to Touch when the pass wrote
     QString liveState_;  // what the gesture last applied, to skip repeats
-    std::function<void(Project&, Sequence&)> lastLive_;  // what plays (the last frame's lanes being written)
+    std::function<void(Sequence&)> lastLive_;  // what plays (the last frame's lanes being written)
     FrameTime lastTick_ = 0;  // the frame the pass last played
-    bool resume_ = false;     // the pass was ended (undo, another sequence): start again at the next frame
-    bool suspended_ = false;  // an edit took the pass's gesture: taken back at the next frame
-    FrameTime stopAt_ = -1;   // playback stopped there, the pass waiting for another gesture to end
+    bool resume_ = false;     // the pass was ended by another sequence made active: start again at the next frame
+    Id passSeq_ = 0;          // the sequence the pass records
+    uint64_t passGeneration_ = 0;  // (EditorState::projectGeneration)
     // Insert parameters moved in this pass: the last value, the frame it came at, and whether its control is held.
     struct InsertMove {
         double value = 0;

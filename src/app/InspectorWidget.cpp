@@ -1253,7 +1253,7 @@ void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const 
         if (!target.clip && target.owner) {
             bool taken = false;
             for (const auto& [n, v] : values)
-                taken = state_->captureParameter({target.owner, target.effect, n, v, read(n), tolerance, toggle, held}) || taken;
+                taken = state_->captureParameter({target.owner, target.effect, n, v, read(n), tolerance, toggle, held, toggle}) || taken;
             if (taken) return;
         }
         FrameTime t = target.time();

@@ -899,7 +899,7 @@ private slots:
         for (FrameTime f = 0; f <= 60; ++f) {
             if (f == 20) fader->setValue(-120);
             mixer->playbackPosition(f);
-            if (f == 30) QCOMPARE(a1().volumeDb, -12.0);
+            if (f == 30) QCOMPARE(mixer->heard().audioTracks.at(0).volumeDb, -12.0);  // heard, the project unchanged
         }
         mixer->playbackStopped(60);
         QVERIFY(!mixer->recordingAutomation());
@@ -993,7 +993,7 @@ private slots:
             }
             if (f == 40) level->setSliderDown(false);
             mixer->playbackPosition(f);
-            if (f == 25) QVERIFY(a1().muted);  // heard while it is written
+            if (f == 25) QVERIFY(mixer->heard().audioTracks.at(0).muted && !a1().muted);  // heard while it is written
         }
         mixer->playbackStopped(60);
         QVERIFY(!mixer->recordingAutomation());
@@ -1103,8 +1103,9 @@ private slots:
             s.audioTracks[0].effects.push_back(c);
             return true;
         }));
-        auto value = [&](Id fx, const char* param, FrameTime t) {
-            for (const Effect& e : a1().effects)
+        auto value = [&](Id fx, const char* param, FrameTime t) {  // as heard (the pass plays over the project)
+            const Sequence heard = mixer->heard();
+            for (const Effect& e : heard.audioTracks.at(0).effects)
                 if (e.id == fx) return e.p(param, t, 0);
             return -100.0;
         };
@@ -1116,7 +1117,7 @@ private slots:
         // Nothing is taken outside a pass.
         QVERIFY(!state()->captureParameter({track, eq, "mid_db", 6, 0, 0.048, false, {}}));
         // Touch on A1: the EQ's mid held at +6 dB over frames 10-19, then let go (back to what was there); Channel Tools'
-        // mode (a choice) changed at frame 30, latching to the stop; an edit at frame 40 goes under the pass.
+        // mode (a choice) changed at frame 30, latching to the stop; an edit at frame 40 is kept, the pass carrying on.
         mixer->trackAutomationMode(0)->setCurrentIndex(int(AutomationMode::Touch));
         bool held = false;
         mixer->playbackStarted(0);
@@ -1126,6 +1127,7 @@ private slots:
                 held = true;
                 QVERIFY(state()->captureParameter({track, eq, "mid_db", 6, 0, 0.048, false, [&held] { return held; }}));
                 QCOMPARE(value(eq, "mid_db", f), 6.0);  // heard at once
+                QVERIFY(!lane(eq, "mid_db").animated() && !lane(eq, "mid_db").value);  // the project untouched
             }
             if (f == 20) held = false;
             if (f == 30) QVERIFY(state()->captureParameter({track, ch, "mode", 1, 0, 0.004, true, {}}));
@@ -1165,8 +1167,8 @@ private slots:
         state()->redo();
         state()->redo();
         QVERIFY(lane(eq, "mid_db").animated() && lane(ch, "mode").animated());
-        // Undo during a pass undoes the step before it and starts the pass over. Here the EQ's low band is typed into
-        // the Inspector at frame 15 (counted as held for half a second).
+        // Undo during a pass undoes the step before it; the pass carries on. Here the EQ's low band is typed into the
+        // Inspector at frame 15 (counted as held for half a second).
         state()->inspectChain(track);
         QApplication::processEvents();
         auto* inspector = win_->findChild<InspectorWidget*>();
@@ -1185,26 +1187,76 @@ private slots:
             }
             if (f == 10) {
                 state()->undo();
-                QVERIFY(!mixer->recordingAutomation());
+                QVERIFY(mixer->recordingAutomation());
                 QVERIFY(!lane(eq, "mid_db").animated());  // the last pass undone
             }
+            // A stepped parameter (a plugin's often runs 0 to 1): its keys hold at the values moved to, not rounded.
+            if (f == 25) QVERIFY(state()->captureParameter({track, eq, "mid_q", 0.333, 0.9, 1e-6, true, {}, false}));
             if (f == 15) {
                 QApplication::processEvents();
                 QDoubleSpinBox* low = lowRow();
                 QVERIFY(low);
                 low->setValue(-3);
             }
+            if (f == 20) held = false;
             mixer->playbackPosition(f);
-            if (f == 12) QVERIFY(mixer->recordingAutomation());  // started over
         }
-        held = false;
         mixer->playbackStopped(80);
-        QVERIFY(!lane(eq, "high_db").animated());  // written before the undo: gone
+        QVERIFY(!lane(eq, "mid_db").animated());  // the undone pass stays undone
+        QCOMPARE(lane(eq, "high_db").at(12), -6.0);  // moved before the undo, written
+        {
+            const Param q = lane(eq, "mid_q");
+            QVERIFY(q.animated() && std::fabs(q.at(40) - 0.333) < 1e-9 && std::fabs(q.at(10) - 0.9) < 1e-9);
+            for (const Keyframe& k : q.keys) QCOMPARE(int(k.interp), int(Interp::Hold));
+        }
         const Param lowLane = lane(eq, "low_db");
         QVERIFY(lowLane.animated());
         QCOMPARE(lowLane.at(10), 0.0);
         QCOMPARE(lowLane.at(17), -3.0);
         QVERIFY(std::fabs(lowLane.at(80)) < 1e-9);
+        // An edit during a pass to a lane the pass is not writing (a point added to A1's volume lane) is kept, and a
+        // control the pass writes keeps its value through the refresh that edit causes.
+        mixer->trackAutomationMode(0)->setCurrentIndex(int(AutomationMode::Latch));
+        QSlider* fader = mixer->trackFader(0);
+        mixer->playbackStarted(0);
+        for (FrameTime f = 0; f <= 40; ++f) {
+            if (f == 5) {
+                fader->setSliderDown(true);
+                fader->setValue(-100);
+            }
+            if (f == 8) fader->setSliderDown(false);  // latched at -10 dB
+            if (f == 20) {
+                QVERIFY(state()->edit("Pan point", [](Project&, Sequence& s) {
+                    s.audioTracks[0].panAuto.addKey(30, -1);
+                    return true;
+                }));
+                QCOMPARE(fader->value(), -100);  // still latched
+            }
+            mixer->playbackPosition(f);
+            if (f == 30) QCOMPARE(mixer->heard().audioTracks.at(0).volumeDb, -10.0);
+        }
+        mixer->playbackStopped(40);
+        QVERIFY(a1().panAuto.keyAt(30));  // the edit made under the pass kept
+        QCOMPARE(a1().volumeAuto.at(30), -10.0);
+        QCOMPARE(a1().volumeAuto.at(40), -10.0);
+        // A sequence made active mid-pass: what was written stays on the sequence it was recorded on.
+        const Id first = state()->sequence()->id;
+        mixer->playbackStarted(0);
+        for (FrameTime f = 0; f <= 20; ++f) {
+            if (f == 5) {
+                fader->setSliderDown(true);
+                fader->setValue(-200);
+            }
+            if (f == 8) fader->setSliderDown(false);
+            if (f == 15) {
+                const Id other = edit::duplicateSequence(state()->mutableProject(), first, "Other");
+                state()->setActiveSequence(other);
+            }
+            mixer->playbackPosition(f);
+        }
+        mixer->playbackStopped(20);
+        QCOMPARE(state()->project().findSequence(first)->audioTracks.at(0).volumeAuto.at(10), -20.0);
+        state()->setActiveSequence(first);
         // A track in Read takes nothing.
         mixer->trackAutomationMode(0)->setCurrentIndex(int(AutomationMode::Read));
         mixer->playbackStarted(0);
@@ -1256,7 +1308,7 @@ private slots:
                 panner->setPan(p);
             }
             mixer->playbackPosition(f);
-            if (f == 30) QCOMPARE(a1().surround.x, 1.0);  // heard as it is written
+            if (f == 30) QCOMPARE(mixer->heard().audioTracks.at(0).surround.x, 1.0);  // heard as it is written
         }
         mixer->playbackStopped(60);
         QVERIFY(surroundAnimated(a1()));
@@ -1280,7 +1332,7 @@ private slots:
         QVERIFY2(a1().surroundXAuto.at(10) < -0.9, qPrintable(QString::number(a1().surroundXAuto.at(10))));
         QVERIFY(std::fabs(a1().surroundXAuto.at(2) - still.x) < 1e-6);                 // before it was held
         QVERIFY(a1().surroundXAuto.at(50) > a1().surroundXAuto.at(20) + 0.1);           // let go: gliding back
-        // During a pass another track's panner and Animate Position wait (an edit would end the pass), while a width
+        // During a pass another track's panner and Animate Position wait for the stop, while a width
         // change on the track being recorded (the wheel: not a drag) is kept, all as one undo step.
         state()->edit("A2 out", [](Project&, Sequence& s) {
             s.audioTracks.at(1).output = 0;

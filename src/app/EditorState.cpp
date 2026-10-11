@@ -105,7 +105,7 @@ bool EditorState::refuseReadOnly() {
 bool EditorState::edit(const QString& label, const std::function<bool(Project&, Sequence&)>& fn,
                        const QString& mergeKey) {
     if (refuseReadOnly()) return false;
-    interruptGesture(true, Interruption::Edit);
+    if (gesture_) endGesture(true);
     Sequence* s = project_.active();
     if (!s) return false;
     Project before = project_;
@@ -130,7 +130,7 @@ bool EditorState::edit(const QString& label, const std::function<bool(Project&, 
 
 bool EditorState::amend(const std::function<bool(Project&, Sequence&)>& fn) {
     if (readOnly_) return false;
-    interruptGesture(true, Interruption::Edit);
+    if (gesture_) endGesture(true);
     Sequence* s = project_.active();
     if (!s) return false;
     Project before = project_;
@@ -156,21 +156,9 @@ bool EditorState::apply(const QString& label, const std::function<edit::Result(P
     return ok;
 }
 
-void EditorState::interruptGesture(bool commit, Interruption why) {
-    if (!gesture_) return;
-    emit gestureInterrupted(why);
-    if (gesture_) endGesture(commit);
-}
-
-void EditorState::dropGesture() {
-    if (!gesture_) return;
-    emit gestureInterrupted(Interruption::Replace);
-    gesture_.reset();
-}
-
 void EditorState::beginGesture(const QString& label) {
     if (refuseReadOnly()) return;  // no gesture: its updates change nothing
-    interruptGesture(true, Interruption::Edit);
+    if (gesture_) endGesture(true);
     gesture_ = Gesture{label, project_, false};
     lastMergeKey_.clear();
 }
@@ -200,7 +188,7 @@ void EditorState::endGesture(bool commit) {
 
 void EditorState::undo() {
     if (refuseReadOnly()) return;
-    interruptGesture(false, Interruption::Undo);
+    if (gesture_) endGesture(false);
     FrameTime ph = playhead();
     if (!history_.undo(project_)) return;
     if (Sequence* s = project_.active()) s->playhead = ph;
@@ -214,7 +202,7 @@ void EditorState::undo() {
 
 void EditorState::redo() {
     if (refuseReadOnly()) return;
-    interruptGesture(false, Interruption::Undo);
+    if (gesture_) endGesture(false);
     FrameTime ph = playhead();
     if (!history_.redo(project_)) return;
     if (Sequence* s = project_.active()) s->playhead = ph;
@@ -822,7 +810,7 @@ bool EditorState::sourceEdit(SourceEdit mode) {
 
 void EditorState::setActiveSequence(Id id) {
     if (!project_.findSequence(id) || id == project_.activeSequence) return;
-    interruptGesture(true, Interruption::Switch);
+    if (gesture_) endGesture(true);
     project_.activeSequence = id;
     selection_.clear();
     selectedTransition_ = 0;
@@ -859,7 +847,7 @@ Id EditorState::newSequence(const QString& name, int w, int h, Rational fps) {
 // Files
 
 bool EditorState::save(const QString& path, QString* error) {
-    interruptGesture(true, Interruption::Edit);
+    if (gesture_) endGesture(true);
     const bool sameFile = samePath(path, path_);
     if (sameFile && readOnly_) {
         if (error)
@@ -947,7 +935,8 @@ bool EditorState::open(const QString& path, QString* error, Access access) {
     lockFree_ = readOnly_ && lockHolder_.isEmpty();
     diskTime_ = QFileInfo(path).lastModified();
     lastRefresh_ = QDateTime::currentDateTimeUtc();
-    dropGesture();
+    if (gesture_) gesture_.reset();
+    ++projectGeneration_;
     project_ = std::move(p);
     // The last project's files are let go (idle decoders keep them open, which on Windows stops their folder being
     // moved or renamed, as when a card is relinked).
@@ -1024,7 +1013,8 @@ bool EditorState::reloadFromDisk() {
         if (const auto it = heads.find(s.id); it != heads.end()) s.playhead = it->second;
     if (p.findSequence(project_.activeSequence)) p.activeSequence = project_.activeSequence;
     const bool switched = p.activeSequence != project_.activeSequence;
-    dropGesture();
+    if (gesture_) gesture_.reset();
+    ++projectGeneration_;
     std::set<std::string> known;
     for (const MediaItem& m : project_.media) known.insert(m.path);
     project_ = std::move(p);
@@ -1082,7 +1072,8 @@ void EditorState::newProject() {
         lockFree_ = false;
         emit lockStateChanged();
     }
-    dropGesture();
+    if (gesture_) gesture_.reset();
+    ++projectGeneration_;
     project_ = makeDefaultProject();
     MediaPool::instance().clear();  // let the last project's files go
     history_.clear();
