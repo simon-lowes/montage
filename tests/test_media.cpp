@@ -9095,6 +9095,7 @@ private slots:
         QVERIFY(loadProject(project.toStdString(), back));
         QCOMPARE(back.active()->videoTracks[1].clips.front().mediaId, ids[1]);
         QVERIFY(call({{"action", "assemble"}, {"video_track", "A1"}}).value("isError").toBool());
+        QVERIFY(call({{"action", "board"}, {"bin", "No Such Bin"}}).value("isError").toBool());
         QVERIFY(call({{"action", "nonsense"}}).value("isError").toBool());
     }
 

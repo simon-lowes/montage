@@ -396,9 +396,6 @@ void MediaBinWidget::setView(View v) {
     iconsBtn_->setChecked(v == View::Icons);
     listBtn_->setChecked(v == View::List);
     boardBtn_->setChecked(v == View::Board);
-    // Drags from the board go in storyboard order; from the other views, in the order picked.
-    if (v == View::Board) model_->setDragOrder([this](const std::vector<Id>& ids) { return storyboardOrder(state_->project(), ids); });
-    else model_->setDragOrder({});
     if (v == View::Board) board_->applyBoard();
     QSettings("Montage", "Montage").setValue("mediaBin/view", v == View::List ? "list" : v == View::Board ? "board" : "icons");
 }
@@ -409,6 +406,10 @@ QAbstractItemView* MediaBinWidget::currentView() const {
 }
 
 bool MediaBinWidget::arrangeBoard() {
+    if (!board_->arrangeable()) {
+        state_->message(tr("Show a bin (not a search or smart bin) to arrange its board"), 4000);
+        return false;
+    }
     const std::vector<Id> order = board_->shownInOrder();
     const int columns = board_->columns();
     return state_->edit(tr("Arrange in Grid"), [&](Project& p, Sequence&) {
@@ -424,13 +425,16 @@ std::vector<Id> MediaBinWidget::assembleStoryboard(bool insert) {
     if (media.empty() || !state_->sequence()) return {};
     std::vector<Id> made;
     const FrameTime at = state_->playhead();
-    const TrackRef video{TrackKind::Video, state_->targetVideoTrack()}, audio{TrackKind::Audio, state_->targetAudioTrack()};
+    const Sequence& sq = *state_->sequence();
+    // The targeted tracks (as a drop or source edit takes them, kept to the tracks there are).
+    const TrackRef video{TrackKind::Video, std::clamp(state_->targetVideoTrack(), 0, std::max(0, int(sq.videoTracks.size()) - 1))},
+        audio{TrackKind::Audio, std::clamp(state_->targetAudioTrack(), 0, std::max(0, int(sq.audioTracks.size()) - 1))};
     state_->apply(insert ? tr("Assemble Storyboard (Insert)") : tr("Assemble Storyboard"), [&](Project& p, Sequence& s) {
         edit::Result r = montage::assembleStoryboard(p, s, media, at, video, audio, insert);
         if (r.ok) made = r.created;
         return r;
     });
-    if (!made.empty()) state_->message(tr("Assembled %n clip(s) in storyboard order", "", int(media.size())), 4000);
+    if (!made.empty()) state_->message(tr("Assembled %n clip(s) in storyboard order", "", int(made.size())), 4000);
     return made;
 }
 
@@ -578,6 +582,10 @@ void MediaBinWidget::rebuild() {
     const std::vector<Id> keep = selectedMedia();
     model_->setMedia(ids);
     if (selectedMedia() != keep) selectMedia(keep);
+    // The board: arranged only when it shows one bin's media, and back at their spots after any change (an undo,
+    // Arrange in Grid, an agent's move), which may keep the same media shown.
+    board_->setArrangeable(!smart_ && query.empty());
+    board_->applyBoard();
 }
 
 // Rebuilds the tree even if the project's bins are unchanged (to undo a rename that failed).

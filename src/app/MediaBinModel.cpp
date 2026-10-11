@@ -350,10 +350,9 @@ QMimeData* MediaBinModel::mimeData(const QModelIndexList& indexes) const {
     QStringList ids;
     std::set<int> rows;
     const double fps = state_->sequence() ? state_->sequence()->fpsValue() : 30.0;
-    std::vector<Id> picked;
+    std::vector<Id> picked;  // in the order given (the Board view gives storyboard order)
     for (const QModelIndex& i : indexes)
         if (rows.insert(i.row()).second) picked.push_back(mediaAt(i.row()));
-    if (dragOrder_) picked = dragOrder_(picked);
     for (Id id : picked) {
         const MediaItem* m = state_->project().findMedia(id);
         if (m && m->subclipOf) {

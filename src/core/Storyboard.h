@@ -24,9 +24,10 @@ std::map<Id, BoardSpot> boardLayout(const Project& p, const std::vector<Id>& med
 // Puts `media` on the board in a grid `columns` wide, in the order given (Arrange in Grid).
 void arrangeStoryboard(Project& p, const std::vector<Id>& media, int columns);
 
-// Places `media` one after another in `s` from `at` (a subclip as its range, a still for the default still length),
-// pictures on `video` and sound on `audio`; `insert` pushes what follows along, else they overwrite. The result's
-// created clips, in order.
+// Places `media` one after another in `s` from `at` (a subclip as its range and name, a still for the default still
+// length), pictures on `video` and sound on `audio`; `insert` pushes what follows along, else they overwrite. `s`
+// itself, or a sequence it plays in, is left out, and media that cannot be placed are skipped. The created clips, in
+// order (a failure only if none could be placed).
 edit::Result assembleStoryboard(Project& p, Sequence& s, const std::vector<Id>& media, FrameTime at, TrackRef video,
                                 TrackRef audio, bool insert);
 

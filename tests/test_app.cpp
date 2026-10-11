@@ -10207,6 +10207,7 @@ const auto seq = [this] { return state()->sequence(); };
         }));
         bin->showBin(QString());
         bin->setView(MediaBinWidget::View::Board);
+        win_->show();
         QApplication::processEvents();
         StoryboardView* board = bin->board();
         QCOMPARE(board->shownInOrder(), ids);  // nothing placed yet: as listed
@@ -10215,18 +10216,40 @@ const auto seq = [this] { return state()->sequence(); };
                 if (Id(board->model()->index(r, 0).data(MediaBinModel::IdRole).toULongLong()) == id) return board->model()->index(r, 0);
             return QModelIndex();
         };
-        // Moved about (three first, one last): saved as one undo step, in cells.
+        // Moved about (three first, one last): saved as one undo step, in cells; the one not moved pinned where it was.
         const QSize cell = board->cellSize();
         board->moveThumbnail(indexOf(ids[0]), QPoint(2 * cell.width(), 0));
-        board->moveThumbnail(indexOf(ids[1]), QPoint(cell.width(), cell.height() / 4));
         board->moveThumbnail(indexOf(ids[2]), QPoint(0, 0));
         const int steps = int(state()->history().undoCount());
-        QVERIFY(board->saveBoard("Arrange Storyboard"));
+        QVERIFY(board->saveBoard("Arrange Storyboard", {ids[0], ids[2]}));
         QCOMPARE(int(state()->history().undoCount()), steps + 1);
-        QVERIFY(!board->saveBoard("Arrange Storyboard"));  // nothing moved since
-        QCOMPARE(board->shownInOrder(), (std::vector<Id>{ids[2], ids[1], ids[0]}));
+        QVERIFY(!board->saveBoard("Arrange Storyboard", {ids[0], ids[2]}));  // nothing moved since
         QCOMPARE(state()->project().findMedia(ids[0])->board, (MediaItem::BoardSpot{2, 0, true}));
-        QCOMPARE(state()->project().findMedia(ids[1])->board.y, 0.25);
+        QCOMPARE(state()->project().findMedia(ids[1])->board, (MediaItem::BoardSpot{1, 0, true}));  // (where it showed)
+        QCOMPARE(board->shownInOrder(), (std::vector<Id>{ids[2], ids[1], ids[0]}));
+        // A real drag on the board: pressed on "two", dropped a cell and a quarter lower; only it moves, one undo step.
+        board->selectionModel()->clearSelection();
+        const QPoint press = board->visualRect(indexOf(ids[1])).center();
+        QTest::mousePress(board->viewport(), Qt::LeftButton, {}, press);
+        QCOMPARE(bin->selectedMedia(), std::vector<Id>{ids[1]});
+        std::unique_ptr<QMimeData> drag(board->dragData());
+        QVERIFY(drag);
+        const QPoint drop = press + QPoint(0, cell.height() + cell.height() / 4);
+        QDragEnterEvent enter(press, Qt::CopyAction | Qt::MoveAction, drag.get(), Qt::LeftButton, {});
+        QApplication::sendEvent(board->viewport(), &enter);
+        QVERIFY(enter.isAccepted());
+        QCOMPARE(enter.dropAction(), Qt::MoveAction);
+        QDropEvent dropped(drop, Qt::CopyAction | Qt::MoveAction, drag.get(), Qt::LeftButton, {});
+        QApplication::sendEvent(board->viewport(), &dropped);
+        QTest::mouseRelease(board->viewport(), Qt::LeftButton, {}, drop);
+        QVERIFY(dropped.isAccepted());
+        QCOMPARE(int(state()->history().undoCount()), steps + 2);
+        QCOMPARE(state()->project().findMedia(ids[1])->board, (MediaItem::BoardSpot{1, 1.25, true}));
+        QCOMPARE(state()->project().findMedia(ids[0])->board, (MediaItem::BoardSpot{2, 0, true}));
+        // Undone: the thumbnail goes back (the bin shows the same media, so only the board's refresh moves it).
+        state()->undo();
+        QApplication::processEvents();
+        QCOMPARE(board->thumbnailAt(indexOf(ids[1])), QPoint(cell.width(), 0));
         // Kept where they are when the bin is rebuilt, and at twice the size, twice as far apart.
         bin->rebuild();
         QApplication::processEvents();
@@ -10236,7 +10259,8 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(board->thumbnailAt(indexOf(ids[0])).x(), 2 * board->cellSize().width());
         board->setThumbnailWidth(width);
         // Dragged out in storyboard order, whatever order they were picked in.
-        std::unique_ptr<QMimeData> mime(board->model()->mimeData({indexOf(ids[0]), indexOf(ids[2])}));
+        bin->selectMedia({ids[0], ids[2]});
+        std::unique_ptr<QMimeData> mime(board->dragData());
         QCOMPARE(QString::fromUtf8(mime->data("application/x-montage-media")), QStringLiteral("%1,%2").arg(ids[2]).arg(ids[0]));
         // Assembled at the playhead on the targeted tracks, in that order, one undo step.
         bin->selectMedia({});
@@ -10256,10 +10280,31 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(bin->assembleStoryboard(false).size(), size_t(4));
         QCOMPARE(state()->sequence()->videoTracks[0].clips[0].mediaId, ids[1]);
         state()->undo();
-        // Arrange in Grid: rows as wide as the view, in storyboard order, one undo step.
+        // Arrange in Grid: rows as wide as the view, in storyboard order, one undo step, shown at once.
+        board->moveThumbnail(indexOf(ids[0]), QPoint(5 * cell.width(), 3 * cell.height()));
+        QVERIFY(board->saveBoard("Arrange Storyboard", {ids[0]}));
         QVERIFY(bin->arrangeBoard());
+        QCOMPARE(state()->project().findMedia(ids[0])->board, (MediaItem::BoardSpot{2, 0, true}));
         QCOMPARE(state()->project().findMedia(ids[2])->board, (MediaItem::BoardSpot{0, 0, true}));
+        QCOMPARE(board->thumbnailAt(indexOf(ids[1])), QPoint(cell.width(), 0));
         QCOMPARE(board->shownInOrder(), (std::vector<Id>{ids[2], ids[1], ids[0]}));
+        // A search shows media from other bins too: nothing is arranged or saved then.
+        auto* search = bin->findChild<QLineEdit*>();
+        search->setText("t");  // two, three
+        QApplication::processEvents();
+        QVERIFY(!board->arrangeable() && !bin->arrangeBoard());
+        QVERIFY(!board->saveBoard("Arrange Storyboard", {ids[1]}));
+        search->clear();
+        QApplication::processEvents();
+        QVERIFY(board->arrangeable());
+        // A new sequence (its item in this bin) is not assembled into itself.
+        state()->newSequence("Second", 1920, 1080, state()->sequence()->fps);
+        bin->rebuild();
+        QApplication::processEvents();
+        bin->selectMedia({});
+        QCOMPARE(bin->assembleStoryboard(false).size(), size_t(6));
+        for (const Track& t : state()->sequence()->videoTracks)
+            for (const Clip& c : t.clips) QVERIFY(state()->project().findMedia(c.mediaId)->kind != MediaKind::Sequence);
         bin->setView(MediaBinWidget::View::Icons);
         state()->newProject();
     }

@@ -65,10 +65,13 @@ edit::Result assembleStoryboard(Project& p, Sequence& s, const std::vector<Id>& 
                                 TrackRef audio, bool insert) {
     edit::Result all;
     all.ok = true;
+    std::string skipped;
     const double fps = s.fpsValue();
     for (Id id : media) {
         const MediaItem* m = p.findMedia(id);
         if (!m) continue;
+        // Never the sequence into itself (nor into one it plays inside).
+        if (m->kind == MediaKind::Sequence && (m->sequenceId == s.id || edit::sequenceUses(p, m->sequenceId, s.id))) continue;
         Id use = id;
         double in = 0, out = -1;
         if (m->subclipOf && m->subclipOut > m->subclipIn) {
@@ -77,14 +80,20 @@ edit::Result assembleStoryboard(Project& p, Sequence& s, const std::vector<Id>& 
             out = std::ceil(m->subclipOut * fps - 1e-6);
         }
         const edit::Result r = edit::placeMedia(p, s, use, at, in, out, video, audio, insert);
-        if (!r.ok) return edit::Result::fail((m->name.empty() ? std::string("A clip") : m->name) + ": " + r.error);
+        if (!r.ok) {  // (the rest still go in, as a drop of several does)
+            if (skipped.empty()) skipped = (m->name.empty() ? std::string("a clip") : m->name) + ": " + r.error;
+            continue;
+        }
         FrameTime end = at;
         for (Id c : r.created)
-            if (const Clip* clip = edit::clipById(s, c)) end = std::max(end, clip->end());
+            if (Clip* clip = edit::clipById(s, c)) {
+                end = std::max(end, clip->end());
+                if (m->subclipOf) clip->name = m->name;  // named as the subclip, as when dropped
+            }
         all.created.insert(all.created.end(), r.created.begin(), r.created.end());
         at = end;
     }
-    if (all.created.empty()) return edit::Result::fail("Nothing to assemble");
+    if (all.created.empty()) return edit::Result::fail(skipped.empty() ? std::string("Nothing to assemble") : skipped);
     return all;
 }
 

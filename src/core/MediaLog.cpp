@@ -204,6 +204,7 @@ bool moveMediaToBin(Project& p, const std::vector<Id>& media, const std::string&
     for (Id id : media)
         if (MediaItem* m = p.findMedia(id); m && m->bin != bin) {
             m->bin = bin;
+            m->board = {};  // (its spot was on the other bin's board)
             any = true;
         }
     if (any && !bin.empty() && std::find(p.bins.begin(), p.bins.end(), bin) == p.bins.end()) p.bins.push_back(bin);
@@ -358,6 +359,7 @@ std::optional<MediaItem> makeSubclip(const Project& p, Id media, double in, doub
     m.subclipOf = base->id;
     m.subclipIn = in;
     m.subclipOut = out;
+    m.board = {};  // a place of its own on the storyboard, not on top of its media's
     m.duration = out - in;
     m.rating = 0;
     m.bin = src->bin;

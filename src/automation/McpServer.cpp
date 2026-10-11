@@ -5594,9 +5594,14 @@ void McpServer::Impl::addTools() {
                 return projectMedia(l.project, v.toString());
             };
             const std::string bin = a.value("bin").toString().toStdString();
-            std::vector<Id> binMedia;
+            if (!bin.empty()) {
+                const std::vector<std::string> bins = projectBins(l.project);
+                if (std::find(bins.begin(), bins.end(), bin) == bins.end())
+                    throw ArgError{QStringLiteral("No bin \"%1\" (bins are paths such as \"Interviews/Day 1\")").arg(QString::fromStdString(bin))};
+            }
+            std::vector<Id> binMedia;  // (as the app's board shows it; assembling leaves out the sequence itself)
             for (const MediaItem& m : l.project.media)
-                if (m.bin == bin && !(m.kind == MediaKind::Sequence && l.project.findSequence(m.sequenceId) == &l.seq())) binMedia.push_back(m.id);
+                if (m.bin == bin) binMedia.push_back(m.id);
             std::vector<Id> named;
             for (const QJsonValue& v : a.value("media").toArray()) named.push_back(mediaRef(v).id);
             const int columns = std::max(1, a.value("columns").toInt(6));

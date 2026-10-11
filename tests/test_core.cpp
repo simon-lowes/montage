@@ -584,6 +584,30 @@ private slots:
         QCOMPARE(s.duration(), end + 2 * two);
         QCOMPARE(edit::clipById(s, r.created[0])->start, 10 + two);
         QVERIFY(!assembleStoryboard(p, s, {}, 0, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        // Clips from a subclip are named after it; the sequence itself is left out; media that cannot be placed are
+        // skipped (the rest still go in), and only if none can is it a failure, with the reason.
+        const auto subClip = std::find_if(s.videoTracks[0].clips.begin(), s.videoTracks[0].clips.end(),
+                                          [&](const Clip& c) { return c.mediaId == A && c.duration == one; });
+        QVERIFY(subClip != s.videoTracks[0].clips.end() && subClip->name == "A middle");
+        MediaItem self, nothing;
+        self.id = p.newId(), nothing.id = p.newId();
+        self.kind = MediaKind::Sequence, self.sequenceId = s.id, self.hasVideo = true, self.name = "This sequence";
+        nothing.kind = MediaKind::Video, nothing.name = "Nothing";  // no picture, no sound
+        p.media.push_back(self), p.media.push_back(nothing);
+        const FrameTime later = s.duration() + 100;
+        r = assembleStoryboard(p, s, {self.id, nothing.id, E}, later, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        QVERIFY2(r.ok, r.error.c_str());
+        QCOMPARE(r.created.size(), size_t(2));
+        QCOMPARE(edit::clipById(s, r.created[0])->mediaId, E);
+        QCOMPARE(edit::clipById(s, r.created[0])->start, later);
+        r = assembleStoryboard(p, s, {self.id, nothing.id}, later, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        QVERIFY(!r.ok && r.error.find("Nothing") != std::string::npos);
+        // A spot belongs to a bin's board: moving media to another bin, or making a subclip, starts it afresh.
+        QVERIFY(p.findMedia(B)->board.placed);
+        QVERIFY(moveMediaToBin(p, {B}, "Elsewhere"));
+        QVERIFY(!p.findMedia(B)->board.placed);
+        const auto subOfC = makeSubclip(p, C, 0.2, 0.8, "C bit");
+        QVERIFY(subOfC && !subOfC->board.placed);
     }
 
     void gzipAndTar() {
