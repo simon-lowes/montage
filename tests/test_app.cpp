@@ -78,6 +78,8 @@
 #include "RedactFacesDialog.h"
 #include "SpectralRepairDialog.h"
 #include "automation/McpServer.h"
+#include "automation/ScriptHost.h"
+#include "ScriptConsole.h"
 #include "media/SpeechSearch.h"
 #include "media/TextReader.h"
 #include "core/OnScreenText.h"
@@ -10178,6 +10180,74 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY2(offered.contains(QStringLiteral("Publish to Graphic…")), qPrintable(offered.join(", ")));
         state()->setActiveSequence(main);
         qunsetenv("MONTAGE_TEMPLATES_DIR");
+        state()->newProject();
+    }
+
+    void scriptsInTheApp() {
+        if (!scriptingAvailable()) QSKIP("built without Lua");
+        state()->newProject();
+        auto* console = win_->scriptConsole();
+        QVERIFY(console && win_->findChild<QMenu*>("scriptsMenu"));
+        auto titles = [&] {
+            int n = 0;
+            for (const Track& t : state()->sequence()->videoTracks)
+                for (const Clip& c : t.clips) n += c.generator.type == "title";
+            return n;
+        };
+        // Two titles from one run: one undo step, named for the script; what it prints in the console.
+        const int steps = int(state()->history().undoCount());
+        console->clearOutput();
+        QVERIFY(console->run("local here = montage.live_context{}\n"
+                             "print('at ' .. here.playhead)\n"
+                             "montage.add_title{text = 'One', at = 0}\n"
+                             "montage.add_title{text = 'Two', at = 1}\n",
+                             "titles.lua"));
+        QCOMPARE(titles(), 2);
+        QCOMPARE(int(state()->history().undoCount()), steps + 1);
+        QCOMPARE(state()->undoText(), QStringLiteral("Script: titles.lua"));
+        QVERIFY2(console->output().contains("at 00:00:00:00"), qPrintable(console->output()));
+        state()->undo();
+        QCOMPARE(titles(), 0);
+        // montage.undo{} takes back only the script's own run, never the editor's last change.
+        QVERIFY(state()->edit("Mine", [](Project&, Sequence& s) {
+            Marker m;
+            m.name = "editor's";
+            s.markers.push_back(m);
+            return true;
+        }));
+        QVERIFY(!console->run("montage.undo{}", "undo.lua"));
+        QCOMPARE(state()->sequence()->markers.size(), size_t(1));
+        QVERIFY(console->run("montage.add_title{text = 'Gone', at = 0}\nmontage.undo{}", "undo2.lua"));
+        QCOMPARE(titles(), 0);
+        QCOMPARE(state()->undoText(), QStringLiteral("Mine"));
+        // A tool's error: the run fails with it shown, and what it did before stays one undo step.
+        QVERIFY(!console->run("montage.add_title{text = 'Kept', at = 0}\nmontage.add_title{at = 'never'}", "fails.lua"));
+        QCOMPARE(titles(), 1);
+        QCOMPARE(state()->undoText(), QStringLiteral("Script: fails.lua"));
+        QVERIFY(console->output().contains("fails.lua:2:"));
+        state()->undo();
+        // Stop: a script that would never end stops, and the window kept working meanwhile.
+        bool ticked = false;
+        QTimer::singleShot(100, console, [&] {
+            ticked = true;
+            QVERIFY(console->running());
+            console->stop();
+        });
+        QVERIFY(!console->run("while true do end", "forever.lua"));
+        QVERIFY(ticked && !console->running());
+        QVERIFY(console->output().endsWith("Stopped"));
+        // The scripts folder: what the menu lists, run from a file.
+        qputenv("MONTAGE_SCRIPTS_DIR", (dir_.path() + "/scripts").toUtf8());
+        QDir().mkpath(dir_.path() + "/scripts");
+        QFile f(dir_.path() + "/scripts/Add Marker.lua");
+        QVERIFY(f.open(QIODevice::WriteOnly));
+        f.write("montage.add_marker{at = 2, name = montage.args[1] or 'none'}\n");
+        f.close();
+        QCOMPARE(listScripts(), QStringList{dir_.path() + "/scripts/Add Marker.lua"});
+        QVERIFY(console->runFile(listScripts()[0], {"From a file"}));
+        QCOMPARE(state()->sequence()->markers.back().name, std::string("From a file"));
+        QVERIFY(console->open(listScripts()[0]) && console->editor()->toPlainText().contains("add_marker"));
+        qunsetenv("MONTAGE_SCRIPTS_DIR");
         state()->newProject();
     }
 

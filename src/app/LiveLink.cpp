@@ -328,6 +328,15 @@ QJsonObject LiveLink::contextResult(const QJsonObject& args, bool& isError) {
 }
 
 void LiveLink::handle(const QByteArray& message, std::function<void(QByteArray)> done, bool external) {
+    dispatch(message, std::move(done), external, {}, {});
+}
+
+void LiveLink::handleScript(const QByteArray& message, std::function<void(QByteArray)> done, const QString& label, const QString& group) {
+    dispatch(message, std::move(done), false, label, group);
+}
+
+void LiveLink::dispatch(const QByteArray& message, std::function<void(QByteArray)> done, bool external, const QString& label,
+                        const QString& group) {
     const QJsonObject msg = QJsonDocument::fromJson(message).object();
     const QString method = msg.value("method").toString();
     if (method == "tools/list") {
@@ -358,16 +367,16 @@ void LiveLink::handle(const QByteArray& message, std::function<void(QByteArray)>
                                      .arg(state_->lockHolder().isEmpty() ? QStringLiteral("someone else") : state_->lockHolder()),
                                  {}, true));
     if (name == "montage_undo" && targetsOpenProject(args)) {
-        // Only an agent's own change: the editor's are theirs to undo.
+        // Only an agent's own change (a script's own run): the editor's are theirs to undo.
         const QString last = state_->undoText();
-        if (!state_->canUndo() || !last.startsWith(QStringLiteral("Assistant: ")))
+        if (!state_->canUndo() || !(label.isEmpty() ? last.startsWith(QStringLiteral("Assistant: ")) : last == label))
             return answer(toolResult(state_->canUndo() ? QStringLiteral("The last change (%1) was the editor's; it is left alone").arg(last)
                                                        : QStringLiteral("Nothing to undo"),
                                      {}, true));
         state_->undo();
         return answer(toolResult(QStringLiteral("Undid %1").arg(last), {}, false));
     }
-    queue_.push_back({msg, std::move(done), external});
+    queue_.push_back({msg, std::move(done), external, label, group});
     pump();
 }
 
@@ -466,11 +475,12 @@ void LiveLink::finish(const Job& job, const QString& tool, const Project& before
                 std::set<Id> had;
                 for (const MediaItem& m : state_->project().media) had.insert(m.id);
                 const auto info = tools_.find(tool);
-                const QString label = QStringLiteral("Assistant: %1").arg(info != tools_.end() && !info->second.title.isEmpty() ? info->second.title : tool);
+                const QString label = !job.label.isEmpty() ? job.label
+                                                           : QStringLiteral("Assistant: %1").arg(info != tools_.end() && !info->second.title.isEmpty() ? info->second.title : tool);
                 state_->edit(label, [&loaded](Project& p, Sequence&) {
                     p = std::move(loaded);
                     return true;
-                });
+                }, job.group);
                 for (const MediaItem& m : state_->project().media)
                     if (!had.count(m.id) && m.hasAudio) state_->startAudioDecode(m);
                 emit applied(label);

@@ -40,6 +40,9 @@ public:
     // within ~1.5 s collapse into one undo step (slider drags, typing).
     bool edit(const QString& label, const std::function<bool(Project&, Sequence&)>& fn,
               const QString& mergeKey = QString());
+    // Edits with merge key `key` join one undo step however far apart they come (a script's run), until it is
+    // cleared (""), the editor makes an edit of their own, or one is undone.
+    void setUndoGroup(const QString& key) { undoGroup_ = key; }
     // Changes the project without a new undo step, for results derived from the
     // latest edit (a segmentation that finished in the background): undoing
     // that edit takes them away with it.
@@ -265,7 +268,7 @@ private:
     bool sequencesAsClips_ = false;
     FrameTime sourceIn_ = -1;
     FrameTime sourceOut_ = -1;
-    QString lastMergeKey_;
+    QString lastMergeKey_, undoGroup_;
     QDateTime lastMergeTime_;
 
     struct Gesture {

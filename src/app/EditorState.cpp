@@ -115,8 +115,8 @@ bool EditorState::edit(const QString& label, const std::function<bool(Project&, 
     }
     if (project_ == before) return true;
     QDateTime now = QDateTime::currentDateTimeUtc();
-    bool merge = !mergeKey.isEmpty() && mergeKey == lastMergeKey_ && lastMergeTime_.isValid() &&
-                 lastMergeTime_.msecsTo(now) < 1500 && history_.canUndo();
+    bool merge = !mergeKey.isEmpty() && mergeKey == lastMergeKey_ && history_.canUndo() &&
+                 (mergeKey == undoGroup_ || (lastMergeTime_.isValid() && lastMergeTime_.msecsTo(now) < 1500));
     if (merge) history_.touch();
     else history_.push(label.toStdString(), before);
     lastMergeKey_ = mergeKey;

@@ -58,6 +58,7 @@ add_library(montage_engine STATIC
   core/ProjectLock.h core/ProjectLock.cpp
   core/Production.h core/Production.cpp
   core/GraphicsTemplate.h core/GraphicsTemplate.cpp
+  automation/ScriptHost.h automation/ScriptHost.cpp
   core/Interchange.h core/Interchange.cpp
   automation/McpServer.h automation/McpServer.cpp
   media/Image.h media/Image.cpp
@@ -308,6 +309,11 @@ endif()
 if(MONTAGE_WITH_THORVG)
   target_link_libraries(montage_engine PRIVATE montage_thorvg)
   target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_THORVG)
+endif()
+
+if(MONTAGE_WITH_LUA)
+  target_link_libraries(montage_engine PRIVATE montage_lua)
+  target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_LUA)
 endif()
 
 if(MONTAGE_WITH_RNNOISE)

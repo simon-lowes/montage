@@ -49,6 +49,10 @@ public:
     // `external`: from an agent outside the app (the HTTP endpoint), so dropped or not applied when the link stops;
     // the Assistant panel's calls are not.
     void handle(const QByteArray& message, std::function<void(QByteArray)> done, bool external = false);
+    // A script's call (app/ScriptConsole.h): as the Assistant's, but a change it makes is undone as `label` and joins
+    // the run's other changes in one undo step (`group`: the run's merge key, set with EditorState::setUndoGroup);
+    // montage_undo takes back only the run's own step.
+    void handleScript(const QByteArray& message, std::function<void(QByteArray)> done, const QString& label, const QString& group);
 
 signals:
     void runningChanged(bool on);
@@ -60,7 +64,9 @@ private:
         QJsonObject message;
         std::function<void(QByteArray)> done;
         bool external = false;  // from an agent over HTTP (the Assistant panel calls in-process)
+        QString label, group;   // a script's: its undo step's name and merge key ("" for the Assistant's and agents')
     };
+    void dispatch(const QByteArray& message, std::function<void(QByteArray)> done, bool external, const QString& label, const QString& group);
     struct ToolInfo {
         QString title;
         bool takesProject = false;  // works on a project (one it reads, not a new one it writes)

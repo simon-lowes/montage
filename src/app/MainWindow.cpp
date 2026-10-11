@@ -3,6 +3,7 @@
 #include "LiveLink.h"
 #include "render/Ofx.h"
 #include "AssistantPanel.h"
+#include "ScriptConsole.h"
 #include "CleanFeed.h"
 #include "Settings.h"
 
@@ -27,6 +28,7 @@
 #include <QDockWidget>
 #include <QDoubleSpinBox>
 #include <QFile>
+#include <QDesktopServices>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QHeaderView>
@@ -453,6 +455,8 @@ void MainWindow::buildPanels() {
     peopleDock_ = makeDock(tr("People"), "people", people_);
     assistant_ = new AssistantPanel(liveLink_, this);
     assistantDock_ = makeDock(tr("Assistant"), "assistant", assistant_);
+    scripts_ = new ScriptConsole(state_, liveLink_, this);
+    scriptsDock_ = makeDock(tr("Script Console"), "scripts", scripts_);
     indexDock_ = makeDock(tr("Sequence Index"), "index", new SequenceIndexPanel(state_, this));
     stacked_ = new StackedTimelineWidget(state_, this);
     stackedDock_ = makeDock(tr("Stacked Timeline"), "stacked", stacked_);
@@ -1808,6 +1812,42 @@ void MainWindow::buildMenus() {
     agentLinkAction_->setCheckable(true);
     agentLinkAction_->setToolTip(tr("Claude and other MCP clients edit the project open here, each change one undo step"));
     add(toolsM, tr("Agent Link…"), QKeySequence(), [this] { agentLinkDialog(); })->setObjectName(QStringLiteral("agentLinkDialog"));
+    // Scripts: those in the scripts folder, any other file, the console (Resolve's Workspace › Scripts).
+    QMenu* scriptsM = toolsM->addMenu(tr("&Scripts"));
+    scriptsM->setObjectName(QStringLiteral("scriptsMenu"));
+    connect(scriptsM, &QMenu::aboutToShow, this, [this, scriptsM] {
+        scriptsM->clear();
+        const QStringList found = listScripts();
+        for (const QString& f : found) {
+            QAction* a = scriptsM->addAction(QFileInfo(f).completeBaseName(), this, [this, f] {
+                if (scripts_->running()) return state_->message(tr("A script is running"), 4000);
+                scriptsDock_->show();
+                scriptsDock_->raise();
+                scripts_->runFile(f);
+            });
+            a->setToolTip(QDir::toNativeSeparators(f));
+        }
+        if (found.isEmpty()) scriptsM->addAction(tr("No Scripts in the Folder Yet"))->setEnabled(false);
+        scriptsM->addSeparator();
+        scriptsM->addAction(tr("Run Script…"), this, [this] {
+            if (scripts_->running()) return state_->message(tr("A script is running"), 4000);
+            QDir().mkpath(scriptsDirectory());
+            const QString f = QFileDialog::getOpenFileName(this, tr("Run Script"), scriptsDirectory(), tr("Lua scripts (*.lua);;All files (*)"));
+            if (f.isEmpty()) return;
+            scriptsDock_->show();
+            scriptsDock_->raise();
+            scripts_->runFile(f);
+        });
+        scriptsM->addAction(tr("Script Console"), this, [this] {
+            scriptsDock_->show();
+            scriptsDock_->raise();
+            scripts_->editor()->setFocus();
+        });
+        scriptsM->addAction(tr("Open Scripts Folder"), this, [] {
+            QDir().mkpath(scriptsDirectory());
+            QDesktopServices::openUrl(QUrl::fromLocalFile(scriptsDirectory()));
+        });
+    });
     add(toolsM, tr("Audio &Plugins…"), QKeySequence(), [this] {
         auto* dlg = new PluginManagerDialog(this);
         dlg->setAttribute(Qt::WA_DeleteOnClose);
@@ -2271,6 +2311,13 @@ void MainWindow::exportFrame() {
 }
 
 void MainWindow::closeEvent(QCloseEvent* e) {
+    // A running script is stopped first (it runs inside this window's event loop); closing again then quits.
+    if (scripts_ && scripts_->running()) {
+        scripts_->stop();
+        state_->message(tr("Stopping the script: close again when it has stopped"), 5000);
+        e->ignore();
+        return;
+    }
     if (queue_->running() &&
         QMessageBox::question(this, tr("Render Queue"), tr("Renders are in progress. Stop them and quit?"),
                               QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) {

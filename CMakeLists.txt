@@ -22,6 +22,7 @@ option(MONTAGE_WITH_VST3 "Host VST3 audio plugins (VST 3 SDK, MIT, vendored)" ON
 option(MONTAGE_WITH_WHISPER "Speech-to-text with whisper.cpp (MIT, fetched at configure time)" ON)
 option(MONTAGE_WITH_RNNOISE "Voice isolation with RNNoise (BSD, fetched with its model at configure time)" ON)
 option(MONTAGE_WITH_THORVG "Lottie animations and SVG graphics with ThorVG (MIT, fetched at configure time)" ON)
+option(MONTAGE_WITH_LUA "Lua scripting (Lua 5.4, MIT, fetched at configure time)" ON)
 option(MONTAGE_WITH_LV2 "Host LV2 audio plugins, when lilv is installed" ON)
 option(MONTAGE_WITH_LIBRAW "Camera raw stills (CR3, NEF, ARW, DNG...), when LibRaw 0.20+ is installed" ON)
 option(MONTAGE_WITH_OPENJPEG "IMF masters in the JPEG 2000 IMF profiles, when OpenJPEG 2.5+ is installed" ON)
@@ -98,6 +99,34 @@ if(MONTAGE_WITH_RNNOISE)
   target_compile_options(montage_rnnoise PRIVATE $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-w -O2>)
   if(NOT WIN32)
     target_link_libraries(montage_rnnoise PRIVATE m)
+  endif()
+endif()
+
+if(MONTAGE_WITH_LUA)
+  include(FetchContent)
+  # Lua's own release; its library sources (not the lua and luac programs) compiled here.
+  FetchContent_Declare(lua
+    URL https://www.lua.org/ftp/lua-5.4.7.tar.gz
+    URL_HASH SHA256=9fbf5e28ef86c69858f6d3d34eccc32e911c1a28b4120ff3e84aaa70cfbf1e30
+    SOURCE_SUBDIR no-cmake)
+  FetchContent_MakeAvailable(lua)
+  set(LUA_SRC ${lua_SOURCE_DIR}/src)
+  set(LUA_FILES lapi lcode lctype ldebug ldo ldump lfunc lgc llex lmem lobject lopcodes lparser lstate lstring ltable ltm
+                lundump lvm lzio lauxlib lbaselib lcorolib ldblib liolib lmathlib loadlib loslib lstrlib ltablib lutf8lib linit)
+  list(TRANSFORM LUA_FILES PREPEND ${LUA_SRC}/)
+  list(TRANSFORM LUA_FILES APPEND .c)
+  # Compiled as C++, as Lua supports, so its errors unwind as exceptions through the C++ that calls it (destructors
+  # run) rather than longjmp past it; its headers are then included without extern "C".
+  set_source_files_properties(${LUA_FILES} PROPERTIES LANGUAGE CXX)
+  add_library(montage_lua STATIC ${LUA_FILES})
+  target_include_directories(montage_lua PUBLIC ${LUA_SRC})
+  set_target_properties(montage_lua PROPERTIES POSITION_INDEPENDENT_CODE ON CXX_VISIBILITY_PRESET hidden)
+  target_compile_options(montage_lua PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-w -O2>)
+  if(APPLE)
+    target_compile_definitions(montage_lua PRIVATE LUA_USE_MACOSX)
+  elseif(UNIX)
+    target_compile_definitions(montage_lua PRIVATE LUA_USE_LINUX)
+    target_link_libraries(montage_lua PRIVATE m ${CMAKE_DL_LIBS})
   endif()
 endif()
 

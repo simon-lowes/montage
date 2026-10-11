@@ -1,4 +1,5 @@
 // montage-cli — headless rendering, probing and project assembly.
+#include <QFileInfo>
 #include <QGuiApplication>
 #include <algorithm>
 #include <atomic>
@@ -30,6 +31,7 @@
 #include "media/Loudness.h"
 #ifdef MONTAGE_WITH_WHISPER
 #include "automation/McpServer.h"
+#include "automation/ScriptHost.h"
 #ifdef MONTAGE_LIVE_BRIDGE
 #include "app/LiveBridge.h"
 #endif
@@ -102,6 +104,8 @@ int usage() {
                  "  montage-cli speak \"text\" -o voice.wav [--voice af_heart] [--speed 1]   (a voiceover from text; --phonemes prints them)\n"
                  "  montage-cli clone-speech \"text\" --voice sample.wav -o out.wav --consent [--language en] [--from S] [--to S]\n"
                  "              [--speed 1] [--exaggeration 0.5]   (in the voice of the sample, with its owner's consent; 23 languages)\n"
+                 "  montage-cli script <file.lua> [--project <project.montage>] [arg...]   (a Lua script driving Montage's tools;\n"
+                 "                                        montage.add_title{text = \"Hi\"} calls montage_add_title)\n"
                  "  montage-cli mcp [--live]              (Model Context Protocol server on stdio, for AI agents;\n"
                  "                                        --live: on the project open in Montage, with Tools > Agent Link on)\n"
                  "  montage-cli captions <project.montage> [-o out.srt|.vtt|.scc|.ttml|.stl|.ass] [--transcribe MODEL]\n"
@@ -1215,6 +1219,44 @@ int cmdCloneSpeech(const std::vector<std::string>& args) {
     return 0;
 }
 
+// A Lua script on Montage's tools, on the project named by --project (the tools that take a project get it when the
+// script names none); print() goes to stdout, the error to stderr.
+int cmdScript(const std::vector<std::string>& args) {
+    std::string file, project;
+    QStringList rest;
+    for (size_t i = 0; i < args.size(); ++i) {
+        if ((args[i] == "--project" || args[i] == "-p") && i + 1 < args.size() && project.empty()) project = args[++i];
+        else if (file.empty()) file = args[i];
+        else rest << QString::fromStdString(args[i]);
+    }
+    if (file.empty()) return usage();
+    if (!scriptingAvailable()) {
+        std::fprintf(stderr, "error: this build of Montage has no Lua\n");
+        return 1;
+    }
+    std::ifstream in(file, std::ios::binary);
+    if (!in) {
+        std::fprintf(stderr, "error: cannot read %s\n", file.c_str());
+        return 1;
+    }
+    const std::string code((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    McpServer server;
+    ScriptOptions o = toolScriptOptions(server, project.empty() ? QString() : QFileInfo(QString::fromStdString(project)).absoluteFilePath());
+    o.args = rest;
+    o.print = [](const QString& line) {
+        std::printf("%s\n", line.toUtf8().constData());
+        std::fflush(stdout);
+    };
+    std::signal(SIGINT, [](int) { gCancel = true; });
+    o.stopped = [] { return gCancel.load(); };
+    QString err;
+    if (!runScript(QString::fromUtf8(code.data(), qsizetype(code.size())), QString::fromStdString(std::filesystem::path(file).filename().string()), o, &err)) {
+        std::fprintf(stderr, "error: %s\n", err.toUtf8().constData());
+        return 1;
+    }
+    return 0;
+}
+
 int cmdPresets() {
     for (const auto& p : exportPresets())
         std::printf("%-28s .%-5s %s\n", p.name.c_str(), p.extension.c_str(), p.description.c_str());
@@ -1266,6 +1308,7 @@ int main(int argc, char** argv) {
     if (cmd == "people") return cmdPeople(args);
     if (cmd == "speak") return cmdSpeak(args);
     if (cmd == "clone-speech") return cmdCloneSpeech(args);
+    if (cmd == "script") return cmdScript(args);
     if (cmd == "mcp") {
 #ifdef MONTAGE_LIVE_BRIDGE
         // --live: the tools work on the project open in the running app (Tools > Agent Link), relayed to it.

@@ -117,6 +117,7 @@
 #include "media/Inpaint.h"
 #include "media/VisualSearch.h"
 #include "automation/McpServer.h"
+#include "automation/ScriptHost.h"
 #include "core/Cdl.h"
 #ifdef MONTAGE_WITH_WHISPER
 #include "media/Transcriber.h"
@@ -9023,6 +9024,65 @@ private slots:
         QCOMPARE(replaced.findMedia(a.id)->name, std::string("c.mp4"));
         QCOMPARE(replaced.findMedia(subItem.id)->path, path("relink/c.mp4"));
         QCOMPARE(replaced.active()->videoTracks[0].clips.size(), size_t(1));
+    }
+
+    void luaScripts() {
+        if (!scriptingAvailable()) QSKIP("built without Lua");
+        QTemporaryDir dir;
+        const QString project = dir.path() + "/s.montage";
+        McpServer server;
+        ScriptOptions o = toolScriptOptions(server, project);
+        QStringList printed;
+        o.print = [&](const QString& line) { printed << line; };
+        o.args = {"Hello", "2"};
+        QVERIFY(o.tools.contains("montage_add_title") && o.tools.contains("montage_create_project"));
+        // A project made, two titles put on it (by the tool's short name and by montage.call), its clips read back;
+        // the script's arguments, results as tables, montage.json and montage.project.
+        QString err;
+        const QString code = R"lua(
+            montage.create_project{width = 1280, height = 720, fps = 25}
+            local first = montage.add_title{text = montage.args[1], at = 0, duration = tonumber(montage.args[2])}
+            local second = montage.call("montage_add_title", {text = "World", at = 2})
+            assert(first.id ~= second.id)
+            local info = montage.project_info{}
+            local titles = 0
+            for _, track in ipairs(info.tracks) do
+              for _, clip in ipairs(track.clips or {}) do
+                if clip.generator == "title" then titles = titles + 1 end
+              end
+            end
+            print("titles", titles)
+            print(montage.json({1, 2, {a = true}}):gsub("%s", ""))
+            print(montage.project:match("s%.montage$") ~= nil)
+            print(math.type(info.width), info.width)
+        )lua";
+        QVERIFY2(runScript(code, "make.lua", o, &err), qPrintable(err));
+        QCOMPARE(printed.value(0), QStringLiteral("titles\t2"));
+        QCOMPARE(printed.value(1).section('\t', 0, 0), QStringLiteral("[1,2,{\"a\":true}]"));
+        QCOMPARE(printed.value(2), QStringLiteral("true"));
+        QCOMPARE(printed.value(3), QStringLiteral("integer\t1280"));
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.active()->width, 1280);
+        // A tool's error stops the script with its message and the line it was called on; so does a tool that does
+        // not exist, a Lua error, and a script that does not parse.
+        QVERIFY(!runScript("\n\nmontage.add_title{text = 'x', at = 'not a time'}", "bad.lua", o, &err));
+        QVERIFY2(err.startsWith("bad.lua:3:") && err.contains("montage_add_title"), qPrintable(err));
+        QVERIFY(!runScript("montage.no_such_tool{}", "t.lua", o, &err));
+        QVERIFY2(err.contains("no tool montage.no_such_tool"), qPrintable(err));
+        QVERIFY(!runScript("error('mine')", "e.lua", o, &err) && err.contains("mine"));
+        QVERIFY(!runScript("this is not lua", "p.lua", o, &err) && err.startsWith("p.lua:1:"));
+        QVERIFY(!runScript("os.exit(3)", "x.lua", o, &err) && err.contains("os.exit"));  // (would end the app)
+        // montage.tools() lists them; a table that holds itself is refused rather than followed for ever.
+        printed.clear();
+        QVERIFY(runScript("print(#montage.tools() > 50)", "n.lua", o, &err));
+        QCOMPARE(printed.value(0), QStringLiteral("true"));
+        QVERIFY(!runScript("local t = {}; t.t = t; montage.project_info(t)", "loop.lua", o, &err) && err.contains("nested"));
+        // Stopped: a script that never ends stops when its host says so.
+        int asked = 0;
+        o.stopped = [&] { return ++asked > 20; };
+        QVERIFY(!runScript("while true do end", "forever.lua", o, &err));
+        QCOMPARE(err, QStringLiteral("Stopped"));
     }
 
     void consolidateKeepsGraphicPictures() {

@@ -68,6 +68,7 @@ class VoiceoverDialog;
 class LinkMediaDialog;
 class LiveLink;
 class AssistantPanel;
+class ScriptConsole;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -193,6 +194,7 @@ public:
     // Tools › Agent Link: AI agents edit the open project over MCP (app/LiveLink.h). On or off (remembered), and the
     // dialog with how to connect.
     LiveLink* liveLink() const { return liveLink_; }
+    ScriptConsole* scriptConsole() const { return scripts_; }
     AssistantPanel* assistant() const { return assistant_; }
     bool setAgentLink(bool on);
     void agentLinkDialog();
@@ -488,6 +490,9 @@ private:
     QDockWidget* peopleDock_ = nullptr;
     QDockWidget* assistantDock_ = nullptr;
     AssistantPanel* assistant_ = nullptr;
+    // Tools › Scripts: Lua scripts on the open project (app/ScriptConsole.h).
+    QDockWidget* scriptsDock_ = nullptr;
+    ScriptConsole* scripts_ = nullptr;
     QDockWidget* indexDock_ = nullptr;
     QDockWidget* stackedDock_ = nullptr;
     StackedTimelineWidget* stacked_ = nullptr;
