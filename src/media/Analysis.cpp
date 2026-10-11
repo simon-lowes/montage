@@ -1,4 +1,5 @@
 #include "Analysis.h"
+#include "media/Proxy.h"
 
 #include <QImage>
 #include <QString>
@@ -100,35 +101,9 @@ std::vector<double> detectSceneCuts(const std::string& path, double sensitivity,
 
 bool createProxy(const std::string& source, const std::string& proxyPath, int maxWidth, const AnalysisProgress& progress,
                  const std::atomic<bool>* cancel, std::string* error) {
-    MediaItem m;
-    if (!probeMedia(source, m, error)) return false;
-    if (!m.hasVideo || m.kind != MediaKind::Video) {
-        if (error) *error = "Proxies are only made for video files";
-        return false;
-    }
-    // Render the clip through a sequence of its own size and rate.
-    Project p = makeDefaultProject();
-    Sequence& s = *p.active();
-    s.width = m.width;
-    s.height = m.height;
-    s.fps = m.fps.valid() ? m.fps : Rational{30, 1};
-    // 360° footage whole, not as a view. (A stereo file's proxy holds its left eye: the right is read from the file.)
-    s.spherical = !m.projection.empty();
-    s.vr180 = m.projection == "vr180";
-    m.id = p.newId();
-    p.media.push_back(m);
-    edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
-    ExportSettings st;
-    st.path = proxyPath;
-    st.videoCodec = "libx264";
-    st.audioCodec = "none";
-    st.crf = 23;
-    st.preset = "veryfast";
-    st.gop = 1;  // intra-only: every frame is a seek point
-    double scale = std::min(1.0, double(maxWidth) / std::max(1, m.width));
-    st.width = std::max(2, int(std::lround(m.width * scale)) & ~1);
-    st.height = std::max(2, int(std::lround(m.height * scale)) & ~1);
-    return exportSequence(p, s, st, [&](double f, FrameTime) { if (progress) progress(f); }, cancel, error);
+    ProxyOptions o;
+    o.maxWidth = maxWidth;
+    return createProxy(source, proxyPath, o, progress, cancel, error);
 }
 
 bool createSuperScaled(const std::string& source, const std::string& dest, int factor, double strength,

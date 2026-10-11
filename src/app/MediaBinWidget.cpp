@@ -60,6 +60,8 @@
 #include "SmartBinDialog.h"
 #include "Theme.h"
 #include "ThumbnailCache.h"
+#include "media/MediaPool.h"
+#include "media/Proxy.h"
 #include "media/Relink.h"
 #include "TranscribeDialog.h"
 #include "core/Slate.h"
@@ -1424,7 +1426,14 @@ void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos)
     }
     if (!videos.empty()) {
         menu.addSeparator();
-        menu.addAction(tr("Create Proxy Media"), this, [this, videos] { createProxies(videos); });
+        menu.addAction(tr("Create Proxy Media…"), this, [this, videos] {
+            if (auto o = proxyOptionsDialog()) createProxies(videos, *o);
+        })->setObjectName(QStringLiteral("createProxies"));
+        menu.addAction(tr("Attach Proxies From Folder…"), this, [this, videos] {
+            const QString dir = QFileDialog::getExistingDirectory(this, tr("Attach Proxies From Folder"),
+                                                                  appSettings().value(QStringLiteral("proxy/attachFolder")).toString());
+            if (!dir.isEmpty()) attachProxiesFrom(videos, dir);
+        });
         menu.addAction(tr("Detach Proxy Media"), this, [this, videos] {
             state_->edit(tr("Detach Proxies"), [videos](Project& p, Sequence&) {
                 for (Id id : videos)
@@ -1531,19 +1540,91 @@ void MediaBinWidget::createSuperScaleCopies(const std::vector<Id>& ids, int fact
     }));
 }
 
-void MediaBinWidget::createProxies(const std::vector<Id>& ids) {
-    QString dir = QStandardPaths::writableLocation(QStandardPaths::CacheLocation) + "/proxies";
-    QDir().mkpath(dir);
+std::optional<ProxyOptions> MediaBinWidget::proxyOptionsDialog() {
+    // Final Cut's and Resolve's proxy settings: format, size, sound and where they go; remembered.
+    QDialog dlg(this);
+    dlg.setObjectName(QStringLiteral("proxyOptions"));
+    dlg.setWindowTitle(tr("Create Proxy Media"));
+    auto* form = new QFormLayout(&dlg);
+    auto* format = new QComboBox(&dlg);
+    format->setObjectName(QStringLiteral("proxyFormat"));
+    format->addItem(tr("H.264 (fast seeking)"), QStringLiteral("h264"));
+    format->addItem(tr("Apple ProRes 422 Proxy (keeps HDR)"), QStringLiteral("prores_proxy"));
+    format->addItem(tr("Avid DNxHR LB"), QStringLiteral("dnxhr_lb"));
+    format->addItem(tr("HEVC 10-bit (smallest, keeps HDR)"), QStringLiteral("hevc10"));
+    format->setCurrentIndex(std::max(0, format->findData(appSettings().value(QStringLiteral("proxy/format"), "h264"))));
+    auto* size = new QComboBox(&dlg);
+    size->setObjectName(QStringLiteral("proxySize"));
+    size->addItem(tr("Quarter size"), -1);
+    size->addItem(tr("Half size"), 0);
+    for (int w : {960, 1280, 1920}) size->addItem(tr("%1 wide at most").arg(w), w);
+    size->setCurrentIndex(std::max(0, size->findData(appSettings().value(QStringLiteral("proxy/width"), 960))));
+    auto* sound = new QCheckBox(tr("With sound (to edit with the proxies alone, the originals offline)"), &dlg);
+    sound->setObjectName(QStringLiteral("proxySound"));
+    sound->setChecked(appSettings().value(QStringLiteral("proxy/sound"), false).toBool());
+    auto* where = new QComboBox(&dlg);
+    where->setObjectName(QStringLiteral("proxyWhere"));
+    where->addItem(tr("Montage's cache"), QStringLiteral("cache"));
+    where->addItem(tr("A Proxy folder beside each original"), QStringLiteral("beside"));
+    where->setCurrentIndex(std::max(0, where->findData(appSettings().value(QStringLiteral("proxy/where"), "cache"))));
+    where->setToolTip(tr("Beside the originals, the proxies travel with the media drive"));
+    form->addRow(tr("Format:"), format);
+    form->addRow(tr("Size:"), size);
+    form->addRow(QString(), sound);
+    form->addRow(tr("Save in:"), where);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    buttons->button(QDialogButtonBox::Ok)->setText(tr("Create"));
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    form->addRow(buttons);
+    if (proxyDialogHook_) proxyDialogHook_(&dlg);
+    if (dlg.exec() != QDialog::Accepted) return std::nullopt;
+    appSettings().setValue(QStringLiteral("proxy/format"), format->currentData());
+    appSettings().setValue(QStringLiteral("proxy/width"), size->currentData());
+    appSettings().setValue(QStringLiteral("proxy/sound"), sound->isChecked());
+    appSettings().setValue(QStringLiteral("proxy/where"), where->currentData());
+    ProxyOptions o;
+    parseProxyFormat(format->currentData().toString().toStdString(), o.format);
+    o.maxWidth = size->currentData().toInt();
+    o.sound = sound->isChecked();
+    return o;
+}
+
+int MediaBinWidget::attachProxiesFrom(const std::vector<Id>& ids, const QString& folder) {
+    appSettings().setValue(QStringLiteral("proxy/attachFolder"), folder);
+    const std::map<Id, std::string> found = findCameraProxies(state_->project(), ids, folder.toStdString());
+    if (!found.empty())
+        state_->edit(tr("Attach Proxies"), [found](Project& p, Sequence&) {
+            for (const auto& [id, path] : found)
+                if (MediaItem* m = p.findMedia(id)) m->proxyPath = path;
+            return true;
+        });
+    state_->message(found.empty() ? tr("No proxies found for these clips (a video file named like each, of the same length)")
+                                  : tr("Attached %n proxy file(s)", nullptr, int(found.size())),
+                    5000);
+    return int(found.size());
+}
+
+void MediaBinWidget::createProxies(const std::vector<Id>& ids, const ProxyOptions& options) {
+    const bool beside = appSettings().value(QStringLiteral("proxy/where"), "cache").toString() == QLatin1String("beside");
+    const QString cache = QStandardPaths::writableLocation(QStandardPaths::CacheLocation) + "/proxies";
     struct Job {
         Id id;
         std::string src, dst;
     };
     std::vector<Job> jobs;
+    const QString ext = QString::fromStdString(proxyExtension(options.format));
     for (Id id : ids) {
         const MediaItem* m = state_->project().findMedia(id);
         if (!m) continue;
-        QByteArray hash = QCryptographicHash::hash(QByteArray::fromStdString(m->path), QCryptographicHash::Sha1).toHex().left(16);
-        jobs.push_back({id, m->path, (dir + "/" + QString::fromLatin1(hash) + "_proxy.mp4").toStdString()});
+        // In the cache under a name from the file's path and the format, or as Proxy/<name>_Proxy beside the file.
+        const QFileInfo src(QString::fromStdString(m->path));
+        QString dir = beside ? src.absolutePath() + QStringLiteral("/Proxy") : cache;
+        QDir().mkpath(dir);
+        if (beside && !QFileInfo(dir).isWritable()) dir = cache, QDir().mkpath(dir);  // (a read-only card: the cache instead)
+        const QByteArray hash = QCryptographicHash::hash(QByteArray::fromStdString(m->path + "|" + proxyFormatName(options.format)), QCryptographicHash::Sha1).toHex().left(16);
+        const QString name = beside && dir != cache ? src.completeBaseName() + QStringLiteral("_Proxy") : QString::fromLatin1(hash) + QStringLiteral("_proxy");
+        jobs.push_back({id, m->path, (dir + "/" + name + ext).toStdString()});
     }
     if (jobs.empty()) return;
     auto* dlg = new QProgressDialog(tr("Creating proxy media..."), tr("Cancel"), 0, 1000, this);
@@ -1572,7 +1653,7 @@ void MediaBinWidget::createProxies(const std::vector<Id>& ids) {
         else state_->message(tr("Proxy media ready — toggle \"Proxy\" in the Program monitor to use it"), 6000);
     });
     QPointer<QProgressDialog> guard(dlg);
-    watcher->setFuture(QtConcurrent::run([jobs, cancel, guard]() {
+    watcher->setFuture(QtConcurrent::run([jobs, cancel, guard, options]() {
         QStringList errors;
         for (size_t i = 0; i < jobs.size(); ++i) {
             std::string err;
@@ -1582,10 +1663,19 @@ void MediaBinWidget::createProxies(const std::vector<Id>& ids) {
                     if (guard) guard->setValue(v);
                 }, Qt::QueuedConnection);
             };
-            if (!createProxy(jobs[i].src, jobs[i].dst, 960, progress, cancel.get(), &err)) {
-                QFile::remove(QString::fromStdString(jobs[i].dst));
+            // Written beside under another name and then put in place, so a proxy being played is never half written.
+            const QString dst = QString::fromStdString(jobs[i].dst);
+            const QFileInfo fi(dst);
+            const QString part = fi.absolutePath() + "/" + fi.completeBaseName() + QStringLiteral("_writing.") + fi.suffix();
+            if (!createProxy(jobs[i].src, part.toStdString(), options, progress, cancel.get(), &err)) {
+                QFile::remove(part);
                 if (*cancel) break;
                 errors << QString::fromStdString(err);
+            } else {
+                QFile::remove(dst);
+                if (!QFile::rename(part, dst)) QFile::remove(part), errors << tr("Could not write %1").arg(dst);
+                MediaPool::instance().forget(jobs[i].dst);
+                forgetFileFacts(jobs[i].dst);
             }
         }
         return errors;
@@ -1595,7 +1685,7 @@ void MediaBinWidget::createProxies(const std::vector<Id>& ids) {
 int MediaBinWidget::logSlatesFromPicture(const std::vector<Id>& media) {
     std::vector<std::pair<Id, std::string>> videos;
     for (Id id : media)
-        if (const MediaItem* m = state_->project().findMedia(id); m && m->kind == MediaKind::Video && !m->path.empty()) videos.push_back({id, m->path});
+        if (const MediaItem* m = state_->project().findMedia(id); m && m->kind == MediaKind::Video && !m->path.empty()) videos.push_back({id, analysisSource(*m)});
     if (videos.empty()) return 0;
     if (!ensureModelPack(window(), ocrModel(), tr("Log Slate from Picture"),
                          tr("Reading the slate uses PP-OCR (PaddlePaddle, Apache-2.0), which runs on this computer.")))

@@ -50,6 +50,7 @@
 #include "media/DualSystem.h"
 #include "media/FieldRecorder.h"
 #include "media/Analysis.h"
+#include "media/Proxy.h"
 #include "media/AudioSync.h"
 #include "media/AutoDuck.h"
 #include "media/Decoder.h"
@@ -17277,6 +17278,158 @@ private slots:
         QCOMPARE(empty.width, 320);
         QCOMPARE(empty.fps.toDouble(), 30.0);
         QVERIFY(!edit::matchSequenceToMedia(s2, src));  // not empty
+    }
+
+    void proxyFormatsAndOfflineEditing() {
+        // A blue 512x288 clip with a 0.4 tone, a second long.
+        std::string wav = path("pxtone.wav");
+        writeWav(wav, 48000, 1.0, 0.4f, 0.4f);
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 512, s.height = 288, s.fps = {30, 1};
+        MediaItem tone = probeOrFail(p, wav);
+        p.media.push_back(tone);
+        QVERIFY(edit::placeMedia(p, s, tone.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Clip blue = makeGeneratorClip(p, "color", 30);
+        blue.generator.params["color.r"] = 0.1;
+        blue.generator.params["color.g"] = 0.1;
+        blue.generator.params["color.b"] = 0.9;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, blue);
+        ExportSettings st;
+        st.path = path("pxsrc.mp4");
+        st.preset = "ultrafast";
+        std::string err;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+
+        // Each format: its codec, its size, sound only when asked.
+        struct Want {
+            ProxyFormat format;
+            int maxWidth;
+            bool sound;
+            const char* codec;
+            int w, h;
+        };
+        std::map<ProxyFormat, std::string> made;
+        for (const Want& w : {Want{ProxyFormat::H264, 256, false, "h264", 256, 144}, Want{ProxyFormat::ProResProxy, 0, true, "prores", 256, 144},
+                              Want{ProxyFormat::DnxhrLb, -1, false, "dnxhd", 256, 144},  // (a quarter, kept at DNxHR's least)
+                              Want{ProxyFormat::Hevc10, 320, true, "hevc", 320, 180}}) {
+            ProxyOptions o;
+            o.format = w.format, o.maxWidth = w.maxWidth, o.sound = w.sound;
+            const std::string out = path((std::string("pxsrc_") + proxyFormatName(w.format) + proxyExtension(w.format)).c_str());
+            QVERIFY2(createProxy(st.path, out, o, nullptr, nullptr, &err), err.c_str());
+            Project q;
+            const MediaItem pm = probeOrFail(q, out);
+            QCOMPARE(pm.videoCodec, std::string(w.codec));
+            QCOMPARE(pm.width, w.w);
+            QCOMPARE(pm.height, w.h);
+            QCOMPARE(pm.hasAudio, w.sound);
+            QVERIFY(std::fabs(pm.duration - 1.0) < 0.1);
+            made[w.format] = out;
+        }
+        ProxyFormat f;
+        QVERIFY(parseProxyFormat("prores_proxy", f) && f == ProxyFormat::ProResProxy);
+        QVERIFY(!parseProxyFormat("prores", f));
+        QCOMPARE(proxyExtension(ProxyFormat::DnxhrLb), std::string(".mov"));
+        // Audio-only files have no proxy.
+        QVERIFY(!createProxy(wav, path("pxtone_proxy.mp4"), ProxyOptions{}, nullptr, nullptr, &err));
+
+        // HDR: ProRes and HEVC proxies stay HDR10; H.264 and DNxHR are tone mapped to Rec.709.
+        {
+            Project h = makeDefaultProject();
+            Sequence& hs = *h.active();
+            hs.width = 320, hs.height = 180, hs.fps = {25, 1};
+            hs.colorSpace = "rec2100pq";
+            hs.hdrPeakNits = 1000;
+            Clip c = makeGeneratorClip(h, "color", 10);
+            for (const char* k : {"color.r", "color.g", "color.b"}) c.generator.params[k] = 1.0;
+            edit::overwrite(h, hs, {TrackKind::Video, 0}, c);
+            ExportSettings hst;
+            hst.path = path("pxhdr.mp4");
+            hst.videoCodec = "libx265";
+            hst.audioCodec = "none";
+            hst.preset = "ultrafast";
+            QVERIFY2(exportSequence(h, hs, hst, nullptr, nullptr, &err), err.c_str());
+            for (ProxyFormat pf : {ProxyFormat::H264, ProxyFormat::ProResProxy, ProxyFormat::DnxhrLb, ProxyFormat::Hevc10}) {
+                ProxyOptions o;
+                o.format = pf;
+                const std::string out = path((std::string("pxhdr_") + proxyFormatName(pf) + proxyExtension(pf)).c_str());
+                QVERIFY2(createProxy(hst.path, out, o, nullptr, nullptr, &err), err.c_str());
+                Project q;
+                const MediaItem pm = probeOrFail(q, out);
+                QVERIFY2((pm.colorSpace == "rec2100pq") == proxyKeepsHdr(pf), (std::string(proxyFormatName(pf)) + " " + pm.colorSpace).c_str());
+            }
+        }
+
+        // Editing with the proxies alone: the original moved away, the clip's picture and sound come from its proxy.
+        Project e = makeDefaultProject();
+        Sequence& es = *e.active();
+        es.width = 512, es.height = 288, es.fps = {30, 1};
+        const std::string moved = path("pxsrc_moved.mp4");
+        QFile::remove(QString::fromStdString(moved));
+        QVERIFY(QFile::copy(QString::fromStdString(st.path), QString::fromStdString(moved)));
+        MediaItem src = probeOrFail(e, moved);
+        src.proxyPath = made[ProxyFormat::ProResProxy];
+        e.media.push_back(src);
+        QCOMPARE(pictureSource(src, true), src.proxyPath);  // proxies on: the proxy, without looking at the file
+        QVERIFY(QFile::remove(QString::fromStdString(moved)));
+        QCOMPARE(pictureSource(src, false), src.proxyPath);
+        QCOMPARE(soundSource(src), src.proxyPath);
+        MediaItem silent = src;
+        silent.proxyPath = made[ProxyFormat::H264];
+        QCOMPARE(pictureSource(silent, false), silent.proxyPath);
+        QCOMPARE(soundSource(silent), moved);  // (a proxy without sound: the file's, which is not there)
+        MediaItem none = src;
+        none.proxyPath.clear();
+        QCOMPARE(pictureSource(none, false), moved);
+        QVERIFY(edit::placeMedia(e, es, src.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Image img = renderProgramFrame(e, es, 15, RenderOptions{});
+        QVERIFY2(img.at(256, 144)[2] > 0.6f && img.at(256, 144)[0] < 0.3f, "the proxy's blue, not Media Offline");
+        AudioMixer mixer;
+        std::vector<float> out(4800 * 2);
+        mixer.mix(e, es, 12000, 4800, out.data());
+        QVERIFY2(std::fabs(out[2000] - 0.4f) < 0.02f, qPrintable(QString::number(out[2000])));
+
+        // Shot analysis reads a proxy at least 640 wide (not this 256-wide one).
+        QCOMPARE(analysisSource(src), moved);
+        {
+            Project g = makeDefaultProject();
+            Sequence& gs = *g.active();
+            gs.width = 640, gs.height = 360;
+            edit::overwrite(g, gs, {TrackKind::Video, 0}, makeGeneratorClip(g, "bars", 10));
+            ExportSettings gst;
+            gst.path = path("pxwide.mp4");
+            gst.audioCodec = "none";
+            gst.preset = "ultrafast";
+            QVERIFY2(exportSequence(g, gs, gst, nullptr, nullptr, &err), err.c_str());
+            MediaItem wide = src;
+            wide.proxyPath = gst.path;
+            QCOMPARE(analysisSource(wide), gst.path);
+            QCOMPARE(fileWidth(gst.path), 640);
+        }
+
+        // Camera proxies found by name and length: "pxsrc_moved_a" comes first by name but is three seconds long.
+        const QString cam = QString::fromStdString(path("pxcam"));
+        QDir(cam).removeRecursively();
+        QVERIFY(QDir().mkpath(cam + "/Sub"));
+        QVERIFY(QFile::copy(QString::fromStdString(made[ProxyFormat::H264]), cam + "/Sub/PXSRC_MOVED_Proxy.mp4"));
+        QVERIFY(QFile::copy(QString::fromStdString(made[ProxyFormat::H264]), cam + "/other.mp4"));
+        {
+            Project g = makeDefaultProject();
+            Sequence& gs = *g.active();
+            gs.width = 64, gs.height = 36;
+            edit::overwrite(g, gs, {TrackKind::Video, 0}, makeGeneratorClip(g, "bars", 90));
+            ExportSettings gst;
+            gst.path = (cam + "/pxsrc_moved_a.mp4").toStdString();
+            gst.audioCodec = "none";
+            gst.preset = "ultrafast";
+            QVERIFY2(exportSequence(g, gs, gst, nullptr, nullptr, &err), err.c_str());
+        }
+        src.proxyPath.clear();
+        e.findMedia(src.id)->proxyPath.clear();
+        const auto found = findCameraProxies(e, {src.id}, cam.toStdString());
+        QCOMPARE(found.size(), size_t(1));
+        QCOMPARE(QFileInfo(QString::fromStdString(found.at(src.id))).fileName(), QString("PXSRC_MOVED_Proxy.mp4"));
+        QVERIFY(findCameraProxies(e, {src.id}, path("no-such-folder")).empty());
     }
 
     void exportAudioAndIntermediates() {

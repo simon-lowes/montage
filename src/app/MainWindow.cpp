@@ -111,6 +111,7 @@
 #include "ProjectManagerDialog.h"
 #include "LinkMediaDialog.h"
 #include "EffectPresetStore.h"
+#include "media/Proxy.h"
 #include "media/Relink.h"
 #include "KeyframePanel.h"
 #include "MediaBinWidget.h"
@@ -2150,7 +2151,15 @@ bool MainWindow::openProjectAs(const QString& path, OpenMode mode) {
     appSettings().setValue("lastProjectDir", QFileInfo(path).absolutePath());
     timeline_->zoomToFit();
     statusBar()->showMessage(tr("Opened %1").arg(path), 4000);
-    if (!offlineMedia(state_->project()).empty()) showLinkMedia();
+    // Offline files are asked about, unless every one has its proxy here (editing with the proxies alone).
+    if (const std::vector<Id> offline = offlineMedia(state_->project()); !offline.empty()) {
+        const bool proxied = std::all_of(offline.begin(), offline.end(), [&](Id id) {
+            const MediaItem* m = state_->project().findMedia(id);
+            return m && m->kind == MediaKind::Video && !m->proxyPath.empty() && QFileInfo::exists(QString::fromStdString(m->proxyPath));
+        });
+        if (proxied) statusBar()->showMessage(tr("%n file(s) offline: playing from their proxies", nullptr, int(offline.size())), 8000);
+        else showLinkMedia();
+    }
     return true;
 }
 
@@ -3549,7 +3558,7 @@ void MainWindow::detectScenes() {
         return;
     }
     const Id clipId = c->id;
-    const std::string path = m->path;
+    const std::string path = analysisSource(*m);  // (a proxy reads quicker, and is there when the file is not)
     auto* dlg = new QProgressDialog(tr("Detecting scene cuts in %1...").arg(QString::fromStdString(m->name)), tr("Cancel"), 0, 1000, this);
     dlg->setWindowModality(Qt::WindowModal);
     dlg->setMinimumDuration(300);

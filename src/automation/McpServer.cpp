@@ -43,6 +43,7 @@
 #include "audio/SpeechCleanup.h"
 #include "core/AafImport.h"
 #include "media/Offload.h"
+#include "media/Proxy.h"
 #include "media/SpeechSearch.h"
 #include "media/TextReader.h"
 #include "media/ImageSequence.h"
@@ -554,7 +555,7 @@ QString McpServer::Impl::indexMissing(Project& p, const std::vector<Id>& only, b
         if (m.kind != MediaKind::Video || !m.hasVideo || m.path.empty() || m.subclipOf || (m.visual && !m.visual->samples.empty())) continue;
         VisualIndex v;
         std::string err;
-        if (!indexVideo(m.path, m.duration, v, 0, [&](double f) { progress(f, QStringLiteral("Indexing %1").arg(QString::fromStdString(m.name))); }, nullptr, &err))
+        if (!indexVideo(analysisSource(m), m.duration, v, 0, [&](double f) { progress(f, QStringLiteral("Indexing %1").arg(QString::fromStdString(m.name))); }, nullptr, &err))
             return QString::fromStdString(m.name + ": " + err);
         m.visual = std::make_shared<const VisualIndex>(std::move(v));
         changed = true;
@@ -3057,7 +3058,7 @@ void McpServer::Impl::addTools() {
                 for (MediaItem* m : items) {
                     SlateInfo slate;
                     std::string why;
-                    const bool found = m->kind == MediaKind::Video && readSlateFromPicture(m->path, slate, &why);
+                    const bool found = m->kind == MediaKind::Video && readSlateFromPicture(analysisSource(*m), slate, &why);
                     if (found) {
                         if (!slate.scene.empty()) setMediaField(*m, "scene", slate.scene);
                         if (!slate.shot.empty()) setMediaField(*m, "shot", slate.shot);

@@ -21,6 +21,7 @@
 #include "core/ProjectLock.h"
 #include "media/Decoder.h"
 #include "media/MediaPool.h"
+#include "media/Proxy.h"
 #include "media/ImageSequence.h"
 #include "media/Relink.h"
 #include "Settings.h"
@@ -596,6 +597,7 @@ void EditorState::startClipAudioDecodes() {
                 // An ambisonic file's field (core/Ambisonics.h), or the channels a clip picked.
                 const bool field = m->ambisonic > 0 && c.channels.empty();
                 if (c.channels.empty() && !field) continue;
+                if (soundSource(*m) != m->path) continue;  // (offline: its proxy's sound plays whole, decoded with the media)
                 std::string key = field ? ambisonicAudioKey(m->path) : audioKey(m->path, c.channels);
                 if (!clipAudioRequested_.insert({key, rate}).second) continue;
                 (void)QtConcurrent::run([key, rate] { MediaPool::instance().audio(key, rate); });
@@ -606,7 +608,7 @@ void EditorState::startAudioDecode(const MediaItem& m) {
     if (!m.hasAudio || m.path.empty() || m.kind == MediaKind::Image) return;
     const Sequence* s = sequence();
     int rate = s ? s->sampleRate : 48000;
-    std::string path = m.path;
+    std::string path = soundSource(m);  // (an offline file's proxy, when it carries sound)
     (void)QtConcurrent::run([path, rate] { MediaPool::instance().audio(path, rate); });
 }
 

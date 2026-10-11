@@ -84,6 +84,7 @@ add_library(montage_engine STATIC
   media/MediaPool.h media/MediaPool.cpp
   media/Relink.h media/Relink.cpp
   media/Analysis.h media/Analysis.cpp
+  media/Proxy.h media/Proxy.cpp
   media/Loudness.h media/Loudness.cpp
   media/AudioSync.h media/AudioSync.cpp
   media/FieldRecorder.h media/FieldRecorder.cpp

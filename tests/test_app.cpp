@@ -92,6 +92,7 @@
 #include "EffectPresetStore.h"
 #include "EffectsBrowser.h"
 #include "MediaBinWidget.h"
+#include "media/Proxy.h"
 #include "StoryboardView.h"
 #include "StackedTimelineWidget.h"
 #include "SmartBinDialog.h"
@@ -3069,6 +3070,103 @@ private slots:
         QCOMPARE(*back.findMedia(id)->transcript, *transcript);
         state()->newProject();
         QVERIFY(QTest::qWaitForWindowActive(win_.get()));  // the window has the focus back
+    }
+
+    void proxyMediaFromTheBin() {
+        // A camera clip with sound.
+        const QString root = dir_.path() + "/proxies";
+        QDir(root).removeRecursively();
+        QVERIFY(QDir().mkpath(root + "/card"));
+        const QString video = root + "/card/B001.mp4";
+        {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 320, gs.height = 180;
+            MediaItem src;
+            src.id = gen.newId();
+            std::string err;
+            QVERIFY(probeMedia(MONTAGE_TEST_DATA_DIR "/jfk.wav", src, &err));
+            gen.media.push_back(src);
+            Clip sound = makeClip(gen, src, TrackKind::Audio, gs);
+            sound.duration = 30;
+            edit::overwrite(gen, gs, {TrackKind::Audio, 0}, sound);
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, makeGeneratorClip(gen, "bars", 30));
+            ExportSettings st;
+            st.path = video.toStdString();
+            st.preset = "ultrafast";
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        state()->newProject();
+        const auto ids = state()->importFiles({video});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id id = ids[0];
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        auto* bin = win_->findChild<MediaBinWidget*>();
+        QVERIFY(bin);
+
+        // The options: ProRes Proxy, half size, with sound, in a Proxy folder beside the original; remembered.
+        bin->proxyDialogHook_ = [](QDialog* d) {
+            auto* format = d->findChild<QComboBox*>("proxyFormat");
+            format->setCurrentIndex(format->findData("prores_proxy"));
+            auto* size = d->findChild<QComboBox*>("proxySize");
+            size->setCurrentIndex(size->findData(0));
+            d->findChild<QCheckBox*>("proxySound")->setChecked(true);
+            auto* where = d->findChild<QComboBox*>("proxyWhere");
+            where->setCurrentIndex(where->findData("beside"));
+            QMetaObject::invokeMethod(d, "accept", Qt::QueuedConnection);
+        };
+        const auto options = bin->proxyOptionsDialog();
+        QVERIFY(options);
+        QVERIFY(options->format == ProxyFormat::ProResProxy && options->maxWidth == 0 && options->sound);
+        QString shown;
+        bin->proxyDialogHook_ = [&shown](QDialog* d) {
+            shown = d->findChild<QComboBox*>("proxyFormat")->currentData().toString();
+            QMetaObject::invokeMethod(d, "reject", Qt::QueuedConnection);
+        };
+        QVERIFY(!bin->proxyOptionsDialog());
+        QCOMPARE(shown, QString("prores_proxy"));
+        bin->proxyDialogHook_ = nullptr;
+
+        // Made in the background and attached in one undo step, nothing half written left behind.
+        bin->createProxies({id}, *options);
+        const QString proxy = root + "/card/Proxy/B001_Proxy.mov";
+        QTRY_COMPARE_WITH_TIMEOUT(state()->project().findMedia(id)->proxyPath, proxy.toStdString(), 60000);
+        QVERIFY(QFileInfo::exists(proxy));
+        QCOMPARE(QDir(root + "/card/Proxy").entryList(QDir::Files), QStringList{"B001_Proxy.mov"});
+        MediaItem made;
+        QVERIFY(probeMedia(proxy.toStdString(), made));
+        QVERIFY(made.width == 160 && made.hasAudio && made.videoCodec == "prores");
+        state()->undo();
+        QVERIFY(state()->project().findMedia(id)->proxyPath.empty());
+
+        // Or the camera's own proxies, found in a folder by name and length.
+        QCOMPARE(bin->attachProxiesFrom({id}, root + "/card/Proxy"), 1);
+        QCOMPARE(state()->project().findMedia(id)->proxyPath, QFileInfo(proxy).absoluteFilePath().toStdString());
+        QCOMPARE(bin->attachProxiesFrom({id}, root + "/nowhere"), 0);
+        QVERIFY(state()->save(root + "/cut.montage"));
+        state()->newProject();
+
+        // The originals offline: the project opens on its proxies, without asking where the files went.
+        bool renamed = false;
+        QTRY_VERIFY_WITH_TIMEOUT(renamed || (renamed = QDir().rename(root + "/card/B001.mp4", root + "/B001-away.mp4")), 10000);
+        QVERIFY(win_->openProject(root + "/cut.montage"));
+        QVERIFY(!win_->findChild<LinkMediaDialog*>("linkMedia"));
+        QVERIFY(win_->statusBar()->currentMessage().contains("playing from their proxies"));
+        QVERIFY(state()->isMediaOffline(id));
+        // A file without a proxy is still asked about.
+        state()->newProject();
+        bool removed = false;
+        QTRY_VERIFY_WITH_TIMEOUT(removed || (removed = QFile::remove(proxy)), 10000);
+        QVERIFY(win_->openProject(root + "/cut.montage"));
+        auto* dlg = win_->findChild<LinkMediaDialog*>("linkMedia");
+        QVERIFY(dlg && dlg->isVisible());
+        dlg->close();
+        appSettings().setValue(QStringLiteral("proxy/where"), "cache");
+        appSettings().setValue(QStringLiteral("proxy/format"), "h264");
+        appSettings().setValue(QStringLiteral("proxy/sound"), false);
+        state()->newProject();
     }
 
     void mergeClipsAndSyncDailies() {

@@ -25,6 +25,7 @@
 #include "core/History.h"
 #include "media/SoundSearch.h"
 #include "media/SpeechSearch.h"
+#include "media/Proxy.h"
 #include "media/VisualSearch.h"
 
 namespace montage {
@@ -232,7 +233,7 @@ bool indexVideos(EditorState* state, const std::vector<Id>& media, QWidget* pare
         const MediaItem* m = state->project().findMedia(id);
         if (m && m->subclipOf) m = state->project().findMedia(m->subclipOf);  // a subclip's media holds the index
         if (!m || !searchable(*m) || (m->visual && !m->visual->samples.empty())) continue;
-        if (std::none_of(jobs.begin(), jobs.end(), [&](const Job& j) { return j.id == m->id; })) jobs.push_back({m->id, m->path, m->duration});
+        if (std::none_of(jobs.begin(), jobs.end(), [&](const Job& j) { return j.id == m->id; })) jobs.push_back({m->id, analysisSource(*m), m->duration});
     }
     if (jobs.empty()) return true;
     if (!ensureModelPack(parent, visualModel(), QObject::tr("Find Shots"),
@@ -294,7 +295,7 @@ bool indexSounds(EditorState* state, const std::vector<Id>& media, QWidget* pare
         const MediaItem* m = state->project().findMedia(id);
         if (m && m->subclipOf) m = state->project().findMedia(m->subclipOf);
         if (!m || !audible(*m) || (m->sounds && !m->sounds->samples.empty())) continue;
-        if (std::none_of(jobs.begin(), jobs.end(), [&](const Job& j) { return j.id == m->id; })) jobs.push_back({m->id, m->path, m->duration});
+        if (std::none_of(jobs.begin(), jobs.end(), [&](const Job& j) { return j.id == m->id; })) jobs.push_back({m->id, soundSource(*m), m->duration});
     }
     if (jobs.empty()) return true;
     if (!ensureModelPack(parent, soundModel(), QObject::tr("Find Sounds"),

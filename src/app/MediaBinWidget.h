@@ -6,10 +6,13 @@
 
 #include <QTreeWidget>
 #include <QWidget>
+#include <functional>
+#include <optional>
 #include <vector>
 
 #include "core/Interpretation.h"
 #include "core/Model.h"
+#include "media/Proxy.h"
 
 class QAbstractItemView;
 class QLineEdit;
@@ -19,6 +22,8 @@ class QSplitter;
 class QStackedWidget;
 class QToolButton;
 class QTreeView;
+
+class QDialog;
 
 namespace montage {
 
@@ -57,6 +62,13 @@ private:
 class MediaBinWidget : public QWidget {
     Q_OBJECT
 public:
+    // Proxies made as `options` say (where: the setting the dialog keeps), attached when written; the settings asked
+    // first, and camera proxies found in a folder and attached (how many).
+    void createProxies(const std::vector<Id>& ids, const ProxyOptions& options);
+    std::optional<ProxyOptions> proxyOptionsDialog();
+    int attachProxiesFrom(const std::vector<Id>& ids, const QString& folder);
+    // (Tests: called with the options dialog before it runs, to fill it and accept it.)
+    std::function<void(QDialog*)> proxyDialogHook_;
     enum class View { Icons, List, Board };
 
     explicit MediaBinWidget(EditorState* state, QWidget* parent = nullptr);
@@ -160,7 +172,6 @@ private:
     void showColumnMenu(const QPoint& pos);
     void addKeywordsDialog(const std::vector<Id>& ids);
     void importInto(const QStringList& files, const QString& bin);
-    void createProxies(const std::vector<Id>& ids);
     // Enlarged copies (2-4x) of videos and stills, written beside them and added to the bin.
     void createSuperScaleCopies(const std::vector<Id>& ids, int factor);
     void transcribe(const std::vector<Id>& ids);

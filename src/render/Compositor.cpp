@@ -42,6 +42,7 @@
 #include "core/Surround.h"
 #include "core/History.h"
 #include "media/MediaPool.h"
+#include "media/Proxy.h"
 #include "media/Relink.h"
 #include "media/DepthMap.h"
 #include "media/Matting.h"
@@ -733,7 +734,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             convertColor(src, sequenceColorSpace(*nested), sequenceColorSpace(seq), seq.hdrPeakNits);
         } else if (m->kind == MediaKind::Video || m->kind == MediaKind::Image) {
             if (!m->hasVideo && m->kind != MediaKind::Image) return {};
-            std::string path = (o.useProxies && !m->proxyPath.empty()) ? m->proxyPath : m->path;
+            std::string path = pictureSource(*m, o.useProxies);  // (an offline file plays its proxy)
             // Stereoscopic footage: the eye being rendered (a clip's Stereo 3D effect can swap them). A proxy holds
             // the left eye alone (it is made through a flat sequence), so the right eye is always read from the file.
             if (!m->stereo.empty()) {
@@ -2184,7 +2185,9 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
             }
         } else {
             if (!m->hasAudio) continue;
-            const std::string source = audioKey(m->path, c.channels);  // the file, or the channels the clip plays
+            // The file, or the channels the clip plays (an offline file's proxy with sound plays whole).
+            const std::string sound = soundSource(*m);
+            const std::string source = sound == m->path ? audioKey(m->path, c.channels) : sound;
             AudioBufferPtr buf = nonBlocking_ ? MediaPool::instance().audioIfReady(source, int(sr))
                                               : MediaPool::instance().audio(source, int(sr));
             if (!buf || buf->samples.empty()) continue;

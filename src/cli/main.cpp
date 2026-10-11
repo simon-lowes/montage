@@ -35,6 +35,7 @@
 #include "automation/McpServer.h"
 #include "automation/ScriptHost.h"
 #include "automation/ScriptPanel.h"
+#include "media/Proxy.h"
 #ifdef MONTAGE_LIVE_BRIDGE
 #include "app/LiveBridge.h"
 #endif
@@ -86,7 +87,8 @@ int usage() {
                  "  montage-cli presets\n"
                  "  montage-cli colorspaces\n"
                  "  montage-cli scenes <video> [--sensitivity 0..1]\n"
-                 "  montage-cli proxy <video> -o <proxy.mp4> [--width 960]\n"
+                 "  montage-cli proxy <video> -o <proxy.mp4|.mov> [--format h264|prores_proxy|dnxhr_lb|hevc10]\n"
+                 "                    [--width 960|half|quarter] [--sound]   (an editing proxy; ProRes and HEVC keep HDR)\n"
                  "  montage-cli upscale <video|image> -o <output> [--factor 2|3|4] [--strength 0..1]  (Super Scale)\n"
                  "  montage-cli loudness <media>\n"
                  "  montage-cli edl <project.montage> [-o out.edl]\n"
@@ -456,15 +458,23 @@ int cmdScenes(const std::vector<std::string>& args) {
 int cmdProxy(const std::vector<std::string>& args) {
     if (args.empty()) return usage();
     std::string out;
-    int width = 960;
+    ProxyOptions o;
     for (size_t i = 1; i < args.size(); ++i) {
         if (args[i] == "-o" && i + 1 < args.size()) out = args[++i];
-        else if (args[i] == "--width" && i + 1 < args.size()) width = std::atoi(args[++i].c_str());
+        else if (args[i] == "--width" && i + 1 < args.size()) {
+            const std::string w = args[++i];
+            o.maxWidth = w == "half" ? 0 : w == "quarter" ? -1 : std::max(16, std::atoi(w.c_str()));
+        } else if (args[i] == "--format" && i + 1 < args.size()) {
+            if (!parseProxyFormat(args[++i], o.format)) {
+                std::fprintf(stderr, "error: --format is h264, prores_proxy, dnxhr_lb or hevc10\n");
+                return 2;
+            }
+        } else if (args[i] == "--sound") o.sound = true;
         else return usage();
     }
     if (out.empty()) return usage();
     std::string err;
-    bool ok = createProxy(args[0], out, width, [](double f) {
+    bool ok = createProxy(args[0], out, o, [](double f) {
         std::fprintf(stderr, "\rProxy... %5.1f%%", f * 100.0);
         std::fflush(stderr);
     }, &gCancel, &err);
