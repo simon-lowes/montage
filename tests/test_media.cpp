@@ -13927,7 +13927,7 @@ private slots:
         auto refused = [](const QJsonObject& r) { return r.value("isError").toBool() || r.isEmpty(); };
         const double clipId = double(c.id), effectId = double(e.id);
         QJsonObject r = call({{"clip", clipId}, {"effect", effectId}, {"object", "new_cut"}, {"name", "Blue"}, {"at", 4.0 / 25},
-                              {"points", QJsonArray{QJsonArray{blue[4].x / 640, blue[4].y / 360, 1}}}, {"track", "both"}});
+                              {"points", QJsonArray{QJsonValue(QJsonArray{blue[4].x / 640, blue[4].y / 360, 1})}}, {"track", "both"}});
         QVERIFY2(!refused(r), QJsonDocument(r).toJson().constData());
         const QJsonArray objs = r.value("structuredContent").toObject().value("objects").toArray();
         QCOMPARE(objs.size(), 2);
@@ -13945,7 +13945,7 @@ private slots:
         QVERIFY(!refused(r) && !r.value("structuredContent").toObject().value("objects").toArray()[1].toObject().value("subtract").toBool());
         QVERIFY(refused(call({{"clip", clipId}, {"effect", effectId}, {"object", 0}, {"subtract", true}})));
         QVERIFY(refused(call({{"clip", clipId}, {"effect", effectId}, {"object", 9}})));
-        QVERIFY(refused(call({{"clip", clipId}, {"effect", effectId}, {"points", QJsonArray{QJsonArray{1.5, 0.2, 1}}}})));
+        QVERIFY(refused(call({{"clip", clipId}, {"effect", effectId}, {"points", QJsonArray{QJsonValue(QJsonArray{1.5, 0.2, 1})}}})));
         QVERIFY(refused(call({{"clip", clipId}, {"effect", effectId + 1000}})));
         r = call({{"clip", clipId}, {"effect", effectId}, {"object", 1}, {"remove", true}});
         QCOMPARE(r.value("structuredContent").toObject().value("objects").toArray().size(), 1);
