@@ -115,7 +115,9 @@ bool PluginEditorWindow::start(QString* error) {
     idle_->start(30);
     // Settings are saved into the project every few seconds and on close.
     auto* saver = new QTimer(this);
-    connect(saver, &QTimer::timeout, this, &PluginEditorWindow::saveSettings);
+    connect(saver, &QTimer::timeout, this, [this] {
+        if (!state_->inGesture()) saveSettings();  // not in the middle of a drag (an edit would end it)
+    });
     saver->start(3000);
     connect(state_, &EditorState::projectChanged, this, [this] {
         if (!effect()) {
@@ -137,7 +139,8 @@ void PluginEditorWindow::syncFromProject() {
         if (key.rfind(kParamPrefix, 0) != 0) continue;
         const uint32_t id = uint32_t(std::strtoul(key.c_str() + kParamPrefix.size(), nullptr, 10));
         if (gesture_.count(id)) continue;  // the user is dragging it right now
-        const double v = param.at(lt);
+        const auto live = state_->liveParameter(clip_, effect_, key);  // a mixer pass writing it
+        const double v = live ? *live : param.at(lt);
         if (std::fabs(inst_->parameter(id) - v) > 1e-9) inst_->setParameter(id, v);
     }
 }

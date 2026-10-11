@@ -1228,10 +1228,12 @@ void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const 
     std::vector<std::string> names = {name};
     if (pi.kind == ParamKind::Color) names = {name + ".r", name + ".g", name + ".b"};
 
-    // Reads the current value(s) from the live project.
+    // Reads the current value(s) from the live project (or, for an insert a mixer pass is writing, what it plays).
     auto read = [this, target, pi](const std::string& n) -> double {
         const Sequence* s = state_->sequence();
         if (!s) return 0;
+        if (!target.clip && target.owner)
+            if (const auto live = state_->liveParameter(target.owner, target.effect, n)) return *live;
         Effect* e = target.resolve(const_cast<Sequence&>(*s));
         // A parameter not stored yet (e.g. an unused mask) shows its default.
         return e ? e->p(n, target.time(), n == pi.name ? pi.def : 0) : 0;

@@ -7,6 +7,7 @@
 #include <QWidget>
 #include <functional>
 #include <map>
+#include <optional>
 #include <set>
 #include <vector>
 
@@ -171,6 +172,11 @@ private:
     void discardPass();  // ends the pass, writing nothing
     std::function<void(Sequence&)> liveOverlay() const;  // what the pass plays now
     void restoreControls();  // the pass's values back on its controls after a refresh
+    void rebaseRecorders();  // the recorders onto the lanes and levels the project holds now (edited mid-pass)
+    bool passWrote() const;
+    void finishWhenFree();   // finishPass at stopAt_ once no other gesture (a drag) is under way
+    // An insert parameter's value as the pass plays it, if the pass is writing it (EditorState::liveParameter).
+    std::optional<double> liveInsert(Id owner, Id effect, const std::string& param) const;
     // An insert parameter moved during a pass (EditorState::captureParameter): true if this pass writes it.
     bool captureInsert(const EditorState::ParameterMove& move);
     // Faders and pans show the automation at the playhead on tracks that read it.
@@ -204,7 +210,7 @@ private:
         bool changedOther = false;          // width, LFE or object changed during the pass
         Id trackId = 0;                     // (an edit that moves the track leaves its lanes as they were)
         double shownDb = 0, shownPan = 0;   // what the fader and pan show
-        SurroundPan shownPosition;
+        SurroundPan shownPosition{};
     };
     std::vector<Recording> recording_;
     // The other lanes written in a pass (track mutes and send levels, bus faders, pans and mutes), each read from its
@@ -219,6 +225,7 @@ private:
         std::function<void(double)> show;                       // the lane shown on it while not written
         std::function<void(Sequence&, double)> live;            // what plays while written
         std::function<Param*(Sequence&)> laneIn;                // its lane in a sequence (to write at the stop)
+        std::function<double(const Sequence&)> stillIn;         // its static value there (empty: the lane's own)
         std::function<bool(const Sequence&)> valid;             // still the same control after an edit (empty: always)
         bool whole = false;                                     // a switch's values are whole numbers
         double shown = 0;                                       // what its control shows
@@ -232,6 +239,8 @@ private:
     bool resume_ = false;     // the pass was ended by another sequence made active: start again at the next frame
     Id passSeq_ = 0;          // the sequence the pass records
     uint64_t passGeneration_ = 0;  // (EditorState::projectGeneration)
+    bool passBaseChanged_ = false;  // the project changed during the pass: the recorders follow it at the next frame
+    FrameTime stopAt_ = -1;         // playback stopped there; the pass is written once another gesture ends
     // Insert parameters moved in this pass: the last value, the frame it came at, and whether its control is held.
     struct InsertMove {
         double value = 0;

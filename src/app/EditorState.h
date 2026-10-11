@@ -68,6 +68,13 @@ public:
     };
     void setParameterCapture(std::function<bool(const ParameterMove&)> fn) { parameterCapture_ = std::move(fn); }
     bool captureParameter(const ParameterMove& move) const { return parameterCapture_ && parameterCapture_(move); }
+    // The value a pass plays for an insert parameter it is writing (what its Inspector row and plugin editor show),
+    // or none.
+    using LiveParameter = std::function<std::optional<double>(Id owner, Id effect, const std::string& param)>;
+    void setLiveParameter(LiveParameter fn) { liveParameter_ = std::move(fn); }
+    std::optional<double> liveParameter(Id owner, Id effect, const std::string& param) const {
+        return liveParameter_ ? liveParameter_(owner, effect, param) : std::nullopt;
+    }
     // Counts projects opened, reloaded or made new: what was taken from one project can tell it is gone.
     uint64_t projectGeneration() const { return projectGeneration_; }
     // The active sequence as it was when the current gesture began (or the
@@ -220,6 +227,7 @@ signals:
 
 private:
     std::function<bool(const ParameterMove&)> parameterCapture_;
+    LiveParameter liveParameter_;
     uint64_t projectGeneration_ = 0;
     void pruneSelection();
     bool refuseReadOnly();     // true, with a message, when the project cannot be changed

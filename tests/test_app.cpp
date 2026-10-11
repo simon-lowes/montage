@@ -1257,6 +1257,79 @@ private slots:
         mixer->playbackStopped(20);
         QCOMPARE(state()->project().findSequence(first)->audioTracks.at(0).volumeAuto.at(10), -20.0);
         state()->setActiveSequence(first);
+        // Through edits during a pass: a pressed mute stays pressed (and written) when the strips refresh; a level set
+        // under the pass (A1's fader level, from elsewhere) is what the fader shows and glides back to; an insert the
+        // pass writes shows its played value in the Inspector.
+        state()->setActiveSequence(first);
+        state()->inspectChain(track);
+        QApplication::processEvents();
+        fader = mixer->trackFader(0);
+        mixer->trackAutomationMode(0)->setCurrentIndex(int(AutomationMode::Touch));
+        QVERIFY(state()->edit("Clear lanes", [](Project&, Sequence& s) {
+            s.audioTracks[0].volumeAuto = Param(), s.audioTracks[0].muteAuto = Param(), s.audioTracks[0].volumeDb = 0;
+            return true;
+        }));
+        mixer->playbackStarted(0);
+        for (FrameTime f = 0; f <= 60; ++f) {
+            if (f == 5) mixer->trackMute(0)->click();
+            if (f == 10) {
+                QVERIFY(state()->edit("Level", [](Project&, Sequence& s) {
+                    s.audioTracks[0].volumeDb = -10;
+                    return true;
+                }));
+                QVERIFY(mixer->trackMute(0)->isChecked());  // still pressed after the refresh
+            }
+            if (f == 20) {
+                QVERIFY(state()->captureParameter({track, eq, "low_db", -9, 0, 0.048, false, {}}));
+                QVERIFY(state()->edit("Rename", [](Project&, Sequence& s) {  // (any edit: the Inspector refreshes)
+                    s.audioTracks[0].name = "Dialogue 2";
+                    return true;
+                }));
+                QApplication::processEvents();
+                QVERIFY(lowRow());
+                QCOMPARE(lowRow()->value(), -9.0);  // the Inspector shows what plays
+                QCOMPARE(*state()->liveParameter(track, eq, "low_db"), -9.0);
+            }
+            if (f == 30) {
+                fader->setSliderDown(true);
+                fader->setValue(-30);
+            }
+            if (f == 35) fader->setSliderDown(false);
+            mixer->playbackPosition(f);
+            if (f == 12) QCOMPARE(fader->value(), -100);  // the level set under the pass
+            if (f == 25) QVERIFY(mixer->heard().audioTracks.at(0).muted);
+        }
+        mixer->playbackStopped(60);
+        QVERIFY(trackMutedAt(a1(), 30) && trackMutedAt(a1(), 60) && !trackMutedAt(a1(), 2));
+        QCOMPARE(a1().volumeDb, -10.0);
+        QCOMPARE(a1().volumeAuto.at(20), -10.0);  // either side of the touch: the level set under the pass
+        QCOMPARE(a1().volumeAuto.at(32), -3.0);
+        QVERIFY(std::fabs(a1().volumeAuto.at(90) - -10.0) < 1e-9);  // glided back after the touch
+        // Stopping while another gesture (a drag) is held: the pass waits for it, and is written after it.
+        mixer->playbackStarted(0);
+        for (FrameTime f = 0; f <= 20; ++f) {
+            if (f == 5) {
+                fader->setSliderDown(true);
+                fader->setValue(-200);
+            }
+            if (f == 8) fader->setSliderDown(false);
+            mixer->playbackPosition(f);
+        }
+        state()->beginGesture("Drag");
+        state()->updateGesture([](Project&, Sequence& s) { s.markers.push_back(Marker{3, 0, "dragged", "", 0, false}); });
+        mixer->playbackStopped(20);
+        QVERIFY(state()->inGesture() && mixer->recordingAutomation());
+        state()->endGesture(true);
+        QTRY_VERIFY(!mixer->recordingAutomation());
+        QCOMPARE(a1().volumeAuto.at(6), -20.0);
+        QVERIFY(std::any_of(state()->sequence()->markers.begin(), state()->sequence()->markers.end(),
+                            [](const Marker& m) { return m.name == "dragged"; }));
+        // A pass that wrote nothing leaves a gesture alone at the stop.
+        mixer->playbackStarted(0);
+        state()->beginGesture("Drag 2");
+        mixer->playbackStopped(5);
+        QVERIFY(state()->inGesture() && !mixer->recordingAutomation());
+        state()->endGesture(false);
         // A track in Read takes nothing.
         mixer->trackAutomationMode(0)->setCurrentIndex(int(AutomationMode::Read));
         mixer->playbackStarted(0);

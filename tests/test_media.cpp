@@ -12727,13 +12727,21 @@ private slots:
             stepped.min = 0, stepped.max = 1, stepped.def = 0, stepped.step = 1;
             fx.params["param.7"] = Param(0);
             fx.strings["meta.7"] = pluginParamMeta(stepped);
+            ParamInfo frequency;  // continuous, 20 Hz to 20 kHz
+            frequency.label = "Frequency";
+            frequency.min = 20, frequency.max = 20000, frequency.def = 1000, frequency.step = 0.01;
+            fx.params["param.8"] = Param(1000);
+            fx.strings["meta.8"] = pluginParamMeta(frequency);
             pluginId = fx.id;
             withPlugin.active()->audioTracks.at(0).effects.push_back(fx);
             QVERIFY(saveProject(withPlugin, project.toStdString()));
         }
         r = tool("montage_automate_track",
-                 QJsonObject{{"project", project}, {"inserts", QJsonArray{QJsonObject{{"effect", double(pluginId)}, {"param", "param.7"},
-                                                                                     {"points", QJsonArray{QJsonArray{0.5, 0.333}, QJsonArray{1, 5}}}}}}});
+                 QJsonObject{{"project", project},
+                             {"inserts", QJsonArray{QJsonObject{{"effect", double(pluginId)}, {"param", "param.7"},
+                                                                {"points", QJsonArray{QJsonArray{0.5, 0.333}, QJsonArray{1, 5}}}},
+                                                    QJsonObject{{"effect", double(pluginId)}, {"param", "param.8"},
+                                                                {"points", QJsonArray{QJsonArray{0, 100}, QJsonArray{1, 1000}}}}}}});
         QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
         {
             Project mixed;
@@ -12743,6 +12751,8 @@ private slots:
                     const Param& lane = e.params.at("param.7");
                     QCOMPARE(lane.keys.size(), size_t(3));  // a key just before the first point holding what was there
                     QVERIFY(lane.keys[1].interp == Interp::Hold && std::fabs(lane.keys[1].v - 0.333) < 1e-9 && lane.keys[2].v == 1);
+                    const Param& freq = e.params.at("param.8");  // continuous: a ramp, nothing added before it
+                    QVERIFY(freq.keys.size() == 2 && freq.keys[0].interp != Interp::Hold && freq.keys[0].v == 100);
                 }
         }
         QVERIFY(tool("montage_automate_track", QJsonObject{{"project", project}, {"inserts", QJsonArray{QJsonObject{{"effect", double(pluginId)},

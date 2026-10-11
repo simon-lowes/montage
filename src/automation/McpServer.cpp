@@ -2268,8 +2268,14 @@ void McpServer::Impl::addTools() {
                         if (pi.name == param && pi.kind != ParamKind::Color) {
                             lo = pi.min, hi = pi.max, def = pi.def, known = true;
                             whole = pi.kind == ParamKind::Bool || pi.kind == ParamKind::Choice;
-                            hold = whole || (e->type == "plugin" && pi.step >= 1);
+                            hold = whole;
                         }
+                    // A plugin's stepped parameter, as recorded when it was added ("meta.<id>": label, min, max, default,
+                    // stepped...); a continuous one with a wide range (20 to 20000 Hz) ramps.
+                    if (known && e->type == "plugin" && param.rfind("param.", 0) == 0) {
+                        const QStringList meta = QString::fromStdString(e->s("meta." + param.substr(6))).split('\t');
+                        hold = hold || (meta.size() >= 5 && meta[4] == QStringLiteral("1"));
+                    }
                     if (!known) throw ArgError{QStringLiteral("%1 has no parameter %2").arg(QString::fromStdString(e->type), QString::fromStdString(param))};
                     const QJsonArray pts = io.value("points").toArray();
                     if (!e->params.count(param)) e->params[param] = Param(def);  // not set yet: its default outside the points

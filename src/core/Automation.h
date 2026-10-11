@@ -51,8 +51,12 @@ public:
     // Whether the fader is being recorded now (what plays should then be the fader).
     bool writing() const { return writing_; }
     bool wrote() const { return !passes_.empty() || writing_; }
-    // Lays what is written over `lane` rather than the lane it began with (it was changed meanwhile), at finish().
-    void rebase(Param lane) { lane_ = std::move(lane); }
+    // Lays what is written over `lane` and `still` rather than those it began with (they were changed meanwhile): what
+    // it shows when not writing, and the level either side of what it writes at finish().
+    void rebase(Param lane, double still) {
+        lane_ = std::move(lane);
+        still_ = still;
+    }
     Param finish(FrameTime stop, double tolerance);
 
 private:
