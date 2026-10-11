@@ -6170,11 +6170,11 @@ void McpServer::Impl::addTools() {
     add("montage_object_mask", "Pick objects for a mask",
         "AI object masks (Premiere's Object Mask, Resolve's Magic Mask, Final Cut's Magnetic Mask), with several objects in "
         "one mask: limits a clip's video effect (`effect`, its id) to objects picked by clicks. `object` is the object's "
-        "index, \"new\" for another object joining the mask or \"new_cut\" for one cut out of it. `points` are clicks on "
-        "the frame at `at` (fractions of the clip's frame, [x, y, label]: label 1 the object, 0 not the object, 2 and 3 a "
+        "index (0, the first, by default), \"new\" for another object joining the mask or \"new_cut\" for one cut out of "
+        "it (once the mask has a first). `points` are clicks on the frame at `at` (fractions of the clip's frame, [x, y, label]: label 1 the object, 0 not the object, 2 and 3 a "
         "box's top left and bottom right); that frame is segmented at once. `track` follows the object forward, backward "
-        "or both from there to the clip's ends. `subtract` cuts an object (not the first) out of the mask or adds it back; "
-        "`name` names it; `remove` drops it. Edges: mask.refine (0-100) snaps the mask's edge to the picture's, "
+        "or both from there to the clip's ends (without `at`, from the first frame it was clicked on). `subtract` cuts an object (not the first) out of the mask or adds it back; "
+        "`name` names it; `remove` drops it (on its own). Edges: mask.refine (0-100) snaps the mask's edge to the picture's, "
         "mask.consolidate (px) closes holes and gaps (montage_add_effect params). Returns each object's clicked and "
         "segmented frames.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
@@ -6198,13 +6198,14 @@ void McpServer::Impl::addTools() {
             const MediaItem* m = c.mediaId ? l.project.findMedia(c.mediaId) : nullptr;
             if (!m || m->kind != MediaKind::Video) throw ArgError{"Object masks follow objects in video clips"};
             e->params["mask.shape"] = Param(3.0);
-            // Which object.
-            int which = currentObject(*e);
+            // Which object (the editor's choice of one is not part of the project: the first unless named).
+            int which = 0;
             const QJsonValue ov = a.value("object");
             if (ov.isString()) {
                 const QString kind = ov.toString();
                 if (kind != "new" && kind != "new_cut") throw ArgError{"\"object\" is an index, \"new\" or \"new_cut\""};
                 e->object = withNewObject(l.project, s, c, *e, kind == "new_cut", &which);
+                if (!e->object) throw ArgError{"The mask has no object to cut out of yet: pick its first (\"object\": 0)"};
             } else if (ov.isDouble()) {
                 which = int(ov.toDouble());
                 const int n = e->object ? e->object->count() : 1;
@@ -6212,6 +6213,8 @@ void McpServer::Impl::addTools() {
             }
             if (a.value("remove").toBool()) {
                 if (!e->object) throw ArgError{"The mask has no objects yet"};
+                for (const char* k : {"points", "track", "name", "subtract", "at"})
+                    if (a.contains(k)) throw ArgError{QStringLiteral("\"remove\" drops the object: give it without \"%1\"").arg(k)};
                 e->object = withoutObject(*e, which);
                 which = std::max(0, which - 1);
             } else {
@@ -6225,8 +6228,17 @@ void McpServer::Impl::addTools() {
                     o->object(which).name = a.value("name").toString().toStdString();
                     e->object = o;
                 }
-                const FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : c.start;
+                FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : c.start;
                 if (!c.contains(at)) throw ArgError{"\"at\" must be inside the clip"};
+                if (!a.contains("at") && !a.contains("points") && a.contains("track") && e->object) {
+                    // Tracking without `at`: from the first frame of the clip the object was clicked on.
+                    const auto& clicked = e->object->object(which).prompts;
+                    for (FrameTime f = 0; f < c.duration; ++f)
+                        if (auto it = clicked.find(clipObjectFrame(l.project, s, c, f)); it != clicked.end() && !it->second.empty()) {
+                            at = c.start + f;
+                            break;
+                        }
+                }
                 const FrameTime local = at - c.start;
                 const bool needModel = a.contains("points") || a.contains("track");
                 if (needModel && (!segmenterAvailable() || !objectModel().installed()))
@@ -6261,7 +6273,6 @@ void McpServer::Impl::addTools() {
                     }
                 }
             }
-            e->params["mask.object"] = Param(double(which));
             save(l);
             QJsonArray objects;
             if (e->object)

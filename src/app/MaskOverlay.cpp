@@ -31,6 +31,7 @@ MaskOverlay::MaskOverlay(EditorState* state, ViewerWidget* viewer) : QObject(vie
     for (auto sig : {&EditorState::projectChanged, &EditorState::selectionChanged, &EditorState::sequenceSwitched})
         connect(state_, sig, viewer_, qOverload<>(&QWidget::update));
     connect(state_, &EditorState::playheadChanged, viewer_, qOverload<>(&QWidget::update));
+    connect(state_, &EditorState::maskObjectChanged, viewer_, qOverload<>(&QWidget::update));
 }
 
 std::vector<MaskOverlay::Shape> MaskOverlay::shapes() const {
@@ -379,7 +380,7 @@ std::vector<MaskOverlay::ObjectTarget> MaskOverlay::objectTargets() const {
         const FrameTime lt = t - c.start;
         for (const Effect& e : c.effects)
             if (e.enabled && std::lround(e.p("mask.shape", lt)) == 3)
-                out.push_back({c.id, e.id, lt, e.object, clipObjectFrame(state_->project(), *s, c, lt), currentObject(e, lt)});
+                out.push_back({c.id, e.id, lt, e.object, clipObjectFrame(state_->project(), *s, c, lt), state_->maskObject(e)});
     }
     return out;
 }
@@ -396,27 +397,36 @@ void MaskOverlay::paintObjects(QPainter& p) const {
         if (!toWidget(t.clip, 0, 0, c00) || !toWidget(t.clip, 1, 0, c10) || !toWidget(t.clip, 1, 1, c11) ||
             !toWidget(t.clip, 0, 1, c01))
             continue;
-        std::vector<float> logits;
-        if (t.object && t.object->maskLogits(t.frame, logits)) {  // (the whole mask: its objects added, less those cut out)
-            const QString key = QStringLiteral("%1:%2").arg(quintptr(t.object.get())).arg(t.frame);
-            if (key != tintKey_) {
-                tint_ = QImage(kObjectGrid, kObjectGrid, QImage::Format_ARGB32_Premultiplied);
+        QTransform tr;
+        if (!QTransform::quadToQuad(QPolygonF(QRectF(0, 0, kObjectGrid, kObjectGrid)), QPolygonF({c00, c10, c11, c01}), tr)) continue;
+        // A tint from logits, made again only when they change.
+        auto draw = [&](const std::vector<float>& logits, const QString& key, QColor colour, QImage& image, QString& made) {
+            if (key != made) {
+                image = QImage(kObjectGrid, kObjectGrid, QImage::Format_ARGB32_Premultiplied);
                 for (int y = 0; y < kObjectGrid; ++y) {
-                    auto* row = reinterpret_cast<QRgb*>(tint_.scanLine(y));
+                    auto* row = reinterpret_cast<QRgb*>(image.scanLine(y));
                     for (int x = 0; x < kObjectGrid; ++x) {
                         const float a = std::clamp(0.5f + logits[size_t(y) * kObjectGrid + size_t(x)], 0.f, 1.f) * 0.42f;
-                        row[x] = qPremultiply(qRgba(70, 160, 255, int(a * 255)));
+                        row[x] = qPremultiply(qRgba(colour.red(), colour.green(), colour.blue(), int(a * 255)));
                     }
                 }
-                tintKey_ = key;
+                made = key;
             }
-            QTransform tr;
-            if (QTransform::quadToQuad(QPolygonF(QRectF(0, 0, kObjectGrid, kObjectGrid)), QPolygonF({c00, c10, c11, c01}), tr)) {
-                p.save();
-                p.setTransform(tr, true);
-                p.drawImage(QRectF(0, 0, kObjectGrid, kObjectGrid), tint_);
-                p.restore();
-            }
+            p.save();
+            p.setTransform(tr, true);
+            p.drawImage(QRectF(0, 0, kObjectGrid, kObjectGrid), image);
+            p.restore();
+        };
+        std::vector<float> logits;
+        const QString key = QStringLiteral("%1:%2").arg(quintptr(t.object.get())).arg(t.frame);
+        if (t.object && t.object->maskLogits(t.frame, logits))  // (the whole mask: its objects added, less those cut out)
+            draw(logits, key, QColor(70, 160, 255), tint_, tintKey_);
+        // With several objects, the one being picked on its own too (a cut-out, or one inside another, shows nowhere
+        // else): amber when it adds, red when it is cut out.
+        if (t.object && t.object->count() > 1 && t.object->object(t.which).logits(t.frame, logits)) {
+            const bool cut = t.which > 0 && t.object->object(t.which).subtract;
+            draw(logits, key + QStringLiteral(":%1").arg(t.which), cut ? QColor(235, 70, 60) : QColor(245, 180, 40), ownTint_,
+                 ownTintKey_);
         }
         // The clicks on this frame for the object being picked: + the object, - not the object, and the box.
         if (t.object)

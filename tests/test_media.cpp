@@ -13871,8 +13871,8 @@ private slots:
         e.object = withNewObject(p, s, c, e, false, &which);
         QCOMPARE(which, 1);
         QCOMPARE(e.object->count(), 2);
-        e.params["mask.object"] = Param(1.0);
-        QCOMPARE(currentObject(e), 1);
+        QCOMPARE(currentObject(e, 1), 1);
+        QCOMPARE(currentObject(e, 7), 1);  // (clamped to the objects there are)
         e.object = withObjectPoint(p, s, c, e, 0, {blue[0].x / 640, blue[0].y / 360, 1}, which);
         QCOMPARE(int(e.object->object(1).prompts.size()), 1);
         QCOMPARE(int(e.object->prompts.size()), 1);  // (the first object's clicks untouched)
@@ -13898,13 +13898,27 @@ private slots:
         m8 = matteAt(8);
         QVERIFY(inside(m8, red[8]) > 0.95 && inside(m8, blue[8]) < 0.05);
         QVERIFY(!withObjectSubtracted(e, 0, true)->object(0).subtract);  // the first always adds
-        // Removed: the first gone, the blue ball takes its place and adds again.
+        // Removed: the first gone, the blue ball stays cut out, under an empty first object.
         auto rest = withoutObject(e, 0);
-        QVERIFY(rest && rest->count() == 1 && !rest->subtract && rest->frames.size() == size_t(frames));
+        QVERIFY(rest && rest->count() == 2 && !rest->subtract && rest->frames.empty() && rest->prompts.empty());
+        QVERIFY(rest->object(1).subtract && rest->object(1).frames.size() == size_t(frames));
+        Effect onlyCut = e;
+        onlyCut.object = rest;
+        QVERIFY(!withoutObject(onlyCut, 0));  // (that empty first removed too: nothing is left to cut from)
+        // Added back first, it takes the first's place when the first goes.
+        Effect both = e;
+        both.object = withObjectSubtracted(e, 1, false);
+        auto promoted = withoutObject(both, 0);
+        QVERIFY(promoted && promoted->count() == 1 && !promoted->subtract && promoted->frames.size() == size_t(frames));
         QVERIFY(!withoutObject(Effect{}, 0));
         Effect single = e;
-        single.object = rest;
+        single.object = promoted;
         QVERIFY(!withoutObject(single, 0));  // the last one
+        // A mask with no object yet has nothing to cut out of: its first object adds.
+        const Effect fresh = makeEffect(p, "invert");
+        QVERIFY(!withNewObject(p, s, c, fresh, true));
+        auto first = withNewObject(p, s, c, fresh, false, &which);
+        QVERIFY(first && first->count() == 1 && !first->subtract && which == 0);
 
         // Over MCP: a new object to cut out, clicked and tracked both ways from the middle; listed with the rest.
         auto firstOnly = std::make_shared<ObjectMask>(*e.object);
@@ -13939,7 +13953,10 @@ private slots:
         QVERIFY(loadProject(project.toStdString(), back));
         const Effect& saved = back.active()->videoTracks[0].clips[0].effects.back();
         QVERIFY(saved.object && saved.object->count() == 2 && saved.object->object(1).subtract);
-        QCOMPARE(currentObject(saved), 1);
+        QVERIFY(!saved.params.count("mask.object"));  // (which object is being picked is not saved in the project)
+        // Tracked without "at": from the frame the object was clicked on (frame 4), not the clip's start.
+        r = call({{"clip", clipId}, {"effect", effectId}, {"object", 1}, {"track", "forward"}});
+        QVERIFY2(!refused(r), QJsonDocument(r).toJson().constData());
         // Added back, then removed; bad input refused.
         r = call({{"clip", clipId}, {"effect", effectId}, {"object", 1}, {"subtract", false}});
         QVERIFY(!refused(r) && !r.value("structuredContent").toObject().value("objects").toArray()[1].toObject().value("subtract").toBool());
@@ -13947,6 +13964,7 @@ private slots:
         QVERIFY(refused(call({{"clip", clipId}, {"effect", effectId}, {"object", 9}})));
         QVERIFY(refused(call({{"clip", clipId}, {"effect", effectId}, {"points", QJsonArray{QJsonValue(QJsonArray{1.5, 0.2, 1})}}})));
         QVERIFY(refused(call({{"clip", clipId}, {"effect", effectId + 1000}})));
+        QVERIFY(refused(call({{"clip", clipId}, {"effect", effectId}, {"object", 1}, {"remove", true}, {"name", "Kept"}})));
         r = call({{"clip", clipId}, {"effect", effectId}, {"object", 1}, {"remove", true}});
         QCOMPARE(r.value("structuredContent").toObject().value("objects").toArray().size(), 1);
     }

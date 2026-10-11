@@ -1025,6 +1025,76 @@ colorspaces:
         consolidateMatte(none, W, H, 0);
         QVERIFY(none == holey);
 
+        // A disc feathered by 20 px keeps its whole ramp; only the slit cut into it fills, feathered the same way.
+        auto smooth = [](double d, double fe) {
+            const double k = std::clamp(0.5 - d / fe, 0.0, 1.0);
+            return float(k * k * (3 - 2 * k));
+        };
+        std::vector<float> soft(size_t(W) * H);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const bool slit = x >= 150 && x < 154 && y > 80 && y < 120;
+                soft[size_t(y) * W + size_t(x)] = slit ? 0.f : smooth(std::hypot(x + 0.5 - 120, y + 0.5 - 100) - 50, 20);
+            }
+        std::vector<float> softClosed = soft;
+        consolidateMatte(softClosed, W, H, 8, 20);
+        QVERIFY(softClosed[size_t(100) * W + 152] > 0.99f);
+        for (int x : {66, 72, 76, 80})  // the left edge's ramp, far from the slit
+            QCOMPARE(softClosed[size_t(100) * W + size_t(x)], soft[size_t(100) * W + size_t(x)]);
+        QVERIFY(soft[size_t(100) * W + 72] > 0.3f && soft[size_t(100) * W + 72] < 0.7f && soft[size_t(100) * W + 76] < 0.95f);
+        // Two feathered discs 4 px apart joined by a small Consolidate: the gap fills, and no haze spreads round them.
+        std::vector<float> pair(size_t(W) * H);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const double d = std::min(std::hypot(x + 0.5 - 68, y + 0.5 - 100), std::hypot(x + 0.5 - 172, y + 0.5 - 100)) - 50;
+                pair[size_t(y) * W + size_t(x)] = smooth(d, 20);
+            }
+        for (float& v : pair) v = v < 0.02f ? 0.f : v;  // (the feather's faint tail cut, so the shapes stand 4 px apart)
+        std::vector<float> joined = pair;
+        consolidateMatte(joined, W, H, 3, 20);
+        QVERIFY(joined[size_t(100) * W + 120] > pair[size_t(100) * W + 120] + 0.2f);
+        QVERIFY2(joined[size_t(70) * W + 120] < 0.01f && pair[size_t(70) * W + 120] == 0, qPrintable(QString::number(joined[size_t(70) * W + 120])));
+        // Nothing joins a shape to the frame's edge: beyond the frame counts as outside.
+        std::vector<float> nearEdge(size_t(W) * H);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) nearEdge[size_t(y) * W + size_t(x)] = std::hypot(x + 0.5 - 53, y + 0.5 - 100) < 50 ? 1.f : 0.f;
+        consolidateMatte(nearEdge, W, H, 8);
+        QVERIFY(nearEdge[size_t(100) * W + 1] < 0.01f && nearEdge[size_t(100) * W + 53] > 0.99f);
+
+        // Refine Edges across a wide feather: the whole ramp settles on the disc, with no step where the band would end.
+        std::vector<float> wide(size_t(W) * H);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) wide[size_t(y) * W + size_t(x)] = smooth(std::hypot(x + 0.5 - 120, y + 0.5 - 100) - 50, 30);
+        std::vector<float> wideRefined = wide;
+        refineMatteEdges(wideRefined, img, 4, 1.0);
+        QVERIFY2(error(wideRefined) < 0.3 * error(wide), qPrintable(QString("%1 -> %2").arg(error(wide)).arg(error(wideRefined))));
+        // A stray faint pixel far from the edge changes nothing, and a mask that is sure but never whole (a people
+        // mask at 0.96 inside) is refined all the same.
+        std::vector<float> stray = coarse, strayRefined;
+        stray[size_t(5) * W + 5] = 0.05f;
+        strayRefined = stray;
+        refineMatteEdges(strayRefined, img, 8, 1.0);
+        QVERIFY2(error(strayRefined) < 0.15 * error(coarse), qPrintable(QString::number(error(strayRefined))));
+        std::vector<float> unsure = coarse;
+        for (float& v : unsure) v *= 0.96f;
+        const double unsureBefore = error(unsure);
+        refineMatteEdges(unsure, img, 8, 1.0);
+        QVERIFY2(error(unsure) < 0.5 * unsureBefore, qPrintable(QString("%1 -> %2").arg(unsureBefore).arg(error(unsure))));
+        // Colours above white (HDR) count as they are, and transparent pixels are left alone.
+        Image bright = img;
+        for (size_t i = 0; i < size_t(W) * H; ++i)
+            for (int k = 0; k < 3; ++k) bright.px[i * 4 + k] += 1.5f;
+        std::vector<float> brightRefined = coarse;
+        refineMatteEdges(brightRefined, bright, 8, 1.0);
+        QVERIFY2(error(brightRefined) < 0.15 * error(coarse), qPrintable(QString::number(error(brightRefined))));
+        Image clear = img;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W / 2; ++x) std::fill_n(clear.at(x, y), 4, 0.f);
+        std::vector<float> clearRefined = coarse;
+        refineMatteEdges(clearRefined, clear, 8, 1.0);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W / 2; ++x) QCOMPARE(clearRefined[size_t(y) * W + size_t(x)], coarse[size_t(y) * W + size_t(x)]);
+
         // Through an effect's mask: an ellipse drawn loosely round the disc, refined onto it.
         Project p = makeDefaultProject();
         Effect e = makeEffect(p, "invert");
@@ -3071,6 +3141,25 @@ colorspaces:
         QVERIFY(frameKey(p, s, 40, o) != k40);
         blue.effects.clear();
         QCOMPARE(frameKey(p, s, 40, o), k40);
+        // An object mask's names don't show in its frames: renaming an object keeps their keys; a cut-out changes them.
+        Effect masked = makeEffect(p, "invert");
+        masked.params["mask.shape"] = Param(3.0);
+        auto objects = std::make_shared<ObjectMask>();
+        objects->fps = 25;
+        objects->more.emplace_back();
+        masked.object = objects;
+        blue.effects.push_back(masked);
+        const QByteArray withMask = frameKey(p, s, 40, o);
+        auto renamed = std::make_shared<ObjectMask>(*objects);
+        renamed->name = "Car";
+        renamed->more[0].name = "Driver";
+        blue.effects.back().object = renamed;
+        QCOMPARE(frameKey(p, s, 40, o), withMask);
+        auto cut = std::make_shared<ObjectMask>(*objects);
+        cut->more[0].subtract = true;
+        blue.effects.back().object = cut;
+        QVERIFY(frameKey(p, s, 40, o) != withMask);
+        blue.effects.clear();
         // Moving a clip keeps its frames: the same frame of it has the same key wherever it sits.
         Project lone = makeDefaultProject();
         Sequence& ls = *lone.active();

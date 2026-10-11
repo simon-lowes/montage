@@ -106,6 +106,10 @@ public:
     // Selecting clips or a transition clears it.
     Id inspectedChain() const { return inspectedChain_; }
     void inspectChain(Id owner);
+    // The object being picked in an effect's object mask (0 the first), clamped to the objects it has. Which one is a
+    // choice of what to work on, not a change to the project: it makes no undo step and works in a read-only project.
+    int maskObject(const Effect& e) const;
+    void setMaskObject(Id effect, int which);
     // The single clip shown in the inspector (first selected), or nullptr.
     const Clip* primaryClip() const;
 
@@ -237,6 +241,7 @@ public:
 signals:
     void projectChanged();            // anything in the project changed
     void selectionChanged();
+    void maskObjectChanged();         // a different object chosen in an object mask
     void playheadChanged(montage::FrameTime t);
     void sequenceSwitched();          // a different sequence became active / project replaced
     void historyChanged();
@@ -299,6 +304,7 @@ private:
     std::vector<Id> selection_;
     Id selectedTransition_ = 0;
     Id inspectedChain_ = 0;
+    std::map<Id, int> maskObjects_;  // effect -> object being picked
     int targetVideo_ = 0;
     int targetAudio_ = 0;
     bool snapping_ = true;

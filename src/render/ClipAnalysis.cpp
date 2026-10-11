@@ -671,9 +671,10 @@ std::shared_ptr<ObjectMask> withNewObject(const Project& p, const Sequence& s, c
                                           int* which) {
     const MediaItem* m = c.mediaId ? p.findMedia(c.mediaId) : nullptr;
     if (!m) return nullptr;
+    if (!e.object && subtract) return nullptr;  // (nothing to cut out of yet)
     auto o = std::make_shared<ObjectMask>(objectFor(s, *m, e.object.get()));
     const int index = e.object ? o->count() : 0;  // (a mask with no object yet: this is its first)
-    objectIn(*o, index).subtract = subtract && index > 0;
+    objectIn(*o, index).subtract = subtract;
     if (which) *which = index;
     return o;
 }
@@ -686,9 +687,16 @@ std::shared_ptr<ObjectMask> withoutObject(const Effect& e, int which) {
         return o;
     }
     if (o->more.empty()) return nullptr;
-    // The next object becomes the first (which always adds).
-    ObjectMask first = std::move(o->more.front());
-    first.more.assign(std::make_move_iterator(o->more.begin() + 1), std::make_move_iterator(o->more.end()));
+    // The next object that adds becomes the first; a cut-out stays a cut-out, under an empty first object if need be.
+    std::vector<ObjectMask> rest = std::move(o->more);
+    auto adds = std::find_if(rest.begin(), rest.end(), [](const ObjectMask& x) { return !x.subtract; });
+    if (adds == rest.end() && o->prompts.empty() && o->frames.empty()) return nullptr;  // (an empty first removed: all goes)
+    ObjectMask first;
+    if (adds != rest.end()) {
+        first = std::move(*adds);
+        rest.erase(adds);
+    }
+    first.more = std::move(rest);
     first.subtract = false;
     first.fps = o->fps;
     return std::make_shared<ObjectMask>(std::move(first));
@@ -701,9 +709,9 @@ std::shared_ptr<ObjectMask> withObjectSubtracted(const Effect& e, int which, boo
     return o;
 }
 
-int currentObject(const Effect& e, FrameTime t) {
+int currentObject(const Effect& e, int chosen) {
     const int n = e.object ? e.object->count() : 1;
-    return std::clamp(int(std::lround(e.p("mask.object", t))), 0, n - 1);
+    return std::clamp(chosen, 0, n - 1);
 }
 
 std::shared_ptr<const ObjectMask> segmentClipObjectFrame(const Project& p, const Sequence& s, const Clip& c,

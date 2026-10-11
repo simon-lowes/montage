@@ -111,6 +111,7 @@ InspectorWidget::InspectorWidget(EditorState* state, QWidget* parent) : QScrollA
         else refreshValues();
     });
     connect(state_, &EditorState::playheadChanged, this, &InspectorWidget::refreshValues);
+    connect(state_, &EditorState::maskObjectChanged, this, &InspectorWidget::refreshValues);
     rebuild();
 }
 
@@ -857,7 +858,7 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
                 auto read = [this, owner, eid]() -> QString {
                     const Sequence* sq = state_->sequence();
                     const Effect* ef = sq ? edit::ownedEffect(const_cast<Sequence&>(*sq), owner, eid) : nullptr;
-                    const ObjectMask* o = ef && ef->object ? &ef->object->object(currentObject(*ef)) : nullptr;
+                    const ObjectMask* o = ef && ef->object ? &ef->object->object(state_->maskObject(*ef)) : nullptr;
                     if (!o || o->prompts.empty())
                         return tr("Click the object in the viewer. Alt-click what is not part of it, or drag a box around it.");
                     return tr("%n frame(s) clicked", "", int(o->prompts.size())) + QStringLiteral(", ") +
@@ -892,11 +893,11 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
                 for (QWidget* w : {static_cast<QWidget*>(addObject), static_cast<QWidget*>(cutObject), static_cast<QWidget*>(removeObject),
                                    static_cast<QWidget*>(cutOut)})
                     oh->addWidget(w);
-                auto fillObjects = [this, owner, eid, list, cutOut, removeObject] {
+                auto fillObjects = [this, owner, eid, list, cutOut, removeObject, addObject, cutObject] {
                     const Sequence* sq = state_->sequence();
                     const Effect* ef = sq ? edit::ownedEffect(const_cast<Sequence&>(*sq), owner, eid) : nullptr;
                     if (!ef) return;
-                    const int n = ef->object ? ef->object->count() : 1, current = currentObject(*ef);
+                    const int n = ef->object ? ef->object->count() : 1, current = state_->maskObject(*ef);
                     QStringList names;
                     for (int i = 0; i < n; ++i) {
                         const ObjectMask* o = ef->object ? &ef->object->object(i) : nullptr;
@@ -915,46 +916,49 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
                     cutOut->setChecked(ef->object && current > 0 && ef->object->object(current).subtract);
                     cutOut->setEnabled(current > 0);
                     removeObject->setEnabled(ef->object != nullptr);
+                    addObject->setEnabled(ef->object != nullptr);  // (a mask's first object comes from clicking it)
+                    cutObject->setEnabled(ef->object != nullptr);
                 };
                 fillObjects();
                 refreshers_.push_back(fillObjects);
-                connect(list, qOverload<int>(&QComboBox::activated), this, [this, owner, eid](int i) {
-                    state_->edit(tr("Choose Object"), [owner, eid, i](Project&, Sequence& s) {
-                        Effect* ef = edit::ownedEffect(s, owner, eid);
-                        if (!ef || currentObject(*ef) == i) return false;
-                        ef->params["mask.object"] = Param(i);
-                        return true;
-                    });
-                });
+                connect(list, qOverload<int>(&QComboBox::activated), this, [this, eid](int i) { state_->setMaskObject(eid, i); });
                 for (auto [button, subtract] : {std::pair{addObject, false}, std::pair{cutObject, true}})
                     connect(button, &QToolButton::clicked, this, [this, owner, eid, subtract = subtract] {
-                        state_->edit(subtract ? tr("Add Object to Cut Out") : tr("Add Object"), [owner, eid, subtract](Project& p, Sequence& s) {
+                        const bool added = state_->edit(subtract ? tr("Add Object to Cut Out") : tr("Add Object"), [owner, eid, subtract](Project& p, Sequence& s) {
                             Clip* c = edit::clipById(s, owner);
                             Effect* ef = c ? edit::ownedEffect(s, owner, eid) : nullptr;
                             if (!c || !ef) return false;
-                            int which = 0;
-                            auto o = withNewObject(p, s, *c, *ef, subtract, &which);
+                            auto o = withNewObject(p, s, *c, *ef, subtract);
                             if (!o) return false;
                             ef->object = o;
-                            ef->params["mask.object"] = Param(which);
                             return true;
                         });
+                        // The new object (the last) is the one to click.
+                        const Sequence* sq = state_->sequence();
+                        const Effect* ef = sq ? edit::ownedEffect(const_cast<Sequence&>(*sq), owner, eid) : nullptr;
+                        if (added && ef && ef->object) state_->setMaskObject(eid, ef->object->count() - 1);
                     });
                 connect(removeObject, &QToolButton::clicked, this, [this, owner, eid] {
-                    state_->edit(tr("Remove Object"), [owner, eid](Project&, Sequence& s) {
+                    const Sequence* sq = state_->sequence();
+                    const Effect* now = sq ? edit::ownedEffect(const_cast<Sequence&>(*sq), owner, eid) : nullptr;
+                    if (!now) return;
+                    const int which = state_->maskObject(*now);
+                    const bool removed = state_->edit(tr("Remove Object"), [owner, eid, which](Project&, Sequence& s) {
                         Effect* ef = edit::ownedEffect(s, owner, eid);
                         if (!ef || !ef->object) return false;
-                        const int which = currentObject(*ef);
                         ef->object = withoutObject(*ef, which);
-                        ef->params["mask.object"] = Param(std::max(0, which - 1));
                         return true;
                     });
+                    if (removed) state_->setMaskObject(eid, std::max(0, which - 1));
                 });
                 connect(cutOut, &QCheckBox::toggled, this, [this, owner, eid](bool on) {
-                    state_->edit(on ? tr("Cut Out Object") : tr("Add Object Back"), [owner, eid, on](Project&, Sequence& s) {
+                    const Sequence* sq = state_->sequence();
+                    const Effect* now = sq ? edit::ownedEffect(const_cast<Sequence&>(*sq), owner, eid) : nullptr;
+                    if (!now) return;
+                    const int which = state_->maskObject(*now);
+                    state_->edit(on ? tr("Cut Out Object") : tr("Add Object Back"), [owner, eid, on, which](Project&, Sequence& s) {
                         Effect* ef = edit::ownedEffect(s, owner, eid);
                         if (!ef || !ef->object) return false;
-                        const int which = currentObject(*ef);
                         if (which == 0 || ef->object->object(which).subtract == on) return false;
                         ef->object = withObjectSubtracted(*ef, which, on);
                         return true;
@@ -993,11 +997,14 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
                     const Clip* cl = sq ? edit::clipById(*sq, owner) : nullptr;
                     if (!cl) return;
                     const FrameTime lt = state_->playhead() - cl->start;
-                    state_->edit(tr("Clear Object Clicks"), [owner, eid, lt](Project& p, Sequence& s) {
+                    const Effect* now = edit::ownedEffect(const_cast<Sequence&>(*sq), owner, eid);
+                    if (!now) return;
+                    const int which = state_->maskObject(*now);
+                    state_->edit(tr("Clear Object Clicks"), [owner, eid, lt, which](Project& p, Sequence& s) {
                         Clip* c = edit::clipById(s, owner);
                         Effect* ef = c ? edit::ownedEffect(s, owner, eid) : nullptr;
                         if (!c || !ef || !ef->object) return false;
-                        ef->object = withObjectPrompts(p, s, *c, *ef, lt, {}, currentObject(*ef, lt));
+                        ef->object = withObjectPrompts(p, s, *c, *ef, lt, {}, which);
                         return true;
                     });
                 });
@@ -2115,7 +2122,7 @@ void InspectorWidget::trackObject(Id clip, Id effect, bool forward) {
     const Clip* c = s ? edit::clipById(*s, clip) : nullptr;
     const Effect* e = s ? edit::ownedEffect(const_cast<Sequence&>(*s), clip, effect) : nullptr;
     if (!c || !e) return;
-    const int which = currentObject(*e);
+    const int which = state_->maskObject(*e);
     if (!e->object || e->object->object(which).prompts.empty()) {
         state_->message(tr("Click the object in the viewer first, then track it"), 5000);
         return;

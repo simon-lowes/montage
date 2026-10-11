@@ -149,16 +149,19 @@ std::shared_ptr<ObjectMask> withObjectPoint(const Project& p, const Sequence& s,
 // and that frame's segmentation).
 std::shared_ptr<ObjectMask> withObjectPrompts(const Project& p, const Sequence& s, const Clip& c, const Effect& e,
                                               FrameTime local, const std::vector<ObjectPoint>& points, int which = 0);
-// Another object, not clicked yet, added to the effect's mask (or cut out of it when `subtract`; the first, when the
-// mask has none, always adds); its index in `which`.
+// Another object, not clicked yet, added to the effect's mask (or cut out of it when `subtract`); its index in `which`.
+// A mask with no object yet gets its first, which always adds: null for one to cut out (there is nothing to cut from).
 std::shared_ptr<ObjectMask> withNewObject(const Project& p, const Sequence& s, const Clip& c, const Effect& e, bool subtract,
                                           int* which = nullptr);
-// The mask without object `which` (the next takes the first's place); null when none is left.
+// The mask without object `which`; null when none is left. Without the first, the next object that adds takes its place
+// (the others keep their order); when only objects cut out are left, an empty first object stays to cut them from
+// (removing that empty first removes the mask).
 std::shared_ptr<ObjectMask> withoutObject(const Effect& e, int which);
 // Object `which` (not the first) cut out of the mask or added to it again.
 std::shared_ptr<ObjectMask> withObjectSubtracted(const Effect& e, int which, bool subtract);
-// The object being picked on an effect: its "mask.object" setting, within the objects it has.
-int currentObject(const Effect& e, FrameTime t = 0);
+// Object `chosen` of the effect's mask, clamped to the objects it has (which object is being picked is the editor's
+// choice, not part of the project: EditorState::maskObject).
+int currentObject(const Effect& e, int chosen);
 // Segments the clicked frame at clip-local `local` on its own (what the user
 // sees straight after clicking), into a copy of `object`.
 std::shared_ptr<const ObjectMask> segmentClipObjectFrame(const Project& p, const Sequence& s, const Clip& c,

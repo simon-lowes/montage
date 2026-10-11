@@ -31,7 +31,11 @@ QByteArray objectHash(const std::shared_ptr<const ObjectMask>& m) {
     QMutexLocker l(&lock);
     auto it = known.find(m.get());
     if (it != known.end() && !it->second.first.expired() && it->second.first.lock() == m) return it->second.second;
-    const QByteArray h = QCryptographicHash::hash(QByteArray::fromStdString(objectMaskToJsonString(*m)), QCryptographicHash::Sha1);
+    // (Names don't show in the picture: renaming an object keeps its frames.)
+    ObjectMask unnamed = *m;
+    unnamed.name.clear();
+    for (ObjectMask& x : unnamed.more) x.name.clear();
+    const QByteArray h = QCryptographicHash::hash(QByteArray::fromStdString(objectMaskToJsonString(unnamed)), QCryptographicHash::Sha1);
     known[m.get()] = {m, h};
     if (known.size() > 256)  // forget the ones that are gone
         for (auto i = known.begin(); i != known.end();) i = i->second.first.expired() ? known.erase(i) : std::next(i);

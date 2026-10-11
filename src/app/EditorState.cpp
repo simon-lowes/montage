@@ -1,4 +1,5 @@
 #include "EditorState.h"
+#include "render/ClipAnalysis.h"
 
 #include <QCoreApplication>
 #include <QDir>
@@ -259,6 +260,18 @@ void EditorState::inspectChain(Id owner) {
     selectedTransition_ = 0;
     inspectedChain_ = owner;
     emit selectionChanged();
+}
+
+int EditorState::maskObject(const Effect& e) const {
+    auto it = maskObjects_.find(e.id);
+    return currentObject(e, it == maskObjects_.end() ? 0 : it->second);
+}
+
+void EditorState::setMaskObject(Id effect, int which) {
+    auto [it, added] = maskObjects_.try_emplace(effect, which);
+    if (!added && it->second == which) return;
+    it->second = which;
+    emit maskObjectChanged();
 }
 
 const Clip* EditorState::primaryClip() const {
@@ -1107,6 +1120,7 @@ bool EditorState::open(const QString& path, QString* error, Access access) {
     lastRefresh_ = QDateTime::currentDateTimeUtc();
     if (gesture_) gesture_.reset();
     ++projectGeneration_;
+    maskObjects_.clear();
     project_ = std::move(p);
     // The last project's files are let go (idle decoders keep them open, which on Windows stops their folder being
     // moved or renamed, as when a card is relinked).
@@ -1185,6 +1199,7 @@ bool EditorState::reloadFromDisk() {
     const bool switched = p.activeSequence != project_.activeSequence;
     if (gesture_) gesture_.reset();
     ++projectGeneration_;
+    maskObjects_.clear();
     std::set<std::string> known;
     for (const MediaItem& m : project_.media) known.insert(m.path);
     project_ = std::move(p);
@@ -1244,6 +1259,7 @@ void EditorState::newProject() {
     }
     if (gesture_) gesture_.reset();
     ++projectGeneration_;
+    maskObjects_.clear();
     project_ = makeDefaultProject();
     MediaPool::instance().clear();  // let the last project's files go
     history_.clear();

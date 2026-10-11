@@ -27,6 +27,7 @@
 #include <fstream>
 #include <map>
 #include <array>
+#include <atomic>
 #include <mutex>
 #include <sstream>
 
@@ -1151,27 +1152,73 @@ std::vector<float> polygonCoverage(const std::vector<std::pair<double, double>>&
     return cov;
 }
 
-void consolidateMatte(std::vector<float>& matte, int W, int H, double px) {
-    if (matte.size() != size_t(W) * size_t(H) || px < 0.5) return;
-    // A closing: the shape grown by `px` and shrunk back, so holes and gaps narrower than twice that fill in. Pixels it
-    // adds are full, with an edge a pixel soft; the shape's own edge stays as it was.
-    std::vector<uint8_t> inside(matte.size()), grownOut(matte.size());
-    for (size_t i = 0; i < matte.size(); ++i) inside[i] = matte[i] > 0.5f;
-    const std::vector<float> toInside = distanceTransform(inside, W, H);
-    for (size_t i = 0; i < matte.size(); ++i) grownOut[i] = toInside[i] > px;
-    const std::vector<float> toOutside = distanceTransform(grownOut, W, H);
-    // (Distances run between pixel centres, so the ramp starts a pixel in: the shape's own edge does not creep out.)
-    for (size_t i = 0; i < matte.size(); ++i) matte[i] = std::max(matte[i], std::clamp(float(toOutside[i] - px - 0.5), 0.f, 1.f));
+void consolidateMatte(std::vector<float>& matte, int W, int H, double px, double feather) {
+    if (matte.size() != size_t(W) * size_t(H) || W <= 0 || H <= 0 || px < 0.5) return;
+    // A closing: the shape grown by `px` and shrunk back, so holes and gaps narrower than twice that fill in. It works on
+    // a copy with a ring of background round it, so beyond the frame counts as outside and no object is joined to the
+    // frame's edge.
+    const int pad = int(std::ceil(px)) + 1, PW = W + 2 * pad, PH = H + 2 * pad;
+    const size_t pn = size_t(PW) * size_t(PH);
+    auto at = [&](int x, int y) { return size_t(y + pad) * size_t(PW) + size_t(x + pad); };
+    std::vector<uint8_t> inside(pn, 0), grownOut(pn), added(pn, 0);
+    parallelRows(H, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y)
+            for (int x = 0; x < W; ++x) inside[at(x, y)] = matte[size_t(y) * size_t(W) + size_t(x)] > 0.5f;
+    });
+    {
+        const std::vector<float> toInside = distanceTransform(inside, PW, PH);
+        for (size_t i = 0; i < pn; ++i) grownOut[i] = toInside[i] > px;
+    }
+    const std::vector<float> toOutside = distanceTransform(grownOut, PW, PH);
+    // The pixels it adds; none (the usual case) leaves the mask as it was.
+    std::atomic<bool> any{false};
+    parallelRows(H, [&](int y0, int y1) {
+        bool found = false;
+        for (int y = y0; y < y1; ++y)
+            for (int x = 0; x < W; ++x) {
+                const size_t i = at(x, y);
+                added[i] = !inside[i] && toOutside[i] > px;
+                found = found || added[i];
+            }
+        if (found) any = true;
+    });
+    if (!any) return;
+    // Near what it adds, the mask takes the closed shape's, feathered as the shape is (its signed distance, negative
+    // inside, through the same smoothstep), and keeps whichever is more; elsewhere the shape's own edge stays as it was.
+    // (Distances run between pixel centres: the closed shape's edge lies half a pixel out from its outermost pixels.)
+    const std::vector<float> toAdded = distanceTransform(added, PW, PH);
+    // Outside the closed shape, its distance comes from a transform of its own (the grown-out set's distance stops at
+    // the edge of the growth, which would leave a haze of the feather all round).
+    std::vector<uint8_t> closedSet(pn);
+    for (size_t i = 0; i < pn; ++i) closedSet[i] = inside[i] || toOutside[i] > px;
+    const std::vector<float> toClosed = distanceTransform(closedSet, PW, PH);
+    const double fe = std::max(1.0, feather), reach = fe + 1;
+    parallelRows(H, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y)
+            for (int x = 0; x < W; ++x) {
+                const size_t i = at(x, y);
+                if (toAdded[i] > 2 * reach) continue;
+                const double d = closedSet[i] ? px + 0.5 - toOutside[i] : toClosed[i] - 0.5;
+                const double k = std::clamp(0.5 - d / fe, 0.0, 1.0);
+                const float closed = float(k * k * (3 - 2 * k));
+                const float w = float(std::clamp(2 - toAdded[i] / reach, 0.0, 1.0));  // (fading out further away)
+                float& m = matte[size_t(y) * size_t(W) + size_t(x)];
+                m += std::max(0.f, closed - m) * w;
+            }
+    });
 }
 
 void refineMatteEdges(std::vector<float>& matte, const Image& guide, double radius, double amount) {
     const int W = guide.width, H = guide.height;
     const size_t n = size_t(W) * size_t(H);
     if (matte.size() != n || W <= 0 || H <= 0 || !(amount > 0)) return;
-    // A band of `radius` either side of the mask's edge is unknown; beyond it the mask is sure (inside or outside). Each
-    // pixel in the band takes the place of its colour between the sure object's colours and the sure background's
-    // near it (a colour-line matte, as matting tools estimate alpha), so the edge lands on the picture's own and
-    // fine detail (hair, fur, leaves) comes through partly.
+    // The mask is sure (inside or outside) more than `radius` from its edge, and unknown in the band within it and along
+    // a soft edge (a wide feather) that runs on from the band, so no hard step is left where the band ends. (A soft
+    // edge is where the mask is partway and still changing: a flat partway interior stays sure, and a stray partway
+    // pixel away from the edge is not part of it.) Each unknown pixel takes the place of its colour between the sure
+    // object's colours and the sure background's near it (a colour-line matte, as matting tools estimate alpha), so the
+    // edge lands on the picture's own and fine detail (hair, fur, leaves) comes through partly. Transparent pixels have
+    // no colour and are left alone.
     const double r = std::max(1.0, radius);
     std::vector<uint8_t> in(n), out(n);
     for (size_t i = 0; i < n; ++i) {
@@ -1179,29 +1226,62 @@ void refineMatteEdges(std::vector<float>& matte, const Image& guide, double radi
         out[i] = !in[i];
     }
     const std::vector<float> toOut = distanceTransform(out, W, H), toIn = distanceTransform(in, W, H);
-    auto colour = [&](size_t i, int k) {
-        const float* px = &guide.px[i * 4];
-        return px[3] > 1e-6f ? std::clamp(px[k] / px[3], 0.f, 1.f) : 0.f;
+    auto opaque = [&](size_t i) { return guide.px[i * 4 + 3] > 1e-3f; };
+    auto colour = [&](size_t i, int k) { return guide.px[i * 4 + k] / guide.px[i * 4 + 3]; };  // (unpremultiplied, HDR kept)
+    auto ramp = [&](int x, int y) {
+        const size_t i = size_t(y) * size_t(W) + size_t(x);
+        if (!(matte[i] > 0.02f && matte[i] < 0.98f)) return false;
+        const float gx = matte[i - size_t(x) + size_t(std::min(x + 1, W - 1))] - matte[i - size_t(x) + size_t(std::max(x - 1, 0))];
+        const float gy = matte[size_t(std::min(y + 1, H - 1)) * size_t(W) + size_t(x)] - matte[size_t(std::max(y - 1, 0)) * size_t(W) + size_t(x)];
+        return 0.25f * (gx * gx + gy * gy) > 1e-6f;  // (changing by more than 0.001 a pixel)
     };
-    // The sure colours' local means, on a smaller copy (they change slowly), over twice the band.
-    const int sub = std::max(1, int(r / 3));
+    std::vector<uint8_t> unknown(n, 0);
+    std::vector<int> queue;
+    for (size_t i = 0; i < n; ++i)
+        if ((in[i] && toOut[i] <= r) || (out[i] && toIn[i] <= r)) {
+            unknown[i] = 1;
+            queue.push_back(int(i));
+        }
+    if (queue.empty()) return;
+    double soft = 0;  // how far the soft edge reaches past the band, so the sure colours are looked for beyond it
+    for (size_t q = 0; q < queue.size(); ++q) {
+        const int x = queue[q] % W, y = queue[q] / W;
+        const int nx[4] = {x - 1, x + 1, x, x}, ny[4] = {y, y, y - 1, y + 1};
+        for (int k = 0; k < 4; ++k) {
+            if (nx[k] < 0 || ny[k] < 0 || nx[k] >= W || ny[k] >= H) continue;
+            const size_t j = size_t(ny[k]) * size_t(W) + size_t(nx[k]);
+            if (unknown[j] || !ramp(nx[k], ny[k])) continue;
+            unknown[j] = 1;
+            soft = std::max(soft, double(in[j] ? toOut[j] : toIn[j]) - r);
+            queue.push_back(int(j));
+        }
+    }
+    queue = {};
+    auto sureIn = [&](size_t i) { return in[i] && !unknown[i]; };
+    auto sureOut = [&](size_t i) { return out[i] && !unknown[i]; };
+    // The sure colours' local means, on a smaller copy (they change slowly), over twice the band and the soft edge.
+    const int sub = std::max(2, int(r / 3));
     const int w = (W + sub - 1) / sub, h = (H + sub - 1) / sub;
     const size_t m = size_t(w) * size_t(h);
     std::vector<float> fg[4], bg[4];  // colour sums and counts
     for (int k = 0; k < 4; ++k) fg[k].assign(m, 0.f), bg[k].assign(m, 0.f);
-    bool band = false;
-    for (int y = 0; y < H; ++y)
-        for (int x = 0; x < W; ++x) {
-            const size_t i = size_t(y) * size_t(W) + size_t(x), j = size_t(y / sub) * size_t(w) + size_t(x / sub);
-            const bool sureIn = in[i] && toOut[i] > r, sureOut = out[i] && toIn[i] > r;
-            band = band || (!sureIn && !sureOut);
-            std::vector<float>* into = sureIn ? fg : sureOut ? bg : nullptr;
-            if (!into) continue;
-            for (int k = 0; k < 3; ++k) into[k][j] += colour(i, k);
-            into[3][j] += 1;
-        }
+    std::atomic<bool> band{false};
+    parallelRows(h, [&](int g0, int g1) {  // (by rows of the smaller copy, so no two threads add to one cell)
+        bool found = false;
+        for (int y = g0 * sub; y < std::min(H, g1 * sub); ++y)
+            for (int x = 0; x < W; ++x) {
+                const size_t i = size_t(y) * size_t(W) + size_t(x), j = size_t(y / sub) * size_t(w) + size_t(x / sub);
+                const bool si = sureIn(i), so = !si && sureOut(i);
+                found = found || (!si && !so);
+                std::vector<float>* into = si ? fg : so ? bg : nullptr;
+                if (!into || !opaque(i)) continue;
+                for (int k = 0; k < 3; ++k) into[k][j] += colour(i, k);
+                into[3][j] += 1;
+            }
+        if (found) band = true;
+    });
     if (!band) return;
-    const int reach = std::max(1, int(std::ceil(2 * r / sub)));
+    const int reach = std::max(1, int(std::ceil((2 * r + soft) / sub)));
     for (int k = 0; k < 4; ++k) {
         boxBlurPlane(fg[k], w, h, reach, 1);
         boxBlurPlane(bg[k], w, h, reach, 1);
@@ -1214,7 +1294,7 @@ void refineMatteEdges(std::vector<float>& matte, const Image& guide, double radi
             const float fy = gy - float(ya);
             for (int x = 0; x < W; ++x) {
                 const size_t i = size_t(y) * size_t(W) + size_t(x);
-                if ((in[i] && toOut[i] > r) || (out[i] && toIn[i] > r)) continue;
+                if (sureIn(i) || sureOut(i) || !opaque(i)) continue;
                 const float gx = std::clamp((x + 0.5f) / float(sub) - 0.5f, 0.f, float(w - 1));
                 const int xa = int(gx), xb = std::min(xa + 1, w - 1);
                 const float fx = gx - float(xa);
@@ -1233,9 +1313,11 @@ void refineMatteEdges(std::vector<float>& matte, const Image& guide, double radi
                     dd += d[k] * d[k];
                     proj += v[k] * d[k];
                 }
-                if (dd < 1e-3f) continue;  // (object and background alike here: the mask stays)
+                if (dd < 1e-6f) continue;
+                // Where object and background are alike the colours say little: the mask moves less, not abruptly.
+                const float trust = dd / (dd + 2e-3f);
                 const float alpha = std::clamp(proj / dd, 0.f, 1.f);
-                matte[i] += (alpha - matte[i]) * a;
+                matte[i] += (alpha - matte[i]) * a * trust;
             }
         }
     });
@@ -1329,10 +1411,10 @@ std::vector<float> effectMatte(const Effect& e, FrameTime t, const Image& img, d
                 }
         });
     }
-    if (shape > 0) {
+    if (shape > 0 && shape != 6) {
         // The shape's holes and gaps closed (Consolidate), then its edge settled on the picture's own (Refine Edges,
-        // as Photoshop's Refine Edge and Resolve's Smart Refine).
-        consolidateMatte(matte, W, H, e.p("mask.consolidate", t) * pixelScale);
+        // as Photoshop's Refine Edge and Resolve's Smart Refine). A gradient has neither holes nor an object's edge.
+        consolidateMatte(matte, W, H, e.p("mask.consolidate", t) * pixelScale, e.p("mask.feather", t, 20) * pixelScale);
         const double refine = std::clamp(e.p("mask.refine", t) / 100.0, 0.0, 1.0);
         if (refine > 0) refineMatteEdges(matte, img, std::max(1.0, e.p("mask.refine_radius", t, 8) * pixelScale), refine);
     }

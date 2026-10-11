@@ -138,6 +138,8 @@ private:
     int pending_ = 0;
     mutable QImage tint_;
     mutable QString tintKey_;
+    mutable QImage ownTint_;  // the object being picked, when the mask has several
+    mutable QString ownTintKey_;
 };
 
 }  // namespace montage
