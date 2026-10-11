@@ -192,6 +192,8 @@ struct Marker {
     std::string comment;
     int color = 0;
     bool chapter = false;  // a chapter marker: a chapter in exported MP4 / MOV / MKV files and YouTube's list
+    std::string drawing;   // a reviewer's drawing over the frame (core/ReviewPage.h): strokes as JSON, in 0..1 of the picture
+    std::string reviewId;  // the review note it came from (the notes imported again bring it up to date)
     bool operator==(const Marker&) const = default;
 };
 

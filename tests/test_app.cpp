@@ -92,6 +92,7 @@
 #include "EffectPresetStore.h"
 #include "EffectsBrowser.h"
 #include "MediaBinWidget.h"
+#include "ReviewOverlay.h"
 #include "media/Proxy.h"
 #include "StoryboardView.h"
 #include "StackedTimelineWidget.h"
@@ -4404,6 +4405,124 @@ private slots:
         QCOMPARE(j2.settings.out, FrameTime(21));
         QVERIFY(QFileInfo::exists(QDir(other).filePath(name + " - Review.html")));
         win_->renderQueue()->remove(j2.id);
+    }
+
+    void reviewDrawingsAndVersions() {
+        loadDemo();
+        MonitorPanel* program = nullptr;
+        for (MonitorPanel* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Program) program = m;
+        QVERIFY(program);
+        ViewerWidget* viewer = program->viewer();
+        auto* overlay = win_->findChild<ReviewOverlay*>();
+        QVERIFY(overlay);
+        QAction* show = win_->findChild<QAction*>("showReviewDrawings");
+        QVERIFY(show && show->isChecked() && show->isCheckable());
+
+        // A reviewer's green line across the middle of frame 10, drawn over the Program monitor there and nowhere else.
+        state()->setPlayhead(10);
+        QTest::qWait(300);  // (the frame rendered for the playhead)
+        ReviewStroke line;
+        line.color = "#00ff00";
+        line.width = 0.05;
+        line.points = {{0.1, 0.5}, {0.9, 0.5}};
+        Marker m{10, 0, "Sam", "Here", 7, false};
+        m.drawing = reviewDrawingJson({line});
+        m.reviewId = "x1";
+        QVERIFY(state()->edit("Mark", [&](Project&, Sequence& s) {
+            edit::addMarker(s, m);
+            return true;
+        }));
+        QCOMPARE(overlay->strokesNow().size(), size_t(1));
+        QImage black(320, 180, QImage::Format_RGB32);
+        black.fill(Qt::black);
+        viewer->setImage(black);
+        auto centre = [&] {
+            const QImage shot = viewer->grab().toImage();
+            const qreal dpr = shot.devicePixelRatio();
+            const QRectF r = viewer->imageRect();
+            return shot.pixelColor(int(r.center().x() * dpr), int(r.center().y() * dpr));
+        };
+        QColor c = centre();
+        QVERIFY2(c.green() > 200 && c.red() < 80 && c.blue() < 80, qPrintable(c.name()));
+        show->trigger();  // Playback › Show Review Drawings off
+        QVERIFY(!overlay->shown());
+        c = centre();
+        QVERIFY2(c.green() < 60, qPrintable(c.name()));
+        show->trigger();
+        QVERIFY(overlay->shown());
+        state()->setPlayhead(11);
+        QVERIFY(overlay->strokesNow().empty());
+        // A marker with a length shows its drawing all through it.
+        QVERIFY(state()->edit("Lengthen", [&](Project&, Sequence& s) {
+            for (Marker& x : s.markers)
+                if (x.reviewId == "x1") x.duration = 5;
+            return true;
+        }));
+        QCOMPARE(overlay->strokesNow().size(), size_t(1));
+        state()->setPlayhead(15);
+        QVERIFY(overlay->strokesNow().empty());
+
+        // A copy sent again to the same folder is version 2, and its page compares with version 1.
+        const QString name = QString::fromStdString(state()->sequence()->name);
+        const QString folder = dir_.filePath("versions");
+        QDir(folder).removeRecursively();
+        const QString first = win_->exportForReview(folder, ReviewExportOptions{});
+        QCOMPARE(first, QDir(folder).filePath(name + " - Review.html"));
+        win_->renderQueue()->remove(win_->renderQueue()->jobs().back().id);
+        {
+            QFile copy(QDir(folder).filePath(name + " - Review.mp4"));  // (as if rendered)
+            QVERIFY(copy.open(QIODevice::WriteOnly));
+        }
+        bool shown = false;
+        QTimer::singleShot(0, this, [&] {
+            auto* dlg = win_->findChild<QDialog*>("exportForReviewDialog");
+            QVERIFY(dlg);
+            shown = true;
+            dlg->findChild<QLineEdit*>("reviewFolder")->setText(folder);
+            auto* version = dlg->findChild<QSpinBox*>("reviewVersion");
+            auto* compare = dlg->findChild<QCheckBox*>("reviewCompare");
+            QCOMPARE(version->value(), 2);
+            QVERIFY(compare->isEnabled() && compare->isChecked());
+            version->setValue(1);
+            QVERIFY(!compare->isEnabled());  // nothing before version 1
+            version->setValue(2);
+            QVERIFY(compare->isEnabled());
+            dlg->accept();
+        });
+        win_->findChild<QAction*>("exportForReview")->trigger();
+        QVERIFY(shown);
+        const RenderQueue::Job& job = win_->renderQueue()->jobs().back();
+        QCOMPARE(QString::fromStdString(job.settings.path), QDir(folder).filePath(name + " - Review v2.mp4"));
+        win_->renderQueue()->remove(job.id);
+        QFile page(QDir(folder).filePath(name + " - Review v2.html"));
+        QVERIFY(page.open(QIODevice::ReadOnly));
+        const auto info = readReviewPage(page.readAll().toStdString());
+        QVERIFY(info && info->version == 2);
+
+        // Notes imported twice: the second time brings the same markers up to date instead of adding more.
+        const QString notes = dir_.filePath("drawn-notes.json");
+        auto writeNotes = [&](const char* json) {
+            QFile f(notes);
+            QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            f.write(json);
+        };
+        writeNotes(R"({"montageReview":2,"fps":[30,1],"version":2,"notes":[{"id":"q1","frame":40,"author":"Ana","text":"Brighter",
+            "drawing":[{"tool":"arrow","points":[[0.2,0.2],[0.5,0.5]]}]}]})");
+        const size_t before = state()->sequence()->markers.size();
+        QCOMPARE(win_->importMarkers(notes), 1);
+        QCOMPARE(state()->sequence()->markers.size(), before + 1);
+        writeNotes(R"({"montageReview":2,"fps":[30,1],"version":2,"notes":[{"id":"q1","frame":40,"author":"Ana","text":"Brighter","status":"done",
+            "drawing":[{"tool":"arrow","points":[[0.2,0.2],[0.5,0.5]]}]}]})");
+        QCOMPARE(win_->importMarkers(notes), 1);
+        QCOMPARE(state()->sequence()->markers.size(), before + 1);
+        QVERIFY(win_->statusBar()->currentMessage().contains("up to date"));
+        const auto& ms = state()->sequence()->markers;
+        QVERIFY(std::any_of(ms.begin(), ms.end(), [](const Marker& x) { return x.reviewId == "q1" && x.name.rfind("\xE2\x9C\x93 ", 0) == 0; }));
+        const auto q1 = std::find_if(ms.begin(), ms.end(), [](const Marker& x) { return x.reviewId == "q1"; });
+        state()->setPlayhead(q1->t);
+        QCOMPARE(overlay->strokesNow().size(), size_t(1));
+        QCOMPARE(overlay->strokesNow()[0].tool, std::string("arrow"));
     }
 
     void transitionsToSelection() {

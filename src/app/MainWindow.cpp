@@ -127,6 +127,7 @@
 #include "CaptionsPanel.h"
 #include "MaskOverlay.h"
 #include "TransformOverlay.h"
+#include "ReviewOverlay.h"
 #include "SequenceIndexPanel.h"
 #include "StackedTimelineWidget.h"
 #include "PanFollowDialog.h"
@@ -359,6 +360,8 @@ void MainWindow::buildPanels() {
     // The transform box first: mask and Corner Pin handles, installed after it, get the pointer before it.
     new TransformOverlay(state_, programPanel_->viewer());
     new MaskOverlay(state_, programPanel_->viewer());
+    reviewOverlay_ = new ReviewOverlay(state_, programPanel_->viewer());
+    reviewOverlay_->setShown(appSettings().value("playback/reviewDrawings", true).toBool());
     connect(programPanel_, &MonitorPanel::exportFrameRequested, this, &MainWindow::exportFrame);
     connect(timeline_, &TimelineWidget::trimViewChanged, this,
             [this](FrameTime left, FrameTime right, const QString& leftLabel, const QString& rightLabel) {
@@ -1722,6 +1725,14 @@ void MainWindow::buildMenus() {
     trimView_->setCheckable(true);
     trimView_->setChecked(appSettings().value("playback/twoUpTrim", true).toBool());
     trimView_->setToolTip(tr("While trimming, rolling, slipping or sliding, show the frames either side of the edit side by side"));
+    QAction* drawings = add(play, tr("Show Review Drawings"), QKeySequence(), [this](bool on) {
+        appSettings().setValue("playback/reviewDrawings", on);
+        if (reviewOverlay_) reviewOverlay_->setShown(on);
+    });
+    drawings->setObjectName(QStringLiteral("showReviewDrawings"));
+    drawings->setCheckable(true);
+    drawings->setChecked(appSettings().value("playback/reviewDrawings", true).toBool());
+    drawings->setToolTip(tr("Show what reviewers drew on a frame (notes imported from a review page) over the Program monitor at its marker"));
     // HDR sequences as HDR on an HDR or EDR display (app/HdrSurface.h); elsewhere, and in builds without it, tone mapped.
     hdrViewer_ = add(play, tr("HDR Viewer"), QKeySequence(), [this](bool on) {
         appSettings().setValue("playback/hdrViewer", on);
@@ -3306,12 +3317,15 @@ int MainWindow::importMarkers(const QString& path) {
         statusBar()->showMessage(QString::fromStdString(err), 6000);
         return 0;
     }
+    MarkerImport result;
     state_->edit(tr("Import Markers"), [&](Project&, Sequence& sq) {
-        for (const Marker& m : markers) edit::addMarker(sq, m);
+        result = addImportedMarkers(sq, markers);
         return true;
     });
-    statusBar()->showMessage(tr("Imported %n marker(s)", nullptr, int(markers.size())), 6000);
-    return int(markers.size());
+    QString msg = tr("Imported %n marker(s)", nullptr, result.added);
+    if (result.updated) msg += tr(", brought %n up to date", nullptr, result.updated);
+    statusBar()->showMessage(msg, 6000);
+    return result.added + result.updated;
 }
 
 int MainWindow::importAle(const QString& path, bool cdlToClips) {
@@ -4909,8 +4923,9 @@ QString MainWindow::exportForReview(const QString& folder, const ReviewExportOpt
     queue_->add(QString::fromStdString(s->name) + tr(" - Review"), tr("Review copy"), state_->project(), s->id, pkg.settings);
     if (queueDock_) queueDock_->show();
     const QString page = QString::fromStdString(pkg.pagePath);
-    state_->message(tr("Review copy queued; send it with %1. The notes saved from the page come back with File › Import Review Notes.")
-                        .arg(QFileInfo(page).fileName()),
+    const QString compare = pkg.page.previous ? tr(" (it compares with version %1)").arg(pkg.page.previous->version) : QString();
+    state_->message(tr("Review copy queued; send it with %1%2. The notes saved from the page come back with File › Import Review Notes.")
+                        .arg(QFileInfo(page).fileName(), compare),
                     8000);
     return page;
 }
@@ -4969,6 +4984,30 @@ void MainWindow::exportForReviewDialog() {
     range->setObjectName(QStringLiteral("reviewRange"));
     range->setEnabled(marked);
     form->addRow(QString(), range);
+    // Version: the next after the copies already in the folder, compared with the one before.
+    auto* version = new QSpinBox(&dlg);
+    version->setObjectName(QStringLiteral("reviewVersion"));
+    version->setRange(1, 999);
+    auto* compare = new QCheckBox(tr("The page compares it with the version before"), &dlg);
+    compare->setObjectName(QStringLiteral("reviewCompare"));
+    compare->setChecked(true);
+    auto versionsHere = [s, folder] { return reviewVersions(*s, folder->text().toStdString()); };
+    auto nextVersion = [version, versionsHere] {
+        const std::vector<int> v = versionsHere();
+        version->setValue(v.empty() ? 1 : v.back() + 1);
+    };
+    auto updateCompare = [compare, version, versionsHere] {
+        const std::vector<int> v = versionsHere();
+        compare->setEnabled(std::any_of(v.begin(), v.end(), [&](int x) { return x < version->value(); }));
+    };
+    nextVersion();
+    updateCompare();
+    connect(folder, &QLineEdit::textChanged, &dlg, [=] { nextVersion(); updateCompare(); });
+    connect(version, &QSpinBox::valueChanged, &dlg, [=] { updateCompare(); });
+    version->setToolTip(tr("A copy of this cut sent again is the next version (\"%1 - Review v2\"); the same number replaces that copy")
+                            .arg(QString::fromStdString(s->name)));
+    form->addRow(tr("Version:"), version);
+    form->addRow(QString(), compare);
     auto* note = new QPlainTextEdit(&dlg);
     note->setObjectName(QStringLiteral("reviewNote"));
     note->setPlaceholderText(tr("A message for the reviewers (optional)"));
@@ -4986,6 +5025,8 @@ void MainWindow::exportForReviewDialog() {
     o.watermark = watermark->text().trimmed().toStdString();
     o.markers = markers->isChecked();
     o.note = note->toPlainText().trimmed().toStdString();
+    o.version = version->value();
+    o.compare = compare->isChecked();
     if (range->isChecked() && marked) {
         o.in = s->inPoint;
         o.out = s->outPoint + 1;

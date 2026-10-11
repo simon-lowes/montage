@@ -526,6 +526,7 @@ private:
     QString voiceRefName_;
     QAction* compareRef_ = nullptr;
     QAction* trimView_ = nullptr;  // Playback › Two-Up Trim View
+    class ReviewOverlay* reviewOverlay_ = nullptr;  // reviewers' drawings over the Program monitor
     QAction* hdrViewer_ = nullptr;  // Playback › HDR Viewer
     bool hdrMessageShown_ = false;  // why HDR is not showing, said once a toggle
     bool hdrWired_ = false;

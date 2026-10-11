@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <sstream>
 
+#include "EditOps.h"
 #include "History.h"
 #include "MediaLog.h"
 #include "ReviewPage.h"
@@ -183,6 +184,31 @@ bool parseMarkerList(const std::string& text, const Sequence& s, std::vector<Mar
         for (Marker& m : out) m.t -= hour;
     std::sort(out.begin(), out.end(), [](const Marker& a, const Marker& b) { return a.t < b.t; });
     return true;
+}
+
+MarkerImport addImportedMarkers(Sequence& s, const std::vector<Marker>& markers) {
+    MarkerImport r;
+    auto at = [&](FrameTime t) { return std::find_if(s.markers.begin(), s.markers.end(), [&](const Marker& m) { return m.t == t; }); };
+    for (const Marker& in : markers) {
+        if (!in.reviewId.empty()) {
+            auto same = std::find_if(s.markers.begin(), s.markers.end(), [&](const Marker& m) { return m.reviewId == in.reviewId; });
+            if (same != s.markers.end()) {
+                const FrameTime t = same->t;
+                const bool chapter = same->chapter;
+                *same = in;
+                same->t = t, same->chapter = chapter;
+                ++r.updated;
+                continue;
+            }
+            Marker m = in;
+            while (at(m.t) != s.markers.end()) ++m.t;  // (never over another marker)
+            edit::addMarker(s, std::move(m));
+        } else {
+            edit::addMarker(s, in);
+        }
+        ++r.added;
+    }
+    return r;
 }
 
 }  // namespace montage

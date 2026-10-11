@@ -9,14 +9,42 @@
 
 namespace montage {
 
-ReviewPackage reviewPackage(const Sequence& s, const std::string& folder, const ReviewExportOptions& o) {
-    ReviewPackage p;
+namespace {
+
+QString reviewBase(const Sequence& s) {
     QString base = QString::fromStdString(s.name.empty() ? std::string("Sequence") : s.name);
     for (QChar& c : base)
         if (QStringLiteral("\\/:*?\"<>|").contains(c)) c = '-';
+    return base + QStringLiteral(" - Review");
+}
+
+QString versionName(const QString& base, int version) { return version <= 1 ? base : base + QStringLiteral(" v%1").arg(version); }
+
+}  // namespace
+
+std::vector<int> reviewVersions(const Sequence& s, const std::string& folder) {
+    const QString base = reviewBase(s);
+    std::vector<int> out;
     const QDir dir(QString::fromStdString(folder));
-    p.videoPath = dir.filePath(base + QStringLiteral(" - Review.mp4")).toStdString();
-    p.pagePath = dir.filePath(base + QStringLiteral(" - Review.html")).toStdString();
+    for (const QString& f : dir.entryList({base + QStringLiteral("*.html")}, QDir::Files)) {
+        const QString rest = f.mid(base.size(), f.size() - base.size() - 5);
+        bool ok = true;
+        const int v = rest.isEmpty() ? 1 : rest.startsWith(QStringLiteral(" v")) ? rest.mid(2).toInt(&ok) : 0;
+        if (ok && v >= 1) out.push_back(v);
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+ReviewPackage reviewPackage(const Sequence& s, const std::string& folder, const ReviewExportOptions& o) {
+    ReviewPackage p;
+    const QString base = reviewBase(s);
+    const QDir dir(QString::fromStdString(folder));
+    const std::vector<int> before = reviewVersions(s, folder);
+    const int version = o.version > 0 ? o.version : before.empty() ? 1 : before.back() + 1;
+    const QString name = versionName(base, version);
+    p.videoPath = dir.filePath(name + QStringLiteral(".mp4")).toStdString();
+    p.pagePath = dir.filePath(name + QStringLiteral(".html")).toStdString();
 
     ExportSettings& st = p.settings;
     st.path = p.videoPath;
@@ -47,6 +75,17 @@ ReviewPackage reviewPackage(const Sequence& s, const std::string& folder, const 
     p.page.width = w;
     p.page.height = h;
     p.page.note = o.note;
+    p.page.version = version;
+    // The latest earlier version whose page and copy are both here, to compare with.
+    for (auto it = before.rbegin(); o.compare && it != before.rend(); ++it) {
+        if (*it >= version) continue;
+        QFile f(dir.filePath(versionName(base, *it) + QStringLiteral(".html")));
+        if (!f.open(QIODevice::ReadOnly)) continue;
+        const auto old = readReviewPage(f.readAll().toStdString());
+        if (!old || old->videoFile.find_first_of("/\\") != std::string::npos || !dir.exists(QString::fromStdString(old->videoFile))) continue;
+        p.page.previous = ReviewVersion{*it, old->videoFile, old->fps, old->offset, old->frames};
+        break;
+    }
     return p;
 }
 

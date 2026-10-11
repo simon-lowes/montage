@@ -14904,6 +14904,73 @@ private slots:
         auto found = std::find_if(ms.begin(), ms.end(), [](const Marker& m) { return m.name == "Ana"; });
         QVERIFY(found != ms.end() && found->t == 12 && found->duration == 5 && found->comment == "Flash frame?");
         QVERIFY(std::any_of(ms.begin(), ms.end(), [](const Marker& m) { return m.name == "Sam" && m.t == 30; }));
+
+        // Versions: the two copies so far are 1 and 2 (the range); the next is 3, its page comparing with 2.
+        QCOMPARE(reviewVersions(*back.active(), folder.toStdString()), (std::vector<int>{1, 2}));
+        r = call("montage_export_review", {{"project", project}, {"folder", folder}, {"max_height", 180}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QJsonObject v3 = r.value("structuredContent").toObject();
+        QVERIFY2(v3.value("version").toInt() == 3, QJsonDocument(r).toJson().constData());
+        QCOMPARE(v3.value("compares_with").toInt(), 2);
+        QVERIFY(v3.value("video").toString().endsWith("Ep 1- Pilot - Review v3.mp4"));
+        QFile p3(v3.value("page").toString());
+        QVERIFY(p3.open(QIODevice::ReadOnly));
+        const auto info3 = readReviewPage(p3.readAll().toStdString());
+        QVERIFY(info3 && info3->version == 3 && info3->frames == 50);
+        QVERIFY(!readReviewPage("<html>not a page</html>"));
+        {
+            QFile again(v3.value("page").toString());
+            QVERIFY(again.open(QIODevice::ReadOnly));
+            const QByteArray h3 = again.readAll();
+            QVERIFY(h3.contains("\"previous\":{"));
+            QVERIFY(h3.contains("\"video\":\"Ep 1- Pilot - Review v2.mp4\""));
+            QVERIFY(h3.contains("\"offset\":25"));  // version 2 was the range from a second in
+        }
+        // The same number replaces that copy; without comparing.
+        r = call("montage_export_review", {{"project", project}, {"folder", folder}, {"max_height", 180}, {"version", 3}, {"compare", false}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("version").toInt(), 3);
+        QVERIFY(r.value("structuredContent").toObject().value("compares_with").isNull());
+        QCOMPARE(reviewVersions(*back.active(), folder.toStdString()), (std::vector<int>{1, 2, 3}));
+        r = call("montage_export_review", {{"project", project}, {"folder", folder}, {"version", 0}});
+        QVERIFY(r.value("isError").toBool() || r.isEmpty());
+
+        // Notes with a drawing, replies and a status: the marker keeps the drawing and the note's id; a note on a frame
+        // that has a marker goes to the next free one.
+        auto writeNotes = [&](const char* json) {
+            QFile f(notes);
+            QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            f.write(json);
+        };
+        writeNotes(R"({"montageReview":2,"fps":[25,1],"version":3,"notes":[
+            {"id":"n1","frame":30,"author":"Sam","text":"Mask this","status":"progress","updated":"2026-10-11T10:00:00Z",
+             "replies":[{"author":"Ana","text":"Agreed","created":"2026-10-11T10:01:00Z"}],
+             "drawing":[{"tool":"ellipse","color":"\u0023ffcc00","width":0.003,"points":[[0.2,0.2],[0.4,0.5]]}]}]})");
+        r = call("montage_import_markers", {{"project", project}, {"path", notes}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("added").toInt(), 1);
+        QVERIFY(loadProject(project.toStdString(), back));
+        auto drawn = std::find_if(back.active()->markers.begin(), back.active()->markers.end(), [](const Marker& m) { return m.reviewId == "n1"; });
+        QVERIFY(drawn != back.active()->markers.end());
+        QCOMPARE(drawn->t, FrameTime(31));
+        QCOMPARE(drawn->name, std::string("\xE2\x97\x90 Sam \xC2\xB7 v3"));
+        QCOMPARE(drawn->comment, std::string("Mask this\n\xE2\x86\xB3 Ana: Agreed"));
+        QCOMPARE(parseReviewDrawing(drawn->drawing).size(), size_t(1));
+        QCOMPARE(parseReviewDrawing(drawn->drawing)[0].tool, std::string("ellipse"));
+        // Imported again, done and with another reply: the same marker brought up to date.
+        writeNotes(R"({"montageReview":2,"fps":[25,1],"version":3,"notes":[
+            {"id":"n1","frame":30,"author":"Sam","text":"Mask this","status":"done",
+             "replies":[{"author":"Ana","text":"Agreed"},{"author":"Sam","text":"Done in v4"}],
+             "drawing":[{"tool":"ellipse","color":"\u0023ffcc00","points":[[0.2,0.2],[0.4,0.5]]}]}]})");
+        r = call("montage_import_markers", {{"project", project}, {"path", notes}});
+        QCOMPARE(r.value("structuredContent").toObject().value("updated").toInt(), 1);
+        QCOMPARE(r.value("structuredContent").toObject().value("added").toInt(), 0);
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.active()->markers.size(), size_t(4));
+        drawn = std::find_if(back.active()->markers.begin(), back.active()->markers.end(), [](const Marker& m) { return m.reviewId == "n1"; });
+        QCOMPARE(drawn->name, std::string("\xE2\x9C\x93 Sam \xC2\xB7 v3"));
+        QVERIFY(drawn->comment.find("Done in v4") != std::string::npos);
+        QCOMPARE(drawn->t, FrameTime(31));
     }
 
     void planarTracking() {

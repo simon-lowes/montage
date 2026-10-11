@@ -173,6 +173,8 @@ QJsonArray markersToJson(const std::vector<Marker>& markers) {
     for (const auto& mk : markers) {
         QJsonObject mo{{"t", double(mk.t)}, {"duration", double(mk.duration)}, {"name", qs(mk.name)}, {"comment", qs(mk.comment)}, {"color", mk.color}};
         if (mk.chapter) mo["chapter"] = true;
+        if (!mk.drawing.empty()) mo["drawing"] = qs(mk.drawing);
+        if (!mk.reviewId.empty()) mo["review_id"] = qs(mk.reviewId);
         m.append(mo);
     }
     return m;
@@ -189,6 +191,8 @@ std::vector<Marker> markersFromJson(const QJsonValue& v) {
         mk.comment = ss(mo.value("comment"));
         mk.color = mo.value("color").toInt(0);
         mk.chapter = mo.value("chapter").toBool(false);
+        mk.drawing = ss(mo.value("drawing"));
+        mk.reviewId = ss(mo.value("review_id"));
         out.push_back(mk);
     }
     return out;
@@ -493,14 +497,10 @@ QJsonObject sequenceToJson(const Sequence& s) {
                   {"in", double(s.inPoint)},
                   {"out", double(s.outPoint)},
                   {"playhead", double(s.playhead)}};
-    QJsonArray v, a, m;
+    QJsonArray v, a;
     for (const auto& t : s.videoTracks) v.append(trackToJson(t));
     for (const auto& t : s.audioTracks) a.append(trackToJson(t));
-    for (const auto& mk : s.markers) {
-        QJsonObject mo{{"t", double(mk.t)}, {"duration", double(mk.duration)}, {"name", qs(mk.name)}, {"comment", qs(mk.comment)}, {"color", mk.color}};
-        if (mk.chapter) mo["chapter"] = true;
-        m.append(mo);
-    }
+    const QJsonArray m = markersToJson(s.markers);
     o["video"] = v;
     o["audio"] = a;
     o["markers"] = m;
@@ -654,17 +654,7 @@ Sequence sequenceFromJson(const QJsonObject& o) {
     if (std::find(audioLayouts().begin(), audioLayouts().end(), s.audioLayout) == audioLayouts().end()) s.audioLayout = "stereo";
     for (const auto& t : o.value("video").toArray()) s.videoTracks.push_back(trackFromJson(t.toObject(), TrackKind::Video));
     for (const auto& t : o.value("audio").toArray()) s.audioTracks.push_back(trackFromJson(t.toObject(), TrackKind::Audio));
-    for (const auto& mv : o.value("markers").toArray()) {
-        QJsonObject mo = mv.toObject();
-        Marker mk;
-        mk.t = i64(mo.value("t"));
-        mk.duration = i64(mo.value("duration"));
-        mk.name = ss(mo.value("name"));
-        mk.comment = ss(mo.value("comment"));
-        mk.color = mo.value("color").toInt(0);
-        mk.chapter = mo.value("chapter").toBool(false);
-        s.markers.push_back(mk);
-    }
+    s.markers = markersFromJson(o.value("markers"));
     for (const auto& c : o.value("captions").toArray()) s.captionTracks.push_back(captionTrackFromJson(c.toObject()));
     for (const auto& v : o.value("adrCues").toArray()) {
         const QJsonObject qo = v.toObject();

@@ -1,8 +1,11 @@
 // Montage — the review copy and its page (core/ReviewPage.h): an H.264 copy at a size that streams and plays
-// anywhere, timecode and an optional watermark burned in, next to the page reviewers open to leave notes.
+// anywhere, timecode and an optional watermark burned in, next to the page reviewers open to leave notes. Copies of
+// the same cut sent again to the same folder are numbered ("<name> - Review v2"), and each page can compare its
+// copy with the version before.
 #pragma once
 
 #include <string>
+#include <vector>
 
 #include "core/ReviewPage.h"
 #include "render/Exporter.h"
@@ -16,7 +19,11 @@ struct ReviewExportOptions {
     bool markers = true;       // the editor's markers on the page
     std::string note;          // the editor's message to the reviewers
     FrameTime in = -1, out = -1;  // a range (out exclusive); -1 = the whole sequence
+    int version = 0;           // 0: the next after the copies of this cut already in the folder (1 when none)
+    bool compare = true;       // the page compares with the latest earlier version in the folder, when there is one
 };
+// The versions of a cut's review pages in `folder` ("<name> - Review.html" is 1, "<name> - Review v<n>.html" n).
+std::vector<int> reviewVersions(const Sequence& s, const std::string& folder);
 
 struct ReviewPackage {
     std::string videoPath;  // "<folder>/<name> - Review.mp4"

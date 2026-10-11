@@ -5667,6 +5667,109 @@ private slots:
         QVERIFY2(parseMarkerList("\xEF\xBB\xBF" + notesJson, s, back, &err), err.c_str());
         QCOMPARE(back.size(), size_t(4));
         QCOMPARE(back[3].comment, std::string("From a timecode"));
+
+        // Drawings: kept to the tools, colours, widths and points understood, as JSON on the marker.
+        const std::vector<ReviewStroke> strokes = parseReviewDrawing(
+            R"([{"tool":"arrow","color":"\u0023FF0000","width":0.004,"points":[[0.1,0.2],[0.5,0.6]]},
+                {"tool":"laser","points":[[0.1,0.1]]},
+                {"tool":"box","color":"red","width":9,"points":[[-1,0.5],[2,0.7]]},
+                {"tool":"ellipse","points":[[0.3,0.3]]},
+                {"tool":"pen","points":[[0.5,0.5],["x",1],[0.6,0.5]]}])");
+        QCOMPARE(strokes.size(), size_t(3));  // an unknown tool and a one-point ellipse left out
+        QCOMPARE(strokes[0].color, std::string("#ff0000"));
+        QCOMPARE(strokes[1].color, std::string("#ff3b30"));  // not a #rrggbb colour: the default
+        QCOMPARE(strokes[1].width, 0.05);
+        QCOMPARE(strokes[1].points[0][0], 0.0);  // clamped into the frame
+        QCOMPARE(strokes[1].points[1][0], 1.0);
+        QCOMPARE(strokes[2].points.size(), size_t(2));
+        QCOMPARE(parseReviewDrawing(reviewDrawingJson(strokes)).size(), size_t(3));
+        QVERIFY(reviewDrawingJson({}).empty() && parseReviewDrawing("").empty() && parseReviewDrawing("{oops").empty());
+        std::string many = "[";
+        for (int i = 0; i < 250; ++i) many += std::string(i ? "," : "") + R"({"tool":"pen","points":[[0.5,0.5]]})";
+        QCOMPARE(parseReviewDrawing(many + "]").size(), size_t(200));
+
+        // Notes with a status, replies, a version, an id and a drawing (a drawing alone is a note too).
+        const std::string v2 = R"({"montageReview":2,"fps":[25,1],"version":2,"notes":[
+            {"id":"a1","frame":20,"author":"Sam","text":"Cut here","status":"progress",
+             "replies":[{"author":"Ana","text":"Yes"},{"author":"","text":"Me too"},{"author":"Bo","text":"  "}],
+             "drawing":[{"tool":"box","color":"\u002334c759","points":[[0.1,0.1],[0.3,0.3]]}]},
+            {"id":"a2","frame":20,"author":"Ana","text":"","drawing":[{"tool":"pen","points":[[0.5,0.5],[0.6,0.6]]}],"version":1},
+            {"id":"a3","frame":90,"author":"Ana","text":"Old style","done":true},
+            {"id":"a4","frame":95,"author":"Ana","text":"","drawing":[{"tool":"laser","points":[[0.5,0.5]]}]}]})";
+        std::vector<ReviewNote> drawn;
+        QVERIFY2(parseReviewNotes(v2, s.fps, drawn, nullptr, &err), err.c_str());
+        QCOMPARE(drawn.size(), size_t(3));  // a drawing nobody can show, and no text: dropped
+        QCOMPARE(drawn[0].status, std::string("progress"));
+        QVERIFY(!drawn[0].done);
+        QCOMPARE(drawn[0].version, 2);  // the file's
+        QCOMPARE(drawn[0].replies.size(), size_t(2));
+        QCOMPARE(drawn[0].replies[1].author, std::string("Reviewer"));
+        QCOMPARE(drawn[1].version, 1);  // the note's own
+        QVERIFY(drawn[1].text.empty() && !drawn[1].drawing.empty());
+        QCOMPARE(drawn[2].status, std::string("done"));
+        const std::vector<Marker> dm = reviewNotesToMarkers(drawn);
+        QCOMPARE(dm[0].name, std::string("\xE2\x97\x90 Sam \xC2\xB7 v2"));
+        QCOMPARE(dm[0].comment, std::string("Cut here\n\xE2\x86\xB3 Ana: Yes\n\xE2\x86\xB3 Reviewer: Me too"));
+        QCOMPARE(dm[0].reviewId, std::string("a1"));
+        QCOMPARE(parseReviewDrawing(dm[0].drawing)[0].tool, std::string("box"));
+        QCOMPARE(dm[1].name, std::string("Ana"));  // version 1: no mark
+        QCOMPARE(dm[1].comment, std::string("(a drawing)"));
+        QCOMPARE(dm[2].name, std::string("\xE2\x9C\x93 Ana \xC2\xB7 v2"));
+
+        // Into the sequence: notes never replace a marker (the editor's at 20 stays; both notes on 20 move along),
+        // and imported again they bring their markers up to date, where the editor moved them.
+        Sequence seq = s;
+        seq.markers = {Marker{20, 0, "Editor's", "", 3, false}};
+        MarkerImport mi = addImportedMarkers(seq, dm);
+        QCOMPARE(mi.added, 3);
+        QCOMPARE(mi.updated, 0);
+        QCOMPARE(seq.markers.size(), size_t(4));
+        QCOMPARE(seq.markers[0].name, std::string("Editor's"));
+        QCOMPARE(seq.markers[1].reviewId, std::string("a1"));
+        QCOMPARE(seq.markers[1].t, FrameTime(21));
+        QCOMPARE(seq.markers[2].reviewId, std::string("a2"));
+        QCOMPARE(seq.markers[2].t, FrameTime(22));
+        seq.markers[3].t = 120;  // moved by the editor
+        std::vector<ReviewNote> later = drawn;
+        later[2].status = "open", later[2].done = false;
+        later[2].replies.push_back({"Sam", "Reopened", ""});
+        mi = addImportedMarkers(seq, reviewNotesToMarkers(later));
+        QCOMPARE(mi.added, 0);
+        QCOMPARE(mi.updated, 3);
+        QCOMPARE(seq.markers.size(), size_t(4));
+        const auto a3 = std::find_if(seq.markers.begin(), seq.markers.end(), [](const Marker& m) { return m.reviewId == "a3"; });
+        QCOMPARE(a3->t, FrameTime(120));
+        QCOMPARE(a3->name, std::string("Ana \xC2\xB7 v2"));
+        QVERIFY(a3->comment.find("Reopened") != std::string::npos);
+        // Markers without an id replace any at their frame, as before.
+        mi = addImportedMarkers(seq, {Marker{20, 0, "CSV", "", 0, false}});
+        QCOMPARE(mi.added, 1);
+        QCOMPARE(seq.markers[0].name, std::string("CSV"));
+
+        // The page: its version, the version it compares with, and the editor's drawings; read back from its HTML.
+        info.version = 3;
+        info.previous = ReviewVersion{2, "Cut - Review v2.mp4", {25, 1}, 10, 200};
+        info.markers[0].drawing = dm[0].drawing;
+        const std::string page3 = reviewPageHtml(info);
+        const auto read = readReviewPage(page3);
+        QVERIFY(read);
+        QCOMPARE(read->version, 3);
+        QCOMPARE(read->videoFile, std::string("Cut - Review.mp4"));
+        QCOMPARE(read->frames, FrameTime(250));
+        QCOMPARE(read->fps, (Rational{25, 1}));
+        QVERIFY(page3.find("\"previous\":{\"fps\":[25,1],\"frames\":200,\"offset\":10,\"version\":2,\"video\":\"Cut - Review v2.mp4\"}") != std::string::npos);
+        QVERIFY(page3.find("\"drawing\":[{\"color\":\"#34c759\"") != std::string::npos);
+        QVERIFY(!readReviewPage("<html><script type=\"application/json\" id=\"review-config\">{}</script></html>"));
+
+        // Saved and loaded with the project.
+        QTemporaryDir dir;
+        Project withNotes = p;
+        withNotes.active()->markers = seq.markers;
+        const std::string file = (dir.path() + "/notes.montage").toStdString();
+        QVERIFY(saveProject(withNotes, file));
+        Project loaded;
+        QVERIFY(loadProject(file, loaded));
+        QCOMPARE(loaded.active()->markers, seq.markers);
     }
 
     void markerLists() {

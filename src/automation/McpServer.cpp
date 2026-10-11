@@ -359,8 +359,11 @@ QJsonObject projectJson(const Project& p) {
         tracks.append(to);
     }
     QJsonArray markers;
-    for (const Marker& m : s.markers)
-        markers.append(QJsonObject{{"at", tc(m.t, s)}, {"name", QString::fromStdString(m.name)}, {"comment", QString::fromStdString(m.comment)}});
+    for (const Marker& m : s.markers) {
+        QJsonObject mo{{"at", tc(m.t, s)}, {"name", QString::fromStdString(m.name)}, {"comment", QString::fromStdString(m.comment)}};
+        if (!m.drawing.empty()) mo["drawing_strokes"] = int(parseReviewDrawing(m.drawing).size());  // a reviewer drew on the frame
+        markers.append(mo);
+    }
     QJsonArray media;
     for (const MediaItem& m : p.media) {
         QJsonObject mo{{"id", double(m.id)}, {"name", QString::fromStdString(m.name)}, {"duration_seconds", m.duration}};
@@ -2655,7 +2658,9 @@ void McpServer::Impl::addTools() {
     add("montage_import_markers", "Import markers",
         "Add markers from a marker list: a CSV with a header row (name, description or notes, in or timecode, out or duration, "
         "type, colour), as review tools and Premiere write them, Avid locator lines, or a notes file saved from a review "
-        "page (montage_export_review; one marker a note, named and coloured by reviewer). Give the file's `path` or its `text`.",
+        "page (montage_export_review; one marker a note, named and coloured by reviewer, with its replies, status and "
+        "drawing; notes imported before bring their markers up to date, and a note never replaces another marker). Give "
+        "the file's `path` or its `text`.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"path":{"type":"string"},"text":{"type":"string"}},
             "required":["project"]})json",
         false, [](const QJsonObject& a) {
@@ -2670,9 +2675,11 @@ void McpServer::Impl::addTools() {
             std::vector<Marker> markers;
             std::string err;
             if (!parseMarkerList(text, s, markers, &err)) return fail(QString::fromStdString(err));
-            for (const Marker& m : markers) edit::addMarker(s, m);
+            const MarkerImport r = addImportedMarkers(s, markers);
             save(l);
-            return ok(QStringLiteral("Added %1 marker(s)").arg(markers.size()));
+            return ok(r.updated ? QStringLiteral("Added %1 marker(s), brought %2 up to date").arg(r.added).arg(r.updated)
+                                : QStringLiteral("Added %1 marker(s)").arg(r.added),
+                      QJsonObject{{"added", r.added}, {"updated", r.updated}});
         });
 
     add("montage_ale", "Avid Log Exchange (ALE) in and out",
@@ -6230,14 +6237,19 @@ void McpServer::Impl::addTools() {
         "Send the cut out for notes without a review service (Frame.io's role): renders an H.264 review copy "
         "(\"<name> - Review.mp4\", at most `max_height` lines, default 1080; timecode burned in unless `timecode` is "
         "false; an optional `watermark` text; captions burned in) into `folder` with \"<name> - Review.html\", a "
-        "self-contained page that plays it in any browser, offline, where reviewers step to a frame or mark a range and "
-        "type notes, then save them as a notes file. montage_import_markers turns that file into markers coloured by "
-        "reviewer. `note` is a message shown to the reviewers; the sequence's markers are shown unless `markers` is "
-        "false; `in`/`out` (timecodes) limit it to a range. Returns both paths.",
+        "self-contained page that plays it in any browser, offline, where reviewers step to a frame or mark a range, "
+        "draw on the picture (pen, arrow, box, ellipse), type notes, reply and set a status, then save them as a notes "
+        "file. montage_import_markers turns that file into markers coloured by reviewer, with their drawings (importing "
+        "it again brings those markers up to date). `note` is a message shown to the reviewers; the sequence's markers "
+        "are shown unless `markers` is false; `in`/`out` (timecodes) limit it to a range. A copy of the same cut sent "
+        "to the same folder again is the next version (\"<name> - Review v2\"; `version` sets the number) and its page "
+        "compares it with the version before, side by side or with a wipe, unless `compare` is false. Returns both "
+        "paths and the version.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"folder":{"type":"string"},
             "max_height":{"type":"integer","default":1080},"timecode":{"type":"boolean","default":true},
             "watermark":{"type":"string"},"note":{"type":"string"},"markers":{"type":"boolean","default":true},
-            "in":{"type":"string"},"out":{"type":"string"}},"required":["project","folder"]})json",
+            "in":{"type":"string"},"out":{"type":"string"},"version":{"type":"integer","minimum":1,"description":"Default: the next after those in the folder"},
+            "compare":{"type":"boolean","default":true}},"required":["project","folder"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
             const Sequence& s = l.seq();
@@ -6251,6 +6263,11 @@ void McpServer::Impl::addTools() {
             if (a.contains("in")) o.in = timeArg(a.value("in"), s, "in");
             if (a.contains("out")) o.out = timeArg(a.value("out"), s, "out");
             if (o.in >= 0 && o.out >= 0 && o.out <= o.in) throw ArgError{"\"out\" comes after \"in\""};
+            if (a.contains("version")) {
+                o.version = a.value("version").toInt(0);
+                if (o.version < 1 || o.version > 999) throw ArgError{"\"version\" is 1 to 999"};
+            }
+            o.compare = a.value("compare").toBool(true);
             const QString folder = absolute(need(a, "folder"));
             QDir().mkpath(folder);
             const ReviewPackage pkg = reviewPackage(s, folder.toStdString(), o);
@@ -6261,7 +6278,9 @@ void McpServer::Impl::addTools() {
             return ok(QStringLiteral("Wrote %1 and %2: send both; the notes saved from the page import as markers.")
                           .arg(QString::fromStdString(pkg.videoPath), QString::fromStdString(pkg.pagePath)),
                       QJsonObject{{"video", QString::fromStdString(pkg.videoPath)}, {"page", QString::fromStdString(pkg.pagePath)},
-                                  {"width", pkg.page.width}, {"height", pkg.page.height}, {"frames", double(pkg.page.frames)}});
+                                  {"width", pkg.page.width}, {"height", pkg.page.height}, {"frames", double(pkg.page.frames)},
+                                  {"version", pkg.page.version},
+                                  {"compares_with", pkg.page.previous ? QJsonValue(pkg.page.previous->version) : QJsonValue()}});
         });
 
     add("montage_export_dcp", "Export a DCP",
