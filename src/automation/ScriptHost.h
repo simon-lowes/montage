@@ -1,8 +1,8 @@
 // Montage — scripts (Resolve's Lua and Python scripting, Premiere's UXP scripts, Avid's scripting): Lua 5.4 programs
 // that drive Montage through the same tools as its MCP server and AI agents. In a script `montage.add_title{text =
 // "Hello", at = 2}` calls montage_add_title (any tool by its name without "montage_", or montage.call("montage_...",
-// args)); arguments are tables, results come back as tables (a tool's structured result, else {text = ...}), and a
-// tool's error stops the script with its message. `montage.tools()` lists them, `montage.args` holds the script's
+// args)); arguments are tables, results come back as tables (a tool's structured result, else {text = ...}; JSON null in
+// an array as montage.null), and a tool's error stops the script with its message. `montage.tools()` lists them, `montage.args` holds the script's
 // arguments, and print() writes to the script's output. The host decides what a call works on: montage-cli runs
 // scripts on project files, the app on the project open in it (each change one undo step).
 #pragma once
@@ -23,6 +23,7 @@ struct ScriptOptions {
     std::function<void()> tick;     // called now and then while the script runs (the app keeps its window alive)
     QStringList args;
     QString project;  // montage.project: the project the script works on ("" if none)
+    bool noStdin = false;  // no io.read or io.lines() from standard input (the app has none: they would wait for ever)
 };
 
 class McpServer;

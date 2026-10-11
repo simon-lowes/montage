@@ -4,6 +4,7 @@
 #include <QJsonDocument>
 #include <QJsonValue>
 #include <cmath>
+#include <cstdlib>
 
 #include "automation/McpServer.h"
 
@@ -60,6 +61,7 @@ bool scriptingAvailable() { return true; }
 namespace {
 
 const char* kHostKey = "montage.host";
+const char* kStopKey = "montage.stop";  // the error a stopped script is ended with (no pcall keeps it)
 const char* kStopped = "Stopped";
 
 const ScriptOptions& host(lua_State* L) {
@@ -68,6 +70,20 @@ const ScriptOptions& host(lua_State* L) {
     lua_pop(L, 1);
     return *o;
 }
+
+void hook(lua_State* L, lua_Debug*);
+
+// Ends the script: its stop value, which pcall, xpcall and coroutine.resume pass on (see kPrelude), and the hook
+// from now on at every instruction, so a script that catches it anyway cannot go on for long.
+[[noreturn]] void stopScript(lua_State* L) {
+    lua_sethook(L, hook, LUA_MASKCOUNT, 1);
+    lua_getfield(L, LUA_REGISTRYINDEX, kStopKey);
+    lua_error(L);
+    std::abort();  // (lua_error does not return)
+}
+
+// JSON null in a result's arrays and as montage.null (a NULL light userdata, as lua-cjson's).
+bool isNull(lua_State* L, int index) { return lua_islightuserdata(L, index) && !lua_touserdata(L, index); }
 
 void push(lua_State* L, const QJsonValue& v);
 
@@ -100,7 +116,8 @@ void push(lua_State* L, const QJsonValue& v) {
             luaL_checkstack(L, 3, "a result nested too deeply");
             lua_createtable(L, int(a.size()), 0);
             for (qsizetype i = 0; i < a.size(); ++i) {
-                push(L, a[i]);
+                if (a[i].isNull()) lua_pushlightuserdata(L, nullptr);  // (nil would leave a hole that ends # and ipairs)
+                else push(L, a[i]);
                 lua_rawseti(L, -2, lua_Integer(i + 1));
             }
             break;
@@ -110,12 +127,27 @@ void push(lua_State* L, const QJsonValue& v) {
     }
 }
 
-// A Lua value as JSON: a table whose keys are 1..n is an array, any other table an object (keys as strings).
+// A Lua value as JSON: a table whose keys are whole numbers from 1 is an array (gaps as null), any other an object
+// (keys strings or numbers); montage.null is null. What JSON cannot hold (NaN, infinity, integers past 2^53, a function,
+// a key that is neither string nor number) is an error rather than a different value.
 QJsonValue toJson(lua_State* L, int index, int depth = 0) {
     index = lua_absindex(L, index);
     switch (lua_type(L, index)) {
         case LUA_TBOOLEAN: return bool(lua_toboolean(L, index));
-        case LUA_TNUMBER: return lua_isinteger(L, index) ? QJsonValue(double(lua_tointeger(L, index))) : QJsonValue(lua_tonumber(L, index));
+        case LUA_TNUMBER: {
+            if (lua_isinteger(L, index)) {
+                const lua_Integer i = lua_tointeger(L, index);
+                if (i > (lua_Integer(1) << 53) || i < -(lua_Integer(1) << 53)) luaL_error(L, "%I is too large for a tool's argument", i);
+                return double(i);
+            }
+            const double d = lua_tonumber(L, index);
+            if (!std::isfinite(d)) luaL_error(L, "a tool's argument cannot be %s", std::isnan(d) ? "NaN" : "infinite");
+            return d;
+        }
+        case LUA_TLIGHTUSERDATA:
+            if (isNull(L, index)) return QJsonValue(QJsonValue::Null);
+            luaL_error(L, "a tool's argument cannot be a userdata");
+            return {};
         case LUA_TSTRING: {
             size_t n = 0;
             const char* s = lua_tolstring(L, index, &n);
@@ -124,20 +156,23 @@ QJsonValue toJson(lua_State* L, int index, int depth = 0) {
         case LUA_TTABLE: {
             if (depth > 64) luaL_error(L, "a table nested too deeply (or holding itself)");
             luaL_checkstack(L, 4, "a table nested too deeply");  // each level holds a key, a value and a copy
-            const lua_Integer n = lua_Integer(lua_rawlen(L, index));
-            lua_Integer keys = 0;
+            lua_Integer keys = 0, last = 0;
             bool sequence = true;
             lua_pushnil(L);
             while (lua_next(L, index)) {
                 ++keys;
-                if (!lua_isinteger(L, -2) || lua_tointeger(L, -2) < 1 || lua_tointeger(L, -2) > n) sequence = false;
+                const int kt = lua_type(L, -2);
+                if (kt != LUA_TSTRING && kt != LUA_TNUMBER) luaL_error(L, "a table key in a tool's argument must be a string or a number");
+                if (lua_isinteger(L, -2) && lua_tointeger(L, -2) >= 1) last = std::max(last, lua_tointeger(L, -2));
+                else sequence = false;
                 lua_pop(L, 1);
             }
-            if (sequence && keys == n && n > 0) {
+            // An array (with null for each gap, unless the gaps outnumber what is there).
+            if (sequence && keys > 0 && last <= 2 * keys + 16) {
                 QJsonArray a;
-                for (lua_Integer i = 1; i <= n; ++i) {
+                for (lua_Integer i = 1; i <= last; ++i) {
                     lua_rawgeti(L, index, i);
-                    a.append(toJson(L, -1, depth + 1));
+                    a.append(lua_isnil(L, -1) ? QJsonValue(QJsonValue::Null) : toJson(L, -1, depth + 1));
                     lua_pop(L, 1);
                 }
                 return a;
@@ -153,7 +188,11 @@ QJsonValue toJson(lua_State* L, int index, int depth = 0) {
             }
             return o;
         }
-        default: return QJsonValue();
+        case LUA_TNIL:
+        case LUA_TNONE: return QJsonValue();
+        default:
+            luaL_error(L, "a tool's argument cannot be a %s", luaL_typename(L, index));
+            return {};
     }
 }
 
@@ -166,9 +205,10 @@ int callTool(lua_State* L, const QString& name, int argsIndex) {
         const QJsonValue v = toJson(L, argsIndex);
         args = v.toObject();
     }
+    if (o.stopped && o.stopped()) stopScript(L);  // (before the tool: a stopped script changes nothing more)
     QString error;
     const QJsonObject result = o.call ? o.call(name, args, &error) : QJsonObject();
-    if (o.stopped && o.stopped()) return luaL_error(L, kStopped);
+    if (o.stopped && o.stopped()) stopScript(L);
     if (result.isEmpty()) return luaL_error(L, "%s: %s", name.toUtf8().constData(), (error.isEmpty() ? QStringLiteral("no answer") : error).toUtf8().constData());
     QString text;
     for (const QJsonValue& c : result.value("content").toArray())
@@ -240,8 +280,25 @@ int montageJson(lua_State* L) {
 void hook(lua_State* L, lua_Debug*) {
     const ScriptOptions& o = host(L);
     if (o.tick) o.tick();
-    if (o.stopped && o.stopped()) luaL_error(L, kStopped);
+    if (o.stopped && o.stopped()) stopScript(L);
 }
+
+// Run before a script, with the stop value as its argument: the catching functions pass it on, so Stop (and Ctrl+C)
+// end a script that catches errors too.
+const char* kPrelude = R"lua(
+local STOP = ...
+local pcall0, xpcall0, error0 = pcall, xpcall, error
+local function pass(ok, ...)
+  if not ok and (...) == STOP then error0(STOP, 0) end
+  return ok, ...
+end
+pcall = function(f, ...) return pass(pcall0(f, ...)) end
+xpcall = function(f, handler, ...)
+  return pass(xpcall0(f, function(e) if e == STOP then return STOP end return handler(e) end, ...))
+end
+local resume0 = coroutine.resume
+coroutine.resume = function(co, ...) return pass(resume0(co, ...)) end
+)lua";
 
 }  // namespace
 
@@ -254,6 +311,28 @@ bool runScript(const QString& code, const QString& name, const ScriptOptions& op
     luaL_openlibs(L);
     lua_pushlightuserdata(L, const_cast<ScriptOptions*>(&options));
     lua_setfield(L, LUA_REGISTRYINDEX, kHostKey);
+    lua_newtable(L);  // the stop value: a table only the host and the prelude hold
+    lua_setfield(L, LUA_REGISTRYINDEX, kStopKey);
+    // Nothing that takes the stop hook away, and no C modules (Lua is built into Montage, not a library to load).
+    lua_getglobal(L, "debug");
+    lua_pushnil(L);
+    lua_setfield(L, -2, "sethook");
+    lua_pop(L, 1);
+    lua_getglobal(L, "package");
+    lua_pushstring(L, "");
+    lua_setfield(L, -2, "cpath");
+    lua_pushnil(L);
+    lua_setfield(L, -2, "loadlib");
+    lua_getfield(L, -1, "searchers");
+    for (int i = 4; i >= 3; --i) lua_pushnil(L), lua_rawseti(L, -2, i);  // (the C and all-in-one searchers)
+    lua_pop(L, 2);
+    // Without a terminal (the app), reading standard input would wait for ever.
+    if (options.noStdin) {
+        luaL_dostring(L, "local lines0 = io.lines\n"
+                         "io.read = function() error('io.read: scripts in the app have no input to read', 2) end\n"
+                         "io.lines = function(f, ...) if f == nil then error('io.lines needs a file here', 2) end return lines0(f, ...) end\n"
+                         "io.stdin = nil");
+    }
     lua_pushcfunction(L, montagePrint);
     lua_setglobal(L, "print");
     // os.exit would end Montage itself (unsaved, in the app): a script ends with error() or by returning.
@@ -277,17 +356,35 @@ bool runScript(const QString& code, const QString& name, const ScriptOptions& op
     lua_setfield(L, -2, "args");
     lua_pushstring(L, options.project.toUtf8().constData());
     lua_setfield(L, -2, "project");
+    lua_pushlightuserdata(L, nullptr);
+    lua_setfield(L, -2, "null");
     lua_newtable(L);  // its metatable
     lua_pushcfunction(L, montageIndex);
     lua_setfield(L, -2, "__index");
     lua_setmetatable(L, -2);
     lua_setglobal(L, "montage");
+    // The prelude, given the stop value.
+    if (luaL_loadstring(L, kPrelude) != LUA_OK) {
+        if (error) *error = QString::fromUtf8(lua_tostring(L, -1));
+        lua_close(L);
+        return false;
+    }
+    lua_getfield(L, LUA_REGISTRYINDEX, kStopKey);
+    lua_call(L, 1, 0);
     lua_sethook(L, hook, LUA_MASKCOUNT, 20000);
-    const QByteArray src = code.toUtf8(), chunk = ("=" + name).toUtf8();
+    // As lua.c reads a file: a UTF-8 byte order mark and a first "#!" line skipped (the line kept, for line numbers).
+    QByteArray src = code.toUtf8();
+    if (src.startsWith("\xEF\xBB\xBF")) src.remove(0, 3);
+    if (src.startsWith('#')) src.remove(0, src.indexOf('\n') < 0 ? src.size() : src.indexOf('\n'));
+    const QByteArray chunk = ("=" + name).toUtf8();
     bool ok = luaL_loadbuffer(L, src.constData(), size_t(src.size()), chunk.constData()) == LUA_OK && lua_pcall(L, 0, 0, 0) == LUA_OK;
     if (!ok && error) {
-        *error = QString::fromUtf8(lua_tostring(L, -1));
-        if (error->endsWith(QLatin1String(kStopped))) *error = QString::fromLatin1(kStopped);
+        lua_getfield(L, LUA_REGISTRYINDEX, kStopKey);
+        const bool stopped = lua_rawequal(L, -1, -2);
+        lua_pop(L, 1);
+        *error = stopped ? QString::fromLatin1(kStopped)
+                 : lua_isstring(L, -1) ? QString::fromUtf8(lua_tostring(L, -1))
+                                       : QStringLiteral("%1: the script raised a %2").arg(name, QString::fromUtf8(luaL_typename(L, -1)));
     }
     lua_close(L);
     return ok;

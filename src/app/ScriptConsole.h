@@ -6,6 +6,7 @@
 #include <QStringList>
 #include <QWidget>
 
+class QEventLoop;
 class QLabel;
 class QPlainTextEdit;
 class QPushButton;
@@ -29,7 +30,7 @@ public:
     // and Stop works); false with the error in the output.
     bool run(const QString& code, const QString& name, const QStringList& args = {});
     bool runFile(const QString& path, const QStringList& args = {});
-    void stop();  // the script stops at its next step (a tool already running finishes first)
+    void stop();  // the script stops at its next step; a tool running is not waited for, and its result not applied
     bool running() const { return running_; }
 
     bool open(const QString& path);  // into the editor
@@ -53,6 +54,8 @@ private:
     QPushButton* stop_;
     QLabel* file_;
     QString path_;  // the editor's script on disk ("" until saved)
+    QString group_;  // the running script's undo group (its calls, for cancelling)
+    QEventLoop* waiting_ = nullptr;  // the wait for a tool's answer, while there is one
     bool running_ = false, stopping_ = false;
     int runs_ = 0, calls_ = 0;
 };

@@ -104,7 +104,7 @@ int usage() {
                  "  montage-cli speak \"text\" -o voice.wav [--voice af_heart] [--speed 1]   (a voiceover from text; --phonemes prints them)\n"
                  "  montage-cli clone-speech \"text\" --voice sample.wav -o out.wav --consent [--language en] [--from S] [--to S]\n"
                  "              [--speed 1] [--exaggeration 0.5]   (in the voice of the sample, with its owner's consent; 23 languages)\n"
-                 "  montage-cli script <file.lua> [--project <project.montage>] [arg...]   (a Lua script driving Montage's tools;\n"
+                 "  montage-cli script [--project <project.montage>] <file.lua> [arg...]   (a Lua script driving Montage's tools;\n"
                  "                                        montage.add_title{text = \"Hi\"} calls montage_add_title)\n"
                  "  montage-cli mcp [--live]              (Model Context Protocol server on stdio, for AI agents;\n"
                  "                                        --live: on the project open in Montage, with Tools > Agent Link on)\n"
@@ -1222,12 +1222,14 @@ int cmdCloneSpeech(const std::vector<std::string>& args) {
 // A Lua script on Montage's tools, on the project named by --project (the tools that take a project get it when the
 // script names none); print() goes to stdout, the error to stderr.
 int cmdScript(const std::vector<std::string>& args) {
+    // Options before the script; everything after it is the script's ("-p 3" there is an argument).
     std::string file, project;
     QStringList rest;
     for (size_t i = 0; i < args.size(); ++i) {
-        if ((args[i] == "--project" || args[i] == "-p") && i + 1 < args.size() && project.empty()) project = args[++i];
-        else if (file.empty()) file = args[i];
-        else rest << QString::fromStdString(args[i]);
+        if (!file.empty()) rest << QString::fromStdString(args[i]);
+        else if ((args[i] == "--project" || args[i] == "-p") && i + 1 < args.size()) project = args[++i];
+        else if (args[i] == "--" && i + 1 < args.size()) file = args[++i];
+        else file = args[i];
     }
     if (file.empty()) return usage();
     if (!scriptingAvailable()) {
@@ -1247,12 +1249,16 @@ int cmdScript(const std::vector<std::string>& args) {
         std::printf("%s\n", line.toUtf8().constData());
         std::fflush(stdout);
     };
-    std::signal(SIGINT, [](int) { gCancel = true; });
+    // Ctrl+C stops the script at its next step; a second one (a tool that takes long, a read) ends at once.
+    std::signal(SIGINT, [](int) {
+        if (gCancel) std::_Exit(130);
+        gCancel = true;
+    });
     o.stopped = [] { return gCancel.load(); };
     QString err;
     if (!runScript(QString::fromUtf8(code.data(), qsizetype(code.size())), QString::fromStdString(std::filesystem::path(file).filename().string()), o, &err)) {
         std::fprintf(stderr, "error: %s\n", err.toUtf8().constData());
-        return 1;
+        return gCancel ? 130 : 1;
     }
     return 0;
 }

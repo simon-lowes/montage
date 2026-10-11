@@ -10317,6 +10317,38 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(!console->run("while true do end", "forever.lua"));
         QVERIFY(ticked && !console->running());
         QVERIFY(console->output().endsWith("Stopped"));
+        // ...also when it catches errors around the tools it calls.
+        QTimer::singleShot(100, console, [console] { console->stop(); });
+        QVERIFY(!console->run("while true do pcall(montage.live_context, {}) end", "catching.lua"));
+        QVERIFY(console->output().endsWith("Stopped"));
+        // Stop during a tool call: a call waiting is answered at once, one running is not applied.
+        {
+            LiveLink* link = win_->liveLink();
+            auto addTitle = [](int id) {
+                return QJsonDocument(QJsonObject{{"jsonrpc", "2.0"}, {"id", id}, {"method", "tools/call"},
+                                                 {"params", QJsonObject{{"name", "montage_add_title"}, {"arguments", QJsonObject{{"text", "x"}, {"at", 0}}}}}})
+                    .toJson(QJsonDocument::Compact);
+            };
+            QByteArray running, waiting;
+            link->handleScript(addTitle(1), [&running](QByteArray r) { running = r; }, "Script: t.lua", "test-run");
+            link->handleScript(addTitle(2), [&waiting](QByteArray r) { waiting = r; }, "Script: t.lua", "test-run");
+            link->cancelScript("test-run");
+            QVERIFY2(waiting.contains("stopped before"), waiting.constData());
+            QTRY_VERIFY(!running.isEmpty());
+            QVERIFY2(running.contains("was stopped while"), running.constData());
+            QCOMPARE(titles(), 0);
+        }
+        // montage.undo{} takes back this run's step only, not an earlier run of the same script.
+        QVERIFY(console->run("montage.add_title{text = 'First', at = 0}", "same.lua"));
+        QCOMPARE(titles(), 1);
+        QVERIFY(!console->run("montage.undo{}", "same.lua"));
+        QCOMPARE(titles(), 1);
+        state()->undo();
+        // Another project opened while a script runs: it stops rather than editing that one.
+        QTimer::singleShot(100, this, [this] { state()->newProject(); });
+        QVERIFY(!console->run("while true do montage.live_context{} end", "switch.lua"));
+        QVERIFY2(console->output().contains("closed"), qPrintable(console->output()));
+        QCOMPARE(int(state()->history().undoCount()), 0);
         // The scripts folder: what the menu lists, run from a file.
         qputenv("MONTAGE_SCRIPTS_DIR", (dir_.path() + "/scripts").toUtf8());
         QDir().mkpath(dir_.path() + "/scripts");

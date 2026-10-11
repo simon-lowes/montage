@@ -481,7 +481,7 @@ Every tool then works on the project open in Montage when its `project` is left 
 
 ## Scripting
 
-Scripts are Lua 5.4 programs that call Montage's tools, the same ones its MCP server gives AI agents: `montage.<name>{...}` runs `montage_<name>` with a table of arguments (or `montage.call("montage_add_title", {...})`), and returns the tool's result as a table (with its message as `message`). A tool's error stops the script with that message and the script's line. `montage.tools()` lists the tools, `montage.args` holds the script's arguments, `montage.project` the project it works on, `montage.json(value)` turns a table into JSON text to print, and `print` writes to the script's output. Lua's own libraries are all there (string, table, math, io, os).
+Scripts are Lua 5.4 programs that call Montage's tools, the same ones its MCP server gives AI agents: `montage.<name>{...}` runs `montage_<name>` with a table of arguments (or `montage.call("montage_add_title", {...})`), and returns the tool's result as a table (with its message as `message`). A tool's error stops the script with that message and the script's line. `montage.tools()` lists the tools, `montage.args` holds the script's arguments, `montage.project` the project it works on, `montage.json(value)` turns a table into JSON text to print, `montage.null` stands for JSON null, and `print` writes to the script's output. Lua's own libraries are there (string, table, math, io, os; not C modules). Stop ends a script even inside `pcall`.
 
 ```lua
 -- Markers at every title in the active sequence, named after its text.
@@ -496,7 +496,7 @@ end
 
 In the app, put scripts in the scripts folder (Tools › Scripts › Open Scripts Folder; `MONTAGE_SCRIPTS_DIR` moves it) to run them from Tools › Scripts, or write and run them in Tools › Scripts › Script Console (Ctrl+Return runs). They work on the open project: tools without a `project` argument edit it, `montage.live_context{}` gives the playhead, In, Out and selection (and moves the playhead or selects clips), and a whole run is one undo step named "Script: <name>"; `montage.undo{}` takes back only that run's own step. The window stays responsive while a script runs, and Stop ends it at its next step.
 
-On the command line, `montage-cli script <file.lua> [--project <project.montage>] [arg...]` runs a script headless; tools that take a project get the one named with `--project` when the script names none. Ctrl+C stops it.
+On the command line, `montage-cli script [--project <project.montage>] <file.lua> [arg...]` runs a script headless (a `#!/usr/bin/env -S montage-cli script` line is allowed); tools that take a project get the one named with `--project` when the script names none. Ctrl+C stops it at its next step, a second Ctrl+C at once.
 
 ## Architecture
 

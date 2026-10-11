@@ -53,6 +53,8 @@ public:
     // the run's other changes in one undo step (`group`: the run's merge key, set with EditorState::setUndoGroup);
     // montage_undo takes back only the run's own step.
     void handleScript(const QByteArray& message, std::function<void(QByteArray)> done, const QString& label, const QString& group);
+    // A stopped script's calls: those waiting are answered as not run, and one running is not applied.
+    void cancelScript(const QString& group);
 
 signals:
     void runningChanged(bool on);
@@ -67,6 +69,7 @@ private:
         QString label, group;   // a script's: its undo step's name and merge key ("" for the Assistant's and agents')
     };
     void dispatch(const QByteArray& message, std::function<void(QByteArray)> done, bool external, const QString& label, const QString& group);
+    QString runningGroup_;  // the script whose call is running ("" for others)
     struct ToolInfo {
         QString title;
         bool takesProject = false;  // works on a project (one it reads, not a new one it writes)

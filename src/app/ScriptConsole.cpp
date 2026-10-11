@@ -153,7 +153,11 @@ bool ScriptConsole::runFile(const QString& path, const QStringList& args) {
 }
 
 void ScriptConsole::stop() {
-    if (running_) stopping_ = true;
+    if (!running_) return;
+    stopping_ = true;
+    // A tool still running is not waited for (nor applied).
+    link_->cancelScript(group_);
+    if (waiting_) waiting_->quit();
 }
 
 bool ScriptConsole::run(const QString& code, const QString& name, const QStringList& args) {
@@ -166,7 +170,9 @@ bool ScriptConsole::run(const QString& code, const QString& name, const QStringL
     stopping_ = false;
     updateButtons();
     const QString label = tr("Script: %1").arg(name), group = QStringLiteral("script-run-%1").arg(++runs_);
+    group_ = group;
     state_->setUndoGroup(group);
+    const uint64_t generation = state_->projectGeneration();  // the project it runs on
     print(tr("Running %1…").arg(name));
 
     ScriptOptions o;
@@ -177,6 +183,7 @@ bool ScriptConsole::run(const QString& code, const QString& name, const QStringL
         o.tools << t.toObject().value("name").toString();
     o.project = state_->filePath();
     o.args = args;
+    o.noStdin = true;
     o.print = [this](const QString& line) { print(line); };
     o.stopped = [this] { return stopping_; };
     QElapsedTimer sinceEvents;
@@ -186,18 +193,35 @@ bool ScriptConsole::run(const QString& code, const QString& name, const QStringL
         QCoreApplication::processEvents();
         sinceEvents.restart();
     };
-    o.call = [this, label, group](const QString& tool, const QJsonObject& a, QString* error) -> QJsonObject {
+    o.call = [this, label, group, generation](const QString& tool, const QJsonObject& a, QString* error) -> QJsonObject {
+        // Another project opened since it started: its calls would edit that one, so none runs.
+        if (state_->projectGeneration() != generation) {
+            if (error) *error = tr("the project the script was running on was closed");
+            return {};
+        }
         const QJsonObject msg{{"jsonrpc", "2.0"}, {"id", ++calls_}, {"method", "tools/call"}, {"params", QJsonObject{{"name", tool}, {"arguments", a}}}};
-        QByteArray answer;
-        bool answered = false;
+        // (Shared: Stop leaves the wait before the answer comes, and the answer may still come later.)
+        struct Pending {
+            QByteArray answer;
+            bool answered = false;
+            QEventLoop* loop = nullptr;
+        };
+        auto pending = std::make_shared<Pending>();
         QEventLoop wait;
-        link_->handleScript(compact(msg), [&](QByteArray r) {
-            answer = std::move(r);
-            answered = true;
-            wait.quit();
+        pending->loop = &wait;
+        link_->handleScript(compact(msg), [pending](QByteArray r) {
+            pending->answer = std::move(r);
+            pending->answered = true;
+            if (pending->loop) pending->loop->quit();
         }, label, group);
-        if (!answered) wait.exec();
-        const QJsonObject reply = QJsonDocument::fromJson(answer).object();
+        if (!pending->answered && !stopping_) {
+            waiting_ = &wait;
+            wait.exec();
+            waiting_ = nullptr;
+        }
+        pending->loop = nullptr;
+        if (!pending->answered) return {};  // stopped meanwhile (the host raises "Stopped")
+        const QJsonObject reply = QJsonDocument::fromJson(pending->answer).object();
         if (reply.contains("error")) {
             if (error) *error = reply.value("error").toObject().value("message").toString();
             return {};
@@ -207,6 +231,7 @@ bool ScriptConsole::run(const QString& code, const QString& name, const QStringL
     QString err;
     const bool ok = runScript(code, name, o, &err);
     state_->setUndoGroup({});
+    group_.clear();
     if (ok) print(tr("Done."));
     else print(err, true);
     running_ = stopping_ = false;

@@ -9155,6 +9155,48 @@ private slots:
         o.stopped = [&] { return ++asked > 20; };
         QVERIFY(!runScript("while true do end", "forever.lua", o, &err));
         QCOMPARE(err, QStringLiteral("Stopped"));
+        // ...even one that catches errors (pcall, xpcall, coroutines), and no tool runs once it is stopped.
+        bool stop = false;
+        int calls = 0;
+        o.stopped = [&] { return stop; };
+        const auto call = o.call;
+        o.call = [&](const QString& name, const QJsonObject& args, QString* e) {
+            if (++calls == 3) stop = true;
+            return call(name, args, e);
+        };
+        for (const char* catching : {"while true do pcall(montage.project_info, {}) end",
+                                     "while true do xpcall(montage.project_info, function() return 'kept' end, {}) end",
+                                     "while true do coroutine.resume(coroutine.create(function() montage.project_info{} end)) end"}) {
+            stop = false;
+            calls = 0;
+            QVERIFY(!runScript(catching, "catching.lua", o, &err));
+            QCOMPARE(err, QStringLiteral("Stopped"));
+            QCOMPARE(calls, 3);  // (stopped during the third: no fourth)
+        }
+        stop = true;  // stopped by the hook, inside a pcall
+        QVERIFY(!runScript("while true do pcall(function() while true do end end) end", "catching.lua", o, &err));
+        QCOMPARE(err, QStringLiteral("Stopped"));
+        o.call = call;
+        o.stopped = {};
+        // The hook cannot be taken away; no C modules.
+        printed.clear();
+        QVERIFY(runScript("print(debug.sethook == nil, package.loadlib == nil, package.cpath == '')", "s.lua", o, &err));
+        QCOMPARE(printed.value(0), QStringLiteral("true\ttrue\ttrue"));
+        // JSON both ways: gaps and montage.null as null; what JSON cannot hold is refused, not changed.
+        printed.clear();
+        QVERIFY2(runScript("print(montage.json({1, nil, 3})); print(montage.json({1, montage.null}))", "j.lua", o, &err), qPrintable(err));
+        QCOMPARE(printed.value(0).remove(QRegularExpression("\\s")), QStringLiteral("[1,null,3]"));
+        QCOMPARE(printed.value(1).remove(QRegularExpression("\\s")), QStringLiteral("[1,null]"));
+        for (const char* bad : {"montage.json({0/0})", "montage.json({math.huge})", "montage.json({1 << 60})", "montage.json({[true] = 1})",
+                                "montage.json({print})"})
+            QVERIFY2(!runScript(bad, "bad.lua", o, &err), bad);
+        // A file's "#!" line and byte order mark, as Lua's own loader skips them (line numbers kept).
+        QVERIFY(!runScript("\xEF\xBB\xBF#!/usr/bin/env -S montage-cli script\nerror('here')", "sh.lua", o, &err));
+        QVERIFY2(err.startsWith("sh.lua:2:"), qPrintable(err));
+        // Without standard input (the app), reading it is an error rather than a wait for ever.
+        o.noStdin = true;
+        QVERIFY(!runScript("io.read()", "in.lua", o, &err) && err.contains("io.read"));
+        QVERIFY(!runScript("for l in io.lines() do end", "in.lua", o, &err) && err.contains("io.lines"));
     }
 
     void consolidateKeepsGraphicPictures() {

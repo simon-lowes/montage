@@ -2311,10 +2311,11 @@ void MainWindow::exportFrame() {
 }
 
 void MainWindow::closeEvent(QCloseEvent* e) {
-    // A running script is stopped first (it runs inside this window's event loop); closing again then quits.
+    // A running script is stopped first (it runs inside this window's event loop), and the window closes once it has.
     if (scripts_ && scripts_->running()) {
         scripts_->stop();
-        state_->message(tr("Stopping the script: close again when it has stopped"), 5000);
+        connect(scripts_, &ScriptConsole::finished, this, [this] { close(); }, Qt::SingleShotConnection);
+        state_->message(tr("Stopping the script…"), 5000);
         e->ignore();
         return;
     }

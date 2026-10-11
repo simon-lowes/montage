@@ -335,6 +335,20 @@ void LiveLink::handleScript(const QByteArray& message, std::function<void(QByteA
     dispatch(message, std::move(done), false, label, group);
 }
 
+void LiveLink::cancelScript(const QString& group) {
+    if (group.isEmpty()) return;
+    std::vector<Job> dropped;
+    for (auto it = queue_.begin(); it != queue_.end();) {
+        if (it->group == group) dropped.push_back(std::move(*it)), it = queue_.erase(it);
+        else ++it;
+    }
+    if (cancel_ && runningGroup_ == group) *cancel_ = true;
+    for (Job& j : dropped) {
+        const QJsonObject r = toolResult(QStringLiteral("The script was stopped before %1 ran").arg(j.message.value("params").toObject().value("name").toString()), {}, true);
+        j.done(compact(QJsonObject{{"jsonrpc", "2.0"}, {"id", j.message.value("id")}, {"result", r}}));
+    }
+}
+
 void LiveLink::dispatch(const QByteArray& message, std::function<void(QByteArray)> done, bool external, const QString& label,
                         const QString& group) {
     const QJsonObject msg = QJsonDocument::fromJson(message).object();
@@ -369,7 +383,8 @@ void LiveLink::dispatch(const QByteArray& message, std::function<void(QByteArray
     if (name == "montage_undo" && targetsOpenProject(args)) {
         // Only an agent's own change (a script's own run): the editor's are theirs to undo.
         const QString last = state_->undoText();
-        if (!state_->canUndo() || !(label.isEmpty() ? last.startsWith(QStringLiteral("Assistant: ")) : last == label))
+        // (A script's: this run's own step, not an earlier run of the same script.)
+        if (!state_->canUndo() || !(label.isEmpty() ? last.startsWith(QStringLiteral("Assistant: ")) : last == label && state_->lastMergeKey() == group))
             return answer(toolResult(state_->canUndo() ? QStringLiteral("The last change (%1) was the editor's; it is left alone").arg(last)
                                                        : QStringLiteral("Nothing to undo"),
                                      {}, true));
@@ -419,6 +434,7 @@ void LiveLink::pump() {
     auto cancel = std::make_shared<std::atomic<bool>>(false);
     cancel_ = cancel;
     runningExternal_ = job.external;
+    runningGroup_ = job.group;
     const std::string line = compact(msg).toStdString();
     connect(watcher, &QFutureWatcher<std::string>::finished, this, [this, watcher, job, tool, live, before, snapshot, path, cancel] {
         const std::string answer = watcher->result();
@@ -426,7 +442,9 @@ void LiveLink::pump() {
         cancel_.reset();
         if (*cancel) {
             if (live) QFile::remove(path), QFile::remove(path + ".bak");
-            const QJsonObject r = toolResult(QStringLiteral("The agent link was turned off while %1 ran, so its result was not applied.").arg(tool), {}, true);
+            const QJsonObject r = toolResult(job.group.isEmpty() ? QStringLiteral("The agent link was turned off while %1 ran, so its result was not applied.").arg(tool)
+                                                                 : QStringLiteral("The script was stopped while %1 ran, so its result was not applied.").arg(tool),
+                                             {}, true);
             job.done(compact(QJsonObject{{"jsonrpc", "2.0"}, {"id", job.message.value("id")}, {"result", r}}));
         } else if (live) {
             finish(job, tool, before, snapshot, path, answer);
