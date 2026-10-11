@@ -37,6 +37,7 @@
 #include "render/Spherical.h"
 #include "render/AudioReactive.h"
 #include "core/EditOps.h"
+#include "core/GraphicsTemplate.h"
 #include "core/Effects.h"
 #include "core/Surround.h"
 #include "core/History.h"
@@ -710,6 +711,12 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
         if (m->kind == MediaKind::Sequence) {
             const Sequence* nested = p.findSequence(m->sequenceId);
             if (!nested || o.depth >= kMaxDepth || nested->id == seq.id) return {};
+            // A graphic shows its own values for the fields its template publishes.
+            Sequence filled;
+            if (!nested->fields.empty() && !c.fields.empty()) {
+                filled = withFieldValues(p, *nested, c.fields);
+                nested = &filled;
+            }
             mw = nested->width;
             mh = nested->height;
             g = clipGeometry(c, lt, mw, mh, SW, SH, seq.fpsValue());

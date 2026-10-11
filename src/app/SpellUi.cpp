@@ -102,12 +102,16 @@ bool addSpellingActions(QMenu* menu, QPlainTextEdit* edit, const QTextCursor& at
     return false;
 }
 
-void enableSpellCheck(QPlainTextEdit* edit, EditorState* state, std::function<QString()> language) {
+void enableSpellCheck(QPlainTextEdit* edit, EditorState* state, std::function<QString()> language, std::function<void(QMenu*)> more) {
     new SpellHighlighter(edit->document(), state, language);
     edit->setContextMenuPolicy(Qt::CustomContextMenu);
-    QObject::connect(edit, &QWidget::customContextMenuRequested, edit, [edit, state, language](const QPoint& p) {
+    QObject::connect(edit, &QWidget::customContextMenuRequested, edit, [edit, state, language, more](const QPoint& p) {
         QMenu* menu = edit->createStandardContextMenu(p);
         addSpellingActions(menu, edit, edit->cursorForPosition(p), state, language());
+        if (more) {
+            menu->addSeparator();
+            more(menu);
+        }
         menu->setAttribute(Qt::WA_DeleteOnClose);
         menu->popup(edit->mapToGlobal(p));
     });

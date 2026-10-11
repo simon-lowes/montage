@@ -130,6 +130,7 @@
 #include "PeoplePanel.h"
 #include "SpeechDialog.h"
 #include "StemsDialog.h"
+#include "GraphicsDialogs.h"
 #include "TranscriptPanel.h"
 #include "HdrSurface.h"
 #include "MonitorPanel.h"
@@ -1308,6 +1309,35 @@ void MainWindow::buildMenus() {
     add(clipM, tr("Nudge &Right"), QKeySequence("Alt+Right"), [this] { nudge(1); });
     clipM->addSeparator();
     add(clipM, tr("New &Title"), QKeySequence("Ctrl+T"), [this] { addTitle(); });
+    // Graphics templates (core/GraphicsTemplate.h): from the library, a picture published, filled from a table.
+    add(clipM, tr("Insert Graphics Template…"), QKeySequence(), withSeq([this] {
+            GraphicsTemplatesDialog dlg(state_, this);
+            dlg.exec();
+        }))->setObjectName(QStringLiteral("insertGraphicsTemplate"));
+    add(clipM, tr("Publish Picture to Graphic…"), QKeySequence(), withSeq([this] {
+            const auto& sel = state_->selectedClips();
+            if (sel.size() != 1) {
+                statusBar()->showMessage(tr("Select one clip of an image or video in the graphic's sequence"), 5000);
+                return;
+            }
+            bool ok = false;
+            const QString label = QInputDialog::getText(this, tr("Publish Picture to Graphic"),
+                                                        tr("Every clip that plays this sequence can swap this picture. Its label:"),
+                                                        QLineEdit::Normal, tr("Image"), &ok).trimmed();
+            if (!ok || label.isEmpty()) return;
+            if (const QString why = publishPictureField(state_, sel.front(), label); !why.isEmpty()) statusBar()->showMessage(why, 5000);
+        }))->setObjectName(QStringLiteral("publishPicture"));
+    add(clipM, tr("Fill Graphics from Table…"), QKeySequence(), withSeq([this] {
+            const auto& sel = state_->selectedClips();
+            const Clip* c = sel.size() == 1 ? edit::clipById(*state_->sequence(), sel.front()) : nullptr;
+            if (!c || !graphicOf(state_->project(), *c)) {
+                statusBar()->showMessage(tr("Select a graphic with fields (a clip of a sequence that publishes some)"), 5000);
+                return;
+            }
+            const QString file = QFileDialog::getOpenFileName(this, tr("Fill Graphics from Table"), QString(),
+                                                              tr("Tables (*.csv *.tsv *.txt);;All files (*)"));
+            if (!file.isEmpty()) fillGraphicsFromFile(state_, sel.front(), file);
+        }))->setObjectName(QStringLiteral("fillGraphics"));
     add(clipM, tr("New &Colour Matte"), QKeySequence(), withSeq([this] {
             const Sequence* s = state_->sequence();
             FrameTime at = s->playhead, len = FrameTime(std::llround(5 * s->fpsValue()));
@@ -1337,6 +1367,12 @@ void MainWindow::buildMenus() {
     QMenu* seqM = menuBar()->addMenu(tr("&Sequence"));
     add(seqM, tr("Sequence &Settings…"), QKeySequence(), [this] { SequenceSettingsDialog::editActive(state_, this); });
     add(seqM, tr("&New Sequence…"), QKeySequence("Ctrl+Alt+N"), [this] { newSequence(); });
+    add(seqM, tr("Save as Graphics Template…"), QKeySequence(), withSeq([this] { saveSequenceAsGraphicsTemplate(state_, this); }))
+        ->setObjectName(QStringLiteral("saveGraphicsTemplate"));
+    add(seqM, tr("Graphic Fields…"), QKeySequence(), withSeq([this] {
+            GraphicFieldsDialog dlg(state_, this);
+            dlg.exec();
+        }))->setObjectName(QStringLiteral("graphicFields"));
     add(seqM, tr("&Duplicate Sequence"), QKeySequence(), [this] {
         const Sequence* s = state_->sequence();
         if (!s) return;

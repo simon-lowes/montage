@@ -19,6 +19,7 @@
 #include "core/GradeVersions.h"
 #include "core/Captions.h"
 #include "core/EditOps.h"
+#include "core/GraphicsTemplate.h"
 #include "core/Effects.h"
 #include "core/MaskPath.h"
 #include "render/ColorSpace.h"
@@ -2711,6 +2712,64 @@ colorspaces:
         // Without animation or a length, a title is unchanged throughout.
         Effect plain = makeEffect(p, "title");
         QCOMPARE(ink(renderGenerator(plain, 0, 320, 180, 1.0)).amount, ink(renderGenerator(plain, 50, 320, 180, 1.0, 60, 30)).amount);
+    }
+
+    void graphicsTemplateValues() {
+        // A graphic (a white title in a sequence of its own) drawn in another sequence with its own text and colour.
+        Project p = makeDefaultProject();
+        Sequence& outer = *p.active();
+        outer.width = 160, outer.height = 90;
+        Sequence g;
+        g.id = p.newId();
+        g.width = 160, g.height = 90, g.fps = outer.fps;
+        g.videoTracks.resize(1);
+        g.videoTracks[0].id = p.newId();
+        Clip title;
+        title.id = p.newId();
+        title.duration = 30;
+        title.generator = makeEffect(p, "title");
+        title.generator.strings["text"] = "IIII";
+        title.generator.params["size"] = Param(60);
+        title.generator.params["shadow"] = Param(0);
+        g.videoTracks[0].clips.push_back(title);
+        QVERIFY(publishField(g, *fieldFor(g, title.id, 0, "text", "Name")).ok);
+        QVERIFY(publishField(g, *fieldFor(g, title.id, 0, "color", "Colour")).ok);
+        MediaItem gm;
+        gm.id = p.newId();
+        gm.kind = MediaKind::Sequence;
+        gm.sequenceId = g.id;
+        gm.hasVideo = true;
+        gm.width = 160, gm.height = 90;
+        p.media.push_back(gm);
+        p.sequences.push_back(g);
+        Sequence& s = *p.active();
+        const edit::Result placed = edit::placeMedia(p, s, gm.id, 0, 0, -1, {TrackKind::Video, 0}, {}, false);
+        QVERIFY(placed.ok);
+        RenderOptions o;
+        auto inkOf = [&](double& redness) {
+            const Image img = renderSequenceFrame(p, *p.active(), 5, o);
+            double ink = 0;
+            redness = 0;
+            for (int y = 0; y < img.height; ++y)
+                for (int x = 0; x < img.width; ++x) {
+                    const float* px = img.at(x, y);
+                    if (px[3] < 0.5f) continue;
+                    ink += 1;
+                    redness = std::max(redness, double(px[0] - px[1]));
+                }
+            return ink;
+        };
+        double red = 0;
+        const double white = inkOf(red);
+        QVERIFY2(white > 100 && red < 0.1, qPrintable(QString("%1 %2").arg(white).arg(red)));
+        edit::clipById(*p.active(), placed.created[0])->fields = {{"colour", "#ff0000"}};
+        const double coloured = inkOf(red);
+        QVERIFY2(red > 0.8 && std::abs(coloured - white) < white * 0.05, qPrintable(QString("%1 %2").arg(coloured).arg(red)));
+        edit::clipById(*p.active(), placed.created[0])->fields = {{"colour", "#ff0000"}, {"name", "I"}};
+        const double shorter = inkOf(red);
+        QVERIFY2(shorter < white * 0.4 && shorter > 0, qPrintable(QString("%1 of %2").arg(shorter).arg(white)));
+        // The template itself is unchanged.
+        QCOMPARE(p.findSequence(g.id)->videoTracks[0].clips[0].generator.s("text"), std::string("IIII"));
     }
 
     void focusRepair() {

@@ -65,7 +65,15 @@ private:
     void buildChain(Id owner);
     void addEffectMenu(TrackKind kind, Id owner);
 
+    // Publishes a clip's setting as a field of the graphic its sequence is, asking for its label.
+    void publishParameter(const Target& target, const std::string& param, const QString& label);
+    // A graphic's own values for the fields its template publishes (core/GraphicsTemplate.h).
+    void addGraphicSection(const Clip& clip);
+
 public:
+    // Publishes setting `param` of effect `effect` (0: the generator) on clip `clip` of the open sequence as a field
+    // labelled `label`; "" or why not.
+    QString publishField(Id clip, Id effect, const std::string& param, const QString& label);
     // Analyses clip `clip`'s footage for its Stabilize effect `effect`.
     void analyzeStabilize(Id clip, Id effect);
     // Tracks the mask of `effect` on `clip` from the playhead to the clip's end

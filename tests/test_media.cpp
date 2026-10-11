@@ -15978,6 +15978,91 @@ private slots:
         QCOMPARE(int(QDir(QString::fromStdString(path("mcp-stems/Stems"))).entryList(QDir::Files).size()), before);
     }
 
+    void graphicsTemplatesOverMcp() {
+        // A lower third in a sequence of its own beside the active one.
+        Project p = makeDefaultProject();
+        Sequence g;
+        g.id = p.newId();
+        g.name = "Lower Third";
+        g.videoTracks.resize(1);
+        g.videoTracks[0].id = p.newId();
+        Clip title;
+        title.id = p.newId();
+        title.duration = 60;
+        title.generator = makeEffect(p, "title");
+        g.videoTracks[0].clips.push_back(title);
+        p.sequences.push_back(g);
+        MediaItem gm;
+        gm.id = p.newId();
+        gm.kind = MediaKind::Sequence;
+        gm.sequenceId = g.id;
+        gm.name = g.name;
+        gm.hasVideo = true;
+        p.media.push_back(gm);
+        QDir().mkpath(QString::fromStdString(path("mcp-graphics/library")));
+        const QString project = QString::fromStdString(path("mcp-graphics/g.montage"));
+        const QString library = QString::fromStdString(path("mcp-graphics/library"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](QJsonObject args) {
+            args["project"] = project;
+            args["folder"] = library;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_graphics"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto data = [](const QJsonObject& r) { return r.value("structuredContent").toObject(); };
+        QJsonObject r = call({{"action", "publish"}, {"sequence", "Lower Third"}, {"clip", double(title.id)}, {"param", "text"}, {"label", "Name"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(data(r).value("id").toString(), QStringLiteral("name"));
+        r = call({{"action", "publish"}, {"sequence", "Lower Third"}, {"clip", double(title.id)}, {"param", "color"}, {"label", "Colour"}});
+        QVERIFY(!r.value("isError").toBool());
+        r = call({{"action", "publish"}, {"sequence", "Lower Third"}, {"clip", double(title.id)}, {"param", "size"}});
+        QVERIFY(!r.value("isError").toBool());
+        QCOMPARE(data(r).value("fields").toArray().size(), 3);
+        QCOMPARE(data(r).value("fields").toArray()[2].toObject().value("max").toDouble(), 1000.0);
+        QVERIFY(call({{"action", "publish"}, {"sequence", "Lower Third"}, {"clip", double(title.id)}, {"param", "nope"}}).value("isError").toBool());
+        QVERIFY(call({{"action", "publish"}, {"sequence", "No Such"}, {"clip", double(title.id)}, {"param", "text"}}).value("isError").toBool());
+        r = call({{"action", "unpublish"}, {"sequence", "Lower Third"}, {"field", "font_size_px"}});
+        QCOMPARE(data(r).value("fields").toArray().size(), 2);
+        // Into the library and back onto the active sequence.
+        r = call({{"action", "save_template"}, {"sequence", "Lower Third"}, {"name", "Name Strap"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        r = call({{"action", "templates"}});
+        QCOMPARE(data(r).value("templates").toArray().size(), 1);
+        QCOMPARE(data(r).value("templates").toArray()[0].toObject().value("name").toString(), QStringLiteral("Name Strap"));
+        r = call({{"action", "insert"}, {"template", "name strap"}, {"at", 1.0}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const double clip = data(r).value("clip").toDouble();
+        QCOMPARE(data(r).value("fields").toArray()[0].toObject().value("value").toString(), QStringLiteral("Title"));
+        // Its own values; a bad one refused.
+        r = call({{"action", "set"}, {"clip", clip}, {"values", QJsonObject{{"name", "Jane Smith"}, {"Colour", "#F00"}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(data(r).value("fields").toArray()[1].toObject().value("value").toString(), QStringLiteral("#ff0000"));
+        QVERIFY(call({{"action", "set"}, {"clip", clip}, {"values", QJsonObject{{"colour", "blue-ish"}}}}).value("isError").toBool());
+        QVERIFY(call({{"action", "set"}, {"clip", clip}, {"values", QJsonObject{{"nothing", "x"}}}}).value("isError").toBool());
+        r = call({{"action", "fields"}, {"clip", clip}});
+        QCOMPARE(data(r).value("fields").toArray()[0].toObject().value("value").toString(), QStringLiteral("Jane Smith"));
+        r = call({{"action", "reset"}, {"clip", clip}, {"ids", QJsonArray{"colour"}}});
+        QCOMPARE(data(r).value("fields").toArray()[1].toObject().value("value").toString(), QStringLiteral("#ffffff"));
+        // Filled from a table: two more after it.
+        r = call({{"action", "fill"}, {"clip", clip}, {"csv", "Name,Colour,Role\nAda,#00ff00,x\nGrace,#0000ff,y\nLinus,#ffffff,z\n"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(data(r).value("clips").toArray().size(), 3);
+        QCOMPARE(data(r).value("unmatched").toArray()[0].toString(), QStringLiteral("Role"));
+        Project back;
+        std::string err;
+        QVERIFY(loadProject(project.toStdString(), back, &err));
+        const Clip* third = edit::clipById(*back.active(), Id(data(r).value("clips").toArray()[2].toDouble()));
+        QVERIFY(third && third->fields.at("name") == "Linus");
+        // Rendered with its own values: the template's white title comes out green for Ada.
+        const Clip* ada = edit::clipById(*back.active(), Id(clip));
+        QCOMPARE(ada->fields.at("colour"), std::string("#00ff00"));
+    }
+
     void voiceCloning() {
         // Text as the model was trained on.
         QCOMPARE(normalizeCloneText("  hello   world "), std::string("Hello world."));

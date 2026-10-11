@@ -27,6 +27,7 @@
 #include "core/TranscriptCorrect.h"
 #include "core/SpellCheck.h"
 #include "core/ColorGroups.h"
+#include "core/GraphicsTemplate.h"
 #include "render/ExtendClip.h"
 #include "render/ReviewExport.h"
 #include "render/RoomTone.h"
@@ -5022,6 +5023,166 @@ void McpServer::Impl::addTools() {
             save(l);
             return ok(QStringLiteral("Placed %1 voiceover clip(s), %2 s in all").arg(lines.size()).arg(total, 0, 'f', 1),
                       QJsonObject{{"clips", placed}});
+        });
+
+    add("montage_graphics", "Graphics templates",
+        "Editable graphics (Premiere's motion graphics templates, Final Cut's published parameters): a sequence of titles, "
+        "shapes and images publishes some of its clips' settings as fields (publish: clip, param such as text, color, size, "
+        "bold, align, and effect for one of the clip's effects, or picture: true to swap the clip's image), and every clip "
+        "that plays that sequence sets them for itself (set: clip, values by field id; reset: ids). fields lists a "
+        "sequence's fields or a graphic clip's values; unpublish removes one. save_template saves the sequence (with the "
+        "files it plays) to the template library as name; templates lists the library; insert places a template (by name "
+        "or path) at a time on a new top track; fill fills a graphic and copies of it after it from CSV text (a header row "
+        "naming fields by id or label, one graphic a row). sequence (a name) picks the sequence for fields, publish, "
+        "unpublish and save_template; else the active one.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "action":{"type":"string","enum":["fields","publish","unpublish","set","reset","save_template","templates","insert","fill"]},
+            "sequence":{"type":"string"},"clip":{"type":"integer"},"effect":{"type":"integer"},"param":{"type":"string"},
+            "picture":{"type":"boolean"},"label":{"type":"string"},"field":{"type":"string"},
+            "values":{"type":"object"},"ids":{"type":"array","items":{"type":"string"}},
+            "name":{"type":"string"},"template":{"type":"string"},"at":{"type":["number","string"]},"csv":{"type":"string"},
+            "folder":{"type":"string","description":"The template library (default Montage's own)"}},"required":["project","action"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            const QString action = a.value("action").toString();
+            const std::string folder = a.contains("folder") ? absolute(a.value("folder").toString()).toStdString() : graphicsTemplatesDirectory();
+            if (action == "templates") {
+                QJsonArray list;
+                for (const GraphicsTemplateInfo& t : listGraphicsTemplates(folder)) {
+                    QJsonArray fields;
+                    for (const std::string& f : t.fields) fields.append(QString::fromStdString(f));
+                    list.append(QJsonObject{{"name", QString::fromStdString(t.name)}, {"path", QString::fromStdString(t.path)},
+                                            {"fields", fields}, {"seconds", t.seconds}, {"width", t.width}, {"height", t.height}});
+                }
+                return ok(QStringLiteral("%1 template(s)").arg(list.size()), QJsonObject{{"templates", list}});
+            }
+            Sequence* sq = l.project.active();
+            if (a.contains("sequence")) {
+                sq = nullptr;
+                for (Sequence& q : l.project.sequences)
+                    if (q.name == a.value("sequence").toString().toStdString()) sq = &q;
+                if (!sq) throw ArgError{QStringLiteral("No sequence \"%1\"").arg(a.value("sequence").toString())};
+            }
+            auto fieldsJson = [&](const Sequence& t, const Clip* graphic) {
+                QJsonArray out;
+                for (const TemplateField& f : liveFields(t)) {
+                    QJsonObject o{{"id", QString::fromStdString(f.id)}, {"label", QString::fromStdString(f.label)},
+                                  {"kind", QString::fromStdString(f.kind)}, {"clip", double(f.clip)},
+                                  {"default", QString::fromStdString(fieldValue(t, f))}};
+                    if (graphic) o["value"] = QString::fromStdString(fieldValue(t, *graphic, f));
+                    double lo, hi;
+                    std::vector<std::string> choices;
+                    if (fieldRange(t, f, lo, hi, &choices)) {
+                        if (f.kind == "number") o["min"] = lo, o["max"] = hi;
+                        if (f.kind == "choice") {
+                            QJsonArray c;
+                            for (const std::string& x : choices) c.append(QString::fromStdString(x));
+                            o["choices"] = c;
+                        }
+                    }
+                    out.append(o);
+                }
+                return out;
+            };
+            if (action == "fields") {
+                if (a.contains("clip")) {
+                    const Clip& c = clipArg(l, a);
+                    const Sequence* t = graphicOf(l.project, c);
+                    if (!t) throw ArgError{"That clip is not a graphic with fields"};
+                    return ok(QStringLiteral("%1 field(s)").arg(liveFields(*t).size()),
+                              QJsonObject{{"fields", fieldsJson(*t, &c)}, {"template", QString::fromStdString(t->name)}});
+                }
+                return ok(QStringLiteral("%1 field(s)").arg(liveFields(*sq).size()), QJsonObject{{"fields", fieldsJson(*sq, nullptr)}});
+            }
+            if (action == "publish") {
+                if (!a.value("clip").isDouble()) throw ArgError{"\"clip\" is the clip (in the sequence) whose setting to publish"};
+                const Id clip = Id(a.value("clip").toDouble());
+                const std::string label = a.value("label").toString().toStdString();
+                const auto f = a.value("picture").toBool() ? mediaFieldFor(l.project, *sq, clip, label)
+                                                           : fieldFor(*sq, clip, Id(a.value("effect").toDouble()), need(a, "param").toStdString(), label);
+                if (!f) throw ArgError{"No such clip or setting to publish (a picture needs a clip of an image or video)"};
+                std::string id;
+                check(publishField(*sq, *f, &id));
+                save(l);
+                return ok(QStringLiteral("Published \"%1\" as %2").arg(QString::fromStdString(f->label), QString::fromStdString(id)),
+                          QJsonObject{{"id", QString::fromStdString(id)}, {"fields", fieldsJson(*sq, nullptr)}});
+            }
+            if (action == "unpublish") {
+                check(unpublishField(*sq, need(a, "field").toStdString()));
+                save(l);
+                return ok(QStringLiteral("Unpublished"), QJsonObject{{"fields", fieldsJson(*sq, nullptr)}});
+            }
+            if (action == "set" || action == "reset") {
+                Clip& c = clipArg(l, a);
+                const Sequence* t = graphicOf(l.project, c);
+                if (!t) throw ArgError{"That clip is not a graphic with fields"};
+                const std::vector<TemplateField> fields = liveFields(*t);
+                auto find = [&](const std::string& key) -> const TemplateField* {
+                    for (const TemplateField& f : fields)
+                        if (f.id == key) return &f;
+                    for (const TemplateField& f : fields)
+                        if (f.label == key) return &f;
+                    return nullptr;
+                };
+                if (action == "set") {
+                    const QJsonObject values = a.value("values").toObject();
+                    if (values.isEmpty()) throw ArgError{"\"values\" maps field ids to values"};
+                    std::map<std::string, std::string> next = c.fields;
+                    for (auto it = values.begin(); it != values.end(); ++it) {
+                        const TemplateField* f = find(it.key().toStdString());
+                        if (!f) throw ArgError{QStringLiteral("No field \"%1\"").arg(it.key())};
+                        const QString text = it.value().isDouble() ? QString::number(it.value().toDouble(), 'g', 10)
+                                             : it.value().isBool() ? QString(it.value().toBool() ? "1" : "0")
+                                                                   : it.value().toString();
+                        std::string out, err;
+                        if (!normalizeFieldValue(l.project, *t, *f, text.toStdString(), out, &err)) throw ArgError{QString::fromStdString(err)};
+                        next[f->id] = out;
+                    }
+                    c.fields = next;
+                } else {
+                    const QJsonArray ids = a.value("ids").toArray();
+                    if (ids.isEmpty()) c.fields.clear();
+                    for (const QJsonValue& v : ids)
+                        if (const TemplateField* f = find(v.toString().toStdString())) c.fields.erase(f->id);
+                }
+                save(l);
+                return ok(action == "set" ? QStringLiteral("Set") : QStringLiteral("Reset"), QJsonObject{{"fields", fieldsJson(*t, &c)}});
+            }
+            if (action == "save_template") {
+                const QString name = a.contains("name") ? a.value("name").toString() : QString::fromStdString(sq->name);
+                std::string path, err;
+                if (!saveGraphicsTemplate(l.project, sq->id, name.toStdString(), folder, &path, &err)) return fail(QString::fromStdString(err));
+                return ok(QStringLiteral("Saved %1 with %2 field(s)").arg(name).arg(liveFields(*sq).size()),
+                          QJsonObject{{"path", QString::fromStdString(path)}});
+            }
+            if (action == "insert") {
+                QString path = need(a, "template");
+                if (!QFileInfo::exists(absolute(path)))
+                    for (const GraphicsTemplateInfo& t : listGraphicsTemplates(folder))
+                        if (QString::fromStdString(t.name).compare(path, Qt::CaseInsensitive) == 0) path = QString::fromStdString(t.path);
+                if (!QFileInfo::exists(absolute(path))) throw ArgError{QStringLiteral("No template \"%1\" (see action templates)").arg(path)};
+                Sequence& s = l.seq();
+                const FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : 0;
+                const edit::Result r = insertGraphicsTemplate(l.project, s, absolute(path).toStdString(), at, -1);
+                check(r);
+                save(l);
+                const Clip* c = edit::clipById(l.seq(), r.created.at(0));
+                const Sequence* t = c ? graphicOf(l.project, *c) : nullptr;
+                return ok(QStringLiteral("Inserted at %1").arg(tc(at, l.seq())),
+                          QJsonObject{{"clip", double(r.created.at(0))}, {"fields", t ? fieldsJson(*t, c) : QJsonArray{}}});
+            }
+            if (action == "fill") {
+                const Id clip = clipArg(l, a).id;
+                std::vector<Id> made;
+                std::vector<std::string> unmatched;
+                check(fillGraphicsFromTable(l.project, l.seq(), clip, need(a, "csv").toStdString(), &made, &unmatched));
+                save(l);
+                QJsonArray clips, cols;
+                for (const Id id : made) clips.append(double(id));
+                for (const std::string& u : unmatched) cols.append(QString::fromStdString(u));
+                return ok(QStringLiteral("Filled %1 graphic(s)").arg(made.size()), QJsonObject{{"clips", clips}, {"unmatched", cols}});
+            }
+            throw ArgError{QStringLiteral("Unknown action \"%1\"").arg(action)};
         });
 
     add("montage_separate_stems", "Separate stems",

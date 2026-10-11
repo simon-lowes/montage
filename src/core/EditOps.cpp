@@ -1803,9 +1803,13 @@ Id duplicateSequence(Project& p, Id id, const std::string& name, std::map<Id, Id
     Sequence s = *src;
     s.id = p.newId();
     s.name = name.empty() ? src->name + " Copy" : name;
-    std::map<Id, Id> clips, groups, buses;
+    std::map<Id, Id> clips, groups, buses, effects;
     auto renew = [&](Effect& e) {
-        if (e.id) e.id = p.newId();
+        if (e.id) {
+            const Id fresh = p.newId();
+            effects[e.id] = fresh;
+            e.id = fresh;
+        }
     };
     for (Bus& b : s.buses) {
         const Id fresh = p.newId();
@@ -1856,6 +1860,12 @@ Id duplicateSequence(Project& p, Id id, const std::string& name, std::map<Id, Id
     for (AdrCue& q : s.adrCues) {
         q.id = p.newId();
         q.clip = clips.count(q.clip) ? clips[q.clip] : 0;
+    }
+    // A graphic's published fields follow their clips and effects to the copies.
+    for (TemplateField& f : s.fields) {
+        if (f.effect && !effects.count(f.effect)) f.clip = 0;
+        f.clip = clips.count(f.clip) ? clips[f.clip] : 0;
+        if (f.effect) f.effect = effects[f.effect];
     }
     // Settings naming a track (a compressor's or gate's sidechain) follow it to its copy.
     std::map<std::string, std::string> tracks;

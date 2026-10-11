@@ -47,8 +47,9 @@ const SpellChecker* activeChecker(const QString& language);
 // Dictionary. False when the word there is spelt right (nothing added).
 bool addSpellingActions(QMenu* menu, QPlainTextEdit* edit, const QTextCursor& cursor, EditorState* state, const QString& language);
 
-// Spell checking on a plain text editor: the highlighter and the right-click menu.
-void enableSpellCheck(QPlainTextEdit* edit, EditorState* state, std::function<QString()> language);
+// Spell checking on a plain text editor: the highlighter and the right-click menu (with `more` adding to it).
+void enableSpellCheck(QPlainTextEdit* edit, EditorState* state, std::function<QString()> language,
+                      std::function<void(QMenu*)> more = {});
 
 // Learns a word for the project (Add to Dictionary), one undo step.
 bool learnSpelling(EditorState* state, const QString& word);

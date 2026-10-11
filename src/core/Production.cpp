@@ -8,6 +8,7 @@
 #include <QJsonObject>
 #include <QSaveFile>
 #include <algorithm>
+#include <cstdlib>
 #include <functional>
 #include <map>
 #include <set>
@@ -147,6 +148,14 @@ std::vector<Id> importFromProject(Project& into, const Project& from, const std:
                             mediaId = bring(mediaId);
                         }
                     };
+                    // A graphic's media fields name the other project's media: brought along too.
+                    if (const MediaItem* gm = c.mediaId ? from.findMedia(c.mediaId) : nullptr; gm && gm->kind == MediaKind::Sequence)
+                        if (const Sequence* g = from.findSequence(gm->sequenceId))
+                            for (const TemplateField& f : g->fields)
+                                if (const auto it = c.fields.find(f.id); f.kind == "media" && it != c.fields.end()) {
+                                    if (const Id brought = bring(Id(std::strtoull(it->second.c_str(), nullptr, 10)))) it->second = std::to_string(brought);
+                                    else c.fields.erase(it);
+                                }
                     remap(c.mediaId);
                     for (Take& tk : c.takes) remap(tk.mediaId);
                 }

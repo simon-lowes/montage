@@ -288,7 +288,23 @@ struct Clip {
     std::vector<GradeVersion> gradeVersions;
     int gradeVersion = 0;
     Id colorGroup = 0;  // the colour group it is graded with (Sequence::colorGroups), 0 = none
+    // A graphic's own settings (core/GraphicsTemplate.h): values for the fields published by the sequence it plays,
+    // by field id, as text ("#rrggbb", "1"); a field without one shows the template's own setting.
+    std::map<std::string, std::string> fields;
     bool operator==(const Clip&) const = default;
+};
+
+// A setting a graphic's designer publishes (Premiere's Essential Graphics properties, Final Cut's published parameters;
+// core/GraphicsTemplate.h): a parameter of one of the sequence's clips that each clip playing the sequence can set
+// for itself in the Inspector.
+struct TemplateField {
+    std::string id;     // unique in the sequence
+    std::string label;  // what the Inspector shows
+    std::string kind;   // "text", "color", "number", "toggle", "choice" or "media"
+    Id clip = 0;        // the clip in the sequence it sets
+    Id effect = 0;      // the effect on it: 0 its generator (a title...), else one of its effects; unused for media
+    std::string param;  // the parameter (a colour's name without .r/.g/.b) or text string; "" for media
+    bool operator==(const TemplateField&) const = default;
 };
 
 // A colour group (Resolve's groups, core/ColorGroups.h): clips graded together. Its pre-clip grade runs on each member
@@ -425,6 +441,7 @@ struct Sequence {
     double hdrPeakNits = 1000;          // mastering peak for HDR spaces
     double hdrMaxCll = 0, hdrMaxFall = 0;  // measured light levels (Analyse HDR Light Levels), nits; 0 = not measured
     std::vector<Hdr10PlusScene> hdr10Plus;  // HDR10+ metadata from the same analysis (PQ only), in time order
+    std::vector<TemplateField> fields;      // published for the clips that play it: a graphics template's settings
     bool spherical = false;             // a 360° sequence (equirectangular): exports say so to players and YouTube
     bool vr180 = false;                 // with spherical: half the sphere in front (VR180), as stereo VR180 cameras shoot
     // Stereoscopic 3D: the sequence is made for two eyes (its size is one eye's); each is rendered from stereo footage's

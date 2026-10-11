@@ -57,6 +57,7 @@ add_library(montage_engine STATIC
   core/ProjectIO.h core/ProjectIO.cpp
   core/ProjectLock.h core/ProjectLock.cpp
   core/Production.h core/Production.cpp
+  core/GraphicsTemplate.h core/GraphicsTemplate.cpp
   core/Interchange.h core/Interchange.cpp
   automation/McpServer.h automation/McpServer.cpp
   media/Image.h media/Image.cpp

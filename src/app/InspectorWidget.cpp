@@ -41,6 +41,7 @@
 #include "core/ClipAnimation.h"
 #include "core/GradeVersions.h"
 #include "core/EditOps.h"
+#include "core/GraphicsTemplate.h"
 #include "core/MaskPath.h"
 #include "ColorWheel.h"
 #include "ColorWarperEditor.h"
@@ -254,6 +255,8 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
         t.effect = effectId;
         return t;
     };
+
+    addGraphicSection(clip);
 
     // ---- Clip ---------------------------------------------------------------
     QFormLayout* form = addSection(clip.isGenerator() ? tr("Clip (Generated)") : tr("Clip"));
@@ -1217,6 +1220,147 @@ void InspectorWidget::applyToOthers(Sequence& s, const Target& target, const std
     }
 }
 
+QString InspectorWidget::publishField(Id clip, Id effect, const std::string& param, const QString& label) {
+    QString why;
+    state_->edit(tr("Publish %1").arg(label), [&](Project&, Sequence& s) {
+        const auto f = fieldFor(s, clip, effect, param, label.toStdString());
+        if (!f) {
+            why = tr("That setting cannot be published");
+            return false;
+        }
+        const edit::Result r = montage::publishField(s, *f);
+        why = QString::fromStdString(r.error);
+        return r.ok;
+    });
+    if (why.isEmpty()) state_->message(tr("\"%1\" is now a field of this graphic: every clip of the sequence can set it").arg(label), 5000);
+    return why;
+}
+
+void InspectorWidget::publishParameter(const Target& target, const std::string& param, const QString& label) {
+    bool ok = false;
+    const QString name = QInputDialog::getText(this, tr("Publish to Graphic"),
+                                               tr("Every clip that plays this sequence can set this as a field. Its label:"),
+                                               QLineEdit::Normal, label, &ok).trimmed();
+    if (!ok || name.isEmpty()) return;
+    if (const QString why = publishField(target.clip, target.effect, param, name); !why.isEmpty()) state_->message(why, 5000);
+}
+
+void InspectorWidget::addGraphicSection(const Clip& clip) {
+    const Sequence* tpl = graphicOf(state_->project(), clip);
+    if (!tpl) return;
+    const std::vector<TemplateField> fields = liveFields(*tpl);
+    if (fields.empty()) return;
+    QFormLayout* form = addSection(tr("Graphic"));
+    const Id clipId = clip.id, tplId = tpl->id;
+    // The value shown: the clip's own, else the template's.
+    auto valueOf = [this, clipId, tplId](const TemplateField& f) -> QString {
+        const Sequence* s = state_->sequence();
+        const Clip* c = s ? edit::clipById(*s, clipId) : nullptr;
+        const Sequence* t = state_->project().findSequence(tplId);
+        return c && t ? QString::fromStdString(fieldValue(*t, *c, f)) : QString();
+    };
+    auto setValue = [this, clipId, tplId](const TemplateField& f, const QString& v) {
+        state_->edit(tr("Change %1").arg(QString::fromStdString(f.label)), [clipId, tplId, f, v](Project& p, Sequence& s) {
+            Clip* c = edit::clipById(s, clipId);
+            const Sequence* t = p.findSequence(tplId);
+            std::string out;
+            if (!c || !t || !normalizeFieldValue(p, *t, f, v.toStdString(), out)) return false;
+            if (c->fields[f.id] == out) return false;
+            c->fields[f.id] = out;
+            return true;
+        }, QStringLiteral("g%1:%2").arg(clipId).arg(QString::fromStdString(f.id)));
+    };
+    auto reset = [this, clipId](const TemplateField& f) {
+        state_->edit(tr("Reset %1").arg(QString::fromStdString(f.label)), [clipId, f](Project&, Sequence& s) {
+            Clip* c = edit::clipById(s, clipId);
+            return c && c->fields.erase(f.id) > 0;
+        });
+    };
+    for (const TemplateField& f : fields) {
+        auto* row = new QWidget(content_);
+        auto* h = new QHBoxLayout(row);
+        h->setContentsMargins(0, 0, 0, 0);
+        h->setSpacing(3);
+        const QString label = QString::fromStdString(f.label);
+        if (f.kind == "text") {
+            auto* edit = new QPlainTextEdit(row);
+            edit->setObjectName(QStringLiteral("field_") + QString::fromStdString(f.id));
+            edit->setFixedHeight(48);
+            h->addWidget(edit, 1);
+            connect(edit, &QPlainTextEdit::textChanged, this, [edit, setValue, f] { setValue(f, edit->toPlainText()); });
+            refreshers_.push_back([edit, valueOf, f] {
+                if (edit->hasFocus() || edit->toPlainText() == valueOf(f)) return;
+                QSignalBlocker b(edit);
+                edit->setPlainText(valueOf(f));
+            });
+        } else if (f.kind == "color") {
+            auto* btn = new QToolButton(row);
+            btn->setObjectName(QStringLiteral("field_") + QString::fromStdString(f.id));
+            btn->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+            btn->setIconSize(QSize(28, 14));
+            h->addWidget(btn, 1);
+            connect(btn, &QToolButton::clicked, this, [this, valueOf, setValue, f, label] {
+                const QColor start(valueOf(f));
+                QColorDialog dlg(start, this);
+                dlg.setWindowTitle(label);
+                dlg.setOption(QColorDialog::DontUseNativeDialog);
+                connect(&dlg, &QColorDialog::currentColorChanged, this, [setValue, f](const QColor& c) { setValue(f, c.name()); });
+                if (dlg.exec() != QDialog::Accepted) setValue(f, start.name());
+            });
+            refreshers_.push_back([btn, valueOf, f] {
+                const QColor c(valueOf(f));
+                btn->setIcon(colorIcon(c));
+                btn->setText(c.name().toUpper());
+            });
+        } else if (f.kind == "toggle") {
+            auto* cb = new QCheckBox(row);
+            cb->setObjectName(QStringLiteral("field_") + QString::fromStdString(f.id));
+            h->addWidget(cb, 1);
+            connect(cb, &QCheckBox::toggled, this, [setValue, f](bool on) { setValue(f, on ? QStringLiteral("1") : QStringLiteral("0")); });
+            refreshers_.push_back([cb, valueOf, f] {
+                QSignalBlocker b(cb);
+                cb->setChecked(valueOf(f) == QLatin1String("1"));
+            });
+        } else if (f.kind == "choice" || f.kind == "media") {
+            auto* combo = new QComboBox(row);
+            combo->setObjectName(QStringLiteral("field_") + QString::fromStdString(f.id));
+            if (f.kind == "choice") {
+                double lo = 0, hi = 0;
+                std::vector<std::string> choices;
+                fieldRange(*tpl, f, lo, hi, &choices);
+                for (size_t i = 0; i < choices.size(); ++i) combo->addItem(tr(choices[i].c_str()), QString::number(i));
+            } else {
+                for (const MediaItem& m : state_->project().media)
+                    if (m.kind == MediaKind::Image || m.kind == MediaKind::Video) combo->addItem(QString::fromStdString(m.name), QString::number(m.id));
+            }
+            h->addWidget(combo, 1);
+            connect(combo, &QComboBox::activated, this, [combo, setValue, f](int i) { setValue(f, combo->itemData(i).toString()); });
+            refreshers_.push_back([combo, valueOf, f] {
+                QSignalBlocker b(combo);
+                combo->setCurrentIndex(combo->findData(valueOf(f)));
+            });
+        } else {
+            auto* spin = new QDoubleSpinBox(row);
+            spin->setObjectName(QStringLiteral("field_") + QString::fromStdString(f.id));
+            double lo = 0, hi = 0;
+            fieldRange(*tpl, f, lo, hi);
+            spin->setRange(lo, hi);
+            spin->setDecimals(hi - lo > 100 ? 1 : 3);
+            spin->setKeyboardTracking(false);
+            h->addWidget(spin, 1);
+            connect(spin, &QDoubleSpinBox::valueChanged, this, [setValue, f](double v) { setValue(f, QString::number(v, 'g', 10)); });
+            refreshers_.push_back([spin, valueOf, f] {
+                QSignalBlocker b(spin);
+                spin->setValue(valueOf(f).toDouble());
+            });
+        }
+        auto* undoBtn = smallButton(row, QStringLiteral("↺"), tr("Back to the template's own setting"));
+        h->addWidget(undoBtn);
+        connect(undoBtn, &QToolButton::clicked, this, [reset, f] { reset(f); });
+        form->addRow(label, row);
+    }
+}
+
 void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const Target& target) {
     auto* row = new QWidget(content_);
     auto* h = new QHBoxLayout(row);
@@ -1353,9 +1497,10 @@ void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const 
             // Double-click the label area resets to default: provided via context menu below.
             spin->setContextMenuPolicy(Qt::CustomContextMenu);
             double def = pi.def;
-            connect(spin, &QWidget::customContextMenuRequested, this, [spin, write, name, def, this](const QPoint& p) {
+            connect(spin, &QWidget::customContextMenuRequested, this, [spin, write, name, def, target, label, this](const QPoint& p) {
                 QMenu m;
                 m.addAction(tr("Reset to Default"), this, [write, name, def] { write({{name, def}}); });
+                if (target.clip) m.addAction(tr("Publish to Graphic…"), this, [this, target, name, label] { publishParameter(target, name, label); });
                 m.exec(spin->mapToGlobal(p));
             });
             refreshWidget = [spin, slider, read, name, pi] {
@@ -1440,6 +1585,15 @@ void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const 
             next->setEnabled(animated);
         };
     }
+    // A clip's setting can be published as a field of the graphic its sequence is (core/GraphicsTemplate.h).
+    if (target.clip) {
+        row->setContextMenuPolicy(Qt::CustomContextMenu);
+        connect(row, &QWidget::customContextMenuRequested, this, [this, row, target, name, label](const QPoint& p) {
+            QMenu m;
+            m.addAction(tr("Publish to Graphic…"), this, [this, target, name, label] { publishParameter(target, name, label); });
+            m.exec(row->mapToGlobal(p));
+        });
+    }
     form->addRow(label, row);
     refreshers_.push_back(refreshWidget);
 }
@@ -1467,7 +1621,12 @@ void InspectorWidget::addStringRow(QFormLayout* form, const StringParamInfo& si,
         case StringKind::MultilineText: {
             auto* edit = new QPlainTextEdit(content_);
             edit->setFixedHeight(64);
-            enableSpellCheck(edit, state_, [] { return titleSpellingLanguage(); });
+            std::function<void(QMenu*)> more;
+            if (target.clip)
+                more = [this, target, name, label](QMenu* m) {
+                    m->addAction(tr("Publish to Graphic…"), this, [this, target, name, label] { publishParameter(target, name, label); });
+                };
+            enableSpellCheck(edit, state_, [] { return titleSpellingLanguage(); }, more);
             form->addRow(label, edit);
             connect(edit, &QPlainTextEdit::textChanged, this, [edit, write] { write(edit->toPlainText()); });
             refreshers_.push_back([edit, read] {

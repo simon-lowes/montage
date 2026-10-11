@@ -143,6 +143,7 @@
 #include "media/Inpaint.h"
 #include "SpeechDialog.h"
 #include "StemsDialog.h"
+#include "GraphicsDialogs.h"
 #include "ShotSearchPanel.h"
 #include "PeoplePanel.h"
 #include "SequenceIndexPanel.h"
@@ -10035,6 +10036,96 @@ const auto seq = [this] { return state()->sequence(); };
         mode->setCurrentIndex(0);
         QCOMPARE(list->count(), 0);
         QVERIFY(panel->resultText(0).isEmpty());
+        state()->newProject();
+    }
+
+    void graphicsTemplatesInTheApp() {
+        state()->newProject();
+        qputenv("MONTAGE_TEMPLATES_DIR", (dir_.path() + "/templates").toUtf8());
+        for (const char* name : {"insertGraphicsTemplate", "publishPicture", "fillGraphics", "saveGraphicsTemplate", "graphicFields"})
+            QVERIFY2(win_->findChild<QAction*>(name), name);
+        // A lower third in a sequence of its own: a title.
+        const Id main = state()->sequence()->id;
+        Id gid = 0, titleId = 0;
+        QVERIFY(state()->edit("Make", [&](Project& p, Sequence& outer) {
+            Sequence g;
+            g.id = gid = p.newId();
+            g.name = "Lower Third";
+            g.width = outer.width, g.height = outer.height, g.fps = outer.fps;
+            g.videoTracks.resize(1);
+            g.videoTracks[0].id = p.newId();
+            Clip t;
+            t.id = titleId = p.newId();
+            t.duration = 60;
+            t.generator = makeEffect(p, "title");
+            g.videoTracks[0].clips.push_back(t);
+            p.sequences.push_back(g);
+            MediaItem m;
+            m.id = p.newId();
+            m.kind = MediaKind::Sequence;
+            m.sequenceId = gid;
+            m.name = "Lower Third";
+            m.hasVideo = true;
+            p.media.push_back(m);
+            return true;
+        }));
+        state()->setActiveSequence(gid);
+        // Its text and colour published from the Inspector.
+        auto* inspector = win_->findChild<InspectorWidget*>();
+        QVERIFY(inspector);
+        QCOMPARE(inspector->publishField(titleId, 0, "text", "Name"), QString());
+        QCOMPARE(inspector->publishField(titleId, 0, "color", "Colour"), QString());
+        QVERIFY(!inspector->publishField(titleId, 0, "text", "Again").isEmpty());
+        QCOMPARE(state()->sequence()->fields.size(), size_t(2));
+        state()->undo();
+        QCOMPARE(state()->sequence()->fields.size(), size_t(1));
+        state()->redo();
+        // The fields dialog: renamed, moved, kept.
+        {
+            GraphicFieldsDialog dlg(state(), win_.get());
+            QCOMPARE(dlg.findChild<QListWidget*>("fields")->count(), 2);
+            QVERIFY(dlg.rename(0, "Person"));
+            QVERIFY(dlg.move(1, -1));
+            QCOMPARE(state()->sequence()->fields[0].label, std::string("Colour"));
+            QCOMPARE(state()->sequence()->fields[1].label, std::string("Person"));
+            QVERIFY(!dlg.move(0, -1));
+        }
+        // Saved to the library, then inserted into the main sequence from it.
+        const QString saved = saveSequenceAsGraphicsTemplate(state(), win_.get(), "Name Strap");
+        QVERIFY(!saved.isEmpty() && QFile::exists(saved));
+        state()->setActiveSequence(main);
+        Id clip = 0;
+        {
+            GraphicsTemplatesDialog dlg(state(), win_.get());
+            QCOMPARE(dlg.templates().size(), size_t(1));
+            QCOMPARE(dlg.findChild<QListWidget*>("templates")->count(), 1);
+            clip = dlg.insert(0);
+        }
+        QVERIFY(clip);
+        const Clip* c = edit::clipById(*state()->sequence(), clip);
+        QVERIFY(c && graphicOf(state()->project(), *c));
+        // Selected, the Inspector shows its fields: typing in one sets the graphic's own value.
+        state()->setSelection({clip});
+        QApplication::processEvents();
+        auto* name = inspector->findChild<QPlainTextEdit*>("field_name");  // (by id: renaming changes its label only)
+        QVERIFY(name && inspector->findChild<QToolButton*>("field_colour"));
+        QCOMPARE(name->toPlainText(), QStringLiteral("Title"));
+        name->setPlainText(QStringLiteral("Jane Smith"));
+        QCOMPARE(edit::clipById(*state()->sequence(), clip)->fields.at("name"), std::string("Jane Smith"));
+        // Filled from a table: two more after it, one undo step.
+        QFile csv(dir_.filePath("names.csv"));
+        QVERIFY(csv.open(QIODevice::WriteOnly));
+        csv.write("Person,Colour\nAda,#00ff00\nGrace,#0000ff\nLinus,#ff00ff\n");
+        csv.close();
+        const int undoBefore = int(state()->history().undoCount());
+        const std::vector<Id> made = fillGraphicsFromFile(state(), clip, dir_.filePath("names.csv"));
+        QCOMPARE(made.size(), size_t(3));
+        QCOMPARE(int(state()->history().undoCount()), undoBefore + 1);
+        QCOMPARE(edit::clipById(*state()->sequence(), made[2])->fields.at("name"), std::string("Linus"));
+        state()->undo();
+        QVERIFY(!edit::clipById(*state()->sequence(), made[2]));
+        QCOMPARE(edit::clipById(*state()->sequence(), clip)->fields.at("name"), std::string("Jane Smith"));
+        qunsetenv("MONTAGE_TEMPLATES_DIR");
         state()->newProject();
     }
 

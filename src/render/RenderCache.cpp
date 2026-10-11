@@ -12,6 +12,7 @@
 #include "core/Captions.h"
 #include "core/ColorGroups.h"
 #include "core/EditOps.h"
+#include "core/GraphicsTemplate.h"
 #include "core/ProjectIO.h"
 
 namespace montage {
@@ -89,6 +90,11 @@ void addClipAt(QCryptographicHash& h, const Project& p, const Sequence& seq, con
         if (m->kind == MediaKind::Sequence) {
             // A nested sequence: its own frame, at the time the clip shows.
             if (const Sequence* nested = p.findSequence(m->sequenceId); nested && depth < 8 && nested->id != seq.id) {
+                Sequence filled;  // a graphic's own values (its media swapped in too)
+                if (!nested->fields.empty() && !c.fields.empty()) {
+                    filled = withFieldValues(p, *nested, c.fields);
+                    nested = &filled;
+                }
                 const FrameTime nf = FrameTime(std::floor(c.sourceFrameAt(t) * nested->fpsValue() / seq.fpsValue() + 1e-6));
                 RenderOptions no = o;
                 no.captions = false;

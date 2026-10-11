@@ -1,5 +1,7 @@
 // Engine tests: keyframes, timecode, edit operations, undo, project I/O.
 #include <QtTest>
+#include <QTemporaryDir>
+#include <QImage>
 #include <set>
 #include <random>
 #include <QJsonArray>
@@ -27,6 +29,7 @@
 #include "core/ChapterSuggest.h"
 #include "core/Checkerboard.h"
 #include "core/EditOps.h"
+#include "core/GraphicsTemplate.h"
 #include "core/GradeVersions.h"
 #include "core/EffectPresets.h"
 #include "core/Effects.h"
@@ -135,6 +138,226 @@ private slots:
         // Unknown words sounded out, the first syllable stressed.
         QCOMPARE(spellingToPhonemes("zorblat"), std::string("zˈɔɹblæt"));
         QCOMPARE(spellingToPhonemes("chime"), std::string("ʧˈIm"));
+    }
+
+    void graphicsTemplates() {
+        // A lower third: a title (text, colour, bold, alignment, size published), a graded logo (its picture and the
+        // grade's saturation published) on the track above.
+        Project p = makeDefaultProject();
+        Sequence& outer = *p.active();
+        Sequence g;
+        g.id = p.newId();
+        g.name = "Lower Third";
+        g.width = outer.width, g.height = outer.height, g.fps = outer.fps;
+        g.videoTracks.resize(2);
+        for (Track& t : g.videoTracks) t.id = p.newId();
+        Clip title;
+        title.id = p.newId();
+        title.duration = 90;
+        title.generator = makeEffect(p, "title");
+        g.videoTracks[0].clips.push_back(title);
+        MediaItem logo, other, sound;
+        for (MediaItem* m : {&logo, &other, &sound}) m->id = p.newId();
+        logo.kind = other.kind = MediaKind::Image;
+        logo.name = "logo.png", logo.path = "/nowhere/logo.png";
+        other.name = "other.png", other.path = "/nowhere/other.png";
+        sound.kind = MediaKind::Audio, sound.path = "/nowhere/a.wav";
+        p.media.push_back(logo), p.media.push_back(other), p.media.push_back(sound);
+        Clip pic;
+        pic.id = p.newId();
+        pic.mediaId = logo.id;
+        pic.duration = 90;
+        Effect grade = makeEffect(p, "color_correct");
+        pic.effects.push_back(grade);
+        g.videoTracks[1].clips.push_back(pic);
+        // What each setting publishes as.
+        QCOMPARE(fieldFor(g, title.id, 0, "text")->kind, std::string("text"));
+        QCOMPARE(fieldFor(g, title.id, 0, "font")->kind, std::string("text"));
+        QCOMPARE(fieldFor(g, title.id, 0, "color")->kind, std::string("color"));
+        QCOMPARE(fieldFor(g, title.id, 0, "bold")->kind, std::string("toggle"));
+        QCOMPARE(fieldFor(g, title.id, 0, "align")->kind, std::string("choice"));
+        QCOMPARE(fieldFor(g, title.id, 0, "size")->kind, std::string("number"));
+        QCOMPARE(fieldFor(g, title.id, title.generator.id, "size")->effect, Id(0));  // the generator by its id too
+        QCOMPARE(fieldFor(g, pic.id, grade.id, "saturation")->effect, grade.id);
+        QVERIFY(!fieldFor(g, title.id, 0, "no_such_setting"));
+        QVERIFY(!fieldFor(g, 999999, 0, "text"));
+        QVERIFY(!fieldFor(g, pic.id, 0, "text"));  // no generator
+        QCOMPARE(mediaFieldFor(p, g, pic.id)->kind, std::string("media"));
+        QVERIFY(!mediaFieldFor(p, g, title.id));
+        // Published, with ids from their labels, kept apart; the same setting twice refused.
+        std::string id;
+        QVERIFY(publishField(g, *fieldFor(g, title.id, 0, "text", "Name"), &id).ok);
+        QCOMPARE(id, std::string("name"));
+        QVERIFY(publishField(g, *fieldFor(g, title.id, 0, "color", "Name Colour"), &id).ok);
+        QCOMPARE(id, std::string("name_colour"));
+        QVERIFY(!publishField(g, *fieldFor(g, title.id, 0, "text", "Again")).ok);
+        QVERIFY(publishField(g, *fieldFor(g, title.id, 0, "bold", "Name")).ok);  // a second "Name": name_2
+        QCOMPARE(g.fields.back().id, std::string("name_2"));
+        QVERIFY(publishField(g, *fieldFor(g, title.id, 0, "align")).ok);
+        QVERIFY(publishField(g, *fieldFor(g, title.id, 0, "size")).ok);
+        QVERIFY(publishField(g, *fieldFor(g, pic.id, grade.id, "saturation")).ok);
+        QVERIFY(publishField(g, *mediaFieldFor(p, g, pic.id, "Logo")).ok);
+        QCOMPARE(g.fields.size(), size_t(7));
+        QCOMPARE(liveFields(g).size(), size_t(7));
+        // The template's own values.
+        auto field = [&](const std::string& fid) { return *std::find_if(g.fields.begin(), g.fields.end(), [&](const TemplateField& f) { return f.id == fid; }); };
+        QCOMPARE(fieldValue(g, field("name")), std::string("Title"));
+        QCOMPARE(fieldValue(g, field("name_colour")), std::string("#ffffff"));
+        QCOMPARE(fieldValue(g, field("name_2")), std::string("1"));
+        QCOMPARE(fieldValue(g, field("alignment")), std::string("1"));
+        QCOMPARE(fieldValue(g, field("font_size_px")), std::string("96"));
+        QCOMPARE(fieldValue(g, field("logo")), std::to_string(logo.id));
+        // Values checked and put in a standard form.
+        std::string v, err;
+        QVERIFY(normalizeFieldValue(p, g, field("name_colour"), "#F00", v) && v == "#ff0000");
+        QVERIFY(normalizeFieldValue(p, g, field("name_colour"), "255, 128, 0", v) && v == "#ff8000");
+        QVERIFY(!normalizeFieldValue(p, g, field("name_colour"), "red", v, &err) && err.find("colour") != std::string::npos);
+        QVERIFY(normalizeFieldValue(p, g, field("name_2"), "Yes", v) && v == "1");
+        QVERIFY(!normalizeFieldValue(p, g, field("name_2"), "maybe", v));
+        QVERIFY(normalizeFieldValue(p, g, field("alignment"), "right", v) && v == "2");
+        QVERIFY(normalizeFieldValue(p, g, field("alignment"), "0", v) && v == "0");
+        QVERIFY(!normalizeFieldValue(p, g, field("alignment"), "5", v));
+        QVERIFY(normalizeFieldValue(p, g, field("font_size_px"), "5000", v) && v == "1000");
+        QVERIFY(!normalizeFieldValue(p, g, field("font_size_px"), "big", v));
+        QVERIFY(normalizeFieldValue(p, g, field("logo"), std::to_string(other.id), v));
+        QVERIFY(!normalizeFieldValue(p, g, field("logo"), std::to_string(sound.id), v));
+        // Put in: what a graphic with these values shows.
+        const std::map<std::string, std::string> mine = {{"name", "Jane Smith"}, {"name_colour", "#ff0000"}, {"name_2", "0"},
+                                                         {"alignment", "2"}, {"font_size_px", "50"}, {"saturation", "0.25"},
+                                                         {"logo", std::to_string(other.id)}, {"unknown", "x"}, {"name_colour_bad", "1"}};
+        const Sequence shown = withFieldValues(p, g, mine);
+        const Clip& t2 = shown.videoTracks[0].clips[0];
+        QCOMPARE(t2.generator.s("text"), std::string("Jane Smith"));
+        QCOMPARE(t2.generator.p("color.r", 0), 1.0);
+        QCOMPARE(t2.generator.p("color.g", 0), 0.0);
+        QCOMPARE(t2.generator.p("bold", 0), 0.0);
+        QCOMPARE(t2.generator.p("align", 0), 2.0);
+        QCOMPARE(t2.generator.p("size", 0), 50.0);
+        QCOMPARE(shown.videoTracks[1].clips[0].effects[0].p("saturation", 0), 0.25);
+        QCOMPARE(shown.videoTracks[1].clips[0].mediaId, other.id);
+        // A bad value is left out (the template's own setting shows).
+        QCOMPARE(withFieldValues(p, g, {{"name_colour", "red"}}).videoTracks[0].clips[0].generator.p("color.g", 0, 1), 1.0);
+        // The graphic in a sequence: its own values where it has them.
+        MediaItem gm;
+        gm.id = p.newId();
+        gm.kind = MediaKind::Sequence;
+        gm.sequenceId = g.id;
+        gm.hasVideo = true;
+        p.media.push_back(gm);
+        p.sequences.push_back(g);
+        Sequence& o = *p.active();
+        edit::Result placed = edit::placeMedia(p, o, gm.id, 0, 0, -1, {TrackKind::Video, 0}, {}, false);
+        QVERIFY(placed.ok);
+        const Id instId = placed.created[0];
+        Clip* inst = edit::clipById(o, instId);
+        inst->fields = {{"name", "Jane Smith"}};
+        const Sequence& tg = *p.findSequence(g.id);
+        QCOMPARE(graphicOf(p, *inst), &tg);
+        QCOMPARE(fieldValue(tg, *inst, field("name")), std::string("Jane Smith"));
+        QCOMPARE(fieldValue(tg, *inst, field("name_colour")), std::string("#ffffff"));
+        // Saved and loaded.
+        QTemporaryDir dir;
+        const std::string file = (dir.path() + "/g.montage").toStdString();
+        QVERIFY(saveProject(p, file));
+        Project back;
+        QVERIFY(loadProject(file, back));
+        QCOMPARE(back.findSequence(g.id)->fields, tg.fields);
+        QCOMPARE(edit::clipById(*back.active(), instId)->fields, inst->fields);
+        // A copy of the template: its fields follow its clips and effects there.
+        const Id copy = edit::duplicateSequence(p, g.id, "Copy");
+        const Sequence& cg = *p.findSequence(copy);
+        QCOMPARE(liveFields(cg).size(), size_t(7));
+        QCOMPARE(withFieldValues(p, cg, mine).videoTracks[0].clips[0].generator.s("text"), std::string("Jane Smith"));
+        QCOMPARE(withFieldValues(p, cg, mine).videoTracks[1].clips[0].effects[0].p("saturation", 0), 0.25);
+        QVERIFY(cg.fields[0].clip != p.findSequence(g.id)->fields[0].clip);
+        // Unpublished.
+        QVERIFY(unpublishField(*p.findSequence(copy), "name_2").ok);
+        QVERIFY(!unpublishField(*p.findSequence(copy), "name_2").ok);
+        QCOMPARE(p.findSequence(copy)->fields.size(), size_t(6));
+
+        // From a table: the first row sets the graphic, the rest go after it (on the track above where taken).
+        {
+            Sequence& sq = *p.active();  // (the copy above moved the sequences: found again)
+            const Id first = instId;
+            const FrameTime len = edit::clipById(sq, instId)->duration;
+            Clip blocker;  // something on V1 where the third graphic would go
+            blocker.id = p.newId();
+            blocker.start = len * 2;
+            blocker.duration = 10;
+            blocker.generator = makeEffect(p, "title");
+            QVERIFY(edit::overwrite(p, sq, {TrackKind::Video, 0}, blocker).ok);
+            std::vector<Id> made;
+            std::vector<std::string> unmatched;
+            const std::string csv = "\xEF\xBB\xBFName,Name Colour,Notes\nJane Smith,#ff0000,x\n\"Smith, John\",#00ff00,y\nAda,\"0,0,255\",z\n";
+            const edit::Result r = fillGraphicsFromTable(p, sq, first, csv, &made, &unmatched);
+            QVERIFY2(r.ok, r.error.c_str());
+            QCOMPARE(made.size(), size_t(3));
+            QCOMPARE(made[0], first);
+            QCOMPARE(unmatched, std::vector<std::string>{"Notes"});
+            const Clip* c2 = edit::clipById(sq, made[1]);
+            const Clip* c3 = edit::clipById(sq, made[2]);
+            QCOMPARE(c2->fields.at("name"), std::string("Smith, John"));
+            QCOMPARE(c2->fields.at("name_colour"), std::string("#00ff00"));
+            QCOMPARE(c2->start, len);
+            QCOMPARE(edit::locate(sq, made[1])->track.index, 0);
+            QCOMPARE(c3->start, len * 2);
+            QCOMPARE(edit::locate(sq, made[2])->track.index, 1);  // V1 is taken there
+            QCOMPARE(c3->fields.at("name_colour"), std::string("#0000ff"));
+            QCOMPARE(edit::clipById(sq, first)->fields.at("name"), std::string("Jane Smith"));
+            // A value that cannot be one: nothing changes.
+            const auto before = sq;
+            QVERIFY(!fillGraphicsFromTable(p, sq, first, "Name Colour\nnot a colour\n").ok);
+            QVERIFY(sq == before);
+            QVERIFY(!fillGraphicsFromTable(p, sq, first, "Nothing\nx\n").ok);
+            QVERIFY(!fillGraphicsFromTable(p, sq, blocker.id, csv).ok);  // not a graphic
+        }
+
+        // The library: saved with its files beside it, listed, and brought into another project.
+        {
+            QTemporaryDir lib;
+            const QString image = lib.path() + "/source-logo.png";
+            QImage(8, 8, QImage::Format_RGBA8888).save(image);
+            Project q = makeDefaultProject();
+            Sequence tq = *p.findSequence(g.id);
+            tq.id = q.newId();
+            MediaItem lm = logo;
+            lm.id = q.newId();
+            lm.path = image.toStdString();
+            for (Track& t : tq.videoTracks)
+                for (Clip& c : t.clips)
+                    if (c.mediaId) c.mediaId = lm.id;
+            q.media.push_back(lm);
+            MediaItem qm;
+            qm.id = q.newId();
+            qm.kind = MediaKind::Sequence;
+            qm.sequenceId = tq.id;
+            q.media.push_back(qm);
+            q.sequences.push_back(tq);
+            std::string saved, why;
+            QVERIFY2(saveGraphicsTemplate(q, tq.id, "Lower Third: Blue", lib.path().toStdString() + "/templates", &saved, &why), why.c_str());
+            QVERIFY(QString::fromStdString(saved).endsWith("Lower Third_ Blue/Lower Third_ Blue.montage"));
+            QVERIFY(QFile::exists(lib.path() + "/templates/Lower Third_ Blue/source-logo.png"));
+            const auto list = listGraphicsTemplates(lib.path().toStdString() + "/templates");
+            QCOMPARE(list.size(), size_t(1));
+            QCOMPARE(list[0].name, std::string("Lower Third_ Blue"));
+            QCOMPARE(list[0].fields.size(), size_t(7));
+            QCOMPARE(list[0].fields[0], std::string("Name"));
+            QCOMPARE(list[0].seconds, 3.0);
+            Project into = makeDefaultProject();
+            Sequence& is = *into.active();
+            const size_t tracks = is.videoTracks.size();
+            const edit::Result r = insertGraphicsTemplate(into, is, saved, 30);
+            QVERIFY2(r.ok && !r.created.empty(), r.error.c_str());
+            Sequence& is2 = *into.active();
+            QCOMPARE(is2.videoTracks.size(), tracks + 1);
+            const Clip* gc = edit::clipById(is2, r.created[0]);
+            QVERIFY(gc && gc->start == 30 && gc->duration == 90);
+            const Sequence* brought = graphicOf(into, *gc);
+            QVERIFY(brought && liveFields(*brought).size() == 7);
+            const MediaItem* broughtLogo = into.findMedia(brought->videoTracks[1].clips[0].mediaId);
+            QVERIFY(broughtLogo && QString::fromStdString(broughtLogo->path).endsWith("Lower Third_ Blue/source-logo.png"));
+            QVERIFY(!insertGraphicsTemplate(into, is2, lib.path().toStdString() + "/nothing.montage", 0).ok);
+        }
     }
 
     void gzipAndTar() {

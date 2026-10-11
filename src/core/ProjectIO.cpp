@@ -10,6 +10,7 @@
 #include <QJsonObject>
 #include <QSaveFile>
 #include <algorithm>
+#include <set>
 #include <utility>
 
 namespace montage {
@@ -249,6 +250,11 @@ QJsonObject clipToJson(const Clip& c) {
         o["gradeVersion"] = c.gradeVersion;
     }
     if (c.colorGroup) o["colorGroup"] = double(c.colorGroup);
+    if (!c.fields.empty()) {
+        QJsonObject values;
+        for (const auto& [id, v] : c.fields) values[qs(id)] = qs(v);
+        o["fields"] = values;
+    }
     return o;
 }
 
@@ -301,6 +307,8 @@ Clip clipFromJson(const QJsonObject& o) {
     }
     c.gradeVersion = c.gradeVersions.empty() ? 0 : std::clamp(o.value("gradeVersion").toInt(), 0, int(c.gradeVersions.size()) - 1);
     c.colorGroup = Id(i64(o.value("colorGroup")));
+    const QJsonObject values = o.value("fields").toObject();
+    for (auto it = values.begin(); it != values.end(); ++it) c.fields[it.key().toStdString()] = ss(it.value());
     return c;
 }
 
@@ -577,6 +585,13 @@ QJsonObject sequenceToJson(const Sequence& s) {
         }
         o["hdr10Plus"] = scenes;
     }
+    if (!s.fields.empty()) {
+        QJsonArray fields;
+        for (const TemplateField& f : s.fields)
+            fields.append(QJsonObject{{"id", qs(f.id)}, {"label", qs(f.label)}, {"kind", qs(f.kind)}, {"clip", double(f.clip)},
+                                      {"effect", double(f.effect)}, {"param", qs(f.param)}});
+        o["fields"] = fields;
+    }
     if (s.spherical) o["spherical"] = true;
     if (s.vr180) o["vr180"] = true;
     if (s.stereo3d) o["stereo3d"] = true;
@@ -619,6 +634,18 @@ Sequence sequenceFromJson(const QJsonObject& o) {
         for (int i = 0; i < 7; ++i) sc.percentiles[i] = nits(6 + i);
         sc.key = ss(a.at(13));
         s.hdr10Plus.push_back(sc);
+    }
+    for (const auto& v : o.value("fields").toArray()) {
+        const QJsonObject f = v.toObject();
+        TemplateField t;
+        t.id = ss(f.value("id"));
+        t.label = ss(f.value("label"));
+        t.kind = ss(f.value("kind"));
+        t.clip = Id(i64(f.value("clip")));
+        t.effect = Id(i64(f.value("effect")));
+        t.param = ss(f.value("param"));
+        static const std::set<std::string> kinds = {"text", "color", "number", "toggle", "choice", "media"};
+        if (!t.id.empty() && kinds.count(t.kind)) s.fields.push_back(std::move(t));
     }
     s.spherical = o.value("spherical").toBool(false);
     s.vr180 = o.value("vr180").toBool(false);
