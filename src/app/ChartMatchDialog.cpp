@@ -238,7 +238,8 @@ bool ChartMatchDialog::findChart() {
 }
 
 void ChartMatchDialog::findChartLater() {
-    if (watcher_.isRunning()) return;
+    if (searching_) return;
+    searching_ = true;
     find_->setEnabled(false);
     apply_->setEnabled(false);
     status_->setText(tr("Looking for the chart…"));
@@ -251,6 +252,7 @@ void ChartMatchDialog::findChartLater() {
 }
 
 void ChartMatchDialog::found(bool ok, const TrackQuad& q) {
+    searching_ = false;
     find_->setEnabled(true);
     if (ok) {
         placed_ = true;
@@ -278,8 +280,8 @@ void ChartMatchDialog::measure() {
     for (size_t i = 0; i < 24; ++i) matched[i] = fit_.ok ? applyChartFit(fit_, shot[i]) : shot[i];
     swatches_->setColors(shot, matched);
     ready_ = fit_.ok && placed_;
-    apply_->setEnabled(ready_ && !watcher_.isRunning());
-    if (watcher_.isRunning()) return;  // ("Looking for the chart…" stays)
+    apply_->setEnabled(ready_ && !searching_);
+    if (searching_) return;  // ("Looking for the chart…" stays)
     status_->setText(!complete  ? tr("The outline must lie inside the picture, its corners apart: put it on the chart.")
                      : !fit_.ok ? tr("The patches cannot be matched: put the outline on the chart.")
                      : !placed_ ? tr("Find Chart, or drag the corners onto the patches.")

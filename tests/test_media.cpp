@@ -15065,11 +15065,13 @@ private slots:
             Id group = 0;
             QVERIFY(edit::makeColorGroup(h, hs, {hc}, "Scene", &group).ok);
             Effect lift = makeEffect(h, "color_correct");
-            lift.params["exposure"] = 0.3;
+            lift.params["exposure"] = 0.1;
             findColorGroup(hs, group)->pre.push_back(lift);
             const QString hdr = QString::fromStdString(path("chart-hdr.montage"));
             QVERIFY(saveProject(h, hdr.toStdString()));
-            r = call({{"project", hdr}, {"clip", double(hc)}});
+            r = call({{"project", hdr}, {"clip", double(hc)},
+                      {"corners", QJsonArray{QJsonArray{120.0 / 640, 80.0 / 360}, QJsonArray{420.0 / 640, 80.0 / 360},
+                                             QJsonArray{420.0 / 640, 280.0 / 360}, QJsonArray{120.0 / 640, 280.0 / 360}}}});
             QVERIFY2(!refused(r), QJsonDocument(r).toJson().constData());
             const double promised = r.value("structuredContent").toObject().value("delta_e_after").toDouble();
             // (The group's exposure works on PQ code values, which no matrix in linear light undoes exactly.)

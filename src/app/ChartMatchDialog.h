@@ -73,7 +73,7 @@ public:
     ChartMatchDialog(const Image& frame, const Image& view, const ColorSpace& space, const QString& clipName, QWidget* parent = nullptr);
     bool findChart();         // the chart looked for now; false (and said) if there is none
     void findChartLater();    // the same in the background (as the dialog opens, and Find Chart)
-    bool searching() const { return watcher_.isRunning(); }
+    bool searching() const { return searching_; }  // (until its result has reached the dialog)
     void setQuad(const TrackQuad& q);
     TrackQuad quad() const;
     const ChartFit& fit() const { return fit_; }
@@ -95,6 +95,7 @@ private:
     ChartFit fit_;
     bool placed_ = false;  // found, or moved by hand
     bool ready_ = false;
+    bool searching_ = false;
     QFutureWatcher<std::pair<bool, TrackQuad>> watcher_;
 };
 
