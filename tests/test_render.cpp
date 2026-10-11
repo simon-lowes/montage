@@ -22,6 +22,7 @@
 #include "core/GraphicsTemplate.h"
 #include "core/Effects.h"
 #include "core/MaskPath.h"
+#include "render/ColorChart.h"
 #include "render/ColorSpace.h"
 #include "render/HdrView.h"
 #include "render/Compositor.h"
@@ -4435,6 +4436,94 @@ colorspaces:
         Project empty = makeDefaultProject();
         empty.active()->colorSpace = "rec2100pq";
         QVERIFY(!measureLightLevels(empty, *empty.active(), 0, 0, l, &err) && err.find("empty") != std::string::npos);
+    }
+
+    void colorChartCalibration() {
+        // A ColorChecker shot under a warm cast: its colours through a matrix in linear light, on a grey wall.
+        const ChartColors& ref = colorChecker24();
+        auto lin = [](double v) { return std::pow(std::max(v, 0.0), 2.4); };
+        auto code = [](double v) { return std::pow(std::max(v, 0.0), 1 / 2.4); };
+        const double cast[3][3] = {{1.15, 0.08, 0.0}, {0.02, 0.95, 0.03}, {0.0, 0.05, 0.7}};
+        ChartColors shot;
+        for (int i = 0; i < 24; ++i)
+            for (int c = 0; c < 3; ++c) {
+                const double l = cast[c][0] * lin(ref[size_t(i)][0]) + cast[c][1] * lin(ref[size_t(i)][1]) + cast[c][2] * lin(ref[size_t(i)][2]);
+                shot[size_t(i)][size_t(c)] = code(l * 0.9);
+            }
+        // Draws the chart over (x, y, w, h) in pixels, turned: 0 upright, 1 upside down, 2 with its top to the right.
+        auto picture = [&](int turn, int x0, int y0, int w, int h) {
+            Image img(640, 360);
+            img.fill(0.33f, 0.33f, 0.33f, 1);
+            for (int y = y0 - 8; y < y0 + h + 8; ++y)
+                for (int x = x0 - 8; x < x0 + w + 8; ++x) {
+                    float* p = img.at(x, y);
+                    p[0] = p[1] = p[2] = 0.05f;  // the chart's black frame and gaps
+                }
+            const int cols = turn == 2 ? 4 : 6, rows = turn == 2 ? 6 : 4;
+            for (int r = 0; r < rows; ++r)
+                for (int c = 0; c < cols; ++c) {
+                    // Which patch sits in this cell.
+                    int pr = r, pc = c;
+                    if (turn == 1) pr = 3 - r, pc = 5 - c;
+                    if (turn == 2) pr = 3 - c, pc = r;
+                    const ChartColor& col = shot[size_t(pr * 6 + pc)];
+                    const double cw = double(w) / cols, ch = double(h) / rows;
+                    for (int y = int(y0 + r * ch + ch * 0.08); y < int(y0 + (r + 1) * ch - ch * 0.08); ++y)
+                        for (int x = int(x0 + c * cw + cw * 0.08); x < int(x0 + (c + 1) * cw - cw * 0.08); ++x) {
+                            float* p = img.at(x, y);
+                            for (int k = 0; k < 3; ++k) p[k] = float(col[size_t(k)]);
+                        }
+                }
+            return img;
+        };
+        auto near = [](const ChartColors& a, const ChartColors& b, double tol) {
+            for (size_t i = 0; i < 24; ++i)
+                for (size_t k = 0; k < 3; ++k)
+                    if (std::fabs(a[i][k] - b[i][k]) > tol) return false;
+            return true;
+        };
+        // Upright: found, its outline the patch area, its patches as shot.
+        Image img = picture(0, 120, 80, 300, 200);
+        TrackQuad q;
+        double residual = 1;
+        QVERIFY(detectChart(img, q, &residual));
+        QVERIFY2(residual < 0.03, qPrintable(QString::number(residual)));
+        QVERIFY2(std::fabs(q.p[0].x - 120.0 / 640) < 0.02 && std::fabs(q.p[0].y - 80.0 / 360) < 0.03, qPrintable(QString("%1 %2").arg(q.p[0].x).arg(q.p[0].y)));
+        QVERIFY(std::fabs(q.p[2].x - 420.0 / 640) < 0.02 && std::fabs(q.p[2].y - 280.0 / 360) < 0.03);
+        const ChartColors measured = sampleChart(img, q);
+        QVERIFY(near(measured, shot, 0.01));
+        // The fit takes the cast away: far off before, close after.
+        const ChartFit fit = fitChart(measured);
+        QVERIFY(fit.ok);
+        QVERIFY2(fit.deltaEBefore > 5 && fit.deltaEAfter < 1 && fit.deltaEMax < 2,
+                 qPrintable(QString("%1 %2 %3").arg(fit.deltaEBefore).arg(fit.deltaEAfter).arg(fit.deltaEMax)));
+        // The Chart Match effect does the same to the picture.
+        Effect e = chartMatchEffect(fit, 1);
+        QCOMPARE(e.type, std::string("chart_match"));
+        Image graded = img;
+        applyChartMatch(e, 0, graded);
+        QVERIFY(near(sampleChart(graded, q), ref, 0.02));
+        e.params["amount"] = 0.0;  // none of it
+        Image same = img;
+        applyChartMatch(e, 0, same);
+        QVERIFY(near(sampleChart(same, q), shot, 1e-4));
+        // Upside down and on its side: found, the outline starting at the chart's own top left.
+        for (int turn : {1, 2}) {
+            const Image turned = turn == 1 ? picture(1, 200, 100, 330, 220) : picture(2, 250, 40, 180, 270);
+            TrackQuad tq;
+            QVERIFY2(detectChart(turned, tq), qPrintable(QString::number(turn)));
+            QVERIFY2(near(sampleChart(turned, tq), shot, 0.015), qPrintable(QString::number(turn)));
+        }
+        // A picture without a chart: none.
+        Image wall(640, 360);
+        for (int y = 0; y < 360; ++y)
+            for (int x = 0; x < 640; ++x) {
+                float* p = wall.at(x, y);
+                p[0] = float(x) / 640, p[1] = float(y) / 360, p[2] = 0.4f, p[3] = 1;
+            }
+        QVERIFY(!detectChart(wall, q));
+        QVERIFY(std::fabs(deltaE76({1, 1, 1}, {0, 0, 0}) - 100) < 0.5);
+        QCOMPARE(std::string(colorCheckerName(18)), std::string("White"));
     }
 
     void stereoViews() {

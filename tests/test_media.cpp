@@ -68,6 +68,7 @@
 #include "render/Spherical.h"
 #include "media/SpatialAudio.h"
 #include "render/ExtendClip.h"
+#include "render/ColorChart.h"
 #include "render/ReviewExport.h"
 #include "render/Versions.h"
 #include "render/ClipPlacement.h"
@@ -563,6 +564,28 @@ static std::shared_ptr<Transcript> threeTalks(double& end) {
         }
     end = at;
     return t;
+}
+
+// A ColorChecker photographed under a warm cast, on a grey wall (640 x 360, the patch area at 120,80 300 x 200).
+static QImage castChartImage() {
+    const ChartColors& ref = colorChecker24();
+    const double cast[3][3] = {{1.15, 0.08, 0.0}, {0.02, 0.95, 0.03}, {0.0, 0.05, 0.7}};
+    QImage img(640, 360, QImage::Format_RGB32);
+    img.fill(QColor(84, 84, 84));
+    QPainter p(&img);
+    p.fillRect(QRect(112, 72, 316, 216), QColor(13, 13, 13));
+    for (int i = 0; i < 24; ++i) {
+        double rgb[3];
+        for (int c = 0; c < 3; ++c) {
+            double l = 0;
+            for (int k = 0; k < 3; ++k) l += cast[c][k] * std::pow(ref[size_t(i)][size_t(k)], 2.4);
+            rgb[c] = std::pow(std::max(0.0, l * 0.9), 1 / 2.4);
+        }
+        const double cw = 50, ch = 50;
+        p.fillRect(QRectF(120 + (i % 6) * cw + 4, 80 + (i / 6) * ch + 4, cw - 8, ch - 8),
+                   QColor::fromRgbF(float(std::min(1.0, rgb[0])), float(std::min(1.0, rgb[1])), float(std::min(1.0, rgb[2]))));
+    }
+    return img;
 }
 
 class TestMedia : public QObject {
@@ -14814,6 +14837,59 @@ private slots:
         const auto badLines = server.handle(QJsonDocument(bad).toJson(QJsonDocument::Compact).toStdString());
         const QJsonObject br = QJsonDocument::fromJson(QByteArray::fromStdString(badLines.back())).object();
         QVERIFY(br.contains("error") || br.value("result").toObject().value("isError").toBool());
+    }
+
+    void matchChartOverMcp() {
+        const std::string png = path("chart-mcp.png");
+        QVERIFY(castChartImage().save(QString::fromStdString(png)));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 640, s.height = 360;
+        MediaItem m = probeOrFail(p, png);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 30, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(edit::placeMedia(p, s, m.id, 60, 0, 30, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Id first = s.videoTracks[0].clips[0].id;
+        const QString project = QString::fromStdString(path("chart.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            QJsonObject full = args;
+            full["project"] = project;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_match_chart"}, {"arguments", full},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        // Measured only: found, far off, nothing changed.
+        QJsonObject r = call({{"clip", double(first)}, {"measure_only", true}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QJsonObject out = r.value("structuredContent").toObject();
+        QVERIFY(out.value("delta_e_before").toDouble() > 5 && out.value("delta_e_after").toDouble() < 2);
+        QCOMPARE(out.value("corners").toArray().size(), 4);
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QVERIFY(back.active()->videoTracks[0].clips[0].effects.empty() ||
+                back.active()->videoTracks[0].clips[0].effects.front().type != "chart_match");
+        // Both clips of the media, from given corners.
+        r = call({{"clip", double(first)}, {"same_media", true},
+                  {"corners", QJsonArray{QJsonArray{120.0 / 640, 80.0 / 360}, QJsonArray{420.0 / 640, 80.0 / 360}, QJsonArray{420.0 / 640, 280.0 / 360},
+                                         QJsonArray{120.0 / 640, 280.0 / 360}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("clips").toInt(), 2);
+        QVERIFY(loadProject(project.toStdString(), back));
+        for (const Clip& c : back.active()->videoTracks[0].clips) QCOMPARE(c.effects.front().type, std::string("chart_match"));
+        // Again: the same effect replaced, not a second one.
+        r = call({{"clip", double(first)}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(loadProject(project.toStdString(), back));
+        const auto& fx = back.active()->videoTracks[0].clips[0].effects;
+        QCOMPARE(std::count_if(fx.begin(), fx.end(), [](const Effect& e) { return e.type == "chart_match"; }), 1);
+        // Bad corners, and a picture without a chart.
+        r = call({{"clip", double(first)}, {"corners", QJsonArray{QJsonArray{0, 0}}}});
+        QVERIFY(r.value("isError").toBool() || r.isEmpty());
     }
 
     void reviewPackages() {

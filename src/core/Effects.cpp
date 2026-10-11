@@ -104,6 +104,14 @@ std::vector<EffectInfo> buildCatalog() {
                  {}});
 
     // ---- Video filters ----------------------------------------------------
+    // A colour chart's match (render/ColorChart.h): a matrix and offset in linear light, from Clip › Match Colour Chart.
+    c.push_back({"chart_match", "Chart Match", EffectCategory::VideoFilter, "Color",
+                 {num("amount", "Amount (%)", 0, 100, 100, 1), num("rr", "Red from Red", -4, 4, 1, 0.001), num("rg", "Red from Green", -4, 4, 0, 0.001),
+                  num("rb", "Red from Blue", -4, 4, 0, 0.001), num("gr", "Green from Red", -4, 4, 0, 0.001), num("gg", "Green from Green", -4, 4, 1, 0.001),
+                  num("gb", "Green from Blue", -4, 4, 0, 0.001), num("br", "Blue from Red", -4, 4, 0, 0.001), num("bg", "Blue from Green", -4, 4, 0, 0.001),
+                  num("bb", "Blue from Blue", -4, 4, 1, 0.001), num("offset_r", "Red Offset", -1, 1, 0, 0.001), num("offset_g", "Green Offset", -1, 1, 0, 0.001),
+                  num("offset_b", "Blue Offset", -1, 1, 0, 0.001)},
+                 {}});
     c.push_back({"color_correct", "Color Correct (Primaries)", EffectCategory::VideoFilter, "Color",
                  {
                      num("exposure", "Exposure (stops)", -5, 5, 0),

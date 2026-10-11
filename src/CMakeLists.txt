@@ -85,6 +85,7 @@ add_library(montage_engine STATIC
   media/Relink.h media/Relink.cpp
   media/Analysis.h media/Analysis.cpp
   media/Proxy.h media/Proxy.cpp
+  render/ColorChart.h render/ColorChart.cpp
   media/Loudness.h media/Loudness.cpp
   media/AudioSync.h media/AudioSync.cpp
   media/FieldRecorder.h media/FieldRecorder.cpp

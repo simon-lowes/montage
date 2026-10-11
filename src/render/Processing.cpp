@@ -1,4 +1,5 @@
 #include "Processing.h"
+#include "ColorChart.h"
 #include "Ofx.h"
 
 #include "ColorSpace.h"
@@ -1635,6 +1636,7 @@ void depthEffect(const Effect& e, FrameTime t, Image& img, double pixelScale) {
 void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelScale) {
     const std::string& ty = e.type;
     if (ty == "color_correct") colorCorrect(e, t, img);
+    else if (ty == "chart_match") applyChartMatch(e, t, img);
     else if (ty == "curves") curves(e, t, img);
     else if (ty == "hue_curves") hueCurves(e, t, img);
     else if (ty == "color_warper") colorWarper(e, t, img);

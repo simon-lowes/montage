@@ -93,6 +93,7 @@
 #include "EffectsBrowser.h"
 #include "MediaBinWidget.h"
 #include "ReviewOverlay.h"
+#include "ChartMatchDialog.h"
 #include "media/Proxy.h"
 #include "StoryboardView.h"
 #include "StackedTimelineWidget.h"
@@ -251,6 +252,28 @@ static std::shared_ptr<Transcript> threeTalks(double& end) {
         }
     end = at;
     return t;
+}
+
+// A ColorChecker photographed under a warm cast, on a grey wall (640 x 360, the patch area at 120,80 300 x 200).
+static QImage castChartImage() {
+    const ChartColors& ref = colorChecker24();
+    const double cast[3][3] = {{1.15, 0.08, 0.0}, {0.02, 0.95, 0.03}, {0.0, 0.05, 0.7}};
+    QImage img(640, 360, QImage::Format_RGB32);
+    img.fill(QColor(84, 84, 84));
+    QPainter p(&img);
+    p.fillRect(QRect(112, 72, 316, 216), QColor(13, 13, 13));
+    for (int i = 0; i < 24; ++i) {
+        double rgb[3];
+        for (int c = 0; c < 3; ++c) {
+            double l = 0;
+            for (int k = 0; k < 3; ++k) l += cast[c][k] * std::pow(ref[size_t(i)][size_t(k)], 2.4);
+            rgb[c] = std::pow(std::max(0.0, l * 0.9), 1 / 2.4);
+        }
+        const double cw = 50, ch = 50;
+        p.fillRect(QRectF(120 + (i % 6) * cw + 4, 80 + (i / 6) * ch + 4, cw - 8, ch - 8),
+                   QColor::fromRgbF(float(std::min(1.0, rgb[0])), float(std::min(1.0, rgb[1])), float(std::min(1.0, rgb[2]))));
+    }
+    return img;
 }
 
 class TestApp : public QObject {
@@ -4433,6 +4456,77 @@ private slots:
         QCOMPARE(j2.settings.out, FrameTime(21));
         QVERIFY(QFileInfo::exists(QDir(other).filePath(name + " - Review.html")));
         win_->renderQueue()->remove(j2.id);
+    }
+
+    void matchColourChart() {
+        // A still of a chart under a warm cast, on the timeline twice.
+        const QString file = dir_.filePath("chart.png");
+        QVERIFY(castChartImage().save(file));
+        state()->newProject();
+        const auto ids = state()->importFiles({file});
+        QCOMPARE(ids.size(), size_t(1));
+        Id a = 0, b = 0;
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            s.width = 640, s.height = 360;
+            if (!edit::placeMedia(p, s, ids[0], 0, 0, 30, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok) return false;
+            if (!edit::placeMedia(p, s, ids[0], 60, 0, 30, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok) return false;
+            a = s.videoTracks[0].clips[0].id, b = s.videoTracks[0].clips[1].id;
+            return true;
+        }));
+        QVERIFY(win_->findChild<QAction*>("matchColourChart"));
+        state()->setSelection({a}, false);
+        // Found when the dialog opens; the outline dragged off it, the match falls apart; Find Chart puts it back.
+        QString first, after;
+        bool shown = false;
+        win_->chartDialogHook_ = [&](ChartMatchDialog* dlg) {
+            shown = true;
+            const TrackQuad found = dlg->quad();
+            QVERIFY(std::fabs(found.p[0].x - 120.0 / 640) < 0.02 && std::fabs(found.p[2].y - 280.0 / 360) < 0.03);
+            QVERIFY(dlg->fit().deltaEBefore > 5 && dlg->fit().deltaEAfter < 2);
+            first = dlg->findChild<QLabel*>("chartStatus")->text();
+            TrackQuad off = found;
+            for (auto& pt : off.p) pt.x += 0.25;
+            dlg->setQuad(off);
+            QVERIFY(dlg->fit().deltaEAfter > 3 || !dlg->fit().ok);
+            dlg->findChild<QPushButton*>("chartFind")->click();
+            QVERIFY(dlg->fit().deltaEAfter < 2);
+            after = dlg->findChild<QLabel*>("chartStatus")->text();
+            QMetaObject::invokeMethod(dlg, "accept", Qt::QueuedConnection);
+        };
+        QCOMPARE(win_->matchColourChart(), 1);
+        QVERIFY(shown);
+        QVERIFY2(first.contains("Delta E") && after.contains("Delta E"), qPrintable(first));
+        // One Chart Match, first in the clip's effects, one undo step; the other clip of the media untouched.
+        auto chartOn = [&](Id id) {
+            const Clip* c = edit::clipById(*state()->sequence(), id);
+            return c && !c->effects.empty() && c->effects.front().type == "chart_match";
+        };
+        QVERIFY(chartOn(a));
+        QVERIFY(!chartOn(b));
+        // The picture played: the patches as the chart has them.
+        {
+            const Sequence& s = *state()->sequence();
+            const Image img = renderProgramFrame(state()->project(), s, 10, RenderOptions{});
+            TrackQuad q;
+            q.p[0] = {120.0 / 640, 80.0 / 360}, q.p[1] = {420.0 / 640, 80.0 / 360}, q.p[2] = {420.0 / 640, 280.0 / 360}, q.p[3] = {120.0 / 640, 280.0 / 360};
+            const ChartColors got = sampleChart(img, q);
+            double worst = 0;
+            for (int i = 0; i < 24; ++i) worst = std::max(worst, deltaE76(got[size_t(i)], colorChecker24()[size_t(i)]));
+            QVERIFY2(worst < 4, qPrintable(QString::number(worst)));
+        }
+        state()->undo();
+        QVERIFY(!chartOn(a));
+        // Every clip of the media, when asked; cancelling changes nothing.
+        win_->chartDialogHook_ = [](ChartMatchDialog* dlg) {
+            dlg->findChild<QCheckBox*>("chartSameMedia")->setChecked(true);
+            QMetaObject::invokeMethod(dlg, "accept", Qt::QueuedConnection);
+        };
+        QCOMPARE(win_->matchColourChart(), 2);
+        QVERIFY(chartOn(a) && chartOn(b));
+        win_->chartDialogHook_ = [](ChartMatchDialog* dlg) { QMetaObject::invokeMethod(dlg, "reject", Qt::QueuedConnection); };
+        QCOMPARE(win_->matchColourChart(), 0);
+        win_->chartDialogHook_ = nullptr;
+        state()->newProject();
     }
 
     void reviewDrawingsAndVersions() {

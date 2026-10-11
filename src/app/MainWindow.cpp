@@ -128,6 +128,7 @@
 #include "MaskOverlay.h"
 #include "TransformOverlay.h"
 #include "ReviewOverlay.h"
+#include "ChartMatchDialog.h"
 #include "SequenceIndexPanel.h"
 #include "StackedTimelineWidget.h"
 #include "PanFollowDialog.h"
@@ -1144,6 +1145,7 @@ void MainWindow::buildMenus() {
     add(clipM, tr("Set Colour &Reference"), QKeySequence(), [this] { setColourReference(); })
         ->setObjectName(QStringLiteral("setColourReference"));
     add(clipM, tr("&Key Out Green / Blue Screen"), QKeySequence(), [this] { keyOutScreen(); })->setObjectName(QStringLiteral("keyScreen"));
+    add(clipM, tr("Match Colour Chart…"), QKeySequence(), [this] { matchColourChart(); })->setObjectName(QStringLiteral("matchColourChart"));
     add(clipM, tr("Match Colour to Reference"), QKeySequence("Ctrl+Alt+Shift+C"), [this] { matchColour(); })
         ->setObjectName(QStringLiteral("matchColour"));
     compareRef_ = add(clipM, tr("Compare with Reference"), QKeySequence(), [this] { setCompareWithReference(compareRef_->isChecked()); });
@@ -3873,6 +3875,48 @@ int MainWindow::matchColour() {
     }
     state_->message(tr("Matched %n clip(s) to %1", "", n).arg(colourRefName_), 5000);
     inspectorDock_->raise();
+    return n;
+}
+
+int MainWindow::matchColourChart() {
+    const Sequence* s = state_->sequence();
+    if (!s) return 0;
+    // The selected picture clip, else the top one at the playhead.
+    const FrameTime at = state_->playhead();
+    const Clip* clip = nullptr;
+    for (Id id : state_->selectedClips())
+        if (auto loc = edit::locate(*s, id); loc && loc->track.kind == TrackKind::Video) {
+            clip = edit::clipById(*s, id);
+            break;
+        }
+    for (auto t = s->videoTracks.rbegin(); !clip && t != s->videoTracks.rend(); ++t)
+        for (const Clip& c : t->clips)
+            if (c.mediaId && c.contains(at)) {
+                clip = &c;
+                break;
+            }
+    const Image frame = clip ? chartFrame(state_->project(), *s, *clip, at) : Image{};
+    if (frame.empty()) {
+        state_->message(tr("Select the clip showing the colour chart (or park on it)"));
+        return 0;
+    }
+    const Id clipId = clip->id;
+    ChartMatchDialog dlg(frame, QString::fromStdString(clip->name), this);
+    if (chartDialogHook_) chartDialogHook_(&dlg);
+    if (dlg.exec() != QDialog::Accepted) return 0;
+    const ChartFit fit = dlg.fit();
+    if (!fit.ok) {
+        state_->message(tr("The chart could not be matched: put its outline on the patches"), 5000);
+        return 0;
+    }
+    int n = 0;
+    const bool all = dlg.sameMedia();
+    state_->edit(tr("Match Colour Chart"), [&](Project& p, Sequence& sq) {
+        n = applyChartMatchToClips(p, sq, all ? clipsOfSameMedia(sq, clipId) : std::vector<Id>{clipId}, fit);
+        return n > 0;
+    });
+    if (n)
+        state_->message(tr("Chart matched on %n clip(s): delta E %1 as shot, %2 now", "", n).arg(fit.deltaEBefore, 0, 'f', 1).arg(fit.deltaEAfter, 0, 'f', 1), 6000);
     return n;
 }
 

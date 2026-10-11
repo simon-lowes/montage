@@ -30,6 +30,7 @@
 #include "core/GraphicsTemplate.h"
 #include "core/Storyboard.h"
 #include "render/ExtendClip.h"
+#include "render/ColorChart.h"
 #include "render/ReviewExport.h"
 #include "render/RoomTone.h"
 #include "render/Versions.h"
@@ -6096,6 +6097,52 @@ void McpServer::Impl::addTools() {
             if (n == 0) return fail("None of the clips has a picture to match");
             save(l);
             return ok(QStringLiteral("Matched %1 clip(s) to the picture at %2").arg(n).arg(tc(at, s)), QJsonObject{{"matched", n}});
+        });
+
+    add("montage_match_chart", "Match a colour chart",
+        "Colour-chart calibration (Resolve's Color Match): finds an X-Rite ColorChecker Classic (24 patches) in a clip's "
+        "picture at `at` (or its middle frame), upright, upside down or on its side, or uses `corners` (the patch area's "
+        "four corners in fractions of the frame, the chart's top left first, by Dark Skin, then clockwise), measures its "
+        "patches and puts a Chart Match first in the clip's effects (a colour matrix in linear light) that brings them to "
+        "the chart's published values. `same_media` grades every clip of the same media too. Returns the corners and "
+        "the patches' mean CIE76 delta E before and after (under 2 is a close match). `measure_only` changes nothing.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":["number","string"],"description":"Clip id or name"},
+            "at":{"type":["number","string"],"description":"Timeline time of the frame showing the chart"},
+            "corners":{"type":"array","items":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},"minItems":4,"maxItems":4},
+            "same_media":{"type":"boolean","default":false},"measure_only":{"type":"boolean","default":false}},
+            "required":["project","clip"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const Clip clip = clipArg(l, a);
+            const FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : clip.start + clip.duration / 2;
+            const Image frame = chartFrame(l.project, s, clip, at);
+            if (frame.empty()) return fail("The clip has no picture to read a chart from");
+            TrackQuad q;
+            double residual = 0;
+            if (a.contains("corners")) {
+                const QJsonArray cs = a.value("corners").toArray();
+                if (cs.size() != 4) throw ArgError{"\"corners\" is four [x, y] pairs"};
+                for (int i = 0; i < 4; ++i) {
+                    const QJsonArray pt = cs[i].toArray();
+                    if (pt.size() != 2 || !pt[0].isDouble() || !pt[1].isDouble()) throw ArgError{"\"corners\" is four [x, y] pairs"};
+                    q.p[i] = {pt[0].toDouble(), pt[1].toDouble()};
+                }
+            } else if (!detectChart(frame, q, &residual)) {
+                return fail("No ColorChecker chart found in the picture: give its corners");
+            }
+            const ChartFit fit = fitChart(sampleChart(frame, q));
+            if (!fit.ok) return fail("The patches could not be matched (are the corners on the chart?)");
+            QJsonArray corners;
+            for (const Point2& p : q.p) corners.append(QJsonArray{std::round(p.x * 1e4) / 1e4, std::round(p.y * 1e4) / 1e4});
+            QJsonObject out{{"corners", corners}, {"delta_e_before", std::round(fit.deltaEBefore * 100) / 100},
+                            {"delta_e_after", std::round(fit.deltaEAfter * 100) / 100}, {"delta_e_worst", std::round(fit.deltaEMax * 100) / 100}};
+            if (a.value("measure_only").toBool()) return ok(QStringLiteral("Chart measured: delta E %1 now, %2 once matched").arg(fit.deltaEBefore, 0, 'f', 1).arg(fit.deltaEAfter, 0, 'f', 1), out);
+            const std::vector<Id> clips = a.value("same_media").toBool() ? clipsOfSameMedia(s, clip.id) : std::vector<Id>{clip.id};
+            const int n = applyChartMatchToClips(l.project, s, clips, fit);
+            save(l);
+            out["clips"] = n;
+            return ok(QStringLiteral("Matched the chart on %1 clip(s): delta E %2 before, %3 after").arg(n).arg(fit.deltaEBefore, 0, 'f', 1).arg(fit.deltaEAfter, 0, 'f', 1), out);
         });
 
     add("montage_auto_reframe", "Auto reframe for another shape",

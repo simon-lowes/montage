@@ -105,6 +105,10 @@ public:
     void setColourReference();
     bool hasColourReference() const { return !colourRef_.empty(); }
     int matchColour();
+    // Clip › Match Colour Chart…: the selected clip's (or the one at the playhead's) chart matched; how many clips
+    // took the match. (Tests: chartDialogHook_ gets the dialog before it runs.)
+    int matchColourChart();
+    std::function<void(class ChartMatchDialog*)> chartDialogHook_;
     // Split-screen compare in the Program monitor: the reference beside the current frame.
     void setCompareWithReference(bool on);
     void scriptCutDialog();  // Sequence › Build Cut from Script…
