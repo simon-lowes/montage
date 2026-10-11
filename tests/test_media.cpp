@@ -15562,32 +15562,45 @@ private slots:
                 crossings += (longer[i - 1] < 0) != (longer[i] < 0);
             const double hz = crossings / 2.0 / (double(longer.size()) / kCloneSampleRate - 0.2);
             QVERIFY2(std::abs(hz - 220) < 15, qPrintable(QString::number(hz)));  // the pitch kept
-            QVERIFY(writeClonedSpeechWav(path("note.wav"), trimmed, "Generated speech in a voice cloned from a test"));
+            const std::string named = path("S\u00e9quence \u00e9t\u00e9.wav");  // (a non-ASCII name opens on Windows too)
+            QVERIFY(writeClonedSpeechWav(named, trimmed, "Generated speech in a voice cloned from a test"));
             MediaItem m;
-            QVERIFY(probeMedia(path("note.wav"), m));
+            QVERIFY(probeMedia(named, m));
             QVERIFY(std::abs(m.duration - 1.0) < 0.06);
-            QFile f(QString::fromStdString(path("note.wav")));
-            QVERIFY(f.open(QIODevice::ReadOnly) && f.readAll().contains("cloned from a test"));
+            QCOMPARE(m.metadata["comment"], std::string("Generated speech in a voice cloned from a test"));  // read back
+        }
+        // Japanese is read from kana: kanji are refused before any model.
+        if (voiceCloneAvailable()) {
+            CloneOptions ja;
+            ja.language = "ja";
+            std::vector<float> none;
+            std::string why;
+            QVERIFY(!cloneSpeech("\u4eca\u65e5\u306f\u3044\u3044\u5929\u6c17\u3067\u3059\u306d", std::vector<float>(48000, 0.1f), 24000, ja, none, &why));
+            QVERIFY2(why.find("kana") != std::string::npos, why.c_str());
         }
         // Korean as jamo, before any model.
         CloneTokenizer bare;
         QCOMPARE(QString::fromStdString(bare.prepare("한국", "ko")), QString::fromUtf8("[ko]한국"));
-        QCOMPARE(bare.prepare("Hola", "es"), std::string("[es]Hola"));
+        QCOMPARE(bare.prepare("Hola", "es"), std::string("[es]hola"));  // (lower case, as the model reads it)
 
         const ModelPack& pack = voiceCloneModel();
         if (!voiceCloneAvailable() || !pack.installed()) QSKIP("Set MONTAGE_VOICE_CLONE_MODEL to the Chatterbox Multilingual ONNX files to run the rest");
         // The tokenizer gives what Hugging Face's does with the model's tokenizer.json.
         CloneTokenizer tok;
         QVERIFY(tok.load(pack.directory() + "/tokenizer.json", pack.directory() + "/Cangjie5_TC.json"));
+        // (Lower case and NFKD first, as Chatterbox's own tokenizer prepares text.)
         QCOMPARE(tok.encode("Hello world, this is a test.", "en"),
-                 (std::vector<int64_t>{6563, 255, 708, 284, 18, 84, 28, 2, 179, 79, 7, 2, 147, 2, 54, 2, 14, 2, 33, 218, 9, 0, 6561, 6561}));
+                 (std::vector<int64_t>{6563, 255, 708, 62, 84, 28, 2, 179, 79, 7, 2, 147, 2, 54, 2, 14, 2, 33, 218, 9, 0, 6561, 6561}));
         QCOMPARE(tok.encode("Bonjour, ça va? Très bien!", "fr"),
-                 (std::vector<int64_t>{6563, 255, 634, 278, 47, 23, 160, 7, 2, 400, 14, 2, 35, 14, 13, 2, 296, 31, 401, 32, 2, 15, 22, 50, 3, 0, 6561, 6561}));
-        QCOMPARE(tok.encode("Größe über Straße.", "de"),
-                 (std::vector<int64_t>{6563, 255, 636, 283, 31, 415, 392, 18, 2, 421, 15, 44, 2, 295, 144, 14, 392, 18, 9, 0, 6561, 6561}));
+                 (std::vector<int64_t>{6563, 255, 634, 15, 47, 23, 160, 7, 2, 16, 766, 14, 2, 35, 14, 13, 2, 33, 46, 768, 32, 2, 15, 22, 50, 3, 0, 6561, 6561}));
+        QCOMPARE(tok.encode("Größe ÜBER Straße.", "de"),
+                 (std::vector<int64_t>{6563, 255, 636, 20, 89, 762, 392, 18, 2, 34, 762, 15, 44, 2, 63, 31, 14, 392, 18, 9, 0, 6561, 6561}));
         QCOMPARE(tok.encode("It's 10,5 km — honestly.", "en"),
-                 (std::vector<int64_t>{6563, 255, 708, 285, 33, 4, 32, 2, 264, 263, 7, 268, 2, 24, 26, 2, 317, 2, 21, 47, 218, 70, 9, 0, 6561, 6561}));
+                 (std::vector<int64_t>{6563, 255, 708, 60, 4, 32, 2, 264, 263, 7, 268, 2, 24, 26, 2, 317, 2, 21, 47, 218, 70, 9, 0, 6561, 6561}));
         QCOMPARE(tok.encode("한국", "ko"), (std::vector<int64_t>{6563, 255, 724, 1801, 1880, 1954, 1783, 1893, 1951, 0, 6561, 6561}));
+        // Japanese kana, voiced ones as their kana and mark.
+        QCOMPARE(tok.encode("こんにちは、ざぶとん。", "ja"),
+                 (std::vector<int64_t>{6563, 255, 723, 2164, 2208, 2177, 2171, 2181, 2118, 2165, 2160, 2184, 2160, 2175, 2208, 2119, 0, 6561, 6561}));
         // Chinese as Cangjie codes ("你" is ONF).
         QVERIFY2(tok.prepare("你", "zh").rfind("[zh][cj_o][cj_n][cj_f][cj_.]", 0) == 0, tok.prepare("你", "zh").c_str());
         // Speech in the sample voice that comes with the model.
@@ -15640,6 +15653,16 @@ private slots:
         QVERIFY(cloneSpeechToFit("Hello, this is a test.", ref, kCloneSampleRate, {}, 1, 2.0, true, fitted, &err));
         const double exact = double(fitted.size()) / kCloneSampleRate;
         QVERIFY2(exact > 1.0 && exact < 2.05, qPrintable(QString::number(exact)));
+        // Too long for the room even 1.6 times as fast: refused (it would run over what follows).
+        QVERIFY(!cloneSpeechToFit("Hello, this is a test of a sentence that is far too long for half a second.", ref, kCloneSampleRate, {}, 1,
+                                  0.5, true, fitted, &err));
+        QVERIFY2(err.find("1.6 times") != std::string::npos, err.c_str());
+        // Asked for twice the speed, a line short of room stays twice as fast (not slowed to 1.6).
+        std::vector<float> twice, cramped;
+        QVERIFY(cloneSpeechToFit("Hello, this is a test.", ref, kCloneSampleRate, {}, 2, 0, false, twice, &err));
+        QVERIFY(cloneSpeechToFit("Hello, this is a test.", ref, kCloneSampleRate, {}, 2, 0.3, false, cramped, &err));
+        QVERIFY2(cramped.size() <= twice.size() + size_t(kCloneSampleRate) / 20,
+                 qPrintable(QString("%1 %2").arg(cramped.size()).arg(twice.size())));
 
         // Through MCP: refused without consent; in place of what is said (the voice heard there), and from a file.
         Project p = makeDefaultProject();

@@ -184,16 +184,20 @@ std::vector<Id> generateSpeech(EditorState* state, const std::vector<SpeechLine>
     for (const QString& p : paths) files << p;
     const std::vector<Id> media = state->importFiles(files, nullptr, QStringLiteral("Voiceover"));
     if (media.size() != lines.size()) return {};
-    std::vector<Id> created;
-    state->apply(QObject::tr("Generate Voiceover"), [&](Project& p, Sequence& sq) {
-        edit::Result all;
-        // Generated, and from whose voice: in the bin as in the files.
-        if (clone)
+    // Generated, and from whose voice: noted on the media as it comes in (the import's own undo step), so undoing or
+    // failing to place it leaves the bin's copy labelled too.
+    if (clone)
+        state->amend([&](Project& p, Sequence&) {
             for (const Id id : media)
                 if (MediaItem* m = p.findMedia(id)) {
                     m->metadata["comment"] = note;
                     if (std::find(m->keywords.begin(), m->keywords.end(), "AI voice") == m->keywords.end()) m->keywords.push_back("AI voice");
                 }
+            return true;
+        });
+    std::vector<Id> created;
+    state->apply(QObject::tr("Generate Voiceover"), [&](Project& p, Sequence& sq) {
+        edit::Result all;
         if (sq.audioTracks.empty() || track < 0) edit::addTrack(p, sq, TrackKind::Audio);
         const TrackRef a{TrackKind::Audio, track < 0 ? int(sq.audioTracks.size()) - 1 : std::clamp(track, 0, int(sq.audioTracks.size()) - 1)};
         for (size_t i = 0; i < lines.size(); ++i) {

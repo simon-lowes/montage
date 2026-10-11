@@ -561,7 +561,8 @@ void CaptionsPanel::dubDialog() {
     std::vector<const CloneLanguage*> cloneTargets;
     if (voiceCloneAvailable())
         for (const CloneLanguage& l : voiceCloneLanguages())
-            if (l.code == from || !translationRoute(from, l.code).empty()) cloneTargets.push_back(&l);
+            // (Not Japanese: translations come in kanji, and the voice model reads Japanese in kana.)
+            if (std::string(l.code) != "ja" && (l.code == from || !translationRoute(from, l.code).empty())) cloneTargets.push_back(&l);
     const auto toEnglish = from == "en" ? std::vector<const ModelPack*>{} : translationRoute(from, "en");
     if (from != "en" && toEnglish.empty() && cloneTargets.empty()) {
         state_->message(tr("There is no translation from %1 to English").arg(QString::fromStdString(translationLanguageName(from))));

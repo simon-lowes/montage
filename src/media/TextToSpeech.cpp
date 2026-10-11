@@ -109,21 +109,20 @@ bool textToPhonemes(const std::string& text, bool british, std::string& out, std
 }
 
 bool writeSpeechWav(const std::string& path, const std::vector<float>& samples, std::string* error) {
-    std::ofstream f(path, std::ios::binary);
-    if (!f) {
+    QByteArray b;
+    auto u32 = [&](uint32_t v) { b.append(reinterpret_cast<const char*>(&v), 4); };
+    auto u16 = [&](uint16_t v) { b.append(reinterpret_cast<const char*>(&v), 2); };
+    const uint32_t bytes = uint32_t(samples.size() * 2);
+    b.append("RIFF", 4), u32(36 + bytes), b.append("WAVEfmt ", 8), u32(16), u16(1), u16(1), u32(kTtsSampleRate), u32(kTtsSampleRate * 2), u16(2),
+        u16(16), b.append("data", 4), u32(bytes);
+    for (float s : samples) u16(uint16_t(int16_t(std::lround(std::clamp(s, -1.0f, 1.0f) * 32767))));
+    // Through QFile: a UTF-8 path opens on Windows too.
+    QFile f(QString::fromStdString(path));
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate) || f.write(b) != b.size()) {
         if (error) *error = "Cannot write " + path;
         return false;
     }
-    auto u32 = [&](uint32_t v) { f.write(reinterpret_cast<const char*>(&v), 4); };
-    auto u16 = [&](uint16_t v) { f.write(reinterpret_cast<const char*>(&v), 2); };
-    const uint32_t bytes = uint32_t(samples.size() * 2);
-    f.write("RIFF", 4), u32(36 + bytes), f.write("WAVEfmt ", 8), u32(16), u16(1), u16(1), u32(kTtsSampleRate), u32(kTtsSampleRate * 2), u16(2),
-        u16(16), f.write("data", 4), u32(bytes);
-    for (float s : samples) {
-        const int16_t v = int16_t(std::lround(std::clamp(s, -1.0f, 1.0f) * 32767));
-        f.write(reinterpret_cast<const char*>(&v), 2);
-    }
-    return bool(f);
+    return true;
 }
 
 #ifndef MONTAGE_WITH_ONNXRUNTIME

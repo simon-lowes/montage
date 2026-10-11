@@ -5573,8 +5573,13 @@ private slots:
         QFile wav(QString::fromStdString(m->path));
         QVERIFY(wav.open(QIODevice::ReadOnly));
         QVERIFY(wav.readAll().contains("Generated speech"));  // the note in the file itself
+        const Id generated = m->id;
         state()->undo();
         QVERIFY(!edit::clipById(*state()->sequence(), clips[0]));
+        // The bin's copy stays labelled: the note came with its import.
+        const MediaItem* left = state()->project().findMedia(generated);
+        QVERIFY(left && left->metadata.count("comment"));
+        QVERIFY(std::find(left->keywords.begin(), left->keywords.end(), "AI voice") != left->keywords.end());
     }
 
     void peopleMaskOffersItsModel() {

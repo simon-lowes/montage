@@ -462,6 +462,9 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         FieldRecording rec;
         if (readFieldRecording(path, rec)) applyFieldRecording(rec, m);
     }
+    // Otherwise the container's comment (a WAV's INFO comment: what generated speech says about itself).
+    if (!m.metadata.count("comment"))
+        if (const std::string c = tag("comment"); !c.empty()) m.metadata["comment"] = c;
     avformat_close_input(&fmt);
     out = m;
     return true;

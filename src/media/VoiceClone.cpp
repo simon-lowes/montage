@@ -9,21 +9,20 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
-#include <fstream>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <thread>
 
+#include "MediaPool.h"
+#include "audio/TimeStretch.h"
 #ifdef MONTAGE_WITH_ONNXRUNTIME
 #if __has_include(<onnxruntime_cxx_api.h>)
 #include <onnxruntime_cxx_api.h>
 #else
 #include <onnxruntime/onnxruntime_cxx_api.h>
 #endif
-#include "MediaPool.h"
 #include "OrtSupport.h"
-#include "audio/TimeStretch.h"
 #endif
 
 namespace montage {
@@ -181,7 +180,9 @@ std::string CloneTokenizer::prepare(const std::string& text, const std::string& 
         const char32_t c = char32_t(cp);
         out += QString::fromUcs4(&c, 1);
     };
-    const QString in = QString::fromStdString(text);
+    // As the model was trained (Chatterbox's MTLTokenizer): lower case, then NFKD (accents and Japanese voicing marks
+    // apart, as the vocabulary holds them).
+    const QString in = QString::fromStdString(text).toLower().normalized(QString::NormalizationForm_KD);
     if (language == "ko") {
         // Hangul syllables as their jamo (lead, vowel, tail).
         for (const uint cp : in.toUcs4()) {
@@ -454,22 +455,28 @@ bool cloneSpeechToFit(const std::string& text, const std::vector<float>& referen
     const double said = double(out.size()) / kCloneSampleRate;
     if (said <= 0) return true;
     double factor = 1 / std::clamp(speed, 0.5, 2.0);  // length, not speed
-    if (exact && room > 0)
-        factor = std::clamp(room / said, 0.7, 1.4);
-    else if (room > 0 && said * factor > room * 1.02)
-        factor = std::max(1 / 1.6, room / said);
+    if (exact && room > 0) {
+        // Filling the room: within 1.6 times as fast and 1.4 times as slow. Longer than that would run over what follows.
+        factor = std::clamp(room / said, 1 / 1.6, 1.4);
+        if (said * factor > room * 1.03) {
+            if (error)
+                *error = QStringLiteral("The words take %1 s to say even 1.6 times as fast, more than the %2 s they replace")
+                             .arg(said * factor, 0, 'f', 1)
+                             .arg(room, 0, 'f', 1)
+                             .toStdString();
+            out.clear();
+            return false;
+        }
+    } else if (room > 0 && said * factor > room * 1.02)
+        factor = std::min(factor, std::max(1 / 1.6, room / said));
     out = stretchSpeech(out, kCloneSampleRate, factor);
     return true;
 }
 
 bool writeClonedSpeechWav(const std::string& path, const std::vector<float>& samples, const std::string& note, std::string* error) {
-    std::ofstream f(path, std::ios::binary);
-    if (!f) {
-        if (error) *error = "Cannot write " + path;
-        return false;
-    }
-    auto u32 = [&](uint32_t v) { f.write(reinterpret_cast<const char*>(&v), 4); };
-    auto u16 = [&](uint16_t v) { f.write(reinterpret_cast<const char*>(&v), 2); };
+    QByteArray b;
+    auto u32 = [&](uint32_t v) { b.append(reinterpret_cast<const char*>(&v), 4); };
+    auto u16 = [&](uint16_t v) { b.append(reinterpret_cast<const char*>(&v), 2); };
     // LIST/INFO: ICMT (the note) and ISFT (what made it), each NUL-terminated and padded to an even size.
     auto info = [](const char* id, const std::string& text) {
         std::string t = text + '\0';
@@ -481,16 +488,18 @@ bool writeClonedSpeechWav(const std::string& path, const std::vector<float>& sam
     };
     const std::string list = "INFO" + info("ICMT", note) + info("ISFT", "Montage (Chatterbox Multilingual voice cloning)");
     const uint32_t bytes = uint32_t(samples.size() * 2);
-    f.write("RIFF", 4), u32(uint32_t(4 + 24 + 8 + list.size() + 8 + bytes)), f.write("WAVEfmt ", 8), u32(16), u16(1), u16(1),
+    b.append("RIFF", 4), u32(uint32_t(4 + 24 + 8 + list.size() + 8 + bytes)), b.append("WAVEfmt ", 8), u32(16), u16(1), u16(1),
         u32(kCloneSampleRate), u32(kCloneSampleRate * 2), u16(2), u16(16);
-    f.write("LIST", 4), u32(uint32_t(list.size())), f.write(list.data(), std::streamsize(list.size()));
-    f.write("data", 4), u32(bytes);
-    for (const float s : samples) {
-        const int16_t v = int16_t(std::lround(std::clamp(s, -1.0f, 1.0f) * 32767));
-        f.write(reinterpret_cast<const char*>(&v), 2);
+    b.append("LIST", 4), u32(uint32_t(list.size())), b.append(list.data(), qsizetype(list.size()));
+    b.append("data", 4), u32(bytes);
+    for (const float s : samples) u16(uint16_t(int16_t(std::lround(std::clamp(s, -1.0f, 1.0f) * 32767))));
+    // Through QFile: a UTF-8 path opens on Windows too.
+    QFile f(QString::fromStdString(path));
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate) || f.write(b) != b.size()) {
+        if (error) *error = "Cannot write " + path;
+        return false;
     }
-    if (!f && error) *error = "Cannot write " + path;
-    return bool(f);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -588,6 +597,14 @@ bool cloneSpeech(const std::string& text, const std::vector<float>& reference, i
         if (error) *error = "Nothing to say";
         return false;
     }
+    if (std::string(lang->code) == "ja") {
+        // The model reads Japanese in kana; its vocabulary has no kanji (Chatterbox converts them with pykakasi).
+        for (const uint cp : QString::fromStdString(said).toUcs4())
+            if ((cp >= 0x4E00 && cp <= 0x9FFF) || (cp >= 0x3400 && cp <= 0x4DBF) || (cp >= 0xF900 && cp <= 0xFAFF)) {
+                if (error) *error = "Japanese is spoken from kana: write the text in hiragana or katakana (the voice model cannot read kanji)";
+                return false;
+            }
+    }
     std::vector<float> ref = cloneReference(reference, referenceRate);
     if (ref.size() < size_t(kCloneSampleRate)) {
         if (error) *error = "The voice sample is too short: it needs at least a second of speech (5 to 10 is best)";
@@ -636,7 +653,10 @@ bool cloneSpeech(const std::string& text, const std::vector<float>& reference, i
         std::vector<const char*> lmIn, lmOut;
         for (const std::string& n : model->lmInputs) lmIn.push_back(n.c_str());
         for (const std::string& n : model->lmOutputs) lmOut.push_back(n.c_str());
-        const std::vector<std::string> pieces = splitCloneText(said);
+        // Syllabic scripts say more per character: longer to speak, so shorter pieces and more room for each.
+        const std::string code = lang->code;
+        const int perChar = code == "zh" ? 10 : code == "ko" ? 8 : code == "ja" ? 6 : 4;
+        const std::vector<std::string> pieces = splitCloneText(said, perChar > 4 ? 90 : 260);
         for (size_t n = 0; n < pieces.size(); ++n) {
             if (cancelled()) return false;
             std::vector<int64_t> ids = model->tokenizer.encode(pieces[n], lang->code);
@@ -653,7 +673,7 @@ bool cloneSpeech(const std::string& text, const std::vector<float>& reference, i
             std::vector<int64_t> spoken{kStartSpeech};
             std::set<int64_t> seen{kStartSpeech};
             // About 25 tokens a second of speech: room for slow speech, and a stop if the model never ends.
-            const int most = std::min(1000, 80 + 4 * int(QString::fromStdString(pieces[n]).size()));
+            const int most = std::min(1000, 80 + perChar * int(QString::fromStdString(pieces[n]).size()));
             for (int i = 0; i < most; ++i) {
                 if (cancelled()) return false;
                 const int64_t embShape3[3] = {1, int64_t(step.size() / dim), int64_t(dim)};
