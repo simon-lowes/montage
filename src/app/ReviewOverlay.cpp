@@ -32,7 +32,8 @@ std::vector<ReviewStroke> ReviewOverlay::strokesNow() const {
     const FrameTime at = s->playhead;
     for (const Marker& m : s->markers) {
         if (m.drawing.empty()) continue;
-        if (m.duration > 1 ? (at < m.t || at >= m.t + m.duration) : at != m.t) continue;
+        const FrameTime from = m.drawingFrame();  // (where it was drawn, when the marker had to sit beside it)
+        if (m.duration > 1 ? (at < from || at >= from + m.duration) : at != from) continue;
         for (ReviewStroke& st : parseReviewDrawing(m.drawing)) out.push_back(std::move(st));
     }
     return out;

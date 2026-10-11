@@ -25,9 +25,12 @@ std::string markersToResolveEdl(const Sequence& s);
 bool parseMarkerList(const std::string& text, const Sequence& s, std::vector<Marker>& out, std::string* error = nullptr);
 
 // Markers read from a list into the sequence. One from a review note brings the marker made from the same note before
-// up to date (its name, comment, colour, length and drawing; where the editor moved it is kept); a new one goes to its
-// frame, or, when a marker is there already, to the next free frame after it (so two reviewers' notes on one frame,
-// and the editor's own markers, are all kept). Other markers replace any at their frame, as edit::addMarker does.
+// up to date (a marker imported before notes kept ids counts when it is at the same frame, by the same reviewer,
+// saying the same): replies from both, the status set later, its length and drawing; where the editor put it and its
+// colour are kept. A new one goes to its frame, or, when a marker is there already, to the nearest free frame (after
+// it first, inside the cut), its drawing kept to the frame it was drawn on (Marker::drawnAt), so two reviewers'
+// notes on one frame and the editor's own markers are all kept. Other markers replace any at their frame, as
+// edit::addMarker does.
 struct MarkerImport {
     int added = 0, updated = 0;
 };

@@ -4490,6 +4490,16 @@ private slots:
         QCOMPARE(overlay->strokesNow().size(), size_t(1));
         state()->setPlayhead(15);
         QVERIFY(overlay->strokesNow().empty());
+        // A note that had to sit beside its frame shows its drawing on the frame it was drawn on.
+        QVERIFY(state()->edit("Move", [&](Project&, Sequence& s) {
+            for (Marker& x : s.markers)
+                if (x.reviewId == "x1") x.duration = 0, x.t = 12, x.drawnAt = 10;
+            return true;
+        }));
+        state()->setPlayhead(10);
+        QCOMPARE(overlay->strokesNow().size(), size_t(1));
+        state()->setPlayhead(12);
+        QVERIFY(overlay->strokesNow().empty());
 
         // A copy sent again to the same folder is version 2, and its page compares with version 1.
         const QString name = QString::fromStdString(state()->sequence()->name);

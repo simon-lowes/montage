@@ -74,6 +74,7 @@ struct ReviewNote {
     std::string status = "open";  // open, progress, done
     int version = 0;              // the review copy it was written on (0: not said)
     std::string id;               // the page's id for it
+    std::string statusAt;         // when its status was last set (ISO 8601; "" not said)
     std::vector<ReviewReply> replies;
     std::string drawing;  // reviewDrawingJson ("" none)
 };

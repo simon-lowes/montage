@@ -5716,20 +5716,24 @@ private slots:
         QCOMPARE(dm[1].comment, std::string("(a drawing)"));
         QCOMPARE(dm[2].name, std::string("\xE2\x9C\x93 Ana \xC2\xB7 v2"));
 
-        // Into the sequence: notes never replace a marker (the editor's at 20 stays; both notes on 20 move along),
-        // and imported again they bring their markers up to date, where the editor moved them.
+        // Into the sequence: notes never replace a marker (the editor's at 20 stays; both notes on 20 go to the nearest
+        // free frames, their drawings kept to frame 20), and imported again they bring their markers up to date.
         Sequence seq = s;
         seq.markers = {Marker{20, 0, "Editor's", "", 3, false}};
         MarkerImport mi = addImportedMarkers(seq, dm);
         QCOMPARE(mi.added, 3);
         QCOMPARE(mi.updated, 0);
         QCOMPARE(seq.markers.size(), size_t(4));
-        QCOMPARE(seq.markers[0].name, std::string("Editor's"));
-        QCOMPARE(seq.markers[1].reviewId, std::string("a1"));
-        QCOMPARE(seq.markers[1].t, FrameTime(21));
-        QCOMPARE(seq.markers[2].reviewId, std::string("a2"));
-        QCOMPARE(seq.markers[2].t, FrameTime(22));
+        QCOMPARE(seq.markers[0].reviewId, std::string("a2"));
+        QCOMPARE(seq.markers[0].t, FrameTime(19));  // (21 was taken by then: the frame before)
+        QCOMPARE(seq.markers[0].drawingFrame(), FrameTime(20));
+        QCOMPARE(seq.markers[1].name, std::string("Editor's"));
+        QCOMPARE(seq.markers[2].reviewId, std::string("a1"));
+        QCOMPARE(seq.markers[2].t, FrameTime(21));
+        QCOMPARE(seq.markers[2].drawnAt, FrameTime(20));
+        QCOMPARE(seq.markers[3].drawnAt, FrameTime(-1));  // at its own frame
         seq.markers[3].t = 120;  // moved by the editor
+        seq.markers[3].color = 2;  // and recoloured
         std::vector<ReviewNote> later = drawn;
         later[2].status = "open", later[2].done = false;
         later[2].replies.push_back({"Sam", "Reopened", ""});
@@ -5739,12 +5743,48 @@ private slots:
         QCOMPARE(seq.markers.size(), size_t(4));
         const auto a3 = std::find_if(seq.markers.begin(), seq.markers.end(), [](const Marker& m) { return m.reviewId == "a3"; });
         QCOMPARE(a3->t, FrameTime(120));
+        QCOMPARE(a3->color, 2);
         QCOMPARE(a3->name, std::string("Ana \xC2\xB7 v2"));
         QVERIFY(a3->comment.find("Reopened") != std::string::npos);
+        // Replies from two reviewers' copies both stay; a status set earlier does not undo one set later.
+        {
+            Sequence two = s;
+            two.markers.clear();
+            ReviewNote n;
+            n.frame = 40, n.author = "Ana", n.text = "Tighter", n.id = "t1", n.status = "done", n.done = true, n.statusAt = "2026-10-02T10:00:00Z";
+            n.replies = {{"Bo", "Agreed", ""}};
+            addImportedMarkers(two, reviewNotesToMarkers({n}));
+            ReviewNote old = n;
+            old.status = "open", old.done = false, old.statusAt = "2026-10-01T10:00:00Z";
+            old.replies = {{"Cy", "Why?", ""}};
+            QCOMPARE(addImportedMarkers(two, reviewNotesToMarkers({old})).updated, 1);
+            QCOMPARE(two.markers.size(), size_t(1));
+            QCOMPARE(two.markers[0].name, std::string("\xE2\x9C\x93 Ana"));
+            QCOMPARE(two.markers[0].comment, std::string("Tighter\n\xE2\x86\xB3 Bo: Agreed\n\xE2\x86\xB3 Cy: Why?"));
+            ReviewNote newer = old;
+            newer.statusAt = "2026-10-03T10:00:00Z";
+            addImportedMarkers(two, reviewNotesToMarkers({newer}));
+            QCOMPARE(two.markers[0].name, std::string("Ana"));  // reopened later
+            QCOMPARE(two.markers[0].reviewStatusAt, std::string("2026-10-03T10:00:00Z"));
+            // A marker imported before notes kept ids: the same note, not a second marker.
+            Sequence before = s;
+            before.markers = {Marker{90, 0, "\xE2\x9C\x93 Ana", "Old style", 7, false}};
+            QCOMPARE(addImportedMarkers(before, {dm[2]}).updated, 1);
+            QCOMPARE(before.markers.size(), size_t(1));
+            QCOMPARE(before.markers[0].reviewId, std::string("a3"));
+            // A note at the cut's last frame, taken: the frame before (not past the end).
+            Sequence end = s;
+            end.markers = {Marker{249, 0, "Last", "", 0, false}};
+            ReviewNote last;
+            last.frame = 249, last.author = "Bo", last.text = "End", last.id = "e1";
+            addImportedMarkers(end, reviewNotesToMarkers({last}));
+            QCOMPARE(end.markers[0].t, FrameTime(248));
+        }
         // Markers without an id replace any at their frame, as before.
         mi = addImportedMarkers(seq, {Marker{20, 0, "CSV", "", 0, false}});
         QCOMPARE(mi.added, 1);
-        QCOMPARE(seq.markers[0].name, std::string("CSV"));
+        QCOMPARE(seq.markers[1].t, FrameTime(20));
+        QCOMPARE(seq.markers[1].name, std::string("CSV"));  // (the editor's marker at 20 replaced)
 
         // The page: its version, the version it compares with, and the editor's drawings; read back from its HTML.
         info.version = 3;
@@ -5760,6 +5800,14 @@ private slots:
         QVERIFY(page3.find("\"previous\":{\"fps\":[25,1],\"frames\":200,\"offset\":10,\"version\":2,\"video\":\"Cut - Review v2.mp4\"}") != std::string::npos);
         QVERIFY(page3.find("\"drawing\":[{\"color\":\"#34c759\"") != std::string::npos);
         QVERIFY(!readReviewPage("<html><script type=\"application/json\" id=\"review-config\">{}</script></html>"));
+        QVERIFY(page3.find("\"drawnAt\":20") != std::string::npos);  // (the editor's drawing at its own frame)
+        // A title holding the page's own placeholders is written as it is (it once froze the export).
+        ReviewPageInfo odd = info;
+        odd.title = "@@TITLE@@ and @@CONFIG@@";
+        const std::string oddPage = reviewPageHtml(odd);
+        QVERIFY(oddPage.find("<title>@@TITLE@@ and @@CONFIG@@ - Review</title>") != std::string::npos);
+        const auto oddBack = readReviewPage(oddPage);
+        QVERIFY(oddBack && oddBack->title == odd.title);
 
         // Saved and loaded with the project.
         QTemporaryDir dir;

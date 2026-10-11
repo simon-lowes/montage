@@ -26,7 +26,9 @@ std::vector<int> reviewVersions(const Sequence& s, const std::string& folder) {
     const QString base = reviewBase(s);
     std::vector<int> out;
     const QDir dir(QString::fromStdString(folder));
-    for (const QString& f : dir.entryList({base + QStringLiteral("*.html")}, QDir::Files)) {
+    // (Every page listed and matched by name, case and all: a name's [ ] or * are not wildcards here.)
+    for (const QString& f : dir.entryList({QStringLiteral("*.html")}, QDir::Files)) {
+        if (!f.startsWith(base, Qt::CaseSensitive)) continue;
         const QString rest = f.mid(base.size(), f.size() - base.size() - 5);
         bool ok = true;
         const int v = rest.isEmpty() ? 1 : rest.startsWith(QStringLiteral(" v")) ? rest.mid(2).toInt(&ok) : 0;

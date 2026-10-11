@@ -14934,6 +14934,20 @@ private slots:
         QCOMPARE(reviewVersions(*back.active(), folder.toStdString()), (std::vector<int>{1, 2, 3}));
         r = call("montage_export_review", {{"project", project}, {"folder", folder}, {"version", 0}});
         QVERIFY(r.value("isError").toBool() || r.isEmpty());
+        // A name with [ ] (not a wildcard here) and another case are told apart.
+        {
+            Sequence promo = s;
+            promo.name = "Promo [final]";
+            const QString pf = QString::fromStdString(path("review-brackets"));
+            QDir(pf).removeRecursively();
+            QVERIFY(QDir().mkpath(pf));
+            for (const char* f : {"Promo [final] - Review.html", "Promo [final] - Review v4.html", "promo [final] - Review v7.html", "Promo [final] - Review vX.html"}) {
+                QFile page(pf + "/" + f);
+                QVERIFY(page.open(QIODevice::WriteOnly));
+            }
+            QCOMPARE(reviewVersions(promo, pf.toStdString()), (std::vector<int>{1, 4}));
+            QCOMPARE(reviewPackage(promo, pf.toStdString()).page.version, 5);
+        }
 
         // Notes with a drawing, replies and a status: the marker keeps the drawing and the note's id; a note on a frame
         // that has a marker goes to the next free one.
@@ -14953,6 +14967,7 @@ private slots:
         auto drawn = std::find_if(back.active()->markers.begin(), back.active()->markers.end(), [](const Marker& m) { return m.reviewId == "n1"; });
         QVERIFY(drawn != back.active()->markers.end());
         QCOMPARE(drawn->t, FrameTime(31));
+        QCOMPARE(drawn->drawingFrame(), FrameTime(30));  // drawn on 30, beside Sam's earlier note there
         QCOMPARE(drawn->name, std::string("\xE2\x97\x90 Sam \xC2\xB7 v3"));
         QCOMPARE(drawn->comment, std::string("Mask this\n\xE2\x86\xB3 Ana: Agreed"));
         QCOMPARE(parseReviewDrawing(drawn->drawing).size(), size_t(1));

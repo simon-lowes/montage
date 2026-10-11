@@ -45,6 +45,7 @@ const char* kPage = R"HTML(<!doctype html>
 :root{--bg:#141518;--panel:#1d1f24;--line:#2e3138;--text:#e8e8ea;--muted:#9c9ea5;--accent:#5b8def;--on-accent:#fff;color-scheme:dark}
 @media (prefers-color-scheme: light){:root{--bg:#f3f3f5;--panel:#fff;--line:#d8d9de;--text:#1b1c1f;--muted:#5b5e66;--accent:#2f63d1;--on-accent:#fff;color-scheme:light}}
 *{box-sizing:border-box}
+[hidden]{display:none!important}
 body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
 header{padding:14px 20px;border-bottom:1px solid var(--line);display:flex;gap:6px 14px;align-items:baseline;flex-wrap:wrap}
 header h1{font-size:18px;margin:0;font-weight:600;overflow-wrap:anywhere}
@@ -60,6 +61,7 @@ main{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:16px;padding:16p
 video{display:block;width:100%;max-height:70vh;background:#000}
 #ink{position:absolute;left:0;top:0;touch-action:none;pointer-events:none;z-index:3}
 #ink.drawing{pointer-events:auto;cursor:crosshair}
+.stage.wipe #ink{clip-path:inset(0 0 0 var(--wipe,50%))}
 .vlabel{position:absolute;top:6px;left:6px;padding:1px 6px;background:rgba(0,0,0,.65);color:#fff;font-size:12px;border-radius:3px;pointer-events:none;z-index:4}
 #prevPane .vlabel{left:auto;right:6px}
 .stage.wipe #prevPane .vlabel{right:auto;left:6px}
@@ -191,10 +193,10 @@ function tc(frame) {
   }
   const pad = (n) => String(n).padStart(2, "0");
   const s = Math.floor(f / nominal);
-  return pad(Math.floor(s / 3600)) + ":" + pad(Math.floor(s / 60) % 60) + ":" + pad(s % 60) + (dropFrame ? ";" : ":") + pad(f % nominal);
-}
 )HTML"
-    R"HTML(const span = (cls, text) => { const e = document.createElement("span"); e.className = cls; e.textContent = text; return e; };
+    R"HTML(  return pad(Math.floor(s / 3600)) + ":" + pad(Math.floor(s / 60) % 60) + ":" + pad(s % 60) + (dropFrame ? ";" : ":") + pad(f % nominal);
+}
+const span = (cls, text) => { const e = document.createElement("span"); e.className = cls; e.textContent = text; return e; };
 const pct = (f) => (100 * f / frames) + "%";
 const status = (text) => { $("status").textContent = text; };
 
@@ -326,7 +328,7 @@ function render() {
     const state = document.createElement("select");
     state.setAttribute("aria-label", "Status");
     for (const [v, label] of [["open", "Open"], ["progress", "In progress"], ["done", "Done"]]) state.append(new Option(label, v, false, n.status === v));
-    state.addEventListener("change", () => { n.status = state.value; n.done = n.status === "done"; n.updated = now(); store(); render(); });
+    state.addEventListener("change", () => { n.status = state.value; n.done = n.status === "done"; n.updated = n.statusUpdated = now(); store(); render(); });
     const reply = document.createElement("button");
     reply.textContent = "Reply";
     const del = document.createElement("button");
@@ -416,7 +418,8 @@ function saveFile() {
   const data = {
     montageReview: 2, title: cfg.title, id: cfg.id, fps: cfg.fps, dropFrame, version: cfg.version, saved: now(),
     notes: notes.map((n) => ({ frame: n.frame, duration: n.duration, timecode: tc(n.frame), author: n.author, text: n.text, status: n.status,
-      done: n.status === "done", version: n.version || cfg.version, replies: n.replies, drawing: n.drawing, created: n.created, updated: n.updated, id: n.id })),
+      done: n.status === "done", version: n.version || 0, replies: n.replies, drawing: n.drawing, created: n.created, updated: n.updated,
+      statusUpdated: n.statusUpdated || "", id: n.id })),
   };
   const a = document.createElement("a");
   a.href = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: "application/json" }));
@@ -433,27 +436,29 @@ async function loadFiles(files) {
     try {
       const data = JSON.parse(await file.text());
       if (!data || !Array.isArray(data.notes)) throw new Error("not a notes file");
-      const theirs = Array.isArray(data.fps) && data.fps[1] ? data.fps[0] / data.fps[1] : rate;
+)HTML"
+    R"HTML(      const theirs = Array.isArray(data.fps) && data.fps[1] ? data.fps[0] / data.fps[1] : rate;
       for (const raw of data.notes) {
         if (!raw || typeof raw.frame !== "number") continue;
         const n = fix(Object.assign({}, raw));
-)HTML"
-    R"HTML(        if (!n.text.trim() && !n.drawing.length) continue;
+        if (!n.text.trim() && !n.drawing.length) continue;
         const mine = n.id ? notes.find((x) => x.id === n.id) : null;
         if (mine) {
           // The same note from another copy: its new replies, and its status if changed later.
           const seen = new Set(mine.replies.map((r) => r.author + "\n" + r.text + "\n" + r.created));
           const more = n.replies.filter((r) => !seen.has(r.author + "\n" + r.text + "\n" + r.created));
-          const later = (n.updated || "") > (mine.updated || "");
+          // (Only a status set later wins: a reply in an older copy does not undo it.)
+          const later = (n.statusUpdated || "") > (mine.statusUpdated || "");
           if (more.length || (later && n.status !== mine.status)) ++changed;
           mine.replies.push(...more);
           mine.replies.sort((a, b) => String(a.created).localeCompare(String(b.created)));
-          if (later) { mine.status = n.status; mine.done = n.done; mine.updated = n.updated; }
+          if (later) { mine.status = n.status; mine.done = n.done; mine.statusUpdated = n.statusUpdated; }
+          if ((n.updated || "") > (mine.updated || "")) mine.updated = n.updated;
           continue;
         }
         notes.push({ id: n.id || newId(), frame: Math.round(n.frame * rate / theirs), duration: Math.round((n.duration || 0) * rate / theirs),
           author: String(n.author || "Reviewer"), text: n.text, status: n.status, done: n.done, version: Number(n.version || data.version) || 0,
-          replies: n.replies, drawing: n.drawing, created: n.created || "", updated: n.updated || "" });
+          replies: n.replies, drawing: n.drawing, created: n.created || "", updated: n.updated || "", statusUpdated: n.statusUpdated || "" });
         ++added;
       }
     } catch (e) {
@@ -492,7 +497,7 @@ $("meta").textContent = (cfg.version > 1 || cfg.previous ? "Version " + cfg.vers
 
 // Drawing over the frame: strokes in 0..1 of the picture, waiting for the note they go with.
 const canvas = $("ink");
-let pending = [], inkFrame = null, drawMode = false, tool = "pen", colour = "#ff3b30", live = null;
+let pending = [], inkFrame = null, drawMode = false, tool = "pen", colour = "#ff3b30", live = null, livePointer = null;
 function contentRect(v) {
   const bw = v.clientWidth, bh = v.clientHeight, a = cfg.width / cfg.height;
   let w = bw, h = bw / a;
@@ -544,7 +549,7 @@ function paintInk() {
   const at = cfg.offset + shown, w = canvas.width, h = canvas.height;
   const shownStrokes = [];
   if (video.paused || drawMode) {
-    for (const m of cfg.markers) if (Array.isArray(m.drawing) && covers(m.frame, m.duration, at)) shownStrokes.push(...m.drawing);
+    for (const m of cfg.markers) if (Array.isArray(m.drawing) && covers(typeof m.drawnAt === "number" ? m.drawnAt : m.frame, m.duration, at)) shownStrokes.push(...m.drawing);
     for (const n of notes) if (n.drawing.length && covers(n.frame, n.duration, at)) shownStrokes.push(...n.drawing);
   }
   if (pending.length && inkFrame === shown) shownStrokes.push(...pending);
@@ -566,7 +571,7 @@ function setDraw(on) {
   paintInk();
 }
 canvas.addEventListener("pointerdown", (e) => {
-  if (!drawMode) return;
+  if (!drawMode || live || e.button !== 0) return;  // (one stroke at a time, with the main button or a finger)
   e.preventDefault();
   video.pause();
   if (pending.length && inkFrame !== shown) {
@@ -577,11 +582,12 @@ canvas.addEventListener("pointerdown", (e) => {
   inkFrame = shown;
   canvas.setPointerCapture(e.pointerId);
   live = { tool, color: colour, width: tool === "pen" ? 0.004 : 0.003, points: [pointOf(e)] };
+  livePointer = e.pointerId;
   pending.push(live);
   update();
 });
 canvas.addEventListener("pointermove", (e) => {
-  if (!live || !canvas.hasPointerCapture(e.pointerId)) return;
+  if (!live || e.pointerId !== livePointer) return;
   const p = pointOf(e);
   if (live.tool === "pen") {
     const q = live.points[live.points.length - 1];
@@ -589,8 +595,8 @@ canvas.addEventListener("pointermove", (e) => {
   } else live.points[1] = p;
   paintInk();
 });
-const endStroke = () => {
-  if (!live) return;
+const endStroke = (e) => {
+  if (!live || e.pointerId !== livePointer) return;
   if (live.tool !== "pen" && live.points.length < 2) pending.pop();
   live = null;
   if (!pending.length) inkFrame = null;
@@ -606,7 +612,7 @@ video.addEventListener("loadedmetadata", layoutInk);
 // The version before, side by side or under a wipe, kept on the same frame of the cut.
 const P = cfg.previous;
 const prev = $("prev");
-let comparing = false;
+let comparing = false, lastResync = 0;
 function setCompare(on) {
   if (!P) return;
   comparing = on;
@@ -638,7 +644,9 @@ function syncPrev() {
   } else {
     prev.playbackRate = video.playbackRate;
     if (prev.paused) prev.play().catch(() => {});
-    if (Math.abs(prev.currentTime - t) > 0.12) prev.currentTime = t;
+    // (Put right only when it has drifted a quarter of a second, and not again until the seek has had time.)
+    const nowMs = performance.now();
+    if (Math.abs(prev.currentTime - t) > 0.25 && !prev.seeking && nowMs - lastResync > 750) { prev.currentTime = t; lastResync = nowMs; }
   }
 }
 if (P) {
@@ -673,7 +681,8 @@ $("markOut").addEventListener("click", () => { markOut = shown; showRange(); });
 $("clearRange").addEventListener("click", () => { markIn = markOut = null; showRange(); });
 $("add").addEventListener("click", addNote);
 $("save").addEventListener("click", saveFile);
-$("load").addEventListener("click", () => $("file").click());
+)HTML"
+    R"HTML($("load").addEventListener("click", () => $("file").click());
 $("file").addEventListener("change", (e) => { loadFiles([...e.target.files]); e.target.value = ""; });
 $("text").addEventListener("focus", () => video.pause());
 $("text").addEventListener("input", () => video.pause());
@@ -685,8 +694,7 @@ document.addEventListener("keydown", (e) => {
   const t = e.target;
   if (t.closest && t.closest("input, textarea, select")) {
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && t.id === "text") { e.preventDefault(); addNote(); }
-)HTML"
-    R"HTML(    else if (e.key === "Escape") t.blur();
+    else if (e.key === "Escape") t.blur();
     return;
   }
   if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === "z" || e.key === "Z") && drawMode) { e.preventDefault(); undoStroke(); return; }
@@ -793,7 +801,7 @@ std::vector<ReviewStroke> parseReviewDrawing(const std::string& json) {
 std::string reviewPageHtml(const ReviewPageInfo& info) {
     QJsonArray markers;
     for (const Marker& m : info.markers) {
-        QJsonObject o{{"frame", double(m.t)}, {"duration", double(m.duration)}, {"name", QString::fromStdString(m.name)},
+        QJsonObject o{{"frame", double(m.t)}, {"duration", double(m.duration)}, {"drawnAt", double(m.drawingFrame())}, {"name", QString::fromStdString(m.name)},
                       {"comment", QString::fromStdString(m.comment)}, {"color", m.color}, {"chapter", m.chapter}};
         if (const auto strokes = parseReviewDrawing(m.drawing); !strokes.empty()) o["drawing"] = drawingArray(strokes);
         markers.append(o);
@@ -826,11 +834,23 @@ std::string reviewPageHtml(const ReviewPageInfo& info) {
         if (c == '<') safe += "\\u003c";
         else safe += c;
     }
-    std::string page = kPage;
+    // The template's placeholders filled in one pass (a title holding "@@TITLE@@" is not looked at again).
     const std::string title = htmlEscape(info.title.empty() ? std::string("Untitled") : info.title);
-    for (size_t at; (at = page.find("@@TITLE@@")) != std::string::npos;) page.replace(at, 9, title);
-    page.replace(page.find("@@CONFIG@@"), 10, safe);
-    return page;
+    const std::string page = kPage;
+    std::string out;
+    out.reserve(page.size() + safe.size() + 2 * title.size());
+    for (size_t at = 0;;) {
+        const size_t t = page.find("@@TITLE@@", at), c = page.find("@@CONFIG@@", at);
+        const size_t next = std::min(t, c);
+        if (next == std::string::npos) {
+            out.append(page, at, std::string::npos);
+            break;
+        }
+        out.append(page, at, next - at);
+        out += next == t ? title : safe;
+        at = next + (next == t ? 9 : 10);
+    }
+    return out;
 }
 
 std::optional<ReviewPageInfo> readReviewPage(const std::string& html) {
@@ -901,6 +921,7 @@ bool parseReviewNotes(const std::string& json, Rational fps, std::vector<ReviewN
         note.done = note.status == "done";
         note.version = std::max(0, n.value("version").toInt(o.value("version").toInt(0)));
         note.id = n.value("id").toString().left(64).toStdString();
+        note.statusAt = n.value("statusUpdated").toString().left(40).toStdString();
         for (const QJsonValue& rv : n.value("replies").toArray()) {
             const QJsonObject r = rv.toObject();
             ReviewReply reply{r.value("author").toString().trimmed().toStdString(), r.value("text").toString().trimmed().toStdString(),
@@ -933,6 +954,7 @@ std::vector<Marker> reviewNotesToMarkers(const std::vector<ReviewNote>& notes) {
         m.color = kAuthorLabels[size_t(it - authors.begin()) % std::size(kAuthorLabels)];
         m.drawing = n.drawing;
         m.reviewId = n.id;
+        m.reviewStatusAt = n.statusAt;
         out.push_back(m);
     }
     return out;
