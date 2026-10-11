@@ -6510,6 +6510,29 @@ private slots:
             QCOMPARE(r.clips[1].clip.sourceIn, 200.0);
             QVERIFY(r.clips[0].clip.id != r.clips[1].clip.id);
         }
+        // A J-cut (its sound starting before its picture) cut at In between the two stays linked; an Out past the end is the end.
+        {
+            Project q;
+            Sequence j = makeSequence(q, "J", 640, 360, Rational{30, 1});
+            QVERIFY(!j.videoTracks.empty() && !j.audioTracks.empty());
+            Clip v;
+            v.id = q.newId();
+            v.mediaId = f.media;
+            v.start = 100;
+            v.duration = 100;
+            v.linkGroup = q.newId();
+            Clip a = v;
+            a.id = q.newId();
+            a.start = 90;
+            a.duration = 110;
+            j.videoTracks[0].clips = {v};
+            j.audioTracks[0].clips = {a};
+            const SequenceRange r = copySequenceRange(j, 95, 999);
+            QCOMPARE(r.length, FrameTime(105));
+            QCOMPARE(r.clips.size(), size_t(2));
+            QVERIFY(r.clips[0].clip.linkGroup != 0);
+            QCOMPARE(r.clips[0].clip.linkGroup, r.clips[1].clip.linkGroup);
+        }
         // Not into itself, nor into a sequence it nests; not at another rate; nothing in an empty stretch.
         QVERIFY(!placeSequenceClips(p, s, main, 0, 10, 0, 0, 0, false).ok);
         {

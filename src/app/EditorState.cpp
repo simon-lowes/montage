@@ -774,6 +774,7 @@ bool EditorState::sourceEdit(SourceEdit mode) {
     const bool asClips = sequencesAsClips_ && m->kind == MediaKind::Sequence && mode != SourceEdit::PlaceOnTop &&
                          mode != SourceEdit::RippleOverwrite;
     bool nestedInstead = false;
+    FrameTime placedEnd = -1;  // where the sequence's clips end (the first created is not the last)
     bool ok = apply(label, [&](Project& p, Sequence& sq) {
         matched = edit::matchSequenceToMedia(sq, *m);
         if (asClips) {
@@ -781,6 +782,8 @@ bool EditorState::sourceEdit(SourceEdit mode) {
             if (src && src->fps == sq.fps) {
                 edit::Result r = edit::placeSequenceClips(p, sq, m->sequenceId, FrameTime(in), out < 0 ? -1 : FrameTime(out), at, vt.index,
                                                           at_.index, insertMode);
+                const FrameTime end = out < 0 ? src->duration() : std::min(FrameTime(out), src->duration());
+                placedEnd = at + std::max<FrameTime>(0, end - FrameTime(in));
                 created = r.created;
                 return r;
             }
@@ -794,7 +797,8 @@ bool EditorState::sourceEdit(SourceEdit mode) {
     });
     if (ok && nestedInstead) message(tr("%1 runs at another frame rate, so it went in nested").arg(QString::fromStdString(m->name)), 6000);
     if (ok && !created.empty()) {
-        if (const Clip* c = edit::clipById(*sequence(), created.front())) setPlayhead(c->end());
+        if (placedEnd >= 0) setPlayhead(placedEnd);
+        else if (const Clip* c = edit::clipById(*sequence(), created.front())) setPlayhead(c->end());
         setSelection(created);
         if (matched) message(tr("Sequence settings changed to match %1").arg(QString::fromStdString(m->name)), 6000);
     }

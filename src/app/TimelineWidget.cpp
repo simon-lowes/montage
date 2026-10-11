@@ -2422,11 +2422,12 @@ void TimelineWidget::dragMoveEvent(QDragMoveEvent* e) {
     hoverPos_ = e->position().toPoint();
     if (m->hasFormat("application/x-montage-media") || hasSequencePart(m)) {
         ghosts_ = ghostsFor(m, hoverPos_);
-        // Snap the drop point.
+        // Snap the drop point (a range from a stacked timeline by its start, which may be a gap before its first clip).
         if (!ghosts_.empty()) {
             bool snapped = false;
-            FrameTime f = snapFrame(ghosts_.front().start, {}, &snapped);
-            FrameTime shift = f - ghosts_.front().start;
+            const FrameTime anchor = m->hasFormat(kSequenceRangeMime) ? frameRound(hoverPos_.x()) : ghosts_.front().start;
+            FrameTime f = snapFrame(anchor, {}, &snapped);
+            FrameTime shift = f - anchor;
             for (auto& g : ghosts_) g.start += shift;
         }
     } else {
@@ -2505,9 +2506,10 @@ void TimelineWidget::dropSequencePart(const QMimeData* mime, const QPoint& pos, 
     Id from = 0;
     edit::SequenceRange part;
     if (!state_->sequence() || !sequencePartFromMime(state_->project(), mime, &from, &part)) return;
-    // Snapped as the ghosts were: by the earliest clip.
+    // Snapped as the ghosts were: a range by its start, chosen clips by the earliest.
     FrameTime at = frameRound(pos.x());
-    if (auto ghosts = ghostsFor(mime, pos); !ghosts.empty()) at += snapFrame(ghosts.front().start, {}) - ghosts.front().start;
+    if (mime->hasFormat(kSequenceRangeMime)) at = snapFrame(at, {});
+    else if (auto ghosts = ghostsFor(mime, pos); !ghosts.empty()) at += snapFrame(ghosts.front().start, {}) - ghosts.front().start;
     auto row = rowAt(pos.y());
     const int vt = row && row->ref.kind == TrackKind::Video ? row->ref.index : state_->targetVideoTrack();
     const int aud = row && row->ref.kind == TrackKind::Audio ? row->ref.index : state_->targetAudioTrack();

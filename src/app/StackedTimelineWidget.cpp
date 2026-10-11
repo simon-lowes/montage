@@ -68,6 +68,11 @@ public:
         setMinimumHeight(90);
         setMouseTracking(false);
     }
+    void resetView() {  // (another sequence: the whole of it)
+        zoom_ = 1;
+        scroll_ = 0;
+        update();
+    }
 
 protected:
     void paintEvent(QPaintEvent*) override;
@@ -140,6 +145,7 @@ private:
 };
 
 void StackedTimelineCanvas::paintEvent(QPaintEvent*) {
+    clampScroll();  // (the sequence may have got shorter)
     QPainter p(this);
     p.fillRect(rect(), theme::kPanel);
     const Sequence* s = w_->sequence();
@@ -336,6 +342,7 @@ void StackedTimelineWidget::setSequence(Id id) {
         selection_.clear();
         playhead_ = 0;
         in_ = out_ = -1;
+        canvas_->resetView();
     }
     refresh();
 }
@@ -354,6 +361,7 @@ void StackedTimelineWidget::refresh() {
         selection_.clear();
         playhead_ = 0;
         in_ = out_ = -1;
+        canvas_->resetView();
         s = sequence();
     }
     filling_ = true;

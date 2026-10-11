@@ -9728,6 +9728,7 @@ const auto seq = [this] { return state()->sequence(); };
             QCOMPARE(v1()[i].duration, FrameTime(15));
         }
         QCOMPARE(v1()[0].sourceIn, 15.0);
+        QCOMPARE(state()->playhead(), FrameTime(30));  // after all of it, not after its first piece
         QCOMPARE(state()->project().findSequence(selects)->videoTracks[0].clips.size(), size_t(3));  // the reel is untouched
         state()->undo();
         QVERIFY(v1().empty());

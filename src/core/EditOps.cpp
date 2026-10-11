@@ -1252,17 +1252,25 @@ void keepTransitions(const Sequence& s, const std::set<Id>& ids, SequenceRange& 
 
 SequenceRange copySequenceRange(const Sequence& src, FrameTime in, FrameTime out) {
     SequenceRange r;
-    if (out < 0) out = src.duration();
+    if (out < 0 || out > src.duration()) out = src.duration();  // (an Out on the end frame itself)
     in = std::max<FrameTime>(0, in);
     if (out <= in) return r;
-    // Cut on a copy; the pieces' ids start above every id in it (they get new ones when placed).
+    // Cut on a copy at both ends, the new pieces' ids above every id in it (all get new ones when placed). Each piece
+    // keeps its clip's link group: the pieces outside are dropped, so a J- or L-cut stays linked.
     Project scratch;
     Sequence s = src;
     for (TrackRef t : allTracks(s))
         for (const Clip& c : trackAt(s, t)->clips) scratch.nextId = std::max({scratch.nextId, c.id + 1, c.linkGroup + 1});
-    for (TrackRef t : allTracks(s)) trackAt(s, t)->locked = false;
-    razorAll(scratch, s, in);
-    razorAll(scratch, s, out);
+    for (FrameTime at : {in, out})
+        for (TrackRef t : allTracks(s)) {
+            Track& track = *trackAt(s, t);
+            for (size_t i = 0; i < track.clips.size(); ++i)
+                if (track.clips[i].start < at && track.clips[i].end() > at) {
+                    splitClip(scratch, track, i, at);
+                    break;
+                }
+            normalize(track);
+        }
     std::set<Id> ids;
     for (TrackRef t : allTracks(s))
         for (const Clip& c : trackAt(s, t)->clips)
