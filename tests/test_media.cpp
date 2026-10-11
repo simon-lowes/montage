@@ -969,6 +969,134 @@ private slots:
         QVERIFY(std::fabs(back->samples[size_t(72000) * 2 + 1]) < 1e-3);     // 1.5 s: hard left
     }
 
+    void auxSendsAndMixerAutomation() {
+        // A steady signal on A1 to the master, and a return bus (no effects) it can send to.
+        const std::string wav = path("sendsrc.wav");
+        writeWav(wav, 48000, 2.0, 0.5f, 0.5f);
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = Rational{30, 1};
+        s.sampleRate = 48000;
+        MediaItem m = probeOrFail(p, wav);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        auto levelAt = [&](const Sequence& q, double seconds, int channel) {
+            AudioMixer mixer;
+            std::vector<float> out(64 * 2);
+            mixer.mix(p, q, int64_t(seconds * 48000), 64, out.data());
+            return double(out[size_t(channel)]);
+        };
+        const double base = levelAt(s, 0.5, 0);
+        QVERIFY(base > 0.1);
+        const double half = std::pow(10.0, -6 / 20.0);
+        auto near = [](double a, double b) { return std::fabs(a - b) < 1e-3; };
+        Bus ret;
+        ret.id = p.newId();
+        ret.name = "Reverb";
+        s.buses.push_back(ret);
+        Track& a1 = s.audioTracks[0];
+        QVERIFY(!edit::setSend(s, 0, 999999, 0, false).ok);  // no such bus
+        QVERIFY(edit::setSend(s, 0, ret.id, -6, false).ok);
+        QCOMPARE(a1.sends.size(), size_t(1));
+        // Post-fader: the direct sound and the send at -6 dB, both following the fader.
+        QVERIFY2(near(levelAt(s, 0.5, 0), base * (1 + half)), qPrintable(QString::number(levelAt(s, 0.5, 0) / base)));
+        a1.volumeDb = -12;
+        QVERIFY(near(levelAt(s, 0.5, 0), base * (1 + half) * std::pow(10.0, -12 / 20.0)));
+        // Pre-fader: its own level with the fader down; it ignores the track's pan, which a post-fader send follows.
+        QVERIFY(edit::setSend(s, 0, ret.id, -6, true).ok);
+        QCOMPARE(a1.sends.size(), size_t(1));  // updated, not added
+        a1.volumeDb = -96;
+        QVERIFY(near(levelAt(s, 0.5, 0), base * half));
+        a1.volumeDb = 0;
+        a1.pan = -1;
+        QVERIFY(near(levelAt(s, 0.5, 1), base * half));
+        a1.sends[0].preFader = false;
+        QVERIFY(levelAt(s, 0.5, 1) < 1e-4);
+        a1.pan = 0;
+        // A muted send adds nothing; nor does the bus muted or turned down.
+        a1.sends[0].muted = true;
+        QVERIFY(near(levelAt(s, 0.5, 0), base));
+        a1.sends[0].muted = false;
+        s.buses[0].volumeDb = -6;
+        QVERIFY(near(levelAt(s, 0.5, 0), base * (1 + half * half)));
+        s.buses[0].muted = true;
+        QVERIFY(near(levelAt(s, 0.5, 0), base));
+        s.buses[0].muted = false;
+        s.buses[0].volumeDb = 0;
+        // The send's level lane: silent at frame 0, up to 0 dB by frame 30.
+        a1.sends[0].levelAuto.addKey(0, -96);
+        a1.sends[0].levelAuto.addKey(30, 0);
+        QVERIFY(near(levelAt(s, 1.5, 0), base * 2));
+        QVERIFY(near(levelAt(s, 0.0, 0), base));
+        a1.automation = int(AutomationMode::Off);  // the lanes kept but not heard
+        QVERIFY(near(levelAt(s, 1.5, 0), base * (1 + half)));
+        a1.automation = int(AutomationMode::Read);
+        a1.sends[0].levelAuto = Param();
+        // The track's mute lane: muted from frame 15 to 30, its send with it; a switch, not a fade.
+        a1.muteAuto.addKey(0, 0);
+        a1.muteAuto.addKey(15, 1);
+        a1.muteAuto.addKey(30, 0);
+        QVERIFY(trackMutedAt(a1, 20) && !trackMutedAt(a1, 14.9) && !trackMutedAt(a1, 31));
+        QVERIFY(near(levelAt(s, 0.25, 0), base * (1 + half)));
+        QVERIFY(std::fabs(levelAt(s, 0.75, 0)) < 1e-6);
+        QVERIFY(near(levelAt(s, 1.5, 0), base * (1 + half)));
+        a1.muteAuto = Param();
+        // The bus's lanes: its fader from -96 dB to 0 over a second, a mute lane, a pan lane.
+        Bus& b = s.buses[0];
+        b.volumeAuto.addKey(0, -96);
+        b.volumeAuto.addKey(30, 0);
+        QVERIFY(near(levelAt(s, 1.5, 0), base * (1 + half)));
+        QVERIFY(near(levelAt(s, 0.0, 0), base));
+        QVERIFY(near(busVolumeAt(b, 15), -48));
+        b.volumeAuto = Param();
+        b.muteAuto.addKey(30, 1);
+        QVERIFY(near(levelAt(s, 1.5, 0), base) && near(levelAt(s, 0.5, 0), base));  // (the first key holds before it)
+        b.muteAuto = Param();
+        b.muteAuto.addKey(0, 0);
+        b.muteAuto.addKey(30, 1);
+        QVERIFY(near(levelAt(s, 0.5, 0), base * (1 + half)) && near(levelAt(s, 1.5, 0), base));
+        b.muteAuto = Param();
+        b.panAuto.addKey(0, 0);
+        b.panAuto.addKey(30, 1);  // hard right from frame 30
+        QVERIFY(near(levelAt(s, 1.5, 0), base) && near(levelAt(s, 1.5, 1), base + base * half * std::sqrt(2.0)));
+        b.automation = int(AutomationMode::Off);
+        QVERIFY(near(levelAt(s, 1.5, 1), base * (1 + half)));
+        b.automation = int(AutomationMode::Read);
+        // Saved and loaded: sends, the mute lane and the bus's lanes and mode.
+        a1.muteAuto.addKey(10, 1);
+        a1.sends[0].levelAuto.addKey(5, -3);
+        b.automation = int(AutomationMode::Latch);
+        b.volumeAuto.addKey(3, -2);
+        const std::string project = path("sends.montage");
+        QVERIFY(saveProject(p, project));
+        Project back;
+        QVERIFY(loadProject(project, back));
+        const Sequence& bs = *back.active();
+        QVERIFY(bs.audioTracks[0].sends == a1.sends);
+        QVERIFY(bs.audioTracks[0].muteAuto == a1.muteAuto);
+        QVERIFY(bs.buses[0].volumeAuto == b.volumeAuto && bs.buses[0].panAuto == b.panAuto);
+        QCOMPARE(bs.buses[0].automation, int(AutomationMode::Latch));
+        a1.muteAuto = Param();
+        a1.sends[0].levelAuto = Param();
+        b.automation = int(AutomationMode::Read);
+        b.volumeAuto = b.panAuto = Param();
+        // Exports hear the send.
+        ExportSettings st;
+        st.path = path("sends.wav");
+        st.videoCodec = "none";
+        st.audioCodec = "pcm_s16le";
+        std::string err;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        AudioBufferPtr heard = decodeAudio(st.path, 48000, &err);
+        QVERIFY2(heard, err.c_str());
+        QVERIFY(std::fabs(heard->samples[size_t(24000) * 2] - base * (1 + half)) < 2e-3);
+        // Removing the bus takes the send with it.
+        QVERIFY(edit::removeBus(s, ret.id).ok);
+        QVERIFY(a1.sends.empty() && s.buses.empty());
+        QVERIFY(!edit::removeSend(s, 0, ret.id).ok);
+        QVERIFY(near(levelAt(s, 0.5, 0), base));
+    }
+
     void lutExportOverMcp() {
         // A matte graded to black and white, with a blur a LUT cannot hold.
         Project p = makeDefaultProject();
@@ -12493,6 +12621,39 @@ private slots:
         QVERIFY(tool("montage_automate_track", QJsonObject{{"project", project}, {"track", "V1"}, {"mode", "read"}}).value("isError").toBool());
         QVERIFY(tool("montage_automate_track", QJsonObject{{"project", project}, {"mode", "loud"}}).value("isError").toBool());
         QVERIFY(!tool("montage_undo", QJsonObject{{"project", project}}).value("isError").toBool());
+        // Aux sends (a return bus made by name), a mute lane, then the bus's own automation. (Undo is one step: the
+        // project is put back from a copy afterwards.)
+        const QString beforeSends = project + ".before-sends";
+        QFile::remove(beforeSends);
+        QVERIFY(QFile::copy(project, beforeSends));
+        r = tool("montage_automate_track",
+                 QJsonObject{{"project", project}, {"track", "A1"},
+                             {"mute", QJsonArray{QJsonArray{0.5, 1}, QJsonArray{1.0, 0}}},
+                             {"sends", QJsonArray{QJsonObject{{"bus", "Reverb"}, {"level_db", -8}, {"pre_fader", true},
+                                                              {"level", QJsonArray{QJsonArray{0, -20}, QJsonArray{1, -8}}}}}}});
+        QVERIFY2(!r.value("isError").toBool() && text(r).contains("Reverb -8.0 dB pre-fader") && text(r).contains("Mute: "), qPrintable(text(r)));
+        r = tool("montage_automate_track", QJsonObject{{"project", project}, {"bus", "reverb"}, {"mode", "touch"},
+                                                       {"volume", QJsonArray{QJsonArray{0, -6}}}, {"mute", QJsonArray{QJsonArray{2, 1}}}});
+        QVERIFY2(!r.value("isError").toBool() && text(r).contains("Bus Reverb: Touch automation"), qPrintable(text(r)));
+        {
+            Project mixed;
+            QVERIFY(loadProject(project.toStdString(), mixed));
+            const Sequence& ms = *mixed.active();
+            QCOMPARE(ms.buses.size(), size_t(1));
+            const Track& t = ms.audioTracks.at(0);
+            QCOMPARE(t.sends.size(), size_t(1));
+            QCOMPARE(t.sends[0].bus, ms.buses[0].id);
+            QVERIFY(t.sends[0].preFader && t.sends[0].levelDb == -8 && t.sends[0].levelAuto.keys.size() == 2);
+            QCOMPARE(t.muteAuto.keys.size(), size_t(2));
+            QVERIFY(t.muteAuto.keys[0].interp == Interp::Hold && t.muteAuto.keys[0].v == 1);
+            QCOMPARE(ms.buses[0].automation, int(AutomationMode::Touch));
+            QVERIFY(ms.buses[0].volumeAuto.keys.size() == 1 && ms.buses[0].muteAuto.keys.size() == 1);
+        }
+        QVERIFY(tool("montage_automate_track", QJsonObject{{"project", project}, {"bus", "Nowhere"}, {"mode", "read"}}).value("isError").toBool());
+        r = tool("montage_automate_track", QJsonObject{{"project", project}, {"sends", QJsonArray{QJsonObject{{"bus", "Reverb"}, {"remove", true}}}}});
+        QVERIFY2(!r.value("isError").toBool() && text(r).contains("Sends: none"), qPrintable(text(r)));
+        QVERIFY(QFile::remove(project) && QFile::rename(beforeSends, project));
+        QFile::remove(project + ".bak");
         // A clip marker, on the clip rather than the sequence.
         {
             Project info;

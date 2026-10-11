@@ -11,6 +11,7 @@
 #include <QPainterPath>
 #include <QTransform>
 #include <algorithm>
+#include <functional>
 #include <cmath>
 #include <cstring>
 #include <deque>
@@ -2350,6 +2351,21 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
     bool anySolo = std::any_of(seq.audioTracks.begin(), seq.audioTracks.end(), [](const Track& t) { return t.solo; });
     if (trackLevels && depth == 0) trackLevels->assign(seq.audioTracks.size(), MeterLevels{});
     auto frameAt = [&](int64_t sample) { return FrameTime(double(sample) * fps / sr); };
+    // Multiplies `buf` (frames x ch) by a gain that glides from one 64-sample step to the next; gainAt(sample) gives it
+    // at a timeline sample.
+    auto rampGain = [&](float* buf, int ch, int64_t from, const std::function<float(int64_t)>& gainAt) {
+        float g0 = gainAt(from);
+        for (int i = 0; i < frames; i += 64) {
+            const int e = std::min(frames, i + 64);
+            const float g1 = gainAt(from + e);
+            if (g0 == 1.0f && g1 == 1.0f) continue;
+            for (int k = i; k < e; ++k) {
+                const float g = g0 + (g1 - g0) * float(k - i) / float(e - i);
+                for (int c = 0; c < ch; ++c) buf[size_t(k) * size_t(ch) + size_t(c)] *= g;
+            }
+            g0 = g1;
+        }
+    };
     // Delay compensation: each stage is fed ahead by the latency of the stages
     // after it, so everything lines up at the output. The master chain gets the
     // mix of [start + Lm, ...), a bus that of [start + Lm + Lb, ...), and a track
@@ -2362,7 +2378,7 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
         busBufs[b.id].assign(size_t(frames) * 2, 0.0f);
         busLat[b.id] = chainLatency(b.effects, b.id, sr);
     }
-    std::vector<float> trackBuf(size_t(frames) * 2);
+    std::vector<float> trackBuf(size_t(frames) * 2), postBuf;
     // An ambisonic mix: ambisonic clips add their field straight to it (W, Y, Z, X), beside the tracks' panned sound.
     // The field passes no stereo inserts (clip, track or bus), so it is read where the master is fed from; a track
     // routed to a bus sends it through the bus's mute and fader.
@@ -2393,6 +2409,44 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
         const bool readsLanes = trackAutomation(track) != AutomationMode::Off && trackAutomation(track) != AutomationMode::Write;
         const bool volumeAuto = readsLanes && track.volumeAuto.animated(), panAuto = readsLanes && track.panAuto.animated();
         const int64_t heard = start + downstream;  // the timeline sample the fader acts on now
+        // Mute automation: off and on again over 64 samples, the field too (heard where the master is fed from).
+        if (readsLanes && track.muteAuto.animated()) {
+            auto open = [&](int64_t at) { return laneMuted(track.muteAuto, false, double(at) * fps / sr) ? 0.0f : 1.0f; };
+            rampGain(trackBuf.data(), 2, heard, open);
+            if (fieldMix) rampGain(trackField.data(), kFoaChannels, fieldStart, open);
+        }
+        // Aux sends (to a bus that exists, not muted): pre-fader ones take the sound here, after the inserts and the
+        // mute; post-fader ones what leaves the fader and pan, below. Each at its own level, its lane gliding as the
+        // fader's does. (A send whose bus has another plugin delay than the track's output is not realigned.)
+        auto sendDest = [&](const Send& sd) -> float* {
+            if (sd.muted) return nullptr;
+            auto it = busBufs.find(sd.bus);
+            return it == busBufs.end() ? nullptr : it->second.data();
+        };
+        auto addSend = [&](const float* src, const Send& sd) {
+            float* dest = sendDest(sd);
+            if (!dest) return;
+            const bool lane = readsLanes && sd.levelAuto.animated();
+            const float still = dbToLin(sd.levelDb);
+            float g0 = lane ? dbToLin(sendLevelAt(track, sd, double(heard) * fps / sr)) : still;
+            for (int i = 0; i < frames; i += 64) {
+                const int e = std::min(frames, i + 64);
+                const float g1 = lane ? dbToLin(sendLevelAt(track, sd, double(heard + e) * fps / sr)) : still;
+                for (int k = i; k < e; ++k) {
+                    const float g = g0 + (g1 - g0) * float(k - i) / float(e - i);
+                    dest[size_t(k) * 2] += src[size_t(k) * 2] * g;
+                    dest[size_t(k) * 2 + 1] += src[size_t(k) * 2 + 1] * g;
+                }
+                g0 = g1;
+            }
+        };
+        bool postSends = false;
+        for (const Send& sd : track.sends) {
+            if (!sendDest(sd)) continue;
+            if (sd.preFader) addSend(trackBuf.data(), sd);
+            else postSends = true;
+        }
+        if (postSends) postBuf.assign(size_t(frames) * 2, 0.0f);
         if (volumeAuto) {
             for (int i = 0; i < frames; i += 64) {
                 const int e = std::min(frames, i + 64);
@@ -2433,11 +2487,13 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
             }
         }
         if (surround && bus == busBufs.end()) {
-            // Straight to the speakers through the track's surround panner.
+            // Straight to the speakers through the track's surround panner (its post-fader sends take it before that).
             for (int i = 0; i < frames; ++i) {
                 lv.peakL = std::max(lv.peakL, std::fabs(trackBuf[size_t(i) * 2] * tg));
                 lv.peakR = std::max(lv.peakR, std::fabs(trackBuf[size_t(i) * 2 + 1] * tg));
             }
+            if (postSends)
+                for (size_t i = 0; i < size_t(frames) * 2; ++i) postBuf[i] = trackBuf[i] * tg;
             if (lfeOnly) {
                 const float lfe = float(std::pow(10.0, track.surround.lfeDb / 20));
                 for (int i = 0; i < frames; ++i)
@@ -2470,10 +2526,14 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
                 float l = trackBuf[size_t(i) * 2] * tg * tl, r = trackBuf[size_t(i) * 2 + 1] * tg * tr;
                 dest[i * 2] += l;
                 dest[i * 2 + 1] += r;
+                if (postSends) postBuf[size_t(i) * 2] = l, postBuf[size_t(i) * 2 + 1] = r;
                 lv.peakL = std::max(lv.peakL, std::fabs(l));
                 lv.peakR = std::max(lv.peakR, std::fabs(r));
             }
         }
+        if (postSends)
+            for (const Send& sd : track.sends)
+                if (!sd.preFader) addSend(postBuf.data(), sd);
         if (trackLevels && depth == 0) (*trackLevels)[ti] = lv;
     }
     for (const Bus& b : seq.buses) {
@@ -2482,14 +2542,31 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
         if (!b.effects.empty()) processChain(b.effects, b.id, frameAt(start + masterLat + busLat[b.id]), sr, bb.data(), frames);
         if (b.muted) continue;
         float g = dbToLin(b.volumeDb), bl, br;
-        if (auto bf = busFields.find(b.id); bf != busFields.end())
+        // Its automation (core/Automation.h), heard where the master is fed from: mute and fader glide every 64
+        // samples, pan steps.
+        const AutomationMode bm = busAutomation(b);
+        const bool busReads = bm == AutomationMode::Read || bm == AutomationMode::Latch || bm == AutomationMode::Touch;
+        const int64_t busHeard = start + masterLat;
+        auto bf = busFields.find(b.id);
+        if (busReads && (b.muteAuto.animated() || b.volumeAuto.animated())) {
+            auto gainAt = [&](int64_t at) {
+                const double f = double(at) * fps / sr;
+                return laneMuted(b.muteAuto, false, f) ? 0.0f : dbToLin(busVolumeAt(b, f));
+            };
+            rampGain(bb.data(), 2, busHeard, gainAt);
+            if (bf != busFields.end()) rampGain(bf->second.data(), kFoaChannels, busHeard, gainAt);
+            g = 1;
+        }
+        if (bf != busFields.end())
             for (size_t i = 0; i < bf->second.size(); ++i) master[i] += bf->second[i] * g;  // fieldMix: master is W, Y, Z, X
         if (surround) {
             panInto(bb.data(), b.surround, g, master.data());
             continue;
         }
+        const bool busPanAuto = busReads && b.panAuto.animated();
         panGains(b.pan, bl, br);
         for (int i = 0; i < frames; ++i) {
+            if (busPanAuto && i % 64 == 0) panGains(busPanAt(b, double(busHeard + i) * fps / sr), bl, br);
             master[size_t(i) * 2] += bb[size_t(i) * 2] * g * bl;
             master[size_t(i) * 2 + 1] += bb[size_t(i) * 2 + 1] * g * br;
         }

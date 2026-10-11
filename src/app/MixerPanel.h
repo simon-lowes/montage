@@ -5,6 +5,8 @@
 
 #include <QVector>
 #include <QWidget>
+#include <functional>
+#include <set>
 #include <vector>
 
 #include "core/Automation.h"
@@ -17,6 +19,7 @@ class QLabel;
 class QScrollArea;
 class QSlider;
 class QToolButton;
+class QVBoxLayout;
 
 namespace montage {
 
@@ -29,12 +32,25 @@ class MixerPanel : public QWidget {
 public:
     explicit MixerPanel(EditorState* state, QWidget* parent = nullptr);
 
-    // Fader automation (core/Automation.h). Playback starting and stopping, and each frame it plays: tracks in
-    // Write, Latch or Touch record their fader and pan, kept as one undo step when playback stops.
+    // Mix automation (core/Automation.h). Playback starting and stopping, and each frame it plays: tracks in Write,
+    // Latch or Touch record their fader, pan, mute and send levels, and buses in those modes their fader, pan and mute,
+    // kept as one undo step when playback stops.
     void playbackStarted(FrameTime t);
     void playbackPosition(FrameTime t);
     void playbackStopped(FrameTime t);
-    bool recordingAutomation() const { return !recording_.empty(); }
+    bool recordingAutomation() const { return !recording_.empty() || !lanes_.empty(); }
+    // Aux sends, as a track strip's "+ Send" menu: to an existing bus, or to a new effects return (its id).
+    void addSend(int track, Id bus);
+    Id newReturn(int track);
+    QSlider* sendLevel(int track, int send) const {
+        if (track < 0 || track >= int(strips_.size()) || send < 0 || send >= int(strips_[size_t(track)].sends.size())) return nullptr;
+        return strips_[size_t(track)].sends[size_t(send)].level;
+    }
+    QToolButton* addSendButton(int track) const { return track >= 0 && track < int(strips_.size()) ? strips_[size_t(track)].addSend : nullptr; }
+    QSlider* busFader(int bus) const { return bus >= 0 && bus < int(busStrips_.size()) ? busStrips_[size_t(bus)].fader : nullptr; }
+    QDial* busPan(int bus) const { return bus >= 0 && bus < int(busStrips_.size()) ? busStrips_[size_t(bus)].pan : nullptr; }
+    QToolButton* busMute(int bus) const { return bus >= 0 && bus < int(busStrips_.size()) ? busStrips_[size_t(bus)].mute : nullptr; }
+    QComboBox* busAutomationMode(int bus) const { return bus >= 0 && bus < int(busStrips_.size()) ? busStrips_[size_t(bus)].automation : nullptr; }
     QSlider* trackFader(int index) const { return index >= 0 && index < int(strips_.size()) ? strips_[size_t(index)].fader : nullptr; }
     SurroundPanner* trackSurround(int index) const { return index >= 0 && index < int(strips_.size()) ? strips_[size_t(index)].surround : nullptr; }
     // A track folder's fader (a VCA over its tracks), shown after the track strips; nullptr if no such folder.
@@ -84,6 +100,14 @@ private:
         QToolButton* fx = nullptr;     // shows the inserts in the Inspector
         QComboBox* output = nullptr;   // master or a bus
         QComboBox* automation = nullptr;  // AutomationMode
+        struct SendRow {
+            QWidget* box = nullptr;
+            QLabel* name = nullptr;
+            QSlider* level = nullptr;
+        };
+        QVBoxLayout* sendLayout = nullptr;
+        std::vector<SendRow> sends;  // one per send, in the track's order
+        QToolButton* addSend = nullptr;
     };
     struct BusStrip {
         QWidget* box = nullptr;
@@ -93,6 +117,9 @@ private:
         QLabel* dbLabel = nullptr;
         QToolButton* mute = nullptr;
         SurroundPanner* surround = nullptr;
+        QDial* pan = nullptr;             // in stereo sequences
+        QComboBox* automation = nullptr;  // AutomationMode
+        Id id = 0;
     };
 
     struct FolderStrip {
@@ -109,6 +136,7 @@ private:
     void rebuild();
     void refresh();
     Strip makeStrip(int index);
+    Strip::SendRow makeSendRow(Strip& strip, int track, int send);
     BusStrip makeBusStrip(Id bus);
     QWidget* makeMasterStrip();
     void inspect(Id owner);
@@ -121,6 +149,12 @@ private:
     void setMute(int index, bool on);
     void setSolo(int index, bool on);
     void setAutomationMode(int index, int mode);
+    void setSendLevel(int track, int send, double db);
+    void editSend(int track, int send, const QString& label, const std::function<bool(Send&)>& fn);
+    void setBusVolume(Id bus, double db);
+    void setBusPan(Id bus, double pan);
+    void setBusMute(Id bus, bool on);
+    bool recordingLane(const QString& id) const;
     // Faders and pans show the automation at the playhead on tracks that read it.
     void followAutomation();
 
@@ -152,6 +186,22 @@ private:
         bool changedOther = false;          // width, LFE or object changed during the pass
     };
     std::vector<Recording> recording_;
+    // The other lanes written in a pass (track mutes and send levels, bus faders, pans and mutes), each read from its
+    // control and put back when the pass ends.
+    struct LaneRecording {
+        QString id;  // "track-mute-<index>", "send-<track>-<send>", "bus-volume-<id>"...
+        AutomationRecorder rec;
+        double tolerance = 0.1;
+        bool hold = false;                                      // a switch (mute): its keys hold
+        std::function<double()> value;                          // the control now
+        std::function<bool()> held;                             // held (Touch), or first moved (Latch)
+        std::function<void(double)> show;                       // the lane shown on it while not written
+        std::function<void(Sequence&, double)> live;            // what plays while written
+        std::function<void(Sequence&, const Param&)> done;      // the new lane, the static value as it was
+    };
+    std::vector<LaneRecording> lanes_;
+    std::set<QString> touched_;       // switches the user changed during the pass (a mute's "move")
+    std::vector<Id> busesFromWrite_;  // handed over to Touch when the pass wrote
     QString liveState_;  // what the gesture last applied, to skip repeats
 };
 

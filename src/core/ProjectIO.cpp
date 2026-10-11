@@ -338,7 +338,19 @@ QJsonObject trackToJson(const Track& t) {
     if (t.surroundXAuto.animated()) o["surroundXAuto"] = paramToJson(t.surroundXAuto);
     if (t.surroundYAuto.animated()) o["surroundYAuto"] = paramToJson(t.surroundYAuto);
     if (t.surroundZAuto.animated()) o["surroundZAuto"] = paramToJson(t.surroundZAuto);
+    if (t.muteAuto.animated()) o["muteAuto"] = paramToJson(t.muteAuto);
     if (t.automation != 1) o["automation"] = t.automation;
+    if (!t.sends.empty()) {
+        QJsonArray sends;
+        for (const Send& sd : t.sends) {
+            QJsonObject so{{"bus", double(sd.bus)}, {"levelDb", sd.levelDb}};
+            if (sd.preFader) so["preFader"] = true;
+            if (sd.muted) so["muted"] = true;
+            if (sd.levelAuto.animated()) so["levelAuto"] = paramToJson(sd.levelAuto);
+            sends.append(so);
+        }
+        o["sends"] = sends;
+    }
     if (!t.folder.empty()) o["folder"] = qs(t.folder);
     return o;
 }
@@ -375,7 +387,18 @@ Track trackFromJson(const QJsonObject& o, TrackKind kind) {
     if (o.contains("surroundXAuto")) t.surroundXAuto = paramFromJson(o.value("surroundXAuto"));
     if (o.contains("surroundYAuto")) t.surroundYAuto = paramFromJson(o.value("surroundYAuto"));
     if (o.contains("surroundZAuto")) t.surroundZAuto = paramFromJson(o.value("surroundZAuto"));
+    if (o.contains("muteAuto")) t.muteAuto = paramFromJson(o.value("muteAuto"));
     t.automation = std::clamp(o.value("automation").toInt(1), 0, 4);
+    for (const auto& v : o.value("sends").toArray()) {
+        const QJsonObject so = v.toObject();
+        Send sd;
+        sd.bus = Id(i64(so.value("bus")));
+        sd.levelDb = so.value("levelDb").toDouble(0);
+        sd.preFader = so.value("preFader").toBool(false);
+        sd.muted = so.value("muted").toBool(false);
+        if (so.contains("levelAuto")) sd.levelAuto = paramFromJson(so.value("levelAuto"));
+        if (sd.bus) t.sends.push_back(std::move(sd));
+    }
     t.folder = ss(o.value("folder"));
     std::sort(t.clips.begin(), t.clips.end(), [](const Clip& a, const Clip& b) { return a.start < b.start; });
     return t;
@@ -499,6 +522,10 @@ QJsonObject sequenceToJson(const Sequence& s) {
             QJsonObject bo{{"id", double(b.id)}, {"name", qs(b.name)}, {"effects", fx},
                            {"volumeDb", b.volumeDb}, {"pan", b.pan}, {"muted", b.muted}};
             if (const QJsonValue sp = surroundToJson(b.surround); !sp.isUndefined()) bo["surround"] = sp;
+            if (b.volumeAuto.animated()) bo["volumeAuto"] = paramToJson(b.volumeAuto);
+            if (b.panAuto.animated()) bo["panAuto"] = paramToJson(b.panAuto);
+            if (b.muteAuto.animated()) bo["muteAuto"] = paramToJson(b.muteAuto);
+            if (b.automation != 1) bo["automation"] = b.automation;
             buses.append(bo);
         }
         o["buses"] = buses;
@@ -636,6 +663,10 @@ Sequence sequenceFromJson(const QJsonObject& o) {
         b.pan = bo.value("pan").toDouble(0);
         b.muted = bo.value("muted").toBool(false);
         if (bo.contains("surround")) b.surround = surroundFromJson(bo.value("surround"));
+        if (bo.contains("volumeAuto")) b.volumeAuto = paramFromJson(bo.value("volumeAuto"));
+        if (bo.contains("panAuto")) b.panAuto = paramFromJson(bo.value("panAuto"));
+        if (bo.contains("muteAuto")) b.muteAuto = paramFromJson(bo.value("muteAuto"));
+        b.automation = std::clamp(bo.value("automation").toInt(1), 0, 4);
         s.buses.push_back(std::move(b));
     }
     for (const auto& e : o.value("masterEffects").toArray()) s.masterEffects.push_back(effectFromJson(e));

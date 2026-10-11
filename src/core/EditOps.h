@@ -284,6 +284,12 @@ void setFolderCollapsed(Sequence& s, TrackKind kind, const std::string& folder, 
 // A folder's fader (a VCA: added to each of its tracks' faders in the mix), dB; 0 when unset.
 double folderGain(const Sequence& s, TrackKind kind, const std::string& folder);
 void setFolderGain(Sequence& s, TrackKind kind, const std::string& folder, double db);
+
+// Buses and aux sends. Removing a bus sends the tracks routed to it to the master and drops the sends to it.
+Result removeBus(Sequence& s, Id bus);
+// A send from an audio track to a bus (one per bus: an existing one is updated); fails for an unknown track or bus.
+Result setSend(Sequence& s, int audioTrack, Id bus, double levelDb, bool preFader);
+Result removeSend(Sequence& s, int audioTrack, Id bus);
 // Renames a folder (its tracks follow); fails if the new name is taken or empty.
 Result renameFolder(Sequence& s, TrackKind kind, const std::string& from, const std::string& to);
 

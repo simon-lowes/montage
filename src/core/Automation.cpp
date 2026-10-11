@@ -40,6 +40,34 @@ double trackPanAt(const Track& t, double frame) {
     return reads(t) && t.panAuto.animated() ? std::clamp(laneAt(t.panAuto, frame), -1.0, 1.0) : t.pan;
 }
 
+bool laneMuted(const Param& lane, bool still, double frame) {
+    if (lane.keys.empty()) return still;
+    const auto after = std::upper_bound(lane.keys.begin(), lane.keys.end(), frame, [](double f, const Keyframe& k) { return f < double(k.t); });
+    const Keyframe& k = after == lane.keys.begin() ? lane.keys.front() : *std::prev(after);
+    return k.v >= 0.5;
+}
+
+bool trackMutedAt(const Track& t, double frame) { return t.muted || (reads(t) && laneMuted(t.muteAuto, false, frame)); }
+
+double sendLevelAt(const Track& t, const Send& send, double frame) {
+    return reads(t) && send.levelAuto.animated() ? laneAt(send.levelAuto, frame) : send.levelDb;
+}
+
+AutomationMode busAutomation(const Bus& b) { return AutomationMode(std::clamp(b.automation, 0, 4)); }
+
+namespace {
+bool reads(const Bus& b) {
+    const AutomationMode m = busAutomation(b);
+    return m == AutomationMode::Read || m == AutomationMode::Latch || m == AutomationMode::Touch;
+}
+}  // namespace
+
+double busVolumeAt(const Bus& b, double frame) { return reads(b) && b.volumeAuto.animated() ? laneAt(b.volumeAuto, frame) : b.volumeDb; }
+
+double busPanAt(const Bus& b, double frame) { return reads(b) && b.panAuto.animated() ? std::clamp(laneAt(b.panAuto, frame), -1.0, 1.0) : b.pan; }
+
+bool busMutedAt(const Bus& b, double frame) { return b.muted || (reads(b) && laneMuted(b.muteAuto, false, frame)); }
+
 bool surroundAnimated(const Track& t) { return t.surroundXAuto.animated() || t.surroundYAuto.animated() || t.surroundZAuto.animated(); }
 
 SurroundPan trackSurroundAt(const Track& t, double frame) {

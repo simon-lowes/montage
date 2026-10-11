@@ -954,6 +954,100 @@ private slots:
         QCOMPARE(a1().volumeAuto.keys.size(), keys);
     }
 
+    void mixerSendsAndBusAutomation() {
+        loadDemo();
+        auto* mixer = win_->findChild<MixerPanel*>();
+        QVERIFY(mixer);
+        QTRY_VERIFY(mixer->trackFader(0));
+        auto seq = [&]() { return state()->sequence(); };
+        auto a1 = [&]() -> const Track& { return seq()->audioTracks.at(0); };
+        const size_t buses = seq()->buses.size();
+        QVERIFY(mixer->addSendButton(0));
+        // "+ Send" › New Effects Return: a return bus, and a send row on the strip.
+        const Id ret = mixer->newReturn(0);
+        QVERIFY(ret);
+        QCOMPARE(seq()->buses.size(), buses + 1);
+        QTRY_VERIFY(mixer->sendLevel(0, 0));
+        QCOMPARE(a1().sends.size(), size_t(1));
+        QCOMPARE(a1().sends[0].bus, ret);
+        // Its slider sets the level, a drag one undo step; the same bus again adds nothing.
+        QSlider* level = mixer->sendLevel(0, 0);
+        level->setValue(-100);
+        level->setValue(-120);
+        QCOMPARE(a1().sends[0].levelDb, -12.0);
+        state()->undo();
+        QCOMPARE(a1().sends[0].levelDb, 0.0);
+        mixer->addSend(0, ret);
+        QCOMPARE(a1().sends.size(), size_t(1));
+        // Touch on A1: a mute pressed at frame 20 is written from there to the stop (a switch latches); the send's level
+        // held at -6 dB over frames 30-39. One undo step.
+        mixer->trackAutomationMode(0)->setCurrentIndex(int(AutomationMode::Touch));
+        mixer->playbackStarted(0);
+        QVERIFY(mixer->recordingAutomation());
+        level = mixer->sendLevel(0, 0);
+        for (FrameTime f = 0; f <= 60; ++f) {
+            if (f == 20) mixer->trackMute(0)->setChecked(true);
+            if (f == 30) {
+                level->setSliderDown(true);
+                level->setValue(-60);
+            }
+            if (f == 40) level->setSliderDown(false);
+            mixer->playbackPosition(f);
+            if (f == 25) QVERIFY(a1().muted);  // heard while it is written
+        }
+        mixer->playbackStopped(60);
+        QVERIFY(!mixer->recordingAutomation());
+        QVERIFY(!a1().muted && a1().muteAuto.animated());
+        QVERIFY(!trackMutedAt(a1(), 10) && trackMutedAt(a1(), 30) && trackMutedAt(a1(), 60));
+        QCOMPARE(a1().sends[0].levelAuto.at(35), -6.0);
+        QCOMPARE(a1().sends[0].levelAuto.at(10), 0.0);
+        QCOMPARE(a1().sends[0].levelDb, 0.0);
+        state()->undo();
+        QVERIFY(!a1().muteAuto.animated() && !a1().sends[0].levelAuto.animated());
+        state()->redo();
+        QVERIFY(a1().muteAuto.animated());
+        // The mute button follows its lane at the playhead.
+        state()->setPlayhead(10);
+        QVERIFY(!mixer->trackMute(0)->isChecked());
+        state()->setPlayhead(30);
+        QVERIFY(mixer->trackMute(0)->isChecked());
+        // The return bus in Write: its fader -10 dB from frame 15; Write hands over to Touch.
+        const int busIndex = int(seq()->buses.size()) - 1;
+        QSlider* busFader = mixer->busFader(busIndex);
+        QComboBox* busMode = mixer->busAutomationMode(busIndex);
+        QVERIFY(busFader && busMode && mixer->busPan(busIndex) && mixer->busMute(busIndex));
+        mixer->trackAutomationMode(0)->setCurrentIndex(int(AutomationMode::Read));
+        busMode->setCurrentIndex(int(AutomationMode::Write));
+        QCOMPARE(seq()->buses.back().automation, int(AutomationMode::Write));
+        mixer->playbackStarted(0);
+        QVERIFY(mixer->recordingAutomation() && !busMode->isEnabled());
+        for (FrameTime f = 0; f <= 40; ++f) {
+            if (f == 15) busFader->setValue(-100);
+            mixer->playbackPosition(f);
+        }
+        mixer->playbackStopped(40);
+        {
+            const Bus& b = seq()->buses.back();
+            QVERIFY(b.volumeAuto.animated());
+            QCOMPARE(b.volumeAuto.at(5), 0.0);
+            QCOMPARE(b.volumeAuto.at(25), -10.0);
+            QCOMPARE(b.volumeDb, 0.0);
+            QCOMPARE(b.automation, int(AutomationMode::Touch));
+        }
+        QCOMPARE(busMode->currentIndex(), int(AutomationMode::Touch));
+        // Stopped, reading: the bus fader follows its lane, and moving it keys the lane at the playhead.
+        busMode->setCurrentIndex(int(AutomationMode::Read));
+        state()->setPlayhead(25);
+        QCOMPARE(busFader->value(), -100);
+        busFader->setValue(-30);
+        QVERIFY(seq()->buses.back().volumeAuto.keyAt(25) && seq()->buses.back().volumeAuto.keyAt(25)->v == -3.0);
+        QCOMPARE(seq()->buses.back().volumeDb, 0.0);
+        // Deleting the bus takes A1's send with it.
+        QVERIFY(state()->apply("Delete Bus", [ret](Project&, Sequence& s) { return edit::removeBus(s, ret); }));
+        QVERIFY(a1().sends.empty());
+        QTRY_VERIFY(!mixer->sendLevel(0, 0));
+    }
+
     void surroundPositionAutomation() {
         loadDemo();
         state()->edit("5.1", [](Project&, Sequence& s) {

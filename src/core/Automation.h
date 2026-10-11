@@ -20,6 +20,18 @@ AutomationMode trackAutomation(const Track& t);
 // The fader values heard at timeline frame t (fractional frames interpolate between whole ones).
 double trackVolumeAt(const Track& t, double frame);
 double trackPanAt(const Track& t, double frame);
+// Mute lanes are switches: the value of the last key at or before the frame (the first key's before it), muted at 0.5
+// or more; without keys, the static mute.
+bool laneMuted(const Param& lane, bool still, double frame);
+bool trackMutedAt(const Track& t, double frame);  // the static mute, or the mute lane where the track reads its lanes
+// A send's level heard at frame t (its lane where the track reads its lanes).
+double sendLevelAt(const Track& t, const Send& send, double frame);
+// Buses: their own mode and lanes, as tracks'.
+AutomationMode busAutomation(const Bus& b);
+double busVolumeAt(const Bus& b, double frame);
+double busPanAt(const Bus& b, double frame);
+bool busMutedAt(const Bus& b, double frame);
+
 // Whether a track's surround position moves (any of its x, y, z lanes has keys), and where it is at frame t when the
 // lanes play: SurroundPan with x, y and z from the lanes that have keys (within -1..1, z 0..1).
 bool surroundAnimated(const Track& t);

@@ -2180,55 +2180,130 @@ void McpServer::Impl::addTools() {
             return ok(text, QJsonObject{{"misspellings", list}, {"vocabulary", int(l.project.vocabulary.size())}});
         });
 
-    add("montage_automate_track", "Automate a track's fader",
-        "Set an audio track's fader automation, as written from the mixer: its mode (off, read, write, latch, touch) and "
-        "volume (dB) and pan (-1 left to 1 right) points at times; points replace the lane's points between the first and last "
-        "given. clear removes the lanes. Lists the lanes afterwards.",
+    add("montage_automate_track", "Automate a track's or bus's mix",
+        "Set an audio track's mix automation, as written from the mixer: its mode (off, read, write, latch, touch) and "
+        "volume (dB), pan (-1 left to 1 right) and mute (1 muted, 0 not; a switch held to the next point) points at times; "
+        "points replace the lane's points between the first and last given. sends sets aux sends to buses by name (a bus "
+        "not there yet is made, as an effects return): level_db, pre_fader, muted, level points, or remove. With bus, the "
+        "named bus's mode, volume, pan and mute are set instead. clear removes the lanes. Lists the automation afterwards.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"track":{"type":"string","default":"A1"},
+            "bus":{"type":"string","description":"Automate this bus (by name) instead of a track"},
             "mode":{"type":"string","enum":["off","read","write","latch","touch"]},
             "volume":{"type":"array","items":{"type":"array","items":{"type":["number","string"]},"minItems":2,"maxItems":2},
                       "description":"[[time, dB], ...]"},
             "pan":{"type":"array","items":{"type":"array","items":{"type":["number","string"]},"minItems":2,"maxItems":2},
                    "description":"[[time, pan], ...]"},
+            "mute":{"type":"array","items":{"type":"array","items":{"type":["number","string"]},"minItems":2,"maxItems":2},
+                    "description":"[[time, 1 or 0], ...]"},
+            "sends":{"type":"array","items":{"type":"object","properties":{
+                "bus":{"type":"string"},"level_db":{"type":"number"},"pre_fader":{"type":"boolean"},"muted":{"type":"boolean"},
+                "remove":{"type":"boolean"},
+                "level":{"type":"array","items":{"type":"array","items":{"type":["number","string"]},"minItems":2,"maxItems":2},
+                         "description":"[[time, dB], ...]"}},"required":["bus"]}},
             "clear":{"type":"boolean","default":false}},"required":["project"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
-            const TrackRef ref = trackArg(str(a, "track", "A1"), s, false);
-            if (ref.kind != TrackKind::Audio) throw ArgError{QStringLiteral("Automation is for audio tracks (A1, A2...)")};
-            Track& t = s.audioTracks.at(size_t(ref.index));
-            if (a.value("clear").toBool()) t.volumeAuto = Param(), t.panAuto = Param();
-            if (a.contains("mode")) {
+            const QStringList names{"off", "read", "write", "latch", "touch"};
+            auto mode = [&]() {
                 const QString m = str(a, "mode").toLower();
-                const QStringList names{"off", "read", "write", "latch", "touch"};
                 if (!names.contains(m)) throw ArgError{QStringLiteral("\"mode\" must be off, read, write, latch or touch")};
-                t.automation = int(names.indexOf(m));
-            }
-            auto points = [&](const char* key, Param& lane, double lo, double hi) {
-                const QJsonArray pts = a.value(key).toArray();
+                return int(names.indexOf(m));
+            };
+            auto points = [&](const QJsonArray& pts, const QString& key, Param& lane, double lo, double hi, bool hold) {
                 if (pts.isEmpty()) return;
                 std::vector<Keyframe> keys;
                 for (const auto& v : pts) {
                     const QJsonArray pt = v.toArray();
-                    if (pt.size() != 2) throw ArgError{QStringLiteral("\"%1\" points are [time, value]").arg(QString::fromLatin1(key))};
-                    keys.push_back({timeArg(pt.at(0), s, key), std::clamp(pt.at(1).toDouble(), lo, hi)});
+                    if (pt.size() != 2) throw ArgError{QStringLiteral("\"%1\" points are [time, value]").arg(key)};
+                    Keyframe k{timeArg(pt.at(0), s, key.toLatin1().constData()), std::clamp(pt.at(1).toDouble(), lo, hi)};
+                    if (hold) k.interp = Interp::Hold, k.v = k.v >= 0.5 ? 1 : 0;
+                    keys.push_back(k);
                 }
                 std::sort(keys.begin(), keys.end(), [](const Keyframe& x, const Keyframe& y) { return x.t < y.t; });
                 std::erase_if(lane.keys, [&](const Keyframe& k) { return k.t >= keys.front().t && k.t <= keys.back().t; });
                 for (const Keyframe& k : keys) lane.keys.push_back(k);
                 std::sort(lane.keys.begin(), lane.keys.end(), [](const Keyframe& x, const Keyframe& y) { return x.t < y.t; });
             };
-            points("volume", t.volumeAuto, -60, 12);
-            points("pan", t.panAuto, -1, 1);
-            save(l);
             auto describe = [&](const Param& lane, const char* unit) {
                 QStringList parts;
                 for (const Keyframe& k : lane.keys) parts << QStringLiteral("%1 %2%3").arg(tc(k.t, s)).arg(k.v, 0, 'f', 2).arg(QString::fromLatin1(unit));
                 return parts.isEmpty() ? QStringLiteral("none") : parts.join(QStringLiteral(", "));
             };
-            return ok(QStringLiteral("%1: %2 automation\nVolume: %3\nPan: %4")
+            auto findBus = [&](const QString& name) -> Bus* {
+                for (Bus& b : s.buses)
+                    if (QString::fromStdString(b.name).compare(name, Qt::CaseInsensitive) == 0) return &b;
+                return nullptr;
+            };
+            if (a.contains("bus")) {
+                Bus* b = findBus(str(a, "bus"));
+                if (!b) throw ArgError{QStringLiteral("No bus called %1").arg(str(a, "bus"))};
+                if (a.value("clear").toBool()) b->volumeAuto = Param(), b->panAuto = Param(), b->muteAuto = Param();
+                if (a.contains("mode")) b->automation = mode();
+                points(a.value("volume").toArray(), QStringLiteral("volume"), b->volumeAuto, -96, 12, false);
+                points(a.value("pan").toArray(), QStringLiteral("pan"), b->panAuto, -1, 1, false);
+                points(a.value("mute").toArray(), QStringLiteral("mute"), b->muteAuto, 0, 1, true);
+                save(l);
+                return ok(QStringLiteral("Bus %1: %2 automation\nVolume: %3\nPan: %4\nMute: %5")
+                              .arg(QString::fromStdString(b->name), QString::fromLatin1(automationModeName(busAutomation(*b))),
+                                   describe(b->volumeAuto, " dB"), describe(b->panAuto, ""), describe(b->muteAuto, "")));
+            }
+            const TrackRef ref = trackArg(str(a, "track", "A1"), s, false);
+            if (ref.kind != TrackKind::Audio) throw ArgError{QStringLiteral("Automation is for audio tracks (A1, A2...)")};
+            const int ti = ref.index;
+            if (a.value("clear").toBool()) {
+                Track& t = s.audioTracks.at(size_t(ti));
+                t.volumeAuto = Param(), t.panAuto = Param(), t.muteAuto = Param();
+                for (Send& sd : t.sends) sd.levelAuto = Param();
+            }
+            if (a.contains("mode")) s.audioTracks.at(size_t(ti)).automation = mode();
+            for (const auto& v : a.value("sends").toArray()) {
+                const QJsonObject so = v.toObject();
+                const QString name = so.value("bus").toString().trimmed();
+                if (name.isEmpty()) throw ArgError{QStringLiteral("Each send names its bus")};
+                Bus* b = findBus(name);
+                if (!b) {
+                    if (so.value("remove").toBool()) throw ArgError{QStringLiteral("No bus called %1").arg(name)};
+                    Bus nb;  // a new effects return
+                    nb.id = l.project.newId();
+                    nb.name = name.toStdString();
+                    s.buses.push_back(nb);
+                    b = &s.buses.back();
+                }
+                const Id bus = b->id;
+                if (so.value("remove").toBool()) {
+                    if (auto r = edit::removeSend(s, ti, bus); !r.ok) throw ArgError{QString::fromStdString(r.error)};
+                    continue;
+                }
+                const auto& sends = s.audioTracks.at(size_t(ti)).sends;
+                auto was = std::find_if(sends.begin(), sends.end(), [bus](const Send& x) { return x.bus == bus; });
+                const double level = so.contains("level_db") ? so.value("level_db").toDouble() : (was != sends.end() ? was->levelDb : 0.0);
+                const bool pre = so.contains("pre_fader") ? so.value("pre_fader").toBool() : (was != sends.end() && was->preFader);
+                if (auto r = edit::setSend(s, ti, bus, level, pre); !r.ok) throw ArgError{QString::fromStdString(r.error)};
+                for (Send& sd : s.audioTracks.at(size_t(ti)).sends)
+                    if (sd.bus == bus) {
+                        if (so.contains("muted")) sd.muted = so.value("muted").toBool();
+                        points(so.value("level").toArray(), QStringLiteral("level"), sd.levelAuto, -96, 12, false);
+                    }
+            }
+            Track& t = s.audioTracks.at(size_t(ti));
+            points(a.value("volume").toArray(), QStringLiteral("volume"), t.volumeAuto, -60, 12, false);
+            points(a.value("pan").toArray(), QStringLiteral("pan"), t.panAuto, -1, 1, false);
+            points(a.value("mute").toArray(), QStringLiteral("mute"), t.muteAuto, 0, 1, true);
+            save(l);
+            QStringList sendText;
+            for (const Send& sd : t.sends) {
+                QString busName = QStringLiteral("?");
+                for (const Bus& b : s.buses)
+                    if (b.id == sd.bus) busName = QString::fromStdString(b.name);
+                sendText << QStringLiteral("%1 %2 dB%3%4%5").arg(busName).arg(sd.levelDb, 0, 'f', 1)
+                                .arg(sd.preFader ? QStringLiteral(" pre-fader") : QString(), sd.muted ? QStringLiteral(" (muted)") : QString(),
+                                     sd.levelAuto.animated() ? QStringLiteral(", level: ") + describe(sd.levelAuto, " dB") : QString());
+            }
+            return ok(QStringLiteral("%1: %2 automation\nVolume: %3\nPan: %4\nMute: %5\nSends: %6")
                           .arg(str(a, "track", "A1"), QString::fromLatin1(automationModeName(trackAutomation(t))), describe(t.volumeAuto, " dB"),
-                               describe(t.panAuto, "")));
+                               describe(t.panAuto, ""), describe(t.muteAuto, ""),
+                               sendText.isEmpty() ? QStringLiteral("none") : sendText.join(QStringLiteral("; "))));
         });
 
     add("montage_export_lut", "Export a clip's grade as a LUT",

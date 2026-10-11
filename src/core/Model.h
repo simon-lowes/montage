@@ -338,6 +338,18 @@ struct SurroundPan {
     bool operator==(const SurroundPan&) const = default;
 };
 
+// An aux send (Pro Tools', Fairlight's and Premiere's sends): a copy of an audio track's sound fed to a bus, an effects
+// return such as a shared reverb, at its own level. Post-fader (the usual) it follows the track's fader, pan and mute;
+// pre-fader it is taken after the inserts, before the fader, for a level of its own (a foldback or a stem).
+struct Send {
+    Id bus = 0;
+    double levelDb = 0;
+    bool preFader = false;
+    bool muted = false;
+    Param levelAuto;  // send level automation (dB), keyed in timeline frames and played in the track's mode
+    bool operator==(const Send&) const = default;
+};
+
 struct Track {
     Id id = 0;
     TrackKind kind = TrackKind::Video;
@@ -360,7 +372,10 @@ struct Track {
     // Surround position lanes (x, y, z as in SurroundPan), keyed in timeline frames and played in the same mode: a
     // sound, or an ADM object, moving round the room.
     Param surroundXAuto, surroundYAuto, surroundZAuto;
+    // Mute automation: muted where the lane is 0.5 or more, holding each key's value until the next (a switch).
+    Param muteAuto;
     int automation = 1;
+    std::vector<Send> sends;  // audio: aux sends to buses
     // Track folder (Resolve's Fairlight folders): tracks of a kind with the same folder, next to each other, show under
     // one header that can collapse them and mute, solo or hide them together. "" = none.
     std::string folder;
@@ -377,6 +392,9 @@ struct Bus {
     double pan = 0;
     bool muted = false;
     SurroundPan surround;
+    // Its fader, pan and mute automation (core/Automation.h), keyed in timeline frames, and its AutomationMode.
+    Param volumeAuto, panAuto, muteAuto;
+    int automation = 1;
     bool operator==(const Bus&) const = default;
 };
 

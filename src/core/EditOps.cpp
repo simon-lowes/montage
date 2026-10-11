@@ -2457,6 +2457,39 @@ void setFolderGain(Sequence& s, TrackKind kind, const std::string& folder, doubl
     else s.folderGains[folderKey(kind, folder)] = db;
 }
 
+Result removeBus(Sequence& s, Id bus) {
+    auto it = std::find_if(s.buses.begin(), s.buses.end(), [bus](const Bus& b) { return b.id == bus; });
+    if (it == s.buses.end()) return Result::fail("No such bus");
+    s.buses.erase(it);
+    for (Track& t : s.audioTracks) {
+        if (t.output == bus) t.output = 0;  // back to the master
+        std::erase_if(t.sends, [bus](const Send& sd) { return sd.bus == bus; });
+    }
+    return {};
+}
+
+Result setSend(Sequence& s, int audioTrack, Id bus, double levelDb, bool preFader) {
+    if (audioTrack < 0 || audioTrack >= int(s.audioTracks.size())) return Result::fail("No such audio track");
+    if (std::none_of(s.buses.begin(), s.buses.end(), [bus](const Bus& b) { return b.id == bus; })) return Result::fail("No such bus");
+    Track& t = s.audioTracks[size_t(audioTrack)];
+    auto it = std::find_if(t.sends.begin(), t.sends.end(), [bus](const Send& sd) { return sd.bus == bus; });
+    if (it == t.sends.end()) {
+        Send sd;
+        sd.bus = bus;
+        it = t.sends.insert(t.sends.end(), sd);
+    }
+    it->levelDb = std::clamp(levelDb, -96.0, 12.0);
+    it->preFader = preFader;
+    return {};
+}
+
+Result removeSend(Sequence& s, int audioTrack, Id bus) {
+    if (audioTrack < 0 || audioTrack >= int(s.audioTracks.size())) return Result::fail("No such audio track");
+    if (!std::erase_if(s.audioTracks[size_t(audioTrack)].sends, [bus](const Send& sd) { return sd.bus == bus; }))
+        return Result::fail("No send to that bus");
+    return {};
+}
+
 Result renameFolder(Sequence& s, TrackKind kind, const std::string& from, const std::string& to) {
     if (to.empty() || to.find('/') != std::string::npos) return Result::fail("Give the folder a name without a slash");
     if (to != from && !folderTracks(s, kind, to).empty()) return Result::fail("There is already a folder called " + to);
