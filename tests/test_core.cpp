@@ -1155,6 +1155,9 @@ private slots:
         const MidiMessage shortTc = hui::timecode("12:34")[0];
         QCOMPARE(MidiMessage(shortTc.begin() + 7, shortTc.end() - 1), (MidiMessage{0x04, 0x03, 0x12, 0x01}));
         QCOMPARE(hui::timecode("100:00:00:00")[0].size(), size_t(6 + 1 + 8 + 1));  // the last eight digits
+        // Only the rightmost digits, as many as asked.
+        QCOMPARE(hui::timecodeDigits("01:02:03:04"), (std::vector<int>{0x04, 0x00, 0x13, 0x00, 0x12, 0x00, 0x11, 0x00}));
+        QCOMPARE(hui::timecode(hui::timecodeDigits("01:02:03:04"), 2), (MidiMessage{0xF0, 0x00, 0x00, 0x66, 0x05, 0x00, 0x11, 0x04, 0x00, 0xF7}));
     }
 
     void captionPlacement() {

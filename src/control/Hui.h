@@ -63,6 +63,10 @@ MidiMessage display(int zone, const std::string& text);       // ten characters 
 // The timecode display, from text such as "01:00:00:00" (the last eight digits, a point after hours, minutes and
 // seconds); nothing for text with no digits.
 std::vector<MidiMessage> timecode(const std::string& text);
+// Its digits as the display takes them, the rightmost first, and the first `count` of them (the surface keeps the rest:
+// a frame's change sends two).
+std::vector<int> timecodeDigits(const std::string& text);
+MidiMessage timecode(const std::vector<int>& digits, size_t count);
 // Text for the displays, plain ASCII the surface can show, cut or padded to `width`.
 std::string fit(const std::string& text, int width, bool mainDisplay = false);
 

@@ -160,21 +160,31 @@ MidiMessage display(int zone, const std::string& text) {
     return m;
 }
 
-std::vector<MidiMessage> timecode(const std::string& text) {
+std::vector<int> timecodeDigits(const std::string& text) {
     // The digits, with a point after the last digit of each group but the last (hours, minutes and seconds).
     std::vector<int> digits;
-    for (size_t i = 0; i < text.size(); ++i) {
-        const char c = text[i];
+    for (char c : text) {
         if (c >= '0' && c <= '9') digits.push_back(c - '0');
         else if ((c == ':' || c == ';' || c == '.') && !digits.empty()) digits.back() |= 0x10;
     }
     if (digits.empty()) return {};
     if (digits.size() > 8) digits.erase(digits.begin(), digits.end() - 8);
     digits.back() &= 0x0F;  // (the rightmost digit has no point)
+    std::reverse(digits.begin(), digits.end());
+    return digits;
+}
+
+MidiMessage timecode(const std::vector<int>& digits, size_t count) {
     MidiMessage m = sysex(0x11);
-    for (auto it = digits.rbegin(); it != digits.rend(); ++it) m.push_back(uint8_t(*it));  // the rightmost first
+    for (size_t i = 0; i < std::min(count, digits.size()); ++i) m.push_back(uint8_t(digits[i]));
     m.push_back(0xF7);
-    return {m};
+    return m;
+}
+
+std::vector<MidiMessage> timecode(const std::string& text) {
+    const std::vector<int> digits = timecodeDigits(text);
+    if (digits.empty()) return {};
+    return {timecode(digits, digits.size())};
 }
 
 }  // namespace montage::hui

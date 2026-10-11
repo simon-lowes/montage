@@ -407,7 +407,10 @@ void MainWindow::buildPanels() {
         if (const Sequence* s = state_->sequence()) program_->seek(edit::nextEdit(*s, state_->playhead()));
     });
     surface_->setCommand(QStringLiteral("loop"), [this] {
-        if (auto* loop = findChild<QToolButton*>(QStringLiteral("programLoop"))) loop->click();
+        // From what playback does (ADR's takes set it without the button), the button kept in step.
+        const bool on = !program_->loop();
+        if (auto* loop = findChild<QToolButton*>(QStringLiteral("programLoop"))) loop->setChecked(on);
+        program_->setLoop(on);
     });
     surface_->setProtocol(appSettings().value(QStringLiteral("controlSurface/protocol")).toString() == QLatin1String("hui")
                               ? SurfaceProtocol::Hui

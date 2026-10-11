@@ -84,6 +84,7 @@ private:
     void send(const MidiMessage& m);
     void send(const std::vector<MidiMessage>& ms);
     void hello();  // what a surface is first sent: Mackie Control's device query, HUI's ping
+    void start();  // the connection (or protocol) new: hello, then everything shown
     void reset();
     mcu::Event decode(const MidiMessage& m);  // (a surface announcing itself is shown everything again)
     void apply(const mcu::Event& e);
@@ -116,6 +117,7 @@ private:
     int bank_ = 0;
     Id selected_ = 0;  // the selected track (by id, so it stays itself when tracks move)
     uint64_t project_ = 0;  // the project the selection and bank are in (EditorState::projectGeneration)
+    QString projectFile_;   // and its file
     void followProject();   // another project open: the selection cleared, the first tracks on the strips
     // Per strip (and the master, index 8): held by touch, held by movement (faders and pots apart), when a pot last
     // turned, and when the level below the name was last sent.
@@ -137,9 +139,11 @@ private:
     SurfaceProtocol protocol_ = SurfaceProtocol::MackieControl;
     hui::Decoder decoder_;
     qint64 pingAt_ = 0, pingReplyAt_ = 0;  // HUI: when a ping was last sent and last answered
+    qint64 resentAt_ = 0;                  // HUI: when it was last shown everything again
     qint64 levelsAt_ = 0;                  // when playback levels last came
     std::array<std::string, 8> zones_;     // HUI: the main display's zones as last sent
     std::array<qint64, 8> zoneAt_{};
+    std::vector<int> huiDigits_;           // HUI: the timecode digits as last sent, the rightmost first
     std::array<int, 8> levels_{};
     std::array<qint64, 8> meterAt_{};
 };

@@ -91,15 +91,19 @@ void ControlSurface::setConnection(std::unique_ptr<MidiConnection> connection) {
     connection_ = std::move(connection);
     ++generation_;
     if (!connection_) return;
+    start();
+    emit connectionChanged(true);
+}
+
+void ControlSurface::start() {
     // Asked to say it is there (Mackie Control surfaces that wait for a host answer it, the rest are taken as there;
     // a HUI is pinged), meters with their signal and peak lights, then everything it shows.
     decoder_.reset();
-    pingReplyAt_ = QDateTime::currentMSecsSinceEpoch();
+    pingReplyAt_ = resentAt_ = QDateTime::currentMSecsSinceEpoch();
     hello();
     reset();
     refresh();
     timer_->start();
-    emit connectionChanged(true);
 }
 
 void ControlSurface::disconnectSurface() {
@@ -139,12 +143,11 @@ void ControlSurface::setProtocol(SurfaceProtocol protocol) {
         protocol_ = protocol;
         return;
     }
-    // The surface was switched to its other mode: the same ports, taken over in the new protocol.
+    // The surface was switched to its other mode: the same ports (and connection), taken over in the new protocol.
     timer_->stop();
     releaseAll();
-    std::unique_ptr<MidiConnection> c = std::move(connection_);
     protocol_ = protocol;
-    setConnection(std::move(c));
+    start();
 }
 
 void ControlSurface::releaseAll() {
@@ -212,7 +215,8 @@ void ControlSurface::drain() {
 
 int ControlSurface::selectedTrack() const {
     const Sequence* s = state_->sequence();
-    if (!s || !selected_ || state_->projectGeneration() != project_) return -1;
+    if (!s || !selected_) return -1;
+    if (state_->projectGeneration() != project_ && (state_->filePath().isEmpty() || state_->filePath() != projectFile_)) return -1;
     for (size_t i = 0; i < s->audioTracks.size(); ++i)
         if (s->audioTracks[i].id == selected_) return int(i);
     return -1;
@@ -251,6 +255,7 @@ void ControlSurface::reset() {
     meterAt_ = {};
     zones_ = {};
     zoneAt_ = {};
+    huiDigits_.clear();
     if (!isHui())
         for (int i = 0; i < mcu::kStrips; ++i) send(mcu::meterMode(i, 0x03, device_));
 }
@@ -311,11 +316,13 @@ void ControlSurface::handle(const MidiMessage& m) { apply(decode(m)); }
 mcu::Event ControlSurface::decode(const MidiMessage& m) {
     if (isHui()) {
         if (hui::isPingReply(m) || hui::isSystemReset(m)) {
-            // A surface switched on, or answering again after a silence (it was off line): shown everything again.
+            // A surface switched on (it sends one or more resets), or answering again after a silence long enough for
+            // it to have gone off line (two seconds without a ping): shown everything again, once.
             const qint64 now = QDateTime::currentMSecsSinceEpoch();
-            const bool back = hui::isSystemReset(m) || now - pingReplyAt_ > 3000;
-            if (hui::isPingReply(m)) pingReplyAt_ = now;
+            const bool back = hui::isSystemReset(m) ? now - resentAt_ > 500 : now - pingReplyAt_ > 1800;
+            pingReplyAt_ = now;
             if (back) {
+                resentAt_ = now;
                 decoder_.reset();
                 reset();
                 refresh();
@@ -340,7 +347,13 @@ mcu::Event ControlSurface::decode(const MidiMessage& m) {
 void ControlSurface::followProject() {
     if (state_->projectGeneration() == project_) return;
     project_ = state_->projectGeneration();
-    selected_ = 0;  // (ids start again in another project, so the old one could name another track)
+    // Another project: the selection cleared (ids start again there, so the old one could name another track) and the
+    // first tracks on the strips. The same project read again from disk (a read-only one following its editor's
+    // saves, File > Edit Project) keeps both.
+    const QString file = state_->filePath();
+    if (!file.isEmpty() && file == projectFile_) return;
+    projectFile_ = file;
+    selected_ = 0;
     bank_ = 0;
 }
 
@@ -632,9 +645,20 @@ void ControlSurface::refresh() {
             assignment_ = a;
         }
     }
-    // The timecode display, digit by digit as they change (a HUI's all at once).
+    // The timecode display, digit by digit as they change (a HUI's from the rightmost up to the last that changed).
     const std::string tc = seq ? formatTimecode(state_->playhead(), seq->fps) : std::string();
-    const std::vector<MidiMessage> digits = isHui() ? hui::timecode(tc) : mcu::timecode(tc);
+    if (isHui()) {
+        const std::vector<int> digits = hui::timecodeDigits(tc);
+        size_t changed = 0;  // how many digits from the rightmost to send
+        if (digits.size() != huiDigits_.size()) changed = digits.size();
+        else
+            for (size_t i = 0; i < digits.size(); ++i)
+                if (digits[i] != huiDigits_[i]) changed = i + 1;
+        if (changed > 0) send(hui::timecode(digits, changed));
+        huiDigits_ = digits;
+        return;
+    }
+    const std::vector<MidiMessage> digits = mcu::timecode(tc);
     if (digits_.size() != digits.size()) digits_.assign(digits.size(), std::string());
     for (size_t i = 0; i < digits.size(); ++i) {
         const std::string key(digits[i].begin(), digits[i].end());

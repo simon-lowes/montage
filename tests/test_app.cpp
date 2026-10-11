@@ -939,9 +939,10 @@ private slots:
         QVERIFY(hasPair(hui::led(0x16, 0, true)));  // the timecode light
         QVERIFY(has(hui::timecode("00:00:00:00")[0]));
         QVERIFY(has(hui::stripText(8, "   1")));  // Select-Assign: the first track on the strips
-        // Nothing of Mackie Control's.
-        QVERIFY(std::none_of(sent->begin(), sent->end(), [](const MidiMessage& m) { return (m[0] & 0xF0) == 0xE0 || (m[0] & 0xF0) == 0xD0; }));
-        QVERIFY(!has(mcu::deviceQuery()));
+        // Nothing of Mackie Control's: no pitch bend, channel pressure, notes but the ping, or its system exclusive.
+        QVERIFY(std::none_of(sent->begin(), sent->end(), [](const MidiMessage& m) {
+            return (m[0] & 0xF0) == 0xE0 || (m[0] & 0xF0) == 0xD0 || (m[0] == 0x90 && m != hui::ping()) || (m[0] == 0xF0 && (m.size() < 5 || m[4] != 0x05));
+        }));
 
         // A touched fader moving: the track's volume, the position echoed back.
         sent->clear();
@@ -1022,6 +1023,20 @@ private slots:
         QVERIFY(hasPair(hui::led(0x0F, 3, true)));
         press(0x0F, 3);
         QVERIFY(!loop->isChecked() && !program->loop());
+        // Looping set by playback itself (ADR's takes) with the button left as it was: Loop follows playback.
+        loop->setChecked(true);
+        program->setLoop(false);
+        press(0x0F, 3);
+        QVERIFY(loop->isChecked() && program->loop());
+        press(0x0F, 3);
+        QVERIFY(!loop->isChecked() && !program->loop());
+        // The timecode display is sent from its rightmost digit up to the last that changed (a frame: one digit).
+        state()->setPlayhead(0);
+        surface->refresh();
+        sent->clear();
+        state()->setPlayhead(1);
+        surface->refresh();
+        QVERIFY(has(hui::timecode(hui::timecodeDigits("00:00:00:01"), 1)));
         const size_t markers = state()->sequence()->markers.size();
         press(0x14, 0);
         QCOMPARE(state()->sequence()->markers.size(), markers + 1);
@@ -1039,14 +1054,45 @@ private slots:
         surface->setLevels(0, 0, QVector<float>{0.5f, 0.25f, 1.0f, 1.0f});
         QVERIFY(has(hui::meter(0, 0, 8)) && has(hui::meter(0, 1, 8)) && has(hui::meter(1, 0, 12)));
         QTRY_VERIFY_WITH_TIMEOUT(has(hui::meter(0, 0, 0)) && has(hui::meter(1, 1, 0)), 2000);
-        // Pinged once a second; a ping answered is not news, a surface switched on is shown everything again.
+        // Pinged once a second; a ping answered a second after the last is not news, an answer after a silence long
+        // enough for the surface to have gone off line (two seconds) is, and so is a surface switched on (its several
+        // resets shown everything once).
         sent->clear();
         QTRY_VERIFY_WITH_TIMEOUT(has(hui::ping()), 2500);
+        surface->handle({0x90, 0x00, 0x7F});
         sent->clear();
+        QTest::qWait(1000);
         surface->handle({0x90, 0x00, 0x7F});
         QVERIFY(!has(hui::stripText(0, "Dial")));
+        QTest::qWait(1900);
+        sent->clear();
+        surface->handle({0x90, 0x00, 0x7F});
+        QVERIFY(has(hui::stripText(0, "Dial")));
+        QTest::qWait(600);
+        sent->clear();
         surface->handle({0xFF});
-        QVERIFY(has(hui::stripText(0, "Dial")) && has(hui::display(0, "Dial Trk  ")));
+        surface->handle({0xFF});
+        surface->handle({0x90, 0x00, 0x7F});
+        QCOMPARE(std::count(sent->begin(), sent->end(), hui::stripText(0, "Dial")), 1);
+        QVERIFY(has(hui::display(0, "Dial Trk  ")));
+        // The same project opened again keeps the bank and selection; another project starts afresh.
+        const QString file = dir_.filePath("hui.montage");
+        QVERIFY(state()->save(file));
+        QVERIFY(state()->open(file));
+        press(0x0A, 3);
+        press(4, 1);
+        QCOMPARE(surface->bank(), 2);
+        QCOMPARE(surface->selectedTrack(), 6);
+        QVERIFY(state()->open(file));
+        surface->refresh();
+        QCOMPARE(surface->bank(), 2);
+        QCOMPARE(surface->selectedTrack(), 6);
+        state()->newProject();
+        surface->refresh();
+        QCOMPARE(surface->bank(), 0);
+        QCOMPARE(surface->selectedTrack(), -1);
+        QVERIFY(state()->open(file));
+        surface->refresh();
 
         // Disconnecting leaves it clean.
         sent->clear();
@@ -1064,7 +1110,11 @@ private slots:
         QVERIFY(surface->isConnected() && surface->protocol() == SurfaceProtocol::MackieControl);
         QCOMPARE(sent2->front(), mcu::deviceQuery());
         QVERIFY(std::find(sent2->begin(), sent2->end(), mcu::lcd(0, "Dialog ")) != sent2->end());
-        surface->disconnectSurface();
+        // The same connection still: unplugged just before the switch, the loss still closes it.
+        surface->connectionLost();
+        surface->setProtocol(SurfaceProtocol::Hui);
+        QTRY_VERIFY(!surface->isConnected());
+        surface->setProtocol(SurfaceProtocol::MackieControl);
 
         // The dialog offers both protocols and keeps the choice.
         QDialog* dlg = win_->controlSurfaceDialog();
