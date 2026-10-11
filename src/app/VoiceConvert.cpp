@@ -62,13 +62,20 @@ bool convertClipVoice(EditorState* state, Id clip, const ClonedVoice& voice, QWi
     };
     const Sequence* s = state->sequence();
     if (!s) return fail(QObject::tr("No sequence"));
-    const auto at = edit::locate(*s, clip);
-    const Clip* c = edit::clipById(*s, clip);
+    auto convertible = [&] {
+        const auto at = s ? edit::locate(*s, clip) : std::nullopt;
+        return at && at->track.kind == TrackKind::Audio;
+    };
     double from = 0, to = 0;
-    if (!at || at->track.kind != TrackKind::Audio || !edit::voiceConversionRange(state->project(), *s, clip, handles, from, to))
+    if (!convertible() || !edit::voiceConversionRange(state->project(), *s, clip, handles, from, to))
         return fail(QObject::tr("Select a clip with speech on an audio track to convert"));
     if (voice.sample.empty()) return fail(QObject::tr("No voice to convert to"));
     if (!ensureVoiceCloneModel(parent)) return fail(QObject::tr("Cancelled"));
+    // (Looked at again: the model's download runs its own event loop, and the editor may have moved on.)
+    s = state->sequence();
+    if (!s || !convertible() || !edit::voiceConversionRange(state->project(), *s, clip, handles, from, to))
+        return fail(QObject::tr("The clip to convert is gone"));
+    const Clip* c = edit::clipById(*s, clip);
     const MediaItem* m = state->project().findMedia(c->mediaId);
     const std::string path = m->path, name = c->name.empty() ? m->name : c->name;
     const std::vector<int> channels = c->channels;
@@ -82,7 +89,7 @@ bool convertClipVoice(EditorState* state, Id clip, const ClonedVoice& voice, QWi
     QDir().mkpath(folder);
     QString out;
     int n = 1;
-    do out = folder + '/' + QString::fromStdString(name) + QStringLiteral(" Converted Voice ") + QString::number(n++) + QStringLiteral(".wav");
+    do out = folder + '/' + QString::fromStdString(edit::convertedVoiceStem(name)) + QString::number(n++) + QStringLiteral(".wav");
     while (QFileInfo::exists(out));
 
     QProgressDialog progress(QObject::tr("Converting the voice…"), QObject::tr("Cancel"), 0, 1000, parent);
@@ -120,7 +127,10 @@ bool convertClipVoice(EditorState* state, Id clip, const ClonedVoice& voice, QWi
         return fail(QString::fromStdString(err));
     }
     const std::vector<Id> media = state->importFiles(QStringList{out}, nullptr, QStringLiteral("Voiceover"));
-    if (media.size() != 1) return fail(QObject::tr("The converted sound could not be imported"));
+    if (media.size() != 1) {
+        QFile::remove(out);
+        return fail(QObject::tr("The converted sound could not be imported"));
+    }
     // Noted on the media as it comes in (the import's own undo step), so the bin's copy says what it is whatever follows.
     state->amend([&](Project& p, Sequence&) {
         if (MediaItem* made = p.findMedia(media[0])) {
@@ -135,7 +145,7 @@ bool convertClipVoice(EditorState* state, Id clip, const ClonedVoice& voice, QWi
         why = r.error;
         return r;
     });
-    if (!ok) return fail(QString::fromStdString(why));
+    if (!ok) return fail(QObject::tr("%1 (the converted sound is in the bin's Voiceover folder)").arg(QString::fromStdString(why)));
     state->message(QObject::tr("Converted %1 to %2's voice: the original is the clip's previous take")
                        .arg(QString::fromStdString(name), QString::fromStdString(voice.from)),
                    6000);

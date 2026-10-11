@@ -251,13 +251,9 @@ QJsonObject clipToJson(const Clip& c) {
     if (!c.takes.empty()) {
         QJsonArray takes;
         for (const Take& t : c.takes) {
-            QJsonObject take{{"media", qint64(t.mediaId)}, {"offset", t.offset}, {"name", qs(t.name)}};
-            if (!t.channels.empty()) {
-                QJsonArray ch;
-                for (int i : t.channels) ch.append(i);
-                take["channels"] = ch;
-            }
-            takes.append(take);
+            QJsonArray ch;  // (always written: a project from before takes had their own plays the clip's channels in each)
+            for (int i : t.channels) ch.append(i);
+            takes.append(QJsonObject{{"media", qint64(t.mediaId)}, {"offset", t.offset}, {"name", qs(t.name)}, {"channels", ch}});
         }
         o["takes"] = takes;
         o["take"] = c.take;
@@ -321,6 +317,7 @@ Clip clipFromJson(const QJsonObject& o) {
         Take take{Id(i64(t.value("media"))), t.value("offset").toDouble(), ss(t.value("name")), {}};
         for (const auto& v : t.value("channels").toArray())
             if (v.toInt(-1) >= 0) take.channels.push_back(v.toInt());
+        if (!t.contains("channels")) take.channels = c.channels;  // as every take played before they had their own
         c.takes.push_back(take);
     }
     c.take = c.takes.empty() ? 0 : std::clamp(o.value("take").toInt(), 0, int(c.takes.size()) - 1);

@@ -7040,6 +7040,50 @@ private slots:
         QCOMPARE(c->channels, std::vector<int>{3});
         QCOMPARE(c->sourceIn, 2 * fps);
         QVERIFY(!addConvertedTake(fx.p, fx.s(), 999999, wav.id, 1).ok);
+
+        // Another file from the same recorder (picture and four channels) plays the same channel when it is a take.
+        MediaItem camB = *fx.p.findMedia(fx.media);
+        camB.id = fx.p.newId();
+        camB.name = "B.mov";
+        camB.path = "/nonexistent/B.mov";
+        fx.p.media.push_back(camB);
+        QVERIFY(addTakes(fx.p, fx.s(), sound, {{camB.id, 3 * fps}}).ok);
+        QCOMPARE(clipById(fx.s(), sound)->takes.back().channels, std::vector<int>{3});
+        // The picture left on B under the converted take catches up when the original is picked again.
+        QVERIFY(pickTake(fx.p, fx.s(), sound, 2).ok);
+        QCOMPARE(clipById(fx.s(), picture)->mediaId, camB.id);
+        QCOMPARE(clipById(fx.s(), picture)->sourceIn, 3 * fps);
+        QCOMPARE(clipById(fx.s(), sound)->channels, std::vector<int>{3});
+        QVERIFY(pickTake(fx.p, fx.s(), sound, 1).ok);
+        QCOMPARE(clipById(fx.s(), picture)->mediaId, camB.id);  // (a sound-only take)
+        QVERIFY(pickTake(fx.p, fx.s(), sound, 0).ok);
+        QCOMPARE(clipById(fx.s(), picture)->mediaId, fx.media);
+        QCOMPARE(clipById(fx.s(), picture)->sourceIn, 2 * fps);
+        QCOMPARE(clipById(fx.s(), sound)->sourceIn, 2 * fps);
+
+        // A project from before takes had their own channels: each plays the clip's, as it did.
+        QJsonDocument doc = QJsonDocument::fromJson(QByteArray::fromStdString(projectToJson(fx.p)));
+        std::function<QJsonValue(const QJsonValue&)> strip = [&](const QJsonValue& v) -> QJsonValue {
+            if (v.isArray()) {
+                QJsonArray a;
+                for (const auto& x : v.toArray()) a.append(strip(x));
+                return a;
+            }
+            if (!v.isObject()) return v;
+            QJsonObject o = v.toObject();
+            if (o.contains("media") && o.contains("offset")) o.remove("channels");
+            for (auto it = o.begin(); it != o.end(); ++it) it.value() = strip(it.value());
+            return o;
+        };
+        Project old;
+        QVERIFY(projectFromJson(QJsonDocument(strip(doc.object()).toObject()).toJson().toStdString(), old));
+        for (const Take& t : clipById(*old.active(), sound)->takes) QCOMPARE(t.channels, std::vector<int>{3});
+
+        // A clip at twice the speed takes its last frame's two source frames; a name with a slash still makes a file name.
+        clipById(fx.s(), sound)->speed = 2;
+        QVERIFY(voiceConversionRange(fx.p, fx.s(), sound, 0, from, to));
+        QVERIFY2(std::abs(to - (2 * fps + 2 * (clipById(fx.s(), sound)->duration - 1) + 2) / fps) < 1e-9, qPrintable(QString::number(to)));
+        QCOMPARE(convertedVoiceStem("Sc 3/Tk 2: \"Hi\""), std::string("Sc 3-Tk 2- -Hi- Converted Voice "));
     }
 
     void swapClips() {

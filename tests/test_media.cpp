@@ -17076,7 +17076,9 @@ private slots:
         std::vector<float> out;
         std::string err;
         QVERIFY(!convertVoice(speech, kCloneSampleRate, std::vector<float>(kCloneSampleRate / 4, 0.2f), kCloneSampleRate, out, &err));
+        QVERIFY2(!voiceCloneAvailable() || err.find("too short") != std::string::npos, err.c_str());
         QVERIFY(!convertVoice(std::vector<float>(kCloneSampleRate * 2, 0.0f), kCloneSampleRate, speech, kCloneSampleRate, out, &err));
+        QVERIFY2(!voiceCloneAvailable() || err.find("no speech") != std::string::npos, err.c_str());
         QVERIFY(out.empty());
 
         // The real model: JFK's words in a synthetic voice, as long as he took to say them.
@@ -17178,7 +17180,7 @@ private slots:
         QCOMPARE(c.start, FrameTime(0));
         QCOMPARE(c.duration, FrameTime(std::llround(3 * fps)));
         const MediaItem* made = back.findMedia(c.mediaId);
-        QVERIFY(made && QString::fromStdString(made->name).contains("Converted Voice"));
+        QVERIFY(made && QString::fromStdString(made->name).contains("Converted Voice") && made->bin == "Voiceover");
         QVERIFY(QString::fromStdString(made->metadata.at("comment")).contains("converted to a voice cloned from narrator.wav"));
         QVERIFY(std::find(made->keywords.begin(), made->keywords.end(), "AI voice") != made->keywords.end());
     }

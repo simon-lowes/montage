@@ -5378,15 +5378,19 @@ void McpServer::Impl::addTools() {
             QDir().mkpath(folder);
             QString path;
             int n = 1;
-            do path = folder + '/' + QString::fromStdString(name) + QStringLiteral(" Converted Voice ") + QString::number(n++) + QStringLiteral(".wav");
+            do path = folder + '/' + QString::fromStdString(edit::convertedVoiceStem(name)) + QString::number(n++) + QStringLiteral(".wav");
             while (QFileInfo::exists(path));
             if (!writeClonedSpeechWav(path.toStdString(), converted, note, &err)) return fail(QString::fromStdString(err));
             const Id media = mediaFor(l.project, path);
             if (MediaItem* made = l.project.findMedia(media)) {
                 made->metadata["comment"] = note;
+                made->bin = "Voiceover";  // (as the app files it)
                 if (std::find(made->keywords.begin(), made->keywords.end(), "AI voice") == made->keywords.end()) made->keywords.push_back("AI voice");
             }
-            if (const edit::Result r = edit::addConvertedTake(l.project, s, clip, media, from); !r.ok) return fail(QString::fromStdString(r.error));
+            if (const edit::Result r = edit::addConvertedTake(l.project, s, clip, media, from); !r.ok) {
+                QFile::remove(path);  // (the project is not saved)
+                return fail(QString::fromStdString(r.error));
+            }
             save(l);
             const Clip* now = edit::clipById(s, clip);
             return ok(QStringLiteral("Converted %1 (%2 s) to the voice from %3: take %4 of %5, picked")

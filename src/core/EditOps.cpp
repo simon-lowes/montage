@@ -2636,7 +2636,10 @@ Result addTakes(Project& p, Sequence& s, Id clipId, const std::vector<std::pair<
         if (!m || m->kind == MediaKind::Sequence) return Result::fail("Takes are media files");
         if (video ? !(m->hasVideo || m->kind == MediaKind::Image) : !m->hasAudio)
             return Result::fail(video ? m->name + " has no picture" : m->name + " has no sound");
-        added.push_back({id, in - c->sourceIn, m->name, {}});
+        // The clip's channel pick, where the take has those channels (another file from the same recorder); else its own sound.
+        const int count = sourceChannelCount(*m);
+        const bool fits = std::all_of(c->channels.begin(), c->channels.end(), [&](int ch) { return ch < count; });
+        added.push_back({id, in - c->sourceIn, m->name, fits ? c->channels : std::vector<int>{}});
     }
     if (added.empty()) return Result::fail("No media to add as takes");
     if (c->takes.empty()) {
@@ -2657,21 +2660,27 @@ Result pickTake(Project& p, Sequence& s, Id clipId, int index) {
     if (!to) return Result::fail("That take's media is no longer in the project");
     // Re-based on the new pick: every take's offset from the clip's new in-point.
     const Take next = c->takes[size_t(index)];
-    const Id was = c->mediaId;
+    const std::vector<Take> before = c->takes;  // offsets from the clip's in-point before the pick
+    const int current = c->take;
     c->takes[size_t(c->take)].name = c->name;  // a rename and a channel choice stay with their take
     c->takes[size_t(c->take)].channels = c->channels;
     for (Take& t : c->takes) t.offset -= next.offset;
-    // Linked clips playing the same media follow when they can play the take as they are: it has what their track plays
-    // (a sound-only take leaves the picture as it is) and the channels they pick.
+    // Linked clips playing one of the takes' media follow when they can play the take as they are: it has what their
+    // track plays (a sound-only take leaves the picture as it is) and the channels they pick. One left behind on an
+    // earlier take (the picture under a sound-only take) catches up when a take it can play is picked.
     const int count = sourceChannelCount(*to);
     for (Id id : linkedClips(s, clipId)) {
         Clip* l = clipById(s, id);
-        const auto at = l && id != clipId && l->mediaId == was && l->takes.empty() ? locate(s, id) : std::nullopt;
+        if (!l || id == clipId || !l->takes.empty()) continue;
+        int on = l->mediaId == before[size_t(current)].mediaId ? current : -1;
+        for (int k = 0; on < 0 && k < int(before.size()); ++k)
+            if (before[size_t(k)].mediaId == l->mediaId) on = k;
+        const auto at = on >= 0 && on != index ? locate(s, id) : std::nullopt;
         if (!at || (at->track.kind == TrackKind::Video ? !(to->hasVideo || to->kind == MediaKind::Image) : !to->hasAudio) ||
             std::any_of(l->channels.begin(), l->channels.end(), [&](int ch) { return ch >= count; }))
             continue;
         l->mediaId = next.mediaId;
-        l->sourceIn += next.offset;
+        l->sourceIn += next.offset - before[size_t(on)].offset;
     }
     c->mediaId = next.mediaId;
     c->sourceIn += next.offset;

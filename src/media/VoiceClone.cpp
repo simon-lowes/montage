@@ -819,7 +819,7 @@ bool convertVoice(const std::vector<float>& speech, int speechRate, const std::v
             const size_t a = cuts[n], b = cuts[n + 1], length = b - a;
             float loudest = 0;
             for (size_t i = a; i < b; ++i) loudest = std::max(loudest, std::fabs(x[i]));
-            if (loudest <= peak * 0.01f || length < size_t(kCloneSampleRate / 10)) {  // (silence stays silence)
+            if (loudest <= peak * 0.01f) {  // (silence stays silence)
                 out.insert(out.end(), length, 0.0f);
                 if (progress) progress(double(b) / double(x.size()));
                 continue;
