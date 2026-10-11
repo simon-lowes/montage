@@ -68,14 +68,17 @@ bool clipVoice(const Project& p, const Sequence& s, Id clip, ClonedVoice& voice,
 }
 
 bool voiceAt(const Project& p, const Sequence& s, FrameTime at, ClonedVoice& voice, QString* error) {
-    for (const Track& t : s.audioTracks) {
-        if (t.muted) continue;
-        for (const Clip& c : t.clips) {
-            if (!c.contains(at) || !c.mediaId || !c.enabled) continue;
-            const MediaItem* m = p.findMedia(c.mediaId);
-            if (m && m->hasAudio) return clipVoice(p, s, c.id, voice, error);
+    // A heard clip (unmuted; soloed if any are), one with a transcript first (someone speaking, not the music).
+    const bool anySolo = std::any_of(s.audioTracks.begin(), s.audioTracks.end(), [](const Track& t) { return t.solo; });
+    for (const bool spoken : {true, false})
+        for (const Track& t : s.audioTracks) {
+            if (t.muted || (anySolo && !t.solo)) continue;
+            for (const Clip& c : t.clips) {
+                if (!c.contains(at) || !c.mediaId || !c.enabled) continue;
+                const MediaItem* m = p.findMedia(c.mediaId);
+                if (m && m->hasAudio && (!spoken || m->transcript)) return clipVoice(p, s, c.id, voice, error);
+            }
         }
-    }
     if (error) *error = QObject::tr("No clip with sound is heard there to take a voice from");
     return false;
 }
@@ -207,6 +210,9 @@ std::vector<Id> generateSpeech(EditorState* state, const std::vector<SpeechLine>
             }
             edit::Result r = edit::placeMedia(p, sq, media[i], lines[i].at, 0, -1, {TrackKind::Video, 0}, a, false);
             if (!r.ok) return r;
+            if (clone && clone->replace && lines[i].fit > 0)  // (never past its room, whatever rounding gave its length)
+                for (const Id id : r.created)
+                    if (Clip* made = edit::clipById(sq, id); made && made->duration > lines[i].fit) made->duration = lines[i].fit;
             created.insert(created.end(), r.created.begin(), r.created.end());
         }
         all.ok = true;

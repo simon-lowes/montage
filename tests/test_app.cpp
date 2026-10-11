@@ -6037,6 +6037,45 @@ private slots:
         // One undo puts the words back.
         state()->undo();
         QCOMPARE(int(trackAt(*state()->sequence(), A1)->clips.size()), 1);
+        // Music on the track above and a second copy of the speech below (a camera's other channel): the voice and the
+        // track are the speech's, the music is left alone, and both copies of the words are replaced.
+        {
+            std::vector<float> tone(size_t(24000) * 12);
+            for (size_t i = 0; i < tone.size(); ++i) tone[i] = float(0.2 * std::sin(2 * M_PI * 220.0 * double(i) / 24000));
+            const QString music = dir_.path() + "/music.wav";
+            QVERIFY(writeSpeechWav(music.toStdString(), tone));
+            const auto imported = state()->importFiles({music});
+            QCOMPARE(imported.size(), size_t(1));
+            const Id song = imported[0];
+            const std::vector<Track> before = state()->sequence()->audioTracks;
+            QVERIFY(state()->apply("Stack", [&](Project& p, Sequence& sq) {
+                sq.audioTracks[0].clips.clear();
+                while (sq.audioTracks.size() < 3) edit::addTrack(p, sq, TrackKind::Audio);
+                if (!edit::placeMedia(p, sq, song, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok) return edit::Result::fail("music");
+                if (!edit::placeMedia(p, sq, media, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 1}, false).ok) return edit::Result::fail("A2");
+                return edit::placeMedia(p, sq, media, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 2}, false);
+            }));
+            QVERIFY(state()->sequence()->audioTracks.size() >= 3);
+            QApplication::processEvents();
+            QCOMPARE(panel->words().size(), size_t(5));  // the two copies' words count once
+            panel->selectWords(2, 3);
+            const Id again = panel->regenerateSelection("our dear", "en", &err);
+            QVERIFY2(again, qPrintable(err));
+            const auto at = edit::locate(*state()->sequence(), again);
+            QVERIFY(at && at->track.index == 1);  // the speech's track, not the music's
+            QCOMPARE(int(state()->sequence()->audioTracks[0].clips.size()), 1);  // the music untouched
+            QCOMPARE(int(state()->sequence()->audioTracks[2].clips.size()), 2);  // the other copy cleared there too
+            const Clip* newClip = edit::clipById(*state()->sequence(), again);
+            QVERIFY(newClip->end() <= FrameTime(std::ceil(2.8 * fps)));
+            const MediaItem* said = state()->project().findMedia(newClip->mediaId);
+            QVERIFY(QString::fromStdString(said->metadata.at("comment")).contains("jfk"));  // his voice, not the tone's
+            state()->undo();
+            QCOMPARE(int(state()->sequence()->audioTracks[2].clips.size()), 1);
+            QVERIFY(state()->edit("Unstack", [&](Project&, Sequence& sq2) {
+                sq2.audioTracks = before;
+                return true;
+            }));
+        }
         // A caption track dubbed in the speaker's own voice (heard under its first caption).
         Id track = 0;
         QVERIFY(state()->edit("Captions", [&](Project& p, Sequence& s) {

@@ -598,6 +598,9 @@ QString McpServer::Impl::speakLines(Project& p, Sequence& s, const std::vector<S
         }
         const edit::Result r = edit::placeMedia(p, s, media, lines[i].at, 0, -1, {TrackKind::Video, 0}, track, false);
         if (!r.ok) return QString::fromStdString(r.error);
+        if (clone && clone->exact && lines[i].fit > 0)  // (never past its room, whatever rounding gave its length)
+            for (const Id id : r.created)
+                if (Clip* made = edit::clipById(s, id); made && made->duration > lines[i].fit) made->duration = lines[i].fit;
         seconds += double(audio.size()) / kTtsSampleRate;
         placed.append(QJsonObject{{"file", path}, {"at_seconds", lines[i].at / s.fpsValue()}, {"seconds", double(audio.size()) / kTtsSampleRate},
                                   {"clip", r.created.empty() ? 0.0 : double(r.created.front())}});
@@ -636,15 +639,20 @@ McpServer::Impl::CloneVoice McpServer::Impl::cloneVoiceArg(const QJsonObject& a,
         to = a.contains("voice_to") ? a.value("voice_to").toDouble() : from + 30;
         v.from = QFileInfo(QString::fromStdString(path)).fileName().toStdString();
     } else {
-        // The voice heard where it speaks.
-        for (const Track& t : s.audioTracks) {
-            if (t.muted) continue;
-            for (const Clip& k : t.clips)
-                if (k.contains(fallback) && k.mediaId && k.enabled)
-                    if (const MediaItem* m = p.findMedia(k.mediaId); m && m->hasAudio) {
-                        c = &k;
-                        break;
-                    }
+        // The voice heard where it speaks: a heard clip (unmuted; soloed if any are), one with a transcript first
+        // (someone speaking, not the music).
+        const bool anySolo = std::any_of(s.audioTracks.begin(), s.audioTracks.end(), [](const Track& t) { return t.solo; });
+        for (const bool spoken : {true, false}) {
+            for (const Track& t : s.audioTracks) {
+                if (t.muted || (anySolo && !t.solo)) continue;
+                for (const Clip& k : t.clips)
+                    if (k.contains(fallback) && k.mediaId && k.enabled)
+                        if (const MediaItem* m = p.findMedia(k.mediaId); m && m->hasAudio && (!spoken || m->transcript)) {
+                            c = &k;
+                            break;
+                        }
+                if (c) break;
+            }
             if (c) break;
         }
         if (!c) throw ArgError{"Give voice_clip or voice_media: no clip with sound is heard there to take a voice from"};

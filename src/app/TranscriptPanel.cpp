@@ -718,18 +718,36 @@ Id TranscriptPanel::regenerateSelection(const QString& text, const std::string& 
     const double fps = s->fpsValue();
     const FrameTime from = FrameTime(std::floor(words_[size_t(a)].start * fps + 1e-6)), to = FrameTime(std::ceil(words_[size_t(b)].end * fps - 1e-6));
     if (to <= from) return 0;
-    // The voice and the track: the clip with sound heard where the words start.
-    int track = -1;
+    // Whose words they are: the heard (unmuted, soloed if any are) transcribed clips whose own words fall there, as
+    // the panel lists them. The voice and the new clip's track come from the one with most of the selected words;
+    // every track carrying them is cleared, so the old words are not heard under the new ones.
+    std::vector<std::string> chosen;
+    for (int i = a; i <= b; ++i) chosen.push_back(words_[size_t(i)].text);
+    const bool anySolo = std::any_of(s->audioTracks.begin(), s->audioTracks.end(), [](const Track& t) { return t.solo; });
+    int track = -1, best = 0;
     Id clip = 0;
-    for (int i = 0; i < int(s->audioTracks.size()) && track < 0; ++i) {
+    std::vector<TrackRef> carrying;
+    for (int i = 0; i < int(s->audioTracks.size()); ++i) {
         const Track& t = s->audioTracks[size_t(i)];
-        if (t.muted) continue;
-        for (const Clip& c : t.clips)
-            if (c.contains(from) && c.mediaId && c.enabled)
-                if (const MediaItem* m = state_->project().findMedia(c.mediaId); m && m->hasAudio) {
-                    track = i, clip = c.id;
-                    break;
-                }
+        if (t.muted || (anySolo && !t.solo)) continue;
+        for (const Clip& c : t.clips) {
+            if (!c.enabled || c.end() <= from || c.start >= to) continue;
+            const MediaItem* m = state_->project().findMedia(c.mediaId);
+            if (!m || !m->hasAudio || !m->transcript) continue;
+            Sequence only = *s;  // this clip alone, read as the panel reads the sequence
+            for (Track& o : only.audioTracks) o.clips.clear();
+            for (Track& o : only.videoTracks) o.clips.clear();
+            only.audioTracks[size_t(i)].clips = {c};
+            only.audioTracks[size_t(i)].solo = false;
+            int matched = 0;
+            for (const TranscriptWord& w : sequenceTranscriptWords(state_->project(), only))
+                if (w.end * fps > double(from) && w.start * fps < double(to) && std::find(chosen.begin(), chosen.end(), w.text) != chosen.end())
+                    ++matched;
+            if (!matched) continue;
+            if (std::none_of(carrying.begin(), carrying.end(), [i](const TrackRef& r) { return r.index == i; }))
+                carrying.push_back({TrackKind::Audio, i});
+            if (matched > best) best = matched, track = i, clip = c.id;
+        }
     }
     ClonedVoice voice;
     if (track < 0 || !clipVoice(state_->project(), *s, clip, voice, error)) {
@@ -740,6 +758,9 @@ Id TranscriptPanel::regenerateSelection(const QString& text, const std::string& 
     voice.replace = true;
     const std::vector<Id> made = generateSpeech(state_, {{text.toStdString(), from, to - from}}, {}, 1.0, track, window(), error, &voice);
     if (made.empty()) return 0;
+    // The same words on the other tracks (a linked copy of the channels, the next clip's speech) go too, in the same step.
+    carrying.erase(std::remove_if(carrying.begin(), carrying.end(), [track](const TrackRef& r) { return r.index == track; }), carrying.end());
+    if (!carrying.empty()) state_->amend([&](Project& p, Sequence& sq) { return edit::liftRange(p, sq, from, to, carrying).ok; });
     // The new words in its transcript (spread over its length by their letters), so the transcript still reads.
     const Clip* c = edit::clipById(*state_->sequence(), made.front());
     if (!c) return made.front();

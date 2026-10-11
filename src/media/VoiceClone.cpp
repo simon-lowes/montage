@@ -458,7 +458,7 @@ bool cloneSpeechToFit(const std::string& text, const std::vector<float>& referen
     if (exact && room > 0) {
         // Filling the room: within 1.6 times as fast and 1.4 times as slow. Longer than that would run over what follows.
         factor = std::clamp(room / said, 1 / 1.6, 1.4);
-        if (said * factor > room * 1.03) {
+        if (said * factor > room * 1.0005) {  // (only rounding past it)
             if (error)
                 *error = QStringLiteral("The words take %1 s to say even 1.6 times as fast, more than the %2 s they replace")
                              .arg(said * factor, 0, 'f', 1)
