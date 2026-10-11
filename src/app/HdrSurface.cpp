@@ -17,6 +17,15 @@
 #include <cmath>
 #include <cstring>
 
+#if defined(Q_OS_WIN)
+#include <windows.h>
+#include <dxgi1_6.h>
+
+#include <cwchar>
+
+#include <vector>
+#endif
+
 namespace {
 #include "shaders/HdrShaders.inc"
 }
@@ -44,6 +53,68 @@ QShader shader(const unsigned char* data, size_t size) {
 
 // The uniform block the shaders share: the clip-space correction, the rectangle drawn and the tone values.
 constexpr quint32 kUniformBytes = 96;
+
+#if defined(Q_OS_WIN)
+// The display a window is on, as Windows reports it. (Qt asks about the display at the window's position, which for
+// the surface, a window inside the main one, is the main display's.)
+struct WinDisplay {
+    bool known = false, hdr = false;
+    double maxNits = 0, sdrWhiteNits = 80;
+};
+
+WinDisplay windowsDisplay(HWND hwnd) {
+    WinDisplay out;
+    HMONITOR monitor = hwnd ? MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) : nullptr;
+    if (!monitor) return out;
+    IDXGIFactory1* factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory)))) return out;
+    IDXGIAdapter1* adapter = nullptr;
+    for (UINT a = 0; !out.known && factory->EnumAdapters1(a, &adapter) != DXGI_ERROR_NOT_FOUND; ++a) {
+        IDXGIOutput* output = nullptr;
+        for (UINT o = 0; !out.known && adapter->EnumOutputs(o, &output) != DXGI_ERROR_NOT_FOUND; ++o) {
+            IDXGIOutput6* output6 = nullptr;
+            if (SUCCEEDED(output->QueryInterface(__uuidof(IDXGIOutput6), reinterpret_cast<void**>(&output6)))) {
+                DXGI_OUTPUT_DESC1 desc;
+                if (SUCCEEDED(output6->GetDesc1(&desc)) && desc.Monitor == monitor) {
+                    out.known = true;
+                    out.hdr = desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+                    out.maxNits = desc.MaxLuminance;
+                }
+                output6->Release();
+            }
+            output->Release();
+        }
+        adapter->Release();
+    }
+    factory->Release();
+    // SDR white (Settings' "SDR content brightness"), from the display configuration of this monitor's source.
+    MONITORINFOEXW info{};
+    info.cbSize = sizeof info;
+    UINT32 paths = 0, modes = 0;
+    if (!out.known || !GetMonitorInfoW(monitor, &info) || GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &paths, &modes) != ERROR_SUCCESS)
+        return out;
+    std::vector<DISPLAYCONFIG_PATH_INFO> pathInfo(paths);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modeInfo(modes);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &paths, pathInfo.data(), &modes, modeInfo.data(), nullptr) != ERROR_SUCCESS) return out;
+    for (UINT32 i = 0; i < paths; ++i) {
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME source{};
+        source.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        source.header.size = sizeof source;
+        source.header.adapterId = pathInfo[i].sourceInfo.adapterId;
+        source.header.id = pathInfo[i].sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS || wcscmp(source.viewGdiDeviceName, info.szDevice) != 0) continue;
+        DISPLAYCONFIG_SDR_WHITE_LEVEL white{};
+        white.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+        white.header.size = sizeof white;
+        white.header.adapterId = pathInfo[i].targetInfo.adapterId;
+        white.header.id = pathInfo[i].targetInfo.id;
+        if (DisplayConfigGetDeviceInfo(&white.header) == ERROR_SUCCESS && white.SDRWhiteLevel > 0)
+            out.sdrWhiteNits = white.SDRWhiteLevel / 1000.0 * 80.0;  // (in thousandths of 80 nits)
+        break;
+    }
+    return out;
+}
+#endif
 
 }  // namespace
 
@@ -118,16 +189,21 @@ void HdrSurface::setTestDisplay(double headroom) { gTestHeadroom = headroom; }
 
 HdrSurface::HdrSurface(QWidget* target) : target_(target) {
     setFlag(Qt::WindowDoesNotAcceptFocus);  // the editor's shortcuts keep working: focus stays in the widgets
+    displayTimer_.setInterval(1000);
+    connect(&displayTimer_, &QTimer::timeout, this, [this] {
+        if (!hdrActive_) return;
+        if (gTestHeadroom <= 0 && !displayShowsHdr()) {
+            stopHdr(problem_);
+            return;
+        }
+        readDisplay();
+    });
     connect(this, &QWindow::screenChanged, this, [this] {
         if (!gpu_ || !gpu_->sc || gTestHeadroom > 0) return;
         // Another display: HDR may have come or gone, and the swap chain is made again for it (macOS resets the layer's
         // colour space when the window changes screens).
-        const bool hdr = gpu_->sc->isFormatSupported(QRhiSwapChain::HDRExtendedSrgbLinear);
-        if (!hdr) {
-            if (hdrActive_) {
-                hdrActive_ = false;
-                emit displayChanged();
-            }
+        if (!displayShowsHdr()) {
+            if (hdrActive_) stopHdr(problem_);
             return;
         }
         if (gpu_->hasSwapChain) {
@@ -184,7 +260,7 @@ bool HdrSurface::probe(QString* why) {
     g.sc.reset(g.rhi->newSwapChain());
     g.sc->setWindow(this);
     if (gTestHeadroom <= 0) {
-        if (!g.sc->isFormatSupported(QRhiSwapChain::HDRExtendedSrgbLinear)) return fail(tr("This display does not show HDR"));
+        if (!displayShowsHdr()) return fail(problem_);
         g.sc->setFormat(QRhiSwapChain::HDRExtendedSrgbLinear);
     }
     g.rp.reset(g.sc->newCompatibleRenderPassDescriptor());
@@ -208,8 +284,39 @@ bool HdrSurface::probe(QString* why) {
     g.psPicture.reset(g.pipeline(shader(kPictureFragQsb, sizeof kPictureFragQsb), g.srbPicture.get(), false));
     g.psOverlay.reset(g.pipeline(shader(kOverlayFragQsb, sizeof kOverlayFragQsb), g.srbOverlay.get(), true));
     hdrActive_ = true;
+    problem_.clear();
     readDisplay();
     return true;
+}
+
+bool HdrSurface::displayShowsHdr() {
+    if (!gpu_ || !gpu_->sc) return false;
+    const bool qt = gpu_->sc->isFormatSupported(QRhiSwapChain::HDRExtendedSrgbLinear);
+#if defined(Q_OS_WIN)
+    // Both must agree: Windows about the viewer's own display, and Qt (which makes the swap chain) about the main one.
+    QWidget* top = target_ ? target_->window() : nullptr;
+    const WinDisplay d = windowsDisplay(top ? reinterpret_cast<HWND>(top->winId()) : reinterpret_cast<HWND>(winId()));
+    if ((d.known && !d.hdr) || (!d.known && !qt)) {
+        problem_ = tr("This display does not show HDR");
+        return false;
+    }
+    if (!qt) {
+        problem_ = tr("On Windows, HDR viewing also needs the main display to show HDR");
+        return false;
+    }
+    return true;
+#else
+    if (!qt) problem_ = tr("This display does not show HDR");
+    return qt;
+#endif
+}
+
+void HdrSurface::stopHdr(const QString& why) {
+    if (!hdrActive_) return;
+    hdrActive_ = false;
+    problem_ = why.isEmpty() ? tr("This display does not show HDR") : why;
+    displayTimer_.stop();
+    emit displayChanged();
 }
 
 void HdrSurface::readDisplay() {
@@ -222,6 +329,22 @@ void HdrSurface::readDisplay() {
     if (gTestHeadroom > 0) {
         h = gTestHeadroom;
     } else if (gpu_ && gpu_->sc && gpu_->hasSwapChain) {
+#if defined(Q_OS_WIN)
+        // The viewer's own display (Qt's answer is about the main one).
+        QWidget* top = target_ ? target_->window() : nullptr;
+        const WinDisplay d = windowsDisplay(top ? reinterpret_cast<HWND>(top->winId()) : reinterpret_cast<HWND>(winId()));
+        if (d.known && d.maxNits > 0) {
+            h = d.maxNits / d.sdrWhiteNits;
+            sc = float(d.sdrWhiteNits / 80);
+            h = std::max(1.0, std::isfinite(h) ? h : 1.0);
+            if (std::fabs(h - headroom_) > 0.01 || sc != scale_) {
+                headroom_ = h;
+                scale_ = sc;
+                emit displayChanged();
+            }
+            return;
+        }
+#endif
         const QRhiSwapChainHdrInfo info = gpu_->sc->hdrInfo();
         if (info.limitsType == QRhiSwapChainHdrInfo::ColorComponentValue) {
             h = info.limits.colorComponentValue.maxColorComponentValue;  // macOS EDR: 1.0 is SDR white
@@ -260,8 +383,18 @@ void HdrSurface::exposeEvent(QExposeEvent*) {
     HdrSurfaceGpu& g = *gpu_;
     if (isExposed() && !g.hasSwapChain) {
         g.hasSwapChain = g.sc->createOrResize();
+        // Now inside the viewer: asked again (on Windows Qt makes an SDR swap chain where it sees an SDR display).
+        if (g.hasSwapChain && gTestHeadroom <= 0 && !displayShowsHdr()) {
+            stopHdr(problem_);
+            return;
+        }
         displayRead_.invalidate();
         readDisplay();
+    }
+    if (isExposed() && hdrActive_) {
+        if (!displayTimer_.isActive()) displayTimer_.start();
+    } else {
+        displayTimer_.stop();
     }
     const QSize size = g.hasSwapChain ? g.sc->surfacePixelSize() : QSize();
     if ((!isExposed() || size.isEmpty()) && g.hasSwapChain) g.notExposed = true;
@@ -314,7 +447,6 @@ bool HdrSurface::forward(QEvent* e) {
             if (m->type() == QEvent::MouseMove && m->buttons() == Qt::NoButton && !t->hasMouseTracking()) return true;
             QMouseEvent copy(m->type(), m->position(), QPointF(t->mapTo(t->window(), m->position().toPoint())), m->globalPosition(), m->button(),
                              m->buttons(), m->modifiers(), m->pointingDevice());
-            if (m->type() == QEvent::MouseButtonPress) t->setFocus(Qt::MouseFocusReason);
             QCoreApplication::sendEvent(t, &copy);
             if (m->type() == QEvent::MouseButtonPress && m->button() == Qt::RightButton && t) {
                 QContextMenuEvent menu(QContextMenuEvent::Mouse, m->position().toPoint(), m->globalPosition().toPoint(), m->modifiers());
@@ -380,6 +512,11 @@ void HdrSurface::render() {
         if (!g.hasSwapChain) return;
         r = g.rhi->beginFrame(g.sc.get());
     }
+    if (r == QRhi::FrameOpDeviceLost || r == QRhi::FrameOpError) {
+        // (a driver reset or update, a GPU switch) The viewer goes back to its SDR picture; turning HDR on again starts over.
+        stopHdr(tr("The graphics device was reset"));
+        return;
+    }
     if (r != QRhi::FrameOpSuccess) {
         requestUpdate();
         return;
@@ -397,7 +534,9 @@ void HdrSurface::render() {
             g.resize(g.picture, g.srbPicture, g.ubufPicture.get(), QRhiTexture::RGBA16F, size);
             g.pictureSize = size;
         }
-        QRhiTextureSubresourceUploadDescription d(picture_->rgba.data(), quint32(size_t(size.width()) * size_t(size.height()) * 8));
+        // (not copied: the picture is held until the frame is drawn)
+        QRhiTextureSubresourceUploadDescription d(QByteArray::fromRawData(reinterpret_cast<const char*>(picture_->rgba.data()),
+                                                                          qsizetype(size_t(size.width()) * size_t(size.height()) * 8)));
         u->uploadTexture(g.picture.get(), QRhiTextureUploadDescription(QRhiTextureUploadEntry(0, 0, d)));
         pictureDirty_ = false;
     }
@@ -449,7 +588,13 @@ void HdrSurface::render() {
     }
     cb->endPass();
     g.rhi->endFrame(g.sc.get());
-    ++frames_;
+    if (++frames_ == 1) {
+        // macOS reports the headroom once a frame is up: asked again straight after the first.
+        QTimer::singleShot(100, this, [this] {
+            displayRead_.invalidate();
+            readDisplay();
+        });
+    }
 }
 
 #endif

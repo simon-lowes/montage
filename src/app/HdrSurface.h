@@ -9,6 +9,7 @@
 #include <QImage>
 #include <QPointer>
 #include <QRectF>
+#include <QTimer>
 #include <QWindow>
 #include <memory>
 
@@ -41,6 +42,8 @@ public:
     double headroom() const { return headroom_; }
     // What 1.0 (SDR white) is written as: 1 on macOS, SDR white's nits / 80 for Windows' scRGB.
     float scale() const { return scale_; }
+    // Why HDR stopped or was refused (empty while it shows).
+    const QString& problem() const { return problem_; }
 
     void setPicture(HdrPicturePtr picture, const QRectF& rect);  // rect in the window's coordinates
     void setOverlay(const QImage& overlay);                      // the viewer's drawing, the window's size
@@ -62,6 +65,8 @@ private:
     bool forward(QEvent* e);
     void render();
     void readDisplay();
+    bool displayShowsHdr();  // the display the viewer is on takes the extended-range swap chain (sets problem_ if not)
+    void stopHdr(const QString& why);
 
     QPointer<QWidget> target_;
     std::unique_ptr<HdrSurfaceGpu> gpu_;
@@ -74,7 +79,9 @@ private:
     double headroom_ = 1;
     float scale_ = 1;
     int frames_ = 0;
+    QString problem_;
     QElapsedTimer displayRead_;  // since the display's HDR range was last asked
+    QTimer displayTimer_;        // asks again while shown, paused too (brightness, the HDR switch)
 };
 
 #endif

@@ -48,7 +48,9 @@ ViewerWidget::ViewerWidget(QWidget* parent) : QWidget(parent) {
 void ViewerWidget::setImage(const QImage& img) {
     const bool reshaped = img.isNull() != image_.isNull() || img.size() != image_.size();
     image_ = img;
-    update();
+    // Under the HDR surface the SDR picture is not seen: repainted (and the drawing over it sent again) only when its
+    // place moved, or when the exposure check, drawn from it, is on.
+    if (!hdrShowing() || reshaped || exposure_ != 0) update();
     if (surface_ && reshaped) updateHdr();  // (the picture's place moved)
 }
 
@@ -105,6 +107,15 @@ void ViewerWidget::clearTwoUp() {
 void ViewerWidget::paintEvent(QPaintEvent*) {
     QPainter p(this);
     paintContent(p, true);
+#ifdef MONTAGE_HDR_VIEWER
+    // Under the HDR surface, what changed goes to it too (straight away, not at the next look).
+    if (hdrShowing()) refreshOverlay(true);
+#endif
+}
+
+void ViewerWidget::showEvent(QShowEvent* e) {
+    QWidget::showEvent(e);
+    updateHdr();  // (nothing was sent while hidden)
 }
 
 void ViewerWidget::paintContent(QPainter& p, bool picture) {
@@ -223,7 +234,10 @@ void ViewerWidget::setHdrViewer(bool on) {
     if (hdrWanted_ == on) return;
     hdrWanted_ = on;
     hdrStatus_.clear();  // asked again: try the display again
-    if (!on) dropHdrSurface();
+    if (!on) {
+        dropHdrSurface();
+        hdrPicture_.reset();  // (stale by the time it is turned on again)
+    }
     updateHdr();
 }
 
@@ -259,13 +273,15 @@ QImage ViewerWidget::overlayImage() {
     return img;
 }
 
-void ViewerWidget::refreshOverlay() {
+void ViewerWidget::refreshOverlay(bool changed) {
 #ifdef MONTAGE_HDR_VIEWER
     if (!hdrShowing()) return;
     QImage img = overlayImage();
-    if (img == lastOverlay_) return;  // (unchanged: nothing to upload)
+    if (!changed && img == lastOverlay_) return;  // (unchanged: nothing to upload)
     lastOverlay_ = img;
     surface_->setOverlay(img);
+#else
+    Q_UNUSED(changed);
 #endif
 }
 
@@ -282,8 +298,21 @@ void ViewerWidget::dropHdrSurface() {
 void ViewerWidget::updateHdr() {
 #ifdef MONTAGE_HDR_VIEWER
     const bool want = hdrWanted_ && hdrPicture_ && !twoUp_ && !image_.isNull();
+    if (QWindow* top = window()->windowHandle(); top && top != watchedWindow_) {
+        // Moved to another display: one that said no may say yes there.
+        disconnect(screenWatch_);
+        watchedWindow_ = top;
+        screenWatch_ = connect(top, &QWindow::screenChanged, this, [this] {
+            if (surface_ || hdrStatus_.isEmpty()) return;
+            hdrStatus_.clear();
+            updateHdr();
+        });
+    }
     if (want && !surface_ && hdrStatus_.isEmpty()) {
         auto* s = new HdrSurface(this);
+        // Asked about the viewer's display (before it is placed inside the viewer, a new window sits on the main one).
+        s->setScreen(screen());
+        s->setGeometry(QRect(mapToGlobal(QPoint(0, 0)), size()));
         QString why;
         if (!s->probe(&why)) {
             delete s;
@@ -299,23 +328,23 @@ void ViewerWidget::updateHdr() {
         container_->setFocusPolicy(Qt::NoFocus);
         connect(s, &HdrSurface::displayChanged, this, [this] {
             if (surface_ && !surface_->hdrActive()) {
-                hdrStatus_ = tr("This display does not show HDR");
+                hdrStatus_ = surface_->problem().isEmpty() ? tr("This display does not show HDR") : surface_->problem();
                 dropHdrSurface();
             }
             updateHdr();
         });
         if (!overlayTimer_) {
-            // The viewer's drawing changes with no signal (overlays repaint on their own), so it is looked at 30 times
-            // a second and uploaded when it changed.
+            // Repaints send the viewer's drawing to the surface as they happen; this catches any a covered widget is not
+            // given, a few times a second, uploading only what changed.
             overlayTimer_ = new QTimer(this);
-            overlayTimer_->setInterval(33);
-            connect(overlayTimer_, &QTimer::timeout, this, &ViewerWidget::refreshOverlay);
+            overlayTimer_->setInterval(250);
+            connect(overlayTimer_, &QTimer::timeout, this, [this] { refreshOverlay(false); });
         }
     }
     if (container_) container_->setVisible(want && surface_ && surface_->hdrActive());
     if (hdrShowing()) {
         surface_->setPicture(hdrPicture_, imageRect());
-        refreshOverlay();
+        if (lastOverlay_.isNull()) refreshOverlay(true);  // (just shown; after that repaints send it)
         if (overlayTimer_ && !overlayTimer_->isActive()) overlayTimer_->start();
     } else if (overlayTimer_) {
         overlayTimer_->stop();

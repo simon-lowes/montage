@@ -3,6 +3,7 @@
 
 #include <QImage>
 #include <QPointer>
+#include <QWindow>
 #include <QWidget>
 #include <functional>
 #include <memory>
@@ -88,6 +89,7 @@ signals:
 protected:
     void paintEvent(QPaintEvent*) override;
     void resizeEvent(QResizeEvent* e) override;
+    void showEvent(QShowEvent* e) override;
     void mousePressEvent(QMouseEvent* e) override;
     void mouseMoveEvent(QMouseEvent* e) override;
     void mouseReleaseEvent(QMouseEvent* e) override;
@@ -96,7 +98,7 @@ private:
     void paintContent(QPainter& p, bool picture);
     void updateHdr();
     void dropHdrSurface();
-    void refreshOverlay();
+    void refreshOverlay(bool changed);  // false: uploaded only if it differs from the last
 
     QImage image_;
     QImage compare_;
@@ -123,6 +125,8 @@ private:
     QPointer<QWidget> container_;
     QTimer* overlayTimer_ = nullptr;
     QImage lastOverlay_;
+    QPointer<QWindow> watchedWindow_;  // the top-level window whose display changes are watched
+    QMetaObject::Connection screenWatch_;
     bool lastShowing_ = false, lastWanted_ = false;  // what hdrChanged last said
     double lastHeadroom_ = 1;
     QString lastStatus_;

@@ -9904,6 +9904,21 @@ const auto seq = [this] { return state()->sequence(); };
         QCoreApplication::sendEvent(surface, &release);
         viewer->removeEventFilter(&presses);
         QCOMPARE(presses.n, 1);
+        // Turned off and on: the last HDR picture is not shown again (it may be another frame by then); the next brings it back.
+        viewer->setHdrViewer(false);
+        viewer->setHdrViewer(true);
+        QVERIFY(!viewer->hdrShowing());
+        program->requestFrame();
+        QTRY_VERIFY(viewer->hdrShowing());
+        // The display stops showing HDR (asked every second, paused too): the SDR picture again, and why.
+        HdrSurface::setTestDisplay(0);
+        QTRY_VERIFY_WITH_TIMEOUT(!viewer->hdrShowing(), 5000);
+        QCOMPARE(viewer->hdrStatus(), QStringLiteral("This display does not show HDR"));
+        HdrSurface::setTestDisplay(4);
+        viewer->setHdrViewer(false);
+        viewer->setHdrViewer(true);
+        program->requestFrame();
+        QTRY_VERIFY(viewer->hdrShowing());
         // Two-up trimming draws over it in SDR; an SDR sequence and the viewer switched off take it away.
         viewer->setTwoUp(QImage(), QImage(), "A", "B");
         QVERIFY(!viewer->hdrShowing());

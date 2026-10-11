@@ -116,6 +116,11 @@ private:
     static constexpr int kAhead = 24;
     static constexpr size_t kMaxCached = 48;
 
+    // HDR frames carry about three times the bytes (half floats beside the SDR picture), so a third as many are kept,
+    // and no more are rendered ahead than fit beside a few already shown.
+    size_t cacheLimit() const { return ctx_.hdr ? kMaxCached / 3 : kMaxCached; }
+    int ahead() const { return std::min(kAhead, int(cacheLimit()) - 4); }
+
     bool sameContext(const Request& r) const {
         return r.project == ctx_.project && r.sequence == ctx_.sequence && r.scale == ctx_.scale && r.proxies == ctx_.proxies &&
                r.captions == ctx_.captions && r.stereoView == ctx_.stereoView && r.hdr == ctx_.hdr;
@@ -197,7 +202,7 @@ private:
         const Sequence* s = ctx_.project->findSequence(ctx_.sequence);
         if (!s) return;
         FrameTime end = s->duration();
-        for (int k = 1; k <= kAhead; ++k) {
+        for (int k = 1, n = ahead(); k <= n; ++k) {
             FrameTime t = ctx_.frame + FrameTime(k) * ctx_.direction;
             if (t < 0 || t >= end) return;
             if (cache_.count(t)) continue;
@@ -210,13 +215,16 @@ private:
         }
     }
 
-    // Drops cached frames furthest from the playhead.
+    // Drops cached frames: those furthest behind the playhead (as it moves) first, then the furthest ahead, so a frame
+    // just rendered ahead is never the one let go.
     void trim() {
-        const size_t limit = ctx_.hdr ? kMaxCached / 2 : kMaxCached;  // HDR frames are twice the size
+        const size_t limit = cacheLimit();
+        const bool forward = ctx_.direction >= 0;
         while (cache_.size() > limit) {
             auto first = cache_.begin(), last = std::prev(cache_.end());
-            if (std::llabs(first->first - ctx_.frame) > std::llabs(last->first - ctx_.frame)) cache_.erase(first);
-            else cache_.erase(last);
+            auto behind = forward ? first : last;
+            const bool passed = forward ? behind->first < ctx_.frame : behind->first > ctx_.frame;
+            cache_.erase(passed ? behind : (forward ? last : first));
         }
     }
 
