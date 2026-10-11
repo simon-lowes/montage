@@ -129,6 +129,7 @@
 #include "media/VisualSearch.h"
 #include "PeoplePanel.h"
 #include "SpeechDialog.h"
+#include "StemsDialog.h"
 #include "TranscriptPanel.h"
 #include "HdrSurface.h"
 #include "MonitorPanel.h"
@@ -1017,6 +1018,17 @@ void MainWindow::buildMenus() {
             if (dlg.exec() == QDialog::Accepted) AutoDuckDialog::apply(state_, music, dlg.dialogueTracks(), dlg.options(), this);
         }))->setObjectName(QStringLiteral("autoDuck"));
     add(clipM, tr("Remove Mic &Bleed…"), QKeySequence(), withSeq([this] { micBleedDialog(); }))->setObjectName(QStringLiteral("removeMicBleed"));
+    add(clipM, tr("Separate S&tems…"), QKeySequence(), withSeq([this] {
+            std::vector<Id> clips;
+            for (Id id : state_->selectedClips())
+                if (auto loc = edit::locate(*state_->sequence(), id); loc && loc->track.kind == TrackKind::Audio) clips.push_back(id);
+            if (clips.empty()) {
+                statusBar()->showMessage(tr("Select the audio clips to separate into stems"), 5000);
+                return;
+            }
+            StemsDialog dlg(this);
+            if (dlg.exec() == QDialog::Accepted) separateStems(state_, clips, dlg.options(), this);
+        }))->setObjectName(QStringLiteral("separateStems"));
     add(clipM, tr("S&pectral Repair…"), QKeySequence(), withSeq([this] { spectralRepairDialog(); }))->setObjectName(QStringLiteral("spectralRepair"));
     add(clipM, tr("Pan to &Follow…"), QKeySequence(), withSeq([this] { panFollowDialog(); }))->setObjectName(QStringLiteral("panFollow"));
     add(clipM, tr("Redact &Faces…"), QKeySequence(), withSeq([this] { redactFacesDialog(); }))->setObjectName(QStringLiteral("redactFaces"));

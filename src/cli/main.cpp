@@ -40,6 +40,7 @@
 #include "media/Translator.h"
 #include "media/VisualSearch.h"
 #include "media/SoundSearch.h"
+#include "media/StemSeparation.h"
 #include "media/Faces.h"
 #include "media/DepthMap.h"
 #include "media/Rife.h"
@@ -97,6 +98,7 @@ int usage() {
                  "  montage-cli shots <project.montage> \"a red car at night\" [--max N]   (find shots by description)\n"
                  "  montage-cli sounds <project.montage> \"applause\" [--max N]   (find sounds by description)\n"
                  "  montage-cli people <project.montage> [--person NAME|ID]   (who is in the footage, and where)\n"
+                 "  montage-cli stems <file> [--stems 2|4|5] [--from S] [--to S] [-o folder]   (vocals, drums, bass... as WAVs)\n"
                  "  montage-cli speak \"text\" -o voice.wav [--voice af_heart] [--speed 1]   (a voiceover from text; --phonemes prints them)\n"
                  "  montage-cli clone-speech \"text\" --voice sample.wav -o out.wav --consent [--language en] [--from S] [--to S]\n"
                  "              [--speed 1] [--exaggeration 0.5]   (in the voice of the sample, with its owner's consent; 23 languages)\n"
@@ -649,6 +651,13 @@ int cmdModels() {
     else
         std::printf("  %-22s %6.1f MB  %s\n", depthModel().id.c_str(), double(depthModel().bytes()) / 1e6,
                     depthModel().installed() ? "downloaded" : "");
+    std::printf("\nStem separation models (Spleeter, the authors' release, for Separate Stems; folder: %s)\n",
+                std::filesystem::path(stemModel(4).directory()).parent_path().string().c_str());
+    if (!stemSeparationAvailable()) std::printf("  unavailable: this build has no ONNX Runtime\n");
+    else
+        for (const int n : {2, 4, 5})
+            std::printf("  %-22s %6.1f MB  %s\n", stemModel(n).id.c_str(), double(stemModel(n).bytes()) / 1e6,
+                        stemModel(n).installed() ? "downloaded" : "");
     std::printf("\nRIFE 4.26 (the authors' release, for AI slow-motion frames; folder: %s)\n", rifeModel().directory().c_str());
     if (!rifeAvailable()) std::printf("  unavailable: this build has no ONNX Runtime\n");
     else
@@ -1018,6 +1027,54 @@ int cmdSounds(const std::vector<std::string>& args) {
     return 0;
 }
 
+// Separates a file's sound into stems, one WAV each beside it (or in -o folder).
+int cmdStems(const std::vector<std::string>& args) {
+    if (args.empty()) return usage();
+    int stems = 4;
+    double from = 0, to = 0;
+    std::string folder;
+    for (size_t i = 1; i < args.size(); ++i)
+        if (args[i] == "--stems" && i + 1 < args.size()) stems = std::atoi(args[++i].c_str());
+        else if (args[i] == "--from" && i + 1 < args.size()) from = std::atof(args[++i].c_str());
+        else if (args[i] == "--to" && i + 1 < args.size()) to = std::atof(args[++i].c_str());
+        else if (args[i] == "-o" && i + 1 < args.size()) folder = args[++i];
+        else return usage();
+    if (stemNames(stems).empty()) {
+        std::fprintf(stderr, "error: --stems is 2, 4 or 5\n");
+        return 1;
+    }
+    if (!stemModel(stems).installed()) {
+        std::fprintf(stderr, "error: the %s is not downloaded (scripts/fetch-models.sh, or Separate Stems in the app)\n",
+                     stemModel(stems).title.c_str());
+        return 1;
+    }
+    const std::filesystem::path in(args[0]);
+    const std::filesystem::path dir = folder.empty() ? in.parent_path() : std::filesystem::path(folder);
+    std::error_code ec;
+    if (!dir.empty()) std::filesystem::create_directories(dir, ec);
+    MediaItem m;
+    double end = to;
+    if (end <= 0 && probeMedia(args[0], m)) end = m.duration;
+    std::vector<std::string> outs;
+    for (const std::string& name : stemNames(stems))
+        outs.push_back((dir / (in.stem().string() + " " + stemTitle(name) + ".wav")).string());
+    std::string err;
+    const bool ok = separateStemsToFiles(
+        args[0], from, end, {}, stems, outs,
+        [](double f) {
+            std::fprintf(stderr, "\rSeparating... %5.1f%%", f * 100);
+            std::fflush(stderr);
+        },
+        nullptr, &err);
+    std::fprintf(stderr, "\n");
+    if (!ok) {
+        std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
+    }
+    for (const std::string& o : outs) std::printf("%s\n", o.c_str());
+    return 0;
+}
+
 // Lists the people in the footage, finding faces in media not looked through yet (and saving them).
 int cmdPeople(const std::vector<std::string>& args) {
     if (args.empty()) return usage();
@@ -1205,6 +1262,7 @@ int main(int argc, char** argv) {
 #endif
     if (cmd == "shots") return cmdShots(args);
     if (cmd == "sounds") return cmdSounds(args);
+    if (cmd == "stems") return cmdStems(args);
     if (cmd == "people") return cmdPeople(args);
     if (cmd == "speak") return cmdSpeak(args);
     if (cmd == "clone-speech") return cmdCloneSpeech(args);

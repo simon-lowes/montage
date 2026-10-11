@@ -137,6 +137,42 @@ private slots:
         QCOMPARE(spellingToPhonemes("chime"), std::string("ʧˈIm"));
     }
 
+    void gzipAndTar() {
+        // A gzipped GNU tar (as Python's tarfile writes it): a file, a folder, and a file under it with a name past
+        // 100 characters.
+        const std::string hex =
+            "1f8b08000000000002ffd3d34fce484dce2ec8cfcc2b61a011300002331313300d04e8b48181b139820d12373430343461503060a003282d2e492c52"
+            "506018a120373f2535271e9106e20b124b32ac1494c0e24a5c0ca36078033dfd94cc227ddada4130ff63b0cdcc0c4d19144c47f33f1de25f4fdfc127"
+            "3f2fdd27332f9b86f18f25dee1716e64608c16ffe6e6a6060c0a3ea3f14fa7fc9f3740402f29336fb40c1eeef14fa0fc3734412fff8d8dcccd0c47db"
+            "7f74018c4ccc2cac6cec1c9c5cdc3cbc7cfc028242c222a262e2129252d232b272f20a8a4aca2aaa6aea1a9a5ada3aba7afa068646c626a666e61696"
+            "56d636b676f60e8e4ece2eae6eee1e9e5ede3ebe7efe018141c121a161e1119151d131b171f1098949c929a969e9199959d939b979f9058545c525a5"
+            "65e5159555d535b575f50d8d4dcd2dad6ded1d9d5ddd3dbd7dfd13264e9a3c65eab4e93366ce9a3d67eebcf90b162e5abc64e9b2e52b56ae5abd66ed"
+            "baf51b366edabc65ebb6ed3b76eedabd67efbefd070e1e3a7ce4e8b1e3274e9e3a7de6ecb9f3172e5eba7ce5eab5eb376edeba7de7eebdfb0f1e3e7a"
+            "fce4e9b3e72f5ebe7afde6edbbf71f3e7efafce5ebb7ef3f7efefafde7efbfffa3fe1fe1fe1f05a360148c8251300a46c1281805a360148c8251300a"
+            "46c1281805a360148c8251300a46c12818660000be0f7bd100280000";
+        std::string gz;
+        for (size_t i = 0; i + 1 < hex.size(); i += 2) gz.push_back(char(std::stoi(hex.substr(i, 2), nullptr, 16)));
+        std::string tar, err;
+        QVERIFY2(gunzip(gz, tar, &err), err.c_str());
+        QCOMPARE(tar.size(), size_t(10240));
+        const std::vector<TarEntry> entries = tarEntries(tar);
+        QCOMPARE(entries.size(), size_t(2));  // the folder is not a file
+        QCOMPARE(entries[0].name, std::string("checkpoint"));
+        QCOMPARE(tar.substr(entries[0].offset, entries[0].size), std::string("model_checkpoint_path: \"model\"\n"));
+        QCOMPARE(entries[1].name, "dir/" + std::string(120, 'n') + ".bin");
+        QCOMPARE(entries[1].size, size_t(768));
+        for (size_t i = 0; i < 768; ++i) QCOMPARE(uint8_t(tar[entries[1].offset + i]), uint8_t(i % 256));
+        // Damaged: a changed byte fails the checksum; not gzip at all; a tar header that does not add up.
+        std::string bad = gz;
+        bad[bad.size() - 9] ^= 1;
+        QVERIFY(!gunzip(bad, tar, &err) && tar.empty());
+        QVERIFY(!gunzip("not gzip at all, not even close", tar, &err));
+        QVERIFY(gunzip(gz, tar, &err));
+        tar[0] = 'X';
+        QVERIFY(tarEntries(tar).empty());
+        QVERIFY(tarEntries(std::string(1024, '\0')).empty());
+    }
+
     void zipReaderAndInflate() {
         // Raw DEFLATE from Qt's zlib stream: without its length prefix, header and checksum.
         auto deflate = [](const QByteArray& data, int level) {

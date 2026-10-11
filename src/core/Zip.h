@@ -1,6 +1,6 @@
 // Montage — reading zip archives (stored and deflated entries, Zip64 sizes),
-// for model downloads that come zipped: the inflater follows RFC 1951 and
-// every entry is checked against its CRC-32.
+// and gzipped tar archives, for model downloads that come packed: the
+// inflater follows RFC 1951 and every entry is checked against its CRC-32.
 #pragma once
 
 #include <cstddef>
@@ -15,6 +15,17 @@ namespace montage {
 bool inflateRaw(const uint8_t* data, size_t size, std::string& out, size_t expected = 0);
 
 uint32_t crc32(const void* data, size_t size, uint32_t crc = 0);
+
+// A gzip file's contents (RFC 1952, one member), checked against its CRC-32 and length.
+bool gunzip(const std::string& gz, std::string& out, std::string* error = nullptr);
+
+// The regular files in a tar archive (POSIX ustar, with GNU long names): each name without a leading "./", and
+// where its bytes are in `tar`. Empty if it is not a tar archive.
+struct TarEntry {
+    std::string name;
+    size_t offset = 0, size = 0;
+};
+std::vector<TarEntry> tarEntries(const std::string& tar);
 
 class ZipReader {
 public:

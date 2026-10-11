@@ -107,6 +107,7 @@
 #include "media/TextToSpeech.h"
 #include "media/VoiceClone.h"
 #include "media/SoundSearch.h"
+#include "media/StemSeparation.h"
 #include "media/Transcriber.h"
 #include "media/VisualSearch.h"
 #include "render/ClipAnalysis.h"
@@ -5021,6 +5022,72 @@ void McpServer::Impl::addTools() {
             save(l);
             return ok(QStringLiteral("Placed %1 voiceover clip(s), %2 s in all").arg(lines.size()).arg(total, 0, 'f', 1),
                       QJsonObject{{"clips", placed}});
+        });
+
+    add("montage_separate_stems", "Separate stems",
+        "Split the sound of audio clips into stems with Spleeter (Deezer Research, on this computer): 4 (vocals, drums, bass, "
+        "other), 5 (vocals, piano, drums, bass, other) or 2 (vocals, accompaniment). Each stem is a 44.1 kHz WAV in the "
+        "Stems folder beside the project, separated from the source the clip plays plus handles seconds either side, and "
+        "played by a copy of the clip (timing, speed, volume, pan) on an audio track named for the stem (Vocals, Drums...; "
+        "reused where free, else added), linked with the clip. The clip itself is disabled unless mute_original is false. "
+        "Needs the model (montage-cli models lists it; the app downloads it on first use).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clips":{"type":"array","items":{"type":"number"}},
+            "stems":{"type":"integer","enum":[2,4,5],"default":4},"mute_original":{"type":"boolean","default":true},
+            "handles":{"type":"number","default":2}},"required":["project","clips"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const int stems = a.value("stems").toInt(4);
+            const std::vector<std::string>& names = stemNames(stems);
+            if (names.empty()) throw ArgError{"\"stems\" is 2, 4 or 5"};
+            if (!stemSeparationAvailable()) return fail("This build of Montage has no ONNX Runtime");
+            if (!stemModel(stems).installed()) return fail(QString::fromStdString("The " + stemModel(stems).title + " is not downloaded"));
+            std::vector<Id> ids;
+            for (const QJsonValue& v : a.value("clips").toArray()) ids.push_back(Id(v.toDouble()));
+            if (ids.empty()) throw ArgError{"\"clips\" must list clip ids"};
+            const double handles = std::clamp(a.value("handles").toDouble(2), 0.0, 60.0);
+            const QString folder = QFileInfo(absolute(need(a, "project"))).absolutePath() + QStringLiteral("/Stems");
+            QDir().mkpath(folder);
+            std::vector<std::string> titles;
+            for (const std::string& n : names) titles.push_back(stemTitle(n));
+            QJsonArray placed;
+            for (const Id id : ids) {
+                double from = 0, to = 0;
+                std::string err;
+                if (!stemSource(l.project, s, id, handles, from, to, &err))
+                    throw ArgError{QStringLiteral("Clip %1: %2").arg(qulonglong(id)).arg(QString::fromStdString(err))};
+                const Clip* c = edit::clipById(s, id);
+                const MediaItem* m = l.project.findMedia(c->mediaId);
+                QString base = QString::fromStdString(c->name.empty() ? m->name : c->name);
+                for (const QChar bad : QStringLiteral("/\\:*?\"<>|")) base.replace(bad, '_');
+                std::vector<std::string> outs;
+                for (const std::string& t : titles) {
+                    QString path = folder + '/' + base + ' ' + QString::fromStdString(t) + QStringLiteral(".wav");
+                    for (int k = 2; QFileInfo::exists(path); ++k)
+                        path = folder + '/' + base + ' ' + QString::fromStdString(t) + ' ' + QString::number(k) + QStringLiteral(".wav");
+                    outs.push_back(path.toStdString());
+                }
+                const std::string source = m->path, clipName = c->name.empty() ? m->name : c->name;
+                if (!separateStemsToFiles(source, from, to, c->channels, stems, outs, {}, nullptr, &err))
+                    return fail(QStringLiteral("Clip %1: %2").arg(qulonglong(id)).arg(QString::fromStdString(err)));
+                std::vector<Id> media;
+                for (size_t k = 0; k < outs.size(); ++k) {
+                    media.push_back(mediaFor(l.project, QString::fromStdString(outs[k])));
+                    if (MediaItem* mi = l.project.findMedia(media.back())) {
+                        mi->metadata["comment"] = titles[k] + " separated from " + clipName + " (" +
+                                                  QFileInfo(QString::fromStdString(source)).fileName().toStdString() + ") with Spleeter in Montage";
+                        if (std::find(mi->keywords.begin(), mi->keywords.end(), "Stem") == mi->keywords.end()) mi->keywords.push_back("Stem");
+                    }
+                }
+                const edit::Result r = placeStems(l.project, s, id, media, titles, from, a.value("mute_original").toBool(true));
+                check(r);
+                for (size_t k = 0; k < r.created.size(); ++k)
+                    if (const Clip* made = edit::clipById(s, r.created[k]))
+                        placed.append(QJsonObject{{"clip", double(made->id)}, {"stem", QString::fromStdString(k < titles.size() ? titles[k] : "")},
+                                                  {"from_clip", double(id)}, {"file", QString::fromStdString(outs[k % outs.size()])}});
+            }
+            save(l);
+            return ok(QStringLiteral("Separated %1 clip(s) into %2 stems each").arg(ids.size()).arg(stems), QJsonObject{{"stems", placed}});
         });
 
     add("montage_clone_speech", "Speak in a cloned voice",

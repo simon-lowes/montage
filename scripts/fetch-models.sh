@@ -15,14 +15,16 @@
 #   <dir>/minilm-qa      Find What's Said   (MONTAGE_SENTENCE_MODEL)
 #   <dir>/ocr            Reading text       (MONTAGE_OCR_MODEL)
 #   <dir>/sound          What's Heard       (MONTAGE_SOUND_MODEL)
+#   <dir>/stems          Separate Stems     (MONTAGE_STEM_MODELS; 4 stems, and 2 and 5 with --stems)
 #   <dir>/voice-clone    Cloned voices      (MONTAGE_VOICE_CLONE_MODEL; 1.6 GB, only with --voice-clone)
 #
-#   scripts/fetch-models.sh [dir] [--voice-clone]      (default: ./models)
+#   scripts/fetch-models.sh [dir] [--voice-clone] [--stems]      (default: ./models)
 set -euo pipefail
 VOICE_CLONE=0
+ALL_STEMS=0
 ARGS=()
 for a in "$@"; do
-  if [ "$a" = "--voice-clone" ]; then VOICE_CLONE=1; else ARGS+=("$a"); fi
+  if [ "$a" = "--voice-clone" ]; then VOICE_CLONE=1; elif [ "$a" = "--stems" ]; then ALL_STEMS=1; else ARGS+=("$a"); fi
 done
 DIR=${ARGS[0]:-models}
 sha256() { if command -v sha256sum > /dev/null; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
@@ -111,6 +113,13 @@ fetch sound audio_model.onnx "$CLAP/onnx/audio_model.onnx" a1c2b43c44f71e0fa841a
 fetch sound text_model_fp16.onnx "$CLAP/onnx/text_model_fp16.onnx" c1fd1e4cdd02acbcacaafe7a8e608dcfc8f84a00bfea3e2ca7df710957b4c3a5
 fetch sound vocab.json "$CLAP/vocab.json" ed19656ea1707df69134c4af35c8ceda2cc9860bf2c3495026153a133670ab5e
 fetch sound merges.txt "$CLAP/merges.txt" 1ce1664773c50f3e0cc8842619a93edc4624525b728b188a9e0be33b7726adc5
+# Spleeter's own release (Deezer Research, MIT).
+SPLEETER=https://github.com/deezer/spleeter/releases/download/v1.4.0
+fetch stems/spleeter-4stems 4stems.tar.gz "$SPLEETER/4stems.tar.gz" 3adb4a50ad4eb18c7c4d65fcf4cf2367a07d48408a5eb7d03cd20067429dfaa8
+if [ "$ALL_STEMS" = 1 ]; then
+  fetch stems/spleeter-2stems 2stems.tar.gz "$SPLEETER/2stems.tar.gz" f3a90b39dd2874269e8b05a48a86745df897b848c61f3958efc80a39152bd692
+  fetch stems/spleeter-5stems 5stems.tar.gz "$SPLEETER/5stems.tar.gz" 25a1e87eb5f75cc72a4d2d5467a0a50ac75f05611f877c278793742513cc7218
+fi
 if [ "$VOICE_CLONE" = 1 ]; then
   CHATTERBOX=https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/452d3f434aa592098f1eedac9099f33642ab2da5
   fetch voice-clone speech_encoder.onnx "$CHATTERBOX/onnx/speech_encoder.onnx" 8f1c8a0f89b77bf9cd5dd8f2e034eb2c79dc00fe70d41196b28c257643b00ccb
@@ -125,4 +134,4 @@ if [ "$VOICE_CLONE" = 1 ]; then
   fetch voice-clone Cangjie5_TC.json "$CHATTERBOX/Cangjie5_TC.json" 7073fd9de919443ae88e0bd2449917a65fe54898a4413ed1edcc4b67f28bce8c
   echo "Voice cloning model: MONTAGE_VOICE_CLONE_MODEL=$DIR/voice-clone"
 fi
-echo "Models in $DIR: MONTAGE_OBJECT_MODEL=$DIR/edgetam-video MONTAGE_SPEAKER_MODEL=$DIR/speakers MONTAGE_VISUAL_MODEL=$DIR/clip-vit-b32 MONTAGE_SPEECH_MODEL=$DIR/speech-enhance MONTAGE_UPSCALE_MODEL=$DIR/upscale MONTAGE_FACE_MODEL=$DIR/faces MONTAGE_DEPTH_MODEL=$DIR/depth MONTAGE_RIFE_MODEL=$DIR/rife MONTAGE_MATTE_MODEL=$DIR/matte MONTAGE_TTS_MODEL=$DIR/tts MONTAGE_INPAINT_MODEL=$DIR/inpaint MONTAGE_SENTENCE_MODEL=$DIR/minilm-qa MONTAGE_OCR_MODEL=$DIR/ocr MONTAGE_SOUND_MODEL=$DIR/sound"
+echo "Models in $DIR: MONTAGE_OBJECT_MODEL=$DIR/edgetam-video MONTAGE_SPEAKER_MODEL=$DIR/speakers MONTAGE_VISUAL_MODEL=$DIR/clip-vit-b32 MONTAGE_SPEECH_MODEL=$DIR/speech-enhance MONTAGE_UPSCALE_MODEL=$DIR/upscale MONTAGE_FACE_MODEL=$DIR/faces MONTAGE_DEPTH_MODEL=$DIR/depth MONTAGE_RIFE_MODEL=$DIR/rife MONTAGE_MATTE_MODEL=$DIR/matte MONTAGE_TTS_MODEL=$DIR/tts MONTAGE_INPAINT_MODEL=$DIR/inpaint MONTAGE_SENTENCE_MODEL=$DIR/minilm-qa MONTAGE_OCR_MODEL=$DIR/ocr MONTAGE_SOUND_MODEL=$DIR/sound MONTAGE_STEM_MODELS=$DIR/stems"

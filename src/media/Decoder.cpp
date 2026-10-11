@@ -1280,37 +1280,54 @@ bool decodeAudioStream(const std::string& path, int sampleRate, int ordinal, std
 
 bool decodeAudioBlocks(const std::string& path, int sampleRate, size_t block, const std::function<bool(const std::vector<float>& mono)>& sink,
                        std::string* error, const std::atomic<bool>* cancel) {
-    block = std::max<size_t>(1, block);
     std::vector<float> mono;
-    mono.reserve(block);
+    return decodeAudioStereoBlocks(
+        path, sampleRate, block,
+        [&](const std::vector<float>& stereo) {
+            mono.resize(stereo.size() / 2);
+            for (size_t i = 0; i < mono.size(); ++i) mono[i] = 0.5f * (stereo[i * 2] + stereo[i * 2 + 1]);
+            return sink(mono);
+        },
+        error, cancel);
+}
+
+bool decodeAudioStereoBlocks(const std::string& path, int sampleRate, size_t block,
+                             const std::function<bool(const std::vector<float>& stereo)>& sink, std::string* error,
+                             const std::atomic<bool>* cancel, const std::vector<int>& channels) {
+    block = std::max<size_t>(1, block);
+    std::vector<float> out;
+    out.reserve(block * 2);
     bool stopped = false;
     auto give = [&](const float* stereo, size_t frames) {
-        for (size_t i = 0; i < frames && !stopped; ++i) {
-            mono.push_back(0.5f * (stereo[i * 2] + stereo[i * 2 + 1]));
-            if (mono.size() == block) {
-                stopped = !sink(mono);
-                mono.clear();
+        for (size_t i = 0; i < frames && !stopped;) {
+            const size_t n = std::min(frames - i, block - out.size() / 2);
+            out.insert(out.end(), stereo + i * 2, stereo + (i + n) * 2);
+            i += n;
+            if (out.size() == block * 2) {
+                stopped = !sink(out);
+                out.clear();
             }
         }
     };
-    // A conformed video's sound (Interpret Footage) is made whole, as decodeAudio makes it, and handed out in blocks.
-    if (Interpretation in; parseInterpretation(path, in) && in.conformed()) {
-        AudioBufferPtr whole = decodeAudio(path, sampleRate, error, cancel);
+    // A conformed video's sound (Interpret Footage) and chosen channels are made whole, as decodeAudio makes them,
+    // and handed out in blocks.
+    if (Interpretation in; !channels.empty() || (parseInterpretation(path, in) && in.conformed())) {
+        AudioBufferPtr whole = decodeAudio(path, sampleRate, error, cancel, channels);
         if (!whole) return false;
         give(whole->samples.data(), size_t(whole->frames()));
-        if (!stopped && !mono.empty()) sink(mono);
-        return true;
+        if (!stopped && !out.empty()) sink(out);
+        return !(cancel && cancel->load());
     }
-    int channels = 2;
+    int count = 2;
     std::vector<float> stereo;
     const std::function<bool(std::vector<float>&, bool)> drain = [&](std::vector<float>& s, bool last) {
         const size_t frames = s.size() / 2;
         give(s.data(), frames);
         s.erase(s.begin(), s.begin() + std::ptrdiff_t(frames * 2));
-        if (last && !stopped && !mono.empty()) sink(mono);
+        if (last && !stopped && !out.empty()) sink(out);
         return !stopped;
     };
-    if (!decodeAudioStream(path, sampleRate, -1, stereo, channels, error, cancel, nullptr, &drain)) return false;
+    if (!decodeAudioStream(path, sampleRate, -1, stereo, count, error, cancel, nullptr, &drain)) return false;
     return !(cancel && cancel->load());
 }
 

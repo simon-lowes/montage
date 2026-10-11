@@ -139,8 +139,10 @@
 #include "media/TextToSpeech.h"
 #include "media/VoiceClone.h"
 #include "media/SoundSearch.h"
+#include "media/StemSeparation.h"
 #include "media/Inpaint.h"
 #include "SpeechDialog.h"
+#include "StemsDialog.h"
 #include "ShotSearchPanel.h"
 #include "PeoplePanel.h"
 #include "SequenceIndexPanel.h"
@@ -10033,6 +10035,65 @@ const auto seq = [this] { return state()->sequence(); };
         mode->setCurrentIndex(0);
         QCOMPARE(list->count(), 0);
         QVERIFY(panel->resultText(0).isEmpty());
+        state()->newProject();
+    }
+
+    void separateStemsFromTheMenu() {
+        state()->newProject();
+        QVERIFY(win_->findChild<QAction*>("separateStems"));
+        {
+            StemsDialog dlg(win_.get());
+            auto* stems = dlg.findChild<QComboBox*>("stems");
+            QVERIFY(stems && stems->count() == 3);
+            QCOMPARE(dlg.options().stems, 4);
+            QVERIFY(dlg.options().muteOriginal);
+            stems->setCurrentIndex(stems->findData(2));
+            dlg.findChild<QCheckBox*>("muteOriginal")->setChecked(false);
+            QCOMPARE(dlg.options().stems, 2);
+            QVERIFY(!dlg.options().muteOriginal);
+        }
+        QString why;
+        QVERIFY(separateStems(state(), {}, StemOptions{}, win_.get(), &why).empty());
+        QVERIFY(why.contains("Select"));
+        if (!stemSeparationAvailable() || !stemModel(4).installed()) QSKIP("Set MONTAGE_STEM_MODELS to a folder holding spleeter-4stems");
+        // A clip of JFK from 1 s to 6 s, at frame 10: its stems on four tracks named for them, linked with it, in sync,
+        // from WAVs in the Stems folder beside the project; the clip muted. One undo takes the placing back.
+        QVERIFY(state()->save(dir_.filePath("stems.montage")));
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        const double fps = state()->sequence()->fpsValue();
+        Id clip = 0;
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            const edit::Result r = edit::placeMedia(p, s, ids[0], 10, 1 * fps, 6 * fps, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+            if (r.ok) clip = r.created.at(0);
+            return r.ok;
+        }));
+        const size_t tracks = state()->sequence()->audioTracks.size();
+        const int undoBefore = int(state()->history().undoCount());
+        StemOptions o;
+        o.handles = 0.5;
+        const std::vector<Id> made = separateStems(state(), {clip}, o, win_.get(), &why);
+        QVERIFY2(made.size() == 4, qPrintable(why));
+        const Sequence* s = state()->sequence();
+        QCOMPARE(s->audioTracks.size(), tracks + 4);
+        const Clip* original = edit::clipById(const_cast<Sequence&>(*s), clip);
+        QVERIFY(original && !original->enabled);
+        const QStringList names{"Vocals", "Drums", "Bass", "Other"};
+        for (size_t k = 0; k < made.size(); ++k) {
+            const Clip* c = edit::clipById(const_cast<Sequence&>(*s), made[k]);
+            QVERIFY(c && c->start == 10 && c->duration == original->duration && c->linkGroup == original->linkGroup);
+            QCOMPARE(QString::fromStdString(s->audioTracks[size_t(edit::locate(*s, made[k])->track.index)].name), names[int(k)]);
+            const MediaItem* m = state()->project().findMedia(c->mediaId);
+            QVERIFY(m && QString::fromStdString(m->path).startsWith(dir_.filePath("Stems/")));
+            QVERIFY(QString::fromStdString(m->path).endsWith(names[int(k)] + ".wav"));
+            QVERIFY(m->metadata.at("comment").find("separated from") != std::string::npos);
+            // The source from half a second (and a frame) before the clip's In, so the stem's In is that far in.
+            QVERIFY2(std::abs(c->sourceIn - (0.5 + 1.0 / fps) * fps) < 1e-6, qPrintable(QString::number(c->sourceIn)));
+        }
+        state()->undo();
+        QCOMPARE(state()->sequence()->audioTracks.size(), tracks);
+        QVERIFY(edit::clipById(const_cast<Sequence&>(*state()->sequence()), clip)->enabled);
+        QVERIFY(int(state()->history().undoCount()) >= undoBefore);
         state()->newProject();
     }
 

@@ -1,5 +1,6 @@
 #include "Zip.h"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <fstream>
@@ -304,6 +305,70 @@ bool ZipReader::read(const Entry& e, std::string& out, std::string* error) const
         return false;
     }
     return true;
+}
+
+bool gunzip(const std::string& gz, std::string& out, std::string* error) {
+    out.clear();
+    auto fail = [&](const char* why) {
+        if (error) *error = why;
+        out.clear();
+        return false;
+    };
+    if (gz.size() < 18 || uint8_t(gz[0]) != 0x1f || uint8_t(gz[1]) != 0x8b || gz[2] != 8) return fail("Not a gzip file");
+    const uint8_t flags = uint8_t(gz[3]);
+    size_t p = 10;
+    if (flags & 4) p += 2 + size_t(le16(gz, p));  // FEXTRA
+    for (const uint8_t f : {uint8_t(8), uint8_t(16)})  // FNAME, FCOMMENT: zero-terminated
+        if (flags & f) {
+            while (p < gz.size() && gz[p]) ++p;
+            ++p;
+        }
+    if (flags & 2) p += 2;  // FHCRC
+    if (p + 8 > gz.size()) return fail("The gzip file is truncated");
+    const size_t trailer = gz.size() - 8;
+    const uint32_t size = le32(gz, trailer + 4);
+    if (!inflateRaw(reinterpret_cast<const uint8_t*>(gz.data() + p), trailer - p, out, size)) return fail("The gzip file is corrupt");
+    if (uint32_t(out.size()) != size || crc32(out.data(), out.size()) != le32(gz, trailer)) return fail("The gzip file fails its checksum");
+    return true;
+}
+
+std::vector<TarEntry> tarEntries(const std::string& tar) {
+    std::vector<TarEntry> entries;
+    auto octal = [&](size_t at, size_t len) {
+        size_t v = 0;
+        for (size_t i = at; i < at + len && i < tar.size(); ++i) {
+            const char c = tar[i];
+            if (c >= '0' && c <= '7') v = v * 8 + size_t(c - '0');
+            else if (c != ' ' || v) break;
+        }
+        return v;
+    };
+    std::string longName;
+    for (size_t h = 0; h + 512 <= tar.size();) {
+        if (std::all_of(tar.begin() + std::ptrdiff_t(h), tar.begin() + std::ptrdiff_t(h + 512), [](char c) { return c == 0; })) break;
+        // The header's checksum: its bytes summed with the checksum field taken as spaces.
+        size_t sum = 0;
+        for (size_t i = 0; i < 512; ++i) sum += (i >= 148 && i < 156) ? size_t(' ') : size_t(uint8_t(tar[h + i]));
+        if (sum != octal(h + 148, 8)) return {};
+        const size_t size = octal(h + 124, 12), data = h + 512;
+        if (data + size > tar.size()) return {};
+        const char type = tar[h + 156];
+        std::string name = longName;
+        longName.clear();
+        if (name.empty()) {
+            name.assign(tar.data() + h, strnlen(tar.data() + h, 100));
+            if (tar.compare(h + 257, 5, "ustar") == 0 && tar[h + 345])  // a ustar prefix
+                name = std::string(tar.data() + h + 345, strnlen(tar.data() + h + 345, 155)) + "/" + name;
+        }
+        if (type == 'L') {  // a GNU long name for the next entry
+            longName.assign(tar.data() + data, strnlen(tar.data() + data, size));
+        } else if (type == '0' || type == 0) {
+            while (name.rfind("./", 0) == 0) name.erase(0, 2);
+            entries.push_back({name, data, size});
+        }
+        h = data + (size + 511) / 512 * 512;
+    }
+    return entries;
 }
 
 }  // namespace montage

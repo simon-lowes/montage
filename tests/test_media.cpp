@@ -112,6 +112,7 @@
 #include "media/TextToSpeech.h"
 #include "media/VoiceClone.h"
 #include "media/SoundSearch.h"
+#include "media/StemSeparation.h"
 #include "media/Inpaint.h"
 #include "media/VisualSearch.h"
 #include "automation/McpServer.h"
@@ -15645,6 +15646,264 @@ private slots:
         QCOMPARE(r.value("structuredContent").toObject().value("skipped").toArray().size(), 1);
         QVERIFY(loadProject(project.toStdString(), back, &err));
         for (const MediaItem& m : back.media) QCOMPARE(bool(m.sounds && !m.sounds->samples.empty()), m.name != "no-such-recording.wav");
+    }
+
+    void stemSeparation() {
+        QCOMPARE(stemNames(4), (std::vector<std::string>{"vocals", "drums", "bass", "other"}));
+        QCOMPARE(stemNames(5), (std::vector<std::string>{"vocals", "piano", "drums", "bass", "other"}));
+        QCOMPARE(stemNames(2), (std::vector<std::string>{"vocals", "accompaniment"}));
+        QVERIFY(stemNames(3).empty());
+        QCOMPARE(stemTitle("accompaniment"), std::string("Accompaniment"));
+        QCOMPARE(stemModel(5).id, std::string("spleeter-5stems"));
+        QCOMPARE(stemModel(2).files[0].name, std::string("2stems.tar.gz"));
+        // Sound read in stereo blocks: the same samples as decoding it whole, chosen channels too.
+        for (const std::vector<int>& channels : {std::vector<int>{}, std::vector<int>{0}}) {
+            AudioBufferPtr whole = decodeAudio(MONTAGE_TEST_DATA_DIR "/jfk.wav", kStemRate, nullptr, nullptr, channels);
+            QVERIFY(whole);
+            std::vector<float> blocks;
+            QVERIFY(decodeAudioStereoBlocks(MONTAGE_TEST_DATA_DIR "/jfk.wav", kStemRate, 30000, [&](const std::vector<float>& b) {
+                blocks.insert(blocks.end(), b.begin(), b.end());
+                return true;
+            }, nullptr, nullptr, channels));
+            QCOMPARE(blocks, whole->samples);
+        }
+        if (!stemSeparationAvailable() || !stemModel(4).installed())
+            QSKIP("Set MONTAGE_STEM_MODELS to a folder holding spleeter-4stems (4stems.tar.gz) to run the rest");
+        auto writeStereoWav = [](const std::string& file, const std::vector<float>& x) {
+            FILE* f = std::fopen(file.c_str(), "wb");
+            if (!f) return false;
+            const uint32_t bytes = uint32_t(x.size() * 4);
+            auto u32 = [&](uint32_t v) { std::fwrite(&v, 4, 1, f); };
+            auto u16 = [&](uint16_t v) { std::fwrite(&v, 2, 1, f); };
+            std::fwrite("RIFF", 1, 4, f), u32(36 + bytes), std::fwrite("WAVEfmt ", 1, 8, f);
+            u32(16), u16(3), u16(2), u32(kStemRate), u32(kStemRate * 8), u16(8), u16(32), std::fwrite("data", 1, 4, f), u32(bytes);
+            std::fwrite(x.data(), 4, x.size(), f);
+            return std::fclose(f) == 0;
+        };
+        auto stemsOf = [&](const std::string& stem, int n) {
+            std::vector<std::string> outs;
+            for (const std::string& name : stemNames(n)) outs.push_back(path((stem + "-" + name + ".wav").c_str()));
+            return outs;
+        };
+        std::string err;
+        // Exactly Spleeter's own separation (its TensorFlow code, with these weights) of a synthetic 13 s mix: a bass
+        // note, two melodies, a kick twice a second and noise, across the segment boundary at 11.8 s.
+        {
+            const int n = kStemRate * 13;
+            std::vector<double> noise(size_t(n) + 7);
+            uint64_t lcg = 1;
+            for (double& v : noise) {
+                lcg = (1103515245 * lcg + 12345) % 2147483648ULL;
+                v = double(lcg) / 1073741824.0 - 1.0;
+            }
+            std::vector<float> mix(size_t(n) * 2);
+            for (int i = 0; i < n; ++i) {
+                const double t = i / double(kStemRate), tau = (i % 22050) / double(kStemRate);
+                const double kick = 0.6 * std::sin(2 * M_PI * (50 + 100 * std::exp(-30 * tau)) * tau) * std::exp(-10 * tau);
+                mix[size_t(i) * 2] = float(0.25 * std::sin(2 * M_PI * 82.4 * t) +
+                                           0.15 * std::sin(2 * M_PI * 523.25 * t) * (0.5 + 0.5 * std::sin(2 * M_PI * 0.7 * t)) + kick + 0.05 * noise[size_t(i)]);
+                mix[size_t(i) * 2 + 1] = float(0.25 * std::sin(2 * M_PI * 82.4 * t + 0.3) +
+                                               0.15 * std::sin(2 * M_PI * 659.25 * t) * (0.5 + 0.5 * std::cos(2 * M_PI * 0.7 * t)) + kick +
+                                               (i + 7 < n ? 0.05 * noise[size_t(i) + 7] : 0.0));
+            }
+            QVERIFY(writeStereoWav(path("synth.wav"), mix));
+            const std::vector<std::string> outs = stemsOf("synth", 4);
+            double progressed = 0;
+            QVERIFY2(separateStemsToFiles(path("synth.wav"), 0, 13, {}, 4, outs, [&](double f) { progressed = f; }, nullptr, &err), err.c_str());
+            QCOMPARE(progressed, 1.0);
+            // TensorFlow's figures: each stem's level (left, right) over all of it and over 11.5-12.3 s, and samples
+            // at 100000, the boundary (520192) and 560000.
+            const double level[4][2] = {{0.002458, 0.002457}, {0.121668, 0.121809}, {0.173225, 0.173238}, {0.067172, 0.067617}};
+            const double boundary[4][2] = {{0.007814, 0.007799}, {0.135077, 0.134167}, {0.168574, 0.167512}, {0.083665, 0.053894}};
+            const int at[3] = {100000, 520192, 560000};
+            const double sample[3][4][2] = {
+                {{0.000133, -0.000471}, {0.025835, 0.023017}, {-0.209735, -0.158303}, {-0.019301, -0.011819}},
+                {{0.000213, 0.000079}, {-0.027798, -0.032654}, {-0.053293, 0.023201}, {0.108686, 0.052247}},
+                {{-0.002658, -0.001867}, {-0.031354, -0.023633}, {0.204586, 0.155898}, {0.011224, 0.055054}}};
+            for (int k = 0; k < 4; ++k) {
+                AudioBufferPtr st = decodeAudio(outs[size_t(k)], kStemRate, &err);
+                QVERIFY2(st && st->sampleRate == kStemRate, err.c_str());
+                QCOMPARE(st->frames(), int64_t(n));
+                for (int c = 0; c < 2; ++c) {
+                    auto rms = [&](int a, int b) {
+                        double sum = 0;
+                        for (int i = a; i < b; ++i) sum += double(st->samples[size_t(i) * 2 + size_t(c)]) * st->samples[size_t(i) * 2 + size_t(c)];
+                        return std::sqrt(sum / (b - a));
+                    };
+                    const double all = rms(0, n), edge = rms(int(11.5 * kStemRate), int(12.3 * kStemRate));
+                    QVERIFY2(std::abs(all - level[k][c]) < 5e-5, qPrintable(QStringLiteral("stem %1 %2: %3").arg(k).arg(c).arg(all)));
+                    QVERIFY2(std::abs(edge - boundary[k][c]) < 5e-5, qPrintable(QStringLiteral("stem %1 %2: %3").arg(k).arg(c).arg(edge)));
+                    for (int j = 0; j < 3; ++j) {
+                        const float v = st->samples[size_t(at[j]) * 2 + size_t(c)];
+                        QVERIFY2(std::abs(v - sample[j][k][c]) < 2e-4, qPrintable(QStringLiteral("stem %1 %2 at %3: %4").arg(k).arg(c).arg(at[j]).arg(v)));
+                    }
+                }
+            }
+            // A stretch of it: that long. Cancelled: nothing left behind.
+            const std::vector<std::string> part = stemsOf("synth-part", 4);
+            QVERIFY2(separateStemsToFiles(path("synth.wav"), 2, 5, {}, 4, part, {}, nullptr, &err), err.c_str());
+            AudioBufferPtr p0 = decodeAudio(part[0], kStemRate);
+            QVERIFY(p0 && std::abs(p0->frames() - 3 * kStemRate) <= 1);
+            std::atomic<bool> stop{true};
+            const std::vector<std::string> dropped = stemsOf("synth-cancel", 4);
+            QVERIFY(!separateStemsToFiles(path("synth.wav"), 0, 13, {}, 4, dropped, {}, &stop, &err));
+            QCOMPARE(err, std::string("Cancelled"));
+            for (const std::string& d : dropped) QVERIFY(!QFile::exists(QString::fromStdString(d)));
+            QVERIFY(!separateStemsToFiles(path("synth.wav"), 0, 13, {}, 3, dropped, {}, nullptr, &err));
+        }
+        // JFK speaking over drums, a bass line and a chord pad: the speech comes out as the vocals, the pad as the rest.
+        AudioBufferPtr jfk = decodeAudio(MONTAGE_TEST_DATA_DIR "/jfk.wav", kStemRate, &err);
+        QVERIFY(jfk);
+        const int n = kStemRate * 14;
+        std::vector<double> speech(static_cast<size_t>(n), 0.0), drums(static_cast<size_t>(n), 0.0), bass(static_cast<size_t>(n)), pad(static_cast<size_t>(n));
+        for (int i = 0; i < n && i < jfk->frames(); ++i) speech[size_t(i)] = 0.5 * (jfk->samples[size_t(i) * 2] + jfk->samples[size_t(i) * 2 + 1]);
+        uint64_t lcg = 7;
+        for (int beat = 0; beat < 28; ++beat) {
+            const int s0 = beat * kStemRate / 2;
+            for (int i = 0; i < kStemRate / 4 && s0 + i < n; ++i) {
+                const double tt = i / double(kStemRate);
+                drums[size_t(s0 + i)] += 0.8 * std::sin(2 * M_PI * (55 + 90 * std::exp(-tt * 30)) * tt) * std::exp(-tt * 12);
+            }
+            for (int i = 0, h0 = s0 + kStemRate / 4; i < kStemRate / 20 && h0 + i < n; ++i) {
+                lcg = (1103515245 * lcg + 12345) % 2147483648ULL;
+                drums[size_t(h0 + i)] += 0.25 * (double(lcg) / 1073741824.0 - 1.0) * std::exp(-i / double(kStemRate) * 80);
+            }
+        }
+        const double notes[4] = {41.2, 41.2, 55.0, 49.0};
+        for (int i = 0; i < n; ++i) {
+            const double t = i / double(kStemRate);
+            bass[size_t(i)] = 0.35 * std::sin(2 * M_PI * notes[int(t / 2) % 4] * t);
+            pad[size_t(i)] = 0.08 * (std::sin(2 * M_PI * 220 * t) + std::sin(2 * M_PI * 277.2 * t) + std::sin(2 * M_PI * 329.6 * t));
+        }
+        std::vector<float> mix(size_t(n) * 2);
+        for (int i = 0; i < n; ++i) {
+            mix[size_t(i) * 2] = float(0.7 * (0.9 * speech[size_t(i)] + 0.6 * drums[size_t(i)] + bass[size_t(i)] + 0.8 * pad[size_t(i)]));
+            mix[size_t(i) * 2 + 1] = float(0.7 * (0.9 * speech[size_t(i)] + 0.5 * drums[size_t(i)] + bass[size_t(i)] + 1.2 * pad[size_t(i)]));
+        }
+        QVERIFY(writeStereoWav(path("band.wav"), mix));
+        auto correlation = [](const std::vector<double>& a, const std::vector<double>& b) {
+            double ab = 0, aa = 0, bb = 0;
+            for (size_t i = 0; i < a.size() && i < b.size(); ++i) ab += a[i] * b[i], aa += a[i] * a[i], bb += b[i] * b[i];
+            return ab / std::sqrt(std::max(1e-30, aa * bb));
+        };
+        auto monoOf = [&](const std::string& file) {
+            AudioBufferPtr b = decodeAudio(file, kStemRate);
+            std::vector<double> m;
+            if (b)
+                for (int64_t i = 0; i < b->frames(); ++i) m.push_back(0.5 * (b->samples[size_t(i) * 2] + b->samples[size_t(i) * 2 + 1]));
+            return m;
+        };
+        {
+            const std::vector<std::string> outs = stemsOf("band", 4);
+            QVERIFY2(separateStemsToFiles(path("band.wav"), 0, 14, {}, 4, outs, {}, nullptr, &err), err.c_str());
+            const std::vector<double> vocals = monoOf(outs[0]), other = monoOf(outs[3]);
+            std::vector<double> rhythm = monoOf(outs[1]), low(static_cast<size_t>(n));
+            const std::vector<double> bassStem = monoOf(outs[2]);
+            for (size_t i = 0; i < rhythm.size() && i < bassStem.size(); ++i) rhythm[i] += bassStem[i];
+            for (int i = 0; i < n; ++i) low[size_t(i)] = drums[size_t(i)] + bass[size_t(i)];
+            QVERIFY2(correlation(vocals, speech) > 0.95, qPrintable(QString::number(correlation(vocals, speech))));
+            QVERIFY2(correlation(vocals, pad) < 0.1, qPrintable(QString::number(correlation(vocals, pad))));
+            QVERIFY2(correlation(other, pad) > 0.9, qPrintable(QString::number(correlation(other, pad))));
+            QVERIFY2(correlation(rhythm, low) > 0.9, qPrintable(QString::number(correlation(rhythm, low))));
+        }
+        // On the timeline: a clip's stems in sync with it, each on a track named for it, linked with it, the clip muted.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        const double fps = s.fpsValue();
+        MediaItem band = probeOrFail(p, path("band.wav"));
+        p.media.push_back(band);
+        const size_t tracksBefore = s.audioTracks.size();
+        edit::Result placed = edit::placeMedia(p, s, band.id, 25, 3 * fps, 8 * fps, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        QVERIFY(placed.ok && placed.created.size() == 1);
+        const Id clipId = placed.created[0];
+        const Clip original = *edit::clipById(s, clipId);
+        double from = 0, to = 0;
+        QVERIFY2(stemSource(p, s, clipId, 2.0, from, to, &err), err.c_str());
+        QVERIFY2(std::abs(from - (1.0 - 1 / fps)) < 1e-9 && std::abs(to - (8.0 + 2.0 + 1 / fps)) < 1e-9, qPrintable(QStringLiteral("%1 %2").arg(from).arg(to)));
+        QVERIFY(!stemSource(p, s, 999999, 2.0, from, to, &err));
+        QVERIFY2(stemSource(p, s, clipId, 2.0, from, to, &err), err.c_str());
+        const std::vector<std::string> outs = stemsOf("clip", 4);
+        QVERIFY2(separateStemsToFiles(band.path, from, to, original.channels, 4, outs, {}, nullptr, &err), err.c_str());
+        std::vector<Id> media;
+        std::vector<std::string> titles;
+        for (size_t k = 0; k < outs.size(); ++k) {
+            MediaItem m = probeOrFail(p, outs[k]);
+            p.media.push_back(m);
+            media.push_back(m.id);
+            titles.push_back(stemTitle(stemNames(4)[k]));
+        }
+        const edit::Result r = placeStems(p, s, clipId, media, titles, from, true);
+        QVERIFY2(r.ok && r.created.size() == 4, r.error.c_str());
+        QCOMPARE(s.audioTracks.size(), tracksBefore + 4);
+        const Clip* after = edit::clipById(s, clipId);
+        QVERIFY(after && !after->enabled && after->linkGroup != 0);
+        for (size_t k = 0; k < 4; ++k) {
+            const auto loc = edit::locate(s, r.created[k]);
+            QVERIFY(loc && loc->track.kind == TrackKind::Audio);
+            QCOMPARE(s.audioTracks[size_t(loc->track.index)].name, titles[k]);
+            const Clip* st = edit::clipById(s, r.created[k]);
+            QCOMPARE(st->start, original.start);
+            QCOMPARE(st->duration, original.duration);
+            QVERIFY(std::abs(st->sourceIn - (original.sourceIn - from * fps)) < 1e-9);
+            QCOMPARE(st->linkGroup, after->linkGroup);
+            QVERIFY(st->enabled && st->mediaId == media[k]);
+        }
+        // The stems add back up to the clip's sound (below 11 kHz, where the masks share it out), from the same moment.
+        {
+            std::vector<double> sum;
+            for (const std::string& o : outs) {
+                const std::vector<double> m = monoOf(o);
+                sum.resize(std::max(sum.size(), m.size()), 0.0);
+                for (size_t i = 0; i < m.size(); ++i) sum[i] += m[i];
+            }
+            std::vector<double> source;
+            for (size_t i = size_t(std::llround(from * kStemRate)); i < size_t(std::llround(to * kStemRate)) && i < size_t(n); ++i)
+                source.push_back(0.5 * (mix[i * 2] + mix[i * 2 + 1]));
+            QVERIFY(std::abs(double(sum.size()) - double(source.size())) <= 1);
+            QVERIFY2(correlation(sum, source) > 0.99, qPrintable(QString::number(correlation(sum, source))));
+        }
+        // Again over the same clip: those tracks are taken there, so four more are added.
+        QVERIFY(placeStems(p, s, clipId, media, titles, from, true).ok);
+        QCOMPARE(s.audioTracks.size(), tracksBefore + 8);
+
+        // Through MCP: the clip's stems written beside the project and placed, the clip left playing.
+        Project fresh = makeDefaultProject();
+        Sequence& fs = *fresh.active();
+        MediaItem fb = probeOrFail(fresh, path("band.wav"));
+        fresh.media.push_back(fb);
+        edit::Result fp = edit::placeMedia(fresh, fs, fb.id, 0, 0, 4 * fps, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        QVERIFY(fp.ok);
+        QDir().mkpath(QString::fromStdString(path("mcp-stems")));
+        const QString project = QString::fromStdString(path("mcp-stems/stems.montage"));
+        QVERIFY(saveProject(fresh, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_separate_stems"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject res = call(QJsonObject{{"project", project}, {"clips", QJsonArray{double(fp.created[0])}}, {"mute_original", false}, {"handles", 0}});
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        const QJsonArray made = res.value("structuredContent").toObject().value("stems").toArray();
+        QCOMPARE(made.size(), 4);
+        QCOMPARE(made[0].toObject().value("stem").toString(), QStringLiteral("Vocals"));
+        QVERIFY(QFile::exists(made[3].toObject().value("file").toString()));
+        QVERIFY(made[3].toObject().value("file").toString().contains(QStringLiteral("/mcp-stems/Stems/")));
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back, &err));
+        const Sequence& bs = *back.active();
+        QVERIFY(edit::clipById(const_cast<Sequence&>(bs), fp.created[0])->enabled);
+        int named = 0;
+        for (const Track& t : bs.audioTracks) named += (t.name == "Vocals" || t.name == "Drums" || t.name == "Bass" || t.name == "Other") && t.clips.size() == 1;
+        QCOMPARE(named, 4);
+        for (const MediaItem& m : back.media)
+            if (m.path.find("/Stems/") != std::string::npos)
+                QVERIFY(std::find(m.keywords.begin(), m.keywords.end(), "Stem") != m.keywords.end() && m.metadata.at("comment").find("Spleeter") != std::string::npos);
+        res = call(QJsonObject{{"project", project}, {"clips", QJsonArray{double(fp.created[0])}}, {"stems", 3}});
+        QVERIFY(res.value("isError").toBool());
     }
 
     void voiceCloning() {
