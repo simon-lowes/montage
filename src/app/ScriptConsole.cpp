@@ -91,8 +91,9 @@ ScriptConsole::ScriptConsole(EditorState* state, LiveLink* link, QWidget* parent
     if (!scriptingAvailable()) print(tr("This build of Montage has no Lua, so scripts cannot run."), true);
 
     connect(run_, &QPushButton::clicked, this, [this] {
-        runScriptAs(editor_->toPlainText(), path_.isEmpty() ? tr("Console") : QFileInfo(path_).fileName(), {},
-                    path_.isEmpty() ? QStringLiteral("console") : path_, std::nullopt, false);
+        // (The console's panel runs the console's script: the file on disk may differ from what is in the editor.)
+        runScriptAs(editor_->toPlainText(), path_.isEmpty() ? tr("Console") : QFileInfo(path_).fileName(), {}, QStringLiteral("console"),
+                    std::nullopt, false);
     });
     connect(stop_, &QPushButton::clicked, this, &ScriptConsole::stop);
     connect(openBtn, &QPushButton::clicked, this, [this] {
@@ -163,7 +164,8 @@ bool ScriptConsole::setUpPanel(const QString& path) {
         print(tr("Cannot read %1").arg(QDir::toNativeSeparators(path)), true);
         return false;
     }
-    return runScriptAs(QString::fromUtf8(f.readAll()), QFileInfo(path).fileName(), {}, QFileInfo(path).absoluteFilePath(), std::nullopt, true);
+    runScriptAs(QString::fromUtf8(f.readAll()), QFileInfo(path).fileName(), {}, QFileInfo(path).absoluteFilePath(), std::nullopt, true);
+    return lastSetUpDescribed_;
 }
 
 void ScriptConsole::stop() {
@@ -213,7 +215,28 @@ bool ScriptConsole::runScriptAs(const QString& code, const QString& name, const 
     o.panel = [&](const QJsonObject& d, QString* error) -> std::optional<QJsonObject> {
         std::optional<PanelSpec> spec = parsePanel(d, error);
         if (!spec) return std::nullopt;
-        if (values) return *values;
+        if (values) {
+            // The script as it is now may describe another panel than the one pressed (edited since): what the panel
+            // holds goes into the new one where a control of that id and kind is still there, new controls bring their
+            // defaults, and the panel is rebuilt to match.
+            const std::optional<PanelSpec> open = panels_.current ? panels_.current(key) : std::nullopt;
+            if (open && samePanelLayout(*open, *spec)) return *values;
+            PanelSpec next = *spec;
+            for (auto it = values->begin(); it != values->end(); ++it)
+                if (const PanelControl* c = next.find(it.key()); c && (!open || !open->find(it.key()) || open->find(it.key())->type == c->type))
+                    setPanelValue(next, it.key(), it.value());  // (a value that no longer fits keeps the default)
+            const QString pressed = values->value("pressed").toString();
+            const PanelControl* button = next.find(pressed);
+            if (!button || button->type != QLatin1String("button")) {
+                *error = tr("the panel has changed: it has no button \"%1\" now (pressed again, it is rebuilt)").arg(pressed);
+                if (panels_.described) panels_.described(key, name, code, next);
+                return std::nullopt;
+            }
+            if (panels_.described) panels_.described(key, name, code, next);
+            QJsonObject merged = panelValues(next);
+            merged["pressed"] = pressed;
+            return merged;
+        }
         if (!panels_.described) {
             *error = tr("panels open in the main window");
             return std::nullopt;
@@ -228,7 +251,11 @@ bool ScriptConsole::runScriptAs(const QString& code, const QString& name, const 
         }
         return panels_.set(key, v, error);
     };
-    o.stopped = [this] { return stopping_; };
+    QElapsedTimer started;
+    started.start();
+    // A panel opening by itself is given five seconds (a script that runs on without describing it is ended).
+    o.stopped = [this, setUp, &started] { return stopping_ || (setUp && started.elapsed() > 5000); };
+    o.quiet = setUp;
     QElapsedTimer sinceEvents;
     sinceEvents.start();
     o.tick = [&sinceEvents] {
@@ -284,6 +311,7 @@ bool ScriptConsole::runScriptAs(const QString& code, const QString& name, const 
     else if (ok) print(tr("Done."));
     else print(err, true);
     if (ok && described) panels_.described(key, name, code, *described);
+    lastSetUpDescribed_ = !setUp || (ok && described);
     if (values && panels_.finished) panels_.finished(key, ok ? lastLine : err, !ok);
     running_ = stopping_ = false;
     updateButtons();

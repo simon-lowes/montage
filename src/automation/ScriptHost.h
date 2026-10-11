@@ -27,6 +27,8 @@ struct ScriptOptions {
     QStringList args;
     QString project;  // montage.project: the project the script works on ("" if none)
     bool noStdin = false;  // no io.read or io.lines() from standard input (the app has none: they would wait for ever)
+    // A panel opening again by itself (at start-up): no os.execute, io.popen, writing or removing files.
+    bool quiet = false;
     // montage.panel{title = ..., controls = {...}}: given what it describes (as JSON), the host answers with what the
     // panel's controls hold (by id) and the button pressed ("pressed"), which montage.panel returns for the script to
     // go on with; or with nothing, which ends the script there, successfully, its panel described (it runs again from

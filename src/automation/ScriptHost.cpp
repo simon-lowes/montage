@@ -82,6 +82,10 @@ void hook(lua_State* L, lua_Debug*);
     lua_getfield(L, LUA_REGISTRYINDEX, key);
     lua_setfield(L, LUA_REGISTRYINDEX, kEndingKey);
     lua_sethook(L, hook, LUA_MASKCOUNT, 1);
+    // The main thread too (raised in a coroutine, it could be caught where the prelude does not reach).
+    lua_rawgeti(L, LUA_REGISTRYINDEX, LUA_RIDX_MAINTHREAD);
+    if (lua_State* main = lua_tothread(L, -1); main && main != L) lua_sethook(main, hook, LUA_MASKCOUNT, 1);
+    lua_pop(L, 1);
     lua_getfield(L, LUA_REGISTRYINDEX, key);
     lua_error(L);
     std::abort();  // (lua_error does not return)
@@ -331,8 +335,15 @@ pcall = function(f, ...) return pass(pcall0(f, ...)) end
 xpcall = function(f, handler, ...)
   return pass(xpcall0(f, function(e) if e == STOP or e == DONE then return e end return handler(e) end, ...))
 end
-local resume0 = coroutine.resume
+local resume0, close0 = coroutine.resume, coroutine.close
 coroutine.resume = function(co, ...) return pass(resume0(co, ...)) end
+coroutine.close = function(co) return pass(close0(co)) end
+local load0 = load
+load = function(...)
+  local f, e = load0(...)
+  if f == nil and (e == STOP or e == DONE) then error0(e, 0) end
+  return f, e
+end
 )lua";
 
 }  // namespace
@@ -363,6 +374,14 @@ bool runScript(const QString& code, const QString& name, const ScriptOptions& op
     lua_getfield(L, -1, "searchers");
     for (int i = 4; i >= 3; --i) lua_pushnil(L), lua_rawseti(L, -2, i);  // (the C and all-in-one searchers)
     lua_pop(L, 2);
+    // A panel opening again at start-up runs with nothing that changes files or runs programs (the user did not ask).
+    if (options.quiet) {
+        luaL_dostring(L, "local function no(name) return function() error(name .. ' is not available while a panel opens', 2) end end\n"
+                         "for _, n in ipairs{'execute', 'remove', 'rename', 'tmpname'} do os[n] = no('os.' .. n) end\n"
+                         "io.popen = no('io.popen'); io.output = no('io.output'); io.write = no('io.write'); io.tmpfile = no('io.tmpfile')\n"
+                         "local open0 = io.open\n"
+                         "io.open = function(f, mode) if mode ~= nil and not tostring(mode):match('^r') then error('io.open: only reading while a panel opens', 2) end return open0(f, mode) end");
+    }
     // Without a terminal (the app), reading standard input would wait for ever.
     if (options.noStdin) {
         luaL_dostring(L, "local lines0 = io.lines\n"

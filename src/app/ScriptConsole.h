@@ -37,6 +37,8 @@ struct PanelHost {
     std::function<bool(const QString& key, const QJsonObject& values, QString* error)> set;
     // A button's run ended: what to show on the panel (its last line of output, or the error).
     std::function<void(const QString& key, const QString& message, bool error)> finished;
+    // The panel open under `key` now (its layout and what its controls hold), if any.
+    std::function<std::optional<PanelSpec>(const QString& key)> current;
 };
 
 class ScriptConsole : public QWidget {
@@ -51,7 +53,8 @@ public:
     bool runFile(const QString& path, const QStringList& args = {});
     // A panel's button pressed: the script run with `values` (its controls and "pressed") as montage.panel's answer.
     bool runPanel(const QString& key, const QString& code, const QString& name, const QJsonObject& values);
-    // A panel opened again (at start-up): its script run until it describes the panel, its tools refused meanwhile.
+    // A panel opened again (at start-up): its script run until it describes the panel, its tools refused meanwhile,
+    // with no programs run or files changed, for five seconds at most. False when it did not describe its panel.
     bool setUpPanel(const QString& path);
     void stop();  // the script stops at its next step; a tool running is not waited for, and its result not applied
     bool running() const { return running_; }
@@ -72,6 +75,7 @@ private:
     bool runScriptAs(const QString& code, const QString& name, const QStringList& args, const QString& key,
                      const std::optional<QJsonObject>& values, bool setUp);
     PanelHost panels_;
+    bool lastSetUpDescribed_ = false;
 
     EditorState* state_;
     LiveLink* link_;

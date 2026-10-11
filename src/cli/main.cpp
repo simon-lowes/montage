@@ -1278,6 +1278,17 @@ int cmdScript(const std::vector<std::string>& args) {
     // A panel: printed (and the script ends there), or answered as if --press's button were pressed.
     std::optional<PanelSpec> panel;
     bool pressed = false;
+    if (!press.isEmpty()) {
+        // (A script that turns out to have no panel must not have changed anything first.)
+        auto call = o.call;
+        o.call = [call, &pressed](const QString& name, const QJsonObject& args, QString* error) -> QJsonObject {
+            if (!pressed) {
+                *error = QStringLiteral("with --press, a script calls montage.panel before any tool");
+                return {};
+            }
+            return call(name, args, error);
+        };
+    }
     o.panel = [&](const QJsonObject& description, QString* error) -> std::optional<QJsonObject> {
         std::optional<PanelSpec> spec = parsePanel(description, error);
         if (!spec) return std::nullopt;

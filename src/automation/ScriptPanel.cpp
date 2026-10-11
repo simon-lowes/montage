@@ -84,7 +84,11 @@ std::optional<PanelSpec> parsePanel(const QJsonObject& d, QString* error) {
             c.min = o.value("min").toDouble(slider ? 0 : -1e9);
             c.max = o.value("max").toDouble(slider ? 100 : 1e9);
             c.step = o.value("step").toDouble(1);
-            if (slider) c.min = std::round(c.min), c.max = std::round(c.max), c.step = std::max(1.0, std::round(c.step));
+            if (slider) {
+                // (Whole numbers a slider can hold.)
+                c.min = std::clamp(std::round(c.min), -1e9, 1e9), c.max = std::clamp(std::round(c.max), -1e9, 1e9);
+                c.step = std::clamp(std::round(c.step), 1.0, 1e6);
+            }
             if (!(c.min <= c.max) || !std::isfinite(c.min) || !std::isfinite(c.max)) return fail(QStringLiteral("%1: min is more than max").arg(at));
             if (!(c.step > 0) || !std::isfinite(c.step)) return fail(QStringLiteral("%1: step is more than 0").arg(at));
             if (!v.isUndefined() && !v.isDouble()) return fail(QStringLiteral("%1: its value is a number").arg(at));
@@ -149,6 +153,17 @@ bool setPanelValue(PanelSpec& spec, const QString& id, const QJsonValue& value, 
         double x = std::clamp(v.toDouble(), c->min, c->max);
         if (c->type == QLatin1String("slider")) x = std::round(x);
         c->value = number(x);
+    }
+    return true;
+}
+
+bool samePanelLayout(const PanelSpec& a, const PanelSpec& b) {
+    if (a.title != b.title || a.controls.size() != b.controls.size()) return false;
+    for (size_t i = 0; i < a.controls.size(); ++i) {
+        const PanelControl &x = a.controls[i], &y = b.controls[i];
+        if (x.type != y.type || x.id != y.id || x.label != y.label || x.min != y.min || x.max != y.max || x.step != y.step ||
+            x.choices != y.choices)
+            return false;
     }
     return true;
 }

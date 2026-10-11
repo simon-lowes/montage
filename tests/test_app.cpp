@@ -10876,7 +10876,7 @@ local ui = montage.panel{title = "Marker Maker", controls = {
 if ui.pressed == "fail" then error("on purpose") end
 montage.add_marker{at = ui.at, name = ui.name, chapter = ui.chapter}
 montage.add_marker{at = ui.at + 1, name = ui.name .. " end"}
-montage.set_panel{status = "Added " .. ui.name, at = ui.at + 2}
+montage.set_panel{status = "Added " .. ui.name, at = ui.at + 2.5}
 print("added " .. ui.name)
 )lua";
         write(code);
@@ -10904,7 +10904,7 @@ print("added " .. ui.name)
         QCOMPARE(int(state()->history().undoCount()), steps + 1);
         QCOMPARE(QString::fromStdString(state()->history().undoLabel()), QString("Script: marker-maker.lua"));
         QCOMPARE(qobject_cast<QLabel*>(panel->control("status"))->text(), QString("Added Intro"));
-        QCOMPARE(qobject_cast<QDoubleSpinBox*>(panel->control("at"))->value(), 4.0);
+        QCOMPARE(qobject_cast<QDoubleSpinBox*>(panel->control("at"))->value(), 4.5);  // (more decimals than its step: kept)
         QCOMPARE(panel->findChild<QLabel*>("panelMessage")->text(), QString("added Intro"));
         QVERIFY(panel->control("add")->isEnabled());
         state()->undo();
@@ -10918,6 +10918,20 @@ print("added " .. ui.name)
         QVERIFY(console->runFile(path));
         QCOMPARE(win_->scriptPanel(path), qobject_cast<ScriptPanelWidget*>(dock->widget()));
         QCOMPARE(dock->windowTitle(), QString("Marker Maker 2"));
+        // Edited to have another control, then pressed on the old panel: the new control's default arrives (not
+        // nothing), what the old panel held carries over, and the panel is rebuilt to match.
+        write(QByteArray(code).replace("Marker Maker", "Marker Maker 3")
+                  .replace("{type = \"label\", id = \"status\", text = \"\"},", "{type = \"label\", id = \"status\", text = \"\"},\n  {type = \"check\", id = \"dry\", label = \"Dry run\", value = true},")
+                  .replace("if ui.pressed == \"fail\"", "print('dry ' .. tostring(ui.dry))\nif ui.dry then return end\nif ui.pressed == \"fail\""));
+        qobject_cast<QLineEdit*>(win_->scriptPanel(path)->control("name"))->setText("Kept");
+        qobject_cast<QPushButton*>(win_->scriptPanel(path)->control("add"))->click();
+        QVERIFY(console->output().contains("dry true"));
+        QVERIFY(state()->sequence()->markers.empty());  // (a dry run)
+        QTRY_COMPARE(dock->windowTitle(), QString("Marker Maker 3"));
+        QVERIFY(win_->scriptPanel(path)->control("dry"));
+        QCOMPARE(qobject_cast<QLineEdit*>(win_->scriptPanel(path)->control("name"))->text(), QString("Kept"));
+        write(QByteArray(code).replace("Marker Maker", "Marker Maker 2"));
+        QVERIFY(console->runFile(path));
         // Closed by its button: gone and not opened again; opened again at start-up while listed, running no tools
         // before its panel (a script that calls one first is refused).
         dock->close();
@@ -10936,6 +10950,34 @@ print("added " .. ui.name)
         QVERIFY(!win_->scriptPanel(path));
         QVERIFY(state()->sequence()->markers.empty());
         QVERIFY(console->output().contains("runs no tools"));
+        // ...and, having described no panel, it is forgotten rather than run at every start.
+        QVERIFY(!appSettings().value("scripts/panels").toStringList().contains(path));
+        // Opening by itself, a script runs no programs, writes no files and is ended after five seconds.
+        const QString trap = dir_.filePath("written-at-start.txt");
+        write(QByteArray("local f = io.open([[") + trap.toUtf8() + "]], 'w')\n" + code);
+        appSettings().setValue("scripts/panels", QStringList{path});
+        win_->restoreScriptPanels();
+        QVERIFY(!QFileInfo::exists(trap) && !win_->scriptPanel(path));
+        QVERIFY(console->output().contains("only reading while a panel opens"));
+        write("while true do end\n" + code);
+        appSettings().setValue("scripts/panels", QStringList{path});
+        QElapsedTimer spent;
+        spent.start();
+        win_->restoreScriptPanels();
+        QVERIFY(spent.elapsed() < 15000 && !win_->scriptPanel(path) && !console->running());
+        QVERIFY(!appSettings().value("scripts/panels").toStringList().contains(path));
+        // Its dock closed while its button's run is going: the run ends cleanly (an error that is not text named after
+        // the script, which the gone panel no longer holds).
+        write(QByteArray(code).replace("if ui.pressed == \"fail\" then error(\"on purpose\") end",
+                                       "if ui.pressed == \"fail\" then montage.add_marker{at = 1, name = 'x'}; error({code = 1}) end"));
+        QVERIFY(console->runFile(path));
+        QPointer<QDockWidget> closing = qobject_cast<QDockWidget*>(win_->scriptPanel(path)->parentWidget());
+        QTimer::singleShot(0, closing.data(), [closing] { closing->close(); });
+        qobject_cast<QPushButton*>(win_->scriptPanel(path)->control("fail"))->click();
+        QTRY_VERIFY(closing.isNull());
+        QVERIFY(!win_->scriptPanel(path) && !console->running());
+        QVERIFY(console->output().contains("marker-maker.lua: the script raised a table"));
+        state()->undo();
         // The console's own script can have a panel too.
         QVERIFY(console->run("local ui = montage.panel{title = 'Here', controls = {{type = 'button', id = 'b'}}}\nprint('pressed ' .. ui.pressed)", "Console"));
         QVERIFY(win_->scriptPanel("console"));

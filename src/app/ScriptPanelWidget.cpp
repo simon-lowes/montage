@@ -47,7 +47,8 @@ ScriptPanelWidget::ScriptPanelWidget(const PanelSpec& spec, QWidget* parent) : Q
             w = e;
         } else if (c.type == QLatin1String("number")) {
             auto* n = new QDoubleSpinBox(body);
-            n->setDecimals(std::max(decimalsFor(c.step), decimalsFor(c.value.toDouble())));
+            // Enough decimals for the step, the range and the value (the box rounds to them).
+            n->setDecimals(std::max({decimalsFor(c.step), decimalsFor(c.min), decimalsFor(c.max), decimalsFor(c.value.toDouble())}));
             n->setRange(c.min, c.max);
             n->setSingleStep(c.step);
             w = n;
@@ -121,7 +122,15 @@ void ScriptPanelWidget::show(const PanelControl& c) {
     QWidget* w = control(c.id);
     if (!w) return;
     if (auto* e = qobject_cast<QLineEdit*>(w)) e->setText(c.value.toString());
-    else if (auto* n = qobject_cast<QDoubleSpinBox*>(w)) n->setValue(c.value.toDouble());
+    else if (auto* n = qobject_cast<QDoubleSpinBox*>(w)) {
+        if (decimalsFor(c.value.toDouble()) > n->decimals()) {
+            // A value with more decimals than the box shows (set by the script): shown as it is.
+            const double lo = n->minimum(), hi = n->maximum();
+            n->setDecimals(decimalsFor(c.value.toDouble()));
+            n->setRange(lo, hi);
+        }
+        n->setValue(c.value.toDouble());
+    }
     else if (auto* b = qobject_cast<QCheckBox*>(w)) b->setChecked(c.value.toBool());
     else if (auto* box = qobject_cast<QComboBox*>(w)) box->setCurrentText(c.value.toString());
     else if (auto* l = qobject_cast<QLabel*>(w)) l->setText(c.text);

@@ -9186,6 +9186,9 @@ private slots:
         QVERIFY(!parse(R"({"controls": [{"type": "text", "id": "1st"}]})", &err) && err.contains("letters"));
         QVERIFY(!parse(R"({"controls": [{"type": "text", "id": "a"}], "colour": "red"})", &err) && err.contains("colour"));
         QVERIFY(!parse(R"({"controls": [{"type": "button", "id": "a", "value": 1}]})", &err) && err.contains("no value"));
+        // A slider's range kept to whole numbers it can hold.
+        std::optional<PanelSpec> big = parse(R"({"controls": [{"type": "slider", "id": "s", "min": -1e12, "max": 1e12, "step": 1e9}]})");
+        QVERIFY(big && big->controls[0].max == 1e9 && big->controls[0].min == -1e9 && big->controls[0].step == 1e6);
         // Values set as the script or the command line gives them, made each control's kind.
         QVERIFY(setPanelValue(*spec, "start", "12.5"));
         QCOMPARE(panelValues(*spec).value("start").toDouble(), 12.5);
@@ -9240,10 +9243,32 @@ private slots:
         QVERIFY(described && described->title == "Titles" && described->controls.size() == 4);
         QCOMPARE(printed, QStringList{"before"});
         QVERIFY(!QFileInfo::exists(project));
-        // Inside pcall, described still ends the script.
-        printed.clear();
-        QVERIFY2(runScript("local ok = pcall(montage.panel, {controls = {{type = 'button', id = 'b'}}})\nprint('after', ok)", "p.lua", o, &error), qPrintable(error));
-        QVERIFY(printed.isEmpty());
+        // Inside pcall, xpcall, coroutines (resumed, wrapped, closed) and a load reader, described still ends the script.
+        const char* catchers[] = {
+            "local ok = pcall(montage.panel, P)",
+            "xpcall(montage.panel, function(e) print('handler', e) return e end, P)",
+            "coroutine.resume(coroutine.create(function() montage.panel(P) end))",
+            "pcall(coroutine.wrap(function() montage.panel(P) end))",
+            "local co = coroutine.create(function() local x <close> = setmetatable({}, {__close = function() montage.panel(P) end}) coroutine.yield() end)\n"
+            "coroutine.resume(co)\ncoroutine.close(co)",
+            "load(coroutine.wrap(function() montage.panel(P) end))",
+        };
+        for (const char* c : catchers) {
+            printed.clear();
+            const QString script = QStringLiteral("P = {controls = {{type = 'button', id = 'b'}}}\n%1\nprint('after')\nmontage.create_project{width = 64, height = 64}").arg(c);
+            QVERIFY2(runScript(script, "p.lua", o, &error), qPrintable(c + (": " + error)));
+            QVERIFY2(printed.isEmpty(), qPrintable(c + (": " + printed.join(" | "))));
+        }
+        QVERIFY(!QFileInfo::exists(project));
+        // Quiet (a panel opening by itself): no programs run, no files written or removed; reading is allowed.
+        o.quiet = true;
+        QVERIFY(!runScript("os.execute('true')", "q.lua", o, &error) && error.contains("not available while a panel opens"));
+        QVERIFY(!runScript("io.popen('ls')", "q.lua", o, &error) && error.contains("io.popen"));
+        QVERIFY(!runScript(QStringLiteral("io.open([[%1/x.txt]], 'w')").arg(dir.path()), "q.lua", o, &error) && error.contains("only reading"));
+        QVERIFY(!runScript(QStringLiteral("os.remove([[%1]])").arg(project), "q.lua", o, &error));
+        QVERIFY2(runScript(QStringLiteral("assert(io.open([[%1]], 'r') == nil or true)").arg(project), "q.lua", o, &error), qPrintable(error));
+        QVERIFY(!QFileInfo::exists(dir.path() + "/x.txt"));
+        o.quiet = false;
         // A button pressed: the script goes on with the panel's values, its tools run and set_panel shows a result.
         printed.clear();
         QJsonObject values = panelValues(*parse(R"({"controls": [{"type": "text", "id": "words"}, {"type": "number", "id": "at"}, {"type": "label", "id": "status"}]})"));

@@ -50,6 +50,8 @@ QJsonObject panelValues(const PanelSpec& spec);
 // type (numbers clamped to the range, a choice one of its own); false with the error for an unknown id, a button or a
 // value of another kind. A label's value is its text.
 bool setPanelValue(PanelSpec& spec, const QString& id, const QJsonValue& value, QString* error = nullptr);
+// Whether two panels have the same controls, laid out the same (their values aside).
+bool samePanelLayout(const PanelSpec& a, const PanelSpec& b);
 // The panel as JSON (montage-cli prints it): its title and controls, every default filled in.
 QJsonObject describePanel(const PanelSpec& spec);
 

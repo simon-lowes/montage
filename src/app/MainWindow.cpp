@@ -504,6 +504,11 @@ void MainWindow::buildPanels() {
             if (it == scriptPanels_.end()) return;
             it->second.widget->setBusy(false);
             it->second.widget->showMessage(message, error);
+        },
+        [this](const QString& key) -> std::optional<PanelSpec> {
+            const auto it = scriptPanels_.find(key);
+            if (it == scriptPanels_.end()) return std::nullopt;
+            return it->second.widget->spec();
         }});
     indexDock_ = makeDock(tr("Sequence Index"), "index", new SequenceIndexPanel(state_, this));
     stacked_ = new StackedTimelineWidget(state_, this);
@@ -5423,8 +5428,11 @@ void MainWindow::openScriptPanel(const QString& key, const QString& name, const 
         p.dock = new QDockWidget(this);
         p.dock->setObjectName(QStringLiteral("scriptPanel_%1").arg(qHash(key), 0, 16));
         p.dock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable | QDockWidget::DockWidgetClosable);
-        addDockWidget(Qt::RightDockWidgetArea, p.dock);
-        if (scriptsDock_->isVisible() && !scriptsDock_->isFloating()) tabifyDockWidget(scriptsDock_, p.dock);
+        // Where it was left last time, if the saved layout knows it; else beside the Script Console.
+        if (!restoreDockWidget(p.dock)) {
+            addDockWidget(Qt::RightDockWidgetArea, p.dock);
+            if (scriptsDock_->isVisible() && !scriptsDock_->isFloating()) tabifyDockWidget(scriptsDock_, p.dock);
+        }
         // Closed by its own button: gone, and not opened again at the next start.
         auto* filter = new ScriptPanelCloseFilter(p.dock, [this, key] {
             const auto it = scriptPanels_.find(key);
@@ -5440,9 +5448,11 @@ void MainWindow::openScriptPanel(const QString& key, const QString& name, const 
     }
     p.name = name;
     p.code = code;
+    QWidget* old = p.dock->widget();
     p.widget = new ScriptPanelWidget(spec, p.dock);
     p.dock->setWindowTitle(spec.title);
-    p.dock->setWidget(p.widget);  // (the old panel, if any, is deleted with its dock's last widget)
+    p.dock->setWidget(p.widget);
+    if (old) old->deleteLater();  // (later: it may be the panel whose button is running the script now)
     connect(p.widget, &ScriptPanelWidget::pressed, this, [this, key](const QString& id) { pressScriptPanel(key, id); });
     p.dock->show();
     p.dock->raise();
@@ -5467,12 +5477,29 @@ void MainWindow::pressScriptPanel(const QString& key, const QString& button) {
     p.widget->setBusy(true);
     p.widget->showMessage(tr("Running…"));
     const QJsonObject values = p.widget->values(button);
-    scripts_->runPanel(key, code, p.name, values);
+    const QString name = p.name;  // (copied: the panel may be closed, and its entry gone, while its script runs)
+    scripts_->runPanel(key, code, name, values);
 }
 
 void MainWindow::restoreScriptPanels() {
-    for (const QString& path : appSettings().value(QStringLiteral("scripts/panels")).toStringList())
-        if (QFileInfo::exists(path) && !scriptPanels_.count(path) && !scripts_->running()) scripts_->setUpPanel(path);
+    // (Not inside another window's modal loop, such as crash recovery's question: after it.)
+    if (QApplication::activeModalWidget()) {
+        QTimer::singleShot(500, this, [this] { restoreScriptPanels(); });
+        return;
+    }
+    QStringList open = appSettings().value(QStringLiteral("scripts/panels")).toStringList(), forgotten;
+    for (const QString& path : open) {
+        if (scriptPanels_.count(path) || scripts_->running()) continue;
+        // A script that is gone, or no longer describes its panel (it errs, runs on, or ends without one), is forgotten
+        // rather than run again at every start.
+        if (!QFileInfo::exists(path) || !scripts_->setUpPanel(path)) forgotten << path;
+    }
+    if (forgotten.isEmpty()) return;
+    for (const QString& f : forgotten) open.removeAll(f);
+    appSettings().setValue(QStringLiteral("scripts/panels"), open);
+    QStringList names;
+    for (const QString& f : forgotten) names << QFileInfo(f).fileName();
+    state_->message(tr("Not opened again (no panel described; see the Script Console): %1").arg(names.join(QStringLiteral(", "))), 8000);
 }
 
 QDialog* MainWindow::controlSurfaceDialog() {
