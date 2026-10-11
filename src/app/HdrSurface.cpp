@@ -5,6 +5,7 @@
 #include <QCoreApplication>
 #include <QDropEvent>
 #include <QExposeEvent>
+#include <QGuiApplication>
 #include <QMouseEvent>
 #include <QPlatformSurfaceEvent>
 #include <QWheelEvent>
@@ -157,6 +158,13 @@ bool HdrSurface::probe(QString* why) {
         QRhiNullInitParams params;
         g.rhi.reset(QRhi::create(QRhi::Null, &params));
     } else {
+#if defined(Q_OS_MACOS) || defined(Q_OS_WIN)
+        // The swap chain draws into the window's own layer (an NSView's, an HWND's), which only the system's windows
+        // have: Qt's offscreen platform (the tests') hands out stand-in ids, and Metal crashes on one.
+        const QString platform = QGuiApplication::platformName();
+        if (platform != QLatin1String("cocoa") && platform != QLatin1String("windows"))
+            return fail(tr("HDR viewing needs the system's own windows, not Qt's %1 platform").arg(platform));
+#endif
 #if defined(Q_OS_MACOS)
         setSurfaceType(QSurface::MetalSurface);
         create();
