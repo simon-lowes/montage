@@ -1018,7 +1018,7 @@ void MainWindow::buildMenus() {
             if (dlg.exec() == QDialog::Accepted) AutoDuckDialog::apply(state_, music, dlg.dialogueTracks(), dlg.options(), this);
         }))->setObjectName(QStringLiteral("autoDuck"));
     add(clipM, tr("Remove Mic &Bleed…"), QKeySequence(), withSeq([this] { micBleedDialog(); }))->setObjectName(QStringLiteral("removeMicBleed"));
-    add(clipM, tr("Separate S&tems…"), QKeySequence(), withSeq([this] {
+    add(clipM, tr("Separate Stems…"), QKeySequence(), withSeq([this] {
             std::vector<Id> clips;
             for (Id id : state_->selectedClips())
                 if (auto loc = edit::locate(*state_->sequence(), id); loc && loc->track.kind == TrackKind::Audio) clips.push_back(id);

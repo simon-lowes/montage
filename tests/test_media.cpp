@@ -149,6 +149,10 @@ extern "C" {
 
 using namespace montage;
 
+// The 4-stem graph compiled into the engine (media/StemSeparation.cpp).
+extern const unsigned char kSpleeter4Graph[];
+extern const size_t kSpleeter4GraphSize;
+
 // Unbuffered output, so that if the process dies the log shows how far it got.
 static const int kUnbufferedStdout = [] { return std::setvbuf(stdout, nullptr, _IONBF, 0); }();
 
@@ -15666,9 +15670,23 @@ private slots:
                 return true;
             }, nullptr, nullptr, channels));
             QCOMPARE(blocks, whole->samples);
+            // From 4 s on: the same samples from there (the file read from a little before).
+            std::vector<float> later;
+            QVERIFY(decodeAudioStereoBlocks(MONTAGE_TEST_DATA_DIR "/jfk.wav", kStemRate, 30000, [&](const std::vector<float>& b) {
+                later.insert(later.end(), b.begin(), b.end());
+                return true;
+            }, nullptr, nullptr, channels, 4.0));
+            const size_t skip = size_t(4 * kStemRate) * 2;
+            QCOMPARE(later.size(), whole->samples.size() - skip);
+            float worst = 0;
+            for (size_t i = 0; i < later.size(); ++i) worst = std::max(worst, std::fabs(later[i] - whole->samples[skip + i]));
+            QVERIFY2(worst < 1e-4f, qPrintable(QString::number(worst)));
         }
         if (!stemSeparationAvailable() || !stemModel(4).installed())
             QSKIP("Set MONTAGE_STEM_MODELS to a folder holding spleeter-4stems (4stems.tar.gz) to run the rest");
+        // A graph another version left on disk is replaced by this one's when the model loads.
+        const QString graph = QString::fromStdString(stemModel(4).directory()) + QStringLiteral("/spleeter-4stems.onnx");
+        if (QFile g(graph); g.exists() && g.open(QIODevice::WriteOnly | QIODevice::Truncate)) g.write("another version's graph");
         auto writeStereoWav = [](const std::string& file, const std::vector<float>& x) {
             FILE* f = std::fopen(file.c_str(), "wb");
             if (!f) return false;
@@ -15711,6 +15729,7 @@ private slots:
             double progressed = 0;
             QVERIFY2(separateStemsToFiles(path("synth.wav"), 0, 13, {}, 4, outs, [&](double f) { progressed = f; }, nullptr, &err), err.c_str());
             QCOMPARE(progressed, 1.0);
+            QCOMPARE(QFileInfo(graph).size(), qint64(kSpleeter4GraphSize));
             // TensorFlow's figures: each stem's level (left, right) over all of it and over 11.5-12.3 s, and samples
             // at 100000, the boundary (520192) and 560000.
             const double level[4][2] = {{0.002458, 0.002457}, {0.121668, 0.121809}, {0.173225, 0.173238}, {0.067172, 0.067617}};
@@ -15750,6 +15769,10 @@ private slots:
             QCOMPARE(err, std::string("Cancelled"));
             for (const std::string& d : dropped) QVERIFY(!QFile::exists(QString::fromStdString(d)));
             QVERIFY(!separateStemsToFiles(path("synth.wav"), 0, 13, {}, 3, dropped, {}, nullptr, &err));
+            // A stretch that ends before it starts.
+            QVERIFY(!separateStemsToFiles(path("synth.wav"), 10.5, 5, {}, 4, dropped, {}, nullptr, &err));
+            QVERIFY(QString::fromStdString(err).contains("before it starts"));
+            for (const std::string& d : dropped) QVERIFY(!QFile::exists(QString::fromStdString(d)));
         }
         // JFK speaking over drums, a bass line and a chord pad: the speech comes out as the vocals, the pad as the rest.
         AudioBufferPtr jfk = decodeAudio(MONTAGE_TEST_DATA_DIR "/jfk.wav", kStemRate, &err);
@@ -15832,9 +15855,27 @@ private slots:
             media.push_back(m.id);
             titles.push_back(stemTitle(stemNames(4)[k]));
         }
+        // The clip's track mixes it 15 dB down through a bus with a send: the stems' tracks mix the same.
+        const Id bus = p.newId();
+        s.buses.push_back(Bus{});
+        s.buses.back().id = bus;
+        s.buses.back().name = "Music";
+        s.audioTracks[0].volumeDb = -15;
+        s.audioTracks[0].pan = -0.25;
+        s.audioTracks[0].output = bus;
+        s.audioTracks[0].sends.push_back(Send{bus, -6, false, false, {}});
+        s.audioTracks[0].effects.push_back(makeEffect(p, "eq3"));
         const edit::Result r = placeStems(p, s, clipId, media, titles, from, true);
         QVERIFY2(r.ok && r.created.size() == 4, r.error.c_str());
         QCOMPARE(s.audioTracks.size(), tracksBefore + 4);
+        for (size_t k = tracksBefore; k < tracksBefore + 4; ++k) {
+            const Track& t = s.audioTracks[k];
+            QCOMPARE(t.volumeDb, -15.0);
+            QCOMPARE(t.pan, -0.25);
+            QCOMPARE(t.output, bus);
+            QVERIFY(t.sends.size() == 1 && t.sends[0].bus == bus && t.sends[0].levelDb == -6);
+            QVERIFY(t.effects.size() == 1 && t.effects[0].type == "eq3" && t.effects[0].id != s.audioTracks[0].effects[0].id);
+        }
         const Clip* after = edit::clipById(s, clipId);
         QVERIFY(after && !after->enabled && after->linkGroup != 0);
         for (size_t k = 0; k < 4; ++k) {
@@ -15865,6 +15906,17 @@ private slots:
         // Again over the same clip: those tracks are taken there, so four more are added.
         QVERIFY(placeStems(p, s, clipId, media, titles, from, true).ok);
         QCOMPARE(s.audioTracks.size(), tracksBefore + 8);
+        // A clip on a track mixed differently does not reuse the stem tracks made for this one where they are free.
+        {
+            const FrameTime later = original.end() + 100;
+            edit::Result other = edit::placeMedia(p, s, band.id, later, 3 * fps, 5 * fps, {TrackKind::Video, 0}, {TrackKind::Audio, 1}, false);
+            QVERIFY(other.ok);
+            double f2 = 0, t2 = 0;
+            QVERIFY(stemSource(p, s, other.created[0], 0, f2, t2, &err));
+            QVERIFY(placeStems(p, s, other.created[0], media, titles, f2, true).ok);
+            QCOMPARE(s.audioTracks.size(), tracksBefore + 12);
+            QCOMPARE(s.audioTracks.back().volumeDb, s.audioTracks[1].volumeDb);
+        }
 
         // Through MCP: the clip's stems written beside the project and placed, the clip left playing.
         Project fresh = makeDefaultProject();
@@ -15899,11 +15951,31 @@ private slots:
         int named = 0;
         for (const Track& t : bs.audioTracks) named += (t.name == "Vocals" || t.name == "Drums" || t.name == "Bass" || t.name == "Other") && t.clips.size() == 1;
         QCOMPARE(named, 4);
+        int stemMedia = 0;
         for (const MediaItem& m : back.media)
-            if (m.path.find("/Stems/") != std::string::npos)
+            if (QDir::fromNativeSeparators(QString::fromStdString(m.path)).contains(QStringLiteral("/Stems/")) && ++stemMedia)
                 QVERIFY(std::find(m.keywords.begin(), m.keywords.end(), "Stem") != m.keywords.end() && m.metadata.at("comment").find("Spleeter") != std::string::npos);
+        QCOMPARE(stemMedia, 4);
         res = call(QJsonObject{{"project", project}, {"clips", QJsonArray{double(fp.created[0])}}, {"stems", 3}});
         QVERIFY(res.value("isError").toBool());
+        // A clip that cannot be separated among them: refused before anything is written.
+        const int before = int(QDir(QString::fromStdString(path("mcp-stems/Stems"))).entryList(QDir::Files).size());
+        Id title = 0;
+        {
+            Project withTitle;
+            QVERIFY(loadProject(project.toStdString(), withTitle, &err));
+            Sequence& ws = *withTitle.active();
+            Clip t;
+            t.id = title = withTitle.newId();
+            t.start = 200;
+            t.duration = 50;
+            t.generator = makeEffect(withTitle, "title");
+            QVERIFY(edit::overwrite(withTitle, ws, {TrackKind::Video, 0}, t).ok);
+            QVERIFY(saveProject(withTitle, project.toStdString()));
+        }
+        res = call(QJsonObject{{"project", project}, {"clips", QJsonArray{double(fp.created[0]), double(title)}}});
+        QVERIFY(res.value("isError").toBool());
+        QCOMPARE(int(QDir(QString::fromStdString(path("mcp-stems/Stems"))).entryList(QDir::Files).size()), before);
     }
 
     void voiceCloning() {

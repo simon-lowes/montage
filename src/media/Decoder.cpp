@@ -1151,7 +1151,7 @@ namespace {
 // and once more at the end with `last` set, instead of all of them being kept.
 bool decodeAudioStream(const std::string& path, int sampleRate, int ordinal, std::vector<float>& samples, int& channels,
                        std::string* error, const std::atomic<bool>* cancel, AVChannelLayout* layoutOut = nullptr,
-                       const std::function<bool(std::vector<float>& samples, bool last)>* drain = nullptr) {
+                       const std::function<bool(std::vector<float>& samples, bool last)>* drain = nullptr, double seekTo = 0) {
     AVFormatContext* fmt = nullptr;
     int rc = openMediaInput(&fmt, path);
     if (rc < 0) {
@@ -1218,6 +1218,10 @@ bool decodeAudioStream(const std::string& path, int sampleRate, int ordinal, std
     if (st->duration > 0 && !drain) samples.reserve(size_t(double(st->duration) * av_q2d(st->time_base) * sampleRate * double(nch) + 4096));
     const double origin = fileOrigin(fmt);
     const double tb = av_q2d(st->time_base);
+    // Starting later in the file: read from a second before (where a decoder has settled by the time it matters; what
+    // comes before the start is dropped below, as the first frame's time says).
+    if (seekTo > 0 && av_seek_frame(fmt, stream, int64_t((std::max(0.0, seekTo - 1.0) + origin) / tb), AVSEEK_FLAG_BACKWARD) >= 0)
+        avcodec_flush_buffers(c.ctx);
     bool first = true;
     int64_t dropLeading = 0;
     std::vector<float> tmp;
@@ -1242,7 +1246,7 @@ bool decodeAudioStream(const std::string& path, int sampleRate, int ordinal, std
             int64_t ts = c.frame->best_effort_timestamp;
             if (ts == AV_NOPTS_VALUE) ts = c.frame->pts;
             double startSec = ts == AV_NOPTS_VALUE ? 0.0 : double(ts) * tb - origin;
-            int64_t offset = int64_t(std::llround(startSec * sampleRate));
+            int64_t offset = int64_t(std::llround(startSec * sampleRate)) - int64_t(std::llround(seekTo * sampleRate));
             if (offset > 0) samples.insert(samples.end(), size_t(offset) * nch, 0.0f);
             else dropLeading = -offset;
         }
@@ -1293,7 +1297,8 @@ bool decodeAudioBlocks(const std::string& path, int sampleRate, size_t block, co
 
 bool decodeAudioStereoBlocks(const std::string& path, int sampleRate, size_t block,
                              const std::function<bool(const std::vector<float>& stereo)>& sink, std::string* error,
-                             const std::atomic<bool>* cancel, const std::vector<int>& channels) {
+                             const std::atomic<bool>* cancel, const std::vector<int>& channels, double from) {
+    from = std::max(0.0, from);
     block = std::max<size_t>(1, block);
     std::vector<float> out;
     out.reserve(block * 2);
@@ -1314,7 +1319,8 @@ bool decodeAudioStereoBlocks(const std::string& path, int sampleRate, size_t blo
     if (Interpretation in; !channels.empty() || (parseInterpretation(path, in) && in.conformed())) {
         AudioBufferPtr whole = decodeAudio(path, sampleRate, error, cancel, channels);
         if (!whole) return false;
-        give(whole->samples.data(), size_t(whole->frames()));
+        const int64_t skip = std::min<int64_t>(whole->frames(), std::llround(from * sampleRate));
+        give(whole->samples.data() + skip * 2, size_t(whole->frames() - skip));
         if (!stopped && !out.empty()) sink(out);
         return !(cancel && cancel->load());
     }
@@ -1327,7 +1333,7 @@ bool decodeAudioStereoBlocks(const std::string& path, int sampleRate, size_t blo
         if (last && !stopped && !out.empty()) sink(out);
         return !stopped;
     };
-    if (!decodeAudioStream(path, sampleRate, -1, stereo, count, error, cancel, nullptr, &drain)) return false;
+    if (!decodeAudioStream(path, sampleRate, -1, stereo, count, error, cancel, nullptr, &drain, from)) return false;
     return !(cancel && cancel->load());
 }
 

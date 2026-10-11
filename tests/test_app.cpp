@@ -10074,6 +10074,7 @@ const auto seq = [this] { return state()->sequence(); };
         o.handles = 0.5;
         const std::vector<Id> made = separateStems(state(), {clip}, o, win_.get(), &why);
         QVERIFY2(made.size() == 4, qPrintable(why));
+        QCOMPARE(int(state()->history().undoCount()), undoBefore + 1);  // brought in and placed in one step
         const Sequence* s = state()->sequence();
         QCOMPARE(s->audioTracks.size(), tracks + 4);
         const Clip* original = edit::clipById(const_cast<Sequence&>(*s), clip);
@@ -10090,10 +10091,11 @@ const auto seq = [this] { return state()->sequence(); };
             // The source from half a second (and a frame) before the clip's In, so the stem's In is that far in.
             QVERIFY2(std::abs(c->sourceIn - (0.5 + 1.0 / fps) * fps) < 1e-6, qPrintable(QString::number(c->sourceIn)));
         }
+        const size_t mediaWith = state()->project().media.size();
         state()->undo();
         QCOMPARE(state()->sequence()->audioTracks.size(), tracks);
         QVERIFY(edit::clipById(const_cast<Sequence&>(*state()->sequence()), clip)->enabled);
-        QVERIFY(int(state()->history().undoCount()) >= undoBefore);
+        QCOMPARE(state()->project().media.size(), mediaWith - 4);  // the stems leave the bin with that one undo
         state()->newProject();
     }
 

@@ -22,6 +22,8 @@
 #include "EditorState.h"
 #include "ModelPacks.h"
 #include "core/EditOps.h"
+#include "core/Interpretation.h"
+#include "media/Decoder.h"
 #include "media/StemSeparation.h"
 
 namespace montage {
@@ -48,6 +50,7 @@ std::vector<Id> separateStems(EditorState* state, const std::vector<Id>& clips, 
     const Sequence* s = state->sequence();
     const std::vector<std::string>& names = stemNames(o.stems);
     if (!s || names.empty()) return fail(QObject::tr("Separation is into 2, 4 or 5 stems"));
+    if (state->readOnly()) return fail(QObject::tr("This project is open read-only"));
     std::vector<Job> jobs;
     QString why;
     for (const Id id : clips) {
@@ -82,7 +85,7 @@ std::vector<Id> separateStems(EditorState* state, const std::vector<Id>& clips, 
         for (const QChar bad : QStringLiteral("/\\:*?\"<>|")) base.replace(bad, '_');
         for (const std::string& n : names) {
             QString path = folder + '/' + base + ' ' + QString::fromStdString(stemTitle(n)) + QStringLiteral(".wav");
-            for (int k = 2; QFileInfo::exists(path) || files.contains(path); ++k)
+            for (int k = 2; QFileInfo::exists(path) || files.contains(path, Qt::CaseInsensitive); ++k)
                 path = folder + '/' + base + ' ' + QString::fromStdString(stemTitle(n)) + ' ' + QString::number(k) + QStringLiteral(".wav");
             j.outs.push_back(path);
             files << path;
@@ -125,24 +128,35 @@ std::vector<Id> separateStems(EditorState* state, const std::vector<Id>& clips, 
         for (const QString& f : files) QFile::remove(f);
         return fail(err == "Cancelled" ? QString() : QString::fromStdString(err));
     }
-    const std::vector<Id> media = state->importFiles(files, nullptr, QStringLiteral("Stems"));
-    if (media.size() != size_t(files.size())) return fail(QObject::tr("The stems could not be imported"));
-    // Where each came from, noted on the media as it comes in (the import's own undo step).
-    state->amend([&](Project& p, Sequence&) {
-        size_t k = 0;
-        for (const Job& j : jobs)
-            for (const std::string& n : names)
-                if (MediaItem* m = p.findMedia(media[k++])) {
-                    m->metadata["comment"] = stemTitle(n) + " separated from " + j.name + " (" +
-                                             QFileInfo(QString::fromStdString(j.path)).fileName().toStdString() + ") with Spleeter in Montage";
-                    if (std::find(m->keywords.begin(), m->keywords.end(), "Stem") == m->keywords.end()) m->keywords.push_back("Stem");
-                }
-        return true;
-    });
+    // The stems come in and go on the timeline in one undo step.
+    std::vector<MediaItem> items;
+    for (size_t k = 0; k < size_t(files.size()); ++k) {
+        MediaItem m;
+        std::string why;
+        if (!probeMedia(files[qsizetype(k)].toStdString(), m, &why)) {
+            for (const QString& f : files) QFile::remove(f);
+            return fail(QObject::tr("The stems could not be read: %1").arg(QString::fromStdString(why)));
+        }
+        const Job& j = jobs[k / names.size()];
+        const std::string& n = names[k % names.size()];
+        m.bin = "Stems";
+        // Where it came from.
+        m.metadata["comment"] = stemTitle(n) + " separated from " + j.name + " (" +
+                                QFileInfo(QString::fromStdString(uninterpretedPath(j.path))).fileName().toStdString() + ") with Spleeter in Montage";
+        m.keywords.push_back("Stem");
+        items.push_back(std::move(m));
+    }
     std::vector<std::string> titles;
     for (const std::string& n : names) titles.push_back(stemTitle(n));
     std::vector<Id> created;
-    state->apply(QObject::tr("Separate Stems"), [&](Project& p, Sequence& sq) {
+    const bool placed = state->apply(QObject::tr("Separate Stems"), [&](Project& p, Sequence& sq) {
+        std::vector<Id> media;
+        for (MediaItem& m : items) {
+            m.id = p.newId();
+            media.push_back(m.id);
+            p.media.push_back(m);
+        }
+        if (std::find(p.bins.begin(), p.bins.end(), "Stems") == p.bins.end()) p.bins.push_back("Stems");
         size_t k = 0;
         for (const Job& j : jobs) {
             const std::vector<Id> mine(media.begin() + std::ptrdiff_t(k), media.begin() + std::ptrdiff_t(k + names.size()));
@@ -156,6 +170,12 @@ std::vector<Id> separateStems(EditorState* state, const std::vector<Id>& clips, 
         all.created = created;
         return all;
     });
+    if (!placed) {
+        for (const QString& f : files) QFile::remove(f);
+        created.clear();
+        return fail(QObject::tr("The stems could not be placed"));
+    }
+    for (const MediaItem& m : items) state->startAudioDecode(m);
     if (!created.empty())
         state->message(QObject::tr("Separated %n clip(s) into %1 stems each", "", int(jobs.size())).arg(o.stems), 5000);
     return created;

@@ -54,7 +54,18 @@ bool unpack(std::string& graphPath, std::string* error) {
     const QString dir = QString::fromStdString(pack.directory());
     graphPath = (dir + "/rife-4.26.onnx").toStdString();
     const QString stamp = dir + "/data/unpacked-" + QString::fromStdString(pack.files[0].sha256.substr(0, 12));
-    if (QFile::exists(stamp) && QFile::exists(QString::fromStdString(graphPath))) return true;
+    if (QFile::exists(stamp)) {
+        // The graph is compiled in, so a new Montage may bring a new one: the copy on disk is rewritten when it differs.
+        QFile graph(QString::fromStdString(graphPath));
+        if (graph.open(QIODevice::ReadOnly) && graph.readAll() == QByteArray::fromRawData(reinterpret_cast<const char*>(kRifeGraph), qsizetype(kRifeGraphSize)))
+            return true;
+        graph.close();
+        if (graph.open(QIODevice::WriteOnly | QIODevice::Truncate) &&
+            graph.write(reinterpret_cast<const char*>(kRifeGraph), qint64(kRifeGraphSize)) == qint64(kRifeGraphSize))
+            return true;
+        if (error) *error = "Cannot unpack the RIFE model";
+        return false;
+    }
     ZipReader outer;
     std::string pkl;
     if (!outer.openFile(pack.path(pack.files[0])) || !outer.read("RIFEv4.26_0921/flownet.pkl", pkl, error)) {

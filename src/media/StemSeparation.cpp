@@ -104,7 +104,22 @@ bool unpack(int stems, std::string& graphPath, std::string* error) {
     graphPath = (dir + QStringLiteral("/spleeter-%1stems.onnx").arg(stems)).toStdString();
     const QString stamp = dir + "/unpacked-" + QString::fromStdString(pack.files[0].sha256.substr(0, 12));
     const QString data = dir + '/' + kData;
-    if (QFile::exists(stamp) && QFile::exists(QString::fromStdString(graphPath)) && QFile(data).size() == info->dataBytes) return true;
+    // The graph is compiled in, so a new Montage may bring a new one: the copy on disk is rewritten when it differs.
+    auto writeGraph = [&] {
+        QFile graph(QString::fromStdString(graphPath));
+        return graph.open(QIODevice::WriteOnly | QIODevice::Truncate) &&
+               graph.write(reinterpret_cast<const char*>(info->graph), qint64(*info->graphSize)) == qint64(*info->graphSize);
+    };
+    if (QFile::exists(stamp) && QFile(data).size() == info->dataBytes) {
+        QFile graph(QString::fromStdString(graphPath));
+        if (graph.open(QIODevice::ReadOnly) &&
+            graph.readAll() == QByteArray::fromRawData(reinterpret_cast<const char*>(info->graph), qsizetype(*info->graphSize)))
+            return true;
+        graph.close();
+        if (writeGraph()) return true;
+        if (error) *error = "Cannot unpack the separation model into " + dir.toStdString();
+        return false;
+    }
     QFile archive(QString::fromStdString(pack.path(pack.files[0])));
     std::string tar;
     if (!archive.open(QIODevice::ReadOnly) || !gunzip(archive.readAll().toStdString(), tar, error)) {
@@ -118,15 +133,13 @@ bool unpack(int stems, std::string& graphPath, std::string* error) {
         if (error) *error = "The separation model download is not the one expected";
         return false;
     }
-    QFile out(data), graph(QString::fromStdString(graphPath));
+    QFile out(data);
     if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate) || out.write(tar.data() + it->offset, qint64(it->size)) != qint64(it->size) ||
-        !graph.open(QIODevice::WriteOnly | QIODevice::Truncate) ||
-        graph.write(reinterpret_cast<const char*>(info->graph), qint64(*info->graphSize)) != qint64(*info->graphSize)) {
+        !writeGraph()) {
         if (error) *error = "Cannot unpack the separation model into " + dir.toStdString();
         return false;
     }
     out.close();
-    graph.close();
     QFile s(stamp);
     s.open(QIODevice::WriteOnly);
     return true;
@@ -322,8 +335,13 @@ bool StemSplitter::Impl::separateSegment(int64_t frames, std::string* error) {
         const char* inName = "magnitude";
         const char* outName = "masks";
         auto result = model->session->Run(Ort::RunOptions{nullptr}, &inName, &input, 1, &outName, 1);
+        const size_t want = size_t(stems) * 2 * kT * kF;
+        if (result.empty() || result[0].GetTensorTypeAndShapeInfo().GetElementCount() != want) {
+            if (error) *error = "The separation model gave masks of the wrong size";
+            return false;
+        }
         const float* m = result[0].GetTensorData<float>();
-        masks.assign(m, m + size_t(stems) * 2 * kT * kF);
+        masks.assign(m, m + want);
     } catch (const Ort::Exception& e) {
         if (error) *error = std::string("The separation failed: ") + e.what();
         return false;
@@ -385,22 +403,28 @@ bool StemSplitter::finish(std::string* error) {
 
 namespace {
 
-// 32-bit float stereo WAV, written as it goes; sizes completed on close.
+// 32-bit float stereo WAV, written as it goes; sizes completed on close. Room is kept (a JUNK chunk) for the ds64 chunk
+// of RF64 (EBU Tech 3306), which a file past 4 GB (about 3 h 20 min) becomes.
 struct FloatWav {
+    static constexpr qint64 kHeader = 80;
     QFile file;
     qint64 frames = 0;
     bool open(const QString& path) {
         file.setFileName(path);
         if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) return false;
-        return file.write(header()) == 44;
+        return file.write(header()) == kHeader;
     }
     QByteArray header() const {
         QByteArray b;
+        auto u64 = [&](uint64_t v) { b.append(reinterpret_cast<const char*>(&v), 8); };
         auto u32 = [&](uint32_t v) { b.append(reinterpret_cast<const char*>(&v), 4); };
         auto u16 = [&](uint16_t v) { b.append(reinterpret_cast<const char*>(&v), 2); };
-        const uint32_t bytes = uint32_t(frames * 8);
-        b.append("RIFF", 4), u32(36 + bytes), b.append("WAVEfmt ", 8), u32(16), u16(3), u16(2), u32(kStemRate), u32(kStemRate * 8), u16(8),
-            u16(32), b.append("data", 4), u32(bytes);
+        const uint64_t bytes = uint64_t(frames) * 8, riff = bytes + uint64_t(kHeader) - 8;
+        const bool large = riff > 0xFFFFFFFFULL;
+        b.append(large ? "RF64" : "RIFF", 4), u32(large ? 0xFFFFFFFFU : uint32_t(riff)), b.append("WAVE", 4);
+        b.append(large ? "ds64" : "JUNK", 4), u32(28), u64(large ? riff : 0), u64(large ? bytes : 0), u64(large ? uint64_t(frames) : 0), u32(0);
+        b.append("fmt ", 4), u32(16), u16(3), u16(2), u32(kStemRate), u32(kStemRate * 8), u16(8), u16(32);
+        b.append("data", 4), u32(large ? 0xFFFFFFFFU : uint32_t(bytes));
         return b;
     }
     bool write(const std::vector<float>& stereo) {
@@ -409,7 +433,7 @@ struct FloatWav {
         return file.write(reinterpret_cast<const char*>(stereo.data()), n) == n;
     }
     bool close() {
-        if (!file.seek(0) || file.write(header()) != 44) return false;
+        if (!file.seek(0) || file.write(header()) != kHeader) return false;
         file.close();
         return true;
     }
@@ -422,6 +446,10 @@ bool separateStemsToFiles(const std::string& path, double from, double to, const
                           const std::atomic<bool>* cancel, std::string* error) {
     if (stemNames(stems).empty() || outPaths.size() != stemNames(stems).size()) {
         if (error) *error = "Separation is into 2, 4 or 5 stems, one file each";
+        return false;
+    }
+    if (to > 0 && to <= from) {
+        if (error) *error = "The stretch to separate ends before it starts";
         return false;
     }
     std::vector<std::unique_ptr<FloatWav>> files;
@@ -448,7 +476,7 @@ bool separateStemsToFiles(const std::string& path, double from, double to, const
     }
     const int64_t a = std::max<int64_t>(0, int64_t(std::llround(from * kStemRate)));
     const int64_t b = to > 0 ? std::max(a, int64_t(std::llround(to * kStemRate))) : -1;
-    int64_t at = 0;  // media frames decoded so far
+    int64_t at = a;  // the media frame the next block starts at
     std::string err;
     const bool decoded = decodeAudioStereoBlocks(
         path, kStemRate, size_t(kStemRate),
@@ -459,7 +487,7 @@ bool separateStemsToFiles(const std::string& path, double from, double to, const
             if (progress && b > a) progress(std::clamp(double(splitter->done()) / double(b - a), 0.0, 1.0));
             return (b < 0 || at < b) && !(cancel && cancel->load());
         },
-        &err, cancel, channels);
+        &err, cancel, channels, double(a) / kStemRate);
     if (cancel && cancel->load()) err = "Cancelled";
     else if (decoded && err.empty() && at <= a) err = "There is no sound there to separate";
     if (!decoded || !err.empty() || !splitter->finish(&err) || writeFailed) {
@@ -502,21 +530,49 @@ edit::Result placeStems(Project& p, Sequence& s, Id clip, const std::vector<Id>&
                         double from, bool muteOriginal) {
     Clip* orig = edit::clipById(s, clip);
     if (!orig || stemMedia.size() != titles.size() || stemMedia.empty()) return edit::Result::fail("Nothing to place");
+    const auto loc = edit::locate(s, clip);
+    if (!loc || loc->track.kind != TrackKind::Audio) return edit::Result::fail("That is not an audio clip");
     if (orig->linkGroup == 0) orig->linkGroup = p.newId();
     const Clip base = *orig;
+    // The stems replace the clip, so they are mixed as its track mixes it: its level, pan, inserts, sends, routing,
+    // surround position and automation.
+    const Track source = s.audioTracks[size_t(loc->track.index)];
+    auto sameMix = [&](const Track& t) {
+        if (t.output != source.output || t.volumeDb != source.volumeDb || t.pan != source.pan || !(t.sends == source.sends) ||
+            t.effects.size() != source.effects.size() || !(t.volumeAuto == source.volumeAuto) || !(t.panAuto == source.panAuto))
+            return false;
+        for (size_t k = 0; k < t.effects.size(); ++k)
+            if (t.effects[k].type != source.effects[k].type || t.effects[k].params != source.effects[k].params) return false;
+        return true;
+    };
     edit::Result all;
     for (size_t i = 0; i < stemMedia.size(); ++i) {
-        // A track for this stem that is free over the clip, else a new one below the others.
+        // A track for this stem that is free over the clip and mixes as the clip's does, else a new one below the others.
         int index = -1;
         for (int t = 0; t < int(s.audioTracks.size()) && index < 0; ++t) {
             const Track& tr = s.audioTracks[size_t(t)];
-            if (tr.name != titles[i] || tr.locked) continue;
+            if (tr.name != titles[i] || tr.locked || !sameMix(tr)) continue;
             if (std::none_of(tr.clips.begin(), tr.clips.end(), [&](const Clip& o) { return o.start < base.end() && base.start < o.end(); }))
                 index = t;
         }
         if (index < 0) {
             index = edit::addTrack(p, s, TrackKind::Audio).index;
-            s.audioTracks[size_t(index)].name = titles[i];
+            Track& made = s.audioTracks[size_t(index)];
+            made.name = titles[i];
+            made.volumeDb = source.volumeDb;
+            made.pan = source.pan;
+            made.output = source.output;
+            made.sends = source.sends;
+            made.surround = source.surround;
+            made.volumeAuto = source.volumeAuto;
+            made.panAuto = source.panAuto;
+            made.muteAuto = source.muteAuto;
+            made.surroundXAuto = source.surroundXAuto;
+            made.surroundYAuto = source.surroundYAuto;
+            made.surroundZAuto = source.surroundZAuto;
+            made.automation = source.automation;
+            made.effects = source.effects;
+            for (Effect& e : made.effects) e.id = p.newId();
         }
         Clip stem = base;
         stem.id = p.newId();

@@ -5050,15 +5050,31 @@ void McpServer::Impl::addTools() {
             QDir().mkpath(folder);
             std::vector<std::string> titles;
             for (const std::string& n : names) titles.push_back(stemTitle(n));
-            QJsonArray placed;
+            // Every clip checked before any is separated; files written are removed if anything fails.
+            std::vector<std::pair<double, double>> ranges;
             for (const Id id : ids) {
                 double from = 0, to = 0;
                 std::string err;
                 if (!stemSource(l.project, s, id, handles, from, to, &err))
                     throw ArgError{QStringLiteral("Clip %1: %2").arg(qulonglong(id)).arg(QString::fromStdString(err))};
-                const Clip* c = edit::clipById(s, id);
-                const MediaItem* m = l.project.findMedia(c->mediaId);
-                QString base = QString::fromStdString(c->name.empty() ? m->name : c->name);
+                ranges.emplace_back(from, to);
+            }
+            struct Written {
+                std::vector<std::string> files;
+                bool keep = false;
+                ~Written() {
+                    if (!keep)
+                        for (const std::string& f : files) QFile::remove(QString::fromStdString(f));
+                }
+            } written;
+            QJsonArray placed;
+            for (size_t c = 0; c < ids.size(); ++c) {
+                const Id id = ids[c];
+                const auto [from, to] = ranges[c];
+                std::string err;
+                const Clip* clip = edit::clipById(s, id);
+                const MediaItem* m = l.project.findMedia(clip->mediaId);
+                QString base = QString::fromStdString(clip->name.empty() ? m->name : clip->name);
                 for (const QChar bad : QStringLiteral("/\\:*?\"<>|")) base.replace(bad, '_');
                 std::vector<std::string> outs;
                 for (const std::string& t : titles) {
@@ -5067,25 +5083,27 @@ void McpServer::Impl::addTools() {
                         path = folder + '/' + base + ' ' + QString::fromStdString(t) + ' ' + QString::number(k) + QStringLiteral(".wav");
                     outs.push_back(path.toStdString());
                 }
-                const std::string source = m->path, clipName = c->name.empty() ? m->name : c->name;
-                if (!separateStemsToFiles(source, from, to, c->channels, stems, outs, {}, nullptr, &err))
+                const std::string source = m->path, clipName = clip->name.empty() ? m->name : clip->name;
+                if (!separateStemsToFiles(source, from, to, clip->channels, stems, outs, {}, nullptr, &err))
                     return fail(QStringLiteral("Clip %1: %2").arg(qulonglong(id)).arg(QString::fromStdString(err)));
+                written.files.insert(written.files.end(), outs.begin(), outs.end());
                 std::vector<Id> media;
                 for (size_t k = 0; k < outs.size(); ++k) {
                     media.push_back(mediaFor(l.project, QString::fromStdString(outs[k])));
                     if (MediaItem* mi = l.project.findMedia(media.back())) {
                         mi->metadata["comment"] = titles[k] + " separated from " + clipName + " (" +
-                                                  QFileInfo(QString::fromStdString(source)).fileName().toStdString() + ") with Spleeter in Montage";
+                                                  QFileInfo(QString::fromStdString(uninterpretedPath(source))).fileName().toStdString() +
+                                                  ") with Spleeter in Montage";
                         if (std::find(mi->keywords.begin(), mi->keywords.end(), "Stem") == mi->keywords.end()) mi->keywords.push_back("Stem");
                     }
                 }
                 const edit::Result r = placeStems(l.project, s, id, media, titles, from, a.value("mute_original").toBool(true));
-                check(r);
-                for (size_t k = 0; k < r.created.size(); ++k)
-                    if (const Clip* made = edit::clipById(s, r.created[k]))
-                        placed.append(QJsonObject{{"clip", double(made->id)}, {"stem", QString::fromStdString(k < titles.size() ? titles[k] : "")},
-                                                  {"from_clip", double(id)}, {"file", QString::fromStdString(outs[k % outs.size()])}});
+                if (!r.ok) return fail(QStringLiteral("Clip %1: %2").arg(qulonglong(id)).arg(QString::fromStdString(r.error)));
+                for (size_t k = 0; k < r.created.size() && k < titles.size(); ++k)
+                    placed.append(QJsonObject{{"clip", double(r.created[k])}, {"stem", QString::fromStdString(titles[k])},
+                                              {"from_clip", double(id)}, {"file", QString::fromStdString(outs[k])}});
             }
+            written.keep = true;
             save(l);
             return ok(QStringLiteral("Separated %1 clip(s) into %2 stems each").arg(ids.size()).arg(stems), QJsonObject{{"stems", placed}});
         });
