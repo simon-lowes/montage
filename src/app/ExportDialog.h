@@ -22,6 +22,7 @@ class QSpinBox;
 namespace montage {
 
 class EditorState;
+class RenderQueue;
 
 class ExportDialog : public QDialog {
     Q_OBJECT
@@ -30,6 +31,8 @@ public:
     ~ExportDialog() override;
 
     bool isExporting() const { return exporting_; }
+    // Shows Add to Queue, which hands the export to this queue instead.
+    void setQueue(RenderQueue* queue);
 
 public slots:
     // Closing (Close button, Esc, window close) mid-export cancels the render
@@ -40,9 +43,12 @@ private:
     struct Result {
         bool ok = false;
         QString error;
+        QString encoder;  // the video encoder that ran (hardware presets resolve at export time)
     };
 
     const ExportPreset* currentPreset() const;
+    bool prepare(ExportSettings& s, FrameTime& in, FrameTime& out);
+    void addToQueue();
     void presetChanged();
     void browse();
     void widthChanged(int w);
@@ -73,6 +79,30 @@ private:
     QSpinBox* width_ = nullptr;
     QSpinBox* height_ = nullptr;
     QSpinBox* quality_ = nullptr;
+    QComboBox* captions_ = nullptr;
+    QCheckBox* chapters_ = nullptr;
+    QComboBox* streams_ = nullptr;      // more audio streams after the mix: none, per role, per track
+    QCheckBox* allCaptions_ = nullptr;  // every caption track as its own subtitle stream
+    QCheckBox* cea608_ = nullptr;       // the caption track as CEA-608 inside H.264/HEVC
+    QCheckBox* hdr10Plus_ = nullptr;    // HDR10+ dynamic metadata (PQ)
+    QCheckBox* smart_ = nullptr;
+    QLineEdit* startTc_ = nullptr;   // the file's starting timecode (MXF, MOV)
+    QComboBox* color_ = nullptr;
+    QComboBox* stereo_ = nullptr;  // a stereoscopic sequence: how its eyes are delivered
+    QComboBox* loudness_ = nullptr;
+    QCheckBox* described_ = nullptr;  // an audio description stream after the mix
+    QComboBox* audioOut_ = nullptr;  // a surround sequence: all its channels, or folded to stereo
+    QComboBox* stems_ = nullptr;     // also write stems: none, per track, per bus
+    int stemsMode_ = 0;
+    // Burn-ins for review copies.
+    QCheckBox* burnTimecode_ = nullptr;
+    QCheckBox* burnClipName_ = nullptr;
+    QLineEdit* burnText_ = nullptr;
+    QComboBox* burnCorner_ = nullptr;
+    QLineEdit* watermark_ = nullptr;
+    QComboBox* watermarkCorner_ = nullptr;
+    QPushButton* queueButton_ = nullptr;
+    RenderQueue* queue_ = nullptr;
     QLabel* summary_ = nullptr;
     QProgressBar* progress_ = nullptr;
     QLabel* eta_ = nullptr;

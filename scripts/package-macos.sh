@@ -20,6 +20,8 @@ MACDEPLOYQT=$(command -v macdeployqt || echo "$(brew --prefix qtbase)/bin/macdep
 # The command-line tool ships inside the bundle, next to the app binary, with
 # the headless "offscreen" platform plugin it runs on (macdeployqt only adds cocoa).
 cp "$BUILD/src/montage-cli" "$APP/Contents/MacOS/"
+# The plugin scanner's helper, loaded from beside the app binary.
+cp "$BUILD/src/app/montage-plugin-probe" "$APP/Contents/MacOS/"
 OFFSCREEN=$(find -L "$(brew --prefix)/share/qt" "$(brew --prefix qtbase)" -name libqoffscreen.dylib 2>/dev/null | head -1 || true)
 [ -n "$OFFSCREEN" ] || { echo "libqoffscreen.dylib not found" >&2; exit 1; }
 mkdir -p "$APP/Contents/PlugIns/platforms"
@@ -30,6 +32,7 @@ cp "$OFFSCREEN" "$APP/Contents/PlugIns/platforms/"
 # -libpath: Homebrew installs each Qt module in its own prefix, so plugins
 # reach frameworks (QtSvg...) through rpaths only the shared lib dir resolves.
 "$MACDEPLOYQT" "$APP" -always-overwrite -executable="$APP/Contents/MacOS/montage-cli" \
+  -executable="$APP/Contents/MacOS/montage-plugin-probe" \
   -executable="$APP/Contents/PlugIns/platforms/libqoffscreen.dylib" -libpath="$(brew --prefix)/lib"
 
 # Qt's SVG image and icon plugins need QtSvg, which macdeployqt cannot find in
@@ -77,6 +80,12 @@ STAGE=$(mktemp -d)
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
 rm -f "$DMG"
-hdiutil create -volname "Montage $VERSION" -srcfolder "$STAGE" -fs HFS+ -format UDZO -ov "$DMG"
+# hdiutil can fail with "Resource busy" while macOS's disk image helper is still busy (often on CI runners): retry.
+for attempt in 1 2 3 4 5; do
+  if hdiutil create -volname "Montage $VERSION" -srcfolder "$STAGE" -fs HFS+ -format UDZO -ov "$DMG"; then break; fi
+  if [ "$attempt" = 5 ]; then echo "hdiutil failed 5 times" >&2; exit 1; fi
+  echo "hdiutil failed (attempt $attempt); retrying in $((attempt * 5)) s" >&2
+  sleep $((attempt * 5))
+done
 rm -rf "$STAGE"
 echo "Wrote $DMG ($(du -h "$DMG" | cut -f1))"

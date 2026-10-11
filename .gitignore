@@ -5,3 +5,4 @@ build-*/
 compile_commands.json
 /out/
 *.montage.autosave
+__pycache__/

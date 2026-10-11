@@ -1,0 +1,65 @@
+// Montage — a surround panner for a mixer strip: the speakers of the
+// sequence's layout round a circle (overhead ones hollow, further in), and the
+// track as a dot (with its left and right channels either side) to drag. The
+// wheel narrows or widens it, double-click puts it back, and the context menu
+// sets its width and LFE. In immersive layouts a bar on the right shows its
+// height (Alt+wheel or the menu sets it), and a track can be made an audio
+// object for ADM masters (drawn as a diamond). A track's position can be
+// animated (its x, y, z lanes): drawn with a ring, set at the playhead.
+#pragma once
+
+#include <QElapsedTimer>
+#include <QWidget>
+
+#include "core/Model.h"
+
+namespace montage {
+
+class SurroundPanner : public QWidget {
+    Q_OBJECT
+public:
+    explicit SurroundPanner(QWidget* parent = nullptr);
+
+    void setSpeakerLayout(const std::string& layout);
+    // Whether the menu offers "Audio object" (tracks yes, buses no).
+    void setObjectsAllowed(bool on) { objectsAllowed_ = on; }
+    void setPan(const SurroundPan& p);  // does not emit
+    const SurroundPan& pan() const { return pan_; }
+    // Whether the position is keyed (drawn with a ring; the menu's "Animate Position" ticked).
+    void setAnimated(bool on);
+    bool isAnimated() const { return animated_; }
+    // Held: dragged, or changed by the wheel, a double-click or the menu within the last 0.75 s (so Touch and Latch
+    // automation record those changes too).
+    bool isDragging() const { return dragging_ || (nudged_.isValid() && nudged_.elapsed() < 750); }
+    // Where a position (x, y in -1..1) is drawn, and the reverse.
+    QPointF toWidget(double x, double y) const;
+    void fromWidget(QPointF p, double& x, double& y) const;
+
+    QSize sizeHint() const override { return {58, 58}; }
+
+signals:
+    void changed(const montage::SurroundPan& p, bool final);
+    // "Animate Position" chosen (on: key the position at the playhead; off: stop it moving).
+    void animateRequested(bool on);
+
+protected:
+    void paintEvent(QPaintEvent*) override;
+    void mousePressEvent(QMouseEvent* e) override;
+    void mouseMoveEvent(QMouseEvent* e) override;
+    void mouseReleaseEvent(QMouseEvent* e) override;
+    void mouseDoubleClickEvent(QMouseEvent* e) override;
+    void wheelEvent(QWheelEvent* e) override;
+    void contextMenuEvent(QContextMenuEvent* e) override;
+
+private:
+    void emitChange(bool final, bool nudge = true);
+
+    std::string layout_ = "5.1";
+    SurroundPan pan_;
+    bool dragging_ = false;
+    QElapsedTimer nudged_;
+    bool objectsAllowed_ = false;
+    bool animated_ = false;
+};
+
+}  // namespace montage

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE fcpxml>
+<fcpxml version="1.11">
+  <resources>
+    <format id="r1" name="FFVideoFormat1080p2997" frameDuration="1001/30000s" width="1920" height="1080"/>
+    <asset id="r2" name="Interview" start="3600s" duration="600600/30000s" hasVideo="1" hasAudio="1" format="r1">
+      <media-rep kind="original-media" src="file:///Volumes/Media/Interview.mov"/>
+    </asset>
+    <asset id="r3" name="Music" start="0s" duration="120s" hasVideo="0" hasAudio="1">
+      <media-rep kind="original-media" src="file:///Volumes/Media/Music.wav"/>
+    </asset>
+    <effect id="r4" name="Basic Title" uid=".../Basic Title.moti"/>
+  </resources>
+  <library><event name="Day 1"><project name="Edit 3">
+    <sequence format="r1" duration="300300/30000s" tcStart="3600s" tcFormat="NDF">
+      <spine>
+        <asset-clip ref="r2" offset="3600s" name="Interview" start="108108108/30000s" duration="150150/30000s" tcFormat="NDF">
+          <title ref="r4" lane="1" offset="108111111/30000s" name="Lower Third" start="0s" duration="60060/30000s">
+            <text><text-style ref="ts1">Jane Doe</text-style></text>
+          </title>
+          <audio ref="r3" lane="-1" offset="108108108/30000s" name="Music" start="0s" duration="150150/30000s"/>
+          <marker start="108120120/30000s" duration="1001/30000s" value="Good line"/>
+        </asset-clip>
+        <gap name="Gap" offset="18168150/5000s" start="0s" duration="150150/30000s"/>
+      </spine>
+    </sequence>
+  </project></event></library>
+</fcpxml>

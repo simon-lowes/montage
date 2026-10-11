@@ -1,5 +1,6 @@
 // Montage — application entry point.
 #include <QApplication>
+#include <clocale>
 #include <QCommandLineParser>
 #include <QFileInfo>
 #include <QIcon>
@@ -11,6 +12,9 @@
 
 int main(int argc, char** argv) {
     QApplication app(argc, argv);
+    // QApplication takes the C library's locale from the environment; numbers in files must not follow it (a German
+    // system's printf writes 1,5 and its atof reads "0.5" as 0).
+    std::setlocale(LC_NUMERIC, "C");
     QApplication::setApplicationName("Montage");
     QApplication::setOrganizationName("Montage");
     QApplication::setApplicationVersion(MONTAGE_VERSION);
@@ -27,11 +31,14 @@ int main(int argc, char** argv) {
     QCommandLineOption select("select-at", "Select the clip under the playhead on track V<n>.", "n");
     QCommandLineOption tool("source", "Open media item <index> (1-based) in the source monitor.", "index");
     QCommandLineOption panel("panel", "Bring the named panel(s) to the front (comma separated).", "names");
-    parser.addOptions({screenshot, frame, select, tool, panel});
+    QCommandLineOption workspace("workspace", "Open in workspace <name> (Editing, Colour, Audio, Effects, Captions, Logging or a saved one).", "name");
+    parser.addOptions({screenshot, frame, select, tool, panel, workspace});
     parser.process(app);
 
     montage::MainWindow w;
     w.show();
+    if (parser.isSet(workspace) && !w.applyWorkspace(parser.value(workspace)))
+        qWarning("No workspace called %s", qPrintable(parser.value(workspace)));
     QStringList media;
     for (const QString& arg : parser.positionalArguments()) {
         if (arg.endsWith(".montage")) w.openProject(QFileInfo(arg).absoluteFilePath());

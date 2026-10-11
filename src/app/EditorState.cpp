@@ -4,17 +4,34 @@
 #include <QDir>
 #include <QPointer>
 #include <QFileInfo>
+#include <QFileSystemWatcher>
+#include <QDirIterator>
+#include <QDateTime>
+#include <cmath>
+#include <QTimer>
 #include <QStandardPaths>
 #include <QtConcurrent>
 #include <algorithm>
+#include <limits>
+#include <set>
+#include <utility>
 
+#include "core/MediaLog.h"
 #include "core/ProjectIO.h"
+#include "core/ProjectLock.h"
 #include "media/Decoder.h"
 #include "media/MediaPool.h"
+#include "media/Proxy.h"
+#include "media/ImageSequence.h"
+#include "media/Relink.h"
+#include "Settings.h"
+#include "ThumbnailCache.h"
 
 namespace montage {
 
 EditorState::EditorState(QObject* parent) : QObject(parent), project_(makeDefaultProject()) {
+    // Clips playing chosen channels of a file need those decoded too (the whole file is decoded on import).
+    connect(this, &EditorState::projectChanged, this, &EditorState::startClipAudioDecodes);
     // Decodes finish on worker threads, possibly after this object is gone:
     // hop to the application object and re-check before emitting.
     QPointer<EditorState> self(this);
@@ -27,9 +44,48 @@ EditorState::EditorState(QObject* parent) : QObject(parent), project_(makeDefaul
         }, Qt::QueuedConnection);
     });
     savedRevision_ = history_.revision();
+    // Changed media files are reloaded once they have been quiet for a moment (editors save in several writes).
+    watcher_ = new QFileSystemWatcher(this);
+    reloadTimer_ = new QTimer(this);
+    reloadTimer_->setSingleShot(true);
+    reloadTimer_->setInterval(400);
+    connect(watcher_, &QFileSystemWatcher::fileChanged, this, [this](const QString& path) {
+        if (!changedFiles_.contains(path)) changedFiles_ << path;
+        reloadTimer_->start();
+        noteMediaFileWritten(path);
+    });
+    connect(reloadTimer_, &QTimer::timeout, this, [this] {
+        // (A file still growing is followed by checkGrowingMedia, and reloaded once it stops.)
+        QStringList paths = std::exchange(changedFiles_, {});
+        paths.removeIf([this](const QString& p) { return growth_.count(p) && growth_.at(p).growing; });
+        reloadChangedMedia(paths);
+    });
+    // Growing media: files being written looked at every second.
+    clock_ = [] { return QDateTime::currentMSecsSinceEpoch(); };
+    growingRefreshMs_ = appSettings().value(QStringLiteral("media/growingRefreshMs"), 15000).toInt();
+    growthTimer_ = new QTimer(this);
+    growthTimer_->setInterval(1000);
+    connect(growthTimer_, &QTimer::timeout, this, &EditorState::checkGrowingMedia);
+    connect(this, &EditorState::projectChanged, this, &EditorState::watchMediaFiles);
+    // Shared projects: the lock renewed, and a read-only project followed, every few seconds.
+    lockTimer_ = new QTimer(this);
+    lockTimer_->setInterval(3000);
+    connect(lockTimer_, &QTimer::timeout, this, [this] { checkSharedState(); });
+    lockTimer_->start();
+    // Watch folders: a scan a moment after anything in them changes.
+    folderWatcher_ = new QFileSystemWatcher(this);
+    folderTimer_ = new QTimer(this);
+    folderTimer_->setSingleShot(true);
+    folderTimer_->setInterval(1100);
+    connect(folderWatcher_, &QFileSystemWatcher::directoryChanged, this, [this] { folderTimer_->start(); });
+    connect(folderTimer_, &QTimer::timeout, this, [this] { scanWatchFolders(); });
+    connect(this, &EditorState::projectChanged, this, &EditorState::watchFoldersChanged);
 }
 
-EditorState::~EditorState() { MediaPool::instance().setReadyCallback(nullptr); }
+EditorState::~EditorState() {
+    MediaPool::instance().setReadyCallback(nullptr);
+    releaseLock();
+}
 
 QString timecodeString(const Sequence* s, FrameTime t) {
     return QString::fromStdString(formatTimecode(t, s ? s->fps : Rational{30, 1}));
@@ -38,8 +94,28 @@ QString timecodeString(const Sequence* s, FrameTime t) {
 // ---------------------------------------------------------------------------
 // Editing
 
+namespace {
+// The same file however it was reached (a link, a mapped drive and its network path).
+bool samePath(const QString& a, const QString& b) {
+    if (a.isEmpty() || b.isEmpty()) return false;
+    const QFileInfo fa(a), fb(b);
+    const QString ca = fa.exists() ? fa.canonicalFilePath() : fa.absoluteFilePath();
+    const QString cb = fb.exists() ? fb.canonicalFilePath() : fb.absoluteFilePath();
+    return ca == cb;
+}
+}  // namespace
+
+bool EditorState::refuseReadOnly() {
+    if (!readOnly_) return false;
+    message(lockHolder_.isEmpty() ? tr("This project is open read-only (File › Edit Project to make changes)")
+                                  : tr("Read-only: %1 is editing this project").arg(lockHolder_),
+            5000);
+    return true;
+}
+
 bool EditorState::edit(const QString& label, const std::function<bool(Project&, Sequence&)>& fn,
                        const QString& mergeKey) {
+    if (refuseReadOnly()) return false;
     if (gesture_) endGesture(true);
     Sequence* s = project_.active();
     if (!s) return false;
@@ -50,8 +126,8 @@ bool EditorState::edit(const QString& label, const std::function<bool(Project&, 
     }
     if (project_ == before) return true;
     QDateTime now = QDateTime::currentDateTimeUtc();
-    bool merge = !mergeKey.isEmpty() && mergeKey == lastMergeKey_ && lastMergeTime_.isValid() &&
-                 lastMergeTime_.msecsTo(now) < 1500 && history_.canUndo();
+    bool merge = !mergeKey.isEmpty() && mergeKey == lastMergeKey_ && history_.canUndo() &&
+                 (mergeKey == undoGroup_ || (lastMergeTime_.isValid() && lastMergeTime_.msecsTo(now) < 1500));
     if (merge) history_.touch();
     else history_.push(label.toStdString(), before);
     lastMergeKey_ = mergeKey;
@@ -59,6 +135,23 @@ bool EditorState::edit(const QString& label, const std::function<bool(Project&, 
     pruneSelection();
     emit projectChanged();
     emit historyChanged();
+    emit fileStateChanged();
+    return true;
+}
+
+bool EditorState::amend(const std::function<bool(Project&, Sequence&)>& fn) {
+    if (readOnly_) return false;
+    if (gesture_) endGesture(true);
+    Sequence* s = project_.active();
+    if (!s) return false;
+    Project before = project_;
+    if (!fn(project_, *project_.active())) {
+        project_ = std::move(before);
+        return false;
+    }
+    if (project_ == before) return true;
+    history_.touch();
+    emit projectChanged();
     emit fileStateChanged();
     return true;
 }
@@ -75,6 +168,7 @@ bool EditorState::apply(const QString& label, const std::function<edit::Result(P
 }
 
 void EditorState::beginGesture(const QString& label) {
+    if (refuseReadOnly()) return;  // no gesture: its updates change nothing
     if (gesture_) endGesture(true);
     gesture_ = Gesture{label, project_, false};
     lastMergeKey_.clear();
@@ -104,6 +198,7 @@ void EditorState::endGesture(bool commit) {
 }
 
 void EditorState::undo() {
+    if (refuseReadOnly()) return;
     if (gesture_) endGesture(false);
     FrameTime ph = playhead();
     if (!history_.undo(project_)) return;
@@ -117,6 +212,7 @@ void EditorState::undo() {
 }
 
 void EditorState::redo() {
+    if (refuseReadOnly()) return;
     if (gesture_) endGesture(false);
     FrameTime ph = playhead();
     if (!history_.redo(project_)) return;
@@ -137,9 +233,10 @@ bool EditorState::isSelected(Id clip) const {
 
 void EditorState::setSelection(std::vector<Id> clips, bool expandLinked) {
     if (expandLinked && sequence()) clips = edit::expandLinks(*sequence(), clips);
-    if (clips == selection_ && selectedTransition_ == 0) return;
+    if (clips == selection_ && selectedTransition_ == 0 && (clips.empty() || !inspectedChain_)) return;
     selection_ = std::move(clips);
     selectedTransition_ = 0;
+    if (!selection_.empty()) inspectedChain_ = 0;
     emit selectionChanged();
 }
 
@@ -153,6 +250,14 @@ void EditorState::clearSelection() {
 void EditorState::selectTransition(Id id) {
     selection_.clear();
     selectedTransition_ = id;
+    inspectedChain_ = 0;
+    emit selectionChanged();
+}
+
+void EditorState::inspectChain(Id owner) {
+    selection_.clear();
+    selectedTransition_ = 0;
+    inspectedChain_ = owner;
     emit selectionChanged();
 }
 
@@ -185,7 +290,9 @@ void EditorState::pruneSelection() {
         if (selectedTransition_ && !edit::transitionById(const_cast<Sequence&>(*s), selectedTransition_))
             selectedTransition_ = 0;
     }
-    if (selection_.size() != before || tr != selectedTransition_) emit selectionChanged();
+    const Id chain = inspectedChain_;
+    if (inspectedChain_ && (!s || !edit::effectChain(const_cast<Sequence&>(*s), inspectedChain_))) inspectedChain_ = 0;
+    if (selection_.size() != before || tr != selectedTransition_ || chain != inspectedChain_) emit selectionChanged();
 }
 
 // ---------------------------------------------------------------------------
@@ -210,7 +317,7 @@ void EditorState::setInPoint(FrameTime t) {
     if (!s) return;
     s->inPoint = t;
     if (t >= 0 && s->outPoint >= 0 && s->outPoint <= t) s->outPoint = -1;
-    history_.touch();
+    if (!readOnly_) history_.touch();  // marks on a read-only project are not changes to keep
     emit projectChanged();
     emit fileStateChanged();
 }
@@ -220,7 +327,7 @@ void EditorState::setOutPoint(FrameTime t) {
     if (!s) return;
     s->outPoint = t;
     if (t >= 0 && s->inPoint >= 0 && s->inPoint >= t) s->inPoint = -1;
-    history_.touch();
+    if (!readOnly_) history_.touch();
     emit projectChanged();
     emit fileStateChanged();
 }
@@ -243,23 +350,452 @@ void EditorState::setSnapping(bool on) {
 // ---------------------------------------------------------------------------
 // Media
 
+void EditorState::watchMediaFiles() {
+    // Decoders stay open only on this project's files (and proxies); a closed project's files are let go.
+    std::set<std::string> open;
+    for (const MediaItem& m : project_.media) {
+        if (!m.path.empty()) open.insert(m.path);
+        if (!m.proxyPath.empty()) open.insert(m.proxyPath);
+    }
+    MediaPool::instance().setOpenFiles(std::move(open));
+    QStringList wanted;
+    for (const MediaItem& m : project_.media)
+        if (!m.path.empty() && m.kind != MediaKind::Sequence && !m.subclipOf) {
+            const QString p = QString::fromStdString(mediaFileOnDisk(m.path));  // a Photoshop layer's file, a sequence's first frame
+            if (!wanted.contains(p) && QFileInfo::exists(p)) wanted << p;
+        }
+    const QStringList watched = watcher_->files();
+    QStringList gone, added;
+    for (const QString& p : watched)
+        if (!wanted.contains(p)) gone << p;
+    for (const QString& p : wanted)
+        if (!watched.contains(p)) added << p;
+    if (!gone.isEmpty()) watcher_->removePaths(gone);
+    if (!added.isEmpty()) watcher_->addPaths(added);
+    // Files no media uses any more (removed, relinked, another project open) are no longer followed as they grow.
+    for (auto it = growth_.begin(); it != growth_.end();) it = wanted.contains(it->first) ? std::next(it) : growth_.erase(it);
+    if (growth_.empty()) growthTimer_->stop();
+}
+
+void EditorState::reloadChangedMedia(const QStringList& paths) {
+    QStringList names;
+    std::vector<Id> reloaded;
+    for (const QString& path : paths) {
+        if (!QFileInfo::exists(path)) continue;  // gone (or being replaced): offline until it is back
+        // The media in that file: the file itself, or each of its layers.
+        std::set<std::string> mediaPaths;
+        for (const MediaItem& m : project_.media)
+            if (!m.path.empty() && m.kind != MediaKind::Sequence && mediaFileOnDisk(m.path) == path.toStdString()) mediaPaths.insert(m.path);
+        if (mediaPaths.empty()) continue;  // (no media of this project's in it)
+        if (!watcher_->files().contains(path)) watcher_->addPath(path);  // replaced by a new file: watch that
+        ++reloads_[path];
+        for (const std::string& p : mediaPaths) {
+            MediaPool::instance().forget(p);
+            ThumbnailCache::instance().forget(QString::fromStdString(p));
+            MediaItem fresh;
+            if (!probeMedia(p, fresh)) continue;
+            applyProbedFacts(p, fresh);
+            for (const MediaItem& m : project_.media) {
+                if (m.path != p) continue;
+                if (!m.subclipOf) names << QString::fromStdString(m.name);
+                reloaded.push_back(m.id);
+            }
+            for (const MediaItem& m : project_.media)
+                if (m.path == p && !m.subclipOf) startAudioDecode(m);
+            for (auto it = clipAudioRequested_.begin(); it != clipAudioRequested_.end();)
+                it = audioKeyFile(it->first) == p ? clipAudioRequested_.erase(it) : std::next(it);
+        }
+    }
+    offlineChecked_.clear();
+    if (reloaded.empty()) return;
+    for (Id id : reloaded) emit mediaFileChanged(id);
+    emit projectChanged();
+    message(tr("Reloaded %1, changed on disk").arg(names.join(QStringLiteral(", "))), 4000);
+}
+
+namespace {
+constexpr qint64 kGrowingAfterMs = 2000;  // written for this long...
+constexpr qint64 kPauseMs = 1500;         // ...without a pause this long: growing
+constexpr qint64 kStoppedMs = 3000;       // and once not written for this long, it has stopped
+}  // namespace
+
+void EditorState::noteMediaFileWritten(const QString& path) {
+    const qint64 now = clock_();
+    Growth& g = growth_[path];
+    if (!g.first || now - g.last > kPauseMs) g.first = now;  // (a fresh run of writes)
+    g.last = now;
+    if (!growthTimer_->isActive()) growthTimer_->start();
+}
+
+void EditorState::setClock(std::function<qint64()> clock) {
+    clock_ = clock ? std::move(clock) : std::function<qint64()>([] { return QDateTime::currentMSecsSinceEpoch(); });
+}
+
+bool EditorState::applyProbedFacts(const std::string& path, const MediaItem& fresh) {
+    auto apply = [&](Project& p) {
+        bool changed = false;
+        for (MediaItem& m : p.media)
+            if (m.path == path && !sameProbedFacts(m, fresh, !m.subclipOf)) {
+                copyProbedFacts(m, fresh, !m.subclipOf);  // (a subclip's range is its own)
+                changed = true;
+            }
+        return changed;
+    };
+    const bool changed = apply(project_);
+    history_.forEachState(apply);
+    if (gesture_) apply(gesture_->origin);
+    if (changed) history_.touch();  // (saved, or the next open would have the old length)
+    return changed;
+}
+
+void EditorState::checkGrowingMedia() {
+    const qint64 now = clock_();
+    QStringList refresh, finished, started;
+    for (auto it = growth_.begin(); it != growth_.end();) {
+        Growth& g = it->second;
+        if (g.growing) {
+            if (now - g.last >= kStoppedMs) {
+                finished << it->first;
+                it = growth_.erase(it);
+                continue;
+            }
+            if (growingRefreshMs_ > 0 && now - g.refreshed >= growingRefreshMs_) refresh << it->first, g.refreshed = now;
+        } else if (now - g.last >= kPauseMs) {
+            it = growth_.erase(it);  // a save in a few writes, reloaded once quiet as any change
+            continue;
+        } else if (g.last - g.first >= kGrowingAfterMs) {
+            g.growing = true;
+            g.refreshed = now;
+            if (growingRefreshMs_ > 0) refresh << it->first;  // (else only read once it stops)
+            started << it->first;
+        }
+        ++it;
+    }
+    if (growth_.empty()) growthTimer_->stop();
+    if (!refresh.isEmpty()) refreshLengths(refresh);
+    if (!started.isEmpty()) emit projectChanged();  // (the bin shows them as growing)
+    if (!started.isEmpty()) {
+        QStringList names;
+        for (const QString& p : started) names << QFileInfo(p).fileName();
+        message(growingRefreshMs_ > 0 ? tr("%1 is still being written: followed as it grows").arg(names.join(QStringLiteral(", ")))
+                                      : tr("%1 is still being written: reloaded once it stops").arg(names.join(QStringLiteral(", "))),
+                5000);
+    }
+    if (!finished.isEmpty()) reloadChangedMedia(finished);  // in full now: thumbnails, sound
+}
+
+void EditorState::refreshLengths(const QStringList& paths) {
+    // The media in those files (each layer of a layered file), read on a worker: a recording on slow shared storage can
+    // take a while to open, and the window stays responsive.
+    std::vector<std::string> mediaPaths;
+    QStringList files;
+    std::map<QString, int> reloads;
+    for (const QString& path : paths) {
+        if (probing_.count(path)) continue;  // (still being read from last time)
+        std::set<std::string> in;
+        for (const MediaItem& m : project_.media)
+            if (!m.path.empty() && m.kind != MediaKind::Sequence && mediaFileOnDisk(m.path) == path.toStdString()) in.insert(m.path);
+        if (in.empty()) continue;
+        probing_.insert(path);
+        files << path;
+        reloads[path] = reloads_[path];
+        mediaPaths.insert(mediaPaths.end(), in.begin(), in.end());
+    }
+    if (files.isEmpty()) {
+        QMetaObject::invokeMethod(this, [this] { emit growingRefreshed(false); }, Qt::QueuedConnection);
+        return;
+    }
+    QPointer<EditorState> self(this);
+    const uint64_t generation = projectGeneration_;
+    (void)QtConcurrent::run([self, mediaPaths, files, reloads, generation] {
+        std::vector<std::pair<std::string, MediaItem>> read;
+        for (const std::string& p : mediaPaths) {
+            MediaItem fresh;
+            if (probeMedia(p, fresh)) read.push_back({p, fresh});  // (unreadable mid-write: tried again next time)
+        }
+        QCoreApplication* app = QCoreApplication::instance();
+        if (!app) return;
+        QMetaObject::invokeMethod(app, [self, read, files, reloads, generation] {
+            if (!self) return;
+            for (const QString& f : files) self->probing_.erase(f);
+            bool changed = false;
+            if (generation == self->projectGeneration_) {
+                for (const auto& [p, fresh] : read) {
+                    const QString file = QString::fromStdString(mediaFileOnDisk(p));
+                    if (reloads.count(file) && self->reloads_[file] != reloads.at(file)) continue;  // (reloaded since: that read is newer)
+                    if (!self->applyProbedFacts(p, fresh)) continue;
+                    changed = true;
+                    // Pictures decoded again to see the new end; the sound read again on a worker, the last read
+                    // playing until then.
+                    MediaPool::instance().forget(p, false);
+                    const Sequence* s = self->sequence();
+                    const int rate = s ? s->sampleRate : 48000;
+                    if (fresh.hasAudio)
+                        (void)QtConcurrent::run([p, rate] {
+                            if (!MediaPool::instance().refreshAudio(p)) MediaPool::instance().audio(p, rate);
+                        });
+                }
+            }
+            if (changed) emit self->projectChanged();
+            emit self->growingRefreshed(changed);
+        }, Qt::QueuedConnection);
+    });
+}
+
+QStringList EditorState::growingFiles() const {
+    QStringList out;
+    for (const auto& [path, g] : growth_)
+        if (g.growing) out << path;
+    return out;
+}
+
+bool EditorState::isMediaGrowing(Id media) const {
+    const MediaItem* m = media ? project_.findMedia(media) : nullptr;
+    if (!m || m->path.empty() || m->kind == MediaKind::Sequence) return false;
+    const auto it = growth_.find(QString::fromStdString(mediaFileOnDisk(m->path)));
+    return it != growth_.end() && it->second.growing;
+}
+
+void EditorState::setGrowingRefreshMs(int ms) {
+    growingRefreshMs_ = std::max(0, ms);
+    appSettings().setValue(QStringLiteral("media/growingRefreshMs"), growingRefreshMs_);
+}
+
+void EditorState::refreshGrowingMedia() {
+    QStringList paths;
+    for (auto& [path, g] : growth_)
+        if (g.growing) paths << path, g.refreshed = clock_();
+    if (paths.isEmpty())
+        for (const MediaItem& m : project_.media)
+            if (!m.path.empty() && m.kind != MediaKind::Sequence && !m.subclipOf && m.kind != MediaKind::Image) {
+                const QString f = QString::fromStdString(mediaFileOnDisk(m.path));
+                if (!paths.contains(f) && QFileInfo::exists(f)) paths << f;
+            }
+    refreshLengths(paths);
+}
+
+bool EditorState::isMediaOffline(Id media) const {
+    const MediaItem* m = media ? project_.findMedia(media) : nullptr;
+    if (!m || m->kind == MediaKind::Sequence || m->path.empty()) return false;
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    auto& [offline, when] = offlineChecked_[m->path];
+    if (when == 0 || now - when > 2000) {
+        offline = isOffline(*m);
+        when = now;
+    }
+    return offline;
+}
+
+void EditorState::startClipAudioDecodes() {
+    const Sequence* s = sequence();
+    const int rate = s ? s->sampleRate : 48000;
+    for (const Sequence& seq : project_.sequences)
+        for (const Track& t : seq.audioTracks)
+            for (const Clip& c : t.clips) {
+                const MediaItem* m = project_.findMedia(c.mediaId);
+                if (!m || !m->hasAudio || m->path.empty()) continue;
+                // An ambisonic file's field (core/Ambisonics.h), or the channels a clip picked.
+                const bool field = m->ambisonic > 0 && c.channels.empty();
+                if (c.channels.empty() && !field) continue;
+                if (soundSource(*m) != m->path) continue;  // (offline: its proxy's sound plays whole, decoded with the media)
+                std::string key = field ? ambisonicAudioKey(m->path) : audioKey(m->path, c.channels);
+                if (!clipAudioRequested_.insert({key, rate}).second) continue;
+                (void)QtConcurrent::run([key, rate] { MediaPool::instance().audio(key, rate); });
+            }
+}
+
 void EditorState::startAudioDecode(const MediaItem& m) {
     if (!m.hasAudio || m.path.empty() || m.kind == MediaKind::Image) return;
     const Sequence* s = sequence();
     int rate = s ? s->sampleRate : 48000;
-    std::string path = m.path;
+    std::string path = soundSource(m);  // (an offline file's proxy, when it carries sound)
     (void)QtConcurrent::run([path, rate] { MediaPool::instance().audio(path, rate); });
 }
 
+Id EditorState::importImageSequence(const QString& frame, Rational fps, QString* error) {
+    ImageSequence seq;
+    if (!detectImageSequence(frame.toStdString(), seq)) {
+        if (error) *error = tr("%1 is not part of a numbered sequence").arg(QFileInfo(frame).fileName());
+        return 0;
+    }
+    seq.fps = fps.valid() ? fps : Rational{24, 1};
+    MediaItem m;
+    std::string err;
+    if (!probeMedia(imageSequencePath(seq), m, &err)) {
+        if (error) *error = QString::fromStdString(err);
+        return 0;
+    }
+    Id id = 0;
+    edit(tr("Import %1").arg(QString::fromStdString(m.name)), [&](Project& p, Sequence&) {
+        m.id = id = p.newId();
+        p.media.push_back(m);
+        return true;
+    });
+    return id;
+}
+
+namespace {
+
+bool importableMedia(const QString& file) {
+    static const QStringList exts = {"mp4", "mov", "mkv",  "avi",  "webm", "m4v", "mxf", "mts", "m2ts", "ts",  "mpg", "mpeg", "wmv",
+                                     "flv", "gif", "wav",  "mp3",  "aac",  "m4a", "flac", "ogg", "opus", "aif", "aiff", "png", "jpg",
+                                     "jpeg", "tif", "tiff", "bmp", "webp", "exr", "dpx", "svg", "psd",  "psb", "heic", "dng", "cr2",
+                                     "cr3", "nef", "arw",  "raf",  "rw2",  "orf"};
+    return exts.contains(QFileInfo(file).suffix().toLower());
+}
+
+}  // namespace
+
+void EditorState::watchFoldersChanged() {
+    QStringList wanted;
+    for (const std::string& f : project_.watchFolders) {
+        // The folder and its subfolders, so files landing anywhere in it are noticed.
+        const QString root = QString::fromStdString(f);
+        if (!QFileInfo(root).isDir()) continue;
+        wanted << root;
+        QDirIterator it(root, QDir::Dirs | QDir::NoDotAndDotDot, QDirIterator::Subdirectories);
+        while (it.hasNext()) wanted << it.next();
+    }
+    const QStringList watched = folderWatcher_->directories();
+    QStringList gone, added;
+    for (const QString& d : watched)
+        if (!wanted.contains(d)) gone << d;
+    for (const QString& d : wanted)
+        if (!watched.contains(d)) added << d;
+    if (!gone.isEmpty()) folderWatcher_->removePaths(gone);
+    if (!added.isEmpty()) folderWatcher_->addPaths(added);
+}
+
+bool EditorState::addWatchFolder(const QString& folder) {
+    const QFileInfo fi(folder);
+    if (!fi.isDir()) return false;
+    const std::string path = QDir::cleanPath(fi.absoluteFilePath()).toStdString();
+    if (std::find(project_.watchFolders.begin(), project_.watchFolders.end(), path) != project_.watchFolders.end()) return false;
+    if (!edit(tr("Watch Folder"), [&](Project& p, Sequence&) {
+            p.watchFolders.push_back(path);
+            return true;
+        }))
+        return false;
+    scanWatchFolders();
+    return true;
+}
+
+bool EditorState::removeWatchFolder(const QString& folder) {
+    const std::string path = QDir::cleanPath(QFileInfo(folder).absoluteFilePath()).toStdString();
+    return edit(tr("Stop Watching Folder"), [&](Project& p, Sequence&) {
+        const auto before = p.watchFolders.size();
+        std::erase(p.watchFolders, path);
+        return p.watchFolders.size() != before;
+    });
+}
+
+std::vector<Id> EditorState::scanWatchFolders() {
+    if (readOnly_) return {};  // looked at again once it can be edited
+    std::vector<Id> ids;
+    // What the project already has: files, image sequences' runs, Photoshop layers' files.
+    std::set<std::string> have, runs;
+    for (const MediaItem& m : project_.media) {
+        if (m.path.empty()) continue;
+        have.insert(m.path);
+        have.insert(mediaFileOnDisk(m.path));
+        if (ImageSequence seq; parseImageSequencePath(m.path, seq)) runs.insert(seq.pattern);
+    }
+    bool waiting = false;
+    const QDateTime now = QDateTime::currentDateTime();
+    for (const std::string& folder : std::vector<std::string>(project_.watchFolders)) {
+        QStringList fresh;
+        QDirIterator it(QString::fromStdString(folder), QDir::Files | QDir::NoDotAndDotDot, QDirIterator::Subdirectories);
+        while (it.hasNext()) {
+            const QFileInfo fi(it.next());
+            if (fi.fileName().startsWith(QLatin1Char('.')) || !importableMedia(fi.fileName())) continue;
+            const std::string abs = QDir::cleanPath(fi.absoluteFilePath()).toStdString();
+            if (have.count(abs) || watchSkipped_.count(abs)) continue;
+            if (ImageSequence seq; isFrameFormat(abs) && detectImageSequence(abs, seq) && runs.count(seq.pattern)) continue;
+            if (fi.lastModified().msecsTo(now) < 1000) {  // still being written
+                waiting = true;
+                continue;
+            }
+            fresh << fi.absoluteFilePath();
+        }
+        if (fresh.isEmpty()) continue;
+        fresh.sort();
+        const QString bin = tr("Watch Folder - %1").arg(QFileInfo(QString::fromStdString(folder)).fileName());
+        QStringList errors;
+        const std::vector<Id> got = importFiles(fresh, &errors, bin);
+        ids.insert(ids.end(), got.begin(), got.end());
+        // Files that did not come in are not tried again.
+        std::set<std::string> now2;
+        for (const MediaItem& m : project_.media) now2.insert(mediaFileOnDisk(m.path));
+        for (const QString& f : fresh)
+            if (!now2.count(f.toStdString())) watchSkipped_.insert(f.toStdString());
+    }
+    if (waiting) folderTimer_->start();
+    if (!ids.empty()) message(tr("Imported %n file(s) from a watch folder", "", int(ids.size())), 5000);
+    return ids;
+}
+
+std::vector<Id> EditorState::importPsd(const QString& path, PsdImport mode, QString* error) {
+    std::vector<Id> ids;
+    std::string err;
+    const std::string file = QFileInfo(path).absoluteFilePath().toStdString();
+    const bool ok = edit(tr("Import %1").arg(QFileInfo(path).fileName()), [&](Project& p, Sequence&) {
+        ids = montage::importPsd(p, file, mode, 5, &err);
+        return !ids.empty();
+    });
+    if (!ok) {
+        if (error) *error = QString::fromStdString(err.empty() ? "The Photoshop file could not be read" : err);
+        return {};
+    }
+    return ids;
+}
+
 std::vector<Id> EditorState::importFiles(const QStringList& paths, QStringList* errors, const QString& bin) {
+    if (refuseReadOnly()) return {};
     std::vector<MediaItem> items;
+    // Numbered frames in render formats, two or more of a run chosen: one image sequence each.
+    std::map<std::string, std::pair<ImageSequence, int>> runs;
+    if (appSettings().value(QStringLiteral("import/imageSequences"), true).toBool())
+        for (const QString& path : paths)
+            if (ImageSequence seq; isFrameFormat(path.toStdString()) && detectImageSequence(QFileInfo(path).absoluteFilePath().toStdString(), seq)) {
+                auto& run = runs[seq.pattern];
+                run.first = seq;
+                ++run.second;
+            }
+    std::set<std::string> made;
+    std::vector<Id> fromFolders;  // what folders brought in, each a step of its own
+    const Rational rate = sequence() && sequence()->fps.valid() ? sequence()->fps : Rational{24, 1};
     for (const QString& path : paths) {
         QFileInfo fi(path);
+        if (ImageSequence seq; !fi.isDir() && isFrameFormat(path.toStdString()) &&
+                               detectImageSequence(fi.absoluteFilePath().toStdString(), seq) && runs.count(seq.pattern) &&
+                               runs[seq.pattern].second >= 2) {
+            if (!made.insert(seq.pattern).second) continue;  // already made from another of its frames
+            double dngRate = 0;
+            seq.fps = cinemaDng(path.toStdString(), &dngRate) && dngRate > 0 ? rateFor(dngRate) : rate;  // CinemaDNG says its rate
+            MediaItem m;
+            std::string err;
+            if (!probeMedia(imageSequencePath(seq), m, &err)) {
+                if (errors) *errors << QString::fromStdString(err);
+                continue;
+            }
+            m.bin = bin.toStdString();
+            items.push_back(m);
+            continue;
+        }
+        // A layered Photoshop file, in layers or as a sequence when so preferred (a step of its own).
+        if (const QString how = appSettings().value(QStringLiteral("import/psd"), QStringLiteral("merged")).toString();
+            !fi.isDir() && isPsdFile(path.toStdString()) && how != QLatin1String("merged")) {
+            QString err;
+            const auto layers = importPsd(path, how == QLatin1String("sequence") ? PsdImport::Sequence : PsdImport::Layers, &err);
+            if (layers.empty() && errors) *errors << err;
+            fromFolders.insert(fromFolders.end(), layers.begin(), layers.end());
+            continue;
+        }
         if (fi.isDir()) {
             QStringList children;
             for (const QFileInfo& c : QDir(path).entryInfoList(QDir::Files, QDir::Name)) children << c.absoluteFilePath();
-            auto ids = importFiles(children, errors, fi.fileName());
-            (void)ids;
+            const auto inFolder = importFiles(children, errors, bin.isEmpty() ? fi.fileName() : bin + "/" + fi.fileName());
+            fromFolders.insert(fromFolders.end(), inFolder.begin(), inFolder.end());
             continue;
         }
         MediaItem m;
@@ -271,7 +807,7 @@ std::vector<Id> EditorState::importFiles(const QStringList& paths, QStringList* 
         m.bin = bin.toStdString();
         items.push_back(m);
     }
-    std::vector<Id> ids;
+    std::vector<Id> ids = fromFolders;
     if (items.empty()) return ids;
     edit(items.size() == 1 ? tr("Import %1").arg(QString::fromStdString(items[0].name)) : tr("Import %n Files", "", int(items.size())),
          [&](Project& p, Sequence&) {
@@ -294,6 +830,7 @@ bool EditorState::removeMedia(Id id, QString* error) {
         return false;
     }
     QString name = QString::fromStdString(m->name);
+    const Id removedSource = sourceMedia_;
     bool ok = edit(tr("Remove %1").arg(name), [id](Project& p, Sequence&) {
         for (auto& s : p.sequences) {
             std::vector<Id> uses;
@@ -310,18 +847,38 @@ bool EditorState::removeMedia(Id id, QString* error) {
                                              [sid](const Sequence& s) { return s.id == sid; }),
                               p.sequences.end());
         }
-        p.media.erase(std::remove_if(p.media.begin(), p.media.end(), [id](const MediaItem& x) { return x.id == id; }),
+        // Its subclips go with it.
+        p.media.erase(std::remove_if(p.media.begin(), p.media.end(), [id](const MediaItem& x) { return x.id == id || x.subclipOf == id; }),
                       p.media.end());
         return true;
     });
-    if (ok && sourceMedia_ == id) setSourceMedia(0);
+    if (ok && removedSource == id) setSourceMedia(0);
     return ok;
 }
 
 void EditorState::setSourceMedia(Id id) {
     sourceMedia_ = id;
     sourceIn_ = sourceOut_ = -1;
+    if (const MediaItem* m = project_.findMedia(id); m && m->subclipOf && project_.findMedia(m->subclipOf)) {
+        const double fps = sequence() ? sequence()->fpsValue() : 30.0;
+        sourceMedia_ = m->subclipOf;
+        sourceIn_ = FrameTime(std::floor(m->subclipIn * fps + 1e-6));
+        sourceOut_ = std::max(sourceIn_, FrameTime(std::ceil(m->subclipOut * fps - 1e-6)) - 1);
+    }
     emit sourceChanged();
+}
+
+Id EditorState::makeSubclip(Id media, FrameTime in, FrameTime out, const QString& name) {
+    const double fps = sequence() ? sequence()->fpsValue() : 30.0;
+    auto sub = montage::makeSubclip(project_, media, double(in) / fps, double(out + 1) / fps, name.toStdString());
+    if (!sub) return 0;
+    Id id = 0;
+    edit(tr("Make Subclip"), [&](Project& p, Sequence&) {
+        sub->id = id = p.newId();
+        p.media.push_back(*sub);
+        return true;
+    });
+    return id;
 }
 
 void EditorState::setSourceIn(FrameTime t) {
@@ -336,7 +893,15 @@ void EditorState::setSourceOut(FrameTime t) {
     emit sourceChanged();
 }
 
-bool EditorState::insertFromSource(bool overwriteMode) {
+void EditorState::setSequencesAsClips(bool on) {
+    if (sequencesAsClips_ == on) return;
+    sequencesAsClips_ = on;
+    emit sequencesAsClipsChanged(on);
+}
+
+bool EditorState::insertFromSource(bool overwriteMode) { return sourceEdit(overwriteMode ? SourceEdit::Overwrite : SourceEdit::Insert); }
+
+bool EditorState::sourceEdit(SourceEdit mode) {
     const MediaItem* m = project_.findMedia(sourceMedia_);
     const Sequence* s = sequence();
     if (!m || !s) {
@@ -352,16 +917,59 @@ bool EditorState::insertFromSource(bool overwriteMode) {
     double out = sourceOut_ >= 0 ? double(sourceOut_ + 1) : -1.0;
     TrackRef vt{TrackKind::Video, std::min(targetVideo_, int(s->videoTracks.size()) - 1)};
     TrackRef at_{TrackKind::Audio, std::min(targetAudio_, int(s->audioTracks.size()) - 1)};
+    const bool insertMode = mode == SourceEdit::Insert || mode == SourceEdit::SmartInsert;
+    // Ripple Overwrite replaces the clip under the playhead on the target video track (else the audio one).
+    Id replaced = 0;
+    if (mode == SourceEdit::RippleOverwrite) {
+        const Clip* c = edit::clipAt(*s, vt, s->playhead);
+        if (!c) c = edit::clipAt(*s, at_, s->playhead);
+        if (!c) {
+            message(tr("Put the playhead over the clip to replace"));
+            return false;
+        }
+        replaced = c->id;
+    } else if (mode == SourceEdit::SmartInsert) {
+        at = edit::nearestEdit(*s, vt, s->playhead);
+    } else if (mode == SourceEdit::Append) {
+        at = s->duration();
+    }
     std::vector<Id> created;
     bool matched = false;
-    bool ok = apply(overwriteMode ? tr("Overwrite") : tr("Insert"), [&](Project& p, Sequence& sq) {
+    const QString label = mode == SourceEdit::Overwrite         ? tr("Overwrite")
+                          : mode == SourceEdit::Append          ? tr("Append at End")
+                          : mode == SourceEdit::PlaceOnTop      ? tr("Place on Top")
+                          : mode == SourceEdit::RippleOverwrite ? tr("Ripple Overwrite")
+                          : mode == SourceEdit::SmartInsert     ? tr("Smart Insert")
+                                                                : tr("Insert");
+    // A sequence as its own clips (insert, overwrite, append, smart insert), at the same frame rate; else nested.
+    const bool asClips = sequencesAsClips_ && m->kind == MediaKind::Sequence && mode != SourceEdit::PlaceOnTop &&
+                         mode != SourceEdit::RippleOverwrite;
+    bool nestedInstead = false;
+    FrameTime placedEnd = -1;  // where the sequence's clips end (the first created is not the last)
+    bool ok = apply(label, [&](Project& p, Sequence& sq) {
         matched = edit::matchSequenceToMedia(sq, *m);
-        auto r = edit::placeMedia(p, sq, m->id, at, in, out, vt, at_, !overwriteMode);
+        if (asClips) {
+            const Sequence* src = p.findSequence(m->sequenceId);
+            if (src && src->fps == sq.fps) {
+                edit::Result r = edit::placeSequenceClips(p, sq, m->sequenceId, FrameTime(in), out < 0 ? -1 : FrameTime(out), at, vt.index,
+                                                          at_.index, insertMode);
+                const FrameTime end = out < 0 ? src->duration() : std::min(FrameTime(out), src->duration());
+                placedEnd = at + std::max<FrameTime>(0, end - FrameTime(in));
+                created = r.created;
+                return r;
+            }
+            nestedInstead = true;
+        }
+        edit::Result r = mode == SourceEdit::PlaceOnTop        ? edit::placeOnTop(p, sq, m->id, at, in, out, vt, at_)
+                         : mode == SourceEdit::RippleOverwrite ? edit::rippleOverwrite(p, sq, replaced, m->id, in, out, vt, at_)
+                                                               : edit::placeMedia(p, sq, m->id, at, in, out, vt, at_, insertMode);
         created = r.created;
         return r;
     });
+    if (ok && nestedInstead) message(tr("%1 runs at another frame rate, so it went in nested").arg(QString::fromStdString(m->name)), 6000);
     if (ok && !created.empty()) {
-        if (const Clip* c = edit::clipById(*sequence(), created.front())) setPlayhead(c->end());
+        if (placedEnd >= 0) setPlayhead(placedEnd);
+        else if (const Clip* c = edit::clipById(*sequence(), created.front())) setPlayhead(c->end());
         setSelection(created);
         if (matched) message(tr("Sequence settings changed to match %1").arg(QString::fromStdString(m->name)), 6000);
     }
@@ -377,6 +985,7 @@ void EditorState::setActiveSequence(Id id) {
     project_.activeSequence = id;
     selection_.clear();
     selectedTransition_ = 0;
+    inspectedChain_ = 0;
     history_.touch();
     emit sequenceSwitched();
     emit selectionChanged();
@@ -410,38 +1019,109 @@ Id EditorState::newSequence(const QString& name, int w, int h, Rational fps) {
 
 bool EditorState::save(const QString& path, QString* error) {
     if (gesture_) endGesture(true);
+    const bool sameFile = samePath(path, path_);
+    if (sameFile && readOnly_) {
+        if (error)
+            *error = lockHolder_.isEmpty() ? tr("The project is open read-only: use Edit Project, or Save As to keep a copy of your own")
+                                           : tr("%1 is editing this project: Save As to keep a copy of your own").arg(lockHolder_);
+        return false;
+    }
+    if (sameFile && holdsLock_ && !refreshProjectLock(path.toStdString())) {
+        // Taken over while this machine slept or lost the drive: the other editor's work is not overwritten.
+        holdsLock_ = false;
+        readOnly_ = true;
+        lockHolder_ = QString::fromStdString(projectLockStatus(path.toStdString()).owner.describe());
+        emit lockStateChanged();
+        if (error) *error = tr("%1 took over this project: Save As to keep your changes").arg(lockHolder_);
+        return false;
+    }
+    bool newLock = false;
+    if (!sameFile) {
+        LockOwner holder;
+        const LockResult r = acquireProjectLock(path.toStdString(), &holder);
+        if (r == LockResult::HeldByOther) {
+            if (error) *error = tr("%1 is editing %2").arg(QString::fromStdString(holder.describe()), QFileInfo(path).fileName());
+            return false;
+        }
+        newLock = r == LockResult::Acquired;
+    }
     Project p = project_;
     if (p.name.empty() || p.name == "Untitled") p.name = QFileInfo(path).completeBaseName().toStdString();
     std::string err;
     if (!saveProject(p, path.toStdString(), &err)) {
+        if (newLock) releaseProjectLock(path.toStdString());
         if (error) *error = QString::fromStdString(err);
         return false;
+    }
+    if (!sameFile) {
+        releaseLock();
+        holdsLock_ = newLock;
+        if (readOnly_ || !lockHolder_.isEmpty()) {
+            readOnly_ = false;
+            lockHolder_.clear();
+            emit lockStateChanged();
+        }
     }
     project_.name = p.name;
     path_ = path;
     savedRevision_ = history_.revision();
+    diskTime_ = QFileInfo(path).lastModified();
+    lastRefresh_ = QDateTime::currentDateTimeUtc();
     QFile::remove(path + ".autosave");
     emit fileStateChanged();
     return true;
 }
 
-bool EditorState::open(const QString& path, QString* error) {
+void EditorState::releaseLock() {
+    if (holdsLock_ && !path_.isEmpty()) releaseProjectLock(path_.toStdString());
+    holdsLock_ = false;
+}
+
+bool EditorState::open(const QString& path, QString* error, Access access) {
     Project p;
     std::string err;
     if (!loadProject(path.toStdString(), p, &err)) {
         if (error) *error = QString::fromStdString(err);
         return false;
     }
+    checkStereoMedia(p);
+    const bool sameFile = samePath(path, path_);
+    LockResult lock = LockResult::Unavailable;
+    LockOwner holder;
+    if (access != Access::ReadOnly) {
+        lock = acquireProjectLock(path.toStdString(), &holder);
+        if (lock == LockResult::HeldByOther && access == Access::Edit) {
+            if (error) *error = tr("%1 is editing this project").arg(QString::fromStdString(holder.describe()));
+            return false;
+        }
+    } else {
+        const LockStatus st = projectLockStatus(path.toStdString());
+        if (st.state == LockState::Theirs) holder = st.owner;
+        if (sameFile && st.state == LockState::Mine) releaseProjectLock(path.toStdString());
+    }
+    if (!sameFile) releaseLock();
+    holdsLock_ = lock == LockResult::Acquired;
+    readOnly_ = access == Access::ReadOnly || lock == LockResult::HeldByOther;
+    lockHolder_ = readOnly_ && !holder.host.empty() ? QString::fromStdString(holder.describe()) : QString();
+    lockFree_ = readOnly_ && lockHolder_.isEmpty();
+    diskTime_ = QFileInfo(path).lastModified();
+    lastRefresh_ = QDateTime::currentDateTimeUtc();
     if (gesture_) gesture_.reset();
+    ++projectGeneration_;
     project_ = std::move(p);
+    // The last project's files are let go (idle decoders keep them open, which on Windows stops their folder being
+    // moved or renamed, as when a card is relinked).
+    MediaPool::instance().clear();
     history_.clear();
     savedRevision_ = history_.revision();
     path_ = path;
     selection_.clear();
     selectedTransition_ = 0;
+    inspectedChain_ = 0;
     sourceMedia_ = 0;
     sourceIn_ = sourceOut_ = -1;
     targetVideo_ = targetAudio_ = 0;
+    offlineChecked_.clear();
     for (const auto& m : project_.media) startAudioDecode(m);
     emit sequenceSwitched();
     emit selectionChanged();
@@ -449,12 +1129,124 @@ bool EditorState::open(const QString& path, QString* error) {
     emit projectChanged();
     emit historyChanged();
     emit fileStateChanged();
+    emit lockStateChanged();
     return true;
 }
 
-void EditorState::newProject() {
+bool EditorState::canTakeEdit() const {
+    if (!readOnly_ || path_.isEmpty()) return false;
+    const LockState s = projectLockStatus(path_.toStdString()).state;
+    return s == LockState::Free || s == LockState::Stale || s == LockState::Mine;
+}
+
+bool EditorState::takeEdit(QString* error, bool discardChanges) {
+    if (!readOnly_) return true;
+    if (path_.isEmpty()) return false;
+    if (isModified() && !discardChanges) {
+        if (error) *error = tr("Your changes here are not saved: Save As to keep them, or discard them to edit the saved project");
+        return false;
+    }
+    LockOwner holder;
+    const LockResult r = acquireProjectLock(path_.toStdString(), &holder);
+    if (r == LockResult::HeldByOther) {
+        lockHolder_ = QString::fromStdString(holder.describe());
+        if (error) *error = tr("%1 is editing this project").arg(lockHolder_);
+        emit lockStateChanged();
+        return false;
+    }
+    if (r == LockResult::Unavailable) {
+        if (error) *error = tr("The project's folder cannot be written to");
+        return false;
+    }
+    holdsLock_ = true;
+    if (!reloadFromDisk()) {  // the latest saved version, not what was on screen when its editor last saved
+        releaseLock();
+        if (error) *error = tr("The project could not be read again");
+        return false;
+    }
+    readOnly_ = false;
+    lockHolder_.clear();
+    lockFree_ = false;
+    lastRefresh_ = QDateTime::currentDateTimeUtc();
+    emit lockStateChanged();
+    emit fileStateChanged();
+    message(tr("You are editing %1").arg(QFileInfo(path_).fileName()), 4000);
+    return true;
+}
+
+bool EditorState::reloadFromDisk() {
+    Project p;
+    if (!loadProject(path_.toStdString(), p)) return false;  // being written just now: tried again later
+    checkStereoMedia(p);
+    std::map<Id, FrameTime> heads;
+    for (const Sequence& s : project_.sequences) heads[s.id] = s.playhead;
+    for (Sequence& s : p.sequences)
+        if (const auto it = heads.find(s.id); it != heads.end()) s.playhead = it->second;
+    if (p.findSequence(project_.activeSequence)) p.activeSequence = project_.activeSequence;
+    const bool switched = p.activeSequence != project_.activeSequence;
     if (gesture_) gesture_.reset();
+    ++projectGeneration_;
+    std::set<std::string> known;
+    for (const MediaItem& m : project_.media) known.insert(m.path);
+    project_ = std::move(p);
+    history_.clear();
+    savedRevision_ = history_.revision();
+    diskTime_ = QFileInfo(path_).lastModified();
+    offlineChecked_.clear();
+    for (const MediaItem& m : project_.media)
+        if (!known.count(m.path)) startAudioDecode(m);
+    pruneSelection();
+    if (switched) emit sequenceSwitched();
+    emit projectChanged();
+    emit historyChanged();
+    emit fileStateChanged();
+    return true;
+}
+
+void EditorState::checkSharedState(bool renewNow) {
+    if (path_.isEmpty()) return;
+    const std::string path = path_.toStdString();
+    if (holdsLock_) {
+        if (!renewNow && lastRefresh_.isValid() && lastRefresh_.secsTo(QDateTime::currentDateTimeUtc()) < 30) return;
+        lastRefresh_ = QDateTime::currentDateTimeUtc();
+        if (refreshProjectLockState(path) == RefreshResult::Lost) {
+            holdsLock_ = false;
+            readOnly_ = true;
+            lockHolder_ = QString::fromStdString(projectLockStatus(path).owner.describe());
+            message(tr("%1 took over this project: it is read-only now (Save As keeps your changes)").arg(lockHolder_), 8000);
+            emit lockStateChanged();
+        }
+        return;
+    }
+    if (!readOnly_) return;  // opened without a lock (its folder cannot be written to)
+    // Saved by its editor: read again (never over changes of this editor's not yet saved: Save As keeps them).
+    const QFileInfo fi(path_);
+    if (!isModified() && fi.exists() && fi.lastModified() != diskTime_ && reloadFromDisk())
+        message(tr("%1 was saved by %2: showing the latest").arg(fi.fileName(), lockHolder_.isEmpty() ? tr("its editor") : lockHolder_), 4000);
+    // Let go, or taken by someone else?
+    const LockStatus st = projectLockStatus(path);
+    const bool free = st.state != LockState::Theirs;
+    const QString who = st.state == LockState::Theirs ? QString::fromStdString(st.owner.describe()) : QString();
+    if (free != lockFree_ || who != lockHolder_) {
+        lockFree_ = free;
+        lockHolder_ = who;
+        if (free) message(tr("%1 is free to edit: File › Edit Project").arg(fi.fileName()), 8000);
+        emit lockStateChanged();
+    }
+}
+
+void EditorState::newProject() {
+    releaseLock();
+    if (readOnly_ || !lockHolder_.isEmpty()) {
+        readOnly_ = false;
+        lockHolder_.clear();
+        lockFree_ = false;
+        emit lockStateChanged();
+    }
+    if (gesture_) gesture_.reset();
+    ++projectGeneration_;
     project_ = makeDefaultProject();
+    MediaPool::instance().clear();  // let the last project's files go
     history_.clear();
     savedRevision_ = history_.revision();
     path_.clear();
@@ -471,17 +1263,26 @@ void EditorState::newProject() {
     emit fileStateChanged();
 }
 
-void EditorState::autosave() {
-    if (!isModified()) return;
-    QString target;
+bool EditorState::recover(const QString& copy, const QString& originalPath, QString* error) {
+    if (!open(copy, error, Access::ReadOnly)) return false;  // the recovery copy is never locked
+    readOnly_ = false;
+    lockHolder_.clear();
+    lockFree_ = false;
+    path_ = originalPath;
     if (!path_.isEmpty()) {
-        target = path_ + ".autosave";
-    } else {
-        QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
-        QDir().mkpath(dir);
-        target = dir + "/untitled.montage.autosave";
+        LockOwner holder;
+        const LockResult r = acquireProjectLock(path_.toStdString(), &holder);
+        holdsLock_ = r == LockResult::Acquired;
+        if (r == LockResult::HeldByOther) {
+            readOnly_ = true;  // someone else is editing the project meanwhile: Save As keeps what was recovered
+            lockHolder_ = QString::fromStdString(holder.describe());
+        }
+        diskTime_ = QFileInfo(path_).lastModified();
     }
-    saveProject(project_, target.toStdString());
+    savedRevision_ = ~uint64_t(0);  // never equal to a real revision: unsaved until saved
+    emit fileStateChanged();
+    emit lockStateChanged();
+    return true;
 }
 
 }  // namespace montage

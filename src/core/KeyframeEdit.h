@@ -1,0 +1,82 @@
+// Montage — editing a parameter's keyframes directly, as the timeline's
+// lines over clips do (volume on audio clips, opacity on video clips):
+// dragging the line between two keys, moving a key in time and value, and
+// the scale volume lines are drawn on.
+#pragma once
+
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "Model.h"
+
+namespace montage {
+
+// Volume lines run from silence at the bottom to +6 dB at the top, linear in
+// the square root of amplitude (0 dB sits at 71 %, -6 dB at half height).
+constexpr double kGainLineMinDb = -60.0;
+constexpr double kGainLineMaxDb = 6.0;
+double gainToLevel(double db);     // 0 (bottom) to 1 (top)
+double levelToGain(double level);  // clamped to [kGainLineMinDb, kGainLineMaxDb]
+
+// Adds `delta` to the line at clip-local time t: to the static value, or to
+// the two keys around t (to the first or last key outside them). Values stay
+// within [lo, hi].
+void offsetLine(Param& p, FrameTime t, double delta, double lo, double hi);
+// Moves the key at `from` to time `to`, kept between its neighbours and
+// within [0, last], with value v. Returns its new time, or -1 if no key is at `from`.
+FrameTime moveKey(Param& p, FrameTime from, FrameTime to, double v, FrameTime last);
+
+// Easing (After Effects' Easy Ease): the key's value arrives (`in`) and/or
+// leaves (`out`) slowly, with flat Bezier handles a third of the way to the
+// neighbouring key. A straight segment it touches keeps its straight start.
+// False if no key is at t.
+bool easeKey(Param& p, FrameTime t, bool in, bool out);
+// Puts one of a key's handles (the outgoing one, or the incoming) at
+// (dt, dv) from the key, turning the segment it shapes to Bezier. With
+// `linked` the other handle turns to the same slope, keeping its length, so
+// the curve stays smooth through the key. False if no key is at t.
+bool setKeyHandle(Param& p, FrameTime t, bool out, double dt, double dv, bool linked);
+
+// Which of a clip's parameters: one of its fixed attributes, its generator,
+// or one of its effects (by id).
+enum class ParamSlot { Motion, Audio, Timing, Generator, Effect };
+struct ParamAddress {
+    ParamSlot slot = ParamSlot::Motion;
+    Id effect = 0;  // for ParamSlot::Effect
+    std::string param;
+    bool operator==(const ParamAddress&) const = default;
+    auto operator<=>(const ParamAddress&) const = default;
+};
+Effect* paramOwner(Clip& c, const ParamAddress& a);
+const Effect* paramOwner(const Clip& c, const ParamAddress& a);
+Param* findParam(Clip& c, const ParamAddress& a);
+const Param* findParam(const Clip& c, const ParamAddress& a);
+
+// Moving several keys of a parameter by the same number of frames: how far
+// they can go (down, up) without passing the keys that stay or leaving
+// [0, last]; and the move itself (which assumes it is within that range).
+std::pair<FrameTime, FrameTime> shiftRange(const Param& p, const std::vector<FrameTime>& keys, FrameTime last);
+void shiftKeys(Param& p, const std::vector<FrameTime>& keys, FrameTime delta);
+
+// Copying and pasting keyframes (After Effects, Premiere, Resolve): the keys
+// of each parameter, timed from the earliest key copied, pasted at a clip
+// frame into the same parameter of the same clip or another one (an effect's
+// parameters go to that effect if the clip has it, else to its first effect
+// of the same type). Pasted keys replace any at the same frames.
+struct CopiedKeys {
+    struct Lane {
+        ParamAddress address;
+        std::string effectType;  // for ParamSlot::Effect
+        std::vector<Keyframe> keys;
+    };
+    std::vector<Lane> lanes;
+    bool empty() const { return lanes.empty(); }
+};
+CopiedKeys copyKeys(const Clip& c, const std::vector<std::pair<ParamAddress, FrameTime>>& keys);
+// The parameter of `target` a copied lane goes to (nullptr if it has none such).
+Effect* pasteOwner(Clip& target, const CopiedKeys::Lane& lane);
+// Returns how many keys were pasted.
+int pasteKeys(Clip& target, const CopiedKeys& keys, FrameTime at);
+
+}  // namespace montage

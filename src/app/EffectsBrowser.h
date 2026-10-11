@@ -1,5 +1,5 @@
 // Montage — effects browser: searchable tree of video / audio effects,
-// transitions and generators. Leaves can be dragged onto clips or edit points
+// transitions, generators and installed audio plugins. Leaves can be dragged onto clips or edit points
 // (mime type kEffectMimeType, payload = effect type) or applied with
 // double-click / Enter.
 #pragma once
@@ -26,6 +26,8 @@ public:
     // Filters the tree as if `text` had been typed in the search field.
     void setFilterText(const QString& text);
     QString filterText() const;
+    // Rebuilds the tree, e.g. after a plugin scan.
+    void reload() { populate(); }
 
 signals:
     void applyRequested(const QString& type, montage::EffectCategory category);

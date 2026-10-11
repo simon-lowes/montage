@@ -31,6 +31,12 @@ public:
     uint64_t revision() const { return revision_; }
     // Marks a change that is merged into the latest undo step (or not undoable).
     void touch() { ++revision_; }
+    // Every state undo and redo can return to (a fact about the files, not an edit, set in all of them).
+    template <class F>
+    void forEachState(F&& f) {
+        for (Entry& e : undo_) f(e.state);
+        for (Entry& e : redo_) f(e.state);
+    }
 
 private:
     struct Entry {
