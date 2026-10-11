@@ -2390,8 +2390,10 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
         const Track& track = seq.audioTracks[ti];
         if (onlyTrack >= 0 ? int(ti) != onlyTrack : (track.muted || (anySolo && !track.solo))) continue;
         if (depth == 0 && !mask_.empty() && (ti >= mask_.size() || !mask_[ti])) continue;
+        // An ADM object in the bed: only its LFE send and its aux sends are heard there.
         const bool lfeOnly = depth == 0 && ti < lfeOnly_.size() && lfeOnly_[ti];
-        if (lfeOnly && (!surround || lfeCh < 0 || track.output || track.surround.lfeDb <= -99)) continue;
+        const bool lfeSend = lfeOnly && surround && lfeCh >= 0 && track.surround.lfeDb > -99;
+        if (lfeOnly && (track.output || (!lfeSend && track.sends.empty()))) continue;
         auto bus = track.output ? busBufs.find(track.output) : busBufs.end();
         const int64_t downstream = masterLat + (bus != busBufs.end() ? busLat[bus->first] : 0);
         const int64_t trackLat = chainLatency(track.effects, track.id, sr);
@@ -2419,7 +2421,7 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
         // mute; post-fader ones what leaves the fader and pan, below. Each at its own level, its lane gliding as the
         // fader's does. (A send whose bus has another plugin delay than the track's output is not realigned.)
         auto sendDest = [&](const Send& sd) -> float* {
-            if (sd.muted) return nullptr;
+            if (sd.muted || sd.bus == track.output) return nullptr;  // (not twice into the bus it feeds)
             auto it = busBufs.find(sd.bus);
             return it == busBufs.end() ? nullptr : it->second.data();
         };
@@ -2495,9 +2497,12 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
             if (postSends)
                 for (size_t i = 0; i < size_t(frames) * 2; ++i) postBuf[i] = trackBuf[i] * tg;
             if (lfeOnly) {
-                const float lfe = float(std::pow(10.0, track.surround.lfeDb / 20));
-                for (int i = 0; i < frames; ++i)
-                    master[size_t(i) * size_t(nch) + size_t(lfeCh)] += 0.70710678f * (trackBuf[size_t(i) * 2] + trackBuf[size_t(i) * 2 + 1]) * tg * lfe;
+                if (lfeSend) {
+                    const float lfe = float(std::pow(10.0, track.surround.lfeDb / 20));
+                    for (int i = 0; i < frames; ++i)
+                        master[size_t(i) * size_t(nch) + size_t(lfeCh)] +=
+                            0.70710678f * (trackBuf[size_t(i) * 2] + trackBuf[size_t(i) * 2 + 1]) * tg * lfe;
+                }
             } else if (readsLanes && surroundAnimated(track)) {
                 // A moving position (its x, y, z lanes): the speakers' gains glide from one 64-sample step to the next.
                 SurroundGains g0 = surroundGains(seq.audioLayout, trackSurroundAt(track, double(heard) * fps / sr));
@@ -2524,8 +2529,10 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
             for (int i = 0; i < frames; ++i) {
                 if (panAuto && i % 64 == 0) panGains(trackPanAt(track, double(heard + i) * fps / sr), tl, tr);
                 float l = trackBuf[size_t(i) * 2] * tg * tl, r = trackBuf[size_t(i) * 2 + 1] * tg * tr;
-                dest[i * 2] += l;
-                dest[i * 2 + 1] += r;
+                if (!lfeOnly) {  // (an object in a bed without speakers to pan to: only its sends)
+                    dest[i * 2] += l;
+                    dest[i * 2 + 1] += r;
+                }
                 if (postSends) postBuf[size_t(i) * 2] = l, postBuf[size_t(i) * 2 + 1] = r;
                 lv.peakL = std::max(lv.peakL, std::fabs(l));
                 lv.peakR = std::max(lv.peakR, std::fabs(r));

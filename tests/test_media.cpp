@@ -6543,6 +6543,32 @@ private slots:
             QVERIFY2(std::fabs(ch[3] - sub) < 0.01, qPrintable(QString("%1 vs %2").arg(ch[3]).arg(sub)));
             QVERIFY(std::fabs(ch[12] - atSpeaker) < 0.01 && ch[9] < 1e-4);
         }
+        // An object's aux send: the return is heard in the bed, once even with an LFE send too, and the object stays dry.
+        {
+            Sequence sent = s;
+            Bus ret;
+            ret.id = p.newId();
+            ret.name = "Return";
+            sent.buses.push_back(ret);
+            Send toRet;
+            toRet.bus = ret.id;
+            sent.audioTracks[1].sends.push_back(toRet);
+            auto bedSend = [&](const std::vector<double>& c) {  // every bed channel but L (the 440) and the LFE
+                double acc = 0;
+                for (int k : {1, 2, 4, 5, 6, 7, 8, 9, 10, 11}) acc += c[size_t(k)] * c[size_t(k)];
+                return std::sqrt(acc);
+            };
+            QVERIFY(exportAdmBwf(p, sent, st, path("sent.wav"), &r, {}, &err) && r.objects == 1);
+            QVERIFY(fileRms(path("sent.wav"), ch));
+            QVERIFY2(std::fabs(ch[12] - atSpeaker) < 0.01, qPrintable(QString("%1 vs %2").arg(ch[12]).arg(atSpeaker)));
+            const double wet = bedSend(ch);
+            QVERIFY2(wet > 0.05, qPrintable(QString::number(wet)));
+            sent.audioTracks[1].surround.lfeDb = 0;
+            QVERIFY(exportAdmBwf(p, sent, st, path("sentLfe.wav"), &r, {}, &err));
+            QVERIFY(fileRms(path("sentLfe.wav"), ch));
+            QVERIFY2(std::fabs(bedSend(ch) - wet) < 0.01, qPrintable(QString("%1 vs %2").arg(bedSend(ch)).arg(wet)));
+            QVERIFY(std::fabs(ch[12] - atSpeaker) < 0.01 && ch[3] > 0.05);
+        }
         // A track sent to a bus is heard through the bus, so it stays in the bed.
         {
             Sequence routed = s;
@@ -12644,10 +12670,13 @@ private slots:
             QCOMPARE(t.sends.size(), size_t(1));
             QCOMPARE(t.sends[0].bus, ms.buses[0].id);
             QVERIFY(t.sends[0].preFader && t.sends[0].levelDb == -8 && t.sends[0].levelAuto.keys.size() == 2);
-            QCOMPARE(t.muteAuto.keys.size(), size_t(2));
-            QVERIFY(t.muteAuto.keys[0].interp == Interp::Hold && t.muteAuto.keys[0].v == 1);
+            // A switch: unmuted before its first point (a key just before it), muted from it to the next.
+            QCOMPARE(t.muteAuto.keys.size(), size_t(3));
+            QVERIFY(t.muteAuto.keys[0].v == 0 && t.muteAuto.keys[1].interp == Interp::Hold && t.muteAuto.keys[1].v == 1);
+            QVERIFY(!laneMuted(t.muteAuto, false, 0) && laneMuted(t.muteAuto, false, double(t.muteAuto.keys[1].t)));
             QCOMPARE(ms.buses[0].automation, int(AutomationMode::Touch));
-            QVERIFY(ms.buses[0].volumeAuto.keys.size() == 1 && ms.buses[0].muteAuto.keys.size() == 1);
+            QVERIFY(ms.buses[0].volumeAuto.keys.size() == 1 && ms.buses[0].muteAuto.keys.size() == 2);
+            QVERIFY(!laneMuted(ms.buses[0].muteAuto, false, 0));
         }
         QVERIFY(tool("montage_automate_track", QJsonObject{{"project", project}, {"bus", "Nowhere"}, {"mode", "read"}}).value("isError").toBool());
         // Insert parameter points: an EQ's mid band ridden, Channel Tools' mode (a choice) switched and held.
@@ -12681,7 +12710,7 @@ private slots:
             const FrameTime end = midLane.keys.back().t, half = end / 2;  // a ramp between the points
             QCOMPARE(eqFx->p("mid_db", half), 24.0 * double(half) / double(end));
             const Param& modeLane = chFx->params.at("mode");
-            QVERIFY(modeLane.keys.size() == 1 && modeLane.keys[0].interp == Interp::Hold && modeLane.keys[0].v == 1);
+            QVERIFY(modeLane.keys.size() == 2 && modeLane.keys[0].v == 0 && modeLane.keys[1].interp == Interp::Hold && modeLane.keys[1].v == 1);
         }
         QVERIFY(tool("montage_automate_track", QJsonObject{{"project", project}, {"inserts", QJsonArray{QJsonObject{{"effect", eqId}, {"param", "nope"}}}}})
                     .value("isError").toBool());

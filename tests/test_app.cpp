@@ -1006,11 +1006,38 @@ private slots:
         QVERIFY(!a1().muteAuto.animated() && !a1().sends[0].levelAuto.animated());
         state()->redo();
         QVERIFY(a1().muteAuto.animated());
-        // The mute button follows its lane at the playhead.
+        // The mute button follows its lane at the playhead, and clicked there switches the lane to its next point.
         state()->setPlayhead(10);
         QVERIFY(!mixer->trackMute(0)->isChecked());
         state()->setPlayhead(30);
         QVERIFY(mixer->trackMute(0)->isChecked());
+        mixer->trackMute(0)->click();
+        QVERIFY(!mixer->trackMute(0)->isChecked());
+        QVERIFY(!a1().muted && !trackMutedAt(a1(), 30) && !trackMutedAt(a1(), 45) && trackMutedAt(a1(), 25));
+        state()->undo();
+        QVERIFY(trackMutedAt(a1(), 30));
+        state()->setPlayhead(10);
+        mixer->trackMute(0)->click();  // before the lane mutes: muted from here, the start as it was
+        QVERIFY(trackMutedAt(a1(), 10) && trackMutedAt(a1(), 15) && !trackMutedAt(a1(), 5) && !a1().muted);
+        state()->undo();
+        // No send to the bus the track goes to; routing it to a bus it sends to drops that send.
+        QVERIFY(!state()->apply("Send", [ret](Project&, Sequence& s) {
+            s.audioTracks[0].output = ret;
+            return edit::setSend(s, 0, ret, 0, false);
+        }));
+        QCOMPARE(a1().output, Id(0));
+        {
+            QComboBox* out = mixer->trackFader(0)->parentWidget()->findChild<QComboBox*>("outputCombo");  // A1's strip
+            QVERIFY(out);
+            const int to = out->findData(QVariant::fromValue(qulonglong(ret)));
+            QVERIFY(to >= 0);
+            emit out->activated(to);
+            QCOMPARE(a1().output, ret);
+            QVERIFY(a1().sends.empty());
+            state()->undo();
+            QCOMPARE(a1().sends.size(), size_t(1));
+            QTRY_VERIFY(mixer->sendLevel(0, 0));
+        }
         // The return bus in Write: its fader -10 dB from frame 15; Write hands over to Touch.
         const int busIndex = int(seq()->buses.size()) - 1;
         QSlider* busFader = mixer->busFader(busIndex);
@@ -1042,6 +1069,14 @@ private slots:
         busFader->setValue(-30);
         QVERIFY(seq()->buses.back().volumeAuto.keyAt(25) && seq()->buses.back().volumeAuto.keyAt(25)->v == -3.0);
         QCOMPARE(seq()->buses.back().volumeDb, 0.0);
+        // A send set below the slider's -60 dB stays there through a Write pass that leaves it alone.
+        QVERIFY(state()->apply("Quiet", [ret](Project&, Sequence& s) { return edit::setSend(s, 0, ret, -90, false); }));
+        mixer->trackAutomationMode(0)->setCurrentIndex(int(AutomationMode::Write));
+        mixer->playbackStarted(0);
+        for (FrameTime f = 0; f <= 20; ++f) mixer->playbackPosition(f);
+        mixer->playbackStopped(20);
+        QCOMPARE(a1().sends[0].levelDb, -90.0);
+        QVERIFY(!a1().sends[0].levelAuto.animated() || std::fabs(a1().sends[0].levelAuto.at(10) - -90.0) < 1e-9);
         // Deleting the bus takes A1's send with it.
         QVERIFY(state()->apply("Delete Bus", [ret](Project&, Sequence& s) { return edit::removeBus(s, ret); }));
         QVERIFY(a1().sends.empty());

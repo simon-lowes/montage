@@ -2228,6 +2228,13 @@ void McpServer::Impl::addTools() {
                     keys.push_back(k);
                 }
                 std::sort(keys.begin(), keys.end(), [](const Keyframe& x, const Keyframe& y) { return x.t < y.t; });
+                // A switch stays as it was before its first point (a lane's first key otherwise reaches back to the start).
+                const FrameTime first = keys.front().t;
+                if (hold && first > 0 && std::none_of(lane.keys.begin(), lane.keys.end(), [&](const Keyframe& k) { return k.t < first; })) {
+                    Keyframe before{first - 1, std::round(lane.animated() ? lane.at(first - 1) : lane.value)};
+                    before.interp = Interp::Hold;
+                    keys.insert(keys.begin(), before);
+                }
                 std::erase_if(lane.keys, [&](const Keyframe& k) { return k.t >= keys.front().t && k.t <= keys.back().t; });
                 for (const Keyframe& k : keys) lane.keys.push_back(k);
                 std::sort(lane.keys.begin(), lane.keys.end(), [](const Keyframe& x, const Keyframe& y) { return x.t < y.t; });

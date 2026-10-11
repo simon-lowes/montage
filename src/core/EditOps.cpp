@@ -1108,10 +1108,20 @@ Result deleteGaps(Project& p, Sequence& s, bool leading, int* closed, FrameTime*
                 if (c.start >= b) c.start -= len;
             shiftParam(t->volumeAuto, b, len);
             shiftParam(t->panAuto, b, len);
+            shiftParam(t->muteAuto, b, len);
             for (Param* lane : {&t->surroundXAuto, &t->surroundYAuto, &t->surroundZAuto}) shiftParam(*lane, b, len);
+            for (Send& sd : t->sends) shiftParam(sd.levelAuto, b, len);
             for (Effect& e : t->effects)
                 for (auto& [name, q] : e.params) shiftParam(q, b, len);
         }
+        // Buses and the master are keyed in timeline frames too.
+        for (Bus& bus : s.buses) {
+            for (Param* lane : {&bus.volumeAuto, &bus.panAuto, &bus.muteAuto}) shiftParam(*lane, b, len);
+            for (Effect& e : bus.effects)
+                for (auto& [name, q] : e.params) shiftParam(q, b, len);
+        }
+        for (Effect& e : s.masterEffects)
+            for (auto& [name, q] : e.params) shiftParam(q, b, len);
         for (CaptionTrack& ct : s.captionTracks) {
             for (Caption& c : ct.captions)
                 if (c.start >= b) {
@@ -1819,6 +1829,9 @@ Id duplicateSequence(Project& p, Id id, const std::string& name, std::map<Id, Id
         for (Track& t : *tracks) {
             t.id = p.newId();
             if (t.output) t.output = buses.count(t.output) ? buses[t.output] : 0;
+            // Sends go to the copy's buses (none to a bus that was not copied).
+            for (Send& sd : t.sends) sd.bus = buses.count(sd.bus) ? buses[sd.bus] : 0;
+            std::erase_if(t.sends, [](const Send& sd) { return !sd.bus; });
             for (Effect& e : t.effects) renew(e);
             for (Clip& c : t.clips) {
                 const Id fresh = p.newId();
@@ -2472,6 +2485,8 @@ Result setSend(Sequence& s, int audioTrack, Id bus, double levelDb, bool preFade
     if (audioTrack < 0 || audioTrack >= int(s.audioTracks.size())) return Result::fail("No such audio track");
     if (std::none_of(s.buses.begin(), s.buses.end(), [bus](const Bus& b) { return b.id == bus; })) return Result::fail("No such bus");
     Track& t = s.audioTracks[size_t(audioTrack)];
+    // A send to the bus the track already feeds would add it there twice.
+    if (t.output == bus) return Result::fail("The track already goes to that bus");
     auto it = std::find_if(t.sends.begin(), t.sends.end(), [bus](const Send& sd) { return sd.bus == bus; });
     if (it == t.sends.end()) {
         Send sd;

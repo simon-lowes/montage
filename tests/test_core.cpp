@@ -4821,6 +4821,54 @@ private slots:
         QCOMPARE(e.p("swap_eyes", 0, 99), 0.0);
     }
 
+    void sendsAndLanesFollowEdits() {
+        Project p = makeDefaultProject();
+        const Id seq = p.active()->id;
+        auto sq = [&]() -> Sequence& { return *p.findSequence(seq); };
+        sq().fps = Rational{25, 1};
+        auto place = [&](FrameTime start, FrameTime len) {
+            Clip c = makeGeneratorClip(p, "color", len);
+            c.start = start;
+            QVERIFY(edit::overwrite(p, sq(), {TrackKind::Video, 0}, c).ok);
+        };
+        place(10, 40);
+        place(80, 50);  // a gap from 50 to 80
+        Bus ret, sub;
+        ret.id = p.newId(), ret.name = "Reverb";
+        sub.id = p.newId(), sub.name = "Dialogue";
+        sq().buses = {ret, sub};
+        QVERIFY(edit::setSend(sq(), 0, ret.id, -6, false).ok);
+        // Not a send to the bus the track already goes to (it would be there twice).
+        sq().audioTracks[0].output = sub.id;
+        QVERIFY(!edit::setSend(sq(), 0, sub.id, 0, false).ok);
+        QCOMPARE(sq().audioTracks[0].sends.size(), size_t(1));
+        // Close Gaps moves every timeline lane after the gap up: the mute, a send's level, a bus's fader, pan and mute,
+        // and the keys of bus and master effects.
+        Track& a1 = sq().audioTracks[0];
+        a1.muteAuto.addKey(100, 1);
+        a1.sends[0].levelAuto.addKey(100, -3);
+        for (Param* lane : {&sq().buses[0].volumeAuto, &sq().buses[0].panAuto, &sq().buses[0].muteAuto}) lane->addKey(100, 1);
+        Effect busFx = makeEffect(p, "reverb");
+        busFx.params["mix"].addKey(100, 50);
+        sq().buses[0].effects.push_back(busFx);
+        Effect masterFx = makeEffect(p, "limiter");
+        masterFx.params["ceiling_db"].addKey(100, -3);
+        sq().masterEffects.push_back(masterFx);
+        QVERIFY(edit::deleteGaps(p, sq()).ok);
+        QCOMPARE(sq().audioTracks[0].muteAuto.keys.at(0).t, FrameTime(70));
+        QCOMPARE(sq().audioTracks[0].sends[0].levelAuto.keys.at(0).t, FrameTime(70));
+        for (const Param* lane : {&sq().buses[0].volumeAuto, &sq().buses[0].panAuto, &sq().buses[0].muteAuto}) QCOMPARE(lane->keys.at(0).t, FrameTime(70));
+        QCOMPARE(sq().buses[0].effects[0].params.at("mix").keys.at(0).t, FrameTime(70));
+        QCOMPARE(sq().masterEffects[0].params.at("ceiling_db").keys.at(0).t, FrameTime(70));
+        // A copy's sends go to its own buses.
+        const Id copy = edit::duplicateSequence(p, seq, "Copy");
+        const Sequence& d = *p.findSequence(copy);
+        QCOMPARE(d.audioTracks[0].sends.size(), size_t(1));
+        QVERIFY(d.buses.at(0).id != ret.id);
+        QCOMPARE(d.audioTracks[0].sends[0].bus, d.buses[0].id);
+        QCOMPARE(d.audioTracks[0].output, d.buses[1].id);
+    }
+
     void deleteGaps() {
         Project p = makeDefaultProject();
         Sequence& s = *p.active();
@@ -5612,6 +5660,19 @@ private slots:
             return q;
         };
         mix.adrCues = {adr("B1", 5, 30, 0), adr("D1", 90, 110, 0), adr("A1", 120, 140, title.id), adr("C1", 160, 175, 0)};
+        // A send's level, the mute lane and a bus's fader ride along with the fader's.
+        Bus ret;
+        ret.id = fx.p.newId();
+        ret.name = "Reverb";
+        mix.buses.push_back(ret);
+        Send toRet;
+        toRet.bus = ret.id;
+        toRet.levelAuto.addKey(0, 0);
+        toRet.levelAuto.addKey(180, -18);
+        mix.audioTracks[0].sends.push_back(toRet);
+        mix.audioTracks[0].muteAuto.keys = {Keyframe{70, 0, Interp::Hold}, Keyframe{80, 1, Interp::Hold}};
+        mix.buses[0].volumeAuto.addKey(0, 0);
+        mix.buses[0].volumeAuto.addKey(180, -18);
         fx.p.sequences.push_back(mix);
         QVERIFY(!reconformSequence(fx.p, mix.id, CutChanges{}, cut.id).sequence);  // nothing to conform to
         CutChanges at25 = ch;
@@ -5642,6 +5703,11 @@ private slots:
         QVERIFY(std::fabs(a.volumeAuto.at(120) - -8.0) < 1e-6);
         QVERIFY(std::fabs(a.volumeAuto.at(25) - -3.5) < 1e-6);
         QVERIFY(std::fabs(a.volumeAuto.at(70) - -12.0) < 1e-6);
+        QCOMPARE(a.sends.size(), size_t(1));
+        QCOMPARE(a.sends[0].bus, out.buses.at(0).id);
+        QVERIFY(std::fabs(a.sends[0].levelAuto.at(120) - -8.0) < 1e-6);
+        QVERIFY(std::fabs(out.buses[0].volumeAuto.at(120) - -8.0) < 1e-6);
+        QVERIFY(laneMuted(a.muteAuto, false, 120) && laneMuted(a.muteAuto, false, 70) && !laneMuted(a.muteAuto, false, 25));
         // The title over the third shot, with its fade; the marker and the caption with their stretches.
         const Track& v2 = out.videoTracks[1];
         QCOMPARE(v2.clips.size(), size_t(1));

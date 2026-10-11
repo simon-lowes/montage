@@ -279,12 +279,13 @@ bool exportAdmBwf(const Project& p, const Sequence& s, const AdmSettings& settin
     if (f.write(head) != head.size()) return fail("Cannot write " + path);
     const qint64 dataStart = f.pos();
 
-    // The bed: every track but the objects, in the layout. Each object: only its track, after its fader, in stereo
-    // (centred, straight out, no master inserts), as one channel.
+    // The bed: every track but the objects, in the layout, with the objects' LFE sends and aux sends (a reverb return is
+    // part of the bed). Each object: only its track, after its fader, in stereo (centred, straight out, dry, no master
+    // inserts), as one channel.
     Sequence mixSeq = s;
     mixSeq.sampleRate = kRate;
     mixSeq.audioLayout = layout;
-    // Objects keep their LFE send in the bed.
+    // Objects keep their LFE send and aux sends in the bed.
     std::vector<bool> lfeOnly(s.audioTracks.size(), false);
     for (int t : objects) lfeOnly[size_t(t)] = true;
     AudioMixer bed;
@@ -299,6 +300,7 @@ bool exportAdmBwf(const Project& p, const Sequence& s, const AdmSettings& settin
         tr.pan = 0;
         tr.panAuto = Param{};
         tr.output = 0;
+        tr.sends.clear();  // heard in the bed's returns
         tr.muted = false;
         tr.solo = false;
         for (Track& other : o.audioTracks) other.solo = false;

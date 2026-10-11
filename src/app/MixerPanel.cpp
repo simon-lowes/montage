@@ -47,6 +47,21 @@ Param switchLane(Param lane) {
     return lane;
 }
 
+// A switch lane (a mute) set to `v` from `at` to its next point, staying as it was before `at`.
+void switchFrom(Param& lane, FrameTime at, double v) {
+    const bool earlier = std::any_of(lane.keys.begin(), lane.keys.end(), [at](const Keyframe& k) { return k.t < at; });
+    const double before = at > 0 ? lane.at(at - 1) : v;
+    auto put = [&lane](FrameTime t, double value) {
+        auto it = std::find_if(lane.keys.begin(), lane.keys.end(), [t](const Keyframe& k) { return k.t == t; });
+        if (it == lane.keys.end()) it = lane.keys.insert(lane.keys.end(), Keyframe{t, value});
+        it->v = value;
+        it->interp = Interp::Hold;
+    };
+    if (at > 0 && !earlier) put(at - 1, before);
+    put(at, v);
+    std::sort(lane.keys.begin(), lane.keys.end(), [](const Keyframe& a, const Keyframe& b) { return a.t < b.t; });
+}
+
 constexpr int kStripWidth = 80;
 constexpr int kMasterWidth = 68;
 constexpr int kFaderMin = -600;  // tenths of a dB
@@ -372,7 +387,8 @@ MixerPanel::Strip MixerPanel::makeStrip(int index) {
         const Track& t = seq->audioTracks[size_t(index)];
         QMenu menu;
         for (const Bus& b : seq->buses) {
-            if (std::any_of(t.sends.begin(), t.sends.end(), [&](const Send& sd) { return sd.bus == b.id; })) continue;
+            // Not the bus it already goes to (that would add it there twice), nor one it already sends to.
+            if (b.id == t.output || std::any_of(t.sends.begin(), t.sends.end(), [&](const Send& sd) { return sd.bus == b.id; })) continue;
             menu.addAction(QString::fromStdString(b.name), this, [this, index, bus = b.id] { addSend(index, bus); });
         }
         if (!menu.isEmpty()) menu.addSeparator();
@@ -455,7 +471,10 @@ MixerPanel::Strip MixerPanel::makeStrip(int index) {
         const Id bus = combo->itemData(i).toULongLong();
         state_->edit(tr("Track Output"), [index, bus](Project&, Sequence& sq) {
             if (index >= int(sq.audioTracks.size()) || sq.audioTracks[size_t(index)].output == bus) return false;
-            sq.audioTracks[size_t(index)].output = bus;
+            Track& t = sq.audioTracks[size_t(index)];
+            t.output = bus;
+            // A send to the bus it now feeds would add it there twice.
+            if (bus) std::erase_if(t.sends, [bus](const Send& sd) { return sd.bus == bus; });
             return true;
         });
     });
@@ -680,11 +699,16 @@ void MixerPanel::setBusMute(Id bus, bool on) {
         else refresh();
         return;
     }
-    const bool ok = state_->edit(on ? tr("Mute Bus") : tr("Unmute Bus"), [bus, on](Project&, Sequence& s) {
+    const FrameTime at = state_->playhead();
+    const bool ok = state_->edit(on ? tr("Mute Bus") : tr("Unmute Bus"), [bus, on, at](Project&, Sequence& s) {
         for (Bus& b : s.buses)
             if (b.id == bus) {
-                if (b.muted == on) return false;
-                b.muted = on;
+                // As a track's: a bus reading its mute lane switches the lane at the playhead.
+                const bool lane = readsLanes(b) && b.muteAuto.animated();
+                if (busMutedAt(b, double(at)) == on) return false;
+                if (!on && b.muted) b.muted = false;
+                if (lane && laneMuted(b.muteAuto, false, double(at)) != on) switchFrom(b.muteAuto, at, on ? 1 : 0);
+                else if (on) b.muted = true;
                 return true;
             }
         return false;
@@ -1127,7 +1151,11 @@ void MixerPanel::playbackStarted(FrameTime t) {
             };
             addLane(
                 QStringLiteral("send-%1-%2").arg(index).arg(send), m, tr.sends[k].levelAuto, tr.sends[k].levelDb, second, 0.1, false,
-                [row, still = tr.sends[k].levelDb] { return row() ? row()->value() / 10.0 : still; },
+                [row, still = tr.sends[k].levelDb] {
+                    // The slider stops at -60 dB: a send set lower (-96, off) stays there unless raised.
+                    const double v = row() ? row()->value() / 10.0 : still;
+                    return v <= -60 && still < -60 ? still : v;
+                },
                 [row] { return row() && row()->isSliderDown(); },
                 [row, setSlider](double v) {
                     if (QSlider* sl = row()) setSlider(sl, v, 10, -60, 12);
@@ -1164,7 +1192,10 @@ void MixerPanel::playbackStarted(FrameTime t) {
         };
         addLane(
             QStringLiteral("bus-volume-%1").arg(bus), m, b.volumeAuto, b.volumeDb, second, 0.1, false,
-            [strip, still = b.volumeDb] { return strip() ? strip()->fader->value() / 10.0 : still; },
+            [strip, still = b.volumeDb] {
+                const double v = strip() ? strip()->fader->value() / 10.0 : still;
+                return v <= -60 && still < -60 ? still : v;  // (as a send's: lower than the fader goes stays)
+            },
             [strip] { return strip() && strip()->fader->isSliderDown(); },
             [strip, setSlider](double v) {
                 if (BusStrip* st = strip()) {
@@ -1502,10 +1533,17 @@ void MixerPanel::setMute(int index, bool on) {
         else refresh();
         return;
     }
-    const bool ok = state_->edit(on ? tr("Mute Track") : tr("Unmute Track"), [index, on](Project&, Sequence& s) {
-        if (index >= int(s.audioTracks.size()) || s.audioTracks[index].muted == on)
-            return false;
-        s.audioTracks[index].muted = on;
+    // On a track reading a mute lane the button switches the lane at the playhead (to its next point), as the fader
+    // keys its lane; a static mute is still turned off by it.
+    const FrameTime at = state_->playhead();
+    const bool ok = state_->edit(on ? tr("Mute Track") : tr("Unmute Track"), [index, on, at](Project&, Sequence& s) {
+        if (index >= int(s.audioTracks.size())) return false;
+        Track& t = s.audioTracks[size_t(index)];
+        const bool lane = readsLanes(t) && t.muteAuto.animated();
+        if (trackMutedAt(t, double(at)) == on) return false;
+        if (!on && t.muted) t.muted = false;
+        if (lane && laneMuted(t.muteAuto, false, double(at)) != on) switchFrom(t.muteAuto, at, on ? 1 : 0);
+        else if (on) t.muted = true;
         return true;
     });
     if (!ok)
