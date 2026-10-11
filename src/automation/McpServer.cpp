@@ -5335,6 +5335,70 @@ void McpServer::Impl::addTools() {
                       QJsonObject{{"clips", placed}, {"voice_from", QString::fromStdString(voice.from)}, {"language", QString::fromStdString(voice.options.language)}});
         });
 
+    add("montage_convert_voice", "Convert a voice",
+        "Say a clip's speech again in another person's voice (speech to speech, as Resolve's Voice Convert: Chatterbox, on "
+        "this computer), its words, timing and delivery kept, for ADR read by someone else or a temp line made to sound "
+        "like the actor. clip is an audio clip; its sound (with handles seconds either side, default 1) is converted and "
+        "added to it as a take, picked, so the original stays one take away. The voice is voice_clip (a clip id, what it "
+        "plays) or voice_media (a file or the project's media, voice_from to voice_to seconds); 5 to 10 clean seconds of "
+        "them speaking is best. Needs consent: true, confirming you have the speaker's consent (or it is your own voice). "
+        "The WAV (in the Voiceover folder) and its media note what it was converted from and whose voice it has; its media "
+        "gets the keyword AI voice.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"integer","description":"The audio clip to convert"},
+            "consent":{"type":"boolean","description":"You have the speaker's consent to use their voice"},
+            "voice_clip":{"type":"integer"},"voice_media":{"type":"string"},"voice_from":{"type":"number"},"voice_to":{"type":"number"},
+            "handles":{"type":"number","default":1,"description":"Seconds converted either side of what the clip plays"}},
+            "required":["project","clip","consent"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const Id clip = clipArg(l, a).id;
+            const auto at = edit::locate(s, clip);
+            double from = 0, to = 0;
+            if (!at || at->track.kind != TrackKind::Audio ||
+                !edit::voiceConversionRange(l.project, s, clip, std::clamp(a.value("handles").toDouble(1), 0.0, 10.0), from, to))
+                throw ArgError{"clip must be a clip with sound on an audio track"};
+            if (!a.contains("voice_clip") && !a.contains("voice_media")) throw ArgError{"Give voice_clip or voice_media: the voice to convert to"};
+            if (a.contains("voice_clip") && Id(a.value("voice_clip").toDouble()) == clip) throw ArgError{"voice_clip is the clip being converted"};
+            const CloneVoice voice = cloneVoiceArg(a, l.project, s, 0);
+            const Clip* c = edit::clipById(s, clip);
+            const MediaItem* m = l.project.findMedia(c->mediaId);
+            const std::string name = c->name.empty() ? m->name : c->name;
+            std::vector<float> speech, converted;
+            std::string err;
+            progress(0, QStringLiteral("Converting the voice"));
+            if (!voiceSoundFrom(m->path, from, to, speech, &err, c->channels, s.sampleRate > 0 ? s.sampleRate : 48000) ||
+                !convertVoice(speech, kCloneSampleRate, voice.sample, kCloneSampleRate, converted, &err,
+                              [this](double f) { progress(f, QStringLiteral("Converting the voice")); }))
+                return fail(QString::fromStdString(err));
+            const std::string note = "Speech from " + name + " converted to a voice cloned from " + voice.from + " with Chatterbox in Montage, " +
+                                     QDateTime::currentDateTime().toString(Qt::ISODate).toStdString() +
+                                     "; the speaker's consent was confirmed by the caller.";
+            const QString folder = QFileInfo(absolute(need(a, "project"))).absolutePath() + QStringLiteral("/Voiceover");
+            QDir().mkpath(folder);
+            QString path;
+            int n = 1;
+            do path = folder + '/' + QString::fromStdString(name) + QStringLiteral(" Converted Voice ") + QString::number(n++) + QStringLiteral(".wav");
+            while (QFileInfo::exists(path));
+            if (!writeClonedSpeechWav(path.toStdString(), converted, note, &err)) return fail(QString::fromStdString(err));
+            const Id media = mediaFor(l.project, path);
+            if (MediaItem* made = l.project.findMedia(media)) {
+                made->metadata["comment"] = note;
+                if (std::find(made->keywords.begin(), made->keywords.end(), "AI voice") == made->keywords.end()) made->keywords.push_back("AI voice");
+            }
+            if (const edit::Result r = edit::addConvertedTake(l.project, s, clip, media, from); !r.ok) return fail(QString::fromStdString(r.error));
+            save(l);
+            const Clip* now = edit::clipById(s, clip);
+            return ok(QStringLiteral("Converted %1 (%2 s) to the voice from %3: take %4 of %5, picked")
+                          .arg(QString::fromStdString(name))
+                          .arg(double(converted.size()) / kCloneSampleRate, 0, 'f', 2)
+                          .arg(QString::fromStdString(voice.from))
+                          .arg(now->take + 1)
+                          .arg(now->takes.size()),
+                      QJsonObject{{"file", path}, {"media", double(media)}, {"seconds", double(converted.size()) / kCloneSampleRate},
+                                  {"take", now->take}, {"takes", int(now->takes.size())}, {"voice_from", QString::fromStdString(voice.from)}});
+        });
+
     add("montage_audio_description", "Audio description",
         "Described video for broadcasters and streaming services: descriptions of what is seen, spoken in the gaps between "
         "the dialogue. gaps finds them (speech on the audio tracks other than the AD track; at least min_gap seconds, kept "

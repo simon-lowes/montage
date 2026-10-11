@@ -77,11 +77,26 @@ bool cloneSpeech(const std::string& text, const std::vector<float>& reference, i
                  const std::atomic<bool>* cancel = nullptr);
 
 // A voice sample from a file: its sound from `from` to `to` seconds (`to` at or before `from`: to the end), as mono at
-// kCloneSampleRate (with `channels`, those channels, as a clip picks them).
 // kCloneSampleRate (with `channels`, those channels, as a clip picks them). Read from the sound decoded for playback at
 // `rate` (MediaPool), decoding it if it is not yet.
 bool voiceSampleFrom(const std::string& path, double from, double to, std::vector<float>& mono, std::string* error = nullptr,
                      const std::vector<int>& channels = {}, int rate = 48000);
+
+// The sound of a file from `from` to `to` seconds as voiceSampleFrom reads it, as mono at kCloneSampleRate, but whole
+// (nothing trimmed or cut to ten seconds): speech to convert.
+bool voiceSoundFrom(const std::string& path, double from, double to, std::vector<float>& mono, std::string* error = nullptr,
+                    const std::vector<int>& channels = {}, int rate = 48000);
+
+// Speech said again in another voice (speech to speech, as Resolve's Voice Convert, for ADR in the actor's voice): the
+// words, timing and delivery of `speech` (mono at `speechRate`) in the voice of `reference` (a few seconds of one person
+// speaking, as for cloneSpeech). Mono at kCloneSampleRate, exactly as long as the speech, so it stays in sync. The
+// speech is converted a piece of at most about ten seconds at a time (voiceConversionCuts).
+bool convertVoice(const std::vector<float>& speech, int speechRate, const std::vector<float>& reference, int referenceRate,
+                  std::vector<float>& out, std::string* error = nullptr, const std::function<void(double)>& progress = {},
+                  const std::atomic<bool>* cancel = nullptr);
+// Where speech is cut into pieces for convertVoice: sample offsets from 0 to its end, each piece at most `most` seconds,
+// cut at the quietest 20 ms in its last three seconds.
+std::vector<size_t> voiceConversionCuts(const std::vector<float>& mono, int rate, double most = 9.5);
 
 // Speech without the near-silence the model leaves before and after it (a few milliseconds kept).
 void trimSpeech(std::vector<float>& speech, int rate);

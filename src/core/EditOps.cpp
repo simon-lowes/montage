@@ -2636,12 +2636,12 @@ Result addTakes(Project& p, Sequence& s, Id clipId, const std::vector<std::pair<
         if (!m || m->kind == MediaKind::Sequence) return Result::fail("Takes are media files");
         if (video ? !(m->hasVideo || m->kind == MediaKind::Image) : !m->hasAudio)
             return Result::fail(video ? m->name + " has no picture" : m->name + " has no sound");
-        added.push_back({id, in - c->sourceIn, m->name});
+        added.push_back({id, in - c->sourceIn, m->name, {}});
     }
     if (added.empty()) return Result::fail("No media to add as takes");
     if (c->takes.empty()) {
         const MediaItem* own = p.findMedia(c->mediaId);
-        c->takes.push_back({c->mediaId, 0, c->name.empty() && own ? own->name : c->name});
+        c->takes.push_back({c->mediaId, 0, c->name.empty() && own ? own->name : c->name, c->channels});
         c->take = 0;
     }
     c->takes.insert(c->takes.end(), added.begin(), added.end());
@@ -2653,22 +2653,30 @@ Result pickTake(Project& p, Sequence& s, Id clipId, int index) {
     if (!c || c->takes.empty()) return Result::fail("That clip is not an audition");
     if (index < 0 || index >= int(c->takes.size())) return Result::fail("No such take");
     if (index == c->take) return {};
-    if (!p.findMedia(c->takes[size_t(index)].mediaId)) return Result::fail("That take's media is no longer in the project");
+    const MediaItem* to = p.findMedia(c->takes[size_t(index)].mediaId);
+    if (!to) return Result::fail("That take's media is no longer in the project");
     // Re-based on the new pick: every take's offset from the clip's new in-point.
     const Take next = c->takes[size_t(index)];
     const Id was = c->mediaId;
-    c->takes[size_t(c->take)].name = c->name;  // a rename stays with its take
+    c->takes[size_t(c->take)].name = c->name;  // a rename and a channel choice stay with their take
+    c->takes[size_t(c->take)].channels = c->channels;
     for (Take& t : c->takes) t.offset -= next.offset;
+    // Linked clips playing the same media follow when they can play the take as they are: it has what their track plays
+    // (a sound-only take leaves the picture as it is) and the channels they pick.
+    const int count = sourceChannelCount(*to);
     for (Id id : linkedClips(s, clipId)) {
         Clip* l = clipById(s, id);
-        if (l && id != clipId && l->mediaId == was && l->takes.empty()) {
-            l->mediaId = next.mediaId;
-            l->sourceIn += next.offset;
-        }
+        const auto at = l && id != clipId && l->mediaId == was && l->takes.empty() ? locate(s, id) : std::nullopt;
+        if (!at || (at->track.kind == TrackKind::Video ? !(to->hasVideo || to->kind == MediaKind::Image) : !to->hasAudio) ||
+            std::any_of(l->channels.begin(), l->channels.end(), [&](int ch) { return ch >= count; }))
+            continue;
+        l->mediaId = next.mediaId;
+        l->sourceIn += next.offset;
     }
     c->mediaId = next.mediaId;
     c->sourceIn += next.offset;
     c->name = next.name;
+    c->channels = next.channels;
     c->take = index;
     return {};
 }

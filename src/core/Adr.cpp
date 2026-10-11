@@ -475,6 +475,26 @@ Result addAdrTake(Project& p, Sequence& s, Id cueId, Id mediaId, FrameTime recor
     return done;
 }
 
+bool voiceConversionRange(const Project& p, const Sequence& s, Id clip, double handles, double& from, double& to) {
+    const Clip* c = clipById(s, clip);
+    const MediaItem* m = c && c->mediaId ? p.findMedia(c->mediaId) : nullptr;
+    if (!m || !m->hasAudio || m->path.empty()) return false;
+    // The source the clip plays (either way round).
+    const double fps = s.fpsValue(), a = c->sourceFrameAt(c->start) / fps, b = c->sourceFrameAt(c->end() - 1) / fps;
+    from = std::max(0.0, std::min(a, b) - handles);
+    to = std::max(a, b) + 1 / fps + handles;
+    if (m->duration > 0) to = std::min(to, m->duration);
+    return to > from;
+}
+
+Result addConvertedTake(Project& p, Sequence& s, Id clip, Id mediaId, double from) {
+    const Clip* c = clipById(s, clip);
+    if (!c) return Result::fail("No such clip");
+    // The file starts `from` seconds into the clip's media: the clip's in-point is that much earlier in it.
+    if (Result r = addTakes(p, s, clip, {{mediaId, c->sourceIn - from * s.fpsValue()}}); !r.ok) return r;
+    return pickTake(p, s, clip, int(clipById(s, clip)->takes.size()) - 1);
+}
+
 }  // namespace edit
 
 }  // namespace montage

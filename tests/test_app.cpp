@@ -154,6 +154,7 @@
 #include "media/StemSeparation.h"
 #include "media/Inpaint.h"
 #include "SpeechDialog.h"
+#include "VoiceConvert.h"
 #include "StemsDialog.h"
 #include "GraphicsDialogs.h"
 #include "ShotSearchPanel.h"
@@ -6366,6 +6367,64 @@ private slots:
         QVERIFY(!edit::clipById(*state()->sequence(), clips[0]));
     }
 
+    void convertVoice() {
+        // JFK's line (two to five seconds of the file) on A1, and the whole of it again on A2 as the voice to convert to.
+        state()->newProject();
+        QVERIFY(state()->save(dir_.path() + "/convert.montage"));
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        const double fps = state()->sequence()->fpsValue();
+        QVERIFY(state()->apply("Place", [&](Project& p, Sequence& s) {
+            edit::addTrack(p, s, TrackKind::Audio);
+            const edit::Result r = edit::placeMedia(p, s, media, 0, FrameTime(2 * fps), FrameTime(5 * fps), V1, A1, false);
+            return r.ok ? edit::placeMedia(p, s, media, 600, 0, -1, V1, {TrackKind::Audio, 1}, false) : r;
+        }));
+        const Id clip = trackAt(*state()->sequence(), A1)->clips.at(0).id;
+        const Id voiceClip = state()->sequence()->audioTracks.at(1).clips.at(0).id;
+        // The clip a selection converts.
+        QCOMPARE(voiceConversionClip(state()->project(), *state()->sequence(), {clip}), clip);
+        QCOMPARE(voiceConversionClip(state()->project(), *state()->sequence(), {}), Id(0));
+        QVERIFY(win_->findChild<QAction*>("convertVoice"));
+
+        // The dialog offers every other clip with sound, then a recording, and needs the speaker's consent.
+        VoiceConvertDialog dlg(state(), clip, voiceClip, win_.get());
+        auto* voice = dlg.findChild<QComboBox*>("convertVoice");
+        auto* consent = dlg.findChild<QCheckBox*>("convertConsent");
+        auto* go = dlg.findChild<QPushButton*>("convertGo");
+        QVERIFY(voice && consent && go);
+        QCOMPARE(voice->count(), 2);
+        QCOMPARE(voice->currentData().toLongLong(), qint64(voiceClip));
+        QCOMPARE(voice->itemData(1).toLongLong(), qint64(0));
+        QVERIFY(!go->isEnabled());
+        QVERIFY(!dlg.convert());  // no consent
+        consent->setChecked(true);
+        QCOMPARE(go->isEnabled(), voiceCloneAvailable());
+        dlg.setRecording(QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav"));
+        QCOMPARE(voice->currentData().toLongLong(), qint64(0));
+        QVERIFY(dlg.findChild<QLabel*>("convertStatus")->text().contains("jfk.wav") || !voiceCloneAvailable());
+        voice->setCurrentIndex(0);
+
+        if (!voiceCloneAvailable() || !voiceCloneModel().installed()) QSKIP("Set MONTAGE_VOICE_CLONE_MODEL to the Chatterbox Multilingual pack");
+        // Converted: a take of the clip, picked, with a second either side, its file beside the project saying what it is.
+        QVERIFY(dlg.convert());
+        const Clip* c = edit::clipById(*state()->sequence(), clip);
+        QCOMPARE(c->takes.size(), size_t(2));
+        QCOMPARE(c->take, 1);
+        QVERIFY(std::abs(c->sourceIn - fps) < 1e-6);
+        const MediaItem* m = state()->project().findMedia(c->mediaId);
+        QVERIFY(m && m->bin == "Voiceover" && QString::fromStdString(m->name).contains("Converted Voice"));
+        QVERIFY(QFileInfo(QString::fromStdString(m->path)).absolutePath() == QDir(dir_.path()).absoluteFilePath("Voiceover"));
+        QVERIFY(std::abs(m->duration - 5.0) < 0.05);
+        QVERIFY(QString::fromStdString(m->metadata.at("comment")).contains("converted to a voice cloned from jfk"));
+        QVERIFY(std::find(m->keywords.begin(), m->keywords.end(), "AI voice") != m->keywords.end());
+        // One undo step gives back the original.
+        state()->undo();
+        c = edit::clipById(*state()->sequence(), clip);
+        QVERIFY(c->takes.empty());
+        QCOMPARE(c->mediaId, media);
+    }
+
     void clonedVoiceover() {
         state()->newProject();
         auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
@@ -7611,6 +7670,7 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(!said.isEmpty());
         QCOMPARE(said.last().at(0).toString(), QString("The start must be a timecode before the end"));
 
+        QVERIFY(!panel->findChild<QPushButton*>("adrConvertVoice")->isEnabled());  // no take to convert yet
         // Rehearse: the cycle (beeps, streamer) goes to the Program monitor and nothing is recorded.
         auto* program = win_->findChild<PlaybackController*>("programPlayback");
         panel->rehearse();
@@ -7656,6 +7716,9 @@ const auto seq = [this] { return state()->sequence(); };
         const Id clip = state()->sequence()->adrCues[0].clip;
         QVERIFY(clip);
         QCOMPARE(state()->sequence()->adrCues[0].status, int(kAdrRecorded));
+        // A take can be said again in the guide's voice (none on the guide track here).
+        QTRY_VERIFY(panel->findChild<QPushButton*>("adrConvertVoice")->isEnabled());
+        QCOMPARE(panel->guideClip(), Id(0));
         const Clip* c = edit::clipById(*state()->sequence(), clip);
         QVERIFY(c && c->start == 150 && c->duration == 60);
         QCOMPARE(c->sourceIn, double(150 - cyc.playFrom));

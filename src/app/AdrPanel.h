@@ -2,7 +2,8 @@
 // Rehearse plays its cycle (pre-roll, three beeps, the streamer and the line on the Program monitor); Record plays it
 // again and records the actor, the take joining the cue's audition clip on the ADR track (the newest the pick); Loop
 // records take after take until stopped. The guide (the production sound) can be muted while recording, and the
-// takes already made are muted too.
+// takes already made are muted too. Convert Voice… says the chosen take again in the guide's voice (app/VoiceConvert.h),
+// as a new take.
 #pragma once
 
 #include <QWidget>
@@ -63,6 +64,8 @@ public:
     bool isRecording() const;
     // The current cue's takes: pick one.
     void pickTake(int index);
+    // The guide's clip under the current cue (the voice Convert Voice… offers first); 0 for none.
+    Id guideClip() const;
 
 signals:
     void takeRecorded(montage::Id cue, montage::Id clip);
@@ -98,6 +101,7 @@ private:
     QPushButton* rehearse_;
     QPushButton* record_;
     QPushButton* stop_;
+    QPushButton* convert_;
     QProgressBar* meter_;
     QLabel* statusLabel_;
     std::optional<AdrCycle> cycle_;

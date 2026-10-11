@@ -250,8 +250,15 @@ QJsonObject clipToJson(const Clip& c) {
     if (!c.markers.empty()) o["markers"] = markersToJson(c.markers);
     if (!c.takes.empty()) {
         QJsonArray takes;
-        for (const Take& t : c.takes)
-            takes.append(QJsonObject{{"media", qint64(t.mediaId)}, {"offset", t.offset}, {"name", qs(t.name)}});
+        for (const Take& t : c.takes) {
+            QJsonObject take{{"media", qint64(t.mediaId)}, {"offset", t.offset}, {"name", qs(t.name)}};
+            if (!t.channels.empty()) {
+                QJsonArray ch;
+                for (int i : t.channels) ch.append(i);
+                take["channels"] = ch;
+            }
+            takes.append(take);
+        }
         o["takes"] = takes;
         o["take"] = c.take;
     }
@@ -311,7 +318,10 @@ Clip clipFromJson(const QJsonObject& o) {
     c.markers = markersFromJson(o.value("markers"));
     for (const auto& tv : o.value("takes").toArray()) {
         const QJsonObject t = tv.toObject();
-        c.takes.push_back({Id(i64(t.value("media"))), t.value("offset").toDouble(), ss(t.value("name"))});
+        Take take{Id(i64(t.value("media"))), t.value("offset").toDouble(), ss(t.value("name")), {}};
+        for (const auto& v : t.value("channels").toArray())
+            if (v.toInt(-1) >= 0) take.channels.push_back(v.toInt());
+        c.takes.push_back(take);
     }
     c.take = c.takes.empty() ? 0 : std::clamp(o.value("take").toInt(), 0, int(c.takes.size()) - 1);
     const QJsonObject anim = o.value("animation").toObject();

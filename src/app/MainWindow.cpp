@@ -140,6 +140,7 @@
 #include "media/VisualSearch.h"
 #include "PeoplePanel.h"
 #include "SpeechDialog.h"
+#include "VoiceConvert.h"
 #include "StemsDialog.h"
 #include "GraphicsDialogs.h"
 #include "TranscriptPanel.h"
@@ -1330,6 +1331,16 @@ void MainWindow::buildMenus() {
     add(clipM, tr("Fit to Fill"), QKeySequence(), [this] { fitToFill(); })->setObjectName(QStringLiteral("fitToFill"));
     add(clipM, tr("Set Voice Reference"), QKeySequence(), [this] { setVoiceReference(); })->setObjectName(QStringLiteral("setVoiceReference"));
     add(clipM, tr("Match Voice to Reference"), QKeySequence(), [this] { matchVoice(); })->setObjectName(QStringLiteral("matchVoice"));
+    add(clipM, tr("Convert Voice…"), QKeySequence(), [this] {
+        const Sequence* s = state_->sequence();
+        const Id clip = s ? voiceConversionClip(state_->project(), *s, state_->selectedClips()) : 0;
+        if (!clip) {
+            state_->message(tr("Select a clip with speech to convert into another voice"), 5000);
+            return;
+        }
+        VoiceConvertDialog dlg(state_, clip, 0, this);
+        dlg.exec();
+    })->setObjectName(QStringLiteral("convertVoice"));
     add(clipM, tr("Add Bar Markers"), QKeySequence(), [this] { addBeatMarkers(false); })->setObjectName(QStringLiteral("addBarMarkers"));
     add(clipM, tr("Add Beat Markers"), QKeySequence(), [this] { addBeatMarkers(true); })->setObjectName(QStringLiteral("addBeatMarkers"));
     add(clipM, tr("Fit Music to Length…"), QKeySequence(), [this] { fitMusicDialog(); })->setObjectName(QStringLiteral("fitMusic"));

@@ -17057,6 +17057,132 @@ private slots:
         QCOMPARE(bs.audioTracks[1].clips[0].start, FrameTime(std::llround(20 * fps)));
     }
 
+    void voiceConversion() {
+        // Cut into pieces of at most 9.5 s, at the quietest moment in each piece's last three seconds.
+        std::vector<float> speech(size_t(kCloneSampleRate) * 25);
+        for (size_t i = 0; i < speech.size(); ++i) speech[i] = float(0.3 * std::sin(2 * M_PI * 200.0 * double(i) / kCloneSampleRate));
+        for (const double gap : {8.0, 16.5})
+            std::fill(speech.begin() + std::ptrdiff_t(gap * kCloneSampleRate), speech.begin() + std::ptrdiff_t((gap + 0.1) * kCloneSampleRate), 0.0f);
+        const std::vector<size_t> cuts = voiceConversionCuts(speech, kCloneSampleRate);
+        QCOMPARE(cuts.size(), size_t(4));
+        QCOMPARE(cuts.front(), size_t(0));
+        QCOMPARE(cuts.back(), speech.size());
+        QVERIFY2(std::abs(double(cuts[1]) / kCloneSampleRate - 8.05) < 0.06, qPrintable(QString::number(double(cuts[1]) / kCloneSampleRate)));
+        QVERIFY2(std::abs(double(cuts[2]) / kCloneSampleRate - 16.55) < 0.06, qPrintable(QString::number(double(cuts[2]) / kCloneSampleRate)));
+        for (size_t i = 1; i < cuts.size(); ++i) QVERIFY(cuts[i] - cuts[i - 1] <= size_t(9.5 * kCloneSampleRate));
+        QCOMPARE(voiceConversionCuts(std::vector<float>(1000), kCloneSampleRate), (std::vector<size_t>{0, 1000}));
+        QCOMPARE(voiceConversionCuts({}, kCloneSampleRate), (std::vector<size_t>{0, 0}));
+        // Refused before any model: a voice sample too short to hear a voice in, and nothing said.
+        std::vector<float> out;
+        std::string err;
+        QVERIFY(!convertVoice(speech, kCloneSampleRate, std::vector<float>(kCloneSampleRate / 4, 0.2f), kCloneSampleRate, out, &err));
+        QVERIFY(!convertVoice(std::vector<float>(kCloneSampleRate * 2, 0.0f), kCloneSampleRate, speech, kCloneSampleRate, out, &err));
+        QVERIFY(out.empty());
+
+        // The real model: JFK's words in a synthetic voice, as long as he took to say them.
+        if (!voiceCloneAvailable() || !voiceCloneModel().installed()) QSKIP("Set MONTAGE_VOICE_CLONE_MODEL to the Chatterbox Multilingual ONNX files to run the rest");
+        if (!ttsModel().installed()) QSKIP("Set MONTAGE_TTS_MODEL to the Kokoro files for a voice to convert to");
+        std::vector<float> voice;
+        QVERIFY2(synthesizeSpeech("Good evening. My name is Michael, and I will be your narrator for tonight. Every story begins with a single "
+                                  "voice.",
+                                  "am_michael", 1.0, voice, &err),
+                 err.c_str());
+        std::vector<float> jfk;
+        QVERIFY2(voiceSoundFrom(MONTAGE_TEST_DATA_DIR "/jfk.wav", 0, 0, jfk, &err), err.c_str());
+        QVERIFY(jfk.size() > size_t(kCloneSampleRate) * 10);  // two pieces
+        QElapsedTimer timer;
+        timer.start();
+        double progressed = 0;
+        QVERIFY2(convertVoice(jfk, kCloneSampleRate, voice, kTtsSampleRate, out, &err, [&](double f) { progressed = f; }), err.c_str());
+        qInfo("converted %.1f s of speech in %.1f s", double(jfk.size()) / kCloneSampleRate, timer.elapsed() / 1000.0);
+        QCOMPARE(out.size(), jfk.size());  // in sync
+        QCOMPARE(progressed, 1.0);
+        double energy = 0;
+        for (const float v : out) energy += double(v) * v;
+        QVERIFY(std::sqrt(energy / double(out.size())) > 0.01);
+        const std::string converted = path("converted.wav");
+        QVERIFY(writeClonedSpeechWav(converted, out, "Speech converted in a test"));
+        // The same words.
+        if (const QByteArray whisper = qgetenv("MONTAGE_TEST_WHISPER_MODEL"); !whisper.isEmpty()) {
+            TranscribeOptions opts;
+            opts.model = whisper.toStdString();
+            Transcript said;
+            QVERIFY2(transcribeMedia(converted, opts, said, {}, nullptr, &err), err.c_str());
+            const QString text = QString::fromStdString(said.text()).toLower();
+            for (const char* word : {"fellow americans", "ask not", "country"}) QVERIFY2(text.contains(QLatin1String(word)), qPrintable(text));
+        }
+        // In the new voice: one person with the voice sample, two with the original.
+        if (diarizerAvailable() && speakerModel().installed()) {
+            auto at16k = [](const std::vector<float>& x, int rate) {
+                std::vector<float> y;
+                for (double t = 0; t + 1 < double(x.size()); t += double(rate) / 16000) {
+                    const size_t i = size_t(t);
+                    y.push_back(float(x[i] + (x[i + 1] - x[i]) * (t - double(i))));
+                }
+                return y;
+            };
+            auto people = [&](const std::vector<float>& a, int rateA, const std::vector<float>& b, int rateB) {
+                std::vector<float> mix = at16k(a, rateA), second = at16k(b, rateB);
+                mix.insert(mix.end(), 16000, 0.0f);
+                mix.insert(mix.end(), second.begin(), second.end());
+                std::vector<SpeakerTurn> turns;
+                std::string why;
+                if (!diarize(mix, {}, turns, {}, nullptr, &why)) return -1;
+                int n = 0;
+                for (const auto& turn : turns) n = std::max(n, turn.speaker + 1);
+                return n;
+            };
+            QCOMPARE(people(voice, kTtsSampleRate, out, kCloneSampleRate), 1);
+            QCOMPARE(people(jfk, kCloneSampleRate, out, kCloneSampleRate), 2);
+        }
+
+        // Through MCP: refused without consent or a voice; a trimmed clip's sound (with a second's handle either side)
+        // becomes its picked take, in place.
+        const std::string sample = path("narrator.wav");
+        QVERIFY(writeSpeechWav(sample, voice, &err));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        MediaItem m;
+        QVERIFY(probeMedia(MONTAGE_TEST_DATA_DIR "/jfk.wav", m));
+        m.id = p.newId();
+        p.media.push_back(m);
+        const double fps = s.fpsValue();
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 2 * fps, 5 * fps, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Id clip = s.audioTracks[0].clips[0].id;
+        const QString project = QString::fromStdString(path("convert.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_convert_voice"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call({{"project", project}, {"clip", double(clip)}, {"consent", false}, {"voice_media", QString::fromStdString(sample)}});
+        QVERIFY(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("consent"));
+        QVERIFY(call({{"project", project}, {"clip", double(clip)}, {"consent", true}}).value("isError").toBool());
+        QVERIFY(call({{"project", project}, {"clip", double(clip)}, {"consent", true}, {"voice_clip", double(clip)}}).value("isError").toBool());
+        r = call({{"project", project}, {"clip", double(clip)}, {"consent", true}, {"voice_media", QString::fromStdString(sample)}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const double seconds = r.value("structuredContent").toObject().value("seconds").toDouble();
+        QVERIFY2(std::abs(seconds - 5.0) < 0.05, qPrintable(QString::number(seconds)));  // 1 s to 6 s of the file
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back, &err));
+        const Clip& c = back.active()->audioTracks[0].clips[0];
+        QCOMPARE(c.takes.size(), size_t(2));
+        QCOMPARE(c.take, 1);
+        QCOMPARE(c.takes[0].mediaId, m.id);
+        QVERIFY(std::abs(c.sourceIn - 1 * fps) < 1e-6);  // its second second, where the line was
+        QCOMPARE(c.start, FrameTime(0));
+        QCOMPARE(c.duration, FrameTime(std::llround(3 * fps)));
+        const MediaItem* made = back.findMedia(c.mediaId);
+        QVERIFY(made && QString::fromStdString(made->name).contains("Converted Voice"));
+        QVERIFY(QString::fromStdString(made->metadata.at("comment")).contains("converted to a voice cloned from narrator.wav"));
+        QVERIFY(std::find(made->keywords.begin(), made->keywords.end(), "AI voice") != made->keywords.end());
+    }
+
     void dubIntoEnglish() {
         const ModelPack* deen = translationModel("de", "en");
         QVERIFY(deen);

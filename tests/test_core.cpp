@@ -6983,6 +6983,65 @@ private slots:
         QVERIFY(!cycleTake(fx.p, fx.s(), clip, 1).ok);
     }
 
+    void convertedVoiceTakes() {
+        // A clip's sound (channel 4 of four) with its picture; a second sound clip linked to them plays channel 2.
+        Fixture fx;
+        fx.p.findMedia(fx.media)->channels = 4;
+        const double fps = fx.s().fpsValue();
+        QVERIFY(placeMedia(fx.p, fx.s(), fx.media, 30, FrameTime(2 * fps), FrameTime(5 * fps), V1, A1, false).ok);
+        const Id picture = fx.v1().clips[0].id, sound = fx.a1().clips[0].id;
+        clipById(fx.s(), sound)->channels = {3};
+        Clip other = *clipById(fx.s(), sound);
+        other.id = fx.p.newId();
+        other.channels = {1};
+        while (fx.s().audioTracks.size() < 2) addTrack(fx.p, fx.s(), TrackKind::Audio);
+        fx.s().audioTracks[1].clips.push_back(other);
+
+        // What a conversion covers: what the clip plays and a second either side, as far as the media goes.
+        double from = 0, to = 0;
+        QVERIFY(voiceConversionRange(fx.p, fx.s(), sound, 1, from, to));
+        QVERIFY(std::abs(from - 1) < 1e-9 && std::abs(to - 6) < 1e-9);
+        QVERIFY(voiceConversionRange(fx.p, fx.s(), sound, 5, from, to));
+        QVERIFY(std::abs(from - 0) < 1e-9 && std::abs(to - 10) < 1e-9);
+        fx.p.findMedia(fx.media)->hasAudio = false;
+        QVERIFY(!voiceConversionRange(fx.p, fx.s(), sound, 1, from, to));
+        fx.p.findMedia(fx.media)->hasAudio = true;
+
+        // The converted sound (a mono file from 1 s of the media on) becomes the picked take: the same moment plays.
+        MediaItem wav;
+        wav.id = fx.p.newId();
+        wav.kind = MediaKind::Audio;
+        wav.name = "Converted Voice 1.wav";
+        wav.path = "/nonexistent/converted.wav";
+        wav.duration = 5;
+        wav.hasAudio = true;
+        wav.channels = 1;
+        fx.p.media.push_back(wav);
+        Result r = addConvertedTake(fx.p, fx.s(), sound, wav.id, 1);
+        QVERIFY2(r.ok, r.error.c_str());
+        const Clip* c = clipById(fx.s(), sound);
+        QCOMPARE(c->mediaId, wav.id);
+        QCOMPARE(c->take, 1);
+        QVERIFY(std::abs(c->sourceIn - fps) < 1e-9);
+        QVERIFY(c->channels.empty());  // the file's own sound
+        QCOMPARE(c->takes[0].channels, std::vector<int>{3});
+        // The picture has no part in a sound-only take, nor the clip on channel 2 in a one-channel file.
+        QCOMPARE(clipById(fx.s(), picture)->mediaId, fx.media);
+        QCOMPARE(clipById(fx.s(), picture)->sourceIn, 2 * fps);
+        QCOMPARE(clipById(fx.s(), other.id)->mediaId, fx.media);
+        // Saved and read back, with the channels each take plays.
+        Project back;
+        QVERIFY(projectFromJson(projectToJson(fx.p), back));
+        QCOMPARE(clipById(*back.active(), sound)->takes, c->takes);
+        // Back to the original: its channel too.
+        QVERIFY(pickTake(fx.p, fx.s(), sound, 0).ok);
+        c = clipById(fx.s(), sound);
+        QCOMPARE(c->mediaId, fx.media);
+        QCOMPARE(c->channels, std::vector<int>{3});
+        QCOMPARE(c->sourceIn, 2 * fps);
+        QVERIFY(!addConvertedTake(fx.p, fx.s(), 999999, wav.id, 1).ok);
+    }
+
     void swapClips() {
         // A (picture and sound), B (picture and sound), C (picture): A and B change places.
         Fixture fx;

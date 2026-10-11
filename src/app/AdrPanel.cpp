@@ -28,6 +28,7 @@
 #include "MonitorPanel.h"
 #include "PlaybackController.h"
 #include "Settings.h"
+#include "VoiceConvert.h"
 #include "Voiceover.h"
 #include "core/History.h"
 
@@ -129,6 +130,10 @@ AdrPanel::AdrPanel(EditorState* state, PlaybackController* program, ViewerWidget
     cueRow->addSpacing(12);
     cueRow->addWidget(new QLabel(tr("Take:"), this));
     cueRow->addWidget(takes_, 1);
+    convert_ = new QPushButton(tr("Convert Voice…"), this);
+    convert_->setObjectName(QStringLiteral("adrConvertVoice"));
+    convert_->setToolTip(tr("Say the chosen take again in the guide's voice (with the speaker's consent), as a new take"));
+    cueRow->addWidget(convert_);
     root->addLayout(cueRow);
     connect(status_, &QComboBox::activated, this, [this](int k) { setCueStatus(k); });
     connect(takes_, &QComboBox::activated, this, [this](int k) { pickTake(k); });
@@ -214,6 +219,14 @@ AdrPanel::AdrPanel(EditorState* state, PlaybackController* program, ViewerWidget
     root->addLayout(transport);
     root->addWidget(statusLabel_);
     connect(rehearse_, &QPushButton::clicked, this, &AdrPanel::rehearse);
+    connect(convert_, &QPushButton::clicked, this, [this] {
+        const Sequence* s = state_->sequence();
+        const AdrCue* q = s ? findAdrCue(*s, currentCue()) : nullptr;
+        if (!q || !q->clip || cycle_) return;
+        VoiceConvertDialog dlg(state_, q->clip, guideClip(), this);
+        dlg.exec();
+        refresh();
+    });
     connect(record_, &QPushButton::clicked, this, &AdrPanel::record);
     connect(stop_, &QPushButton::clicked, this, &AdrPanel::stop);
 
@@ -375,6 +388,9 @@ void AdrPanel::updateButtons() {
     rehearse_->setEnabled(cue && !cycle_);
     record_->setEnabled(cue && !cycle_ && (input_->count() > 0 || !useDevice_));
     stop_->setEnabled(cycle_.has_value() || recorder_->isRecording());
+    const Sequence* s = state_->sequence();
+    const AdrCue* q = s && cue ? findAdrCue(*s, currentCue()) : nullptr;
+    convert_->setEnabled(q && q->clip && !cycle_);
     if (!cycle_) statusLabel_->setText(cue ? tr("Ready") : tr("Add cues: from captions, range markers, In/Out, or a cue sheet"));
 }
 
@@ -651,6 +667,21 @@ void AdrPanel::stop() {
     if (recorder_->isRecording()) recorder_->stop();  // what was recorded is kept (onTaken ends the cycle)
     if (cycle_) endCycle();
     updateButtons();
+}
+
+Id AdrPanel::guideClip() const {
+    // The clip on the guide track heard most during the current cue's line.
+    const Sequence* s = state_->sequence();
+    const AdrCue* q = s ? findAdrCue(*s, currentCue()) : nullptr;
+    const int track = guide_->currentIndex() - 1;
+    if (!q || track < 0 || track >= int(s->audioTracks.size())) return 0;
+    Id best = 0;
+    FrameTime most = 0;
+    for (const Clip& c : s->audioTracks[size_t(track)].clips) {
+        const FrameTime overlap = std::min(c.end(), q->end) - std::max(c.start, q->start);
+        if (c.mediaId && overlap > most) best = c.id, most = overlap;
+    }
+    return best;
 }
 
 void AdrPanel::pickTake(int index) {

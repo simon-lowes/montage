@@ -327,31 +327,33 @@ std::vector<std::string> splitCloneText(const std::string& text, int limit) {
 // ---------------------------------------------------------------------------
 // The reference
 
-std::vector<float> cloneReference(const std::vector<float>& mono, int rate) {
-    std::vector<float> x;
-    if (mono.empty() || rate <= 0) return x;
-    if (rate == kCloneSampleRate) {
-        x = mono;
-    } else {
-        // Windowed-sinc resampling, low-passed below the lower Nyquist.
-        const double ratio = double(kCloneSampleRate) / rate, cutoff = std::min(1.0, ratio);
-        const int taps = 16;
-        x.resize(size_t(double(mono.size()) * ratio));
-        for (size_t i = 0; i < x.size(); ++i) {
-            const double at = double(i) / ratio;
-            const long centre = long(std::floor(at));
-            double acc = 0, norm = 0;
-            for (long k = centre - taps + 1; k <= centre + taps; ++k) {
-                if (k < 0 || k >= long(mono.size())) continue;
-                const double d = (at - double(k)) * cutoff;
-                const double sinc = std::abs(d) < 1e-9 ? 1.0 : std::sin(M_PI * d) / (M_PI * d);
-                const double w = 0.5 + 0.5 * std::cos(M_PI * (at - double(k)) / taps);
-                acc += mono[size_t(k)] * sinc * w;
-                norm += sinc * w;
-            }
-            x[i] = norm != 0 ? float(acc / norm) : 0.0f;
+static std::vector<float> resampleForVoice(const std::vector<float>& mono, int rate) {
+    if (mono.empty() || rate <= 0) return {};
+    if (rate == kCloneSampleRate) return mono;
+    // Windowed-sinc resampling, low-passed below the lower Nyquist.
+    const double ratio = double(kCloneSampleRate) / rate, cutoff = std::min(1.0, ratio);
+    const int taps = 16;
+    std::vector<float> x(size_t(double(mono.size()) * ratio));
+    for (size_t i = 0; i < x.size(); ++i) {
+        const double at = double(i) / ratio;
+        const long centre = long(std::floor(at));
+        double acc = 0, norm = 0;
+        for (long k = centre - taps + 1; k <= centre + taps; ++k) {
+            if (k < 0 || k >= long(mono.size())) continue;
+            const double d = (at - double(k)) * cutoff;
+            const double sinc = std::abs(d) < 1e-9 ? 1.0 : std::sin(M_PI * d) / (M_PI * d);
+            const double w = 0.5 + 0.5 * std::cos(M_PI * (at - double(k)) / taps);
+            acc += mono[size_t(k)] * sinc * w;
+            norm += sinc * w;
         }
+        x[i] = norm != 0 ? float(acc / norm) : 0.0f;
     }
+    return x;
+}
+
+std::vector<float> cloneReference(const std::vector<float>& mono, int rate) {
+    std::vector<float> x = resampleForVoice(mono, rate);
+    if (x.empty()) return x;
     // Quiet edges off (below -40 dB of the peak, in 20 ms windows).
     float peak = 0;
     for (const float v : x) peak = std::max(peak, std::fabs(v));
@@ -386,6 +388,17 @@ std::vector<float> cloneReference(const std::vector<float>& mono, int rate) {
 
 bool voiceSampleFrom(const std::string& path, double from, double to, std::vector<float>& mono, std::string* error,
                      const std::vector<int>& channels, int rate) {
+    if (!voiceSoundFrom(path, from, to, mono, error, channels, rate)) return false;
+    mono = cloneReference(mono, kCloneSampleRate);
+    if (mono.empty()) {
+        if (error) *error = "The voice sample is silent";
+        return false;
+    }
+    return true;
+}
+
+bool voiceSoundFrom(const std::string& path, double from, double to, std::vector<float>& mono, std::string* error,
+                    const std::vector<int>& channels, int rate) {
     mono.clear();
     const AudioBufferPtr sound = MediaPool::instance().audio(audioKey(path, channels), rate);
     if (!sound || sound->frames() == 0) {
@@ -406,12 +419,33 @@ bool voiceSampleFrom(const std::string& path, double from, double to, std::vecto
         for (size_t c = 0; c < ch; ++c) v += sound->samples[(size_t(a) + i) * ch + c];
         mixed[i] = v / float(ch);
     }
-    mono = cloneReference(mixed, sound->sampleRate);
-    if (mono.empty()) {
-        if (error) *error = "The voice sample is silent";
-        return false;
-    }
+    mono = resampleForVoice(mixed, sound->sampleRate);
     return true;
+}
+
+std::vector<size_t> voiceConversionCuts(const std::vector<float>& mono, int rate, double most) {
+    std::vector<size_t> cuts{0};
+    if (rate <= 0 || most <= 0) {
+        cuts.push_back(mono.size());
+        return cuts;
+    }
+    const size_t limit = std::max<size_t>(1, size_t(most * rate)), look = std::min(limit / 2, size_t(3 * rate));
+    const size_t win = std::max<size_t>(1, size_t(rate / 50)), hop = std::max<size_t>(1, win / 2);
+    size_t at = 0;
+    while (mono.size() - at > limit) {
+        // The quietest 20 ms in the piece's last few seconds.
+        size_t best = at + limit;
+        double least = -1;
+        for (size_t w = at + limit - look; w + win <= at + limit; w += hop) {
+            double e = 0;
+            for (size_t i = w; i < w + win; ++i) e += double(mono[i]) * mono[i];
+            if (least < 0 || e < least) least = e, best = w + win / 2;
+        }
+        cuts.push_back(best);
+        at = best;
+    }
+    cuts.push_back(mono.size());
+    return cuts;
 }
 
 void trimSpeech(std::vector<float>& speech, int rate) {
@@ -513,6 +547,13 @@ bool cloneSpeech(const std::string&, const std::vector<float>&, int, const Clone
                  const std::function<void(double)>&, const std::atomic<bool>*) {
     out.clear();
     if (error) *error = "This build of Montage cannot clone voices: it was built without ONNX Runtime";
+    return false;
+}
+
+bool convertVoice(const std::vector<float>&, int, const std::vector<float>&, int, std::vector<float>& out, std::string* error,
+                  const std::function<void(double)>&, const std::atomic<bool>*) {
+    out.clear();
+    if (error) *error = "This build of Montage cannot convert voices: it was built without ONNX Runtime";
     return false;
 }
 
@@ -727,6 +768,88 @@ bool cloneSpeech(const std::string& text, const std::vector<float>& reference, i
     }
     if (out.empty()) {
         if (error) *error = "Nothing was said";
+        return false;
+    }
+    return true;
+}
+
+bool convertVoice(const std::vector<float>& speech, int speechRate, const std::vector<float>& reference, int referenceRate,
+                  std::vector<float>& out, std::string* error, const std::function<void(double)>& progress, const std::atomic<bool>* cancel) {
+    out.clear();
+    const std::vector<float> ref = cloneReference(reference, referenceRate);
+    if (ref.size() < size_t(kCloneSampleRate)) {
+        if (error) *error = "The voice sample is too short: it needs at least a second of speech (5 to 10 is best)";
+        return false;
+    }
+    const std::vector<float> x = resampleForVoice(speech, speechRate);
+    float peak = 0;
+    for (const float v : x) peak = std::max(peak, std::fabs(v));
+    if (x.empty() || peak <= 1e-4f) {
+        if (error) *error = "There is no speech to convert";
+        return false;
+    }
+    auto model = loadCloneModel(error);
+    if (!model) return false;
+    try {
+        Ort::MemoryInfo cpu = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+        const char* encIn[] = {"audio_values"};
+        const char* encOut[] = {"audio_features", "audio_tokens", "speaker_embeddings", "speaker_features"};
+        auto encode = [&](std::vector<float>& audio) {
+            const int64_t shape[2] = {1, int64_t(audio.size())};
+            Ort::Value in = Ort::Value::CreateTensor<float>(cpu, audio.data(), audio.size(), shape, 2);
+            return model->encoder->Run(Ort::RunOptions{nullptr}, encIn, &in, 1, encOut, 4);
+        };
+        // The new voice: its speech tokens, which lead the decoder in, and its speaker embedding and features.
+        std::vector<float> refCopy = ref;
+        auto speaker = encode(refCopy);
+        const int64_t* promptData = speaker[1].GetTensorData<int64_t>();
+        const std::vector<int64_t> prompt(promptData, promptData + speaker[1].GetTensorTypeAndShapeInfo().GetElementCount());
+        const std::vector<int64_t> embShape = speaker[2].GetTensorTypeAndShapeInfo().GetShape();
+        const std::vector<int64_t> featShape = speaker[3].GetTensorTypeAndShapeInfo().GetShape();
+        // What is said, as speech tokens (the words, timing and delivery without the voice), a piece of at most about ten
+        // seconds at a time (all the encoder hears), each piece said again in the new voice and kept to its own length.
+        const std::vector<size_t> cuts = voiceConversionCuts(x, kCloneSampleRate);
+        out.reserve(x.size());
+        for (size_t n = 0; n + 1 < cuts.size(); ++n) {
+            if (cancel && cancel->load()) {
+                if (error) *error = "Cancelled";
+                out.clear();
+                return false;
+            }
+            const size_t a = cuts[n], b = cuts[n + 1], length = b - a;
+            float loudest = 0;
+            for (size_t i = a; i < b; ++i) loudest = std::max(loudest, std::fabs(x[i]));
+            if (loudest <= peak * 0.01f || length < size_t(kCloneSampleRate / 10)) {  // (silence stays silence)
+                out.insert(out.end(), length, 0.0f);
+                if (progress) progress(double(b) / double(x.size()));
+                continue;
+            }
+            std::vector<float> piece(x.begin() + std::ptrdiff_t(a), x.begin() + std::ptrdiff_t(b));
+            piece.resize(std::max(piece.size(), size_t(kCloneSampleRate)), 0.0f);  // (at least a second for the encoder)
+            auto said = encode(piece);
+            std::vector<int64_t> tokens(prompt);
+            const int64_t* t = said[1].GetTensorData<int64_t>();
+            tokens.insert(tokens.end(), t, t + said[1].GetTensorTypeAndShapeInfo().GetElementCount());
+            const int64_t tokShape[2] = {1, int64_t(tokens.size())};
+            Ort::Value dec[3] = {Ort::Value::CreateTensor<int64_t>(cpu, tokens.data(), tokens.size(), tokShape, 2),
+                                 Ort::Value::CreateTensor<float>(cpu, const_cast<float*>(speaker[2].GetTensorData<float>()),
+                                                                 speaker[2].GetTensorTypeAndShapeInfo().GetElementCount(), embShape.data(),
+                                                                 embShape.size()),
+                                 Ort::Value::CreateTensor<float>(cpu, const_cast<float*>(speaker[3].GetTensorData<float>()),
+                                                                 speaker[3].GetTensorTypeAndShapeInfo().GetElementCount(), featShape.data(),
+                                                                 featShape.size())};
+            const char* decIn[] = {"speech_tokens", "speaker_embeddings", "speaker_features"};
+            const char* decOut[] = {"waveform"};
+            auto wav = model->decoder->Run(Ort::RunOptions{nullptr}, decIn, dec, 3, decOut, 1);
+            const float* w = wav[0].GetTensorData<float>();
+            const size_t count = std::min(length, size_t(wav[0].GetTensorTypeAndShapeInfo().GetElementCount()));
+            out.insert(out.end(), w, w + count);
+            out.insert(out.end(), length - count, 0.0f);  // (tokens come 25 a second: up to 40 ms short)
+            if (progress) progress(double(b) / double(x.size()));
+        }
+    } catch (const Ort::Exception& e) {
+        if (error) *error = std::string("Voice conversion failed: ") + e.what();
+        out.clear();
         return false;
     }
     return true;

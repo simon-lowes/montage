@@ -215,11 +215,13 @@ struct AdrCue {
 };
 
 // One take of an audition (Final Cut's auditions, Resolve's take selector): a piece of media, starting `offset`
-// sequence frames from the clip's own in-point, so trims and splits of the clip carry its takes along.
+// sequence frames from the clip's own in-point, so trims and splits of the clip carry its takes along. Its sound plays
+// `channels` (Clip::channels) when it is the pick.
 struct Take {
     Id mediaId = 0;
     double offset = 0;
     std::string name;
+    std::vector<int> channels;
     bool operator==(const Take&) const = default;
 };
 
