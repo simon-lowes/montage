@@ -51,6 +51,10 @@ public:
     bool revertSelection();
     int replaceInAllTranscripts(const QString& find, const QString& with);
     int applyVocabulary();
+    // Sequence: the selected words said again as `text` in the speaker's own voice (cloned from the clip heard there,
+    // in `language`), made to fill their time and put over them on that clip's track, with the new words in the
+    // transcript; one undo step. The caller has the speaker's consent. Returns the new clip, or 0.
+    Id regenerateSelection(const QString& text, const std::string& language, QString* error = nullptr);
 
 public slots:
     void deleteSelection();     // Sequence: ripple-delete the selected words

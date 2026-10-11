@@ -5988,6 +5988,75 @@ private slots:
         state()->newProject();
     }
 
+    void regenerateWordsAndDubInTheSpeakersVoice() {
+        state()->newProject();
+        auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        auto t = std::make_shared<Transcript>();
+        t->language = "en";
+        TranscriptSegment seg;
+        seg.words = {{0.5, 0.9, "And", 1}, {1.0, 1.3, "so", 1}, {1.8, 2.2, "my", 1}, {2.3, 2.8, "fellow", 1}, {2.9, 3.6, "Americans.", 1}};
+        t->segments.push_back(seg);
+        QVERIFY(state()->edit("Transcript", [media, t](Project& p, Sequence&) {
+            p.findMedia(media)->transcript = t;
+            return true;
+        }));
+        QVERIFY(state()->apply("Place", [media](Project& p, Sequence& s) { return edit::placeMedia(p, s, media, 0, 0, -1, V1, A1, false); }));
+        auto* panel = win_->findChild<TranscriptPanel*>();
+        QVERIFY(panel && panel->findChild<QAction*>("regenerateWords"));
+        panel->setMode(TranscriptPanel::Mode::Sequence);
+        QCOMPARE(panel->words().size(), size_t(5));
+        auto* captions = win_->findChild<CaptionsPanel*>();
+        QVERIFY(captions);
+        if (!voiceCloneAvailable() || !voiceCloneModel().installed()) QSKIP("Set MONTAGE_VOICE_CLONE_MODEL to the Chatterbox Multilingual pack");
+        // "my fellow" (1.8 to 2.8 s) said again as "our dear", in his voice, over the words on A1.
+        const double fps = state()->sequence()->fpsValue();
+        panel->selectWords(2, 3);
+        QString err;
+        const Id made = panel->regenerateSelection("our dear", "en", &err);
+        QVERIFY2(made, qPrintable(err));
+        const auto& a1 = trackAt(*state()->sequence(), A1)->clips;
+        QCOMPARE(int(a1.size()), 3);
+        QCOMPARE(a1[1].id, made);
+        QCOMPARE(a1[1].start, FrameTime(std::floor(1.8 * fps + 1e-6)));
+        QVERIFY(a1[1].end() <= FrameTime(std::ceil(2.8 * fps)));
+        QCOMPARE(a1[2].start, FrameTime(std::ceil(2.8 * fps - 1e-6)));
+        const MediaItem* m = state()->project().findMedia(a1[1].mediaId);
+        QVERIFY(m && m->transcript && std::find(m->keywords.begin(), m->keywords.end(), "AI voice") != m->keywords.end());
+        QApplication::processEvents();
+        QStringList heard;
+        for (const TranscriptWord& w : panel->words()) heard << QString::fromStdString(w.text);
+        QVERIFY2(heard.join(' ').contains("our dear"), qPrintable(heard.join(' ')));
+        // One undo puts the words back.
+        state()->undo();
+        QCOMPARE(int(trackAt(*state()->sequence(), A1)->clips.size()), 1);
+        // A caption track dubbed in the speaker's own voice (heard under its first caption).
+        Id track = 0;
+        QVERIFY(state()->edit("Captions", [&](Project& p, Sequence& s) {
+            CaptionTrack c;
+            c.id = track = p.newId();
+            c.language = "en";
+            c.captions = {{0, 45, "Hello and welcome.", {}}, {60, 120, "This is the dub.", {}}};
+            s.captionTracks.push_back(c);
+            return true;
+        }));
+        captions->setCurrentTrack(track);
+        ClonedVoice voice;
+        QVERIFY(voiceAt(state()->project(), *state()->sequence(), 0, voice, &err));
+        voice.language = "en";
+        const int tracks = int(state()->sequence()->audioTracks.size());
+        const auto r = captions->dub({}, -12, &err, &voice);
+        QVERIFY2(r.clips.size() == 2, qPrintable(err));
+        QCOMPARE(r.audioTrack, tracks);
+        QCOMPARE(state()->sequence()->audioTracks[size_t(tracks)].name, std::string("Dub (English)"));
+        QCOMPARE(r.captions, track);  // already in English
+        const MediaItem* dubbed = state()->project().findMedia(edit::clipById(*state()->sequence(), r.clips[0])->mediaId);
+        QVERIFY(dubbed && QString::fromStdString(dubbed->metadata.at("comment")).contains("cloned from"));
+        QCOMPARE(r.ducked, 1);
+        state()->newProject();
+    }
+
     void autoMixDialog() {
         state()->newProject();
         const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});

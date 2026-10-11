@@ -43,6 +43,7 @@
 #include "core/EditOps.h"
 #include "media/AutoDuck.h"
 #include "media/TextToSpeech.h"
+#include "media/VoiceClone.h"
 #include "media/Translator.h"
 #include "TranscribeDialog.h"
 #include "core/History.h"
@@ -508,28 +509,30 @@ void CaptionsPanel::translateDialog() {
     if (!translateTrack(to, &error) && !error.isEmpty()) QMessageBox::warning(this, tr("Translate Captions"), error);
 }
 
-CaptionsPanel::DubResult CaptionsPanel::dub(const std::string& voice, double duckDb, QString* error) {
+CaptionsPanel::DubResult CaptionsPanel::dub(const std::string& voice, double duckDb, QString* error, const ClonedVoice* clone) {
     DubResult r;
     const CaptionTrack* src = track();
     if (!src || src->captions.empty()) {
         if (error) *error = tr("There are no captions to dub");
         return r;
     }
-    const std::string from = src->language.empty() ? "en" : src->language;
-    r.captions = from == "en" ? src->id : translateTrack("en", error);
+    const std::string from = src->language.empty() ? "en" : src->language, to = clone ? clone->language : "en";
+    r.captions = from == to ? src->id : translateTrack(to, error);
     if (!r.captions) return r;
     const Sequence* s = state_->sequence();
     int index = -1;
     for (int i = 0; i < int(s->captionTracks.size()); ++i)
         if (s->captionTracks[size_t(i)].id == r.captions) index = i;
-    r.clips = generateSpeech(state_, captionLines(*s, index), voice, 1.0, -1, window(), error);
+    r.clips = generateSpeech(state_, captionLines(*s, index), voice, 1.0, -1, window(), error, clone);
     if (r.clips.empty()) return r;
     const auto at = edit::locate(*state_->sequence(), r.clips.front());
     if (!at) return r;
     r.audioTrack = at->track.index;
     // Part of the same undo step as the speech.
     state_->amend([&](Project&, Sequence& sq) {
-        sq.audioTracks[size_t(r.audioTrack)].name = tr("Dub (English)").toStdString();
+        const CloneLanguage* lang = findCloneLanguage(to);
+        sq.audioTracks[size_t(r.audioTrack)].name =
+            (clone && lang ? tr("Dub (%1)").arg(QString::fromUtf8(lang->name)) : tr("Dub (English)")).toStdString();
         if (duckDb < 0) {
             DuckOptions o;
             o.amountDb = std::max(-60.0, duckDb);
@@ -554,28 +557,44 @@ void CaptionsPanel::dubDialog() {
         return;
     }
     const std::string from = src->language.empty() ? "en" : src->language;
-    const auto route = from == "en" ? std::vector<const ModelPack*>{} : translationRoute(from, "en");
-    if (from != "en" && route.empty()) {
+    // In the speaker's own voice, into any language voice cloning speaks that the track can be translated into.
+    std::vector<const CloneLanguage*> cloneTargets;
+    if (voiceCloneAvailable())
+        for (const CloneLanguage& l : voiceCloneLanguages())
+            if (l.code == from || !translationRoute(from, l.code).empty()) cloneTargets.push_back(&l);
+    const auto toEnglish = from == "en" ? std::vector<const ModelPack*>{} : translationRoute(from, "en");
+    if (from != "en" && toEnglish.empty() && cloneTargets.empty()) {
         state_->message(tr("There is no translation from %1 to English").arg(QString::fromStdString(translationLanguageName(from))));
         return;
     }
     QDialog dlg(this);
-    dlg.setWindowTitle(tr("Dub into English"));
+    dlg.setWindowTitle(tr("Dub"));
     auto* lay = new QVBoxLayout(&dlg);
-    auto* about = new QLabel(from == "en" ? tr("Speaks \"%1\" with an AI voice on a new audio track, each caption at its time, and lowers "
-                                               "the other audio under it.")
-                                                .arg(QString::fromStdString(src->name))
-                                          : tr("Translates \"%1\" from %2 into English, speaks it with an AI voice on a new audio track, "
-                                               "each caption at its time, and lowers the other audio under it.")
-                                                .arg(QString::fromStdString(src->name), QString::fromStdString(translationLanguageName(from))),
+    auto* about = new QLabel(tr("Speaks \"%1\" (%2) with an AI voice on a new audio track, each caption at its time, translated first "
+                                "where it is in another language, and lowers the other audio under it. The voice is an English "
+                                "one, or the speaker's own, cloned, in any of the languages listed under Into.")
+                                 .arg(QString::fromStdString(src->name), QString::fromStdString(translationLanguageName(from))),
                              &dlg);
     about->setWordWrap(true);
     lay->addWidget(about);
     auto* form = new QFormLayout;
     auto* voice = new QComboBox(&dlg);
     voice->setObjectName(QStringLiteral("dubVoice"));
-    for (const TtsVoice& v : ttsVoices()) voice->addItem(QString::fromStdString(v.name), QString::fromStdString(v.id));
+    if (from == "en" || !toEnglish.empty())
+        for (const TtsVoice& v : ttsVoices()) voice->addItem(QString::fromStdString(v.name) + tr(" (English)"), QString::fromStdString(v.id));
+    if (!cloneTargets.empty()) {
+        if (voice->count()) voice->insertSeparator(voice->count());
+        voice->addItem(tr("The speaker's own voice (cloned)"), QStringLiteral("clone"));
+    }
     form->addRow(tr("Voice:"), voice);
+    auto* language = new QComboBox(&dlg);
+    language->setObjectName(QStringLiteral("dubLanguage"));
+    for (const CloneLanguage* l : cloneTargets) language->addItem(QString::fromUtf8(l->name), QString::fromUtf8(l->code));
+    language->setCurrentIndex(std::max(0, language->findData(QStringLiteral("en"))));
+    form->addRow(tr("Into:"), language);
+    auto* consent = new QCheckBox(tr("I have the speaker's consent to clone their voice"), &dlg);
+    consent->setObjectName(QStringLiteral("dubConsent"));
+    form->addRow(QString(), consent);
     auto* duck = new QDoubleSpinBox(&dlg);
     duck->setObjectName(QStringLiteral("dubDuck"));
     duck->setRange(-60, 0);
@@ -589,15 +608,38 @@ void CaptionsPanel::dubDialog() {
     connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
     connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
     lay->addWidget(buttons);
+    auto update = [&] {
+        const bool clone = voice->currentData().toString() == QLatin1String("clone");
+        for (QWidget* w : {static_cast<QWidget*>(language), static_cast<QWidget*>(consent)}) {
+            w->setVisible(clone);
+            if (QWidget* label = form->labelForField(w)) label->setVisible(clone);
+        }
+        buttons->button(QDialogButtonBox::Ok)->setEnabled(!clone || consent->isChecked());
+    };
+    connect(voice, &QComboBox::currentIndexChanged, &dlg, update);
+    connect(consent, &QCheckBox::toggled, &dlg, update);
+    update();
     if (dlg.exec() != QDialog::Accepted) return;
-    for (const ModelPack* pack : route)
-        if (!ensureModelPack(window(), *pack, tr("Dub into English"),
+    const bool cloning = voice->currentData().toString() == QLatin1String("clone");
+    const std::string to = cloning ? language->currentData().toString().toStdString() : "en";
+    for (const ModelPack* pack : from == to ? std::vector<const ModelPack*>{} : translationRoute(from, to))
+        if (!ensureModelPack(window(), *pack, tr("Dub"),
                              tr("Translation runs on this computer with Opus-MT (University of Helsinki, CC-BY-4.0), one model per language pair.")))
             return;
     QString error;
-    const DubResult r = dub(voice->currentData().toString().toStdString(), duck->value(), &error);
+    ClonedVoice clone;
+    if (cloning) {
+        // The voice heard under the first caption.
+        if (!consent->isChecked()) return;
+        if (!voiceAt(state_->project(), *state_->sequence(), src->captions.front().start, clone, &error)) {
+            QMessageBox::warning(this, tr("Dub"), error);
+            return;
+        }
+        clone.language = to;
+    }
+    const DubResult r = dub(voice->currentData().toString().toStdString(), duck->value(), &error, cloning ? &clone : nullptr);
     if (r.clips.empty()) {
-        if (!error.isEmpty() && error != QLatin1String("Cancelled")) QMessageBox::warning(this, tr("Dub into English"), error);
+        if (!error.isEmpty() && error != QLatin1String("Cancelled")) QMessageBox::warning(this, tr("Dub"), error);
         return;
     }
     state_->message(tr("Dubbed %1 captions onto %2").arg(r.clips.size()).arg(QString::fromStdString(state_->sequence()->audioTracks[size_t(r.audioTrack)].name)));

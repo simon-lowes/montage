@@ -37,6 +37,7 @@ struct ClonedVoice {
     std::vector<float> sample;  // mono at kCloneSampleRate (media/VoiceClone.h cloneReference: at most ten seconds)
     std::string language = "en";
     std::string from;  // where the sample came from, noted in every file spoken with it
+    bool replace = false;  // each line made to fill its room exactly, in place of what is on the track there
 };
 // The voice in a clip: its sound as the clip plays it (its channels), from its source In, at most `seconds` of it.
 bool clipVoice(const Project& p, const Sequence& s, Id clip, ClonedVoice& voice, QString* error = nullptr, double seconds = 30);

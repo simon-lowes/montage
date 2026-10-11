@@ -15759,6 +15759,25 @@ private slots:
         QCOMPARE(back.active()->audioTracks.size(), tracks + 2);
         QCOMPARE(back.active()->audioTracks[tracks + 1].clips.size(), size_t(2));
         QVERIFY(call({{"project", project}, {"track", 5}}).value("isError").toBool());
+
+        // In the speaker's own voice (cloned from what is heard under the first caption): refused without consent;
+        // the English track dubbed into German.
+        QVERIFY(call({{"project", project}, {"track", 1}, {"voice", "clone"}, {"to", "de"}}).value("isError").toBool());
+        const ModelPack* ende = translationModel("en", "de");
+        if (!voiceCloneAvailable() || !voiceCloneModel().installed() || !ende || !ende->installed()) return;
+        r = call({{"project", project}, {"track", 1}, {"voice", "clone"}, {"to", "de"}, {"consent", true}, {"duck_db", 0}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(loadProject(project.toStdString(), back, &err));
+        const Sequence& cs = *back.active();
+        QCOMPARE(cs.captionTracks.size(), size_t(3));
+        QCOMPARE(cs.captionTracks[2].language, std::string("de"));
+        QCOMPARE(cs.audioTracks.size(), tracks + 3);
+        const Track& german = cs.audioTracks[tracks + 2];
+        QCOMPARE(german.name, std::string("Dub (German)"));
+        QCOMPARE(german.clips.size(), size_t(2));
+        QCOMPARE(german.clips[1].start, FrameTime(150));
+        const MediaItem* voiced = back.findMedia(german.clips[0].mediaId);
+        QVERIFY(voiced && QString::fromStdString(voiced->metadata.at("comment")).contains("(German) in a voice cloned from"));
     }
 
     void audioRolesAndAutoMix() {

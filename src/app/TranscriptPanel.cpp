@@ -3,6 +3,7 @@
 #include "FlowLayout.h"
 #include "Settings.h"
 
+#include <QCheckBox>
 #include <QComboBox>
 #include <QContextMenuEvent>
 #include <QDialog>
@@ -16,6 +17,7 @@
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
+#include <QPushButton>
 #include <QListWidget>
 #include <QMenu>
 #include <QMouseEvent>
@@ -33,11 +35,13 @@
 #include <map>
 
 #include "EditorState.h"
+#include "SpeechDialog.h"
 #include "Theme.h"
 #include "core/History.h"
 #include "core/Bleep.h"
 #include "core/TranscriptEdit.h"
 #include "core/TranscriptCorrect.h"
+#include "media/VoiceClone.h"
 
 namespace montage {
 
@@ -194,11 +198,54 @@ TranscriptPanel::TranscriptPanel(EditorState* state, QWidget* parent) : QWidget(
             state_->message(n ? tr("Corrected %n near miss(es)", "", n) : tr("No near misses of the vocabulary"));
         });
         near->setObjectName(QStringLiteral("applyVocabulary"));
-        connect(menu, &QMenu::aboutToShow, this, [this, fix, revert, near] {
+        // Overdub: the selected words said again in the speaker's own (cloned) voice.
+        menu->addSeparator();
+        QAction* regen = menu->addAction(tr("Regenerate Selected Words in This Voice…"), this, [this] {
+            const auto [a, b] = selectedWords();
+            if (mode_ != Mode::Sequence || a < 0) return;
+            QStringList now;
+            for (int i = a; i <= b; ++i) now << QString::fromStdString(words_[size_t(i)].text);
+            QDialog dlg(this);
+            dlg.setWindowTitle(tr("Regenerate Words"));
+            auto* lay = new QVBoxLayout(&dlg);
+            auto* about = new QLabel(tr("The words are said again in the speaker's own voice, cloned from the clip heard there, made to fit "
+                                        "their time and put over them. The new file notes that it is generated speech."),
+                                     &dlg);
+            about->setWordWrap(true);
+            lay->addWidget(about);
+            auto* form = new QFormLayout;
+            auto* text = new QLineEdit(now.join(' '), &dlg);
+            text->setObjectName(QStringLiteral("regenerateText"));
+            text->setMinimumWidth(360);
+            form->addRow(tr("Say:"), text);
+            auto* language = new QComboBox(&dlg);
+            for (const CloneLanguage& l : voiceCloneLanguages()) language->addItem(QString::fromUtf8(l.name), QString::fromUtf8(l.code));
+            const CloneLanguage* spoken = findCloneLanguage(sequenceTranscriptLanguage(state_->project(), *state_->sequence()));
+            language->setCurrentIndex(std::max(0, language->findData(QString::fromUtf8(spoken ? spoken->code : "en"))));
+            form->addRow(tr("Language:"), language);
+            lay->addLayout(form);
+            auto* consent = new QCheckBox(tr("I have this person's consent to clone their voice (or it is my own)"), &dlg);
+            lay->addWidget(consent);
+            auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+            buttons->button(QDialogButtonBox::Ok)->setText(tr("Regenerate"));
+            buttons->button(QDialogButtonBox::Ok)->setEnabled(false);
+            connect(consent, &QCheckBox::toggled, buttons->button(QDialogButtonBox::Ok), &QPushButton::setEnabled);
+            connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+            connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+            lay->addWidget(buttons);
+            if (dlg.exec() != QDialog::Accepted || !consent->isChecked() || text->text().trimmed().isEmpty()) return;
+            QString err;
+            if (!regenerateSelection(text->text().trimmed(), language->currentData().toString().toStdString(), &err) && !err.isEmpty() &&
+                err != QLatin1String("Cancelled"))
+                state_->message(err, 6000);
+        });
+        regen->setObjectName(QStringLiteral("regenerateWords"));
+        connect(menu, &QMenu::aboutToShow, this, [this, fix, revert, near, regen] {
             const bool source = mode_ == Mode::Source && selectedWords().first >= 0;
             fix->setEnabled(source);
             revert->setEnabled(source);
             near->setEnabled(!state_->project().vocabulary.empty());
+            regen->setEnabled(mode_ == Mode::Sequence && selectedWords().first >= 0 && voiceCloneAvailable());
         });
         correctBtn_->setMenu(menu);
         correctBtn_->setPopupMode(QToolButton::InstantPopup);
@@ -662,6 +709,67 @@ bool TranscriptPanel::revertSelection() {
         media->transcript = t;
         return true;
     });
+}
+
+Id TranscriptPanel::regenerateSelection(const QString& text, const std::string& language, QString* error) {
+    const auto [a, b] = selectedWords();
+    const Sequence* s = state_->sequence();
+    if (mode_ != Mode::Sequence || a < 0 || !s || text.trimmed().isEmpty()) return 0;
+    const double fps = s->fpsValue();
+    const FrameTime from = FrameTime(std::floor(words_[size_t(a)].start * fps + 1e-6)), to = FrameTime(std::ceil(words_[size_t(b)].end * fps - 1e-6));
+    if (to <= from) return 0;
+    // The voice and the track: the clip with sound heard where the words start.
+    int track = -1;
+    Id clip = 0;
+    for (int i = 0; i < int(s->audioTracks.size()) && track < 0; ++i) {
+        const Track& t = s->audioTracks[size_t(i)];
+        if (t.muted) continue;
+        for (const Clip& c : t.clips)
+            if (c.contains(from) && c.mediaId && c.enabled)
+                if (const MediaItem* m = state_->project().findMedia(c.mediaId); m && m->hasAudio) {
+                    track = i, clip = c.id;
+                    break;
+                }
+    }
+    ClonedVoice voice;
+    if (track < 0 || !clipVoice(state_->project(), *s, clip, voice, error)) {
+        if (error && error->isEmpty()) *error = tr("No clip with sound is heard under those words");
+        return 0;
+    }
+    voice.language = findCloneLanguage(language) ? findCloneLanguage(language)->code : "en";
+    voice.replace = true;
+    const std::vector<Id> made = generateSpeech(state_, {{text.toStdString(), from, to - from}}, {}, 1.0, track, window(), error, &voice);
+    if (made.empty()) return 0;
+    // The new words in its transcript (spread over its length by their letters), so the transcript still reads.
+    const Clip* c = edit::clipById(*state_->sequence(), made.front());
+    if (!c) return made.front();
+    const Id media = c->mediaId;
+    const QStringList said = text.simplified().split(' ');
+    state_->amend([&](Project& p, Sequence&) {
+        MediaItem* m = p.findMedia(media);
+        if (!m || said.isEmpty()) return false;
+        auto t = std::make_shared<Transcript>();
+        t->language = voice.language;
+        t->model = "typed";
+        TranscriptSegment seg;
+        seg.end = m->duration;
+        seg.text = text.simplified().toStdString();
+        double letters = 0;
+        for (const QString& w : said) letters += w.size() + 1;
+        double at = 0;
+        for (const QString& w : said) {
+            TranscriptWord word;
+            word.text = w.toStdString();
+            word.start = at;
+            at += m->duration * (w.size() + 1) / letters;
+            word.end = at;
+            seg.words.push_back(word);
+        }
+        t->segments.push_back(seg);
+        m->transcript = t;
+        return true;
+    });
+    return made.front();
 }
 
 int TranscriptPanel::replaceInAllTranscripts(const QString& find, const QString& with) {

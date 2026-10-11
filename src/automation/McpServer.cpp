@@ -5162,16 +5162,22 @@ void McpServer::Impl::addTools() {
             throw ArgError{"Unknown action"};
         });
 
-    add("montage_dub", "Dub into English",
-        "Dub a caption track into English on this computer: translated from its language (Opus-MT; skipped if it is English), "
-        "each cue spoken at its time with an AI voice (Kokoro; a little faster where a cue is short) on a new audio track "
-        "\"Dub (English)\", and every other audio clip lowered by duck_db while the dub speaks (volume keyframes, replacing "
-        "theirs; 0 leaves them), as in a voice-over translation. The English captions are added as a hidden track. Needs the "
-        "translation and speech models (the app asks the first time; or scripts/fetch-models.sh).",
+    add("montage_dub", "Dub a caption track",
+        "Dub a caption track on this computer: translated from its language (Opus-MT; skipped if it is in the dub's language "
+        "already), each cue spoken at its time on a new audio track \"Dub (<language>)\", and every other audio clip lowered "
+        "by duck_db while the dub speaks (volume keyframes, replacing theirs; 0 leaves them), as in a voice-over translation. "
+        "The translated captions are added as a hidden track. The voice is an English AI voice (Kokoro; a little faster where "
+        "a cue is short), or with voice: \"clone\" the speaker's own voice cloned (Chatterbox; from voice_clip, voice_media, "
+        "or the clip heard under the first caption) into `to`, any of ar da de el en es fi fr he hi it ja ko ms nl no pl pt ru "
+        "sv sw tr zh, which needs consent: true. Needs the translation and speech models (the app asks the first time; or "
+        "scripts/fetch-models.sh).",
         R"json({"type":"object","properties":{"project":{"type":"string"},
             "track":{"type":"integer","default":0,"description":"Caption track index"},
             "from":{"type":"string","description":"The track's language, if its setting is wrong"},
-            "voice":{"type":"string","default":"af_heart"},"speed":{"type":"number","default":1},
+            "voice":{"type":"string","default":"af_heart","description":"A Kokoro voice, or \"clone\""},"speed":{"type":"number","default":1},
+            "to":{"type":"string","default":"en","description":"With voice clone: the dub's language"},
+            "consent":{"type":"boolean"},"voice_clip":{"type":"integer"},"voice_media":{"type":"string"},
+            "voice_from":{"type":"number"},"voice_to":{"type":"number"},
             "duck_db":{"type":"number","default":-18}},"required":["project"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
@@ -5180,19 +5186,33 @@ void McpServer::Impl::addTools() {
             if (index < 0 || index >= int(s.captionTracks.size())) return fail("No such caption track");
             if (s.captionTracks[size_t(index)].captions.empty()) return fail("That caption track is empty");
             if (!ttsAvailable() || !translatorAvailable()) return fail("This build of Montage cannot dub (no ONNX Runtime)");
-            if (!ttsModel().installed())
-                return fail("The speech model is not downloaded: run `scripts/fetch-models.sh` or generate a voiceover once in the app");
             const std::string voice = str(a, "voice", "af_heart").toStdString();
-            if (!findTtsVoice(voice)) throw ArgError{QStringLiteral("Unknown voice \"%1\"").arg(QString::fromStdString(voice))};
+            const bool cloning = voice == "clone";
+            std::optional<CloneVoice> clone;
+            std::string to = "en";
+            if (cloning) {
+                QJsonObject args = a;
+                args["language"] = str(a, "to", "en");
+                const FrameTime first = s.captionTracks[size_t(index)].captions.front().start;
+                clone = cloneVoiceArg(args, l.project, s, first);
+                to = clone->options.language;
+            } else {
+                if (!ttsModel().installed())
+                    return fail("The speech model is not downloaded: run `scripts/fetch-models.sh` or generate a voiceover once in the app");
+                if (!findTtsVoice(voice)) throw ArgError{QStringLiteral("Unknown voice \"%1\"").arg(QString::fromStdString(voice))};
+            }
+            const CloneLanguage* toLang = findCloneLanguage(to);
+            const QString toName = toLang ? QString::fromUtf8(toLang->name) : QStringLiteral("English");
             const double speed = std::clamp(a.value("speed").toDouble(1), 0.5, 2.0);
             const double duckDb = std::clamp(a.value("duck_db").toDouble(-18), -60.0, 0.0);
             const CaptionTrack source = s.captionTracks[size_t(index)];
             const std::string from = a.contains("from") ? a.value("from").toString().toLower().toStdString()
                                                         : (source.language.empty() ? "en" : source.language);
-            int english = index;
-            if (from != "en") {
-                const auto route = translationRoute(from, "en");
-                if (route.empty()) return fail(QStringLiteral("There is no translation from %1 to English").arg(QString::fromStdString(from)));
+            int english = index;  // the captions spoken (in `to`)
+            if (from != to) {
+                const auto route = translationRoute(from, to);
+                if (route.empty())
+                    return fail(QStringLiteral("There is no translation from %1 to %2").arg(QString::fromStdString(from), toName));
                 for (const ModelPack* pack : route)
                     if (!pack->installed())
                         return fail(QStringLiteral("The %1 is not downloaded (%2 MB): translate once in the app, or fetch it into %3")
@@ -5202,8 +5222,8 @@ void McpServer::Impl::addTools() {
                 std::vector<std::string> out;
                 std::string err;
                 progress(0, QStringLiteral("Translating"));
-                if (!translateTexts(captionTexts(source), from, "en", out, {}, nullptr, &err)) return fail(QString::fromStdString(err));
-                CaptionTrack t = translatedTrack(source, out, l.project.newId(), "en", translationLanguageName("en"));
+                if (!translateTexts(captionTexts(source), from, to, out, {}, nullptr, &err)) return fail(QString::fromStdString(err));
+                CaptionTrack t = translatedTrack(source, out, l.project.newId(), to, translationLanguageName(to));
                 t.visible = false;
                 s.captionTracks.push_back(std::move(t));
                 english = int(s.captionTracks.size()) - 1;
@@ -5211,11 +5231,12 @@ void McpServer::Impl::addTools() {
             const std::vector<SpeechLine> lines = captionSpeech(s.captionTracks[size_t(english)]);
             if (lines.empty()) return fail("Nothing to say");
             const TrackRef dub = edit::addTrack(l.project, s, TrackKind::Audio);
-            s.audioTracks[size_t(dub.index)].name = "Dub (English)";
+            s.audioTracks[size_t(dub.index)].name = QStringLiteral("Dub (%1)").arg(toName).toStdString();
             QJsonArray placed;
             double total = 0;
             const QString err = speakLines(l.project, s, lines, voice, speed, dub,
-                                           QFileInfo(absolute(need(a, "project"))).absolutePath() + QStringLiteral("/Voiceover"), placed, total);
+                                           QFileInfo(absolute(need(a, "project"))).absolutePath() + QStringLiteral("/Voiceover"), placed, total,
+                                           clone ? &*clone : nullptr);
             if (!err.isEmpty()) return fail(err);
             int ducked = 0;
             if (duckDb < 0) {

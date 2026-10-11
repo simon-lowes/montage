@@ -21,6 +21,8 @@ class QToolButton;
 
 namespace montage {
 
+struct ClonedVoice;
+
 class EditorState;
 
 class CaptionsPanel : public QWidget {
@@ -54,7 +56,9 @@ public:
         std::vector<Id> clips;
         int ducked = 0;       // clips lowered under it
     };
-    DubResult dub(const std::string& voice, double duckDb = -18, QString* error = nullptr);
+    // With `clone`, into clone->language (translated first unless the track is in it already) in that cloned voice
+    // (the caller has the speaker's consent), on "Dub (<language>)".
+    DubResult dub(const std::string& voice, double duckDb = -18, QString* error = nullptr, const ClonedVoice* clone = nullptr);
 
     // Subtitle tools. The reading limits (remembered between sessions) and what each caption of the current
     // track breaks; the selected captions (rows), or all of them when none are.

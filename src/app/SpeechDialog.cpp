@@ -151,7 +151,7 @@ std::vector<Id> generateSpeech(EditorState* state, const std::vector<SpeechLine>
                 CloneOptions o;
                 o.language = cloned->language;
                 if (!cloneSpeechToFit(lines[i].text, cloned->sample, kCloneSampleRate, o, speed, lines[i].fit > 0 ? lines[i].fit / fps : 0,
-                                      false, audio, &err, cancel.get()) ||
+                                      cloned->replace, audio, &err, cancel.get()) ||
                     !writeClonedSpeechWav(paths[i].toStdString(), audio, note, &err))
                     return err;
                 *done = double(i + 1) / lines.size();
@@ -197,6 +197,10 @@ std::vector<Id> generateSpeech(EditorState* state, const std::vector<SpeechLine>
         if (sq.audioTracks.empty() || track < 0) edit::addTrack(p, sq, TrackKind::Audio);
         const TrackRef a{TrackKind::Audio, track < 0 ? int(sq.audioTracks.size()) - 1 : std::clamp(track, 0, int(sq.audioTracks.size()) - 1)};
         for (size_t i = 0; i < lines.size(); ++i) {
+            if (clone && clone->replace && lines[i].fit > 0) {
+                const edit::Result lifted = edit::liftRange(p, sq, lines[i].at, lines[i].at + lines[i].fit, {a});
+                if (!lifted.ok && !lifted.error.empty()) return lifted;
+            }
             edit::Result r = edit::placeMedia(p, sq, media[i], lines[i].at, 0, -1, {TrackKind::Video, 0}, a, false);
             if (!r.ok) return r;
             created.insert(created.end(), r.created.begin(), r.created.end());
