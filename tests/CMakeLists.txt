@@ -10,6 +10,8 @@ endfunction()
 montage_test(test_core)
 montage_test(test_render)
 montage_test(test_media)
+# Several minutes of real encoding, decoding and model runs: slow CI runners need more than the default.
+set_tests_properties(test_media PROPERTIES TIMEOUT 900)
 target_compile_definitions(test_media PRIVATE MONTAGE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data"
                            MONTAGE_TEST_TOOLS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tools")
 target_compile_definitions(test_core PRIVATE MONTAGE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
