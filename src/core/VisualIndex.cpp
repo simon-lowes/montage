@@ -45,7 +45,8 @@ std::string visualIndexToJson(const VisualIndex& v) {
         std::memcpy(b.data() + sizeof(float), s.values.data(), s.values.size());
         data.append(QString::fromLatin1(b.toBase64()));
     }
-    const QJsonObject o{{"model", QString::fromStdString(v.model)}, {"step", v.step}, {"times", times}, {"samples", data}};
+    QJsonObject o{{"model", QString::fromStdString(v.model)}, {"step", v.step}, {"times", times}, {"samples", data}};
+    if (v.span > 0) o["span"] = v.span;
     return QJsonDocument(o).toJson(QJsonDocument::Compact).toStdString();
 }
 
@@ -55,6 +56,7 @@ bool visualIndexFromJson(const std::string& json, VisualIndex& out) {
     VisualIndex v;
     v.model = o.value("model").toString().toStdString();
     v.step = o.value("step").toDouble();
+    v.span = o.value("span").toDouble(0);
     const QJsonArray times = o.value("times").toArray(), data = o.value("samples").toArray();
     if (times.size() != data.size()) return false;
     for (qsizetype i = 0; i < times.size(); ++i) {
@@ -95,9 +97,10 @@ std::vector<ShotMatch> findMoments(const Project& p, std::shared_ptr<const Visua
             for (size_t k = a; k <= b; ++k) used[k] = true;
             ShotMatch s;
             s.media = m.id;
-            s.start = std::max(0.0, v.samples[a].time - half);
-            s.end = m.duration > 0 ? std::min(m.duration, v.samples[b].time + half) : v.samples[b].time + half;
-            s.best = v.samples[peak].time;
+            const double before = v.span > 0 ? v.span / 2 : half;  // a window's whole span, or around an instant
+            s.start = std::max(0.0, v.samples[a].time - before);
+            s.end = m.duration > 0 ? std::min(m.duration, v.samples[b].time + before) : v.samples[b].time + before;
+            s.best = v.span > 0 ? s.start : v.samples[peak].time;
             s.score = score[peak];
             all.push_back(s);
         }

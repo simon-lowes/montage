@@ -995,9 +995,9 @@ int cmdSounds(const std::vector<std::string>& args) {
             },
             nullptr, &err);
         std::fprintf(stderr, "\n");
-        if (!ok) {
-            std::fprintf(stderr, "error: %s: %s\n", m.name.c_str(), err.c_str());
-            return 1;
+        if (!ok) {  // (offline or unreadable: the rest are still searched)
+            std::fprintf(stderr, "warning: %s: %s\n", m.name.c_str(), err.c_str());
+            continue;
         }
         m.sounds = std::make_shared<const VisualIndex>(std::move(v));
         changed = true;

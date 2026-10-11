@@ -390,6 +390,7 @@ int ShotSearchPanel::search(const QString& queryText) {
 }
 
 int ShotSearchPanel::searchSimilar(Id media, double seconds) {
+    setMode(Shown);  // shots like a frame, whatever the panel was searching (and indexing) before
     results_.clear();
     const MediaItem* m = state_->project().findMedia(media);
     if (!m || !visualSearchAvailable()) {

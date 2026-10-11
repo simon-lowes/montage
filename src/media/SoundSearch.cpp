@@ -365,6 +365,7 @@ bool indexSound(const std::string& path, double duration, VisualIndex& out, doub
     out = VisualIndex{};
     out.model = soundModel().id;
     out.step = step;
+    out.span = double(kClapWindow) / kClapRate;
     // The sound a block at a time; a window is embedded as soon as all of it is in.
     std::vector<float> buffer;
     size_t bufferStart = 0, next = 0, total = 0;  // in samples from the start

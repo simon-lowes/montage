@@ -15604,6 +15604,12 @@ private slots:
         QVERIFY2(said.similarity(0, speech) > 0.2f, qPrintable(QString::number(said.similarity(0, speech))));
         auto hits = findSounds(p, speech);
         QVERIFY(!hits.empty() && hits[0].media == jfk.id);
+        // A moment is the windows it was heard in (JFK's whole 10 s from its start, not 2 s around the middle), played
+        // from where they start.
+        QCOMPARE(said.span, 10.0);
+        QCOMPARE(hits[0].start, 0.0);
+        QVERIFY2(hits[0].end >= 10.0 - 1e-9, qPrintable(QString::number(hits[0].end)));
+        QCOMPARE(hits[0].best, 0.0);
         hits = findSounds(p, music);
         QVERIFY(!hits.empty() && hits[0].media == song.id);
         // Saved with the project.
@@ -15617,6 +15623,12 @@ private slots:
         Project fresh = makeDefaultProject();
         fresh.media.push_back(probeOrFail(fresh, MONTAGE_TEST_DATA_DIR "/jfk.wav"));
         fresh.media.push_back(probeOrFail(fresh, path("song.wav")));
+        {
+            MediaItem gone = probeOrFail(fresh, path("song.wav"));  // then offline: skipped, the rest still searched
+            gone.path = path("no-such-recording.wav");
+            gone.name = "no-such-recording.wav";
+            fresh.media.push_back(gone);
+        }
         const QString project = QString::fromStdString(path("find-sounds.montage"));
         QVERIFY(saveProject(fresh, project.toStdString()));
         McpServer server;
@@ -15630,8 +15642,9 @@ private slots:
         QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
         const QJsonArray moments = r.value("structuredContent").toObject().value("moments").toArray();
         QVERIFY(!moments.isEmpty() && moments[0].toObject().value("media").toString().endsWith("jfk.wav"));
+        QCOMPARE(r.value("structuredContent").toObject().value("skipped").toArray().size(), 1);
         QVERIFY(loadProject(project.toStdString(), back, &err));
-        for (const MediaItem& m : back.media) QVERIFY(m.sounds && !m.sounds->samples.empty());
+        for (const MediaItem& m : back.media) QCOMPARE(bool(m.sounds && !m.sounds->samples.empty()), m.name != "no-such-recording.wav");
     }
 
     void voiceCloning() {

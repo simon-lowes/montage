@@ -4865,12 +4865,15 @@ void McpServer::Impl::addTools() {
             const std::string query = need(a, "query").toStdString();
             std::string err;
             bool changed = false;
+            QJsonArray skipped;  // offline or unreadable: reported, and the rest still searched
             for (MediaItem& m : l.project.media) {
                 if (!m.hasAudio || m.path.empty() || m.subclipOf || (m.sounds && !m.sounds->samples.empty())) continue;
                 VisualIndex v;
                 if (!indexSound(m.path, m.duration, v, 0,
-                                [&](double f) { progress(f, QStringLiteral("Listening to %1").arg(QString::fromStdString(m.name))); }, nullptr, &err))
-                    return fail(QString::fromStdString(m.name + ": " + err));
+                                [&](double f) { progress(f, QStringLiteral("Listening to %1").arg(QString::fromStdString(m.name))); }, nullptr, &err)) {
+                    skipped.append(QJsonObject{{"media", QString::fromStdString(m.path)}, {"error", QString::fromStdString(err)}});
+                    continue;
+                }
                 m.sounds = std::make_shared<const VisualIndex>(std::move(v));
                 changed = true;
             }
@@ -4892,7 +4895,9 @@ void McpServer::Impl::addTools() {
                             .arg(h.end, 0, 'f', 1)
                             .arg(double(h.score), 0, 'f', 3);
             }
-            return ok(text.isEmpty() ? QStringLiteral("No recording with sound") : text, QJsonObject{{"moments", list}});
+            for (const QJsonValue& v : skipped)
+                text += QStringLiteral("(not searched: %1: %2)\n").arg(v.toObject().value("media").toString(), v.toObject().value("error").toString());
+            return ok(text.isEmpty() ? QStringLiteral("No recording with sound") : text, QJsonObject{{"moments", list}, {"skipped", skipped}});
         });
 
     add("montage_find_people", "Find people",

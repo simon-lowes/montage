@@ -21,6 +21,7 @@ struct VisualIndex {
     };
     std::string model;  // the model the embeddings come from
     double step = 0;    // seconds between samples
+    double span = 0;    // seconds each sample hears, centred on its time (a sound window); 0: an instant (a frame)
     std::vector<Sample> samples;
 
     // Adds a sample from a unit-length embedding (quantised to 8 bits).
@@ -41,7 +42,9 @@ struct ShotMatch {
     float score = 0;            // cosine similarity there
 };
 // The best moments across the project's indexed media, best first: runs of
-// samples close to their media's best score are joined into one moment.
+// samples close to their media's best score are joined into one moment (each
+// sample's span wide where it has one, else half a step either side; `best` is
+// then where the first window starts, so playing from it hears the sound).
 // `tolerance`: how far below a peak a neighbouring sample may score and still be part of its moment.
 std::vector<ShotMatch> findShots(const Project& p, const std::vector<float>& query, size_t max = 20, float tolerance = 0.015f);
 // The same over the media's sound indexes (media/SoundSearch.h): where the sound a query describes is heard.

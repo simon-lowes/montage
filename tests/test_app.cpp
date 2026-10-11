@@ -10068,6 +10068,10 @@ const auto seq = [this] { return state()->sequence(); };
         QSignalSpy opened(panel, &ShotSearchPanel::openRequested);
         panel->open(0);
         QCOMPARE(opened.count(), 1);
+        QCOMPARE(opened.at(0).at(1).value<FrameTime>(), FrameTime(0));  // the window it was heard in, from its start
+        // Find Similar (shots like a frame) switches back to what's shown, so it indexes videos, not sound.
+        panel->searchSimilar(ids[0], 1.0);
+        QCOMPARE(panel->mode(), ShotSearchPanel::Shown);
         state()->newProject();
     }
 
