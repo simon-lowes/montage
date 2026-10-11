@@ -2,6 +2,7 @@
 // Include after onnxruntime_cxx_api.h.
 #pragma once
 
+#include <memory>
 #include <string>
 
 namespace montage {
@@ -17,5 +18,9 @@ inline bool ortUsable(std::string* error) {
                  ") is older than the one Montage was built for (API " + std::to_string(ORT_API_VERSION) + ")";
     return false;
 }
+
+// A model opened on the device media/Inference.h chooses (the processor when that device will not take it), with
+// `options` otherwise as given.
+std::unique_ptr<Ort::Session> openModel(Ort::Env& env, const ORTCHAR_T* path, const Ort::SessionOptions& options);
 
 }  // namespace montage

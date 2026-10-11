@@ -4749,3 +4749,6 @@ colorspaces:
 
 QTEST_MAIN(TestRender)
 #include "test_render.moc"
+
+// (AI models run on the processor in tests, so results do not depend on the machine's GPU: media/Inference.h.)
+[[maybe_unused]] static const bool kCpuInference = (qputenv("MONTAGE_INFERENCE", "cpu"), true);

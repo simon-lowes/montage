@@ -561,7 +561,7 @@ std::shared_ptr<CloneModel> loadCloneModel(std::string* error) {
 #else
             const std::string path = dir + "/" + name;
 #endif
-            return std::make_unique<Ort::Session>(model->env, path.c_str(), options);
+            return openModel(model->env, path.c_str(), options);
         };
         model->encoder = open("speech_encoder.onnx", so);
         model->embed = open("embed_tokens.onnx", so);

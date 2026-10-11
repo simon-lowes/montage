@@ -50,6 +50,7 @@
 #include "media/DualSystem.h"
 #include "media/FieldRecorder.h"
 #include "media/Analysis.h"
+#include "media/Inference.h"
 #include "media/Proxy.h"
 #include "media/AudioSync.h"
 #include "media/AutoDuck.h"
@@ -17438,6 +17439,29 @@ private slots:
         QVERIFY(!edit::matchSequenceToMedia(s2, src));  // not empty
     }
 
+    void inferenceDevices() {
+        // The processor is always among the devices; a model runs in every mode (falling back to the processor when the
+        // device chosen cannot take it), and the environment variable wins over the setting.
+        const auto devices = montage::inferenceDevices();
+        QVERIFY(!devices.empty());
+        QVERIFY(std::any_of(devices.begin(), devices.end(), [](const InferenceDevice& d) { return d.kind == "CPU"; }));
+        InferenceMode parsed;
+        QVERIFY(parseInferenceMode("efficient", parsed) && parsed == InferenceMode::Efficient);
+        QVERIFY(!parseInferenceMode("gpu", parsed));
+        qunsetenv("MONTAGE_INFERENCE");
+        for (InferenceMode m : {InferenceMode::Auto, InferenceMode::Efficient, InferenceMode::Cpu}) {
+            setInferenceMode(m);
+            QCOMPARE(inferenceMode(), m);
+            std::string why;
+            QVERIFY2(inferenceCheck(&why), why.c_str());
+        }
+        qputenv("MONTAGE_INFERENCE", "cpu");  // (as the tests run)
+        setInferenceMode(InferenceMode::Auto);
+        QCOMPARE(inferenceMode(), InferenceMode::Cpu);
+        // A folder of things that are not provider libraries registers none.
+        QCOMPARE(registerInferenceLibraries(path("no-providers-here")), 0);
+    }
+
     void proxyFormatsAndOfflineEditing() {
         // A blue 512x288 clip with a 0.4 tone, a second long.
         std::string wav = path("pxtone.wav");
@@ -17683,3 +17707,6 @@ private slots:
 
 QTEST_MAIN(TestMedia)
 #include "test_media.moc"
+
+// (AI models run on the processor in tests, so results do not depend on the machine's GPU: media/Inference.h.)
+[[maybe_unused]] static const bool kCpuInference = (qputenv("MONTAGE_INFERENCE", "cpu"), true);

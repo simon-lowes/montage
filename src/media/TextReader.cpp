@@ -119,7 +119,7 @@ std::shared_ptr<TextReader> TextReader::load(const std::string& language, std::s
 #else
             const std::string path = pack.path(f);
 #endif
-            return std::make_unique<Ort::Session>(r->d_->env, path.c_str(), so);
+            return openModel(r->d_->env, path.c_str(), so);
         };
         r->d_->det = open(pack.files[0]);
         r->d_->rec = open(pack.files[latin ? 3 : 1]);

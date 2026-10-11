@@ -333,7 +333,7 @@ std::shared_ptr<Model> loadModel(const std::string& from, const std::string& to,
 #else
             const std::string path = file(name);
 #endif
-            return std::make_unique<Ort::Session>(model->env, path.c_str(), so);
+            return openModel(model->env, path.c_str(), so);
         };
         model->encoder = open("encoder.onnx");
         model->decoder = open("decoder.onnx");

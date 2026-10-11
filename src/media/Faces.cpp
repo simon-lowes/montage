@@ -146,7 +146,7 @@ std::shared_ptr<FaceModel> FaceModel::load(std::string* error) {
 #else
             const std::string path = pack.path(f);
 #endif
-            return std::make_unique<Ort::Session>(model->d_->env, path.c_str(), so);
+            return openModel(model->d_->env, path.c_str(), so);
         };
         model->d_->detector = open(pack.files[0]);
         model->d_->recogniser = open(pack.files[1]);

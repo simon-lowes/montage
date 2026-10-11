@@ -117,7 +117,7 @@ std::shared_ptr<Models> loadModels(std::string* error) {
         so.SetIntraOpNumThreads(int(std::max(1u, std::thread::hardware_concurrency())));
         so.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
         auto open = [&](const char* name) {
-            return std::make_unique<Ort::Session>(models->env, ortPath(dir + "/" + name).c_str(), so);
+            return openModel(models->env, ortPath(dir + "/" + name).c_str(), so);
         };
         models->encoder = open("vision_encoder.onnx");
         models->decoder = open("mask_decoder.onnx");

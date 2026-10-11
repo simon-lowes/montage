@@ -4529,6 +4529,24 @@ private slots:
         state()->newProject();
     }
 
+    void aiRunsOn() {
+        // Tools > AI Models Run On: one choice checked at a time, remembered in the settings.
+        QVERIFY(win_->findChild<QMenu*>("aiRunOn"));
+        QVERIFY(win_->findChild<QAction*>("aiDevices"));
+        auto* efficient = win_->findChild<QAction*>("aiRunOn_efficient");
+        auto* cpu = win_->findChild<QAction*>("aiRunOn_cpu");
+        auto* automatic = win_->findChild<QAction*>("aiRunOn_auto");
+        QVERIFY(efficient && cpu && automatic);
+        efficient->trigger();
+        QVERIFY(efficient->isChecked() && !automatic->isChecked() && !cpu->isChecked());
+        QCOMPARE(appSettings().value("ai/inference").toString(), QString("efficient"));
+        cpu->trigger();
+        QVERIFY(cpu->isChecked() && !efficient->isChecked());
+        QCOMPARE(appSettings().value("ai/inference").toString(), QString("cpu"));
+        automatic->trigger();
+        QCOMPARE(appSettings().value("ai/inference").toString(), QString("auto"));
+    }
+
     void reviewDrawingsAndVersions() {
         loadDemo();
         MonitorPanel* program = nullptr;
@@ -12567,3 +12585,6 @@ print("added " .. ui.name)
 
 QTEST_MAIN(TestApp)
 #include "test_app.moc"
+
+// (AI models run on the processor in tests, so results do not depend on the machine's GPU: media/Inference.h.)
+[[maybe_unused]] static const bool kCpuInference = (qputenv("MONTAGE_INFERENCE", "cpu"), true);

@@ -111,6 +111,7 @@
 #include "ProjectManagerDialog.h"
 #include "LinkMediaDialog.h"
 #include "EffectPresetStore.h"
+#include "media/Inference.h"
 #include "media/Proxy.h"
 #include "media/Relink.h"
 #include "KeyframePanel.h"
@@ -1925,6 +1926,51 @@ void MainWindow::buildMenus() {
         connect(dlg, &PluginManagerDialog::pluginsChanged, effects_, &EffectsBrowser::reload);
         dlg->show();
     });
+    {
+        // Where the AI models run (media/Inference.h): the GPU or NPU when there is one, or the processor only.
+        // Provider libraries beside the program or in Montage's data folder are registered first.
+        const QString exeDir = QCoreApplication::applicationDirPath() + QStringLiteral("/execution-providers");
+        const QString dataDir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/execution-providers");
+        for (const QString& d : {exeDir, dataDir}) registerInferenceLibraries(d.toStdString());
+        InferenceMode saved = InferenceMode::Auto;
+        parseInferenceMode(appSettings().value(QStringLiteral("ai/inference"), "auto").toString().toStdString(), saved);
+        setInferenceMode(saved);
+        QMenu* runOn = toolsM->addMenu(tr("AI Models Run On"));
+        runOn->setObjectName(QStringLiteral("aiRunOn"));
+        auto* modes = new QActionGroup(this);
+        const std::pair<InferenceMode, QString> choices[] = {
+            {InferenceMode::Auto, tr("Automatic (the GPU when there is one)")},
+            {InferenceMode::Efficient, tr("Power Saving (an NPU first)")},
+            {InferenceMode::Cpu, tr("This Computer's Processor Only")},
+        };
+        for (const auto& [mode, label] : choices) {
+            const InferenceMode m = mode;
+            QAction* a = runOn->addAction(label, this, [this, m] {
+                setInferenceMode(m);
+                appSettings().setValue(QStringLiteral("ai/inference"), QString::fromLatin1(inferenceModeName(m)));
+                statusBar()->showMessage(tr("AI models opened from now on run %1").arg(m == InferenceMode::Cpu ? tr("on the processor")
+                                                                                          : m == InferenceMode::Efficient ? tr("on an NPU when there is one")
+                                                                                                                          : tr("on the GPU when there is one")),
+                                         5000);
+            });
+            a->setObjectName(QStringLiteral("aiRunOn_") + QString::fromLatin1(inferenceModeName(m)));
+            a->setCheckable(true);
+            a->setChecked(m == saved);
+            modes->addAction(a);
+        }
+        runOn->addSeparator();
+        runOn->addAction(tr("Devices…"), this, [this] {
+            QStringList lines;
+            for (const InferenceDevice& d : inferenceDevices())
+                lines << QStringLiteral("%1 — %2%3").arg(QString::fromStdString(d.kind), QString::fromStdString(d.provider),
+                                                         d.vendor.empty() ? QString() : QStringLiteral(" (%1)").arg(QString::fromStdString(d.vendor)));
+            if (lines.isEmpty()) lines << tr("No AI runtime is loaded.");
+            if (inferenceFallbacks())
+                lines << QString() << tr("%n model(s) ran on the processor because the device would not take them: %1", "", inferenceFallbacks())
+                                          .arg(QString::fromStdString(lastInferenceFallback()));
+            QMessageBox::information(this, tr("AI Devices"), tr("AI models can run on:") + "\n\n" + lines.join("\n"));
+        })->setObjectName(QStringLiteral("aiDevices"));
+    }
     tb->addSeparator();
     tb->addAction(snapping_);
     tb->addSeparator();

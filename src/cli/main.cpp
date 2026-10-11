@@ -35,6 +35,7 @@
 #include "automation/McpServer.h"
 #include "automation/ScriptHost.h"
 #include "automation/ScriptPanel.h"
+#include "media/Inference.h"
 #include "media/Proxy.h"
 #ifdef MONTAGE_LIVE_BRIDGE
 #include "app/LiveBridge.h"
@@ -86,6 +87,7 @@ int usage() {
                  "  montage-cli frame <project.montage> --at TC -o <image.png>\n"
                  "  montage-cli presets\n"
                  "  montage-cli colorspaces\n"
+                 "  montage-cli devices                                (where AI models can run: CPU, GPU, NPU)\n"
                  "  montage-cli scenes <video> [--sensitivity 0..1]\n"
                  "  montage-cli proxy <video> -o <proxy.mp4|.mov> [--format h264|prores_proxy|dnxhr_lb|hevc10]\n"
                  "                    [--width 960|half|quarter] [--sound]   (an editing proxy; ProRes and HEVC keep HDR)\n"
@@ -1368,6 +1370,15 @@ int main(int argc, char** argv) {
     if (cmd == "render") return cmdRender(args);
     if (cmd == "frame") return cmdFrame(args);
     if (cmd == "presets") return cmdPresets();
+    if (cmd == "devices") {  // where the AI models can run (media/Inference.h)
+        for (const InferenceDevice& d : inferenceDevices())
+            std::printf("%-4s %s%s\n", d.kind.c_str(), d.provider.c_str(), d.vendor.empty() ? "" : (" (" + d.vendor + ")").c_str());
+        std::printf("Models run: %s (MONTAGE_INFERENCE=auto|efficient|cpu)\n", inferenceModeName(inferenceMode()));
+        std::string why;
+        const bool ok = inferenceCheck(&why);
+        std::printf("A test model: %s\n", ok ? "ran" : why.c_str());
+        return ok ? 0 : 1;
+    }
     if (cmd == "colorspaces") {
         for (const auto& c : colorSpaces())
             std::printf("%-20s %s%s\n", c.id.c_str(), c.label.c_str(), c.sceneReferred ? "  (media only)" : "");

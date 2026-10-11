@@ -205,7 +205,7 @@ std::shared_ptr<SentenceModel> SentenceModel::load(std::string* error) {
 #else
         const std::string path = pack.path(pack.files[0]);
 #endif
-        model->d_->session = std::make_unique<Ort::Session>(model->d_->env, path.c_str(), so);
+        model->d_->session = openModel(model->d_->env, path.c_str(), so);
     } catch (const Ort::Exception& e) {
         if (error) *error = std::string("The speech search model could not be loaded: ") + e.what();
         return nullptr;

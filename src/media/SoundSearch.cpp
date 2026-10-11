@@ -293,7 +293,7 @@ std::shared_ptr<SoundModel> SoundModel::load(std::string* error) {
 #else
             const std::string path = pack.path(f);
 #endif
-            return std::make_unique<Ort::Session>(model->d_->env, path.c_str(), so);
+            return openModel(model->d_->env, path.c_str(), so);
         };
         model->d_->audio = open(pack.files[0]);
         model->d_->text = open(pack.files[1]);

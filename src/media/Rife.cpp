@@ -145,7 +145,7 @@ std::shared_ptr<Model> loadModel(std::string* error) {
 #else
         const std::string& path = graph;
 #endif
-        model->session = std::make_unique<Ort::Session>(model->env, path.c_str(), so);
+        model->session = openModel(model->env, path.c_str(), so);
         *cached = model;
         return model;
     } catch (const Ort::Exception& e) {

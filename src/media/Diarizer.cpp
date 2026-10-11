@@ -314,7 +314,7 @@ std::shared_ptr<Models> loadModels(std::string* error) {
 #else
             const std::string path = pack.path(f);
 #endif
-            return std::make_unique<Ort::Session>(models->env, path.c_str(), so);
+            return openModel(models->env, path.c_str(), so);
         };
         models->segmentation = open(pack.files[0]);
         models->embedding = open(pack.files[1]);
