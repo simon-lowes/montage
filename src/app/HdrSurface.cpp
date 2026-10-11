@@ -1,5 +1,7 @@
 #include "HdrSurface.h"
 
+#include <QGuiApplication>
+
 #ifdef MONTAGE_HDR_VIEWER
 #include <QContextMenuEvent>
 #include <QCoreApplication>
@@ -157,6 +159,12 @@ bool HdrSurface::probe(QString* why) {
         QRhiNullInitParams params;
         g.rhi.reset(QRhi::create(QRhi::Null, &params));
     } else {
+#if defined(Q_OS_MACOS) || defined(Q_OS_WIN)
+        // A native window is needed: headless platforms (offscreen, minimal, VNC) have no swap chain to show HDR.
+        const QString platform = QGuiApplication::platformName();
+        if (platform != QLatin1String("cocoa") && platform != QLatin1String("windows") && platform != QLatin1String("direct2d"))
+            return fail(tr("HDR viewing needs a desktop display (this one is \"%1\")").arg(platform));
+#endif
 #if defined(Q_OS_MACOS)
         setSurfaceType(QSurface::MetalSurface);
         create();
