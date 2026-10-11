@@ -140,6 +140,10 @@ MixerPanel::MixerPanel(EditorState* state, QWidget* parent) : QWidget(parent), s
             discardPass();
             return;
         }
+        if (stopAt_ >= 0) {  // stopped, waiting for a drag that the switch has ended: written as that stop
+            finishPass(stopAt_, true);
+            return;
+        }
         finishPass(lastTick_, false);
         resume_ = true;
     });
@@ -581,7 +585,8 @@ void MixerPanel::rebaseRecorders() {
     }
     for (LaneRecording& lr : lanes_) {
         if (lr.valid && !lr.valid(s)) continue;
-        if (const Param* lane = lr.laneIn(s)) lr.rec.rebase(*lane, lr.stillIn ? lr.stillIn(s) : lane->value);
+        const double still = lr.stillIn ? lr.stillIn(s) : 0;  // (before laneIn, which may add an unstored parameter at 0)
+        if (const Param* lane = lr.laneIn(s)) lr.rec.rebase(*lane, lr.stillIn ? still : lane->value);
     }
     liveState_.clear();
 }
@@ -1116,7 +1121,7 @@ void MixerPanel::followAutomation() {
 
 void MixerPanel::playbackStarted(FrameTime t) {
     const Sequence* seq = state_->sequence();
-    if (recordingAutomation() || !seq) return;
+    if (recordingAutomation() || !seq) return;  // (a stopped pass waiting for a drag: this playback is not recorded)
     for (size_t i = 0; i < seq->audioTracks.size() && i < strips_.size(); ++i) {
         const Track& tr = seq->audioTracks[i];
         const AutomationMode m = trackAutomation(tr);
@@ -1452,8 +1457,9 @@ void MixerPanel::restoreControls() {
 
 void MixerPanel::playbackStopped(FrameTime t) {
     resume_ = false;
-    if (!recordingAutomation()) return;
+    if (!recordingAutomation() || stopAt_ >= 0) return;  // (already waiting: written at the first stop)
     stopAt_ = t;
+    emit liveMix({});  // what plays from now on is the project, even if the pass waits to be written
     finishWhenFree();
 }
 
@@ -1493,9 +1499,17 @@ void MixerPanel::finishPass(FrameTime t, bool final) {
     // what those lanes hold now, on the sequence it was recorded on. Lanes nothing was written to are left alone, and
     // a pass that wrote nothing makes no edit.
     emit liveMix({});
-    if (passWrote() && state_->projectGeneration() == passGeneration_) {
-        state_->edit(tr("Write Automation"), [this, t, final](Project& p, Sequence&) {
-            Sequence* s = p.findSequence(passSeq_);
+    const bool commit = passWrote() && state_->projectGeneration() == passGeneration_;
+    // The pass ends before its edit, so what refreshes for the edit (the strips, Inspector rows, plugin editors) reads
+    // the project, not the pass.
+    std::vector<Recording> recording = std::move(recording_);
+    std::vector<LaneRecording> lanes = std::move(lanes_);
+    const std::vector<Id> fromWrite = busesFromWrite_;
+    const Id sequence = passSeq_;
+    clearPass();
+    if (commit) {
+        state_->edit(tr("Write Automation"), [&](Project& p, Sequence&) {
+            Sequence* s = p.findSequence(sequence);
             if (!s) return false;
             bool wrote = false;
             auto write = [&](AutomationRecorder& rec, Param& lane, double still, double tolerance, bool hold, bool whole) {
@@ -1506,7 +1520,7 @@ void MixerPanel::finishPass(FrameTime t, bool final) {
                 if (hold) out = switchLane(out, whole);
                 if (out.animated() || lane.animated()) lane = out;
             };
-            for (Recording& r : recording_) {
+            for (Recording& r : recording) {
                 if (r.track >= int(s->audioTracks.size()) || s->audioTracks[size_t(r.track)].id != r.trackId) continue;
                 Track& tr = s->audioTracks[size_t(r.track)];
                 write(r.volume, tr.volumeAuto, tr.volumeDb, 0.1, false, false);
@@ -1521,23 +1535,22 @@ void MixerPanel::finishPass(FrameTime t, bool final) {
                     wrote = true;
                 }
             }
-            for (LaneRecording& lr : lanes_) {
+            for (LaneRecording& lr : lanes) {
                 if (lr.valid && !lr.valid(*s)) continue;
                 const double still = lr.stillIn ? lr.stillIn(*s) : 0;
                 if (Param* lane = lr.laneIn(*s)) write(lr.rec, *lane, lr.stillIn ? still : lane->value, lr.tolerance, lr.hold, lr.whole);
             }
             // Write hands over to Touch, so the next pass does not write over this one unless a control is moved.
             if (wrote && final) {
-                for (const Recording& r : recording_)
+                for (const Recording& r : recording)
                     if (r.mode == AutomationMode::Write && r.track < int(s->audioTracks.size()) && s->audioTracks[size_t(r.track)].id == r.trackId)
                         s->audioTracks[size_t(r.track)].automation = int(AutomationMode::Touch);
                 for (Bus& b : s->buses)
-                    if (std::find(busesFromWrite_.begin(), busesFromWrite_.end(), b.id) != busesFromWrite_.end()) b.automation = int(AutomationMode::Touch);
+                    if (std::find(fromWrite.begin(), fromWrite.end(), b.id) != fromWrite.end()) b.automation = int(AutomationMode::Touch);
             }
             return wrote;
         });
     }
-    clearPass();
     refresh();
 }
 

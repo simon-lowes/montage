@@ -1324,6 +1324,42 @@ private slots:
         QCOMPARE(a1().volumeAuto.at(6), -20.0);
         QVERIFY(std::any_of(state()->sequence()->markers.begin(), state()->sequence()->markers.end(),
                             [](const Marker& m) { return m.name == "dragged"; }));
+        // Played again and stopped again while the pass waits for a drag: written at the first stop (Latch writes to
+        // the stop), nothing more.
+        mixer->trackAutomationMode(0)->setCurrentIndex(int(AutomationMode::Latch));
+        const Param before = a1().volumeAuto;
+        mixer->playbackStarted(0);
+        for (FrameTime f = 0; f <= 20; ++f) {
+            if (f == 5) {
+                fader->setSliderDown(true);
+                fader->setValue(-150);
+            }
+            if (f == 8) fader->setSliderDown(false);
+            mixer->playbackPosition(f);
+        }
+        state()->beginGesture("Drag 3");
+        mixer->playbackStopped(20);
+        mixer->playbackStarted(0);
+        for (FrameTime f = 0; f <= 40; ++f) mixer->playbackPosition(f);
+        mixer->playbackStopped(40);
+        state()->endGesture(false);
+        QTRY_VERIFY(!mixer->recordingAutomation());
+        QCOMPARE(a1().volumeAuto.at(15), -15.0);
+        QCOMPARE(a1().volumeAuto.at(30), before.at(30));  // not written on to the second stop
+        // An insert parameter the effect does not store yet keeps its default (not 0) when the pass follows an edit.
+        mixer->trackAutomationMode(0)->setCurrentIndex(int(AutomationMode::Touch));
+        mixer->playbackStarted(0);
+        for (FrameTime f = 0; f <= 40; ++f) {
+            if (f == 5) QVERIFY(state()->captureParameter({track, eq, "high_hz", 6000, 5000, 1, false, {}}));
+            if (f == 8) QVERIFY(state()->edit("Rename 3", [](Project&, Sequence& s) {
+                s.audioTracks[0].name = "Dialogue 3";
+                return true;
+            }));
+            mixer->playbackPosition(f);
+            if (f == 6) QCOMPARE(*state()->liveParameter(track, eq, "high_hz"), 6000.0);
+            if (f == 39) QCOMPARE(*state()->liveParameter(track, eq, "high_hz"), 5000.0);  // let go: back to its default
+        }
+        mixer->playbackStopped(40);
         // A pass that wrote nothing leaves a gesture alone at the stop.
         mixer->playbackStarted(0);
         state()->beginGesture("Drag 2");
