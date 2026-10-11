@@ -4480,6 +4480,10 @@ private slots:
         bool shown = false;
         win_->chartDialogHook_ = [&](ChartMatchDialog* dlg) {
             shown = true;
+            // Looked for in the background: nothing to apply until it is found.
+            QVERIFY(!dlg->findChild<QPushButton*>("chartApply")->isEnabled());
+            QTRY_VERIFY(!dlg->searching() && dlg->ready());
+            QVERIFY(dlg->findChild<QPushButton*>("chartApply")->isEnabled());
             const TrackQuad found = dlg->quad();
             QVERIFY(std::fabs(found.p[0].x - 120.0 / 640) < 0.02 && std::fabs(found.p[2].y - 280.0 / 360) < 0.03);
             QVERIFY(dlg->fit().deltaEBefore > 5 && dlg->fit().deltaEAfter < 2);
@@ -4489,8 +4493,17 @@ private slots:
             dlg->setQuad(off);
             QVERIFY(dlg->fit().deltaEAfter > 3 || !dlg->fit().ok);
             dlg->findChild<QPushButton*>("chartFind")->click();
+            QTRY_VERIFY(!dlg->searching() && dlg->fit().ok);
             QVERIFY(dlg->fit().deltaEAfter < 2);
             after = dlg->findChild<QLabel*>("chartStatus")->text();
+            // The corners move with the keys: 3 picks the bottom right, Shift+Right moves it ten pixels of the frame.
+            auto* view = dlg->findChild<QWidget*>("chartView");
+            const double x = dlg->quad().p[2].x;
+            QTest::keyClick(view, Qt::Key_3);
+            QTest::keyClick(view, Qt::Key_Right, Qt::ShiftModifier);
+            QVERIFY(std::fabs(dlg->quad().p[2].x - (x + 10.0 / 640)) < 1e-6);
+            QTest::keyClick(view, Qt::Key_Left, Qt::ShiftModifier);
+            QVERIFY(std::fabs(dlg->quad().p[2].x - x) < 1e-6);
             QMetaObject::invokeMethod(dlg, "accept", Qt::QueuedConnection);
         };
         QCOMPARE(win_->matchColourChart(), 1);
@@ -4518,6 +4531,7 @@ private slots:
         QVERIFY(!chartOn(a));
         // Every clip of the media, when asked; cancelling changes nothing.
         win_->chartDialogHook_ = [](ChartMatchDialog* dlg) {
+            QTRY_VERIFY(!dlg->searching());
             dlg->findChild<QCheckBox*>("chartSameMedia")->setChecked(true);
             QMetaObject::invokeMethod(dlg, "accept", Qt::QueuedConnection);
         };
@@ -4525,6 +4539,31 @@ private slots:
         QVERIFY(chartOn(a) && chartOn(b));
         win_->chartDialogHook_ = [](ChartMatchDialog* dlg) { QMetaObject::invokeMethod(dlg, "reject", Qt::QueuedConnection); };
         QCOMPARE(win_->matchColourChart(), 0);
+        // A picture with no chart: Apply stays off, and accepting anyway changes nothing.
+        {
+            const QString plain = dir_.filePath("plain.png");
+            QImage grey(640, 360, QImage::Format_RGB32);
+            grey.fill(QColor(90, 90, 90));
+            QVERIFY(grey.save(plain));
+            const auto plainIds = state()->importFiles({plain});
+            QCOMPARE(plainIds.size(), size_t(1));
+            Id c = 0;
+            QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+                if (!edit::placeMedia(p, s, plainIds[0], 200, 0, 30, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok) return false;
+                c = s.videoTracks[0].clips.back().id;
+                return true;
+            }));
+            state()->setSelection({c}, false);
+            bool apply = true;
+            win_->chartDialogHook_ = [&](ChartMatchDialog* dlg) {
+                QTRY_VERIFY(!dlg->searching());
+                apply = dlg->findChild<QPushButton*>("chartApply")->isEnabled() || dlg->ready();
+                QMetaObject::invokeMethod(dlg, "accept", Qt::QueuedConnection);
+            };
+            QCOMPARE(win_->matchColourChart(), 0);
+            QVERIFY(!apply);
+            QVERIFY(!chartOn(c));
+        }
         win_->chartDialogHook_ = nullptr;
         state()->newProject();
     }

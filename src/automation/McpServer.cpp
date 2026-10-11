@@ -6106,7 +6106,7 @@ void McpServer::Impl::addTools() {
         "patches and puts a Chart Match first in the clip's effects (a colour matrix in linear light) that brings them to "
         "the chart's published values. `same_media` grades every clip of the same media too. Returns the corners and "
         "the patches' mean CIE76 delta E before and after (under 2 is a close match). `measure_only` changes nothing.",
-        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":["number","string"],"description":"Clip id or name"},
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":["number","string"],"description":"A video clip's id or name"},
             "at":{"type":["number","string"],"description":"Timeline time of the frame showing the chart"},
             "corners":{"type":"array","items":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},"minItems":4,"maxItems":4},
             "same_media":{"type":"boolean","default":false},"measure_only":{"type":"boolean","default":false}},
@@ -6114,7 +6114,23 @@ void McpServer::Impl::addTools() {
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
-            const Clip clip = clipArg(l, a);
+            // A video clip, by id or by its name.
+            const Clip* found = nullptr;
+            if (a.value("clip").isString()) {
+                const std::string name = a.value("clip").toString().toStdString();
+                for (const Track& t : s.videoTracks)
+                    for (const Clip& c : t.clips)
+                        if (c.name == name) {
+                            if (found) throw ArgError{QStringLiteral("Several clips are named \"%1\": give its id").arg(QString::fromStdString(name))};
+                            found = &c;
+                        }
+                if (!found) throw ArgError{QStringLiteral("No video clip named \"%1\" in the active sequence").arg(QString::fromStdString(name))};
+            } else {
+                found = &clipArg(l, a);
+                const auto loc = edit::locate(s, found->id);
+                if (!loc || loc->track.kind != TrackKind::Video) throw ArgError{"\"clip\" must be a video clip (its picture, not its sound)"};
+            }
+            const Clip clip = *found;
             const FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : clip.start + clip.duration / 2;
             const Image frame = chartFrame(l.project, s, clip, at);
             if (frame.empty()) return fail("The clip has no picture to read a chart from");
@@ -6126,12 +6142,17 @@ void McpServer::Impl::addTools() {
                 for (int i = 0; i < 4; ++i) {
                     const QJsonArray pt = cs[i].toArray();
                     if (pt.size() != 2 || !pt[0].isDouble() || !pt[1].isDouble()) throw ArgError{"\"corners\" is four [x, y] pairs"};
-                    q.p[i] = {pt[0].toDouble(), pt[1].toDouble()};
+                    const double x = pt[0].toDouble(), y = pt[1].toDouble();
+                    if (!(x >= 0 && x <= 1 && y >= 0 && y <= 1)) throw ArgError{"\"corners\" are fractions of the frame, 0 to 1"};
+                    q.p[i] = {x, y};
                 }
-            } else if (!detectChart(frame, q, &residual)) {
+            } else if (!detectChart(chartView(frame, s), q, &residual)) {
                 return fail("No ColorChecker chart found in the picture: give its corners");
             }
-            const ChartFit fit = fitChart(sampleChart(frame, q));
+            bool complete = false;
+            const ChartColors shot = sampleChart(frame, q, sequenceColorSpace(s), &complete);
+            if (!complete) throw ArgError{"\"corners\" must outline the chart: four corners apart, in order round it, not crossed"};
+            const ChartFit fit = fitChart(shot);
             if (!fit.ok) return fail("The patches could not be matched (are the corners on the chart?)");
             QJsonArray corners;
             for (const Point2& p : q.p) corners.append(QJsonArray{std::round(p.x * 1e4) / 1e4, std::round(p.y * 1e4) / 1e4});

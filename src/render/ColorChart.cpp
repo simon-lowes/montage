@@ -4,9 +4,11 @@
 #include <cmath>
 #include <vector>
 
+#include "core/ColorGroups.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
-#include "render/Compositor.h"
+#include "media/MediaPool.h"
+#include "render/Processing.h"
 
 namespace montage {
 
@@ -92,10 +94,71 @@ double fitAffine(const std::vector<ChartColor>& in, const std::vector<ChartColor
 // Chart (u, v in 0..1, u across its 6 columns) to the picture, for an outline.
 Point2 onQuad(const Homography& h, double u, double v) { return h.apply({u, v}); }
 
-Homography quadHomography(const TrackQuad& q) {
-    Homography h;
-    fitHomography({{0, 0}, {1, 0}, {1, 1}, {0, 1}}, {q.p[0], q.p[1], q.p[2], q.p[3]}, h);
-    return h;
+// The outline's homography; false when it is no outline (corners together, in a line, or crossed).
+bool quadHomography(const TrackQuad& q, Homography& h) {
+    double area = 0;
+    int sign = 0;
+    for (int i = 0; i < 4; ++i) {
+        const Point2 &a = q.p[i], &b = q.p[(i + 1) % 4], &c = q.p[(i + 2) % 4];
+        if (!std::isfinite(a.x) || !std::isfinite(a.y)) return false;
+        area += a.x * b.y - b.x * a.y;
+        const double turn = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x);
+        const int sg = turn > 0 ? 1 : turn < 0 ? -1 : 0;
+        if (sg == 0 || (sign && sg != sign)) return false;
+        sign = sg;
+    }
+    if (std::fabs(area) / 2 < 1e-4) return false;
+    return fitHomography({{0, 0}, {1, 0}, {1, 1}, {0, 1}}, {q.p[0], q.p[1], q.p[2], q.p[3]}, h);
+}
+
+// HLG's OOTF as convertColor applies it: a 1000-nit display, system gamma 1.2, SDR white at 203 nits.
+constexpr double kHlgPeakNits = 1000, kHlgSystemGamma = 1.2, kSdrWhiteNits = 203;
+template <typename T>
+T luma2020(const T c[3]) {
+    return T(0.2627) * c[0] + T(0.6780) * c[1] + T(0.0593) * c[2];
+}
+
+// How a colour space's code values become linear light with SDR white at 1, and back: each channel through the
+// transfer curve (negatives mirrored for the display curves, so out-of-gamut colour survives), then for HLG the
+// OOTF taking scene light to display light (and its inverse), which works on the three channels together.
+struct LinearLight {
+    Transfer tr;
+    bool hlg = false, mirror = true;
+    explicit LinearLight(const ColorSpace& cs) : tr(cs.transfer) {
+        hlg = tr == Transfer::Hlg;
+        mirror = tr == Transfer::Bt1886 || tr == Transfer::Srgb || tr == Transfer::Pq || hlg;
+    }
+    double lin(double v) const {
+        if (!std::isfinite(v)) return 0;
+        return v < 0 && mirror ? -toLinear(tr, -v) : toLinear(tr, v);
+    }
+    double code(double l) const {
+        if (!std::isfinite(l)) return 0;
+        return l < 0 && mirror ? -fromLinear(tr, -l) : fromLinear(tr, l);
+    }
+    // The gain taking a pixel's channel values (as lin gives them) to display light, and display light back.
+    template <typename T>
+    T toDisplay(const T c[3]) const {
+        if (!hlg) return T(1);
+        const T ys = std::max(T(0), luma2020(c));
+        return T(kHlgPeakNits / kSdrWhiteNits) * std::pow(ys, T(kHlgSystemGamma - 1));
+    }
+    template <typename T>
+    T toScene(const T l[3]) const {
+        if (!hlg) return T(1);
+        const T yd = std::max(T(1e-12), luma2020(l) * T(kSdrWhiteNits / kHlgPeakNits));
+        return std::pow(yd, T((1 - kHlgSystemGamma) / kHlgSystemGamma)) * T(kSdrWhiteNits / kHlgPeakNits);
+    }
+    void decode(double c[3]) const {
+        for (int k = 0; k < 3; ++k) c[k] = lin(c[k]);
+        const double g = toDisplay(c);
+        for (int k = 0; k < 3; ++k) c[k] *= g;
+    }
+};
+
+void mul3(const double a[9], const double b[9], double out[9]) {
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c) out[r * 3 + c] = a[r * 3] * b[c] + a[r * 3 + 1] * b[3 + c] + a[r * 3 + 2] * b[6 + c];
 }
 
 }  // namespace
@@ -117,10 +180,12 @@ const ChartColors& colorChecker24() {
 
 const char* colorCheckerName(int patch) { return patch >= 0 && patch < 24 ? kNames[patch] : ""; }
 
-ChartColors sampleChart(const Image& img, const TrackQuad& quad) {
+ChartColors sampleChart(const Image& img, const TrackQuad& quad, const ColorSpace& space, bool* complete) {
     ChartColors out{};
-    if (img.empty()) return out;
-    const Homography h = quadHomography(quad);
+    if (complete) *complete = false;
+    Homography h;
+    if (img.empty() || !quadHomography(quad, h)) return out;
+    bool all = true;
     constexpr int kSteps = 9;  // a 9 x 9 grid of samples across each patch's middle half
     for (int r = 0; r < 4; ++r)
         for (int c = 0; c < 6; ++c) {
@@ -133,19 +198,37 @@ ChartColors sampleChart(const Image& img, const TrackQuad& quad) {
                     const int x = int(std::floor(p.x * img.width)), y = int(std::floor(p.y * img.height));
                     if (x < 0 || y < 0 || x >= img.width || y >= img.height) continue;
                     const float* px = img.at(x, y);
-                    for (int k = 0; k < 3; ++k) sum[k] += px[k];
+                    if (px[3] <= 0) continue;
+                    for (int k = 0; k < 3; ++k) sum[k] += px[k] / px[3];
                     ++n;
                 }
             ChartColor& o = out[size_t(r * 6 + c)];
             for (int k = 0; k < 3; ++k) o[size_t(k)] = n ? sum[k] / n : 0.0;
+            all = all && n >= kSteps * kSteps / 2;
         }
+    // Into Rec.709 code values: the picture's linear light in Rec.709 primaries, with the chart's 2.4 gamma.
+    if (space.id != rec709Space().id) {
+        const LinearLight from(space);
+        double m[9];
+        primariesMatrix(space.primaries, Primaries::Bt709, m);
+        for (ChartColor& o : out) {
+            double l[3] = {o[0], o[1], o[2]};
+            from.decode(l);
+            for (int k = 0; k < 3; ++k) {
+                const double v = m[k * 3] * l[0] + m[k * 3 + 1] * l[1] + m[k * 3 + 2] * l[2];
+                o[size_t(k)] = v < 0 ? -toCode(-v) : toCode(v);
+            }
+        }
+    }
+    if (complete) *complete = all;
     return out;
 }
 
 bool detectChart(const Image& img, TrackQuad& out, double* residual) {
     if (img.width < 24 || img.height < 16) return false;
-    // A smaller copy (at most 360 wide) and its summed-area tables, so any box's mean is four look-ups.
-    const int sw = std::min(360, img.width), sh = std::max(1, int(std::lround(double(img.height) * sw / img.width)));
+    // A smaller copy (its longest side at most 360) and its summed-area tables, so any box's mean is four look-ups.
+    const double shrink = std::min(1.0, 360.0 / std::max(img.width, img.height));
+    const int sw = std::max(1, int(std::lround(img.width * shrink))), sh = std::max(1, int(std::lround(img.height * shrink)));
     std::vector<double> sat[3];
     for (auto& s : sat) s.assign(size_t(sw + 1) * size_t(sh + 1), 0.0);
     for (int y = 0; y < sh; ++y) {
@@ -190,7 +273,9 @@ bool detectChart(const Image& img, TrackQuad& out, double* residual) {
         int turn = 0;
         double x = 0, y = 0, w = 0, h = 0;
     } best;
-    auto score = [&](int turn, double x, double y, double w, double h) {
+    // `box`: the part of each patch sampled about its middle (a quarter each way, or an eighth in the coarse search,
+    // whose rectangles are further apart).
+    auto score = [&](int turn, double x, double y, double w, double h, double box = 0.25) {
         const double cw = (turn < 2 ? w / 6 : w / 4), ch = (turn < 2 ? h / 4 : h / 6);  // a patch's size
         if (cw < 3 || ch < 3) return 1e9;
         double lum[24];
@@ -198,7 +283,7 @@ bool detectChart(const Image& img, TrackQuad& out, double* residual) {
             const int r = i / 6, c = i % 6;
             const Point2 p = place(turn, x, y, w, h, (c + 0.5) / 6, (r + 0.5) / 4);
             ChartColor& m = measured[size_t(i)];
-            if (!boxMean(p.x - cw / 4, p.y - ch / 4, p.x + cw / 4, p.y + ch / 4, m)) return false;
+            if (!boxMean(p.x - cw * box, p.y - ch * box, p.x + cw * box, p.y + ch * box, m)) return false;
             lum[i] = 0.2126 * m[0] + 0.7152 * m[1] + 0.0722 * m[2];
             return true;
         };
@@ -213,19 +298,45 @@ bool detectChart(const Image& img, TrackQuad& out, double* residual) {
         double A[3][4];
         return fitAffine(measured, target, A, 1e-4, kIdentity);
     };
+    // Coarse to fine: rectangles half a patch apart, each patch sampled close to its middle so a rectangle that far off
+    // still reads the right patches; the best few places (apart from each other) then searched a sixth of a patch apart.
+    std::vector<Best> coarse;
     for (int turn = 0; turn < 4; ++turn)
         for (double aspect : {1.3, 1.45, 1.6, 1.75}) {
             const double ar = turn < 2 ? aspect : 1 / aspect;  // width over height on the picture
             for (double w = 0.12 * sw; w <= sw; w *= 1.08) {
                 const double h = w / ar;
                 if (h > sh) break;
-                const double step = std::max(1.0, std::min(w, h) / 24);
+                const double step = std::max(1.0, std::min(w, h) / 8);
                 for (double y = 0; y + h <= sh; y += step)
                     for (double x = 0; x + w <= sw; x += step) {
-                        const double s = score(turn, x, y, w, h);
-                        if (s < best.score) best = {s, turn, x, y, w, h};
+                        const double s = score(turn, x, y, w, h, 0.125);
+                        if (s < 0.15) coarse.push_back({s, turn, x, y, w, h});
                     }
             }
+        }
+    std::sort(coarse.begin(), coarse.end(), [](const Best& a, const Best& b) { return a.score < b.score; });
+    std::vector<Best> places;
+    for (const Best& c : coarse) {
+        if (places.size() >= 16) break;
+        const bool near = std::any_of(places.begin(), places.end(), [&](const Best& o) {
+            const double ix = std::max(0.0, std::min(c.x + c.w, o.x + o.w) - std::max(c.x, o.x));
+            const double iy = std::max(0.0, std::min(c.y + c.h, o.y + o.h) - std::max(c.y, o.y));
+            return ix * iy > 0.5 * std::min(c.w * c.h, o.w * o.h);
+        });
+        if (!near) places.push_back(c);
+    }
+    for (const Best& c : places)
+        for (double k : {1 / 1.08, 1.0, 1.08}) {
+            const double w = c.w * k, h = c.h * k, reach = std::max(1.0, std::min(c.w, c.h) / 8);
+            const double step = std::max(0.5, std::min(w, h) / 24);
+            for (double dy = -reach; dy <= reach + 1e-9; dy += step)
+                for (double dx = -reach; dx <= reach + 1e-9; dx += step) {
+                    const double x = c.x + (c.w - w) / 2 + dx, y = c.y + (c.h - h) / 2 + dy;
+                    if (x < 0 || y < 0 || x + w > sw || y + h > sh) continue;
+                    const double s = score(c.turn, x, y, w, h);
+                    if (s < best.score) best = {s, c.turn, x, y, w, h};
+                }
         }
     if (best.score > 0.08) return false;
     // Refined: each edge nudged while that fits better, in ever smaller steps.
@@ -290,7 +401,7 @@ double deltaE76(const ChartColor& a, const ChartColor& b) {
     return std::sqrt((x[0] - y[0]) * (x[0] - y[0]) + (x[1] - y[1]) * (x[1] - y[1]) + (x[2] - y[2]) * (x[2] - y[2]));
 }
 
-Effect chartMatchEffect(const ChartFit& f, Id id) {
+Effect chartMatchEffect(const ChartFit& f, Id id, const std::string& space) {
     Effect e = makeEffect("chart_match", id);
     static const char* const m[3][3] = {{"rr", "rg", "rb"}, {"gr", "gg", "gb"}, {"br", "bg", "bb"}};
     static const char* const o[3] = {"offset_r", "offset_g", "offset_b"};
@@ -298,70 +409,128 @@ Effect chartMatchEffect(const ChartFit& f, Id id) {
         for (int k = 0; k < 3; ++k) e.params[m[c][k]] = f.m[c][k];
         e.params[o[c]] = f.offset[c];
     }
+    e.strings["space"] = space;
     return e;
 }
 
 void applyChartMatch(const Effect& e, FrameTime t, Image& img) {
-    const double amount = std::clamp(e.p("amount", t, 100) / 100, 0.0, 1.0);
-    if (amount <= 0) return;
+    const float a = float(std::clamp(e.p("amount", t, 100) / 100, 0.0, 1.0));
+    if (!(a > 0) || img.empty()) return;
+    const ColorSpace* found = findColorSpace(e.s("space"));
+    const ColorSpace& space = found ? *found : rec709Space();
+    const LinearLight light(space);
+    // The fit (made in linear Rec.709) in the picture's own primaries: to Rec.709, the fit, back again.
     static const char* const names[3][3] = {{"rr", "rg", "rb"}, {"gr", "gg", "gb"}, {"br", "bg", "bb"}};
-    float m[3][3], off[3];
+    double fit[9], off[3];
     for (int c = 0; c < 3; ++c) {
-        for (int k = 0; k < 3; ++k) m[c][k] = float(e.p(names[c][k], t, c == k ? 1 : 0));
-        off[c] = float(e.p(c == 0 ? "offset_r" : c == 1 ? "offset_g" : "offset_b", t, 0));
+        for (int k = 0; k < 3; ++k) fit[c * 3 + k] = e.p(names[c][k], t, c == k ? 1 : 0);
+        off[c] = e.p(c == 0 ? "offset_r" : c == 1 ? "offset_g" : "offset_b", t, 0);
     }
-    // Tables for the gamma both ways (code values 0..1 in, linear 0..2 out), straight maths beyond them.
-    static const auto tables = [] {
-        std::pair<std::vector<float>, std::vector<float>> t;
-        t.first.resize(4097);
-        t.second.resize(8193);
-        for (int i = 0; i <= 4096; ++i) t.first[size_t(i)] = float(toLin(i / 4096.0));
-        for (int i = 0; i <= 8192; ++i) t.second[size_t(i)] = float(toCode(2.0 * i / 8192));
-        return t;
-    }();
-    auto lin = [&](float v) {
-        if (v <= 0) return 0.0f;
-        if (v >= 1) return float(toLin(v));
-        const float x = v * 4096, f = x - std::floor(x);
-        const size_t i = size_t(x);
-        return tables.first[i] + (tables.first[std::min<size_t>(i + 1, 4096)] - tables.first[i]) * f;
-    };
-    auto code = [&](float v) {
-        if (v <= 0) return 0.0f;
-        if (v >= 2) return float(toCode(v));
-        const float x = v * 4096, f = x - std::floor(x);
-        const size_t i = size_t(x);
-        return tables.second[i] + (tables.second[std::min<size_t>(i + 1, 8192)] - tables.second[i]) * f;
-    };
-    const float a = float(amount);
-    const size_t n = size_t(img.width) * size_t(img.height);
-#pragma omp parallel for if (n > 65536)
-    for (long long i = 0; i < (long long)n; ++i) {
-        float* px = img.px.data() + size_t(i) * 4;
-        const float l[3] = {lin(px[0]), lin(px[1]), lin(px[2])};
-        for (int c = 0; c < 3; ++c) {
-            const float v = code(m[c][0] * l[0] + m[c][1] * l[1] + m[c][2] * l[2] + off[c]);
-            px[c] += (v - px[c]) * a;
+    double to709[9], from709[9], tmp[9], whole[9];
+    primariesMatrix(space.primaries, Primaries::Bt709, to709);
+    primariesMatrix(Primaries::Bt709, space.primaries, from709);
+    mul3(fit, to709, tmp);
+    mul3(from709, tmp, whole);
+    float m[9], o[3];
+    for (int i = 0; i < 9; ++i) m[i] = float(whole[i]);
+    for (int c = 0; c < 3; ++c) o[c] = float(from709[c * 3] * off[0] + from709[c * 3 + 1] * off[1] + from709[c * 3 + 2] * off[2]);
+    // Tables both ways: code values 0..1 to linear light (smooth there), and linear light up to code value 1's to code
+    // values, looked up by the fourth root of the light so the curve's steep start by black is followed closely. Exact
+    // maths outside them; negatives mirrored; anything not a number becomes black. (HLG's OOTF on top, per pixel.)
+    constexpr int kN = 4096;
+    const double top = std::max(1e-6, light.lin(1.0)), rootTop = std::sqrt(std::sqrt(top));
+    std::vector<float> dec(kN + 2), enc(kN + 2);
+    for (int i = 0; i <= kN + 1; ++i) {
+        dec[size_t(i)] = float(light.lin(std::min(1.0, double(i) / kN)));
+        const double w = rootTop * std::min(1.0, double(i) / kN);
+        enc[size_t(i)] = float(light.code(w * w * w * w));
+    }
+    auto lin = [&](float v) -> float {
+        if (v >= 0.0f && v <= 1.0f) {
+            const float x = v * kN;
+            const int i = int(x);
+            return dec[size_t(i)] + (dec[size_t(i) + 1] - dec[size_t(i)]) * (x - float(i));
         }
-    }
+        return float(light.lin(v));
+    };
+    const float scale = float(kN / rootTop);
+    auto code = [&](float l) -> float {
+        if (l >= 0.0f && l <= float(top)) {
+            const float x = std::sqrt(std::sqrt(l)) * scale;
+            const int i = std::min(kN, int(x));
+            return enc[size_t(i)] + (enc[size_t(i) + 1] - enc[size_t(i)]) * (x - float(i));
+        }
+        return float(light.code(l));
+    };
+    // Straight colour (the picture is premultiplied), so edges and empty pixels stay as they are.
+    parallelRows(img.height, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y) {
+            float* px = img.row(y);
+            for (int x = 0; x < img.width; ++x, px += 4) {
+                const float alpha = px[3];
+                if (!(alpha > 0)) continue;
+                const float inv = 1 / alpha;
+                float v[3] = {px[0] * inv, px[1] * inv, px[2] * inv};
+                for (float& x : v)
+                    if (!std::isfinite(x)) x = 0;
+                float l[3] = {lin(v[0]), lin(v[1]), lin(v[2])};
+                if (light.hlg) {
+                    const float g = light.toDisplay(l);
+                    for (float& x : l) x *= g;
+                }
+                float r[3];
+                for (int c = 0; c < 3; ++c) r[c] = m[c * 3] * l[0] + m[c * 3 + 1] * l[1] + m[c * 3 + 2] * l[2] + o[c];
+                if (light.hlg) {
+                    const float g = light.toScene(r);
+                    for (float& x : r) x *= g;
+                }
+                for (int c = 0; c < 3; ++c) px[c] = (v[c] + (code(r[c]) - v[c]) * a) * alpha;
+            }
+        }
+    });
 }
 
 Image chartFrame(const Project& p, const Sequence& s, const Clip& c, FrameTime at) {
     const MediaItem* m = c.mediaId ? p.findMedia(c.mediaId) : nullptr;
     if (!m || (m->kind != MediaKind::Video && m->kind != MediaKind::Image) || !m->hasVideo) return {};
     const FrameTime t = c.contains(at) ? at : c.start + c.duration / 2;
+    const FrameTime lt = t - c.start;
     const double sec = m->kind == MediaKind::Video ? std::max(0.0, c.sourceFrameAt(t) / s.fpsValue()) : 0.0;
     const int mw = std::max(1, m->width), mh = std::max(1, m->height);
-    const double scale = std::min(1.0, 1280.0 / mw);
-    return renderMediaFrame(p, *m, sec, std::max(1, int(std::lround(mw * scale))), std::max(1, int(std::lround(mh * scale))));
+    const double scale = std::min(1.0, 1280.0 / std::max(mw, mh));
+    Frame16Ptr f = MediaPool::instance().videoFrame(m->path, sec, std::max(1, int(std::lround(mw * scale))), std::max(1, int(std::lround(mh * scale))));
+    if (!f) return {};
+    Image img = toImage(*f);
+    // As the compositor takes it to the clip's effects: an on-set CDL in the camera's own space, the input transform,
+    // then the colour group's pre-clip grade.
+    const ColorSpace& source = mediaColorSpace(*m);
+    for (const Effect& e : c.effects)
+        if (e.enabled && e.type == "cdl" && e.s("space") == source.label) {
+            applyCdlValues(e, lt, img);
+            break;
+        }
+    convertColor(img, source, sequenceColorSpace(s), s.hdrPeakNits);
+    if (const ColorGroup* g = colorGroupOf(s, c))
+        for (const Effect& e : g->pre)
+            if (e.enabled) applyVideoEffect(e, lt, img, double(img.width) / mw, sec);
+    return img;
+}
+
+Image chartView(const Image& frame, const Sequence& s) {
+    Image v = frame;
+    const ColorSpace& space = sequenceColorSpace(s);
+    if (space.id != rec709Space().id) convertColor(v, space, rec709Space(), s.hdrPeakNits);
+    return v;
 }
 
 int applyChartMatchToClips(Project& p, Sequence& s, const std::vector<Id>& clips, const ChartFit& fit) {
     int n = 0;
+    const std::string space = sequenceColorSpace(s).id;
     for (Id id : clips) {
-        Clip* c = edit::clipById(s, id);
+        const auto loc = edit::locate(s, id);
+        Clip* c = loc && loc->track.kind == TrackKind::Video ? edit::clipById(s, id) : nullptr;
         if (!c || !c->mediaId) continue;
-        Effect e = chartMatchEffect(fit, p.newId());
+        Effect e = chartMatchEffect(fit, p.newId(), space);
         auto it = std::find_if(c->effects.begin(), c->effects.end(), [](const Effect& x) { return x.type == "chart_match"; });
         if (it != c->effects.end()) {
             e.id = it->id;

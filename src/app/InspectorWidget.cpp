@@ -1488,7 +1488,7 @@ void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const 
         default: {
             auto* spin = new QDoubleSpinBox(row);
             spin->setObjectName(QStringLiteral("param_%1_%2").arg(target.effect).arg(QString::fromStdString(name)));
-            int decimals = pi.step >= 1 ? 0 : (pi.step >= 0.1 ? 1 : (pi.step >= 0.01 ? 2 : 3));
+            int decimals = pi.step >= 1 ? 0 : pi.step >= 0.1 ? 1 : pi.step >= 0.01 ? 2 : pi.step >= 0.001 ? 3 : pi.step >= 0.0001 ? 4 : 5;
             spin->setDecimals(decimals);
             spin->setRange(pi.min, pi.max);
             spin->setSingleStep(pi.step);

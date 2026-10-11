@@ -3,11 +3,13 @@
 #include <QCheckBox>
 #include <QDialogButtonBox>
 #include <QHBoxLayout>
+#include <QKeyEvent>
 #include <QLabel>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPushButton>
 #include <QVBoxLayout>
+#include <QtConcurrent>
 #include <algorithm>
 #include <cmath>
 
@@ -37,6 +39,9 @@ QImage toQImage(const Image& img) {
 ChartView::ChartView(QWidget* parent) : QWidget(parent) {
     setMinimumSize(320, 180);
     setMouseTracking(true);
+    setFocusPolicy(Qt::StrongFocus);
+    setAccessibleName(tr("Chart outline"));
+    setAccessibleDescription(tr("Press 1 to 4 (or [ and ]) to pick a corner, the arrow keys to move it, Shift for larger steps"));
     quad_.p[0] = {0.3, 0.3}, quad_.p[1] = {0.7, 0.3}, quad_.p[2] = {0.7, 0.7}, quad_.p[3] = {0.3, 0.7};
 }
 
@@ -80,6 +85,11 @@ void ChartView::paintEvent(QPaintEvent*) {
         p.setBrush(i == 0 ? QColor(255, 210, 0) : QColor(0, 0, 0, 160));
         p.drawEllipse(toWidget(quad_.p[i]), 6, 6);
     }
+    if (hasFocus()) {  // the corner the keys move
+        p.setBrush(Qt::NoBrush);
+        p.setPen(QPen(Qt::white, 2, Qt::DotLine));
+        p.drawEllipse(toWidget(quad_.p[corner_]), 10, 10);
+    }
     p.setPen(Qt::white);
     p.drawText(toWidget(quad_.p[0]) + QPointF(9, -8), tr("Dark Skin"));
 }
@@ -91,6 +101,7 @@ void ChartView::mousePressEvent(QMouseEvent* e) {
         const double d = QLineF(toWidget(quad_.p[i]), e->position()).length();
         if (d < best) best = d, dragging_ = i;
     }
+    if (dragging_ >= 0) corner_ = dragging_;
 }
 
 void ChartView::mouseMoveEvent(QMouseEvent* e) {
@@ -99,9 +110,48 @@ void ChartView::mouseMoveEvent(QMouseEvent* e) {
     quad_.p[dragging_] = {std::clamp((e->position().x() - r.left()) / r.width(), 0.0, 1.0), std::clamp((e->position().y() - r.top()) / r.height(), 0.0, 1.0)};
     update();
     emit quadChanged();
+    emit quadEdited();
 }
 
 void ChartView::mouseReleaseEvent(QMouseEvent*) { dragging_ = -1; }
+
+bool ChartView::ownKey(int k) {
+    return (k >= Qt::Key_1 && k <= Qt::Key_4) || k == Qt::Key_BracketLeft || k == Qt::Key_BracketRight || k == Qt::Key_Left ||
+           k == Qt::Key_Right || k == Qt::Key_Up || k == Qt::Key_Down;
+}
+
+bool ChartView::event(QEvent* e) {
+    if (e->type() == QEvent::ShortcutOverride && ownKey(static_cast<QKeyEvent*>(e)->key())) {
+        e->accept();
+        return true;
+    }
+    return QWidget::event(e);
+}
+
+void ChartView::keyPressEvent(QKeyEvent* e) {
+    const int k = e->key();
+    if (k >= Qt::Key_1 && k <= Qt::Key_4) {
+        corner_ = k - Qt::Key_1;
+    } else if (k == Qt::Key_BracketRight || k == Qt::Key_BracketLeft) {
+        corner_ = (corner_ + (k == Qt::Key_BracketRight ? 1 : 3)) % 4;
+    } else if (k == Qt::Key_Left || k == Qt::Key_Right || k == Qt::Key_Up || k == Qt::Key_Down) {
+        const double n = e->modifiers() & Qt::ShiftModifier ? 10 : 1;
+        const double dx = n / std::max(1, picture_.isNull() ? width() : picture_.width()),
+                     dy = n / std::max(1, picture_.isNull() ? height() : picture_.height());
+        Point2& p = quad_.p[corner_];
+        if (k == Qt::Key_Left) p.x -= dx;
+        if (k == Qt::Key_Right) p.x += dx;
+        if (k == Qt::Key_Up) p.y -= dy;
+        if (k == Qt::Key_Down) p.y += dy;
+        p.x = std::clamp(p.x, 0.0, 1.0), p.y = std::clamp(p.y, 0.0, 1.0);
+        emit quadChanged();
+        emit quadEdited();
+    } else {
+        QWidget::keyPressEvent(e);
+        return;
+    }
+    update();
+}
 
 ChartSwatches::ChartSwatches(QWidget* parent) : QWidget(parent) { setMinimumSize(300, 120); }
 
@@ -124,12 +174,13 @@ void ChartSwatches::paintEvent(QPaintEvent*) {
     }
 }
 
-ChartMatchDialog::ChartMatchDialog(const Image& frame, const QString& clipName, QWidget* parent) : QDialog(parent), frame_(frame) {
+ChartMatchDialog::ChartMatchDialog(const Image& frame, const Image& view, const ColorSpace& space, const QString& clipName, QWidget* parent)
+    : QDialog(parent), frame_(frame), view_image_(view), space_(space) {
     setObjectName(QStringLiteral("chartMatchDialog"));
     setWindowTitle(tr("Match Colour Chart"));
     auto* layout = new QVBoxLayout(this);
-    auto* intro = new QLabel(tr("Outline the ColorChecker's 24 patches in %1 (Find Chart, or drag the corners: the yellow one by Dark Skin). "
-                                "Each patch shows as shot, as matched and as the chart has it.")
+    auto* intro = new QLabel(tr("Outline the ColorChecker's 24 patches in %1 (Find Chart, or drag the corners: the yellow one by Dark Skin; "
+                                "or press 1 to 4 and the arrow keys). Each patch shows as shot, as matched and as the chart has it.")
                                  .arg(clipName),
                              this);
     intro->setWordWrap(true);
@@ -137,7 +188,7 @@ ChartMatchDialog::ChartMatchDialog(const Image& frame, const QString& clipName, 
     auto* row = new QHBoxLayout;
     view_ = new ChartView(this);
     view_->setObjectName(QStringLiteral("chartView"));
-    view_->setPicture(toQImage(frame));
+    view_->setPicture(toQImage(view_image_));
     row->addWidget(view_, 3);
     auto* side = new QVBoxLayout;
     swatches_ = new ChartSwatches(this);
@@ -147,10 +198,10 @@ ChartMatchDialog::ChartMatchDialog(const Image& frame, const QString& clipName, 
     status_->setObjectName(QStringLiteral("chartStatus"));
     status_->setWordWrap(true);
     side->addWidget(status_);
-    auto* find = new QPushButton(tr("Find Chart"), this);
-    find->setObjectName(QStringLiteral("chartFind"));
-    connect(find, &QPushButton::clicked, this, [this] { findChart(); });
-    side->addWidget(find);
+    find_ = new QPushButton(tr("Find Chart"), this);
+    find_->setObjectName(QStringLiteral("chartFind"));
+    connect(find_, &QPushButton::clicked, this, [this] { findChartLater(); });
+    side->addWidget(find_);
     sameMedia_ = new QCheckBox(tr("Every clip of this media"), this);
     sameMedia_->setObjectName(QStringLiteral("chartSameMedia"));
     side->addWidget(sameMedia_);
@@ -158,43 +209,84 @@ ChartMatchDialog::ChartMatchDialog(const Image& frame, const QString& clipName, 
     row->addLayout(side, 2);
     layout->addLayout(row, 1);
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
-    buttons->button(QDialogButtonBox::Ok)->setText(tr("Apply"));
-    buttons->button(QDialogButtonBox::Ok)->setObjectName(QStringLiteral("chartApply"));
+    apply_ = buttons->button(QDialogButtonBox::Ok);
+    apply_->setText(tr("Apply"));
+    apply_->setObjectName(QStringLiteral("chartApply"));
+    apply_->setEnabled(false);
     connect(buttons, &QDialogButtonBox::accepted, this, &QDialog::accept);
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
     layout->addWidget(buttons);
     connect(view_, &ChartView::quadChanged, this, &ChartMatchDialog::measure);
+    connect(view_, &ChartView::quadEdited, this, [this] {
+        placed_ = true;
+        measure();
+    });
+    connect(&watcher_, &QFutureWatcherBase::finished, this, [this] {
+        const auto [ok, q] = watcher_.result();
+        found(ok, q);
+    });
     resize(980, 520);
-    if (!findChart()) measure();
+    measure();
+    findChartLater();
 }
 
 bool ChartMatchDialog::findChart() {
     TrackQuad q;
-    if (!detectChart(frame_, q)) {
-        status_->setText(tr("No chart found: drag the corners onto its patches."));
-        return false;
-    }
-    view_->setQuad(q);  // (measured again by quadChanged)
-    return true;
+    const bool ok = detectChart(view_image_, q);
+    found(ok, q);
+    return ok;
 }
 
-void ChartMatchDialog::setQuad(const TrackQuad& q) { view_->setQuad(q); }
+void ChartMatchDialog::findChartLater() {
+    if (watcher_.isRunning()) return;
+    find_->setEnabled(false);
+    apply_->setEnabled(false);
+    status_->setText(tr("Looking for the chart…"));
+    const Image img = view_image_;
+    watcher_.setFuture(QtConcurrent::run([img] {
+        TrackQuad q;
+        const bool ok = detectChart(img, q);
+        return std::make_pair(ok, q);
+    }));
+}
+
+void ChartMatchDialog::found(bool ok, const TrackQuad& q) {
+    find_->setEnabled(true);
+    if (ok) {
+        placed_ = true;
+        view_->setQuad(q);  // (measured again by quadChanged)
+        return;
+    }
+    measure();
+    status_->setText(placed_ ? tr("No chart found: the outline stays where it was.") : tr("No chart found: drag the corners onto its patches."));
+}
+
+void ChartMatchDialog::setQuad(const TrackQuad& q) {
+    placed_ = true;
+    view_->setQuad(q);
+}
 
 TrackQuad ChartMatchDialog::quad() const { return view_->quad(); }
 
 bool ChartMatchDialog::sameMedia() const { return sameMedia_->isChecked(); }
 
 void ChartMatchDialog::measure() {
-    const ChartColors shot = sampleChart(frame_, view_->quad());
-    fit_ = fitChart(shot);
+    bool complete = false;
+    const ChartColors shot = sampleChart(frame_, view_->quad(), space_, &complete);
+    fit_ = complete ? fitChart(shot) : ChartFit{};
     ChartColors matched{};
-    for (size_t i = 0; i < 24; ++i) matched[i] = applyChartFit(fit_, shot[i]);
+    for (size_t i = 0; i < 24; ++i) matched[i] = fit_.ok ? applyChartFit(fit_, shot[i]) : shot[i];
     swatches_->setColors(shot, matched);
-    status_->setText(fit_.ok ? tr("Delta E %1 as shot, %2 matched (worst patch %3)")
-                                   .arg(fit_.deltaEBefore, 0, 'f', 1)
-                                   .arg(fit_.deltaEAfter, 0, 'f', 1)
-                                   .arg(fit_.deltaEMax, 0, 'f', 1)
-                             : tr("The patches cannot be matched: put the outline on the chart."));
+    ready_ = fit_.ok && placed_;
+    apply_->setEnabled(ready_ && !watcher_.isRunning());
+    if (watcher_.isRunning()) return;  // ("Looking for the chart…" stays)
+    status_->setText(!complete  ? tr("The outline must lie inside the picture, its corners apart: put it on the chart.")
+                     : !fit_.ok ? tr("The patches cannot be matched: put the outline on the chart.")
+                     : !placed_ ? tr("Find Chart, or drag the corners onto the patches.")
+                                : tr("Delta E %1 as shot, %2 matched (worst patch %3)")
+                                      .arg(fit_.deltaEBefore, 0, 'f', 1)
+                                      .arg(fit_.deltaEAfter, 0, 'f', 1)
+                                      .arg(fit_.deltaEMax, 0, 'f', 1));
 }
 
 }  // namespace montage

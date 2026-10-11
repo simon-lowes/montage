@@ -14,7 +14,7 @@
 
 namespace montage {
 
-// Whether an effect belongs to the grade.
+// Whether an effect belongs to the grade (the Color filters, a Chart Match aside: it stays under every version).
 bool isGradeEffect(const Effect& e);
 
 namespace edit {

@@ -11,6 +11,7 @@
 #include <complex>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <set>
 #include <tuple>
 
@@ -4450,22 +4451,24 @@ colorspaces:
                 const double l = cast[c][0] * lin(ref[size_t(i)][0]) + cast[c][1] * lin(ref[size_t(i)][1]) + cast[c][2] * lin(ref[size_t(i)][2]);
                 shot[size_t(i)][size_t(c)] = code(l * 0.9);
             }
-        // Draws the chart over (x, y, w, h) in pixels, turned: 0 upright, 1 upside down, 2 with its top to the right.
-        auto picture = [&](int turn, int x0, int y0, int w, int h) {
-            Image img(640, 360);
+        // Draws the chart over (x, y, w, h) in pixels of a W x H picture, turned: 0 upright, 1 upside down, 2 with its top
+        // to the right, 3 with its top to the left.
+        auto picture = [&](int turn, int x0, int y0, int w, int h, int W = 640, int H = 360) {
+            Image img(W, H);
             img.fill(0.33f, 0.33f, 0.33f, 1);
             for (int y = y0 - 8; y < y0 + h + 8; ++y)
                 for (int x = x0 - 8; x < x0 + w + 8; ++x) {
                     float* p = img.at(x, y);
                     p[0] = p[1] = p[2] = 0.05f;  // the chart's black frame and gaps
                 }
-            const int cols = turn == 2 ? 4 : 6, rows = turn == 2 ? 6 : 4;
+            const int cols = turn >= 2 ? 4 : 6, rows = turn >= 2 ? 6 : 4;
             for (int r = 0; r < rows; ++r)
                 for (int c = 0; c < cols; ++c) {
                     // Which patch sits in this cell.
                     int pr = r, pc = c;
                     if (turn == 1) pr = 3 - r, pc = 5 - c;
                     if (turn == 2) pr = 3 - c, pc = r;
+                    if (turn == 3) pr = c, pc = 5 - r;
                     const ChartColor& col = shot[size_t(pr * 6 + pc)];
                     const double cw = double(w) / cols, ch = double(h) / rows;
                     for (int y = int(y0 + r * ch + ch * 0.08); y < int(y0 + (r + 1) * ch - ch * 0.08); ++y)
@@ -4507,13 +4510,75 @@ colorspaces:
         Image same = img;
         applyChartMatch(e, 0, same);
         QVERIFY(near(sampleChart(same, q), shot, 1e-4));
-        // Upside down and on its side: found, the outline starting at the chart's own top left.
-        for (int turn : {1, 2}) {
-            const Image turned = turn == 1 ? picture(1, 200, 100, 330, 220) : picture(2, 250, 40, 180, 270);
+        // Upside down and on either side: found, the outline starting at the chart's own top left; and in a tall frame.
+        for (int turn : {1, 2, 3, 4}) {
+            const Image turned = turn == 1   ? picture(1, 200, 100, 330, 220)
+                                 : turn == 4 ? picture(0, 40, 240, 270, 180, 360, 640)
+                                             : picture(turn, 250, 40, 180, 270);
             TrackQuad tq;
             QVERIFY2(detectChart(turned, tq), qPrintable(QString::number(turn)));
             QVERIFY2(near(sampleChart(turned, tq), shot, 0.015), qPrintable(QString::number(turn)));
         }
+        // An outline that is none (corners in a line) or off the picture is no measurement.
+        {
+            bool complete = false;
+            sampleChart(img, q, rec709Space(), &complete);
+            QVERIFY(complete);
+            TrackQuad line;
+            line.p[0] = {0.1, 0.5}, line.p[1] = {0.5, 0.5}, line.p[2] = {0.9, 0.5}, line.p[3] = {0.3, 0.5};
+            sampleChart(img, line, rec709Space(), &complete);
+            QVERIFY(!complete);
+            TrackQuad off = q;
+            for (auto& pt : off.p) pt.x += 0.6;
+            sampleChart(img, off, rec709Space(), &complete);
+            QVERIFY(!complete);
+        }
+        // At no change it changes nothing: deep shadows, highlights past white and colour outside the gamut kept.
+        {
+            const float vals[6] = {0.002f, 0.01f, 0.02f, 0.03f, 1.3f, -0.02f};
+            Image px(6, 1);
+            for (int i = 0; i < 6; ++i) {
+                float* p = px.at(i, 0);
+                p[0] = p[1] = p[2] = vals[i], p[3] = 1;
+            }
+            applyChartMatch(chartMatchEffect(ChartFit{}, 3), 0, px);
+            for (int i = 0; i < 6; ++i) QVERIFY2(std::fabs(px.at(i, 0)[0] - vals[i]) < 2e-4, qPrintable(QString("%1 %2").arg(vals[i]).arg(px.at(i, 0)[0])));
+        }
+        // Premultiplied pixels: an empty one stays empty, a half-covered one gets the same colour at half strength; a pixel
+        // that is not a number does no harm.
+        {
+            ChartFit lift;
+            lift.m[0][0] = 1.2;
+            lift.offset[0] = lift.offset[1] = lift.offset[2] = 0.002;
+            Image a(4, 1);
+            a.fill(0, 0, 0, 0);
+            float* half = a.at(1, 0);
+            half[0] = half[1] = half[2] = 0.25f, half[3] = 0.5f;
+            float* whole = a.at(2, 0);
+            whole[0] = whole[1] = whole[2] = 0.5f, whole[3] = 1;
+            float* bad = a.at(3, 0);
+            bad[0] = std::numeric_limits<float>::quiet_NaN(), bad[1] = bad[2] = 0.5f, bad[3] = 1;
+            applyChartMatch(chartMatchEffect(lift, 4), 0, a);
+            for (int k = 0; k < 4; ++k) QCOMPARE(a.at(0, 0)[k], 0.0f);
+            for (int k = 0; k < 3; ++k) QVERIFY(std::fabs(a.at(1, 0)[k] - a.at(2, 0)[k] * 0.5f) < 1e-5);
+            QVERIFY(a.at(2, 0)[0] > 0.5f);
+            QVERIFY(std::isfinite(a.at(3, 0)[0]));
+        }
+        // In HDR and wide-gamut sequences: the patches read back as the chart's own values, and the effect, told the
+        // space, grades the picture there to the chart.
+        QCOMPARE(e.s("space"), std::string("rec709"));
+        for (const char* id : {"rec2100pq", "rec2100hlg", "p3d65", "rec2020"}) {
+            const ColorSpace& cs = *findColorSpace(id);
+            Image wide = img;
+            convertColor(wide, rec709Space(), cs);
+            const ChartColors read = sampleChart(wide, q, cs);
+            QVERIFY2(near(read, shot, 0.01), id);
+            applyChartMatch(chartMatchEffect(fitChart(read), 5, id), 0, wide);
+            QVERIFY2(near(sampleChart(wide, q, cs), ref, 0.02), id);
+        }
+        // The camera's calibration stays under every grade version.
+        QVERIFY(!isGradeEffect(e));
+        QVERIFY(isGradeEffect(makeEffect("color_correct", 9)));
         // A picture without a chart: none.
         Image wall(640, 360);
         for (int y = 0; y < 360; ++y)

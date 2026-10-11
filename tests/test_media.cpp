@@ -14851,12 +14851,13 @@ private slots:
         QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 30, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
         QVERIFY(edit::placeMedia(p, s, m.id, 60, 0, 30, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
         const Id first = s.videoTracks[0].clips[0].id;
+        s.videoTracks[0].clips[0].name = "Chart A";
         const QString project = QString::fromStdString(path("chart.montage"));
         QVERIFY(saveProject(p, project.toStdString()));
         McpServer server;
         auto call = [&](const QJsonObject& args) {
             QJsonObject full = args;
-            full["project"] = project;
+            if (!full.contains("project")) full["project"] = project;
             const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
                                   {"params", QJsonObject{{"name", "montage_match_chart"}, {"arguments", full},
                                                          {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
@@ -14888,9 +14889,54 @@ private slots:
         QVERIFY(loadProject(project.toStdString(), back));
         const auto& fx = back.active()->videoTracks[0].clips[0].effects;
         QCOMPARE(std::count_if(fx.begin(), fx.end(), [](const Effect& e) { return e.type == "chart_match"; }), 1);
-        // Bad corners, and a picture without a chart.
+        // Bad corners: too few, in a line, off the frame; a clip by name, and a name two clips share.
+        auto refused = [](const QJsonObject& res) { return res.value("isError").toBool() || res.isEmpty(); };
         r = call({{"clip", double(first)}, {"corners", QJsonArray{QJsonArray{0, 0}}}});
-        QVERIFY(r.value("isError").toBool() || r.isEmpty());
+        QVERIFY(refused(r));
+        r = call({{"clip", double(first)}, {"corners", QJsonArray{QJsonArray{0.1, 0.5}, QJsonArray{0.5, 0.5}, QJsonArray{0.9, 0.5}, QJsonArray{0.3, 0.5}}}});
+        QVERIFY(refused(r));
+        r = call({{"clip", double(first)}, {"corners", QJsonArray{QJsonArray{0.1, 0.1}, QJsonArray{1.4, 0.1}, QJsonArray{1.4, 0.9}, QJsonArray{0.1, 0.9}}}});
+        QVERIFY(refused(r));
+        r = call({{"clip", "Chart A"}, {"measure_only", true}});
+        QVERIFY2(!refused(r), QJsonDocument(r).toJson().constData());
+        r = call({{"clip", "No Such Clip"}, {"measure_only", true}});
+        QVERIFY(refused(r));
+        // In an HDR sequence, behind its colour group's pre-clip grade: the chart is measured as the effect receives the
+        // picture, so what plays is as close to the chart as the tool said (read back from PQ), not graded twice or in
+        // the wrong space.
+        {
+            Project h = makeDefaultProject();
+            Sequence& hs = *h.active();
+            hs.width = 640, hs.height = 360;
+            hs.colorSpace = "rec2100pq";
+            MediaItem hm = probeOrFail(h, png);
+            h.media.push_back(hm);
+            QVERIFY(edit::placeMedia(h, hs, hm.id, 0, 0, 30, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+            const Id hc = hs.videoTracks[0].clips[0].id;
+            Id group = 0;
+            QVERIFY(edit::makeColorGroup(h, hs, {hc}, "Scene", &group).ok);
+            Effect lift = makeEffect(h, "color_correct");
+            lift.params["exposure"] = 0.3;
+            findColorGroup(hs, group)->pre.push_back(lift);
+            const QString hdr = QString::fromStdString(path("chart-hdr.montage"));
+            QVERIFY(saveProject(h, hdr.toStdString()));
+            r = call({{"project", hdr}, {"clip", double(hc)}});
+            QVERIFY2(!refused(r), QJsonDocument(r).toJson().constData());
+            const double promised = r.value("structuredContent").toObject().value("delta_e_after").toDouble();
+            // (The group's exposure works on PQ code values, which no matrix in linear light undoes exactly.)
+            QVERIFY2(promised < 4, qPrintable(QString::number(promised)));
+            Project back2;
+            QVERIFY(loadProject(hdr.toStdString(), back2));
+            const Sequence& bs = *back2.active();
+            QCOMPARE(bs.videoTracks[0].clips[0].effects.front().s("space"), std::string("rec2100pq"));
+            const Image played = renderProgramFrame(back2, bs, 10, RenderOptions{});
+            TrackQuad q;
+            q.p[0] = {120.0 / 640, 80.0 / 360}, q.p[1] = {420.0 / 640, 80.0 / 360}, q.p[2] = {420.0 / 640, 280.0 / 360}, q.p[3] = {120.0 / 640, 280.0 / 360};
+            const ChartColors got = sampleChart(played, q, *findColorSpace("rec2100pq"));
+            double mean = 0;
+            for (int i = 0; i < 24; ++i) mean += deltaE76(got[size_t(i)], colorChecker24()[size_t(i)]) / 24;
+            QVERIFY2(mean < promised + 1, qPrintable(QString("%1 played, %2 promised").arg(mean).arg(promised)));
+        }
     }
 
     void reviewPackages() {

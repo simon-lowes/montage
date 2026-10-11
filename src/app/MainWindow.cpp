@@ -3947,11 +3947,12 @@ int MainWindow::matchColourChart() {
         return 0;
     }
     const Id clipId = clip->id;
-    ChartMatchDialog dlg(frame, QString::fromStdString(clip->name), this);
+    // (Measured in the sequence's working space, as the effect receives the picture; shown and searched as Rec.709.)
+    ChartMatchDialog dlg(frame, chartView(frame, *s), sequenceColorSpace(*s), QString::fromStdString(clip->name), this);
     if (chartDialogHook_) chartDialogHook_(&dlg);
     if (dlg.exec() != QDialog::Accepted) return 0;
     const ChartFit fit = dlg.fit();
-    if (!fit.ok) {
+    if (!fit.ok || !dlg.ready()) {
         state_->message(tr("The chart could not be matched: put its outline on the patches"), 5000);
         return 0;
     }
