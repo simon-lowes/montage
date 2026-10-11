@@ -70,6 +70,7 @@ class LinkMediaDialog;
 class LiveLink;
 class AssistantPanel;
 class ScriptConsole;
+class OscControl;
 class ScriptPanelWidget;
 
 class MainWindow : public QMainWindow {
@@ -169,6 +170,7 @@ public:
     // Edit > Control Surface: the Mackie Control surface's MIDI ports (one dialog, shown and returned).
     QDialog* controlSurfaceDialog();
     ControlSurface* controlSurface() const { return surface_; }
+    OscControl* oscControl() const { return osc_; }
     // Clip › Colour Group (core/ColorGroups.h), each one undo step: a new group of the selected video clips (its id, 0
     // with a message when none are selected), the selection joining a group, or leaving its group.
     Id newColorGroup(const QString& name = {});
@@ -458,6 +460,7 @@ private:
     CleanFeedWindow* cleanFeed_ = nullptr;
     MixerPanel* mixer_ = nullptr;
     ControlSurface* surface_ = nullptr;
+    OscControl* osc_ = nullptr;
     MulticamPanel* multicam_ = nullptr;
     AdrPanel* adr_ = nullptr;
     ProductionPanel* production_ = nullptr;

@@ -40,6 +40,7 @@
 #include <QTimer>
 #include <QTextEdit>
 #include <QToolButton>
+#include <QUdpSocket>
 #include <QTreeView>
 #include <QTreeWidget>
 #include <QJsonObject>
@@ -117,6 +118,8 @@
 #include "ModelPacks.h"
 #include "MixerPanel.h"
 #include "ControlSurface.h"
+#include "OscControl.h"
+#include "control/Osc.h"
 #include "core/Cdl.h"
 #include "control/Hui.h"
 #include "control/MackieControl.h"
@@ -890,6 +893,128 @@ private slots:
         QTest::qWait(50);
         QVERIFY(surface->isConnected());
         surface->disconnectSurface();
+    }
+
+    void oscControl() {
+        state()->newProject();
+        QVERIFY(state()->edit("Tracks", [](Project& p, Sequence& s) {
+            while (s.audioTracks.size() < 2) edit::addTrack(p, s, TrackKind::Audio);
+            edit::overwrite(p, s, V1, makeGeneratorClip(p, "color", 250));
+            return true;
+        }));
+        auto* mixer = win_->findChild<MixerPanel*>();
+        QTRY_VERIFY(mixer->trackFader(1));
+        OscControl* osc = win_->oscControl();
+        QVERIFY(osc);
+        QString err;
+        QVERIFY2(osc->start(0, false, &err), qPrintable(err));
+        QVERIFY(osc->isRunning() && osc->port() > 0);
+        // A sender (as Companion's generic OSC connection) that also listens for feedback.
+        QUdpSocket sender;
+        QVERIFY(sender.bind(QHostAddress::LocalHost, 0));
+        osc->setFeedbackPort(sender.localPort());
+        auto sendOsc = [&](const osc::Message& m) {
+            const std::string bytes = osc::encode(m);
+            sender.writeDatagram(bytes.data(), qint64(bytes.size()), QHostAddress::LocalHost, osc->port());
+        };
+        std::vector<osc::Message> heard;
+        auto received = [&](const std::string& address) {
+            while (sender.hasPendingDatagrams()) {
+                QByteArray d(int(sender.pendingDatagramSize()), '\0');
+                sender.readDatagram(d.data(), d.size());
+                osc::parse(std::string(d.constData(), size_t(d.size())), heard);
+            }
+            for (auto it = heard.rbegin(); it != heard.rend(); ++it)  // (the latest)
+                if (it->address == address) return static_cast<const osc::Message*>(&*it);
+            return static_cast<const osc::Message*>(nullptr);
+        };
+        auto* program = win_->findChild<PlaybackController*>("programPlayback");
+        const Rational fps = state()->sequence()->fps;
+        // Over the network socket: go to a timecode, play (a button's release, 0, does nothing), stop; feedback back.
+        sendOsc({"/montage/goto", {osc::string("00:00:02:00")}});
+        QTRY_COMPARE(state()->playhead(), FrameTime(2 * fps.num / fps.den));
+        QTRY_VERIFY(received("/montage/state/timecode"));
+        sendOsc({"/montage/play", {osc::int32(0)}});
+        QTest::qWait(100);
+        QVERIFY(!program->isPlaying());
+        sendOsc({"/montage/play", {osc::int32(1)}});
+        QTRY_VERIFY(program->isPlaying());
+        QTRY_VERIFY(received("/montage/state/playing") && received("/montage/state/playing")->args.at(0).i == 1);
+        sendOsc({"/montage/stop", {}});
+        QTRY_VERIFY(!program->isPlaying());
+        sendOsc({"/montage/nowhere", {}});
+        QTRY_VERIFY(received("/montage/error"));
+        // Seconds, steps, start and end, In and Out, loop on and off.
+        QVERIFY(osc->handle({"/montage/goto", {osc::float32(1.0f)}}));
+        QCOMPARE(state()->playhead(), FrameTime(fps.num / fps.den));
+        QVERIFY(osc->handle({"/montage/step", {osc::int32(3)}}));
+        QTRY_COMPARE(state()->playhead(), FrameTime(fps.num / fps.den + 3));
+        QVERIFY(osc->handle({"/montage/in", {}}));
+        QCOMPARE(state()->sequence()->inPoint, FrameTime(fps.num / fps.den + 3));
+        QVERIFY(osc->handle({"/montage/end", {}}));
+        QTRY_COMPARE(state()->playhead(), state()->sequence()->duration());
+        QVERIFY(osc->handle({"/montage/start", {}}));
+        QTRY_COMPARE(state()->playhead(), FrameTime(0));
+        QVERIFY(osc->handle({"/montage/loop", {osc::int32(1)}}) && program->loop());
+        QVERIFY(osc->handle({"/montage/loop", {osc::int32(0)}}) && !program->loop());
+        QVERIFY(!osc->handle({"/montage/goto", {osc::string("soon")}}, QHostAddress::LocalHost, &err) && err.contains("timecode"));
+        // Markers: named, and the menu command by its address; undo.
+        const size_t markers = state()->sequence()->markers.size();
+        QVERIFY(osc->handle({"/montage/marker", {osc::string("Cue")}}));
+        QCOMPARE(state()->sequence()->markers.size(), markers + 1);
+        QCOMPARE(QString::fromStdString(state()->sequence()->markers.back().name), QString("Cue"));
+        QString addMarker;
+        for (const auto& [address, id] : osc->commandAddresses())
+            if (id == "Sequence/Add Marker") addMarker = address;
+        QCOMPARE(addMarker, QString("/montage/command/sequence/add_marker"));
+        state()->setPlayhead(30);
+        QVERIFY(osc->handle({addMarker.toStdString(), {}}));
+        QCOMPARE(state()->sequence()->markers.size(), markers + 2);
+        QVERIFY(osc->handle({addMarker.toStdString(), {osc::int32(0)}}));  // (a release)
+        QCOMPARE(state()->sequence()->markers.size(), markers + 2);
+        QVERIFY(osc->handle({"/montage/undo", {}}));
+        QCOMPARE(state()->sequence()->markers.size(), markers + 1);
+        QVERIFY(!osc->handle({"/montage/command/sequence/no_such_thing", {}}, QHostAddress::LocalHost, &err) && err.contains("No menu command"));
+        // The mixer: a track's volume (one undo step), mute set and toggled, solo, the master.
+        auto track = [&](int i) -> const Track& { return state()->sequence()->audioTracks.at(size_t(i)); };
+        const int steps = int(state()->history().undoCount());
+        QVERIFY(osc->handle({"/montage/track/2/volume", {osc::float32(-6)}}));
+        QCOMPARE(track(1).volumeDb, -6.0);
+        QCOMPARE(int(state()->history().undoCount()), steps + 1);
+        QVERIFY(osc->handle({"/montage/track/1/mute", {osc::int32(1)}}) && track(0).muted);
+        QVERIFY(osc->handle({"/montage/track/1/mute", {osc::int32(1)}}) && track(0).muted);  // (set, not toggled)
+        QVERIFY(osc->handle({"/montage/track/1/mute", {}}) && !track(0).muted);            // (no value: toggled)
+        QVERIFY(osc->handle({"/montage/track/2/solo", {osc::boolean(true)}}) && track(1).solo);
+        QVERIFY(osc->handle({"/montage/master/volume", {osc::int32(-3)}}));
+        QCOMPARE(state()->sequence()->masterVolumeDb, -3.0);
+        QVERIFY(!osc->handle({"/montage/track/9/volume", {osc::int32(0)}}, QHostAddress::LocalHost, &err) && err.contains("track"));
+        QVERIFY(!osc->handle({"/montage/track/1/volume", {osc::string("loud")}}, QHostAddress::LocalHost, &err));
+        // An agent tool on the open project: one undo step named after it, its answer sent back.
+        heard.clear();
+        sendOsc({"/montage/tool/add_marker", {osc::string(R"({"at": 4, "name": "From OSC"})")}});
+        QTRY_VERIFY(std::any_of(state()->sequence()->markers.begin(), state()->sequence()->markers.end(),
+                                [](const Marker& m) { return m.name == "From OSC"; }));
+        QCOMPARE(QString::fromStdString(state()->history().undoLabel()), QString("OSC: add_marker"));
+        QTRY_VERIFY(received("/montage/reply/add_marker"));
+        QVERIFY(!osc->handle({"/montage/tool/add_marker", {osc::string("not json")}}, QHostAddress::LocalHost, &err) && err.contains("JSON"));
+        heard.clear();
+        sendOsc({"/montage/tool/add_marker", {osc::string(R"({"at": "never"})")}});
+        QTRY_VERIFY(received("/montage/error"));
+        // A malformed packet is answered with an error and nothing done.
+        heard.clear();
+        sender.writeDatagram("bad!", 4, QHostAddress::LocalHost, osc->port());
+        QTRY_VERIFY(received("/montage/error"));
+        // The settings: in the Control Surface dialog, with every address listed.
+        QDialog* dlg = win_->controlSurfaceDialog();
+        QVERIFY(dlg->findChild<QCheckBox*>("oscEnabled")->isChecked());
+        QVERIFY(dlg->findChild<QLabel*>("oscStatus")->text().contains(QString::number(osc->port())));
+        dlg->findChild<QPushButton*>("oscAddresses")->click();
+        auto* list = dlg->findChild<QDialog*>("oscAddressList");
+        QVERIFY(list && list->findChild<QPlainTextEdit*>()->toPlainText().contains("/montage/command/sequence/add_marker"));
+        dlg->close();
+        osc->stop();
+        osc->setFeedbackPort(0);
+        QVERIFY(!osc->isRunning());
     }
 
     void controlSurfaceHui() {

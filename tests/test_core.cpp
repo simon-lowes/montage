@@ -62,6 +62,7 @@
 #include "core/Zip.h"
 #include "core/G2p.h"
 #include "control/Hui.h"
+#include "control/Osc.h"
 #include "control/MackieControl.h"
 #include "control/Midi.h"
 
@@ -1078,6 +1079,69 @@ private slots:
         for (double db : {-60.0, -30.0, -12.0, -6.0, 0.0, 6.0, 11.0}) QVERIFY(std::fabs(mcu::faderDb(mcu::faderValue(db)) - db) < 0.01);
         QCOMPARE(mcu::faderDb(0x3F70), 12.0);
         QVERIFY(mcu::faderDb(mcu::faderValue(-6) + 100) > -6);
+    }
+
+    void oscMessages() {
+        using osc::Message;
+        // A message with no arguments: the address and an empty type tag string, each padded to four bytes.
+        QCOMPARE(osc::encode(Message{"/montage/play", {}}), std::string("/montage/play\0\0\0,\0\0\0", 20));
+        // Arguments both ways: int32, float32, string, true, blob, double, int64.
+        osc::Value blob;
+        blob.type = 'b';
+        blob.s = std::string("\x01\x02\x03", 3);
+        osc::Value d;
+        d.type = 'd';
+        d.f = 0.1;
+        osc::Value h;
+        h.type = 'h';
+        h.i = -(int64_t(1) << 40);
+        const Message m{"/montage/track/2/volume", {osc::int32(-7), osc::float32(-6.5f), osc::string("Cue A"), osc::boolean(true), blob, d, h}};
+        const std::string bytes = osc::encode(m);
+        QCOMPARE(bytes.size() % 4, size_t(0));
+        std::vector<Message> back;
+        std::string err;
+        QVERIFY2(osc::parse(bytes, back, &err), err.c_str());
+        QCOMPARE(back.size(), size_t(1));
+        QCOMPARE(back[0].address, m.address);
+        QCOMPARE(back[0].args.size(), size_t(7));
+        QCOMPARE(back[0].args[0].i, int64_t(-7));
+        QCOMPARE(back[0].args[1].f, -6.5);
+        QCOMPARE(back[0].args[2].s, std::string("Cue A"));
+        QCOMPARE(back[0].args[3].type, 'T');
+        QCOMPARE(back[0].args[4].s, blob.s);
+        QCOMPARE(back[0].args[5].f, 0.1);
+        QCOMPARE(back[0].args[6].i, h.i);
+        // Values read as numbers, text and switches.
+        QCOMPARE(osc::string("2.5").number(), 2.5);
+        bool ok = true;
+        osc::string("go").number(&ok);
+        QVERIFY(!ok);
+        QCOMPARE(osc::float32(1.5f).text(), std::string("1.5"));
+        QVERIFY(osc::int32(1).truthy() && !osc::int32(0).truthy() && osc::string("on").truthy() && !osc::boolean(false).truthy());
+        // A message without type tags (old senders), and bundles inside bundles, opened in order.
+        back.clear();
+        QVERIFY(osc::parse(std::string("/montage/stop\0\0\0", 16), back) && back.size() == 1 && back[0].args.empty());
+        auto u32 = [](uint32_t v) { return std::string{char(v >> 24), char(v >> 16), char(v >> 8), char(v)}; };
+        const std::string a = osc::encode(Message{"/a", {osc::int32(1)}}), b = osc::encode(Message{"/b", {}});
+        const std::string inner = std::string("#bundle\0", 8) + std::string(8, '\0') + u32(uint32_t(b.size())) + b;
+        const std::string outer = std::string("#bundle\0", 8) + std::string(7, '\0') + "\x01" + u32(uint32_t(a.size())) + a + u32(uint32_t(inner.size())) + inner;
+        back.clear();
+        QVERIFY2(osc::parse(outer, back, &err), err.c_str());
+        QCOMPARE(back.size(), size_t(2));
+        QCOMPARE(back[0].address, std::string("/a"));
+        QCOMPARE(back[1].address, std::string("/b"));
+        // Malformed packets are refused whole.
+        back.clear();
+        QVERIFY(!osc::parse(std::string("/x\0", 3), back, &err));                 // not whole words
+        QVERIFY(!osc::parse(std::string("play\0\0\0\0", 8), back, &err));       // no address
+        QVERIFY(!osc::parse(std::string("/x\0\0,i\0\0", 8), back, &err));       // an int missing
+        QVERIFY(!osc::parse(std::string("/x\0\0,q\0\0", 8), back, &err));       // an unknown tag
+        QVERIFY(!osc::parse(std::string("/x\0\0,s\0\0abcd", 12), back, &err));  // an unterminated string
+        QVERIFY(!osc::parse(std::string("#bundle\0", 8) + std::string(8, '\0') + u32(400) + a, back, &err));  // an element too long
+        std::string deep = b;
+        for (int i = 0; i < 10; ++i) deep = std::string("#bundle\0", 8) + std::string(8, '\0') + u32(uint32_t(deep.size())) + deep;
+        QVERIFY(!osc::parse(deep, back, &err) && err.find("deeply") != std::string::npos);
+        QVERIFY(back.empty());
     }
 
     void huiProtocol() {

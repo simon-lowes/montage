@@ -25,7 +25,9 @@
 #include <QDialogButtonBox>
 #include <QComboBox>
 #include <QEventLoop>
+#include <QFontDatabase>
 #include <QFormLayout>
+#include <QGroupBox>
 #include <QDockWidget>
 #include <QDoubleSpinBox>
 #include <QFile>
@@ -116,6 +118,7 @@
 #include "RenderQueuePanel.h"
 #include "MixerPanel.h"
 #include "ControlSurface.h"
+#include "OscControl.h"
 #include "control/Midi.h"
 #include "MulticamPanel.h"
 #include "AdrPanel.h"
@@ -399,23 +402,38 @@ void MainWindow::buildPanels() {
     // A hardware control surface (Mackie Control) works the mixer and transport.
     surface_ = new ControlSurface(state_, mixer_, program_, this);
     connect(program_, &PlaybackController::audioLevels, surface_, &ControlSurface::setLevels);
-    surface_->setCommand(QStringLiteral("marker"), [this] { addMarker(); });
-    surface_->setCommand(QStringLiteral("save"), [this] { save(); });
-    surface_->setCommand(QStringLiteral("record"), [this] {
-        if (QAction* a = findChild<QAction*>(QStringLiteral("recordVoiceover"))) a->trigger();
-    });
-    surface_->setCommand(QStringLiteral("previousEdit"), [this] {
-        if (const Sequence* s = state_->sequence()) program_->seek(edit::prevEdit(*s, state_->playhead()));
-    });
-    surface_->setCommand(QStringLiteral("nextEdit"), [this] {
-        if (const Sequence* s = state_->sequence()) program_->seek(edit::nextEdit(*s, state_->playhead()));
-    });
-    surface_->setCommand(QStringLiteral("loop"), [this] {
-        // From what playback does (ADR's takes set it without the button), the button kept in step.
-        const bool on = !program_->loop();
-        if (auto* loop = findChild<QToolButton*>(QStringLiteral("programLoop"))) loop->setChecked(on);
-        program_->setLoop(on);
-    });
+    // OSC (Bitfocus Companion's Stream Deck and Loupedeck buttons, TouchOSC, lighting desks) works them too.
+    osc_ = new OscControl(state_, mixer_, program_, liveLink_, this, this);
+    const std::pair<const char*, std::function<void()>> transportCommands[] = {
+        {"marker", [this] { addMarker(); }},
+        {"save", [this] { save(); }},
+        {"record",
+         [this] {
+             if (QAction* a = findChild<QAction*>(QStringLiteral("recordVoiceover"))) a->trigger();
+         }},
+        {"previousEdit",
+         [this] {
+             if (const Sequence* s = state_->sequence()) program_->seek(edit::prevEdit(*s, state_->playhead()));
+         }},
+        {"nextEdit",
+         [this] {
+             if (const Sequence* s = state_->sequence()) program_->seek(edit::nextEdit(*s, state_->playhead()));
+         }},
+        {"loop",
+         [this] {
+             // From what playback does (ADR's takes set it without the button), the button kept in step.
+             const bool on = !program_->loop();
+             if (auto* loop = findChild<QToolButton*>(QStringLiteral("programLoop"))) loop->setChecked(on);
+             program_->setLoop(on);
+         }},
+    };
+    for (const auto& [name, fn] : transportCommands) {
+        surface_->setCommand(QString::fromLatin1(name), fn);
+        osc_->setCommand(QString::fromLatin1(name), fn);
+    }
+    osc_->setFeedbackPort(quint16(appSettings().value(QStringLiteral("osc/feedbackPort"), 0).toInt()));
+    if (appSettings().value(QStringLiteral("osc/enabled"), false).toBool())
+        osc_->start(quint16(appSettings().value(QStringLiteral("osc/port"), 9100).toInt()), appSettings().value(QStringLiteral("osc/network"), false).toBool());
     surface_->setProtocol(appSettings().value(QStringLiteral("controlSurface/protocol")).toString() == QLatin1String("hui")
                               ? SurfaceProtocol::Hui
                               : SurfaceProtocol::MackieControl);
@@ -5547,6 +5565,91 @@ QDialog* MainWindow::controlSurfaceDialog() {
     connect(atStart, &QCheckBox::toggled, this, [](bool on) { appSettings().setValue(QStringLiteral("controlSurface/connect"), on); });
     connect(buttons, &QDialogButtonBox::rejected, dlg, &QDialog::close);
     form->addRow(buttons);
+    // OSC: Stream Deck, Loupedeck and X-keys through Bitfocus Companion's generic OSC connection, TouchOSC, QLab...
+    auto* oscBox = new QGroupBox(tr("OSC (Stream Deck, Loupedeck, X-keys through Bitfocus Companion; TouchOSC; QLab)"), dlg);
+    auto* oscForm = new QFormLayout(oscBox);
+    auto* oscOn = new QCheckBox(tr("Listen for OSC messages"), oscBox);
+    oscOn->setObjectName(QStringLiteral("oscEnabled"));
+    oscOn->setChecked(osc_->isRunning());
+    auto* oscPort = new QSpinBox(oscBox);
+    oscPort->setObjectName(QStringLiteral("oscPort"));
+    oscPort->setRange(1024, 65535);
+    oscPort->setValue(appSettings().value(QStringLiteral("osc/port"), 9100).toInt());
+    auto* oscFeedback = new QSpinBox(oscBox);
+    oscFeedback->setObjectName(QStringLiteral("oscFeedbackPort"));
+    oscFeedback->setRange(0, 65535);
+    oscFeedback->setSpecialValueText(tr("None"));
+    oscFeedback->setValue(osc_->feedbackPort());
+    oscFeedback->setToolTip(tr("Playing, timecode, loop and tools' answers are sent to this port on the computer the messages come from"));
+    auto* oscNetwork = new QCheckBox(tr("Accept messages from other computers"), oscBox);
+    oscNetwork->setObjectName(QStringLiteral("oscNetwork"));
+    oscNetwork->setChecked(appSettings().value(QStringLiteral("osc/network"), false).toBool());
+    oscNetwork->setToolTip(tr("Otherwise only this computer can send (anyone on the network could edit the open project)"));
+    auto* oscStatus = new QLabel(oscBox);
+    oscStatus->setObjectName(QStringLiteral("oscStatus"));
+    oscStatus->setWordWrap(true);
+    auto* oscAddresses = new QPushButton(tr("Addresses…"), oscBox);
+    oscAddresses->setObjectName(QStringLiteral("oscAddresses"));
+    oscForm->addRow(oscOn);
+    oscForm->addRow(tr("Port:"), oscPort);
+    oscForm->addRow(tr("Feedback port:"), oscFeedback);
+    oscForm->addRow(oscNetwork);
+    oscForm->addRow(oscStatus);
+    oscForm->addRow(oscAddresses);
+    form->addRow(oscBox);
+    auto showOsc = [this, oscStatus] {
+        oscStatus->setText(osc_->isRunning() ? tr("Listening on port %1.").arg(osc_->port()) : tr("Not listening."));
+    };
+    showOsc();
+    auto applyOsc = [this, oscOn, oscPort, oscNetwork, oscStatus, showOsc] {
+        appSettings().setValue(QStringLiteral("osc/enabled"), oscOn->isChecked());
+        appSettings().setValue(QStringLiteral("osc/port"), oscPort->value());
+        appSettings().setValue(QStringLiteral("osc/network"), oscNetwork->isChecked());
+        QString err;
+        if (!oscOn->isChecked()) osc_->stop();
+        else if (!osc_->start(quint16(oscPort->value()), oscNetwork->isChecked(), &err)) return oscStatus->setText(err);
+        showOsc();
+    };
+    connect(oscOn, &QCheckBox::toggled, dlg, applyOsc);
+    connect(oscNetwork, &QCheckBox::toggled, dlg, [oscOn, applyOsc] {
+        if (oscOn->isChecked()) applyOsc();
+    });
+    connect(oscPort, &QSpinBox::editingFinished, dlg, [oscOn, applyOsc] {
+        if (oscOn->isChecked()) applyOsc();
+    });
+    connect(oscFeedback, &QSpinBox::valueChanged, dlg, [this](int port) {
+        osc_->setFeedbackPort(quint16(port));
+        appSettings().setValue(QStringLiteral("osc/feedbackPort"), port);
+    });
+    connect(oscAddresses, &QPushButton::clicked, dlg, [this, dlg] {
+        // Every address, to copy into Companion's buttons.
+        QStringList lines = {tr("Transport and editing:"),
+                             QStringLiteral("  /montage/play  /montage/stop  /montage/playpause  /montage/rewind  /montage/forward"),
+                             QStringLiteral("  /montage/shuttle <-1|0|1>  /montage/step <frames>  /montage/goto <timecode|seconds>"),
+                             QStringLiteral("  /montage/start  /montage/end  /montage/previous_edit  /montage/next_edit"),
+                             QStringLiteral("  /montage/in  /montage/out  /montage/marker [name]  /montage/loop [0|1]"),
+                             QStringLiteral("  /montage/undo  /montage/redo  /montage/save  /montage/record"),
+                             tr("Mixer (audio track n from 1):"),
+                             QStringLiteral("  /montage/track/<n>/volume <dB>  /montage/track/<n>/mute [0|1]  /montage/track/<n>/solo [0|1]"),
+                             QStringLiteral("  /montage/track/<n>/pan <-1..1>  /montage/master/volume <dB>"),
+                             tr("Agent tools on the open project (one undo step each):"),
+                             QStringLiteral("  /montage/tool/<name> '{\"argument\": value}'   e.g. /montage/tool/add_title '{\"text\": \"Hello\"}'"),
+                             tr("Feedback: /montage/state/playing, /montage/state/timecode, /montage/state/loop, /montage/reply/<tool>, /montage/error"),
+                             QString(), tr("Menu commands:")};
+        for (const auto& [address, id] : osc_->commandAddresses()) lines << QStringLiteral("  %1   (%2)").arg(address, id);
+        auto* list = new QDialog(dlg);
+        list->setObjectName(QStringLiteral("oscAddressList"));
+        list->setWindowTitle(tr("OSC Addresses"));
+        list->setAttribute(Qt::WA_DeleteOnClose);
+        auto* v = new QVBoxLayout(list);
+        auto* text = new QPlainTextEdit(list);
+        text->setReadOnly(true);
+        text->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+        text->setPlainText(lines.join(QLatin1Char('\n')));
+        v->addWidget(text);
+        list->resize(760, 520);
+        list->show();
+    });
     dlg->show();
     return dlg;
 }

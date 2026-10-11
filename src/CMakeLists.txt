@@ -130,6 +130,7 @@ add_library(montage_engine STATIC
   control/Midi.h control/Midi.cpp
   control/MackieControl.h control/MackieControl.cpp
   control/Hui.h control/Hui.cpp
+  control/Osc.h control/Osc.cpp
   render/Versions.h render/Versions.cpp
   render/ReviewExport.h render/ReviewExport.cpp
   render/DcpMxf.h render/DcpMxf.cpp
