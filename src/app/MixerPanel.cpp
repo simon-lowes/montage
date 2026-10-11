@@ -585,7 +585,7 @@ void MixerPanel::rebaseRecorders() {
     }
     for (LaneRecording& lr : lanes_) {
         if (lr.valid && !lr.valid(s)) continue;
-        const double still = lr.stillIn ? lr.stillIn(s) : 0;  // (before laneIn, which may add an unstored parameter at 0)
+        const double still = lr.stillIn ? lr.stillIn(s) : 0;  // (before laneIn, which may add an unstored parameter)
         if (const Param* lane = lr.laneIn(s)) lr.rec.rebase(*lane, lr.stillIn ? still : lane->value);
     }
     liveState_.clear();
@@ -631,9 +631,10 @@ bool MixerPanel::captureInsert(const EditorState::ParameterMove& m) {
                           [owner, effect, param](Sequence& s, double v) {
                               if (Effect* fx = edit::ownedEffect(s, owner, effect)) fx->params[param] = Param(v);
                           },
-                          [owner, effect, param](Sequence& s) -> Param* {
+                          [owner, effect, param, fallback = before.value](Sequence& s) -> Param* {
+                              // (not stored yet: added at its default, which stays if nothing is written to it)
                               Effect* fx = edit::ownedEffect(s, owner, effect);
-                              return fx ? &fx->params[param] : nullptr;
+                              return fx ? &fx->params.try_emplace(param, Param(fallback)).first->second : nullptr;
                           },
                           {}, {}, false, 0.0});
         lanes_.back().whole = m.toggle && m.whole;

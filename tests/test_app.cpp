@@ -1360,6 +1360,20 @@ private slots:
             if (f == 39) QCOMPARE(*state()->liveParameter(track, eq, "high_hz"), 5000.0);  // let go: back to its default
         }
         mixer->playbackStopped(40);
+        // One moved less than its thinning tolerance writes no keys and is left at its default, not 0.
+        mixer->playbackStarted(0);
+        for (FrameTime f = 0; f <= 10; ++f) {
+            if (f == 3) QVERIFY(state()->captureParameter({track, eq, "mid_hz", 1000.5, 1000, 1, false, {}}));
+            mixer->playbackPosition(f);
+        }
+        mixer->playbackStopped(10);
+        {
+            Sequence now = *state()->sequence();
+            const Effect* fx = edit::ownedEffect(now, track, eq);
+            QVERIFY(fx);
+            QVERIFY(!fx->params.count("mid_hz") || !fx->params.at("mid_hz").animated());
+            QCOMPARE(fx->p("mid_hz", 5, 1000), 1000.0);
+        }
         // A pass that wrote nothing leaves a gesture alone at the stop.
         mixer->playbackStarted(0);
         state()->beginGesture("Drag 2");
